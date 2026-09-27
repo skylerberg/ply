@@ -1,11 +1,16 @@
 #![cfg(unix)]
 
-use crate::harness::{process, write};
+use crate::harness::{Reservation, connect_when_ready, process, write};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// The status line and headers both programs answer with, as Ply source. The `HEAD` token in the
+/// sources below is replaced with it, so an edit cannot leave the two answers disagreeing.
+const HEAD: &str =
+    r#"b"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Test-Nonce: NONCE\r\nContent-Length: ""#;
 
 const SERVER: &str = r#"
 import std.net
@@ -21,7 +26,7 @@ fn answer(c: Int) -> Unit / {net.write[conn], signal.read} = {
   let _ = net.recv[conn](c, 4096, 20000);
   let payload = body();
   let head = bytes_concat(
-    b"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Test-Nonce: NONCE\r\nContent-Length: ",
+    HEAD,
     bytes_concat(bytes_of_string(int_to_string(bytes_len(payload))), b"\r\n\r\n"));
   let _ = net::send_all[conn](c, bytes_concat(head, payload), 20000);
   net.close[conn](c)
@@ -46,13 +51,6 @@ fn main() -> Int / {net.write[listener], net.write[conn], signal.read} = {
 "#;
 
 const PORT_ATTEMPTS: usize = 3;
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
-    let port = listener.local_addr().expect("an address").port();
-    drop(listener);
-    port
-}
 
 /// A token this test's server echoes in its answer, so a probe cannot read another test's server
 /// as this one. The shutdown suite is one binary and its tests start together, and the kernel can
@@ -93,13 +91,17 @@ impl Server {
         Server::start_with(SERVER, flags)
     }
 
-    /// Retries on a fresh port if the one `free_port` handed over was taken before `ply run` could claim it.
+    /// Retries on a fresh port if this one was taken before `ply run` could claim it.
     fn start_with(source: &str, flags: &[&str]) -> Server {
         let mut refused = Vec::new();
         for _ in 0..PORT_ATTEMPTS {
-            let mut server = Server::spawn(source, flags);
+            let reserved = Reservation::take();
+            let mut server = Server::spawn(source, flags, reserved.port());
             match server.wait_until_listening() {
-                Ok(()) => return server,
+                Ok(()) => {
+                    reserved.bound();
+                    return server;
+                }
                 Err(why) => refused.push(why),
             }
         }
@@ -109,14 +111,14 @@ impl Server {
         );
     }
 
-    fn spawn(source: &str, flags: &[&str]) -> Server {
+    fn spawn(source: &str, flags: &[&str], port: u16) -> Server {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let port = free_port();
         let nonce = nonce();
         write(
             dir.path(),
             "main.ply",
             &source
+                .replace("HEAD", HEAD)
                 .replace("PORT", &port.to_string())
                 .replace("NONCE", &nonce),
         );
@@ -139,43 +141,12 @@ impl Server {
     /// The probe is a whole request and response, and the answer has to carry this test's token:
     /// a bare connect, or a `200 OK`, can belong to another test's server on the same port.
     fn wait_until_listening(&mut self) -> Result<(), String> {
-        let until = Instant::now() + Duration::from_secs(60);
-        while Instant::now() < until {
-            if let Some(status) = self.child.try_wait().expect("the child's status") {
-                return Err(self.epitaph(status));
-            }
-            if let Ok(mut probe) =
-                TcpStream::connect_timeout(&self.address(), Duration::from_millis(200))
-            {
-                let _ = probe.set_read_timeout(Some(Duration::from_secs(10)));
-                if ready(&request(&mut probe), &self.nonce) {
-                    return Ok(());
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        Err(format!(
-            "127.0.0.1:{}: the process was still running after 60s and never answered a probe",
-            self.port
-        ))
-    }
-
-    fn epitaph(&mut self, status: ExitStatus) -> String {
-        let mut out = String::new();
-        let mut err = String::new();
-        if let Some(mut pipe) = self.child.stdout.take() {
-            let _ = pipe.read_to_string(&mut out);
-        }
-        if let Some(mut pipe) = self.child.stderr.take() {
-            let _ = pipe.read_to_string(&mut err);
-        }
-        format!(
-            "127.0.0.1:{}: `ply run --host` exited {status} without binding\n  stdout: \
-             {}\n  stderr: {}",
-            self.port,
-            out.trim(),
-            err.trim()
-        )
+        let addr = self.address();
+        let nonce = self.nonce.clone();
+        connect_when_ready(&mut self.child, addr, Duration::from_secs(60), |stream| {
+            ready(&request(stream), &nonce)
+        })
+        .map(|_| ())
     }
 
     fn address(&self) -> std::net::SocketAddr {
@@ -474,7 +445,7 @@ fn answer(c: Int) -> Int / {net.write[conn], signal.read} = {
   let _ = net.recv[conn](c, 4096, 20000);
   let payload = if signal.stopping() { b"draining" } else { b"ok" };
   let head = bytes_concat(
-    b"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Test-Nonce: NONCE\r\nContent-Length: ",
+    HEAD,
     bytes_concat(bytes_of_string(int_to_string(bytes_len(payload))), b"\r\n\r\n"));
   let _ = net::send_all[conn](c, bytes_concat(head, payload), 20000);
   net.close[conn](c);

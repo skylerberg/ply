@@ -1,18 +1,13 @@
 //! The one test in this tree that opens a real socket.
 
-use crate::harness::{process, repo};
+use crate::harness::{Reservation, connect_when_ready, process, repo};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// How long the server has to typecheck the program and bind.
 const STARTUP: Duration = Duration::from_secs(30);
-
-fn reserve_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
-    listener.local_addr().expect("a bound address").port()
-}
 
 /// The example, verbatim, with the two numbers a test needs to choose.
 fn project(port: u16, connections: u32) -> tempfile::TempDir {
@@ -69,20 +64,9 @@ impl Server {
     }
 
     fn connect(&mut self) -> TcpStream {
-        let deadline = Instant::now() + STARTUP;
-        loop {
-            if let Some(status) = self.running().try_wait().expect("the child is waitable") {
-                let output = self.take();
-                panic!("`ply run --host` exited {status} before listening:\n{output}");
-            }
-            match TcpStream::connect_timeout(&self.addr, Duration::from_millis(250)) {
-                Ok(stream) => return stream,
-                Err(e) if Instant::now() >= deadline => {
-                    panic!("nothing listening on {} after {STARTUP:?}: {e}", self.addr)
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(25)),
-            }
-        }
+        let addr = self.addr;
+        connect_when_ready(self.running(), addr, STARTUP, |_| true)
+            .unwrap_or_else(|why| panic!("{why}"))
     }
 
     /// Asked for a fixed number of connections and given them, the server must return on its own.
@@ -143,10 +127,12 @@ fn exchange(mut stream: TcpStream, request: &[u8]) -> String {
 
 #[test]
 fn a_request_over_a_real_socket_is_answered_by_a_ply_program() {
-    let port = reserve_port();
+    let reserved = Reservation::take();
+    let port = reserved.port();
     let dir = project(port, 1);
     let mut server = Server::start(dir.path(), port);
     let stream = server.connect();
+    reserved.bound();
 
     let response = exchange(
         stream,
@@ -175,11 +161,14 @@ fn a_request_over_a_real_socket_is_answered_by_a_ply_program() {
 
 #[test]
 fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
-    let port = reserve_port();
+    let reserved = Reservation::take();
+    let port = reserved.port();
     let dir = project(port, 2);
     let mut server = Server::start(dir.path(), port);
 
-    let response = exchange(server.connect(), b"GET /\r\n\r\n");
+    let first = server.connect();
+    reserved.bound();
+    let response = exchange(first, b"GET /\r\n\r\n");
     assert!(
         response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
         "got:\n{response}"
@@ -201,10 +190,12 @@ fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
 
 #[test]
 fn a_request_split_across_writes_is_read_to_its_terminator() {
-    let port = reserve_port();
+    let reserved = Reservation::take();
+    let port = reserved.port();
     let dir = project(port, 1);
     let mut server = Server::start(dir.path(), port);
     let mut stream = server.connect();
+    reserved.bound();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -233,7 +224,8 @@ fn a_request_split_across_writes_is_read_to_its_terminator() {
 
 #[test]
 fn the_same_program_is_hermetic_under_ply_test() {
-    let dir = project(reserve_port(), 1);
+    let reserved = Reservation::take();
+    let dir = project(reserved.port(), 1);
     let out = process(dir.path())
         .arg("test")
         .output()
@@ -252,7 +244,8 @@ fn the_same_program_is_hermetic_under_ply_test() {
 
 #[test]
 fn without_the_flag_the_program_never_reaches_the_socket() {
-    let port = reserve_port();
+    let reserved = Reservation::take();
+    let port = reserved.port();
     let dir = project(port, 1);
     let out = process(dir.path())
         .arg("run")
@@ -307,7 +300,8 @@ fn output(out: &Output) -> String {
 
 #[test]
 fn a_hermetic_test_that_reaches_the_boundary_names_the_handler_it_did_not_use() {
-    let dir = reaching_test(reserve_port());
+    let reserved = Reservation::take();
+    let dir = reaching_test(reserved.port());
     let out = process(dir.path())
         .arg("test")
         .output()
@@ -325,7 +319,8 @@ fn a_hermetic_test_that_reaches_the_boundary_names_the_handler_it_did_not_use() 
 
 #[test]
 fn a_host_backed_pass_is_never_cached_and_never_satisfies_a_hermetic_run() {
-    let dir = reaching_test(reserve_port());
+    let reserved = Reservation::take();
+    let dir = reaching_test(reserved.port());
 
     for attempt in 0..2 {
         let out = process(dir.path())
