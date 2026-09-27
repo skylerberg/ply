@@ -1,6 +1,8 @@
 // The database effect.
 
 import std.json
+import std.net (net)
+import std.pg
 
 pub nondet effect db {
   read query[t](s: Stmt, ps: List<Param>) -> Answer
@@ -3153,3 +3155,460 @@ test "a text parameter in an integer column is refused rather than coerced" {
   );
   assert_eq(t_code(t_out(d, "insert into part (sku, price, n) values ('a', 1, 'x')", [])), "22P02")
 }
+
+// --- A live server ---------------------------------------------------------------
+//
+// The effect's own handler, over `std.pg`. A perform names its label — the table — and a clause
+// written `[*]` answers every one of them, so the driver is here rather than in the host: the
+// pool, the transaction scope, the text of every value and the tables a statement names. What is
+// left to the host is `net`.
+
+pub type Server = {
+  host: String,
+  port: Int,
+  user: String,
+  database: String,
+  password: Option<String>,
+  client: pg::Client,
+}
+
+pub fn server(
+  host: String,
+  port: Int,
+  user: String,
+  database: String,
+  password: Option<String>,
+) -> Server =
+  {
+    host: host,
+    port: port,
+    user: user,
+    database: database,
+    password: password,
+    client: pg::default_client(),
+  }
+
+// A connection with a transaction open, and how deep: depth 0 is between transactions.
+type Open = { session: pg::Session, depth: Int }
+
+// What the handler holds between performs: the connections it may hand out, the one a transaction
+// has taken, and how many it has opened, which is what bounds it.
+type Pool = { idle: List<pg::Session>, open: Option<Open>, opened: Int }
+
+// --- The text of a value ---------------------------------------------------------
+
+fn hex_of(b: Bytes) -> String =
+  fold(range(0, bytes_len(b)), "", |acc: String, i: Int| {
+    let v = bytes_at(b, i);
+    acc ++ string_slice("0123456789abcdef", v >>> 4, (v >>> 4) + 1)
+      ++ string_slice("0123456789abcdef", v & 0xF, (v & 0xF) + 1)
+  })
+
+fn hex_value(c: Int) -> Int =
+  if c >= 48 && c <= 57 { c - 48 }
+  else if c >= 97 && c <= 102 { c - 87 }
+  else if c >= 65 && c <= 70 { c - 55 }
+  else { 0 }
+
+fn unhex_text(text: String) -> Bytes = {
+  let b = bytes_of_string(text);
+  bytes_concat_all(
+    map(range(0, bytes_len(b) / 2), |i: Int|
+      byte_of_int(hex_value(bytes_at(b, i * 2)) * 16 + hex_value(bytes_at(b, i * 2 + 1)))),
+  )
+}
+
+// Bytea's hex output is introduced by `\x`; the older escape format is read as its own bytes.
+fn bytes_of_bytea(text: String) -> Bytes =
+  if string_starts_with(text, "\\x") { unhex_text(string_slice(text, 2, string_len(text))) }
+  else { bytes_of_string(text) }
+
+fn signed_digits(text: String) -> Int = {
+  let b = bytes_of_string(text);
+  let negative = bytes_len(b) > 0 && bytes_at(b, 0) == 45;
+  let from = if negative { 1 } else { 0 };
+  let magnitude = fold(range(from, bytes_len(b)), 0, |acc: Int, i: Int| {
+    let c = bytes_at(b, i);
+    if c >= 48 && c <= 57 { acc * 10 + c - 48 } else { acc }
+  });
+  if negative { 0 - magnitude } else { magnitude }
+}
+
+fn nat_of_text(text: String) -> Int =
+  fold(range(0, string_len(text)), 0, |acc: Int, i: Int| {
+    let c = bytes_at(bytes_of_string(string_slice(text, i, i + 1)), 0);
+    if c >= 48 && c <= 57 { acc * 10 + c - 48 } else { acc }
+  })
+
+fn float_of_text(text: String) -> Float = match float_of_string(text) { Some(f) -> f, None -> 0.0 }
+
+fn decimal_of_text(text: String) -> Decimal =
+  match decimal_of_string(text) { Some(d) -> d, None -> decimal_of_int(0) }
+
+fn json_of_text(text: String) -> json::Json =
+  match json::parse_string(text) { Ok(j) -> j, Err(_) -> json::Str(text) }
+
+// The element type of an array type, or `0` when the OID is not one this reads.
+fn element_oid(oid: Int) -> Int =
+  if oid == 1000 { 16 }
+  else if oid == 1001 { 17 }
+  else if oid == 1005 { 21 }
+  else if oid == 1007 { 23 }
+  else if oid == 1016 { 20 }
+  else if oid == 1009 { 25 }
+  else if oid == 1015 { 1043 }
+  else if oid == 1021 { 700 }
+  else if oid == 1022 { 701 }
+  else if oid == 1231 { 1700 }
+  else if oid == 199 { 114 }
+  else if oid == 3807 { 3802 }
+  else { 0 }
+
+// An array's text is `{...}`, elements separated by commas, quoted when they need to be, and the
+// word `NULL` bare — so a quoted `NULL` is the text and an unquoted one is nothing.
+type Scanning = {
+  items: List<Datum>,
+  piece: String,
+  quoted: Bool,
+  was_quoted: Bool,
+  escaped: Bool,
+  done: Bool,
+}
+
+fn array_values(element: Int, text: String) -> List<Datum> = {
+  let inner = if string_len(text) >= 2 { string_slice(text, 1, string_len(text) - 1) } else { "" };
+  let end = fold(
+    range(0, string_len(inner)),
+    { items: [], piece: "", quoted: false, was_quoted: false, escaped: false, done: false },
+    |acc: Scanning, i: Int|
+      if acc.done { acc } else {
+        let c = string_slice(inner, i, i + 1);
+        if acc.escaped { { ..acc, piece: acc.piece ++ c, escaped: false } }
+        else if acc.quoted && c == "\\" { { ..acc, escaped: true } }
+        else if c == "\"" { { ..acc, quoted: !acc.quoted, was_quoted: true } } else if !acc.quoted
+            && c == "," {
+          {
+            ..acc,
+            items: push(acc.items, array_value(element, acc.piece, acc.was_quoted)),
+            piece: "",
+            was_quoted: false,
+          }
+        } else { { ..acc, piece: acc.piece ++ c } }
+      },
+  );
+  if string_len(inner) == 0 { [] }
+  else { push(end.items, array_value(element, end.piece, end.was_quoted)) }
+}
+
+fn array_value(element: Int, piece: String, was_quoted: Bool) -> Datum =
+  if !was_quoted && piece == "NULL" { CNull } else { datum_of(element, Some(piece)) }
+
+fn datum_of(oid: Int, text: Option<String>) -> Datum =
+  match text {
+    None -> CNull,
+    Some(t) -> if oid == 16 { CBool(t == "t") }
+    else if oid == 20 || oid == 21 || oid == 23 { CInt(signed_digits(t)) }
+    else if oid == 700 || oid == 701 { CFloat(float_of_text(t)) }
+    else if oid == 1700 { CNumeric(decimal_of_text(t)) }
+    else if oid == 17 { CBytes(bytes_of_bytea(t)) }
+    else if oid == 114 || oid == 3802 { CJson(json_of_text(t)) }
+    else if element_oid(oid) != 0 { CArray(array_values(element_oid(oid), t)) }
+    else { CText(t) },
+  }
+
+// What the server sent for one column: text, except that bytea's hex form and the text of every
+// other type are read by `datum_of`. `string_of_bytes_lossy` because a bytea is bytes, not text.
+fn datum_bytes(oid: Int, raw: Option<Bytes>) -> Datum =
+  match raw { None -> CNull, Some(b) -> datum_of(oid, Some(string_of_bytes_lossy(b))) }
+
+fn param_text(p: Param) -> Option<String> =
+  match p {
+    PNull -> None,
+    PInt(n) -> Some(int_to_string(n)),
+    PBool(b) -> Some(if b { "t" } else { "f" }),
+    PText(s) -> Some(s),
+    PBytes(b) -> Some("\\x" ++ hex_of(b)),
+    PFloat(f) -> Some(float_to_string(f)),
+    PNumeric(d) -> Some(decimal_to_string(d)),
+    PJson(j) -> Some(json::to_string(j)),
+    PArray(items) ->
+      Some("{" ++ join_with(map(items, |p: Param| array_element_text(p)), ",") ++ "}"),
+  }
+
+// An array element is always quoted, which is the one form whose escaping is two characters.
+fn array_element_text(p: Param) -> String =
+  match param_text(p) {
+    None -> "NULL",
+    Some(t) ->
+      "\""
+        ++ fold(range(0, string_len(t)), "", |acc: String, i: Int| {
+          let c = string_slice(t, i, i + 1);
+          if c == "\"" || c == "\\" { acc ++ "\\" ++ c } else { acc ++ c }
+        })
+        ++ "\"",
+  }
+
+// --- The answer a statement makes ------------------------------------------------
+
+fn last_word(text: String) -> Option<String> =
+  fold(string_split(text, " "), None, |acc: Option<String>, w: String|
+    if string_len(w) > 0 { Some(w) } else { acc })
+
+// `SELECT 3`, `INSERT 0 1`, `UPDATE 2`: the count is the tag's last number, and a tag with none
+// (`BEGIN`) counts nothing.
+fn count_of(tag: String) -> Int = match last_word(tag) { Some(w) -> nat_of_text(w), None -> 0 }
+
+fn row_of(columns: List<pg::Column>, values: List<Option<Bytes>>, i: Int, acc: Row) -> Row =
+  if i >= len(columns) { acc } else {
+    match list_at(columns, i) {
+      None -> acc,
+      Some(column) -> {
+        let raw = match list_at(values, i) { Some(v) -> v, None -> None };
+        row_of(columns, values, i + 1, map_insert(acc, column.name, datum_bytes(column.ty, raw)))
+      },
+    }
+  }
+
+fn rows_of(columns: List<pg::Column>, rows: List<List<Option<Bytes>>>) -> List<Row> =
+  map(rows, |r: List<Option<Bytes>>| row_of(columns, r, 0, map_new()))
+
+// --- The scope a statement runs in -----------------------------------------------
+
+fn isolation_sql(level: Isolation) -> String =
+  match level {
+    ReadCommitted -> "read committed",
+    RepeatableRead -> "repeatable read",
+    Serializable -> "serializable",
+  }
+
+fn access_sql(access: Access) -> String =
+  match access { ReadWrite -> "read write", ReadOnly -> "read only" }
+
+fn savepoint_name(depth: Int) -> String = "ply_sp" ++ int_to_string(depth)
+
+// --- The handler -----------------------------------------------------------------
+
+type Taken = { session: pg::Session, pool: Pool }
+
+// A connection to run one statement on: the open transaction's, or one of the pool's.
+fn checkout(
+  cfg: Server,
+  size: Int,
+  pool: Pool,
+  nonce: String,
+) -> Result<Taken, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match pool.idle {
+    [first, ..rest] -> Ok({ session: first, pool: { ..pool, idle: rest } }),
+    [] -> if pool.opened >= size {
+      Err(db_error("53300", "", "the pool of " ++ int_to_string(size) ++ " connection(s) is busy"))
+    } else {
+      match pg::connect[link](
+          cfg.host,
+          cfg.port,
+          cfg.user,
+          cfg.database,
+          cfg.password,
+          nonce ++ "-" ++ int_to_string(pool.opened),
+          cfg.client,
+        ) {
+        Err(e) -> Err(db_error("", "", pg::client_error_text(e))),
+        Ok(session) -> Ok({ session: session, pool: { ..pool, opened: pool.opened + 1 } }),
+      }
+    },
+  }
+
+fn release(session: pg::Session, pool: Pool) -> Pool = { ..pool, idle: push(pool.idle, session) }
+
+fn give_back(session: pg::Session, pool: Pool) -> Pool =
+  release(session, { ..pool, opened: pool.opened - 1 })
+
+type Ran = { session: pg::Session, answer: Answer }
+
+fn run_statement(
+  session: pg::Session,
+  s: Stmt,
+  ps: List<Param>,
+  rows: Bool,
+  cfg: Server,
+) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link]} =
+  match pg::extended_query[link](session, s.sql, map(ps, |p: Param| param_text(p)), cfg.client) {
+    Err(e) -> Err(e),
+    Ok(reply) ->
+      Ok({
+        session: reply.session,
+        answer: if rows { Rows(rows_of(reply.answer.columns, reply.answer.rows)) }
+        else { Count(count_of(reply.answer.tag)) },
+      }),
+  }
+
+// A statement the driver itself sends, which only has to have worked.
+fn control(
+  session: pg::Session,
+  sql: String,
+  cfg: Server,
+) -> Result<pg::Session, pg::ClientError> / {net.send[link], net.recv[link]} =
+  match pg::simple_query[link](session, sql, cfg.client) {
+    Err(e) -> Err(e),
+    Ok(reply) -> Ok(reply.session),
+  }
+
+fn statement_on(
+  cfg: Server,
+  size: Int,
+  nonce: String,
+  pool: Pool,
+  s: Stmt,
+  ps: List<Param>,
+  rows: Bool,
+) -> { answer: Answer, pool: Pool } / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match pool.open {
+    Some(open) -> match run_statement(open.session, s, ps, rows, cfg) {
+      Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
+      Ok(ran) -> {
+        let held = { ..open, session: ran.session };
+        { answer: ran.answer, pool: { ..pool, open: Some(held) } }
+      },
+    },
+    None -> match checkout(cfg, size, pool, nonce) {
+      Err(e) -> { answer: Failed(e), pool: pool },
+      Ok(taken) -> match run_statement(taken.session, s, ps, rows, cfg) {
+        Err(e) -> {
+          pg::finish[link](taken.session, cfg.client);
+          {
+            answer: Failed(db_error("", "", pg::client_error_text(e))),
+            pool: give_back(taken.session, taken.pool),
+          }
+        },
+        Ok(ran) -> { answer: ran.answer, pool: release(ran.session, taken.pool) },
+      },
+    },
+  }
+
+fn begin_txn(
+  cfg: Server,
+  size: Int,
+  nonce: String,
+  pool: Pool,
+  level: Isolation,
+  access: Access,
+) -> { answer: Answer, pool: Pool } / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match pool.open {
+    // A nested begin is a savepoint on the connection the outer transaction holds.
+    Some(open) -> match control(open.session, "savepoint " ++ savepoint_name(open.depth + 1), cfg) {
+      Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
+      Ok(session) -> {
+        let deeper = { ..open, session: session, depth: open.depth + 1 };
+        { answer: Count(0), pool: { ..pool, open: Some(deeper) } }
+      },
+    },
+    None -> match checkout(cfg, size, pool, nonce) {
+      Err(e) -> { answer: Failed(e), pool: pool },
+      Ok(taken) -> match control(
+          taken.session,
+          "begin isolation level " ++ isolation_sql(level) ++ " " ++ access_sql(access),
+          cfg,
+        ) {
+        Err(e) -> {
+          pg::finish[link](taken.session, cfg.client);
+          {
+            answer: Failed(db_error("", "", pg::client_error_text(e))),
+            pool: give_back(taken.session, taken.pool),
+          }
+        },
+        Ok(session) -> {
+          let open = { session: session, depth: 1 };
+          { answer: Count(0), pool: { ..taken.pool, open: Some(open) } }
+        },
+      },
+    },
+  }
+
+fn commit_txn(
+  cfg: Server,
+  pool: Pool,
+) -> { answer: Answer, pool: Pool } / {net.send[link], net.recv[link]} =
+  match pool.open {
+    None -> { answer: Count(0), pool: pool },
+    Some(open) -> if open.depth > 1 {
+      match control(open.session, "release savepoint " ++ savepoint_name(open.depth), cfg) {
+        Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
+        Ok(session) -> {
+          let shallower = { ..open, session: session, depth: open.depth - 1 };
+          { answer: Count(0), pool: { ..pool, open: Some(shallower) } }
+        },
+      }
+    } else {
+      match control(open.session, "commit", cfg) {
+        Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
+        Ok(session) -> { answer: Count(0), pool: release(session, { ..pool, open: None }) },
+      }
+    },
+  }
+
+fn abort_txn(
+  cfg: Server,
+  pool: Pool,
+) -> { answer: Answer, pool: Pool } / {net.send[link], net.recv[link]} =
+  match pool.open {
+    None -> { answer: Count(0), pool: pool },
+    Some(open) -> if open.depth > 1 {
+      // The savepoint is still open after a rollback to it, so the scope stays as deep.
+      match control(open.session, "rollback to savepoint " ++ savepoint_name(open.depth), cfg) {
+        Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
+        Ok(session) -> {
+          let same = { ..open, session: session };
+          { answer: Count(0), pool: { ..pool, open: Some(same) } }
+        },
+      }
+    } else {
+      match control(open.session, "rollback", cfg) {
+        Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
+        Ok(session) -> { answer: Count(0), pool: release(session, { ..pool, open: None }) },
+      }
+    },
+  }
+
+// The `db` effect served from a live server. `nonce` is the caller's, so a run's seed decides it
+// and a test can fix it; each connection's nonce is that text and its own number.
+pub fn serve<a | e>(
+  cfg: Server,
+  size: Int,
+  nonce: String,
+  body: () -> a / e,
+) -> a / {net.connect[link], net.send[link], net.recv[link], net.close[link] | e} =
+  with_cell[dbpool]({ idle: [], open: None, opened: 0 }) { pool ->
+    handle {
+      body()
+    } with {
+      db.query[*](s, ps) -> {
+        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true);
+        cell_set(pool, ran.pool);
+        ran.answer
+      },
+      db.execute[*](s, ps) -> {
+        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, false);
+        cell_set(pool, ran.pool);
+        ran.answer
+      },
+      db.returning[*](s, ps) -> {
+        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true);
+        cell_set(pool, ran.pool);
+        ran.answer
+      },
+      db.begin(level, access) -> {
+        let ran = begin_txn(cfg, size, nonce, cell_get(pool), level, access);
+        cell_set(pool, ran.pool);
+        ran.answer
+      },
+      db.commit() -> {
+        let ran = commit_txn(cfg, cell_get(pool));
+        cell_set(pool, ran.pool);
+        ran.answer
+      },
+      db.abort() -> {
+        let ran = abort_txn(cfg, cell_get(pool));
+        cell_set(pool, ran.pool);
+        ran.answer
+      },
+    }
+  }
