@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# The tables CI's test jobs are cut from, and the check that the cut is total.
+# The tables CI's test jobs are cut from, the check that the cut is total, and the caches a run
+# parks for its own jobs, handed back when it is green.
 #
 #   ci-shards.sh verify          every crate is a member, every test named here
 #                                exists, every `probes/` directory is run by a
 #                                job the `ci` aggregate requires, the shards run
-#                                every test exactly once, and every cache key a
-#                                job writes is one a job reads
+#                                every test exactly once, every cache key a job
+#                                writes is one a job reads, and every key that
+#                                names the run is one the run gives back or a
+#                                later run reads
 #   ci-shards.sh cache-keys      just that last check
 #   ci-shards.sh partitions      the JSON matrix of partitions
 #   ci-shards.sh shard-configs D the nextest config each partition runs under,
@@ -23,6 +26,8 @@
 #                                suite and the tree checks
 #   ci-shards.sh postgres-filter the filterset selecting the postgres packages
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
+#   ci-shards.sh give-back RUN   delete the entries this run parked for its own
+#                                jobs, once every job that reads them is done
 
 set -euo pipefail
 
@@ -78,6 +83,13 @@ TREE_CHECKS=(
 declare -a PROBE_JOBS=(
   "ucontext:ucontext-probe"
 )
+
+# What a run parks for its own jobs, as the literal ci.yml writes before `${{ github.run_id }}`:
+# the archive every partition unpacks, the emitter's stage, and the shard cut. No later run can
+# name one, so a green run gives them back, and the repository's 10 GB cache stays for what does
+# outlive a run -- the stage under `ply-c-stage-sources-`, and the object cache. `test-timings-` is
+# run-scoped too and stays: a later run reads it, through `restore-keys`.
+GIVE_BACK=(nextest-archive- ply-c-stage-emitter- ply-c-stage-run- test-shards-)
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -348,14 +360,16 @@ cmd_shard_configs() { shard_configs "${1:?a directory to write the configs to}" 
 # compared: it is the part a restore can match on, and the part both sides spell out.
 cmd_cache_keys() {
   local files=("$root"/.github/workflows/*.yml "$root"/.github/actions/*/action.yml)
-  awk '
+  awk -v give_back="${GIVE_BACK[*]}" '
     function literal(s) {
       sub(/\$\{\{.*/, "", s)
       gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", s)
       return s
     }
     # `key:` inside a save step is written, inside a restore step or in a `restore-keys` list it
-    # is read. An entry with no literal at all is all expression, and nothing to compare.
+    # is read. An entry with no literal at all is all expression, and nothing to compare. A write
+    # whose key names the run belongs to this run, and `late` holds the reads a later run makes --
+    # the `restore-keys` prefixes, which do not name it.
     function note(kind, value, key) {
       key = literal(value)
       if (key == "") return
@@ -363,7 +377,11 @@ cmd_cache_keys() {
         if (key in saved) return
         saved[key] = 1
         where[key] = FILENAME ":" FNR
+        if (index(value, "github.run_id") > 0) run_scoped[key] = 1
         order[++n] = key
+      } else if (kind == "late") {
+        late[key] = 1
+        read[key] = 1
       } else {
         read[key] = 1
       }
@@ -379,14 +397,14 @@ cmd_cache_keys() {
       line = $0
       sub(/^[[:space:]]*/, "", line)
       if (length($0) - length(line) <= indent) inkeys = 0
-      else { note("read", line); next }
+      else { note("late", line); next }
     }
     /^[[:space:]]*restore-keys:/ {
       rest = $0
       sub(/.*restore-keys:[[:space:]]*/, "", rest)
       indent = match($0, /[^ ]/) - 1
       if (rest == "|") { inkeys = 1; next }
-      if (rest != "") note(mode, rest)
+      if (rest != "") note("late", rest)
       next
     }
     /^[[:space:]]*key:/ {
@@ -416,10 +434,48 @@ cmd_cache_keys() {
           bad = 1
         }
       }
+      # A key that names the run carries the work of this run to the jobs of this run, and no later
+      # run can name it: the run has to give it back, unless a `restore-keys` entry matches it.
+      ng = split(give_back, gk, " ")
+      for (i = 1; i <= n; i++) {
+        if (!(order[i] in run_scoped)) continue
+        ok = 0
+        for (j = 1; j <= ng; j++) if (gk[j] != "" && index(order[i], gk[j]) == 1) { ok = 1; break }
+        if (!ok) for (r in late) if (index(order[i], r) == 1) { ok = 1; break }
+        if (!ok) {
+          printf "FAIL: %s writes run-scoped cache key \"%s\", which no later run reads and GIVE_BACK does not name\n", where[order[i]], order[i] > "/dev/stderr"
+          bad = 1
+        }
+      }
+      # And the other way: an entry that names no key is a delete that quietly stops matching.
+      for (j = 1; j <= ng; j++) {
+        if (gk[j] == "") continue
+        ok = 0
+        for (k in saved) if (index(k, gk[j]) == 1) { ok = 1; break }
+        if (!ok) {
+          printf "FAIL: GIVE_BACK names \"%s\", which no save writes\n", gk[j] > "/dev/stderr"
+          bad = 1
+        }
+      }
       if (bad) exit 1
-      printf "cache keys: %d written and %d restored, each side matched by the other\n", n, length(read)
+      printf "cache keys: %d written and %d restored, each side matched by the other; %d run-scoped, each read later or given back\n", n, length(read), length(run_scoped)
     }
   ' "${files[@]}"
+}
+
+# Deletes this run's entries under the keys above. A GitHub key is immutable, so an entry no later
+# run reads holds the repository's cache budget against the object cache, which does outlive a run.
+cmd_give_back() {
+  local run=${1:?usage: ci-shards.sh give-back RUN_ID} key listing size id
+  for key in ${GIVE_BACK[@]+"${GIVE_BACK[@]}"}; do
+    listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=$key$run" \
+      -q '.actions_caches[] | "\(.size_in_bytes) \(.id)"')
+    while read -r size id; do
+      [[ -n $id ]] || continue
+      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id"
+      echo "gave back $key$run, $((size / 1000000)) MB"
+    done <<< "$listing"
+  done
 }
 
 cmd_solo_matrix() {
@@ -747,6 +803,20 @@ cmd_verify() {
 
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
+  # GIVE_BACK is a table until a job runs it, and a job that is not required can stop running with
+  # nothing red about it.
+  local give_back_job
+  give_back_job=$(awk '
+    /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
+    /ci-shards\.sh give-back/ { print job; exit }
+  ' "$workflow")
+  if [[ -z $give_back_job ]]; then
+    echo "FAIL: GIVE_BACK names the caches a run gives back, and no job in $workflow runs \`ci-shards.sh give-back\`" >&2
+    failures=$((failures + 1))
+  elif [[ " ${needs//[][,]/ } " != *" $give_back_job "* ]]; then
+    echo "FAIL: job '$give_back_job' gives this run's own caches back, and is not in the \`ci\` job's needs list" >&2
+    failures=$((failures + 1))
+  fi
 
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the CI tables" >&2
@@ -770,8 +840,9 @@ case "${1:-}" in
   postgres-filter) cmd_postgres_filter ;;
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;
+  give-back) cmd_give_back "${2:?a run id}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|exclude-filter|gate-filter|postgres-filter|tree-checks|tree-check-filter}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|exclude-filter|gate-filter|postgres-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
     exit 2
     ;;
 esac
