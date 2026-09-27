@@ -17,9 +17,10 @@ mod w6;
 
 use crate::support::{dump_files, generate};
 use ply_corpus::pipeline::{Front, front};
-use ply_corpus::{CorpusSpec, Verified, verify};
+use ply_corpus::{CorpusSpec, run_on_tier};
 use ply_eval::Plan;
 use ply_store::Store;
+use std::path::Path;
 
 #[test]
 fn a_generated_corpus_compiles_and_every_test_passes() {
@@ -367,3 +368,61 @@ fn a_second_run_over_an_unchanged_corpus_selects_nothing() {
 }
 mod r#gen;
 mod real;
+
+#[derive(Clone, Debug)]
+struct Verified {
+    tests: usize,
+    passed: usize,
+    failed: usize,
+    groups: usize,
+    largest_group: usize,
+    /// Tests whose footprint carries `sim.read`, so their result depends on a seed.
+    seeded: usize,
+}
+
+/// Compiles and runs a corpus with the real crates. It lives here rather than in the library
+/// because nothing but these tests asked for it, and a `select` the library no longer makes is a
+/// `select` the tests should own until the decision moves to the corpus's own program.
+fn verify(root: &Path) -> anyhow::Result<Verified> {
+    let front = front(root)?;
+    let mut store = Store::open(root)?;
+    store.clear()?;
+
+    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
+    let report = run_on_tier(
+        &front,
+        &selection,
+        &mut store,
+        ply_test::Search::of(&selection),
+        ply_test::Hosting::hermetic(),
+    );
+
+    if report.failed > 0 {
+        let shown: Vec<String> = report
+            .failures
+            .iter()
+            .take(3)
+            .map(|f| format!("{}: {}", f.key, f.diagnostic.message))
+            .collect();
+        panic!(
+            "{} of {} generated tests failed — the reference evaluator disagrees with `ply-eval`:\n  {}",
+            report.failed,
+            selection.total,
+            shown.join("\n  ")
+        );
+    }
+
+    Ok(Verified {
+        tests: front.check.tests.len(),
+        passed: report.passed,
+        failed: report.failed,
+        groups: selection.groups.len(),
+        largest_group: selection.groups.iter().map(|g| g.len()).max().unwrap_or(0),
+        seeded: front
+            .check
+            .tests
+            .iter()
+            .filter(|t| ply_test::is_seeded(&t.footprint))
+            .count(),
+    })
+}
