@@ -10,7 +10,7 @@ use crate::config::Configuration;
 use crate::hosts::Hosts;
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
-use crate::support::{describe_schema, enter_constant, prover_backend, select_profile};
+use crate::support::{enter_constant, prover_backend, select_profile};
 use ply_eval::Value as PlyValue;
 use ply_host::process::{Executables, ProcessHost, Sink, Stream};
 use ply_host::signal::{self, Shutdown};
@@ -35,7 +35,6 @@ pub struct RunOptions {
     pub tls: crate::options::TlsOptions,
     pub fs: Vec<ply_host::fs::RootSpec>,
     pub exec: Vec<ply_host::process::ExecSpec>,
-    pub db: crate::db::DbOptions,
     pub config: crate::config::ConfigOptions,
     pub trace: crate::trace::TraceOptions,
     pub shutdown: crate::options::ShutdownOptions,
@@ -59,7 +58,6 @@ impl Default for RunOptions {
             tls: crate::options::TlsOptions::default(),
             fs: Vec::new(),
             exec: Vec::new(),
-            db: crate::db::DbOptions::default(),
             config: crate::config::ConfigOptions::default(),
             trace: crate::trace::TraceOptions::default(),
             shutdown: crate::options::ShutdownOptions::default(),
@@ -319,11 +317,6 @@ impl Drive {
             sources: target.sources(),
             artifact: None,
         };
-        // Before anything evaluates; a hermetic run resolves nothing, so no registry can break it.
-        let db = match options.db.resolve(options.host) {
-            Ok(db) => db,
-            Err(diagnostics) => return Err(refuse(diagnostics)),
-        };
         // What a host answer is checked against, and whether this run needs a database.
         let declared = target
             .check()
@@ -398,15 +391,13 @@ impl Drive {
                 )]));
             }
         };
-        let mut hosts = match Hosts::open_stopping(
+        let hosts = match Hosts::open_stopping(
             target.check(),
             options.host,
             &options.tls,
             &options.fs,
-            db,
             configuration,
             &options.trace,
-            declared.as_ref(),
             shutdown.clone(),
             process,
             lent,
@@ -414,7 +405,6 @@ impl Drive {
             Ok(hosts) => hosts,
             Err(diagnostics) => return Err(refuse(diagnostics)),
         };
-        describe_schema(&mut hosts, &constant);
         let disclosed = disclosed(options, &hosts, shutdown.as_ref(), warnings);
         self.bound = Some((
             entry.to_string(),
@@ -626,7 +616,6 @@ fn disclosed(
             .as_ref()
             .map(|_| hosts.configuration().banner()),
         trace: facilities.observability.as_ref().map(|o| o.banner()),
-        database: crate::hosts::database_line(hosts),
         signals: shutdown.map(|s| Signals {
             names: s
                 .signals()
@@ -898,7 +887,6 @@ pub struct Disclosed {
     digest: String,
     config: Option<String>,
     trace: Option<String>,
-    database: Option<String>,
     signals: Option<Signals>,
     warnings: Vec<Diagnostic>,
 }
@@ -984,7 +972,6 @@ pub fn disclosed_value(d: &Disclosed) -> PlyValue {
         ("digest", PlyValue::str(&d.digest)),
         ("config", option(d.config.as_deref().map(PlyValue::str))),
         ("trace", option(d.trace.as_deref().map(PlyValue::str))),
-        ("database", option(d.database.as_deref().map(PlyValue::str))),
         (
             "signals",
             option(d.signals.as_ref().map(|g| {
@@ -1164,7 +1151,6 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
         None => None,
     };
     let tls = cred_list("tls")?;
-    let db_v = get("db")?;
     let config_v = get("config")?;
     let trace_v = get("trace")?;
     Ok(RunOptions {
@@ -1203,17 +1189,6 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
                 path: std::path::PathBuf::from(path),
             })
             .collect(),
-        db: crate::db::DbOptions {
-            url: crate::payload::opt_str_at(db_v, "url", span)?,
-            pool: crate::payload::opt_int_at(db_v, "pool", span)?.map(|n| n as u32),
-            acquire_ms: crate::payload::opt_int_at(db_v, "acquire_ms", span)?.map(|n| n as u64),
-            statement_ms: crate::payload::opt_int_at(db_v, "statement_ms", span)?.map(|n| n as u64),
-            idle_txn_ms: crate::payload::opt_int_at(db_v, "idle_txn_ms", span)?.map(|n| n as u64),
-            connect_ms: crate::payload::opt_int_at(db_v, "connect_ms", span)?.map(|n| n as u64),
-            statement_cache: crate::payload::opt_int_at(db_v, "statement_cache", span)?
-                .map(|n| n as u32),
-            schema: crate::payload::opt_str_at(db_v, "schema", span)?,
-        },
         config: crate::config::ConfigOptions {
             set: crate::payload::str_list_at(config_v, "set", span)?,
             files: crate::payload::str_list_at(config_v, "files", span)?
