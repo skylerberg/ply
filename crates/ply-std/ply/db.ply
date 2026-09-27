@@ -4785,29 +4785,44 @@ fn sql_nothing_left(p: SqlAt) -> Result<(), DbError> =
     else { Err(sql_refuse_tok(t, "the statement ends here")) },
   }
 
-// Whether a statement writes, which decides the operations that may perform it: a write performed
-// as `db.query` is published to the scheduler as a read.
-pub fn writes(sql: String) -> Result<Bool, DbError> =
-  match scan_statement(sql) { Err(e) -> Err(e), Ok(s) -> Ok(scan_writes(s)) }
-
 type Ran = { session: pg::Session, answer: Answer }
 
+// The statement's own check, before it costs a round trip. A statement's tables are a function of
+// its text rather than of the call site's label, so a join reaches tables the label never named —
+// and the atom the scheduler records is the label's, so the label has to be one of them.
 fn run_statement(
   session: pg::Session,
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
   reads_only: Bool,
+  label: String,
   cfg: Server,
 ) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link]} = {
-  let writing = match writes(s.sql) { Err(e) -> panic(e.detail), Ok(w) -> w };
-  if writing && reads_only {
+  let scanned = match scan_statement(s.sql) { Err(e) -> panic(e.detail), Ok(scanned) -> scanned };
+  if !sql_has_table(scan_table_names(scanned.tables), label) {
+    panic(
+      "this call site names `" ++ label ++ "`, and the statement touches "
+        ++ describe_tables(scanned.tables)
+        ++ ": label the call site with a table the statement names, or split the statement",
+    )
+  };
+  if scan_writes(scanned) && reads_only {
     panic(
       "this statement writes, and `db.query` is a read: perform it as `db.execute` or `db.returning`, or two endpoints that both write would be run beside each other",
     )
   };
   run_checked(session, s, ps, rows, cfg)
 }
+
+// What a statement touches, for a refusal that says why a label does not fit.
+fn describe_tables(t: SqlTables) -> String =
+  if len(t.written) > 0 && len(t.read) > 0 {
+    "`" ++ join_with(t.written, "`, `") ++ "` (written) and `" ++ join_with(t.read, "`, `")
+      ++ "` (read)"
+  } else if len(t.written) > 0 { "`" ++ join_with(t.written, "`, `") ++ "` (written)" }
+  else if len(t.read) > 0 { "`" ++ join_with(t.read, "`, `") ++ "` (read)" }
+  else { "no table" }
 
 fn run_checked(
   session: pg::Session,
@@ -4846,9 +4861,10 @@ fn statement_on(
   ps: List<Param>,
   rows: Bool,
   reads_only: Bool,
+  label: String,
 ) -> { answer: Answer, pool: Pool } / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
   match pool.open {
-    Some(open) -> match run_statement(open.session, s, ps, rows, reads_only, cfg) {
+    Some(open) -> match run_statement(open.session, s, ps, rows, reads_only, label, cfg) {
       Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
       Ok(ran) -> {
         let held = { ..open, session: ran.session };
@@ -4857,7 +4873,7 @@ fn statement_on(
     },
     None -> match checkout(cfg, size, pool, nonce) {
       Err(e) -> { answer: Failed(e), pool: pool },
-      Ok(taken) -> match run_statement(taken.session, s, ps, rows, reads_only, cfg) {
+      Ok(taken) -> match run_statement(taken.session, s, ps, rows, reads_only, label, cfg) {
         Err(e) -> {
           pg::finish[link](taken.session, cfg.client);
           {
@@ -4966,18 +4982,18 @@ pub fn serve<a | e>(
     handle {
       body()
     } with {
-      db.query[*](s, ps) -> {
-        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true, true);
+      db.query[*t](s, ps) -> {
+        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true, true, t);
         cell_set(pool, ran.pool);
         ran.answer
       },
-      db.execute[*](s, ps) -> {
-        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, false, false);
+      db.execute[*t](s, ps) -> {
+        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, false, false, t);
         cell_set(pool, ran.pool);
         ran.answer
       },
-      db.returning[*](s, ps) -> {
-        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true, false);
+      db.returning[*t](s, ps) -> {
+        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true, false, t);
         cell_set(pool, ran.pool);
         ran.answer
       },
