@@ -137,3 +137,55 @@ fn a_stale_edit_site_is_an_error_rather_than_a_silent_no_op() {
         "the stale site must say so, not slip by: {why}"
     );
 }
+
+/// The in-process half: what a continuation resumption costs, measured by driving the machine the
+/// corpus program itself holds. The property is that each resumption does work — the fixture is the
+/// same computation resumed a varying number of times, so the steps have to climb — and the points
+/// are the counts 0, 1, 2 and 4.
+#[test]
+fn the_resumption_curve_climbs_with_the_number_of_resumptions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("corpus");
+    corpus_at(&root);
+
+    let report = bench(&root);
+    let measure = &report["measure"];
+    assert_eq!(
+        measure["ok"].as_bool(),
+        Some(true),
+        "the measurement did not run: {measure:#}"
+    );
+    let points = measure["resumptions"]["points"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the resumption curve is not a list: {measure:#}"));
+    assert_eq!(
+        points.iter().map(|p| p["n"].as_i64()).collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2), Some(4)],
+        "{measure:#}"
+    );
+    let steps: Vec<i64> = points
+        .iter()
+        .map(|p| p["steps"].as_i64().unwrap_or(0))
+        .collect();
+    assert!(
+        steps.windows(2).all(|w| w[0] < w[1]),
+        "more resumptions must do more work: {steps:?}"
+    );
+    // The first point resumes nothing, so its marginal is the zero it was given.
+    assert_eq!(points[0]["marginal_steps"].as_i64(), Some(0), "{measure:#}");
+    // And every later point's marginal is positive: each resumption costs something.
+    assert!(
+        points[1..]
+            .iter()
+            .all(|p| p["marginal_steps"].as_i64().unwrap_or(0) > 0),
+        "a resumption that costs nothing is a resumption that did not happen: {measure:#}"
+    );
+    // Throughput is one call to a fixed-work definition, so it reports a step count too.
+    assert!(
+        measure["throughput"]["points"][0]["steps"]
+            .as_i64()
+            .unwrap_or(0)
+            > 0,
+        "{measure:#}"
+    );
+}

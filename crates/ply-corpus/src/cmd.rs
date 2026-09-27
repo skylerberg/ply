@@ -141,6 +141,16 @@ pub fn run_ply_subcommand(entry: &str, args: Vec<Value>, cwd: &Path, ply: &Path)
     for (op, handler) in ply_launcher::env::registrations(env!("CARGO_PKG_VERSION")) {
         registry.register(op, handler);
     }
+    // The corpus measures the interpreter, which means calling it in-process: its own entries are
+    // privileged, so they are lent the machine family the way the CLI lends it to `run`. The
+    // module is named as *this* program declares it — the corpus imports `cli.machine`, so its
+    // `Value` constructors are `cli.machine.VInt` and the like — and every answer is built with
+    // that name, which is how a value crosses without a `Value` type being `Send`.
+    for (op, handler) in
+        ply_machine::registrations_for(ply_machine::drive::RunOptions::default(), "cli.machine")
+    {
+        registry.register(op, handler);
+    }
     let binding = registry.bind(&opened.front.check).map_err(|d| {
         anyhow!(
             "binding the host: {}",
