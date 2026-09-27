@@ -18,8 +18,11 @@ pub type Ty = | Var(Int) | Fn | Record(List<{ name: String, ty: Ty }>) | Con(Str
 // One case of a declared type: its name and its fields, in declaration order.
 pub type Variant = { name: String, fields: List<Ty> }
 
-// A declared type: the variants its constructors belong to.
-pub type Decl = { name: String, variants: List<Variant> }
+// A declared type: its parameters, and the variants its constructors belong to. The fields are
+// written in terms of the parameters, so `Con(name, args)` means the fields with `args` substituted
+// for them — a `Pair<Bool>` is four values, and the same declaration under `Pair<Int>` is not
+// finite at all.
+pub type Decl = { name: String, params: List<String>, variants: List<Variant> }
 
 // What a finite domain came to: each binder's type, how many values it holds, and the product. The
 // sizes are kept because a point is named by index, and only the sizes say what an index means.
@@ -30,7 +33,7 @@ pub type Domain = { types: List<Ty>, sizes: List<Int>, points: Int }
 pub fn bound() -> Int = 4096
 
 // How many values inhabit a type, or `None` when it is infinite, unknown, or past [`bound`].
-pub fn size(ty: Ty, decls: List<Decl>) -> Option<Int> = sized(ty, decls, [])
+pub fn size(ty: Ty, decls: List<Decl>) -> Option<Int> = sized(ty, decls, [], [])
 
 // The binders' domain, when every one of them is finite and the product is within [`bound`].
 pub fn finite(binders: List<Ty>, decls: List<Decl>) -> Option<Domain> =
@@ -78,11 +81,17 @@ fn sizes_within(binders: List<Ty>, decls: List<Decl>) -> Option<{ sizes: List<In
 
 // How many values inhabit a type, with the names whose variants are already being walked: a type
 // that mentions itself has no finite size even when it has a nullary case.
-fn sized(ty: Ty, decls: List<Decl>, open: List<String>) -> Option<Int> =
+fn sized(ty: Ty, decls: List<Decl>, open: List<String>, subst: List<Ty>) -> Option<Int> =
   match ty {
-    Var(_) -> None,
+    // A parameter the declaration being walked bound: the argument's own size, which may itself
+    // mention a parameter of the declaration that was applied.
+    Var(index) -> match list_at(subst, index) {
+      Some(argument) -> sized(argument, decls, open, subst),
+      None -> None,
+    },
     Fn -> None,
-    Record(fields) -> product_of(map(fields, |f: { name: String, ty: Ty }| f.ty), decls, open),
+    Record(fields) ->
+      product_of(map(fields, |f: { name: String, ty: Ty }| f.ty), decls, open, subst),
     Con(name, args) -> {
       if name == "Unit" { Some(1) }
       else if name == "Bool" { Some(2) }
@@ -93,7 +102,7 @@ fn sized(ty: Ty, decls: List<Decl>, open: List<String>) -> Option<Int> =
       else if contains_text(open, name) { None } else {
         match find_decl(decls, name) {
           None -> None,
-          Some(decl) -> sum_of_variants(decl, decls, push(open, name)),
+          Some(decl) -> sum_of_variants(decl, decls, push(open, name), args),
         }
       }
     },
@@ -117,11 +126,16 @@ fn width_of(name: String) -> Int =
 fn two_to(bits: Int) -> Int = fold(range(0, bits), 1, |acc: Int, _i: Int| acc * 2)
 
 // Every case of one declared type, summed: a type with no variants has no values at all.
-fn sum_of_variants(decl: Decl, decls: List<Decl>, open: List<String>) -> Option<Int> =
+fn sum_of_variants(
+  decl: Decl,
+  decls: List<Decl>,
+  open: List<String>,
+  args: List<Ty>,
+) -> Option<Int> =
   fold(decl.variants, Some(0), |acc: Option<Int>, variant: Variant|
     match acc {
       None -> None,
-      Some(total) -> match product_of(variant.fields, decls, open) {
+      Some(total) -> match product_of(variant.fields, decls, open, args) {
         None -> None,
         Some(n) -> {
           let next = total + n;
@@ -131,11 +145,16 @@ fn sum_of_variants(decl: Decl, decls: List<Decl>, open: List<String>) -> Option<
     })
 
 // A tuple's size is the product of its fields', refused as soon as it is past the bound.
-fn product_of(types: List<Ty>, decls: List<Decl>, open: List<String>) -> Option<Int> =
+fn product_of(
+  types: List<Ty>,
+  decls: List<Decl>,
+  open: List<String>,
+  subst: List<Ty>,
+) -> Option<Int> =
   fold(types, Some(1), |acc: Option<Int>, ty: Ty|
     match acc {
       None -> None,
-      Some(total) -> match sized(ty, decls, open) {
+      Some(total) -> match sized(ty, decls, open, subst) {
         None -> None,
         Some(n) -> {
           let next = total * n;
@@ -161,6 +180,7 @@ fn kinds() -> List<Decl> =
   [
     {
       name: "Kind",
+      params: [],
       variants: [
         { name: "Asset", fields: [] },
         { name: "Liability", fields: [] },
@@ -173,6 +193,7 @@ fn nat() -> List<Decl> =
   [
     {
       name: "Nat",
+      params: [],
       variants: [{ name: "Zero", fields: [] }, { name: "Succ", fields: [Con("Nat", [])] }],
     },
   ]
@@ -223,6 +244,7 @@ test "a case with fields multiplies them into its type's size" {
   let declared = appended(kinds(), [
     {
       name: "Wrap",
+      params: [],
       variants: [
         { name: "Nothing", fields: [] },
         { name: "Held", fields: [Con("Kind", []), Con("Bool", [])] },
@@ -242,7 +264,7 @@ test "a product beyond the bound is refused rather than walked" {
 }
 
 test "a domain with a binder no value inhabits is a vacuity, not a proof" {
-  let declared = [{ name: "Empty", variants: [] }];
+  let declared = [{ name: "Empty", params: [], variants: [] }];
   assert_eq(finite([con("Empty")], declared), None)
 }
 
@@ -273,4 +295,33 @@ test "enumeration covers the domain once each in a fixed order" {
       assert_eq(len(tuples), domain.points)
     },
   }
+}
+
+test "a parameter is the argument the type was applied to" {
+  let declared = appended(kinds(), [
+    { name: "Pair", params: ["a"], variants: [{ name: "Both", fields: [Var(0), Var(0)] }] },
+  ]);
+  assert_eq(size(Con("Pair", [con("Bool")]), declared), Some(4));
+  assert_eq(size(Con("Pair", [con("Kind")]), declared), Some(9));
+  // The same declaration under a type with no finite size is not a finite type.
+  assert_eq(size(Con("Pair", [con("Int")]), declared), None);
+  // A type already being walked is refused whether it nests or recurses: `Pair<Pair<Bool>>` is
+  // finite, and reading it as unbounded is the conservative answer the reference gives too.
+  assert_eq(size(Con("Pair", [Con("Pair", [con("Bool")])]), declared), None);
+  // An argument the declaration never binds is unknown rather than dropped.
+  assert_eq(size(Con("Pair", []), declared), None)
+}
+
+test "a recursive type stays infinite under an argument, not only on its own" {
+  let declared = [
+    {
+      name: "Nest",
+      params: ["a"],
+      variants: [
+        { name: "Leaf", fields: [Var(0)] },
+        { name: "More", fields: [Con("Nest", [Var(0)])] },
+      ],
+    },
+  ];
+  assert_eq(size(Con("Nest", [con("Bool")]), declared), None)
 }
