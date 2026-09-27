@@ -41,7 +41,7 @@ impl Run {
             .obligations
             .into_iter()
             .map(|o| {
-                let discharge = prover.discharge_with(&o, plan);
+                let discharge = prover.discharge_with(&o, plan, None);
                 (o, discharge)
             })
             .collect();
@@ -309,7 +309,7 @@ fn nothing_proved_here_is_refutable_by_sampling() {
             ));
         for obligation in &collected.obligations {
             if prover
-                .discharge_with(obligation, &ProvePlan::default())
+                .discharge_with(obligation, &ProvePlan::default(), None)
                 .tier()
                 != Some(Tier::Proved)
             {
@@ -535,7 +535,7 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
         .obligations
         .into_iter()
         .map(|o| {
-            let d = prover.discharge_with(&o, &ProvePlan::default());
+            let d = prover.discharge_with(&o, &ProvePlan::default(), None);
             (o, d)
         })
         .collect();
@@ -695,7 +695,7 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
     let mut lies = Vec::new();
     for obligation in &collected.obligations {
         if prover
-            .discharge_with(obligation, &ProvePlan::default())
+            .discharge_with(obligation, &ProvePlan::default(), None)
             .tier()
             != Some(Tier::Proved)
         {

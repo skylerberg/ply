@@ -166,7 +166,12 @@ impl Scripted {
 }
 
 impl Discharger for Scripted {
-    fn discharge(&self, obligation: &Obligation, _plan: &ProvePlan) -> Discharge {
+    fn discharge(
+        &self,
+        obligation: &Obligation,
+        _plan: &ProvePlan,
+        _domain: Option<&ply_test::obligation::Domain>,
+    ) -> Discharge {
         self.asked.lock().unwrap().push(obligation.key);
         match self.answers.get(&obligation.key) {
             Some(Discharge::Held(e)) => Discharge::Held(e.clone()),
