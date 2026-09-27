@@ -1079,18 +1079,18 @@ pub struct Material {
     pub der: CertificateDer<'static>,
 }
 
-/// Generated per run rather than checked in.
+/// Generated per run rather than checked in, by the same facility a program would use.
 pub fn credential(dir: &Path) -> Result<Material> {
-    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .context("generating a self-signed certificate")?;
+    let issued =
+        ply_host::certgen::issue(&["localhost".to_string()]).map_err(|why| anyhow::anyhow!(why))?;
     let certificate = dir.join("desk.pem");
     let key = dir.join("desk.key");
-    std::fs::write(&certificate, issued.cert.pem())?;
-    std::fs::write(&key, issued.signing_key.serialize_pem())?;
+    std::fs::write(&certificate, &issued.certificate)?;
+    std::fs::write(&key, &issued.key)?;
     Ok(Material {
         certificate,
         key,
-        der: issued.cert.der().clone(),
+        der: CertificateDer::from(issued.der),
     })
 }
 

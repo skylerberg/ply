@@ -125,6 +125,8 @@ pub enum Builtin {
     /// Takes the contents out for the call, so an append inside the function owns them.
     CellUpdate,
     Panic,
+    /// The identity a benchmark pins a measured value with: opaque, so it is not optimized away.
+    Observe,
     /// The only introduction of a [`Value::Secret`].
     SecretOfString,
     SecretVerify,
@@ -220,6 +222,7 @@ impl Builtin {
             "cell_set" => Builtin::CellSet,
             "cell_update" => Builtin::CellUpdate,
             "panic" => Builtin::Panic,
+            "observe" => Builtin::Observe,
             "secret_of_string" => Builtin::SecretOfString,
             "secret_verify" => Builtin::SecretVerify,
             "secret_is_empty" => Builtin::SecretIsEmpty,
@@ -325,6 +328,7 @@ impl Builtin {
             Builtin::CellSet => "cell_set",
             Builtin::CellUpdate => "cell_update",
             Builtin::Panic => "panic",
+            Builtin::Observe => "observe",
             Builtin::SecretOfString => "secret_of_string",
             Builtin::SecretVerify => "secret_verify",
             Builtin::SecretIsEmpty => "secret_is_empty",
@@ -340,6 +344,7 @@ impl Builtin {
             | Builtin::ByteOfInt
             | Builtin::CellGet
             | Builtin::Panic
+            | Builtin::Observe
             | Builtin::BytesLen
             | Builtin::BytesOfString
             | Builtin::BytesIsUtf8
@@ -566,6 +571,7 @@ impl Builtin {
             Builtin::CellSet,
             Builtin::CellUpdate,
             Builtin::Panic,
+            Builtin::Observe,
             Builtin::SecretOfString,
             Builtin::SecretVerify,
             Builtin::SecretIsEmpty,
@@ -1257,6 +1263,12 @@ fn call_with(
         Builtin::FloatOfBits => {
             let n = args[0].as_int(span, "`float_of_bits`")?;
             Ok(Step::Done(Value::Float(f64::from_bits(n as u64))))
+        }
+
+        Builtin::Observe => {
+            // The identity; its work is the emitter's, which makes the call opaque so the C
+            // compiler cannot drop a pure computation whose value is only observed.
+            Ok(Step::Done(args[0].clone()))
         }
 
         Builtin::Panic => {

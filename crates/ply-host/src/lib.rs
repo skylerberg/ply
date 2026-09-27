@@ -3,6 +3,7 @@
 // `Value` holds `Rc`, so the `Arc`s the db driver builds around values can never be `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
+pub mod certgen;
 pub mod config;
 pub mod db;
 pub mod fs;

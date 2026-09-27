@@ -2430,3 +2430,50 @@ fn run_accepts_a_seed_and_takes_only_that_interleaving() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// A run generates its own certificate: nothing checked in is trusted by anything.
+const ISSUES_A_CERTIFICATE: &str = "\
+import std.certgen (certgen)
+
+fn main() -> Int / {certgen.issue} = {
+  let issued = certgen.issue();
+  assert(string_starts_with(issued.certificate, \"-----BEGIN CERTIFICATE-----\"));
+  assert(string_starts_with(issued.key, \"-----BEGIN PRIVATE KEY-----\"));
+  assert(string_starts_with(issued.fingerprint, \"sha256:\"));
+  bytes_len(issued.der)
+}
+";
+
+#[test]
+fn a_program_under_host_generates_a_certificate_for_itself() {
+    let dir = project(ISSUES_A_CERTIFICATE);
+    let out = ply(dir.path()).args(["run", "--host"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let text = stdout_of(&out);
+    let der: i64 = text
+        .lines()
+        .last()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
+    assert!(der > 0, "the certificate has no DER: {text}");
+}
+
+/// `--count-allocs` is the launcher's own flag: the program never sees it, and the run writes
+/// what the entry allocated.
+#[test]
+fn count_allocations_writes_what_the_entry_allocated() {
+    let dir = project(GREEN);
+    let out_path = dir.path().join("counted.json");
+    let flag = format!("--count-allocs={}", out_path.display());
+    let out = ply(dir.path()).args([&flag, "run"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let text = std::fs::read_to_string(&out_path).expect("the count is written");
+    let counted: Value = serde_json::from_str(&text).expect("the count is JSON");
+    assert!(
+        counted["allocations"].as_u64().unwrap_or(0) > 0,
+        "nothing was counted: {text}"
+    );
+    assert!(counted["bytes"].as_u64().unwrap_or(0) > 0, "{text}");
+}

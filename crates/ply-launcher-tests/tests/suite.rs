@@ -1,6 +1,11 @@
 //! The environment a launched program reads, end to end: a program performs `env.var`,
 //! `env.terminal` and `env.binary_version` and the launcher answers.
 
+/// The counting allocator is a whole-binary decision, so this test binary installs it too, which
+/// is what makes the window tests meaningful here.
+#[global_allocator]
+static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
+
 use ply_eval::host::HostRegistry;
 use ply_eval::{Machine, Provider};
 use ply_span::{SourceId, Span};
@@ -62,4 +67,69 @@ fn a_program_reads_its_environment() {
     let answer = ask();
     assert_eq!(answer, "\"here|absent|piped|9.9.9-test\"");
     unsafe { std::env::remove_var("PLY_LAUNCHER_TEST_MARK") };
+}
+
+// --- `--count-allocs` ---------------------------------------------------------
+
+/// The launcher's own flag, taken out of the line wherever it is written; the program parses
+/// what is left and never sees it.
+#[test]
+fn the_count_allocations_flag_is_read_from_the_line_and_taken_out() {
+    for line in [
+        vec!["--count-allocs=out.json", "run", "p.ply"],
+        vec!["run", "--count-allocs=out.json", "p.ply"],
+        vec!["run", "p.ply", "--count-allocs=out.json"],
+    ] {
+        let mut argv: Vec<String> = line.iter().map(|s| s.to_string()).collect();
+        let path = ply_launcher::count::flag(&mut argv).unwrap().unwrap();
+        assert_eq!(path, std::path::PathBuf::from("out.json"));
+        assert_eq!(
+            argv,
+            vec!["run".to_string(), "p.ply".to_string()],
+            "the flag was left in the line"
+        );
+    }
+}
+
+#[test]
+fn the_count_allocations_flag_may_name_its_path_with_a_space() {
+    let mut argv: Vec<String> = ["run", "--count-allocs", "out.json", "p.ply"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let path = ply_launcher::count::flag(&mut argv).unwrap().unwrap();
+    assert_eq!(path, std::path::PathBuf::from("out.json"));
+    assert_eq!(argv, vec!["run".to_string(), "p.ply".to_string()]);
+}
+
+#[test]
+fn the_count_allocations_flag_requires_a_path() {
+    let mut argv: Vec<String> = ["run", "--count-allocs"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert!(ply_launcher::count::flag(&mut argv).is_err());
+}
+
+#[test]
+fn a_line_without_the_flag_keeps_its_words() {
+    let mut argv: Vec<String> = ["run", "p.ply"].iter().map(|s| s.to_string()).collect();
+    assert!(ply_launcher::count::flag(&mut argv).unwrap().is_none());
+    assert_eq!(argv, vec!["run".to_string(), "p.ply".to_string()]);
+}
+
+#[test]
+fn a_window_counts_what_it_ran_and_nothing_else() {
+    let some = ply_launcher::count::window(|| (0..64u64).map(|n| n * 2).collect::<Vec<u64>>()).1;
+    let (answer, counted) = ply_launcher::count::window(|| {
+        let v: Vec<u64> = (0..64u64).map(|n| n * 2).collect();
+        v.iter().sum::<u64>()
+    });
+    assert_eq!(answer, (0..64u64).map(|n| n * 2).sum::<u64>());
+    assert!(counted.allocations > 0, "a vector allocates");
+    assert!(counted.bytes >= 64 * 8);
+    assert!(
+        counted.allocations <= some.allocations,
+        "a window that ended must not count the next window's work"
+    );
 }
