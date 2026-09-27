@@ -35,6 +35,9 @@ pub enum Resource {
     Named(Symbol),
     Var(LabelVar),
     Singleton,
+    /// Every label: what an atom written `op[*]` stands for, so a row can say which atoms it
+    /// consumes without naming a label.
+    Every,
 }
 
 impl fmt::Display for Resource {
@@ -43,6 +46,7 @@ impl fmt::Display for Resource {
             Resource::Named(s) => write!(f, "[{s}]"),
             Resource::Var(v) => write!(f, "[{}]", label_var_name(*v)),
             Resource::Singleton => Ok(()),
+            Resource::Every => write!(f, "[*]"),
         }
     }
 }

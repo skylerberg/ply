@@ -17,7 +17,7 @@ import std.db (db, serve, server, stmt, transaction, PInt, PText, CInt, CText, A
 
 pub fn run(host: String, port: Int) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  serve(server(host, port, "ply", "ply", None), 4, "a-test-nonce", || {
+  serve(server(host, port, "ply", "ply", Some("pencil")), 4, "a-test-nonce", || {
     match db.execute[items](stmt("create table if not exists items (id int4 primary key, name text)"), []) {
       Failed(e) -> Err(e.detail),
       _ -> match db.returning[items](
@@ -56,7 +56,7 @@ fn names(rows: List<Row>) -> String =
 // A transaction commits what it did, through `begin` and `commit` on the same connection.
 pub fn commit_one(host: String, port: Int) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  serve(server(host, port, "ply", "ply", None), 4, "a-test-nonce", || {
+  serve(server(host, port, "ply", "ply", Some("pencil")), 4, "a-test-nonce", || {
     match transaction(ReadCommitted, ReadWrite, || {
       db.execute[items](stmt("insert into items (id, name) values ($1, $2)"), [PInt(8), PText("eight")])
     }) {

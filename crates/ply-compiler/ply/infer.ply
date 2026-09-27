@@ -1491,40 +1491,78 @@ fn conv_row(cx: Cx, row: RowExpr) -> { cx: Cx, r: Row } = {
 fn refused(cx: Cx, s: Span) -> Bool =
   fold(cx.refused_atoms, false, |acc: Bool, x: Span| acc || x == s)
 
+// `[*]` on an operation declared without a label names nothing: the atom is refused where it is
+// written, and dropped so the row does not carry a label the operation has no room for.
+fn refuse_every(cx: Cx, span: Span, eff: Bytes, op: Bytes, at: Loc) -> Cx = {
+  let reported: Cx = err2(
+    cx,
+    b"E0304",
+    span,
+    bytes_concat_all([b"`", eff, b".", op, b"` is not resource-parameterized"]),
+    b"`[*]` names no label",
+    at,
+    b"declared without `[r]`",
+    [],
+  );
+  { ..reported, refused_atoms: push(cx.refused_atoms, span) }
+}
+
 fn conv_atom(cx: Cx, a: AtomExpr) -> { cx: Cx, atom: Option<Atom> } =
   if refused(cx, a.span) { { cx: cx, atom: None } } else {
     let e: WithName = effect_name(cx, a.eff);
     match e.name {
       None -> { cx: { ..e.cx, refused_atoms: push(e.cx.refused_atoms, a.span) }, atom: None },
       Some(eff) -> {
-        let resource = match a.resource {
-          Some(r) -> match map_get(cx.label_params, r.name) {
-            Some(v) -> RVar(v),
-            None -> RNamed(r.name),
-          },
-          None -> RSingleton,
+        // `[*]` is every label, which no label variable can stand for.
+        let resource = if a.every { RAny } else {
+          match a.resource {
+            Some(r) -> match map_get(cx.label_params, r.name) {
+              Some(v) -> RVar(v),
+              None -> RNamed(r.name),
+            },
+            None -> RSingleton,
+          }
         };
         let info = effect_of(e.cx, eff);
-        // An operation atom takes the declared operation's mode; the parser wrote a placeholder.
-        let atom: Option<Atom> = match a.op {
+        // `[*]` on an operation declared without a label names nothing, so the atom is refused
+        // where it is written and dropped: the row must not carry a label it has no room for.
+        let label_less: { cx: Cx, refused: Bool } = match a.op {
           Some(op) -> match info {
             Some(i) -> match op_named(i, op.name) {
-              Some(o) -> Some({ effect: eff, resource: resource, mode: o.mode, op: Some(o.name) }),
+              Some(o) -> if a.every && !o.resource_param {
+                { cx: refuse_every(e.cx, a.span, eff, o.name, o.at), refused: true }
+              } else { { cx: e.cx, refused: false } },
+              None -> { cx: e.cx, refused: false },
+            },
+            None -> { cx: e.cx, refused: false },
+          },
+          None -> { cx: e.cx, refused: false },
+        };
+        let named_cx: Cx = label_less.cx;
+        // An operation atom takes the declared operation's mode; the parser wrote a placeholder.
+        let atom: Option<Atom> = if label_less.refused { None } else {
+          match a.op {
+            Some(op) -> match info {
+              Some(i) -> match op_named(i, op.name) {
+                Some(o) ->
+                  Some({ effect: eff, resource: resource, mode: o.mode, op: Some(o.name) }),
+                None -> None,
+              },
               None -> None,
             },
-            None -> None,
-          },
-          None -> {
-            let declares_mode = match info {
-              Some(i) -> fold(i.ops, false, |acc: Bool, o: OpInfo| acc || mode_eq(o.mode, a.mode)),
-              None -> true,
-            };
-            if declares_mode { Some({ effect: eff, resource: resource, mode: a.mode, op: None }) }
-            else { None }
-          },
+            None -> {
+              let declares_mode = match info {
+                Some(i) ->
+                  fold(i.ops, false, |acc: Bool, o: OpInfo| acc || mode_eq(o.mode, a.mode)),
+                None -> true,
+              };
+              if declares_mode { Some({ effect: eff, resource: resource, mode: a.mode, op: None }) }
+              else { None }
+            },
+          }
         };
         match atom {
-          Some(_) -> { cx: e.cx, atom: atom },
+          Some(_) -> { cx: named_cx, atom: atom },
           None -> {
             let known = match info {
               Some(i) -> match a.op {
@@ -1553,7 +1591,7 @@ fn conv_atom(cx: Cx, a: AtomExpr) -> { cx: Cx, atom: Option<Atom> } =
                   bytes_concat_all([b"no `", mode_key(a.mode), b"` operation to perform"]),
                 ),
             };
-            let reported: Cx = err1(e.cx, b"E0104", a.span, message, label, help);
+            let reported: Cx = err1(named_cx, b"E0104", a.span, message, label, help);
             { cx: { ..reported, refused_atoms: push(reported.refused_atoms, a.span) }, atom: None }
           },
         }
@@ -7503,6 +7541,16 @@ test "`[*]` on an operation that takes no resource is refused" {
     {
       name: b"m",
       src: b"effect log { write note(line: String) -> Unit }\nfn go() -> Unit = handle { log.note(\"x\") } with { log.note[*](line) -> () }",
+    },
+  ]);
+  assert(string_contains(dump, "E0304"))
+}
+
+test "`[*]` in a row on an operation that takes no resource is refused" {
+  let dump = check_dump([
+    {
+      name: b"m",
+      src: b"effect log { write note(line: String) -> Unit }\nfn go() -> Unit / {log.note[*]} = log.note(\"x\")",
     },
   ]);
   assert(string_contains(dump, "E0304"))
