@@ -1449,6 +1449,61 @@ derives `ord`, ordered major, then minor, then patch. `prefix_of` and
 `entry_of` answer the defaults (`name` and `main`), and `render_version`
 writes a version dotted.
 
+### 13.16 `std.pg` — the postgres wire protocol
+
+```ply
+pub fn startup(user: String, database: String) -> Bytes
+pub fn query(sql: String) -> Bytes
+pub fn parse(statement: String, sql: String, param_types: List<Int>) -> Bytes
+pub fn bind(portal: String, statement: String, params: List<Option<String>>) -> Bytes
+pub fn describe(statement: Bool, name: String) -> Bytes
+pub fn execute(portal: String, max_rows: Int) -> Bytes
+pub fn sync() -> Bytes
+pub fn terminate() -> Bytes
+pub fn read(buf: Bytes) -> Frames
+
+pub fn connect<[l]>(
+  host: String, port: Int, user: String, database: String,
+  password: Option<String>, client: Client,
+) -> Result<Session, ClientError> / {net.connect[l], net.send[l], net.recv[l], net.close[l]}
+pub fn simple_query<[l]>(s: Session, sql: String, client: Client)
+  -> Result<Reply, ClientError> / {net.send[l], net.recv[l]}
+pub fn extended_query<[l]>(s: Session, sql: String, params: List<Option<String>>, client: Client)
+  -> Result<Reply, ClientError> / {net.send[l], net.recv[l]}
+pub fn finish<[l]>(s: Session, client: Client) -> Unit / {net.send[l], net.close[l]}
+```
+
+The protocol as framing and nothing else. Every front-end message after start-up
+is a kind byte, an `Int32` length that counts itself, and a body; `startup` is
+the exception, its length first, because the server has agreed no protocol
+version yet. `ssl_request` and `cancel_request` are the two other unframed
+messages. Values travel as text in both directions, so a parameter is the text
+the server would have printed and a column is the text it printed: this layer
+never decodes a value.
+
+`read` takes what a socket returned and answers the whole messages in it plus
+the bytes that are not yet one, so a short read is not an error. The back-end
+readers are `auth_code` and `auth_body`, `ready_status`, `parameter_status`,
+`backend_key`, `row_description`, `data_row`, `command_tag`, `parameter_types`
+and `diagnostic_fields` — the last shared by `ErrorResponse` and
+`NoticeResponse`, with `field_of` for one field such as the SQLSTATE under `C`.
+A kind this module does not name is kept as `Other(byte)` rather than dropped.
+
+`connect` opens the socket and gets to where the server will answer a query:
+start-up, whatever authentication it asks for, its parameters, and
+`ReadyForQuery`; the parameters are left on the session and `setting` reads one.
+Authentication is answered for `AuthenticationOk` and for a clear-text password;
+md5 and SASL are refused with a message naming what was asked for.
+`simple_query` runs one statement, `extended_query` runs one with parameters
+bound as text, and both answer the columns, the rows and the command tag; NULL is
+`None` and every column is `Some` bytes. A statement the server refuses is
+`Rejected(session, server)`, which carries the connection back because it is
+still usable — the SQLSTATE is what a program branches on. `finish` sends
+`Terminate` and closes.
+
+A connection is `std.net`'s: `connect`, `send_all`, `drain`. Which statements to
+send, what a transaction is and when to retry are `std.db`'s.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
