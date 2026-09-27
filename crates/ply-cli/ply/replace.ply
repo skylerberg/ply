@@ -3,17 +3,20 @@
 // is a file the Rust side was pointed at, or this process's own stdin.
 
 import args (Flags, no_flags, style_of)
+import paths (Resolved, address, here, shown)
 import diagnostic (Place, all_to_json, all_to_text, errors_of)
 import program (Program, load_program, outside)
 import report (Answer, schema_version, ok_code, compile_error, refused)
 import show (Shown, locate)
 import sources (shelf)
 import style (Style)
-import compiler.front (Whole, Pulled, Refused, Analysed, analyse_pulling_std)
+import compiler.front (Whole, Pulled, Refused, Analysed, analyse_pulling_std_with)
 import compiler.fmt (replace_item)
 import compiler.hash (HashOutput)
+import compiler.pkg (Pkgs)
 import compiler.resolve (Source, Diag, diag1)
 import std.fs (fs)
+import std.path (join)
 import std.json (Json, Null, Str, Bool, Number, object)
 
 // The item to put in place of the one named, as the Rust side reads it: `--with FILE`, else
@@ -151,7 +154,15 @@ fn still_the_same(
   shown: Shown,
   text: Bytes,
 ) -> Option<Diag> / {fs.list_dir[shelf], fs.read_file[shelf]} = {
-  let out: Pulled = analyse_pulling_std(spliced(p, shown.at.module, text), shelf());
+  // The same package closure the load used, so a project with dependencies re-checks the way it
+  // first checked: without it a dependency's bare imports have nothing to resolve against.
+  let out: Pulled = analyse_pulling_std_with(
+    spliced(p, shown.at.module, text),
+    shelf(),
+    [],
+    [],
+    p.pkgs,
+  );
   match out.out {
     Refused(ds) ->
       Some(
@@ -172,9 +183,12 @@ fn still_the_same(
 fn said(flags: Flags, shown: Option<Shown>, changed: Bool) -> List<String> =
   match shown {
     None -> [],
-    Some(x) -> if !changed { [x.name ++ " in " ++ x.path ++ " is unchanged"] }
-    else if flags.check { ["would replace " ++ x.path] }
-    else { ["replaced " ++ x.name ++ " in " ++ x.path] },
+    Some(x) -> {
+      let path = shown_path(root_of(flags), x.path);
+      if !changed { [x.name ++ " in " ++ path ++ " is unchanged"] }
+      else if flags.check { ["would replace " ++ path] }
+      else { ["replaced " ++ x.name ++ " in " ++ path] }
+    },
   }
 
 fn name_json(shown: Option<Shown>) -> Json = match shown { Some(x) -> Str(x.name), None -> Null }
@@ -211,18 +225,40 @@ pub fn answered(
 fn stopped(s: Style, flags: Flags, p: Program, shown: Shown, d: Diag) -> Answer =
   answered(s, flags, Some(shown), false, [d], p.places)
 
+// The root the run was pointed at. The loader already defaulted an empty path list to the working
+// directory, so a run that named none is the one it read.
+fn root_of(flags: Flags) -> Resolved =
+  match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
+
+// Where a file of the loaded program lives as the label spells it: the load names its files
+// relative to the root, and the root is not always the working directory.
+fn address_of(r: Resolved, inside: String) -> String = join(address(r), inside)
+
+// The path a report prints, the way the other commands print the files they touched.
+fn shown_path(r: Resolved, inside: String) -> String = shown(r, address_of(r, inside))
+
+fn write_label(
+  r: Resolved,
+  path: String,
+  text: Bytes,
+) -> Bool / {fs.write_file[cwd], fs.write_file[abs]} =
+  if r.label == "cwd" { fs.write_file[cwd](path, text) } else { fs.write_file[abs](path, text) }
+
 fn written(
   s: Style,
   flags: Flags,
   p: Program,
   shown: Shown,
   text: Bytes,
-) -> Answer / {fs.write_file[cwd]} =
-  if flags.check { answered(s, flags, Some(shown), true, [], p.places) } else if fs.write_file[cwd](
-      shown.path,
+) -> Answer / {fs.write_file[cwd], fs.write_file[abs]} = {
+  let path = address_of(root_of(flags), shown.path);
+  if flags.check { answered(s, flags, Some(shown), true, [], p.places) } else if write_label(
+      root_of(flags),
+      path,
       text,
     ) { answered(s, flags, Some(shown), true, [], p.places) }
-  else { stopped(s, flags, p, shown, unwritable(shown.path)) }
+  else { stopped(s, flags, p, shown, unwritable(shown_path(root_of(flags), shown.path))) }
+}
 
 fn replaced(
   s: Style,
@@ -231,7 +267,7 @@ fn replaced(
   before: HashOutput,
   shown: Shown,
   item: String,
-) -> Answer / {fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd]} =
+) -> Answer / {fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} =
   match replace_item(shown.text, bytes_of_string(shown.simple), bytes_of_string(item)) {
     Err(why) -> stopped(s, flags, p, shown, not_one_item(shown, string_of_bytes_lossy(why))),
     Ok(text) -> if text == shown.text { answered(s, flags, Some(shown), false, [], p.places) } else {
@@ -248,7 +284,7 @@ fn rewritten(
   p: Program,
   w: Whole,
   shown: Shown,
-) -> Answer / {fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], edit.item[replace]} =
+) -> Answer / {fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs], edit.item[replace]} =
   if shown.at.module >= len(p.files) {
     stopped(
       s,
@@ -269,7 +305,7 @@ fn rewritten(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.list_dir[shelf], fs.read_file[shelf], edit.item[replace]} = {
+) -> Answer / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], edit.item[replace]} = {
   let loaded: Program = load_program(flags.paths);
   let s = style_of(flags);
   match loaded.whole {
