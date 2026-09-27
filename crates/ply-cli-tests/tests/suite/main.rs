@@ -31,6 +31,7 @@ mod effect_sets;
 mod explain;
 mod failure_classification_audit;
 mod fmt;
+mod grants;
 mod harness;
 mod http_audit;
 mod http_endpoint;

@@ -55,20 +55,11 @@ fn main() {
     std::process::exit(code);
 }
 
-/// The ops any command may perform, each configured by the program itself.
+/// The ops any command may perform, each configured by the program itself: every family the
+/// policy names, lent to the `ply` program, which is this binary's own.
 fn lent_all() -> Vec<(
     ply_eval::host::HostOp,
     std::sync::Arc<dyn ply_eval::host::HostHandler>,
 )> {
-    let mut lent = ply_machine::registrations();
-    lent.extend(
-        ply_machine::tester::Session::new(&ply_machine::tester::TestOptions::default()).lent(),
-    );
-    lent.extend(ply_machine::claims::lent());
-    lent.extend(ply_machine::builder::lent());
-    lent.extend(ply_machine::cache::lent());
-    lent.extend(ply_machine::bootstrap::lent());
-    lent.extend(ply_machine::hosts::lent());
-    lent.extend(ply_machine::edit::lent());
-    lent
+    ply_machine::policy::all()
 }
