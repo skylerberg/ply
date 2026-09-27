@@ -31,6 +31,7 @@ impl Signature {
 }
 
 /// Every definition either configuration knows, with its baseline (`before`) and current hash.
+#[derive(Clone)]
 pub struct Mixture {
     before: BTreeMap<DefKey, DefHash>,
     after: BTreeMap<DefKey, DefHash>,
@@ -186,6 +187,14 @@ struct Chosen {
 impl Hybrid for BodyHybrid<'_> {
     fn trial(&mut self, delta: &Delta, flipped: &[usize]) -> Trial {
         let wanted: BTreeSet<DefKey> = delta.flipped_keys(flipped).into_iter().collect();
+        self.trial_over(wanted)
+    }
+}
+
+impl BodyHybrid<'_> {
+    /// The same trial, from the keys themselves: whoever holds the delta does the flipping, so a
+    /// caller that decided which definitions to swap does not have to hand a `Delta` over.
+    pub fn trial_over(&mut self, wanted: BTreeSet<DefKey>) -> Trial {
         let chosen = match self.choose(&wanted) {
             Ok(chosen) => chosen,
             Err(why) => return Trial::unresolved(why),

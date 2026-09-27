@@ -464,6 +464,7 @@ test "the regression" { assert_eq(ask(1), expected()) }
         &after.port,
         &mut store,
         &ply_test::Options::default(),
+        true,
     );
 
     let bisection = &report.failures[0].attribution.bisection;
