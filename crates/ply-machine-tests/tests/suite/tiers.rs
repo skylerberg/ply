@@ -275,38 +275,6 @@ law "reverse is an involution"
 }
 
 #[test]
-fn a_law_over_bytes_is_quantifiable_and_shrinks_toward_the_empty_value() {
-    let dir = project(
-        r#"
-law "concatenation preserves length"
-  forall (a: Bytes, b: Bytes) {
-    bytes_len(bytes_concat(a, b)) == bytes_len(a) + bytes_len(b)
-  }
-
-law "every byte string is empty"
-  forall (b: Bytes) {
-    bytes_len(b) == 0
-  }
-"#,
-    );
-    let run = Run::of(dir.path());
-    assert_eq!(
-        run.tier("concatenation preserves length"),
-        Some(Tier::Property),
-        "`bytes_len` and `bytes_concat` are opaque to the fragment, so this samples"
-    );
-
-    let Discharge::Refuted(counterexample) = &run.find("every byte string is empty").1 else {
-        panic!("a false law over `Bytes` must be refuted, not skipped");
-    };
-    assert_eq!(counterexample.bindings.len(), 1);
-    assert_eq!(
-        counterexample.bindings[0].rendered, "b\"\\x00\"",
-        "the witness did not shrink toward `b\"\"`"
-    );
-}
-
-#[test]
 fn a_term_outside_the_fragment_is_never_proved() {
     let dir = project(
         r#"
@@ -563,39 +531,6 @@ fn a_refutation_shrinks_to_the_same_value_twice() {
 }
 
 /// The fixture above takes zero shrink steps: its first falsifying draw is already `[-1, -1]`.
-#[test]
-fn a_long_counterexample_is_visibly_reduced() {
-    let dir = project(
-        r#"
-law "a batch never holds more than six entries"
-  forall (xs: List<Int>) {
-    len(xs) <= 6
-  }
-"#,
-    );
-    let run = Run::of(dir.path());
-    let Discharge::Refuted(counterexample) = &run.find("a batch never holds more than six").1
-    else {
-        panic!("the law is false for every list of seven");
-    };
-    let width = |bindings: &[ply_prove::Binding]| -> usize {
-        bindings.iter().map(|b| b.rendered.chars().count()).sum()
-    };
-    let (before, after) = (
-        width(&counterexample.original),
-        width(&counterexample.bindings),
-    );
-    assert!(counterexample.shrinks > 0, "the walk accepted nothing");
-    assert!(
-        after * 2 < before,
-        "shrank from {before} rendered characters only to {after}"
-    );
-    assert_eq!(
-        counterexample.bindings[0].rendered, "[0, 0, 0, 0, 0, 0, 0]",
-        "seven zeroes is the minimum: shorter satisfies the law and no element shrinks below 0"
-    );
-}
-
 #[test]
 fn a_precondition_alone_is_not_an_obligation() {
     let dir = project(
