@@ -637,6 +637,24 @@ that names a label answers that label alone, and clauses are matched in order,
 so a clause naming a label belongs before a `[*]` one that would answer it.
 `[*]` on an operation declared without a label is `E0304`.
 
+`[*t]` answers the same set of labels and **binds** the one the call site named to `t`, which is
+in scope in the clause's body as a `String` — so a handler can check what it was asked rather
+than only answer it. That is what a database driver's table check is: it answers `db.query` on
+every table and refuses a statement that reaches one the call site did not label.
+
+```ply
+handle { load() } with {
+  db.query[*table](sql, params) -> match labelled(table, sql) {
+    Some(answer) -> answer,
+    None -> panic("this statement reaches a table the call site did not label"),
+  },
+}
+```
+
+The label bound is the one the *call site* used, not the name of a label parameter: a clause
+answering `relay[users]("k")` binds `"users"` even when the call site is inside
+`fn relay<[l]>(…)`. A clause may either name a label or bind one, never both.
+
 A **row** may name `[*]` too, and that is what lets a library handle an effect for code it is
 given: `fn sink<a | e>(body: () -> a / {log.note[*] | e}) -> a / {wire.put[c] | e}` says the body
 may perform `log.note` on any label and `sink` answers it. A row written with `[*]` is a licence
