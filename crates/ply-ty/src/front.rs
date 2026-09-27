@@ -129,6 +129,8 @@ pub struct Front {
     /// Every root the emitter offers, with the arity its body is emitted at and whether its
     /// parameters and answer are all `Int` or `Bool`.
     pub emitter_roots: Vec<EmitterRoot>,
+    /// The emitter's constructors, in the order the emitted C names tags by.
+    pub emitter_ctors: Vec<(Symbol, usize)>,
     /// The hasher's item order: every hashed name, test and law, as the `hash` frames are written.
     pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
@@ -390,6 +392,11 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         p.field("arity", &root.arity.to_string());
         p.field("scalar", flag(root.scalar));
         p.frame(&mut out, "emitroot", root.root.as_str());
+    }
+    for (name, arity) in &front.emitter_ctors {
+        let mut p = Payload::default();
+        p.field("arity", &arity.to_string());
+        p.frame(&mut out, "emitctor", name.as_str());
     }
 
     for (module, items) in &front.ordinals {
@@ -803,6 +810,20 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                     return Err(format!("{what} is written twice"));
                 }
                 front.hash_order.push(Hashed::Law(i));
+            }
+            "emitctor" => {
+                let f = Fields::of(payload, &what)?;
+                let mut arity = None;
+                for (key, text) in f.all() {
+                    match key {
+                        "arity" => f.once(&mut arity, key, text)?,
+                        other => return Err(unknown_field(&what, other)),
+                    }
+                }
+                front.emitter_ctors.push((
+                    Symbol::new(name),
+                    f.number(f.required(arity, "arity")?, "arity")?,
+                ));
             }
             "emitroot" => {
                 let f = Fields::of(payload, &what)?;
