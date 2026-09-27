@@ -228,6 +228,7 @@ impl Site {
                 ("mains", crate::drive::mains_value(loaded)),
                 ("modules", crate::drive::modules_value(loaded)),
                 ("places", places_value(&loaded.sources)),
+                ("pins", pins_value(&loaded.front.pins)),
                 ("binary_bytes", option(binary_bytes().map(size))),
                 ("version", PlyValue::str(env!("CARGO_PKG_VERSION"))),
             ])],
@@ -269,6 +270,23 @@ fn arity(def: &DefInfo) -> usize {
 }
 
 // --- The build ----------------------------------------------------------------
+
+/// Each dependency as the front end pinned it: its name, its version, and the digest of the
+/// modules it contributed. `E0131`'s judgments decide what a package is, so the pin is the front
+/// end's answer rather than anything this side derives from a path.
+fn pins_value(pins: &[ply_ty::front::Pinned]) -> PlyValue {
+    PlyValue::list(
+        pins.iter()
+            .map(|pin| {
+                record(vec![
+                    ("name", PlyValue::str(&pin.name)),
+                    ("version", PlyValue::str(&pin.version)),
+                    ("digest", PlyValue::str(&pin.digest)),
+                ])
+            })
+            .collect(),
+    )
+}
 
 fn build(loaded: &Loaded, entry: &str, startup: &[String]) -> Result<Built, Diagnostic> {
     let named = |name: &str| {
