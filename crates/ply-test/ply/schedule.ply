@@ -1,0 +1,310 @@
+// `schedule` — which selected tests may run at the same time, as graph colouring over the resources
+// they declare. The graph is a *conflict* graph, not a sharing one: two tests may share a resource
+// freely as long as neither writes it, so a conflict is an effect and a resource both name plus a
+// write on one side. Colouring is greedy, largest footprint first, and a test takes the first class
+// it clears *every* member of — conflict is not transitive, so clearing one member is not enough.
+//
+// The footprints are the row's own `contends`: the atoms of a test's footprint another test could
+// reach, with `sim` already dropped, since an input no test can write cannot be contended over.
+// What the language declares about a resource lives here too — which effects are region scoped,
+// which are ambient, and what `simulate { .. }` discharges — because a rename's power over a region
+// label is a fact about the language, not about the runtime.
+
+// One atom of a test's shared footprint.
+pub type Atom = { effect: String, resource: String, writes: Bool }
+
+// --- What the language declares about an atom -------------------------------
+
+// Effects whose atoms name a region label: two writes to the same label conflict, and the label is
+// what a rename can move.
+pub fn region_scoped_effects() -> List<String> = ["cell"]
+
+// Effects whose atoms name an input that no test can write.
+pub fn ambient_effects() -> List<String> = ["sim"]
+
+// What `simulate { .. }` discharges, and nothing else.
+pub fn simulated_effects() -> List<String> = ["task", "clock", "random"]
+
+pub fn sim_effect() -> String = "sim"
+
+pub fn is_region_scoped(a: Atom) -> Bool = in_text(region_scoped_effects(), a.effect)
+
+pub fn is_ambient(a: Atom) -> Bool = in_text(ambient_effects(), a.effect)
+
+// Whether an atom can be contended over at all. An ambient input cannot: it is read, and only the
+// run looking at it knows what it is.
+pub fn contends(a: Atom) -> Bool = !is_ambient(a)
+
+// Nothing this test names can be reached from another one.
+pub fn region_isolated(f: List<Atom>) -> Bool = every(f, |a: Atom| !contends(a))
+
+// The atoms that can contend across tests: the footprint minus the inputs only this test is handed.
+pub fn shared(f: List<Atom>) -> List<Atom> = filter(f, contends)
+
+// Whether everything that contends is a region label: the contention a rename removes, as against
+// the contention that needs a lock.
+pub fn contends_only_over_regions(f: List<Atom>) -> Bool = {
+  let s = shared(f);
+  !is_empty(s) && every(s, is_region_scoped)
+}
+
+// Something in this test's closure entered a `simulate` region, so its outcome also depends on a
+// seed.
+pub fn is_seeded(f: List<Atom>) -> Bool = some(f, is_ambient)
+
+// Whether a test can interfere with any other test at all.
+pub type Isolation = | Region | Shared
+
+pub fn isolation_of(f: List<Atom>) -> Isolation = if region_isolated(f) { Region } else { Shared }
+
+pub fn is_isolated(i: Isolation) -> Bool = match i { Region -> true, Shared -> false }
+
+pub fn isolation_word(i: Isolation) -> String = match i { Region -> "region", Shared -> "shared" }
+
+// --- The conflict graph -----------------------------------------------------
+
+pub fn conflicts(a: Atom, b: Atom) -> Bool =
+  a.effect == b.effect && a.resource == b.resource && (a.writes || b.writes)
+
+// Two tests conflict when any pair of their atoms does.
+pub fn footprints_conflict(xs: List<Atom>, ys: List<Atom>) -> Bool =
+  !every(xs, |a: Atom| !footprints_hold(ys, a))
+
+fn footprints_hold(ys: List<Atom>, a: Atom) -> Bool = some(ys, |b: Atom| conflicts(a, b))
+
+// One selected test, with the atoms another test could contend over.
+pub type Scheduled = { index: Int, contends: List<Atom> }
+
+// Greedy colouring of the conflict graph, largest footprint first, ties by index. Each class is
+// returned with its indices ascending, and the classes come out in the order they were opened.
+pub fn group_by_conflict(tests: List<Scheduled>) -> List<List<Int>> =
+  map(
+    fold(in_order(tests), [], |classes: List<List<Scheduled>>, t: Scheduled| placed(classes, t)),
+    |class: List<Scheduled>| sorted_indices(class),
+  )
+
+// The tests as a scheduler considers them: most contended first, so the classes are not shaped by
+// an accident of the order the tree happens to declare them in.
+fn in_order(tests: List<Scheduled>) -> List<Scheduled> =
+  fold(tests, [], |acc: List<Scheduled>, t: Scheduled| placed_among(acc, t))
+
+fn placed_among(acc: List<Scheduled>, t: Scheduled) -> List<Scheduled> = {
+  let n = len(acc);
+  let at = fold(range(0, n), n, |i: Int, j: Int|
+    if i < n { i } else if ahead_of(t, at_or(acc, j)) { j } else { i });
+  let before = map(range(0, at), |j: Int| at_or(acc, j));
+  fold(range(at, n), push(before, t), |out: List<Scheduled>, j: Int| push(out, at_or(acc, j)))
+}
+
+// Most atoms first; ties by index, so the order is total and no insertion order leaks in.
+fn ahead_of(t: Scheduled, other: Scheduled) -> Bool =
+  if len(t.contends) == len(other.contends) { t.index < other.index }
+  else { len(t.contends) > len(other.contends) }
+
+fn sorted_indices(class: List<Scheduled>) -> List<Int> =
+  fold(class, [], |acc: List<Int>, t: Scheduled| {
+    // Positions, not elements: `acc` holds indices, and one of those is not an index into `acc`.
+    let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+      if i < len(acc) { i } else if t.index < at_or(acc, j) { j } else { i });
+    let before = map(range(0, at), |j: Int| at_or(acc, j));
+    fold(range(at, len(acc)), push(before, t.index), |out: List<Int>, j: Int|
+      push(out, at_or(acc, j)))
+  })
+
+// The first class this test clears every member of; a new class when it clears none.
+fn placed(classes: List<List<Scheduled>>, t: Scheduled) -> List<List<Scheduled>> = {
+  let slot = first_clear(classes, t.contends);
+  match slot {
+    Some(k) -> set_at(classes, k, push(at_or(classes, k), t)),
+    None -> push(classes, [t]),
+  }
+}
+
+fn first_clear(classes: List<List<Scheduled>>, atoms: List<Atom>) -> Option<Int> =
+  fold(range(0, len(classes)), None, |found: Option<Int>, k: Int|
+    match found {
+      Some(_) -> found,
+      None -> if clears(at_or(classes, k), atoms) { Some(k) } else { None },
+    })
+
+fn clears(class: List<Scheduled>, atoms: List<Atom>) -> Bool =
+  every(class, |other: Scheduled| !footprints_conflict(atoms, other.contends))
+
+fn set_at<a>(xs: List<a>, k: Int, x: a) -> List<a> =
+  map(range(0, len(xs)), |i: Int| if i == k { x } else { at_or(xs, i) })
+
+// --- How much of the corpus is trivially parallel ---------------------------
+
+pub type Parallelism = {
+  total: Int,
+  isolated: Int,
+  shared: Int,
+  // Of `shared`: how many contend only over a region label.
+  region_contended: Int,
+  // Selected tests: what `groups` and `shared_groups` are counted over.
+  scheduled: Int,
+  groups: Int,
+  // What the shared selected tests need on their own.
+  shared_groups: Int,
+}
+
+// Groups equal what the shared tests alone need: the property `--explain` publishes.
+pub fn holds(p: Parallelism) -> Bool = {
+  let floor = if p.scheduled > 0 { 1 } else { 0 };
+  p.groups == max(p.shared_groups, floor)
+}
+
+// `universe` is every test the run reports on; `scheduled` is the subset being coloured, and
+// `groups` is what `group_by_conflict` made of it.
+pub fn parallelism(
+  universe: List<List<Atom>>,
+  scheduled: List<Scheduled>,
+  groups: List<List<Int>>,
+) -> Parallelism = {
+  let total = len(universe);
+  let isolated = len(filter(universe, region_isolated));
+  let shared_only = filter(scheduled, |t: Scheduled| !region_isolated(t.contends));
+  {
+    total: total,
+    isolated: isolated,
+    shared: total - isolated,
+    region_contended: len(filter(universe, |f: List<Atom>| contends_only_over_regions(f))),
+    scheduled: len(scheduled),
+    groups: len(groups),
+    shared_groups: len(group_by_conflict(shared_only)),
+  }
+}
+
+// --- Helpers ----------------------------------------------------------------
+
+fn in_text(xs: List<String>, x: String) -> Bool = some(xs, |y: String| y == x)
+
+// The two quantifiers, as folds: neither is a builtin.
+fn every<a>(xs: List<a>, p: (a) -> Bool) -> Bool = fold(xs, true, |ok: Bool, x: a| ok && p(x))
+
+fn some<a>(xs: List<a>, p: (a) -> Bool) -> Bool = fold(xs, false, |hit: Bool, x: a| hit || p(x))
+
+fn is_empty<a>(xs: List<a>) -> Bool = len(xs) == 0
+
+// `list_at` as a total lookup: every caller here asks only for indices it holds.
+fn at_or<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list holds") }
+
+// `effect` is not a parameter name — the parser reads it as an effect declaration — so the
+// constructor's parameters are named around it.
+fn atom(e: String, r: String, w: Bool) -> Atom = { effect: e, resource: r, writes: w }
+
+// --- Tests ------------------------------------------------------------------
+//
+// The expectations below are what the runtime's own `schedule` answers for the same inputs, printed
+// by a scratch run against it: the package is a port, so agreement is the property to pin, and the
+// cases are chosen where two implementations could differ — a class that must clear every member,
+// the order the largest footprint imposes, and the two ways a class may be shared.
+
+fn cell(label: String) -> Atom = atom("cell", label, true)
+
+fn reads_cell(label: String) -> Atom = atom("cell", label, false)
+
+fn fs(path: String) -> Atom = atom("fs", path, true)
+
+fn sim() -> Atom = atom("sim", "", false)
+
+fn scheduled(index: Int, atoms: List<Atom>) -> Scheduled = { index: index, contends: atoms }
+
+test "a region label is what contends, and a rename is what moves it" {
+  // Isolated: nothing another test could reach.
+  assert_eq(region_isolated([sim()]), true);
+  assert_eq(isolation_of([sim()]), Region);
+  assert_eq(shared([cell("a"), sim()]), [cell("a")]);
+  // Region-scoped contention: a rename removes it. Any other resource needs a lock or a hook.
+  assert_eq(contends_only_over_regions([cell("a")]), true);
+  assert_eq(contends_only_over_regions([cell("a"), sim()]), true);
+  assert_eq(contends_only_over_regions([fs("/tmp/x")]), false);
+  assert_eq(contends_only_over_regions([cell("a"), fs("/tmp/x")]), false);
+  assert_eq(contends_only_over_regions([sim()]), false);
+  assert_eq(isolation_of([cell("a")]), Shared);
+  assert_eq(isolation_word(Shared), "shared")
+}
+
+test "a simulation region is what makes a test seeded" {
+  assert_eq(is_seeded([sim()]), true);
+  assert_eq(is_seeded([sim(), cell("a")]), true);
+  assert_eq(is_seeded([cell("a"), fs("/tmp/x")]), false)
+}
+
+test "conflict needs one writer, so two readers of one resource never conflict" {
+  assert_eq(conflicts(cell("a"), cell("a")), true);
+  assert_eq(conflicts(reads_cell("a"), cell("a")), true);
+  assert_eq(conflicts(cell("a"), reads_cell("a")), true);
+  assert_eq(conflicts(reads_cell("a"), reads_cell("a")), false);
+  // A different label is a different resource, and a different effect is a different resource.
+  assert_eq(conflicts(cell("a"), cell("b")), false);
+  assert_eq(conflicts(cell("a"), atom("db", "a", true)), false);
+  assert_eq(footprints_conflict([cell("a"), fs("/tmp/x")], [fs("/tmp/x")]), true);
+  assert_eq(footprints_conflict([cell("a")], [fs("/tmp/x")]), false)
+}
+
+test "a class is taken only when it clears every member, because conflict is not transitive" {
+  // `0` contends with `1` and `2`; `1` and `2` do not contend with each other. Colouring `0` first
+  // puts it in a class of its own and `1` and `2` together in the next, which a class-per-*pair*
+  // test would not do.
+  let tests = [
+    scheduled(0, [cell("a"), cell("b")]),
+    scheduled(1, [cell("a")]),
+    scheduled(2, [cell("b")]),
+  ];
+  assert_eq(group_by_conflict(tests), [[0], [1, 2]]);
+  // Without the transitivity trap: two tests over one label need two classes.
+  assert_eq(group_by_conflict([scheduled(0, [cell("a")]), scheduled(1, [cell("a")])]), [[0], [1]]);
+  // A test nothing can reach conflicts with nothing, so it joins the first class.
+  assert_eq(
+    group_by_conflict([
+      scheduled(0, [cell("a")]),
+      scheduled(1, [cell("a")]),
+      scheduled(2, [sim()]),
+    ]),
+    [[0, 2], [1]],
+  );
+  assert_eq(group_by_conflict([]), [])
+}
+
+test "the largest footprint is coloured first, so the order it was declared in does not show" {
+  // Declared smallest first, and the answer is the same as if it were declared the other way.
+  let small = scheduled(0, [cell("a")]);
+  let big = scheduled(1, [cell("a"), cell("b")]);
+  assert_eq(group_by_conflict([small, big]), [[1], [0]]);
+  assert_eq(group_by_conflict([big, small]), [[1], [0]]);
+  // Ties go by index, and every class's members come back ascending.
+  let three = [cell("a"), cell("b"), cell("c")];
+  assert_eq(group_by_conflict([scheduled(2, three), scheduled(0, three), scheduled(1, three)]), [
+    [0],
+    [1],
+    [2],
+  ])
+}
+
+test "the groups a run needs are what the shared tests alone need" {
+  let universe = [[cell("a")], [sim()], [fs("/tmp/x")], [cell("b"), sim()]];
+  let scheduled_tests = [scheduled(0, [cell("a")]), scheduled(1, [fs("/tmp/x")])];
+  let groups = group_by_conflict(scheduled_tests);
+  // Different effects, so nothing contends: one class holds both.
+  assert_eq(groups, [[0, 1]]);
+  let p = parallelism(universe, scheduled_tests, groups);
+  assert_eq(p.total, 4);
+  assert_eq(p.isolated, 1);
+  assert_eq(p.shared, 3);
+  assert_eq(p.region_contended, 2);
+  assert_eq(p.scheduled, 2);
+  assert_eq(p.groups, 1);
+  assert_eq(p.shared_groups, 1);
+  assert_eq(holds(p), true);
+  // One selected test, and one nothing else could reach: `groups` is one while `shared_groups` is
+  // zero, so the floor is what makes the property hold.
+  let one = parallelism(universe, [scheduled(0, [sim()])], [[0]]);
+  assert_eq(one.shared_groups, 0);
+  assert_eq(one.groups, 1);
+  assert_eq(holds(one), true);
+  // Nothing selected at all: no floor, and nothing to colour.
+  let none = parallelism(universe, [], []);
+  assert_eq(holds(none), true)
+}
