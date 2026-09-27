@@ -81,8 +81,9 @@ fn the_count_allocations_flag_is_read_from_the_line_and_taken_out() {
         vec!["run", "p.ply", "--count-allocs=out.json"],
     ] {
         let mut argv: Vec<String> = line.iter().map(|s| s.to_string()).collect();
-        let path = ply_launcher::count::flag(&mut argv).unwrap().unwrap();
-        assert_eq!(path, std::path::PathBuf::from("out.json"));
+        let asked = ply_launcher::count::flag(&mut argv).unwrap().unwrap();
+        assert_eq!(asked.path, std::path::PathBuf::from("out.json"));
+        assert!(!asked.sites);
         assert_eq!(
             argv,
             vec!["run".to_string(), "p.ply".to_string()],
@@ -97,8 +98,9 @@ fn the_count_allocations_flag_may_name_its_path_with_a_space() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let path = ply_launcher::count::flag(&mut argv).unwrap().unwrap();
-    assert_eq!(path, std::path::PathBuf::from("out.json"));
+    let asked = ply_launcher::count::flag(&mut argv).unwrap().unwrap();
+    assert_eq!(asked.path, std::path::PathBuf::from("out.json"));
+    assert!(!asked.sites);
     assert_eq!(argv, vec!["run".to_string(), "p.ply".to_string()]);
 }
 
@@ -118,18 +120,49 @@ fn a_line_without_the_flag_keeps_its_words() {
     assert_eq!(argv, vec!["run".to_string(), "p.ply".to_string()]);
 }
 
+/// One test, because a window is process-global: two tests taking windows at once would clobber
+/// each other's sites, which is fine for a launcher run (one entry, one window) and not for a
+/// suite that runs its tests in parallel.
 #[test]
-fn a_window_counts_what_it_ran_and_nothing_else() {
-    let some = ply_launcher::count::window(|| (0..64u64).map(|n| n * 2).collect::<Vec<u64>>()).1;
-    let (answer, counted) = ply_launcher::count::window(|| {
-        let v: Vec<u64> = (0..64u64).map(|n| n * 2).collect();
-        v.iter().sum::<u64>()
-    });
+fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
+    let some =
+        ply_launcher::count::window(|| (0..64u64).map(|n| n * 2).collect::<Vec<u64>>(), false).1;
+    let (answer, counted, sites) = ply_launcher::count::window(
+        || {
+            let v: Vec<u64> = (0..64u64).map(|n| n * 2).collect();
+            v.iter().sum::<u64>()
+        },
+        false,
+    );
     assert_eq!(answer, (0..64u64).map(|n| n * 2).sum::<u64>());
     assert!(counted.allocations > 0, "a vector allocates");
     assert!(counted.bytes >= 64 * 8);
     assert!(
+        sites.is_empty(),
+        "no sites were asked for, so none were recorded"
+    );
+    assert!(
         counted.allocations <= some.allocations,
         "a window that ended must not count the next window's work"
     );
+
+    // The same work, attributed: the sites are a breakdown of the total, minus the walk's own
+    // allocations, which are the walker's rather than the program's.
+    let (_, counted, sites) = ply_launcher::count::window(
+        || {
+            let v: Vec<u64> = (0..64u64).map(|n| n * 2).collect();
+            v.len()
+        },
+        true,
+    );
+    assert!(counted.allocations > 0);
+    assert!(!sites.is_empty(), "a window that asked for sites got none");
+    let attributed: u64 = sites.values().map(|at| at.allocations).sum();
+    assert!(
+        attributed > 0 && attributed <= counted.allocations,
+        "{attributed} of {} allocations were attributed",
+        counted.allocations
+    );
+    let bytes: u64 = sites.values().map(|at| at.bytes).sum();
+    assert!(bytes > 0 && bytes <= counted.bytes);
 }
