@@ -1,10 +1,9 @@
 #![cfg(unix)]
 
-use assert_cmd::cargo::CommandCargoExt;
+use crate::harness::{process, write};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const SERVER: &str = r#"
@@ -92,15 +91,15 @@ impl Server {
     fn spawn(source: &str, flags: &[&str]) -> Server {
         let dir = tempfile::tempdir().expect("a temp dir");
         let port = free_port();
-        write(dir.path(), &source.replace("PORT", &port.to_string()));
-        let child = Command::cargo_bin("ply")
-            .expect("the binary is built")
-            .arg("--color")
-            .arg("never")
+        write(
+            dir.path(),
+            "main.ply",
+            &source.replace("PORT", &port.to_string()),
+        );
+        let child = process(dir.path())
             .arg("run")
             .arg("--host")
             .args(flags)
-            .current_dir(dir.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -169,7 +168,7 @@ impl Server {
     }
 
     fn signal(&self, name: &str) {
-        let status = Command::new("kill")
+        let status = std::process::Command::new("kill")
             .arg(format!("-{name}"))
             .arg(self.child.id().to_string())
             .status()
@@ -204,10 +203,6 @@ impl Server {
         // `None` means a signal killed the process, and a killed run did not drain.
         (status.code().unwrap_or(-1), format!("{out}{err}"))
     }
-}
-
-fn write(dir: &Path, source: &str) {
-    std::fs::write(dir.join("main.ply"), source).unwrap();
 }
 
 fn request(stream: &mut TcpStream) -> String {
@@ -377,6 +372,7 @@ fn signal_is_withheld_under_ply_test_and_names_the_twin() {
     let dir = tempfile::tempdir().expect("a temp dir");
     write(
         dir.path(),
+        "main.ply",
         r#"
 import std.signal (signal)
 
@@ -389,12 +385,8 @@ test/nondet "a stop reaches the program" {
     );
     // `--json` because the human projection renders the message rather than the code.
     for flags in [vec!["test", "--json"], vec!["test", "--host", "--json"]] {
-        let out = Command::cargo_bin("ply")
-            .expect("the binary is built")
-            .arg("--color")
-            .arg("never")
+        let out = process(dir.path())
             .args(&flags)
-            .current_dir(dir.path())
             .output()
             .expect("`ply test` ran");
         let text = format!(

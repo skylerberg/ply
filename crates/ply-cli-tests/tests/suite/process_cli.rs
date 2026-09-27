@@ -1,6 +1,5 @@
-use assert_cmd::Command;
+use crate::harness::{json_of, ply, project};
 use serde_json::Value;
-use std::path::Path;
 
 const SOURCE: &str = r#"
 import std.process (process)
@@ -31,23 +30,6 @@ test/nondet "the announcement reaches the process" {
   announce()
 }
 "#;
-
-fn project(source: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn json_of(out: &std::process::Output) -> Value {
-    serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
-}
 
 fn text_of(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()

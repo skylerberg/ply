@@ -1,6 +1,4 @@
-use assert_cmd::Command;
-use serde_json::Value;
-use std::path::Path;
+use crate::harness::{json_of, ply, project};
 
 const SOURCE: &str = "\
 fn unrelated() -> Int = 0
@@ -15,26 +13,9 @@ fn widened(limit: Int, by: Int) -> Int = limit + by
 fn undocumented(xs: List<Int>) -> Int = len(xs)
 ";
 
-fn project() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), SOURCE).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn json_of(out: &std::process::Output) -> Value {
-    serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
-}
-
 #[test]
 fn a_definition_is_documented_by_its_signature_the_comment_above_it_and_its_place() {
-    let dir = project();
+    let dir = project(SOURCE);
     let out = ply(dir.path())
         .args(["doc", "widened", "--json"])
         .output()
@@ -77,7 +58,7 @@ fn a_definition_is_documented_by_its_signature_the_comment_above_it_and_its_plac
 
 #[test]
 fn a_builtin_is_documented_from_the_compilers_table_with_names_and_a_note() {
-    let dir = project();
+    let dir = project(SOURCE);
     let out = ply(dir.path())
         .args(["doc", "map", "--json"])
         .output()
@@ -147,7 +128,7 @@ fn a_label_generic_definition_documents_the_binder_it_leaves_to_its_caller() {
 
 #[test]
 fn a_name_that_is_neither_exits_two_with_the_unknown_name_code() {
-    let dir = project();
+    let dir = project(SOURCE);
     let out = ply(dir.path())
         .args(["doc", "nothing_here", "--json"])
         .output()

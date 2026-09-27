@@ -1,12 +1,4 @@
-use assert_cmd::prelude::*;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-fn repo(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(rel)
-}
+use crate::harness::{ply, repo, scratch};
 
 struct Run {
     stdout: String,
@@ -16,13 +8,8 @@ struct Run {
 
 impl Run {
     fn of(args: &[&str]) -> Run {
-        let out = Command::cargo_bin("ply")
-            .expect("the binary is built")
-            .arg("--color")
-            .arg("never")
-            .args(args)
-            .output()
-            .expect("ply runs");
+        let dir = scratch();
+        let out = ply(dir.path()).args(args).output().expect("ply runs");
         Run {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -81,7 +68,7 @@ fn desk_types() -> String {
     let run = Run::of(&[
         "check",
         "--types",
-        repo("examples/desk.ply").to_str().unwrap(),
+        repo().join("examples/desk.ply").to_str().unwrap(),
     ]);
     assert!(run.ok, "`ply check --types` failed\n\n{}", run.all());
     run.stdout
@@ -193,8 +180,11 @@ fn only_the_entry_point_reads_settings_and_only_one_route_reads_a_credential() {
 #[test]
 fn the_desks_credential_reaches_no_line_of_a_whole_test_run() {
     let dir = tempfile::tempdir().expect("a temp dir");
-    std::fs::copy(repo("examples/desk.ply"), dir.path().join("desk.ply"))
-        .expect("the example is copied");
+    std::fs::copy(
+        repo().join("examples/desk.ply"),
+        dir.path().join("desk.ply"),
+    )
+    .expect("the example is copied");
 
     let run = Run::of(&["test", "--json", dir.path().to_str().unwrap()]);
     assert!(run.ok, "the desk's suite must be green\n\n{}", run.all());
@@ -220,7 +210,8 @@ fn the_desks_credential_reaches_no_line_of_a_whole_test_run() {
 fn every_route_out_of_a_secret_is_a_compile_error() {
     let run = Run::of(&[
         "check",
-        repo("tests/fixtures/secret_containment.ply")
+        repo()
+            .join("tests/fixtures/secret_containment.ply")
             .to_str()
             .unwrap(),
     ]);
@@ -237,7 +228,8 @@ fn every_route_out_of_a_secret_is_a_compile_error() {
     // A separate run: derivation refuses before inference, so one file would report `E0206` and hide the rest.
     let derived = Run::of(&[
         "check",
-        repo("tests/fixtures/secret_not_derivable.ply")
+        repo()
+            .join("tests/fixtures/secret_not_derivable.ply")
             .to_str()
             .unwrap(),
     ]);
@@ -249,8 +241,11 @@ fn every_route_out_of_a_secret_is_a_compile_error() {
 #[test]
 fn the_desks_suite_is_hermetic_without_host_and_says_so() {
     let dir = tempfile::tempdir().expect("a temp dir");
-    std::fs::copy(repo("examples/desk.ply"), dir.path().join("desk.ply"))
-        .expect("the example is copied");
+    std::fs::copy(
+        repo().join("examples/desk.ply"),
+        dir.path().join("desk.ply"),
+    )
+    .expect("the example is copied");
 
     let first = Run::of(&["test", "--explain", dir.path().to_str().unwrap()]);
     assert!(first.ok, "{}", first.all());
@@ -266,7 +261,7 @@ fn the_desks_suite_is_hermetic_without_host_and_says_so() {
 
 #[test]
 fn the_desks_laws_still_hold_over_a_service_that_records_and_authenticates() {
-    let run = Run::of(&["prove", repo("examples/desk.ply").to_str().unwrap()]);
+    let run = Run::of(&["prove", repo().join("examples/desk.ply").to_str().unwrap()]);
     assert!(run.ok, "{}", run.all());
     run.says("7 held");
     run.says("2 proved");
@@ -276,7 +271,7 @@ fn the_desks_laws_still_hold_over_a_service_that_records_and_authenticates() {
 
 #[test]
 fn hosts_prints_where_records_go_which_channels_exist_and_what_a_signal_does() {
-    let desk = repo("examples/desk.ply");
+    let desk = repo().join("examples/desk.ply");
     let desk = desk.to_str().unwrap();
     let run = Run::of(&["hosts", desk, "--host", "--trace", "json"]);
     assert!(run.ok, "{}", run.all());
@@ -300,7 +295,7 @@ fn hosts_prints_where_records_go_which_channels_exist_and_what_a_signal_does() {
 /// A structural change to the trusted computing base breaks CI; a deployment's own configuration does not.
 #[test]
 fn the_hosts_digest_moves_with_the_sink_and_the_drain_and_not_with_a_value() {
-    let desk = repo("examples/desk.ply");
+    let desk = repo().join("examples/desk.ply");
     let desk = desk.to_str().unwrap();
     let digest = |extra: &[&str]| -> String {
         let mut args = vec![

@@ -3,20 +3,10 @@
 //! CI's `refresh` job rebuilds the artifact and its digest on main with `ply build`, so no pull
 //! request carries either.
 
-use assert_cmd::Command;
+use crate::harness::{ply, write};
 use ply_launcher::shipped;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn write(dir: &Path, name: &str, text: &str) {
-    std::fs::write(dir.join(name), text).unwrap();
-}
 
 #[test]
 fn the_cli_tree_is_a_package() {

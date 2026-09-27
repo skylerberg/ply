@@ -1,17 +1,5 @@
-use assert_cmd::prelude::*;
+use crate::harness::{ply, write};
 use ply_span::codes;
-use std::path::Path;
-use std::process::Command;
-
-fn write(dir: &Path, rel: &str, text: &str) {
-    std::fs::write(dir.join(rel), text).unwrap();
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
 
 fn output(out: &std::process::Output) -> String {
     format!(

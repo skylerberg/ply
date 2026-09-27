@@ -1,20 +1,5 @@
-use assert_cmd::Command;
+use crate::harness::{ply, project_files};
 use std::path::Path;
-use tempfile::TempDir;
-
-fn project(files: &[(&str, &str)]) -> TempDir {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    for (name, source) in files {
-        std::fs::write(dir.path().join(name), source).expect("a project file");
-    }
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the `ply` binary");
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
 
 fn run(dir: &Path, args: &[&str]) -> (i32, String) {
     let out = ply(dir).args(args).output().expect("`ply` runs");
@@ -67,7 +52,7 @@ pub fn wire(d: Doc) -> String = string_of_bytes(json::encode_bytes(d, doc_json()
 
 #[test]
 fn a_derived_program_hashes_identically_in_two_processes_and_two_directories() {
-    let a = project(&[("m.ply", DERIVED)]);
+    let a = project_files(&[("m.ply", DERIVED)]);
     let first = hashes(a.path());
     let second = hashes(a.path());
     assert_eq!(
@@ -76,7 +61,7 @@ fn a_derived_program_hashes_identically_in_two_processes_and_two_directories() {
     );
 
     // A different absolute path, same file names.
-    let b = project(&[("m.ply", DERIVED)]);
+    let b = project_files(&[("m.ply", DERIVED)]);
     assert_eq!(
         first,
         hashes(b.path()),
@@ -97,7 +82,7 @@ fn a_generated_definitions_hash_does_not_depend_on_the_import_that_spelled_it() 
     ];
     let mut seen: Option<(String, String)> = None;
     for form in forms {
-        let dir = project(&[("m.ply", &format!("{form}{body}"))]);
+        let dir = project_files(&[("m.ply", &format!("{form}{body}"))]);
         let text = hashes(dir.path());
         let pair = (hash_of(&text, "a_json"), hash_of(&text, "b_json"));
         match &seen {
@@ -120,9 +105,9 @@ fn renaming_a_type_parameter_does_not_move_a_generated_hash() {
              derive json for Pair\n"
         )
     };
-    let plain = project(&[("m.ply", &with("a, b", "a", "b"))]);
+    let plain = project_files(&[("m.ply", &with("a, b", "a", "b"))]);
     // `d` is the emitter's first-choice prefix, so this forces it to walk to `d_` and rename every binder.
-    let shadowing = project(&[("m.ply", &with("d, e", "d", "e"))]);
+    let shadowing = project_files(&[("m.ply", &with("d, e", "d", "e"))]);
     assert_eq!(
         hash_of(&hashes(plain.path()), "pair_json"),
         hash_of(&hashes(shadowing.path()), "pair_json"),
@@ -142,8 +127,8 @@ fn reordering_two_fields_moves_the_hash_and_leaves_the_wire_alone() {
              test \"the wire\" {{ assert_eq(wire(), \"{{\\\"x\\\":1,\\\"y\\\":\\\"hi\\\"}}\") }}\n"
         )
     };
-    let declared = project(&[("m.ply", &source("x: Int, y: String"))]);
-    let reordered = project(&[("m.ply", &source("y: String, x: Int"))]);
+    let declared = project_files(&[("m.ply", &source("x: Int, y: String"))]);
+    let reordered = project_files(&[("m.ply", &source("y: String, x: Int"))]);
 
     assert_ne!(
         hash_of(&hashes(declared.path()), "a_json"),
@@ -177,7 +162,7 @@ fn renaming_the_type_re_runs_no_test_and_renaming_a_variant_re_runs_its_own() {
              test \"an unrelated arithmetic fact\" {{ assert_eq(1 + 1, 2) }}\n"
         )
     };
-    let dir = project(&[("m.ply", &source("Order", "order_json", "Placed"))]);
+    let dir = project_files(&[("m.ply", &source("Order", "order_json", "Placed"))]);
 
     let (code, text) = run(dir.path(), &["test"]);
     assert_eq!(code, 0, "{text}");
@@ -212,7 +197,7 @@ fn renaming_the_type_re_runs_no_test_and_renaming_a_variant_re_runs_its_own() {
 
 #[test]
 fn a_map_in_a_derived_encoding_is_byte_identical_however_it_was_built() {
-    let dir = project(&[(
+    let dir = project_files(&[(
         "m.ply",
         r#"import std.json
 
@@ -256,7 +241,7 @@ test "one map, one document" {
 
 #[test]
 fn a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last() {
-    let dir = project(&[(
+    let dir = project_files(&[(
         "m.ply",
         r#"import std.json
 
@@ -291,7 +276,7 @@ test "one catalogue, one document" {
 
 #[test]
 fn a_stdlib_digest_that_moved_invalidates_nothing() {
-    let dir = project(&[(
+    let dir = project_files(&[(
         "m.ply",
         "import std.json\n\
          pub type A = { x: Int }\n\
@@ -327,8 +312,8 @@ fn pulling_the_stdlib_into_a_program_moves_no_hash_outside_it() {
                         pub type A = { x: Int }\n\
                         derive json for A\n";
 
-    let alone = project(&[("m.ply", PLAIN)]);
-    let beside = project(&[("m.ply", PLAIN), ("other.ply", USER)]);
+    let alone = project_files(&[("m.ply", PLAIN)]);
+    let beside = project_files(&[("m.ply", PLAIN), ("other.ply", USER)]);
 
     let a = hashes(alone.path());
     let b = hashes(beside.path());
@@ -348,11 +333,11 @@ fn pulling_the_stdlib_into_a_program_moves_no_hash_outside_it() {
 
 #[test]
 fn a_copied_stdlib_is_the_same_definitions_but_cannot_host_a_derivation() {
-    let shipped = project(&[(
+    let shipped = project_files(&[(
         "m.ply",
         "import std.json\npub type A = { x: Int, y: String }\nderive json for A\n",
     )]);
-    let copied = project(&[
+    let copied = project_files(&[
         ("json.ply", ply_std::JSON),
         (
             "m.ply",
@@ -371,7 +356,7 @@ fn a_copied_stdlib_is_the_same_definitions_but_cannot_host_a_derivation() {
         );
     }
 
-    let derived_against_the_copy = project(&[
+    let derived_against_the_copy = project_files(&[
         ("json.ply", ply_std::JSON),
         (
             "m.ply",

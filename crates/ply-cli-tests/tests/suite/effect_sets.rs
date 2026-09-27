@@ -1,7 +1,6 @@
-use assert_cmd::Command;
+use crate::harness::{ply, project, repo, stdout_of};
 use serde_json::Value;
 use std::path::Path;
-use tempfile::TempDir;
 
 /// Two `effect set`s, an endpoint that performs less than it declares, and endpoints that write their rows out.
 const SERVICE: &str = r#"
@@ -32,22 +31,6 @@ pub fn audit() -> Int / {store.read[audit], store.write[audit]} = {
   len(store.all[audit]())
 }
 "#;
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    std::fs::write(dir.path().join("m.ply"), source).expect("the fixture is written");
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the binary is built");
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn stdout_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stdout.clone()).expect("stdout is utf-8")
-}
 
 fn module_block(text: &str) -> String {
     let start = text
@@ -278,15 +261,9 @@ fn the_json_provenance_is_the_same_on_every_run() {
     assert_eq!(once["definitions"], twice["definitions"]);
 }
 
-fn repo(rel: &str) -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(rel)
-}
-
 #[test]
 fn the_example_service_reads_as_a_map_of_the_api_to_what_it_touches() {
-    let desk = repo("examples/desk.ply");
+    let desk = repo().join("examples/desk.ply");
     if !desk.exists() {
         return;
     }

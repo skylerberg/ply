@@ -1,20 +1,18 @@
-use assert_cmd::Command;
+use crate::harness::{ply, scratch};
 use serde_json::Value;
-
-fn ply() -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never");
-    cmd
-}
 
 #[test]
 fn a_code_is_explained_in_one_line_and_as_json() {
-    let out = ply().args(["explain", "e0302"]).output().unwrap();
+    let dir = scratch();
+    let out = ply(dir.path()).args(["explain", "e0302"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     let text = String::from_utf8(out.stdout).unwrap();
     assert_eq!(text, "E0302 effect not permitted by the written row\n");
 
-    let out = ply().args(["explain", "W0611", "--json"]).output().unwrap();
+    let out = ply(dir.path())
+        .args(["explain", "W0611", "--json"])
+        .output()
+        .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["code"], "W0611");
     assert_eq!(v["severity"], "warning");
@@ -24,7 +22,8 @@ fn a_code_is_explained_in_one_line_and_as_json() {
 
 #[test]
 fn the_label_instantiation_code_is_explained_like_any_other() {
-    let out = ply().args(["explain", "E0306"]).output().unwrap();
+    let dir = scratch();
+    let out = ply(dir.path()).args(["explain", "E0306"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
@@ -32,7 +31,10 @@ fn the_label_instantiation_code_is_explained_like_any_other() {
          of them, or a label-generic definition is used as a value\n"
     );
 
-    let out = ply().args(["explain", "e0306", "--json"]).output().unwrap();
+    let out = ply(dir.path())
+        .args(["explain", "e0306", "--json"])
+        .output()
+        .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["code"], "E0306");
     assert_eq!(v["severity"], "error");
@@ -41,11 +43,15 @@ fn the_label_instantiation_code_is_explained_like_any_other() {
 
 #[test]
 fn a_code_nothing_raises_exits_two_and_points_at_the_list() {
-    let out = ply().args(["explain", "E9999"]).output().unwrap();
+    let dir = scratch();
+    let out = ply(dir.path()).args(["explain", "E9999"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("explain --all"));
 
-    let out = ply().args(["explain", "--all", "--json"]).output().unwrap();
+    let out = ply(dir.path())
+        .args(["explain", "--all", "--json"])
+        .output()
+        .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     let codes = v["codes"].as_array().unwrap();
     assert_eq!(codes.len(), ply_span::MEANINGS.len());

@@ -1,15 +1,13 @@
-use std::process::Command;
+use crate::harness::{json_of, process, scratch, write};
 
 fn run(src: &str) -> serde_json::Value {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let file = dir.path().join("m.ply");
-    std::fs::write(&file, src).expect("write");
-    let out = Command::new(assert_cmd::cargo::cargo_bin("ply"))
-        .args(["run", "--json"])
-        .arg(&file)
+    let dir = scratch();
+    write(dir.path(), "m.ply", src);
+    let out = process(dir.path())
+        .args(["run", "--json", "m.ply"])
         .output()
         .expect("`ply run` must start");
-    serde_json::from_slice(&out.stdout).expect("`--json` must answer one object")
+    json_of(&out)
 }
 
 /// The growing field last, so the machine can reuse at every step and the counts are round.

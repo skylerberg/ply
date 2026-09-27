@@ -1,8 +1,8 @@
+use crate::fixture::write;
 use ply_machine::driver;
 use ply_machine::load::Loaded;
 use ply_store::Store;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
@@ -59,10 +59,6 @@ fn codes(e: &ply_machine::load::LoadError) -> Vec<String> {
         .iter()
         .map(|d| format!("{}: {}", d.code, d.message))
         .collect()
-}
-
-fn write(dir: &Path, name: &str, text: &str) {
-    fs::write(dir.join(name), text).unwrap();
 }
 
 const DECLARER: &str = "\

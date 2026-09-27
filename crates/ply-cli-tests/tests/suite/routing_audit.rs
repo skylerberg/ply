@@ -1,18 +1,10 @@
-use assert_cmd::prelude::*;
-use std::path::Path;
-use std::process::Command;
+use crate::harness::ply;
 use tempfile::TempDir;
 
 fn project(source: &str) -> TempDir {
     let dir = TempDir::new().expect("temp dir");
     std::fs::write(dir.path().join("main.ply"), source).expect("write main.ply");
     dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the ply binary");
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
 }
 
 fn output(out: &std::process::Output) -> String {

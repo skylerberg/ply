@@ -1,19 +1,13 @@
 //! The one test in this tree that opens a real socket.
 
+use crate::harness::{process, repo};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// How long the server has to typecheck the program and bind.
 const STARTUP: Duration = Duration::from_secs(30);
-
-fn repo(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(rel)
-}
 
 fn reserve_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
@@ -23,7 +17,8 @@ fn reserve_port() -> u16 {
 /// The example, verbatim, with the two numbers a test needs to choose.
 fn project(port: u16, connections: u32) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
-    let hello = std::fs::read_to_string(repo("examples/hello.ply")).expect("examples/hello.ply");
+    let hello =
+        std::fs::read_to_string(repo().join("examples/hello.ply")).expect("examples/hello.ply");
 
     let source = replace(
         &hello,
@@ -49,12 +44,6 @@ fn replace(source: &str, from: &str, to: &str) -> String {
     source.replace(from, to)
 }
 
-fn ply(dir: &std::path::Path) -> Command {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("ply"));
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
 /// Kills the server whatever the test does, including panicking out of an assertion.
 struct Server {
     child: Option<Child>,
@@ -63,7 +52,7 @@ struct Server {
 
 impl Server {
     fn start(dir: &std::path::Path, port: u16) -> Server {
-        let child = ply(dir)
+        let child = process(dir)
             .args(["run", "--host"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -245,7 +234,7 @@ fn a_request_split_across_writes_is_read_to_its_terminator() {
 #[test]
 fn the_same_program_is_hermetic_under_ply_test() {
     let dir = project(reserve_port(), 1);
-    let out = ply(dir.path())
+    let out = process(dir.path())
         .arg("test")
         .output()
         .expect("`ply test` runs");
@@ -265,7 +254,10 @@ fn the_same_program_is_hermetic_under_ply_test() {
 fn without_the_flag_the_program_never_reaches_the_socket() {
     let port = reserve_port();
     let dir = project(port, 1);
-    let out = ply(dir.path()).arg("run").output().expect("`ply run` runs");
+    let out = process(dir.path())
+        .arg("run")
+        .output()
+        .expect("`ply run` runs");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -316,7 +308,7 @@ fn output(out: &Output) -> String {
 #[test]
 fn a_hermetic_test_that_reaches_the_boundary_names_the_handler_it_did_not_use() {
     let dir = reaching_test(reserve_port());
-    let out = ply(dir.path())
+    let out = process(dir.path())
         .arg("test")
         .output()
         .expect("`ply test` runs");
@@ -336,7 +328,7 @@ fn a_host_backed_pass_is_never_cached_and_never_satisfies_a_hermetic_run() {
     let dir = reaching_test(reserve_port());
 
     for attempt in 0..2 {
-        let out = ply(dir.path())
+        let out = process(dir.path())
             .args(["test", "--host"])
             .output()
             .expect("`ply test --host` runs");
@@ -353,7 +345,7 @@ fn a_host_backed_pass_is_never_cached_and_never_satisfies_a_hermetic_run() {
         );
     }
 
-    let out = ply(dir.path())
+    let out = process(dir.path())
         .arg("test")
         .output()
         .expect("`ply test` runs");
@@ -382,7 +374,7 @@ fn task_spawn_under_the_flag_runs_on_the_production_scheduler() {
     )
     .unwrap();
 
-    let out = ply(dir.path())
+    let out = process(dir.path())
         .args(["run", "--host"])
         .output()
         .expect("`ply run --host` runs");
@@ -391,7 +383,10 @@ fn task_spawn_under_the_flag_runs_on_the_production_scheduler() {
     assert!(text.contains('3'), "got:\n{text}");
 
     // Hermetically, the program reaches the boundary and is told both remedies rather than getting real threads.
-    let out = ply(dir.path()).arg("run").output().expect("`ply run` runs");
+    let out = process(dir.path())
+        .arg("run")
+        .output()
+        .expect("`ply run` runs");
     let text = output(&out);
     assert_ne!(out.status.code(), Some(0), "got:\n{text}");
     assert!(text.contains("E0424"), "got:\n{text}");
