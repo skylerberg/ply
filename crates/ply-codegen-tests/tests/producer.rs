@@ -70,7 +70,7 @@ fn built_and_checked() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", PROGRAM)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -165,7 +165,7 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", EFFECTS)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -244,7 +244,7 @@ fn a_perform_no_handler_in_the_program_answers_still_compiles() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", UNANSWERED)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -295,7 +295,7 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", HOSTED)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -405,7 +405,7 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", NUMERIC)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -494,7 +494,7 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", SIMULATED)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -613,7 +613,7 @@ fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", RESUMED)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -725,7 +725,7 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", MULTISHOT)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -837,7 +837,7 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", PRODUCTION)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -962,7 +962,7 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", PROPOSITIONS)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     for root in [
@@ -1046,8 +1046,7 @@ fn standard_library() -> (&'static Source, Vec<String>) {
         .collect();
     let front: &'static ply_ty::Front = Box::leak(Box::new(front));
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(front, ply_codegen::emit_keys(front))
-            .with_texts(modules.into_iter().collect()),
+        Source::from_front(front).with_texts(modules.into_iter().collect()),
     ));
     (source, unused)
 }
@@ -1125,7 +1124,7 @@ fn the_shipped_blake3_is_blake3() {
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("std.bytes", ply_std::BYTES), ("std.hash", ply_std::HASH)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();

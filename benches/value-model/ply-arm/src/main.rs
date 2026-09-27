@@ -112,6 +112,5 @@ fn load(dir: &str) -> &'static Source {
         ply_codegen::c::producer::checked_front(&modules, &ids).expect("the project checks"),
     ));
     let texts: std::collections::HashMap<String, String> = modules.into_iter().collect();
-    let keys = ply_codegen::emit_keys(front);
-    Box::leak(Box::new(Source::from_front(front, keys).with_texts(texts)))
+    Box::leak(Box::new(Source::from_front(front).with_texts(texts)))
 }
