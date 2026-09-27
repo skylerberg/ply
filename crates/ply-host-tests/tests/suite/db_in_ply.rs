@@ -2,26 +2,28 @@
 //!
 //! `std.pg` proves the protocol can be spoken in Ply; this proves the *effect* can be served in
 //! Ply — the pool, the transaction scope and the text of every value are `std.db`'s, and the host
-//! sees only `net`.
+//! sees only `net`. A program serves itself: `with_server` reads the connection string, so nothing
+//! about the effect comes from the host.
 
 use ply_eval::{Machine, Value};
 use ply_span::Span;
 use std::sync::Arc;
 
-/// A program that handles its own `db`, so nothing about the effect is the host's.
+/// A program that handles its own `db` from a connection string.
 const PROGRAM: &str = r#"
 import std.net (net)
+import std.random (entropy)
 import std.db
-import std.db (db, serve, server, stmt, transaction, PInt, PText, CInt, CText, Answer, Rows, Count,
+import std.db (db, with_server, stmt, transaction, PInt, PText, CInt, CText, Answer, Rows, Count,
                Failed, ReadCommitted, ReadWrite, Row)
 
-pub fn run(host: String, port: Int) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  serve(server(host, port, "ply", "ply", Some("pencil")), 4, "a-test-nonce", || {
+pub fn run(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
+  match with_server(url, 4, || {
     match db.execute[items](stmt("create table if not exists items (id int4 primary key, name text)"), []) {
       Failed(e) -> Err(e.detail),
       _ -> match db.returning[items](
-        stmt("insert into items (id, name) values ($1, $2) returning id"),
+        stmt("insert into items (id, name) values ($1, $2) on conflict (id) do update set name = excluded.name returning id"),
         [PInt(7), PText("seven")],
       ) {
         Failed(e) -> Err(e.detail),
@@ -42,7 +44,10 @@ pub fn run(host: String, port: Int) -> Result<String, String>
         },
       },
     }
-  })
+  }) {
+    Err(why) -> Err(why),
+    Ok(answered) -> answered,
+  }
 
 fn names(rows: List<Row>) -> String =
   match rows {
@@ -54,11 +59,11 @@ fn names(rows: List<Row>) -> String =
   }
 
 // A transaction commits what it did, through `begin` and `commit` on the same connection.
-pub fn commit_one(host: String, port: Int) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  serve(server(host, port, "ply", "ply", Some("pencil")), 4, "a-test-nonce", || {
+pub fn commit_one(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
+  match with_server(url, 4, || {
     match transaction(ReadCommitted, ReadWrite, || {
-      db.execute[items](stmt("insert into items (id, name) values ($1, $2)"), [PInt(8), PText("eight")])
+      db.execute[items](stmt("insert into items (id, name) values ($1, $2) on conflict (id) do nothing"), [PInt(8), PText("eight")])
     }) {
       Err(roll) -> Err(roll.reason),
       Ok(_) -> match db.query[items](stmt("select count(*) as n from items"), []) {
@@ -70,7 +75,10 @@ pub fn commit_one(host: String, port: Int) -> Result<String, String>
         },
       },
     }
-  })
+  }) {
+    Err(why) -> Err(why),
+    Ok(answered) -> answered,
+  }
 
 fn shown(row: Row) -> String =
   match map_get(row, "n") {
@@ -91,7 +99,7 @@ fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
 }
 
 /// The entry, over the real network: the host's only part in this is the socket.
-fn call(entry: &str, port: u16) -> Result<String, String> {
+fn call(entry: &str, url: &str) -> Result<String, String> {
     let host = ply_host::Host::new();
     let (front, unit) = tiered(PROGRAM);
     let binding = host
@@ -115,11 +123,7 @@ fn call(entry: &str, port: u16) -> Result<String, String> {
     }
 
     let answered = machine
-        .call(
-            entry,
-            vec![Value::str("127.0.0.1"), Value::Int(i64::from(port))],
-            Span::DUMMY,
-        )
+        .call(entry, vec![Value::str(url)], Span::DUMMY)
         .unwrap_or_else(|e| panic!("the call answers: {e}"));
     let Value::Ctor { name, args } = &answered else {
         panic!("the entry answered {answered}, not an `Ok` or an `Err`");
@@ -134,21 +138,26 @@ fn call(entry: &str, port: u16) -> Result<String, String> {
     }
 }
 
-fn cluster() -> Option<crate::support::cluster::Cluster> {
+fn cluster() -> Option<(crate::support::cluster::Cluster, String)> {
     if !crate::support::cluster::available() {
         eprintln!("skipping: this machine has no initdb and postgres");
         return None;
     }
     // A password, so the connection is SCRAM rather than trust.
-    Some(crate::support::cluster::Cluster::start_with_password(
-        "ply", "pencil",
-    ))
+    let cluster = crate::support::cluster::Cluster::start_with_password("ply", "pencil");
+    let url = format!(
+        "postgres://ply:pencil@127.0.0.1:{}/ply?sslmode=disable",
+        cluster.port()
+    );
+    Some((cluster, url))
 }
 
 #[test]
 fn the_db_effect_is_served_from_a_real_server() {
-    let Some(cluster) = cluster() else { return };
-    match call("m.run", cluster.port()) {
+    let Some((_cluster, url)) = cluster() else {
+        return;
+    };
+    match call("m.run", &url) {
         Ok(text) => assert_eq!(text, "7 seven"),
         Err(why) => panic!("the driver could not run a statement: {why}"),
     }
@@ -156,13 +165,15 @@ fn the_db_effect_is_served_from_a_real_server() {
 
 #[test]
 fn a_transaction_commits_what_it_did() {
-    let Some(cluster) = cluster() else { return };
+    let Some((_cluster, url)) = cluster() else {
+        return;
+    };
     // The table is the first test's, and it is created if it is not there.
-    match call("m.run", cluster.port()) {
+    match call("m.run", &url) {
         Ok(text) => assert_eq!(text, "7 seven"),
         Err(why) => panic!("the driver could not run a statement: {why}"),
     }
-    match call("m.commit_one", cluster.port()) {
+    match call("m.commit_one", &url) {
         Ok(text) => assert_eq!(text, "2"),
         Err(why) => panic!("the transaction did not commit: {why}"),
     }
