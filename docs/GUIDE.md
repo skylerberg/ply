@@ -43,7 +43,8 @@ named under either collides with its prefix (`E0133`). Naming a single file
 makes its parent the root and loads only that file.
 
 **The cache.** `.ply-cache/` at the root holds the front-end, result and
-obligation caches and the review baseline. It is safe to delete
+obligation caches, the review baseline, and the git dependencies that were
+fetched. It is safe to delete
 (`ply cache clear`); add it to `.gitignore`. `PLY_CACHE_UPSTREAM=DIR` names a
 second cache shared between checkouts and machines, a directory on any storage
 they all reach: the passes and discharged obligations found there count here,
@@ -246,8 +247,13 @@ own modules only: the loading package's bare modules are unreachable from a
 dependency. Reaching a package the manifest does not declare is
 `E0132`, two packages granting one prefix is `E0133` — as is a module of the
 root package squatting on a dependency's prefix — and a cycle of packages is
-`E0134`. `Git` and `Registry` sources are checked and refused for now: only
-path dependencies resolve.
+`E0134`. A `Git(url, rev)` dependency is fetched into the project's own cache
+(`.ply-cache/git/`, one directory per url and revision) and read like any other
+package root: `rev` may be a commit, a tag or a branch, and a branch means what
+it means the day it is fetched — the fetched tree is reused without asking the
+remote again, so a cleared cache is what picks up a moved branch, and `ply.lock`'s
+digest is what catches it when that happens. A fetch that git cannot do is
+`E0140`. `Registry` sources arrive with resolution.
 
 The manifest is checked on every load. Resolution is minimal version selection:
 two manifests may ask different floors of one package — the highest floor wins —
@@ -1919,6 +1925,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0137` | one package reached at two places, where a closure pins one version |
 | `E0138` | a dependency whose sources are not what `ply.lock` pinned |
 | `E0139` | a `ply.lock` that does not decode or is from another format |
+| `E0140` | a git dependency that could not be fetched |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |

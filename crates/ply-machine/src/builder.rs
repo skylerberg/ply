@@ -25,12 +25,13 @@ use std::sync::{Arc, Mutex};
 /// else: `ply run` and the shipped program open artifacts too, and neither is a program.
 const EFFECT: &str = "builder";
 
-const OPERATIONS: [(&str, &str); 5] = [
+const OPERATIONS: [(&str, &str); 6] = [
     ("loaded", "ply_machine::build::loaded"),
     ("made", "ply_machine::build::made"),
     ("previous", "ply_machine::build::previous"),
     ("stored", "ply_machine::build::stored"),
     ("unit", "ply_machine::build::unit"),
+    ("git", "ply_machine::build::git"),
 ];
 
 /// An entry into a compiled unit does not nest on a thread, and a build enters the emitter's while
@@ -102,6 +103,17 @@ impl HostHandler for Site {
                 })
             }
             ("unit", [names]) => self.unit(&texts(names, span)?),
+            ("git", [root, key]) => {
+                let root = PathBuf::from(root.as_str(span, "the project's root")?);
+                let key = key.as_str(span, "a git dependency's key")?.to_string();
+                // A fetch is I/O and a subprocess, not an entry into a compiled body: it runs on
+                // this thread, and its failure is the dependency's trouble rather than a refusal
+                // of the whole program.
+                answered(
+                    crate::vcs::fetch(&root, &key)
+                        .map(|dir| PlyValue::str(dir.display().to_string())),
+                )
+            }
             ("stored", [path, body]) => answered(
                 stored(
                     Path::new(path.as_str(span, "a file to write")?),

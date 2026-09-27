@@ -279,6 +279,8 @@ pub mod codes {
     pub const LOCK_MISMATCH: &str = "E0138";
     /// A `ply.lock` that does not decode or is from another format.
     pub const LOCK_UNREADABLE: &str = "E0139";
+    /// A git dependency that could not be fetched.
+    pub const DEPENDENCY_FETCH: &str = "E0140";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -832,6 +834,7 @@ mod tests {
             ("DEPENDENCY_DIAMOND", codes::DEPENDENCY_DIAMOND, "E0137"),
             ("LOCK_MISMATCH", codes::LOCK_MISMATCH, "E0138"),
             ("LOCK_UNREADABLE", codes::LOCK_UNREADABLE, "E0139"),
+            ("DEPENDENCY_FETCH", codes::DEPENDENCY_FETCH, "E0140"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),

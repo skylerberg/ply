@@ -136,13 +136,35 @@ fn a_dependency_cycle_is_refused_naming_the_cycle() {
 }
 
 #[test]
-fn a_non_path_dependency_is_told_what_resolves_today() {
+fn a_git_dependency_that_cannot_be_fetched_says_so() {
     let dir = tempfile::tempdir().expect("a temp dir");
     std::fs::write(
         dir.path().join("ply.pkg"),
         manifest(
             "app",
-            "{name: \"glib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Git(\"https://example.com/glib\", \"abc123\")}",
+            "{name: \"glib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Git(\"https://example.invalid/glib\", \"abc123\")}",
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("main.ply"), "fn main() -> Int = 1\n").unwrap();
+    let out = ply(dir.path()).arg("check").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    // A url that does not resolve is the dependency's trouble, named as such: git could not fetch
+    // it, and nothing was read.
+    assert!(err.contains("E0140") || err.contains("E0135"), "{err}");
+    assert!(err.contains("glib"), "{err}");
+}
+
+/// The one source that still has no resolver: a registry arrives with resolution (P15).
+#[test]
+fn a_registry_dependency_is_told_what_resolves_today() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(
+        dir.path().join("ply.pkg"),
+        manifest(
+            "app",
+            "{name: \"glib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}",
         ),
     )
     .unwrap();
@@ -587,4 +609,162 @@ fn a_library_builds_as_a_package_and_never_as_a_program() {
     );
     let out = built(&["test", "core"]);
     assert_eq!(out.status.code(), Some(0));
+}
+
+/// A git repository in a temp directory, with the one commit `HEAD` points at.
+fn git_repo(dir: &std::path::Path, source: &str) -> String {
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("`git {args:?}`: {e}"));
+        assert!(
+            out.status.success(),
+            "`git {args:?}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    if !dir.join(".git").exists() {
+        run(&["init", "--quiet"]);
+    }
+    std::fs::write(dir.join("ply.pkg"), manifest("gitlib", "")).unwrap();
+    std::fs::write(dir.join("answer.ply"), source).unwrap();
+    run(&["add", "-A"]);
+    run(&[
+        "-c",
+        "user.email=t@test",
+        "-c",
+        "user.name=test",
+        "commit",
+        "--quiet",
+        "-m",
+        "a",
+    ]);
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn git_project(dir: &std::path::Path, lib: &std::path::Path, rev: &str) {
+    let root = dir.join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("ply.pkg"),
+        manifest(
+            "app",
+            &format!(
+                "{{name: \"gitlib\", prefix: None, min: {{major: 0, minor: 0, patch: 1}}, source: Git(\"{}\", \"{rev}\")}}",
+                lib.display()
+            ),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("main.ply"),
+        "import gitlib.answer\nfn main() -> Int = answer::answer()\ntest \"answers\" { assert_eq(answer::answer(), 7) }\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_git_dependency_is_fetched_and_reads_like_any_other_package() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    let rev = git_repo(&lib, "pub fn answer() -> Int = 7\n");
+    git_project(dir.path(), &lib, &rev);
+
+    // The walk fetches it: `check` loads through the Ply walker, `run` through the machine's.
+    for (args, want) in [
+        (vec!["check", "app"], "checked 2 modules"),
+        (vec!["run", "app"], "7"),
+        (vec!["test", "app"], "1 passed"),
+    ] {
+        let out = ply(dir.path()).args(&args).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {text}");
+        assert!(text.contains(want), "{args:?}: {text}");
+    }
+
+    // The tree is fetched under the project's own cache, once, and `resolve` pins what it read.
+    assert!(dir.path().join("app/.ply-cache/git").exists());
+    let out = ply(dir.path()).args(["resolve", "app"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let lock = std::fs::read_to_string(dir.path().join("app/ply.lock")).unwrap();
+    assert!(lock.contains("\"name\":\"gitlib\""), "{lock}");
+    // The cache is reused: a second load does not need a repository to fetch from.
+    std::fs::remove_dir_all(&lib).unwrap();
+    let out = ply(dir.path()).args(["check", "app"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_git_dependency_whose_branch_moved_is_not_what_the_lock_pins() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    let _rev = git_repo(&lib, "pub fn answer() -> Int = 7\n");
+    git_project(dir.path(), &lib, "HEAD");
+    std::fs::write(
+        dir.path().join("app/main.ply"),
+        "import gitlib.answer\nfn main() -> Int = answer::answer()\n",
+    )
+    .unwrap();
+
+    let out = ply(dir.path()).args(["resolve", "app"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let before = std::fs::read_to_string(dir.path().join("app/ply.lock")).unwrap();
+
+    // A branch means what it means today, and the cache holds the tree the resolve fetched. A
+    // cleared cache is what asks the branch again — and then the lock is what says the sources
+    // moved, before a build writes anything.
+    git_repo(&lib, "pub fn answer() -> Int = 8\n");
+    std::fs::remove_dir_all(dir.path().join("app/.ply-cache/git")).unwrap();
+    let out = ply(dir.path())
+        .args(["build", "app", "-o", "app.plyx"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0138"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("app/ply.lock")).unwrap(),
+        before
+    );
+
+    // Accepting the new tip is `ply resolve`, and then the build is green again.
+    let out = ply(dir.path()).args(["resolve", "app"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_ne!(
+        std::fs::read_to_string(dir.path().join("app/ply.lock")).unwrap(),
+        before
+    );
+    let out = ply(dir.path())
+        .args(["build", "app", "-o", "app.plyx"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
