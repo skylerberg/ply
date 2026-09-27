@@ -15,6 +15,9 @@ use std::sync::Arc;
 
 pub const EXTENSION: &str = "plyx";
 
+/// A library's container: a package to depend on, not a program, and never entered.
+pub const LIBRARY_EXTENSION: &str = "plyz";
+
 /// The container is `crates/ply-compiler/ply/plyx.ply`: the magic, every header offset, the
 /// section table and what a digest covers are written there and nowhere else.
 const ENCODE: &str = "plyx.encode";
@@ -548,6 +551,57 @@ pub fn build(
         entry_compiled: emission.entry_compiled,
         warnings: emission.warnings,
     })
+}
+
+/// What a library's `.plyz` carries: the compiled unit for a set of definitions, and the head a
+/// consumer's gate reads. A library has no artifact — no entry, no closure — so the head fields
+/// are the same three a program's artifact computes.
+pub struct LibraryUnit {
+    pub frontend: [u8; 32],
+    pub runtime: [u8; 32],
+    pub body_encoding: u32,
+    pub stdlib: [u8; 32],
+    pub payload: Vec<u8>,
+}
+
+/// The compiled unit for a set of definitions, with no entry: what a library's `.plyz` carries.
+/// Every definition named is compiled, since a library has no closure to prune against — a consumer
+/// imports whichever modules it likes — and the budget a `ply build` gives an entry is not spent.
+pub fn library_unit(loaded: &Loaded, names: &[String]) -> Result<LibraryUnit, Vec<Diagnostic>> {
+    ply_codegen::c::producer::ensure_default();
+    let texts = crate::support::module_texts(&loaded.check, &loaded.sources);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let produced =
+        ply_codegen::Unit::over_front(&loaded.front, texts).and_then(|unit| unit.produce(&names));
+    match produced {
+        Ok(produced) => {
+            let payload = ply_codegen::c::bundle::pack(&produced.text).map_err(|e| {
+                vec![Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("the library's unit would not pack: {e}"),
+                )]
+            })?;
+            Ok(LibraryUnit {
+                frontend: *blake3::hash(ply_store::FRONTEND_VERSION.as_bytes()).as_bytes(),
+                runtime: *blake3::hash(ply_store::RUNTIME_VERSION.as_bytes()).as_bytes(),
+                body_encoding: ply_store::BODY_ENCODING,
+                stdlib: ply_std::digest(),
+                payload,
+            })
+        }
+        Err(e) => {
+            match ply_codegen::c::refused_in(&e) {
+                Some(refusals) => Err(vec![refusals.diagnostic().clone()]),
+                None => Err(
+                    vec![Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the library's unit would not compile: {e}"),
+            )
+            .note("this is Ply's fault: the front end accepted the program the emitter refused")],
+                ),
+            }
+        }
+    }
 }
 
 /// Whether the module that holds `name` exports it; a prelude effect has no entry and is public.
