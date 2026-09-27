@@ -3,8 +3,7 @@
 use anyhow::{Context, Result, bail};
 use ply_eval::host::HostRegistry;
 use ply_eval::{Machine, Value};
-use ply_host::db::{PoolConfig, value as dbvalue};
-use ply_span::{Diagnostic, Span};
+use ply_span::{Diagnostic, Span, Symbol};
 use ply_ty::CheckOutput;
 use ply_ty::ModuleName;
 use ply_ty::ty::Footprint;
@@ -93,13 +92,7 @@ impl Program {
         let Value::List(stmts) = &value else {
             bail!("`ddl` answered {value}, which is not a list of statements");
         };
-        stmts
-            .iter()
-            .map(|s| {
-                dbvalue::statement(s, Span::DUMMY)
-                    .map_err(|d| anyhow::anyhow!("a `Stmt` would not decode: {}", d.message))
-            })
-            .collect()
+        stmts.iter().map(statement_of).collect()
     }
 
     /// One call of one entry point with no host.
@@ -164,6 +157,20 @@ impl Program {
         let registry: HostRegistry = host.registry();
         registry.bind(&self.check)
     }
+}
+
+/// The SQL a `db::Stmt` holds: `{ sql: String }`, and nothing else.
+fn statement_of(value: &Value) -> Result<String> {
+    let Value::Record(fields) = value else {
+        bail!("`ddl` answered {value}, which is not a `Stmt`");
+    };
+    let Some(sql) = fields.get(&Symbol::new("sql")) else {
+        bail!("a `Stmt` with no `sql` field");
+    };
+    Ok(sql
+        .as_str(Span::DUMMY, "a statement's `sql`")
+        .map_err(|d| anyhow::anyhow!("a `Stmt` would not decode: {}", d.message))?
+        .to_string())
 }
 
 /// The one table both handlers use, created from the program's own schema.
@@ -269,20 +276,34 @@ impl Workload {
 
     fn sequential(self) -> &'static str {
         match self {
-            Workload::Select => "selects",
-            Workload::SelectParam => "selects_by",
-            Workload::Insert => "inserts",
-            Workload::Transaction => "transactions",
+            Workload::Select => "selects_served",
+            Workload::SelectParam => "selects_by_served",
+            Workload::Insert => "inserts_served",
+            Workload::Transaction => "transactions_served",
         }
     }
 
     fn concurrent(self) -> &'static str {
         match self {
-            Workload::Select => "selects_at",
-            Workload::SelectParam => "selects_by_at",
-            Workload::Insert => "inserts_at",
-            Workload::Transaction => "transactions_at",
+            Workload::Select => "selects_at_served",
+            Workload::SelectParam => "selects_by_at_served",
+            Workload::Insert => "inserts_at_served",
+            Workload::Transaction => "transactions_at_served",
         }
+    }
+
+    /// A served entry point takes where to reach the database and how big a pool to keep, then
+    /// whatever the twin of that call takes: the program answers its own `db`.
+    fn served_args(self, url: &str, size: usize, base: i64, count: u32) -> Vec<Value> {
+        let mut args = vec![Value::str(url), Value::Int(size as i64)];
+        args.extend(self.args(base, count));
+        args
+    }
+
+    fn served_args_at(self, url: &str, size: usize, base: i64, tasks: u32, per: u32) -> Vec<Value> {
+        let mut args = vec![Value::str(url), Value::Int(size as i64)];
+        args.extend(self.args_at(base, tasks, per));
+        args
     }
 
     pub fn twin(self) -> &'static str {
@@ -338,8 +359,9 @@ pub fn ops(
     let program = Program::parse()?;
     let fixture = Fixture::create(url, &program)?;
     let mut out = Vec::new();
-    // A key base that never repeats, so no write collides with an earlier point's row.
-    let mut base: i64 = 1;
+    // A key base that never repeats *and* never meets the fixture's own keys (`sku-0` … `sku-63`),
+    // so no write collides with an earlier point's row or with the rows the reset puts there.
+    let mut base: i64 = 1_000_000;
     // The twin's fixture is built through the twin's own scanner inside every `twin_*` call.
     let mut seed = Duration::MAX;
     for _ in 0..repeats.max(2) {
@@ -373,20 +395,18 @@ pub fn ops(
             let mut live = Duration::MAX;
             for _ in 0..repeats {
                 fixture.reset()?;
-                let host = Arc::new(
-                    ply_host::Host::with_database(
-                        ply_host::Credentials::empty(),
-                        config(url, pool),
-                    )
-                    .map_err(|d| anyhow::anyhow!("[{}] {}", d.code, d.message))?,
-                );
+                let host = Arc::new(ply_host::Host::new());
                 let (taken, answered) = if concurrency == 1 {
-                    program.call_on(&host, workload.sequential(), workload.args(base, per))?
+                    program.call_on(
+                        &host,
+                        workload.sequential(),
+                        workload.served_args(url, pool, base, per),
+                    )?
                 } else {
                     program.call_on(
                         &host,
                         workload.concurrent(),
-                        workload.args_at(base, concurrency, per),
+                        workload.served_args_at(url, pool, base, concurrency, per),
                     )?
                 };
                 expect(answered, total, workload, "ply-postgres")?;
@@ -447,13 +467,6 @@ fn expect(answered: Value, want: u32, workload: Workload, rung: &str) -> Result<
              rather than ran",
             workload.label()
         ),
-    }
-}
-
-fn config(url: &str, pool: usize) -> PoolConfig {
-    PoolConfig {
-        size: pool,
-        ..PoolConfig::new(url)
     }
 }
 
@@ -556,10 +569,7 @@ pub struct SizePoint {
 pub fn sizes(url: &str, rows: &[u32], operations: u32, repeats: usize) -> Result<Vec<SizePoint>> {
     let program = Program::parse()?;
     let fixture = Fixture::create(url, &program)?;
-    let host = Arc::new(
-        ply_host::Host::with_database(ply_host::Credentials::empty(), config(url, 4))
-            .map_err(|d| anyhow::anyhow!("[{}] {}", d.code, d.message))?,
-    );
+    let host = Arc::new(ply_host::Host::new());
     let mut out = Vec::new();
     for &n in rows {
         // The twin, with its own fixture build subtracted.
@@ -586,8 +596,11 @@ pub fn sizes(url: &str, rows: &[u32], operations: u32, repeats: usize) -> Result
         fixture.fill(n)?;
         let mut live = Duration::MAX;
         for _ in 0..repeats {
-            let (taken, _) =
-                program.call_on(&host, "selects", vec![Value::Int(i64::from(operations))])?;
+            let (taken, _) = program.call_on(
+                &host,
+                Workload::Select.sequential(),
+                Workload::Select.served_args(url, 4, 0, operations),
+            )?;
             live = live.min(taken);
         }
         out.push(SizePoint {
@@ -631,17 +644,11 @@ pub fn pool(
             let mut best = Duration::MAX;
             for _ in 0..repeats {
                 fixture.reset()?;
-                let host = Arc::new(
-                    ply_host::Host::with_database(
-                        ply_host::Credentials::empty(),
-                        config(url, size),
-                    )
-                    .map_err(|d| anyhow::anyhow!("[{}] {}", d.code, d.message))?,
-                );
+                let host = Arc::new(ply_host::Host::new());
                 let (taken, answered) = program.call_on(
                     &host,
                     workload.concurrent(),
-                    workload.args_at(base, concurrency, per),
+                    workload.served_args_at(url, size, base, concurrency, per),
                 )?;
                 expect(answered, total, workload, "pool")?;
                 base += i64::from(total) + 1;
@@ -677,17 +684,14 @@ pub fn exhaustion(url: &str, pool: usize, concurrency: u32, acquire_ms: u64) -> 
     let program = Program::parse()?;
     let fixture = Fixture::create(url, &program)?;
     fixture.reset()?;
-    let mut settings = config(url, pool);
-    settings.acquire = Duration::from_millis(acquire_ms);
-    let host = Arc::new(
-        ply_host::Host::with_database(ply_host::Credentials::empty(), settings)
-            .map_err(|d| anyhow::anyhow!("[{}] {}", d.code, d.message))?,
-    );
+    // The pool size is the run's argument and the acquire bound is the driver's own: `std.db`
+    // refuses a checkout past its size rather than waiting, so a run below takes the refusal.
+    let host = Arc::new(ply_host::Host::new());
     let started = Instant::now();
     let answered = program.refusal_on(
         &host,
         Workload::Transaction.concurrent(),
-        Workload::Transaction.args_at(9_000_000, concurrency, 8),
+        Workload::Transaction.served_args_at(url, pool, 9_000_000, concurrency, 8),
     )?;
     let seconds = started.elapsed().as_secs_f64();
     Ok(match answered {
