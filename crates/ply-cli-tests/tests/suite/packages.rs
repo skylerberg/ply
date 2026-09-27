@@ -768,3 +768,86 @@ fn a_git_dependency_whose_branch_moved_is_not_what_the_lock_pins() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `ply vendor` copies the closure into `vendor/`, and a check that reads it needs neither the
+/// repository the dependency came from nor the cache the fetch used.
+#[test]
+fn a_vendored_project_builds_with_no_repository_and_no_cache() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    let rev = git_repo(&lib, "pub fn answer() -> Int = 7\n");
+    git_project(dir.path(), &lib, &rev);
+    std::fs::write(
+        dir.path().join("lib/data.txt"),
+        "a package ships what it ships\n",
+    )
+    .unwrap();
+    let rev = git_repo(&lib, "pub fn answer() -> Int = 7\n");
+    git_project(dir.path(), &lib, &rev);
+
+    let out = ply(dir.path()).args(["vendor", "app"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("vendored 1 package"), "{stdout}");
+    assert!(stdout.contains("vendor/gitlib"), "{stdout}");
+
+    // The package whole: its `ply.pkg`, its modules, and the data it ships — and not the repository
+    // the fetch came from.
+    assert!(dir.path().join("app/vendor/gitlib/ply.pkg").exists());
+    assert!(dir.path().join("app/vendor/gitlib/answer.ply").exists());
+    assert!(dir.path().join("app/vendor/gitlib/data.txt").exists());
+    assert!(!dir.path().join("app/vendor/gitlib/.git").exists());
+    let index = std::fs::read_to_string(dir.path().join("app/vendor/index")).unwrap();
+    assert!(index.starts_with("git+"), "{index}");
+    assert!(index.ends_with("vendor/gitlib\n"), "{index}");
+
+    // Vendoring twice writes the same index: one closure, one file.
+    let out = ply(dir.path()).args(["vendor", "app"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("app/vendor/index")).unwrap(),
+        index
+    );
+
+    // With the repository and the cache gone, the walk reads `vendor/` and asks for nothing.
+    std::fs::remove_dir_all(&lib).unwrap();
+    std::fs::remove_dir_all(dir.path().join("app/.ply-cache")).unwrap();
+    for (args, want) in [
+        (vec!["check", "app"], "checked 3 modules"),
+        (vec!["run", "app"], "7"),
+        (vec!["resolve", "app"], "1 package"),
+    ] {
+        let out = ply(dir.path()).args(&args).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {text}");
+        assert!(text.contains(want), "{args:?}: {text}");
+    }
+}
+
+#[test]
+fn a_project_with_no_dependencies_vendors_nothing() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(dir.path().join("m.ply"), "fn main() -> Int = 1\n").unwrap();
+    let out = ply(dir.path()).args(["vendor"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("vendored 0 packages"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("vendor/index")).unwrap(),
+        ""
+    );
+}

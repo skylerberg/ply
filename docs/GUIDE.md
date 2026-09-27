@@ -44,7 +44,8 @@ makes its parent the root and loads only that file.
 
 **The cache.** `.ply-cache/` at the root holds the front-end, result and
 obligation caches, the review baseline, and the git dependencies that were
-fetched. It is safe to delete
+fetched; `vendor/` holds the ones `ply vendor` copied, which is what a checkout
+that must not reach the network carries. It is safe to delete
 (`ply cache clear`); add it to `.gitignore`. `PLY_CACHE_UPSTREAM=DIR` names a
 second cache shared between checkouts and machines, a directory on any storage
 they all reach: the passes and discharged obligations found there count here,
@@ -270,7 +271,14 @@ the lock before it writes an artifact — a dependency whose sources moved since
 was pinned is `E0138`, and a lock this `ply` cannot read is `E0139` — and writes
 one when the closure it resolved is not the one on file. `ply resolve` pins what is on
 disk now, and is how a change to a dependency is accepted, deliberately —
-deleting the lockfile, or one package's entry in it, does the same. `ply why
+deleting the lockfile, or one package's entry in it, does the same. `ply vendor`
+copies the closure into `vendor/`, one directory per package named by the prefix
+the closure granted it, whole — its `ply.pkg`, its modules and the data it ships,
+but not the repository a fetch came from — plus `vendor/index`, one line per
+package saying which want that directory answers. A walk that finds the index
+reads those trees and asks for nothing else, so a vendored checkout builds with
+no cache, no network and no git; the lockfile's digest still says the sources are
+the ones that were pinned. `ply why
 NAME` says how a package got here: the path from the root package to it through
 the packages that declare it, then the version and digest it resolved to. `Git`
 and `Registry` sources arrive with resolution.
@@ -1787,6 +1795,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
 | `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest |
+| `ply vendor [path]` | copy the closure into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
@@ -1796,9 +1805,9 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
-`ply show`, `ply replace`, `ply resolve`, `ply why`, `ply callers`, `ply std`,
-`ply explain`, `ply hosts`, `ply cache` and `ply bootstrap` are one Ply program
-(`crates/ply-cli/ply`, entered at `ply.main`). The program itself parses the command line, prints help and
+`ply show`, `ply replace`, `ply resolve`, `ply vendor`, `ply why`, `ply callers`,
+`ply std`, `ply explain`, `ply hosts`, `ply cache` and `ply bootstrap` are one
+Ply program (`crates/ply-cli/ply`, entered at `ply.main`). The program itself parses the command line, prints help and
 refusals, and resolves the paths it is given against the working directory — a
 relative path reads under it, an absolute one reads where it points. The binary
 answers with the code the program asked to exit with. What a command needs of

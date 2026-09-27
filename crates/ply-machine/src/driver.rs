@@ -304,11 +304,26 @@ fn package_roots(packages: &[DepPackage]) -> Vec<(PathBuf, String)> {
 
 /// What the manifests on hand ask for, round by round, until nothing is new: the closure of
 /// the root package's path dependencies.
+/// The directories `ply vendor` wrote, by the want each answers: `<want>\t<dir>` a line, read once
+/// per walk. A project that was not vendored has no index and reads nothing extra.
+fn vendored(root: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(text) = std::fs::read_to_string(root.join("vendor").join("index")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (want, dir) = line.split_once('\t')?;
+            Some((want.to_string(), root.join(dir)))
+        })
+        .collect()
+}
+
 fn walk_packages(
     root: &Path,
     manifest: &Option<(PathBuf, Arc<str>)>,
 ) -> Result<Vec<DepPackage>, String> {
     let root_key = root.to_string_lossy().into_owned();
+    let vendored = vendored(root);
     let mut known = vec![root_key.clone()];
     let mut manifests = vec![producer::SuppliedPackage {
         root: root_key,
@@ -325,13 +340,15 @@ fn walk_packages(
             known.push(w.clone());
             // A git want is fetched first, and is named by its key rather than by where the fetch
             // put it: the front end judges roots, and a tree's address is the walker's business.
-            let tree = if w.starts_with("git+") {
-                match crate::vcs::fetch(root, &w) {
+            // A vendored copy answers the want whether it is a path or a git key, and asks for
+            // nothing: that is what makes a vendored checkout build with no cache and no git.
+            let tree = match vendored.iter().find(|(want, _)| *want == w) {
+                Some((_, dir)) => dir.clone(),
+                None if w.starts_with("git+") => match crate::vcs::fetch(root, &w) {
                     Ok(dir) => dir,
                     Err(diagnostic) => return Err(diagnostic.message.clone()),
-                }
-            } else {
-                PathBuf::from(&w)
+                },
+                None => PathBuf::from(&w),
             };
             let package = read_package(&w, &tree);
             manifests.push(producer::SuppliedPackage {
