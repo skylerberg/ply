@@ -1483,6 +1483,15 @@ struct FaultView {
     conclusive: bool,
     requested: bool,
     reason: String,
+    /// The verdict as the artifact publishes it: the cases by word, the groups, and the counts a
+    /// reader sees beside the answer. A program that searched replaces all of these.
+    verdict: &'static str,
+    skipped: Option<&'static str>,
+    confidence: &'static str,
+    groups: Vec<Vec<String>>,
+    /// The counts the search would have published. Named `stats` because `search` above is the
+    /// change set a program that decides reads.
+    stats: ply_test::SearchStats,
     culprits: Vec<(Vec<String>, Option<Span>)>,
     slice: Option<(bool, bool, Vec<String>)>,
     suspects: Vec<SuspectView>,
@@ -1751,6 +1760,15 @@ fn fault(
             Verdict::NotAttempted(Skipped::NotRequested)
         ),
         reason: bisection.reason.clone(),
+        verdict: bisection.verdict.as_str(),
+        skipped: bisection.verdict.skipped().map(|why| why.as_str()),
+        confidence: bisection.confidence.as_str(),
+        groups: bisection
+            .groups
+            .iter()
+            .map(|group| group.iter().map(|n| n.as_str().to_string()).collect())
+            .collect(),
+        stats: bisection.search,
         culprits: bisection
             .groups
             .iter()
@@ -2123,6 +2141,30 @@ fn fault_value(f: &FaultView) -> PlyValue {
                 ("conclusive", PlyValue::Bool(f.conclusive)),
                 ("requested", PlyValue::Bool(f.requested)),
                 ("reason", PlyValue::str(&f.reason)),
+                ("verdict", PlyValue::str(f.verdict)),
+                ("skipped", option(f.skipped.map(PlyValue::str))),
+                ("confidence", PlyValue::str(f.confidence)),
+                (
+                    "groups",
+                    PlyValue::list(
+                        f.groups
+                            .iter()
+                            .map(|g| PlyValue::list(g.iter().map(|n| PlyValue::str(n)).collect()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "search",
+                    record(vec![
+                        ("candidates", count(f.stats.candidates)),
+                        ("clusters", count(f.stats.clusters)),
+                        ("evaluated", count(f.stats.evaluated)),
+                        ("cached", count(f.stats.cached)),
+                        ("memoized", count(f.stats.memoized)),
+                        ("unresolved", count(f.stats.unresolved)),
+                        ("exhausted", PlyValue::Bool(f.stats.exhausted)),
+                    ]),
+                ),
                 (
                     "culprits",
                     PlyValue::list(
