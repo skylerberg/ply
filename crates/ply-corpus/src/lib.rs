@@ -20,8 +20,7 @@ pub mod w6_run;
 
 pub use spec::CorpusSpec;
 
-use anyhow::{Result, bail};
-use ply_eval::Plan;
+use anyhow::Result;
 use ply_store::Store;
 use std::path::Path;
 
@@ -80,62 +79,4 @@ pub fn run_on_tier(
         .with_search(search)
         .with_hosts(hosting);
     ply_test::run_with(selection, &front.check, &front.hashes, store, &executor)
-}
-
-#[derive(Clone, Debug)]
-pub struct Verified {
-    pub definitions: usize,
-    pub tests: usize,
-    pub passed: usize,
-    pub failed: usize,
-    pub groups: usize,
-    pub largest_group: usize,
-    /// Tests whose footprint carries `sim.read`, so their result depends on a seed.
-    pub seeded: usize,
-}
-
-/// Compiles and runs a corpus with the real crates.
-pub fn verify(root: &Path) -> Result<Verified> {
-    let front = pipeline::front(root)?;
-    let mut store = Store::open(root)?;
-    store.clear()?;
-
-    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
-    let report = run_on_tier(
-        &front,
-        &selection,
-        &mut store,
-        ply_test::Search::of(&selection),
-        ply_test::Hosting::hermetic(),
-    );
-
-    if report.failed > 0 {
-        let shown: Vec<String> = report
-            .failures
-            .iter()
-            .take(3)
-            .map(|f| format!("{}: {}", f.key, f.diagnostic.message))
-            .collect();
-        bail!(
-            "{} of {} generated tests failed — the reference evaluator disagrees with `ply-eval`:\n  {}",
-            report.failed,
-            selection.total,
-            shown.join("\n  ")
-        );
-    }
-
-    Ok(Verified {
-        definitions: front.check.defs.len(),
-        tests: front.check.tests.len(),
-        passed: report.passed,
-        failed: report.failed,
-        groups: selection.groups.len(),
-        largest_group: selection.groups.iter().map(|g| g.len()).max().unwrap_or(0),
-        seeded: front
-            .check
-            .tests
-            .iter()
-            .filter(|t| ply_test::is_seeded(&t.footprint))
-            .count(),
-    })
 }
