@@ -347,15 +347,10 @@ pub mod codes {
     /// A `--tls` credential that does not load, or whose key does not match its certificate.
     pub const TLS_CREDENTIAL_INVALID: &str = "E0430";
     /// Postgres is bound but the database is unnamed, unparseable, unsupported or unreachable.
-    pub const DB_NOT_CONFIGURED: &str = "E0431";
     /// The server refused to prepare a statement, or its columns do not fit the row codec.
     /// A statement touches a table outside its entry point's declared footprint.
-    pub const DB_SCHEMA_MISMATCH: &str = "E0435";
     /// A database operation by a task that does not own the open transaction scope.
-    pub const DB_TRANSACTION_SCOPE: &str = "E0436";
-    pub const DB_POOL_EXHAUSTED: &str = "E0437";
     /// The live schema has a trigger, rule or cascade touching tables no statement names.
-    pub const DB_UNMODELLED_SIDE_EFFECT: &str = "E0438";
     /// A `Secret` passed to a host operation whose registration does not accept one.
     pub const SECRET_TO_HOST: &str = "E0439";
     /// A `--config` file or `--set` that cannot be read or is not `KEY=VALUE`.
@@ -409,7 +404,6 @@ pub mod codes {
     /// The stdlib shipped with this compiler differs from the one the cache was written under.
     pub const STDLIB_CHANGED: &str = "W0605";
     /// A host runtime could not hand every resource back when an entry point ended.
-    pub const HOST_TEARDOWN: &str = "W0606";
     /// An explicitly supplied configuration key the run's schema does not declare.
     pub const CONFIG_UNDECLARED: &str = "W0607";
     /// The drain deadline expired with connections still in flight.
@@ -595,17 +589,6 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0428", "`blocking` host handler answered inline"),
     ("E0429", "`net.listen_tls` named a credential the run lacks"),
     ("E0430", "`--tls` credential that does not load"),
-    ("E0431", "no database configured"),
-    ("E0435", "live database differs from the schema (reserved)"),
-    (
-        "E0436",
-        "database operation from a task not owning the transaction",
-    ),
-    ("E0437", "connection pool exhausted"),
-    (
-        "E0438",
-        "live schema has an unmodellable trigger, rule or cascade (reserved)",
-    ),
     (
         "E0439",
         "`Secret` passed to a host operation not allowed one",
@@ -644,7 +627,6 @@ pub const MEANINGS: &[(&str, &str)] = &[
         "W0605",
         "standard library changed since the cache was written",
     ),
-    ("W0606", "host runtime could not release every resource"),
     (
         "W0607",
         "supplied configuration key the schema does not declare",
@@ -904,15 +886,6 @@ mod tests {
                 codes::TLS_CREDENTIAL_INVALID,
                 "E0430",
             ),
-            ("DB_NOT_CONFIGURED", codes::DB_NOT_CONFIGURED, "E0431"),
-            ("DB_SCHEMA_MISMATCH", codes::DB_SCHEMA_MISMATCH, "E0435"),
-            ("DB_TRANSACTION_SCOPE", codes::DB_TRANSACTION_SCOPE, "E0436"),
-            ("DB_POOL_EXHAUSTED", codes::DB_POOL_EXHAUSTED, "E0437"),
-            (
-                "DB_UNMODELLED_SIDE_EFFECT",
-                codes::DB_UNMODELLED_SIDE_EFFECT,
-                "E0438",
-            ),
             ("SECRET_TO_HOST", codes::SECRET_TO_HOST, "E0439"),
             ("CONFIG_UNAVAILABLE", codes::CONFIG_UNAVAILABLE, "E0440"),
             ("CONFIG_MISSING", codes::CONFIG_MISSING, "E0441"),
@@ -962,7 +935,6 @@ mod tests {
                 "W0604",
             ),
             ("STDLIB_CHANGED", codes::STDLIB_CHANGED, "W0605"),
-            ("HOST_TEARDOWN", codes::HOST_TEARDOWN, "W0606"),
             ("CONFIG_UNDECLARED", codes::CONFIG_UNDECLARED, "W0607"),
             ("DRAIN_INCOMPLETE", codes::DRAIN_INCOMPLETE, "W0608"),
             ("SPAN_ABANDONED", codes::SPAN_ABANDONED, "W0609"),
