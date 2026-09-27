@@ -1,7 +1,6 @@
 //! What an obligation was discharged with, on disk.
 
 use ply_span::Symbol;
-use ply_ty::Type;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -33,7 +32,8 @@ pub struct CachedCases {
     pub kept: u32,
     pub rejected: u32,
     pub roots: Vec<u64>,
-    pub instantiations: Vec<(Symbol, Type)>,
+    /// Each type variable's instantiation, rendered: evidence is shown, never re-checked.
+    pub instantiations: Vec<(Symbol, String)>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
