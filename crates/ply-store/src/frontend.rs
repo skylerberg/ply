@@ -98,9 +98,16 @@ pub struct CachedTest {
 }
 
 /// What one file declared when it was last checked, and the bytes it was checked as.
+///
+/// `module` is the program-wide name the file was checked under, which is not derivable from the
+/// file: a dependency's module is named under the prefix its manifest grants, and what grants it
+/// is the importing project's manifest closure. It is kept here so a later run can file the rows
+/// again without the front end's answer — the run that reads them has not asked for one yet.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SourceFingerprint {
     pub content_hash: ContentHash,
+    #[serde(default)]
+    pub module: String,
     pub defs: Vec<DefEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tests: Vec<CachedTest>,
@@ -110,6 +117,7 @@ impl SourceFingerprint {
     pub fn new(content_hash: ContentHash) -> SourceFingerprint {
         SourceFingerprint {
             content_hash,
+            module: String::new(),
             defs: Vec::new(),
             tests: Vec::new(),
         }

@@ -527,6 +527,7 @@ pub fn encode_fingerprint(f: &SourceFingerprint) -> Vec<u8> {
     let mut w = Writer::new();
     w.tag(tag::FINGERPRINT);
     w.content_hash(f.content_hash);
+    w.text(&f.module);
 
     w.count(f.defs.len());
     for def in &f.defs {
@@ -565,6 +566,7 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
     let mut r = Reader::new(bytes);
     r.tag(tag::FINGERPRINT, WHAT)?;
     let content_hash = r.content_hash(WHAT)?;
+    let module = r.text(WHAT)?.to_string();
 
     let count = r.count(WHAT)?;
     let mut defs = Vec::with_capacity(count);
@@ -616,6 +618,7 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
     r.end(WHAT)?;
     Ok(SourceFingerprint {
         content_hash,
+        module,
         defs,
         tests,
     })

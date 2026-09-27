@@ -44,7 +44,9 @@ pub const FRONTEND_VERSION: &str = "0.28.0";
 /// Bumping this re-attempts every obligation and re-runs no test.
 pub const PROVER_VERSION: &str = "0.7.0";
 
-pub const FRONTEND_FORMAT: u32 = 9;
+/// Bumped when a stored fingerprint gained its module name: a cache from before it holds rows
+/// nothing can file again, and every source is re-checked once.
+pub const FRONTEND_FORMAT: u32 = 10;
 
 pub const BODY_ENCODING: u32 = 7;
 
@@ -292,6 +294,10 @@ impl<'de> Deserialize<'de> for Outcome {
 
 pub struct Store {
     root: PathBuf,
+    /// The closure's dependency packages, by root and identity: a source under one is keyed under
+    /// the package rather than under the store's own root, so its entry is the same wherever the
+    /// package is checked out.
+    packages: Vec<(PathBuf, String)>,
     dir: PathBuf,
     path: PathBuf,
     entries: disk::Entries,
@@ -628,6 +634,7 @@ impl Store {
             frontend::Frontend::open(&frontend_path, &frontend_data_path);
         let mut store = Store {
             root: root.to_path_buf(),
+            packages: Vec::new(),
             dir,
             path,
             entries: disk::Entries::new(),
@@ -1029,6 +1036,14 @@ impl Store {
         &self.frontend_data_path
     }
 
+    /// The dependency packages this run's closure reached, by root directory and identity. A
+    /// source under one of these is keyed under the package, so its entry survives the package
+    /// being checked out somewhere else; the root's own files stay keyed relative to the root,
+    /// which is what survives *this* checkout being moved.
+    pub fn set_packages(&mut self, packages: Vec<(PathBuf, String)>) {
+        self.packages = packages;
+    }
+
     /// Trustworthy only once its `content_hash` matches the file's current bytes.
     pub fn fingerprint(&self, path: &Path) -> Option<Arc<SourceFingerprint>> {
         self.frontend.fingerprint(&self.key(path)?)
@@ -1242,8 +1257,25 @@ impl Store {
         self.frontend.is_dirty()
     }
 
+    /// What a path is keyed by: the root's own files by their path inside it, a dependency's by its
+    /// identity and its path inside the package. A file outside both is unkeyed, and never takes the
+    /// fast path.
     fn key(&self, path: &Path) -> Option<String> {
+        if let Some(key) = self.package_key(path) {
+            return Some(key);
+        }
         frontend::source_key(&self.root, path)
+    }
+
+    fn package_key(&self, path: &Path) -> Option<String> {
+        for (root, identity) in &self.packages {
+            let Ok(inside) = path.strip_prefix(root) else {
+                continue;
+            };
+            let inside = frontend::source_key(root, &root.join(inside))?;
+            return Some(format!("{identity}/{inside}"));
+        }
+        None
     }
 }
 

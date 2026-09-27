@@ -101,6 +101,7 @@ pub fn exemplars() -> Exemplars {
     Exemplars {
         fingerprint: SourceFingerprint {
             content_hash: ContentHash([1u8; 32]),
+            module: "user.store".to_string(),
             // Distinct hashes per `DefEntry`, so the pin moves if two are swapped or one dropped.
             defs: vec![
                 DefEntry {
