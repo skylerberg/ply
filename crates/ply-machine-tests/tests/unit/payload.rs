@@ -51,7 +51,10 @@ fn a_fixed_width_integer_crosses_with_its_type() {
     let value = Value::Fixed(ply_eval::Fixed::of(ply_eval::IntTy::U32, 4_000_000_000).unwrap());
     let adt = machine_value(&value, "m").unwrap();
     assert_eq!(adt.to_string(), "m.VFixed(\"U32\", 4000000000)");
-    assert_eq!(value_of_adt(&adt, Span::DUMMY, "m").unwrap().to_string(), "4000000000");
+    assert_eq!(
+        value_of_adt(&adt, Span::DUMMY, "m").unwrap().to_string(),
+        "4000000000"
+    );
     // A U64 above `Int`'s range has no `Int` to cross as.
     let too_big = Value::Fixed(ply_eval::Fixed::new(ply_eval::IntTy::U64, u64::MAX));
     machine_value(&too_big, "m").expect_err("a U64 above i64::MAX does not cross");
@@ -103,5 +106,8 @@ fn the_adt_wire_carries_records_and_ctors_both_ways() {
     ]);
     let wire = adt_to_wire(&machine_value(&value, "m").unwrap(), Span::DUMMY, "m").unwrap();
     let back = wire_to_adt(&wire, Span::DUMMY, "m").unwrap();
-    assert_eq!(back.to_string(), machine_value(&value, "m").unwrap().to_string());
+    assert_eq!(
+        back.to_string(),
+        machine_value(&value, "m").unwrap().to_string()
+    );
 }
