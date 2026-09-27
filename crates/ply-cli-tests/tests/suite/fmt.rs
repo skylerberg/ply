@@ -36,7 +36,10 @@ fn a_file_is_formatted_in_place_and_a_second_run_changes_nothing() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "formatted m.ply\n");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), FORMATTED);
 
-    let out = ply(dir.path()).args(["fmt", "--json"]).output().unwrap();
+    let out = ply(dir.path())
+        .args(["fmt", "--check", "--json"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(0));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["command"], "fmt");
@@ -81,7 +84,10 @@ fn a_file_that_does_not_parse_exits_two_and_is_left_alone() {
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
 
-    let out = ply(dir.path()).args(["fmt", "--json"]).output().unwrap();
+    let out = ply(dir.path())
+        .args(["fmt", "--check", "--json"])
+        .output()
+        .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["exit_code"], 2);
     assert_eq!(v["errors"][0]["path"], "m.ply");
@@ -105,15 +111,24 @@ fn check_codes(dir: &Path, target: &str) -> Vec<String> {
 }
 
 /// A `ply fmt` over `dir`, as JSON. `check` asks what would move instead of moving it.
-fn fmt_json(dir: &Path, check: bool) -> Value {
-    let mut cmd = ply(dir);
-    cmd.arg("fmt");
-    if check {
-        cmd.arg("--check");
-    }
-    let out = cmd.arg("--json").output().unwrap();
+/// `ply fmt --check --json` over `dir`: the report, which is the only shape
+/// `--json` comes in — without `--check` the command rewrites what it names,
+/// and a report that rewrites its own subjects was read as a dry run once
+/// already.
+fn fmt_json(dir: &Path) -> Value {
+    let out = ply(dir)
+        .args(["fmt", "--check", "--json"])
+        .output()
+        .unwrap();
     serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+}
+
+/// The same tree, actually formatted: no `--json`, because that is the shape
+/// that writes. Answers the exit code, which is 2 exactly when a file was
+/// refused — the one thing the report used to say that the write no longer can.
+fn fmt_in_place(dir: &Path) -> Option<i32> {
+    ply(dir).arg("fmt").output().unwrap().status.code()
 }
 
 /// Formats a copy of every `.ply` file under `relative` and requires the result to be a fixed
@@ -138,7 +153,7 @@ fn corpus_round_trip(relative: &str) {
     assert!(!names.is_empty(), "{relative} holds no .ply files");
 
     // What the formatter would move, and what it will not parse.
-    let planned = fmt_json(dir.path(), true);
+    let planned = fmt_json(dir.path());
     let reported: BTreeSet<String> = planned["files"]
         .as_array()
         .expect("a files array")
@@ -195,16 +210,17 @@ fn corpus_round_trip(relative: &str) {
         );
     }
 
-    // One `ply fmt` over the corpus.
-    let done = fmt_json(dir.path(), false);
+    // One `ply fmt` over the corpus, writing: exit 2 exactly when a file was refused.
+    let code = fmt_in_place(dir.path());
     assert_eq!(
-        done["ok"].as_bool(),
-        Some(refused.is_empty()),
-        "{relative}: ply fmt answered {done}"
+        code == Some(2),
+        !refused.is_empty(),
+        "{relative}: ply fmt exited {code:?} with {} refused file(s)",
+        refused.len()
     );
 
     // The answer is a fixed point: a second check finds nothing left to move.
-    let again = fmt_json(dir.path(), true);
+    let again = fmt_json(dir.path());
     let moved: Vec<String> = again["files"]
         .as_array()
         .expect("a files array")
