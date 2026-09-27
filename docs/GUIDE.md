@@ -637,6 +637,13 @@ that names a label answers that label alone, and clauses are matched in order,
 so a clause naming a label belongs before a `[*]` one that would answer it.
 `[*]` on an operation declared without a label is `E0304`.
 
+A **row** may name `[*]` too, and that is what lets a library handle an effect for code it is
+given: `fn sink<a | e>(body: () -> a / {log.note[*] | e}) -> a / {wire.put[c] | e}` says the body
+may perform `log.note` on any label and `sink` answers it. A row written with `[*]` is a licence
+rather than a demand, so a body that performs nothing satisfies it; what the body may *not* do is
+perform an operation the row does not name. `[*]` in a row on an operation declared without a
+label is `E0304`.
+
 A handler discharges an
 **operation**: a clause for `net.send[conn]` removes that atom from the body's
 row, and a clause set covering every operation of a mode (`send`, `recv` and

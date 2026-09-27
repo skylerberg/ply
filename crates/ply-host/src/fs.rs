@@ -239,7 +239,7 @@ impl Roots {
         match at {
             Resource::Named(name) => self.bound.get(name.as_str()).map(PathBuf::as_path),
             // Unreachable when well-typed; `None` keeps a malformed registration a diagnostic.
-            Resource::Var(_) | Resource::Singleton => None,
+            Resource::Var(_) | Resource::Singleton | Resource::Every => None,
         }
     }
 
@@ -678,6 +678,7 @@ pub fn unbound(op: Op, at: &Resource, span: Span) -> Diagnostic {
         Resource::Named(name) => name.as_str().to_string(),
         Resource::Var(v) => ply_ty::label_var_name(*v),
         Resource::Singleton => "the singleton resource".to_string(),
+        Resource::Every => "every label".to_string(),
     };
     Diagnostic::error(
         codes::FS_ROOT_UNBOUND,

@@ -19,6 +19,8 @@ mod tag {
     pub(super) const RESOURCE_NAMED: u8 = 0x20;
     pub(super) const RESOURCE_SINGLETON: u8 = 0x21;
     pub(super) const RESOURCE_VAR: u8 = 0x22;
+    /// Every label: an atom written `op[*]`.
+    pub(super) const RESOURCE_EVERY: u8 = 0x23;
 
     pub(super) const MODE_READ: u8 = 0x28;
     pub(super) const MODE_WRITE: u8 = 0x29;
@@ -181,6 +183,7 @@ fn put_atom(w: &mut Writer, atom: &EffectAtom) {
             w.u32(*v);
         }
         Resource::Singleton => w.tag(tag::RESOURCE_SINGLETON),
+        Resource::Every => w.tag(tag::RESOURCE_EVERY),
     }
     put_mode(w, atom.mode);
     if let Some(op) = &atom.op {
@@ -200,6 +203,7 @@ fn get_atom(r: &mut Reader) -> Decoded<EffectAtom> {
         tag::RESOURCE_NAMED => Resource::Named(r.symbol(WHAT)?),
         tag::RESOURCE_VAR => Resource::Var(LabelVar(r.u32(WHAT)?)),
         tag::RESOURCE_SINGLETON => Resource::Singleton,
+        tag::RESOURCE_EVERY => Resource::Every,
         _ => return Err(crate::binary::DecodeError { what: WHAT, at: 0 }),
     };
     let mode = get_mode(r)?;

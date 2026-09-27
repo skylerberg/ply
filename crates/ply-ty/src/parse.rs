@@ -404,11 +404,18 @@ impl<'a> Parser<'a> {
         }
         let resource = if self.rest().starts_with('[') {
             self.at += 1;
-            let resource = self.name("a resource")?;
-            self.expect("]")?;
-            match self.label_vars.iter().find(|(n, _)| n == resource) {
-                Some((_, v)) => Resource::Var(*v),
-                None => Resource::Named(Symbol::new(resource)),
+            // `[*]` is every label, which is not a name, so it is read before the name scanner.
+            if self.rest().starts_with('*') {
+                self.at += 1;
+                self.expect("]")?;
+                Resource::Every
+            } else {
+                let resource = self.name("a resource")?;
+                self.expect("]")?;
+                match self.label_vars.iter().find(|(n, _)| n == resource) {
+                    Some((_, v)) => Resource::Var(*v),
+                    None => Resource::Named(Symbol::new(resource)),
+                }
             }
         } else {
             Resource::Singleton
