@@ -61,6 +61,19 @@ fn the_bench_verdicts_hold_on_a_generated_corpus() {
     let report = bench(&root);
     assert_eq!(report["ok"].as_bool(), Some(true), "{report:#}");
 
+    // The pipeline section is the harness's own phases beside the toolchain's: it must have run, and
+    // it must have read the tree it walked.
+    let pipeline = &report["pipeline"];
+    assert_eq!(
+        pipeline["ok"].as_bool(),
+        Some(true),
+        "the pipeline did not run: {pipeline:#}"
+    );
+    assert!(
+        pipeline["stages"]["harness"]["files"].as_i64().unwrap_or(0) > 0,
+        "the harness walked no files: {pipeline:#}"
+    );
+
     let warm = scenario(&report, "warm");
     assert_eq!(warm["tests_selected"].as_i64(), Some(0), "{warm:#}");
 
