@@ -1078,7 +1078,7 @@ fn execute(
         }
         None => None,
     };
-    let over = Over {
+    let mut over = Over {
         hermetic: hosts.is_hermetic(),
         label: hosts.label().to_string(),
         operations: hosts.listing().rows.len(),
@@ -1097,7 +1097,16 @@ fn execute(
         failures: report
             .failures
             .iter()
-            .map(|f| fault(f, loaded, hashes, &report))
+            .enumerate()
+            .map(|(i, f)| {
+                fault(
+                    f,
+                    loaded,
+                    hashes,
+                    &report,
+                    hybrids.per_failure.get(i).and_then(|slot| slot.as_ref()),
+                )
+            })
             .collect(),
         results: report.results.iter().map(outcome).collect(),
         summary: report_summary(&report),
@@ -1476,6 +1485,13 @@ struct SuspectView {
 struct FaultView {
     key: String,
     diagnostic: Diagnostic,
+    /// The interpreter failed rather than the program, and the failing run reached a host handler:
+    /// two of the gate's three answers, the third being the program's own `bisect` mode.
+    defect: bool,
+    host: bool,
+    /// What a program that searches for itself needs: the change set, what the classifier could not
+    /// tell apart, the reason to give when there is nothing to try, and where each definition is.
+    search: Option<ChangeSetView>,
     conclusive: bool,
     requested: bool,
     reason: String,
@@ -1493,6 +1509,27 @@ struct FaultView {
     status: Option<&'static str>,
     declared: Option<Vec<String>>,
     observed: Option<Vec<String>>,
+}
+
+/// Every name a change set mentions: its own change, the changes, and the fused groups' members.
+fn delta_names(delta: &ply_test::bisect::Delta) -> Vec<&Symbol> {
+    let mut out: Vec<&Symbol> = Vec::new();
+    if let Some(own) = &delta.test {
+        out.push(&own.name);
+    }
+    out.extend(delta.changes.iter().map(|c| &c.name));
+    out.extend(delta.clusters.iter().flat_map(|c| c.members.iter()));
+    out
+}
+
+/// One failure's change set, as the program reads it. The names are the change set's own, and each
+/// carries the place `ply` would print for it.
+struct ChangeSetView {
+    delta: ply_test::bisect::Delta,
+    classified: usize,
+    test_classified: bool,
+    absent: ply_test::bisect::Skipped,
+    at: Vec<(String, Option<Span>)>,
 }
 
 struct SiteView {
@@ -1653,7 +1690,7 @@ fn outcome(result: &TestResult) -> OutcomeView {
         duration_us: result.duration.as_micros(),
         status: status_str(result.status),
         diagnostic: result.failure.clone(),
-        search: result.simulation.as_ref().map(|e| SearchView {
+search: result.simulation.as_ref().map(|e| SearchView {
             explored: u64::from(e.explored),
             exhaustive: e.exhaustive,
             exhausted: e.exhausted,
@@ -1685,14 +1722,40 @@ fn fault(
     loaded: &Loaded,
     hashes: &HashOutput,
     report: &RunReport,
+    input: Option<&ply_test::HybridInput>,
 ) -> FaultView {
     let check = &loaded.check;
     let index = check.tests.iter().position(|t| t.key == failure.key);
     let test = index.and_then(|i| check.tests.get(i));
     let bisection = &failure.attribution.bisection;
+    let search = input.map(|input| ChangeSetView {
+        delta: input.delta.clone(),
+        classified: input.classified,
+        test_classified: input.test_classified,
+        absent: input.absent,
+        // Every name the change set mentions, with its place: a verdict that this program searched
+        // has no spans of its own, and a report prints where each culprit is.
+        at: {
+            let mut names: Vec<&Symbol> = delta_names(&input.delta);
+            names.sort();
+            names.dedup();
+            names
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.as_str().to_string(),
+                        check.defs.get(name).map(|def| def.span),
+                    )
+                })
+                .collect()
+        },
+    });
     FaultView {
         key: failure.key.as_str().to_string(),
         diagnostic: failure.diagnostic.clone(),
+        defect: failure.defect,
+        host: failure.host,
+        search,
         conclusive: bisection.is_conclusive(),
         // Silent when no bisection was asked for.
         requested: !matches!(
@@ -2060,6 +2123,12 @@ fn fault_value(f: &FaultView) -> PlyValue {
     record(vec![
         ("key", PlyValue::str(&f.key)),
         ("diagnostic", diag_value(&f.diagnostic)),
+        // Two of the gate's three answers; the mode is the program's own flag.
+        ("defect", PlyValue::Bool(f.defect)),
+        ("host", PlyValue::Bool(f.host)),
+        // What a program that searches for itself reads: the change set, what could not be told
+        // apart, the reason to give when there is nothing to try, and where each name is.
+        ("search", option(f.search.as_ref().map(change_set_value))),
         (
             "bisect",
             record(vec![
@@ -2520,4 +2589,130 @@ fn trial_value(trial: &ply_test::bisect::Trial) -> PlyValue {
         ("outcome", outcome),
         ("cached", PlyValue::Bool(trial.cached)),
     ])
+}
+
+
+/// One failure's change set, as the program reads it.
+fn change_set_value(view: &ChangeSetView) -> PlyValue {
+    record(vec![
+        ("delta", delta_value(&view.delta)),
+        ("classified", count(view.classified)),
+        ("test_classified", PlyValue::Bool(view.test_classified)),
+        ("absent", PlyValue::ctor(skipped_ctor(view.absent), Vec::new())),
+        (
+            "at",
+            PlyValue::list(
+                view.at
+                    .iter()
+                    .map(|(name, span)| {
+                        record(vec![
+                            ("name", PlyValue::str(name)),
+                            ("at", option(span.and_then(placed))),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+/// The change set, in the shapes `suite.delta` declares: the names are the cases of its own ADTs,
+/// because that is how a value crosses.
+fn delta_value(delta: &ply_test::bisect::Delta) -> PlyValue {
+    record(vec![
+        ("own", option(delta.test.as_ref().map(change_value))),
+        (
+            "changes",
+            PlyValue::list(delta.changes.iter().map(change_value).collect()),
+        ),
+        (
+            "clusters",
+            PlyValue::list(delta.clusters.iter().map(cluster_value).collect()),
+        ),
+        ("unclassified", count(delta.unclassified)),
+    ])
+}
+
+fn change_value(change: &ply_test::bisect::Change) -> PlyValue {
+    record(vec![
+        ("name", PlyValue::str(change.name.as_str())),
+        ("ns", PlyValue::ctor(ns_ctor(change.ns), Vec::new())),
+        (
+            "before",
+            option(change.before.map(|h| PlyValue::str(h.to_hex()))),
+        ),
+        (
+            "after",
+            option(change.after.map(|h| PlyValue::str(h.to_hex()))),
+        ),
+        ("kind", PlyValue::ctor(kind_ctor(change.kind), Vec::new())),
+        ("independent", PlyValue::Bool(change.independent)),
+    ])
+}
+
+fn cluster_value(cluster: &ply_test::bisect::Cluster) -> PlyValue {
+    record(vec![
+        (
+            "members",
+            strings(cluster.members.iter().map(|n| n.as_str())),
+        ),
+        (
+            "keys",
+            PlyValue::list(
+                cluster
+                    .keys
+                    .iter()
+                    .map(|k| {
+                        record(vec![
+                            ("name", PlyValue::str(k.name.as_str())),
+                            ("ns", PlyValue::ctor(ns_ctor(k.ns), Vec::new())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "reason",
+            PlyValue::ctor(reason_ctor(cluster.reason), Vec::new()),
+        ),
+    ])
+}
+
+fn ns_ctor(ns: ply_test::bisect::Ns) -> &'static str {
+    match ns {
+        ply_test::bisect::Ns::Value => "Value",
+        ply_test::bisect::Ns::Decl => "Decl",
+    }
+}
+
+fn kind_ctor(kind: ply_test::bisect::ChangeKind) -> &'static str {
+    match kind {
+        ply_test::bisect::ChangeKind::Edited => "Edited",
+        ply_test::bisect::ChangeKind::Derived => "Derived",
+        ply_test::bisect::ChangeKind::Added => "Added",
+        ply_test::bisect::ChangeKind::Removed => "Removed",
+    }
+}
+
+fn reason_ctor(reason: ply_test::bisect::FusionReason) -> &'static str {
+    match reason {
+        ply_test::bisect::FusionReason::Independent => "Independent",
+        ply_test::bisect::FusionReason::InterfaceChanged => "InterfaceChanged",
+        ply_test::bisect::FusionReason::Existence => "Existence",
+        ply_test::bisect::FusionReason::Component => "Component",
+    }
+}
+
+fn skipped_ctor(skipped: ply_test::bisect::Skipped) -> &'static str {
+    match skipped {
+        ply_test::bisect::Skipped::NotRequested => "NotRequested",
+        ply_test::bisect::Skipped::NeverPassed => "NeverPassed",
+        ply_test::bisect::Skipped::Host => "Host",
+        ply_test::bisect::Skipped::Nondet => "Nondet",
+        ply_test::bisect::Skipped::Panicked => "Panicked",
+        ply_test::bisect::Skipped::NoChanges => "NoChanges",
+        ply_test::bisect::Skipped::NoBodies => "NoBodies",
+        ply_test::bisect::Skipped::NoHybrids => "NoHybrids",
+        ply_test::bisect::Skipped::Delegated => "Delegated",
+    }
 }
