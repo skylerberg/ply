@@ -1,0 +1,198 @@
+// `pipeline` — where a compile's time goes.
+//
+// The harness times what it runs *itself* — discovering the tree and reading it — and takes the rest
+// from the product: a `ply test` report publishes the phases the toolchain spent (reading, the front
+// end, writing back), so the two together are the whole path from "a directory" to "a checked
+// program". The split matters because the phases have different fixes: a slow discovery is a walk
+// that should not happen twice, a slow read is I/O, and a slow front end is the compiler.
+//
+// A *cold* run and a *warm* one answer different questions — the first is a rebuild, the second is
+// opening a fixture that is already there — so both are reported, and the difference between them is
+// what the cache is worth.
+
+import spine (Finished, exit_zero, ply, report_json, test_report)
+import std.json (Json, Str, Number, Bool, Null, Object, Array, object, array)
+import std.json
+import std.fs (fs)
+import std.fs
+import std.process (process)
+import std.time (time)
+
+// What the harness itself spent, in milliseconds. The phases the toolchain reports arrive with the
+// run's report; these are the ones no report can carry.
+pub type Harness = {
+  discover_ms: Int,
+  read_ms: Int,
+  files: Int,
+  bytes: Int,
+}
+
+// A run's reported phases, and the wall clock around it.
+pub type Stages = {
+  wall_ms: Int,
+  read_ms: Int,
+  front_ms: Int,
+  write_back_ms: Int,
+  /// What the file walk and the reads cost before the toolchain was asked anything.
+  harness: Harness,
+}
+
+/// Every `.ply` file under `dir`, in a fixed order: a directory listing's own order would make the
+/// measurement move between runs.
+pub fn discover(dir: String) -> Result<List<String>, String> / {fs.list_dir[cwd], fs.kind[cwd]} =
+  match fs.list_dir[cwd](dir) {
+    None -> Err("`" ++ dir ++ "` cannot be listed"),
+    Some(names) -> {
+      let entries = sorted(names);
+      let here = filter(entries, |n: String| ends_with(n, ".ply"));
+      let dirs = filter(entries, |n: String| is_dir(dir ++ "/" ++ n));
+      fold(dirs, here, |acc: List<String>, n: String|
+        match discover(dir ++ "/" ++ n) {
+          Ok(deeper) -> appended(acc, deeper),
+          Err(_) -> acc,
+        })
+    },
+  }
+
+fn is_dir(path: String) -> Bool / {fs.kind[cwd]} =
+  match fs.kind[cwd](path) { Some(k) -> k == "dir", None -> false }
+
+fn ends_with(s: String, suffix: String) -> Bool = string_ends_with(s, suffix)
+
+/// The harness's own phases: walking the tree, then reading what it found.
+pub fn harness(dir: String) -> Result<Harness, String> / {
+  fs.list_dir[cwd],
+  fs.kind[cwd],
+  fs.read_file[cwd],
+  time.elapsed_ms,
+} = {
+  let started = time.elapsed_ms();
+  let files = discover(dir)?;
+  let discover_ms = time.elapsed_ms() - started;
+  if len(files) == 0 {
+    return Err("no `.ply` files under `" ++ dir ++ "`");
+  }
+  let read_started = time.elapsed_ms();
+  let bytes = fold(files, 0, |acc: Int, path: String| match fs.read_file[cwd](path) {
+    Some(text) -> acc + len(text),
+    None -> acc,
+  });
+  Ok({
+    discover_ms: discover_ms,
+    read_ms: time.elapsed_ms() - read_started,
+    files: len(files),
+    bytes: bytes,
+  })
+}
+
+/// One compile, as a whole: what this harness spent, and what the product reported.
+pub fn stages(
+  dir: String,
+  clear: Bool,
+) -> Result<Stages, String> / {
+  fs.list_dir[cwd],
+  fs.kind[cwd],
+  fs.read_file[cwd],
+  time.elapsed_ms,
+  process.spawn[ply],
+  cli.env::env.var[sys],
+} = {
+  if clear {
+    let _ = spine::clear(dir);
+  }
+  let measured = harness(dir)?;
+  let started = time.elapsed_ms();
+  let finished = ply(["test", "--json"], dir);
+  let wall_ms = time.elapsed_ms() - started;
+  if !exit_zero(finished) {
+    return Err("the compile failed: " ++ spine::why(finished));
+  }
+  match report_json(finished) {
+    Err(e) -> Err(e),
+    Ok(j) -> match test_report(j) {
+      Err(e) -> Err(e),
+      Ok(report) -> Ok({
+        wall_ms: wall_ms,
+        // The harness has already read the tree once, so the toolchain's own read is what is left:
+        // what it reports here is a second read, and that is exactly the number worth knowing.
+        read_ms: report.read_ms,
+        front_ms: report.front_ms,
+        write_back_ms: report.write_back_ms,
+        harness: measured,
+      }),
+    },
+  }
+}
+
+pub fn stages_json(s: Stages) -> Json =
+  object([
+    { key: "wall_ms", value: Number(decimal_of_int(s.wall_ms)) },
+    { key: "discover_ms", value: Number(decimal_of_int(s.harness.discover_ms)) },
+    { key: "read_ms", value: Number(decimal_of_int(s.harness.read_ms)) },
+    { key: "front_ms", value: Number(decimal_of_int(s.front_ms)) },
+    { key: "write_back_ms", value: Number(decimal_of_int(s.write_back_ms)) },
+    { key: "files", value: Number(decimal_of_int(s.harness.files)) },
+    { key: "source_bytes", value: Number(decimal_of_int(s.harness.bytes)) },
+  ])
+
+pub fn pipelined(dir: String) -> Result<Json, String> / {
+  fs.list_dir[cwd],
+  fs.kind[cwd],
+  fs.read_file[cwd],
+  time.elapsed_ms,
+  process.spawn[ply],
+  cli.env::env.var[sys],
+} =
+  match stages(dir, false) {
+    Err(why) -> Err(why),
+    Ok(rebuild) -> match stages(dir, true) {
+      Err(why) -> Err(why),
+      Ok(cold) -> Ok(object([
+        { key: "rebuild", value: stages_json(rebuild) },
+        { key: "cold", value: stages_json(cold) },
+      ])),
+    },
+  }
+
+// --- Small things -----------------------------------------------------------
+
+fn sorted(xs: List<String>) -> List<String> =
+  fold(xs, [], |acc: List<String>, x: String| {
+    let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+      if i < len(acc) { i } else if compare(x, at(acc, j, "")) == Less { j } else { i });
+    let head = map(range(0, at), |j: Int| at(acc, j, ""));
+    fold(range(at, len(acc)), push(head, x), |out: List<String>, j: Int| push(out, at(acc, j, "")))
+  })
+
+fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) -> x, None -> spare }
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+// --- Tests ------------------------------------------------------------------
+//
+// The arithmetic is the part a fixture can pin; the walk and the reads are exercised by the corpus's
+// own run against a generated tree.
+
+test "a stages record carries both halves of the split" {
+  let s: Stages = {
+    wall_ms: 100,
+    read_ms: 10,
+    front_ms: 80,
+    write_back_ms: 5,
+    harness: { discover_ms: 3, read_ms: 7, files: 4, bytes: 1024 },
+  };
+  let j = stages_json(s);
+  assert_eq(text_of(j, "discover_ms"), "3");
+  assert_eq(text_of(j, "front_ms"), "80");
+  assert_eq(text_of(j, "files"), "4");
+  // The harness's read and the toolchain's are different numbers and both are reported.
+  assert_eq(text_of(j, "read_ms"), "7");
+  assert_eq(text_of(s, "read_ms"), "10")
+}
+
+test "the walk is in a fixed order, so a run does not move between measurements" {
+  assert_eq(sorted(["b.ply", "a.ply", "c.ply"]), ["a.ply", "b.ply", "c.ply"]);
+  assert_eq(sorted([]), []);
+  assert_eq(sorted(["only.ply"]), ["only.ply"])
+}
