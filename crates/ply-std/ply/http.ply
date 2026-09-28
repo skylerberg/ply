@@ -1281,7 +1281,15 @@ pub fn request_to(method: Method, authority: String, target: String, body: Bytes
 
 // One request per connection, so it says `Connection: close`. Panics on a header the program may
 // not set: `Host` comes from `authority`, and the rest as in `encode`.
-pub reuse fn encode_request(r: Request) -> Bytes = {
+pub reuse fn encode_request(r: Request) -> Bytes =
+  bytes_concat_all([request_head(r), b"Connection: close\r\n", b"\r\n", r.body])
+
+// The same request on a connection that stays open. HTTP/1.1 keeps a connection by default, so the
+// difference is the field `encode_request` adds rather than one this leaves out.
+pub reuse fn encode_request_kept(r: Request) -> Bytes =
+  bytes_concat_all([request_head(r), b"\r\n", r.body])
+
+fn request_head(r: Request) -> Bytes = {
   let line = bytes_of_string(method_name(r.method) ++ " " ++ request_target(r) ++ " HTTP/1.1\r\n");
   let host = if has_header(r.headers, "host") {
     panic("`Host` is computed from `Request.authority` and may not be set by the program")
@@ -1292,15 +1300,7 @@ pub reuse fn encode_request(r: Request) -> Bytes = {
     |acc: List<Bytes>, e: { key: String, value: List<String> }|
       fold(e.value, acc, |inner: List<Bytes>, v: String| push(inner, header_bytes(e.key, v))),
   );
-  bytes_concat_all([
-    line,
-    host,
-    bytes_concat_all(fields),
-    request_framing(r),
-    b"Connection: close\r\n",
-    b"\r\n",
-    r.body,
-  ])
+  bytes_concat_all([line, host, bytes_concat_all(fields), request_framing(r)])
 }
 
 fn request_target(r: Request) -> String =
@@ -1357,13 +1357,37 @@ pub fn dial<[l]>(
     },
   }
 
+/// The same over TLS, verifying the server against the roots this run was given (`--trust`).
+pub fn dial_tls<[l]>(
+  host: String,
+  port: Int,
+  limits: Limits,
+) -> Result<Connection, ClientError> / {net.connect_tls[l]} =
+  match net.connect_tls[l](host, port, limits.connect_timeout_ms) {
+    None -> Err(Unreachable),
+    Some(c) -> {
+      let opened: Connection = { handle: c, host: host, port: port };
+      Ok(opened)
+    },
+  }
+
 /// One exchange on a connection that stays open: the request is sent, its answer read whole, and the
 /// connection left for the next `ask`.
 pub fn ask<[l]>(
   c: Connection,
   req: Request,
   limits: Limits,
-) -> Result<Response, ClientError> / {net.send[l], net.recv[l]} = exchange[l](c.handle, req, limits)
+) -> Result<Response, ClientError> / {net.send[l], net.recv[l]} =
+  exchange_over[l](c.handle, req, limits, false)
+
+/// The last exchange on a connection: it says `Connection: close`, so the peer hangs up after
+/// answering, which is what `request` does on a connection of its own.
+pub fn ask_last<[l]>(
+  c: Connection,
+  req: Request,
+  limits: Limits,
+) -> Result<Response, ClientError> / {net.send[l], net.recv[l]} =
+  exchange_over[l](c.handle, req, limits, true)
 
 pub fn close<[l]>(c: Connection) -> Unit / {net.close[l]} = net.close[l](c.handle)
 
@@ -1372,7 +1396,16 @@ fn exchange<[l]>(
   req: Request,
   limits: Limits,
 ) -> Result<Response, ClientError> / {net.send[l], net.recv[l]} =
-  if !send_all[l](c, encode_request(req), limits.write_timeout_ms) { Err(NotSent) } else {
+  exchange_over[l](c, req, limits, true)
+
+fn exchange_over<[l]>(
+  c: Int,
+  req: Request,
+  limits: Limits,
+  close: Bool,
+) -> Result<Response, ClientError> / {net.send[l], net.recv[l]} = {
+  let out = if close { encode_request(req) } else { encode_request_kept(req) };
+  if !send_all[l](c, out, limits.write_timeout_ms) { Err(NotSent) } else {
     match read_head[l](c, b"", limits, false) {
       HeadTimedOut -> Err(TimedOut),
       HeadIdle -> Err(TimedOut),
@@ -1393,6 +1426,7 @@ fn exchange<[l]>(
       },
     }
   }
+}
 
 fn read_answer<[l]>(
   c: Int,
@@ -3067,43 +3101,70 @@ test "a peer that stops taking bytes is reported as not sent" {
   assert_eq(answer, Err(NotSent))
 }
 
-test "a connection is dialled once and asked twice" {
+test "a kept connection sends every request but the last without `Connection`" {
   let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-  with_cell[inbox]([Some(answer), Some(answer)]) { inbox -> {
-    with_cell[dialled](0) { dialled -> {
-      with_cell[closed](0) { closed -> {
-        let both = handle {
-          match dial[conn]("example.org", 80, client_limits()) {
-            Err(_) -> (Err(Unreachable), Err(Unreachable)),
-            Ok(c) -> {
-              let first = ask[conn](c, request_to(Get, "example.org", "/a", b""), client_limits());
-              let second = ask[conn](c, request_to(Get, "example.org", "/b", b""), client_limits());
-              close[conn](c);
-              (first, second)
+  with_cell[inbox]([Some(answer), Some(answer), Some(answer)]) { inbox -> {
+    with_cell[sent](b"") { sent -> {
+      with_cell[dialled](0) { dialled -> {
+        with_cell[closed](0) { closed -> {
+          let answers = handle {
+            match dial[conn]("example.org", 80, client_limits()) {
+              Err(_) -> (Err(Unreachable), Err(Unreachable), Err(Unreachable)),
+              Ok(c) -> {
+                let first = ask[conn](
+                  c,
+                  request_to(Get, "example.org", "/a", b""),
+                  client_limits(),
+                );
+                let second = ask[conn](
+                  c,
+                  request_to(Get, "example.org", "/b", b""),
+                  client_limits(),
+                );
+                let last = ask_last[conn](
+                  c,
+                  request_to(Get, "example.org", "/c", b""),
+                  client_limits(),
+                );
+                close[conn](c);
+                (first, second, last)
+              },
+            }
+          } with {
+            net.connect[conn](host, port, t) -> {
+              cell_set(dialled, cell_get(dialled) + 1);
+              Some(7)
             },
-          }
-        } with {
-          net.connect[conn](host, port, t) -> {
-            cell_set(dialled, cell_get(dialled) + 1);
-            Some(7)
-          },
-          net.recv[conn](c, max, t) -> {
-            let queued = cell_get(inbox);
-            cell_set(inbox, rest_answers(queued));
-            next_answer(queued)
-          },
-          net.send[conn](c, payload, t) -> Some(bytes_len(payload)),
-          net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
-        };
-        // One connection for both exchanges, and closed once at the end.
-        assert_eq(cell_get(dialled), 1);
-        assert_eq(cell_get(closed), 1);
-        let expected = Ok({
-          status: 200,
-          headers: set_header(empty_headers(), "content-length", "5"),
-          body: b"hello",
-        });
-        assert_eq(both, (expected, expected))
+            net.recv[conn](c, max, t) -> {
+              let queued = cell_get(inbox);
+              cell_set(inbox, rest_answers(queued));
+              next_answer(queued)
+            },
+            net.send[conn](c, payload, t) -> {
+              cell_set(sent, bytes_concat(cell_get(sent), payload));
+              Some(bytes_len(payload))
+            },
+            net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
+          };
+          // One connection for all three exchanges, and closed once at the end.
+          assert_eq(cell_get(dialled), 1);
+          assert_eq(cell_get(closed), 1);
+          // HTTP/1.1 keeps a connection by default, so only the one that ends it says so.
+          assert_eq(
+            cell_get(sent),
+            bytes_concat_all([
+              b"GET /a HTTP/1.1\r\nHost: example.org\r\n\r\n",
+              b"GET /b HTTP/1.1\r\nHost: example.org\r\n\r\n",
+              b"GET /c HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n",
+            ]),
+          );
+          let expected = Ok({
+            status: 200,
+            headers: set_header(empty_headers(), "content-length", "5"),
+            body: b"hello",
+          });
+          assert_eq(answers, (expected, expected, expected))
+        } }
       } }
     } }
   } }
