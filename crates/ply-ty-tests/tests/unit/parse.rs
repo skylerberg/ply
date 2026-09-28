@@ -84,7 +84,7 @@ fn shapes() -> Vec<Type> {
             Symbol::new("Cell"),
             vec![Type::Var(TyVar(5)), Type::list(Type::int())],
         ),
-        Type::secret(Type::string()),
+        Type::Con(Symbol::new("Secret"), vec![Type::string()]),
         Type::con("U8"),
     ]
 }

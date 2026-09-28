@@ -5,8 +5,8 @@ use crate::property::{
 };
 use ply_eval::IntTy;
 use ply_eval::{Decimal, Fixed, List, Value};
+use ply_eval::{SECRET, TASK_TYPE};
 use ply_span::{Diagnostic, Symbol};
-use ply_ty::TASK_TYPE;
 use ply_ty::Type;
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -208,7 +208,7 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
             "Map" => Ok(Value::empty_map()),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == TASK_TYPE => Err(Ungeneratable::Task),
-            _ if name.as_str() == ply_ty::SECRET => Err(Ungeneratable::Secret),
+            _ if name.as_str() == SECRET => Err(Ungeneratable::Secret),
             _ => {
                 let Some((variant, fields)) = shallowest(name, args, world) else {
                     return Err(Ungeneratable::Uninhabited(name.clone()));
