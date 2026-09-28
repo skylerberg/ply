@@ -1,0 +1,290 @@
+// The corpus's load client: connections opened as tasks, requests sent on them, and the clock read
+// around each exchange.
+//
+// It is a program rather than a library because what it measures is a run: one task per connection,
+// so the concurrency is the program's rather than a caller's thread pool's, and a reading is one the
+// program took rather than one taken of it. Everything it needs comes from the run's configuration
+// (`--set LOAD_PORT=…`), and everything it found goes to one JSON file, so its caller reads a
+// result rather than a process's streams.
+//
+// What it reports are the samples, not the summary: a percentile is the reading's *report*, and the
+// caller that renders a table is the one that decides how to summarise (§ the corpus's measurements).
+
+import std.config
+import std.config (config)
+import std.fs
+import std.fs (fs)
+import std.http
+import std.http (Connection, Get, Limits, default_limits, request_to)
+import std.json
+import std.json (Json)
+import std.net (net)
+import std.router (int_of_text)
+import std.time
+import std.time (time)
+
+// --- What the run was told --------------------------------------------------
+
+pub fn host_key() -> String = "LOAD_HOST"
+
+pub fn port_key() -> String = "LOAD_PORT"
+
+// The routes one connection cycles through, comma-separated: `/health,/items`.
+pub fn routes_key() -> String = "LOAD_ROUTES"
+
+pub fn connections_key() -> String = "LOAD_CONNECTIONS"
+
+// Requests one connection carries before it is closed and another opened.
+pub fn per_conn_key() -> String = "LOAD_PER_CONN"
+
+pub fn tls_key() -> String = "LOAD_TLS"
+
+// Where the report is written, relative to the root the `report` resource names.
+pub fn report_key() -> String = "LOAD_REPORT"
+
+pub fn config() -> config::ConfigSpec =
+  config::spec([
+    config::with_default(host_key(), config::SText, "127.0.0.1"),
+    config::required(port_key(), config::SInt),
+    config::with_default(routes_key(), config::SText, "/health"),
+    config::required(connections_key(), config::SInt),
+    config::required(per_conn_key(), config::SInt),
+    config::with_default(tls_key(), config::SBool, "false"),
+    config::required(report_key(), config::SText),
+  ])
+
+// What the client performs: one connection per task, and the clock read around the work.
+effect set Load = {config.get[load], net.connect[link], net.connect_tls[link], net.send[link], net.recv[link], net.close[link], fs.write_file[report], task.spawn, task.join, time.elapsed_us}
+
+// --- What one connection saw ------------------------------------------------
+
+pub type Found = {
+  latencies: List<Int>,
+  connects: List<Int>,
+  handshakes: List<Int>,
+  answered: Int,
+  statuses: Map<String, Int>,
+  failures: List<String>,
+}
+
+pub fn empty_found() -> Found =
+  { latencies: [], connects: [], handshakes: [], answered: 0, statuses: map_new(), failures: [] }
+
+/// Everything two connections found, together: the report is of the run, not of one of its tasks.
+pub fn merge(a: Found, b: Found) -> Found =
+  {
+    latencies: also(a.latencies, b.latencies),
+    connects: also(a.connects, b.connects),
+    handshakes: also(a.handshakes, b.handshakes),
+    answered: a.answered + b.answered,
+    statuses: merge_counts(a.statuses, b.statuses),
+    failures: also(a.failures, b.failures),
+  }
+
+/// `head` then `tail`: there is no builtin for it, and both are lists the run owns.
+pub fn also<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+fn merge_counts(a: Map<String, Int>, b: Map<String, Int>) -> Map<String, Int> =
+  fold(map_entries(b), a, |acc: Map<String, Int>, e: { key: String, value: Int }|
+    map_insert(acc, e.key, count_of(acc, e.key) + e.value))
+
+fn count_of(m: Map<String, Int>, key: String) -> Int =
+  match map_get(m, key) { Some(n) -> n, None -> 0 }
+
+// --- Reading the run's settings ---------------------------------------------
+
+fn configured(key: String, fallback: String) -> String / {config.get[load]} =
+  match config.get[load](key) { Some(value) -> value, None -> fallback }
+
+fn configured_number(key: String) -> Int / {config.get[load]} =
+  match config.get[load](key) {
+    None -> panic(key ++ " is unset"),
+    Some(text) -> match int_of_text(text) {
+      None -> panic(key ++ " is `" ++ text ++ "`, which is not a number"),
+      Some(n) -> n,
+    },
+  }
+
+fn configured_flag(key: String) -> Bool / {config.get[load]} = configured(key, "false") == "true"
+
+/// The paths one connection cycles through, in the order they were given.
+pub fn route_paths() -> List<String> / {config.get[load]} = {
+  let given = filter(
+    map(string_split(configured(routes_key(), "/health"), ","), string_trim),
+    |part: String| string_len(part) > 0,
+  );
+  if len(given) == 0 { ["/health"] } else { given }
+}
+
+// --- One connection ---------------------------------------------------------
+
+fn limits() -> Limits = default_limits()
+
+fn why_text(why: http::ClientError) -> String =
+  match why {
+    http::Unreachable -> "the host was not reachable",
+    http::NotSent -> "the request could not be sent",
+    http::TimedOut -> "the answer did not arrive in time",
+    http::Closed -> "the server closed the connection",
+    http::Malformed(r) -> "the answer was refused: " ++ r.reason,
+  }
+
+/// One connection: dial it, spend `per_conn` requests on it, close it.
+///
+/// A TLS connection's handshake happens inside `net.connect_tls` the first time the connection is
+/// written to, so its `connect` sample covers the handshake and its first request's latency carries
+/// one too. The plaintext samples, which are the ones a ladder is built from, do not.
+fn one_connection(
+  host: String,
+  port: Int,
+  routes: List<String>,
+  per_conn: Int,
+  tls: Bool,
+  at: Int,
+) -> Found / {net.connect[link], net.connect_tls[link], net.send[link], net.recv[link], net.close[link], time.elapsed_us} = {
+  let began = time.elapsed_us();
+  let opened = if tls { http::dial_tls[link](host, port, limits()) }
+  else { http::dial[link](host, port, limits()) };
+  let connected = time.elapsed_us() - began;
+  match opened {
+    Err(why) -> { ..empty_found(), failures: [why_text(why)] },
+    Ok(conn) -> {
+      let found = exchanges(conn, routes, per_conn, at, empty_found());
+      http::close[link](conn);
+      { ..found, connects: push(found.connects, connected) }
+    },
+  }
+}
+
+/// `per_conn` exchanges on one connection, starting at `at` in the mix so two connections do not
+/// send identical requests.
+fn exchanges(
+  conn: Connection,
+  routes: List<String>,
+  left: Int,
+  next: Int,
+  acc: Found,
+) -> Found / {net.send[link], net.recv[link], time.elapsed_us} =
+  if left <= 0 { acc } else {
+    let route = route_at(routes, next);
+    let req = request_to(Get, conn.host, route, b"");
+    let began = time.elapsed_us();
+    // The last one says `Connection: close`, so the peer hangs up after answering it.
+    let answer = if left == 1 { http::ask_last[link](conn, req, limits()) }
+    else { http::ask[link](conn, req, limits()) };
+    let spent = time.elapsed_us() - began;
+    match answer {
+      Err(why) -> { ..acc, failures: push(acc.failures, route ++ ": " ++ why_text(why)) },
+      Ok(response) ->
+        exchanges(conn, routes, left - 1, next + 1, {
+          ..acc,
+          latencies: push(acc.latencies, spent),
+          answered: acc.answered + 1,
+          statuses: map_insert(
+            acc.statuses,
+            int_to_string(response.status),
+            count_of(acc.statuses, int_to_string(response.status)) + 1,
+          ),
+        }),
+    }
+  }
+
+fn route_at(routes: List<String>, at: Int) -> String =
+  match list_at(routes, at - at / len(routes) * len(routes)) {
+    Some(route) -> route,
+    None -> "/health",
+  }
+
+// --- What the run writes down -----------------------------------------------
+
+fn number(n: Int) -> Json = json::Number(decimal_of_int(n))
+
+fn numbers(xs: List<Int>) -> Json = json::Array(map(xs, |n: Int| number(n)))
+
+fn texts(xs: List<String>) -> Json = json::Array(map(xs, |s: String| json::Str(s)))
+
+fn counts(m: Map<String, Int>) -> Json =
+  json::Object(
+    map_of_entries(
+      map(map_entries(m), |e: { key: String, value: Int }| { key: e.key, value: number(e.value) }),
+    ),
+  )
+
+pub fn report(found: Found, connections: Int, per_conn: Int, wall_micros: Int) -> Json =
+  json::object([
+    { key: "requests", value: number(found.answered + len(found.failures)) },
+    { key: "answered", value: number(found.answered) },
+    { key: "connections", value: number(connections) },
+    { key: "per_conn", value: number(per_conn) },
+    { key: "wall_micros", value: number(wall_micros) },
+    // In the order a connection took them, connections in the order they were spawned.
+    { key: "latencies", value: numbers(found.latencies) },
+    { key: "connects", value: numbers(found.connects) },
+    { key: "handshakes", value: numbers(found.handshakes) },
+    { key: "statuses", value: counts(found.statuses) },
+    { key: "failures", value: texts(found.failures) },
+  ])
+
+fn main() -> Int / {Load} = {
+  let host = configured(host_key(), "127.0.0.1");
+  let port = configured_number(port_key());
+  let connections = configured_number(connections_key());
+  let per_conn = configured_number(per_conn_key());
+  let tls = configured_flag(tls_key());
+  let routes = route_paths();
+  let where = configured(report_key(), "load.json");
+  let began = time.elapsed_us();
+  let tasks = map(range(0, connections), |at: Int|
+    task.spawn(|| one_connection(host, port, routes, per_conn, tls, at)));
+  let found = fold(tasks, empty_found(), |acc: Found, t: Task<Found>| merge(acc, task.join(t)));
+  let wall = time.elapsed_us() - began;
+  if fs.write_file[report](where, json::to_bytes(report(found, connections, per_conn, wall))) { 0 }
+  else { panic("the report could not be written to " ++ where) }
+}
+
+// --- Tests: what a run was told, and what it writes down --------------------
+
+test "the routes are the paths a run was given, in order" {
+  handle {
+    assert_eq(route_paths(), ["/health", "/items"])
+  } with {
+    config.get[load](key) -> if key == routes_key() { Some("/health, /items") } else { None },
+  }
+}
+
+test "a run told nothing cycles through `/health`" {
+  handle { assert_eq(route_paths(), ["/health"]) } with { config.get[load](key) -> None }
+}
+
+test "the report carries every sample and both counts" {
+  let found = {
+    ..empty_found(),
+    latencies: [10, 30, 20],
+    connects: [100],
+    answered: 3,
+    statuses: map_of_entries([{ key: "200", value: 3 }]),
+  };
+  let written = json::to_string(report(found, 1, 3, 250));
+  assert(string_contains(written, "\"latencies\":[10,30,20]"));
+  assert(string_contains(written, "\"requests\":3"));
+  assert(string_contains(written, "\"wall_micros\":250"));
+  assert(string_contains(written, "\"statuses\":{\"200\":3}"));
+  assert(string_contains(written, "\"failures\":[]"))
+}
+
+test "merging two connections adds their samples and their counts" {
+  let one = { ..empty_found(), latencies: [1], answered: 1 };
+  let two = {
+    ..empty_found(),
+    latencies: [2, 3],
+    answered: 2,
+    failures: ["/items: the answer did not arrive in time"],
+    statuses: map_of_entries([{ key: "500", value: 2 }]),
+  };
+  let both = merge(one, two);
+  assert_eq(both.answered, 3);
+  assert_eq(len(both.latencies), 3);
+  assert_eq(len(both.failures), 1);
+  assert_eq(map_get(both.statuses, "500"), Some(2))
+}
