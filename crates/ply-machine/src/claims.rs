@@ -43,13 +43,13 @@ const EFFECT: &str = "prover";
 /// the only place that says it. `every_marshalled_type_is_declared_where_this_side_says` holds
 /// every row to the program, because a tag that names no declaration is a placeless `no arm of this
 /// match matched` the moment the program matches the value.
-const MARSHALLED: &[(&str, &str)] = &[
-    ("claims", "Evidence"),
-    ("claims", "Outcome"),
-    ("claims", "Point"),
+pub const MARSHALLED: &[(&str, &str)] = &[
     ("claims", "Refusal"),
     ("proof.domain", "Ty"),
     ("proof.obligation", "Frame"),
+    ("proof.obligation", "Evidence"),
+    ("proof.obligation", "Outcome"),
+    ("proof.obligation", "Point"),
     ("proof.obligation", "Gap"),
     ("proof.obligation", "Kind"),
     ("proof.obligation", "Moved"),
