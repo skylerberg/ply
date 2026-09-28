@@ -24,6 +24,9 @@ use std::time::Instant;
 /// convert into this.
 #[derive(Clone, Debug)]
 pub struct RunOptions {
+    /// The front end the CLI ran. A run without one is refused rather than loading again: the
+    /// CLI walks the tree and runs the compiler, and this side reads the answer.
+    pub front: Option<crate::driver::HandedFront>,
     /// The target's argument vector: what its `process.args` answers.
     pub argv: Vec<String>,
     /// `--json` promises stdout to the one object, so the program's own lines go to stderr.
@@ -49,6 +52,7 @@ pub struct RunOptions {
 impl Default for RunOptions {
     fn default() -> RunOptions {
         RunOptions {
+            front: None,
             argv: Vec::new(),
             json: false,
             steps: 0,
@@ -98,6 +102,7 @@ impl Target {
     pub fn open(
         path: &std::path::Path,
         cache: bool,
+        front: Option<&crate::driver::HandedFront>,
     ) -> Result<(Target, Option<ply_store::Store>), Refused> {
         if path.extension().is_some_and(|e| e == artifact::EXTENSION) {
             return deployment(path).map(|d| (Target::Deployed(Box::new(d)), None));
@@ -122,6 +127,14 @@ impl Target {
                 artifact: None,
             });
         }
+        // A front end handed over is the CLI's own load, read here rather than repeated. A load with
+        // none is a *program* loading a program of its own, at a root it chose while running: nobody
+        // could have handed one, so the compiler is lent for that load and that load only.
+        let refused = |err: crate::load::LoadError| Refused {
+            diagnostics: err.diagnostics,
+            sources: err.sources,
+            artifact: None,
+        };
         let loaded = if cache {
             // The store is the project's, so a file path roots at the file's directory.
             let root = crate::load::project_root(path);
@@ -132,22 +145,37 @@ impl Target {
                     sources: SourceMap::new(),
                     artifact: None,
                 })?;
-            crate::driver::load_incremental(path, &mut store)
+            let loaded = match front {
+                Some(front) => crate::driver::load_over_front(
+                    path,
+                    &front.files,
+                    &front.packages,
+                    &front.dump,
+                    front.read,
+                    front.front,
+                    crate::driver::Mode::Incremental,
+                    Some(&mut store),
+                ),
+                None => crate::driver::load_incremental(path, &mut store),
+            };
+            loaded
                 .map(|loaded| (loaded, Some(store)))
-                .map_err(|err| Refused {
-                    diagnostics: err.diagnostics,
-                    sources: err.sources,
-                    artifact: None,
-                })?
+                .map_err(refused)?
         } else {
-            (
-                crate::load::load(path).map_err(|err| Refused {
-                    diagnostics: err.diagnostics,
-                    sources: err.sources,
-                    artifact: None,
-                })?,
-                None,
-            )
+            let loaded = match front {
+                Some(front) => crate::driver::load_over_front(
+                    path,
+                    &front.files,
+                    &front.packages,
+                    &front.dump,
+                    front.read,
+                    front.front,
+                    crate::driver::Mode::Full,
+                    None,
+                ),
+                None => crate::load::load(path),
+            };
+            (loaded.map_err(refused)?, None)
         };
         let (loaded, store) = loaded;
         match crate::costs::broken_promises(&loaded) {
@@ -298,7 +326,7 @@ impl Drive {
     /// Load the target at `path`; the answer a `load` op hands back.
     pub fn open(options: RunOptions, path: &std::path::Path) -> Result<Drive, Refused> {
         let cache = options.cache;
-        let (target, store) = Target::open(path, cache)?;
+        let (target, store) = Target::open(path, cache, options.front.as_ref())?;
         Ok(Drive {
             options,
             target,
@@ -314,13 +342,16 @@ impl Drive {
     }
 
     /// The load again, for a tree that moved; artifacts are read fresh from their file.
-    pub fn reload(&mut self) -> Result<(), Refused> {
+    ///
+    /// The front end comes with the asking: the tree moved, so the one the load was handed is the
+    /// tree as it *was*, and whoever noticed the move re-ran the compiler for this one.
+    pub fn reload(&mut self, front: &crate::driver::HandedFront) -> Result<(), Refused> {
         let path = std::path::PathBuf::from(match &self.target {
             Target::Project(loaded) => loaded.root.display().to_string(),
             Target::Deployed(d) => d.path.clone(),
         });
         let cache = self.options.cache;
-        let (target, store) = Target::open(&path, cache)?;
+        let (target, store) = Target::open(&path, cache, Some(front))?;
         self.target = target;
         self.store = store;
         self.bound = None;
@@ -1192,6 +1223,7 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
     let config_v = get("config")?;
     let trace_v = get("trace")?;
     Ok(RunOptions {
+        front: None,
         argv: str_list("argv")?,
         allow: str_list("allow")?,
         json: bool_at("json")?,

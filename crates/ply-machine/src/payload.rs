@@ -191,6 +191,28 @@ pub fn field_of<'a>(
     }
 }
 
+/// An `Option` a caller built, read without knowing what is inside it.
+pub fn option_of<'v>(
+    value: &'v PlyValue,
+    what: &str,
+    span: Span,
+) -> Result<Option<&'v PlyValue>, Diagnostic> {
+    match value {
+        PlyValue::Ctor { name, args } if name.as_str() == "Some" => {
+            args.first().map(Some).ok_or_else(|| {
+                Diagnostic::error(codes::INTERNAL_ERROR, format!("`Some` holds no {what}"))
+                    .primary(span, "empty `Some`")
+            })
+        }
+        PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
+        other => Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("`{what}` is an option, and this is {other}"),
+        )
+        .primary(span, "an option")),
+    }
+}
+
 pub fn opt_str_at(value: &PlyValue, name: &str, span: Span) -> Result<Option<String>, Diagnostic> {
     match field_of(value, name, span)? {
         PlyValue::Ctor { name, args } if name.as_str() == "Some" => Ok(args

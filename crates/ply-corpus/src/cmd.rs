@@ -112,13 +112,28 @@ pub fn run_ply_subcommand(entry: &str, args: Vec<Value>, cwd: &Path, ply: &Path)
             ply_codegen::Unit::embedded(&opened.front, text).map_err(|e| anyhow!("{e:#}"))?;
         machine.set_compiled(ply_eval::Provider::attach(unit));
     }
+    // The corpus program loads the fixtures it writes, so it needs the roots the loader reads:
+    // the tree it is working in, the shipped modules it pulls, and the filesystem root a path
+    // that leaves the working directory is addressed under.
+    let shelf = ply_launcher::shipped::shelf()
+        .map_err(|d| anyhow!("the shipped modules could not be laid out: {}", d.message))?;
     let host = std::sync::Arc::new(
         ply_host::Host::new()
             .rooted(ply_host::fs::Roots::load(
-                &[ply_host::fs::RootSpec {
-                    name: "cwd".to_string(),
-                    path: cwd.to_path_buf(),
-                }],
+                &[
+                    ply_host::fs::RootSpec {
+                        name: "cwd".to_string(),
+                        path: cwd.to_path_buf(),
+                    },
+                    ply_host::fs::RootSpec {
+                        name: "shelf".to_string(),
+                        path: shelf,
+                    },
+                    ply_host::fs::RootSpec {
+                        name: "abs".to_string(),
+                        path: std::path::PathBuf::from("/"),
+                    },
+                ],
                 Span::DUMMY,
             )?)
             .with_process(
