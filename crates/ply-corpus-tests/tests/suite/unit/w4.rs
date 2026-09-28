@@ -1,4 +1,4 @@
-use ply_corpus::w4::{Program, Workload};
+use ply_corpus::w4::{Program, Workload, served_args};
 use ply_eval::Value;
 
 #[test]
@@ -53,6 +53,55 @@ fn the_fixture_ddl_is_the_programs_own() {
     assert_eq!(ddl.len(), 1, "the fixture is one table");
     assert!(ddl[0].starts_with("create table \"part\""), "{}", ddl[0]);
     assert!(ddl[0].contains("numeric(10,4)"), "{}", ddl[0]);
+}
+
+/// A served section builds a `ply run --host` command line, and a flag the CLI does not declare is
+/// a refusal when the section finally runs — which no CI job reaches. `ply hosts` parses the same
+/// flags and resolves the same configuration without opening a database, so the shape is checked
+/// here: the sections' own `served_args`, driven through the real CLI.
+#[test]
+fn a_served_run_takes_the_flags_the_sections_pass() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        root.join("crates/ply-corpus/fixtures/desk-sequential-postgres.ply"),
+        dir.path().join("desk.ply"),
+    )
+    .unwrap();
+
+    let url = "postgres://nobody@127.0.0.1:1/none";
+    let mut args = vec![
+        "hosts".to_string(),
+        "desk.ply".to_string(),
+        "--host".to_string(),
+    ];
+    args.extend(served_args(8199, 8, "bench-key", Some(url)));
+    args.extend([
+        "--trace".to_string(),
+        "off".to_string(),
+        "--drain-ms".to_string(),
+        "100".to_string(),
+    ]);
+
+    let out = std::process::Command::new(crate::support::ply())
+        .args(&args)
+        .current_dir(dir.path())
+        .output()
+        .expect("the CLI runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "`ply hosts` refused the flags a served section passes:\n{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("DESK_DATABASE={url}")),
+        "the setting a served run carries did not reach the listing:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "the CLI does not take a flag the sections pass:\n{stderr}"
+    );
 }
 
 #[test]

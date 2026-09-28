@@ -4,20 +4,17 @@
 --     $ psql -d desk -f examples/desk.sql
 --     $ examples/serve.sh --db postgres://localhost/desk
 --
--- **This file is not the authority and must not become one.** `desk.schema` in
+-- **This file is not the authority and must not become one.** `schema()` in
 -- `examples/desk.ply` is, and the statements below are what `db::create_schema`
 -- renders it to, written out so that a database can be created without a Ply
 -- program having to be the thing that creates it — W4 ships a schema as a value
 -- and refuses to ship a migration tool, and this is the honest shape of that
 -- refusal.
 --
--- What keeps the two from drifting is not care. It is `--db-schema desk.schema`,
--- which `examples/serve.sh` always passes: at bind time the driver materialises
--- `desk.schema`, reads `information_schema` and `pg_constraint`, and reports
--- `E0435` naming every difference — a missing table, a missing column, a type
--- that does not match, a nullability that disagrees — before a single request is
--- served. A column renamed in one file and not the other is a start-up refusal
--- you can read, rather than a 500 on whichever route touched it first.
+-- Nothing checks the two against each other: a change to `schema()` and a change
+-- to this file are one change by hand, and a drift surfaces as a failed statement
+-- on whichever route touched it first. `examples/same-tests.sh` applies this file
+-- and then runs the desk against both stores, which is where a drift is caught.
 --
 -- The `create table` text is `create_schema`'s, quoting and all, so a diff
 -- between this file and that function is a diff a reader can do by eye.
