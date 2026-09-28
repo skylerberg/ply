@@ -1763,6 +1763,21 @@ and is what a query string and a form body carry. A decoder is total and answers
 empty part is passed over, a part with no `=` is a name with an empty value) and
 `query_build` spells them back with `form_encode` on both sides.
 
+### 13.21 `std.csv`
+
+```ply
+pub fn csv_parse(text: String) -> Option<List<List<String>>>
+pub fn csv_build(rows: List<List<String>>) -> String
+```
+
+RFC 4180: records of fields, a field quoted with `"` exactly when it holds a
+comma, a quote, CR or LF, and an embedded quote doubled. A reader is total and
+answers `None` for what the RFC does not name — an unterminated quoted field,
+text after a closing quote, a quote inside an unquoted field, a bare carriage
+return. A bare line feed also ends a record, because files in the world have
+one; the writer always writes CRLF. A trailing line break adds no record and an
+empty line is one empty field.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the

@@ -1,0 +1,134 @@
+// `csv` — RFC 4180: records of fields, with quoting when a field needs it.
+//
+// A parser that is total: `csv_parse` answers `None` for what RFC 4180 does not name — an
+// unterminated quoted field, text after a closing quote, a quote inside an unquoted field, a bare
+// carriage return — rather than guessing. A bare line feed ends a record too, because files in the
+// world have one and refusing them would make the reader useless; the writer always writes CRLF.
+// A trailing line break does not add an empty record, and an empty line is one empty field, which
+// is what a spreadsheet does.
+
+pub fn csv_parse(text: String) -> Option<List<List<String>>> = csv_records(text, 0, [])
+
+/// The text for a table: every field quoted only if it has to be, every record ended with CRLF
+/// except the last.
+pub fn csv_build(rows: List<List<String>>) -> String = join_all(map(rows, csv_row_text), "\r\n")
+
+fn csv_records(text: String, at: Int, acc: List<List<String>>) -> Option<List<List<String>>> =
+  if at >= string_len(text) { Some(acc) } else {
+    match csv_record(text, at) {
+      None -> None,
+      Some(record) -> if record.at >= string_len(text) { Some(push(acc, record.fields)) }
+      else { csv_records(text, record.at, push(acc, record.fields)) },
+    }
+  }
+
+// One record from `at`, and the index just past its terminator (or the end of the text).
+fn csv_record(text: String, at: Int) -> Option<{ fields: List<String>, at: Int }> =
+  match csv_field(text, at) {
+    None -> None,
+    Some(field) -> csv_more_fields(text, field.at, [field.text]),
+  }
+
+fn csv_more_fields(
+  text: String,
+  at: Int,
+  acc: List<String>,
+) -> Option<{ fields: List<String>, at: Int }> =
+  if at >= string_len(text) { Some({ fields: acc, at: at }) } else {
+    let c = string_slice(text, at, at + 1);
+    if c == "," {
+      match csv_field(text, at + 1) {
+        None -> None,
+        Some(field) -> csv_more_fields(text, field.at, push(acc, field.text)),
+      }
+    } else if c == "\n" { Some({ fields: acc, at: at + 1 }) } else if c == "\r" {
+      if at + 1 < string_len(text) && string_slice(text, at + 1, at + 2) == "\n" {
+        Some({ fields: acc, at: at + 2 })
+      } else { None }
+    } else {
+      // Text after a closing quote: RFC 4180 names nothing there.
+      None
+    }
+  }
+
+fn csv_field(text: String, at: Int) -> Option<{ text: String, at: Int }> =
+  if at < string_len(text) && string_slice(text, at, at + 1) == "\"" {
+    csv_quoted(text, at + 1, "")
+  } else { csv_unquoted(text, at, "") }
+
+// A field without quotes: up to a comma, a line break, or the end. A quote here is an error rather
+// than a literal, because a caller that wanted one had to quote the field.
+fn csv_unquoted(text: String, at: Int, acc: String) -> Option<{ text: String, at: Int }> =
+  if at >= string_len(text) { Some({ text: acc, at: at }) } else {
+    let c = string_slice(text, at, at + 1);
+    if c == "," || c == "\n" { Some({ text: acc, at: at }) }
+    else if c == "\"" { None } else if c == "\r" {
+      if at + 1 < string_len(text) && string_slice(text, at + 1, at + 2) == "\n" {
+        Some({ text: acc, at: at })
+      } else { None }
+    } else { csv_unquoted(text, at + 1, acc ++ c) }
+  }
+
+// A quoted field: `""` is one quote, and the closing quote ends it. A field that never closes is
+// `None`.
+fn csv_quoted(text: String, at: Int, acc: String) -> Option<{ text: String, at: Int }> =
+  if at >= string_len(text) { None } else {
+    let c = string_slice(text, at, at + 1);
+    if c == "\"" {
+      if at + 1 < string_len(text) && string_slice(text, at + 1, at + 2) == "\"" {
+        csv_quoted(text, at + 2, acc ++ "\"")
+      } else { Some({ text: acc, at: at + 1 }) }
+    } else { csv_quoted(text, at + 1, acc ++ c) }
+  }
+
+fn csv_row_text(fields: List<String>) -> String = join_all(map(fields, csv_field_text), ",")
+
+fn csv_field_text(field: String) -> String =
+  if needs_quotes(field) { "\"" ++ doubled(field) ++ "\"" } else { field }
+
+// RFC 4180 §2.6: a comma, a double quote, CR or LF forces the quotes.
+fn needs_quotes(field: String) -> Bool =
+  string_contains(field, ",") || string_contains(field, "\"") || string_contains(field, "\n")
+    || string_contains(field, "\r")
+
+fn doubled(field: String) -> String = join_all(string_split(field, "\""), "\"\"")
+
+fn join_all(pieces: List<String>, sep: String) -> String =
+  match pieces {
+    [] -> "",
+    [first, ..rest] -> fold(rest, first, |acc: String, p: String| acc ++ sep ++ p),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+test "quoting is the minimum the RFC asks for, and it round-trips" {
+  assert_eq(csv_build([["a", "b"], ["c", "d"]]), "a,b\r\nc,d");
+  assert_eq(csv_parse("a,b\r\nc,d"), Some([["a", "b"], ["c", "d"]]));
+  assert_eq(csv_build([["a,b", "c"]]), "\"a,b\",c");
+  assert_eq(csv_build([["a\"b"]]), "\"a\"\"b\"");
+  assert_eq(csv_build([["a\nb"]]), "\"a\nb\"");
+  assert_eq(csv_build([["a\rb"]]), "\"a\rb\"");
+  assert_eq(csv_parse("\"a,b\",\"c\"\"d\""), Some([["a,b", "c\"d"]]));
+  assert_eq(csv_parse("\"a\nb\",c"), Some([["a\nb", "c"]]));
+  assert_eq(csv_build([["plain"]]), "plain")
+}
+
+test "a trailing break adds no record and an empty line is one empty field" {
+  assert_eq(csv_parse(""), Some([]));
+  assert_eq(csv_parse("a"), Some([["a"]]));
+  assert_eq(csv_parse("a\n"), Some([["a"]]));
+  assert_eq(csv_parse("a\r\n"), Some([["a"]]));
+  assert_eq(csv_parse("a\nb"), Some([["a"], ["b"]]));
+  assert_eq(csv_parse("\n"), Some([[""]]));
+  assert_eq(csv_parse("a\n\n"), Some([["a"], [""]]));
+  assert_eq(csv_parse("a,"), Some([["a", ""]]));
+  assert_eq(csv_parse(","), Some([["", ""]]))
+}
+
+test "a parser refuses what the RFC does not name" {
+  assert_eq(csv_parse("\"unterminated"), None);
+  assert_eq(csv_parse("a\"b"), None);
+  assert_eq(csv_parse("\"a\"b"), None);
+  assert_eq(csv_parse("a\rb"), None);
+  assert_eq(csv_parse("a\"\"b"), None)
+}
