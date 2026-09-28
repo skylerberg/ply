@@ -347,3 +347,36 @@ pub fn count() -> Int / {Web}
     );
     assert!(!text.contains("frame covers"), "{text}");
 }
+
+/// A clause written twice is unreachable, not fatal: the runtime takes the first, and the program
+/// still compiles. It did not always -- a warning made the checker answer `ok: false`, which
+/// `emit_facts` read as *the program is uncheckable*, so the emitter answered nothing and every
+/// definition in the program came back "which the Ply emitter did not answer".
+#[test]
+fn a_clause_written_twice_is_unreachable_rather_than_fatal() {
+    const SOURCE: &str = "\
+nondet effect tick {
+  read now[clock]() -> Int
+}
+
+fn twice() -> Int =
+  handle {
+    tick.now[clock]()
+  } with {
+    tick.now[clock]() -> 1,
+    tick.now[clock]() -> 2,
+  }
+
+test \"the first clause wins\" {
+  assert_eq(twice(), 1)
+}
+";
+    let dir = project(SOURCE);
+    let out = ply(dir.path()).args(["test"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "a warning is not a reason to refuse a program: {text}"
+    );
+    assert!(text.contains("1 passed"), "the test ran: {text}");
+}
