@@ -19,6 +19,21 @@ fn every_declared_helper_has_an_address() {
     }
 }
 
+/// A foreign caller builds the argument array, so the count is checked against the unit's own:
+/// entering one argument too few read past that array and took the process down, and what the
+/// caller got was a segfault rather than a diagnostic naming the entry.
+#[test]
+fn an_entry_entered_with_the_wrong_arity_is_refused_rather_than_read_past() {
+    ply_codegen::c::producer::ensure_default();
+    let err = ply_codegen::c::producer::call("emit.emit_roots", &[])
+        .expect_err("`emit.emit_roots` takes seven arguments");
+    let text = err.to_string();
+    assert!(
+        text.contains("`emit.emit_roots` takes 7 arguments and was entered with 0"),
+        "the refusal names the entry and both counts: {text}"
+    );
+}
+
 #[test]
 fn the_prelude_agrees_with_the_layouts_it_mirrors() {
     assert_eq!(ply_codegen::heap::HEADER, 16, "PLY_HEADER");
