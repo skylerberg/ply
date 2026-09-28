@@ -1864,6 +1864,64 @@ unchanged rather than a loop, and the case fold touches `A-Z`/`a-z` and leaves
 every other character as it is. `std.bytes.join` is the same operation over
 `Bytes`.
 
+### 13.25 `std.option`
+
+```ply
+pub fn option_map<a, b>(o: Option<a>, f: (a) -> b) -> Option<b>
+pub fn option_and_then<a, b>(o: Option<a>, f: (a) -> Option<b>) -> Option<b>
+pub fn option_filter<a>(o: Option<a>, ok: (a) -> Bool) -> Option<a>
+pub fn option_or<a>(o: Option<a>, fallback: Option<a>) -> Option<a>
+pub fn option_unwrap_or<a>(o: Option<a>, fallback: a) -> a
+pub fn option_expect<a>(o: Option<a>, message: String) -> a
+pub fn option_is_some<a>(o: Option<a>) -> Bool
+pub fn option_is_none<a>(o: Option<a>) -> Bool
+pub fn option_ok_or<a, e>(o: Option<a>, err: e) -> Result<a, e>
+```
+
+`Option`'s constructors and `?` are the prelude's; this is the chain a caller reads
+with. Each is `option_`-prefixed because `map` and `and_then` are names a program
+already has (for lists, and for `std.parse`), and an unqualified `map` that
+silently took an `Option` would be a trap. `option_expect` is the one place an
+absent value is a defect, so its message says why it cannot happen.
+
+### 13.26 `std.result`
+
+```ply
+pub fn result_map<a, b, e>(r: Result<a, e>, f: (a) -> b) -> Result<b, e>
+pub fn result_map_err<a, e, f>(r: Result<a, e>, g: (e) -> f) -> Result<a, f>
+pub fn result_and_then<a, b, e>(r: Result<a, e>, f: (a) -> Result<b, e>) -> Result<b, e>
+pub fn result_unwrap_or<a, e>(r: Result<a, e>, fallback: a) -> a
+pub fn result_expect<a, e>(r: Result<a, e>, message: String) -> a
+pub fn result_ok<a, e>(r: Result<a, e>) -> Option<a>
+pub fn result_err<a, e>(r: Result<a, e>) -> Option<e>
+pub fn result_is_ok<a, e>(r: Result<a, e>) -> Bool
+pub fn result_is_err<a, e>(r: Result<a, e>) -> Bool
+```
+
+The same shape over `Ok`/`Err`. `result_map_err` is how a low-level failure
+becomes the one a caller names.
+
+### 13.27 `std.math`
+
+```ply
+pub fn min_int() -> Int
+pub fn max_int() -> Int
+pub fn abs(n: Int) -> Int
+pub fn sign(n: Int) -> Int
+pub fn clamp(n: Int, lo: Int, hi: Int) -> Int
+pub fn even(n: Int) -> Bool
+pub fn odd(n: Int) -> Bool
+pub fn gcd(a: Int, b: Int) -> Int
+pub fn lcm(a: Int, b: Int) -> Int
+pub fn pow(base: Int, exponent: Int) -> Int
+```
+
+`min` and `max` are prelude builtins and stay there. Everything here is `Int`,
+which is `i64`, and the arithmetic wraps at that width rather than raising, so
+`pow` and `abs(min_int())` answer a wrapped value — a checked variant would have
+to say what it answers instead, and that belongs with `B10`'s numeric
+predicates. `gcd` and `lcm` are never negative, and `gcd(0, 0)` is `0`.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
