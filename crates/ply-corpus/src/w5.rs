@@ -424,31 +424,20 @@ impl Serving {
         let port = reserve_port()?;
         project(dir.path(), repo, stack, variant)?;
 
-        let port_set = format!("DESK_PORT={port}");
-        let conns_set = format!("DESK_CONNECTIONS={connections}");
-        let key_set = format!("DESK_API_KEY={api_key}");
-        let mut args: Vec<String> = vec![
-            "--config-schema".into(),
-            "desk.config".into(),
-            "--set".into(),
-            port_set,
-            "--set".into(),
-            conns_set,
-            "--set".into(),
-            key_set,
-            "--trace".into(),
-            sinking.flag().into(),
+        let mut args = crate::w4::served_args(
+            port,
+            connections,
+            api_key,
+            (stack != Stack::Twin).then_some(url),
+        );
+        args.extend([
+            "--trace".to_string(),
+            sinking.flag().to_string(),
             // Every record `desk.ply` writes is `Info` or above, so the sink admits all of them.
-            "--trace-level".into(),
-            "info".into(),
-        ];
+            "--trace-level".to_string(),
+            "info".to_string(),
+        ]);
         let mut trust = None;
-        if stack != Stack::Twin {
-            args.push("--db".into());
-            args.push(url.to_string());
-            args.push("--db-schema".into());
-            args.push("desk.schema".into());
-        }
         if stack == Stack::PostgresTls {
             let material = w3::credential(dir.path())?;
             args.push("--tls".into());
@@ -661,32 +650,19 @@ fn one_drain(
     let port = reserve_port()?;
     project(dir.path(), repo, Stack::Postgres, w3::Variant::TaskPerConn)?;
 
-    let sets = [
-        format!("DESK_PORT={port}"),
-        format!("DESK_CONNECTIONS={}", in_flight + 8),
-        format!("DESK_API_KEY={api_key}"),
-    ];
     let drain = drain_ms.to_string();
     let lead = lead_ms.to_string();
-    let mut args: Vec<&str> = vec![
-        "--config-schema",
-        "desk.config",
-        "--db",
-        url,
-        "--db-schema",
-        "desk.schema",
-        "--trace",
-        "off",
-        "--drain-ms",
-        &drain,
-        "--drain-lead-ms",
-        &lead,
-    ];
-    for s in &sets {
-        args.push("--set");
-        args.push(s);
-    }
-    let mut server = Server::start_with(ply, dir.path(), &args, Stdio::piped())?;
+    let mut args = crate::w4::served_args(port, in_flight + 8, api_key, Some(url));
+    args.extend([
+        "--trace".to_string(),
+        "off".to_string(),
+        "--drain-ms".to_string(),
+        drain,
+        "--drain-lead-ms".to_string(),
+        lead,
+    ]);
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut server = Server::start_with(ply, dir.path(), &borrowed, Stdio::piped())?;
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     w3::wait_until_serving(&mut server, addr)?;
 
@@ -821,41 +797,22 @@ pub fn transaction_at_deadline(
     let port = reserve_port()?;
     project(dir.path(), repo, Stack::Postgres, w3::Variant::TaskPerConn)?;
 
-    let sets = [
-        format!("DESK_PORT={port}"),
-        "DESK_CONNECTIONS=8".to_string(),
-        format!("DESK_API_KEY={api_key}"),
-    ];
     let drain = drain_ms.to_string();
-    // Above the drain so the deadline stops the run; not far, since the `ROLLBACK` waits on it.
-    let statement = (drain_ms + 5_000).to_string();
-    let mut args: Vec<&str> = vec![
-        "--config-schema",
-        "desk.config",
-        "--db",
-        url,
-        "--db-schema",
-        "desk.schema",
-        "--trace",
-        "off",
-        "--drain-ms",
-        &drain,
-        "--db-statement-ms",
-        &statement,
-        "--db-idle-txn-ms",
-        &statement,
-    ];
-    for s in &sets {
-        args.push("--set");
-        args.push(s);
-    }
+    let mut args = crate::w4::served_args(port, 8, api_key, Some(url));
+    args.extend([
+        "--trace".to_string(),
+        "off".to_string(),
+        "--drain-ms".to_string(),
+        drain,
+    ]);
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let queries = Queries::open(url)?;
     let blocker = crate::pg::Lock::hold(url, "select 1 from items where sku = 'bolt' for update")?;
     let orders_before = queries.order_count()?;
     let sequence_before = queries.last_order_id()?;
 
-    let mut server = Server::start_with(ply, dir.path(), &args, Stdio::piped())?;
+    let mut server = Server::start_with(ply, dir.path(), &borrowed, Stdio::piped())?;
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     w3::wait_until_serving(&mut server, addr)?;
 
