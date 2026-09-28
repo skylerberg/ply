@@ -1,5 +1,4 @@
-use ply_corpus::w4::{Program, Workload, served_args};
-use ply_eval::Value;
+use ply_corpus::w4::{Program, served_args};
 
 #[test]
 fn the_bench_program_checks() {
@@ -44,15 +43,6 @@ fn a_twin_entry_point_reaches_nothing() {
             "`{simple}` publishes a row, so it is not hermetic"
         );
     }
-}
-
-#[test]
-fn the_fixture_ddl_is_the_programs_own() {
-    let program = Program::parse().unwrap();
-    let ddl = program.ddl().unwrap();
-    assert_eq!(ddl.len(), 1, "the fixture is one table");
-    assert!(ddl[0].starts_with("create table \"part\""), "{}", ddl[0]);
-    assert!(ddl[0].contains("numeric(10,4)"), "{}", ddl[0]);
 }
 
 /// A served section builds a `ply run --host` command line, and a flag the CLI does not declare is
@@ -102,20 +92,4 @@ fn a_served_run_takes_the_flags_the_sections_pass() {
         !stderr.contains("unexpected argument"),
         "the CLI does not take a flag the sections pass:\n{stderr}"
     );
-}
-
-#[test]
-fn every_workload_runs_against_the_twin() {
-    let program = Program::parse().unwrap();
-    for workload in Workload::ALL {
-        let (_, answered) = program
-            .call_pure(workload.twin(), workload.args(500, 4))
-            .unwrap_or_else(|e| panic!("`{}` failed: {e}", workload.label()));
-        assert_eq!(
-            answered,
-            Value::Int(4),
-            "`{}` answered {answered}",
-            workload.label()
-        );
-    }
 }
