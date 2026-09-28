@@ -54,7 +54,7 @@ pub fn config() -> config::ConfigSpec =
   ])
 
 // What the client performs: one connection per task, and the clock read around the work.
-effect set Load = {config.get[load], net.connect[link], net.connect_tls[link], net.send[link], net.recv[link], net.close[link], fs.write_file[report], task.spawn, task.join, time.elapsed_us}
+effect set Load = {config.get[load], net.connect[link], net.connect_tls[link], net.handshake[link], net.send[link], net.recv[link], net.close[link], fs.write_file[report], task.spawn, task.join, time.elapsed_us}
 
 // --- What one connection saw ------------------------------------------------
 
@@ -132,9 +132,9 @@ fn why_text(why: http::ClientError) -> String =
 
 /// One connection: dial it, spend `per_conn` requests on it, close it.
 ///
-/// A TLS connection's handshake happens inside `net.connect_tls` the first time the connection is
-/// written to, so its `connect` sample covers the handshake and its first request's latency carries
-/// one too. The plaintext samples, which are the ones a ladder is built from, do not.
+/// A TLS connection's handshake is completed here, before anything is timed: the transport leaves it
+/// to the first write, so a run that skipped this would report one request per connection carrying
+/// its connection's handshake.
 fn one_connection(
   host: String,
   port: Int,
@@ -142,7 +142,7 @@ fn one_connection(
   per_conn: Int,
   tls: Bool,
   at: Int,
-) -> Found / {net.connect[link], net.connect_tls[link], net.send[link], net.recv[link], net.close[link], time.elapsed_us} = {
+) -> Found / {net.connect[link], net.connect_tls[link], net.handshake[link], net.send[link], net.recv[link], net.close[link], time.elapsed_us} = {
   let began = time.elapsed_us();
   let opened = if tls { http::dial_tls[link](host, port, limits()) }
   else { http::dial[link](host, port, limits()) };
@@ -150,9 +150,18 @@ fn one_connection(
   match opened {
     Err(why) -> { ..empty_found(), failures: [why_text(why)] },
     Ok(conn) -> {
-      let found = exchanges(conn, routes, per_conn, at, empty_found());
+      // The handshake before the requests, never inside them: a TLS connection handshakes on its
+      // first write, which would charge one request for it. `None` is a connection with no handshake
+      // to complete, which a TLS run reads as one that failed and left the connection dead.
+      let found = if tls {
+        match net.handshake[link](conn.handle) {
+          Some(micros) -> { ..empty_found(), handshakes: [micros] },
+          None -> { ..empty_found(), failures: ["the TLS handshake did not complete"] },
+        }
+      } else { empty_found() };
+      let spent = exchanges(conn, routes, per_conn, at, found);
       http::close[link](conn);
-      { ..found, connects: push(found.connects, connected) }
+      { ..spent, connects: push(spent.connects, connected) }
     },
   }
 }

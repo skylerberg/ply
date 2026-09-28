@@ -13,13 +13,16 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The Rust path `ply hosts` prints for `net.listen_tls`; it must name [`listen`].
 pub const HANDLER: &str = "ply_host::tls::listen";
 
 /// The Rust path `ply hosts` prints for `net.connect_tls`; it must name [`connect`].
 pub const CONNECT_HANDLER: &str = "ply_host::tls::connect";
+
+/// The Rust path `ply hosts` prints for `net.handshake`; it must name [`Session::handshake`].
+pub const HANDSHAKE_HANDLER: &str = "ply_host::tls::handshake";
 
 pub const LIBRARY: &str = "rustls";
 pub const VERSION: &str = "0.23.43";
@@ -312,6 +315,14 @@ enum Stream {
 }
 
 impl Stream {
+    /// One round of the handshake, driven from outside the read/write path.
+    fn complete_io(&mut self) -> io::Result<(usize, usize)> {
+        match self {
+            Stream::Server(s) => s.conn.complete_io(&mut s.sock),
+            Stream::Client(s) => s.conn.complete_io(&mut s.sock),
+        }
+    }
+
     fn is_handshaking(&self) -> bool {
         match self {
             Stream::Server(s) => s.conn.is_handshaking(),
@@ -356,6 +367,9 @@ pub struct Session {
     socket: Arc<TcpStream>,
     session: Mutex<Option<Stream>>,
     handshakes: Arc<Handshakes>,
+    /// What the handshake took, once one has completed: microseconds, measured by whichever
+    /// operation got there first — `net.handshake`, or the read or write that needed the connection.
+    took: Mutex<Option<u64>>,
 }
 
 impl Session {
@@ -396,6 +410,43 @@ impl Session {
             socket,
             session: Mutex::new(started),
             handshakes,
+            took: Mutex::new(None),
+        }
+    }
+
+    /// The handshake, completed now rather than when a request needs it, answering what it took in
+    /// microseconds.
+    ///
+    /// `None` when this connection has none to complete: a session whose configuration refused to
+    /// start, or one whose handshake failed, which closes the connection the way the read/write path
+    /// would. A session that already handshook answers what that earlier handshake took.
+    pub fn handshake(&self) -> Option<u64> {
+        let began = Instant::now();
+        let mut guard = lock(&self.session);
+        let stream = guard.as_mut()?;
+        if !stream.is_handshaking() {
+            return Some(lock(&self.took).unwrap_or(0));
+        }
+        loop {
+            match stream.complete_io() {
+                // Neither read nor wrote, and still handshaking: the peer is gone.
+                Ok((0, 0)) if stream.is_handshaking() => {
+                    self.finish(&mut guard, Some(REASON_GONE));
+                    return None;
+                }
+                Ok(_) if !stream.is_handshaking() => {
+                    let took = began.elapsed().as_micros() as u64;
+                    *lock(&self.took) = Some(took);
+                    self.handshakes.completed();
+                    return Some(took);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let refused = (!expired(&e)).then(|| reason(true, &e));
+                    self.finish(&mut guard, refused);
+                    return None;
+                }
+            }
         }
     }
 
@@ -407,6 +458,7 @@ impl Session {
 
     /// Up to `max` decrypted bytes: `None` on deadline, empty once the peer or session is gone.
     pub fn read(&self, max: usize) -> Option<Vec<u8>> {
+        let began = Instant::now();
         let mut guard = lock(&self.session);
         // An ending, never a deadline: `None` would have the caller wait on a dead connection.
         let Some(stream) = guard.as_mut() else {
@@ -416,12 +468,12 @@ impl Session {
         let mut buffer = vec![0u8; max];
         match stream.read(&mut buffer) {
             Ok(0) => {
-                self.completed(handshaking, stream);
+                self.completed(began, handshaking, stream);
                 self.finish(&mut guard, None);
                 Some(Vec::new())
             }
             Ok(n) => {
-                self.completed(handshaking, stream);
+                self.completed(began, handshaking, stream);
                 buffer.truncate(n);
                 Some(buffer)
             }
@@ -435,6 +487,7 @@ impl Session {
 
     /// The whole payload, or `0` for a connection that is finished.
     pub fn write(&self, payload: &[u8]) -> usize {
+        let began = Instant::now();
         let mut guard = lock(&self.session);
         let Some(stream) = guard.as_mut() else {
             return 0;
@@ -442,7 +495,7 @@ impl Session {
         let handshaking = stream.is_handshaking();
         match stream.write_all(payload).and_then(|()| stream.flush()) {
             Ok(()) => {
-                self.completed(handshaking, stream);
+                self.completed(began, handshaking, stream);
                 payload.len()
             }
             Err(e) => {
@@ -464,9 +517,11 @@ impl Session {
         let _ = self.socket.shutdown(Shutdown::Both);
     }
 
-    /// A handshake that has just finished, counted once.
-    fn completed(&self, was_handshaking: bool, stream: &Stream) {
+    /// A handshake that has just finished; `began` is when the operation that drove it started, so
+    /// the number is the handshake's own and not the wait before it.
+    fn completed(&self, began: Instant, was_handshaking: bool, stream: &Stream) {
         if was_handshaking && !stream.is_handshaking() {
+            *lock(&self.took) = Some(began.elapsed().as_micros() as u64);
             self.handshakes.completed();
         }
     }

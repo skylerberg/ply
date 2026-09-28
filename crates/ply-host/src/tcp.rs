@@ -33,6 +33,7 @@ pub enum Op {
     ListenTls,
     Connect,
     ConnectTls,
+    Handshake,
     Accept,
     Recv,
     Send,
@@ -40,11 +41,12 @@ pub enum Op {
 }
 
 impl Op {
-    pub const ALL: [Op; 8] = [
+    pub const ALL: [Op; 9] = [
         Op::Listen,
         Op::ListenTls,
         Op::Connect,
         Op::ConnectTls,
+        Op::Handshake,
         Op::Accept,
         Op::Recv,
         Op::Send,
@@ -57,6 +59,7 @@ impl Op {
             Op::ListenTls => "listen_tls",
             Op::Connect => "connect",
             Op::ConnectTls => "connect_tls",
+            Op::Handshake => "handshake",
             Op::Accept => "accept",
             Op::Recv => "recv",
             Op::Send => "send",
@@ -70,6 +73,7 @@ impl Op {
             Op::ListenTls => "`net.listen_tls`",
             Op::Connect => "`net.connect`",
             Op::ConnectTls => "`net.connect_tls`",
+            Op::Handshake => "`net.handshake`",
             Op::Accept => "`net.accept`",
             Op::Recv => "`net.recv`",
             Op::Send => "`net.send`",
@@ -79,7 +83,7 @@ impl Op {
 
     fn arity(self) -> usize {
         match self {
-            Op::Listen | Op::Accept | Op::Close => 1,
+            Op::Listen | Op::Accept | Op::Close | Op::Handshake => 1,
             Op::ListenTls => 2,
             Op::Connect | Op::ConnectTls | Op::Recv | Op::Send => 3,
         }
@@ -88,7 +92,7 @@ impl Op {
     fn waits(self) -> bool {
         matches!(
             self,
-            Op::Connect | Op::ConnectTls | Op::Accept | Op::Recv | Op::Send
+            Op::Connect | Op::ConnectTls | Op::Handshake | Op::Accept | Op::Recv | Op::Send
         )
     }
 
@@ -139,6 +143,9 @@ pub trait Net: Send + Sync {
         timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
+    /// The TLS handshake, completed now rather than when a request needs it, answering what it took
+    /// in microseconds. `None` for a connection with no handshake to complete.
+    fn handshake(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
     /// `None` is the deadline expiring; `Some(b"")` is the peer having stopped sending.
     fn recv(
@@ -283,6 +290,10 @@ impl HostHandler for Operation {
             Op::Accept => {
                 let listener = req.args[0].as_int(span, "a socket handle")?;
                 self.net.accept(at, listener, span)
+            }
+            Op::Handshake => {
+                let conn = req.args[0].as_int(span, "a socket handle")?;
+                self.net.handshake(at, conn, span)
             }
             Op::Recv => {
                 let conn = req.args[0].as_int(span, "a socket handle")?;

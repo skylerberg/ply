@@ -1140,6 +1140,7 @@ pub nondet effect net {
   write listen_tls[s](port: Int, credential: String) -> Int
   write connect[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
   write connect_tls[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
+  write handshake[s](conn: Int) -> Option<Int>
   write accept[s](listener: Int) -> Int
   write recv[s](conn: Int, max: Int, timeout_ms: Int) -> Option<Bytes>
   write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
@@ -1157,8 +1158,12 @@ runtime error. `send` may write fewer bytes than given; `send_all` loops.
 is a host not reached for any reason, and the connection it answers is used
 under the label it was opened under. `connect_tls` is the same over TLS: the
 server is verified as `host` against the built-in roots and any `--trust`
-certificate on the first `send` or `recv`, and a failed handshake reads as EOF
-and writes `0`.
+certificate, and a failed handshake reads as EOF and writes `0`. The handshake
+itself is left to the first `send` or `recv`, so a peer that connects and says
+nothing costs nothing; `handshake` completes it there and then and answers what
+it took in microseconds, which is what a program that times a connection wants
+(`None` for a connection with none to complete: a plaintext one, or a session
+whose handshake failed, which ends it).
 
 ### 13.2 `std.http` — HTTP/1.1
 
