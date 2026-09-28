@@ -221,10 +221,6 @@ impl ProcessHost {
         }
     }
 
-    pub fn executables(&self) -> &Executables {
-        &self.executables
-    }
-
     pub fn owns(&self, pending: &Pending) -> bool {
         self.pool.owns(pending)
     }

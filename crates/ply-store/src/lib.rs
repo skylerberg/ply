@@ -757,10 +757,6 @@ impl Store {
         self.reviews.put(name, record);
     }
 
-    pub fn review_records(&self) -> impl Iterator<Item = (&Symbol, &ReviewRecord)> {
-        self.reviews.all()
-    }
-
     pub fn review_records_len(&self) -> usize {
         self.reviews.len()
     }

@@ -181,10 +181,6 @@ impl IsolationCost {
         }
         self.without_forking.makespan_millis / self.today.makespan_millis
     }
-
-    pub fn groups_added(&self) -> i64 {
-        self.without_forking.groups as i64 - self.today.groups as i64
-    }
 }
 
 /// The footprints and per-test costs an analysis runs on.

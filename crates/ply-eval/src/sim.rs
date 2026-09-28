@@ -366,14 +366,6 @@ impl Access {
             _ => false,
         }
     }
-
-    pub fn is_write(&self) -> bool {
-        match self {
-            Access::Atom(a) => a.mode == Mode::Write,
-            Access::Cell { mode, .. } => *mode == Mode::Write,
-            Access::Alloc => true,
-        }
-    }
 }
 
 impl fmt::Display for Access {

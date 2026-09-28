@@ -273,14 +273,6 @@ impl Value {
         }
     }
 
-    /// `ctor` for a pooled buffer: copies into an exact payload and returns the buffer.
-    pub fn ctor_pooled(name: impl Into<Symbol>, mut args: Vec<Value>) -> Value {
-        let mut payload = Vec::with_capacity(args.len());
-        payload.append(&mut args);
-        crate::argv::give(args);
-        Value::ctor(name, payload)
-    }
-
     pub fn builtin(b: Builtin) -> Value {
         let fresh = || {
             Value::Closure(Arc::new(Closure {

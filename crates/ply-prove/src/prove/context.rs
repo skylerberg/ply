@@ -66,11 +66,6 @@ impl<'a> Context<'a> {
         reaches_float(ty, &self.float_types)
     }
 
-    pub fn with_sort_names(mut self, names: BTreeMap<TyVar, Symbol>) -> Context<'a> {
-        self.sort_names = names;
-        self
-    }
-
     pub fn sort_name(&self, v: TyVar) -> Symbol {
         self.sort_names
             .get(&v)
