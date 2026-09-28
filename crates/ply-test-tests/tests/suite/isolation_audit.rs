@@ -288,7 +288,7 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
         let root = TempRoot::new();
         let mut store = root.store();
         let selection =
-            ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+            crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
 
         assert_eq!(
             selection.groups.len(),
@@ -325,7 +325,8 @@ fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {
     let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection =
+        crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     assert_eq!(selection.groups.len(), 1);
 
     let executor = FixtureProbe::default();
@@ -424,7 +425,8 @@ fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
     let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection =
+        crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     assert_eq!(selection.groups.len(), 1);
 
     let executor = FixtureProbe::default();
@@ -484,7 +486,7 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
         let root = TempRoot::new();
         let mut store = root.store();
         let selection =
-            ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+            crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
         let groups = selection.groups.clone();
         let parallelism = selection.parallelism;
         let pool = rayon::ThreadPoolBuilder::new()
@@ -560,7 +562,7 @@ test "real writer" { db.put[users](1) }
         let root = TempRoot::new();
         let store = root.store();
         let selection =
-            ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+            crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
         assert_eq!(selection.parallelism.isolated, extra);
         assert_eq!(selection.parallelism.region_contended, 0);
         assert!(selection.parallelism.holds(), "{:?}", selection.parallelism);

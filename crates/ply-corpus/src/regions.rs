@@ -295,21 +295,14 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
                 .join("; ")
         )
     })?;
-    let hashes = loaded.hashes().map_err(|d| {
-        anyhow::anyhow!(
-            "hashing `{}` failed: {} diagnostic(s)",
-            root.display(),
-            d.len()
-        )
-    })?;
-
     let scratch = tempfile::tempdir().context("opening a scratch cache")?;
     let mut store = Store::open(scratch.path()).context("opening a scratch cache")?;
 
-    let plan_of = |store: &mut Store| {
-        let bare = ply_test::select(&loaded.check, &hashes, store, &Plan::default());
+    let plan_of = |_store: &mut Store| {
+        // Every test in scope, nothing from the cache: a measurement wants the same rows twice.
         let plan = ply_machine::tester::Plan::new(&loaded.check, None, std_tests);
-        (bare.keep(&plan.visible), plan)
+        let bare = ply_test::fresh(&loaded.check, &plan.visible, &Plan::default());
+        (bare, plan)
     };
 
     let visible = plan_of(&mut store).1.visible;
