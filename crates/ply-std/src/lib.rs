@@ -28,11 +28,15 @@ pub const HASH: &str = include_str!("../ply/hash.ply");
 
 pub const JSON: &str = include_str!("../ply/json.ply");
 
+pub const MATH: &str = include_str!("../ply/math.ply");
+
 pub const MSGPACK: &str = include_str!("../ply/msgpack.ply");
 
 pub const HTTP: &str = include_str!("../ply/http.ply");
 
 pub const NET: &str = include_str!("../ply/net.ply");
+
+pub const OPTION: &str = include_str!("../ply/option.ply");
 
 pub const PARSE: &str = include_str!("../ply/parse.ply");
 
@@ -45,6 +49,8 @@ pub const PKG: &str = include_str!("../ply/pkg.ply");
 pub const PROCESS: &str = include_str!("../ply/process.ply");
 
 pub const RANDOM: &str = include_str!("../ply/random.ply");
+
+pub const RESULT: &str = include_str!("../ply/result.ply");
 
 pub const ROUTER: &str = include_str!("../ply/router.ply");
 
@@ -72,14 +78,17 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.hash", HASH),
     ("std.http", HTTP),
     ("std.json", JSON),
+    ("std.math", MATH),
     ("std.msgpack", MSGPACK),
     ("std.net", NET),
+    ("std.option", OPTION),
     ("std.parse", PARSE),
     ("std.path", PATH),
     ("std.pg", PG),
     ("std.pkg", PKG),
     ("std.process", PROCESS),
     ("std.random", RANDOM),
+    ("std.result", RESULT),
     ("std.router", ROUTER),
     ("std.signal", SIGNAL),
     ("std.string", STRING),
