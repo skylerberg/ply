@@ -15,7 +15,6 @@ pub mod fixture {
         HostRuntime, Linearity,
     };
     use ply_span::{Diagnostic, Symbol, codes};
-    use ply_ty::ty::Resource;
     use std::sync::Arc;
 
     struct Never;
@@ -56,18 +55,6 @@ pub mod fixture {
     /// The same registration, declared able to receive a credential.
     pub fn receives_secrets(mut op: HostOp) -> HostOp {
         op.secrets = true;
-        op
-    }
-
-    #[allow(dead_code)]
-    pub fn named(label: &str) -> HostResource {
-        HostResource::Only(Resource::Named(Symbol::new(label)))
-    }
-
-    /// Declared deterministic, which binds against an effect the program did not mark `nondet`.
-    #[allow(dead_code)]
-    pub fn deterministic(mut op: HostOp) -> HostOp {
-        op.determinism = Determinism::Deterministic;
         op
     }
 
