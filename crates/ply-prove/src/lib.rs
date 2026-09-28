@@ -178,6 +178,10 @@ pub enum Gap {
     Raised {
         bindings: Vec<Binding>,
         diagnostic: Box<Diagnostic>,
+        /// The draw the values came from, so a program that shrinks this counterexample can
+        /// regenerate them: a value of a type the program never named is not something it can hold.
+        root: u64,
+        case: u32,
     },
     /// The guard kept no case of a full budget, yet admits `witness`.
     GuardNotSampled {

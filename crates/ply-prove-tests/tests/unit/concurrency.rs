@@ -411,6 +411,7 @@ fn a_body_that_raises_is_a_gap_and_not_a_refutation() {
     let Discharge::Unattempted(Gap::Raised {
         bindings,
         diagnostic,
+        ..
     }) = &searched.discharge
     else {
         panic!("expected a gap, got {:?}", searched.discharge);
