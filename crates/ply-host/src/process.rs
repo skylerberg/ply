@@ -1,4 +1,5 @@
-//! The `process` effect: the arguments, the two output streams, the exit code, and spawning.
+//! The `process` effect: the arguments, the two output streams, standard input, the exit code, and
+//! spawning.
 
 use crate::pool::{Done, Ended, PROCESS_FIRST_TOKEN, Pool};
 use ply_eval::host::HostRegistry;
@@ -291,18 +292,20 @@ pub enum Op {
     Args,
     Out,
     Err,
+    Line,
     Exit,
     Spawn,
 }
 
 impl Op {
-    pub const ALL: [Op; 5] = [Op::Args, Op::Out, Op::Err, Op::Exit, Op::Spawn];
+    pub const ALL: [Op; 6] = [Op::Args, Op::Out, Op::Err, Op::Line, Op::Exit, Op::Spawn];
 
     pub fn name(self) -> &'static str {
         match self {
             Op::Args => "args",
             Op::Out => "out",
             Op::Err => "err",
+            Op::Line => "line",
             Op::Exit => "exit",
             Op::Spawn => "spawn",
         }
@@ -313,6 +316,7 @@ impl Op {
             Op::Args => "`process.args`",
             Op::Out => "`process.out`",
             Op::Err => "`process.err`",
+            Op::Line => "`process.line`",
             Op::Exit => "`process.exit`",
             Op::Spawn => "`process.spawn`",
         }
@@ -323,6 +327,7 @@ impl Op {
             Op::Args => "ply_host::process::args",
             Op::Out => "ply_host::process::out",
             Op::Err => "ply_host::process::err",
+            Op::Line => "ply_host::process::line",
             Op::Exit => "ply_host::process::exit",
             Op::Spawn => "ply_host::process::spawn",
         }
@@ -330,7 +335,7 @@ impl Op {
 
     pub fn arity(self) -> usize {
         match self {
-            Op::Args => 0,
+            Op::Args | Op::Line => 0,
             Op::Out | Op::Err | Op::Exit => 1,
             Op::Spawn => 3,
         }
@@ -342,13 +347,15 @@ impl Op {
             op: Symbol::new(self.name()),
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
-            // The arguments never change; a line written twice is written twice.
+            // The arguments never change; a line written twice is written twice, and a line read
+            // is consumed once.
             linearity: match self {
                 Op::Args => Linearity::Repeatable,
-                Op::Out | Op::Err | Op::Exit | Op::Spawn => Linearity::AtMostOnce,
+                Op::Out | Op::Err | Op::Line | Op::Exit | Op::Spawn => Linearity::AtMostOnce,
             },
-            // A spawn waits for another process, so it waits in the pool rather than on the machine.
-            blocking: self == Op::Spawn,
+            // A spawn waits for another process and a read waits for a person, so both wait in the
+            // pool rather than on the machine.
+            blocking: self == Op::Spawn || self == Op::Line,
             secrets: false,
             path: self.path(),
         }
@@ -394,6 +401,12 @@ impl HostHandler for Operation {
                     .write(stream, text)
                     .map_err(|e| err_write(self.op, &e, span))?;
                 Ok(HostAnswer::Value(Value::Unit))
+            }
+            Op::Line => {
+                let pending =
+                    host.pool
+                        .submit(span, "process-line", Op::Line.what(), Box::new(read_line))?;
+                Ok(HostAnswer::Pending(pending))
             }
             Op::Exit => {
                 let code = req.args[0].as_int(span, "an exit code")?;
@@ -454,6 +467,22 @@ fn environment(value: &Value, span: Span) -> Result<Vec<(String, String)>, Diagn
         ));
     }
     Ok(out)
+}
+
+/// One line of this process's standard input, without its ending; `None` at end of input. Read in
+/// the pool, because a console waits for a person.
+fn read_line() -> Done {
+    let mut text = String::new();
+    match std::io::stdin().read_line(&mut text) {
+        Ok(0) => Done::MaybeString(None),
+        Ok(_) => {
+            while text.ends_with('\n') || text.ends_with('\r') {
+                text.pop();
+            }
+            Done::MaybeString(Some(text))
+        }
+        Err(e) => Done::Failed(format!("standard input could not be read: {e}")),
+    }
 }
 
 /// Buffered, never streamed: Ply has no file handles, so each stream arrives whole or not at all.
