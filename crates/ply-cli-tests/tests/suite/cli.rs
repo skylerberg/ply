@@ -2479,18 +2479,20 @@ fn count_allocations_writes_what_the_entry_allocated() {
     assert!(counted["bytes"].as_u64().unwrap_or(0) > 0, "{text}");
 }
 
-/// `--count-alloc-sites` is the wider record: the same totals, and the `ply_*` frames each
-/// allocation came from.
+/// `--count-alloc-sites-exact` is the wider record: the same totals, and the `ply_*` frames each
+/// allocation came from, with every allocation walked.
 #[test]
-fn count_alloc_sites_writes_where_the_entry_allocated() {
+fn count_alloc_sites_exact_writes_where_the_entry_allocated() {
     let dir = project(GREEN);
     let out_path = dir.path().join("sites.json");
-    let flag = format!("--count-alloc-sites={}", out_path.display());
+    let flag = format!("--count-alloc-sites-exact={}", out_path.display());
     let out = ply(dir.path()).args([&flag, "run"]).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{err}");
     let text = std::fs::read_to_string(&out_path).expect("the count is written");
     let counted: Value = serde_json::from_str(&text).expect("the count is JSON");
+    assert_eq!(counted["exact"], Value::Bool(true), "{text}");
+    assert_eq!(counted["sampled_every"], Value::from(1), "{text}");
     let total = counted["allocations"].as_u64().unwrap_or(0);
     assert!(total > 0, "nothing was counted: {text}");
     let sites = counted["sites"].as_array().expect("the sites are there");
@@ -2499,8 +2501,31 @@ fn count_alloc_sites_writes_where_the_entry_allocated() {
         .iter()
         .map(|s| s["allocations"].as_u64().unwrap_or(0))
         .sum();
-    assert!(
-        attributed > 0 && attributed <= total,
-        "{attributed} of {total} attributed: {text}"
+    assert_eq!(
+        attributed, total,
+        "every allocation was walked, so the rows are the total: {text}"
     );
+}
+
+/// `--count-alloc-sites` is the default and it samples: every allocation is counted, one in
+/// `sampled_every` is walked, and the report says so rather than presenting an estimate as a
+/// census. A program this small may sample nothing at all and still be honest.
+#[test]
+fn count_alloc_sites_samples_by_default_and_says_so() {
+    let dir = project(GREEN);
+    let out_path = dir.path().join("sites.json");
+    let flag = format!("--count-alloc-sites={}", out_path.display());
+    let out = ply(dir.path()).args([&flag, "run"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let text = std::fs::read_to_string(&out_path).expect("the count is written");
+    let counted: Value = serde_json::from_str(&text).expect("the count is JSON");
+    assert_eq!(counted["exact"], Value::Bool(false), "{text}");
+    let every = counted["sampled_every"].as_u64().unwrap_or(0);
+    assert!(
+        every > 1,
+        "a sample of every {every} is not a sample: {text}"
+    );
+    assert!(counted["allocations"].as_u64().unwrap_or(0) > 0, "{text}");
+    assert!(counted["sites"].is_array(), "the sites are there: {text}");
 }

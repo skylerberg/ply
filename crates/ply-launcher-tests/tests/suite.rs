@@ -84,6 +84,8 @@ fn the_count_allocations_flag_is_read_from_the_line_and_taken_out() {
         let asked = ply_launcher::count::flag(&mut argv).unwrap().unwrap();
         assert_eq!(asked.path, std::path::PathBuf::from("out.json"));
         assert!(!asked.sites);
+        assert!(!asked.exact);
+        assert_eq!(asked.every(), 0, "no sites, so nothing is walked");
         assert_eq!(
             argv,
             vec!["run".to_string(), "p.ply".to_string()],
@@ -162,5 +164,107 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
     assert_eq!(
         bytes, counted.bytes,
         "the rows' bytes are the window's bytes"
+    );
+    // And the same work again at the run's default sample: every allocation is still counted, one
+    // in `SAMPLED` is walked, and the rows come back scaled up so they read in the totals' units.
+    // Their sum is near the total rather than equal to it, which is the trade the report states.
+    let (answer, counted, sites) = ply_launcher::count::window_sampled(
+        || {
+            let mut v: Vec<Vec<u64>> = Vec::new();
+            for n in 0..4096u64 {
+                v.push(vec![n; 4]);
+            }
+            v.len()
+        },
+        ply_launcher::count::SAMPLED,
+    );
+    assert_eq!(answer, 4096);
+    assert!(
+        counted.allocations >= 4096,
+        "4096 vectors allocate at least once each: {}",
+        counted.allocations
+    );
+    assert!(!sites.is_empty(), "a long window sampled some sites");
+    let walked: u64 = sites.values().map(|at| at.allocations).sum();
+    assert!(
+        walked < counted.allocations,
+        "the sample is smaller than the window: {walked} of {}",
+        counted.allocations
+    );
+    let scaled = walked * u64::from(ply_launcher::count::SAMPLED);
+    let low = counted.allocations * 3 / 4;
+    let high = counted.allocations * 5 / 4;
+    assert!(
+        (low..=high).contains(&scaled),
+        "the scaled rows are near the total: {scaled} against {}",
+        counted.allocations
+    );
+}
+
+/// The flags that ask for sites: plain ones sample — the walk is the whole cost of a site census —
+/// and `-exact` walks every allocation. The stronger request wins wherever it stands, and asking
+/// for sites at all still means sites.
+#[test]
+fn the_sites_flags_choose_between_every_allocation_and_a_sample() {
+    for (line, exact) in [
+        (vec!["run", "--count-alloc-sites=out.json"], false),
+        (vec!["run", "--count-alloc-sites-exact=out.json"], true),
+        (
+            vec![
+                "run",
+                "--count-alloc-sites=out.json",
+                "--count-alloc-sites-exact=e.json",
+            ],
+            true,
+        ),
+        (
+            vec![
+                "run",
+                "--count-alloc-sites-exact=e.json",
+                "--count-alloc-sites=out.json",
+            ],
+            true,
+        ),
+    ] {
+        let mut argv: Vec<String> = line.iter().map(|s| s.to_string()).collect();
+        let asked = ply_launcher::count::flag(&mut argv).unwrap().unwrap();
+        assert!(asked.sites, "sites were asked for: {line:?}");
+        assert_eq!(asked.exact, exact, "{line:?}");
+        assert_eq!(
+            asked.every(),
+            if exact {
+                1
+            } else {
+                ply_launcher::count::SAMPLED
+            },
+            "{line:?}"
+        );
+    }
+}
+
+/// A sample of every `n`th allocation would alias with a program that allocates exactly `n` times
+/// around an iteration — the same site every time, which is the one thing a site census must not
+/// do. The sample is spread instead.
+#[test]
+fn the_sample_does_not_fall_on_one_period_of_the_window() {
+    let every = ply_launcher::count::SAMPLED;
+    let hits: Vec<u64> = (0..(1u64 << 20))
+        .filter(|n| ply_launcher::count::sampled_nth(*n, every))
+        .collect();
+    let expected = (1usize << 20) / every as usize;
+    assert!(
+        hits.len() > expected / 2 && hits.len() < expected * 2,
+        "{} sampled of an expected {expected}",
+        hits.len()
+    );
+    assert!(
+        hits.windows(2)
+            .any(|pair| pair[1] - pair[0] != u64::from(every)),
+        "every gap is {every}: the sample is periodic after all"
+    );
+    assert!(ply_launcher::count::sampled_nth(0, 1), "exact walks all");
+    assert!(
+        ply_launcher::count::sampled_nth(7, 0),
+        "no sites walks none"
     );
 }
