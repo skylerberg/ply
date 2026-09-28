@@ -842,7 +842,6 @@ pub fn fresh(check: &CheckOutput, visible: &[usize], plan: &Plan) -> Selection {
     )
 }
 
-
 /// Turns each failure's suspect list into a ranked attribution; `sources` are what `front` read.
 /// What the runtime keeps so a program can retry a mixture after the run that collected it: the
 /// bodies this run introduced (a definition the run added is not in the store until the flush), and

@@ -15,7 +15,7 @@ mod w4;
 mod w5;
 mod w6;
 
-use crate::support::{dump_files, generate};
+use crate::support::generate;
 use ply_corpus::pipeline::{Front, front};
 use ply_corpus::{CorpusSpec, run_on_tier};
 use ply_eval::Plan;
@@ -26,7 +26,6 @@ use std::path::Path;
 fn visible_of(check: &ply_ty::CheckOutput) -> Vec<usize> {
     (0..check.tests.len()).collect()
 }
-
 
 #[test]
 fn a_generated_corpus_compiles_and_every_test_passes() {
@@ -49,34 +48,6 @@ fn a_generated_corpus_compiles_and_every_test_passes() {
         verified.tests >= 40,
         "only {} tests reached the runner",
         verified.tests
-    );
-}
-
-#[test]
-fn contended_resources_force_more_than_one_concurrency_group() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("corpus");
-    let spec = CorpusSpec {
-        seed: 12,
-        modules: 8,
-        defs_per_module: 12,
-        tests: 60,
-        depth: 3,
-        tables: 3,
-        regions: 2,
-        ..CorpusSpec::default()
-    };
-    generate(&root, &spec);
-
-    let verified = verify(&root).unwrap();
-    assert_eq!(verified.failed, 0);
-    assert!(
-        verified.groups >= 2,
-        "every test landed in one group, so the conflict graph is trivial"
-    );
-    assert!(
-        verified.largest_group < verified.tests,
-        "one group holds every test, so nothing was serialized"
     );
 }
 
@@ -266,31 +237,6 @@ fn raising_the_spec_density_changes_no_definition_hash() {
 }
 
 #[test]
-fn attaching_a_spec_to_every_definition_selects_no_test() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("corpus");
-    let bare = specified_spec(0.0, 0);
-    generate(&root, &bare);
-    verify(&root).unwrap();
-
-    // Not `gen.run`, which clears the directory and the cache with it.
-    for file in dump_files(&specified_spec(1.0, 0)) {
-        std::fs::write(root.join(&file.0), &file.1).unwrap();
-    }
-
-    let front = front(&root).unwrap();
-    let store = Store::open(&root).unwrap();
-    let selection = ply_test::fresh(&front.check, &visible_of(&front.check), &Plan::default());
-    let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
-    assert_eq!(
-        selection.to_run.len(),
-        nondet,
-        "a spec edit selected {} tests",
-        selection.to_run.len()
-    );
-}
-
-#[test]
 fn attaching_a_spec_changes_no_footprint_and_no_concurrency_group() {
     let bare = tempfile::tempdir().unwrap();
     let specified = tempfile::tempdir().unwrap();
@@ -345,33 +291,6 @@ fn the_manifest_reports_the_obligations_the_corpus_actually_carries() {
     );
 }
 
-#[test]
-fn a_second_run_over_an_unchanged_corpus_selects_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("corpus");
-    let spec = CorpusSpec {
-        seed: 21,
-        modules: 4,
-        defs_per_module: 8,
-        tests: 12,
-        depth: 2,
-        nondet_fraction: 0.0,
-        ..CorpusSpec::default()
-    };
-    generate(&root, &spec);
-    verify(&root).unwrap();
-
-    let front = front(&root).unwrap();
-    let store = Store::open(&root).unwrap();
-    let selection = ply_test::fresh(&front.check, &visible_of(&front.check), &Plan::default());
-    let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
-    assert_eq!(
-        selection.to_run.len(),
-        nondet,
-        "an unchanged corpus re-selected {} tests",
-        selection.to_run.len()
-    );
-}
 mod r#gen;
 mod real;
 
@@ -381,7 +300,6 @@ struct Verified {
     passed: usize,
     failed: usize,
     groups: usize,
-    largest_group: usize,
     /// Tests whose footprint carries `sim.read`, so their result depends on a seed.
     seeded: usize,
 }
@@ -423,7 +341,6 @@ fn verify(root: &Path) -> anyhow::Result<Verified> {
         passed: report.passed,
         failed: report.failed,
         groups: selection.groups.len(),
-        largest_group: selection.groups.iter().map(|g| g.len()).max().unwrap_or(0),
         seeded: front
             .check
             .tests

@@ -295,14 +295,6 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
                 .join("; ")
         )
     })?;
-    let hashes = loaded.hashes().map_err(|d| {
-        anyhow::anyhow!(
-            "hashing `{}` failed: {} diagnostic(s)",
-            root.display(),
-            d.len()
-        )
-    })?;
-
     let scratch = tempfile::tempdir().context("opening a scratch cache")?;
     let mut store = Store::open(scratch.path()).context("opening a scratch cache")?;
 
