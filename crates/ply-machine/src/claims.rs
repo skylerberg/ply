@@ -40,10 +40,10 @@ const EFFECT: &str = "prover";
 const PAYLOAD: &str = "claims";
 
 /// The module the suite declares the vocabulary a run *decides* in. A constructor crosses the
-/// substrate boundary by its program-wide name — `claimer.Fresh` is not `suite.obligation.Fresh` —
+/// substrate boundary by its program-wide name — `claimer.Fresh` is not `proof.obligation.Fresh` —
 /// so marshalling one is a statement about where it is declared. Records cross by field name and
 /// need nothing here.
-const SUITE: &str = "suite.obligation";
+const PROOF: &str = "proof.obligation";
 
 const OPERATIONS: [(&str, &str); 13] = [
     ("configure", "ply_machine::claims::configure"),
@@ -1393,9 +1393,9 @@ fn at_value(at: &At) -> PlyValue {
 
 fn kind_value(kind: &Kind) -> PlyValue {
     match kind {
-        Kind::Ensures(index) => ctor(SUITE, "Ensures", vec![count(*index)]),
+        Kind::Ensures(index) => ctor(PROOF, "Ensures", vec![count(*index)]),
         Kind::Law(label) => ctor(
-            SUITE,
+            PROOF,
             "Law",
             vec![option(label.as_deref().map(PlyValue::str))],
         ),
@@ -1478,7 +1478,7 @@ fn tier_value(tier: Tier) -> PlyValue {
         Tier::Property => "Property",
         Tier::Example => "Example",
     };
-    ctor(SUITE, named, Vec::new())
+    ctor(PROOF, named, Vec::new())
 }
 
 fn bindings_value(bindings: &[ply_prove::Binding]) -> PlyValue {
@@ -1654,7 +1654,7 @@ fn reason_value(reason: Reason) -> PlyValue {
         Reason::Uncached => "Uncached",
         Reason::Refused => "CacheRefused",
     };
-    ctor(SUITE, named, Vec::new())
+    ctor(PROOF, named, Vec::new())
 }
 
 fn coverage_value(coverage: &ply_prove::Coverage) -> PlyValue {
@@ -1709,7 +1709,7 @@ fn moved_value(moved: Moved) -> PlyValue {
         Moved::Changed => "Changed",
         Moved::Never => "Never",
     };
-    ctor(SUITE, named, Vec::new())
+    ctor(PROOF, named, Vec::new())
 }
 
 fn changes_value(changes: &Changes) -> PlyValue {
