@@ -37,15 +37,13 @@ fn a_twin_entry_point_reaches_nothing() {
     }
 }
 
+/// The sink rungs need a host, so they cannot be an in-package `test`; the bare and twin rungs
+/// (`w5.ply`'s "every rung does the same work and answers the same count") do not, and are not
+/// asserted twice.
 #[test]
-fn every_rung_runs_the_same_loop() {
+fn every_sink_rung_runs_the_same_loop() {
     let program = Program::parse().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let (_, bare) = program.call_pure("bare", 32).unwrap();
-    assert_eq!(bare, Value::Int(64));
-    for simple in ["twin_events", "twin_spans", "twin_counters"] {
-        assert_eq!(program.call_pure(simple, 32).unwrap().1, Value::Int(64));
-    }
     for (rung, entry) in [
         (Rung::Discard, "events"),
         (Rung::Discard, "spans"),
