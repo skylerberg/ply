@@ -166,10 +166,6 @@ impl Row {
         Row::closed([atom])
     }
 
-    pub fn is_closed(&self) -> bool {
-        self.tail.is_none()
-    }
-
     pub fn is_pure(&self) -> bool {
         self.atoms.is_empty() && self.tail.is_none()
     }
@@ -197,11 +193,6 @@ impl Row {
             .into_iter()
             .map(|a| a.with_declared_mode(mode_of))
             .collect();
-    }
-
-    /// Discards the tail.
-    pub fn to_footprint(&self) -> Footprint {
-        Footprint(self.atoms.clone())
     }
 }
 
@@ -261,10 +252,6 @@ impl Footprint {
         self.0
             .iter()
             .any(|a| other.0.iter().any(|b| a.conflicts_with(b)))
-    }
-
-    pub fn effects(&self) -> BTreeSet<&Symbol> {
-        self.0.iter().map(|a| &a.effect).collect()
     }
 }
 
