@@ -573,7 +573,15 @@ fn the_driver_places_the_shipped_modules_the_port_pulls_in_and_answers_as_it_doe
     );
 
     // A round's imports follow the round before it, so the whole is not in byte order.
-    let rounds: &[&str] = &["std.router", "std.trace", "std.http", "std.json", "std.net"];
+    // `std.bytes` is the second round's first: `std.router` and `std.json` both join with it.
+    let rounds: &[&str] = &[
+        "std.router",
+        "std.trace",
+        "std.bytes",
+        "std.http",
+        "std.json",
+        "std.net",
+    ];
     for (dir, pulls) in [
         (repo().join("examples"), None),
         (chain.path().to_path_buf(), Some(rounds)),
