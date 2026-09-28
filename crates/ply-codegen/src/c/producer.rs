@@ -599,6 +599,19 @@ impl PlyProducer {
             .native
             .entry(name)
             .ok_or_else(|| anyhow!("the unit has no `{name}`"))?;
+        // A foreign caller builds the argument array, so the entry's arity is checked before the
+        // entry is entered: reading one argument too few reads past the array the caller wrote.
+        let arity = self
+            .native
+            .arity(name)
+            .ok_or_else(|| anyhow!("`{name}` was compiled without an arity"))?;
+        if arity != args.len() {
+            bail!(
+                "`{name}` takes {arity} argument{} and was entered with {}",
+                if arity == 1 { "" } else { "s" },
+                args.len()
+            );
+        }
         let mut ctx = self.native.context();
         ctx.begin(i64::MAX / 2);
         let layouts: *const crate::heap::Layouts = &self.native.tables().layouts;
