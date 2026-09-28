@@ -1713,6 +1713,23 @@ rather than a raise. `uuid_v4` draws two machine words of `std.random` entropy
 and overwrites the version and variant bits, so a test pins it by handling
 `entropy.next`.
 
+### 13.19 `std.base64`
+
+```ply
+pub fn base64_encode(data: Bytes) -> String
+pub fn base64_decode(text: String) -> Option<Bytes>
+pub fn base64url_encode(data: Bytes) -> String
+pub fn base64url_decode(text: String) -> Option<Bytes>
+```
+
+RFC 4648: the standard alphabet (`A-Za-z0-9+/`) with padding, and the URL-safe
+alphabet (`A-Za-z0-9-_`) without, which is the form a JWT and a URL carry. A
+decoder is total and answers `None` for what the RFC does not call canonical — a
+padding character anywhere but the end, a length not divisible by four (for the
+padded form), a letter outside the alphabet, or bits left over in the final
+group. So a decode of an encode is the identity, and so is an encode of a
+decode.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
