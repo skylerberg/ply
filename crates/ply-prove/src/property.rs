@@ -7,9 +7,9 @@ use crate::{
 };
 use ply_eval::IntTy;
 use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Synth, Value};
+use ply_eval::{SECRET, TASK_TYPE};
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_ty::DefHash;
-use ply_ty::TASK_TYPE;
 use ply_ty::{CtorInfo, LawBinder, Row, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -232,7 +232,7 @@ impl TypeWorld {
                 "List" | "Map" => Some(0),
                 "Cell" => None,
                 _ if name.as_str() == TASK_TYPE => None,
-                _ if name.as_str() == ply_ty::SECRET => None,
+                _ if name.as_str() == SECRET => None,
                 _ => self.types.get(name).and_then(|d| d.depth),
             },
         }
@@ -348,7 +348,7 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
             "List" | "Map" => args.iter().try_for_each(|a| generatable(a, world)),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == TASK_TYPE => Err(Ungeneratable::Task),
-            _ if name.as_str() == ply_ty::SECRET => Err(Ungeneratable::Secret),
+            _ if name.as_str() == SECRET => Err(Ungeneratable::Secret),
             _ => {
                 let Some(decl) = world.types.get(name) else {
                     return Err(Ungeneratable::Unknown(name.clone()));
@@ -462,7 +462,7 @@ impl Gen<'_> {
                 }
                 "Cell" => Err(Ungeneratable::Cell),
                 _ if name.as_str() == TASK_TYPE => Err(Ungeneratable::Task),
-                _ if name.as_str() == ply_ty::SECRET => Err(Ungeneratable::Secret),
+                _ if name.as_str() == SECRET => Err(Ungeneratable::Secret),
                 _ => self.adt(name, args, depth),
             },
         }

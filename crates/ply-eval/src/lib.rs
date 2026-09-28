@@ -19,6 +19,11 @@ pub mod intty;
 pub mod limit;
 pub mod list;
 pub use expr::{BinOp, Lit, UnOp, render_float};
+/// The built-in type names the runtime recognizes: a credential, and the handle `task.spawn`
+/// answers with. The checker declares them; only their names reach here.
+pub const SECRET: &str = "Secret";
+pub const TASK_TYPE: &str = "Task";
+
 pub use intty::{INT_TYPES, IntTy};
 pub use list::List;
 pub mod evaluator;
