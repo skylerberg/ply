@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 pub fn repo_root() -> PathBuf {
@@ -167,10 +165,6 @@ pub mod port {
     pub fn dump_program(name: &str, modules: &[(String, String)]) -> String {
         let sources = modules.iter().map(|(n, s)| source(n, s)).collect();
         call(name, &[Value::list(sources)])
-    }
-
-    pub fn bytes_list(items: &[String]) -> Value {
-        Value::list(items.iter().map(|s| Value::bytes(s.as_bytes())).collect())
     }
 }
 

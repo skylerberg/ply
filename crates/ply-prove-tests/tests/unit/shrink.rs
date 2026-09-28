@@ -1,89 +1,21 @@
-// The walk this file's fixtures were built for is `crates/ply-prove/ply/shrink.ply`'s now: the
-// helpers that only its tests used are kept here, and the end-to-end claim — a counterexample that
-// visibly shrank — is a `ply prove` test.
-#![allow(dead_code)]
+// `crates/ply-prove/ply/shrink.ply` is the walk. What is left here are the two functions it is
+// built on -- `size`, and the candidates it offers -- and neither is about the walk: the order is
+// fixed, and a type's floor is its smallest value.
 
-use crate::property::{Fixture, key};
+use crate::property::Fixture;
 use ply_eval::Value;
-use ply_prove::property::{Judge, TypeWorld, run_property};
+use ply_prove::property::TypeWorld;
 use ply_prove::shrink::{candidates, minimal, size};
-use ply_prove::{Counterexample, DEFAULT_SHRINK_BUDGET, Discharge, ProvePlan};
-use ply_span::{Diagnostic, Span, Symbol};
-use ply_ty::{LawBinder, Type};
+use ply_span::Symbol;
+use ply_ty::Type;
 
 const ADTS: &str = r#"
 type Opt = Nothing | Just(Int)
 type Tree = Leaf | Node(Tree, Int, Tree)
 "#;
 
-const BOXES: &str = "type Box<a> = B(a)";
-
 fn con(name: &str) -> Type {
     Type::Con(Symbol::new(name), Vec::new())
-}
-
-/// Saturating: a single `i64::MIN` already saturates [`size`].
-fn total_size(values: &[Value], world: &TypeWorld) -> u64 {
-    values
-        .iter()
-        .fold(0u64, |acc, v| acc.saturating_add(size(v, world)))
-}
-
-fn plan() -> ProvePlan {
-    ProvePlan {
-        cases: 200,
-        roots: vec![0],
-        prove_budget: 10,
-        shrink_budget: DEFAULT_SHRINK_BUDGET,
-        step_budget: ply_eval::DEFAULT_STEP_BUDGET,
-        sim: Default::default(),
-    }
-}
-
-/// A judge that checks every tuple the walk accepts against the guard and the property.
-struct Watchful<G, B> {
-    guard: G,
-    body: B,
-    accepted: Vec<Vec<Value>>,
-}
-
-impl<G, B> Judge for Watchful<G, B>
-where
-    G: Fn(&[Value]) -> bool,
-    B: Fn(&[Value]) -> bool,
-{
-    fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
-        Ok((self.guard)(values))
-    }
-    fn body(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
-        let held = (self.body)(values);
-        if !held && (self.guard)(values) {
-            self.accepted.push(values.to_vec());
-        }
-        Ok(held)
-    }
-}
-
-fn refute<G, B>(
-    binders: &[LawBinder],
-    world: &TypeWorld,
-    guard: G,
-    body: B,
-) -> (Counterexample, Vec<Vec<Value>>)
-where
-    G: Fn(&[Value]) -> bool + Copy,
-    B: Fn(&[Value]) -> bool + Copy,
-{
-    let mut judge = Watchful {
-        guard,
-        body,
-        accepted: Vec::new(),
-    };
-    let discharge = run_property(key(5), binders, world, &plan(), Span::DUMMY, &mut judge);
-    let Discharge::Refuted(counterexample) = discharge else {
-        panic!("expected a refutation, got {discharge:?}");
-    };
-    (counterexample, judge.accepted)
 }
 
 #[test]
@@ -137,17 +69,6 @@ fn a_recursive_types_floor_terminates() {
     let fixture = Fixture::compile("type Tree = Node(Tree, Int, Tree) | Leaf");
     let world = fixture.world();
     assert_eq!(minimal(&con("Tree"), &world).unwrap().render(), "Leaf");
-}
-
-type Property = fn(&[Value]) -> bool;
-
-/// Holds at every proper sublist of its counterexample, so no monotonicity may be assumed.
-fn left_is_a_node(value: &Value) -> bool {
-    let Value::Ctor { name, args } = value else {
-        return false;
-    };
-    name.as_str().ends_with("Node")
-        && matches!(args.first(), Some(Value::Ctor { name, .. }) if name.as_str().ends_with("Node"))
 }
 
 #[test]
