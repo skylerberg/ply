@@ -3,7 +3,11 @@
 // `simulate` answers the prelude's `random` with values a seed decides, which is what makes a
 // simulation reproducible; that is why it is the scheduler's and not the host's. A run that is not
 // simulated needs the operating system's entropy, and that is this effect: the host draws, the
-// program reads.
+// program reads. A `Rand` below is the third thing: a value, drawn by a pure function of its root,
+// for code that wants a seeded stream without a `simulate` region.
+
+import std.bytes (hex_of, u64_at, u64_le)
+import std.hash (blake3)
 
 pub nondet effect entropy {
   read next() -> Int
@@ -40,6 +44,101 @@ test "a draw is the effect's to answer, not the program's" {
 test "a nonce is two draws, so a server cannot predict it from one" {
   let out = handle { nonce() } with { entropy.next() -> 5 };
   assert_eq(out, "5-5")
+}
+
+// --- A pure stream ----------------------------------------------------------
+//
+// Counter-mode BLAKE3, the construction ADR 0006 chose for the simulation's own stream, so a result
+// is a function of the root on every machine and every version rather than of a dependency's
+// generator. `Rand` carries the counter, so a stream is a value a caller threads through its own
+// code and can rewind by holding an earlier one.
+
+pub type Rand = { root: Int, counter: Int }
+
+pub fn rand(root: Int) -> Rand = { root: root, counter: 0 }
+
+/// One draw: a non-negative integer, sixty-three bits wide, and the stream that follows it.
+pub fn rand_int(r: Rand) -> { value: Int, rand: Rand } = {
+  let b = block(r.root, r.counter);
+  // The top bit is cleared so the eight bytes are an `Int`; a draw is sixty-three bits, like the
+  // effect's.
+  let eight = bytes_concat_all([bytes_slice(b, 0, 7), byte_of_int(bytes_at(b, 7) & 0x7F)]);
+  {
+    value: match u64_at(eight, 0) { Some(v) -> v, None -> 0 },
+    rand: { root: r.root, counter: r.counter + 1 },
+  }
+}
+
+/// `n` bytes of the stream, advanced by the blocks they need.
+pub fn rand_bytes(r: Rand, n: Int) -> { bytes: Bytes, rand: Rand } =
+  if n <= 0 { { bytes: b"", rand: r } } else {
+    let blocks = (n + 31) / 32;
+    let raw = fold(range(0, blocks), b"", |acc: Bytes, i: Int|
+      bytes_concat(acc, block(r.root, r.counter + i)));
+    { bytes: bytes_slice(raw, 0, n), rand: { root: r.root, counter: r.counter + blocks } }
+  }
+
+/// Uniform over `0..n` by rejection: a draw in the last, partial multiple of `n` is thrown away
+/// rather than folded, so no residue is likelier than another. `None` for a bound at or below zero,
+/// which has no uniform draw.
+pub fn rand_below(r: Rand, n: Int) -> Option<{ value: Int, rand: Rand }> =
+  if n <= 0 { None }
+  else {
+    // `max_63 / n * n` is the largest multiple of `n` a 63-bit draw can name without bias.
+    Some(below_draw(r, n, max_63() / n * n))
+  }
+
+fn below_draw(r: Rand, n: Int, limit: Int) -> { value: Int, rand: Rand } = {
+  let step = rand_int(r);
+  if step.value < limit { { value: step.value % n, rand: step.rand } }
+  else { below_draw(step.rand, n, limit) }
+}
+
+// The four words of one block: the domain `ply-eval`'s `sim::Stream` uses, the root, the random
+// domain's tag, and the counter, each little-endian as that stream writes them.
+fn block(root: Int, counter: Int) -> Bytes =
+  blake3(
+    bytes_concat_all([
+      bytes_of_string("ply.sim.stream.1"),
+      u64_le(root),
+      byte_of_int(1),
+      u64_le(counter),
+    ]),
+  )
+
+fn max_63() -> Int = 0x7FFF_FFFF_FFFF_FFFF
+
+// --- Tests ------------------------------------------------------------------
+
+test "a pure stream is a function of its root and not of the world" {
+  let first = rand_int(rand(7));
+  let again = rand_int(rand(7));
+  assert_eq(first.value, again.value);
+  assert_eq(first.rand, again.rand);
+  assert_eq(rand_bytes(rand(1), 40).bytes, rand_bytes(rand(1), 40).bytes);
+  assert(rand_int(rand(7)).value != rand_int(rand(8)).value)
+}
+
+test "a draw is in range, and `below` refuses a bound it cannot honour" {
+  let draws = fold(
+    range(0, 200),
+    { ok: true, rand: rand(11) },
+    |acc: { ok: Bool, rand: Rand }, _: Int|
+      match rand_below(acc.rand, 6) {
+        None -> acc,
+        Some(step) -> { ok: acc.ok && step.value >= 0 && step.value < 6, rand: step.rand },
+      },
+  );
+  assert(draws.ok);
+  assert_eq(rand_below(rand(1), 0), None)
+}
+
+// The block function is the one the simulation uses, so a root and a counter name the same bytes
+// here as there. Pinned so a change to either side is a failure rather than a silent divergence.
+test "a block is BLAKE3 over the simulation's own four words" {
+  // `blake3("ply.sim.stream.1" ++ 0u64_le ++ rand_tag ++ 0u64_le)`, so the domain, the tag and the
+  // endianness are pinned here rather than diverging from `ply-eval`'s stream silently.
+  assert_eq(hex_of(block(0, 0)), "242257320a1f4f4c9f0b62a52348f099e6f3738dcc4c2a85040607361f7cb92b")
 }
 
 fn main() -> Int = 0
