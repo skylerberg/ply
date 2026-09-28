@@ -40,14 +40,16 @@ fn main() -> Result<()> {
         small_requests >= 10,
         "a per-request cost is read off two windows, so `--requests` is at least 100, not {requests}"
     );
-    // Every window is counted on a run that is not the first of that window: a launcher's first run
-    // of a program pays for caches — the emitted unit above all — that the run after it reuses, and
-    // that cost is the size of the program rather than of the request.
+    // Every window is counted twice and the smaller reading is the one the fit reads. A launcher's
+    // first run of a program pays for caches — the emitted unit above all — that the run after it
+    // reuses, and that cost is the size of the program rather than of the request. A run that paid
+    // for one anywhere inside a window inflates that window, and a count can only ever be inflated
+    // by the instrument's own work, never deflated: the smaller of two is the one that is about the
+    // request. (A window that is *always* interpreted rather than compiled is a different problem,
+    // and this does not see it; card `93b9fa5e` has the evidence.)
     let stage = tempfile::tempdir().context("a stage for these windows")?;
-    ply_corpus::w6_run::counted(&ply, dir.path(), small_requests, sites, stage.path())?;
-    ply_corpus::w6_run::counted(&ply, dir.path(), requests, sites, stage.path())?;
-    let small = ply_corpus::w6_run::counted(&ply, dir.path(), small_requests, sites, stage.path())?;
-    let large = ply_corpus::w6_run::counted(&ply, dir.path(), requests, sites, stage.path())?;
+    let small = best_of_two(&ply, dir.path(), small_requests, sites, stage.path())?;
+    let large = best_of_two(&ply, dir.path(), requests, sites, stage.path())?;
     let span = f64::from(requests - small_requests);
     let allocations_per_request = (large.allocations as f64 - small.allocations as f64) / span;
     let bytes_per_request = (large.bytes as f64 - small.bytes as f64) / span;
@@ -88,6 +90,23 @@ fn main() -> Result<()> {
         eprintln!("wrote {}", out.display());
     }
     Ok(())
+}
+
+/// The smaller of two counted runs of one window, and its sites with it.
+fn best_of_two(
+    ply: &std::path::Path,
+    dir: &std::path::Path,
+    requests: u32,
+    sites: bool,
+    stage: &std::path::Path,
+) -> Result<ply_corpus::w6_run::Counted> {
+    let first = ply_corpus::w6_run::counted(ply, dir, requests, sites, stage)?;
+    let second = ply_corpus::w6_run::counted(ply, dir, requests, sites, stage)?;
+    Ok(if second.allocations < first.allocations {
+        second
+    } else {
+        first
+    })
 }
 
 /// The answer's size, which the figure carries so a reader can see what it is per byte of.
