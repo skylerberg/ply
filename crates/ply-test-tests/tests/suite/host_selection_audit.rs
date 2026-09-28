@@ -6,7 +6,7 @@ use ply_eval::host::{
 use ply_eval::{Plan, Value};
 use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
-use ply_test::{Hosting, InterpExecutor, Reason, Search, select};
+use ply_test::{Hosting, InterpExecutor, Reason, Search};
 use ply_ty::Resource;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,7 +91,8 @@ fn run(
     store: &mut Store,
     binding: Option<&Arc<HostBinding>>,
 ) -> ply_test::RunReport {
-    let selection = select(&compiled.check, &compiled.hashes, store, &Plan::default());
+    let selection =
+        crate::fixture::select(&compiled.check, &compiled.hashes, store, &Plan::default());
     let hosting = match binding {
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
@@ -111,7 +112,8 @@ fn run(
 }
 
 fn reason(compiled: &Compiled, store: &Store, name: &str) -> Reason {
-    let selection = select(&compiled.check, &compiled.hashes, store, &Plan::default());
+    let selection =
+        crate::fixture::select(&compiled.check, &compiled.hashes, store, &Plan::default());
     let index = compiled
         .check
         .tests

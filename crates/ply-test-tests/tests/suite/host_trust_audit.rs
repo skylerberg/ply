@@ -6,7 +6,7 @@ use ply_eval::host::{
 use ply_eval::{Plan, Value};
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::Store;
-use ply_test::{Hosting, InterpExecutor, Record, RunReport, Search, select};
+use ply_test::{Hosting, InterpExecutor, Record, RunReport, Search};
 use ply_ty::Resource;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -90,7 +90,8 @@ fn bind(compiled: &Compiled, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> Ar
 }
 
 fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>>) -> RunReport {
-    let selection = select(&compiled.check, &compiled.hashes, store, &Plan::default());
+    let selection =
+        crate::fixture::select(&compiled.check, &compiled.hashes, store, &Plan::default());
     let hosting = match binding {
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
