@@ -670,33 +670,14 @@ pub fn project(dir: &Path, repo: &Path, store: Store, variant: w3::Variant) -> R
     Ok(())
 }
 
-/// The command line a served desk runs on: which config schema, its own settings, and where its
-/// database is when it has one.
-///
-/// One function rather than four, so a flag the CLI does not declare is one edit from being caught:
-/// `a_served_run_takes_the_flags_the_sections_pass` drives the real CLI with this.
-pub fn served_args(
-    port: u16,
-    connections: u32,
-    api_key: &str,
-    database: Option<&str>,
-) -> Vec<String> {
-    let mut args = vec![
-        "--config-schema".to_string(),
-        "desk.config".to_string(),
-        "--set".to_string(),
+/// The `--set` arguments a served desk needs.
+fn settings(port: u16, connections: u32) -> Vec<String> {
+    vec![
         format!("DESK_PORT={port}"),
-        "--set".to_string(),
         format!("DESK_CONNECTIONS={connections}"),
         // A fixture value: `desk.config` declares the key `required`, so a run needs one.
-        "--set".to_string(),
-        format!("DESK_API_KEY={api_key}"),
-    ];
-    if let Some(url) = database {
-        args.push("--set".to_string());
-        args.push(format!("DESK_DATABASE={url}"));
-    }
-    args
+        "DESK_API_KEY=bench-key".to_string(),
+    ]
 }
 
 /// Throughput and tail latency per route and concurrency, over the real binary and socket.
@@ -722,15 +703,16 @@ pub fn crud(
             let dir = tempfile::tempdir().context("a temp dir for the served project")?;
             let port = reserve_port()?;
             project(dir.path(), repo, store, w3::Variant::Sequential)?;
-            let mut args = served_args(
-                port,
-                budget,
-                "bench-key",
-                (store == Store::Postgres).then_some(url),
-            );
-            args.extend(["--trace".to_string(), "off".to_string()]);
-            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-            let mut server = Server::start(ply, dir.path(), &borrowed)?;
+            let sets = settings(port, budget);
+            let mut args: Vec<&str> = vec!["--config-schema", "desk.config", "--trace", "off"];
+            for set in &sets {
+                args.push("--set");
+                args.push(set);
+            }
+            if store == Store::Postgres {
+                args.extend(["--db", url, "--db-schema", "desk.schema"]);
+            }
+            let mut server = Server::start(ply, dir.path(), &args)?;
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             w3::wait_until_serving(&mut server, addr)?;
             for (name, path) in routes {

@@ -302,7 +302,7 @@ if psql -tA -d "$db" -c "select to_regclass('public.items')" | grep -q items; th
   fi
 fi
 psql -v ON_ERROR_STOP=1 -q -d "$db" -f "$here/desk.sql"
-echo '   the same schema examples/desk.ply declares'
+echo '   the same schema desk.schema describes; --db-schema is what checks that'
 echo
 
 # One credential for both services, exported before either starts. Without this
