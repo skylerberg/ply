@@ -125,8 +125,6 @@ fn a_line_without_the_flag_keeps_its_words() {
 /// suite that runs its tests in parallel.
 #[test]
 fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
-    let some =
-        ply_launcher::count::window(|| (0..64u64).map(|n| n * 2).collect::<Vec<u64>>(), false).1;
     let (answer, counted, sites) = ply_launcher::count::window(
         || {
             let v: Vec<u64> = (0..64u64).map(|n| n * 2).collect();
@@ -141,13 +139,11 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
         sites.is_empty(),
         "no sites were asked for, so none were recorded"
     );
-    assert!(
-        counted.allocations <= some.allocations,
-        "a window that ended must not count the next window's work"
-    );
-
-    // The same work, attributed: the sites are a breakdown of the total, minus the walk's own
-    // allocations, which are the walker's rather than the program's.
+    // The same work, attributed. Every allocation the window counted is attributed to a site, and
+    // the walk's own allocations are neither: they are the instrument's, not the program's. That
+    // makes the rows a *complete* breakdown of the total — an allocation counted but not
+    // attributed is exactly the bug worth catching (the walker's `Vec` growth used to be counted
+    // in the total and left out of every row).
     let (_, counted, sites) = ply_launcher::count::window(
         || {
             let v: Vec<u64> = (0..64u64).map(|n| n * 2).collect();
@@ -158,11 +154,13 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
     assert!(counted.allocations > 0);
     assert!(!sites.is_empty(), "a window that asked for sites got none");
     let attributed: u64 = sites.values().map(|at| at.allocations).sum();
-    assert!(
-        attributed > 0 && attributed <= counted.allocations,
-        "{attributed} of {} allocations were attributed",
-        counted.allocations
+    assert_eq!(
+        attributed, counted.allocations,
+        "the rows are what the window counted, in full"
     );
     let bytes: u64 = sites.values().map(|at| at.bytes).sum();
-    assert!(bytes > 0 && bytes <= counted.bytes);
+    assert_eq!(
+        bytes, counted.bytes,
+        "the rows' bytes are the window's bytes"
+    );
 }
