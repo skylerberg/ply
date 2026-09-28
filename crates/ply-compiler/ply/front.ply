@@ -12,9 +12,9 @@ import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
              NLabel, NCell, NLambda, NSim, NHandle, NField, NUpd, CField, CArm, CClause, CStmt,
              CLet, CLetPat, CDo, CPat, CPatField, PxCtor, PxRecord, PxList, lower_fn, dump)
-import tycore (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, atoms_text,
-               atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new, print_ty, at,
-               append, take, contains_bytes, contains_int)
+import tycore (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
+               atoms_text, atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new,
+               print_ty, Field, at, append, take, contains_bytes, contains_int)
 import resolve (Source, Mod, Diag, Label, Edit, Fix, Resolved, Resolved_, Failed, Ns, NValue,
                 NEffect, resolve_modules, qualify, lookup, find, is_bare, diag1, backticked,
                 import_module_name, path_span)
@@ -677,7 +677,7 @@ fn root_keys(mods: List<Mod>, c: Front, h: HashOutput) -> List<KeyRow> = {
 
 // One root the emitter offers: a definition, a spec clause, a test or a law part, with the arity
 // its body is emitted at and whether every parameter and the answer is `Int` or `Bool`.
-type EmitRoot = { root: Bytes, arity: Int, scalar: Bool }
+type EmitRoot = { root: Bytes, arity: Int, scalar: Bool, width: Bool }
 
 /// One constructor, with its arity; the emitter orders tags by position here.
 type EmitCtor = { name: Bytes, arity: Int }
@@ -723,6 +723,24 @@ fn emit_constants(mods: List<Mod>, c: Front) -> List<Bytes> = {
       }))
 }
 
+// A fixed width, which a value crossing the compiled seam cannot carry: it is held there as
+// a tagged `Int`, so a root whose scheme mentions one is not offered at the seam.
+fn width_type_name(name: Bytes) -> Bool =
+  name == b"U8" || name == b"U16" || name == b"U32" || name == b"U64" || name == b"I8"
+    || name == b"I16"
+    || name == b"I32"
+    || name == b"I64"
+
+fn mentions_width(t: Type) -> Bool =
+  match t {
+    TyVar(_) -> false,
+    TyCon(c) ->
+      width_type_name(c.name) || fold(c.args, false, |acc: Bool, a: Type| acc || mentions_width(a)),
+    TyFn(f) ->
+      fold(f.params, false, |acc: Bool, a: Type| acc || mentions_width(a)) || mentions_width(f.ret),
+    TyRecord(fields) -> fold(fields, false, |acc: Bool, f: Field| acc || mentions_width(f.ty)),
+  }
+
 fn emit_is_scalar(t: Type) -> Bool =
   match t { TyCon(c) -> len(c.args) == 0 && (c.name == b"Int" || c.name == b"Bool"), _ -> false }
 
@@ -755,6 +773,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                   root: name,
                   arity: len(sig.params) + len(def.scheme.label_vars),
                   scalar: scalar_params && emit_is_scalar(sig.ret),
+                  width: mentions_width(def.scheme.ty),
                 };
                 let clauses = fold(
                   range(0, len(d.spec)),
@@ -767,6 +786,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                             root: key_clause_root(name, b"requires", b.requires),
                             arity: len(sig.params),
                             scalar: scalar_params,
+                            width: false,
                           }),
                           requires: b.requires + 1,
                           ensures: b.ensures,
@@ -778,6 +798,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                             // `ensures` also takes `result`.
                             arity: len(sig.params) + 1,
                             scalar: scalar_params && emit_is_scalar(sig.ret),
+                            width: false,
                           }),
                           requires: b.requires,
                           ensures: b.ensures + 1,
@@ -790,7 +811,12 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
             }
           },
           ITest(d) -> {
-            let row = { root: qualify(m.name, key_test_root(a.ordinal)), arity: 0, scalar: false };
+            let row = {
+              root: qualify(m.name, key_test_root(a.ordinal)),
+              arity: 0,
+              scalar: false,
+              width: false,
+            };
             { ..a, tests: push(a.tests, row), ordinal: a.ordinal + 1 }
           },
           ILaw(d) -> {
@@ -807,6 +833,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                   root: qualify(m.name, key_law_root(a.law_ordinal, part)),
                   arity: len(binders),
                   scalar: scalar,
+                  width: false,
                 }),
             );
             { ..a, specs: append(a.specs, rows), law_ordinal: a.law_ordinal + 1 }
@@ -824,7 +851,11 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
 }
 
 fn emit_root_frame(r: EmitRoot) -> Bytes =
-  framed(b"emitroot", r.root, [field(b"arity", num(r.arity)), field(b"scalar", flag(r.scalar))])
+  framed(b"emitroot", r.root, [
+    field(b"arity", num(r.arity)),
+    field(b"scalar", flag(r.scalar)),
+    field(b"width", flag(r.width)),
+  ])
 
 fn ordinal_row(m: Mod) -> OrdinalRow =
   {
@@ -3051,13 +3082,16 @@ fn bulk_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dum
   } else if tag == 16 { Ok({ ..d, hashes_digest: unhexed(what, u.body)? }) }
   else if tag == 17 { Ok({ ..d, keys: push(d.keys, { root: name, key: u.body }) }) } else if tag
       == 18 {
-    let fs = fields(what, u.body, [b"arity", b"scalar"])?;
+    let fs = fields(what, u.body, [b"arity", b"scalar", b"width"])?;
+    let widths = all_of(fs, b"width");
     Ok({
       ..d,
       emit_roots: push(d.emit_roots, {
         root: name,
         arity: counted(what, fs, b"arity")?,
         scalar: flagged(what, fs, b"scalar")?,
+        // An answer from a bundle whose front end predates the field carries none.
+        width: len(widths) == 1 && at(widths, 0) == b"1",
       }),
     })
   } else if tag == 19 {
