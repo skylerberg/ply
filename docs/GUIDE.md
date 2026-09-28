@@ -2051,6 +2051,11 @@ pub fn elements<a>(s: Map<a, Unit>) -> List<a>
 pub fn of_list<a>(xs: List<a>) -> Map<a, Unit>
 pub fn contains_all<a>(s: Map<a, Unit>, xs: List<a>) -> Bool
 pub fn contains_none<a>(s: Map<a, Unit>, xs: List<a>) -> Bool
+pub fn intersection<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Map<a, Unit>
+pub fn difference<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Map<a, Unit>
+pub fn symmetric_difference<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Map<a, Unit>
+pub fn is_subset<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Bool
+pub fn is_superset<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Bool
 ```
 
 A set is a `Map` whose values are `Unit` and nothing else, and there is no set
@@ -2059,7 +2064,60 @@ type in the language yet: an alias would read better — `type Set<a>` — but a
 type alias cannot carry `derivable` (card `313874be`). Until it can, the parameter
 is the map and the constraint is on the signature. The key order is the set's
 order, so `elements` is stable. `union` is `map_merge`, which is why a duplicate
-is inserted once however many times it appears in the `of_list`.
+is inserted once however many times it appears in the `of_list`; `intersection`
+and `difference` walk one set's elements and ask the other, so each is `n log n`.
+There is no `fold` here: the fold is the prelude's `map_fold`, whose open effect
+row a wrapper would close.
+
+### 13.31 `std.bigint`
+
+```ply
+pub type BigInt = { negative: Bool, limbs: List<Int> }
+pub fn zero() -> BigInt
+pub fn one() -> BigInt
+pub fn is_zero(value: BigInt) -> Bool
+pub fn is_negative(value: BigInt) -> Bool
+pub fn sign(value: BigInt) -> Int
+pub fn abs_value(value: BigInt) -> BigInt
+pub fn neg(value: BigInt) -> BigInt
+pub fn of_int(n: Int) -> BigInt
+pub fn to_int(value: BigInt) -> Option<Int>
+pub fn to_string(value: BigInt) -> String
+pub fn of_string(text: String) -> Option<BigInt>
+pub fn compare(a: BigInt, b: BigInt) -> Ordering
+pub fn less_than(a: BigInt, b: BigInt) -> Bool
+pub fn add(a: BigInt, b: BigInt) -> BigInt
+pub fn sub(a: BigInt, b: BigInt) -> BigInt
+pub fn mul(a: BigInt, b: BigInt) -> BigInt
+pub fn div_mod(a: BigInt, b: BigInt) -> Option<{ q: BigInt, r: BigInt }>
+pub fn div(a: BigInt, b: BigInt) -> Option<BigInt>
+pub fn modulo(a: BigInt, b: BigInt) -> Option<BigInt>
+pub fn floor_mod(a: BigInt, b: BigInt) -> Option<BigInt>
+pub fn pow(base: BigInt, exponent: Int) -> BigInt
+pub fn mod_pow(base: BigInt, exponent: Int, modulus: BigInt) -> Option<BigInt>
+pub fn gcd(a: BigInt, b: BigInt) -> BigInt
+pub fn shift_left(value: BigInt, bits: Int) -> BigInt
+pub fn shift_right(value: BigInt, bits: Int) -> BigInt
+```
+
+Arbitrary precision, where `Int` wraps at `i64`. A value is a sign and base-2^30
+limbs, least significant first, with no high zero limb and with zero positive and
+limbless, so the representation is canonical and `derive eq` is the right
+equality. The base is a power of two so a limb boundary is a bit boundary — shifts
+and bit tests are limb arithmetic, and only the decimal conversions pay for the
+base. `ord` is deliberately **not** derived: the number's order is not the
+record's (with the sign first, `-10` would sort after `-5` by magnitude), so
+`compare` is the ordering and a hand-written instance would be card `C4`'s ground.
+`of_string` takes an optional sign and refuses anything else, `to_string` is its
+inverse, and `-0` is zero. Division is truncated toward zero — `q` takes the sign
+of `a * b` and `r` the sign of `a`, so `a == q * b + r` and `|r| < |b|` — and a
+zero divisor is `None` rather than a raise; `floor_mod` is the remainder with the
+divisor's sign, which is what `mod_pow` reduces with. A negative exponent is one,
+as integer arithmetic has it. `to_int` answers `None` outside `i64`, `min_int`
+included as exact on the way in and out. One implementation note worth keeping:
+`limbs_of` is written as a plain recursion rather than a tail loop because a self
+tail call that passes an `Int` at or beyond 2^62 back to itself releases the word
+and reuses it (card `6298c4dd`).
 
 ## 14. The host boundary
 
