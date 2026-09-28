@@ -46,7 +46,7 @@ fn script() -> Vec<(&'static str, Vec<u8>)> {
 
 fn variants() -> Result<(w3::Loaded, w3::Loaded)> {
     let service = w3::Service::open(&repo())?;
-    let source = service.source(w3::Variant::Sequential)?;
+    let source = service.source(w3::Variant::Sequential, w3::Transport::Http)?;
     // The ladder's own rewrite, so this control and the one `w6-ladder` prices against are one program.
     let control = w6_run::without_constants(&source);
     assert_ne!(source, control, "the rewrite found nothing to disable");
