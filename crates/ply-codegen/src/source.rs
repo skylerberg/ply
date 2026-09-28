@@ -2,7 +2,7 @@
 //! Every table here is read from a [`Front`].
 
 use ply_span::{SourceId, SourceMap, Span, Symbol};
-use ply_ty::{CheckOutput, Front, LawInfo, Ordinal, SpecKind};
+use ply_ty::{Front, LawInfo, Ordinal, SpecKind};
 use std::collections::{HashMap, HashSet};
 use std::sync::{PoisonError, RwLock};
 
@@ -10,7 +10,6 @@ use std::sync::{PoisonError, RwLock};
 pub struct Source {
     pub front: &'static Front,
     /// [`Front::check`].
-    pub check: &'static CheckOutput,
     tables: Tables,
     /// Each root's definition span where failures are reported: `tables.spans` until relocated.
     placed: RwLock<HashMap<String, Span>>,
@@ -58,6 +57,8 @@ struct Tables {
     arities: HashMap<String, usize>,
     /// Roots whose parameters and answer are all `Int` or `Bool`.
     scalars: HashSet<String>,
+    /// Roots whose scheme mentions a fixed-width type, which the compiled seam cannot carry.
+    widths: HashSet<String>,
     modules: Vec<(Symbol, SourceId)>,
     /// Each root's definition span; a clause's is its owner's.
     spans: HashMap<String, Span>,
@@ -81,6 +82,12 @@ impl Tables {
                 .emitter_roots
                 .iter()
                 .filter(|r| r.scalar)
+                .map(|r| r.root.to_string())
+                .collect(),
+            widths: front
+                .emitter_roots
+                .iter()
+                .filter(|r| r.width)
                 .map(|r| r.root.to_string())
                 .collect(),
             modules: Vec::new(),
@@ -175,7 +182,6 @@ impl Source {
         let tables = Tables::of(front);
         Source {
             front,
-            check: &front.check,
             placed: RwLock::new(tables.spans.clone()),
             tables,
             keys,
@@ -245,6 +251,11 @@ impl Source {
     }
 
     /// Whether every parameter and the answer are `Int` or `Bool`.
+    /// Whether the root's scheme mentions a fixed-width type.
+    pub fn mentions_width(&self, name: &str) -> bool {
+        self.tables.widths.contains(name)
+    }
+
     pub fn scalar_signature(&self, name: &str) -> bool {
         self.tables.scalars.contains(name)
     }
