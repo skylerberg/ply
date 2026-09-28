@@ -1501,17 +1501,27 @@ and `std.fs (fs)` to name the module and the effect.
 ```ply
 pub fn join(dir: String, name: String) -> String
 pub fn file_name(path: String) -> String
+pub fn stem(path: String) -> String
+pub fn with_extension(path: String, ext: String) -> String
 pub fn parent(path: String) -> String
 pub fn extension(path: String) -> Option<String>
+pub fn components(path: String) -> List<String>
+pub fn resolve(base: String, path: String) -> String
 pub fn strip_dot(path: String) -> String
 ```
 
 Text, not a filesystem: nothing here performs an effect. `join` places exactly
 one separator and adds none for a root spelled `"."` or `""`. `file_name` is the
-last segment, `""` for a path ending in a separator. `parent` is the directory
-holding the path, `"."` for a name with no separator and for a root, so
+last segment, `""` for a path ending in a separator, and `stem` is that name
+with its extension taken off, so `stem("a.tar.gz")` is `"a.tar"` and
+`with_extension` puts another one back. `parent` is the directory holding the
+path, `"."` for a name with no separator and for a root, so
 `join(parent(p), file_name(p))` puts back what the two took apart. `extension`
-follows the last dot of the file name, and a dotfile has none. `strip_dot`
+follows the last dot of the file name, and a dotfile has none. `components` is
+the separators' parts, a leading separator an empty first segment.
+`resolve(base, p)` is `p` against `base`, an absolute `p` as itself and a
+relative one appended and normalized; it reads no directory, so `..` is resolved
+by segment rather than by what is there. `strip_dot`
 removes a leading `./`, so `./m.ply` and `m.ply` are one key in a set.
 
 ### 13.13 `std.hash`
@@ -1554,6 +1564,8 @@ pub fn i32_be_at(b: Bytes, at: Int) -> Option<Int>
 pub fn i64_be_at(b: Bytes, at: Int) -> Option<Int>
 pub fn slice_at(b: Bytes, at: Int, n: Int) -> Option<Bytes>
 pub fn join(pieces: List<Bytes>, sep: Bytes) -> Bytes
+pub fn compare(a: Bytes, b: Bytes) -> Ordering
+pub fn repeat(b: Bytes, n: Int) -> Bytes
 pub fn hex_of(b: Bytes) -> String
 pub fn bytes_of_hex(text: String) -> Bytes
 ```
@@ -1855,14 +1867,28 @@ pub fn to_upper(text: String) -> String
 pub fn repeat(text: String, n: Int) -> String
 pub fn pad_left(text: String, width: Int, fill: String) -> String
 pub fn pad_right(text: String, width: Int, fill: String) -> String
+pub fn split(text: String, sep: String) -> List<String>
+pub fn contains(text: String, needle: String) -> Bool
+pub fn starts_with(text: String, prefix: String) -> Bool
+pub fn ends_with(text: String, suffix: String) -> Bool
+pub fn index_of(text: String, needle: String) -> Option<Int>
+pub fn lines(text: String) -> List<String>
+pub fn words(text: String) -> List<String>
+pub fn count(text: String, needle: String) -> Int
+pub fn capitalize(text: String) -> String
 ```
 
 The whole the prelude's string builtins do not make: `join` (which three shipped
 modules were each writing for themselves), `replace`, trim, ASCII case fold,
-repeat and pad. Every one is total — `replace` with an empty needle is the text
-unchanged rather than a loop, and the case fold touches `A-Z`/`a-z` and leaves
-every other character as it is. `std.bytes.join` is the same operation over
-`Bytes`.
+repeat and pad, and then the two names a caller reaches for that the prelude
+spells `string_split`/`string_contains`/`string_find`. `index_of` answers `None`
+rather than the prelude's `-1`, which is not a position. `lines` takes a trailing
+`\r` off each line, so a CRLF file reads as an LF one, and the empty text has no
+lines rather than one empty line; `words` is the runs that are not whitespace and
+never empty. `count` does not overlap. Every one is total — `replace` with an
+empty needle is the text unchanged rather than a loop, and the case fold touches
+`A-Z`/`a-z` and leaves every other character as it is. `std.bytes.join` is the
+same operation over `Bytes`.
 
 ### 13.25 `std.option`
 
@@ -1876,6 +1902,9 @@ pub fn option_expect<a>(o: Option<a>, message: String) -> a
 pub fn option_is_some<a>(o: Option<a>) -> Bool
 pub fn option_is_none<a>(o: Option<a>) -> Bool
 pub fn option_ok_or<a, e>(o: Option<a>, err: e) -> Result<a, e>
+pub fn option_or_else<a>(o: Option<a>, fallback: () -> Option<a>) -> Option<a>
+pub fn option_unwrap_or_else<a>(o: Option<a>, fallback: () -> a) -> a
+pub fn option_map_or<a, b>(o: Option<a>, fallback: b, f: (a) -> b) -> b
 ```
 
 `Option`'s constructors and `?` are the prelude's; this is the chain a caller reads
@@ -1896,6 +1925,9 @@ pub fn result_ok<a, e>(r: Result<a, e>) -> Option<a>
 pub fn result_err<a, e>(r: Result<a, e>) -> Option<e>
 pub fn result_is_ok<a, e>(r: Result<a, e>) -> Bool
 pub fn result_is_err<a, e>(r: Result<a, e>) -> Bool
+pub fn result_or_else<a, e>(r: Result<a, e>, fallback: (e) -> Result<a, e>) -> Result<a, e>
+pub fn result_unwrap_or_else<a, e>(r: Result<a, e>, fallback: (e) -> a) -> a
+pub fn result_map_or<a, b, e>(r: Result<a, e>, fallback: b, f: (a) -> b) -> b
 ```
 
 The same shape over `Ok`/`Err`. `result_map_err` is how a low-level failure
@@ -1914,6 +1946,9 @@ pub fn odd(n: Int) -> Bool
 pub fn gcd(a: Int, b: Int) -> Int
 pub fn lcm(a: Int, b: Int) -> Int
 pub fn pow(base: Int, exponent: Int) -> Int
+pub fn is_prime(n: Int) -> Bool
+pub fn factorial(n: Int) -> Int
+pub fn isqrt(n: Int) -> Int
 ```
 
 `min` and `max` are prelude builtins and stay there. Everything here is `Int`,
@@ -1921,6 +1956,110 @@ which is `i64`, and the arithmetic wraps at that width rather than raising, so
 `pow` and `abs(min_int())` answer a wrapped value — a checked variant would have
 to say what it answers instead, and that belongs with `B10`'s numeric
 predicates. `gcd` and `lcm` are never negative, and `gcd(0, 0)` is `0`.
+`is_prime` says no for zero, one and every negative, `factorial` is `1` at and
+below one, and `isqrt` is the greatest `r` with `r * r <= n` — `0` for a negative
+`n`, which has none.
+
+### 13.28 `std.list`
+
+```ply
+pub fn first<a>(xs: List<a>) -> Option<a>
+pub fn last<a>(xs: List<a>) -> Option<a>
+pub fn take<a>(xs: List<a>, n: Int) -> List<a>
+pub fn drop<a>(xs: List<a>, n: Int) -> List<a>
+pub fn reverse<a>(xs: List<a>) -> List<a>
+pub fn concat<a>(xs: List<a>, ys: List<a>) -> List<a>
+pub fn flat_map<a, b>(xs: List<a>, f: (a) -> List<b>) -> List<b>
+pub fn zip<a, b>(xs: List<a>, ys: List<b>) -> List<{ first: a, second: b }>
+pub fn any<a>(xs: List<a>, ok: (a) -> Bool) -> Bool
+pub fn all<a>(xs: List<a>, ok: (a) -> Bool) -> Bool
+pub fn count<a>(xs: List<a>, ok: (a) -> Bool) -> Int
+pub fn find<a>(xs: List<a>, ok: (a) -> Bool) -> Option<a>
+pub fn find_index<a>(xs: List<a>, ok: (a) -> Bool) -> Option<Int>
+pub fn contains<a>(xs: List<a>, x: a) -> Bool where derivable(eq, a)
+pub fn index_of<a>(xs: List<a>, x: a) -> Option<Int> where derivable(eq, a)
+pub fn remove_first<a>(xs: List<a>, x: a) -> Option<List<a>> where derivable(eq, a)
+pub fn sum(xs: List<Int>) -> Int
+pub fn max_of<a>(xs: List<a>) -> Option<a> where derivable(ord, a)
+pub fn min_of<a>(xs: List<a>) -> Option<a> where derivable(ord, a)
+pub fn is_sorted<a>(xs: List<a>) -> Bool where derivable(ord, a)
+pub fn sort<a>(xs: List<a>) -> List<a> where derivable(ord, a)
+pub fn sort_by<a>(xs: List<a>, before: (a, a) -> Bool) -> List<a>
+pub fn flatten<a>(xss: List<List<a>>) -> List<a>
+pub fn partition<a>(xs: List<a>, ok: (a) -> Bool) -> { yes: List<a>, no: List<a> }
+pub fn split_at<a>(xs: List<a>, n: Int) -> { head: List<a>, tail: List<a> }
+pub fn chunks<a>(xs: List<a>, n: Int) -> List<List<a>>
+pub fn intersperse<a>(xs: List<a>, sep: a) -> List<a>
+pub fn unique<a>(xs: List<a>) -> List<a> where derivable(ord, a)
+```
+
+The prelude has the pieces — `map`, `filter`, `fold`, `iterate`, `range`, `push`
+and `list_at` — and not the wholes. A `List` is a vector, not a linked list: the
+cheap end is the back, `push` appends and nothing prepends, so every function
+here folds left to right and appends, which is one pass and linear. That is why
+building the same list from the front is a shape to avoid in Ply as well: it
+copies the accumulator every step and is quadratic. `take` and `drop` are the two
+halves of a list (`concat(take(xs, n), drop(xs, n))` is `xs`), `reverse` walks its
+index down while it appends, and `sort` is a merge sort — `n log n` comparisons
+whatever the input order is, and equal elements keep their relative order.
+`sort_by` is the same sort under a caller's `before`, which is how a key sort is
+written. `find` and `find_index` keep the first answer a scan meets. `partition`,
+`split_at` and `chunks` divide one list into others and keep the order;
+`flatten` is `flat_map` of the identity, `intersperse` puts its separator
+between the elements, and `unique` keeps each element's first occurrence — its
+membership test is a map's, so it is `n log n` rather than the `n²` a scan
+through the output would be.
+
+### 13.29 `std.map`
+
+```ply
+pub fn is_empty<k, v>(m: Map<k, v>) -> Bool
+pub fn size<k, v>(m: Map<k, v>) -> Int
+pub fn get<k, v>(m: Map<k, v>, key: k) -> Option<v>
+pub fn get_or<k, v>(m: Map<k, v>, key: k, fallback: v) -> v
+pub fn contains<k, v>(m: Map<k, v>, key: k) -> Bool
+pub fn insert<k, v>(m: Map<k, v>, key: k, value: v) -> Map<k, v>
+pub fn remove<k, v>(m: Map<k, v>, key: k) -> Map<k, v>
+pub fn merge<k, v>(a: Map<k, v>, b: Map<k, v>) -> Map<k, v>
+pub fn keys<k, v>(m: Map<k, v>) -> List<k>
+pub fn values<k, v>(m: Map<k, v>) -> List<v>
+pub fn entries<k, v>(m: Map<k, v>) -> List<{ key: k, value: v }>
+pub fn from_entries<k, v>(entries: List<{ key: k, value: v }>) -> Map<k, v>
+```
+
+Every signature carries `where derivable(ord, k)`: a `Map` key has to be an
+ordered type, and a wrapper has to say so as the map builtins do. This is the
+prelude's `map_`-prefixed builtins under the module's name — `map.get(m, key)`
+reads where `map_get(m, key)` spells a word twice — with the composed ones
+(`size`, `get_or`) and the names a caller reaches for (`contains`, `keys`,
+`entries`). Every answer comes back in the map's key order. The effectful folds
+stay in the prelude, as `map_fold` and `map_update`: a wrapper's signature closes
+the effect row, and a fold that could not perform an effect would not be the
+prelude's.
+
+### 13.30 `std.set`
+
+```ply
+pub fn empty<a>() -> Map<a, Unit> where derivable(ord, a)
+pub fn is_empty<a>(s: Map<a, Unit>) -> Bool
+pub fn size<a>(s: Map<a, Unit>) -> Int
+pub fn contains<a>(s: Map<a, Unit>, x: a) -> Bool
+pub fn insert<a>(s: Map<a, Unit>, x: a) -> Map<a, Unit>
+pub fn remove<a>(s: Map<a, Unit>, x: a) -> Map<a, Unit>
+pub fn union<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Map<a, Unit>
+pub fn elements<a>(s: Map<a, Unit>) -> List<a>
+pub fn of_list<a>(xs: List<a>) -> Map<a, Unit>
+pub fn contains_all<a>(s: Map<a, Unit>, xs: List<a>) -> Bool
+pub fn contains_none<a>(s: Map<a, Unit>, xs: List<a>) -> Bool
+```
+
+A set is a `Map` whose values are `Unit` and nothing else, and there is no set
+type in the language yet: an alias would read better — `type Set<a>` — but a
+`Map` key has to be ordered, the constraint would have to ride on the alias, and a
+type alias cannot carry `derivable` (card `313874be`). Until it can, the parameter
+is the map and the constraint is on the signature. The key order is the set's
+order, so `elements` is stable. `union` is `map_merge`, which is why a duplicate
+is inserted once however many times it appears in the `of_list`.
 
 ## 14. The host boundary
 
