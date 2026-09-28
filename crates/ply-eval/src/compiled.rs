@@ -5,10 +5,11 @@ use crate::host::{HostBinding, HostRuntime, HostUse};
 use crate::region::Record;
 use crate::sim::Seed;
 use crate::value::Value;
+use crate::{SECRET, TASK_TYPE};
 use ply_span::{Diagnostic, Symbol};
 use ply_ty::CheckOutput;
 use ply_ty::Footprint;
-use ply_ty::{DefHash, EffectAtom, SECRET, TyVar, Type};
+use ply_ty::{DefHash, EffectAtom, TyVar, Type};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -232,7 +233,7 @@ impl CarriedTypes {
                 "List" | "Map" => args.iter().all(|t| self.carries(t, decl_vars)),
                 // Refused before this table is asked; excluded to keep the leaf set honest.
                 "Float" | "Decimal" => false,
-                "Cell" | ply_ty::TASK_TYPE | SECRET => false,
+                "Cell" | TASK_TYPE | SECRET => false,
                 // Compiled code holds these as `Int` immediates, so one crossing back is wrong.
                 n if IntTy::from_name(n).is_some() => false,
                 _ => match self.decls.get(name) {

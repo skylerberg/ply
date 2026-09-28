@@ -1,3 +1,4 @@
+use ply_eval::TASK_TYPE;
 use ply_eval::{Compiled, DEFAULT_MAX_CALLS, Entered, Value};
 use ply_prove::property::{
     EDGE_CASES, EDGE_INTS, GenStream, Judge, TypeWorld, Ungeneratable, draw_cases, generatable,
@@ -10,7 +11,6 @@ use ply_prove::{
 use ply_span::{Diagnostic, SourceId, Span, Symbol};
 use ply_ty::DefHash;
 use ply_ty::Mode;
-use ply_ty::TASK_TYPE;
 use ply_ty::{EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
