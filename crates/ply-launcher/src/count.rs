@@ -23,6 +23,9 @@ static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Site -> what it allocated, in site order.
 static SITES: Mutex<BTreeMap<String, Counted>> = Mutex::new(BTreeMap::new());
+/// Instruction pointer -> the `ply_*` names at that frame, in the order the symbolizer reports
+/// them. A frame with none is an entry with an empty list.
+static RESOLVED: Mutex<BTreeMap<usize, Vec<String>>> = Mutex::new(BTreeMap::new());
 
 thread_local! {
     /// A backtrace allocates, and a site that counted those allocations would be the walker's
@@ -42,23 +45,40 @@ pub struct Counting;
 impl Counting {
     #[inline]
     fn note(layout: &Layout) {
+        Counting::record(1, layout.size() as u64);
+    }
+
+    /// One allocation's contribution: the count, the bytes it added, and — when the run asked for
+    /// sites — the `ply_*` frame that made it. The alloc and realloc paths both come through here,
+    /// so the two modes count the same window and every allocation is attributed.
+    #[inline]
+    fn record(allocations: u64, bytes: u64) {
         if !ON.load(Ordering::Relaxed) {
             return;
         }
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         if !ATTRIBUTE.load(Ordering::Relaxed) {
+            ALLOCS.fetch_add(allocations, Ordering::Relaxed);
+            BYTES.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
+        Counting::attribute(allocations, bytes);
+    }
+
+    #[inline(never)]
+    fn attribute(allocations: u64, bytes: u64) {
+        // Naming a site walks the stack, and the walk itself allocates: those allocations are the
+        // instrument's, not the program's, so they are neither counted nor attributed.
         let already = INSIDE.with(|c| c.replace(true));
         if already {
             return;
         }
+        ALLOCS.fetch_add(allocations, Ordering::Relaxed);
+        BYTES.fetch_add(bytes, Ordering::Relaxed);
         let site = site();
         if let Ok(mut sites) = SITES.lock() {
             let entry = sites.entry(site).or_default();
-            entry.allocations += 1;
-            entry.bytes += layout.size() as u64;
+            entry.allocations += allocations;
+            entry.bytes += bytes;
         }
         INSIDE.with(|c| c.set(false));
     }
@@ -83,6 +103,26 @@ fn site() -> String {
 /// own functions are `ply_`-prefixed C symbols, while the launcher's and the toolchain's Rust
 /// frames carry `::`, so a site is the program's code and not the tool running it.
 fn named(frame: &backtrace::Frame, into: &mut Vec<String>) {
+    for cut in resolved_names(frame) {
+        if !into.iter().any(|seen| seen == &cut) {
+            into.push(cut);
+        }
+    }
+}
+
+/// The `ply_*` names at one frame, resolved once per instruction pointer.
+///
+/// One call site allocates over and over, and symbolizing answers the same question every time;
+/// the answer is kept per address. A frame with no `ply_*` name is kept too, since a Rust frame in
+/// the toolchain is the common case.
+fn resolved_names(frame: &backtrace::Frame) -> Vec<String> {
+    let at = frame.ip() as usize;
+    if let Ok(cache) = RESOLVED.lock()
+        && let Some(hit) = cache.get(&at)
+    {
+        return hit.clone();
+    }
+    let mut found: Vec<String> = Vec::new();
     backtrace::resolve_frame(frame, |symbol| {
         let Some(name) = symbol.name() else { return };
         let name = name.to_string();
@@ -90,10 +130,14 @@ fn named(frame: &backtrace::Frame, into: &mut Vec<String>) {
             return;
         }
         let cut = name.rfind("::h").map(|i| &name[..i]).unwrap_or(&name);
-        if !into.iter().any(|seen| seen == cut) {
-            into.push(cut.to_string());
+        if !found.iter().any(|seen| seen == cut) {
+            found.push(cut.to_string());
         }
     });
+    if let Ok(mut cache) = RESOLVED.lock() {
+        cache.insert(at, found.clone());
+    }
+    found
 }
 
 unsafe impl GlobalAlloc for Counting {
@@ -108,14 +152,9 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // A realloc is an allocation; the bytes it holds are the ones it asked for now.
-        if ON.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(
-                new_size.saturating_sub(layout.size()) as u64,
-                Ordering::Relaxed,
-            );
-        }
+        // A realloc is an allocation; the bytes it holds are the ones it asked for now, so the
+        // count is one and the bytes are the growth.
+        Counting::record(1, new_size.saturating_sub(layout.size()) as u64);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
