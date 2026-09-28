@@ -423,7 +423,6 @@ pub struct Ctx {
     pub heap: Heap,
     /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
     last_entry: usize,
-    unclosed_entries: u64,
     pub tables: Rc<Tables>,
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
@@ -482,7 +481,6 @@ impl Ctx {
             time_budget_ms: 0,
             heap: Heap::new(),
             last_entry: 0,
-            unclosed_entries: 0,
             tables,
             cells,
             cells_baseline: baseline,
@@ -544,7 +542,6 @@ impl Ctx {
         self.resumed = None;
         // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.allocated() != 0 {
-            self.unclosed_entries += 1;
             self.end();
         }
         // After the recovery above, which gives back what that entry held.
@@ -651,20 +648,6 @@ impl Ctx {
             }
         }
         self.heap.end();
-    }
-
-    /// How many objects the entry that just finished allocated.
-    pub fn allocated_by_entry(&self) -> usize {
-        if self.heap.allocated() == 0 {
-            self.last_entry
-        } else {
-            self.heap.allocated()
-        }
-    }
-
-    /// Entries that reached [`Ctx::begin`] without their predecessor having closed itself.
-    pub fn unclosed_entries(&self) -> u64 {
-        self.unclosed_entries
     }
 
     /// Whether the entry gave back every region it opened and cell slot it took; a cell word in the
