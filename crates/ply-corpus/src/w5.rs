@@ -404,7 +404,8 @@ struct Serving {
     addr: std::net::SocketAddr,
     /// Where the sink wrote, for the run that reads its records back.
     records: Option<PathBuf>,
-    tls: Option<Arc<rustls::ClientConfig>>,
+    /// The certificate a client of this server trusts, which is the one this run issued it.
+    trust: Option<PathBuf>,
 }
 
 impl Serving {
@@ -441,7 +442,7 @@ impl Serving {
             "--trace-level".into(),
             "info".into(),
         ];
-        let mut tls = None;
+        let mut trust = None;
         if stack != Stack::Twin {
             args.push("--db".into());
             args.push(url.to_string());
@@ -456,7 +457,7 @@ impl Serving {
                 material.certificate.display(),
                 material.key.display()
             ));
-            tls = Some(Arc::new(w3::client_config(&material.der)?));
+            trust = Some(material.certificate);
         }
 
         let (stderr, records) = match sinking {
@@ -471,13 +472,13 @@ impl Serving {
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut server = Server::start_with(ply, dir.path(), &borrowed, stderr)?;
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        w3::wait_until_serving_over(&mut server, addr, tls.clone())?;
+        w3::wait_until_serving_over(&mut server, addr, trust.as_deref())?;
         Ok(Serving {
             _dir: dir,
             server,
             addr,
             records,
-            tls,
+            trust,
         })
     }
 
@@ -536,10 +537,11 @@ pub fn tracing(
                     Serving::start(repo, ply, url, stack, variant, sinking, budget, api_key)?;
                 let before = serving.records_written();
                 for (label, path) in routes {
+                    let trust = serving.trust.clone();
                     let point = w3::load_point_over(
                         &mut serving.server,
                         serving.addr,
-                        serving.tls.clone(),
+                        trust.as_deref(),
                         stack.label(),
                         label,
                         path,

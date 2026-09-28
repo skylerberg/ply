@@ -8,7 +8,7 @@ use ply_span::Span;
 use ply_ty::CheckOutput;
 use ply_ty::ModuleName;
 use ply_ty::ty::Footprint;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -860,6 +860,8 @@ pub fn load_floor(headers: usize, concurrency: u32, requests: u32) -> Result<Loa
 /// `ply run --host`, killed however the harness leaves.
 pub struct Server {
     child: Option<Child>,
+    /// The binary this was started with, which is also the one a load client runs.
+    ply: PathBuf,
 }
 
 impl Server {
@@ -878,7 +880,15 @@ impl Server {
             .stderr(stderr)
             .spawn()
             .with_context(|| format!("starting `{} run --host`", ply.display()))?;
-        Ok(Server { child: Some(child) })
+        Ok(Server {
+            child: Some(child),
+            ply: ply.to_path_buf(),
+        })
+    }
+
+    /// The binary this server was started with, which is the one its load client runs.
+    pub fn ply(&self) -> &Path {
+        &self.ply
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -978,6 +988,120 @@ impl Drop for Server {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// The load client's own source, embedded so the file the harness ships and the file the corpus
+/// checks are one file: `crates/ply-corpus/fixtures/load.ply`.
+const LOAD_CLIENT: &str = include_str!("../fixtures/load.ply");
+
+/// What one run of the load client found, as the program wrote it down.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Report {
+    pub requests: u32,
+    pub answered: u32,
+    pub connections: u32,
+    pub per_conn: u32,
+    pub wall_micros: i64,
+    /// Microseconds, one per exchange, in the order the connection took them.
+    pub latencies: Vec<i64>,
+    pub connects: Vec<i64>,
+    pub handshakes: Vec<i64>,
+    pub statuses: Vec<Status>,
+    pub failures: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Status {
+    pub status: u16,
+    pub count: u32,
+}
+
+/// The name this harness's credential is issued for, and the name every load client presents.
+///
+/// A server is dialled by address (the port is the run's), but a name is what TLS verifies, so
+/// `localhost` is sent as the host: the certificate `certgen` issues names it, and a client that
+/// presented `127.0.0.1` would fail verification against its own server's certificate.
+const SERVER_NAME: &str = "localhost";
+
+/// The load client: the program on disk, a root its report is written under, and the settings one
+/// point adds to it.
+///
+/// The client is a program rather than a library of this harness, so a measurement runs the same
+/// thing a user would: `ply run --host` with its own configuration, one process per point. It is
+/// given no file of its own to write except the report, and no port of its own to reach.
+pub struct LoadClient {
+    ply: PathBuf,
+    /// Holds `load.ply`, the project `ply run --host` is pointed at.
+    dir: tempfile::TempDir,
+    /// The `report` resource's root, so a run cannot write anywhere else.
+    root: tempfile::TempDir,
+}
+
+impl LoadClient {
+    pub fn new(ply: &Path) -> Result<LoadClient> {
+        let dir = tempfile::tempdir().context("a temp dir for the load client")?;
+        std::fs::write(dir.path().join("load.ply"), LOAD_CLIENT)
+            .context("writing the load client")?;
+        let root = tempfile::tempdir().context("a temp dir for the load client's report")?;
+        Ok(LoadClient {
+            ply: ply.to_path_buf(),
+            dir,
+            root,
+        })
+    }
+
+    /// One measured run: `connections` connections carrying `per_conn` requests each over `paths`.
+    ///
+    /// `trust` is a certificate the run accepts beside the built-in roots, which is how a client
+    /// reaches the server this harness generated a credential for; naming one is what makes the run
+    /// speak TLS rather than plaintext.
+    pub fn measure(
+        &self,
+        addr: SocketAddr,
+        paths: &str,
+        connections: u32,
+        per_conn: u32,
+        trust: Option<&Path>,
+    ) -> Result<Report> {
+        let report = "load.json";
+        // A stale report would be read as this run's, so the run that fails to write one fails here.
+        let _ = std::fs::remove_file(self.root.path().join(report));
+        let mut command = Command::new(&self.ply);
+        command
+            .args(["run", "--host", "--color", "never"])
+            .arg("--fs")
+            .arg(format!("report={}", self.root.path().display()))
+            .args(["--set", &format!("LOAD_HOST={SERVER_NAME}")])
+            .args(["--set", &format!("LOAD_PORT={}", addr.port())])
+            .args(["--set", &format!("LOAD_ROUTES={paths}")])
+            .args(["--set", &format!("LOAD_CONNECTIONS={connections}")])
+            .args(["--set", &format!("LOAD_PER_CONN={per_conn}")])
+            .args(["--set", &format!("LOAD_TLS={}", trust.is_some())])
+            .args(["--set", &format!("LOAD_REPORT={report}")])
+            .current_dir(self.dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(certificate) = trust {
+            command.arg("--trust").arg(certificate);
+        }
+        let out = command.output().with_context(|| {
+            format!(
+                "running `{} run --host` as a load client",
+                self.ply.display()
+            )
+        })?;
+        if !out.status.success() {
+            bail!(
+                "the load client exited {} at {connections}x{per_conn} on {paths}:\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let path = self.root.path().join(report);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("the load client wrote no report to `{}`", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("reading `{}`", path.display()))
     }
 }
 
