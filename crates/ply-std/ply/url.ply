@@ -1,0 +1,150 @@
+// `url` — percent-encoding, the form dialect, and query strings.
+//
+// RFC 3986 §2.1 is `url_encode`/`url_decode`: every byte that is not unreserved (`A-Za-z0-9-._~`)
+// becomes `%XX` with upper-case hex, and a decoder answers `None` for a `%` that is not followed by
+// two hex digits or for bytes that are not UTF-8. `application/x-www-form-urlencoded` is the form
+// dialect `form_encode`/`form_decode`, which spells a space `+`; it is what a query string and a
+// form body carry, and why `query_parse`/`query_build` use it rather than `url_*`.
+//
+// A `Url` is not here yet: this module is the two encodings and the query string, which nothing in
+// the library had, rather than a URL parser that `std.http` and `std.router` already do their own
+// way. Everything is pure and total.
+
+pub type Pair = { name: String, value: String }
+
+/// RFC 3986 percent-encoding: every byte outside the unreserved set as `%XX`.
+pub fn url_encode(text: String) -> String = percent_encode(bytes_of_string(text), false)
+
+/// The inverse. `None` for a `%` not followed by two hex digits, or for bytes that are not UTF-8.
+pub fn url_decode(text: String) -> Option<String> = percent_decode(bytes_of_string(text), false)
+
+/// `application/x-www-form-urlencoded`: `url_encode` with a space as `+`.
+pub fn form_encode(text: String) -> String = percent_encode(bytes_of_string(text), true)
+
+/// The inverse, where `+` is a space. `None` on the same terms as `url_decode`.
+pub fn form_decode(text: String) -> Option<String> = percent_decode(bytes_of_string(text), true)
+
+/// A query string as `name`/`value` pairs, in the order it names them. `None` if any pair is not
+/// valid form encoding. An empty part (`a=1&&b=2`) is passed over; a part with no `=` is a name
+/// with an empty value.
+pub fn query_parse(query: String) -> Option<List<Pair>> =
+  query_pairs(filter(string_split(query, "&"), |part: String| string_len(part) > 0))
+
+/// The query string a list of pairs spells, in the order given, each side form-encoded.
+pub fn query_build(pairs: List<Pair>) -> String =
+  join_all(map(pairs, |p: Pair| form_encode(p.name) ++ "=" ++ form_encode(p.value)), "&")
+
+fn join_all(pieces: List<String>, sep: String) -> String =
+  match pieces {
+    [] -> "",
+    [first, ..rest] -> fold(rest, first, |acc: String, p: String| acc ++ sep ++ p),
+  }
+
+fn query_pairs(parts: List<String>) -> Option<List<Pair>> =
+  fold(parts, Some([]), |acc: Option<List<Pair>>, part: String|
+    match acc {
+      None -> None,
+      Some(pairs) -> match query_pair(part) { None -> None, Some(pair) -> Some(push(pairs, pair)) },
+    })
+
+fn query_pair(part: String) -> Option<Pair> =
+  if string_contains(part, "=") {
+    let at = string_find(part, "=");
+    match form_decode(string_slice(part, 0, at)) {
+      None -> None,
+      Some(name) -> match form_decode(string_slice(part, at + 1, string_len(part))) {
+        None -> None,
+        Some(value) -> Some({ name: name, value: value }),
+      },
+    }
+  } else { match form_decode(part) { None -> None, Some(name) -> Some({ name: name, value: "" }) } }
+
+fn percent_encode(data: Bytes, form: Bool) -> String =
+  fold(range(0, bytes_len(data)), "", |acc: String, i: Int| {
+    let c = bytes_at(data, i);
+    if unreserved(c) { acc ++ string_of_bytes(byte_of_int(c)) }
+    else if form && c == 32 { acc ++ "+" }
+    else { acc ++ "%" ++ hex_digit(c / 16) ++ hex_digit(c % 16) }
+  })
+
+fn percent_decode(data: Bytes, form: Bool) -> Option<String> =
+  match percent_bytes(data, 0, b"", form) {
+    None -> None,
+    Some(out) -> if bytes_is_utf8(out) { Some(string_of_bytes(out)) } else { None },
+  }
+
+fn percent_bytes(data: Bytes, at: Int, acc: Bytes, form: Bool) -> Option<Bytes> =
+  if at >= bytes_len(data) { Some(acc) } else {
+    let c = bytes_at(data, at);
+    if c == 37 {
+      // `%`: the two hex digits must both be there and both be hex.
+      if at + 2 >= bytes_len(data) { None } else {
+        let high = hex_value(bytes_at(data, at + 1));
+        let low = hex_value(bytes_at(data, at + 2));
+        if high < 0 || low < 0 { None }
+        else { percent_bytes(data, at + 3, bytes_concat(acc, byte_of_int(high * 16 + low)), form) }
+      }
+    } else if form && c == 43 {
+      percent_bytes(data, at + 1, bytes_concat(acc, byte_of_int(32)), form)
+    } else { percent_bytes(data, at + 1, bytes_concat(acc, byte_of_int(c)), form) }
+  }
+
+// RFC 3986 §2.3: always safe, so never encoded.
+fn unreserved(c: Int) -> Bool =
+  (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 46
+    || c == 95
+    || c == 126
+
+fn hex_digit(n: Int) -> String = string_slice("0123456789ABCDEF", n, n + 1)
+
+// The value of one hex digit, or -1. Written as arithmetic rather than a lookup so a non-hex byte
+// is a value and not a raise.
+fn hex_value(c: Int) -> Int =
+  if c >= 48 && c <= 57 { c - 48 }
+  else if c >= 97 && c <= 102 { c - 87 }
+  else if c >= 65 && c <= 70 { c - 55 }
+  else { 0 - 1 }
+
+// --- Tests ------------------------------------------------------------------
+
+test "percent-encoding leaves the unreserved set and upper-cases the rest" {
+  assert_eq(url_encode("a-b_c.d~e"), "a-b_c.d~e");
+  assert_eq(url_encode("a b"), "a%20b");
+  assert_eq(url_encode("/?"), "%2F%3F");
+  assert_eq(url_encode("é"), "%C3%A9");
+  assert_eq(url_decode("%C3%A9"), Some("é"));
+  assert_eq(url_decode("a%2fb"), Some("a/b"))
+}
+
+test "form encoding spells a space `+` and nothing else differently" {
+  assert_eq(form_encode("a b+c"), "a+b%2Bc");
+  assert_eq(form_decode("a+b%2Bc"), Some("a b+c"));
+  assert_eq(form_encode("a b"), "a+b");
+  assert_eq(url_encode("a b"), "a%20b")
+}
+
+test "a decoder refuses a percent sign that is not two hex digits, and non-UTF-8" {
+  assert_eq(url_decode("%2"), None);
+  assert_eq(url_decode("%zz"), None);
+  assert_eq(url_decode("%"), None);
+  assert_eq(url_decode("%FF"), None);
+}
+
+test "a query string parses to pairs and builds back to itself" {
+  assert_eq(
+    query_parse("a=1&b=two%20words&c=&d"),
+    Some([
+      { name: "a", value: "1" },
+      { name: "b", value: "two words" },
+      { name: "c", value: "" },
+      { name: "d", value: "" },
+    ]),
+  );
+  assert_eq(query_parse(""), Some([]));
+  assert_eq(query_parse("a=1&&b=2"), Some([{ name: "a", value: "1" }, { name: "b", value: "2" }]));
+  assert_eq(
+    query_build([{ name: "a", value: "1" }, { name: "b", value: "two words" }]),
+    "a=1&b=two+words",
+  );
+  assert_eq(query_parse("a=%zz"), None)
+}
