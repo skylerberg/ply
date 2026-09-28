@@ -107,6 +107,9 @@ pub struct EmitterRoot {
     /// Whether the root's scheme mentions a fixed-width type, which the compiled seam cannot
     /// carry.
     pub width: bool,
+    /// The root's definition span, which a failure is reported against. `None` from an answer a
+    /// bundle whose front end predates the field wrote.
+    pub span: Option<Span>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -397,6 +400,9 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         p.field("arity", &root.arity.to_string());
         p.field("scalar", flag(root.scalar));
         p.field("width", flag(root.width));
+        if let Some(span) = root.span {
+            p.field("span", &w.span(span, "a root's span")?);
+        }
         p.frame(&mut out, "emitroot", root.root.as_str());
     }
     for (name, arity) in &front.emitter_ctors {
@@ -839,12 +845,13 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
             }
             "emitroot" => {
                 let f = Fields::of(payload, &what)?;
-                let (mut arity, mut scalar, mut width) = (None, None, None);
+                let (mut arity, mut scalar, mut width, mut span) = (None, None, None, None);
                 for (key, text) in f.all() {
                     match key {
                         "arity" => f.once(&mut arity, key, text)?,
                         "scalar" => f.once(&mut scalar, key, text)?,
                         "width" => f.once(&mut width, key, text)?,
+                        "span" => f.once(&mut span, key, text)?,
                         other => return Err(unknown_field(&what, other)),
                     }
                 }
@@ -855,6 +862,10 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                     width: match width {
                         Some(text) => f.flag(text, "width")?,
                         None => false,
+                    },
+                    span: match span {
+                        Some(text) => Some(r.span(text, "a root's span")?),
+                        None => None,
                     },
                 });
             }
