@@ -1,0 +1,196 @@
+// `parse` — combinators: a parser is a value, and a bigger one is built from smaller ones.
+//
+// The shape `std.json`, `std.db` and `std.http` already write by hand: a position into a string, a
+// refusal that is `None` rather than a diagnostic, and every loop bounded by the input rather than
+// by a budget. `many` stops when its parser consumes nothing, so a parser that can succeed on an
+// empty input cannot loop here; nothing else needs a fuel argument.
+//
+// There is no backtracking across a committed choice and no `try`: `or_else` runs its second parser
+// from the same position as the first, and a caller that wants to keep what the first consumed
+// builds that from the step it answers. That is the whole of a parser's state, which is what makes
+// it a value a test can call at any position.
+
+pub type Input = String
+
+/// A position in an `Input`, in characters.
+pub type At = Int
+
+/// What one parse answered: the value and where the input stood after it.
+pub type Step<a> = { value: a, at: At }
+
+/// A parser: the input, a position, and `None` if it does not match there.
+pub type Parser<a> = (Input, At) -> Option<Step<a>>
+
+/// The value an input parses to, or `None` if the parser does not consume all of it. A partial parse
+/// is not an answer, so a trailing rest is a refusal; `at` is the one that reads a prefix.
+pub fn run<a>(p: Parser<a>, input: Input) -> Option<a> =
+  match p(input, 0) {
+    None -> None,
+    Some(step) -> if step.at == string_len(input) { Some(step.value) } else { None },
+  }
+
+/// The first `Step` a parser answers, leaving the rest of the input unread.
+pub fn at<a>(p: Parser<a>, input: Input, position: At) -> Option<Step<a>> = p(input, position)
+
+/// One character for which `ok` answers true.
+pub fn satisfy(ok: (String) -> Bool) -> Parser<String> =
+  |input: Input, position: At|
+    if position < string_len(input) {
+      let c = string_slice(input, position, position + 1);
+      if ok(c) { Some({ value: c, at: position + 1 }) } else { None }
+    } else { None }
+
+/// The one character `c`.
+pub fn char(c: String) -> Parser<String> = text(c)
+
+/// The literal `t`, which is `""` matching at every position.
+pub fn text(t: String) -> Parser<String> =
+  |input: Input, position: At|
+    if position + string_len(t) > string_len(input) { None } else if string_slice(
+          input,
+          position,
+          position + string_len(t),
+        )
+        == t { Some({ value: t, at: position + string_len(t) }) }
+    else { None }
+
+/// `p`, with its value passed through `f`.
+pub fn map<a, b>(p: Parser<a>, f: (a) -> b) -> Parser<b> =
+  |input: Input, position: At|
+    match p(input, position) {
+      None -> None,
+      Some(step) -> Some({ value: f(step.value), at: step.at }),
+    }
+
+/// `p`, then whatever parser its value names, from where `p` stopped.
+pub fn and_then<a, b>(p: Parser<a>, f: (a) -> Parser<b>) -> Parser<b> =
+  |input: Input, position: At|
+    match p(input, position) { None -> None, Some(step) -> f(step.value)(input, step.at) }
+
+/// `p`, or `q` from the same position when `p` refuses.
+pub fn or_else<a>(p: Parser<a>, q: Parser<a>) -> Parser<a> =
+  |input: Input, position: At|
+    match p(input, position) { None -> q(input, position), Some(step) -> Some(step) }
+
+/// `p` any number of times, ending at the first position where it refuses — or where it answers
+/// without consuming anything, which is the bound that makes an empty-matching parser safe.
+pub fn many<a>(p: Parser<a>) -> Parser<List<a>> =
+  |input: Input, position: At| many_from(p, input, position, [])
+
+/// `p` at least once.
+pub fn many1<a>(p: Parser<a>) -> Parser<List<a>> =
+  and_then(p, |first: a| map(many(p), |rest: List<a>| cons(first, rest)))
+
+/// `p`, or nothing without consuming.
+pub fn opt<a>(p: Parser<a>) -> Parser<Option<a>> =
+  |input: Input, position: At|
+    match p(input, position) {
+      None -> Some({ value: None, at: position }),
+      Some(step) -> Some({ value: Some(step.value), at: step.at }),
+    }
+
+/// `p`, then `sep` between each, so a trailing separator is a refusal rather than a shorter list.
+pub fn sep_by<a, b>(p: Parser<a>, sep: Parser<b>) -> Parser<List<a>> =
+  |input: Input, position: At|
+    match p(input, position) {
+      None -> Some({ value: [], at: position }),
+      Some(first) -> separated(p, sep, input, first.at, [first.value]),
+    }
+
+/// `s` itself, consuming nothing; then `p`.
+pub fn after<s, a>(s: Parser<s>, p: Parser<a>) -> Parser<a> = and_then(s, |_: s| p)
+
+/// `p` itself, consuming nothing; then `s`, whose value is the answer.
+pub fn before<a, s>(p: Parser<a>, s: Parser<s>) -> Parser<s> = and_then(p, |_: a| s)
+
+/// One decimal digit, as its text.
+pub fn digit() -> Parser<String> = satisfy(|c: String| string_contains("0123456789", c))
+
+/// One or more decimal digits, as their text.
+pub fn digits() -> Parser<String> = map(many1(digit()), |ds: List<String>| joined(ds))
+
+/// Zero or more spaces or tabs, as their text.
+pub fn spaces() -> Parser<String> =
+  map(many(satisfy(|c: String| c == " " || c == "\t")), |cs: List<String>| joined(cs))
+
+/// A non-empty run of characters that are not `stop`.
+pub fn word(stop: String) -> Parser<String> =
+  map(many1(satisfy(|c: String| !string_contains(stop, c))), |cs: List<String>| joined(cs))
+
+fn joined(xs: List<String>) -> String = fold(xs, "", |acc: String, x: String| acc ++ x)
+
+fn cons<a>(x: a, xs: List<a>) -> List<a> = fold(xs, [x], |acc: List<a>, y: a| push(acc, y))
+
+fn many_from<a>(p: Parser<a>, input: Input, position: At, acc: List<a>) -> Option<Step<List<a>>> =
+  match p(input, position) {
+    None -> Some({ value: acc, at: position }),
+    Some(step) -> if step.at <= position { Some({ value: acc, at: position }) }
+    else { many_from(p, input, step.at, push(acc, step.value)) },
+  }
+
+fn separated<a, b>(
+  p: Parser<a>,
+  sep: Parser<b>,
+  input: Input,
+  position: At,
+  acc: List<a>,
+) -> Option<Step<List<a>>> =
+  match sep(input, position) {
+    None -> Some({ value: acc, at: position }),
+    Some(sep_step) -> match p(input, sep_step.at) {
+      None -> None,
+      Some(step) -> separated(p, sep, input, step.at, push(acc, step.value)),
+    },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn int_text() -> Parser<Int> =
+  map(digits(), |ds: String|
+    fold(range(0, string_len(ds)), 0, |acc: Int, i: Int|
+      acc * 10 + string_find("0123456789", string_slice(ds, i, i + 1))))
+
+test "a literal consumes exactly what it matches, and `run` wants all of it" {
+  assert_eq(run(text("ab"), "ab"), Some("ab"));
+  assert_eq(run(text("ab"), "abc"), None);
+  assert_eq(run(char("a"), "a"), Some("a"));
+  assert_eq(run(char("a"), "b"), None);
+  assert_eq(run(text(""), ""), Some(""));
+  // `run` wants the whole input; `at` reads a prefix and answers where it stopped.
+  assert_eq(at(text("ab"), "abc", 0), Some({ value: "ab", at: 2 }));
+  assert_eq(at(text("ab"), "xab", 1), Some({ value: "ab", at: 3 }))
+}
+
+test "or_else tries the second from the same position" {
+  let p = or_else(text("ab"), text("ac"));
+  assert_eq(run(p, "ab"), Some("ab"));
+  assert_eq(run(p, "ac"), Some("ac"));
+  assert_eq(run(p, "ad"), None);
+  // A prefix is a step, so `or_else` answered it and the fully-consuming `run` is what refused.
+  assert_eq(at(p, "ac", 2), None);
+  assert_eq(at(p, "ab", 0), Some({ value: "ab", at: 2 }))
+}
+
+test "many stops at a refusal and at a parser that consumes nothing" {
+  assert_eq(run(many(digit()), "123"), Some(["1", "2", "3"]));
+  assert_eq(run(many(digit()), ""), Some([]));
+  // An empty match would be an infinite loop without the no-progress bound: it stops at the
+  // position it began at, having consumed nothing.
+  assert_eq(at(many(text("")), "abc", 0), Some({ value: [], at: 0 }));
+  assert_eq(run(many(text("")), ""), Some([]));
+  assert_eq(run(many1(digit()), ""), None);
+  assert_eq(run(map(digits(), |ds: String| string_len(ds)), "12345"), Some(5))
+}
+
+test "sep_by refuses a trailing separator, and a sequence reads both sides" {
+  let row = sep_by(word(","), char(","));
+  assert_eq(run(row, "a,b,c"), Some(["a", "b", "c"]));
+  assert_eq(run(row, "a,b,"), None);
+  assert_eq(run(row, ""), Some([]));
+  assert_eq(at(opt(char("+")), "x", 0), Some({ value: None, at: 0 }));
+  assert_eq(run(opt(char("+")), ""), Some(None));
+  assert_eq(run(opt(char("+")), "+"), Some(Some("+")));
+  let sum = and_then(int_text(), |a: Int| map(after(char(":"), int_text()), |b: Int| a + b));
+  assert_eq(run(sum, "12:30"), Some(42));
+  assert_eq(run(before(spaces(), text("end")), "   end"), Some("end"))
+}

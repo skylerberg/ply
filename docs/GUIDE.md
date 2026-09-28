@@ -1803,6 +1803,39 @@ past 64, a `float32` or an extension type, or a `uint64` above `i63` — checkin
 every length against what is left before walking it, so a hostile header cannot
 make it loop.
 
+### 13.23 `std.parse`
+
+```ply
+pub type Step<a> = { value: a, at: Int }
+pub type Parser<a> = (String, Int) -> Option<Step<a>>
+pub fn run<a>(p: Parser<a>, input: String) -> Option<a>
+pub fn at<a>(p: Parser<a>, input: String, position: Int) -> Option<Step<a>>
+pub fn satisfy(ok: (String) -> Bool) -> Parser<String>
+pub fn char(c: String) -> Parser<String>
+pub fn text(t: String) -> Parser<String>
+pub fn map<a, b>(p: Parser<a>, f: (a) -> b) -> Parser<b>
+pub fn and_then<a, b>(p: Parser<a>, f: (a) -> Parser<b>) -> Parser<b>
+pub fn or_else<a>(p: Parser<a>, q: Parser<a>) -> Parser<a>
+pub fn many<a>(p: Parser<a>) -> Parser<List<a>>
+pub fn many1<a>(p: Parser<a>) -> Parser<List<a>>
+pub fn opt<a>(p: Parser<a>) -> Parser<Option<a>>
+pub fn sep_by<a, b>(p: Parser<a>, sep: Parser<b>) -> Parser<List<a>>
+pub fn after<s, a>(s: Parser<s>, p: Parser<a>) -> Parser<a>
+pub fn before<a, s>(p: Parser<a>, s: Parser<s>) -> Parser<s>
+pub fn digit() -> Parser<String>
+pub fn digits() -> Parser<String>
+pub fn spaces() -> Parser<String>
+pub fn word(stop: String) -> Parser<String>
+```
+
+A parser is a value: the input, a position, and a `Step` or `None`. `run` wants
+the whole input consumed and `at` reads a prefix. `or_else` runs its second
+parser from the same position as the first, so there is no half-consumed state
+to unwind; `many` stops when its parser consumes nothing, so a parser that can
+match the empty string still cannot loop, and nothing needs a fuel argument.
+This is the shape `std.json`, `std.db` and `std.http` already write by hand, as
+a module a user's parser can share.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
