@@ -1,5 +1,6 @@
 //! What one served request allocates, counted rather than timed.
 
+use anyhow::Context;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -43,6 +44,16 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // The stage is pointed at a directory of this run's own, so the measurement does not depend on
+    // whether some earlier run left a compiled stage behind: whether bodies enter compiled code at
+    // all is a function of the stage cache, and the slope between two windows then describes the
+    // cache as much as the request path. A shipped figure is a cap, so it is taken in the state
+    // that allocates the most, the same way every time.
+    let stage = tempfile::tempdir().context("a temp dir for the stage")?;
+    // SAFETY: this binary is single-threaded until the machine runs, and nothing reads the
+    // environment between here and the stage's first use. `PLY_C_STAGE` is read at each compil.
+    unsafe { std::env::set_var("PLY_C_STAGE", stage.path()) };
 
     let loaded = ply_corpus::w6_run::program(&repo)?;
     let request = ply_corpus::w6_run::head();
