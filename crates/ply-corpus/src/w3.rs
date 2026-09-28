@@ -7,17 +7,14 @@ use ply_span::{Span, Symbol};
 use ply_store::body::{BodySet, of_front};
 use ply_ty::ty::Footprint;
 use ply_ty::{CheckOutput, DefHash, HashOutput, ModuleName};
-use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::serve::{Server, reserve_port};
+use crate::serve::{LoadClient, Report, Server, reserve_port};
 
 /// Where `examples/desk.ply` stops being the service and starts being its tests.
 const TESTS_MARKER: &str = "// --- Tests: the business, which needs no handler at all";
@@ -57,8 +54,6 @@ fn header_span(source: &str, name: &str) -> Result<std::ops::Range<usize>> {
         .with_context(|| format!("`{name}` in `examples/desk.ply` has no body"))?;
     Ok(start..end + 1)
 }
-
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 const MAX_CONNECTIONS: u32 = 1000;
 
@@ -334,14 +329,6 @@ fn diagnostics(what: &str, diagnostics: &[ply_span::Diagnostic]) -> anyhow::Erro
     anyhow::anyhow!("{what} failed:\n  {}", shown.join("\n  "))
 }
 
-/// One request the harness sends, by the name a table prints for it.
-#[derive(Clone, Debug)]
-pub struct Call {
-    pub name: &'static str,
-    pub bytes: Arc<[u8]>,
-    pub last: Arc<[u8]>,
-}
-
 /// A request head, with an optional body and optional padding.
 pub fn request(
     method: &str,
@@ -381,14 +368,6 @@ pub fn get(target: &str) -> Vec<u8> {
     request("GET", target, None, false, 0, 0)
 }
 
-fn call(name: &'static str, target: &str) -> Call {
-    Call {
-        name,
-        bytes: get(target).into(),
-        last: request("GET", target, None, true, 0, 0).into(),
-    }
-}
-
 /// A placement whose `customer` string is `pad` bytes long.
 pub fn placement(pad: usize) -> Vec<u8> {
     let customer = "a".repeat(pad.max(3));
@@ -396,9 +375,10 @@ pub fn placement(pad: usize) -> Vec<u8> {
         .into_bytes()
 }
 
-/// The read-only routes a mixed load cycles through.
-pub fn read_mix() -> Vec<Call> {
-    let paths: [(&'static str, &'static str); 8] = [
+/// The read-only routes a mixed load cycles through: a name for the report and the path a run
+/// sends. The client builds its own request bytes, so this is everything a mix has to say.
+pub fn read_mix() -> Vec<(&'static str, &'static str)> {
+    vec![
         ("health", "/health"),
         ("items", "/items"),
         ("featured", "/items/featured"),
@@ -407,163 +387,10 @@ pub fn read_mix() -> Vec<Call> {
         ("order", "/orders/1"),
         ("docs", "/docs/orders/placing"),
         ("receipt", "/orders/1/receipt"),
-    ];
-    paths.iter().map(|(name, path)| call(name, path)).collect()
+    ]
 }
 
-trait Stream: Read + Write + Send {}
-impl<T: Read + Write + Send> Stream for T {}
-
-/// One connection, and the leftover bytes of the last response read off it.
-struct Conn {
-    io: Box<dyn Stream>,
-    buf: Vec<u8>,
-    at: usize,
-}
-
-impl Conn {
-    fn plain(addr: SocketAddr) -> Result<(Conn, Duration)> {
-        let started = Instant::now();
-        let socket = TcpStream::connect_timeout(&addr, CLIENT_TIMEOUT)?;
-        let connected = started.elapsed();
-        socket.set_read_timeout(Some(CLIENT_TIMEOUT))?;
-        socket.set_write_timeout(Some(CLIENT_TIMEOUT))?;
-        socket.set_nodelay(true)?;
-        Ok((
-            Conn {
-                io: Box::new(socket),
-                buf: Vec::with_capacity(8192),
-                at: 0,
-            },
-            connected,
-        ))
-    }
-
-    /// A TLS connection with the handshake completed here, so [`tls`] can time it separately.
-    fn tls(addr: SocketAddr, config: Arc<ClientConfig>) -> Result<(Conn, Duration, Duration)> {
-        let started = Instant::now();
-        let socket = TcpStream::connect_timeout(&addr, CLIENT_TIMEOUT)?;
-        let connected = started.elapsed();
-        socket.set_read_timeout(Some(CLIENT_TIMEOUT))?;
-        socket.set_write_timeout(Some(CLIENT_TIMEOUT))?;
-        socket.set_nodelay(true)?;
-        let name = ServerName::try_from("localhost").context("`localhost` as a server name")?;
-        let connection = ClientConnection::new(config, name).context("a rustls client")?;
-        let mut stream = StreamOwned::new(connection, socket);
-        let shook = Instant::now();
-        while stream.conn.is_handshaking() {
-            let (read, written) = stream.conn.complete_io(&mut stream.sock)?;
-            if read == 0 && written == 0 {
-                bail!("the TLS handshake stalled");
-            }
-        }
-        let handshake = shook.elapsed();
-        Ok((
-            Conn {
-                io: Box::new(stream),
-                buf: Vec::with_capacity(8192),
-                at: 0,
-            },
-            connected,
-            handshake,
-        ))
-    }
-
-    fn send(&mut self, request: &[u8]) -> Result<()> {
-        self.io.write_all(request)?;
-        self.io.flush()?;
-        Ok(())
-    }
-
-    fn fill(&mut self) -> Result<usize> {
-        let mut chunk = [0u8; 8192];
-        let read = self.io.read(&mut chunk)?;
-        self.buf.extend_from_slice(&chunk[..read]);
-        Ok(read)
-    }
-
-    /// Read one whole response, framed the way the server framed it.
-    fn response(&mut self) -> Result<u16> {
-        let head_end = loop {
-            if let Some(at) = find(&self.buf[self.at..], b"\r\n\r\n") {
-                break self.at + at + 4;
-            }
-            if self.fill()? == 0 {
-                bail!("the connection closed before a response head arrived");
-            }
-        };
-        let head = String::from_utf8_lossy(&self.buf[self.at..head_end]).to_string();
-        let status: u16 = head
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .with_context(|| format!("no status in `{}`", head.lines().next().unwrap_or("")))?;
-        let mut length: Option<usize> = None;
-        let mut chunked = false;
-        for line in head.lines().skip(1) {
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
-            };
-            match name.trim().to_ascii_lowercase().as_str() {
-                "content-length" => length = value.trim().parse().ok(),
-                "transfer-encoding" if value.trim().eq_ignore_ascii_case("chunked") => {
-                    chunked = true;
-                }
-                _ => {}
-            }
-        }
-        self.at = head_end;
-        if chunked {
-            self.chunked_body()?;
-        } else {
-            let want = length.unwrap_or(0);
-            while self.buf.len() - self.at < want {
-                if self.fill()? == 0 {
-                    bail!("the connection closed inside a {want}-byte body");
-                }
-            }
-            self.at += want;
-        }
-        // Rewound rather than grown, since one connection may serve many requests.
-        if self.at == self.buf.len() {
-            self.buf.clear();
-            self.at = 0;
-        }
-        Ok(status)
-    }
-
-    fn chunked_body(&mut self) -> Result<()> {
-        loop {
-            let line_end = loop {
-                if let Some(at) = find(&self.buf[self.at..], b"\r\n") {
-                    break self.at + at;
-                }
-                if self.fill()? == 0 {
-                    bail!("the connection closed inside a chunk size");
-                }
-            };
-            let text = String::from_utf8_lossy(&self.buf[self.at..line_end]).to_string();
-            let size = usize::from_str_radix(text.split(';').next().unwrap_or("").trim(), 16)
-                .with_context(|| format!("a chunk size that is not hex: `{text}`"))?;
-            let need = line_end + 2 + size + 2;
-            while self.buf.len() < need {
-                if self.fill()? == 0 {
-                    bail!("the connection closed inside a {size}-byte chunk");
-                }
-            }
-            self.at = need;
-            if size == 0 {
-                return Ok(());
-            }
-        }
-    }
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-/// What one client thread observed.
+/// What one connection's exchanges came back as, which is what a percentile is taken of.
 #[derive(Clone, Debug, Default)]
 pub struct Sample {
     latencies: Vec<Duration>,
@@ -574,15 +401,25 @@ pub struct Sample {
 }
 
 impl Sample {
-    fn merge(mut self, other: Sample) -> Sample {
-        self.latencies.extend(other.latencies);
-        self.connects.extend(other.connects);
-        self.handshakes.extend(other.handshakes);
-        for (status, n) in other.statuses {
-            *self.statuses.entry(status).or_default() += n;
+    /// The client program's report as the samples a percentile is taken of. The program merges its
+    /// own connections; this is the crossing, and the one place a reading changes type.
+    fn of(report: &Report) -> Sample {
+        let micros = |of: &[i64]| -> Vec<Duration> {
+            of.iter()
+                .map(|us| Duration::from_micros(*us as u64))
+                .collect()
+        };
+        Sample {
+            latencies: micros(&report.latencies),
+            connects: micros(&report.connects),
+            handshakes: micros(&report.handshakes),
+            statuses: report
+                .statuses
+                .iter()
+                .map(|s| (s.status, s.count))
+                .collect(),
+            failures: report.failures.clone(),
         }
-        self.failures.extend(other.failures);
-        self
     }
 
     /// A partial answer is a different measurement, not a slower server.
@@ -621,91 +458,6 @@ impl Sample {
     }
 }
 
-#[derive(Clone)]
-struct Plan {
-    addr: SocketAddr,
-    calls: Vec<Call>,
-    /// Requests one connection carries before it is closed and another opened.
-    per_conn: u32,
-    /// Connections one thread opens.
-    conns_per_thread: u32,
-    tls: Option<Arc<ClientConfig>>,
-}
-
-impl Plan {
-    fn requests(&self, threads: u32) -> u32 {
-        threads * self.conns_per_thread * self.per_conn
-    }
-
-    fn connections(&self, threads: u32) -> u32 {
-        threads * self.conns_per_thread
-    }
-}
-
-fn drive(plan: &Plan, thread: u32) -> Sample {
-    let mut sample = Sample::default();
-    // Threads start at different points in the mix so they do not send identical requests.
-    let mut next = thread as usize;
-    for _ in 0..plan.conns_per_thread {
-        let opened = match &plan.tls {
-            None => Conn::plain(plan.addr).map(|(c, t)| (c, t, Duration::ZERO)),
-            Some(config) => Conn::tls(plan.addr, Arc::clone(config)),
-        };
-        let (mut conn, connected, handshake) = match opened {
-            Ok(triple) => triple,
-            Err(e) => {
-                sample.failures.push(format!("connecting: {e}"));
-                return sample;
-            }
-        };
-        sample.connects.push(connected);
-        if plan.tls.is_some() {
-            sample.handshakes.push(handshake);
-        }
-        for i in 0..plan.per_conn {
-            let call = &plan.calls[next % plan.calls.len()];
-            next += 1;
-            let body = if i + 1 == plan.per_conn {
-                &call.last
-            } else {
-                &call.bytes
-            };
-            let started = Instant::now();
-            let answered = conn.send(body).and_then(|()| conn.response());
-            match answered {
-                Ok(status) => {
-                    sample.latencies.push(started.elapsed());
-                    *sample.statuses.entry(status).or_default() += 1;
-                }
-                Err(e) => {
-                    sample.failures.push(format!("{}: {e}", call.name));
-                    return sample;
-                }
-            }
-        }
-    }
-    sample
-}
-
-fn run_plan(plan: &Plan, threads: u32) -> Result<(Sample, Duration)> {
-    let started = Instant::now();
-    let handles: Vec<_> = (0..threads)
-        .map(|i| {
-            let plan = plan.clone();
-            std::thread::spawn(move || drive(&plan, i))
-        })
-        .collect();
-    let mut sample = Sample::default();
-    for handle in handles {
-        sample = sample.merge(
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("a client thread panicked"))?,
-        );
-    }
-    Ok((sample, started.elapsed()))
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct LoadPoint {
     pub variant: &'static str,
@@ -727,46 +479,106 @@ pub struct LoadPoint {
     pub handshake_p99_micros: f64,
 }
 
-/// A server, started once and driven through several points.
+/// One point's row, from the samples the client reported and the wall clock it measured.
+#[allow(clippy::too_many_arguments)]
+fn point_of(
+    variant: &'static str,
+    transport: &'static str,
+    label: String,
+    concurrency: u32,
+    per_conn: u32,
+    connections: u32,
+    requests: u32,
+    wall_micros: i64,
+    sample: &Sample,
+) -> LoadPoint {
+    let seconds = wall_micros as f64 / 1e6;
+    LoadPoint {
+        variant,
+        transport,
+        label,
+        concurrency,
+        per_conn,
+        connections,
+        requests,
+        seconds,
+        per_second: if seconds > 0.0 {
+            requests as f64 / seconds
+        } else {
+            0.0
+        },
+        p50_micros: micros(Sample::percentile(&sample.latencies, 0.50)),
+        p95_micros: micros(Sample::percentile(&sample.latencies, 0.95)),
+        p99_micros: micros(Sample::percentile(&sample.latencies, 0.99)),
+        max_micros: micros(Sample::percentile(&sample.latencies, 1.0)),
+        connect_p50_micros: micros(Sample::percentile(&sample.connects, 0.50)),
+        handshake_p50_micros: micros(Sample::percentile(&sample.handshakes, 0.50)),
+        handshake_p99_micros: micros(Sample::percentile(&sample.handshakes, 0.99)),
+    }
+}
+
+/// The `--set` arguments a served desk needs: the port it listens on, the whole number of
+/// connections it will accept, and the key its routes read (which `desk.config` declares
+/// `required`, so a run without one refuses every request).
+fn settings(port: u16, connections: u32) -> Vec<String> {
+    vec![
+        "--set".to_string(),
+        format!("DESK_PORT={port}"),
+        "--set".to_string(),
+        format!("DESK_CONNECTIONS={connections}"),
+        "--set".to_string(),
+        "DESK_API_KEY=bench-key".to_string(),
+    ]
+}
+
+/// A server, started once and driven through several points by the load client.
 struct Bench {
     _dir: tempfile::TempDir,
     server: Server,
+    /// The client: one program, and one root its report is written under.
+    client: LoadClient,
     port: u16,
     variant: Variant,
     transport: Transport,
-    tls: Option<Arc<ClientConfig>>,
+    /// The certificate a TLS run trusts, which is the one this run issued its own server.
+    trust: Option<PathBuf>,
 }
 
 impl Bench {
+    /// `connections` is the server's whole accept budget: every point opens fresh connections, and a
+    /// desk stops serving once it has accepted that many.
     fn start(
         service: &Service,
         ply: &Path,
         variant: Variant,
         transport: Transport,
+        connections: u32,
     ) -> Result<Bench> {
         let dir = tempfile::tempdir().context("a temp dir for the served project")?;
         let port = reserve_port()?;
         service.project(dir.path(), variant, transport)?;
-        let (server, tls) = match transport {
-            Transport::Http => (Server::start(ply, dir.path(), &[])?, None),
-            Transport::Https => {
-                let material = credential(dir.path())?;
-                let arg = format!(
-                    "{CREDENTIAL}={},{}",
-                    material.certificate.display(),
-                    material.key.display()
-                );
-                let server = Server::start(ply, dir.path(), &["--tls", &arg])?;
-                (server, Some(Arc::new(client_config(&material.der)?)))
-            }
-        };
+        let mut args = vec!["--trace".to_string(), "off".to_string()];
+        args.extend(settings(port, connections));
+        if transport == Transport::Https {
+            let material = credential(dir.path())?;
+            args.push("--tls".to_string());
+            args.push(format!(
+                "{CREDENTIAL}={},{}",
+                material.certificate.display(),
+                material.key.display()
+            ));
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let server = Server::start(ply, dir.path(), &borrowed)?;
+        let trust = (transport == Transport::Https).then(|| dir.path().join("desk.pem"));
         let mut bench = Bench {
             _dir: dir,
             server,
+            client: LoadClient::new(ply)?,
             port,
             variant,
             transport,
-            tls,
+            trust,
         };
         bench.probe()?;
         Ok(bench)
@@ -776,15 +588,9 @@ impl Bench {
         SocketAddr::from(([127, 0, 0, 1], self.port))
     }
 
-    /// One real request, so the first timed point does not race the server's typecheck.
+    /// One real request, so the first timed point does not race the server's typecheck. It is the
+    /// same program a point runs, pointed at one connection's worth of work.
     fn probe(&mut self) -> Result<()> {
-        let plan = Plan {
-            addr: self.addr(),
-            calls: vec![call("health", "/health")],
-            per_conn: 1,
-            conns_per_thread: 1,
-            tls: self.tls.clone(),
-        };
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             if let Some(status) = self.server.exited()? {
@@ -793,67 +599,68 @@ impl Bench {
                     self.server.output()
                 );
             }
-            let sample = drive(&plan, 0);
-            if sample.require(1).is_ok() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "nothing answering on {} after two minutes: {}",
+            let ready = self
+                .client
+                .measure(self.addr(), "/health", 1, 1, self.trust.as_deref());
+            match ready {
+                Ok(report) if report.answered == 1 && report.failures.is_empty() => return Ok(()),
+                Ok(report) if Instant::now() >= deadline => bail!(
+                    "nothing answering on {} after two minutes: {:?}",
                     self.addr(),
-                    sample
-                        .failures
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or("no failure recorded")
-                );
+                    report.failures
+                ),
+                Err(why) if Instant::now() >= deadline => bail!(
+                    "nothing answering on {} after two minutes: {why:#}",
+                    self.addr()
+                ),
+                _ => std::thread::sleep(Duration::from_millis(20)),
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
+    /// One measured point: the client's run, then the row its samples make.
     fn point(
         &mut self,
         label: impl Into<String>,
-        calls: &[Call],
+        paths: &[&str],
         concurrency: u32,
         per_conn: u32,
         conns_per_thread: u32,
     ) -> Result<LoadPoint> {
-        let plan = Plan {
-            addr: self.addr(),
-            calls: calls.to_vec(),
+        let connections = concurrency * conns_per_thread;
+        let requests = connections * per_conn;
+        let routes = paths.join(",");
+        let measured = self.client.measure(
+            self.addr(),
+            &routes,
+            connections,
             per_conn,
-            conns_per_thread,
-            tls: self.tls.clone(),
-        };
-        let requests = plan.requests(concurrency);
-        let (sample, taken) = run_plan(&plan, concurrency)?;
+            self.trust.as_deref(),
+        );
+        let report = measured.with_context(|| {
+            format!(
+                "at concurrency {concurrency}, {per_conn} requests per connection\n{}",
+                self.server.output_if_exited()
+            )
+        })?;
+        let sample = Sample::of(&report);
         sample.require(requests).with_context(|| {
             format!(
                 "at concurrency {concurrency}, {per_conn} requests per connection\n{}",
                 self.server.output_if_exited()
             )
         })?;
-        let seconds = taken.as_secs_f64();
-        Ok(LoadPoint {
-            variant: self.variant.label(),
-            transport: self.transport.label(),
-            label: label.into(),
+        Ok(point_of(
+            self.variant.label(),
+            self.transport.label(),
+            label.into(),
             concurrency,
             per_conn,
-            connections: plan.connections(concurrency),
+            connections,
             requests,
-            seconds,
-            per_second: requests as f64 / seconds,
-            p50_micros: micros(Sample::percentile(&sample.latencies, 0.50)),
-            p95_micros: micros(Sample::percentile(&sample.latencies, 0.95)),
-            p99_micros: micros(Sample::percentile(&sample.latencies, 0.99)),
-            max_micros: micros(Sample::percentile(&sample.latencies, 1.0)),
-            connect_p50_micros: micros(Sample::percentile(&sample.connects, 0.50)),
-            handshake_p50_micros: micros(Sample::percentile(&sample.handshakes, 0.50)),
-            handshake_p99_micros: micros(Sample::percentile(&sample.handshakes, 0.99)),
-        })
+            report.wall_micros,
+            &sample,
+        ))
     }
 
     fn finish(self) -> Result<()> {
@@ -867,18 +674,14 @@ pub fn wait_until_serving(server: &mut Server, addr: SocketAddr) -> Result<()> {
 }
 
 /// The same over whichever transport the server was started with.
+/// The same over whichever transport the server was started with; `trust` is a certificate a TLS
+/// client accepts beside the built-in roots, which is what makes it speak TLS at all.
 pub fn wait_until_serving_over(
     server: &mut Server,
     addr: SocketAddr,
-    tls: Option<Arc<ClientConfig>>,
+    trust: Option<&Path>,
 ) -> Result<()> {
-    let plan = Plan {
-        addr,
-        calls: vec![call("health", "/health")],
-        per_conn: 1,
-        conns_per_thread: 1,
-        tls,
-    };
+    let client = LoadClient::new(server.ply())?;
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         if let Some(status) = server.exited()? {
@@ -887,7 +690,10 @@ pub fn wait_until_serving_over(
                 server.output()
             );
         }
-        if drive(&plan, 0).require(1).is_ok() {
+        if let Ok(report) = client.measure(addr, "/health", 1, 1, trust)
+            && report.answered == 1
+            && report.failures.is_empty()
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -927,7 +733,7 @@ pub fn load_point(
 pub fn load_point_over(
     server: &mut Server,
     addr: SocketAddr,
-    tls: Option<Arc<ClientConfig>>,
+    trust: Option<&Path>,
     variant: &'static str,
     label: &'static str,
     path: &str,
@@ -935,54 +741,51 @@ pub fn load_point_over(
     per_conn: u32,
     conns_per_thread: u32,
 ) -> Result<LoadPoint> {
-    let transport = if tls.is_some() {
+    let transport = if trust.is_some() {
         Transport::Https
     } else {
         Transport::Http
     };
-    let plan = Plan {
-        addr,
-        calls: vec![call(label, path)],
-        per_conn,
-        conns_per_thread,
-        tls,
-    };
-    let requests = plan.requests(concurrency);
-    let (sample, taken) = run_plan(&plan, concurrency)?;
+    let connections = concurrency * conns_per_thread;
+    let requests = connections * per_conn;
+    let client = LoadClient::new(server.ply())?;
+    let measured = client.measure(addr, path, connections, per_conn, trust);
+    let report = measured.with_context(|| {
+        format!(
+            "{label} at concurrency {concurrency}\n{}",
+            server.output_if_exited()
+        )
+    })?;
+    let sample = Sample::of(&report);
     sample.require(requests).with_context(|| {
         format!(
             "{label} at concurrency {concurrency}\n{}",
             server.output_if_exited()
         )
     })?;
-    let seconds = taken.as_secs_f64();
-    Ok(LoadPoint {
+    Ok(point_of(
         variant,
-        transport: transport.label(),
-        label: label.to_string(),
+        transport.label(),
+        label.to_string(),
         concurrency,
         per_conn,
-        connections: plan.connections(concurrency),
+        connections,
         requests,
-        seconds,
-        per_second: requests as f64 / seconds,
-        p50_micros: micros(Sample::percentile(&sample.latencies, 0.50)),
-        p95_micros: micros(Sample::percentile(&sample.latencies, 0.95)),
-        p99_micros: micros(Sample::percentile(&sample.latencies, 0.99)),
-        max_micros: micros(Sample::percentile(&sample.latencies, 1.0)),
-        connect_p50_micros: micros(Sample::percentile(&sample.connects, 0.50)),
-        handshake_p50_micros: micros(Sample::percentile(&sample.handshakes, 0.50)),
-        handshake_p99_micros: micros(Sample::percentile(&sample.handshakes, 0.99)),
-    })
+        report.wall_micros,
+        &sample,
+    ))
 }
 
 pub struct Material {
     pub certificate: PathBuf,
     pub key: PathBuf,
-    pub der: CertificateDer<'static>,
 }
 
-/// Generated per run rather than checked in, by the same facility a program would use.
+/// Generated per run rather than checked in, by the same facility a program would use. The server is
+/// given the two files and a client is told to trust the certificate, which is what `--trust` is.
+///
+/// The DER `issued.der` also carries is dropped here: a `ply run --host` client verifies against the
+/// PEM file, so nothing outside the host reads a certificate as bytes.
 pub fn credential(dir: &Path) -> Result<Material> {
     let issued =
         ply_host::certgen::issue(&["localhost".to_string()]).map_err(|why| anyhow::anyhow!(why))?;
@@ -990,28 +793,8 @@ pub fn credential(dir: &Path) -> Result<Material> {
     let key = dir.join("desk.key");
     std::fs::write(&certificate, &issued.certificate)?;
     std::fs::write(&key, &issued.key)?;
-    Ok(Material {
-        certificate,
-        key,
-        der: CertificateDer::from(issued.der),
-    })
-}
-
-/// A client trusting exactly this run's certificate, so verification stays on.
-pub fn client_config(der: &CertificateDer<'static>) -> Result<ClientConfig> {
-    let mut roots = RootCertStore::empty();
-    roots.add(der.clone()).context("trusting the certificate")?;
-    let mut config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .context("the provider supports both versions")?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-    config.alpn_protocols = ply_host::tls::ALPN
-        .iter()
-        .map(|p| p.as_bytes().to_vec())
-        .collect();
-    Ok(config)
+    let _ = issued.der;
+    Ok(Material { certificate, key })
 }
 
 /// Throughput and tail latency for the mixed read load, at each concurrency.
@@ -1024,16 +807,19 @@ pub fn routes(
     requests_per_point: u32,
 ) -> Result<Vec<LoadPoint>> {
     let service = Service::open(repo)?;
-    let calls = read_mix();
+    let paths: Vec<&'static str> = read_mix().into_iter().map(|(_, path)| path).collect();
     // Every point gets about as many requests, so each p99 rests on comparable samples.
     let shares: Vec<(u32, u32)> = concurrencies
         .iter()
         .map(|&c| (c, share(c, per_conn, requests_per_point)))
         .collect();
-    let mut bench = Bench::start(&service, ply, variant, Transport::Http)?;
+    // Every point opens fresh connections, and a desk stops once it has served its budget: one
+    // spare is the probe that proves it answers.
+    let budget: u32 = shares.iter().map(|&(c, per)| c * per).sum::<u32>() + 1;
+    let mut bench = Bench::start(&service, ply, variant, Transport::Http, budget)?;
     let mut out = Vec::new();
     for (concurrency, conns_per_thread) in shares {
-        out.push(bench.point("read mix", &calls, concurrency, per_conn, conns_per_thread)?);
+        out.push(bench.point("read mix", &paths, concurrency, per_conn, conns_per_thread)?);
     }
     bench.finish()?;
     Ok(out)
@@ -1058,13 +844,7 @@ pub fn per_route(repo: &Path, requests: u32, repeats: usize) -> Result<Vec<Route
     let writes = requests.min(400);
     let mut cases: Vec<(String, Vec<u8>, u32)> = read_mix()
         .into_iter()
-        .map(|c| {
-            (
-                format!("GET {}", route_path(c.name)),
-                c.bytes.to_vec(),
-                requests,
-            )
-        })
+        .map(|(_, path)| (format!("GET {path}"), get(path), requests))
         .collect();
     cases.push(("GET /nope (404)".to_string(), get("/nope"), requests));
     cases.push((
@@ -1188,19 +968,6 @@ fn bench_method() -> http::Method = http::Get
 fn bench_version() -> http::Version = http::Http11
 "#;
 
-fn route_path(name: &str) -> &'static str {
-    match name {
-        "health" => "/health",
-        "items" => "/items",
-        "featured" => "/items/featured",
-        "item" => "/items/bolt",
-        "orders" => "/orders",
-        "order" => "/orders/1",
-        "docs" => "/docs/orders/placing",
-        _ => "/orders/1/receipt",
-    }
-}
-
 fn best_of(repeats: usize, mut run: impl FnMut() -> Result<(Duration, usize)>) -> Result<Duration> {
     let mut best: Option<Duration> = None;
     for _ in 0..repeats.max(1) {
@@ -1294,18 +1061,23 @@ pub fn keep_alive(
     requests_per_point: u32,
 ) -> Result<Vec<LoadPoint>> {
     let service = Service::open(repo)?;
-    let calls = read_mix();
+    let paths: Vec<&'static str> = read_mix().into_iter().map(|(_, path)| path).collect();
     let ladder: [u32; 5] = [1, 2, 8, 32, 100];
     let shares: Vec<(u32, u32)> = ladder
         .iter()
         .map(|&per| (per, share(concurrency, per, requests_per_point)))
         .collect();
-    let mut bench = Bench::start(&service, ply, variant, Transport::Http)?;
+    let budget: u32 = shares
+        .iter()
+        .map(|&(_, conns)| concurrency * conns)
+        .sum::<u32>()
+        + 1;
+    let mut bench = Bench::start(&service, ply, variant, Transport::Http, budget)?;
     let mut out = Vec::new();
     for (per_conn, conns_per_thread) in shares {
         out.push(bench.point(
             format!("{per_conn} req/conn"),
-            &calls,
+            &paths,
             concurrency,
             per_conn,
             conns_per_thread,
@@ -1324,7 +1096,7 @@ pub fn tls(
     requests_per_point: u32,
 ) -> Result<Vec<LoadPoint>> {
     let service = Service::open(repo)?;
-    let calls = vec![call("items", "/items")];
+    let paths: [&'static str; 1] = ["/items"];
     let ladder: [u32; 3] = [1, 8, 32];
     let concurrencies: Vec<u32> = if concurrency == 1 {
         vec![1]
@@ -1339,13 +1111,14 @@ pub fn tls(
                 .map(move |&per| (c, per, share(c, per, requests_per_point)))
         })
         .collect();
+    let budget: u32 = shares.iter().map(|&(c, _, conns)| c * conns).sum::<u32>() + 1;
     let mut out = Vec::new();
     for transport in [Transport::Http, Transport::Https] {
-        let mut bench = Bench::start(&service, ply, variant, transport)?;
+        let mut bench = Bench::start(&service, ply, variant, transport, budget)?;
         for &(concurrency, per_conn, conns_per_thread) in &shares {
             out.push(bench.point(
                 format!("{per_conn} req/conn"),
-                &calls,
+                &paths,
                 concurrency,
                 per_conn,
                 conns_per_thread,
