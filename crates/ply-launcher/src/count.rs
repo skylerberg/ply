@@ -6,7 +6,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// What one window allocated.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -19,6 +19,11 @@ static ON: AtomicBool = AtomicBool::new(false);
 /// Whether each allocation is also attributed to the `ply_*` frames that asked for it, which
 /// means a stack walk per allocation: off unless the run asked for sites.
 static ATTRIBUTE: AtomicBool = AtomicBool::new(false);
+/// The window's every-Nth sample: every allocation is counted, one in this many is walked, and the
+/// rows are scaled by it. One when the run asked for exact sites, zero when it asked for no sites.
+static SAMPLE: AtomicU32 = AtomicU32::new(0);
+/// Allocations seen since the window opened, which picks the sample.
+static SEEN: AtomicU64 = AtomicU64::new(0);
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Attributions in flight. A window waits for this to reach zero before it answers, so its rows
@@ -87,15 +92,37 @@ impl Counting {
         }
         ALLOCS.fetch_add(allocations, Ordering::Relaxed);
         BYTES.fetch_add(bytes, Ordering::Relaxed);
-        let site = site();
-        if let Ok(mut sites) = SITES.lock() {
-            let entry = sites.entry(site).or_default();
-            entry.allocations += allocations;
-            entry.bytes += bytes;
+        if sampled() {
+            let site = site();
+            if let Ok(mut sites) = SITES.lock() {
+                let entry = sites.entry(site).or_default();
+                entry.allocations += allocations;
+                entry.bytes += bytes;
+            }
         }
         INSIDE.with(|c| c.set(false));
         ATTRIBUTING.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Whether this allocation is one of the window's walked ones.
+#[inline]
+fn sampled() -> bool {
+    sampled_nth(
+        SEEN.fetch_add(1, Ordering::Relaxed),
+        SAMPLE.load(Ordering::Relaxed),
+    )
+}
+
+/// Whether the `n`th counted allocation of a window is one of the sampled ones: every `every`
+/// allocations on average, one when `every` is one or less.
+///
+/// By a hash of the count rather than by `n % every`, because a program that allocates exactly
+/// `every` times around a loop — or any other period it happens to have — would otherwise land on
+/// the sample every time and attribute the same site, which is the one thing a site census is
+/// trying to find out.
+pub fn sampled_nth(n: u64, every: u32) -> bool {
+    every <= 1 || (n.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58).is_multiple_of(u64::from(every))
 }
 
 /// The nearest few `ply_*` frames of the current stack, outermost last.
@@ -183,12 +210,26 @@ pub fn window<R>(
     f: impl FnOnce() -> R,
     attribute: bool,
 ) -> (R, Counted, BTreeMap<String, Counted>) {
+    window_sampled(f, u32::from(attribute))
+}
+
+/// Runs `f` with the window open, walking one allocation in `every` for its site. `every` is zero
+/// for no sites and one for every allocation; a larger value is what makes a site census over a
+/// long served window answerable, since the walk is most of its cost. The rows that come back are
+/// the *sampled* ones — [`write`] scales them by `every` and says so — so a caller reading them
+/// directly should scale by `every` too.
+pub fn window_sampled<R>(
+    f: impl FnOnce() -> R,
+    every: u32,
+) -> (R, Counted, BTreeMap<String, Counted>) {
     ALLOCS.store(0, Ordering::Relaxed);
     BYTES.store(0, Ordering::Relaxed);
+    SEEN.store(0, Ordering::Relaxed);
     if let Ok(mut sites) = SITES.lock() {
         sites.clear();
     }
-    ATTRIBUTE.store(attribute, Ordering::Relaxed);
+    SAMPLE.store(every, Ordering::Relaxed);
+    ATTRIBUTE.store(every >= 1, Ordering::Relaxed);
     ON.store(true, Ordering::Relaxed);
     let answer = f();
     ON.store(false, Ordering::Relaxed);
@@ -213,20 +254,48 @@ pub struct Asked {
     pub path: std::path::PathBuf,
     /// Whether each allocation is also attributed to the `ply_*` frames that asked for it.
     pub sites: bool,
+    /// Whether every allocation is walked rather than one in [`SAMPLED`], which is what
+    /// `--count-alloc-sites-exact` asks for.
+    pub exact: bool,
 }
 
-/// `--count-allocs=PATH` (totals) and `--count-alloc-sites=PATH` (totals and where), wherever they
-/// are written: the launcher's own flags. `None` when neither was given.
+impl Asked {
+    /// One allocation in this many is walked: zero when no sites were asked for, one for exact
+    /// sites, [`SAMPLED`] otherwise.
+    pub fn every(&self) -> u32 {
+        if !self.sites {
+            0
+        } else if self.exact {
+            1
+        } else {
+            SAMPLED
+        }
+    }
+}
+
+/// How many allocations one walked site stands for when the run did not ask for exact sites. The
+/// walk is the whole cost of a site census — about 19µs an allocation, measured — so sampling by
+/// this keeps a served window in the same order as a plain count while leaving the biggest sites
+/// clear: the row's allocations are its sampled ones times this.
+pub const SAMPLED: u32 = 64;
+
+/// `--count-allocs=PATH` (totals), `--count-alloc-sites=PATH` (totals and where, one allocation in
+/// [`SAMPLED`] walked) and `--count-alloc-sites-exact=PATH` (every allocation walked), wherever
+/// they are written: the launcher's own flags. `None` when none was given.
 pub fn flag(argv: &mut Vec<String>) -> Result<Option<Asked>, String> {
     let mut asked: Option<Asked> = None;
     let mut i = 0;
     while i < argv.len() {
         let mut consumed = false;
-        for (name, sites) in [("--count-allocs", false), ("--count-alloc-sites", true)] {
+        for (name, sites, exact) in [
+            ("--count-allocs", false, false),
+            ("--count-alloc-sites", true, false),
+            ("--count-alloc-sites-exact", true, true),
+        ] {
             let joined = format!("{name}=");
             if let Some(path) = argv[i].strip_prefix(&joined).map(str::to_string) {
                 argv.remove(i);
-                note(&mut asked, path, sites);
+                note(&mut asked, path, sites, exact);
                 consumed = true;
                 break;
             }
@@ -236,7 +305,7 @@ pub fn flag(argv: &mut Vec<String>) -> Result<Option<Asked>, String> {
                 }
                 let path = argv[i + 1].clone();
                 argv.drain(i..i + 2);
-                note(&mut asked, path, sites);
+                note(&mut asked, path, sites, exact);
                 consumed = true;
                 break;
             }
@@ -248,29 +317,43 @@ pub fn flag(argv: &mut Vec<String>) -> Result<Option<Asked>, String> {
     Ok(asked)
 }
 
-/// Folds one flag into what the run asked for: the last path wins, and asking for sites at all
-/// means sites.
-fn note(asked: &mut Option<Asked>, path: String, sites: bool) {
+/// Folds one flag into what the run asked for: the last path wins, asking for sites at all means
+/// sites, and asking for exact sites anywhere means exact — the stronger request is the one the
+/// run gets.
+fn note(asked: &mut Option<Asked>, path: String, sites: bool, exact: bool) {
     let sites = sites || asked.as_ref().is_some_and(|a| a.sites);
+    let exact = exact || asked.as_ref().is_some_and(|a| a.exact);
     *asked = Some(Asked {
         path: std::path::PathBuf::from(path),
         sites,
+        exact,
     });
 }
 
 /// Writes what the run allocated where the flag asked for it. A handful of numbers, so the
 /// document is written here rather than through a JSON library the launcher would carry for
-/// nothing.
+/// nothing. When sites were asked for it also says whether they were sampled, and the rows are in
+/// the totals' units: `every` walked allocations scaled back up by `every`.
 pub fn write(
     path: &std::path::Path,
     counted: Counted,
     sites: &BTreeMap<String, Counted>,
+    every: u32,
 ) -> std::io::Result<()> {
     let mut out = format!(
         "{{\n  \"allocations\": {},\n  \"bytes\": {}",
         counted.allocations, counted.bytes
     );
-    if !sites.is_empty() {
+    if every >= 1 {
+        // How the rows were read, so a reader knows whether they are the program's allocations or
+        // a sample of them scaled up.
+        out.push_str(&format!(
+            ",\n  \"exact\": {},\n  \"sampled_every\": {every}",
+            every == 1
+        ));
+        // One walked allocation stands for `every` of them, so the rows read in the totals' units
+        // rather than the sample's.
+        let scale = u64::from(every.max(1));
         // Most to least, so a reader starts at what mattered; the site name breaks ties.
         let mut rows: Vec<(&String, &Counted)> = sites.iter().collect();
         rows.sort_by(|a, b| {
@@ -286,8 +369,8 @@ pub fn write(
             out.push_str(&format!(
                 "\n    {{\"site\": {}, \"allocations\": {}, \"bytes\": {}}}",
                 json_string(site),
-                at.allocations,
-                at.bytes
+                at.allocations * scale,
+                at.bytes * scale
             ));
         }
         out.push_str("\n  ]");
