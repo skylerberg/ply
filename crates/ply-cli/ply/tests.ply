@@ -7,12 +7,20 @@
 // and the code it exits with.
 
 import args (Flags, from_argv, style_of)
+import builder (builder)
+import std.fs (fs)
+import std.time (time)
 import cmdline
 import cmdline (Parsed, has, value, values_of)
 import machine
 import compiler.resolve (Diag, Label)
 import diagnostic (Place, Spot, spot_of, all_to_json, all_to_text)
 import entry (At, no_module)
+import program (Timed, is_shelved, modules_of, timed_load)
+import compiler.front (Analysed, Whole, dump_of, dump_text)
+import compiler.pkg (Supplied)
+import compiler.hash (hex)
+import std.hash (blake3)
 import report (Answer, ind, ok_code, compile_error, count_of, plural, refused, warning_lines)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string)
 import style (Style, plain, bold, dim, green, red, yellow)
@@ -39,6 +47,44 @@ import suite.select (Cached, Decision, New, Nondet, PreviousFailure, Reason, Unh
 // watching run decides there is another report to write; the walk is the host's and the deciding
 // is not. It answers `None` when a directory would not be read, which a watcher must not read as
 // a tree that has not moved.
+// The front end this run is against, as the machine reads it: the compiler's frames, every source
+// they name in the order their ids run, the package roots the store files a dependency's sources
+// under, and what this side's own load cost. `ply test` walks the tree and runs the compiler in
+// order to report on both, so it hands the answer over rather than letting the machine repeat it.
+pub type Front = {
+  dump: Bytes,
+  files: List<FrontFile>,
+  packages: List<FrontPackage>,
+  read_ms: Int,
+  front_ms: Int,
+}
+
+pub type FrontFile = { path: String, name: String, text: Bytes }
+
+pub type FrontPackage = { root: String, digest: String }
+
+// A package's manifest digest is the identity the store files its sources under, and it is the one
+// `ply-store` computes: blake3 of the manifest text.
+fn manifest_digest(manifest: Option<Bytes>) -> String =
+  match manifest { None -> "", Some(text) -> string_of_bytes(hex(blake3(text))) }
+
+fn front_of(t: Timed, w: Whole) -> Front = {
+  let named = modules_of(t.program, w);
+  {
+    dump: dump_text(dump_of(Analysed(w))),
+    files: map(range(0, len(named)), |i: Int|
+      {
+        path: match list_at(named, i) { Some(m) -> m.path, None -> "" },
+        name: match list_at(named, i) { Some(m) -> m.name, None -> "" },
+        text: match list_at(t.program.places, i) { Some(place) -> place.text, None -> b"" },
+      }),
+    packages: map(t.program.pkgs.supplied, |s: Supplied|
+      { root: string_of_bytes_lossy(s.root), digest: manifest_digest(s.manifest) }),
+    read_ms: t.read_ms,
+    front_ms: t.front_ms,
+  }
+}
+
 // What the test run is configured with: the report flags, the machine's budgets and bounds, and
 // the host it may bind — the program parses the line and hands the record over.
 pub type Options = {
@@ -80,7 +126,7 @@ pub type SimOpts = {
 pub type Atom = { effect: String, resource: String, writes: Bool }
 
 pub nondet effect tester {
-  write configure[corpus](options: Options) -> Unit
+  write configure[corpus](options: Options, front: Front) -> Unit
   read loaded[r]() -> Result<Program, Refusal>
   read bound[r]() -> Result<Unit, Refusal>
   read ran[r]() -> Ran
@@ -1645,9 +1691,25 @@ fn key_as_case(
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.searched[corpus], tester.trial[corpus]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.searched[corpus], tester.trial[corpus]} = {
   let s: Style = style_of(flags);
-  tester.configure[corpus](options);
+  let t: Timed = timed_load(flags.paths);
+  match t.program.whole {
+    // Every diagnostic, as `check` refuses: an error is the whole answer, so the shelved-module
+    // filter a successful load applies to warnings is not applied here.
+    None -> refused(s, "test", t.program.diags, t.program.places),
+    Some(w) -> tests_over(flags, s, options, front_of(t, w)),
+  }
+}
+
+// The run itself, over the front end `run` loaded.
+fn tests_over(
+  flags: Flags,
+  s: Style,
+  options: Options,
+  front: Front,
+) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.searched[corpus], tester.trial[corpus]} = {
+  tester.configure[corpus](options, front);
   match tester.loaded[corpus]() {
     Err(refusal) -> refused(s, "test", refusal.diags, refusal.places),
     Ok(p) -> {
