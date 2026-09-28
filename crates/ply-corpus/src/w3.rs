@@ -29,6 +29,17 @@ pub fn main_header(source: &str) -> Result<&str> {
     Ok(&source[header_span(source, "main")?])
 }
 
+/// The twin's entry row: `run_memory` discharges `db`, `trace` and `signal` itself, reads the
+/// credential, and may listen over TLS.
+pub(crate) fn twin_entry_row(main_row: &str) -> String {
+    main_row
+        .replace("Serving, ", "config.secret[credentials], ")
+        .replace(
+            "net.listen[listener], ",
+            "net.listen[listener], net.listen_tls[listener], ",
+        )
+}
+
 /// The span of `name`'s signature in `source`: its declaration through the `=` that ends it.
 fn header_span(source: &str, name: &str) -> Result<std::ops::Range<usize>> {
     let start = ["fn ", "pub fn "]
@@ -58,6 +69,23 @@ fn header_span(source: &str, name: &str) -> Result<std::ops::Range<usize>> {
     Ok(start..end + 1)
 }
 
+/// Adds `atoms` to the head of the effect row `name` declares.
+fn widen_row(source: &str, name: &str, atoms: &str) -> Result<String> {
+    let header = header_span(source, name)?;
+    let row = source[header.clone()].find("/ {").with_context(|| {
+        format!(
+            "`{name}` in `examples/desk.ply` no longer declares an effect row; this harness \
+             widens it and must be updated with it rather than measuring a program it guessed at"
+        )
+    })?;
+    let at = header.start + row + "/ {".len();
+    let mut out = String::with_capacity(source.len() + atoms.len());
+    out.push_str(&source[..at]);
+    out.push_str(atoms);
+    out.push_str(&source[at..]);
+    Ok(out)
+}
+
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 const MAX_CONNECTIONS: u32 = 1000;
@@ -72,19 +100,9 @@ fn micros(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
 }
 
-/// The corpus's own services: programs under `fixtures/`, one per variant and transport, with the
-/// example they were written from checked rather than rewritten.
+/// `examples/desk.ply`, split where its tests begin.
 pub struct Service {
-    root: PathBuf,
-}
-
-/// The corpus's own program for one variant and transport.
-pub fn fixture(root: &Path, variant: Variant, transport: Transport) -> PathBuf {
-    root.join(format!(
-        "crates/ply-corpus/fixtures/desk-{}-{}.ply",
-        variant.label(),
-        transport.label()
-    ))
+    server_only: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
@@ -126,35 +144,155 @@ impl Service {
         let path = repo.join("examples/desk.ply");
         let source = std::fs::read_to_string(&path)
             .with_context(|| format!("reading `{}`", path.display()))?;
-        if !source.contains(TESTS_MARKER) {
+        let Some(cut) = source.find(TESTS_MARKER) else {
             bail!(
-                "`{}` no longer contains `{TESTS_MARKER}`; the corpus's own services under \
-                 `crates/ply-corpus/fixtures/` were cut there and must be updated with it rather \
-                 than measuring a program nobody has looked at",
+                "`{}` no longer contains `{TESTS_MARKER}`; this harness splits the service there \
+                 and must be updated with it rather than measuring a program it guessed at",
                 path.display()
             );
-        }
-        main_header(&source)?;
+        };
         Ok(Service {
-            root: repo.to_path_buf(),
+            server_only: source[..cut].to_string(),
         })
     }
 
-    /// The service as it is written: the corpus's own program, one file per variant and transport.
-    pub fn source(&self, variant: Variant, transport: Transport) -> Result<String> {
-        let path = fixture(&self.root, variant, transport);
-        std::fs::read_to_string(&path).with_context(|| format!("reading `{}`", path.display()))
+    /// The service alone, without its tests.
+    pub fn source(&self, variant: Variant) -> Result<String> {
+        match variant {
+            Variant::Sequential => Ok(self.server_only.clone()),
+            Variant::TaskPerConn => self.task_per_connection(),
+        }
     }
 
-}
+    fn task_per_connection(&self) -> Result<String> {
+        // The joins unwind at the end of the loop, so up to `count` handlers are in flight at once.
+        let source = replace(
+            &self.server_only,
+            "serve_connection(c, l);",
+            "let t = task.spawn(|| serve_connection(c, l));",
+        )?;
+        let source = replace(
+            &source,
+            "1 + serve(listener, l, count - 1)",
+            "let rest = serve(listener, l, count - 1);\n      task.join(t);\n      1 + rest",
+        )?;
+        // The accept loop and the rows above and below it, each widened by the one atom spawning
+        // adds; the twin's entry points too, since this harness drives them.
+        const WIDENED: [&str; 10] = [
+            "serve",
+            "listen_and_serve",
+            "listen_and_serve_tls",
+            "run",
+            "run_tls",
+            "run_memory",
+            "run_memory_tls",
+            "memory_serving",
+            // The entry point's own function, which serves the desk from postgres and so performs
+            // whatever the accept loop does.
+            "postgres",
+            "main",
+        ];
+        WIDENED
+            .iter()
+            .try_fold(source, |acc, name| widen_row(&acc, name, "task.write, "))
+    }
 
-    /// A project directory `ply run --host` can be pointed at: the corpus's own program,
-    /// copied. `desk.ply` declares its own `main`, so a second one would be `E0112`.
-    pub fn project(&self, dir: &Path, variant: Variant, transport: Transport) -> Result<()> {
-        let source = self.source(variant, transport)?;
+    /// A project directory `ply run --host` can be pointed at.
+    pub fn project(
+        &self,
+        dir: &Path,
+        variant: Variant,
+        transport: Transport,
+        port: u16,
+        connections: u32,
+    ) -> Result<()> {
+        // Rewritten in place: `desk.ply` declares its own `main`, and a second one is `E0112`.
+        let source = self.source(variant)?;
+        let spawning = match variant {
+            Variant::Sequential => "",
+            Variant::TaskPerConn => "task.write, ",
+        };
+        // The twin, not postgres.
+        let call = match transport {
+            Transport::Http => format!("run_memory({port}, None, {connections})"),
+            Transport::Https => {
+                format!("run_memory_tls({port}, \"{CREDENTIAL}\", None, {connections})")
+            }
+        };
+        let source = replace_entry_point(
+            &source,
+            &format!(
+                "fn main() -> Int / {{{spawning}net.write[conn], net.write[listener]}} =\n  {call}"
+            ),
+        )?;
         std::fs::write(dir.join("desk.ply"), source)?;
         Ok(())
     }
+
+    /// Every `/ {Desk}` and `/ {Desk, ..}` row written out as the atoms the set expands to.
+    pub fn explicit_rows(&self) -> Result<(String, usize)> {
+        const EXPANSION: &str = "db.query[items], db.execute[items], \
+             db.query[orders], db.execute[orders], db.returning[orders], \
+             db.begin, db.commit, db.abort, db.rollback, \
+             trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], \
+             trace.event[items]";
+        let mut out = String::with_capacity(self.server_only.len() + 4096);
+        let mut rewritten = 0usize;
+        let mut rest = self.server_only.as_str();
+        // Only inside a row.
+        while let Some(at) = rest.find("/ {Desk") {
+            let (before, from) = rest.split_at(at);
+            out.push_str(before);
+            let tail = &from["/ {Desk".len()..];
+            if let Some(rest_of_row) = tail.strip_prefix('}') {
+                out.push_str("/ {");
+                out.push_str(EXPANSION);
+                out.push('}');
+                rest = rest_of_row;
+            } else if let Some(rest_of_row) = tail.strip_prefix(',') {
+                out.push_str("/ {");
+                out.push_str(EXPANSION);
+                out.push(',');
+                rest = rest_of_row;
+            } else {
+                bail!(
+                    "a row beginning `/ {{Desk` is neither `/ {{Desk}}` nor `/ {{Desk, ..`; this \
+                     harness rewrites the service's rows and must be updated with it"
+                );
+            }
+            rewritten += 1;
+        }
+        out.push_str(rest);
+        if rewritten == 0 {
+            bail!("`examples/desk.ply` no longer annotates anything with `/ {{Desk`");
+        }
+        Ok((out, rewritten))
+    }
+}
+
+/// Replaces `main`, declaration to closing `}`, with an entry point that drives the twin.
+fn replace_entry_point(source: &str, to: &str) -> Result<String> {
+    let header = header_span(source, "main")?;
+    let body = &source[header.end..];
+    let close = body
+        .find("\n}\n")
+        .context("`desk.ply`'s `main` has no closing brace at column zero")?;
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..header.start]);
+    out.push_str(to);
+    out.push_str(&body[close + "\n}".len()..]);
+    Ok(out)
+}
+
+fn replace(source: &str, from: &str, to: &str) -> Result<String> {
+    if !source.contains(from) {
+        bail!(
+            "`examples/desk.ply` no longer contains:\n{from}\n\
+             this harness rewrites it and must be updated with it rather than measuring a program \
+             it guessed at"
+        );
+    }
+    Ok(source.replace(from, to))
 }
 
 /// A checked service, callable with whatever answers `net`.
