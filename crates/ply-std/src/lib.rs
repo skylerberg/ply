@@ -18,6 +18,8 @@ pub const CERTGEN: &str = include_str!("../ply/certgen.ply");
 
 pub const CONFIG: &str = include_str!("../ply/config.ply");
 
+pub const CSV: &str = include_str!("../ply/csv.ply");
+
 pub const DB: &str = include_str!("../ply/db.ply");
 
 pub const FS: &str = include_str!("../ply/fs.ply");
@@ -58,6 +60,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.bytes", BYTES),
     ("std.certgen", CERTGEN),
     ("std.config", CONFIG),
+    ("std.csv", CSV),
     ("std.db", DB),
     ("std.fs", FS),
     ("std.hash", HASH),
