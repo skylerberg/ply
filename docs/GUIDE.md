@@ -2052,8 +2052,14 @@ taken out of the line before the program parses it, and the run writes what the
 entry allocated — every thread's allocations, in a window around the entry — as
 `allocations` and `bytes`. `--count-alloc-sites=PATH` writes the same totals and
 adds `sites`, the nearest few `ply_*` C frames each allocation came from, most
-first: it walks a stack per allocation, so it is for measurements, not for
-production, and the walk's own allocations are the walker's and are not counted.
+first, with `exact` and `sampled_every` saying how they were read: it walks a
+stack per allocation, so it is for measurements, not for production, and the
+walk's own allocations are the walker's and are not counted. The walk is most of
+what a site census costs, so this flag samples — every allocation is counted and
+one in `sampled_every` is walked, with the rows scaled back up, so they read in
+the totals' units and their sum is near the total rather than equal to it.
+`--count-alloc-sites-exact=PATH` walks every allocation instead, for a census
+that is exact and slower.
 A run whose work is interpreted has no such frames: its allocations are the
 interpreter's, and they are what the totals are made of.
 What a host may lend is a policy with names, one family each:
