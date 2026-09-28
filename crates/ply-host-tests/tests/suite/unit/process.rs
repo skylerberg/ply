@@ -89,8 +89,10 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
     for (op, _) in &handlers {
         assert_eq!(op.effect.as_str(), EFFECT);
         assert_eq!(op.determinism, Determinism::Nondeterministic);
-        // Only a spawn waits for something outside this process.
-        assert_eq!(op.blocking, op.op.as_str() == "spawn", "{op}");
+        // A spawn waits for another process and a line waits for input; both wait outside this
+        // process, so both go to the pool rather than parking the machine.
+        let waits = matches!(op.op.as_str(), "spawn" | "line");
+        assert_eq!(op.blocking, waits, "{op}");
         assert!(!op.secrets, "a line or a code is never a credential");
         assert!(op.path.starts_with("ply_host::process::"));
         let expected = if op.op.as_str() == "args" {

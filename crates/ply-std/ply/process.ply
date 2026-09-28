@@ -3,6 +3,9 @@ pub nondet effect process {
   read args[p]() -> List<String>
   write out[p](text: String) -> Unit
   write err[p](text: String) -> Unit
+  // One line of the program's standard input, without its line ending, or `None` at end of input.
+  // A write rather than a read: each line is consumed, so two readers of one input race for it.
+  write line[p]() -> Option<String>
   write exit[p](code: Int) -> Unit
   write spawn[e](args: List<String>, dir: String, env: List<Var>) -> Finished
 }
@@ -24,12 +27,32 @@ pub fn exit_code(f: Finished) -> Option<Int> =
 // --- The twin ---------------------------------------------------------------
 
 // What a test hands the clauses below in place of the host: the arguments the
-// program was started with, each stream's lines, and the code it asked to exit with.
-pub type Captured = { args: List<String>, out: List<String>, err: List<String>, code: Option<Int> }
+// program was started with, the lines it may read, each stream's lines, and the code it asked to
+// exit with. `input` runs out into end of input, which is what a console does.
+pub type Captured = {
+  args: List<String>,
+  input: List<String>,
+  out: List<String>,
+  err: List<String>,
+  code: Option<Int>,
+}
 
-pub fn captured(args: List<String>) -> Captured = { args: args, out: [], err: [], code: None }
+pub fn captured(args: List<String>) -> Captured =
+  { args: args, input: [], out: [], err: [], code: None }
+
+/// The same twin, reading the given lines before end of input.
+pub fn with_input(c: Captured, lines: List<String>) -> Captured = { ..c, input: lines }
 
 pub fn args_step(c: Captured) -> List<String> = c.args
+
+/// One scripted line and the twin with it consumed; `None` once the script is empty.
+pub type Line = { captured: Captured, line: Option<String> }
+
+pub fn line_step(c: Captured) -> Line =
+  match c.input {
+    [] -> { captured: c, line: None },
+    [first, ..rest] -> { captured: { ..c, input: rest }, line: Some(first) },
+  }
 
 pub fn out_step(c: Captured, text: String) -> Captured = { ..c, out: push(c.out, text) }
 
@@ -188,6 +211,34 @@ test "a nonzero exit and a signal are both answers" {
   } with {
     process.spawn[cc](args, dir, env) -> signalled(9, b"", b""),
   }
+}
+
+fn echo_lines() -> Unit / {process.line[proc], process.out[proc]} =
+  match process.line[proc]() {
+    None -> (),
+    Some(text) -> {
+      process.out[proc](text);
+      echo_lines()
+    },
+  }
+
+test "a program reads lines until the input ends, and each ends at its newline" {
+  with_cell[twin](with_input(captured([]), ["one", "two"])) { s -> {
+    handle {
+      echo_lines()
+    } with {
+      process.line[proc]() -> {
+        let step = line_step(cell_get(s));
+        cell_set(s, step.captured);
+        step.line
+      },
+      process.out[proc](t) -> cell_set(s, out_step(cell_get(s), t)),
+    };
+    let c = cell_get(s);
+    assert_eq(c.out, ["one", "two"]);
+    // The script runs out into end of input, and reading past it is `None` rather than a raise.
+    assert_eq(line_step(captured([])).line, None)
+  } }
 }
 
 test "a spawn a test planned no reply for is a command that could not be run" {
