@@ -1324,23 +1324,27 @@ pub type Ended = Exited(Int) | Signalled(Int)
 pub type Finished = { ended: Ended, out: Bytes, err: Bytes }
 
 pub nondet effect process {
-  read args[p]()             -> List<String>
-  write out[p](text: String) -> Unit
-  write err[p](text: String) -> Unit
-  write exit[p](code: Int)   -> Unit
+  read  args[p]()             -> List<String>
+  write out[p](text: String)  -> Unit
+  write err[p](text: String)  -> Unit
+  write line[p]()             -> Option<String>
+  write exit[p](code: Int)    -> Unit
   write spawn[e](args: List<String>, dir: String, env: List<Var>) -> Finished
 }
 ```
 
 The label names the process, `[proc]` by convention. `args` answers what
 followed `--` on the `ply run` command line, `out` and `err` each write one
-line, and `exit` ends the program there: nothing after it runs, no value is
+line, `line` reads one line of the program's standard input without its line
+ending and answers `None` at end of input (a `write`, because each line is
+consumed and two readers of one input race for it), and `exit` ends the program
+there: nothing after it runs, no value is
 printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). It is
 bound only by `ply run --host`; `ply test` withholds it, even with `--host`
 (`E0424`). Under `ply run --json` the lines `out` writes go to stderr, so stdout
 still carries the one object. Handle it over a `Captured` value: `captured(args)`,
-`args_step`, `out_step`, `err_step` and `exit_step` keep each line and the first
-exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
+`args_step`, `out_step`, `err_step`, `line_step` and `exit_step` keep each line,
+hand out `with_input`'s scripted input lines, and the first exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
 ends the handled body as the host would.
 
 `spawn` starts another program and waits for it. Its label is not the process
@@ -1355,7 +1359,8 @@ directory, and `""` is the run's own. `env` is the *whole* environment: a spawn
 inherits none of the run's, so what the child reads is in the program's text and
 its configuration rather than in the shell that started `ply`. Both streams are
 captured whole — Ply has no file handles, so there is no streaming and no
-interleaving of the two — and a stream over 64MiB is `E0458`. `stdin` is empty.
+interleaving of the two — and a stream over 64MiB is `E0458`. A spawned program's standard input
+is empty; the run's own is what `line` reads.
 `Exited(code)` is the program's own answer and `Signalled(n)` the signal that
 killed it; neither is a diagnostic, because what a compiler says about a source
 file is a value the driver reads. The label is the capability and nothing
