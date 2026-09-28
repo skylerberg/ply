@@ -52,6 +52,8 @@ pub const TRACE: &str = include_str!("../ply/trace.ply");
 
 pub const SIGNAL: &str = include_str!("../ply/signal.ply");
 
+pub const STRING: &str = include_str!("../ply/string.ply");
+
 pub const TIME: &str = include_str!("../ply/time.ply");
 
 pub const URL: &str = include_str!("../ply/url.ply");
@@ -80,6 +82,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.random", RANDOM),
     ("std.router", ROUTER),
     ("std.signal", SIGNAL),
+    ("std.string", STRING),
     ("std.time", TIME),
     ("std.trace", TRACE),
     ("std.url", URL),
