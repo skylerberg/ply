@@ -28,6 +28,8 @@ pub const HASH: &str = include_str!("../ply/hash.ply");
 
 pub const JSON: &str = include_str!("../ply/json.ply");
 
+pub const MSGPACK: &str = include_str!("../ply/msgpack.ply");
+
 pub const HTTP: &str = include_str!("../ply/http.ply");
 
 pub const NET: &str = include_str!("../ply/net.ply");
@@ -66,6 +68,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.hash", HASH),
     ("std.http", HTTP),
     ("std.json", JSON),
+    ("std.msgpack", MSGPACK),
     ("std.net", NET),
     ("std.path", PATH),
     ("std.pg", PG),
