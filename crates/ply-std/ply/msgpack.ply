@@ -1,0 +1,312 @@
+// `msgpack` — MessagePack, the compact binary form of the same data JSON carries.
+//
+// The subset here is the one a program needs and not the whole format: nil, booleans, integers in
+// every width, float64, UTF-8 text, binary, arrays and maps. MessagePack's extension types
+// (`0xc7`–`0xc9`, `0xd4`–`0xd8`), `float32` (`0xca`) and the reserved `0xc1` are refused by the
+// reader rather than guessed at — `None`, not a nearest value — and the writer never produces one.
+//
+// The writer chooses the shortest *signed* encoding the value fits — it never emits a
+// `uint` — and one value has one encoding. The reader accepts `uint` widths, because another
+// writer will use them. The
+// reader is total: it answers `None` for a truncated input, a length that claims more bytes than
+// are left, a value nested past `max_depth()`, or a tag in the extension range. Every length is
+// checked against what remains before it is walked, so a hostile header cannot make it loop.
+
+import std.bytes (bytes_of_hex, hex_of, i16_be, i32_be, i64_be, u16_be, u32_be)
+
+pub type Value =
+  | Nil
+  | Flag(Bool)
+  | Int(Int)
+  | Float(Float)
+  | Text(String)
+  | Bits(Bytes)
+  | Items(List<Value>)
+  | Fields(List<Field>)
+
+pub type Field = { key: Value, value: Value }
+
+pub fn field(key: Value, value: Value) -> Field = { key: key, value: value }
+
+// --- Writing ----------------------------------------------------------------
+
+pub fn msgpack_encode(v: Value) -> Bytes =
+  match v {
+    Nil -> byte_of_int(0xC0),
+    Flag(b) -> if b { byte_of_int(0xC3) } else { byte_of_int(0xC2) },
+    Int(n) -> int_bytes(n),
+    Float(f) -> bytes_concat(byte_of_int(0xCB), i64_be(bits_of_float(f))),
+    Text(s) -> with_head(text_head(bytes_len(bytes_of_string(s))), bytes_of_string(s)),
+    Bits(b) -> with_head(bits_head(bytes_len(b)), b),
+    Items(xs) -> with_head(items_head(len(xs)), bytes_concat_all(map(xs, msgpack_encode))),
+    Fields(kvs) ->
+      with_head(
+        fields_head(len(kvs)),
+        bytes_concat_all(
+          map(kvs, |f: Field| bytes_concat(msgpack_encode(f.key), msgpack_encode(f.value))),
+        ),
+      ),
+  }
+
+fn with_head(head: Bytes, body: Bytes) -> Bytes = bytes_concat(head, body)
+
+// Integers, shortest first: positive fixint, negative fixint, then int8/16/32/64.
+fn int_bytes(n: Int) -> Bytes =
+  if n >= 0 && n <= 127 { byte_of_int(n) }
+  else if n >= 0 - 32 && n < 0 { byte_of_int(0xE0 | n & 0x1F) }
+  else if n >= 0 - 128 && n <= 127 { bytes_concat(byte_of_int(0xD0), byte_of_int(n & 0xFF)) }
+  else if n >= 0 - 32768 && n <= 32767 { bytes_concat(byte_of_int(0xD1), i16_be(n)) }
+  else if n >= 0 - 2147483648 && n <= 2147483647 { bytes_concat(byte_of_int(0xD2), i32_be(n)) }
+  else { bytes_concat(byte_of_int(0xD3), i64_be(n)) }
+
+fn text_head(n: Int) -> Bytes =
+  if n <= 31 { byte_of_int(0xA0 | n) }
+  else if n <= 255 { bytes_concat(byte_of_int(0xD9), byte_of_int(n)) }
+  else if n <= 65535 { bytes_concat(byte_of_int(0xDA), u16_be(n)) }
+  else { bytes_concat(byte_of_int(0xDB), u32_be(n)) }
+
+fn bits_head(n: Int) -> Bytes =
+  if n <= 255 { bytes_concat(byte_of_int(0xC4), byte_of_int(n)) }
+  else if n <= 65535 { bytes_concat(byte_of_int(0xC5), u16_be(n)) }
+  else { bytes_concat(byte_of_int(0xC6), u32_be(n)) }
+
+fn items_head(n: Int) -> Bytes =
+  if n <= 15 { byte_of_int(0x90 | n) }
+  else if n <= 65535 { bytes_concat(byte_of_int(0xDC), u16_be(n)) }
+  else { bytes_concat(byte_of_int(0xDD), u32_be(n)) }
+
+fn fields_head(n: Int) -> Bytes =
+  if n <= 15 { byte_of_int(0x80 | n) }
+  else if n <= 65535 { bytes_concat(byte_of_int(0xDE), u16_be(n)) }
+  else { bytes_concat(byte_of_int(0xDF), u32_be(n)) }
+
+// --- Reading ----------------------------------------------------------------
+
+/// The value `data` holds, or `None` if it is not exactly one value of this subset.
+pub fn msgpack_decode(data: Bytes) -> Option<Value> =
+  match read_at(data, 0, 0) {
+    None -> None,
+    Some(read) -> if read.at == bytes_len(data) { Some(read.value) } else { None },
+  }
+
+pub type Read = { value: Value, at: Int }
+
+/// How deep a value may nest. A reader that recursed from the input alone could be made to walk a
+/// stack it cannot hold; 64 is deeper than any message and shallower than the stack.
+fn max_depth() -> Int = 64
+
+fn read_at(data: Bytes, at: Int, depth: Int) -> Option<Read> =
+  if depth > max_depth() || at >= bytes_len(data) { None } else {
+    let tag = bytes_at(data, at);
+    if tag <= 0x7F { Some({ value: Int(tag), at: at + 1 }) }
+    else if tag >= 0xE0 { Some({ value: Int(tag - 256), at: at + 1 }) }
+    else if tag >= 0x80 && tag <= 0x8F { read_fields(data, at + 1, tag & 0x0F, depth) }
+    else if tag >= 0x90 && tag <= 0x9F { read_items(data, at + 1, tag & 0x0F, depth) }
+    else if tag >= 0xA0 && tag <= 0xBF { read_text(data, at + 1, tag & 0x1F) }
+    else {
+      // A table rather than a chain of comparisons: one level of nesting for twenty-odd tags, and
+      // the emitter's recursion is what the depth costs.
+      read_tagged(data, at, tag, depth)
+    }
+  }
+
+fn read_tagged(data: Bytes, at: Int, tag: Int, depth: Int) -> Option<Read> =
+  match tag {
+    0xC0 -> Some({ value: Nil, at: at + 1 }),
+    0xC2 -> Some({ value: Flag(false), at: at + 1 }),
+    0xC3 -> Some({ value: Flag(true), at: at + 1 }),
+    0xC4 -> read_length(data, at + 1, 1, KBits, depth),
+    0xC5 -> read_length(data, at + 1, 2, KBits, depth),
+    0xC6 -> read_length(data, at + 1, 4, KBits, depth),
+    0xCB -> read_float(data, at),
+    0xCC -> unsigned(data, at, 1, 2),
+    0xCD -> unsigned(data, at, 2, 3),
+    0xCE -> unsigned(data, at, 4, 5),
+    0xCF -> read_uint64(data, at),
+    0xD0 -> read_signed(data, at, 1, 0x80, 256),
+    0xD1 -> read_signed(data, at, 2, 0x8000, 0x1_0000),
+    0xD2 -> read_signed(data, at, 4, 0x8000_0000, 0x1_0000_0000),
+    0xD3 -> read_int64(data, at),
+    0xD9 -> read_length(data, at + 1, 1, KText, depth),
+    0xDA -> read_length(data, at + 1, 2, KText, depth),
+    0xDB -> read_length(data, at + 1, 4, KText, depth),
+    0xDC -> read_length(data, at + 1, 2, KItems, depth),
+    0xDD -> read_length(data, at + 1, 4, KItems, depth),
+    0xDE -> read_length(data, at + 1, 2, KFields, depth),
+    0xDF -> read_length(data, at + 1, 4, KFields, depth),
+    // `float32`, the extension types, the reserved `0xc1`, and everything above `0xdf`.
+    _ -> None,
+  }
+
+fn read_float(data: Bytes, at: Int) -> Option<Read> =
+  match read_n(data, at + 1, 8) {
+    None -> None,
+    Some(eight) -> Some({ value: Float(float_of_bits(be_int(eight))), at: at + 9 }),
+  }
+
+fn read_int64(data: Bytes, at: Int) -> Option<Read> =
+  match read_n(data, at + 1, 8) {
+    None -> None,
+    // Eight bytes are the two's complement an `Int` already is.
+    Some(eight) -> Some({ value: Int(be_int(eight)), at: at + 9 }),
+  }
+
+fn read_uint64(data: Bytes, at: Int) -> Option<Read> =
+  match read_n(data, at + 1, 8) {
+    None -> None,
+    // A `uint64` above `i63` is not an `Int`, and answering the wrapped bits would be a lie.
+    Some(eight) -> if bytes_at(eight, 0) & 0x80 != 0 { None }
+    else { Some({ value: Int(be_int(eight)), at: at + 9 }) },
+  }
+
+fn read_signed(data: Bytes, at: Int, width: Int, high: Int, span: Int) -> Option<Read> =
+  match read_n(data, at + 1, width) {
+    None -> None,
+    Some(prefix) -> Some({ value: Int(signed(be_int(prefix), high, span)), at: at + 1 + width }),
+  }
+
+// What a length-prefixed tag says its payload is.
+type Kind = | KBits | KText | KItems | KFields
+
+// One length-prefixed value. The length is checked against what remains *before* it is walked, so a
+// header claiming four billion elements is truncation rather than four billion iterations.
+fn read_length(data: Bytes, at: Int, width: Int, kind: Kind, depth: Int) -> Option<Read> =
+  match read_n(data, at, width) {
+    None -> None,
+    Some(prefix) -> {
+      let n = be_int(prefix);
+      let from = at + width;
+      if n < 0 || n > bytes_len(data) - from { None } else if kind == KBits {
+        match read_n(data, from, n) {
+          None -> None,
+          Some(payload) -> Some({ value: Bits(payload), at: from + n }),
+        }
+      } else if kind == KText { read_text(data, from, n) }
+      else if kind == KItems { read_items(data, from, n, depth) }
+      else { read_fields(data, from, n, depth) }
+    },
+  }
+
+// A `uint8`/`uint16`/`uint32`, which fit an `Int` whatever their bits say.
+fn unsigned(data: Bytes, at: Int, width: Int, after: Int) -> Option<Read> =
+  match read_n(data, at + 1, width) {
+    None -> None,
+    Some(prefix) -> Some({ value: Int(be_int(prefix)), at: at + after }),
+  }
+
+fn read_n(data: Bytes, at: Int, n: Int) -> Option<Bytes> =
+  if n < 0 || at + n > bytes_len(data) { None } else { Some(bytes_slice(data, at, at + n)) }
+
+fn read_text(data: Bytes, at: Int, n: Int) -> Option<Read> =
+  match read_n(data, at, n) {
+    None -> None,
+    Some(payload) -> if bytes_is_utf8(payload) {
+      Some({ value: Text(string_of_bytes(payload)), at: at + n })
+    } else { None },
+  }
+
+fn read_items(data: Bytes, at: Int, n: Int, depth: Int) -> Option<Read> =
+  match read_values(data, at, n, depth, []) {
+    None -> None,
+    Some(done) -> Some({ value: Items(done.items), at: done.at }),
+  }
+
+fn read_values(
+  data: Bytes,
+  at: Int,
+  n: Int,
+  depth: Int,
+  acc: List<Value>,
+) -> Option<{ items: List<Value>, at: Int }> =
+  if n <= 0 { Some({ items: acc, at: at }) } else {
+    match read_at(data, at, depth + 1) {
+      None -> None,
+      Some(read) -> read_values(data, read.at, n - 1, depth, push(acc, read.value)),
+    }
+  }
+
+fn read_fields(data: Bytes, at: Int, n: Int, depth: Int) -> Option<Read> =
+  match read_pairs(data, at, n, depth, []) {
+    None -> None,
+    Some(done) -> Some({ value: Fields(done.fields), at: done.at }),
+  }
+
+fn read_pairs(
+  data: Bytes,
+  at: Int,
+  n: Int,
+  depth: Int,
+  acc: List<Field>,
+) -> Option<{ fields: List<Field>, at: Int }> =
+  if n <= 0 { Some({ fields: acc, at: at }) } else {
+    match read_at(data, at, depth + 1) {
+      None -> None,
+      Some(key) -> match read_at(data, key.at, depth + 1) {
+        None -> None,
+        Some(value) ->
+          read_pairs(
+            data,
+            value.at,
+            n - 1,
+            depth,
+            push(acc, { key: key.value, value: value.value }),
+          ),
+      },
+    }
+  }
+
+// The big-endian integer a byte string names, as the `Int` its bits are.
+fn be_int(data: Bytes) -> Int =
+  fold(range(0, bytes_len(data)), 0, |acc: Int, i: Int| acc << 8 | bytes_at(data, i))
+
+// A width narrower than an `Int` sign-extends from its own high bit.
+fn signed(n: Int, high: Int, span: Int) -> Int = if n >= high { n - span } else { n }
+
+// --- Tests ------------------------------------------------------------------
+
+test "the shortest signed encoding of each width, and each reads back" {
+  assert_eq(msgpack_encode(Nil), bytes_of_hex("c0"));
+  assert_eq(msgpack_encode(Flag(false)), bytes_of_hex("c2"));
+  assert_eq(msgpack_encode(Flag(true)), bytes_of_hex("c3"));
+  assert_eq(msgpack_encode(Int(0)), bytes_of_hex("00"));
+  assert_eq(msgpack_encode(Int(127)), bytes_of_hex("7f"));
+  assert_eq(msgpack_encode(Int(-1)), bytes_of_hex("ff"));
+  assert_eq(msgpack_encode(Int(-32)), bytes_of_hex("e0"));
+  assert_eq(msgpack_encode(Int(-33)), bytes_of_hex("d0df"));
+  assert_eq(msgpack_encode(Int(128)), bytes_of_hex("d10080"));
+  assert_eq(msgpack_encode(Int(-32768)), bytes_of_hex("d18000"));
+  assert_eq(msgpack_encode(Int(-32769)), bytes_of_hex("d2ffff7fff"));
+  assert_eq(msgpack_encode(Float(1.5)), bytes_of_hex("cb3ff8000000000000"));
+  assert_eq(msgpack_decode(msgpack_encode(Int(70000))), Some(Int(70000)));
+  assert_eq(msgpack_decode(msgpack_encode(Float(-0.5))), Some(Float(-0.5)));
+  assert_eq(msgpack_decode(msgpack_encode(Text("héllo"))), Some(Text("héllo")));
+  assert_eq(msgpack_decode(msgpack_encode(Bits(b"\x00\xff"))), Some(Bits(b"\x00\xff")))
+}
+
+test "text, binary, arrays and maps round-trip, and two values are not one" {
+  assert_eq(msgpack_encode(Text("hello")), bytes_of_hex("a568656c6c6f"));
+  assert_eq(msgpack_encode(Bits(b"\x01\x02")), bytes_of_hex("c4020102"));
+  assert_eq(msgpack_encode(Items([Int(1), Int(2)])), bytes_of_hex("920102"));
+  assert_eq(msgpack_encode(Fields([field(Text("a"), Int(1))])), bytes_of_hex("81a16101"));
+  let nested = Items([Int(1), Items([Flag(true)]), Fields([field(Text("k"), Bits(b"v"))])]);
+  assert_eq(msgpack_decode(msgpack_encode(nested)), Some(nested));
+  // `decode` is one value: two concatenated is not a value this reader answers.
+  let two = bytes_concat(msgpack_encode(Int(1)), msgpack_encode(Int(2)));
+  assert_eq(msgpack_decode(two), None)
+}
+
+test "a reader accepts the unsigned widths and refuses what this subset does not name" {
+  assert_eq(msgpack_decode(bytes_of_hex("cc80")), Some(Int(128)));
+  assert_eq(msgpack_decode(bytes_of_hex("cd0100")), Some(Int(256)));
+  assert_eq(msgpack_decode(bytes_of_hex("ce00010000")), Some(Int(65536)));
+  // float32, an extension type, the reserved byte, a truncated string, a length past the end, a
+  // `uint64` above i63, a truncated array, and nothing at all.
+  assert_eq(msgpack_decode(bytes_of_hex("ca3fc00000")), None);
+  assert_eq(msgpack_decode(bytes_of_hex("c70102ff")), None);
+  assert_eq(msgpack_decode(bytes_of_hex("c1")), None);
+  assert_eq(msgpack_decode(bytes_of_hex("d90561")), None);
+  assert_eq(msgpack_decode(bytes_of_hex("db0000000561")), None);
+  assert_eq(msgpack_decode(bytes_of_hex("cfffffffffffffffff")), None);
+  assert_eq(msgpack_decode(bytes_of_hex("9201")), None);
+  assert_eq(msgpack_decode(bytes_of_hex("")), None)
+}
