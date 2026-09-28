@@ -25,7 +25,7 @@
 #                                the postgres packages
 #   ci-shards.sh gate-filter     the filterset the gates job runs: the shutdown
 #                                suite and the tree checks
-#   ci-shards.sh postgres-filter the filterset selecting the postgres packages
+#   ci-shards.sh host-filter     the filterset selecting the host packages
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
 #   ci-shards.sh give-back RUN   delete the entries this run parked for its own
 #                                jobs, once every job that reads them is done
@@ -54,8 +54,10 @@ SOLO=(
   "corpus-socket-bench:ply-corpus-tests:suite:unit::w3::the_socket_bench_serves_the_read_mix"
 )
 
-# Their tests skip, passing, without a postgres server; only `test-postgres` runs them.
-POSTGRES_PACKAGES=(ply-host-tests)
+# The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.
+# `test-hosts` runs them in one job. The set was named for postgres when the driver lived in the
+# host; the exclusion is the same and the name is not.
+HOST_PACKAGES=(ply-host-tests)
 
 # `-tests` packages with no same-named crate: the CLI's suite drives ply-launcher's binary, and
 # ply-cli is the program's sources, not a crate.
@@ -156,9 +158,9 @@ cmd_solo_filter() {
   return 1
 }
 
-cmd_postgres_filter() {
+cmd_host_filter() {
   local package first=1
-  for package in "${POSTGRES_PACKAGES[@]}"; do
+  for package in "${HOST_PACKAGES[@]}"; do
     ((first)) || printf ' | '
     first=0
     printf 'package(%s)' "$package"
@@ -177,7 +179,7 @@ cmd_gate_filter() {
 
 # Solo tests are excluded by name, so a new test in one of their binaries still runs in a partition.
 cmd_exclude_filter() {
-  printf '%s | %s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$SHUTDOWN_FILTER" "$(cmd_postgres_filter)"
+  printf '%s | %s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$SHUTDOWN_FILTER" "$(cmd_host_filter)"
 }
 
 cmd_partitions() {
@@ -676,9 +678,9 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
-  for package in "${POSTGRES_PACKAGES[@]}"; do
+  for package in "${HOST_PACKAGES[@]}"; do
     if ! printf '%s\n' "${all_members[@]}" | grep -qx "$package"; then
-      echo "FAIL: POSTGRES_PACKAGES names '$package', which is not a workspace member" >&2
+      echo "FAIL: HOST_PACKAGES names '$package', which is not a workspace member" >&2
       failures=$((failures + 1))
     fi
   done
@@ -878,12 +880,12 @@ case "${1:-}" in
   solo-filter) cmd_solo_filter "${2:?a solo id}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
-  postgres-filter) cmd_postgres_filter ;;
+  host-filter) cmd_host_filter ;;
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;
   give-back) cmd_give_back "${2:?a run id}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|exclude-filter|gate-filter|postgres-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
     exit 2
     ;;
 esac
