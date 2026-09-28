@@ -280,10 +280,6 @@ pub unsafe fn bridged<'a>(o: *mut Obj) -> &'a Value {
     unsafe { &*bridge_slot(o) }
 }
 
-pub unsafe fn bridged_mut<'a>(o: *mut Obj) -> &'a mut Value {
-    unsafe { &mut *bridge_slot(o) }
-}
-
 /// Where a string's or a bytes value's payload starts.
 #[inline]
 pub unsafe fn bytes_ptr(o: *mut Obj) -> *mut u8 {

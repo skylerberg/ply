@@ -50,7 +50,6 @@ pub use escape::{Boundary, Escapee, Handle};
 pub use host::{
     Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
     HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, ShutdownReport,
-    is_drain_incomplete,
 };
 pub use task_regions::{Fixture, TaskRegions};
 // `explore::Step` is not re-exported: `Step` at the root is the builtin's.

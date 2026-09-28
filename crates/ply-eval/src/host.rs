@@ -192,15 +192,7 @@ pub struct ShutdownReport {
     pub problems: Vec<String>,
 }
 
-impl ShutdownReport {
-    pub fn is_clean(&self) -> bool {
-        self.problems.is_empty()
-    }
-}
-
-pub fn is_drain_incomplete(d: &Diagnostic) -> bool {
-    d.code == codes::DRAIN_INCOMPLETE
-}
+impl ShutdownReport {}
 
 #[derive(Default)]
 pub struct HostRegistry {

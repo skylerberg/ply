@@ -156,10 +156,6 @@ impl Shutdown {
         self.woke.notify_all();
     }
 
-    pub fn attach_db(&self, db: Arc<dyn Transactions>) {
-        *lock(&self.db) = Some(db);
-    }
-
     pub fn stopping(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
