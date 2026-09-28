@@ -373,35 +373,16 @@ impl Stack {
     }
 }
 
-/// `examples/desk.ply` as a project `ply run --host` can be pointed at.
-fn project(dir: &Path, service: &str, stack: Stack) -> Result<()> {
-    let source = match stack {
-        Stack::Postgres => service.to_string(),
-        Stack::PostgresTls => {
-            // `run_tls` performs what `run` performs plus the handshake, so the entry row
-            // widens with it.
-            let from = w3::main_header(service)?;
-            let row = from.replace(
-                "net.listen[listener],",
-                "net.listen[listener], net.listen_tls[listener],",
-            );
-            let widened = replace(service, from, &row)?;
-            replace(
-                &widened,
-                "    run(port, count)",
-                &format!("    run_tls(port, \"{CREDENTIAL}\", count)"),
-            )?
-        }
-        Stack::Twin => {
-            let from = w3::main_header(service)?;
-            let narrowed = replace(service, from, &w3::twin_entry_row(from))?;
-            replace(
-                &narrowed,
-                "    run(port, count)",
-                "    run_memory(port, key, count)",
-            )?
-        }
+/// The corpus's own program for one stack, copied into a project `ply run --host` can be pointed
+/// at. There is nothing to rewrite: each stack's entry point is written down.
+pub fn project(dir: &Path, repo: &Path, stack: Stack, variant: w3::Variant) -> Result<()> {
+    let mode = match stack {
+        Stack::Postgres => "postgres",
+        Stack::PostgresTls => "tls",
+        Stack::Twin => "memory",
     };
+    let name = format!("desk-{}-{mode}.ply", variant.label());
+    let source = std::fs::read_to_string(repo.join("crates/ply-corpus/fixtures").join(name))?;
     std::fs::write(dir.join("desk.ply"), source)?;
     Ok(())
 }
@@ -438,10 +419,9 @@ impl Serving {
         connections: u32,
         api_key: &str,
     ) -> Result<Serving> {
-        let service = w3::Service::open(repo)?.source(variant)?;
         let dir = tempfile::tempdir().context("a temp dir for the served project")?;
         let port = reserve_port()?;
-        project(dir.path(), &service, stack)?;
+        project(dir.path(), repo, stack, variant)?;
 
         let port_set = format!("DESK_PORT={port}");
         let conns_set = format!("DESK_CONNECTIONS={connections}");
@@ -675,10 +655,9 @@ fn one_drain(
     api_key: &str,
     scenario: &str,
 ) -> Result<DrainPoint> {
-    let service = w3::Service::open(repo)?.source(w3::Variant::TaskPerConn)?;
     let dir = tempfile::tempdir().context("a temp dir for the served project")?;
     let port = reserve_port()?;
-    project(dir.path(), &service, Stack::Postgres)?;
+    project(dir.path(), repo, Stack::Postgres, w3::Variant::TaskPerConn)?;
 
     let sets = [
         format!("DESK_PORT={port}"),
@@ -836,10 +815,9 @@ pub fn transaction_at_deadline(
     drain_ms: u64,
     api_key: &str,
 ) -> Result<TxnOutcome> {
-    let service = w3::Service::open(repo)?.source(w3::Variant::TaskPerConn)?;
     let dir = tempfile::tempdir().context("a temp dir for the served project")?;
     let port = reserve_port()?;
-    project(dir.path(), &service, Stack::Postgres)?;
+    project(dir.path(), repo, Stack::Postgres, w3::Variant::TaskPerConn)?;
 
     let sets = [
         format!("DESK_PORT={port}"),

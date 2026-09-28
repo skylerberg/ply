@@ -37,7 +37,10 @@ const ROUTE: &str = "/health";
 /// The service with the ladder's driver appended, exactly as the rungs measure it.
 pub fn program(repo: &Path) -> Result<w3::Loaded> {
     let service = w3::Service::open(repo)?;
-    let source = format!("{}{DRIVER}", service.source(w3::Variant::Sequential)?);
+    let source = format!(
+        "{}{DRIVER}",
+        service.source(w3::Variant::Sequential, w3::Transport::Http)?
+    );
     w3::Loaded::parse(&source)
 }
 

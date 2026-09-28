@@ -16,12 +16,8 @@ use std::time::{Duration, Instant};
 use crate::serve::{Server, reserve_port};
 use crate::w3;
 
-/// The program the `ops` and `pool` sections run.
+/// The `ops` and `pool` sections' programs.
 const BENCH: &str = include_str!("../ply/w4.ply");
-
-fn desk_service(repo: &Path) -> Result<String> {
-    w3::Service::open(repo)?.source(w3::Variant::Sequential)
-}
 
 fn micros(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
@@ -733,19 +729,15 @@ impl Store {
     }
 }
 
-/// `examples/desk.ply` as a project `ply run --host` can be pointed at, with its store rewritten.
-fn project(dir: &Path, service: &str, store: Store) -> Result<()> {
-    let source = if store == Store::Twin {
-        let from = w3::main_header(service)?;
-        let narrowed = replace(service, from, &w3::twin_entry_row(from))?;
-        replace(
-            &narrowed,
-            "    run(port, count)",
-            "    run_memory(port, key, count)",
-        )?
-    } else {
-        service.to_string()
+/// The corpus's own program for one store, copied into a project `ply run --host` can be pointed
+/// at. There is nothing to rewrite: each store's entry point is written down.
+pub fn project(dir: &Path, repo: &Path, store: Store, variant: w3::Variant) -> Result<()> {
+    let mode = match store {
+        Store::Postgres => "postgres",
+        Store::Twin => "memory",
     };
+    let name = format!("desk-{}-{mode}.ply", variant.label());
+    let source = std::fs::read_to_string(repo.join("crates/ply-corpus/fixtures").join(name))?;
     std::fs::write(dir.join("desk.ply"), source)?;
     Ok(())
 }
@@ -760,17 +752,6 @@ fn settings(port: u16, connections: u32) -> Vec<String> {
     ]
 }
 
-fn replace(source: &str, from: &str, to: &str) -> Result<String> {
-    if !source.contains(from) {
-        bail!(
-            "`examples/desk.ply` no longer contains:\n{from}\n\
-             this harness rewrites it and must be updated with it rather than measuring a program \
-             it guessed at"
-        );
-    }
-    Ok(source.replace(from, to))
-}
-
 /// Throughput and tail latency per route and concurrency, over the real binary and socket.
 pub fn crud(
     repo: &Path,
@@ -781,7 +762,6 @@ pub fn crud(
     per_conn: u32,
     requests_per_point: u32,
 ) -> Result<Vec<w3::LoadPoint>> {
-    let service = desk_service(repo)?;
     let routes: [(&'static str, &'static str); 3] = [
         ("health (no db)", "/health"),
         ("items (1 select)", "/items"),
@@ -794,7 +774,7 @@ pub fn crud(
             let budget = concurrency * conns_per_thread * routes.len() as u32 + 1;
             let dir = tempfile::tempdir().context("a temp dir for the served project")?;
             let port = reserve_port()?;
-            project(dir.path(), &service, store)?;
+            project(dir.path(), repo, store, w3::Variant::Sequential)?;
             let sets = settings(port, budget);
             let mut args: Vec<&str> = vec!["--config-schema", "desk.config", "--trace", "off"];
             for set in &sets {
