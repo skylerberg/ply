@@ -1697,6 +1697,22 @@ exchange and a cache key want.
 what makes a simulation reproducible; that is why it is the scheduler's and not
 the host's. A run that is not simulated draws here, and `--host` binds it.
 
+### 13.18 `std.uuid`
+
+```ply
+pub type Uuid = { octets: Bytes }
+pub fn uuid_render(u: Uuid) -> String
+pub fn uuid_parse(text: String) -> Option<Uuid>
+pub fn uuid_v4() -> Uuid / {entropy.next}
+```
+
+A 128-bit identifier as its sixteen octets. `uuid_render` writes the canonical
+lower-case `8-4-4-4-12` form; `uuid_parse` reads it and accepts upper case, as
+RFC 9562 requires of a reader, while anything that is not that form is `None`
+rather than a raise. `uuid_v4` draws two machine words of `std.random` entropy
+and overwrites the version and variant bits, so a test pins it by handling
+`entropy.next`.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
