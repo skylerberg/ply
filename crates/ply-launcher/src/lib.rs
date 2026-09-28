@@ -114,17 +114,18 @@ pub fn run(
         .spawn(move || {
             match count {
                 Some(asked) => {
-                    let (answer, counted, sites) = crate::count::window(
+                    let (answer, counted, sites) = crate::count::window_sampled(
                         || {
                             ply_codegen::rt::unbounded(|| {
                                 artifact::enter(&artifact, &opened, argv, binds)
                             })
                         },
-                        asked.sites,
+                        asked.every(),
                     );
                     // The entry's answer stands: the run happened, and a count that could not
                     // be written is reported rather than replacing what the program did.
-                    if let Err(e) = crate::count::write(&asked.path, counted, &sites) {
+                    if let Err(e) = crate::count::write(&asked.path, counted, &sites, asked.every())
+                    {
                         eprintln!(
                             "the allocation count could not be written to {}: {e}",
                             asked.path.display()
