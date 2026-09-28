@@ -126,6 +126,17 @@ impl Program {
         Ok((started.elapsed(), value))
     }
 
+    /// One call of one entry point over a real database, for the harness's own questions: W5's
+    /// verification reads the desk's schema through the same program every measurement runs.
+    pub fn call_served(
+        &self,
+        host: &Arc<ply_host::Host>,
+        simple: &str,
+        args: Vec<Value>,
+    ) -> Result<(Duration, Value)> {
+        self.call_on(host, simple, args)
+    }
+
     /// The same, keeping the diagnostic, whose code the exhaustion row asserts.
     fn refusal_on(
         &self,
@@ -169,39 +180,37 @@ fn statement_of(value: &Value) -> Result<String> {
         .to_string())
 }
 
-/// The one table both handlers use, created from the program's own schema.
-pub struct Fixture {
+/// The one table both handlers use, installed by the program that reads it.
+///
+/// The harness holds no SQL of its own: the statements are the program's `ddl` and its seed, run
+/// through `std.db` over `net` exactly as a served rung runs them. A second client in another
+/// language would be a second implementation of the thing under measurement.
+pub struct Fixture<'a> {
+    program: &'a Program,
+    host: Arc<ply_host::Host>,
     url: String,
+    /// The pool the harness's own statements use, which is one connection: they are not measured.
+    size: usize,
 }
 
-impl Fixture {
-    pub fn create(url: &str, program: &Program) -> Result<Fixture> {
-        let ddl = program.ddl()?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("a runtime for the fixture")?;
-        runtime.block_on(async {
-            let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
-                .await
-                .with_context(|| format!("connecting to `{url}`"))?;
-            let handle = tokio::spawn(connection);
-            client
-                .batch_execute("drop table if exists part cascade")
-                .await
-                .context("dropping the fixture table")?;
-            for statement in &ddl {
-                client
-                    .batch_execute(statement)
-                    .await
-                    .with_context(|| format!("creating the fixture: `{statement}`"))?;
-            }
-            handle.abort();
-            Ok::<(), anyhow::Error>(())
-        })?;
-        Ok(Fixture {
+impl<'a> Fixture<'a> {
+    pub fn create(url: &str, program: &'a Program) -> Result<Fixture<'a>> {
+        let fixture = Fixture {
+            program,
+            host: Arc::new(ply_host::Host::new()),
             url: url.to_string(),
-        })
+            size: 1,
+        };
+        fixture.install()?;
+        Ok(fixture)
+    }
+
+    /// The fixture's schema, applied: the program's own `ddl`, over the one client that may run
+    /// `drop` and `create`.
+    fn install(&self) -> Result<()> {
+        let mut statements = vec!["drop table if exists part cascade".to_string()];
+        statements.extend(self.program.ddl()?);
+        crate::pg::sql(&self.url, &statements.join("; "))
     }
 
     /// Refills the table with the twin fixture's keys, dropping earlier writes.
@@ -211,27 +220,18 @@ impl Fixture {
 
     /// The same, at a chosen row count.
     pub fn fill(&self, rows: u32) -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
-            let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
-                .await
-                .context("connecting to reset the fixture")?;
-            let handle = tokio::spawn(connection);
-            client.batch_execute("truncate part").await?;
-            // The rows `bench.ply`'s `seeded_to` puts in the twin, so a keyed select hits on both.
-            client
-                .batch_execute(&format!(
-                    "insert into part (sku, name, price, n) \
-                     select 'sku-' || g, 'a part', 1.2500, g \
-                     from generate_series(0, {}) g",
-                    rows.saturating_sub(1)
-                ))
-                .await?;
-            handle.abort();
-            Ok::<(), anyhow::Error>(())
-        })
+        self.harness(
+            "refill",
+            vec![Value::Int(self.size as i64), Value::Int(i64::from(rows))],
+        )
+    }
+
+    /// One of the harness's own entry points, with the url it reaches the database at.
+    fn harness(&self, entry: &str, rest: Vec<Value>) -> Result<()> {
+        let mut args = vec![Value::str(&self.url)];
+        args.extend(rest);
+        self.program.call_on(&self.host, entry, args)?;
+        Ok(())
     }
 }
 
@@ -386,7 +386,7 @@ pub fn ops(
                 base += i64::from(total) + 1;
                 floor = floor.min(taken);
             }
-            out.push(point(workload, "rust-floor", concurrency, total, floor));
+            out.push(point(workload, "libpq-floor", concurrency, total, floor));
 
             let mut live = Duration::MAX;
             for _ in 0..repeats {
@@ -467,6 +467,9 @@ fn expect(answered: Value, want: u32, workload: Workload, rung: &str) -> Result<
 }
 
 /// The same statements, prepared once per connection, with no Ply anywhere.
+///
+/// The baseline is a C program over libpq rather than a client in this harness: a floor written in
+/// Rust would be the harness comparing itself with itself, which is the one thing a floor is for.
 fn floor_run(
     url: &str,
     workload: Workload,
@@ -474,82 +477,7 @@ fn floor_run(
     per: u32,
     base: i64,
 ) -> Result<Duration> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("a runtime for the floor")?;
-    runtime.block_on(async move {
-        let mut clients = Vec::new();
-        let mut connections = Vec::new();
-        for _ in 0..concurrency {
-            let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
-                .await
-                .context("connecting for the floor")?;
-            connections.push(tokio::spawn(connection));
-            clients.push(client);
-        }
-        let started = Instant::now();
-        // Spawned so `concurrency` statements are in flight at once, like the Ply rung's tasks.
-        let mut running = tokio::task::JoinSet::new();
-        for (slot, client) in clients.into_iter().enumerate() {
-            let from = base + (slot as i64) * i64::from(per);
-            running.spawn(async move { floor_task(client, workload, per, from).await });
-        }
-        while let Some(joined) = running.join_next().await {
-            joined.context("a floor task panicked")??;
-        }
-        let taken = started.elapsed();
-        for handle in connections {
-            handle.abort();
-        }
-        Ok(taken)
-    })
-}
-
-async fn floor_task(
-    client: tokio_postgres::Client,
-    workload: Workload,
-    per: u32,
-    base: i64,
-) -> Result<()> {
-    let select_all = client
-        .prepare("select sku, name, price, n from part order by sku limit 1")
-        .await?;
-    let select_by = client
-        .prepare("select sku, name, price, n from part where sku = $1")
-        .await?;
-    let insert = client
-        .prepare("insert into part (sku, name, price, n) values ($1, $2, $3, $4)")
-        .await?;
-    let price = rust_decimal::Decimal::new(12500, 4);
-    for i in 0..per {
-        match workload {
-            Workload::Select => {
-                client.query(&select_all, &[]).await?;
-            }
-            Workload::SelectParam => {
-                let sku = format!("sku-{}", i % 64);
-                client.query(&select_by, &[&sku]).await?;
-            }
-            Workload::Insert => {
-                let n = base + i64::from(i);
-                let sku = format!("sku-{n}");
-                client
-                    .execute(&insert, &[&sku, &"a part", &price, &n])
-                    .await?;
-            }
-            Workload::Transaction => {
-                let n = base + i64::from(i);
-                let sku = format!("sku-{n}");
-                client.batch_execute("begin").await?;
-                client
-                    .execute(&insert, &[&sku, &"a part", &price, &n])
-                    .await?;
-                client.batch_execute("commit").await?;
-            }
-        }
-    }
-    Ok(())
+    crate::pg::floor(url, workload.label(), concurrency, per, base)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -828,11 +756,11 @@ pub fn render(m: &Measurements) -> String {
                 .find(|p| {
                     p.workload == point.workload
                         && p.concurrency == point.concurrency
-                        && p.rung == "rust-floor"
+                        && p.rung == "libpq-floor"
                 })
                 .map(|p| p.per_operation_micros);
             let over = match floor {
-                Some(f) if point.rung != "rust-floor" && f > 0.0 => {
+                Some(f) if point.rung != "libpq-floor" && f > 0.0 => {
                     format!(
                         "{:+.1}us {:.2}x",
                         point.per_operation_micros - f,

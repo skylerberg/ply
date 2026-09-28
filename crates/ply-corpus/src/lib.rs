@@ -5,6 +5,7 @@ pub mod cmd;
 pub mod discharge;
 pub mod measure;
 pub mod payload;
+pub mod pg;
 pub mod pipeline;
 pub mod r4;
 pub mod regions;
