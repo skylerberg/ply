@@ -698,13 +698,8 @@ fn one_derivation_point(
 /// Every test the *project* declares, which is what `ply test` runs.
 pub fn run_tests(loaded: &ply_machine::load::Loaded, store: &mut Store) -> Result<Duration> {
     let started = Instant::now();
-    let selection = ply_test::select(
-        &loaded.check,
-        &loaded.hashes,
-        store,
-        &ply_eval::Plan::default(),
-    );
     let plan = ply_machine::tester::Plan::new(&loaded.check, None, false);
+    let selection = ply_test::fresh(&loaded.check, &plan.visible, &ply_eval::Plan::default());
     let selection = selection.keep(&plan.visible);
     let report =
         ply_machine::support::run_on_tier(loaded, &selection, ply_test::Hosting::hermetic(), store);

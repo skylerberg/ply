@@ -31,7 +31,11 @@ fn the_reconstructed_parser_passes_every_test_the_shipped_one_does() {
     };
 
     let mut store = ply_store::Store::open(dir.path()).expect("a cache");
-    let selection = ply_test::select(&loaded.check, &loaded.hashes, &store, &Plan::default());
+    let selection = ply_test::fresh(
+        &loaded.check,
+        &(0..loaded.check.tests.len()).collect::<Vec<_>>(),
+        &Plan::default(),
+    );
     assert!(
         selection.total >= 16,
         "the example declares {} tests; this comparison is worth what they cover",
