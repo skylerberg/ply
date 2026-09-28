@@ -280,13 +280,7 @@ impl Bodies {
                 );
             }
             // Fixed widths are held as tagged `Int`s, so one crossing the seam would read wrongly.
-            if unit
-                .source
-                .check
-                .defs
-                .get(name)
-                .is_some_and(|def| ply_eval::mentions_a_width(&def.scheme.ty))
-            {
+            if unit.source.mentions_width(name.as_str()) {
                 continue;
             }
             let constant = code.constant_index(name.as_str());
