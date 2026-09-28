@@ -21,6 +21,9 @@ static ON: AtomicBool = AtomicBool::new(false);
 static ATTRIBUTE: AtomicBool = AtomicBool::new(false);
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
+/// Attributions in flight. A window waits for this to reach zero before it answers, so its rows
+/// are the whole of its total rather than whatever had finished by the time it looked.
+static ATTRIBUTING: AtomicU64 = AtomicU64::new(0);
 /// Site -> what it allocated, in site order.
 static SITES: Mutex<BTreeMap<String, Counted>> = Mutex::new(BTreeMap::new());
 /// Instruction pointer -> the `ply_*` names at that frame, in the order the symbolizer reports
@@ -66,10 +69,20 @@ impl Counting {
 
     #[inline(never)]
     fn attribute(allocations: u64, bytes: u64) {
+        // Registering before the re-check is what makes the window's answer coherent: an
+        // attribution that counts has announced itself before the window can observe zero, so the
+        // window's wait sees it, and one that arrives after the window closed finds `ON` false and
+        // counts nothing.
+        ATTRIBUTING.fetch_add(1, Ordering::SeqCst);
+        if !ON.load(Ordering::SeqCst) {
+            ATTRIBUTING.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
         // Naming a site walks the stack, and the walk itself allocates: those allocations are the
         // instrument's, not the program's, so they are neither counted nor attributed.
         let already = INSIDE.with(|c| c.replace(true));
         if already {
+            ATTRIBUTING.fetch_sub(1, Ordering::SeqCst);
             return;
         }
         ALLOCS.fetch_add(allocations, Ordering::Relaxed);
@@ -81,6 +94,7 @@ impl Counting {
             entry.bytes += bytes;
         }
         INSIDE.with(|c| c.set(false));
+        ATTRIBUTING.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -179,6 +193,11 @@ pub fn window<R>(
     let answer = f();
     ON.store(false, Ordering::Relaxed);
     ATTRIBUTE.store(false, Ordering::Relaxed);
+    // Every attribution that was counted has announced itself, so waiting them out makes the rows
+    // below the whole of the totals above rather than a snapshot of how far they had got.
+    while ATTRIBUTING.load(Ordering::SeqCst) != 0 {
+        std::hint::spin_loop();
+    }
     let counted = Counted {
         allocations: ALLOCS.load(Ordering::Relaxed),
         bytes: BYTES.load(Ordering::Relaxed),
