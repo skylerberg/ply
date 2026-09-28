@@ -824,99 +824,24 @@ fn test_hash(hashes: &HashOutput, index: usize) -> Option<DefHash> {
     hashes.tests.get(index).copied()
 }
 
-/// What this run must execute. `plan` keys seeded tests, so a selection made against one plan
-/// says nothing about another.
-pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Plan) -> Selection {
-    let plan = plan.clone().normalized();
-    let total = check.tests.len();
-    let mut reasons = Vec::with_capacity(total);
-    let mut cached = Vec::new();
-    let mut to_run = Vec::new();
-    let mut narrowed: BTreeMap<usize, Plan> = BTreeMap::new();
-
-    for (index, test) in check.tests.iter().enumerate() {
-        let seeded = is_seeded(&test.footprint);
-        let hash = test_hash(hashes, index);
-        let stored = hash.map(|hash| store.get(result_key(hash, seeded, &plan)));
-
-        // A `random` plan is one claim per root, so a widened root set owes only unanswered roots.
-        let owed = match (seeded, hash) {
-            (true, Some(hash)) if writes_seed_keys(&plan) => plan
-                .roots
-                .iter()
-                .copied()
-                .filter(|&root| {
-                    !matches!(
-                        store.get(seed_key(hash, &Seed::root(root))),
-                        Some(Outcome::Pass)
-                    )
-                })
-                .collect(),
-            _ => plan.roots.clone(),
-        };
-
-        let reason = if test.nondet {
-            Reason::Nondet
-        } else {
-            match stored {
-                None => Reason::Unhashed,
-                // Every root already passed on its own, so the widened plan is proved.
-                Some(None) if owed.is_empty() => Reason::Cached,
-                Some(None) => Reason::New,
-                Some(Some(Outcome::Pass)) => Reason::Cached,
-                // Never trust a stored failure.
-                Some(Some(Outcome::Fail { .. })) => Reason::PreviousFailure,
-            }
-        };
-
-        match (reason, stored) {
-            (Reason::Cached, Some(Some(outcome))) => cached.push((index, outcome)),
-            (Reason::Cached, _) => cached.push((index, Outcome::Pass)),
-            _ => {
-                if owed.len() < plan.roots.len() {
-                    narrowed.insert(
-                        index,
-                        Plan {
-                            roots: owed,
-                            ..plan.clone()
-                        }
-                        .normalized(),
-                    );
-                }
-                to_run.push(index)
-            }
-        }
-        reasons.push(reason);
-    }
-
-    let footprints: Vec<(usize, Footprint)> = to_run
-        .iter()
-        .map(|&i| (i, check.tests[i].footprint.clone()))
-        .collect();
-    let groups = group_by_conflict(&footprints);
-    let parallelism = parallelism(
-        check.tests.iter().map(|t| &t.footprint),
-        &footprints,
-        &groups,
-    );
-
-    Selection {
-        total,
-        cached,
-        to_run,
-        groups,
-        reasons,
-        isolation: check
-            .tests
-            .iter()
-            .map(|t| Isolation::of(&t.footprint))
-            .collect(),
-        parallelism,
+/// Every test the run reports on, nothing answered from the cache, in one class. A caller with no
+/// program — a measurement, an audit — wants the same rows every time, and "all of them, fresh" is
+/// what it says in the vocabulary a program uses to decide. The store is not consulted at all: a
+/// selection made against one plan says nothing about another, so nothing here is read back.
+pub fn fresh(check: &CheckOutput, visible: &[usize], plan: &Plan) -> Selection {
+    Selection::chosen(
+        &Choice {
+            runs: visible.to_vec(),
+            groups: vec![visible.to_vec()],
+            reasons: Vec::new(),
+            narrowed: BTreeMap::new(),
+        },
+        check,
+        visible,
         plan,
-        narrowed,
-        out_of_scope: BTreeSet::new(),
-    }
+    )
 }
+
 
 /// Turns each failure's suspect list into a ranked attribution; `sources` are what `front` read.
 /// What the runtime keeps so a program can retry a mixture after the run that collected it: the

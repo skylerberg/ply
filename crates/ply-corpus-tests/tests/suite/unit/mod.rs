@@ -22,6 +22,12 @@ use ply_eval::Plan;
 use ply_store::Store;
 use std::path::Path;
 
+/// Every test the module declares: what a caller with no program means by "run them all".
+fn visible_of(check: &ply_ty::CheckOutput) -> Vec<usize> {
+    (0..check.tests.len()).collect()
+}
+
+
 #[test]
 fn a_generated_corpus_compiles_and_every_test_passes() {
     let dir = tempfile::tempdir().unwrap();
@@ -274,7 +280,7 @@ fn attaching_a_spec_to_every_definition_selects_no_test() {
 
     let front = front(&root).unwrap();
     let store = Store::open(&root).unwrap();
-    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
+    let selection = ply_test::fresh(&front.check, &visible_of(&front.check), &Plan::default());
     let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
     assert_eq!(
         selection.to_run.len(),
@@ -357,7 +363,7 @@ fn a_second_run_over_an_unchanged_corpus_selects_nothing() {
 
     let front = front(&root).unwrap();
     let store = Store::open(&root).unwrap();
-    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
+    let selection = ply_test::fresh(&front.check, &visible_of(&front.check), &Plan::default());
     let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
     assert_eq!(
         selection.to_run.len(),
@@ -388,7 +394,7 @@ fn verify(root: &Path) -> anyhow::Result<Verified> {
     let mut store = Store::open(root)?;
     store.clear()?;
 
-    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
+    let selection = ply_test::fresh(&front.check, &visible_of(&front.check), &Plan::default());
     let report = run_on_tier(
         &front,
         &selection,

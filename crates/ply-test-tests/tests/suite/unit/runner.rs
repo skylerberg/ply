@@ -3,7 +3,7 @@ use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
 use ply_test::{
     Executor, Hosting, InterpExecutor, Isolation, Parallelism, Reason, Search, Selection, Status,
-    group_by_conflict, run_with, select,
+    fresh, group_by_conflict, run_with,
 };
 use ply_ty::Mode;
 use ply_ty::{CheckOutput, DefHash, EffectAtom, Footprint, HashOutput, Resource};
@@ -72,7 +72,7 @@ impl Program {
     }
 
     fn select_under(&self, store: &Store, plan: &Plan) -> Selection {
-        select(&self.check, &self.hashes, store, plan)
+        fresh(&self.check, &(0..self.check.tests.len()).collect::<Vec<_>>(), plan)
     }
 
     /// Runs on the compiled C tier; `Unit::over_front` leaks a `&'static Unit`.
