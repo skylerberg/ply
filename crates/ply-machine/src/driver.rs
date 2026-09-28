@@ -2,7 +2,8 @@
 //! last one published, definition by definition, so it walks what moved and what depends on it.
 
 use crate::load::{
-    Discovered, Found, LoadError, Loaded, Stamp, anchor, discover, stamp_of, unreadable,
+    Discovered, Found, LoadError, Loaded, Stamp, anchor, discover, project_root, stamp_of,
+    unreadable,
 };
 use ply_codegen::c::producer::{self, KnownDef, KnownTest};
 use ply_prove::prove::{Claims, read_claims};
@@ -64,6 +65,81 @@ pub fn load_full(path: &Path) -> Result<Loaded, LoadError> {
 
 pub fn load_incremental(path: &Path, store: &mut Store) -> Result<Loaded, LoadError> {
     run(path, Mode::Incremental, Some(store))
+}
+
+/// One source as a caller's load found it: its path, the module the front end named it, and the text
+/// it read.
+#[derive(Clone, Debug)]
+pub struct FrontFile {
+    pub path: String,
+    pub name: String,
+    pub text: String,
+}
+
+/// The load over a front end a caller already ran.
+///
+/// `ply test` walks the tree and runs the compiler in order to report on both, so this side is
+/// handed the answer -- the frames, every source they name in the order their ids run, and the
+/// package roots the store files a dependency's sources under -- rather than walking and analysing a
+/// second time. The store's own bookkeeping is unchanged: it needs the files and the front end, and
+/// both are here.
+#[allow(clippy::too_many_arguments)]
+pub fn load_over_front(
+    path: &Path,
+    files: &[FrontFile],
+    packages: &[(String, String)],
+    dump: &str,
+    read: Duration,
+    front: Duration,
+    mode: Mode,
+    mut store: Option<&mut Store>,
+) -> Result<Loaded, LoadError> {
+    let root = project_root(path);
+    let whole_project = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+    let mut sources = SourceMap::new();
+    let mut states = Vec::with_capacity(files.len());
+    for file in files {
+        let path = PathBuf::from(&file.path);
+        let module = ModuleName::from_dotted(&file.name);
+        let content = ContentHash::of(file.text.as_bytes());
+        let source = sources.add(&path, file.text.clone());
+        let stamp = crate::load::stamp_of(&path);
+        states.push(FileState {
+            path,
+            module: module.clone(),
+            source,
+            text: Arc::from(file.text.as_str()),
+            content,
+            stamp,
+            shipped: crate::shelf::source(&module).is_some(),
+        });
+    }
+    if let Some(store) = store.as_deref_mut() {
+        store.set_packages(
+            packages
+                .iter()
+                .map(|(root, digest)| (PathBuf::from(root), digest.clone()))
+                .collect(),
+        );
+    }
+    Driver {
+        root,
+        mode,
+        store,
+        whole_project,
+        answer: Some(dump.to_string()),
+        project: SourceMap::new(),
+        manifest: None,
+        packages: Vec::new(),
+        sources,
+        files: states,
+        phases: Phases {
+            read,
+            front,
+            write_back: Duration::ZERO,
+        },
+    }
+    .finish()
 }
 
 pub fn run(path: &Path, mode: Mode, store: Option<&mut Store>) -> Result<Loaded, LoadError> {
@@ -236,6 +312,10 @@ struct Driver<'s> {
     mode: Mode,
     store: Option<&'s mut Store>,
     whole_project: bool,
+    /// The front end a caller already ran, which [`Driver::ask_the_port`] reads rather than pulls.
+    /// Nothing here walks or analyses when it is set: the caller did both, and the answer is the
+    /// one the report is about.
+    answer: Option<String>,
     /// The project's own files, which every placement of the shipped modules follows.
     project: SourceMap,
     /// The root's `ply.pkg`, when there is one: the front end checks it and places it last.
@@ -459,6 +539,7 @@ impl<'s> Driver<'s> {
             mode,
             store,
             whole_project,
+            answer: None,
             manifest,
             project: sources.clone(),
             sources,
@@ -537,6 +618,15 @@ impl<'s> Driver<'s> {
     }
 
     fn ask_the_port(&mut self) -> Result<Front, LoadError> {
+        if let Some(dump) = self.answer.take() {
+            let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
+            let started = Instant::now();
+            let answer = ply_ty::read_front(&dump, &ids).map_err(|e| {
+                self.seam_failed(&format!("the front end's answer does not read: {e}"))
+            });
+            self.phases.front += started.elapsed();
+            return answer;
+        }
         ply_codegen::c::producer::ensure_default();
         let started = Instant::now();
         let answer = self.whole();
