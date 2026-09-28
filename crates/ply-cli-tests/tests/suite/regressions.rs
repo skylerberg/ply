@@ -246,3 +246,37 @@ fn a_constructor_name_is_the_module_it_was_imported_from_and_not_any_module_that
     assert!(out.status.success(), "{text}");
     assert!(text.contains("1 passed"), "{text}");
 }
+
+/// An `Int` at or beyond `2^62` does not fit an immediate and is boxed, and a self tail call used
+/// to release that boxed word on every restart and again on the way out: the compiled tier aborted
+/// in `heap::release_last`, one iteration in, because the emitter bound the parameter local with
+/// no count and the release dropped it (card `6298c4dd`). The whole pipeline is the point here —
+/// the front end, the emitted C, the launcher and the exit code — so it is a `ply run` and not a
+/// unit test.
+#[test]
+fn a_boxed_int_passes_through_a_self_tail_call() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "m.ply",
+        "fn countdown(n: Int, k: Int) -> Int = if k == 0 { n } else { countdown(n, k - 1) }\n\
+         pub fn main() -> Unit {\n\
+           assert_eq(countdown(4611686018427387904, 1), 4611686018427387904);\n\
+           assert_eq(countdown(4611686018427387904, 1000), 4611686018427387904);\n\
+           assert_eq(countdown(0 - 4611686018427387905, 1), 0 - 4611686018427387905)\n\
+         }\n",
+    );
+    let out = ply(dir.path())
+        .args(["run", "--color", "never"])
+        .output()
+        .unwrap();
+    let said = || {
+        format!(
+            "exit {:?}\nstdout: {}\nstderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    assert_eq!(out.status.code(), Some(0), "{}", said());
+}
