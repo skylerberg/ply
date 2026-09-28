@@ -678,6 +678,15 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  # --- dead code the compiler is not allowed to see -------------------------
+  # `pub` items in a library are never `dead_code`, and `allow(dead_code)` silences the lint
+  # wherever else it would fire, so between them nothing reports a function no one calls.
+  local allow
+  while read -r allow; do
+    echo "FAIL: $allow silences dead-code warnings — delete what nothing calls instead" >&2
+    failures=$((failures + 1))
+  done < <(grep -rn -E "allow\((dead_code|unused)\)" --include=*.rs "$root/crates" "$root/benches" | sed "s|^$root/||" || true)
+
   for package in "${HOST_PACKAGES[@]}"; do
     if ! printf '%s\n' "${all_members[@]}" | grep -qx "$package"; then
       echo "FAIL: HOST_PACKAGES names '$package', which is not a workspace member" >&2
