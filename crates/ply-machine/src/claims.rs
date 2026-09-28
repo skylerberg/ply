@@ -36,14 +36,36 @@ use std::sync::{Arc, Mutex, mpsc};
 /// obligations and nowhere else.
 const EFFECT: &str = "prover";
 
-/// The module the payload's constructors are declared in, as a program-wide name.
-const PAYLOAD: &str = "claims";
+/// Where each type this side marshals is declared, by the type's own name.
+///
+/// A constructor crosses the substrate boundary by its program-wide name -- `claims.Raised` is not
+/// `proof.obligation.Raised` -- so building one says which module declares its type, and this is
+/// the only place that says it. `every_marshalled_type_is_declared_where_this_side_says` holds
+/// every row to the program, because a tag that names no declaration is a placeless `no arm of this
+/// match matched` the moment the program matches the value.
+const MARSHALLED: &[(&str, &str)] = &[
+    ("claims", "Evidence"),
+    ("claims", "Outcome"),
+    ("claims", "Point"),
+    ("claims", "Refusal"),
+    ("proof.domain", "Ty"),
+    ("proof.obligation", "Frame"),
+    ("proof.obligation", "Gap"),
+    ("proof.obligation", "Kind"),
+    ("proof.obligation", "Moved"),
+    ("proof.obligation", "Reason"),
+    ("proof.obligation", "Tier"),
+    ("proof.obligation", "Vacuity"),
+];
 
-/// The module the suite declares the vocabulary a run *decides* in. A constructor crosses the
-/// substrate boundary by its program-wide name — `claimer.Fresh` is not `proof.obligation.Fresh` —
-/// so marshalling one is a statement about where it is declared. Records cross by field name and
-/// need nothing here.
-const PROOF: &str = "proof.obligation";
+/// The module that declares `ty`, which is where a value of it crosses by.
+fn home(ty: &str) -> &'static str {
+    MARSHALLED
+        .iter()
+        .find(|(_, name)| *name == ty)
+        .unwrap_or_else(|| panic!("`{ty}` is not a type this side marshals"))
+        .0
+}
 
 const OPERATIONS: [(&str, &str); 13] = [
     ("configure", "ply_machine::claims::configure"),
@@ -436,10 +458,6 @@ fn typed_of(
     }
 }
 
-/// The `Ty` vocabulary `prove.domain` reads, marshalled where it is declared: a constructor crosses
-/// the substrate by its program-wide name, so `prove.domain.Con` is the one a program matches.
-const DOMAIN: &str = "proof.domain";
-
 fn typed_value(typed: Typed) -> PlyValue {
     record(vec![
         (
@@ -516,11 +534,11 @@ fn ty_value(ty: &ply_ty::Type) -> PlyValue {
     use ply_ty::Type;
     match ty {
         Type::Var(var) => {
-            crate::payload::ctor(DOMAIN, "Var", vec![PlyValue::Int(i64::from(var.0))])
+            crate::payload::ctor(home("Ty"), "Var", vec![PlyValue::Int(i64::from(var.0))])
         }
-        Type::Fn { .. } => crate::payload::ctor(DOMAIN, "Fn", Vec::new()),
+        Type::Fn { .. } => crate::payload::ctor(home("Ty"), "Fn", Vec::new()),
         Type::Record(fields) => crate::payload::ctor(
-            DOMAIN,
+            home("Ty"),
             "Record",
             vec![PlyValue::list(
                 fields
@@ -535,7 +553,7 @@ fn ty_value(ty: &ply_ty::Type) -> PlyValue {
             )],
         ),
         Type::Con(name, args) => crate::payload::ctor(
-            DOMAIN,
+            home("Ty"),
             "Con",
             vec![
                 PlyValue::str(name.as_str()),
@@ -1374,7 +1392,7 @@ fn refusal_value(refused: &Refused) -> PlyValue {
         Why::Trouble => "Trouble",
     };
     ctor(
-        PAYLOAD,
+        home("Refusal"),
         named,
         vec![record(vec![
             ("diags", diags_value(&refused.diagnostics)),
@@ -1393,9 +1411,9 @@ fn at_value(at: &At) -> PlyValue {
 
 fn kind_value(kind: &Kind) -> PlyValue {
     match kind {
-        Kind::Ensures(index) => ctor(PROOF, "Ensures", vec![count(*index)]),
+        Kind::Ensures(index) => ctor(home("Kind"), "Ensures", vec![count(*index)]),
         Kind::Law(label) => ctor(
-            PROOF,
+            home("Kind"),
             "Law",
             vec![option(label.as_deref().map(PlyValue::str))],
         ),
@@ -1404,14 +1422,14 @@ fn kind_value(kind: &Kind) -> PlyValue {
 
 fn frame_value(frame: &Frame) -> PlyValue {
     match frame {
-        Frame::Pure => ctor(PAYLOAD, "Pure", Vec::new()),
+        Frame::Pure => ctor(home("Frame"), "Pure", Vec::new()),
         Frame::Writes(writes) => {
             let named: Vec<String> = writes
                 .iter()
                 .map(|(effect, resource)| format!("{effect}[{resource}]"))
                 .collect();
             ctor(
-                PAYLOAD,
+                home("Frame"),
                 "Writes",
                 vec![strings(named.iter().map(String::as_str))],
             )
@@ -1478,7 +1496,7 @@ fn tier_value(tier: Tier) -> PlyValue {
         Tier::Property => "Property",
         Tier::Example => "Example",
     };
-    ctor(PROOF, named, Vec::new())
+    ctor(home("Tier"), named, Vec::new())
 }
 
 fn bindings_value(bindings: &[ply_prove::Binding]) -> PlyValue {
@@ -1505,7 +1523,7 @@ fn rules_value(rules: &[ply_prove::Rule]) -> PlyValue {
 fn evidence_value(evidence: &Evidence) -> PlyValue {
     match evidence {
         Evidence::Proof(c) => ctor(
-            PAYLOAD,
+            home("Evidence"),
             "Proof",
             vec![record(vec![
                 ("rules", rules_value(&c.rules)),
@@ -1518,7 +1536,7 @@ fn evidence_value(evidence: &Evidence) -> PlyValue {
             ])],
         ),
         Evidence::Cases(c) => ctor(
-            PAYLOAD,
+            home("Evidence"),
             "Sampled",
             vec![record(vec![
                 ("generated", tally(u64::from(c.generated))),
@@ -1547,14 +1565,14 @@ fn evidence_value(evidence: &Evidence) -> PlyValue {
 fn gap_value(gap: &Gap) -> PlyValue {
     match gap {
         Gap::UnhandledEffect(footprint) => ctor(
-            PAYLOAD,
+            home("Gap"),
             "UnhandledEffect",
             vec![option(
                 (!footprint.is_empty()).then(|| PlyValue::str(footprint.to_string())),
             )],
         ),
         Gap::Ungeneratable { param, ty } => ctor(
-            PAYLOAD,
+            home("Gap"),
             "Ungeneratable",
             vec![record(vec![
                 ("param", PlyValue::str(param.as_str())),
@@ -1566,7 +1584,7 @@ fn gap_value(gap: &Gap) -> PlyValue {
             diagnostic,
             ..
         } => ctor(
-            PAYLOAD,
+            home("Gap"),
             "Raised",
             vec![record(vec![
                 ("message", PlyValue::str(&diagnostic.message)),
@@ -1574,7 +1592,7 @@ fn gap_value(gap: &Gap) -> PlyValue {
             ])],
         ),
         Gap::GuardNotSampled { generated, witness } => ctor(
-            PAYLOAD,
+            home("Gap"),
             "GuardNotSampled",
             vec![record(vec![
                 ("generated", tally(u64::from(*generated))),
@@ -1582,11 +1600,11 @@ fn gap_value(gap: &Gap) -> PlyValue {
             ])],
         ),
         Gap::ReachesHost(footprint) => ctor(
-            PAYLOAD,
+            home("Gap"),
             "ReachesHost",
             vec![PlyValue::str(footprint.to_string())],
         ),
-        Gap::NotDrawn => ctor(PAYLOAD, "NotDrawn", Vec::new()),
+        Gap::NotDrawn => ctor(home("Gap"), "NotDrawn", Vec::new()),
     }
 }
 
@@ -1594,10 +1612,12 @@ fn gap_value(gap: &Gap) -> PlyValue {
 /// the tier, because a case that held says nothing about how the obligation as a whole was shown.
 fn point_value(point: &Point) -> PlyValue {
     match point {
-        Point::Kept(bindings) => ctor(PAYLOAD, "Kept", vec![bindings_value(bindings)]),
-        Point::Falsified(bindings) => ctor(PAYLOAD, "Falsified", vec![bindings_value(bindings)]),
-        Point::Rejected => ctor(PAYLOAD, "Rejected", Vec::new()),
-        Point::Undrawn(gap) => ctor(PAYLOAD, "Undrawn", vec![gap_value(gap)]),
+        Point::Kept(bindings) => ctor(home("Point"), "Kept", vec![bindings_value(bindings)]),
+        Point::Falsified(bindings) => {
+            ctor(home("Point"), "Falsified", vec![bindings_value(bindings)])
+        }
+        Point::Rejected => ctor(home("Point"), "Rejected", Vec::new()),
+        Point::Undrawn(gap) => ctor(home("Point"), "Undrawn", vec![gap_value(gap)]),
     }
 }
 
@@ -1607,10 +1627,14 @@ fn vacuity_value(vacuity: &Vacuity) -> PlyValue {
         (
             "why",
             match vacuity.kind {
-                VacuityKind::ProvedUnsatisfiable => ctor(PAYLOAD, "Unsatisfiable", Vec::new()),
-                VacuityKind::NoCaseKept { generated } => {
-                    ctor(PAYLOAD, "NoCaseKept", vec![tally(u64::from(generated))])
+                VacuityKind::ProvedUnsatisfiable => {
+                    ctor(home("Vacuity"), "Unsatisfiable", Vec::new())
                 }
+                VacuityKind::NoCaseKept { generated } => ctor(
+                    home("Vacuity"),
+                    "NoCaseKept",
+                    vec![tally(u64::from(generated))],
+                ),
             },
         ),
     ])
@@ -1619,7 +1643,7 @@ fn vacuity_value(vacuity: &Vacuity) -> PlyValue {
 fn outcome_value(discharge: &Discharge) -> PlyValue {
     match discharge {
         Discharge::Held(evidence) => ctor(
-            PAYLOAD,
+            home("Outcome"),
             "Held",
             vec![record(vec![
                 ("tier", tier_value(evidence.tier())),
@@ -1627,7 +1651,7 @@ fn outcome_value(discharge: &Discharge) -> PlyValue {
             ])],
         ),
         Discharge::Refuted(cx) => ctor(
-            PAYLOAD,
+            home("Outcome"),
             "Refuted",
             vec![record(vec![
                 ("bindings", bindings_value(&cx.bindings)),
@@ -1641,8 +1665,10 @@ fn outcome_value(discharge: &Discharge) -> PlyValue {
                 ),
             ])],
         ),
-        Discharge::Vacuous(vacuity) => ctor(PAYLOAD, "Vacuous", vec![vacuity_value(vacuity)]),
-        Discharge::Unattempted(gap) => ctor(PAYLOAD, "Unattempted", vec![gap_value(gap)]),
+        Discharge::Vacuous(vacuity) => {
+            ctor(home("Outcome"), "Vacuous", vec![vacuity_value(vacuity)])
+        }
+        Discharge::Unattempted(gap) => ctor(home("Outcome"), "Unattempted", vec![gap_value(gap)]),
     }
 }
 
@@ -1654,7 +1680,7 @@ fn reason_value(reason: Reason) -> PlyValue {
         Reason::Uncached => "Uncached",
         Reason::Refused => "CacheRefused",
     };
-    ctor(PROOF, named, Vec::new())
+    ctor(home("Reason"), named, Vec::new())
 }
 
 fn coverage_value(coverage: &ply_prove::Coverage) -> PlyValue {
@@ -1709,7 +1735,7 @@ fn moved_value(moved: Moved) -> PlyValue {
         Moved::Changed => "Changed",
         Moved::Never => "Never",
     };
-    ctor(PROOF, named, Vec::new())
+    ctor(home("Moved"), named, Vec::new())
 }
 
 fn changes_value(changes: &Changes) -> PlyValue {
@@ -1955,4 +1981,30 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
         plan: crate::simulation::prove_plan(&prove_opts, &sim_opts),
         binding,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MARSHALLED;
+
+    /// Every row has to name a module that declares the type. The tag this side builds is
+    /// `<module>.<constructor>` and the program matches it against the name its own spine gives the
+    /// constructor, so a type that moved module and left its row behind is a value no arm matches.
+    #[test]
+    fn every_marshalled_type_is_declared_where_this_side_says() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-cli/ply");
+        let loaded = crate::load::load(&dir).expect("the CLI tree loads");
+        for (home, ty) in MARSHALLED {
+            assert!(
+                loaded
+                    .check
+                    .ctors
+                    .values()
+                    .any(|c| c.type_name.as_str().rsplit('.').next() == Some(*ty)
+                        && c.module.as_str() == *home),
+                "no constructor of `{ty}` is declared in `{home}`, so a tag built from it names \
+                 nothing the program matches"
+            );
+        }
+    }
 }
