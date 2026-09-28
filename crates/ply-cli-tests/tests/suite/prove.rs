@@ -574,3 +574,51 @@ law \"shift agrees with base\" forall (x: Int) where x > 0 && x < 1000
         }
     }
 }
+
+/// A counterexample is not finished when it is found: the walk that makes it small is the
+/// program's, driven one question at a time through the shrink operations, and what a report shows
+/// is what the walk settled on. This is the end-to-end claim for that — the fixture
+/// `ply-prove-tests`' walk tests used, read where a person reads it.
+#[test]
+fn a_counterexample_is_shrunk_by_the_program_that_reads_it() {
+    // `n < 100` fails only at 100 and above, and the draw that finds it is as large as the type
+    // allows: a report that showed the draw would be unreadable.
+    let source = "\
+law \"the bound holds\"
+  forall (n: Int) {
+    n < 100
+  }
+";
+    let dir = project(source);
+    let out = ply(dir.path()).arg("prove").output().unwrap();
+    let text = stdout_of(&out);
+    assert!(text.contains("refuted"), "{text}");
+    assert!(
+        text.contains("shrank from"),
+        "a refutation reports what the walk started from: {text}"
+    );
+    let steps: u64 = text
+        .split("in ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(steps > 0, "the walk took no steps: {text}");
+    // And the value it settled on is smaller than the one it started from.
+    let settled: i64 = text
+        .split("→  n = ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(i64::MAX);
+    let started: i64 = text
+        .split("shrank from n = ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(i64::MIN);
+    assert!(
+        settled < started,
+        "the walk settled on {settled}, no smaller than the {started} it started from: {text}"
+    );
+}

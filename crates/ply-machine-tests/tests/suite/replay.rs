@@ -17,6 +17,11 @@ nondet effect prover {
   write configure[claims](options: Options) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
   read typed[claims]() -> Result<Typed, Refusal>
+  read shrink[claims](claim: Int) -> Result<Option<Int>, Refusal>
+  read offers[claims](i: Int) -> Result<Option<Offer>, Refusal>
+  read would[claims](i: Int, position: Int) -> Result<Bool, Refusal>
+  write accept[claims](i: Int, position: Int) -> Result<Unit, Refusal>
+  read settled[claims]() -> Result<Option<Settled>, Refusal>
   read outcomes[claims](keys: List<String>) -> List<Option<String>>
   read discharged[claims](choice: Choice) -> Result<Verdicts, Refusal>
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
@@ -25,6 +30,8 @@ nondet effect prover {
 }
 
 type Binder = { name: String, text: String, ty: Ty }
+type Offer = { here: Int, candidates: List<{ position: Int, size: Int }> }
+type Settled = { bindings: List<Binding>, original: List<Binding> }
 type Ty = | Var(Int) | Fn | Record(List<{ name: String, ty: Ty }>) | Con(String, List<Ty>)
 type Variant = { name: String, fields: List<Ty> }
 type Decl = { name: String, variants: List<Variant> }
