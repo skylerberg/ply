@@ -8,7 +8,7 @@ use tempfile::TempDir;
 const OUTER: &str = "\
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
   read reload[m]() -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -17,6 +17,13 @@ nondet effect machine {
   write drop[m]() -> Unit
 }
 
+type Front = {
+  dump: Bytes,
+  files: List<{ path: String, name: String, text: Bytes }>,
+  packages: List<{ root: String, digest: String }>,
+  read_ms: Int,
+  front_ms: Int,
+}
 type Options = Unit
 type Ended = Unit
 type Target = Unit
@@ -28,7 +35,7 @@ type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
 fn main() -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  match machine.load[m](\"inner\") {
+  match machine.load[m](\"inner\", None) {
     Ok(_) -> match machine.bound[m](\"inner.main\") {
       Ok(_) -> {
         let doubled = machine.call[m](\"inner.double\", [VInt(21)]);

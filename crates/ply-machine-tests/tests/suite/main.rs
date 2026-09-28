@@ -26,8 +26,8 @@ use std::sync::Arc;
 const OUTER: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String) -> Result<Target, Refusal>
-  read reload[m]() -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
@@ -89,6 +89,13 @@ type Bound = {
   warnings: List<Diag>,
 }
 
+type Front = {
+  dump: Bytes,
+  files: List<{ path: String, name: String, text: Bytes }>,
+  packages: List<{ root: String, digest: String }>,
+  read_ms: Int,
+  front_ms: Int,
+}
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
 
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
@@ -124,8 +131,8 @@ type Ended = {
   configuration: Json,
 }
 
-fn main(root: String) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
-  match machine.load[m](root) {
+fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+  match machine.load[m](root, Some(front)) {
     Ok(_t) -> {
       match machine.bound[m]("inner.main") {
         Ok(_b) -> {
@@ -189,7 +196,10 @@ fn entered_with(inner: &str, host: bool) -> Value {
     machine
         .call(
             "m.main",
-            vec![Value::str(project.path().display().to_string())],
+            vec![
+                Value::str(project.path().display().to_string()),
+                crate::fixture::handed(project.path()),
+            ],
             Span::DUMMY,
         )
         .expect("the outer main ran")
@@ -291,7 +301,10 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
     let raised = machine
         .call(
             "m.main",
-            vec![Value::str(project.path().display().to_string())],
+            vec![
+                Value::str(project.path().display().to_string()),
+                crate::fixture::handed(project.path()),
+            ],
             Span::DUMMY,
         )
         .expect_err("the outer main raises the refusal's message");
@@ -303,8 +316,8 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
 const OUTER_TWICE: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String) -> Result<Target, Refusal>
-  read reload[m]() -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
@@ -364,6 +377,13 @@ type Bound = {
   warnings: List<Diag>,
 }
 
+type Front = {
+  dump: Bytes,
+  files: List<{ path: String, name: String, text: Bytes }>,
+  packages: List<{ root: String, digest: String }>,
+  read_ms: Int,
+  front_ms: Int,
+}
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
 
 type Ended = { exit: Option<Int>, value: Option<String>, raised: Option<Diag>, rest: Int }
@@ -373,13 +393,13 @@ fn once() -> Option<String> / {machine.bound[m], machine.enter[m]} = {
   (machine.enter[m]()).value
 }
 
-fn main(root: String) -> Option<String> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
-  let _loaded = machine.load[m](root);
+fn main(root: String, front: Front) -> Option<String> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
+  let _loaded = machine.load[m](root, Some(front));
   once()
 }
 
-fn again() -> Option<String> / {machine.reload[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
-  let _again = machine.reload[m]();
+fn again(front: Front) -> Option<String> / {machine.reload[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+  let _again = machine.reload[m](front);
   let value = once();
   machine.drop[m]();
   value
@@ -408,18 +428,20 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     );
     let binding = Arc::new(registry.bind(&front.check).expect("the machine ops bind"));
 
-    let call = |entry: &str, arg: Option<String>| {
+    let call = |entry: &str, args: Vec<Value>| {
         let mut machine = Machine::new(&front);
         machine.set_compiled(unit.attach());
         machine.set_host_binding(Arc::clone(&binding));
-        let args = arg.iter().map(Value::str).collect::<Vec<Value>>();
         machine
             .call(entry, args, Span::DUMMY)
             .expect("the entry ran")
     };
 
     let root = project.path().display().to_string();
-    let first = call("m.main", Some(root));
+    let first = call(
+        "m.main",
+        vec![Value::str(root), crate::fixture::handed(project.path())],
+    );
     assert_eq!(option_text(&first).as_deref(), Some("1"));
     assert!(
         project.path().join(".ply-cache").is_dir(),
@@ -427,7 +449,7 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     );
 
     std::fs::write(&inner, "fn main() -> Int = 2\n").unwrap();
-    let second = call("m.again", None);
+    let second = call("m.again", vec![crate::fixture::handed(project.path())]);
     assert_eq!(
         option_text(&second).as_deref(),
         Some("2"),
@@ -442,8 +464,8 @@ fn a_configured_machine_binds_what_the_options_say() {
     let outer = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String) -> Result<Target, Refusal>
-  read reload[m]() -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
@@ -535,6 +557,13 @@ type Bound = {
   signals: Option<Signals>,
   warnings: List<Diag>,
 }
+type Front = {
+  dump: Bytes,
+  files: List<{ path: String, name: String, text: Bytes }>,
+  packages: List<{ root: String, digest: String }>,
+  read_ms: Int,
+  front_ms: Int,
+}
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
 type Ended = { exit: Option<Int>, value: Option<String>, raised: Option<Diag>, rest: Int }
 
@@ -570,9 +599,9 @@ fn opts(host: Bool) -> Options =
     cache: false,
   }
 
-fn main(root: String) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
   machine.configure[m](opts(true));
-  match machine.load[m](root) {
+  match machine.load[m](root, Some(front)) {
     Err(_) -> false,
     Ok(_t) -> {
       let bound = machine.bound[m]("inner.main");
@@ -605,7 +634,10 @@ fn main(root: String) -> Bool / {machine.configure[m], machine.load[m], machine.
     let answer = machine
         .call(
             "m.main",
-            vec![Value::str(project.path().display().to_string())],
+            vec![
+                Value::str(project.path().display().to_string()),
+                crate::fixture::handed(project.path()),
+            ],
             Span::DUMMY,
         )
         .expect("the outer main ran");
@@ -620,8 +652,8 @@ fn main(root: String) -> Bool / {machine.configure[m], machine.load[m], machine.
 const OUTER_CALL: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String) -> Result<Target, Refusal>
-  read reload[m]() -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
@@ -634,14 +666,21 @@ type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>
 type Options = Unit
 type Target = Unit
 type Bound = Unit
+type Front = {
+  dump: Bytes,
+  files: List<{ path: String, name: String, text: Bytes }>,
+  packages: List<{ root: String, digest: String }>,
+  read_ms: Int,
+  front_ms: Int,
+}
 type Refusal = Unit
 type Ended = Unit
 type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
-fn main(root: String) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  match machine.load[m](root) {
+fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
+  match machine.load[m](root, Some(front)) {
     Ok(_) -> match machine.bound[m]("inner.main") {
       Ok(_) -> {
         let doubled = machine.call[m]("inner.double", [VInt(21)]);
@@ -703,7 +742,10 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
     let answer = machine
         .call(
             "m.main",
-            vec![Value::str(project.path().display().to_string())],
+            vec![
+                Value::str(project.path().display().to_string()),
+                crate::fixture::handed(project.path()),
+            ],
             Span::DUMMY,
         )
         .expect("the outer main ran");
