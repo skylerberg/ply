@@ -1783,6 +1783,26 @@ return. A bare line feed also ends a record, because files in the world have
 one; the writer always writes CRLF. A trailing line break adds no record and an
 empty line is one empty field.
 
+### 13.22 `std.msgpack`
+
+```ply
+pub type Value =
+  | Nil | Flag(Bool) | Int(Int) | Float(Float)
+  | Text(String) | Bits(Bytes) | Items(List<Value>) | Fields(List<Field>)
+pub type Field = { key: Value, value: Value }
+pub fn msgpack_encode(v: Value) -> Bytes
+pub fn msgpack_decode(data: Bytes) -> Option<Value>
+```
+
+MessagePack: the compact binary form of the same data JSON carries. The subset
+is nil, booleans, integers in every width, float64, UTF-8 text, binary, arrays
+and maps; the writer emits the shortest *signed* encoding a value fits, and the
+reader accepts the `uint` widths too. A reader is total and answers `None` for a
+truncated input, a length that claims more bytes than remain, a value nested
+past 64, a `float32` or an extension type, or a `uint64` above `i63` — checking
+every length against what is left before walking it, so a hostile header cannot
+make it loop.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
