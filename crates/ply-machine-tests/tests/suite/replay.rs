@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// requires, and `Point` is the shape `claims.ply` reads.
 const REPLAY: &str = r#"
 nondet effect prover {
-  write configure[claims](options: Options) -> Unit
+  write configure[claims](options: Options, front: Front) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
   read typed[claims]() -> Result<Typed, Refusal>
   read shrink[claims](claim: Int) -> Result<Option<Int>, Refusal>
@@ -69,6 +69,13 @@ type Verdicts = Unit
 type Changes = Unit
 type Accepted = Unit
 type Binding = { name: String, ty: String, rendered: String }
+type Front = {
+  dump: Bytes,
+  files: List<{ path: String, name: String, text: Bytes }>,
+  packages: List<{ root: String, digest: String }>,
+  read_ms: Int,
+  front_ms: Int,
+}
 type Gap = Unit
 type Point = | Kept(List<Binding>) | Falsified(List<Binding>) | Rejected | Undrawn(Gap)
 
@@ -103,7 +110,7 @@ fn scan(index: Int, case: Int, seen: Answer) -> Answer / {prover.replay[claims]}
     }
   }
 
-fn main(root: String, index: Int) -> Answer / {prover.configure[claims], prover.collected[claims], prover.replay[claims]} = {
+fn main(root: String, index: Int, front: Front) -> Answer / {prover.configure[claims], prover.collected[claims], prover.replay[claims]} = {
   prover.configure[claims]({
     path: root,
     no_incremental: false,
@@ -135,7 +142,7 @@ fn main(root: String, index: Int) -> Answer / {prover.configure[claims], prover.
       steps: None,
       measure_reduction: false,
     },
-  });
+  }, front);
   match prover.collected[claims]() {
     Err(_) -> { falsified: 0 - 1, kept: 0, rejected: 0, first: "" },
     Ok(_) -> scan(index, 0, nothing()),
@@ -179,6 +186,7 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_span::Diagnostic> {
         vec![
             Value::str(project.path().display().to_string()),
             Value::Int(index),
+            crate::fixture::handed(project.path()),
         ],
         Span::DUMMY,
     )

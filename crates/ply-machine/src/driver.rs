@@ -67,6 +67,62 @@ pub fn load_incremental(path: &Path, store: &mut Store) -> Result<Loaded, LoadEr
     run(path, Mode::Incremental, Some(store))
 }
 
+/// The front end a CLI ran and handed over: the compiler's frames, every source they name in
+/// the order its ids run, the package roots the store files a dependency's sources under, and what
+/// the CLI's own load cost. This side reads the answer rather than walking and analysing again.
+#[derive(Clone, Debug)]
+pub struct HandedFront {
+    pub dump: String,
+    pub files: Vec<FrontFile>,
+    pub packages: Vec<(String, String)>,
+    pub read: Duration,
+    pub front: Duration,
+}
+
+pub fn handed_front_of(v: &ply_eval::Value, span: Span) -> Result<HandedFront, Diagnostic> {
+    use crate::payload::field_of;
+    let dump = String::from_utf8_lossy(field_of(v, "dump", span)?.as_bytes(span, "the frames")?)
+        .into_owned();
+    let mut files = Vec::new();
+    for item in field_of(v, "files", span)?.as_list(span, "files")?.iter() {
+        let text = String::from_utf8_lossy(field_of(item, "text", span)?.as_bytes(span, "a text")?)
+            .into_owned();
+        files.push(FrontFile {
+            path: field_of(item, "path", span)?
+                .as_str(span, "a path")?
+                .to_string(),
+            name: field_of(item, "name", span)?
+                .as_str(span, "a module")?
+                .to_string(),
+            text,
+        });
+    }
+    let mut packages = Vec::new();
+    for item in field_of(v, "packages", span)?
+        .as_list(span, "packages")?
+        .iter()
+    {
+        packages.push((
+            field_of(item, "root", span)?
+                .as_str(span, "a root")?
+                .to_string(),
+            field_of(item, "digest", span)?
+                .as_str(span, "a digest")?
+                .to_string(),
+        ));
+    }
+    let millis = |name: &str| -> Result<Duration, Diagnostic> {
+        let ms = field_of(v, name, span)?.as_int(span, name)?;
+        Ok(Duration::from_millis(u64::try_from(ms).unwrap_or(0)))
+    };
+    Ok(HandedFront {
+        dump,
+        files,
+        packages,
+        read: millis("read_ms")?,
+        front: millis("front_ms")?,
+    })
+}
 /// One source as a caller's load found it: its path, the module the front end named it, and the text
 /// it read.
 #[derive(Clone, Debug)]
