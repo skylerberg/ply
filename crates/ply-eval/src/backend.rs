@@ -28,16 +28,6 @@ impl Counters {
         }
     }
 
-    /// An answered [`Value::Bytes`].
-    pub fn note_bytes_out(&self) {
-        self.bytes_out.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// An answered [`Value::Str`].
-    pub fn note_str_out(&self) {
-        self.str_out.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn offers(&self) -> Offers {
         Offers {
             offered: self.offered.load(Ordering::Relaxed),
@@ -54,10 +44,6 @@ impl Counters {
     pub fn note_converted(&self, inward: u64, outward: u64) {
         self.converted_in.fetch_add(inward, Ordering::Relaxed);
         self.converted_out.fetch_add(outward, Ordering::Relaxed);
-    }
-
-    pub fn note_container_out(&self) {
-        self.containers_out.fetch_add(1, Ordering::Relaxed);
     }
 }
 

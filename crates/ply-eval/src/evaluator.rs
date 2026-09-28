@@ -72,10 +72,6 @@ impl<'a> Machine<'a> {
         self
     }
 
-    pub fn set_max_calls(&mut self, max: usize) {
-        self.max_calls = max.max(1);
-    }
-
     pub fn set_host_binding(&mut self, binding: Arc<HostBinding>) {
         self.binding = binding;
         self.share_host();
@@ -151,10 +147,6 @@ impl<'a> Machine<'a> {
 
     pub fn compiled_counts(&self) -> (u64, u64) {
         (self.compiled_entries.get(), self.compiled_declines.get())
-    }
-
-    pub fn compiled_refusals(&self) -> u64 {
-        self.compiled_refusals.get()
     }
 
     /// Every subsequent entry point resets to this stack's fixture rather than to an empty one.

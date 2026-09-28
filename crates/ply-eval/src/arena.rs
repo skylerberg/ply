@@ -109,11 +109,7 @@ pub struct Stats {
     pub element: usize,
 }
 
-impl Stats {
-    pub fn bytes_reserved(&self) -> usize {
-        self.chunks_allocated * CHUNK * (self.element + std::mem::size_of::<u32>())
-    }
-}
+impl Stats {}
 
 /// A bump arena whose scopes are regions, over interpreter values or the tier's heap words.
 pub struct Arena<V = Value> {
@@ -156,14 +152,6 @@ impl<V: Clone + Default> Arena<V> {
 
     pub fn journal(&mut self) {
         self.journal = Some(Vec::new());
-    }
-
-    pub fn journalled(&self) -> &[(Slot, V)] {
-        self.journal.as_deref().unwrap_or(&[])
-    }
-
-    pub fn journalling(&self) -> bool {
-        self.journal.is_some()
     }
 
     pub fn clear_journal(&mut self) {

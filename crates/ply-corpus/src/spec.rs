@@ -117,9 +117,4 @@ impl CorpusSpec {
         let spread = (1.0 - self.conflict_density) * (tasks - 1) as f64;
         1 + spread.round() as usize
     }
-
-    /// Generated `fn`s only; core modules and `stage` helpers are counted separately.
-    pub fn generated_defs(&self) -> usize {
-        self.modules * self.defs_per_module
-    }
 }
