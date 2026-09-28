@@ -1730,6 +1730,26 @@ padded form), a letter outside the alphabet, or bits left over in the final
 group. So a decode of an encode is the identity, and so is an encode of a
 decode.
 
+### 13.20 `std.url`
+
+```ply
+pub fn url_encode(text: String) -> String
+pub fn url_decode(text: String) -> Option<String>
+pub fn form_encode(text: String) -> String
+pub fn form_decode(text: String) -> Option<String>
+pub type Pair = { name: String, value: String }
+pub fn query_parse(query: String) -> Option<List<Pair>>
+pub fn query_build(pairs: List<Pair>) -> String
+```
+
+RFC 3986 percent-encoding — every byte outside `A-Za-z0-9-._~` as `%XX`
+— and the `application/x-www-form-urlencoded` dialect, which spells a space `+`
+and is what a query string and a form body carry. A decoder is total and answers
+`None` for a `%` not followed by two hex digits or for bytes that are not UTF-8.
+`query_parse` splits a query string into pairs in the order it names them (an
+empty part is passed over, a part with no `=` is a name with an empty value) and
+`query_build` spells them back with `form_encode` on both sides.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
