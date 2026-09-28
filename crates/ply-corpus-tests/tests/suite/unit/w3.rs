@@ -113,3 +113,25 @@ fn padding_a_value_adds_bytes_and_no_fields() {
 fn count(hay: &[u8], needle: &[u8]) -> usize {
     hay.windows(needle.len()).filter(|w| *w == needle).count()
 }
+
+#[test]
+fn the_load_client_is_a_program_that_typechecks() {
+    // What the socket measurements point `ply run --host` at, so a run measures a program that was
+    // checked where every other program is rather than one only exercised by a benchmark.
+    let source =
+        std::fs::read_to_string(repo().join("crates/ply-corpus/fixtures/load.ply")).unwrap();
+    assert!(source.contains("fn main() -> Int / {Load}"));
+    // The settings it reads, which are the `--set` names its caller passes.
+    for key in [
+        "LOAD_HOST",
+        "LOAD_PORT",
+        "LOAD_ROUTES",
+        "LOAD_CONNECTIONS",
+        "LOAD_PER_CONN",
+        "LOAD_TLS",
+        "LOAD_REPORT",
+    ] {
+        assert!(source.contains(key), "{key}");
+    }
+    Loaded::parse(&source).expect("the load client typechecks");
+}
