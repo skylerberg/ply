@@ -481,6 +481,22 @@ impl PlyProducer {
         let memo = memos.entry(program).or_default();
         match entered {
             Ok(answers) => {
+                if answers.is_empty() {
+                    // The emitter ran and answered no body at all. That is not "these bodies were
+                    // refused": it is that the emitter could not *answer* for the program -- a
+                    // module it cannot parse, a package it cannot resolve, or a check of its own it
+                    // does not pass -- and every root would otherwise report "did not answer",
+                    // which says nothing about why.
+                    self.failed.borrow_mut().insert(
+                        program,
+                        format!(
+                            "it answered nothing for the {} root(s) it was asked for, so no body \
+                             was emitted: a module it cannot parse, a package it cannot resolve, or \
+                             a program its own check refuses",
+                            missing.len()
+                        ),
+                    );
+                }
                 memo.answers.extend(answers);
                 let answered = missing
                     .iter()
