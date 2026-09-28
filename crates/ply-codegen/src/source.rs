@@ -20,11 +20,6 @@ pub struct Source {
     pub texts: HashMap<String, String>,
 }
 
-/// A test's root name, by its place among its module's tests; must match `ply_eval`'s runner.
-pub fn test_root_name(ordinal: usize) -> Symbol {
-    Symbol::new(format!("test#{ordinal}"))
-}
-
 /// A law's guard or body as a root, by its place among the module's laws; binders are its params.
 pub fn law_root_name(ordinal: usize, part: &str) -> Symbol {
     Symbol::new(format!("law#{ordinal}.{part}"))
