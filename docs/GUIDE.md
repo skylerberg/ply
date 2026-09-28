@@ -1553,6 +1553,9 @@ pub fn i16_be_at(b: Bytes, at: Int) -> Option<Int>
 pub fn i32_be_at(b: Bytes, at: Int) -> Option<Int>
 pub fn i64_be_at(b: Bytes, at: Int) -> Option<Int>
 pub fn slice_at(b: Bytes, at: Int, n: Int) -> Option<Bytes>
+pub fn join(pieces: List<Bytes>, sep: Bytes) -> Bytes
+pub fn hex_of(b: Bytes) -> String
+pub fn bytes_of_hex(text: String) -> Bytes
 ```
 
 Integers in a byte string, little-endian and big-endian: how a binary format and
@@ -1835,6 +1838,31 @@ to unwind; `many` stops when its parser consumes nothing, so a parser that can
 match the empty string still cannot loop, and nothing needs a fuel argument.
 This is the shape `std.json`, `std.db` and `std.http` already write by hand, as
 a module a user's parser can share.
+
+### 13.24 `std.string`
+
+```ply
+pub fn join(parts: List<String>, sep: String) -> String
+pub fn is_empty(text: String) -> Bool
+pub fn replace(text: String, from: String, to: String) -> String
+pub fn replace_first(text: String, from: String, to: String) -> String
+pub fn split_once(text: String, sep: String) -> Option<{ head: String, tail: String }>
+pub fn trim(text: String) -> String
+pub fn trim_start(text: String) -> String
+pub fn trim_end(text: String) -> String
+pub fn to_lower(text: String) -> String
+pub fn to_upper(text: String) -> String
+pub fn repeat(text: String, n: Int) -> String
+pub fn pad_left(text: String, width: Int, fill: String) -> String
+pub fn pad_right(text: String, width: Int, fill: String) -> String
+```
+
+The whole the prelude's string builtins do not make: `join` (which three shipped
+modules were each writing for themselves), `replace`, trim, ASCII case fold,
+repeat and pad. Every one is total — `replace` with an empty needle is the text
+unchanged rather than a loop, and the case fold touches `A-Z`/`a-z` and leaves
+every other character as it is. `std.bytes.join` is the same operation over
+`Bytes`.
 
 ## 14. The host boundary
 
