@@ -65,19 +65,40 @@ fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + i)
 /// The producer's mode is a process-wide flag, so the tests that set it take turns.
 static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The body of the test below, with a cache of its own.
+///
+/// The object cache is content-addressed on disk and shared with every other test binary in the
+/// run, so whether this build enters the emitter at all is a function of what ran before it: a
+/// warm entry means no ask, and the census below is about the build rather than about the cache.
+fn with_its_own_cache<T>(f: impl FnOnce() -> T) -> T {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let restore = std::env::var("PLY_C_CACHE").ok();
+    // SAFETY: the caller holds `MODE`, so this binary builds nothing else meanwhile, and the other
+    // binaries are other processes.
+    unsafe { std::env::set_var("PLY_C_CACHE", dir.path()) };
+    let out = f();
+    match restore {
+        Some(had) => unsafe { std::env::set_var("PLY_C_CACHE", had) },
+        None => unsafe { std::env::remove_var("PLY_C_CACHE") },
+    }
+    out
+}
+
 fn built_and_checked() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", PROGRAM)]);
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
-    ));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    assert!(refused.is_empty(), "{refused:?}");
-
-    let (asked, answered) = producer::with_current(|p| p.counts()).expect("the producer is built");
+    let (native, (asked, answered)) = with_its_own_cache(|| {
+        let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+        let loaded = load(&[("m", PROGRAM)]);
+        let source: &'static Source = Box::leak(Box::new(
+            Source::from_front(loaded.front).with_texts(loaded.texts.clone()),
+        ));
+        let names: Vec<String> = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+        assert!(refused.is_empty(), "{refused:?}");
+        let counts = producer::with_current(|p| p.counts()).expect("the producer is built");
+        (native, counts)
+    });
     assert!(
         answered > 0,
         "the Ply emitter answered nothing of {asked} asked, so nothing below is about it"
