@@ -374,7 +374,7 @@ impl Stack {
 }
 
 /// `examples/desk.ply` as a project `ply run --host` can be pointed at.
-fn project(dir: &Path, service: &str, stack: Stack) -> Result<()> {
+pub fn project(dir: &Path, service: &str, stack: Stack) -> Result<()> {
     let source = match stack {
         Stack::Postgres => service.to_string(),
         Stack::PostgresTls => {
