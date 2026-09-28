@@ -2,15 +2,9 @@ use crate::fixture::Compiled;
 use ply_eval::Plan;
 use ply_span::{Diagnostic, Severity, SourceId, Span, codes};
 use ply_store::Store;
-use ply_test::{Executor, RunReport, Skipped, Status, Verdict, fresh, run_with};
+use ply_test::{Executor, RunReport, Skipped, Status, Verdict, run_with};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Every test the module declares: what a caller with no program means by "run them all".
-fn visible_of(check: &ply_ty::CheckOutput) -> Vec<usize> {
-    (0..check.tests.len()).collect()
-}
-
 
 struct TempRoot(PathBuf);
 
@@ -70,7 +64,8 @@ fn report_for(executor: &Answering) -> RunReport {
     let root = TempRoot::new();
     let mut store = root.store();
     let compiled = Compiled::anonymous(CORPUS);
-    let selection = fresh(&compiled.check, &visible_of(&compiled.check), &Plan::default());
+    let selection =
+        crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     run_with(
         &selection,
         &compiled.check,
@@ -162,7 +157,8 @@ fn an_abandoned_run_is_no_verdict_and_is_recorded_nowhere() {
     let root = TempRoot::new();
     let mut store = root.store();
     let compiled = Compiled::anonymous(CORPUS);
-    let selection = fresh(&compiled.check, &visible_of(&compiled.check), &Plan::default());
+    let selection =
+        crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     let report = run_with(
         &selection,
         &compiled.check,

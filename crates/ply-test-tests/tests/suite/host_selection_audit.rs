@@ -6,17 +6,11 @@ use ply_eval::host::{
 use ply_eval::{Plan, Value};
 use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
-use ply_test::{Hosting, InterpExecutor, Reason, Search, fresh};
-use ply_ty::{CheckOutput, Resource};
+use ply_test::{Hosting, InterpExecutor, Reason, Search};
+use ply_ty::Resource;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Every test the module declares: what a caller with no program means by "run them all".
-fn visible_of(check: &ply_ty::CheckOutput) -> Vec<usize> {
-    (0..check.tests.len()).collect()
-}
-
 
 struct TempRoot(PathBuf);
 
@@ -97,7 +91,8 @@ fn run(
     store: &mut Store,
     binding: Option<&Arc<HostBinding>>,
 ) -> ply_test::RunReport {
-    let selection = fresh(&compiled.check, &visible_of(&compiled.check), &Plan::default());
+    let selection =
+        crate::fixture::select(&compiled.check, &compiled.hashes, store, &Plan::default());
     let hosting = match binding {
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
@@ -117,7 +112,8 @@ fn run(
 }
 
 fn reason(compiled: &Compiled, store: &Store, name: &str) -> Reason {
-    let selection = fresh(&compiled.check, &visible_of(&compiled.check), &Plan::default());
+    let selection =
+        crate::fixture::select(&compiled.check, &compiled.hashes, store, &Plan::default());
     let index = compiled
         .check
         .tests
