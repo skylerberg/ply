@@ -850,17 +850,17 @@ pub fn transaction_at_deadline(
         args.push(s);
     }
 
-    let mut blocker = Blocker::open(url)?;
-    let orders_before = count_orders(url)?;
-    let sequence_before = last_order_id(url)?;
+    let queries = Queries::open(url)?;
+    let blocker = crate::pg::Lock::hold(url, "select 1 from items where sku = 'bolt' for update")?;
+    let orders_before = queries.order_count()?;
+    let sequence_before = queries.last_order_id()?;
 
     let mut server = Server::start_with(ply, dir.path(), &args, Stdio::piped())?;
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     w3::wait_until_serving(&mut server, addr)?;
 
-    blocker.lock_bolt()?;
     let order = post_order(addr, api_key)?;
-    wait_until_blocked(url, Duration::from_secs(30))?;
+    queries.wait_until_blocked(Duration::from_secs(30))?;
 
     let pid = server.pid().context("the server has already been reaped")?;
     let signalled = Instant::now();
@@ -872,9 +872,9 @@ pub fn transaction_at_deadline(
     // Released only now, so nothing the desk left behind is resolved by this harness.
     blocker.release()?;
 
-    let orders_after = count_orders(url)?;
-    let sequence_after = last_order_id(url)?;
-    let sessions_left = idle_in_transaction(url)?;
+    let orders_after = queries.order_count()?;
+    let sequence_after = queries.last_order_id()?;
+    let sessions_left = queries.idle_in_transaction()?;
     Ok(TxnOutcome {
         sequence_before,
         sequence_after,
@@ -907,56 +907,62 @@ fn verdict_of(output: &str) -> String {
     }
 }
 
-/// A second session holding a row lock, so the desk's `UPDATE` blocks.
-struct Blocker {
-    runtime: tokio::runtime::Runtime,
-    client: Option<tokio_postgres::Client>,
-    handle: Option<tokio::task::JoinHandle<()>>,
+/// The harness's own questions of the desk's schema, asked by the bench program.
+///
+/// The SQL is the program's (`w4.ply`'s `order_count` and friends) and it runs over `std.db` the way
+/// every measurement does, so the harness reads the database with the same client the desk writes it
+/// with rather than with a second one in Rust.
+struct Queries {
+    program: crate::w4::Program,
+    host: Arc<ply_host::Host>,
+    url: String,
 }
 
-impl Blocker {
-    fn open(url: &str) -> Result<Blocker> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("a runtime for the blocking session")?;
-        let (client, handle) = runtime.block_on(async {
-            let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
-                .await
-                .with_context(|| format!("connecting to `{url}`"))?;
-            let handle = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            Ok::<_, anyhow::Error>((client, handle))
-        })?;
-        Ok(Blocker {
-            runtime,
-            client: Some(client),
-            handle: Some(handle),
+impl Queries {
+    fn open(url: &str) -> Result<Queries> {
+        Ok(Queries {
+            program: crate::w4::Program::parse()?,
+            host: Arc::new(ply_host::Host::new()),
+            url: url.to_string(),
         })
     }
 
-    fn lock_bolt(&mut self) -> Result<()> {
-        let client = self.client.as_ref().context("the session is closed")?;
-        self.runtime.block_on(async {
-            client.batch_execute("begin").await?;
-            client
-                .batch_execute("select 1 from items where sku = 'bolt' for update")
-                .await?;
-            Ok::<(), anyhow::Error>(())
-        })
+    fn ask(&self, entry: &str) -> Result<i64> {
+        let (_, value) = self.program.call_served(
+            &self.host,
+            entry,
+            vec![Value::str(&self.url), Value::Int(1)],
+        )?;
+        match value {
+            Value::Int(n) => Ok(n),
+            other => bail!("`{entry}` answered {other}, which is not a count"),
+        }
     }
 
-    fn release(&mut self) -> Result<()> {
-        if let Some(client) = &self.client {
-            self.runtime
-                .block_on(async { client.batch_execute("rollback").await })?;
+    fn order_count(&self) -> Result<i64> {
+        self.ask("order_count")
+    }
+
+    fn last_order_id(&self) -> Result<i64> {
+        self.ask("last_order_id")
+    }
+
+    fn idle_in_transaction(&self) -> Result<i64> {
+        self.ask("idle_in_transaction")
+    }
+
+    /// Wait until some backend is waiting on a lock, which is the desk's `UPDATE`.
+    fn wait_until_blocked(&self, within: Duration) -> Result<()> {
+        let deadline = Instant::now() + within;
+        loop {
+            if self.ask("waiting_on_lock")? > 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("no backend was waiting on a lock after {within:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        self.client = None;
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-        Ok(())
     }
 }
 
@@ -981,58 +987,6 @@ fn post_order(addr: std::net::SocketAddr, api_key: &str) -> Result<std::thread::
         let mut buf = [0u8; 1024];
         let _ = std::io::Read::read(&mut socket, &mut buf);
     }))
-}
-
-fn count_orders(url: &str) -> Result<i64> {
-    query_one_i64(url, "select count(*) from orders")
-}
-
-fn last_order_id(url: &str) -> Result<i64> {
-    query_one_i64(url, "select last_value from orders_id_seq")
-}
-
-fn idle_in_transaction(url: &str) -> Result<i64> {
-    query_one_i64(
-        url,
-        "select count(*) from pg_stat_activity \
-         where state = 'idle in transaction' and application_name <> 'ply-corpus'",
-    )
-}
-
-fn query_one_i64(url: &str, sql: &'static str) -> Result<i64> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
-        let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
-            .await
-            .with_context(|| format!("connecting to `{url}`"))?;
-        let handle = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let row = client.query_one(sql, &[]).await?;
-        handle.abort();
-        Ok(row.get::<_, i64>(0))
-    })
-}
-
-/// Wait until some backend is waiting on a lock, which is the desk's `UPDATE`.
-fn wait_until_blocked(url: &str, within: Duration) -> Result<()> {
-    let deadline = Instant::now() + within;
-    loop {
-        let waiting = query_one_i64(
-            url,
-            "select count(*) from pg_stat_activity \
-             where wait_event_type = 'Lock' and state = 'active'",
-        )?;
-        if waiting > 0 {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("no backend was waiting on a lock after {within:?}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 #[derive(Clone, Debug, Serialize)]
