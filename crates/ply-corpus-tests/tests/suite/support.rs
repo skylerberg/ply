@@ -7,6 +7,11 @@ pub fn ply() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ply")
 }
 
+/// The repository root, which is where the corpus package is reachable by path.
+pub fn repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
 /// Call a `gen.*` entry of the corpus package and answer its text payload.
 fn call(entry: &str, args: Vec<ply_eval::Value>, cwd: &Path) -> String {
     let value = ply_corpus::cmd::run_ply_subcommand(entry, args, cwd, &ply())
