@@ -277,6 +277,7 @@ fn sample() -> Front {
         keys: Default::default(),
         emitter_roots: Vec::new(),
         emitter_ctors: Vec::new(),
+        emitter_constants: BTreeSet::new(),
         hash_order: vec![
             Hashed::Def(sym("std.db.Db")),
             Hashed::Def(sym("std.db.query")),
