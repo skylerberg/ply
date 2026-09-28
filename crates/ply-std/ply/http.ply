@@ -1339,6 +1339,34 @@ pub fn request<[l]>(
     },
   }
 
+// A connection kept open for more than one exchange: `dial`, then `ask` as many times as the server
+// allows, then `close`. A load generator wants this — a request on a fresh connection measures the
+// handshake as much as it measures the request — and `request` above is its one-shot case.
+pub type Connection = { handle: Int, host: String, port: Int }
+
+pub fn dial<[l]>(
+  host: String,
+  port: Int,
+  limits: Limits,
+) -> Result<Connection, ClientError> / {net.connect[l]} =
+  match net.connect[l](host, port, limits.connect_timeout_ms) {
+    None -> Err(Unreachable),
+    Some(c) -> {
+      let opened: Connection = { handle: c, host: host, port: port };
+      Ok(opened)
+    },
+  }
+
+/// One exchange on a connection that stays open: the request is sent, its answer read whole, and the
+/// connection left for the next `ask`.
+pub fn ask<[l]>(
+  c: Connection,
+  req: Request,
+  limits: Limits,
+) -> Result<Response, ClientError> / {net.send[l], net.recv[l]} = exchange[l](c.handle, req, limits)
+
+pub fn close<[l]>(c: Connection) -> Unit / {net.close[l]} = net.close[l](c.handle)
+
 fn exchange<[l]>(
   c: Int,
   req: Request,
@@ -3037,4 +3065,46 @@ test "a peer that stops taking bytes is reported as not sent" {
     net.close[conn](c) -> (),
   };
   assert_eq(answer, Err(NotSent))
+}
+
+test "a connection is dialled once and asked twice" {
+  let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+  with_cell[inbox]([Some(answer), Some(answer)]) { inbox -> {
+    with_cell[dialled](0) { dialled -> {
+      with_cell[closed](0) { closed -> {
+        let both = handle {
+          match dial[conn]("example.org", 80, client_limits()) {
+            Err(_) -> (Err(Unreachable), Err(Unreachable)),
+            Ok(c) -> {
+              let first = ask[conn](c, request_to(Get, "example.org", "/a", b""), client_limits());
+              let second = ask[conn](c, request_to(Get, "example.org", "/b", b""), client_limits());
+              close[conn](c);
+              (first, second)
+            },
+          }
+        } with {
+          net.connect[conn](host, port, t) -> {
+            cell_set(dialled, cell_get(dialled) + 1);
+            Some(7)
+          },
+          net.recv[conn](c, max, t) -> {
+            let queued = cell_get(inbox);
+            cell_set(inbox, rest_answers(queued));
+            next_answer(queued)
+          },
+          net.send[conn](c, payload, t) -> Some(bytes_len(payload)),
+          net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
+        };
+        // One connection for both exchanges, and closed once at the end.
+        assert_eq(cell_get(dialled), 1);
+        assert_eq(cell_get(closed), 1);
+        let expected = Ok({
+          status: 200,
+          headers: set_header(empty_headers(), "content-length", "5"),
+          body: b"hello",
+        });
+        assert_eq(both, (expected, expected))
+      } }
+    } }
+  } }
 }
