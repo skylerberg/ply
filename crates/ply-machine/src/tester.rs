@@ -28,7 +28,6 @@ use serde_json::{Value, json as jsonlit};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
 
 /// The effect `crates/ply-cli/ply/tests.ply` declares. It is lent to that one entry and nowhere
 /// else: no other command runs a corpus.
@@ -63,63 +62,6 @@ const OPERATIONS: [(&str, &str); 12] = [
 /// kilobytes. Reserved, not committed.
 const RUN_STACK: usize = 256 << 20;
 
-/// The front end `ply test` ran and handed over: the compiler's frames, every source they name in
-/// the order its ids run, the package roots the store files a dependency's sources under, and what
-/// the CLI's own load cost. This side reads the answer rather than walking and analysing again.
-#[derive(Clone, Debug)]
-pub struct HandedFront {
-    pub dump: String,
-    pub files: Vec<crate::driver::FrontFile>,
-    pub packages: Vec<(String, String)>,
-    pub read: Duration,
-    pub front: Duration,
-}
-
-fn front_of(v: &PlyValue, span: Span) -> Result<HandedFront, Diagnostic> {
-    use crate::payload::field_of;
-    let dump = String::from_utf8_lossy(field_of(v, "dump", span)?.as_bytes(span, "the frames")?)
-        .into_owned();
-    let mut files = Vec::new();
-    for item in field_of(v, "files", span)?.as_list(span, "files")?.iter() {
-        let text = String::from_utf8_lossy(field_of(item, "text", span)?.as_bytes(span, "a text")?)
-            .into_owned();
-        files.push(crate::driver::FrontFile {
-            path: field_of(item, "path", span)?
-                .as_str(span, "a path")?
-                .to_string(),
-            name: field_of(item, "name", span)?
-                .as_str(span, "a module")?
-                .to_string(),
-            text,
-        });
-    }
-    let mut packages = Vec::new();
-    for item in field_of(v, "packages", span)?
-        .as_list(span, "packages")?
-        .iter()
-    {
-        packages.push((
-            field_of(item, "root", span)?
-                .as_str(span, "a root")?
-                .to_string(),
-            field_of(item, "digest", span)?
-                .as_str(span, "a digest")?
-                .to_string(),
-        ));
-    }
-    let millis = |name: &str| -> Result<Duration, Diagnostic> {
-        let ms = field_of(v, name, span)?.as_int(span, name)?;
-        Ok(Duration::from_millis(u64::try_from(ms).unwrap_or(0)))
-    };
-    Ok(HandedFront {
-        dump,
-        files,
-        packages,
-        read: millis("read_ms")?,
-        front: millis("front_ms")?,
-    })
-}
-
 /// One process's machine. The load, the store and the binding are opened on a thread of their own
 /// and live as long as this does, so a `--watch` iteration over an unmoved tree re-derives nothing.
 /// What `ply test` is configured with, as plain data: the shell's parsed flags convert into
@@ -129,7 +71,7 @@ pub struct TestOptions {
     pub path: std::path::PathBuf,
     /// The front end the CLI ran. A run without one is refused rather than loading again: `ply
     /// test` is the only caller that starts one, and it always hands its answer over.
-    pub front: Option<HandedFront>,
+    pub front: Option<crate::driver::HandedFront>,
     pub json: bool,
     pub explain: bool,
     pub no_cache: bool,
@@ -257,7 +199,7 @@ impl HostHandler for Site {
                     .ok_or_else(|| unasked("configure", req.span))?;
                 let mut options = test_options_of(options, req.span)?;
                 options.front = match req.args.get(1) {
-                    Some(front) => Some(front_of(front, req.span)?),
+                    Some(front) => Some(crate::driver::handed_front_of(front, req.span)?),
                     None => None,
                 };
                 *self.args.lock().unwrap_or_else(|e| e.into_inner()) = options;
