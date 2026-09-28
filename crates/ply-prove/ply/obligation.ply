@@ -15,6 +15,8 @@
 // The laws are the vocabulary all of this speaks: a law names definitions, and rewriting the law
 // changes its targets' spec, so a law's text is part of the spec of everything it names.
 
+import std.json (Array, Json, Null, Number, Object, Str)
+
 // What an obligation is about: one of a definition's own `ensures` clauses, or a whole law.
 pub type Kind = | Ensures(Int) | Law(Option<String>)
 
@@ -360,6 +362,152 @@ fn a_clause(owner: String, tier: Option<Tier>) -> ClaimRow =
 fn a_law(owner: String, tier: Option<Tier>) -> ClaimRow =
   a_row(owner, Law(None), tier, tier != None, tier != None)
 
+// The rules are the prover's own document, placed under `rules` as it wrote them: a certificate
+// crosses once, and what a rule is called is its business rather than this report's.
+pub type Certificate = { rules: Json, steps: Int, guard_satisfiable: Bool, sorts: List<String> }
+
+pub type Instantiation = { var: String, ty: String }
+
+pub type Cases = {
+  generated: Int,
+  kept: Int,
+  rejected: Int,
+  roots: List<Int>,
+  instantiations: List<Instantiation>,
+}
+
+pub type Evidence = | Proof(Certificate) | Sampled(Cases)
+
+pub type Counter = {
+  bindings: List<Binding>,
+  original: List<Binding>,
+  shrinks: Int,
+  root: Int,
+  case: Int,
+  seed: Option<String>,
+}
+
+// What re-running one case answered. `Kept` is a point the guard admitted and the body held,
+// `Refuted` one the guard admitted and the body did not, and `Rejected` one the guard drew the
+// line on: exactly what one turn of a search over cases sees.
+pub type Point = | Kept(List<Binding>) | Falsified(List<Binding>) | Rejected | Undrawn(Gap)
+
+pub type Outcome =
+  | Held({ tier: Tier, evidence: Evidence })
+  | Refuted(Counter)
+  // Where the claim is written, as the CLI points at it, spelled out so this package carries no
+  // opinion about a label.
+  | Vacuous({ guard: { module: Int, start: Int, end: Int }, why: Vacuity })
+  | Unattempted(Gap)
+// --- What a discharge has to say for itself ---------------------------------
+
+fn field(fields: Map<String, Json>, key: String) -> Json =
+  match map_get(fields, key) { Some(v) -> v, None -> Null }
+
+fn text_at(fields: Map<String, Json>, key: String) -> String =
+  match field(fields, key) { Str(s) -> s, _ -> "" }
+
+fn int_at(fields: Map<String, Json>, key: String) -> Int =
+  match field(fields, key) {
+    Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 },
+    _ -> 0,
+  }
+
+// A rule the prover named with fields carries them under its own tag, and one that needs none is
+// the tag alone.
+type Tagged = { tag: String, body: Map<String, Json> }
+
+fn no_fields() -> Map<String, Json> = map_new()
+
+fn tagged(m: Map<String, Json>) -> Tagged =
+  map_fold(m, { tag: "", body: no_fields() }, |acc: Tagged, k: String, v: Json|
+    if acc.tag == "" { { tag: k, body: match v { Object(fs) -> fs, _ -> no_fields() } } }
+    else { acc })
+
+fn spaced(tag: String) -> String = joined(string_split(tag, "_"), " ")
+
+fn rule_tag(r: Json) -> String = match r { Str(tag) -> tag, Object(m) -> tagged(m).tag, _ -> "" }
+
+fn unfolds(r: Json) -> Bool = rule_tag(r) == "unfold"
+
+// An unfolding is counted rather than named, so a certificate that unfolded a hundred times is
+// still one line.
+fn rule_text(r: Json) -> String =
+  match r {
+    Str(tag) -> spaced(tag),
+    Object(m) -> {
+      let t: Tagged = tagged(m);
+      if t.tag == "exhaustive_enumeration" {
+        let points = int_at(t.body, "points");
+        "exhaustive over " ++ int_to_string(points) ++ " " ++ plural(points, "point") ++ " of "
+          ++ text_at(t.body, "domain")
+      } else if t.tag == "case_split" {
+        "case analysis over " ++ text_at(t.body, "ty") ++ " ("
+          ++ int_to_string(int_at(t.body, "arms"))
+          ++ " arms)"
+      } else if t.tag == "induction" {
+        "induction on " ++ text_at(t.body, "binder") ++ ", unrolling " ++ text_at(t.body, "def")
+      } else if t.tag == "exhaustive_interleaving" {
+        let n = int_at(t.body, "interleavings");
+        "exhaustive over " ++ int_to_string(n) ++ " " ++ plural(n, "interleaving")
+      } else { spaced(t.tag) }
+    },
+    _ -> "",
+  }
+
+fn rules_of(c: Certificate) -> List<Json> = match c.rules { Array(rs) -> rs, _ -> [] }
+
+fn named_once(parts: List<String>, part: String) -> List<String> =
+  if fold(parts, false, |seen: Bool, p: String| seen || p == part) { parts }
+  else { push(parts, part) }
+
+pub fn certificate_summary(c: Certificate) -> String = {
+  let rules = rules_of(c);
+  let named = fold(rules, [], |acc: List<String>, r: Json|
+    if unfolds(r) { acc } else { named_once(acc, rule_text(r)) });
+  let unfoldings = len(filter(rules, |r: Json| unfolds(r)));
+  let counted = if unfoldings > 0 {
+    push(named, int_to_string(unfoldings) ++ " " ++ plural(unfoldings, "unfolding"))
+  } else { named };
+  let sorted = if len(c.sorts) > 0 { push(counted, "uninterpreted " ++ joined(c.sorts, ", ")) }
+  else { counted };
+  joined(push(sorted, int_to_string(c.steps) ++ " steps"), " · ")
+}
+
+// Below the property tier a run has concrete cases and no coverage claim, so it says how many of
+// what it drew the guard let through.
+pub fn cases_summary(tier: Tier, c: Cases) -> String = {
+  let head = match tier {
+    Example ->
+      int_to_string(c.kept) ++ " of " ++ int_to_string(c.generated)
+        ++ " cases kept · guard rejected "
+        ++ int_to_string(c.rejected),
+    _ ->
+      int_to_string(c.kept) ++ " " ++ plural(c.kept, "case") ++ " · " ++ int_to_string(c.rejected)
+        ++ " rejected",
+  };
+  let rooted = if len(c.roots) > 1 { head ++ " · " ++ int_to_string(len(c.roots)) ++ " roots" }
+  else { head };
+  fold(c.instantiations, rooted, |acc: String, i: Instantiation|
+    acc ++ " · " ++ i.var ++ " := " ++ i.ty)
+}
+
+pub fn evidence_summary(tier: Tier, e: Evidence) -> String =
+  match e { Proof(c) -> certificate_summary(c), Sampled(c) -> cases_summary(tier, c) }
+
+// A count of them wears its word. This is a package, so it carries the one it needs rather than
+// reaching into the CLI's report.
+fn plural(n: Int, word: String) -> String =
+  if n == 1 { word } else if string_ends_with(word, "y")
+      && !ends_in_vowel(string_slice(word, 0, string_len(word) - 1)) {
+    string_slice(word, 0, string_len(word) - 1) ++ "ies"
+  } else { word ++ "s" }
+
+fn ends_in_vowel(stem: String) -> Bool =
+  string_ends_with(stem, "a") || string_ends_with(stem, "e") || string_ends_with(stem, "i")
+    || string_ends_with(stem, "o")
+    || string_ends_with(stem, "u")
+
 test "the cache answers per obligation, and a host is never cached" {
   let answers = [
     { reason: FromProof, answered: true, warning: None },
@@ -608,4 +756,39 @@ fn joined(parts: List<String>, sep: String) -> String =
 test "a frame reads as one line too" {
   assert_eq(frame_summary(Pure), "pure");
   assert_eq(frame_summary(Writes(["std.io.file", "clock"])), "writes std.io.file, clock")
+}
+
+test "a certificate and a sample each read as one line" {
+  assert_eq(
+    evidence_summary(
+      Example,
+      Sampled({ generated: 3, kept: 3, rejected: 0, roots: [0], instantiations: [] }),
+    ),
+    "3 of 3 cases kept · guard rejected 0",
+  );
+  assert_eq(
+    evidence_summary(
+      Property,
+      Sampled({
+        generated: 9,
+        kept: 8,
+        rejected: 1,
+        roots: [],
+        instantiations: [{ var: "x", ty: "Int" }],
+      }),
+    ),
+    "8 cases · 1 rejected · x := Int",
+  );
+  assert_eq(
+    evidence_summary(
+      Proved,
+      Proof({
+        rules: Array([Str("induction"), Str("unfold"), Str("unfold")]),
+        steps: 3,
+        guard_satisfiable: true,
+        sorts: ["T"],
+      }),
+    ),
+    "induction · 2 unfoldings · uninterpreted T · 3 steps",
+  )
 }
