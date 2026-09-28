@@ -131,6 +131,8 @@ pub struct Front {
     pub emitter_roots: Vec<EmitterRoot>,
     /// The emitter's constructors, in the order the emitted C names tags by.
     pub emitter_ctors: Vec<(Symbol, usize)>,
+    /// The roots that are pure and take no parameters, which the emitted unit memoizes.
+    pub emitter_constants: BTreeSet<Symbol>,
     /// The hasher's item order: every hashed name, test and law, as the `hash` frames are written.
     pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
@@ -397,6 +399,9 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         let mut p = Payload::default();
         p.field("arity", &arity.to_string());
         p.frame(&mut out, "emitctor", name.as_str());
+    }
+    for name in &front.emitter_constants {
+        raw_frame(&mut out, "emitconst", name.as_str(), "");
     }
 
     for (module, items) in &front.ordinals {
@@ -810,6 +815,9 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                     return Err(format!("{what} is written twice"));
                 }
                 front.hash_order.push(Hashed::Law(i));
+            }
+            "emitconst" => {
+                front.emitter_constants.insert(Symbol::new(name));
             }
             "emitctor" => {
                 let f = Fields::of(payload, &what)?;
