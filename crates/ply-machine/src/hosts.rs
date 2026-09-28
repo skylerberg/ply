@@ -698,6 +698,8 @@ const PAYLOAD: &str = "hosts";
 #[derive(Clone, Debug)]
 pub struct HostsOptions {
     pub path: std::path::PathBuf,
+    /// The front end the CLI ran, handed over with the asking.
+    pub front: Option<crate::driver::HandedFront>,
     pub host: bool,
     pub json: bool,
     pub digest: bool,
@@ -719,6 +721,7 @@ impl HostsOptions {
     pub fn of(path: std::path::PathBuf, o: crate::drive::RunOptions) -> HostsOptions {
         HostsOptions {
             path,
+            front: o.front,
             host: o.host,
             json: false,
             digest: false,
@@ -774,8 +777,9 @@ impl HostHandler for Facility {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
-            ("preview", [path, options]) => {
-                let o = crate::drive::run_options_of(options, span)?;
+            ("preview", [path, options, front]) => {
+                let mut o = crate::drive::run_options_of(options, span)?;
+                o.front = Some(crate::driver::handed_front_of(front, span)?);
                 let options = HostsOptions::of(
                     std::path::PathBuf::from(path.as_str(span, "the project's path")?),
                     o,
@@ -785,8 +789,9 @@ impl HostHandler for Facility {
                     .expect("assembled")
                     .preview()
             }
-            ("open", [path, options]) => {
+            ("open", [path, options, front]) => {
                 let mut o = crate::drive::run_options_of(options, span)?;
+                o.front = Some(crate::driver::handed_front_of(front, span)?);
                 o.host = true;
                 let options = HostsOptions::of(
                     std::path::PathBuf::from(path.as_str(span, "the project's path")?),

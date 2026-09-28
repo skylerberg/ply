@@ -194,6 +194,7 @@ enum Go {
         reply: Sender<drive::Measured>,
     },
     Reload {
+        front: crate::driver::HandedFront,
         reply: Sender<Result<drive::FoundData, drive::Refused>>,
     },
 }
@@ -204,10 +205,11 @@ impl HostHandler for Site {
         let label = label_of(req, span)?;
         let value = match (req.op.op.as_str(), req.args) {
             ("configure", [options]) => self.configure(&label, options, span)?,
-            ("load", [root]) => self.load(&label, root, span)?,
-            ("reload", []) => {
+            ("load", [root, front]) => self.load(&label, root, front, span)?,
+            ("reload", [front]) => {
+                let front = crate::driver::handed_front_of(front, span)?;
                 let answer: Result<drive::FoundData, drive::Refused> =
-                    self.ask(&label, span, |reply| Go::Reload { reply })?;
+                    self.ask(&label, span, |reply| Go::Reload { reply, front })?;
                 match answer {
                     Ok(found) => ok(drive::found_value(&found)),
                     Err(refused) => refused_value(&refused),
@@ -295,8 +297,18 @@ impl Site {
         Ok(Value::Unit)
     }
 
-    fn load(&self, label: &str, root: &Value, span: Span) -> Result<Value, Diagnostic> {
+    fn load(
+        &self,
+        label: &str,
+        root: &Value,
+        front: &Value,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
         let root = root.as_str(span, "the program's root")?.to_string();
+        // `None` is a program loading a program of its own, at a root it chose while running.
+        let front = crate::payload::option_of(front, "a front end", span)?
+            .map(|front| crate::driver::handed_front_of(front, span))
+            .transpose()?;
         if self
             .labels
             .lock()
@@ -311,12 +323,13 @@ impl Site {
         }
         let (reply, answered) = mpsc::channel();
         let (go, hearing) = mpsc::channel();
-        let options = self
+        let mut options = self
             .configured
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(label)
             .unwrap_or_else(|| self.options.clone());
+        options.front = front;
         let path = PathBuf::from(root);
         let thread = std::thread::Builder::new()
             .name(format!("machine-{label}"))
@@ -437,8 +450,8 @@ fn park(mut drive: drive::Drive, hearing: mpsc::Receiver<Go>) {
             Go::Accounting { reply } => {
                 let _ = reply.send(drive.accounting());
             }
-            Go::Reload { reply } => {
-                let answer = drive.reload().map(|()| drive.found_data());
+            Go::Reload { reply, front } => {
+                let answer = drive.reload(&front).map(|()| drive.found_data());
                 let _ = reply.send(answer);
             }
         }

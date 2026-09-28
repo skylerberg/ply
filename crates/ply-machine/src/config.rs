@@ -229,8 +229,7 @@ pub mod schema {
         Ok(symbol)
     }
 
-    /// Resolve, evaluate and decode; a name that resolves but will not evaluate is still a
-    /// refusal.
+    /// Resolve, evaluate and decode; unlike `--db-schema`, an evaluation failure is a refusal.
     pub fn materialise(
         check: &CheckOutput,
         name: &str,
