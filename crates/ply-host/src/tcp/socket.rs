@@ -169,6 +169,7 @@ impl Net for TcpHost {
             Op::ListenTls => tls::HANDLER,
             Op::Connect => "ply_host::tcp::connect",
             Op::ConnectTls => tls::CONNECT_HANDLER,
+            Op::Handshake => tls::HANDSHAKE_HANDLER,
             Op::Accept => "ply_host::tcp::accept",
             Op::Recv => "ply_host::tcp::recv",
             Op::Send => "ply_host::tcp::send",
@@ -244,7 +245,23 @@ impl Net for TcpHost {
         })
     }
 
-    /// No handshake here, deliberately: the session handshakes on its first read or write.
+    /// No handshake here, deliberately: a session handshakes on its first read or write, so a peer
+    /// that connects and says nothing costs nothing. A client that wants it earlier asks with
+    /// `net.handshake`.
+    fn handshake(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
+        let session = match self.sockets.stream(conn, at, span)? {
+            Conn::Tls(session) => Some(session),
+            Conn::Plain(_) => None,
+        };
+        self.waiting(span, "handshake", Op::Handshake.what(), move || {
+            Done::MaybeInt(
+                session
+                    .and_then(|session| session.handshake())
+                    .map(|us| us as i64),
+            )
+        })
+    }
+
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
         // Before the lookup, because `stop_accepting` has already swapped the listener out.
         if self.stopping.load(Ordering::Acquire) {
