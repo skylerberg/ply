@@ -34,6 +34,8 @@ pub const HTTP: &str = include_str!("../ply/http.ply");
 
 pub const NET: &str = include_str!("../ply/net.ply");
 
+pub const PARSE: &str = include_str!("../ply/parse.ply");
+
 pub const PATH: &str = include_str!("../ply/path.ply");
 
 pub const PG: &str = include_str!("../ply/pg.ply");
@@ -70,6 +72,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.json", JSON),
     ("std.msgpack", MSGPACK),
     ("std.net", NET),
+    ("std.parse", PARSE),
     ("std.path", PATH),
     ("std.pg", PG),
     ("std.pkg", PKG),
