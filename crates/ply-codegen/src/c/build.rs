@@ -175,10 +175,7 @@ fn emit_all(
     phases.emit = started.elapsed();
     let constants: Vec<String> = taken
         .iter()
-        .filter(|n| {
-            loaded.arity_of(n) == Some(0)
-                && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(n))
-        })
+        .filter(|n| loaded.front.emitter_constants.contains(&Symbol::new(n)))
         .cloned()
         .collect();
     // An uncalled pure nullary root still needs a code-table row for its memo slot.
