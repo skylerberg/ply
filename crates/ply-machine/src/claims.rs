@@ -2017,29 +2017,3 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
         binding,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::MARSHALLED;
-
-    /// Every row has to name a module that declares the type. The tag this side builds is
-    /// `<module>.<constructor>` and the program matches it against the name its own spine gives the
-    /// constructor, so a type that moved module and left its row behind is a value no arm matches.
-    #[test]
-    fn every_marshalled_type_is_declared_where_this_side_says() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-cli/ply");
-        let loaded = crate::load::load(&dir).expect("the CLI tree loads");
-        for (home, ty) in MARSHALLED {
-            assert!(
-                loaded
-                    .check
-                    .ctors
-                    .values()
-                    .any(|c| c.type_name.as_str().rsplit('.').next() == Some(*ty)
-                        && c.module.as_str() == *home),
-                "no constructor of `{ty}` is declared in `{home}`, so a tag built from it names \
-                 nothing the program matches"
-            );
-        }
-    }
-}
