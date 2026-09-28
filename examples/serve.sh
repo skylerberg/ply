@@ -35,30 +35,10 @@
 # guessed at.
 #
 # The database is created out of band, by `examples/desk.sql`. W4 ships a schema
-# as a value and refuses to ship a migration tool. `--db-schema desk.schema` is
-# passed on every run below.
-#
-# CORRECTED (docs audit, 2026-08-17): this comment used to say the driver
-# "refuses at bind time with `E0435` if the live database is not the one
-# `desk.ply` describes". It does not, and never did. `E0435 DB_SCHEMA_MISMATCH`
-# is raised nowhere: `grep -rn 'E0435\|DB_SCHEMA_MISMATCH' crates/ --include='*.rs'`
-# returns twelve hits and none is a raise — `crates/ply-span/src/lib.rs:441`
-# defines the constant, `:825` registers it (inside `#[cfg(test)] mod tests`),
-# `crates/ply-eval/src/host.rs:1106` lists it as reserved,
-# `crates/ply-span-tests/tests/armed.rs` pins it as reserved-and-never-constructed, and
-# `crates/ply-cli/src/artifact.rs:253` and `crates/ply-eval/src/limit.rs:99` are
-# prose. (The hit count and the two `ply-span` line numbers above were stale from
-# 2026-08-17 and are corrected here too.) This list used to end with
-# `crates/ply-cli/src/db.rs:539`, called "prose describing the check as future
-# work". That was wrong twice over: it was `--db-schema`'s own `--help` text, so
-# it made this same withdrawn claim to every operator, and calling it prose is
-# what let it survive this very audit. Corrected 2026-08-30.
-# What `--db-schema` actually does is resolve the name, check it is a nullary
-# function returning a `Schema`, evaluate it, and read its table and column
-# counts; it never opens a connection to compare. A mismatch surfaces later as
-# `E0433 DB_PREPARE_FAILED`, per statement, on first execution. README.md
-# §"What is missing" documents this correctly; this comment was not updated with
-# it, which made it the same never-armed-check defect W1 shipped.
+# as a value and refuses to ship a migration tool, and where the run reaches its
+# database is one more setting — `--set DESK_DATABASE`. Nothing checks the live
+# database against the program's schema; a mismatch surfaces as a failed statement
+# on whichever route touched it first.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -168,6 +148,11 @@ if [ -n "$db" ]; then
   settings+=(--set "DESK_DATABASE=$db")
 fi
 
+# `ply` is the launcher, which carries the CLI's sources: `crates/ply-cli` is a Ply program, not a
+# cargo package, so `-p ply-cli` names nothing and a person running this script by hand got
+# `package ID specification ply-cli did not match any packages` (CI never saw it because
+# `same-tests.sh` exports `PLY_BIN`). `PLY_BIN` still wins, for a build a caller already has.
+#
 # `--locked` for the same reason `same-tests.sh` passes it, and it matters more
 # here: `same-tests.sh` starts this script twice, so this line is on the CI path
 # too, and an unlocked build here would update the `Cargo.lock` that job's own
@@ -176,7 +161,7 @@ fi
 if [ -n "${PLY_BIN:-}" ]; then
   ply="$PLY_BIN"
 else
-  cargo build --locked --release --manifest-path "$root/Cargo.toml" -p ply-cli
+  cargo build --locked --release --manifest-path "$root/Cargo.toml" -p ply-launcher --bin ply
   ply="$root/target/release/ply"
 fi
 
@@ -192,9 +177,9 @@ if [ "$memory" -eq 1 ]; then
 fi
 
 if [ "$tls" -eq 0 ]; then
-  "$ply" hosts "$out/desk.ply" --host --db "$db" --db-schema desk.schema "${settings[@]}"
+  "$ply" hosts "$out/desk.ply" --host "${settings[@]}"
   echo "serving http://localhost:$port for $requests connections"
-  exec "$ply" run "$out/desk.ply" --host --db "$db" --db-schema desk.schema "${settings[@]}"
+  exec "$ply" run "$out/desk.ply" --host "${settings[@]}"
 fi
 
 if [ -z "$cert" ] || [ -z "$key" ]; then
@@ -214,9 +199,7 @@ fi
 # configuration, observability and shutdown blocks, with every secret key shown
 # as `****` beside the source that supplied it. Printed before serving, because
 # that is the moment to read it.
-"$ply" hosts "$out/desk.ply" --host --tls "$credential=$cert,$key" \
-  --db "$db" --db-schema desk.schema "${settings[@]}"
+"$ply" hosts "$out/desk.ply" --host --tls "$credential=$cert,$key" "${settings[@]}"
 
 echo "serving https://localhost:$port for $requests connections (curl -k)"
-exec "$ply" run "$out/desk.ply" --host --tls "$credential=$cert,$key" \
-  --db "$db" --db-schema desk.schema "${settings[@]}"
+exec "$ply" run "$out/desk.ply" --host --tls "$credential=$cert,$key" "${settings[@]}"
