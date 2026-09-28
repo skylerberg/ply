@@ -31,6 +31,16 @@ test/nondet "the announcement reaches the process" {
 }
 "#;
 
+const ONE_LINE: &str = r#"
+import std.process (process)
+
+fn main() -> Unit / {process.write[proc]} =
+  match process.line[proc]() {
+    None -> process.out[proc]("end of input"),
+    Some(line) -> process.out[proc]("read " ++ line),
+  }
+"#;
+
 fn text_of(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -56,6 +66,42 @@ fn run_with_host_answers_the_arguments_writes_each_stream_and_exits_with_the_cod
         !stderr.contains("E0455") && !stderr.contains("raised at"),
         "an exit the program asked for is not an error:\n{stderr}"
     );
+}
+
+#[test]
+fn run_with_host_reads_a_line_from_standard_input() {
+    let dir = project(ONE_LINE);
+    let out = ply(dir.path())
+        .args(["run", "m.ply", "--host"])
+        .write_stdin("hello\nrest\n")
+        .output()
+        .unwrap();
+    let stdout = text_of(&out.stdout);
+    let stderr = text_of(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("read hello"), "{stdout}");
+    assert!(
+        !stdout.contains("rest"),
+        "the whole input is not one call's answer:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_line_read_past_the_end_of_input_is_none() {
+    let dir = project(ONE_LINE);
+    let out = ply(dir.path())
+        .args(["run", "m.ply", "--host"])
+        .write_stdin("")
+        .output()
+        .unwrap();
+    let stdout = text_of(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        text_of(&out.stderr)
+    );
+    assert!(stdout.contains("end of input"), "{stdout}");
 }
 
 #[test]

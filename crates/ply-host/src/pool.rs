@@ -32,6 +32,8 @@ pub enum Done {
     MaybeInt(Option<i64>),
     /// `None` when it is not a directory this run can read.
     MaybeStrings(Option<Vec<String>>),
+    /// `None` at end of input, which is what reading a line past the last one answers.
+    MaybeString(Option<String>),
     /// A constructor with no fields, by the program-wide name the declaring module gives it.
     Ctor(&'static str),
     /// A `std.process.Finished`: how a spawned process ended and what it wrote to each stream.
@@ -219,6 +221,7 @@ fn take(state: &mut State, token: u64) -> Taken {
                 Value::list(names.into_iter().map(Value::str).collect())
             })))
         }
+        Done::MaybeString(text) => Ok(option(text.map(Value::str))),
         Done::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
         Done::Spawned { ended, out, err } => Ok(finished(ended, out, err)),
         Done::Refused(diagnostic) => Err(diagnostic),
