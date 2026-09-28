@@ -25,7 +25,7 @@ const TESTS_MARKER: &str = "// --- Tests: the business, which needs no handler a
 const CREDENTIAL: &str = "desk";
 
 /// `main`'s signature in `source`, as written: its declaration through the `=` that ends it.
-pub(crate) fn main_header(source: &str) -> Result<&str> {
+pub fn main_header(source: &str) -> Result<&str> {
     Ok(&source[header_span(source, "main")?])
 }
 
