@@ -46,6 +46,8 @@ pub const SIGNAL: &str = include_str!("../ply/signal.ply");
 
 pub const TIME: &str = include_str!("../ply/time.ply");
 
+pub const UUID: &str = include_str!("../ply/uuid.ply");
+
 /// The trusted list, kept sorted and unique.
 pub const MODULES: &[(&str, &str)] = &[
     ("std.bytes", BYTES),
@@ -66,6 +68,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.signal", SIGNAL),
     ("std.time", TIME),
     ("std.trace", TRACE),
+    ("std.uuid", UUID),
 ];
 
 pub fn source(module: &ModuleName) -> Option<&'static str> {
