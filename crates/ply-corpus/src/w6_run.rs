@@ -4,9 +4,11 @@ use anyhow::{Context, Result, bail};
 use ply_eval::Value;
 use ply_eval::host::HostRuntime;
 use ply_span::Span;
+use serde::Deserialize;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,14 +36,35 @@ fn keep_alive_script(request: &[u8], requests: u32) -> Vec<Vec<Vec<u8>>> {
 /// The route rungs 1–6 are taken on.
 const ROUTE: &str = "/health";
 
-/// The service with the ladder's driver appended, exactly as the rungs measure it.
+/// The service with the ladder's rungs appended, exactly as the rungs measure it.
 pub fn program(repo: &Path) -> Result<w3::Loaded> {
+    w3::Loaded::parse(&rung_source(repo)?)
+}
+
+/// The same source, for a launcher to run rather than this process to call.
+pub fn rung_source(repo: &Path) -> Result<String> {
     let service = w3::Service::open(repo)?;
-    let source = format!(
-        "{}{DRIVER}",
+    Ok(format!(
+        "{}{RUNGS}",
         service.source(w3::Variant::Sequential, w3::Transport::Http)?
-    );
-    w3::Loaded::parse(&source)
+    ))
+}
+
+/// The source a launcher runs to serve requests: the service with its own entry renamed, the rungs
+/// it measures appended, and the counting entry last.
+///
+/// The cut is at the service's `main` signature, which `Service::open` has already proven exists;
+/// everything before it — the routes, the statements, the entry points — is what the rungs measure,
+/// and is unchanged.
+pub fn counting_source(repo: &Path) -> Result<String> {
+    let service = w3::Service::open(repo)?;
+    let desk = service.source(w3::Variant::Sequential, w3::Transport::Http)?;
+    // The service's own entry is renamed rather than cut: everything it needs stays defined, and
+    // the program's only `main` is the driver's.
+    let header = w3::main_header(&desk)?;
+    let renamed = header.replacen("fn main(", "fn desk_main(", 1);
+    let source = desk.replacen(header, &renamed, 1);
+    Ok(format!("{source}{RUNGS}{COUNTING}"))
 }
 
 /// The head every in-process rung answers.
@@ -67,138 +90,10 @@ pub struct Allocation {
 }
 
 /// The in-Ply loops rungs 2-4 are read off, plus an empty one pricing the loop itself.
-const DRIVER: &str = r#"
-
-// --- W6: the in-process ladder's driver -------------------------------------
-
-fn w6_const() -> Int = 0
-
-fn w6_head() -> Bytes = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
-
-fn w6_empty(n: Int, acc: Int) -> Int =
-  if n <= 0 { acc } else { w6_empty(n - 1, acc + 1) }
-
-fn w6_endpoint(n: Int, acc: Int) -> Int =
-  if n <= 0 {
-    acc
-  } else {
-    let r = health();
-    w6_endpoint(n - 1, acc + r.status)
-  }
-
-fn w6_framed(n: Int, acc: Int, raw: Bytes, l: http::Limits) -> Int =
-  if n <= 0 {
-    acc
-  } else {
-    let m = match http::parse_head(raw, l) {
-      http::Parsed(h) -> h.request.method,
-      _ -> http::Get,
-    };
-    let r = health();
-    let out = http::encode(m, http::Http11, false, r);
-    w6_framed(n - 1, acc + bytes_len(out), raw, l)
-  }
-
-fn w6_routed(n: Int, acc: Int, raw: Bytes, l: http::Limits) -> Int =
-  if n <= 0 {
-    acc
-  } else {
-    let p = match http::parse_head(raw, l) {
-      http::Parsed(h) -> {method: h.request.method, path: h.request.path},
-      _ -> {method: http::Get, path: "/"},
-    };
-    let hit = match route_of(p.method, p.path) {
-      router::Found(_) -> 1,
-      _ -> 0,
-    };
-    let r = health();
-    let out = http::encode(p.method, http::Http11, false, r);
-    w6_routed(n - 1, acc + bytes_len(out) + hit, raw, l)
-  }
-
-// The routing rung with the route table built once instead of once per
-// request. The difference between this and `w6_routed` is what `table()` costs
-// a request, which is the "caching derived work" lever priced on the request
-// path.
-fn w6_cached(n: Int, acc: Int, raw: Bytes, l: http::Limits,
-             t: List<router::Route<Endpoint>>) -> Int =
-  if n <= 0 {
-    acc
-  } else {
-    let p = match http::parse_head(raw, l) {
-      http::Parsed(h) -> {method: h.request.method, path: h.request.path},
-      _ -> {method: http::Get, path: "/"},
-    };
-    let hit = match router::route(t, p.method, p.path) {
-      router::Found(_) -> 1,
-      _ -> 0,
-    };
-    let r = health();
-    let out = http::encode(p.method, http::Http11, false, r);
-    w6_cached(n - 1, acc + bytes_len(out) + hit, raw, l, t)
-  }
-
-// `table()` on its own: ten `Route` records built from their pattern strings.
-fn w6_table(n: Int, acc: Int) -> Int =
-  if n <= 0 { acc } else { w6_table(n - 1, acc + len(table())) }
-
-fn w6_bench(mode: Int, n: Int) -> Int =
-  if mode == 0 {
-    w6_empty(n, 0)
-  } else if mode == 1 {
-    w6_endpoint(n, 0)
-  } else if mode == 2 {
-    w6_framed(n, 0, w6_head(), limits())
-  } else if mode == 4 {
-    w6_cached(n, 0, w6_head(), limits(), table())
-  } else if mode == 5 {
-    w6_table(n, 0)
-  } else {
-    w6_routed(n, 0, w6_head(), limits())
-  }
-
-// The twin's store, priced apart from the ladder.
-//
-// `/items` cannot carry the ladder's lower rungs: its handler performs, so a
-// pure call needs a store, and the store the twin supplies is `std.db`'s memory
-// engine — which parses its SQL in Ply on every call. That cost is the twin's
-// and not the served stack's, so it is measured here and reported beside the
-// ladder rather than inside a layer.
-fn w6_items_loop(n: Int, acc: Int) -> Int / {db.read[items]} =
-  if n <= 0 {
-    acc
-  } else {
-    let r = list_items();
-    w6_items_loop(n - 1, acc + r.status)
-  }
-
-fn w6_scan_loop(n: Int, acc: Int) -> Int / {db.read[items]} =
-  if n <= 0 {
-    acc
-  } else {
-    let a = db.query[items](items_all(), []);
-    let got = match a {
-      db::Rows(rs) -> len(rs),
-      db::Count(k) -> k,
-      db::Failed(_) -> 0,
-    };
-    w6_scan_loop(n - 1, acc + got)
-  }
-
-fn w6_items(mode: Int, n: Int) -> Int =
-  with_cell[store](stocked(seed_shelf(), seed_orders())) { c -> {
-    let step = |q: db::Stmt, ps: List<db::Param>| {
-      let o = db::step(cell_get(c), q, ps);
-      cell_set(c, o.db);
-      o.out
-    };
-    handle {
-      if mode == 0 { w6_items_loop(n, 0) } else { w6_scan_loop(n, 0) }
-    } with {
-      db.query[items](q, ps) -> step(q, ps),
-    }
-  } }
-"#;
+/// The rungs the harness calls, and the entry a launcher runs: both written programs, both
+/// checked by the corpus's own tests.
+const RUNGS: &str = include_str!("../fixtures/w6-rungs.ply");
+const COUNTING: &str = include_str!("../fixtures/w6-count.ply");
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct InProcess {
@@ -1423,4 +1318,78 @@ pub fn ply_binary(given: Option<PathBuf>) -> Result<PathBuf> {
         .parent()
         .context("this binary has no directory")?
         .join("ply"))
+}
+
+/// What the launcher counted for one run: what the entry allocated, and where.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Counted {
+    pub allocations: u64,
+    pub bytes: u64,
+    #[serde(default)]
+    pub sites: Vec<Site>,
+}
+
+/// One allocation site, named by the `ply_*` symbol the launcher saw it under.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Site {
+    pub site: String,
+    pub allocations: u64,
+    pub bytes: u64,
+}
+
+/// A project holding the counting entry, which is what a launcher runs.
+pub fn counting_project(repo: &Path) -> Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir().context("a temp dir for the counting program")?;
+    std::fs::write(dir.path().join("w6.ply"), counting_source(repo)?)
+        .context("writing the counting program")?;
+    Ok(dir)
+}
+
+/// One run of the counting entry under the launcher, which is where the numbers come from.
+///
+/// `stage` is a directory the caller owns, and every window of one measurement passes the same one:
+/// whether the compiled tier enters a body at all is a function of the stage cache, so a count taken
+/// over whatever an earlier run left behind — or over a stage a *different* window built — describes
+/// the cache as much as the request path.
+pub fn counted(
+    ply: &Path,
+    dir: &Path,
+    requests: u32,
+    sites: bool,
+    stage: &Path,
+) -> Result<Counted> {
+    let out = dir.join(format!(
+        "counted-{requests}{}.json",
+        if sites { "-sites" } else { "" }
+    ));
+    let _ = std::fs::remove_file(&out);
+    let flag = if sites {
+        "--count-alloc-sites"
+    } else {
+        "--count-allocs"
+    };
+    let run = Command::new(ply)
+        .arg(format!("{flag}={}", out.display()))
+        .args(["run", "--host", "--color", "never", "--trace", "off"])
+        .arg("--set")
+        .arg(format!("W6_REQUESTS={requests}"))
+        .current_dir(dir)
+        .env("PLY_C_STAGE", stage)
+        .output()
+        .with_context(|| format!("running `{}` as the counting launcher", ply.display()))?;
+    if !run.status.success() {
+        bail!(
+            "the counting run exited {}:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+    let text = std::fs::read_to_string(&out).with_context(|| {
+        format!(
+            "the launcher wrote no count to `{}`: {}",
+            out.display(),
+            String::from_utf8_lossy(&run.stderr)
+        )
+    })?;
+    serde_json::from_str(&text).with_context(|| format!("reading `{}`", out.display()))
 }

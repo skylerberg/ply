@@ -6,5 +6,4 @@ mod counting;
 static ALLOCATOR: counting::Counting = counting::Counting;
 
 mod frame_cost;
-mod w6_report_allocations;
 mod w6_request_cost;
