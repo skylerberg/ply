@@ -30,6 +30,11 @@ const WINDOW: usize = 200;
 const SMALL: usize = 20;
 
 /// What one request costs, and what a run costs before it serves anything.
+///
+/// This measures in whatever stage state the process has, which is the point of a *cap*: the shipped
+/// figure is taken by `w6-alloc` with the stage pinned to a directory of its own (the state that
+/// allocates the most), and this check passes in both that state and in a run that reuses a compiled
+/// stage from an earlier one, where the same request costs five fewer allocations.
 fn per_request() -> (f64, f64, f64, f64) {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service compiles");
     let request = ply_corpus::w6_run::head();
