@@ -677,7 +677,10 @@ fn root_keys(mods: List<Mod>, c: Front, h: HashOutput) -> List<KeyRow> = {
 
 // One root the emitter offers: a definition, a spec clause, a test or a law part, with the arity
 // its body is emitted at and whether every parameter and the answer is `Int` or `Bool`.
-type EmitRoot = { root: Bytes, arity: Int, scalar: Bool, width: Bool }
+type EmitRoot = { root: Bytes, arity: Int, scalar: Bool, width: Bool, at: At }
+
+// The span of a root the tables do not place: a test or law whose check output has no row.
+fn no_at() -> At = { module: no_module(), start: 0, end: 0 }
 
 /// One constructor, with its arity; the emitter orders tags by position here.
 type EmitCtor = { name: Bytes, arity: Int }
@@ -756,6 +759,7 @@ fn emit_scalar_params(ts: List<Type>) -> Bool =
 fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
   let defs = map_of_entries(map(c.defs, |d: DefInfo| { key: d.name, value: d }));
   let laws = map_of_entries(map(c.laws, |l: LawInfo| { key: l.key, value: l }));
+  let tests = map_of_entries(map(c.tests, |t: TestInfo| { key: t.key, value: t }));
   let walked = fold(mods, { fns: [], tests: [], specs: [] }, |acc: EmitTables, m: Mod| {
     let items = fold(
       m.module.items,
@@ -774,6 +778,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                   arity: len(sig.params) + len(def.scheme.label_vars),
                   scalar: scalar_params && emit_is_scalar(sig.ret),
                   width: mentions_width(def.scheme.ty),
+                  at: span_at(def.at.module, def.at.span),
                 };
                 let clauses = fold(
                   range(0, len(d.spec)),
@@ -787,6 +792,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                             arity: len(sig.params),
                             scalar: scalar_params,
                             width: false,
+                            at: span_at(def.at.module, def.at.span),
                           }),
                           requires: b.requires + 1,
                           ensures: b.ensures,
@@ -799,6 +805,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                             arity: len(sig.params) + 1,
                             scalar: scalar_params && emit_is_scalar(sig.ret),
                             width: false,
+                            at: span_at(def.at.module, def.at.span),
                           }),
                           requires: b.requires,
                           ensures: b.ensures + 1,
@@ -816,6 +823,10 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
               arity: 0,
               scalar: false,
               width: false,
+              at: match map_get(tests, qualify(m.name, d.name)) {
+                Some(t) -> span_at(t.at.module, t.at.span),
+                None -> no_at(),
+              },
             };
             { ..a, tests: push(a.tests, row), ordinal: a.ordinal + 1 }
           },
@@ -834,6 +845,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                   arity: len(binders),
                   scalar: scalar,
                   width: false,
+                  at: match law { Some(l) -> span_at(l.at.module, l.at.span), None -> no_at() },
                 }),
             );
             { ..a, specs: append(a.specs, rows), law_ordinal: a.law_ordinal + 1 }
@@ -855,6 +867,7 @@ fn emit_root_frame(r: EmitRoot) -> Bytes =
     field(b"arity", num(r.arity)),
     field(b"scalar", flag(r.scalar)),
     field(b"width", flag(r.width)),
+    field(b"span", at_text(r.at)),
   ])
 
 fn ordinal_row(m: Mod) -> OrdinalRow =
@@ -3070,8 +3083,12 @@ fn bulk_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dum
   } else if tag == 16 { Ok({ ..d, hashes_digest: unhexed(what, u.body)? }) }
   else if tag == 17 { Ok({ ..d, keys: push(d.keys, { root: name, key: u.body }) }) } else if tag
       == 18 {
-    let fs = fields(what, u.body, [b"arity", b"scalar", b"width"])?;
+    let fs = fields(what, u.body, [b"arity", b"scalar", b"width", b"span"])?;
     let widths = all_of(fs, b"width");
+    let ats = all_of(fs, b"span");
+    // An answer from a bundle whose front end predates the field carries none, and a root nothing
+    // places reads as the same no-module span a dummy one writes.
+    let place = at_of(what, if len(ats) == 1 { at(ats, 0) } else { at_text(no_at()) })?;
     Ok({
       ..d,
       emit_roots: push(d.emit_roots, {
@@ -3080,6 +3097,7 @@ fn bulk_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dum
         scalar: flagged(what, fs, b"scalar")?,
         // An answer from a bundle whose front end predates the field carries none.
         width: len(widths) == 1 && at(widths, 0) == b"1",
+        at: place,
       }),
     })
   } else if tag == 19 {
