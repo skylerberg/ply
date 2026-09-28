@@ -1,6 +1,7 @@
 //! `prover.replay` through the effect: a program configures a run, collects, and re-runs one
 //! case of one obligation's guard at a root it chooses, reading what the draw said. The fixture is
-//! the module the payload's constructors are named after, as the CLI's own `claims` is.
+//! the module the payload's constructors are named after, so it declares them where the package
+//! does: `the_fixture_declares_the_payload_where_the_machine_names_it` is what says so.
 
 use crate::fixture::project;
 use ply_eval::host::HostRegistry;
@@ -29,11 +30,13 @@ nondet effect prover {
   read accepted[claims]() -> Accepted
 }
 
-type Binder = { name: String, text: String, ty: Ty }
+type Binder = { name: String, text: String, ty: Shape }
 type Offer = { here: Int, candidates: List<{ position: Int, size: Int }> }
 type Settled = { bindings: List<Binding>, original: List<Binding> }
-type Ty = | Var(Int) | Fn | Record(List<{ name: String, ty: Ty }>) | Con(String, List<Ty>)
-type Variant = { name: String, fields: List<Ty> }
+// The domain vocabulary is a shape this fixture only carries: it never reads one, so it names
+// the type itself rather than borrowing the name of the package's.
+type Shape = | Var(Int) | Fn | Record(List<{ name: String, ty: Shape }>) | Con(String, List<Shape>)
+type Variant = { name: String, fields: List<Shape> }
 type Decl = { name: String, variants: List<Variant> }
 type Typed = { decls: List<Decl>, claims: List<{ claim: Int, binders: List<Binder> }> }
 type Measured = { claim: Int, sizes: List<Int>, name: String }
@@ -149,7 +152,7 @@ law "doubling is tripling"
 "#;
 
 fn front_of(source: &str) -> Front {
-    let named = vec![("claims".to_string(), source.to_string())];
+    let named = vec![("proof.obligation".to_string(), source.to_string())];
     let ids = vec![SourceId(0)];
     ply_codegen::c::producer::ensure_default();
     ply_codegen::c::producer::checked_front(&named, &ids).expect("the re-run program checks")
@@ -159,7 +162,7 @@ fn front_of(source: &str) -> Front {
 fn one_run(source: &str, index: i64) -> Result<Value, ply_span::Diagnostic> {
     let project = project(source);
     let front = front_of(REPLAY);
-    let texts: HashMap<String, String> = [("claims".to_string(), REPLAY.to_string())]
+    let texts: HashMap<String, String> = [("proof.obligation".to_string(), REPLAY.to_string())]
         .into_iter()
         .collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
@@ -172,7 +175,7 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_span::Diagnostic> {
     let binding = registry.bind(&front.check).expect("the prover ops bind");
     machine.set_host_binding(Arc::new(binding));
     machine.call(
-        "claims.main",
+        "proof.obligation.main",
         vec![
             Value::str(project.path().display().to_string()),
             Value::Int(index),
@@ -228,5 +231,33 @@ fn a_claim_index_the_collection_does_not_hold_is_refused_rather_than_answered() 
         why.message.contains("no claim 99"),
         "the run said `{}` rather than naming the claim",
         why.message
+    );
+}
+
+#[test]
+fn the_fixture_declares_the_payload_where_the_machine_names_it() {
+    let front = front_of(REPLAY);
+    let mut checked = 0;
+    for (home, ty) in ply_machine::claims::MARSHALLED {
+        let declared: Vec<&str> = front
+            .check
+            .ctors
+            .values()
+            .filter(|c| c.type_name.as_str().rsplit('.').next() == Some(*ty))
+            .map(|c| c.module.as_str())
+            .collect();
+        if declared.is_empty() {
+            continue;
+        }
+        assert!(
+            declared.iter().all(|module| module == home),
+            "the fixture declares `{ty}` in {declared:?}, and the machine builds its constructors \
+             in `{home}`: a tag that names the wrong module is one no arm matches"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "the fixture mirrors no type the machine marshals"
     );
 }
