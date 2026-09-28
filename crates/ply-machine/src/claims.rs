@@ -90,6 +90,9 @@ const CLAIMS_STACK: usize = 256 << 20;
 /// What the machine is asked to work with, which is every flag that is not about the report.
 pub struct Job {
     pub path: PathBuf,
+    /// The front end the CLI ran. A run without one is refused rather than loading again: `ply
+    /// prove` and `ply review` start one and hand its answer over.
+    pub front: Option<crate::driver::HandedFront>,
     pub incremental: bool,
     pub use_cache: bool,
     /// Also discharge what the shipped modules declare.
@@ -151,8 +154,10 @@ impl HostHandler for Site {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
-            ("configure", [options]) => {
-                *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job_of(options, span)?);
+            ("configure", [options, front]) => {
+                let mut job = job_of(options, span)?;
+                job.front = Some(crate::driver::handed_front_of(front, span)?);
+                *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job);
                 PlyValue::Unit
             }
             ("collected", _) => self.collected()?,
@@ -1106,12 +1111,41 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
 }
 
 /// Every module parsed: a clause the run did not read is a claim nobody checked.
+///
+/// The walk and the compiler are the CLI's, and what it answered is what this reads. `incremental`
+/// still decides whether the store takes part, exactly as it did when this side ran the front end.
 fn load(job: &Job, store: &mut Store) -> Result<Loaded, LoadError> {
-    if job.incremental {
-        crate::driver::load_incremental(&job.path, store)
+    let Some(front) = &job.front else {
+        return Err(LoadError {
+            sources: ply_span::SourceMap::new(),
+            diagnostics: vec![
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    "the CLI handed no front end over, and this side runs none",
+                )
+                .note(
+                    "the CLI walks the tree and runs the compiler; a run without its answer has \
+                 nothing to discharge",
+                ),
+            ],
+        });
+    };
+    let mode = if job.incremental {
+        crate::driver::Mode::Incremental
     } else {
-        crate::load::load(&job.path)
-    }
+        crate::driver::Mode::Full
+    };
+    let store = job.incremental.then_some(store);
+    crate::driver::load_over_front(
+        &job.path,
+        &front.files,
+        &front.packages,
+        &front.dump,
+        front.read,
+        front.front,
+        mode,
+        store,
+    )
 }
 
 fn flushed(store: &mut Store) -> Vec<Diagnostic> {
@@ -1974,6 +2008,7 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
     };
     Ok(Job {
         path: PathBuf::from(str_at("path")?),
+        front: None,
         incremental: !bool_at("no_incremental")?,
         use_cache: !bool_at("no_cache")?,
         std: bool_at("std")?,
