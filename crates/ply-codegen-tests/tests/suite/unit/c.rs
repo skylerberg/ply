@@ -1737,6 +1737,71 @@ pub fn parity(n: Int) -> Bool = even(n)
     let _ = loaded;
 }
 
+/// A parameter the prologue converted — an `Int` unboxed at entry, so the body reads the converted
+/// local and never the raw word again — is the call's, not the pass's. A self tail call restarts as
+/// often as its counter likes and the epilogue runs once, so the raw word has to be released
+/// exactly once. It was released on every restart as well, which freed a boxed `Int` (|v| >= 2^62,
+/// the first value that does not fit an immediate) on the first restart and read it again on the
+/// way out. Immediates hid it, and so did every `List`, `String` and record, whose words the move
+/// spends rather than releases.
+#[test]
+fn a_self_tail_call_releases_a_converted_parameter_once() {
+    let source = r#"
+fn countdown(n: Int, k: Int) -> Int = if k == 0 { n } else { countdown(n, k - 1) }
+fn flip(b: Bool, k: Int) -> Bool = if k == 0 { b } else { flip(b, k - 1) }
+fn narrow(w: U32, k: Int) -> U32 = if k == 0 { w } else { narrow(w, k - 1) }
+pub fn down(k: Int) -> Int = countdown(4611686018427387904, k)
+pub fn toggled(k: Int) -> Bool = flip(true, k)
+pub fn narrowed(k: Int) -> U32 = narrow(7u32, k)
+"#;
+    let Some((loaded, native)) = tests_support::unit(source) else {
+        return;
+    };
+    let names = loaded.functions();
+    let produced = numbering_support::produce(loaded, &names);
+    let code = numbering_support::code(&produced.text);
+    // Every prologue conversion -- `Int`, `Bool` and a sized integer alike -- leaves a raw word the
+    // loop no longer reads, and each is released once, on the way out.
+    for (name, raw) in [("m.countdown", "p0"), ("m.flip", "p0"), ("m.narrow", "p0")] {
+        let body = numbering_support::body(code, &numbering_support::symbol(&produced, name));
+        assert_eq!(
+            body.matches(&format!("ply_dec(ctx, {raw})")).count(),
+            1,
+            "`{name}` releases its converted parameter {raw} other than once, on the way out:\n{body}"
+        );
+    }
+    // And the value itself survives the loop, which is what the release discipline is for.
+    let entry: ply_codegen::rt::Entry = native
+        .entry("m.down")
+        .unwrap_or_else(|| panic!("`down` was not compiled"));
+    for k in [1_i64, 1_000] {
+        let mut ctx = native.context();
+        ctx.fuel = 100_000;
+        let args = [ply_codegen::heap::imm(k)];
+        let w = unsafe { entry(&mut ctx, args.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`down({k})` raised");
+        assert_eq!(
+            ply_codegen::heap::as_int(w),
+            Some(4_611_686_018_427_387_904),
+            "`down({k})` lost the boxed parameter"
+        );
+    }
+    // The `Bool` and `U32` loops answer what they were handed, too.
+    let run = |name: &str| -> ply_codegen::heap::Word {
+        let entry: ply_codegen::rt::Entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.fuel = 100_000;
+        let args = [ply_codegen::heap::imm(1_000)];
+        let w = unsafe { entry(&mut ctx, args.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}` raised");
+        w
+    };
+    assert_eq!(run("m.toggled"), ply_codegen::heap::bool(true));
+    assert_eq!(ply_codegen::heap::imm_value(run("m.narrowed")), 7);
+}
+
 /// A `handle` lands failures on its own label, so a cycle holding one is emitted definition by definition.
 #[test]
 fn a_recursive_group_holding_a_handle_is_emitted_per_definition() {

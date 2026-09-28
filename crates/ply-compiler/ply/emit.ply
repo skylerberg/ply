@@ -1260,17 +1260,29 @@ fn union_made(a: List<Made>, b: List<Made>) -> List<Made> =
     else { push(acc, m) })
 
 // Releases holders at depth `from` or deeper; a `break` passes the loop's depth.
-fn release_at(em: Em, from: Int) -> Em =
+fn release_at(em: Em, from: Int) -> Em = release_at_except(em, from, [])
+
+// As `release_at`, but the holders named in `skip` are left held. A self tail call restarts with
+// what the *pass* holds released, and a parameter a prologue converted -- an `Int` or `Bool`
+// unboxed at entry, so the body reads the converted local and never the raw word again -- is the
+// call's, not the pass's: releasing it here as well freed a boxed `Int` on the first restart and
+// then again on the way out, which is card `6298c4dd`. Skipped, it is released once, by the
+// epilogue or by whichever return path the body takes.
+fn release_at_except(em: Em, from: Int, skip: List<Bytes>) -> Em =
   if !em.release { em } else {
     let out: Em = fold(em.made, em, |acc: Em, m: Made|
-      if m.ind >= from { line(acc, bytes_concat_all([b"ply_dec(ctx, ", m.name, b");"])) }
-      else { acc });
+      if m.ind >= from && !among(skip, m.name) {
+        line(acc, bytes_concat_all([b"ply_dec(ctx, ", m.name, b");"]))
+      } else { acc });
     {
       ..out,
       made: fold(em.made, [], |acc: List<Made>, m: Made|
-        if m.ind >= em.ind { acc } else { push(acc, m) }),
+        if m.ind >= em.ind && !among(skip, m.name) { acc } else { push(acc, m) }),
     }
   }
+
+fn among(names: List<Bytes>, name: Bytes) -> Bool =
+  fold(names, false, |acc: Bool, n: Bytes| acc || n == name)
 
 fn close(em: Em) -> Em = line(outdent(release_at(em, em.ind)), b"}")
 
@@ -6193,6 +6205,12 @@ fn param_local(em: Em, i: Int) -> Option<V> =
       None -> if c.slot == i { Some({ k: c.k, c: c.c, ty: c.ty }) } else { None },
     })
 
+// The raw `p<i>` words of the parameters a prologue converted. Those words are dead for the loop --
+// the body reads the converted local -- but they are the call's, so a restart leaves them held.
+fn converted_params(em: Em, params: List<P>) -> List<Bytes> =
+  fold(range(0, len(params)), [], |acc: List<Bytes>, i: Int|
+    match param_local(em, i) { Some(_) -> push(acc, bytes_concat(b"p", num(i))), None -> acc })
+
 // Each argument in a temporary fitted to its parameter: the opened kind, or an owned word the parameter takes over.
 fn tail_args(
   em: Em,
@@ -6222,20 +6240,24 @@ fn self_tail(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<O
   match tail_args(em, args, params, 0, []) {
     None -> None,
     Some(w) -> {
-      let assigned = fold(range(0, len(params)), release_at(w.em, 0), |acc: Em, i: Int|
-        match list_at(w.names, i) {
-          None -> acc,
-          Some(nm) ->
-            line(
-              acc,
-              bytes_concat_all([
-                match param_local(acc, i) { Some(p) -> p.c, None -> bytes_concat(b"p", num(i)) },
-                b" = ",
-                nm,
-                b";",
-              ]),
-            ),
-        });
+      let assigned = fold(
+        range(0, len(params)),
+        release_at_except(w.em, 0, converted_params(w.em, params)),
+        |acc: Em, i: Int|
+          match list_at(w.names, i) {
+            None -> acc,
+            Some(nm) ->
+              line(
+                acc,
+                bytes_concat_all([
+                  match param_local(acc, i) { Some(p) -> p.c, None -> bytes_concat(b"p", num(i)) },
+                  b" = ",
+                  nm,
+                  b";",
+                ]),
+              ),
+          },
+      );
       let d = ret_of(em.here, name);
       Some({
         em: line(assigned, b"goto ply_loop;"),
