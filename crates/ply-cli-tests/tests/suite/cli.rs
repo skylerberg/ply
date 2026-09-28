@@ -26,6 +26,26 @@ const BROKEN: &str = "fn f() -> Int = true\n";
 
 const UNPARSEABLE: &str = "fn f(( = )\n";
 
+/// Two clauses for one operation. The second can never run, and the emitter refuses the whole
+/// program over it.
+const DUPLICATE_CLAUSE: &str = r#"effect log {
+  write note(line: String) -> Unit
+}
+
+fn run() -> Unit / {log.note} =
+  handle {
+    log.note("hi")
+  } with {
+    log.note(line) -> (),
+    log.note(line) -> (),
+  }
+
+fn main() -> Int = {
+  run();
+  0
+}
+"#;
+
 #[test]
 fn check_accepts_a_good_module() {
     let dir = project(GREEN);
@@ -118,6 +138,28 @@ fn check_exits_two_on_a_syntax_error() {
     let out = ply(dir.path()).arg("check").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8(out.stderr).unwrap().contains("E0001"));
+}
+
+/// A clause that can never run is an error where the source is, not a program the checker calls
+/// fine and the emitter refuses whole: the emitter answered nothing for every definition, so `ply
+/// run` used to report `E0448` and a count with no line, clause or operation in it.
+#[test]
+fn a_duplicate_handler_clause_is_refused_with_the_operation_named() {
+    let dir = project(DUPLICATE_CLAUSE);
+    for args in [&["check"][..], &["test"][..]] {
+        let out = ply(dir.path()).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("E0105"), "{args:?}:\n{stderr}");
+        assert!(
+            stderr.contains("`m.log.note` is handled more than once"),
+            "{args:?}:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("E0448"),
+            "{args:?} refused the whole program rather than the clause:\n{stderr}"
+        );
+    }
 }
 
 /// Run twice, so a warning survives whatever the second run answers from.
