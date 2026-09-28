@@ -104,15 +104,6 @@ impl Trail {
         }
     }
 
-    pub fn has_site(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    /// The first site noted for a step wins.
-    pub fn note_site(&mut self, site: StepSite) {
-        self.pending.get_or_insert(site);
-    }
-
     pub fn end_step(&mut self, fallback: Span) {
         let site = self.pending.take().unwrap_or(StepSite {
             definition: None,
