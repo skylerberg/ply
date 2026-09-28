@@ -104,6 +104,9 @@ pub struct EmitterRoot {
     pub root: Symbol,
     pub arity: usize,
     pub scalar: bool,
+    /// Whether the root's scheme mentions a fixed-width type, which the compiled seam cannot
+    /// carry.
+    pub width: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -393,6 +396,7 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         let mut p = Payload::default();
         p.field("arity", &root.arity.to_string());
         p.field("scalar", flag(root.scalar));
+        p.field("width", flag(root.width));
         p.frame(&mut out, "emitroot", root.root.as_str());
     }
     for (name, arity) in &front.emitter_ctors {
@@ -835,11 +839,12 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
             }
             "emitroot" => {
                 let f = Fields::of(payload, &what)?;
-                let (mut arity, mut scalar) = (None, None);
+                let (mut arity, mut scalar, mut width) = (None, None, None);
                 for (key, text) in f.all() {
                     match key {
                         "arity" => f.once(&mut arity, key, text)?,
                         "scalar" => f.once(&mut scalar, key, text)?,
+                        "width" => f.once(&mut width, key, text)?,
                         other => return Err(unknown_field(&what, other)),
                     }
                 }
@@ -847,6 +852,10 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                     root: Symbol::new(name),
                     arity: f.number(f.required(arity, "arity")?, "arity")?,
                     scalar: f.flag(f.required(scalar, "scalar")?, "scalar")?,
+                    width: match width {
+                        Some(text) => f.flag(text, "width")?,
+                        None => false,
+                    },
                 });
             }
             "key" => {
