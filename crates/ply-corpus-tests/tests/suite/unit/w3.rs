@@ -1,4 +1,6 @@
-use ply_corpus::w3::{Loaded, Sample, Service, Transport, Variant, aliases, get, request};
+use ply_corpus::w3::{
+    Loaded, Sample, Service, Transport, Variant, aliases, get, keep_alive, request,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -134,4 +136,24 @@ fn the_load_client_is_a_program_that_typechecks() {
         assert!(source.contains(key), "{key}");
     }
     Loaded::parse(&source).expect("the load client typechecks");
+}
+
+/// The socket bench, end to end: a real listener, the twin store, and a report read off it.
+///
+/// Everywhere else these benches are taken by hand. This is where CI runs the harness that takes
+/// them, so a `Bench` that cannot start a server, read a response or time one fails here rather
+/// than in a report nobody re-took.
+#[test]
+fn the_socket_bench_serves_the_read_mix() {
+    let points = keep_alive(&repo(), &crate::support::ply(), Variant::Sequential, 1, 8)
+        .expect("the socket bench runs");
+    assert_eq!(points.len(), 5, "the keep-alive ladder is five points");
+    for point in &points {
+        assert_eq!(point.transport, "http", "{point:?}");
+        assert!(point.requests > 0, "{point:?}");
+        assert!(
+            point.p50_micros > 0.0,
+            "nothing was timed, so the bench answered nothing: {point:?}"
+        );
+    }
 }
