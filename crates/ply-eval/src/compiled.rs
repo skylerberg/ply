@@ -1,5 +1,6 @@
 //! Where a natively compiled body may be entered in place of evaluating one.
 
+use crate::IntTy;
 use crate::host::{HostBinding, HostRuntime, HostUse};
 use crate::region::Record;
 use crate::sim::Seed;
@@ -7,7 +8,7 @@ use crate::value::Value;
 use ply_span::{Diagnostic, Symbol};
 use ply_ty::CheckOutput;
 use ply_ty::Footprint;
-use ply_ty::{DefHash, EffectAtom, IntTy, SECRET, TyVar, Type};
+use ply_ty::{DefHash, EffectAtom, SECRET, TyVar, Type};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 use std::sync::Arc;

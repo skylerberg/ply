@@ -214,7 +214,7 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
             "f" => {
                 let (ty, bits) = rest.split_once(' ')?;
                 let n: u8 = ty.parse().ok()?;
-                let ty = ply_ty::INT_TYPES.iter().find(|t| **t as u8 == n)?;
+                let ty = ply_eval::INT_TYPES.iter().find(|t| **t as u8 == n)?;
                 // Unsigned from `encode_tables`, signed from the Ply emitter: same bit pattern.
                 let bits: u64 = match bits.parse::<u64>() {
                     Ok(b) => b,
