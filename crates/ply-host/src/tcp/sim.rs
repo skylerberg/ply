@@ -80,6 +80,7 @@ impl Net for SimNet {
             Op::ListenTls => "ply_host::tls::sim::listen",
             Op::Connect => "ply_host::tcp::sim::connect",
             Op::ConnectTls => "ply_host::tls::sim::connect",
+            Op::Handshake => "ply_host::tls::sim::handshake",
             Op::Accept => "ply_host::tcp::sim::accept",
             Op::Recv => "ply_host::tcp::sim::recv",
             Op::Send => "ply_host::tcp::sim::send",
@@ -137,6 +138,13 @@ impl Net for SimNet {
         span: Span,
     ) -> Result<HostAnswer, Diagnostic> {
         self.connect(at, host, port, timeout, span)
+    }
+
+    /// The twin has no transport to handshake over, so a connection it hands out has none left to
+    /// complete: it answers a zero-length one rather than pretending to have measured anything.
+    fn handshake(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
+        self.handles.check(conn, at, span)?;
+        Ok(HostAnswer::Value(some(Value::Int(0))))
     }
 
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic> {

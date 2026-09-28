@@ -170,6 +170,8 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.connect[listener] ply_host::tcp::connect",
             "std.net.net.connect_tls[conn] ply_host::tls::connect",
             "std.net.net.connect_tls[listener] ply_host::tls::connect",
+            "std.net.net.handshake[conn] ply_host::tls::handshake",
+            "std.net.net.handshake[listener] ply_host::tls::handshake",
             "std.net.net.listen[conn] ply_host::tcp::listen",
             "std.net.net.listen[listener] ply_host::tcp::listen",
             "std.net.net.listen_tls[conn] ply_host::tls::listen",
