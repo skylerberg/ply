@@ -75,11 +75,6 @@ impl ModuleName {
         self.0.as_str().split('.')
     }
 
-    /// The name a bare `import` binds this module as: its last segment.
-    pub fn default_binder(&self) -> Symbol {
-        Symbol::new(self.0.as_str().rsplit('.').next().unwrap_or(""))
-    }
-
     /// This module's `place` under its program-wide name, `store.orders.place`.
     pub fn qualify(&self, name: &Symbol) -> Symbol {
         if self.is_anonymous() {
