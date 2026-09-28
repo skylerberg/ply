@@ -7,15 +7,20 @@ fn repo() -> PathBuf {
 }
 
 #[test]
-fn both_variants_are_produced_from_the_example_and_typecheck() {
+fn every_variant_and_mode_is_written_down_and_typechecks() {
     let service = Service::open(&repo()).expect("the example is where it was");
     for variant in [Variant::Sequential, Variant::TaskPerConn] {
-        let source = service.source(variant).unwrap();
-        Loaded::parse(&source).expect("the rewritten service typechecks");
+        for transport in [Transport::Http, Transport::Https] {
+            let source = service.source(variant, transport).unwrap();
+            Loaded::parse(&source).expect("the corpus's service typechecks");
+        }
     }
-    let concurrent = service.source(Variant::TaskPerConn).unwrap();
+    // The task-per-connection program is the sequential one with the accept loop spawned: that is
+    // the whole of what its variant means, and the rest of the service is the same program.
+    let concurrent = service
+        .source(Variant::TaskPerConn, Transport::Http)
+        .unwrap();
     assert!(concurrent.contains("task.spawn(|| serve_connection(c, l))"));
-    // Everything below the accept loop is the same program.
     for shared in [
         "pub fn serve_connection(c: Int, l: http::Limits) -> Unit\n  / {Serving, net.recv[conn], net.send[conn], net.close[conn]} = {",
         "pub fn answer(req: http::Request) -> Reply / {Serving} =",
@@ -30,28 +35,22 @@ fn the_served_project_typechecks_and_drives_the_twin() {
     let service = Service::open(&repo()).unwrap();
     for variant in [Variant::Sequential, Variant::TaskPerConn] {
         for (transport, entry) in [
-            (Transport::Http, "run_memory(8137, None, 9)"),
-            (Transport::Https, "run_memory_tls(8137, \"desk\", None, 9)"),
+            (Transport::Http, "run_memory(port, None, count)"),
+            (
+                Transport::Https,
+                "run_memory_tls(port, \"desk\", None, count)",
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            service
-                .project(dir.path(), variant, transport, 8137, 9)
-                .unwrap();
+            service.project(dir.path(), variant, transport).unwrap();
             let source = std::fs::read_to_string(dir.path().join("desk.ply")).unwrap();
+            // The entry point reads its port and connection count from the service's own settings,
+            // so one program serves any port: the splice it replaced wrote a port into the source.
             assert!(source.contains(entry), "{entry} in {variant:?}");
-            // The generated entry point is the twin call, which reads no configuration. The module
-            // still names `config.get[server]` for the postgres entry point it stands in for — a
-            // row about a program this project is not — so the check is the entry point itself.
-            let entry_body = source
-                .split_once("fn main()")
-                .expect("the project has an entry point")
-                .1
-                // The generated entry point is a header and one call; a blank line ends it.
-                .split_once("\n\n")
-                .expect("the entry point is followed by a blank line")
-                .0;
-            assert!(entry_body.contains(entry), "{variant:?}: {entry_body}");
-            assert!(!entry_body.contains("config."), "{variant:?}: {entry_body}");
+            assert!(
+                source.contains("configured(port_of(config.get[server](port_key())))"),
+                "{variant:?}"
+            );
             Loaded::parse(&source).expect("the served project typechecks");
         }
     }
@@ -80,7 +79,12 @@ fn an_alias_and_its_expansion_are_one_program() {
 #[test]
 fn the_client_reads_both_framings_the_service_produces() {
     let service = Service::open(&repo()).unwrap();
-    let loaded = Loaded::parse(&service.source(Variant::Sequential).unwrap()).unwrap();
+    let loaded = Loaded::parse(
+        &service
+            .source(Variant::Sequential, Transport::Http)
+            .unwrap(),
+    )
+    .unwrap();
     // Buffered then streamed on one connection: the second response must begin exactly where the first ended.
     let script = vec![vec![get("/items"), get("/orders/1/receipt")]];
     let (_, connections) = loaded.over_sim(script).unwrap();
