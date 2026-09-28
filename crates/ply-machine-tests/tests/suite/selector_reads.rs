@@ -100,54 +100,6 @@ fn main(root: String, front: Front) -> Bool / {
 }
 "#;
 
-/// The front end the tester is handed, built the way `ply test` builds it: the project walked, the
-/// compiler run once over it, and both marshalled into the record the effect declares. This test
-/// drives the effect directly, so there is no CLI to hand one over.
-fn handed(root: &std::path::Path, source: &str) -> ply_eval::Value {
-    use ply_codegen::c::producer::{self, Packages};
-    producer::ensure_default();
-    let own = vec![("p".to_string(), source.to_string())];
-    let packages = Packages {
-        root: root.display().to_string(),
-        manifest: None,
-        supplied: Vec::new(),
-    };
-    let pulled =
-        producer::front_pulling_std_with(&own, ply_machine::shelf::sources(), &[], &[], &packages)
-            .expect("the front end runs");
-    let file = |path: String, name: String, text: String| {
-        ply_machine::payload::record(vec![
-            ("path", ply_eval::Value::str(&path)),
-            ("name", ply_eval::Value::str(&name)),
-            ("text", ply_eval::Value::bytes(text.as_bytes())),
-        ])
-    };
-    let mut files = vec![file(
-        "p.ply".to_string(),
-        "p".to_string(),
-        source.to_string(),
-    )];
-    for name in &pulled.modules {
-        let module = ply_ty::ModuleName::from_dotted(name);
-        if let Some(text) = ply_machine::shelf::source(&module) {
-            files.push(file(
-                ply_machine::shelf::pseudo_path(&module)
-                    .display()
-                    .to_string(),
-                name.clone(),
-                text.to_string(),
-            ));
-        }
-    }
-    ply_machine::payload::record(vec![
-        ("dump", ply_eval::Value::bytes(pulled.dump.as_bytes())),
-        ("files", ply_eval::Value::list(files)),
-        ("packages", ply_eval::Value::list(Vec::new())),
-        ("read_ms", ply_eval::Value::Int(0)),
-        ("front_ms", ply_eval::Value::Int(0)),
-    ])
-}
-
 fn front_of(source: &str) -> Front {
     let named = vec![("m".to_string(), source.to_string())];
     let ids = vec![SourceId(0)];
@@ -187,10 +139,7 @@ fn a_selector_reads_the_keys_the_hashes_and_the_plan_before_anything_runs() {
             "m.main",
             vec![
                 ply_eval::Value::str(dir.path().display().to_string()),
-                handed(
-                    dir.path(),
-                    &std::fs::read_to_string(dir.path().join("p.ply")).expect("the file"),
-                ),
+                crate::fixture::handed(dir.path()),
             ],
             Span::DUMMY,
         )
