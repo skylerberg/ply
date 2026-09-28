@@ -2,7 +2,7 @@
 //! Every table here is read from a [`Front`].
 
 use ply_span::{SourceId, SourceMap, Span, Symbol};
-use ply_ty::{Front, LawInfo, Ordinal, SpecKind};
+use ply_ty::Front;
 use std::collections::{HashMap, HashSet};
 use std::sync::{PoisonError, RwLock};
 
@@ -34,19 +34,6 @@ pub fn law_root_name(ordinal: usize, part: &str) -> Symbol {
 /// owner's parameters, `<owner>#ensures#<k>` over them and then `result`.
 pub fn clause_root_name(owner: &Symbol, kind: &str, ordinal: usize) -> Symbol {
     Symbol::new(format!("{owner}#{kind}#{ordinal}"))
-}
-
-/// A program-wide name in `module`, as `ModuleName::qualify` spells it.
-fn qualified(module: &Symbol, name: &Symbol) -> String {
-    if module.as_str().is_empty() {
-        return name.to_string();
-    }
-    format!("{module}.{name}")
-}
-
-/// One clause of `owner`, whose name is already program-wide.
-fn clause_root(owner: &Symbol, kind: &str, ordinal: usize) -> String {
-    format!("{owner}#{kind}#{ordinal}")
 }
 
 /// Everything a unit is emitted against, read once from the front end's answer.
@@ -93,66 +80,25 @@ impl Tables {
             modules: Vec::new(),
             spans: HashMap::new(),
         };
-        t.spans_of(front);
+        t.modules = front
+            .order
+            .iter()
+            .filter_map(|m| {
+                front
+                    .check
+                    .modules
+                    .get(m)
+                    .map(|info| (m.clone(), info.source))
+            })
+            .collect();
+        // Each root's span, which the emitter's own frame carries. The root name the frame holds is
+        // the name a site is reported under, so nothing here rebuilds one.
+        t.spans = front
+            .emitter_roots
+            .iter()
+            .filter_map(|r| r.span.map(|span| (r.root.to_string(), span)))
+            .collect();
         t
-    }
-
-    /// Each root's definition span and each module's source, by walking the front end's ordinals.
-    fn spans_of(&mut self, front: &Front) {
-        let laws: HashMap<&Symbol, &LawInfo> =
-            front.check.laws.iter().map(|l| (&l.key, l)).collect();
-        let tests_by_key: HashMap<&Symbol, Span> =
-            front.check.tests.iter().map(|t| (&t.key, t.span)).collect();
-        for (module, items) in &front.ordinals {
-            if let Some(info) = front.check.modules.get(module) {
-                self.modules.push((module.clone(), info.source));
-            }
-            let (mut ordinal, mut law_ordinal) = (0, 0);
-            for item in items {
-                match item {
-                    Ordinal::Fn(name, kinds) => {
-                        let Some(def) = front.check.defs.get(name) else {
-                            continue;
-                        };
-                        self.spans.insert(name.to_string(), def.span);
-                        let (mut requires, mut ensures) = (0, 0);
-                        for kind in kinds {
-                            let (kind, k) = match kind {
-                                SpecKind::Requires => {
-                                    requires += 1;
-                                    ("requires", requires - 1)
-                                }
-                                SpecKind::Ensures => {
-                                    ensures += 1;
-                                    ("ensures", ensures - 1)
-                                }
-                            };
-                            self.spans.insert(clause_root(name, kind, k), def.span);
-                        }
-                    }
-                    Ordinal::Test(key) => {
-                        let root = qualified(module, &test_root_name(ordinal));
-                        if let Some(span) = tests_by_key.get(key) {
-                            self.spans.insert(root, *span);
-                        }
-                        ordinal += 1;
-                    }
-                    Ordinal::Law(key) => {
-                        let law = laws.get(key);
-                        for part in ["guard", "body"] {
-                            if part == "guard" && !law.is_some_and(|l| l.has_guard) {
-                                continue;
-                            }
-                            let root = qualified(module, &law_root_name(law_ordinal, part));
-                            if let Some(l) = law {
-                                self.spans.insert(root, l.span);
-                            }
-                        }
-                        law_ordinal += 1;
-                    }
-                }
-            }
-        }
     }
 
     /// The text of `root`'s definition in `texts`, which are by module name.
