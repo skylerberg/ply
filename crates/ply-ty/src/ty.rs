@@ -348,16 +348,7 @@ impl Type {
     pub fn iter(seed: Type, stop: Type) -> Type {
         Type::Con(Symbol::new("Iter"), vec![seed, stop])
     }
-    /// A credential.
-    pub fn secret(inner: Type) -> Type {
-        Type::Con(Symbol::new(SECRET), vec![inner])
-    }
 }
-
-pub const SECRET: &str = "Secret";
-
-/// The handle `task.spawn` answers with: a type the language declares, not a module's.
-pub const TASK_TYPE: &str = "Task";
 
 /// `Some(n)` when a record's fields are exactly `_0` to `_{n-1}` with `n >= 2`: a tuple.
 pub fn tuple_arity(len: usize, has: impl Fn(&Symbol) -> bool) -> Option<usize> {
