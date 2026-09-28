@@ -138,6 +138,41 @@ fn the_load_client_is_a_program_that_typechecks() {
     Loaded::parse(&source).expect("the load client typechecks");
 }
 
+/// Every served fixture's entry point answers its own `db` in Ply: since the driver moved in there
+/// is no host handler for a `db` atom, so a `main` that performs one is a run that refuses with
+/// `E0303`. The TLS fixtures had drifted exactly that way, in a section no CI job runs.
+#[test]
+fn no_served_fixtures_entry_point_performs_db_itself() {
+    let root = repo();
+    for variant in ["sequential", "task-per-conn"] {
+        for mode in ["http", "https", "memory", "postgres", "tls"] {
+            let path = root.join(format!(
+                "crates/ply-corpus/fixtures/desk-{variant}-{mode}.ply"
+            ));
+            let source = std::fs::read_to_string(&path).unwrap();
+            let loaded = Loaded::parse(&source)
+                .unwrap_or_else(|e| panic!("{} does not check: {e:#}", path.display()));
+            let main = loaded
+                .check
+                .defs
+                .values()
+                .find(|d| d.simple_name.as_str() == "main" && d.module.to_string() == "desk")
+                .unwrap_or_else(|| panic!("{} declares no `desk.main`", path.display()));
+            for (which, row) in [
+                ("publishes", &main.footprint),
+                ("performs", &main.performed),
+            ] {
+                let row = row.to_string();
+                assert!(
+                    !row.contains("std.db.db."),
+                    "{}: `main` {which} `db` and nothing binds it: {row}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
 /// The socket bench, end to end: a real listener, the twin store, and a report read off it.
 ///
 /// Everywhere else these benches are taken by hand. This is where CI runs the harness that takes
