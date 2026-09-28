@@ -5,11 +5,12 @@ use crate::{
     Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan, Vacuity,
     VacuityKind,
 };
+use ply_eval::IntTy;
 use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Synth, Value};
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_ty::DefHash;
 use ply_ty::TASK_TYPE;
-use ply_ty::{CtorInfo, IntTy, LawBinder, Row, TyVar, Type};
+use ply_ty::{CtorInfo, LawBinder, Row, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
