@@ -6,9 +6,10 @@
 #                                exists, every `probes/` directory is run by a
 #                                job the `ci` aggregate requires, the shards run
 #                                every test exactly once, every cache key a job
-#                                writes is one a job reads, and every key that
+#                                writes is one a job reads, every key that
 #                                names the run is one the run gives back or a
-#                                later run reads
+#                                later run reads, and every key over a crate's
+#                                Ply sources names every crate's
 #   ci-shards.sh cache-keys      just that last check
 #   ci-shards.sh partitions      the JSON matrix of partitions
 #   ci-shards.sh shard-configs D the nextest config each partition runs under,
@@ -463,6 +464,42 @@ cmd_cache_keys() {
   ' "${files[@]}"
 }
 
+# What each key above is a key *of*. The stage, its emitted bodies and its objects are built from
+# every tree that holds Ply sources, so a key that enumerates those trees by name goes stale the
+# moment a package is added -- and a stale hit serves a build of sources that moved, which no test
+# sees, because the tests then run against the cache rather than the sources. Any `hashFiles` that
+# names a crate's own `ply/` sources -- or any crate tree at all -- must name every one of them.
+cmd_cache_payloads() {
+  local pattern tree pat base covered missing=0
+  while IFS= read -r pattern; do
+    case "$pattern" in *"/ply/"*) ;; *) continue ;; esac
+    for tree in "$root"/crates/*/ply; do
+      [ -d "$tree" ] || continue
+      tree=${tree#"$root"/}
+      covered=no
+      while IFS= read -r pat; do
+        pat=$(printf '%s' "$pat" | tr -d "\"' ")
+        [ -n "$pat" ] || continue
+        # The tree itself, or its recursive form: `crates/*/ply/**` and `crates/*/ply` both
+        # name the whole tree, and `crates/*/ply/*` -- one level -- names only some of it.
+        base=${pat%%/\*\*}
+        if [[ $tree == $pat || $tree == $base ]]; then
+          covered=yes
+          break
+        fi
+      done < <(printf '%s\n' "$pattern" | tr ',' '\n')
+      if [ "$covered" = no ]; then
+        printf 'FAIL: a cache key hashes crate sources and does not name %s, whose Ply sources the stage is emitted from\n' "$tree" >&2
+        missing=$((missing + 1))
+      fi
+    done
+  done < <(grep -o 'hashFiles([^)]*)' "$root"/.github/workflows/*.yml | sed -e 's/.*hashFiles(//' -e 's/)$//')
+  if [ "$missing" -eq 0 ]; then
+    printf 'cache payloads: every key over crate sources names every tree holding Ply sources\n'
+  fi
+  return $((missing > 0))
+}
+
 # Deletes this run's entries under the keys above. A GitHub key is immutable, so an entry no later
 # run reads holds the repository's cache budget against the object cache, which does outlive a run.
 cmd_give_back() {
@@ -803,6 +840,7 @@ cmd_verify() {
 
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
+  cmd_cache_payloads || failures=$((failures + 1))
   # GIVE_BACK is a table until a job runs it, and a job that is not required can stop running with
   # nothing red about it.
   local give_back_job
