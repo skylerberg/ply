@@ -824,7 +824,35 @@ struct Assembled {
 
 impl Assembled {
     fn of(args: &crate::hosts::HostsOptions) -> Assembled {
-        let loaded = match crate::load::load(&args.path) {
+        // The front end is the CLI's: it ran the compiler over this tree and handed the answer with
+        // the asking, so nothing here reads a path twice. A preview without one is a caller that did
+        // not ask `tcb`, which is a defect rather than a refusal to report.
+        let Some(front) = &args.front else {
+            return Assembled::refused(
+                "NotLoaded",
+                String::new(),
+                vec![
+                    Diagnostic::error(
+                        ply_span::codes::INTERNAL_ERROR,
+                        "the CLI handed no front end over, and this side runs none",
+                    )
+                    .note(
+                        "the CLI walks the tree and runs the compiler before it asks for a binding",
+                    ),
+                ],
+                SourceMap::new(),
+            );
+        };
+        let loaded = match crate::driver::load_over_front(
+            &args.path,
+            &front.files,
+            &front.packages,
+            &front.dump,
+            front.read,
+            front.front,
+            crate::driver::Mode::Full,
+            None,
+        ) {
             Ok(loaded) => loaded,
             Err(err) => {
                 return Assembled::refused(
