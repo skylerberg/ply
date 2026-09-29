@@ -1,21 +1,23 @@
-// The bench: where a `ply test` run's time goes, answered from the product's own reports.
-// Every scenario declares its criterion up front; the report is the verdicts with the numbers
-// attached. The old in-process phase split is gone on purpose: what `ply` does not report,
-// this bench does not know.
+// The bench: where a `ply test` run's time goes, answered from the product's own reports. Every
+// scenario declares its criterion up front; the report is the verdicts with the numbers attached,
+// beside the harness's own phases (`pipeline`) and what the machine costs in-process (`measure`).
+//
+// `dir`, everywhere below, is the corpus's path relative to the working directory: the `work` root
+// the files are read and written through, and the directory `ply` is spawned in.
 
 import cli.machine
 import cli.machine (machine)
 import measure
 import pipeline
 import spine
+import spine (under)
 import std.json (Json, Str, Number, Bool, Null, Object, object, array)
 import std.json
 import std.fs (fs)
 import std.fs
 import std.process (process)
+import std.config (config)
 import std.time (time)
-import cli.env (env)
-import cli.builder (builder)
 
 // --- The generated corpus's own description ------------------------------------------
 
@@ -32,8 +34,8 @@ pub type Corpus = {
   rename_replacement: String,
 }
 
-pub fn corpus_at(dir: String) -> Result<Corpus, String> / {fs.read_file[cwd]} =
-  match fs.read_file[cwd]("corpus.json") {
+pub fn corpus_at(dir: String) -> Result<Corpus, String> / {fs.read_file[work]} =
+  match fs.read_file[work](under(dir, "corpus.json")) {
     None -> Err("`" ++ dir ++ "` is not a generated corpus: no corpus.json"),
     Some(bytes) -> match json::parse(bytes) {
       Err(e) -> Err("the corpus manifest is not JSON: " ++ e.message),
@@ -83,18 +85,17 @@ pub type Applied = List<{ path: String, text: Bytes }>
 
 // The rename is a whole-corpus textual substitution; the edit is one site, once. Both answer
 // what they changed so the scenario can put it back.
-// Every `.ply` file under the corpus root, as a path relative to it: the walk `ply test`
-// itself takes.
-pub fn ply_files() -> List<String> / {fs.list_dir[cwd], fs.kind[cwd]} = walk(".", [])
+// Every `.ply` file under the corpus, as a path under the root: the walk `ply test` itself takes.
+pub fn ply_files(dir: String) -> List<String> / {fs.list_dir[work], fs.kind[work]} = walk(dir, [])
 
-fn walk(dir: String, acc: List<String>) -> List<String> / {fs.list_dir[cwd], fs.kind[cwd]} =
-  match fs.list_dir[cwd](dir) {
+fn walk(dir: String, acc: List<String>) -> List<String> / {fs.list_dir[work], fs.kind[work]} =
+  match fs.list_dir[work](dir) {
     None -> acc,
     Some(names) ->
       fold(names, acc, |inner: List<String>, name: String|
         if name == ".ply-cache" { inner } else {
-          let path = if dir == "." { name } else { dir ++ "/" ++ name };
-          match fs.kind[cwd](path) {
+          let path = under(dir, name);
+          match fs.kind[work](path) {
             fs::Dir -> walk(path, inner),
             _ -> if bytes_ends_with(bytes_of_string(name), b".ply") { push(inner, path) }
             else { inner },
@@ -106,9 +107,9 @@ pub fn apply_rename(
   dir: String,
   from: String,
   to: String,
-) -> Result<Applied, String> / {fs.list_dir[cwd], fs.kind[cwd], fs.read_file[cwd], fs.write_file[cwd]} = {
-  let applied = fold(ply_files(), [], |acc: Applied, path: String|
-    match fs.read_file[cwd](path) {
+) -> Result<Applied, String> / {fs.list_dir[work], fs.kind[work], fs.read_file[work], fs.write_file[work]} = {
+  let applied = fold(ply_files(dir), [], |acc: Applied, path: String|
+    match fs.read_file[work](path) {
       None -> acc,
       Some(text) -> if bytes_index_of(text, bytes_of_string(from)) != None {
         push(acc, { path: path, text: text })
@@ -118,7 +119,7 @@ pub fn apply_rename(
     Err("`" ++ from ++ "` does not occur in the corpus; the manifest is stale")
   } else {
     let _ = map(applied, |a: { path: String, text: Bytes }|
-      fs.write_file[cwd](a.path, replace_all(a.text, bytes_of_string(from), bytes_of_string(to))));
+      fs.write_file[work](a.path, replace_all(a.text, bytes_of_string(from), bytes_of_string(to))));
     Ok(applied)
   }
 }
@@ -126,9 +127,9 @@ pub fn apply_rename(
 pub fn apply_edit(
   dir: String,
   site: EditSite,
-) -> Result<Applied, String> / {fs.read_file[cwd], fs.write_file[cwd]} = {
-  let path = site.path;
-  match fs.read_file[cwd](path) {
+) -> Result<Applied, String> / {fs.read_file[work], fs.write_file[work]} = {
+  let path = under(dir, site.path);
+  match fs.read_file[work](path) {
     None -> Err("the edit site `" ++ site.path ++ "` is not in the corpus"),
     Some(text) -> {
       let find = bytes_of_string(site.find);
@@ -139,15 +140,15 @@ pub fn apply_edit(
             ++ "`, not once",
         )
       } else {
-        let _ = fs.write_file[cwd](path, replace_first(text, find, bytes_of_string(site.replace)));
+        let _ = fs.write_file[work](path, replace_first(text, find, bytes_of_string(site.replace)));
         Ok([{ path: path, text: text }])
       }
     },
   }
 }
 
-pub fn undo(applied: Applied) -> Unit / {fs.write_file[cwd]} = {
-  let _ = map(applied, |a: { path: String, text: Bytes }| fs.write_file[cwd](a.path, a.text));
+pub fn undo(applied: Applied) -> Unit / {fs.write_file[work]} = {
+  let _ = map(applied, |a: { path: String, text: Bytes }| fs.write_file[work](a.path, a.text));
   ()
 }
 
@@ -185,15 +186,13 @@ fn occurrences(text: Bytes, find: Bytes) -> Int =
 // as disk work.
 pub type Snapshot = List<{ name: String, body: Bytes }>
 
-pub fn take_snapshot(
-  dir: String,
-) -> Snapshot / {fs.list_dir[cwd], fs.read_file[cwd], fs.kind[cwd]} = {
-  let cache = ".ply-cache";
-  match fs.list_dir[cwd](cache) {
+pub fn take_snapshot(dir: String) -> Snapshot / {fs.list_dir[work], fs.read_file[work]} = {
+  let cache = under(dir, ".ply-cache");
+  match fs.list_dir[work](cache) {
     None -> [],
     Some(names) ->
       fold(names, [], |acc: Snapshot, name: String|
-        match fs.read_file[cwd](cache ++ "/" ++ name) {
+        match fs.read_file[work](under(cache, name)) {
           Some(body) -> push(acc, { name: name, body: body }),
           None -> acc,
         }),
@@ -203,33 +202,32 @@ pub fn take_snapshot(
 pub fn restore_snapshot(
   dir: String,
   snap: Snapshot,
-) -> Unit / {fs.list_dir[cwd], fs.remove[cwd], fs.create_dir[cwd], fs.write_file[cwd]} = {
-  let cache = ".ply-cache";
+) -> Unit / {fs.list_dir[work], fs.remove[work], fs.create_dir[work], fs.write_file[work]} = {
+  let cache = under(dir, ".ply-cache");
   clear_dir(cache);
-  let _ = fs.create_dir[cwd](cache);
+  let _ = fs.create_dir[work](cache);
   let _ = map(snap, |f: { name: String, body: Bytes }|
-    fs.write_file[cwd](cache ++ "/" ++ f.name, f.body));
+    fs.write_file[work](under(cache, f.name), f.body));
   ()
 }
 
-fn clear_dir(dir: String) -> Unit / {fs.list_dir[cwd], fs.remove[cwd]} = {
-  let _ = match fs.list_dir[cwd](dir) {
+fn clear_dir(dir: String) -> Unit / {fs.list_dir[work], fs.remove[work]} = {
+  let _ = match fs.list_dir[work](dir) {
     None -> [],
-    Some(names) -> map(names, |name: String| fs.remove[cwd](dir ++ "/" ++ name)),
+    Some(names) -> map(names, |name: String| fs.remove[work](under(dir, name))),
   };
   ()
 }
 
-pub fn clear_cache(dir: String) -> Unit / {fs.list_dir[cwd], fs.remove[cwd]} =
-  clear_dir(".ply-cache")
+pub fn clear_cache(dir: String) -> Unit / {fs.list_dir[work], fs.remove[work]} =
+  clear_dir(under(dir, ".ply-cache"))
 
 // One measured run of the product over the corpus.
 pub fn once(
   dir: String,
-) -> Result<spine::TestReport, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, time.elapsed_us} = {
-  let args = ["test", dir, "--json", "--color", "never"];
+) -> Result<spine::TestReport, String> / {process.spawn[ply], config.get[env], time.elapsed_ms} = {
   let started = time.elapsed_ms();
-  let done = spine::ply(args, dir);
+  let done = spine::ply(["test", ".", "--json", "--color", "never"], dir);
   // The wall, not the report's own clock: the user waits for the process.
   let wall_ms = time.elapsed_ms() - started;
   match spine::report_json(done) {
@@ -245,7 +243,7 @@ pub fn once(
 pub fn run(
   dir: String,
   repeats: Int,
-) -> Result<String, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, time.elapsed_us, fs.list_dir[cwd], fs.read_file[cwd], fs.write_file[cwd], fs.kind[cwd], fs.remove[cwd], fs.create_dir[cwd], builder.git[vcs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.resolved[cwd], fs.resolved[abs], env.pwd[sys], time.elapsed_ms, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], fs.list_dir[cwd], fs.remove[cwd]} =
+) -> Result<spine::Report, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
   match corpus_at(dir) {
     Err(why) -> Err(why),
     Ok(corpus) -> {
@@ -266,14 +264,12 @@ pub fn run(
                 Err(e) -> Err(e),
                 Ok(h) ->
                   Ok(
-                    json::to_string(
-                      report_json(
-                        dir,
-                        corpus,
-                        measure::measure_json(dir, repeats),
-                        pipeline::pipeline_json(dir),
-                        [{ ..cold_scenario(), runs: c }, { ..warm_scenario(), runs: w }, r, l, h],
-                      ),
+                    report_of(
+                      dir,
+                      corpus,
+                      measure::measure_json(dir, repeats),
+                      pipeline::pipeline_json(dir),
+                      [{ ..cold_scenario(), runs: c }, { ..warm_scenario(), runs: w }, r, l, h],
                     ),
                   ),
               },
@@ -370,7 +366,7 @@ fn go_repeat(
   left: Int,
   reset: String,
   acc: List<spine::TestReport>,
-) -> Result<List<spine::TestReport>, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, time.elapsed_us, fs.list_dir[cwd], fs.remove[cwd]} =
+) -> Result<List<spine::TestReport>, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, fs.list_dir[work], fs.remove[work]} =
   if left <= 0 { Ok(acc) } else {
     let _ = if reset == "clear" { clear_cache(dir) } else { () };
     match once(dir) { Err(e) -> Err(e), Ok(r) -> go_repeat(dir, left - 1, reset, push(acc, r)) }
@@ -384,7 +380,7 @@ fn mutated_scenario(
   corpus: Corpus,
   repeats: Int,
   which: String,
-) -> Result<Scenario, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, time.elapsed_us, fs.list_dir[cwd], fs.read_file[cwd], fs.write_file[cwd], fs.kind[cwd], fs.remove[cwd], fs.create_dir[cwd]} = {
+) -> Result<Scenario, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, fs.read[work], fs.write[work]} = {
   let snap = take_snapshot(dir);
   match apply_mutation(dir, corpus, which) {
     Err(e) -> Err(e),
@@ -402,7 +398,7 @@ fn go_mutation(
   dir: String,
   snap: Snapshot,
   acc: List<spine::TestReport>,
-) -> Result<List<spine::TestReport>, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, time.elapsed_us, fs.list_dir[cwd], fs.remove[cwd], fs.create_dir[cwd], fs.write_file[cwd]} =
+) -> Result<List<spine::TestReport>, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, fs.list_dir[work], fs.remove[work], fs.create_dir[work], fs.write_file[work]} =
   if left <= 0 { Ok(acc) } else {
     let _ = restore_snapshot(dir, snap);
     match once(dir) { Err(e) -> Err(e), Ok(r) -> go_mutation(left - 1, dir, snap, push(acc, r)) }
@@ -412,33 +408,37 @@ fn apply_mutation(
   dir: String,
   corpus: Corpus,
   which: String,
-) -> Result<Applied, String> / {fs.list_dir[cwd], fs.kind[cwd], fs.read_file[cwd], fs.write_file[cwd]} =
+) -> Result<Applied, String> / {fs.list_dir[work], fs.kind[work], fs.read_file[work], fs.write_file[work]} =
   if which == "rename" { apply_rename(dir, corpus.rename_symbol, corpus.rename_replacement) }
   else if which == "leaf" { apply_edit(dir, corpus.leaf) }
   else { apply_edit(dir, corpus.hub) }
 
 // --- The report -------------------------------------------------------------------------------
 
-pub fn report_json(
+pub fn report_of(
   dir: String,
   corpus: Corpus,
   measured: Json,
   pipelined: Json,
   scenarios: List<Scenario>,
-) -> Json = {
+) -> spine::Report = {
   let rows = rows_of(corpus, scenarios);
-  object([
-    { key: "root", value: Str(dir) },
-    { key: "modules", value: Number(decimal_of_int(corpus.modules)) },
-    { key: "definitions", value: Number(decimal_of_int(corpus.definitions)) },
-    { key: "tests", value: Number(decimal_of_int(corpus.tests)) },
-    { key: "source_bytes", value: Number(decimal_of_int(corpus.bytes)) },
-    { key: "ok", value: Bool(all_pass(rows)) },
-    { key: "measure", value: measured },
-    { key: "pipeline", value: pipelined },
-    { key: "scenarios", value: array(map(rows, |row: spine::Row| scenario_json(row))) },
-    { key: "rendered", value: Str(render(dir, corpus, rows)) },
-  ])
+  let rendered = render(dir, corpus, rows);
+  {
+    json: object([
+      { key: "root", value: Str(dir) },
+      { key: "modules", value: Number(decimal_of_int(corpus.modules)) },
+      { key: "definitions", value: Number(decimal_of_int(corpus.definitions)) },
+      { key: "tests", value: Number(decimal_of_int(corpus.tests)) },
+      { key: "source_bytes", value: Number(decimal_of_int(corpus.bytes)) },
+      { key: "ok", value: Bool(all_pass(rows)) },
+      { key: "measure", value: measured },
+      { key: "pipeline", value: pipelined },
+      { key: "scenarios", value: array(map(rows, |row: spine::Row| scenario_json(row))) },
+      { key: "rendered", value: Str(rendered) },
+    ]),
+    rendered: rendered,
+  }
 }
 
 fn scenario_json(row: spine::Row) -> Json = {
@@ -536,4 +536,34 @@ test "the rename row's criterion fires" {
   assert(match (s.judge)(r, c) { Err(_) -> true, Ok(_) -> false });
   let clear: spine::TestReport = { ..r, selected: 0, cached: 4 };
   assert(match (s.judge)(clear, c) { Ok(_) -> true, Err(_) -> false });
+}
+
+test "the report's table is the text it carries" {
+  let r: spine::TestReport = {
+    ok: true,
+    duration_ms: 12,
+    total: 4,
+    selected: 0,
+    passed: 4,
+    failed: 0,
+    cached: 4,
+    groups: 1,
+    read_ms: 0,
+    front_ms: 1,
+    write_back_ms: 0,
+  };
+  let c: Corpus = {
+    modules: 2,
+    definitions: 5,
+    tests: 4,
+    bytes: 2048,
+    leaf: { path: "a", find: "x", replace: "y", dependents: 1 },
+    hub: { path: "b", find: "p", replace: "q", dependents: 3 },
+    rename_symbol: "s",
+    rename_replacement: "t",
+  };
+  let report = report_of("sweep/m2", c, Null, Null, [{ ..warm_scenario(), runs: [r] }]);
+  assert(string_starts_with(report.rendered, "sweep/m2\n2 modules · 5 definitions"));
+  assert(string_contains(report.rendered, "pass  warm  12ms  selected 0 of 4 (4 cached)"));
+  assert(string_contains(json::to_string(report.json), "\"root\":\"sweep/m2\""))
 }
