@@ -94,6 +94,7 @@ pub fn program() -> Result<Vec<u8>, Diagnostic> {
     }
     let staged = stage().join(ARTIFACT);
     if let Ok(bytes) = std::fs::read(&staged) {
+        ply_codegen::c::sweep::used(&stage());
         return Ok(bytes);
     }
     let bytes = build()?;
@@ -118,13 +119,10 @@ pub fn build() -> Result<Vec<u8>, Diagnostic> {
 
 fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
     let loaded = ply_machine::load::load(dir).map_err(|err| {
-        // Rendered where it happened: this program is only ever built from sources in the tree,
-        // so a refusal is a defect someone has to find, not a user's mistake to summarise.
+        // With where it happened: this program is only ever built from sources in the tree, so a
+        // refusal is a defect someone has to find, not a user's mistake to summarise.
         unbuilt(match err.diagnostics.first() {
-            Some(d) => format!(
-                "it does not check:\n{}",
-                ply_span::render::to_terminal(d, &err.sources, false)
-            ),
+            Some(d) => format!("it does not check:\n{}", d.clone().placed(&err.sources)),
             None => "it does not check, and nothing said why".to_string(),
         })
     })?;

@@ -17,10 +17,7 @@ fn main() {
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
         Err(diagnostic) => {
-            eprint!(
-                "{}",
-                ply_span::render::to_terminal(&diagnostic, &ply_span::SourceMap::new(), false)
-            );
+            eprintln!("{diagnostic}");
             std::process::exit(1);
         }
     };
@@ -42,16 +39,10 @@ fn main() {
     let code = match ply_launcher::run(&program, &root, argv, binds, count) {
         Ok(code) => code,
         Err(diagnostic) => {
-            eprint!(
-                "{}",
-                ply_span::render::to_terminal(&diagnostic, &ply_span::SourceMap::new(), false)
-            );
+            eprintln!("{diagnostic}");
             1
         }
     };
-    if ply_eval::census::enabled() {
-        eprint!("{}", ply_eval::census::report());
-    }
     std::process::exit(code);
 }
 

@@ -7,7 +7,6 @@ pub mod arena;
 pub mod argv;
 pub mod backend;
 pub mod builtins;
-pub mod census;
 pub mod compiled;
 pub mod cont;
 pub mod escape;
@@ -44,7 +43,7 @@ pub use arena::{Arena, RegionKind};
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use backend::{Compilation, Counters, Offers, Provider};
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
-pub use compiled::{Compiled, Entered, mentions_a_width};
+pub use compiled::{Compiled, Entered};
 pub use cont::{Frame, Next, Prompt, Segment, SimId, Stack};
 pub use escape::{Boundary, Escapee, Handle};
 pub use host::{
