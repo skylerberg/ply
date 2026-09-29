@@ -15,7 +15,6 @@ pub use decl::{
 };
 pub use front::{
     DefWritten, EffectSet, Front, Hashed, Literal, Ordinal, TypeDecl, WrittenParam, read_front,
-    write_front,
 };
 pub use hash::{DefHash, HashOutput};
 pub use parse::{parse_atom, parse_footprint, parse_row, parse_scheme, parse_type};

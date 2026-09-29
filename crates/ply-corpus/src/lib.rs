@@ -36,8 +36,8 @@ pub fn checked_front_with_std(
     )])?;
     let mut sources = ply_span::SourceMap::new();
     for (name, text) in &answered.modules {
-        let path = if ply_std::is_reserved(name) {
-            ply_std::pseudo_path(&ply_ty::ModuleName::from_dotted(name))
+        let path = if ply_std::is_std(name) {
+            ply_std::pseudo_path(name)
         } else {
             path.to_path_buf()
         };

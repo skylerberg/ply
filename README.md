@@ -20,7 +20,7 @@ of it next.
 
 | path | holds |
 | --- | --- |
-| `crates/ply-span` | spans, diagnostics and the registry of diagnostic codes |
+| `crates/ply-span` | spans, diagnostics and the constants for diagnostic codes |
 | `crates/ply-ty` | the type vocabulary the checker produces and everything else reads |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator |
 | `crates/ply-codegen` | the compiled tier: emits C, builds it and loads it |
