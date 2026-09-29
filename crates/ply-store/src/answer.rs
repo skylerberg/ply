@@ -1,7 +1,7 @@
-//! The parts of the port's per-module claims, in one file replaced whole.
+//! The parts of the port's per-module claims, in one file replaced whole. A part is bytes this
+//! file does not read: the caller encodes it.
 
 use crate::{ContentHash, FRONTEND_FORMAT, FRONTEND_VERSION, disk};
-use ply_span::frames::Cursor;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -12,12 +12,16 @@ pub(crate) const CLAIMS_STEM: &str = "claims";
 const MAGIC: &[u8; 8] = b"PLYPARTS";
 const HEADER: usize = 8 + 32 + 32;
 
+/// Bumped when what a part holds or how the parts are laid out changes; a file of another layout
+/// is then only a miss.
+const PARTS_FORMAT: u32 = 2;
+
 pub(crate) struct Answer {
     path: PathBuf,
     stem: &'static str,
     what: &'static str,
-    stored: OnceLock<BTreeMap<ContentHash, String>>,
-    pending: Option<BTreeMap<ContentHash, String>>,
+    stored: OnceLock<BTreeMap<ContentHash, Vec<u8>>>,
+    pending: Option<BTreeMap<ContentHash, Vec<u8>>>,
 }
 
 impl Answer {
@@ -31,11 +35,11 @@ impl Answer {
         }
     }
 
-    fn stored(&self) -> &BTreeMap<ContentHash, String> {
+    fn stored(&self) -> &BTreeMap<ContentHash, Vec<u8>> {
         self.stored.get_or_init(|| read(&self.path))
     }
 
-    pub(crate) fn part(&self, key: ContentHash) -> Option<String> {
+    pub(crate) fn part(&self, key: ContentHash) -> Option<Vec<u8>> {
         self.pending
             .as_ref()
             .unwrap_or_else(|| self.stored())
@@ -44,7 +48,7 @@ impl Answer {
     }
 
     /// Replaces every part on disk at the next flush, unless these are the parts already there.
-    pub(crate) fn put(&mut self, parts: BTreeMap<ContentHash, String>) {
+    pub(crate) fn put(&mut self, parts: BTreeMap<ContentHash, Vec<u8>>) {
         self.pending = if self.stored().keys().eq(parts.keys()) {
             None
         } else {
@@ -78,17 +82,19 @@ impl Answer {
 
 fn stamp() -> [u8; 32] {
     let mut h = blake3::Hasher::new();
+    h.update(&PARTS_FORMAT.to_le_bytes());
     h.update(&FRONTEND_FORMAT.to_le_bytes());
     h.update(FRONTEND_VERSION.as_bytes());
     *h.finalize().as_bytes()
 }
 
 /// Empty for a missing, foreign or damaged file: each is only a miss.
-fn read(path: &Path) -> BTreeMap<ContentHash, String> {
+fn read(path: &Path) -> BTreeMap<ContentHash, Vec<u8>> {
     parts(path).unwrap_or_default()
 }
 
-fn parts(path: &Path) -> Option<BTreeMap<ContentHash, String>> {
+/// Each part is its key, its length as eight little-endian bytes, and that many bytes.
+fn parts(path: &Path) -> Option<BTreeMap<ContentHash, Vec<u8>>> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() < HEADER || &bytes[..8] != MAGIC || bytes[8..40] != stamp() {
         return None;
@@ -98,16 +104,14 @@ fn parts(path: &Path) -> Option<BTreeMap<ContentHash, String>> {
         return None;
     }
     let mut parts = BTreeMap::new();
-    let mut cursor = Cursor::new(body, "part");
-    while !cursor.done() {
-        let (words, text) = cursor.unit().ok()?;
-        let [key] = words[..] else {
-            return None;
-        };
-        parts.insert(
-            ContentHash::from_hex(key)?,
-            String::from_utf8(text.to_vec()).ok()?,
-        );
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (key, after) = rest.split_first_chunk::<32>()?;
+        let (len, after) = after.split_first_chunk::<8>()?;
+        let len = usize::try_from(u64::from_le_bytes(*len)).ok()?;
+        let part = after.get(..len)?;
+        parts.insert(ContentHash(*key), part.to_vec());
+        rest = &after[len..];
     }
     Some(parts)
 }
@@ -116,13 +120,14 @@ fn write(
     dir: &Path,
     path: &Path,
     stem: &str,
-    parts: &BTreeMap<ContentHash, String>,
+    parts: &BTreeMap<ContentHash, Vec<u8>>,
     what: &str,
 ) -> anyhow::Result<()> {
     let mut body = Vec::new();
-    for (key, text) in parts {
-        body.extend_from_slice(format!("{} {}\n", key.to_hex(), text.len()).as_bytes());
-        body.extend_from_slice(text.as_bytes());
+    for (key, part) in parts {
+        body.extend_from_slice(&key.0);
+        body.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        body.extend_from_slice(part);
     }
     let mut out = Vec::with_capacity(HEADER + body.len());
     out.extend_from_slice(MAGIC);
