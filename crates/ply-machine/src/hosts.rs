@@ -23,7 +23,7 @@ pub fn registry() -> HostRegistry {
 /// One host operation and the handler that serves it, as a caller lends it to an entry.
 pub type Lent = (HostOp, Arc<dyn HostHandler>);
 
-fn registry_for(_check: &CheckOutput, trace: Option<Arc<ply_host::trace::Trace>>) -> HostRegistry {
+fn registry_for(trace: Option<Arc<ply_host::trace::Trace>>) -> HostRegistry {
     match trace {
         Some(trace) => ply_host::registry_over(trace),
         None => ply_host::registry(),
@@ -85,7 +85,7 @@ impl Hosts {
         lent: Vec<Lent>,
     ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
-            let mut registry = registry_for(check, None);
+            let mut registry = registry_for(None);
             for (op, handler) in lent {
                 registry.register(op, handler);
             }
@@ -958,7 +958,7 @@ fn bind(args: &crate::hosts::HostsOptions, loaded: &crate::load::Loaded) -> Resu
     // Whether or not `--host` was passed: a digest that moved with a flag would pin nothing.
     let trace = args.trace.open();
     let stopping = ply_host::signal::Shutdown::new(args.shutdown.bounds());
-    let registry = registry_for(&loaded.check, Some(Arc::clone(&trace)));
+    let registry = registry_for(Some(Arc::clone(&trace)));
     let listing = registry
         .preview(&loaded.check)
         .map_err(|diagnostics| ("NotResolved", diagnostics))?;
