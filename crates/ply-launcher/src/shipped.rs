@@ -137,6 +137,7 @@ pub fn program() -> Result<Vec<u8>, Diagnostic> {
     }
     let staged = stage().join(ARTIFACT);
     if let Ok(bytes) = std::fs::read(&staged) {
+        ply_codegen::c::sweep::used(&stage());
         return Ok(bytes);
     }
     let bytes = build()?;

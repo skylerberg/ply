@@ -1073,7 +1073,7 @@ fn front_cache(artifact: &Artifact) -> PathBuf {
     hasher.update(ply_codegen::c::producer::identity().as_bytes());
     hasher.update(&[0]);
     hasher.update(&ply_std::digest());
-    ply_codegen::c::bundle::stage_dir("artifact-fronts")
+    ply_codegen::c::bundle::stage_dir(ply_codegen::c::sweep::FRONTS)
         .join(format!("front.{}", &hasher.finalize().to_hex()[..16]))
 }
 
@@ -1120,7 +1120,10 @@ fn cached_front(
     let kept_ids = ids.clone();
     let kept_sources = sources.clone();
     match place_and_read(&modules, dump, ids, sources) {
-        Ok(front) => Some(front),
+        Ok(front) => {
+            ply_codegen::c::sweep::used(at);
+            Some(front)
+        }
         Err(_) => {
             *ids = kept_ids;
             *sources = kept_sources;
