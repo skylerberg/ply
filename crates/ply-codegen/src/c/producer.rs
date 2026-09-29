@@ -9,7 +9,7 @@ use ply_eval::decode::{self, At};
 use ply_eval::{Fields, Value};
 use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, Severity, SourceId, Symbol, codes};
-use ply_ty::{DefHash, Front, ModuleName, read_front};
+use ply_ty::{DefHash, Front, read_front};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -109,10 +109,10 @@ fn shipped_closure(own: &[(String, String)]) -> Vec<(String, String)> {
         .map(str::to_string)
         .collect();
     while let Some(name) = frontier.pop() {
-        if !ply_std::is_reserved(&name) {
+        if !ply_std::is_std(&name) {
             continue;
         }
-        let Some(text) = ply_std::source(&ModuleName::from_dotted(&name)) else {
+        let Some(text) = ply_std::source(&name) else {
             continue;
         };
         if wanted.insert(name) {
@@ -174,10 +174,14 @@ pub fn build(src: &Sources) -> Result<PlyProducer, String> {
     let (native, _refused) = if carried.sources_digest() == Some(identity.as_str()) {
         super::bundle::build(&carried).map_err(|e| format!("{e:#}"))?
     } else {
-        let staged = super::bundle::from_dir(&super::bundle::stage_dir(&identity))
-            .and_then(|stage| super::bundle::build(&stage).ok());
+        let dir = super::bundle::stage_dir(&identity);
+        let staged =
+            super::bundle::from_dir(&dir).and_then(|stage| super::bundle::build(&stage).ok());
         match staged {
-            Some(built) => built,
+            Some(built) => {
+                super::sweep::used(&dir);
+                built
+            }
             None => emit_stage(src, &identity)?,
         }
     };
@@ -1186,7 +1190,7 @@ pub fn checked_front_with_std(user: &[(String, String)]) -> Result<FrontWithStd>
     let pulled = front_pulling_std(user, &shipped)?;
     let mut modules: Vec<(String, String)> = user.to_vec();
     for name in &pulled.modules {
-        let Some(text) = ply_std::source(&ply_ty::ModuleName::from_dotted(name)) else {
+        let Some(text) = ply_std::source(name) else {
             bail!("the front end pulled `{name}`, which does not ship");
         };
         modules.push((name.clone(), text.to_string()));

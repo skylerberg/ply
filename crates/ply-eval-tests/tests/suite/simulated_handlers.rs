@@ -86,9 +86,13 @@ fn every_seeded_operation_has_the_declared_mode_and_types() {
             .get(&Symbol::new(sig.op))
             .unwrap_or_else(|| panic!("`{sig}` is declared"));
         assert_eq!(op.mode, sig.mode, "`{sig}` disagrees about its mode");
-        let params: Vec<Type> = sig.params.iter().map(|p| p.ply()).collect();
+        let params: Vec<Type> = sig.params.iter().map(|p| Type::con(p.as_str())).collect();
         assert_eq!(op.params, params, "`{sig}` disagrees about its parameters");
-        assert_eq!(op.ret, sig.ret.ply(), "`{sig}` disagrees about its result");
+        assert_eq!(
+            op.ret,
+            Type::con(sig.ret.as_str()),
+            "`{sig}` disagrees about its result"
+        );
     }
 }
 
