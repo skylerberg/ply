@@ -1,7 +1,12 @@
 //! The `process` effect: the arguments, the two output streams, standard input, the exit code, and
-//! spawning.
+//! the programs a run may start, to completion or beside it.
 
-use crate::pool::{Done, Ended, PROCESS_FIRST_TOKEN, Pool};
+mod children;
+
+pub(crate) use children::{Children, Io, Output, Signal};
+
+use crate::pool::{Bell, Done, Exit, PROCESS_FIRST_TOKEN, Pool};
+use children::{Child, Launch, Refusal, Unusable};
 use ply_eval::host::HostRegistry;
 use ply_eval::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime,
@@ -13,9 +18,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The Ply declaration the registrations below are checked against.
 pub const DECLARATION: &str = ply_std::PROCESS;
@@ -27,7 +32,8 @@ pub const EFFECT: &str = "std.process.process";
 /// What `process.exit` accepts; above it the shell reports a signal or its own failure.
 pub const EXIT_RANGE: RangeInclusive<i64> = 0..=125;
 
-/// What one captured stream holds; a spawn answers with the whole of each, as `fs.read_file` does.
+/// What one captured stream holds: a spawn's whole stream, or what a child's `Keep` stream took
+/// and its `Lines` stream holds unread.
 pub const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -196,22 +202,26 @@ fn is_executable(_: &Path) -> bool {
 
 pub struct ProcessHost {
     argv: Vec<String>,
-    sink: Sink,
+    /// Shared with the drains that forward an inheriting child's lines to a captured sink.
+    sink: Arc<Sink>,
     exit: Mutex<Option<i32>>,
     /// The programs `--exec NAME=PATH` bound; a label outside this is `E0456`.
     executables: Executables,
     /// Where a spawn waits, so a driver that starts a compiler does not stop the machine.
     pool: Pool,
+    /// Held nowhere else, so the children go when the host does.
+    children: Arc<Children>,
 }
 
 impl ProcessHost {
     pub fn new(argv: Vec<String>, sink: Sink) -> ProcessHost {
         ProcessHost {
             argv,
-            sink,
+            sink: Arc::new(sink),
             exit: Mutex::new(None),
             executables: Executables::new(),
             pool: Pool::new(PROCESS_FIRST_TOKEN),
+            children: Arc::new(Children::new()),
         }
     }
 
@@ -242,6 +252,14 @@ impl ProcessHost {
         self.pool.outstanding()
     }
 
+    pub fn ready(&self) -> bool {
+        self.pool.ready()
+    }
+
+    pub fn ring(&self, bell: &Arc<Bell>) {
+        self.pool.ring(bell);
+    }
+
     pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
         self.pool.block_on(pending)
     }
@@ -257,10 +275,19 @@ impl ProcessHost {
 
     /// Every line a captured sink took, in order; a real sink keeps nothing.
     pub fn captured(&self) -> Vec<(Stream, String)> {
-        match &self.sink {
+        match &*self.sink {
             Sink::Captured(lines) => lock(lines).clone(),
             Sink::Real { .. } => Vec::new(),
         }
+    }
+
+    pub(crate) fn children(&self) -> &Arc<Children> {
+        &self.children
+    }
+
+    /// Kills and reaps every child `process.start` launched that is still running.
+    pub fn end_children(&self) {
+        self.children.end_all();
     }
 }
 
@@ -295,10 +322,29 @@ pub enum Op {
     Line,
     Exit,
     Spawn,
+    Start,
+    Wait,
+    Signal,
+    Input,
+    EndInput,
+    OutputLine,
 }
 
 impl Op {
-    pub const ALL: [Op; 6] = [Op::Args, Op::Out, Op::Err, Op::Line, Op::Exit, Op::Spawn];
+    pub const ALL: [Op; 12] = [
+        Op::Args,
+        Op::Out,
+        Op::Err,
+        Op::Line,
+        Op::Exit,
+        Op::Spawn,
+        Op::Start,
+        Op::Wait,
+        Op::Signal,
+        Op::Input,
+        Op::EndInput,
+        Op::OutputLine,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -308,6 +354,12 @@ impl Op {
             Op::Line => "line",
             Op::Exit => "exit",
             Op::Spawn => "spawn",
+            Op::Start => "start",
+            Op::Wait => "wait",
+            Op::Signal => "signal",
+            Op::Input => "input",
+            Op::EndInput => "end_input",
+            Op::OutputLine => "output_line",
         }
     }
 
@@ -319,6 +371,12 @@ impl Op {
             Op::Line => "`process.line`",
             Op::Exit => "`process.exit`",
             Op::Spawn => "`process.spawn`",
+            Op::Start => "`process.start`",
+            Op::Wait => "`process.wait`",
+            Op::Signal => "`process.signal`",
+            Op::Input => "`process.input`",
+            Op::EndInput => "`process.end_input`",
+            Op::OutputLine => "`process.output_line`",
         }
     }
 
@@ -330,14 +388,32 @@ impl Op {
             Op::Line => "ply_host::process::line",
             Op::Exit => "ply_host::process::exit",
             Op::Spawn => "ply_host::process::spawn",
+            Op::Start => "ply_host::process::start",
+            Op::Wait => "ply_host::process::wait",
+            Op::Signal => "ply_host::process::signal",
+            Op::Input => "ply_host::process::input",
+            Op::EndInput => "ply_host::process::end_input",
+            Op::OutputLine => "ply_host::process::output_line",
         }
     }
 
     pub fn arity(self) -> usize {
         match self {
             Op::Args | Op::Line => 0,
-            Op::Out | Op::Err | Op::Exit => 1,
+            Op::Out | Op::Err | Op::Exit | Op::EndInput => 1,
+            Op::Wait | Op::Signal | Op::Input | Op::OutputLine => 2,
             Op::Spawn => 3,
+            Op::Start => 4,
+        }
+    }
+
+    /// Waits for another process, for a person, or on a pipe a child drains at its own pace.
+    pub fn waits(self) -> bool {
+        match self {
+            Op::Spawn | Op::Line | Op::Wait | Op::Input | Op::OutputLine => true,
+            Op::Args | Op::Out | Op::Err | Op::Exit | Op::Start | Op::Signal | Op::EndInput => {
+                false
+            }
         }
     }
 
@@ -347,15 +423,23 @@ impl Op {
             op: Symbol::new(self.name()),
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
-            // The arguments never change; a line written twice is written twice, and a line read
-            // is consumed once.
+            // The arguments never change; everything else writes, starts, signals, reaps or
+            // consumes.
             linearity: match self {
                 Op::Args => Linearity::Repeatable,
-                Op::Out | Op::Err | Op::Line | Op::Exit | Op::Spawn => Linearity::AtMostOnce,
+                Op::Out
+                | Op::Err
+                | Op::Line
+                | Op::Exit
+                | Op::Spawn
+                | Op::Start
+                | Op::Wait
+                | Op::Signal
+                | Op::Input
+                | Op::EndInput
+                | Op::OutputLine => Linearity::AtMostOnce,
             },
-            // A spawn waits for another process and a read waits for a person, so both wait in the
-            // pool rather than on the machine.
-            blocking: self == Op::Spawn || self == Op::Line,
+            blocking: self.waits(),
             secrets: false,
             path: self.path(),
         }
@@ -422,17 +506,91 @@ impl HostHandler for Operation {
             // The resolved atom's resource, never one the handler re-derives.
             Op::Spawn => {
                 let Some(program) = host.executables.get(&req.atom.resource) else {
-                    return Err(unbound(&req.atom.resource, span));
+                    return Err(unbound(self.op, &req.atom.resource, span));
                 };
                 let program = program.to_path_buf();
                 let args = argument_vector(&req.args[0], span)?;
                 let dir = req.args[1].as_str(span, "a working directory")?.to_string();
-                let env = environment(&req.args[2], span)?;
+                let env = environment(self.op, &req.args[2], span)?;
                 let pending = host.pool.submit(
                     span,
                     "process-spawn",
                     Op::Spawn.what(),
-                    Box::new(move || start(&program, &args, &dir, &env, span)),
+                    Box::new(move || run_to_end(&program, &args, &dir, &env, span)),
+                )?;
+                Ok(HostAnswer::Pending(pending))
+            }
+            Op::Start => {
+                let Some(program) = host.executables.get(&req.atom.resource) else {
+                    return Err(unbound(self.op, &req.atom.resource, span));
+                };
+                let args = argument_vector(&req.args[0], span)?;
+                let env = environment(self.op, &req.args[2], span)?;
+                let io = io_of(&req.args[3], span)?;
+                let launch = Launch {
+                    label: &req.atom.resource,
+                    program,
+                    args: &args,
+                    dir: req.args[1].as_str(span, "a working directory")?,
+                    env: &env,
+                    io: &io,
+                };
+                Ok(HostAnswer::Value(
+                    match host.children.start(&launch, &host.sink) {
+                        Ok(handle) => Value::ctor("Ok", vec![Value::Int(handle)]),
+                        Err(why) => Value::ctor("Err", vec![Value::str(why)]),
+                    },
+                ))
+            }
+            Op::Wait => {
+                let (handle, child) = child_of(host, self.op, req)?;
+                let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
+                let pending = host.pool.submit(
+                    span,
+                    "process-wait",
+                    Op::Wait.what(),
+                    Box::new(move || match child.wait(deadline) {
+                        Ok(exit) => Done::MaybeFinished(exit),
+                        Err(refusal) => refused(Op::Wait, handle, &child, refusal, span),
+                    }),
+                )?;
+                Ok(HostAnswer::Pending(pending))
+            }
+            Op::Signal => {
+                let (handle, child) = child_of(host, self.op, req)?;
+                let signal = signal_of(&req.args[1], span)?;
+                let delivered = child
+                    .signal(signal)
+                    .map_err(|e| undelivered(handle, signal, &e, span))?;
+                Ok(HostAnswer::Value(Value::Bool(delivered)))
+            }
+            Op::Input => {
+                let (_, child) = child_of(host, self.op, req)?;
+                let bytes = Arc::clone(req.args[1].as_bytes(span, "the bytes to write")?);
+                let pending = host.pool.submit(
+                    span,
+                    "process-input",
+                    Op::Input.what(),
+                    Box::new(move || Done::Bool(child.input(&bytes))),
+                )?;
+                Ok(HostAnswer::Pending(pending))
+            }
+            Op::EndInput => {
+                let (_, child) = child_of(host, self.op, req)?;
+                child.end_input();
+                Ok(HostAnswer::Value(Value::Unit))
+            }
+            Op::OutputLine => {
+                let (handle, child) = child_of(host, self.op, req)?;
+                let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
+                let pending = host.pool.submit(
+                    span,
+                    "process-output-line",
+                    Op::OutputLine.what(),
+                    Box::new(move || match child.next_line(deadline) {
+                        Ok(heard) => Done::Heard(heard),
+                        Err(refusal) => refused(Op::OutputLine, handle, &child, refusal, span),
+                    }),
                 )?;
                 Ok(HostAnswer::Pending(pending))
             }
@@ -448,18 +606,27 @@ fn argument_vector(value: &Value, span: Span) -> Result<Vec<String>, Diagnostic>
         .collect()
 }
 
-/// The whole environment a spawn runs under; a later entry for one name wins, as `map_insert` does.
-fn environment(value: &Value, span: Span) -> Result<Vec<(String, String)>, Diagnostic> {
+/// The whole environment a child runs under; a later entry for one name wins, as `map_insert`
+/// does.
+fn environment(op: Op, value: &Value, span: Span) -> Result<Vec<(String, String)>, Diagnostic> {
     let mut out = Vec::new();
     for entry in value.as_list(span, "an environment")?.iter() {
         let Value::Record(fields) = entry else {
-            return Err(malformed_env(entry.type_name(), span));
+            return Err(malformed_argument(
+                op,
+                &format!("an environment entry that is {}", entry.type_name()),
+                span,
+            ));
         };
         let (Some(name), Some(setting)) = (
             fields.get(&Symbol::new("name")),
             fields.get(&Symbol::new("value")),
         ) else {
-            return Err(malformed_env("a record without `name` and `value`", span));
+            return Err(malformed_argument(
+                op,
+                "an environment entry without `name` and `value`",
+                span,
+            ));
         };
         out.push((
             name.as_str(span, "a variable's name")?.to_string(),
@@ -467,6 +634,102 @@ fn environment(value: &Value, span: Span) -> Result<Vec<(String, String)>, Diagn
         ));
     }
     Ok(out)
+}
+
+/// A constructor of `std.process` by its simple name, with what it carries.
+fn constructor(value: &Value) -> Option<(&str, &[Value])> {
+    match value {
+        Value::Ctor { name, args } => name
+            .as_str()
+            .strip_prefix(MODULE)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .map(|simple| (simple, args.as_slice())),
+        _ => None,
+    }
+}
+
+fn io_of(value: &Value, span: Span) -> Result<Io, Diagnostic> {
+    let Value::Record(fields) = value else {
+        return Err(malformed_argument(
+            Op::Start,
+            &format!("an `Io` that is {}", value.type_name()),
+            span,
+        ));
+    };
+    let field = |name: &str| {
+        fields.get(&Symbol::new(name)).ok_or_else(|| {
+            malformed_argument(Op::Start, &format!("an `Io` without `{name}`"), span)
+        })
+    };
+    Ok(Io {
+        input: field("input")?.as_bool(span, "whether the child reads input")?,
+        out: output_of(field("out")?, span)?,
+        err: output_of(field("err")?, span)?,
+    })
+}
+
+fn output_of(value: &Value, span: Span) -> Result<Output, Diagnostic> {
+    Ok(match constructor(value) {
+        Some(("Keep", [])) => Output::Keep,
+        Some(("Discard", [])) => Output::Discard,
+        Some(("Inherit", [])) => Output::Inherit,
+        Some(("Lines", [])) => Output::Lines,
+        Some(("File", [path])) => Output::File(path.as_str(span, "a file's path")?.to_string()),
+        _ => {
+            return Err(malformed_argument(
+                Op::Start,
+                &format!("an `Output` that is {}", value.render()),
+                span,
+            ));
+        }
+    })
+}
+
+fn signal_of(value: &Value, span: Span) -> Result<Signal, Diagnostic> {
+    Ok(match constructor(value) {
+        Some(("Hangup", [])) => Signal::Hangup,
+        Some(("Interrupt", [])) => Signal::Interrupt,
+        Some(("Terminate", [])) => Signal::Terminate,
+        Some(("Kill", [])) => Signal::Kill,
+        _ => {
+            return Err(malformed_argument(
+                Op::Signal,
+                &format!("a `Signal` that is {}", value.render()),
+                span,
+            ));
+        }
+    })
+}
+
+/// The child the first argument names, if this operation's label may reach it.
+fn child_of(
+    host: &ProcessHost,
+    op: Op,
+    req: &HostRequest<'_>,
+) -> Result<(i64, Arc<Child>), Diagnostic> {
+    let handle = req.args[0].as_int(req.span, "a child's handle")?;
+    host.children
+        .get(handle, &req.atom.resource)
+        .map(|child| (handle, child))
+        .map_err(|why| unusable(op, handle, &req.atom.resource, why, req.span))
+}
+
+/// A negative timeout waits for as long as it takes, and so does one no clock can reach.
+fn deadline(ms: i64) -> Option<Instant> {
+    let ms = u64::try_from(ms).ok()?;
+    Instant::now().checked_add(Duration::from_millis(ms))
+}
+
+fn refused(op: Op, handle: i64, child: &Child, refusal: Refusal, span: Span) -> Done {
+    match refusal {
+        Refusal::Spent => Done::Refused(raced(op, handle, span)),
+        Refusal::TooMuch { out, err } => {
+            Done::Refused(too_much(op, child.program(), out, err, span))
+        }
+        Refusal::Unreaped(why) => {
+            Done::Failed(format!("child {handle}'s ending could not be read: {why}"))
+        }
+    }
 }
 
 /// One line of this process's standard input, without its ending; `None` at end of input. Read in
@@ -485,56 +748,53 @@ fn read_line() -> Done {
     }
 }
 
-/// Buffered, never streamed: Ply has no file handles, so each stream arrives whole or not at all.
-fn start(program: &Path, args: &[String], dir: &str, env: &[(String, String)], span: Span) -> Done {
+/// The whole environment is `env`, and `""` is the run's own directory.
+fn command(program: &Path, args: &[String], dir: &str, env: &[(String, String)]) -> Command {
     let mut command = Command::new(program);
-    command.args(args).env_clear().stdin(Stdio::null());
+    command.args(args).env_clear();
     for (name, value) in env {
         command.env(name, value);
     }
     if !dir.is_empty() {
         command.current_dir(dir);
     }
-    match command.output() {
+    command
+}
+
+/// Each stream arrives whole or not at all; `process.start` is what streams.
+fn run_to_end(
+    program: &Path,
+    args: &[String],
+    dir: &str,
+    env: &[(String, String)],
+    span: Span,
+) -> Done {
+    match command(program, args, dir, env)
+        .stdin(Stdio::null())
+        .output()
+    {
         Err(e) => Done::Failed(format!("`{}` could not be started: {e}", program.display())),
         Ok(done) => {
             if done.stdout.len() > MAX_CAPTURE_BYTES || done.stderr.len() > MAX_CAPTURE_BYTES {
                 return Done::Refused(too_much(
+                    Op::Spawn,
                     program,
                     done.stdout.len(),
                     done.stderr.len(),
                     span,
                 ));
             }
-            Done::Spawned {
-                ended: ended(&done.status),
+            Done::Finished(Exit {
+                ended: children::ending(&done.status),
                 out: done.stdout,
                 err: done.stderr,
-            }
+            })
         }
     }
 }
 
-fn ended(status: &ExitStatus) -> Ended {
-    match status.code() {
-        Some(code) => Ended::Exited(i64::from(code)),
-        None => Ended::Signalled(signal_of(status)),
-    }
-}
-
-#[cfg(unix)]
-fn signal_of(status: &ExitStatus) -> i64 {
-    use std::os::unix::process::ExitStatusExt;
-    status.signal().map_or(0, i64::from)
-}
-
-#[cfg(not(unix))]
-fn signal_of(_: &ExitStatus) -> i64 {
-    0
-}
-
 #[cold]
-pub fn unbound(at: &Resource, span: Span) -> Diagnostic {
+pub fn unbound(op: Op, at: &Resource, span: Span) -> Diagnostic {
     let label = match at {
         Resource::Named(name) => name.as_str().to_string(),
         Resource::Var(v) => ply_ty::label_var_name(*v),
@@ -543,15 +803,18 @@ pub fn unbound(at: &Resource, span: Span) -> Diagnostic {
     };
     Diagnostic::error(
         codes::PROCESS_EXEC_UNBOUND,
-        format!("`process.spawn` names `{label}`, and no executable is bound to it"),
+        format!(
+            "{} names `{label}`, and no executable is bound to it",
+            op.what()
+        ),
     )
     .primary(span, format!("`{label}` names no program"))
     .note(format!("bind one beside the run: `--exec {label}=<program>`"))
-    .note("the label is the capability: a spawned process is outside what the effect system can promise, so which program a label may start is named where the run is configured, never in the program")
+    .note("the label is the capability: a child process is outside what the effect system can promise, so which program a label may start is named where the run is configured, never in the program")
 }
 
 #[cold]
-fn too_much(program: &Path, out: usize, err: usize, span: Span) -> Diagnostic {
+fn too_much(op: Op, program: &Path, out: usize, err: usize, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::PROCESS_OUTPUT_TOO_LARGE,
         format!(
@@ -561,16 +824,69 @@ fn too_much(program: &Path, out: usize, err: usize, span: Span) -> Diagnostic {
     )
     .primary(span, "this is more than a captured stream holds")
     .note(format!(
-        "`process.spawn` answers with each stream whole, and the bound is {MAX_CAPTURE_BYTES} bytes"
+        "what the host holds of one stream, whole or as lines not yet read, is at most {MAX_CAPTURE_BYTES} bytes"
     ))
-    .note("a spawn answers with each stream whole, and there is no handle to read a child's output through in pieces as `fs.read_at` reads a file")
+    .note(match op {
+        Op::Spawn => "`process.start` can send a stream to a `File`, or hand it over a line at a time as `Lines`",
+        _ => "read `Lines` as they arrive with `process.output_line`, or send the stream to a `File`",
+    })
 }
 
 #[cold]
-fn malformed_env(found: &str, span: Span) -> Diagnostic {
+fn unusable(op: Op, handle: i64, at: &Resource, why: Unusable, span: Span) -> Diagnostic {
+    match why {
+        Unusable::Unknown => Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("{} was given {handle}, and no child has that handle", op.what()),
+        )
+        .primary(span, "`process.start` never answered this handle")
+        .note("handles ascend and are never reused, so a stale one names nothing rather than whatever started next"),
+        Unusable::Spent => Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("child {handle} has already been waited on"),
+        )
+        .primary(span, "this handle is spent")
+        .note("`process.wait` hands a child back once it has ended, and its handle names nothing after that"),
+        Unusable::Elsewhere(started) => Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!(
+                "child {handle} was started as `process.start{started}` and is used as `process.{}{at}`",
+                op.name()
+            ),
+        )
+        .primary(span, format!("this operation names `{at}`"))
+        .note("a child's label is the executable it was started as, and it keeps that label until it is waited on"),
+    }
+}
+
+/// Another `process.wait` on the same child answered while this one was waiting.
+#[cold]
+fn raced(op: Op, handle: i64, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!(
+            "child {handle} was waited on while {} was waiting",
+            op.what()
+        ),
+    )
+    .primary(span, "another `process.wait` handed this child back first")
+    .note("one child is handed back once; a program that waits on it from two tasks races them")
+}
+
+#[cold]
+fn undelivered(handle: i64, signal: Signal, e: &std::io::Error, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{signal:?}` could not be delivered to child {handle}: {e}"),
+    )
+    .primary(span, "the host could not signal this child")
+}
+
+#[cold]
+fn malformed_argument(op: Op, found: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("`process.spawn` was given an environment entry that is {found}"),
+        format!("{} was given {found}", op.what()),
     )
     .primary(span, "this perform reached the host handler")
     .note("inference checks a perform's argument types, so reaching this means the evaluator was handed a module that was never checked")
