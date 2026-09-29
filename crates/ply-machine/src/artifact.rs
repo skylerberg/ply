@@ -1221,6 +1221,8 @@ pub struct Binds {
     pub roots: Vec<ply_host::fs::RootSpec>,
     pub executables: ply_host::process::Executables,
     pub lent: Vec<crate::hosts::Lent>,
+    /// Certificates its `net.connect_tls` accepts beside the built-in roots, as `--trust` names them.
+    pub trust: Vec<PathBuf>,
 }
 
 /// One entry into an opened artifact, with no line of its own on either stream: the program's
@@ -1239,6 +1241,7 @@ pub fn enter(
         roots,
         executables,
         lent,
+        trust,
     } = binds;
     // A unit built for another runtime is left aside and the bodies serve.
     let unit = if servable(artifact) {
@@ -1263,7 +1266,10 @@ pub fn enter(
     let hosts = crate::hosts::Hosts::open_stopping(
         &opened.front.check,
         true,
-        &crate::options::TlsOptions::default(),
+        &crate::options::TlsOptions {
+            tls: Vec::new(),
+            trust,
+        },
         &roots,
         crate::config::Configuration::default(),
         &crate::trace::TraceOptions::default(),

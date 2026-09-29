@@ -2171,7 +2171,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | flag | meaning |
 | --- | --- |
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
-| `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` label may start (`ply run` only); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare an effect of that name: `machine`, `tester`, `claims`, `builder`, `cache`, `bootstrap`, `hosts` or `edit` (`ply run` only); `E0459` otherwise |
@@ -2256,9 +2256,11 @@ a new resolution passes it over and a lock that pins it keeps it, and its archiv
 is served exactly as before. Nothing is ever deleted.
 
 `PLY_REGISTRY` is one base URL, `https://host[:port][/prefix]`; the client
-verifies the server against the built-in roots, since the command's own
-connections take no `--trust`. `http://` is accepted only for a registry on this
-machine (`localhost`, `127.x.x.x`, `[::1]`), because a publish carries a token.
+verifies the server against the built-in roots and the certificates `PLY_TRUST`
+names (§16), so a registry under a private CA is reached by pointing `PLY_TRUST`
+at the CA's certificate. A handshake the client cannot complete is `E0141`, and
+says so. `http://` is accepted only for a registry on this machine
+(`localhost`, `127.x.x.x`, `[::1]`), because a publish carries a token.
 
 The registry is a Ply program, `crates/ply-registry/ply`:
 
@@ -2275,6 +2277,9 @@ machine. Each package's token is the configuration key `token.<name>` — one ex
 name per key, so a `--config` file of `token.orders=...` lines is the whole of
 who may publish what. It serves one connection at a time, and takes a package's
 lock around every write, so two registries over one store never interleave one.
+Like every Ply listener it binds `127.0.0.1`: another machine reaches it through a
+proxy in front of it, one that passes TLS through to a `--tls` registry or
+terminates it for a plain one.
 
 ## 16. The `ply` command
 
@@ -2282,6 +2287,14 @@ lock around every write, so two registries over one store never interleave one.
 global; `auto` colours only a terminal with `NO_COLOR` unset. The path defaults
 to `.`. Every command takes `--json` and then prints exactly one JSON object on
 stdout, compact and with its keys sorted.
+
+The command reads its own environment: `NO_COLOR`, `PLY_CACHE_UPSTREAM` (§1),
+`PLY_REGISTRY` and `PLY_REGISTRY_TOKEN` (§15.1), the backend's `PLY_C_*`
+(§8.6), and `PLY_TRUST` — PEM files, colon-separated, whose certificates the
+command's own HTTPS connections (a registry's, for `ply publish`, `ply yank` and
+`ply resolve`) accept beside the built-in roots, as `--trust` does for a
+program's `net.connect_tls`. Every file it names must load: one that does not is
+`E0430` before the command runs.
 
 | exit | meaning |
 | --- | --- |
@@ -2495,7 +2508,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0427` | host handler answered an atom outside the entry point's footprint |
 | `E0428` | `blocking` host handler answered inline |
 | `E0429` | `net.listen_tls` named a credential the run lacks |
-| `E0430` | `--tls` credential that does not load |
+| `E0430` | `--tls` credential, or certificate to trust, that does not load |
 | `E0439` | `Secret` passed to a host operation not allowed one |
 | `E0440` | configuration source unreadable |
 | `E0441` | required configuration key missing |
