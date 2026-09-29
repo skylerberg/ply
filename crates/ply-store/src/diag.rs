@@ -1,9 +1,7 @@
 //! A deserializable `Diagnostic`: its `&'static str` code cannot borrow from a runtime file.
 
-use ply_span::{Diagnostic, Fix, Label, Severity};
+use ply_span::{Diagnostic, Fix, Label, Severity, intern_code};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
 
 #[derive(Serialize, Deserialize)]
 pub struct DiagnosticRepr {
@@ -42,19 +40,4 @@ impl From<DiagnosticRepr> for Diagnostic {
             fixes: r.fixes,
         }
     }
-}
-
-/// Leaks each distinct code once, rather than once per cache read.
-pub fn intern_code(code: &str) -> &'static str {
-    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let mut pool = POOL
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(existing) = pool.get(code) {
-        return existing;
-    }
-    let leaked: &'static str = Box::leak(code.to_owned().into_boxed_str());
-    pool.insert(leaked);
-    leaked
 }
