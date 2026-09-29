@@ -156,9 +156,9 @@ fn a_git_dependency_that_cannot_be_fetched_says_so() {
     assert!(err.contains("glib"), "{err}");
 }
 
-/// The one source that still has no resolver: a registry arrives with resolution (P15).
+/// A registry dependency is read from the project's cache, and only `ply resolve` fills it.
 #[test]
-fn a_registry_dependency_is_told_what_resolves_today() {
+fn a_registry_dependency_nothing_fetched_says_what_fetches_it() {
     let dir = tempfile::tempdir().expect("a temp dir");
     std::fs::write(
         dir.path().join("ply.pkg"),
@@ -173,7 +173,15 @@ fn a_registry_dependency_is_told_what_resolves_today() {
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("E0135"), "{err}");
-    assert!(err.contains("path dependencies"), "{err}");
+    assert!(err.contains("`glib` has not been fetched"), "{err}");
+    assert!(err.contains("`ply resolve`"), "{err}");
+
+    // Resolving needs a registry to ask, and says which variable names it.
+    let out = ply(dir.path()).arg("resolve").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0141"), "{err}");
+    assert!(err.contains("`PLY_REGISTRY` is not set"), "{err}");
 }
 
 #[test]

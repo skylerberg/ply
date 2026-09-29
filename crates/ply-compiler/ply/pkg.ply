@@ -228,6 +228,18 @@ fn deps_ok(
             ]),
           ),
         )
+      } else if is_registry(d) && !is_dotted_path(d.name) {
+        // The name is the registry's address for it, and the directory it is fetched into.
+        push(
+          diags,
+          bad(
+            bytes_concat_all([
+              b"the registry dependency `",
+              bytes_of_string(d.name),
+              b"` is not a package name: lower-case identifier segments joined by dots",
+            ]),
+          ),
+        )
       } else { diags };
       deps_ok(rest, push(seen, bytes_of_string(d.name)), here, bad)
     },
@@ -345,6 +357,75 @@ fn a_dep(name: String, floor: Int, path: String) -> String =
 fn supplied_at(root: String, name: String, deps: List<String>) -> Supplied =
   { root: bytes_of_string(root), manifest: Some(a_manifest(name, deps)), modules: [] }
 
+fn a_registry_dep(name: String, floor: Int) -> String =
+  "{name: \"" ++ name ++ "\", prefix: None, min: {major: 0, minor: " ++ int_to_string(floor)
+    ++ ", patch: 0}, source: Registry}"
+
+fn codes_of(clo: Closure) -> List<Bytes> =
+  map(clo.diags, |d: { slot: Int, diag: PDiag }| d.diag.code)
+
+test "a registry dependency is wanted at the root's cache, whichever package declares it" {
+  let app = supplied_at("/x/app", "app", [a_registry_dep("orders", 1), a_dep("lib", 0, "../lib")]);
+  let lib = supplied_at("/x/lib", "lib", [a_registry_dep("money", 0)]);
+  assert_eq(wants([b"/x/app"], [app]), [b"/x/app/.ply-cache/registry/orders", b"/x/lib"]);
+  assert_eq(wants([b"/x/app", b"/x/app/.ply-cache/registry/orders", b"/x/lib"], [app, lib]), [
+    b"/x/app/.ply-cache/registry/money",
+  ]);
+  assert_eq(registry_key(b".", b"orders"), b".ply-cache/registry/orders")
+}
+
+test "a registry dependency at or above its floor is the package its slot holds" {
+  let pkgs: Pkgs = {
+    root: b"/x/app",
+    manifest: Some(a_manifest("app", [a_registry_dep("orders", 1)])),
+    supplied: [supplied_at("/x/app/.ply-cache/registry/orders", "orders", [])],
+  };
+  let clo = closure(pkgs, []);
+  assert_eq(clo.diags, []);
+  assert_eq(map(clo.packages, |p: Package| p.prefix), [b"app", b"orders"]);
+  assert_eq(at(clo.packages, 0).deps, [b"orders"])
+}
+
+test "a registry slot never fetched, fetched below the floor, or holding another package says so" {
+  let unfetched = closure(
+    {
+      root: b"/x/app",
+      manifest: Some(a_manifest("app", [a_registry_dep("orders", 1)])),
+      supplied: [{ root: b"/x/app/.ply-cache/registry/orders", manifest: None, modules: [] }],
+    },
+    [],
+  );
+  assert_eq(codes_of(unfetched), [b"E0135"]);
+  let said = at(unfetched.diags, 0).diag;
+  assert(string_contains(string_of_bytes_lossy(said.message), "`orders` has not been fetched"));
+  assert(string_contains(string_of_bytes_lossy(at(said.notes_text, 0)), "`ply resolve`"));
+  let below = closure(
+    {
+      root: b"/x/app",
+      manifest: Some(a_manifest("app", [a_registry_dep("orders", 2)])),
+      supplied: [supplied_at("/x/app/.ply-cache/registry/orders", "orders", [])],
+    },
+    [],
+  );
+  assert_eq(codes_of(below), [b"E0136"]);
+  assert_eq(at(below.diags, 0).diag.notes, 1);
+  let other = closure(
+    {
+      root: b"/x/app",
+      manifest: Some(a_manifest("app", [a_registry_dep("orders", 1)])),
+      supplied: [supplied_at("/x/app/.ply-cache/registry/orders", "billing", [])],
+    },
+    [],
+  );
+  assert_eq(codes_of(other), [b"E0135"]);
+  assert(
+    string_contains(
+      string_of_bytes_lossy(at(other.diags, 0).diag.message),
+      "holds the package `billing`",
+    ),
+  )
+}
+
 test "a package two others depend on is not a cycle" {
   let edges = [
     { from: 0, target: 1 },
@@ -410,7 +491,11 @@ test "fields that fail validation are named" {
   assert_eq(at(check_source(head ++ b"{name: \"Not A Path\"" ++ tail).diags, 0).code, b"E0131");
   assert_eq(at(check_source(head ++ b"{name: 3" ++ tail).diags, 0).code, b"E0131");
   let dup = b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"d\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}, {name: \"d\", prefix: None, min: {major: 0, minor: 0, patch: 2}, source: Registry}], entry: None}";
-  assert_eq(at(check_source(dup).diags, 0).code, b"E0131")
+  assert_eq(at(check_source(dup).diags, 0).code, b"E0131");
+  let escaping = b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"../up\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}], entry: None}";
+  let refused = at(check_source(escaping).diags, 0);
+  assert_eq(refused.code, b"E0131");
+  assert(string_contains(string_of_bytes_lossy(refused.message), "is not a package name"))
 }
 
 test "a manifest with a syntax error reports the parse, not the shape" {
@@ -488,7 +573,9 @@ fn normalize(path: Bytes, out: List<Bytes>, i: Int) -> Bytes =
 
 // The root keys a set of manifests asks for beyond the ones already known: what a walker
 // reads next. Malformed manifests ask for nothing; their refusal is the final pass's to say.
-pub fn wants(known: List<Bytes>, manifests: List<Supplied>) -> List<Bytes> =
+// The first manifest is the root package's, whose directory holds every registry dependency.
+pub fn wants(known: List<Bytes>, manifests: List<Supplied>) -> List<Bytes> = {
+  let root = match list_at(manifests, 0) { Some(s) -> s.root, None -> b"" };
   fold(manifests, [], |acc: List<Bytes>, s: Supplied|
     match s.manifest {
       None -> acc,
@@ -502,10 +589,11 @@ pub fn wants(known: List<Bytes>, manifests: List<Supplied>) -> List<Bytes> =
               // walker that has not fetched it yet has nothing to read.
               Git(url, rev) ->
                 wanted(known, acc2, git_key(bytes_of_string(url), bytes_of_string(rev))),
-              Registry -> acc2,
+              Registry -> wanted(known, acc2, registry_key(root, bytes_of_string(d.name))),
             }),
       },
     })
+}
 
 fn wanted(known: List<Bytes>, acc: List<Bytes>, root: Bytes) -> List<Bytes> =
   if has(known, root) || has(acc, root) { acc } else { push(acc, root) }
@@ -514,6 +602,15 @@ fn wanted(known: List<Bytes>, acc: List<Bytes>, root: Bytes) -> List<Bytes> =
 /// end judges it like any other root, so nothing here needs to know where a fetch puts a tree — and
 /// `rev` is read from the last `@`, since a url may hold one of its own (`git@host:path`).
 pub fn git_key(url: Bytes, rev: Bytes) -> Bytes = bytes_concat_all([b"git+", url, b"@", rev])
+
+/// The root package's registry cache, where every registry dependency of its closure is read from.
+pub fn registry_dir(root: Bytes) -> Bytes = join_normalized(root, b".ply-cache/registry")
+
+/// Where one registry dependency is read from: a directory per name, since a closure holds one
+/// version of a name. `ply resolve` puts the version the closure selects there, and every other
+/// walk only reads it. The name is a package name, which the manifest check holds it to.
+pub fn registry_key(root: Bytes, name: Bytes) -> Bytes =
+  bytes_concat_all([registry_dir(root), b"/", name])
 
 /// The url and revision a key names, for the walker that has to fetch it.
 pub fn git_spec(key: Bytes) -> Option<{ url: Bytes, rev: Bytes }> =
@@ -803,173 +900,173 @@ fn one_dep(
   acc: Pending,
   d: Dep,
 ) -> Pending = {
-  let slot = slot_of(texts, i);
   let name = bytes_of_string(d.name);
   match d.source {
     Git(url, rev) -> {
       let key = git_key(bytes_of_string(url), bytes_of_string(rev));
-      match root_index(roots, key, 0) {
-        None ->
-          push_diag_text(
-            acc,
-            slot,
-            b"E0135",
-            bytes_concat_all([b"the dependency `", name, b"` at `", key, b"` was not fetched"]),
-          ),
-        Some(j) -> match at(manifests, j) {
-          None ->
-            push_diag_text(
+      reached(
+        texts,
+        roots,
+        manifests,
+        i,
+        acc,
+        d,
+        key,
+        bytes_concat_all([b"the dependency `", name, b"` at `", key, b"` was not fetched"]),
+        [],
+      )
+    },
+    Path(p) -> {
+      let target = join_normalized(at(roots, i), bytes_of_string(p));
+      reached(
+        texts,
+        roots,
+        manifests,
+        i,
+        acc,
+        d,
+        target,
+        bytes_concat_all([b"the dependency `", name, b"` at `", target, b"` was not read"]),
+        [],
+      )
+    },
+    Registry ->
+      reached(
+        texts,
+        roots,
+        manifests,
+        i,
+        acc,
+        d,
+        registry_key(at(roots, 0), name),
+        bytes_concat_all([b"the registry dependency `", name, b"` has not been fetched"]),
+        [resolve_note()],
+      ),
+  }
+}
+
+fn resolve_note() -> Bytes =
+  b"`ply resolve` fetches the version this closure selects into the project's `.ply-cache/registry`"
+
+fn is_registry(d: Dep) -> Bool = match d.source { Registry -> true, _ -> false }
+
+// A dependency judged at the root the walk supplied it under: it must have been read, hold a
+// manifest, be the package a registry slot is named for, be at least the floor asked for, and call
+// itself by the prefix it is granted. A registry slot with no manifest is one never fetched.
+fn reached(
+  texts: List<Option<Bytes>>,
+  roots: List<Bytes>,
+  manifests: List<Option<Manifest>>,
+  i: Int,
+  acc: Pending,
+  d: Dep,
+  key: Bytes,
+  absent: Bytes,
+  notes: List<Bytes>,
+) -> Pending = {
+  let slot = slot_of(texts, i);
+  let name = bytes_of_string(d.name);
+  match root_index(roots, key, 0) {
+    None -> push_diag_notes(acc, slot, b"E0135", absent, notes),
+    Some(j) -> match at(texts, j) {
+      None -> if is_registry(d) { push_diag_notes(acc, slot, b"E0135", absent, notes) } else {
+        push_diag_text(
+          acc,
+          slot,
+          b"E0135",
+          bytes_concat_all([
+            b"the dependency `",
+            name,
+            b"` at `",
+            key,
+            b"` holds no ply.pkg; a package that is depended on must declare one",
+          ]),
+        )
+      },
+      Some(_) -> match at(manifests, j) {
+        None -> acc,
+        Some(tm) -> {
+          let granted = bytes_of_string(prefix_of(tm));
+          let aliased = match d.prefix { None -> granted, Some(a) -> bytes_of_string(a) };
+          if is_registry(d) && tm.name != d.name {
+            push_diag_notes(
               acc,
               slot,
               b"E0135",
+              bytes_concat_all([
+                b"the registry dependency `",
+                name,
+                b"` at `",
+                key,
+                b"` holds the package `",
+                bytes_of_string(tm.name),
+                b"`",
+              ]),
+              notes,
+            )
+          } else if compare(tm.version, d.min) == Less {
+            // `derive ord` gives the type a `compare`, not an operator.
+            push_diag_notes(
+              acc,
+              slot,
+              b"E0136",
               bytes_concat_all([
                 b"the dependency `",
                 name,
                 b"` at `",
                 key,
-                b"` holds no ply.pkg; a package that is depended on must declare one",
+                b"` is version ",
+                version_text(tm.version),
+                b", and this manifest asks for at least ",
+                version_text(d.min),
               ]),
-            ),
-          Some(tm) -> match at(texts, j) {
-            None -> acc,
-            Some(_) -> {
-              let granted = bytes_of_string(prefix_of(tm));
-              let aliased = match d.prefix { None -> granted, Some(a) -> bytes_of_string(a) };
-              if compare(tm.version, d.min) == Less {
-                push_diag_text(
-                  acc,
-                  slot,
-                  b"E0136",
-                  bytes_concat_all([
-                    b"the dependency `",
-                    name,
-                    b"` at `",
-                    key,
-                    b"` is version ",
-                    version_text(tm.version),
-                    b", and this manifest asks for at least ",
-                    version_text(d.min),
-                  ]),
-                )
-              } else if aliased != granted {
-                push_diag_text(
-                  acc,
-                  slot,
-                  b"E0133",
-                  bytes_concat_all([
-                    b"the dependency `",
-                    name,
-                    b"` is granted the prefix `",
-                    aliased,
-                    b"` here, but calls itself `",
-                    granted,
-                    b"`",
-                  ]),
-                )
-              } else {
-                {
-                  packages: set_at(acc.packages, i, {
-                    ..at(acc.packages, i),
-                    deps: push(at(acc.packages, i).deps, granted),
-                  }),
-                  diags: acc.diags,
-                  edges: push(acc.edges, { from: i, target: j }),
-                }
-              }
-            },
-          },
-        },
-      }
-    },
-    Registry ->
-      push_diag_text(
-        acc,
-        slot,
-        b"E0135",
-        bytes_concat_all([
-          b"the dependency `",
-          name,
-          b"` comes from the registry; only path dependencies resolve today",
-        ]),
-      ),
-    Path(p) -> {
-      let target = join_normalized(at(roots, i), bytes_of_string(p));
-      match root_index(roots, target, 0) {
-        None ->
-          push_diag_text(
-            acc,
-            slot,
-            b"E0135",
-            bytes_concat_all([b"the dependency `", name, b"` at `", target, b"` was not read"]),
-          ),
-        Some(j) -> match at(texts, j) {
-          None ->
+              notes,
+            )
+          } else if aliased != granted {
             push_diag_text(
               acc,
               slot,
-              b"E0135",
+              b"E0133",
               bytes_concat_all([
                 b"the dependency `",
                 name,
-                b"` at `",
-                target,
-                b"` holds no ply.pkg; a package that is depended on must declare one",
+                b"` is granted the prefix `",
+                aliased,
+                b"` here, but calls itself `",
+                granted,
+                b"`",
               ]),
-            ),
-          Some(_) -> match at(manifests, j) {
-            None -> acc,
-            Some(tm) -> {
-              let granted = bytes_of_string(prefix_of(tm));
-              let aliased = match d.prefix { None -> granted, Some(a) -> bytes_of_string(a) };
-              // `derive ord` gives the type a `compare`, not an operator.
-              if compare(tm.version, d.min) == Less {
-                push_diag_text(
-                  acc,
-                  slot,
-                  b"E0136",
-                  bytes_concat_all([
-                    b"the dependency `",
-                    name,
-                    b"` at `",
-                    target,
-                    b"` is version ",
-                    version_text(tm.version),
-                    b", and this manifest asks for at least ",
-                    version_text(d.min),
-                  ]),
-                )
-              } else if aliased != granted {
-                push_diag_text(
-                  acc,
-                  slot,
-                  b"E0133",
-                  bytes_concat_all([
-                    b"the dependency `",
-                    name,
-                    b"` is granted the prefix `",
-                    aliased,
-                    b"` here, but calls itself `",
-                    granted,
-                    b"`",
-                  ]),
-                )
-              } else {
-                {
-                  packages: set_at(acc.packages, i, {
-                    ..at(acc.packages, i),
-                    deps: push(at(acc.packages, i).deps, granted),
-                  }),
-                  diags: acc.diags,
-                  edges: push(acc.edges, { from: i, target: j }),
-                }
-              }
-            },
-          },
+            )
+          } else {
+            {
+              packages: set_at(acc.packages, i, {
+                ..at(acc.packages, i),
+                deps: push(at(acc.packages, i).deps, granted),
+              }),
+              diags: acc.diags,
+              edges: push(acc.edges, { from: i, target: j }),
+            }
+          }
         },
-      }
+      },
     },
   }
 }
+
+fn push_diag_notes(
+  acc: Pending,
+  slot: Int,
+  code: Bytes,
+  message: Bytes,
+  notes: List<Bytes>,
+) -> Pending =
+  {
+    ..acc,
+    diags: push(acc.diags, {
+      slot: slot,
+      diag: diag1(code, dummy_span(), message, b"in this package's manifest", notes),
+    }),
+  }
 
 fn push_diag_text(acc: Pending, slot: Int, code: Bytes, message: Bytes) -> Pending =
   { ..acc, diags: push(acc.diags, pkg_diag(slot, code, message)) }
