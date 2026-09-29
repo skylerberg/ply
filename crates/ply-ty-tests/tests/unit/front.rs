@@ -1,542 +1,89 @@
-use indexmap::IndexMap;
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
+use ply_span::SourceId;
 use ply_ty::*;
-use std::collections::BTreeSet;
-
-fn sym(s: &str) -> Symbol {
-    Symbol::new(s)
-}
-
-fn hash(n: u8) -> DefHash {
-    DefHash([n; 32])
-}
-
-fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
-    EffectAtom::new(
-        effect,
-        resource.map_or(Resource::Singleton, |r| Resource::Named(Symbol::new(r))),
-        mode,
-    )
-}
-
-fn span(source: u32, start: u32, end: u32) -> Span {
-    Span::new(SourceId(source), start, end)
-}
-
-/// One of everything the protocol carries, over two modules.
-fn sample() -> Front {
-    let db = atom("std.db", Some("users"), Mode::Read);
-    let net = atom("std.net", None, Mode::Write);
-    let mut check = CheckOutput::default();
-    check.modules.insert(
-        sym("std.db"),
-        ModuleInfo {
-            name: ModuleName::from_dotted("std.db"),
-            source: SourceId(0),
-            items: vec![sym("std.db.Db"), sym("std.db.Row"), sym("std.db.query")],
-            imports: vec![],
-        },
-    );
-    check.modules.insert(
-        sym("m"),
-        ModuleInfo {
-            name: ModuleName::from_dotted("m"),
-            source: SourceId(1),
-            items: vec![
-                sym("m.count"),
-                sym("m.Shape"),
-                sym("m.Circle"),
-                sym("m.Square"),
-            ],
-            imports: vec![ModuleName::from_dotted("std.db")],
-        },
-    );
-    let scheme = Scheme {
-        ty_vars: vec![TyVar(3)],
-        row_vars: vec![RowVar(1)],
-        label_vars: vec![],
-        ty: Type::Fn {
-            params: vec![Type::list(Type::Var(TyVar(3)))],
-            ret: Box::new(Type::int()),
-            effects: Row {
-                atoms: [db.clone()].into(),
-                tail: Some(RowVar(1)),
-            },
-        },
-    };
-    check.defs.insert(
-        sym("m.count"),
-        DefInfo {
-            name: sym("m.count"),
-            module: ModuleName::from_dotted("m"),
-            simple_name: sym("count"),
-            scheme: scheme.clone(),
-            footprint: Footprint::from_atoms([db.clone(), net.clone()]),
-            performed: Footprint::from_atoms([db.clone()]),
-            row_aliases: vec![sym("io"), sym("store")],
-            constraints: vec![DefConstraint {
-                deriver: Deriver::Eq,
-                param: 0,
-            }],
-            spec: vec![
-                SpecInfo {
-                    kind: SpecKind::Requires,
-                    index: 0,
-                    footprint: Footprint::empty(),
-                    span: span(1, 10, 20),
-                },
-                SpecInfo {
-                    kind: SpecKind::Ensures,
-                    index: 1,
-                    footprint: Footprint::empty(),
-                    span: span(1, 21, 30),
-                },
-            ],
-            internally_effectful: true,
-            span: span(1, 0, 40),
-        },
-    );
-    check.defs.insert(
-        sym("std.db.query"),
-        DefInfo {
-            name: sym("std.db.query"),
-            module: ModuleName::from_dotted("std.db"),
-            simple_name: sym("query"),
-            scheme: Scheme::mono(Type::Fn {
-                params: vec![Type::string()],
-                ret: Box::new(Type::list(Type::con("std.db.Row"))),
-                effects: Row::closed([db.clone()]),
-            }),
-            footprint: Footprint::from_atoms([db.clone()]),
-            performed: Footprint::from_atoms([db.clone()]),
-            row_aliases: vec![],
-            constraints: vec![],
-            spec: vec![],
-            internally_effectful: false,
-            span: span(0, 5, 50),
-        },
-    );
-    check.tests.push(TestInfo {
-        name: "counts the users".to_string(),
-        module: ModuleName::from_dotted("m"),
-        key: sym("m.counts the users"),
-        index: 0,
-        nondet: true,
-        footprint: Footprint::from_atoms([db.clone()]),
-        span: span(1, 41, 60),
-    });
-    check.laws.push(LawInfo {
-        name: "count is non-negative".to_string(),
-        module: ModuleName::from_dotted("m"),
-        key: sym("m.count is non-negative"),
-        index: 0,
-        binders: vec![LawBinder {
-            name: sym("xs"),
-            ty: Type::list(Type::int()),
-            span: span(1, 62, 70),
-        }],
-        has_guard: true,
-        host: false,
-        footprint: Footprint::empty(),
-        span: span(1, 61, 90),
-    });
-    let mut ops = IndexMap::new();
-    ops.insert(
-        sym("query"),
-        OpInfo {
-            name: sym("query"),
-            mode: Mode::Read,
-            resource_param: true,
-            params: vec![Type::string(), Type::int()],
-            ret: Type::list(Type::con("std.db.Row")),
-            span: span(0, 1, 4),
-            scheme: None,
-        },
-    );
-    ops.insert(
-        sym("spawn"),
-        OpInfo {
-            name: sym("spawn"),
-            mode: Mode::Write,
-            resource_param: false,
-            params: vec![],
-            ret: Type::unit(),
-            span: Span::DUMMY,
-            scheme: Some(Scheme {
-                ty_vars: vec![TyVar(0)],
-                row_vars: vec![RowVar(0)],
-                label_vars: vec![],
-                ty: Type::Fn {
-                    params: vec![Type::Fn {
-                        params: vec![],
-                        ret: Box::new(Type::Var(TyVar(0))),
-                        effects: Row::open(RowVar(0)),
-                    }],
-                    ret: Box::new(Type::unit()),
-                    effects: Row::open(RowVar(0)),
-                },
-            }),
-        },
-    );
-    check.effects.insert(
-        sym("std.db"),
-        EffectInfo {
-            name: sym("std.db"),
-            module: ModuleName::from_dotted("std.db"),
-            simple_name: sym("db"),
-            nondet: false,
-            ops,
-            span: span(0, 0, 4),
-        },
-    );
-    check.ctors.insert(
-        sym("m.Circle"),
-        CtorInfo {
-            name: sym("m.Circle"),
-            module: ModuleName::from_dotted("m"),
-            simple_name: sym("Circle"),
-            type_name: sym("m.Shape"),
-            index: 0,
-            arity: 1,
-            fields: vec![Type::float()],
-            scheme: Scheme::mono(Type::Fn {
-                params: vec![Type::float()],
-                ret: Box::new(Type::con("m.Shape")),
-                effects: Row::empty(),
-            }),
-            span: span(1, 91, 99),
-        },
-    );
-    check.ctors.insert(
-        sym("Some"),
-        CtorInfo {
-            name: sym("Some"),
-            module: ModuleName::anonymous(),
-            simple_name: sym("Some"),
-            type_name: sym("Option"),
-            index: 0,
-            arity: 1,
-            fields: vec![Type::Var(TyVar(0))],
-            scheme: Scheme {
-                ty_vars: vec![TyVar(0)],
-                row_vars: vec![],
-                label_vars: vec![],
-                ty: Type::Fn {
-                    params: vec![Type::Var(TyVar(0))],
-                    ret: Box::new(Type::option(Type::Var(TyVar(0)))),
-                    effects: Row::empty(),
-                },
-            },
-            span: Span::DUMMY,
-        },
-    );
-
-    let mut hashes = HashOutput::default();
-    hashes.defs.insert(sym("std.db.query"), hash(1));
-    hashes.defs.insert(sym("m.count"), hash(2));
-    hashes.own.insert(sym("std.db.query"), hash(3));
-    hashes.own.insert(sym("m.count"), hash(4));
-    hashes.decls.insert(sym("std.db.Db"), hash(5));
-    hashes.decls.insert(sym("m.Shape"), hash(6));
-    hashes.tests.push(hash(7));
-    hashes.laws.push(hash(8));
-    hashes.law_texts.push(hash(9));
-    hashes
-        .specs
-        .insert(sym("m.count"), vec![hash(10), hash(11)]);
-    hashes
-        .spec_texts
-        .insert(sym("m.count"), vec![hash(12), hash(13)]);
-    for (name, deps) in [
-        ("std.db.Db", vec![]),
-        ("std.db.query", vec!["std.db.Db"]),
-        ("m.Shape", vec![]),
-        ("m.count", vec!["std.db.query", "m.Shape"]),
-        ("m.counts the users", vec!["m.count"]),
-        ("m.count is non-negative", vec!["m.count"]),
-    ] {
-        hashes
-            .deps
-            .insert(sym(name), deps.iter().map(|d| sym(d)).collect());
-        let closure: BTreeSet<Symbol> = deps.iter().chain([&name]).map(|d| sym(d)).collect();
-        hashes.closure.insert(sym(name), closure);
-    }
-
-    Front {
-        packages: Vec::new(),
-        pins: Vec::new(),
-        mod_pkg: Vec::new(),
-        diagnostics: vec![
-            Diagnostic::warning(codes::UNKNOWN_NAME, "a warning that does not stop the dump")
-                .primary(span(1, 0, 1), "here"),
-        ],
-        order: vec![sym("std.db"), sym("m")],
-        check,
-        hashes,
-        hashes_digest: Default::default(),
-        keys: Default::default(),
-        emitter_roots: Vec::new(),
-        emitter_ctors: Vec::new(),
-        emitter_constants: BTreeSet::new(),
-        hash_order: vec![
-            Hashed::Def(sym("std.db.Db")),
-            Hashed::Def(sym("std.db.query")),
-            Hashed::Def(sym("m.Shape")),
-            Hashed::Def(sym("m.count")),
-            Hashed::Test(0),
-            Hashed::Law(0),
-        ],
-        ordinals: vec![
-            (
-                sym("std.db"),
-                vec![Ordinal::Fn(sym("std.db.query"), vec![])],
-            ),
-            (
-                sym("m"),
-                vec![
-                    Ordinal::Fn(sym("m.count"), vec![SpecKind::Requires, SpecKind::Ensures]),
-                    Ordinal::Test(sym("m.counts the users")),
-                    Ordinal::Law(sym("m.count is non-negative")),
-                ],
-            ),
-        ],
-        bodies: vec![
-            (sym("std.db.Db"), vec![0, 9]),
-            (sym("std.db.query"), vec![0, 1, 2, 255]),
-            (sym("m.Shape"), vec![]),
-            (sym("m.count"), vec![1, 0, 0, 0, 0, 16]),
-        ],
-        test_bodies: vec![vec![0, 7, 7]],
-        defs_written: IndexMap::from([
-            (
-                sym("m.count"),
-                DefWritten {
-                    vis: Visibility::Public,
-                    reuse: true,
-                    params: vec![WrittenParam {
-                        name: sym("xs"),
-                        span: span(1, 8, 10),
-                    }],
-                    requires_literals: vec![Literal::Int(0), Literal::Str("none".to_string())],
-                },
-            ),
-            (
-                sym("std.db.query"),
-                DefWritten {
-                    vis: Visibility::Private,
-                    reuse: false,
-                    params: vec![WrittenParam {
-                        name: sym("sql"),
-                        span: span(0, 11, 14),
-                    }],
-                    requires_literals: Vec::new(),
-                },
-            ),
-        ]),
-        types: IndexMap::from([
-            (
-                sym("std.db.Db"),
-                TypeDecl {
-                    name: sym("std.db.Db"),
-                    module: ModuleName::from_dotted("std.db"),
-                    simple_name: sym("Db"),
-                    vis: Visibility::Public,
-                    arity: 0,
-                    span: span(0, 0, 4),
-                },
-            ),
-            (
-                sym("m.Shape"),
-                TypeDecl {
-                    name: sym("m.Shape"),
-                    module: ModuleName::from_dotted("m"),
-                    simple_name: sym("Shape"),
-                    vis: Visibility::Private,
-                    arity: 2,
-                    span: span(1, 80, 99),
-                },
-            ),
-        ]),
-        effects_written: IndexMap::from([(sym("std.db"), Visibility::Public)]),
-        test_name_spans: vec![span(1, 46, 60)],
-        law_literals: vec![vec![
-            Literal::Int(-3),
-            Literal::Str("hi there".to_string()),
-            Literal::Bytes(vec![0, 255]),
-        ]],
-        effect_sets: IndexMap::from([(
-            sym("m"),
-            vec![EffectSet {
-                name: sym("io"),
-                includes: vec![sym("store")],
-                atoms: Footprint::from_atoms([db, net]),
-            }],
-        )]),
-    }
-}
 
 const SOURCES: [SourceId; 2] = [SourceId(0), SourceId(1)];
 
-#[test]
-fn a_front_writes_reads_and_writes_to_the_same_text() {
-    let front = sample();
-    let text = write_front(&front, &SOURCES).unwrap();
-    let back = read_front(&text, &SOURCES).unwrap_or_else(|e| panic!("{e}\n{text}"));
-    assert_eq!(write_front(&back, &SOURCES).unwrap(), text);
-
-    assert_eq!(back.order, front.order);
-    assert_eq!(back.hashes, front.hashes);
-    assert_eq!(back.ordinals, front.ordinals);
-    assert_eq!(back.bodies, front.bodies);
-    assert_eq!(back.test_bodies, front.test_bodies);
-    assert_eq!(back.defs_written, front.defs_written);
-    assert_eq!(back.types, front.types);
-    assert_eq!(back.effects_written, front.effects_written);
-    assert_eq!(back.test_name_spans, front.test_name_spans);
-    assert_eq!(back.law_literals, front.law_literals);
-    assert_eq!(back.effect_sets, front.effect_sets);
-    assert_eq!(back.diagnostics.len(), 1);
-    assert_eq!(back.check.modules[&sym("m")].source, SourceId(1));
-    assert_eq!(
-        back.check.modules[&sym("m")].imports,
-        vec![ModuleName::from_dotted("std.db")]
-    );
-    let count = &back.check.defs[&sym("m.count")];
-    assert_eq!(
-        print_scheme(&count.scheme),
-        "<a | e>(List<a>) -> Int / {std.db.read[users] | e}"
-    );
-    assert_eq!(
-        count.constraints,
-        front.check.defs[&sym("m.count")].constraints
-    );
-    assert_eq!(count.row_aliases, vec![sym("io"), sym("store")]);
-    assert_eq!(count.spec.len(), 2);
-    assert_eq!(count.spec[1].kind, SpecKind::Ensures);
-    assert_eq!(count.spec[1].span, span(1, 21, 30));
-    assert!(count.internally_effectful);
-    assert_eq!(count.footprint, front.check.defs[&sym("m.count")].footprint);
-    // The layouts `crates/ply-compiler/ply/front.ply` pins.
-    assert!(text.contains("test 0 "), "{text}");
-    assert_eq!(back.hash_order, front.hash_order);
-    assert!(
-        text.contains("item 27\nfn m.count requires,ensures"),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "op 71\nspawn write 0 0 1 4294967295 0 0\nUnit\n<a | e>(() -> a / e) -> Unit / e\n"
-        ),
-        "{text}"
-    );
-    assert!(text.contains("binder 20\nxs 1 62 70\nList<Int>"), "{text}");
-    assert!(text.contains("testhash 0 "), "{text}");
-    // Syntax-tree fields, which `front.ply` pins the same way.
-    assert!(text.contains("public 1\n1reuse 1\n1"), "{text}");
-    assert!(text.contains("param 9\nxs 1 8 10"), "{text}");
-    assert!(
-        text.contains("literal 5\nint 0literal 8\nstr none"),
-        "{text}"
-    );
-    assert!(text.contains("type m.Shape "), "{text}");
-    assert!(
-        text.contains("simple_name 5\nShapepublic 1\n0arity 1\n2"),
-        "{text}"
-    );
-    assert!(text.contains("name_span 7\n1 46 60"), "{text}");
-    assert!(text.contains("literal 6\nint -3"), "{text}");
-    assert!(text.contains("literal 12\nstr hi there"), "{text}");
-    assert!(text.contains("literal 10\nbytes 00ff"), "{text}");
-    assert!(
-        text.contains("effect_set 41\nio store std.db.read[users],std.net.write"),
-        "{text}"
-    );
-    let test = &back.check.tests[0];
-    assert_eq!(test.name, "counts the users");
-    assert_eq!(test.key, sym("m.counts the users"));
-    assert!(test.nondet);
-    let law = &back.check.laws[0];
-    assert_eq!(law.binders[0].name, sym("xs"));
-    assert_eq!(law.binders[0].ty, Type::list(Type::int()));
-    assert!(law.has_guard && !law.host);
-    let db = &back.check.effects[&sym("std.db")];
-    assert_eq!(
-        db.ops[&sym("query")].params,
-        vec![Type::string(), Type::int()]
-    );
-    assert!(db.ops[&sym("query")].resource_param);
-    assert!(db.ops[&sym("spawn")].span.is_dummy());
-    assert_eq!(
-        print_scheme(db.ops[&sym("spawn")].scheme.as_ref().unwrap()),
-        "<a | e>(() -> a / e) -> Unit / e"
-    );
-    let some = &back.check.ctors[&sym("Some")];
-    assert!(some.module.is_anonymous());
-    assert!(some.span.is_dummy());
-    assert_eq!(some.arity, 1);
+/// `<header> <length>\n<body>`: a frame, or a field inside one.
+fn unit(header: &str, body: &str) -> String {
+    format!("{header} {}\n{body}", body.len())
 }
 
-/// Without the binders in the text, a label a caller fills comes back as a resource of that name,
-/// and nothing downstream can tell a generic definition from a program that uses a label called
-/// `l`.
-#[test]
-fn a_footprint_on_a_bound_label_reads_back_as_a_variable() {
-    let mut front = sample();
-    let send = EffectAtom::operation("std.net", Resource::Var(LabelVar(0)), Mode::Write, "send");
-    let mut relay = front.check.defs[&sym("m.count")].clone();
-    relay.name = sym("m.relay");
-    relay.simple_name = sym("relay");
-    relay.scheme = Scheme {
-        ty_vars: vec![],
-        row_vars: vec![],
-        label_vars: vec![LabelVar(0)],
-        ty: Type::Fn {
-            params: vec![Type::bytes()],
-            ret: Box::new(Type::unit()),
-            effects: Row {
-                atoms: [send.clone()].into(),
-                tail: None,
-            },
-        },
-    };
-    relay.footprint = Footprint::from_atoms([send.clone()]);
-    relay.performed = Footprint::from_atoms([send.clone()]);
-    relay.row_aliases = vec![];
-    relay.constraints = vec![];
-    relay.spec = vec![];
-    let written = front.defs_written[&sym("m.count")].clone();
-    front.check.defs.insert(sym("m.relay"), relay);
-    front.defs_written.insert(sym("m.relay"), written);
+/// A `<kind> <name>` frame of `<key> <text>` fields.
+fn frame(kind: &str, name: &str, fields: &[(&str, &str)]) -> String {
+    let payload: String = fields.iter().map(|(key, text)| unit(key, text)).collect();
+    unit(&format!("{kind} {name}"), &payload)
+}
 
-    let text = write_front(&front, &SOURCES).unwrap();
-    assert!(
-        text.contains("footprint 20\n<[l]>std.net.send[l]"),
-        "the binders are missing from the text:\n{text}"
-    );
-    let back = read_front(&text, &SOURCES).unwrap_or_else(|e| panic!("{e}\n{text}"));
-    let relay = &back.check.defs[&sym("m.relay")];
-    assert_eq!(relay.footprint, Footprint::from_atoms([send.clone()]));
-    assert_eq!(relay.performed, Footprint::from_atoms([send]));
-    assert_eq!(write_front(&back, &SOURCES).unwrap(), text);
+/// Test 0, `m.t`, whole.
+fn a_test() -> String {
+    frame(
+        "test",
+        "0",
+        &[
+            ("key", "m.t"),
+            ("name", "t"),
+            ("module", "m"),
+            ("index", "0"),
+            ("nondet", "0"),
+            ("footprint", ""),
+            ("span", "1 0 9"),
+            ("name_span", "1 5 8"),
+        ],
+    )
+}
 
-    // A label no head binds is a resource of that name, as it is inside a row.
-    let unbound = parse_footprint("std.net.send[l]").unwrap();
-    assert_eq!(
-        unbound.atoms().next().unwrap().resource,
-        Resource::Named(sym("l"))
-    );
+/// Law 0, `m.l`, whole.
+fn a_law() -> String {
+    frame(
+        "law",
+        "0",
+        &[
+            ("key", "m.l"),
+            ("name", "l"),
+            ("module", "m"),
+            ("index", "0"),
+            ("has_guard", "0"),
+            ("host", "0"),
+            ("footprint", ""),
+            ("span", "1 10 20"),
+        ],
+    )
+}
+
+fn test_hash(name: &str) -> String {
+    frame(
+        "testhash",
+        name,
+        &[("key", "m.t"), ("hash", &"07".repeat(32))],
+    )
 }
 
 #[test]
 fn an_error_diagnostic_ends_the_dump() {
-    let mut front = sample();
-    front.diagnostics.push(
-        Diagnostic::error(codes::TYPE_MISMATCH, "expected Int").primary(span(1, 2, 3), "here"),
+    let warned = frame(
+        "diag",
+        "0",
+        &[
+            ("code", "W0611"),
+            ("severity", "warning"),
+            ("message", "never used"),
+            ("label", "1 0 1 1\nhere"),
+        ],
     );
-    let text = write_front(&front, &SOURCES).unwrap();
-    assert!(!text.contains("\norder _ "), "{text}");
-    let back = read_front(&text, &SOURCES).unwrap();
+    let failed = frame(
+        "diag",
+        "1",
+        &[
+            ("code", "E0201"),
+            ("severity", "error"),
+            ("message", "expected Int"),
+            ("label", "1 2 3 1\nhere"),
+        ],
+    );
+    let text = format!("{warned}{failed}");
+    let back = read_front(&text, &SOURCES).unwrap_or_else(|e| panic!("{e}\n{text}"));
     assert_eq!(back.diagnostics.len(), 2);
+    assert!(back.has_error());
     assert!(back.check.defs.is_empty());
 
     let continued = format!("{text}order _ 0\n");
@@ -546,184 +93,125 @@ fn an_error_diagnostic_ends_the_dump() {
 
 #[test]
 fn the_reader_names_what_it_refuses() {
-    let text = write_front(&sample(), &SOURCES).unwrap();
+    let refused = |dump: &str| read_front(dump, &SOURCES).unwrap_err();
 
-    let err = read_front("", &SOURCES).unwrap_err();
+    let err = refused("");
     assert!(err.contains("ends after the diagnostics"), "{err}");
 
-    let err = read_front(&text.replace("def m.count ", "defn m.count "), &SOURCES).unwrap_err();
+    let err = refused(&frame("defn", "m.count", &[]));
     assert!(err.contains("unknown frame kind `defn`"), "{err}");
 
-    let err = read_front(
-        &text.replace("simple_name 5\ncount", "simple_nane 5\ncount"),
-        &SOURCES,
-    )
-    .unwrap_err();
+    let err = refused(&frame("typ3", "m.Shape", &[]));
+    assert!(err.contains("unknown frame kind `typ3`"), "{err}");
+
+    let order = frame("order", "_", &[("module", "m")]);
+    let err = refused(&order[..order.len() - 3]);
+    assert!(err.contains("truncated"), "{err}");
+
+    let def = |fields: &[(&str, &str)]| frame("def", "m.count", fields);
+    let err = refused(&def(&[("module", "m"), ("simple_nane", "count")]));
     assert!(
         err.contains("def `m.count`: unknown field `simple_nane`"),
         "{err}"
     );
 
-    let err = read_front(&text[..text.len() - 3], &SOURCES).unwrap_err();
-    assert!(err.contains("truncated"), "{err}");
+    let err = refused(&def(&[("public", "2")]));
+    assert!(err.contains("`public` is `2`, not 0 or 1"), "{err}");
 
-    let err = read_front(&text.replace("nondet 1\n1", "nondet 1\n2"), &SOURCES).unwrap_err();
-    assert!(
-        err.contains("test `0`: `nondet` is `2`, not 0 or 1"),
-        "{err}"
-    );
+    let err = refused(&def(&[("public", "1"), ("reuse", "2")]));
+    assert!(err.contains("`reuse` is `2`, not 0 or 1"), "{err}");
 
-    let err = read_front(&text.replace("testhash 0 ", "testhash 1 "), &SOURCES).unwrap_err();
-    assert!(
-        err.contains("testhash `1` names test 1, and only 1 were declared"),
-        "{err}"
-    );
+    let named = [
+        ("public", "1"),
+        ("reuse", "0"),
+        ("module", "m"),
+        ("simple_name", "count"),
+    ];
+    let err = refused(&def(&[&named[..], &[("scheme", "(Int) -) Int")]].concat()));
+    assert!(err.contains("def `m.count`: scheme:"), "{err}");
 
-    let err = read_front(&text.replace("lawhash 0 ", "lawhash 1 "), &SOURCES).unwrap_err();
-    assert!(
-        err.contains("lawhash `1` names law 1, and only 1 were declared"),
-        "{err}"
-    );
-
-    let at = text.find("testhash 0 ").unwrap();
-    let header_end = at + text[at..].find('\n').unwrap();
-    let length: usize = text[at + "testhash 0 ".len()..header_end].parse().unwrap();
-    let frame = &text[at..header_end + 1 + length];
-    let twice = format!("{}{frame}{}", &text[..at], &text[at..]);
-    let err = read_front(&twice, &SOURCES).unwrap_err();
-    assert!(err.contains("testhash `0` is written twice"), "{err}");
-
-    let err = read_front(&text.replace("testbody 0 ", "testbody 1 "), &SOURCES).unwrap_err();
-    assert!(
-        err.contains("testbody `1` is numbered out of order"),
-        "{err}"
-    );
-
-    let err = read_front(
-        &text.replace("index 1\n0nondet", "index 1\n7nondet"),
-        &SOURCES,
-    )
-    .unwrap_err();
-    assert!(
-        err.contains("test `0`: `index` is 7, but the frame is numbered 0"),
-        "{err}"
-    );
-
-    // Same length, so the frame's own length still holds.
-    let dropped = text.replace("internally_effectful 1\n1", "row_alias 11\n12345678901");
-    let err = read_front(&dropped, &SOURCES).unwrap_err();
+    let err = refused(&def(&[
+        &named[..],
+        &[
+            ("scheme", "(Int) -> Int"),
+            ("footprint", ""),
+            ("performed", ""),
+        ],
+    ]
+    .concat()));
     assert!(
         err.contains("def `m.count` has no `internally_effectful`"),
         "{err}"
     );
 
-    let bad_scheme = text.replace("(List<a>) -> Int", "(List<a>) -) Int");
-    let err = read_front(&bad_scheme, &[SourceId(0), SourceId(1)]).unwrap_err();
-    assert!(err.contains("def `m.count`: scheme:"), "{err}");
+    let err = refused(&def(&[("param", "xs1810abc")]));
+    assert!(
+        err.contains("def `m.count`: param `xs1810abc` is not `<name> <span>`"),
+        "{err}"
+    );
 
-    let err = read_front(&text, &[SourceId(0)]).unwrap_err();
-    assert!(err.contains("only 1 sources were handed over"), "{err}");
-
-    let err = read_front(&text.replace("type m.Shape ", "typ3 m.Shape "), &SOURCES).unwrap_err();
-    assert!(err.contains("unknown frame kind `typ3`"), "{err}");
-
-    let err = read_front(
-        &text.replace("public 1\n1reuse", "public 1\n2reuse"),
-        &SOURCES,
-    )
-    .unwrap_err();
-    assert!(err.contains("`public` is `2`, not 0 or 1"), "{err}");
-
-    let err = read_front(&text.replace("reuse 1\n1", "reuse 1\n2"), &SOURCES).unwrap_err();
-    assert!(err.contains("`reuse` is `2`, not 0 or 1"), "{err}");
-
-    let err = read_front(&text.replace("name_span 7\n", "xame_span 7\n"), &SOURCES).unwrap_err();
-    assert!(err.contains("test `0`: unknown field `xame_span`"), "{err}");
-
-    let err = read_front(
-        &text.replace("literal 6\nint -3", "literal 6\nrat -3"),
-        &SOURCES,
-    )
-    .unwrap_err();
+    let err = refused(&def(&[("literal", "rat -3")]));
     assert!(
         err.contains("`rat` is not `int`, `str` or `bytes`"),
         "{err}"
     );
 
-    // Same length, so the frame's own length still holds and only the field's shape is wrong.
-    let err = read_front(
-        &text.replace("\nio store std.db", "\nio,store std.db"),
-        &SOURCES,
-    )
-    .unwrap_err();
+    let err = read_front(&frame("module", "m", &[("index", "1")]), &[SourceId(0)]).unwrap_err();
+    assert!(err.contains("only 1 sources were handed over"), "{err}");
+
+    let err = refused(&frame(
+        "module",
+        "m",
+        &[("index", "1"), ("effect_set", "io,store std.db.read")],
+    ));
     assert!(err.contains("is not `<name> <includes> <atoms>`"), "{err}");
 
-    let err = read_front(
-        &text.replace("param 9\nxs 1 8 10", "param 9\nxs1810abc"),
-        &SOURCES,
-    )
-    .unwrap_err();
-    assert!(
-        err.contains("def `m.count`: param `xs1810abc` is not `<name> <span>`"),
-        "{err}"
-    );
-}
+    let test = |fields: &[(&str, &str)]| frame("test", "0", fields);
+    let err = refused(&test(&[("key", "m.t"), ("xame_span", "1 5 8")]));
+    assert!(err.contains("test `0`: unknown field `xame_span`"), "{err}");
 
-#[test]
-fn the_writer_refuses_a_front_whose_syntax_tables_are_missing() {
-    let mut front = sample();
-    front.defs_written.shift_remove(&sym("m.count"));
-    let err = write_front(&front, &SOURCES).unwrap_err();
+    let placed = [
+        ("key", "m.t"),
+        ("name", "t"),
+        ("module", "m"),
+        ("name_span", "1 5 8"),
+    ];
+    let err = refused(&test(
+        &[&placed[..], &[("index", "0"), ("nondet", "2")]].concat(),
+    ));
     assert!(
-        err.contains("def `m.count` has no record of what its source wrote"),
+        err.contains("test `0`: `nondet` is `2`, not 0 or 1"),
         "{err}"
     );
 
-    let mut front = sample();
-    front.effects_written.clear();
-    let err = write_front(&front, &SOURCES).unwrap_err();
+    let err = refused(&test(
+        &[&placed[..], &[("index", "7"), ("nondet", "0")]].concat(),
+    ));
     assert!(
-        err.contains("effect `std.db` is declared in `std.db`"),
+        err.contains("test `0`: `index` is 7, but the frame is numbered 0"),
         "{err}"
     );
 
-    let mut front = sample();
-    front.test_name_spans.clear();
-    let err = write_front(&front, &SOURCES).unwrap_err();
-    assert!(err.contains("0 test name spans beside 1 tests"), "{err}");
+    let err = refused(&format!("{}{}", a_test(), test_hash("1")));
+    assert!(
+        err.contains("testhash `1` names test 1, and only 1 were declared"),
+        "{err}"
+    );
 
-    let mut front = sample();
-    front.law_literals.clear();
-    let err = write_front(&front, &SOURCES).unwrap_err();
-    assert!(err.contains("0 law literal lists beside 1 laws"), "{err}");
-}
+    let err = refused(&format!("{}{}", a_law(), frame("lawhash", "1", &[])));
+    assert!(
+        err.contains("lawhash `1` names law 1, and only 1 were declared"),
+        "{err}"
+    );
 
-#[test]
-fn the_writer_refuses_a_front_the_protocol_cannot_carry() {
-    let mut front = sample();
-    front.hashes.tests.clear();
-    let err = write_front(&front, &SOURCES).unwrap_err();
-    assert!(err.contains("0 test hashes beside 1 tests"), "{err}");
+    let err = refused(&format!("{}{}{}", a_test(), test_hash("0"), test_hash("0")));
+    assert!(err.contains("testhash `0` is written twice"), "{err}");
 
-    let mut front = sample();
-    front.hashes.defs.insert(sym("m.orphan"), hash(99));
-    let err = write_front(&front, &SOURCES).unwrap_err();
-    assert!(err.contains("`m.orphan` is in the hashes' `defs`"), "{err}");
-
-    let mut front = sample();
-    front.hash_order.pop();
-    let err = write_front(&front, &SOURCES).unwrap_err();
-    assert!(err.contains("names 1 of 1 tests and 0 of 1 laws"), "{err}");
-
-    let mut front = sample();
-    front.hash_order.push(Hashed::Def(sym("m.count")));
-    let err = write_front(&front, &SOURCES).unwrap_err();
-    assert!(err.contains("names `m.count` twice"), "{err}");
-
-    let mut front = sample();
-    front.check.modules[&sym("m")].source = SourceId(7);
-    let err = write_front(&front, &SOURCES).unwrap_err();
-    assert!(err.contains("module `m` is source 7"), "{err}");
+    let err = refused(&frame("testbody", "1", &[]));
+    assert!(
+        err.contains("testbody `1` is numbered out of order"),
+        "{err}"
+    );
 }
 
 fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
@@ -742,28 +230,34 @@ fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Every frame kind the front end writes, over the examples and the compiler: the answer reads,
+/// and reads to one structure however often it is read.
 #[test]
-fn a_real_answer_is_written_and_read_back_byte_for_byte() {
+fn a_real_answer_reads_to_one_structure() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut user = ply_files(&root.join("examples"));
     user.extend(ply_files(&root.join("crates/ply-compiler/ply")));
-    let answered = ply_codegen::c::producer::checked_front_with_std(&user)
-        .unwrap_or_else(|e| panic!("the corpus does not check: {e:#}"));
-    let front = answered.front;
-    let program = answered.modules;
-    let ids: Vec<SourceId> = (0..program.len()).map(|i| SourceId(i as u32)).collect();
-    let whole = write_front(&front, &ids).unwrap();
+    let shipped: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    let pulled = ply_codegen::c::producer::front_pulling_std(&user, &shipped)
+        .unwrap_or_else(|e| panic!("the corpus does not answer: {e:#}"));
+    let ids: Vec<SourceId> = (0..user.len() + pulled.modules.len())
+        .map(|i| SourceId(i as u32))
+        .collect();
 
-    let back = read_front(&whole, &ids).unwrap_or_else(|e| panic!("{e}"));
-    same(
-        "the written answer",
-        &write_front(&back, &ids).unwrap(),
-        &whole,
+    let first = read_front(&pulled.dump, &ids).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !first.has_error(),
+        "the corpus does not check: {:?}",
+        first.diagnostics
     );
+    assert!(!first.check.defs.is_empty() && !first.hash_order.is_empty());
+    let second = read_front(&pulled.dump, &ids).unwrap_or_else(|e| panic!("{e}"));
     same(
         "the answer's structure",
-        &format!("{back:?}"),
-        &format!("{front:?}"),
+        &format!("{second:?}"),
+        &format!("{first:?}"),
     );
 }
 

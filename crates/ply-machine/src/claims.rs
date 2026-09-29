@@ -1460,7 +1460,7 @@ fn frame_value(frame: &Frame) -> PlyValue {
         Frame::Writes(writes) => {
             let named: Vec<String> = writes
                 .iter()
-                .map(|(effect, resource)| format!("{effect}[{resource}]"))
+                .map(|(effect, resource)| format!("{effect}{resource}"))
                 .collect();
             ctor(
                 home("Frame"),

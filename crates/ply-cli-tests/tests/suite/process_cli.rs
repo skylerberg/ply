@@ -1,5 +1,8 @@
-use crate::harness::{json_of, ply, project};
+use crate::harness::{json_of, ply, process, project};
 use serde_json::Value;
+use std::io::{BufRead, BufReader};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 const SOURCE: &str = r#"
 import std.process (process)
@@ -182,4 +185,142 @@ fn main() -> Int / {process.read[proc]} = len(process.args[proc]())
     assert_eq!(v["ok"], true, "{v}");
     assert_eq!(v["exit_code"], 0);
     assert_eq!(v["value"], "2");
+}
+
+/// Starts a child that says its pid and sleeps, says that pid, then ends as `ENDING` says.
+const LEAVES_A_CHILD: &str = r#"
+import std.process
+import std.process (process)
+
+fn main() -> Unit / {process.start[sh], process.output_line[sh], process.wait[sh], process.out[proc], process.exit[proc]} = {
+  let started = process.start[sh](
+    ["-c", "echo $$; exec sleep 600"],
+    "",
+    [process::var("PATH", "/usr/bin:/bin")],
+    { input: false, out: process::Lines, err: process::Discard },
+  );
+  match started {
+    Err(why) -> process.out[proc]("not started: " ++ why),
+    Ok(child) -> {
+      match process.output_line[sh](child, 10000) {
+        process::Said(pid) -> process.out[proc]("pid " ++ pid),
+        _ -> process.out[proc]("no pid"),
+      };
+      ENDING
+    },
+  }
+}
+"#;
+
+const WAITS_ON_IT: &str = "let _ = process.wait[sh](child, -1);\n      ()";
+
+fn leaving(ending: &str) -> tempfile::TempDir {
+    project(&LEAVES_A_CHILD.replace("ENDING", ending))
+}
+
+fn pid_in(line: &str) -> Option<String> {
+    line.strip_prefix("pid ").map(|pid| pid.trim().to_string())
+}
+
+/// Whether any process has this pid, as `kill -0` asks.
+fn alive(pid: &str) -> bool {
+    std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+        .status()
+        .expect("a shell runs")
+        .success()
+}
+
+#[test]
+fn a_child_still_running_when_the_run_ends_does_not_outlive_it() {
+    for (ending, code) in [
+        ("()", 0),
+        ("process.exit[proc](3)", 3),
+        ("panic(\"the program gave up\")", 1),
+    ] {
+        let dir = leaving(ending);
+        let out = ply(dir.path())
+            .args(["run", "m.ply", "--host", "--exec", "sh=/bin/sh"])
+            .output()
+            .unwrap();
+        let stdout = text_of(&out.stdout);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "ended by `{ending}`\n{stdout}\n{}",
+            text_of(&out.stderr)
+        );
+        let pid = stdout
+            .lines()
+            .find_map(pid_in)
+            .unwrap_or_else(|| panic!("the run never said the child's pid:\n{stdout}"));
+        assert!(
+            !alive(&pid),
+            "the child {pid} outlived a run ended by `{ending}`"
+        );
+    }
+}
+
+/// A run waiting on its child, stopped from outside; the answer is the exit status and the pid.
+#[cfg(unix)]
+fn stopped(flags: &[&str], signals: usize) -> (Option<i32>, String) {
+    let dir = leaving(WAITS_ON_IT);
+    let mut run = process(dir.path())
+        .args(["run", "m.ply", "--host", "--exec", "sh=/bin/sh"])
+        .args(flags)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("`ply run` starts");
+    // Read to the end on a thread of its own, so nothing the run writes later meets a closed pipe.
+    let stdout = run.stdout.take().expect("piped");
+    let (said, heard) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(pid) = pid_in(&line) {
+                let _ = said.send(pid);
+            }
+        }
+    });
+    let pid = heard
+        .recv_timeout(Duration::from_secs(300))
+        .expect("the run said the child's pid");
+    assert!(alive(&pid), "the child {pid} is running");
+    for _ in 0..signals {
+        let sent = std::process::Command::new("kill")
+            .args(["-TERM", &run.id().to_string()])
+            .status()
+            .expect("`kill` runs");
+        assert!(sent.success(), "`kill -TERM` failed");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let until = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = run.try_wait().expect("the run can be waited on") {
+            break status;
+        }
+        if Instant::now() >= until {
+            let _ = run.kill();
+            panic!("the run was still going a minute after it was stopped");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    reader.join().expect("the reader finished");
+    (status.code(), pid)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_signal_ends_the_children_before_the_run_exits() {
+    let (code, pid) = stopped(&[], 2);
+    assert_eq!(code, Some(143), "a second `SIGTERM` exits 143");
+    assert!(!alive(&pid), "the child {pid} outlived the second signal");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_drain_that_runs_out_of_time_ends_the_children_with_the_run() {
+    let (code, pid) = stopped(&["--drain-ms", "200"], 1);
+    assert_eq!(code, Some(3), "an expired drain exits 3");
+    assert!(!alive(&pid), "the child {pid} outlived the drain");
 }

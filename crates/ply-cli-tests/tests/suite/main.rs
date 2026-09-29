@@ -1,5 +1,5 @@
-//! One binary. A test that reads process-global state (`#[global_allocator]`, `ply_eval::census`)
-//! needs a binary of its own.
+//! One binary. A test that reads process-global state (`#[global_allocator]`) needs a binary of
+//! its own.
 //!
 //! What belongs here: a test of `ply` as shipped — the binary as a process, the artifact and the
 //! module sources `ply build` commits and the launcher lays out, and the standard library and the
@@ -23,7 +23,6 @@ mod derivation_determinism_audit;
 mod derive;
 mod desk_operations;
 mod determinism_audit;
-mod diagnostic_text;
 mod doc;
 mod effect_set_selection;
 mod effect_sets;

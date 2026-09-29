@@ -10,7 +10,7 @@ use rustls::{ClientConfig, Error as TlsError, PeerIncompatible, RootCertStore, S
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -412,6 +412,11 @@ impl Session {
             handshakes,
             took: Mutex::new(None),
         }
+    }
+
+    /// This end's address, which the session shares with the socket it runs over.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
     }
 
     /// The handshake, completed now rather than when a request needs it, answering what it took in
