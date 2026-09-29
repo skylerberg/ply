@@ -51,7 +51,7 @@ pub struct Counts {
     pub carried_sig_walked: u64,
     pub frame_ceiling: u64,
     pub gates: BTreeMap<&'static str, u64>,
-    /// For `ArgumentShape`: every argument `compiled::crossable` refuses, by kind.
+    /// For `ArgumentShape`: every argument outside the leaf kinds that hold no handle, by kind.
     pub blocking_args: BTreeMap<&'static str, u64>,
     /// For `ArgumentType`: what in the declared parameter types refused it.
     pub blocking_types: BTreeMap<&'static str, u64>,
@@ -169,7 +169,7 @@ pub fn report() -> String {
         out.push_str(&format!("  {k:<14} {n:>12}\n"));
     }
     out.push_str(&format!(
-        "counterfactual: what a wider `crossable` would admit (DEEP rungs walk to a budget of {} nodes)\n",
+        "counterfactual: what a wider leaf set would admit (DEEP rungs walk to a budget of {} nodes)\n",
         deep_budget()
     ));
     for (label, _, _) in LADDER {
