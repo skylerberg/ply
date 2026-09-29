@@ -1,4 +1,4 @@
-use ply_eval::{Exploration, Naive, Plan, Seed, SimMode};
+use ply_eval::{Exploration, Naive, Seed};
 use ply_test::sim::{Record, SimSummary, record_under, replay_command};
 use ply_ty::DefHash;
 
@@ -14,50 +14,16 @@ fn passing(explored: u32) -> Exploration {
     }
 }
 
+/// Where a pass goes is the program's to say: the runtime writes exactly what it was handed.
 #[test]
-fn an_unsimulated_test_is_written_under_its_own_hash_and_nothing_else() {
-    let plan = Plan::default();
+fn a_pass_is_written_under_exactly_the_keys_it_was_filed_under() {
     assert_eq!(
-        record_under(hash(1), false, &plan, &plan, None),
+        record_under(&[hash(1)], false, None),
         Record::Under(vec![hash(1)])
     );
-}
-
-#[test]
-fn a_seeded_test_is_never_written_under_its_bare_hash() {
-    let plan = Plan::default();
-    let record = record_under(hash(1), true, &plan, &plan, Some(&passing(12)));
-    assert!(record.is_written());
-    assert!(!record.keys().contains(&hash(1)));
-    assert_eq!(record.keys(), [ply_test::sim_key(hash(1), &plan)]);
-}
-
-#[test]
-fn a_dpor_search_writes_no_per_root_key() {
-    let plan = Plan {
-        roots: vec![0, 1, 2],
-        ..Plan::default()
-    };
-    assert_eq!(plan.mode, SimMode::Dpor);
-    let record = record_under(hash(1), true, &plan, &plan, Some(&passing(9)));
-    assert_eq!(record.keys().len(), 1);
-}
-
-#[test]
-fn a_random_search_writes_one_key_per_root_it_ran_plus_the_plan() {
-    let run = Plan::random(4);
-    let ran = Plan {
-        roots: vec![2, 3],
-        ..run.clone()
-    };
-    let record = record_under(hash(1), true, &run, &ran, Some(&passing(2)));
     assert_eq!(
-        record.keys(),
-        [
-            ply_test::seed_key(hash(1), &Seed::root(2)),
-            ply_test::seed_key(hash(1), &Seed::root(3)),
-            ply_test::sim_key(hash(1), &run),
-        ]
+        record_under(&[hash(2), hash(3)], true, Some(&passing(12))),
+        Record::Under(vec![hash(2), hash(3)])
     );
 }
 
@@ -68,35 +34,28 @@ fn a_spent_budget_writes_nothing_under_either_mode() {
         exhausted: true,
         ..Exploration::default()
     };
-    for plan in [Plan::default(), Plan::random(4)] {
-        let record = record_under(hash(1), true, &plan, &plan, Some(&spent));
-        assert_eq!(record, Record::Exhausted);
-        assert!(record.keys().is_empty());
-    }
+    let record = record_under(&[hash(1), hash(2)], true, Some(&spent));
+    assert_eq!(record, Record::Exhausted);
+    assert!(record.keys().is_empty());
 }
 
 /// A handler for `sim.seed()` drops `sim.read` from the row, but the region inside still searched.
 #[test]
 fn a_spent_budget_stops_an_unseeded_test_caching_too() {
-    let plan = Plan::default();
     let spent = Exploration {
         explored: 256,
         exhausted: true,
         ..Exploration::default()
     };
     assert_eq!(
-        record_under(hash(1), false, &plan, &plan, Some(&spent),),
+        record_under(&[hash(1)], false, Some(&spent)),
         Record::Exhausted
     );
 }
 
 #[test]
 fn a_seeded_test_whose_search_was_not_observed_writes_nothing() {
-    let plan = Plan::default();
-    assert_eq!(
-        record_under(hash(1), true, &plan, &plan, None),
-        Record::Unobserved
-    );
+    assert_eq!(record_under(&[hash(1)], true, None), Record::Unobserved);
 }
 
 #[test]
@@ -140,7 +99,6 @@ fn the_replay_command_is_the_command() {
 
 #[test]
 fn a_measured_reduction_does_not_change_what_is_written() {
-    let plan = Plan::default();
     let measured = Exploration {
         naive: Some(Naive {
             explored: 720,
@@ -149,7 +107,7 @@ fn a_measured_reduction_does_not_change_what_is_written() {
         ..passing(12)
     };
     assert_eq!(
-        record_under(hash(1), true, &plan, &plan, Some(&measured),).keys(),
-        [ply_test::sim_key(hash(1), &plan)]
+        record_under(&[hash(1)], true, Some(&measured)).keys(),
+        [hash(1)]
     );
 }

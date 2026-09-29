@@ -1,6 +1,6 @@
 use ply_eval::Plan;
 use ply_span::{Diagnostic, SourceId, Symbol};
-use ply_store::{Outcome, Store};
+use ply_store::Store;
 use ply_test::{
     Executor, Hosting, InterpExecutor, Isolation, Parallelism, Reason, Search, Selection, Status,
     group_by_conflict, run_with,
@@ -482,20 +482,6 @@ test "twice is right" {
 "#;
 
 #[test]
-fn a_cold_cache_selects_every_test() {
-    let root = TempRoot::new();
-    let store = root.store();
-    let program = Program::compile(ARITHMETIC);
-
-    let selection = program.select(&store);
-    assert_eq!(selection.total, 3);
-    assert_eq!(selection.to_run, vec![0, 1, 2]);
-    assert!(selection.cached.is_empty());
-    assert!(selection.reasons.iter().all(|r| *r == Reason::New));
-    assert_eq!(selection.groups, vec![vec![0, 1, 2]]);
-}
-
-#[test]
 fn a_warm_cache_selects_nothing() {
     let root = TempRoot::new();
     let mut store = root.store();
@@ -578,50 +564,6 @@ fn renaming_a_definition_selects_nothing() {
         selection.to_run.is_empty(),
         "a rename changes no behaviour, so nothing may re-run: {selection:?}"
     );
-}
-
-#[test]
-fn a_stored_failure_is_never_trusted() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(ARITHMETIC);
-
-    let selection = program.select(&store);
-    assert_eq!(program.run(&selection, &mut store).failed, 0);
-    assert!(program.select(&store).to_run.is_empty());
-
-    let mul = program.index_of("mul is right");
-    store.put(
-        program.hashes.tests[mul],
-        Outcome::Fail {
-            message: "written by something else".into(),
-            diagnostic: None,
-        },
-    );
-
-    let selection = program.select(&store);
-    assert_eq!(selection.reason(mul), Some(Reason::PreviousFailure));
-    assert_eq!(selection.to_run, vec![mul]);
-}
-
-#[test]
-fn a_test_with_no_hash_runs_and_is_never_cached() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let mut program = Program::compile(ARITHMETIC);
-    program.hashes.tests.truncate(1);
-
-    for _ in 0..2 {
-        let selection = program.select(&store);
-        assert_eq!(selection.reason(1), Some(Reason::Unhashed));
-        assert_eq!(selection.reason(2), Some(Reason::Unhashed));
-        assert!(selection.to_run.contains(&1) && selection.to_run.contains(&2));
-        let report = program.run(&selection, &mut store);
-        assert_eq!(report.failed, 0, "{:#?}", report.failures);
-        assert!(report.warnings.is_empty());
-    }
-
-    assert_eq!(program.select(&store).reason(0), Some(Reason::Cached));
 }
 
 const ONE_RED: &str = r#"
@@ -967,6 +909,7 @@ fn an_empty_selection_runs_nothing() {
         parallelism: Parallelism::default(),
         plan: Plan::default(),
         narrowed: BTreeMap::new(),
+        filed: BTreeMap::new(),
         out_of_scope: BTreeSet::new(),
     };
     let report = program.run(&selection, &mut store);
@@ -989,6 +932,7 @@ fn a_selected_test_left_out_of_every_group_is_still_run() {
         parallelism: Parallelism::default(),
         plan: Plan::default(),
         narrowed: BTreeMap::new(),
+        filed: BTreeMap::new(),
         out_of_scope: BTreeSet::new(),
     };
     let report = program.run(&selection, &mut store);
@@ -1011,6 +955,7 @@ fn a_selection_naming_a_test_that_does_not_exist_warns_instead_of_panicking() {
         parallelism: Parallelism::default(),
         plan: Plan::default(),
         narrowed: BTreeMap::new(),
+        filed: BTreeMap::new(),
         out_of_scope: BTreeSet::new(),
     };
     let report = program.run(&selection, &mut store);
@@ -1106,6 +1051,7 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
         parallelism: Parallelism::default(),
         plan: Plan::default(),
         narrowed: BTreeMap::new(),
+        filed: BTreeMap::new(),
         out_of_scope: BTreeSet::new(),
     };
     let executor = PanickingExecutor { panic_on: 0 };
@@ -1547,15 +1493,8 @@ fn the_attribution_covers_exactly_the_suspect_set() {
             .iter()
             .all(|s| s.hash.is_some())
     );
-    // Nothing compared or traced yet, so every judgement is withheld.
+    // Nothing traced yet, so every judgement is withheld.
     assert!(failure.attribution.suspects.iter().all(|s| s.ran.is_none()));
-    assert!(
-        failure
-            .attribution
-            .suspects
-            .iter()
-            .all(|s| s.before.is_none())
-    );
     assert!(failure.attribution.slice.is_none());
 }
 
@@ -1576,24 +1515,6 @@ fn a_run_that_did_not_bisect_says_so_rather_than_naming_nobody() {
     assert_eq!(bisection.confidence, ply_test::Confidence::None);
     assert!(bisection.culprits().is_empty());
     assert!(!bisection.is_conclusive());
-}
-
-#[test]
-fn a_nondet_failure_is_marked_unbisectable_at_the_point_it_fails() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(
-        "nondet effect wall {\n  read now() -> Int\n}\n\
-         test/nondet \"clock is negative\" { assert(wall.now() < 0) }\n",
-    );
-    let selection = program.select(&store);
-    let report = program.run(&selection, &mut store);
-
-    assert_eq!(report.failed, 1);
-    assert_eq!(
-        report.failures[0].attribution.bisection.verdict,
-        ply_test::Verdict::NotAttempted(ply_test::Skipped::Nondet)
-    );
 }
 
 #[test]
@@ -1730,7 +1651,7 @@ fn the_summary_leads_with_the_culprit_and_the_artifact_carries_the_verdict() {
     assert!(failure["assertion"].is_null());
 }
 
-use ply_eval::{Exploration, Naive, Race, RaceSite, Seed, SimMode};
+use ply_eval::{Exploration, Naive, Race, RaceSite, Seed};
 
 /// Reports a search without running one.
 struct SimExecutor {
@@ -1797,10 +1718,6 @@ impl Executor for SimExecutor {
     }
 }
 
-fn passed(store: &Store, key: DefHash) -> bool {
-    matches!(store.get(key), Some(Outcome::Pass))
-}
-
 fn exhaustive(explored: u32) -> Exploration {
     Exploration {
         explored,
@@ -1844,71 +1761,6 @@ fn seeded_program() -> (Program, usize) {
     let mut program = Program::compile(ARITHMETIC);
     let index = make_seeded(&mut program, "mul is right");
     (program, index)
-}
-
-#[test]
-fn a_seeded_test_is_never_written_under_its_bare_hash() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let (program, seeded) = seeded_program();
-    let plan = Plan::default();
-
-    let selection = program.select_under(&store, &plan);
-    let executor = SimExecutor::new(&selection).exploring(seeded, exhaustive(12));
-    let report = run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
-    assert_eq!((report.passed, report.failed), (3, 0));
-
-    let hash = program.hashes.tests[seeded];
-    assert!(store.get(hash).is_none(), "the bare hash must stay empty");
-    assert!(
-        passed(&store, ply_test::sim_key(hash, &plan)),
-        "the plan key is where the claim lives"
-    );
-    // A test whose row never mentions a seed keeps its existing cache key.
-    let plain = program.hashes.tests[program.index_of("add is right")];
-    assert!(passed(&store, plain));
-}
-
-#[test]
-fn widening_the_budget_re_runs_a_seeded_test_and_changing_nothing_does_not() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let (program, seeded) = seeded_program();
-    let narrow = Plan::default();
-
-    let selection = program.select_under(&store, &narrow);
-    let executor = SimExecutor::new(&selection).exploring(seeded, exhaustive(12));
-    run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
-
-    let again = program.select_under(&store, &narrow);
-    assert!(
-        again.to_run.is_empty(),
-        "the same plan proved the same thing: {again:?}"
-    );
-
-    let wider = Plan {
-        budget: narrow.budget * 2,
-        ..narrow
-    };
-    let widened = program.select_under(&store, &wider);
-    assert_eq!(
-        widened.to_run,
-        vec![seeded],
-        "a wider search is a different claim and has to be made"
-    );
-    assert_eq!(widened.reason(seeded), Some(Reason::New));
 }
 
 #[test]
@@ -1959,51 +1811,6 @@ fn widening_a_random_root_set_runs_only_the_roots_nothing_answered_for() {
 }
 
 #[test]
-fn a_dpor_search_never_narrows_and_writes_no_per_root_key() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let (program, seeded) = seeded_program();
-    let plan = Plan {
-        mode: SimMode::Dpor,
-        roots: vec![0, 1, 2, 3],
-        ..Plan::default()
-    };
-
-    let selection = program.select_under(&store, &plan);
-    let executor = SimExecutor::new(&selection).exploring(seeded, exhaustive(30));
-    run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
-
-    let hash = program.hashes.tests[seeded];
-    for root in &plan.roots {
-        assert!(
-            store
-                .get(ply_test::seed_key(hash, &Seed::root(*root),))
-                .is_none(),
-            "root {root} is not a standalone claim under dpor"
-        );
-    }
-    assert!(passed(&store, ply_test::sim_key(hash, &plan)));
-
-    let wider = Plan {
-        roots: vec![0, 1, 2, 3, 4],
-        ..plan
-    };
-    let widened = program.select_under(&store, &wider);
-    assert_eq!(widened.to_run, vec![seeded]);
-    assert!(
-        widened.narrowed.is_empty(),
-        "a dpor plan has nothing to narrow: {:?}",
-        widened.narrowed
-    );
-}
-
-#[test]
 fn an_exhausted_search_reports_green_writes_nothing_and_re_runs() {
     let root = TempRoot::new();
     let mut store = root.store();
@@ -2033,7 +1840,7 @@ fn an_exhausted_search_reports_green_writes_nothing_and_re_runs() {
 
     let hash = program.hashes.tests[seeded];
     assert!(store.get(hash).is_none());
-    assert!(store.get(ply_test::sim_key(hash, &plan)).is_none());
+    assert!(store.get(crate::fixture::plan_key(hash, &plan)).is_none());
     assert_eq!(program.select_under(&store, &plan).to_run, vec![seeded]);
     assert!(report.simulation.line().unwrap().contains("not cached"));
 }
@@ -2061,13 +1868,9 @@ fn a_simulated_failure_is_never_cached_under_any_key() {
     assert_eq!(report.failed, 1);
     let hash = program.hashes.tests[seeded];
     assert!(store.get(hash).is_none());
-    assert!(store.get(ply_test::sim_key(hash, &plan)).is_none());
+    assert!(store.get(crate::fixture::plan_key(hash, &plan)).is_none());
     for root in &plan.roots {
-        assert!(
-            store
-                .get(ply_test::seed_key(hash, &Seed::root(*root),))
-                .is_none()
-        );
+        assert!(store.get(crate::fixture::root_key(hash, *root)).is_none());
     }
     assert_eq!(program.select_under(&store, &plan).to_run, vec![seeded]);
 }
@@ -2181,7 +1984,10 @@ fn a_seeded_test_with_no_observed_search_warns_and_is_not_cached() {
     assert_eq!(report.failed, 0);
     assert!(
         store
-            .get(ply_test::sim_key(program.hashes.tests[seeded], &plan))
+            .get(crate::fixture::plan_key(
+                program.hashes.tests[seeded],
+                &plan
+            ))
             .is_none()
     );
     assert_eq!(

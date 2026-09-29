@@ -1,8 +1,8 @@
-//! Selection, scheduling, and running: a test re-runs iff its hash is absent from the cache.
+//! Scheduling and running the tests the program chose, and filing each result under the keys it
+//! handed over.
 
 pub mod bisect;
 pub mod hybrid;
-pub mod key;
 pub mod obligation;
 pub mod region;
 pub mod report;
@@ -28,12 +28,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub use bisect::{
-    Baseline, Bisection, Change, ChangeKind, Classify, Cluster, Confidence, DefKey, Delta,
-    DepEdges, Diff, FusionReason, Ns, Regression, Rehashed, SearchStats, Skipped, StoreClassify,
-    Trial, TrialOutcome, Unresolved, Verdict, diff,
+    Baseline, Bisection, ChangeSet, Classify, Confidence, DefKey, Ns, Regression, Rehashed, Row,
+    SearchStats, Skipped, StoreClassify, Trial, TrialOutcome, Unresolved, Verdict, change_set,
 };
 pub use hybrid::{BodyHybrid, Mixture, Signature};
-pub use key::{result_key, seed_key, sim_key, writes_seed_keys};
 pub use region::GroupRegion;
 pub use schedule::{
     AMBIENT, Isolation, Parallelism, REGION_SCOPED, SIM_EFFECT, SIMULATED, contends,
@@ -87,7 +85,8 @@ impl Reason {
 }
 
 /// What a run decided, sent by the program that decided it. The runtime applies its own `--filter`
-/// and `--std` to it, executes exactly what is left of `runs`, and schedules by `groups`.
+/// and `--std` to it, executes exactly what is left of `runs`, schedules by `groups`, and writes a
+/// pass under the keys `filed` names for it.
 #[derive(Clone, Debug, Default)]
 pub struct Choice {
     /// Test indices to execute, ascending.
@@ -96,9 +95,11 @@ pub struct Choice {
     /// all of them, whether or not this run's filter will report on one.
     pub reasons: Vec<Reason>,
     /// The roots a seeded test still owes, when the cache already answered some of the plan's.
-    pub narrowed: std::collections::BTreeMap<usize, Vec<u64>>,
+    pub narrowed: BTreeMap<usize, Vec<u64>>,
     /// Concurrency classes over `runs`, as the program coloured them.
     pub groups: Vec<Vec<usize>>,
+    /// Every key each running test's pass is written under. A test with none is never written.
+    pub filed: BTreeMap<usize, Vec<DefHash>>,
 }
 
 #[derive(Clone)]
@@ -117,6 +118,8 @@ pub struct Selection {
     pub plan: Plan,
     /// What a seeded test still owes, when the cache already covers part of the plan.
     pub narrowed: BTreeMap<usize, Plan>,
+    /// Every key each running test's pass is written under.
+    pub filed: BTreeMap<usize, Vec<DefHash>>,
     /// Test indices this run was never asked to decide: a shipped module's tests without `--std`.
     pub out_of_scope: BTreeSet<usize>,
 }
@@ -178,6 +181,7 @@ impl Selection {
             ),
             plan,
             narrowed,
+            filed: choice.filed.clone(),
             out_of_scope: BTreeSet::new(),
         }
     }
@@ -198,6 +202,7 @@ impl Selection {
             .filter(|class| !class.is_empty())
             .collect();
         out.narrowed.retain(|index, _| keeps(index));
+        out.filed.retain(|index, _| keeps(index));
         out
     }
 
@@ -237,6 +242,7 @@ impl fmt::Debug for Selection {
             .field("parallelism", &self.parallelism)
             .field("plan", &self.plan)
             .field("narrowed", &self.narrowed)
+            .field("filed", &self.filed)
             .finish()
     }
 }
@@ -282,10 +288,6 @@ impl TestResult {
 pub struct Suspect {
     pub name: Symbol,
     pub hash: Option<DefHash>,
-    /// Its hash when the test last passed.
-    pub before: Option<DefHash>,
-    /// `None` when the configurations were never compared, so an edit looks like a moved hash.
-    pub change: Option<ChangeKind>,
     /// `None` when the failing execution was not traced.
     pub ran: Option<bool>,
     /// Distance above the failing frame, zero being where it happened.
@@ -299,17 +301,15 @@ impl Suspect {
         Suspect {
             name,
             hash,
-            before: None,
-            change: None,
             ran: None,
             depth: None,
             culprit: false,
         }
     }
 
-    /// Most-likely-first: a bisected culprit, the stack innermost first, whatever else ran, an edit
-    /// over a hash that only moved, then the name.
-    fn rank(&self) -> (u8, usize, u8, &str) {
+    /// Most-likely-first: a bisected culprit, the stack innermost first, whatever else ran, then
+    /// the name.
+    fn rank(&self) -> (u8, usize, &str) {
         let tier = match (self.culprit, self.ran, self.depth) {
             (true, ..) => 0,
             (false, _, Some(_)) => 1,
@@ -317,13 +317,7 @@ impl Suspect {
             (false, None, None) => 3,
             (false, Some(false), None) => 4,
         };
-        let inherited = u8::from(self.change == Some(ChangeKind::Derived));
-        (
-            tier,
-            self.depth.unwrap_or(usize::MAX),
-            inherited,
-            self.name.as_str(),
-        )
+        (tier, self.depth.unwrap_or(usize::MAX), self.name.as_str())
     }
 }
 
@@ -826,8 +820,8 @@ fn test_hash(hashes: &HashOutput, index: usize) -> Option<DefHash> {
 
 /// Every test the run reports on, nothing answered from the cache, in one class. A caller with no
 /// program — a measurement, an audit — wants the same rows every time, and "all of them, fresh" is
-/// what it says in the vocabulary a program uses to decide. The store is not consulted at all: a
-/// selection made against one plan says nothing about another, so nothing here is read back.
+/// what it says in the vocabulary a program uses to decide. The store is neither read nor written:
+/// the keys a result is filed under are a program's to name.
 pub fn fresh(check: &CheckOutput, visible: &[usize], plan: &Plan) -> Selection {
     Selection::chosen(
         &Choice {
@@ -835,6 +829,7 @@ pub fn fresh(check: &CheckOutput, visible: &[usize], plan: &Plan) -> Selection {
             groups: vec![visible.to_vec()],
             reasons: Vec::new(),
             narrowed: BTreeMap::new(),
+            filed: BTreeMap::new(),
         },
         check,
         visible,
@@ -842,171 +837,92 @@ pub fn fresh(check: &CheckOutput, visible: &[usize], plan: &Plan) -> Selection {
     )
 }
 
-/// Turns each failure's suspect list into a ranked attribution; `sources` are what `front` read.
-/// What the runtime keeps so a program can retry a mixture after the run that collected it: the
+/// What the runtime keeps so a program can try a mixture after the run that collected it: the
 /// bodies this run introduced (a definition the run added is not in the store until the flush), and
-/// per failure the mixture, the test's body, the signature the failure has to keep, and the seed.
+/// per failure what a mixture needs.
 pub struct Hybrids {
     pub fresh: ply_store::body::BodySet,
     pub per_failure: Vec<Option<HybridInput>>,
 }
 
 pub struct HybridInput {
-    /// The change set this failure is about, as the caller will search it.
-    pub delta: crate::bisect::Delta,
-    /// What a mixture needs, when one can be built at all: a failure whose baseline is missing, or
-    /// whose bodies are not on record, still has a change set to report and nothing to try.
+    /// What the runtime knows about each definition in the failing test's closure, either era.
+    pub facts: ChangeSet,
+    /// What a mixture needs, when one can be built at all.
     pub runnable: Option<(Mixture, ply_store::body::StoredBody)>,
     pub signature: Signature,
     pub seed: Option<Seed>,
-    /// What the classifier could not tell apart, and whether the test's own hash was one of them:
-    /// the two sentences a verdict adds are the caller's to add now.
-    pub classified: usize,
-    pub test_classified: bool,
-    /// The reason to give when there is nothing to try, in place of a search that did not happen.
-    pub absent: crate::bisect::Skipped,
+    /// Why no mixture can be tried, exactly when none can.
+    pub absent: Option<Skipped>,
 }
 
-/// How each failure's change set is described, and what the program that reads it needs to search.
-///
-/// The search is the program's: a `ply test` report is read by the entry that declares the effect,
-/// and only it knows which of its own definitions a mixture should try. This side computes what
-/// changed, what a mixture would need, and the reason to give when there is nothing to try, and
-/// hands every failure's answer back in [`Hybrids`].
+/// What each failure's cause is decided from, for the program that reads the report to decide it:
+/// the facts its change set is classified from, and whether a mixture of the two eras can be built.
+/// A failure that never passed has no baseline, and so no facts.
 pub fn diagnose_failures(
-    report: &mut RunReport,
+    report: &RunReport,
     sources: &[(String, String)],
     front: &ply_ty::Front,
-    store: &mut Store,
-    requested: bool,
+    store: &Store,
 ) -> Hybrids {
     let check = &front.check;
     let hashes = &front.hashes;
-    let mut hybrids = Hybrids {
-        fresh: ply_store::body::of_front(front),
-        per_failure: Vec::new(),
-    };
-    if report.failures.is_empty() {
-        return hybrids;
-    }
-
-    let edges = DepEdges::from(hashes);
-
     let fresh = ply_store::body::of_front(front);
-
-    for failure in &mut report.failures {
-        let baseline = store.pass_record(&failure.key).map(|record| {
-            Baseline::with_decls(
+    let per_failure = report
+        .failures
+        .iter()
+        .map(|failure| {
+            let record = store.pass_record(&failure.key)?;
+            let baseline = Baseline::with_decls(
                 record.test_hash,
                 record.closure.clone(),
                 record.decls.clone(),
-            )
-        });
-        let test_hash = hashes
-            .tests
-            .iter()
-            .zip(check.tests.iter())
-            .find(|(_, t)| t.key == failure.key)
-            .map(|(hash, _)| *hash);
-
-        let nondet = check
-            .tests
-            .iter()
-            .find(|t| t.key == failure.key)
-            .is_some_and(|t| t.nondet);
-        let mixture = baseline
-            .as_ref()
-            .map(|baseline| hybrid::mixture_for(hashes, &failure.key, baseline));
-        let complete = mixture
-            .as_ref()
-            .is_some_and(|m| hybrid::bodies_available(store, &fresh, m));
-        let test_body = test_hash.and_then(|hash| BodyHybrid::test_body(&fresh, hash));
-        let seed = failure.seed.clone();
-        // A mixture is runnable when the baseline's closure is on record, every body it needs is
-        // available, and the test itself reached the world at all.
-        let absent = match (&mixture, complete) {
-            (Some(_), false) => Skipped::NoBodies,
-            _ => Skipped::NoHybrids,
-        };
-        let runnable = match mixture {
-            Some(mixture) if complete && !failure.host => test_body.map(|test| (mixture, test)),
-            _ => None,
-        };
-
-        let slot = hybrids.per_failure.len();
-        hybrids.per_failure.push(None);
-
-        // Unclassified, every change stays a candidate: a wider answer, never a wrong one.
-        let rehashed = baseline.as_ref().and_then(|baseline| {
-            Rehashed::under(sources, baseline, &front.packages, &front.mod_pkg).ok()
-        });
-        let mut unknown = bisect::Unknown;
-        let mut store_classify;
-        let classify: &mut dyn Classify = match rehashed {
-            Some(rehashed) => {
-                store_classify = StoreClassify::new(rehashed, store, check);
-                &mut store_classify
-            }
-            None => &mut unknown,
-        };
-
-        let differences = baseline.as_ref().map(|baseline| {
+            );
+            let test_hash = hashes
+                .tests
+                .iter()
+                .zip(check.tests.iter())
+                .find(|(_, t)| t.key == failure.key)
+                .map(|(hash, _)| *hash);
+            let mixture = hybrid::mixture_for(hashes, &failure.key, &baseline);
+            let complete = hybrid::bodies_available(store, &fresh, &mixture);
+            let test_body = test_hash.and_then(|hash| BodyHybrid::test_body(&fresh, hash));
+            // Runnable when every body the mixture needs is available and the failing run reached
+            // nothing outside the program.
+            let runnable = match test_body {
+                Some(test) if complete && !failure.host => Some((mixture, test)),
+                _ => None,
+            };
+            let absent = match (&runnable, complete) {
+                (Some(_), _) => None,
+                (None, false) => Some(Skipped::NoBodies),
+                (None, true) => Some(Skipped::NoHybrids),
+            };
+            // Unclassified, every change stays a candidate: a wider answer, never a wrong one.
+            let rehashed =
+                Rehashed::under(sources, &baseline, &front.packages, &front.mod_pkg).ok();
             let regression = Regression {
                 key: &failure.key,
                 test_hash,
-                baseline,
+                baseline: &baseline,
                 hashes,
             };
-            diff(&regression, classify, &edges)
-        });
-        let delta = differences.as_ref().map(|d| d.delta.clone());
-        if let Some(change) = delta.clone() {
-            hybrids.per_failure[slot] = Some(HybridInput {
-                delta: change,
+            let facts = match rehashed {
+                Some(rehashed) => {
+                    change_set(&regression, &mut StoreClassify::new(rehashed, store, check))
+                }
+                None => change_set(&regression, &mut bisect::Unknown),
+            };
+            Some(HybridInput {
+                facts,
                 runnable,
                 signature: Signature::of(&failure.diagnostic),
-                seed,
-                classified: differences
-                    .as_ref()
-                    .map(|d| d.unclassified.len())
-                    .unwrap_or(0),
-                test_classified: differences
-                    .as_ref()
-                    .map(|d| !d.test_unclassified)
-                    .unwrap_or(true),
+                seed: failure.seed.clone(),
                 absent,
-            });
-        }
-        if let Some(change) = &delta {
-            failure.attribution.annotate(change);
-        }
-        // What this side can say without searching, in the order the gate asks — a defect in Ply,
-        // `nondet`, a host-backed failure and a test that never passed are facts about the record,
-        // not conclusions a search reaches. When a change set *is* handed over, the search is the
-        // program's and the verdict is its to give.
-        let why = if !requested {
-            // `--bisect never` is asked before anything else is looked at: the gate's own order.
-            Skipped::NotRequested
-        } else if failure.defect {
-            Skipped::Panicked
-        } else if nondet {
-            Skipped::Nondet
-        } else if failure.host {
-            Skipped::Host
-        } else if baseline.is_none() {
-            Skipped::NeverPassed
-        } else if delta.is_none() {
-            Skipped::NoChanges
-        } else {
-            Skipped::Delegated
-        };
-        failure.attribution.resolve(
-            crate::Bisection::not_attempted(why),
-            failure.attribution.slice.clone(),
-        );
-    }
-
-    hybrids
+            })
+        })
+        .collect();
+    Hybrids { fresh, per_failure }
 }
 
 pub fn run_with<E: Executor>(
@@ -1073,15 +989,7 @@ pub fn run_with<E: Executor>(
             } else if let Some(diagnostic) = &executed.failure {
                 failed += 1;
                 let suspects = suspects_for(hashes, &test.key, &changed);
-                let mut attribution = Attribution::from_suspects(&suspects, hashes);
-                // The same order `precheck` applies.
-                if defect {
-                    attribution.bisection = Bisection::not_attempted(Skipped::Panicked);
-                } else if host_backed {
-                    attribution.bisection = Bisection::not_attempted(Skipped::Host);
-                } else if test.nondet {
-                    attribution.bisection = Bisection::not_attempted(Skipped::Nondet);
-                }
+                let attribution = Attribution::from_suspects(&suspects, hashes);
                 failures.push(Failure {
                     name: test.name.clone(),
                     key: test.key.clone(),
@@ -1100,16 +1008,8 @@ pub fn run_with<E: Executor>(
                 recorded = Some(Record::Host);
             } else {
                 passed += 1;
-                if !test.nondet
-                    && let Some(hash) = hash
-                {
-                    let record = record_under(
-                        hash,
-                        seeded,
-                        &selection.plan,
-                        selection.plan_for(index),
-                        exploration.as_ref(),
-                    );
+                if let Some(filed) = selection.filed.get(&index) {
+                    let record = record_under(filed, seeded, exploration.as_ref());
                     if record == Record::Unobserved {
                         warnings.push(unobserved_search(&test.key));
                     }
@@ -1117,7 +1017,9 @@ pub fn run_with<E: Executor>(
                         store.put(*key, Outcome::Pass);
                     }
                     // Only the evaluator writes the name-keyed baseline.
-                    if record.is_written() {
+                    if record.is_written()
+                        && let Some(hash) = hash
+                    {
                         let (closure, decls) = closure_hashes(hashes, &test.key);
                         store.put_pass_record(
                             test.key.clone(),
@@ -1413,27 +1315,4 @@ fn observe_definitions(
             .filter(|(name, _)| !implicated.contains(name))
             .map(|(_, hash)| *hash),
     );
-}
-
-/// What the change set says about the suspects already ranked: their kind and their hash before,
-/// and a candidate the ranking never saw is added so `suspects[0]` stays the best guess.
-impl Attribution {
-    pub fn annotate(&mut self, delta: &Delta) {
-        for suspect in &mut self.suspects {
-            if let Some(change) = delta.change(&suspect.name) {
-                suspect.before = change.before;
-                suspect.change = Some(change.kind);
-            }
-        }
-        // A candidate the search names must be ranked too, or `suspects[0]` is not the best guess.
-        for change in &delta.changes {
-            if !self.suspects.iter().any(|s| s.name == change.name) {
-                let mut extra = Suspect::new(change.name.clone(), change.after);
-                extra.before = change.before;
-                extra.change = Some(change.kind);
-                self.suspects.push(extra);
-            }
-        }
-        self.suspects.sort_by(|a, b| a.rank().cmp(&b.rank()));
-    }
 }

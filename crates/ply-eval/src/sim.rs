@@ -315,29 +315,6 @@ impl Plan {
         };
         plan.roots.len() as u64 * per_root > 1
     }
-
-    /// Covers every normalized field, length-prefixed, so no two plans serialize alike.
-    pub fn digest(&self) -> [u8; 32] {
-        let plan = self.clone().normalized();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"ply.sim.plan.1");
-        hasher.update(&[match plan.mode {
-            SimMode::Once => 0,
-            SimMode::Random => 1,
-            SimMode::Dpor => 2,
-        }]);
-        hasher.update(&plan.budget.to_le_bytes());
-        hasher.update(&plan.steps.to_le_bytes());
-        hasher.update(&(plan.roots.len() as u32).to_le_bytes());
-        for root in &plan.roots {
-            hasher.update(&root.to_le_bytes());
-        }
-        hasher.update(&(plan.path.len() as u32).to_le_bytes());
-        for choice in &plan.path {
-            hasher.update(&choice.to_le_bytes());
-        }
-        *hasher.finalize().as_bytes()
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]

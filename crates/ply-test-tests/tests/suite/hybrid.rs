@@ -3,10 +3,10 @@ use ply_span::{SourceId, Symbol};
 use ply_store::body::{BodySet, of_front};
 use ply_store::{CachedDef, Outcome, PassRecord, Store};
 use ply_test::bisect::{
-    Baseline, Delta, DepEdges, Regression, Rehashed, Skipped, StoreClassify, TrialOutcome, diff,
+    Baseline, ChangeSet, Regression, Rehashed, Skipped, StoreClassify, TrialOutcome, change_set,
 };
 use ply_test::{BodyHybrid, Signature, hybrid};
-use ply_ty::{CheckOutput, HashOutput, ModuleName};
+use ply_ty::{CheckOutput, DefHash, HashOutput, ModuleName};
 use std::collections::BTreeMap;
 
 fn sym(s: &str) -> Symbol {
@@ -102,8 +102,9 @@ impl Drop for TempRoot {
     }
 }
 
-/// The store a passing run leaves: normalized bodies, published interfaces, and the pass record.
-fn passed(before: &Compiled, key: &str) -> (TempRoot, Store) {
+/// The store a passing run leaves: normalized bodies, published interfaces, and the pass record,
+/// with a pass already filed under each of `filed`.
+fn passed_with(before: &Compiled, key: &str, filed: &[DefHash]) -> (TempRoot, Store) {
     let root = TempRoot::new("store");
     let mut store = Store::open(&root.0).expect("open store");
     for (hash, body) in before.bodies.defs() {
@@ -123,6 +124,9 @@ fn passed(before: &Compiled, key: &str) -> (TempRoot, Store) {
     }
     let baseline = before.baseline(key);
     store.put(baseline.test_hash, Outcome::Pass);
+    for mixture in filed {
+        store.put(*mixture, Outcome::Pass);
+    }
     store.put_pass_record(
         sym(key),
         PassRecord {
@@ -135,16 +139,26 @@ fn passed(before: &Compiled, key: &str) -> (TempRoot, Store) {
 }
 
 /// Everything a failing `ply test` does for one failure, up to the hybrid a program's own search
-/// would ask: the real change set, the real mixture, and a builder that runs a mixture of them.
+/// would ask: the real facts, the real mixture, and a builder that runs a mixture of them.
 ///
 /// Choosing which definitions to flip is the program's, so the questions are asked here by name.
 fn asked<R>(
     before: &Compiled,
     after: &Compiled,
     key: &str,
-    ask: impl FnOnce(&mut BodyHybrid<'_>, &Delta, &Store) -> R,
+    ask: impl FnOnce(&mut BodyHybrid<'_>, &ChangeSet, &Store) -> R,
 ) -> R {
-    let (_root, store) = passed(before, key);
+    asked_with(before, after, key, &[], ask)
+}
+
+fn asked_with<R>(
+    before: &Compiled,
+    after: &Compiled,
+    key: &str,
+    filed: &[DefHash],
+    ask: impl FnOnce(&mut BodyHybrid<'_>, &ChangeSet, &Store) -> R,
+) -> R {
+    let (_root, store) = passed_with(before, key, filed);
     let baseline = before.baseline(key);
     let rehashed = Rehashed::under(
         &after.sources(),
@@ -166,7 +180,7 @@ fn asked<R>(
         baseline: &baseline,
         hashes: &after.hashes,
     };
-    let diff = diff(&regression, &mut classify, &DepEdges::from(&after.hashes));
+    let facts = change_set(&regression, &mut classify);
 
     let mixture = hybrid::mixture_for(&after.hashes, &key, &baseline);
     assert!(
@@ -185,7 +199,7 @@ fn asked<R>(
         test_body,
         Signature::of(&after.failure(key.as_str())),
     );
-    ask(&mut builder, &diff.delta, &store)
+    ask(&mut builder, &facts, &store)
 }
 
 /// The definitions a trial flips: the programs here are all value definitions.
@@ -197,7 +211,7 @@ fn keys(names: &[&str]) -> std::collections::BTreeSet<ply_test::bisect::DefKey> 
 }
 
 fn flips(builder: &mut BodyHybrid<'_>, names: &[&str]) -> ply_test::bisect::TrialOutcome {
-    builder.trial_over(keys(names)).outcome
+    builder.trial_over(keys(names), None).outcome
 }
 
 const LEDGER: &str = r#"
@@ -396,7 +410,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
     ));
 
     let (outcomes, names_the_test) =
-        asked(&before, &after, "m.doubles", |builder, delta, _store| {
+        asked(&before, &after, "m.doubles", |builder, facts, _store| {
             (
                 [
                     // Every definition at the baseline it passed at. What still fails is the
@@ -404,8 +418,9 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
                     flips(builder, &[]),
                     flips(builder, &["m.other"]),
                 ],
-                // So the change set is what says the test is the cause, not a mixture.
-                delta.test.is_some(),
+                // So the facts are what say the test is the cause, not a mixture: its own body
+                // hashes away from its baseline.
+                facts.rehashed.is_some() && facts.rehashed != Some(facts.before),
             )
         });
     assert_eq!(outcomes, [TrialOutcome::Fails, TrialOutcome::Fails]);
@@ -442,46 +457,66 @@ fn a_trial_records_no_definition_as_seen() {
     );
 }
 
-/// A green mixture is a program whose definitions all pass at once, so what it proved may be
-/// cached — under the *mixture's* own hash. The failing test's hash is a different test's, and
-/// caching a pass for it would turn a red test green.
-#[test]
-fn a_green_mixture_proves_its_own_hash_and_never_the_failing_tests() {
-    let src = r#"
+const EDITED_TEST: &str = r#"
 fn scale(n: Int) -> Int = n * 2
 fn other(n: Int) -> Int = n + 1
 
 test "doubles" { assert_eq(scale(2) + other(0), 5) }
 "#;
-    let before = Compiled::new(src);
-    // The test's text moves too — a space — so the mixture's own test hash is one no record holds.
+
+/// A green mixture is a program whose definitions all pass at once, so what it proved is filed —
+/// under the key the program handed over for that mixture, and never the failing test's, since a
+/// pass there would turn a red test green.
+#[test]
+fn a_green_mixture_is_filed_under_the_key_it_was_handed_and_never_the_failing_tests() {
+    let before = Compiled::new(EDITED_TEST);
+    // The test's text moves too — a space — so the mixture is a program no record covers.
     let after = Compiled::new(
-        &src.replace(
-            "fn other(n: Int) -> Int = n + 1",
-            "fn other(n: Int) -> Int = n + 3",
-        )
-        .replace(
-            "test \"doubles\" { assert_eq",
-            "test \"doubles\" {  assert_eq",
-        ),
+        &EDITED_TEST
+            .replace(
+                "fn other(n: Int) -> Int = n + 1",
+                "fn other(n: Int) -> Int = n + 3",
+            )
+            .replace(
+                "test \"doubles\" { assert_eq",
+                "test \"doubles\" {  assert_eq",
+            ),
     );
 
-    let index = after.test_index("m.doubles");
-    let failing = after.hashes.tests[index];
-    let (outcome, proved) = asked(&before, &after, "m.doubles", |builder, _delta, _store| {
-        // Every definition at the baseline it passed at, and the *test* as it is now: a program
-        // no record covers, because that text is new. It has to be run for its hash to be known.
-        let outcome = flips(builder, &[]);
+    let failing = after.hashes.tests[after.test_index("m.doubles")];
+    let mixture = DefHash([9; 32]);
+    let (outcome, proved) = asked(&before, &after, "m.doubles", |builder, _facts, _store| {
+        // Every definition at the baseline it passed at, and the *test* as it is now.
+        let outcome = builder.trial_over(keys(&[]), Some(mixture)).outcome;
         (outcome, builder.take_proved())
     });
 
     assert_eq!(outcome, TrialOutcome::Passes);
-    // A proof is recorded only for a run that was actually made: a mixture whose hash a record
-    // already covers proves nothing new, and this one may well have been covered.
+    assert_eq!(proved, vec![mixture]);
     assert!(
         !proved.contains(&failing),
         "the failing test's own hash was offered as a proof"
     );
+}
+
+#[test]
+fn a_mixture_whose_key_already_holds_a_pass_is_answered_without_being_built() {
+    let before = Compiled::new(LEDGER);
+    let after = Compiled::new(&LEDGER.replace(
+        "if n < 0 { 0 - 1 } else { 1 }",
+        "if n < 0 { 0 - 1 } else { 0 - 1 }",
+    ));
+    let mixture = DefHash([7; 32]);
+    let trial = asked_with(
+        &before,
+        &after,
+        "m.balances",
+        &[mixture],
+        |builder, _facts, _store| builder.trial_over(keys(&["m.normal_sign"]), Some(mixture)),
+    );
+    // The flip would fail if it were run: the answer is the one filed under its key.
+    assert_eq!(trial.outcome, TrialOutcome::Passes);
+    assert!(trial.cached);
 }
 
 #[test]

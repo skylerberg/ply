@@ -452,33 +452,26 @@ test "the regression" { assert_eq(ask(1), expected()) }
             99,
         )],
     );
-    let mut report = run(&after, &mut store, Some(&binding));
+    let report = run(&after, &mut store, Some(&binding));
     assert_eq!(report.failed, 1);
     let during_the_run = calls.load(Ordering::SeqCst);
     assert_eq!(during_the_run, 1, "the failing run did reach the host");
 
     let mut sources: Vec<(String, String)> = after.texts.clone().into_iter().collect();
     sources.sort();
-    ply_test::diagnose_failures(&mut report, &sources, &after.port, &mut store, true);
+    let hybrids = ply_test::diagnose_failures(&report, &sources, &after.port, &store);
 
     // The failure says it reached the host, and no mixture is offered for one: a re-run would
-    // repeat whatever was done outside the program.
+    // repeat whatever was done outside the program. Refusing to search it is the program's gate.
     assert!(report.failures[0].host);
-    let bisection = &report.failures[0].attribution.bisection;
-    // A host-backed failure is refused before any mixture: a re-run would repeat whatever the
-    // handler did outside the program, and that is a fact about the run, not the program's decision.
-    assert_eq!(
-        bisection.verdict,
-        ply_test::Verdict::NotAttempted(ply_test::Skipped::Host),
-        "a host-backed failure was attributed rather than skipped: {:?} / {}",
-        bisection.verdict,
-        bisection.reason
-    );
+    let input = hybrids.per_failure[0]
+        .as_ref()
+        .expect("the test passed before, so its facts are handed over");
     assert!(
-        !bisection.is_conclusive(),
-        "a culprit was named, with confidence, for a verdict a socket decided"
+        input.runnable.is_none(),
+        "a mixture was offered for a failure that reached the host"
     );
-    assert!(bisection.culprits().is_empty());
+    assert_eq!(input.absent, Some(ply_test::Skipped::NoHybrids));
     assert_eq!(
         calls.load(Ordering::SeqCst),
         during_the_run,
