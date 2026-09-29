@@ -6505,8 +6505,8 @@ pub fn emit_fn(
     Some(f) -> Some(f.text),
   }
 
-// One definition's C, with its tables encoded as the C tier's body cache keeps them. `full` is the
-// definition's own name (`m.f`, or a root's `m.f#requires#0`), from which its C symbol is derived.
+// One definition's C, with the tables it names. `full` is the definition's own name (`m.f`, or a
+// root's `m.f#requires#0`), from which its C symbol is derived.
 pub fn emit_fn_full(
   module: Bytes,
   base: Int,
@@ -6519,7 +6519,7 @@ pub fn emit_fn_full(
   body: Code,
   effects: List<EffectName>,
   release: Bool,
-) -> Option<{ text: Bytes, tables: Bytes }> = {
+) -> Option<{ text: Bytes, tables: Tables }> = {
   let name = symbol_of(full);
   let start = {
     out: [],
@@ -6605,7 +6605,7 @@ pub fn emit_fn_full(
           entry,
           o.em.extra,
         ]),
-        tables: encode_tables(o.em, full),
+        tables: tables_of(o.em, full),
       })
     },
   }
@@ -6685,7 +6685,7 @@ pub fn emit_group_full(
   members: List<Member>,
   effects: List<EffectName>,
   release: Bool,
-) -> Option<{ text: Bytes, tables: Bytes }> = {
+) -> Option<{ text: Bytes, tables: Tables }> = {
   let names = map(members, |m: Member| m.full);
   let first = match list_at(members, 0) { Some(m) -> m.full, None -> b"" };
   let gname = bytes_concat(symbol_of(first), b"_group");
@@ -6780,7 +6780,7 @@ pub fn emit_group_full(
           wrappers,
           em.extra,
         ]),
-        tables: encode_tables(em, first),
+        tables: tables_of(em, first),
       })
     },
   }
@@ -6848,40 +6848,102 @@ fn group_wrapper(gname: Bytes, which: Int, m: Member, width: Int) -> Bytes = {
   ])
 }
 
-// Five tables, the calls, the effects, the members and the symbols, each as a count and one entry per line; a constant is its tag and its bytes in hex.
-fn encode_tables(em: Em, full: Bytes) -> Bytes =
-  bytes_concat_all([
-    counted(
-      b"consts",
-      map(em.consts, |l: Lit|
-        match l {
-          LStr(x) -> bytes_concat(b"s ", hex(x)),
-          LBytes(x) -> bytes_concat(b"b ", hex(x)),
-          LFixed(name, bits) -> match width_named(name) {
-            Some(w) -> bytes_concat_all([b"f ", num(width_index(w)), b" ", num(bits)]),
-            None -> b"u",
-          },
-          // As written: the driver converts the text by the lexer's own rule.
-          LFloat(x) -> bytes_concat(b"X ", unspaced(x)),
-          LDec(x) -> bytes_concat(b"D ", unspaced(x)),
-          _ -> b"u",
-        }),
-    ),
-    counted(b"builtins", em.met),
-    counted(b"fields", em.fields),
+// A constant of a body's table. A width is the runtime's numbering of it, and a float or a decimal
+// is its literal as written, which the driver converts by the lexer's own rule. `ConstUnit` is the
+// unit, and any literal the table has no entry for.
+pub type Const =
+  | ConstStr(Bytes)
+  | ConstBytes(Bytes)
+  | ConstFixed({ width: Int, bits: Int })
+  | ConstFloat(Bytes)
+  | ConstDecimal(Bytes)
+  | ConstUnit
+
+// What the emitted C calls one definition, and the entry the loader binds it by.
+pub type Defined = { symbol: Bytes, entry: Bytes }
+
+// What one body names of the unit around it, each table in the order its own text numbers it.
+// `members` are a group's definitions in case order, and empty for a body of its own.
+pub type Tables = {
+  consts: List<Const>,
+  builtins: List<Bytes>,
+  fields: List<Bytes>,
+  shapes: List<List<Bytes>>,
+  lambdas: List<Bytes>,
+  calls: List<Bytes>,
+  performs: List<Bytes>,
+  handles: List<Bytes>,
+  members: List<Bytes>,
+  symbols: List<Defined>,
+}
+
+fn no_tables() -> Tables =
+  {
+    consts: [],
+    builtins: [],
+    fields: [],
+    shapes: [],
+    lambdas: [],
+    calls: [],
+    performs: [],
+    handles: [],
+    members: [],
+    symbols: [],
+  }
+
+fn const_of_lit(l: Lit) -> Const =
+  match l {
+    LStr(x) -> ConstStr(x),
+    LBytes(x) -> ConstBytes(x),
+    LFixed(name, bits) -> match width_named(name) {
+      Some(w) -> ConstFixed({ width: width_index(w), bits: bits }),
+      None -> ConstUnit,
+    },
+    LFloat(x) -> ConstFloat(unspaced(x)),
+    LDec(x) -> ConstDecimal(unspaced(x)),
+    _ -> ConstUnit,
+  }
+
+fn tables_of(em: Em, full: Bytes) -> Tables =
+  {
+    consts: map(em.consts, const_of_lit),
+    builtins: em.met,
+    fields: em.fields,
     // A shape's fields in the checker's order, which is what the unit interns a shape by.
-    counted(b"shapes", map(em.shapes, |names: List<Bytes>| bytes_join(sorted_names(names), b" "))),
-    counted(b"lambdas", em.lambdas),
-    counted(b"calls", em.calls),
-    counted(b"performs", em.performs),
-    counted(b"handles", em.handles),
-    counted(b"members", em.group),
+    shapes: map(em.shapes, sorted_names),
+    lambdas: em.lambdas,
+    calls: em.calls,
+    performs: em.performs,
+    handles: em.handles,
+    members: em.group,
     // What this body's C calls each definition it holds, so nothing downstream spells a symbol itself.
-    counted(
-      b"symbols",
-      map(if len(em.group) == 0 { [full] } else { em.group }, |m: Bytes|
-        bytes_concat_all([symbol_of(m), b" ", entry_of(m)])),
-    ),
+    symbols: map(if len(em.group) == 0 { [full] } else { em.group }, |m: Bytes|
+      { symbol: symbol_of(m), entry: entry_of(m) }),
+  }
+
+fn const_text(c: Const) -> Bytes =
+  match c {
+    ConstStr(x) -> bytes_concat(b"s ", hex(x)),
+    ConstBytes(x) -> bytes_concat(b"b ", hex(x)),
+    ConstFixed(f) -> bytes_concat_all([b"f ", num(f.width), b" ", num(f.bits)]),
+    ConstFloat(x) -> bytes_concat(b"X ", x),
+    ConstDecimal(x) -> bytes_concat(b"D ", x),
+    ConstUnit -> b"u",
+  }
+
+// Five tables, the calls, the effects, the members and the symbols, each as a count and one entry per line; a constant is its tag and its bytes in hex.
+fn encode_tables(t: Tables) -> Bytes =
+  bytes_concat_all([
+    counted(b"consts", map(t.consts, const_text)),
+    counted(b"builtins", t.builtins),
+    counted(b"fields", t.fields),
+    counted(b"shapes", map(t.shapes, |names: List<Bytes>| bytes_join(names, b" "))),
+    counted(b"lambdas", t.lambdas),
+    counted(b"calls", t.calls),
+    counted(b"performs", t.performs),
+    counted(b"handles", t.handles),
+    counted(b"members", t.members),
+    counted(b"symbols", map(t.symbols, |d: Defined| bytes_concat_all([d.symbol, b" ", d.entry]))),
   ])
 
 // A negative pattern literal's text runs from its `-`, across any space written after it.
@@ -7065,7 +7127,7 @@ test "a self call that takes no arguments restarts the body as well" {
   // A lone definition is no group, so the jump is the self path's, and a nullary body assigns nothing before it.
   let spin = match list_at(out, 0) {
     Some(e) -> e,
-    None -> { name: b"", text: b"", tables: b"", why: None, handles: [] },
+    None -> { name: b"", text: b"", tables: no_tables(), why: None, handles: [] },
   };
   assert_eq(bytes_index_of(spin.text, b"which = ") != None, false);
   assert_eq(bytes_index_of(spin.text, b"p0 = ") != None, false)
@@ -7083,27 +7145,13 @@ test "a tail call into a definition's own recursive group jumps instead of nesti
   assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
   let group = match list_at(out, 0) {
     Some(e) -> e,
-    None -> { name: b"", text: b"", tables: b"", why: None, handles: [] },
+    None -> { name: b"", text: b"", tables: no_tables(), why: None, handles: [] },
   };
-  assert_eq(bytes_index_of(group.tables, b"members 2\nm.even\nm.odd\n") != None, true);
-  assert_eq(
-    bytes_index_of(
-        group.tables,
-        bytes_concat_all([
-          b"symbols 2\n",
-          symbol_of(b"m.even"),
-          b" ",
-          entry_of(b"m.even"),
-          b"\n",
-          symbol_of(b"m.odd"),
-          b" ",
-          entry_of(b"m.odd"),
-          b"\n",
-        ]),
-      )
-      != None,
-    true,
-  );
+  assert_eq(group.tables.members, [b"m.even", b"m.odd"]);
+  assert_eq(group.tables.symbols, [
+    { symbol: symbol_of(b"m.even"), entry: entry_of(b"m.even") },
+    { symbol: symbol_of(b"m.odd"), entry: entry_of(b"m.odd") },
+  ]);
   assert_eq(
     bytes_index_of(
         group.text,
@@ -7153,7 +7201,7 @@ test "a tail call into a definition's own recursive group jumps instead of nesti
   let count = match list_at(out, 2) { Some(e) -> e, None -> group };
   assert_eq(bytes_index_of(count.text, b"ply_loop: if") != None, true);
   assert_eq(bytes_index_of(count.text, b"which = ") != None, false);
-  assert_eq(bytes_index_of(count.tables, b"members 0\n") != None, true)
+  assert_eq(count.tables.members, [])
 }
 
 test "a cycle whose member holds a handle, or whose calls are not in tail position, is emitted per definition" {
@@ -7166,12 +7214,7 @@ test "a cycle whose member holds a handle, or whose calls are not in tail positi
   let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
   assert_eq(map(out, |e: Emitted| e.name), [b"m.a", b"m.b", b"m.c", b"m.d"]);
   assert_eq(map(out, |e: Emitted| e.why == None), [true, true, true, true]);
-  assert_eq(map(out, |e: Emitted| bytes_index_of(e.tables, b"members 2") != None), [
-    false,
-    false,
-    false,
-    false,
-  ]);
+  assert_eq(map(out, |e: Emitted| len(e.tables.members) == 2), [false, false, false, false]);
   assert_eq(
     map(out, |e: Emitted| bytes_index_of(e.text, b"_group(PlyCtx *ctx, int which") != None),
     [false, false, false, false],
@@ -7198,6 +7241,49 @@ test "a program that will not parse is refused, and the refusal carries the pars
   assert_eq(map(out, |e: Emitted| match e.why { Some(w) -> bytes_len(w) > 0, None -> false }), [
     true,
   ])
+}
+
+// The text entry's frames, spelled out from the values of the answer.
+fn framed_from(answers: List<RootAnswer>) -> Bytes =
+  bytes_concat_all(
+    map(answers, |a: RootAnswer|
+      match a.answer {
+        Body(b) -> {
+          let enc = bytes_concat_all([encode_tables(b.tables), b"text\n", b.text]);
+          bytes_concat_all([b"body ", a.name, b" ", num(bytes_len(enc)), b"\n", enc])
+        },
+        Refused(r) -> {
+          let why = bytes_concat_all([r.why, b"\nhandles ", bytes_join(r.handles, b" ")]);
+          bytes_concat_all([b"refused ", a.name, b" ", num(bytes_len(why)), b"\n", why])
+        },
+      }),
+  )
+
+test "the emitter's answer holds each body's tables as values, which frame to the text entry's answer" {
+  let src = b"fn greet() -> Bytes = b\"hi\"\nfn twice(x: Int) -> Int = x + x\nfn guarded() -> Option<Int> = handle { Some(clock.now()) } with { clock.now() -> 7, }\n";
+  let wanted = [b"m.greet", b"m.twice", b"m.guarded"];
+  // No constructor is in the table, so the body that builds one is refused.
+  let answers = emit_roots_answer([b"m"], [src], [], [], wanted, [], []);
+  assert_eq(map(answers, |a: RootAnswer| a.name), wanted);
+  assert_eq(
+    framed_from(answers),
+    bytes_of_string(emit_roots([b"m"], [src], [], [], wanted, [], [])),
+  );
+  match at(answers, 0).answer {
+    Body(b) -> {
+      assert_eq(b.tables.consts, [ConstBytes(b"hi")]);
+      assert_eq(b.tables.symbols, [{ symbol: symbol_of(b"m.greet"), entry: entry_of(b"m.greet") }]);
+      assert(bytes_starts_with(encode_tables(b.tables), b"consts 1\nb 6869\nbuiltins 0\n"))
+    },
+    Refused(_) -> assert(false),
+  };
+  match at(answers, 2).answer {
+    Refused(r) -> {
+      assert_eq(r.why, b"a constructor not in the table: Some");
+      assert_eq(r.handles, [b"clock#now"])
+    },
+    Body(_) -> assert(false),
+  }
 }
 
 test "guarded arms and every literal pattern are emitted rather than refused" {
@@ -7299,7 +7385,7 @@ fn refused_rather_than_emitted(
       Some(m) -> map_keys(m),
       None -> map(map(sources, |s: Source| s.name), |n: Bytes| n),
     },
-    |n: Bytes| { name: n, text: b"", tables: b"", why: Some(why), handles: [] },
+    |n: Bytes| { name: n, text: b"", tables: no_tables(), why: Some(why), handles: [] },
   )
 
 // Resolved together first, so defaults are filled and derives expanded; a program that does not resolve emits nothing.
@@ -7649,7 +7735,7 @@ fn emit_module(
 pub type Emitted = {
   name: Bytes,
   text: Bytes,
-  tables: Bytes,
+  tables: Tables,
   why: Option<Bytes>,
   handles: List<Bytes>,
 }
@@ -7887,7 +7973,7 @@ fn emitted_from(
       {
         name: full,
         text: b"",
-        tables: b"",
+        tables: no_tables(),
         handles: ast_handles(body, effects),
         why: Some(if known { b"a body the lowering does not reach" }
         else { b"a parameter with no written type" }),
@@ -7909,7 +7995,7 @@ fn emitted_from(
         {
           name: full,
           text: b"",
-          tables: b"",
+          tables: no_tables(),
           handles: walk_handles(c, effects),
           why: emit_fn_why(
             module,
@@ -8177,7 +8263,32 @@ pub fn emit_roots(
   pkgs: List<Pkg>,
   mod_pkg: List<Int>,
 ) -> String =
-  unit_frames(
+  string_of_bytes(
+    bytes_join(
+      map(emit_roots_answer(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg), answer_frame),
+      b"",
+    ),
+  )
+
+// A body's C and the tables it names, or why it was refused and the operations it would have
+// handled, which a refusal still names so the fixpoint drops their performers.
+pub type Answer =
+  | Body({ text: Bytes, tables: Tables })
+  | Refused({ why: Bytes, handles: List<Bytes> })
+
+pub type RootAnswer = { name: Bytes, answer: Answer }
+
+// `emit_roots`' answer before it is framed: one entry per root emitted or refused, in its order.
+pub fn emit_roots_answer(
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  ctors: List<Bytes>,
+  builtins: List<Bytes>,
+  wanted: List<Bytes>,
+  pkgs: List<Pkg>,
+  mod_pkg: List<Int>,
+) -> List<RootAnswer> =
+  map(
     emit_program(
       zip_sources(names, srcs),
       ctors,
@@ -8187,29 +8298,31 @@ pub fn emit_roots(
       pkgs,
       mod_pkg,
     ),
+    answer_of,
   )
 
-fn unit_frames(emitted: List<Emitted>) -> String =
-  string_of_bytes(
-    bytes_join(
-      fold(emitted, [], |acc: List<Bytes>, e: Emitted|
-        match e.why {
-          // A refusal still names the operations the body would have handled, so the fixpoint drops their performers.
-          Some(w) -> {
-            let frame = bytes_concat_all([w, b"\nhandles ", bytes_join(e.handles, b" ")]);
-            push(
-              acc,
-              bytes_concat_all([b"refused ", e.name, b" ", num(bytes_len(frame)), b"\n", frame]),
-            )
-          },
-          None -> {
-            let enc = bytes_concat_all([e.tables, b"text\n", e.text]);
-            push(acc, bytes_concat_all([b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc]))
-          },
-        }),
-      b"",
-    ),
-  )
+fn answer_of(e: Emitted) -> RootAnswer =
+  {
+    name: e.name,
+    answer: match e.why {
+      Some(w) -> Refused({ why: w, handles: e.handles }),
+      None -> Body({ text: e.text, tables: e.tables }),
+    },
+  }
+
+fn answer_frame(a: RootAnswer) -> Bytes =
+  match a.answer {
+    Refused(r) -> {
+      let frame = bytes_concat_all([r.why, b"\nhandles ", bytes_join(r.handles, b" ")]);
+      bytes_concat_all([b"refused ", a.name, b" ", num(bytes_len(frame)), b"\n", frame])
+    },
+    Body(b) -> body_frame(a.name, b.text, b.tables),
+  }
+
+fn body_frame(name: Bytes, text: Bytes, tables: Tables) -> Bytes = {
+  let enc = bytes_concat_all([encode_tables(tables), b"text\n", text]);
+  bytes_concat_all([b"body ", name, b" ", num(bytes_len(enc)), b"\n", enc])
+}
 
 // The producer's rendering over a whole program, resolved together.
 pub fn emit_bodies_all(
@@ -8224,10 +8337,7 @@ pub fn emit_bodies_all(
         emit_all_program(zip_sources(names, srcs), ctors, builtins, true),
         [],
         |acc: List<Bytes>, e: Emitted|
-          if e.why != None { acc } else {
-            let enc = bytes_concat_all([e.tables, b"text\n", e.text]);
-            push(acc, bytes_concat_all([b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc]))
-          },
+          if e.why != None { acc } else { push(acc, body_frame(e.name, e.text, e.tables)) },
       ),
       b"",
     ),
@@ -8246,10 +8356,7 @@ pub fn emit_bodies_reference(
         emit_all_program(zip_sources(names, srcs), ctors, builtins, false),
         [],
         |acc: List<Bytes>, e: Emitted|
-          if e.why != None { acc } else {
-            let enc = bytes_concat_all([e.tables, b"text\n", e.text]);
-            push(acc, bytes_concat_all([b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc]))
-          },
+          if e.why != None { acc } else { push(acc, body_frame(e.name, e.text, e.tables)) },
       ),
       b"",
     ),
@@ -8271,10 +8378,7 @@ pub fn emit_bodies_in(
 ) -> String =
   string_of_bytes(
     fold(emit_all_in(module, ctors, builtins, src, true), b"", |acc: Bytes, e: Emitted|
-      if e.why != None { acc } else {
-        let enc = bytes_concat_all([e.tables, b"text\n", e.text]);
-        bytes_concat_all([acc, b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc])
-      }),
+      if e.why != None { acc } else { bytes_concat(acc, body_frame(e.name, e.text, e.tables)) }),
   )
 
 // The C symbol a full name becomes: the name cut on its dots and its `#`s, each piece written as
