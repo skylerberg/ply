@@ -1,11 +1,28 @@
-// The corpus's command line, declared once as a cmdline spec: argument parsing for the corpus
-// binary is the CLI package's library, not a copy of it. `dispatch` turns argv into the JSON
-// plan the binary reads; `main` makes the front door an ordinary runnable program.
+// The corpus's command line and its entry point. The line is declared once as a cmdline spec — the
+// CLI package's library, not a copy of it — and `main` answers it: help, a version and a refusal
+// here; `gen`, `bench`, `sweep` and `real` in this package; and every other subcommand as a JSON
+// plan handed to the Rust executor bound as `executor`, whose output and exit code are this
+// program's own.
+//
+// It runs under `ply run` (`benches/corpus.sh` holds the whole line) with two filesystem roots:
+// `work`, bound at the working directory, which every path this program reads, writes or spawns in
+// is relative to, and `repo`, the checkout whose standard library the in-process measurements are
+// checked against.
 
 import cli.cmdline
+import cli.machine (machine)
+import bench
+import gbuild
+import gen
+import real
+import spine
+import sweep
 import std.json (Json, Str, Number, Bool, Null, object, array)
-import std.process (process)
 import std.json
+import std.fs (fs)
+import std.process (process, exit_code)
+import std.config (config)
+import std.time (time)
 
 fn cats<a>(xss: List<List<a>>) -> List<a> =
   fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |acc2: List<a>, x: a| push(acc2, x)))
@@ -23,49 +40,93 @@ fn text(long: String, default: String, help: String) -> cmdline::Flag =
 fn opt(long: String, help: String) -> cmdline::Flag =
   cmdline::valued(long, "TEXT", cmdline::Text, help)
 
-fn nats(long: String, default: String, help: String) -> cmdline::Flag =
-  cmdline::with_default(cmdline::valued(long, "N,N,…", cmdline::Text, help), default)
-
 fn texts(long: String, help: String) -> cmdline::Flag =
   cmdline::repeated(cmdline::valued(long, "TEXT", cmdline::Text, help))
+
+// The entries of a comma list; the empty list is written as nothing at all.
+fn split_commas(text: String) -> List<String> =
+  if text == "" { [] } else { string_split(text, ",") }
+
+fn every(v: String, ok: (String) -> Bool, what: String) -> Result<Unit, String> =
+  fold(split_commas(v), Ok(()), |acc: Result<Unit, String>, entry: String|
+    match acc { Err(e) -> Err(e), Ok(_) -> if ok(entry) { Ok(()) } else { Err(entry ++ what) } })
+
+fn is_nat(entry: String) -> Bool = cmdline::parse_nat(entry) != None
+
+fn is_pair(entry: String) -> Bool =
+  match cmdline::cut_once(entry, ":") {
+    Some(cut) -> is_nat(cut.head) && is_nat(cut.tail),
+    None -> false,
+  }
+
+// Comma lists are checked entry by entry here, so the plan never carries an entry that is not what
+// its flag says it holds.
+fn nats(long: String, default: String, help: String) -> cmdline::Flag =
+  cmdline::checking(
+    cmdline::with_default(cmdline::valued(long, "N,N,…", cmdline::Text, help), default),
+    |v: String| every(v, is_nat, " is not a number"),
+  )
+
+fn pairs(long: String, default: String, help: String) -> cmdline::Flag =
+  cmdline::checking(
+    cmdline::with_default(cmdline::valued(long, "N:N,…", cmdline::Text, help), default),
+    |v: String| every(v, is_pair, " is not two numbers `N:N`"),
+  )
 
 fn is_a_number(v: String) -> Result<Unit, String> =
   match decimal_of_string(v) { Some(_) -> Ok(()), None -> Err("not a number: " ++ v) }
 
-fn float(long: String, default: String, help: String) -> cmdline::Flag =
+fn float(long: String, default: Float, help: String) -> cmdline::Flag =
   cmdline::checking(
-    cmdline::with_default(cmdline::valued(long, "F", cmdline::Text, help), default),
+    cmdline::with_default(
+      cmdline::valued(long, "F", cmdline::Text, help),
+      float_to_string(default),
+    ),
     is_a_number,
   )
 
+// A directory the corpus reads or writes itself goes through the `work` root, which is the working
+// directory: a path that is absolute, or climbs out of it, names nothing the program can reach.
+fn inside(v: String) -> Result<Unit, String> =
+  if v == "" { Err("a directory is required") } else if string_starts_with(v, "/") {
+    Err("`" ++ v ++ "` is absolute; paths are relative to the working directory")
+  } else if fold(string_split(v, "/"), false, |up: Bool, segment: String| up || segment == "..") {
+    Err("`" ++ v ++ "` climbs out of the working directory, which is all the corpus can reach")
+  } else { Ok(()) }
+
+fn dir_flag(long: String, help: String) -> cmdline::Flag =
+  cmdline::checking(cmdline::valued(long, "DIR", cmdline::Text, help), inside)
+
 fn json_switch() -> cmdline::Flag = sw("json", "The measurements as JSON rather than a table")
 
-// The knobs a generated corpus's shape takes; `gen` and the sizes half of `sweep` share them.
-fn shape_flags() -> List<cmdline::Flag> =
+// The knobs a generated corpus's shape takes, at the generator's own defaults.
+fn shape_flags() -> List<cmdline::Flag> = {
+  let d = gen::default_spec();
   [
-    nat("seed", 1, "The seed the corpus is a function of"),
-    nat("modules", 20, "Modules in the generated corpus"),
-    nat("defs-per-module", 25, "Definitions per module"),
-    nat("tests", 200, "Tests in the generated corpus"),
-    nat("depth", 4, "Import depth of the generated module graph"),
-    nat("tables", 12, "Tables in the generated schema"),
-    nat("regions", 6, "Regions in the generated effect map"),
-    float("effect-fraction", "0.35", "Definitions that perform effects"),
-    float("nondet-fraction", "0.03", "Definitions that perform nondeterministically"),
-    nat("hub-modules", 3, "Modules everything else imports"),
-    nat("max-weight", 192, "The largest one definition weighs"),
-    nat("concurrent-tests", 0, "Tests that run tasks concurrently"),
-    nat("tasks-per-test", 3, "Tasks each concurrent test spawns"),
-    nat("steps-per-task", 2, "Steps each spawned task takes"),
-    float("conflict-density", "0.5", "How often concurrent tasks contend"),
-    float("spec-fraction", "0.0", "Definitions carrying a spec the prover reads"),
-    nat("specimens-per-module", 0, "Specimen definitions per module"),
+    nat("seed", d.seed, "The seed the corpus is a function of"),
+    nat("modules", d.modules, "Modules in the generated corpus"),
+    nat("defs-per-module", d.defs_per_module, "Definitions per module"),
+    nat("tests", d.tests, "Tests in the generated corpus"),
+    nat("depth", d.depth, "Import depth of the generated module graph"),
+    nat("tables", d.tables, "Tables in the generated schema"),
+    nat("regions", d.regions, "Regions in the generated effect map"),
+    float("effect-fraction", d.effect_fraction, "Definitions that perform effects"),
+    float("nondet-fraction", d.nondet_fraction, "Definitions that perform nondeterministically"),
+    nat("hub-modules", d.hub_modules, "Modules everything else imports"),
+    nat("max-weight", d.max_weight, "The largest one definition weighs"),
+    nat("concurrent-tests", d.concurrent_tests, "Tests that run tasks concurrently"),
+    nat("tasks-per-test", d.tasks_per_test, "Tasks each concurrent test spawns"),
+    nat("steps-per-task", d.steps_per_task, "Steps each spawned task takes"),
+    float("conflict-density", d.conflict_density, "How often concurrent tasks contend"),
+    float("spec-fraction", d.spec_fraction, "Definitions carrying a spec the prover reads"),
+    nat("specimens-per-module", d.specimens_per_module, "Specimen definitions per module"),
   ]
+}
 
 fn serve_flags() -> List<cmdline::Flag> =
   [
     text("repo", ".", "The repository root the fixtures are read from"),
-    opt("ply", "The `ply` binary the load tables drive; this binary's sibling when left off"),
+    opt("ply", "The `ply` binary the load tables drive; the executor's sibling when left off"),
     nat("requests", 2000, "Requests per point"),
     nat("repeats", 3, "Repeats per point; the fastest is reported"),
     json_switch(),
@@ -90,27 +151,33 @@ pub fn spec() -> cmdline::Spec =
           cats([
             shape_flags(),
             [
-              opt("out", "Where to write it; must be empty, or a corpus this tool wrote"),
+              dir_flag("out", "Where to write it; must be empty, or a corpus this tool wrote"),
               sw("no-verify", "Write the corpus without compiling it"),
               json_switch(),
             ],
           ]),
         ),
-        cmdline::with_positionals(
-          cmdline::command(
-            "bench",
-            "Time discovery, cache lookup, selection, compilation and execution over a corpus",
-            [nat("repeats", 3, "Repeats per scenario; the fastest run is reported"), json_switch()],
+        cmdline::with_extra(
+          cmdline::with_positionals(
+            cmdline::command(
+              "bench",
+              "Time discovery, cache lookup, selection, compilation and execution over a corpus",
+              [
+                nat("repeats", 3, "Repeats per scenario; the fastest run is reported"),
+                json_switch(),
+              ],
+            ),
+            [cmdline::positional("corpus", "A directory a previous `gen` wrote")],
           ),
-          [cmdline::positional("corpus", "A directory a previous `gen` wrote")],
+          |p: cmdline::Parsed| inside(cmdline::nth_of(p.positionals, 0, "")),
         ),
         cmdline::command(
           "sweep",
           "Generate and benchmark at several sizes, for one comparison table",
           [
-            text("out", "", "A directory to hold one sub-directory per size"),
+            dir_flag("out", "A directory to hold one sub-directory per size"),
             texts("sizes", "A size to sweep, `modules,defs_per_module,tests`; repeat for each"),
-            nat("seed", 1, "The seed every size is a function of"),
+            nat("seed", gen::default_spec().seed, "The seed every size is a function of"),
             nat("repeats", 3, "Repeats per scenario; the fastest run is reported"),
             json_switch(),
           ],
@@ -201,7 +268,7 @@ pub fn spec() -> cmdline::Spec =
           [
             nats("lines", "1,10,40,200,1000", "Line items per JSON payload"),
             nat("iterations", 200, "Encodes and decodes per payload size"),
-            nats(
+            pairs(
               "shape",
               "40:0,40:100,40:400,40:1600",
               "`lines:pad` pairs separating a decode's per-field cost from its per-byte one",
@@ -216,7 +283,7 @@ pub fn spec() -> cmdline::Spec =
             ),
             opt(
               "ply",
-              "The `ply` binary the order check drives; this binary's sibling when left off",
+              "The `ply` binary the order check drives; the executor's sibling when left off",
             ),
             nat("repeats", 3, "Repeats per point; the fastest is reported"),
             sw("no-derivation", "Drop the derivation comparison, the slow half"),
@@ -262,7 +329,7 @@ pub fn spec() -> cmdline::Spec =
             ),
             opt(
               "ply",
-              "The `ply` binary the load table drives; this binary's sibling when left off",
+              "The `ply` binary the load table drives; the executor's sibling when left off",
             ),
             nats("concurrency", "1,2,4,8,16", "Concurrent tasks in the `ops` sweep"),
             nat("operations", 400, "Statements per point in the `ops` sweep"),
@@ -287,7 +354,7 @@ pub fn spec() -> cmdline::Spec =
             text("repo", ".", "The repository root, where `examples/desk.ply` is read from"),
             opt(
               "ply",
-              "The `ply` binary the served sections drive; this binary's sibling when left off",
+              "The `ply` binary the served sections drive; the executor's sibling when left off",
             ),
             opt(
               "db",
@@ -341,7 +408,7 @@ pub fn spec() -> cmdline::Spec =
             text("repo", ".", "The repository root, where `examples/desk.ply` is read from"),
             opt(
               "ply",
-              "The `ply` binary the served rungs drive; this binary's sibling when left off",
+              "The `ply` binary the served rungs drive; the executor's sibling when left off",
             ),
             text(
               "db",
@@ -424,14 +491,120 @@ pub fn spec() -> cmdline::Spec =
         ),
         cmdline::command(
           "real",
-          "The compiler and the CLI themselves, pinned by digest, front-ended and tested",
+          "The compiler and the CLI themselves, pinned by digest, front-ended and tested; run from the repository's root",
           [sw("no-tests", "Front-end only; skip the test suites"), json_switch()],
         ),
       ],
     ),
   }
 
-// --- The plan a run materializes ------------------------------------------------
+// --- What a line asks for ------------------------------------------------------
+
+pub type GenArgs = { out: String, spec: gbuild::Spec, no_verify: Bool, json: Bool }
+
+pub type BenchArgs = { corpus: String, repeats: Int, json: Bool }
+
+pub type SweepArgs = { out: String, sizes: List<String>, seed: Int, repeats: Int, json: Bool }
+
+pub type RealArgs = { tests: Bool, json: Bool }
+
+// A line, answered: text for stdout (help, a version), a refusal for stderr, a subcommand this
+// package runs, or the plan the executor runs.
+pub type Asked =
+  | Said(String)
+  | Refusal(String)
+  | Gen(GenArgs)
+  | Bench(BenchArgs)
+  | Sweep(SweepArgs)
+  | Real(RealArgs)
+  | Plan(Json)
+
+fn nat_of(p: cmdline::Parsed, long: String) -> Int =
+  match cmdline::value(p, long) {
+    Some(v) -> match cmdline::parse_nat(v) { Some(n) -> n, None -> 0 },
+    None -> 0,
+  }
+
+fn float_of(p: cmdline::Parsed, long: String) -> Float =
+  match cmdline::value(p, long) {
+    Some(v) -> match decimal_of_string(v) { Some(d) -> float_of_decimal(d), None -> 0.0 },
+    None -> 0.0,
+  }
+
+fn spec_of(p: cmdline::Parsed) -> gbuild::Spec =
+  {
+    seed: nat_of(p, "seed"),
+    modules: nat_of(p, "modules"),
+    defs_per_module: nat_of(p, "defs-per-module"),
+    tests: nat_of(p, "tests"),
+    depth: nat_of(p, "depth"),
+    tables: nat_of(p, "tables"),
+    regions: nat_of(p, "regions"),
+    effect_fraction: float_of(p, "effect-fraction"),
+    nondet_fraction: float_of(p, "nondet-fraction"),
+    hub_modules: nat_of(p, "hub-modules"),
+    max_weight: nat_of(p, "max-weight"),
+    concurrent_tests: nat_of(p, "concurrent-tests"),
+    tasks_per_test: nat_of(p, "tasks-per-test"),
+    steps_per_task: nat_of(p, "steps-per-task"),
+    conflict_density: float_of(p, "conflict-density"),
+    spec_fraction: float_of(p, "spec-fraction"),
+    specimens_per_module: nat_of(p, "specimens-per-module"),
+  }
+
+// A valued flag that must be written: the line is refused when it was not, the library's way.
+fn required(p: cmdline::Parsed, long: String) -> Result<String, String> =
+  match cmdline::value(p, long) {
+    Some(v) -> Ok(v),
+    None ->
+      Err(
+        cmdline::refused(
+          spec(),
+          p.path,
+          "a value is required for '--" ++ long ++ "' but none was supplied",
+        ),
+      ),
+  }
+
+pub fn asked(argv: List<String>) -> Asked =
+  match cmdline::parse(spec(), argv) {
+    cmdline::Help(text) -> Said(text),
+    cmdline::Version(text) -> Said(text),
+    cmdline::Refused(text) -> Refusal(text),
+    cmdline::Run(p) -> match cmdline::nth_of(p.path, 0, "") {
+      "gen" -> match required(p, "out") {
+        Err(why) -> Refusal(why),
+        Ok(out) ->
+          Gen({
+            out: out,
+            spec: spec_of(p),
+            no_verify: cmdline::has(p, "no-verify"),
+            json: cmdline::has(p, "json"),
+          }),
+      },
+      "bench" ->
+        Bench({
+          corpus: cmdline::nth_of(p.positionals, 0, ""),
+          repeats: nat_of(p, "repeats"),
+          json: cmdline::has(p, "json"),
+        }),
+      "sweep" -> match required(p, "out") {
+        Err(why) -> Refusal(why),
+        Ok(out) ->
+          Sweep({
+            out: out,
+            sizes: cmdline::values_of(p, "sizes"),
+            seed: nat_of(p, "seed"),
+            repeats: nat_of(p, "repeats"),
+            json: cmdline::has(p, "json"),
+          }),
+      },
+      "real" -> Real({ tests: !cmdline::has(p, "no-tests"), json: cmdline::has(p, "json") }),
+      _ -> match run_plan(p) { Ok(j) -> Plan(j), Err(why) -> Refusal(why) },
+    },
+  }
+
+// --- The plan the executor runs ------------------------------------------------
 
 fn str_flag(p: cmdline::Parsed, long: String) -> Json =
   match cmdline::value(p, long) { Some(v) -> Str(v), None -> Null }
@@ -442,23 +615,7 @@ fn int_flag(p: cmdline::Parsed, long: String) -> Json =
     None -> Null,
   }
 
-fn float_flag(p: cmdline::Parsed, long: String) -> Json =
-  match cmdline::value(p, long) {
-    Some(v) -> match decimal_of_string(v) { Some(d) -> Number(d), None -> Null },
-    None -> Null,
-  }
-
 fn bool_flag(p: cmdline::Parsed, long: String) -> Json = Bool(cmdline::has(p, long))
-
-fn split_commas(text: String) -> List<String> =
-  if text == "" { [] } else { split_from(bytes_of_string(text), 0, []) }
-
-fn split_from(b: Bytes, from: Int, acc: List<String>) -> List<String> =
-  match bytes_index_of(bytes_slice(b, from, bytes_len(b)), b",") {
-    None -> push(acc, string_of_bytes(bytes_slice(b, from, bytes_len(b)))),
-    Some(i) ->
-      split_from(b, from + i + 1, push(acc, string_of_bytes(bytes_slice(b, from, from + i)))),
-  }
 
 fn nats_json(text: String) -> Json =
   array(
@@ -469,32 +626,16 @@ fn nats_json(text: String) -> Json =
 fn list_flag(p: cmdline::Parsed, long: String) -> Json =
   match cmdline::value(p, long) { Some(v) -> nats_json(v), None -> array([]) }
 
+fn texts_flag(p: cmdline::Parsed, long: String) -> Json =
+  match cmdline::value(p, long) {
+    Some(v) -> array(map(split_commas(v), |s: String| Str(s))),
+    None -> array([]),
+  }
+
 fn repeated_json(p: cmdline::Parsed, long: String) -> Json =
   array(map(cmdline::values_of(p, long), |s: String| Str(s)))
 
 fn positionals_json(p: cmdline::Parsed) -> Json = array(map(p.positionals, |s: String| Str(s)))
-
-// The shape knobs, one member list, shared by `gen`.
-fn shape_args(p: cmdline::Parsed) -> List<{ key: String, value: Json }> =
-  [
-    { key: "seed", value: int_flag(p, "seed") },
-    { key: "modules", value: int_flag(p, "modules") },
-    { key: "defs_per_module", value: int_flag(p, "defs-per-module") },
-    { key: "tests", value: int_flag(p, "tests") },
-    { key: "depth", value: int_flag(p, "depth") },
-    { key: "tables", value: int_flag(p, "tables") },
-    { key: "regions", value: int_flag(p, "regions") },
-    { key: "effect_fraction", value: float_flag(p, "effect-fraction") },
-    { key: "nondet_fraction", value: float_flag(p, "nondet-fraction") },
-    { key: "hub_modules", value: int_flag(p, "hub-modules") },
-    { key: "max_weight", value: int_flag(p, "max-weight") },
-    { key: "concurrent_tests", value: int_flag(p, "concurrent-tests") },
-    { key: "tasks_per_test", value: int_flag(p, "tasks-per-test") },
-    { key: "steps_per_task", value: int_flag(p, "steps-per-task") },
-    { key: "conflict_density", value: float_flag(p, "conflict-density") },
-    { key: "spec_fraction", value: float_flag(p, "spec-fraction") },
-    { key: "specimens_per_module", value: int_flag(p, "specimens-per-module") },
-  ]
 
 fn serve_args(p: cmdline::Parsed) -> List<{ key: String, value: Json }> =
   [
@@ -512,64 +653,10 @@ fn plan(command: String, args: List<{ key: String, value: Json }>) -> Json =
     { key: "args", value: object(args) },
   ])
 
-fn refused_plan(why: String) -> Json =
-  object([{ key: "outcome", value: Str("refused") }, { key: "why", value: Str(why) }])
-
-// A valued flag that must be written: the plan is a refusal when it was not, rendered the
-// library's way.
-fn required(p: cmdline::Parsed, long: String) -> Result<String, String> =
-  match cmdline::value(p, long) {
-    Some(v) -> Ok(v),
-    None ->
-      Err(
-        cmdline::refused(
-          spec(),
-          p.path,
-          "a value is required for '--" ++ long ++ "' but none was supplied",
-        ),
-      ),
-  }
-
+// Every knob of a subcommand the executor runs, materialized: defaults filled, numbers parsed and
+// comma lists split, so the executor only decodes.
 fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
   match cmdline::nth_of(p.path, 0, "") {
-    "gen" -> match required(p, "out") {
-      Err(why) -> Err(why),
-      Ok(_) ->
-        Ok(
-          plan(
-            "gen",
-            cats([
-              shape_args(p),
-              [
-                { key: "out", value: str_flag(p, "out") },
-                { key: "no_verify", value: bool_flag(p, "no-verify") },
-                { key: "json", value: bool_flag(p, "json") },
-              ],
-            ]),
-          ),
-        ),
-    },
-    "bench" ->
-      Ok(
-        plan("bench", [
-          { key: "corpus", value: Str(cmdline::nth_of(p.positionals, 0, "")) },
-          { key: "repeats", value: int_flag(p, "repeats") },
-          { key: "json", value: bool_flag(p, "json") },
-        ]),
-      ),
-    "sweep" -> match required(p, "out") {
-      Err(why) -> Err(why),
-      Ok(_) ->
-        Ok(
-          plan("sweep", [
-            { key: "out", value: str_flag(p, "out") },
-            { key: "sizes", value: repeated_json(p, "sizes") },
-            { key: "seed", value: int_flag(p, "seed") },
-            { key: "repeats", value: int_flag(p, "repeats") },
-            { key: "json", value: bool_flag(p, "json") },
-          ]),
-        ),
-    },
     "measure" ->
       Ok(
         plan("measure", [
@@ -630,7 +717,7 @@ fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
         plan("payload", [
           { key: "lines", value: list_flag(p, "lines") },
           { key: "iterations", value: int_flag(p, "iterations") },
-          { key: "shape", value: list_flag(p, "shape") },
+          { key: "shape", value: texts_flag(p, "shape") },
           { key: "entries", value: list_flag(p, "entries") },
           { key: "types", value: list_flag(p, "types") },
           { key: "types_per_module", value: int_flag(p, "types-per-module") },
@@ -762,83 +849,205 @@ fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
           { key: "json", value: bool_flag(p, "json") },
         ]),
       ),
-    "real" ->
-      Ok(
-        plan("real", [
-          { key: "no_tests", value: bool_flag(p, "no-tests") },
-          { key: "json", value: bool_flag(p, "json") },
-        ]),
-      ),
-    _ -> Err("no command named " ++ cmdline::nth_of(p.path, 0, "")),
+    other -> Err(cmdline::refused(spec(), p.path, "no command named " ++ other)),
   }
 
-// --- The front door --------------------------------------------------------------
+// --- Running what was asked ------------------------------------------------------
 
-// argv as the binary's own, minus its name: the JSON plan the Rust half reads. A run plan's
-// `args` carries every knob materialized -- defaults filled, nats and floats parsed, comma
-// lists split -- so the Rust half only ever decodes.
-pub fn dispatch(argv: List<String>) -> String =
-  encode(match cmdline::parse(spec(), argv) {
-    cmdline::Run(p) -> match run_plan(p) { Ok(j) -> j, Err(why) -> refused_plan(why) },
-    cmdline::Help(text) ->
-      object([{ key: "outcome", value: Str("help") }, { key: "text", value: Str(text) }]),
-    cmdline::Version(text) ->
-      object([{ key: "outcome", value: Str("version") }, { key: "text", value: Str(text) }]),
-    cmdline::Refused(text) ->
-      object([{ key: "outcome", value: Str("refused") }, { key: "why", value: Str(text) }]),
-  })
+// A text as the stream carries it: `out` and `err` end each write with a newline, so one the text
+// already ends with is not written twice.
+fn chomped(text: String) -> String =
+  if string_ends_with(text, "\n") { string_slice(text, 0, string_len(text) - 1) } else { text }
 
-fn encode(j: Json) -> String = json::to_string(j)
+fn say(text: String) -> Unit / {process.out[proc]} =
+  if text == "" { () } else { process.out[proc](chomped(text)) }
 
-pub fn main() -> Unit / {process.args[proc], process.out[proc]} = {
-  let argv: List<String> = process.args[proc]();
-  process.out[proc](dispatch(drop_first(argv)))
+fn complain(text: String) -> Unit / {process.err[proc]} =
+  if text == "" { () } else { process.err[proc](chomped(text)) }
+
+// A subcommand's answer: what it printed and exit 0, or why it could not and exit 1.
+fn answered(outcome: Result<String, String>) -> Int / {process.out[proc], process.err[proc]} =
+  match outcome {
+    Ok(text) -> {
+      say(text);
+      0
+    },
+    Err(why) -> {
+      complain("ply-corpus: " ++ why);
+      1
+    },
+  }
+
+fn report_text(report: spine::Report, json_wanted: Bool) -> String =
+  if json_wanted { json::to_string(report.json) } else { report.rendered }
+
+// The executor runs the plan with the few variables the toolchain reads, in the working directory,
+// and what it wrote and the code it exited with are this program's.
+fn executed(
+  plan: Json,
+) -> Int / {process.spawn[executor], config.get[env], process.out[proc], process.err[proc]} = {
+  let done = process.spawn[executor](["--plan", json::to_string(plan)], "", spine::inherited_env());
+  say(string_of_bytes_lossy(done.out));
+  complain(string_of_bytes_lossy(done.err));
+  match exit_code(done) {
+    Some(code) -> if code >= 0 && code <= 125 { code } else { 1 },
+    None -> {
+      complain("ply-corpus: the executor was stopped by a signal");
+      1
+    },
+  }
 }
 
-fn drop_first(xs: List<String>) -> List<String> = match xs { [] -> [], [_, ..rest] -> rest }
+fn code_of(
+  a: Asked,
+) -> Int / {process.out[proc], process.err[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  match a {
+    Said(text) -> {
+      process.out[proc](text);
+      0
+    },
+    Refusal(text) -> {
+      complain(text);
+      2
+    },
+    Gen(g) ->
+      answered(match gen::run(g.out, g.spec, g.no_verify) {
+        Err(why) -> Err(why),
+        Ok(made) ->
+          Ok(if g.json { json::to_string(gen::report_json(made)) } else { gen::summary(made) }),
+      }),
+    Bench(b) ->
+      answered(match bench::run(b.corpus, b.repeats) {
+        Err(why) -> Err(why),
+        Ok(report) -> Ok(report_text(report, b.json)),
+      }),
+    Sweep(s) ->
+      answered(match sweep::sizes_of(s.sizes, s.seed) {
+        Err(why) -> Err(why),
+        Ok(sizes) -> match sweep::run(s.out, sizes, s.repeats) {
+          Err(why) -> Err(why),
+          Ok(reports) ->
+            Ok(if s.json { json::to_string(array(map(reports, |r: spine::Report| r.json))) }
+            else { fold(reports, "", |acc: String, r: spine::Report| acc ++ r.rendered) }),
+        },
+      }),
+    Real(r) ->
+      answered(match real::run(r.tests) {
+        Err(why) -> Err(why),
+        Ok(report) -> Ok(report_text(report, r.json)),
+      }),
+    Plan(j) -> executed(j),
+  }
+
+pub fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  process.exit[proc](code_of(asked(process.args[proc]())))
 
 // --- Tests -----------------------------------------------------------------------
 
+fn plan_text(argv: List<String>) -> String =
+  match asked(argv) { Plan(j) -> json::to_string(j), _ -> "" }
+
+fn refusal_of(argv: List<String>) -> String = match asked(argv) { Refusal(text) -> text, _ -> "" }
+
 test "a bare word is refused with the help in it" {
-  match cmdline::parse(spec(), ["nonsense"]) {
-    cmdline::Refused(text) -> assert(string_contains(text, "unrecognized subcommand")),
+  assert(string_contains(refusal_of(["nonsense"]), "unrecognized subcommand"))
+}
+
+test "gen fills the shape's defaults, which are the generator's" {
+  match asked(["gen", "--out", "gen-out"]) {
+    Gen(g) -> {
+      assert_eq(g.out, "gen-out");
+      assert_eq(g.spec, gen::default_spec());
+      assert(!g.no_verify);
+      assert(!g.json)
+    },
     _ -> assert(false),
   }
 }
 
-test "gen fills the shape's defaults" {
-  let out = dispatch(["gen", "--out", "gen-out"]);
-  assert(string_contains(out, "\"command\":\"gen\""));
-  assert(string_contains(out, "\"seed\":1"));
-  assert(string_contains(out, "\"effect_fraction\":0.35"));
-  assert(string_contains(out, "\"no_verify\":false"));
-  assert(string_contains(out, "\"out\":\"gen-out\""));
+test "gen refuses without --out" { assert(string_contains(refusal_of(["gen"]), "--out")) }
+
+test "a conflict density outside 0 to 1 is refused by the generator" {
+  match asked(["gen", "--out", "c", "--conflict-density", "2"]) {
+    Gen(g) ->
+      assert(match gen::validate(g.spec) {
+        Err(why) -> string_contains(why, "--conflict-density"),
+        Ok(_) -> false,
+      }),
+    _ -> assert(false),
+  }
 }
 
-test "gen refuses without --out" {
-  let out = dispatch(["gen"]);
-  assert(string_contains(out, "\"outcome\":\"refused\""));
-  assert(string_contains(out, "--out"));
+test "a directory the corpus writes is under the working directory" {
+  assert(string_contains(refusal_of(["gen", "--out", "/tmp/corpus"]), "is absolute"));
+  assert(string_contains(refusal_of(["bench", "../corpus"]), "climbs out"));
+  match asked(["bench", "corpora/m4", "--repeats", "1"]) {
+    Bench(b) -> {
+      assert_eq(b.corpus, "corpora/m4");
+      assert_eq(b.repeats, 1)
+    },
+    _ -> assert(false),
+  }
 }
 
-test "w4 refuses without --db" {
-  let out = dispatch(["w4"]);
-  assert(string_contains(out, "\"outcome\":\"refused\""));
-  assert(string_contains(out, "--db"));
+test "sweep reads its sizes and its seed" {
+  match asked(["sweep", "--out", "s", "--sizes", "4,5,8", "--sizes", "6,5,8", "--seed", "3"]) {
+    Sweep(s) -> {
+      assert_eq(s.sizes, ["4,5,8", "6,5,8"]);
+      assert_eq(s.seed, 3)
+    },
+    _ -> assert(false),
+  }
 }
+
+test "real tests unless told not to" {
+  match asked(["real"]) { Real(r) -> assert(r.tests && !r.json), _ -> assert(false) };
+  match asked(["real", "--no-tests", "--json"]) {
+    Real(r) -> assert(!r.tests && r.json),
+    _ -> assert(false),
+  }
+}
+
+test "w4 refuses without --db" { assert(string_contains(refusal_of(["w4"]), "--db")) }
 
 test "w6-ladder reads a comma list of concurrencies" {
-  let out = dispatch(["w6-ladder", "--db", "pg://x", "--concurrency", "1,16,64"]);
-  assert(string_contains(out, "\"concurrency\":[1,16,64]"));
+  assert(
+    string_contains(
+      plan_text(["w6-ladder", "--db", "pg://x", "--concurrency", "1,16,64"]),
+      "\"concurrency\":[1,16,64]",
+    ),
+  )
+}
+
+test "payload's shape is a list of `lines:pad` texts, as the executor reads it" {
+  assert(
+    string_contains(
+      plan_text(["payload"]),
+      "\"shape\":[\"40:0\",\"40:100\",\"40:400\",\"40:1600\"]",
+    ),
+  );
+  assert(string_contains(refusal_of(["payload", "--shape", "40:0,40"]), "40 is not two numbers"))
+}
+
+test "a list entry that is not a number is refused rather than planned as a null" {
+  assert(string_contains(refusal_of(["measure", "--cells", "1,x"]), "x is not a number"))
 }
 
 test "an unknown flag is a refusal, not a panic" {
-  let out = dispatch(["bench", "some-corpus", "--bogus"]);
-  assert(string_contains(out, "\"outcome\":\"refused\""));
+  assert(refusal_of(["bench", "some-corpus", "--bogus"]) != "")
 }
 
-test "help is its own outcome" {
-  let out = dispatch(["--help"]);
-  assert(string_contains(out, "\"outcome\":\"help\""));
-  assert(string_contains(out, "w6-ladder"));
+test "help is text for stdout, and names every subcommand" {
+  match asked(["--help"]) {
+    Said(text) -> {
+      assert(string_contains(text, "w6-ladder"));
+      assert(string_contains(text, "sweep"))
+    },
+    _ -> assert(false),
+  }
+}
+
+test "a text the stream would end with a newline is not given a second" {
+  assert_eq(chomped("a\nb\n"), "a\nb");
+  assert_eq(chomped("a"), "a")
 }
