@@ -1,19 +1,24 @@
-use crate::support::generate as generate_corpus;
+use crate::support::generate;
 use ply_corpus::measure::{scheduling, throughput};
-use ply_corpus::spec::CorpusSpec;
 
 use std::path::Path;
 
 fn corpus_at(root: &Path) {
-    let spec = CorpusSpec {
-        seed: 4,
-        modules: 5,
-        defs_per_module: 6,
-        tests: 10,
-        depth: 2,
-        ..CorpusSpec::default()
-    };
-    generate_corpus(root, &spec);
+    generate(
+        root,
+        &[
+            "--seed",
+            "4",
+            "--modules",
+            "5",
+            "--defs-per-module",
+            "6",
+            "--tests",
+            "10",
+            "--depth",
+            "2",
+        ],
+    );
 }
 
 #[test]

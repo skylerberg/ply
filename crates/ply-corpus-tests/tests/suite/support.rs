@@ -1,80 +1,103 @@
-//! Generating corpora in tests, through the corpus package's own generator.
+//! Driving the corpus program the way `benches/corpus.sh` does: `ply run` over the package, with
+//! the grants it runs under and the working directory as its `work` root.
 
-use ply_corpus::spec::CorpusSpec;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 pub fn ply() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ply")
 }
 
+/// The transitional executor, which runs the subcommands still written in Rust.
+pub fn executor() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ply-corpus")
+}
+
 /// The repository root, which is where the corpus package is reachable by path.
 pub fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the crate lives two levels below the repository root")
 }
 
-/// Call a `gen.*` entry of the corpus package and answer its text payload.
-fn call(entry: &str, args: Vec<ply_eval::Value>, cwd: &Path) -> String {
-    let value = ply_corpus::cmd::run_ply_subcommand(entry, args, cwd, &ply())
-        .unwrap_or_else(|e| panic!("`{entry}` would not run: {e:#}"));
-    let ply_eval::Value::Ctor { name, args } = &value else {
-        panic!("`{entry}` answered {value}, not an `Ok` or an `Err`");
-    };
-    let ply_eval::Value::Str(text) = &args[0] else {
-        panic!("`{entry}`'s answer is not text: {value}");
-    };
-    match name.as_str() {
-        "Ok" => text.to_string(),
-        "Err" => panic!("`{entry}` refused: {text}"),
-        other => panic!("`{entry}` answered `{other}`"),
+/// What `ply` and the program read from the environment, and nothing else from the test's.
+const INHERITED: &[&str] = &["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "NEXTEST"];
+
+/// `ply run` over the corpus package in `dir`, with the grants the program's own subcommands are
+/// run with, and `args` after `--`.
+pub fn corpus(dir: &Path, args: &[&str]) -> Output {
+    run(dir, &[], args)
+}
+
+/// The same, with the executor bound too, for a subcommand the program hands to it.
+pub fn delegated(dir: &Path, args: &[&str]) -> Output {
+    run(
+        dir,
+        &[format!("--exec=executor={}", executor().display())],
+        args,
+    )
+}
+
+fn run(dir: &Path, grants: &[String], args: &[&str]) -> Output {
+    let mut cmd = Command::new(ply());
+    cmd.env_clear();
+    for key in INHERITED {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
     }
+    cmd.arg("run")
+        .arg(repo().join("crates/ply-corpus/ply"))
+        .args(["--host", "--allow", "machine"])
+        .arg(format!("--exec=ply={}", ply().display()))
+        .args(grants)
+        .args(["--fs", "work=."])
+        .arg(format!("--fs=repo={}", repo().display()))
+        .arg("--")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("`ply run` starts")
 }
 
-/// A corpus generated and verified on disk, as `ply-corpus gen` writes it.
-pub fn generate(root: &Path, spec: &CorpusSpec) {
-    let parent = root.parent().expect("a corpus root has a parent");
-    let name = root.file_name().expect("a corpus root has a name");
-    call(
-        "gen.run",
-        vec![
-            ply_eval::Value::str(name.to_string_lossy()),
-            ply_eval::Value::str(root.to_string_lossy()),
-            ply_eval::Value::str(serde_json::to_string(spec).unwrap()),
-            ply_eval::Value::Bool(false),
-        ],
-        parent,
-    );
-}
-
-/// The files the generator emits for a spec, `(path, text)` each.
-pub fn dump_files(spec: &CorpusSpec) -> Vec<(String, String)> {
-    let dir = tempfile::tempdir().unwrap();
-    let text = call(
-        "gen.dump",
-        vec![ply_eval::Value::str(serde_json::to_string(spec).unwrap())],
-        dir.path(),
-    );
-    let dump: serde_json::Value = serde_json::from_str(&text).expect("the dump is JSON");
-    dump["files"]
-        .as_array()
-        .expect("files is an array")
-        .iter()
-        .map(|f| {
-            (
-                f["path"].as_str().unwrap().to_string(),
-                f["text"].as_str().unwrap().to_string(),
-            )
-        })
+/// The program's stdout after the lines `ply run` writes about the binding before the entry
+/// runs, which are indented.
+pub fn written(out: &Output) -> String {
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .skip_while(|line| line.starts_with("   "))
+        .map(|line| format!("{line}\n"))
         .collect()
 }
 
-/// The manifest the generator writes for a spec, as decoded JSON.
-pub fn dump_manifest(spec: &CorpusSpec) -> serde_json::Value {
-    let dir = tempfile::tempdir().unwrap();
-    let text = call(
-        "gen.dump",
-        vec![ply_eval::Value::str(serde_json::to_string(spec).unwrap())],
-        dir.path(),
+/// The one JSON document a `--json` subcommand wrote.
+pub fn document(out: &Output) -> serde_json::Value {
+    let text = written(out);
+    serde_json::from_str(&text).unwrap_or_else(|e| {
+        panic!(
+            "stdout was not one JSON document: {e}\n---\n{text}\n---\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// A corpus generated at `root` and verified, as `gen` writes one; `shape` is its shape flags.
+pub fn generate(root: &Path, shape: &[&str]) {
+    let parent = root.parent().expect("a corpus root has a parent");
+    let name = root
+        .file_name()
+        .expect("a corpus root has a name")
+        .to_string_lossy()
+        .into_owned();
+    let mut args = vec!["gen", "--out", name.as_str()];
+    args.extend_from_slice(shape);
+    let out = corpus(parent, &args);
+    assert!(
+        out.status.success(),
+        "`gen {}` failed:\n{}\n{}",
+        shape.join(" "),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
-    let dump: serde_json::Value = serde_json::from_str(&text).expect("the dump is JSON");
-    dump["manifest"].clone()
 }

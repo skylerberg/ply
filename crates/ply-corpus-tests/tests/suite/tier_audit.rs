@@ -1,5 +1,4 @@
 use crate::support::generate;
-use ply_corpus::CorpusSpec;
 use ply_machine::engine::Prover;
 use ply_machine::load::load;
 use ply_machine::obligations;
@@ -16,17 +15,26 @@ fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
     for seed in 1..=6u64 {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("corpus");
-        let spec = CorpusSpec {
-            seed,
-            modules: 6,
-            defs_per_module: 10,
-            tests: 20,
-            depth: 3,
-            spec_fraction: 0.4,
-            specimens_per_module: 3,
-            ..CorpusSpec::default()
-        };
-        generate(&root, &spec);
+        let seed_text = seed.to_string();
+        generate(
+            &root,
+            &[
+                "--seed",
+                &seed_text,
+                "--modules",
+                "6",
+                "--defs-per-module",
+                "10",
+                "--tests",
+                "20",
+                "--depth",
+                "3",
+                "--spec-fraction",
+                "0.4",
+                "--specimens-per-module",
+                "3",
+            ],
+        );
 
         let loaded = load(&root).expect("a generated corpus compiles");
         let hashes = loaded.hashes.clone();

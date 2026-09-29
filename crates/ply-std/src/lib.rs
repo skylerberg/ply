@@ -1,7 +1,5 @@
-//! The modules that ship with the compiler.
+//! The modules that ship with the compiler, by dotted name.
 
-use ply_span::{Diagnostic, Span, codes};
-use ply_ty::ModuleName;
 use std::path::{Path, PathBuf};
 
 /// The reserved first segment.
@@ -110,34 +108,28 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.uuid", UUID),
 ];
 
-pub fn source(module: &ModuleName) -> Option<&'static str> {
+pub fn source(name: &str) -> Option<&'static str> {
     MODULES
         .iter()
-        .find(|(name, _)| *name == module.as_str())
+        .find(|(module, _)| *module == name)
         .map(|(_, source)| *source)
 }
 
-pub fn modules() -> impl Iterator<Item = ModuleName> {
-    MODULES
-        .iter()
-        .map(|(name, _)| ModuleName::from_dotted(name))
+pub fn modules() -> impl Iterator<Item = &'static str> {
+    MODULES.iter().map(|(name, _)| *name)
 }
 
 pub fn sources() -> impl Iterator<Item = (&'static str, &'static str)> {
     MODULES.iter().copied()
 }
 
-pub fn is_std(module: &ModuleName) -> bool {
-    is_reserved(module.as_str())
-}
-
-/// [`is_std`] for a name that is not a [`ModuleName`] yet.
-pub fn is_reserved(name: &str) -> bool {
+/// The reserved root itself, or a module under it.
+pub fn is_std(name: &str) -> bool {
     name == ROOT || name.starts_with(&format!("{ROOT}."))
 }
 
-pub fn pseudo_path(module: &ModuleName) -> PathBuf {
-    let rest: Vec<&str> = module.segments().skip(1).collect();
+pub fn pseudo_path(name: &str) -> PathBuf {
+    let rest: Vec<&str> = name.split('.').skip(1).collect();
     PathBuf::from(format!("{PSEUDO_ROOT}/{}.ply", rest.join("/")))
 }
 
@@ -167,17 +159,6 @@ pub fn digest_short() -> String {
     out
 }
 
-pub fn unknown_module(name: &ModuleName, span: Span) -> Diagnostic {
-    let listed: Vec<String> = MODULES.iter().map(|(n, _)| format!("`{n}`")).collect();
-    Diagnostic::error(
-        codes::UNKNOWN_MODULE,
-        format!("no module named `{name}` ships with this compiler"),
-    )
-    .primary(span, "not found")
-    .note(format!("the stdlib holds: {}", listed.join(", ")))
-    .note("`ply std` lists them with the digest this binary was built from")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,46 +176,40 @@ mod tests {
     #[test]
     fn every_shipped_module_is_addressable() {
         for (name, source) in MODULES {
-            let module = ModuleName::from_dotted(name);
-            assert!(is_std(&module), "`{name}` is not under `{ROOT}`");
+            assert!(is_std(name), "`{name}` is not under `{ROOT}`");
             assert!(!source.is_empty(), "`{name}` ships no source");
-            assert_eq!(super::source(&module), Some(*source));
-            assert!(module.segments().count() >= 2, "`{name}` names no module");
+            assert_eq!(super::source(name), Some(*source));
+            assert!(name.split('.').count() >= 2, "`{name}` names no module");
         }
     }
 
     #[test]
     fn a_module_that_does_not_ship_has_no_source() {
-        assert_eq!(source(&ModuleName::from_dotted("std.sql")), None);
+        assert_eq!(source("std.sql"), None);
         // The unqualified name is a project's to use, and never resolves here.
-        assert_eq!(source(&ModuleName::from_dotted("net")), None);
-        assert_eq!(source(&ModuleName::from_dotted("json")), None);
+        assert_eq!(source("net"), None);
+        assert_eq!(source("json"), None);
     }
 
     #[test]
     fn the_pseudo_path_is_slash_separated_and_outside_the_identifier_space() {
+        assert_eq!(pseudo_path("std.net"), PathBuf::from("<std>/net.ply"));
         assert_eq!(
-            pseudo_path(&ModuleName::from_dotted("std.net")),
-            PathBuf::from("<std>/net.ply")
-        );
-        assert_eq!(
-            pseudo_path(&ModuleName::from_dotted("std.http.server")),
+            pseudo_path("std.http.server"),
             PathBuf::from("<std>/http/server.ply")
         );
-        assert!(is_pseudo_path(&pseudo_path(&ModuleName::from_dotted(
-            "std.net"
-        ))));
+        assert!(is_pseudo_path(&pseudo_path("std.net")));
         assert!(!is_pseudo_path(Path::new("src/net.ply")));
     }
 
     #[test]
     fn the_reserved_root_covers_itself_and_everything_under_it() {
-        assert!(is_reserved("std"));
-        assert!(is_reserved("std.net"));
-        assert!(is_reserved("std.a.b"));
-        assert!(!is_reserved("stdlib"));
-        assert!(!is_reserved("mine.std"));
-        assert!(!is_reserved(""));
+        assert!(is_std("std"));
+        assert!(is_std("std.net"));
+        assert!(is_std("std.a.b"));
+        assert!(!is_std("stdlib"));
+        assert!(!is_std("mine.std"));
+        assert!(!is_std(""));
     }
 
     #[test]

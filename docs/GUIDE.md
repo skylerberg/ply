@@ -2174,6 +2174,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` label may start (`ply run` only); `E0457` if it cannot be executed |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare an effect of that name: `machine`, `tester`, `claims`, `builder`, `cache`, `bootstrap`, `hosts` or `edit` (`ply run` only); `E0459` otherwise |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -2381,7 +2382,7 @@ through `ply fmt` into the range `show` reports.
 
 `E` is an error; `W` is a warning and never a fault in your program.
 `ply explain CODE` prints a code's line from this table, and `--all` the whole
-table, from the registry the compiler raises from.
+table.
 
 Every command writes a diagnostic the same way, in one shape:
 
@@ -2514,6 +2515,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0456` | `process.spawn` label with no executable bound |
 | `E0457` | `--exec` path that cannot be executed |
 | `E0458` | captured output over the bound |
+| `E0459` | `--allow` family the program does not declare |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

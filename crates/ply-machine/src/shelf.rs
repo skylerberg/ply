@@ -25,7 +25,7 @@ pub fn is_shipped(module: &ModuleName) -> bool {
 
 /// [`is_shipped`] for a name that is not a [`ModuleName`] yet.
 pub fn is_shipped_name(name: &str) -> bool {
-    ply_std::is_reserved(name) || is_compiler(name)
+    ply_std::is_std(name) || is_compiler(name)
 }
 
 /// The whole shelf the port pulls from, in the order the two tables hold it. Built once: the
@@ -57,7 +57,7 @@ pub fn pseudo_path(module: &ModuleName) -> PathBuf {
             "{COMPILER_PSEUDO_ROOT}/{}.ply",
             rest.replace('.', "/")
         )),
-        None => ply_std::pseudo_path(module),
+        None => ply_std::pseudo_path(module.as_str()),
     }
 }
 

@@ -3,7 +3,6 @@ use ply_machine::driver;
 use ply_machine::load::{Loaded, load};
 use ply_span::{Symbol, codes};
 use ply_store::{ContentHash, DefEntry, Store};
-use ply_ty::ModuleName;
 use std::path::Path;
 
 fn output(out: &std::process::Output) -> String {
@@ -12,10 +11,6 @@ fn output(out: &std::process::Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
-}
-
-fn std_net() -> ModuleName {
-    ModuleName::from_dotted("std.net")
 }
 
 fn hash_of(loaded: &Loaded, name: &str) -> String {
@@ -139,12 +134,12 @@ fn no_cycle_can_be_built_between_a_project_and_the_stdlib() {
     );
     let loaded = load(dir.path()).expect("it checks");
     for view in loaded.modules() {
-        if !ply_std::is_std(view.name) {
+        if !ply_std::is_std(view.name.as_str()) {
             continue;
         }
         for imported in &view.info.imports {
             assert!(
-                ply_std::is_std(imported),
+                ply_std::is_std(imported.as_str()),
                 "the shipped module `{}` imports `{imported}`",
                 view.name
             );
@@ -199,7 +194,7 @@ fn a_definition_that_does_not_import_std_is_unmoved_by_one_that_does() {
 
 /// What the previous compiler left behind, rewritten as this one would find it.
 fn age_the_shipped_fingerprint(dir: &Path, mut mutate: impl FnMut(&mut DefEntry)) {
-    let path = ply_std::pseudo_path(&std_net());
+    let path = ply_std::pseudo_path("std.net");
     let mut store = Store::open(dir).unwrap();
     let mut fingerprint = (*store
         .fingerprint(&path)

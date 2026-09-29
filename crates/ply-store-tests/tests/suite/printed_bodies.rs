@@ -14,7 +14,7 @@ fn port_front(files: &[(&str, &str)]) -> ply_ty::Front {
     // A printed program carries the toolchain's modules inline; re-fronting pulls them.
     let named: Vec<(String, String)> = files
         .iter()
-        .filter(|(name, _)| ply_std::source(&ply_ty::ModuleName::from_dotted(name)).is_none())
+        .filter(|(name, _)| ply_std::source(name).is_none())
         .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
         .collect();
     ply_codegen::c::producer::checked_front_with_std(&named)
@@ -50,7 +50,7 @@ fn names_of(checked: &Checked) -> Vec<(Symbol, DefHash)> {
 }
 
 fn is_shipped(name: &str) -> bool {
-    ply_std::is_reserved(name) || name.starts_with("compiler.") || name.starts_with("ply_tests")
+    ply_std::is_std(name) || name.starts_with("compiler.") || name.starts_with("ply_tests")
 }
 
 fn shipped_names() -> Vec<String> {
