@@ -1,4 +1,5 @@
-// The process a program runs in, as an effect; `spawn` starts another one.
+// The process a program runs in, as an effect; `spawn` runs another to its end, and `start` runs
+// one beside the program.
 pub nondet effect process {
   read args[p]() -> List<String>
   write out[p](text: String) -> Unit
@@ -8,21 +9,49 @@ pub nondet effect process {
   write line[p]() -> Option<String>
   write exit[p](code: Int) -> Unit
   write spawn[e](args: List<String>, dir: String, env: List<Var>) -> Finished
+  // A child's handle, or why it could not start. The run kills any child still running when it
+  // ends, however it ends.
+  write start[e](args: List<String>, dir: String, env: List<Var>, io: Io) -> Result<Int, String>
+  // How the child ended and what its streams hold, once it has, and the handle is then spent.
+  // `None` while it runs past the timeout; a negative timeout waits for as long as it takes.
+  write wait[e](child: Int, timeout_ms: Int) -> Option<Finished>
+  // `false` when the child had already ended.
+  write signal[e](child: Int, signal: Signal) -> Bool
+  // Every byte, or `false` once the child's input is closed or the child has ended.
+  write input[e](child: Int, bytes: Bytes) -> Bool
+  write end_input[e](child: Int) -> Unit
+  write output_line[e](child: Int, timeout_ms: Int) -> Heard
 }
 
-// One environment variable. A spawn is given the whole environment and inherits none of the run's.
+// One environment variable. A child is given the whole environment and inherits none of the run's.
 pub type Var = { name: String, value: String }
 
 pub fn var(name: String, value: String) -> Var = { name: name, value: value }
 
-// How a spawned process ended: its own code, or the signal that killed it.
+// How a child ended: its own code, or the signal that killed it.
 pub type Ended = | Exited(Int) | Signalled(Int)
 
-// What a spawned process left behind: how it ended and, whole, what it wrote to each stream.
+// What a child left behind: how it ended and what the host held of each stream, which for a spawn
+// is everything it wrote.
 pub type Finished = { ended: Ended, out: Bytes, err: Bytes }
 
 pub fn exit_code(f: Finished) -> Option<Int> =
   match f.ended { Exited(code) -> Some(code), Signalled(_) -> None }
+
+// Where one of a started child's output streams goes. `Keep` holds all of it for `wait`; `Lines`
+// hands it over a line at a time through `output_line`, and the unread ones at `wait`; `Inherit`
+// is the program's own stream; `File` writes a file, relative to the child's directory, from empty.
+pub type Output = | Keep | Discard | Inherit | Lines | File(String)
+
+// How a started child is wired: whether it reads what the program writes, and where each of its
+// output streams goes.
+pub type Io = { input: Bool, out: Output, err: Output }
+
+pub type Signal = | Hangup | Interrupt | Terminate | Kill
+
+// What `output_line` heard: the next line of any `Lines` stream without its ending, nothing before
+// the timeout, or the end of every `Lines` stream once each line has been read.
+pub type Heard = | Said(String) | Quiet | Closed
 
 // --- The twin ---------------------------------------------------------------
 
@@ -62,7 +91,8 @@ pub fn err_step(c: Captured, text: String) -> Captured = { ..c, err: push(c.err,
 pub fn exit_step(c: Captured, code: Int) -> Captured =
   match c.code { Some(_) -> c, None -> { ..c, code: Some(code) } }
 
-// What one spawn asked for. The executable is not here: the label names it, and the host binds that.
+// What one spawn or start asked for. The executable is not here: the label names it, and the host
+// binds that.
 pub type Launch = { args: List<String>, dir: String, env: List<Var> }
 
 // What a test answers spawns with, and what it has been asked to run; replies are handed out in order.
@@ -90,6 +120,113 @@ pub fn exited(code: Int, out: Bytes, err: Bytes) -> Finished =
 
 pub fn signalled(signal: Int, out: Bytes, err: Bytes) -> Finished =
   { ended: Signalled(signal), out: out, err: err }
+
+// --- The children's twin ----------------------------------------------------
+
+// One child a test plans: how many `wait`s find it still running, how it ends, and what
+// `output_line` hears from it, in order.
+pub type Script = { polls: Int, finished: Finished, heard: List<Heard> }
+
+pub fn script(polls: Int, finished: Finished, heard: List<Heard>) -> Script =
+  { polls: polls, finished: finished, heard: heard }
+
+// A started child and what the program did to it: the bytes it wrote to the child's input,
+// whether that input is still open, and the signals it sent.
+pub type Child = {
+  launch: Launch,
+  io: Io,
+  script: Script,
+  written: Bytes,
+  open: Bool,
+  signals: List<Signal>,
+  spent: Bool,
+}
+
+// What a test hands the children's clauses in place of the host: the children it planned, handed
+// to `start`s in order, and each child started, whose handle is its place in `started` from 1.
+pub type Children = { planned: List<Script>, started: List<Child> }
+
+pub fn children(planned: List<Script>) -> Children = { planned: planned, started: [] }
+
+// One step of the twin: the twin with the step recorded, and what the host would have answered.
+pub type Answered<a> = { children: Children, answer: a }
+
+// A start a test planned no child for could not start, as a spawn it planned no reply for could
+// not run.
+pub fn start_step(c: Children, launch: Launch, io: Io) -> Answered<Result<Int, String>> =
+  match c.planned {
+    [] -> { children: c, answer: Err("no child was planned for this start") },
+    [first, ..rest] -> {
+      let child = {
+        launch: launch,
+        io: io,
+        script: first,
+        written: b"",
+        open: io.input,
+        signals: [],
+        spent: false,
+      };
+      let started = push(c.started, child);
+      { children: { planned: rest, started: started }, answer: Ok(len(started)) }
+    },
+  }
+
+// The host refuses a handle it never answered and one already waited on, and so does the twin.
+fn child_at(c: Children, child: Int) -> Child =
+  match list_at(c.started, child - 1) {
+    None -> panic("no child has the handle " ++ int_to_string(child)),
+    Some(one) -> if one.spent {
+      panic("child " ++ int_to_string(child) ++ " has already been waited on")
+    } else { one },
+  }
+
+fn replaced(c: Children, child: Int, one: Child) -> Children =
+  { ..c, started: list_set(c.started, child - 1, one) }
+
+pub fn wait_step(c: Children, child: Int) -> Answered<Option<Finished>> = {
+  let one = child_at(c, child);
+  if one.script.polls > 0 {
+    let polled = { ..one.script, polls: one.script.polls - 1 };
+    { children: replaced(c, child, { ..one, script: polled }), answer: None }
+  } else {
+    { children: replaced(c, child, { ..one, spent: true }), answer: Some(one.script.finished) }
+  }
+}
+
+// `Kill` ends a scripted child as it ends a real one, so the next `wait` hands it back.
+pub fn signal_step(c: Children, child: Int, signal: Signal) -> Answered<Bool> = {
+  let one = child_at(c, child);
+  let polls = match signal { Kill -> 0, _ -> one.script.polls };
+  let signalled = {
+    ..one,
+    script: { ..one.script, polls: polls },
+    signals: push(one.signals, signal),
+  };
+  { children: replaced(c, child, signalled), answer: true }
+}
+
+pub fn input_step(c: Children, child: Int, bytes: Bytes) -> Answered<Bool> = {
+  let one = child_at(c, child);
+  if one.open {
+    let fed = { ..one, written: bytes_concat(one.written, bytes) };
+    { children: replaced(c, child, fed), answer: true }
+  } else { { children: c, answer: false } }
+}
+
+pub fn end_input_step(c: Children, child: Int) -> Children =
+  replaced(c, child, { ..child_at(c, child), open: false })
+
+// A script that runs out is the end of the child's lines, as a stream's end is.
+pub fn output_line_step(c: Children, child: Int) -> Answered<Heard> = {
+  let one = child_at(c, child);
+  match one.script.heard {
+    [] -> { children: c, answer: Closed },
+    [first, ..rest] -> {
+      let heard = { ..one, script: { ..one.script, heard: rest } };
+      { children: replaced(c, child, heard), answer: first }
+    },
+  }
+}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -247,4 +384,176 @@ test "a spawn a test planned no reply for is a command that could not be run" {
   assert_eq(r.finished.out, b"");
   assert_eq(len(r.runs.launched), 1);
   assert_eq(exit_code(signalled(9, b"", b"")), None)
+}
+
+// A supervisor's shape: start a server, read until it says it listens, stop it, and kill it if it
+// has not stopped in time.
+fn supervise(
+  tries: Int,
+) -> Result<Finished, String> / {process.start[srv], process.output_line[srv], process.signal[srv], process.wait[srv]} = {
+  let child = process.start[srv](["serve"], "", [], { input: false, out: Lines, err: Inherit })?;
+  if listening(child, tries) {
+    let _ = process.signal[srv](child, Terminate);
+    match process.wait[srv](child, 1000) { Some(done) -> Ok(done), None -> killed(child) }
+  } else {
+    let _ = killed(child);
+    Err("the server never said it was listening")
+  }
+}
+
+fn listening(child: Int, tries: Int) -> Bool / {process.output_line[srv]} =
+  if tries <= 0 { false } else {
+    match process.output_line[srv](child, 100) {
+      Said(line) -> string_starts_with(line, "listening") || listening(child, tries - 1),
+      Quiet -> listening(child, tries - 1),
+      Closed -> false,
+    }
+  }
+
+fn killed(child: Int) -> Result<Finished, String> / {process.signal[srv], process.wait[srv]} = {
+  let _ = process.signal[srv](child, Kill);
+  match process.wait[srv](child, -1) {
+    Some(done) -> Ok(done),
+    None -> Err("the server outlived a kill"),
+  }
+}
+
+// The supervisor with every child it starts answered by the twin.
+fn supervised(planned: List<Script>) -> Answered<Result<Finished, String>> =
+  with_cell[kids](children(planned)) { kids -> {
+    let answer = handle {
+      supervise(5)
+    } with {
+      process.start[srv](args, dir, env, io) -> {
+        let step = start_step(cell_get(kids), { args: args, dir: dir, env: env }, io);
+        cell_set(kids, step.children);
+        step.answer
+      },
+      process.output_line[srv](child, timeout_ms) -> {
+        let step = output_line_step(cell_get(kids), child);
+        cell_set(kids, step.children);
+        step.answer
+      },
+      process.signal[srv](child, signal) -> {
+        let step = signal_step(cell_get(kids), child, signal);
+        cell_set(kids, step.children);
+        step.answer
+      },
+      process.wait[srv](child, timeout_ms) -> {
+        let step = wait_step(cell_get(kids), child);
+        cell_set(kids, step.children);
+        step.answer
+      },
+    };
+    { children: cell_get(kids), answer: answer }
+  } }
+
+fn only_child(c: Children) -> Child =
+  match c.started { [one] -> one, _ -> panic("one child was started") }
+
+test "a server that says it listens is stopped, and the stop is what ended it" {
+  let run = supervised([
+    script(0, exited(0, b"", b""), [Said("booting"), Quiet, Said("listening on 8080")]),
+  ]);
+  assert_eq(run.answer, Ok(exited(0, b"", b"")));
+  let server = only_child(run.children);
+  assert_eq(server.launch.args, ["serve"]);
+  assert_eq(server.io, { input: false, out: Lines, err: Inherit });
+  assert_eq(server.signals, [Terminate]);
+  assert(server.spent)
+}
+
+test "a server that outlives its stop is killed, and the kill hands it back" {
+  let run = supervised([script(3, signalled(9, b"", b""), [Said("listening on 8080")])]);
+  assert_eq(run.answer, Ok(signalled(9, b"", b"")));
+  assert_eq(only_child(run.children).signals, [Terminate, Kill])
+}
+
+test "a server that never says it listens is killed rather than waited on" {
+  let run = supervised([script(10, signalled(9, b"", b""), [Said("booting")])]);
+  assert_eq(run.answer, Err("the server never said it was listening"));
+  assert_eq(only_child(run.children).signals, [Kill])
+}
+
+test "a start with no child planned could not start, and nothing is waited on" {
+  let run = supervised([]);
+  assert_eq(run.answer, Err("no child was planned for this start"));
+  assert_eq(run.children.started, [])
+}
+
+// A tool driven over its input: every line in, the end of its input, and what it wrote back.
+fn feed(
+  lines: List<String>,
+) -> Result<Bytes, String> / {process.start[tool], process.input[tool], process.end_input[tool], process.wait[tool]} = {
+  let child = process.start[tool](["--stdin"], "", [], { input: true, out: Keep, err: Discard })?;
+  let fed = fold(lines, true, |ok: Bool, line: String|
+    ok && process.input[tool](child, bytes_of_string(line ++ "\n")));
+  process.end_input[tool](child);
+  match process.wait[tool](child, -1) {
+    Some(done) -> if fed { Ok(done.out) } else { Err("the tool stopped reading") },
+    None -> Err("the tool is still running"),
+  }
+}
+
+test "a tool fed over its input gets every byte, then the end of its input" {
+  with_cell[kids](children([script(0, exited(0, b"2 lines\n", b""), [])])) { kids -> {
+    handle {
+      assert_eq(feed(["one", "two"]), Ok(b"2 lines\n"))
+    } with {
+      process.start[tool](args, dir, env, io) -> {
+        let step = start_step(cell_get(kids), { args: args, dir: dir, env: env }, io);
+        cell_set(kids, step.children);
+        step.answer
+      },
+      process.input[tool](child, bytes) -> {
+        let step = input_step(cell_get(kids), child, bytes);
+        cell_set(kids, step.children);
+        step.answer
+      },
+      process.end_input[tool](child) -> cell_set(kids, end_input_step(cell_get(kids), child)),
+      process.wait[tool](child, timeout_ms) -> {
+        let step = wait_step(cell_get(kids), child);
+        cell_set(kids, step.children);
+        step.answer
+      },
+    };
+    let tool = only_child(cell_get(kids));
+    assert_eq(tool.written, b"one\ntwo\n");
+    assert(!tool.open)
+  } }
+}
+
+test "a child's input takes nothing once it is ended or was never opened" {
+  let io = { input: true, out: Keep, err: Keep };
+  let started = start_step(
+    children([script(0, exited(0, b"", b""), [])]),
+    { args: [], dir: "", env: [] },
+    io,
+  );
+  let ended = end_input_step(started.children, 1);
+  assert_eq(input_step(ended, 1, b"late").answer, false);
+  let unopened = start_step(
+    children([script(0, exited(0, b"", b""), [])]),
+    { args: [], dir: "", env: [] },
+    { ..io, input: false },
+  );
+  assert_eq(input_step(unopened.children, 1, b"early").answer, false)
+}
+
+test "a child runs through its polls, then hands back how it ended, and its lines run out closed" {
+  let started = start_step(
+    children([script(2, exited(3, b"", b""), [Said("one")])]),
+    { args: [], dir: "", env: [] },
+    { input: false, out: Lines, err: Keep },
+  );
+  let first = wait_step(started.children, 1);
+  assert_eq(first.answer, None);
+  let second = wait_step(first.children, 1);
+  assert_eq(second.answer, None);
+  let heard = output_line_step(second.children, 1);
+  assert_eq(heard.answer, Said("one"));
+  assert_eq(output_line_step(heard.children, 1).answer, Closed);
+  let third = wait_step(heard.children, 1);
+  assert_eq(third.answer, Some(exited(3, b"", b"")));
+  assert(only_child(third.children).spent)
 }

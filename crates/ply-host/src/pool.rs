@@ -5,7 +5,7 @@ use ply_eval::{Pending, Value};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 pub const MAX_BLOCKING_OPERATIONS: usize = 64;
@@ -19,9 +19,25 @@ pub const FS_FIRST_TOKEN: u64 = 1 << 62;
 pub const PROCESS_FIRST_TOKEN: u64 = 1 << 63;
 
 /// How a spawned process ended: its own code, or the signal that killed it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ended {
     Exited(i64),
     Signalled(i64),
+}
+
+/// A `std.process.Finished`: how a child ended and what it left in each stream.
+pub struct Exit {
+    pub ended: Ended,
+    pub out: Vec<u8>,
+    pub err: Vec<u8>,
+}
+
+/// A `std.process.Heard`: what `process.output_line` answers.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Heard {
+    Said(String),
+    Quiet,
+    Closed,
 }
 
 pub enum Done {
@@ -36,18 +52,45 @@ pub enum Done {
     MaybeString(Option<String>),
     /// A constructor with no fields, by the program-wide name the declaring module gives it.
     Ctor(&'static str),
-    /// A `std.process.Finished`: how a spawned process ended and what it wrote to each stream.
-    Spawned {
-        ended: Ended,
-        out: Vec<u8>,
-        err: Vec<u8>,
-    },
+    Finished(Exit),
+    /// `None` when the child was still running at the deadline.
+    MaybeFinished(Option<Exit>),
+    Heard(Heard),
     /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
     Refused(Diagnostic),
 }
 
 type Job = Box<dyn FnOnce() -> Done + Send + 'static>;
+
+/// Rung by every pool it is handed to whenever one of their operations finishes, so one wait can
+/// cover several pools: separate condition variables cannot be waited on together.
+#[derive(Default)]
+pub struct Bell {
+    rung: Mutex<u64>,
+    heard: Condvar,
+}
+
+impl Bell {
+    /// How many times it has rung; read before looking for work, so a ring after the look is
+    /// never missed.
+    pub fn rung(&self) -> u64 {
+        *lock(&self.rung)
+    }
+
+    /// Blocks until it has rung more than `seen` times.
+    pub fn wait_past(&self, seen: u64) {
+        let mut rung = lock(&self.rung);
+        while *rung == seen {
+            rung = wait(&self.heard, rung);
+        }
+    }
+
+    fn ring(&self) {
+        *lock(&self.rung) += 1;
+        self.heard.notify_all();
+    }
+}
 
 struct Waiting {
     span: Span,
@@ -65,6 +108,7 @@ struct Shared {
     /// Signalled by a job finishing, so neither `park` nor `block_on` spins.
     finished: Condvar,
     next: AtomicU64,
+    bell: OnceLock<Arc<Bell>>,
 }
 
 /// Not `Clone`: the handler owns it, and jobs hold an [`Arc`] of the shared state.
@@ -81,8 +125,19 @@ impl Pool {
                 finished: Condvar::new(),
                 // Token 0 is never minted, so a zeroed `Pending` belongs to no pool.
                 next: AtomicU64::new(first),
+                bell: OnceLock::new(),
             }),
         }
+    }
+
+    /// Rings `bell` too whenever an operation finishes; a pool rings one bell at most.
+    pub fn ring(&self, bell: &Arc<Bell>) {
+        let _ = self.shared.bell.set(Arc::clone(bell));
+    }
+
+    /// Whether an operation has finished and is waiting to be polled.
+    pub fn ready(&self) -> bool {
+        !lock(&self.shared.state).done.is_empty()
     }
 
     pub fn submit(
@@ -121,6 +176,9 @@ impl Pool {
                 state.done.insert(token, outcome);
                 drop(state);
                 shared.finished.notify_all();
+                if let Some(bell) = shared.bell.get() {
+                    bell.ring();
+                }
             });
 
         if let Err(e) = spawned {
@@ -223,7 +281,9 @@ fn take(state: &mut State, token: u64) -> Taken {
         }
         Done::MaybeString(text) => Ok(option(text.map(Value::str))),
         Done::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
-        Done::Spawned { ended, out, err } => Ok(finished(ended, out, err)),
+        Done::Finished(exit) => Ok(finished(exit)),
+        Done::MaybeFinished(exit) => Ok(option(exit.map(finished))),
+        Done::Heard(heard) => Ok(heard_value(heard)),
         Done::Refused(diagnostic) => Err(diagnostic),
         Done::Failed(message) => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,
@@ -234,17 +294,25 @@ fn take(state: &mut State, token: u64) -> Taken {
 }
 
 /// The record `std.process.Finished` names, built where the `Value` will live.
-fn finished(ended: Ended, out: Vec<u8>, err: Vec<u8>) -> Value {
-    let ended = match ended {
+fn finished(exit: Exit) -> Value {
+    let ended = match exit.ended {
         Ended::Exited(code) => Value::ctor("std.process.Exited", vec![Value::Int(code)]),
         Ended::Signalled(signal) => Value::ctor("std.process.Signalled", vec![Value::Int(signal)]),
     };
     let fields: BTreeMap<Symbol, Value> = BTreeMap::from([
         (Symbol::new("ended"), ended),
-        (Symbol::new("err"), Value::bytes(err)),
-        (Symbol::new("out"), Value::bytes(out)),
+        (Symbol::new("err"), Value::bytes(exit.err)),
+        (Symbol::new("out"), Value::bytes(exit.out)),
     ]);
     Value::Record(Arc::new(fields.into_iter().collect()))
+}
+
+fn heard_value(heard: Heard) -> Value {
+    match heard {
+        Heard::Said(line) => Value::ctor("std.process.Said", vec![Value::str(line)]),
+        Heard::Quiet => Value::ctor("std.process.Quiet", Vec::new()),
+        Heard::Closed => Value::ctor("std.process.Closed", Vec::new()),
+    }
 }
 
 /// Built on the polling thread: a `Value` holds `Rc` and never crosses threads.
