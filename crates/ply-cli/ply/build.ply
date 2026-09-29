@@ -9,8 +9,7 @@ import builder (Compiled, Def, Loaded, Made, Named, Previous, Reach, Refusal)
 import builder (builder)
 import lock
 import paths (Resolved, here)
-import compiler.hash (hex)
-import compiler.plyx (Head, Section, Range, covers, domain, encode, encode_named, format,
+import compiler.plyx (Head, digest_of, digest_text, domain, encode, encode_named, format,
                       library_domain, library_magic, off_digest)
 import compiler.resolve (Diag, Label, diag, diag1)
 import diagnostic (Place, all_to_json, all_to_text)
@@ -18,26 +17,26 @@ import entry (At, Main, Module, entry_point, marked, no_module, nowhere)
 import env (env)
 import sources (File)
 import program (Program, load_program)
+import plyz
 import report (Answer, ind, ok_code, count_of, plural, refused, reported, warning_lines)
 import std.fs (fs, Missing)
-import std.hash (blake3)
 import std.path (is_absolute)
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string)
 import std.pkg (Manifest, render_version)
-import compiler.front (Whole)
 import style (Style, plain, bold, green, red)
 
-// The container with its digest written into the field no range of the digest covers.
-pub type Sealed = { bytes: Bytes, digest: String }
+// The container with its digest written into the field no range of the digest covers: `digest`
+// is the short form a report prints, and `full` the digest itself.
+pub type Sealed = { bytes: Bytes, digest: String, full: Bytes }
 
-// The digest is the writer's own work: `compiler.plyx` says the domain, the field and the ranges,
-// and the hash is `std.hash`'s. Sealing is hashing and a splice, so the program does it itself.
+// The digest is `compiler.plyx`'s, which says the domain, the field and the ranges; sealing is that
+// digest and a splice, so the program does it itself.
 fn seal(container: Bytes) -> Result<Sealed, Refusal> = sealed_at(container, domain())
 
 // A library's container is the same file under a domain of its own: a library digest is never read
 // as a program digest, and the ranges `compiler.plyx` covers are the same ones.
 fn sealed_at(container: Bytes, into: Bytes) -> Result<Sealed, Refusal> =
-  match covers(bytes_len(container)) {
+  match digest_of(into, container) {
     None ->
       Err({
         diags: [
@@ -53,17 +52,16 @@ fn sealed_at(container: Bytes, into: Bytes) -> Result<Sealed, Refusal> =
         ],
         places: [],
       }),
-    Some(ranges) -> {
-      let parts = map(ranges, |r: Range| bytes_slice(container, r.at, r.at + r.len));
-      let digest = blake3(bytes_concat_all(appended([into], parts)));
+    Some(d) -> {
       let at = off_digest();
       Ok({
         bytes: bytes_concat_all([
           bytes_slice(container, 0, at),
-          digest,
+          d,
           bytes_slice(container, at + 32, bytes_len(container)),
         ]),
-        digest: "b3:" ++ string_slice(string_of_bytes(hex(digest)), 0, 12),
+        digest: string_slice(digest_text(d), 0, 15),
+        full: d,
       })
     },
   }
@@ -549,7 +547,10 @@ fn pinned_ok(r: Resolved, existing: Option<lock::Lock>, p: Loaded) -> Option<Dia
   }
 
 fn unchanged(existing: Option<lock::Lock>, pins: List<lock::Pinned>) -> Bool =
-  match existing { None -> false, Some(l) -> l.version == lock::format() && l.packages == pins }
+  match existing {
+    None -> false,
+    Some(l) -> l.version == lock::format() && map(l.packages, lock::pin_of) == pins,
+  }
 
 fn pinned(
   r: Resolved,
@@ -557,7 +558,7 @@ fn pinned(
   p: Loaded,
 ) -> Unit / {fs.write_file[cwd], fs.write_file[abs]} =
   if unchanged(existing, p.pins) { () } else {
-    let text = bytes_of_string(lock::text(existing, p.pins));
+    let text = bytes_of_string(lock::text(existing, p.pins, []));
     if r.label == "cwd" { fs.write_file[cwd](lock::path_of(r), text) }
     else { fs.write_file[abs](lock::path_of(r), text) };
     ()
@@ -568,25 +569,6 @@ fn resolved_root(flags: Flags) -> Resolved =
   match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
 
 // --- A library ----------------------------------------------------------------------
-
-// One module's source, framed as `module <name> <length>` and its bytes: the front end's own
-// framing, so a reader of the container is a reader of the dump.
-fn source_frame(f: File) -> Bytes =
-  bytes_concat_all([
-    b"module ",
-    bytes_of_string(f.module),
-    b" ",
-    bytes_of_string(int_to_string(bytes_len(f.text))),
-    b"\n",
-    f.text,
-  ])
-
-fn library_sections(files: List<File>, manifest: Bytes, unit: Compiled) -> List<Section> =
-  [
-    { name: b"sources", count: len(files), payload: bytes_concat_all(map(files, source_frame)) },
-    { name: b"manifest", count: 1, payload: manifest },
-    { name: b"unit", count: unit.count, payload: unit.payload },
-  ]
 
 fn member(xs: List<String>, x: String) -> Bool =
   fold(xs, false, |found: Bool, y: String| found || y == x)
@@ -613,7 +595,32 @@ fn library(
       // An anonymous directory is not a library: there is no package to write down.
       None -> reported(s, "build", [refused], p.places),
       Some(m) -> if m.entry != None { reported(s, "build", [refused], p.places) }
-      else { library_writing(s, flags, p, loaded, w, m) },
+      else { library_writing(s, flags, p, loaded, m) },
+    },
+  }
+}
+
+/// A library's archive, sealed, with what a report says of it: the definitions its unit compiled.
+pub type Packed = { own: List<Def>, unit: Compiled, x: Sealed }
+
+/// The archive a library ships as: what `ply build` writes and `ply publish` uploads, one function
+/// so the two are the same bytes.
+pub fn packed(p: Loaded, loaded: Program) -> Result<Packed, Refusal> / {builder.unit[build]} = {
+  let owned = map(loaded.files, |f: File| f.module);
+  let own = filter(p.defs, |d: Def| member(owned, d.module));
+  match builder.unit[build](map(own, |d: Def| d.name)) {
+    Err(why) -> Err(why),
+    Ok(compiled) -> {
+      let manifest = match loaded.pkgs.manifest { Some(text) -> text, None -> b"" };
+      let container = encode_named(
+        library_magic(),
+        compiled.head,
+        plyz::sections(loaded.files, manifest, compiled),
+      );
+      match sealed_at(container, library_domain()) {
+        Err(why) -> Err(why),
+        Ok(x) -> Ok({ own: own, unit: compiled, x: x }),
+      }
     },
   }
 }
@@ -623,42 +630,24 @@ fn library_writing(
   flags: Flags,
   p: Loaded,
   loaded: Program,
-  w: Whole,
   m: Manifest,
-) -> Answer / {builder.stored[build], builder.unit[build], fs.write_file[cwd], fs.write_file[abs]} = {
-  let owned = map(loaded.files, |f: File| f.module);
-  let own = filter(p.defs, |d: Def| member(owned, d.module));
-  match builder.unit[build](map(own, |d: Def| d.name)) {
+) -> Answer / {builder.stored[build], builder.unit[build], fs.write_file[cwd], fs.write_file[abs]} =
+  match packed(p, loaded) {
     Err(why) -> reported(s, "build", why.diags, p.places),
-    Ok(compiled) -> {
-      let container = encode_named(
-        library_magic(),
-        compiled.head,
-        library_sections(
-          loaded.files,
-          match loaded.pkgs.manifest { Some(text) -> text, None -> b"" },
-          compiled,
-        ),
-      );
-      match sealed_at(container, library_domain()) {
-        Err(why) -> refused(s, "build", why.diags, why.places),
-        Ok(x) -> {
-          let out = library_output(flags, m.name);
-          match builder.stored[build](out, x.bytes) {
-            Err(why) -> reported(s, "build", why.diags, p.places),
-            Ok(_) ->
-              {
-                json: library_json(p, m, own, compiled, x, out),
-                lines: library_lines(s, m, len(loaded.files), own, compiled, x, out),
-                errs: [],
-                code: ok_code(),
-              },
-          }
-        },
+    Ok(k) -> {
+      let out = library_output(flags, m.name);
+      match builder.stored[build](out, k.x.bytes) {
+        Err(why) -> reported(s, "build", why.diags, p.places),
+        Ok(_) ->
+          {
+            json: library_json(p, m, k.own, k.unit, k.x, out),
+            lines: library_lines(s, m, len(loaded.files), k.own, k.unit, k.x, out),
+            errs: [],
+            code: ok_code(),
+          },
       }
     },
   }
-}
 
 fn library_lines(
   s: Style,
@@ -702,40 +691,6 @@ fn library_json(
     { key: "artifact_bytes", value: num(bytes_len(x.bytes)) },
     { key: "diagnostics", value: all_to_json([], p.places) },
   ])
-
-/// A library's sources section is each module's own framing: `module <name> <length>` and the
-/// bytes, so a reader of the container reads the same shape the front-end dump writes.
-test "a library frames every module's source under its name" {
-  let first: File = {
-    path: "core.ply",
-    module: "core",
-    text: b"pub fn double(n: Int) -> Int = n * 2\n",
-  };
-  let second: File = {
-    path: "math.ply",
-    module: "math",
-    text: b"pub fn half(n: Int) -> Int = n / 2\n",
-  };
-  assert_eq(
-    source_frame(first),
-    bytes_concat_all([b"module core 37\n", b"pub fn double(n: Int) -> Int = n * 2\n"]),
-  );
-  let sections = library_sections([first, second], b"manifest text", {
-    head: a_head(),
-    count: 1,
-    payload: b"unit",
-  });
-  assert_eq(len(sections), 3);
-  assert_eq(nth(sections, 0).name, b"sources");
-  assert_eq(nth(sections, 0).count, 2);
-  assert_eq(nth(sections, 1).name, b"manifest");
-  assert_eq(nth(sections, 1).payload, b"manifest text");
-  assert_eq(nth(sections, 2).name, b"unit");
-  assert_eq(nth(sections, 2).payload, b"unit")
-}
-
-fn nth<a>(xs: List<a>, i: Int) -> a =
-  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
 
 // --- Tests ------------------------------------------------------------------
 

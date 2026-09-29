@@ -1,0 +1,787 @@
+// Registry dependencies, resolved: minimal version selection over the registry's indexes, each
+// version the selection reaches fetched and checked against the lock and the index, and the ones it
+// settles on unpacked into the project's cache. Only `ply resolve` asks the registry; a check, a
+// build or a run reads what the last resolve left there.
+
+import compiler.pkg (check_source, registry_dir, registry_key)
+import compiler.plyx (digest_of, digest_text, encode_named, library_domain, library_magic,
+                      off_digest)
+import builder (builder)
+import compiler.resolve (Diag, diag1)
+import env (env)
+import lock (Archived, Lock, entry_of)
+import plyz
+import plyz (Module, Unpacked, unpacked)
+import registry (Base, archive_target, base_of, exchange, get, index_target, said, unasked, unset,
+                 variable)
+import sources (DepPackage, File, Project, Vendored, from_vendor, under_abs, vendored)
+import std.fs (fs, Dir)
+import std.json (decode_bytes, error_to_string)
+import std.net (net)
+import std.path (join, parent)
+import std.pkg (Dep, Index, Manifest, Registry, Release, Version, index_json, parse_version,
+                render_version)
+
+/// One registry dependency as a manifest asks for it: a name, and the least version it takes.
+pub type Requirement = { name: String, floor: Version }
+
+// --- What the closure asks for ------------------------------------------------------
+
+pub fn cache_dir(root: String) -> String =
+  string_of_bytes_lossy(registry_dir(bytes_of_string(root)))
+
+pub fn slot_of(root: String, name: String) -> String =
+  string_of_bytes_lossy(registry_key(bytes_of_string(root), bytes_of_string(name)))
+
+fn archive_path(root: String, name: String, version: String) -> String =
+  join(cache_dir(root), name ++ "@" ++ version ++ ".plyz")
+
+/// Every registry dependency the root package and the packages the walk read declare. The
+/// registry's own packages are left out: what they ask for is read from the archives this resolve
+/// fetches, never from whatever the cache holds now. A manifest that does not check asks for
+/// nothing here, and the load that follows is what says why.
+pub fn requirements(project: Project) -> List<Requirement> = {
+  let cached = cache_dir(project.root_key) ++ "/";
+  let own = match project.manifest { Some(f) -> [f.text], None -> [] };
+  let texts = fold(project.packages, own, |acc: List<Bytes>, p: DepPackage|
+    if string_starts_with(p.root, cached) { acc }
+    else { match p.manifest { Some(t) -> push(acc, t), None -> acc } });
+  fold(texts, [], |acc: List<Requirement>, t: Bytes|
+    match checked(t) { None -> acc, Some(m) -> appended(acc, asked(m)) })
+}
+
+fn checked(text: Bytes) -> Option<Manifest> = {
+  let c = check_source(text);
+  if len(c.diags) > 0 { None } else { c.manifest }
+}
+
+fn asked(m: Manifest) -> List<Requirement> =
+  fold(m.dependencies, [], |acc: List<Requirement>, d: Dep|
+    match d.source { Registry -> push(acc, { name: d.name, floor: d.min }), _ -> acc })
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+// --- Selection ------------------------------------------------------------------------
+
+/// The version a floor selects: the one the lock pins when it is at or above the floor — a yank
+/// does not take a version from a lock that holds it — else the lowest published at or above the
+/// floor that is not yanked.
+pub fn select(index: Index, floor: Version, pinned: Option<Version>) -> Option<Release> = {
+  let held = match pinned {
+    None -> None,
+    Some(v) -> if compare(v, floor) == Less { None } else { release_of(index, v) },
+  };
+  match held {
+    Some(r) -> Some(r),
+    None ->
+      fold(index.versions, None, |best: Option<Release>, r: Release|
+        if r.yanked || compare(r.version, floor) == Less { best } else {
+          match best {
+            None -> Some(r),
+            Some(b) -> if compare(r.version, b.version) == Less { Some(r) } else { best },
+          }
+        }),
+  }
+}
+
+fn release_of(index: Index, v: Version) -> Option<Release> =
+  fold(index.versions, None, |found: Option<Release>, r: Release|
+    match found { Some(_) -> found, None -> if r.version == v { Some(r) } else { None } })
+
+fn pinned_version(lock: Option<Lock>, name: String) -> Option<Version> =
+  match lock {
+    None -> None,
+    Some(l) -> match entry_of(l, name) { None -> None, Some(e) -> parse_version(e.version) },
+  }
+
+// The archive digest the lock pins for exactly this version, when it pins one.
+fn pinned_archive(lock: Option<Lock>, name: String, version: String) -> Option<String> =
+  match lock {
+    None -> None,
+    Some(l) -> match entry_of(l, name) {
+      None -> None,
+      Some(e) -> if e.version == version { e.archive } else { None },
+    },
+  }
+
+// --- The walk -----------------------------------------------------------------------
+// Minimal version selection as the least fixed point: every requirement reaches the version its
+// floor selects, every version reached adds what its own manifest asks for, and each name settles
+// on the highest version reached. The order requirements are met in changes none of that.
+
+/// One version the walk reached: what the index says of it, and what its archive holds.
+pub type Node = { name: String, release: Release, archive: Unpacked, deps: List<Requirement> }
+
+type Walk = { indexes: Map<String, Index>, nodes: Map<String, Node>, queue: List<Requirement> }
+
+/// Every version the requirements reach, asking `index_of` for a package's index once and
+/// `node_at` for each version reached: the registry in a resolve, a table in a test.
+pub fn walk<| e>(
+  lock: Option<Lock>,
+  reqs: List<Requirement>,
+  index_of: (String) -> Result<Index, Diag> / e,
+  node_at: (String, Release) -> Result<Node, Diag> / e,
+) -> Result<List<Node>, Diag> / e =
+  match walked(lock, index_of, node_at, { indexes: map_new(), nodes: map_new(), queue: reqs }) {
+    Err(d) -> Err(d),
+    Ok(w) -> Ok(map_values(w.nodes)),
+  }
+
+fn walked<| e>(
+  lock: Option<Lock>,
+  index_of: (String) -> Result<Index, Diag> / e,
+  node_at: (String, Release) -> Result<Node, Diag> / e,
+  w: Walk,
+) -> Result<Walk, Diag> / e =
+  match w.queue {
+    [] -> Ok(w),
+    [req, ..rest] -> match visited(lock, index_of, node_at, { ..w, queue: rest }, req) {
+      Err(d) -> Err(d),
+      Ok(next) -> walked(lock, index_of, node_at, next),
+    },
+  }
+
+fn visited<| e>(
+  lock: Option<Lock>,
+  index_of: (String) -> Result<Index, Diag> / e,
+  node_at: (String, Release) -> Result<Node, Diag> / e,
+  w: Walk,
+  req: Requirement,
+) -> Result<Walk, Diag> / e = {
+  let asked = match map_get(w.indexes, req.name) { Some(x) -> Ok(x), None -> index_of(req.name) };
+  match asked {
+    Err(d) -> Err(d),
+    Ok(index) -> {
+      let w1 = { ..w, indexes: map_insert(w.indexes, req.name, index) };
+      match select(index, req.floor, pinned_version(lock, req.name)) {
+        None -> Err(unsatisfied(req, index)),
+        Some(r) -> {
+          let key = req.name ++ "@" ++ render_version(r.version);
+          if map_contains(w1.nodes, key) { Ok(w1) } else {
+            match node_at(req.name, r) {
+              Err(d) -> Err(d),
+              Ok(node) ->
+                Ok({
+                  ..w1,
+                  nodes: map_insert(w1.nodes, key, node),
+                  queue: appended(w1.queue, node.deps),
+                }),
+            }
+          }
+        },
+      }
+    },
+  }
+}
+
+type Ctx = { base: Base, root: String, lock: Option<Lock> }
+
+// A package's index, asked once per resolve: it is what says which versions exist and which are
+// yanked, so a resolve never selects from a stale one. Its row is the walk's whole row, since the
+// walk takes this and `fetched` as one registry.
+fn indexed(
+  base: Base,
+  name: String,
+) -> Result<Index, Diag> / {net.connect[registry], net.connect_tls[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} = {
+  let target = index_target(base, name);
+  match exchange(base, get(base, target)) {
+    Err(why) -> Err(unasked(why, [])),
+    Ok(r) -> if r.status == 404 { Err(no_package(base, name)) }
+    else if r.status != 200 { Err(answered(base, target, r.status, said(r))) } else {
+      match decode_bytes(r.body, index_json()) {
+        Err(e) ->
+          Err(
+            unasked(base.url ++ target ++ " is not a registry index: " ++ error_to_string(e), []),
+          ),
+        Ok(index) -> if index.name != name {
+          Err(
+            untrue(
+              "the registry answered the index of `" ++ name ++ "` with the index of `"
+                ++ index.name
+                ++ "`",
+              [],
+            ),
+          )
+        } else { Ok(index) },
+      }
+    },
+  }
+}
+
+// The archive a selected version names, from the cache when the cache holds exactly those bytes,
+// else from the registry — checked either way against the index and the lock before anything in it
+// is read, and kept in the cache once it has passed.
+fn fetched(
+  ctx: Ctx,
+  name: String,
+  r: Release,
+) -> Result<Node, Diag> / {net.connect[registry], net.connect_tls[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs]} = {
+  let version = render_version(r.version);
+  let pinned = pinned_archive(ctx.lock, name, version);
+  let path = archive_path(ctx.root, name, version);
+  match cached(path, r.digest, pinned) {
+    Some(u) -> node_of(name, r, u),
+    None -> {
+      let target = archive_target(ctx.base, name, version);
+      match exchange(ctx.base, get(ctx.base, target)) {
+        Err(why) -> Err(unasked(why, [])),
+        Ok(answer) -> if answer.status != 200 {
+          Err(answered(ctx.base, target, answer.status, said(answer)))
+        } else {
+          match vouched(name, version, answer.body, r.digest, pinned) {
+            Err(d) -> Err(d),
+            Ok(u) -> match node_of(name, r, u) {
+              Err(d) -> Err(d),
+              Ok(node) -> if kept(path, answer.body) { Ok(node) } else { Err(unwritable(path)) },
+            },
+          }
+        },
+      }
+    },
+  }
+}
+
+fn cached(
+  path: String,
+  listed: String,
+  pinned: Option<String>,
+) -> Option<Unpacked> / {fs.read_file[abs]} =
+  match fs.read_file[abs](under_abs(path)) {
+    None -> None,
+    Some(bytes) -> match unpacked(bytes) {
+      Err(_) -> None,
+      Ok(u) -> {
+        let d = digest_text(u.digest);
+        if d == listed && (pinned == None || pinned == Some(d)) { Some(u) } else { None }
+      },
+    },
+  }
+
+/// An archive the registry served, believed only when it is a library whose bytes seal the digest
+/// the lock pins for this version and the digest the index lists for it.
+pub fn vouched(
+  name: String,
+  version: String,
+  bytes: Bytes,
+  listed: String,
+  pinned: Option<String>,
+) -> Result<Unpacked, Diag> =
+  match unpacked(bytes) {
+    Err(why) ->
+      Err(
+        untrue(
+          "the registry's archive of `" ++ name ++ "` " ++ version ++ " does not read: " ++ why,
+          [],
+        ),
+      ),
+    Ok(u) -> {
+      let d = digest_text(u.digest);
+      match pinned {
+        Some(p) -> if p != d { Err(repinned(name, version, p, d)) }
+        else { listed_as(name, version, listed, d, u) },
+        None -> listed_as(name, version, listed, d, u),
+      }
+    },
+  }
+
+fn listed_as(
+  name: String,
+  version: String,
+  listed: String,
+  d: String,
+  u: Unpacked,
+) -> Result<Unpacked, Diag> =
+  if listed == d { Ok(u) } else {
+    Err(
+      untrue(
+        "the registry's index lists `" ++ name ++ "` " ++ version ++ " as " ++ listed
+          ++ ", and the archive it served is "
+          ++ d,
+        [
+          b"the index is advisory and the archive's own bytes decide: these are not the bytes the registry says they are",
+        ],
+      ),
+    )
+  }
+
+fn kept(path: String, bytes: Bytes) -> Bool / {fs.create_dir[abs], fs.write_file[abs]} =
+  fs.create_dir[abs](under_abs(parent(path))) && fs.write_file[abs](under_abs(path), bytes)
+
+// A version reached is the package and version its archive's manifest names, or the registry has
+// answered for something it was not asked.
+fn node_of(name: String, r: Release, u: Unpacked) -> Result<Node, Diag> = {
+  let version = render_version(r.version);
+  match checked(u.manifest) {
+    None ->
+      Err(
+        untrue(
+          "the manifest in the registry's archive of `" ++ name ++ "` " ++ version
+            ++ " does not check",
+          [],
+        ),
+      ),
+    Some(m) -> if m.name != name || m.version != r.version {
+      Err(
+        untrue(
+          "the registry's archive of `" ++ name ++ "` " ++ version ++ " holds `" ++ m.name ++ "` "
+            ++ render_version(m.version),
+          [],
+        ),
+      )
+    } else { Ok({ name: name, release: r, archive: u, deps: asked(m) }) },
+  }
+}
+
+// Each name at the highest version the walk reached: one version of a name serves the closure.
+pub fn settled(nodes: List<Node>) -> List<Node> = {
+  let best = fold(nodes, map_new(), |acc: Map<String, Node>, n: Node|
+    match map_get(acc, n.name) {
+      None -> map_insert(acc, n.name, n),
+      Some(held) -> if compare(held.release.version, n.release.version) == Less {
+        map_insert(acc, n.name, n)
+      } else { acc },
+    });
+  map_values(best)
+}
+
+// --- Placing what was selected -------------------------------------------------------
+// A selected version is unpacked beside where it goes and renamed into place, so a walk never reads
+// half of one. It goes to the project's cache, and — in a vendored project, whose walks read
+// `vendor/` and nothing else — to the vendored copy as well, so what a resolve pins is what the
+// next walk reads.
+
+fn placed(
+  root: String,
+  items: List<Vendored>,
+  n: Node,
+) -> Result<Unit, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs]} = {
+  let slot = slot_of(root, n.name);
+  match replaced(slot, n) {
+    Err(d) -> Err(d),
+    Ok(_) -> match from_vendor(root, items, bytes_of_string(slot)) {
+      None -> Ok(()),
+      Some(dir) -> replaced(dir, n),
+    },
+  }
+}
+
+fn replaced(
+  dir: String,
+  n: Node,
+) -> Result<Unit, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs]} = {
+  let staging = dir ++ "@" ++ render_version(n.release.version);
+  cleared(staging, 0);
+  if !unpacked_into(staging, n.archive) { Err(unwritable(staging)) } else {
+    cleared(dir, 0);
+    if fs.rename[abs](under_abs(staging), under_abs(dir)) { Ok(()) } else { Err(unwritable(dir)) }
+  }
+}
+
+fn unpacked_into(dir: String, u: Unpacked) -> Bool / {fs.create_dir[abs], fs.write_file[abs]} =
+  fs.create_dir[abs](under_abs(dir))
+    && fs.write_file[abs](under_abs(join(dir, "ply.pkg")), u.manifest)
+    && fold(u.modules, true, |ok: Bool, m: Module|
+      ok && fs.create_dir[abs](under_abs(parent(join(dir, m.path))))
+        && fs.write_file[abs](under_abs(join(dir, m.path)), m.text))
+
+// Everything under `dir`, then `dir` itself. A package's tree is a few levels deep; the bound is
+// only there so a symlink loop cannot keep this going.
+fn cleared(dir: String, depth: Int) -> Bool / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs]} =
+  if depth > 16 { false } else {
+    match fs.list_dir[abs](under_abs(dir)) {
+      None -> true,
+      Some(names) -> {
+        let emptied = fold(names, true, |ok: Bool, name: String| {
+          let child = join(dir, name);
+          match fs.kind[abs](under_abs(child)) {
+            Dir -> cleared(child, depth + 1) && ok,
+            _ -> fs.remove[abs](under_abs(child)) && ok,
+          }
+        });
+        emptied && fs.remove[abs](under_abs(dir))
+      },
+    }
+  }
+
+// --- The resolve's half ----------------------------------------------------------------
+
+/// The registry packages a closure selects, fetched, checked and placed where every walk reads
+/// them, each with the archive digest the lock records. A closure that asks nothing of a registry
+/// asks nothing of the network either.
+pub fn resolved(
+  project: Project,
+  lock: Option<Lock>,
+) -> Result<List<Archived>, Diag> / {builder.git[vcs], env.var[sys], net.connect[registry], net.connect_tls[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[abs], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs]} =
+  match requirements(project) {
+    [] -> Ok([]),
+    reqs -> match env.var[sys](variable()) {
+      None -> Err(unset(variable(), "this closure has registry dependencies")),
+      Some(text) -> match base_of(text) {
+        Err(why) -> Err(unasked(why, [])),
+        Ok(base) -> {
+          let ctx: Ctx = { base: base, root: project.root_key, lock: lock };
+          match walk(lock, reqs, |name: String| indexed(base, name), |name: String, r: Release|
+              fetched(ctx, name, r)) {
+            Err(d) -> Err(d),
+            Ok(nodes) -> placed_all(ctx.root, vendored(ctx.root), settled(nodes), []),
+          }
+        },
+      },
+    },
+  }
+
+fn placed_all(
+  root: String,
+  items: List<Vendored>,
+  nodes: List<Node>,
+  out: List<Archived>,
+) -> Result<List<Archived>, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs]} =
+  match nodes {
+    [] -> Ok(out),
+    [n, ..rest] -> match placed(root, items, n) {
+      Err(d) -> Err(d),
+      Ok(_) ->
+        placed_all(
+          root,
+          items,
+          rest,
+          push(out, {
+            name: n.name,
+            version: render_version(n.release.version),
+            archive: digest_text(n.archive.digest),
+          }),
+        ),
+    },
+  }
+
+// --- Refusals -----------------------------------------------------------------------
+
+fn outside() -> Int = 4294967295
+
+fn nowhere(code: Bytes, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
+  diag1(code, outside(), { start: 0, end: 0 }, bytes_of_string(message), label, notes)
+
+// The registry answered, and not with what it was asked for.
+fn untrue(message: String, notes: List<Bytes>) -> Diag =
+  nowhere(b"E0142", message, b"the registry's answer is not what it names", notes)
+
+fn repinned(name: String, version: String, pinned: String, served: String) -> Diag =
+  untrue(
+    "the registry served `" ++ name ++ "` " ++ version ++ " as " ++ served
+      ++ ", and `ply.lock` pins it as "
+      ++ pinned,
+    [
+      b"a published version never changes, so these are not the bytes that were pinned",
+      bytes_of_string(
+        "if the registry was rebuilt on purpose, delete `" ++ name
+          ++ "` from `ply.lock` to accept what it serves now",
+      ),
+    ],
+  )
+
+fn answered(base: Base, target: String, status: Int, why: String) -> Diag =
+  unasked(
+    base.url ++ target ++ " answered " ++ int_to_string(status)
+      ++ (if why == "" { "" } else { ": " ++ why }),
+    [],
+  )
+
+fn no_package(base: Base, name: String) -> Diag =
+  nowhere(
+    b"E0143",
+    "the registry at " ++ base.url ++ " has no package named `" ++ name ++ "`",
+    b"no published version satisfies this dependency",
+    [b"check the name in `ply.pkg`, and that `PLY_REGISTRY` names the registry it is published to"],
+  )
+
+fn unsatisfied(req: Requirement, index: Index) -> Diag = {
+  let above = filter(index.versions, |r: Release| compare(r.version, req.floor) != Less);
+  let floor = render_version(req.floor);
+  if len(above) == 0 {
+    nowhere(
+      b"E0143",
+      "no published version of `" ++ req.name ++ "` is at or above " ++ floor,
+      b"no published version satisfies this dependency",
+      [bytes_of_string("published: " ++ shown(index.versions))],
+    )
+  } else {
+    nowhere(
+      b"E0143",
+      "every version of `" ++ req.name ++ "` at or above " ++ floor ++ " is yanked: "
+        ++ shown(above),
+      b"no published version satisfies this dependency",
+      [b"a yanked version is served only to a lock that already pins it"],
+    )
+  }
+}
+
+fn shown(rs: List<Release>) -> String =
+  if len(rs) == 0 { "nothing" } else {
+    fold(rs, "", |acc: String, r: Release| {
+      let one = render_version(r.version) ++ (if r.yanked { " (yanked)" } else { "" });
+      if acc == "" { one } else { acc ++ ", " ++ one }
+    })
+  }
+
+fn unwritable(path: String) -> Diag =
+  nowhere(
+    b"E0502",
+    "could not write `" ++ path ++ "`",
+    b"the registry dependency was not placed",
+    [b"check the directory's permissions; the cache is this project's own `.ply-cache`"],
+  )
+
+// --- Tests ------------------------------------------------------------------
+
+fn v(text: String) -> Version =
+  match parse_version(text) { Some(x) -> x, None -> panic("a fixture's version") }
+
+fn rel(version: String, yanked: Bool) -> Release =
+  { version: v(version), digest: "b3:" ++ version, yanked: yanked, runtime: v("0.16.0") }
+
+fn an_index(releases: List<Release>) -> Index = { name: "orders", versions: releases }
+
+fn chosen(r: Option<Release>) -> String =
+  match r { None -> "none", Some(x) -> render_version(x.version) }
+
+test "a floor selects the lowest version at or above it that is not yanked" {
+  let index = an_index([rel("0.1.0", false), rel("0.3.0", false), rel("0.2.0", false)]);
+  assert_eq(chosen(select(index, v("0.1.0"), None)), "0.1.0");
+  assert_eq(chosen(select(index, v("0.1.5"), None)), "0.2.0");
+  assert_eq(chosen(select(index, v("0.3.0"), None)), "0.3.0");
+  assert_eq(chosen(select(index, v("0.4.0"), None)), "none")
+}
+
+test "a yanked version is refused to a new resolution and served to a lock that pins it" {
+  let index = an_index([rel("0.1.0", false), rel("0.2.0", true), rel("0.2.1", false)]);
+  assert_eq(chosen(select(index, v("0.2.0"), None)), "0.2.1");
+  assert_eq(chosen(select(index, v("0.2.0"), Some(v("0.2.0")))), "0.2.0");
+  let only = an_index([rel("0.2.0", true)]);
+  assert_eq(chosen(select(only, v("0.1.0"), None)), "none");
+  assert_eq(unsatisfied({ name: "orders", floor: v("0.1.0") }, only).code, b"E0143")
+}
+
+test "a lock's version holds while the floor allows it, and a raised floor moves past it" {
+  let index = an_index([rel("0.1.0", false), rel("0.2.0", false), rel("0.3.0", false)]);
+  assert_eq(chosen(select(index, v("0.1.0"), Some(v("0.2.0")))), "0.2.0");
+  assert_eq(chosen(select(index, v("0.3.0"), Some(v("0.2.0")))), "0.3.0");
+  // A pin the index no longer lists is not a version to select.
+  assert_eq(chosen(select(index, v("0.1.0"), Some(v("0.9.0")))), "0.1.0")
+}
+
+fn a_node(name: String, version: String) -> Node =
+  {
+    name: name,
+    release: rel(version, false),
+    archive: { digest: b"", manifest: b"", modules: [] },
+    deps: [],
+  }
+
+test "each name settles on the highest version the walk reached" {
+  let nodes = [
+    a_node("orders", "0.1.0"),
+    a_node("money", "1.0.0"),
+    a_node("orders", "0.3.0"),
+    a_node("orders", "0.2.0"),
+  ];
+  let got = map(settled(nodes), |n: Node| n.name ++ " " ++ render_version(n.release.version));
+  assert_eq(got, ["money 1.0.0", "orders 0.3.0"])
+}
+
+// A registry as a table: each package's index, and what each version's manifest asks for.
+fn a_registry() -> Map<String, Index> =
+  map_of_entries([
+    {
+      key: "orders",
+      value: { name: "orders", versions: [rel("0.1.0", false), rel("0.2.0", false)] },
+    },
+    {
+      key: "money",
+      value: {
+        name: "money",
+        versions: [rel("1.0.0", false), rel("1.1.0", false), rel("1.2.0", false)],
+      },
+    },
+    { key: "billing", value: { name: "billing", versions: [rel("0.1.0", false)] } },
+  ])
+
+fn deps_of(name: String, version: String) -> List<Requirement> =
+  if name == "orders" && version == "0.1.0" { [{ name: "money", floor: v("1.0.0") }] }
+  else if name == "orders" && version == "0.2.0" { [{ name: "money", floor: v("1.1.0") }] }
+  else if name == "billing" { [{ name: "orders", floor: v("0.2.0") }] }
+  else { [] }
+
+fn over_table(reqs: List<Requirement>, lock: Option<Lock>) -> Result<List<String>, Diag> = {
+  let table = a_registry();
+  match walk(
+      lock,
+      reqs,
+      |name: String|
+        match map_get(table, name) {
+          Some(x) -> Ok(x),
+          None ->
+            Err(
+              no_package(
+                {
+                  secure: true,
+                  host: "r",
+                  port: 443,
+                  authority: "r",
+                  prefix: "",
+                  url: "https://r",
+                },
+                name,
+              ),
+            ),
+        },
+      |name: String, r: Release|
+        Ok({
+          ..a_node(name, render_version(r.version)),
+          deps: deps_of(name, render_version(r.version)),
+        }),
+    ) {
+    Err(d) -> Err(d),
+    Ok(nodes) ->
+      Ok(map(settled(nodes), |n: Node| n.name ++ " " ++ render_version(n.release.version))),
+  }
+}
+
+test "minimal version selection takes the highest floor anything reached asks for" {
+  // `billing` raises `orders` to 0.2.0, which raises `money` to 1.1.0; nothing asks for 1.2.0.
+  let got = over_table(
+    [{ name: "orders", floor: v("0.1.0") }, { name: "billing", floor: v("0.1.0") }],
+    None,
+  );
+  assert_eq(got, Ok(["billing 0.1.0", "money 1.1.0", "orders 0.2.0"]));
+  // The same closure asked in the other order settles the same way.
+  assert_eq(
+    over_table(
+      [{ name: "billing", floor: v("0.1.0") }, { name: "orders", floor: v("0.1.0") }],
+      None,
+    ),
+    got,
+  )
+}
+
+test "a package the registry does not hold, or a floor it cannot meet, is refused" {
+  match over_table([{ name: "absent", floor: v("0.1.0") }], None) {
+    Ok(_) -> panic("a package nobody published was selected"),
+    Err(d) -> assert_eq(d.code, b"E0143"),
+  };
+  match over_table([{ name: "orders", floor: v("0.9.0") }], None) {
+    Ok(_) -> panic("a floor above every version was met"),
+    Err(d) -> {
+      assert_eq(d.code, b"E0143");
+      assert(string_contains(string_of_bytes_lossy(d.message), "at or above 0.9.0"))
+    },
+  }
+}
+
+test "a lock keeps the versions it pins while the floors allow them" {
+  let lock: Lock = {
+    version: 1,
+    packages: [{ name: "money", version: "1.2.0", digest: "b3:m", archive: Some("b3:1.2.0") }],
+  };
+  assert_eq(
+    over_table([{ name: "orders", floor: v("0.2.0") }], Some(lock)),
+    Ok(["money 1.2.0", "orders 0.2.0"]),
+  )
+}
+
+fn a_manifest(name: String, minor: Int) -> Bytes =
+  bytes_of_string(
+    "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name
+      ++ "\", version: {major: 0, minor: "
+      ++ int_to_string(minor)
+      ++ ", patch: 0}, prefix: None, runtime: {major: 0, minor: 16, patch: 0}, dependencies: [], entry: None}",
+  )
+
+// An archive as `ply build` seals one: the sections, then the digest spliced into its own field.
+fn an_archive(manifest: Bytes) -> Bytes = {
+  let files: List<File> = [
+    { path: "core.ply", module: "core", text: b"pub fn one() -> Int = 1\n" },
+  ];
+  let container = encode_named(
+    library_magic(),
+    { frontend: b"", runtime: b"", body_encoding: 1, stdlib: b"", entry: b"" },
+    plyz::sections(files, manifest, {
+      head: { frontend: b"", runtime: b"", body_encoding: 1, stdlib: b"", entry: b"" },
+      count: 0,
+      payload: b"",
+    }),
+  );
+  match digest_of(library_domain(), container) {
+    None -> panic("a container this test built is long enough to seal"),
+    Some(d) ->
+      bytes_concat_all([
+        bytes_slice(container, 0, off_digest()),
+        d,
+        bytes_slice(container, off_digest() + 32, bytes_len(container)),
+      ]),
+  }
+}
+
+fn digest_of_archive(b: Bytes) -> String =
+  match digest_of(library_domain(), b) { Some(d) -> digest_text(d), None -> "" }
+
+test "an archive is believed only when its bytes seal the digest listed and the digest pinned" {
+  let bytes = an_archive(a_manifest("orders", 2));
+  let d = digest_of_archive(bytes);
+  match vouched("orders", "0.2.0", bytes, d, Some(d)) {
+    Err(_) -> panic("the archive the index lists and the lock pins was refused"),
+    Ok(u) -> assert_eq(map(u.modules, |m: Module| m.path), ["core.ply"]),
+  };
+  match vouched("orders", "0.2.0", bytes, "b3:00", None) {
+    Ok(_) -> panic("an archive the index does not list was believed"),
+    Err(e) -> {
+      assert_eq(e.code, b"E0142");
+      assert(string_contains(string_of_bytes_lossy(e.message), "index lists"))
+    },
+  };
+  match vouched("orders", "0.2.0", bytes, d, Some("b3:00")) {
+    Ok(_) -> panic("different bytes for a pinned version were believed"),
+    Err(e) -> {
+      assert_eq(e.code, b"E0142");
+      assert(string_contains(string_of_bytes_lossy(e.message), "`ply.lock` pins it"))
+    },
+  }
+}
+
+test "a tampered archive does not read, whatever the index says of it" {
+  let bytes = an_archive(a_manifest("orders", 2));
+  let at = bytes_len(bytes) - 3;
+  let tampered = bytes_concat_all([
+    bytes_slice(bytes, 0, at),
+    b"X",
+    bytes_slice(bytes, at + 1, bytes_len(bytes)),
+  ]);
+  match vouched("orders", "0.2.0", tampered, digest_of_archive(tampered), None) {
+    Ok(_) -> panic("an archive whose digest field lies was believed"),
+    Err(e) -> {
+      assert_eq(e.code, b"E0142");
+      assert(string_contains(string_of_bytes_lossy(e.message), "does not read"))
+    },
+  }
+}
+
+test "an archive holding another package or version is not the one asked for" {
+  let bytes = an_archive(a_manifest("billing", 2));
+  match unpacked(bytes) {
+    Err(why) -> panic(why),
+    Ok(u) -> match node_of("orders", rel("0.2.0", false), u) {
+      Ok(_) -> panic("`billing` was taken for `orders`"),
+      Err(e) -> {
+        assert_eq(e.code, b"E0142");
+        assert(string_contains(string_of_bytes_lossy(e.message), "holds `billing` 0.2.0"))
+      },
+    },
+  };
+  match unpacked(an_archive(a_manifest("orders", 3))) {
+    Err(why) -> panic(why),
+    Ok(u) -> match node_of("orders", rel("0.2.0", false), u) {
+      Ok(_) -> panic("0.3.0 was taken for 0.2.0"),
+      Err(e) -> assert_eq(e.code, b"E0142"),
+    },
+  }
+}

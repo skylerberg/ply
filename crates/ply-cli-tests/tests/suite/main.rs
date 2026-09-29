@@ -49,6 +49,7 @@ mod packages;
 mod process_cli;
 mod prove;
 mod refcount_counters;
+mod registry;
 mod regressions;
 mod replace;
 mod routing_audit;

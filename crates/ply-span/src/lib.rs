@@ -269,7 +269,7 @@ pub mod codes {
     pub const PREFIX_COLLISION: &str = "E0133";
     /// `ply.pkg` files depending on one another in a cycle.
     pub const DEPENDENCY_CYCLE: &str = "E0134";
-    /// A dependency whose path is missing, that holds no `ply.pkg`, or that is not a path.
+    /// A dependency whose path is missing, that holds no `ply.pkg`, or that was never fetched.
     pub const DEPENDENCY_UNUSABLE: &str = "E0135";
     /// A dependency below the version floor the manifest importing it asks for.
     pub const DEPENDENCY_VERSION: &str = "E0136";
@@ -281,6 +281,16 @@ pub mod codes {
     pub const LOCK_UNREADABLE: &str = "E0139";
     /// A git dependency that could not be fetched.
     pub const DEPENDENCY_FETCH: &str = "E0140";
+    /// A registry that could not be asked: `PLY_REGISTRY` unset or malformed, or no answer.
+    pub const REGISTRY_UNASKED: &str = "E0141";
+    /// A registry archive whose bytes are not the ones the lock pins or the index lists.
+    pub const REGISTRY_ARCHIVE: &str = "E0142";
+    /// A registry dependency no published, unyanked version satisfies.
+    pub const REGISTRY_UNSATISFIED: &str = "E0143";
+    /// A publish or a yank the registry refused.
+    pub const REGISTRY_REFUSED: &str = "E0144";
+    /// A package or a version no registry takes: a program, a non-registry dependency, a bad name.
+    pub const REGISTRY_UNTAKEABLE: &str = "E0145";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -503,7 +513,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0134", "packages depending on one another in a cycle"),
     (
         "E0135",
-        "a dependency that is missing, unmanifested or not a path",
+        "a dependency that is missing, unmanifested or not fetched",
     ),
     (
         "E0136",
@@ -522,6 +532,20 @@ pub const MEANINGS: &[(&str, &str)] = &[
         "a `ply.lock` that does not decode or is from another format",
     ),
     ("E0140", "a git dependency that could not be fetched"),
+    (
+        "E0141",
+        "a registry that could not be asked: unset, malformed or not answering",
+    ),
+    (
+        "E0142",
+        "a registry archive that is not the one the lock pins or the index lists",
+    ),
+    (
+        "E0143",
+        "a registry dependency no published version satisfies",
+    ),
+    ("E0144", "a publish or a yank the registry refused"),
+    ("E0145", "a package or a version no registry takes"),
     ("E0201", "type mismatch"),
     ("E0202", "arity mismatch"),
     ("E0203", "occurs check"),
@@ -812,6 +836,11 @@ mod tests {
             ("LOCK_MISMATCH", codes::LOCK_MISMATCH, "E0138"),
             ("LOCK_UNREADABLE", codes::LOCK_UNREADABLE, "E0139"),
             ("DEPENDENCY_FETCH", codes::DEPENDENCY_FETCH, "E0140"),
+            ("REGISTRY_UNASKED", codes::REGISTRY_UNASKED, "E0141"),
+            ("REGISTRY_ARCHIVE", codes::REGISTRY_ARCHIVE, "E0142"),
+            ("REGISTRY_UNSATISFIED", codes::REGISTRY_UNSATISFIED, "E0143"),
+            ("REGISTRY_REFUSED", codes::REGISTRY_REFUSED, "E0144"),
+            ("REGISTRY_UNTAKEABLE", codes::REGISTRY_UNTAKEABLE, "E0145"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),
