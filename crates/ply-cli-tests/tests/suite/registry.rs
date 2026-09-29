@@ -22,16 +22,20 @@ struct Registry {
     child: Child,
     url: String,
     store: PathBuf,
+    /// The certificate a client names in `PLY_TRUST`, when the registry serves over TLS.
+    trust: Option<PathBuf>,
 }
 
 impl Registry {
-    fn start(dir: &Path) -> Registry {
+    /// Over plain HTTP, or over `--tls` with `(certificate, key)`.
+    fn start(dir: &Path, tls: Option<(&Path, &Path)>) -> Registry {
         let mut reserved = Reservation::take();
         let store = dir.join("store");
         std::fs::create_dir_all(&store).expect("the store is made");
         let tokens = dir.join("tokens.conf");
         std::fs::write(&tokens, format!("token.orders={TOKEN}\n")).expect("the tokens are written");
-        let mut child = process(dir)
+        let mut command = process(dir);
+        command
             .arg("run")
             .arg(repo().join("crates/ply-registry/ply"))
             .arg("--host")
@@ -40,14 +44,31 @@ impl Registry {
             .arg("--set")
             .arg(format!("port={}", reserved.port()))
             .arg("--config")
-            .arg(&tokens)
+            .arg(&tokens);
+        if let Some((certificate, key)) = tls {
+            command
+                .arg("--tls")
+                .arg(format!(
+                    "registry={},{}",
+                    certificate.display(),
+                    key.display()
+                ))
+                .arg("--set")
+                .arg("tls=registry");
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("`ply run` starts the registry");
         let port = reserved.port();
-        // The registry's own answer for a package nobody published proves the port is its.
+        let secure = tls.is_some();
+        // Over plain HTTP, the registry's own answer for a package nobody published proves the
+        // port is its; over TLS the reservation already made the port this registry's alone.
         let probe = connect_when_ready(&mut reserved, &mut child, STARTUP, |stream| {
+            if secure {
+                return true;
+            }
             let asked = stream.write_all(
                 b"GET /nobody/index.json HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
             );
@@ -62,8 +83,13 @@ impl Registry {
         }
         Registry {
             child,
-            url: format!("http://127.0.0.1:{port}"),
+            url: if secure {
+                format!("https://localhost:{port}")
+            } else {
+                format!("http://127.0.0.1:{port}")
+            },
             store,
+            trust: tls.map(|(certificate, _)| certificate.to_path_buf()),
         }
     }
 
@@ -81,10 +107,14 @@ impl Drop for Registry {
     }
 }
 
-/// `ply` in `dir`, pointed at the registry, with the publisher's token when `token` says so.
+/// `ply` in `dir`, pointed at the registry and trusting its certificate, with the publisher's token
+/// when `token` says so.
 fn asking(dir: &Path, registry: &Registry, token: bool, args: &[&str]) -> Output {
     let mut cmd = ply(dir);
     cmd.env("PLY_REGISTRY", &registry.url);
+    if let Some(certificate) = &registry.trust {
+        cmd.env("PLY_TRUST", certificate);
+    }
     if token {
         cmd.env("PLY_REGISTRY_TOKEN", TOKEN);
     }
@@ -143,7 +173,7 @@ fn lock(dir: &Path) -> Value {
 fn a_library_is_published_resolved_built_and_its_tampered_archive_refused() {
     let tmp = tempfile::tempdir().expect("a temp dir");
     let dir = tmp.path();
-    let registry = Registry::start(dir);
+    let registry = Registry::start(dir, None);
 
     ok(&ply(dir).args(["new", "orders", "--lib"]).output().unwrap());
     let out = asking(dir, &registry, true, &["publish", "orders", "--json"]);
@@ -254,6 +284,47 @@ fn a_library_is_published_resolved_built_and_its_tampered_archive_refused() {
         "E0142",
         "index lists",
     );
+}
+
+/// A registry under a certificate no public root signed — a company's own CA, here one issued for
+/// the test — is reached by naming that certificate in `PLY_TRUST`, and refused by name without it.
+#[test]
+fn a_registry_under_a_private_certificate_is_reached_through_ply_trust() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let dir = tmp.path();
+    let issued =
+        ply_host::certgen::issue(&["localhost".to_string()]).expect("a certificate is issued");
+    let certificate = dir.join("registry.pem");
+    let key = dir.join("registry.key");
+    std::fs::write(&certificate, &issued.certificate).expect("the certificate is written");
+    std::fs::write(&key, &issued.key).expect("the key is written");
+    let registry = Registry::start(dir, Some((&certificate, &key)));
+
+    ok(&ply(dir).args(["new", "orders", "--lib"]).output().unwrap());
+    ok(&asking(dir, &registry, true, &["publish", "orders"]));
+    an_app(dir);
+    ok(&asking(dir, &registry, false, &["resolve", "app"]));
+    assert_eq!(lock(dir)["packages"][0]["version"], "0.1.0");
+
+    // The same registry with nothing naming its certificate: the handshake is what fails.
+    let out = ply(dir)
+        .env("PLY_REGISTRY", &registry.url)
+        .args(["resolve", "app"])
+        .output()
+        .unwrap();
+    refused(&out, "E0141", "did not complete a TLS handshake");
+    assert!(said(&out).contains("PLY_TRUST"), "{}", said(&out));
+
+    // A file `PLY_TRUST` names that does not load stops the command before it runs.
+    let out = ply(dir)
+        .env("PLY_TRUST", dir.join("absent.pem"))
+        .args(["check", "app"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", said(&out));
+    let text = said(&out);
+    assert!(text.contains("E0430"), "{text}");
+    assert!(text.contains("absent.pem"), "{text}");
 }
 
 #[test]

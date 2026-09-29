@@ -34,6 +34,7 @@ fn main() {
     // Every command family's ops are lent unconfigured; the program configures what it drives.
     let binds = ply_machine::artifact::Binds {
         lent: lent_all(),
+        trust: ply_launcher::trust(),
         ..ply_machine::artifact::Binds::default()
     };
     let code = match ply_launcher::run(&program, &root, argv, binds, count) {
