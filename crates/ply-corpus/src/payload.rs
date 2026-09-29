@@ -652,13 +652,13 @@ fn one_derivation_point(
         .check
         .defs
         .values()
-        .filter(|d| !ply_std::is_std(&d.module))
+        .filter(|d| !ply_std::is_std(d.module.as_str()))
         .count();
     let tests = loaded
         .check
         .tests
         .iter()
-        .filter(|t| !ply_std::is_std(&t.module))
+        .filter(|t| !ply_std::is_std(t.module.as_str()))
         .count();
     let cold_test = run_tests(&loaded, &mut store)?;
     let warm_test = run_tests(&loaded, &mut store)?;

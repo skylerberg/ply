@@ -2,7 +2,6 @@ use crate::harness::{json_of, ply, repo, warm_agrees, write};
 use ply_machine::load::{LoadError, Loaded, load};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_store::{ContentHash, Store};
-use ply_ty::ModuleName;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -12,10 +11,6 @@ fn output(out: &std::process::Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
-}
-
-fn std_net() -> ModuleName {
-    ModuleName::from_dotted("std.net")
 }
 
 /// Handles every atom it can perform, so its test is `det` and cacheable.
@@ -251,7 +246,7 @@ fn a_shipped_module_is_fingerprinted_under_its_pseudo_path() {
     let out = ply(dir.path()).arg("check").output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", output(&out));
 
-    let path = ply_std::pseudo_path(&std_net());
+    let path = ply_std::pseudo_path("std.net");
     assert_eq!(path, PathBuf::from("<std>/net.ply"));
     let store = Store::open(dir.path()).unwrap();
     let fingerprint = store
@@ -510,12 +505,7 @@ fn pulled_and_loaded(dir: &Path) -> (Vec<String>, ply_ty::Front, Result<Loaded, 
     let placed: Vec<PathBuf> = sources.files().iter().map(|f| f.path.clone()).collect();
     let expected: Vec<PathBuf> = files
         .into_iter()
-        .chain(
-            pulled
-                .modules
-                .iter()
-                .map(|m| ply_std::pseudo_path(&ModuleName::from_dotted(m))),
-        )
+        .chain(pulled.modules.iter().map(|m| ply_std::pseudo_path(m)))
         .collect();
     assert_eq!(placed, expected, "{}: the modules, in order", dir.display());
     (pulled.modules, ours, theirs)
@@ -698,7 +688,7 @@ fn compaction_keeps_the_shipped_modules_it_loaded() {
     write(dir.path(), "app.ply", IMPORTER);
     ply(dir.path()).arg("test").output().unwrap();
 
-    let path = ply_std::pseudo_path(&std_net());
+    let path = ply_std::pseudo_path("std.net");
     assert!(
         Store::open(dir.path())
             .unwrap()
@@ -849,7 +839,7 @@ fn a_shipped_definition_the_project_never_touched_is_not_a_suspect() {
 /// `std.http` with each run of whitespace squeezed to one space, and to none inside a brace, so
 /// that the scrapes below ask what it says rather than how the formatter laid it out.
 fn shipped_http() -> String {
-    let source = ply_std::source(&ModuleName::from_dotted("std.http")).expect("std.http ships");
+    let source = ply_std::source("std.http").expect("std.http ships");
     let mut out = String::with_capacity(source.len());
     for c in source.chars() {
         if c.is_whitespace() {

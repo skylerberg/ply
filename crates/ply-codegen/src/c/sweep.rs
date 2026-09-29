@@ -1,10 +1,14 @@
-//! Keeping the content-addressed object cache to a size: oldest-written first (true LRU would
-//! write on every hit), gated by a stamp and run on a background thread so no build waits on it.
+//! Keeping the content-addressed object cache and the stage directory to a size, gated by a stamp
+//! and run on a background thread so no build waits on it. The object cache goes oldest-written
+//! first (true LRU would write on every hit); the stage directory goes oldest-used first, since a
+//! stage is written once and then used by every run of the binary it serves.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
+use std::time::{Duration, SystemTime};
 
-/// What the cache may hold, in bytes; `PLY_C_CACHE_MAX` overrides it, `0` meaning no bound.
+/// What each of the two roots may hold, in bytes; `PLY_C_CACHE_MAX` overrides it, `0` meaning no
+/// bound.
 const DEFAULT_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 
 pub fn budget() -> Option<u64> {
@@ -29,7 +33,7 @@ pub const STAMP: &str = ".swept";
 
 static SWEPT: Once = Once::new();
 
-/// Sweep the cache down to its budget in the background, at most once per process and interval.
+/// Sweep both roots down to their budget in the background, at most once per process and interval.
 pub fn once() {
     SWEPT.call_once(|| {
         let Some(budget) = budget() else { return };
@@ -41,6 +45,7 @@ pub fn once() {
             .name("ply-cache-sweep".to_string())
             .spawn(move || {
                 sweep(&root, budget);
+                sweep_stages(&super::bundle::stage_root(), budget, SystemTime::now());
             })
             .ok();
     });
@@ -117,4 +122,109 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
         }
     }
     freed
+}
+
+/// Where a stage records its last use, since a directory's own time moves only when it is written.
+pub const USED: &str = ".used";
+
+/// The stage-directory entry holding one file per opened artifact, each swept on its own.
+pub const FRONTS: &str = "artifact-fronts";
+
+/// An entry used within this long is never swept: a run may still be reading it.
+const RECENT: Duration = Duration::from_secs(3600);
+
+/// Records that a stage directory, or a file in [`FRONTS`], was just used.
+pub fn used(path: &Path) {
+    if path.is_dir() {
+        let _ = std::fs::write(path.join(USED), b"");
+    } else if let Ok(f) = std::fs::File::options().write(true).open(path) {
+        let _ = f.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
+    }
+}
+
+/// Remove stage-directory entries, least recently used first, until the rest fits in `budget`.
+/// Each stage directory goes whole; each file under [`FRONTS`] goes on its own. Errors are
+/// ignored.
+pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
+    let Ok(read) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut entries = Vec::new();
+    let mut total: u64 = 0;
+    for e in read.flatten() {
+        let path = e.path();
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        if e.file_name() == FRONTS {
+            let Ok(fronts) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for f in fronts.flatten() {
+                let path = f.path();
+                if path.extension().is_some_and(|x| x == "tmp") {
+                    continue;
+                }
+                let Ok(meta) = f.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                total += meta.len();
+                entries.push(Entry {
+                    path,
+                    bytes: meta.len(),
+                    written: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                });
+            }
+            continue;
+        }
+        let bytes = size_of(&path);
+        let last = std::fs::metadata(path.join(USED))
+            .and_then(|m| m.modified())
+            .into_iter()
+            .chain(meta.modified())
+            .max()
+            .unwrap_or(std::time::UNIX_EPOCH);
+        total += bytes;
+        entries.push(Entry {
+            path,
+            bytes,
+            written: last,
+        });
+    }
+    if total <= budget {
+        return 0;
+    }
+    entries.retain(|e| now.duration_since(e.written).is_ok_and(|age| age >= RECENT));
+    entries.sort_by_key(|e| e.written);
+    let mut freed = 0;
+    for entry in entries {
+        if total <= budget {
+            break;
+        }
+        let gone = if entry.path.is_dir() {
+            std::fs::remove_dir_all(&entry.path)
+        } else {
+            std::fs::remove_file(&entry.path)
+        };
+        if gone.is_ok() {
+            total -= entry.bytes.min(total);
+            freed += entry.bytes;
+        }
+    }
+    freed
+}
+
+fn size_of(path: &Path) -> u64 {
+    let Ok(read) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    read.flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => size_of(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }

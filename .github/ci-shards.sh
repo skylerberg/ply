@@ -77,7 +77,8 @@ TREE_CHECKS=(
   "ply-span-tests:armed:every_registered_code_is_constructed_in_production"
   "ply-span-tests:armed:every_variant_of_a_covered_enum_is_constructed_in_production"
   "ply-span-tests:armed:every_diagnostic_constructor_call_names_its_code_literally"
-  "ply-span-tests:armed:the_code_registry_table_is_total_over_the_codes_module"
+  "ply-span-tests:armed:every_code_declared_or_raised_has_one_row_in_the_registry"
+  "ply-span-tests:armed:the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
   "ply-span-tests:armed:no_allowlist_entry_has_outlived_its_reason"
   "ply-span-tests:armed:ambiguous_enum_names_are_declared"
   "ply-cli-tests:suite:fmt::the_maintained_sources_are_committed_formatted"
@@ -360,12 +361,20 @@ shard_configs() {
 
 cmd_shard_configs() { shard_configs "${1:?a directory to write the configs to}" "$TIMINGS"; }
 
+# Every file CI's steps are written in: the workflows, and the actions they use, whose steps save
+# and restore caches too.
+ci_files() {
+  find "$root/.github/workflows" "$root/.github/actions" -type f \( -name '*.yml' -o -name '*.yaml' \) |
+    LC_ALL=C sort
+}
+
 # One job writes each cache key and another reads it. A rename that misses a side leaves a cache
 # nothing restores -- a run that is quietly slow rather than red -- and a restore naming a key
 # nothing writes always misses the same way. Only the literal before the first `${{ ... }}` is
 # compared: it is the part a restore can match on, and the part both sides spell out.
 cmd_cache_keys() {
-  local files=("$root"/.github/workflows/*.yml "$root"/.github/actions/*/action.yml)
+  local files=() file
+  while IFS= read -r file; do files+=("$file"); done < <(ci_files)
   awk -v give_back="${GIVE_BACK[*]}" '
     function literal(s) {
       sub(/\$\{\{.*/, "", s)
@@ -475,7 +484,8 @@ cmd_cache_keys() {
 # sees, because the tests then run against the cache rather than the sources. Any `hashFiles` that
 # names a crate's own `ply/` sources -- or any crate tree at all -- must name every one of them.
 cmd_cache_payloads() {
-  local pattern tree pat base covered missing=0
+  local pattern tree pat base covered missing=0 files=() file
+  while IFS= read -r file; do files+=("$file"); done < <(ci_files)
   while IFS= read -r pattern; do
     case "$pattern" in *"/ply/"*) ;; *) continue ;; esac
     for tree in "$root"/crates/*/ply; do
@@ -498,7 +508,7 @@ cmd_cache_payloads() {
         missing=$((missing + 1))
       fi
     done
-  done < <(grep -o 'hashFiles([^)]*)' "$root"/.github/workflows/*.yml | sed -e 's/.*hashFiles(//' -e 's/)$//')
+  done < <(grep -oh 'hashFiles([^)]*)' "${files[@]}" | sed -e 's/.*hashFiles(//' -e 's/)$//')
   if [ "$missing" -eq 0 ]; then
     printf 'cache payloads: every key over crate sources names every tree holding Ply sources\n'
   fi

@@ -91,10 +91,6 @@ impl Loaded {
             .collect()
     }
 
-    pub fn hashes(&self) -> Result<HashOutput, Vec<Diagnostic>> {
-        Ok(self.hashes.clone())
-    }
-
     pub fn file_names(&self) -> Vec<String> {
         self.files
             .iter()
