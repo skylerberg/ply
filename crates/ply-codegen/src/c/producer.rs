@@ -242,14 +242,7 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
     let shipped = shipped_closure(&own);
     // The shipped modules are pulled, not inlined: inlined they would be root modules named
     // `std.*`, which the front end's built-in-package check refuses.
-    let pulled = front_pulling_std_with(
-        &own,
-        &shipped,
-        &[],
-        &[],
-        &Packages::anonymous(String::new()),
-    )
-    .map_err(|e| format!("{e:#}"))?;
+    let pulled = front_pulling_std(&own, &shipped).map_err(|e| format!("{e:#}"))?;
     let ids: Vec<SourceId> = (0..own.len() + pulled.modules.len())
         .map(|i| SourceId(i as u32))
         .collect();
@@ -986,41 +979,6 @@ pub fn print_bodies(
 /// [`FRONT`], pulling in the shipped modules the program imports itself.
 const FRONT_PULLING: &str = "front.front_pulling_std_with";
 
-/// One definition's published rows under the hash it had when they were published; the front end
-/// takes them wherever it hashes that definition the same, and walks the rest.
-pub struct KnownDef {
-    pub name: String,
-    pub hash: DefHash,
-    /// The declaration each effect the rows name had, by name and hash: a reference is encoded by
-    /// what it reaches, so renaming an effect moves no hash and only this says the rows are stale.
-    pub witness: Vec<(String, DefHash)>,
-    pub footprint: String,
-    pub performed: String,
-}
-
-/// One test's footprint, keyed as `<module>.<label>`, under the hash it had. A test's row names its
-/// effects exactly as a definition's does, so it carries the same witness.
-pub struct KnownTest {
-    pub key: String,
-    pub hash: DefHash,
-    pub witness: Vec<(String, DefHash)>,
-    pub footprint: String,
-}
-
-fn witness_list(witness: &[(String, DefHash)]) -> Value {
-    Value::list(
-        witness
-            .iter()
-            .map(|(name, hash)| {
-                record(vec![
-                    ("name", Value::bytes(name.as_bytes())),
-                    ("hash", Value::bytes(hash.0)),
-                ])
-            })
-            .collect(),
-    )
-}
-
 /// What [`front_pulling_std`] answered.
 pub struct Pulled {
     /// The shipped modules pulled in, in the positions they took after the user's.
@@ -1080,18 +1038,14 @@ pub fn pkg_wants(known: &[String], manifests: &[SuppliedPackage]) -> Result<Vec<
         .collect()
 }
 
-/// [`front_pulling_std_with`] over a front end that has been handed nothing.
+/// [`front_pulling_std_with`] over a project without packages.
 pub fn front_pulling_std(
     user: &[(String, String)],
     shipped: &[(String, String)],
 ) -> Result<Pulled> {
-    front_pulling_std_with(user, shipped, &[], &[], &Packages::anonymous(String::new()))
+    front_pulling_std_with(user, shipped, &Packages::anonymous(String::new()))
 }
 
-/// [`front_dump`] over `user` plus each module of `shipped` it imports, transitively, placed
-/// as the CLI driver places them: a round of newly imported modules at a time, each in byte order.
-/// `defs` and `tests` carry what a previous answer published, which the front end takes wherever
-/// this program hashes that item the same.
 /// A dependency package the walk read: its root, its manifest text when the root holds one,
 /// and its modules named relative to the root.
 pub struct SuppliedPackage {
@@ -1154,46 +1108,21 @@ impl Packages {
     }
 }
 
+/// [`front_dump`] over `user` plus each module of `shipped` it imports, transitively, placed
+/// as the CLI driver places them: a round of newly imported modules at a time, each in byte order.
+/// Nothing is handed in: the rows a previous answer published are the CLI's to seed it with.
 pub fn front_pulling_std_with(
     user: &[(String, String)],
     shipped: &[(String, String)],
-    defs: &[KnownDef],
-    tests: &[KnownTest],
     packages: &Packages,
 ) -> Result<Pulled> {
-    let known_defs = Value::list(
-        defs.iter()
-            .map(|d| {
-                record(vec![
-                    ("name", Value::bytes(d.name.as_bytes())),
-                    ("hash", Value::bytes(d.hash.0)),
-                    ("witness", witness_list(&d.witness)),
-                    ("footprint", Value::bytes(d.footprint.as_bytes())),
-                    ("performed", Value::bytes(d.performed.as_bytes())),
-                ])
-            })
-            .collect(),
-    );
-    let known_tests = Value::list(
-        tests
-            .iter()
-            .map(|t| {
-                record(vec![
-                    ("key", Value::bytes(t.key.as_bytes())),
-                    ("hash", Value::bytes(t.hash.0)),
-                    ("witness", witness_list(&t.witness)),
-                    ("footprint", Value::bytes(t.footprint.as_bytes())),
-                ])
-            })
-            .collect(),
-    );
     let answer = call(
         FRONT_PULLING,
         &[
             source_list(user),
             source_list(shipped),
-            known_defs,
-            known_tests,
+            Value::list(Vec::new()),
+            Value::list(Vec::new()),
             packages.value(),
         ],
     )?;

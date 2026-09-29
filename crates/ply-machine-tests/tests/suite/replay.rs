@@ -72,9 +72,10 @@ type Binding = { name: String, ty: String, rendered: String }
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
-  packages: List<{ root: String, digest: String }>,
   read_ms: Int,
   front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
 }
 type Gap = Unit
 type Point = | Kept(List<Binding>) | Falsified(List<Binding>) | Rejected | Undrawn(Gap)

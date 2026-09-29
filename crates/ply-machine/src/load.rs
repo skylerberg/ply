@@ -198,9 +198,9 @@ pub fn project_root(path: &Path) -> PathBuf {
     }
 }
 
-/// The from-scratch path: no cache is read and none is written.
+/// A program's load of a program of its own, from scratch: no cache is read and none is written.
 pub fn load(path: &Path) -> Result<Loaded, LoadError> {
-    crate::driver::load_full(path)
+    crate::driver::run(path)
 }
 
 pub(crate) struct Discovered {

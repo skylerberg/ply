@@ -35,7 +35,6 @@ mod harness;
 mod http_audit;
 mod http_endpoint;
 mod incremental;
-mod incremental_audit;
 mod json_endpoint;
 mod lang_fixtures;
 mod manifest;
