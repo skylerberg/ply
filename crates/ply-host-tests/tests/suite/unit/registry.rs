@@ -34,6 +34,8 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
     assert_eq!(
         repeatable,
         [
+            // A socket's port is fixed while it is open, so reading it again reads the same one.
+            "std.net.net.local_port[..]",
             "std.config.config.get[..]",
             "std.config.config.secret[..]",
             "task.spawn[..]",
