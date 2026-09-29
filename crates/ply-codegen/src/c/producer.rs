@@ -2,13 +2,14 @@
 //! each thread builds its own, since the loaded unit holds `Rc`s.
 
 use super::build::Native;
-use super::tables::Tables;
+use super::tables::{Defined, Tables};
 use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
+use ply_eval::decode::{self, At};
 use ply_eval::{Fields, Value};
 use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, Severity, SourceId, Symbol, codes};
-use ply_ty::{DefHash, Front, ModuleName, Scheme, parse_scheme, read_front};
+use ply_ty::{DefHash, Front, ModuleName, read_front};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -431,9 +432,9 @@ pub struct PlyProducer {
     failed: RefCell<HashMap<usize, String>>,
 }
 
-/// Entered as `(names, srcs, ctors, builtins, wanted)`: every module at once, so they resolve
-/// together, emitting the roots `wanted` names.
-const ENTRY: &str = "emit.emit_roots";
+/// Entered as `(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg)`: every module at once, so
+/// they resolve together, emitting the roots `wanted` names.
+const ENTRY: &str = "emit.emit_roots_answer";
 
 impl PlyProducer {
     pub fn new(native: Native) -> Result<PlyProducer> {
@@ -598,10 +599,7 @@ impl PlyProducer {
         ];
         tally(|census| census.wanted.push(wanted.to_vec()));
         let value = self.call(ENTRY, &args)?;
-        let Value::Str(dump) = &value else {
-            bail!("the emitter answered something that is not a string");
-        };
-        parse(dump).context("reading the emitter's answer")
+        read_answers(&value).context("reading the emitter's answer")
     }
 
     /// Enters any function of the unit (`module.name`) with `args`, in a fresh context and under
@@ -657,7 +655,7 @@ pub struct Census {
     pub entries: usize,
     /// Modules handed to the front end, summed over its entries.
     pub modules: usize,
-    /// Modules handed to [`claims_dump`], summed over its entries.
+    /// Modules handed to [`claims`], summed over its entries.
     pub claimed: usize,
     pub allocated: usize,
     pub recycled: usize,
@@ -726,7 +724,7 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
     dump_over(FRONT, sources)
 }
 
-const CLAIMS: &str = "front.claims_dump";
+const CLAIMS: &str = "front.claims";
 
 /// The package tables a caller passes to a resolving entry, as values: what [`Front`]
 /// publishes, or empty lists for a program without packages.
@@ -766,75 +764,15 @@ pub fn package_tables(
 
 /// Every body, clause and law of a program [`front`] already checked, lowered, resolving the
 /// way the front end did: `packages` and `mod_pkg` are what it published, or empty for a
-/// program without packages.
-pub fn claims_dump(
+/// program without packages. The answer is a `List<front.Claim>`, as the prover reads it.
+pub fn claims(
     sources: &[(String, String)],
     packages: &[(String, Vec<String>)],
     mod_pkg: &[usize],
-) -> Result<String> {
+) -> Result<Value> {
     tally(|census| census.claimed += sources.len());
     let (pkgs, mods, shelf) = package_tables(packages, mod_pkg);
-    string_answer(
-        CLAIMS,
-        call(CLAIMS, &[source_list(sources), pkgs, mods, shelf])?,
-    )
-}
-
-const BUILTINS: &str = "front.builtins_dump";
-
-/// A builtin as the port's checker binds it: its scheme, the names of its parameters and a note.
-#[derive(Clone, Debug)]
-pub struct BuiltinInfo {
-    pub name: Symbol,
-    pub scheme: Scheme,
-    pub params: Vec<String>,
-    pub note: String,
-}
-
-/// Every builtin, in the prelude's order.
-pub fn builtins() -> Result<Vec<BuiltinInfo>> {
-    let dump = string_answer(BUILTINS, call(BUILTINS, &[])?)?;
-    let mut frames = Cursor::new(dump.as_bytes(), "frame");
-    let mut out = Vec::new();
-    while !frames.done() {
-        let (words, payload) = frames
-            .unit()
-            .map_err(|e| anyhow!("`{BUILTINS}`'s answer: {e}"))?;
-        let ["builtin", name] = words[..] else {
-            bail!("`{BUILTINS}` framed a `{}`", words.join(" "));
-        };
-        let mut fields = Cursor::new(payload, "field");
-        let mut scheme = None;
-        let mut params = Vec::new();
-        let mut note = String::new();
-        while !fields.done() {
-            let (key, text) = fields
-                .unit()
-                .map_err(|e| anyhow!("`{name}`'s frame: {e}"))?;
-            let text = std::str::from_utf8(text).context("a builtin's field")?;
-            match key[..] {
-                ["scheme"] => {
-                    scheme = Some(
-                        parse_scheme(text)
-                            .map_err(|e| anyhow!("`{name}`'s scheme `{text}`: {e}"))?,
-                    );
-                }
-                ["param"] => params.push(text.to_string()),
-                ["note"] => note = text.to_string(),
-                _ => bail!("`{name}`'s frame has a `{}` field", key.join(" ")),
-            }
-        }
-        let Some(scheme) = scheme else {
-            bail!("`{name}`'s frame has no `scheme` field");
-        };
-        out.push(BuiltinInfo {
-            name: Symbol::new(name),
-            scheme,
-            params,
-            note,
-        });
-    }
-    Ok(out)
+    call(CLAIMS, &[source_list(sources), pkgs, mods, shelf])
 }
 
 fn dump_over(entry: &str, sources: &[(String, String)]) -> Result<String> {
@@ -874,17 +812,17 @@ fn string_answer(entry: &str, answer: Value) -> Result<String> {
     Ok(text.to_string())
 }
 
-const REHASH: &str = "front.rehash_dump";
+const REHASH: &str = "front.rehash";
 
-/// Every definition and test re-hashed with each reference to a `pins` name written as its pin.
-/// The packages are the ones the program was analysed with: without them a rehash resolves a
-/// dependency's own modules as root ones.
-pub fn rehash_dump(
+/// Every definition and test re-hashed with each reference to a `pins` name written as its pin,
+/// as a `hash.Rehashed`. The packages are the ones the program was analysed with: without them a
+/// rehash resolves a dependency's own modules as root ones.
+pub fn rehash(
     sources: &[(String, String)],
     pins: &[(String, bool, DefHash)],
     packages: &[(String, Vec<String>)],
     mod_pkg: &[usize],
-) -> Result<String> {
+) -> Result<Value> {
     let pins = Value::list(
         pins.iter()
             .map(|(name, decl, hash)| {
@@ -897,13 +835,10 @@ pub fn rehash_dump(
             .collect(),
     );
     let (pkgs, mods, shelf) = package_tables(packages, mod_pkg);
-    string_answer(
-        REHASH,
-        call(REHASH, &[source_list(sources), pins, pkgs, mods, shelf])?,
-    )
+    call(REHASH, &[source_list(sources), pins, pkgs, mods, shelf])
 }
 
-const PRINT: &str = "front.print_dump";
+const PRINT: &str = "hash.print_bodies";
 
 /// One name a body may be printed under: the program-wide name, its body's hash, and whether the
 /// module it is in exports it. A reference from another module is printed `binder::name`, so a name
@@ -951,36 +886,32 @@ pub fn print_bodies(
         ),
         Value::list(shipped.iter().map(|m| Value::bytes(m.as_bytes())).collect()),
     ];
-    let dump = call(PRINT, &args)
-        .and_then(|answer| string_answer(PRINT, answer))
+    let answer = call(PRINT, &args)
         .map_err(|e| refused(format!("the stored bodies do not decode: {e:#}")))?;
-    let unreadable = |e: String| refused(format!("`{PRINT}`'s answer does not read: {e}"));
-    let mut frames = Cursor::new(dump.as_bytes(), "frame");
-    let mut modules = Vec::new();
-    while !frames.done() {
-        let (words, payload) = frames.unit().map_err(unreadable)?;
-        let text = std::str::from_utf8(payload)
-            .map_err(|e| unreadable(e.to_string()))?
-            .to_string();
-        match words[..] {
-            ["module", name] => modules.push((name.to_string(), text)),
-            ["refused", _] => {
-                let mut fields = Cursor::new(payload, "field");
-                let mut diagnostic = refused(String::new());
-                while !fields.done() {
-                    let (key, body) = fields.unit().map_err(unreadable)?;
-                    let body = String::from_utf8_lossy(body).into_owned();
-                    match key[..] {
-                        ["message"] => diagnostic.message = body,
-                        _ => diagnostic = diagnostic.note(body),
-                    }
+    let what = format!("`{PRINT}`'s answer");
+    let read =
+        || -> Result<std::result::Result<Vec<(String, String)>, Diagnostic>, decode::Error> {
+            let printing = At::new(&what, &answer).ctor()?;
+            match printing.name() {
+                "Printed" => Ok(Ok(printing.arg(0)?.items(|m| {
+                    Ok((
+                        m.field("module")?.utf8()?.to_string(),
+                        m.field("text")?.utf8()?.to_string(),
+                    ))
+                })?)),
+                "Unprintable" => {
+                    let why = printing.arg(0)?;
+                    let lossy = |text: At<'_>| -> Result<String, decode::Error> {
+                        Ok(String::from_utf8_lossy(text.bytes()?).into_owned())
+                    };
+                    let notes = why.field("notes")?.items(lossy)?;
+                    let diagnostic = refused(lossy(why.field("message")?)?);
+                    Ok(Err(notes.into_iter().fold(diagnostic, Diagnostic::note)))
                 }
-                return Err(diagnostic);
+                _ => Err(printing.unknown()),
             }
-            _ => return Err(unreadable(format!("a `{}` frame", words.join(" ")))),
-        }
-    }
-    Ok(modules)
+        };
+    read().map_err(|e| refused(format!("the answer does not read: {e}")))?
 }
 
 /// [`FRONT`], pulling in the shipped modules the program imports itself.
@@ -1029,7 +960,7 @@ pub struct Pulled {
     pub dump: String,
 }
 
-const WANTS: &str = "pkg.wants_dump";
+const WANTS: &str = "pkg.wants";
 
 /// What the manifests on hand ask for beyond `known`: the walk's next reads, as root keys.
 pub fn pkg_wants(known: &[String], manifests: &[SuppliedPackage]) -> Result<Vec<String>> {
@@ -1059,25 +990,8 @@ pub fn pkg_wants(known: &[String], manifests: &[SuppliedPackage]) -> Result<Vec<
             ),
         ],
     )?;
-    let Value::Str(json) = &answer else {
-        bail!(
-            "`{WANTS}` answered a {} rather than a string",
-            answer.type_name()
-        );
-    };
-    let parsed: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| anyhow!("`{WANTS}` answered JSON that does not read: {e}"))?;
-    let Some(wants) = parsed.get("wants").and_then(|w| w.as_array()) else {
-        bail!("`{WANTS}` answered JSON without a `wants` array");
-    };
-    wants
-        .iter()
-        .map(|w| {
-            w.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("`{WANTS}` answered a want that is not a string"))
-        })
-        .collect()
+    let what = format!("`{WANTS}`'s answer");
+    Ok(strings(At::new(&what, &answer))?)
 }
 
 /// [`front_pulling_std_with`] over a front end that has been handed nothing.
@@ -1299,39 +1213,19 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
     })
 }
 
-/// `body <name> <n>\n` and then exactly `n` bytes, repeated: the tables in the cache's encoding,
-/// `text\n`, and the C. A body whose tables list members is a group's, under its first member.
-fn parse(dump: &str) -> Result<Bodies> {
+/// Each root's `emit.RootAnswer`. A body whose tables list members is a group's, and answers for
+/// every one of them.
+fn read_answers(answer: &Value) -> Result<Bodies, decode::Error> {
+    let what = format!("`{ENTRY}`'s answer");
     let mut out = HashMap::new();
-    let bytes = dump.as_bytes();
-    let mut at = 0usize;
-    while at < bytes.len() {
-        let line_end = dump[at..]
-            .find('\n')
-            .map(|i| at + i)
-            .ok_or_else(|| anyhow!("an unterminated frame header"))?;
-        let header = &dump[at..line_end];
-        let mut parts = header.split(' ');
-        let (Some(kind), Some(name), Some(n), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            bail!(
-                "a frame header that is not `body <name> <n>` or `refused <name> <n>`: {header:?}"
-            );
-        };
-        let n: usize = n.parse().context("a frame's length")?;
-        let start = line_end + 1;
-        let end = start + n;
-        if end > bytes.len() {
-            bail!("a frame of {n} bytes past the end of the answer");
-        }
-        let chunk = std::str::from_utf8(&bytes[start..end]).context("a frame that is not UTF-8")?;
-        match kind {
-            "body" => {
-                let (text, tables) = super::cache::decode(chunk)
-                    .ok_or_else(|| anyhow!("`{name}`'s frame does not decode as a body"))?;
-                let tables = Box::new(tables);
-                // A group's one body answers for every member.
+    for root in At::new(&what, answer).list()? {
+        let name = root.field("name")?.utf8()?;
+        let answer = root.field("answer")?.ctor()?;
+        match answer.name() {
+            "Body" => {
+                let body = answer.arg(0)?;
+                let text = body.field("text")?.utf8()?.to_string();
+                let tables = Box::new(read_tables(body.field("tables")?)?);
                 if tables.members.is_empty() {
                     out.insert(name.to_string(), Answer::Body(text, tables));
                 } else {
@@ -1340,23 +1234,87 @@ fn parse(dump: &str) -> Result<Bodies> {
                     }
                 }
             }
-            "refused" => {
-                let (why, handles) = chunk.split_once("\nhandles ").unwrap_or((chunk, ""));
+            "Refused" => {
+                let refused = answer.arg(0)?;
+                let why = refused.field("why")?.utf8()?.to_string();
                 out.insert(
                     name.to_string(),
-                    Answer::Refused(
-                        why.to_string(),
-                        handles
-                            .split(' ')
-                            .filter(|h| !h.is_empty())
-                            .map(str::to_string)
-                            .collect(),
-                    ),
+                    Answer::Refused(why, strings(refused.field("handles")?)?),
                 );
             }
-            other => bail!("a frame of a kind this seam does not read: {other:?}"),
+            _ => return Err(answer.unknown()),
         }
-        at = end;
     }
     Ok(out)
+}
+
+fn read_tables(t: At<'_>) -> Result<Tables, decode::Error> {
+    let symbols = |list: At<'_>| list.items(|s| Ok(Symbol::new(s.utf8()?)));
+    Ok(Tables {
+        consts: t.field("consts")?.items(read_const)?,
+        builtins: t.field("builtins")?.items(|b| {
+            let name = b.utf8()?;
+            ply_eval::Builtin::from_name(name)
+                .ok_or_else(|| b.error(format!("`{name}` is no builtin this runtime has")))
+        })?,
+        fields: symbols(t.field("fields")?)?,
+        shapes: t.field("shapes")?.items(symbols)?,
+        calls: strings(t.field("calls")?)?,
+        lambdas: strings(t.field("lambdas")?)?,
+        performs: strings(t.field("performs")?)?,
+        handles: strings(t.field("handles")?)?,
+        members: strings(t.field("members")?)?,
+        symbols: t.field("symbols")?.items(|d| {
+            Ok(Defined {
+                symbol: d.field("symbol")?.utf8()?.to_string(),
+                entry: d.field("entry")?.utf8()?.to_string(),
+            })
+        })?,
+    })
+}
+
+/// An `emit.Const`. A float or a decimal crosses as its literal, which is read as the lexer reads it.
+fn read_const(c: At<'_>) -> Result<Value, decode::Error> {
+    let c = c.ctor()?;
+    Ok(match c.name() {
+        "ConstStr" => Value::str(c.arg(0)?.utf8()?),
+        "ConstBytes" => Value::bytes(c.arg(0)?.bytes()?),
+        "ConstFixed" => {
+            let fixed = c.arg(0)?;
+            let width = fixed.field("width")?;
+            let ty = ply_eval::INT_TYPES
+                .get(width.number::<usize>()?)
+                .ok_or_else(|| width.error("a width the runtime does not number"))?;
+            // The bits are the `Int` the width reads, so a negative one is the same pattern.
+            Value::Fixed(ply_eval::Fixed::new(
+                *ty,
+                fixed.field("bits")?.int()? as u64,
+            ))
+        }
+        "ConstFloat" => {
+            let text = c.arg(0)?;
+            let literal = text.utf8()?.replace('_', "");
+            Value::Float(
+                literal
+                    .parse()
+                    .map_err(|_| text.error(format!("the float `{literal}` does not read")))?,
+            )
+        }
+        "ConstDecimal" => {
+            let text = c.arg(0)?;
+            let literal = text.utf8()?.replace('_', "");
+            Value::Decimal(
+                literal
+                    .trim_end_matches('m')
+                    .parse()
+                    .map_err(|_| text.error(format!("the decimal `{literal}` does not read")))?,
+            )
+        }
+        "ConstUnit" => Value::Unit,
+        _ => return Err(c.unknown()),
+    })
+}
+
+fn strings(list: At<'_>) -> Result<Vec<String>, decode::Error> {
+    list.items(|s| Ok(s.utf8()?.to_string()))
 }
