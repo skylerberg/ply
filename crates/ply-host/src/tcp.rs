@@ -38,10 +38,11 @@ pub enum Op {
     Recv,
     Send,
     Close,
+    LocalPort,
 }
 
 impl Op {
-    pub const ALL: [Op; 9] = [
+    pub const ALL: [Op; 10] = [
         Op::Listen,
         Op::ListenTls,
         Op::Connect,
@@ -51,6 +52,7 @@ impl Op {
         Op::Recv,
         Op::Send,
         Op::Close,
+        Op::LocalPort,
     ];
 
     pub fn name(self) -> &'static str {
@@ -64,6 +66,7 @@ impl Op {
             Op::Recv => "recv",
             Op::Send => "send",
             Op::Close => "close",
+            Op::LocalPort => "local_port",
         }
     }
 
@@ -78,12 +81,13 @@ impl Op {
             Op::Recv => "`net.recv`",
             Op::Send => "`net.send`",
             Op::Close => "`net.close`",
+            Op::LocalPort => "`net.local_port`",
         }
     }
 
     fn arity(self) -> usize {
         match self {
-            Op::Listen | Op::Accept | Op::Close | Op::Handshake => 1,
+            Op::Listen | Op::Accept | Op::Close | Op::Handshake | Op::LocalPort => 1,
             Op::ListenTls => 2,
             Op::Connect | Op::ConnectTls | Op::Recv | Op::Send => 3,
         }
@@ -102,7 +106,19 @@ impl Op {
             op: Symbol::new(self.name()),
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
-            linearity: Linearity::AtMostOnce,
+            // Reading a port changes nothing; every other operation opens, moves or closes bytes.
+            linearity: match self {
+                Op::LocalPort => Linearity::Repeatable,
+                Op::Listen
+                | Op::ListenTls
+                | Op::Connect
+                | Op::ConnectTls
+                | Op::Handshake
+                | Op::Accept
+                | Op::Recv
+                | Op::Send
+                | Op::Close => Linearity::AtMostOnce,
+            },
             blocking: self.waits() && net.waits(),
             // No expression turns a `Secret` into the `Bytes` a socket write takes.
             secrets: false,
@@ -166,6 +182,8 @@ pub trait Net: Send + Sync {
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
     fn close(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
+    /// The port this end of a socket is bound to; `None` for a listener the drain has closed.
+    fn local_port(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
 }
 
 /// The resource label each open socket is operated under.
@@ -313,6 +331,10 @@ impl HostHandler for Operation {
             Op::Close => {
                 let socket = req.args[0].as_int(span, "a socket handle")?;
                 self.net.close(at, socket, span)
+            }
+            Op::LocalPort => {
+                let socket = req.args[0].as_int(span, "a socket handle")?;
+                self.net.local_port(at, socket, span)
             }
         }
     }
