@@ -1,141 +1,152 @@
-use ply_corpus::regions::{
-    Corpus, Hypothetical, analyse, colour, hypothetical, makespan, region_footprint,
-};
-use ply_span::Symbol;
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, Resource};
+//! `regions`, end to end: projects whose tests carry `cell` atoms, and `examples/`, each measured by
+//! the product and coloured with the runner's own colouring under both models.
 
-fn atom(effect: &str, resource: &str, mode: Mode) -> EffectAtom {
-    EffectAtom::new(effect, Resource::Named(Symbol::new(resource)), mode)
+use crate::support::{corpus, document, measured, outcome, repo, row};
+use std::path::Path;
+
+/// `cells` tests each writing the cell of one of `labels` labels, then `pure` tests touching nothing.
+fn cell_project(dir: &Path, cells: usize, labels: usize, pure: usize) {
+    let mut src = String::new();
+    for i in 0..cells {
+        let label = i % labels;
+        src.push_str(&format!(
+            "fn touch{i}() -> Int / {{cell.read[r{label}], cell.write[r{label}]}} =\n  \
+             with_cell[r{label}](0) {{ c -> {{ cell_set(c, {i}); cell_get(c) }} }}\n\n\
+             test \"cell test {i}\" {{ assert_eq(touch{i}(), {i}) }}\n\n"
+        ));
+    }
+    for i in 0..pure {
+        src.push_str(&format!(
+            "test \"pure test {i}\" {{ assert_eq({i} + 1, {}) }}\n",
+            i + 1
+        ));
+    }
+    std::fs::create_dir_all(dir).expect("the scratch project directory");
+    std::fs::write(dir.join("main.ply"), src).expect("writing the scratch project");
 }
 
-fn fp(atoms: impl IntoIterator<Item = EffectAtom>) -> Footprint {
-    Footprint::from_atoms(atoms)
-}
-
-#[test]
-fn colouring_reproduces_the_runners_own_grouping() {
-    let tests: Vec<(usize, Footprint)> = vec![
-        (0, fp([atom("db", "a", Mode::Write)])),
-        (1, fp([atom("db", "a", Mode::Read)])),
-        (2, fp([atom("db", "b", Mode::Write)])),
-        (3, fp([atom("cell", "s", Mode::Write)])),
-        (4, Footprint::empty()),
-        (
-            5,
-            fp([atom("db", "a", Mode::Write), atom("db", "b", Mode::Write)]),
-        ),
-        (6, fp([atom("sim", "x", Mode::Read)])),
-    ];
-    let projected: Vec<Footprint> = tests.iter().map(|(_, f)| region_footprint(f)).collect();
-    assert_eq!(
-        colour(&tests, &projected),
-        ply_test::group_by_conflict(&tests)
+fn regions(dir: &Path, args: &[&str]) -> serde_json::Value {
+    let mut line = vec!["regions"];
+    line.extend_from_slice(args);
+    line.push("--json");
+    let out = corpus(dir, &line);
+    assert!(
+        out.status.success(),
+        "regions refused:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    document(&out)
+}
+
+fn effects(row: &serde_json::Value) -> Vec<&str> {
+    row["detail"]["effects"]
+        .as_array()
+        .expect("the effects are a list")
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect()
 }
 
 #[test]
-fn two_tests_sharing_one_cell_label_split_without_forking() {
-    let corpus = Corpus {
-        root: "unit".into(),
-        keys: vec!["m.a".into(), "m.b".into()],
-        footprints: vec![
-            fp([atom("cell", "users", Mode::Write)]),
-            fp([atom("cell", "users", Mode::Write)]),
-        ],
-        millis: vec![1.0, 1.0],
-        worker_setup_millis: 0.0,
-        measured_suite_millis: None,
-        measured_sequential_millis: None,
-    };
-    let cost = analyse(&corpus, 8);
-    assert_eq!(cost.isolated_today, 2);
-    assert_eq!(cost.today.groups, 1);
-    assert_eq!(cost.without_forking.groups, 2);
-    assert_eq!(cost.newly_serialized, 2);
-    assert_eq!(cost.wall_clock_ratio(), 2.0);
+fn a_cell_atom_reaches_a_footprint_and_only_forking_hides_it() {
+    let dir = tempfile::tempdir().unwrap();
+    cell_project(&dir.path().join("cells"), 24, 4, 8);
+    let report = regions(dir.path(), &["cells", "--jobs", "4"]);
+
+    let cost = row(&report, "cells");
+    assert!(
+        effects(cost).contains(&"cell"),
+        "the project was written so that a `cell` atom reaches a footprint: {cost:#}"
+    );
+    assert_eq!(measured(cost, "tests"), 32.0);
+    assert_eq!(
+        measured(cost, "isolated"),
+        32.0,
+        "forking makes every one of them isolated, which is the property being priced"
+    );
+    assert_eq!(measured(cost, "groups_forked"), 1.0);
+    assert_eq!(
+        measured(cost, "groups_regions"),
+        6.0,
+        "six tests share each of four labels, so the clique is six colours wide"
+    );
+    assert_eq!(measured(cost, "newly_serialized"), 24.0);
+    assert!(
+        measured(cost, "critical_regions") > measured(cost, "critical_forked"),
+        "six barriers where there was one has to cost something: {cost:#}"
+    );
+    // The criterion is that the region model serializes nothing, and here it serializes all of them.
+    assert_eq!(outcome(cost), "fail", "{cost:#}");
+    // And the model's colouring is the runner's own.
+    let agreement = row(&report, "cells colouring");
+    assert_eq!(outcome(agreement), "pass", "{agreement:#}");
 }
 
 #[test]
-fn pure_tests_cost_nothing_under_either_model() {
-    let mut footprints = vec![fp([atom("db", "a", Mode::Write)])];
-    footprints.extend((0..100).map(|_| Footprint::empty()));
-    let corpus = Corpus {
-        root: "unit".into(),
-        keys: (0..footprints.len()).map(|i| format!("m.t{i}")).collect(),
-        footprints,
-        millis: vec![1.0; 101],
-        worker_setup_millis: 0.0,
-        measured_suite_millis: None,
-        measured_sequential_millis: None,
-    };
-    let cost = analyse(&corpus, 8);
-    assert_eq!(cost.newly_serialized, 0);
-    assert_eq!(cost.today.groups, cost.without_forking.groups);
-    assert_eq!(cost.pure, 100);
+fn cell_tests_on_distinct_labels_are_free_to_lose_the_exemption() {
+    let dir = tempfile::tempdir().unwrap();
+    cell_project(&dir.path().join("cells"), 16, 16, 8);
+    let report = regions(dir.path(), &["cells", "--jobs", "4"]);
+
+    let cost = row(&report, "cells");
+    assert_eq!(measured(cost, "cell"), 16.0);
+    assert_eq!(measured(cost, "newly_serialized"), 0.0);
+    assert_eq!(
+        measured(cost, "groups_forked"),
+        measured(cost, "groups_regions")
+    );
+    assert_eq!(outcome(cost), "pass", "{cost:#}");
+    assert_eq!(report["ok"].as_bool(), Some(true), "{report:#}");
 }
 
 #[test]
-fn a_seeded_test_is_untouched_by_the_change() {
-    let corpus = Corpus {
-        root: "unit".into(),
-        keys: vec!["m.a".into(), "m.b".into()],
-        footprints: vec![
-            fp([atom("sim", "x", Mode::Read)]),
-            fp([atom("sim", "x", Mode::Read)]),
-        ],
-        millis: vec![1.0, 1.0],
-        worker_setup_millis: 0.0,
-        measured_suite_millis: None,
-        measured_sequential_millis: None,
-    };
-    let cost = analyse(&corpus, 8);
-    assert_eq!(cost.newly_serialized, 0);
-    assert_eq!(cost.seeded_only, 2);
-    assert_eq!(cost.without_forking.groups, 1);
+fn the_examples_suite_loses_nothing_to_the_region_model() {
+    let report = regions(&repo(), &["examples", "--jobs", "8"]);
+
+    let cost = row(&report, "examples");
+    assert!(
+        !effects(cost).contains(&"cell"),
+        "no test in `examples/` carries a `cell` atom; if one now does, the cost is no longer zero"
+    );
+    assert_eq!(measured(cost, "tests"), 189.0);
+    assert_eq!(measured(cost, "isolated"), 179.0);
+    assert_eq!(measured(cost, "pure"), 168.0);
+    assert_eq!(measured(cost, "seeded"), 11.0);
+    assert_eq!(measured(cost, "cell"), 0.0);
+    assert_eq!(measured(cost, "newly_serialized"), 0.0);
+    assert_eq!(
+        measured(cost, "groups_forked"),
+        measured(cost, "groups_regions")
+    );
+    assert_eq!(
+        measured(cost, "critical_forked"),
+        measured(cost, "critical_regions")
+    );
+    assert_eq!(outcome(cost), "pass", "{cost:#}");
+    let agreement = row(&report, "examples colouring");
+    assert_eq!(outcome(agreement), "pass", "{agreement:#}");
 }
 
 #[test]
-fn a_lone_cell_label_does_not_serialize() {
-    let corpus = Corpus {
-        root: "unit".into(),
-        keys: vec!["m.a".into(), "m.b".into()],
-        footprints: vec![
-            fp([atom("cell", "users", Mode::Write)]),
-            fp([atom("cell", "orders", Mode::Write)]),
-        ],
-        millis: vec![1.0, 1.0],
-        worker_setup_millis: 0.0,
-        measured_suite_millis: None,
-        measured_sequential_millis: None,
-    };
-    let cost = analyse(&corpus, 8);
-    assert_eq!(cost.world_backed, 2);
-    assert_eq!(cost.newly_serialized, 0);
-    assert_eq!(cost.without_forking.groups, 1);
+fn a_hypothetical_is_priced_without_a_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = regions(dir.path(), &["--hypothetical", "12:3"]);
+    let rows = report["rows"].as_array().expect("rows is an array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "one hypothetical asked for is one row: {report:#}"
+    );
+    let cost = row(&report, "hypothetical 12:3");
+    assert_eq!(measured(cost, "tests"), 12.0 + 10.0 + 165.0);
+    assert!(measured(cost, "newly_serialized") > 0.0, "{cost:#}");
 }
 
 #[test]
-fn makespan_charges_a_barrier_between_groups() {
-    let groups = vec![vec![0, 1, 2, 3], vec![4]];
-    let millis = vec![1.0, 1.0, 1.0, 1.0, 10.0];
-    assert_eq!(makespan(&groups, &millis, 2, 0.0), 2.0 + 10.0);
-    assert_eq!(makespan(&groups, &millis, 0, 0.0), 1.0 + 10.0);
-    assert_eq!(makespan(&groups, &millis, 1, 0.0), 4.0 + 10.0);
-}
-
-#[test]
-fn a_hypothetical_corpus_is_a_pure_function_of_its_shape() {
-    let shape = Hypothetical {
-        cell_tests: 40,
-        labels: 4,
-        shared_tests: 10,
-        shared_labels: 3,
-        pure_tests: 100,
-        seed: 7,
-    };
-    let a = hypothetical(shape);
-    let b = hypothetical(shape);
-    assert_eq!(a.footprints, b.footprints);
-    assert_eq!(a.footprints.len(), 150);
+fn nothing_to_analyse_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = corpus(dir.path(), &["regions"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nothing to analyse"), "{stderr}");
 }
