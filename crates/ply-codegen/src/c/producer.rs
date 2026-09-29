@@ -173,10 +173,14 @@ pub fn build(src: &Sources) -> Result<PlyProducer, String> {
     let (native, _refused) = if carried.sources_digest() == Some(identity.as_str()) {
         super::bundle::build(&carried).map_err(|e| format!("{e:#}"))?
     } else {
-        let staged = super::bundle::from_dir(&super::bundle::stage_dir(&identity))
-            .and_then(|stage| super::bundle::build(&stage).ok());
+        let dir = super::bundle::stage_dir(&identity);
+        let staged =
+            super::bundle::from_dir(&dir).and_then(|stage| super::bundle::build(&stage).ok());
         match staged {
-            Some(built) => built,
+            Some(built) => {
+                super::sweep::used(&dir);
+                built
+            }
             None => emit_stage(src, &identity)?,
         }
     };
