@@ -79,11 +79,32 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[
         "The search that spends a budget runs in the program. See Confidence::Fused.",
     ),
     (
+        "Skipped::NeverPassed",
+        "The gate is the program's: `suite.bisect`'s `precheck` decides every failure from the \
+         facts the runtime hands over. See Verdict::Bisected.",
+    ),
+    (
+        "Skipped::Host",
+        "The program's gate. See Skipped::NeverPassed.",
+    ),
+    (
+        "Skipped::Nondet",
+        "The program's gate. See Skipped::NeverPassed.",
+    ),
+    (
+        "Skipped::Panicked",
+        "The program's gate. See Skipped::NeverPassed.",
+    ),
+    (
+        "Skipped::NoChanges",
+        "The program's verdict, over the change set it classifies. See Verdict::Bisected.",
+    ),
+    (
         "Verdict::Bisected",
-        "`Skipped::Delegated` is the one verdict the runtime still builds, for a failure whose \
-         change set it hands over; every other case comes from the program's own search, which \
-         `crates/ply-test/ply/bisect.ply` constructs. The runtime marshals them and matches on \
-         them (the artifact, the report), which is a consumer and not a producer.",
+        "Every verdict is the program's: `crates/ply-test/ply/bisect.ply` constructs each case a \
+         search reaches, over the facts the runtime hands over. The runtime's own copy is only ever \
+         the default, and it matches on the rest (the artifact, the report), which is a consumer \
+         and not a producer.",
     ),
     (
         "Verdict::Inconclusive",
@@ -111,14 +132,7 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[
 const CODE_INDIRECTION: &[Indirection] = &[];
 
 /// Covered enum names that more than one covered enum declares.
-const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[(
-    "Reason",
-    "crates/ply-test/src/lib.rs's Reason (why a test was selected) and \
-     crates/ply-test/src/obligation.rs's Reason (where a discharge came from) \
-     share the variant name New. Every variant of both is armed today, so the \
-     ambiguity changes no answer; if one of them dies while the other keeps a \
-     variant of the same name, this gate will not see it.",
-)];
+const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[];
 
 struct Indirection {
     file: &'static str,

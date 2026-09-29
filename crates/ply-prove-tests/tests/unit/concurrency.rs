@@ -8,10 +8,9 @@ use ply_prove::concurrency::{
     BodyRun, LawSearch, Searched, ValueDomain, audit_interleaving_proof, discharge, refutation,
     replay_command,
 };
-use ply_prove::key::result_key;
 use ply_prove::{
-    Binding, Certificate, Discharge, Evidence, Frame, Gap, Obligation, ObligationKind, ProvePlan,
-    Rule, Tier, Vacuity, VacuityKind, interleaving_proves,
+    Binding, Certificate, Discharge, Evidence, Frame, Gap, Obligation, ObligationKind, Rule, Tier,
+    Vacuity, VacuityKind, interleaving_proves,
 };
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::DefHash;
@@ -234,19 +233,6 @@ fn a_search_that_spends_its_budget_is_property_and_says_how_many() {
     assert_eq!(report.kept, 30, "the count is the interleavings it ran");
     assert_eq!(report.kept, searched.evaluations);
     assert!(searched.line().unwrap().contains("budget spent"));
-}
-
-/// A spent budget is a claim about the plan that spent it, so a wider plan must not read it.
-#[test]
-fn a_spent_budget_is_not_written_under_the_bare_key() {
-    let obligation = law(0);
-    let mut model = Model::new(3, |counter| counter <= 3);
-    let searched = discharge(&obligation, &dpor(30), &ValueDomain::ground(), &mut model);
-    let plan = ProvePlan::default();
-    assert_ne!(
-        result_key(obligation.key, searched.discharge.tier(), &plan),
-        obligation.key
-    );
 }
 
 #[test]

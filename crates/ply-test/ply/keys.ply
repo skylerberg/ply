@@ -3,19 +3,22 @@
 // nothing else moves. A domain tag on each keeps a derived key from colliding with a definition's
 // own untagged hash.
 //
-// These encodings are the Rust side's, byte for byte — a cache written by one is read by the other —
-// which is what the goldens in the tests below pin.
+// This is the only encoding of them: the runtime reads and writes the store under the keys the
+// program hands it, so the goldens below are the bytes every cache already written holds.
 
-import std.bytes (u32_le, u64_le)
+import std.bytes (bytes_of_hex, hex_of, u32_le, u64_le)
 import std.hash (blake3)
+import delta (Decl, DefKey, Ns, Value, key_before)
 
 fn sim_domain() -> Bytes = b"ply.sim.key.1"
 fn seed_domain() -> Bytes = b"ply.sim.seed.1"
 fn digest_domain() -> Bytes = b"ply.sim.plan.1"
+fn mixture_domain() -> Bytes = b"ply.sim.mixture.1"
 
 // The plan's digest: the mode as one byte, the budget and step bounds little-endian, then the roots
-// (as 64-bit) and the fixed choices (as 16-bit), each counted. The roots are the ones the search
-// would be run with: a plan is normalized before it is digested, and this takes that as read.
+// (as 64-bit) and the fixed choices (as 16-bit), each counted. A plan is digested normalized: the
+// roots in one order with none repeated and never none at all, the bounds at least one, and a path
+// only under `once`. Two plans that would be run the same way are one digest.
 pub fn plan_digest(
   mode: String,
   budget: Int,
@@ -23,27 +26,28 @@ pub fn plan_digest(
   roots: List<Int>,
   path: List<Int>,
 ) -> Bytes = {
-  // `budget` and `steps` are 32-bit on the Rust side and the roots are 64-bit; the choices are 16.
-  // A plan is digested normalized, as the Rust side digests it: the roots in one order with none
-  // repeated and never none at all, the bounds at least one, and a path only where a path means
-  // something. Two plans that would be run the same way are one digest.
-  let ropts = match sorted_ints(roots) { [] -> [0], some -> some };
-  let fixed = if mode == "once" { sorted_ints(path) } else { [] };
+  // A path is the choices one interleaving took, in the order it took them.
+  let fixed = if mode == "once" { path } else { [] };
+  let normal = normal_roots(roots);
   blake3(
     bytes_concat_all([
       digest_domain(),
       mode_byte(mode),
       u32_le(if budget < 1 { 1 } else { budget }),
       u32_le(if steps < 1 { 1 } else { steps }),
-      u32_le(len(ropts)),
-      bytes_concat_all(map(ropts, u64_le)),
+      u32_le(len(normal)),
+      bytes_concat_all(map(normal, u64_le)),
       u32_le(len(fixed)),
       bytes_concat_all(map(fixed, u16_le)),
     ]),
   )
 }
 
-// Ascending, with repeats dropped: the order a normalized plan's roots and choices are in.
+// The roots a search is run with: ascending, none repeated, and never none at all.
+fn normal_roots(roots: List<Int>) -> List<Int> =
+  match sorted_ints(roots) { [] -> [0], some -> some }
+
+// Ascending, with repeats dropped: the order a normalized plan's roots are in.
 fn sorted_ints(xs: List<Int>) -> List<Int> =
   fold(xs, [], |acc: List<Int>, x: Int| {
     if contains(acc, x) { acc } else {
@@ -54,10 +58,10 @@ fn sorted_ints(xs: List<Int>) -> List<Int> =
     }
   })
 
-fn inserted(xs: List<Int>, at: Int, x: Int) -> List<Int> = {
+fn inserted<a>(xs: List<a>, at: Int, x: a) -> List<a> = {
   let before = map(range(0, at), |j: Int| nth(xs, j));
   let after = map(range(at, len(xs)), |j: Int| nth(xs, j));
-  fold(after, push(before, x), |acc: List<Int>, y: Int| push(acc, y))
+  fold(after, push(before, x), |acc: List<a>, y: a| push(acc, y))
 }
 
 fn contains(xs: List<Int>, x: Int) -> Bool = fold(xs, false, |found: Bool, y: Int| found || y == x)
@@ -89,7 +93,60 @@ pub fn default_steps() -> Int = 100000
 pub fn writes_seed_keys(mode: String, budget: Int, steps: Int, path: List<Int>) -> Bool =
   mode == "random" && budget == 1 && steps == default_steps() && len(path) == 0
 
-// `once` is 0, `random` 1 and `dpor` 2: the Rust enum's own order, and anything else is `dpor`.
+/// Every key a pass is filed under. A hermetic test's is its own hash; a seeded test's is the
+/// search's key and, when the plan answers root by root, one per root it ran — the roots it owed,
+/// which is how a later, wider plan finds the ones already answered.
+pub fn filed_keys(
+  test_hash: Bytes,
+  seeded: Bool,
+  plan_digest: Bytes,
+  per_root: Bool,
+  ran: List<Int>,
+) -> List<Bytes> =
+  if !seeded { [test_hash] } else {
+    let roots = if per_root {
+      map(normal_roots(ran), |root: Int| seed_key(test_hash, seed_bytes(root, [])))
+    } else { [] };
+    push(roots, sim_key(test_hash, plan_digest))
+  }
+
+/// The key a mixture's pass is filed under. A test's hash covers its whole closure, so the test as
+/// it is now and as it last passed, with the definitions taken from the post-edit side, name the
+/// mixture exactly; the seed pins it to the interleaving the failure took.
+pub fn mixture_key(now: Bytes, then: Bytes, flipped: List<DefKey>, seed: Option<String>) -> Bytes = {
+  let keys = normal_keys(flipped);
+  blake3(
+    bytes_concat_all([
+      mixture_domain(),
+      now,
+      then,
+      u32_le(len(keys)),
+      bytes_concat_all(map(keys, |k: DefKey| bytes_concat(counted(k.name), ns_byte(k.ns)))),
+      match seed { None -> b"\x00", Some(text) -> bytes_concat(b"\x01", counted(text)) },
+    ]),
+  )
+}
+
+fn counted(text: String) -> Bytes = {
+  let b = bytes_of_string(text);
+  bytes_concat(u32_le(bytes_len(b)), b)
+}
+
+fn ns_byte(ns: Ns) -> Bytes = match ns { Value -> b"\x00", Decl -> b"\x01" }
+
+// Ascending, with repeats dropped: a key is about the set of definitions taken, not the order they
+// were named in.
+fn normal_keys(keys: List<DefKey>) -> List<DefKey> =
+  fold(keys, [], |acc: List<DefKey>, k: DefKey| {
+    if fold(acc, false, |found: Bool, x: DefKey| found || x == k) { acc } else {
+      let n = len(acc);
+      let at = fold(range(0, n), n, |i: Int, j: Int|
+        if i < n { i } else if key_before(k, nth(acc, j)) { j } else { i });
+      inserted(acc, at, k)
+    }
+  })
+
+// `once` is 0, `random` 1 and `dpor` 2, and anything else is `dpor`.
 fn mode_byte(mode: String) -> Bytes =
   if mode == "once" { b"\x00" } else if mode == "random" { b"\x01" } else { b"\x02" }
 
@@ -98,9 +155,8 @@ fn u16_le(n: Int) -> Bytes = bytes_slice(u32_le(n & 0xFFFF), 0, 2)
 
 // --- Tests ------------------------------------------------------------------
 
-// A digest is opaque, so a golden is a byte literal: the value `ply_eval::Plan::digest` answers for
-// the plan named above it. If one of these moves, the two sides have stopped agreeing and every
-// cache entry keyed by it is invalid.
+// A digest is opaque, so a golden is a byte literal: the bytes the store already holds keys under.
+// If one of these moves, every cache entry keyed by it is invalid.
 // A definition's hash is 32 bytes, so the goldens below are for one that reads `11223344` and
 // then zeros — not for a four-byte value, which is not a hash at all.
 fn a_hash() -> Bytes =
@@ -109,7 +165,10 @@ fn a_hash() -> Bytes =
     b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
   )
 
-test "a plan's digest is the fields the Rust side digests, in its order" {
+fn sevens() -> Bytes =
+  bytes_of_hex("0707070707070707070707070707070707070707070707070707070707070707")
+
+test "a plan's digest is the fields the store's keys were digested from, in their order" {
   assert_eq(
     plan_digest("once", 1, 100000, [], []),
     b"\xbc\x1a\x3b\x85\xbe\x13\x7e\x77\x8c\x4b\x60\xfa\x9e\xbc\xbb\xd5\x49\x67\xf4\x53\x82\xc4\x67\x36\x40\x87\x9f\x3f\x25\xb0\x36\x17",
@@ -117,6 +176,59 @@ test "a plan's digest is the fields the Rust side digests, in its order" {
   assert_eq(
     plan_digest("dpor", 256, 100000, [0, 1], []),
     b"\xe8\xaa\x1f\x9d\xd0\x88\x94\x75\xed\x1f\xa7\x27\xda\xc0\xed\x48\x81\x02\xfb\x79\x4d\xf3\x27\xa9\xbb\x88\x08\x4b\xac\x33\x42\x44",
+  );
+  // The default search, which every obligation's key folds in.
+  assert_eq(
+    hex_of(plan_digest("dpor", 256, 100000, [0], [])),
+    "3fd52dde1cf3697764f69bc85a2f911e96beccbee26bd7961190b298f4694469",
+  );
+  assert_eq(
+    hex_of(plan_digest("random", 1, 100000, [0, 1, 2, 3], [])),
+    "7a99e05acca1f79db5c3e3a9239f631e4d15aa5663fb85bb96f68460e8ff498e",
+  )
+}
+
+// `--seed 7:3.0.2` and `--seed 7:2.3.0` are two interleavings, so their plans are two digests.
+test "a path is digested in the order its choices were taken" {
+  assert_eq(
+    hex_of(plan_digest("once", 1, 100000, [7], [3, 0, 2])),
+    "68e4f179b5579c9e4dc7908e92306450aa94778467373791d3cf4dad5521d6ca",
+  );
+  assert_eq(
+    hex_of(plan_digest("once", 1, 100000, [7], [2, 3, 0])),
+    "46e36ae2c680e04083a2be5e2e0a80cf0fe236e348dac4a4f6d1638025164d80",
+  );
+  // A path means something only under `once`.
+  assert_eq(
+    plan_digest("dpor", 256, 100000, [0], [1, 2]),
+    plan_digest("dpor", 256, 100000, [0], []),
+  )
+}
+
+test "two spellings of one plan are one digest, and every field of it reaches the digest" {
+  assert_eq(
+    plan_digest("dpor", 256, 100000, [3, 1, 1, 2], []),
+    plan_digest("dpor", 256, 100000, [1, 2, 3], []),
+  );
+  assert_eq(plan_digest("dpor", 0, 0, [], []), plan_digest("dpor", 1, 1, [0], []));
+  let digests = map(
+    [
+      plan_digest("dpor", 256, 100000, [0], []),
+      plan_digest("random", 256, 100000, [0], []),
+      plan_digest("dpor", 256, 100000, [0, 1], []),
+      plan_digest("dpor", 257, 100000, [0], []),
+      plan_digest("dpor", 256, 100001, [0], []),
+      plan_digest("once", 1, 100000, [0], [1]),
+      plan_digest("once", 1, 100000, [0], [2]),
+    ],
+    hex_of,
+  );
+  assert_eq(
+    len(
+      filter(range(0, len(digests)), |i: Int|
+        len(filter(digests, |d: String| d == nth(digests, i))) == 1),
+    ),
+    len(digests),
   )
 }
 
@@ -127,13 +239,27 @@ test "a seeded test's key is its hash and its plan, and a hermetic one is its ha
     sim_key(hash, digest),
     b"\x48\x37\x11\x8d\xfc\xd9\xe6\x3b\x95\x62\xfd\xf6\x85\xb6\x7c\x6b\x67\x6b\x9a\xc4\xa8\x9b\xcf\x47\x63\xd4\x08\x3b\xdc\xc6\x5e\x76",
   );
-  assert_eq(result_key(hash, false, digest), hash)
+  assert_eq(result_key(hash, false, digest), hash);
+  assert_eq(result_key(hash, true, digest), sim_key(hash, digest));
+  assert(result_key(hash, true, digest) != hash);
+  assert_eq(
+    hex_of(sim_key(sevens(), plan_digest("random", 1, 100000, [0, 1, 2, 3], []))),
+    "b3651fcad22fb580be85f11d16da747cf852606ff5f41fa6534eeafa8b60d15f",
+  );
+  assert_eq(
+    hex_of(sim_key(sevens(), plan_digest("once", 1, 100000, [7], [3, 0, 2]))),
+    "3f21a7298fee33790cb225495102c7c00c2a78ed45c90dea0322273813ae2621",
+  )
 }
 
 test "a root's own key is the test's hash, the seed, and nothing else" {
   assert_eq(
     seed_key(a_hash(), seed_bytes(0, [])),
     b"\xfe\xcb\x3e\x1e\xca\x97\x25\x92\xb9\x28\x82\xdd\xa8\x5c\xca\xd3\xb2\xeb\x7f\x57\xc4\xe1\x80\x36\x32\x01\xf1\x14\x50\x89\x64\x61",
+  );
+  assert_eq(
+    hex_of(seed_key(sevens(), seed_bytes(3, []))),
+    "3163e508582674f72866bc99df149a2c884e8a6c50dcef9ddeca4803c1545d46",
   )
 }
 
@@ -143,4 +269,44 @@ test "only the plan a root can answer alone writes per-root keys" {
   assert(!writes_seed_keys("random", 1, 5, []));
   assert(!writes_seed_keys("random", 1, default_steps(), [0]));
   assert(!writes_seed_keys("dpor", 1, default_steps(), []))
+}
+
+test "a pass is filed under the test's hash, or under its search and each root it ran" {
+  let hash = sevens();
+  let dpor = plan_digest("dpor", 256, 100000, [0, 1, 2], []);
+  assert_eq(filed_keys(hash, false, dpor, false, [0, 1, 2]), [hash]);
+  // A seeded test is never filed under its bare hash.
+  assert_eq(filed_keys(hash, true, dpor, false, [0, 1, 2]), [sim_key(hash, dpor)]);
+  // A narrowed `random` search files each root it ran, and the key of the plan it answers for.
+  let four = plan_digest("random", 1, 100000, [0, 1, 2, 3], []);
+  assert_eq(filed_keys(hash, true, four, true, [3, 2]), [
+    seed_key(hash, seed_bytes(2, [])),
+    seed_key(hash, seed_bytes(3, [])),
+    sim_key(hash, four),
+  ])
+}
+
+test "a mixture's key names the eras, the definitions taken and the interleaving, and nothing else" {
+  let now = sevens();
+  let then = a_hash();
+  let x = { name: "m.x", ns: Value };
+  let y = { name: "m.y", ns: Value };
+  let one = mixture_key(now, then, [x, y], None);
+  // The same set named in another order, or twice, is the same mixture.
+  assert_eq(mixture_key(now, then, [y, x, y], None), one);
+  let others = [
+    mixture_key(then, now, [x, y], None),
+    mixture_key(now, then, [x], None),
+    mixture_key(now, then, [x, { name: "m.y", ns: Decl }], None),
+    mixture_key(now, then, [x, y], Some("0")),
+    mixture_key(now, then, [x, y], Some("0:1")),
+    mixture_key(now, then, [], None),
+  ];
+  assert_eq(len(filter(others, |k: Bytes| k == one)), 0);
+  assert_eq(
+    len(filter(others, |k: Bytes| len(filter(others, |o: Bytes| o == k)) == 1)),
+    len(others),
+  );
+  // Never a test's own key, whatever the eras are.
+  assert(one != now && one != sim_key(now, then) && one != seed_key(now, then))
 }

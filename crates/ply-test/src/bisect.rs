@@ -50,376 +50,6 @@ impl DefKey {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ChangeKind {
-    /// Its own normalized body differs.
-    Edited,
-    /// Its body is byte-identical; its hash moved only because a dependency's did.
-    Derived,
-    Added,
-    Removed,
-}
-
-impl ChangeKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ChangeKind::Edited => "edited",
-            ChangeKind::Derived => "derived",
-            ChangeKind::Added => "added",
-            ChangeKind::Removed => "removed",
-        }
-    }
-
-    pub fn is_candidate(self) -> bool {
-        !matches!(self, ChangeKind::Derived)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Change {
-    /// The program-wide name — `store.orders.place`.
-    pub name: Symbol,
-    pub ns: Ns,
-    /// Its hash when the test last passed.
-    pub before: Option<DefHash>,
-    pub after: Option<DefHash>,
-    pub kind: ChangeKind,
-    /// Whether its published interface (scheme and footprint) is the same on both sides.
-    pub independent: bool,
-}
-
-impl Change {
-    pub fn edited(name: Symbol, before: DefHash, after: DefHash, independent: bool) -> Change {
-        Change {
-            name,
-            ns: Ns::Value,
-            before: Some(before),
-            after: Some(after),
-            kind: ChangeKind::Edited,
-            independent,
-        }
-    }
-
-    pub fn in_namespace(mut self, ns: Ns) -> Change {
-        self.ns = ns;
-        self
-    }
-
-    pub fn key(&self) -> DefKey {
-        DefKey {
-            name: self.name.clone(),
-            ns: self.ns,
-        }
-    }
-
-    pub fn derived(name: Symbol, before: DefHash, after: DefHash) -> Change {
-        Change {
-            name,
-            ns: Ns::Value,
-            before: Some(before),
-            after: Some(after),
-            kind: ChangeKind::Derived,
-            independent: true,
-        }
-    }
-
-    /// Never independent: nothing referencing it can be flipped without it.
-    pub fn added(name: Symbol, after: DefHash) -> Change {
-        Change {
-            name,
-            ns: Ns::Value,
-            before: None,
-            after: Some(after),
-            kind: ChangeKind::Added,
-            independent: false,
-        }
-    }
-
-    /// Never independent: a baseline body still referencing it cannot be kept while it is deleted.
-    pub fn removed(name: Symbol, before: DefHash) -> Change {
-        Change {
-            name,
-            ns: Ns::Value,
-            before: Some(before),
-            after: None,
-            kind: ChangeKind::Removed,
-            independent: false,
-        }
-    }
-
-    pub fn is_candidate(&self) -> bool {
-        self.kind.is_candidate()
-    }
-}
-
-/// Which definitions mention which, unioned over both configurations.
-#[derive(Clone, Debug, Default)]
-pub struct DepEdges {
-    /// referent -> everything that mentions it.
-    referrers: BTreeMap<Symbol, BTreeSet<Symbol>>,
-}
-
-impl DepEdges {
-    pub fn new() -> DepEdges {
-        DepEdges::default()
-    }
-
-    /// `from` mentions `to`.
-    pub fn add(&mut self, from: Symbol, to: Symbol) {
-        self.referrers.entry(to).or_default().insert(from);
-    }
-
-    pub fn extend_from_hashes(&mut self, hashes: &HashOutput) {
-        for (from, deps) in &hashes.deps {
-            for to in deps {
-                self.add(from.clone(), to.clone());
-            }
-        }
-    }
-
-    pub fn referrers(&self, name: &Symbol) -> impl Iterator<Item = &Symbol> {
-        self.referrers.get(name).into_iter().flatten()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.referrers.is_empty()
-    }
-}
-
-impl From<&HashOutput> for DepEdges {
-    fn from(hashes: &HashOutput) -> DepEdges {
-        let mut edges = DepEdges::new();
-        edges.extend_from_hashes(hashes);
-        edges
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FusionReason {
-    /// Its interface is unchanged, so it stands alone and the search can name it exactly.
-    Independent,
-    /// Its scheme or footprint moved, so splitting it from its callers would not typecheck.
-    InterfaceChanged,
-    /// It exists on only one side, so nothing that mentions it can be flipped without it.
-    Existence,
-    /// Its members are mutually recursive, so they share one component hash and one stored body.
-    Component,
-}
-
-impl FusionReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FusionReason::Independent => "independent",
-            FusionReason::InterfaceChanged => "interface changed",
-            FusionReason::Existence => "added or removed",
-            FusionReason::Component => "one recursive component",
-        }
-    }
-
-    /// Says *why* a fused group's members are inseparable.
-    pub fn describe(self) -> &'static str {
-        match self {
-            FusionReason::Independent => "nothing forced these together",
-            FusionReason::InterfaceChanged => {
-                "their published interfaces moved together, so no hybrid that split them \
-                 would typecheck"
-            }
-            FusionReason::Existence => {
-                "one of them exists on only one side, so nothing that mentions it can be \
-                 flipped without it"
-            }
-            FusionReason::Component => {
-                "they are mutually recursive and share one component hash, so no hybrid can \
-                 flip one without the other"
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Cluster {
-    /// Program-wide names, ascending: the order is part of the artifact.
-    pub members: Vec<Symbol>,
-    /// `members` with namespaces: a name that is both a `fn` and a `type` must say which to swap.
-    pub keys: Vec<DefKey>,
-    pub reason: FusionReason,
-}
-
-impl Cluster {
-    pub fn is_singleton(&self) -> bool {
-        self.members.len() == 1
-    }
-}
-
-/// What moved since the test last passed, classified and grouped into what the search may flip.
-#[derive(Clone, Debug, Default)]
-pub struct Delta {
-    /// The test's own definition, when the test body itself was edited.
-    pub test: Option<Change>,
-    pub changes: Vec<Change>,
-    /// The atoms of the search, in ascending order of first member.
-    pub clusters: Vec<Cluster>,
-    /// How many changes could not be told apart from a hash that merely moved.
-    pub unclassified: usize,
-}
-
-impl Delta {
-    /// Classifies `changes` and fuses those that cannot be flipped apart.
-    pub fn new(test: Option<Change>, changes: Vec<Change>, edges: &DepEdges) -> Delta {
-        Delta::with_components(test, changes, edges, &[])
-    }
-
-    /// [`Delta::new`], also fusing the members of each strongly connected component.
-    pub fn with_components(
-        test: Option<Change>,
-        changes: Vec<Change>,
-        edges: &DepEdges,
-        components: &[Vec<DefKey>],
-    ) -> Delta {
-        let candidates: Vec<usize> = (0..changes.len())
-            .filter(|&i| changes[i].is_candidate())
-            .collect();
-        let mut slot: BTreeMap<DefKey, usize> = BTreeMap::new();
-        for (at, &i) in candidates.iter().enumerate() {
-            slot.insert(changes[i].key(), at);
-        }
-        // Fused by name: `DepEdges` is a name graph, and a mention reaches either namespace.
-        let mut by_name: BTreeMap<&Symbol, Vec<usize>> = BTreeMap::new();
-        for (at, &i) in candidates.iter().enumerate() {
-            by_name.entry(&changes[i].name).or_default().push(at);
-        }
-
-        let mut parent: Vec<usize> = (0..candidates.len()).collect();
-        let mut component_fused = vec![false; candidates.len()];
-        for (at, &i) in candidates.iter().enumerate() {
-            if changes[i].independent {
-                continue;
-            }
-            for referrer in edges.referrers(&changes[i].name) {
-                for &other in by_name.get(referrer).into_iter().flatten() {
-                    union(&mut parent, at, other);
-                }
-            }
-        }
-        for component in components {
-            let members: Vec<usize> = component
-                .iter()
-                .filter_map(|k| slot.get(k))
-                .copied()
-                .collect();
-            let Some((&first, rest)) = members.split_first() else {
-                continue;
-            };
-            for &other in rest {
-                component_fused[first] = true;
-                component_fused[other] = true;
-                union(&mut parent, first, other);
-            }
-        }
-
-        let mut grouped: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for at in 0..candidates.len() {
-            grouped.entry(find(&mut parent, at)).or_default().push(at);
-        }
-
-        let mut clusters: Vec<Cluster> = grouped
-            .into_values()
-            .map(|slots| {
-                let members: Vec<usize> = slots.iter().map(|&at| candidates[at]).collect();
-                let reason = if members
-                    .iter()
-                    .any(|&i| matches!(changes[i].kind, ChangeKind::Added | ChangeKind::Removed))
-                {
-                    FusionReason::Existence
-                } else if slots.iter().any(|&at| component_fused[at]) {
-                    FusionReason::Component
-                } else if members.iter().all(|&i| changes[i].independent) {
-                    FusionReason::Independent
-                } else {
-                    FusionReason::InterfaceChanged
-                };
-                let mut keys: Vec<DefKey> = members.iter().map(|&i| changes[i].key()).collect();
-                keys.sort();
-                let mut members: Vec<Symbol> = keys.iter().map(|k| k.name.clone()).collect();
-                members.sort();
-                members.dedup();
-                Cluster {
-                    members,
-                    keys,
-                    reason,
-                }
-            })
-            .collect();
-        clusters.sort_by(|a, b| a.keys.cmp(&b.keys));
-
-        Delta {
-            test,
-            changes,
-            clusters,
-            unclassified: 0,
-        }
-    }
-
-    pub fn candidates(&self) -> usize {
-        self.changes.iter().filter(|c| c.is_candidate()).count()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.clusters.is_empty()
-    }
-
-    /// Prefers a candidate over a `Derived` change sharing its name, so the edit is what shows.
-    pub fn change(&self, name: &Symbol) -> Option<&Change> {
-        self.changes
-            .iter()
-            .find(|c| &c.name == name && c.is_candidate())
-            .or_else(|| self.changes.iter().find(|c| &c.name == name))
-    }
-
-    pub fn change_of(&self, key: &DefKey) -> Option<&Change> {
-        self.changes.iter().find(|c| c.key() == *key)
-    }
-
-    /// The definitions a hybrid takes from the post-edit side, given the chosen cluster indices.
-    pub fn flipped_names(&self, flipped: &[usize]) -> Vec<Symbol> {
-        let mut out: Vec<Symbol> = flipped
-            .iter()
-            .filter_map(|&i| self.clusters.get(i))
-            .flat_map(|c| c.members.iter().cloned())
-            .collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// [`Delta::flipped_names`] without the namespace collapse.
-    pub fn flipped_keys(&self, flipped: &[usize]) -> Vec<DefKey> {
-        let mut out: Vec<DefKey> = flipped
-            .iter()
-            .filter_map(|&i| self.clusters.get(i))
-            .flat_map(|c| c.keys.iter().cloned())
-            .collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-}
-
-fn find(parent: &mut [usize], mut x: usize) -> usize {
-    while parent[x] != x {
-        parent[x] = parent[parent[x]];
-        x = parent[x];
-    }
-    x
-}
-
-fn union(parent: &mut [usize], a: usize, b: usize) {
-    let (a, b) = (find(parent, a), find(parent, b));
-    if a != b {
-        parent[a.max(b)] = a.min(b);
-    }
-}
-
 /// The definition set a test was last seen to pass at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Baseline {
@@ -474,13 +104,41 @@ impl Baseline {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Diff {
-    pub delta: Delta,
-    /// Definitions whose `Edited`/`Derived` split could not be decided.
-    pub unclassified: Vec<Symbol>,
-    /// The test's own hash moved and nothing could say whether its body was edited.
-    pub test_unclassified: bool,
+/// What the runtime knows about one definition in a failing test's closure, in either era: the facts
+/// a change set is classified from. Which kind of change they make is the program's to decide.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    pub key: DefKey,
+    /// Its hash when the test last passed, and now.
+    pub before: Option<DefHash>,
+    pub after: Option<DefHash>,
+    /// Its current body hashed as the baseline wrote references; `None` when the rehasher had no
+    /// answer.
+    pub rehashed: Option<DefHash>,
+    /// Whether its published interface is the same on both sides; `None` when nothing could say, or
+    /// when its body did not move on its own.
+    pub stable: Option<bool>,
+    /// Its baseline hash is still somewhere in the current program.
+    pub kept: bool,
+    /// Its baseline hash is one the current program re-normalizes to.
+    pub renamed: bool,
+    /// The members of its recursive component, when it has more than one.
+    pub component: Vec<DefKey>,
+    /// The closure's names that mention it.
+    pub referrers: Vec<Symbol>,
+}
+
+/// One failure's facts: the test's own hashes, and a row for every definition either era's closure
+/// holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeSet {
+    pub test: Symbol,
+    /// The test's hash when it last passed, now, and its current body hashed as the baseline wrote
+    /// references.
+    pub before: DefHash,
+    pub after: Option<DefHash>,
+    pub rehashed: Option<DefHash>,
+    pub rows: Vec<Row>,
 }
 
 pub struct Regression<'a> {
@@ -491,14 +149,12 @@ pub struct Regression<'a> {
     pub hashes: &'a HashOutput,
 }
 
-pub fn diff(regression: &Regression<'_>, classify: &mut dyn Classify, edges: &DepEdges) -> Diff {
-    let key = regression.key;
+pub fn change_set(regression: &Regression<'_>, classify: &mut dyn Classify) -> ChangeSet {
     let current = regression.hashes;
     let baseline = regression.baseline;
 
-    // Both namespaces, separately.
     let mut keys: BTreeSet<DefKey> = baseline.keys().collect();
-    for name in current.closure.get(key).into_iter().flatten() {
+    for name in current.closure.get(regression.key).into_iter().flatten() {
         if current.defs.contains_key(name) {
             keys.insert(DefKey::value(name.clone()));
         }
@@ -506,86 +162,66 @@ pub fn diff(regression: &Regression<'_>, classify: &mut dyn Classify, edges: &De
             keys.insert(DefKey::decl(name.clone()));
         }
     }
-    keys.remove(&DefKey::value(key.clone()));
-    keys.remove(&DefKey::decl(key.clone()));
-
-    // A rename moves a name but no hash, so a vanished name whose hash remains did not go anywhere.
+    let names: BTreeSet<&Symbol> = keys.iter().map(|k| &k.name).collect();
+    let mut referrers: BTreeMap<&Symbol, BTreeSet<Symbol>> = BTreeMap::new();
+    for (from, deps) in &current.deps {
+        if !names.contains(from) {
+            continue;
+        }
+        for to in deps {
+            if names.contains(to) {
+                referrers.entry(to).or_default().insert(from.clone());
+            }
+        }
+    }
     let now: BTreeSet<DefHash> = current
         .defs
         .values()
         .chain(current.decls.values())
         .copied()
         .collect();
-    let then: BTreeSet<DefHash> = baseline.hashes().collect();
-    let renamed_into = classify.baseline_image();
+    let image = classify.baseline_image();
 
-    let mut unclassified = Vec::new();
-    let mut changes = Vec::new();
-    for key in &keys {
-        let before = baseline.hash_of(key);
-        let after = match key.ns {
-            Ns::Value => current.defs.get(&key.name).copied(),
-            Ns::Decl => current.decls.get(&key.name).copied(),
-        };
-        let change = match (before, after) {
-            (Some(before), Some(after)) if before == after => continue,
-            (None, None) => continue,
-            (None, Some(after)) if then.contains(&after) => continue,
-            (Some(before), None) if now.contains(&before) => continue,
-            (Some(before), None) if renamed_into.contains(&before) => continue,
-            (None, Some(after)) => match classify.renormalized(key) {
-                // Renamed, and its hash moved as well because something under it was edited.
-                Some(was) if then.contains(&was) => Change::derived(key.name.clone(), was, after),
-                _ => Change::added(key.name.clone(), after),
-            },
-            (Some(before), None) => Change::removed(key.name.clone(), before),
-            (Some(before), Some(after)) => match classify.renormalized(key) {
-                Some(rehashed) if rehashed == before => {
-                    Change::derived(key.name.clone(), before, after)
+    let rows = keys
+        .iter()
+        .map(|key| {
+            let before = baseline.hash_of(key);
+            let after = match key.ns {
+                Ns::Value => current.defs.get(&key.name).copied(),
+                Ns::Decl => current.decls.get(&key.name).copied(),
+            };
+            let rehashed = classify.renormalized(key);
+            // Comparing interfaces reads the baseline's out of the store, so it is asked only of a
+            // body that moved on its own.
+            let stable = match (before, after) {
+                (Some(was), Some(is)) if was != is && rehashed != Some(was) => {
+                    classify.interface_stable(key, was)
                 }
-                answer => {
-                    if answer.is_none() {
-                        unclassified.push(key.name.clone());
-                    }
-                    let independent = classify.interface_stable(key, before) == Some(true);
-                    Change::edited(key.name.clone(), before, after, independent)
-                }
-            },
-        };
-        changes.push(change.in_namespace(key.ns));
-    }
-
-    let mut components: Vec<Vec<DefKey>> = Vec::new();
-    for change in &changes {
-        if !change.is_candidate() {
-            continue;
-        }
-        let members = classify.component(&change.key());
-        if members.len() > 1 && !components.contains(&members) {
-            components.push(members);
-        }
-    }
-
-    let mut test_unclassified = false;
-    let test = match regression.test_hash {
-        Some(after) if after != baseline.test_hash => match classify.renormalized_test(key) {
-            Some(rehashed) if rehashed == baseline.test_hash => None,
-            Some(_) => Some(Change::edited(key.clone(), baseline.test_hash, after, true)),
-            None => {
-                test_unclassified = true;
-                None
+                _ => None,
+            };
+            Row {
+                key: key.clone(),
+                before,
+                after,
+                rehashed,
+                stable,
+                kept: before.is_some_and(|was| now.contains(&was)),
+                renamed: before.is_some_and(|was| image.contains(&was)),
+                component: classify.component(key),
+                referrers: referrers
+                    .get(&key.name)
+                    .map(|from| from.iter().cloned().collect())
+                    .unwrap_or_default(),
             }
-        },
-        _ => None,
-    };
+        })
+        .collect();
 
-    let mut delta = Delta::with_components(test, changes, edges, &components);
-    delta.unclassified = unclassified.len() + usize::from(test_unclassified);
-
-    Diff {
-        delta,
-        unclassified,
-        test_unclassified,
+    ChangeSet {
+        test: regression.key.clone(),
+        before: baseline.test_hash,
+        after: regression.test_hash,
+        rehashed: classify.renormalized_test(regression.key),
+        rows,
     }
 }
 
@@ -618,9 +254,6 @@ pub enum Skipped {
     NoBodies,
     /// The bodies are there, but this build cannot assemble them into a mixed program.
     NoHybrids,
-    /// The program the run is being reported to does the searching, so the runtime did not: a
-    /// caller that reads the delta and a mixture can run every trial itself.
-    Delegated,
 }
 
 impl Skipped {
@@ -634,7 +267,6 @@ impl Skipped {
             Skipped::NoChanges => "no_changes",
             Skipped::NoBodies => "no_bodies",
             Skipped::NoHybrids => "no_hybrids",
-            Skipped::Delegated => "delegated",
         }
     }
 
@@ -661,9 +293,6 @@ impl Skipped {
             }
             Skipped::NoHybrids => {
                 "this build cannot mix two eras of a definition graph, so the change set could not be narrowed by running it"
-            }
-            Skipped::Delegated => {
-                "the program reading this report decides which change sets to try, so the runtime did not search"
             }
         }
     }
