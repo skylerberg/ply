@@ -1,46 +1,39 @@
-//! The bench, end to end: a tiny generated corpus, the corpus package's own `bench.run`
-//! driving the real `ply`, and the scenarios judged from the report it answers.
+//! The bench, end to end: a tiny generated corpus, the corpus program's `bench` driving the real
+//! `ply`, and the scenarios judged from the report it answers.
 
-use crate::support::{generate, ply};
-use ply_corpus::cmd::run_ply_subcommand;
-use ply_corpus::spec::CorpusSpec;
+use crate::support::{corpus, document, generate};
 use std::path::Path;
 
 fn corpus_at(root: &Path) {
-    let spec = CorpusSpec {
-        seed: 4,
-        modules: 5,
-        defs_per_module: 6,
-        tests: 10,
-        depth: 2,
-        ..CorpusSpec::default()
-    };
-    generate(root, &spec);
+    generate(
+        root,
+        &[
+            "--seed",
+            "4",
+            "--modules",
+            "5",
+            "--defs-per-module",
+            "6",
+            "--tests",
+            "10",
+            "--depth",
+            "2",
+        ],
+    );
 }
 
+/// `bench corpus`, run from the directory above the corpus, as the report it wrote.
 fn bench(root: &Path) -> serde_json::Value {
-    let root = &root.canonicalize().unwrap();
-    let value = run_ply_subcommand(
-        "bench.run",
-        vec![
-            ply_eval::Value::str(root.to_string_lossy()),
-            ply_eval::Value::Int(1),
-        ],
-        root,
-        &ply(),
-    )
-    .expect("the bench runs");
-    let ply_eval::Value::Ctor { name, args } = &value else {
-        panic!("`bench.run` answered {value}, not an `Ok` or an `Err`");
-    };
-    let ply_eval::Value::Str(text) = &args[0] else {
-        panic!("`bench.run`'s answer is not text: {value}");
-    };
-    match name.as_str() {
-        "Ok" => serde_json::from_str(text).expect("the bench's report is JSON"),
-        "Err" => panic!("the bench refused: {text}"),
-        other => panic!("`bench.run` answered `{other}`"),
-    }
+    let out = corpus(
+        root.parent().unwrap(),
+        &["bench", "corpus", "--repeats", "1", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "the bench refused:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    document(&out)
 }
 
 fn scenario<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
@@ -60,6 +53,7 @@ fn the_bench_verdicts_hold_on_a_generated_corpus() {
 
     let report = bench(&root);
     assert_eq!(report["ok"].as_bool(), Some(true), "{report:#}");
+    assert_eq!(report["root"].as_str(), Some("corpus"), "{report:#}");
 
     // The pipeline section is the harness's own phases beside the toolchain's: it must have run, and
     // it must have read the tree it walked.
@@ -128,33 +122,19 @@ fn a_stale_edit_site_is_an_error_rather_than_a_silent_no_op() {
         serde_json::Value::String("fn definitely_not_here() -> Int = 0\n".to_string());
     std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
 
-    let value = run_ply_subcommand(
-        "bench.run",
-        vec![
-            ply_eval::Value::str(root.to_string_lossy()),
-            ply_eval::Value::Int(1),
-        ],
-        &root.canonicalize().unwrap(),
-        &ply(),
-    )
-    .expect("the bench runs");
-    let ply_eval::Value::Ctor { name, args } = &value else {
-        panic!("`bench.run` answered {value}, not an `Err`");
-    };
-    assert_eq!(name.as_str(), "Err", "{value}");
-    let ply_eval::Value::Str(why) = &args[0] else {
-        panic!("the refusal is not text: {value}");
-    };
+    let out = corpus(dir.path(), &["bench", "corpus", "--repeats", "1"]);
+    assert_eq!(out.status.code(), Some(1), "a stale site ran to the end");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        why.contains("occurs 0 times"),
-        "the stale site must say so, not slip by: {why}"
+        stderr.contains("ply-corpus: ") && stderr.contains("occurs 0 times"),
+        "the stale site must say so, not slip by: {stderr}"
     );
 }
 
 /// The in-process half: what a continuation resumption costs, measured by driving the machine the
-/// corpus program itself holds. The property is that each resumption does work — the fixture is the
-/// same computation resumed a varying number of times, so the steps have to climb — and the points
-/// are the counts 0, 1, 2 and 4.
+/// corpus program itself holds, over a fixture whose front end the program ran. The property is
+/// that each resumption does work — the fixture is the same computation resumed a varying number of
+/// times, so the steps have to climb — and the points are the counts 0, 1, 2 and 4.
 #[test]
 fn the_resumption_curve_climbs_with_the_number_of_resumptions() {
     let dir = tempfile::tempdir().unwrap();
@@ -200,5 +180,23 @@ fn the_resumption_curve_climbs_with_the_number_of_resumptions() {
             .unwrap_or(0)
             > 0,
         "{measure:#}"
+    );
+    // Both fixtures were read back and front-ended by the program before the machine held them.
+    for curve in ["resumptions", "throughput"] {
+        let loaded = &measure[curve]["loaded"];
+        assert!(
+            loaded["read_us"].as_i64().is_some_and(|us| us >= 0)
+                && loaded["front_us"].as_i64().is_some_and(|us| us > 0),
+            "`{curve}` carries no timed front end: {measure:#}"
+        );
+    }
+    // And each was taken back out, so the tree the scenarios compile is the one `gen` wrote.
+    assert!(
+        std::fs::read_dir(&root).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("measure-")),
+        "a fixture was left in the corpus"
     );
 }
