@@ -44,9 +44,6 @@ fn main() {
             1
         }
     };
-    if ply_eval::census::enabled() {
-        eprint!("{}", ply_eval::census::report());
-    }
     std::process::exit(code);
 }
 
