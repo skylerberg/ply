@@ -23,7 +23,6 @@ mod derivation_determinism_audit;
 mod derive;
 mod desk_operations;
 mod determinism_audit;
-mod diagnostic_text;
 mod doc;
 mod effect_set_selection;
 mod effect_sets;

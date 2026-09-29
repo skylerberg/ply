@@ -63,10 +63,14 @@ pub fn from_dir(dir: &Path) -> Option<Bundle> {
 /// than under it: a run with a cache of its own still finds the stage an earlier one wrote.
 /// `PLY_C_STAGE` names another root.
 pub fn stage_dir(identity: &str) -> std::path::PathBuf {
+    stage_root().join(identity)
+}
+
+/// The directory every stage is kept under, which `sweep` keeps to its budget.
+pub fn stage_root() -> std::path::PathBuf {
     std::env::var("PLY_C_STAGE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("ply-c-stage"))
-        .join(identity)
 }
 
 impl Bundle {
