@@ -1,17 +1,26 @@
-// The real-code row: the compiler and the CLI themselves as declared corpus members, pinned by
-// digest. Real code is the realism benchmark; the synthetic corpora are for controlled
-// variables. The trees are laid out beside the corpus front door by the binary, from the same
-// embedded sources the toolchain ships, so what is measured here is what was shipped.
+// The real-code row: the compiler and the CLI themselves as corpus members, each pinned by the digest
+// of the sources `ply` reads for it. Real code is the realism benchmark; the synthetic corpora are for
+// controlled variables. The members are the checkout's own trees under the working directory — `real`
+// runs from the repository's root — so the tree `ply` is spawned over is the one the pin was read
+// from.
 
 import spine
+import spine (under)
+import compiler.pkg (check_source)
+import std.bytes (hex_of)
+import std.hash (blake3)
+import std.pkg
 import std.json (Json, Str, Number, Bool, Null, Object, object, array)
 import std.json
+import std.fs (fs)
+import std.fs
 import std.process (process)
+import std.config (config)
 import std.time (time)
-import cli.env (env)
 
-// One member of the row: a tree, its digest, and what the product said about it.
-pub type Member = { name: String, dir: String, digest: String }
+// One member of the row: the tree `ply` is run over, every tree it reads — its own and the packages
+// it depends on by path — and the digest of their sources.
+pub type Member = { name: String, dir: String, trees: List<String>, digest: String }
 
 pub type Measured = {
   ok: Bool,
@@ -26,12 +35,148 @@ pub type Measured = {
   cached: Int,
 }
 
+// --- The members, and what pins them ------------------------------------------------------
+
+// A path under the working directory with its `.` and `..` segments spelled out of it; `None` when
+// it climbs above the directory, which no root reaches.
+pub fn normalized(path: String) -> Option<String> = {
+  let kept = fold(
+    string_split(path, "/"),
+    Some([]),
+    |acc: Option<List<String>>, segment: String|
+      match acc {
+        None -> None,
+        Some(parts) -> if segment == "" || segment == "." { Some(parts) } else if segment == ".." {
+          if len(parts) == 0 { None } else {
+            Some(
+              fold(range(0, len(parts) - 1), [], |out: List<String>, i: Int|
+                match list_at(parts, i) { Some(p) -> push(out, p), None -> out }),
+            )
+          }
+        } else { Some(push(parts, segment)) },
+      },
+  );
+  match kept {
+    None -> None,
+    Some(parts) ->
+      Some(if len(parts) == 0 { "." }
+      else {
+        fold(parts, "", |acc: String, p: String| if acc == "" { p } else { acc ++ "/" ++ p })
+      }),
+  }
+}
+
+// The trees `ply` reads for the package at `dir`: the package itself, then every package its manifest
+// names by path, transitively, each once.
+fn trees_of(
+  dir: String,
+  seen: List<String>,
+) -> Result<List<String>, String> / {fs.read_file[work]} =
+  if fold(seen, false, |found: Bool, s: String| found || s == dir) { Ok(seen) } else {
+    let here = push(seen, dir);
+    match fs.read_file[work](under(dir, "ply.pkg")) {
+      None -> Ok(here),
+      Some(text) -> match check_source(text).manifest {
+        None -> Err("`" ++ under(dir, "ply.pkg") ++ "` does not check as a manifest"),
+        Some(m) ->
+          fold(m.dependencies, Ok(here), |acc: Result<List<String>, String>, d: pkg::Dep|
+            match acc {
+              Err(e) -> Err(e),
+              Ok(found) -> match d.source {
+                pkg::Path(relative) -> match normalized(under(dir, relative)) {
+                  None ->
+                    Err(
+                      "`" ++ dir ++ "` depends on `" ++ relative
+                        ++ "`, which is not under the working directory",
+                    ),
+                  Some(dep) -> trees_of(dep, found),
+                },
+                _ -> Ok(found),
+              },
+            }),
+      },
+    }
+  }
+
+// Every source `ply` reads under `dir`: the `.ply` files and the manifest, past any hidden directory.
+fn sources_under(
+  dir: String,
+  acc: List<String>,
+) -> List<String> / {fs.list_dir[work], fs.kind[work]} =
+  match fs.list_dir[work](dir) {
+    None -> acc,
+    Some(names) ->
+      fold(names, acc, |found: List<String>, name: String|
+        if string_starts_with(name, ".") { found } else {
+          let path = under(dir, name);
+          match fs.kind[work](path) {
+            fs::Dir -> sources_under(path, found),
+            fs::File -> if string_ends_with(name, ".ply") || name == "ply.pkg" { push(found, path) }
+            else { found },
+            _ -> found,
+          }
+        }),
+  }
+
+// The digest a member is pinned by: BLAKE3 over every source's path and text, each closed by a zero
+// byte, in path order, so neither a walk's order nor anything but those bytes can move it.
+pub fn pin_of(files: List<{ path: String, text: Bytes }>) -> String = {
+  let texts = fold(files, map_new(), |acc: Map<String, Bytes>, f: { path: String, text: Bytes }|
+    map_insert(acc, f.path, f.text));
+  let parts = map_fold(texts, [], |acc: List<Bytes>, path: String, text: Bytes|
+    push(push(push(push(acc, bytes_of_string(path)), b"\0"), text), b"\0"));
+  "b3:" ++ hex_of(blake3(bytes_concat_all(parts)))
+}
+
+fn member(name: String, dir: String) -> Result<Member, String> / {fs.read[work]} =
+  match fs.kind[work](dir) {
+    fs::Dir -> match trees_of(dir, []) {
+      Err(e) -> Err(e),
+      Ok(trees) -> {
+        let paths = fold(trees, [], |acc: List<String>, t: String| sources_under(t, acc));
+        let files = fold(
+          paths,
+          Ok([]),
+          |acc: Result<List<{ path: String, text: Bytes }>, String>, p: String|
+            match acc {
+              Err(e) -> Err(e),
+              Ok(read) -> match fs.read_file[work](p) {
+                Some(text) -> Ok(push(read, { path: p, text: text })),
+                None -> Err("`" ++ p ++ "` could not be read"),
+              },
+            },
+        );
+        match files {
+          Err(e) -> Err(e),
+          Ok(read) -> Ok({ name: name, dir: dir, trees: trees, digest: pin_of(read) }),
+        }
+      },
+    },
+    _ ->
+      Err(
+        "`" ++ dir
+          ++ "` is not a tree under the working directory: run `real` from the repository's root",
+      ),
+  }
+
+// The toolchain's own trees: the compiler's modules, and the CLI package with what it depends on.
+pub fn members() -> Result<List<Member>, String> / {fs.read[work]} =
+  match member("compiler", "crates/ply-compiler/ply") {
+    Err(e) -> Err(e),
+    Ok(compiler) -> match member("cli", "crates/ply-cli/ply") {
+      Err(e) -> Err(e),
+      Ok(cli) -> Ok([compiler, cli]),
+    },
+  }
+
+// --- Measuring one --------------------------------------------------------------------------
+
 // `ply check` on a tree: the front end's own numbers, and the wall the user waits.
 pub fn check(
   dir: String,
-) -> Result<Measured, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, time.elapsed_us} = {
+) -> Result<Measured, String> / {process.spawn[ply], config.get[env], time.elapsed_ms} = {
   let started = time.elapsed_ms();
-  let done = spine::ply(["check", dir, "--json", "--color", "never"], dir);
+  let done = spine::ply(["check", ".", "--json", "--color", "never"], dir);
   let wall = time.elapsed_ms() - started;
   match spine::report_json(done) {
     Err(why) -> Err(why),
@@ -57,9 +202,9 @@ pub fn check(
 // `ply test` on a tree: the suite's own verdict, and the wall.
 pub fn tested(
   dir: String,
-) -> Result<Measured, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, time.elapsed_us} = {
+) -> Result<Measured, String> / {process.spawn[ply], config.get[env], time.elapsed_ms} = {
   let started = time.elapsed_ms();
-  let done = spine::ply(["test", dir, "--json", "--color", "never"], dir);
+  let done = spine::ply(["test", ".", "--json", "--color", "never"], dir);
   let wall = time.elapsed_ms() - started;
   match spine::report_json(done) {
     Err(why) -> Err(why),
@@ -81,36 +226,40 @@ pub fn tested(
   }
 }
 
-// The members, in order, each front-ended and (unless told otherwise) tested.
+// The members, in order, each pinned, front-ended and (unless told otherwise) tested.
 pub fn run(
-  compiler_name: String,
-  compiler_dir: String,
-  compiler_digest: String,
-  cli_name: String,
-  cli_dir: String,
-  cli_digest: String,
   tests: Bool,
-) -> Result<String, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, time.elapsed_us} = {
-  let compiler: Member = { name: compiler_name, dir: compiler_dir, digest: compiler_digest };
-  let cli: Member = { name: cli_name, dir: cli_dir, digest: cli_digest };
-  match measure(compiler, tests) {
+) -> Result<spine::Report, String> / {fs.read[work], process.spawn[ply], config.get[env], time.elapsed_ms} =
+  match members() {
     Err(e) -> Err(e),
-    Ok(c) -> match measure(cli, tests) {
-      Err(e) -> Err(e),
-      Ok(l) -> Ok(json::to_string(report_json([compiler, cli], [c, l], tests))),
+    Ok(ms) -> {
+      let measured = fold(
+        ms,
+        Ok([]),
+        |acc: Result<List<(Measured, Measured)>, String>, m: Member|
+          match acc {
+            Err(e) -> Err(e),
+            Ok(done) -> match measure(m, tests) {
+              Err(e) -> Err(e),
+              Ok(pair) -> Ok(push(done, pair)),
+            },
+          },
+      );
+      match measured { Err(e) -> Err(e), Ok(pairs) -> Ok(report_of(ms, pairs, tests)) }
     },
   }
-}
 
 fn measure(
   m: Member,
   tests: Bool,
-) -> Result<(Measured, Measured), String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, time.elapsed_us} =
+) -> Result<(Measured, Measured), String> / {process.spawn[ply], config.get[env], time.elapsed_ms} =
   match check(m.dir) {
     Err(e) -> Err(e),
     Ok(c) -> if tests { match tested(m.dir) { Err(e) -> Err(e), Ok(t) -> Ok((c, t)) } }
     else { Ok((c, { ..c, ok: true })) },
   }
+
+// --- The report -----------------------------------------------------------------------------
 
 // The rows: each member's two verdicts, with the digest pinned beside them.
 fn rows_of(measured: List<(Measured, Measured)>, tests: Bool) -> List<spine::Row> =
@@ -119,21 +268,21 @@ fn rows_of(measured: List<(Measured, Measured)>, tests: Bool) -> List<spine::Row
     let rows = push(acc, {
       name: "check",
       criterion: "the tree front-ends clean",
-      best: report_of(c),
+      best: report_of_one(c),
       verdict: if c.ok { Ok(()) } else { Err("the front end refused the tree it ships") },
     });
     if tests {
       push(rows, {
         name: "test",
         criterion: "the tree's tests all pass",
-        best: report_of(t),
+        best: report_of_one(t),
         verdict: if t.ok && t.failed == 0 { Ok(()) }
         else { Err(int_to_string(t.failed) ++ " of the shipped tests failed") },
       })
     } else { rows }
   })
 
-fn report_of(m: Measured) -> spine::TestReport =
+fn report_of_one(m: Measured) -> spine::TestReport =
   {
     ok: m.ok,
     duration_ms: m.wall_ms,
@@ -148,22 +297,30 @@ fn report_of(m: Measured) -> spine::TestReport =
     write_back_ms: 0,
   }
 
-fn report_json(members: List<Member>, measured: List<(Measured, Measured)>, tests: Bool) -> Json = {
+pub fn report_of(
+  members: List<Member>,
+  measured: List<(Measured, Measured)>,
+  tests: Bool,
+) -> spine::Report = {
   let rows = rows_of(measured, tests);
-  object([
-    {
-      key: "members",
-      value: array(
-        map(zip(members, measured), |pair: (Member, (Measured, Measured))|
-          match pair { (m, md) -> member_json(m, md, tests) }),
-      ),
-    },
-    {
-      key: "ok",
-      value: Bool(fold(rows, true, |acc: Bool, r: spine::Row| acc && spine::passed(r))),
-    },
-    { key: "rendered", value: Str(render(members, measured, rows, tests)) },
-  ])
+  let rendered = render(members, measured, tests);
+  {
+    json: object([
+      {
+        key: "members",
+        value: array(
+          map(zip(members, measured), |pair: (Member, (Measured, Measured))|
+            match pair { (m, md) -> member_json(m, md, tests) }),
+        ),
+      },
+      {
+        key: "ok",
+        value: Bool(fold(rows, true, |acc: Bool, r: spine::Row| acc && spine::passed(r))),
+      },
+      { key: "rendered", value: Str(rendered) },
+    ]),
+    rendered: rendered,
+  }
 }
 
 fn zip(xs: List<Member>, ys: List<(Measured, Measured)>) -> List<(Member, (Measured, Measured))> =
@@ -185,6 +342,7 @@ fn member_json(m: Member, measured: (Measured, Measured), tests: Bool) -> Json =
   object([
     { key: "name", value: Str(m.name) },
     { key: "digest", value: Str(m.digest) },
+    { key: "trees", value: array(map(m.trees, |tree: String| Str(tree))) },
     { key: "modules", value: Number(decimal_of_int(c.modules)) },
     { key: "definitions", value: Number(decimal_of_int(c.definitions)) },
     { key: "tests", value: Number(decimal_of_int(c.tests)) },
@@ -211,12 +369,7 @@ fn member_json(m: Member, measured: (Measured, Measured), tests: Bool) -> Json =
   ])
 }
 
-fn render(
-  members: List<Member>,
-  measured: List<(Measured, Measured)>,
-  rows: List<spine::Row>,
-  tests: Bool,
-) -> String = {
+fn render(members: List<Member>, measured: List<(Measured, Measured)>, tests: Bool) -> String = {
   let lines = map(zip(members, measured), |pair: (Member, (Measured, Measured))|
     match pair { (m, md) -> member_lines(m, md, tests) });
   "the toolchain, pinned by digest\n\n" ++ fold(lines, "", |acc: String, l: String| acc ++ l)
@@ -279,8 +432,27 @@ test "the report pins the digest beside the verdict" {
     failed: 0,
     cached: 4,
   };
-  let member: Member = { name: "compiler", dir: ".", digest: "abc123" };
-  let out = json::to_string(report_json([member], [(m, m)], true));
-  assert(string_contains(out, "abc123"));
+  let member: Member = { name: "compiler", dir: ".", trees: ["."], digest: "b3:abc123" };
+  let report = report_of([member], [(m, m)], true);
+  let out = json::to_string(report.json);
+  assert(string_contains(out, "b3:abc123"));
   assert(string_contains(out, "\"ok\":true"));
+  assert(string_contains(report.rendered, "compiler  b3:abc123"))
+}
+
+test "a pin is over the sources' bytes and paths, whatever order they were read in" {
+  let a = { path: "t/a.ply", text: b"fn a() -> Int = 1\n" };
+  let b = { path: "t/b.ply", text: b"fn b() -> Int = 2\n" };
+  assert_eq(pin_of([a, b]), pin_of([b, a]));
+  assert(pin_of([a, b]) != pin_of([a, { ..b, text: b"fn b() -> Int = 3\n" }]));
+  assert(pin_of([a, b]) != pin_of([a, { ..b, path: "t/c.ply" }]));
+  assert(string_starts_with(pin_of([a]), "b3:"));
+  assert_eq(string_len(pin_of([a])), 67)
+}
+
+test "a dependency's path is read under the working directory, and one above it is not" {
+  assert_eq(normalized("crates/ply-cli/ply/../../ply-test/ply"), Some("crates/ply-test/ply"));
+  assert_eq(normalized("./crates/ply-cli/ply"), Some("crates/ply-cli/ply"));
+  assert_eq(normalized("crates/.."), Some("."));
+  assert_eq(normalized("crates/../.."), None)
 }

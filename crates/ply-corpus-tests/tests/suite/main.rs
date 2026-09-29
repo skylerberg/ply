@@ -3,6 +3,7 @@
 mod constant_memo_service;
 mod corpus_self_tests;
 mod http_cost;
+mod program;
 mod region_isolation_cost;
 mod support;
 mod tier_audit;

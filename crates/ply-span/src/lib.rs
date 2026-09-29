@@ -1,12 +1,13 @@
-//! Every diagnostic renders two ways from one value: lines for a terminal and JSON for an agent.
+//! Spans, sources and diagnostics; `crates/ply-cli/ply/diagnostic.ply` renders them.
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
-/// An interned, cheaply-cloned name.
+/// A cheaply-cloned name.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol(Arc<str>);
 
@@ -81,21 +82,6 @@ impl Span {
 
     pub fn is_dummy(&self) -> bool {
         self.source.0 == u32::MAX
-    }
-
-    /// Smallest span covering both.
-    pub fn to(self, other: Span) -> Span {
-        if self.is_dummy() {
-            return other;
-        }
-        if other.is_dummy() || self.source != other.source {
-            return self;
-        }
-        Span {
-            source: self.source,
-            start: self.start.min(other.start),
-            end: self.end.max(other.end),
-        }
     }
 
     pub fn range(&self) -> std::ops::Range<usize> {
@@ -431,247 +417,6 @@ pub mod codes {
     pub const RUN_ABANDONED: &str = "W0612";
 }
 
-/// Every published code with its meaning in one line, in the order the guide lists them; a code
-/// gets its row when it is registered, which the tree checks enforce.
-pub const MEANINGS: &[(&str, &str)] = &[
-    ("E0001", "unexpected token"),
-    ("E0002", "unterminated string or byte-string literal"),
-    ("E0101", "unknown name (including no `main` to run)"),
-    ("E0102", "unknown type"),
-    ("E0103", "unknown effect"),
-    ("E0104", "unknown operation"),
-    ("E0105", "duplicate definition, or a reserved name"),
-    ("E0106", "unknown module"),
-    ("E0107", "private name"),
-    ("E0108", "ambiguous import"),
-    ("E0109", "module cycle"),
-    ("E0110", "duplicate import"),
-    ("E0111", "file path that cannot name a module"),
-    ("E0112", "ambiguous entry point"),
-    (
-        "E0114",
-        "unknown `effect set`, including a `pub` or qualified one",
-    ),
-    ("E0115", "`effect set` cycle"),
-    (
-        "E0116",
-        "record update base that is not a record of a known type",
-    ),
-    ("E0117", "record update naming a field the base lacks"),
-    (
-        "E0118",
-        "`?` with no written `Result`/`Option` return type to exit through",
-    ),
-    (
-        "E0119",
-        "`?` where its early exit would change what runs or drop an annotation",
-    ),
-    (
-        "E0120",
-        "parameter default on a lambda, operation or handler clause",
-    ),
-    (
-        "E0121",
-        "parameter default that is not a pure, closed value",
-    ),
-    (
-        "E0122",
-        "default on a `pub fn` naming something its module does not export",
-    ),
-    ("E0123", "named argument naming no parameter, or one twice"),
-    ("E0124", "positional argument after a named one"),
-    (
-        "E0125",
-        "parameter left unfilled by a call that used a name",
-    ),
-    ("E0126", "top-level `fn` missing a parameter or return type"),
-    (
-        "E0127",
-        "`reuse fn` with an append that cannot reuse its list",
-    ),
-    (
-        "E0128",
-        "`ply replace` refused: the result would not check or would move another definition",
-    ),
-    (
-        "E0129",
-        "a `ply.pkg` that is not exactly one `fn package` returning `Manifest`",
-    ),
-    (
-        "E0130",
-        "a manifest body that runs rather than being a value",
-    ),
-    (
-        "E0131",
-        "a manifest field that does not decode or fails validation",
-    ),
-    (
-        "E0132",
-        "an import of a package the manifest does not declare as a dependency",
-    ),
-    ("E0133", "two packages granting one module prefix"),
-    ("E0134", "packages depending on one another in a cycle"),
-    (
-        "E0135",
-        "a dependency that is missing, unmanifested or not fetched",
-    ),
-    (
-        "E0136",
-        "a dependency below the version floor its importer asks for",
-    ),
-    (
-        "E0137",
-        "one package reached at two places, where a closure pins one version",
-    ),
-    (
-        "E0138",
-        "a dependency whose sources are not what `ply.lock` pinned",
-    ),
-    (
-        "E0139",
-        "a `ply.lock` that does not decode or is from another format",
-    ),
-    ("E0140", "a git dependency that could not be fetched"),
-    (
-        "E0141",
-        "a registry that could not be asked: unset, malformed or not answering",
-    ),
-    (
-        "E0142",
-        "a registry archive that is not the one the lock pins or the index lists",
-    ),
-    (
-        "E0143",
-        "a registry dependency no published version satisfies",
-    ),
-    ("E0144", "a publish or a yank the registry refused"),
-    ("E0145", "a package or a version no registry takes"),
-    ("E0201", "type mismatch"),
-    ("E0202", "arity mismatch"),
-    ("E0203", "occurs check"),
-    ("E0204", "not a function"),
-    ("E0205", "non-exhaustive match"),
-    ("E0206", "not derivable, including an unordered `Map` key"),
-    ("E0207", "unknown deriver"),
-    ("E0208", "orphan `derive`"),
-    ("E0209", "`/` on `Decimal`"),
-    ("E0210", "operand type nothing determines"),
-    ("E0211", "integer literal out of range for its fixed width"),
-    ("E0301", "unbound row variable"),
-    ("E0302", "effect not permitted by the written row"),
-    ("E0303", "unhandled effect (compiler defect)"),
-    ("E0304", "resource label required"),
-    (
-        "E0305",
-        "`handle` with no clause for an operation its body performs on a handled atom",
-    ),
-    (
-        "E0306",
-        "label instantiation: a call leaves a label unfilled or writes the wrong number of them, \
-         or a label-generic definition is used as a value",
-    ),
-    (
-        "E0307",
-        "mutually recursive definitions binding different label or row parameters",
-    ),
-    (
-        "E0308",
-        "polymorphic recursion: a call inside a recursive group asks for another row or type \
-         parameter than the group was checked with",
-    ),
-    ("E0412", "nondeterministic effect in a deterministic test"),
-    ("E0413", "`Task` escapes its region"),
-    ("E0414", "deadlock, or spent step budget"),
-    (
-        "E0415",
-        "replay did not reproduce the schedule (Ply's fault)",
-    ),
-    ("E0416", "nested `simulate`"),
-    ("E0417", "effect in a spec, guard or law body"),
-    ("E0418", "`forall` binder type that cannot be quantified"),
-    ("E0419", "obligation refuted by a counterexample"),
-    ("E0420", "vacuous obligation: the guard admits nothing"),
-    ("E0421", "host registration for something undeclared"),
-    ("E0422", "two host registrations for one atom"),
-    (
-        "E0423",
-        "host handler determinism disagrees with the declaration",
-    ),
-    (
-        "E0424",
-        "operation reached the host boundary with nothing bound",
-    ),
-    (
-        "E0425",
-        "host operation inside a `simulate` region, or in a test the search re-runs",
-    ),
-    (
-        "E0426",
-        "continuation resumed twice across an at-most-once host operation",
-    ),
-    (
-        "E0427",
-        "host handler answered an atom outside the entry point's footprint",
-    ),
-    ("E0428", "`blocking` host handler answered inline"),
-    ("E0429", "`net.listen_tls` named a credential the run lacks"),
-    ("E0430", "`--tls` credential that does not load"),
-    (
-        "E0439",
-        "`Secret` passed to a host operation not allowed one",
-    ),
-    ("E0440", "configuration source unreadable"),
-    ("E0441", "required configuration key missing"),
-    ("E0442", "configuration value of the wrong shape"),
-    ("E0443", "artifact does not verify"),
-    ("E0444", "artifact built under another version"),
-    ("E0445", "`trace.exit` of a span not open on this task"),
-    ("E0446", "value outlives its region"),
-    ("E0448", "definition the compiled tier cannot compile"),
-    ("E0449", "region handle reaching a runtime boundary"),
-    ("E0450", "compiled backend cannot be attached"),
-    ("E0451", "`fs` label with no root bound"),
-    ("E0452", "path leaves its root"),
-    ("E0453", "read over the bound"),
-    ("E0454", "`--fs` root that is not a directory"),
-    ("E0455", "the program asked to exit with a code"),
-    ("E0456", "`process.spawn` label with no executable bound"),
-    ("E0457", "`--exec` path that cannot be executed"),
-    ("E0458", "captured output over the bound"),
-    ("E0459", "`--allow` family the program does not declare"),
-    ("E0501", "assertion failed"),
-    (
-        "E0502",
-        "runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit",
-    ),
-    ("E0503", "spent its step budget without finishing"),
-    ("E0505", "Ply broke one of its own invariants"),
-    ("W0601", "cache unreadable"),
-    ("W0602", "cache corrupt"),
-    ("W0603", "cache from another version"),
-    ("W0604", "obligation undecided at every tier"),
-    (
-        "W0605",
-        "standard library changed since the cache was written",
-    ),
-    (
-        "W0607",
-        "supplied configuration key the schema does not declare",
-    ),
-    ("W0608", "drain deadline expired with requests in flight"),
-    ("W0609", "spans still open when an entry point ended"),
-    ("W0610", "reference cycle, never freed"),
-    (
-        "W0611",
-        "definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps it quiet",
-    ),
-    ("W0612", "run abandoned at its wall clock; nothing recorded"),
-];
-
-pub fn meaning(code: &str) -> Option<&'static str> {
-    MEANINGS.iter().find(|(c, _)| *c == code).map(|(_, m)| *m)
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,
@@ -739,20 +484,64 @@ impl Diagnostic {
             .or_else(|| self.labels.first())
             .map(|l| l.span)
     }
+
+    /// For a reader that will not hold `sources`: each label they place becomes a note.
+    pub fn placed(self, sources: &SourceMap) -> Diagnostic {
+        let notes: Vec<String> = self
+            .labels
+            .iter()
+            .filter_map(|l| {
+                let file = sources.containing(l.span)?;
+                let (line, col) = file.line_col(l.span.start);
+                let at = format!("at {}:{line}:{col}", file.path.display());
+                Some(if l.message.is_empty() {
+                    at
+                } else {
+                    format!("{at}: {}", l.message)
+                })
+            })
+            .collect();
+        notes.into_iter().fold(self, Diagnostic::note)
+    }
 }
 
+/// With no source to point into: the heading, then a line per note and per fix.
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.code, self.message)
+        let titled = match self.severity {
+            Severity::Error => "Error",
+            Severity::Warning => "Warning",
+            Severity::Note => "Note",
+        };
+        write!(f, "{titled}[{}]: {}", self.code, self.message)?;
+        for note in &self.notes {
+            write!(f, "\n  = {note}")?;
+        }
+        for fix in &self.fixes {
+            write!(f, "\n  = fix: {}", fix.title)?;
+        }
+        Ok(())
     }
 }
 
 impl std::error::Error for Diagnostic {}
 
-pub mod frames;
-pub mod render;
+/// A code read at run time as a [`Diagnostic`]'s `&'static str`, leaked once per distinct code.
+pub fn intern_code(code: &str) -> &'static str {
+    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut pool = POOL
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = pool.get(code) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(code.to_owned().into_boxed_str());
+    pool.insert(leaked);
+    leaked
+}
 
-pub type Result<T> = std::result::Result<T, Vec<Diagnostic>>;
+pub mod frames;
 
 #[cfg(test)]
 mod tests {
@@ -770,224 +559,15 @@ mod tests {
     }
 
     #[test]
-    fn span_to_covers_both_and_ignores_dummy() {
-        let s = SourceId(0);
-        let a = Span::new(s, 5, 10);
-        let b = Span::new(s, 20, 25);
-        assert_eq!(a.to(b), Span::new(s, 5, 25));
-        assert_eq!(Span::DUMMY.to(b), b);
-        assert_eq!(a.to(Span::DUMMY), a);
-    }
-
-    /// Tooling matches on codes, so a number is never reused or renumbered.
-    #[test]
-    fn every_registered_code_has_its_published_number() {
-        let registry = [
-            ("UNEXPECTED_TOKEN", codes::UNEXPECTED_TOKEN, "E0001"),
-            ("UNTERMINATED_STRING", codes::UNTERMINATED_STRING, "E0002"),
-            ("UNKNOWN_NAME", codes::UNKNOWN_NAME, "E0101"),
-            ("UNKNOWN_TYPE", codes::UNKNOWN_TYPE, "E0102"),
-            ("UNKNOWN_EFFECT", codes::UNKNOWN_EFFECT, "E0103"),
-            ("UNKNOWN_OPERATION", codes::UNKNOWN_OPERATION, "E0104"),
-            ("DUPLICATE_DEFINITION", codes::DUPLICATE_DEFINITION, "E0105"),
-            ("UNKNOWN_MODULE", codes::UNKNOWN_MODULE, "E0106"),
-            ("PRIVATE_NAME", codes::PRIVATE_NAME, "E0107"),
-            ("AMBIGUOUS_IMPORT", codes::AMBIGUOUS_IMPORT, "E0108"),
-            ("MODULE_CYCLE", codes::MODULE_CYCLE, "E0109"),
-            ("DUPLICATE_IMPORT", codes::DUPLICATE_IMPORT, "E0110"),
-            ("INVALID_MODULE_PATH", codes::INVALID_MODULE_PATH, "E0111"),
-            (
-                "AMBIGUOUS_ENTRY_POINT",
-                codes::AMBIGUOUS_ENTRY_POINT,
-                "E0112",
-            ),
-            ("UNKNOWN_EFFECT_SET", codes::UNKNOWN_EFFECT_SET, "E0114"),
-            ("EFFECT_SET_CYCLE", codes::EFFECT_SET_CYCLE, "E0115"),
-            ("RECORD_UPDATE_SHAPE", codes::RECORD_UPDATE_SHAPE, "E0116"),
-            ("RECORD_UPDATE_FIELD", codes::RECORD_UPDATE_FIELD, "E0117"),
-            ("TRY_SCOPE", codes::TRY_SCOPE, "E0118"),
-            ("TRY_POSITION", codes::TRY_POSITION, "E0119"),
-            ("DEFAULT_NOT_ALLOWED", codes::DEFAULT_NOT_ALLOWED, "E0120"),
-            ("DEFAULT_NOT_PURE", codes::DEFAULT_NOT_PURE, "E0121"),
-            ("DEFAULT_PRIVATE_NAME", codes::DEFAULT_PRIVATE_NAME, "E0122"),
-            (
-                "UNKNOWN_ARGUMENT_NAME",
-                codes::UNKNOWN_ARGUMENT_NAME,
-                "E0123",
-            ),
-            ("ARGUMENT_ORDER", codes::ARGUMENT_ORDER, "E0124"),
-            ("MISSING_ARGUMENT", codes::MISSING_ARGUMENT, "E0125"),
-            ("MISSING_SIGNATURE", codes::MISSING_SIGNATURE, "E0126"),
-            ("REUSE_BROKEN", codes::REUSE_BROKEN, "E0127"),
-            ("REPLACEMENT_REFUSED", codes::REPLACEMENT_REFUSED, "E0128"),
-            ("MANIFEST_SHAPE", codes::MANIFEST_SHAPE, "E0129"),
-            ("MANIFEST_NOT_LITERAL", codes::MANIFEST_NOT_LITERAL, "E0130"),
-            ("MANIFEST_FIELD", codes::MANIFEST_FIELD, "E0131"),
-            (
-                "DEPENDENCY_NOT_DECLARED",
-                codes::DEPENDENCY_NOT_DECLARED,
-                "E0132",
-            ),
-            ("PREFIX_COLLISION", codes::PREFIX_COLLISION, "E0133"),
-            ("DEPENDENCY_CYCLE", codes::DEPENDENCY_CYCLE, "E0134"),
-            ("DEPENDENCY_UNUSABLE", codes::DEPENDENCY_UNUSABLE, "E0135"),
-            ("DEPENDENCY_VERSION", codes::DEPENDENCY_VERSION, "E0136"),
-            ("DEPENDENCY_DIAMOND", codes::DEPENDENCY_DIAMOND, "E0137"),
-            ("LOCK_MISMATCH", codes::LOCK_MISMATCH, "E0138"),
-            ("LOCK_UNREADABLE", codes::LOCK_UNREADABLE, "E0139"),
-            ("DEPENDENCY_FETCH", codes::DEPENDENCY_FETCH, "E0140"),
-            ("REGISTRY_UNASKED", codes::REGISTRY_UNASKED, "E0141"),
-            ("REGISTRY_ARCHIVE", codes::REGISTRY_ARCHIVE, "E0142"),
-            ("REGISTRY_UNSATISFIED", codes::REGISTRY_UNSATISFIED, "E0143"),
-            ("REGISTRY_REFUSED", codes::REGISTRY_REFUSED, "E0144"),
-            ("REGISTRY_UNTAKEABLE", codes::REGISTRY_UNTAKEABLE, "E0145"),
-            ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
-            ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
-            ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),
-            ("NOT_A_FUNCTION", codes::NOT_A_FUNCTION, "E0204"),
-            ("NON_EXHAUSTIVE_MATCH", codes::NON_EXHAUSTIVE_MATCH, "E0205"),
-            ("NOT_DERIVABLE", codes::NOT_DERIVABLE, "E0206"),
-            ("UNKNOWN_DERIVER", codes::UNKNOWN_DERIVER, "E0207"),
-            ("ORPHAN_DERIVE", codes::ORPHAN_DERIVE, "E0208"),
-            ("DECIMAL_DIVISION", codes::DECIMAL_DIVISION, "E0209"),
-            ("NUMERIC_UNDETERMINED", codes::NUMERIC_UNDETERMINED, "E0210"),
-            ("LITERAL_OUT_OF_RANGE", codes::LITERAL_OUT_OF_RANGE, "E0211"),
-            ("UNBOUND_ROW_VAR", codes::UNBOUND_ROW_VAR, "E0301"),
-            ("EFFECT_NOT_PERMITTED", codes::EFFECT_NOT_PERMITTED, "E0302"),
-            ("UNHANDLED_EFFECT", codes::UNHANDLED_EFFECT, "E0303"),
-            ("RESOURCE_REQUIRED", codes::RESOURCE_REQUIRED, "E0304"),
-            (
-                "HANDLER_CLAUSE_MISSING",
-                codes::HANDLER_CLAUSE_MISSING,
-                "E0305",
-            ),
-            ("LABEL_INSTANTIATION", codes::LABEL_INSTANTIATION, "E0306"),
-            ("LABEL_GROUP_BINDERS", codes::LABEL_GROUP_BINDERS, "E0307"),
-            (
-                "POLYMORPHIC_RECURSION",
-                codes::POLYMORPHIC_RECURSION,
-                "E0308",
-            ),
-            ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
-            ("TASK_ESCAPES_SCOPE", codes::TASK_ESCAPES_SCOPE, "E0413"),
-            ("DEADLOCK", codes::DEADLOCK, "E0414"),
-            (
-                "SIMULATION_DIVERGENCE",
-                codes::SIMULATION_DIVERGENCE,
-                "E0415",
-            ),
-            ("NESTED_SIMULATION", codes::NESTED_SIMULATION, "E0416"),
-            ("EFFECT_IN_SPEC", codes::EFFECT_IN_SPEC, "E0417"),
-            ("UNQUANTIFIABLE_TYPE", codes::UNQUANTIFIABLE_TYPE, "E0418"),
-            ("OBLIGATION_REFUTED", codes::OBLIGATION_REFUTED, "E0419"),
-            ("VACUOUS_OBLIGATION", codes::VACUOUS_OBLIGATION, "E0420"),
-            (
-                "HOST_OPERATION_UNKNOWN",
-                codes::HOST_OPERATION_UNKNOWN,
-                "E0421",
-            ),
-            (
-                "HOST_HANDLER_CONFLICT",
-                codes::HOST_HANDLER_CONFLICT,
-                "E0422",
-            ),
-            (
-                "HOST_DETERMINISM_MISMATCH",
-                codes::HOST_DETERMINISM_MISMATCH,
-                "E0423",
-            ),
-            ("HERMETIC_BOUNDARY", codes::HERMETIC_BOUNDARY, "E0424"),
-            ("HOST_IN_SIMULATION", codes::HOST_IN_SIMULATION, "E0425"),
-            (
-                "HOST_CONTINUATION_RESUMED",
-                codes::HOST_CONTINUATION_RESUMED,
-                "E0426",
-            ),
-            (
-                "HOST_FOOTPRINT_ESCAPE",
-                codes::HOST_FOOTPRINT_ESCAPE,
-                "E0427",
-            ),
-            ("HOST_BLOCKING_ANSWER", codes::HOST_BLOCKING_ANSWER, "E0428"),
-            (
-                "TLS_CREDENTIAL_UNKNOWN",
-                codes::TLS_CREDENTIAL_UNKNOWN,
-                "E0429",
-            ),
-            (
-                "TLS_CREDENTIAL_INVALID",
-                codes::TLS_CREDENTIAL_INVALID,
-                "E0430",
-            ),
-            ("SECRET_TO_HOST", codes::SECRET_TO_HOST, "E0439"),
-            ("CONFIG_UNAVAILABLE", codes::CONFIG_UNAVAILABLE, "E0440"),
-            ("CONFIG_MISSING", codes::CONFIG_MISSING, "E0441"),
-            ("CONFIG_INVALID", codes::CONFIG_INVALID, "E0442"),
-            ("ARTIFACT_INVALID", codes::ARTIFACT_INVALID, "E0443"),
-            ("ARTIFACT_VERSION", codes::ARTIFACT_VERSION, "E0444"),
-            ("SPAN_UNBALANCED", codes::SPAN_UNBALANCED, "E0445"),
-            ("REGION_ESCAPE", codes::REGION_ESCAPE, "E0446"),
-            ("DEFINITION_REFUSED", codes::DEFINITION_REFUSED, "E0448"),
-            (
-                "REGION_ESCAPE_AT_BOUNDARY",
-                codes::REGION_ESCAPE_AT_BOUNDARY,
-                "E0449",
-            ),
-            ("BACKEND_UNAVAILABLE", codes::BACKEND_UNAVAILABLE, "E0450"),
-            ("FS_ROOT_UNBOUND", codes::FS_ROOT_UNBOUND, "E0451"),
-            ("FS_PATH_ESCAPES_ROOT", codes::FS_PATH_ESCAPES_ROOT, "E0452"),
-            ("FS_FILE_TOO_LARGE", codes::FS_FILE_TOO_LARGE, "E0453"),
-            ("FS_ROOT_INVALID", codes::FS_ROOT_INVALID, "E0454"),
-            ("PROCESS_EXIT", codes::PROCESS_EXIT, "E0455"),
-            (
-                "CAPABILITY_UNDECLARED",
-                codes::CAPABILITY_UNDECLARED,
-                "E0459",
-            ),
-            ("PROCESS_EXEC_UNBOUND", codes::PROCESS_EXEC_UNBOUND, "E0456"),
-            ("PROCESS_EXEC_INVALID", codes::PROCESS_EXEC_INVALID, "E0457"),
-            (
-                "PROCESS_OUTPUT_TOO_LARGE",
-                codes::PROCESS_OUTPUT_TOO_LARGE,
-                "E0458",
-            ),
-            ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
-            ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
-            ("STEP_BUDGET", codes::STEP_BUDGET, "E0503"),
-            ("INTERNAL_ERROR", codes::INTERNAL_ERROR, "E0505"),
-            ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
-            ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),
-            (
-                "CACHE_VERSION_CHANGED",
-                codes::CACHE_VERSION_CHANGED,
-                "W0603",
-            ),
-            (
-                "OBLIGATION_NOT_DISCHARGED",
-                codes::OBLIGATION_NOT_DISCHARGED,
-                "W0604",
-            ),
-            ("STDLIB_CHANGED", codes::STDLIB_CHANGED, "W0605"),
-            ("CONFIG_UNDECLARED", codes::CONFIG_UNDECLARED, "W0607"),
-            ("DRAIN_INCOMPLETE", codes::DRAIN_INCOMPLETE, "W0608"),
-            ("SPAN_ABANDONED", codes::SPAN_ABANDONED, "W0609"),
-            ("REFERENCE_CYCLE", codes::REFERENCE_CYCLE, "W0610"),
-            ("UNUSED_DEFINITION", codes::UNUSED_DEFINITION, "W0611"),
-            ("RUN_ABANDONED", codes::RUN_ABANDONED, "W0612"),
-        ];
-
-        for (name, code, expected) in registry {
-            assert_eq!(code, expected, "`{name}` moved to a different number");
+    fn a_span_is_bounded_by_its_texts_length_alone() {
+        let mut sm = SourceMap::new();
+        let id = sm.add("t.ply", "fn f() = \"é\"\n");
+        for outside in [Span::new(id, 21, 26), Span::new(id, 5, 2)] {
+            assert!(sm.containing(outside).is_none());
+            assert_eq!(sm.snippet(outside), "");
         }
-
-        let mut numbers: Vec<&str> = registry.iter().map(|(_, code, _)| *code).collect();
-        numbers.sort_unstable();
-        let before = numbers.len();
-        numbers.dedup();
-        assert_eq!(
-            before,
-            numbers.len(),
-            "two constants share one number: {numbers:?}"
-        );
+        let halved = Span::new(id, 11, 12);
+        assert!(sm.containing(halved).is_some());
+        assert_eq!(sm.snippet(halved), "\u{fffd}");
     }
 }

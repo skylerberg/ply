@@ -1,7 +1,6 @@
-//! A synthetic but realistic Ply project, at whatever scale a benchmark needs, and a harness that
-//! says which compiler phase the time went to.
+//! The benchmark harnesses the corpus program (`crates/ply-corpus/ply`) still hands to Rust: the
+//! transitional executor's subcommands, each run from the plan the program writes.
 
-pub mod cmd;
 pub mod discharge;
 pub mod measure;
 pub mod payload;
@@ -12,14 +11,11 @@ pub mod regions;
 pub mod rng;
 pub mod serve;
 pub mod simulate;
-pub mod spec;
 pub mod w3;
 pub mod w4;
 pub mod w5;
 pub mod w6;
 pub mod w6_run;
-
-pub use spec::CorpusSpec;
 
 use anyhow::Result;
 use ply_store::Store;
@@ -40,8 +36,8 @@ pub fn checked_front_with_std(
     )])?;
     let mut sources = ply_span::SourceMap::new();
     for (name, text) in &answered.modules {
-        let path = if ply_std::is_reserved(name) {
-            ply_std::pseudo_path(&ply_ty::ModuleName::from_dotted(name))
+        let path = if ply_std::is_std(name) {
+            ply_std::pseudo_path(name)
         } else {
             path.to_path_buf()
         };

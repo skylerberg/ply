@@ -1,5 +1,4 @@
-//! What this binary ships: the `ply` program built from `crates/ply-cli/ply`, and the shelf the
-//! runtime's `ply_machine::shelf` holds for it laid out where the program can read it.
+//! What this binary ships: the `ply` program built from `crates/ply-cli/ply`.
 
 use ply_codegen::c::{bundle, producer};
 use ply_span::{Diagnostic, Span, codes};
@@ -13,10 +12,6 @@ pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ply-cli/bootstrap
 pub const ARTIFACT: &str = "ply.plyx";
 
 pub const DIGEST: &str = "ply.digest";
-
-/// The marker that says a shelf directory is whole; landed last, so a reader never sees half of
-/// one. Not a `.ply` file, so the program's own listing passes over it.
-const SHELF_MARKER: &str = "SHELF.ok";
 
 // --- The `ply` program -------------------------------------------------------
 
@@ -50,8 +45,7 @@ pub fn program_sources() -> Vec<(String, String)> {
 }
 
 /// Lays the shipped closure out under `stage`, keyed by the repository's paths, so a package's
-/// `Path(..)` dependency resolves the way it does in a checkout. A caller that ships more than this
-/// closure — the corpus, which also carries its own package — calls this first and adds itself.
+/// `Path(..)` dependency resolves the way it does in a checkout.
 pub fn lay_out(stage: &Path) -> std::io::Result<()> {
     for (dir, name, text) in PROGRAM_PACKAGES {
         let package = stage.join(dir);
@@ -78,43 +72,6 @@ pub fn stage() -> PathBuf {
     bundle::stage_dir(&format!("cli-{}", identity()))
 }
 
-/// Where the modules this binary ships are laid out for the program to read, one flat
-/// `<dotted name>.ply` each. A program cannot read the binary it runs in, and the front end it
-/// runs pulls in the shipped modules a project imports, so they have to be somewhere it can reach.
-pub fn shelf_dir() -> PathBuf {
-    stage().join("shelf")
-}
-
-/// The shelf directory, laid out once per identity. Each file lands by a rename and the marker
-/// lands last, so a run that finds the marker finds every module whole.
-pub fn shelf() -> Result<PathBuf, Diagnostic> {
-    let dir = shelf_dir();
-    if dir.join(SHELF_MARKER).exists() {
-        return Ok(dir);
-    }
-    match lay_out_shelf(&dir) {
-        Ok(()) => Ok(dir),
-        Err(e) => Err(unbuilt(format!(
-            "the shipped modules could not be placed in `{}`: {e}",
-            dir.display()
-        ))),
-    }
-}
-
-fn lay_out_shelf(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    for (name, text) in ply_machine::shelf::sources() {
-        land_in(dir, &format!("{name}.ply"), text.as_bytes())?;
-    }
-    land_in(dir, SHELF_MARKER, identity().as_bytes())
-}
-
-fn land_in(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, dir.join(name))
-}
-
 /// The digest the committed program was built from, when one is committed at all.
 pub fn committed_digest() -> Option<String> {
     std::fs::read_to_string(Path::new(DIR).join(DIGEST))
@@ -137,6 +94,7 @@ pub fn program() -> Result<Vec<u8>, Diagnostic> {
     }
     let staged = stage().join(ARTIFACT);
     if let Ok(bytes) = std::fs::read(&staged) {
+        ply_codegen::c::sweep::used(&stage());
         return Ok(bytes);
     }
     let bytes = build()?;
@@ -161,13 +119,10 @@ pub fn build() -> Result<Vec<u8>, Diagnostic> {
 
 fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
     let loaded = ply_machine::load::load(dir).map_err(|err| {
-        // Rendered where it happened: this program is only ever built from sources in the tree,
-        // so a refusal is a defect someone has to find, not a user's mistake to summarise.
+        // With where it happened: this program is only ever built from sources in the tree, so a
+        // refusal is a defect someone has to find, not a user's mistake to summarise.
         unbuilt(match err.diagnostics.first() {
-            Some(d) => format!(
-                "it does not check:\n{}",
-                ply_span::render::to_terminal(d, &err.sources, false)
-            ),
+            Some(d) => format!("it does not check:\n{}", d.clone().placed(&err.sources)),
             None => "it does not check, and nothing said why".to_string(),
         })
     })?;

@@ -13,9 +13,8 @@ edits="${1:-5}"
 sizes=("10,25,125" "40,25,500" "160,25,2000")
 load1() { uptime | sed 's/.*load averages*: *//' | awk -F'[ ,]+' '{print $1}'; }
 
-cargo build --release --manifest-path "$root/Cargo.toml" -p ply-corpus -p ply-cli
+cargo build --release --manifest-path "$root/Cargo.toml" -p ply-launcher --bin ply
 "$root/.github/binary-is-current.sh" || { echo "STALE -- rebuild before measuring" >&2; exit 2; }
-corpus="$root/target/release/ply-corpus"
 ply="$root/target/release/ply"
 
 work="$(mktemp -d)"
@@ -25,10 +24,11 @@ for size in "${sizes[@]}"; do
   IFS=, read -r m d t <<<"$size"
   # Two of each size: one whose tests are all deterministic, and one with the generator's default
   # fraction of nondeterministic tests — which run on every invocation whatever the cache says.
-  "$corpus" gen --out "$work/det_$m" --seed 1 --modules "$m" --defs-per-module "$d" --tests "$t" \
-    --depth 6 --nondet-fraction 0.0 >/dev/null
-  "$corpus" gen --out "$work/nondet_$m" --seed 1 --modules "$m" --defs-per-module "$d" --tests "$t" \
-    --depth 6 >/dev/null
+  # The corpus writes under its working directory, so each is named from inside `$work`.
+  (cd "$work" && "$root/benches/corpus.sh" gen --out "det_$m" --seed 1 --modules "$m" \
+    --defs-per-module "$d" --tests "$t" --depth 6 --nondet-fraction 0.0 >/dev/null)
+  (cd "$work" && "$root/benches/corpus.sh" gen --out "nondet_$m" --seed 1 --modules "$m" \
+    --defs-per-module "$d" --tests "$t" --depth 6 >/dev/null)
 done
 
 for _ in $(seq 60); do

@@ -1,52 +1,97 @@
-//! The real-code row, end to end: the compiler and the CLI, laid out from the embedded sources,
-//! front-ended by the product itself, with the digests pinned beside the verdicts.
+//! The real-code row, end to end: the checkout's compiler and CLI, front-ended by the product
+//! itself, with the digest each member is pinned by beside the verdicts.
+
+use crate::support::{corpus, document, repo};
+use std::path::Path;
+
+/// The pin, taken here the way the program says it takes it: BLAKE3 over every `.ply` file and
+/// manifest under the trees, outside hidden directories, as its path under the repository, a zero
+/// byte, its text and a zero byte, in path order.
+fn pin_of(trees: &[&str]) -> String {
+    fn walk(root: &Path, dir: &Path, into: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                walk(root, &entry.path(), into);
+            } else if kind.is_file() && (name.ends_with(".ply") || name == "ply.pkg") {
+                let relative = entry.path().strip_prefix(root).unwrap().to_owned();
+                into.push((
+                    relative.to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+    let root = repo();
+    let mut files = Vec::new();
+    for tree in trees {
+        walk(&root, &root.join(tree), &mut files);
+    }
+    files.sort();
+    let mut h = blake3::Hasher::new();
+    for (path, text) in &files {
+        h.update(path.as_bytes());
+        h.update(&[0]);
+        h.update(text);
+        h.update(&[0]);
+    }
+    format!("b3:{}", h.finalize().to_hex())
+}
 
 #[test]
-fn the_toolchain_trees_frontend_clean_at_their_digests() {
-    let members = ply_corpus::cmd::real_members().expect("the real trees are laid out");
-    let [(cname, cdir, cdigest), (lname, ldir, ldigest)] = members;
-    let stage = cdir.parent().unwrap().parent().unwrap().to_path_buf();
-    let value = ply_corpus::cmd::run_ply_subcommand(
-        "real.run",
-        vec![
-            ply_eval::Value::str(cname),
-            ply_eval::Value::str(cdir.to_string_lossy()),
-            ply_eval::Value::str(cdigest.clone()),
-            ply_eval::Value::str(lname),
-            ply_eval::Value::str(ldir.to_string_lossy()),
-            ply_eval::Value::str(ldigest.clone()),
-            ply_eval::Value::Bool(false),
-        ],
-        &stage,
-        &ply(),
-    )
-    .expect("the real-code row runs");
-    let ply_eval::Value::Ctor { name, args } = &value else {
-        panic!("`real.run` answered {value}, not an `Ok` or an `Err`");
-    };
-    let ply_eval::Value::Str(text) = &args[0] else {
-        panic!("`real.run`'s answer is not text: {value}");
-    };
-    assert_eq!(name.as_str(), "Ok", "the real-code row refused: {text}");
-    let report: serde_json::Value =
-        serde_json::from_str(text).expect("the real-code report is JSON");
+fn the_toolchain_trees_frontend_clean_at_their_pins() {
+    let out = corpus(&repo(), &["real", "--no-tests", "--json"]);
+    assert!(
+        out.status.success(),
+        "the real-code row refused:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = document(&out);
     assert_eq!(report["ok"].as_bool(), Some(true), "{report:#}");
     let members = report["members"].as_array().expect("members is an array");
     assert_eq!(members.len(), 2);
+
     let compiler = &members[0];
     assert_eq!(compiler["name"].as_str(), Some("compiler"));
-    assert_eq!(compiler["digest"].as_str(), Some(cdigest.as_str()));
+    assert_eq!(
+        compiler["digest"].as_str(),
+        Some(pin_of(&["crates/ply-compiler/ply"]).as_str()),
+        "{compiler:#}"
+    );
     assert_eq!(compiler["check"]["ok"].as_bool(), Some(true));
     assert!(
         compiler["definitions"].as_i64().unwrap_or(0) > 1000,
         "the compiler is the real one: {compiler:#}"
     );
+
+    // The CLI reads the packages its manifest names by path, so its pin covers them too.
     let cli = &members[1];
     assert_eq!(cli["name"].as_str(), Some("cli"));
-    assert_eq!(cli["digest"].as_str(), Some(ldigest.as_str()));
+    assert_eq!(
+        cli["trees"],
+        serde_json::json!([
+            "crates/ply-cli/ply",
+            "crates/ply-test/ply",
+            "crates/ply-prove/ply"
+        ]),
+        "{cli:#}"
+    );
+    assert_eq!(
+        cli["digest"].as_str(),
+        Some(
+            pin_of(&[
+                "crates/ply-cli/ply",
+                "crates/ply-test/ply",
+                "crates/ply-prove/ply"
+            ])
+            .as_str()
+        ),
+        "{cli:#}"
+    );
     assert_eq!(cli["check"]["ok"].as_bool(), Some(true));
-}
-
-fn ply() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ply")
 }
