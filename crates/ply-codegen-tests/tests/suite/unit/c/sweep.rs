@@ -1,4 +1,4 @@
-use ply_codegen::c::sweep::{STAMP, claim, sweep};
+use ply_codegen::c::sweep::{FRONTS, STAMP, USED, claim, sweep, sweep_stages};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -128,4 +128,100 @@ fn a_budget_of_zero_bytes_is_no_bound_rather_than_an_empty_cache() {
         None,
         "`PLY_C_CACHE_MAX=0` is the unbounded spelling"
     );
+}
+
+fn set(path: &Path, when: SystemTime) {
+    let f = if path.is_dir() {
+        std::fs::File::open(path).unwrap()
+    } else {
+        std::fs::File::options().write(true).open(path).unwrap()
+    };
+    f.set_times(std::fs::FileTimes::new().set_modified(when))
+        .unwrap();
+}
+
+/// A stage directory as a run leaves it: `size` bytes of unit, last used `ago` before `now`.
+fn stage(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(dir.join("shelf")).unwrap();
+    std::fs::write(dir.join("shelf").join("unit.c.gz"), vec![b'x'; size]).unwrap();
+    std::fs::write(dir.join(USED), b"").unwrap();
+    for path in [
+        dir.join("shelf").join("unit.c.gz"),
+        dir.join("shelf"),
+        dir.join(USED),
+    ] {
+        set(&path, now - ago);
+    }
+    set(&dir, now - ago);
+}
+
+/// A cached front of `size` bytes, last used `ago` before `now`.
+fn front(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
+    let dir = root.join(FRONTS);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(name), vec![b'x'; size]).unwrap();
+    set(&dir.join(name), now - ago);
+}
+
+const HOUR: Duration = Duration::from_secs(3600);
+
+#[test]
+fn a_stage_directory_inside_its_budget_is_left_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let now = SystemTime::now();
+    stage(root.path(), "stage-a", 100, now, 5 * HOUR);
+    front(root.path(), "front.a", 100, now, 5 * HOUR);
+    assert_eq!(sweep_stages(root.path(), 1_000, now), 0);
+    assert!(root.path().join("stage-a").exists());
+    assert!(root.path().join(FRONTS).join("front.a").exists());
+}
+
+/// A stage goes whole and a front goes on its own, least recently used first, and whatever a run
+/// used within the hour stays however far over budget the rest is.
+#[test]
+fn stages_and_fronts_go_least_recently_used_first() {
+    let root = tempfile::tempdir().unwrap();
+    let now = SystemTime::now();
+    front(root.path(), "front.oldest", 100, now, 5 * HOUR);
+    stage(root.path(), "stage-old", 100, now, 3 * HOUR);
+    stage(root.path(), "stage-mid", 100, now, 2 * HOUR);
+    stage(root.path(), "stage-fresh", 100, now, HOUR / 6);
+    front(root.path(), "front.fresh", 100, now, HOUR / 2);
+    assert_eq!(sweep_stages(root.path(), 250, now), 300);
+    let left: Vec<bool> = ["stage-old", "stage-mid", "stage-fresh"]
+        .iter()
+        .map(|n| root.path().join(n).exists())
+        .collect();
+    assert_eq!(left, vec![false, false, true]);
+    assert!(!root.path().join(FRONTS).join("front.oldest").exists());
+    assert!(root.path().join(FRONTS).join("front.fresh").exists());
+}
+
+/// A stage is written once and used by every run after, so its use, not its writing, is its age.
+#[test]
+fn a_stage_used_lately_outlives_one_written_later() {
+    let root = tempfile::tempdir().unwrap();
+    let now = SystemTime::now();
+    stage(root.path(), "written-early", 100, now, 9 * HOUR);
+    stage(root.path(), "written-late", 100, now, 3 * HOUR);
+    set(
+        &root.path().join("written-early").join(USED),
+        now - 2 * HOUR,
+    );
+    sweep_stages(root.path(), 100, now);
+    assert!(root.path().join("written-early").exists());
+    assert!(!root.path().join("written-late").exists());
+}
+
+#[test]
+fn a_front_being_written_and_a_file_beside_the_stages_are_never_swept() {
+    let root = tempfile::tempdir().unwrap();
+    let now = SystemTime::now();
+    front(root.path(), "front.1234.tmp", 100, now, 5 * HOUR);
+    std::fs::write(root.path().join(STAMP), vec![b'x'; 100]).unwrap();
+    set(&root.path().join(STAMP), now - 5 * HOUR);
+    sweep_stages(root.path(), 0, now);
+    assert!(root.path().join(FRONTS).join("front.1234.tmp").exists());
+    assert!(root.path().join(STAMP).exists());
 }

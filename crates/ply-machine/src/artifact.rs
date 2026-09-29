@@ -987,7 +987,7 @@ fn front_cache(artifact: &Artifact) -> PathBuf {
     hasher.update(ply_codegen::c::producer::identity().as_bytes());
     hasher.update(&[0]);
     hasher.update(&ply_std::digest());
-    ply_codegen::c::bundle::stage_dir("artifact-fronts")
+    ply_codegen::c::bundle::stage_dir(ply_codegen::c::sweep::FRONTS)
         .join(format!("front.{}", &hasher.finalize().to_hex()[..16]))
 }
 
@@ -1034,7 +1034,10 @@ fn cached_front(
     let kept_ids = ids.clone();
     let kept_sources = sources.clone();
     match place_and_read(&modules, dump, ids, sources) {
-        Ok(front) => Some(front),
+        Ok(front) => {
+            ply_codegen::c::sweep::used(at);
+            Some(front)
+        }
         Err(_) => {
             *ids = kept_ids;
             *sources = kept_sources;
@@ -1274,15 +1277,9 @@ fn unfaithful(message: String) -> Diagnostic {
 }
 
 /// A refusal over text no caller holds. The spans point into the closure printed a moment ago, so
-/// this is the only place they mean anything; rendered here, the reason survives as a note.
+/// this is the only place they mean anything; each label that places survives as a note.
 fn over_printed(diags: Vec<Diagnostic>, sources: &SourceMap) -> Vec<Diagnostic> {
-    diags
-        .into_iter()
-        .map(|d| {
-            let shown = ply_span::render::to_terminal(&d, sources, false);
-            d.note(shown.trim_end().to_string())
-        })
-        .collect()
+    diags.into_iter().map(|d| d.placed(sources)).collect()
 }
 
 fn first_of(diags: &[Diagnostic]) -> String {

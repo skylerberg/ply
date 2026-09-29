@@ -32,6 +32,7 @@ const SHELF_MARKER: &str = "SHELF.ok";
 pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
     let dir = ply_codegen::c::bundle::stage_dir(&program.stage).join("shelf");
     if dir.join(SHELF_MARKER).exists() {
+        ply_codegen::c::sweep::used(&ply_codegen::c::bundle::stage_dir(&program.stage));
         return Ok(dir);
     }
     lay_out(&dir, &program.shelf).map_err(|e| {

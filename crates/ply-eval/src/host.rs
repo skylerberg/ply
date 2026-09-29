@@ -379,7 +379,7 @@ fn resolve(
 
 /// Reserved std effects match by program-wide name; others by their declared name.
 fn registration_names(registered: &Symbol, program_wide: &Symbol, declared: &Symbol) -> bool {
-    if ply_std::is_reserved(registered.as_str()) {
+    if ply_std::is_std(registered.as_str()) {
         registered == program_wide
     } else {
         registered == declared

@@ -1119,7 +1119,7 @@ fn the_emitters_program_is_the_one_the_front_end_pulls() {
     let mut ours: Vec<&str> = program
         .iter()
         .map(|(name, _)| name.as_str())
-        .filter(|name| ply_std::is_reserved(name))
+        .filter(|name| ply_std::is_std(name))
         .collect();
     ours.sort_unstable();
     let mut theirs: Vec<&str> = pulled.modules.iter().map(String::as_str).collect();

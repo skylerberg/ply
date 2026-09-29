@@ -7,15 +7,15 @@
 // is a walk that should not happen twice, a slow read is I/O, and a slow front end is the compiler.
 //
 // The walk is in a fixed order — a directory listing's own order would move the measurement between
-// runs — and the paths are relative to the corpus directory, which is the root the entry was given.
+// runs — and the paths are relative to the `work` root the corpus directory is under.
 
-import spine (exit_zero, ply, report_json, test_report)
+import spine (exit_zero, ply, report_json, test_report, under)
 import std.fs (Dir, fs)
 import std.fs
 import std.json (Json, Str, Number, Bool, Null, Object, array, object)
 import std.json
 import std.process (process)
-import cli.env (env)
+import std.config (config)
 import std.time (time)
 
 // What this harness spent on the tree, in microseconds: a benchmark's unit, not a user's.
@@ -32,38 +32,31 @@ pub type Stages = {
 }
 
 /// Every `.ply` file under `dir`, relative to it, ascending: the order the run's own reading takes.
-pub fn discover(dir: String) -> Result<List<String>, String> / {fs.list_dir[cwd], fs.kind[cwd]} =
-  match fs.list_dir[cwd](dir) {
+pub fn discover(dir: String) -> Result<List<String>, String> / {fs.list_dir[work], fs.kind[work]} =
+  match fs.list_dir[work](dir) {
     None -> Err("`" ++ dir ++ "` cannot be listed"),
     Some(names) ->
       Ok({
         let entries = sorted(names);
         let here = filter(entries, |n: String| string_ends_with(n, ".ply"));
-        let dirs = filter(entries, |n: String| is_dir(joined(dir, n)));
-        // Every path is a name under the root: `"."` is the root itself, so it is not spelled into
-        // the paths the reads then use.
+        let dirs = filter(entries, |n: String| is_dir(under(dir, n)));
         fold(dirs, here, |acc: List<String>, n: String|
-          match discover(joined(dir, n)) {
-            Ok(deeper) -> appended(acc, map(deeper, |path: String| joined(n, path))),
+          match discover(under(dir, n)) {
+            Ok(deeper) -> appended(acc, map(deeper, |path: String| under(n, path))),
             Err(_) -> acc,
           })
       }),
   }
 
-fn is_dir(path: String) -> Bool / {fs.kind[cwd]} = fs.kind[cwd](path) == Dir
-
-// A name under a directory, without a `./` for the root: the fs effect wants paths under the root,
-// and a read is only found for the path the walk reported.
-fn joined(dir: String, name: String) -> String = if dir == "." { name } else { dir ++ "/" ++ name }
+fn is_dir(path: String) -> Bool / {fs.kind[work]} = fs.kind[work](path) == Dir
 
 /// The harness's own phases: walking the tree, then reading what it found. A `Symlink` or a
 /// `Missing` entry is neither read nor walked, so the numbers are about files that are there.
-///
-/// The walk starts at the root itself, spelled `"."`: the fs effect is confined to the directory the
-/// entry was given and refuses an absolute path, even one that names that directory.
-pub fn harness() -> Result<Harness, String> / {fs.list_dir[cwd], fs.kind[cwd], fs.read_file[cwd], time.elapsed_us} = {
+pub fn harness(
+  dir: String,
+) -> Result<Harness, String> / {fs.list_dir[work], fs.kind[work], fs.read_file[work], time.elapsed_us} = {
   let started = time.elapsed_us();
-  match discover(".") {
+  match discover(dir) {
     Err(why) -> Err(why),
     Ok(files) -> {
       let discover_us = time.elapsed_us() - started;
@@ -72,9 +65,12 @@ pub fn harness() -> Result<Harness, String> / {fs.list_dir[cwd], fs.kind[cwd], f
         // A file the walk found and the read cannot open is a failure, not a zero: the number this
         // reports is what the toolchain then has to read again.
         let unread = fold(files, 0, |bad: Int, path: String|
-          match fs.read_file[cwd](path) { Some(_) -> bad, None -> bad + 1 });
+          match fs.read_file[work](under(dir, path)) { Some(_) -> bad, None -> bad + 1 });
         let bytes = fold(files, 0, |acc: Int, path: String|
-          match fs.read_file[cwd](path) { Some(text) -> acc + bytes_len(text), None -> acc });
+          match fs.read_file[work](under(dir, path)) {
+            Some(text) -> acc + bytes_len(text),
+            None -> acc,
+          });
         if unread > 0 {
           Err(
             int_to_string(unread) ++ " of " ++ int_to_string(len(files))
@@ -93,23 +89,15 @@ pub fn harness() -> Result<Harness, String> / {fs.list_dir[cwd], fs.kind[cwd], f
   }
 }
 
-/// One compile, as a whole: the harness's own phases, and the toolchain's, from the same run. `cold`
-/// would ask for `--no-cache`, which is not available here — the cache it would use is a scratch
-/// directory outside the root this entry's fs is confined to — so the cold/warm split is the bench's
-/// own scenarios' business and this reports the run as it comes.
+/// One compile, as a whole: the harness's own phases, and the toolchain's, from the same run.
 pub fn stages(
   dir: String,
-  cold: Bool,
-) -> Result<Stages, String> / {fs.list_dir[cwd], fs.kind[cwd], fs.read_file[cwd], time.elapsed_us, time.elapsed_ms, process.spawn[ply], env.var[sys]} =
-  match harness() {
+) -> Result<Stages, String> / {fs.list_dir[work], fs.kind[work], fs.read_file[work], time.elapsed_us, time.elapsed_ms, process.spawn[ply], config.get[env]} =
+  match harness(dir) {
     Err(why) -> Err("the harness could not walk the corpus: " ++ why),
     Ok(measured) -> {
       let started = time.elapsed_ms();
-      let finished = ply(
-        appended(["test", dir, "--json", "--color", "never"], if cold { ["--no-cache"] }
-        else { [] }),
-        dir,
-      );
+      let finished = ply(["test", ".", "--json", "--color", "never"], dir);
       let wall_ms = time.elapsed_ms() - started;
       if !exit_zero(finished) { Err("the compile failed: " ++ string_of_bytes_lossy(finished.err)) } else {
         match report_json(finished) {
@@ -160,8 +148,8 @@ pub fn stages_json(s: Stages) -> Json =
 /// phases the product reports.
 pub fn pipeline_json(
   dir: String,
-) -> Json / {fs.list_dir[cwd], fs.kind[cwd], fs.read_file[cwd], time.elapsed_us, time.elapsed_ms, process.spawn[ply], env.var[sys]} =
-  match stages(dir, false) {
+) -> Json / {fs.list_dir[work], fs.kind[work], fs.read_file[work], time.elapsed_us, time.elapsed_ms, process.spawn[ply], config.get[env]} =
+  match stages(dir) {
     Err(why) -> object([{ key: "ok", value: Bool(false) }, { key: "why", value: Str(why) }]),
     Ok(one) ->
       object([{ key: "ok", value: Bool(true) }, { key: "stages", value: stages_json(one) }]),
