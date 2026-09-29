@@ -1,4 +1,4 @@
-//! `seam_census.rs` stays a binary of its own: `ply_eval::census` is a process-wide static.
+//! A binary of its own: it installs a `#[global_allocator]`.
 
 mod counting;
 
