@@ -383,11 +383,11 @@ pub mod codes {
     pub const FS_ROOT_INVALID: &str = "E0454";
     /// `process.exit` was performed: the machine unwinds and `ply run` exits with the code.
     pub const PROCESS_EXIT: &str = "E0455";
-    /// `process.spawn` named a resource label the run bound no executable to.
+    /// `process.spawn` or `process.start` named a resource label the run bound no executable to.
     pub const PROCESS_EXEC_UNBOUND: &str = "E0456";
     /// An `--exec NAME=PATH` that is missing, is not a file, or cannot be executed.
     pub const PROCESS_EXEC_INVALID: &str = "E0457";
-    /// A spawned process wrote more to a stream than one captured value holds.
+    /// A child wrote more to a stream than the host holds of one, whole or as unread lines.
     pub const PROCESS_OUTPUT_TOO_LARGE: &str = "E0458";
     /// A `--allow` family the program being run does not declare: nothing would reach it.
     pub const CAPABILITY_UNDECLARED: &str = "E0459";
@@ -611,7 +611,10 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0453", "read over the bound"),
     ("E0454", "`--fs` root that is not a directory"),
     ("E0455", "the program asked to exit with a code"),
-    ("E0456", "`process.spawn` label with no executable bound"),
+    (
+        "E0456",
+        "`process.spawn` or `process.start` label with no executable bound",
+    ),
     ("E0457", "`--exec` path that cannot be executed"),
     ("E0458", "captured output over the bound"),
     ("E0459", "`--allow` family the program does not declare"),
