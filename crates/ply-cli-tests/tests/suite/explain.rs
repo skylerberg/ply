@@ -16,19 +16,24 @@ fn a_code_is_explained_in_one_line_and_as_json() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["code"], "W0611");
     assert_eq!(v["severity"], "warning");
-    assert_eq!(v["meaning"], ply_span::meaning("W0611").unwrap());
+    assert_eq!(
+        v["meaning"],
+        "definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps \
+         it quiet"
+    );
     assert_eq!(v["exit_code"], 0);
 }
 
 #[test]
 fn the_label_instantiation_code_is_explained_like_any_other() {
+    const MEANING: &str = "label instantiation: a call leaves a label unfilled or writes the wrong \
+                           number of them, or a label-generic definition is used as a value";
     let dir = scratch();
     let out = ply(dir.path()).args(["explain", "E0306"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "E0306 label instantiation: a call leaves a label unfilled or writes the wrong number \
-         of them, or a label-generic definition is used as a value\n"
+        format!("E0306 {MEANING}\n")
     );
 
     let out = ply(dir.path())
@@ -38,7 +43,7 @@ fn the_label_instantiation_code_is_explained_like_any_other() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["code"], "E0306");
     assert_eq!(v["severity"], "error");
-    assert_eq!(v["meaning"], ply_span::meaning("E0306").unwrap());
+    assert_eq!(v["meaning"], MEANING);
 }
 
 #[test]
@@ -54,6 +59,22 @@ fn a_code_nothing_raises_exits_two_and_points_at_the_list() {
         .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     let codes = v["codes"].as_array().unwrap();
-    assert_eq!(codes.len(), ply_span::MEANINGS.len());
     assert_eq!(codes[0]["code"], "E0001");
+
+    let out = ply(dir.path()).args(["explain", "--all"]).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        codes.len(),
+        lines.len(),
+        "`--all` and `--all --json` list different tables"
+    );
+    for (row, line) in codes.iter().zip(lines) {
+        let listed = format!(
+            "{} {}",
+            row["code"].as_str().unwrap(),
+            row["meaning"].as_str().unwrap()
+        );
+        assert_eq!(listed, line);
+    }
 }

@@ -2,7 +2,7 @@
 
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::Mode;
-use ply_ty::{EffectAtom, Resource, Type};
+use ply_ty::{EffectAtom, Resource};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -466,13 +466,6 @@ pub enum SimTy {
 }
 
 impl SimTy {
-    pub fn ply(self) -> Type {
-        match self {
-            SimTy::Int => Type::int(),
-            SimTy::Unit => Type::unit(),
-        }
-    }
-
     pub fn holds(self, value: &Value) -> bool {
         matches!(
             (self, value),
