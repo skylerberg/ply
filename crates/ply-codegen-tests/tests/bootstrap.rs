@@ -15,9 +15,8 @@ fn emitter_source() -> (&'static Source, String) {
     let identity = producer::digest_of(&modules);
     // The compiler's modules are the program's own; the std ones it imports pull as the
     // built-in package rather than inline.
-    let (own, _std): (Vec<_>, Vec<_>) = modules
-        .iter()
-        .partition(|(name, _)| !ply_std::is_reserved(name));
+    let (own, _std): (Vec<_>, Vec<_>) =
+        modules.iter().partition(|(name, _)| !ply_std::is_std(name));
     let own: Vec<_> = own.into_iter().cloned().collect();
     // No recipe is installed: each round's emitter is handed over in `emit_with`, and a handover wins over an installation.
     let answered = producer::checked_front_with_std(&own).expect("the emitter checks");

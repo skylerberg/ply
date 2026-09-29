@@ -1,84 +1,12 @@
-//! Diagnostics as length-framed text, written and read by one codec so both sides of a
-//! differential encode one way.
+//! Diagnostics as length-framed text, as `crates/ply-compiler/ply/diag.ply` writes them.
 
-use crate::{Diagnostic, Edit, Fix, Label, Severity, SourceId, Span, codes};
+use crate::{Diagnostic, Edit, Fix, Label, Severity, SourceId, Span, intern_code};
 
 /// The module index of a span outside every module: [`Span::DUMMY`]'s source.
 const NO_MODULE: u32 = u32::MAX;
 
-/// Each label's module is written as its position in `sources`.
-pub fn write_diagnostics(diags: &[Diagnostic], sources: &[SourceId]) -> Result<String, String> {
-    let mut out = String::new();
-    for (index, d) in diags.iter().enumerate() {
-        let mut payload = String::new();
-        field(&mut payload, "code", d.code);
-        field(&mut payload, "severity", severity_name(d.severity, index)?);
-        field(&mut payload, "message", &d.message);
-        for l in &d.labels {
-            let module = module_index(l.span, sources, index)?;
-            field(
-                &mut payload,
-                "label",
-                &format!(
-                    "{module} {} {} {}\n{}",
-                    l.span.start,
-                    l.span.end,
-                    u8::from(l.primary),
-                    l.message
-                ),
-            );
-        }
-        for n in &d.notes {
-            field(&mut payload, "note", n);
-        }
-        for f in &d.fixes {
-            field(&mut payload, "fix", &f.title);
-            for e in &f.edits {
-                let module = module_index(e.span, sources, index)?;
-                field(
-                    &mut payload,
-                    "edit",
-                    &format!("{module} {} {}\n{}", e.span.start, e.span.end, e.text),
-                );
-            }
-        }
-        out.push_str(&format!("diag {index} {}\n{payload}", payload.len()));
-    }
-    Ok(out)
-}
-
-fn field(out: &mut String, key: &str, text: &str) {
-    out.push_str(&format!("{key} {}\n{text}", text.len()));
-}
-
-fn severity_name(severity: Severity, index: usize) -> Result<&'static str, String> {
-    match severity {
-        Severity::Error => Ok("error"),
-        Severity::Warning => Ok("warning"),
-        Severity::Note => Err(format!(
-            "diagnostic {index} is a note, which the frame protocol has no severity for"
-        )),
-    }
-}
-
-fn module_index(span: Span, sources: &[SourceId], index: usize) -> Result<u32, String> {
-    if span.is_dummy() {
-        return Ok(NO_MODULE);
-    }
-    sources
-        .iter()
-        .position(|s| *s == span.source)
-        .map(|i| i as u32)
-        .ok_or_else(|| {
-            format!(
-                "diagnostic {index} labels source {}, which is not among the {} sources handed over",
-                span.source.0,
-                sources.len()
-            )
-        })
-}
-
-/// Each label's module is read as an index into `sources`; unknown or truncated input is an error.
+/// Each label's module is read as an index into `sources`; an unknown frame or field, or truncated
+/// input, is an error, and any code is taken as written.
 pub fn read_diagnostics(dump: &str, sources: &[SourceId]) -> Result<Vec<Diagnostic>, String> {
     let mut frames = Cursor::new(dump.as_bytes(), "frame");
     let mut out = Vec::new();
@@ -142,13 +70,14 @@ fn read_one(payload: &[u8], sources: &[SourceId], index: usize) -> Result<Diagno
         "warning" => Severity::Warning,
         other => return Err(format!("diagnostic {index}: unknown severity `{other}`")),
     };
-    let mut d = by_code(code, required(message, "message", index)?)
-        .ok_or_else(|| format!("diagnostic {index}: unknown code `{code}`"))?;
-    d.severity = severity;
-    d.labels = labels;
-    d.notes = notes;
-    d.fixes = fixes;
-    Ok(d)
+    Ok(Diagnostic {
+        severity,
+        code: intern_code(code),
+        message: required(message, "message", index)?.to_string(),
+        labels,
+        notes,
+        fixes,
+    })
 }
 
 /// `<module> <start> <end>\n<text>`.
@@ -284,69 +213,4 @@ impl<'a> Cursor<'a> {
         self.at += nl + 1 + length;
         Ok((words, body))
     }
-}
-
-/// The codes the self-hosted front end raises; any other code is refused rather than guessed.
-fn by_code(code: &str, message: &str) -> Option<Diagnostic> {
-    Some(match code {
-        "E0001" => Diagnostic::error(codes::UNEXPECTED_TOKEN, message),
-        "E0002" => Diagnostic::error(codes::UNTERMINATED_STRING, message),
-        "E0101" => Diagnostic::error(codes::UNKNOWN_NAME, message),
-        "E0102" => Diagnostic::error(codes::UNKNOWN_TYPE, message),
-        "E0103" => Diagnostic::error(codes::UNKNOWN_EFFECT, message),
-        "E0104" => Diagnostic::error(codes::UNKNOWN_OPERATION, message),
-        "E0105" => Diagnostic::error(codes::DUPLICATE_DEFINITION, message),
-        "E0106" => Diagnostic::error(codes::UNKNOWN_MODULE, message),
-        "E0107" => Diagnostic::error(codes::PRIVATE_NAME, message),
-        "E0108" => Diagnostic::error(codes::AMBIGUOUS_IMPORT, message),
-        "E0109" => Diagnostic::error(codes::MODULE_CYCLE, message),
-        "E0110" => Diagnostic::error(codes::DUPLICATE_IMPORT, message),
-        "E0114" => Diagnostic::error(codes::UNKNOWN_EFFECT_SET, message),
-        "E0115" => Diagnostic::error(codes::EFFECT_SET_CYCLE, message),
-        "E0116" => Diagnostic::error(codes::RECORD_UPDATE_SHAPE, message),
-        "E0117" => Diagnostic::error(codes::RECORD_UPDATE_FIELD, message),
-        "E0118" => Diagnostic::error(codes::TRY_SCOPE, message),
-        "E0119" => Diagnostic::error(codes::TRY_POSITION, message),
-        "E0120" => Diagnostic::error(codes::DEFAULT_NOT_ALLOWED, message),
-        "E0121" => Diagnostic::error(codes::DEFAULT_NOT_PURE, message),
-        "E0122" => Diagnostic::error(codes::DEFAULT_PRIVATE_NAME, message),
-        "E0123" => Diagnostic::error(codes::UNKNOWN_ARGUMENT_NAME, message),
-        "E0124" => Diagnostic::error(codes::ARGUMENT_ORDER, message),
-        "E0125" => Diagnostic::error(codes::MISSING_ARGUMENT, message),
-        "E0126" => Diagnostic::error(codes::MISSING_SIGNATURE, message),
-        "E0129" => Diagnostic::error(codes::MANIFEST_SHAPE, message),
-        "E0130" => Diagnostic::error(codes::MANIFEST_NOT_LITERAL, message),
-        "E0131" => Diagnostic::error(codes::MANIFEST_FIELD, message),
-        "E0132" => Diagnostic::error(codes::DEPENDENCY_NOT_DECLARED, message),
-        "E0133" => Diagnostic::error(codes::PREFIX_COLLISION, message),
-        "E0134" => Diagnostic::error(codes::DEPENDENCY_CYCLE, message),
-        "E0135" => Diagnostic::error(codes::DEPENDENCY_UNUSABLE, message),
-        "E0201" => Diagnostic::error(codes::TYPE_MISMATCH, message),
-        "E0202" => Diagnostic::error(codes::ARITY_MISMATCH, message),
-        "E0203" => Diagnostic::error(codes::OCCURS_CHECK, message),
-        "E0204" => Diagnostic::error(codes::NOT_A_FUNCTION, message),
-        "E0205" => Diagnostic::error(codes::NON_EXHAUSTIVE_MATCH, message),
-        "E0206" => Diagnostic::error(codes::NOT_DERIVABLE, message),
-        "E0207" => Diagnostic::error(codes::UNKNOWN_DERIVER, message),
-        "E0208" => Diagnostic::error(codes::ORPHAN_DERIVE, message),
-        "E0209" => Diagnostic::error(codes::DECIMAL_DIVISION, message),
-        "E0210" => Diagnostic::error(codes::NUMERIC_UNDETERMINED, message),
-        "E0211" => Diagnostic::error(codes::LITERAL_OUT_OF_RANGE, message),
-        "E0301" => Diagnostic::error(codes::UNBOUND_ROW_VAR, message),
-        "E0302" => Diagnostic::error(codes::EFFECT_NOT_PERMITTED, message),
-        "E0304" => Diagnostic::error(codes::RESOURCE_REQUIRED, message),
-        "E0305" => Diagnostic::error(codes::HANDLER_CLAUSE_MISSING, message),
-        "E0306" => Diagnostic::error(codes::LABEL_INSTANTIATION, message),
-        "E0307" => Diagnostic::error(codes::LABEL_GROUP_BINDERS, message),
-        "E0308" => Diagnostic::error(codes::POLYMORPHIC_RECURSION, message),
-        "E0412" => Diagnostic::error(codes::NONDET_IN_DET_TEST, message),
-        "E0413" => Diagnostic::error(codes::TASK_ESCAPES_SCOPE, message),
-        "E0416" => Diagnostic::error(codes::NESTED_SIMULATION, message),
-        "E0417" => Diagnostic::error(codes::EFFECT_IN_SPEC, message),
-        "E0418" => Diagnostic::error(codes::UNQUANTIFIABLE_TYPE, message),
-        "E0446" => Diagnostic::error(codes::REGION_ESCAPE, message),
-        "E0505" => Diagnostic::error(codes::INTERNAL_ERROR, message),
-        "W0611" => Diagnostic::warning(codes::UNUSED_DEFINITION, message),
-        _ => return None,
-    })
 }

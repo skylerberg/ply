@@ -1,7 +1,6 @@
 use ply_codegen::Unit;
 use ply_eval::{Machine, Value};
 use ply_span::{SourceId, Span, Symbol};
-use ply_ty::ModuleName;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -46,7 +45,7 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
         .map(|(name, text)| (name.clone(), text.clone()))
         .collect::<Vec<_>>();
     for name in &pulled.modules {
-        let text = ply_std::source(&ModuleName::from_dotted(name)).expect("it ships");
+        let text = ply_std::source(name).expect("it ships");
         modules.push((name.clone(), text.to_string()));
     }
     let ids: Vec<_> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();

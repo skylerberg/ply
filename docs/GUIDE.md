@@ -2288,7 +2288,7 @@ through `ply fmt` into the range `show` reports.
 
 `E` is an error; `W` is a warning and never a fault in your program.
 `ply explain CODE` prints a code's line from this table, and `--all` the whole
-table, from the registry the compiler raises from.
+table.
 
 Every command writes a diagnostic the same way, in one shape:
 
