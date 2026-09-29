@@ -1,8 +1,9 @@
-//! One binary. A test that reads process-global state (`#[global_allocator]`, `ply_eval::census`) needs a binary of its own.
+//! One binary. A test that reads process-global state (`#[global_allocator]`) needs a binary of its own.
 
 mod constant_memo_service;
 mod corpus_self_tests;
 mod http_cost;
+mod program;
 mod region_isolation_cost;
 mod support;
 mod tier_audit;

@@ -7,21 +7,25 @@
 // and the accounting the runtime keeps. Every measured value is pinned with `observe`, so a tier
 // that can see through the work still has to do it.
 //
+// The fixture's front end is this module's own: it reads the fixture back and the checkout's
+// standard library the way `ply` reads a program and its shelf, runs the compiler's front end over
+// them, and hands the machine what that answered — so the two phases before a load are timed here.
+//
 // The fixtures are Ply, and they *are* the artifact: `multi_shot` resumes a handler's continuation
 // 0, 1, 2 and 4 times, so the difference between two rows is what one resumption costs.
 
 import cli.machine
-import cli.machine (Accounting, Options, Value, VInt, VUnit, default_options, machine)
-import cli.builder (builder)
-import cli.env (env)
-import cli.paths (resolve)
-import cli.program (Timed, front_of, timed_uncached)
-import compiler.resolve (Diag)
+import cli.machine (Accounting, Value, VInt, machine, default_options)
+import cli.cache (SourceFile)
+import cli.program (Front, pseudo_path)
+import compiler.front (Analysed, Pulled, Refused, analyse_pulling_std_with, dump_of, dump_text)
+import compiler.resolve (Diag, Source)
+import spine (under)
 import std.fs (fs)
 import std.fs
 import std.json (Json, Str, Number, Bool, Null, Object, object, array)
 import std.json
-import std.process (process)
+import std.list (sort)
 import std.time (time)
 
 // One point on a curve: the count that names it, and what one call cost. Wall time and the runtime's
@@ -37,13 +41,17 @@ pub type Point = {
   marginal_steps: Int,
 }
 
-pub type Curve = { label: String, unit: String, points: List<Point> }
+/// What the fixture cost before the machine held it: reading its sources, then the front end.
+pub type Loaded = { read_us: Int, front_us: Int }
+
+pub type Curve = { label: String, unit: String, loaded: Loaded, points: List<Point> }
 
 // How much work one round does. A round has to be long enough that the clock sees it: two hundred
 // calls of a few microseconds each is a millisecond, which even a microsecond clock resolves.
 fn calls_per_round() -> Int = 200
 
-fn rounds() -> Int = 8
+// Where the standard library the fixtures are checked against lives under the `repo` root.
+fn std_tree() -> String = "crates/ply-std/ply"
 
 // --- The fixtures -----------------------------------------------------------
 
@@ -77,27 +85,140 @@ pub fn resumption_source() -> String =
 pub fn work_source() -> String =
   "pub fn work(n: Int) -> Int =\n" ++ "  fold(range(0, 200), 0, |acc, x| acc + x * n)\n"
 
+// --- The front end, over sources read here ----------------------------------------
+
+/// Every `.ply` under `dir` of the `repo` root as the shipped module it is: `std.json` is
+/// `json.ply`, `std.http.server` is `http/server.ply`.
+fn shelved(dir: String, module: String, acc: List<Source>) -> List<Source> / {fs.read[repo]} =
+  match fs.list_dir[repo](dir) {
+    None -> acc,
+    Some(names) ->
+      fold(sort(names), acc, |found: List<Source>, name: String| {
+        let path = under(dir, name);
+        match fs.kind[repo](path) {
+          fs::Dir -> shelved(path, module ++ "." ++ name, found),
+          fs::File -> if !string_ends_with(name, ".ply") { found } else {
+            match fs.read_file[repo](path) {
+              None -> found,
+              Some(src) ->
+                push(found, {
+                  name: bytes_of_string(
+                    module ++ "." ++ string_slice(name, 0, string_len(name) - 4),
+                  ),
+                  src: src,
+                }),
+            }
+          },
+          _ -> found,
+        }
+      }),
+  }
+
+fn shelf() -> Result<List<Source>, String> / {fs.read[repo]} =
+  match shelved(std_tree(), "std", []) {
+    [] ->
+      Err(
+        "no standard library under `" ++ std_tree()
+          ++ "` of the `repo` root: bind the checkout as `--fs repo=PATH`",
+      ),
+    found -> Ok(found),
+  }
+
+fn joined_diags(diags: List<Diag>) -> String =
+  fold(diags, "", |acc: String, d: Diag|
+    if acc == "" { string_of_bytes_lossy(d.message) }
+    else { acc ++ "; " ++ string_of_bytes_lossy(d.message) })
+
+/// The fixture `name` in `scratch`, read back, and the shelf beside it, through the compiler's own
+/// front end: the front end the machine is handed, and what the two phases before it cost.
+fn front_end(
+  scratch: String,
+  name: String,
+) -> Result<(Front, Loaded), String> / {fs.read[work], fs.read[repo], time.elapsed_us} = {
+  let started = time.elapsed_us();
+  let path = under(scratch, name ++ ".ply");
+  match fs.read_file[work](path) {
+    None -> Err("the " ++ name ++ " fixture could not be read back from `" ++ path ++ "`"),
+    Some(text) -> match shelf() {
+      Err(why) -> Err(why),
+      Ok(shipped) -> {
+        let read = time.elapsed_us();
+        let pulled: Pulled = analyse_pulling_std_with(
+          [{ name: bytes_of_string(name), src: text }],
+          shipped,
+          [],
+          [],
+        );
+        let analysed = time.elapsed_us();
+        match pulled.out {
+          // The corpus writes these fixtures itself, so one that does not check is a defect in the
+          // corpus rather than a user's mistake, and it says so in the fixture's own words.
+          Refused(diags) ->
+            Err("the " ++ name ++ " fixture would not check: " ++ joined_diags(diags)),
+          Analysed(w) -> {
+            let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+              map_insert(acc, s.name, s.src));
+            // One place per module the front end numbered: the fixture, then the shelf it pulled.
+            let places: List<{ path: String, text: Bytes }> = fold(
+              pulled.pulled,
+              [{ path: path, text: text }],
+              |acc: List<{ path: String, text: Bytes }>, n: Bytes|
+                push(acc, {
+                  path: pseudo_path(string_of_bytes_lossy(n)),
+                  text: match map_get(texts, n) { Some(t) -> t, None -> b"" },
+                }),
+            );
+            let files: List<SourceFile> = map(range(0, len(places)), |i: Int| {
+              let place = match list_at(places, i) {
+                Some(p) -> p,
+                None -> panic("a place for every module"),
+              };
+              {
+                path: place.path,
+                name: match list_at(w.mods, i) {
+                  Some(mo) -> string_of_bytes_lossy(mo.name),
+                  None -> panic("a module for every place"),
+                },
+                text: place.text,
+              }
+            });
+            let loaded: Loaded = { read_us: read - started, front_us: analysed - read };
+            let front: Front = {
+              dump: dump_text(dump_of(Analysed(w))),
+              files: files,
+              read_ms: loaded.read_us / 1000,
+              front_ms: loaded.front_us / 1000,
+              file_ms: 0,
+              cached: false,
+            };
+            Ok((front, loaded))
+          },
+        }
+      },
+    },
+  }
+}
+
 // --- Driving one ------------------------------------------------------------
 
-/// Writes a fixture into a directory of its own under `dir` and hands back the directory.
+/// Writes a fixture into a directory of its own under `dir` and hands back that directory, which the
+/// machine is handed too: both are relative to the working directory, which is the `work` root.
 fn written(
   dir: String,
   name: String,
   source: String,
-) -> Result<String, String> / {fs.create_dir[cwd], fs.write_file[cwd]} = {
-  // The fs effect is confined to the root the entry was given — the corpus directory — and it
-  // refuses an absolute path outright, so the fixture is named relative to that root. The machine,
-  // which is not confined, is handed the same place spelled absolutely.
-  let here = "measure-" ++ name;
-  if !fs.create_dir[cwd](here) { Err("the fixture directory could not be made: " ++ here) } else if !fs.write_file[cwd](
-      here ++ "/" ++ name ++ ".ply",
+) -> Result<String, String> / {fs.create_dir[work], fs.write_file[work]} = {
+  let here = under(dir, "measure-" ++ name);
+  if !fs.create_dir[work](here) { Err("the fixture directory could not be made: " ++ here) } else if !fs.write_file[work](
+      under(here, name ++ ".ply"),
       bytes_of_string(source),
     ) { Err("the fixture could not be written: " ++ here) }
-  else { Ok(dir ++ "/" ++ here) }
+  else { Ok(here) }
 }
 
-/// One entry of a loaded fixture, measured. The first call is outside the clock: lazy lowering is
-/// not what a caller pays per call, and neither is its accounting.
+/// One entry of a loaded fixture, measured over `repeats` rounds, the fastest kept. The first call
+/// is outside the clock: lazy lowering is not what a caller pays per call, and neither is its
+/// accounting.
 fn point_at(
   n: Int,
   name: String,
@@ -108,7 +229,7 @@ fn point_at(
     Err(raised) -> Err("`" ++ name ++ "` raised " ++ raised.code ++ ": " ++ raised.message),
     Ok(_) -> {
       let _ = machine.accounting[bench]();
-      let best = fold(range(0, rounds()), -1, |acc: Int, _r: Int| {
+      let best = fold(range(0, if repeats < 1 { 1 } else { repeats }), -1, |acc: Int, _r: Int| {
         let started = time.elapsed_us();
         // Pinned: a tier that can see the answer still has to compute it.
         let _ = observe(calls(name, args, calls_per_round()));
@@ -176,13 +297,14 @@ fn margined(points: List<Point>) -> List<Point> =
 pub fn resumptions(
   dir: String,
   repeats: Int,
-) -> Result<Curve, String> / {fs.create_dir[cwd], fs.write_file[cwd], fs.list_dir[cwd], fs.remove[cwd], time.elapsed_us, fs.kind[cwd], fs.read_file[cwd], builder.git[vcs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.resolved[cwd], fs.resolved[abs], env.pwd[sys], time.elapsed_ms, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
-  with_fixture(dir, "multishot", resumption_source(), "multishot.r0", |_dir: String|
+) -> Result<Curve, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  with_fixture(dir, "multishot", resumption_source(), "multishot.r0", |loaded: Loaded|
     match all_points(
         map([0, 1, 2, 4], |n: Int| point_at(n, "multishot.r" ++ int_to_string(n), [], repeats)),
       ) {
       Err(why) -> Err(why),
-      Ok(points) -> Ok({ label: "resumptions", unit: "resumption", points: margined(points) }),
+      Ok(points) ->
+        Ok({ label: "resumptions", unit: "resumption", loaded: loaded, points: margined(points) }),
     })
 
 /// The interpreter's throughput on one definition: the unit is a call, and the work inside it is
@@ -190,81 +312,60 @@ pub fn resumptions(
 pub fn throughput(
   dir: String,
   repeats: Int,
-) -> Result<Curve, String> / {fs.create_dir[cwd], fs.write_file[cwd], fs.list_dir[cwd], fs.remove[cwd], time.elapsed_us, fs.kind[cwd], fs.read_file[cwd], builder.git[vcs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.resolved[cwd], fs.resolved[abs], env.pwd[sys], time.elapsed_ms, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
-  with_fixture(dir, "work", work_source(), "work.work", |_dir: String|
+) -> Result<Curve, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  with_fixture(dir, "work", work_source(), "work.work", |loaded: Loaded|
     match point_at(1, "work.work", [VInt(1)], repeats) {
       Err(why) -> Err(why),
-      Ok(point) -> Ok({ label: "throughput", unit: "call", points: [point] }),
+      Ok(point) -> Ok({ label: "throughput", unit: "call", loaded: loaded, points: [point] }),
     })
 
 /// Take the fixture back out of the corpus: the bench's own scenarios compile this tree, and a
 /// stray `.ply` under it would be read as a module of the program.
-fn removed(name: String) -> Unit / {fs.list_dir[cwd], fs.remove[cwd]} = {
-  // Relative to the root the entry was given, like the write: the fs effect refuses an absolute
-  // path even when it names a place inside that root. The contents go first — `remove` on a
-  // directory is `remove_dir`, which wants it empty — and the same walk as the bench's own
-  // snapshot clearing is what does it.
-  let here = "measure-" ++ name;
-  let _ = match fs.list_dir[cwd](here) {
+fn removed(dir: String, name: String) -> Unit / {fs.list_dir[work], fs.remove[work]} = {
+  // The contents go first: `remove` on a directory is `remove_dir`, which wants it empty.
+  let here = under(dir, "measure-" ++ name);
+  let _ = match fs.list_dir[work](here) {
     None -> [],
-    Some(names) -> map(names, |entry: String| fs.remove[cwd](here ++ "/" ++ entry)),
+    Some(names) -> map(names, |entry: String| fs.remove[work](under(here, entry))),
   };
-  let _ = fs.remove[cwd](here);
+  let _ = fs.remove[work](here);
   ()
 }
 
-/// Write the fixture, load it, bind it, run `body`, and let go of the machine either way.
+/// Write the fixture, front-end it, load it, bind it, run `body`, and let go of the machine either
+/// way.
 fn with_fixture<a>(
   dir: String,
   name: String,
   source: String,
   entry: String,
-  body: (String) -> Result<a, String> / {machine.accounting[bench], machine.call[bench], time.elapsed_us},
-) -> Result<a, String> / {fs.create_dir[cwd], fs.write_file[cwd], fs.list_dir[cwd], fs.remove[cwd], time.elapsed_us, fs.kind[cwd], fs.read_file[cwd], builder.git[vcs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.resolved[cwd], fs.resolved[abs], env.pwd[sys], time.elapsed_ms, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  body: (Loaded) -> Result<a, String> / {machine.accounting[bench], machine.call[bench], time.elapsed_us},
+) -> Result<a, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
   match written(dir, name, source) {
     Err(why) -> Err(why),
     Ok(scratch) -> {
       // Whatever happens below, the corpus is left as it was found.
       let finish = |outcome: Result<a, String>| -> Result<a, String> {
-        removed(name);
+        removed(dir, name);
         outcome
       };
-      // The front end is this side's to run, and it files nothing: a fixture is measured once and
-      // thrown away, and a cache left beside it would have to be walked out of the corpus with it.
-      let t: Timed = timed_uncached([resolve(scratch)]);
-      match t.program.whole {
-        // The corpus writes these fixtures itself, so one that does not check is a defect in the
-        // corpus rather than a user's mistake, and it says so in the fixture's own words.
-        None ->
-          finish(
-            Err(
-              "the " ++ name ++ " fixture would not check: "
-                ++ refusal_text({
-                  diags: t.program.diags,
-                  places: t.program.places,
-                  artifact: None,
-                }),
-            ),
-          ),
-        Some(w) -> {
+      match front_end(scratch, name) {
+        Err(why) -> finish(Err(why)),
+        Ok(pair) -> {
+          let (front, loaded) = pair;
           machine.configure[bench](default_options());
-          match machine.load[bench](scratch, Some(front_of(t, w))) {
+          match machine.load[bench](scratch, Some(front)) {
             Err(refusal) ->
-              Err("the " ++ name ++ " fixture would not load: " ++ refusal_text(refusal)),
+              finish(Err("the " ++ name ++ " fixture would not load: " ++ refusal_text(refusal))),
             Ok(_) -> match machine.bound[bench](entry) {
-              Err(refusal) ->
-                Err("the " ++ name ++ " fixture would not bind: " ++ refusal_text(refusal)),
+              Err(refusal) -> {
+                machine.drop[bench]();
+                finish(Err("the " ++ name ++ " fixture would not bind: " ++ refusal_text(refusal)))
+              },
               Ok(_) -> {
-                match body(scratch) {
-                  Err(why) -> {
-                    machine.drop[bench]();
-                    finish(Err(why))
-                  },
-                  Ok(value) -> {
-                    machine.drop[bench]();
-                    finish(Ok(value))
-                  },
-                }
+                let outcome = body(loaded);
+                machine.drop[bench]();
+                finish(outcome)
               },
             },
           }
@@ -273,10 +374,7 @@ fn with_fixture<a>(
     },
   }
 
-fn refusal_text(refusal: machine::Refusal) -> String =
-  fold(refusal.diags, "", |acc: String, d: Diag|
-    if acc == "" { string_of_bytes_lossy(d.message) }
-    else { acc ++ "; " ++ string_of_bytes_lossy(d.message) })
+fn refusal_text(refusal: machine::Refusal) -> String = joined_diags(refusal.diags)
 
 // --- The report -------------------------------------------------------------
 
@@ -284,6 +382,13 @@ pub fn curve_json(c: Curve) -> Json =
   object([
     { key: "label", value: Str(c.label) },
     { key: "unit", value: Str(c.unit) },
+    {
+      key: "loaded",
+      value: object([
+        { key: "read_us", value: Number(decimal_of_int(c.loaded.read_us)) },
+        { key: "front_us", value: Number(decimal_of_int(c.loaded.front_us)) },
+      ]),
+    },
     {
       key: "points",
       value: array(
@@ -303,7 +408,7 @@ pub fn curve_json(c: Curve) -> Json =
 pub fn measure_json(
   dir: String,
   repeats: Int,
-) -> Json / {fs.create_dir[cwd], fs.write_file[cwd], fs.list_dir[cwd], fs.remove[cwd], time.elapsed_us, fs.kind[cwd], fs.read_file[cwd], builder.git[vcs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.resolved[cwd], fs.resolved[abs], env.pwd[sys], time.elapsed_ms, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+) -> Json / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
   match resumptions(dir, repeats) {
     Err(why) -> object([{ key: "ok", value: Bool(false) }, { key: "why", value: Str(why) }]),
     Ok(resumed) -> match throughput(dir, repeats) {
@@ -317,18 +422,25 @@ pub fn measure_json(
     },
   }
 
-/// What a curve reads as, one line a point.
+/// What a curve reads as: the load's two phases, then one line a point.
 pub fn curve_text(c: Curve) -> String =
-  fold(c.points, c.label ++ " (per " ++ c.unit ++ ")\n", |acc: String, p: Point|
-    acc ++ "  " ++ int_to_string(p.n) ++ " · " ++ int_to_string(p.nanos) ++ "ns · "
-      ++ int_to_string(p.steps)
-      ++ " steps"
-      ++ (if p.marginal_nanos == 0 { "" } else {
-        " · marginal " ++ int_to_string(p.marginal_nanos) ++ "ns, "
-          ++ int_to_string(p.marginal_steps)
-          ++ " steps"
-      })
-      ++ "\n")
+  fold(
+    c.points,
+    c.label ++ " (per " ++ c.unit ++ ") · loaded in " ++ int_to_string(c.loaded.read_us)
+      ++ "µs read + "
+      ++ int_to_string(c.loaded.front_us)
+      ++ "µs front\n",
+    |acc: String, p: Point|
+      acc ++ "  " ++ int_to_string(p.n) ++ " · " ++ int_to_string(p.nanos) ++ "ns · "
+        ++ int_to_string(p.steps)
+        ++ " steps"
+        ++ (if p.marginal_nanos == 0 { "" } else {
+          " · marginal " ++ int_to_string(p.marginal_nanos) ++ "ns, "
+            ++ int_to_string(p.marginal_steps)
+            ++ " steps"
+        })
+        ++ "\n",
+  )
 
 // --- Tests ------------------------------------------------------------------
 
@@ -353,12 +465,27 @@ test "the marginal cost is what one more resumption added, per resumption" {
   assert_eq(at(rows, 3, zero).marginal_steps, 20)
 }
 
-test "a curve reads as one line a point" {
+test "a curve reads as its load and then one line a point" {
   let text = curve_text({
     label: "work",
     unit: "call",
+    loaded: { read_us: 40, front_us: 900 },
     points: [{ n: 1, nanos: 250, steps: 7, marginal_nanos: 0, marginal_steps: 0 }],
   });
-  assert(string_contains(text, "work (per call)"));
+  assert(string_contains(text, "work (per call) · loaded in 40µs read + 900µs front"));
   assert(string_contains(text, "1 · 250ns · 7 steps"))
+}
+
+test "the fixtures check against the compiler's front end with no shelf pulled" {
+  let checks = |name: String, source: String| -> Bool {
+    let pulled: Pulled = analyse_pulling_std_with(
+      [{ name: bytes_of_string(name), src: bytes_of_string(source) }],
+      [],
+      [],
+      [],
+    );
+    match pulled.out { Analysed(_) -> len(pulled.pulled) == 0, Refused(_) -> false }
+  };
+  assert(checks("multishot", resumption_source()));
+  assert(checks("work", work_source()))
 }

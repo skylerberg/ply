@@ -1,0 +1,118 @@
+// `sweep`: a corpus generated and benched at each of several sizes, for one comparison table. A size
+// is `modules,defs_per_module,tests`, laid over the generator's defaults with the sweep's seed, and
+// each is written to a directory of its own under the sweep's.
+
+import bench
+import cli.cmdline
+import gbuild
+import gen
+import spine
+import spine (under)
+import cli.machine (machine)
+import std.fs (fs)
+import std.process (process)
+import std.config (config)
+import std.time (time)
+
+pub type Size = { dir: String, text: String, spec: gbuild::Spec }
+
+fn number(text: String) -> Result<Int, String> = {
+  let digits = string_trim(text);
+  match cmdline::parse_nat(digits) {
+    Some(n) -> Ok(n),
+    None -> Err("`" ++ digits ++ "` is not a number"),
+  }
+}
+
+// One size, as the spec it asks the generator for; refused before anything is written when that
+// spec is not one the generator takes.
+pub fn size_of(text: String, seed: Int) -> Result<Size, String> =
+  match string_split(text, ",") {
+    [m, d, t] -> match number(m) {
+      Err(e) -> Err(e),
+      Ok(modules) -> match number(d) {
+        Err(e) -> Err(e),
+        Ok(defs) -> match number(t) {
+          Err(e) -> Err(e),
+          Ok(tests) -> {
+            let base = gen::default_spec();
+            let spec = {
+              ..base,
+              seed: seed,
+              modules: modules,
+              defs_per_module: defs,
+              tests: tests,
+              depth: min(4, max(modules, 1)),
+            };
+            match gen::validate(spec) {
+              Err(why) -> Err("`" ++ text ++ "`: " ++ why),
+              Ok(valid) ->
+                Ok({
+                  dir: "m" ++ int_to_string(modules) ++ "_d" ++ int_to_string(defs) ++ "_t"
+                    ++ int_to_string(tests),
+                  text: text,
+                  spec: valid,
+                }),
+            }
+          },
+        },
+      },
+    },
+    _ -> Err("`" ++ text ++ "` is not `modules,defs_per_module,tests`"),
+  }
+
+pub fn sizes_of(texts: List<String>, seed: Int) -> Result<List<Size>, String> =
+  fold(texts, Ok([]), |acc: Result<List<Size>, String>, text: String|
+    match acc {
+      Err(e) -> Err(e),
+      Ok(sizes) -> match size_of(text, seed) { Err(e) -> Err(e), Ok(s) -> Ok(push(sizes, s)) },
+    })
+
+// Each size generated under `out`, verified, and benched, in order; the first that fails stops the
+// sweep and says which size it was.
+pub fn run(
+  out: String,
+  sizes: List<Size>,
+  repeats: Int,
+) -> Result<List<spine::Report>, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  fold(sizes, Ok([]), |acc: Result<List<spine::Report>, String>, size: Size|
+    match acc {
+      Err(e) -> Err(e),
+      Ok(reports) -> {
+        let root = under(out, size.dir);
+        match gen::run(root, size.spec, false) {
+          Err(why) -> Err("the corpus for `" ++ size.text ++ "` does not compile: " ++ why),
+          Ok(_) -> match bench::run(root, repeats) {
+            Err(e) -> Err(e),
+            Ok(report) -> Ok(push(reports, report)),
+          },
+        }
+      },
+    })
+
+// --- Tests ------------------------------------------------------------------
+
+fn sized(text: String, seed: Int) -> Size =
+  match size_of(text, seed) { Ok(s) -> s, Err(why) -> panic(why) }
+
+test "a size is three numbers and nothing else" {
+  let s = sized("10,20,30", 5);
+  assert_eq((s.spec.modules, s.spec.defs_per_module, s.spec.tests), (10, 20, 30));
+  assert_eq(s.spec.seed, 5);
+  assert_eq(s.dir, "m10_d20_t30");
+  assert(match size_of("10,20", 1) { Err(_) -> true, Ok(_) -> false });
+  assert(match size_of("10,20,x", 1) { Err(why) -> string_contains(why, "`x`"), Ok(_) -> false });
+  assert(match size_of("10,-2,4", 1) { Err(_) -> true, Ok(_) -> false })
+}
+
+test "a sweep never asks for more layers than it has modules" {
+  assert_eq(sized("2,5,5", 1).spec.depth, 2);
+  assert_eq(sized("40,25,500", 1).spec.depth, 4)
+}
+
+test "a size the generator would refuse stops the sweep before it writes anything" {
+  assert(match sizes_of(["4,5,8", "0,5,8"], 1) {
+    Err(why) -> string_contains(why, "`0,5,8`") && string_contains(why, "at least one module"),
+    Ok(_) -> false,
+  })
+}

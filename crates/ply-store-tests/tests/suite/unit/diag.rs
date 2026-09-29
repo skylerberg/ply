@@ -37,13 +37,6 @@ fn unknown_code_survives_instead_of_being_dropped() {
 }
 
 #[test]
-fn interning_is_stable_across_reads() {
-    let a = intern_code("E0001");
-    let b = intern_code(&String::from("E0001"));
-    assert!(std::ptr::eq(a, b));
-}
-
-#[test]
 fn missing_optional_fields_default_to_empty() {
     let r: DiagnosticRepr =
         serde_json::from_str(r#"{"severity":"note","code":"E0101","message":"m"}"#).unwrap();

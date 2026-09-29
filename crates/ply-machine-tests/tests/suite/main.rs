@@ -7,7 +7,6 @@
 
 mod claims;
 mod fixture;
-mod front_read;
 mod prover_soundness_audit;
 mod replay;
 mod selector_reads;
