@@ -364,6 +364,39 @@ fn stored(k: Int) -> Int / {db.read[rows]}
     assert_eq!(v["changed"][0]["obligations"][0]["tier"], Value::Null);
 }
 
+/// A frame names each write as a row names its resource: bracketed, and nothing for an effect
+/// that has none.
+#[test]
+fn a_frame_names_each_write_as_a_row_does() {
+    const WRITES: &str = "\
+effect db {
+  write put[r](key: Int, value: Int) -> Int
+}
+
+effect audit {
+  write note(n: Int) -> Unit
+}
+
+fn stored(k: Int) -> Int / {db.write[rows], audit.write}
+  ensures result >= 0
+= {
+  audit.note(k);
+  db.put[rows](k, 1)
+}
+";
+    let dir = project(WRITES);
+    let v = json_of(
+        &ply(dir.path())
+            .args(["prove", "--no-cache", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        v["obligations"][0]["frame"], "writes m.audit, m.db[rows]",
+        "{v}"
+    );
+}
+
 #[test]
 fn a_guard_the_search_missed_is_a_gap_and_not_a_vacuity() {
     const SOURCE: &str = "\

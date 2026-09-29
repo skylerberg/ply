@@ -20,18 +20,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The discharger this build drives, its claims kept in `store`.
-pub fn of<'a>(
-    loaded: &'a Loaded,
-    hosting: Option<Hosting>,
-    backend: Option<&'static dyn ply_eval::Provider>,
-    store: &mut Store,
-) -> Result<Box<dyn ply_test::obligation::Discharger + 'a>, LoadError> {
-    Ok(Box::new(prover(loaded, hosting, backend, store)?))
-}
-
-/// The same prover, unboxed: a caller that also re-runs points needs the concrete type, and one
-/// built once serves a whole run's discharges and re-runs alike.
+/// The discharger this build drives, its claims kept in `store`. One built once serves a whole
+/// run's discharges and re-runs alike.
 pub fn prover<'a>(
     loaded: &'a Loaded,
     hosting: Option<Hosting>,
