@@ -406,16 +406,13 @@ impl Drive {
             .values()
             .map(|e| e.simple_name.as_str())
             .collect();
-        if let Some(undeclared) = options
-            .allow
-            .iter()
-            .find(|family| !declared_effects.contains(&family.as_str()))
-        {
+        if let Some((family, effect)) = options.allow.iter().find_map(|family| {
+            let effect = crate::policy::effect_of(family)?;
+            (!declared_effects.contains(&effect.as_str())).then_some((family, effect))
+        }) {
             return Err(refuse(vec![Diagnostic::error(
                 codes::CAPABILITY_UNDECLARED,
-                format!(
-                    "`--allow {undeclared}` was granted and the program declares no `{undeclared}` effect"
-                ),
+                format!("`--allow {family}` was granted and the program declares no `{effect}` effect"),
             )
             .primary(
                 Span::DUMMY,

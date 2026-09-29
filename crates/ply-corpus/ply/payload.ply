@@ -1,0 +1,877 @@
+// `payload` — what payload types cost: a derived JSON codec, `Map`, and what derivation costs the
+// front end and the cache.
+//
+// The codec and the map are priced in-process, over fixtures this program writes, front-ends and loads
+// into the machine it is lent. Every timed entry takes numbers and answers a number, and repeats its
+// operation `rounds` times itself: a value crossing into the machine is copied on the way, and a copy
+// of the order or the map inside the clock would be priced as the codec or the map. What derivation
+// costs is the product's own report over two projects that differ only by their `derive`s, and
+// whether `map_keys`' order holds across processes is `ply run` in several of them.
+
+import cli.machine
+import cli.machine (Value, VInt, VBool, machine)
+import compiler.front (Analysed, Pulled, Refused, analyse_pulling_std_with)
+import harness
+import harness (Loaded)
+import report
+import report (Row, Measurement, holding, number, exact, row, untaken)
+import spine
+import spine (under)
+import std.fs (fs)
+import std.fs
+import std.json (Json, Str, Null, Object, object, array)
+import std.json
+import std.process (process)
+import std.config (config)
+import std.time (time)
+
+// --- The fixtures ------------------------------------------------------------------
+
+// An order with `n` line items, each mixing `String`, `Int`, `Decimal` and `Bool`; the wide one has
+// one field widened. Line count fixes the fields the codec visits and `width` the bytes the scanner
+// crosses between them: varying them apart is the only way to say whether a decode is priced per field
+// or per byte.
+pub fn codec_source() -> String =
+  "import std.json\n\n"
+    ++ "pub type Line = { sku: String, qty: Int, unit_price: Decimal, note: String, active: Bool }\n\n"
+    ++ "pub type Order = { id: Int, customer: String, tags: List<String>, lines: List<Line> }\n\n"
+    ++ "derive json for Line\n"
+    ++ "derive json for Order\n\n"
+    ++ "fn pad(width: Int) -> String = fold(range(0, width), \"\", |s: String, _i: Int| s ++ \"x\")\n\n"
+    ++ "fn line(i: Int, note: String) -> Line =\n"
+    ++ "  { sku: \"SKU-\" ++ int_to_string(i), qty: i % 7 + 1, unit_price: decimal_of_int(i % 500 + 100) * 0.01m, note: note, active: i % 2 == 0 }\n\n"
+    ++ "fn order(n: Int) -> Order =\n"
+    ++ "  { id: 4242, customer: \"ada lovelace\", tags: [\"priority\", \"gift\", \"eu\"], lines: map(range(0, n), |i: Int| line(i, \"line \" ++ int_to_string(i) ++ \" of a synthetic order\")) }\n\n"
+    ++ "fn wide(n: Int, width: Int) -> Order = {\n"
+    ++ "  let note = pad(width);\n"
+    ++ "  { id: 4242, customer: \"ada lovelace\", tags: [\"priority\", \"gift\", \"eu\"], lines: map(range(0, n), |i: Int| line(i, note)) }\n"
+    ++ "}\n\n"
+    ++ "fn shaped(n: Int, width: Int) -> Order = if width < 0 { order(n) } else { wide(n, width) }\n\n"
+    ++ "fn encoded(o: Order) -> Bytes = json::encode_bytes(o, order_json())\n\n"
+    ++ "fn decoded(src: Bytes) -> Int = match json::decode_bytes(src, order_json()) { Ok(o) -> len(o.lines), Err(_) -> -1 }\n\n"
+    ++ "fn parsed(src: Bytes) -> Int = match json::parse(src) { Ok(_) -> 1, Err(_) -> -1 }\n\n"
+    ++ "fn document(src: Bytes) -> json::Json = match json::parse(src) { Ok(j) -> j, Err(_) -> json::Null }\n\n"
+    ++ "fn codec(j: json::Json) -> Int = match (order_json().decode)(j) { Ok(o) -> len(o.lines), Err(_) -> -1 }\n\n"
+    ++ "// A width below zero is the plain order, whose notes say which line they are.\n"
+    ++ "pub fn payload_bytes(n: Int, width: Int) -> Int = bytes_len(encoded(shaped(n, width)))\n\n"
+    ++ "pub fn encodes(n: Int, width: Int, rounds: Int) -> Int = {\n"
+    ++ "  let o = shaped(n, width);\n"
+    ++ "  fold(range(0, rounds), 0, |acc: Int, _r: Int| acc + bytes_len(encoded(observe(o))))\n"
+    ++ "}\n\n"
+    ++ "pub fn decodes(n: Int, width: Int, rounds: Int) -> Int = {\n"
+    ++ "  let src = encoded(shaped(n, width));\n"
+    ++ "  fold(range(0, rounds), 0, |acc: Int, _r: Int| acc + decoded(observe(src)))\n"
+    ++ "}\n\n"
+    ++ "// A decode's first half on its own: bytes to a `Json`, before any dictionary runs.\n"
+    ++ "pub fn parses(n: Int, width: Int, rounds: Int) -> Int = {\n"
+    ++ "  let src = encoded(shaped(n, width));\n"
+    ++ "  fold(range(0, rounds), 0, |acc: Int, _r: Int| acc + parsed(observe(src)))\n"
+    ++ "}\n\n"
+    ++ "// Its second half, over a document already parsed: timed itself rather than as a difference of\n"
+    ++ "// two timings, which can come out negative under load.\n"
+    ++ "pub fn codecs(n: Int, width: Int, rounds: Int) -> Int = {\n"
+    ++ "  let j = document(encoded(shaped(n, width)));\n"
+    ++ "  fold(range(0, rounds), 0, |acc: Int, _r: Int| acc + codec(observe(j)))\n"
+    ++ "}\n\n"
+    ++ "test \"the derived codec round-trips the payload it is measured on\" {\n"
+    ++ "  assert_eq(decodes(4, -1, 2), 8);\n"
+    ++ "  assert_eq(decodes(4, 16, 1), 4);\n"
+    ++ "  assert_eq(codecs(3, 0, 1), 3);\n"
+    ++ "  assert_eq(parses(3, 0, 2), 2)\n"
+    ++ "}\n\n"
+    ++ "test \"widening a field grows the bytes and not the fields\" {\n"
+    ++ "  assert_eq(payload_bytes(2, 64), payload_bytes(2, 0) + 128)\n"
+    ++ "}\n"
+
+// `loops` is the subtrahend that separates `Map` from `fold`: the scaffold every other entry runs.
+pub fn map_source() -> String =
+  "fn key(i: Int) -> Int = (i * 2654435761) % 1000003\n\n"
+    ++ "fn scaffold(n: Int) -> Int = fold(range(0, n), 0, |a: Int, i: Int| a + key(i))\n\n"
+    ++ "fn build(n: Int) -> Map<Int, Int> =\n"
+    ++ "  fold(range(0, n), map_new(), |m: Map<Int, Int>, i: Int| map_insert(m, key(i), i))\n\n"
+    ++ "fn build_descending(n: Int) -> Map<Int, Int> =\n"
+    ++ "  fold(range(0, n), map_new(), |m: Map<Int, Int>, i: Int| map_insert(m, key(n - 1 - i), n - 1 - i))\n\n"
+    ++ "fn got(m: Map<Int, Int>, n: Int) -> Int =\n"
+    ++ "  fold(range(0, n), 0, |acc: Int, i: Int| match map_get(m, key(i)) { Some(v) -> acc + v, None -> acc })\n\n"
+    ++ "pub fn loops(n: Int, rounds: Int) -> Int =\n"
+    ++ "  fold(range(0, rounds), 0, |acc: Int, _r: Int| acc + scaffold(observe(n)))\n\n"
+    ++ "pub fn inserts(n: Int, rounds: Int) -> Int =\n"
+    ++ "  fold(range(0, rounds), 0, |acc: Int, _r: Int| acc + map_len(build(observe(n))))\n\n"
+    ++ "pub fn lookups(n: Int, rounds: Int) -> Int = {\n"
+    ++ "  let m = build(n);\n"
+    ++ "  fold(range(0, rounds), 0, |acc: Int, _r: Int| acc + got(observe(m), n))\n"
+    ++ "}\n\n"
+    ++ "pub fn keys(n: Int, rounds: Int) -> Int = {\n"
+    ++ "  let m = build(n);\n"
+    ++ "  fold(range(0, rounds), 0, |acc: Int, _r: Int| acc + fold(map_keys(observe(m)), 0, |a: Int, k: Int| a + k))\n"
+    ++ "}\n\n"
+    ++ "pub fn folds(n: Int, rounds: Int) -> Int = {\n"
+    ++ "  let m = build(n);\n"
+    ++ "  fold(range(0, rounds), 0, |acc: Int, _r: Int| acc + map_fold(observe(m), 0, |a: Int, k: Int, v: Int| a + k + v))\n"
+    ++ "}\n\n"
+    ++ "pub fn order_blind(n: Int) -> Bool =\n"
+    ++ "  build(n) == build_descending(n) && map_keys(build(n)) == map_keys(build_descending(n))\n\n"
+    ++ "test \"insertion order changes neither the map nor the order it iterates in\" {\n"
+    ++ "  assert(order_blind(256))\n"
+    ++ "}\n"
+
+// `map_keys` under three insertion orders of one key set, each after a `|`: the sequences are
+// recovered by splitting rather than by trusting where `ply run`'s own framing stops.
+pub fn order_source() -> String =
+  "fn key(i: Int) -> Int = (i * 2654435761) % 100003\n\n"
+    ++ "fn insert_all(order: List<Int>) -> Map<Int, Int> =\n"
+    ++ "  fold(order, map_new(), |m: Map<Int, Int>, i: Int| map_insert(m, key(i), i))\n\n"
+    ++ "fn render(m: Map<Int, Int>) -> String =\n"
+    ++ "  fold(map_keys(m), \"\", |acc: String, k: Int| acc ++ \",\" ++ int_to_string(k))\n\n"
+    ++ "fn n() -> Int = 997\n\n"
+    ++ "fn main() -> String =\n"
+    ++ "  \"|\" ++ render(insert_all(range(0, n())))\n"
+    ++ "    ++ \"|\" ++ render(insert_all(map(range(0, n()), |i: Int| n() - 1 - i)))\n"
+    ++ "    ++ \"|\" ++ render(insert_all(map(range(0, n()), |i: Int| (i * 7919) % n())))\n"
+
+// One module of `types` record types, with or without a `derive` for each; both variants declare the
+// same types and the same tests, so what differs between them is derivation alone.
+pub fn derived_module(index: Int, types: Int, derived: Bool) -> String =
+  fold(range(0, types), if derived { "import std.json\n\n" } else { "" }, |s: String, i: Int| {
+    let name = "T" ++ int_to_string(index) ++ "x" ++ int_to_string(i);
+    let lower = "t" ++ int_to_string(index) ++ "x" ++ int_to_string(i);
+    let declared = "pub type " ++ name
+      ++ " = { name: String, count: Int, price: Decimal, tags: List<String>, live: Bool }\n\n";
+    let derive = if derived { "derive json for " ++ name ++ "\n\n" } else { "" };
+    let value = "fn " ++ lower ++ "_value() -> " ++ name ++ " =\n  {name: \"" ++ lower
+      ++ "\", count: "
+      ++ int_to_string(i)
+      ++ ", price: 1.25m, tags: [\"a\", \"b\"], live: true}\n\n";
+    let tested = if derived {
+      "test \"" ++ lower ++ " round-trips\" {\n  let src = json::encode_bytes(" ++ lower
+        ++ "_value(), "
+        ++ lower
+        ++ "_json());\n  assert_eq(json::decode_bytes(src, "
+        ++ lower
+        ++ "_json()), Ok("
+        ++ lower
+        ++ "_value()))\n}\n\n"
+    } else {
+      "test \"" ++ lower ++ " round-trips\" {\n  assert_eq(" ++ lower ++ "_value().count, "
+        ++ int_to_string(i)
+        ++ ")\n}\n\n"
+    };
+    s ++ declared ++ derive ++ value ++ tested
+  })
+
+// --- Timing an entry ----------------------------------------------------------------
+
+// One call of `rounds` operations, timed at its fastest over `repeats`, after one call outside the
+// clock that pays for whatever the engine defers. The answer comes back with the time, so a caller can
+// check the work was the work it asked for.
+fn timed(
+  name: String,
+  args: List<Value>,
+  repeats: Int,
+) -> Result<{ us: Int, answer: Int }, String> / {time.elapsed_us, machine.call[bench]} =
+  match harness::called(name, args) {
+    Err(why) -> Err(why),
+    Ok(_) ->
+      fold(
+        range(0, if repeats < 1 { 1 } else { repeats }),
+        Ok({ us: -1, answer: 0 }),
+        |acc: Result<{ us: Int, answer: Int }, String>, _r: Int|
+          match acc {
+            Err(e) -> Err(e),
+            Ok(best) -> {
+              let started = time.elapsed_us();
+              let answer = harness::called(name, args);
+              let taken = time.elapsed_us() - started;
+              match answer {
+                Err(why) -> Err(why),
+                Ok(VInt(n)) ->
+                  Ok(if best.us < 0 || taken < best.us { { us: taken, answer: n } } else { best }),
+                Ok(_) -> Err("`" ++ name ++ "` answered something other than a count"),
+              }
+            },
+          },
+      ),
+  }
+
+fn ints(xs: List<Int>) -> List<Value> = map(xs, |n: Int| VInt(n))
+
+fn count_of(name: String, args: List<Value>) -> Result<Int, String> / {machine.call[bench]} =
+  match harness::called(name, args) {
+    Err(why) -> Err(why),
+    Ok(VInt(n)) -> Ok(n),
+    Ok(_) -> Err("`" ++ name ++ "` answered something other than a count"),
+  }
+
+// Nanoseconds one of `rounds` operations took.
+fn per_op(us: Int, rounds: Int) -> Int = if rounds <= 0 { 0 } else { us * 1000 / rounds }
+
+// Bytes per microsecond is megabytes per second.
+fn mb_per_s(bytes: Int, rounds: Int, us: Int) -> Decimal =
+  if us <= 0 { 0m }
+  else { decimal_div(decimal_of_int(bytes * rounds), decimal_of_int(us), 2, HalfEven) }
+
+// --- The codec -------------------------------------------------------------------------
+
+fn round_trip() -> report::Criterion =
+  holding(
+    "the derived codec round-trips the payload it is timed on",
+    ["decoded", "lines"],
+    |vs: List<Decimal>| match vs { [d, l] -> d == l, _ -> false },
+  )
+
+// Encode and decode at one payload size.
+fn json_point(
+  lines: Int,
+  rounds: Int,
+  repeats: Int,
+) -> Result<List<Measurement>, String> / {time.elapsed_us, machine.call[bench]} =
+  match count_of("payload.payload_bytes", ints([lines, -1])) {
+    Err(e) -> Err(e),
+    Ok(bytes) -> match timed("payload.encodes", ints([lines, -1, rounds]), repeats) {
+      Err(e) -> Err(e),
+      Ok(enc) -> match timed("payload.decodes", ints([lines, -1, rounds]), repeats) {
+        Err(e) -> Err(e),
+        Ok(dec) ->
+          Ok([
+            number("lines", lines, "lines"),
+            number("decoded", if rounds <= 0 { 0 } else { dec.answer / rounds }, "lines"),
+            number("payload", bytes, "bytes"),
+            number("encode", per_op(enc.us, rounds), "ns"),
+            number("decode", per_op(dec.us, rounds), "ns"),
+            exact("encode_rate", mb_per_s(bytes, rounds, enc.us), "MB/s"),
+            exact("decode_rate", mb_per_s(bytes, rounds, dec.us), "MB/s"),
+          ]),
+      },
+    },
+  }
+
+fn shape_criterion() -> report::Criterion =
+  holding(
+    "the codec round-trips the widened payload, and parsing and the codec each did work, timed on its own",
+    ["decoded", "lines", "parse", "codec"],
+    |vs: List<Decimal>| match vs { [d, l, p, c] -> d == l && p > 0m && c > 0m, _ -> false },
+  )
+
+// One `lines:pad` point: the fields held fixed down a column while the bytes grow beside them.
+fn shape_point(
+  lines: Int,
+  pad: Int,
+  rounds: Int,
+  repeats: Int,
+) -> Result<List<Measurement>, String> / {time.elapsed_us, machine.call[bench]} =
+  match count_of("payload.payload_bytes", ints([lines, pad])) {
+    Err(e) -> Err(e),
+    Ok(bytes) -> {
+      let args = ints([lines, pad, rounds]);
+      match timed("payload.encodes", args, repeats) {
+        Err(e) -> Err(e),
+        Ok(enc) -> match timed("payload.decodes", args, repeats) {
+          Err(e) -> Err(e),
+          Ok(dec) -> match timed("payload.parses", args, repeats) {
+            Err(e) -> Err(e),
+            Ok(parse) -> match timed("payload.codecs", args, repeats) {
+              Err(e) -> Err(e),
+              Ok(codec) -> {
+                // Leaf values the codec visits: five a line, and the order's own four.
+                let fields = lines * 5 + 4;
+                let decode = per_op(dec.us, rounds);
+                Ok([
+                  number("lines", lines, "lines"),
+                  number("decoded", if rounds <= 0 { 0 } else { dec.answer / rounds }, "lines"),
+                  number("pad", pad, "bytes"),
+                  number("payload", bytes, "bytes"),
+                  number("fields", fields, "fields"),
+                  number("encode", per_op(enc.us, rounds), "ns"),
+                  number("decode", decode, "ns"),
+                  number("parse", per_op(parse.us, rounds), "ns"),
+                  number("codec", per_op(codec.us, rounds), "ns"),
+                  exact(
+                    "decode_per_byte",
+                    decimal_div(decimal_of_int(decode), decimal_of_int(max(bytes, 1)), 3, HalfEven),
+                    "ns",
+                  ),
+                  exact(
+                    "decode_per_field",
+                    decimal_div(decimal_of_int(decode), decimal_of_int(fields), 3, HalfEven),
+                    "ns",
+                  ),
+                ])
+              },
+            },
+          },
+        },
+      }
+    },
+  }
+
+pub type Shape = { lines: Int, pad: Int }
+
+pub fn shape_of(text: String) -> Result<Shape, String> =
+  match string_split(text, ":") {
+    [l, p] -> match ((parse_count(l), parse_count(p))) {
+      (Some(lines), Some(pad)) -> Ok({ lines: lines, pad: pad }),
+      _ -> Err("`" ++ text ++ "` is not `lines:pad`"),
+    },
+    _ -> Err("`" ++ text ++ "` is not `lines:pad`"),
+  }
+
+fn parse_count(text: String) -> Option<Int> =
+  match decimal_of_string(string_trim(text)) {
+    Some(d) -> match int_of_decimal(d, Down) {
+      Some(n) -> if n >= 0 && decimal_of_int(n) == d { Some(n) } else { None },
+      None -> None,
+    },
+    None -> None,
+  }
+
+fn codec_rows(
+  lines: List<Int>,
+  shapes: List<Shape>,
+  rounds: Int,
+  repeats: Int,
+) -> List<Row> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} = {
+  let json_names = map(lines, |n: Int| "json " ++ int_to_string(n));
+  let shape_names = map(shapes, |s: Shape|
+    "shape " ++ int_to_string(s.lines) ++ ":" ++ int_to_string(s.pad));
+  let measured = harness::with_fixture(
+    ".",
+    "payload",
+    codec_source(),
+    "payload.payload_bytes",
+    |loaded: Loaded|
+      Ok({
+        json: map(lines, |n: Int| json_point(n, rounds, repeats)),
+        shape: map(shapes, |s: Shape| shape_point(s.lines, s.pad, rounds, repeats)),
+      }),
+  );
+  match measured {
+    Err(why) ->
+      appended(
+        map(json_names, |name: String| untaken(name, round_trip(), why)),
+        map(shape_names, |name: String| untaken(name, shape_criterion(), why)),
+      ),
+    Ok(m) ->
+      appended(
+        map(
+          zip_names(json_names, m.json),
+          |p: { name: String, taken: Result<List<Measurement>, String> }|
+            { name: p.name, criterion: round_trip(), taken: p.taken, detail: Null },
+        ),
+        map(
+          zip_names(shape_names, m.shape),
+          |p: { name: String, taken: Result<List<Measurement>, String> }|
+            { name: p.name, criterion: shape_criterion(), taken: p.taken, detail: Null },
+        ),
+      ),
+  }
+}
+
+// --- The map -----------------------------------------------------------------------------
+
+fn map_criterion() -> report::Criterion =
+  holding(
+    "insertion order changes neither the map nor the order it iterates in",
+    ["order_blind"],
+    |vs: List<Decimal>| vs == [1m],
+  )
+
+// Enough rounds to spread fixed cost, few enough that the largest size finishes.
+pub fn map_rounds(entries: Int) -> Int = min(200, max(1, 500000 / max(entries, 1)))
+
+// `insert` and `get` need a `fold` around them, so theirs are subtractions: the scaffold's own time
+// comes off, and a lookup's and a key walk's one build of the map with it. None is clamped.
+fn map_point(
+  entries: Int,
+  repeats: Int,
+) -> Result<List<Measurement>, String> / {time.elapsed_us, machine.call[bench]} = {
+  let rounds = map_rounds(entries);
+  let args = ints([entries, rounds]);
+  match timed("maps.loops", args, repeats) {
+    Err(e) -> Err(e),
+    Ok(loops) -> match timed("maps.inserts", args, repeats) {
+      Err(e) -> Err(e),
+      Ok(inserts) -> match timed("maps.lookups", args, repeats) {
+        Err(e) -> Err(e),
+        Ok(lookups) -> match timed("maps.keys", args, repeats) {
+          Err(e) -> Err(e),
+          Ok(keys) -> match timed("maps.folds", args, repeats) {
+            Err(e) -> Err(e),
+            Ok(folds) -> match harness::called("maps.order_blind", ints([entries])) {
+              Err(e) -> Err(e),
+              Ok(blind) -> {
+                let ops = rounds * entries;
+                let one_build = inserts.us / rounds;
+                let per = |us: Int| -> Int { if ops <= 0 { 0 } else { us * 1000 / ops } };
+                Ok([
+                  number("entries", entries, "entries"),
+                  number("order_blind", match blind { VBool(true) -> 1, _ -> 0 }, ""),
+                  number("insert", per(inserts.us - loops.us), "ns"),
+                  number("get", per(lookups.us - one_build - loops.us), "ns"),
+                  number("keys", per(keys.us - one_build), "ns"),
+                  number("fold", per(folds.us - one_build), "ns"),
+                  number("loop", per(loops.us), "ns"),
+                ])
+              },
+            },
+          },
+        },
+      },
+    },
+  }
+}
+
+fn map_rows(
+  entries: List<Int>,
+  repeats: Int,
+) -> List<Row> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} = {
+  let names = map(entries, |n: Int| "map " ++ int_to_string(n));
+  match harness::with_fixture(".", "maps", map_source(), "maps.loops", |loaded: Loaded|
+      Ok(map(entries, |n: Int| map_point(n, repeats)))) {
+    Err(why) -> map(names, |name: String| untaken(name, map_criterion(), why)),
+    Ok(points) ->
+      map(
+        zip_names(names, points),
+        |p: { name: String, taken: Result<List<Measurement>, String> }|
+          { name: p.name, criterion: map_criterion(), taken: p.taken, detail: Null },
+      ),
+  }
+}
+
+// --- `map_keys` across processes -----------------------------------------------------------
+
+// The three sequences one `ply run` printed, split out of whatever frames them.
+pub fn sequences(printed: String) -> List<String> =
+  match string_split(printed, "|") {
+    [] -> [],
+    [_] -> [],
+    parts ->
+      map(drop_first(parts), |p: String| {
+        let t = string_trim(p);
+        if string_ends_with(t, "\"") { string_slice(t, 0, string_len(t) - 1) } else { t }
+      }),
+  }
+
+fn ascending(keys: List<Int>) -> Bool =
+  fold(range(1, len(keys)), len(keys) > 0, |ok: Bool, i: Int|
+    ok
+      && (match ((list_at(keys, i - 1), list_at(keys, i))) {
+        (Some(a), Some(b)) -> a < b,
+        _ -> false,
+      }))
+
+fn keys_of(sequence: String) -> List<Int> =
+  fold(string_split(sequence, ","), [], |acc: List<Int>, part: String|
+    match parse_count(part) { Some(n) -> push(acc, n), None -> acc })
+
+pub fn order_measurements(outputs: List<String>) -> Result<List<Measurement>, String> =
+  match list_at(outputs, 0) {
+    None -> Err("no process ran"),
+    Some(first) -> match sequences(first) {
+      [a, b, c] -> {
+        let keys = keys_of(a);
+        let same = fold(outputs, true, |ok: Bool, o: String| ok && sequences(o) == [a, b, c]);
+        Ok([
+          number("processes", len(outputs), "processes"),
+          number("entries", len(keys), "entries"),
+          number("across_processes", if same { 1 } else { 0 }, ""),
+          number("across_insertion_orders", if a == b && b == c { 1 } else { 0 }, ""),
+          number("ascending", if ascending(keys) { 1 } else { 0 }, ""),
+        ])
+      },
+      _ -> Err("`main` should have printed three key sequences, and printed " ++ first),
+    },
+  }
+
+fn order_criterion() -> report::Criterion =
+  holding(
+    "map_keys is ascending, and the same in every process and under every insertion order",
+    ["across_processes", "across_insertion_orders", "ascending"],
+    |vs: List<Decimal>| vs == [1m, 1m, 1m],
+  )
+
+fn order_row(
+  processes: Int,
+) -> Row / {process.spawn[ply], config.get[env], fs.read[work], fs.write[work]} = {
+  let here = harness::scratch_of(".", "order");
+  let written = harness::fresh(here)
+    && fs.write_file[work](under(here, "order.ply"), bytes_of_string(order_source()));
+  let outputs = if !written { Err("the order program could not be written under `" ++ here ++ "`") } else {
+    fold(range(0, max(processes, 2)), Ok([]), |acc: Result<List<String>, String>, _i: Int|
+      match acc {
+        Err(e) -> Err(e),
+        Ok(done) -> {
+          let ran = spine::ply(["run", "--color", "never"], here);
+          if spine::exit_zero(ran) { Ok(push(done, string_of_bytes_lossy(ran.out))) }
+          else { Err("`ply run` failed: " ++ string_of_bytes_lossy(ran.err)) }
+        },
+      })
+  };
+  harness::removed(here);
+  match outputs {
+    Err(why) -> untaken("order", order_criterion(), why),
+    Ok(os) -> match order_measurements(os) {
+      Err(why) -> untaken("order", order_criterion(), why),
+      Ok(ms) -> row("order", order_criterion(), ms),
+    },
+  }
+}
+
+// --- What derivation costs --------------------------------------------------------------
+
+// One variant of the derivation project, as the product reports on it.
+pub type Variant = {
+  definitions: Int,
+  // What the project itself declares, the shipped modules left out.
+  own: Int,
+  tests: Int,
+  cold_check_ms: Decimal,
+  warm_check_ms: Decimal,
+  cold_test_ms: Decimal,
+  warm_test_ms: Decimal,
+  cache_bytes: Int,
+}
+
+fn write_variant(
+  here: String,
+  types: Int,
+  per_module: Int,
+  derived: Bool,
+) -> Bool / {fs.read[work], fs.write[work]} = {
+  let per = max(per_module, 1);
+  let modules = (types + per - 1) / per;
+  harness::fresh(here)
+    && fold(range(0, modules), true, |ok: Bool, m: Int|
+      ok
+        && fs.write_file[work](
+          under(here, "m" ++ int_to_string(m) ++ ".ply"),
+          bytes_of_string(derived_module(m, min(per, types - m * per), derived)),
+        ))
+}
+
+// The bytes under `dir`, every file in every directory beneath it.
+fn bytes_under(dir: String) -> Int / {fs.list_dir[work], fs.kind[work], fs.file_size[work]} =
+  match fs.list_dir[work](dir) {
+    None -> 0,
+    Some(names) ->
+      fold(names, 0, |acc: Int, name: String| {
+        let path = under(dir, name);
+        match fs.kind[work](path) {
+          fs::Dir -> acc + bytes_under(path),
+          fs::File -> acc + (match fs.file_size[work](path) { Some(n) -> n, None -> 0 }),
+          _ -> acc,
+        }
+      }),
+  }
+
+// A `ply test` run's front end — reading, the front end, and filing what it found — and its tests.
+type Taken = { check_ms: Decimal, test_ms: Decimal, tests: Int, failed: Int }
+
+// A cold run and the warm one straight after it.
+type Pair = { cold: Taken, warm: Taken }
+
+fn test_run(here: String) -> Result<Taken, String> / {process.spawn[ply], config.get[env]} =
+  match spine::report_json(spine::ply(["test", ".", "--json", "--color", "never"], here)) {
+    Err(why) -> Err(why),
+    Ok(Object(m)) -> match spine::field(m, "front_end") {
+      Err(e) -> Err(e),
+      Ok(fe) -> match spine::field(fe, "phases") {
+        Err(e) -> Err(e),
+        Ok(phases) -> match spine::field(m, "summary") {
+          Err(e) -> Err(e),
+          Ok(summary) -> match spine::field(m, "selection") {
+            Err(e) -> Err(e),
+            Ok(selection) ->
+              Ok({
+                check_ms: spine::decimal_field(phases, "total"),
+                test_ms: spine::decimal_field(summary, "duration_ms"),
+                tests: spine::int_field(selection, "total"),
+                failed: spine::int_field(summary, "failed"),
+              }),
+          },
+        },
+      },
+    },
+    Ok(_) -> Err("the test report is not an object"),
+  }
+
+fn lesser(a: Decimal, b: Decimal) -> Decimal = if a < b { a } else { b }
+
+fn variant_of(
+  here: String,
+  repeats: Int,
+) -> Result<Variant, String> / {process.spawn[ply], config.get[env], fs.read[work], fs.write[work]} = {
+  // A fresh cache per cold run, so a cold number is cold; the warm one is the run after it.
+  let runs = fold(
+    range(0, if repeats < 1 { 1 } else { repeats }),
+    Ok([]),
+    |acc: Result<List<Pair>, String>, _r: Int|
+      match acc {
+        Err(e) -> Err(e),
+        Ok(done) -> {
+          harness::removed(under(here, ".ply-cache"));
+          match test_run(here) {
+            Err(e) -> Err(e),
+            Ok(cold) -> match test_run(here) {
+              Err(e) -> Err(e),
+              Ok(warm) -> Ok(push(done, { cold: cold, warm: warm })),
+            },
+          }
+        },
+      },
+  );
+  match runs {
+    Err(e) -> Err(e),
+    Ok(rs) -> match list_at(rs, 0) {
+      None -> Err("no run was taken"),
+      Some(first) -> if first.cold.failed > 0 {
+        Err(
+          int_to_string(first.cold.failed)
+            ++ " of the derivation project's tests failed; the number would be about failure formatting rather than about derivation",
+        )
+      } else {
+        match spine::report_json(spine::ply(["check", ".", "--json", "--color", "never"], here)) {
+          Err(why) -> Err(why),
+          Ok(Object(m)) -> {
+            let defs = spine::objects(spine::array_field(m, "definitions"));
+            Ok({
+              definitions: len(defs),
+              own: len(
+                filter(defs, |d: Map<String, Json>| {
+                  let module = spine::str_field(d, "module");
+                  module != "std" && !string_starts_with(module, "std.")
+                }),
+              ),
+              tests: first.cold.tests,
+              cold_check_ms: fold(rs, first.cold.check_ms, |b: Decimal, r: Pair|
+                lesser(b, r.cold.check_ms)),
+              warm_check_ms: fold(rs, first.warm.check_ms, |b: Decimal, r: Pair|
+                lesser(b, r.warm.check_ms)),
+              cold_test_ms: fold(rs, first.cold.test_ms, |b: Decimal, r: Pair|
+                lesser(b, r.cold.test_ms)),
+              warm_test_ms: fold(rs, first.warm.test_ms, |b: Decimal, r: Pair|
+                lesser(b, r.warm.test_ms)),
+              cache_bytes: bytes_under(under(here, ".ply-cache")),
+            })
+          },
+          Ok(_) -> Err("the check report is not an object"),
+        }
+      },
+    },
+  }
+}
+
+fn variant_measurements(prefix: String, v: Variant) -> List<Measurement> =
+  [
+    number(prefix ++ "_definitions", v.definitions, "definitions"),
+    number(prefix ++ "_own", v.own, "definitions"),
+    number(prefix ++ "_tests", v.tests, "tests"),
+    exact(prefix ++ "_cold_check", v.cold_check_ms, "ms"),
+    exact(prefix ++ "_warm_check", v.warm_check_ms, "ms"),
+    exact(prefix ++ "_cold_test", v.cold_test_ms, "ms"),
+    exact(prefix ++ "_warm_test", v.warm_test_ms, "ms"),
+    number(prefix ++ "_cache", v.cache_bytes, "bytes"),
+  ]
+
+fn derivation_criterion() -> report::Criterion =
+  holding(
+    "deriving adds definitions and changes no test",
+    ["derived_definitions", "plain_definitions", "derived_tests", "plain_tests"],
+    |vs: List<Decimal>| match vs { [dd, pd, dt, pt] -> dd > pd && dt == pt, _ -> false },
+  )
+
+fn derivation_row(
+  types: Int,
+  per_module: Int,
+  repeats: Int,
+) -> Row / {process.spawn[ply], config.get[env], fs.read[work], fs.write[work]} = {
+  let name = "derive " ++ int_to_string(types);
+  let one = |derived: Bool| {
+    let here = harness::scratch_of(".", "derive-" ++ (if derived { "derived" } else { "plain" }));
+    let made = if write_variant(here, types, per_module, derived) { variant_of(here, repeats) }
+    else { Err("the derivation project could not be written under `" ++ here ++ "`") };
+    harness::removed(here);
+    made
+  };
+  match one(false) {
+    Err(why) -> untaken(name, derivation_criterion(), why),
+    Ok(plain) -> match one(true) {
+      Err(why) -> untaken(name, derivation_criterion(), why),
+      Ok(derived) ->
+        row(
+          name,
+          derivation_criterion(),
+          appended(
+            push(variant_measurements("plain", plain), number("types", types, "types")),
+            variant_measurements("derived", derived),
+          ),
+        ),
+    },
+  }
+}
+
+// --- The fixtures' own tests --------------------------------------------------------------
+
+// A measurement program's own tests, run by the product: a fixture that does not do what its numbers
+// say it does is a defect in the corpus, and this is where it would show.
+fn fixture_tested(
+  name: String,
+  source: String,
+) -> Result<List<Measurement>, String> / {process.spawn[ply], config.get[env], fs.read[work], fs.write[work]} = {
+  let here = harness::scratch_of(".", "tested-" ++ name);
+  let ran = if harness::fresh(here)
+      && fs.write_file[work](under(here, name ++ ".ply"), bytes_of_string(source)) {
+    spine::document(spine::ply(["test", ".", "--json", "--no-cache", "--color", "never"], here))
+  } else { Err("the " ++ name ++ " fixture could not be written under `" ++ here ++ "`") };
+  harness::removed(here);
+  match ran {
+    Err(why) -> Err(why),
+    Ok(j) -> match spine::test_report(j) {
+      Err(e) -> Err(e),
+      Ok(r) ->
+        Ok([
+          number(name ++ "_passed", r.passed, "tests"),
+          number(name ++ "_failed", r.failed, "tests"),
+        ]),
+    },
+  }
+}
+
+fn fixtures_row() -> Row / {process.spawn[ply], config.get[env], fs.read[work], fs.write[work]} = {
+  let criterion = holding(
+    "every measurement program's own tests pass",
+    ["payload_passed", "payload_failed", "maps_passed", "maps_failed"],
+    |vs: List<Decimal>|
+      match vs { [pp, pf, mp, mf] -> pp > 0m && pf == 0m && mp > 0m && mf == 0m, _ -> false },
+  );
+  match fixture_tested("payload", codec_source()) {
+    Err(why) -> untaken("fixtures", criterion, why),
+    Ok(codec) -> match fixture_tested("maps", map_source()) {
+      Err(why) -> untaken("fixtures", criterion, why),
+      Ok(maps) -> row("fixtures", criterion, appended(codec, maps)),
+    },
+  }
+}
+
+// --- The subcommand ---------------------------------------------------------------------------
+
+pub type Args = {
+  lines: List<Int>,
+  iterations: Int,
+  shapes: List<Shape>,
+  entries: List<Int>,
+  types: List<Int>,
+  types_per_module: Int,
+  processes: Int,
+  repeats: Int,
+  derivation: Bool,
+}
+
+// Every section in order; its scratch directories are written under the working directory and taken
+// back out after each.
+pub fn run(
+  a: Args,
+) -> Result<report::Report, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, process.spawn[ply], config.get[env], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} = {
+  let fixtures = [fixtures_row()];
+  let codec = codec_rows(a.lines, a.shapes, a.iterations, a.repeats);
+  let maps = map_rows(a.entries, a.repeats);
+  let order = [order_row(a.processes)];
+  let derivation = if a.derivation {
+    map(a.types, |t: Int| derivation_row(t, a.types_per_module, a.repeats))
+  } else { [] };
+  report::made(
+    "payload",
+    "payload — a derived codec, Map, and what derivation costs",
+    appended(appended(appended(appended(fixtures, codec), maps), order), derivation),
+    [],
+  )
+}
+
+// --- Small things -------------------------------------------------------------------------
+
+fn zip_names(
+  names: List<String>,
+  taken: List<Result<List<Measurement>, String>>,
+) -> List<{ name: String, taken: Result<List<Measurement>, String> }> =
+  map(range(0, min(len(names), len(taken))), |i: Int|
+    {
+      name: match list_at(names, i) { Some(n) -> n, None -> "" },
+      taken: match list_at(taken, i) { Some(t) -> t, None -> Err("not measured") },
+    })
+
+fn drop_first<a>(xs: List<a>) -> List<a> =
+  fold(range(1, len(xs)), [], |acc: List<a>, i: Int|
+    match list_at(xs, i) { Some(x) -> push(acc, x), None -> acc })
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+// --- Tests ---------------------------------------------------------------------------------
+
+test "the two derivation variants declare the same types and the same tests" {
+  let plain = derived_module(0, 3, false);
+  let derived = derived_module(0, 3, true);
+  let _ = map(range(0, 3), |i: Int| {
+    let decl = "pub type T0x" ++ int_to_string(i) ++ " = ";
+    assert(string_contains(plain, decl) && string_contains(derived, decl));
+    assert(string_contains(plain, "t0x" ++ int_to_string(i) ++ " round-trips"));
+    assert(string_contains(derived, "t0x" ++ int_to_string(i) ++ " round-trips"))
+  });
+  assert(!string_contains(plain, "derive json"));
+  assert_eq(len(string_split(derived, "derive json for ")) - 1, 3)
+}
+
+test "a shape is two counts, and anything else is refused" {
+  assert_eq(shape_of("40:1600"), Ok({ lines: 40, pad: 1600 }));
+  assert(match shape_of("40") { Err(_) -> true, Ok(_) -> false });
+  assert(match shape_of("40:x") { Err(_) -> true, Ok(_) -> false });
+  assert(match shape_of("1.5:0") { Err(_) -> true, Ok(_) -> false })
+}
+
+test "the order check reads three sequences out of what `ply run` printed, framing and all" {
+  let printed = "\"|,1,2,3|,1,2,3|,1,2,3\"\n";
+  assert_eq(sequences(printed), [",1,2,3", ",1,2,3", ",1,2,3"]);
+  match order_measurements([printed, printed]) {
+    Err(why) -> panic(why),
+    Ok(ms) ->
+      assert_eq(
+        report::named(ms, ["entries", "across_processes", "across_insertion_orders", "ascending"]),
+        [
+          number("entries", 3, "entries"),
+          number("across_processes", 1, ""),
+          number("across_insertion_orders", 1, ""),
+          number("ascending", 1, ""),
+        ],
+      ),
+  };
+  match order_measurements(["\"|,1,3,2|,1,2,3|,1,2,3\"", "\"|,1,2,3|,1,2,3|,1,2,3\""]) {
+    Err(why) -> panic(why),
+    Ok(ms) ->
+      assert_eq(report::named(ms, ["across_processes", "across_insertion_orders", "ascending"]), [
+        number("across_processes", 0, ""),
+        number("across_insertion_orders", 0, ""),
+        number("ascending", 0, ""),
+      ]),
+  };
+  assert(match order_measurements(["\"|,1,2\""]) { Err(_) -> true, Ok(_) -> false })
+}
+
+test "a map is timed in rounds enough to beat the clock, and no more than the largest size finishes" {
+  assert_eq(map_rounds(16), 200);
+  assert_eq(map_rounds(65536), 7);
+  assert_eq(map_rounds(1000000), 1)
+}
+
+test "the fixtures that need no shelf check against the compiler's front end" {
+  let checks = |name: String, source: String| -> Bool {
+    let pulled: Pulled = analyse_pulling_std_with(
+      [{ name: bytes_of_string(name), src: bytes_of_string(source) }],
+      [],
+      [],
+      [],
+    );
+    match pulled.out { Analysed(_) -> len(pulled.pulled) == 0, Refused(_) -> false }
+  };
+  assert(checks("maps", map_source()));
+  assert(checks("order", order_source()));
+  assert(checks("m0", derived_module(0, 3, false)))
+}
