@@ -1,4 +1,4 @@
-//! One binary for link time; a test reading process-global state (allocator, census) needs its own.
+//! One binary for link time; a test reading process-global state (the allocator) needs its own.
 
 mod fixture;
 
