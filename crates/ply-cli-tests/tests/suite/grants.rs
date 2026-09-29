@@ -20,9 +20,10 @@ nondet effect machine {
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
-  packages: List<{ root: String, digest: String }>,
   read_ms: Int,
   front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
 }
 type Options = Unit
 type Ended = Unit

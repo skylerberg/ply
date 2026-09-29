@@ -42,8 +42,6 @@ pub struct RunOptions {
     pub trace: crate::trace::TraceOptions,
     pub shutdown: crate::options::ShutdownOptions,
     pub profile: String,
-    /// A project load that reads and writes the store; off for a plain `run`.
-    pub cache: bool,
     /// The privileged families `--allow` granted the program being run, by name. What may drive
     /// a machine is a decision with a name, and one the program has to have declared.
     pub allow: Vec<String>,
@@ -66,7 +64,6 @@ impl Default for RunOptions {
             trace: crate::trace::TraceOptions::default(),
             shutdown: crate::options::ShutdownOptions::default(),
             profile: "development".to_string(),
-            cache: false,
             allow: Vec::new(),
         }
     }
@@ -101,11 +98,10 @@ impl Target {
     /// An artifact runs out of its own verified definitions, not a source tree.
     pub fn open(
         path: &std::path::Path,
-        cache: bool,
         front: Option<&crate::driver::HandedFront>,
-    ) -> Result<(Target, Option<ply_store::Store>), Refused> {
+    ) -> Result<Target, Refused> {
         if path.extension().is_some_and(|e| e == artifact::EXTENSION) {
-            return deployment(path).map(|d| (Target::Deployed(Box::new(d)), None));
+            return deployment(path).map(|d| Target::Deployed(Box::new(d)));
         }
         // A library is a package to depend on, not a program: reading it as sources would report a
         // container as text that is not UTF-8.
@@ -130,61 +126,22 @@ impl Target {
         // A front end handed over is the CLI's own load, read here rather than repeated. A load with
         // none is a *program* loading a program of its own, at a root it chose while running: nobody
         // could have handed one, so the compiler is lent for that load and that load only.
-        let refused = |err: crate::load::LoadError| Refused {
+        let loaded = match front {
+            Some(front) => crate::driver::load_over_front(path, front),
+            None => crate::load::load(path),
+        }
+        .map_err(|err| Refused {
             diagnostics: err.diagnostics,
             sources: err.sources,
             artifact: None,
-        };
-        let loaded = if cache {
-            // The store is the project's, so a file path roots at the file's directory.
-            let root = crate::load::project_root(path);
-            let mut store = ply_store::Store::open(&root)
-                .map(|store| store.with_upstream(ply_store::Upstream::from_env()))
-                .map_err(|e| Refused {
-                    diagnostics: vec![unopened(&root, &e)],
-                    sources: SourceMap::new(),
-                    artifact: None,
-                })?;
-            let loaded = match front {
-                Some(front) => crate::driver::load_over_front(
-                    path,
-                    &front.files,
-                    &front.packages,
-                    &front.dump,
-                    front.read,
-                    front.front,
-                    crate::driver::Mode::Incremental,
-                    Some(&mut store),
-                ),
-                None => crate::driver::load_incremental(path, &mut store),
-            };
-            loaded
-                .map(|loaded| (loaded, Some(store)))
-                .map_err(refused)?
-        } else {
-            let loaded = match front {
-                Some(front) => crate::driver::load_over_front(
-                    path,
-                    &front.files,
-                    &front.packages,
-                    &front.dump,
-                    front.read,
-                    front.front,
-                    crate::driver::Mode::Full,
-                    None,
-                ),
-                None => crate::load::load(path),
-            };
-            (loaded.map_err(refused)?, None)
-        };
-        let (loaded, store) = loaded;
+        })?;
         match crate::costs::broken_promises(&loaded) {
             Some(err) => Err(Refused {
                 diagnostics: err.diagnostics,
                 sources: err.sources,
                 artifact: None,
             }),
-            None => Ok((Target::Project(Box::new(loaded)), store)),
+            None => Ok(Target::Project(Box::new(loaded))),
         }
     }
 
@@ -251,14 +208,6 @@ impl Target {
     }
 }
 
-fn unopened(path: &std::path::Path, e: &dyn std::fmt::Display) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("the store under `{}` did not open: {e:#}", path.display()),
-    )
-    .primary(Span::DUMMY, "the load was not read and nothing ran")
-}
-
 fn deployment(path: &std::path::Path) -> Result<Deployment, Refused> {
     let about = |diagnostics: Vec<Diagnostic>| Refused {
         diagnostics,
@@ -311,12 +260,10 @@ pub struct Measured {
     pub counters: ply_eval::rc::Stats,
 }
 
-/// The machine's state on its own thread: the target, the store it was loaded over when it has
-/// one, and the binding once `bound` made it.
+/// The machine's state on its own thread: the target, and the binding once `bound` made it.
 pub struct Drive {
     options: RunOptions,
     target: Target,
-    store: Option<ply_store::Store>,
     bound: Option<(String, Bound)>,
     /// What the calls since the last `accounting` read measured, reset by that read.
     accounting: Measured,
@@ -325,12 +272,10 @@ pub struct Drive {
 impl Drive {
     /// Load the target at `path`; the answer a `load` op hands back.
     pub fn open(options: RunOptions, path: &std::path::Path) -> Result<Drive, Refused> {
-        let cache = options.cache;
-        let (target, store) = Target::open(path, cache, options.front.as_ref())?;
+        let target = Target::open(path, options.front.as_ref())?;
         Ok(Drive {
             options,
             target,
-            store,
             bound: None,
             accounting: Measured::default(),
         })
@@ -350,10 +295,7 @@ impl Drive {
             Target::Project(loaded) => loaded.root.display().to_string(),
             Target::Deployed(d) => d.path.clone(),
         });
-        let cache = self.options.cache;
-        let (target, store) = Target::open(&path, cache, Some(front))?;
-        self.target = target;
-        self.store = store;
+        self.target = Target::open(&path, Some(front))?;
         self.bound = None;
         Ok(())
     }
@@ -1289,7 +1231,6 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
             drain_lead_ms: int_at("drain_lead_ms")? as u64,
         },
         profile: str_at("profile")?,
-        cache: bool_at("cache")?,
     })
 }
 

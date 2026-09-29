@@ -1,5 +1,4 @@
-use crate::harness::{ply, repo, write};
-use ply_machine::driver;
+use crate::harness::{json_of, ply, repo, warm_agrees, write};
 use ply_machine::load::{LoadError, Loaded, load};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_store::{ContentHash, Store};
@@ -249,12 +248,12 @@ fn a_shipped_module_is_fingerprinted_under_its_pseudo_path() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "app.ply", IMPORTER);
 
-    let mut store = Store::open(dir.path()).unwrap();
-    driver::load_incremental(dir.path(), &mut store).unwrap();
-    store.flush().unwrap();
+    let out = ply(dir.path()).arg("check").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", output(&out));
 
     let path = ply_std::pseudo_path(&std_net());
     assert_eq!(path, PathBuf::from("<std>/net.ply"));
+    let store = Store::open(dir.path()).unwrap();
     let fingerprint = store
         .fingerprint(&path)
         .expect("the shipped module is filed under its pseudo-path");
@@ -266,29 +265,18 @@ fn a_shipped_module_is_fingerprinted_under_its_pseudo_path() {
 }
 
 #[test]
-fn incremental_and_full_agree_over_a_program_that_imports_std() {
+fn a_warm_check_agrees_with_a_cold_one_over_a_program_that_imports_std() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "app.ply", IMPORTER);
-
-    let mut store = Store::open(dir.path()).unwrap();
-    let cold = driver::load_incremental(dir.path(), &mut store).unwrap();
-    store.flush().unwrap();
-    let warm = driver::load_incremental(dir.path(), &mut store).unwrap();
-    let full = driver::load_full(dir.path()).unwrap();
-
-    for name in ["std.net.drain", "std.net.net", "app.touch"] {
-        assert_eq!(hash_of(&cold, name), hash_of(&full, name), "{name}");
-        assert_eq!(hash_of(&warm, name), hash_of(&full, name), "{name}");
-    }
-    assert_eq!(
-        format!(
-            "{:?}",
-            warm.check.defs[&Symbol::new("std.net.drain")].scheme
-        ),
-        format!(
-            "{:?}",
-            full.check.defs[&Symbol::new("std.net.drain")].scheme
-        ),
+    warm_agrees(dir.path(), "cold");
+    let warm = warm_agrees(dir.path(), "warm");
+    assert!(
+        warm["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "std.net.drain"),
+        "the shipped module is part of the answer: {warm}"
     );
 }
 
@@ -446,26 +434,17 @@ fn a_cache_written_under_another_digest_warns_once_and_says_how_much_moved() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "app.ply", IMPORTER);
 
-    let mut store = Store::open(dir.path()).unwrap();
-    driver::load_incremental(dir.path(), &mut store).unwrap();
-    store.flush().unwrap();
+    assert!(stdlib_notices(dir.path()).is_empty(), "a cold cache warns");
     assert_eq!(
-        store.stdlib_digest().as_deref(),
+        Store::open(dir.path()).unwrap().stdlib_digest().as_deref(),
         Some(ply_std::digest_short().as_str())
     );
 
     // A warm cache written by a build whose stdlib was something else.
     std::fs::write(dir.path().join(".ply-cache/stdlib"), "b3:000000000000\n").unwrap();
-    let mut store = Store::open(dir.path()).unwrap();
-    let loaded = driver::load_incremental(dir.path(), &mut store).unwrap();
-    let warnings: Vec<_> = loaded
-        .frontend
-        .warnings
-        .iter()
-        .filter(|d| d.code == codes::STDLIB_CHANGED)
-        .collect();
-    assert_eq!(warnings.len(), 1, "{:?}", loaded.frontend.warnings);
-    let rendered = format!("{:?}", warnings[0]);
+    let notices = stdlib_notices(dir.path());
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let rendered = notices[0].to_string();
     assert!(rendered.contains("b3:000000000000"), "{rendered}");
     assert!(rendered.contains(&ply_std::digest_short()), "{rendered}");
     // Nothing moved: the shipped sources are the last run's; only the recorded digest was a lie.
@@ -473,37 +452,28 @@ fn a_cache_written_under_another_digest_warns_once_and_says_how_much_moved() {
         rendered.contains("no definition this program reaches changed"),
         "{rendered}"
     );
-    store.flush().unwrap();
 
     // Once. The run that saw it recorded the digest, so the next is quiet.
-    let mut store = Store::open(dir.path()).unwrap();
-    let again = driver::load_incremental(dir.path(), &mut store).unwrap();
-    assert!(
-        !again
-            .frontend
-            .warnings
-            .iter()
-            .any(|d| d.code == codes::STDLIB_CHANGED),
-        "{:?}",
-        again.frontend.warnings
-    );
+    assert!(stdlib_notices(dir.path()).is_empty());
+}
+
+/// The `W0605` notices a `ply check` at `dir` gives.
+fn stdlib_notices(dir: &Path) -> Vec<Value> {
+    let answer = json_of(&ply(dir).args(["check", "--json"]).output().unwrap());
+    answer["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == codes::STDLIB_CHANGED)
+        .cloned()
+        .collect()
 }
 
 #[test]
 fn a_cold_cache_does_not_warn_about_the_stdlib() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "app.ply", IMPORTER);
-    let mut store = Store::open(dir.path()).unwrap();
-    let loaded = driver::load_incremental(dir.path(), &mut store).unwrap();
-    assert!(
-        !loaded
-            .frontend
-            .warnings
-            .iter()
-            .any(|d| d.code == codes::STDLIB_CHANGED),
-        "{:?}",
-        loaded.frontend.warnings
-    );
+    assert!(stdlib_notices(dir.path()).is_empty());
 }
 
 /// The port's answer over a flat directory, pulling in the shipped modules itself, and the driver's.

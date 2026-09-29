@@ -577,20 +577,7 @@ fn iterate(
     let loaded = match held {
         Some(loaded) => Ok(loaded),
         None => match &args.front {
-            Some(front) => crate::driver::load_over_front(
-                &args.path,
-                &front.files,
-                &front.packages,
-                &front.dump,
-                front.read,
-                front.front,
-                if args.no_cache {
-                    crate::driver::Mode::Full
-                } else {
-                    crate::driver::Mode::Incremental
-                },
-                Some(&mut cache.store),
-            ),
+            Some(front) => crate::driver::load_over_front(&args.path, front),
             None => Err(crate::load::LoadError {
                 sources: ply_span::SourceMap::new(),
                 diagnostics: vec![Diagnostic::error(

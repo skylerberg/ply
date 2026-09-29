@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use ply_eval::{Machine, Value};
-use ply_machine::driver;
+use ply_machine::load::load;
 use ply_span::Span;
 use ply_store::Store;
 use serde::Serialize;
@@ -38,7 +38,7 @@ pub struct Checked {
 
 impl Checked {
     pub fn open(root: &Path) -> Result<Checked> {
-        let loaded = driver::load_full(root).map_err(|e| {
+        let loaded = load(root).map_err(|e| {
             let shown: Vec<String> = e
                 .diagnostics
                 .iter()
@@ -589,14 +589,13 @@ pub struct DerivePoint {
     pub definitions: usize,
     pub project_definitions: usize,
     pub tests: usize,
-    /// A check with no cache at all.
-    pub cold_check_millis: f64,
-    /// A check against a cache a previous identical run filled.
-    pub warm_check_millis: f64,
+    /// A check from nothing.
+    pub check_millis: f64,
     /// Selecting and running every test, from an empty result cache.
     pub cold_test_millis: f64,
     /// The same run when every test is a cache hit.
     pub warm_test_millis: f64,
+    /// What the test runs filed, which is results alone: the front-end cache is the CLI's.
     pub cache_bytes: u64,
 }
 
@@ -634,22 +633,20 @@ fn one_derivation_point(
         })
         .collect();
 
-    // A fresh copy per timing, so a cold number is cold.
-    let cold = best_of(repeats, || {
+    // The load a program runs of a program: the whole front end, seeded from nothing. The
+    // front-end cache is the CLI's, so a warm check is `ply check` twice and not a number here.
+    let check = best_of(repeats, || {
         let dir = write_files(&files)?;
-        let mut store = Store::open(dir.path())?;
         let started = Instant::now();
-        let loaded =
-            driver::load_incremental(dir.path(), &mut store).map_err(|e| compile_error(&e))?;
+        let loaded = load(dir.path()).map_err(|e| compile_error(&e))?;
         let taken = started.elapsed();
         drop(loaded);
-        store.flush()?;
         Ok(taken)
     })?;
 
     let dir = write_files(&files)?;
     let mut store = Store::open(dir.path())?;
-    let loaded = driver::load_incremental(dir.path(), &mut store).map_err(|e| compile_error(&e))?;
+    let loaded = load(dir.path()).map_err(|e| compile_error(&e))?;
     let definitions = loaded.check.defs.len();
     let project_definitions = loaded
         .check
@@ -669,17 +666,6 @@ fn one_derivation_point(
     store.flush()?;
     drop(store);
 
-    let warm = best_of(repeats, || {
-        let mut store = Store::open(dir.path())?;
-        let started = Instant::now();
-        let loaded =
-            driver::load_incremental(dir.path(), &mut store).map_err(|e| compile_error(&e))?;
-        let taken = started.elapsed();
-        drop(loaded);
-        store.flush()?;
-        Ok(taken)
-    })?;
-
     Ok(DerivePoint {
         variant: if derived { "derived" } else { "plain" },
         types,
@@ -687,8 +673,7 @@ fn one_derivation_point(
         definitions,
         project_definitions,
         tests,
-        cold_check_millis: millis(cold),
-        warm_check_millis: millis(warm),
+        check_millis: millis(check),
         cold_test_millis: millis(cold_test),
         warm_test_millis: millis(warm_test),
         cache_bytes: directory_bytes(&dir.path().join(ply_store::CACHE_DIR_NAME))?,
@@ -876,28 +861,26 @@ pub fn render(m: &Measurements) -> String {
     if !m.derivation.is_empty() {
         s.push_str("derivation's cost — the same types, with and without a `derive`\n");
         s.push_str(&format!(
-            "  {:<9} {:>6} {:>7} {:>8} {:>7} {:>11} {:>11} {:>10} {:>10} {:>10}\n",
+            "  {:<9} {:>6} {:>7} {:>8} {:>7} {:>11} {:>10} {:>10} {:>10}\n",
             "variant",
             "types",
             "defs",
             "own defs",
             "tests",
-            "cold check",
-            "warm check",
+            "check",
             "cold test",
             "warm test",
             "cache KiB"
         ));
         for p in &m.derivation {
             s.push_str(&format!(
-                "  {:<9} {:>6} {:>7} {:>8} {:>7} {:>10.1}m {:>10.1}m {:>9.1}m {:>9.1}m {:>10}\n",
+                "  {:<9} {:>6} {:>7} {:>8} {:>7} {:>10.1}m {:>9.1}m {:>9.1}m {:>10}\n",
                 p.variant,
                 p.types,
                 p.definitions,
                 p.project_definitions,
                 p.tests,
-                p.cold_check_millis,
-                p.warm_check_millis,
+                p.check_millis,
                 p.cold_test_millis,
                 p.warm_test_millis,
                 p.cache_bytes / 1024
@@ -919,11 +902,10 @@ pub fn render(m: &Measurements) -> String {
                 let shipped = derived.definitions as i64 - derived.project_definitions as i64;
                 s.push_str(&format!(
                     "  {types} types: {codecs} project definitions ({:.2} per type) plus {shipped} in `std`, \
-                     cache {:.1}x, cold check {:.2}x, warm check {:.2}x\n",
+                     cache {:.1}x, check {:.2}x\n",
                     codecs as f64 / types as f64,
                     derived.cache_bytes as f64 / plain.cache_bytes.max(1) as f64,
-                    derived.cold_check_millis / plain.cold_check_millis,
-                    derived.warm_check_millis / plain.warm_check_millis,
+                    derived.check_millis / plain.check_millis,
                 ));
             }
         }

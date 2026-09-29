@@ -1,7 +1,7 @@
 use ply_eval::Provider;
 use ply_span::{SourceId, Symbol};
 use ply_store::body::{BodySet, of_front};
-use ply_store::{CachedDef, Outcome, PassRecord, Store};
+use ply_store::{Outcome, PassRecord, Store};
 use ply_test::bisect::{
     Baseline, Delta, DepEdges, Regression, Rehashed, Skipped, StoreClassify, TrialOutcome, diff,
 };
@@ -109,18 +109,12 @@ fn passed(before: &Compiled, key: &str) -> (TempRoot, Store) {
     for (hash, body) in before.bodies.defs() {
         store.put_body(hash, ply_store::DefBody::of(body.clone()));
     }
-    for (name, info) in &before.check.defs {
-        if let Some(hash) = before.hashes.defs.get(name) {
-            store.put_def(
-                *hash,
-                CachedDef::new(
-                    info.scheme.clone(),
-                    info.footprint.clone(),
-                    info.performed.clone(),
-                ),
-            );
-        }
-    }
+    crate::fixture::file_interfaces(
+        &mut store,
+        &root.0.join("m.ply"),
+        &before.check,
+        &before.hashes,
+    );
     let baseline = before.baseline(key);
     store.put(baseline.test_hash, Outcome::Pass);
     store.put_pass_record(
@@ -144,7 +138,14 @@ fn asked<R>(
     key: &str,
     ask: impl FnOnce(&mut BodyHybrid<'_>, &Delta, &Store) -> R,
 ) -> R {
-    let (_root, store) = passed(before, key);
+    let (root, mut store) = passed(before, key);
+    // The CLI files the program it loaded before the tests run.
+    crate::fixture::file_interfaces(
+        &mut store,
+        &root.0.join("m.ply"),
+        &after.check,
+        &after.hashes,
+    );
     let baseline = before.baseline(key);
     let rehashed = Rehashed::under(
         &after.sources(),
