@@ -88,7 +88,7 @@ fn load(dir: &str) -> &'static Source {
     let mut modules: Vec<(String, String)> = Vec::new();
     // The whole standard library: the kernels import `std.hash`, which imports others.
     for name in ply_std::modules() {
-        let text = ply_std::source(&name).expect("a listed std module has a source");
+        let text = ply_std::source(name).expect("a listed std module has a source");
         modules.push((name.to_string(), text.to_string()));
     }
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)

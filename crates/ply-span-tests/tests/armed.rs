@@ -12,9 +12,9 @@ const UNARMED_CODES: &[(&str, &str)] = &[];
 const UNARMED_VARIANTS: &[(&str, &str)] = &[
     (
         "Severity::Note",
-        "Two consumers and no producer: crates/ply-span/src/render.rs heads a \
-         rendered diagnostic \"Note\", and crates/ply-cli/src/commands/common.rs \
-         writes a dim \"note\". \
+        "Two consumers and no producer: `Diagnostic`'s Display in \
+         crates/ply-span/src/lib.rs heads a diagnostic \"Note\", and \
+         crates/ply-machine/src/payload.rs hands the program a \"note\". \
          Nothing builds one. Severity also derives Deserialize, so a Note could \
          in principle arrive from a stored diagnostic rather than from a \
          constructor — nothing in the workspace writes one, and the gate cannot \
@@ -944,23 +944,101 @@ fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
     out
 }
 
-/// The registry table's rows in ply-span's `#[cfg(test)]` module, read as text.
-fn registry_rows(root: &Path) -> BTreeSet<String> {
-    let raw = std::fs::read(root.join("crates/ply-span/src/lib.rs")).expect("ply-span's lib.rs");
-    let blanked = blank_literals_and_comments(&raw);
-    let at = find_all(&blanked, b"let registry = [")
+/// The registry of codes: the table `ply explain` answers from, one `m("E0000", "...")` per code.
+const REGISTRY: &str = "crates/ply-cli/ply/explain.ply";
+
+/// `(code, line)` for every row of the registry's `meanings()`, in the table's order. A row this
+/// cannot read fails the read rather than being skipped, so no code hides behind another shape.
+fn registry_rows(root: &Path) -> Vec<(String, usize)> {
+    let text = std::fs::read(root.join(REGISTRY)).expect("the registry is readable");
+    let head = find_all(&text, b"pub fn meanings()")
         .into_iter()
         .next()
-        .expect("the registry table is `let registry = [`");
-    let open = at + b"let registry = ".len();
-    let close = delim_close(&blanked, open);
-    find_all(&blanked[open..close], b"codes::")
-        .into_iter()
-        .map(|p| {
-            let (name, _) = ident_at(&blanked, open + p + b"codes::".len());
-            String::from_utf8_lossy(name).into_owned()
-        })
-        .collect()
+        .expect("the registry declares `pub fn meanings()`");
+    let open = text[head..]
+        .iter()
+        .position(|b| *b == b'[')
+        .map(|p| head + p)
+        .expect("`meanings()` is a list");
+    let mut rows = Vec::new();
+    let mut i = open + 1;
+    loop {
+        i = skip_ply_space(&text, i);
+        if text.get(i) == Some(&b']') {
+            return rows;
+        }
+        if !text[i..].starts_with(b"m(") {
+            unreadable_row(&text, i);
+        }
+        let row = i;
+        let (code, after) = ply_string(&text, skip_ply_space(&text, i + 2))
+            .unwrap_or_else(|| unreadable_row(&text, i));
+        i = skip_ply_space(&text, after);
+        if text.get(i) != Some(&b',') {
+            unreadable_row(&text, i);
+        }
+        let (_, after) = ply_string(&text, skip_ply_space(&text, i + 1))
+            .unwrap_or_else(|| unreadable_row(&text, i));
+        i = skip_ply_space(&text, after);
+        if text.get(i) == Some(&b',') {
+            i = skip_ply_space(&text, i + 1);
+        }
+        if text.get(i) != Some(&b')') {
+            unreadable_row(&text, i);
+        }
+        rows.push((code, line_of(&text, row)));
+        i = skip_ply_space(&text, i + 1);
+        match text.get(i) {
+            Some(b',') => i += 1,
+            Some(b']') => return rows,
+            _ => unreadable_row(&text, i),
+        }
+    }
+}
+
+fn unreadable_row(text: &[u8], at: usize) -> ! {
+    panic!(
+        "{REGISTRY}:{}: `meanings()` holds something other than an `m(\"E0000\", \"meaning\")` \
+         row, which the registry gates cannot read",
+        line_of(text, at)
+    )
+}
+
+/// Past whitespace and `//` comments.
+fn skip_ply_space(text: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < text.len() && text[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if !text[i..].starts_with(b"//") {
+            return i;
+        }
+        while i < text.len() && text[i] != b'\n' {
+            i += 1;
+        }
+    }
+}
+
+/// The string literal opening at `i`, undecoded, and the offset past its closing quote.
+fn ply_string(text: &[u8], i: usize) -> Option<(String, usize)> {
+    if text.get(i) != Some(&b'"') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < text.len() {
+        match text[j] {
+            b'\\' => j += 2,
+            b'"' => return Some((String::from_utf8_lossy(&text[i + 1..j]).into_owned(), j + 1)),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+fn is_code_shaped(code: &str) -> bool {
+    code.len() == 5
+        && matches!(code.as_bytes()[0], b'E' | b'W')
+        && code.as_bytes()[1..].iter().all(u8::is_ascii_digit)
 }
 
 /// Every production `Diagnostic::error`/`warning` call, as `(source, offset, first argument)`.
@@ -1162,7 +1240,9 @@ fn variant_is_armed(tree: &Tree, covered: &CoveredEnum, variant: &str) -> bool {
 struct Tree {
     sources: Vec<Source>,
     declared: BTreeMap<String, (String, usize)>,
-    rows: BTreeSet<String>,
+    /// The numbers a `.ply` source raises.
+    raised: BTreeSet<String>,
+    registry: Vec<(String, usize)>,
     armed: BTreeSet<String>,
     covered: Vec<CoveredEnum>,
     paths: BTreeSet<(String, String, usize)>,
@@ -1175,13 +1255,13 @@ fn tree() -> &'static Tree {
         let root = workspace_root();
         let sources = production_sources(&root);
         let declared = declared_codes(&root);
-        let rows = registry_rows(&root);
+        let registry = registry_rows(&root);
         // A Ply source raises a code by its number, so an arming there is matched against the
-        // registry rather than against `codes::NAME`.
-        let raised_in_ply = ply_armed_numbers(&ply_sources(&root));
+        // constant's number rather than against `codes::NAME`.
+        let raised = ply_armed_numbers(&ply_sources(&root));
         let mut armed = armed_codes(&sources);
         for (name, (number, _)) in &declared {
-            if raised_in_ply.contains(number) {
+            if raised.contains(number) {
                 armed.insert(name.clone());
             }
         }
@@ -1191,7 +1271,8 @@ fn tree() -> &'static Tree {
         Tree {
             sources,
             declared,
-            rows,
+            raised,
+            registry,
             armed,
             covered,
             paths,
@@ -1376,60 +1457,112 @@ fn every_diagnostic_constructor_call_names_its_code_literally() {
     );
 }
 
+/// Tooling matches on codes, so a number is published once, with one meaning, and never shared.
 #[test]
-fn every_registered_code_has_its_meaning_and_no_other_does() {
-    let Tree { declared, .. } = tree();
-    let numbers: BTreeSet<&str> = declared.values().map(|(code, _)| code.as_str()).collect();
-    let explained: BTreeSet<&str> = ply_span::MEANINGS.iter().map(|(c, _)| *c).collect();
-    let unexplained: Vec<&&str> = numbers.iter().filter(|c| !explained.contains(*c)).collect();
+fn every_code_declared_or_raised_has_one_row_in_the_registry() {
+    let Tree {
+        declared,
+        raised,
+        registry,
+        ..
+    } = tree();
+
     assert!(
-        unexplained.is_empty(),
-        "{} code(s) have no row in `ply_span::MEANINGS`, so `ply explain` cannot say what they \
-         mean: {unexplained:?}",
-        unexplained.len()
+        declared.len() > 50 && raised.len() > 50 && registry.len() > 50,
+        "parsed {} constants, {} numbers raised in Ply and {} registry rows — one of the three \
+         parsers is broken",
+        declared.len(),
+        raised.len(),
+        registry.len()
     );
-    let stale: Vec<&&str> = explained.iter().filter(|c| !numbers.contains(*c)).collect();
+
+    let mut named: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (name, (number, _)) in declared {
+        named
+            .entry(number.as_str())
+            .or_default()
+            .push(name.as_str());
+    }
+    let shared: Vec<String> = named
+        .iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(number, names)| format!("{number}: {}", names.join(", ")))
+        .collect();
     assert!(
-        stale.is_empty(),
-        "`ply_span::MEANINGS` explains {} code(s) nothing registers: {stale:?}",
-        stale.len()
+        shared.is_empty(),
+        "constants in ply_span::codes share a number, which nothing reading a code can tell \
+         apart: {shared:?}"
     );
-    assert_eq!(
-        ply_span::MEANINGS.len(),
-        explained.len(),
-        "a code is explained twice"
+
+    let mut rows: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (code, line) in registry {
+        rows.entry(code.as_str()).or_default().push(*line);
+    }
+    let twice: Vec<String> = rows
+        .iter()
+        .filter(|(_, lines)| lines.len() > 1)
+        .map(|(code, lines)| format!("{code} at lines {lines:?}"))
+        .collect();
+    assert!(
+        twice.is_empty(),
+        "{REGISTRY} explains a code twice: {twice:?}"
+    );
+
+    let wanted: BTreeSet<&str> = named
+        .keys()
+        .copied()
+        .chain(raised.iter().map(String::as_str))
+        .collect();
+    let missing: Vec<&&str> = wanted.iter().filter(|c| !rows.contains_key(**c)).collect();
+    assert!(
+        missing.is_empty(),
+        "{} code(s) declared in ply_span::codes or raised from a `.ply` source have no row in \
+         `meanings()` in {REGISTRY}, so `ply explain` cannot say what they mean: {missing:?}\n\n\
+         Add a row m(\"E0000\", \"what it means\") — adding a row moves no existing number.",
+        missing.len()
     );
 }
 
 #[test]
-fn the_code_registry_table_is_total_over_the_codes_module() {
-    let Tree { declared, rows, .. } = tree();
+fn the_registry_has_no_row_for_a_code_nothing_declares_or_raises() {
+    let Tree {
+        declared,
+        raised,
+        registry,
+        ..
+    } = tree();
 
     assert!(
-        declared.len() > 50 && rows.len() > 50,
-        "parsed {} constants and {} registry rows — one of the two parsers is broken",
-        declared.len(),
-        rows.len()
+        registry.len() > 50,
+        "parsed {} registry rows — the parser is broken",
+        registry.len()
     );
-
-    let missing: Vec<&String> = declared.keys().filter(|n| !rows.contains(*n)).collect();
+    let malformed: Vec<&str> = registry
+        .iter()
+        .map(|(code, _)| code.as_str())
+        .filter(|code| !is_code_shaped(code))
+        .collect();
     assert!(
-        missing.is_empty(),
-        "{} constant(s) in ply_span::codes have no row in the registry table in \
-         crates/ply-span/src/lib.rs: {:?}\n\nA code with no row has no published number that \
-         anything checks, so it can be renumbered without a test noticing. Add a row \
-         (\"NAME\", codes::NAME, \"E0000\") to `let registry = [` — adding a row moves no \
-         existing number.",
-        missing.len(),
-        missing
+        malformed.is_empty(),
+        "{REGISTRY} has rows whose code is not shaped E0000 or W0000: {malformed:?}"
     );
 
-    let stale: Vec<&String> = rows.iter().filter(|n| !declared.contains_key(*n)).collect();
+    let wanted: BTreeSet<&str> = declared
+        .values()
+        .map(|(number, _)| number.as_str())
+        .chain(raised.iter().map(String::as_str))
+        .collect();
+    let stale: Vec<String> = registry
+        .iter()
+        .filter(|(code, _)| !wanted.contains(code.as_str()))
+        .map(|(code, line)| format!("{code} at {REGISTRY}:{line}"))
+        .collect();
     assert!(
         stale.is_empty(),
-        "the registry table names {} constant(s) that ply_span::codes no longer declares: {:?}",
-        stale.len(),
-        stale
+        "the registry explains {} code(s) that nothing declares in ply_span::codes or raises from \
+         a `.ply` source: {stale:?}\n\nDelete the row, or raise the code where the condition it \
+         names is detected.",
+        stale.len()
     );
 }
 
