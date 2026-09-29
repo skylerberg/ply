@@ -1562,23 +1562,23 @@ fn a_root_carrying_a_dot_hands_back_the_spelling_that_was_stored() {
 #[test]
 fn only_the_latest_claims_parts_are_kept_and_a_damaged_file_keeps_none() {
     let root = TempRoot::new("claims-parts");
-    let parts = |entries: &[(u8, &str)]| {
+    let parts = |entries: &[(u8, &[u8])]| {
         entries
             .iter()
-            .map(|(n, text)| (content(*n), text.to_string()))
+            .map(|(n, bytes)| (content(*n), bytes.to_vec()))
             .collect::<std::collections::BTreeMap<_, _>>()
     };
+    // A part is bytes the store does not read, a length's worth of them included.
+    let two: &[u8] = &[2, 0, 0, 0, 0, 0, 0, 0, b'\n', 0xff];
     let mut store = root.open();
-    store.put_claims_parts(parts(&[(1, "one"), (2, "two 2\nlines")]));
-    assert_eq!(store.claims_part(content(1)).as_deref(), Some("one"));
+    store.put_claims_parts(parts(&[(1, b"one"), (2, two), (4, b"")]));
+    assert_eq!(store.claims_part(content(1)).as_deref(), Some(&b"one"[..]));
     store.flush().unwrap();
 
     let mut store = root.open();
-    assert_eq!(
-        store.claims_part(content(2)).as_deref(),
-        Some("two 2\nlines")
-    );
-    store.put_claims_parts(parts(&[(2, "two 2\nlines"), (3, "three")]));
+    assert_eq!(store.claims_part(content(2)).as_deref(), Some(two));
+    assert_eq!(store.claims_part(content(4)).as_deref(), Some(&b""[..]));
+    store.put_claims_parts(parts(&[(2, two), (3, b"three")]));
     store.flush().unwrap();
 
     let store = root.open();
@@ -1587,7 +1587,10 @@ fn only_the_latest_claims_parts_are_kept_and_a_damaged_file_keeps_none() {
         None,
         "an earlier answer's part"
     );
-    assert_eq!(store.claims_part(content(3)).as_deref(), Some("three"));
+    assert_eq!(
+        store.claims_part(content(3)).as_deref(),
+        Some(&b"three"[..])
+    );
 
     let path = root.path().join(CACHE_DIR_NAME).join("claims.answer");
     let mut bytes = fs::read(&path).unwrap();

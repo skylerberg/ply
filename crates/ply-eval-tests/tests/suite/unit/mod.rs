@@ -7,6 +7,7 @@ mod builtins;
 mod codec;
 mod compiled;
 mod cont;
+mod decode;
 mod escape;
 mod explore;
 mod host;

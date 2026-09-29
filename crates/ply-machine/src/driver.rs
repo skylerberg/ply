@@ -7,8 +7,9 @@ use crate::load::{
     unreadable,
 };
 use ply_codegen::c::producer;
+use ply_eval::Value as PlyValue;
+use ply_eval::decode::{self, At};
 use ply_prove::prove::{Claims, read_claims};
-use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_store::{ContentHash, Store};
 use ply_ty::{Front, ModuleInfo, ModuleName};
@@ -174,11 +175,12 @@ pub fn claims(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, Stri
     } else {
         Vec::new()
     };
-    let mut parts: Vec<Option<(String, Claims)>> = (0..modules.len())
+    let mut parts: Vec<Option<(Vec<u8>, Claims)>> = (0..modules.len())
         .map(|i| {
-            let text = store.as_deref()?.claims_part(keys[i])?;
-            let read = claims_part(&text, modules[i].source).ok()?;
-            Some((text, read))
+            let bytes = store.as_deref()?.claims_part(keys[i])?;
+            let part = ply_eval::codec::decode(&bytes).ok()?;
+            let read = claims_part(&part, modules[i].source).ok()?;
+            Some((bytes, read))
         })
         .collect();
 
@@ -193,9 +195,8 @@ pub fn claims(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, Stri
             .iter()
             .map(|&i| loaded.front.mod_pkg.get(i).copied().unwrap_or(0))
             .collect();
-        let dump =
-            ply_codegen::c::producer::claims_dump(&sources, &loaded.front.packages, &mod_pkg)
-                .map_err(|e| format!("{e:#}"))?;
+        let answer = producer::claims(&sources, &loaded.front.packages, &mod_pkg)
+            .map_err(|e| format!("{e:#}"))?;
         let items: HashMap<&str, usize> = modules
             .iter()
             .enumerate()
@@ -207,13 +208,16 @@ pub fn claims(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, Stri
             .iter()
             .filter_map(|law| Some((law.key.as_str(), *by_module.get(law.module.as_symbol())?)))
             .collect();
-        let unread = |e: String| format!("its answer does not read: {e}");
-        for (&i, text) in asked
+        let unread = |e: decode::Error| format!("its answer does not read: {e}");
+        let answer = At::new("`front.claims`' answer", &answer);
+        for (&i, part) in asked
             .iter()
-            .zip(split_claims(&dump, &asked, &items, &laws).map_err(unread)?)
+            .zip(split_claims(answer, &asked, &items, &laws).map_err(unread)?)
         {
-            let read = claims_part(&text, modules[i].source).map_err(unread)?;
-            parts[i] = Some((text, read));
+            let read = claims_part(&part, modules[i].source).map_err(unread)?;
+            let bytes = ply_eval::codec::encode(&part)
+                .map_err(|e| format!("a module's claims do not encode: {e}"))?;
+            parts[i] = Some((bytes, read));
         }
         if let Some(store) = store {
             let filed = keys
@@ -234,51 +238,43 @@ pub fn claims(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, Stri
     Ok(claims)
 }
 
-/// Each asked module's part: its position among `asked`, then the frames it owns.
+/// Each asked module's part, as the store keeps it: its position among `asked`, which its spans
+/// index, and the claims it owns.
 fn split_claims(
-    dump: &str,
+    answer: At<'_>,
     asked: &[usize],
     items: &HashMap<&str, usize>,
     laws: &HashMap<&str, usize>,
-) -> Result<Vec<String>, String> {
-    let mut parts: Vec<String> = (0..asked.len()).map(|at| format!("{at}\n")).collect();
-    let mut frames = Cursor::new(dump.as_bytes(), "frame");
-    while !frames.done() {
-        let start = frames.at();
-        let (words, payload) = frames.unit()?;
-        let owner = match words[..] {
-            ["law", _] => law_key(payload)?.and_then(|key| laws.get(key)),
-            [_, name] => items.get(name),
-            _ => None,
+) -> Result<Vec<PlyValue>, decode::Error> {
+    let mut owned: Vec<Vec<PlyValue>> = vec![Vec::new(); asked.len()];
+    for claim in answer.list()? {
+        let c = claim.ctor()?;
+        let owner = match c.name() {
+            "ClaimLaw" => laws.get(c.arg(0)?.field("key")?.utf8()?),
+            _ => items.get(c.arg(0)?.field("name")?.utf8()?),
         };
         let at = owner
             .and_then(|i| asked.iter().position(|j| j == i))
-            .ok_or_else(|| format!("`{}` belongs to no module asked", words.join(" ")))?;
-        parts[at].push_str(&dump[start..frames.at()]);
+            .ok_or_else(|| claim.error("a claim of no module asked"))?;
+        owned[at].push(claim.value().clone());
     }
-    Ok(parts)
+    Ok(owned
+        .into_iter()
+        .enumerate()
+        .map(|(at, claims)| {
+            crate::payload::record(vec![
+                ("at", crate::payload::count(at)),
+                ("claims", PlyValue::list(claims)),
+            ])
+        })
+        .collect())
 }
 
-fn law_key(payload: &[u8]) -> Result<Option<&str>, String> {
-    let mut fields = Cursor::new(payload, "field");
-    while !fields.done() {
-        let (words, text) = fields.unit()?;
-        if words == ["key"] {
-            return Ok(std::str::from_utf8(text).ok());
-        }
-    }
-    Ok(None)
-}
-
-/// A module's frames span only it, so every position up to its own reads as its source.
-fn claims_part(text: &str, source: SourceId) -> Result<Claims, String> {
-    let (at, frames) = text
-        .split_once('\n')
-        .ok_or("a module's claims have no position")?;
-    let at: usize = at
-        .parse()
-        .map_err(|_| format!("a module's claims are at `{at}`"))?;
-    read_claims(frames, &vec![source; at + 1])
+/// A module's claims span only it, so every position up to its own reads as its source.
+fn claims_part(part: &PlyValue, source: SourceId) -> Result<Claims, decode::Error> {
+    let part = At::new("a module's claims", part);
+    let at: usize = part.field("at")?.number()?;
+    read_claims(part.field("claims")?, &vec![source; at + 1])
 }
 
 struct FileState {
