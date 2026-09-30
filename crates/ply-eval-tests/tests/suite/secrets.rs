@@ -358,7 +358,7 @@ fn the_secrets_column_moves_the_listing_digest() {
 #[test]
 fn a_clause_may_not_answer_a_concrete_type_for_a_polymorphic_operation() {
     let source = r#"
-effect vault { read fetch[k](s: Secret<String>) -> a }
+effect vault { read fetch[k]<a>(s: Secret<String>) -> a }
 fn launder(s: Secret<String>) -> String / {vault.read[k]} = vault.fetch[k](s)
 test "launder" {
   handle {
@@ -385,7 +385,7 @@ test "launder" {
 #[test]
 fn a_clause_may_not_answer_the_wrong_type_for_a_polymorphic_operation() {
     let source = r#"
-effect box { read take[k]() -> a }
+effect box { read take[k]<a>() -> a }
 fn as_string() -> String / {box.read[k]} = box.take[k]()
 test "confuse" {
   handle {

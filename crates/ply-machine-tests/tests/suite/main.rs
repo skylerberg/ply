@@ -341,6 +341,7 @@ nondet effect machine {
 }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
+type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Raised = { diag: Diag, values: List<Value> }
 
 type Options = { host: Bool, trace: TraceOpts }
