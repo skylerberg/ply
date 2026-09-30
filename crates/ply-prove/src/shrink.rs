@@ -1,12 +1,10 @@
 //! Shrinking a counterexample.
 
-use crate::property::{
-    HARD_GEN_DEPTH, Judge, Outcome, TypeWorld, Ungeneratable, const_fn, fn_size, judge_case,
-};
+use crate::property::{HARD_GEN_DEPTH, TypeWorld, Ungeneratable, const_fn, fn_size};
 use ply_eval::IntTy;
 use ply_eval::{Decimal, Fixed, List, Value};
 use ply_eval::{SECRET, TASK_TYPE};
-use ply_span::{Diagnostic, Symbol};
+use ply_span::Symbol;
 use ply_ty::Type;
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -18,66 +16,6 @@ use std::sync::Arc;
 pub enum Target {
     Falsifies,
     Raises,
-}
-
-#[derive(Debug)]
-pub struct Shrunk {
-    pub values: Vec<Value>,
-    pub steps: u32,
-    /// Counted against `--shrink-budget`.
-    pub evaluations: u32,
-    /// For [`Target::Raises`], what the last accepted candidate raised.
-    pub diagnostic: Option<Diagnostic>,
-}
-
-/// Greedy descent: the first accepted candidate becomes the new value and the walk restarts.
-pub fn shrink(
-    values: &[Value],
-    types: &[Type],
-    world: &TypeWorld,
-    judge: &mut dyn Judge,
-    target: Target,
-    budget: u32,
-) -> Shrunk {
-    let mut current: Vec<Value> = values.to_vec();
-    let mut steps: u32 = 0;
-    let mut evaluations: u32 = 0;
-    let mut diagnostic: Option<Diagnostic> = None;
-
-    'restart: loop {
-        for index in 0..current.len() {
-            let Some(ty) = types.get(index) else { continue };
-            let here = size(&current[index], world);
-            for candidate in candidates(&current[index], ty, world) {
-                if size(&candidate, world) >= here {
-                    continue;
-                }
-                if evaluations >= budget {
-                    break 'restart;
-                }
-                let mut next = current.clone();
-                next[index] = candidate;
-                evaluations = evaluations.saturating_add(1);
-                let outcome = judge_case(judge, &next);
-                if outcome.matches(target) {
-                    if let Outcome::Raised(d) = outcome {
-                        diagnostic = Some(d);
-                    }
-                    current = next;
-                    steps = steps.saturating_add(1);
-                    continue 'restart;
-                }
-            }
-        }
-        break;
-    }
-
-    Shrunk {
-        values: current,
-        steps,
-        evaluations,
-        diagnostic,
-    }
 }
 
 /// A saturating structural measure, and the reason the walk terminates.

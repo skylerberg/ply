@@ -9,130 +9,37 @@ use std::sync::OnceLock;
 const UNARMED_CODES: &[(&str, &str)] = &[];
 
 /// Variants of a covered enum that no production source constructs.
-const UNARMED_VARIANTS: &[(&str, &str)] = &[
-    (
-        "Severity::Note",
-        "Two consumers and no producer: `Diagnostic`'s Display in \
+const UNARMED_VARIANTS: &[(&str, &str)] = &[(
+    "Severity::Note",
+    "Two consumers and no producer: `Diagnostic`'s Display in \
          crates/ply-span/src/lib.rs heads a diagnostic \"Note\", and \
          crates/ply-machine/src/payload.rs hands the program a \"note\". \
          Nothing builds one. Severity also derives Deserialize, so a Note could \
          in principle arrive from a stored diagnostic rather than from a \
          constructor — nothing in the workspace writes one, and the gate cannot \
          see serde either way. Disposition not decided here.",
-    ),
-    (
-        "AssertionKind::Bool",
-        "Eq is the only variant ever built, in crates/ply-test/src/slice.rs. \
-         This row holds the finding open.",
-    ),
-    (
-        "AssertionKind::Panic",
-        "Nothing constructs it either. See AssertionKind::Bool.",
-    ),
-    (
-        "AssertionKind::Runtime",
-        "Nothing constructs it either. See AssertionKind::Bool.",
-    ),
-    (
-        "AssertionKind::UnhandledEffect",
-        "Nothing constructs it either. See AssertionKind::Bool.",
-    ),
-    (
-        "AssertionKind::RecursionLimit",
-        "Nothing constructs it either. See AssertionKind::Bool.",
-    ),
-    (
-        "AssertionKind::Deadlock",
-        "Nothing constructs it either. See AssertionKind::Bool.",
-    ),
-    (
-        "Event::Enter",
-        "Nothing outside crates/ply-test-tests/tests/ constructs a SliceBuilder, \
-         so nothing calls SliceBuilder::record, so no Event is ever built. \
-         SliceBuilder::record does match on all three variants — that is a \
-         consumer, not a producer.",
-    ),
-    (
-        "Event::Return",
-        "Nothing constructs it either. See Event::Enter.",
-    ),
-    (
-        "Event::Perform",
-        "Nothing constructs it either. See Event::Enter.",
-    ),
-    (
-        "Confidence::Fused",
-        "The verdict is the program's now: `suite.bisect` in crates/ply-test/ply constructs every \
-         case a search reaches, and the runtime only marshals the verdict and matches on it. \
-         See Verdict::Bisected.",
-    ),
-    (
-        "Confidence::Minimal",
-        "The program's verdict. See Confidence::Fused.",
-    ),
-    (
-        "Confidence::Partial",
-        "The program's verdict. See Confidence::Fused.",
-    ),
-    (
-        "Unresolved::BudgetSpent",
-        "The search that spends a budget runs in the program. See Confidence::Fused.",
-    ),
-    (
-        "Skipped::NeverPassed",
-        "The gate is the program's: `suite.bisect`'s `precheck` decides every failure from the \
-         facts the runtime hands over. See Verdict::Bisected.",
-    ),
-    (
-        "Skipped::Host",
-        "The program's gate. See Skipped::NeverPassed.",
-    ),
-    (
-        "Skipped::Nondet",
-        "The program's gate. See Skipped::NeverPassed.",
-    ),
-    (
-        "Skipped::Panicked",
-        "The program's gate. See Skipped::NeverPassed.",
-    ),
-    (
-        "Skipped::NoChanges",
-        "The program's verdict, over the change set it classifies. See Verdict::Bisected.",
-    ),
-    (
-        "Verdict::Bisected",
-        "Every verdict is the program's: `crates/ply-test/ply/bisect.ply` constructs each case a \
-         search reaches, over the facts the runtime hands over. The runtime's own copy is only ever \
-         the default, and it matches on the rest (the artifact, the report), which is a consumer \
-         and not a producer.",
-    ),
-    (
-        "Verdict::Inconclusive",
-        "The program's verdict. See Verdict::Bisected.",
-    ),
-    (
-        "Verdict::NotInTheGraph",
-        "The program's verdict. See Verdict::Bisected.",
-    ),
-    (
-        "Verdict::NotReproduced",
-        "The program's verdict. See Verdict::Bisected.",
-    ),
-    (
-        "Verdict::Sole",
-        "The program's verdict. See Verdict::Bisected.",
-    ),
-    (
-        "Verdict::TestChanged",
-        "The program's verdict. See Verdict::Bisected.",
-    ),
-];
+)];
 
 /// Functions that take a code and hand it to `Diagnostic::error`/`warning` unchanged.
 const CODE_INDIRECTION: &[Indirection] = &[];
 
 /// Covered enum names that more than one covered enum declares.
-const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[];
+const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[
+    (
+        "Reason",
+        "crates/ply-test/src/lib.rs's Reason (why a test runs) and crates/ply-prove/src/prove/mod.rs's \
+         Reason (why the static tier stopped) share no variant name, so a `Reason::X` hit can only \
+         arm the enum that has X. If one of them gains a variant the other has, this gate stops \
+         telling them apart.",
+    ),
+    (
+        "Shape",
+        "crates/ply-prove/src/domain.rs's Shape (a domain the program measured) and \
+         crates/ply-prove/src/prove/egraph.rs's Shape (an e-graph node's constructor) share no \
+         variant name, so a `Shape::X` hit can only arm the enum that has X. If one of them gains \
+         a variant the other has, this gate stops telling them apart.",
+    ),
+];
 
 struct Indirection {
     file: &'static str,
@@ -141,8 +48,9 @@ struct Indirection {
     reason: &'static str,
 }
 
-/// Every `pub enum` under these directories is covered by the variant half.
-const COVERED_ENUM_ROOTS: &[&str] = &["crates/ply-test/src"];
+/// Every `pub enum` under these directories is covered by the variant half: the runtimes the test
+/// and prove packages drive, whose decisions are the packages' and whose mechanisms are these.
+const COVERED_ENUM_ROOTS: &[&str] = &["crates/ply-test/src", "crates/ply-prove/src"];
 
 /// Individually covered enums outside `COVERED_ENUM_ROOTS`, as `(file, name)`.
 const COVERED_ENUMS: &[(&str, &str)] = &[("crates/ply-span/src/lib.rs", "Severity")];
