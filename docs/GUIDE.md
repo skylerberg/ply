@@ -825,9 +825,9 @@ not license it, because no type records the join.
   binding, handed to an operation, put in a declared type, or handed to a
   `task.spawn` whose scheduler is older than the region).
 * `E0449`: a region handle (a cell, a task, or the continuation a clause's
-  `resume` binds) reaches a host operation, a host answer or an entry point's
-  argument (at run time). A continuation's type is an ordinary function's, so
-  this is the one check that sees it.
+  `resume` binds) reaches a host operation, a host answer, or an entry point's
+  argument or answer (at run time). A continuation's type is an ordinary
+  function's, so this is the one check that sees it.
 * `W0610`: a reference cycle; cycles are never freed.
 
 ## 8. Tests
@@ -835,10 +835,11 @@ not license it, because no type records the join.
 ### 8.1 Writing tests
 
 `test "label" { ... }` is an item with a block body (§6.5 shows one); it cannot
-be `pub`, referenced or given arguments. `assert(cond)` /
-`assert(cond, Some("why"))` and `assert_eq(actual, expected)` fail with `E0501`,
-the latter reporting both values and their first difference. Any other failure
-is `E0502`.
+be `pub`, referenced or given arguments. The body is `Unit`: a test passes when
+it finishes, so one that ends on a value, such as a comparison missing its
+`assert`, is `E0201`. `assert(cond)` / `assert(cond, Some("why"))` and
+`assert_eq(actual, expected)` fail with `E0501`, the latter reporting both
+values and their first difference. Any other failure is `E0502`.
 
 ### 8.2 Selection
 
@@ -1750,6 +1751,7 @@ pub fn compare(a: Bytes, b: Bytes) -> Ordering
 pub fn repeat(b: Bytes, n: Int) -> Bytes
 pub fn hex_of(b: Bytes) -> String
 pub fn bytes_of_hex(text: String) -> Bytes
+pub fn int_of_ascii(b: Bytes) -> Option<Int>
 ```
 
 Integers in a byte string, little-endian and big-endian: how a binary format and
@@ -1758,7 +1760,11 @@ or eight bytes of `n`; the `i` writers are the `u` ones' bytes, since two's
 complement is the representation, and exist so a call site says which it meant.
 Nothing here raises: a read past either end is `None`, and so is a `u64` past
 what an `Int` holds, so an answer is never a negative length. The `i` readers
-carry the sign, and `i64_be_at` answers for every `Int`.
+carry the sign, and `i64_be_at` answers for every `Int`. `int_of_ascii` reads a
+decimal integer written in ASCII — an optional `-`, then digits, and nothing else
+— and is `None` for anything else and for a number past what an `Int` holds; it
+is the one integer parser the shipped modules share, and `std.string`'s
+`int_of_string` is it over a `String`.
 
 ### 13.15 `std.pkg`
 
@@ -1890,7 +1896,7 @@ client trusts exactly this one by. Each call makes a new key. It is bound under
 `ply run --host`, and a test handles it over `canned(certificate, key, der,
 fingerprint)`.
 
-### 13.17 `std.random`
+### 13.18 `std.random`
 
 ```ply
 pub nondet effect entropy {
@@ -1900,9 +1906,11 @@ pub nondet effect entropy {
 pub fn next() -> Int / {entropy.next}
 pub fn below(n: Int) -> Int / {entropy.below}
 pub fn nonce() -> String / {entropy.next}
-pub type Rand = { root: Int, counter: Int }
+pub type Rand = { root: Int, key: Bytes, counter: Int }
 pub fn rand(root: Int) -> Rand
+pub fn rand_keyed(root: Int, key: Bytes) -> Rand
 pub fn rand_int(r: Rand) -> { value: Int, rand: Rand }
+pub fn rand_u64(r: Rand) -> { value: U64, rand: Rand }
 pub fn rand_bytes(r: Rand, n: Int) -> { bytes: Bytes, rand: Rand }
 pub fn rand_below(r: Rand, n: Int) -> Option<{ value: Int, rand: Rand }>
 ```
@@ -1918,14 +1926,18 @@ code that wants a seeded stream without a `simulate` region — a fuzz case, a
 shuffled order, a scatter. It is counter-mode BLAKE3, the construction ADR 0006
 chose for the simulation's *own* stream (`ply-eval`'s `sim::Stream`), so a result
 is a function of the root on every machine and every version; `rand_int` is
-sixty-three bits like the effect's, `rand_bytes` advances by the blocks it
-needs, and `rand_below` is uniform by rejection rather than by a remainder.
+sixty-three bits like the effect's, `rand_u64` all sixty-four of the same draw,
+`rand_bytes` advances by the blocks it needs, and `rand_below` is uniform by
+rejection rather than by a remainder. A key names one stream among many from a
+root — one claim's draws apart from every other's — and no two keys, nor a key
+and the simulation, share a block; `rand` is the empty key, the simulation's own
+stream. The counter is a field, so a stream may start at any draw.
 
 `simulate` answers the *prelude's* `random` with values a seed decides, which is
 what makes a simulation reproducible; that is why it is the scheduler's and not
 the host's. A run that is not simulated draws here, and `--host` binds it.
 
-### 13.18 `std.uuid`
+### 13.19 `std.uuid`
 
 ```ply
 pub type Uuid = { octets: Bytes }
@@ -1941,7 +1953,7 @@ rather than a raise. `uuid_v4` draws two machine words of `std.random` entropy
 and overwrites the version and variant bits, so a test pins it by handling
 `entropy.next`.
 
-### 13.19 `std.base64`
+### 13.20 `std.base64`
 
 ```ply
 pub fn base64_encode(data: Bytes) -> String
@@ -1958,7 +1970,7 @@ padded form), a letter outside the alphabet, or bits left over in the final
 group. So a decode of an encode is the identity, and so is an encode of a
 decode.
 
-### 13.20 `std.url`
+### 13.21 `std.url`
 
 ```ply
 pub fn url_encode(text: String) -> String
@@ -1978,7 +1990,7 @@ and is what a query string and a form body carry. A decoder is total and answers
 empty part is passed over, a part with no `=` is a name with an empty value) and
 `query_build` spells them back with `form_encode` on both sides.
 
-### 13.21 `std.csv`
+### 13.22 `std.csv`
 
 ```ply
 pub fn csv_parse(text: String) -> Option<List<List<String>>>
@@ -1993,7 +2005,7 @@ return. A bare line feed also ends a record, because files in the world have
 one; the writer always writes CRLF. A trailing line break adds no record and an
 empty line is one empty field.
 
-### 13.22 `std.msgpack`
+### 13.23 `std.msgpack`
 
 ```ply
 pub type Value =
@@ -2013,7 +2025,7 @@ past 64, a `float32` or an extension type, or a `uint64` above `i63` — checkin
 every length against what is left before walking it, so a hostile header cannot
 make it loop.
 
-### 13.23 `std.parse`
+### 13.24 `std.parse`
 
 ```ply
 pub type Step<a> = { value: a, at: Int }
@@ -2046,7 +2058,7 @@ match the empty string still cannot loop, and nothing needs a fuel argument.
 This is the shape `std.json`, `std.db` and `std.http` already write by hand, as
 a module a user's parser can share.
 
-### 13.24 `std.string`
+### 13.25 `std.string`
 
 ```ply
 pub fn join(parts: List<String>, sep: String) -> String
@@ -2071,6 +2083,9 @@ pub fn lines(text: String) -> List<String>
 pub fn words(text: String) -> List<String>
 pub fn count(text: String, needle: String) -> Int
 pub fn capitalize(text: String) -> String
+pub fn int_of_string(text: String) -> Option<Int>
+pub fn code_points(text: String) -> List<Int>
+pub fn of_code_points(points: List<Int>) -> Option<String>
 ```
 
 The whole the prelude's string builtins do not make: `join` (which three shipped
@@ -2083,9 +2098,12 @@ lines rather than one empty line; `words` is the runs that are not whitespace an
 never empty. `count` does not overlap. Every one is total — `replace` with an
 empty needle is the text unchanged rather than a loop, and the case fold touches
 `A-Z`/`a-z` and leaves every other character as it is. `std.bytes.join` is the
-same operation over `Bytes`.
+same operation over `Bytes`. `int_of_string` is `std.bytes.int_of_ascii` over the
+text: `"7.5"`, `" 7"` and `"+7"` are `None`. `code_points` is each character's
+Unicode scalar value, and `of_code_points` spells them back, `None` when one is
+negative, a surrogate (`U+D800` to `U+DFFF`) or past `U+10FFFF`.
 
-### 13.25 `std.option`
+### 13.26 `std.option`
 
 ```ply
 pub fn option_map<a, b>(o: Option<a>, f: (a) -> b) -> Option<b>
@@ -2108,7 +2126,7 @@ already has (for lists, and for `std.parse`), and an unqualified `map` that
 silently took an `Option` would be a trap. `option_expect` is the one place an
 absent value is a defect, so its message says why it cannot happen.
 
-### 13.26 `std.result`
+### 13.27 `std.result`
 
 ```ply
 pub fn result_map<a, b, e>(r: Result<a, e>, f: (a) -> b) -> Result<b, e>
@@ -2128,7 +2146,7 @@ pub fn result_map_or<a, b, e>(r: Result<a, e>, fallback: b, f: (a) -> b) -> b
 The same shape over `Ok`/`Err`. `result_map_err` is how a low-level failure
 becomes the one a caller names.
 
-### 13.27 `std.math`
+### 13.28 `std.math`
 
 ```ply
 pub fn min_int() -> Int
@@ -2155,7 +2173,7 @@ predicates. `gcd` and `lcm` are never negative, and `gcd(0, 0)` is `0`.
 below one, and `isqrt` is the greatest `r` with `r * r <= n` — `0` for a negative
 `n`, which has none.
 
-### 13.28 `std.list`
+### 13.29 `std.list`
 
 ```ply
 pub fn first<a>(xs: List<a>) -> Option<a>
@@ -2205,7 +2223,7 @@ between the elements, and `unique` keeps each element's first occurrence — its
 membership test is a map's, so it is `n log n` rather than the `n²` a scan
 through the output would be.
 
-### 13.29 `std.map`
+### 13.30 `std.map`
 
 ```ply
 pub fn is_empty<k, v>(m: Map<k, v>) -> Bool
@@ -2232,7 +2250,7 @@ stay in the prelude, as `map_fold` and `map_update`: a wrapper's signature close
 the effect row, and a fold that could not perform an effect would not be the
 prelude's.
 
-### 13.30 `std.set`
+### 13.31 `std.set`
 
 ```ply
 pub fn empty<a>() -> Map<a, Unit> where derivable(ord, a)
@@ -2264,7 +2282,7 @@ and `difference` walk one set's elements and ask the other, so each is `n log n`
 There is no `fold` here: the fold is the prelude's `map_fold`, whose open effect
 row a wrapper would close.
 
-### 13.31 `std.bigint`
+### 13.32 `std.bigint`
 
 ```ply
 pub type BigInt = { negative: Bool, limbs: List<Int> }
@@ -2313,6 +2331,49 @@ included as exact on the way in and out. One implementation note worth keeping:
 `limbs_of` is written as a plain recursion rather than a tail loop because a self
 tail call that passes an `Int` at or beyond 2^62 back to itself releases the word
 and reuses it (card `6298c4dd`).
+
+### 13.33 `std.decimal`
+
+```ply
+pub fn scale(d: Decimal) -> Int
+pub fn normalize(d: Decimal) -> Decimal
+pub fn trunc(d: Decimal) -> Decimal
+pub fn fract(d: Decimal) -> Decimal
+pub fn is_negative(d: Decimal) -> Bool
+pub fn abs(d: Decimal) -> Decimal
+pub fn of_parts(mantissa: Int, scale: Int) -> Option<Decimal>
+pub fn max_value() -> Decimal
+pub fn min_value() -> Decimal
+```
+
+What a `Decimal` is made of. A value keeps the scale it was written or computed
+at, so `1.5m == 1.50m` while `scale` answers 1 and 2; `normalize` is the same
+value at the least scale that holds it. `trunc` goes toward zero and `fract` is
+what it leaves, with the value's sign. `of_parts(150, 2)` is `1.50m`, and a
+scale outside `0..=28` is `None`. The extremes are the 96-bit mantissa at scale
+zero and its negation.
+
+### 13.34 `std.float`
+
+```ply
+pub fn is_nan(f: Float) -> Bool
+pub fn is_infinite(f: Float) -> Bool
+pub fn is_finite(f: Float) -> Bool
+pub fn is_sign_negative(f: Float) -> Bool
+pub fn abs(f: Float) -> Float
+pub fn trunc(f: Float) -> Float
+pub fn pow2(k: Int) -> Float
+pub fn nan() -> Float
+pub fn infinity() -> Float
+pub fn neg_infinity() -> Float
+pub fn max_value() -> Float
+```
+
+A `Float`'s classification, sign and magnitude, read off its IEEE-754 bits, so
+nothing here raises. `is_sign_negative` holds for `-0.0` and a negative NaN too.
+`trunc` goes toward zero and keeps the sign, leaving a NaN or an infinity as it
+is. `pow2(k)` is `2^k` exactly, through the subnormals down to `2^-1074`, zero
+below that and an infinity above `2^1023`.
 
 ## 14. The host boundary
 
@@ -2751,13 +2812,14 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads.
 * No file handles — `fs` reads a range and appends by path, with nothing open
-  between calls — and no recursive walk, permissions or `stdin`; no
-  cancellation or backpressure; no migrations or live schema check; HTTP/1.1
-  only; no authentication framework.
+  between calls — and no recursive walk or permissions; no cancellation or
+  backpressure; no migrations or live schema check; HTTP/1.1 only; no
+  authentication framework.
 
-Sharp edges: `x.f(y)` with a bare variable `x` is a perform; a missing handler
-clause fails at run time; a record update needs the base's type to be known
-where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
+Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no
+`handle` names is found only when it reaches the host boundary at run time
+(`E0424`), unless its effect is `nondet` in a deterministic test (`E0412`); a
+record update needs the base's type to be known where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
 `string_find` and `list_set` raise where `list_at` answers `None`.
 
 ## 19. Examples

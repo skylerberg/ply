@@ -17,13 +17,7 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 - **One implementation, O(change) everywhere.** Nothing is redone that an edit did not reach,
   including in the compiler's own loop. New code is Ply; Rust is ported as work reaches it.
 
-## Work
-
-- Reach: packages with dependencies pinned by content hash.
-
 ## Open
 
 - Loops and mutable variables, dispatch and method syntax: stay out unless generated code's
   error rate says otherwise.
-- The module system's shape: manifests, hash-pinned dependencies, the standard library as a
-  package.
