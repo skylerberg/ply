@@ -923,15 +923,18 @@ pub fn sort_bytes(xs: List<Bytes>) -> List<Bytes> =
     append(push(take(acc, i), x), map(range(i, n), |j: Int| at(acc, j)))
   })
 
+// An effect's operations share one encoder, so each one's type parameters go out of scope after it.
 fn op_def(z: Nz, op: OpDef) -> Nz = {
-  let z1: Nz = boolv(
-    emit(strv(tag(z, t_op()), op.name.name), byte_of(mode_byte(op.mode))),
-    op.resource_param,
+  let z1: Nz = u32v(
+    boolv(emit(strv(tag(z, t_op()), op.name.name), byte_of(mode_byte(op.mode))), op.resource_param),
+    len(op.ty_params),
   );
-  type_expr(
-    fold(op.params, u32v(z1, len(op.params)), |acc: Nz, p: TypeExpr| type_expr(acc, p)),
+  let bound: Nz = { ..z1, ty_params: append(z1.ty_params, map(op.ty_params, |p: Ident| p.name)) };
+  let encoded: Nz = type_expr(
+    fold(op.params, u32v(bound, len(op.params)), |acc: Nz, p: TypeExpr| type_expr(acc, p)),
     op.ret,
-  )
+  );
+  { ..encoded, ty_params: z.ty_params }
 }
 
 pub fn test_def(z: Nz, d: TestDef) -> Nz = expr(boolv(tag(z, t_test()), d.is_nondet), d.body)
@@ -3274,6 +3277,10 @@ fn p_fn(x: Pr, d: Dc, name: Bytes) -> Got = {
   }
 }
 
+fn type_binders(count: Int) -> Bytes =
+  if count > 0 { bytes_concat_all([b"<", joined(map(range(0, count), tname), b", "), b">"]) }
+  else { b"" }
+
 fn p_type_def(x: Pr, d: Dc, name: Bytes) -> Got = {
   let n: Rd = rd_binders(expect(d, t_type(), b"a type"));
   let k = rd_u8({ ..n.d, typs: n.v });
@@ -3299,17 +3306,7 @@ fn p_type_def(x: Pr, d: Dc, name: Bytes) -> Got = {
     });
     { d: vs.d, t: bytes_concat_all(vs.ts) }
   } else { panic("a tag that does not begin a type body") };
-  {
-    d: body.d,
-    t: bytes_concat_all([
-      b"type ",
-      name,
-      if n.v > 0 { bytes_concat_all([b"<", joined(map(range(0, n.v), tname), b", "), b">"]) }
-      else { b"" },
-      b" = ",
-      body.t,
-    ]),
-  }
+  { d: body.d, t: bytes_concat_all([b"type ", name, type_binders(n.v), b" = ", body.t]) }
 }
 
 fn p_effect(x: Pr, d: Dc, name: Bytes) -> Got = {
@@ -3322,17 +3319,19 @@ fn p_effect(x: Pr, d: Dc, name: Bytes) -> Got = {
     let op = rd_text(expect(g, t_op(), b"an operation"));
     let m = rd_mode(op.d);
     let r = rd_bool(m.d);
-    let pc = rd_count(r.d);
+    let tc = rd_binders(r.d);
+    let pc = rd_count({ ..tc.d, typs: tc.v });
     let ps = rd_many(pc.d, pc.v, |h: Dc| p_type(x, h));
     let ret = p_type(x, ps.d);
     {
-      d: ret.d,
+      d: { ..ret.d, typs: g.typs },
       t: bytes_concat_all([
         nl(1),
         m.t,
         b" ",
         op.t,
         if r.v { b"[r]" } else { b"" },
+        type_binders(tc.v),
         b"(",
         joined(ps.ts, b", "),
         b") -> ",
@@ -4101,6 +4100,26 @@ test "a label binder, the resources it names and the labels a call fills print b
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "renaming an operation's type parameter does not move a hash, and it prints back bound" {
+  let boxed = |v: Bytes|
+    bytes_concat_all([
+      b"pub effect box { read take[k]<",
+      v,
+      b">(xs: List<",
+      v,
+      b">) -> ",
+      v,
+      b" }",
+    ]);
+  let out = hash_index(indexed([{ name: b"m", src: boxed(b"a") }]));
+  let renamed = hash_index(indexed([{ name: b"m", src: boxed(b"b") }]));
+  assert_eq(by_name(named_hashes(renamed)), by_name(named_hashes(out)));
+  let ms = printed_of(out, []);
+  assert(holds_text(at(ms, 0).text, b"read take[r]<_t0>(List<_t0>) -> _t0"));
+  let again = hash_index(indexed([{ name: b"m", src: at(ms, 0).text }]));
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
