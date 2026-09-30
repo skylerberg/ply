@@ -111,6 +111,93 @@ pub fn json_of(output: &Output) -> Value {
         .unwrap_or_else(|e| panic!("`--json` writes one document on stdout: {e}\n{text}"))
 }
 
+/// What `ply check --explain --json` answers about the program at `dir`, less what two runs of one
+/// program may differ by: where the project is, what each phase cost and where its answer came
+/// from, and the cache's own warnings.
+#[track_caller]
+pub fn check_answer(dir: &Path) -> Value {
+    let mut answer = json_of(
+        &ply(dir)
+            .args(["check", "--explain", "--json"])
+            .output()
+            .expect("`ply check` runs"),
+    );
+    let object = answer.as_object_mut().expect("one object");
+    object.remove("root");
+    object.remove("files");
+    object.remove("front_end");
+    if let Some(Value::Array(modules)) = object.get_mut("modules") {
+        for module in modules.iter_mut() {
+            if let Some(module) = module.as_object_mut() {
+                module.remove("file");
+            }
+        }
+    }
+    if let Some(Value::Array(diagnostics)) = object.get_mut("diagnostics") {
+        use ply_span::codes;
+        let about_the_cache = [
+            codes::CACHE_UNREADABLE,
+            codes::CACHE_CORRUPT,
+            codes::CACHE_VERSION_CHANGED,
+            codes::STDLIB_CHANGED,
+        ];
+        diagnostics.retain(|d| !about_the_cache.contains(&d["code"].as_str().unwrap_or("")));
+    }
+    answer
+}
+
+/// Every source under `from`, and nothing its caches hold, copied to `to`.
+pub fn copy_sources(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from)
+        .expect("the project is readable")
+        .flatten()
+    {
+        let path = entry.path();
+        let name = entry.file_name();
+        if path.is_dir() {
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            std::fs::create_dir_all(to.join(&name)).expect("the copy's directory is made");
+            copy_sources(&path, &to.join(&name));
+        } else {
+            std::fs::copy(&path, to.join(&name)).expect("the source is copied");
+        }
+    }
+}
+
+/// The program at `dir` checked from nothing: its sources, beside no cache.
+#[track_caller]
+pub fn cold_answer(dir: &Path) -> Value {
+    let copy = scratch();
+    copy_sources(dir, copy.path());
+    check_answer(copy.path())
+}
+
+/// A check at `dir`, seeded from and filing into its cache, answers what a cold check of the same
+/// sources does. The warm run goes first, so the cache it reads is the one the last step left.
+#[track_caller]
+pub fn warm_agrees(dir: &Path, what: &str) -> Value {
+    let warm = check_answer(dir);
+    let cold = cold_answer(dir);
+    assert_eq!(
+        warm, cold,
+        "{what}: a check seeded from the cache answered differently from one that started cold"
+    );
+    warm
+}
+
+/// How many definitions a `ply check` at `dir` took from the cache, and how many it checked.
+#[track_caller]
+pub fn seeding(dir: &Path) -> (u64, u64) {
+    let answer = json_of(&ply(dir).args(["check", "--json"]).output().unwrap());
+    let definitions = &answer["front_end"]["definitions"];
+    (
+        definitions["seeded"].as_u64().expect("a seeded count"),
+        definitions["checked"].as_u64().expect("a checked count"),
+    )
+}
+
 /// A port for a `ply run --host` server a test is about to start, held against every other test
 /// that reserves this way until the server has answered on it.
 ///

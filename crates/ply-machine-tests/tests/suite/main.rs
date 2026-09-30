@@ -1,14 +1,12 @@
 //! The nested-entry capability, end to end: a program performs `machine.load`/`machine.bound`/
 //! `machine.enter` over a project on disk, and another program has run — its ending a value the
-//! caller reads, and the load incremental over the project's own store.
+//! caller reads.
 //!
 //! One binary. The engine's own unit tests, one per module of `crates/ply-machine/src`, are in
 //! `tests/unit`.
 
 mod claims;
-mod dependency_cache;
 mod fixture;
-mod modules_hash_audit;
 mod prover_runs;
 mod prover_soundness_audit;
 mod replay;
@@ -40,7 +38,7 @@ type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
-type Options = { host: Bool, trace: TraceOpts, cache: Bool }
+type Options = { host: Bool, trace: TraceOpts }
 type TraceOpts = { sink: String, level: String }
 
 type At = { module: Int, start: Int, end: Int }
@@ -93,9 +91,10 @@ type Bound = {
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
-  packages: List<{ root: String, digest: String }>,
   read_ms: Int,
   front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
 }
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
 
@@ -188,7 +187,6 @@ fn entered_with(inner: &str, host: bool) -> Value {
         &mut registry,
         ply_machine::drive::RunOptions {
             host,
-            cache: false,
             ..Default::default()
         },
     );
@@ -313,7 +311,7 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
 }
 
 /// A load, a bound entry, then a reload after the tree moved: the second answer is the new
-/// program's, and the store the first load wrote is what the second read.
+/// program's.
 const OUTER_TWICE: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
@@ -330,7 +328,7 @@ type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
-type Options = { host: Bool, trace: TraceOpts, cache: Bool }
+type Options = { host: Bool, trace: TraceOpts }
 type TraceOpts = { sink: String, level: String }
 
 type At = { module: Int, start: Int, end: Int }
@@ -381,9 +379,10 @@ type Bound = {
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
-  packages: List<{ root: String, digest: String }>,
   read_ms: Int,
   front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
 }
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
 
@@ -420,13 +419,7 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
 
     let mut registry = HostRegistry::new();
-    ply_machine::register_with(
-        &mut registry,
-        ply_machine::drive::RunOptions {
-            cache: true,
-            ..Default::default()
-        },
-    );
+    ply_machine::register_with(&mut registry, ply_machine::drive::RunOptions::default());
     let binding = Arc::new(registry.bind(&front.check).expect("the machine ops bind"));
 
     let call = |entry: &str, args: Vec<Value>| {
@@ -445,8 +438,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     );
     assert_eq!(option_text(&first).as_deref(), Some("1"));
     assert!(
-        project.path().join(".ply-cache").is_dir(),
-        "the load wrote its store"
+        !project.path().join(".ply-cache").exists(),
+        "a machine's load reads the answer it was handed and files nothing"
     );
 
     std::fs::write(&inner, "fn main() -> Int = 2\n").unwrap();
@@ -513,7 +506,6 @@ type Options = {
   backend: Option<String>,
   profile: String,
   argv: List<String>,
-  cache: Bool,
 }
 
 type At = { module: Int, start: Int, end: Int }
@@ -561,9 +553,10 @@ type Bound = {
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
-  packages: List<{ root: String, digest: String }>,
   read_ms: Int,
   front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
 }
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
 type Ended = { exit: Option<Int>, value: Option<String>, raised: Option<Diag>, rest: Int }
@@ -597,7 +590,6 @@ fn opts(host: Bool) -> Options =
     backend: None,
     profile: "development",
     argv: [],
-    cache: false,
   }
 
 fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
@@ -670,9 +662,10 @@ type Bound = Unit
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
-  packages: List<{ root: String, digest: String }>,
   read_ms: Int,
   front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
 }
 type Refusal = Unit
 type Ended = Unit
@@ -733,7 +726,6 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
         &mut registry,
         ply_machine::drive::RunOptions {
             host: false,
-            cache: false,
             ..Default::default()
         },
         "m",

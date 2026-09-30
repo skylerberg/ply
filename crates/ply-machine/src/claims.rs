@@ -98,7 +98,6 @@ pub struct Job {
     /// The front end the CLI ran. A run without one is refused rather than loading again: `ply
     /// prove` and `ply review` start one and hand its answer over.
     pub front: Option<crate::driver::HandedFront>,
-    pub incremental: bool,
     pub use_cache: bool,
     /// Also discharge what the shipped modules declare.
     pub std: bool,
@@ -1062,7 +1061,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
         }
     };
     let mut warnings = store.take_warnings();
-    let loaded = match load(&job, &mut store) {
+    let loaded = match load(&job) {
         Ok(loaded) => loaded,
         Err(err) => {
             let _ = told.send(Step::Collected(Box::new(Err(Refused {
@@ -1299,9 +1298,8 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
 
 /// Every module parsed: a clause the run did not read is a claim nobody checked.
 ///
-/// The walk and the compiler are the CLI's, and what it answered is what this reads. `incremental`
-/// still decides whether the store takes part, exactly as it did when this side ran the front end.
-fn load(job: &Job, store: &mut Store) -> Result<Loaded, LoadError> {
+/// The walk and the compiler are the CLI's, and what it answered is what this reads.
+fn load(job: &Job) -> Result<Loaded, LoadError> {
     let Some(front) = &job.front else {
         return Err(LoadError {
             sources: ply_span::SourceMap::new(),
@@ -1317,22 +1315,7 @@ fn load(job: &Job, store: &mut Store) -> Result<Loaded, LoadError> {
             ],
         });
     };
-    let mode = if job.incremental {
-        crate::driver::Mode::Incremental
-    } else {
-        crate::driver::Mode::Full
-    };
-    let store = job.incremental.then_some(store);
-    crate::driver::load_over_front(
-        &job.path,
-        &front.files,
-        &front.packages,
-        &front.dump,
-        front.read,
-        front.front,
-        mode,
-        store,
-    )
+    crate::driver::load_over_front(&job.path, front)
 }
 
 fn flushed(store: &mut Store) -> Vec<Diagnostic> {
@@ -2176,7 +2159,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
     Ok(Job {
         path: PathBuf::from(str_at("path")?),
         front: None,
-        incremental: !bool_at("no_incremental")?,
         use_cache: !bool_at("no_cache")?,
         std: bool_at("std")?,
         jobs: opt_int_at(v, "jobs", span)?.map(|n| n as u32),
