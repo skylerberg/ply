@@ -1,8 +1,68 @@
 use ply_eval::Plan;
 use ply_span::{Diagnostic, SourceId};
+use ply_store::Store;
 use ply_test::{Choice, Reason, Selection};
-use ply_ty::{CheckOutput, DefHash, HashOutput, ModuleName};
+use ply_ty::{CheckOutput, DefHash, Footprint, HashOutput, ModuleName};
 use std::collections::{BTreeMap, HashMap};
+
+/// Files a checked program's definitions as the CLI does before its tests run: each one's row and
+/// scheme under its hash and name, and the file's fingerprint naming the hashes it has now.
+///
+/// `Value::Record` holds an `Arc`, and its fields are not `Send`.
+#[allow(clippy::arc_with_non_send_sync)]
+pub fn file_interfaces(
+    store: &mut Store,
+    file: &std::path::Path,
+    check: &CheckOutput,
+    hashes: &HashOutput,
+) {
+    use ply_eval::{Fields, Value};
+    use ply_span::Symbol;
+    let record = |fields: Vec<(&str, Value)>| {
+        Value::Record(std::sync::Arc::new(Fields::from_unsorted(
+            fields
+                .into_iter()
+                .map(|(k, v)| (Symbol::new(k), v))
+                .collect(),
+        )))
+    };
+    let mut fingerprint = ply_store::SourceFingerprint::new(ply_store::ContentHash::of(b""));
+    for (name, info) in &check.defs {
+        let Some(hash) = hashes.defs.get(name) else {
+            continue;
+        };
+        let footprint = |f: &Footprint| Value::bytes(ply_ty::print_footprint(f).as_bytes());
+        let row = record(vec![
+            ("name", Value::bytes(name.as_str().as_bytes())),
+            ("hash", Value::bytes(hash.0)),
+            ("witness", Value::list(Vec::new())),
+            ("footprint", footprint(&info.footprint)),
+            ("performed", footprint(&info.performed)),
+        ]);
+        let filed = record(vec![
+            ("row", row),
+            (
+                "scheme",
+                Value::bytes(ply_ty::print_scheme(&info.scheme).as_bytes()),
+            ),
+        ]);
+        store.put_def(
+            *hash,
+            ply_store::Slot {
+                name: name.clone(),
+                value: ply_eval::codec::encode(&filed).expect("a filed interface is plain data"),
+            },
+        );
+        fingerprint.defs.push(ply_store::DefEntry {
+            name: name.clone(),
+            hash: *hash,
+            span: ply_store::FileSpan { start: 0, end: 0 },
+            kind: ply_store::DefKind::Fn,
+            members: Vec::new(),
+        });
+    }
+    store.put_source(file, fingerprint);
+}
 
 #[track_caller]
 pub fn port_front(sources: &[(String, String)], ids: &[SourceId]) -> ply_ty::Front {

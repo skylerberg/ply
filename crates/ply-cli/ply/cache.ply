@@ -4,19 +4,50 @@
 // four subcommands say, in both forms, and what they exit with.
 
 import args (Flags, no_flags, style_of)
+import compiler.front (DefInterface, DeclInterface, FiledOp, FiledVariant, Filing, KnownTestRow)
+import compiler.hash (hex)
 import compiler.resolve (Diag)
 import diagnostic (all_to_json, all_to_text)
 import report (Answer, ind, ok_code, compile_error, count_of, plural, warning_lines)
 import std.json (Json, Null, Str, Bool, Number, Array, Member, object, to_string)
 import style (Style, plain, bold, dim, green, yellow)
 
-// The store this project keeps, as the Rust side opens and works it. One operation per subcommand:
-// the action has already run when the program performs it, so what comes back is what was done.
+// The store this project keeps, as the Rust side opens and works it. One operation per `ply cache`
+// subcommand, whose action has already run when the program performs it, so what comes back is
+// what was done; and the front-end cache every load reads before it analyses and files after.
 pub nondet effect store {
   read statistics[r](root: String) -> Result<Stats, Refusal>
   read matches[r](query: String, root: String) -> Result<Matches, Refusal>
   write compacted[r](root: String) -> Result<Compacted, Refusal>
   write cleared[r](root: String) -> Result<Cleared, Refusal>
+  read known[r](root: String, sources: Sources) -> Recorded
+  write file[r](root: String, sources: Sources, filing: Filing, whole: Bool) -> List<Diag>
+}
+
+// --- What a load reads and files ----------------------------------------------
+
+// One file a load read: where from, the module it is, and its bytes. The store keys it by its path,
+// a dependency's under its package's identity, and a shipped module's by its pseudo-path.
+pub type SourceFile = { path: String, name: String, text: Bytes }
+
+// A dependency package's root, and the identity its files are keyed under: its manifest's digest.
+pub type SourcePackage = { root: String, digest: String }
+
+pub type Sources = { files: List<SourceFile>, packages: List<SourcePackage> }
+
+// A shipped module's entry as the store last filed it.
+pub type ShippedEntry = { name: Bytes, hash: Bytes }
+
+// What the shipped modules were when the store was last filed, by a compiler whose were different.
+pub type StdlibMoved = { was: String, now: String, entries: List<ShippedEntry> }
+
+// What the store holds for the files a load reads: every definition's and test's filed rows,
+// whatever hash each was filed under, and what opening and reading the store degraded past.
+pub type Recorded = {
+  defs: List<DefInterface>,
+  tests: List<KnownTestRow>,
+  stdlib: Option<StdlibMoved>,
+  warnings: List<Diag>,
 }
 
 // --- What the Rust side answers with ----------------------------------------
@@ -98,6 +129,7 @@ pub type Interface =
 
 pub type Outcome = | Passed | Failed(String)
 
+// One match as a report prints it.
 pub type Entry = {
   // A definition's program-wide name, or a test's name as it was written.
   name: String,
@@ -114,7 +146,28 @@ pub type Entry = {
   outcome: Option<Outcome>,
 }
 
-pub type Matches = { directory: String, warnings: List<Diag>, entries: List<Entry> }
+// What the front end filed for a match, handed over as it was filed. `Unfiled` is a half-pruned
+// cache, a slot written for other names, or a value that no longer reads.
+pub type Filed =
+  | FiledDefinition(DefInterface)
+  | FiledDeclaration(DeclInterface)
+  | FiledTestRow(KnownTestRow)
+  | Unfiled
+
+// One match as the Rust side found it.
+pub type Hit = {
+  name: String,
+  kind: Kind,
+  hash: String,
+  file: String,
+  location: Option<String>,
+  stale: Bool,
+  filed: Filed,
+  body: Option<Body>,
+  outcome: Option<Outcome>,
+}
+
+pub type Matches = { directory: String, warnings: List<Diag>, entries: List<Hit> }
 
 // --- Small things -----------------------------------------------------------
 
@@ -413,6 +466,85 @@ fn clear_lines(s: Style, c: Cleared) -> List<String> =
 
 // --- `ply cache inspect` ----------------------------------------------------
 
+fn texts_of(bs: List<Bytes>) -> List<String> = map(bs, |b: Bytes| string_of_bytes_lossy(b))
+
+// A row's atoms, one per line of the footprint: a row is written `atom,atom`, and one headed by the
+// labels its atoms bind is shown whole.
+fn atoms_listed(row: Bytes) -> List<String> =
+  if bytes_len(row) == 0 { [] }
+  else if bytes_starts_with(row, b"<") { [string_of_bytes_lossy(row)] }
+  else { texts_of(bytes_split(row, b",")) }
+
+fn witness_of(ws: List<{ name: Bytes, hash: Bytes }>) -> List<Witness> =
+  map(ws, |w: { name: Bytes, hash: Bytes }|
+    { name: string_of_bytes_lossy(w.name), hash: string_of_bytes_lossy(hex(w.hash)) })
+
+fn declared_as(d: DeclInterface) -> Interface =
+  if d.effect {
+    OfEffect(
+      d.nondet,
+      map(d.ops, |o: FiledOp|
+        {
+          mode: string_of_bytes_lossy(o.mode),
+          name: string_of_bytes_lossy(o.name),
+          resource: o.resource,
+          params: texts_of(o.params),
+          ret: string_of_bytes_lossy(o.ret),
+        }),
+    )
+  } else {
+    OfType(
+      d.arity,
+      map(d.variants, |v: FiledVariant|
+        { name: string_of_bytes_lossy(v.name), fields: texts_of(v.fields) }),
+    )
+  }
+
+fn nondet_of(k: Kind) -> Bool = match k { ATest(nd) -> nd, _ -> false }
+
+type Shape = { interface: Interface, footprint: Option<List<String>>, witness: List<Witness> }
+
+fn shape_of(h: Hit) -> Shape =
+  match h.filed {
+    FiledDefinition(i) ->
+      {
+        interface: OfFn(string_of_bytes_lossy(i.scheme)),
+        footprint: Some(atoms_listed(i.row.footprint)),
+        witness: witness_of(i.row.witness),
+      },
+    FiledDeclaration(d) -> { interface: declared_as(d), footprint: None, witness: [] },
+    FiledTestRow(r) ->
+      {
+        interface: OfTest(nondet_of(h.kind)),
+        footprint: Some(atoms_listed(r.footprint)),
+        witness: witness_of(r.witness),
+      },
+    Unfiled ->
+      {
+        interface: match h.kind { ATest(nd) -> OfTest(nd), _ -> Unrecorded },
+        footprint: None,
+        witness: [],
+      },
+  }
+
+// A match as the report prints it, read from what the front end filed.
+pub fn entry_of(h: Hit) -> Entry = {
+  let shaped = shape_of(h);
+  {
+    name: h.name,
+    kind: h.kind,
+    hash: h.hash,
+    file: h.file,
+    location: h.location,
+    stale: h.stale,
+    interface: shaped.interface,
+    footprint: shaped.footprint,
+    witness: shaped.witness,
+    body: h.body,
+    outcome: h.outcome,
+  }
+}
+
 type Field = { label: String, value: String }
 
 // As the reference prints a test's name: the bytes, with the ones that would close the quotes escaped.
@@ -668,7 +800,7 @@ fn clear_answer(s: Style, answer: Result<Cleared, Refusal>) -> Answer =
   }
 
 fn matched(s: Style, query: String, m: Matches) -> Answer = {
-  let entries = ordered(m.entries);
+  let entries = ordered(map(m.entries, entry_of));
   if len(entries) == 0 {
     stopped(s, "inspect", {
       directory: Some(m.directory),
@@ -1056,8 +1188,83 @@ test "inspecting a name nothing cached is E0101 and exits two" {
   ])
 }
 
+fn a_row(footprint: Bytes) -> DefInterface =
+  {
+    row: {
+      name: b"m.active",
+      hash: b"\x9f",
+      witness: [{ name: b"m.db", hash: b"\xab\xcd" }],
+      footprint: footprint,
+      performed: footprint,
+    },
+    scheme: b"(Int) -> List<Int>",
+  }
+
+fn a_hit() -> Hit =
+  {
+    name: "m.active",
+    kind: AFn,
+    hash: "9f2c1a4e8b03c7d5e6f70819a2b3c4d5",
+    file: "m.ply",
+    location: Some("m.ply:4:1"),
+    stale: false,
+    filed: FiledDefinition(a_row(b"")),
+    body: None,
+    outcome: None,
+  }
+
+test "a definition's filed row prints as its scheme, its atoms and the effects it names" {
+  let e = entry_of({ ..a_hit(), filed: FiledDefinition(a_row(b"m.db.read[users],m.log.write")) });
+  assert_eq(e.interface, OfFn("(Int) -> List<Int>"));
+  assert_eq(e.footprint, Some(["m.db.read[users]", "m.log.write"]));
+  assert_eq(e.witness, [{ name: "m.db", hash: "abcd" }]);
+  // A pure definition has an empty footprint, which is still one it has.
+  assert_eq(entry_of(a_hit()).footprint, Some([]))
+}
+
+test "a declaration's filed interface prints as its variants or its operations" {
+  let wall: DeclInterface = {
+    effect: true,
+    arity: 0,
+    nondet: true,
+    variants: [],
+    ops: [{ name: b"set", mode: b"write", resource: true, params: [b"Int"], ret: b"Unit" }],
+  };
+  let e = entry_of({ ..a_hit(), kind: AnEffect, filed: FiledDeclaration(wall) });
+  assert_eq(
+    e.interface,
+    OfEffect(true, [{ mode: "write", name: "set", resource: true, params: ["Int"], ret: "Unit" }]),
+  );
+  assert_eq(e.footprint, None);
+  let shape: DeclInterface = {
+    effect: false,
+    arity: 1,
+    nondet: false,
+    variants: [{ name: b"Circle", fields: [b"Int"] }, { name: b"Empty", fields: [] }],
+    ops: [],
+  };
+  assert_eq(
+    entry_of({ ..a_hit(), kind: AType, filed: FiledDeclaration(shape) }).interface,
+    OfType(1, [{ name: "Circle", fields: ["Int"] }, { name: "Empty", fields: [] }]),
+  )
+}
+
+test "a test's filed row prints its footprint, and a value that did not read is unrecorded" {
+  let row: KnownTestRow = {
+    key: b"m.one is one",
+    hash: b"\x01",
+    witness: [],
+    footprint: b"m.log.write",
+  };
+  let t = entry_of({ ..a_hit(), kind: ATest(true), filed: FiledTestRow(row) });
+  assert_eq(t.interface, OfTest(true));
+  assert_eq(t.footprint, Some(["m.log.write"]));
+  assert_eq(entry_of({ ..a_hit(), kind: ATest(false), filed: Unfiled }).interface, OfTest(false));
+  assert_eq(entry_of({ ..a_hit(), filed: Unfiled }).interface, Unrecorded)
+}
+
 test "a match is one object under `matches`, with the hash shortened and the type resolved" {
-  let hits: Matches = { directory: "/p/.ply-cache", warnings: [], entries: [an_entry()] };
+  let hits: Matches = { directory: "/p/.ply-cache", warnings: [], entries: [a_hit()] };
   let answer = answered_over(
     flags_of("inspect", "active", true),
     Err(nowhere()),
