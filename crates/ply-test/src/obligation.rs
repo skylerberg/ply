@@ -138,12 +138,12 @@ pub struct Choice {
     pub read: Vec<(usize, DefHash)>,
 }
 
-/// A finite domain, as the program measured it: how many values each binder's type holds, in binder
-/// order, and what the domain is called in an artifact. The runtime materialises a point from these
-/// and walks them itself; whether there are points to walk is not its decision.
+/// A finite domain, as the program measured it: each binder's shape, in binder order, and what the
+/// domain is called in an artifact. The runtime materialises a point from these and walks them
+/// itself; whether there are points to walk, and how many, is not its decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Domain {
-    pub sizes: Vec<u64>,
+    pub shapes: Vec<ply_prove::domain::Shape>,
     pub name: String,
 }
 

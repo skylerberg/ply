@@ -1,16 +1,16 @@
 // `schedule` — which selected tests may run at the same time, as graph colouring over the resources
-// they declare. The graph is a *conflict* graph, not a sharing one: two tests may share a resource
-// freely as long as neither writes it, so a conflict is an effect and a resource both name plus a
-// write on one side. Colouring is greedy, largest footprint first, and a test takes the first class
-// it clears *every* member of — conflict is not transitive, so clearing one member is not enough.
+// they declare, and how a run's tests split once the binding is taken into account. The graph is a
+// *conflict* graph, not a sharing one: two tests may share a resource freely as long as neither
+// writes it, so a conflict is an effect and a resource both name plus a write on one side. Colouring
+// is greedy, largest footprint first, and a test takes the first class it clears *every* member of —
+// conflict is not transitive, so clearing one member is not enough.
 //
-// The footprints are the row's own `contends`: the atoms of a test's footprint another test could
-// reach, with `sim` already dropped, since an input no test can write cannot be contended over.
-// What the language declares about a resource lives here too — which effects are region scoped,
-// which are ambient, and what `simulate { .. }` discharges — because a rename's power over a region
-// label is a fact about the language, not about the runtime.
+// The runtime hands over every atom of a test's footprint; which of them another test could reach,
+// and what that makes the test, is decided here. What the language declares about a resource lives
+// here too — which effects are region scoped and which are ambient — because a rename's power over a
+// region label is a fact about the language, not about the runtime.
 
-// One atom of a test's shared footprint.
+// One atom of a test's footprint.
 pub type Atom = { effect: String, resource: String, writes: Bool }
 
 // --- What the language declares about an atom -------------------------------
@@ -21,11 +21,6 @@ pub fn region_scoped_effects() -> List<String> = ["cell"]
 
 // Effects whose atoms name an input that no test can write.
 pub fn ambient_effects() -> List<String> = ["sim"]
-
-// What `simulate { .. }` discharges, and nothing else.
-pub fn simulated_effects() -> List<String> = ["task", "clock", "random"]
-
-pub fn sim_effect() -> String = "sim"
 
 pub fn is_region_scoped(a: Atom) -> Bool = in_text(region_scoped_effects(), a.effect)
 
@@ -48,18 +43,33 @@ pub fn contends_only_over_regions(f: List<Atom>) -> Bool = {
   !is_empty(s) && every(s, is_region_scoped)
 }
 
-// Something in this test's closure entered a `simulate` region, so its outcome also depends on a
-// seed.
-pub fn is_seeded(f: List<Atom>) -> Bool = some(f, is_ambient)
+// --- What a run's tests are, once the binding is taken into account ----------
 
-// Whether a test can interfere with any other test at all.
-pub type Isolation = | Region | Shared
+// One test the run reports on: its footprint, and whether the run's binding reaches it.
+pub type Reported = { atoms: List<Atom>, host: Bool }
 
-pub fn isolation_of(f: List<Atom>) -> Isolation = if region_isolated(f) { Region } else { Shared }
+// Whether a test can interfere with any other test at all. A test the binding reaches acts on the
+// world, which lives outside every region, so it is never isolated.
+pub type Isolation = | Region | Shared | Host
 
-pub fn is_isolated(i: Isolation) -> Bool = match i { Region -> true, Shared -> false }
+pub fn isolation_of(t: Reported) -> Isolation =
+  if t.host { Host } else if region_isolated(t.atoms) { Region } else { Shared }
 
-pub fn isolation_word(i: Isolation) -> String = match i { Region -> "region", Shared -> "shared" }
+pub fn isolation_word(i: Isolation) -> String =
+  match i { Region -> "region", Shared -> "shared", Host -> "host" }
+
+// How a run's tests split: each counts under exactly one of the three.
+pub type Counts = { total: Int, isolated: Int, shared: Int, host: Int }
+
+pub fn counts(tests: List<Reported>) -> Counts =
+  fold(tests, { total: 0, isolated: 0, shared: 0, host: 0 }, |c: Counts, t: Reported| {
+    let one = { ..c, total: c.total + 1 };
+    match isolation_of(t) {
+      Region -> { ..one, isolated: c.isolated + 1 },
+      Shared -> { ..one, shared: c.shared + 1 },
+      Host -> { ..one, host: c.host + 1 },
+    }
+  })
 
 // --- The conflict graph -----------------------------------------------------
 
@@ -196,10 +206,8 @@ fn atom(e: String, r: String, w: Bool) -> Atom = { effect: e, resource: r, write
 
 // --- Tests ------------------------------------------------------------------
 //
-// The expectations below are what the runtime's own `schedule` answers for the same inputs, printed
-// by a scratch run against it: the package is a port, so agreement is the property to pin, and the
-// cases are chosen where two implementations could differ — a class that must clear every member,
-// the order the largest footprint imposes, and the two ways a class may be shared.
+// The cases are chosen where a colouring could go wrong — a class that must clear every member, the
+// order the largest footprint imposes, and the two ways a class may be shared.
 
 fn cell(label: String) -> Atom = atom("cell", label, true)
 
@@ -211,10 +219,12 @@ fn sim() -> Atom = atom("sim", "", false)
 
 fn scheduled(index: Int, atoms: List<Atom>) -> Scheduled = { index: index, contends: atoms }
 
+fn hermetic(atoms: List<Atom>) -> Reported = { atoms: atoms, host: false }
+
 test "a region label is what contends, and a rename is what moves it" {
   // Isolated: nothing another test could reach.
   assert_eq(region_isolated([sim()]), true);
-  assert_eq(isolation_of([sim()]), Region);
+  assert_eq(isolation_of(hermetic([sim()])), Region);
   assert_eq(shared([cell("a"), sim()]), [cell("a")]);
   // Region-scoped contention: a rename removes it. Any other resource needs a lock or a hook.
   assert_eq(contends_only_over_regions([cell("a")]), true);
@@ -222,14 +232,43 @@ test "a region label is what contends, and a rename is what moves it" {
   assert_eq(contends_only_over_regions([fs("/tmp/x")]), false);
   assert_eq(contends_only_over_regions([cell("a"), fs("/tmp/x")]), false);
   assert_eq(contends_only_over_regions([sim()]), false);
-  assert_eq(isolation_of([cell("a")]), Shared);
+  assert_eq(isolation_of(hermetic([cell("a")])), Shared);
   assert_eq(isolation_word(Shared), "shared")
 }
 
-test "a simulation region is what makes a test seeded" {
-  assert_eq(is_seeded([sim()]), true);
-  assert_eq(is_seeded([sim(), cell("a")]), true);
-  assert_eq(is_seeded([cell("a"), fs("/tmp/x")]), false)
+// A seed read is an input only the test reading it is handed, so a simulated test is not shared for
+// reading one, and still contends over what its tasks touch.
+test "a seed never makes a test shared, and what its tasks touch still does" {
+  assert_eq(isolation_of(hermetic([sim()])), Region);
+  assert_eq(isolation_of(hermetic([sim(), cell("a")])), Shared);
+  assert_eq(shared([sim(), cell("a")]), [cell("a")]);
+  // Two simulated tests over one label are two classes, and two over nothing share one.
+  assert_eq(
+    group_by_conflict([scheduled(0, shared([sim(), cell("a")])), scheduled(1, [cell("a")])]),
+    [[0], [1]],
+  );
+  assert_eq(group_by_conflict([scheduled(0, shared([sim()])), scheduled(1, shared([sim()]))]), [
+    [0, 1],
+  ])
+}
+
+// A socket lives outside every region, so a test the binding reaches is host whatever its footprint
+// says, and each test counts under exactly one heading.
+test "a test the binding reaches is host rather than isolated, and counts only there" {
+  assert_eq(isolation_of({ atoms: [sim()], host: true }), Host);
+  assert_eq(isolation_word(Host), "host");
+  assert_eq(isolation_word(Region), "region");
+  let c = counts([
+    { atoms: [atom("db", "users", false)], host: true },
+    hermetic([]),
+    hermetic([sim()]),
+    hermetic([fs("/tmp/x")]),
+  ]);
+  assert_eq(c, { total: 4, isolated: 2, shared: 1, host: 1 });
+  // A hermetic binding reaches nothing, so the host column is empty.
+  let unbound = counts([hermetic([atom("db", "users", false)]), hermetic([])]);
+  assert_eq(unbound, { total: 2, isolated: 1, shared: 1, host: 0 });
+  assert_eq(counts([]), { total: 0, isolated: 0, shared: 0, host: 0 })
 }
 
 test "conflict needs one writer, so two readers of one resource never conflict" {
@@ -307,4 +346,146 @@ test "the groups a run needs are what the shared tests alone need" {
   // Nothing selected at all: no floor, and nothing to colour.
   let none = parallelism(universe, [], []);
   assert_eq(holds(none), true)
+}
+
+fn db(resource: String, w: Bool) -> Atom = atom("db", resource, w)
+
+fn occurrences(xs: List<Int>, x: Int) -> Int =
+  fold(xs, 0, |n: Int, y: Int| if y == x { n + 1 } else { n })
+
+fn contends_of(tests: List<Scheduled>, i: Int) -> List<Atom> =
+  fold(tests, [], |found: List<Atom>, t: Scheduled| if t.index == i { t.contends } else { found })
+
+fn clear_pairs(tests: List<Scheduled>, class: List<Int>) -> Bool =
+  every(range(0, len(class)), |a: Int|
+    every(range(a + 1, len(class)), |b: Int|
+      !footprints_conflict(
+        contends_of(tests, at_or(class, a)),
+        contends_of(tests, at_or(class, b)),
+      )))
+
+test "only the language's own effect names a region, and nothing contends over nothing" {
+  assert_eq(is_region_scoped(cell("users")), true);
+  assert_eq(is_region_scoped(db("users", true)), false);
+  // A program's own effects are module-qualified, so none of them can pass for `cell`.
+  assert_eq(is_region_scoped(atom("m.cell", "users", true)), false);
+  assert_eq(region_isolated([]), true);
+  assert_eq(region_isolated([cell("users"), cell("orders")]), false);
+  let mixed = [cell("users"), db("orders", true)];
+  assert_eq(shared(mixed), mixed);
+  assert_eq(contends_only_over_regions(mixed), false);
+  assert_eq(contends_only_over_regions([]), false)
+}
+
+test "tests that touch nothing, or disjoint things, share one class, and only a writer is apart" {
+  assert_eq(group_by_conflict(map(range(0, 5), |i: Int| scheduled(i, []))), [[0, 1, 2, 3, 4]]);
+  assert_eq(
+    group_by_conflict([
+      scheduled(0, [db("users", true)]),
+      scheduled(1, [db("orders", true)]),
+      scheduled(2, []),
+    ]),
+    [[0, 1, 2]],
+  );
+  // Readers of one resource share, its writer is apart, and a write elsewhere separates no reader.
+  assert_eq(
+    group_by_conflict([
+      scheduled(0, [db("users", false)]),
+      scheduled(1, [db("users", false)]),
+      scheduled(2, [db("users", true)]),
+      scheduled(3, [db("users", false)]),
+      scheduled(4, [db("orders", true)]),
+    ]),
+    [[0, 1, 3, 4], [2]],
+  )
+}
+
+test "one label separates all its writers, and a label each separates none" {
+  assert_eq(len(group_by_conflict(map(range(0, 4), |i: Int| scheduled(i, [cell("users")])))), 4);
+  assert_eq(
+    group_by_conflict(map(range(0, 4), |i: Int| scheduled(i, [cell("r" ++ int_to_string(i))]))),
+    [[0, 1, 2, 3]],
+  )
+}
+
+// Declaration order would colour this six-cycle in three classes; the largest footprints first need
+// the two it has.
+test "coloured largest first, a six-cycle takes the two classes it needs" {
+  let tests = [
+    scheduled(0, [db("e03", true), db("e05", true), db("p0", false)]),
+    scheduled(1, [db("e12", true), db("e14", true)]),
+    scheduled(2, [db("e12", true), db("e25", true), db("p2", false)]),
+    scheduled(3, [db("e03", true), db("e34", true)]),
+    scheduled(4, [db("e14", true), db("e34", true), db("p4", false)]),
+    scheduled(5, [db("e05", true), db("e25", true)]),
+  ];
+  assert_eq(group_by_conflict(tests), [[0, 2, 4], [1, 3, 5]])
+}
+
+// What the runtime relies on when it runs a class at once.
+test "every test lands in exactly one class, and no class holds a conflicting pair" {
+  let tests = [
+    scheduled(3, [db("users", true)]),
+    scheduled(7, [db("users", false)]),
+    scheduled(8, []),
+    scheduled(11, [db("users", true), db("orders", true)]),
+    scheduled(12, [db("orders", false)]),
+    scheduled(13, [cell("t0"), reads_cell("t0")]),
+    scheduled(14, [cell("t0"), reads_cell("t0")]),
+    scheduled(15, [cell("t1")]),
+  ];
+  let classes = group_by_conflict(tests);
+  let flat = fold(classes, [], |acc: List<Int>, class: List<Int>|
+    fold(class, acc, |xs: List<Int>, x: Int| push(xs, x)));
+  assert_eq(len(flat), len(tests));
+  assert(every(tests, |t: Scheduled| occurrences(flat, t.index) == 1));
+  assert(every(classes, |class: List<Int>| clear_pairs(tests, class)))
+}
+
+test "a test nothing can reach joins the first class, so adding such tests never adds one" {
+  let contended = [
+    scheduled(0, [db("users", true)]),
+    scheduled(1, [db("users", false)]),
+    scheduled(2, [db("orders", true)]),
+  ];
+  let baseline = group_by_conflict(contended);
+  assert_eq(baseline, [[0, 2], [1]]);
+  let wider = fold(range(3, 40), contended, |acc: List<Scheduled>, i: Int|
+    push(acc, scheduled(i, shared([sim()]))));
+  let classes = group_by_conflict(wider);
+  assert_eq(len(classes), len(baseline));
+  assert(every(range(3, 40), |i: Int| occurrences(at_or(classes, 0), i) == 1));
+  let universe = fold(
+    range(3, 40),
+    map(contended, |t: Scheduled| t.contends),
+    |acc: List<List<Atom>>, i: Int| push(acc, [sim()]),
+  );
+  let p = parallelism(universe, wider, classes);
+  assert_eq(p.isolated, 37);
+  assert_eq(p.shared, 3);
+  assert_eq(p.shared_groups, len(baseline));
+  assert_eq(holds(p), true)
+}
+
+test "a region label and a real resource conflict independently" {
+  let universe = [
+    [cell("users"), db("accounts", true)],
+    [db("accounts", false)],
+    [cell("accounts")],
+    [],
+  ];
+  let tests = map(range(0, 4), |i: Int| scheduled(i, at_or(universe, i)));
+  let classes = group_by_conflict(tests);
+  // A real write and a real read of `accounts` are apart, and a label nobody else names is free.
+  assert_eq(classes, [[0, 2, 3], [1]]);
+  let p = parallelism(universe, tests, classes);
+  assert_eq({ total: p.total, isolated: p.isolated, shared: p.shared }, {
+    total: 4,
+    isolated: 1,
+    shared: 3,
+  });
+  // Only the test that names a label and nothing else contends over regions alone.
+  assert_eq(p.region_contended, 1);
+  assert_eq({ groups: p.groups, shared_groups: p.shared_groups }, { groups: 2, shared_groups: 2 });
+  assert_eq(holds(p), true)
 }
