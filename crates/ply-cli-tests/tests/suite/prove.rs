@@ -660,6 +660,52 @@ fn inc(x: Int) -> Int
     assert_eq!(v["ok"], false, "{v}");
 }
 
+/// A proposition over a fixed width is declined at the seam rather than judged over misread bytes.
+#[test]
+fn a_claim_over_a_fixed_width_is_declined_at_the_seam_rather_than_misread() {
+    const SOURCE: &str = "\
+fn narrow(n: Int) -> U8
+  requires n >= 0 && n < 256
+  ensures int_of_u8(result) < 256
+= u8_of_int(n)
+
+fn low_bit(b: U8) -> Int
+  requires int_of_u8(b) > 300
+  ensures result < 2
+= int_of_u8(b & 1u8)
+
+law \"no byte is seven\" forall (b: U8) { int_of_u8(b) != 7 }
+";
+    let dir = project(SOURCE);
+    let out = ply(dir.path())
+        .args(["prove", "--no-cache", "--json"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    for (needle, declined) in [
+        ("m.narrow", "m.narrow"),
+        ("m.low_bit", "m.low_bit#requires#0"),
+        ("no byte is seven", "m.law#0.body"),
+    ] {
+        let o = v["obligations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["label"].as_str().unwrap_or_default().contains(needle))
+            .cloned()
+            .unwrap_or_else(|| panic!("no obligation for `{needle}`: {v}"));
+        assert_eq!(o["outcome"], "defect", "{o}");
+        assert!(
+            o["defect"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(&format!("declined to enter `{declined}`"))),
+            "{o}"
+        );
+    }
+    assert_eq!(v["summary"]["defect"], 3, "{v}");
+    assert_eq!(out.status.code(), Some(1), "{v}");
+}
+
 #[test]
 fn a_law_host_is_unattempted_under_a_hermetic_run_and_never_green() {
     const SOURCE: &str = "\
