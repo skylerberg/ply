@@ -203,11 +203,13 @@ impl Stats {}
 pub struct Arena<V = Value> {
     /// `chunks[c][o]` is the value at index `c * CHUNK + o`; a free slot holds `V::default()`.
     chunks: Vec<Vec<V>>,
-    /// A position's generation only rises, so a stale slot never matches.
+    /// A position's generation only rises until [`Arena::renew`], so a stale slot never matches.
     meta: Vec<Vec<Meta>>,
     live: usize,
     /// Every index from here up is free.
     top: usize,
+    /// Every index from here up has been at generation zero since the store was new or renewed.
+    used: usize,
     /// The free indices below `top`, reused lowest first, as a bump pointer would.
     holes: BinaryHeap<Reverse<u32>>,
     scopes: Vec<Scope>,
@@ -216,6 +218,8 @@ pub struct Arena<V = Value> {
     owners: Vec<Nesting>,
     /// Regions open across every owner; a parked one counts on none.
     depth: usize,
+    /// [`Pin`]s handed out and not yet given back; a parked region holds at least one.
+    pins: usize,
     stats: Stats,
     /// Slots a `cell_update` has taken out; touching one meanwhile is refused.
     taken: Vec<Slot>,
@@ -234,11 +238,13 @@ impl<V: Clone + Default> Arena<V> {
             meta: Vec::new(),
             live: 0,
             top: 0,
+            used: 0,
             holes: BinaryHeap::new(),
             scopes: Vec::new(),
             free_scopes: NIL,
             owners: Vec::new(),
             depth: 0,
+            pins: 0,
             stats: Stats {
                 element: std::mem::size_of::<V>(),
                 ..Stats::default()
@@ -343,6 +349,7 @@ impl<V: Clone + Default> Arena<V> {
             State::Open { pins, .. } => *pins += 1,
             State::Parked { .. } | State::Free { .. } => unreachable!("`scope` finds open regions"),
         }
+        self.pins += 1;
         Some(Pin(region))
     }
 
@@ -361,6 +368,7 @@ impl<V: Clone + Default> Arena<V> {
             },
             State::Free { .. } => unreachable!("`named` finds open or parked regions"),
         };
+        self.pins += 1;
         Pin(pin.0)
     }
 
@@ -368,6 +376,7 @@ impl<V: Clone + Default> Arena<V> {
     /// frees it, while an open one is left for its own close to free.
     pub fn unpin(&mut self, pin: Pin) -> usize {
         let at = self.named(pin.0).expect("a pinned region is never freed");
+        self.pins -= 1;
         match self.scopes[at].state {
             State::Open { owner, below, pins } => {
                 self.scopes[at].state = State::Open {
@@ -422,6 +431,7 @@ impl<V: Clone + Default> Arena<V> {
                     self.stats.chunks_allocated += 1;
                 }
                 self.top += 1;
+                self.used = self.used.max(self.top);
                 self.top - 1
             }
             None => return None,
@@ -517,6 +527,28 @@ impl<V: Clone + Default> Arena<V> {
         while self.owners.last().is_some_and(|n| n.depth == 0) {
             self.owners.pop();
         }
+    }
+
+    /// Starts every index over at generation zero, keeping the chunks, so the slots handed out next
+    /// are named as a new store names them. Refused, changing nothing, unless the only open regions
+    /// are the `depth` oldest `keep` holds, no pin is out and no slot is live. A slot handed out
+    /// before it resolves again after it, so it is sound only once nothing still holds one.
+    pub fn renew(&mut self, keep: Owner, depth: usize) -> bool {
+        if self.total_depth() != depth
+            || self.depth(keep) != depth
+            || self.pins != 0
+            || self.live != 0
+        {
+            return false;
+        }
+        for index in 0..self.used {
+            self.meta[chunk_of(index)][offset_of(index)].generation = 0;
+        }
+        self.used = 0;
+        self.top = 0;
+        self.holes.clear();
+        self.taken.clear();
+        true
     }
 
     /// Live slots ascending by index, for deterministic comparison and rendering.
