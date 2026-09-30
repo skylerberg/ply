@@ -8,10 +8,9 @@
 mod claims;
 mod fixture;
 mod prover_runs;
-mod prover_soundness_audit;
 mod replay;
 mod selector_reads;
-mod tiers;
+mod strategy;
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{Front, Machine, Provider, SourceId, Span, Value};

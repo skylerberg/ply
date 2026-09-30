@@ -1,5 +1,6 @@
-//! Finite domains, and the proof that comes from covering one.
+//! A finite domain as `proof.domain` measured it, and the values its points are.
 
+use ply_eval::decode::{At, Error};
 use ply_eval::{Fixed, IntTy, Symbol, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,6 +34,39 @@ impl Shape {
                 *size
             }
         }
+    }
+
+    /// A `proof.domain.Shape`.
+    pub fn decode(at: At<'_>) -> Result<Shape, Error> {
+        stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+            let shape = at.ctor()?;
+            match shape.name() {
+                "Scalar" => Ok(Shape::Scalar {
+                    name: shape.arg(0)?.str()?.to_string(),
+                    size: shape.arg(1)?.number()?,
+                }),
+                "Cases" => Ok(Shape::Cases {
+                    size: shape.arg(0)?.number()?,
+                    cases: shape.arg(1)?.items(|case| {
+                        Ok(Case {
+                            name: Symbol::new(case.field("name")?.str()?),
+                            size: case.field("size")?.number()?,
+                            fields: case.field("fields")?.items(Shape::decode)?,
+                        })
+                    })?,
+                }),
+                "Fields" => Ok(Shape::Fields {
+                    size: shape.arg(0)?.number()?,
+                    fields: shape.arg(1)?.items(|field| {
+                        Ok((
+                            Symbol::new(field.field("name")?.str()?),
+                            Shape::decode(field.field("shape")?)?,
+                        ))
+                    })?,
+                }),
+                _ => Err(shape.unknown()),
+            }
+        })
     }
 
     /// The `index`-th value, in the order the program counted: constructors in declaration order,
@@ -74,24 +108,39 @@ impl Shape {
     }
 }
 
-#[derive(Clone, Debug)]
+/// A domain the program decided to walk: each binder's shape, how many points there are, and
+/// what an artifact calls it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finite {
     /// One per binder.
-    shapes: Vec<Shape>,
+    pub shapes: Vec<Shape>,
     pub points: u64,
+    pub name: Symbol,
 }
 
 impl Finite {
-    /// The domain the program measured; `None` when it has no points, which is a vacuity rather than
-    /// a domain.
-    pub fn of_shapes(shapes: Vec<Shape>) -> Option<Finite> {
-        let points = shapes
+    /// A `proof.domain.Domain` and its name. A count the shapes do not multiply out to would walk a
+    /// point twice or miss one, so it is refused rather than walked.
+    pub fn decode(domain: At<'_>, name: At<'_>) -> Result<Finite, Error> {
+        let shapes = domain.field("shapes")?.items(Shape::decode)?;
+        let count = domain.field("points")?;
+        let points: u64 = count.number()?;
+        let product = shapes
             .iter()
-            .try_fold(1u64, |acc, s| acc.checked_mul(s.size()))?;
+            .try_fold(1u64, |acc, shape| acc.checked_mul(shape.size()));
         if points == 0 {
-            return None;
+            return Err(count.error("a domain of no points"));
         }
-        Some(Finite { shapes, points })
+        if product != Some(points) {
+            return Err(count.error(format!(
+                "{points} points, which the binders' shapes do not multiply out to"
+            )));
+        }
+        Ok(Finite {
+            shapes,
+            points,
+            name: Symbol::new(name.str()?),
+        })
     }
 
     /// The `index`-th point, in a fixed order — the first binder varying slowest — and `None` past

@@ -1,4 +1,5 @@
-//! Obligations, and the tiers they are discharged at.
+//! The searches that discharge an obligation, the static prover, and the readers of what
+//! `proof.world` decided: which search each obligation goes to is the program's.
 
 // `Value` shares non-`Send` payloads through `Arc` by design.
 #![allow(clippy::arc_with_non_send_sync)]
@@ -14,6 +15,7 @@ pub mod world;
 pub use sort::Sort;
 pub use world::World;
 
+use domain::Finite;
 use ply_eval::{DefHash, Diagnostic, Plan, Race, Seed, Span, Symbol};
 use serde::Serialize;
 use std::fmt;
@@ -31,7 +33,7 @@ pub const DEFAULT_CASES: u32 = 200;
 pub const DEFAULT_PROVE_BUDGET: u32 = 10_000;
 pub const DEFAULT_SHRINK_BUDGET: u32 = 500;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
     /// Concrete cases, and no coverage claim.
     Example,
@@ -87,17 +89,6 @@ pub enum Rule {
     ExhaustiveInterleaving {
         interleavings: u32,
     },
-}
-
-impl Rule {
-    pub fn is_execution(&self) -> bool {
-        matches!(
-            self,
-            Rule::GroundEvaluation
-                | Rule::ExhaustiveEnumeration { .. }
-                | Rule::ExhaustiveInterleaving { .. }
-        )
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -204,27 +195,6 @@ pub enum Discharge {
     Unattempted(Gap),
 }
 
-impl Discharge {
-    pub fn tier(&self) -> Option<Tier> {
-        match self {
-            Discharge::Held(e) => Some(e.tier()),
-            _ => None,
-        }
-    }
-
-    pub fn holds(&self) -> bool {
-        matches!(self, Discharge::Held(_))
-    }
-
-    pub fn is_cacheable(&self) -> bool {
-        self.holds()
-    }
-
-    pub fn is_plan_independent(&self) -> bool {
-        self.tier() == Some(Tier::Proved)
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObligationKind {
     /// Its place among the owner's `ensures` clauses.
@@ -239,18 +209,34 @@ pub enum ObligationKind {
 pub struct Binder {
     pub name: Symbol,
     pub sort: Sort,
-    /// Its type as the compiler prints it, with the letters [`Sort`]'s `Display` gives its variables.
+    /// Its type as the compiler prints it.
     pub text: String,
 }
 
-impl Binder {
-    pub fn new(name: &str, sort: Sort) -> Binder {
-        Binder {
-            name: Symbol::new(name),
-            text: sort.to_string(),
-            sort,
-        }
-    }
+/// How `proof.world` decided an obligation is discharged. The engine follows it.
+#[derive(Clone, Debug)]
+pub enum Strategy {
+    /// A law over a `simulate` region: its interleavings are searched at each of its points.
+    Interleave(Points),
+    /// A `law/host`, run against the host the run binds.
+    Hosted,
+    /// The static prover first, and what follows when that does not settle the claim.
+    Static(Unsettled),
+}
+
+#[derive(Clone, Debug)]
+pub enum Unsettled {
+    /// Checking the clause calls an owner that performs this row, and nothing supplies handlers.
+    Unhandled(String),
+    Run(Points),
+}
+
+/// The points a search runs a claim at.
+#[derive(Clone, Debug)]
+pub enum Points {
+    /// Every point of a domain the program measured, which is a proof when each holds.
+    Every(Finite),
+    Drawn,
 }
 
 /// A claim the program owes, as `proof.world` built it.
@@ -262,35 +248,22 @@ pub struct Obligation {
     pub owner: Symbol,
     pub kind: ObligationKind,
     pub span: Span,
-    /// The owner's parameters then `result` for a clause; the `forall` binders for a law.
+    /// What a point assigns: the owner's parameters for a clause, the `forall` binders for a law.
     pub binders: Vec<Binder>,
-    pub guarded: bool,
-    /// `law/host`: the body reaches the world.
-    pub host: bool,
+    /// A clause's `result`, which is the owner's answer and never drawn.
+    pub result: Option<Binder>,
+    /// The name each type variable of the binders and the result prints as, by its number.
+    pub variables: Vec<Symbol>,
     /// The claim's own row as a report prints it, when it performs anything: `{sim.read}` for a
     /// concurrency law, or any row at all for a `law/host`.
     pub footprint: Option<String>,
+    pub strategy: Strategy,
 }
 
 impl Obligation {
-    /// A law whose body reaches a `simulate` region.
-    pub fn is_concurrency_law(&self) -> bool {
-        matches!(self.kind, ObligationKind::Law) && !self.host && self.footprint.is_some()
-    }
-
-    pub fn generated(&self) -> &[Binder] {
-        match self.kind {
-            ObligationKind::Ensures { .. } => &self.binders[..self.binders.len().saturating_sub(1)],
-            ObligationKind::Law => &self.binders,
-        }
-    }
-
-    /// The return-value binder that [`Obligation::generated`] withholds.
-    pub fn result_binder(&self) -> Option<&Binder> {
-        match self.kind {
-            ObligationKind::Ensures { .. } => self.binders.last(),
-            ObligationKind::Law => None,
-        }
+    /// The binders the static prover reasons over: the drawn ones, then `result`.
+    pub fn all_binders(&self) -> Vec<Binder> {
+        self.binders.iter().chain(&self.result).cloned().collect()
     }
 }
 
@@ -332,45 +305,11 @@ impl ProvePlan {
     }
 }
 
+/// What a run discharged: each obligation it was asked about beside what became of it.
 #[derive(Clone, Debug)]
 pub struct ProveReport {
     pub obligations: Vec<(Obligation, Discharge)>,
-    pub plan: ProvePlan,
     pub duration: Duration,
-}
-
-impl ProveReport {
-    pub fn count(&self, tier: Tier) -> usize {
-        self.obligations
-            .iter()
-            .filter(|(_, d)| d.tier() == Some(tier))
-            .count()
-    }
-
-    pub fn refuted(&self) -> usize {
-        self.obligations
-            .iter()
-            .filter(|(_, d)| matches!(d, Discharge::Refuted(_)))
-            .count()
-    }
-
-    pub fn vacuous(&self) -> usize {
-        self.obligations
-            .iter()
-            .filter(|(_, d)| matches!(d, Discharge::Vacuous(_)))
-            .count()
-    }
-
-    pub fn unattempted(&self) -> usize {
-        self.obligations
-            .iter()
-            .filter(|(_, d)| matches!(d, Discharge::Unattempted(_)))
-            .count()
-    }
-
-    pub fn failed(&self) -> bool {
-        self.refuted() > 0 || self.vacuous() > 0
-    }
 }
 
 pub fn interleaving_proves(

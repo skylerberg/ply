@@ -12,7 +12,6 @@ use ply_eval::{
     TASK_TYPE, Value,
 };
 use std::collections::BTreeMap;
-use std::fmt;
 use std::sync::Arc;
 
 /// Case indices below this draw their type's edge values rather than a sample.
@@ -20,7 +19,7 @@ pub const EDGE_CASES: u32 = 5;
 
 pub const EDGE_INTS: [i64; 5] = [0, 1, -1, i64::MIN, i64::MAX];
 
-pub const EDGE_FLOATS: [f64; 8] = [
+const EDGE_FLOATS: [f64; 8] = [
     f64::NAN,
     0.0,
     -0.0,
@@ -46,13 +45,16 @@ fn edge_decimal(index: usize) -> Decimal {
 }
 
 /// Starts at `'a'` because the shrinker lowers characters toward `'a'`.
-pub const GEN_ALPHABET: &[u8; 16] = b"abcdefghijklmnop";
+const GEN_ALPHABET: &[u8; 16] = b"abcdefghijklmnop";
 
-pub const MAX_GEN_LEN: u64 = 16;
+const MAX_GEN_LEN: u64 = 16;
 
-pub const MAX_GEN_ENTRIES: usize = 8;
+const MAX_GEN_ENTRIES: usize = 8;
 
-pub const HARD_GEN_DEPTH: u32 = 64;
+pub(crate) const HARD_GEN_DEPTH: u32 = 64;
+
+/// What every type variable is drawn as, as a report names the type.
+const VARIABLE_DRAWN_AS: &str = "Int";
 
 const GEN_DOMAIN: &[u8] = b"ply.gen.stream.1";
 
@@ -66,11 +68,11 @@ pub struct GenStream {
 
 impl GenStream {
     pub fn new(root: u64, key: DefHash) -> GenStream {
-        GenStream::at(root, key, 0)
-    }
-
-    pub fn at(root: u64, key: DefHash, counter: u64) -> GenStream {
-        GenStream { root, key, counter }
+        GenStream {
+            root,
+            key,
+            counter: 0,
+        }
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -79,30 +81,8 @@ impl GenStream {
         value
     }
 
-    /// Uniform by rejection. Do not change the rule: printed `(root, case)` pairs would shift.
-    pub fn below(&mut self, n: u64) -> Option<u64> {
-        if n == 0 {
-            return None;
-        }
-        let limit = (u64::MAX / n) * n;
-        loop {
-            let x = self.next_u64();
-            if x < limit {
-                return Some(x % n);
-            }
-        }
-    }
-
-    pub fn drawn(&self) -> u64 {
-        self.counter
-    }
-
-    pub fn root(&self) -> u64 {
-        self.root
-    }
-
-    /// Pure, so a replay can ask for draw *i* directly.
-    pub fn draw(root: u64, key: &DefHash, counter: u64) -> u64 {
+    /// Pure: a draw is its root, its obligation and its place, and nothing a stream remembers.
+    fn draw(root: u64, key: &DefHash, counter: u64) -> u64 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(GEN_DOMAIN);
         hasher.update(&root.to_le_bytes());
@@ -127,24 +107,6 @@ pub enum Ungeneratable {
     Uninhabited(Symbol),
     Unknown(Symbol),
     TooDeep,
-}
-
-impl fmt::Display for Ungeneratable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Ungeneratable::Cell => f.write_str("a `Cell` belongs to the region that opened it"),
-            Ungeneratable::Task => f.write_str("a `Task` belongs to a `simulate` region"),
-            Ungeneratable::Secret => {
-                f.write_str("a `Secret` is a credential, and nothing may generate one")
-            }
-            Ungeneratable::Effectful => {
-                f.write_str("a function whose row is not empty cannot be applied in a spec")
-            }
-            Ungeneratable::Uninhabited(name) => write!(f, "no finite value inhabits `{name}`"),
-            Ungeneratable::Unknown(name) => write!(f, "no type named `{name}` is declared"),
-            Ungeneratable::TooDeep => write!(f, "nesting reached {HARD_GEN_DEPTH} levels"),
-        }
-    }
 }
 
 pub fn generatable(sort: &Sort, world: &World) -> Result<(), Ungeneratable> {
@@ -190,25 +152,6 @@ pub fn generate(
         edge: edge_for(case),
     };
     draw.value(sort, 0)
-}
-
-pub fn draw_cases(
-    binders: &[Binder],
-    world: &World,
-    key: DefHash,
-    root: u64,
-    cases: u32,
-) -> Result<Vec<Vec<Value>>, Ungeneratable> {
-    let mut stream = GenStream::new(root, key);
-    let mut out = Vec::with_capacity(cases as usize);
-    for case in 0..cases {
-        let mut tuple = Vec::with_capacity(binders.len());
-        for binder in binders {
-            tuple.push(generate(&binder.sort, world, &mut stream, case)?);
-        }
-        out.push(tuple);
-    }
-    Ok(out)
 }
 
 fn size_for(case: u32) -> u64 {
@@ -614,9 +557,11 @@ pub fn ungeneratable(binder: &Binder) -> Gap {
     }
 }
 
+/// `variables` names each type variable of the binders by its number, as the claim prints it.
 pub fn run_property(
     key: DefHash,
     binders: &[Binder],
+    variables: &[Symbol],
     world: &World,
     plan: &ProvePlan,
     guard_span: Span,
@@ -686,7 +631,7 @@ pub fn run_property(
         kept,
         rejected: generated - kept,
         roots: plan.roots.clone(),
-        instantiations: instantiations(binders),
+        instantiations: instantiations(binders, variables),
     }))
 }
 
@@ -703,18 +648,14 @@ pub fn bindings(binders: &[Binder], values: &[Value]) -> Vec<Binding> {
         .collect()
 }
 
-/// Every variable of the binders, in the order they first appear, each drawn as an `Int`.
-pub fn instantiations(binders: &[Binder]) -> Vec<(Symbol, String)> {
+/// Every variable of the binders, in the order they first appear, named as `variables` numbers
+/// them, beside the type each is drawn as.
+pub fn instantiations(binders: &[Binder], variables: &[Symbol]) -> Vec<(Symbol, String)> {
     let mut vars: Vec<u32> = Vec::new();
     for binder in binders {
         binder.sort.vars(&mut vars);
     }
     vars.into_iter()
-        .map(|v| {
-            (
-                Symbol::new(Sort::Var(v).to_string()),
-                Sort::int().to_string(),
-            )
-        })
+        .map(|v| (variables[v as usize].clone(), VARIABLE_DRAWN_AS.to_string()))
         .collect()
 }
