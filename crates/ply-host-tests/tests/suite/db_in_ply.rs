@@ -5,7 +5,7 @@
 //! sees only `net`. A program serves itself: `with_server` reads the connection string, so nothing
 //! about the effect comes from the host.
 
-use ply_eval::{Machine, Span, Value};
+use ply_eval::{Machine, Span, Symbol, Value};
 use std::sync::Arc;
 
 /// A program that handles its own `db` from a connection string.
@@ -253,16 +253,12 @@ fn call_outcome(entry: &str, url: &str) -> Result<Value, ply_eval::Diagnostic> {
     machine.set_compiled(ply_eval::Provider::attach(unit));
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(host.runtime());
-    let simple = entry.rsplit('.').next().expect("an entry has a name");
-    if let Some(declared) = front
+    let declared = front
         .check
         .defs
-        .values()
-        .find(|d| d.simple_name.as_str() == simple)
-        .map(|d| d.footprint.clone())
-    {
-        machine.set_declared_footprint(declared);
-    }
+        .get(&Symbol::new(entry))
+        .expect("the entry is a definition of the program");
+    machine.set_declared_footprint(declared.footprint.clone());
     machine.call(entry, vec![Value::str(url)], Span::DUMMY)
 }
 
