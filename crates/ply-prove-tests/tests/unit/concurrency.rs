@@ -1,8 +1,8 @@
 use ply_eval::arena::Slot;
 use ply_eval::explore::Step;
 use ply_eval::{
-    Access, Domain, Interleaving, Plan, Seed, SimId, SimMode, Simulation, StepFootprint, Stream,
-    TaskId, explore,
+    Access, DefHash, Diagnostic, Domain, Interleaving, Mode, Plan, Seed, SimId, SimMode,
+    Simulation, Span, StepFootprint, Stream, Symbol, TaskId, codes, explore,
 };
 use ply_prove::concurrency::{
     BodyRun, LawSearch, Searched, ValueDomain, audit_interleaving_proof, discharge, refutation,
@@ -12,9 +12,6 @@ use ply_prove::{
     Binder, Binding, Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, Rule, Sort,
     Tier, Vacuity, VacuityKind, interleaving_proves,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::DefHash;
-use ply_ty::Mode;
 
 fn body_was_false(span: Span) -> Diagnostic {
     Diagnostic::error(

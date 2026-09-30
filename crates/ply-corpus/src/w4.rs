@@ -2,11 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use ply_eval::host::HostRegistry;
-use ply_eval::{Machine, Value};
-use ply_span::{Diagnostic, Span, Symbol};
-use ply_ty::CheckOutput;
-use ply_ty::ModuleName;
-use ply_ty::ty::Footprint;
+use ply_eval::{CheckOutput, Diagnostic, Footprint, Machine, ModuleName, Span, Symbol, Value};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -34,8 +30,8 @@ fn diagnostics(what: &str, diagnostics: &[Diagnostic]) -> anyhow::Error {
 pub struct Program {
     check: CheckOutput,
     /// The tier is built from this rather than from a second front end.
-    port: ply_ty::Front,
-    sources: ply_span::SourceMap,
+    port: ply_eval::Front,
+    sources: ply_eval::SourceMap,
 }
 
 impl Program {

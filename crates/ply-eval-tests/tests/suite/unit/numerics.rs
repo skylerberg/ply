@@ -1,5 +1,4 @@
-use ply_eval::{Value, values_equal};
-use ply_span::Span;
+use ply_eval::{Span, Value, values_equal};
 
 /// `values_equal` is the language's `==` and `Value::cmp` is the map's order.
 #[test]

@@ -3,10 +3,9 @@
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime,
-    Linearity, Value,
+    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
+    HostRuntime, Linearity, Span, Symbol, Value, codes,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

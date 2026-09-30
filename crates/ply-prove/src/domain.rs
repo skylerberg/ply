@@ -1,8 +1,6 @@
 //! Finite domains, and the proof that comes from covering one.
 
-use ply_eval::IntTy;
-use ply_eval::{Fixed, Value};
-use ply_span::Symbol;
+use ply_eval::{Fixed, IntTy, Symbol, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

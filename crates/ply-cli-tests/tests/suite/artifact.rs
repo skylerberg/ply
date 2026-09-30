@@ -1,9 +1,8 @@
 use crate::harness::{json_of, ply, project};
+use ply_eval::{DefHash, Span, codes};
 use ply_host::process::Executables;
 use ply_machine::artifact::{self, Artifact, Binds};
 use ply_machine::load::{Loaded, load};
-use ply_span::{Span, codes};
-use ply_ty::DefHash;
 use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;

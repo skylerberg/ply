@@ -34,12 +34,11 @@ pub mod trace;
 pub mod vcs;
 pub mod warm;
 
-use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_eval::{Diagnostic, Span, Symbol, Value, codes};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
@@ -272,7 +271,7 @@ impl HostHandler for Site {
 
 fn label_of(req: &HostRequest<'_>, span: Span) -> Result<String, Diagnostic> {
     match &req.atom.resource {
-        ply_ty::Resource::Named(name) => Ok(name.to_string()),
+        ply_eval::Resource::Named(name) => Ok(name.to_string()),
         _ => Err(Diagnostic::error(
             codes::INTERNAL_ERROR,
             "`machine` operations name a label: `machine.load[m](..)`".to_string(),

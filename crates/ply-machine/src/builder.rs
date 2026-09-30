@@ -11,12 +11,10 @@ use crate::driver::{HandedFront, handed_front_of, load_over_front};
 use crate::hosts::Lent;
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, diags_value, option, places_value, record};
-use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, Severity, Span, Symbol, codes};
-use ply_ty::{DefHash, DefInfo};
+use ply_eval::{DefHash, DefInfo, Diagnostic, Severity, Span, Symbol, Value as PlyValue, codes};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -293,7 +291,7 @@ impl Site {
 /// Each dependency as the front end pinned it: its name, its version, and the digest of the
 /// modules it contributed. `E0131`'s judgments decide what a package is, so the pin is the front
 /// end's answer rather than anything this side derives from a path.
-fn pins_value(pins: &[ply_ty::front::Pinned]) -> PlyValue {
+fn pins_value(pins: &[ply_eval::Pinned]) -> PlyValue {
     PlyValue::list(
         pins.iter()
             .map(|pin| {

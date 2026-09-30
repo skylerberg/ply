@@ -9,11 +9,11 @@ pub mod sim;
 
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
 use ply_eval::host::{HostBinding, HostRuntime};
-use ply_eval::{Arena, Exploration, Machine, Plan, Race, Seed, TaskRegions, Value};
-use ply_span::{Diagnostic, Symbol, codes};
+use ply_eval::{
+    Arena, CheckOutput, DefHash, Diagnostic, Exploration, HashOutput, Machine, Plan, Race, Seed,
+    Symbol, TaskRegions, Value, codes,
+};
 use ply_store::{Outcome, PassRecord, Store};
-use ply_ty::CheckOutput;
-use ply_ty::{DefHash, HashOutput};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -367,7 +367,7 @@ impl<'a> Hosting<'a> {
 }
 
 pub struct InterpExecutor<'a> {
-    front: &'a ply_ty::Front,
+    front: &'a ply_eval::Front,
     fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
     hosts: Hosting<'a>,
     /// The backend this run installs.
@@ -456,7 +456,7 @@ impl<'a> Worker<'a> {
 }
 
 impl<'a> InterpExecutor<'a> {
-    pub fn new(front: &'a ply_ty::Front) -> InterpExecutor<'a> {
+    pub fn new(front: &'a ply_eval::Front) -> InterpExecutor<'a> {
         InterpExecutor {
             front,
             fixture: None,
@@ -708,7 +708,7 @@ pub struct HybridInput {
 pub fn diagnose_failures(
     report: &RunReport,
     sources: &[(String, String)],
-    front: &ply_ty::Front,
+    front: &ply_eval::Front,
     store: &Store,
 ) -> Hybrids {
     let check = &front.check;
@@ -1072,7 +1072,7 @@ fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: us
 
     let (name, span) = match check.tests.get(index) {
         Some(t) => (t.key.to_string(), t.span),
-        None => (format!("test {index}"), ply_span::Span::DUMMY),
+        None => (format!("test {index}"), ply_eval::Span::DUMMY),
     };
 
     Diagnostic::error(

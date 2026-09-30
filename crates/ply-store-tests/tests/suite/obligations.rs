@@ -1,11 +1,10 @@
 //! The obligation and review files, neither of which is read at [`Store::open`].
 
-use ply_span::Symbol;
+use ply_eval::{DefHash, Symbol};
 use ply_store::{
     CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule, PROVER_VERSION,
     ReviewRecord, Store,
 };
-use ply_ty::DefHash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -132,7 +131,7 @@ fn a_file_written_by_another_prover_is_discarded_whole() {
         store
             .warnings()
             .iter()
-            .any(|w| w.code == ply_span::codes::CACHE_VERSION_CHANGED),
+            .any(|w| w.code == ply_eval::codes::CACHE_VERSION_CHANGED),
         "a prover-version mismatch has to be reported, not silently re-proved"
     );
 }

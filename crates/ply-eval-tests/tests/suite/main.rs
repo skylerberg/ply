@@ -2,6 +2,7 @@
 
 mod fixture;
 
+mod armed;
 mod constant_memo;
 mod determinism_audit;
 mod hoist_staleness_audit;

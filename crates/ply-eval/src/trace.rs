@@ -1,6 +1,6 @@
 //! What an engine actually did, as against what its type said it might.
 
-use ply_ty::{EffectAtom, Footprint};
+use crate::{EffectAtom, Footprint};
 
 /// Counts performs too: a footprint is a set, so it cannot tell one perform from three.
 #[derive(Clone, Debug)]

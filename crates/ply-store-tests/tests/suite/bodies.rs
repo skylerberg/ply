@@ -1,10 +1,9 @@
 //! Definition bodies through the store.
 
 use ply_codegen::c::producer::PrintedName;
-use ply_span::{SourceId, Symbol};
+use ply_eval::{DefHash, HashOutput, SourceId, Symbol};
 use ply_store::body::{BodySet, of_front};
 use ply_store::{BODY_ENCODING, DefBody, Store};
-use ply_ty::{DefHash, HashOutput};
 use std::path::{Path, PathBuf};
 
 struct TempRoot(PathBuf);
@@ -102,7 +101,7 @@ fn a_stored_definition_set_prints_into_a_program_that_checks() {
     assert_eq!(info.footprint.atoms().count(), 1);
     assert_eq!(
         info.footprint.atoms().next().unwrap().resource,
-        ply_ty::Resource::Named(Symbol::new("users"))
+        ply_eval::Resource::Named(Symbol::new("users"))
     );
 }
 

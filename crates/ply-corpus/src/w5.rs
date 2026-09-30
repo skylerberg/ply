@@ -2,12 +2,8 @@
 
 use anyhow::{Context, Result, bail};
 use ply_eval::host::HostRegistry;
-use ply_eval::{Machine, Value};
+use ply_eval::{CheckOutput, Diagnostic, Footprint, Machine, ModuleName, Span, Value};
 use ply_host::trace::{Level, Record, Trace, sink};
-use ply_span::{Diagnostic, Span};
-use ply_ty::CheckOutput;
-use ply_ty::ModuleName;
-use ply_ty::ty::Footprint;
 use serde::Serialize;
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -61,8 +57,8 @@ fn diagnostics(what: &str, diagnostics: &[Diagnostic]) -> anyhow::Error {
 pub struct Program {
     check: CheckOutput,
     /// The port's whole answer, which the tier is built from.
-    port: ply_ty::Front,
-    sources: ply_span::SourceMap,
+    port: ply_eval::Front,
+    sources: ply_eval::SourceMap,
 }
 
 impl Program {

@@ -1,11 +1,8 @@
-use ply_eval::{Bound, HostBinding, Pending, Value};
-use ply_eval::{HostAnswer, HostRequest, HostRuntime, Linearity};
+use ply_eval::{
+    Bound, CheckOutput, Diagnostic, EffectAtom, HostAnswer, HostBinding, HostRequest, HostRuntime,
+    Linearity, Mode, Pending, Resource, SourceId, Span, Symbol, Value, codes,
+};
 use ply_host::tcp::*;
-use ply_span::SourceId;
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::CheckOutput;
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Resource};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;

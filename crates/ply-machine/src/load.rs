@@ -1,11 +1,11 @@
 //! Turning a path into the front end's checked answer.
 
 use crate::driver::FrontEnd;
-use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
+use ply_eval::{
+    CheckOutput, DefInfo, Diagnostic, Front, HashOutput, ModuleInfo, ModuleName, SourceId,
+    SourceMap, Span, Symbol, TestInfo, codes,
+};
 use ply_store::ContentHash;
-use ply_ty::HashOutput;
-use ply_ty::ModuleName;
-use ply_ty::{CheckOutput, DefInfo, Front, ModuleInfo, TestInfo};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
