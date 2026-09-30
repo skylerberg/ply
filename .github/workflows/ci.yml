@@ -30,7 +30,7 @@ env:
 
 jobs:
   plan:
-    name: CI tables and cache keys are total
+    name: CI tables and cache keys are total, and the ucontext probe
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -58,6 +58,9 @@ jobs:
       # and durations come out the same on both, and it is cheaper than a report someone acts on.
       - name: The timings tool's arithmetic holds
         run: .github/ci-timings.sh --self-test
+
+      - name: ./probes/ucontext/run.sh
+        run: ./probes/ucontext/run.sh
 
       # One job cuts the shards, and every partition runs the cut it left: two that cut their own
       # from tables a run apart could agree on no test at all.
@@ -92,23 +95,8 @@ jobs:
           echo "partitions=$(.github/ci-shards.sh partitions)" >> "$GITHUB_OUTPUT"
           echo "solo=$(.github/ci-shards.sh solo-matrix)" >> "$GITHUB_OUTPUT"
 
-  fmt:
-    name: cargo fmt --all --check
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: "1.93.1"
-          components: rustfmt
-      - name: cargo fmt --all --check
-        run: cargo fmt --all --check
-
   clippy:
-    name: cargo clippy --workspace --all-targets
+    name: cargo fmt --all --check and cargo clippy --workspace --all-targets
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -118,7 +106,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: "1.93.1"
-          components: clippy
+          components: clippy, rustfmt
       # rust-cache keys only on Cargo.lock; hashing the manifests moves the key when a profile or
       # feature does.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -126,6 +114,10 @@ jobs:
           key: clippy-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml') }}
           save-if: ${{ github.ref_name == github.event.repository.default_branch }}
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # Whatever clippy said, so one run reports both.
+      - name: cargo fmt --all --check
+        if: ${{ !cancelled() }}
+        run: cargo fmt --all --check
 
   build:
     name: cargo nextest archive
@@ -356,10 +348,12 @@ jobs:
   # compiled there, under the compiler every suite job compiles it with, and saved under this
   # run's emitter key. That leaves the corpus program's unit, which only a run of the program by the
   # archive's `ply` builds, and this is the job with the archive: it restores the emission, adds the
-  # corpus program to it, and republishes the set under this run's key for the shards and, from
-  # main, under the tree's key for a later run whose sources have not moved.
+  # corpus program to it, and saves the set under the tree's key for a later run whose sources have
+  # not moved. Only main's entries reach a later run, and the shards start before this finishes,
+  # so a pull request skips it.
   stage:
     name: the emitter's stage
+    if: github.event_name == 'push'
     needs: [build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -369,14 +363,6 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/suite
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            /tmp/ply-c-cache
-            /tmp/ply-c-stage
-          key: ply-c-stage-run-${{ github.run_id }}
-      # Across runs as well as within one, so a run whose sources are unchanged emits nothing.
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main'
         with:
           path: |
             /tmp/ply-c-cache
@@ -525,6 +511,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
+        with:
+          corpus-program: "false"
 
       - name: cargo nextest run
         env:
@@ -564,6 +552,8 @@ jobs:
         with:
           persist-credentials: true
       - uses: ./.github/actions/suite
+        with:
+          corpus-program: "false"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ply
@@ -603,6 +593,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
+        with:
+          corpus-program: "false"
 
       - name: cargo nextest run
         run: |
@@ -657,6 +649,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
+        with:
+          corpus-program: "false"
 
       - name: cargo nextest run
         run: |
@@ -668,33 +662,42 @@ jobs:
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --no-fail-fast --success-output immediate -E "$filter"
 
-  ucontext-probe:
-    name: ./probes/ucontext/run.sh
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: ./probes/ucontext/run.sh
-        run: ./probes/ucontext/run.sh
-
-  # What a run parks in the cache for its own jobs -- the archive every partition unpacks, the
-  # emitter's stage, the shard cut -- is keyed by the run id, so no later run can read it. Left
-  # behind it is most of what the repository's 10 GB cache holds, and the object cache that does
-  # outlive a run is evicted for it. A run that went green gives them back; a red one keeps them,
-  # because the next thing that happens to it is a re-run, and a job re-run on its own cannot
-  # rebuild the archive the others read.
-  sweep:
-    name: give back this run's caches
-    if: ${{ always() && !failure() && !cancelled() }}
-    needs: [stage, test, solo, gates, test-hosts, refresh]
+  # The one required check. What a run parks in the cache for its own jobs -- the archive every
+  # partition unpacks, the emitter's stage, the shard cut -- is keyed by the run id, so no later run
+  # can read it, and left behind it evicts the object cache that does outlive a run. A green run
+  # gives them back here, after every job that reads them; a red one keeps them, because the next
+  # thing that happens to it is a re-run, and a job re-run on its own cannot rebuild the archive.
+  ci:
+    name: CI
+    if: always()
+    needs: [plan, clippy, build, build-ply, stage, test, solo, gates, test-hosts, refresh]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: write
       contents: read
     steps:
+      - name: Every job succeeded
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          echo '${{ toJSON(needs) }}' > /tmp/needs.json
+          cat /tmp/needs.json
+          # `stage` and `refresh` run on main only.
+          not_ok=$(jq -r --arg event "$EVENT" '
+            to_entries[]
+            | select(.value.result != "success")
+            | select(($event == "pull_request" and .value.result == "skipped"
+                and (.key == "stage" or .key == "refresh")) | not)
+            | "\(.key) = \(.value.result)"
+          ' /tmp/needs.json)
+          if [ -n "$not_ok" ]; then
+            echo "$not_ok" >&2
+            exit 1
+          fi
+          echo "fmt, clippy and the whole test suite are green."
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -710,36 +713,3 @@ jobs:
             exit 0
           fi
           .github/ci-shards.sh give-back "${{ github.run_id }}"
-
-  ci:
-    name: CI
-    if: always()
-    needs:
-      [
-        plan,
-        fmt,
-        clippy,
-        build,
-        build-ply,
-        stage,
-        test,
-        solo,
-        gates,
-        test-hosts,
-        ucontext-probe,
-        sweep,
-      ]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Every job succeeded
-        run: |
-          set -euo pipefail
-          echo '${{ toJSON(needs) }}' > /tmp/needs.json
-          cat /tmp/needs.json
-          not_ok=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key) = \(.value.result)"' /tmp/needs.json)
-          if [ -n "$not_ok" ]; then
-            echo "$not_ok" >&2
-            exit 1
-          fi
-          echo "fmt, clippy and the whole test suite are green."
