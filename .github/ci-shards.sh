@@ -237,7 +237,9 @@ cmd_corpus_for_partition() {
 # `path filter`: the program's entry takes every test of its package, a checks module's its own, and
 # `module:N` its Nth test by the qualified name `ply test --filter` matches.
 cmd_corpus_line() {
-  local entry module n name
+  local entry module n name entries
+  # Read whole before the loop can return, so the lister never writes into a closed pipe.
+  entries=$(corpus_entries)
   while read -r entry; do
     [[ $entry == "$1" ]] || continue
     if [[ $entry == program ]]; then
@@ -250,7 +252,7 @@ cmd_corpus_line() {
       printf '%s %s.\n' "$CORPUS_CHECKS" "$entry"
     fi
     return 0
-  done < <(corpus_entries)
+  done <<< "$entries"
   echo "no corpus entry named '$1'" >&2
   return 1
 }
