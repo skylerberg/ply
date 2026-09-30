@@ -253,6 +253,14 @@ impl ply_eval::Compiled for Absent {
     }
 }
 
+/// What an entry leaves for the machine to read after it, all of it from the body it ran.
+#[derive(Default)]
+struct LastEntry {
+    steps: u64,
+    record: Option<ply_eval::region::Record>,
+    performed: Vec<ply_eval::EffectAtom>,
+}
+
 /// One worker's compiled bodies, offered to a `Machine` through `ply_eval::Compiled`.
 pub struct Bodies {
     unit: &'static Unit,
@@ -263,6 +271,8 @@ pub struct Bodies {
     ctx: RefCell<crate::rt::Ctx>,
     entered: Cell<u64>,
     declines: Cell<Declines>,
+    /// `run` clears it first, so an entry no body ran for reports none of the one before it.
+    last: RefCell<LastEntry>,
 }
 
 impl Bodies {
@@ -311,10 +321,12 @@ impl Bodies {
             ctx,
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
+            last: RefCell::new(LastEntry::default()),
         })
     }
 
-    /// Native bodies actually run, over this backend's whole life.
+    /// Entries the tier answered or raised, a memo's answers among them, over this backend's
+    /// whole life.
     pub fn entered(&self) -> u64 {
         self.entered.get()
     }
@@ -352,6 +364,7 @@ impl Bodies {
     }
 
     fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> Run {
+        *self.last.borrow_mut() = LastEntry::default();
         let Some(admitted) = self.admitted.get(name) else {
             return self.decline(|d| d.not_compiled += 1);
         };
@@ -408,6 +421,11 @@ impl Bodies {
         {
             ctx.teardown.push(d);
         }
+        *self.last.borrow_mut() = LastEntry {
+            steps: u64::try_from(ctx.ticks).unwrap_or(0),
+            record: ctx.record.take(),
+            performed: std::mem::take(&mut ctx.performed),
+        };
 
         if ctx.failed != 0 {
             let raised = if ctx.failed == crate::rt::FAILED_OUT_OF_FUEL {
@@ -513,12 +531,8 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
-    // A borrowed context means a nested entry, which `run` declines, so there is nothing to take.
     fn take_performed(&self) -> Vec<ply_eval::EffectAtom> {
-        self.ctx
-            .try_borrow_mut()
-            .map(|mut ctx| std::mem::take(&mut ctx.performed))
-            .unwrap_or_default()
+        std::mem::take(&mut self.last.borrow_mut().performed)
     }
 
     fn set_seed(&self, seed: ply_eval::Seed, steps: u32) {
@@ -528,19 +542,12 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
-    // The entry's own count: `begin` zeroes it, so what stands here is the entry that ran last.
     fn steps(&self) -> u64 {
-        self.ctx
-            .try_borrow()
-            .map(|ctx| u64::try_from(ctx.ticks).unwrap_or(0))
-            .unwrap_or(0)
+        self.last.borrow().steps
     }
 
     fn simulated(&self) -> Option<ply_eval::region::Record> {
-        self.ctx
-            .try_borrow()
-            .ok()
-            .and_then(|ctx| ctx.record.clone())
+        self.last.borrow().record.clone()
     }
 
     fn set_host(

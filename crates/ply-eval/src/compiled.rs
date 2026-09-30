@@ -25,18 +25,19 @@ pub trait Compiled {
         Entered::Declined
     }
 
-    /// Atoms performed since the last entry, handled ones included.
+    /// The atoms the last entry's body performed, handled ones included.
     fn take_performed(&self) -> Vec<EffectAtom> {
         Vec::new()
     }
 
     fn set_seed(&self, _seed: Seed, _steps: u32) {}
 
-    /// The calls the runtime counted in the entry it ran last; 0 for one that counts none.
+    /// The calls the last entry's body made: 0 when no body ran, as when a memo answered it.
     fn steps(&self) -> u64 {
         0
     }
 
+    /// What the `simulate` regions of the last entry's body did; none when no body ran.
     fn simulated(&self) -> Option<Record> {
         None
     }
@@ -52,6 +53,7 @@ pub trait Compiled {
         (HostUse::default(), 0)
     }
 
+    /// What the host runtime said as the entries since the last take ended.
     fn take_teardown(&self) -> Vec<Diagnostic> {
         Vec::new()
     }
