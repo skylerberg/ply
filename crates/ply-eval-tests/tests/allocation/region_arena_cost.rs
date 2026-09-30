@@ -1,6 +1,6 @@
 use crate::counting::charge;
-use ply_eval::arena::{Arena, RegionKind};
-use ply_eval::{Span, Value};
+use ply_eval::Value;
+use ply_eval::arena::{Arena, Owner, RegionKind};
 use rpds::RedBlackTreeMap;
 
 fn counted<R>(f: impl FnOnce() -> R) -> (usize, usize, R) {
@@ -10,9 +10,9 @@ fn counted<R>(f: impl FnOnce() -> R) -> (usize, usize, R) {
 
 /// One region's worth of work: open, fill, close.
 fn cycle(arena: &mut Arena, kind: RegionKind, size: usize) {
-    let r = arena.open(kind, Span::DUMMY);
+    let r = arena.open(Owner::ENTRY, kind);
     for i in 0..size {
-        arena.alloc(Value::Int(i as i64));
+        arena.alloc(Owner::ENTRY, Value::Int(i as i64));
     }
     arena.close(r);
 }
@@ -58,11 +58,11 @@ fn a_cold_region_costs_one_chunk_per_two_hundred_and_fifty_six_slots() {
 fn nesting_costs_the_allocator_nothing_once_warm() {
     let mut arena = Arena::new();
     let run = |arena: &mut Arena| {
-        let outer = arena.open(RegionKind::Unique, Span::DUMMY);
+        let outer = arena.open(Owner::ENTRY, RegionKind::Unique);
         for depth in 0..64 {
-            let inner = arena.open(RegionKind::Unique, Span::DUMMY);
+            let inner = arena.open(Owner::ENTRY, RegionKind::Unique);
             for i in 0..16 {
-                arena.alloc(Value::Int(depth * 16 + i));
+                arena.alloc(Owner::ENTRY, Value::Int(depth * 16 + i));
             }
             arena.close(inner);
         }
@@ -77,6 +77,41 @@ fn nesting_costs_the_allocator_nothing_once_warm() {
     });
 
     assert_eq!((allocations, bytes), (0, 0));
+}
+
+/// Two stacks interleaving their allocations, the one that opened first closing first, so the
+/// store frees out of order and reuses what it freed.
+#[test]
+fn two_stacks_interleaving_cost_the_allocator_nothing_once_warm() {
+    let (first, second) = (Owner(0), Owner(1));
+    let mut arena = Arena::new();
+    let run = |arena: &mut Arena| {
+        let older = arena.open(first, RegionKind::Shared);
+        let younger = arena.open(second, RegionKind::Shared);
+        for i in 0..300 {
+            arena.alloc(first, Value::Int(i));
+            arena.alloc(second, Value::Int(i));
+        }
+        arena.close(older);
+        let nested = arena.open(second, RegionKind::Unique);
+        for i in 0..300 {
+            arena.alloc(second, Value::Int(i));
+        }
+        arena.close(nested);
+        arena.close(younger);
+    };
+    for _ in 0..2 {
+        run(&mut arena);
+    }
+
+    let (allocations, bytes, ()) = counted(|| {
+        for _ in 0..100 {
+            run(&mut arena);
+        }
+    });
+
+    assert_eq!((allocations, bytes), (0, 0));
+    assert_eq!((arena.total_depth(), arena.live()), (0, 0));
 }
 
 #[test]
@@ -103,11 +138,16 @@ fn a_region_against_the_persistent_map_it_replaced() {
     cycle(&mut arena, RegionKind::Unique, CELLS);
 
     let mut slots = Vec::with_capacity(CELLS);
-    let (region_build, region_bytes, ()) = counted(|| {
-        arena.open(RegionKind::Unique, Span::DUMMY);
+    let (region_build, region_bytes, region) = counted(|| {
+        let region = arena.open(Owner::ENTRY, RegionKind::Unique);
         for i in 0..CELLS {
-            slots.push(arena.alloc(Value::Int(i as i64)).expect("inside a region"));
+            slots.push(
+                arena
+                    .alloc(Owner::ENTRY, Value::Int(i as i64))
+                    .expect("inside a region"),
+            );
         }
+        region
     });
     let (region_write, _, ()) = counted(|| {
         for slot in &slots {
@@ -115,7 +155,7 @@ fn a_region_against_the_persistent_map_it_replaced() {
         }
     });
     let (region_close, _, ()) = counted(|| {
-        arena.close_current();
+        arena.close(region);
     });
 
     println!(

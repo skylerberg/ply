@@ -9,7 +9,7 @@ use crate::heap::{
 use crate::list;
 use crate::map;
 use crate::stack::{Stack, switch};
-use ply_eval::arena::Slot;
+use ply_eval::arena::{Owner, RegionId, Slot};
 use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::{
     BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Resource, Span, Step,
@@ -232,8 +232,9 @@ pub struct HandlerFrame {
     simulate: bool,
     /// For a `handle` resuming off the tail: the detached body whose own stack this frame bottoms.
     detached: Option<usize>,
-    /// How deep the region stack stood when this frame went on: an unwind caught at this `handle`
-    /// closes back to here, since the body it abandons never reaches the closes below its jump.
+    /// How deep its stack's regions stood when this frame went on: an unwind caught at this
+    /// `handle` closes that stack's back to here, since the body it abandons never reaches the
+    /// closes below its jump.
     regions: usize,
 }
 
@@ -248,13 +249,14 @@ impl HandlerFrame {
         }
     }
 
-    pub(crate) fn detached(clauses: Vec<FrameClause>, id: usize, regions: usize) -> HandlerFrame {
+    /// The bottom of a detached body's own stack, which holds no region yet.
+    pub(crate) fn detached(clauses: Vec<FrameClause>, id: usize) -> HandlerFrame {
         HandlerFrame {
             clauses,
             ret: 0,
             simulate: false,
             detached: Some(id),
-            regions,
+            regions: 0,
         }
     }
 }
@@ -333,13 +335,14 @@ pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
         .collect()
 }
 
-/// A spawned task's copies of the handlers around its spawn; none may name a detached body,
-/// whose clause would capture the spawner's stack.
+/// A spawned task's copies of the handlers around its spawn, at the bottom of its own stack; none
+/// may name a detached body, whose clause would capture the spawner's stack.
 pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
     clone_frames(list)
         .into_iter()
         .map(|f| HandlerFrame {
             detached: None,
+            regions: 0,
             ..f
         })
         .collect()
@@ -415,8 +418,9 @@ pub struct Ctx {
     deadline: Option<std::time::Instant>,
     time_budget_ms: u64,
     /// The cells, holding heap words: declared before the heap, so their counts go back first.
+    /// Each stack in `stacks` owns the regions it opens, under the index that names it.
     cells: ply_eval::TaskRegions<Held>,
-    /// The arena's `(depth, live)` when the running entry began, for [`Ctx::cells_balanced`].
+    /// The arena's `(total depth, live)` when the running entry began, for [`Ctx::cells_balanced`].
     cells_baseline: (usize, usize),
     /// The arena `ply_eval::builtins::call` insists on; nothing reaching it uses it.
     scratch: ply_eval::Arena,
@@ -465,7 +469,7 @@ pub struct Ctx {
 impl Ctx {
     pub fn new(tables: Rc<Tables>) -> Ctx {
         let cells = ply_eval::TaskRegions::new();
-        let baseline = (cells.arena().depth(), cells.arena().live());
+        let baseline = (cells.total_depth(), cells.live());
         Ctx {
             failed: 0,
             fuel: 0,
@@ -595,8 +599,9 @@ impl Ctx {
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
-        // Only this runs on every exit, so a region a failure or an unwind jumped past closes
-        // here; the cells go back before the heap their words live in.
+        // Only this runs on every exit, so a region a failure or an unwind jumped past, or a
+        // suspended stack still holds, closes here; the cells go back before the heap their words
+        // live in.
         self.cells.close_program_regions();
         debug_assert!(
             self.cells_balanced(),
@@ -656,14 +661,25 @@ impl Ctx {
         self.cell_extent() == self.cells_baseline
     }
 
-    /// The cell arena's `(regions open, slots live)`, which an entry has to leave as it found.
+    /// The cell arena's `(regions open on every stack, slots live)`, which an entry has to leave
+    /// as it found.
     pub fn cell_extent(&self) -> (usize, usize) {
-        (self.region_depth(), self.cells.arena().live())
+        (self.cells.total_depth(), self.cells.live())
     }
 
-    /// How deep the region stack stands, for a handler frame that closes back to it.
+    /// The running stack, which owns the regions it opens.
+    fn owner(&self) -> Owner {
+        Owner(self.current)
+    }
+
+    /// How deep the running stack's regions stand, for a handler frame that closes back to it.
     pub(crate) fn region_depth(&self) -> usize {
-        self.cells.arena().depth()
+        self.cells.depth(self.owner())
+    }
+
+    /// A stack that will not run again gives back the regions it still holds.
+    pub(crate) fn release_regions(&mut self, stack: usize) {
+        self.cells.close_regions_above(Owner(stack), 0);
     }
 
     /// The singleton a nullary constructor is.
@@ -789,31 +805,38 @@ pub(crate) fn values_taken(ctx: &mut Ctx, args: &[Word]) -> Vec<Value> {
     out
 }
 
-/// Opens a `with cell` region; `unique` is the site's proof that no continuation crosses it.
+/// Opens a `with cell` region on the running stack; `unique` is the site's proof that no
+/// continuation crosses it.
 pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, unique: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let kind = match unique {
         0 => ply_eval::RegionKind::Shared,
         _ => ply_eval::RegionKind::Unique,
     };
-    ctx.cells.open_region(kind, Span::DUMMY).0 as i64
+    let owner = ctx.owner();
+    ctx.cells.open(owner, kind).to_bits() as i64
 }
 
-/// Closes a region, reclaiming its cells. The emitter puts it after the body, so only a body that
-/// ran to its end reaches it; an abandoned one is closed by its `handle` or by [`Ctx::end`].
+/// Closes a region, reclaiming its cells. The emitter puts it after the body, on the stack that
+/// opened it, so only a body that ran to its end reaches it; an abandoned one is closed by its
+/// `handle`, by its stack's release, or by [`Ctx::end`].
 pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
     let ctx = unsafe { &mut *ctx };
-    ctx.cells
-        .close_region(ply_eval::arena::RegionId(region as u32));
+    ctx.cells.close(RegionId::from_bits(region as u64));
 }
 
-/// Allocates a cell in the context's arena, shared with the interpreter's cell builtins.
+/// Allocates a cell in the running stack's innermost region, shared with the interpreter's cell
+/// builtins.
 pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if !ctx.sims.is_empty() {
         ctx.trail.record_access(ply_eval::sim::Access::Alloc);
     }
-    let slot = ctx.cells.alloc_cell(Held(init));
+    let owner = ctx.owner();
+    let slot = ctx
+        .cells
+        .alloc(owner, Held(init))
+        .expect("a `with_cell` allocates in the region its stack just opened");
     ctx.heap.bridge(Value::Cell(slot))
 }
 
@@ -2226,7 +2249,7 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     for f in c.stacks[stack].list.split_off(depth) {
         drop_frame(f);
     }
-    c.sims.pop();
+    crate::simulate::end(c);
     c.record = Some(c.trail.record());
     r
 }
@@ -2252,8 +2275,10 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
             c.failed = 0;
             if let Some(f) = mine {
                 // The body is abandoned where it stood, above the closes the emitter put after
-                // the regions it opened; they go back here so the entry stays balanced.
-                c.cells.close_regions_above(f.regions);
+                // the regions it opened on this stack; they go back here so the entry stays
+                // balanced.
+                let owner = c.owner();
+                c.cells.close_regions_above(owner, f.regions);
                 drop_frame(f);
             }
             return v;

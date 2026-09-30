@@ -175,7 +175,7 @@ pub unsafe fn finish_root(ctx: *mut Ctx, value: Word) -> Word {
     let from = &mut sim.tasks[ROOT.0 as usize].sp as *mut usize;
     unsafe { switch(&mut *from, to) };
     let c = unsafe { &mut *ctx };
-    let sim = c.sims.pop().expect("the region that just completed");
+    let sim = end(c);
     c.current = sim.tasks[ROOT.0 as usize].frames;
     c.stack_floor = sim.tasks[ROOT.0 as usize].floor;
     drop(sim.loop_stack);
@@ -184,13 +184,14 @@ pub unsafe fn finish_root(ctx: *mut Ctx, value: Word) -> Word {
 
 /// The production loop failed while the root was suspended in it, and resumed the root directly.
 fn ended_under_root(c: &mut Ctx) -> Word {
-    let sim = c.sims.pop().expect("the region that just ended");
+    let sim = end(c);
     c.current = sim.tasks[ROOT.0 as usize].frames;
     c.stack_floor = sim.tasks[ROOT.0 as usize].floor;
     sim.answer
 }
 
-/// Drop a finished task's stack and frames; the production root keeps its frames.
+/// Drops a task's stack, its frames, and the regions a failure or an unwind left open on it; the
+/// production root runs on the opening stack and keeps all three.
 fn release(c: &mut Ctx, at: usize) {
     let sim = c.sims.last_mut().expect("a region is running");
     if sim.tasks[at].stack.take().is_none() {
@@ -200,6 +201,16 @@ fn release(c: &mut Ctx, at: usize) {
     for f in std::mem::take(&mut c.stacks[frames].list) {
         drop_frame(f);
     }
+    c.release_regions(frames);
+}
+
+/// Pops the innermost region and releases each task it never finished, which will not run again.
+pub(crate) fn end(c: &mut Ctx) -> Simulation {
+    let tasks = c.sims.last().expect("a region is running").tasks.len();
+    for at in 0..tasks {
+        release(c, at);
+    }
+    c.sims.pop().expect("a region is running")
 }
 
 /// The region's loop. Returns the body's answer, or zero with the context failed.

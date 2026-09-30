@@ -426,6 +426,7 @@ impl Bodies {
                 None => Run::Declined,
             };
         }
+        crate::detached::release_all(&mut ctx);
         if !ctx.cells_balanced() {
             ctx.end();
             drop(ctx);

@@ -16,6 +16,7 @@ mod reference_cycles;
 mod region_boundary_audit;
 mod region_isolation_audit;
 mod region_meaning_adversarial;
+mod region_stacks_audit;
 mod secrets;
 mod simulated_handlers;
 mod unit;

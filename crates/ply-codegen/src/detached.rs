@@ -63,11 +63,10 @@ const ONE_SHOT: &str = "the region this continuation was captured in has already
 pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, body: Word) -> Word {
     let c = unsafe { &mut *ctx };
     let id = c.detached.len();
-    let regions = c.region_depth();
     let frames = c.open_stack(Some(c.current));
     c.stacks[frames]
         .list
-        .push(HandlerFrame::detached(clauses, id, regions));
+        .push(HandlerFrame::detached(clauses, id));
     let stack = Stack::new();
     let sp = stack.prepare(entry, ctx as usize);
     let floor = stack.floor();
@@ -89,7 +88,22 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
         captures: Vec::new(),
         live: None,
     });
-    unsafe { resume(ctx, id, None, None) }
+    let answer = unsafe { resume(ctx, id, None, None) };
+    let c = unsafe { &mut *ctx };
+    // A failure or an unwind leaving the `handle` abandons its body wherever the body stood.
+    if c.failed != 0 {
+        let frames = c.detached[id].frames;
+        c.release_regions(frames);
+    }
+    answer
+}
+
+/// Once the entry has returned no body can be resumed, so none holds a region any longer.
+pub(crate) fn release_all(c: &mut Ctx) {
+    for id in 0..c.detached.len() {
+        let frames = c.detached[id].frames;
+        c.release_regions(frames);
+    }
 }
 
 /// Runs the body from where it stopped, `answer` returned from its `perform`, until it stops again.
@@ -169,11 +183,11 @@ pub(crate) unsafe fn resume(
             call_value(ctx, closure, &args)
         }
         Some(Stopped::Finished(v)) => {
-            finish(d);
+            finish(c, id);
             v
         }
         Some(Stopped::Failed) => {
-            finish(d);
+            finish(c, id);
             0
         }
         None => {
@@ -187,8 +201,10 @@ pub(crate) unsafe fn resume(
     }
 }
 
-/// A finished body keeps its stack and closures only while a snapshot could be restored onto it.
-fn finish(d: &mut Detached) {
+/// A finished body keeps its stack, closures and the regions it left open only while a snapshot
+/// could be restored onto it.
+fn finish(c: &mut Ctx, id: usize) {
+    let d = &mut c.detached[id];
     d.state = State::Done;
     d.live = None;
     if d.captures.iter().all(|k| k.bytes.is_none()) {
@@ -201,6 +217,8 @@ fn finish(d: &mut Detached) {
             heap::dec(d.ret);
             d.ret = 0;
         }
+        let frames = d.frames;
+        c.release_regions(frames);
     }
 }
 
@@ -335,8 +353,8 @@ extern "C" fn entry(arg: usize) {
     let c = unsafe { &mut *ctx };
     let frames = c.detached[id].frames;
     let frame = c.stacks[frames].list.pop();
-    // A zero-shot clause of this frame unwinds to it; `return` is not applied. The body's regions
-    // are not closed here: a clause suspended in `resume` may own one and run on past this.
+    // A zero-shot clause of this frame unwinds to it; `return` is not applied. What the body left
+    // open goes back with its stack in `finish`, since a snapshot may still resume into it.
     if c.failed == FAILED_UNWIND
         && let Some((stack, depth, v)) = c.unwind.take()
     {
