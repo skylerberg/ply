@@ -568,12 +568,10 @@ fn a_dependency_module_is_filed_under_its_package_and_survives_the_package_movin
     );
 }
 
-/// `ply prove` lowers a module's claims only when it has something to discharge there, and keeps
-/// what it lowered keyed by the texts the module reaches.
+/// A warm `ply prove` answers every obligation from the cache, across modules that import one
+/// another.
 #[test]
-fn prove_asks_for_claims_only_when_something_is_discharged_and_only_where_an_edit_reached() {
-    use ply_codegen::c::producer;
-    use ply_machine::driver;
+fn a_warm_prove_answers_every_obligation_from_the_cache() {
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -609,40 +607,7 @@ fn zero(x: Int) -> Int
 ",
     );
 
-    // What a load the CLI cached answers with: its claims are kept beside the front-end cache.
-    let cached = || {
-        let mut loaded = ply_machine::load::load(dir.path()).expect("the project loads");
-        loaded.frontend.incremental = true;
-        loaded
-    };
-    // `ply prove` lowers claims on the thread its prover runs on, and the port's census is that
-    // thread's, so it is read here, where the claims are asked for.
-    let lowered = |what: &str, claimed: usize| {
-        let mut store = Store::open(dir.path()).unwrap();
-        let loaded = cached();
-        producer::reset_census();
-        driver::claims(&loaded, Some(&mut store)).expect("the claims lower");
-        assert_eq!(
-            producer::census().claimed,
-            claimed,
-            "{what}: modules whose claims the port was asked for"
-        );
-        store.flush().unwrap();
-    };
-
-    lowered("cold", 3);
-    lowered("nothing edited", 0);
-    edit(dir.path(), "side.ply", "x - x", "x - x + 0");
-    lowered("an edit to a module nothing imports", 1);
-    edit(dir.path(), "base.ply", "x + one()", "x + one() + 0");
-    lowered("an edit to a module another imports", 2);
-
     ply(dir.path()).args(["prove", "."]).assert().success();
-    ply(dir.path()).args(["prove", "."]).assert().success();
-
-    // What the run reads the cache for: every obligation is answered from it, whatever became of
-    // the claims the prover lowered.
-    fs::remove_file(dir.path().join(".ply-cache/claims.answer")).unwrap();
     let out = ply(dir.path())
         .args(["prove", ".", "--json"])
         .output()

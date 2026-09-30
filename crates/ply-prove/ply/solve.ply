@@ -1,0 +1,985 @@
+// `solve` — the decision procedure: case analysis over a saturating congruence closure, with linear
+// integer arithmetic at every leaf.
+
+import arith (Row, Feasibility, Infeasible, Undecided, leq, eq_rows, feasibility)
+import context (Context, Ctor, variants)
+import domain (Ty, Con, Record, Decl, Variant)
+import egraph (Classes, Pair, Joined, classes, grow, find, union, equal, distinguish, has_diseq,
+               check_diseqs, groups, Shape, shape_of, conflict)
+import lower (field_sorts)
+import rules (RuleLog, Rule, note, Propositional, CaseSplit, Congruence, Injectivity,
+              LinearArithmetic)
+import sort (is_con, list_elem, field_names)
+import term (Terms, Made, Node, TInt, TBool, TLin, TApp, TCtor, TNil, TCons, TRecord, TField, TNot,
+             TAnd, TOr, TCmp, TEq, TIf, TMatch, Poly, Mono, CmpOp, Lt, Le, Gt, Ge, Arm, ArmTest,
+             Always, TestCtor, TestLit, TestList, Undecidable, true_id, false_id, size, node,
+             sort_of, is_int, mk, sym, nil, cons)
+
+pub type Answer = | Closed | Open | Exhausted
+
+pub type Solver = { ts: Terms, rules: RuleLog, budget: Int, split_depth: Int, cx: Context }
+
+// One branch of the search: its classes, the `Int` orderings its disequality splits chose, and the
+// disequalities it has split on.
+type Branch = { cs: Classes, int_lt: List<Pair>, split: Map<Pair, Bool> }
+
+type Split =
+  | SplitBool(Int)
+  | SplitCtor({ scrutinee: Int, type_name: String, ctors: List<{ name: String, fields: List<Option<Ty>> }> })
+  | SplitLit(Int, Int)
+  | SplitDiseq(Int, Int)
+  | SplitList(Int)
+
+// A solver after a search, and what the search came to.
+pub type Searched = { sv: Solver, answer: Answer }
+
+fn charged(sv: Solver) -> Option<Solver> =
+  if sv.budget >= 1 { Some({ ..sv, budget: sv.budget - 1 }) } else { None }
+
+fn spent(sv: Solver) -> Solver = { ..sv, budget: 0 }
+
+fn noted(sv: Solver, r: Rule) -> Solver = { ..sv, rules: note(sv.rules, r) }
+
+// `Closed` iff the assertions contradict each other.
+pub fn refute(sv: Solver, assertions: List<{ term: Int, polarity: Bool }>) -> Searched = {
+  let start = fold(
+    assertions,
+    classes(size(sv.ts)),
+    |cs: Classes, a: { term: Int, polarity: Bool }|
+      union(cs, a.term, if a.polarity { true_id() } else { false_id() }).cs,
+  );
+  explore(sv, { cs: start, int_lt: [], split: map_new() }, 0)
+}
+
+fn explore(sv: Solver, b: Branch, depth: Int) -> Searched = {
+  let sat = saturate(sv, b);
+  match sat.answer {
+    Closed -> { sv: sat.sv, answer: Closed },
+    Exhausted -> { sv: sat.sv, answer: Exhausted },
+    Open -> match choose_split(sat.sv, sat.b) {
+      None -> { sv: sat.sv, answer: Open },
+      Some(split) -> if depth >= sat.sv.split_depth { { sv: sat.sv, answer: Exhausted } } else {
+        match charged(sat.sv) {
+          None -> { sv: spent(sat.sv), answer: Exhausted },
+          Some(sv2) -> branch_on(sv2, split, sat.b, depth),
+        }
+      },
+    },
+  }
+}
+
+fn branch_on(sv: Solver, split: Split, b: Branch, depth: Int) -> Searched = {
+  let made = children(sv, split, b);
+  let walked = fold(
+    made.children,
+    { sv: made.sv, exhausted: false, open: false },
+    |st: { sv: Solver, exhausted: Bool, open: Bool }, child: Branch|
+      if st.open { st } else {
+        let r = explore(st.sv, child, depth + 1);
+        match r.answer {
+          Open -> { sv: r.sv, exhausted: st.exhausted, open: true },
+          Exhausted -> { sv: r.sv, exhausted: true, open: false },
+          Closed -> { sv: r.sv, exhausted: st.exhausted, open: false },
+        }
+      },
+  );
+  {
+    sv: walked.sv,
+    answer: if walked.open { Open } else if walked.exhausted { Exhausted } else { Closed },
+  }
+}
+
+fn joined(b: Branch, x: Int, y: Int) -> Branch = { ..b, cs: union(b.cs, x, y).cs }
+
+fn children(sv: Solver, split: Split, b: Branch) -> { sv: Solver, children: List<Branch> } =
+  match split {
+    SplitBool(t) ->
+      {
+        sv: noted(sv, Propositional),
+        children: [joined(b, t, true_id()), joined(b, t, false_id())],
+      },
+    SplitCtor(c) -> {
+      let sv1 = noted(sv, CaseSplit({ ty: c.type_name, arms: len(c.ctors) }));
+      fold(
+        c.ctors,
+        { sv: sv1, children: [] },
+        |acc: { sv: Solver, children: List<Branch> }, k: { name: String, fields: List<Option<Ty>> }| {
+          let args = fold(
+            k.fields,
+            { ts: acc.sv.ts, ids: [] },
+            |a: { ts: Terms, ids: List<Int> }, s: Option<Ty>| {
+              let m = sym(a.ts, s);
+              { ts: m.ts, ids: push(a.ids, m.id) }
+            },
+          );
+          let applied = mk(
+            args.ts,
+            TCtor({ name: k.name, args: args.ids }),
+            sort_of(args.ts, c.scrutinee),
+          );
+          let child = joined({ ..b, cs: grow(b.cs, size(applied.ts)) }, c.scrutinee, applied.id);
+          { sv: { ..acc.sv, ts: applied.ts }, children: push(acc.children, child) }
+        },
+      )
+    },
+    SplitList(s) -> {
+      let sv1 = noted(sv, CaseSplit({ ty: "List", arms: 2 }));
+      let sort = sort_of(sv1.ts, s);
+      let elem = match sort { Some(t) -> list_elem(t), None -> None };
+      let empty = nil(sv1.ts, sort);
+      let head = sym(empty.ts, elem);
+      let tail = sym(head.ts, sort);
+      let pair = cons(tail.ts, head.id, tail.id, sort);
+      {
+        sv: { ..sv1, ts: pair.ts },
+        children: map([empty.id, pair.id], |applied: Int|
+          joined({ ..b, cs: grow(b.cs, size(pair.ts)) }, s, applied)),
+      }
+    },
+    SplitLit(s, lit) ->
+      {
+        sv: noted(sv, Propositional),
+        children: [joined(b, s, lit), { ..b, cs: distinguish(b.cs, s, lit) }],
+      },
+    SplitDiseq(x, y) -> {
+      let key = { a: if x < y { x } else { y }, b: if x < y { y } else { x } };
+      {
+        sv: noted(sv, LinearArithmetic),
+        children: map([{ a: x, b: y }, { a: y, b: x }], |lohi: Pair|
+          { ..b, split: map_insert(b.split, key, true), int_lt: push(b.int_lt, lohi) }),
+      }
+    },
+  }
+
+type Saturated = { sv: Solver, b: Branch, answer: Answer }
+
+fn saturate(sv: Solver, b: Branch) -> Saturated =
+  match charged(sv) {
+    None -> { sv: spent(sv), b: b, answer: Exhausted },
+    Some(sv1) -> {
+      let grown = { ..b, cs: grow(b.cs, size(sv1.ts)) };
+      let c = congruence(sv1, grown);
+      if c.b.cs.contradiction { { sv: c.sv, b: c.b, answer: Closed } } else {
+        let p = propagate(c.sv, c.b);
+        let checked = { ..p.b, cs: check_diseqs(p.b.cs) };
+        if checked.cs.contradiction { { sv: noted(p.sv, Congruence), b: checked, answer: Closed } }
+        else if c.changed || p.changed { saturate(p.sv, checked) } else {
+          let a = arithmetic(p.sv, checked);
+          match a.answer {
+            Infeasible -> { sv: noted(a.sv, LinearArithmetic), b: checked, answer: Closed },
+            Undecided ->
+              { sv: a.sv, b: checked, answer: if a.sv.budget == 0 { Exhausted } else { Open } },
+          }
+        }
+      }
+    },
+  }
+
+type Stepped = { sv: Solver, b: Branch, changed: Bool }
+
+// Merges terms whose arguments are already equal, then applies the constructor rules.
+fn congruence(sv: Solver, b: Branch) -> Stepped = {
+  let n = size(sv.ts);
+  let walked = fold(
+    range(0, n),
+    { sv: sv, b: b, changed: false, seen: map_new() },
+    |st: { sv: Solver, b: Branch, changed: Bool, seen: Map<Node, Int> }, t: Int|
+      match canonical(st.sv.ts, st.b.cs, t) {
+        None -> st,
+        Some(sig) -> match map_get(st.seen, sig) {
+          Some(other) -> {
+            let j = union(st.b.cs, t, other);
+            if j.changed {
+              {
+                sv: noted(st.sv, Congruence),
+                b: { ..st.b, cs: j.cs },
+                changed: true,
+                seen: st.seen,
+              }
+            } else { st }
+          },
+          None -> { ..st, seen: map_insert(st.seen, sig, t) },
+        },
+      },
+  );
+  let s = structural(walked.sv, walked.b, n);
+  { sv: s.sv, b: s.b, changed: walked.changed || s.changed }
+}
+
+fn canonical(ts: Terms, cs: Classes, t: Int) -> Option<Node> = {
+  let f = |x: Int| find(cs, x);
+  match node(ts, t) {
+    TLin(p) -> {
+      let summed = fold(p.monomials, Some(map_new()), |acc: Option<Map<Int, I128>>, m: Mono|
+        match acc {
+          None -> None,
+          Some(mm) -> match checked_add(
+              match map_get(mm, f(m.term)) { Some(c) -> c, None -> 0i128 },
+              m.coeff,
+            ) {
+            Some(c) -> Some(map_insert(mm, f(m.term), c)),
+            None -> None,
+          },
+        });
+      match summed {
+        None -> None,
+        Some(mm) ->
+          Some(
+            TLin({
+              monomials: fold(
+                map_entries(mm),
+                [],
+                |acc: List<Mono>, e: { key: Int, value: I128 }|
+                  if e.value == 0i128 { acc } else { push(acc, { term: e.key, coeff: e.value }) },
+              ),
+              konst: p.konst,
+            }),
+          ),
+      }
+    },
+    TApp(a) -> Some(TApp({ head: f(a.head), args: map(a.args, f) })),
+    TCtor(c) -> Some(TCtor({ name: c.name, args: map(c.args, f) })),
+    TCons(c) -> Some(TCons({ head: f(c.head), tail: f(c.tail) })),
+    TRecord(fields) ->
+      Some(
+        TRecord(map(fields, |x: { name: String, value: Int }| { name: x.name, value: f(x.value) })),
+      ),
+    TField(x) -> Some(TField({ base: f(x.base), field: x.field })),
+    TNot(a) -> Some(TNot(f(a))),
+    TAnd(a, c) -> Some(TAnd(f(a), f(c))),
+    TOr(a, c) -> Some(TOr(f(a), f(c))),
+    TCmp(c) -> Some(TCmp({ op: c.op, lhs: f(c.lhs), rhs: f(c.rhs) })),
+    TEq(e) -> {
+      let x = f(e.lhs);
+      let y = f(e.rhs);
+      Some(TEq({ lhs: if x < y { x } else { y }, rhs: if x < y { y } else { x } }))
+    },
+    TIf(i) ->
+      Some(TIf({ cond: f(i.cond), then_branch: f(i.then_branch), else_branch: f(i.else_branch) })),
+    TMatch(m) ->
+      Some(
+        TMatch({
+          scrutinee: f(m.scrutinee),
+          arms: map(m.arms, |arm: Arm|
+            { test: arm.test, binds: map(arm.binds, f), body: f(arm.body) }),
+        }),
+      ),
+    leaf -> Some(leaf),
+  }
+}
+
+// Injectivity and disjointness for constructors, list literals and record literals.
+fn structural(sv: Solver, b: Branch, n: Int) -> Stepped =
+  fold(
+    groups(b.cs, n),
+    { sv: sv, b: b, changed: false },
+    |st: Stepped, g: { rep: Int, members: List<Int> }|
+      if st.b.cs.contradiction { st } else {
+        fold(
+          g.members,
+          { st: st, witness: None },
+          |acc: { st: Stepped, witness: Option<Int> }, t: Int|
+            if acc.st.b.cs.contradiction { acc } else {
+              match shape_of(acc.st.sv.ts, t) {
+                None -> acc,
+                Some(shape) -> match acc.witness {
+                  None -> { st: acc.st, witness: Some(t) },
+                  Some(previous) -> match shape_of(acc.st.sv.ts, previous) {
+                    None -> acc,
+                    Some(earlier) -> match conflict(earlier, shape) {
+                      Some(true) ->
+                        {
+                          st: {
+                            sv: noted(acc.st.sv, Injectivity),
+                            b: { ..acc.st.b, cs: { ..acc.st.b.cs, contradiction: true } },
+                            changed: true,
+                          },
+                          witness: acc.witness,
+                        },
+                      Some(false) -> {
+                        let u = unify_arguments(acc.st.sv.ts, acc.st.b, previous, t);
+                        if u.changed {
+                          {
+                            st: { sv: noted(acc.st.sv, Injectivity), b: u.b, changed: true },
+                            witness: acc.witness,
+                          }
+                        } else { { st: { ..acc.st, b: u.b }, witness: acc.witness } }
+                      },
+                      None -> acc,
+                    },
+                  },
+                },
+              }
+            },
+        ).st
+      },
+  )
+
+fn unify_arguments(ts: Terms, b: Branch, x: Int, y: Int) -> { b: Branch, changed: Bool } = {
+  let pairs = match node(ts, x) {
+    TCtor(c) -> match node(ts, y) { TCtor(d) -> zipped(c.args, d.args), _ -> [] },
+    TCons(c) -> match node(ts, y) {
+      TCons(d) -> [{ a: c.head, b: d.head }, { a: c.tail, b: d.tail }],
+      _ -> [],
+    },
+    TRecord(xs) -> match node(ts, y) {
+      TRecord(ys) ->
+        zipped(
+          map(xs, |f: { name: String, value: Int }| f.value),
+          map(ys, |f: { name: String, value: Int }| f.value),
+        ),
+      _ -> [],
+    },
+    _ -> [],
+  };
+  fold(pairs, { b: b, changed: false }, |acc: { b: Branch, changed: Bool }, p: Pair| {
+    let j = union(acc.b.cs, p.a, p.b);
+    { b: { ..acc.b, cs: j.cs }, changed: acc.changed || j.changed }
+  })
+}
+
+fn zipped(xs: List<Int>, ys: List<Int>) -> List<Pair> =
+  fold(range(0, if len(xs) < len(ys) { len(xs) } else { len(ys) }), [], |acc: List<Pair>, i: Int|
+    match list_at(xs, i) {
+      Some(x) -> match list_at(ys, i) { Some(y) -> push(acc, { a: x, b: y }), None -> acc },
+      None -> acc,
+    })
+
+fn propagate(sv: Solver, b: Branch) -> Stepped = {
+  let walked = fold(
+    range(0, size(sv.ts)),
+    { sv: sv, b: b, changed: false },
+    |st: Stepped, t: Int| {
+      let r = propagate_one(st.sv, st.b, t);
+      { sv: r.sv, b: r.b, changed: st.changed || r.changed }
+    },
+  );
+  let d = propagate_disequalities(walked.sv, walked.b);
+  { sv: d.sv, b: d.b, changed: walked.changed || d.changed }
+}
+
+fn propagate_one(sv: Solver, b: Branch, t: Int) -> Stepped =
+  match node(sv.ts, t) {
+    TNot(a) -> {
+      let s1 = match truth(sv.ts, b, a) {
+        Some(v) -> set(sv.ts, b, t, !v),
+        None -> { b: b, changed: false },
+      };
+      let s2 = match truth(sv.ts, s1.b, t) {
+        Some(v) -> set(sv.ts, s1.b, a, !v),
+        None -> { b: s1.b, changed: false },
+      };
+      let changed = s1.changed || s2.changed;
+      { sv: if changed { noted(sv, Propositional) } else { sv }, b: s2.b, changed: changed }
+    },
+    TAnd(x, y) -> junction(sv, b, t, x, y, true),
+    TOr(x, y) -> junction(sv, b, t, x, y, false),
+    TEq(e) -> equality(sv, b, t, e.lhs, e.rhs),
+    TIf(i) -> match truth(sv.ts, b, i.cond) {
+      Some(true) -> {
+        let j = union(b.cs, t, i.then_branch);
+        { sv: noted(sv, Propositional), b: { ..b, cs: j.cs }, changed: j.changed }
+      },
+      Some(false) -> {
+        let j = union(b.cs, t, i.else_branch);
+        { sv: noted(sv, Propositional), b: { ..b, cs: j.cs }, changed: j.changed }
+      },
+      None -> { sv: sv, b: b, changed: false },
+    },
+    TMatch(m) -> {
+      let r = reduce_match(sv.ts, b, t, m.scrutinee, m.arms);
+      { sv: sv, b: r.b, changed: r.changed }
+    },
+    TField(f) -> match record_field(sv.ts, b, f.base, f.field) {
+      Some(v) -> {
+        let j = union(b.cs, t, v);
+        { sv: noted(sv, Congruence), b: { ..b, cs: j.cs }, changed: j.changed }
+      },
+      None -> { sv: sv, b: b, changed: false },
+    },
+    _ -> { sv: sv, b: b, changed: false },
+  }
+
+// `a != b` at `Bool` decides one side from the other.
+fn propagate_disequalities(sv: Solver, b: Branch) -> Stepped = {
+  let walked = fold(
+    b.cs.diseqs,
+    { b: b, changed: false },
+    |acc: { b: Branch, changed: Bool }, d: Pair|
+      fold(
+        [{ a: d.a, b: d.b }, { a: d.b, b: d.a }],
+        acc,
+        |inner: { b: Branch, changed: Bool }, xy: Pair|
+          if !is_bool(sv.ts, xy.b) { inner } else {
+            match truth(sv.ts, inner.b, xy.a) {
+              Some(v) -> {
+                let s = set(sv.ts, inner.b, xy.b, !v);
+                { b: s.b, changed: inner.changed || s.changed }
+              },
+              None -> inner,
+            }
+          },
+      ),
+  );
+  {
+    sv: if walked.changed { noted(sv, Propositional) } else { sv },
+    b: walked.b,
+    changed: walked.changed,
+  }
+}
+
+fn is_bool(ts: Terms, t: Int) -> Bool =
+  match sort_of(ts, t) { Some(s) -> is_con(s, "Bool"), None -> false }
+
+// `&&` when `conjunction` holds, `||` when it does not.
+fn junction(sv: Solver, b: Branch, t: Int, x: Int, y: Int, conjunction: Bool) -> Stepped = {
+  let short = !conjunction;
+  let left = truth(sv.ts, b, x);
+  let right = truth(sv.ts, b, y);
+  let s1 = if left == Some(short) || right == Some(short) { set(sv.ts, b, t, short) }
+  else if left == Some(!short) && right == Some(!short) { set(sv.ts, b, t, !short) }
+  else { { b: b, changed: false } };
+  let s2 = match truth(sv.ts, s1.b, t) {
+    Some(v) -> if v != short {
+      let a1 = set(sv.ts, s1.b, x, !short);
+      let a2 = set(sv.ts, a1.b, y, !short);
+      { b: a2.b, changed: a1.changed || a2.changed }
+    } else {
+      let a1 = if left == Some(!short) { set(sv.ts, s1.b, y, short) }
+      else { { b: s1.b, changed: false } };
+      let a2 = if right == Some(!short) { set(sv.ts, a1.b, x, short) }
+      else { { b: a1.b, changed: false } };
+      { b: a2.b, changed: a1.changed || a2.changed }
+    },
+    None -> { b: s1.b, changed: false },
+  };
+  let changed = s1.changed || s2.changed;
+  { sv: if changed { noted(sv, Propositional) } else { sv }, b: s2.b, changed: changed }
+}
+
+fn equality(sv: Solver, b: Branch, t: Int, lhs: Int, rhs: Int) -> Stepped = {
+  // Extensionality holds whatever polarity the equality was asserted at.
+  let ext = if !equal(b.cs, lhs, rhs) && fields_all_equal(sv.ts, b, lhs, rhs) {
+    let j = union(b.cs, lhs, rhs);
+    { sv: noted(sv, Congruence), b: { ..b, cs: j.cs }, changed: j.changed }
+  } else { { sv: sv, b: b, changed: false } };
+  let d = decide_equality(ext.sv, ext.b, t, lhs, rhs);
+  { sv: d.sv, b: d.b, changed: ext.changed || d.changed }
+}
+
+fn decide_equality(sv: Solver, b: Branch, t: Int, lhs: Int, rhs: Int) -> Stepped =
+  match truth(sv.ts, b, t) {
+    Some(true) -> {
+      let j = union(b.cs, lhs, rhs);
+      { sv: sv, b: { ..b, cs: j.cs }, changed: j.changed }
+    },
+    Some(false) -> if has_diseq(b.cs, lhs, rhs) { { sv: sv, b: b, changed: false } }
+    else { { sv: sv, b: { ..b, cs: distinguish(b.cs, lhs, rhs) }, changed: true } },
+    None -> if equal(b.cs, lhs, rhs) {
+      let s = set(sv.ts, b, t, true);
+      { sv: noted(sv, Congruence), b: s.b, changed: s.changed }
+    } else if distinct(sv.ts, b, lhs, rhs) {
+      let s = set(sv.ts, b, t, false);
+      { sv: noted(sv, Injectivity), b: s.b, changed: s.changed }
+    } else { { sv: sv, b: b, changed: false } },
+  }
+
+type Taken = | TakenArm(Int) | NeedsCtor | NeedsList(Int) | NeedsLit(Int) | NotTaken
+
+type ListShape = | ShapeTaken | ShapeMissed | ShapeUnknown(Int)
+
+fn reduce_match(
+  ts: Terms,
+  b: Branch,
+  t: Int,
+  scrutinee: Int,
+  arms: List<Arm>,
+) -> { b: Branch, changed: Bool } =
+  match taken_arm(ts, b, scrutinee, arms) {
+    TakenArm(index) -> match list_at(arms, index) {
+      None -> { b: b, changed: false },
+      Some(arm) -> {
+        let j0 = union(b.cs, t, arm.body);
+        let b0 = { ..b, cs: j0.cs };
+        let fields = match known_constructor(ts, b0, scrutinee) {
+          Some(applied) -> match node(ts, applied) {
+            TCtor(c) ->
+              fold(
+                zipped(arm.binds, c.args),
+                { b: b0, changed: j0.changed },
+                |acc: { b: Branch, changed: Bool }, p: Pair| {
+                  let j = union(acc.b.cs, p.a, p.b);
+                  { b: { ..acc.b, cs: j.cs }, changed: acc.changed || j.changed }
+                },
+              ),
+            _ -> { b: b0, changed: j0.changed },
+          },
+          None -> { b: b0, changed: j0.changed },
+        };
+        match arm.test {
+          TestList(l) -> {
+            let walked = fold(
+              range(0, l.fixed),
+              { b: fields.b, changed: fields.changed, at: scrutinee, next: 0, stop: false },
+              |st: { b: Branch, changed: Bool, at: Int, next: Int, stop: Bool }, _: Int|
+                if st.stop { st } else {
+                  match known_list(ts, st.b, st.at) {
+                    None -> { ..st, stop: true },
+                    Some(known) -> match node(ts, known) {
+                      TCons(c) -> match list_at(arm.binds, st.next) {
+                        Some(bind) -> {
+                          let j = union(st.b.cs, bind, c.head);
+                          {
+                            b: { ..st.b, cs: j.cs },
+                            changed: st.changed || j.changed,
+                            at: c.tail,
+                            next: st.next + 1,
+                            stop: false,
+                          }
+                        },
+                        None -> { ..st, at: c.tail },
+                      },
+                      _ -> { ..st, stop: true },
+                    },
+                  }
+                },
+            );
+            if l.rest {
+              match list_at(arm.binds, walked.next) {
+                Some(bind) -> {
+                  let j = union(walked.b.cs, bind, walked.at);
+                  { b: { ..walked.b, cs: j.cs }, changed: walked.changed || j.changed }
+                },
+                None -> { b: walked.b, changed: walked.changed },
+              }
+            } else { { b: walked.b, changed: walked.changed } }
+          },
+          _ -> fields,
+        }
+      },
+    },
+    _ -> { b: b, changed: false },
+  }
+
+fn taken_arm(ts: Terms, b: Branch, scrutinee: Int, arms: List<Arm>) -> Taken =
+  match fold(range(0, len(arms)), None, |acc: Option<Taken>, index: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> match list_at(arms, index) {
+          None -> acc,
+          Some(arm) -> match arm.test {
+            Always -> Some(TakenArm(index)),
+            TestCtor(wanted) -> match known_constructor(ts, b, scrutinee) {
+              Some(applied) -> match node(ts, applied) {
+                TCtor(c) -> if c.name == wanted { Some(TakenArm(index)) } else { None },
+                _ -> None,
+              },
+              None -> Some(NeedsCtor),
+            },
+            TestLit(literal) -> if equal(b.cs, scrutinee, literal) { Some(TakenArm(index)) }
+            else if distinct(ts, b, scrutinee, literal) { None }
+            else { Some(NeedsLit(literal)) },
+            TestList(l) -> match list_shape(ts, b, scrutinee, l.fixed, l.rest) {
+              ShapeTaken -> Some(TakenArm(index)),
+              ShapeMissed -> None,
+              ShapeUnknown(at) -> Some(NeedsList(at)),
+            },
+            Undecidable -> Some(NotTaken),
+          },
+        },
+      }) {
+    Some(taken) -> taken,
+    None -> NotTaken,
+  }
+
+// Walks `fixed` conses down from the scrutinee, then asks for a rest or the end.
+fn list_shape(ts: Terms, b: Branch, scrutinee: Int, fixed: Int, rest: Bool) -> ListShape = {
+  let walked = fold(
+    range(0, fixed),
+    { at: scrutinee, done: None },
+    |st: { at: Int, done: Option<ListShape> }, _: Int|
+      match st.done {
+        Some(_) -> st,
+        None -> match known_list(ts, b, st.at) {
+          Some(k) -> match node(ts, k) {
+            TCons(c) -> { at: c.tail, done: None },
+            _ -> { at: st.at, done: Some(ShapeMissed) },
+          },
+          None -> { at: st.at, done: Some(ShapeUnknown(st.at)) },
+        },
+      },
+  );
+  match walked.done {
+    Some(s) -> s,
+    None -> if rest { ShapeTaken } else {
+      match known_list(ts, b, walked.at) {
+        Some(k) -> match node(ts, k) { TNil -> ShapeTaken, _ -> ShapeMissed },
+        None -> ShapeUnknown(walked.at),
+      }
+    },
+  }
+}
+
+fn first_in_class(ts: Terms, b: Branch, t: Int, wanted: (Node) -> Bool) -> Option<Int> = {
+  let rep = find(b.cs, t);
+  fold(range(0, size(ts)), None, |acc: Option<Int>, x: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> if find(b.cs, x) == rep && wanted(node(ts, x)) { Some(x) } else { None },
+    })
+}
+
+fn known_list(ts: Terms, b: Branch, t: Int) -> Option<Int> =
+  first_in_class(ts, b, t, |n: Node| match n { TNil -> true, TCons(_) -> true, _ -> false })
+
+fn known_constructor(ts: Terms, b: Branch, t: Int) -> Option<Int> =
+  first_in_class(ts, b, t, |n: Node| match n { TCtor(_) -> true, _ -> false })
+
+fn fields_all_equal(ts: Terms, b: Branch, x: Int, y: Int) -> Bool =
+  match sort_of(ts, x) {
+    Some(Record(left)) -> match sort_of(ts, y) {
+      Some(Record(right)) ->
+        len(left) > 0
+          && map(left, |f: { name: String, ty: Ty }| f.name)
+          == map(right, |f: { name: String, ty: Ty }| f.name)
+          && fold(left, true, |ok: Bool, f: { name: String, ty: Ty }|
+            ok
+              && (match projection(ts, b, x, f.name) {
+                Some(p) -> match projection(ts, b, y, f.name) {
+                  Some(q) -> equal(b.cs, p, q),
+                  None -> false,
+                },
+                None -> false,
+              })),
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+// A record literal's field from `base`'s class, or an interned `TField` node.
+fn projection(ts: Terms, b: Branch, base: Int, name: String) -> Option<Int> =
+  match record_field(ts, b, base, name) {
+    Some(found) -> Some(found),
+    None -> {
+      let rep = find(b.cs, base);
+      fold(range(0, size(ts)), None, |acc: Option<Int>, t: Int|
+        match acc {
+          Some(_) -> acc,
+          None -> match node(ts, t) {
+            TField(f) -> if f.field == name && find(b.cs, f.base) == rep { Some(t) } else { None },
+            _ -> None,
+          },
+        })
+    },
+  }
+
+fn record_field(ts: Terms, b: Branch, base: Int, name: String) -> Option<Int> = {
+  let rep = find(b.cs, base);
+  fold(range(0, size(ts)), None, |acc: Option<Int>, t: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> if find(b.cs, t) != rep { None } else {
+        match node(ts, t) {
+          TRecord(fields) ->
+            fold(fields, None, |found: Option<Int>, f: { name: String, value: Int }|
+              match found {
+                Some(_) -> found,
+                None -> if f.name == name { Some(f.value) } else { None },
+              }),
+          _ -> None,
+        }
+      },
+    })
+}
+
+fn truth(ts: Terms, b: Branch, t: Int) -> Option<Bool> =
+  if equal(b.cs, t, true_id()) { Some(true) }
+  else if equal(b.cs, t, false_id()) { Some(false) }
+  else { None }
+
+fn set(ts: Terms, b: Branch, t: Int, value: Bool) -> { b: Branch, changed: Bool } = {
+  let j = union(b.cs, t, if value { true_id() } else { false_id() });
+  { b: { ..b, cs: j.cs }, changed: j.changed }
+}
+
+fn distinct(ts: Terms, b: Branch, x: Int, y: Int) -> Bool = {
+  let ra = find(b.cs, x);
+  let rb = find(b.cs, y);
+  if ra == rb { false } else {
+    let left = filter(range(0, size(ts)), |t: Int| find(b.cs, t) == ra);
+    let right = filter(range(0, size(ts)), |t: Int| find(b.cs, t) == rb);
+    fold(left, false, |found: Bool, l: Int|
+      found
+        || (match shape_of(ts, l) {
+          None -> false,
+          Some(ls) ->
+            fold(right, false, |f: Bool, r: Int|
+              f
+                || (match shape_of(ts, r) {
+                  Some(rs) -> conflict(ls, rs) == Some(true),
+                  None -> false,
+                })),
+        }))
+  }
+}
+
+fn choose_split(sv: Solver, b: Branch) -> Option<Split> = {
+  let ts = sv.ts;
+  // `if` and `match` first: reducing one exposes structure the other rules need.
+  let structural_split = fold(range(0, size(ts)), None, |acc: Option<Split>, t: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> match node(ts, t) {
+        TIf(i) -> if truth(ts, b, i.cond) == None { Some(SplitBool(i.cond)) } else { None },
+        TMatch(m) -> match taken_arm(ts, b, m.scrutinee, m.arms) {
+          NeedsCtor -> constructor_split(sv, m.scrutinee),
+          NeedsLit(literal) -> Some(SplitLit(m.scrutinee, literal)),
+          NeedsList(at) -> Some(SplitList(at)),
+          _ -> None,
+        },
+        _ -> None,
+      },
+    });
+  match structural_split {
+    Some(s) -> Some(s),
+    None -> {
+      let junction_split = fold(range(0, size(ts)), None, |acc: Option<Split>, t: Int|
+        match acc {
+          Some(_) -> acc,
+          None -> {
+            let parts = match node(ts, t) {
+              TAnd(x, y) -> Some({ a: x, b: y, wanted: false }),
+              TOr(x, y) -> Some({ a: x, b: y, wanted: true }),
+              _ -> None,
+            };
+            match parts {
+              Some(p) -> if truth(ts, b, t) == Some(p.wanted) && truth(ts, b, p.a) == None
+                  && truth(ts, b, p.b) == None { Some(SplitBool(p.a)) }
+              else { None },
+              None -> None,
+            }
+          },
+        });
+      match junction_split {
+        Some(s) -> Some(s),
+        None -> {
+          // An `Int` disequality reaches the arithmetic only through this split.
+          let diseq = fold(b.cs.diseqs, None, |acc: Option<Split>, d: Pair|
+            match acc {
+              Some(_) -> acc,
+              None -> {
+                let key = {
+                  a: if d.a < d.b { d.a } else { d.b },
+                  b: if d.a < d.b { d.b } else { d.a },
+                };
+                if map_contains(b.split, key) { None }
+                else if is_int(ts, d.a) && is_int(ts, d.b) { Some(SplitDiseq(d.a, d.b)) }
+                else { None }
+              },
+            });
+          match diseq {
+            Some(s) -> Some(s),
+            None -> match undecided_atom(ts, b) { Some(t) -> Some(SplitBool(t)), None -> None },
+          }
+        },
+      }
+    },
+  }
+}
+
+// An unsettled, non-connective `Bool` term reachable from what this branch constrains; the least.
+fn undecided_atom(ts: Terms, b: Branch) -> Option<Int> = {
+  let known = filter(range(0, size(ts)), |t: Int| truth(ts, b, t) != None);
+  let roots = fold(b.cs.diseqs, known, |acc: List<Int>, d: Pair| push(push(acc, d.a), d.b));
+  let walked = iterate(
+    { stack: roots, seen: map_new(), best: None },
+    10000000,
+    |st: { stack: List<Int>, seen: Map<Int, Bool>, best: Option<Int> }|
+      match list_at(st.stack, len(st.stack) - 1) {
+        None -> Stop(st),
+        Some(t) -> {
+          let rest = fold(range(0, len(st.stack) - 1), [], |acc: List<Int>, i: Int|
+            match list_at(st.stack, i) { Some(x) -> push(acc, x), None -> acc });
+          if map_contains(st.seen, t) { Continue({ ..st, stack: rest }) } else {
+            let seen = map_insert(st.seen, t, true);
+            Continue(match node(ts, t) {
+              TNot(a) -> { stack: push(rest, a), seen: seen, best: st.best },
+              TAnd(x, y) -> { stack: push(push(rest, x), y), seen: seen, best: st.best },
+              TOr(x, y) -> { stack: push(push(rest, x), y), seen: seen, best: st.best },
+              TIf(i) -> { stack: push(rest, i.cond), seen: seen, best: st.best },
+              TEq(e) -> if is_bool(ts, e.lhs) && is_bool(ts, e.rhs) {
+                { stack: push(push(rest, e.lhs), e.rhs), seen: seen, best: st.best }
+              } else { atom(ts, b, t, rest, seen, st.best) },
+              _ -> atom(ts, b, t, rest, seen, st.best),
+            })
+          }
+        },
+      },
+  );
+  walked.best
+}
+
+fn atom(
+  ts: Terms,
+  b: Branch,
+  t: Int,
+  rest: List<Int>,
+  seen: Map<Int, Bool>,
+  best: Option<Int>,
+) -> { stack: List<Int>, seen: Map<Int, Bool>, best: Option<Int> } =
+  if is_bool(ts, t) && truth(ts, b, t) == None {
+    {
+      stack: rest,
+      seen: seen,
+      best: match best { Some(p) -> Some(if p < t { p } else { t }), None -> Some(t) },
+    }
+  } else { { stack: rest, seen: seen, best: best } }
+
+fn constructor_split(sv: Solver, scrutinee: Int) -> Option<Split> =
+  match sort_of(sv.ts, scrutinee) {
+    Some(Con(type_name, args)) -> match variants(sv.cx, type_name) {
+      None -> None,
+      Some(decl) ->
+        Some(
+          SplitCtor({
+            scrutinee: scrutinee,
+            type_name: decl.name,
+            ctors: map(decl.variants, |v: Variant|
+              {
+                name: v.name,
+                fields: field_sorts({ decl: decl, variant: v }, Some(Con(type_name, args))),
+              }),
+          }),
+        ),
+    },
+    _ -> None,
+  }
+
+fn arithmetic(sv: Solver, b: Branch) -> { sv: Solver, answer: Feasibility } = {
+  let ts = sv.ts;
+  let f = |t: Int| find(b.cs, t);
+  let from_cmps = fold(
+    range(0, size(ts)),
+    { rows: [], relevant: map_new() },
+    |acc: { rows: List<{ coeffs: Map<Int, I128>, konst: I128 }>, relevant: Map<Int, Bool> }, t: Int|
+      match node(ts, t) {
+        TCmp(c) -> match truth(ts, b, t) {
+          None -> acc,
+          Some(holds) -> {
+            let oriented = if (c.op == Lt && holds) || (c.op == Ge && !holds) {
+              { a: c.lhs, b: c.rhs, slack: 1i128 }
+            } else if (c.op == Le && holds) || (c.op == Gt && !holds) {
+              { a: c.lhs, b: c.rhs, slack: 0i128 }
+            } else if (c.op == Gt && holds) || (c.op == Le && !holds) {
+              { a: c.rhs, b: c.lhs, slack: 1i128 }
+            } else { { a: c.rhs, b: c.lhs, slack: 0i128 } };
+            {
+              rows: push(acc.rows, {
+                coeffs: difference(f(oriented.a), f(oriented.b)),
+                konst: oriented.slack,
+              }),
+              relevant: map_insert(
+                map_insert(acc.relevant, f(oriented.a), true),
+                f(oriented.b),
+                true,
+              ),
+            }
+          },
+        },
+        _ -> acc,
+      },
+  );
+  let comparisons = fold(
+    b.int_lt,
+    from_cmps,
+    |acc: { rows: List<{ coeffs: Map<Int, I128>, konst: I128 }>, relevant: Map<Int, Bool> }, p: Pair|
+      {
+        rows: push(acc.rows, { coeffs: difference(f(p.a), f(p.b)), konst: 1i128 }),
+        relevant: map_insert(map_insert(acc.relevant, f(p.a), true), f(p.b), true),
+      },
+  );
+  // Only definitions a comparison reaches, so unrelated literals don't blow up elimination.
+  let definitions = fold(
+    range(0, size(ts)),
+    [],
+    |acc: List<{ coeffs: Map<Int, I128>, konst: I128 }>, t: Int|
+      match node(ts, t) {
+        TLin(p) -> {
+          let own = map_insert(map_new(), f(t), 1i128);
+          let summed = fold(p.monomials, Some(own), |m: Option<Map<Int, I128>>, x: Mono|
+            match m {
+              None -> None,
+              Some(mm) -> match checked_sub(
+                  match map_get(mm, f(x.term)) { Some(c) -> c, None -> 0i128 },
+                  x.coeff,
+                ) {
+                Some(c) -> Some(map_insert(mm, f(x.term), c)),
+                None -> None,
+              },
+            });
+          match summed {
+            None -> acc,
+            Some(mm) -> match checked_neg(p.konst) {
+              Some(k) -> push(acc, { coeffs: nonzero(mm), konst: k }),
+              None -> acc,
+            },
+          }
+        },
+        TInt(k) ->
+          push(acc, {
+            coeffs: map_insert(map_new(), f(t), 1i128),
+            konst: match checked_neg(i128_of_int(k)) { Some(n) -> n, None -> 0i128 },
+          }),
+        _ -> acc,
+      },
+  );
+  // A fully cancelled definition (`x == x + 1`) reaches nothing, so it is seeded as used.
+  let used0 = map(definitions, |d: { coeffs: Map<Int, I128>, konst: I128 }| map_len(d.coeffs) == 0);
+  let reached = iterate(
+    { used: used0, relevant: comparisons.relevant },
+    len(definitions) + 2,
+    |st: { used: List<Bool>, relevant: Map<Int, Bool> }| {
+      let next = fold(
+        range(0, len(definitions)),
+        { used: st.used, relevant: st.relevant, grew: false },
+        |acc: { used: List<Bool>, relevant: Map<Int, Bool>, grew: Bool }, i: Int|
+          if list_at(acc.used, i) == Some(true) { acc } else {
+            match list_at(definitions, i) {
+              Some(d) -> if fold(map_keys(d.coeffs), false, |f2: Bool, v: Int|
+                  f2 || map_contains(acc.relevant, v)) {
+                {
+                  used: list_set(acc.used, i, true),
+                  relevant: fold(map_keys(d.coeffs), acc.relevant, |r: Map<Int, Bool>, v: Int|
+                    map_insert(r, v, true)),
+                  grew: true,
+                }
+              } else { acc },
+              None -> acc,
+            }
+          },
+      );
+      if next.grew { Continue({ used: next.used, relevant: next.relevant }) }
+      else { Stop({ used: next.used, relevant: next.relevant }) }
+    },
+  );
+  let with_defs = fold(range(0, len(definitions)), [], |rows: List<Row>, i: Int|
+    if list_at(reached.used, i) == Some(true) {
+      match list_at(definitions, i) { Some(d) -> eq_rows(rows, d.coeffs, d.konst), None -> rows }
+    } else { rows });
+  let system = fold(
+    comparisons.rows,
+    with_defs,
+    |rows: List<Row>, r: { coeffs: Map<Int, I128>, konst: I128 }| leq(rows, r.coeffs, r.konst),
+  );
+  if len(system) == 0 { { sv: sv, answer: Undecided } } else {
+    let settled = feasibility(system, sv.budget);
+    { sv: { ..sv, budget: settled.budget }, answer: settled.answer }
+  }
+}
+
+fn nonzero(m: Map<Int, I128>) -> Map<Int, I128> =
+  fold(map_entries(m), map_new(), |acc: Map<Int, I128>, e: { key: Int, value: I128 }|
+    if e.value == 0i128 { acc } else { map_insert(acc, e.key, e.value) })
+
+fn difference(a: Int, b: Int) -> Map<Int, I128> =
+  if a == b { map_new() } else { map_insert(map_insert(map_new(), a, 1i128), b, -1i128) }

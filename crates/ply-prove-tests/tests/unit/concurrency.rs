@@ -138,6 +138,7 @@ fn law(binders: usize) -> Obligation {
         variables: Vec::new(),
         footprint: Some("{sim.read}".to_string()),
         strategy: Strategy::Interleave(Points::Drawn),
+        guards: Vec::new(),
     }
 }
 

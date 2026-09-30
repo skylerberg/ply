@@ -1,5 +1,5 @@
-//! The searches that discharge an obligation, the static prover, and the readers of what
-//! `proof.world` decided: which search each obligation goes to is the program's.
+//! The searches that discharge an obligation, and the readers of what `proof.world` decided:
+//! which search each obligation goes to, and what the static prover answered, are the program's.
 
 // `Value` shares non-`Send` payloads through `Arc` by design.
 #![allow(clippy::arc_with_non_send_sync)]
@@ -7,7 +7,6 @@
 pub mod concurrency;
 pub mod domain;
 pub mod property;
-pub mod prove;
 pub mod shrink;
 pub mod sort;
 pub mod world;
@@ -23,8 +22,6 @@ use std::time::Duration;
 
 /// Kept cases below which a run has concrete evidence and no coverage claim.
 pub const MIN_PROPERTY_CASES: u32 = 25;
-
-pub const UNFOLD_DEPTH: u32 = 3;
 
 /// Past this depth only non-recursive constructors are drawn, so generation terminates.
 pub const GEN_DEPTH: u32 = 4;
@@ -269,13 +266,25 @@ pub struct Obligation {
     /// concurrency law, or any row at all for a `law/host`.
     pub footprint: Option<String>,
     pub strategy: Strategy,
+    /// Each guard's place: an owner's `requires` clauses, or a law's `where`.
+    pub guards: Vec<Span>,
 }
 
 impl Obligation {
-    /// The binders the static prover reasons over: the drawn ones, then `result`.
-    pub fn all_binders(&self) -> Vec<Binder> {
-        self.binders.iter().chain(&self.result).cloned().collect()
+    /// Where a vacuity points: the first guard, or the claim.
+    pub fn guard_span(&self) -> Span {
+        self.guards.first().copied().unwrap_or(self.span)
     }
+}
+
+/// What the program's static prover answered for an obligation before anything ran.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Static {
+    Proved(Certificate),
+    /// A decided body over a domain the prover could not show inhabited: a kept case certifies it.
+    NeedsWitness(Certificate),
+    Vacuous,
+    Inconclusive,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

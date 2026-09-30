@@ -1,64 +1,45 @@
 //! Which prover a run drives.
 
-use crate::load::{LoadError, Loaded};
+use crate::load::Loaded;
 use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{
     CheckOutput, DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Literal, Machine, Seed,
-    Span, SpecKind, Symbol, Value, codes,
+    Span, Symbol, Value, codes,
 };
 use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
 use ply_prove::domain::Finite;
 use ply_prove::property::{
     self, GenStream, Judge, Outcome, bindings, judge_case, run_property, ungeneratable,
 };
-use ply_prove::prove::claims::{Clause, Code, Definition, Law};
-use ply_prove::prove::{self, Blocker, Claims, Decision, Goal, Limits, Proof};
 use ply_prove::{
     Binder, Binding, Certificate, Counterexample, Discharge, Evidence, Fault, Gap, Obligation,
-    ObligationKind, Points, ProvePlan, Rule, Sort, Strategy, Unsettled, Vacuity, VacuityKind,
-    World,
+    ObligationKind, Points, ProvePlan, Rule, Sort, Static, Strategy, Unsettled, Vacuity,
+    VacuityKind, World,
 };
-use ply_store::Store;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The discharger this build drives over the program's `world`, its claims kept in `store`. One
-/// built once serves a whole run's discharges and re-runs alike.
+/// The discharger this build drives over the program's `world`. One built once serves a whole
+/// run's discharges and re-runs alike.
 pub fn prover<'a>(
     loaded: &'a Loaded,
     world: &'a World,
     hosting: Option<Hosting>,
     backend: &'static dyn ply_eval::Provider,
-    store: &mut Store,
-) -> Result<Prover<'a>, LoadError> {
-    let prover = Prover::over(loaded, world, backend, Some(store))?;
-    Ok(match hosting {
+) -> Prover<'a> {
+    let prover = Prover::new(loaded, world, backend);
+    match hosting {
         Some(hosting) => prover.with_hosting(hosting),
         None => prover,
-    })
-}
-
-fn claims_of(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, LoadError> {
-    crate::driver::claims(loaded, store).map_err(|why| {
-        loaded.refused(
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("the front end could not lower this program's claims: {why}"),
-            )
-            .primary(Span::DUMMY, "nothing was proved, so nothing is claimed")
-            .note("this is Ply's fault: the compiler's own front end is what failed here"),
-        )
-    })
+    }
 }
 
 /// Where an obligation's claim is written, found once per run.
 enum Claim<'s> {
     Ensures {
         owner: &'s DefInfo,
-        def: &'s Definition,
-        clause: &'s Clause,
         /// Its place among the owner's `ensures` clauses, which names its root.
         index: usize,
     },
@@ -66,43 +47,13 @@ enum Claim<'s> {
         info: &'s LawInfo,
         /// Its place among the module's laws, which names its roots.
         ordinal: usize,
-        law: &'s Law,
     },
-}
-
-impl<'s> Claim<'s> {
-    /// The propositions that narrow the domain: an owner's `requires` clauses, or a law's `where`.
-    fn guards(&self) -> Vec<&'s Clause> {
-        match self {
-            Claim::Ensures { def, .. } => def
-                .spec
-                .iter()
-                .filter(|(kind, _)| *kind == SpecKind::Requires)
-                .map(|(_, clause)| clause)
-                .collect(),
-            Claim::Law { law, .. } => law.guard.iter().collect(),
-        }
-    }
-
-    fn body(&self) -> &'s Code {
-        match self {
-            Claim::Ensures { clause, .. } => &clause.code,
-            Claim::Law { law, .. } => &law.body,
-        }
-    }
-
-    /// Where a vacuity points.
-    fn guard_span(&self, fallback: Span) -> Span {
-        self.guards().first().map_or(fallback, |g| g.span)
-    }
 }
 
 pub struct Prover<'a> {
     check: &'a CheckOutput,
     front: &'a Front,
     world: &'a World,
-    /// Built once; `machine()` runs per obligation.
-    ctx: prove::Context<'a>,
     laws: HashMap<Symbol, (usize, &'a LawInfo)>,
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting>,
@@ -124,16 +75,7 @@ impl<'a> Prover<'a> {
         loaded: &'a Loaded,
         world: &'a World,
         backend: &'static dyn ply_eval::Provider,
-    ) -> Result<Prover<'a>, LoadError> {
-        Prover::over(loaded, world, backend, None)
-    }
-
-    fn over(
-        loaded: &'a Loaded,
-        world: &'a World,
-        backend: &'static dyn ply_eval::Provider,
-        store: Option<&mut Store>,
-    ) -> Result<Prover<'a>, LoadError> {
+    ) -> Prover<'a> {
         let check = &loaded.check;
         let mut laws = HashMap::new();
         let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
@@ -142,15 +84,14 @@ impl<'a> Prover<'a> {
             laws.insert(law.key.clone(), (*ordinal, law));
             *ordinal += 1;
         }
-        Ok(Prover {
+        Prover {
             check,
             front: &loaded.front,
             world,
-            ctx: prove::Context::new(claims_of(loaded, store)?, world),
             laws,
             hosting: None,
             backend,
-        })
+        }
     }
 
     /// The unit, attached once per thread: obligations are discharged on pool threads.
@@ -182,10 +123,11 @@ impl<'a> Prover<'a> {
         }
     }
 
-    /// Each guard's compiled root, in [`Claim::guards`] order, which `source.rs` numbers alike.
-    fn guard_roots(&self, claim: &Claim<'_>) -> Vec<Symbol> {
+    /// Each guard's compiled root, in [`Obligation::guards`] order, which `source.rs` numbers
+    /// alike.
+    fn guard_roots(&self, obligation: &Obligation, claim: &Claim<'_>) -> Vec<Symbol> {
         match claim {
-            Claim::Ensures { owner, .. } => (0..claim.guards().len())
+            Claim::Ensures { owner, .. } => (0..obligation.guards.len())
                 .map(|k| {
                     owner.module.qualify(&ply_codegen::clause_root_name(
                         &owner.simple_name,
@@ -194,8 +136,8 @@ impl<'a> Prover<'a> {
                     ))
                 })
                 .collect(),
-            Claim::Law { info, ordinal, .. } => claim
-                .guards()
+            Claim::Law { info, ordinal } => obligation
+                .guards
                 .iter()
                 .map(|_| {
                     info.module
@@ -212,29 +154,14 @@ impl<'a> Prover<'a> {
     }
 
     fn claim(&self, obligation: &Obligation) -> Option<Claim<'_>> {
-        let claims = self.ctx.claims();
         match obligation.kind {
-            ObligationKind::Ensures { index } => {
-                let def = claims.defs.get(&obligation.owner)?;
-                let (_, clause) = def
-                    .spec
-                    .iter()
-                    .filter(|(kind, _)| *kind == SpecKind::Ensures)
-                    .nth(index)?;
-                Some(Claim::Ensures {
-                    owner: self.check.defs.get(&obligation.owner)?,
-                    def,
-                    clause,
-                    index,
-                })
-            }
+            ObligationKind::Ensures { index } => Some(Claim::Ensures {
+                owner: self.check.defs.get(&obligation.owner)?,
+                index,
+            }),
             ObligationKind::Law => {
                 let &(ordinal, info) = self.laws.get(&obligation.owner)?;
-                Some(Claim::Law {
-                    info,
-                    ordinal,
-                    law: claims.laws.get(&obligation.owner)?,
-                })
+                Some(Claim::Law { info, ordinal })
             }
         }
     }
@@ -259,64 +186,6 @@ impl<'a> Prover<'a> {
         }
         Ok(machine)
     }
-
-    fn decide(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        plan: &ProvePlan,
-    ) -> (Decision, Vec<Blocker>) {
-        let guards: Vec<&Code> = claim.guards().into_iter().map(|g| &g.code).collect();
-        let result = match claim {
-            Claim::Ensures { def, .. } => obligation.result.as_ref().map(|_| &def.body),
-            Claim::Law { .. } => None,
-        };
-        let binders = obligation.all_binders();
-        let goal = Goal {
-            binders: &binders,
-            guards: &guards,
-            result,
-            body: claim.body(),
-        };
-        let limits = Limits {
-            steps: plan.prove_budget,
-            ..Limits::default()
-        };
-        prove::decide_and_diagnose(&self.ctx, &goal, &limits)
-    }
-
-    fn attempt_static(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        plan: &ProvePlan,
-    ) -> Static {
-        match self.decide(obligation, claim, plan).0 {
-            Decision::GuardUnsatisfiable { .. } => Static::Vacuous,
-            Decision::Proved(proof) => match proof.certify(false, &obligation.variables) {
-                Some(certificate) => Static::Proved(certificate),
-                None => Static::NeedsWitness(proof),
-            },
-            Decision::Unknown { .. } => Static::Inconclusive,
-        }
-    }
-
-    /// What the static tier alone answered, and where the obligation left the fragment on the way:
-    /// nothing for a claim whose strategy never asks it.
-    pub fn reach(&self, obligation: &Obligation, plan: &ProvePlan) -> Option<Reach> {
-        if let Strategy::Interleave(_) = obligation.strategy {
-            return None;
-        }
-        let claim = self.claim(obligation)?;
-        let (decision, blockers) = self.decide(obligation, &claim, plan);
-        Some(Reach { decision, blockers })
-    }
-}
-
-/// What the static tier answered, and the fragment boundaries it crossed.
-pub struct Reach {
-    pub decision: Decision,
-    pub blockers: Vec<Blocker>,
 }
 
 /// One point of one obligation's guard, as `claims.ply` reads it: what a search over cases is
@@ -391,18 +260,9 @@ fn unclaimed(obligation: &Obligation) -> Fault {
     }
 }
 
-/// What the static tier had to say, before anything ran.
-enum Static {
-    Proved(Certificate),
-    /// A decided body over a domain the prover could not show inhabited.
-    NeedsWitness(Proof),
-    Vacuous,
-    Inconclusive,
-}
-
 impl ply_test::obligation::Discharger for Prover<'_> {
-    fn discharge(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
-        self.discharge_with(obligation, plan)
+    fn discharge(&self, obligation: &Obligation, plan: &ProvePlan, settled: &Static) -> Discharge {
+        self.discharge_with(obligation, plan, settled)
     }
 }
 
@@ -427,8 +287,13 @@ impl<'a> Prover<'a> {
     }
 
     /// One obligation, discharged the way its strategy says, at the strongest tier this build can
-    /// demonstrate.
-    pub fn discharge_with(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
+    /// demonstrate, from what the program's static prover `settled` for it.
+    pub fn discharge_with(
+        &self,
+        obligation: &Obligation,
+        plan: &ProvePlan,
+        settled: &Static,
+    ) -> Discharge {
         let Some(claim) = self.claim(obligation) else {
             return Discharge::Faulted(unclaimed(obligation));
         };
@@ -438,7 +303,7 @@ impl<'a> Prover<'a> {
             }
             Strategy::Hosted => self.discharge_host(obligation, &claim, plan),
             Strategy::Static(unsettled) => {
-                self.discharge_static(obligation, &claim, plan, unsettled)
+                self.discharge_static(obligation, &claim, plan, unsettled, settled)
             }
         }
     }
@@ -450,16 +315,19 @@ impl<'a> Prover<'a> {
         claim: &Claim<'_>,
         plan: &ProvePlan,
         unsettled: &Unsettled,
+        settled: &Static,
     ) -> Discharge {
-        let witness = match self.attempt_static(obligation, claim, plan) {
-            Static::Proved(certificate) => return Discharge::Held(Evidence::Proof(certificate)),
+        let witness = match settled {
+            Static::Proved(certificate) => {
+                return Discharge::Held(Evidence::Proof(certificate.clone()));
+            }
             Static::Vacuous => {
                 return Discharge::Vacuous(Vacuity {
-                    guard: claim.guard_span(obligation.span),
+                    guard: obligation.guard_span(),
                     kind: VacuityKind::ProvedUnsatisfiable,
                 });
             }
-            Static::NeedsWitness(proof) => Some(proof),
+            Static::NeedsWitness(certificate) => Some(certificate.clone()),
             Static::Inconclusive => None,
         };
         let points = match unsettled {
@@ -473,7 +341,7 @@ impl<'a> Prover<'a> {
             Err(stop) => return stop.discharge(),
         };
         match points {
-            Points::Every(finite) => self.enumerate(obligation, claim, finite, &mut cases, witness),
+            Points::Every(finite) => self.enumerate(obligation, finite, &mut cases, witness),
             Points::Drawn => self.sample(obligation, claim, plan, &mut cases, witness),
         }
     }
@@ -486,7 +354,7 @@ impl<'a> Prover<'a> {
         claim: &Claim<'_>,
         plan: &ProvePlan,
         cases: &mut Cases<'a>,
-        witness: Option<Proof>,
+        witness: Option<Certificate>,
     ) -> Discharge {
         let discharge = run_property(
             obligation.key,
@@ -494,7 +362,7 @@ impl<'a> Prover<'a> {
             &obligation.variables,
             self.world,
             plan,
-            claim.guard_span(obligation.span),
+            obligation.guard_span(),
             cases,
         );
         match discharge {
@@ -503,19 +371,17 @@ impl<'a> Prover<'a> {
                 kind: VacuityKind::NoCaseKept { generated },
                 ..
             }) => match self.witness(obligation, claim, cases) {
-                Ok(Some(values)) => {
-                    match witness.and_then(|proof| proof.certify(true, &obligation.variables)) {
-                        Some(certificate) => Discharge::Held(Evidence::Proof(certificate)),
-                        None => Discharge::Unattempted(Gap::GuardNotSampled {
-                            generated,
-                            witness: bindings(&obligation.binders, &values),
-                        }),
-                    }
-                }
+                Ok(Some(values)) => match witness {
+                    Some(certificate) => Discharge::Held(Evidence::Proof(certificate)),
+                    None => Discharge::Unattempted(Gap::GuardNotSampled {
+                        generated,
+                        witness: bindings(&obligation.binders, &values),
+                    }),
+                },
                 Ok(None) => discharge,
                 Err(fault) => Discharge::Faulted(fault),
             },
-            other => upgrade(other, witness, &obligation.variables),
+            other => upgrade(other, witness),
         }
     }
 
@@ -612,7 +478,7 @@ impl<'a> Prover<'a> {
             &obligation.variables,
             self.world,
             plan,
-            claim.guard_span(obligation.span),
+            obligation.guard_span(),
             &mut cases,
         )
     }
@@ -739,7 +605,7 @@ impl<'a> Prover<'a> {
         Ok(Cases {
             machine: self.machine()?,
             compiled: self.compiled(),
-            guard_roots: self.guard_roots(claim),
+            guard_roots: self.guard_roots(obligation, claim),
             body_root: self.body_root(claim),
             binders: obligation.binders.clone(),
             span: obligation.span,
@@ -752,10 +618,9 @@ impl<'a> Prover<'a> {
     fn enumerate(
         &self,
         obligation: &Obligation,
-        claim: &Claim<'_>,
         finite: &Finite,
         cases: &mut Cases<'a>,
-        witness: Option<Proof>,
+        witness: Option<Certificate>,
     ) -> Discharge {
         let mut kept = 0u64;
         for point in 0..finite.points {
@@ -800,15 +665,13 @@ impl<'a> Prover<'a> {
         if kept == 0 {
             // A finite domain enumerated with nothing kept decides the guard unsatisfiable.
             return Discharge::Vacuous(Vacuity {
-                guard: claim.guard_span(obligation.span),
+                guard: obligation.guard_span(),
                 kind: VacuityKind::ProvedUnsatisfiable,
             });
         }
 
-        // A kept point witnesses the domain, so the static argument can now be certified.
-        if let Some(proof) = witness
-            && let Some(certificate) = proof.certify(true, &obligation.variables)
-        {
+        // A kept point witnesses the domain, so the static argument now stands.
+        if let Some(certificate) = witness {
             return Discharge::Held(Evidence::Proof(certificate));
         }
 
@@ -961,20 +824,16 @@ impl Literals {
     }
 }
 
-/// Certifies a static argument the prover could not vouch for, once a run kept a case.
-fn upgrade(discharge: Discharge, witness: Option<Proof>, variables: &[Symbol]) -> Discharge {
-    let Some(proof) = witness else {
+/// Stands a static argument the prover could not vouch for, once a run kept a case.
+fn upgrade(discharge: Discharge, witness: Option<Certificate>) -> Discharge {
+    let Some(certificate) = witness else {
         return discharge;
     };
-    let Discharge::Held(Evidence::Cases(report)) = &discharge else {
-        return discharge;
-    };
-    if report.kept == 0 {
-        return discharge;
-    }
-    match proof.certify(true, variables) {
-        Some(certificate) => Discharge::Held(Evidence::Proof(certificate)),
-        None => discharge,
+    match &discharge {
+        Discharge::Held(Evidence::Cases(report)) if report.kept > 0 => {
+            Discharge::Held(Evidence::Proof(certificate))
+        }
+        _ => discharge,
     }
 }
 

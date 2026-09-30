@@ -5,6 +5,9 @@ use crate::harness::{json_of, ply, project, repo, stderr_of};
 use serde_json::Value;
 use std::path::Path;
 
+/// `proof.goal`'s `default_unfold_depth`: no certificate inlines deeper.
+const UNFOLD_DEPTH: u64 = 3;
+
 /// What `ply prove` answers for the project at `dir`, discharged afresh, with `flags` besides.
 fn proved_at(dir: &Path, path: Option<&str>, flags: &[&str]) -> Value {
     let mut command = ply(dir);
@@ -232,10 +235,7 @@ law \"twice is doubling\" forall (x: Int) where x > -1000 && x < 1000
         })
         .collect();
     assert!(
-        !depths.is_empty()
-            && depths
-                .iter()
-                .all(|d| *d <= u64::from(ply_prove::UNFOLD_DEPTH)),
+        !depths.is_empty() && depths.iter().all(|d| *d <= UNFOLD_DEPTH),
         "{twice}"
     );
 }
