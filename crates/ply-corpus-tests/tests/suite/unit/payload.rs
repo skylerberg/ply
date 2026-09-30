@@ -73,11 +73,27 @@ fn payload_prices_its_codec_maps_and_derivation_and_every_criterion_holds() {
     assert!(measured(derive, "derived_cache") > 0.0, "{derive:#}");
 
     assert_eq!(report["ok"].as_bool(), Some(true), "{report:#}");
-    let left: Vec<String> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
+    // Its fixtures are written under the build output and taken back out, and nothing is written
+    // beside the tree it was started in.
+    let names = |at: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(at)
+            .map(|entries| {
+                entries
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let left = names(&dir.path().join("target/corpus/payload"));
     assert!(left.is_empty(), "payload left scratch behind: {left:?}");
+    let beside: Vec<String> = names(dir.path())
+        .into_iter()
+        .filter(|n| n != "target")
+        .collect();
+    assert!(
+        beside.is_empty(),
+        "payload wrote beside the tree: {beside:?}"
+    );
 }
 
 #[test]
