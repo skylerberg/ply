@@ -22,7 +22,6 @@ pub struct Discharged {
     pub reach: ReachTable,
     /// Why an obligation was not attempted at all, most common first.
     pub gaps: Vec<(String, usize)>,
-    pub shrinks: Vec<Shrink>,
     pub discharge_millis: f64,
 }
 
@@ -54,17 +53,6 @@ pub struct ReachTable {
     pub guard_unsatisfiable: usize,
     /// Why an undecided obligation left the fragment, most common first.
     pub blockers: Vec<(String, usize)>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Shrink {
-    pub label: String,
-    /// Rendered characters across every binding, before and after.
-    pub original_width: usize,
-    pub shrunk_width: usize,
-    pub steps: u32,
-    pub original: String,
-    pub shrunk: String,
 }
 
 pub fn discharge(path: &Path, plan: &ProvePlan) -> Result<Discharged> {
@@ -99,7 +87,6 @@ pub fn discharge(path: &Path, plan: &ProvePlan) -> Result<Discharged> {
 
     let mut tiers = Tiers::default();
     let mut gaps: BTreeMap<String, usize> = BTreeMap::new();
-    let mut shrinks = Vec::new();
     let mut covered: Vec<&ply_span::Symbol> = Vec::new();
     for (obligation, discharge) in collected.obligations.iter().zip(&discharges) {
         tally(&mut tiers, discharge);
@@ -108,16 +95,6 @@ pub fn discharge(path: &Path, plan: &ProvePlan) -> Result<Discharged> {
         }
         if let Discharge::Unattempted(gap) = discharge {
             *gaps.entry(gap_label(gap).to_string()).or_default() += 1;
-        }
-        if let Discharge::Refuted(counterexample) = discharge {
-            shrinks.push(Shrink {
-                label: obligation.owner.to_string(),
-                original_width: width(&counterexample.original),
-                shrunk_width: width(&counterexample.bindings),
-                steps: counterexample.shrinks,
-                original: bindings(&counterexample.original),
-                shrunk: bindings(&counterexample.bindings),
-            });
         }
     }
     covered.sort();
@@ -135,7 +112,6 @@ pub fn discharge(path: &Path, plan: &ProvePlan) -> Result<Discharged> {
         tiers,
         reach,
         gaps,
-        shrinks,
         discharge_millis,
     })
 }
@@ -223,18 +199,6 @@ fn label(blocker: &Blocker) -> String {
     .to_string()
 }
 
-fn width(bindings: &[ply_prove::Binding]) -> usize {
-    bindings.iter().map(|b| b.rendered.chars().count()).sum()
-}
-
-fn bindings(bindings: &[ply_prove::Binding]) -> String {
-    bindings
-        .iter()
-        .map(|b| format!("{} = {}", b.name, b.rendered))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn gap_label(gap: &Gap) -> &'static str {
     match gap {
         Gap::UnhandledEffect(_) => "unhandled effect",
@@ -313,34 +277,6 @@ pub fn render(runs: &[Discharged]) -> String {
         }
         for (gap, count) in &run.gaps {
             let _ = writeln!(s, "    {count:>4}  (not attempted at all) {gap}");
-        }
-    }
-
-    let shrinks: Vec<&Shrink> = runs.iter().flat_map(|r| r.shrinks.iter()).collect();
-    if !shrinks.is_empty() {
-        let _ = writeln!(s, "\nshrink");
-        let _ = writeln!(
-            s,
-            "  {:<40} {:>9} {:>8} {:>7} {:>7}",
-            "obligation", "before", "after", "steps", "ratio"
-        );
-        for shrink in &shrinks {
-            let ratio = if shrink.original_width == 0 {
-                1.0
-            } else {
-                shrink.shrunk_width as f64 / shrink.original_width as f64
-            };
-            let _ = writeln!(
-                s,
-                "  {:<40} {:>9} {:>8} {:>7} {:>6.2}x",
-                truncate(&shrink.label, 40),
-                shrink.original_width,
-                shrink.shrunk_width,
-                shrink.steps,
-                ratio
-            );
-            let _ = writeln!(s, "      from {}", shrink.original);
-            let _ = writeln!(s, "        to {}", shrink.shrunk);
         }
     }
 

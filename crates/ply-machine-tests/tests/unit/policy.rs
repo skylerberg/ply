@@ -48,6 +48,24 @@ fn a_family_that_does_not_exist_is_refused_by_name() {
 }
 
 #[test]
+fn a_family_lends_under_one_effect_and_that_is_the_one_a_program_declares() {
+    for family in policy::FAMILIES {
+        let effect = policy::effect_of(family.name)
+            .unwrap_or_else(|| panic!("`{}` lends under no effect", family.name));
+        let ops = policy::lent(family.name, "machine").expect("the family is there");
+        assert!(
+            ops.iter().all(|(op, _)| op.effect.as_str() == effect),
+            "`{}` lends under more than one effect",
+            family.name
+        );
+    }
+    // The two whose effect is not named for the family: a grant is checked against the effect.
+    assert_eq!(policy::effect_of("claims").as_deref(), Some("prover"));
+    assert_eq!(policy::effect_of("cache").as_deref(), Some("store"));
+    assert_eq!(policy::effect_of("everything"), None);
+}
+
+#[test]
 fn the_machine_module_is_the_one_the_program_declares() {
     // The machine family is the one whose values carry their module's name; lending it twice
     // under different names is two different sets of constructors.
