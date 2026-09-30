@@ -2,8 +2,8 @@
 //!
 //! The emitter recurses over an expression, so depth is what costs it and not size: a long run of
 //! small statements is free, one expression built from many nested ones is not. Past what the
-//! thread's native stack holds, `emit.emit_roots` raises and the failure surfaces in the bootstrap
-//! fixpoint, which is the most expensive place in CI to learn it.
+//! thread's native stack holds, `emit.emit_roots_answer` raises and the failure surfaces in the
+//! bootstrap fixpoint, which is the most expensive place in CI to learn it.
 //!
 //! This is a source-level proxy for that walk: bracket nesting, plus a level for each `?`, which
 //! expands to a `match` wrapping the rest of its block, and each `else if`, which is one more
@@ -116,7 +116,8 @@ fn no_shipped_definition_nests_deeper_than_the_emitter_walks() {
     assert!(
         over.is_empty(),
         "these nest deeper than {DEEPEST}, which is as deep as the emitter has ever walked; \
-         flatten them or the bootstrap fixpoint fails with `emit.emit_roots` raised: {over:?}"
+         flatten them or the bootstrap fixpoint fails with `emit.emit_roots_answer` raised: \
+         {over:?}"
     );
     // The bound is only worth keeping while something is near it.
     assert!(

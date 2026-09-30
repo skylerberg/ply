@@ -6921,41 +6921,12 @@ fn tables_of(em: Em, full: Bytes) -> Tables =
       { symbol: symbol_of(m), entry: entry_of(m) }),
   }
 
-fn const_text(c: Const) -> Bytes =
-  match c {
-    ConstStr(x) -> bytes_concat(b"s ", hex(x)),
-    ConstBytes(x) -> bytes_concat(b"b ", hex(x)),
-    ConstFixed(f) -> bytes_concat_all([b"f ", num(f.width), b" ", num(f.bits)]),
-    ConstFloat(x) -> bytes_concat(b"X ", x),
-    ConstDecimal(x) -> bytes_concat(b"D ", x),
-    ConstUnit -> b"u",
-  }
-
-// Five tables, the calls, the effects, the members and the symbols, each as a count and one entry per line; a constant is its tag and its bytes in hex.
-fn encode_tables(t: Tables) -> Bytes =
-  bytes_concat_all([
-    counted(b"consts", map(t.consts, const_text)),
-    counted(b"builtins", t.builtins),
-    counted(b"fields", t.fields),
-    counted(b"shapes", map(t.shapes, |names: List<Bytes>| bytes_join(names, b" "))),
-    counted(b"lambdas", t.lambdas),
-    counted(b"calls", t.calls),
-    counted(b"performs", t.performs),
-    counted(b"handles", t.handles),
-    counted(b"members", t.members),
-    counted(b"symbols", map(t.symbols, |d: Defined| bytes_concat_all([d.symbol, b" ", d.entry]))),
-  ])
-
 // A negative pattern literal's text runs from its `-`, across any space written after it.
 fn unspaced(s: Bytes) -> Bytes =
   bytes_concat_all(
     map(range(0, bytes_len(s)), |i: Int|
       if bytes_at(s, i) <= 32 { b"" } else { bytes_slice(s, i, i + 1) }),
   )
-
-fn counted(what: Bytes, xs: List<Bytes>) -> Bytes =
-  fold(xs, bytes_concat_all([what, b" ", num(len(xs)), b"\n"]), |acc: Bytes, x: Bytes|
-    bytes_concat_all([acc, x, b"\n"]))
 
 // Ascending: declarations come out sorted, not in the order the widths were found.
 fn sorted_widths(xs: List<Int>) -> List<Int> =
@@ -7243,37 +7214,17 @@ test "a program that will not parse is refused, and the refusal carries the pars
   ])
 }
 
-// The text entry's frames, spelled out from the values of the answer.
-fn framed_from(answers: List<RootAnswer>) -> Bytes =
-  bytes_concat_all(
-    map(answers, |a: RootAnswer|
-      match a.answer {
-        Body(b) -> {
-          let enc = bytes_concat_all([encode_tables(b.tables), b"text\n", b.text]);
-          bytes_concat_all([b"body ", a.name, b" ", num(bytes_len(enc)), b"\n", enc])
-        },
-        Refused(r) -> {
-          let why = bytes_concat_all([r.why, b"\nhandles ", bytes_join(r.handles, b" ")]);
-          bytes_concat_all([b"refused ", a.name, b" ", num(bytes_len(why)), b"\n", why])
-        },
-      }),
-  )
-
-test "the emitter's answer holds each body's tables as values, which frame to the text entry's answer" {
+test "the emitter answers each root it was asked for, a body's tables as values" {
   let src = b"fn greet() -> Bytes = b\"hi\"\nfn twice(x: Int) -> Int = x + x\nfn guarded() -> Option<Int> = handle { Some(clock.now()) } with { clock.now() -> 7, }\n";
   let wanted = [b"m.greet", b"m.twice", b"m.guarded"];
   // No constructor is in the table, so the body that builds one is refused.
   let answers = emit_roots_answer([b"m"], [src], [], [], wanted, [], []);
   assert_eq(map(answers, |a: RootAnswer| a.name), wanted);
-  assert_eq(
-    framed_from(answers),
-    bytes_of_string(emit_roots([b"m"], [src], [], [], wanted, [], [])),
-  );
   match at(answers, 0).answer {
     Body(b) -> {
       assert_eq(b.tables.consts, [ConstBytes(b"hi")]);
-      assert_eq(b.tables.symbols, [{ symbol: symbol_of(b"m.greet"), entry: entry_of(b"m.greet") }]);
-      assert(bytes_starts_with(encode_tables(b.tables), b"consts 1\nb 6869\nbuiltins 0\n"))
+      assert_eq(b.tables.members, []);
+      assert_eq(b.tables.symbols, [{ symbol: symbol_of(b"m.greet"), entry: entry_of(b"m.greet") }])
     },
     Refused(_) -> assert(false),
   };
@@ -7372,9 +7323,9 @@ fn said_p(diags: List<PDiag>) -> Bytes =
   }
 
 // Every root the caller wanted, refused for the same reason. An arm that refuses a whole program has
-// no body to hang the reason on, and the dump's reader keys a refusal by body name, so the refusal
+// no body to hang the reason on, and the answer's reader keys a refusal by root name, so the refusal
 // has to ride on the roots it was asked for. A caller that wanted everything names its sources
-// instead: those are the names it has, and `emit_refusals_all` only prints them.
+// instead: those are the names it has.
 fn refused_rather_than_emitted(
   sources: List<Source>,
   wanted: Option<Map<Bytes, Bool>>,
@@ -8207,69 +8158,6 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> = {
   }
 }
 
-// The differential's rendering: `f:<name>;<text>;` per body.
-pub fn emit_dump_in(
-  module: Bytes,
-  ctors: List<Bytes>,
-  builtins: List<Bytes>,
-  src: Bytes,
-) -> String =
-  string_of_bytes(
-    fold(emit_all_in(module, ctors, builtins, src, false), b"C;1;", |acc: Bytes, e: Emitted|
-      if e.why != None { acc } else { bytes_concat_all([acc, b"f:", e.name, b";", e.text, b";"]) }),
-  )
-
-// The differential's rendering over a whole program, resolved together.
-pub fn emit_dump_all(
-  names: List<Bytes>,
-  srcs: List<Bytes>,
-  ctors: List<Bytes>,
-  builtins: List<Bytes>,
-) -> String =
-  string_of_bytes(
-    fold(
-      emit_all_program(zip_sources(names, srcs), ctors, builtins, false),
-      b"C;1;",
-      |acc: Bytes, e: Emitted|
-        if e.why != None { acc }
-        else { bytes_concat_all([acc, b"f:", e.name, b";", e.text, b";"]) },
-    ),
-  )
-
-// Every refused body, one per line as `<name> :: <reason>`.
-pub fn emit_refusals_all(
-  names: List<Bytes>,
-  srcs: List<Bytes>,
-  ctors: List<Bytes>,
-  builtins: List<Bytes>,
-) -> String =
-  string_of_bytes(
-    fold(
-      emit_all_program(zip_sources(names, srcs), ctors, builtins, true),
-      b"",
-      |acc: Bytes, e: Emitted|
-        match e.why { None -> acc, Some(w) -> bytes_concat_all([acc, e.name, b" :: ", w, b"\n"]) },
-    ),
-  )
-
-// The roots `wanted` names, resolved against the whole program: every body as a producer frame and
-// every refusal as its own frame, so the driver can drop what was refused. Joined once.
-pub fn emit_roots(
-  names: List<Bytes>,
-  srcs: List<Bytes>,
-  ctors: List<Bytes>,
-  builtins: List<Bytes>,
-  wanted: List<Bytes>,
-  pkgs: List<Pkg>,
-  mod_pkg: List<Int>,
-) -> String =
-  string_of_bytes(
-    bytes_join(
-      map(emit_roots_answer(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg), answer_frame),
-      b"",
-    ),
-  )
-
 // A body's C and the tables it names, or why it was refused and the operations it would have
 // handled, which a refusal still names so the fixpoint drops their performers.
 pub type Answer =
@@ -8278,7 +8166,8 @@ pub type Answer =
 
 pub type RootAnswer = { name: Bytes, answer: Answer }
 
-// `emit_roots`' answer before it is framed: one entry per root emitted or refused, in its order.
+// The roots `wanted` names, resolved against the whole program: one entry per root emitted or
+// refused, in its order, so the driver can drop what was refused.
 pub fn emit_roots_answer(
   names: List<Bytes>,
   srcs: List<Bytes>,
@@ -8310,76 +8199,12 @@ fn answer_of(e: Emitted) -> RootAnswer =
     },
   }
 
-fn answer_frame(a: RootAnswer) -> Bytes =
-  match a.answer {
-    Refused(r) -> {
-      let frame = bytes_concat_all([r.why, b"\nhandles ", bytes_join(r.handles, b" ")]);
-      bytes_concat_all([b"refused ", a.name, b" ", num(bytes_len(frame)), b"\n", frame])
-    },
-    Body(b) -> body_frame(a.name, b.text, b.tables),
-  }
-
-fn body_frame(name: Bytes, text: Bytes, tables: Tables) -> Bytes = {
-  let enc = bytes_concat_all([encode_tables(tables), b"text\n", text]);
-  bytes_concat_all([b"body ", name, b" ", num(bytes_len(enc)), b"\n", enc])
-}
-
-// The producer's rendering over a whole program, resolved together.
-pub fn emit_bodies_all(
-  names: List<Bytes>,
-  srcs: List<Bytes>,
-  ctors: List<Bytes>,
-  builtins: List<Bytes>,
-) -> String =
-  string_of_bytes(
-    bytes_join(
-      fold(
-        emit_all_program(zip_sources(names, srcs), ctors, builtins, true),
-        [],
-        |acc: List<Bytes>, e: Emitted|
-          if e.why != None { acc } else { push(acc, body_frame(e.name, e.text, e.tables)) },
-      ),
-      b"",
-    ),
-  )
-
-// Without release every count is kept until the entry ends: the text compared against the Rust back end.
-pub fn emit_bodies_reference(
-  names: List<Bytes>,
-  srcs: List<Bytes>,
-  ctors: List<Bytes>,
-  builtins: List<Bytes>,
-) -> String =
-  string_of_bytes(
-    bytes_join(
-      fold(
-        emit_all_program(zip_sources(names, srcs), ctors, builtins, false),
-        [],
-        |acc: List<Bytes>, e: Emitted|
-          if e.why != None { acc } else { push(acc, body_frame(e.name, e.text, e.tables)) },
-      ),
-      b"",
-    ),
-  )
-
 fn zip_sources(names: List<Bytes>, srcs: List<Bytes>) -> List<Source> =
   map(range(0, len(names)), |i: Int|
     {
       name: match list_at(names, i) { Some(n) -> n, None -> b"" },
       src: match list_at(srcs, i) { Some(t) -> t, None -> b"" },
     })
-
-// Framed by length so no byte of a body is a delimiter: `body <name> <n>\n`, then exactly `n` bytes.
-pub fn emit_bodies_in(
-  module: Bytes,
-  ctors: List<Bytes>,
-  builtins: List<Bytes>,
-  src: Bytes,
-) -> String =
-  string_of_bytes(
-    fold(emit_all_in(module, ctors, builtins, src, true), b"", |acc: Bytes, e: Emitted|
-      if e.why != None { acc } else { bytes_concat(acc, body_frame(e.name, e.text, e.tables)) }),
-  )
 
 // The C symbol a full name becomes: the name cut on its dots and its `#`s, each piece written as
 // its bytes, a mode byte (`_` after a dot, `h` after a `#`, `x` and `y` for the same two with the
@@ -8425,8 +8250,6 @@ fn c_ident_bytes(part: Bytes, i: Int) -> Bool =
 
 fn c_ident_byte(c: Int) -> Bool =
   (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
-
-pub fn emit_dump(src: Bytes) -> String = emit_dump_in(b"m", [], [], src)
 
 fn bytes_join_dots(xs: List<Bytes>) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
