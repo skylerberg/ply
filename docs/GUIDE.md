@@ -1882,9 +1882,11 @@ pub nondet effect entropy {
 pub fn next() -> Int / {entropy.next}
 pub fn below(n: Int) -> Int / {entropy.below}
 pub fn nonce() -> String / {entropy.next}
-pub type Rand = { root: Int, counter: Int }
+pub type Rand = { root: Int, key: Bytes, counter: Int }
 pub fn rand(root: Int) -> Rand
+pub fn rand_keyed(root: Int, key: Bytes) -> Rand
 pub fn rand_int(r: Rand) -> { value: Int, rand: Rand }
+pub fn rand_u64(r: Rand) -> { value: U64, rand: Rand }
 pub fn rand_bytes(r: Rand, n: Int) -> { bytes: Bytes, rand: Rand }
 pub fn rand_below(r: Rand, n: Int) -> Option<{ value: Int, rand: Rand }>
 ```
@@ -1900,8 +1902,12 @@ code that wants a seeded stream without a `simulate` region — a fuzz case, a
 shuffled order, a scatter. It is counter-mode BLAKE3, the construction ADR 0006
 chose for the simulation's *own* stream (`ply-eval`'s `sim::Stream`), so a result
 is a function of the root on every machine and every version; `rand_int` is
-sixty-three bits like the effect's, `rand_bytes` advances by the blocks it
-needs, and `rand_below` is uniform by rejection rather than by a remainder.
+sixty-three bits like the effect's, `rand_u64` all sixty-four of the same draw,
+`rand_bytes` advances by the blocks it needs, and `rand_below` is uniform by
+rejection rather than by a remainder. A key names one stream among many from a
+root — one claim's draws apart from every other's — and no two keys, nor a key
+and the simulation, share a block; `rand` is the empty key, the simulation's own
+stream. The counter is a field, so a stream may start at any draw.
 
 `simulate` answers the *prelude's* `random` with values a seed decides, which is
 what makes a simulation reproducible; that is why it is the scheduler's and not
