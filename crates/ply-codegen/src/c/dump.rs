@@ -116,7 +116,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
             arity: e.field("arity")?.number()?,
             scalar: e.field("scalar")?.bool()?,
             width: e.field("width")?.bool()?,
-            pure: published_pure(e)?,
+            pure: e.field("pure")?.bool()?,
             span: r.span(e.field("at")?)?,
         })
     })?;
@@ -259,14 +259,6 @@ fn item_hash(h: At<'_>, declared: &Symbol, out: &mut HashOutput) -> Result<DefHa
         .or_default()
         .extend(symbols(h.field("closure")?)?);
     Ok(hash)
-}
-
-/// Absent reads as impure: the bundle that stages a pull request's compiler may predate the field.
-fn published_pure(root: At<'_>) -> Result<bool, Error> {
-    match root.field("pure") {
-        Ok(pure) => pure.bool(),
-        Err(_) => Ok(false),
-    }
 }
 
 /// A hash as the hasher's rows hold one: sixty-four hex digits.
