@@ -94,6 +94,30 @@ impl Decision {
             Decision::GuardUnsatisfiable { steps } | Decision::Unknown { steps, .. } => *steps,
         }
     }
+
+    /// The word a report prints for it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Decision::Proved(_) => "proved",
+            Decision::GuardUnsatisfiable { .. } => "guard_unsatisfiable",
+            Decision::Unknown {
+                reason: Reason::Open,
+                ..
+            } => "open",
+            Decision::Unknown {
+                reason: Reason::BudgetSpent,
+                ..
+            } => "budget_spent",
+        }
+    }
+}
+
+/// What the static tier alone answered for one obligation, and where it left the fragment on the
+/// way.
+#[derive(Clone, Debug)]
+pub struct Reach {
+    pub decision: Decision,
+    pub blockers: Vec<Blocker>,
 }
 
 pub fn decide(ctx: &Context<'_>, goal: &Goal<'_>, limits: &Limits) -> Decision {

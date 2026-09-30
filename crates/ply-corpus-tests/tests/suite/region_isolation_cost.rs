@@ -98,23 +98,6 @@ fn the_examples_suite_loses_nothing_to_the_region_model() {
 }
 
 #[test]
-fn the_examples_colouring_is_the_runners_own() {
-    let root = repo_root().join("examples");
-    let corpus = regions::measure(&root, 8, false).expect("`examples/` must run green");
-    let scheduled: Vec<(usize, Footprint)> =
-        corpus.footprints.iter().cloned().enumerate().collect();
-    let projected: Vec<Footprint> = corpus
-        .footprints
-        .iter()
-        .map(regions::region_footprint)
-        .collect();
-    assert_eq!(
-        regions::colour(&scheduled, &projected),
-        ply_test::group_by_conflict(&scheduled)
-    );
-}
-
-#[test]
 fn the_exposure_is_a_group_per_test_only_at_one_label() {
     let shape = |labels: usize| {
         let corpus = regions::hypothetical(Hypothetical {

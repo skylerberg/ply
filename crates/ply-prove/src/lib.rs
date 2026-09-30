@@ -23,8 +23,6 @@ pub const MIN_PROPERTY_CASES: u32 = 25;
 
 pub const UNFOLD_DEPTH: u32 = 3;
 
-pub const ENUMERATION_BOUND: u64 = 4096;
-
 /// Past this depth only non-recursive constructors are drawn, so generation terminates.
 pub const GEN_DEPTH: u32 = 4;
 
@@ -332,6 +330,9 @@ impl ProvePlan {
 #[derive(Clone, Debug)]
 pub struct ProveReport {
     pub obligations: Vec<(Obligation, Discharge)>,
+    /// Parallel to `obligations`: what the static tier alone answered for each one this run
+    /// discharged, and `None` for one the cache answered or the static tier never sees.
+    pub reaches: Vec<Option<prove::Reach>>,
     pub plan: ProvePlan,
     pub duration: Duration,
 }

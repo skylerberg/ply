@@ -12,23 +12,29 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
 
-/// The atoms that contended under the forkable world: neither ambient nor region-scoped.
+/// A region label: what the forkable world forked per test, and what a rename moves.
+fn is_region_scoped(a: &EffectAtom) -> bool {
+    a.effect.as_str() == "cell"
+}
+
+/// The atoms that contended under the forkable world: neither a seed nor region-scoped.
 pub fn forked_footprint(f: &Footprint) -> Footprint {
     Footprint::from_atoms(
         f.atoms()
-            .filter(|a| !ply_test::is_ambient(a) && !ply_test::is_region_scoped(a))
+            .filter(|a| !ply_test::sim::is_seed(a) && !is_region_scoped(a))
             .cloned(),
     )
 }
 
-/// The atoms that contend once a test no longer gets its own world.
+/// The atoms that contend once a test no longer gets its own world: all but the seed, which no
+/// other test can write. This models `suite.schedule`, which decides it for `ply test`.
 pub fn region_footprint(f: &Footprint) -> Footprint {
-    ply_test::shared_footprint(f)
+    Footprint::from_atoms(f.atoms().filter(|a| !ply_test::sim::is_seed(a)).cloned())
 }
 
 /// Isolated under the forkable world only because its region-scoped state was forked.
 pub fn isolated_by_forking(f: &Footprint) -> bool {
-    forked_footprint(f).is_empty() && f.atoms().any(ply_test::is_region_scoped)
+    forked_footprint(f).is_empty() && f.atoms().any(is_region_scoped)
 }
 
 /// Isolated under the forkable world: the counterfactual's baseline.
@@ -36,7 +42,7 @@ fn was_world_isolated(f: &Footprint) -> bool {
     forked_footprint(f).is_empty()
 }
 
-/// `ply_test::group_by_conflict` with the projection lifted out, so both sides share one colouring.
+/// Greedy colouring over the projected footprints, largest first, as `suite.schedule` colours a run.
 pub fn colour(tests: &[(usize, Footprint)], projected: &[Footprint]) -> Vec<Vec<usize>> {
     assert_eq!(tests.len(), projected.len());
 
@@ -71,6 +77,29 @@ pub fn colour(tests: &[(usize, Footprint)], projected: &[Footprint]) -> Vec<Vec<
             group
         })
         .collect()
+}
+
+/// Every test in `visible`, nothing answered from the cache, in the classes [`colour`] makes of them:
+/// a measurement has no program to decide for it, and wants the same rows every time.
+pub fn every_test(
+    check: &ply_ty::CheckOutput,
+    visible: &[usize],
+    plan: &Plan,
+) -> ply_test::Selection {
+    let tests: Vec<(usize, Footprint)> = visible
+        .iter()
+        .filter_map(|&i| Some((i, check.tests.get(i)?.footprint.clone())))
+        .collect();
+    let projected: Vec<Footprint> = tests.iter().map(|(_, f)| region_footprint(f)).collect();
+    ply_test::Selection::chosen(
+        &ply_test::Choice {
+            runs: visible.to_vec(),
+            groups: colour(&tests, &projected),
+            ..ply_test::Choice::default()
+        },
+        check,
+        plan,
+    )
 }
 
 /// Wall clock for a schedule as `ply_test::run_with` executes it: groups in turn, `jobs` workers each.
@@ -296,8 +325,8 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
 
     let plan_of = |_store: &mut Store| {
         // Every test in scope, nothing from the cache: a measurement wants the same rows twice.
-        let plan = ply_machine::tester::Plan::new(&loaded.check, None, std_tests);
-        let bare = ply_test::fresh(&loaded.check, &plan.visible, &Plan::default());
+        let plan = ply_machine::tester::Plan::new(&loaded, None, std_tests);
+        let bare = every_test(&loaded.check, &plan.visible, &Plan::default());
         (bare, plan)
     };
 

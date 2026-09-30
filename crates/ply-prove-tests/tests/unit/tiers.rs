@@ -168,6 +168,7 @@ fn a_report_fails_on_a_refutation_or_a_vacuity_and_not_on_a_gap() {
     };
     let report = |discharge| ProveReport {
         obligations: vec![(obligation.clone(), discharge)],
+        reaches: vec![None],
         plan: ProvePlan::default(),
         duration: Duration::ZERO,
     };

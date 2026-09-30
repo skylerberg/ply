@@ -6,7 +6,7 @@
 // line and key of both reports, and the code each run exits with are decided here.
 
 import cmdline (Parsed, has, parse_nat, value, values_of)
-import proof.domain (Decl, Ty, finite, name_of, size)
+import proof.domain (Decl, Shape, Ty, finite, name_of, size)
 import proof.shrink (Offer, Reply)
 import machine
 import compiler.resolve (Diag, diag, diag1)
@@ -49,7 +49,7 @@ pub type Options = {
   config: machine::ConfigOpts,
   trace: machine::TraceOpts,
   prove: ProveOpts,
-  sim: SimOpts,
+  sim: machine::SimOpts,
 }
 
 pub type ProveOpts = {
@@ -58,15 +58,6 @@ pub type ProveOpts = {
   budget: Option<Int>,
   shrink_budget: Option<Int>,
   steps: Option<Int>,
-}
-
-pub type SimOpts = {
-  seed: Option<String>,
-  mode: String,
-  seeds: Option<Int>,
-  budget: Option<Int>,
-  steps: Option<Int>,
-  measure_reduction: Bool,
 }
 
 pub nondet effect prover {
@@ -132,14 +123,7 @@ pub fn options_from(p: Parsed, root: String) -> Options = {
       shrink_budget: opt_nat(p, "shrink-budget"),
       steps: opt_nat(p, "prove-steps"),
     },
-    sim: {
-      seed: value(p, "seed"),
-      mode: match value(p, "sim") { Some(v) -> v, None -> "dpor" },
-      seeds: opt_nat(p, "seeds"),
-      budget: opt_nat(p, "sim-budget"),
-      steps: opt_nat(p, "sim-steps"),
-      measure_reduction: has(p, "measure-reduction"),
-    },
+    sim: machine::sim_options_from(p),
   }
 }
 
@@ -183,9 +167,9 @@ pub type Choice = {
   domains: List<Measured>,
 }
 
-// What this side measured about one obligation's binders. The sizes are in binder order; the name is
+// What this side measured about one obligation's binders: each binder's shape, in binder order, and
 // what an artifact calls the domain.
-pub type Measured = { claim: Int, sizes: List<Int>, name: String }
+pub type Measured = { claim: Int, shapes: List<Shape>, name: String }
 
 // One binder of one obligation: its name, the type as the runtime prints it, and the type itself.
 pub type Binder = { name: String, text: String, ty: Ty }
@@ -216,13 +200,29 @@ pub type Collection = {
 }
 
 // What the runtime discharged, parallel to the claims the run asked for.
-pub type Discharged = { outcomes: List<Outcome>, duration_ms: Decimal, warnings: List<Diag> }
+pub type Discharged = {
+  outcomes: List<Outcome>,
+  // Parallel to `outcomes`: what the static tier alone answered, for each claim this run discharged
+  // that the static tier sees.
+  reaches: List<Option<Reach>>,
+  duration_ms: Decimal,
+  warnings: List<Diag>,
+}
+
+// What the static tier alone answered for one obligation, and every place it left the decidable
+// fragment on the way: `kind` names the construct, and `about` the definition or reason it names.
+pub type Reach = {
+  decision: String,
+  steps: Int,
+  blockers: List<{ kind: String, about: Option<String> }>,
+}
 
 // A run of obligations as a report reads it: what became of each claim it asked for, where each
 // answer came from, and the accounting over them.
 pub type Verdicts = {
   // Parallel to the indices the run asked for.
   outcomes: List<Outcome>,
+  reaches: List<Option<Reach>>,
   reasons: List<Reason>,
   coverage: Coverage,
   cached: Int,
@@ -235,7 +235,7 @@ pub type Verdicts = {
 pub type Accepted = { definitions: Int, stored: Bool, warnings: List<Diag> }
 
 // One claim and what became of it, which is what every row and every object is written from.
-pub type Row = { claim: Claim, outcome: Outcome, reason: Reason }
+pub type Row = { claim: Claim, outcome: Outcome, reason: Reason, reach: Option<Reach> }
 
 // --- Small things -----------------------------------------------------------
 
@@ -385,6 +385,7 @@ pub fn rows_of(claims: List<Claim>, wanted: List<Int>, v: Verdicts) -> List<Row>
             claim: c,
             outcome: o,
             reason: match list_at(v.reasons, i) { Some(r) -> r, None -> Fresh },
+            reach: match list_at(v.reaches, i) { Some(r) -> r, None -> None },
           }),
       },
     })
@@ -482,6 +483,7 @@ pub fn decided(
       let names = map(c.defs, |x: Def| x.name);
       Ok({
         outcomes: d.outcomes,
+        reaches: d.reaches,
         reasons: selection.reasons,
         coverage: coverage(names, laws, claim_rows(c, wanted, d.outcomes)),
         cached: hits(selection),
@@ -648,12 +650,35 @@ pub fn obligation_json(r: Row, places: List<Place>) -> Json =
             key: "tier",
             value: match tier_of(r.outcome) { Some(t) -> Str(tier_word(t)), None -> Null },
           },
+          { key: "reach", value: reach_json(r.reach) },
         ],
         index_members(r.claim),
       ),
       outcome_members(r.outcome),
     ),
   )
+
+// What the static tier alone answered: absent for a claim the cache answered, or one the static tier
+// never sees, such as a law over interleavings.
+fn reach_json(v: Option<Reach>) -> Json =
+  match v {
+    None -> Null,
+    Some(reach) ->
+      object([
+        { key: "decision", value: Str(reach.decision) },
+        { key: "steps", value: num(reach.steps) },
+        {
+          key: "blockers",
+          value: Array(
+            map(reach.blockers, |b: { kind: String, about: Option<String> }|
+              object([
+                { key: "kind", value: Str(b.kind) },
+                { key: "about", value: match b.about { Some(a) -> Str(a), None -> Null } },
+              ])),
+          ),
+        },
+      ]),
+  }
 
 pub fn coverage_json(cov: Coverage) -> Json =
   object([
@@ -936,6 +961,7 @@ test "a row is the tier, the claim and what it rests on, in fixed columns" {
     claim: a_claim("m.one", Ensures(0)),
     outcome: proved(Array([Str("congruence")]), 2),
     reason: Fresh,
+    reach: None,
   };
   assert_eq(
     row_head(plain(), r, [a_place()]),
@@ -948,6 +974,7 @@ test "a refuted claim is E0419 over the claim, and a gap is W0604 over the same 
     claim: a_claim("m.short", Law(Some("a batch is small"))),
     outcome: Refuted(a_counter()),
     reason: Fresh,
+    reach: None,
   };
   let ds = diagnostics_of([refuted]);
   assert_eq(len(ds), 1);
@@ -964,6 +991,7 @@ test "a refuted claim is E0419 over the claim, and a gap is W0604 over the same 
     claim: a_claim("m.stored", Ensures(0)),
     outcome: Unattempted(UnhandledEffect(Some("{db.read[rows]}"))),
     reason: Fresh,
+    reach: None,
   };
   let warnings = diagnostics_of([gap]);
   let w: Diag = match list_at(warnings, 0) { Some(x) -> x, None -> panic("one diagnostic") };
@@ -980,6 +1008,7 @@ test "a claim that holds raises nothing at all" {
     claim: a_claim("m.one", Ensures(0)),
     outcome: proved(Array([]), 1),
     reason: FromProof,
+    reach: None,
   };
   assert_eq(len(diagnostics_of([held])), 0)
 }
@@ -1028,14 +1057,7 @@ pub fn no_options() -> Options =
     config: machine::no_options().config,
     trace: machine::no_options().trace,
     prove: { cases: None, roots: None, budget: None, shrink_budget: None, steps: None },
-    sim: {
-      seed: None,
-      mode: "dpor",
-      seeds: None,
-      budget: None,
-      steps: None,
-      measure_reduction: false,
-    },
+    sim: machine::no_sim_options(),
   }
 
 // The domains this side measured for the obligations it will discharge: the binders' types are the
@@ -1066,7 +1088,7 @@ fn measured_one(typed: Typed, cs: List<Claim>, wanted: List<Int>, place: Int) ->
           [
             {
               claim: claim,
-              sizes: domain.sizes,
+              shapes: domain.shapes,
               name: name_of(map(entry.binders, |b: Binder| b.text)),
             },
           ],

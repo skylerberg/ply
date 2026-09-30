@@ -313,18 +313,33 @@ pub fn scheduling(root: &Path) -> Result<Scheduling> {
         .map(|t| t.footprint.clone())
         .collect();
     let scheduled: Vec<(usize, Footprint)> = footprints.iter().cloned().enumerate().collect();
+    let projected: Vec<Footprint> = footprints
+        .iter()
+        .map(crate::regions::region_footprint)
+        .collect();
 
-    let groups = ply_test::group_by_conflict(&scheduled);
-    let parallelism = ply_test::parallelism(&footprints, &scheduled, &groups);
+    let groups = crate::regions::colour(&scheduled, &projected);
+    let shared: Vec<(usize, Footprint)> = scheduled
+        .iter()
+        .zip(&projected)
+        .filter(|(_, p)| !p.is_empty())
+        .map(|(t, _)| t.clone())
+        .collect();
+    let shared_projected: Vec<Footprint> = projected
+        .iter()
+        .filter(|p| !p.is_empty())
+        .cloned()
+        .collect();
+    let isolated = footprints.len() - shared.len();
     let sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
 
     Ok(Scheduling {
         root: root.display().to_string(),
-        tests: parallelism.total,
-        isolated: parallelism.isolated,
-        shared: parallelism.shared,
-        groups: parallelism.groups,
-        shared_groups: parallelism.shared_groups,
+        tests: footprints.len(),
+        isolated,
+        shared: shared.len(),
+        groups: groups.len(),
+        shared_groups: crate::regions::colour(&shared, &shared_projected).len(),
         largest_group: sizes.iter().copied().max().unwrap_or(0),
         smallest_group: sizes.iter().copied().min().unwrap_or(0),
         largest_group_share: match scheduled.len() {

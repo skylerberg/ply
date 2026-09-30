@@ -31,7 +31,7 @@ fn the_reconstructed_parser_passes_every_test_the_shipped_one_does() {
     };
 
     let mut store = ply_store::Store::open(dir.path()).expect("a cache");
-    let selection = ply_test::fresh(
+    let selection = ply_corpus::regions::every_test(
         &loaded.check,
         &(0..loaded.check.tests.len()).collect::<Vec<_>>(),
         &Plan::default(),

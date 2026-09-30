@@ -177,7 +177,7 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_span::Diagnostic> {
     let mut machine = Machine::new(&front);
     machine.set_compiled(unit.attach());
     let mut registry = HostRegistry::new();
-    for (op, handler) in ply_machine::claims::lent() {
+    for (op, handler) in ply_machine::claims::lent("proof.obligation") {
         registry.register(op, handler);
     }
     let binding = registry.bind(&front.check).expect("the prover ops bind");

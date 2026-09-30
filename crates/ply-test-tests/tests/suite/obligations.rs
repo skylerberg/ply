@@ -1,3 +1,4 @@
+use ply_prove::prove::{Decision, Reach};
 use ply_prove::{
     CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, ObligationKind,
     ProvePlan, Rule, Tier, Vacuity, VacuityKind,
@@ -107,6 +108,8 @@ fn unattempted() -> Discharge {
 struct Scripted {
     answers: BTreeMap<DefHash, Discharge>,
     asked: Mutex<Vec<DefHash>>,
+    /// What its static tier answers for every obligation it discharges.
+    reach: Option<Reach>,
 }
 
 impl Scripted {
@@ -114,6 +117,7 @@ impl Scripted {
         Scripted {
             answers: answers.into_iter().collect(),
             asked: Mutex::new(Vec::new()),
+            reach: None,
         }
     }
 
@@ -131,14 +135,15 @@ impl Discharger for Scripted {
         obligation: &Obligation,
         _plan: &ProvePlan,
         _domain: Option<&ply_test::obligation::Domain>,
-    ) -> Discharge {
+    ) -> (Discharge, Option<Reach>) {
         self.asked.lock().unwrap().push(obligation.key);
-        match self.answers.get(&obligation.key) {
+        let discharge = match self.answers.get(&obligation.key) {
             Some(Discharge::Held(e)) => Discharge::Held(e.clone()),
             Some(Discharge::Refuted(_)) => refuted(),
             Some(Discharge::Vacuous(_)) => vacuous(),
             _ => unattempted(),
-        }
+        };
+        (discharge, self.reach.clone())
     }
 }
 
@@ -185,6 +190,39 @@ fn evidence_is_read_back_from_the_key_the_program_named_and_only_the_rest_is_dis
     );
     let tiers: Vec<Option<Tier>> = report.obligations.iter().map(|(_, d)| d.tier()).collect();
     assert_eq!(tiers, vec![Some(Tier::Property), Some(Tier::Proved)]);
+}
+
+#[test]
+fn the_static_tiers_reach_comes_back_beside_the_obligation_it_answered_for() {
+    let dir = TempRoot::new();
+    let mut store = dir.store();
+    store.put_obligation(hash(40), to_cached(&Evidence::Cases(cases(200))));
+    store.flush().unwrap();
+
+    let store = dir.store();
+    let scripted = Scripted {
+        reach: Some(Reach {
+            decision: Decision::GuardUnsatisfiable { steps: 3 },
+            blockers: Vec::new(),
+        }),
+        ..Scripted::new([(hash(2), proved())])
+    };
+    let report = carried_out(
+        vec![ensures(1, "m.f", 0), ensures(2, "m.g", 0)],
+        &store,
+        vec![(0, hash(40))],
+        vec![1],
+        &scripted,
+    );
+    assert_eq!(report.reaches.len(), report.obligations.len());
+    assert!(
+        report.reaches[0].is_none(),
+        "evidence read back from the store was decided by no tier this run"
+    );
+    assert_eq!(
+        report.reaches[1].as_ref().map(|r| &r.decision),
+        Some(&Decision::GuardUnsatisfiable { steps: 3 })
+    );
 }
 
 #[test]
