@@ -1,8 +1,8 @@
 //! `Edited` versus `Derived`, exactly: today's bodies hashed as the baseline wrote references.
 
 use super::{Baseline, DefKey, Ns};
+use ply_eval::decode::{self, At};
 use ply_span::Symbol;
-use ply_span::frames::Cursor;
 use ply_ty::DefHash;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,9 +27,9 @@ impl Rehashed {
             .keys()
             .filter_map(|key| Some((key.name.to_string(), key.is_decl(), baseline.hash_of(&key)?)))
             .collect();
-        let dump = ply_codegen::c::producer::rehash_dump(sources, &pins, packages, mod_pkg)
+        let answer = ply_codegen::c::producer::rehash(sources, &pins, packages, mod_pkg)
             .map_err(|e| format!("{e:#}"))?;
-        read(&dump)
+        read(At::new("`front.rehash`'s answer", &answer)).map_err(|e| e.to_string())
     }
 
     pub fn rehash(&self, key: &DefKey) -> Option<DefHash> {
@@ -56,52 +56,31 @@ impl Rehashed {
     }
 }
 
-fn read(dump: &str) -> Result<Rehashed, String> {
+/// A `hash.Rehashed`. A node's component is `-1` when it is in none.
+fn read(answer: At<'_>) -> Result<Rehashed, decode::Error> {
+    let hash = |at: At<'_>| at.byte_array().map(DefHash);
     let mut out = Rehashed::default();
-    let mut frames = Cursor::new(dump.as_bytes(), "frame");
-    while !frames.done() {
-        let (words, payload) = frames.unit()?;
-        let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
-        let mut cursor = Cursor::new(payload, "field");
-        while !cursor.done() {
-            let (key, body) = cursor.unit()?;
-            let [key] = key[..] else {
-                return Err(format!("a field headed `{}`", key.join(" ")));
-            };
-            fields.insert(key, std::str::from_utf8(body).map_err(|e| e.to_string())?);
-        }
-        let hash = |field: &str| {
-            fields
-                .get(field)
-                .copied()
-                .and_then(DefHash::from_hex)
-                .ok_or_else(|| format!("a `{}` frame with no `{field}` hash", words.join(" ")))
+    for node in answer.field("nodes")?.list()? {
+        let key = DefKey {
+            name: Symbol::new(node.field("name")?.utf8()?),
+            ns: if node.field("decl")?.bool()? {
+                Ns::Decl
+            } else {
+                Ns::Value
+            },
         };
-        match words[..] {
-            ["node", name] => {
-                let ns = match fields.get("ns") {
-                    Some(&"decl") => Ns::Decl,
-                    _ => Ns::Value,
-                };
-                let key = DefKey {
-                    name: Symbol::new(name),
-                    ns,
-                };
-                out.fresh.insert(key.clone(), hash("fresh")?);
-                out.image.insert(hash("table")?);
-                if let Some(component) = fields.get("component") {
-                    let id = component
-                        .parse()
-                        .map_err(|_| format!("component `{component}`"))?;
-                    out.components.insert(key, id);
-                }
-            }
-            ["test", _] => {
-                let key = fields.get("key").ok_or("a test frame with no key")?;
-                out.tests.insert(Symbol::new(key), hash("hash")?);
-            }
-            _ => return Err(format!("a `{}` frame", words.join(" "))),
+        out.fresh.insert(key.clone(), hash(node.field("fresh")?)?);
+        out.image.insert(hash(node.field("table")?)?);
+        let component = node.field("component")?;
+        if component.int()? >= 0 {
+            out.components.insert(key, component.number()?);
         }
+    }
+    for test in answer.field("tests")?.list()? {
+        out.tests.insert(
+            Symbol::new(test.field("key")?.utf8()?),
+            hash(test.field("hash")?)?,
+        );
     }
     Ok(out)
 }

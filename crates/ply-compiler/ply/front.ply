@@ -19,12 +19,11 @@ import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEff
                 resolve_modules, qualify, lookup, find, is_bare, diag1, backticked,
                 import_module_name, path_span)
 import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index, hash_index, hex,
-             digest, unused, Pin, Rehash, Rehashed, rehash_index, Printed, Unprintable,
-             print_bodies)
+             digest, unused, Pin, Rehash, Rehashed, rehash_index)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, update_shapes, expanded_mods,
-              check_front_with, deriver_text, is_prelude_effect, builtin_schemes, BuiltinDoc,
-              builtin_docs, find_doc)
+              check_front_with, deriver_text, is_prelude_effect, builtin_schemes, builtin_docs,
+              find_doc)
 import diag (Parsed, parse_all, parse_at, outside_every_module, frame, framed, field, flag, placed)
 import pkg (Pkgs, Closure, Package, Pinned, closure, empty, pins_of)
 import resolve (Pkg, resolve_packaged, no_pkgs)
@@ -54,8 +53,6 @@ fn span_at(module: Int, s: Span) -> At =
   }
 
 fn loc_at(l: Loc) -> At = span_at(l.module, l.span)
-
-fn span_text(module: Int, s: Span) -> Bytes = at_text(span_at(module, s))
 
 // --- What the source wrote ----------------------------------------------------
 // What the driver reads from the tree that the checker's tables do not keep.
@@ -1274,29 +1271,18 @@ pub fn front_dump_with(
   tests: List<KnownTestRow>,
 ) -> String = string_of_bytes(dump_text(dump_of(analyse_with(parse_all(sources), defs, tests))))
 
-// Every builtin's scheme as the checker binds it, its parameter names and its note: one `builtin`
-// frame each.
-pub fn builtins_dump() -> String = {
+// A builtin as the checker binds it, and the names its parameters are documented under.
+pub type BuiltinRow = { name: Bytes, scheme: Scheme, params: List<Bytes> }
+
+// Every builtin, in the prelude's order.
+pub fn builtin_rows() -> List<BuiltinRow> = {
   let docs = builtin_docs();
-  string_of_bytes(
-    bytes_concat_all(
-      map(builtin_schemes(0, 1, 2, 0), |x: { name: Bytes, sc: Scheme }| {
-        let d: BuiltinDoc = match find_doc(docs, x.name) {
-          Some(d) -> d,
-          None -> { name: x.name, params: [], note: b"" },
-        };
-        framed(
-          b"builtin",
-          x.name,
-          cat([
-            [field(b"scheme", scheme_text(x.sc))],
-            map(d.params, |p: Bytes| field(b"param", p)),
-            [field(b"note", d.note)],
-          ]),
-        )
-      }),
-    ),
-  )
+  map(builtin_schemes(0, 1, 2, 0), |x: { name: Bytes, sc: Scheme }|
+    {
+      name: x.name,
+      scheme: x.sc,
+      params: match find_doc(docs, x.name) { Some(d) -> d.params, None -> [] },
+    })
 }
 
 fn global(r: Resolved, module: Int, written: Bytes) -> Bytes = {
@@ -1420,76 +1406,76 @@ fn named(r: Resolved, m: Int, c: Code) -> Code = {
   { own: c.own, node: node, span: c.span }
 }
 
-fn lowered(r: Resolved, m: Int, params: List<Bytes>, e: Expr) -> Bytes =
-  match lower_fn(params, [], map_new(), e) { Some(l) -> dump(named(r, m, l.code)), None -> b"" }
+// What the prover reads of a program: each `fn`'s lowered body and clauses, each sum type's
+// variant count, and each law. A body the lowering does not take is `None`, which reads as
+// unreached.
+pub type Claim =
+  | ClaimDef({ name: Bytes, params: Int, body: Option<Code>, spec: List<ClaimClause> })
+  | ClaimSum({ name: Bytes, variants: Int })
+  | ClaimLaw({ key: Bytes, guard: Option<Lowered>, body: Option<Code> })
 
-fn clause_text(r: Resolved, m: Int, params: List<Bytes>, e: Expr) -> Bytes =
-  bytes_concat_all([span_text(m, expr_span(e)), b"\n", lowered(r, m, params, e)])
+// A clause lowered under its binders, and where it is written.
+pub type Lowered = { at: At, code: Option<Code> }
+
+pub type ClaimClause = { kind: SpecKind, clause: Lowered }
+
+fn lowered(r: Resolved, m: Int, params: List<Bytes>, e: Expr) -> Option<Code> =
+  match lower_fn(params, [], map_new(), e) { Some(l) -> Some(named(r, m, l.code)), None -> None }
+
+fn lowered_at(r: Resolved, m: Int, params: List<Bytes>, e: Expr) -> Lowered =
+  { at: span_at(m, expr_span(e)), code: lowered(r, m, params, e) }
 
 // `result` takes the slot after the parameters, as the obligation's binders place it.
-fn def_claims(r: Resolved, m: Int, module: Bytes, d: FnDef) -> Bytes = {
+fn def_claim(r: Resolved, m: Int, module: Bytes, d: FnDef) -> Claim = {
   let params = map(d.params, |p: Param| p.name.name);
-  framed(
-    b"def",
-    qualify(module, d.name.name),
-    cat([
-      [field(b"params", num(len(params))), field(b"body", lowered(r, m, params, d.body))],
-      map(d.spec, |c: SpecClause|
-        match c.kind {
-          SRequires -> field(b"requires", clause_text(r, m, params, c.expr)),
-          SEnsures -> field(b"ensures", clause_text(r, m, push(params, b"result"), c.expr)),
-        }),
-    ]),
-  )
+  ClaimDef({
+    name: qualify(module, d.name.name),
+    params: len(params),
+    body: lowered(r, m, params, d.body),
+    spec: map(d.spec, |c: SpecClause|
+      {
+        kind: c.kind,
+        clause: lowered_at(
+          r,
+          m,
+          match c.kind { SRequires -> params, SEnsures -> push(params, b"result") },
+          c.expr,
+        ),
+      }),
+  })
 }
 
-fn law_claims(r: Resolved, m: Int, module: Bytes, index: Int, d: LawDef) -> Bytes = {
+fn law_claim(r: Resolved, m: Int, module: Bytes, d: LawDef) -> Claim = {
   let names = map(d.binders, |b: Binder| b.name.name);
-  framed(
-    b"law",
-    num(index),
-    cat([
-      [field(b"key", qualify(module, d.name))],
-      match d.guard { Some(g) -> [field(b"guard", clause_text(r, m, names, g))], None -> [] },
-      [field(b"body", lowered(r, m, names, d.body))],
-    ]),
-  )
+  ClaimLaw({
+    key: qualify(module, d.name),
+    guard: match d.guard { Some(g) -> Some(lowered_at(r, m, names, g)), None -> None },
+    body: lowered(r, m, names, d.body),
+  })
 }
 
-type Claimed = { frames: List<Bytes>, laws: Int }
-
-fn claim_frames(mods: List<Mod>, r: Resolved) -> List<Bytes> = {
-  let walked = fold(range(0, len(mods)), { frames: [], laws: 0 }, |acc: Claimed, i: Int| {
+fn claims_of(mods: List<Mod>, r: Resolved) -> List<Claim> =
+  fold(range(0, len(mods)), [], |acc: List<Claim>, i: Int| {
     let m = at(mods, i);
-    fold(m.module.items, acc, |a: Claimed, it: Item|
+    fold(m.module.items, acc, |a: List<Claim>, it: Item|
       match it {
-        IFn(d) -> { frames: push(a.frames, def_claims(r, i, m.name, d)), laws: a.laws },
+        IFn(d) -> push(a, def_claim(r, i, m.name, d)),
         // A split over a type is sound only with every variant in hand.
         IType(d) -> match d.body {
-          TDSum(vs) ->
-            {
-              frames: push(
-                a.frames,
-                framed(b"sum", qualify(m.name, d.name.name), [field(b"variants", num(len(vs)))]),
-              ),
-              laws: a.laws,
-            },
+          TDSum(vs) -> push(a, ClaimSum({ name: qualify(m.name, d.name.name), variants: len(vs) })),
           _ -> a,
         },
-        ILaw(d) ->
-          { frames: push(a.frames, law_claims(r, i, m.name, a.laws, d)), laws: a.laws + 1 },
+        ILaw(d) -> push(a, law_claim(r, i, m.name, d)),
         _ -> a,
       })
-  });
-  walked.frames
-}
+  })
 
-pub fn claims_dump(
+pub fn claims(
   sources: List<Source>,
   pkgs: List<Pkg> = [],
   mod_pkg: List<Int> = [],
   shelf: Int = 0,
-) -> String = {
+) -> List<Claim> = {
   let mods = map(parse_all(sources), |p: Parsed| p.module);
   // The published table ends with the built-in packages; the shelf sits one past them.
   let packaged = if len(pkgs) == 0 { no_pkgs(mods) }
@@ -1505,22 +1491,21 @@ pub fn claims_dump(
     Failed(_) -> panic("a program the front end checked does not resolve"),
     Resolved_(x) -> match update_shapes(x.r, x.mods) {
       None -> panic("a program the front end checked does not check"),
-      Some(shapes) ->
-        string_of_bytes(bytes_concat_all(claim_frames(expanded_mods(x.mods, shapes), x.r))),
+      Some(shapes) -> claims_of(expanded_mods(x.mods, shapes), x.r),
     },
   }
 }
 
 // Every definition and test re-hashed under `pins`. The package tables are the ones the program
 // was analysed with — a rehash that resolved with pre-package rules would read a dependency's own
-// modules as root ones — and the shelf sits one past the published table, as `claims_dump` has it.
-pub fn rehash_dump(
+// modules as root ones — and the shelf sits one past the published table, as `claims` has it.
+pub fn rehash(
   sources: List<Source>,
   pins: List<Pin>,
   pkgs: List<Pkg> = [],
   mod_pkg: List<Int> = [],
   shelf: Int = 0,
-) -> String = {
+) -> Rehashed = {
   let mods = map(parse_all(sources), |p: Parsed| p.module);
   let packaged = if len(pkgs) == 0 { no_pkgs(mods) }
   else { { pkgs: pkgs, mod_pkg: mod_pkg, std: shelf - 2, compiler: shelf - 1, shelf: shelf } };
@@ -1533,55 +1518,9 @@ pub fn rehash_dump(
       packaged.shelf,
     ) {
     Failed(_) -> panic("a program the front end checked does not resolve"),
-    Resolved_(x) -> {
-      let r: Rehashed = rehash_index(build_index(x.mods, x.r).index, pins);
-      string_of_bytes(
-        bytes_concat_all(
-          cat([
-            map(r.nodes, |n: Rehash|
-              framed(
-                b"node",
-                n.name,
-                cat([
-                  [
-                    field(b"ns", if n.decl { b"decl" } else { b"def" }),
-                    field(b"fresh", hex(n.fresh)),
-                    field(b"table", hex(n.table)),
-                  ],
-                  if n.component < 0 { [] } else { [field(b"component", num(n.component))] },
-                ]),
-              )),
-            map(range(0, len(r.tests)), |i: Int|
-              framed(b"test", num(i), [
-                field(b"key", at(r.tests, i).key),
-                field(b"hash", hex(at(r.tests, i).hash)),
-              ])),
-          ]),
-        ),
-      )
-    },
+    Resolved_(x) -> rehash_index(build_index(x.mods, x.r).index, pins),
   }
 }
-
-pub fn print_dump(
-  bodies: List<Bytes>,
-  names: List<{ name: Bytes, hash: Bytes, public: Bool }>,
-  tests: List<Bytes>,
-  relink: List<{ from: Bytes, to: Bytes }>,
-  shipped: List<Bytes>,
-) -> String =
-  string_of_bytes(match print_bodies(bodies, names, tests, relink, shipped) {
-    Printed(ms) ->
-      bytes_concat_all(
-        map(ms, |m: { module: Bytes, text: Bytes }| framed(b"module", m.module, [m.text])),
-      ),
-    Unprintable(why) ->
-      framed(
-        b"refused",
-        b"_",
-        cat([[field(b"message", why.message)], map(why.notes, |n: Bytes| field(b"note", n))]),
-      ),
-  })
 
 // --- Pulling in the shipped modules --------------------------------------------
 // As the driver places them: after the program's own modules, a round of new imports at a time, each round in byte order.
@@ -2418,29 +2357,62 @@ fn claimed() -> List<Source> =
     },
   ]
 
+fn code_text(c: Option<Code>) -> Bytes = match c { Some(x) -> dump(x), None -> b"" }
+
 test "a claim is lowered with each global named program-wide, and a builtin and a prelude constructor as written" {
-  let out = claims_dump(claimed());
-  assert(
-    holds(
-      out,
-      b"def base.one 25\nparams 1\n0body 8\nblit(i1)sum base.Coin 12\nvariants 1\n2def app.two 152\nparams 1\n1",
-    ),
-  );
-  assert(
-    holds(
-      out,
-      b"body 87\nbapp(bvar(Some,-),bbin(add,bapp(bvar(base.one,-)),bapp(bvar(len,-),blist(ovar(x,0),))))requires 35\n1 51 56\nbbin(gt,ovar(x,0),blit(i0))",
-    ),
-  );
-  assert(holds(out, b"key 12\napp.it growsguard "));
-  assert(holds(out, b"bbin(ne,bapp(bvar(app.two,-),ovar(x,0)),bvar(None,-))"))
+  let out = claims(claimed());
+  assert_eq(len(out), 4);
+  match at(out, 0) {
+    ClaimDef(d) -> {
+      assert_eq(d.name, b"base.one");
+      assert_eq(d.params, 0);
+      assert_eq(code_text(d.body), b"blit(i1)");
+      assert_eq(d.spec, [])
+    },
+    _ -> assert(false),
+  };
+  assert_eq(at(out, 1), ClaimSum({ name: b"base.Coin", variants: 2 }));
+  match at(out, 2) {
+    ClaimDef(d) -> {
+      assert_eq(d.name, b"app.two");
+      assert_eq(d.params, 1);
+      assert_eq(
+        code_text(d.body),
+        b"bapp(bvar(Some,-),bbin(add,bapp(bvar(base.one,-)),bapp(bvar(len,-),blist(ovar(x,0),))))",
+      );
+      assert_eq(map(d.spec, |c: ClaimClause| c.kind), [SRequires]);
+      let c = at(d.spec, 0).clause;
+      assert_eq(c.at, { module: 1, start: 51, end: 56 });
+      assert_eq(code_text(c.code), b"bbin(gt,ovar(x,0),blit(i0))")
+    },
+    _ -> assert(false),
+  };
+  match at(out, 3) {
+    ClaimLaw(l) -> {
+      assert_eq(l.key, b"app.it grows");
+      assert(l.guard != None);
+      assert_eq(code_text(l.body), b"bblock(bbin(ne,bapp(bvar(app.two,-),ovar(x,0)),bvar(None,-)))")
+    },
+    _ -> assert(false),
+  }
 }
 
 test "a record update reaches a claim as the literal it stands for" {
-  let out = claims_dump([
+  let out = claims([
     { name: b"m", src: b"pub type P = { a: Int, b: Int }\npub fn bump(p: P) -> P = {..p, b: 3}" },
   ]);
-  assert(holds(out, b"upd("))
+  assert_eq(len(out), 1);
+  match at(out, 0) {
+    ClaimDef(d) -> assert(bytes_index_of(code_text(d.body), b"upd(") != None),
+    _ -> assert(false),
+  }
+}
+
+test "a builtin is published with its scheme and the names its parameters are documented under" {
+  let rows = filter(builtin_rows(), |r: BuiltinRow| r.name == b"push");
+  assert_eq(len(rows), 1);
+  assert_eq(at(rows, 0).params, [b"xs", b"x"]);
+  match at(rows, 0).scheme.ty { TyFn(f) -> assert_eq(len(f.params), 2), _ -> assert(false) }
 }
 
 fn shelf() -> List<Source> =
@@ -2883,8 +2855,13 @@ test "a rehash resolves a dependency's own modules with the program's packages" 
         user,
         map(lib, |m: Source| { name: bytes_concat(b"lib.", m.name), src: m.src }),
       );
-      let dump = rehash_dump(sources, [], w.packages, w.mod_pkg, len(w.packages));
-      assert(string_len(dump) > 0)
+      let r = rehash(sources, [], w.packages, w.mod_pkg, len(w.packages));
+      assert(len(r.nodes) > 0);
+      // Each node's hashes are whole digests, which is how the bisector reads them.
+      assert_eq(
+        filter(r.nodes, |n: Rehash| bytes_len(n.fresh) != 32 || bytes_len(n.table) != 32),
+        [],
+      )
     },
   }
 }
