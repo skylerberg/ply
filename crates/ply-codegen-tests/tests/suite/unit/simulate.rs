@@ -135,3 +135,88 @@ fn a_production_region_keeps_its_tables_to_the_tasks_still_live() {
     );
     ctx.end();
 }
+
+/// A spawn's handle and a `with_cell`'s cell are both bridges: what a server makes per request.
+const BRIDGED: &str = r#"
+fn counted(i: Int) -> Int =
+  with_cell[work](i) { c -> {
+    cell_set(c, cell_get(c) + 1);
+    cell_get(c)
+  } }
+
+pub fn fired(n: Int) -> Int / {task.write} =
+  fold(range(0, n), 0, |sum: Int, i: Int| {
+    task.spawn(|| counted(i));
+    task.yield();
+    sum + i
+  })
+
+pub fn celled(n: Int) -> Int = fold(range(0, n), 0, |sum: Int, i: Int| sum + counted(i))
+"#;
+
+/// Past a handful of bridges, the table is growing with the requests rather than the live values.
+const LIVE_BRIDGES: usize = 4;
+
+#[test]
+fn a_production_region_that_drops_its_task_handles_gives_their_bridges_back() {
+    let Some((front, native)) = built(BRIDGED) else {
+        return;
+    };
+    let entry = native.entry("m.fired").expect("`fired` compiles");
+    let mut ctx = native.context();
+    ctx.set_host(Arc::new(tasks_bound(front)), None);
+    ctx.begin(100_000);
+    let rounds = 10_000;
+    let answer = unsafe { entry(&mut ctx, [imm(rounds)].as_ptr()) };
+    assert_eq!(
+        ctx.failed,
+        0,
+        "`fired` raised: {:?}",
+        ctx.diagnostic.as_ref().map(|d| d.message.clone())
+    );
+    assert!(
+        ctx.sims.last().is_some_and(|sim| sim.is_production()),
+        "the first `task` operation opened no production region"
+    );
+    assert!(
+        ctx.heap.bridges() <= LIVE_BRIDGES,
+        "the heap keeps {} bridges after {rounds} dropped handles and cells",
+        ctx.heap.bridges()
+    );
+
+    let answer = unsafe { ply_codegen::simulate::finish_root(&mut ctx, answer) };
+    assert_eq!(ctx.failed, 0, "draining the region raised");
+    assert_eq!(
+        Heap::to_value(&native.tables().layouts, answer),
+        Value::Int(rounds * (rounds - 1) / 2)
+    );
+    ctx.end();
+}
+
+#[test]
+fn a_with_cell_opened_in_a_loop_gives_its_cells_bridge_back() {
+    let Some((_, native)) = built(BRIDGED) else {
+        return;
+    };
+    let entry = native.entry("m.celled").expect("`celled` compiles");
+    let mut ctx = native.context();
+    ctx.begin(100_000);
+    let rounds = 10_000;
+    let answer = unsafe { entry(&mut ctx, [imm(rounds)].as_ptr()) };
+    assert_eq!(
+        ctx.failed,
+        0,
+        "`celled` raised: {:?}",
+        ctx.diagnostic.as_ref().map(|d| d.message.clone())
+    );
+    assert!(
+        ctx.heap.bridges() <= LIVE_BRIDGES,
+        "the heap keeps {} bridges after {rounds} cells",
+        ctx.heap.bridges()
+    );
+    assert_eq!(
+        Heap::to_value(&native.tables().layouts, answer),
+        Value::Int(rounds * (rounds + 1) / 2)
+    );
+    ctx.end();
+}
