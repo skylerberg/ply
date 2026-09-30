@@ -217,6 +217,10 @@ fn a_failure_in_an_artifact_carries_no_line_number() {
         from_source["diagnostics"][0]["labels"][0]["start"]["line"],
         1
     );
+    assert_eq!(
+        from_source["diagnostics"][0]["message"], "division by zero",
+        "the program's own failure, not the seam's: {from_source}"
+    );
     let failed = json_of(
         &ply(dir.path())
             .args(["run", "m.plyx", "--json"])
@@ -924,6 +928,12 @@ fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
         bare_run["diagnostics"][0]["code"],
         codes::CONFIG_UNAVAILABLE,
         "{bare_run}"
+    );
+    assert!(
+        bare_run["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("names no definition in this program")),
+        "the schema is absent from the artifact, rather than entered and declined: {bare_run}"
     );
 
     // Named at build time, the schema ships, and the artifact refuses to start on the missing key as the source does.

@@ -767,4 +767,8 @@ test/nondet "waits on a token nothing resolves" {
         "a run that cannot progress must say so: {}",
         d.message
     );
+    assert!(
+        d.message.contains("returned from `park`"),
+        "the scheduler must be what refused, not the seam: {d:?}"
+    );
 }

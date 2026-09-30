@@ -174,6 +174,15 @@ pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
     backend.enter(&Symbol::new(name), args, 10_000)
 }
 
+/// What `name` raised: the tier ran it, where [`call`]'s `None` is a raise and a decline alike.
+#[track_caller]
+fn raised(unit: &'static Unit, name: &str, args: &[Value]) -> ply_eval::Diagnostic {
+    match unit.attach().enter_whole(&Symbol::new(name), args, 10_000) {
+        ply_eval::Entered::Raised(d) => d,
+        other => panic!("`{name}{args:?}` did not raise: {other:?}"),
+    }
+}
+
 const CLOSURES: &str = r#"
 fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc, x| acc + x)
 
@@ -480,7 +489,13 @@ fn a_compiled_body_answers_over_closures_and_callbacks() {
 fn a_native_closure_stays_inside_the_entry_that_made_it() {
     let (_, unit) = unit(CLOSURES);
     assert!(unit.compiled().iter().any(|f| f == "m.adder"));
-    assert_eq!(call(unit, "m.adder", &[Value::Int(1)]), None);
+    let bodies = unit.bodies().expect("the unit builds");
+    let adder = Symbol::new("m.adder");
+    assert_eq!(
+        ply_eval::Compiled::enter(&*bodies, &adder, &[Value::Int(1)], 10_000),
+        None
+    );
+    assert_eq!(bodies.declines().answer, 1, "{:?}", bodies.declines());
     assert_eq!(
         call(unit, "m.added", &[Value::Int(1), Value::Int(2)]),
         Some(Value::Int(3))
@@ -521,8 +536,17 @@ fn list_set_answers_the_replaced_list_and_declines_outside_it() {
 fn a_callback_that_raises_declines_rather_than_answering() {
     let (_, unit) = unit(CLOSURES);
     assert_eq!(call(unit, "m.stuck", &[Value::Int(0)]), None);
+    let stuck = raised(unit, "m.stuck", &[Value::Int(0)]);
+    assert!(
+        stuck
+            .message
+            .contains("did not stop within its budget of 3"),
+        "{stuck:?}"
+    );
     // A fused loop declines where the runtime's would: a range past the interpreter's limit.
     assert_eq!(call(unit, "m.huge", &[Value::Int(1)]), None);
+    let huge = raised(unit, "m.huge", &[Value::Int(1)]);
+    assert!(huge.message.contains("exceeds the limit of"), "{huge:?}");
     assert_eq!(call(unit, "m.bad_shift", &[Value::Int(70)]), None);
     assert_eq!(
         call(unit, "m.bad_shift", &[Value::Int(3)]),
@@ -543,15 +567,16 @@ fn a_definition_the_fragment_has_no_body_for_is_declined() {
 #[test]
 fn a_call_of_the_wrong_arity_is_declined() {
     let (_, unit) = unit(ARITHMETIC);
-    assert_eq!(call(unit, "m.clamp", &[Value::Int(1)]), None);
+    let bodies = unit.bodies().expect("the unit builds");
+    let enter = |name: &str, args: &[Value]| {
+        ply_eval::Compiled::enter(&*bodies, &Symbol::new(name), args, 10_000)
+    };
+    assert_eq!(enter("m.clamp", &[Value::Int(1)]), None);
     assert_eq!(
-        call(
-            unit,
-            "m.double",
-            &[Value::Int(1), Value::Int(2), Value::Int(3)]
-        ),
+        enter("m.double", &[Value::Int(1), Value::Int(2), Value::Int(3)]),
         None
     );
+    assert_eq!(bodies.declines().arity, 2, "{:?}", bodies.declines());
 }
 
 /// `budget` is the machine's remaining nested calls and not a hint.
@@ -576,6 +601,11 @@ fn a_recursion_past_the_budget_declines_rather_than_running_it() {
 fn an_overflow_declines_rather_than_wrapping() {
     let (_, unit) = unit(ARITHMETIC);
     assert_eq!(call(unit, "m.double", &[Value::Int(i64::MAX)]), None);
+    let overflow = raised(unit, "m.double", &[Value::Int(i64::MAX)]);
+    assert!(
+        overflow.message.contains("integer overflow"),
+        "{overflow:?}"
+    );
 }
 
 /// A bisection builds programs whose definitions reuse the names they replace, so a registry keyed on a name answers for the wrong body.

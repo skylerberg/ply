@@ -120,8 +120,8 @@ fn a_selector_reads_the_keys_the_hashes_and_the_plan_before_anything_runs() {
     let texts: HashMap<String, String> =
         [("m".to_string(), OUTER.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(Provider::attach(unit));
+    let mut machine = Machine::new(&front, Provider::attach(unit))
+        .expect("the unit was compiled from this program");
 
     let mut registry = HostRegistry::new();
     // Only the operations this program declares: the reads it makes, and the two that start it.

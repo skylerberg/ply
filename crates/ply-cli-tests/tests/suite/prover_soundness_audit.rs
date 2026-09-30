@@ -411,12 +411,22 @@ law \"spin is a function\" forall (x: Int) { spin(x) == spin(x) }
 law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
 ",
     );
-    for needle in ["m.go", "spin is a function", "a divisor is a function"] {
+    for (needle, raised) in [
+        ("m.go", "did not finish within its budget"),
+        ("spin is a function", "did not finish within its budget"),
+        ("a divisor is a function", "division by zero"),
+    ] {
         let o = never_proved(&report, needle);
         assert_eq!(
             outcome(o),
             "unattempted",
             "`{needle}` is a theorem about a total symbol and not about this program: {o}"
+        );
+        assert!(
+            o["gap"]
+                .as_str()
+                .is_some_and(|gap| gap.starts_with("raised: ") && gap.contains(raised)),
+            "`{needle}` is a gap because the program ran and raised: {o}"
         );
     }
     // Nothing is covered, which is the half a reviewer reads: coverage counts only a claim that

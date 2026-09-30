@@ -199,8 +199,8 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_eval::Diagnostic> {
         .into_iter()
         .collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     for (op, handler) in ply_machine::claims::lent("proof.obligation") {
         registry.register(op, handler);
