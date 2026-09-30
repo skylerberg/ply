@@ -1,8 +1,9 @@
 // `sim` — what the concurrency simulator's search costs over a corpus's simulated tests, read off the
 // product's own reports: every table is `ply test --json --no-cache` under the search the line names.
-// The reduction is each test's footprint-guided search beside an unpruned one (`--measure-reduction`);
-// race power is the interleavings each strategy runs to the first failure, one root a trial through
-// `--sim-roots`; throughput is seeds a second under `--sim random`.
+// The reduction is each test's footprint-guided search beside an unpruned one, and the
+// synchronization the same search beside one blind to the order spawns and joins impose, both from
+// one `--measure-reduction` run; race power is the interleavings each strategy runs to the first
+// failure, one root a trial through `--sim-roots`; throughput is seeds a second under `--sim random`.
 
 import report
 import report (Row, Criterion, Measurement, Pass, Fail, Inconclusive, Holds, holding, number, exact,
@@ -46,6 +47,8 @@ pub type Searched = {
   // The unpruned search run beside it: what it explored, and whether its budget or a failure
   // stopped it.
   naive: Option<{ explored: Int, bounded: Bool }>,
+  // The same search blind to the order spawns and joins impose, run beside it.
+  blind: Option<{ explored: Int, bounded: Bool }>,
   steps: Int,
   // An interleaving failed, and the search stopped there.
   failed: Bool,
@@ -56,6 +59,14 @@ pub type Searched = {
 // search for is `None`.
 pub type Ran = List<{ key: String, search: Option<Searched> }>
 
+// A search the product ran beside the pruned one, under `key`; `null` when it ran none.
+fn beside(s: Map<String, Json>, key: String) -> Option<{ explored: Int, bounded: Bool }> =
+  match spine::field(s, key) {
+    Ok(c) ->
+      Some({ explored: spine::int_field(c, "explored"), bounded: spine::bool_field(c, "bounded") }),
+    Err(_) -> None,
+  }
+
 fn searched_of(r: Map<String, Json>) -> Option<Searched> =
   match spine::field(r, "simulation") {
     Err(_) -> None,
@@ -64,14 +75,8 @@ fn searched_of(r: Map<String, Json>) -> Option<Searched> =
         explored: spine::int_field(s, "explored"),
         exhaustive: spine::bool_field(s, "exhaustive"),
         exhausted: spine::bool_field(s, "exhausted"),
-        naive: match spine::field(s, "naive") {
-          Ok(n) ->
-            Some({
-              explored: spine::int_field(n, "explored"),
-              bounded: spine::bool_field(n, "bounded"),
-            }),
-          Err(_) -> None,
-        },
+        naive: beside(s, "naive"),
+        blind: beside(s, "blind"),
         steps: spine::int_field(s, "steps"),
         failed: match map_get(s, "failing_seed") { Some(Str(_)) -> true, _ -> false },
         us: spine::us_of_ms(spine::decimal_field(r, "duration_ms")),
@@ -220,18 +225,74 @@ pub fn reduction_row(key: String, s: Searched) -> Row =
     ]),
   )
 
+// --- The synchronization ----------------------------------------------------------------------
+
+// What the clocks earn: they only spare the search reorderings a spawn or a join already rules out,
+// so a search that reads them should run no more interleavings than one that cannot.
+pub fn synchronized() -> Criterion =
+  Holds(
+    "the pruned search runs no more interleavings than one that cannot see the synchronization",
+    |ms: List<Measurement>|
+      match ((report::value_of(ms, "pruned"), report::value_of(ms, "unsynchronized"))) {
+        (Some(pruned), Some(unsynchronized)) -> if cut_short(ms) {
+          Inconclusive("a search stopped short of its frontier, so its count is only a lower bound")
+        } else if pruned <= unsynchronized { Pass }
+        else { Fail(report::named(ms, ["pruned", "unsynchronized"])) },
+        (Some(_), None) ->
+          Inconclusive(
+            "no clock-blind search ran beside it: the pruned search stopped at a failure of its own",
+          ),
+        _ -> Inconclusive("the search was not measured"),
+      },
+  )
+
+// A spent budget or a failure stopped either search short of its frontier, leaving its count a lower
+// bound.
+fn cut_short(ms: List<Measurement>) -> Bool =
+  report::value_of(ms, "pruned_bounded") == Some(1m)
+    || report::value_of(ms, "unsynchronized_bounded") == Some(1m)
+
+// A test's pruned search and, when it ran, the same search with every step's clock withheld.
+pub fn synchronization_row(key: String, s: Searched) -> Row =
+  row(
+    "synchronization " ++ key,
+    synchronized(),
+    cats([
+      [
+        number("pruned", s.explored, "interleavings"),
+        number("pruned_bounded", flag(s.exhausted), ""),
+      ],
+      match s.blind {
+        None -> [],
+        Some(b) ->
+          [
+            number("unsynchronized", b.explored, "interleavings"),
+            number("unsynchronized_bounded", flag(b.bounded), ""),
+          ],
+      },
+    ]),
+  )
+
+// Both tables are read off one run, which searches each test three ways.
 fn reduction_rows(a: Args) -> Result<List<Row>, String> / {process.spawn[ply], config.get[env]} =
   match ran(a, push(dpor_flags(a, 0), "--measure-reduction")) {
     Err(why) -> Err(why),
     Ok(r) ->
       Ok(
-        map(r, |t: { key: String, search: Option<Searched> }|
-          match t.search {
-            Some(s) -> reduction_row(t.key, s),
-            None -> untaken("reduction " ++ t.key, pruning(), "the run reported no search for it"),
-          }),
+        cats([
+          measured(r, "reduction ", pruning(), reduction_row),
+          measured(r, "synchronization ", synchronized(), synchronization_row),
+        ]),
       ),
   }
+
+// A row per test the run reported, and an untaken one for a test it reported no search for.
+fn measured(r: Ran, table: String, c: Criterion, row_of: (String, Searched) -> Row) -> List<Row> =
+  map(r, |t: { key: String, search: Option<Searched> }|
+    match t.search {
+      Some(s) -> row_of(t.key, s),
+      None -> untaken(table ++ t.key, c, "the run reported no search for it"),
+    })
 
 // --- Race power -------------------------------------------------------------------------------
 
@@ -478,6 +539,7 @@ fn a_search() -> Searched =
     exhaustive: true,
     exhausted: false,
     naive: Some({ explored: 120, bounded: false }),
+    blind: Some({ explored: 30, bounded: false }),
     steps: 480,
     failed: false,
     us: 3000,
@@ -514,7 +576,7 @@ test "the pruned search passes against the unpruned one, and fails when it ran m
       number("skipped", 1, ""),
     ]),
   );
-  let stopped = { ..a_search(), failed: true, naive: None };
+  let stopped = { ..a_search(), failed: true, naive: None, blind: None };
   assert(match verdict_of(reduction_row("m.t", stopped)) {
     Inconclusive(why) -> string_contains(why, "stopped at a failure"),
     _ -> false,
@@ -523,6 +585,28 @@ test "the pruned search passes against the unpruned one, and fails when it ran m
     Ok(ms) -> assert_eq(report::value_of(ms, "reduction"), Some(10.0m)),
     Err(why) -> panic(why),
   }
+}
+
+test "the pruned search passes against the clock-blind one, fails when it ran more, and a bound decides nothing" {
+  assert_eq(verdict_of(synchronization_row("m.t", a_search())), Pass);
+  assert_eq(verdict_of(synchronization_row("m.t", { ..a_search(), explored: 30 })), Pass);
+  assert_eq(
+    verdict_of(synchronization_row("m.t", { ..a_search(), explored: 31 })),
+    Fail([number("pruned", 31, "interleavings"), number("unsynchronized", 30, "interleavings")]),
+  );
+  let lower_bound = |s: Searched|
+    match verdict_of(synchronization_row("m.t", s)) {
+      Inconclusive(why) -> string_contains(why, "lower bound"),
+      _ -> false,
+    };
+  assert(lower_bound({ ..a_search(), explored: 256, exhausted: true, exhaustive: false }));
+  assert(lower_bound({ ..a_search(), blind: Some({ explored: 4096, bounded: true }) }));
+  assert(lower_bound({ ..a_search(), explored: 31, blind: Some({ explored: 30, bounded: true }) }));
+  let stopped = { ..a_search(), failed: true, naive: None, blind: None };
+  assert(match verdict_of(synchronization_row("m.t", stopped)) {
+    Inconclusive(why) -> string_contains(why, "stopped at a failure"),
+    _ -> false,
+  })
 }
 
 test "a test with no race reports its misses and no ratio, and is no verdict on the search" {
@@ -601,7 +685,7 @@ test "each trial searches one root, and no sample draws a seed another trial or 
 }
 
 test "a run's searches are read off its report, one for every test that reads a seed" {
-  let text = "{\"selection\":{\"tests\":[{\"index\":0,\"key\":\"m.plain\",\"seeded\":false},{\"index\":1,\"key\":\"m.raced\",\"seeded\":true},{\"index\":2,\"key\":\"m.quiet\",\"seeded\":true}]},\"results\":[{\"index\":0,\"duration_ms\":1.0,\"simulation\":null},{\"index\":1,\"duration_ms\":2.5,\"simulation\":{\"explored\":7,\"exhaustive\":false,\"exhausted\":false,\"naive\":{\"explored\":70,\"bounded\":true,\"rendered\":\">= 70\"},\"reduction\":10.0,\"steps\":90,\"virtual_time_ns\":0,\"failing_seed\":\"4:0.1\"}},{\"index\":2,\"duration_ms\":0.5,\"simulation\":null}]}";
+  let text = "{\"selection\":{\"tests\":[{\"index\":0,\"key\":\"m.plain\",\"seeded\":false},{\"index\":1,\"key\":\"m.raced\",\"seeded\":true},{\"index\":2,\"key\":\"m.quiet\",\"seeded\":true}]},\"results\":[{\"index\":0,\"duration_ms\":1.0,\"simulation\":null},{\"index\":1,\"duration_ms\":2.5,\"simulation\":{\"explored\":7,\"exhaustive\":false,\"exhausted\":false,\"blind\":{\"explored\":9,\"bounded\":false,\"rendered\":\"9\"},\"naive\":{\"explored\":70,\"bounded\":true,\"rendered\":\">= 70\"},\"reduction\":10.0,\"steps\":90,\"virtual_time_ns\":0,\"failing_seed\":\"4:0.1\"}},{\"index\":2,\"duration_ms\":0.5,\"simulation\":null}]}";
   match json::parse_string(text) {
     Err(_) -> panic("the report is JSON"),
     Ok(j) -> match ran_of(j) {
@@ -615,6 +699,7 @@ test "a run's searches are read off its report, one for every test that reads a 
               exhaustive: false,
               exhausted: false,
               naive: Some({ explored: 70, bounded: true }),
+              blind: Some({ explored: 9, bounded: false }),
               steps: 90,
               failed: true,
               us: 2500,
