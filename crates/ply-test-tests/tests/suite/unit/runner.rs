@@ -4,11 +4,12 @@
 //! own tests pin them; these state the choice and check what the runtime did with it.
 
 use crate::fixture::{handed, plan_key, root_key};
-use ply_eval::{Exploration, Naive, Plan, Race, RaceSite, Seed};
-use ply_span::{Diagnostic, SourceId, Symbol};
+use ply_eval::{
+    CheckOutput, DefHash, Diagnostic, EffectAtom, Exploration, Footprint, HashOutput, Mode, Naive,
+    Plan, Race, RaceSite, Resource, Seed, SourceId, Symbol,
+};
 use ply_store::{Outcome, Store};
 use ply_test::{Executor, Hosting, InterpExecutor, Reason, Search, Selection, Status, run_with};
-use ply_ty::{CheckOutput, DefHash, EffectAtom, Footprint, HashOutput, Mode, Resource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,7 +41,7 @@ impl Drop for TempRoot {
 }
 
 struct Program {
-    port: ply_ty::Front,
+    port: ply_eval::Front,
     check: CheckOutput,
     hashes: HashOutput,
     src: String,
@@ -497,7 +498,7 @@ fn a_failure_whose_test_alone_moved_names_no_suspect() {
 
     let failure = &report.failures[0];
     assert_eq!(failure.name, "settle nets out");
-    assert_eq!(failure.diagnostic.code, ply_span::codes::ASSERTION_FAILED);
+    assert_eq!(failure.diagnostic.code, ply_eval::codes::ASSERTION_FAILED);
     assert!(
         failure.suspects.is_empty(),
         "only the expectation inside the test moved, so the test is the change: {:?}",
@@ -721,7 +722,7 @@ fn a_panicking_test_is_contained_and_reported_as_a_failure() {
         .failure
         .as_ref()
         .expect("a panic carries a diagnostic");
-    assert_eq!(diagnostic.code, ply_span::codes::INTERNAL_ERROR);
+    assert_eq!(diagnostic.code, ply_eval::codes::INTERNAL_ERROR);
     assert!(
         diagnostic.message.contains("deliberate panic"),
         "{}",
@@ -788,7 +789,7 @@ impl Executor for InternalErrorExecutor {
     fn execute(&self, _worker: &mut (), index: usize) -> Result<(), Diagnostic> {
         if index == self.fail_on {
             return Err(Diagnostic::error(
-                ply_span::codes::INTERNAL_ERROR,
+                ply_eval::codes::INTERNAL_ERROR,
                 "internal error: a frame that is not a builtin step reached `advance`",
             ));
         }
@@ -874,7 +875,7 @@ impl Executor for SimExecutor {
         *worker = self.explorations.get(&index).cloned();
         if self.failing.contains(&index) {
             return Err(Diagnostic::error(
-                ply_span::codes::ASSERTION_FAILED,
+                ply_eval::codes::ASSERTION_FAILED,
                 "balance went negative",
             ));
         }
@@ -1087,7 +1088,7 @@ fn a_failure_carries_the_seed_and_the_race_that_explain_it() {
         task: ply_eval::TaskId(task),
         definition: Some(Symbol::new("apply_debit")),
         access: "db.write[accounts]".into(),
-        span: ply_span::Span::DUMMY,
+        span: ply_eval::Span::DUMMY,
     };
 
     let selection = seeded_choice(&program, &[seeded], &Plan::default(), false);

@@ -1,7 +1,6 @@
-use ply_eval::Value;
+use ply_eval::{SourceId, Symbol, Value, codes};
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
 use ply_machine::config::*;
-use ply_span::{SourceId, Symbol, codes};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,7 +18,7 @@ fn a_hermetic_run_opens_no_source() {
     assert!(!Configuration::default().is_opened());
 }
 
-fn check(source: &str) -> ply_ty::CheckOutput {
+fn check(source: &str) -> ply_eval::CheckOutput {
     ply_codegen::c::producer::checked_front(&[(String::new(), source.to_string())], &[SourceId(0)])
         .expect("the fixture typechecks")
         .check
@@ -45,7 +44,7 @@ fn a_schema_is_evaluated_and_decoded_and_one_the_program_does_not_carry_is_refus
     );
 
     let raised = |_: &str| {
-        Err(ply_span::Diagnostic::error(
+        Err(ply_eval::Diagnostic::error(
             codes::RUNTIME_ERROR,
             "it raised",
         ))

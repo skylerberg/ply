@@ -11,11 +11,11 @@ use crate::hosts::Hosts;
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
 use crate::support::{enter_constant, prover_backend, select_profile};
-use ply_eval::Value as PlyValue;
+use ply_eval::{
+    CheckOutput, Diagnostic, Front, ModuleName, SourceMap, Span, Symbol, Value as PlyValue, codes,
+};
 use ply_host::process::{Executables, ProcessHost, Sink, Stream};
 use ply_host::signal::{self, Shutdown};
-use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
-use ply_ty::{CheckOutput, Front, ModuleName};
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
@@ -235,7 +235,7 @@ fn deployment(path: &std::path::Path) -> Result<Deployment, Refused> {
 /// What the entry's binding disclosed, held while it runs.
 pub struct Bound {
     hosts: Hosts,
-    declared: Option<ply_ty::ty::Footprint>,
+    declared: Option<ply_eval::Footprint>,
     tier: &'static dyn ply_eval::Provider,
     /// The tier, attached once and entered any number of times: building it per call would put
     /// the build in every measurement the call is asked for.
@@ -609,7 +609,7 @@ fn evaluate(
     span: Span,
     plan: &ply_eval::Plan,
     hosts: &Hosts,
-    declared: Option<&ply_ty::ty::Footprint>,
+    declared: Option<&ply_eval::Footprint>,
     compiled: std::rc::Rc<dyn ply_eval::Compiled>,
 ) -> Result<PlyValue, Diagnostic> {
     let mut machine = ply_eval::Machine::new(front);
@@ -1197,7 +1197,7 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
 #[cfg(test)]
 mod tests {
     use super::place_the_unplaced;
-    use ply_span::{Diagnostic, Span, codes};
+    use ply_eval::{Diagnostic, Span, codes};
 
     #[test]
     fn a_raise_with_no_place_names_the_entry_point_it_came_from() {
@@ -1216,7 +1216,7 @@ mod tests {
     #[test]
     fn a_raise_that_has_a_place_is_left_alone() {
         let with_place = Diagnostic::error(codes::RUNTIME_ERROR, "boom")
-            .primary(Span::new(ply_span::SourceId(0), 1, 2), "here");
+            .primary(Span::new(ply_eval::SourceId(0), 1, 2), "here");
         let same = place_the_unplaced(with_place, "ply.main");
         assert!(same.notes.is_empty(), "{:?}", same.notes);
     }

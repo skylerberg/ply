@@ -3,9 +3,8 @@
 //! `SimNet` hands the client the bytes a server would have sent and records what it sent back,
 //! so the framing, the handshake and both query cycles are decided without a socket.
 
-use ply_eval::{Machine, Value};
+use ply_eval::{Machine, Span, Value};
 use ply_host::tcp::{Net, SimNet};
-use ply_span::Span;
 use std::sync::Arc;
 
 /// The client, entered once. Trust authentication, because the script decides the handshake.
@@ -106,7 +105,7 @@ fn first_text(answer: Answer) -> String =
   }
 "#;
 
-fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
+fn tiered(service: &str) -> (ply_eval::Front, &'static ply_codegen::Unit) {
     let answered =
         ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), service.to_string())])
             .unwrap_or_else(|e| panic!("they check: {e:#}"));

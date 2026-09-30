@@ -1,11 +1,10 @@
 //! An adversarial audit of the front-end cache's binary format.
 
-use ply_span::{Symbol, codes};
+use ply_eval::{DefHash, Symbol, codes};
 use ply_store::{
     BODY_ENCODING, ContentHash, DefBody, DefEntry, DefKind, FileSpan, Outcome, Slot,
     SourceFingerprint, Store, TestEntry,
 };
-use ply_ty::DefHash;
 use std::path::{Path, PathBuf};
 
 const DATA_HEADER: usize = 56;

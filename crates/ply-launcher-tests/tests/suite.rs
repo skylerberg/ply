@@ -7,9 +7,7 @@
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{Machine, Provider};
-use ply_span::{SourceId, Span};
-use ply_ty::Front;
+use ply_eval::{Front, Machine, Provider, SourceId, Span};
 use std::collections::HashMap;
 use std::sync::Arc;
 

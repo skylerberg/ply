@@ -1,10 +1,7 @@
-use ply_eval::TaskId;
 use ply_eval::host::MachineId;
+use ply_eval::{Resource, Span, Symbol, TaskId, codes};
 use ply_host::trace::Outcome;
 use ply_host::trace::spans::*;
-use ply_span::Symbol;
-use ply_span::{Span, codes};
-use ply_ty::Resource;
 
 fn machine() -> MachineId {
     MachineId::next()

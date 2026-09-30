@@ -3,8 +3,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Plan, Value};
-use ply_span::{Diagnostic, Symbol, codes};
+use ply_eval::{Diagnostic, Plan, Symbol, Value, codes};
 use ply_store::Store;
 use ply_test::{Hosting, InterpExecutor, RunReport, Search, Selection};
 use std::path::PathBuf;

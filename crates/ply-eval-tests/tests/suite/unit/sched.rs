@@ -1,4 +1,3 @@
-use ply_eval::Value;
 use ply_eval::arena::Slot;
 use ply_eval::cont::SimId;
 use ply_eval::host::{HostRuntime, Pending};
@@ -6,10 +5,7 @@ use ply_eval::region::Trail;
 use ply_eval::sched::*;
 use ply_eval::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use ply_eval::sim::{Answer, Handlers, signature};
-use ply_span::Symbol;
-use ply_span::{Diagnostic, Span, codes};
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Resource};
+use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, Value, codes};
 
 type Sched = Scheduler<usize, Value>;
 type Choice = Turn<usize, Value>;

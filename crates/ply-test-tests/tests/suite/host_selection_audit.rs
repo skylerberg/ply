@@ -1,13 +1,11 @@
 use crate::fixture::Compiled;
-use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, Symbol};
+use ply_eval::{Diagnostic, Resource, Symbol, Value};
 use ply_store::{Outcome, Store};
 use ply_test::{Hosting, InterpExecutor, Search};
-use ply_ty::Resource;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,7 +37,7 @@ impl Drop for TempRoot {
 }
 
 impl Compiled {
-    fn footprint_of_test(&self, name: &str) -> &ply_ty::Footprint {
+    fn footprint_of_test(&self, name: &str) -> &ply_eval::Footprint {
         &self
             .check
             .tests

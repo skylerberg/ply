@@ -1,12 +1,10 @@
 use self::fixture::{op, receives_secrets, registry};
 use ply_codegen::c::producer;
 use ply_eval::host::{HostListing, HostRegistry, HostResource, Linearity};
+use ply_eval::{CheckOutput, Footprint, Resource, SourceId, Symbol};
 use ply_host::tls;
 use ply_machine::config::Configuration;
 use ply_machine::hosts::*;
-use ply_span::{SourceId, Symbol};
-use ply_ty::CheckOutput;
-use ply_ty::ty::{Footprint, Resource};
 
 /// A registry whose handlers must never be called, for the tests that only report on a binding.
 pub mod fixture {
@@ -14,7 +12,7 @@ pub mod fixture {
         Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
         HostRuntime, Linearity,
     };
-    use ply_span::{Diagnostic, Symbol, codes};
+    use ply_eval::{Diagnostic, Symbol, codes};
     use std::sync::Arc;
 
     struct Never;

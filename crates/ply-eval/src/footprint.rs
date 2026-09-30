@@ -1,4 +1,6 @@
-use ply_span::Symbol;
+//! The effect model: the atoms a row is made of, and the closed row a definition publishes.
+
+use crate::Symbol;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 

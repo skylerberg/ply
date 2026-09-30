@@ -16,7 +16,7 @@ pub use lower::Blocker;
 use crate::sort::Sort;
 use crate::{Binder, Certificate, DEFAULT_PROVE_BUDGET, Rule, UNFOLD_DEPTH};
 use claims::Code;
-use ply_span::Symbol;
+use ply_eval::Symbol;
 use std::collections::BTreeSet;
 
 pub const SPLIT_DEPTH: u32 = 48;

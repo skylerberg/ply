@@ -1,12 +1,12 @@
 //! Discharging obligations, and the evidence they are filed and read back under.
 
+use ply_eval::DefHash;
 use ply_prove::{
     CaseReport, Certificate, Discharge, Evidence, Obligation, ProvePlan, ProveReport, Rule,
 };
 use ply_store::{
     CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule, Store,
 };
-use ply_ty::DefHash;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::time::Instant;

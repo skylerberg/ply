@@ -1,6 +1,5 @@
+use ply_eval::{ModuleName, Symbol, codes};
 use ply_machine::load::*;
-use ply_span::{Symbol, codes};
-use ply_ty::ModuleName;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -360,7 +359,7 @@ fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
         .warnings
         .iter()
         .filter(|d| d.code == codes::UNUSED_DEFINITION)
-        .inspect(|d| assert_eq!(d.severity, ply_span::Severity::Warning))
+        .inspect(|d| assert_eq!(d.severity, ply_eval::Severity::Warning))
         .map(|d| {
             let at = d.primary_span().expect("the name is labelled");
             (d.message.as_str(), loaded.sources.snippet(at).into_owned())

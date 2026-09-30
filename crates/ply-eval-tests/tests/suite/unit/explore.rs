@@ -4,9 +4,7 @@ use ply_eval::explore::*;
 use ply_eval::sched::{Stamp, happens_before};
 use ply_eval::sim::{Access, Domain, Stream};
 use ply_eval::sim::{Naive, Plan, Seed, StepFootprint, TaskId};
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Resource};
+use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, codes};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Enough of a scheduler to exercise the search, and none of the machine.

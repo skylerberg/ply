@@ -1,11 +1,10 @@
 //! The replacement `ply replace` writes: the one thing that command needs a host for. The text
 //! is read when the program asks for it and not before — from `--with`'s file, else from stdin.
 
-use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_eval::{Diagnostic, Span, Symbol, Value as PlyValue, codes};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

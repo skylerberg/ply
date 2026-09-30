@@ -16,10 +16,10 @@ pub struct SimOptions {
 /// already, so a bad value here is an internal error.
 pub fn sim_options_of(
     v: &ply_eval::Value,
-    span: ply_span::Span,
-) -> Result<SimOptions, ply_span::Diagnostic> {
+    span: ply_eval::Span,
+) -> Result<SimOptions, ply_eval::Diagnostic> {
     use crate::payload::{field_of, missing, opt_int_at, opt_str_at, option_of};
-    let int = |v: &ply_eval::Value, name: &str| -> Result<u64, ply_span::Diagnostic> {
+    let int = |v: &ply_eval::Value, name: &str| -> Result<u64, ply_eval::Diagnostic> {
         u64::try_from(field_of(v, name, span)?.as_int(span, name)?)
             .map_err(|_| missing("a natural", span))
     };

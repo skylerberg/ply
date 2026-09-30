@@ -113,7 +113,7 @@ fn same_named_definitions_in_two_modules_do_not_collide() {
         ),
     ]);
     let mut machine = compiled.machine();
-    let at = ply_span::Span::DUMMY;
+    let at = ply_eval::Span::DUMMY;
     assert_eq!(
         machine
             .call("alpha.wrapped", Vec::new(), at)
@@ -146,7 +146,7 @@ fn constructors_from_two_modules_are_distinct_values() {
         ),
     ]);
     let mut machine = compiled.machine();
-    let at = ply_span::Span::DUMMY;
+    let at = ply_eval::Span::DUMMY;
     assert_eq!(
         machine
             .call("beta.theirs", Vec::new(), at)

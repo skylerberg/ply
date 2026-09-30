@@ -2,15 +2,12 @@
 
 use crate::config::Configuration;
 use crate::payload::{count, diags_value, option, places_value, record, strings};
-use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
     HostRequest, HostResource, HostRow, HostRuntime, Linearity,
 };
+use ply_eval::{CheckOutput, Diagnostic, Footprint, SourceMap, Span, Symbol, Value as PlyValue};
 use ply_host::tls;
-use ply_span::{Diagnostic, SourceMap, Span, Symbol};
-use ply_ty::CheckOutput;
-use ply_ty::ty::Footprint;
 use serde_json::{Value, json};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -460,12 +457,12 @@ impl Observability {
             .iter()
             .filter(|row| row.effect.as_str() == ply_host::trace::EFFECT)
             .filter_map(|row| match &row.resource {
-                ply_ty::ty::Resource::Named(name) => Some(name.as_str().to_string()),
+                ply_eval::Resource::Named(name) => Some(name.as_str().to_string()),
                 // A host row names a resource or none: nothing holds a label a caller fills,
                 // and a binding that answers every label has no one name to list.
-                ply_ty::ty::Resource::Var(_)
-                | ply_ty::ty::Resource::Singleton
-                | ply_ty::ty::Resource::Every => None,
+                ply_eval::Resource::Var(_)
+                | ply_eval::Resource::Singleton
+                | ply_eval::Resource::Every => None,
             })
             .collect();
         channels.sort();
@@ -806,7 +803,7 @@ impl Assembled {
                 String::new(),
                 vec![
                     Diagnostic::error(
-                        ply_span::codes::INTERNAL_ERROR,
+                        ply_eval::codes::INTERNAL_ERROR,
                         "the CLI handed no front end over, and this side runs none",
                     )
                     .note(
@@ -976,10 +973,10 @@ fn row_value(row: &HostRow) -> PlyValue {
         (
             "resource",
             option(match &row.resource {
-                ply_ty::ty::Resource::Named(name) => Some(PlyValue::str(name.as_str())),
-                ply_ty::ty::Resource::Var(_)
-                | ply_ty::ty::Resource::Singleton
-                | ply_ty::ty::Resource::Every => None,
+                ply_eval::Resource::Named(name) => Some(PlyValue::str(name.as_str())),
+                ply_eval::Resource::Var(_)
+                | ply_eval::Resource::Singleton
+                | ply_eval::Resource::Every => None,
             }),
         ),
         ("triple", PlyValue::str(row.to_string())),
@@ -1127,7 +1124,7 @@ fn shutdown_value(shutdown: &Shutdown) -> PlyValue {
 #[cold]
 fn unregistered(op: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
-        ply_span::codes::INTERNAL_ERROR,
+        ply_eval::codes::INTERNAL_ERROR,
         format!("`{EFFECT}.{op}` reached the binding, and nothing here serves it"),
     )
     .primary(span, "this perform reached `ply hosts`")

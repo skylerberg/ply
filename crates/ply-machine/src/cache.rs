@@ -30,17 +30,15 @@ pub struct InspectOptions {
 }
 use crate::hosts::Lent;
 use crate::payload::{count, ctor, diags_value, field_of, option, record};
-use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_eval::{DefHash, Diagnostic, Span, Symbol, Value as PlyValue, codes};
 use ply_store::{
     BODY_ENCODING, CacheStats, Compaction, ContentHash, DefBody, DefEntry, DefKind,
     FRONTEND_VERSION, FileSpan, Found, FoundDef, FoundTest, Member, Outcome, PROVER_VERSION,
     RUNTIME_VERSION, Slot, SourceFingerprint, Store, TestEntry,
 };
-use ply_ty::DefHash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -915,7 +913,7 @@ fn locate(store: &Store, path: &Path, span: FileSpan) -> (Option<String>, bool) 
     if !unchanged || span.start as usize > text.len() {
         return (None, true);
     }
-    let mut sources = ply_span::SourceMap::new();
+    let mut sources = ply_eval::SourceMap::new();
     let id = sources.add(path, text);
     let Some(file) = sources.get(id) else {
         return (None, true);

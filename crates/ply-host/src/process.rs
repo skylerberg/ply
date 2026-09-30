@@ -9,11 +9,9 @@ use crate::pool::{Bell, Done, Exit, PROCESS_FIRST_TOKEN, Pool};
 use children::{Child, Launch, Refusal, Unusable};
 use ply_eval::host::HostRegistry;
 use ply_eval::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime,
-    Linearity, Pending, Value,
+    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
+    HostRuntime, Linearity, Pending, Resource, Span, Symbol, Value, codes,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::Resource;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::ops::RangeInclusive;
@@ -845,7 +843,7 @@ fn run_to_end(
 pub fn unbound(op: Op, at: &Resource, span: Span) -> Diagnostic {
     let label = match at {
         Resource::Named(name) => name.as_str().to_string(),
-        Resource::Var(v) => ply_ty::label_var_name(*v),
+        Resource::Var(v) => ply_eval::label_var_name(*v),
         Resource::Singleton => "the singleton resource".to_string(),
         Resource::Every => "every label".to_string(),
     };
