@@ -6,7 +6,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Diagnostic, SECRET_REDACTED, Symbol, Value, codes, constant_time_eq, values_equal};
+use ply_eval::{Diagnostic, Plain, Symbol, Value, codes, constant_time_eq, values_equal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,7 +30,7 @@ fn fails(source: &str) -> Diagnostic {
 }
 
 #[test]
-fn a_secret_renders_redacted_whatever_it_holds() {
+fn a_secret_is_copied_out_with_no_payload_whatever_it_holds() {
     for payload in [
         Value::str("hunter2"),
         Value::str(""),
@@ -39,24 +39,28 @@ fn a_secret_renders_redacted_whatever_it_holds() {
         Value::list(vec![Value::str("a"), Value::str("b")]),
     ] {
         let secret = Value::secret(payload);
-        assert_eq!(secret.render(), SECRET_REDACTED);
-        assert_eq!(format!("{secret}"), SECRET_REDACTED);
-        assert_eq!(format!("{secret:?}"), SECRET_REDACTED);
-        assert!(!secret.render().contains("hunter2"));
+        assert_eq!(Plain::of(&secret), Plain::Secret);
+        assert_eq!(Plain::shown(&secret), Plain::Secret);
+        assert!(!format!("{secret:?}").contains("hunter2"));
     }
 }
 
 #[test]
-fn a_nested_secret_renders_redacted() {
+fn a_nested_secret_is_copied_out_with_no_payload() {
     let inner = Value::secret(Value::str("hunter2"));
-    let rendered = Value::list(vec![
+    let outer = Value::list(vec![
         Value::ctor("Some", vec![inner.clone()]),
         Value::map([(Value::str("password"), inner.clone())]),
         inner,
-    ])
-    .render();
-    assert!(!rendered.contains("hunter2"), "{rendered}");
-    assert_eq!(rendered.matches(SECRET_REDACTED).count(), 3, "{rendered}");
+    ]);
+    assert_eq!(
+        Plain::of(&outer),
+        Plain::List(vec![
+            Plain::Ctor("Some".to_string(), vec![Plain::Secret]),
+            Plain::Map(vec![(Plain::Str("password".to_string()), Plain::Secret)]),
+            Plain::Secret,
+        ])
+    );
 }
 
 #[test]
@@ -73,7 +77,10 @@ test "two logins differ" {
     let text = format!("{d:#?}");
     assert!(!text.contains("hunter2"), "{text}");
     assert!(!text.contains("correct-horse"), "{text}");
-    assert!(text.contains(SECRET_REDACTED), "{text}");
+    assert!(
+        d.values.iter().any(|v| format!("{v:?}").contains("Secret")),
+        "{text}"
+    );
 }
 
 /// `type_error` interpolates the offending value, so this is a route the redaction has to cover.
@@ -242,7 +249,7 @@ test/nondet "nothing sensitive goes out" {
 #[derive(Default)]
 struct Counter {
     calls: AtomicU64,
-    seen: std::sync::Mutex<Vec<String>>,
+    seen: std::sync::Mutex<Vec<Plain>>,
 }
 
 impl HostHandler for Counter {
@@ -251,7 +258,7 @@ impl HostHandler for Counter {
         self.seen
             .lock()
             .unwrap()
-            .extend(req.args.iter().map(Value::render));
+            .extend(req.args.iter().map(Plain::of));
         Ok(HostAnswer::Value(Value::Int(1)))
     }
 }
@@ -320,8 +327,8 @@ fn an_operation_that_declares_secrets_receives_one() {
 
     machine.eval_test(0).expect("the handler answers");
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
-    // Even there, the value still refuses to render itself.
-    assert_eq!(handler.seen.lock().unwrap().as_slice(), [SECRET_REDACTED]);
+    // Even there, the value still refuses to be copied out.
+    assert_eq!(handler.seen.lock().unwrap().as_slice(), [Plain::Secret]);
 }
 
 #[test]

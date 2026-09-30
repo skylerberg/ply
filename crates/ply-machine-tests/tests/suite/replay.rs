@@ -12,6 +12,8 @@ use std::sync::Arc;
 /// The re-run program. Every operation of the effect is declared, as the run that binds it
 /// requires, and `Point` is the shape `claims.ply` reads.
 const REPLAY: &str = r#"
+import std.value (Value, render)
+
 nondet effect prover {
   write configure[claims](options: Options, front: Front, world: World) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
@@ -90,7 +92,7 @@ type Collection = Unit
 type Verdicts = Unit
 type Baseline = Unit
 type Accepted = Unit
-type Binding = { name: String, ty: String, rendered: String }
+type Binding = { name: String, ty: String, value: Value }
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
@@ -117,7 +119,7 @@ fn nothing() -> Answer = { falsified: 0, kept: 0, rejected: 0, first: "" }
 
 fn drawn(bs: List<Binding>) -> String =
   fold(bs, "", |acc: String, b: Binding|
-    if acc == "" { b.rendered } else { acc ++ ", " ++ b.rendered })
+    if acc == "" { render(b.value) } else { acc ++ ", " ++ render(b.value) })
 
 fn scan(index: Int, case: Int, seen: Answer) -> Answer / {prover.replay[claims]} =
   if case >= cases() { seen } else {
@@ -232,15 +234,15 @@ fn field(answer: &Value, name: &str) -> Value {
             .iter()
             .find(|(key, _)| key.as_str() == name)
             .map(|(_, value)| value.clone())
-            .unwrap_or_else(|| panic!("the answer carries `{name}`: {answer}")),
-        other => panic!("the answer is a record, not {other}"),
+            .unwrap_or_else(|| panic!("the answer carries `{name}`: {answer:?}")),
+        other => panic!("the answer is a record, not {other:?}"),
     }
 }
 
 fn int(answer: &Value, name: &str) -> i64 {
     match field(answer, name) {
         Value::Int(n) => n,
-        other => panic!("`{name}` is an int, not {other}"),
+        other => panic!("`{name}` is an int, not {other:?}"),
     }
 }
 
@@ -249,12 +251,12 @@ fn a_replayed_case_comes_back_as_the_value_that_falsifies_the_claim() {
     let answer = one_run(A_FALSE_LAW, 0).expect("the run finished");
     assert!(
         int(&answer, "falsified") > 0,
-        "no draw falsified a law that does not hold: {answer}"
+        "no draw falsified a law that does not hold: {answer:?}"
     );
     let first = field(&answer, "first");
     let drawn = match &first {
         Value::Str(text) => text.to_string(),
-        other => panic!("the first falsifying point is a string, not {other}"),
+        other => panic!("the first falsifying point is a string, not {other:?}"),
     };
     // Independently of the prover: the value the point drew really does break the law.
     let n: i64 = drawn.parse().unwrap_or_else(|e| {

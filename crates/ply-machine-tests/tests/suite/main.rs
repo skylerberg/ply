@@ -21,6 +21,8 @@ use std::sync::Arc;
 /// The outer program: load the root it is handed, bind and enter `inner.main`, answer with how
 /// that ended. The effect, and the record shapes crossing it, are the program's own declarations.
 const OUTER: &str = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -34,8 +36,20 @@ nondet effect machine {
 }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+type Fix = { title: Bytes, edits: List<Edit> }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+type Raised = { diag: Diag, values: List<Value> }
 
 type Options = { host: Bool, trace: TraceOpts }
 type TraceOpts = { sink: String, level: String }
@@ -324,6 +338,8 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
 /// A load, a bound entry, then a reload after the tree moved: the second answer is the new
 /// program's.
 const OUTER_TWICE: &str = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -337,8 +353,20 @@ nondet effect machine {
 }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+type Fix = { title: Bytes, edits: List<Edit> }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+type Raised = { diag: Diag, values: List<Value> }
 
 type Options = { host: Bool, trace: TraceOpts }
 type TraceOpts = { sink: String, level: String }
@@ -469,6 +497,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
 #[test]
 fn a_configured_machine_binds_what_the_options_say() {
     let outer = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -483,8 +513,20 @@ nondet effect machine {
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+type Fix = { title: Bytes, edits: List<Edit> }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+type Raised = { diag: Diag, values: List<Value> }
 
 type TlsCred = { name: String, cert: String, key: String }
 type Named = { name: String, path: String }
@@ -649,7 +691,7 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
             Span::DUMMY,
         )
         .expect("the outer main ran");
-    assert_eq!(answer.to_string(), "true", "the configured host bound");
+    assert_eq!(answer, Value::Bool(true), "the configured host bound");
 }
 
 // --- `machine.call` ----------------------------------------------------------
@@ -658,6 +700,8 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
 /// with one argument. The machine module here is `m`, so the values it is handed are `m.VInt`
 /// and the like.
 const OUTER_CALL: &str = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -686,8 +730,20 @@ type Front = {
 }
 type Refusal = Unit
 type Ended = Unit
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+type Fix = { title: Bytes, edits: List<Edit> }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+type Raised = { diag: Diag, values: List<Value> }
 type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
 fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
@@ -703,7 +759,7 @@ fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[
         match doubled {
           Ok(v) -> match v {
             VInt(i) -> match raised {
-              Err(r) -> if string_contains(r.message, "oh no") {
+              Err(r) -> if bytes_index_of(r.diag.message, b"oh no") != None {
                 { value: i, steps: first.steps, reset: again.steps, raised_steps: after_raised.steps }
               } else { { value: 0 - 4, steps: 0, reset: 0, raised_steps: 0 } },
               Ok(_) -> { value: 0 - 3, steps: 0, reset: 0, raised_steps: 0 },
@@ -739,13 +795,12 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
-    ply_machine::register_with_for(
+    ply_machine::register_with(
         &mut registry,
         ply_machine::drive::RunOptions {
             host: false,
             ..Default::default()
         },
-        "m",
     );
     let binding = registry.bind(&front.check).expect("the machine ops bind");
     machine.set_host_binding(Arc::new(binding));
@@ -760,7 +815,7 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
         )
         .expect("the outer main ran");
     let Value::Record(fields) = &answer else {
-        panic!("the outer program answers a record, not {answer}");
+        panic!("the outer program answers a record, not {answer:?}");
     };
     let field = |name: &str| {
         fields
@@ -774,7 +829,7 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
     let Value::Int(steps) = field("steps") else {
         panic!("steps is an int");
     };
-    assert!(*steps > 0, "the call's steps were not counted: {answer}");
+    assert!(*steps > 0, "the call's steps were not counted: {answer:?}");
     assert_eq!(
         field("reset"),
         &Value::Int(0),
@@ -786,13 +841,15 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
     };
     assert!(
         *raised_steps > 0,
-        "the raising call's steps were not counted: {answer}"
+        "the raising call's steps were not counted: {answer:?}"
     );
 }
 
 /// The outer program: call the constant `inner.constant` twice, reading the accounting after
 /// each; its twin twice under one read; then a name the inner program never defined.
 const OUTER_TOTAL: &str = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -821,8 +878,20 @@ type Front = {
 }
 type Refusal = Unit
 type Ended = Unit
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+type Fix = { title: Bytes, edits: List<Edit> }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+type Raised = { diag: Diag, values: List<Value> }
 type Spent = { answers: List<Int>, ran: Int, remembered: Int, both: Int, declined: Int }
 
 fn spent() -> Int / {machine.accounting[m]} = (machine.accounting[m]()).steps
@@ -876,11 +945,7 @@ fn a_memo_answer_and_a_decline_add_no_steps_to_the_accounting() {
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
-    ply_machine::register_with_for(
-        &mut registry,
-        ply_machine::drive::RunOptions::default(),
-        "m",
-    );
+    ply_machine::register_with(&mut registry, ply_machine::drive::RunOptions::default());
     let binding = registry.bind(&front.check).expect("the machine ops bind");
     machine.set_host_binding(Arc::new(binding));
     let answer = machine
@@ -896,32 +961,35 @@ fn a_memo_answer_and_a_decline_add_no_steps_to_the_accounting() {
     let int = |value: &Value| {
         value
             .as_int(Span::DUMMY, "a count")
-            .unwrap_or_else(|d| panic!("{d}: {answer}"))
+            .unwrap_or_else(|d| panic!("{d}: {answer:?}"))
     };
     let Value::List(answers) = field(&answer, "answers") else {
-        panic!("the answers are a list: {answer}");
+        panic!("the answers are a list: {answer:?}");
     };
     // `inner.absent` is declined, which the machine answers as a raise.
     assert_eq!(
         answers.iter().map(int).collect::<Vec<_>>(),
         [50, 50, 50, 50, -1],
-        "{answer}"
+        "{answer:?}"
     );
     let ran = int(field(&answer, "ran"));
-    assert!(ran > 0, "the first call's steps were not counted: {answer}");
+    assert!(
+        ran > 0,
+        "the first call's steps were not counted: {answer:?}"
+    );
     assert_eq!(
         int(field(&answer, "remembered")),
         0,
-        "the memo's answer added the call before it to the accounting: {answer}"
+        "the memo's answer added the call before it to the accounting: {answer:?}"
     );
     assert_eq!(
         int(field(&answer, "both")),
         ran,
-        "a run and the memo's answer after it were totalled as two runs: {answer}"
+        "a run and the memo's answer after it were totalled as two runs: {answer:?}"
     );
     assert_eq!(
         int(field(&answer, "declined")),
         0,
-        "the declined call added the call before it to the accounting: {answer}"
+        "the declined call added the call before it to the accounting: {answer:?}"
     );
 }

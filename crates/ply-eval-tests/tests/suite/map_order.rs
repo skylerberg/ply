@@ -1,7 +1,7 @@
 // `Value`'s `Arc` payloads are deliberately not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_eval::{Map, Span, Value, values_equal};
+use ply_eval::{Map, PathStep, Plain, Span, Value, values_equal};
 use rust_decimal::Decimal;
 use std::cmp::Ordering;
 use std::process::Command;
@@ -34,7 +34,13 @@ fn keys(m: &Value) -> Vec<String> {
     let Value::Map(m) = m else {
         panic!("not a map")
     };
-    m.keys().map(|k| k.render()).collect()
+    m.keys().map(shape).collect()
+}
+
+/// A value's structure, scale and all, as the tests spell it; a reader is shown one by
+/// `std.value.render`.
+fn shape(v: &Value) -> String {
+    format!("{:?}", Plain::of(v))
 }
 
 fn map_of(pairs: Vec<(Value, Value)>) -> Value {
@@ -54,7 +60,7 @@ fn iteration_is_ascending_under_every_insertion_order() {
         let mut sorted = base.clone();
         sorted.sort();
         sorted.dedup();
-        sorted.iter().map(|k| k.render()).collect::<Vec<_>>()
+        sorted.iter().map(shape).collect::<Vec<_>>()
     };
 
     let mut rng = Rng(0x5eed_1234_9abc_def1);
@@ -86,7 +92,7 @@ fn two_insertion_orders_build_one_value() {
         (Value::Int(1), Value::str("a")),
     ]);
     assert!(eq(&forward, &backward));
-    assert_eq!(forward.render(), backward.render());
+    assert_eq!(shape(&forward), shape(&backward));
     assert_eq!(forward.cmp(&backward), Ordering::Equal);
 }
 
@@ -100,7 +106,7 @@ fn the_iteration_order_is_pinned() {
         pairs.push((Value::bytes([(i % 251) as u8, 7]), Value::Bool(i % 2 == 0)));
     }
     rng.shuffle(&mut pairs);
-    let rendered = map_of(pairs).render();
+    let rendered = shape(&map_of(pairs));
     assert_eq!(
         blake3::hash(rendered.as_bytes()).to_hex().as_str(),
         "d95a132e0e9c2537b40decf812619093cb2c4f98fcad839380bf556fa43dcab7",
@@ -148,8 +154,8 @@ fn the_order_and_the_language_agree_except_on_float() {
                 assert!(
                     matches!(a, Value::Closure(_)) || matches!(b, Value::Closure(_)),
                     "{} vs {} refused comparison",
-                    a.render(),
-                    b.render()
+                    shape(a),
+                    shape(b)
                 );
                 continue;
             };
@@ -159,8 +165,8 @@ fn the_order_and_the_language_agree_except_on_float() {
             assert!(
                 float_peculiarity(a, b),
                 "`cmp` and `values_equal` disagree on {} vs {}: {ordered} and {equal}",
-                a.render(),
-                b.render()
+                shape(a),
+                shape(b)
             );
         }
     }
@@ -256,15 +262,15 @@ fn the_order_is_total() {
             a.cmp(a),
             Ordering::Equal,
             "{} is not equal to itself",
-            a.render()
+            shape(a)
         );
         for b in &values {
             assert_eq!(
                 a.cmp(b),
                 b.cmp(a).reverse(),
                 "{} and {} are not antisymmetric",
-                a.render(),
-                b.render()
+                shape(a),
+                shape(b)
             );
             for c in &values {
                 if a.cmp(b) != Ordering::Greater && b.cmp(c) != Ordering::Greater {
@@ -272,9 +278,9 @@ fn the_order_is_total() {
                         a.cmp(c),
                         Ordering::Greater,
                         "transitivity fails at {} {} {}",
-                        a.render(),
-                        b.render(),
-                        c.render()
+                        shape(a),
+                        shape(b),
+                        shape(c)
                     );
                 }
             }
@@ -288,8 +294,8 @@ fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
         (dec("1.50"), Value::str("first")),
         (dec("1.5"), Value::str("second")),
     ]);
-    assert_eq!(keys(&m), vec!["1.5"]);
-    assert_eq!(m.render(), "{1.5: \"second\"}");
+    assert_eq!(keys(&m), vec!["Decimal(1.5)"]);
+    assert_eq!(shape(&m), "Map([(Decimal(1.5), Str(\"second\"))])");
 
     let other = map_of(vec![
         (dec("1.5"), Value::str("first")),
@@ -297,17 +303,17 @@ fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
     ]);
     assert_eq!(
         keys(&other),
-        vec!["1.5"],
+        vec!["Decimal(1.5)"],
         "the surviving key is still a function of which spelling was written last"
     );
-    assert_eq!(other.render(), "{1.5: \"second\"}");
+    assert_eq!(shape(&other), "Map([(Decimal(1.5), Str(\"second\"))])");
     assert!(
         eq(&m, &other),
         "two maps that hold one key and one value are not equal"
     );
     assert_eq!(
-        m.render(),
-        other.render(),
+        shape(&m),
+        shape(&other),
         "two `==`-equal maps render as two different strings, so `map_keys`, `map_entries`, \
          `map_fold` and every derived encoding over them are functions of insertion history"
     );
@@ -325,18 +331,22 @@ fn a_decimal_anywhere_under_a_key_is_canonical() {
         (
             Value::list(vec![dec("1.50")]),
             Value::list(vec![dec("1.5")]),
-            "[1.5]",
+            "List([Decimal(1.5)])",
         ),
-        (field("1.50"), field("1.5"), "{price: 1.5}"),
+        (
+            field("1.50"),
+            field("1.5"),
+            "Record([(\"price\", Decimal(1.5))])",
+        ),
         (
             Value::ctor("Box", vec![dec("2.00")]),
             Value::ctor("Box", vec![dec("2")]),
-            "Box(2)",
+            "Ctor(\"Box\", [Decimal(2)])",
         ),
         (
             map_of(vec![(dec("1.50"), dec("3.10"))]),
             map_of(vec![(dec("1.5"), dec("3.1"))]),
-            "{1.5: 3.1}",
+            "Map([(Decimal(1.5), Decimal(3.1))])",
         ),
     ];
     for (written, canonical, rendered) in cases {
@@ -347,8 +357,8 @@ fn a_decimal_anywhere_under_a_key_is_canonical() {
         assert!(
             eq(&a, &b),
             "{} and {} are not one map",
-            written.render(),
-            canonical.render()
+            shape(&written),
+            shape(&canonical)
         );
     }
 }
@@ -380,7 +390,10 @@ fn a_map_is_itself_an_ordered_key() {
         (inner_b.clone(), Value::str("b")),
         (inner_a.clone(), Value::str("a")),
     ]);
-    assert_eq!(keys(&outer), vec!["{1: 1}", "{1: 2}"]);
+    assert_eq!(
+        keys(&outer),
+        vec!["Map([(Int(1), Int(1))])", "Map([(Int(1), Int(2))])"]
+    );
 }
 
 #[test]
@@ -404,11 +417,14 @@ fn a_failing_comparison_locates_the_entry_that_differs() {
         (Value::str("y"), Value::Int(9)),
         (Value::str("x"), Value::Int(1)),
     ]);
-    let (path, expected, actual) =
-        ply_eval::first_difference(&a, &b).expect("the two differ at one entry");
-    assert_eq!(path, "[\"y\"]");
-    assert_eq!(expected, "9");
-    assert_eq!(actual, "2");
+    let d = ply_eval::first_difference(&a, &b).expect("the two differ at one entry");
+    assert!(
+        matches!(d.path.as_slice(), [PathStep::Key(k)] if *k == Value::str("y")),
+        "{:?}",
+        d.path
+    );
+    assert_eq!(d.expected, Value::Int(9));
+    assert_eq!(d.actual, Value::Int(2));
 
     // Different key sets have no entry to blame, so the pair is reported whole.
     let c = map_of(vec![(Value::str("x"), Value::Int(1))]);

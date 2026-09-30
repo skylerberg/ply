@@ -1,10 +1,11 @@
 //! Fixed-width integers, with the arithmetic the value model checks them with.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A fixed-width integer type; `Int` is not one. Arithmetic is checked unless `wrap_*` is used.
 /// The 128-bit widths come last, so each narrower width keeps its number in every format.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum IntTy {
     U8,
     U16,

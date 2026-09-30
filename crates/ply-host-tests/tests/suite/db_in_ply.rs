@@ -266,10 +266,10 @@ fn call_outcome(entry: &str, url: &str) -> Result<Value, ply_eval::Diagnostic> {
 fn call(entry: &str, url: &str) -> Result<String, String> {
     let answered = call_outcome(entry, url).unwrap_or_else(|e| panic!("the call answers: {e}"));
     let Value::Ctor { name, args } = &answered else {
-        panic!("the entry answered {answered}, not an `Ok` or an `Err`");
+        panic!("the entry answered {answered:?}, not an `Ok` or an `Err`");
     };
     let Value::Str(text) = &args[0] else {
-        panic!("the entry carried {answered}, not text");
+        panic!("the entry carried {answered:?}, not text");
     };
     match name.as_str() {
         "Ok" => Ok(text.to_string()),
@@ -281,7 +281,7 @@ fn call(entry: &str, url: &str) -> Result<String, String> {
 /// Why the entry would not run, for the refusals that are the driver's rather than the server's.
 fn call_err(entry: &str, url: &str) -> String {
     match call_outcome(entry, url) {
-        Ok(other) => panic!("the call answered {other}, not a refusal"),
+        Ok(other) => panic!("the call answered {other:?}, not a refusal"),
         Err(why) => format!("{why}"),
     }
 }

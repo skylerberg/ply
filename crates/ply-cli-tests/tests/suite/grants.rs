@@ -3,9 +3,10 @@
 use crate::harness::{ply, project};
 use tempfile::TempDir;
 
-/// The outer program: declare `machine`, and drive one. The nested program's module is named
-/// `machine`, so the values it hands back carry that module's constructors.
+/// The outer program: declare `machine`, and drive one; the values it hands back are `std.value`'s.
 const OUTER: &str = "\
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -34,8 +35,20 @@ type Bound = Unit
 type Refusal = Unit
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Accounting = { steps: Int, micros: Int, counters: Counters }
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+type Fix = { title: Bytes, edits: List<Edit> }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+type Raised = { diag: Diag, values: List<Value> }
 
 fn main() -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
   match machine.load[m](\"inner\", None, None) {
