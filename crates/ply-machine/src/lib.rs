@@ -4,9 +4,10 @@
 //! evaluate bodies, `build` enters the emitter. A compiled body entered while another entry holds
 //! the thread is declined, so the machine these operations drive lives on a thread of its own per
 //! resource label, parked on a channel between operations: `load[m]` opens the target rooted at a
-//! path (`reload[m]` asks again), `bound[m]` binds the hosts the named entry may reach and
-//! answers the disclosure, `enter[m]` runs it and answers how it ended, `drop[m]` lets the thread
-//! go. The run flow itself — targets, bindings, teardown — is `crate::drive`.
+//! path (`reload[m]` asks again, and `reuse[m]` opens it over the front end an earlier run filed),
+//! `bound[m]` binds the hosts the named entry may reach and answers the disclosure, `enter[m]`
+//! runs it and answers how it ended, `drop[m]` lets the thread go. The run flow itself —
+//! targets, bindings, teardown — is `crate::drive`.
 
 pub mod artifact;
 pub mod bootstrap;
@@ -26,6 +27,7 @@ pub mod mutate;
 pub mod options;
 pub mod payload;
 pub mod policy;
+pub mod reused;
 pub mod shelf;
 pub mod simulation;
 pub mod support;
@@ -44,13 +46,14 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
-/// The effect a program declares to drive a machine: `machine.load[m](..)`, `machine.bound[m](..)`,
-/// `machine.enter[m]()`, `machine.reload[m]()`, `machine.drop[m]()`.
+/// The effect a program declares to drive a machine: `machine.load[m](..)`, `machine.reuse[m](..)`,
+/// `machine.bound[m](..)`, `machine.enter[m]()`, `machine.reload[m]()`, `machine.drop[m]()`.
 pub const EFFECT: &str = "machine";
 
-const OPERATIONS: [(&str, &str); 8] = [
+const OPERATIONS: [(&str, &str); 9] = [
     ("configure", "ply_machine::configure"),
     ("load", "ply_machine::load"),
+    ("reuse", "ply_machine::reuse"),
     ("reload", "ply_machine::reload"),
     ("bound", "ply_machine::bound"),
     ("enter", "ply_machine::enter"),
@@ -202,7 +205,8 @@ impl HostHandler for Site {
         let label = label_of(req, span)?;
         let value = match (req.op.op.as_str(), req.args) {
             ("configure", [options]) => self.configure(&label, options, span)?,
-            ("load", [root, front]) => self.load(&label, root, front, span)?,
+            ("load", [root, front, keep]) => self.load(&label, root, front, keep, span)?,
+            ("reuse", [root, walked]) => self.reuse(&label, root, walked, span)?,
             ("reload", [front]) => {
                 let front = Box::new(crate::driver::handed_front_of(front, span)?);
                 let answer: Result<drive::FoundData, drive::Refused> =
@@ -294,18 +298,123 @@ impl Site {
         Ok(Value::Unit)
     }
 
+    /// `keep` is the key the front is filed under once the load holds, for a later run of the same
+    /// closure to take in place of its front end.
     fn load(
         &self,
         label: &str,
         root: &Value,
         front: &Value,
+        keep: &Value,
         span: Span,
     ) -> Result<Value, Diagnostic> {
         let root = root.as_str(span, "the program's root")?.to_string();
         // `None` is a program loading a program of its own, at a root it chose while running.
-        let front = crate::payload::option_of(front, "a front end", span)?
+        let handed = crate::payload::option_of(front, "a front end", span)?;
+        let front = handed
             .map(|front| crate::driver::handed_front_of(front, span))
             .transpose()?;
+        let keep = crate::payload::option_of(keep, "a key", span)?
+            .map(|key| key.as_str(span, "a key"))
+            .transpose()?;
+        // Taken before the front leaves for the machine's thread; the dump stays here as it came.
+        let kept = keep.zip(front.as_ref()).map(|(key, front)| {
+            let placed: Vec<(String, String)> = front
+                .files
+                .iter()
+                .map(|f| (f.path.clone(), f.name.clone()))
+                .collect();
+            (key, placed)
+        });
+        let mut options = self.taken(label);
+        options.front = front;
+        let found = self.open(label, root, options, span)?;
+        if let (Ok(drive::FoundData::Project { .. }), Some((key, placed)), Some(handed)) =
+            (&found, kept, handed)
+        {
+            crate::reused::file(
+                key,
+                &placed,
+                crate::payload::field_of(handed, "dump", span)?,
+            );
+        }
+        Ok(match found {
+            Ok(found) => ok(drive::found_value(&found)),
+            Err(refused) => refused_value(&refused),
+        })
+    }
+
+    /// The load an earlier run filed under the walk's key, over this run's own files, or `None`
+    /// when nothing readable is filed there: then the label is left as it was, configuration and
+    /// all, for the load the caller makes over a front end of its own.
+    fn reuse(
+        &self,
+        label: &str,
+        root: &Value,
+        walked: &Value,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        use crate::payload::field_of;
+        let root = root.as_str(span, "the program's root")?.to_string();
+        let key = field_of(walked, "key", span)?.as_str(span, "a key")?;
+        let files = |name: &str| -> Result<Vec<reused::Walked>, Diagnostic> {
+            field_of(walked, name, span)?
+                .as_list(span, name)?
+                .iter()
+                .map(|file| {
+                    Ok(reused::Walked {
+                        path: field_of(file, "path", span)?
+                            .as_str(span, "a path")?
+                            .to_string(),
+                        text: String::from_utf8_lossy(
+                            field_of(file, "text", span)?.as_bytes(span, "a text")?,
+                        )
+                        .into_owned(),
+                    })
+                })
+                .collect()
+        };
+        let Some((front, entry)) = reused::front(key, files("modules")?, files("manifests")?)
+        else {
+            return Ok(payload::option(None));
+        };
+        let mut options = self
+            .configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(label)
+            .cloned()
+            .unwrap_or_else(|| self.options.clone());
+        options.front = Some(front);
+        match self.open(label, root, options, span)? {
+            Ok(found) => {
+                // A load that opens consumes its label's configuration.
+                self.taken(label);
+                ply_codegen::c::sweep::used(&entry);
+                Ok(payload::option(Some(drive::found_value(&found))))
+            }
+            Err(_) => Ok(payload::option(None)),
+        }
+    }
+
+    /// What the label was configured with, taken for the load that uses it.
+    fn taken(&self, label: &str) -> drive::RunOptions {
+        self.configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(label)
+            .unwrap_or_else(|| self.options.clone())
+    }
+
+    /// The target at `root` opened on a thread of its own, and parked there under `label` when it
+    /// opens.
+    fn open(
+        &self,
+        label: &str,
+        root: String,
+        options: drive::RunOptions,
+        span: Span,
+    ) -> Result<Result<drive::FoundData, drive::Refused>, Diagnostic> {
         if self
             .labels
             .lock()
@@ -320,27 +429,17 @@ impl Site {
         }
         let (reply, answered) = mpsc::channel();
         let (go, hearing) = mpsc::channel();
-        let mut options = self
-            .configured
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(label)
-            .unwrap_or_else(|| self.options.clone());
-        options.front = front;
         let path = PathBuf::from(root);
         let thread = std::thread::Builder::new()
             .name(format!("machine-{label}"))
             .stack_size(STACK)
             .spawn(move || serve(options, path, reply, hearing))
             .map_err(|e| unspawned(label, &e))?;
-        let value = match answered.recv().map_err(|_| unanswered(label))? {
-            Ok(found) => ok(drive::found_value(&found)),
-            Err(refused) => refused_value(&refused),
-        };
-        if !matches_open(&value) {
+        let found = answered.recv().map_err(|_| unanswered(label))?;
+        if found.is_err() {
             // The target refused: the thread has already said what it had to and is done.
             let _ = thread.join();
-            return Ok(value);
+            return Ok(found);
         }
         self.labels
             .lock()
@@ -352,7 +451,7 @@ impl Site {
                     thread: Some(thread),
                 },
             );
-        Ok(value)
+        Ok(found)
     }
 
     /// One round trip to the machine's thread: send the step, wait for the answer it sends back.
@@ -389,11 +488,6 @@ impl Site {
         }
         Value::Unit
     }
-}
-
-// A refusal crosses as `Err(..)`; a load that refused parked no machine.
-fn matches_open(value: &Value) -> bool {
-    matches!(value, Value::Ctor { name, .. } if name.as_str() == "Ok")
 }
 
 fn unspawned(label: &str, e: &std::io::Error) -> Diagnostic {
