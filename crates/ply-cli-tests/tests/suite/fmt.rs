@@ -93,6 +93,105 @@ fn a_file_that_does_not_parse_exits_two_and_is_left_alone() {
     assert_eq!(v["errors"][0]["path"], "m.ply");
 }
 
+#[test]
+fn a_directory_outside_the_working_directory_is_checked_and_formatted_where_it_is() {
+    let project = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let file = project.path().join("sub/m.ply");
+    std::fs::create_dir(project.path().join("sub")).unwrap();
+    std::fs::write(&file, UNFORMATTED).unwrap();
+    let shown = file.display().to_string();
+
+    let out = ply(elsewhere.path())
+        .args(["fmt", "--check"])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("would format {shown}\n")
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), UNFORMATTED);
+
+    let out = ply(elsewhere.path())
+        .arg("fmt")
+        .arg(project.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("formatted {shown}\n")
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), FORMATTED);
+
+    let out = ply(elsewhere.path())
+        .args(["fmt", "--check", "--json"])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["files"][0]["path"], shown.as_str());
+    assert_eq!(v["files"][0]["changed"], false);
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn a_file_that_cannot_be_read_fails_the_check_and_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("m.ply"), FORMATTED).unwrap();
+    let locked = dir.path().join("locked.ply");
+    std::fs::write(&locked, UNFORMATTED).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(
+        std::fs::read(&locked).is_err(),
+        "the test needs a file this user cannot read"
+    );
+
+    let out = ply(dir.path()).args(["fmt", "--check"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("error: locked.ply: could not read"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+
+    let out = ply(dir.path())
+        .args(["fmt", "--check", "--json"])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["exit_code"], 2);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["errors"][0]["path"], "locked.ply");
+    assert_eq!(v["errors"][0]["error"], "could not read");
+
+    let out = ply(dir.path()).arg("fmt").output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("error: locked.ply: could not read"),
+        "{stderr}"
+    );
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(std::fs::read_to_string(&locked).unwrap(), UNFORMATTED);
+}
+
 /// The diagnostic codes `ply check` reports for `dir`, sorted; what formatting must not change.
 fn check_codes(dir: &Path, target: &str) -> Vec<String> {
     let out = ply(dir).args(["check", target, "--json"]).output().unwrap();
