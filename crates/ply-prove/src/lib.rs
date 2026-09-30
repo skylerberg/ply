@@ -123,15 +123,15 @@ impl Evidence {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Binding {
     pub name: Symbol,
     /// The binder's type as the compiler prints it.
     pub ty: String,
-    pub rendered: String,
+    pub value: ply_eval::Plain,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Counterexample {
     pub bindings: Vec<Binding>,
     pub original: Vec<Binding>,

@@ -391,17 +391,21 @@ impl Reader<'_> {
                 })
             })?,
             notes: strings(d.field("notes_text")?)?,
-            fixes: d.field("fixes")?.items(|f| {
-                Ok(Fix {
-                    title: f.field("title")?.utf8()?.to_string(),
-                    edits: f.field("edits")?.items(|e| {
-                        Ok(Edit {
-                            span: self.span(e)?,
-                            text: e.field("text")?.utf8()?.to_string(),
-                        })
-                    })?,
-                })
-            })?,
+            fixes: d
+                .field("fixes")?
+                .items(|f| {
+                    Ok(Fix {
+                        title: f.field("title")?.utf8()?.to_string(),
+                        edits: f.field("edits")?.items(|e| {
+                            Ok(Edit {
+                                span: self.span(e)?,
+                                text: e.field("text")?.utf8()?.to_string(),
+                            })
+                        })?,
+                    })
+                })?
+                .into(),
+            values: ply_eval::Sparse::new(),
         })
     }
 

@@ -24,7 +24,7 @@ fn drain_into(mut stack: Stack, out: &mut Vec<i64>) {
             Next::Frame(Frame::BinaryApply { lhs, .. }, rest) => {
                 out.push(match lhs {
                     Value::Int(n) => n,
-                    other => panic!("the stack held {other} rather than the marker"),
+                    other => panic!("the stack held {other:?} rather than the marker"),
                 });
                 stack = rest;
             }

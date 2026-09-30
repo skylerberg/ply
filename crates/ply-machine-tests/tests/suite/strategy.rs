@@ -204,7 +204,11 @@ fn a_proposition_that_raises_is_still_a_gap() {
             panic!("the program's raise was reported as {discharge:?}");
         };
         assert_eq!(diagnostic.code, codes::RUNTIME_ERROR, "{diagnostic:?}");
-        assert_eq!(bindings[0].rendered, "false", "{bindings:?}");
+        assert_eq!(
+            bindings[0].value,
+            ply_eval::Plain::Bool(false),
+            "{bindings:?}"
+        );
     }
 }
 
@@ -332,15 +336,16 @@ fn a_refutation_is_re_run_at_the_root_and_case_it_came_from() {
         else {
             panic!("a false law over `Int` must be refuted, not skipped");
         };
-        let original: Vec<String> = counterexample
+        let original: Vec<ply_eval::Plain> = counterexample
             .original
             .iter()
-            .map(|b| b.rendered.clone())
+            .map(|b| b.value.clone())
             .collect();
         let (root, case) = (counterexample.root, counterexample.case);
         match prover.point_at(&obligation, root, case, &ProvePlan::default()) {
             Point::Falsified(bindings) => {
-                let drawn: Vec<String> = bindings.iter().map(|b| b.rendered.clone()).collect();
+                let drawn: Vec<ply_eval::Plain> =
+                    bindings.iter().map(|b| b.value.clone()).collect();
                 assert_eq!(
                     drawn, original,
                     "the point was not the one the counterexample came from"

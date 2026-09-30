@@ -445,52 +445,24 @@ fn comparable(sort: &Sort) -> bool {
     }
 }
 
-fn param_names(arity: usize) -> Vec<Symbol> {
-    (0..arity).map(|i| Symbol::new(format!("x{i}"))).collect()
-}
-
-fn closure(arity: usize, rule: Synth, description: String) -> Value {
+/// Unnamed: `std.value.render` spells a generated function from its rule.
+fn closure(arity: usize, rule: Synth) -> Value {
     Value::Closure(Arc::new(Closure {
-        name: Some(Symbol::new(description)),
+        name: None,
         kind: ClosureKind::Synth { arity, rule },
     }))
 }
 
-fn binder_list(arity: usize, names: &[Symbol]) -> String {
-    if names.is_empty() {
-        return (0..arity).map(|_| "_").collect::<Vec<_>>().join(", ");
-    }
-    names
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 pub(crate) fn const_fn(arity: usize, value: Value) -> Value {
-    let description = format!("|{}| {}", binder_list(arity, &[]), value.render());
-    closure(arity, Synth::Const(value), description)
+    closure(arity, Synth::Const(value))
 }
 
 fn projection_fn(arity: usize, index: usize) -> Value {
-    let names = param_names(arity);
-    let description = format!("|{}| {}", binder_list(arity, &names), names[index]);
-    closure(arity, Synth::Project(index), description)
+    closure(arity, Synth::Project(index))
 }
 
 fn table_fn(arity: usize, entries: Vec<(Value, Value)>, default: Value) -> Value {
-    let names = param_names(arity);
-    let subject = &names[0];
-    let mut description = default.render();
-    for (key, value) in entries.iter().rev() {
-        description = format!(
-            "if {subject} == {} {{ {} }} else {{ {description} }}",
-            key.render(),
-            value.render()
-        );
-    }
-    let description = format!("|{}| {description}", binder_list(arity, &names));
-    closure(arity, Synth::Table { entries, default }, description)
+    closure(arity, Synth::Table { entries, default })
 }
 
 pub(crate) fn fn_size(value: &Value, world: &World) -> Option<u64> {
@@ -670,7 +642,7 @@ pub fn bindings(binders: &[Binder], values: &[Value]) -> Vec<Binding> {
         .map(|(binder, value)| Binding {
             name: binder.name.clone(),
             ty: binder.text.clone(),
-            rendered: value.render(),
+            value: ply_eval::Plain::shown(value),
         })
         .collect()
 }

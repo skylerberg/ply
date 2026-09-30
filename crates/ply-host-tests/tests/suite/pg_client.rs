@@ -141,10 +141,10 @@ struct Ran {
 
 fn ran(answered: Value, net: Option<Arc<SimNet>>) -> Result<Ran, String> {
     let Value::Ctor { name, args } = &answered else {
-        panic!("the entry answered {answered}, not an `Ok` or an `Err`");
+        panic!("the entry answered {answered:?}, not an `Ok` or an `Err`");
     };
     let Value::Str(text) = &args[0] else {
-        panic!("the entry carried {answered}, not text");
+        panic!("the entry carried {answered:?}, not text");
     };
     match name.as_str() {
         "Ok" => Ok(Ran {

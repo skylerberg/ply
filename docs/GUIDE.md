@@ -663,6 +663,12 @@ perform must supply a label (`E0304`). `nondet` marks results that are not a
 function of program state (§8.3). Effects are nominal. `task`, `clock`,
 `random`, `sim` and `cell` are taken (`E0105`).
 
+An operation's type parameters sit just before its parameters,
+`read take[r]<a>(key: Int) -> a`, and are its only type variables: its
+signature resolves names as a `fn` signature does, so a lowercase name its list
+does not declare, or a type name not in scope, is `E0102`. Each perform picks
+its own `a`, so a clause for the operation has to answer every type (`E0201`).
+
 ### 6.2 Atoms and rows
 
 An atom is `effect.mode[resource]`, or `effect.mode` for a singleton. A row is a
@@ -2384,6 +2390,36 @@ nothing here raises. `is_sign_negative` holds for `-0.0` and a negative NaN too.
 `trunc` goes toward zero and keeps the sign, leaving a NaN or an infinity as it
 is. `pow2(k)` is `2^k` exactly, through the subnormals down to `2^-1074`, zero
 below that and an infinity above `2^1023`.
+
+### 13.35 `std.value`
+
+```ply
+pub type Value =
+  | VUnit | VBool(Bool) | VInt(Int) | VFloat(Float) | VDecimal(Decimal)
+  | VFixed(String, U128) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
+  | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
+  | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
+pub type Field = { name: String, value: Value }
+pub type Entry = { key: Value, value: Value }
+pub type Fun =
+  | FNamed(String) | FAnonymous | FConst({ arity: Int, value: Value })
+  | FProject({ arity: Int, index: Int })
+  | FTable({ arity: Int, entries: List<Entry>, default: Value })
+pub fn render(v: Value) -> String
+pub fn filled(text: String, values: List<Value>) -> String
+pub fn shown_items() -> Int
+pub fn shown_depth() -> Int
+```
+
+A value of any type as data: what `machine.call` takes and answers, what a
+runtime diagnostic carries, and what a counterexample binds. `render` is the one
+way a value is shown, in the language's own spelling. A list or map past
+`shown_items` items counts the rest, nesting past `shown_depth` shows as `…`,
+and a credential shows as `Secret(****)`. A fixed width holds the bit pattern it
+reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
+a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
+and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each
+value a runtime diagnostic's text names in its place.
 
 ## 14. The host boundary
 

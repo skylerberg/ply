@@ -511,7 +511,7 @@ fn settled_of(s: &Shrinking) -> Settled {
                 (
                     binder.name.as_str().to_string(),
                     binder.text.clone(),
-                    value.render(),
+                    ply_eval::Plain::shown(value),
                 )
             })
             .collect(),
@@ -522,23 +522,23 @@ fn settled_of(s: &Shrinking) -> Settled {
                 (
                     binding.name.as_str().to_string(),
                     binding.ty.clone(),
-                    binding.rendered.clone(),
+                    binding.value.clone(),
                 )
             })
             .collect(),
     }
 }
 
-/// A counterexample's bindings, as a report prints them: name, type, rendered value.
-fn texts_of_bindings(bindings: &[(String, String, String)]) -> PlyValue {
+/// A counterexample's bindings, as `proof.obligation.Binding`s.
+fn texts_of_bindings(bindings: &[(String, String, ply_eval::Plain)]) -> PlyValue {
     PlyValue::list(
         bindings
             .iter()
-            .map(|(name, ty, rendered)| {
+            .map(|(name, ty, value)| {
                 record(vec![
                     ("name", PlyValue::str(name)),
                     ("ty", PlyValue::str(ty)),
-                    ("rendered", PlyValue::str(rendered)),
+                    ("value", crate::payload::plain_value(value)),
                 ])
             })
             .collect(),
@@ -552,10 +552,10 @@ struct Offer {
     candidates: Vec<(u64, u64)>,
 }
 
-/// The counterexample as it now stands, in the words a report prints: `(name, type, rendered)`.
+/// The counterexample as it now stands: `(name, type, value)`.
 struct Settled {
-    bindings: Vec<(String, String, String)>,
-    original: Vec<(String, String, String)>,
+    bindings: Vec<(String, String, ply_eval::Plain)>,
+    original: Vec<(String, String, ply_eval::Plain)>,
 }
 
 /// One counterexample being walked down. The values live here because a program cannot hold a value
@@ -1366,7 +1366,7 @@ fn bindings_value(bindings: &[ply_prove::Binding]) -> PlyValue {
                 record(vec![
                     ("name", PlyValue::str(b.name.as_str())),
                     ("ty", PlyValue::str(&b.ty)),
-                    ("rendered", PlyValue::str(&b.rendered)),
+                    ("value", crate::payload::plain_value(&b.value)),
                 ])
             })
             .collect(),
@@ -1445,6 +1445,7 @@ fn gap_value(gap: &Gap) -> PlyValue {
             "Raised",
             vec![record(vec![
                 ("message", PlyValue::str(&diagnostic.message)),
+                ("values", shown_values(diagnostic)),
                 ("bindings", bindings_value(bindings)),
             ])],
         ),
@@ -1473,8 +1474,20 @@ fn fault_value(fault: &Fault) -> PlyValue {
             "notes",
             strings(fault.diagnostic.notes.iter().map(String::as_str)),
         ),
+        ("values", shown_values(&fault.diagnostic)),
         ("bindings", bindings_value(&fault.bindings)),
     ])
+}
+
+/// The values a diagnostic's text names, which `std.value.filled` puts in place.
+fn shown_values(diagnostic: &Diagnostic) -> PlyValue {
+    PlyValue::list(
+        diagnostic
+            .values
+            .iter()
+            .map(crate::payload::plain_value)
+            .collect(),
+    )
 }
 
 /// One point as `claims.ply` reads it: the same constructors the whole-run outcomes use, minus

@@ -658,7 +658,7 @@ fn local_port(
             Some(args[0].as_int(Span::DUMMY, "a port").expect("an Int"))
         }
         Value::Ctor { name, .. } if name.as_str() == "None" => None,
-        other => panic!("not an `Option`: {}", other.render()),
+        other => panic!("not an `Option`: {other:?}"),
     }
 }
 
@@ -943,7 +943,7 @@ fn a_host_that_cannot_be_reached_is_none_rather_than_a_failure() {
     .expect("an answer");
     assert!(
         matches!(&answer, Value::Ctor { name, .. } if name.as_str() == "None"),
-        "{answer}"
+        "{answer:?}"
     );
     let answer = perform(
         &binding,
@@ -959,7 +959,7 @@ fn a_host_that_cannot_be_reached_is_none_rather_than_a_failure() {
     .expect("an answer");
     assert!(
         matches!(&answer, Value::Ctor { name, .. } if name.as_str() == "None"),
-        "{answer}"
+        "{answer:?}"
     );
     assert_eq!(net.outstanding(), 0);
 }
@@ -1111,7 +1111,7 @@ fn answer(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) {
 fn sent_some(value: Value) -> Value {
     match &value {
         Value::Ctor { name, args } if name.as_str() == "Some" && args.len() == 1 => args[0].clone(),
-        other => panic!("expected `Some(..)`, got {other}"),
+        other => panic!("expected `Some(..)`, got {other:?}"),
     }
 }
 

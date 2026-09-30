@@ -5,13 +5,14 @@
 
 use crate::fixture::project;
 use ply_eval::host::HostRegistry;
-use ply_eval::{Front, Machine, Provider, SourceId, Span, Value};
-use std::collections::HashMap;
+use ply_eval::{Front, Machine, Provider, Span, Value};
 use std::sync::Arc;
 
 /// The re-run program. Every operation of the effect is declared, as the run that binds it
 /// requires, and `Point` is the shape `claims.ply` reads.
 const REPLAY: &str = r#"
+import std.value (Value, render)
+
 nondet effect prover {
   write configure[claims](options: Options, front: Front, world: World) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
@@ -86,10 +87,11 @@ type Options = {
 }
 type Refusal = Unit
 type Collection = Unit
+type Choice = Unit
 type Verdicts = Unit
 type Baseline = Unit
 type Accepted = Unit
-type Binding = { name: String, ty: String, rendered: String }
+type Binding = { name: String, ty: String, value: Value }
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
@@ -116,7 +118,7 @@ fn nothing() -> Answer = { falsified: 0, kept: 0, rejected: 0, first: "" }
 
 fn drawn(bs: List<Binding>) -> String =
   fold(bs, "", |acc: String, b: Binding|
-    if acc == "" { b.rendered } else { acc ++ ", " ++ b.rendered })
+    if acc == "" { render(b.value) } else { acc ++ ", " ++ render(b.value) })
 
 fn scan(index: Int, case: Int, seen: Answer) -> Answer / {prover.replay[claims]} =
   if case >= cases() { seen } else {
@@ -191,20 +193,33 @@ law "doubling is tripling"
 const THE_LAW: (&str, &[&str]) = ("m.doubling is tripling", &["n"]);
 
 fn front_of(source: &str) -> Front {
-    let named = vec![("proof.obligation".to_string(), source.to_string())];
-    let ids = vec![SourceId(0)];
     ply_codegen::c::producer::ensure_default();
-    ply_codegen::c::producer::checked_front(&named, &ids).expect("the re-run program checks")
+    ply_codegen::c::producer::checked_front_with_std(&[(
+        "proof.obligation".to_string(),
+        source.to_string(),
+    )])
+    .expect("the re-run program checks")
+    .front
+}
+
+/// The program checked with the standard library it imports, and compiled.
+fn built(source: &str) -> (Front, &'static ply_codegen::Unit) {
+    ply_codegen::c::producer::ensure_default();
+    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
+        "proof.obligation".to_string(),
+        source.to_string(),
+    )])
+    .expect("the re-run program checks");
+    let unit =
+        ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
+            .expect("this host has a C toolchain");
+    (answered.front, unit)
 }
 
 /// The fixture's answer, from one entered call.
 fn one_run(source: &str, index: i64) -> Result<Value, ply_eval::Diagnostic> {
     let project = project(source);
-    let front = front_of(REPLAY);
-    let texts: HashMap<String, String> = [("proof.obligation".to_string(), REPLAY.to_string())]
-        .into_iter()
-        .collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(REPLAY);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
@@ -231,15 +246,15 @@ fn field(answer: &Value, name: &str) -> Value {
             .iter()
             .find(|(key, _)| key.as_str() == name)
             .map(|(_, value)| value.clone())
-            .unwrap_or_else(|| panic!("the answer carries `{name}`: {answer}")),
-        other => panic!("the answer is a record, not {other}"),
+            .unwrap_or_else(|| panic!("the answer carries `{name}`: {answer:?}")),
+        other => panic!("the answer is a record, not {other:?}"),
     }
 }
 
 fn int(answer: &Value, name: &str) -> i64 {
     match field(answer, name) {
         Value::Int(n) => n,
-        other => panic!("`{name}` is an int, not {other}"),
+        other => panic!("`{name}` is an int, not {other:?}"),
     }
 }
 
@@ -248,12 +263,12 @@ fn a_replayed_case_comes_back_as_the_value_that_falsifies_the_claim() {
     let answer = one_run(A_FALSE_LAW, 0).expect("the run finished");
     assert!(
         int(&answer, "falsified") > 0,
-        "no draw falsified a law that does not hold: {answer}"
+        "no draw falsified a law that does not hold: {answer:?}"
     );
     let first = field(&answer, "first");
     let drawn = match &first {
         Value::Str(text) => text.to_string(),
-        other => panic!("the first falsifying point is a string, not {other}"),
+        other => panic!("the first falsifying point is a string, not {other:?}"),
     };
     // Independently of the prover: the value the point drew really does break the law.
     let n: i64 = drawn.parse().unwrap_or_else(|e| {
