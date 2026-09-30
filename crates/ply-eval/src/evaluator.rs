@@ -308,7 +308,10 @@ pub fn err_not_compiled(name: &Symbol, span: Span) -> Diagnostic {
 fn err_test_answered(root: &Symbol, value: &Value, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("test root `{root}` answered `{value}`, and a test body is `Unit`"),
+        format!(
+            "test root `{root}` answered `{}`, and a test body is `Unit`",
+            crate::slot(0)
+        ),
     )
     .primary(
         span,
@@ -318,6 +321,7 @@ fn err_test_answered(root: &Symbol, value: &Value, span: Span) -> Diagnostic {
         "the checker refuses a test whose body is not `Unit` with E0201, so no test can answer one",
     )
     .note("this is Ply's fault, not the program's")
+    .showing(vec![crate::Plain::shown(value)])
 }
 
 #[cold]
