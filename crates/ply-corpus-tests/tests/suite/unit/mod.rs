@@ -10,7 +10,6 @@ mod regions;
 mod simulate;
 mod w4;
 mod w5;
-mod w6;
 
 use crate::support::{generate, product, product_document};
 use serde_json::Value;
