@@ -938,6 +938,44 @@ test/nondet "each task reads its cell after the other's region closed" {
 }
 
 #[test]
+fn a_production_task_answers_from_the_handle_around_its_spawn_after_that_handle_ended() {
+    // The spawner marks after its `handle` ends and the task as it first runs, so the task's is 2.
+    let compiled = Compiled::named(
+        "t",
+        r#"
+nondet effect net {
+  write mark[s]() -> Int
+}
+
+effect ask {
+  read get() -> Int
+}
+
+test/nondet "the task first runs after the handle around its spawn ended" {
+  let t = handle { task.spawn(|| net.mark[probe]() * 10 + ask.get()) } with { ask.get() -> 7 };
+  assert_eq(net.mark[probe](), 1);
+  assert_eq(task.join(t), 27)
+}
+"#,
+    );
+    let probe = Arc::new(Counter::default());
+    let mut registry = task_registry(Arc::new(Counter::default()));
+    registry.register(op("net", "mark", Linearity::Repeatable), probe.clone());
+    let binding = registry.bind(&compiled.front.check).expect("binds");
+
+    let mut machine = compiled.machine_on_tier();
+    machine.set_host_binding(Arc::new(binding));
+    machine
+        .eval_test(0)
+        .expect("the task answers from the handle that ended before it first ran");
+    assert_eq!(
+        probe.calls(),
+        2,
+        "the spawner and the task each marked once"
+    );
+}
+
+#[test]
 fn a_pending_outside_a_region_blocks_the_one_thread_it_is_allowed_to() {
     let compiled = Compiled::named(
         "t",
