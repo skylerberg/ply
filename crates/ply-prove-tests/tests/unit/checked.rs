@@ -89,7 +89,8 @@ fn sort_of(ty: At<'_>, vars: &[i64]) -> Result<Sort, Error> {
     })
 }
 
-/// One claim's binders, numbered together.
+/// One claim's binders, numbered together. The static prover prints nothing, so a binder's text,
+/// which is the compiler's printing, is left empty.
 pub fn binders_of(named: &[(Symbol, At<'_>)]) -> Vec<Binder> {
     let mut vars = Vec::new();
     for (_, ty) in named {
@@ -97,13 +98,10 @@ pub fn binders_of(named: &[(Symbol, At<'_>)]) -> Vec<Binder> {
     }
     named
         .iter()
-        .map(|(name, ty)| {
-            let sort = sort_of(*ty, &vars).unwrap_or_else(|e| panic!("{e}"));
-            Binder {
-                name: name.clone(),
-                text: sort.to_string(),
-                sort,
-            }
+        .map(|(name, ty)| Binder {
+            name: name.clone(),
+            sort: sort_of(*ty, &vars).unwrap_or_else(|e| panic!("{e}")),
+            text: String::new(),
         })
         .collect()
 }
