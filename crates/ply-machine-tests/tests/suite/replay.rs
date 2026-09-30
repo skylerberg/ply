@@ -5,8 +5,7 @@
 
 use crate::fixture::project;
 use ply_eval::host::HostRegistry;
-use ply_eval::{Front, Machine, Provider, SourceId, Span, Value};
-use std::collections::HashMap;
+use ply_eval::{Front, Machine, Provider, Span, Value};
 use std::sync::Arc;
 
 /// The re-run program. Every operation of the effect is declared, as the run that binds it
@@ -194,20 +193,33 @@ law "doubling is tripling"
 const THE_LAW: (&str, &[&str]) = ("m.doubling is tripling", &["n"]);
 
 fn front_of(source: &str) -> Front {
-    let named = vec![("proof.obligation".to_string(), source.to_string())];
-    let ids = vec![SourceId(0)];
     ply_codegen::c::producer::ensure_default();
-    ply_codegen::c::producer::checked_front(&named, &ids).expect("the re-run program checks")
+    ply_codegen::c::producer::checked_front_with_std(&[(
+        "proof.obligation".to_string(),
+        source.to_string(),
+    )])
+    .expect("the re-run program checks")
+    .front
+}
+
+/// The program checked with the standard library it imports, and compiled.
+fn built(source: &str) -> (Front, &'static ply_codegen::Unit) {
+    ply_codegen::c::producer::ensure_default();
+    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
+        "proof.obligation".to_string(),
+        source.to_string(),
+    )])
+    .expect("the re-run program checks");
+    let unit =
+        ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
+            .expect("this host has a C toolchain");
+    (answered.front, unit)
 }
 
 /// The fixture's answer, from one entered call.
 fn one_run(source: &str, index: i64) -> Result<Value, ply_eval::Diagnostic> {
     let project = project(source);
-    let front = front_of(REPLAY);
-    let texts: HashMap<String, String> = [("proof.obligation".to_string(), REPLAY.to_string())]
-        .into_iter()
-        .collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(REPLAY);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
