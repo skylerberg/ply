@@ -639,6 +639,12 @@ perform must supply a label (`E0304`). `nondet` marks results that are not a
 function of program state (§8.3). Effects are nominal. `task`, `clock`,
 `random`, `sim` and `cell` are taken (`E0105`).
 
+An operation's type parameters sit just before its parameters,
+`read take[r]<a>(key: Int) -> a`, and are its only type variables: its
+signature resolves names as a `fn` signature does, so a lowercase name its list
+does not declare, or a type name not in scope, is `E0102`. Each perform picks
+its own `a`, so a clause for the operation has to answer every type (`E0201`).
+
 ### 6.2 Atoms and rows
 
 An atom is `effect.mode[resource]`, or `effect.mode` for a singleton. A row is a
