@@ -946,7 +946,7 @@ pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut Ctx, w: i64) -> i64 {
 }
 
 /// The operator codes compiled code hands [`rt_binary`]; `emit.ply`'s `binary_code` must match.
-const BINOPS: [BinOp; 17] = [
+const BINOPS: [BinOp; 18] = [
     BinOp::Add,
     BinOp::Sub,
     BinOp::Mul,
@@ -964,9 +964,11 @@ const BINOPS: [BinOp; 17] = [
     BinOp::BitXor,
     BinOp::Shl,
     BinOp::Shr,
+    BinOp::Ushr,
 ];
 
-/// The machine's own negation of a value whose type the emitter cannot see. Takes it.
+/// The machine's own negation of a `Float`, a `Decimal` or a 64-bit width, which compiled code
+/// holds as the runtime's own words. Takes it.
 pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let vals = values_taken(c, &[a]);
@@ -988,7 +990,8 @@ pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
     c.word(&answer)
 }
 
-/// The machine's own operator over two values whose type the emitter does not fix. Takes both.
+/// The machine's own operator over two words of a `Float`, a `Decimal` or a 64-bit width. Takes
+/// both.
 pub unsafe extern "C" fn rt_binary(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let Some(op) = usize::try_from(op)
@@ -1264,12 +1267,15 @@ pub unsafe extern "C" fn rt_let_no_match(ctx: *mut Ctx) {
     ctx.fail(d);
 }
 
+/// `what` is `emit.ply`'s `overflow_code`.
 pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
     let name = match what {
         0 => "addition",
         1 => "subtraction",
-        _ => "negation",
+        2 => "negation",
+        3 => "multiplication",
+        _ => "division",
     };
     let d = error(format!("integer overflow in {name}"));
     ctx.fail(d);
