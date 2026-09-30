@@ -87,25 +87,29 @@ fn a_tier_built_from_another_program_is_refused_before_anything_runs() {
 
 /// Nothing the program wrote ran, so the failure is Ply's and no assertion on the program's own
 /// codes can be met by it.
-#[track_caller]
-fn assert_declined(c: &Checked, what: &str, entered: impl Fn() -> Entered + 'static) {
-    let (outcome, counts) = first_test_under(c, entered);
-    let d = outcome.expect_err(what);
-    assert_eq!(d.code, codes::INTERNAL_ERROR, "{what}: {d:?}");
-    assert!(
-        d.message.starts_with("the compiled tier declined to enter"),
-        "{what}: {d:?}"
-    );
-    assert_eq!(counts, (0, 1), "{what}");
-}
-
 #[test]
 fn a_test_root_the_tier_did_not_run_is_plys_defect_and_counted_as_declined() {
     let c = checked_source(DOUBLE_DOUBLES);
-    assert_declined(&c, "a decline", || Entered::Declined);
-    assert_declined(&c, "an answer other than `()`", || {
-        Entered::Answered(Value::Int(7))
-    });
+    let (outcome, counts) = first_test_under(&c, || Entered::Declined);
+    let d = outcome.expect_err("a declined test answers nothing");
+    assert_eq!(d.code, codes::INTERNAL_ERROR, "{d:?}");
+    assert!(
+        d.message.starts_with("the compiled tier declined to enter"),
+        "{d:?}"
+    );
+    assert_eq!(counts, (0, 1));
+}
+
+/// The checker refuses a test whose body is not `Unit`, so a value is Ply's defect rather than a
+/// decline: the tier did run the test.
+#[test]
+fn a_test_root_that_answers_a_value_is_plys_defect_and_counted_as_entered() {
+    let c = checked_source(DOUBLE_DOUBLES);
+    let (outcome, counts) = first_test_under(&c, || Entered::Answered(Value::Int(7)));
+    let d = outcome.expect_err("a test answers `()`");
+    assert_eq!(d.code, codes::INTERNAL_ERROR, "{d:?}");
+    assert!(d.message.contains("answered `7`"), "{d:?}");
+    assert_eq!(counts, (1, 0));
 }
 
 #[test]
