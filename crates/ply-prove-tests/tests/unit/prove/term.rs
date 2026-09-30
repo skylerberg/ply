@@ -1,11 +1,11 @@
+use ply_prove::Sort;
 use ply_prove::prove::term::{Node, Terms};
 use ply_span::Symbol;
-use ply_ty::Type;
 
 #[test]
 fn a_linear_combination_is_canonical() {
     let mut terms = Terms::new();
-    let x = terms.sym(Some(Type::int()));
+    let x = terms.sym(Some(Sort::int()));
     let zero = terms.int_lit(0);
     let plus_zero = terms.add(x, zero).unwrap();
     assert_eq!(plus_zero, x, "`x + 0` and `x` are one term");
@@ -22,7 +22,7 @@ fn a_linear_combination_is_canonical() {
 #[test]
 fn a_coefficient_that_overflows_produces_no_term() {
     let mut terms = Terms::new();
-    let x = terms.sym(Some(Type::int()));
+    let x = terms.sym(Some(Sort::int()));
     let big = terms.int_lit(i64::MAX);
     let scaled = terms.mul(x, big).unwrap();
     let again = terms.mul(scaled, big).unwrap();
@@ -42,8 +42,8 @@ fn a_constant_outside_int_produces_no_term() {
 #[test]
 fn multiplication_of_two_symbolics_is_not_arithmetic() {
     let mut terms = Terms::new();
-    let x = terms.sym(Some(Type::int()));
-    let y = terms.sym(Some(Type::int()));
+    let x = terms.sym(Some(Sort::int()));
+    let y = terms.sym(Some(Sort::int()));
     assert!(terms.mul(x, y).is_none());
 }
 
