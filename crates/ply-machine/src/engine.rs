@@ -5,30 +5,33 @@ use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{DEFAULT_MAX_CALLS, Machine, Seed, Value};
 use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
 use ply_prove::domain::Finite;
-use ply_prove::property::{self, GenStream, Judge, Outcome, TypeWorld, judge_case, run_property};
+use ply_prove::property::{
+    self, GenStream, Judge, Outcome, bindings, judge_case, run_property, ungeneratable,
+};
 use ply_prove::prove::claims::{Clause, Code, Definition, Law};
 use ply_prove::prove::{self, Blocker, Claims, Decision, Goal, Limits, Proof};
 use ply_prove::{
-    Binding, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, ObligationKind,
-    ProvePlan, Rule, Vacuity, VacuityKind,
+    Binder, Binding, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation,
+    ObligationKind, ProvePlan, Rule, Sort, Vacuity, VacuityKind, World,
 };
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_store::Store;
-use ply_ty::{CheckOutput, DefInfo, Front, LawBinder, LawInfo, Literal, SpecKind};
+use ply_ty::{CheckOutput, DefInfo, Front, LawInfo, Literal, SpecKind};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The discharger this build drives, its claims kept in `store`. One built once serves a whole
-/// run's discharges and re-runs alike.
+/// The discharger this build drives over the program's `world`, its claims kept in `store`. One
+/// built once serves a whole run's discharges and re-runs alike.
 pub fn prover<'a>(
     loaded: &'a Loaded,
+    world: &'a World,
     hosting: Option<Hosting>,
     backend: Option<&'static dyn ply_eval::Provider>,
     store: &mut Store,
 ) -> Result<Prover<'a>, LoadError> {
-    let prover = Prover::over(loaded, Some(store))?;
+    let prover = Prover::over(loaded, world, Some(store))?;
     let prover = match hosting {
         Some(hosting) => prover.with_hosting(hosting),
         None => prover,
@@ -96,7 +99,7 @@ impl<'s> Claim<'s> {
 pub struct Prover<'a> {
     check: &'a CheckOutput,
     front: &'a Front,
-    world: TypeWorld,
+    world: &'a World,
     /// Built once; `machine()` runs per obligation.
     ctx: prove::Context<'a>,
     laws: HashMap<Symbol, (usize, &'a LawInfo)>,
@@ -115,11 +118,15 @@ pub struct Hosting {
 }
 
 impl<'a> Prover<'a> {
-    pub fn new(loaded: &'a Loaded) -> Result<Prover<'a>, LoadError> {
-        Prover::over(loaded, None)
+    pub fn new(loaded: &'a Loaded, world: &'a World) -> Result<Prover<'a>, LoadError> {
+        Prover::over(loaded, world, None)
     }
 
-    fn over(loaded: &'a Loaded, store: Option<&mut Store>) -> Result<Prover<'a>, LoadError> {
+    fn over(
+        loaded: &'a Loaded,
+        world: &'a World,
+        store: Option<&mut Store>,
+    ) -> Result<Prover<'a>, LoadError> {
         let check = &loaded.check;
         let mut laws = HashMap::new();
         let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
@@ -131,8 +138,8 @@ impl<'a> Prover<'a> {
         Ok(Prover {
             check,
             front: &loaded.front,
-            world: TypeWorld::new(check.ctors.values()),
-            ctx: prove::Context::new(claims_of(loaded, store)?, check),
+            world,
+            ctx: prove::Context::new(claims_of(loaded, store)?, world),
             laws,
             hosting: None,
             backend: None,
@@ -343,9 +350,9 @@ impl ply_test::obligation::Discharger for Prover<'_> {
 }
 
 impl<'a> Prover<'a> {
-    /// The types the laws are written over: what a program needs to measure a binder's domain.
-    pub fn world(&self) -> &TypeWorld {
-        &self.world
+    /// The program as the prover reads it.
+    pub fn world(&self) -> &World {
+        self.world
     }
 
     /// Judge one tuple the way a discharge would: the same guard, the same body, the same case
@@ -375,7 +382,7 @@ impl<'a> Prover<'a> {
                 obligation
                     .generated()
                     .iter()
-                    .map(|b| b.ty.clone())
+                    .map(|b| b.sort.clone())
                     .collect(),
                 d.sizes.clone(),
             )
@@ -430,7 +437,7 @@ impl<'a> Prover<'a> {
         let discharge = run_property(
             obligation.key,
             obligation.generated(),
-            &self.world,
+            self.world,
             plan,
             claim.guard_span(obligation.span),
             &mut cases,
@@ -445,7 +452,7 @@ impl<'a> Prover<'a> {
                     Some(certificate) => Discharge::Held(Evidence::Proof(certificate)),
                     None => Discharge::Unattempted(Gap::GuardNotSampled {
                         generated,
-                        witness: bindings_of(obligation.generated(), &values),
+                        witness: bindings(obligation.generated(), &values),
                     }),
                 },
                 None => discharge,
@@ -489,17 +496,12 @@ impl<'a> Prover<'a> {
         let mut stream = GenStream::new(root, obligation.key);
         let mut values = Vec::with_capacity(obligation.generated().len());
         for binder in obligation.generated() {
-            match property::generate(&binder.ty, &self.world, &mut stream, case) {
+            match property::generate(&binder.sort, self.world, &mut stream, case) {
                 Ok(value) => values.push(value),
-                Err(_) => {
-                    return Point::Undrawn(Gap::Ungeneratable {
-                        param: binder.name.clone(),
-                        ty: binder.ty.clone(),
-                    });
-                }
+                Err(_) => return Point::Undrawn(ungeneratable(binder)),
             }
         }
-        let bindings = bindings_of(obligation.generated(), &values);
+        let bindings = bindings(obligation.generated(), &values);
         match judge_case(&mut cases, &values) {
             Outcome::Held => Point::Kept(bindings),
             Outcome::Failed => Point::Falsified(bindings),
@@ -535,7 +537,7 @@ impl<'a> Prover<'a> {
         run_property(
             obligation.key,
             obligation.generated(),
-            &self.world,
+            self.world,
             plan,
             claim.guard_span(obligation.span),
             &mut cases,
@@ -554,10 +556,10 @@ impl<'a> Prover<'a> {
         let mut columns: Vec<Vec<Value>> = Vec::with_capacity(cases.binders.len());
         let mut points = 1usize;
         for binder in &cases.binders {
-            let column = match self.candidates(&binder.ty, &literals) {
+            let column = match self.candidates(&binder.sort, &literals) {
                 Some(column) => column,
                 // A shape the guard's literals cannot name: a list, record, ADT or function.
-                None => vec![property::generate(&binder.ty, &self.world, &mut stream, 0).ok()?],
+                None => vec![property::generate(&binder.sort, self.world, &mut stream, 0).ok()?],
             };
             points = points.checked_mul(column.len())?;
             if points > WITNESS_POINTS {
@@ -594,8 +596,8 @@ impl<'a> Prover<'a> {
     }
 
     /// The values one binder is tried at, smallest and most literal first.
-    fn candidates(&self, ty: &ply_ty::Type, literals: &Literals) -> Option<Vec<Value>> {
-        let ply_ty::Type::Con(name, args) = ty else {
+    fn candidates(&self, sort: &Sort, literals: &Literals) -> Option<Vec<Value>> {
+        let Sort::Con(name, args) = sort else {
             return None;
         };
         if !args.is_empty() {
@@ -650,7 +652,7 @@ impl<'a> Prover<'a> {
         run_property(
             obligation.key,
             obligation.generated(),
-            &self.world,
+            self.world,
             plan,
             claim.guard_span(obligation.span),
             &mut cases,
@@ -677,13 +679,12 @@ impl<'a> Prover<'a> {
             Claim::Law { .. } => None,
         };
         let result = obligation.result_binder().map(|b| b.name.clone());
-        for binder in obligation.generated() {
-            if property::generatable(&binder.ty, &self.world).is_err() {
-                return Err(Gap::Ungeneratable {
-                    param: binder.name.clone(),
-                    ty: binder.ty.clone(),
-                });
-            }
+        if let Some(binder) = obligation
+            .generated()
+            .iter()
+            .find(|b| property::generatable(&b.sort, self.world).is_err())
+        {
+            return Err(ungeneratable(binder));
         }
         Ok(Cases {
             machine: self.machine(),
@@ -710,18 +711,15 @@ impl<'a> Prover<'a> {
         let mut kept = 0u64;
         for point in 0..finite.points {
             // A domain that cannot produce its own point has not been covered.
-            let Some(values) = finite.point(&self.world, point) else {
-                return Discharge::Unattempted(Gap::Ungeneratable {
-                    param: obligation.generated()[0].name.clone(),
-                    ty: obligation.generated()[0].ty.clone(),
-                });
+            let Some(values) = finite.point(self.world, point) else {
+                return Discharge::Unattempted(ungeneratable(&obligation.generated()[0]));
             };
             match judge_case(cases, &values) {
                 Outcome::Rejected => {}
                 Outcome::Held => kept += 1,
                 Outcome::Failed => {
                     // No shrinking: the enumeration order is fixed.
-                    let bindings = bindings_of(obligation.generated(), &values);
+                    let bindings = bindings(obligation.generated(), &values);
                     return Discharge::Refuted(Counterexample {
                         original: bindings.clone(),
                         bindings,
@@ -734,7 +732,7 @@ impl<'a> Prover<'a> {
                 }
                 Outcome::Raised(diagnostic) => {
                     return Discharge::Unattempted(Gap::Raised {
-                        bindings: bindings_of(obligation.generated(), &values),
+                        bindings: bindings(obligation.generated(), &values),
                         diagnostic: Box::new(diagnostic),
                         // The domain's order is the walk's: the index is the case.
                         root: 0,
@@ -819,7 +817,7 @@ impl<'a> Prover<'a> {
 
         if let Some((finite, name)) = measured {
             for point in 0..finite.points {
-                let Some(values) = finite.point(&self.world, point) else {
+                let Some(values) = finite.point(self.world, point) else {
                     continue;
                 };
                 if self.admits(cases, &values)? {
@@ -835,21 +833,15 @@ impl<'a> Prover<'a> {
         }
 
         let plan = plan.clone().normalized();
-        let types: Vec<ply_ty::Type> = binders.iter().map(|b| b.ty.clone()).collect();
         let mut generated = 0u32;
         for &root in &plan.roots {
             let mut stream = GenStream::new(root, obligation.key);
             for case in 0..plan.cases {
                 let mut values = Vec::with_capacity(binders.len());
                 for binder in binders {
-                    match property::generate(&binder.ty, &self.world, &mut stream, case) {
+                    match property::generate(&binder.sort, self.world, &mut stream, case) {
                         Ok(value) => values.push(value),
-                        Err(_) => {
-                            return Err(Gap::Ungeneratable {
-                                param: binder.name.clone(),
-                                ty: binder.ty.clone(),
-                            });
-                        }
+                        Err(_) => return Err(ungeneratable(binder)),
                     }
                 }
                 generated = generated.saturating_add(1);
@@ -862,14 +854,14 @@ impl<'a> Prover<'a> {
             generated,
             kept: u32::try_from(kept.len()).unwrap_or(u32::MAX),
             rejected: generated.saturating_sub(u32::try_from(kept.len()).unwrap_or(u32::MAX)),
-            instantiations: property::instantiations(&types),
+            instantiations: property::instantiations(binders),
         };
         Ok((kept, domain))
     }
 
     fn admits(&self, cases: &mut Cases<'a>, values: &[Value]) -> Result<bool, Gap> {
         cases.guard(values).map_err(|diagnostic| Gap::Raised {
-            bindings: bindings_of(&cases.binders, values),
+            bindings: bindings(&cases.binders, values),
             diagnostic: Box::new(diagnostic),
             // A guard that raised while values were handed in: nothing here knows the draw.
             root: 0,
@@ -923,25 +915,13 @@ fn upgrade(discharge: Discharge, witness: Option<Proof>) -> Discharge {
     }
 }
 
-fn bindings_of(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
-    binders
-        .iter()
-        .zip(values)
-        .map(|(binder, value)| Binding {
-            name: binder.name.clone(),
-            ty: binder.ty.clone(),
-            rendered: value.render(),
-        })
-        .collect()
-}
-
 /// How a tuple of binder values is judged: guard first, always.
 struct Cases<'a> {
     machine: Machine<'a>,
     compiled: Option<Rc<dyn ply_eval::Compiled>>,
     guard_roots: Vec<Symbol>,
     body_root: Symbol,
-    binders: Vec<LawBinder>,
+    binders: Vec<Binder>,
     span: Span,
     /// The definition an `ensures` is attached to, called to produce `result`.
     call: Option<Symbol>,
@@ -1007,7 +987,7 @@ impl Judge for Cases<'_> {
 struct Search {
     compiled: Option<Rc<dyn ply_eval::Compiled>>,
     body_root: Symbol,
-    binders: Vec<LawBinder>,
+    binders: Vec<Binder>,
     /// The points the guard kept, in order.
     points: Vec<Vec<Value>>,
     /// A `simulate` region's own budget: scheduling steps, not calls.
@@ -1040,7 +1020,7 @@ impl LawSearch for Search {
 
     fn bindings(&self, point: u64) -> Vec<Binding> {
         match self.points.get(point as usize) {
-            Some(values) => bindings_of(&self.binders, values),
+            Some(values) => bindings(&self.binders, values),
             None => Vec::new(),
         }
     }
