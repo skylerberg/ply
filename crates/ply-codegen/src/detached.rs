@@ -461,16 +461,54 @@ extern "C" fn entry(arg: usize) {
     std::process::abort();
 }
 
-/// The `k` a clause off the tail is handed: a closure resuming the body from its capture.
+/// Whether `code` is a continuation's: the closure names a handler or a body that only the entry
+/// which captured it holds, so it means nothing to any other.
+pub(crate) fn is_continuation(code: usize) -> bool {
+    code == rt_resume_detached_entry as *const () as usize
+        || code == crate::rt::rt_resume_entry as *const () as usize
+}
+
+/// The `k` a clause off the tail is handed: a closure resuming the body from its capture, and the
+/// entry it was captured in.
 fn token(c: &mut Ctx, id: usize, capture: usize) -> Word {
+    let entry = c.entry as i64;
     crate::rt::closure_of(
         c,
         rt_resume_detached_entry as *const () as usize,
-        ((id << 32) | capture) as i64,
+        &[((id << 32) | capture) as i64, entry],
     )
 }
 
 unsafe extern "C" fn rt_resume_detached_entry(ctx: *mut Ctx, args: *const i64) -> i64 {
-    let (packed, v) = unsafe { (heap::imm_value(*args) as usize, *args.add(1)) };
-    unsafe { resume(ctx, packed >> 32, Some(packed & 0xffff_ffff), Some(v)) }
+    let (packed, entry, v) = unsafe {
+        (
+            heap::imm_value(*args) as usize,
+            heap::imm_value(*args.add(1)),
+            *args.add(2),
+        )
+    };
+    let (id, k) = (packed >> 32, packed & 0xffff_ffff);
+    let c = unsafe { &mut *ctx };
+    if !captured_here(c, entry, id, k) {
+        return c.fail(err_stale_continuation());
+    }
+    unsafe { resume(ctx, id, Some(k), Some(v)) }
+}
+
+/// Whether this entry captured stop `k` of body `id`. A token from another entry may carry an index
+/// this entry uses for a body of its own, or one past every body it has.
+fn captured_here(c: &Ctx, entry: i64, id: usize, k: usize) -> bool {
+    entry == c.entry as i64 && c.detached.get(id).is_some_and(|d| k < d.captures.len())
+}
+
+/// `E0505`: nothing a program writes carries a continuation out of the entry that captured it.
+#[cold]
+#[inline(never)]
+fn err_stale_continuation() -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "a continuation was resumed outside the entry that captured it",
+    )
+    .note("the body it would resume lived only as long as that entry, so nothing is left to run")
+    .note("this is Ply's fault, not the program's")
 }
