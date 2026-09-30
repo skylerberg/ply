@@ -56,6 +56,14 @@ pub fn law_text(laws: Laws, law: String) -> Option<String> = map_get(laws.texts,
 
 pub fn has_laws(laws: Laws) -> Bool = map_len(laws.texts) > 0
 
+/// A law as the program wrote it: its key, the hash of its text, and every name it mentions.
+pub type Written = { key: String, text: String, mentions: List<String> }
+
+/// What each law speaks about: a law covers the definitions it mentions, and nothing else it names.
+pub fn laws_of(defs: List<String>, written: List<Written>) -> Laws =
+  fold(written, no_laws(), |laws: Laws, w: Written|
+    add_law(laws, w.key, w.text, filter(w.mentions, |name: String| contains_text(defs, name))))
+
 /// Every law sentence naming this definition: rewriting a law changes its targets' spec.
 pub fn naming(laws: Laws, name: String) -> List<String> =
   fold(map_keys(laws.targets), [], |acc: List<String>, law: String|
@@ -69,8 +77,35 @@ pub type Moved = | Unchanged | Changed | Never
 pub fn moved_word(m: Moved) -> String =
   match m { Unchanged -> "unchanged", Changed -> "changed", Never -> "never" }
 
-// One definition's claims as they stand now, or as they stood when they were accepted.
+// One definition's claims as they stand now, or as they stood when they were accepted. The spec is
+// a set of claim hashes: what moved is which claims there are, not the order they were named in.
 pub type Record = { def_hash: String, specs: List<String> }
+
+/// A definition the program declares: its hash, when the front end produced one, and the spec text
+/// of each of its own clauses.
+pub type Def = { name: String, hash: Option<String>, specs: List<String> }
+
+/// Every hashed definition's claims as they stand now, which is also the baseline accepting them
+/// records: its hash, its own clauses, and every law naming it.
+pub fn records(defs: List<Def>, laws: Laws) -> List<{ name: String, record: Record }> =
+  fold(defs, [], |acc: List<{ name: String, record: Record }>, d: Def|
+    match d.hash {
+      None -> acc,
+      Some(h) ->
+        push(acc, {
+          name: d.name,
+          record: { def_hash: h, specs: spec_set(push_all(d.specs, naming(laws, d.name))) },
+        }),
+    })
+
+// Ascending, with repeats dropped: the one spelling of a set of claim hashes.
+fn spec_set(specs: List<String>) -> List<String> =
+  fold(sorted_texts(specs), [], |acc: List<String>, x: String|
+    if contains_text(acc, x) { acc } else { push(acc, x) })
+
+pub fn record_map(rs: List<{ name: String, record: Record }>) -> Map<String, Record> =
+  fold(rs, map_new(), |m: Map<String, Record>, r: { name: String, record: Record }|
+    map_insert(m, r.name, r.record))
 
 // Every claim about one definition: its own clause keys and every law naming it directly.
 pub fn spec_hashes(
@@ -98,28 +133,33 @@ pub fn reason_word(r: Reason) -> String =
     CacheRefused -> "cache refused",
   }
 
-// One obligation's answer from the cache, whatever the caller's lookup made of it. `answered` is
-// whether evidence came back: a refusal is an answer, and not evidence.
-pub type Answer = { reason: Reason, answered: Bool, warning: Option<String> }
+// One obligation's answer from the cache. `from` is the key its evidence is read back from, present
+// exactly when the cache answered: a refusal is an answer, and not evidence.
+pub type Answer = { reason: Reason, from: Option<String>, warning: Option<String> }
 
-pub fn missed(reason: Reason) -> Answer = { reason: reason, answered: false, warning: None }
+pub fn missed(reason: Reason) -> Answer = { reason: reason, from: None, warning: None }
 
 // What the obligation cache holds under one key, as the runtime spells it back: a proof, a sampled
 // discharge, or `other` for something it cannot read at all. Absent when nothing is filed there.
 pub type Held = Option<String>
 
 /// A proof may only sit under the bare key, and a sample only under the key of the plan that
-/// produced it. The reason to give, whether the cache answered, and — when it did not, because
-/// something was filed under the wrong key — the word that says what was wrong with it.
-pub fn verdict_of(bare: Held, planned: Held, key: String) -> Answer =
+/// produced it. The reason to give, where the evidence is read from, and — when something was filed
+/// under the wrong key — what was wrong with it.
+pub fn verdict_of(bare_key: String, plan_key: String, bare: Held, planned: Held) -> Answer =
   match bare {
-    None -> match planned { None -> missed(Fresh), Some(kind) -> refused(kind, true, key) },
-    Some(kind) -> if kind == "proof" { { reason: FromProof, answered: true, warning: None } }
-    else { refused(kind, false, key) },
+    None -> match planned {
+      None -> missed(Fresh),
+      Some(kind) -> if kind == "sample" {
+        { reason: FromSample, from: Some(plan_key), warning: None }
+      } else { refused(kind, false, bare_key) },
+    },
+    Some(kind) -> if kind == "proof" { { reason: FromProof, from: Some(bare_key), warning: None } }
+    else { refused(kind, true, bare_key) },
   }
 
-// `bare` is which key was filled: a proof may only sit under the bare one, and a sample only under
-// the plan's. A cache that silently declines looks like a slow prover, so a refusal is reported.
+// `bare` is which key was filled. A cache that silently declines looks like a slow prover, so a
+// refusal is reported.
 fn refused(kind: String, bare: Bool, key: String) -> Answer = {
   let what = if kind == "sample" { "a sampled discharge" }
   else if kind == "proof" { "a proof" }
@@ -127,10 +167,10 @@ fn refused(kind: String, bare: Bool, key: String) -> Answer = {
   let where = if bare { "the bare key" } else { "a plan key" };
   {
     reason: CacheRefused,
-    answered: false,
+    from: None,
     warning: Some(
       "the obligation cache holds " ++ what ++ " under " ++ where ++ " for `"
-        ++ string_slice(key, 0, 8)
+        ++ string_slice(key, 0, 12)
         ++ "`; it was discarded",
     ),
   }
@@ -139,8 +179,8 @@ fn refused(kind: String, bare: Bool, key: String) -> Answer = {
 /// What the cache answered for each obligation, parallel to the obligation list.
 pub type Selection = {
   reasons: List<Reason>,
-  /// Whether each obligation's evidence came back.
-  answered: List<Bool>,
+  /// The key each obligation's evidence is read back from, when the cache answered for it.
+  from: List<Option<String>>,
   /// Indices the cache could not answer for, in order.
   to_discharge: List<Int>,
   warnings: List<String>,
@@ -148,19 +188,42 @@ pub type Selection = {
 
 pub fn hits(s: Selection) -> Int = len(filter(s.reasons, reason_hit))
 
-/// `hosted` is whether each obligation reaches the world, and `answers` what the caller's lookup
-/// made of it. A `law/host` is never cached: a verdict against a real database is about that moment.
+/// `hosted` is whether each obligation reaches the world, and `answers` what the cache held for it.
+/// A `law/host` is never cached: a verdict against a real database is about that moment.
 pub fn select(hosted: List<Bool>, answers: List<Answer>, use_cache: Bool) -> Selection = {
   let decided = map(range(0, len(hosted)), |i: Int|
     if use_cache && !at_or(hosted, i) { at_or(answers, i) } else { missed(Uncached) });
   {
     reasons: map(decided, |a: Answer| a.reason),
-    answered: map(decided, |a: Answer| a.answered),
-    to_discharge: indices_where(len(decided), |i: Int| !at_or(decided, i).answered),
+    from: map(decided, |a: Answer| a.from),
+    to_discharge: indices_where(len(decided), |i: Int| at_or(decided, i).from == None),
     warnings: fold(decided, [], |acc: List<String>, a: Answer|
       match a.warning { Some(w) -> push(acc, w), None -> acc }),
   }
 }
+
+/// Where each discharge just made is filed: a proof under the obligation's own key, anything weaker
+/// under the plan's. Only what held is filed — a refutation, a vacuity and a gap re-run until they
+/// go green — and nothing is when the cache is off or the claim reaches the world.
+pub fn filings(
+  keys: List<{ bare: String, planned: String }>,
+  hosted: List<Bool>,
+  outcomes: List<Option<Tier>>,
+  to_discharge: List<Int>,
+  use_cache: Bool,
+) -> List<{ at: Int, key: String }> =
+  if !use_cache { [] } else {
+    fold(to_discharge, [], |acc: List<{ at: Int, key: String }>, at: Int|
+      if at_or(hosted, at) { acc } else {
+        match at_or(outcomes, at) {
+          None -> acc,
+          Some(tier) -> {
+            let k = at_or(keys, at);
+            push(acc, { at: at, key: if tier == Proved { k.bare } else { k.planned } })
+          },
+        }
+      })
+  }
 
 // --- How much of the program a reader still has to read ------------------------
 
@@ -214,11 +277,14 @@ fn strongest_tier(held: Option<Tier>, tier: Tier) -> Tier =
 fn tier_of(strongest: Map<String, Tier>, name: String) -> String =
   match map_get(strongest, name) { Some(t) -> tier_word(t), None -> "" }
 
+/// What an obligation is about, before anything became of it.
+pub type Claimed = { owner: String, kind: Kind }
+
 /// How many definitions carry at least one obligation at all, whatever became of it. A definition
 /// named twice by the same law is still one definition.
-pub fn specified(defs: List<String>, laws: Laws, claims: List<ClaimRow>) -> Int = {
-  let named = fold(claims, [], |acc: List<String>, c: ClaimRow|
-    fold(covered_by(c, laws), acc, |out: List<String>, name: String|
+pub fn specified(defs: List<String>, laws: Laws, claims: List<Claimed>) -> Int = {
+  let named = fold(claims, [], |acc: List<String>, c: Claimed|
+    fold(owners_of(c.owner, c.kind, laws), acc, |out: List<String>, name: String|
       if contains_text(out, name) { out } else { push(out, name) }));
   len(filter(named, |name: String| contains_text(defs, name)))
 }
@@ -291,7 +357,10 @@ pub fn review(
               None -> Never,
               Some(was) -> moved(was.def_hash == now.def_hash),
             },
-            spec: match baseline { None -> Never, Some(was) -> moved(was.specs == now.specs) },
+            spec: match baseline {
+              None -> Never,
+              Some(was) -> moved(spec_set(was.specs) == spec_set(now.specs)),
+            },
             obligations: owned(owed, name),
             holding: len(filter(owned(owed, name), |i: Int| at_or(results, i).holds)),
           };
@@ -317,8 +386,10 @@ pub fn review(
 }
 
 // A clause covers its owner; a law covers everything it names, which is why a law is worth writing.
-fn owners(r: ClaimRow, laws: Laws) -> List<String> =
-  match r.kind { Ensures(_) -> [r.owner], Law(_) -> law_targets(laws, r.owner) }
+fn owners(r: ClaimRow, laws: Laws) -> List<String> = owners_of(r.owner, r.kind, laws)
+
+fn owners_of(owner: String, kind: Kind, laws: Laws) -> List<String> =
+  match kind { Ensures(_) -> [owner], Law(_) -> law_targets(laws, owner) }
 
 fn owned(m: Map<String, List<Int>>, name: String) -> List<Int> =
   match map_get(m, name) { Some(xs) -> xs, None -> [] }
@@ -510,28 +581,29 @@ fn ends_in_vowel(stem: String) -> Bool =
 
 test "the cache answers per obligation, and a host is never cached" {
   let answers = [
-    { reason: FromProof, answered: true, warning: None },
-    { reason: Fresh, answered: false, warning: None },
-    { reason: FromSample, answered: true, warning: None },
+    { reason: FromProof, from: Some("k0"), warning: None },
+    { reason: Fresh, from: None, warning: None },
+    { reason: FromSample, from: Some("p2"), warning: None },
   ];
   let hosted = [false, false, true];
   let s = select(hosted, answers, true);
   // The third reaches the world, so it is discharged whatever the cache holds.
   assert_eq(s.reasons, [FromProof, Fresh, Uncached]);
-  assert_eq(s.answered, [true, false, false]);
+  assert_eq(s.from, [Some("k0"), None, None]);
   assert_eq(s.to_discharge, [1, 2]);
   assert_eq(hits(s), 1);
   assert_eq(s.warnings, []);
   // `--no-cache` makes every obligation unanswerable, host or not.
   let s = select(hosted, answers, false);
   assert_eq(s.reasons, [Uncached, Uncached, Uncached]);
+  assert_eq(s.from, [None, None, None]);
   assert_eq(s.to_discharge, [0, 1, 2]);
   assert_eq(hits(s), 0);
   // A refusal is an answer, and not evidence: it is reported and the obligation runs again.
   let refused = [
     {
       reason: CacheRefused,
-      answered: false,
+      from: None,
       warning: Some("the obligation cache holds something else for `ab`; it was discarded"),
     },
   ];
@@ -539,6 +611,91 @@ test "the cache answers per obligation, and a host is never cached" {
   assert_eq(s.reasons, [CacheRefused]);
   assert_eq(s.to_discharge, [0]);
   assert_eq(s.warnings, ["the obligation cache holds something else for `ab`; it was discarded"])
+}
+
+fn bare() -> String = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+fn planned() -> String = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+fn verdict(b: Held, p: Held) -> Answer = verdict_of(bare(), planned(), b, p)
+
+// Every combination of what the two keys can hold: nothing, a proof, a sample, or an entry the
+// runtime could not read.
+test "a proof is read under the bare key and a sample under the plan's, and nothing else" {
+  assert_eq(verdict(None, None), { reason: Fresh, from: None, warning: None });
+  assert_eq(verdict(Some("proof"), None), { reason: FromProof, from: Some(bare()), warning: None });
+  // A sample under the plan's key is exactly what belongs there.
+  assert_eq(verdict(None, Some("sample")), {
+    reason: FromSample,
+    from: Some(planned()),
+    warning: None,
+  });
+  // The bare key decides whatever the plan's holds.
+  assert_eq(verdict(Some("proof"), Some("sample")).reason, FromProof);
+  assert_eq(verdict(Some("proof"), Some("proof")).from, Some(bare()));
+  assert_eq(verdict(Some("sample"), Some("sample")).reason, CacheRefused);
+  assert_eq(verdict(Some("other"), Some("sample")).reason, CacheRefused)
+}
+
+test "anything under the wrong key is refused, and says which key it was under" {
+  let bare_sample = verdict(Some("sample"), None);
+  assert_eq(bare_sample.reason, CacheRefused);
+  assert_eq(bare_sample.from, None);
+  assert_eq(
+    bare_sample.warning,
+    Some(
+      "the obligation cache holds a sampled discharge under the bare key for `0123456789ab`; it was discarded",
+    ),
+  );
+  let planned_proof = verdict(None, Some("proof"));
+  assert_eq(planned_proof.reason, CacheRefused);
+  assert_eq(
+    planned_proof.warning,
+    Some(
+      "the obligation cache holds a proof under a plan key for `0123456789ab`; it was discarded",
+    ),
+  );
+  assert_eq(
+    verdict(Some("other"), None).warning,
+    Some(
+      "the obligation cache holds something it cannot read under the bare key for `0123456789ab`; it was discarded",
+    ),
+  );
+  assert_eq(
+    verdict(None, Some("other")).warning,
+    Some(
+      "the obligation cache holds something it cannot read under a plan key for `0123456789ab`; it was discarded",
+    ),
+  );
+  // A refusal is discharged again, and its warning reaches the run.
+  let s = select([false, false], [planned_proof, verdict(None, Some("sample"))], true);
+  assert_eq(s.to_discharge, [0]);
+  assert_eq(len(s.warnings), 1);
+  assert_eq(hits(s), 1)
+}
+
+test "a proof is filed under the bare key, anything weaker under the plan's, and a failure nowhere" {
+  let keys = [
+    { bare: "b0", planned: "p0" },
+    { bare: "b1", planned: "p1" },
+    { bare: "b2", planned: "p2" },
+    { bare: "b3", planned: "p3" },
+  ];
+  let outcomes = [Some(Proved), Some(Property), None, Some(Example)];
+  assert_eq(filings(keys, [false, false, false, false], outcomes, [0, 1, 2, 3], true), [
+    { at: 0, key: "b0" },
+    { at: 1, key: "p1" },
+    { at: 3, key: "p3" },
+  ]);
+  // Only what this run discharged: an answer from the cache is already filed.
+  assert_eq(filings(keys, [false, false, false, false], outcomes, [1], true), [
+    { at: 1, key: "p1" },
+  ]);
+  // A claim that reaches the world is about that moment, and `--no-cache` writes nothing at all.
+  assert_eq(filings(keys, [true, false, false, false], outcomes, [0, 1], true), [
+    { at: 1, key: "p1" },
+  ]);
+  assert_eq(filings(keys, [false, false, false, false], outcomes, [0, 1, 2, 3], false), [])
 }
 
 test "a law names definitions, and the sentence it was written as is part of their spec" {
@@ -598,16 +755,80 @@ test "the strongest discharge is what a definition is covered by" {
 test "a law covers every definition it names, and a definition named twice is still one" {
   let laws = add_law(no_laws(), "m.sorted", "h-law", ["m.sort", "m.insert"]);
   let defs = ["m.sort", "m.insert", "m.other"];
-  let results = [a_law("m.sorted", Some(Proved)), a_clause("m.sort", Some(Example))];
-  assert_eq(specified(defs, laws, results), 2);
-  // A claim about a definition outside the program is not counted, and neither is one that held
-  // nothing.
-  let outside = [a_clause("m.gone", Some(Proved))];
-  assert_eq(specified(defs, laws, outside), 0);
-  assert_eq(specified(defs, laws, [a_row("m.sort", Ensures(0), None, false, true)]), 1)
+  let claims = [{ owner: "m.sorted", kind: Law(None) }, { owner: "m.sort", kind: Ensures(0) }];
+  assert_eq(specified(defs, laws, claims), 2);
+  // A claim about a definition outside the program is not counted.
+  assert_eq(specified(defs, laws, [{ owner: "m.gone", kind: Ensures(0) }]), 0);
+  // Carrying a claim is a fact about the program, whatever became of the claim.
+  assert_eq(specified(defs, laws, [{ owner: "m.sort", kind: Ensures(0) }]), 1);
+  assert_eq(specified(defs, laws, []), 0)
 }
 
-fn records(
+test "a law covers the definitions it mentions, and nothing else it names" {
+  let laws = laws_of(["m.credited", "m.debited", "m.helper"], [
+    {
+      key: "m.cancel",
+      text: "h9",
+      mentions: ["m.credited", "m.debited", "std.list.len", "m.Coin"],
+    },
+  ]);
+  assert_eq(law_targets(laws, "m.cancel"), ["m.credited", "m.debited"]);
+  assert_eq(law_text(laws, "m.cancel"), Some("h9"));
+  let c = coverage(["m.credited", "m.debited", "m.helper"], laws, [
+    a_law("m.cancel", Some(Proved)),
+  ]);
+  assert_eq(c.covered, 2);
+  assert_eq(c.uncovered, ["m.helper"]);
+  // A law that does not hold covers nothing.
+  let refuted = coverage(["m.credited"], laws, [a_row("m.cancel", Law(None), None, false, true)]);
+  assert_eq(refuted.covered, 0);
+  assert_eq(refuted.uncovered, ["m.credited"])
+}
+
+test "a definition with no obligation is never covered, and each covered one counts once" {
+  let none = coverage(["m.f"], no_laws(), []);
+  assert_eq(none.covered, 0);
+  assert_eq(none.uncovered, ["m.f"]);
+  // Only an obligation that holds covers its definition.
+  let c = coverage(["m.f", "m.g", "m.h", "m.i"], no_laws(), [
+    a_clause("m.f", Some(Proved)),
+    a_row("m.g", Ensures(0), None, false, true),
+    a_row("m.h", Ensures(0), None, false, false),
+  ]);
+  assert_eq(c.definitions, 4);
+  assert_eq(c.covered, 1);
+  assert_eq(c.uncovered, ["m.g", "m.h", "m.i"]);
+  let both = coverage(["m.f", "m.g"], no_laws(), [
+    a_clause("m.f", Some(Example)),
+    { ..a_clause("m.f", Some(Proved)), kind: Ensures(1) },
+    a_clause("m.g", Some(Property)),
+  ]);
+  assert_eq(
+    fold(both.by_tier, 0, |n: Int, b: { tier: Tier, count: Int }| n + b.count),
+    both.covered,
+  )
+}
+
+test "a definition's record is its hash, its own clauses and the laws naming it" {
+  let laws = add_law(no_laws(), "m.cancel", "h-law", ["m.f"]);
+  let rs = records(
+    [
+      { name: "m.f", hash: Some("h1"), specs: ["h7"] },
+      { name: "m.g", hash: Some("h2"), specs: [] },
+      { name: "m.unhashed", hash: None, specs: ["h8"] },
+    ],
+    laws,
+  );
+  // One baseline per hashed definition, keyed by name.
+  // A spec is a set, so it has one spelling however it was gathered.
+  assert_eq(rs, [
+    { name: "m.f", record: { def_hash: "h1", specs: ["h-law", "h7"] } },
+    { name: "m.g", record: { def_hash: "h2", specs: [] } },
+  ]);
+  assert_eq(map_get(record_map(rs), "m.g"), Some({ def_hash: "h2", specs: [] }))
+}
+
+fn baselines_of(
   xs: List<{ name: String, def_hash: String, specs: List<String> }>,
 ) -> Map<String, Record> =
   fold(
@@ -620,13 +841,13 @@ fn records(
 test "the review names what moved, and what became of the claims that went with it" {
   let laws = no_laws();
   let defs = ["m.moved", "m.spec_moved", "m.same", "m.fresh"];
-  let current = records([
+  let current = baselines_of([
     { name: "m.moved", def_hash: "h2", specs: ["s1"] },
     { name: "m.spec_moved", def_hash: "h1", specs: ["s2"] },
     { name: "m.same", def_hash: "h1", specs: ["s1"] },
     { name: "m.fresh", def_hash: "h1", specs: ["s1"] },
   ]);
-  let baselines = records([
+  let baselines = baselines_of([
     { name: "m.moved", def_hash: "h1", specs: ["s1"] },
     { name: "m.spec_moved", def_hash: "h1", specs: ["s1"] },
     { name: "m.same", def_hash: "h1", specs: ["s1"] },
@@ -665,7 +886,7 @@ test "a law that moved takes its targets' spec with it" {
     def_hash: "h1",
     specs: spec_hashes("m.sort", map_new(), laws),
   });
-  let baselines = records([{ name: "m.sort", def_hash: "h1", specs: ["h-law-1"] }]);
+  let baselines = baselines_of([{ name: "m.sort", def_hash: "h1", specs: ["h-law-1"] }]);
   let r = review(defs, laws, current, baselines, []);
   assert_eq(map(r.changed, |c: Change| c.name), ["m.sort"]);
   assert_eq(moved_word(at_or(r.changed, 0).implementation), "unchanged");
@@ -673,6 +894,132 @@ test "a law that moved takes its targets' spec with it" {
   // With no claims about it, nothing is broken by the move — but it is a list to read.
   assert_eq(r.broken, 0);
   assert_eq(r.undischarged, 0)
+}
+
+// The review a run over `after` reads, against the baseline `--accept` recorded over `before`.
+fn reviewed_after(
+  defs: List<String>,
+  before: List<Def>,
+  laws_before: Laws,
+  after: List<Def>,
+  laws_after: Laws,
+  results: List<ClaimRow>,
+) -> Changes =
+  review(
+    defs,
+    laws_after,
+    record_map(records(after, laws_after)),
+    record_map(records(before, laws_before)),
+    results,
+  )
+
+fn def(name: String, hash: String, specs: List<String>) -> Def =
+  { name: name, hash: Some(hash), specs: specs }
+
+test "what a review names: the moved half, the claims that went with it, and nothing unmoved" {
+  // An unchanged definition is not reported at all, though it has a baseline.
+  let same = reviewed_after(
+    ["m.f"],
+    [def("m.f", "h1", ["h7"])],
+    no_laws(),
+    [def("m.f", "h1", ["h7"])],
+    no_laws(),
+    [a_clause("m.f", Some(Proved))],
+  );
+  assert_eq(same.changed, []);
+  assert_eq(same.reviewed, 1);
+  // A definition with no baseline is unreviewed rather than unchanged.
+  let fresh = reviewed_after(
+    ["m.new"],
+    [def("m.old", "h1", [])],
+    no_laws(),
+    [def("m.new", "h1", [])],
+    no_laws(),
+    [],
+  );
+  assert_eq(map(fresh.changed, |c: Change| moved_word(c.implementation)), ["never"]);
+  assert_eq(fresh.reviewed, 0);
+  // Two changed definitions, one covered by a claim that holds: the other is a change this run
+  // says nothing about.
+  let two = reviewed_after(
+    ["m.f", "m.g"],
+    [def("m.f", "h1", ["h7"]), def("m.g", "h3", [])],
+    no_laws(),
+    [def("m.f", "h2", ["h7"]), def("m.g", "h4", [])],
+    no_laws(),
+    [a_clause("m.f", Some(Proved))],
+  );
+  assert_eq(len(two.changed), 2);
+  assert_eq(specified_changes(two), 1);
+  assert_eq(unspecified_changes(two), 1);
+  assert_eq(two.broken, 0)
+}
+
+test "a refuted claim is broken, and one never discharged is broken and undischarged too" {
+  let before = [def("m.f", "h1", ["h7"])];
+  let after = [def("m.f", "h2", ["h7"])];
+  let refuted = reviewed_after(["m.f"], before, no_laws(), after, no_laws(), [
+    a_row("m.f", Ensures(0), None, false, true),
+  ]);
+  assert_eq(refuted.broken, 1);
+  assert_eq(refuted.undischarged, 0);
+  let gap = reviewed_after(["m.f"], before, no_laws(), after, no_laws(), [
+    a_row("m.f", Ensures(0), None, false, false),
+  ]);
+  assert_eq(gap.broken, 1);
+  assert_eq(gap.undischarged, 1);
+  let entry = at_or(gap.changed, 0);
+  assert_eq(moved_word(entry.implementation), "changed");
+  assert_eq(moved_word(entry.spec), "unchanged");
+  // An obligation nothing established is not a specification that holds, and it is still a claim.
+  assert_eq(is_specified(entry), false);
+  assert_eq(claimed(entry), true);
+  assert_eq(specified_changes(gap), 0)
+}
+
+test "a baseline read back in another order is the same spec" {
+  let laws = add_law(add_law(no_laws(), "m.b", "h-b", ["m.f"]), "m.a", "h-a", ["m.f"]);
+  let now = record_map(records([def("m.f", "h1", ["h9", "h1c"])], laws));
+  let stored = baselines_of([
+    { name: "m.f", def_hash: "h1", specs: ["h9", "h-b", "h1c", "h-a", "h9"] },
+  ]);
+  let r = review(["m.f"], laws, now, stored, []);
+  assert_eq(r.changed, []);
+  assert_eq(r.reviewed, 1)
+}
+
+test "a law's text is its targets' spec, wherever the law is declared" {
+  let f = [def("m.f", "h1", [])];
+  // Moving a law between modules changes its key and not its text, so no baseline moves.
+  let moved_law = reviewed_after(
+    ["m.f"],
+    f,
+    add_law(no_laws(), "a.cancel", "h9", ["m.f"]),
+    f,
+    add_law(no_laws(), "b.cancel", "h9", ["m.f"]),
+    [a_law("b.cancel", Some(Proved))],
+  );
+  assert_eq(moved_law.changed, []);
+  // Rewriting it, or deleting it, is a spec change on everything it named.
+  let rewritten = reviewed_after(
+    ["m.f"],
+    f,
+    add_law(no_laws(), "m.cancel", "h9", ["m.f"]),
+    f,
+    add_law(no_laws(), "m.cancel", "h10", ["m.f"]),
+    [a_law("m.cancel", Some(Proved))],
+  );
+  assert_eq(map(rewritten.changed, |c: Change| moved_word(c.spec)), ["changed"]);
+  assert_eq(map(rewritten.changed, |c: Change| moved_word(c.implementation)), ["unchanged"]);
+  let deleted = reviewed_after(
+    ["m.f"],
+    f,
+    add_law(no_laws(), "m.cancel", "h9", ["m.f"]),
+    f,
+    no_laws(),
+    [],
+  );
+  assert_eq(map(deleted.changed, |c: Change| moved_word(c.spec)), ["changed"])
 }
 
 test "every word a report prints for a reason, a tier, or a move" {

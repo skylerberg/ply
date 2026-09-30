@@ -1,7 +1,7 @@
 use ply_span::{SourceId, Symbol};
 use ply_test::bisect::{
-    Baseline, Change, ChangeKind, Classify, DefKey, DepEdges, Diff, Regression, Rehashed,
-    StoreClassify, Unknown, diff,
+    Baseline, ChangeSet, Classify, DefKey, Regression, Rehashed, Row, StoreClassify, Unknown,
+    change_set,
 };
 use ply_ty::CheckOutput;
 use ply_ty::{DefHash, HashOutput};
@@ -118,7 +118,10 @@ impl Classify for Renormalizing {
     }
 }
 
-fn diff_of(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> Diff {
+/// What the runtime hands the program about one failure: a row of facts per definition either era's
+/// closure holds. Which kind of change the facts make is `suite.delta`'s to decide, and its tests pin
+/// that; these pin the facts, over real programs.
+fn facts_of(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> ChangeSet {
     let baseline = before.baseline(key);
     let mut classify = Renormalizing::new(after, &baseline, independent);
     let key = Symbol::new(key);
@@ -128,15 +131,30 @@ fn diff_of(before: &Compiled, after: &Compiled, key: &str, independent: bool) ->
         baseline: &baseline,
         hashes: &after.hashes,
     };
-    let mut edges = DepEdges::new();
-    edges.extend_from_hashes(&after.hashes);
-    diff(&regression, &mut classify, &edges)
+    change_set(&regression, &mut classify)
 }
 
-fn kind_of(diff: &Diff, name: &str) -> Option<ChangeKind> {
-    diff.delta
-        .change(&Symbol::new(name))
-        .map(|c: &Change| c.kind)
+#[track_caller]
+fn row<'a>(facts: &'a ChangeSet, key: &DefKey) -> &'a Row {
+    facts
+        .rows
+        .iter()
+        .find(|r| &r.key == key)
+        .unwrap_or_else(|| panic!("no row for {key:?} in {facts:#?}"))
+}
+
+fn value(name: &str) -> DefKey {
+    DefKey::value(Symbol::new(name))
+}
+
+/// Its body is today's, hashed as the baseline wrote references: what an edit leaves.
+fn edited(r: &Row) -> bool {
+    r.before != r.after && r.rehashed.is_some() && r.rehashed != r.before
+}
+
+/// Its hash moved and its body did not: what an edit beneath it leaves.
+fn derived(r: &Row) -> bool {
+    r.before != r.after && r.rehashed == r.before
 }
 
 const CHAIN: &str = r#"
@@ -150,7 +168,7 @@ test "chain" {
 "#;
 
 #[test]
-fn an_edit_to_a_leaf_leaves_its_dependents_derived() {
+fn an_edit_to_a_leaf_leaves_what_references_it_rehashing_to_its_baseline() {
     let before = Compiled::new(CHAIN);
     let after = Compiled::new(&CHAIN.replace(
         "fn leaf(n: Int) -> Int = n + 1",
@@ -162,66 +180,62 @@ fn an_edit_to_a_leaf_leaves_its_dependents_derived() {
         after.hashes.defs.get(&Symbol::new("top"))
     );
 
-    let diff = diff_of(&before, &after, "chain", true);
-    assert_eq!(kind_of(&diff, "leaf"), Some(ChangeKind::Edited));
-    assert_eq!(kind_of(&diff, "mid"), Some(ChangeKind::Derived));
-    assert_eq!(kind_of(&diff, "top"), Some(ChangeKind::Derived));
-    assert!(diff.unclassified.is_empty(), "{:?}", diff.unclassified);
-
-    // Three hashes moved and exactly one is worth a hybrid.
-    assert_eq!(diff.delta.candidates(), 1);
-    assert_eq!(diff.delta.clusters.len(), 1);
-    assert_eq!(diff.delta.clusters[0].members, vec![Symbol::new("leaf")]);
-}
-
-#[test]
-fn two_edits_are_two_candidates() {
-    let before = Compiled::new(CHAIN);
-    let after = Compiled::new(
-        &CHAIN
-            .replace(
-                "fn leaf(n: Int) -> Int = n + 1",
-                "fn leaf(n: Int) -> Int = n + 2",
-            )
-            .replace(
-                "fn top(n: Int) -> Int = mid(n) + 1",
-                "fn top(n: Int) -> Int = mid(n) + 5",
-            ),
+    let facts = facts_of(&before, &after, "chain", true);
+    assert!(edited(row(&facts, &value("leaf"))));
+    assert!(derived(row(&facts, &value("mid"))));
+    assert!(derived(row(&facts, &value("top"))));
+    // The mentions a fusion reads, restricted to the closure.
+    assert_eq!(
+        row(&facts, &value("leaf")).referrers,
+        vec![Symbol::new("mid")]
     );
-
-    let diff = diff_of(&before, &after, "chain", true);
-    assert_eq!(kind_of(&diff, "leaf"), Some(ChangeKind::Edited));
-    assert_eq!(kind_of(&diff, "mid"), Some(ChangeKind::Derived));
-    assert_eq!(kind_of(&diff, "top"), Some(ChangeKind::Edited));
-    assert_eq!(diff.delta.candidates(), 2);
-    assert_eq!(diff.delta.clusters.len(), 2);
+    assert_eq!(
+        row(&facts, &value("mid")).referrers,
+        vec![Symbol::new("top")]
+    );
+    // Interfaces are compared only for a body that moved on its own.
+    assert_eq!(row(&facts, &value("leaf")).stable, Some(true));
+    assert_eq!(row(&facts, &value("mid")).stable, None);
 }
 
 #[test]
-fn renaming_a_definition_produces_no_change_at_all() {
+fn a_renamed_definition_keeps_its_hash_in_the_program() {
     let before = Compiled::new(CHAIN);
     let after = Compiled::new(&CHAIN.replace("leaf", "first"));
 
-    let diff = diff_of(&before, &after, "chain", true);
-    assert!(diff.delta.changes.is_empty(), "{:?}", diff.delta.changes);
-    assert!(diff.delta.clusters.is_empty());
+    let facts = facts_of(&before, &after, "chain", true);
+    let gone = row(&facts, &value("leaf"));
+    assert_eq!(gone.after, None);
+    assert!(
+        gone.kept,
+        "its hash is still in the program, under the new name"
+    );
+    let arrived = row(&facts, &value("first"));
+    assert_eq!(arrived.before, None);
+    assert_eq!(
+        arrived.after, gone.before,
+        "a rename moves a name and no hash"
+    );
+    for name in ["mid", "top"] {
+        let r = row(&facts, &value(name));
+        assert_eq!(r.before, r.after, "{name}");
+    }
 }
 
 #[test]
-fn editing_the_test_body_is_recorded_on_the_test_rather_than_on_a_definition() {
+fn an_edit_to_the_test_body_rehashes_away_from_its_baseline() {
     let before = Compiled::new(CHAIN);
     let after = Compiled::new(&CHAIN.replace("assert_eq(top(1), 4)", "assert_eq(top(2), 4)"));
 
-    let diff = diff_of(&before, &after, "chain", true);
-    let test = diff.delta.test.as_ref().expect("the test itself moved");
-    assert_eq!(test.name, Symbol::new("chain"));
-    assert_eq!(test.kind, ChangeKind::Edited);
-    assert!(diff.delta.changes.is_empty(), "{:?}", diff.delta.changes);
-    assert!(!diff.test_unclassified);
+    let facts = facts_of(&before, &after, "chain", true);
+    assert_eq!(facts.test, Symbol::new("chain"));
+    assert_ne!(facts.after, Some(facts.before));
+    assert!(facts.rehashed.is_some() && facts.rehashed != Some(facts.before));
+    assert!(facts.rows.iter().all(|r| r.before == r.after));
 }
 
 #[test]
-fn a_test_whose_closure_moved_is_not_itself_a_change() {
+fn a_test_whose_closure_moved_rehashes_to_its_baseline() {
     let before = Compiled::new(CHAIN);
     let after = Compiled::new(&CHAIN.replace(
         "fn leaf(n: Int) -> Int = n + 1",
@@ -229,69 +243,43 @@ fn a_test_whose_closure_moved_is_not_itself_a_change() {
     ));
 
     assert_ne!(before.test_hash("chain"), after.test_hash("chain"));
-    let diff = diff_of(&before, &after, "chain", true);
-    assert!(diff.delta.test.is_none());
-    assert!(!diff.test_unclassified);
+    let facts = facts_of(&before, &after, "chain", true);
+    assert_eq!(facts.rehashed, Some(facts.before));
 }
 
 #[test]
-fn an_added_definition_is_a_candidate_and_fuses_with_its_caller() {
+fn an_added_definition_is_named_with_what_mentions_it() {
     let before = Compiled::new(CHAIN);
     let after = Compiled::new(&CHAIN.replace(
         "fn mid(n: Int) -> Int = leaf(n) + 1",
         "fn bump(n: Int) -> Int = n\nfn mid(n: Int) -> Int = bump(leaf(n)) + 1",
     ));
 
-    let diff = diff_of(&before, &after, "chain", true);
-    assert_eq!(kind_of(&diff, "bump"), Some(ChangeKind::Added));
-    assert_eq!(kind_of(&diff, "mid"), Some(ChangeKind::Edited));
-    let cluster = diff
-        .delta
-        .clusters
-        .iter()
-        .find(|c| c.members.contains(&Symbol::new("bump")))
-        .expect("bump is in a cluster");
-    assert!(cluster.members.contains(&Symbol::new("mid")));
+    let facts = facts_of(&before, &after, "chain", true);
+    let added = row(&facts, &value("bump"));
+    assert_eq!(added.before, None);
+    assert!(added.after.is_some());
+    assert_eq!(added.referrers, vec![Symbol::new("mid")]);
+    assert!(edited(row(&facts, &value("mid"))));
 }
 
 #[test]
-fn a_removed_definition_is_a_candidate() {
+fn a_removed_definition_is_gone_from_the_program() {
     let before = Compiled::new(&CHAIN.replace(
         "fn mid(n: Int) -> Int = leaf(n) + 1",
         "fn spare(n: Int) -> Int = n\nfn mid(n: Int) -> Int = spare(leaf(n)) + 1",
     ));
     let after = Compiled::new(CHAIN);
 
-    let diff = diff_of(&before, &after, "chain", true);
-    assert_eq!(kind_of(&diff, "spare"), Some(ChangeKind::Removed));
-    assert_eq!(kind_of(&diff, "mid"), Some(ChangeKind::Edited));
+    let facts = facts_of(&before, &after, "chain", true);
+    let removed = row(&facts, &value("spare"));
+    assert_eq!(removed.after, None);
+    assert!(!removed.kept && !removed.renamed, "{removed:?}");
+    assert!(edited(row(&facts, &value("mid"))));
 }
 
 #[test]
-fn a_mutually_recursive_pair_is_classified_rather_than_given_up_on() {
-    let src = r#"
-fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
-fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
-fn parity(n: Int) -> Bool = even(n)
-
-test "parity holds" {
-  assert(parity(4))
-}
-"#;
-    let before = Compiled::new(src);
-    let after = Compiled::new(&src.replace(
-        "fn parity(n: Int) -> Bool = even(n)",
-        "fn parity(n: Int) -> Bool = even(n + 2)",
-    ));
-
-    let diff = diff_of(&before, &after, "parity holds", true);
-    assert_eq!(kind_of(&diff, "parity"), Some(ChangeKind::Edited));
-    assert_eq!(kind_of(&diff, "even"), None, "the pair did not move");
-    assert!(diff.unclassified.is_empty(), "{:?}", diff.unclassified);
-}
-
-#[test]
-fn editing_one_member_of_a_component_moves_the_whole_component() {
+fn editing_one_member_of_a_component_moves_the_whole_component_and_names_it() {
     let src = r#"
 fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
 fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
@@ -306,13 +294,16 @@ test "parity holds" {
         "fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) && true }",
     ));
 
-    let diff = diff_of(&before, &after, "parity holds", true);
-    assert_eq!(kind_of(&diff, "odd"), Some(ChangeKind::Edited));
-    assert_eq!(kind_of(&diff, "even"), Some(ChangeKind::Edited));
+    let facts = facts_of(&before, &after, "parity holds", true);
+    assert!(edited(row(&facts, &value("odd"))));
+    assert!(edited(row(&facts, &value("even"))));
+    let pair = vec![value("even"), value("odd")];
+    assert_eq!(row(&facts, &value("even")).component, pair);
+    assert_eq!(row(&facts, &value("odd")).component, pair);
 }
 
 #[test]
-fn a_classifier_with_no_evidence_calls_everything_edited() {
+fn a_classifier_with_no_evidence_answers_nothing() {
     let before = Compiled::new(CHAIN);
     let after = Compiled::new(&CHAIN.replace(
         "fn leaf(n: Int) -> Int = n + 1",
@@ -327,17 +318,16 @@ fn a_classifier_with_no_evidence_calls_everything_edited() {
         baseline: &baseline,
         hashes: &after.hashes,
     };
-    let diff = diff(&regression, &mut Unknown, &DepEdges::from(&after.hashes));
-
-    assert_eq!(diff.delta.candidates(), 3);
-    assert_eq!(diff.unclassified.len(), 3);
-    assert!(diff.test_unclassified);
+    let facts = change_set(&regression, &mut Unknown);
+    assert_eq!(facts.rehashed, None);
     assert!(
-        diff.delta.test.is_none(),
-        "an unclassifiable test is not accused"
+        facts
+            .rows
+            .iter()
+            .all(|r| r.rehashed.is_none() && r.stable.is_none() && r.component.is_empty())
     );
-    // Nothing is independent without an interface to compare, so the three fuse.
-    assert_eq!(diff.delta.clusters.len(), 1);
+    // The hashes themselves are facts no classifier is needed for.
+    assert_eq!(facts.rows.iter().filter(|r| r.before != r.after).count(), 3);
 }
 
 #[track_caller]
@@ -478,7 +468,7 @@ fn an_interface_the_store_never_saw_is_a_refusal_rather_than_a_yes() {
 }
 
 #[test]
-fn the_store_backed_classifier_produces_the_same_split() {
+fn the_store_backed_classifier_answers_the_same_facts() {
     let before = Compiled::new(SIGNATURE);
     let after = Compiled::new(&SIGNATURE.replace("n * 2", "n * 3"));
     let (_root, store) = stored(&before, &["scale", "total"]);
@@ -493,13 +483,17 @@ fn the_store_backed_classifier_produces_the_same_split() {
         baseline: &baseline,
         hashes: &after.hashes,
     };
-    let diff = diff(&regression, &mut classify, &DepEdges::from(&after.hashes));
+    let facts = change_set(&regression, &mut classify);
 
-    assert_eq!(kind_of(&diff, "scale"), Some(ChangeKind::Edited));
-    assert_eq!(kind_of(&diff, "total"), Some(ChangeKind::Derived));
-    assert!(diff.delta.test.is_none());
-    assert_eq!(diff.delta.clusters.len(), 1);
-    assert_eq!(diff.delta.clusters[0].members, vec![Symbol::new("scale")]);
+    let scale = row(&facts, &value("scale"));
+    assert!(edited(scale));
+    assert_eq!(
+        scale.stable,
+        Some(true),
+        "`n * 3` keeps the published interface"
+    );
+    assert!(derived(row(&facts, &value("total"))));
+    assert_eq!(facts.rehashed, Some(facts.before));
 }
 
 const STORE: &str = r#"
@@ -531,7 +525,7 @@ fn re_hashing_is_the_identity_across_a_module_boundary() {
 }
 
 #[test]
-fn an_edit_in_one_module_leaves_its_importer_derived() {
+fn an_edit_in_one_module_leaves_its_importer_rehashing_to_its_baseline() {
     let before = Compiled::of(&[("store", STORE), ("app", APP)]);
     let after = Compiled::of(&[
         (
@@ -541,18 +535,7 @@ fn an_edit_in_one_module_leaves_its_importer_derived() {
         ("app", APP),
     ]);
 
-    let baseline = before.baseline("app.doubling");
-    let mut classify = Renormalizing::new(&after, &baseline, true);
-    let key = Symbol::new("app.doubling");
-    let regression = Regression {
-        key: &key,
-        test_hash: after.test_hash("app.doubling"),
-        baseline: &baseline,
-        hashes: &after.hashes,
-    };
-    let diff = diff(&regression, &mut classify, &DepEdges::from(&after.hashes));
-
-    assert_eq!(kind_of(&diff, "store.lookup"), Some(ChangeKind::Edited));
-    assert_eq!(kind_of(&diff, "app.doubled"), Some(ChangeKind::Derived));
-    assert_eq!(diff.delta.candidates(), 1);
+    let facts = facts_of(&before, &after, "app.doubling", true);
+    assert!(edited(row(&facts, &value("store.lookup"))));
+    assert!(derived(row(&facts, &value("app.doubled"))));
 }

@@ -1,29 +1,35 @@
 // The obligations a project carries, and what became of each: what `ply prove` and `ply review`
-// are both about. The load, the store, the prover and the review baseline are the Rust side's — a
-// front end is not a value a program can hold, discharging a claim enters compiled bodies, and an
-// entry does not nest on the thread this program is itself running on. Which claims are asked for,
-// every line and key of both reports, and the code each run exits with are decided here.
+// are both about. The load, the store and the prover are the Rust side's — a front end is not a
+// value a program can hold, discharging a claim enters compiled bodies, and an entry does not nest
+// on the thread this program is itself running on. Which claims are asked for, the keys their
+// evidence is read and filed under, what the coverage, the review and the baseline come to, every
+// line and key of both reports, and the code each run exits with are decided here.
 
 import cmdline (Parsed, has, parse_nat, value, values_of)
 import proof.domain (Decl, Ty, finite, name_of, size)
 import proof.shrink (Offer, Reply)
 import machine
-import compiler.resolve (Diag, diag1)
+import compiler.resolve (Diag, diag, diag1)
+import std.bytes (bytes_of_hex, hex_of)
+// An obligation's key folds in the simulation's digest, which is the suite's own encoding.
+import suite.select (Search, digest_of)
+import proof.keys (plan_digest, prove_key)
 import diagnostic (Place, Spot, spot_of)
 import report (Answer, ind, ok_code, count_of, plural, reported, refused)
 import std.json (Json, Null, Str, Bool, Number, Array, Object, Member, object)
 import style (Style, plain, dim, red, green, yellow)
 // What a run decides lives in the suite, which is where the runtime reads it from; these are the
 // names and the words it marshals, so a program that reports on them shares the one definition.
-import proof.obligation (Binding, CacheRefused, Cases, Certificate, Change, Changed, Counter,
-                         Coverage, Ensures, Evidence, Example, Falsified, Frame, Fresh, FromProof,
-                         FromSample, Gap, GuardNotSampled, Held, Instantiation, Kept, Kind, Law,
-                         Moved, Never, NoCaseKept, NotDrawn, Outcome, Point, Proof, Property,
-                         Proved, Pure, Raised, ReachesHost, Reason, Refuted, Rejected, Sampled,
-                         Tier, Unattempted, Uncached, Unchanged, Undrawn, Ungeneratable,
-                         UnhandledEffect, Unsatisfiable, Vacuity, Vacuous, Writes, cases_summary,
-                         certificate_summary, evidence_summary, frame_summary, gap_summary,
-                         reason_word, tier_word, vacuity_summary)
+import proof.obligation (Binding, CacheRefused, Cases, Certificate, Change, Changed, ClaimRow,
+                         Counter, Coverage, Def, Ensures, Evidence, Example, Falsified, Frame,
+                         Fresh, FromProof, FromSample, Gap, GuardNotSampled, Held, Instantiation,
+                         Kept, Kind, Law, Laws, Moved, Never, NoCaseKept, NotDrawn, Outcome, Point,
+                         Proof, Property, Proved, Pure, Raised, ReachesHost, Reason, Record,
+                         Refuted, Rejected, Sampled, Tier, Unattempted, Uncached, Unchanged,
+                         Undrawn, Ungeneratable, UnhandledEffect, Unsatisfiable, Vacuity, Vacuous,
+                         Writes, Written, cases_summary, certificate_summary, coverage,
+                         evidence_summary, filings, frame_summary, gap_summary, hits, laws_of,
+                         reason_word, select, specified, tier_word, vacuity_summary, verdict_of)
 
 // What the Rust side collects, discharges, reviews and accepts, in that order. Collecting comes
 // first and once; a run then either accepts a baseline or discharges what it was asked for, and
@@ -71,10 +77,13 @@ pub nondet effect prover {
   // rule; the runtime only says what the types are.
   read typed[claims]() -> Result<Typed, Refusal>
   // What the obligation cache holds under each key the program names, spelled out: a proof, a
-  // sample, or something the runtime cannot read. The keys are the program's — a plan key is part
-  // of an obligation's own encoding — so no row could carry the answers.
+  // sample, or something the runtime cannot read. Every key is the program's: this is the only side
+  // that encodes one.
   read outcomes[claims](keys: List<String>) -> List<Option<String>>
-  read discharged[claims](choice: Choice) -> Result<Verdicts, Refusal>
+  read discharged[claims](choice: Choice) -> Result<Discharged, Refusal>
+  // Files the evidence of each discharge just made, by its place in the run, under the key this
+  // program chose for it, and answers what storing it had to say.
+  write record[claims](entries: List<{ at: Int, key: String }>) -> List<Diag>
   // One point of one obligation's guard, at a root and case the caller chose: what a search over
   // cases is made of, one case at a time. The index is the claim's place in the collection, as
   // `discharged` reads its wants, and the root is the seed a counterexample reports.
@@ -87,8 +96,9 @@ pub nondet effect prover {
   read would[claims](i: Int, position: Int) -> Result<Bool, Refusal>
   write accept[claims](i: Int, position: Int) -> Result<Unit, Refusal>
   read settled[claims]() -> Result<Option<Settled>, Refusal>
-  read reviewed[claims]() -> Changes
-  read accepted[claims]() -> Accepted
+  // The baseline a reader accepted for each definition in scope, where there is one.
+  read baselines[claims]() -> List<{ name: String, record: Record }>
+  write accepted[claims](records: List<{ name: String, record: Record }>) -> Accepted
 }
 
 // The walk's own vocabulary (`Ask`, `Reply`, `Offer`) is `proof.shrink`'s: the operations below are
@@ -150,8 +160,6 @@ pub type Refusal = | Broken(Refused) | Unbound(Refused) | Trouble(Refused)
 
 pub type Claim = {
   key: String,
-  // The key a discharge weaker than a proof is filed under. A proof may only sit under `key`.
-  planned: String,
   // `law/host`: a verdict against the world, which is never cached.
   host: Bool,
   owner: String,
@@ -164,11 +172,12 @@ pub type Claim = {
 }
 
 // What the program decided about a run of obligations: which ones it reports on, by collection
-// index, which of those the cache could not answer for, in that order, and the reason for each.
+// index, which of those the cache could not answer for, in that order, and the key each answered
+// one's evidence is read back from, by its place in the run.
 pub type Choice = {
   claims: List<Int>,
   runs: List<Int>,
-  reasons: List<String>,
+  read: List<{ at: Int, key: String }>,
   // The finite domains this side measured for the claims it wants walked. A claim without one is
   // sampled, which is a decision too.
   domains: List<Measured>,
@@ -184,7 +193,7 @@ pub type Binder = { name: String, text: String, ty: Ty }
 // Every obligation's binders, by collection index, and every declared type a size needs.
 pub type Typed = { decls: List<Decl>, claims: List<{ claim: Int, binders: List<Binder> }> }
 
-pub type Sim = { mode: String, roots: List<Int>, budget: Int, steps: Int }
+pub type Sim = { mode: String, roots: List<Int>, budget: Int, steps: Int, path: List<Int> }
 
 // What an obligation weaker than a proof was discharged against, and cached under.
 pub type Plan = {
@@ -200,39 +209,27 @@ pub type Collection = {
   places: List<Place>,
   warnings: List<Diag>,
   claims: List<Claim>,
-  // Definitions carrying at least one obligation, whatever became of it.
-  specified: Int,
+  // Every definition in scope, in name order.
+  defs: List<Def>,
+  laws: List<Written>,
   plan: Plan,
 }
 
-// The strength of what a run established, which decides what it may be cached under.
+// What the runtime discharged, parallel to the claims the run asked for.
+pub type Discharged = { outcomes: List<Outcome>, duration_ms: Decimal, warnings: List<Diag> }
 
-// Where one answer came from, which `--explain` prints under its row.
-
-// The review surface: how much of the program a reader still has to read line by line.
-
+// A run of obligations as a report reads it: what became of each claim it asked for, where each
+// answer came from, and the accounting over them.
 pub type Verdicts = {
   // Parallel to the indices the run asked for.
   outcomes: List<Outcome>,
   reasons: List<Reason>,
   coverage: Coverage,
   cached: Int,
+  // Definitions carrying at least one obligation, whatever became of it.
+  specified: Int,
   duration_ms: Decimal,
   warnings: List<Diag>,
-}
-
-// Whether something moved since the baseline a reader accepted.
-
-// The coverage and the definition count are the run's own, from the verdicts it read them off.
-pub type Changes = {
-  // Definitions with a baseline at all.
-  reviewed: Int,
-  changed: List<Change>,
-  // Obligations attached to a changed definition that did not hold.
-  broken: Int,
-  // How many of those were never discharged at all, rather than refuted or found vacuous.
-  undischarged: Int,
-  duration_ms: Decimal,
 }
 
 pub type Accepted = { definitions: Int, stored: Bool, warnings: List<Diag> }
@@ -392,12 +389,142 @@ pub fn rows_of(claims: List<Claim>, wanted: List<Int>, v: Verdicts) -> List<Row>
       },
     })
 
+// --- What a run decides -------------------------------------------------------
+
+/// What each law speaks about, among the definitions in scope.
+pub fn laws_in(c: Collection) -> Laws = laws_of(map(c.defs, |d: Def| d.name), c.laws)
+
+/// The digest of the plan everything weaker than a proof is filed under.
+pub fn plan_digest_of(p: Plan) -> Bytes =
+  plan_digest(
+    p.cases,
+    p.prove_budget,
+    p.step_budget,
+    p.roots,
+    digest_of({
+      mode: p.sim.mode,
+      roots: p.sim.roots,
+      budget: p.sim.budget,
+      steps: p.sim.steps,
+      path: p.sim.path,
+    }),
+  )
+
+// A refusal is reported: a cache that silently declines looks like a slow prover.
+fn refusal_warning(text: String) -> Diag = {
+  let d: Diag = diag(b"W0602", bytes_of_string(text), [], [
+    b"the obligation was discharged again, so no claim rests on it",
+    b"run `ply cache clear` if it happens again",
+  ]);
+  { ..d, severity: b"warning" }
+}
+
+// One claim's outcome, as the accounting over a run reads it.
+fn claim_row(c: Claim, o: Outcome) -> ClaimRow =
+  {
+    owner: c.owner,
+    kind: c.kind,
+    tier: tier_of(o),
+    holds: holds(o),
+    attempted: match o { Unattempted(_) -> false, _ -> true },
+  }
+
+/// The rows a run's accounting reads, parallel to the claims it asked for.
+pub fn claim_rows(c: Collection, wanted: List<Int>, outcomes: List<Outcome>) -> List<ClaimRow> =
+  fold(range(0, len(wanted)), [], |acc: List<ClaimRow>, i: Int|
+    match list_at(c.claims, match list_at(wanted, i) { Some(k) -> k, None -> -1 }) {
+      None -> acc,
+      Some(claim) -> match list_at(outcomes, i) {
+        None -> acc,
+        Some(o) -> push(acc, claim_row(claim, o)),
+      },
+    })
+
+/// A run of obligations, decided: what the cache answered for each claim the run reports on, what
+/// the runtime discharged, the evidence filed after, and the accounting a report reads.
+pub fn decided(
+  c: Collection,
+  wanted: List<Int>,
+  use_cache: Bool,
+) -> Result<Verdicts, Refusal> / {prover.outcomes[claims], prover.typed[claims], prover.discharged[claims], prover.record[claims]} = {
+  let digest = plan_digest_of(c.plan);
+  let asked = map(wanted, |i: Int| blank_claim(c.claims, i));
+  let keys = map(asked, |claim: Claim|
+    { bare: claim.key, planned: hex_of(prove_key(bytes_of_hex(claim.key), digest)) });
+  let answers = map(keys, |k: { bare: String, planned: String }| {
+    let held = prover.outcomes[claims]([k.bare, k.planned]);
+    verdict_of(k.bare, k.planned, held_at(held, 0), held_at(held, 1))
+  });
+  let hosted = map(asked, |claim: Claim| claim.host);
+  let selection = select(hosted, answers, use_cache);
+  let choice = {
+    claims: wanted,
+    runs: selection.to_discharge,
+    read: fold(range(0, len(selection.from)), [], |acc: List<{ at: Int, key: String }>, at: Int|
+      match list_at(selection.from, at) {
+        Some(Some(key)) -> push(acc, { at: at, key: key }),
+        _ -> acc,
+      }),
+    domains: measured(c, wanted, selection.to_discharge),
+  };
+  match prover.discharged[claims](choice) {
+    Err(why) -> Err(why),
+    Ok(d) -> {
+      let filed = filings(
+        keys,
+        hosted,
+        map(d.outcomes, tier_of),
+        selection.to_discharge,
+        use_cache,
+      );
+      let stored = if len(filed) == 0 { [] } else { prover.record[claims](filed) };
+      let laws = laws_in(c);
+      let names = map(c.defs, |x: Def| x.name);
+      Ok({
+        outcomes: d.outcomes,
+        reasons: selection.reasons,
+        coverage: coverage(names, laws, claim_rows(c, wanted, d.outcomes)),
+        cached: hits(selection),
+        specified: specified(
+          names,
+          laws,
+          map(c.claims, |claim: Claim| { owner: claim.owner, kind: claim.kind }),
+        ),
+        duration_ms: d.duration_ms,
+        warnings: also(also(map(selection.warnings, refusal_warning), d.warnings), stored),
+      })
+    },
+  }
+}
+
+// The n-th answer, or none when the runtime answered fewer than were asked.
+fn held_at(held: List<Option<String>>, i: Int) -> Option<String> =
+  match list_at(held, i) { Some(x) -> x, None -> None }
+
+// The claim at a collection index, or a blank one: a fixture's collection may be shorter than the
+// indices a test hands it.
+pub fn blank_claim(cs: List<Claim>, i: Int) -> Claim =
+  match list_at(cs, i) {
+    Some(c) -> c,
+    None ->
+      {
+        key: "",
+        host: false,
+        owner: "",
+        kind: Ensures(0),
+        guarded: false,
+        frame: Pure,
+        at: { module: 0, start: 0, end: 0 },
+        unperformed: [],
+      },
+  }
+
 // --- The lines a reader reads ------------------------------------------------
 
 // How much of the program carries a claim at all, then what is left to read line by line.
-pub fn coverage_lines(s: Style, cov: Coverage, specified: Int, explain: Bool) -> List<String> = {
-  let unspecified = if cov.definitions > specified { cov.definitions - specified } else { 0 };
-  let head = ind() ++ count_of(cov.definitions, "definition") ++ " · " ++ int_to_string(specified)
+pub fn coverage_lines(s: Style, cov: Coverage, carried: Int, explain: Bool) -> List<String> = {
+  let unspecified = if cov.definitions > carried { cov.definitions - carried } else { 0 };
+  let head = ind() ++ count_of(cov.definitions, "definition") ++ " · " ++ int_to_string(carried)
     ++ " carry an obligation · "
     ++ int_to_string(unspecified)
     ++ " do not";
@@ -661,8 +788,7 @@ pub fn a_loc() -> Loc = { module: 0, start: 3, end: 7 }
 
 pub fn a_claim(owner: String, kind: Kind) -> Claim =
   {
-    key: "abcd",
-    planned: "abcd0",
+    key: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     host: false,
     owner: owner,
     kind: kind,
@@ -681,7 +807,7 @@ pub fn a_plan() -> Plan =
     prove_budget: 10000,
     shrink_budget: 500,
     step_budget: 1000000000,
-    sim: { mode: "dpor", roots: [0], budget: 256, steps: 100000 },
+    sim: { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [] },
   }
 
 pub fn proved(rules: Json, steps: Int) -> Outcome =
