@@ -330,9 +330,6 @@ impl ProvePlan {
 #[derive(Clone, Debug)]
 pub struct ProveReport {
     pub obligations: Vec<(Obligation, Discharge)>,
-    /// Parallel to `obligations`: what the static tier alone answered for each one this run
-    /// discharged, and `None` for one the cache answered or the static tier never sees.
-    pub reaches: Vec<Option<prove::Reach>>,
     pub plan: ProvePlan,
     pub duration: Duration,
 }

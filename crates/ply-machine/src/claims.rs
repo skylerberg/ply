@@ -70,7 +70,7 @@ fn home(ty: &str) -> &'static str {
         .0
 }
 
-const OPERATIONS: [(&str, &str); 14] = [
+const OPERATIONS: [(&str, &str); 15] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
     ("typed", "ply_machine::claims::typed"),
@@ -78,6 +78,7 @@ const OPERATIONS: [(&str, &str); 14] = [
     ("discharged", "ply_machine::claims::discharged"),
     ("record", "ply_machine::claims::record"),
     ("replay", "ply_machine::claims::replay"),
+    ("reaches", "ply_machine::claims::reaches"),
     ("shrink", "ply_machine::claims::shrink"),
     ("offers", "ply_machine::claims::offers"),
     ("would", "ply_machine::claims::would"),
@@ -206,6 +207,7 @@ impl HostHandler for Site {
                 u64::try_from(root.as_int(span, "the generator's root")?).unwrap_or(0),
                 u32::try_from(case.as_int(span, "the case to draw")?).unwrap_or(u32::MAX),
             )?,
+            ("reaches", [claims]) => self.reaches(indices(claims, span)?)?,
             ("baselines", _) => self.baselines()?,
             ("accepted", [records]) => self.accepted(records_of(records, span)?)?,
             (other, _) => return Err(unasked(other, span)),
@@ -865,6 +867,30 @@ impl Site {
         }
     }
 
+    /// What the static tier alone answers for each claim, cached or not: `None` for one it never
+    /// sees, such as a law over interleavings.
+    fn reaches(&self, wanted: Vec<usize>) -> Result<PlyValue, Diagnostic> {
+        let held = self.claims.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&index) = wanted.iter().find(|&&index| index >= *held) {
+            return Err(no_such_claim(index, *held));
+        }
+        drop(held);
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("reaches"))?;
+        machine.ask(Go::Reaches(wanted))?;
+        match machine.step()? {
+            Step::Reached(answer) => Ok(self.answered((*answer).map(|reached| {
+                PlyValue::list(
+                    reached
+                        .iter()
+                        .map(|reach| option(reach.as_ref().map(reach_value)))
+                        .collect(),
+                )
+            }))),
+            _ => Err(out_of_step("reaches")),
+        }
+    }
+
     /// The baseline a reader accepted for each definition in scope, where there is one.
     fn baselines(&self) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
@@ -946,6 +972,9 @@ enum Go {
         root: u64,
         case: u32,
     },
+    /// What the static tier alone answers for each of these claims, by its place in the
+    /// collection, whether or not anything discharged it this run.
+    Reaches(Vec<usize>),
     Baselines,
     Accept(Vec<(Symbol, ReviewRecord)>),
 }
@@ -963,6 +992,7 @@ enum Step {
     Discharged(Box<Result<Verdicts, Refused>>),
     Recorded(Vec<Diagnostic>),
     Replayed(Box<Result<Point, Refused>>),
+    Reached(Box<Result<Vec<Option<crate::engine::Reach>>, Refused>>),
     Baselines(Vec<(String, ReviewRecord)>),
     Accepted(Box<Accepted>),
 }
@@ -1214,6 +1244,24 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                     None => return,
                 };
                 let _ = told.send(Step::Replayed(Box::new(answer)));
+            }
+            Ok(Go::Reaches(wanted)) => {
+                if prepared.is_none() {
+                    prepared = Some(prepare(&job, &loaded, &mut store));
+                }
+                let answer = match prepared.as_ref() {
+                    Some(Ok(ready)) => Ok(wanted
+                        .iter()
+                        .map(|&index| {
+                            obligations
+                                .get(index)
+                                .and_then(|obligation| ready.prover.reach(obligation, &job.plan))
+                        })
+                        .collect()),
+                    Some(Err(refused)) => Err(refused.clone()),
+                    None => return,
+                };
+                let _ = told.send(Step::Reached(Box::new(answer)));
             }
             Ok(Go::Baselines) => {
                 let baselines = scoped
@@ -1467,8 +1515,6 @@ struct Collection {
 
 struct Verdicts {
     outcomes: Vec<Discharge>,
-    /// Parallel to `outcomes`: what the static tier alone answered, when this run asked it.
-    reaches: Vec<Option<ply_prove::prove::Reach>>,
     duration: std::time::Duration,
     warnings: Vec<Diagnostic>,
 }
@@ -1552,7 +1598,6 @@ fn verdicts_of(report: &ProveReport, warnings: Vec<Diagnostic>) -> Verdicts {
             .iter()
             .map(|(_, discharge)| discharge.clone())
             .collect(),
-        reaches: report.reaches.clone(),
         duration: report.duration,
         warnings,
     }
@@ -1891,23 +1936,13 @@ fn verdicts_value(verdicts: &Verdicts) -> PlyValue {
             "outcomes",
             PlyValue::list(verdicts.outcomes.iter().map(outcome_value).collect()),
         ),
-        (
-            "reaches",
-            PlyValue::list(
-                verdicts
-                    .reaches
-                    .iter()
-                    .map(|reach| option(reach.as_ref().map(reach_value)))
-                    .collect(),
-            ),
-        ),
         ("duration_ms", millis(verdicts.duration)),
         ("warnings", diags_value(&verdicts.warnings)),
     ])
 }
 
 /// What the static tier alone answered for one obligation, as the product carries it.
-fn reach_value(reach: &ply_prove::prove::Reach) -> PlyValue {
+fn reach_value(reach: &crate::engine::Reach) -> PlyValue {
     record(vec![
         ("decision", PlyValue::str(reach.decision.as_str())),
         ("steps", tally(u64::from(reach.decision.steps()))),
