@@ -112,6 +112,28 @@ fn check_exits_two_on_a_type_error_and_says_nothing_on_stdout() {
     );
 }
 
+/// A body that ends on a value is the program's mistake, so it is refused before anything runs
+/// rather than reaching the runtime, where only Ply can be at fault.
+#[test]
+fn a_test_whose_body_ends_on_a_value_is_a_type_error() {
+    let dir = project("test \"t\" { 1 }\n");
+    let out = ply(dir.path()).arg("check").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(stdout_of(&out), "");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    for said in [
+        "Error[E0201]: type mismatch: the body of test `t`",
+        "expected `Unit`, found `Int`",
+        "= fix: end the body with `()`",
+    ] {
+        assert!(stderr.contains(said), "no {said:?} in:\n{stderr}");
+    }
+
+    let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_of(&out)["diagnostics"][0]["code"], "E0201");
+}
+
 #[test]
 fn check_exits_two_on_a_syntax_error() {
     let dir = project(UNPARSEABLE);
