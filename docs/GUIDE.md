@@ -2269,7 +2269,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance) |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, and how many definitions the front-end cache seeded and how many were checked; with `--types`, effect sets and provenance) |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--profile`, `--std`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, host, trace, prove, simulation |
@@ -2328,17 +2328,25 @@ names the ones it means, so `machine` — which drives another machine — is
 granted on purpose and not by accident.
 The first run after `ply` or the program itself changes compiles the program's unit,
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
-run loads the compiled object and the front end it filed beside it. The ones
-that load a program run the whole front end every time: the front-end cache
-under `.ply-cache` is written by `ply test`, `ply prove` and `ply review`, read
-back by them and by `ply cache`, and by nothing else.
+run loads the compiled object and the front end it filed beside it. A command
+that loads a program reads the front-end cache under `.ply-cache` before it
+analyses and files what it answered after: a definition whose hash has not moved
+since it was filed is taken from its filed rows, so a run checks what an edit
+moved and what reaches it, and a definition generic over an effect row every
+time. `ply build`, `ply hosts`, `ply test
+--no-cache` and `--no-incremental` neither read nor file it, and a program's own
+`machine.load` of a program runs the whole front end. A cache that will not read
+is a warning and a cold check, never a failure; the run that files over one
+filed by a compiler whose shipped modules differed says so once, as `W0605`.
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
-directory whose name starts with `.`, and one named `target`, are not walked; a
-symlink found while walking is passed over, and one named on the command line is
-an error rather than a file to rewrite.
+file it cannot read or write back is an error too, exiting 2, so `--check`
+never passes over a file it did not read. A directory whose name starts with
+`.`, and one named `target`, are not walked; a symlink found while walking is
+passed over, and one named on the command line is an error rather than a file to
+rewrite.
 
 `ply show NAME` and `ply replace NAME` are the edit loop for one definition: read
 it, rewrite it, and touch nothing else in the file. The replacement is one item
