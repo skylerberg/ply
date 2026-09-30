@@ -27,6 +27,7 @@ nondet effect prover {
   read discharged[claims](choice: Choice) -> Result<Verdicts, Refusal>
   write record[claims](entries: List<{ at: Int, key: String }>) -> List<Unit>
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
+  read reaches[claims](claims: List<Int>) -> Result<List<Unit>, Refusal>
   read baselines[claims]() -> List<Baseline>
   write accepted[claims](records: List<Baseline>) -> Accepted
 }
@@ -47,7 +48,7 @@ type Db = { url: Option<String>, pool: Option<Int>, acquire_ms: Option<Int>, sta
 type Config = { set: List<String>, files: List<String>, schema: Option<String> }
 type Trace = { sink: String, level: String }
 type ProveOpts = { cases: Option<Int>, roots: Option<Int>, budget: Option<Int>, shrink_budget: Option<Int>, steps: Option<Int> }
-type SimOpts = { seed: Option<String>, mode: String, seeds: Option<Int>, budget: Option<Int>, steps: Option<Int>, measure_reduction: Bool }
+type SimOpts = { seed: Option<String>, mode: String, roots: Option<{ from: Int, to: Int }>, budget: Option<Int>, steps: Option<Int>, measure_reduction: Bool }
 type Options = {
   path: String,
   no_incremental: Bool,
@@ -138,7 +139,7 @@ fn main(root: String, index: Int, front: Front) -> Answer / {prover.configure[cl
     sim: {
       seed: None,
       mode: "dpor",
-      seeds: None,
+      roots: None,
       budget: None,
       steps: None,
       measure_reduction: false,
@@ -177,7 +178,7 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_span::Diagnostic> {
     let mut machine = Machine::new(&front);
     machine.set_compiled(unit.attach());
     let mut registry = HostRegistry::new();
-    for (op, handler) in ply_machine::claims::lent() {
+    for (op, handler) in ply_machine::claims::lent("proof.obligation") {
         registry.register(op, handler);
     }
     let binding = registry.bind(&front.check).expect("the prover ops bind");

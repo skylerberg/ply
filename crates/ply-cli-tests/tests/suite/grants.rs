@@ -129,6 +129,7 @@ nondet effect prover {
   read discharged[claims](choice: Unit) -> Result<Unit, Unit>
   write record[claims](entries: Unit) -> Unit
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Unit, Unit>
+  read reaches[claims](claims: List<Int>) -> Result<Unit, Unit>
   read shrink[claims](claim: Int) -> Result<Option<Int>, Unit>
   read offers[claims](i: Int) -> Result<Option<Unit>, Unit>
   read would[claims](i: Int, position: Int) -> Result<Bool, Unit>
