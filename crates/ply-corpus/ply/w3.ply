@@ -1,0 +1,402 @@
+// `w3`: the request path of a multi-route service. The desk served over loopback under the read
+// mix at each number of clients and one route at a time; the same work over fewer connections as
+// each one carries more requests; plaintext against TLS with the handshake timed apart from the
+// requests; and, in one process, what framing costs as a request's bytes and fields grow.
+
+import kit
+import kit (Kit, Server, Sample)
+import report
+import report (Row, Criterion, Judged, WithinRatio, holding, number, exact, row)
+import served
+import spine
+import spine (under)
+import stats
+import std.certgen (certgen)
+import std.config (config)
+import std.fs (fs)
+import std.json (Json, Object, Number, Str, array)
+import std.net (net)
+import std.process (process)
+import std.time (time)
+
+pub type Args = {
+  repo: String,
+  scratch: String,
+  // Which sections: `mix`, `routes`, `keep-alive`, `tls` and `shape`.
+  sections: List<String>,
+  // The desk's accept loop, as `DESK_ACCEPT` names it.
+  accept: String,
+  concurrency: List<Int>,
+  per_conn: Int,
+  requests_per_point: Int,
+  ladder_requests: Int,
+  ladder_concurrency: Int,
+  repeats: Int,
+  iterations: Int,
+}
+
+pub fn sections() -> List<String> = ["mix", "routes", "keep-alive", "tls", "shape"]
+
+fn has(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |seen: Bool, y: String| seen || y == x)
+
+fn cats<a>(xss: List<List<a>>) -> List<a> =
+  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
+
+fn clients_text(c: Int) -> String = if c == 1 { "1 client" } else { int_to_string(c) ++ " clients" }
+
+fn per_conn_text(p: Int) -> String =
+  if p == 1 { "1 request a connection" } else { int_to_string(p) ++ " requests a connection" }
+
+// One point of a table: how the load was asked for and what it found.
+pub type Point = { load: kit::Load, sample: Sample }
+
+fn rate(p: Point) -> Int = stats::per_second(p.sample.answered, p.sample.wall_us)
+
+fn answered(name: String, p: Point) -> Row = kit::answered_row(name, p.load, p.sample)
+
+fn load(
+  port: Int,
+  routes: List<String>,
+  clients: Int,
+  per_conn: Int,
+  requests: Int,
+  trust: Option<String>,
+) -> kit::Load =
+  {
+    port: port,
+    routes: routes,
+    connections: clients * served::share(clients, per_conn, requests),
+    concurrency: clients,
+    per_conn: per_conn,
+    trust: trust,
+  }
+
+fn points(
+  k: Kit,
+  repeats: Int,
+  loads: List<kit::Load>,
+) -> Result<List<Point>, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work]} =
+  kit::all_of(
+    map(loads, |l: kit::Load|
+      match kit::measured(k, l, repeats) {
+        Err(why) -> Err(why),
+        Ok(s) -> Ok({ load: l, sample: s }),
+      }),
+  )
+
+// --- The rows --------------------------------------------------------------------------
+
+pub fn mix_rows(ps: List<Point>) -> List<Row> =
+  map(ps, |p: Point| answered("the read mix, " ++ clients_text(p.load.concurrency), p))
+
+pub fn route_rows(ps: List<Point>) -> List<Row> =
+  map(ps, |p: Point| answered("GET " ++ (match p.load.routes { [r, ..] -> r, _ -> "" }), p))
+
+fn per_second_at(per_conn: Int) -> String = "per_second_at_" ++ int_to_string(per_conn)
+
+// Each point answered, and one row for the claim the ladder is for: reuse never costs throughput,
+// so every point sustains at least the rate of one request a connection.
+pub fn keep_alive_rows(ps: List<Point>) -> List<Row> =
+  push(
+    map(ps, |p: Point| answered(per_conn_text(p.load.per_conn), p)),
+    row(
+      "reuse",
+      holding(
+        "every point sustains at least the rate of one request a connection",
+        cats([
+          [per_second_at(1)],
+          map(filter(ps, |p: Point| p.load.per_conn != 1), |p: Point|
+            per_second_at(p.load.per_conn)),
+        ]),
+        |vs: List<Decimal>|
+          match vs {
+            [single, ..] -> fold(vs, true, |ok: Bool, v: Decimal| ok && v >= single),
+            [] -> false,
+          },
+      ),
+      map(ps, |p: Point| number(per_second_at(p.load.per_conn), rate(p), "requests/s")),
+    ),
+  )
+
+fn handshaken() -> Criterion =
+  holding(
+    "every request answered 200, none failed, and each connection's handshake timed apart from its requests",
+    ["asked", "answered", "answered_200", "failed", "handshakes", "connections"],
+    |vs: List<Decimal>|
+      match vs {
+        [wanted, taken, rightly, failed, handshakes, connections] ->
+          taken == wanted && rightly == wanted && failed == 0m && handshakes == connections,
+        _ -> false,
+      },
+  )
+
+// A TLS point's handshakes are timed on their own, one a connection, so the requests after them
+// carry none of it.
+pub fn tls_rows(transport: String, ps: List<Point>) -> List<Row> =
+  map(ps, |p: Point| {
+    let name = transport ++ ", " ++ per_conn_text(p.load.per_conn) ++ ", "
+      ++ clients_text(p.load.concurrency);
+    match p.load.trust {
+      None -> answered(name, p),
+      Some(_) ->
+        {
+          ..row(name, handshaken(), kit::measurements_of(p.load, p.sample, 200)),
+          detail: kit::detail_of(p.sample),
+        },
+    }
+  })
+
+pub type Shaped = { axis: String, fields: Int, bytes: Int, nanos: Int }
+
+fn int_of(j: Json) -> Int =
+  match j { Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }, _ -> 0 }
+
+pub fn shaped_of(j: Json) -> Result<List<Shaped>, String> =
+  match j {
+    Object(m) -> {
+      let calls = spine::int_field(m, "iterations");
+      Ok(
+        map(spine::array_field(m, "points"), |one: Json|
+          match one {
+            Object(p) ->
+              {
+                axis: match map_get(p, "axis") { Some(Str(s)) -> s, _ -> "" },
+                fields: spine::int_field(p, "fields"),
+                bytes: spine::int_field(p, "bytes"),
+                nanos: match stats::best(map(spine::array_field(p, "runs_us"), int_of)) {
+                  Some(us) -> stats::nanos_each(us, calls),
+                  None -> 0,
+                },
+              },
+            _ -> { axis: "", fields: 0, bytes: 0, nanos: 0 },
+          }),
+      )
+    },
+    _ -> Err("the shape report is not an object"),
+  }
+
+fn shape_name(s: Shaped) -> String =
+  s.axis ++ ": " ++ int_to_string(s.bytes) ++ " bytes, " ++ int_to_string(s.fields) ++ " fields"
+
+fn per_kib(s: Shaped) -> Decimal =
+  if s.bytes <= 0 { 0m }
+  else { decimal_div(decimal_of_int(s.nanos * 1024), decimal_of_int(s.bytes), 3, HalfEven) }
+
+// Framing is linear or better in what it frames: a point costs no more a byte than its axis's
+// smallest request.
+pub fn shape_rows(ss: List<Shaped>) -> List<Row> =
+  map(ss, |s: Shaped| {
+    let first = fold(ss, s, |found: Shaped, t: Shaped|
+      if t.axis == s.axis && (found.axis != s.axis || t.bytes < found.bytes) { t } else { found });
+    row(shape_name(s), WithinRatio("ns_per_kib", shape_name(first), 1m), [
+      number("bytes", s.bytes, "bytes"),
+      number("fields", s.fields, "fields"),
+      number("ns", s.nanos, "ns"),
+      exact("ns_per_kib", per_kib(s), "ns"),
+    ])
+  })
+
+// --- Running it ------------------------------------------------------------------------
+
+type Plain = { mix: List<Point>, routes: List<Point>, keep_alive: List<Point>, tls: List<Point> }
+
+fn ladder() -> List<Int> = [1, 2, 8, 32, 100]
+
+fn tls_ladder() -> List<Int> = [1, 8, 32]
+
+fn tls_clients(a: Args) -> List<Int> =
+  if a.ladder_concurrency <= 1 { [1] } else { [1, a.ladder_concurrency] }
+
+fn tls_loads(a: Args, port: Int, trust: Option<String>) -> List<kit::Load> =
+  cats(
+    map(tls_clients(a), |c: Int|
+      map(tls_ladder(), |per: Int| load(port, ["/items"], c, per, a.ladder_requests, trust))),
+  )
+
+// Every plaintext table off one server.
+fn plain_points(
+  k: Kit,
+  a: Args,
+  s: Server,
+) -> Result<Plain, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work]} = {
+  let mix = if has(a.sections, "mix") {
+    points(
+      k,
+      a.repeats,
+      map(a.concurrency, |c: Int|
+        load(s.port, served::read_mix(), c, a.per_conn, a.requests_per_point, None)),
+    )
+  } else { Ok([]) };
+  let routes = if has(a.sections, "routes") {
+    points(
+      k,
+      a.repeats,
+      map(served::read_mix(), |r: String|
+        load(s.port, [r], 1, a.per_conn, a.requests_per_point, None)),
+    )
+  } else { Ok([]) };
+  let keep = if has(a.sections, "keep-alive") {
+    points(
+      k,
+      a.repeats,
+      map(ladder(), |per: Int|
+        load(s.port, served::read_mix(), a.ladder_concurrency, per, a.ladder_requests, None)),
+    )
+  } else { Ok([]) };
+  let tls = if has(a.sections, "tls") { points(k, a.repeats, tls_loads(a, s.port, None)) }
+  else { Ok([]) };
+  match kit::all_of([mix, routes, keep, tls]) {
+    Err(why) -> Err(why),
+    Ok(parts) -> match parts {
+      [m, r, ka, t] -> Ok({ mix: m, routes: r, keep_alive: ka, tls: t }),
+      _ -> Err("a plaintext table went missing"),
+    },
+  }
+}
+
+fn served_rows(
+  k: Kit,
+  a: Args,
+) -> Result<List<Row>, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], certgen.issue, config.get[env], fs.read_file[work], fs.write_file[work], fs.remove[work], net.connect[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let accept = "the desk, " ++ a.accept;
+  let desk = served::twin(a.accept);
+  match kit::serving[ply](k, "desk-plain", served::desk_args(k, desk), |s: Server|
+      plain_points(k, a, s)) {
+    Err(why) -> Err(why),
+    Ok(plain) -> {
+      let secured = if has(a.sections, "tls") {
+        match kit::credential(k, "desk") {
+          Err(why) -> Err(why),
+          Ok(c) -> match kit::serving[ply](
+              k,
+              "desk-tls",
+              served::desk_args(k, { ..desk, tls: Some(c) }),
+              |s: Server| points(k, a.repeats, tls_loads(a, s.port, Some(c.certificate))),
+            ) {
+            Err(why) -> Err(why),
+            Ok(done) ->
+              Ok({
+                points: done.value,
+                stops: [kit::stop_row(accept ++ " over TLS,", done.stop, kit::drained())],
+              }),
+          },
+        }
+      } else { Ok({ points: [], stops: [] }) };
+      match secured {
+        Err(why) -> Err(why),
+        Ok(t) -> {
+          let p = plain.value;
+          Ok(
+            cats([
+              mix_rows(p.mix),
+              route_rows(p.routes),
+              if len(p.keep_alive) == 0 { [] } else { keep_alive_rows(p.keep_alive) },
+              tls_rows("plaintext", p.tls),
+              tls_rows("TLS", t.points),
+              [kit::stop_row(accept ++ " in plaintext,", plain.stop, kit::drained())],
+              t.stops,
+            ]),
+          )
+        },
+      }
+    },
+  }
+}
+
+pub fn run(
+  a: Args,
+) -> Result<report::Report, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], certgen.issue, config.get[env], fs.read_file[work], fs.write_file[work], fs.remove[work], fs.create_dir[work], fs.read[repo], net.connect[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let k = { repo: a.repo, scratch: under(a.scratch, "w3") };
+  match kit::prepare(k) {
+    Err(why) -> Err(why),
+    Ok(_) -> {
+      let loaded = if has(a.sections, "mix") || has(a.sections, "routes")
+          || has(a.sections, "keep-alive")
+          || has(a.sections, "tls") { served_rows(k, a) }
+      else { Ok([]) };
+      let shape = if has(a.sections, "shape") {
+        match kit::timed(k, "shape.ply", a.iterations, a.repeats) {
+          Err(why) -> Err(why),
+          Ok(j) -> match shaped_of(j) { Err(why) -> Err(why), Ok(ss) -> Ok(shape_rows(ss)) },
+        }
+      } else { Ok([]) };
+      match kit::all_of([loaded, shape]) {
+        Err(why) -> Err(why),
+        Ok(parts) ->
+          report::made(
+            "w3",
+            "w3 — routing, framing, keep-alive and TLS on the request path",
+            cats(parts),
+            [
+              { key: "sections", value: array(map(a.sections, |s: String| Str(s))) },
+              { key: "accept", value: Str(a.accept) },
+              { key: "per_conn", value: Number(decimal_of_int(a.per_conn)) },
+              { key: "ladder_concurrency", value: Number(decimal_of_int(a.ladder_concurrency)) },
+            ],
+          ),
+      }
+    },
+  }
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+fn sample(answered: Int, wall_us: Int, handshakes: List<Int>) -> Sample =
+  {
+    requests: answered,
+    answered: answered,
+    connections: 1,
+    wall_us: wall_us,
+    latencies: [10],
+    connects: [5],
+    handshakes: handshakes,
+    statuses: [{ status: 200, count: answered }],
+    failures: [],
+  }
+
+fn at(
+  per_conn: Int,
+  connections: Int,
+  trust: Option<String>,
+  answered: Int,
+  wall_us: Int,
+  handshakes: List<Int>,
+) -> Point =
+  {
+    load: {
+      port: 1,
+      routes: ["/items"],
+      connections: connections,
+      concurrency: 1,
+      per_conn: per_conn,
+      trust: trust,
+    },
+    sample: { ..sample(answered, wall_us, handshakes), connections: connections },
+  }
+
+fn verdicts(rows: List<Row>) -> List<Bool> = map(report::judge(rows), |j: Judged| report::passed(j))
+
+test "reusing a connection is judged against one request a connection, apart from its answers" {
+  let quicker = keep_alive_rows([at(1, 8, None, 8, 800, []), at(8, 1, None, 8, 400, [])]);
+  assert_eq(verdicts(quicker), [true, true, true]);
+  let slower = keep_alive_rows([at(1, 8, None, 8, 800, []), at(32, 1, None, 32, 6400, [])]);
+  assert_eq(verdicts(slower), [true, true, false])
+}
+
+test "a TLS point needs a handshake for every connection, and a plaintext point none" {
+  assert_eq(verdicts(tls_rows("TLS", [at(1, 2, Some("c.pem"), 2, 100, [40, 50])])), [true]);
+  assert_eq(verdicts(tls_rows("TLS", [at(1, 2, Some("c.pem"), 2, 100, [40])])), [false]);
+  assert_eq(verdicts(tls_rows("TLS", [at(1, 2, Some("c.pem"), 2, 100, [])])), [false]);
+  assert_eq(verdicts(tls_rows("plaintext", [at(1, 2, None, 2, 100, [])])), [true])
+}
+
+test "framing is judged against its axis's smallest request, a byte at a time" {
+  let rows = shape_rows([
+    { axis: "head-bytes", fields: 2, bytes: 100, nanos: 1000 },
+    { axis: "head-bytes", fields: 3, bytes: 1000, nanos: 4000 },
+    { axis: "body-bytes", fields: 4, bytes: 200, nanos: 1000 },
+    { axis: "body-bytes", fields: 4, bytes: 400, nanos: 3000 },
+  ]);
+  assert_eq(verdicts(rows), [true, true, true, false])
+}

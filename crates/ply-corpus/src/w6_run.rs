@@ -1,10 +1,14 @@
 //! Takes the W6 ladder; `w6.rs` assembles and judges it.
 
 use anyhow::{Context, Result, bail};
-use ply_eval::Value;
 use ply_eval::host::HostRuntime;
+use ply_eval::{Machine, Value};
+use ply_host::tcp::{Net, SimNet};
 use ply_span::Span;
+use ply_ty::ty::Footprint;
+use ply_ty::{CheckOutput, ModuleName};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -13,11 +17,192 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::serve::reserve_port;
-use crate::{w3, w5, w6};
+use crate::w4::{Variant, reserve_port};
+use crate::{w5, w6};
 
 fn micros(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
+}
+
+/// A checked service, callable with whatever answers `net`.
+pub struct Loaded {
+    pub check: CheckOutput,
+    /// The port's whole answer, which the tier is built from.
+    pub port: ply_ty::Front,
+    /// Each module's source text, which the Ply emitter re-parses to produce bodies.
+    texts: HashMap<String, String>,
+    /// The unit over the program, built once.
+    unit: std::sync::OnceLock<&'static ply_codegen::Unit>,
+}
+
+impl Loaded {
+    /// One `.ply` source as the module `desk`, with the standard library pulled as the built-in
+    /// package rather than inlined.
+    pub fn parse(desk: &str) -> Result<Loaded> {
+        let name = ModuleName::from_relative_path(Path::new("desk.ply"))
+            .map_err(|d| anyhow::anyhow!("{}", d.message))?;
+        let (port, sources) =
+            crate::checked_front_with_std(Path::new("desk.ply"), name.as_str(), desk)
+                .map_err(|e| anyhow::anyhow!("checking the service: {e:#}"))?;
+        let texts = ply_machine::support::module_texts(&port.check, &sources);
+        Ok(Loaded {
+            check: port.check.clone(),
+            port,
+            texts,
+            unit: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The program-wide name of `simple` in the service's own module.
+    pub fn full(&self, simple: &str) -> Result<String> {
+        self.check
+            .defs
+            .values()
+            .find(|d| d.simple_name.as_str() == simple && d.module.to_string() == "desk")
+            .map(|d| d.name.to_string())
+            .with_context(|| format!("`desk` declares no `{simple}`"))
+    }
+
+    /// A machine over this program; its evaluator is a compiled tier.
+    pub fn machine(&self) -> Machine<'_> {
+        ply_codegen::c::producer::ensure_default();
+        let mut machine = Machine::new(&self.port);
+        let unit = *self.unit.get_or_init(|| {
+            ply_codegen::Unit::over_front(&self.port, self.texts.clone())
+                .expect("this host has a C compiler")
+        });
+        machine.set_compiled(ply_eval::Provider::attach(unit));
+        machine
+    }
+
+    pub fn pure_call(&self, name: &str, args: Vec<Value>, calls: u32) -> Result<(Duration, Value)> {
+        let mut machine = self.machine();
+        let mut last = Value::Unit;
+        let started = Instant::now();
+        for _ in 0..calls {
+            last = machine
+                .call(name, args.clone(), Span::DUMMY)
+                .map_err(|d| anyhow::anyhow!("`{name}` raised: {}", d.message))?;
+        }
+        Ok((started.elapsed(), last))
+    }
+
+    /// What the service wrote back on one scripted connection.
+    pub fn response_over_sim(&self, request: &[u8]) -> Result<Vec<u8>> {
+        let sim = Arc::new(SimNet::new(vec![vec![request.to_vec()]]));
+        let net: Arc<dyn Net> = Arc::clone(&sim) as Arc<dyn Net>;
+        self.run_memory_over(net, 1)?;
+        Ok(sim.sent(2))
+    }
+
+    pub fn footprint(&self, simple: &str) -> Option<Footprint> {
+        self.check
+            .defs
+            .values()
+            .find(|d| d.simple_name.as_str() == simple)
+            .map(|d| d.footprint.clone())
+    }
+
+    /// `run_memory` over a scripted network: the whole service with no syscall in it.
+    pub fn over_sim(&self, script: Vec<Vec<Vec<u8>>>) -> Result<(Duration, usize)> {
+        let connections = script.len();
+        let net: Arc<dyn Net> = Arc::new(SimNet::new(script));
+        let started = Instant::now();
+        self.run_memory_over(net, connections)?;
+        Ok((started.elapsed(), connections))
+    }
+
+    /// Port `0`, since `SimNet` answers any, and no API key, since no measured request has one.
+    fn run_memory_over(&self, net: Arc<dyn Net>, connections: usize) -> Result<()> {
+        let binding = ply_host::tcp::registry(net)
+            .bind(&self.check)
+            .map_err(|d| {
+                anyhow::anyhow!("binding the simulated network failed: {}", d[0].message)
+            })?;
+        let name = self.full("run_memory")?;
+        let mut machine = self.machine();
+        machine.set_host_binding(Arc::new(binding));
+        if let Some(declared) = self.footprint("run_memory") {
+            machine.set_declared_footprint(declared);
+        }
+        let served = machine
+            .call(
+                &name,
+                vec![
+                    Value::Int(0),
+                    Value::ctor("None", Vec::new()),
+                    Value::Int(connections as i64),
+                ],
+                Span::DUMMY,
+            )
+            .map_err(|d| anyhow::anyhow!("the service raised: {}", d.message))?;
+        match served {
+            Value::Int(n) if n == connections as i64 => Ok(()),
+            other => bail!("the service answered {other} connections and was given {connections}"),
+        }
+    }
+}
+
+/// A request head, with an optional body and optional padding.
+pub fn request(
+    method: &str,
+    target: &str,
+    body: Option<&[u8]>,
+    close: bool,
+    pad_value: usize,
+    pad_fields: usize,
+) -> Vec<u8> {
+    let mut head = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+    if close {
+        head.push_str("Connection: close\r\n");
+    }
+    if pad_value > 0 {
+        head.push_str("X-Pad: ");
+        head.push_str(&"0123456789abcdef".repeat(pad_value.div_ceil(16))[..pad_value]);
+        head.push_str("\r\n");
+    }
+    for i in 0..pad_fields {
+        head.push_str(&format!(
+            "X-Pad-{i:02}: 0123456789abcdef0123456789abcdef\r\n"
+        ));
+    }
+    if let Some(body) = body {
+        head.push_str("Content-Type: application/json\r\n");
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    let mut out = head.into_bytes();
+    if let Some(body) = body {
+        out.extend_from_slice(body);
+    }
+    out
+}
+
+/// `examples/desk.ply` as it is written.
+pub fn desk_source(repo: &Path) -> Result<String> {
+    let path = repo.join("examples/desk.ply");
+    std::fs::read_to_string(&path).with_context(|| format!("reading `{}`", path.display()))
+}
+
+/// `main`'s signature in `source`, as written: its declaration through the `=` that ends it.
+fn main_header(source: &str) -> Result<&str> {
+    let start = if source.starts_with("fn main(") {
+        0
+    } else {
+        source
+            .find("\nfn main(")
+            .map(|at| at + 1)
+            .context("`examples/desk.ply` no longer defines `fn main(`")?
+    };
+    let bytes = source.as_bytes();
+    let end = (start + 1..bytes.len())
+        .find(|&i| {
+            bytes[i] == b'='
+                && bytes.get(i + 1) != Some(&b'=')
+                && !matches!(bytes[i - 1], b'=' | b'!' | b'<' | b'>')
+        })
+        .context("`main` in `examples/desk.ply` has no body")?;
+    Ok(&source[start..end + 1])
 }
 
 /// The route the ladder is built around.
@@ -37,31 +222,22 @@ fn keep_alive_script(request: &[u8], requests: u32) -> Vec<Vec<Vec<u8>>> {
 const ROUTE: &str = "/health";
 
 /// The service with the ladder's rungs appended, exactly as the rungs measure it.
-pub fn program(repo: &Path) -> Result<w3::Loaded> {
-    w3::Loaded::parse(&rung_source(repo)?)
+pub fn program(repo: &Path) -> Result<Loaded> {
+    Loaded::parse(&rung_source(repo)?)
 }
 
 /// The same source, for a launcher to run rather than this process to call.
 pub fn rung_source(repo: &Path) -> Result<String> {
-    let service = w3::Service::open(repo)?;
-    Ok(format!(
-        "{}{RUNGS}",
-        service.source(w3::Variant::Sequential, w3::Transport::Http)?
-    ))
+    Ok(format!("{}{RUNGS}", desk_source(repo)?))
 }
 
 /// The source a launcher runs to serve requests: the service with its own entry renamed, the rungs
 /// it measures appended, and the counting entry last.
-///
-/// The cut is at the service's `main` signature, which `Service::open` has already proven exists;
-/// everything before it — the routes, the statements, the entry points — is what the rungs measure,
-/// and is unchanged.
 pub fn counting_source(repo: &Path) -> Result<String> {
-    let service = w3::Service::open(repo)?;
-    let desk = service.source(w3::Variant::Sequential, w3::Transport::Http)?;
+    let desk = desk_source(repo)?;
     // The service's own entry is renamed rather than cut: everything it needs stays defined, and
     // the program's only `main` is the driver's.
-    let header = w3::main_header(&desk)?;
+    let header = main_header(&desk)?;
     let renamed = header.replacen("fn main(", "fn desk_main(", 1);
     let source = desk.replacen(header, &renamed, 1);
     Ok(format!("{source}{RUNGS}{COUNTING}"))
@@ -69,7 +245,7 @@ pub fn counting_source(repo: &Path) -> Result<String> {
 
 /// The head every in-process rung answers.
 pub fn head() -> Vec<u8> {
-    w3::request("GET", ROUTE, None, false, 0, 0)
+    request("GET", ROUTE, None, false, 0, 0)
 }
 
 /// Where `w6-alloc` writes what one request allocates, relative to the repository root.
@@ -170,7 +346,7 @@ pub fn in_process(
     let loaded = program(repo)?;
     let request = head();
     let response = loaded.response_over_sim(&request)?;
-    let items_request = w3::request("GET", DB_ROUTE, None, false, 0, 0);
+    let items_request = self::request("GET", DB_ROUTE, None, false, 0, 0);
     let items_response = loaded.response_over_sim(&items_request)?;
     let per_run = (connections_for(requests) * PER_CONN) as f64;
 
@@ -269,7 +445,7 @@ pub fn in_process(
 }
 
 /// `run_memory` over a real listener in this process, with `ply_host`'s TCP handler under it.
-fn over_socket(loaded: &w3::Loaded, request: &[u8], requests: u32) -> Result<Duration> {
+fn over_socket(loaded: &Loaded, request: &[u8], requests: u32) -> Result<Duration> {
     let port = reserve_port()?;
     let host = Arc::new(ply_host::Host::new());
     let binding = host
@@ -514,7 +690,7 @@ pub fn served(
     repo: &Path,
     ply: &Path,
     url: &str,
-    variant: w3::Variant,
+    variant: Variant,
     concurrencies: &[u32],
     per_conn: u32,
     requests_per_point: u32,
@@ -700,8 +876,8 @@ pub fn memo_lever(
     repo: &Path,
     ply: &Path,
     url: &str,
-    variant: w3::Variant,
-    other: w3::Variant,
+    variant: Variant,
+    other: Variant,
     concurrency: u32,
     per_conn: u32,
     requests_per_point: u32,

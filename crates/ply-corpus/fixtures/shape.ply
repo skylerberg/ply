@@ -1,0 +1,166 @@
+// Fields or bytes: what framing one request costs as its head's bytes, its head's fields and its
+// body grow, through `std.http` under the desk's limits. Every point stays inside those limits,
+// because a refusal is a different path.
+//
+// It times itself and prints one JSON object: for each point, the microseconds each of `repeats`
+// rounds of `iterations` framings took. `BENCH_ITERATIONS` and `BENCH_REPEATS` are its settings.
+
+import std.config
+import std.config (config)
+import std.http
+import std.json
+import std.json (Json)
+import std.process (process)
+import std.router
+import std.time (time)
+
+// The bounds `examples/desk.ply` runs under, where they differ from the defaults.
+fn limits() -> http::Limits = {
+  let d = http::default_limits();
+  { ..d, max_header_bytes: 16384, max_header_count: 64, max_body: 65536 }
+}
+
+fn filler(n: Int) -> String = string_slice(repeat_text("0123456789abcdef", n / 16 + 1), 0, n)
+
+fn repeat_text(s: String, times: Int) -> String =
+  fold(range(0, times), "", |acc: String, _i: Int| acc ++ s)
+
+fn two_digits(i: Int) -> String = if i < 10 { "0" ++ int_to_string(i) } else { int_to_string(i) }
+
+// `GET /items` with one field `pad` bytes long, or with `fields` short fields, or a `POST` whose
+// body is a placement `pad` bytes past its smallest.
+pub fn padded_value(pad: Int) -> Bytes =
+  bytes_of_string(
+    "GET /items HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+      ++ (if pad > 0 { "X-Pad: " ++ filler(pad) ++ "\r\n" } else { "" })
+      ++ "\r\n",
+  )
+
+pub fn padded_fields(fields: Int) -> Bytes =
+  bytes_of_string(
+    "GET /items HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+      ++ fold(range(0, fields), "", |acc: String, i: Int|
+        acc ++ "X-Pad-" ++ two_digits(i) ++ ": 0123456789abcdef0123456789abcdef\r\n")
+      ++ "\r\n",
+  )
+
+pub fn padded_body(pad: Int) -> Bytes = {
+  let customer = repeat_text("a", if pad < 3 { 3 } else { pad });
+  let body = "{\"customer\":\"" ++ customer ++ "\",\"lines\":[{\"sku\":\"bolt\",\"qty\":1}]}";
+  bytes_of_string(
+    "POST /nope HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+      ++ "Content-Length: "
+      ++ int_to_string(string_len(body))
+      ++ "\r\n\r\n"
+      ++ body,
+  )
+}
+
+// One request framed: its head parsed and its body read out of what followed the head. The answer
+// is the bytes framed, or 0 for a request that was refused.
+pub fn framed(raw: Bytes, l: http::Limits) -> Int =
+  match http::parse_head(raw, l) {
+    http::Parsed(h) -> match http::body_step(
+        http::body_start(h.framing, l),
+        bytes_slice(raw, h.consumed, bytes_len(raw)),
+      ) {
+      http::Complete(b) -> h.consumed + b.consumed,
+      _ -> 0,
+    },
+    _ -> 0,
+  }
+
+// --- The clock --------------------------------------------------------------------------
+
+fn spin(left: Int, acc: Int, raw: Bytes, l: http::Limits) -> Int =
+  if left <= 0 { acc } else { spin(left - 1, acc + framed(observe(raw), l), raw, l) }
+
+fn timed(n: Int, raw: Bytes, l: http::Limits) -> Int / {time.elapsed_us} = {
+  let started = time.elapsed_us();
+  let _ = observe(spin(n, 0, raw, l));
+  time.elapsed_us() - started
+}
+
+pub type Point = { axis: String, fields: Int, bytes: Int, runs_us: List<Int> }
+
+// The fields a head carries: the request line's, `Host`, and whatever was added.
+fn point(axis: String, fields: Int, raw: Bytes, n: Int, repeats: Int) -> Point / {time.elapsed_us} = {
+  let l = limits();
+  if framed(raw, l) != bytes_len(raw) {
+    panic("a point the desk would refuse measures a refusal: " ++ axis)
+  } else {
+    {
+      axis: axis,
+      fields: fields,
+      bytes: bytes_len(raw),
+      runs_us: map(range(0, repeats), |_r: Int| timed(n, raw, l)),
+    }
+  }
+}
+
+fn points(n: Int, repeats: Int) -> List<Point> / {time.elapsed_us} = {
+  let values = map([0, 64, 256, 1024, 4096, 12288], |pad: Int|
+    point("head-bytes", if pad == 0 { 2 } else { 3 }, padded_value(pad), n, repeats));
+  let fields = map([0, 2, 4, 8, 16, 32, 60], |k: Int|
+    point("head-fields", 2 + k, padded_fields(k), n, repeats));
+  let bodies = map([0, 256, 1024, 4096, 16384, 61440], |pad: Int|
+    point("body-bytes", 4, padded_body(pad), n, repeats));
+  fold(
+    bodies,
+    fold(fields, values, |acc: List<Point>, p: Point| push(acc, p)),
+    |acc: List<Point>, p: Point| push(acc, p),
+  )
+}
+
+// --- The report ------------------------------------------------------------------------
+
+fn number(n: Int) -> Json = json::Number(decimal_of_int(n))
+
+pub fn report(n: Int, repeats: Int, ps: List<Point>) -> Json =
+  json::object([
+    { key: "iterations", value: number(n) },
+    { key: "repeats", value: number(repeats) },
+    {
+      key: "points",
+      value: json::array(
+        map(ps, |p: Point|
+          json::object([
+            { key: "axis", value: json::Str(p.axis) },
+            { key: "fields", value: number(p.fields) },
+            { key: "bytes", value: number(p.bytes) },
+            { key: "runs_us", value: json::array(map(p.runs_us, |us: Int| number(us))) },
+          ])),
+      ),
+    },
+  ])
+
+fn setting(key: String, fallback: Int) -> Int / {config.get[bench]} =
+  match config.get[bench](key) {
+    None -> fallback,
+    Some(text) -> match router::int_of_text(text) {
+      Some(n) -> if n > 0 { n } else { fallback },
+      None -> panic(key ++ " is `" ++ text ++ "`, which is not a number"),
+    },
+  }
+
+fn main() -> Unit / {config.get[bench], time.elapsed_us, process.out[proc]} = {
+  let n = setting("BENCH_ITERATIONS", 2000);
+  let repeats = setting("BENCH_REPEATS", 3);
+  process.out[proc](json::to_string(report(n, repeats, points(n, repeats))))
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+test "every point is framed whole, so none of them measures a refusal" {
+  let l = limits();
+  let raws = [padded_value(12288), padded_fields(60), padded_body(61440), padded_value(0)];
+  assert(fold(raws, true, |ok: Bool, raw: Bytes| ok && framed(raw, l) == bytes_len(raw)))
+}
+
+test "padding adds the bytes it names and fields add lines" {
+  assert_eq(bytes_len(padded_value(4096)) - bytes_len(padded_value(0)), 4096 + 9);
+  assert_eq(
+    len(bytes_split(padded_fields(8), b"\r\n")) - len(bytes_split(padded_fields(0), b"\r\n")),
+    8,
+  )
+}

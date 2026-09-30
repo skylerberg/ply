@@ -250,13 +250,13 @@ fn the_desks_suite_is_hermetic_without_host_and_says_so() {
     let first = Run::of(&["test", "--explain", dir.path().to_str().unwrap()]);
     assert!(first.ok, "{}", first.all());
     // The twins are values in region-scoped cells, so nothing reaches the boundary.
-    first.says("isolated 68 of 68");
+    first.says("isolated 73 of 73");
     first.silent_about("isolation: host");
 
     // And every one is cached: a twin-backed tracing test's row is empty after the region, so it is `det`.
     let second = Run::of(&["test", dir.path().to_str().unwrap()]);
     assert!(second.ok, "{}", second.all());
-    second.says("0 passed, 68 cached");
+    second.says("0 passed, 73 cached");
 }
 
 #[test]

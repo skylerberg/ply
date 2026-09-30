@@ -1,0 +1,488 @@
+// `serve`: what one request costs. In one process, layer by layer, through the language's own
+// libraries; served over a real socket by the desk, one connection at a time and a task per
+// connection; and served by a floor in C that answers the same bytes with no language in the path,
+// loaded by the same client. The runner builds the floor and binds it as `http_floor`.
+
+import kit
+import kit (Kit, Server, Sample, Stop, Stopped)
+import report
+import report (Row, Criterion, Measurement, Judged, Pass, Fail, Inconclusive, WithinRatio, holding,
+               number, row, untaken)
+import served
+import spine
+import spine (under)
+import stats
+import std.config (config)
+import std.fs (fs)
+import std.http
+import std.json
+import std.json (Json, Object, Number, Str, Null, array)
+import std.net (net)
+import std.process (process, Exited)
+import std.time (time)
+
+pub type Args = {
+  repo: String,
+  scratch: String,
+  // Which sections: `layers`, `scans` and `load`.
+  sections: List<String>,
+  requests: Int,
+  per_conn: Int,
+  concurrency: List<Int>,
+  repeats: Int,
+  iterations: Int,
+}
+
+pub fn sections() -> List<String> = ["layers", "scans", "load"]
+
+fn has(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |seen: Bool, y: String| seen || y == x)
+
+fn cats<a>(xss: List<List<a>>) -> List<a> =
+  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
+
+fn int_of(j: Json) -> Int =
+  match j { Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }, _ -> 0 }
+
+fn fastest_nanos(m: Map<String, Json>, calls: Int) -> Int =
+  match stats::best(map(spine::array_field(m, "runs_us"), int_of)) {
+    Some(us) -> stats::nanos_each(us, calls),
+    None -> 0,
+  }
+
+fn text_of(m: Map<String, Json>, key: String) -> String =
+  match map_get(m, key) { Some(Str(s)) -> s, _ -> "" }
+
+// --- In one process ----------------------------------------------------------------------
+
+pub type Layer = { name: String, what: String, nanos: Int }
+
+pub fn layers_of(j: Json) -> Result<List<Layer>, String> =
+  match j {
+    Object(m) -> {
+      let calls = spine::int_field(m, "iterations");
+      Ok(
+        map(spine::array_field(m, "layers"), |one: Json|
+          match one {
+            Object(l) ->
+              {
+                name: text_of(l, "name"),
+                what: text_of(l, "what"),
+                nanos: fastest_nanos(l, calls),
+              },
+            _ -> { name: "", what: "", nanos: 0 },
+          }),
+      )
+    },
+    _ -> Err("the layers report is not an object"),
+  }
+
+fn nanos_of(ls: List<Layer>, name: String) -> Int =
+  fold(ls, 0, |found: Int, l: Layer| if l.name == name { l.nanos } else { found })
+
+fn ns(name: String, nanos: Int) -> Measurement = number(name, nanos, "ns")
+
+fn more_than(what: String, other: String) -> Criterion =
+  holding(what, ["ns", other], |vs: List<Decimal>| match vs { [n, o] -> n > o, _ -> false })
+
+// The pieces overlap and do not sum, so each is judged against the whole it is part of; the
+// clock's own loop is judged against the cheapest layer, which it has to be well under to measure
+// it at all. The table is not a piece: a request reads it through the constant memo, so building
+// it is what the memo saves, and it has to cost more than the routing it serves.
+pub fn layer_rows(ls: List<Layer>) -> List<Row> = {
+  let pieces = ["frame", "route", "endpoint", "encode"];
+  let cheapest = fold(ls, None, |low: Option<Layer>, l: Layer|
+    if l.name == "loop" { low } else {
+      match low { Some(c) -> if c.nanos <= l.nanos { low } else { Some(l) }, None -> Some(l) }
+    });
+  map(ls, |l: Layer| {
+    let taken = [ns("ns", l.nanos)];
+    let judged = match l.name {
+      "loop" -> match cheapest {
+        Some(c) -> row(l.name, WithinRatio("ns", c.name, 0.1m), taken),
+        None -> untaken(l.name, WithinRatio("ns", "", 0.1m), "no layer was timed beside the loop"),
+      },
+      "table" ->
+        row(
+          l.name,
+          more_than(
+            "more than routing over it, which is what remembering it saves a request",
+            "route",
+          ),
+          push(taken, ns("route", nanos_of(ls, "route"))),
+        ),
+      "answer" -> row(l.name, WithinRatio("ns", "handled", 1m), taken),
+      name -> if has(pieces, name) { row(name, WithinRatio("ns", "answer", 1m), taken) } else {
+        row(
+          name,
+          more_than("more than the answer: the handler clauses are not free", "answer"),
+          push(taken, ns("answer", nanos_of(ls, "answer"))),
+        )
+      },
+    };
+    { ..judged, detail: Str(l.what) }
+  })
+}
+
+pub type Scan = { scans: String, headers: Int, bytes: Int, nanos: Int }
+
+pub fn scans_of(j: Json) -> Result<List<Scan>, String> =
+  match j {
+    Object(m) ->
+      Ok(
+        map(spine::array_field(m, "points"), |one: Json|
+          match one {
+            Object(p) ->
+              {
+                scans: text_of(p, "scans"),
+                headers: spine::int_field(p, "headers"),
+                bytes: spine::int_field(p, "bytes"),
+                nanos: fastest_nanos(p, spine::int_field(p, "iterations")),
+              },
+            _ -> { scans: "", headers: 0, bytes: 0, nanos: 0 },
+          }),
+      ),
+    _ -> Err("the scans report is not an object"),
+  }
+
+// One row a head length: the byte builtins against the folds they replaced, over the same head.
+pub fn scan_rows(ss: List<Scan>) -> List<Row> =
+  map(filter(ss, |s: Scan| s.scans == "builtins"), |b: Scan| {
+    let folded = fold(ss, [], |found: List<Measurement>, s: Scan|
+      if s.scans == "folds" && s.headers == b.headers { [ns("folds", s.nanos)] } else { found });
+    row(
+      "scans, " ++ int_to_string(b.headers) ++ " filler field(s)",
+      holding(
+        "the byte builtins parse the head faster than the folds",
+        ["builtins", "folds"],
+        |vs: List<Decimal>| match vs { [fast, slow] -> fast < slow, _ -> false },
+      ),
+      cats([[number("bytes", b.bytes, "bytes"), ns("builtins", b.nanos)], folded]),
+    )
+  })
+
+// --- Served --------------------------------------------------------------------------------
+
+// One served point: the load that asked for it, and what it took.
+pub type Point = { load: kit::Load, sample: Sample }
+
+// A server's points, its answer to `GET /health`, and how it stopped.
+pub type Measured = { points: List<Point>, health: http::Response, stop: Stop }
+
+fn connections(a: Args) -> Int = {
+  let per = if a.per_conn < 1 { 1 } else { a.per_conn };
+  (a.requests + per - 1) / per
+}
+
+fn load_at(a: Args, port: Int, clients: Int) -> kit::Load =
+  {
+    port: port,
+    routes: ["/health"],
+    connections: connections(a),
+    concurrency: clients,
+    per_conn: a.per_conn,
+    trust: None,
+  }
+
+// A server's points at each of `clients`, the best of `repeats` runs each, and its `/health`.
+fn points_on(
+  k: Kit,
+  a: Args,
+  s: Server,
+  clients: List<Int>,
+) -> Result<{ points: List<Point>, health: http::Response }, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe]} =
+  match kit::fetch(s.port, "/health") {
+    Err(why) -> Err(why),
+    Ok(health) -> match kit::all_of(
+        map(clients, |c: Int| {
+          let l = load_at(a, s.port, c);
+          match kit::measured(k, l, a.repeats) {
+            Err(why) -> Err(why),
+            Ok(sample) -> Ok({ load: l, sample: sample }),
+          }
+        }),
+      ) {
+      Err(why) -> Err(why),
+      Ok(points) -> Ok({ points: points, health: health }),
+    },
+  }
+
+fn rate(p: Point) -> Int = stats::per_second(p.sample.answered, p.sample.wall_us)
+
+fn at_clients(ps: List<Point>, clients: Int) -> Option<Point> =
+  fold(ps, None, |found: Option<Point>, p: Point|
+    if p.load.concurrency == clients { Some(p) } else { found })
+
+fn clients_text(c: Int) -> String = if c == 1 { "1 client" } else { int_to_string(c) ++ " clients" }
+
+// Every request answered 200, and for the desk, its rate as a share of the floor's at the same
+// number of clients.
+fn point_rows(name: String, mine: List<Point>, floor: List<Point>) -> List<Row> =
+  map(mine, |p: Point| {
+    let versus = match at_clients(floor, p.load.concurrency) {
+      Some(f) -> [number("floor_percent", stats::percent(rate(p), rate(f)), "%")],
+      None -> [],
+    };
+    {
+      ..row(name ++ ", " ++ clients_text(p.load.concurrency), kit::complete(200), cats([kit::measurements_of(p.load, p.sample, 200), versus])),
+      detail: kit::detail_of(p.sample),
+    }
+  })
+
+fn agreement_name() -> String = "the floor's `GET /health`"
+
+fn agreement() -> Criterion =
+  holding(
+    "the desk's status, fields and body",
+    ["desk_status", "floor_status", "same_fields", "same_body"],
+    |vs: List<Decimal>|
+      match vs {
+        [desk, floor, fields, body] -> desk == floor && fields == 1m && body == 1m,
+        _ -> false,
+      },
+  )
+
+fn one_if(claim: Bool) -> Int = if claim { 1 } else { 0 }
+
+// The floor is only a floor for the desk's rows if it answers what the desk answers.
+fn agreement_row(desk: http::Response, floor: http::Response) -> Row = {
+  let same = desk.headers == floor.headers && desk.body == floor.body;
+  {
+    ..row(agreement_name(), agreement(), [number("desk_status", desk.status, ""), number("floor_status", floor.status, ""), number("same_fields", one_if(desk.headers == floor.headers), ""), number("same_body", one_if(desk.body == floor.body), "")]),
+    detail: if same { Null } else { Str(string_of_bytes_lossy(floor.body)) },
+  }
+}
+
+fn measured_on<[l]>(
+  k: Kit,
+  a: Args,
+  name: String,
+  args: List<String>,
+  clients: List<Int>,
+) -> Result<Measured, String> / {process.start[l], process.output_line[l], process.wait[l], process.signal[l], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
+  match kit::serving[l](k, name, args, |s: Server| points_on(k, a, s, clients)) {
+    Err(why) -> Err(why),
+    Ok(done) -> Ok({ points: done.value.points, health: done.value.health, stop: done.stop }),
+  }
+
+// The floor one connection at a time and a thread per connection.
+pub type Floors = { sequential: Measured, threads: Measured }
+
+pub type Servers = { desk: Measured, desk_tasks: Measured, floors: Option<Floors> }
+
+fn not_bound() -> String = "the floor is not bound (benches/corpus.sh builds it)"
+
+fn sequential_floor() -> String = "floor, one connection at a time"
+
+fn threaded_floor() -> String = "floor, a thread per connection"
+
+// The floor one connection at a time and then a thread per connection, each started, loaded and
+// stopped before the next.
+fn floors_served(
+  k: Kit,
+  a: Args,
+) -> Result<Floors, String> / {process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
+  match measured_on[http_floor](k, a, "floor-sequential", ["sequential", "0"], [1]) {
+    Err(why) -> Err(why),
+    Ok(sequential) -> match measured_on[http_floor](
+        k,
+        a,
+        "floor-threads",
+        ["threads", "0"],
+        a.concurrency,
+      ) {
+      Err(why) -> Err(why),
+      Ok(threads) -> Ok({ sequential: sequential, threads: threads }),
+    },
+  }
+
+// The desk one connection at a time and a task per connection, then the floor when the runner
+// bound one.
+fn all_served(
+  k: Kit,
+  a: Args,
+) -> Result<Servers, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
+  match measured_on[ply](
+      k,
+      a,
+      "desk-sequential",
+      served::desk_args(k, served::twin("sequential")),
+      [1],
+    ) {
+    Err(why) -> Err(why),
+    Ok(desk) -> match measured_on[ply](
+        k,
+        a,
+        "desk-task-per-connection",
+        served::desk_args(k, served::twin("task-per-connection")),
+        a.concurrency,
+      ) {
+      Err(why) -> Err(why),
+      Ok(desk_tasks) -> if kit::bound("http_floor") {
+        match floors_served(k, a) {
+          Err(why) -> Err(why),
+          Ok(floors) -> Ok({ desk: desk, desk_tasks: desk_tasks, floors: Some(floors) }),
+        }
+      } else { Ok({ desk: desk, desk_tasks: desk_tasks, floors: None }) },
+    },
+  }
+
+pub fn load_rows(s: Servers) -> List<Row> = {
+  let desks = |floor: List<Point>, floor_threads: List<Point>|
+    cats([
+      point_rows("desk, one connection at a time", s.desk.points, floor),
+      point_rows("desk, a task per connection", s.desk_tasks.points, floor_threads),
+    ]);
+  let stops = [
+    kit::stop_row("the desk, one connection at a time,", s.desk.stop, kit::drained()),
+    kit::stop_row("the desk, a task per connection,", s.desk_tasks.stop, kit::drained()),
+  ];
+  match s.floors {
+    Some(f) ->
+      cats([
+        desks(f.sequential.points, f.threads.points),
+        point_rows(sequential_floor(), f.sequential.points, []),
+        point_rows(threaded_floor(), f.threads.points, []),
+        [agreement_row(s.desk.health, f.sequential.health)],
+        stops,
+        [
+          kit::stop_row("the floor, one connection at a time,", f.sequential.stop, kit::ended()),
+          kit::stop_row("the floor, a thread per connection,", f.threads.stop, kit::ended()),
+        ],
+      ]),
+    None ->
+      cats([
+        desks([], []),
+        [
+          untaken(sequential_floor(), kit::complete(200), not_bound()),
+          untaken(threaded_floor(), kit::complete(200), not_bound()),
+          untaken(agreement_name(), agreement(), not_bound()),
+        ],
+        stops,
+      ]),
+  }
+}
+
+// --- The report ------------------------------------------------------------------------
+
+pub fn run(
+  a: Args,
+) -> Result<report::Report, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], config.get[env], fs.read_file[work], fs.remove[work], fs.create_dir[work], fs.read[repo], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let k = { repo: a.repo, scratch: under(a.scratch, "serve") };
+  match kit::prepare(k) {
+    Err(why) -> Err(why),
+    Ok(_) -> {
+      let layers = if has(a.sections, "layers") {
+        match kit::timed(k, "layers.ply", a.iterations, a.repeats) {
+          Err(why) -> Err(why),
+          Ok(j) -> match layers_of(j) {
+            Err(why) -> Err(why),
+            Ok(ls) -> Ok(report::prefixed("layer ", layer_rows(ls))),
+          },
+        }
+      } else { Ok([]) };
+      let scans = if has(a.sections, "scans") {
+        match kit::timed(k, "scans.ply", a.iterations, a.repeats) {
+          Err(why) -> Err(why),
+          Ok(j) -> match scans_of(j) { Err(why) -> Err(why), Ok(ss) -> Ok(scan_rows(ss)) },
+        }
+      } else { Ok([]) };
+      let load = if has(a.sections, "load") {
+        match all_served(k, a) { Err(why) -> Err(why), Ok(servers) -> Ok(load_rows(servers)) }
+      } else { Ok([]) };
+      match kit::all_of([layers, scans, load]) {
+        Err(why) -> Err(why),
+        Ok(parts) ->
+          report::made("serve", "serve — what one request costs, and where", cats(parts), [
+            { key: "sections", value: array(map(a.sections, |s: String| Str(s))) },
+            { key: "per_conn", value: Number(decimal_of_int(a.per_conn)) },
+          ]),
+      }
+    },
+  }
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+fn layer(name: String, nanos: Int) -> Layer = { name: name, what: name, nanos: nanos }
+
+fn verdicts(rows: List<Row>) -> List<Bool> = map(report::judge(rows), |j: Judged| report::passed(j))
+
+test "a layer is judged against the whole it is part of, and the loop against the cheapest layer" {
+  let rows = layer_rows([
+    layer("loop", 2),
+    layer("frame", 300),
+    layer("table", 5000),
+    layer("route", 150),
+    layer("answer", 900),
+    layer("handled", 1400),
+  ]);
+  assert_eq(verdicts(rows), [true, true, true, true, true, true]);
+  assert_eq(verdicts(report::prefixed("layer ", rows)), [true, true, true, true, true, true]);
+  let cheap_table = layer_rows([
+    layer("route", 300),
+    layer("table", 200),
+    layer("answer", 900),
+    layer("handled", 1000),
+  ]);
+  assert_eq(verdicts(cheap_table), [true, false, true, true]);
+  let slow = layer_rows([
+    layer("loop", 100),
+    layer("frame", 1000),
+    layer("answer", 900),
+    layer("handled", 800),
+  ]);
+  assert_eq(verdicts(slow), [false, false, false, false])
+}
+
+test "the layers report's rounds become nanoseconds a call, the fastest round kept" {
+  let text = "{\"iterations\":2000,\"repeats\":2,\"layers\":[{\"name\":\"frame\",\"what\":\"one head\",\"runs_us\":[900,800]}]}";
+  match json::parse_string(text) {
+    Err(_) -> panic("the report is JSON"),
+    Ok(j) -> assert_eq(layers_of(j), Ok([{ name: "frame", what: "one head", nanos: 400 }])),
+  }
+}
+
+test "the builtins are judged against the folds over the same head, and a head with none is not" {
+  let rows = scan_rows([
+    { scans: "builtins", headers: 0, bytes: 23, nanos: 90 },
+    { scans: "folds", headers: 0, bytes: 23, nanos: 700 },
+    { scans: "builtins", headers: 8, bytes: 500, nanos: 900 },
+    { scans: "folds", headers: 8, bytes: 500, nanos: 800 },
+    { scans: "builtins", headers: 16, bytes: 900, nanos: 900 },
+  ]);
+  assert_eq(map(report::judge(rows), |j: Judged| j.verdict), [
+    Pass,
+    Fail([ns("builtins", 900), ns("folds", 800)]),
+    Inconclusive("not every one of builtins, folds was measured"),
+  ])
+}
+
+fn quiet_desk() -> Measured =
+  { points: [], health: { status: 200, headers: map_new(), body: b"" }, stop: Stopped(Exited(0)) }
+
+test "a floor the runner did not bind leaves its rows inconclusive and fails nothing" {
+  let judged = report::judge(
+    load_rows({ desk: quiet_desk(), desk_tasks: quiet_desk(), floors: None }),
+  );
+  assert_eq(
+    map(filter(judged, |j: Judged| j.verdict == Inconclusive(not_bound())), |j: Judged| j.row.name),
+    [sequential_floor(), threaded_floor(), agreement_name()],
+  );
+  assert(
+    fold(judged, true, |ok: Bool, j: Judged|
+      ok && (match j.verdict { Fail(_) -> false, _ -> true })),
+  )
+}
+
+test "the floor stands for the desk only when it answers the desk's bytes" {
+  let desk = {
+    status: 200,
+    headers: map_insert(map_new(), "content-type", ["application/json"]),
+    body: b"{}",
+  };
+  assert_eq(verdicts([agreement_row(desk, desk)]), [true]);
+  let other = agreement_row(desk, { ..desk, body: b"{\"x\":1}" });
+  assert_eq(verdicts([other]), [false]);
+  assert_eq(other.detail, Str("{\"x\":1}"))
+}
