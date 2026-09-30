@@ -953,7 +953,7 @@ holds for **every** interleaving and is reported `exhaustive`.
 | `--sim-budget N` | interleavings per seed (`dpor` only) |
 | `--sim-steps N` | steps per interleaving before `E0414` |
 | `--seed 7`, `--seed 7:3.0.2` | replay one interleaving; implies `--sim once` |
-| `--measure-reduction` | also run unpruned and report the cost |
+| `--measure-reduction` | also run the search twice more, unpruned (`naive`) and blind to the order spawns and joins impose (`blind`), and report each count; a failure only they reach fails the test |
 
 Results are cached per search plan; a search that spends its budget passes but
 is not cached. A failure prints the racing steps, their tasks and positions, and
