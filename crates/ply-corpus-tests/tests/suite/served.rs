@@ -260,7 +260,7 @@ fn the_lifecycle_bench_drains_and_deploys_and_names_what_needs_a_database() {
             "drain, 1 request, a 1500ms lead",
             "deploy: the edit is one `ply replace`",
             "deploy: the build is reproducible",
-            "deploy: the edit ships as one definition",
+            "deploy: the edit ships only what reaches it",
         ],
     );
 }
