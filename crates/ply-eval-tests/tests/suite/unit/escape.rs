@@ -1,4 +1,4 @@
-use ply_eval::arena::{Arena, RegionKind};
+use ply_eval::arena::{Arena, Owner, RegionKind};
 use ply_eval::escape::*;
 use ply_eval::{ClosureKind, Span, Symbol, Value, codes};
 use std::collections::BTreeMap;
@@ -7,8 +7,12 @@ use std::sync::Arc;
 /// A real slot, because a [`Slot`](ply_eval::arena::Slot) carries a generation only the allocator assigns.
 fn cell() -> Value {
     let mut arena = Arena::new();
-    arena.open(RegionKind::Shared, Span::DUMMY);
-    Value::Cell(arena.alloc(Value::Int(0)).expect("the region is open"))
+    arena.open(Owner::ENTRY, RegionKind::Shared);
+    Value::Cell(
+        arena
+            .alloc(Owner::ENTRY, Value::Int(0))
+            .expect("the region is open"),
+    )
 }
 
 #[test]

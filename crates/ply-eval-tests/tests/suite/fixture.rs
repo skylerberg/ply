@@ -1,5 +1,6 @@
 use ply_eval::{CheckOutput, Diagnostic, Front, Machine, ModuleName, Provider, SourceId};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// `sources[i]` is `(module name, text)` for `SourceId(i)`.
 #[track_caller]
@@ -101,6 +102,17 @@ impl Compiled {
 
     pub fn machine_on_tier(&self) -> Machine<'_> {
         self.machine()
+    }
+
+    /// [`Compiled::machine`], and the tier it runs on, which counts what it declined and why.
+    pub fn machine_and_tier(&self) -> (Machine<'_>, Rc<ply_codegen::Bodies>) {
+        ply_codegen::c::producer::ensure_default();
+        let unit = ply_codegen::Unit::over_front(&self.front, self.texts.clone())
+            .expect("this host has a C compiler");
+        let tier = unit.bodies().expect("the unit builds");
+        let mut m = Machine::new(&self.front);
+        m.set_compiled(tier.clone());
+        (m, tier)
     }
 
     pub fn index_of(&self, name: &str) -> usize {

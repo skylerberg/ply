@@ -2,6 +2,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use crate::fixture::Compiled;
+use ply_eval::arena::Owner;
 use ply_eval::escape::Boundary;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -13,8 +14,10 @@ use std::sync::Arc;
 /// A cell over a still-open region's slot, so what is under test is the boundary and not staleness.
 fn live_cell() -> (Arena, Value) {
     let mut arena = Arena::new();
-    arena.open(RegionKind::Shared, Span::DUMMY);
-    let slot = arena.alloc(Value::Int(41)).expect("the region is open");
+    arena.open(Owner::ENTRY, RegionKind::Shared);
+    let slot = arena
+        .alloc(Owner::ENTRY, Value::Int(41))
+        .expect("the region is open");
     (arena, Value::Cell(slot))
 }
 
@@ -140,7 +143,7 @@ fn an_entry_point_reset_leaves_an_earlier_runs_slot_resolvable() {
     let mut regions = TaskRegions::new();
     let slot = regions
         .arena_mut()
-        .alloc(Value::Int(1))
+        .alloc(Owner::ENTRY, Value::Int(1))
         .expect("the root region is open");
     regions.seal();
 
@@ -254,12 +257,16 @@ fn a_constant_whose_value_reaches_a_region_is_not_remembered_across_runs() {
 #[test]
 fn a_stale_slot_reports_rather_than_reading_what_replaced_it() {
     let mut arena = Arena::new();
-    let first = arena.open(RegionKind::Unique, Span::DUMMY);
-    let stale = arena.alloc(Value::Int(41)).expect("inside a region");
+    let first = arena.open(Owner::ENTRY, RegionKind::Unique);
+    let stale = arena
+        .alloc(Owner::ENTRY, Value::Int(41))
+        .expect("inside a region");
     arena.close(first);
 
-    let second = arena.open(RegionKind::Unique, Span::DUMMY);
-    let fresh = arena.alloc(Value::Int(99)).expect("inside a region");
+    let second = arena.open(Owner::ENTRY, RegionKind::Unique);
+    let fresh = arena
+        .alloc(Owner::ENTRY, Value::Int(99))
+        .expect("inside a region");
 
     assert_eq!(
         stale.index(),

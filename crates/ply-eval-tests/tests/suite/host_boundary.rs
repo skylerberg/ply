@@ -5,7 +5,7 @@ use ply_eval::host::{
 };
 use ply_eval::{Diagnostic, EffectAtom, Footprint, Mode, Resource, Symbol, Value, codes};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A host handler that answers the ordinal of its own call.
 #[derive(Default)]
@@ -855,6 +855,86 @@ test/nondet "the sibling runs while one task waits" {
         1,
         "the pending operation is charged once, at the perform and not at the wake"
     );
+}
+
+#[test]
+fn two_tasks_parked_on_the_host_keep_their_cells_when_the_older_region_closes_first() {
+    /// Never completes on the spot, and tells its calls apart.
+    struct Parks {
+        calls: AtomicU64,
+    }
+
+    impl HostHandler for Parks {
+        fn call(&self, _: &dyn HostRuntime, _: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+            Ok(HostAnswer::Pending(Pending {
+                token: self.calls.fetch_add(1, Ordering::SeqCst),
+                label: "accept",
+            }))
+        }
+    }
+
+    /// Resolves nothing until the scheduler parks, then everything, so the tasks wake together
+    /// and run in spawn order.
+    struct AfterPark {
+        parked: AtomicBool,
+    }
+
+    impl HostRuntime for AfterPark {
+        fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
+            Ok(self.parked.load(Ordering::SeqCst).then_some(Value::Int(5)))
+        }
+
+        fn park(&self) -> Result<(), Diagnostic> {
+            self.parked.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+            panic!("a task inside a production region must park, never block the thread")
+        }
+    }
+
+    // Each task opens its region, then parks; the first opened is the first to wake and close.
+    let compiled = Compiled::named(
+        "t",
+        r#"
+nondet effect net {
+  write accept[s](listener: Int) -> Int
+}
+
+fn waits(n: Int) -> Int / {net.write[socket]} = net.accept[socket](n)
+
+test/nondet "each task reads its cell after the other's region closed" {
+  let first = task.spawn(|| with_cell[a](10) { c -> {
+    let got = waits(1);
+    cell_get(c) + got
+  } });
+  let second = task.spawn(|| with_cell[b](20) { c -> {
+    let got = waits(2);
+    cell_get(c) + got
+  } });
+  assert_eq(task.join(first) + task.join(second), 40)
+}
+"#,
+    );
+    let mut registry = task_registry(Arc::new(Counter::default()));
+    registry.register(
+        op("net", "accept", Linearity::AtMostOnce),
+        Arc::new(Parks {
+            calls: AtomicU64::new(0),
+        }),
+    );
+    let binding = registry.bind(&compiled.front.check).expect("binds");
+
+    let (mut machine, tier) = compiled.machine_and_tier();
+    machine.set_host_binding(Arc::new(binding));
+    machine.set_host_runtime(std::rc::Rc::new(AfterPark {
+        parked: AtomicBool::new(false),
+    }));
+    machine
+        .eval_test(0)
+        .expect("both tasks read their own cells");
+    assert_eq!(tier.declines().touched_cells, 0, "{:?}", tier.declines());
 }
 
 #[test]

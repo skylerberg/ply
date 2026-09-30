@@ -322,12 +322,13 @@ pub enum Access {
         id: Slot,
         mode: Mode,
     },
-    /// A `with_cell` took the next slot from the arena's bump pointer.
+    /// A `with_cell` took the lowest free slot of the store every stack shares.
     Alloc,
 }
 
 impl Access {
-    /// Cells conflict when one writes the same slot; allocations always, as they share one counter.
+    /// Cells conflict when one writes the same slot; allocations always, as the order they run in
+    /// decides which slot each takes.
     pub fn conflicts_with(&self, other: &Access) -> bool {
         match (self, other) {
             (Access::Atom(a), Access::Atom(b)) => a.conflicts_with(b),
