@@ -64,6 +64,9 @@ SOLO=(
 CORPUS_PROGRAM=crates/ply-corpus/ply
 CORPUS_CHECKS=crates/ply-corpus/checks
 CORPUS_ALONE=(serving database)
+# Placed a test at a time rather than a module at a time: a whole module on one partition would
+# outlast the partition's nextest shard.
+CORPUS_BY_TEST=(audit generated toolchain)
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.
 # `test-hosts` runs them in one job. The set was named for postgres when the driver lived in the
@@ -176,12 +179,32 @@ cmd_solo_filter() {
 }
 
 # One entry id a line: `program`, then every checks module that declares a test.
+# One entry id a line: `program`, then every checks module that declares a test, as `module` or, for
+# a module placed a test at a time, `module:N` for its Nth test.
 corpus_entries() {
-  local file
+  local file module count i
   printf 'program\n'
   for file in "$root/$CORPUS_CHECKS"/*.ply; do
-    if grep -qE '^test(/[a-z]+)? "' "$file"; then basename "$file" .ply; fi
+    grep -qE '^test(/[a-z]+)? "' "$file" || continue
+    module=$(basename "$file" .ply)
+    if corpus_by_test "$module"; then
+      count=$(corpus_test_names "$file" | grep -c .)
+      for ((i = 1; i <= count; i++)); do printf '%s:%d\n' "$module" "$i"; done
+    else
+      printf '%s\n' "$module"
+    fi
   done
+}
+
+corpus_by_test() {
+  local id
+  for id in "${CORPUS_BY_TEST[@]}"; do [[ $id == "$1" ]] && return 0; done
+  return 1
+}
+
+# The names of a checks module's tests, in the order it declares them.
+corpus_test_names() {
+  sed -nE 's/^test(\/[a-z]+)? "([^"]*)".*/\2/p' "$1"
 }
 
 corpus_alone() {
@@ -211,13 +234,18 @@ cmd_corpus_for_partition() {
   done < <(corpus_entries)
 }
 
-# `path filter`: the program's entry takes every test of its package, a checks module's its own.
+# `path filter`: the program's entry takes every test of its package, a checks module's its own, and
+# `module:N` its Nth test by the qualified name `ply test --filter` matches.
 cmd_corpus_line() {
-  local entry
+  local entry module n name
   while read -r entry; do
     [[ $entry == "$1" ]] || continue
     if [[ $entry == program ]]; then
       printf '%s\n' "$CORPUS_PROGRAM"
+    elif [[ $entry == *:* ]]; then
+      module=${entry%%:*} n=${entry##*:}
+      name=$(corpus_test_names "$root/$CORPUS_CHECKS/$module.ply" | sed -n "${n}p")
+      printf '%s %s.%s\n' "$CORPUS_CHECKS" "$module" "$name"
     else
       printf '%s %s.\n' "$CORPUS_CHECKS" "$entry"
     fi
@@ -956,6 +984,23 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  # A test placed by name is picked out by a substring of its qualified name, so no name in its module
+  # may hold another.
+  local module names
+  for module in "${CORPUS_BY_TEST[@]}"; do
+    names=$(corpus_test_names "$root/$CORPUS_CHECKS/$module.ply")
+    while IFS= read -r name; do
+      [[ -n $name ]] || continue
+      if [[ $(grep -cF -- "$name" <<< "$names") -gt 1 ]]; then
+        echo "FAIL: '$module.$name' is part of another test's name in $CORPUS_CHECKS/$module.ply, so its filter picks both" >&2
+        failures=$((failures + 1))
+      fi
+    done <<< "$names"
+  done
+  if ! grep -q 'ci-corpus\.sh' "$workflow"; then
+    echo "FAIL: no job in $workflow runs ci-corpus.sh, so the partitions' corpus runs run nowhere" >&2
+    failures=$((failures + 1))
+  fi
   # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
   for corpus_command in corpus-matrix corpus-for-partition; do
     corpus_job=$(awk -v c="ci-shards\\.sh $corpus_command" '

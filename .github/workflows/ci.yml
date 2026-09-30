@@ -422,6 +422,16 @@ jobs:
           set -euo pipefail
           exclude=$(.github/ci-shards.sh exclude-filter)
           [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
+          # The corpus's runs this partition takes go beside nextest rather than after it: a run is
+          # one mostly single-threaded process, so nextest gives up one of the runner's four threads.
+          threads=()
+          if [ -n "$(.github/ci-shards.sh corpus-for-partition "$SHARD")" ]; then
+            .github/ci-corpus.sh "$SHARD" "/tmp/corpus-timings-$SHARD.tsv" > /tmp/corpus.log 2>&1 &
+            corpus=$!
+            threads=(--test-threads 3)
+          else
+            : > "/tmp/corpus-timings-$SHARD.tsv"
+          fi
           config=/tmp/ply-shards/shard-$SHARD.toml
           if [ "$SHARDS" = true ]; then
             [ -f "$config" ] || { echo "the plan cut the shards and $config did not come back" >&2; exit 1; }
@@ -435,7 +445,7 @@ jobs:
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast "${cut[@]}" \
+            --no-fail-fast "${cut[@]}" "${threads[@]}" \
             -E "not ($exclude)" 2>&1 | tee /tmp/partition.log
           ran=$(awk '
             { gsub(/\033\[[0-9;]*m/, "") }
@@ -446,33 +456,12 @@ jobs:
           [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
           echo "profile=$profile" >> "$GITHUB_OUTPUT"
           echo "ran=$ran" >> "$GITHUB_OUTPUT"
-
-      # The corpus's runs this partition takes (`ci-shards.sh corpus-for-partition`): the program's
-      # own tests and the checks that need no desk under load. Every check spawns `ply`, so each run
-      # takes its checks one after another; they add no runner. With the program's tests go those of
-      # the programs under `fixtures/` it runs, each of which must test something that passes.
-      - name: The corpus's runs this partition takes
-        env:
-          SHARD: ${{ matrix.shard }}
-        run: |
-          set -euo pipefail
-          ply="$PWD/target/debug/ply"
-          : > "/tmp/corpus-timings-$SHARD.tsv"
-          for id in $(.github/ci-shards.sh corpus-for-partition "$SHARD"); do
-            read -r path filter < <(.github/ci-shards.sh corpus-line "$id")
-            echo "::group::corpus $id"
-            started=$(date +%s%3N)
-            "$ply" test "$path" ${filter:+--filter "$filter"} --host --timeout 900000 --steps 0 \
-              --exec "ply=$ply" --allow machine --allow claims --fs work=. --fs "repo=$PWD"
-            if [ "$id" = program ]; then
-              for fixture in crates/ply-corpus/fixtures/*.ply; do
-                "$ply" test "$fixture" --no-cache --json > /tmp/fixture.json || { cat /tmp/fixture.json; exit 1; }
-                jq -e '.summary.passed > 0' /tmp/fixture.json > /dev/null || { echo "$fixture tested nothing" >&2; exit 1; }
-              done
-            fi
-            printf 'corpus\t%s\t%s\n' "$id" "$(($(date +%s%3N) - started))" >> "/tmp/corpus-timings-$SHARD.tsv"
-            echo "::endgroup::"
-          done
+          if [ -n "${corpus:-}" ]; then
+            status=0
+            wait "$corpus" || status=$?
+            cat /tmp/corpus.log
+            [ "$status" -eq 0 ] || { echo "a corpus run this partition took failed" >&2; exit 1; }
+          fi
 
       # What the next run cuts its shards from.
       - name: The durations this shard measured
