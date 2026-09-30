@@ -531,8 +531,6 @@ pub fn intern_code(code: &str) -> &'static str {
     leaked
 }
 
-pub mod frames;
-
 #[cfg(test)]
 mod tests {
     use super::*;

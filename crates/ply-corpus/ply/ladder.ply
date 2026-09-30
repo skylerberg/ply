@@ -1,0 +1,1470 @@
+// `w6-ladder`: takes the W6 ladder. The in-process rungs are a program under `fixtures/` that times
+// itself. The served ones are `examples/desk.ply` run by setting — its twin, then postgres in
+// plaintext, over TLS, and tracing — each loaded by the corpus's client at every number of clients
+// and read at the number the total peaks at, against the C floor the runner binds. What one request
+// allocates is the launcher's own count: the slope between two served windows of the desk as it is
+// written. `--out` writes the evidence, `w6-ladder.json` and `w6-alloc.json`, which is measurements.
+
+import kit
+import kit (Kit, Server, Sample, Stop, Stopped, Killed, Credential, Load)
+import report
+import report (Row, Criterion, Measurement, Pass, Fail, Inconclusive, Holds, exact, number, row,
+               untaken)
+import serve
+import served
+import spine
+import spine (under)
+import stats
+import w6
+import w6 (Rung, End, Figure, Taken, Layer, Ladder)
+import std.certgen
+import std.certgen (certgen)
+import std.config (config)
+import std.fs (fs)
+import std.http
+import std.json
+import std.json (Json, Object, Number, Str, Bool)
+import std.net (net)
+import std.process
+import std.process (process, Exited, Signalled)
+import std.time (time)
+
+pub type Args = {
+  repo: String,
+  scratch: String,
+  // Which sections: `in-process`, `served` and `alloc`.
+  sections: List<String>,
+  // Where the postgres stacks reach their database; without one, the rungs that need it are not taken.
+  db: Option<String>,
+  // The desk's accept loop, as `DESK_ACCEPT` names it.
+  accept: String,
+  concurrency: List<Int>,
+  per_conn: Int,
+  requests_per_point: Int,
+  repeats: Int,
+  served_repeats: Int,
+  iterations: Int,
+  // The larger of the two counted windows; the smaller is a tenth of it.
+  alloc_requests: Int,
+  machine: String,
+  out: Option<String>,
+}
+
+pub fn sections() -> List<String> = ["in-process", "served", "alloc"]
+
+fn has(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |seen: Bool, y: String| seen || y == x)
+
+fn cats<a>(xss: List<List<a>>) -> List<a> =
+  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
+
+// `f` over each of `xs` in order, stopping at the first that fails.
+fn each<a, b | e>(xs: List<a>, f: (a) -> Result<b, String> / e) -> Result<List<b>, String> / e =
+  fold(xs, Ok([]), |acc: Result<List<b>, String>, x: a|
+    match acc {
+      Err(why) -> Err(why),
+      Ok(done) -> match f(x) { Err(why) -> Err(why), Ok(y) -> Ok(push(done, y)) },
+    })
+
+fn clients_text(c: Int) -> String = if c == 1 { "1 client" } else { int_to_string(c) ++ " clients" }
+
+fn not_asked(section: String) -> String = "the " ++ section ++ " section was not asked for"
+
+fn no_database() -> String = "no database: `--db` names none"
+
+fn not_bound() -> String = "the floor is not bound (benches/corpus.sh builds it)"
+
+// --- In one process ----------------------------------------------------------------------
+
+// A rung as its program timed it: per request, the fastest round and the slowest.
+pub type Timed = { name: String, what: String, requests: Int, best_us: Decimal, worst_us: Decimal }
+
+// Microseconds over the requests they answered, to a tenth of a nanosecond.
+pub fn per_request(us: Int, requests: Int) -> Decimal =
+  decimal_div(
+    decimal_of_int(us),
+    decimal_of_int(if requests < 1 { 1 } else { requests }),
+    4,
+    HalfEven,
+  )
+
+fn slowest(xs: List<Int>) -> Option<Int> =
+  fold(xs, None, |acc: Option<Int>, x: Int|
+    match acc { None -> Some(x), Some(w) -> Some(if x > w { x } else { w }) })
+
+fn int_of(j: Json) -> Int =
+  match j { Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }, _ -> 0 }
+
+fn timed_one(j: Json) -> Result<Timed, String> =
+  match j {
+    Object(r) -> {
+      let runs = map(spine::array_field(r, "runs_us"), int_of);
+      let requests = spine::int_field(r, "requests");
+      match ((stats::best(runs), slowest(runs))) {
+        (Some(best), Some(worst)) ->
+          Ok({
+            name: spine::str_field(r, "name"),
+            what: spine::str_field(r, "what"),
+            requests: requests,
+            best_us: per_request(best, requests),
+            worst_us: per_request(worst, requests),
+          }),
+        _ -> Err("the `" ++ spine::str_field(r, "name") ++ "` rung was timed in no rounds"),
+      }
+    },
+    _ -> Err("a rung of the in-process report is not an object"),
+  }
+
+pub fn timed_of(j: Json) -> Result<List<Timed>, String> =
+  match j {
+    Object(m) -> kit::all_of(map(spine::array_field(m, "rungs"), timed_one)),
+    _ -> Err("the in-process report is not an object"),
+  }
+
+// Each rung read against the one below it, and the first against nothing.
+pub fn chained(ts: List<Timed>) -> List<Rung> = {
+  let walked = fold(
+    ts,
+    { below: None, rungs: [] },
+    |acc: { below: Option<Timed>, rungs: List<Rung> }, t: Timed|
+      {
+        below: Some(t),
+        rungs: push(acc.rungs, {
+          layer: t.name,
+          taken_on: "/health in one process: " ++ t.what,
+          with_us: t.best_us,
+          with_worst_us: t.worst_us,
+          without_us: match acc.below { Some(b) -> b.best_us, None -> 0m },
+          without_worst_us: match acc.below { Some(b) -> b.worst_us, None -> 0m },
+          requests: t.requests,
+        }),
+      },
+  );
+  walked.rungs
+}
+
+fn in_process(
+  k: Kit,
+  a: Args,
+) -> Result<List<Rung>, String> / {process.spawn[ply], config.get[env]} = {
+  let j = kit::timed(
+    k,
+    "rungs.ply",
+    a.iterations,
+    a.repeats,
+    kit::set("BENCH_PER_CONN", int_to_string(a.per_conn)),
+  )?;
+  let ts = timed_of(j)?;
+  Ok(chained(ts))
+}
+
+fn in_process_if(
+  k: Kit,
+  a: Args,
+) -> Result<Option<List<Rung>>, String> / {process.spawn[ply], config.get[env]} =
+  if has(a.sections, "in-process") {
+    match in_process(k, a) { Ok(rs) -> Ok(Some(rs)), Err(why) -> Err(why) }
+  } else { Ok(None) }
+
+// --- Served ------------------------------------------------------------------------------
+
+// How the desk is served for a table: its store, whether over TLS, its trace sink, and the routes
+// its loads ask for. `slug` names the server's log.
+pub type Stack = {
+  name: String,
+  slug: String,
+  store: String,
+  tls: Bool,
+  trace: String,
+  routes: List<String>,
+}
+
+pub fn twin_stack() -> Stack =
+  {
+    name: "the twin in plaintext",
+    slug: "twin",
+    store: "memory",
+    tls: false,
+    trace: "off",
+    routes: ["/health"],
+  }
+
+pub fn postgres_stack() -> Stack =
+  {
+    name: "postgres in plaintext",
+    slug: "postgres",
+    store: "postgres",
+    tls: false,
+    trace: "off",
+    routes: ["/health", "/items"],
+  }
+
+pub fn tls_stack() -> Stack =
+  {
+    name: "postgres over TLS",
+    slug: "tls",
+    store: "postgres",
+    tls: true,
+    trace: "off",
+    routes: ["/items"],
+  }
+
+pub fn traced_stack() -> Stack =
+  {
+    name: "postgres over TLS, --trace json",
+    slug: "traced",
+    store: "postgres",
+    tls: true,
+    trace: "json",
+    routes: ["/items"],
+  }
+
+pub fn stacks(db: Option<String>) -> List<Stack> =
+  match db {
+    None -> [twin_stack()],
+    Some(_) -> [twin_stack(), postgres_stack(), tls_stack(), traced_stack()],
+  }
+
+fn floor_mode(a: Args) -> String = if a.accept == "sequential" { "sequential" } else { "threads" }
+
+pub fn floor_name(a: Args) -> String =
+  if a.accept == "sequential" { "the floor, one connection at a time" }
+  else { "the floor, a thread per connection" }
+
+pub type Point = { stack: String, route: String, load: Load, sample: Sample }
+
+fn load_at(a: Args, port: Int, route: String, clients: Int, trust: Option<String>) -> Load =
+  {
+    port: port,
+    routes: [route],
+    connections: clients * served::share(clients, a.per_conn, a.requests_per_point),
+    concurrency: clients,
+    per_conn: a.per_conn,
+    trust: trust,
+  }
+
+// Every route at every number of clients, the best of `repeats` runs each.
+fn loaded(
+  k: Kit,
+  a: Args,
+  port: Int,
+  stack: String,
+  routes: List<String>,
+  trust: Option<String>,
+) -> Result<List<Point>, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work]} =
+  each(
+    cats(map(routes, |route: String| map(a.concurrency, |c: Int| { route: route, clients: c }))),
+    |at: { route: String, clients: Int }| {
+      let l = load_at(a, port, at.route, at.clients, trust);
+      match kit::measured(k, l, a.repeats) {
+        Err(why) -> Err(why),
+        Ok(sample) -> Ok({ stack: stack, route: at.route, load: l, sample: sample }),
+      }
+    },
+  )
+
+// One server of a sweep: its points, its `GET /health` when it answers in plaintext, and how it
+// stopped.
+pub type Took = { name: String, points: List<Point>, health: Option<http::Response>, stop: Stop }
+
+type Answered = { points: List<Point>, health: Option<http::Response> }
+
+fn plain_health(
+  port: Int,
+  tls: Bool,
+) -> Result<Option<http::Response>, String> / {net.connect[probe], net.send[probe], net.recv[probe], net.close[probe]} =
+  if tls { Ok(None) }
+  else { match kit::fetch(port, "/health") { Ok(r) -> Ok(Some(r)), Err(why) -> Err(why) } }
+
+fn desk_took(
+  k: Kit,
+  a: Args,
+  stack: Stack,
+  cred: Option<Credential>,
+) -> Result<Took, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let desk = {
+    accept: a.accept,
+    store: stack.store,
+    tls: if stack.tls { cred } else { None },
+    database: if stack.store == "postgres" { a.db } else { None },
+  };
+  let trust = match desk.tls { Some(c) -> Some(c.certificate), None -> None };
+  let done = kit::serving[ply](
+    k,
+    "desk-" ++ stack.slug,
+    served::desk_args(k, desk, stack.trace),
+    |s: Server| -> Result<Answered, String> {
+      let health = plain_health(s.port, stack.tls)?;
+      let points = loaded(k, a, s.port, stack.name, stack.routes, trust)?;
+      Ok({ points: points, health: health })
+    },
+  )?;
+  Ok({ name: stack.name, points: done.value.points, health: done.value.health, stop: done.stop })
+}
+
+fn floor_took(
+  k: Kit,
+  a: Args,
+) -> Result<Took, String> / {process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let done = kit::serving[http_floor](
+    k,
+    "floor",
+    [floor_mode(a), "0"],
+    |s: Server| -> Result<Answered, String> {
+      let health = plain_health(s.port, false)?;
+      let points = loaded(k, a, s.port, floor_name(a), ["/health"], None)?;
+      Ok({ points: points, health: health })
+    },
+  )?;
+  Ok({ name: floor_name(a), points: done.value.points, health: done.value.health, stop: done.stop })
+}
+
+fn floor_if_bound(
+  k: Kit,
+  a: Args,
+) -> Result<Option<Took>, String> / {process.bound[http_floor], process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
+  if process.bound[http_floor]() {
+    match floor_took(k, a) { Ok(f) -> Ok(Some(f)), Err(why) -> Err(why) }
+  } else { Ok(None) }
+
+type Sweep = { desks: List<Took>, floor: Option<Took> }
+
+// One sweep: every stack the run serves, each started, loaded and stopped before the next, then the
+// floor when the runner bound one.
+fn sweep(
+  k: Kit,
+  a: Args,
+  cred: Option<Credential>,
+) -> Result<Sweep, String> / {process.bound[http_floor], process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let desks = each(stacks(a.db), |s: Stack| desk_took(k, a, s, cred))?;
+  let floor = floor_if_bound(k, a)?;
+  Ok({ desks: desks, floor: floor })
+}
+
+// A point over every sweep: the sample its row is read off — the first that fell short, so a failure
+// is not averaged away, else the fastest — and per request the best and the worst of the samples
+// that answered every request 200.
+pub type Merged = {
+  stack: String,
+  route: String,
+  load: Load,
+  sample: Sample,
+  us: Option<Decimal>,
+  worst_us: Option<Decimal>,
+}
+
+fn answered_200(s: Sample) -> Int =
+  fold(s.statuses, 0, |n: Int, one: { status: Int, count: Int }|
+    if one.status == 200 { n + one.count } else { n })
+
+fn whole(l: Load, s: Sample) -> Bool = answered_200(s) == kit::asked(l) && len(s.failures) == 0
+
+fn us_of(l: Load, s: Sample) -> Option<Decimal> =
+  if whole(l, s) && s.answered > 0 { Some(per_request(s.wall_us, s.answered)) } else { None }
+
+fn fewer(a: Option<Decimal>, b: Option<Decimal>) -> Option<Decimal> =
+  match ((a, b)) {
+    (Some(x), Some(y)) -> Some(if y < x { y } else { x }),
+    (None, y) -> y,
+    (x, None) -> x,
+  }
+
+fn more(a: Option<Decimal>, b: Option<Decimal>) -> Option<Decimal> =
+  match ((a, b)) {
+    (Some(x), Some(y)) -> Some(if y > x { y } else { x }),
+    (None, y) -> y,
+    (x, None) -> x,
+  }
+
+fn same_point(m: Merged, p: Point) -> Bool =
+  m.stack == p.stack && m.route == p.route && m.load.concurrency == p.load.concurrency
+
+fn first_of(p: Point) -> Merged = {
+  let u = us_of(p.load, p.sample);
+  { stack: p.stack, route: p.route, load: p.load, sample: p.sample, us: u, worst_us: u }
+}
+
+fn merged_into(m: Merged, p: Point) -> Merged = {
+  let u = us_of(p.load, p.sample);
+  let kept = if !whole(m.load, m.sample) { m.sample }
+  else if !whole(p.load, p.sample) { p.sample } else {
+    match ((u, m.us)) {
+      (Some(x), Some(y)) -> if x < y { p.sample } else { m.sample },
+      _ -> m.sample,
+    }
+  };
+  { ..m, sample: kept, us: fewer(m.us, u), worst_us: more(m.worst_us, u) }
+}
+
+pub fn merged(sweeps: List<List<Point>>) -> List<Merged> =
+  fold(sweeps, [], |acc: List<Merged>, ps: List<Point>|
+    fold(ps, acc, |ms: List<Merged>, p: Point|
+      if fold(ms, false, |seen: Bool, m: Merged| seen || same_point(m, p)) {
+        map(ms, |m: Merged| if same_point(m, p) { merged_into(m, p) } else { m })
+      } else { push(ms, first_of(p)) }))
+
+type Timing = { clients: Int, us: Decimal }
+
+// The number of clients a stack's point peaks at: the most requests a second, and of the points
+// within 5% of that, the one with the fewest clients.
+pub fn peak(ms: List<Merged>) -> Option<Int> = {
+  let timed = fold(ms, [], |acc: List<Timing>, m: Merged|
+    match m.us { Some(u) -> push(acc, { clients: m.load.concurrency, us: u }), None -> acc });
+  match fold(timed, None, |best: Option<Decimal>, t: Timing| fewer(best, Some(t.us))) {
+    None -> None,
+    Some(fastest) ->
+      fold(
+        filter(timed, |t: Timing| t.us * 0.95m <= fastest),
+        None,
+        |low: Option<Int>, t: Timing|
+          match low {
+            None -> Some(t.clients),
+            Some(c) -> Some(if t.clients < c { t.clients } else { c }),
+          },
+      ),
+  }
+}
+
+fn point_name(stack: String, route: String, clients: Int) -> String =
+  stack ++ ", " ++ route ++ ", " ++ clients_text(clients)
+
+fn at(
+  a: Args,
+  ms: List<Merged>,
+  stack: String,
+  route: String,
+  clients: Int,
+) -> Result<End, String> =
+  match filter(ms, |m: Merged|
+      m.stack == stack && m.route == route && m.load.concurrency == clients) {
+    [m, ..] -> match ((m.us, m.worst_us)) {
+      (Some(u), Some(w)) ->
+        Ok({
+          taken_on: point_name(stack, route, clients) ++ ", " ++ int_to_string(a.per_conn)
+            ++ " requests a connection",
+          us: u,
+          worst_us: w,
+          requests: kit::asked(m.load),
+        }),
+      _ -> Err(point_name(stack, route, clients) ++ " did not answer every request 200"),
+    },
+    [] -> Err(point_name(stack, route, clients) ++ " was not loaded"),
+  }
+
+fn between(layer: String, taken_on: String, on: End, off: End) -> Rung =
+  {
+    layer: layer,
+    taken_on: taken_on,
+    with_us: on.us,
+    with_worst_us: on.worst_us,
+    without_us: off.us,
+    without_worst_us: off.worst_us,
+    requests: on.requests,
+  }
+
+fn both(
+  layer: String,
+  taken_on: String,
+  on: Result<End, String>,
+  off: Result<End, String>,
+) -> Result<Rung, String> =
+  match ((on, off)) {
+    (Ok(x), Ok(y)) -> Ok(between(layer, taken_on, x, y)),
+    (Err(why), _) -> Err(why),
+    (_, Err(why)) -> Err(why),
+  }
+
+pub type Taking = { layer: String, rung: Result<Rung, String> }
+
+// What the served half gives the ladder: its rungs and the two ends, each taken or why not.
+pub type Half = { rungs: List<Taking>, total: Result<End, String>, floor: Result<End, String> }
+
+fn untaken_half(why: String, floor: String) -> Half =
+  {
+    rungs: map(["socket", "tls", "database", "tracing"], |l: String| { layer: l, rung: Err(why) }),
+    total: Err(why),
+    floor: Err(floor),
+  }
+
+fn machine_end(inner: Option<List<Rung>>) -> Result<End, String> =
+  match inner {
+    None -> Err("the machine rung it is read against was not taken: " ++ not_asked("in-process")),
+    Some(rs) -> match filter(rs, |r: Rung| r.layer == "machine") {
+      [m, ..] ->
+        Ok({
+          taken_on: m.taken_on,
+          us: m.with_us,
+          worst_us: m.with_worst_us,
+          requests: m.requests,
+        }),
+      [] -> Err("the in-process program timed no `machine` rung"),
+    },
+  }
+
+// The served rungs, each read at the number of clients the total peaks at, so a layer is one setting
+// moved; the socket rung is read against the in-process connection.
+pub fn served_half(
+  a: Args,
+  points: List<Merged>,
+  floor: Option<List<Merged>>,
+  inner: Option<List<Rung>>,
+) -> Half =
+  match a.db {
+    None ->
+      untaken_half(
+        no_database() ++ ", and the ladder is read at the clients the total peaks at",
+        no_database(),
+      ),
+    Some(_) -> {
+      let traced = traced_stack().name;
+      match peak(filter(points, |m: Merged| m.stack == traced && m.route == "/items")) {
+        None ->
+          untaken_half(
+            "the total's stack answered no load whole, so there is no number of clients to read the ladder at",
+            "there is no number of clients to read the floor at",
+          ),
+        Some(c) -> {
+          let on = |stack: String, route: String| at(a, points, stack, route, c);
+          let read_at = |route: String, what: String|
+            route ++ " at " ++ clients_text(c) ++ ", " ++ int_to_string(a.per_conn)
+              ++ " requests a connection: "
+              ++ what;
+          {
+            rungs: [
+              {
+                layer: "socket",
+                rung: both(
+                  "socket",
+                  read_at("/health", "the twin served, against one process"),
+                  on(twin_stack().name, "/health"),
+                  machine_end(inner),
+                ),
+              },
+              {
+                layer: "tls",
+                rung: both(
+                  "tls",
+                  read_at("/items", "TLS against plaintext"),
+                  on(tls_stack().name, "/items"),
+                  on(postgres_stack().name, "/items"),
+                ),
+              },
+              {
+                layer: "database",
+                rung: both(
+                  "database",
+                  read_at("/items against /health", "one select against none"),
+                  on(postgres_stack().name, "/items"),
+                  on(postgres_stack().name, "/health"),
+                ),
+              },
+              {
+                layer: "tracing",
+                rung: both(
+                  "tracing",
+                  read_at("/items", "`--trace json` against `--trace off`"),
+                  on(traced, "/items"),
+                  on(tls_stack().name, "/items"),
+                ),
+              },
+            ],
+            total: on(traced, "/items"),
+            floor: match floor {
+              Some(fs) -> at(a, fs, floor_name(a), "/health", c),
+              None -> Err(not_bound()),
+            },
+          }
+        },
+      }
+    },
+  }
+
+fn reason_in(ts: List<Taking>, label: String, fallback: String) -> String =
+  fold(ts, fallback, |found: String, t: Taking|
+    if t.layer == label { match t.rung { Err(why) -> why, Ok(_) -> found } } else { found })
+
+// The ladder a run took: the in-process rungs and the served ones, each layer not taken saying why.
+pub fn ladder_of(inner: Option<List<Rung>>, half: Option<Half>) -> Ladder = {
+  let served_rungs = match half {
+    Some(h) ->
+      fold(h.rungs, [], |acc: List<Rung>, t: Taking|
+        match t.rung { Ok(r) -> push(acc, r), Err(_) -> acc }),
+    None -> [],
+  };
+  let why = |l: Layer|
+    if l.language {
+      match inner {
+        None -> not_asked("in-process"),
+        Some(_) -> "the in-process program timed no `" ++ l.label ++ "` rung",
+      }
+    } else {
+      match half {
+        None -> not_asked("served"),
+        Some(h) -> reason_in(h.rungs, l.label, "the served half took no `" ++ l.label ++ "` rung"),
+      }
+    };
+  w6::ladder(
+    cats([match inner { Some(rs) -> rs, None -> [] }, served_rungs]),
+    match half { Some(h) -> h.total, None -> Err(not_asked("served")) },
+    match half { Some(h) -> h.floor, None -> Err(not_asked("served")) },
+    why,
+  )
+}
+
+// --- The served rows -----------------------------------------------------------------------
+
+// The served sweeps, merged: the desk's points and the floor's, how each server stopped at worst, and
+// the `GET /health` the twin and the floor first answered.
+pub type Swept = {
+  points: List<Merged>,
+  floor: Option<List<Merged>>,
+  stops: List<{ name: String, stop: Stop, floor: Bool }>,
+  desk_health: Option<http::Response>,
+  floor_health: Option<http::Response>,
+}
+
+fn severity(s: Stop) -> Int = match s { Killed -> 2, Stopped(Exited(0)) -> 0, Stopped(_) -> 1 }
+
+// Every server's worst stop over the sweeps, in the order they were started.
+fn stops_of(
+  tooks: List<{ name: String, stop: Stop, floor: Bool }>,
+) -> List<{ name: String, stop: Stop, floor: Bool }> =
+  fold(
+    tooks,
+    [],
+    |acc: List<{ name: String, stop: Stop, floor: Bool }>, t: { name: String, stop: Stop, floor: Bool }|
+      if fold(acc, false, |seen: Bool, s: { name: String, stop: Stop, floor: Bool }|
+          seen || s.name == t.name) {
+        map(acc, |s: { name: String, stop: Stop, floor: Bool }|
+          if s.name == t.name && severity(t.stop) > severity(s.stop) { t } else { s })
+      } else { push(acc, t) },
+  )
+
+fn swept_of(sweeps: List<Sweep>) -> Swept = {
+  let first = list_at(sweeps, 0);
+  {
+    points: merged(map(sweeps, |s: Sweep| cats(map(s.desks, |t: Took| t.points)))),
+    floor: match first {
+      Some(s) -> match s.floor {
+        Some(_) ->
+          Some(merged(map(sweeps, |w: Sweep| match w.floor { Some(t) -> t.points, None -> [] }))),
+        None -> None,
+      },
+      None -> None,
+    },
+    stops: stops_of(
+      cats(
+        map(sweeps, |s: Sweep|
+          cats([
+            map(s.desks, |t: Took| { name: t.name, stop: t.stop, floor: false }),
+            match s.floor { Some(t) -> [{ name: t.name, stop: t.stop, floor: true }], None -> [] },
+          ])),
+      ),
+    ),
+    desk_health: match first {
+      Some(s) -> match filter(s.desks, |t: Took| t.name == twin_stack().name) {
+        [t, ..] -> t.health,
+        [] -> None,
+      },
+      None -> None,
+    },
+    floor_health: match first {
+      Some(s) -> match s.floor { Some(t) -> t.health, None -> None },
+      None -> None,
+    },
+  }
+}
+
+fn credential_if(
+  k: Kit,
+  db: Option<String>,
+) -> Result<Option<Credential>, String> / {certgen.issue, fs.write_file[work]} =
+  if fold(stacks(db), false, |any: Bool, s: Stack| any || s.tls) {
+    match kit::credential(k, "desk") { Ok(c) -> Ok(Some(c)), Err(why) -> Err(why) }
+  } else { Ok(None) }
+
+fn served_if(
+  k: Kit,
+  a: Args,
+) -> Result<Option<Swept>, String> / {process.bound[http_floor], process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], certgen.issue, config.get[env], fs.read_file[work], fs.write_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
+  if has(a.sections, "served") {
+    match credential_if(k, a.db) {
+      Err(why) -> Err(why),
+      Ok(cred) -> match each(
+          range(0, if a.served_repeats < 1 { 1 } else { a.served_repeats }),
+          |_r: Int| sweep(k, a, cred),
+        ) {
+        Err(why) -> Err(why),
+        Ok(sweeps) -> Ok(Some(swept_of(sweeps))),
+      },
+    }
+  } else { Ok(None) }
+
+fn rate(m: Merged) -> Int = stats::per_second(m.sample.answered, m.sample.wall_us)
+
+// A served point's row: every request answered 200, with the best and worst per request over the
+// sweeps and, for the twin, its rate as a share of the floor's at the same number of clients.
+fn point_row(m: Merged, floor: List<Merged>) -> Row = {
+  let versus = if m.stack != twin_stack().name { [] } else {
+    match filter(floor, |f: Merged|
+        f.route == m.route && f.load.concurrency == m.load.concurrency) {
+      [f, ..] -> [number("floor_percent", stats::percent(rate(m), rate(f)), "%")],
+      [] -> [],
+    }
+  };
+  let timed = match ((m.us, m.worst_us)) {
+    (Some(u), Some(w)) -> [exact("us", u, "µs"), exact("worst", w, "µs")],
+    _ -> [],
+  };
+  {
+    ..row(point_name(m.stack, m.route, m.load.concurrency), kit::complete(200), cats([kit::measurements_of(m.load, m.sample, 200), timed, versus])),
+    detail: kit::detail_of(m.sample),
+  }
+}
+
+pub fn served_rows(a: Args, s: Swept) -> List<Row> = {
+  let floor = match s.floor { Some(fs) -> fs, None -> [] };
+  cats([
+    map(s.points, |m: Merged| point_row(m, floor)),
+    match s.floor {
+      Some(fs) -> map(fs, |m: Merged| point_row(m, [])),
+      None -> [untaken(floor_name(a) ++ ", /health", kit::complete(200), not_bound())],
+    },
+    [
+      match ((s.desk_health, s.floor_health)) {
+        (Some(d), Some(f)) -> serve::agreement_row(d, f),
+        (_, None) -> untaken(serve::agreement_name(), serve::agreement(), not_bound()),
+        (None, _) ->
+          untaken(
+            serve::agreement_name(),
+            serve::agreement(),
+            "the twin's `GET /health` was not asked",
+          ),
+      },
+    ],
+    map(s.stops, |t: { name: String, stop: Stop, floor: Bool }|
+      if t.floor { kit::stop_row(t.name ++ ",", t.stop, kit::ended()) }
+      else { kit::stop_row("the desk, " ++ t.name ++ ",", t.stop, kit::drained()) }),
+  ])
+}
+
+// --- What a request allocates ----------------------------------------------------------------
+
+type Count = { allocations: Int, bytes: Int, body_bytes: Int }
+
+fn counted_path(k: Kit, requests: Int, attempt: Int) -> String =
+  under(
+    k.scratch,
+    "counted-" ++ int_to_string(requests) ++ "-" ++ int_to_string(attempt) ++ ".json",
+  )
+
+fn cleanly(s: Stop) -> Result<Unit, String> =
+  if s == Stopped(Exited(0)) { Ok(()) } else {
+    Err("the counted desk " ++ kit::stop_text(s) ++ ", so what it wrote is not a whole run's count")
+  }
+
+fn count_in(bytes: Bytes, path: String) -> Result<{ allocations: Int, bytes: Int }, String> =
+  match json::parse(bytes) {
+    Err(e) -> Err("the count at " ++ path ++ " is not JSON: " ++ e.message),
+    Ok(Object(m)) ->
+      Ok({ allocations: spine::int_field(m, "allocations"), bytes: spine::int_field(m, "bytes") }),
+    Ok(_) -> Err("the count at " ++ path ++ " is not an object"),
+  }
+
+// One window: the desk as it is written, run under the launcher's count, asked its `/health` once and
+// then `requests` requests of it a connection each, and stopped. The count is the whole run's, so its
+// start-up is in every window alike and the slope between two windows leaves it out.
+fn window(
+  k: Kit,
+  requests: Int,
+  attempt: Int,
+) -> Result<Count, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let path = counted_path(k, requests, attempt);
+  let _ = fs.remove[work](path);
+  let done = kit::serving[ply](
+    k,
+    "counted",
+    cats([["--count-allocs=" ++ path], served::desk_args(k, served::twin("sequential"))]),
+    |s: Server| -> Result<Int, String> {
+      let health = kit::fetch(s.port, "/health")?;
+      let sample = kit::load(k, {
+        port: s.port,
+        routes: ["/health"],
+        connections: requests,
+        concurrency: 1,
+        per_conn: 1,
+        trust: None,
+      })?;
+      if sample.answered == requests && len(sample.failures) == 0 { Ok(bytes_len(health.body)) } else {
+        Err(
+          "the counted desk answered " ++ int_to_string(sample.answered) ++ " of "
+            ++ int_to_string(requests)
+            ++ " requests",
+        )
+      }
+    },
+  )?;
+  let _ = cleanly(done.stop)?;
+  let bytes = (match fs.read_file[work](path) {
+    Some(b) -> Ok(b),
+    None -> Err("the counted desk wrote no count to " ++ path),
+  })?;
+  let c = count_in(bytes, path)?;
+  Ok({ allocations: c.allocations, bytes: c.bytes, body_bytes: done.value })
+}
+
+// A window counted twice, and the smaller count kept: a count can only be inflated by the
+// launcher's own work — the first run of a program can pay for its compilation — and never deflated.
+fn smaller_of_two(
+  k: Kit,
+  requests: Int,
+) -> Result<Count, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let first = window(k, requests, 1)?;
+  let second = window(k, requests, 2)?;
+  Ok(if second.allocations < first.allocations { second } else { first })
+}
+
+pub fn slope(large: Int, small: Int, span: Int) -> Decimal =
+  decimal_div(
+    decimal_of_int(large - small),
+    decimal_of_int(if span < 1 { 1 } else { span }),
+    3,
+    HalfEven,
+  )
+
+fn counted(
+  k: Kit,
+  a: Args,
+  taken: Taken,
+) -> Result<Figure, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let small_n = a.alloc_requests / 10;
+  let small = smaller_of_two(k, small_n)?;
+  let large = smaller_of_two(k, a.alloc_requests)?;
+  let span = a.alloc_requests - small_n;
+  Ok({
+    taken: taken,
+    route: "/health",
+    requests: a.alloc_requests,
+    body_bytes: large.body_bytes,
+    allocations_per_request: slope(large.allocations, small.allocations, span),
+    bytes_per_request: slope(large.bytes, small.bytes, span),
+  })
+}
+
+fn counted_if(
+  k: Kit,
+  a: Args,
+  taken: Taken,
+) -> Result<Option<Figure>, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
+  if has(a.sections, "alloc") {
+    match counted(k, a, taken) { Ok(f) -> Ok(Some(f)), Err(why) -> Err(why) }
+  } else { Ok(None) }
+
+// The figure the tree ships, read before anything is counted: what a count is held to.
+fn shipped_figure() -> Result<Figure, String> / {fs.read_file[repo]} =
+  match fs.read_file[repo](w6::figure_file()) {
+    None -> Err("there is no figure at " ++ w6::figure_file() ++ " to hold this count to"),
+    Some(bytes) -> match w6::figure_of(bytes) {
+      Ok(f) -> Ok(f),
+      Err(why) -> Err(w6::figure_file() ++ " is not a figure `w6-ladder --out` wrote: " ++ why),
+    },
+  }
+
+fn capped_text() -> String =
+  "at most 1% above the figure " ++ w6::figure_file()
+    ++ " ships, over the window and the answer it was taken at"
+
+// A request's allocations are held to the shipped figure: the request path may get cheaper and not
+// dearer, and a count over another window or another answer is not the same measurement.
+pub fn held_to(shipped: Result<Figure, String>) -> Criterion =
+  match shipped {
+    Err(why) -> Holds(capped_text(), |ms: List<Measurement>| Inconclusive(why)),
+    Ok(f) ->
+      Holds(capped_text(), |ms: List<Measurement>|
+        match ((
+            report::value_of(ms, "requests"),
+            report::value_of(ms, "body_bytes"),
+            report::value_of(ms, "allocations"),
+            report::value_of(ms, "bytes"),
+          )) {
+          (Some(n), Some(body), Some(allocations), Some(bytes)) -> if n
+              != decimal_of_int(f.requests)
+              || body != decimal_of_int(f.body_bytes) {
+            Inconclusive(
+              "the figure was taken at " ++ int_to_string(f.requests) ++ " requests of a "
+                ++ int_to_string(f.body_bytes)
+                ++ "-byte body, and this count at "
+                ++ decimal_to_string(n)
+                ++ " of a "
+                ++ decimal_to_string(body)
+                ++ "-byte one",
+            )
+          } else if allocations <= f.allocations_per_request * 1.01m
+              && bytes <= f.bytes_per_request * 1.01m { Pass } else {
+            Fail(
+              report::named(ms, ["allocations", "shipped_allocations", "bytes", "shipped_bytes"]),
+            )
+          },
+          _ -> Inconclusive("the counts were not taken"),
+        }),
+  }
+
+pub fn allocation_row(shipped: Result<Figure, String>, f: Figure) -> Row =
+  row(
+    "allocations, one /health request",
+    held_to(shipped),
+    cats([
+      [
+        exact("allocations", f.allocations_per_request, "allocations"),
+        exact("bytes", f.bytes_per_request, "bytes"),
+        number("requests", f.requests, "requests"),
+        number("body_bytes", f.body_bytes, "bytes"),
+      ],
+      match shipped {
+        Ok(s) ->
+          [
+            exact("shipped_allocations", s.allocations_per_request, "allocations"),
+            exact("shipped_bytes", s.bytes_per_request, "bytes"),
+          ],
+        Err(_) -> [],
+      },
+    ]),
+  )
+
+// --- The evidence and the report -------------------------------------------------------------
+
+pub fn evidence_from(taken: Taken, l: Ladder) -> w6::Evidence =
+  {
+    taken: taken,
+    rungs: fold(l.steps, [], |acc: List<Rung>, s: w6::Step|
+      match s.rung { Ok(r) -> push(acc, r), Err(_) -> acc }),
+    total: match l.total { Ok(t) -> Some(t), Err(_) -> None },
+    floor: match l.floor { Ok(f) -> Some(f), Err(_) -> None },
+  }
+
+fn wrote(dir: String, name: String, text: String) -> Result<Unit, String> / {fs.write_file[work]} =
+  if fs.write_file[work](under(dir, name), bytes_of_string(text)) { Ok(()) }
+  else { Err(under(dir, name) ++ " could not be written") }
+
+fn made_dir(dir: String) -> Result<Unit, String> / {fs.create_dir[work]} =
+  if fs.create_dir[work](dir) { Ok(()) } else { Err("`" ++ dir ++ "` could not be made") }
+
+fn ladder_written(
+  dir: String,
+  taken: Taken,
+  l: Ladder,
+  took: Bool,
+) -> Result<Unit, String> / {fs.write_file[work]} =
+  if took { wrote(dir, "w6-ladder.json", w6::evidence_text(evidence_from(taken, l))) }
+  else { Ok(()) }
+
+fn figure_written(dir: String, f: Option<Figure>) -> Result<Unit, String> / {fs.write_file[work]} =
+  match f { Some(x) -> wrote(dir, "w6-alloc.json", w6::figure_text(x)), None -> Ok(()) }
+
+// `--out`: the ladder when either of its sections was taken, and the figure when it was counted.
+fn written(
+  a: Args,
+  taken: Taken,
+  l: Ladder,
+  f: Option<Figure>,
+) -> Result<Unit, String> / {fs.create_dir[work], fs.write_file[work]} =
+  match a.out {
+    None -> Ok(()),
+    Some(dir) -> {
+      let _ = made_dir(dir)?;
+      let _ = ladder_written(
+        dir,
+        taken,
+        l,
+        has(a.sections, "in-process") || has(a.sections, "served"),
+      )?;
+      figure_written(dir, f)
+    },
+  }
+
+pub fn run(
+  a: Args,
+) -> Result<report::Report, String> / {process.bound[http_floor], process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], process.start[http_floor], process.output_line[http_floor], process.wait[http_floor], process.signal[http_floor], certgen.issue, config.get[env], fs.read_file[work], fs.write_file[work], fs.remove[work], fs.create_dir[work], fs.read[repo], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let k = { repo: a.repo, scratch: under(a.scratch, "w6") };
+  let _ = kit::prepare(k)?;
+  let p = report::provenance()?;
+  let taken = { corpus: p.corpus, runtime: p.runtime, machine: a.machine };
+  let shipped = shipped_figure();
+  let inner = in_process_if(k, a)?;
+  let outer = served_if(k, a)?;
+  let figure = counted_if(k, a, taken)?;
+  let half = match outer {
+    Some(s) -> Some(served_half(a, s.points, s.floor, inner)),
+    None -> None,
+  };
+  let l = ladder_of(inner, half);
+  let _ = written(a, taken, l, figure)?;
+  Ok(
+    report::report_of(
+      "w6-ladder",
+      "w6-ladder — where a request's time goes, rung by rung",
+      p,
+      cats([
+        w6::judged(l),
+        match outer { Some(s) -> served_rows(a, s), None -> [] },
+        match figure { Some(f) -> [allocation_row(shipped, f)], None -> [] },
+      ]),
+      [
+        { key: "sections", value: json::array(map(a.sections, |s: String| Str(s))) },
+        { key: "accept", value: Str(a.accept) },
+        { key: "per_conn", value: Number(decimal_of_int(a.per_conn)) },
+        { key: "database", value: Bool(a.db != None) },
+        { key: "machine", value: Str(a.machine) },
+      ],
+    ),
+  )
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+fn args() -> Args =
+  {
+    repo: ".",
+    scratch: "target/corpus",
+    sections: sections(),
+    db: None,
+    accept: "sequential",
+    concurrency: [1, 2, 4],
+    per_conn: 32,
+    requests_per_point: 3000,
+    repeats: 3,
+    served_repeats: 3,
+    iterations: 2000,
+    alloc_requests: 200,
+    machine: "a laptop",
+    out: None,
+  }
+
+test "the in-process report's rounds become rungs, each read against the one below it" {
+  let text = "{\"iterations\":2000,\"repeats\":2,\"per_conn\":32,\"rungs\":[{\"name\":\"call\",\"what\":\"a call\",\"requests\":2000,\"runs_us\":[12,10]},{\"name\":\"endpoint\",\"what\":\"the endpoint\",\"requests\":2000,\"runs_us\":[30,40]}]}";
+  match json::parse_string(text) {
+    Err(_) -> panic("the report is JSON"),
+    Ok(j) -> match timed_of(j) {
+      Err(why) -> panic(why),
+      Ok(ts) -> match chained(ts) {
+        [call, endpoint] -> {
+          assert_eq((call.with_us, call.with_worst_us, call.without_us), (0.005m, 0.006m, 0m));
+          assert_eq(
+            (
+              endpoint.with_us,
+              endpoint.with_worst_us,
+              endpoint.without_us,
+              endpoint.without_worst_us,
+            ),
+            (0.015m, 0.02m, 0.005m, 0.006m),
+          );
+          assert_eq(endpoint.taken_on, "/health in one process: the endpoint")
+        },
+        _ -> panic("two rungs were timed"),
+      },
+    },
+  }
+}
+
+fn sample(answered: Int, wall_us: Int, failures: List<String>) -> Sample =
+  {
+    requests: answered,
+    answered: answered,
+    connections: 1,
+    wall_us: wall_us,
+    latencies: [10],
+    connects: [5],
+    handshakes: [],
+    statuses: [{ status: 200, count: answered }],
+    failures: failures,
+  }
+
+fn point(stack: String, clients: Int, answered: Int, wall_us: Int) -> Point =
+  {
+    stack: stack,
+    route: "/items",
+    load: {
+      port: 1,
+      routes: ["/items"],
+      connections: answered,
+      concurrency: clients,
+      per_conn: 1,
+      trust: None,
+    },
+    sample: sample(answered, wall_us, []),
+  }
+
+test "sweeps merge into a point's best and worst, and a sample that fell short is the one shown" {
+  let ms = merged([
+    [point("s", 1, 100, 1000), point("s", 2, 100, 800)],
+    [point("s", 1, 100, 1200), { ..point("s", 2, 100, 500), sample: sample(90, 500, ["cut off"]) }],
+  ]);
+  match ms {
+    [one, two] -> {
+      assert_eq((one.us, one.worst_us, one.sample.wall_us), (Some(10m), Some(12m), 1000));
+      assert_eq((two.us, two.worst_us), (Some(8m), Some(8m)));
+      assert_eq(two.sample.failures, ["cut off"])
+    },
+    _ -> panic("two points, however many sweeps"),
+  }
+}
+
+test "a stack peaks at the fewest clients within 5% of its fastest point" {
+  let flat = merged([
+    [
+      point("s", 1, 100, 2000),
+      point("s", 2, 100, 1030),
+      point("s", 4, 100, 1000),
+      point("s", 8, 100, 1010),
+    ],
+  ]);
+  assert_eq(peak(flat), Some(2));
+  assert_eq(peak([]), None)
+}
+
+test "without a database the served rungs, the total and the floor say so, and the rest is taken" {
+  let half = served_half(args(), merged([[point(twin_stack().name, 1, 100, 1000)]]), None, None);
+  assert_eq(map(half.rungs, |t: Taking| t.layer), ["socket", "tls", "database", "tracing"]);
+  assert(
+    fold(half.rungs, true, |ok: Bool, t: Taking|
+      ok && (match t.rung { Err(why) -> string_starts_with(why, no_database()), Ok(_) -> false })),
+  );
+  assert_eq(
+    half.total,
+    Err(no_database() ++ ", and the ladder is read at the clients the total peaks at"),
+  );
+  let l = ladder_of(Some([]), Some(half));
+  match filter(l.steps, |s: w6::Step| s.layer.label == "call") {
+    [s] -> assert_eq(s.rung, Err("the in-process program timed no `call` rung")),
+    _ -> panic("one step a layer"),
+  };
+  match filter(ladder_of(None, None).steps, |s: w6::Step| s.layer.label == "tls") {
+    [s] -> assert_eq(s.rung, Err(not_asked("served"))),
+    _ -> panic("one step a layer"),
+  }
+}
+
+test "with a database every served rung is read at the clients the total peaks at" {
+  let a = { ..args(), db: Some("postgres://ply@127.0.0.1/desk") };
+  let at_two = |stack: String, route: String, wall: Int|
+    [
+      { ..point(stack, 1, 100, wall * 2), route: route },
+      { ..point(stack, 2, 100, wall), route: route },
+    ];
+  let points = merged([
+    cats([
+      at_two(twin_stack().name, "/health", 600),
+      at_two(postgres_stack().name, "/health", 700),
+      at_two(postgres_stack().name, "/items", 1300),
+      at_two(tls_stack().name, "/items", 1400),
+      at_two(traced_stack().name, "/items", 1500),
+    ]),
+  ]);
+  let machine = {
+    layer: "machine",
+    taken_on: "/health in one process: connections",
+    with_us: 3m,
+    with_worst_us: 4m,
+    without_us: 2m,
+    without_worst_us: 2m,
+    requests: 2000,
+  };
+  let half = served_half(a, points, None, Some([machine]));
+  assert_eq(match half.total { Ok(t) -> t.us, Err(why) -> panic(why) }, 15m);
+  assert_eq(half.floor, Err(not_bound()));
+  let taken = |t: Taking| match t.rung { Ok(r) -> r, Err(why) -> panic(why) };
+  match half.rungs {
+    [socket, tls, database, tracing] -> {
+      let s = taken(socket);
+      assert_eq((s.with_us, s.without_us, s.without_worst_us), (6m, 3m, 4m));
+      assert_eq((taken(tls).with_us, taken(tls).without_us), (14m, 13m));
+      assert_eq((taken(database).with_us, taken(database).without_us), (13m, 7m));
+      assert_eq((taken(tracing).with_us, taken(tracing).without_us), (15m, 14m))
+    },
+    _ -> panic("four served rungs"),
+  }
+}
+
+test "a server's worst stop over the sweeps is the one its row is judged by" {
+  let stops = stops_of([
+    { name: "desk", stop: Stopped(Exited(0)), floor: false },
+    { name: "floor", stop: Stopped(Signalled(15)), floor: true },
+    { name: "desk", stop: Killed, floor: false },
+    { name: "desk", stop: Stopped(Exited(0)), floor: false },
+  ]);
+  assert_eq(map(stops, |s: { name: String, stop: Stop, floor: Bool }| s.stop), [
+    Killed,
+    Stopped(Signalled(15)),
+  ])
+}
+
+fn figure(requests: Int, allocations: Decimal, bytes: Decimal) -> Figure =
+  {
+    taken: { corpus: "b3:c0ffee", runtime: "ply 0.16.0", machine: "a laptop" },
+    route: "/health",
+    requests: requests,
+    body_bytes: 36,
+    allocations_per_request: allocations,
+    bytes_per_request: bytes,
+  }
+
+fn verdict_of(r: Row) -> report::Verdict =
+  match report::judge([r]) { [j] -> j.verdict, _ -> panic("one row is judged as one") }
+
+test "a count is held to the shipped figure at its window, and a dearer one fails with both" {
+  let shipped = Ok(figure(200, 50m, 3800m));
+  assert_eq(verdict_of(allocation_row(shipped, figure(200, 50.4m, 3800m))), Pass);
+  assert_eq(verdict_of(allocation_row(shipped, figure(200, 40m, 3000m))), Pass);
+  assert_eq(
+    verdict_of(allocation_row(shipped, figure(200, 51m, 3800m))),
+    Fail([
+      exact("allocations", 51m, "allocations"),
+      exact("shipped_allocations", 50m, "allocations"),
+      exact("bytes", 3800m, "bytes"),
+      exact("shipped_bytes", 3800m, "bytes"),
+    ]),
+  );
+  assert(match verdict_of(allocation_row(shipped, figure(100, 50m, 3800m))) {
+    Inconclusive(why) -> string_contains(why, "taken at 200 requests"),
+    _ -> false,
+  });
+  assert_eq(
+    verdict_of(allocation_row(Err("there is no figure"), figure(200, 50m, 3800m))),
+    Inconclusive("there is no figure"),
+  )
+}
+
+test "a request's cost is the slope between two windows, so a run's start-up is not charged to it" {
+  assert_eq(slope(15000, 6000, 180), 50m);
+  assert_eq(slope(10, 3, 3), 2.333m)
+}
+
+fn counts_at(path: String) -> Bytes =
+  if string_ends_with(path, "counted-20-1.json") { b"{\"allocations\":10000,\"bytes\":400000}" }
+  else if string_ends_with(path, "counted-20-2.json") { b"{\"allocations\":9990,\"bytes\":399000}" } else if string_ends_with(
+      path,
+      "counted-200-1.json",
+    ) { b"{\"allocations\":19000,\"bytes\":1100000}" }
+  else { b"{\"allocations\":19100,\"bytes\":1110000}" }
+
+fn load_report(n: Int) -> Bytes = {
+  let count = int_to_string(n);
+  bytes_of_string(
+    "{\"requests\":" ++ count ++ ",\"answered\":" ++ count ++ ",\"connections\":" ++ count
+      ++ ",\"per_conn\":1,\"wall_micros\":1000,\"latencies\":[],\"connects\":[],\"handshakes\":[],\"statuses\":[{\"count\":"
+      ++ count
+      ++ ",\"status\":200}],\"failures\":[]}",
+  )
+}
+
+// The number a `--set KEY=N` on a command line gives `key`.
+fn setting_in(args: List<String>, key: String) -> Int = {
+  let prefix = key ++ "=";
+  fold(args, 0, |n: Int, arg: String|
+    if string_starts_with(arg, prefix) {
+      match decimal_of_string(string_slice(arg, string_len(prefix), string_len(arg))) {
+        Some(d) -> match int_of_decimal(d, Down) { Some(x) -> x, None -> n },
+        None -> n,
+      }
+    } else { n })
+}
+
+test "a window is counted twice and the smaller kept, and a request is the slope between two" {
+  let health = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"routes\":11,\"service\":\"parts desk\"}";
+  let desk = process::script(0, process::exited(0, b"", b""), [
+    process::Said("listening on 40123"),
+  ]);
+  let taken = { corpus: "b3:c0ffee", runtime: "ply 0.16.0", machine: "a laptop" };
+  with_cell[kids](process::children([desk, desk, desk, desk])) { kids -> {
+    with_cell[asked](0) { asked -> {
+      with_cell[pending](false) { pending -> {
+        let figure = handle {
+          counted({ repo: "../repo", scratch: "target/corpus/w6" }, args(), taken)
+        } with {
+          process.start[ply](args, dir, env, io) -> {
+            let step = process::start_step(cell_get(kids), { args: args, dir: dir, env: env }, io);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.output_line[ply](child, timeout_ms) -> {
+            let step = process::output_line_step(cell_get(kids), child);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.wait[ply](child, timeout_ms) -> {
+            let step = process::wait_step(cell_get(kids), child);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.signal[ply](child, signal) -> {
+            let step = process::signal_step(cell_get(kids), child, signal);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.spawn[ply](args, dir, env) -> {
+            cell_set(asked, setting_in(args, "LOAD_CONNECTIONS"));
+            process::exited(0, b"", b"")
+          },
+          config.get[env](key) -> None,
+          fs.read_file[work](path) -> if string_ends_with(path, "load.json") {
+            Some(load_report(cell_get(asked)))
+          } else { Some(counts_at(path)) },
+          fs.remove[work](path) -> true,
+          net.connect[probe](host, port, timeout_ms) -> Some(3),
+          net.send[probe](c, payload, timeout_ms) -> {
+            cell_set(pending, true);
+            Some(bytes_len(payload))
+          },
+          net.recv[probe](c, max, timeout_ms) -> if cell_get(pending) {
+            cell_set(pending, false);
+            Some(health)
+          } else { Some(b"") },
+          net.close[probe](c) -> (),
+          time.elapsed_ms() -> 0,
+          time.sleep_ms(ms) -> (),
+        };
+        match figure {
+          Err(why) -> panic(why),
+          Ok(f) -> {
+            assert_eq((f.requests, f.body_bytes), (200, 36));
+            assert_eq(f.allocations_per_request, 50.056m);
+            assert_eq(f.bytes_per_request, 3894.444m)
+          },
+        };
+        let started = cell_get(kids).started;
+        assert_eq(map(started, |c: process::Child| list_at(c.launch.args, 0)), [
+          Some("--count-allocs=target/corpus/w6/counted-20-1.json"),
+          Some("--count-allocs=target/corpus/w6/counted-20-2.json"),
+          Some("--count-allocs=target/corpus/w6/counted-200-1.json"),
+          Some("--count-allocs=target/corpus/w6/counted-200-2.json"),
+        ]);
+        assert(
+          fold(started, true, |ok: Bool, c: process::Child|
+            ok && c.signals == [process::Terminate] && list_at(c.launch.args, 1) == Some("run")
+              && fold(c.launch.args, false, |seen: Bool, arg: String|
+                seen || arg == "DESK_ACCEPT=sequential")),
+        )
+      } }
+    } }
+  } }
+}
+
+test "a sweep with no database serves the twin and the floor, and the rungs it cannot take say why" {
+  let health = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nContent-Length: 36\r\n\r\n{\"routes\":11,\"service\":\"parts desk\"}";
+  let desk = process::script(0, process::exited(0, b"", b""), [
+    process::Said("listening on 40123"),
+  ]);
+  let floor = process::script(0, process::signalled(15, b"", b""), [
+    process::Said("listening on 40124"),
+  ]);
+  let a = {
+    ..args(),
+    concurrency: [1, 2],
+    per_conn: 4,
+    requests_per_point: 8,
+    repeats: 1,
+    served_repeats: 1,
+  };
+  with_cell[kids](process::children([desk, floor])) { kids -> {
+    with_cell[asked](0) { asked -> {
+      with_cell[pending](false) { pending -> {
+        let swept = handle {
+          served_if({ repo: "../repo", scratch: "target/corpus/w6" }, a)
+        } with {
+          process.start[ply](args, dir, env, io) -> {
+            let step = process::start_step(cell_get(kids), { args: args, dir: dir, env: env }, io);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.output_line[ply](child, timeout_ms) -> {
+            let step = process::output_line_step(cell_get(kids), child);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.wait[ply](child, timeout_ms) -> {
+            let step = process::wait_step(cell_get(kids), child);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.signal[ply](child, signal) -> {
+            let step = process::signal_step(cell_get(kids), child, signal);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.start[http_floor](args, dir, env, io) -> {
+            let step = process::start_step(cell_get(kids), { args: args, dir: dir, env: env }, io);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.output_line[http_floor](child, timeout_ms) -> {
+            let step = process::output_line_step(cell_get(kids), child);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.wait[http_floor](child, timeout_ms) -> {
+            let step = process::wait_step(cell_get(kids), child);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.signal[http_floor](child, signal) -> {
+            let step = process::signal_step(cell_get(kids), child, signal);
+            cell_set(kids, step.children);
+            step.answer
+          },
+          process.spawn[ply](args, dir, env) -> {
+            cell_set(
+              asked,
+              setting_in(args, "LOAD_CONNECTIONS") * setting_in(args, "LOAD_PER_CONN"),
+            );
+            process::exited(0, b"", b"")
+          },
+          config.get[env](key) -> None,
+          process.bound[http_floor]() -> true,
+          certgen.issue() -> certgen::canned("certificate", "key", b"", "fingerprint"),
+          fs.read_file[work](path) -> Some(load_report(cell_get(asked))),
+          fs.write_file[work](path, body) -> true,
+          fs.remove[work](path) -> true,
+          net.connect[probe](host, port, timeout_ms) -> Some(3),
+          net.send[probe](c, payload, timeout_ms) -> {
+            cell_set(pending, true);
+            Some(bytes_len(payload))
+          },
+          net.recv[probe](c, max, timeout_ms) -> if cell_get(pending) {
+            cell_set(pending, false);
+            Some(health)
+          } else { Some(b"") },
+          net.close[probe](c) -> (),
+          time.elapsed_ms() -> 0,
+          time.sleep_ms(ms) -> (),
+        };
+        match swept {
+          Err(why) -> panic(why),
+          Ok(None) -> panic("the served section was asked for"),
+          Ok(Some(s)) -> {
+            let judged = report::judge(served_rows(a, s));
+            assert_eq(map(judged, |j: report::Judged| j.row.name), [
+              "the twin in plaintext, /health, 1 client",
+              "the twin in plaintext, /health, 2 clients",
+              "the floor, one connection at a time, /health, 1 client",
+              "the floor, one connection at a time, /health, 2 clients",
+              serve::agreement_name(),
+              "the desk, the twin in plaintext, stops",
+              "the floor, one connection at a time, stops",
+            ]);
+            assert(fold(judged, true, |ok: Bool, j: report::Judged| ok && report::passed(j)));
+            let l = ladder_of(None, Some(served_half(a, s.points, s.floor, None)));
+            match filter(l.steps, |step: w6::Step| step.layer.label == "socket") {
+              [step] ->
+                assert(match step.rung {
+                  Err(why) -> string_starts_with(why, no_database()),
+                  Ok(_) -> false,
+                }),
+              _ -> panic("one step a layer"),
+            };
+            assert_eq(l.floor, Err(no_database()))
+          },
+        }
+      } }
+    } }
+  } }
+}

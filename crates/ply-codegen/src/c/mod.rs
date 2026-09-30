@@ -4,6 +4,7 @@
 mod build;
 pub mod bundle;
 pub mod cache;
+pub mod dump;
 pub mod exports;
 mod load;
 mod prelude;
