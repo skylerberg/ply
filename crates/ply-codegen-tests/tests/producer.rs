@@ -2,8 +2,7 @@
 
 use ply_codegen::Source;
 use ply_codegen::c::producer::{self, PlyProducer, Sources};
-use ply_eval::Value;
-use ply_span::SourceId;
+use ply_eval::{SourceId, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -24,7 +23,7 @@ fn repo() -> PathBuf {
 }
 
 struct Loaded {
-    front: &'static ply_ty::Front,
+    front: &'static ply_eval::Front,
     texts: HashMap<String, String>,
 }
 
@@ -302,7 +301,7 @@ impl ply_eval::HostHandler for Doubler {
         &self,
         _rt: &dyn ply_eval::HostRuntime,
         req: &ply_eval::HostRequest<'_>,
-    ) -> Result<ply_eval::HostAnswer, ply_span::Diagnostic> {
+    ) -> Result<ply_eval::HostAnswer, ply_eval::Diagnostic> {
         let Some(Value::Int(n)) = req.args.first() else {
             panic!("ping takes an Int");
         };
@@ -325,8 +324,8 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     let mut registry = ply_eval::HostRegistry::new();
     registry.register(
         ply_eval::HostOp {
-            effect: ply_span::Symbol::new("m.served"),
-            op: ply_span::Symbol::new("ping"),
+            effect: ply_eval::Symbol::new("m.served"),
+            op: ply_eval::Symbol::new("ping"),
             resource: ply_eval::HostResource::Any,
             determinism: ply_eval::Determinism::Nondeterministic,
             linearity: ply_eval::Linearity::Repeatable,
@@ -824,7 +823,7 @@ impl ply_eval::HostHandler for Slow {
         &self,
         _rt: &dyn ply_eval::HostRuntime,
         req: &ply_eval::HostRequest<'_>,
-    ) -> Result<ply_eval::HostAnswer, ply_span::Diagnostic> {
+    ) -> Result<ply_eval::HostAnswer, ply_eval::Diagnostic> {
         let Some(Value::Int(n)) = req.args.first() else {
             panic!("fetch takes an Int");
         };
@@ -839,15 +838,15 @@ impl ply_eval::HostHandler for Slow {
 struct Reactor;
 
 impl ply_eval::HostRuntime for Reactor {
-    fn poll(&self, pending: &ply_eval::Pending) -> Result<Option<Value>, ply_span::Diagnostic> {
+    fn poll(&self, pending: &ply_eval::Pending) -> Result<Option<Value>, ply_eval::Diagnostic> {
         Ok(Some(Value::Int(pending.token as i64 * 3)))
     }
 
-    fn park(&self) -> Result<(), ply_span::Diagnostic> {
+    fn park(&self) -> Result<(), ply_eval::Diagnostic> {
         Ok(())
     }
 
-    fn block_on(&self, pending: ply_eval::Pending) -> Result<Value, ply_span::Diagnostic> {
+    fn block_on(&self, pending: ply_eval::Pending) -> Result<Value, ply_eval::Diagnostic> {
         Ok(Value::Int(pending.token as i64 * 3))
     }
 }
@@ -867,8 +866,8 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     let mut registry = ply_eval::HostRegistry::new();
     registry.register(
         ply_eval::HostOp {
-            effect: ply_span::Symbol::new("m.slow"),
-            op: ply_span::Symbol::new("fetch"),
+            effect: ply_eval::Symbol::new("m.slow"),
+            op: ply_eval::Symbol::new("fetch"),
             resource: ply_eval::HostResource::Any,
             determinism: ply_eval::Determinism::Nondeterministic,
             linearity: ply_eval::Linearity::Repeatable,
@@ -882,8 +881,8 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     for op in ply_eval::sim::TASK_OPS {
         registry.register(
             ply_eval::HostOp {
-                effect: ply_span::Symbol::new("task"),
-                op: ply_span::Symbol::new(*op),
+                effect: ply_eval::Symbol::new("task"),
+                op: ply_eval::Symbol::new(*op),
                 resource: ply_eval::HostResource::Any,
                 determinism: ply_eval::Determinism::Nondeterministic,
                 linearity: ply_eval::Linearity::Repeatable,
@@ -1002,8 +1001,8 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
     assert!(refused.is_empty(), "{refused:?}");
     let account = |balance: i64| {
         Value::Record(std::sync::Arc::new(ply_eval::Fields::from_unsorted(vec![
-            (ply_span::Symbol::new("name"), Value::str("a")),
-            (ply_span::Symbol::new("balance"), Value::Int(balance)),
+            (ply_eval::Symbol::new("name"), Value::str("a")),
+            (ply_eval::Symbol::new("balance"), Value::Int(balance)),
         ])))
     };
     let cases: Vec<(&str, Vec<Value>, bool)> = vec![
@@ -1062,10 +1061,10 @@ fn standard_library() -> (&'static Source, Vec<String>) {
     let unused: Vec<String> = front
         .diagnostics
         .iter()
-        .filter(|d| d.code == ply_span::codes::UNUSED_DEFINITION)
+        .filter(|d| d.code == ply_eval::codes::UNUSED_DEFINITION)
         .map(|d| d.message.clone())
         .collect();
-    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
     let source: &'static Source = Box::leak(Box::new(
         Source::from_front(front).with_texts(modules.into_iter().collect()),
     ));

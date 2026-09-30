@@ -1,9 +1,9 @@
 //! The host effect boundary: the types the machine speaks and the registry of host handlers.
 
 use crate::value::Value;
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::{CheckOutput, EffectInfo};
-use ply_ty::{EffectAtom, Footprint, Resource};
+use crate::{
+    CheckOutput, Diagnostic, EffectAtom, EffectInfo, Footprint, Resource, Span, Symbol, codes,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -82,7 +82,7 @@ pub struct HostOp {
 }
 
 impl HostOp {
-    fn atom(&self, effect: &Symbol, resource: Resource, mode: ply_ty::Mode) -> EffectAtom {
+    fn atom(&self, effect: &Symbol, resource: Resource, mode: crate::Mode) -> EffectAtom {
         EffectAtom::operation(effect.clone(), resource, mode, self.op.clone())
     }
 
@@ -687,7 +687,7 @@ pub fn attribute(
     operation: &str,
     span: Span,
 ) -> Diagnostic {
-    diagnostic.severity = ply_span::Severity::Error;
+    diagnostic.severity = crate::Severity::Error;
     if is_reserved_code(diagnostic.code) {
         let claimed = diagnostic.code;
         diagnostic.code = codes::RUNTIME_ERROR;

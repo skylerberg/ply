@@ -7,12 +7,13 @@ use crate::load::{
     unreadable,
 };
 use ply_codegen::c::producer;
-use ply_eval::Value as PlyValue;
 use ply_eval::decode::{self, At};
+use ply_eval::{
+    Diagnostic, Front, ModuleInfo, ModuleName, SourceId, SourceMap, Span, Symbol,
+    Value as PlyValue, codes,
+};
 use ply_prove::prove::{Claims, read_claims};
-use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_store::{ContentHash, Store};
-use ply_ty::{Front, ModuleInfo, ModuleName};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -744,12 +745,12 @@ fn module_key<'a>(
 }
 
 /// Files in load order, then items as written; the port answers dependency-first.
-fn published_order(front: &Front) -> ply_ty::CheckOutput {
+fn published_order(front: &Front) -> ply_eval::CheckOutput {
     let mut check = front.check.clone();
     let mut defs = indexmap::IndexMap::with_capacity(check.defs.len());
     for (_, items) in &front.ordinals {
         for item in items {
-            if let ply_ty::Ordinal::Fn(name, _) = item
+            if let ply_eval::Ordinal::Fn(name, _) = item
                 && let Some(info) = check.defs.shift_remove(name)
             {
                 defs.insert(name.clone(), info);

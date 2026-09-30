@@ -6,8 +6,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{SECRET_REDACTED, Value, constant_time_eq, values_equal};
-use ply_span::{Diagnostic, Symbol, codes};
+use ply_eval::{Diagnostic, SECRET_REDACTED, Symbol, Value, codes, constant_time_eq, values_equal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -83,7 +82,7 @@ fn a_runtime_type_error_over_a_secret_prints_no_payload() {
     let d = values_equal(
         &Value::secret(Value::str("hunter2")),
         &Value::builtin(ply_eval::Builtin::Len),
-        ply_span::Span::DUMMY,
+        ply_eval::Span::DUMMY,
     )
     .expect_err("a function has no equality");
     let text = format!("{d:#?}");
@@ -108,7 +107,7 @@ test "equality works and prints nothing" {
 
 #[test]
 fn a_secret_is_never_equal_to_its_payload() {
-    let span = ply_span::Span::DUMMY;
+    let span = ply_eval::Span::DUMMY;
     let secret = Value::secret(Value::str("hunter2"));
     let plain = Value::str("hunter2");
     assert!(!values_equal(&secret, &plain, span).unwrap());
@@ -139,7 +138,7 @@ fn compare_values_refuses_a_secret_at_run_time() {
             Value::secret(Value::str("b")),
         ],
         &mut regions,
-        ply_span::Span::DUMMY,
+        ply_eval::Span::DUMMY,
     )
     .expect_err("a credential has no order");
     assert_eq!(d.code, codes::RUNTIME_ERROR);
@@ -172,7 +171,7 @@ fn a_secret_key_is_refused_by_every_map_operation_that_takes_one() {
             vec![Value::empty_map(), key.clone()],
         ),
     ] {
-        let d = ply_eval::builtins::call(builtin, args, &mut regions, ply_span::Span::DUMMY)
+        let d = ply_eval::builtins::call(builtin, args, &mut regions, ply_eval::Span::DUMMY)
             .err()
             .unwrap_or_else(|| panic!("{} accepted a Secret key", builtin.name()));
         assert_eq!(d.code, codes::RUNTIME_ERROR, "{}", builtin.name());
@@ -407,7 +406,7 @@ fn map_of_entries_refuses_a_secret_key() {
             entry(Value::secret(Value::str("hunter1")), Value::Int(0)),
         ])],
         &mut regions,
-        ply_span::Span::DUMMY,
+        ply_eval::Span::DUMMY,
     );
     let d = refused.expect_err("`map_of_entries` refuses a `Secret` key");
     assert_eq!(d.code, codes::RUNTIME_ERROR, "{d:#?}");
@@ -427,7 +426,7 @@ fn map_merge_refuses_a_secret_key() {
         ply_eval::Builtin::MapMerge,
         vec![Value::empty_map(), right],
         &mut regions,
-        ply_span::Span::DUMMY,
+        ply_eval::Span::DUMMY,
     );
     let d = refused.expect_err("`map_merge` refuses a `Secret` key");
     assert_eq!(d.code, codes::RUNTIME_ERROR, "{d:#?}");
@@ -472,7 +471,7 @@ fn every_map_operation_that_orders_a_key_refuses_a_secret() {
     ];
     for (builtin, args) in cases {
         let mut regions = ply_eval::TaskRegions::new();
-        let refused = ply_eval::builtins::call(builtin, args, &mut regions, ply_span::Span::DUMMY);
+        let refused = ply_eval::builtins::call(builtin, args, &mut regions, ply_eval::Span::DUMMY);
         let d = refused
             .err()
             .unwrap_or_else(|| panic!("{builtin:?} accepted a `Secret` key"));

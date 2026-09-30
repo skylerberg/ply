@@ -207,14 +207,14 @@ static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 pub mod tests_support {
     use ply_codegen::c::Native;
     use ply_codegen::source::Source;
-    use ply_span::SourceId;
+    use ply_eval::SourceId;
     use std::collections::HashMap;
 
     pub fn unit(text: &str) -> Option<(&'static Source, Native)> {
         with_refusals(text).map(|(s, n, _)| (s, n))
     }
 
-    fn front(text: &str) -> &'static ply_ty::Front {
+    fn front(text: &str) -> &'static ply_eval::Front {
         Box::leak(Box::new(
             ply_codegen::c::producer::checked_front(
                 &[("m".to_string(), text.to_string())],
@@ -233,7 +233,7 @@ pub mod tests_support {
             .keys()
             .map(|n| (n.clone(), format!("h-{n}-{}", &stamp[..16])))
             .collect();
-        let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+        let front: &'static ply_eval::Front = Box::leak(Box::new(front));
         Some(Box::leak(Box::new(
             Source::from_front(front).with_texts(texts(text)),
         )))
@@ -693,7 +693,7 @@ fn the_build_error_names_each_refused_definition_and_where_it_sits() {
     }];
     let borrowed: Vec<&ply_codegen::Refused> = refusals.iter().collect();
     let diagnostic = ply_codegen::c::Refusals::over(loaded, &borrowed).into_diagnostic();
-    assert_eq!(diagnostic.code, ply_span::codes::DEFINITION_REFUSED);
+    assert_eq!(diagnostic.code, ply_eval::codes::DEFINITION_REFUSED);
     let label = diagnostic.labels.first().expect("the refusal is placed");
     assert!(label.primary);
     assert_eq!(label.message, "a construct this port does not emit");
@@ -792,14 +792,14 @@ fn nonce() -> u128 {
 /// source keyed apart from the others is built cold.
 fn keyed_by_hash(text: &str, suffix: &str) -> &'static ply_codegen::Source {
     let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
-    let id = ply_span::SourceId(0);
+    let id = ply_eval::SourceId(0);
     let mut front =
         ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
             .expect("checks");
     for key in front.keys.values_mut() {
         key.push_str(suffix);
     }
-    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
     Box::leak(Box::new(ply_codegen::Source::from_front(front).with_texts(
         std::collections::HashMap::from([("m".to_string(), owned.to_string())]),
     )))
@@ -821,7 +821,7 @@ fn a_definition_that_only_moved_is_served_from_the_cache_and_placed_where_it_now
     let main = "fn main() -> Int = 1 / 0\n";
     let moved = format!("fn spare() -> Int = {nonce}\n\n\n{main}");
     let hashed = |text: &str| keyed_by_hash(text, "");
-    let failure = |source: &'static ply_codegen::Source| -> Option<ply_span::Span> {
+    let failure = |source: &'static ply_codegen::Source| -> Option<ply_eval::Span> {
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let native = match ply_codegen::c::build(source, &refs) {
@@ -1463,11 +1463,11 @@ fn keyed_modules(modules: &[(&str, &str)]) -> &'static ply_codegen::Source {
         .iter()
         .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
         .collect();
-    let ids: Vec<ply_span::SourceId> = (0..owned.len())
-        .map(|i| ply_span::SourceId(i as u32))
+    let ids: Vec<ply_eval::SourceId> = (0..owned.len())
+        .map(|i| ply_eval::SourceId(i as u32))
         .collect();
     let front = ply_codegen::c::producer::checked_front(&owned, &ids).expect("checks");
-    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
     Box::leak(Box::new(
         ply_codegen::Source::from_front(front).with_texts(owned.into_iter().collect()),
     ))

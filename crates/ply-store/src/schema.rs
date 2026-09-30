@@ -2,7 +2,7 @@
 
 use crate::frontend::{DefEntry, DefKind, FileSpan, Member, Slot, SourceFingerprint, TestEntry};
 use crate::{BODY_ENCODING, ContentHash, DefBody, FRONTEND_FORMAT, Outcome};
-use ply_span::{Diagnostic, Edit, Span, Symbol, codes};
+use ply_eval::{Diagnostic, Edit, Span, Symbol, codes};
 
 /// Every variant name the exemplars below must between them mention.
 pub const COVERED: &[&str] = &[
@@ -23,8 +23,8 @@ pub struct Exemplars {
     pub outcomes: Vec<Outcome>,
 }
 
-fn h(n: u8) -> ply_ty::DefHash {
-    ply_ty::DefHash([n; 32])
+fn h(n: u8) -> ply_eval::DefHash {
+    ply_eval::DefHash([n; 32])
 }
 
 fn span(start: u32, end: u32) -> FileSpan {
@@ -90,13 +90,13 @@ pub fn exemplars() -> Exemplars {
                 diagnostic: Some(
                     Diagnostic::error(codes::ASSERTION_FAILED, "assertion failed")
                         .primary(
-                            Span::new(ply_span::SourceId(3), 88, 97),
+                            Span::new(ply_eval::SourceId(3), 88, 97),
                             "expected 0, found -5",
                         )
                         .fix(
                             "expect -5",
                             vec![Edit {
-                                span: Span::new(ply_span::SourceId(3), 88, 89),
+                                span: Span::new(ply_eval::SourceId(3), 88, 89),
                                 text: "-5".to_string(),
                             }],
                         ),

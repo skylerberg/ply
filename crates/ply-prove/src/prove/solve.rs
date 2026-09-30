@@ -8,7 +8,7 @@ use super::{RuleLog, arith};
 use crate::Rule;
 use crate::sort::Sort;
 use crate::world::Ctor;
-use ply_span::Symbol;
+use ply_eval::Symbol;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -1,9 +1,8 @@
 //! The explicit control stack, and the prompts that delimit it.
 
-use crate::BinOp;
 use crate::pool::{self, Free, Link, Pooled};
 use crate::value::{List, Value};
-use ply_span::{Span, Symbol};
+use crate::{BinOp, Span, Symbol};
 use std::rc::Rc;
 
 #[derive(Clone)]

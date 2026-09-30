@@ -5,9 +5,7 @@
 
 use crate::fixture::project;
 use ply_eval::host::HostRegistry;
-use ply_eval::{Machine, Provider, Value};
-use ply_span::{SourceId, Span};
-use ply_ty::Front;
+use ply_eval::{Front, Machine, Provider, SourceId, Span, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -185,7 +183,7 @@ fn front_of(source: &str) -> Front {
 }
 
 /// The fixture's answer, from one entered call.
-fn one_run(source: &str, index: i64) -> Result<Value, ply_span::Diagnostic> {
+fn one_run(source: &str, index: i64) -> Result<Value, ply_eval::Diagnostic> {
     let project = project(source);
     let front = front_of(REPLAY);
     let texts: HashMap<String, String> = [("proof.obligation".to_string(), REPLAY.to_string())]

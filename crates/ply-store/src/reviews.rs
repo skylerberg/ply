@@ -1,6 +1,6 @@
 //! What a human last accepted, per definition.
 
-use ply_ty::DefHash;
+use ply_eval::DefHash;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

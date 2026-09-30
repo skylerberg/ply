@@ -1,6 +1,5 @@
 use crate::fixture::Compiled;
-use ply_eval::{Machine, Value};
-use ply_span::{Span, codes};
+use ply_eval::{Machine, Span, Value, codes};
 
 /// Admits `deep` (700 pending calls) or `nest` alone, not `nest(400)` with a `deep` under it.
 const BUDGET: usize = 1000;
@@ -35,7 +34,7 @@ pub fn probe_over_declared(n: Int) -> Int / {store.read} =
   over_declared() + nest_over_declared(n)
 "#;
 
-fn probe(c: &Compiled, name: &str) -> Result<Value, ply_span::Diagnostic> {
+fn probe(c: &Compiled, name: &str) -> Result<Value, ply_eval::Diagnostic> {
     let mut machine = Machine::new(&c.front).with_max_calls(BUDGET);
     machine.call(name, vec![Value::Int(400)], Span::DUMMY)
 }

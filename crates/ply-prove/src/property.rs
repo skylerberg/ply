@@ -7,11 +7,10 @@ use crate::{
     Binder, Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan,
     Vacuity, VacuityKind,
 };
-use ply_eval::IntTy;
-use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Synth, Value};
-use ply_eval::{SECRET, TASK_TYPE};
-use ply_span::{Diagnostic, Span, Symbol};
-use ply_ty::DefHash;
+use ply_eval::{
+    Closure, ClosureKind, Decimal, DefHash, Diagnostic, Fixed, IntTy, SECRET, Span, Symbol, Synth,
+    TASK_TYPE, Value,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;

@@ -1,6 +1,6 @@
 use crate::harness::{json_of, ply, repo, warm_agrees, write};
+use ply_eval::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_machine::load::{LoadError, Loaded, load};
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_store::{ContentHash, Store};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -472,7 +472,7 @@ fn a_cold_cache_does_not_warn_about_the_stdlib() {
 }
 
 /// The port's answer over a flat directory, pulling in the shipped modules itself, and the driver's.
-fn pulled_and_loaded(dir: &Path) -> (Vec<String>, ply_ty::Front, Result<Loaded, LoadError>) {
+fn pulled_and_loaded(dir: &Path) -> (Vec<String>, ply_eval::Front, Result<Loaded, LoadError>) {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())

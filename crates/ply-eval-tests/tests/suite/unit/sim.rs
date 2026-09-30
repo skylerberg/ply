@@ -1,9 +1,6 @@
-use ply_eval::Value;
 use ply_eval::arena::Slot;
 use ply_eval::sim::*;
-use ply_span::{Span, Symbol, codes};
-use ply_ty::EffectAtom;
-use ply_ty::Mode;
+use ply_eval::{EffectAtom, Mode, Span, Symbol, Value, codes};
 
 #[test]
 fn a_seed_round_trips_through_its_text_form() {
@@ -105,7 +102,7 @@ fn below_rejects_only_above_the_limit() {
 }
 
 fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
-    use ply_ty::Resource;
+    use ply_eval::Resource;
     EffectAtom::new(
         effect,
         resource
@@ -268,7 +265,7 @@ fn reduction_is_none_until_it_is_measured() {
 }
 
 fn span() -> Span {
-    Span::new(ply_span::SourceId(0), 12, 20)
+    Span::new(ply_eval::SourceId(0), 12, 20)
 }
 
 fn sig(effect: &str, op: &str) -> &'static OpSignature {
