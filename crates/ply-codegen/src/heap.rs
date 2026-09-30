@@ -3,7 +3,7 @@
 
 use crate::list;
 use crate::map;
-use ply_eval::{Closure, ClosureKind, Fields, Symbol, Value};
+use ply_eval::{Carry, Closure, ClosureKind, CtorCarries, Fields, Fixed, Symbol, Value};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -1000,6 +1000,8 @@ impl Heap {
     pub fn to_word(&mut self, layouts: &Layouts, v: &Value) -> Word {
         match v {
             Value::Int(n) => self.boxed_int(*n),
+            // Below 64 bits a width is held as the `Int` it stands for; at 64 it is the runtime's own.
+            Value::Fixed(f) if f.ty.bits() < 64 => imm(f.value() as i64),
             Value::Bool(b) => bool(*b),
             Value::Unit => unit(),
             Value::Str(s) if u32::try_from(s.len()).is_ok() => self.str(s),
@@ -1063,15 +1065,28 @@ impl Heap {
         }
     }
 
-    /// The interpreter value a word denotes: deep, and a borrow — the word keeps its count.
+    /// The value a word denotes where no fixed width sits below it: deep, and a borrow — the word
+    /// keeps its count.
     pub fn to_value(layouts: &Layouts, w: Word) -> Value {
         Heap::to_value_counted(layouts, w, &mut Walked::default())
     }
 
     /// [`Heap::to_value`], also counting objects read and noting any handle among them.
     pub fn to_value_counted(layouts: &Layouts, w: Word, walked: &mut Walked) -> Value {
+        Heap::read(layouts, w, &Carry::Plain, &NO_CTORS, walked)
+    }
+
+    /// The value a word denotes, each word read as `carry` says it reads, the constructors' fields
+    /// as `ctors` does; counted and noted as [`Heap::to_value_counted`] is.
+    pub fn read(
+        layouts: &Layouts,
+        w: Word,
+        carry: &Carry,
+        ctors: &CtorCarries,
+        walked: &mut Walked,
+    ) -> Value {
         if is_imm(w) {
-            return Value::Int(imm_value(w));
+            return read_int(imm_value(w), carry, walked);
         }
         walked.read += 1;
         let o = obj(w);
@@ -1079,7 +1094,7 @@ impl Heap {
             match (*o).kind {
                 KIND_UNIT => Value::Unit,
                 KIND_BOOL => Value::Bool((*o).flags != 0),
-                KIND_INT => Value::Int(word_at(o, 0)),
+                KIND_INT => read_int(word_at(o, 0), carry, walked),
                 KIND_STR => Value::Str(Arc::from(str_of(o))),
                 KIND_BYTES => Value::Bytes(Arc::from(bytes_of(o))),
                 KIND_RECORD => {
@@ -1088,9 +1103,10 @@ impl Heap {
                         .iter()
                         .enumerate()
                         .map(|(i, name)| {
+                            let field = carry.field(name);
                             (
                                 name.clone(),
-                                Heap::to_value_counted(layouts, word_at(o, i), walked),
+                                Heap::read(layouts, word_at(o, i), &field, ctors, walked),
                             )
                         })
                         .collect();
@@ -1099,22 +1115,31 @@ impl Heap {
                 KIND_CTOR => {
                     let name = layouts.ctors[(*o).layout as usize].0.clone();
                     let args = (0..(*o).len as usize)
-                        .map(|i| Heap::to_value_counted(layouts, word_at(o, i), walked))
+                        .map(|i| {
+                            let field = carry.ctor_field(&name, i, ctors);
+                            Heap::read(layouts, word_at(o, i), &field, ctors, walked)
+                        })
                         .collect();
                     Value::ctor(name, args)
                 }
-                KIND_LIST => Value::list(
-                    list::to_vec(o)
-                        .into_iter()
-                        .map(|x| Heap::to_value_counted(layouts, x, walked))
-                        .collect(),
-                ),
-                KIND_MAP => Value::map(map::to_vec(o).into_iter().map(|(k, v)| {
-                    (
-                        Heap::to_value_counted(layouts, k, walked),
-                        Heap::to_value_counted(layouts, v, walked),
+                KIND_LIST => {
+                    let item = carry.item();
+                    Value::list(
+                        list::to_vec(o)
+                            .into_iter()
+                            .map(|x| Heap::read(layouts, x, &item, ctors, walked))
+                            .collect(),
                     )
-                })),
+                }
+                KIND_MAP => {
+                    let (key, value) = carry.entry();
+                    Value::map(map::to_vec(o).into_iter().map(|(k, v)| {
+                        (
+                            Heap::read(layouts, k, &key, ctors, walked),
+                            Heap::read(layouts, v, &value, ctors, walked),
+                        )
+                    }))
+                }
                 KIND_CLOSURE => {
                     walked.handle = true;
                     let captured: Vec<Value> = (CLOSURE_CAPTURES..(*o).len as usize)
@@ -1142,11 +1167,33 @@ impl Heap {
     }
 }
 
-/// What a conversion out of the heap read: how many objects, and whether one was a handle.
+/// What a conversion out of the heap read: how many objects, whether one was a handle, and whether
+/// an `Int` word did not read, its carry leaving open whether it is an `Int` or a width, or it
+/// holding no value of its width.
 #[derive(Default)]
 pub struct Walked {
     pub read: u64,
     pub handle: bool,
+    pub unread: bool,
+}
+
+static NO_CTORS: std::sync::LazyLock<CtorCarries> = std::sync::LazyLock::new(CtorCarries::new);
+
+fn read_int(n: i64, carry: &Carry, walked: &mut Walked) -> Value {
+    match carry {
+        Carry::Plain => Value::Int(n),
+        Carry::Width(t) => Fixed::of(*t, i128::from(n)).map_or_else(
+            || {
+                walked.unread = true;
+                Value::Int(n)
+            },
+            Value::Fixed,
+        ),
+        _ => {
+            walked.unread = true;
+            Value::Int(n)
+        }
+    }
 }
 
 impl Drop for Heap {

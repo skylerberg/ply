@@ -3,7 +3,11 @@
 use crate::rt::Entry;
 use crate::source::Source;
 use anyhow::{Context, Result, bail};
-use ply_eval::{Compilation, Counters, DefHash, Diagnostic, Entered, Provider, Symbol, Value};
+use ply_eval::{
+    Carry, Compilation, Counters, CtorCarries, DefHash, Diagnostic, Entered, Provider, Symbol,
+    Value,
+};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -13,12 +17,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The widest arity this boundary carries without allocating an argument array.
 const MAX_ARITY: usize = 16;
 
-/// One admitted definition: where its code is, how many arguments it takes, and what may answer
-/// an entry instead of running it.
+/// One admitted definition: where its code is, how many arguments it takes, what may answer an
+/// entry instead of running it, and how its arguments and answer read.
 struct Admitted {
     entry: Entry,
     arity: usize,
     memo: Memo,
+    params: &'static [Carry],
+    answer: &'static Carry,
+}
+
+/// The carry of a root the compiler published none for.
+static UNPUBLISHED: Carry = Carry::Open;
+
+impl Admitted {
+    /// How this entry's answer reads: its type, each variable bound by what the arguments show of
+    /// it. What no argument shows stays open, since only a value of that type could show it.
+    fn reading(&self, args: &[Value], ctors: &CtorCarries) -> Cow<'static, Carry> {
+        if !self.answer.mentions_var() {
+            return Cow::Borrowed(self.answer);
+        }
+        let mut vars = Vec::new();
+        for (param, arg) in self.params.iter().zip(args) {
+            param.bind(arg, &mut vars, ctors);
+        }
+        Cow::Owned(self.answer.instantiate(&vars))
+    }
 }
 
 /// Decided once, from the purity the compiler published: an impure root has no memo to consult.
@@ -44,11 +68,19 @@ pub struct Declines {
     pub touched_cells: u64,
     /// The answer held a closure, cell, task, continuation or secret, which cannot cross out.
     pub answer: u64,
+    /// The answer held an `Int` word where neither its type nor the arguments say whether it is
+    /// an `Int` or a width, or one that is no value of the width its type says.
+    pub unread: u64,
 }
 
 impl Declines {
     pub fn total(&self) -> u64 {
-        self.not_compiled + self.arity + self.reentered + self.touched_cells + self.answer
+        self.not_compiled
+            + self.arity
+            + self.reentered
+            + self.touched_cells
+            + self.answer
+            + self.unread
     }
 }
 
@@ -288,10 +320,6 @@ impl Bodies {
                      every call and no reason recorded against it"
                 );
             }
-            // Fixed widths are held as tagged `Int`s, so one crossing the seam would read wrongly.
-            if unit.source.mentions_width(name.as_str()) {
-                continue;
-            }
             // An embedded unit's slots were chosen when it was built; this program's purity decides.
             let memo = match (
                 unit.source.pure(name.as_str()),
@@ -301,9 +329,21 @@ impl Bodies {
                 (true, Some(slot)) => Memo::Constant(slot),
                 (true, None) => Memo::Calls,
             };
-            admitted.insert(name.clone(), Admitted { entry, arity, memo });
+            let row = unit.source.row(name.as_str());
+            admitted.insert(
+                name.clone(),
+                Admitted {
+                    entry,
+                    arity,
+                    memo,
+                    params: row.map_or(&[], |r| r.params.as_slice()),
+                    answer: row.map_or(&UNPUBLISHED, |r| &r.answer),
+                },
+            );
         }
-        let ctx = RefCell::new(code.context());
+        let mut ctx = code.context();
+        ctx.program = Some(unit.source.front);
+        let ctx = RefCell::new(ctx);
         Ok(Bodies {
             unit,
             _code: code,
@@ -445,7 +485,14 @@ impl Bodies {
         }
         // Memoize the word and its converted value, so later entries skip both run and conversion.
         let mut walked = crate::heap::Walked::default();
-        let value = crate::heap::Heap::to_value_counted(&tables.layouts, out, &mut walked);
+        let ctors = &self.unit.source.front.ctor_carries;
+        let value = crate::heap::Heap::read(
+            &tables.layouts,
+            out,
+            &admitted.reading(args, ctors),
+            ctors,
+            &mut walked,
+        );
         let kept = match admitted.memo {
             Memo::Constant(index) if crate::heap::world_independent(out) => {
                 Some(tables.memoize(index, out))
@@ -459,6 +506,9 @@ impl Bodies {
         drop(ctx);
         if walked.handle {
             return self.decline(|d| d.answer += 1);
+        }
+        if walked.unread {
+            return self.decline(|d| d.unread += 1);
         }
         if let Some(kept) = kept {
             tables.remember(kept, &value);

@@ -23,7 +23,7 @@ pub fn size(value: &Value, world: &World) -> u64 {
     while let Some(v) = pending.pop() {
         let here = match v {
             Value::Int(n) => int_size(*n),
-            Value::Fixed(f) => int_size(f.value().clamp(i64::MIN as i128, i64::MAX as i128) as i64),
+            Value::Fixed(f) => fixed_size(f.value()),
             Value::Bool(b) => u64::from(*b),
             Value::Unit => 0,
             Value::Float(f) => float_size(*f),
@@ -93,6 +93,15 @@ fn int_size(n: i64) -> u64 {
     n.unsigned_abs()
         .saturating_mul(2)
         .saturating_add(u64::from(n < 0))
+}
+
+/// [`int_size`] over a width's value, which a `U64` can take past what an `Int` holds.
+fn fixed_size(v: i128) -> u64 {
+    let size = v
+        .unsigned_abs()
+        .saturating_mul(2)
+        .saturating_add(u128::from(v < 0));
+    u64::try_from(size).unwrap_or(u64::MAX)
 }
 
 /// The smallest value of a type: the shrinker's floor.
@@ -176,6 +185,7 @@ fn candidates_at(value: &Value, sort: &Sort, world: &World, depth: u32) -> Vec<V
     }
     match (value, sort) {
         (Value::Int(n), _) => int_candidates(*n),
+        (Value::Fixed(f), _) => fixed_candidates(*f),
         (Value::Float(f), _) => float_candidates(*f),
         (Value::Decimal(d), _) => decimal_candidates(*d),
         (Value::Bool(true), _) => vec![Value::Bool(false)],
@@ -246,6 +256,30 @@ fn int_candidates(n: i64) -> Vec<Value> {
     out.retain(|c| *c != n);
     out.dedup();
     out.into_iter().map(Value::Int).collect()
+}
+
+/// [`int_candidates`] within the width, so each candidate is a value of the type.
+fn fixed_candidates(f: Fixed) -> Vec<Value> {
+    let n = f.value();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<i128> = vec![0];
+    let mut half = n / 2;
+    while half != 0 {
+        out.push(half);
+        half /= 2;
+    }
+    out.push(n - n.signum());
+    if n < 0 {
+        out.push(-n);
+    }
+    out.retain(|c| *c != n);
+    out.dedup();
+    out.into_iter()
+        .filter_map(|c| Fixed::of(f.ty, c))
+        .map(Value::Fixed)
+        .collect()
 }
 
 fn float_candidates(f: f64) -> Vec<Value> {

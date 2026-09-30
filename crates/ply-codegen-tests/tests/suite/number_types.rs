@@ -1,7 +1,11 @@
-use crate::fragment::{call, unit};
-use ply_eval::Value;
+// `Value` pins `Arc` for its shared payloads.
+#![allow(clippy::arc_with_non_send_sync)]
 
-/// Signatures are `Int` because a fixed width may not cross the seam; the widths live inside the bodies, as in `std.hash`.
+use crate::fragment::{call, unit};
+use ply_eval::{Closure, ClosureKind, Fields, Fixed, IntTy, Synth, Value};
+use std::sync::Arc;
+
+/// `Int` signatures over bodies that compute in widths, as `std.hash` does.
 const WIDTHS: &str = r#"
 fn add_u8(a: Int, b: Int) -> Int = int_of_u8(u8_of_int(a) + u8_of_int(b))
 fn wrap_u8(a: Int, b: Int) -> Int = int_of_u8(wrap_add(u8_of_int(a), u8_of_int(b)))
@@ -64,13 +68,31 @@ fn mixed(n: Int) -> Int =
   int_of_u32(fold(range(0, n), 0u32, |acc: U32, i: Int| rotr(acc ^ u32_of_int(i), 7)))
 "#;
 
-/// A width may not cross the seam, so these are declined rather than answered.
+/// Widths in signatures, fields, lists, constructors and type variables, crossing the seam both ways.
 const CROSSES: &str = r#"
+type Byte = | Byte(U8)
+type Word = { w: U32 }
+type Sample = { level: I16, label: String }
+
 fn narrows(n: Int) -> U32 requires n >= 0 ensures int_of_u32(result) == n = u32_of_int(n)
 fn widens(w: U32) -> Int requires int_of_u32(w) > 0 = int_of_u32(w)
-type Word = { w: U32 }
 fn boxed(n: Int) -> Word = {w: u32_of_int(n)}
 law "no word is seven" forall (w: U32) { int_of_u32(w) != 7 }
+
+fn negated(b: I8) -> I8 = -b
+fn doubled(w: U32) -> U32 = wrap_add(w, w)
+fn flipped(w: U64) -> U64 = w ^ 1u64
+fn bytes(n: Int) -> List<U8> = map(range(0, n), |i: Int| u8_of_int(i * 100 % 256))
+fn summed(xs: List<U8>) -> Int = fold(xs, 0, |acc: Int, x: U8| acc + int_of_u8(x))
+fn sample(n: Int) -> Sample = {level: i16_of_int(n), label: "s"}
+fn level(s: Sample) -> I16 = s.level
+fn wrap(b: U8) -> Byte = Byte(b)
+fn unwrap(b: Byte) -> U8 = match b { Byte(x) -> x }
+law "no byte is seven" forall (b: Byte) { match b { Byte(x) -> int_of_u8(x) != 7 } }
+
+fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }
+fn made<a>(make: () -> a) -> a = make()
+fn applied<a, b>(f: (a) -> b, x: a) -> b = f(x)
 "#;
 
 #[test]
@@ -209,39 +231,195 @@ fn each_width_answers_what_its_type_means() {
     }
 }
 
-/// A width is a tagged immediate and would arrive as an `Int`, so the crossing is refused, not the body.
+fn u8(n: i128) -> Value {
+    Value::Fixed(Fixed::of(IntTy::U8, n).expect("a U8"))
+}
+
+fn fixed(ty: IntTy, n: i128) -> Value {
+    Value::Fixed(Fixed::of(ty, n).expect("a value of the width"))
+}
+
+fn record(fields: Vec<(&str, Value)>) -> Value {
+    Value::Record(Arc::new(Fields::from_unsorted(
+        fields
+            .into_iter()
+            .map(|(name, v)| (name.into(), v))
+            .collect(),
+    )))
+}
+
+/// A width crosses as the tagged `Int` compiled code holds it, and reads back as the width its
+/// type says, however deep: the roots are entered, not declined, and each answer is typed.
 #[test]
-fn a_signature_naming_a_width_is_declined_rather_than_answered() {
+fn a_signature_naming_a_width_is_entered_and_answers_typed() {
     let (_, unit) = unit(CROSSES);
     let bodies = unit.bodies().expect("the unit builds");
-    for (name, args) in [
-        ("m.narrows", vec![Value::Int(7)]),
-        ("m.widens", vec![Value::Int(7)]),
-        ("m.boxed", vec![Value::Int(7)]),
+    let byte = |n: i128| Value::ctor("m.Byte", vec![u8(n)]);
+    let cases: Vec<(&str, Vec<Value>, Value)> = vec![
+        ("m.narrows", vec![Value::Int(7)], fixed(IntTy::U32, 7)),
+        ("m.widens", vec![fixed(IntTy::U32, 7)], Value::Int(7)),
+        (
+            "m.boxed",
+            vec![Value::Int(7)],
+            record(vec![("w", fixed(IntTy::U32, 7))]),
+        ),
         // A clause is entered with its owner's parameters, and an `ensures` with `result` too.
-        ("m.narrows#ensures#0", vec![Value::Int(7), Value::Int(7)]),
-        ("m.widens#requires#0", vec![Value::Int(7)]),
-        ("m.law#0.body", vec![Value::Int(7)]),
-    ] {
+        (
+            "m.narrows#ensures#0",
+            vec![Value::Int(7), fixed(IntTy::U32, 7)],
+            Value::Bool(true),
+        ),
+        (
+            "m.narrows#ensures#0",
+            vec![Value::Int(7), fixed(IntTy::U32, 8)],
+            Value::Bool(false),
+        ),
+        (
+            "m.widens#requires#0",
+            vec![fixed(IntTy::U32, 0)],
+            Value::Bool(false),
+        ),
+        (
+            "m.law#0.body",
+            vec![fixed(IntTy::U32, 7)],
+            Value::Bool(false),
+        ),
+        (
+            "m.law#0.body",
+            vec![fixed(IntTy::U32, 4_294_967_295)],
+            Value::Bool(true),
+        ),
+        ("m.negated", vec![fixed(IntTy::I8, -5)], fixed(IntTy::I8, 5)),
+        (
+            "m.negated",
+            vec![fixed(IntTy::I8, 127)],
+            fixed(IntTy::I8, -127),
+        ),
+        (
+            "m.doubled",
+            vec![fixed(IntTy::U32, 3_000_000_000)],
+            fixed(IntTy::U32, 1_705_032_704),
+        ),
+        // Past `2^63`, where a `U64` is the runtime's own object rather than an immediate.
+        (
+            "m.flipped",
+            vec![fixed(IntTy::U64, i128::from(u64::MAX) - 1)],
+            fixed(IntTy::U64, i128::from(u64::MAX)),
+        ),
+        (
+            "m.bytes",
+            vec![Value::Int(3)],
+            Value::list(vec![u8(0), u8(100), u8(200)]),
+        ),
+        (
+            "m.summed",
+            vec![Value::list(vec![u8(200), u8(100)])],
+            Value::Int(300),
+        ),
+        (
+            "m.sample",
+            vec![Value::Int(-300)],
+            record(vec![
+                ("label", Value::str("s")),
+                ("level", fixed(IntTy::I16, -300)),
+            ]),
+        ),
+        (
+            "m.level",
+            vec![record(vec![
+                ("label", Value::str("s")),
+                ("level", fixed(IntTy::I16, -300)),
+            ])],
+            fixed(IntTy::I16, -300),
+        ),
+        ("m.wrap", vec![u8(200)], byte(200)),
+        ("m.unwrap", vec![byte(9)], u8(9)),
+        ("m.law#1.body", vec![byte(7)], Value::Bool(false)),
+        ("m.law#1.body", vec![byte(8)], Value::Bool(true)),
+    ];
+    for (name, args, want) in &cases {
         assert!(
-            unit.compiled().iter().any(|f| f == name),
-            "`{name}`'s body was refused, so its crossing never was"
+            bodies.admits(name),
+            "`{name}` is not offered to the machine"
         );
-        assert!(!bodies.admits(name), "`{name}` is offered to the machine");
+        let got = call(unit, name, args);
         assert_eq!(
-            call(unit, name, &args),
-            None,
-            "`{name}` crossed the seam, where a width reads as an `Int`"
+            got.as_ref(),
+            Some(want),
+            "`{name}{args:?}` answered {got:?}, not {want:?}"
         );
     }
-    // A `requires` is entered without `result`, so one over an `Int` crosses nothing wide.
-    assert!(
-        bodies.admits("m.narrows#requires#0"),
-        "refused: {:?}",
-        unit.refusals()
-    );
+}
+
+/// A type variable reads as what the arguments show of it: a width where they hold one, an `Int`
+/// where they hold `Int`s, and a prover's generated function shows its answers.
+#[test]
+fn a_type_variable_reads_as_the_arguments_show_it() {
+    let (_, unit) = unit(CROSSES);
+    let generated = |rule: Synth| {
+        Value::Closure(Arc::new(Closure {
+            name: None,
+            kind: ClosureKind::Synth { arity: 0, rule },
+        }))
+    };
+    for (name, args, want) in [
+        (
+            "m.first",
+            vec![Value::list(vec![u8(5), u8(6)])],
+            Value::ctor("Some", vec![u8(5)]),
+        ),
+        (
+            "m.first",
+            vec![Value::list(vec![Value::Int(5)])],
+            Value::ctor("Some", vec![Value::Int(5)]),
+        ),
+        (
+            "m.first",
+            vec![Value::list(vec![])],
+            Value::ctor("None", vec![]),
+        ),
+        ("m.made", vec![generated(Synth::Const(u8(3)))], u8(3)),
+        (
+            "m.made",
+            vec![generated(Synth::Const(Value::Int(3)))],
+            Value::Int(3),
+        ),
+    ] {
+        let got = call(unit, name, &args);
+        assert_eq!(
+            got.as_ref(),
+            Some(&want),
+            "`{name}{args:?}` answered {got:?}, not {want:?}"
+        );
+    }
+}
+
+/// An `Int` word where nothing says whether it is an `Int` or a width is declined, never guessed:
+/// here `b` is a `U8`, which only the builtin knows.
+#[test]
+fn an_answer_no_argument_types_is_declined_rather_than_guessed() {
+    let (_, unit) = unit(CROSSES);
+    let bodies = unit.bodies().expect("the unit builds");
+    let narrowing = Value::Closure(Arc::new(Closure {
+        name: None,
+        kind: ClosureKind::Builtin(ply_eval::Builtin::U8OfInt),
+    }));
+    let applied = ply_eval::Symbol::new("m.applied");
     assert_eq!(
-        call(unit, "m.narrows#requires#0", &[Value::Int(7)]),
-        Some(Value::Bool(true))
+        ply_eval::Compiled::enter(&*bodies, &applied, &[narrowing, Value::Int(5)], 10_000),
+        None
+    );
+    assert_eq!(bodies.declines().unread, 1, "{:?}", bodies.declines());
+    // The same root reads its answer wherever an argument shows the variable it answers.
+    let generated = Value::Closure(Arc::new(Closure {
+        name: None,
+        kind: ClosureKind::Synth {
+            arity: 1,
+            rule: Synth::Const(u8(5)),
+        },
+    }));
+    assert_eq!(
+        call(unit, "m.applied", &[generated, Value::Int(0)]),
+        Some(u8(5))
     );
 }
