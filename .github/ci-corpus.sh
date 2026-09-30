@@ -20,9 +20,14 @@ run_one() {
   line=$("$shards" corpus-line "$id") || return 2
   read -r path filter <<< "$line"
   out=$(mktemp)
-  "$ply" test "$path" ${filter:+--filter "$filter"} --host --timeout 900000 --steps 0 --json \
-    --exec "ply=$ply" --allow machine --allow claims --fs work=. --fs "repo=$root" "$@" \
-    > "$out" || status=$?
+  if [[ $id == package-* ]]; then
+    # A package's own suite runs as `ply test` runs it: the corpus's grants are for the corpus.
+    "$ply" test "$path" --json "$@" > "$out" || status=$?
+  else
+    "$ply" test "$path" ${filter:+--filter "$filter"} --host --timeout 900000 --steps 0 --json \
+      --exec "ply=$ply" --allow machine --allow claims --fs work=. --fs "repo=$root" "$@" \
+      > "$out" || status=$?
+  fi
   jq -r '.results[]? | "\(.status)\t\(.name)"' "$out" 2>/dev/null
   selected=$(jq -s 'map(.results // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
   if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then

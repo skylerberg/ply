@@ -66,6 +66,12 @@ CORPUS_ALONE=(serving database)
 # Placed a test at a time rather than a module at a time: a whole module on one partition would
 # outlast the partition's nextest shard.
 CORPUS_BY_TEST=(audit generated toolchain)
+# Packages whose own suites run as corpus entries too, as `id:path`: each failing test is named in
+# the log, where a Rust test wrapping the run would report one failure for all of them.
+PACKAGE_SUITES=(
+  "prove:crates/ply-prove/ply"
+  "suite:crates/ply-test/ply"
+)
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.
 # `test-hosts` runs them in one job. The set was named for postgres when the driver lived in the
@@ -177,12 +183,12 @@ cmd_solo_filter() {
   return 1
 }
 
-# One entry id a line: `program`, then every checks module that declares a test.
-# One entry id a line: `program`, then every checks module that declares a test, as `module` or, for
-# a module placed a test at a time, `module:N` for its Nth test.
+# One entry id a line: `program`, `package-<id>` per package suite, then every checks module that
+# declares a test, as `module` or, for a module placed a test at a time, `module:N` for its Nth test.
 corpus_entries() {
-  local file module count i
+  local file module count i entry
   printf 'program\n'
+  for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
   for file in "$root/$CORPUS_CHECKS"/*.ply; do
     grep -qE '^test(/[a-z]+)? "' "$file" || continue
     module=$(basename "$file" .ply)
@@ -193,6 +199,14 @@ corpus_entries() {
       printf '%s\n' "$module"
     fi
   done
+}
+
+package_path() {
+  local entry
+  for entry in "${PACKAGE_SUITES[@]}"; do
+    [[ ${entry%%:*} == "$1" ]] && { printf '%s\n' "${entry#*:}"; return 0; }
+  done
+  return 1
 }
 
 corpus_by_test() {
@@ -243,6 +257,8 @@ cmd_corpus_line() {
     [[ $entry == "$1" ]] || continue
     if [[ $entry == program ]]; then
       printf '%s\n' "$CORPUS_PROGRAM"
+    elif [[ $entry == package-* ]]; then
+      package_path "${entry#package-}"
     elif [[ $entry == *:* ]]; then
       module=${entry%%:*} n=${entry##*:}
       name=$(corpus_test_names "$root/$CORPUS_CHECKS/$module.ply" | sed -n "${n}p")

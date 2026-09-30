@@ -278,6 +278,7 @@ const EMITTABLE: [&str; 103] = [
     "%alias",
     "%and",
     "%bitand",
+    "%bitnot",
     "%bitor",
     "%bitxor",
     "%bool",
