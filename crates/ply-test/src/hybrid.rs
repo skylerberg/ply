@@ -252,10 +252,9 @@ impl BodyHybrid<'_> {
             // Hermetic always: a search asks this up to `Budget::max_trials` times.
             let texts: std::collections::HashMap<String, String> =
                 printed.iter().cloned().collect();
-            let mut machine = ply_eval::Machine::new(&front);
             let unit =
                 ply_codegen::Unit::over_front(&front, texts).expect("this host has a C compiler");
-            machine.set_compiled(unit.attach());
+            let mut machine = ply_eval::Machine::new(&front, unit.attach())?;
             seed_run(&mut machine, &plan.seeds()[0], plan.steps);
             machine.eval_test(index)
         }));

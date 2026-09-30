@@ -1157,20 +1157,26 @@ fn execute(
     };
     let (report, mutants) = ply_codegen::rt::with_step_budget(args.steps, || {
         ply_codegen::rt::with_time_budget(args.timeout, || {
-            let mut run = || {
-                let mut executor = ply_test::InterpExecutor::new(&loaded.front)
-                    .with_search(simulation.clone())
-                    .with_hosts(hosting(hosts, &runtime));
-                if let Some(provider) = provider {
-                    executor = executor.with_backend(provider);
+            let mut run = || match provider {
+                Some(provider) => {
+                    let executor = ply_test::InterpExecutor::new(&loaded.front, provider)
+                        .with_search(simulation.clone())
+                        .with_hosts(hosting(hosts, &runtime));
+                    ply_test::run_with(
+                        selection,
+                        &loaded.check,
+                        hashes,
+                        &mut cache.store,
+                        &executor,
+                    )
                 }
-                ply_test::run_with(
+                None => ply_test::run_with(
                     selection,
                     &loaded.check,
                     hashes,
                     &mut cache.store,
-                    &executor,
-                )
+                    &NothingToRun,
+                ),
             };
             let report = match &pool {
                 Some(pool) => pool.install(run),
@@ -1457,6 +1463,31 @@ pub fn hosts_escapes(report: &RunReport, check: &CheckOutput, hosts: &Hosts) -> 
             .note("this is Ply's fault — the runner and the binding disagree about what this test can do")
         })
         .collect()
+}
+
+/// What a run that decided to execute nothing hands the runner: it built no unit, so no test can
+/// be given a machine.
+struct NothingToRun;
+
+impl ply_test::Executor for NothingToRun {
+    type Worker = std::convert::Infallible;
+
+    fn worker(&self) -> Result<std::convert::Infallible, Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "a test was scheduled in a run that decided to execute nothing, so no unit was built \
+             to run it on",
+        )
+        .note("this is Ply's fault: the choice named no test to run and scheduled one anyway"))
+    }
+
+    fn execute(
+        &self,
+        worker: &mut std::convert::Infallible,
+        _index: usize,
+    ) -> Result<(), Diagnostic> {
+        match *worker {}
+    }
 }
 
 /// An unbuilt backend declines every call, which would make a green run vacuous.

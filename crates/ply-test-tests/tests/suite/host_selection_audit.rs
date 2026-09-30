@@ -94,8 +94,7 @@ fn run(
         None => Hosting::hermetic(),
     };
     let unit = compiled.tier();
-    let executor = InterpExecutor::new(&compiled.port)
-        .with_backend(unit)
+    let executor = InterpExecutor::new(&compiled.port, unit)
         .with_search(Search::default())
         .with_hosts(hosting);
     ply_test::run_with(
@@ -161,6 +160,12 @@ fn the_same_test_reaches_nothing_when_nothing_is_bound() {
     let report = run(&compiled, &mut store, None);
     assert_eq!(report.passed, 0);
     assert_eq!(report.failed, 1);
+    assert_eq!(
+        report.failures[0].diagnostic.code,
+        ply_eval::codes::UNHANDLED_EFFECT,
+        "the operation, not the seam, is what failed: {:?}",
+        report.failures[0].diagnostic
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
