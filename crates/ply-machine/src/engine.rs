@@ -415,7 +415,7 @@ impl<'a> Prover<'a> {
 
         // Checking an `ensures` calls the definition, which needs handlers nothing supplies.
         if let Some(footprint) = self.unhandled(obligation) {
-            return Discharge::Unattempted(Gap::UnhandledEffect(footprint));
+            return Discharge::Unattempted(Gap::UnhandledEffect(Some(footprint)));
         }
 
         let mut cases = match self.cases(obligation, &claim, plan) {
@@ -488,7 +488,7 @@ impl<'a> Prover<'a> {
             };
             cases.machine = self.host_machine(hosting);
         } else if let Some(footprint) = self.unhandled(obligation) {
-            return Point::Undrawn(Gap::UnhandledEffect(footprint));
+            return Point::Undrawn(Gap::UnhandledEffect(Some(footprint)));
         }
 
         // The draw is the generator's, from a stream the caller seeds: the same point a whole
@@ -643,7 +643,7 @@ impl<'a> Prover<'a> {
             return self.search_interleavings(obligation, &claim, plan, None);
         }
         if let Some(footprint) = self.unhandled(obligation) {
-            return Discharge::Unattempted(Gap::UnhandledEffect(footprint));
+            return Discharge::Unattempted(Gap::UnhandledEffect(Some(footprint)));
         }
         let mut cases = match self.cases(obligation, &claim, plan) {
             Ok(cases) => cases,
@@ -660,12 +660,12 @@ impl<'a> Prover<'a> {
     }
 
     /// The owner's footprint, when it is one no obligation can supply handlers for.
-    fn unhandled(&self, obligation: &Obligation) -> Option<ply_ty::Footprint> {
+    fn unhandled(&self, obligation: &Obligation) -> Option<String> {
         let ObligationKind::Ensures { .. } = obligation.kind else {
             return None;
         };
         let footprint = &self.check.defs.get(&obligation.owner)?.footprint;
-        (!footprint.is_empty()).then(|| footprint.clone())
+        (!footprint.is_empty()).then(|| footprint.to_string())
     }
 
     fn cases(

@@ -17,7 +17,6 @@ pub use world::World;
 use ply_eval::{Plan, Race, Seed};
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_ty::DefHash;
-use ply_ty::Footprint;
 use serde::Serialize;
 use std::fmt;
 use std::time::Duration;
@@ -173,8 +172,9 @@ pub struct Vacuity {
 
 #[derive(Clone, Debug)]
 pub enum Gap {
-    /// Checking an `ensures` calls the definition, whose footprint needs an unsupplied handler.
-    UnhandledEffect(Footprint),
+    /// Checking an `ensures` calls the definition, whose row needs an unsupplied handler: the row as
+    /// a report prints it, or `None` when it names nothing to hold a handler for.
+    UnhandledEffect(Option<String>),
     Ungeneratable {
         param: Symbol,
         /// As the compiler prints it.
@@ -193,8 +193,8 @@ pub enum Gap {
         generated: u32,
         witness: Vec<Binding>,
     },
-    /// A `law/host` under a hermetic run.
-    ReachesHost(Footprint),
+    /// A `law/host` under a hermetic run, with its row as a report prints it.
+    ReachesHost(Option<String>),
     /// The obligation's points are not drawn one at a time, so there is no case to re-run: a
     /// concurrency law's points are interleavings that the search chooses.
     NotDrawn,
@@ -271,14 +271,15 @@ pub struct Obligation {
     pub guarded: bool,
     /// `law/host`: the body reaches the world.
     pub host: bool,
-    /// `{}`, or `{sim.read}` for a concurrency law, or any row at all for a `law/host`.
-    pub footprint: Footprint,
+    /// The claim's own row as a report prints it, when it performs anything: `{sim.read}` for a
+    /// concurrency law, or any row at all for a `law/host`.
+    pub footprint: Option<String>,
 }
 
 impl Obligation {
     /// A law whose body reaches a `simulate` region.
     pub fn is_concurrency_law(&self) -> bool {
-        matches!(self.kind, ObligationKind::Law) && !self.host && !self.footprint.is_empty()
+        matches!(self.kind, ObligationKind::Law) && !self.host && self.footprint.is_some()
     }
 
     pub fn generated(&self) -> &[Binder] {

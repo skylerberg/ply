@@ -236,7 +236,7 @@ pub fn world_of(
                 binders: binders.clone(),
                 guarded,
                 host: false,
-                footprint: clause.footprint.clone(),
+                footprint: row(&clause.footprint),
             });
         }
     }
@@ -259,10 +259,14 @@ pub fn world_of(
             binders: binders_of(&named),
             guarded: law.has_guard,
             host: law.host,
-            footprint: law.footprint.clone(),
+            footprint: row(&law.footprint),
         });
     }
     (World::new(decls, signatures), obligations)
+}
+
+fn row(footprint: &ply_ty::Footprint) -> Option<String> {
+    (!footprint.is_empty()).then(|| footprint.to_string())
 }
 
 /// The obligations as the program hands them over with `configure`, in a world of no declarations
@@ -311,10 +315,7 @@ pub fn world_value(obligations: &[ply_prove::Obligation]) -> ply_eval::Value {
             ),
             ("guarded", Value::Bool(o.guarded)),
             ("host", Value::Bool(o.host)),
-            (
-                "footprint",
-                Value::str(ply_ty::print_footprint(&o.footprint)),
-            ),
+            ("footprint", option(o.footprint.as_deref().map(Value::str))),
             ("frame", ctor("proof.obligation", "Pure", Vec::new())),
         ])
     };

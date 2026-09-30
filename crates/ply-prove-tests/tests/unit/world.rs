@@ -77,7 +77,7 @@ fn obligation(key: &str, binders: Vec<Value>) -> Value {
         ("binders", Value::list(binders)),
         ("guarded", Value::Bool(true)),
         ("host", Value::Bool(false)),
-        ("footprint", Value::str("")),
+        ("footprint", Value::ctor("None", Vec::new())),
     ])
 }
 
@@ -293,7 +293,7 @@ fn a_world_reads_its_types_its_signatures_and_its_obligations() {
     assert_eq!(o.owner.as_str(), "m.pick");
     assert_eq!(o.kind, ObligationKind::Ensures { index: 1 });
     assert_eq!(o.span, Span::new(SourceId(0), 12, 30));
-    assert!(o.guarded && !o.host && o.footprint.is_empty());
+    assert!(o.guarded && !o.host && o.footprint.is_none());
     assert_eq!(
         o.binders
             .iter()

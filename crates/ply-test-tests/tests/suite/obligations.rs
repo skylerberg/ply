@@ -6,7 +6,6 @@ use ply_span::{Span, Symbol};
 use ply_store::{CachedCases, CachedEvidence, CachedObligation, Store};
 use ply_test::obligation::{self, Choice, Discharger, from_cached, to_cached};
 use ply_ty::DefHash;
-use ply_ty::Footprint;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -48,7 +47,7 @@ fn ensures(key: u8, owner: &str, index: usize) -> Obligation {
         binders: vec![Binder::new("x", Sort::int())],
         guarded: false,
         host: false,
-        footprint: Footprint::empty(),
+        footprint: None,
     }
 }
 
@@ -95,7 +94,7 @@ fn vacuous() -> Discharge {
 }
 
 fn unattempted() -> Discharge {
-    Discharge::Unattempted(Gap::UnhandledEffect(Footprint::empty()))
+    Discharge::Unattempted(Gap::UnhandledEffect(None))
 }
 
 /// A prover with scripted answers that records every obligation it was asked about.

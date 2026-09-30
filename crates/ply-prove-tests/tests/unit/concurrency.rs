@@ -15,7 +15,6 @@ use ply_prove::{
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::DefHash;
 use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, Resource};
 
 fn body_was_false(span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -141,7 +140,7 @@ fn law(binders: usize) -> Obligation {
             .collect(),
         guarded: false,
         host: false,
-        footprint: Footprint::from_atoms([EffectAtom::new("sim", Resource::Singleton, Mode::Read)]),
+        footprint: Some("{sim.read}".to_string()),
     }
 }
 
@@ -539,7 +538,7 @@ fn a_refutation_reports_the_seed_the_race_and_the_replay() {
 fn only_a_law_carrying_sim_read_is_routed_to_a_search() {
     assert!(law(0).is_concurrency_law());
     let pure = Obligation {
-        footprint: Footprint::empty(),
+        footprint: None,
         ..law(0)
     };
     assert!(!pure.is_concurrency_law());

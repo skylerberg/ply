@@ -290,8 +290,6 @@ fn obligation(at: At<'_>) -> Result<Obligation, Error> {
     let text = key.str()?;
     let kind = at.field("kind")?.ctor()?;
     let place = at.field("at")?;
-    let footprint = at.field("footprint")?;
-    let row = footprint.str()?;
     Ok(Obligation {
         key: DefHash::from_hex(text)
             .ok_or_else(|| key.error(format!("`{text}` is not a hash in hex")))?,
@@ -317,7 +315,9 @@ fn obligation(at: At<'_>) -> Result<Obligation, Error> {
         })?,
         guarded: at.field("guarded")?.bool()?,
         host: at.field("host")?.bool()?,
-        footprint: ply_ty::parse_footprint(row)
-            .map_err(|e| footprint.error(format!("`{row}` is not a row: {e}")))?,
+        footprint: match at.field("footprint")?.option()? {
+            Some(row) => Some(row.str()?.to_string()),
+            None => None,
+        },
     })
 }
