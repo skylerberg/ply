@@ -1363,6 +1363,10 @@ pub fn world_independent(w: Word) -> bool {
                     pending.extend(map::child_words(o).map(|i| word_at(o, i)));
                 }
                 KIND_CLOSURE => {
+                    // A continuation's captures are immediates naming a body its entry alone holds.
+                    if crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize) {
+                        return false;
+                    }
                     for i in CLOSURE_CAPTURES..(*o).len as usize {
                         pending.push(word_at(o, i));
                     }
