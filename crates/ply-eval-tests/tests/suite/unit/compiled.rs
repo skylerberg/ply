@@ -1,10 +1,7 @@
 use crate::fixture::port_front;
-use ply_eval::Value;
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
-use ply_span::Symbol;
-use ply_span::{Diagnostic, codes};
-use ply_ty::{DefHash, Front};
+use ply_eval::{DefHash, Diagnostic, Front, Symbol, Value, codes};
 use std::rc::Rc;
 
 struct Checked {

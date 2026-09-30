@@ -1,6 +1,5 @@
 use ply_codegen::Unit;
-use ply_eval::{Machine, Value};
-use ply_span::{SourceId, Span, Symbol};
+use ply_eval::{Machine, SourceId, Span, Symbol, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -12,12 +11,12 @@ fn fixtures() -> PathBuf {
 }
 
 pub struct Loaded {
-    pub front: ply_ty::Front,
+    pub front: ply_eval::Front,
     /// Each module's text by name: what the Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
 }
 
-fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
+fn load(dir: &Path) -> Result<Loaded, Vec<ply_eval::Diagnostic>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -49,7 +48,7 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
         modules.push((name.clone(), text.to_string()));
     }
     let ids: Vec<_> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let front = ply_ty::read_front(&pulled.dump, &ids).expect("the dump reads");
+    let front = ply_codegen::c::dump::read(&pulled.dump, &ids).expect("the dump reads");
     if front.has_error() {
         return Err(front.diagnostics);
     }
@@ -104,7 +103,7 @@ impl Harness {
         budget: i64,
         name: &str,
         args: Vec<Value>,
-    ) -> Result<Value, ply_span::Diagnostic> {
+    ) -> Result<Value, ply_eval::Diagnostic> {
         let machine = &mut self.machine;
         ply_codegen::rt::with_step_budget(budget, || machine.call(name, args, Span::DUMMY))
     }
@@ -117,7 +116,7 @@ impl Harness {
             .expect_err(name);
         assert_eq!(
             raised.code,
-            ply_span::codes::RUNTIME_ERROR,
+            ply_eval::codes::RUNTIME_ERROR,
             "`{name}{args:?}` raised {raised}"
         );
         assert!(
@@ -341,7 +340,7 @@ fn a_compiled_loop_that_never_ends_stops_at_its_step_budget() {
     for budget in [10_000i64, 250_000] {
         let out = h.under_steps(budget, "pure.spin", vec![Value::Int(0)]);
         let raised = out.expect_err("a loop with no exit cannot answer");
-        assert_eq!(raised.code, ply_span::codes::STEP_BUDGET, "{raised}");
+        assert_eq!(raised.code, ply_eval::codes::STEP_BUDGET, "{raised}");
         let want = format!("budget of {budget} calls");
         assert!(raised.message.contains(&want), "{raised}");
     }
@@ -357,7 +356,7 @@ fn a_long_computation_inside_its_step_budget_answers() {
     }
     let out = h.under_steps(100, "pure.ladder", args);
     let raised = out.expect_err("a hundred calls is short of five hundred");
-    assert_eq!(raised.code, ply_span::codes::STEP_BUDGET, "{raised}");
+    assert_eq!(raised.code, ply_eval::codes::STEP_BUDGET, "{raised}");
 }
 
 /// `Ctx` is one flat frame, so a nested entry would alias the outer one's words.
@@ -388,7 +387,7 @@ fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     let declined = inside.expect_err("a reentrant entry is declined, not served");
     assert_eq!(
         declined.code,
-        ply_span::codes::RUNTIME_ERROR,
+        ply_eval::codes::RUNTIME_ERROR,
         "the decline arrived as something other than a runtime error: {declined}"
     );
 

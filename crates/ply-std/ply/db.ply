@@ -3164,6 +3164,13 @@ pub type Server = {
   user: String,
   database: String,
   password: Option<String>,
+  // Told to the server as each connection starts, so every connection the pool opens runs under
+  // them: how long one statement may run, and a transaction sit idle between statements, before the
+  // server ends it, in milliseconds (`None` leaves the server's own), and the name its sessions are
+  // listed under.
+  statement_timeout_ms: Option<Int>,
+  idle_in_transaction_timeout_ms: Option<Int>,
+  application_name: Option<String>,
   client: pg::Client,
 }
 
@@ -3180,8 +3187,27 @@ pub fn server(
     user: user,
     database: database,
     password: password,
+    statement_timeout_ms: None,
+    idle_in_transaction_timeout_ms: None,
+    application_name: None,
     client: pg::default_client(),
   }
+
+// The settings a connection starts with, under the names postgres gives them.
+pub fn startup_parameters(s: Server) -> List<pg::Set> =
+  concat_lists(
+    concat_lists(
+      parameter("application_name", s.application_name),
+      parameter("statement_timeout", millis_text(s.statement_timeout_ms)),
+    ),
+    parameter("idle_in_transaction_session_timeout", millis_text(s.idle_in_transaction_timeout_ms)),
+  )
+
+fn parameter(name: String, value: Option<String>) -> List<pg::Set> =
+  match value { Some(v) -> [{ name: name, value: v }], None -> [] }
+
+fn millis_text(ms: Option<Int>) -> Option<String> =
+  match ms { Some(n) -> Some(int_to_string(n)), None -> None }
 
 // A connection with a transaction open, and how deep: depth 0 is between transactions.
 type Open = { session: pg::Session, depth: Int }
@@ -3402,6 +3428,7 @@ fn checkout(
           cfg.port,
           cfg.user,
           cfg.database,
+          startup_parameters(cfg),
           cfg.password,
           nonce ++ "-" ++ int_to_string(pool.opened),
           cfg.client,
@@ -5011,7 +5038,7 @@ pub fn serve<a | e>(
 
 // --- Where the server is ---------------------------------------------------------
 
-// `postgres://user[:password]@host[:port]/database[?sslmode=…]`, the form `with_server` takes.
+// `postgres://user[:password]@host[:port]/database[?key=value&…]`, the form `with_server` takes.
 // The language reads it, so a driver needs nothing from the host but `net`.
 
 type Split = { head: String, tail: String }
@@ -5047,7 +5074,6 @@ fn rsplit_at(text: String, sep: String) -> Option<Split> = {
   }
 }
 
-// `%XX` as the byte it names; anything else is itself, so a password may hold a `:` or a `@`.
 // `%XX` as the byte it names; anything else is itself, so a password may hold a `:` or an `@`.
 fn unpercent(text: String) -> Result<String, String> =
   match unpercent_from(bytes_of_string(text), 0, b"") {
@@ -5117,15 +5143,15 @@ type HostPort = { host: String, port: Int }
 fn hostport_of(text: String) -> Result<HostPort, String> =
   match rsplit_at(text, ":") {
     None -> checked_host(text, 5432),
-    Some(s) -> match port_of(s.tail) {
+    Some(s) -> match natural_of(s.tail) {
       None -> Err("`" ++ s.tail ++ "` is not a port"),
       Some(port) -> if port == 0 { Err("port 0 is not a port a server listens on") }
       else { checked_host(s.head, port) },
     },
   }
 
-// A decimal port, and nothing that merely begins with one.
-fn port_of(text: String) -> Option<Int> =
+// A decimal number, and nothing that merely begins with one.
+fn natural_of(text: String) -> Option<Int> =
   if string_len(text) == 0 { None } else {
     let value = nat_of_text(text);
     if string_len(int_to_string(value)) == string_len(text) { Some(value) } else { None }
@@ -5162,43 +5188,76 @@ fn server_parts(rest: String) -> Result<Server, String> = {
         Err(why) -> Err(why),
         Ok(hp) -> match database_of(split.tail) {
           Err(why) -> Err(why),
-          Ok(database) -> match query_settings(database.query) {
-            Err(why) -> Err(why),
-            Ok(_) ->
-              Ok({
-                host: hp.host,
-                port: hp.port,
-                user: c.user,
-                database: database.name,
-                password: c.password,
-                client: pg::default_client(),
-              }),
-          },
+          Ok(database) ->
+            with_query(database.query, server(hp.host, hp.port, c.user, database.name, c.password)),
         },
       },
     },
   }
 }
 
-fn query_settings(query: String) -> Result<Unit, String> =
-  if string_len(query) == 0 { Ok(()) } else {
-    fold(string_split(query, "&"), Ok(()), |acc: Result<Unit, String>, pair: String|
+// `sslmode` is read and nothing more: TLS to postgres is not wired up. Every other parameter is a
+// setting the server is told at start-up, under the name postgres gives it.
+fn with_query(query: String, s: Server) -> Result<Server, String> =
+  if string_len(query) == 0 { Ok(s) } else {
+    fold(string_split(query, "&"), Ok(s), |acc: Result<Server, String>, pair: String|
       match acc {
         Err(why) -> Err(why),
-        Ok(_) -> match split_at(pair, "=") {
+        Ok(so_far) -> match split_at(pair, "=") {
           None -> Err("`" ++ pair ++ "` is not a `key=value` parameter"),
-          Some(s) -> if s.head == "sslmode" {
-            if s.tail == "disable" || s.tail == "prefer" { Ok(()) } else {
-              Err(
-                "`sslmode=" ++ s.tail
-                  ++ "` is not configurable: TLS to postgres is not wired up, so only `disable` and `prefer` are read",
-              )
-            }
-          } else if s.head == "application_name" { Ok(()) }
-          else { Err("`" ++ s.head ++ "` is not a parameter this driver reads") },
+          Some(kv) -> match unpercent(kv.tail) {
+            Err(why) -> Err(why),
+            Ok(value) -> with_setting(so_far, kv.head, value),
+          },
         },
       })
   }
+
+fn with_setting(s: Server, key: String, value: String) -> Result<Server, String> =
+  if key == "sslmode" {
+    if value == "disable" || value == "prefer" { Ok(s) } else {
+      Err(
+        "`sslmode=" ++ value
+          ++ "` is not configurable: TLS to postgres is not wired up, so only `disable` and `prefer` are read",
+      )
+    }
+  } else if key == "application_name" {
+    // A zero byte ends a start-up parameter, so the rest of the name would be read as another.
+    if string_contains(value, "\0") { Err("an `application_name` may not hold a zero byte") }
+    else { once(s.application_name, key, { ..s, application_name: Some(value) }) }
+  } else if key == "statement_timeout" {
+    match millis_of(key, value) {
+      Err(why) -> Err(why),
+      Ok(ms) -> once(s.statement_timeout_ms, key, { ..s, statement_timeout_ms: Some(ms) }),
+    }
+  } else if key == "idle_in_transaction_session_timeout" {
+    match millis_of(key, value) {
+      Err(why) -> Err(why),
+      Ok(ms) ->
+        once(s.idle_in_transaction_timeout_ms, key, {
+          ..s,
+          idle_in_transaction_timeout_ms: Some(ms),
+        }),
+    }
+  } else { Err("`" ++ key ++ "` is not a parameter this driver reads") }
+
+fn once<a>(given: Option<a>, key: String, set: Server) -> Result<Server, String> =
+  match given { Some(_) -> Err("`" ++ key ++ "` is given twice"), None -> Ok(set) }
+
+// Postgres reads a timeout written without a unit as milliseconds, and `0` as none at all.
+fn millis_of(key: String, text: String) -> Result<Int, String> =
+  match natural_of(text) {
+    None -> Err("`" ++ key ++ "=" ++ text ++ "`: a timeout is a whole number of milliseconds"),
+    Some(ms) -> if ms > most_millis() {
+      Err(
+        "`" ++ key ++ "=" ++ text ++ "` is past the most postgres takes, "
+          ++ int_to_string(most_millis())
+          ++ " milliseconds",
+      )
+    } else { Ok(ms) },
+  }
+
+fn most_millis() -> Int = 2147483647
 
 // The `db` effect served from a connection string: the driver, wrapped for a program that was
 // told where the server is rather than handling the effect's clauses itself.
@@ -5642,9 +5701,43 @@ test "a connection string reads into the parts a driver needs" {
       assert_eq(s.password, Some("hunter2"));
       assert_eq(s.host, "127.0.0.1");
       assert_eq(s.port, 5433);
-      assert_eq(s.database, "app")
+      assert_eq(s.database, "app");
+      assert_eq(s.application_name, Some("ply"))
     },
   }
+}
+
+test "a connection string's timeouts and name are what every connection starts with" {
+  match server_of(
+      "postgres://ply@db/app?statement_timeout=250&application_name=the%20desk&idle_in_transaction_session_timeout=0",
+    ) {
+    Err(why) -> panic(why),
+    Ok(s) -> {
+      assert_eq(s.statement_timeout_ms, Some(250));
+      assert_eq(s.idle_in_transaction_timeout_ms, Some(0));
+      assert_eq(startup_parameters(s), [
+        { name: "application_name", value: "the desk" },
+        { name: "statement_timeout", value: "250" },
+        { name: "idle_in_transaction_session_timeout", value: "0" },
+      ])
+    },
+  };
+  match server_of("postgres://ply@db/app?sslmode=disable") {
+    Err(why) -> panic(why),
+    Ok(s) -> {
+      assert_eq(s.statement_timeout_ms, None);
+      assert_eq(startup_parameters(s), [])
+    },
+  }
+}
+
+test "a timeout is whole milliseconds, given once, and no more than postgres takes" {
+  assert_err("postgres://ply@db/app?statement_timeout=5s", "whole number of milliseconds");
+  assert_err("postgres://ply@db/app?statement_timeout=-1", "whole number of milliseconds");
+  assert_err("postgres://ply@db/app?idle_in_transaction_session_timeout=", "whole number");
+  assert_err("postgres://ply@db/app?statement_timeout=2147483648", "past the most postgres takes");
+  assert_err("postgres://ply@db/app?statement_timeout=1&statement_timeout=2", "given twice");
+  assert_err("postgres://ply@db/app?application_name=a%00b", "zero byte")
 }
 
 test "a connection string may leave out the port, the password and the parameters" {

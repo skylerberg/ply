@@ -1,23 +1,19 @@
-//! Scheduling and running the tests the program chose, and filing each result under the keys it
-//! handed over.
+//! Running the tests the program chose, in the classes it chose, and filing each result under the
+//! keys it handed over.
 
 pub mod bisect;
 pub mod hybrid;
 pub mod obligation;
 pub mod region;
-pub mod report;
-pub mod schedule;
 pub mod sim;
-pub mod slice;
 
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
 use ply_eval::host::{HostBinding, HostRuntime};
-use ply_eval::{Arena, Exploration, Machine, Plan, Race, Seed, TaskRegions, Value};
-use ply_span::{Diagnostic, Symbol, codes};
+use ply_eval::{
+    Arena, CheckOutput, DefHash, Diagnostic, Exploration, HashOutput, Machine, Plan, Race, Seed,
+    Symbol, TaskRegions, Value, codes,
+};
 use ply_store::{Outcome, PassRecord, Store};
-use ply_ty::{CheckOutput, Footprint};
-use ply_ty::{DefHash, HashOutput};
-use serde::Serialize;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -28,23 +24,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub use bisect::{
-    Baseline, Bisection, ChangeSet, Classify, Confidence, DefKey, Ns, Regression, Rehashed, Row,
-    SearchStats, Skipped, StoreClassify, Trial, TrialOutcome, Unresolved, Verdict, change_set,
+    Absent, Baseline, ChangeSet, Classify, DefKey, Ns, Regression, Rehashed, Row, StoreClassify,
+    Trial, TrialOutcome, Unresolved, change_set,
 };
 pub use hybrid::{BodyHybrid, Mixture, Signature};
 pub use region::GroupRegion;
-pub use schedule::{
-    AMBIENT, Isolation, Parallelism, REGION_SCOPED, SIM_EFFECT, SIMULATED, contends,
-    contends_only_over_regions, group_by_conflict, is_ambient, is_region_scoped, is_seeded,
-    parallelism, region_isolated, shared_footprint,
-};
-pub use sim::{Record, SimSummary, record_under, replay_command};
-pub use slice::{
-    Assertion, AssertionKind, CausalSlice, Difference, Entered, Event, Frame, SliceBuilder, Tracing,
-};
+pub use sim::{Record, SimSummary, is_seeded, record_under};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reason {
     /// The hash is absent from the store: this exact test has never gone green.
     New,
@@ -98,6 +85,9 @@ pub struct Choice {
     pub narrowed: BTreeMap<usize, Vec<u64>>,
     /// Concurrency classes over `runs`, as the program coloured them.
     pub groups: Vec<Vec<usize>>,
+    /// Concurrency classes over every test the run reports on, for a pass that re-runs any of them
+    /// whatever the cache held: a mutant runs the tests that reach it. Empty unless one is asked for.
+    pub every: Vec<Vec<usize>>,
     /// Every key each running test's pass is written under. A test with none is never written.
     pub filed: BTreeMap<usize, Vec<DefHash>>,
 }
@@ -111,39 +101,26 @@ pub struct Selection {
     pub groups: Vec<Vec<usize>>,
     /// Indexed by test index, length `total`.
     pub reasons: Vec<Reason>,
-    /// Indexed by test index, length `total`.
-    pub isolation: Vec<Isolation>,
-    pub parallelism: Parallelism,
     /// The search this selection was made against; a seeded test's result is published under it.
     pub plan: Plan,
     /// What a seeded test still owes, when the cache already covers part of the plan.
     pub narrowed: BTreeMap<usize, Plan>,
     /// Every key each running test's pass is written under.
     pub filed: BTreeMap<usize, Vec<DefHash>>,
-    /// Test indices this run was never asked to decide: a shipped module's tests without `--std`.
+    /// Test indices this run was never asked to decide: a test outside the root package, or a
+    /// shipped module's without `--std`.
     pub out_of_scope: BTreeSet<usize>,
 }
 
 impl Selection {
-    /// The runtime's view of what the program decided: the same fields `select` used to build, laid
-    /// out from the choice. The evidence a cached test is reported with is always a pass — a stored
-    /// failure is never `Cached` — so nothing here has to read the store again.
-    pub fn chosen(
-        choice: &Choice,
-        check: &CheckOutput,
-        visible: &[usize],
-        plan: &Plan,
-    ) -> Selection {
+    /// The runtime's view of what the program decided. The evidence a cached test is reported with is
+    /// always a pass — a stored failure is never `Cached` — so nothing here has to read the store.
+    pub fn chosen(choice: &Choice, check: &CheckOutput, plan: &Plan) -> Selection {
         let plan = plan.clone().normalized();
         let total = check.tests.len();
         let cached: Vec<(usize, Outcome)> = (0..total)
             .filter(|i| choice.reasons.get(*i) == Some(&Reason::Cached))
             .map(|i| (i, Outcome::Pass))
-            .collect();
-        let footprints: Vec<(usize, Footprint)> = choice
-            .runs
-            .iter()
-            .filter_map(|&i| check.tests.get(i).map(|t| (i, t.footprint.clone())))
             .collect();
         let narrowed: BTreeMap<usize, Plan> = choice
             .narrowed
@@ -165,20 +142,6 @@ impl Selection {
             to_run: choice.runs.clone(),
             groups: choice.groups.clone(),
             reasons: choice.reasons.clone(),
-            isolation: check
-                .tests
-                .iter()
-                .map(|t| Isolation::of(&t.footprint))
-                .collect(),
-            // Over the tests this run reports on, so every count shares one denominator.
-            parallelism: parallelism(
-                visible
-                    .iter()
-                    .filter_map(|&i| check.tests.get(i))
-                    .map(|t| &t.footprint),
-                &footprints,
-                &choice.groups,
-            ),
             plan,
             narrowed,
             filed: choice.filed.clone(),
@@ -215,14 +178,6 @@ impl Selection {
         self.narrowed.get(&index).unwrap_or(&self.plan)
     }
 
-    pub fn isolation_of(&self, index: usize) -> Option<Isolation> {
-        self.isolation.get(index).copied()
-    }
-
-    pub fn group_of(&self, index: usize) -> Option<usize> {
-        self.groups.iter().position(|g| g.contains(&index))
-    }
-
     pub fn is_empty(&self) -> bool {
         self.to_run.is_empty()
     }
@@ -238,8 +193,6 @@ impl fmt::Debug for Selection {
             .field("to_run", &self.to_run)
             .field("groups", &self.groups)
             .field("reasons", &self.reasons)
-            .field("isolation", &self.isolation)
-            .field("parallelism", &self.parallelism)
             .field("plan", &self.plan)
             .field("narrowed", &self.narrowed)
             .field("filed", &self.filed)
@@ -247,8 +200,7 @@ impl fmt::Debug for Selection {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
     Passed,
     Failed,
@@ -272,6 +224,9 @@ pub struct TestResult {
     /// Absent when nothing was written: a spent budget or an unobserved search proved nothing.
     pub recorded: Option<Record>,
     pub backend: Option<BackendUse>,
+    /// The operations the test performed, handled ones included, summed over every interleaving
+    /// a search ran.
+    pub performs: u64,
 }
 
 impl TestResult {
@@ -281,104 +236,6 @@ impl TestResult {
 
     pub fn green_but_uncached(&self) -> bool {
         self.passed() && matches!(self.recorded, Some(Record::Exhausted | Record::Unobserved))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Suspect {
-    pub name: Symbol,
-    pub hash: Option<DefHash>,
-    /// `None` when the failing execution was not traced.
-    pub ran: Option<bool>,
-    /// Distance above the failing frame, zero being where it happened.
-    pub depth: Option<usize>,
-    /// Whether bisection put it in the minimal failure-inducing set.
-    pub culprit: bool,
-}
-
-impl Suspect {
-    pub fn new(name: Symbol, hash: Option<DefHash>) -> Suspect {
-        Suspect {
-            name,
-            hash,
-            ran: None,
-            depth: None,
-            culprit: false,
-        }
-    }
-
-    /// Most-likely-first: a bisected culprit, the stack innermost first, whatever else ran, then
-    /// the name.
-    fn rank(&self) -> (u8, usize, &str) {
-        let tier = match (self.culprit, self.ran, self.depth) {
-            (true, ..) => 0,
-            (false, _, Some(_)) => 1,
-            (false, Some(true), None) => 2,
-            (false, None, None) => 3,
-            (false, Some(false), None) => 4,
-        };
-        (tier, self.depth.unwrap_or(usize::MAX), self.name.as_str())
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Attribution {
-    /// The same set as [`Failure::suspects`], ranked and annotated.
-    pub suspects: Vec<Suspect>,
-    pub bisection: Bisection,
-    /// `None` until a traced re-run has happened.
-    pub slice: Option<CausalSlice>,
-}
-
-impl Attribution {
-    pub fn from_suspects(names: &[Symbol], hashes: &HashOutput) -> Attribution {
-        let mut suspects: Vec<Suspect> = names
-            .iter()
-            .map(|name| {
-                let hash = hashes
-                    .defs
-                    .get(name)
-                    .or_else(|| hashes.decls.get(name))
-                    .copied();
-                Suspect::new(name.clone(), hash)
-            })
-            .collect();
-        suspects.sort_by(|a, b| a.rank().cmp(&b.rank()));
-        Attribution {
-            suspects,
-            bisection: Bisection::default(),
-            slice: None,
-        }
-    }
-
-    /// Folds a bisection and a trace into the suspects, then re-ranks.
-    pub fn resolve(&mut self, bisection: Bisection, slice: Option<CausalSlice>) {
-        let culprits = bisection.culprits();
-        for suspect in &mut self.suspects {
-            suspect.culprit = culprits.contains(&suspect.name);
-            if let Some(slice) = &slice
-                && slice.traced
-                && slice.reproduced
-            {
-                suspect.ran = slice.did_run(&suspect.name);
-                suspect.depth = slice.depth_of(&suspect.name);
-            }
-        }
-        // A culprit outside the suspect set is still the answer: a cause need not look changed.
-        for name in culprits {
-            if !self.suspects.iter().any(|s| s.name == name) {
-                let mut extra = Suspect::new(name, None);
-                extra.culprit = true;
-                self.suspects.push(extra);
-            }
-        }
-        self.suspects.sort_by(|a, b| a.rank().cmp(&b.rank()));
-        self.bisection = bisection;
-        self.slice = slice;
-    }
-
-    pub fn culprits(&self) -> Vec<Symbol> {
-        self.bisection.culprits()
     }
 }
 
@@ -395,17 +252,9 @@ pub struct Failure {
     pub host: bool,
     /// Definitions in this test's closure whose hash is not in the store.
     pub suspects: Vec<Symbol>,
-    pub assertion: Option<Assertion>,
-    pub attribution: Attribution,
     pub seed: Option<Seed>,
     /// The two steps whose reordering flipped a passing interleaving to this one.
     pub race: Option<Race>,
-}
-
-impl Failure {
-    pub fn replay(&self) -> Option<String> {
-        Some(replay_command(self.seed.as_ref()?, &self.name))
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -418,7 +267,6 @@ pub struct RunReport {
     pub cached: usize,
     pub failures: Vec<Failure>,
     pub duration: Duration,
-    pub parallelism: Parallelism,
     /// Every test that actually ran, in execution order.
     pub results: Vec<TestResult>,
     /// Problems with the run itself rather than with any test.
@@ -450,6 +298,11 @@ pub trait Executor: Sync {
 
     fn backend_use(&self, _worker: &Self::Worker) -> Option<BackendUse> {
         None
+    }
+
+    /// The operations the last [`Executor::execute`] performed.
+    fn performs(&self, _worker: &Self::Worker) -> u64 {
+        0
     }
 
     /// What the host runtime reported while closing the entry point; forgotten once read.
@@ -514,7 +367,7 @@ impl<'a> Hosting<'a> {
 }
 
 pub struct InterpExecutor<'a> {
-    front: &'a ply_ty::Front,
+    front: &'a ply_eval::Front,
     fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
     hosts: Hosting<'a>,
     /// The backend this run installs.
@@ -531,6 +384,7 @@ pub struct Worker<'a> {
     /// Built once and installed on every machine the worker builds, per-interleaving ones too.
     backend: Option<Rc<dyn ply_eval::Compiled>>,
     backend_use: Option<BackendUse>,
+    performs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -550,6 +404,7 @@ impl<'a> Worker<'a> {
             region: GroupRegion::empty(),
             backend: None,
             backend_use: None,
+            performs: 0,
         }
     }
 
@@ -601,7 +456,7 @@ impl<'a> Worker<'a> {
 }
 
 impl<'a> InterpExecutor<'a> {
-    pub fn new(front: &'a ply_ty::Front) -> InterpExecutor<'a> {
+    pub fn new(front: &'a ply_eval::Front) -> InterpExecutor<'a> {
         InterpExecutor {
             front,
             fixture: None,
@@ -684,6 +539,7 @@ impl<'a> InterpExecutor<'a> {
         Option<Exploration>,
         Option<ply_eval::host::HostUse>,
         Option<BackendUse>,
+        u64,
     ) {
         let plan = self.search.plan_for(index);
         // A search re-runs the whole test, so any host operation runs once per interleaving.
@@ -693,6 +549,7 @@ impl<'a> InterpExecutor<'a> {
         let mut host: Option<ply_eval::host::HostUse> = None;
         // Every interleaving's, summed.
         let mut used: Option<BackendUse> = None;
+        let mut performs = 0u64;
         let region = &worker.region;
         let backend = worker.backend.clone();
         let mut interleaving = |seed: &Seed| {
@@ -704,6 +561,7 @@ impl<'a> InterpExecutor<'a> {
             machine.set_re_executed(re_executed);
             sim::seed_run(machine.as_mut(), seed, plan.steps);
             let outcome = machine.eval_test(index);
+            performs = performs.saturating_add(machine.trace().performs());
             if let Some(reached) = machine.host_use() {
                 let into = host.get_or_insert_with(Default::default);
                 into.atoms = into.atoms.union(&reached.atoms);
@@ -741,6 +599,7 @@ impl<'a> InterpExecutor<'a> {
             observed.then_some(explored.exploration),
             host,
             used,
+            performs,
         )
     }
 }
@@ -769,6 +628,10 @@ impl<'a> Executor for InterpExecutor<'a> {
         worker.backend_use
     }
 
+    fn performs(&self, worker: &Worker<'a>) -> u64 {
+        worker.performs
+    }
+
     fn teardown(&self, worker: &mut Worker<'a>) -> Vec<Diagnostic> {
         let mut out = ply_eval::rc::take_cycles();
         let m = &mut worker.machine;
@@ -783,15 +646,17 @@ impl<'a> Executor for InterpExecutor<'a> {
         let before = worker.backed().map(Machine::compiled_counts);
         worker.backend_use = None;
         if self.searches(index) {
-            let (outcome, exploration, host, searched) = self.search(worker, index);
+            let (outcome, exploration, host, searched, performs) = self.search(worker, index);
             worker.exploration = exploration;
             worker.host = host;
             // The worker's counters never moved; the search reports its own.
             worker.backend_use = searched;
+            worker.performs = performs;
             return outcome;
         }
         worker.open_region();
         let outcome = self.execute_directly(worker, index);
+        worker.performs = worker.machine.trace().performs();
         worker.backend_use = match (before, worker.backed().map(Machine::compiled_counts)) {
             (Some((e0, d0)), Some((e1, d1))) => Some(BackendUse {
                 entries: e1.saturating_sub(e0),
@@ -818,25 +683,6 @@ fn test_hash(hashes: &HashOutput, index: usize) -> Option<DefHash> {
     hashes.tests.get(index).copied()
 }
 
-/// Every test the run reports on, nothing answered from the cache, in one class. A caller with no
-/// program — a measurement, an audit — wants the same rows every time, and "all of them, fresh" is
-/// what it says in the vocabulary a program uses to decide. The store is neither read nor written:
-/// the keys a result is filed under are a program's to name.
-pub fn fresh(check: &CheckOutput, visible: &[usize], plan: &Plan) -> Selection {
-    Selection::chosen(
-        &Choice {
-            runs: visible.to_vec(),
-            groups: vec![visible.to_vec()],
-            reasons: Vec::new(),
-            narrowed: BTreeMap::new(),
-            filed: BTreeMap::new(),
-        },
-        check,
-        visible,
-        plan,
-    )
-}
-
 /// What the runtime keeps so a program can try a mixture after the run that collected it: the
 /// bodies this run introduced (a definition the run added is not in the store until the flush), and
 /// per failure what a mixture needs.
@@ -853,7 +699,7 @@ pub struct HybridInput {
     pub signature: Signature,
     pub seed: Option<Seed>,
     /// Why no mixture can be tried, exactly when none can.
-    pub absent: Option<Skipped>,
+    pub absent: Option<Absent>,
 }
 
 /// What each failure's cause is decided from, for the program that reads the report to decide it:
@@ -862,7 +708,7 @@ pub struct HybridInput {
 pub fn diagnose_failures(
     report: &RunReport,
     sources: &[(String, String)],
-    front: &ply_ty::Front,
+    front: &ply_eval::Front,
     store: &Store,
 ) -> Hybrids {
     let check = &front.check;
@@ -894,8 +740,8 @@ pub fn diagnose_failures(
             };
             let absent = match (&runnable, complete) {
                 (Some(_), _) => None,
-                (None, false) => Some(Skipped::NoBodies),
-                (None, true) => Some(Skipped::NoHybrids),
+                (None, false) => Some(Absent::NoBodies),
+                (None, true) => Some(Absent::NoHybrids),
             };
             // Unclassified, every change stays a candidate: a wider answer, never a wrong one.
             let rehashed =
@@ -956,7 +802,9 @@ pub fn run_with<E: Executor>(
                             check.tests.len()
                         ),
                     )
-                    .note("re-run `select` against this module; the stale index was skipped"),
+                    .note(
+                        "the choice was made against another program; the stale index was skipped",
+                    ),
                 );
             }
         }
@@ -987,17 +835,13 @@ pub fn run_with<E: Executor>(
                 abandoned += 1;
             } else if let Some(diagnostic) = &executed.failure {
                 failed += 1;
-                let suspects = suspects_for(hashes, &test.key, &changed);
-                let attribution = Attribution::from_suspects(&suspects, hashes);
                 failures.push(Failure {
                     name: test.name.clone(),
                     key: test.key.clone(),
                     diagnostic: diagnostic.clone(),
                     defect,
                     host: host_backed,
-                    suspects,
-                    assertion: None,
-                    attribution,
+                    suspects: suspects_for(hashes, &test.key, &changed),
                     seed: exploration.as_ref().and_then(|e| e.failure.clone()),
                     race: exploration.as_ref().and_then(|e| e.race.clone()),
                 });
@@ -1044,6 +888,7 @@ pub fn run_with<E: Executor>(
                 simulation: exploration,
                 recorded,
                 backend: executed.backend,
+                performs: executed.performs,
             });
         }
     }
@@ -1069,7 +914,6 @@ pub fn run_with<E: Executor>(
         cached: selection.cached.len(),
         failures,
         duration: started.elapsed(),
-        parallelism: selection.parallelism,
         results,
         warnings,
         simulation,
@@ -1125,7 +969,7 @@ fn schedule_of(selection: &Selection, warnings: &mut Vec<Diagnostic>) -> Vec<Vec
                 orphans.len()
             ),
         )
-        .note("they were run one at a time; rebuild the selection with `select`"),
+        .note("they were run one at a time: the choice named them to run and gave them no class"),
     );
     let mut groups = selection.groups.clone();
     groups.extend(orphans.into_iter().map(|i| vec![i]));
@@ -1142,6 +986,7 @@ struct Executed {
     host: Option<ply_eval::host::HostUse>,
     teardown: Vec<Diagnostic>,
     backend: Option<BackendUse>,
+    performs: u64,
 }
 
 /// One worker per pool thread, built lazily so a small group builds no idle interpreters.
@@ -1180,6 +1025,7 @@ fn execute_group<E: Executor>(
             let exploration = worker.as_ref().and_then(|w| executor.exploration(w));
             let host = worker.as_ref().and_then(|w| executor.host_use(w));
             let backend = worker.as_ref().and_then(|w| executor.backend_use(w));
+            let performs = worker.as_ref().map_or(0, |w| executor.performs(w));
             let teardown = worker
                 .as_mut()
                 .map(|w| executor.teardown(w))
@@ -1193,6 +1039,7 @@ fn execute_group<E: Executor>(
                 host,
                 teardown,
                 backend,
+                performs,
             });
         }
     });
@@ -1225,7 +1072,7 @@ fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: us
 
     let (name, span) = match check.tests.get(index) {
         Some(t) => (t.key.to_string(), t.span),
-        None => (format!("test {index}"), ply_span::Span::DUMMY),
+        None => (format!("test {index}"), ply_eval::Span::DUMMY),
     };
 
     Diagnostic::error(

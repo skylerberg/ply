@@ -1,30 +1,11 @@
 //! What the front-end cache's on-disk shape is, as a value.
 
-use crate::frontend::{
-    CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, DeclBody, DefEntry, DefKind, FileSpan,
-    Member, NameRef, SourceFingerprint,
-};
+use crate::frontend::{DefEntry, DefKind, FileSpan, Member, Slot, SourceFingerprint, TestEntry};
 use crate::{BODY_ENCODING, ContentHash, DefBody, FRONTEND_FORMAT, Outcome};
-use ply_span::{Diagnostic, Edit, Span, Symbol, codes};
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
-use std::collections::BTreeMap;
+use ply_eval::{Diagnostic, Edit, Span, Symbol, codes};
 
 /// Every variant name the exemplars below must between them mention.
 pub const COVERED: &[&str] = &[
-    "Type::Var",
-    "Type::Con",
-    "Type::Fn",
-    "Type::Record",
-    "Resource::Named",
-    "Resource::Var",
-    "Resource::Singleton",
-    "Mode::Read",
-    "Mode::Write",
-    "EffectAtom::mode",
-    "EffectAtom::op",
-    "DeclBody::Type",
-    "DeclBody::Effect",
     "DefKind::Fn",
     "DefKind::Type",
     "DefKind::Effect",
@@ -32,143 +13,75 @@ pub const COVERED: &[&str] = &[
     "Outcome::Fail",
 ];
 
-/// One value of every stored type, between them reaching every variant of every stored enum.
+/// One value of every stored type, between them reaching every variant of every stored enum. A
+/// slot's value and a test's row are the front end's own bytes, which this crate never reads.
 pub struct Exemplars {
     pub fingerprint: SourceFingerprint,
-    pub def: CachedDef,
-    pub type_decl: CachedDecl,
-    pub effect_decl: CachedDecl,
+    pub def: Slot,
+    pub decl: Slot,
     pub body: DefBody,
     pub outcomes: Vec<Outcome>,
 }
 
-fn sym(s: &str) -> Symbol {
-    Symbol::new(s)
+fn h(n: u8) -> ply_eval::DefHash {
+    ply_eval::DefHash([n; 32])
 }
 
-fn h(n: u8) -> ply_ty::DefHash {
-    ply_ty::DefHash([n; 32])
-}
-
-fn atom(effect: &str, resource: Resource, mode: Mode) -> EffectAtom {
-    EffectAtom::new(effect, resource, mode)
-}
-
-fn footprint() -> Footprint {
-    Footprint::from_atoms([
-        atom("db", Resource::Named(sym("users")), Mode::Read),
-        atom("clock", Resource::Singleton, Mode::Write),
-        EffectAtom::operation("net", Resource::Named(sym("conn")), Mode::Write, "send"),
-    ])
-}
-
-/// Narrower than what the same definition publishes, so filing one row where the other belongs
-/// moves the pin.
-fn performed() -> Footprint {
-    Footprint::from_atoms([atom("db", Resource::Named(sym("users")), Mode::Read)])
-}
-
-fn every_type() -> Type {
-    Type::Fn {
-        params: vec![
-            Type::Var(TyVar(0)),
-            Type::Con(sym("List"), vec![Type::Var(TyVar(1))]),
-            // The only two-argument `Con`, so the codec's arity is exercised.
-            Type::map(Type::string(), Type::Var(TyVar(1))),
-            Type::Record(BTreeMap::from([(sym("id"), Type::int())])),
-        ],
-        ret: Box::new(Type::Var(TyVar(0))),
-        effects: Row {
-            // An atom on a label the scheme quantifies; a footprint holds one too, through the
-            // same atom encoding.
-            atoms: footprint()
-                .0
-                .into_iter()
-                .chain([atom("net", Resource::Var(LabelVar(0)), Mode::Write)])
-                .collect(),
-            tail: Some(RowVar(0)),
-        },
-    }
+fn span(start: u32, end: u32) -> FileSpan {
+    FileSpan { start, end }
 }
 
 pub fn exemplars() -> Exemplars {
-    let scheme = Scheme {
-        ty_vars: vec![TyVar(0), TyVar(1)],
-        row_vars: vec![RowVar(0)],
-        label_vars: vec![LabelVar(0)],
-        ty: every_type(),
-    };
     Exemplars {
         fingerprint: SourceFingerprint {
             content_hash: ContentHash([1u8; 32]),
-            module: "user.store".to_string(),
-            // Distinct hashes per `DefEntry`, so the pin moves if two are swapped or one dropped.
+            module: "m".to_string(),
+            // Distinct hashes per entry, so the pin moves if two are swapped or one dropped.
             defs: vec![
                 DefEntry {
-                    name: sym("user.active_users"),
+                    name: Symbol::new("m.f"),
                     hash: h(2),
-                    span: FileSpan { start: 10, end: 42 },
+                    span: span(1, 2),
                     kind: DefKind::Fn,
                     members: vec![],
                 },
                 DefEntry {
-                    name: sym("user.User"),
+                    name: Symbol::new("m.T"),
                     hash: h(3),
-                    span: FileSpan { start: 50, end: 80 },
+                    span: span(3, 4),
                     kind: DefKind::Type,
                     members: vec![Member {
-                        name: sym("user.Active"),
-                        span: FileSpan { start: 60, end: 66 },
+                        name: Symbol::new("A"),
+                        span: span(5, 6),
                     }],
                 },
                 DefEntry {
-                    name: sym("user.db"),
+                    name: Symbol::new("m.e"),
                     hash: h(4),
-                    span: FileSpan {
-                        start: 90,
-                        end: 120,
-                    },
+                    span: span(7, 8),
                     kind: DefKind::Effect,
                     members: vec![Member {
-                        name: sym("user.get"),
-                        span: FileSpan {
-                            start: 100,
-                            end: 110,
-                        },
+                        name: Symbol::new("op"),
+                        span: span(9, 10),
                     }],
                 },
             ],
-            tests: vec![CachedTest {
-                name: "active_users excludes inactive".to_string(),
+            tests: vec![TestEntry {
+                name: "t".to_string(),
                 hash: h(5),
                 nondet: true,
-                footprint: footprint(),
-                span: FileSpan {
-                    start: 130,
-                    end: 180,
-                },
+                span: span(11, 12),
+                row: vec![0xa1, 0xa2],
             }],
         },
-        def: CachedDef::new(scheme.clone(), footprint(), performed())
-            .witnessed_by(vec![NameRef::new("user.User", h(3))]),
-        type_decl: CachedDecl::new(DeclBody::Type {
-            arity: 1,
-            ctors: vec![CachedCtor {
-                fields: vec![Type::Var(TyVar(0))],
-                scheme: scheme.clone(),
-            }],
-        })
-        .witnessed_by(vec![NameRef::new("user.User", h(3))]),
-        effect_decl: CachedDecl::new(DeclBody::Effect {
-            nondet: true,
-            ops: vec![CachedOp {
-                name: sym("get"),
-                mode: Mode::Write,
-                resource_param: true,
-                params: vec![Type::int()],
-                ret: Type::unit(),
-            }],
-        }),
+        def: Slot {
+            name: Symbol::new("m.f"),
+            value: vec![0xd1],
+        },
+        decl: Slot {
+            name: Symbol::new("m.T"),
+            value: vec![0xd2, 0xd3],
+        },
         body: DefBody::new(BODY_ENCODING, vec![0x20, 0x01, 0xff]),
         outcomes: vec![
             Outcome::Pass,
@@ -177,13 +90,13 @@ pub fn exemplars() -> Exemplars {
                 diagnostic: Some(
                     Diagnostic::error(codes::ASSERTION_FAILED, "assertion failed")
                         .primary(
-                            Span::new(ply_span::SourceId(3), 88, 97),
+                            Span::new(ply_eval::SourceId(3), 88, 97),
                             "expected 0, found -5",
                         )
                         .fix(
                             "expect -5",
                             vec![Edit {
-                                span: Span::new(ply_span::SourceId(3), 88, 89),
+                                span: Span::new(ply_eval::SourceId(3), 88, 89),
                                 text: "-5".to_string(),
                             }],
                         ),
@@ -200,8 +113,25 @@ pub fn fingerprint() -> ContentHash {
 
 pub fn fingerprint_at(body_encoding: u32) -> ContentHash {
     let e = exemplars();
+    // The result cache stores `Outcome` as JSON, so it is digested in that form.
+    let outcomes = serde_json::to_vec(&e.outcomes)
+        .unwrap_or_else(|e| format!("unserializable: {e}").into_bytes());
+    digest_of(
+        body_encoding,
+        &[
+            crate::codec::encode_fingerprint(&e.fingerprint),
+            crate::codec::encode_slot(&e.def),
+            crate::codec::encode_slot(&e.decl),
+            crate::codec::encode_body(&e.body),
+            outcomes,
+        ],
+    )
+}
+
+/// The digest over encoded exemplars, in the order [`fingerprint_at`] lists them.
+pub fn digest_of(body_encoding: u32, encoded: &[Vec<u8>]) -> ContentHash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ply-store schema v1");
+    hasher.update(b"ply-store schema v2");
     hasher.update(&FRONTEND_FORMAT.to_le_bytes());
     hasher.update(&body_encoding.to_le_bytes());
     // Variant names too, so a new variant moves the digest before an exemplar reaches it.
@@ -209,19 +139,9 @@ pub fn fingerprint_at(body_encoding: u32) -> ContentHash {
         hasher.update(&(name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
     }
-    // The result cache stores `Outcome` as JSON, so it is digested in that form.
-    let outcomes = serde_json::to_vec(&e.outcomes)
-        .unwrap_or_else(|e| format!("unserializable: {e}").into_bytes());
-    for bytes in [
-        crate::codec::encode_fingerprint(&e.fingerprint),
-        crate::codec::encode_def(&e.def),
-        crate::codec::encode_decl(&e.type_decl),
-        crate::codec::encode_decl(&e.effect_decl),
-        crate::codec::encode_body(&e.body),
-        outcomes,
-    ] {
+    for bytes in encoded {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
-        hasher.update(&bytes);
+        hasher.update(bytes);
     }
     ContentHash(*hasher.finalize().as_bytes())
 }

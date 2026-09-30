@@ -4,11 +4,12 @@
 // append copies.
 
 import builder (builder)
+import cache (store)
 import args (Flags, style_of)
 import appends (costs_of, promised, promises, report_lines, unresolved)
 import diagnostic (Place, all_to_json)
 import program (Program, Timed, ModuleFacts, timed_load, module_facts, published, is_shelved)
-import report (Answer, ok_code, count_of, ind, refused, warning_lines)
+import report (Answer, ok_code, count_of, ind, plural, refused, warning_lines)
 import signature (SetLine, definition_lines, effect_sets, provenance, provenance_lines, set_lines)
 import style (Style, bold, dim, green)
 import compiler.costs (Report)
@@ -94,12 +95,20 @@ fn phase_line(s: Style, p: Phase, total: Int) -> String =
   under() ++ pad_right(p.label, 11) ++ " " ++ pad_left(int_to_string(p.ms), 8) ++ "ms "
     ++ dim(s, share(p.ms, total))
 
-// Longest first, so what dominated a run is read first.
-fn ordered(a: Phase, b: Phase) -> List<Phase> = if b.ms > a.ms { [b, a] } else { [a, b] }
+// Longest first, so what dominated a run is read first; a tie keeps the order the load ran them in.
+fn ordered(phases: List<Phase>) -> List<Phase> =
+  fold(phases, [], |acc: List<Phase>, p: Phase| {
+    let before = filter(acc, |q: Phase| q.ms >= p.ms);
+    append(push(before, p), filter(acc, |q: Phase| q.ms < p.ms))
+  })
 
 fn phase_lines(s: Style, t: Timed) -> List<String> = {
-  let total = t.read_ms + t.front_ms;
-  let rows = ordered({ label: "read", ms: t.read_ms }, { label: "front", ms: t.front_ms });
+  let total = t.read_ms + t.front_ms + t.file_ms;
+  let rows = ordered([
+    { label: "read", ms: t.read_ms },
+    { label: "front", ms: t.front_ms },
+    { label: "write back", ms: t.file_ms },
+  ]);
   append(
     append(["", ind() ++ bold(s, "front-end time")], map(rows, |p: Phase| phase_line(s, p, total))),
     [under() ++ pad_right("total", 11) ++ " " ++ pad_left(int_to_string(total), 8) ++ "ms"],
@@ -110,8 +119,39 @@ fn phases_json(t: Timed) -> Json =
   object([
     { key: "read", value: number(t.read_ms) },
     { key: "front", value: number(t.front_ms) },
-    { key: "total", value: number(t.read_ms + t.front_ms) },
+    { key: "write_back", value: number(t.file_ms) },
+    { key: "total", value: number(t.read_ms + t.front_ms + t.file_ms) },
   ])
+
+// --- Where the answer came from ---------------------------------------------------
+// A definition whose hash has not moved since the cache filed it is taken from its filed rows, and
+// every other one is checked.
+
+type Seeding = { seeded: Int, checked: Int }
+
+fn seeding_of(w: Whole) -> Seeding = {
+  let seeded = len(w.checked.seeded);
+  { seeded: seeded, checked: len(w.checked.defs) - seeded }
+}
+
+fn count_line(label: String, n: Int) -> String =
+  under() ++ pad_right(label, 11) ++ " " ++ pad_left(int_to_string(n), 8) ++ " "
+    ++ plural(n, "definition")
+
+fn seeding_lines(s: Style, w: Whole) -> List<String> = {
+  let x = seeding_of(w);
+  [
+    "",
+    ind() ++ bold(s, "front-end cache"),
+    count_line("seeded", x.seeded),
+    count_line("checked", x.checked),
+  ]
+}
+
+fn seeding_json(w: Whole) -> Json = {
+  let x = seeding_of(w);
+  object([{ key: "seeded", value: number(x.seeded) }, { key: "checked", value: number(x.checked) }])
+}
 
 // --- `--types` ---------------------------------------------------------------------
 
@@ -313,7 +353,13 @@ fn document(
     { key: "definitions", value: Array(map(defs, |d: DefInfo| definition_json(flags.explain, d))) },
     { key: "tests", value: Array(map(w.checked.tests, test_json)) },
     { key: "effects", value: Array(map(w.checked.effects, effect_json)) },
-    { key: "front_end", value: object([{ key: "phases", value: phases_json(t) }]) },
+    {
+      key: "front_end",
+      value: object([
+        { key: "phases", value: phases_json(t) },
+        { key: "definitions", value: seeding_json(w) },
+      ]),
+    },
     { key: "diagnostics", value: all_to_json(warnings, p.places) },
   ])
 }
@@ -338,7 +384,8 @@ fn answered(s: Style, flags: Flags, t: Timed, w: Whole, r: Report, warnings: Lis
   let views = module_facts(t.program, w);
   let defs = published(w);
   let head = append([summary(s, w, defs)], warning_lines(s, warnings));
-  let explained = if flags.explain { append(head, phase_lines(s, t)) } else { head };
+  let explained = if flags.explain { append(append(head, phase_lines(s, t)), seeding_lines(s, w)) }
+  else { head };
   let typed = if flags.types { append(explained, type_lines(s, flags.explain, w, views, defs)) }
   else { explained };
   {
@@ -362,7 +409,7 @@ fn checked(s: Style, flags: Flags, t: Timed, w: Whole) -> Answer = {
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, store.known[cache], store.file[cache]} = {
   let t: Timed = timed_load(flags.paths);
   match t.program.whole {
     None -> refused(style_of(flags), "check", t.program.diags, t.program.places),
@@ -380,7 +427,7 @@ test "a share is a tenth of a percent, and a run that took no time at all is not
   assert_eq(share(0, 0), "  0.0%")
 }
 
-test "the longest phase is printed first, and the total accounts for both" {
+test "the longest phase is printed first, and the total accounts for all three" {
   let lines = phase_lines(plain(), {
     program: {
       files: [],
@@ -390,15 +437,37 @@ test "the longest phase is printed first, and the total accounts for both" {
       pkgs: { root: b"", manifest: None, supplied: [] },
     },
     read_ms: 2,
-    front_ms: 98,
+    front_ms: 90,
+    file_ms: 8,
+    cached: true,
   });
   assert_eq(lines, [
     "",
     "   front-end time",
-    "     front             98ms  98.0%",
+    "     front             90ms  90.0%",
+    "     write back         8ms   8.0%",
     "     read               2ms   2.0%",
     "     total            100ms",
   ])
+}
+
+test "phases that took the same time are read in the order the load ran them" {
+  assert_eq(
+    map(
+      ordered([
+        { label: "read", ms: 0 },
+        { label: "front", ms: 0 },
+        { label: "write back", ms: 0 },
+      ]),
+      |p: Phase| p.label,
+    ),
+    ["read", "front", "write back"],
+  )
+}
+
+test "the cache reading says how many definitions were seeded and how many were checked" {
+  assert_eq(count_line("seeded", 2950), "     seeded          2950 definitions");
+  assert_eq(count_line("checked", 1), "     checked            1 definition")
 }
 
 test "a test name is printed as the reference prints it, with the quotes escaped" {

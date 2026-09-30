@@ -1,11 +1,13 @@
 // The path a command was given, resolved. The launcher binds `cwd` to the working directory and
 // `abs` to the filesystem's root: a path that stays under the working directory is addressed
-// under `cwd` as today, and one that leaves it is addressed under `abs`, root-relative, after a
-// lexical normalize. The program is the tool, and the tool reads where it is told.
+// under `cwd`, and one that leaves it is addressed under `abs`, root-relative, after a lexical
+// normalize. `resolve` is where that is decided; everything after it carries the answer as a
+// `Rooted` path. The program is the tool, and the tool reads where it is told.
 
 import cmdline
 import env (env)
-import std.fs (fs, File, Dir, Symlink, Missing)
+import std.fs (fs, Kind, File, Dir, Symlink, Missing, MemFs, Written, mem_create_dir, mem_empty,
+               mem_kind, mem_list, mem_of, mem_read, mem_resolved, mem_write)
 import std.path (file_name, is_absolute, join, normalize, parent, strip_dot)
 
 // A command's path argument, resolved: the label its fs reads spell, the project root it reports
@@ -18,7 +20,7 @@ pub type Resolved = {
   // The project root as reports print it: relative to the working directory when it can be.
   display: String,
   inside: String,
-  // The absolute path, which the machine's own loads take.
+  // The project root, absolute: the key a package walk roots at and resolves dependencies against.
   absolute: String,
   // The spelling the machine loads by: the working-directory spelling while the path stays
   // under it (so the spans a run reports read as given), the absolute form once it leaves.
@@ -45,6 +47,9 @@ fn nearest_dir(label: String, spelling: String) -> String / {fs.resolved[cwd], f
 
 fn display_of(pwd: String, full: String) -> String =
   match strip_prefix(full, pwd) { Some(rest) -> if rest == "" { "." } else { rest }, None -> full }
+
+fn absolute_of(pwd: String, label: String, spelling: String) -> String =
+  normalize(if label == "cwd" { join(pwd, spelling) } else { "/" ++ spelling })
 
 pub fn resolve(arg: String) -> Resolved / {fs.resolved[cwd], fs.resolved[abs], env.pwd[sys]} = {
   let pwd = env.pwd[sys]();
@@ -77,19 +82,20 @@ pub fn resolve(arg: String) -> Resolved / {fs.resolved[cwd], fs.resolved[abs], e
         spelling: dspelling,
         display: display_of(pwd, dir),
         inside: file_name(full),
-        absolute: full,
+        absolute: dir,
         machine: machine_spelling,
       }
     },
     _ -> {
       // Nothing there: the nearest directory above it is rooted, so the program reports the name.
       let dir = nearest_dir(label, spelling);
+      let root = absolute_of(pwd, label, dir);
       {
         label: label,
         spelling: dir,
-        display: display_of(pwd, dir),
+        display: display_of(pwd, root),
         inside: match strip_prefix(spelling, dir) { Some(rest) -> rest, None -> spelling },
-        absolute: full,
+        absolute: root,
         machine: machine_spelling,
       }
     },
@@ -97,24 +103,49 @@ pub fn resolve(arg: String) -> Resolved / {fs.resolved[cwd], fs.resolved[abs], e
 }
 
 // The fs spelling of the whole resolved path (the root's spelling joined with the inside path).
-pub fn address(r: Resolved) -> String =
+fn address(r: Resolved) -> String =
   if r.inside == "." { r.spelling } else { join(r.spelling, r.inside) }
 
-// The prefix a walked path shares with the root it was found under, which the module's name drops.
+// A path as one root spells it, read and written through that root and no other.
+pub type Rooted = { label: String, path: String }
+
+// The whole resolved path, under the root it resolved to.
+pub fn rooted(r: Resolved) -> Rooted = { label: r.label, path: address(r) }
+
+// A file in the root's own directory, whatever the path named inside it: where a package keeps its
+// `ply.pkg` and its `ply.lock`.
+pub fn in_root(r: Resolved, name: String) -> Rooted =
+  child({ label: r.label, path: r.spelling }, name)
+
+// A name in a rooted directory, under the directory's root.
+pub fn child(dir: Rooted, name: String) -> Rooted = { label: dir.label, path: join(dir.path, name) }
+
+// The path as a report prints it: as spelled under the working directory, absolute outside it.
+pub fn displayed(p: Rooted) -> String = if p.label == "cwd" { p.path } else { "/" ++ p.path }
+
+pub fn read_file(p: Rooted) -> Option<Bytes> / {fs.read_file[cwd], fs.read_file[abs]} =
+  if p.label == "cwd" { fs.read_file[cwd](p.path) } else { fs.read_file[abs](p.path) }
+
+pub fn write_file(p: Rooted, body: Bytes) -> Bool / {fs.write_file[cwd], fs.write_file[abs]} =
+  if p.label == "cwd" { fs.write_file[cwd](p.path, body) } else { fs.write_file[abs](p.path, body) }
+
+// What the path names; a symlink is reported as one and never followed.
+pub fn kind(p: Rooted) -> Kind / {fs.kind[cwd], fs.kind[abs]} =
+  if p.label == "cwd" { fs.kind[cwd](p.path) } else { fs.kind[abs](p.path) }
+
+pub fn list_dir(p: Rooted) -> Option<List<String>> / {fs.list_dir[cwd], fs.list_dir[abs]} =
+  if p.label == "cwd" { fs.list_dir[cwd](p.path) } else { fs.list_dir[abs](p.path) }
+
+pub fn create_dir(p: Rooted) -> Bool / {fs.create_dir[cwd], fs.create_dir[abs]} =
+  if p.label == "cwd" { fs.create_dir[cwd](p.path) } else { fs.create_dir[abs](p.path) }
+
 // The walked path's prefix that module naming drops: the root's own spelling, so a file names
 // its stem and a directory's walk names what is under it. `strip_prefix` adds the separator.
 pub fn root_prefix(r: Resolved) -> String = if r.spelling == "." { "" } else { r.spelling }
 
-// The path as a report prints it: the working directory's own display form under it, else the
-// absolute form.
-pub fn shown(r: Resolved, spelling: String) -> String =
-  match strip_prefix(spelling, r.spelling) {
-    Some(rest) -> if r.display == "." { rest } else { join(r.display, rest) },
-    None -> spelling,
-  }
-
 // The command's path arguments, each resolved against the working directory. The name a query
-// command looks up is not a path; an empty list is the working directory.
+// command looks up is not a path, nor is either word of a yank; an empty list is the working
+// directory.
 pub fn resolve_all(
   command: String,
   p: cmdline::Parsed,
@@ -124,13 +155,17 @@ pub fn resolve_all(
       || command == "why"
       || command == "explain" { drop_first(p.positionals) } else if command == "cache"
       && cmdline::nth_of(p.path, 1, "") == "inspect" { drop_first(p.positionals) }
+  else if command == "yank" { [] }
   else { p.positionals };
   if len(paths) == 0 { [resolve(".")] } else { map(paths, |path: String| resolve(path)) }
 }
 
-// The one the machine loads: the last path argument, resolved.
-pub fn path_arg(command: String, p: cmdline::Parsed) -> String =
-  match list_at(resolve_all(command, p), 0) { Some(r) -> r.absolute, None -> "." }
+// A flag whose value is a path, resolved as a path argument is; `None` when the line left it off.
+pub fn resolve_flag(
+  p: cmdline::Parsed,
+  flag: String,
+) -> Option<Rooted> / {fs.resolved[cwd], fs.resolved[abs], env.pwd[sys]} =
+  match cmdline::value(p, flag) { Some(v) -> Some(rooted(resolve(v))), None -> None }
 
 fn drop_first(xs: List<String>) -> List<String> = match xs { [] -> [], [_, ..rest] -> rest }
 
@@ -148,3 +183,137 @@ pub fn at_cwd(spelling: String) -> Resolved =
     absolute: spelling,
     machine: spelling,
   }
+
+// --- Tests ------------------------------------------------------------------
+
+test "a rooted path prints as spelled under the working directory, and absolute outside it" {
+  assert_eq(displayed({ label: "cwd", path: "sub/m.ply" }), "sub/m.ply");
+  assert_eq(displayed({ label: "abs", path: "srv/app/m.ply" }), "/srv/app/m.ply");
+  assert_eq(displayed({ label: "abs", path: "" }), "/")
+}
+
+test "a rooted path is read and written through its own root, never the other" {
+  let read = handle {
+    read_file({ label: "abs", path: "srv/m.ply" })
+  } with {
+    fs.read_file[cwd](p) -> panic("a path under `abs` is read under `abs`"),
+    fs.read_file[abs](p) -> if p == "srv/m.ply" { Some(b"text") } else { None },
+  };
+  assert_eq(read, Some(b"text"));
+  let wrote = handle {
+    write_file({ label: "cwd", path: "m.ply" }, b"text")
+  } with {
+    fs.write_file[cwd](p, body) -> p == "m.ply" && body == b"text",
+    fs.write_file[abs](p, body) -> panic("a path under `cwd` is written under `cwd`"),
+  };
+  assert(wrote)
+}
+
+test "a rooted path is looked at and listed through its own root, never the other" {
+  let here = mem_of([{ path: "app/m.ply", body: b"fn m() -> Int = 1" }]);
+  let root = mem_of([{ path: "srv/app/m.ply", body: b"fn m() -> Int = 2" }]);
+  let kinds = handle {
+    [
+      kind({ label: "cwd", path: "app" }),
+      kind({ label: "cwd", path: "app/m.ply" }),
+      kind({ label: "abs", path: "app" }),
+      kind({ label: "abs", path: "srv/app/m.ply" }),
+    ]
+  } with {
+    fs.kind[cwd](p) -> mem_kind(here, p),
+    fs.kind[abs](p) -> mem_kind(root, p),
+  };
+  assert_eq(kinds, [Dir, File, Missing, File]);
+  let listed = handle {
+    [
+      list_dir({ label: "cwd", path: "." }),
+      list_dir({ label: "abs", path: "srv/app" }),
+      list_dir({ label: "abs", path: "app" }),
+    ]
+  } with {
+    fs.list_dir[cwd](p) -> mem_list(here, p),
+    fs.list_dir[abs](p) -> mem_list(root, p),
+  };
+  assert_eq(listed, [Some(["app"]), Some(["m.ply"]), None])
+}
+
+test "a directory is made through its own root, and a child of it is written there" {
+  with_cell[twin](mem_empty()) { a -> {
+    let made: Rooted = { label: "abs", path: "srv/demo" };
+    let wrote = handle {
+      create_dir(made) && write_file(child(made, "ply.pkg"), b"pkg")
+    } with {
+      fs.create_dir[cwd](p) -> panic("a path under `abs` is made under `abs`"),
+      fs.create_dir[abs](p) -> {
+        let w: Written = mem_create_dir(cell_get(a), p);
+        cell_set(a, w.fs);
+        w.ok
+      },
+      fs.write_file[cwd](p, body) -> panic("a path under `abs` is written under `abs`"),
+      fs.write_file[abs](p, body) -> {
+        let w: Written = mem_write(cell_get(a), p, body);
+        cell_set(a, w.fs);
+        w.ok
+      },
+    };
+    assert(wrote);
+    assert_eq(mem_kind(cell_get(a), "srv/demo"), Dir);
+    assert_eq(mem_read(cell_get(a), "srv/demo/ply.pkg"), Some(b"pkg"))
+  } }
+}
+
+test "a child keeps its directory's root, and the working directory's `.` adds no segment" {
+  assert_eq(child({ label: "cwd", path: "." }, "m.ply"), { label: "cwd", path: "m.ply" });
+  assert_eq(child({ label: "cwd", path: "app" }, "m.ply"), { label: "cwd", path: "app/m.ply" });
+  assert_eq(child({ label: "abs", path: "" }, "m.ply"), { label: "abs", path: "m.ply" });
+  assert_eq(displayed(child({ label: "abs", path: "srv/app" }, "m.ply")), "/srv/app/m.ply")
+}
+
+// One disk under `/`, with the working directory at `pwd`, bound as the launcher binds the roots.
+fn resolved_at(disk: MemFs, pwd: String, arg: String) -> Resolved =
+  handle {
+    resolve(arg)
+  } with {
+    env.pwd[sys]() -> pwd,
+    fs.resolved[cwd](p) -> mem_resolved(disk, join(string_slice(pwd, 1, string_len(pwd)), p)),
+    fs.resolved[abs](p) -> mem_resolved(disk, p),
+  }
+
+fn a_disk() -> MemFs =
+  mem_of([
+    { path: "w/m.ply", body: b"fn m() -> Int = 1" },
+    { path: "w/app/main.ply", body: b"fn main() -> Int = 1" },
+    { path: "srv/lib/x.ply", body: b"pub fn x() -> Int = 1" },
+  ])
+
+test "a file's root is its directory, so a package's own files are beside the file named" {
+  let file = resolved_at(a_disk(), "/w", "app/main.ply");
+  assert_eq(rooted(file), { label: "cwd", path: "app/main.ply" });
+  assert_eq(in_root(file, "ply.lock"), { label: "cwd", path: "app/ply.lock" });
+  assert_eq(file.absolute, "/w/app");
+  let dir = resolved_at(a_disk(), "/w", "app");
+  assert_eq(in_root(dir, "ply.lock"), in_root(file, "ply.lock"));
+  assert_eq(dir.absolute, file.absolute);
+  // The working directory's own file: its spelling is `.`, which adds no segment.
+  assert_eq(in_root(resolved_at(a_disk(), "/w", "m.ply"), "ply.pkg"), {
+    label: "cwd",
+    path: "ply.pkg",
+  });
+  let outside = resolved_at(a_disk(), "/w", "../srv/lib/x.ply");
+  assert_eq(in_root(outside, "ply.lock"), { label: "abs", path: "srv/lib/ply.lock" });
+  assert_eq(displayed(in_root(outside, "ply.lock")), "/srv/lib/ply.lock");
+  assert_eq(outside.absolute, "/srv/lib")
+}
+
+test "a path that names nothing yet is rooted at the nearest directory above it" {
+  // `--stamp ../gate` from a subdirectory: a file to write, outside the working directory.
+  let gate = resolved_at(a_disk(), "/w/app", "../gate");
+  assert_eq(rooted(gate), { label: "abs", path: "w/gate" });
+  assert_eq(displayed(rooted(gate)), "/w/gate");
+  assert_eq(gate.absolute, "/w");
+  assert_eq(gate.display, "/w");
+  // `ply new store/orders`: two levels to make, under the working directory.
+  let made = resolved_at(a_disk(), "/w", "store/orders");
+  assert_eq(rooted(made), { label: "cwd", path: "store/orders" });
+  assert_eq(made.absolute, "/w")
+}

@@ -7,11 +7,10 @@
 
 use crate::hosts::Lent;
 use crate::payload::{count, diags_value, option, places_value, record};
-use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
+use ply_eval::{Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, codes};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

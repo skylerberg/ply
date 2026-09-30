@@ -3,10 +3,9 @@
 use crate::process::Children;
 use ply_eval::host::HostRegistry;
 use ply_eval::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime,
-    Linearity, Value,
+    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
+    HostRuntime, Linearity, Span, Symbol, Value, codes,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -402,7 +401,7 @@ pub fn register(registry: &mut HostRegistry, shutdown: Option<&Arc<Shutdown>>) {
     for (op, handler) in registrations(shutdown) {
         match shutdown {
             Some(_) => registry.register(op, handler),
-            None => registry.register_withheld(op, handler),
+            None => registry.register_withheld(op, handler, crate::process::ONLY_A_RUN),
         }
     }
 }

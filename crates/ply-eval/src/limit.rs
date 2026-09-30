@@ -1,6 +1,6 @@
 //! The two bounds on a runaway program: how deep it may nest, and how much work it may do.
 
-use ply_span::{Diagnostic, Span, codes};
+use crate::{Diagnostic, Span, codes};
 
 /// The most nested calls a program may hold at once.
 pub const DEFAULT_MAX_CALLS: usize = 10_000;

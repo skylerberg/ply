@@ -2,7 +2,7 @@
 
 use crate::cont::Frame;
 use crate::value::{Fields, Map, Value};
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use crate::{Diagnostic, Span, Symbol, codes};
 use std::rc::Rc;
 use std::sync::Arc;
 

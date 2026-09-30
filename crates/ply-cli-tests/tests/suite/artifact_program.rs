@@ -136,7 +136,7 @@ fn the_compiler_is_on_the_shelf_under_its_own_root_and_nothing_may_shadow_it() {
     let err = ply_machine::load::load(dir.path())
         .expect_err("`compiler` is the built-in package's prefix");
     assert_eq!(err.diagnostics.len(), 1);
-    assert_eq!(err.diagnostics[0].code, ply_span::codes::PREFIX_COLLISION);
+    assert_eq!(err.diagnostics[0].code, ply_eval::codes::PREFIX_COLLISION);
     assert!(
         err.diagnostics[0].message.contains("compiler.fmt"),
         "{:?}",

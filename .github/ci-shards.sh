@@ -48,10 +48,13 @@ SOLO=(
   "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
   "archive-round-trip:ply-cli-tests:suite:bootstrap_archive::an_archive_is_written_and_verifies_against_the_tree_it_came_from"
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
-  "corpus-session-audit:ply-cli-tests:suite:incremental_audit::a_long_session_over_the_example_corpus_agrees_at_every_step"
-  # The corpus's own socket bench, which nothing in a shard reaches: it binds a real listener, and
-  # the CLI's reservations do not cover another crate's, so it gets a runner of its own.
+  "corpus-session-audit:ply-cli-tests:suite:incremental::a_long_session_over_the_example_corpus_agrees_at_every_step"
+  # The corpus's own served benches, which nothing in a shard reaches: each binds real listeners, and
+  # the CLI's reservations do not cover another crate's, so each gets a runner of its own.
   "corpus-socket-bench:ply-corpus-tests:suite:served::the_socket_bench_serves_the_desk_and_its_floor"
+  "corpus-database-bench:ply-corpus-tests:suite:served::the_database_bench_takes_what_needs_no_database_and_names_what_does"
+  "corpus-lifecycle-bench:ply-corpus-tests:suite:served::the_lifecycle_bench_drains_and_deploys_and_names_what_needs_a_database"
+  "corpus-ladder:ply-corpus-tests:suite:served::the_ladder_serves_the_desk_and_holds_the_shipped_allocation_figure"
 )
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.
@@ -74,13 +77,13 @@ declare -a KNOWN_OUTSIDE=(
 # Checks on the tree, as `package:target:test` (`target` is `lib` for a unit test, named by full
 # module path). The gates job asserts each ran, since a check that stops running reports nothing.
 TREE_CHECKS=(
-  "ply-span-tests:armed:every_registered_code_is_constructed_in_production"
-  "ply-span-tests:armed:every_variant_of_a_covered_enum_is_constructed_in_production"
-  "ply-span-tests:armed:every_diagnostic_constructor_call_names_its_code_literally"
-  "ply-span-tests:armed:every_code_declared_or_raised_has_one_row_in_the_registry"
-  "ply-span-tests:armed:the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
-  "ply-span-tests:armed:no_allowlist_entry_has_outlived_its_reason"
-  "ply-span-tests:armed:ambiguous_enum_names_are_declared"
+  "ply-eval-tests:suite:armed::every_registered_code_is_constructed_in_production"
+  "ply-eval-tests:suite:armed::every_variant_of_a_covered_enum_is_constructed_in_production"
+  "ply-eval-tests:suite:armed::every_diagnostic_constructor_call_names_its_code_literally"
+  "ply-eval-tests:suite:armed::every_code_declared_or_raised_has_one_row_in_the_registry"
+  "ply-eval-tests:suite:armed::the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
+  "ply-eval-tests:suite:armed::no_allowlist_entry_has_outlived_its_reason"
+  "ply-eval-tests:suite:armed::ambiguous_enum_names_are_declared"
   "ply-cli-tests:suite:fmt::the_maintained_sources_are_committed_formatted"
   "ply-cli-tests:suite:tree::every_test_file_is_declared_and_every_declaration_has_a_file"
   "ply-cli-tests:suite:tree::the_harness_is_the_only_place_the_ply_binary_is_named"

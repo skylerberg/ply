@@ -1,16 +1,7 @@
-use crate::harness::{ply, write};
-use ply_machine::driver;
+use crate::harness::{json_of, ply, warm_agrees, write};
+use ply_eval::codes;
 use ply_machine::load::{Loaded, load};
-use ply_span::{Symbol, codes};
-use ply_store::Store;
 use std::fs;
-use std::path::Path;
-
-#[track_caller]
-fn incremental(dir: &Path) -> Loaded {
-    let mut store = Store::open(dir).expect("the cache directory is writable");
-    driver::load_incremental(dir, &mut store).expect("the corpus checks")
-}
 
 /// An imported but unused name is in no `deps` entry, so deleting it leaves every hash the importer names untouched.
 #[test]
@@ -27,19 +18,22 @@ fn deleting_an_unused_selectively_imported_name_is_reported_not_skipped_past() {
         "import lib (used, spare)\nfn go() -> Int = used()\n",
     );
 
-    incremental(dir.path());
-    incremental(dir.path());
+    warm_agrees(dir.path(), "cold");
+    warm_agrees(dir.path(), "warm");
 
     write(dir.path(), "lib.ply", "pub fn used() -> Int = 1\n");
-    let mut store = Store::open(dir.path()).unwrap();
-    let err = driver::load_incremental(dir.path(), &mut store)
-        .expect_err("an import of a deleted name must be an error, not a skipped file");
+    let answer = warm_agrees(dir.path(), "the imported name deleted");
+    assert_eq!(
+        answer["exit_code"], 2,
+        "an import of a deleted name must be an error, not a skipped file: {answer}"
+    );
     assert!(
-        err.diagnostics
+        answer["diagnostics"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|d| d.code == codes::UNKNOWN_NAME),
-        "codes: {:?}",
-        err.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
+            .any(|d| d["code"] == codes::UNKNOWN_NAME),
+        "{answer}"
     );
 }
 
@@ -64,19 +58,11 @@ fn the_published_order_is_the_same_warm_as_cold() {
          pub fn base() -> Int = 1\n",
     );
 
-    incremental(dir.path());
-    let warm = incremental(dir.path());
+    // A warm check publishes in the order a cold one does.
+    warm_agrees(dir.path(), "cold");
+    warm_agrees(dir.path(), "warm");
 
-    let full = load(dir.path()).unwrap();
-    let keys = |l: &Loaded| {
-        (
-            l.check.defs.keys().cloned().collect::<Vec<Symbol>>(),
-            l.check.effects.keys().cloned().collect::<Vec<Symbol>>(),
-            l.check.ctors.keys().cloned().collect::<Vec<Symbol>>(),
-            l.check.modules.keys().cloned().collect::<Vec<Symbol>>(),
-        )
-    };
-    assert_eq!(keys(&warm), keys(&full));
+    let full: Loaded = load(dir.path()).unwrap();
 
     // The run's own order: files sorted, then each file's items as written.
     let defs: Vec<&str> = full.check.defs.keys().map(|k| k.as_str()).collect();
@@ -90,25 +76,27 @@ fn a_result_cache_write_failure_is_not_blamed_on_the_front_end() {
     // `rename` cannot replace a directory, so only the result cache's atomic write fails.
     fs::create_dir_all(dir.path().join(".ply-cache/results.json")).unwrap();
 
-    let mut store = Store::open(dir.path()).unwrap();
-    let loaded = driver::load_incremental(dir.path(), &mut store)
-        .expect("an unwritable cache never fails a compile");
-
-    let warning = loaded
-        .frontend
-        .warnings
-        .first()
-        .expect("an unwritable cache has to be reported");
-    assert_eq!(warning.code, codes::CACHE_UNREADABLE);
+    let out = ply(dir.path()).args(["check", "--json"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unwritable cache never fails a compile"
+    );
+    let answer = json_of(&out);
+    let warnings: Vec<&str> = answer["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == codes::CACHE_UNREADABLE)
+        .map(|d| d["message"].as_str().unwrap())
+        .collect();
     assert!(
-        warning.message.contains("result cache"),
-        "the failing cache has to be named: {}",
-        warning.message
+        warnings.iter().any(|m| m.contains("result cache")),
+        "the failing cache has to be named: {warnings:?}"
     );
     assert!(
-        !warning.message.contains("front-end cache"),
-        "the front-end cache is not what failed: {}",
-        warning.message
+        warnings.iter().all(|m| !m.contains("front-end cache")),
+        "the front-end cache is not what failed: {warnings:?}"
     );
 }
 
@@ -147,7 +135,7 @@ fn three_operations_sharing_one_atom_are_three_reachable_clauses() {
     assert_eq!(
         err.diagnostics
             .iter()
-            .filter(|d| d.severity == ply_span::Severity::Error)
+            .filter(|d| d.severity == ply_eval::Severity::Error)
             .count(),
         1,
         "only `nope` is an error"

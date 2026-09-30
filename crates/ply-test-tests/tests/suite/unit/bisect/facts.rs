@@ -1,10 +1,8 @@
-use ply_span::{SourceId, Symbol};
+use ply_eval::{CheckOutput, DefHash, HashOutput, SourceId, Symbol};
 use ply_test::bisect::{
     Baseline, ChangeSet, Classify, DefKey, Regression, Rehashed, Row, StoreClassify, Unknown,
     change_set,
 };
-use ply_ty::CheckOutput;
-use ply_ty::{DefHash, HashOutput};
 use std::collections::BTreeMap;
 
 struct Compiled {
@@ -382,23 +380,14 @@ impl Drop for TempRoot {
     }
 }
 
-/// Files the baseline's interfaces as a passing run would, so `StoreClassify` has both sides.
-fn stored(before: &Compiled, names: &[&str]) -> (TempRoot, ply_store::Store) {
+/// Files the baseline's interfaces as a passing run would, then the current program's as the CLI
+/// does before its tests run, so `StoreClassify` has both sides.
+fn stored(before: &Compiled, after: &Compiled) -> (TempRoot, ply_store::Store) {
     let root = TempRoot::new();
     let mut store = ply_store::Store::open(&root.0).expect("open store");
-    for name in names {
-        let name = Symbol::new(name);
-        let info = &before.check.defs[&name];
-        let hash = before.hashes.defs[&name];
-        store.put_def(
-            hash,
-            ply_store::CachedDef::new(
-                info.scheme.clone(),
-                info.footprint.clone(),
-                info.performed.clone(),
-            ),
-        );
-    }
+    let file = root.0.join("m.ply");
+    crate::fixture::file_interfaces(&mut store, &file, &before.sources);
+    crate::fixture::file_interfaces(&mut store, &file, &after.sources);
     (root, store)
 }
 
@@ -415,7 +404,7 @@ test "totals" {
 fn an_interface_preserving_edit_is_independent() {
     let before = Compiled::new(SIGNATURE);
     let after = Compiled::new(&SIGNATURE.replace("n * 2", "n * 3"));
-    let (_root, store) = stored(&before, &["scale", "total"]);
+    let (_root, store) = stored(&before, &after);
 
     let baseline = before.baseline("totals");
     let mut classify = StoreClassify::new(after.rehashed(&baseline), &store, &after.check);
@@ -438,7 +427,7 @@ fn a_signature_change_is_not_independent() {
             )
             .replace("acc + scale(x)", "acc + scale(x, 3)"),
     );
-    let (_root, store) = stored(&before, &["scale", "total"]);
+    let (_root, store) = stored(&before, &after);
 
     let baseline = before.baseline("totals");
     let mut classify = StoreClassify::new(after.rehashed(&baseline), &store, &after.check);
@@ -471,7 +460,7 @@ fn an_interface_the_store_never_saw_is_a_refusal_rather_than_a_yes() {
 fn the_store_backed_classifier_answers_the_same_facts() {
     let before = Compiled::new(SIGNATURE);
     let after = Compiled::new(&SIGNATURE.replace("n * 2", "n * 3"));
-    let (_root, store) = stored(&before, &["scale", "total"]);
+    let (_root, store) = stored(&before, &after);
 
     let baseline = before.baseline("totals");
     let mut classify = StoreClassify::new(after.rehashed(&baseline), &store, &after.check);

@@ -1,8 +1,7 @@
 //! An operator's meaning and the diagnostics shared by every evaluation strategy.
 
-use crate::BinOp;
 use crate::value::{Decimal, Fixed, Value, type_error, values_equal};
-use ply_span::{Diagnostic, Span, codes};
+use crate::{BinOp, Diagnostic, Span, codes};
 
 #[inline(never)]
 pub fn strict_binary(

@@ -1,6 +1,6 @@
 use ply_codegen::heap::{self, Heap, KIND_DEAD, Layouts, Word, dec, inc, kind, obj};
 use ply_codegen::map::{get, len, root, to_vec};
-use ply_span::Symbol;
+use ply_eval::Symbol;
 
 fn layouts() -> Layouts {
     Layouts::new(vec![(Symbol::new("Some"), 1), (Symbol::new("None"), 0)])
