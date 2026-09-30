@@ -19,7 +19,7 @@ use claims::Code;
 use ply_eval::Symbol;
 use std::collections::BTreeSet;
 
-pub const SPLIT_DEPTH: u32 = 48;
+const SPLIT_DEPTH: u32 = 48;
 
 /// Binder `i` is slot `i` of every clause's window.
 pub struct Goal<'a> {
@@ -61,13 +61,16 @@ pub struct Proof {
     /// In application order, deduplicated.
     pub rules: Vec<Rule>,
     pub steps: u32,
-    pub sorts: Vec<Symbol>,
+    /// The type variables left as uninterpreted sorts, by number, ascending.
+    pub sorts: Vec<u32>,
     /// No guard, or a valid one, over an inhabited domain.
     pub guard_satisfiable: bool,
 }
 
 impl Proof {
-    pub fn certify(&self, guard_witnessed: bool) -> Option<Certificate> {
+    /// `variables` names each of the claim's type variables by its number, as the world does; it
+    /// holds every variable the binders do.
+    pub fn certify(&self, guard_witnessed: bool, variables: &[Symbol]) -> Option<Certificate> {
         if !self.guard_satisfiable && !guard_witnessed {
             return None;
         }
@@ -75,7 +78,11 @@ impl Proof {
             rules: self.rules.clone(),
             steps: self.steps,
             guard_satisfiable: true,
-            sorts: self.sorts.clone(),
+            sorts: self
+                .sorts
+                .iter()
+                .map(|v| variables[*v as usize].clone())
+                .collect(),
         })
     }
 }
@@ -450,16 +457,14 @@ fn domain_inhabited(ctx: &Context<'_>, binders: &[Binder]) -> bool {
     binders.iter().all(|b| ctx.inhabited(&b.sort))
 }
 
-/// The binders' variables, each named as the claim's binders print it.
-fn uninterpreted_sorts(binders: &[Binder]) -> Vec<Symbol> {
+/// The binders' variables, by number.
+fn uninterpreted_sorts(binders: &[Binder]) -> Vec<u32> {
     let mut vars: Vec<u32> = Vec::new();
     for binder in binders {
         binder.sort.vars(&mut vars);
     }
     let vars: BTreeSet<u32> = vars.into_iter().collect();
-    vars.into_iter()
-        .map(|v| Symbol::new(Sort::Var(v).to_string()))
-        .collect()
+    vars.into_iter().collect()
 }
 
 /// In application order, without repeats.
