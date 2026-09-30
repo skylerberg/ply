@@ -1,0 +1,280 @@
+// The W6 ladder's in-process rungs: what one `/health` request costs in one process, each rung the
+// one below it plus one piece of the request path, through the language's own libraries over the
+// desk's shapes — its route table, its endpoint and its limits. Nothing here reaches a socket.
+//
+// It times itself and prints one JSON object: for each rung, the requests one round answers and the
+// microseconds each of `repeats` rounds took. `BENCH_ITERATIONS`, `BENCH_REPEATS` and
+// `BENCH_PER_CONN` are its settings.
+
+import std.config
+import std.config (config)
+import std.http
+import std.json
+import std.json (Json)
+import std.net (net)
+import std.process (process)
+import std.router
+import std.time (time)
+
+// --- The desk's shapes ----------------------------------------------------------------------
+
+fn head() -> Bytes = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+
+// The bounds `examples/desk.ply` runs under.
+fn limits() -> http::Limits =
+  {
+    max_request_line: 8192,
+    max_header_bytes: 16384,
+    max_header_count: 64,
+    max_body: 65536,
+    max_chunk_size: 65536,
+    max_chunk_line: 4096,
+    max_trailer_bytes: 4096,
+    max_keep_alive: 100,
+    max_stream_chunks: 1024,
+    header_timeout_ms: 5000,
+    idle_timeout_ms: 5000,
+    body_timeout_ms: 15000,
+    write_timeout_ms: 15000,
+    connect_timeout_ms: 5000,
+  }
+
+pub type Endpoint =
+  | Health
+  | Ready
+  | Docs
+  | ListItems
+  | Featured
+  | GetItem
+  | ListOrders
+  | PlaceOrder
+  | GetOrder
+  | CancelOrder
+  | Receipt
+
+fn route(method: http::Method, pattern: String, e: Endpoint) -> router::Route<Endpoint> =
+  { method: method, path: router::pattern_of_string(pattern), endpoint: e }
+
+fn get(pattern: String, e: Endpoint) -> router::Route<Endpoint> = route(http::Get, pattern, e)
+
+// Nullary, as the desk's is, so the constant memo builds it once.
+fn table() -> List<router::Route<Endpoint>> =
+  [
+    get("/health", Health),
+    get("/ready", Ready),
+    get("/docs/{..page}", Docs),
+    get("/items", ListItems),
+    get("/items/featured", Featured),
+    get("/items/{sku}", GetItem),
+    get("/orders", ListOrders),
+    route(http::Post, "/orders", PlaceOrder),
+    get("/orders/{id:Int}", GetOrder),
+    route(http::Delete, "/orders/{id:Int}", CancelOrder),
+    get("/orders/{id:Int}/receipt", Receipt),
+  ]
+
+fn route_of(method: http::Method, path: String) -> router::Matched<Endpoint> =
+  router::route(table(), method, path)
+
+pub type Health = { service: String, routes: Int }
+
+derive json for Health
+
+// Nullary, as the desk's is, so every request after the first reads it from the constant memo.
+fn health() -> http::Response =
+  {
+    status: 200,
+    headers: map_of_entries([{ key: "content-type", value: ["application/json"] }]),
+    body: json::encode_bytes({ service: "parts desk", routes: len(table()) }, health_json()),
+  }
+
+fn respond(method: http::Method, path: String) -> http::Response =
+  match route_of(method, path) {
+    router::Found(m) -> match m.endpoint {
+      Health -> health(),
+      _ -> http::text_response(501, "this bench serves /health\n"),
+    },
+    router::NotFound -> http::text_response(404, "no such route\n"),
+    router::MethodNotAllowed(ms) -> http::method_not_allowed(ms),
+  }
+
+// --- The rungs, each the one below it and one piece more --------------------------------------
+
+// The endpoint's response with the request's head parsed and the response encoded around it.
+fn framed(raw: Bytes, l: http::Limits) -> Bytes =
+  match http::parse_head(raw, l) {
+    http::Parsed(h) -> http::encode(h.request.method, h.request.version, h.keep_alive, health()),
+    _ -> b"",
+  }
+
+// The same with the path matched against the route table before the endpoint answers.
+fn routed(raw: Bytes, l: http::Limits) -> Bytes =
+  match http::parse_head(raw, l) {
+    http::Parsed(h) ->
+      http::encode(
+        h.request.method,
+        h.request.version,
+        h.keep_alive,
+        respond(h.request.method, h.request.path),
+      ),
+    _ -> b"",
+  }
+
+// One connection carrying `per_conn` requests through `std.http`'s serve loop, and then the peer's
+// close, every `net` operation answered by a clause here: the bytes it wrote.
+fn handled(raw: Bytes, l: http::Limits, per_conn: Int) -> Int =
+  with_cell[wire](0) { sent -> {
+    with_cell[heard](0) { read -> {
+      handle {
+        http::serve_connection[conn](7, l, |req: http::Request| respond(req.method, req.path))
+      } with {
+        net.recv[conn](c, max, timeout_ms) -> if cell_get(read) >= per_conn { Some(b"") } else {
+          cell_set(read, cell_get(read) + 1);
+          Some(raw)
+        },
+        net.send[conn](c, payload, timeout_ms) -> {
+          cell_set(sent, cell_get(sent) + bytes_len(payload));
+          Some(bytes_len(payload))
+        },
+        net.close[conn](c) -> (),
+      };
+      cell_get(sent)
+    } }
+  } }
+
+// --- The clock --------------------------------------------------------------------------
+
+// `n` calls of `body`, each result folded into the next so none is dead.
+fn spin<| e>(left: Int, acc: Int, body: (Int) -> Int / e) -> Int / e =
+  if left <= 0 { acc } else { spin(left - 1, acc + body(left), body) }
+
+fn timed<| e>(n: Int, body: (Int) -> Int / e) -> Int / {time.elapsed_us | e} = {
+  let started = time.elapsed_us();
+  let _ = observe(spin(n, 0, body));
+  time.elapsed_us() - started
+}
+
+// A rung as timed: `calls` bodies a round, and what each round took.
+pub type Rung = { name: String, what: String, requests: Int, runs_us: List<Int> }
+
+fn rung<| e>(
+  name: String,
+  what: String,
+  calls: Int,
+  per_call: Int,
+  repeats: Int,
+  body: (Int) -> Int / e,
+) -> Rung / {time.elapsed_us | e} =
+  {
+    name: name,
+    what: what,
+    requests: calls * per_call,
+    runs_us: map(range(0, repeats), |_r: Int| timed(calls, body)),
+  }
+
+fn rungs(n: Int, repeats: Int, per_conn: Int) -> List<Rung> / {time.elapsed_us} = {
+  let l = limits();
+  let raw = head();
+  let connections = if n / per_conn < 1 { 1 } else { n / per_conn };
+  [
+    rung("call", "the loop's body called and returned", n, 1, repeats, |i: Int| observe(i)),
+    rung(
+      "endpoint",
+      "the /health endpoint's response, which the constant memo holds",
+      n,
+      1,
+      repeats,
+      |i: Int| bytes_len(observe(health()).body),
+    ),
+    rung(
+      "framing",
+      "the head parsed and the response encoded around the endpoint",
+      n,
+      1,
+      repeats,
+      |i: Int| bytes_len(framed(observe(raw), l)),
+    ),
+    rung(
+      "routing",
+      "the path matched against the route table before the endpoint answers",
+      n,
+      1,
+      repeats,
+      |i: Int| bytes_len(routed(observe(raw), l)),
+    ),
+    rung(
+      "machine",
+      "connections through std.http's serve loop, each net operation a handler clause",
+      connections,
+      per_conn,
+      repeats,
+      |i: Int| handled(observe(raw), l, per_conn),
+    ),
+  ]
+}
+
+// --- The report ------------------------------------------------------------------------
+
+fn number(n: Int) -> Json = json::Number(decimal_of_int(n))
+
+pub fn report(n: Int, repeats: Int, per_conn: Int, rs: List<Rung>) -> Json =
+  json::object([
+    { key: "iterations", value: number(n) },
+    { key: "repeats", value: number(repeats) },
+    { key: "per_conn", value: number(per_conn) },
+    {
+      key: "rungs",
+      value: json::array(
+        map(rs, |one: Rung|
+          json::object([
+            { key: "name", value: json::Str(one.name) },
+            { key: "what", value: json::Str(one.what) },
+            { key: "requests", value: number(one.requests) },
+            { key: "runs_us", value: json::array(map(one.runs_us, |us: Int| number(us))) },
+          ])),
+      ),
+    },
+  ])
+
+fn setting(key: String, fallback: Int) -> Int / {config.get[bench]} =
+  match config.get[bench](key) {
+    None -> fallback,
+    Some(text) -> match router::int_of_text(text) {
+      Some(n) -> if n > 0 { n } else { fallback },
+      None -> panic(key ++ " is `" ++ text ++ "`, which is not a number"),
+    },
+  }
+
+fn main() -> Unit / {config.get[bench], time.elapsed_us, process.out[proc]} = {
+  let n = setting("BENCH_ITERATIONS", 2000);
+  let repeats = setting("BENCH_REPEATS", 3);
+  let per_conn = setting("BENCH_PER_CONN", 32);
+  process.out[proc](json::to_string(report(n, repeats, per_conn, rungs(n, repeats, per_conn))))
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+test "every rung answers /health 200, and a connection's requests are answered alike" {
+  let l = limits();
+  let one = routed(head(), l);
+  assert(bytes_starts_with(one, b"HTTP/1.1 200 OK\r\n"));
+  assert(bytes_index_of(one, b"{\"routes\":11,\"service\":\"parts desk\"}") != None);
+  assert_eq(framed(head(), l), one);
+  assert_eq(handled(head(), l, 3), 3 * bytes_len(one))
+}
+
+test "the table is the desk's: eleven routes, none of them in conflict" {
+  assert_eq(len(table()), 11);
+  assert_eq(router::conflicts(table()), [])
+}
+
+test "the report carries each rung's requests and rounds under its name" {
+  let written = json::to_string(
+    report(10, 2, 5, [{ name: "machine", what: "a connection", requests: 10, runs_us: [7, 5] }]),
+  );
+  assert(string_contains(written, "\"iterations\":10"));
+  assert(string_contains(written, "\"per_conn\":5"));
+  assert(string_contains(written, "\"name\":\"machine\""));
+  assert(string_contains(written, "\"requests\":10"));
+  assert(string_contains(written, "\"runs_us\":[7,5]"))
+}

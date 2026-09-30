@@ -411,11 +411,12 @@ fn the_client_answers_scram_and_checks_the_servers_proof() {
 }
 
 /// A real cluster, whose TCP connections are configured to demand a password, so the handshake
-/// is SCRAM against postgres rather than against a script. Skipped where `initdb` is absent.
+/// is SCRAM against postgres rather than against a script. Skipped where postgres is not installed,
+/// except under CI, where that fails.
 #[test]
 fn the_client_speaks_scram_to_a_real_server() {
     if !crate::support::cluster::available() {
-        eprintln!("skipping: this machine has no initdb and postgres");
+        eprintln!("skipping: postgres is not installed here");
         return;
     }
     let cluster = crate::support::cluster::Cluster::start_with_password("ply", "pencil");
