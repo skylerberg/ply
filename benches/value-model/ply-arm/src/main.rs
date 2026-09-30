@@ -105,8 +105,8 @@ fn load(dir: &str) -> &'static Source {
             .to_string();
         modules.push((stem, std::fs::read_to_string(&path).expect("readable")));
     }
-    let ids: Vec<ply_span::SourceId> = (0..modules.len())
-        .map(|i| ply_span::SourceId(i as u32))
+    let ids: Vec<ply_eval::SourceId> = (0..modules.len())
+        .map(|i| ply_eval::SourceId(i as u32))
         .collect();
     let front = Box::leak(Box::new(
         ply_codegen::c::producer::checked_front(&modules, &ids).expect("the project checks"),

@@ -1,4 +1,4 @@
-use ply_ty::DefHash;
+use ply_eval::DefHash;
 
 #[test]
 fn hex_round_trips_and_short_is_a_prefix() {

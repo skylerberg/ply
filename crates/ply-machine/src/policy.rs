@@ -4,8 +4,7 @@
 
 use crate::hosts::Lent;
 use crate::tester::TestOptions;
-use ply_span::{Diagnostic, Span, codes};
-use ply_ty::CheckOutput;
+use ply_eval::{CheckOutput, Diagnostic, Span, codes};
 
 /// One family of capabilities, and what lending it lets a program do.
 pub struct Family {

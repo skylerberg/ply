@@ -1,4 +1,28 @@
-use ply_span::{Diagnostic, Edit, SourceMap, Span, codes};
+use ply_eval::{Diagnostic, Edit, SourceMap, Span, codes};
+
+#[test]
+fn line_col_is_one_based_and_char_counted() {
+    let mut sm = SourceMap::new();
+    let id = sm.add("t.ply", "abc\nlét x = 1\n");
+    let f = sm.get(id).unwrap();
+    assert_eq!(f.line_col(0), (1, 1));
+    assert_eq!(f.line_col(4), (2, 1));
+    // `é` is two bytes; the column after it is still counted in chars.
+    assert_eq!(f.line_col(7), (2, 3));
+}
+
+#[test]
+fn a_span_is_bounded_by_its_texts_length_alone() {
+    let mut sm = SourceMap::new();
+    let id = sm.add("t.ply", "fn f() = \"é\"\n");
+    for outside in [Span::new(id, 21, 26), Span::new(id, 5, 2)] {
+        assert!(sm.containing(outside).is_none());
+        assert_eq!(sm.snippet(outside), "");
+    }
+    let halved = Span::new(id, 11, 12);
+    assert!(sm.containing(halved).is_some());
+    assert_eq!(sm.snippet(halved), "\u{fffd}");
+}
 
 /// What `ply` prints for a failure no program is there to render: the heading, a line per note and
 /// per fix, and no label, since nothing holds the source a label points into.

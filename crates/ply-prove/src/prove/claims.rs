@@ -1,10 +1,7 @@
 //! `front.ply`'s `claims` read back: each `fn` body, clause and law as `code.ply` lowers it.
 
-use ply_eval::IntTy;
 use ply_eval::decode::{At, Ctor, Error};
-use ply_eval::{BinOp, Lit, UnOp};
-use ply_span::{SourceId, Span, Symbol};
-use ply_ty::SpecKind;
+use ply_eval::{BinOp, IntTy, Lit, SourceId, Span, SpecKind, Symbol, UnOp};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const NO_MODULE: u32 = u32::MAX;

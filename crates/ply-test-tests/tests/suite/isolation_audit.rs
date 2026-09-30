@@ -3,11 +3,9 @@
 //! other. How atoms become classes is the program's, and its tests pin it.
 
 use crate::fixture::Compiled;
-use ply_eval::{TaskRegions, Value};
-use ply_span::SourceId;
+use ply_eval::{Footprint, SourceId, TaskRegions, Value};
 use ply_store::Store;
 use ply_test::{GroupRegion, Selection};
-use ply_ty::Footprint;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,7 +37,7 @@ impl Drop for TempRoot {
 }
 
 impl Compiled {
-    fn rejected(src: &str) -> Vec<ply_span::Diagnostic> {
+    fn rejected(src: &str) -> Vec<ply_eval::Diagnostic> {
         crate::fixture::port_diagnostics(&[(String::new(), src.to_string())], &[SourceId(0)])
     }
 }
@@ -328,7 +326,7 @@ impl ply_test::Executor for FixtureProbe {
         })
     }
 
-    fn execute(&self, region: &mut GroupRegion, index: usize) -> Result<(), ply_span::Diagnostic> {
+    fn execute(&self, region: &mut GroupRegion, index: usize) -> Result<(), ply_eval::Diagnostic> {
         let (mut stack, handle) = region.open();
         let seed = match handle {
             Value::Cell(slot) => slot,

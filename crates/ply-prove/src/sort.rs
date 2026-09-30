@@ -1,7 +1,7 @@
 //! What the prover reasons a value's type with, as `proof.world` hands one over.
 
+use ply_eval::Symbol;
 use ply_eval::decode::{At, Error};
-use ply_span::Symbol;
 use std::fmt;
 
 /// A type as the prover reads one. A variable is numbered by where it first appears in the item it

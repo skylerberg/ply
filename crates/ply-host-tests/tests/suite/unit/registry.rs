@@ -1,6 +1,6 @@
+use ply_eval::codes;
 use ply_eval::host::{Determinism, Linearity, Pending};
 use ply_host::{Host, registry};
-use ply_span::codes;
 
 #[test]
 fn the_trusted_computing_base_declares_everything_it_must() {

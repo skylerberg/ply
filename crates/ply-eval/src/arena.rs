@@ -1,7 +1,7 @@
 //! The region allocator: a bump arena whose scopes are the program's regions.
 
+use crate::Span;
 use crate::value::Value;
-use ply_span::Span;
 use std::fmt;
 
 pub const CHUNK: usize = 256;

@@ -216,7 +216,7 @@ impl Heap {
         ply_eval::rc::note_update_of(
             in_place,
             if in_place { 0 } else { n },
-            ply_span::Span::DUMMY,
+            ply_eval::Span::DUMMY,
         );
         if !is_unique(xs) || (n == cap(o) && n < WIDTH) {
             let room = if n == cap(o) {
@@ -276,7 +276,7 @@ impl Heap {
         let old = unsafe { word_at(node, at) };
         unsafe { set_word(node, at, v) };
         dec(old);
-        ply_eval::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), ply_span::Span::DUMMY);
+        ply_eval::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), ply_eval::Span::DUMMY);
         o as Word
     }
 

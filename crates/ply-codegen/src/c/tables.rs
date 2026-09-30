@@ -4,8 +4,7 @@
 
 use super::cache::encode_const;
 use crate::heap::Layouts;
-use ply_eval::{Builtin, Value};
-use ply_span::Symbol;
+use ply_eval::{Builtin, Symbol, Value};
 use std::collections::HashMap;
 
 /// What the emitter named one definition's C: the function its callers write and the entry the

@@ -1,7 +1,5 @@
-use ply_eval::{Exploration, Naive};
-use ply_span::Symbol;
+use ply_eval::{DefHash, EffectAtom, Exploration, Footprint, Mode, Naive, Resource, Symbol};
 use ply_test::sim::{Record, is_seeded, record_under};
-use ply_ty::{DefHash, EffectAtom, Footprint, Mode, Resource};
 
 fn hash(byte: u8) -> DefHash {
     DefHash([byte; 32])

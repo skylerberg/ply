@@ -58,7 +58,7 @@ pub(crate) fn decode_slot(bytes: &[u8]) -> Decoded<Slot> {
     Ok(Slot { name, value })
 }
 
-pub(crate) fn peek_slot_name(bytes: &[u8]) -> Decoded<ply_span::Symbol> {
+pub(crate) fn peek_slot_name(bytes: &[u8]) -> Decoded<ply_eval::Symbol> {
     const WHAT: &str = "malformed slot";
     let mut r = Reader::new(bytes);
     r.tag(tag::SLOT, WHAT)?;

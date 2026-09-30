@@ -1,7 +1,6 @@
 use crate::counting::charge;
-use ply_eval::Value;
 use ply_eval::arena::{Arena, RegionKind};
-use ply_span::Span;
+use ply_eval::{Span, Value};
 use rpds::RedBlackTreeMap;
 
 fn counted<R>(f: impl FnOnce() -> R) -> (usize, usize, R) {

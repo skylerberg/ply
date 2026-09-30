@@ -6,9 +6,7 @@ use super::tables::{Defined, Tables};
 use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::decode::{self, At};
-use ply_eval::{Fields, Value};
-use ply_span::{Diagnostic, Severity, SourceId, Symbol, codes};
-use ply_ty::{DefHash, Front};
+use ply_eval::{DefHash, Diagnostic, Fields, Front, Severity, SourceId, Symbol, Value, codes};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -279,7 +277,7 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
 
 /// The error with its place: the module, the line and column of its primary label, and what the
 /// label says, since nothing else about the emitter's own sources reaches a reader.
-fn placed(error: &ply_span::Diagnostic, modules: &[(String, String)]) -> String {
+fn placed(error: &ply_eval::Diagnostic, modules: &[(String, String)]) -> String {
     let mut out = error.message.clone();
     if let Some(label) = error
         .labels

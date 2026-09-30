@@ -14,10 +14,11 @@ use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, ctor, diags_value, option, places_value, record, strings};
 use crate::support::{build_pool, enter_constant, prover_backend};
-use ply_eval::Value as PlyValue;
-use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
+};
+use ply_eval::{
+    CheckOutput, DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes,
 };
 use ply_prove::domain::Shape;
 use ply_prove::property::{GenStream, generate};
@@ -26,12 +27,9 @@ use ply_prove::{
     Binder, Discharge, Evidence, Gap, Obligation, ProvePlan, ProveReport, Tier, Vacuity,
     VacuityKind, World,
 };
-use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_store::ReviewRecord;
 use ply_store::Store;
 use ply_test::obligation::{self, from_cached, to_cached};
-use ply_ty::CheckOutput;
-use ply_ty::DefHash;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -912,7 +910,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                 let answers: Vec<Option<String>> = keys
                     .iter()
                     .map(|key| {
-                        let entry = ply_ty::DefHash::from_hex(key)
+                        let entry = ply_eval::DefHash::from_hex(key)
                             .and_then(|hash| store.obligation(hash))?;
                         Some(match from_cached(&entry) {
                             Ok(Evidence::Proof(_)) => "proof".to_string(),
@@ -1088,7 +1086,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
 fn load(job: &Job) -> Result<Loaded, LoadError> {
     let Some(front) = &job.front else {
         return Err(LoadError {
-            sources: ply_span::SourceMap::new(),
+            sources: ply_eval::SourceMap::new(),
             diagnostics: vec![
                 Diagnostic::error(
                     codes::INTERNAL_ERROR,
@@ -1291,7 +1289,7 @@ struct Accepted {
 }
 
 /// Every definition in scope, in name order, with its hash and its own clauses' spec text.
-fn defs_of(scoped: &CheckOutput, hashes: &ply_ty::HashOutput) -> Vec<Def> {
+fn defs_of(scoped: &CheckOutput, hashes: &ply_eval::HashOutput) -> Vec<Def> {
     scoped
         .defs
         .keys()
@@ -1305,7 +1303,7 @@ fn defs_of(scoped: &CheckOutput, hashes: &ply_ty::HashOutput) -> Vec<Def> {
 
 /// Every law in scope the front end hashed: the hash of its text, or of the law when its text has
 /// none, and every name it mentions.
-fn laws_of(scoped: &CheckOutput, hashes: &ply_ty::HashOutput) -> Vec<Written> {
+fn laws_of(scoped: &CheckOutput, hashes: &ply_eval::HashOutput) -> Vec<Written> {
     scoped
         .laws
         .iter()
@@ -1476,7 +1474,7 @@ fn evidence_value(evidence: &Evidence) -> PlyValue {
                 ("guard_satisfiable", PlyValue::Bool(c.guard_satisfiable)),
                 (
                     "sorts",
-                    strings(c.sorts.iter().map(ply_span::Symbol::as_str)),
+                    strings(c.sorts.iter().map(ply_eval::Symbol::as_str)),
                 ),
             ])],
         ),

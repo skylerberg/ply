@@ -1,8 +1,7 @@
 //! The program a unit compiles out of: the front end's answer over it, and each module's text.
 //! Every table here is read from a [`Front`].
 
-use ply_span::{SourceId, SourceMap, Span, Symbol};
-use ply_ty::Front;
+use ply_eval::{Front, SourceId, SourceMap, Span, Symbol};
 use std::collections::{HashMap, HashSet};
 use std::sync::{PoisonError, RwLock};
 

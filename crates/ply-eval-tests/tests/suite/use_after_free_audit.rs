@@ -1,7 +1,6 @@
 use crate::fixture::Compiled;
-use ply_eval::Value;
 use ply_eval::arena::{Arena, Reclaim, RegionKind, Slot, Stats};
-use ply_span::{Diagnostic, Span, codes};
+use ply_eval::{Diagnostic, Span, Value, codes};
 
 #[track_caller]
 fn refused(src: &str) -> Vec<Diagnostic> {
