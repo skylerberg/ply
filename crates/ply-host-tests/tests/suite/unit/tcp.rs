@@ -789,9 +789,10 @@ fn the_script_refuses_to_answer_for_a_token() {
         label: "recv",
     };
     assert_eq!(
-        net.poll(&stray).expect_err("not its token").code,
+        net.watch(&stray).expect_err("not its token").code,
         codes::INTERNAL_ERROR
     );
+    assert!(net.resolved().is_empty(), "the twin resolves nothing");
     assert_eq!(
         net.park().expect_err("nothing to wait for").code,
         codes::INTERNAL_ERROR

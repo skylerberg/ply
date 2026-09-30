@@ -59,11 +59,23 @@ impl HostHandler for Answers {
 }
 
 /// A runtime whose tokens are already resolved.
-struct Resolved7;
+#[derive(Default)]
+struct Resolved7 {
+    watched: std::cell::RefCell<Vec<u64>>,
+}
 
 impl HostRuntime for Resolved7 {
-    fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
-        Ok(Some(Value::Int(7)))
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        self.watched.borrow_mut().push(pending.token);
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        self.watched
+            .take()
+            .into_iter()
+            .map(|token| (token, Ok(Value::Int(7))))
+            .collect()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
@@ -391,7 +403,7 @@ test/nondet "a socket under a seed" {
 
         let mut machine = compiled.machine_on_tier();
         machine.set_host_binding(Arc::new(binding));
-        machine.set_host_runtime(std::rc::Rc::new(Resolved7));
+        machine.set_host_runtime(std::rc::Rc::new(Resolved7::default()));
         let d = diagnostic(machine.eval_test(0));
         assert_eq!(
             d.code,
@@ -640,7 +652,7 @@ test/nondet "waits" {
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.set_host_runtime(std::rc::Rc::new(Resolved7));
+    machine.set_host_runtime(std::rc::Rc::new(Resolved7::default()));
     machine.eval_test(0).expect("the token resolves");
     assert_eq!(machine.host_ops(), 1);
 }
@@ -804,15 +816,28 @@ fn a_task_pending_on_a_host_token_parks_and_the_others_run() {
         }
     }
 
-    /// Resolves only on the second poll.
+    /// Hands its token back only the second time it is asked.
+    #[derive(Default)]
     struct Later {
-        polls: AtomicU64,
+        watched: std::cell::RefCell<Vec<u64>>,
+        asked: AtomicU64,
     }
 
     impl HostRuntime for Later {
-        fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
-            let n = self.polls.fetch_add(1, Ordering::SeqCst);
-            Ok((n > 0).then_some(Value::Int(5)))
+        fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+            self.watched.borrow_mut().push(pending.token);
+            Ok(())
+        }
+
+        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+            if self.asked.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Vec::new();
+            }
+            self.watched
+                .take()
+                .into_iter()
+                .map(|token| (token, Ok(Value::Int(5))))
+                .collect()
         }
 
         fn park(&self) -> Result<(), Diagnostic> {
@@ -846,9 +871,7 @@ test/nondet "the sibling runs while one task waits" {
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.set_host_runtime(std::rc::Rc::new(Later {
-        polls: AtomicU64::new(0),
-    }));
+    machine.set_host_runtime(std::rc::Rc::new(Later::default()));
     machine.eval_test(0).expect("both tasks finish");
     assert_eq!(
         machine.host_use().expect("reached the host").operations,
@@ -875,13 +898,27 @@ fn two_tasks_parked_on_the_host_keep_their_cells_when_the_older_region_closes_fi
 
     /// Resolves nothing until the scheduler parks, then everything, so the tasks wake together
     /// and run in spawn order.
+    #[derive(Default)]
     struct AfterPark {
+        watched: std::cell::RefCell<Vec<u64>>,
         parked: AtomicBool,
     }
 
     impl HostRuntime for AfterPark {
-        fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
-            Ok(self.parked.load(Ordering::SeqCst).then_some(Value::Int(5)))
+        fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+            self.watched.borrow_mut().push(pending.token);
+            Ok(())
+        }
+
+        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+            if !self.parked.load(Ordering::SeqCst) {
+                return Vec::new();
+            }
+            self.watched
+                .take()
+                .into_iter()
+                .map(|token| (token, Ok(Value::Int(5))))
+                .collect()
         }
 
         fn park(&self) -> Result<(), Diagnostic> {
@@ -928,9 +965,7 @@ test/nondet "each task reads its cell after the other's region closed" {
 
     let (mut machine, tier) = compiled.machine_and_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.set_host_runtime(std::rc::Rc::new(AfterPark {
-        parked: AtomicBool::new(false),
-    }));
+    machine.set_host_runtime(std::rc::Rc::new(AfterPark::default()));
     machine
         .eval_test(0)
         .expect("both tasks read their own cells");
@@ -975,6 +1010,83 @@ test/nondet "the task first runs after the handle around its spawn ended" {
     );
 }
 
+/// Under `--host`, bound so that `task` opens a production region.
+fn tasks_bound(source: &str) -> ply_eval::Machine<'static> {
+    let compiled: &'static Compiled = Box::leak(Box::new(Compiled::named("t", source)));
+    let binding = task_registry(Arc::new(Counter::default()))
+        .bind(&compiled.front.check)
+        .expect("binds");
+    let mut machine = compiled.machine_on_tier();
+    machine.set_host_binding(Arc::new(binding));
+    machine
+}
+
+/// Tasks retire as they finish unheld, and a retired id is never reused, so no join lands on
+/// another task's answer.
+#[test]
+fn hundreds_of_tasks_come_and_go_and_every_join_answers_its_own_task() {
+    let mut machine = tasks_bound(
+        r#"
+fn churn(n: Int) -> Int / {task.write} =
+  fold(range(0, n), 0, |sum: Int, i: Int| {
+    task.spawn(|| i);
+    let t = task.spawn(|| i * 2);
+    task.yield();
+    sum + task.join(t)
+  })
+
+test/nondet "every join answers its own task" {
+  assert_eq(churn(300), 89700)
+}
+"#,
+    );
+    machine
+        .eval_test(0)
+        .expect("each join answers its own task");
+}
+
+#[test]
+fn a_task_whose_handle_the_program_keeps_answers_every_join() {
+    let mut machine = tasks_bound(
+        r#"
+fn kept(n: Int) -> Int / {task.write} = {
+  let held = fold(range(0, n), [], |tasks: List<Task<Int>>, i: Int| push(tasks, task.spawn(|| i)));
+  task.yield();
+  fold(held, 0, |sum: Int, t: Task<Int>| sum + task.join(t) + task.join(t))
+}
+
+test/nondet "every join of a kept task answers" {
+  assert_eq(kept(40), 1560)
+}
+"#,
+    );
+    machine
+        .eval_test(0)
+        .expect("each kept task answers both joins");
+}
+
+/// A finished task's answer can hold another task's last handle, which keeps that task joinable.
+#[test]
+fn a_handle_inside_a_finished_tasks_answer_keeps_its_task() {
+    let mut machine = tasks_bound(
+        r#"
+fn relayed() -> Int / {task.write} = {
+  let outer = task.spawn(|| task.spawn(|| 21));
+  task.yield();
+  task.yield();
+  let inner = task.join(outer);
+  task.yield();
+  task.join(inner) * 2
+}
+
+test/nondet "the relayed task stays joinable" {
+  assert_eq(relayed(), 42)
+}
+"#,
+    );
+    machine.eval_test(0).expect("the relayed task answers");
+}
+
 #[test]
 fn a_pending_outside_a_region_blocks_the_one_thread_it_is_allowed_to() {
     let compiled = Compiled::named(
@@ -996,6 +1108,6 @@ test/nondet "one operation, no tasks" {
     let binding = registry.bind(&compiled.front.check).expect("binds");
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.set_host_runtime(std::rc::Rc::new(Resolved7));
+    machine.set_host_runtime(std::rc::Rc::new(Resolved7::default()));
     machine.eval_test(0).expect("block_on answers");
 }

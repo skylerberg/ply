@@ -36,7 +36,10 @@ impl Counting {
 struct NoRuntime;
 
 impl HostRuntime for NoRuntime {
-    fn poll(&self, _: &Pending) -> Result<Option<ply_eval::Value>, Diagnostic> {
+    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+        unreachable!("nothing here answers `Pending`")
+    }
+    fn resolved(&self) -> Vec<(u64, Result<ply_eval::Value, Diagnostic>)> {
         unreachable!("nothing here answers `Pending`")
     }
     fn park(&self) -> Result<(), Diagnostic> {
@@ -388,6 +391,86 @@ fn teardown_closes_what_the_program_left_open_and_reports_w0609() {
     assert!(
         f.trace.end_entry_point(f.machine).is_none(),
         "a second teardown has nothing to close"
+    );
+}
+
+/// A task that finished with a span open can never close it, so its retirement does.
+#[test]
+fn a_retired_task_writes_the_spans_it_left_open_as_abandoned() {
+    let f = fixture();
+    let task = TaskId(3);
+    for (at, name) in [("http", "request"), ("db", "query")] {
+        f.as_task(
+            Some(task),
+            Op::Enter,
+            at,
+            vec![ply_eval::Value::str(name), no_fields()],
+        )
+        .unwrap_or_else(|d| panic!("{d:?}"));
+    }
+    enter(&f, "http", "serve");
+
+    f.trace.end_task(f.machine, task);
+    let records = f.records();
+    assert_eq!(
+        f.kinds(),
+        [
+            Kind::Enter,
+            Kind::Enter,
+            Kind::Enter,
+            Kind::Exit,
+            Kind::Exit
+        ]
+    );
+    assert_eq!(records[3].name, "query", "innermost first");
+    assert_eq!(records[4].name, "request");
+    assert!(records[3..].iter().all(|r| r.outcome == Outcome::Abandoned));
+    assert_eq!(
+        f.trace.open_spans(),
+        1,
+        "the entry point's own span stays open"
+    );
+    assert_eq!(
+        f.trace.span_owners(),
+        1,
+        "the retired task's stack went with it"
+    );
+}
+
+/// Leaving a span open is the same mistake in a task as in the entry point, whenever it closes.
+#[test]
+fn a_retired_tasks_open_span_is_still_reported_as_w0609_when_the_entry_point_ends() {
+    let f = fixture();
+    f.as_task(
+        Some(TaskId(3)),
+        Op::Enter,
+        "db",
+        vec![ply_eval::Value::str("query"), no_fields()],
+    )
+    .unwrap_or_else(|d| panic!("{d:?}"));
+    f.trace.end_task(f.machine, TaskId(3));
+    assert_eq!(f.trace.open_spans(), 0);
+
+    let warning = f
+        .trace
+        .end_entry_point(f.machine)
+        .expect("the retired task's span is reported");
+    assert_eq!(warning.code, codes::SPAN_ABANDONED);
+    assert!(
+        warning.message.contains(
+            "1 span was still open when its task or the entry point ended: `query` on `db`"
+        ),
+        "{}",
+        warning.message
+    );
+    assert_eq!(
+        f.kinds(),
+        [Kind::Enter, Kind::Exit],
+        "written once, at retirement"
+    );
+    assert!(
+        f.trace.end_entry_point(f.machine).is_none(),
+        "reported once"
     );
 }
 

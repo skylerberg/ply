@@ -88,9 +88,11 @@ fn a_secret_is_not_a_place_to_hide_a_handle_and_its_shape_stays_redacted() {
 #[test]
 fn a_task_and_a_continuation_are_handles_too() {
     assert_eq!(
-        carries(&Value::Task(ply_eval::sim::TaskId(0)))
-            .expect("a task is a handle")
-            .handle,
+        carries(&Value::Task(ply_eval::TaskHandle::unowned(
+            ply_eval::sim::TaskId(0)
+        )))
+        .expect("a task is a handle")
+        .handle,
         Handle::Task
     );
 }
