@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 pub fn ply() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ply")
@@ -37,6 +38,45 @@ pub fn delegated(dir: &Path, args: &[&str]) -> Output {
         &[format!("--exec=executor={}", executor().display())],
         args,
     )
+}
+
+/// The same, with the floor a served subcommand compares the desk with built and bound as
+/// `benches/corpus.sh` binds it, and named in `CORPUS_BOUND` as that script names it.
+pub fn served(dir: &Path, args: &[&str]) -> Output {
+    run(
+        dir,
+        &[
+            format!("--exec=http_floor={}", floor().display()),
+            "--set".to_string(),
+            "CORPUS_BOUND=http_floor".to_string(),
+        ],
+        args,
+    )
+}
+
+/// `benches/http-floor/floor.c`, compiled once a test process beside the `ply` the tests run.
+fn floor() -> &'static Path {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let built = ply().with_file_name("http-floor");
+        // Renamed into place, so another test process never starts a half-written binary.
+        let staged = built.with_file_name(format!("http-floor.{}", std::process::id()));
+        let out = Command::new("cc")
+            .arg("-O2")
+            .arg("-o")
+            .arg(&staged)
+            .arg(repo().join("benches/http-floor/floor.c"))
+            .arg("-lpthread")
+            .output()
+            .expect("`cc` starts");
+        assert!(
+            out.status.success(),
+            "compiling the floor failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::rename(&staged, &built).expect("the floor moves into place");
+        built
+    })
 }
 
 fn run(dir: &Path, grants: &[String], args: &[&str]) -> Output {
