@@ -2631,5 +2631,5 @@ and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
 `relay.ply` (one forwarder generic over the label it writes under);
 `store.ply` (a handler as a capability grant); `agreement.ply` and
 `twin_divergence_audit.ply` (`std.db`'s twin against recorded PostgreSQL
-answers); `desk.ply` (a PostgreSQL service with TLS, config, tracing and
-shutdown).
+answers); `desk.ply` (a service over PostgreSQL or its in-memory twin, whose
+store, TLS and accept loop are configuration, with tracing and shutdown).
