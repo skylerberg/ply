@@ -449,7 +449,8 @@ impl Op {
     /// Labelled by the program `--exec` bound rather than by the run's own process.
     pub fn names_an_executable(self) -> bool {
         match self {
-            Op::Spawn
+            Op::Bound
+            | Op::Spawn
             | Op::Start
             | Op::Wait
             | Op::Signal

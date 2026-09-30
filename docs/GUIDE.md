@@ -1368,9 +1368,10 @@ consumed and two readers of one input race for it), and `exit` ends the program
 there: nothing after it runs, no value is
 printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). These
 are bound only by `ply run --host`; `ply test` withholds them, even with
-`--host` (`E0424`). The operations whose label is an executable — `spawn`,
-`start` and those on a started child — are bound by `ply test --host` too, for
-the labels `--exec` names. Under `ply run --json` the lines `out` writes go to
+`--host` (`E0424`). The operations whose label is an executable — `bound`,
+`spawn`, `start` and those on a started child — are bound by `ply test --host`
+too: a label `--exec` does not name is unbound (`E0456`), and `bound` answers
+`false` for it. Under `ply run --json` the lines `out` writes go to
 stderr, so stdout still carries the one object. Handle it over a `Captured`
 value: `captured(args)`, `args_step`, `out_step`, `err_step`, `line_step` and `exit_step` keep each line,
 hand out `with_input`'s scripted input lines, and the first exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
@@ -2208,8 +2209,9 @@ always runs and is never cached. An operation performed inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
-test run binds `process.spawn`, `process.start` and the operations on a started
-child for the labels `--exec` names. All flags below require `--host`.
+test run binds `process.bound`, `process.spawn`, `process.start` and the
+operations on a started child, which reach only the programs `--exec` names. All
+flags below require `--host`.
 
 `ply hosts` lists every bindable operation (`effect.op[resource]`: one row per
 operation and label some row of the program names, where a written mode atom
