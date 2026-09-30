@@ -533,11 +533,7 @@ fn an_immortal_word_survives_the_end_of_every_entry_and_counts_nothing() {
     );
 }
 
-/// A continuation's captures are immediates, so only its code tells the memo it names a body its
-/// entry alone holds; an ordinary closure over an immediate is kept.
-#[test]
-fn a_continuation_however_deep_in_a_word_leaves_it_to_its_entry() {
-    const NESTED: &str = r#"
+const NESTED: &str = r#"
 effect amb { read flip[coin]() -> Bool }
 
 type Saved = Nothing | Just((Bool) -> Int)
@@ -555,22 +551,77 @@ pub fn continuation_inside() -> { saved: List<Saved> } = { saved: [Nothing, park
 pub fn closure_inside(n: Int) -> { saved: List<Saved> } =
   { saved: [Nothing, Just(|b: Bool| if b { n } else { 0 })] }
 "#;
+
+/// `NESTED`'s two entries, and whether each answer holds a continuation.
+fn nested_cases() -> [(&'static str, Vec<Word>, bool); 2] {
+    [
+        ("m.continuation_inside", Vec::new(), true),
+        ("m.closure_inside", vec![imm(41)], false),
+    ]
+}
+
+/// A continuation's captures are immediates, so only its code tells the memo it names a body its
+/// entry alone holds; an ordinary closure over an immediate is kept.
+#[test]
+fn a_continuation_however_deep_in_a_word_leaves_it_to_its_entry() {
     let Some((_source, native)) = super::c::tests_support::unit(NESTED) else {
         return;
     };
-    let cases: [(&str, &[Word], bool); 2] = [
-        ("m.continuation_inside", &[], false),
-        ("m.closure_inside", &[imm(41)], true),
-    ];
     let mut ctx = native.context();
-    for (name, args, independent) in cases {
+    for (name, args, continuation) in nested_cases() {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` compiled"));
         ctx.begin(10_000);
         let out = unsafe { entry(&mut ctx, args.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}`: {:?}", ctx.diagnostic);
-        assert_eq!(world_independent(out), independent, "`{name}`");
+        assert_eq!(world_independent(out), !continuation, "`{name}`");
+        ctx.end();
+    }
+}
+
+/// The conversion out of the heap is where a continuation stops being told apart by its code, so
+/// the value it makes says so to the escape check and the memo, and goes on saying so back through
+/// a word and through a bridge.
+#[test]
+fn a_continuation_word_converts_to_a_value_that_says_it_is_one() {
+    let Some((_source, native)) = super::c::tests_support::unit(NESTED) else {
+        return;
+    };
+    let layouts = &native.tables().layouts;
+    let mut ctx = native.context();
+    for (name, args, continuation) in nested_cases() {
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` compiled"));
+        ctx.begin(10_000);
+        let out = unsafe { entry(&mut ctx, args.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}`: {:?}", ctx.diagnostic);
+        let value = Heap::to_value(layouts, out);
+        let rebuilt = ctx.heap.to_word(layouts, &value);
+        assert_eq!(
+            world_independent(rebuilt),
+            !continuation,
+            "`{name}` rebuilt"
+        );
+        let again = Heap::to_value(layouts, rebuilt);
+        let bridged = Heap::to_value(layouts, ctx.heap.bridge(value.clone()));
+        for (path, v) in [
+            ("converted", &value),
+            ("rebuilt", &again),
+            ("bridged", &bridged),
+        ] {
+            assert_eq!(
+                ply_eval::escape::carries(v).map(|found| found.handle),
+                continuation.then_some(ply_eval::escape::Handle::Continuation),
+                "`{name}` {path}: {v:?}"
+            );
+            assert_eq!(
+                ply_eval::memo::world_independent(v),
+                !continuation,
+                "`{name}` {path}"
+            );
+        }
         ctx.end();
     }
 }

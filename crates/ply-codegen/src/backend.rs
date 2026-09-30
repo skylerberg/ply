@@ -66,7 +66,7 @@ pub struct Declines {
     pub reentered: u64,
     /// A builtin touched cells, so the compile-time refusal of `cell_get`/`cell_set` has a hole.
     pub touched_cells: u64,
-    /// The answer held a closure, cell, task, continuation or secret, which cannot cross out.
+    /// The answer held a closure or a secret, which cannot cross out; a handle raises `E0449`.
     pub answer: u64,
     /// The answer held an `Int` word where neither its type nor the arguments say whether it is
     /// an `Int` or a width, or one that is no value of the width its type says.
@@ -285,6 +285,14 @@ impl ply_eval::Compiled for Absent {
     }
 }
 
+/// What an entry leaves for the machine to read after it, all of it from the body it ran.
+#[derive(Default)]
+struct LastEntry {
+    steps: u64,
+    record: Option<ply_eval::region::Record>,
+    performed: Vec<ply_eval::EffectAtom>,
+}
+
 /// One worker's compiled bodies, offered to a `Machine` through `ply_eval::Compiled`.
 pub struct Bodies {
     unit: &'static Unit,
@@ -295,6 +303,8 @@ pub struct Bodies {
     ctx: RefCell<crate::rt::Ctx>,
     entered: Cell<u64>,
     declines: Cell<Declines>,
+    /// `run` clears it first, so an entry no body ran for reports none of the one before it.
+    last: RefCell<LastEntry>,
 }
 
 impl Bodies {
@@ -351,10 +361,12 @@ impl Bodies {
             ctx,
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
+            last: RefCell::new(LastEntry::default()),
         })
     }
 
-    /// Native bodies actually run, over this backend's whole life.
+    /// Entries the tier answered or raised, a memo's answers among them, over this backend's
+    /// whole life.
     pub fn entered(&self) -> u64 {
         self.entered.get()
     }
@@ -392,6 +404,7 @@ impl Bodies {
     }
 
     fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> Run {
+        *self.last.borrow_mut() = LastEntry::default();
         let Some(admitted) = self.admitted.get(name) else {
             return self.decline(|d| d.not_compiled += 1);
         };
@@ -448,6 +461,11 @@ impl Bodies {
         {
             ctx.teardown.push(d);
         }
+        *self.last.borrow_mut() = LastEntry {
+            steps: u64::try_from(ctx.ticks).unwrap_or(0),
+            record: ctx.record.take(),
+            performed: std::mem::take(&mut ctx.performed),
+        };
 
         if ctx.failed != 0 {
             let raised = if ctx.failed == crate::rt::FAILED_OUT_OF_FUEL {
@@ -504,7 +522,20 @@ impl Bodies {
         };
         ctx.end();
         drop(ctx);
+        // Covers every handle `escape` refuses; a closure or secret that holds none declines.
         if walked.handle {
+            let boundary = ply_eval::Boundary::EntryAnswer {
+                name: name.as_str(),
+            };
+            let span = self
+                .unit
+                .source
+                .span_of(name.as_str())
+                .unwrap_or(ply_eval::Span::DUMMY);
+            if let Err(refused) = ply_eval::escape::check(&boundary, &value, span) {
+                self.entered.set(self.entered.get() + 1);
+                return Run::Raised(refused);
+            }
             return self.decline(|d| d.answer += 1);
         }
         if walked.unread {
@@ -563,12 +594,8 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
-    // A borrowed context means a nested entry, which `run` declines, so there is nothing to take.
     fn take_performed(&self) -> Vec<ply_eval::EffectAtom> {
-        self.ctx
-            .try_borrow_mut()
-            .map(|mut ctx| std::mem::take(&mut ctx.performed))
-            .unwrap_or_default()
+        std::mem::take(&mut self.last.borrow_mut().performed)
     }
 
     fn set_seed(&self, seed: ply_eval::Seed, steps: u32) {
@@ -578,19 +605,12 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
-    // The entry's own count: `begin` zeroes it, so what stands here is the entry that ran last.
     fn steps(&self) -> u64 {
-        self.ctx
-            .try_borrow()
-            .map(|ctx| u64::try_from(ctx.ticks).unwrap_or(0))
-            .unwrap_or(0)
+        self.last.borrow().steps
     }
 
     fn simulated(&self) -> Option<ply_eval::region::Record> {
-        self.ctx
-            .try_borrow()
-            .ok()
-            .and_then(|ctx| ctx.record.clone())
+        self.last.borrow().record.clone()
     }
 
     fn set_host(

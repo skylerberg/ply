@@ -151,21 +151,80 @@ fn two_entries_on_one_tier_each_resume_the_continuation_they_parked() {
     assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
 }
 
-/// The seam offers the memo a constant's answer before it declines one that holds a closure, and
-/// a `k` kept there would reach the next entry through the constant's every call.
+/// `Saved`'s field is an ordinary function type, so the checker lets `k` reach `parked`'s answer,
+/// and the seam refuses it there as the program's error.
 #[test]
-fn a_constant_the_seam_declines_keeps_no_continuation_for_the_next_entry() {
+fn a_continuation_in_an_entrys_answer_is_the_programs_error_and_no_decline() {
     let compiled = Compiled::new(PARKED);
     let (mut machine, tier) = compiled.machine_and_tier();
 
-    machine
+    let d = machine
         .call("m.parked", vec![], Span::DUMMY)
-        .expect_err("a continuation does not cross out of the tier");
-    assert_eq!(tier.declines().answer, 1, "{:?}", tier.declines());
+        .expect_err("a continuation does not leave the entry that captured it");
+
+    assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{d:#?}");
+    assert!(!codes::is_defect(d.code));
+    assert!(
+        d.message.contains("`m.parked` answered a continuation"),
+        "{}",
+        d.message
+    );
+    assert!(d.message.contains("Just`'s argument 1"), "{}", d.message);
+    let at = d
+        .labels
+        .iter()
+        .find(|l| l.primary)
+        .expect("the refusal is placed")
+        .span;
+    assert!(PARKED[at.range()].starts_with("fn parked()"), "{d:#?}");
+    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+    assert_eq!(machine.compiled_counts(), (1, 0));
+}
+
+/// The seam offers the memo a constant's answer before it refuses one that holds a continuation,
+/// and a `k` kept there would answer the next entry past the refusal and reach its every call.
+#[test]
+fn a_constant_the_seam_refuses_keeps_no_continuation_for_the_next_entry() {
+    let compiled = Compiled::new(PARKED);
+    let (mut machine, tier) = compiled.machine_and_tier();
+
+    for entry in 0..2 {
+        let d = machine
+            .call("m.parked", vec![], Span::DUMMY)
+            .expect_err("a continuation does not cross out of the tier");
+        assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "entry {entry}");
+    }
+    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
 
     machine
         .eval_test(compiled.index_of("the parked continuation still reads its region's cell"))
         .expect("the test parks and resumes a continuation of its own");
+}
+
+/// A declared field may name `Task<Int>`, so `spawned`'s task reaches its answer past the checker.
+const HELD: &str = r#"
+type Held = Held(Task<Int>)
+
+fn spawned() -> Held = simulate { Held(task.spawn(|| 1)) }
+"#;
+
+#[test]
+fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
+    let compiled = Compiled::new(HELD);
+    let (mut machine, tier) = compiled.machine_and_tier();
+
+    let d = machine
+        .call("m.spawned", vec![], Span::DUMMY)
+        .expect_err("a task does not leave the region that spawned it");
+
+    assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{d:#?}");
+    assert!(
+        d.message.contains("`m.spawned` answered a `Task`"),
+        "{}",
+        d.message
+    );
+    assert!(d.message.contains("Held`'s argument 1"), "{}", d.message);
+    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
 }
 
 #[test]
@@ -209,6 +268,34 @@ fn a_cell_from_another_arena_is_refused_at_the_entry_point() {
 
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY);
     assert!(d.message.contains("`Cell`"), "{}", d.message);
+}
+
+/// `k` converted out of the entry that parked it is refused where a smuggled cell is, before the
+/// run begins, rather than resumed into a body that is gone.
+#[test]
+fn a_continuation_from_another_entry_is_refused_at_the_entry_point() {
+    let compiled = Compiled::new(PARKED);
+    let native = compiled.native();
+    let entry = native.entry("m.parked").expect("`parked` compiled");
+    let mut ctx = native.context();
+    ctx.begin(10_000);
+    let out = unsafe { entry(&mut ctx, std::ptr::null()) };
+    assert_eq!(ctx.failed, 0, "`parked`: {:?}", ctx.diagnostic);
+    let saved = ply_codegen::heap::Heap::to_value(&native.tables().layouts, out);
+    ctx.end();
+
+    let d = compiled
+        .machine()
+        .call("m.resume_it", vec![saved], Span::DUMMY)
+        .expect_err("a continuation may not enter a run");
+
+    assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{}", d.message);
+    assert!(
+        d.message.contains("was called with a continuation"),
+        "{}",
+        d.message
+    );
+    assert!(d.message.contains("Just`'s argument 1"), "{}", d.message);
 }
 
 #[test]

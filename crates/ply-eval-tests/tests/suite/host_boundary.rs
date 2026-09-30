@@ -246,6 +246,57 @@ test/nondet "the double answers" {
     assert!(machine.host_use().is_none());
 }
 
+/// `k` resumes a body only this entry holds, and its type is an ordinary function's, so nothing but
+/// the boundary stops a handler keeping it past the entry.
+#[test]
+fn a_continuation_handed_to_the_host_is_refused_before_the_handler_runs() {
+    let compiled = Compiled::named(
+        "t",
+        r#"
+nondet effect ext {
+  write keep[s](k: (Bool) -> Int) -> Int
+}
+
+effect amb {
+  read flip[coin]() -> Bool
+}
+
+test/nondet "the clause hands its continuation to the host" {
+  let answered = handle {
+    if amb.flip[coin]() { 1 } else { 0 }
+  } with { amb.flip[coin]() resume k -> ext.keep[socket](k) };
+  assert_eq(answered, 1)
+}
+"#,
+    );
+    let counter = Arc::new(Counter::default());
+    let registry = registry_of(vec![(
+        op("ext", "keep", Linearity::AtMostOnce),
+        counter.clone(),
+    )]);
+    let binding = registry.bind(&compiled.front.check).expect("binds");
+
+    let mut machine = compiled.machine_on_tier();
+    machine.set_host_binding(Arc::new(binding));
+    let d = diagnostic(machine.eval_test(0));
+
+    assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{}", d.message);
+    assert!(
+        d.message
+            .contains("ext.keep[socket]` was handed a continuation in argument 1"),
+        "{}",
+        d.message
+    );
+    assert!(
+        d.notes.iter().any(|n| n.contains("test::send")),
+        "the handler is named: {:#?}",
+        d.notes
+    );
+    assert_eq!(counter.calls(), 0, "the refusal precedes the handler");
+    assert_eq!(machine.host_ops(), 0);
+    assert!(machine.host_use().is_none());
+}
+
 /// A second resumption is refused only when an irreversible operation happened after the capture.
 #[test]
 fn a_continuation_captured_after_the_last_send_resumes_twice() {

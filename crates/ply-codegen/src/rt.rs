@@ -2536,7 +2536,7 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                     }
                 }
                 // `Heap::to_word` rebuilds a native closure as one, so it never crosses as a bridge.
-                ClosureKind::Native { .. } => {
+                ClosureKind::Native { .. } | ClosureKind::Continuation { .. } => {
                     let d = error("a compiled closure arrived bridged rather than native");
                     c.fail(d)
                 }

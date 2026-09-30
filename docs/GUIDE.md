@@ -805,8 +805,10 @@ not license it, because no type records the join.
 * `E0446`: a region-branded value outlives the region (stored in an older
   binding, handed to an operation, put in a declared type, or handed to a
   `task.spawn` whose scheduler is older than the region).
-* `E0449`: a region handle reaches a host operation, a host answer or an entry
-  point's argument (at run time).
+* `E0449`: a region handle (a cell, a task, or the continuation a clause's
+  `resume` binds) reaches a host operation, a host answer, or an entry point's
+  argument or answer (at run time). A continuation's type is an ordinary
+  function's, so this is the one check that sees it.
 * `W0610`: a reference cycle; cycles are never freed.
 
 ## 8. Tests
@@ -2693,7 +2695,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0445` | `trace.exit` of a span not open on this task |
 | `E0446` | value outlives its region |
 | `E0448` | definition the compiled tier cannot compile |
-| `E0449` | region handle reaching a runtime boundary |
+| `E0449` | region handle or continuation reaching a runtime boundary |
 | `E0450` | compiled backend cannot be attached |
 | `E0451` | `fs` label with no root bound |
 | `E0452` | path leaves its root |
@@ -2728,13 +2730,14 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads.
 * No file handles — `fs` reads a range and appends by path, with nothing open
-  between calls — and no recursive walk, permissions or `stdin`; no
-  cancellation or backpressure; no migrations or live schema check; HTTP/1.1
-  only; no authentication framework.
+  between calls — and no recursive walk or permissions; no cancellation or
+  backpressure; no migrations or live schema check; HTTP/1.1 only; no
+  authentication framework.
 
-Sharp edges: `x.f(y)` with a bare variable `x` is a perform; a missing handler
-clause fails at run time; a record update needs the base's type to be known
-where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
+Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no
+`handle` names is found only when it reaches the host boundary at run time
+(`E0424`), unless its effect is `nondet` in a deterministic test (`E0412`); a
+record update needs the base's type to be known where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
 `string_find` and `list_set` raise where `list_at` answers `None`.
 
 ## 19. Examples
