@@ -214,7 +214,7 @@ fn the_goldens_reach_every_tag_the_parser_can_emit() {
 }
 
 /// Every tag the parser's dump can emit.
-const EMITTABLE: [&str; 102] = [
+const EMITTABLE: [&str; 103] = [
     // nodes
     "arm",
     "atm",
@@ -278,6 +278,7 @@ const EMITTABLE: [&str; 102] = [
     "%alias",
     "%and",
     "%bitand",
+    "%bitnot",
     "%bitor",
     "%bitxor",
     "%bool",

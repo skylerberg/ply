@@ -1733,32 +1733,45 @@ fn record_type(cx: Cx, m: Mod, def: TypeDef) -> Cx = {
 fn collect_types(cx: Cx, m: Mod) -> Cx =
   fold(m.module.items, cx, |c: Cx, it: Item| match it { IType(d) -> record_type(c, m, d), _ -> c })
 
-fn mentions_cell(t: Type) -> Bool =
+// The first `Cell` or `Task` in `t`: either is a key into the region that made it.
+fn region_brand(t: Type) -> Option<Bytes> =
   match t {
-    TyCon(c) ->
-      c.name == b"Cell" || fold(c.args, false, |acc: Bool, a: Type| acc || mentions_cell(a)),
-    TyFn(f) ->
-      fold(f.params, false, |acc: Bool, p: Type| acc || mentions_cell(p)) || mentions_cell(f.ret),
-    TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || mentions_cell(f.ty)),
-    TyVar(_) -> false,
+    TyCon(c) -> if c.name == b"Cell" || c.name == b"Task" { Some(c.name) }
+    else { first_reason(c.args, region_brand) },
+    TyFn(f) -> match first_reason(f.params, region_brand) {
+      Some(b) -> Some(b),
+      None -> region_brand(f.ret),
+    },
+    TyRecord(fs) -> first_reason(fs, |f: Field| region_brand(f.ty)),
+    TyVar(_) -> None,
   }
 
-fn ty_expr_span(t: TypeExpr) -> Span = ty_span(t)
-
-fn reject_declared_cell(cx: Cx, t: Type, span: Span, owner: Bytes, what: Bytes) -> Cx =
-  if mentions_cell(t) {
-    err1(
-      cx,
-      b"E0446",
-      span,
-      bytes_concat_all([b"`", owner, b"` declares ", what, b" that mentions a `Cell`"]),
-      b"a declaration is outside every region there is",
-      [
-        b"a declared type is fixed once for the whole program, so the region a cell that reached it came from would be pinned by whichever value got there first, and no later check could tell that the cell had outlived it",
-        b"take the cell as a type parameter instead, so the region stays in the type argument and the escape check can see it",
-      ],
-    )
-  } else { cx }
+fn reject_declared_brand(cx: Cx, t: Type, span: Span, owner: Bytes, what: Bytes) -> Cx =
+  match region_brand(t) {
+    None -> cx,
+    Some(brand) ->
+      err1(
+        cx,
+        b"E0446",
+        span,
+        bytes_concat_all([b"`", owner, b"`'s ", what, b" mentions a `", brand, b"`"]),
+        b"a declaration is outside every region there is",
+        [
+          bytes_concat_all([
+            b"a declaration is fixed once for the whole program, so it cannot say which region a `",
+            brand,
+            b"` in it came from, and no later check could tell that the `",
+            brand,
+            b"` had outlived its region",
+          ]),
+          bytes_concat_all([
+            b"take the `",
+            brand,
+            b"` as a type parameter instead, so it stays in the type argument, where the escape check can see it",
+          ]),
+        ],
+      ),
+  }
 
 fn collect_effects(cx: Cx, m: Mod) -> Cx =
   fold(m.module.items, cx, |c: Cx, it: Item|
@@ -1816,19 +1829,19 @@ fn collect_effects(cx: Cx, m: Mod) -> Cx =
                     let r: WithTy = conv_type(ps.cx, op.ret);
                     let c2: Cx = { ..r.cx, auto_ty_params: false, ty_params: map_new() };
                     let c3: Cx = fold(range(0, len(ps.ts)), c2, |cc: Cx, i: Int|
-                      reject_declared_cell(
+                      reject_declared_brand(
                         cc,
                         at(ps.ts, i),
-                        ty_expr_span(at(op.params, i)),
+                        ty_span(at(op.params, i)),
                         op.name.name,
-                        b"a parameter",
+                        bytes_concat(b"parameter ", num(i + 1)),
                       ));
-                    let c4 = reject_declared_cell(
+                    let c4 = reject_declared_brand(
                       c3,
                       r.t,
-                      ty_expr_span(op.ret),
+                      ty_span(op.ret),
                       op.name.name,
-                      b"a result",
+                      b"result",
                     );
                     {
                       cx: c4,
@@ -1891,12 +1904,12 @@ fn collect_ctors(cx: Cx, m: Mod) -> Cx =
                   None -> {
                     let fs: WithTys = conv_types(cc, variant.fields);
                     let checked: Cx = fold(range(0, len(fs.ts)), fs.cx, |c3: Cx, i: Int|
-                      reject_declared_cell(
+                      reject_declared_brand(
                         c3,
                         at(fs.ts, i),
-                        ty_expr_span(at(variant.fields, i)),
+                        ty_span(at(variant.fields, i)),
                         variant.name.name,
-                        b"a field",
+                        bytes_concat(b"field ", num(i + 1)),
                       ));
                     let ty = if len(fs.ts) == 0 { result }
                     else { t_fn(fs.ts, result, row_empty()) };
@@ -5568,7 +5581,8 @@ fn check_tests(cx: Cx, m: Mod) -> Cx = {
               };
               let pushed: Cx = { ..c1, env: env_push(c1.env) };
               let o: Inferred = infer(pushed, def.body);
-              let popped: Cx = { ..o.cx, env: env_pop(o.cx.env) };
+              let answered: Cx = check_test_answer(o.cx, def, o.ty);
+              let popped: Cx = { ..answered, env: env_pop(answered.env) };
               let row = resolve_r(popped, o.row);
               {
                 cx: if def.is_nondet { popped } else { check_determinism(popped, def, row.atoms) },
@@ -5598,6 +5612,36 @@ fn check_tests(cx: Cx, m: Mod) -> Cx = {
   );
   walked.cx
 }
+
+fn check_test_answer(cx: Cx, def: TestDef, ty: Type) -> Cx = {
+  let u = unify(cx.subst, cx.fresh, t_unit(), ty);
+  let c = with_unified(cx, u);
+  match u.err {
+    None -> c,
+    Some(_) -> {
+      let span = expr_span(tail_value(def.body));
+      let found = resolve(c, ty);
+      let shown = print_ty(printer_new(), found).s;
+      let d = diag1(
+        b"E0201",
+        c.module,
+        span,
+        bytes_concat_all([b"type mismatch: the body of test `", def.name, b"`"]),
+        bytes_concat_all([b"expected `Unit`, found `", shown, b"`"]),
+        [b"a test passes when its body finishes, so a value it ends on is never read"],
+      );
+      report(c, if found == t_bool() {
+        with_fix(d, b"wrap it in `assert`", [
+          insertion(c.module, span.start, b"assert("),
+          insertion(c.module, span.end, b")"),
+        ])
+      } else { with_fix(d, b"end the body with `()`", [insertion(c.module, span.end, b"; ()")]) })
+    },
+  }
+}
+
+fn tail_value(e: Expr) -> Expr =
+  match e { EBlock(b) -> match b.tail { Some(t) -> tail_value(t), None -> e }, _ -> e }
 
 type WithAtoms = { cx: Cx, atoms: List<Atom> }
 
@@ -7869,6 +7913,53 @@ fn check_codes(src: Bytes) -> List<Bytes> = map(check_diags(src), |dg: Diag| dg.
 fn fixes_of(diags: List<Diag>) -> List<Fix> =
   fold(diags, [], |acc: List<Fix>, dg: Diag| append(acc, dg.fixes))
 
+// Last edit first, so each offset still points where it did.
+fn fixed_by(src: Bytes, f: Fix) -> Bytes = {
+  let n = len(f.edits);
+  fold(range(0, n), src, |s: Bytes, i: Int| {
+    let e = at(f.edits, n - 1 - i);
+    bytes_concat_all([bytes_slice(s, 0, e.start), e.text, bytes_slice(s, e.end, bytes_len(s))])
+  })
+}
+
+fn refuses_a_value(form: Bytes) -> Unit = {
+  let src = |body: Bytes| bytes_concat_all([form, b" \"t\" { ", body, b" }"]);
+  let start = bytes_len(form) + 7;
+  assert_eq(check_codes(src(b"assert(true)")), []);
+  assert_eq(check_codes(src(b"let x = 1; ()")), []);
+  let valued = check_diags(src(b"1"));
+  assert_eq(map(valued, |dg: Diag| dg.code), [b"E0201"]);
+  assert_eq(map(valued, |dg: Diag| dg.message), [b"type mismatch: the body of test `t`"]);
+  assert_eq(map(valued, |dg: Diag| dg.labels), [
+    [
+      {
+        module: 0,
+        start: start,
+        end: start + 1,
+        primary: true,
+        text: b"expected `Unit`, found `Int`",
+      },
+    ],
+  ]);
+  assert_eq(map(fixes_of(valued), |f: Fix| f.title), [b"end the body with `()`"]);
+  assert_eq(map(fixes_of(valued), |f: Fix| fixed_by(src(b"1"), f)), [src(b"1; ()")]);
+  assert_eq(check_codes(src(b"1; ()")), []);
+  let compared = check_diags(src(b"let x = 1; x == 2"));
+  assert_eq(map(compared, |dg: Diag| map(dg.labels, |l: Label| (l.start, l.end, l.text))), [
+    [(start + 11, start + 17, b"expected `Unit`, found `Bool`")],
+  ]);
+  assert_eq(map(fixes_of(compared), |f: Fix| f.title), [b"wrap it in `assert`"]);
+  assert_eq(map(fixes_of(compared), |f: Fix| fixed_by(src(b"let x = 1; x == 2"), f)), [
+    src(b"let x = 1; assert(x == 2)"),
+  ]);
+  assert_eq(check_codes(src(b"let x = 1; assert(x == 2)")), [])
+}
+
+test "a test body is `Unit`, so one that ends on a value is refused with a fix that makes it check" {
+  refuses_a_value(b"test");
+  refuses_a_value(b"test/nondet")
+}
+
 fn net_src(rest: Bytes) -> Bytes =
   bytes_concat(
     b"effect net { write send[s](payload: Bytes) -> Unit\n write recv[s](max: Int) -> Bytes\n write close[s]() -> Unit\n read peek[s]() -> Int }\n",
@@ -8269,6 +8360,55 @@ test "a cell reaches a task only where the scheduler cannot outlive the region" 
       b"fn data() -> Int = simulate { with_cell[s](0) { c -> { let t = task.spawn(|| 1); cell_get(c) + task.join(t) } } }",
     ),
     [],
+  )
+}
+
+// Each diagnostic as its code, its message and the source its primary label covers.
+fn refusals(src: Bytes) -> List<List<Bytes>> =
+  map(check_diags(src), |dg: Diag|
+    [
+      dg.code,
+      dg.message,
+      fold(dg.labels, b"", |acc: Bytes, l: Label|
+        if l.primary { bytes_slice(src, l.start, l.end) } else { acc }),
+    ])
+
+test "a declaration that mentions a `Cell` or a `Task` is refused at the type that mentions it" {
+  assert_eq(refusals(b"type Held = Held(Task<Int>)"), [
+    [b"E0446", b"`Held`'s field 1 mentions a `Task`", b"Task<Int>"],
+  ]);
+  assert_eq(refusals(b"type Held = Held(Cell<Int>)"), [
+    [b"E0446", b"`Held`'s field 1 mentions a `Cell`", b"Cell<Int>"],
+  ]);
+  assert_eq(refusals(b"type Pool = Idle | Busy(Int, List<Task<Unit>>)"), [
+    [b"E0446", b"`Busy`'s field 2 mentions a `Task`", b"List<Task<Unit>>"],
+  ]);
+  assert_eq(refusals(b"type Box<a> = Box(a)\ntype Held = Held(Box<Task<Int>>)"), [
+    [b"E0446", b"`Held`'s field 1 mentions a `Task`", b"Box<Task<Int>>"],
+  ]);
+  assert_eq(refusals(b"type Pending = Task<Int>\ntype Held = Held(Pending)"), [
+    [b"E0446", b"`Held`'s field 1 mentions a `Task`", b"Pending"],
+  ]);
+  assert_eq(
+    refusals(b"effect pool { write give(t: Task<Int>) -> Unit\n write take() -> Task<Int> }"),
+    [
+      [b"E0446", b"`give`'s parameter 1 mentions a `Task`", b"Task<Int>"],
+      [b"E0446", b"`take`'s result mentions a `Task`", b"Task<Int>"],
+    ],
+  )
+}
+
+test "a `Task` in a parameter or a type argument is left to the escape check" {
+  assert_eq(check_codes(b"fn serve(running: List<Task<Unit>>) -> Int = len(running)"), []);
+  assert_eq(
+    check_codes(b"type Box<a> = Box(a)\nfn boxed(t: Task<Int>) -> Box<Task<Int>> = Box(t)"),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"type Box<a> = Box(a)\nfn spawned() -> Box<Task<Int>> = simulate { Box(task.spawn(|| 1)) }",
+    ),
+    [b"E0413"],
   )
 }
 
