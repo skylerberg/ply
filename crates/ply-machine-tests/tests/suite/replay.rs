@@ -25,9 +25,10 @@ nondet effect prover {
   read settled[claims]() -> Result<Option<Settled>, Refusal>
   read outcomes[claims](keys: List<String>) -> List<Option<String>>
   read discharged[claims](choice: Choice) -> Result<Verdicts, Refusal>
+  write record[claims](entries: List<{ at: Int, key: String }>) -> List<Unit>
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
-  read reviewed[claims]() -> Changes
-  read accepted[claims]() -> Accepted
+  read baselines[claims]() -> List<Baseline>
+  write accepted[claims](records: List<Baseline>) -> Accepted
 }
 
 type Binder = { name: String, text: String, ty: Shape }
@@ -66,7 +67,7 @@ type Options = {
 type Refusal = Unit
 type Collection = Unit
 type Verdicts = Unit
-type Changes = Unit
+type Baseline = Unit
 type Accepted = Unit
 type Binding = { name: String, ty: String, rendered: String }
 type Front = {

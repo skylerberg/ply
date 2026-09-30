@@ -1,11 +1,12 @@
-//! What `ply test` loads, selects, binds and runs, as the program in `crates/ply-cli/ply/tests.ply`
+//! What `ply test` loads, binds and runs, as the program in `crates/ply-cli/ply/tests.ply`
 //! performs it.
 //!
-//! The front end, the result cache, the selection it answers, the conflict grouping, the compiled
-//! backend, the host binding, the worker pool, the per-test unwind catching and the bisection stay
-//! here: a front end is not a value a program can hold, a Rust unwind is not a Ply value, and a
-//! reader of the store's on-disk format written in Ply would be a second implementation of it.
-//! What is said about all of it, in both forms, and the code the run exits with are the program's.
+//! The front end, the store, the compiled backend, the host binding, the worker pool, the per-test
+//! unwind catching and the building of a mixture stay here: a front end is not a value a program can
+//! hold, a Rust unwind is not a Ply value, and the store's on-disk format has one reader. Which tests
+//! run, the keys each result is read and filed under, the classes they share, why a failure happened
+//! and everything said about it are the program's: this side answers what it knows and does what it
+//! is told.
 
 use crate::hosts::{self, Hosts, Lent, hosting};
 use crate::load::{Loaded, project_root};
@@ -20,9 +21,7 @@ use ply_eval::host::{
 };
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_store::Store;
-use ply_test::{
-    Isolation, Record, RunReport, Selection, Skipped, Status, Suspect, TestResult, Verdict,
-};
+use ply_test::{Isolation, Record, RunReport, Selection, Status, Suspect, TestResult};
 use ply_ty::{CheckOutput, Footprint, HashOutput, Mode};
 use serde_json::{Value, json as jsonlit};
 use std::collections::BTreeSet;
@@ -33,12 +32,44 @@ use std::sync::{Arc, Mutex, mpsc};
 /// else: no other command runs a corpus.
 const EFFECT: &str = "tester";
 
-/// The modules the change set's and the trial's vocabulary is declared in. A constructor the runtime
-/// builds has to carry the name the program's own spine gives it, and that name is `<module>::<Case>`
-/// — the source's `.` and `payload::ctor`'s `.` are both wrong for a value the program *matches* on.
-/// Getting it wrong is a placeless `no arm of this match matched` the moment the program matches.
-const DELTA: &str = "suite.delta";
-const BISECT: &str = "suite.bisect";
+/// Where each type this side marshals is declared, and every case it builds of it.
+///
+/// A constructor crosses by its program-wide name, `<module>.<Case>`, and a name the program does
+/// not declare is a placeless `no arm of this match matched` the moment it matches the value. So a
+/// case is built only through [`case`], which refuses one this table does not list, and
+/// `every_case_the_tester_builds_is_declared_where_it_says` holds the table to the program.
+pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
+    ("suite.delta", "Ns", &["Value", "Decl"]),
+    ("suite.bisect", "Skipped", &["NoBodies", "NoHybrids"]),
+    (
+        "suite.bisect",
+        "TrialOutcome",
+        &["Fails", "Passes", "Unresolved"],
+    ),
+    (
+        "suite.bisect",
+        "Unresolved",
+        &[
+            "DoesNotCheck",
+            "DifferentFailure",
+            "MissingBody",
+            "BudgetSpent",
+        ],
+    ),
+];
+
+/// One case of a type this side marshals, under the name the program declares it by.
+fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
+    let (home, _, cases) = MARSHALLED
+        .iter()
+        .find(|(_, declared, _)| *declared == ty)
+        .unwrap_or_else(|| panic!("`{ty}` is not a type this side marshals"));
+    assert!(
+        cases.contains(&name),
+        "`{name}` is not a case of `{ty}` this side builds"
+    );
+    crate::payload::ctor(home, name, args)
+}
 
 const OPERATIONS: [(&str, &str); 12] = [
     ("configure", "ply_machine::tester::configure"),
@@ -116,7 +147,7 @@ impl Session {
     }
 }
 
-/// The decision, as the program sent it: the same four fields `ply_test::Choice` holds.
+/// The decision, as the program sent it: the same fields `ply_test::Choice` holds.
 fn choice_of(v: &PlyValue, span: Span) -> Result<ply_test::Choice, Diagnostic> {
     use crate::payload::field_of;
     let runs = ints_of(field_of(v, "runs", span)?, span, "the tests to run")?;
@@ -141,11 +172,32 @@ fn choice_of(v: &PlyValue, span: Span) -> Result<ply_test::Choice, Diagnostic> {
     for class in field_of(v, "groups", span)?.as_list(span, "the classes")? {
         groups.push(ints_of(class, span, "a class")?);
     }
+    let mut filed = std::collections::BTreeMap::new();
+    for entry in field_of(v, "filed", span)?.as_list(span, "where each pass is filed")? {
+        let index = field_of(entry, "index", span)?.as_int(span, "a test index")? as usize;
+        let mut keys = Vec::new();
+        for key in field_of(entry, "keys", span)?.as_list(span, "the keys a pass is filed under")? {
+            keys.push(hash_of(key.as_str(span, "a key")?, span)?);
+        }
+        filed.insert(index, keys);
+    }
     Ok(ply_test::Choice {
         runs,
         reasons,
         narrowed,
         groups,
+        filed,
+    })
+}
+
+/// A key the program computed, as the store is keyed.
+fn hash_of(hex: &str, span: Span) -> Result<ply_ty::DefHash, Diagnostic> {
+    ply_ty::DefHash::from_hex(hex).ok_or_else(|| {
+        Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("`{hex}` is not a key the store could be read or written under"),
+        )
+        .primary(span, "the program handed this key over")
     })
 }
 
@@ -235,7 +287,15 @@ impl HostHandler for Site {
                             .to_string(),
                     ));
                 }
-                self.trial(usize::try_from(failure).unwrap_or(usize::MAX), named)?
+                let filed = match crate::payload::option_of(
+                    req.args.get(2).ok_or_else(|| unasked("trial", req.span))?,
+                    "the key a pass is filed under",
+                    span,
+                )? {
+                    Some(key) => Some(hash_of(key.as_str(span, "a key")?, span)?),
+                    None => None,
+                };
+                self.trial(usize::try_from(failure).unwrap_or(usize::MAX), named, filed)?
             }
             "chosen" => {
                 let value = req
@@ -363,13 +423,19 @@ impl Site {
 
     /// One mixture the program decided to try. The runtime answers it on its own thread, where the
     /// store and the warm front end are; this waits for that answer.
-    fn trial(&self, failure: usize, keys: Vec<(String, String)>) -> Result<PlyValue, Diagnostic> {
+    fn trial(
+        &self,
+        failure: usize,
+        keys: Vec<(String, String)>,
+        filed: Option<ply_ty::DefHash>,
+    ) -> Result<PlyValue, Diagnostic> {
         let (reply, answers) = mpsc::channel();
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("trial"))?;
         machine.ask(Go::Trial {
             failure,
             keys,
+            filed,
             reply,
         })?;
         match answers.recv() {
@@ -427,11 +493,12 @@ enum Go {
     /// The printed union of these tests' footprints. The program colours the graph; the rendering of
     /// a colour is the compiler's, since only its printer can keep a label variable off a name.
     Footprint(Vec<usize>),
-    /// One mixture the program decided to try. Answered on this thread, because the store a hybrid
-    /// is built over lives here and a `BodyHybrid` is not `Send`.
+    /// One mixture the program decided to try, and the key its pass is filed under. Answered on this
+    /// thread, because the store a hybrid is built over lives here and a `BodyHybrid` is not `Send`.
     Trial {
         failure: usize,
         keys: Vec<(String, String)>,
+        filed: Option<ply_ty::DefHash>,
         reply: mpsc::Sender<Result<ply_test::bisect::Trial, Diagnostic>>,
     },
 }
@@ -537,11 +604,12 @@ fn serve(args: &TestOptions, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<G
         if let Go::Trial {
             failure,
             keys,
+            filed,
             reply,
         } = signal
         {
             let answer = match &mut cache {
-                Ok(cache) => trial(&mut cache.store, hybrids.as_ref(), failure, &keys),
+                Ok(cache) => trial(&mut cache.store, hybrids.as_ref(), failure, &keys, filed),
                 Err(diagnostic) => Err(diagnostic.clone()),
             };
             let _ = reply.send(answer);
@@ -638,7 +706,7 @@ fn iterate(
     // What a selector reads, before anything runs. It states its decision on the same channel, so
     // the machine has it by the time the binding decides whether a unit is worth building.
     let mut chosen = None;
-    let knowledge = Knowledge::of(&loaded, &hashes, &cache.store, &search);
+    let knowledge = Knowledge::of(&loaded, &hashes, &search);
     if !serve_reads(asked, told, &knowledge, &cache.store, &mut chosen) {
         return;
     }
@@ -672,7 +740,7 @@ struct Knowledge {
 }
 
 /// The store's answer under each key, as a report prints one: `passed`, `failed`, or nothing. The
-/// keys are the caller's — a per-root narrowing computes them — so no row could have carried them.
+/// keys are the program's, which is the only side that encodes one.
 fn outcomes_of(store: &ply_store::Store, keys: &[String]) -> Vec<Option<String>> {
     keys.iter()
         .map(|key| {
@@ -701,8 +769,7 @@ impl Knowledge {
     }
 }
 
-/// One test the loaded tree declares, and what the store has under the key its result is filed
-/// under.
+/// One test the loaded tree declares: its own hash, and whether the search is part of its key.
 #[derive(Clone)]
 struct KeyRow {
     index: usize,
@@ -711,15 +778,10 @@ struct KeyRow {
     /// The test's program-wide name: `<module>.<label>`.
     name: String,
     module: String,
-    /// The key the result is filed under; `None` when the front end produced no hash.
-    cache_key: Option<String>,
-    /// Whether the key is the search's, rather than the test's own hash.
+    /// `None` when the front end produced no hash.
+    hash: Option<String>,
     seeded: bool,
-    /// `test/nondet` opts out of the cache in both directions, so a selection never calls it
-    /// cached whatever the store holds.
     nondet: bool,
-    /// `Some("passed")` or `Some("failed")` when the store holds a result under that key.
-    cached: Option<&'static str>,
 }
 
 /// One definition or test the loaded tree declares, and its hash.
@@ -730,7 +792,8 @@ struct HashedRow {
     test: bool,
 }
 
-/// The search a seeded test's key is computed against.
+/// The search a seeded test's key is computed against: one shape wherever the program reads a
+/// plan, since a record crosses by its fields and a missing one is a read of the wrong one.
 #[derive(Clone)]
 struct SearchedRow {
     mode: String,
@@ -739,42 +802,59 @@ struct SearchedRow {
     /// crosses as a *dynamic* value, so nothing checks the two against each other.
     budget: u32,
     steps: u32,
+    /// The choices `--seed` fixes, which name one interleaving under `once`.
+    path: Vec<u16>,
+}
+
+impl SearchedRow {
+    fn of(search: &ply_eval::Plan) -> SearchedRow {
+        SearchedRow {
+            mode: search.mode.as_str().to_string(),
+            roots: search.roots.clone(),
+            budget: search.budget,
+            steps: search.steps,
+            path: search.path.clone(),
+        }
+    }
+}
+
+fn searched_value(row: &SearchedRow) -> PlyValue {
+    record(vec![
+        (
+            "roots",
+            PlyValue::list(row.roots.iter().map(|&r| PlyValue::Int(r as i64)).collect()),
+        ),
+        ("mode", PlyValue::str(&row.mode)),
+        ("seeds", count(row.roots.len())),
+        ("budget", count(row.budget as usize)),
+        ("steps", count(row.steps as usize)),
+        (
+            "path",
+            PlyValue::list(
+                row.path
+                    .iter()
+                    .map(|&c| PlyValue::Int(i64::from(c)))
+                    .collect(),
+            ),
+        ),
+    ])
 }
 
 impl Knowledge {
-    fn of(
-        loaded: &Loaded,
-        hashes: &HashOutput,
-        store: &ply_store::Store,
-        search: &ply_eval::Plan,
-    ) -> Knowledge {
+    fn of(loaded: &Loaded, hashes: &HashOutput, search: &ply_eval::Plan) -> Knowledge {
         let keys = loaded
             .check
             .tests
             .iter()
             .enumerate()
-            .map(|(index, test)| {
-                // The same key the selection files a result under: the test's hash, or the
-                // search's key when the test is keyed on the plan.
-                let hash = hashes.tests.get(index).copied();
-                let seeded = ply_test::is_seeded(&test.footprint);
-                let key = hash.map(|h| ply_test::result_key(h, seeded, search));
-                KeyRow {
-                    index,
-                    label: test.name.as_str().to_string(),
-                    name: test.key.as_str().to_string(),
-                    module: test.module.as_str().to_string(),
-                    cache_key: key.map(|k| k.to_hex()),
-                    seeded,
-                    nondet: test.nondet,
-                    cached: key.and_then(|k| store.get(k)).map(|outcome| {
-                        if outcome.is_pass() {
-                            "passed"
-                        } else {
-                            "failed"
-                        }
-                    }),
-                }
+            .map(|(index, test)| KeyRow {
+                index,
+                label: test.name.as_str().to_string(),
+                name: test.key.as_str().to_string(),
+                module: test.module.as_str().to_string(),
+                hash: hashes.tests.get(index).map(|h| h.to_hex()),
+                seeded: ply_test::is_seeded(&test.footprint),
+                nondet: test.nondet,
             })
             .collect();
         let mut hashed: Vec<HashedRow> = hashes
@@ -809,12 +889,7 @@ impl Knowledge {
                 .iter()
                 .map(|t| t.footprint.clone())
                 .collect(),
-            searched: SearchedRow {
-                mode: search.mode.as_str().to_string(),
-                roots: search.roots.clone(),
-                budget: search.budget,
-                steps: search.steps,
-            },
+            searched: SearchedRow::of(search),
         }
     }
 }
@@ -1045,20 +1120,15 @@ fn execute(
                     &executor,
                 )
             };
-            let mut report = match &pool {
+            let report = match &pool {
                 Some(pool) => pool.install(run),
                 None => run(),
             };
             // After the run, since a pass recorded now is a valid baseline for another's failure.
-            // The search is the program's: what changed, what a mixture would need and why nothing
-            // could be tried are handed over, and the program that reads the report decides.
-            hybrids = ply_test::diagnose_failures(
-                &mut report,
-                &loaded.texts(),
-                &loaded.front,
-                &mut cache.store,
-                !matches!(args.bisect, When::Never),
-            );
+            // What changed and what a mixture would need are handed over; the program that reads
+            // the report decides everything about the cause.
+            hybrids =
+                ply_test::diagnose_failures(&report, &loaded.texts(), &loaded.front, &cache.store);
             let escapes = hosts_escapes(&report, &loaded.check, hosts);
             let ok = report.is_success() && escapes.is_empty();
             // Only over a green program: a survivor of a red one says nothing.
@@ -1208,6 +1278,12 @@ pub(crate) fn decided(
             .iter()
             .filter(|(index, _)| keeps(index))
             .map(|(index, roots)| (*index, roots.clone()))
+            .collect(),
+        filed: choice
+            .filed
+            .iter()
+            .filter(|(index, _)| keeps(index))
+            .map(|(index, keys)| (*index, keys.clone()))
             .collect(),
         reasons: choice.reasons.clone(),
     };
@@ -1418,7 +1494,7 @@ struct Found {
     declared: usize,
     cases: Vec<CaseView>,
     filtered_out: usize,
-    plan: (String, Vec<u64>, u32, u32),
+    plan: SearchedRow,
     warnings: Vec<Diagnostic>,
     options: Value,
 }
@@ -1479,40 +1555,22 @@ struct SearchView {
     failing_seed: Option<String>,
 }
 
+/// A definition in the failing test's closure the store has never seen pass, with its current hash.
 struct SuspectView {
     name: String,
-    /// The definition's current hash, so a program that re-publishes the list loses nothing: the
-    /// artifact's suspects carry it, and the row's did not.
     hash: Option<String>,
-    change: Option<String>,
-    ran: Option<bool>,
-    depth: Option<usize>,
-    culprit: bool,
 }
 
 struct FaultView {
     key: String,
     diagnostic: Diagnostic,
     /// The interpreter failed rather than the program, and the failing run reached a host handler:
-    /// two of the gate's three answers, the third being the program's own `bisect` mode.
+    /// two of the facts a verdict's gate is decided from.
     defect: bool,
     host: bool,
-    /// What a program that searches for itself needs: the change set, what the classifier could not
-    /// tell apart, the reason to give when there is nothing to try, and where each definition is.
+    /// What the cause is decided from, when the test passed before: the facts its change set is
+    /// classified from, why no mixture can be tried when none can, and where each name is.
     search: Option<ChangeSetView>,
-    conclusive: bool,
-    requested: bool,
-    reason: String,
-    /// The verdict as the artifact publishes it: the cases by word, the groups, and the counts a
-    /// reader sees beside the answer. A program that searched replaces all of these.
-    verdict: &'static str,
-    skipped: Option<&'static str>,
-    confidence: &'static str,
-    groups: Vec<Vec<String>>,
-    /// The counts the search would have published. Named `stats` because `search` above is the
-    /// change set a program that decides reads.
-    stats: ply_test::SearchStats,
-    culprits: Vec<(Vec<String>, Option<Span>)>,
     slice: Option<(bool, bool, Vec<String>)>,
     suspects: Vec<SuspectView>,
     unchanged: bool,
@@ -1528,24 +1586,11 @@ struct FaultView {
     observed: Option<Vec<String>>,
 }
 
-/// Every name a change set mentions: its own change, the changes, and the fused groups' members.
-fn delta_names(delta: &ply_test::bisect::Delta) -> Vec<&Symbol> {
-    let mut out: Vec<&Symbol> = Vec::new();
-    if let Some(own) = &delta.test {
-        out.push(&own.name);
-    }
-    out.extend(delta.changes.iter().map(|c| &c.name));
-    out.extend(delta.clusters.iter().flat_map(|c| c.members.iter()));
-    out
-}
-
-/// One failure's change set, as the program reads it. The names are the change set's own, and each
-/// carries the place `ply` would print for it.
+/// One failure's facts, as the program reads them. Each name they mention carries the place `ply`
+/// would print for it.
 struct ChangeSetView {
-    delta: ply_test::bisect::Delta,
-    classified: usize,
-    test_classified: bool,
-    absent: ply_test::bisect::Skipped,
+    facts: ply_test::ChangeSet,
+    absent: Option<ply_test::Skipped>,
     at: Vec<(String, Option<Span>)>,
 }
 
@@ -1636,12 +1681,7 @@ fn found(
             })
             .collect(),
         filtered_out: plan.filtered_out,
-        plan: (
-            search.mode.as_str().to_string(),
-            search.roots.clone(),
-            search.budget,
-            search.steps,
-        ),
+        plan: SearchedRow::of(search),
         warnings,
         options: jsonlit!({
             "bisect": args.bisect.as_str(),
@@ -1728,10 +1768,6 @@ fn suspect_view(suspect: &Suspect) -> SuspectView {
     SuspectView {
         name: suspect.name.to_string(),
         hash: suspect.hash.map(|h| h.to_hex()),
-        change: suspect.change.map(|c| c.as_str().to_string()),
-        ran: suspect.ran,
-        depth: suspect.depth,
-        culprit: suspect.culprit,
     }
 }
 
@@ -1745,16 +1781,14 @@ fn fault(
     let check = &loaded.check;
     let index = check.tests.iter().position(|t| t.key == failure.key);
     let test = index.and_then(|i| check.tests.get(i));
-    let bisection = &failure.attribution.bisection;
     let search = input.map(|input| ChangeSetView {
-        delta: input.delta.clone(),
-        classified: input.classified,
-        test_classified: input.test_classified,
+        facts: input.facts.clone(),
         absent: input.absent,
-        // Every name the change set mentions, with its place: a verdict that this program searched
-        // has no spans of its own, and a report prints where each culprit is.
+        // Every name the facts mention, with its place: a verdict the program reaches has no spans
+        // of its own, and a report prints where each culprit is.
         at: {
-            let mut names: Vec<&Symbol> = delta_names(&input.delta);
+            let mut names: Vec<&Symbol> = input.facts.rows.iter().map(|r| &r.key.name).collect();
+            names.push(&input.facts.test);
             names.sort();
             names.dedup();
             names
@@ -1774,35 +1808,6 @@ fn fault(
         defect: failure.defect,
         host: failure.host,
         search,
-        conclusive: bisection.is_conclusive(),
-        // Silent when no bisection was asked for.
-        requested: !matches!(
-            bisection.verdict,
-            Verdict::NotAttempted(Skipped::NotRequested)
-        ),
-        reason: bisection.reason.clone(),
-        verdict: bisection.verdict.as_str(),
-        skipped: bisection.verdict.skipped().map(|why| why.as_str()),
-        confidence: bisection.confidence.as_str(),
-        groups: bisection
-            .groups
-            .iter()
-            .map(|group| group.iter().map(|n| n.as_str().to_string()).collect())
-            .collect(),
-        stats: bisection.search,
-        culprits: bisection
-            .groups
-            .iter()
-            .map(|group| {
-                (
-                    group.iter().map(|n| n.as_str().to_string()).collect(),
-                    group
-                        .iter()
-                        .find_map(|n| check.defs.get(n))
-                        .map(|def| def.span),
-                )
-            })
-            .collect(),
         slice: failure.attribution.slice.as_ref().map(|slice| {
             (
                 slice.traced,
@@ -2010,26 +2015,7 @@ fn found_value(found: Found) -> PlyValue {
             PlyValue::list(found.cases.iter().map(case_value).collect()),
         ),
         ("filtered_out", count(found.filtered_out)),
-        (
-            "plan",
-            record(vec![
-                ("mode", PlyValue::str(&found.plan.0)),
-                (
-                    "roots",
-                    PlyValue::list(
-                        found
-                            .plan
-                            .1
-                            .iter()
-                            .map(|&r| PlyValue::Int(r as i64))
-                            .collect(),
-                    ),
-                ),
-                ("seeds", count(found.plan.1.len())),
-                ("budget", count(found.plan.2 as usize)),
-                ("steps", count(found.plan.3 as usize)),
-            ]),
-        ),
+        ("plan", searched_value(&found.plan)),
         ("warnings", diags_value(&found.warnings)),
         ("options", json(&found.options)),
     ])
@@ -2046,13 +2032,9 @@ fn knowledge_value(value: &KnowledgeValue) -> PlyValue {
                         ("label", PlyValue::str(&row.label)),
                         ("name", PlyValue::str(&row.name)),
                         ("module", PlyValue::str(&row.module)),
-                        (
-                            "cache_key",
-                            option(row.cache_key.as_deref().map(PlyValue::str)),
-                        ),
+                        ("hash", option(row.hash.as_deref().map(PlyValue::str))),
                         ("seeded", PlyValue::Bool(row.seeded)),
                         ("nondet", PlyValue::Bool(row.nondet)),
-                        ("cached", option(row.cached.map(PlyValue::str))),
                     ])
                 })
                 .collect(),
@@ -2075,16 +2057,7 @@ fn knowledge_value(value: &KnowledgeValue) -> PlyValue {
                 .map(|answer| option(answer.as_deref().map(PlyValue::str)))
                 .collect(),
         ),
-        KnowledgeValue::Searched(row) => record(vec![
-            (
-                "roots",
-                PlyValue::list(row.roots.iter().map(|&r| PlyValue::Int(r as i64)).collect()),
-            ),
-            ("mode", PlyValue::str(&row.mode)),
-            ("seeds", count(row.roots.len())),
-            ("budget", count(row.budget as usize)),
-            ("steps", count(row.steps as usize)),
-        ]),
+        KnowledgeValue::Searched(row) => searched_value(row),
     }
 }
 
@@ -2150,58 +2123,9 @@ fn fault_value(f: &FaultView) -> PlyValue {
     record(vec![
         ("key", PlyValue::str(&f.key)),
         ("diagnostic", diag_value(&f.diagnostic)),
-        // Two of the gate's three answers; the mode is the program's own flag.
         ("defect", PlyValue::Bool(f.defect)),
         ("host", PlyValue::Bool(f.host)),
-        // What a program that searches for itself reads: the change set, what could not be told
-        // apart, the reason to give when there is nothing to try, and where each name is.
         ("search", option(f.search.as_ref().map(change_set_value))),
-        (
-            "bisect",
-            record(vec![
-                ("conclusive", PlyValue::Bool(f.conclusive)),
-                ("requested", PlyValue::Bool(f.requested)),
-                ("reason", PlyValue::str(&f.reason)),
-                ("verdict", PlyValue::str(f.verdict)),
-                ("skipped", option(f.skipped.map(PlyValue::str))),
-                ("confidence", PlyValue::str(f.confidence)),
-                (
-                    "groups",
-                    PlyValue::list(
-                        f.groups
-                            .iter()
-                            .map(|g| PlyValue::list(g.iter().map(PlyValue::str).collect()))
-                            .collect(),
-                    ),
-                ),
-                (
-                    "search",
-                    record(vec![
-                        ("candidates", count(f.stats.candidates)),
-                        ("clusters", count(f.stats.clusters)),
-                        ("evaluated", count(f.stats.evaluated)),
-                        ("cached", count(f.stats.cached)),
-                        ("memoized", count(f.stats.memoized)),
-                        ("unresolved", count(f.stats.unresolved)),
-                        ("exhausted", PlyValue::Bool(f.stats.exhausted)),
-                    ]),
-                ),
-                (
-                    "culprits",
-                    PlyValue::list(
-                        f.culprits
-                            .iter()
-                            .map(|(names, span)| {
-                                record(vec![
-                                    ("names", texts(names)),
-                                    ("at", option(span.and_then(placed))),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-            ]),
-        ),
         (
             "slice",
             option(f.slice.as_ref().map(|(traced, reproduced, path)| {
@@ -2221,10 +2145,6 @@ fn fault_value(f: &FaultView) -> PlyValue {
                         record(vec![
                             ("name", PlyValue::str(&x.name)),
                             ("hash", option(x.hash.as_deref().map(PlyValue::str))),
-                            ("change", option(x.change.as_deref().map(PlyValue::str))),
-                            ("ran", option(x.ran.map(PlyValue::Bool))),
-                            ("depth", option(x.depth.map(count))),
-                            ("culprit", PlyValue::Bool(x.culprit)),
                         ])
                     })
                     .collect(),
@@ -2573,6 +2493,7 @@ fn trial(
     hybrids: Option<&ply_test::Hybrids>,
     failure: usize,
     keys: &[(String, String)],
+    filed: Option<ply_ty::DefHash>,
 ) -> Result<ply_test::bisect::Trial, Diagnostic> {
     let Some(hybrids) = hybrids else {
         return Err(Diagnostic::error(
@@ -2587,9 +2508,11 @@ fn trial(
         ));
     };
     let Some((mixture, test)) = &input.runnable else {
-        return Ok(ply_test::bisect::Trial::unresolved(
-            ply_test::bisect::Unresolved::MissingBody,
-        ));
+        return Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("a mixture of failure {failure} was asked for, and none can be built"),
+        )
+        .note("the report said why none can; this is Ply's fault"));
     };
     let wanted: std::collections::BTreeSet<ply_test::bisect::DefKey> = keys
         .iter()
@@ -2616,15 +2539,11 @@ fn trial(
         Some(seed) => hybrid.at_seed(seed),
         None => hybrid,
     };
-    let trial = hybrid.trial_over(wanted);
-    // A mixture that went green is a program whose definitions all pass at once, so what it proved
-    // may be cached — under the mixture's own test hash. The failing test's hash is a different
-    // test's, so a red test can never be passed by a mixture of it.
-    // A mixture that went green is a program whose definitions all pass at once, so what it proved
-    // may be cached — under the mixture's own test hash. The failing test's hash is a different
-    // test's, so a red test can never be passed by a mixture of it.
-    for hash in hybrid.take_proved() {
-        store.put(hash, ply_store::Outcome::Pass);
+    let trial = hybrid.trial_over(wanted, filed);
+    // A mixture that went green is a program whose definitions all pass at once, filed under the
+    // mixture's own key: never the failing test's, so a red test is never passed by a mixture of it.
+    for key in hybrid.take_proved() {
+        store.put(key, ply_store::Outcome::Pass);
     }
     Ok(trial)
 }
@@ -2633,16 +2552,13 @@ fn trial(
 /// result it already had.
 fn trial_value(trial: &ply_test::bisect::Trial) -> PlyValue {
     let outcome = match trial.outcome {
-        ply_test::bisect::TrialOutcome::Fails => crate::payload::ctor(BISECT, "Fails", Vec::new()),
-        ply_test::bisect::TrialOutcome::Passes => {
-            crate::payload::ctor(BISECT, "Passes", Vec::new())
-        }
-        // The case names are the ones `suite.bisect` declares, so the program matches on them.
-        ply_test::bisect::TrialOutcome::Unresolved(why) => crate::payload::ctor(
-            BISECT,
+        ply_test::bisect::TrialOutcome::Fails => case("TrialOutcome", "Fails", Vec::new()),
+        ply_test::bisect::TrialOutcome::Passes => case("TrialOutcome", "Passes", Vec::new()),
+        ply_test::bisect::TrialOutcome::Unresolved(why) => case(
+            "TrialOutcome",
             "Unresolved",
-            vec![crate::payload::ctor(
-                BISECT,
+            vec![case(
+                "Unresolved",
                 match why {
                     ply_test::bisect::Unresolved::DoesNotCheck => "DoesNotCheck",
                     ply_test::bisect::Unresolved::DifferentFailure => "DifferentFailure",
@@ -2659,15 +2575,72 @@ fn trial_value(trial: &ply_test::bisect::Trial) -> PlyValue {
     ])
 }
 
-/// One failure's change set, as the program reads it.
+/// One failure's facts, as the program reads them.
 fn change_set_value(view: &ChangeSetView) -> PlyValue {
+    let facts = &view.facts;
+    let hex = |hash: Option<ply_ty::DefHash>| option(hash.map(|h| PlyValue::str(h.to_hex())));
     record(vec![
-        ("delta", delta_value(&view.delta)),
-        ("classified", count(view.classified)),
-        ("test_classified", PlyValue::Bool(view.test_classified)),
+        (
+            "facts",
+            record(vec![
+                (
+                    "own",
+                    record(vec![
+                        ("name", PlyValue::str(facts.test.as_str())),
+                        ("before", PlyValue::str(facts.before.to_hex())),
+                        ("after", hex(facts.after)),
+                        ("rehashed", hex(facts.rehashed)),
+                    ]),
+                ),
+                (
+                    "rows",
+                    PlyValue::list(
+                        facts
+                            .rows
+                            .iter()
+                            .map(|row| {
+                                record(vec![
+                                    ("name", PlyValue::str(row.key.name.as_str())),
+                                    ("ns", ns_value(row.key.ns)),
+                                    ("before", hex(row.before)),
+                                    ("after", hex(row.after)),
+                                    ("rehashed", hex(row.rehashed)),
+                                    ("stable", option(row.stable.map(PlyValue::Bool))),
+                                    ("kept", PlyValue::Bool(row.kept)),
+                                    ("renamed", PlyValue::Bool(row.renamed)),
+                                    (
+                                        "component",
+                                        PlyValue::list(
+                                            row.component.iter().map(key_value).collect(),
+                                        ),
+                                    ),
+                                    (
+                                        "referrers",
+                                        strings(row.referrers.iter().map(|n| n.as_str())),
+                                    ),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]),
+        ),
         (
             "absent",
-            crate::payload::ctor(BISECT, skipped_ctor(view.absent), Vec::new()),
+            option(view.absent.map(|why| {
+                case(
+                    "Skipped",
+                    match why {
+                        ply_test::Skipped::NoBodies => "NoBodies",
+                        ply_test::Skipped::NoHybrids => "NoHybrids",
+                        other => panic!(
+                            "`{}` is a verdict, not why a mixture cannot be built",
+                            other.as_str()
+                        ),
+                    },
+                    Vec::new(),
+                )
+            })),
         ),
         (
             "at",
@@ -2686,109 +2659,20 @@ fn change_set_value(view: &ChangeSetView) -> PlyValue {
     ])
 }
 
-/// The change set, in the shapes `suite.delta` declares: the names are the cases of its own ADTs,
-/// because that is how a value crosses.
-fn delta_value(delta: &ply_test::bisect::Delta) -> PlyValue {
+fn key_value(key: &ply_test::DefKey) -> PlyValue {
     record(vec![
-        ("own", option(delta.test.as_ref().map(change_value))),
-        (
-            "changes",
-            PlyValue::list(delta.changes.iter().map(change_value).collect()),
-        ),
-        (
-            "clusters",
-            PlyValue::list(delta.clusters.iter().map(cluster_value).collect()),
-        ),
-        ("unclassified", count(delta.unclassified)),
+        ("name", PlyValue::str(key.name.as_str())),
+        ("ns", ns_value(key.ns)),
     ])
 }
 
-fn change_value(change: &ply_test::bisect::Change) -> PlyValue {
-    record(vec![
-        ("name", PlyValue::str(change.name.as_str())),
-        (
-            "ns",
-            crate::payload::ctor(DELTA, ns_ctor(change.ns), Vec::new()),
-        ),
-        (
-            "before",
-            option(change.before.map(|h| PlyValue::str(h.to_hex()))),
-        ),
-        (
-            "after",
-            option(change.after.map(|h| PlyValue::str(h.to_hex()))),
-        ),
-        (
-            "kind",
-            crate::payload::ctor(DELTA, kind_ctor(change.kind), Vec::new()),
-        ),
-        ("independent", PlyValue::Bool(change.independent)),
-    ])
-}
-
-fn cluster_value(cluster: &ply_test::bisect::Cluster) -> PlyValue {
-    record(vec![
-        (
-            "members",
-            strings(cluster.members.iter().map(|n| n.as_str())),
-        ),
-        (
-            "keys",
-            PlyValue::list(
-                cluster
-                    .keys
-                    .iter()
-                    .map(|k| {
-                        record(vec![
-                            ("name", PlyValue::str(k.name.as_str())),
-                            ("ns", crate::payload::ctor(DELTA, ns_ctor(k.ns), Vec::new())),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-        (
-            "reason",
-            crate::payload::ctor(DELTA, reason_ctor(cluster.reason), Vec::new()),
-        ),
-    ])
-}
-
-fn ns_ctor(ns: ply_test::bisect::Ns) -> &'static str {
-    match ns {
-        ply_test::bisect::Ns::Value => "Value",
-        ply_test::bisect::Ns::Decl => "Decl",
-    }
-}
-
-fn kind_ctor(kind: ply_test::bisect::ChangeKind) -> &'static str {
-    match kind {
-        ply_test::bisect::ChangeKind::Edited => "Edited",
-        ply_test::bisect::ChangeKind::Derived => "Derived",
-        ply_test::bisect::ChangeKind::Added => "Added",
-        ply_test::bisect::ChangeKind::Removed => "Removed",
-    }
-}
-
-fn reason_ctor(reason: ply_test::bisect::FusionReason) -> &'static str {
-    match reason {
-        ply_test::bisect::FusionReason::Independent => "Independent",
-        ply_test::bisect::FusionReason::InterfaceChanged => "InterfaceChanged",
-        ply_test::bisect::FusionReason::Existence => "Existence",
-        ply_test::bisect::FusionReason::Component => "Component",
-    }
-}
-
-fn skipped_ctor(skipped: ply_test::bisect::Skipped) -> &'static str {
-    match skipped {
-        ply_test::bisect::Skipped::NotRequested => "NotRequested",
-        ply_test::bisect::Skipped::NeverPassed => "NeverPassed",
-        ply_test::bisect::Skipped::Host => "Host",
-        ply_test::bisect::Skipped::Nondet => "Nondet",
-        ply_test::bisect::Skipped::Panicked => "Panicked",
-        ply_test::bisect::Skipped::NoChanges => "NoChanges",
-        ply_test::bisect::Skipped::NoBodies => "NoBodies",
-        ply_test::bisect::Skipped::NoHybrids => "suite.bisect.NoHybrids",
-        ply_test::bisect::Skipped::Delegated => "Delegated",
-    }
+fn ns_value(ns: ply_test::Ns) -> PlyValue {
+    case(
+        "Ns",
+        match ns {
+            ply_test::Ns::Value => "Value",
+            ply_test::Ns::Decl => "Decl",
+        },
+        Vec::new(),
+    )
 }

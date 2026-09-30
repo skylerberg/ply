@@ -1,194 +1,15 @@
-//! Selecting, caching and reporting obligations.
+//! Discharging obligations, and the evidence they are filed and read back under.
 
-use ply_prove::key::{prove_key, result_key};
 use ply_prove::{
-    CaseReport, Certificate, Coverage, Discharge, Evidence, Obligation, ObligationKind, ProvePlan,
-    ProveReport, Rule, Tier,
+    CaseReport, Certificate, Discharge, Evidence, Obligation, ProvePlan, ProveReport, Rule,
 };
-use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::{
-    CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule, ReviewRecord,
-    Store,
+    CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule, Store,
 };
-use ply_ty::CheckOutput;
-use ply_ty::{DefHash, HashOutput};
+use ply_ty::DefHash;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
-
-/// What each law hashes to, and which definitions it speaks about.
-#[derive(Clone, Debug, Default)]
-pub struct Laws {
-    targets: BTreeMap<Symbol, BTreeSet<Symbol>>,
-    hashes: BTreeMap<Symbol, DefHash>,
-    /// The law as a *sentence*, for the review baseline only.
-    texts: BTreeMap<Symbol, DefHash>,
-}
-
-impl Laws {
-    pub fn of(check: &CheckOutput, hashes: &HashOutput) -> Laws {
-        let mut laws = Laws::default();
-        for law in &check.laws {
-            let Some(&hash) = hashes.laws.get(law.index) else {
-                continue;
-            };
-            let text = hashes.law_texts.get(law.index).copied().unwrap_or(hash);
-            let targets = hashes
-                .deps
-                .get(&law.key)
-                .into_iter()
-                .flatten()
-                .filter(|name| check.defs.contains_key(*name))
-                .cloned();
-            laws.insert(law.key.clone(), hash, text, targets);
-        }
-        laws
-    }
-
-    pub fn insert(
-        &mut self,
-        key: Symbol,
-        hash: DefHash,
-        text: DefHash,
-        targets: impl IntoIterator<Item = Symbol>,
-    ) {
-        self.targets.entry(key.clone()).or_default().extend(targets);
-        self.hashes.insert(key.clone(), hash);
-        self.texts.insert(key, text);
-    }
-
-    pub fn targets(&self, law: &Symbol) -> Option<&BTreeSet<Symbol>> {
-        self.targets.get(law)
-    }
-
-    /// Every law sentence naming this definition: rewriting a law changes its targets' spec.
-    pub fn naming(&self, name: &Symbol) -> Vec<DefHash> {
-        self.targets
-            .iter()
-            .filter(|(_, targets)| targets.contains(name))
-            .filter_map(|(law, _)| self.texts.get(law).copied())
-            .collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.hashes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.hashes.is_empty()
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Reason {
-    /// Nothing is recorded under any key this run may read.
-    New,
-    /// A proof, read under the bare key.
-    Proved,
-    /// A sampled discharge, read under this exact plan's key.
-    Sampled,
-    /// `--no-cache`.
-    Uncached,
-    /// Recorded under a key it does not belong under, or a label its evidence does not support.
-    Refused,
-}
-
-impl Reason {
-    /// The word a reason crosses as, and back: the program prints these and the runtime reads them.
-    pub fn parse(word: &str) -> Option<Reason> {
-        match word {
-            "new" => Some(Reason::New),
-            "cached proof" => Some(Reason::Proved),
-            "cached sample" => Some(Reason::Sampled),
-            "uncached" => Some(Reason::Uncached),
-            "cache refused" => Some(Reason::Refused),
-            _ => None,
-        }
-    }
-
-    pub fn hit(self) -> bool {
-        matches!(self, Reason::Proved | Reason::Sampled)
-    }
-}
-
-pub struct Answer {
-    pub reason: Reason,
-    pub evidence: Option<Evidence>,
-    /// A refusal, reported: a cache that silently declines looks like a slow prover.
-    pub warning: Option<Diagnostic>,
-}
-
-impl Answer {
-    fn miss(reason: Reason) -> Answer {
-        Answer {
-            reason,
-            evidence: None,
-            warning: None,
-        }
-    }
-
-    fn refused(key: DefHash, why: &str) -> Answer {
-        Answer {
-            reason: Reason::Refused,
-            evidence: None,
-            warning: Some(
-                Diagnostic::warning(
-                    codes::CACHE_CORRUPT,
-                    format!(
-                        "the obligation cache holds {why} for `{}`; it was discarded",
-                        key.short()
-                    ),
-                )
-                .note("the obligation was discharged again, so no claim rests on it")
-                .note("run `ply cache clear` if it happens again"),
-            ),
-        }
-    }
-}
-
-/// A proof may only sit under the bare key, and a sample only under this plan's key.
-pub fn lookup(store: &Store, key: DefHash, plan: &ProvePlan) -> Answer {
-    if let Some(entry) = store.obligation(key) {
-        return match from_cached(&entry) {
-            Ok(evidence @ Evidence::Proof(_)) => Answer {
-                reason: Reason::Proved,
-                evidence: Some(evidence),
-                warning: None,
-            },
-            Ok(Evidence::Cases(_)) => {
-                Answer::refused(key, "a sampled discharge under the bare key")
-            }
-            Err(mismatch) => Answer::refused(key, &mismatch),
-        };
-    }
-
-    let Some(entry) = store.obligation(prove_key(key, plan)) else {
-        return Answer::miss(Reason::New);
-    };
-    match from_cached(&entry) {
-        Ok(evidence @ Evidence::Cases(_)) => Answer {
-            reason: Reason::Sampled,
-            evidence: Some(evidence),
-            warning: None,
-        },
-        Ok(Evidence::Proof(_)) => Answer::refused(key, "a proof under a plan key"),
-        Err(mismatch) => Answer::refused(key, &mismatch),
-    }
-}
-
-pub fn record(store: &mut Store, key: DefHash, discharge: &Discharge, plan: &ProvePlan) -> bool {
-    let Discharge::Held(evidence) = discharge else {
-        return false;
-    };
-    let tier = evidence.tier();
-    let at = result_key(key, Some(tier), plan);
-    // Defensive: only a proof may land on the bare key.
-    if tier != Tier::Proved && at == key {
-        return false;
-    }
-    store.put_obligation(at, to_cached(evidence));
-    true
-}
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 pub fn to_cached(evidence: &Evidence) -> CachedObligation {
     CachedObligation {
@@ -302,10 +123,8 @@ fn from_cached_rule(rule: &CachedRule) -> Rule {
     }
 }
 
-/// What the cache answered for each obligation, parallel to the obligation list.
-/// What a program decided about the obligations it asked about: which the cache could not answer
-/// for, and the reason for each, in collection order. The runtime reads the evidence back from the
-/// store for the ones it does not discharge.
+/// What a program decided about the obligations it asked about: which it reports on, which of those
+/// the cache could not answer for, and the key each answered one's evidence is read back from.
 #[derive(Clone, Debug, Default)]
 pub struct Choice {
     /// Which obligations the run reports on, by collection index, ascending.
@@ -315,8 +134,8 @@ pub struct Choice {
     pub domains: Vec<(usize, Domain)>,
     /// Positions in `claims` the cache could not answer for, in order.
     pub to_discharge: Vec<usize>,
-    /// One reason per position in `claims`.
-    pub reasons: Vec<Reason>,
+    /// Positions in `claims` the cache answered for, and the key each one's evidence is under.
+    pub read: Vec<(usize, DefHash)>,
 }
 
 /// A finite domain, as the program measured it: how many values each binder's type holds, in binder
@@ -326,83 +145,6 @@ pub struct Choice {
 pub struct Domain {
     pub sizes: Vec<u64>,
     pub name: String,
-}
-
-pub struct Selection {
-    pub reasons: Vec<Reason>,
-    pub cached: Vec<Option<Evidence>>,
-    /// Indices the cache could not answer for, in order.
-    pub to_discharge: Vec<usize>,
-    pub warnings: Vec<Diagnostic>,
-}
-
-impl Selection {
-    /// The runtime's view of the program's decision. A cached obligation was answered under a key
-    /// the program asked about, so its evidence is read back rather than carried; a `law/host` is
-    /// never cached, and the program says so by not putting it in `to_discharge`.
-    pub fn chosen(
-        choice: &Choice,
-        obligations: &[Obligation],
-        store: &Store,
-        plan: &ProvePlan,
-    ) -> Selection {
-        let mut selection = Selection {
-            reasons: choice.reasons.clone(),
-            cached: Vec::with_capacity(obligations.len()),
-            to_discharge: Vec::new(),
-            warnings: Vec::new(),
-        };
-        for (index, obligation) in obligations.iter().enumerate() {
-            if choice.to_discharge.contains(&index) {
-                selection.to_discharge.push(index);
-                selection.cached.push(None);
-                continue;
-            }
-            let answer = lookup(store, obligation.key, plan);
-            // The program decided *that* this one was refused; the runtime is the only side that can
-            // say what was under the key, so it is what describes the refusal.
-            if choice.reasons.get(index) == Some(&Reason::Refused) {
-                selection.warnings.extend(answer.warning);
-            }
-            selection.cached.push(answer.evidence);
-        }
-        selection
-    }
-
-    pub fn hits(&self) -> usize {
-        self.reasons.iter().filter(|r| r.hit()).count()
-    }
-}
-
-pub fn select(
-    obligations: &[Obligation],
-    store: &Store,
-    plan: &ProvePlan,
-    use_cache: bool,
-) -> Selection {
-    let mut selection = Selection {
-        reasons: Vec::with_capacity(obligations.len()),
-        cached: Vec::with_capacity(obligations.len()),
-        to_discharge: Vec::new(),
-        warnings: Vec::new(),
-    };
-    for (index, obligation) in obligations.iter().enumerate() {
-        // A `law/host` is never cached: a verdict against a real database is about that moment.
-        let answer = if use_cache && !obligation.host {
-            lookup(store, obligation.key, plan)
-        } else {
-            Answer::miss(Reason::Uncached)
-        };
-        if let Some(warning) = answer.warning {
-            selection.warnings.push(warning);
-        }
-        if answer.evidence.is_none() {
-            selection.to_discharge.push(index);
-        }
-        selection.reasons.push(answer.reason);
-        selection.cached.push(answer.evidence);
-    }
-    selection
 }
 
 pub trait Discharger: Sync {
@@ -416,31 +158,14 @@ pub trait Discharger: Sync {
     ) -> Discharge;
 }
 
-pub struct Proved {
-    pub report: ProveReport,
-    /// Parallel to [`ProveReport::obligations`]: exactly one answer each, from cache or work.
-    pub reasons: Vec<Reason>,
-    pub warnings: Vec<Diagnostic>,
-}
-
-pub fn prove(
-    obligations: Vec<Obligation>,
-    check: &CheckOutput,
-    laws: &Laws,
-    store: &mut Store,
-    plan: &ProvePlan,
-    use_cache: bool,
-    discharger: &dyn Discharger,
-) -> Proved {
-    Asked::new(obligations, store, plan, use_cache).discharge(check, laws, store, discharger)
-}
-
-/// [`prove`] up to what the cache answered, so a discharger is built only when one is needed.
+/// A program's decision, carried out up to what the cache answered, so a discharger is built only
+/// when one is needed.
 pub struct Asked {
     obligations: Vec<Obligation>,
-    selection: Selection,
+    /// The evidence read back for each position the cache answered for.
+    cached: Vec<Option<Evidence>>,
+    to_discharge: Vec<usize>,
     plan: ProvePlan,
-    use_cache: bool,
     started: Instant,
     /// What the program measured, keyed by the obligation's position in `obligations` — the same
     /// index `to_discharge` holds. The discharge of a claim the program measured walks the points it
@@ -449,72 +174,50 @@ pub struct Asked {
 }
 
 impl Asked {
-    /// [`Asked::new`], from the decision the program made instead of one this side computes. The
-    /// cache is not consulted again: what the program did not name is what it found.
+    /// The evidence of every answered obligation is read back under the key the program named.
     pub fn chosen(
         obligations: Vec<Obligation>,
         choice: &Choice,
         store: &Store,
         plan: &ProvePlan,
-        use_cache: bool,
     ) -> Asked {
         let started = Instant::now();
-        let plan = plan.clone().normalized();
-        let selection = Selection::chosen(choice, &obligations, store, &plan);
+        let mut cached: Vec<Option<Evidence>> = vec![None; obligations.len()];
+        for (at, key) in &choice.read {
+            if let Some(slot) = cached.get_mut(*at) {
+                *slot = store
+                    .obligation(*key)
+                    .and_then(|entry| from_cached(&entry).ok());
+            }
+        }
         Asked {
             obligations,
-            selection,
-            plan,
-            use_cache,
+            cached,
+            to_discharge: choice.to_discharge.clone(),
+            plan: plan.clone().normalized(),
             started,
             domains: choice.domains.iter().cloned().collect(),
         }
     }
 
-    pub fn new(
-        obligations: Vec<Obligation>,
-        store: &Store,
-        plan: &ProvePlan,
-        use_cache: bool,
-    ) -> Asked {
-        let started = Instant::now();
-        let plan = plan.clone().normalized();
-        let selection = select(&obligations, store, &plan, use_cache);
-        Asked {
-            obligations,
-            selection,
-            plan,
-            use_cache,
-            started,
-            domains: BTreeMap::new(),
-        }
-    }
-
     /// Whether the cache left anything to discharge.
     pub fn pending(&self) -> bool {
-        !self.selection.to_discharge.is_empty()
+        !self.to_discharge.is_empty()
     }
 
-    pub fn discharge(
-        self,
-        check: &CheckOutput,
-        laws: &Laws,
-        store: &mut Store,
-        discharger: &dyn Discharger,
-    ) -> Proved {
+    pub fn discharge(self, discharger: &dyn Discharger) -> ProveReport {
         let Asked {
             obligations,
-            selection,
+            cached,
+            to_discharge,
             plan,
-            use_cache,
             started,
             domains,
         } = self;
-        let mut warnings = selection.warnings;
 
-        let fresh: Vec<(usize, Discharge)> = selection
-            .to_discharge
+        let fresh: Vec<(usize, Discharge)> = to_discharge
             .par_iter()
+            .filter(|&&index| index < obligations.len())
             .map(|&index| {
                 (
                     index,
@@ -523,15 +226,11 @@ impl Asked {
             })
             .collect();
 
-        let mut discharges: Vec<Option<Discharge>> = selection
-            .cached
+        let mut discharges: Vec<Option<Discharge>> = cached
             .into_iter()
             .map(|evidence| evidence.map(Discharge::Held))
             .collect();
         for (index, discharge) in fresh {
-            if use_cache && !obligations[index].host {
-                record(store, obligations[index].key, &discharge, &plan);
-            }
             discharges[index] = Some(discharge);
         }
 
@@ -549,270 +248,10 @@ impl Asked {
             })
             .collect();
 
-        warnings.extend(store.take_warnings());
-        let coverage = coverage(check, laws, &paired);
-        Proved {
-            report: ProveReport {
-                obligations: paired,
-                coverage,
-                plan,
-                cached: selection.reasons.iter().filter(|r| r.hit()).count(),
-                duration: started.elapsed(),
-            },
-            reasons: selection.reasons,
-            warnings,
+        ProveReport {
+            obligations: paired,
+            plan,
+            duration: started.elapsed(),
         }
-    }
-}
-
-pub struct Undecided;
-
-impl Discharger for Undecided {
-    fn discharge(
-        &self,
-        obligation: &Obligation,
-        _plan: &ProvePlan,
-        _domain: Option<&Domain>,
-    ) -> Discharge {
-        Discharge::Unattempted(ply_prove::Gap::UnhandledEffect(
-            obligation.footprint.clone(),
-        ))
-    }
-}
-
-/// The review surface: how much of the program a reader still has to read line by line.
-pub fn coverage(check: &CheckOutput, laws: &Laws, results: &[(Obligation, Discharge)]) -> Coverage {
-    let mut strongest: BTreeMap<Symbol, Tier> = BTreeMap::new();
-    let mut by_tier: BTreeMap<Tier, usize> = BTreeMap::new();
-
-    for (obligation, discharge) in results {
-        let Some(tier) = discharge.tier() else {
-            continue;
-        };
-        let covered: Vec<Symbol> = match obligation.kind {
-            ObligationKind::Ensures { .. } => vec![obligation.owner.clone()],
-            ObligationKind::Law => laws
-                .targets(&obligation.owner)
-                .map(|names| names.iter().cloned().collect())
-                .unwrap_or_default(),
-        };
-        for name in covered {
-            if !check.defs.contains_key(&name) {
-                continue;
-            }
-            strongest
-                .entry(name)
-                .and_modify(|best| *best = (*best).max(tier))
-                .or_insert(tier);
-        }
-    }
-
-    for tier in strongest.values() {
-        *by_tier.entry(*tier).or_insert(0) += 1;
-    }
-
-    let mut uncovered: Vec<Symbol> = check
-        .defs
-        .keys()
-        .filter(|name| !strongest.contains_key(*name))
-        .cloned()
-        .collect();
-    uncovered.sort();
-
-    Coverage {
-        definitions: check.defs.len(),
-        covered: strongest.len(),
-        uncovered,
-        by_tier,
-    }
-}
-
-/// How many definitions carry at least one obligation at all, whatever became of it.
-pub fn specified(check: &CheckOutput, laws: &Laws, obligations: &[Obligation]) -> usize {
-    let mut named: BTreeSet<Symbol> = BTreeSet::new();
-    for obligation in obligations {
-        match obligation.kind {
-            ObligationKind::Ensures { .. } => {
-                named.insert(obligation.owner.clone());
-            }
-            ObligationKind::Law => {
-                if let Some(targets) = laws.targets(&obligation.owner) {
-                    named.extend(targets.iter().cloned());
-                }
-            }
-        }
-    }
-    named
-        .iter()
-        .filter(|name| check.defs.contains_key(*name))
-        .count()
-}
-
-/// Whether something moved since the baseline a human accepted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Moved {
-    Unchanged,
-    Changed,
-    /// No baseline: never accepted, or its name moved and took its baseline with it.
-    Never,
-}
-
-#[derive(Clone, Debug)]
-pub struct Reviewed {
-    pub name: Symbol,
-    pub implementation: Moved,
-    pub spec: Moved,
-    /// Indices into [`ProveReport::obligations`], in report order.
-    pub obligations: Vec<usize>,
-    /// How many of them the machine actually established.
-    pub holding: usize,
-}
-
-impl Reviewed {
-    /// Whether anything about this definition is a claim **the machine established**.
-    pub fn specified(&self) -> bool {
-        self.holding > 0
-    }
-
-    pub fn claimed(&self) -> bool {
-        !self.obligations.is_empty()
-    }
-
-    pub fn changed(&self) -> bool {
-        self.implementation != Moved::Unchanged || self.spec != Moved::Unchanged
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ReviewReport {
-    pub definitions: usize,
-    /// Definitions with a baseline at all.
-    pub reviewed: usize,
-    /// Only the definitions that moved, in program order.
-    pub changed: Vec<Reviewed>,
-    pub coverage: Coverage,
-    /// Obligations attached to a changed definition that did **not** hold.
-    pub broken: usize,
-    /// How many of those were never discharged at all, rather than refuted or found vacuous.
-    pub undischarged: usize,
-    pub duration: Duration,
-}
-
-impl ReviewReport {
-    pub fn specified(&self) -> usize {
-        self.changed.iter().filter(|r| r.specified()).count()
-    }
-
-    pub fn unspecified(&self) -> usize {
-        self.changed.len() - self.specified()
-    }
-}
-
-/// Which definitions moved, whether their claims moved with them, and what became of those claims.
-pub fn review(
-    check: &CheckOutput,
-    hashes: &HashOutput,
-    laws: &Laws,
-    store: &Store,
-    report: &ProveReport,
-) -> ReviewReport {
-    let started = Instant::now();
-    let mut owed: BTreeMap<Symbol, Vec<usize>> = BTreeMap::new();
-    for (index, (obligation, _)) in report.obligations.iter().enumerate() {
-        for name in owners(obligation, laws) {
-            owed.entry(name).or_default().push(index);
-        }
-    }
-
-    let mut out = ReviewReport {
-        definitions: check.defs.len(),
-        coverage: report.coverage.clone(),
-        duration: Duration::ZERO,
-        ..ReviewReport::default()
-    };
-
-    for name in check.defs.keys() {
-        let Some(&def_hash) = hashes.defs.get(name) else {
-            continue;
-        };
-        let current = ReviewRecord::new(def_hash, spec_hashes(name, hashes, laws));
-        let baseline = store.review_record(name);
-        if baseline.is_some() {
-            out.reviewed += 1;
-        }
-        let (implementation, spec) = match baseline {
-            None => (Moved::Never, Moved::Never),
-            Some(record) => (
-                moved(record.def_hash == current.def_hash),
-                moved(record.specs == current.specs),
-            ),
-        };
-        let obligations = owed.get(name).cloned().unwrap_or_default();
-        let holding = obligations
-            .iter()
-            .filter(|&&i| report.obligations[i].1.holds())
-            .count();
-        let reviewed = Reviewed {
-            name: name.clone(),
-            implementation,
-            spec,
-            obligations,
-            holding,
-        };
-        if reviewed.changed() {
-            for &index in &reviewed.obligations {
-                match &report.obligations[index].1 {
-                    Discharge::Held(_) => {}
-                    Discharge::Unattempted(_) => {
-                        out.broken += 1;
-                        out.undischarged += 1;
-                    }
-                    Discharge::Refuted(_) | Discharge::Vacuous(_) => out.broken += 1,
-                }
-            }
-            out.changed.push(reviewed);
-        }
-    }
-    out.duration = started.elapsed();
-    out
-}
-
-pub fn accept(check: &CheckOutput, hashes: &HashOutput, laws: &Laws, store: &mut Store) -> usize {
-    let mut accepted = 0;
-    for name in check.defs.keys() {
-        let Some(&def_hash) = hashes.defs.get(name) else {
-            continue;
-        };
-        store.put_review_record(
-            name.clone(),
-            ReviewRecord::new(def_hash, spec_hashes(name, hashes, laws)),
-        );
-        accepted += 1;
-    }
-    accepted
-}
-
-/// Every claim about one definition: its own clause keys and every law naming it directly.
-fn spec_hashes(name: &Symbol, hashes: &HashOutput, laws: &Laws) -> Vec<DefHash> {
-    let mut out: Vec<DefHash> = hashes.spec_texts.get(name).cloned().unwrap_or_default();
-    out.extend(laws.naming(name));
-    out
-}
-
-fn owners(obligation: &Obligation, laws: &Laws) -> Vec<Symbol> {
-    match obligation.kind {
-        ObligationKind::Ensures { .. } => vec![obligation.owner.clone()],
-        ObligationKind::Law => laws
-            .targets(&obligation.owner)
-            .map(|names| names.iter().cloned().collect())
-            .unwrap_or_default(),
-    }
-}
-
-fn moved(same: bool) -> Moved {
-    if same {
-        Moved::Unchanged
-    } else {
-        Moved::Changed
     }
 }

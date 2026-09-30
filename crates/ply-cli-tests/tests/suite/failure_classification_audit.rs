@@ -521,19 +521,13 @@ fn a_pruned_body_store_says_no_bodies_and_not_no_hybrids() {
     let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
     let culprit = &v["failures"][0]["culprit"];
     assert_eq!(v["failures"][0]["defect"], false, "{v}");
-    // The search is the program's now, so a pruned store surfaces where the trial does: the search
-    // is inconclusive and says the body is missing, rather than the runtime refusing before it.
-    assert_eq!(culprit["verdict"], "inconclusive", "{culprit}");
+    // Two edits need a mixture to tell apart and none can be built, so no trial is run at all.
+    assert_eq!(culprit["verdict"], "not_attempted", "{culprit}");
+    assert_eq!(culprit["skipped"], "no_bodies", "{culprit}");
+    assert_eq!(culprit["search"]["evaluated"], 0, "{culprit}");
     assert!(
         culprit["definitions"].as_array().unwrap().is_empty(),
         "nothing may be named when no mixture could be run: {culprit}"
-    );
-    assert!(
-        culprit["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("missing from the store"),
-        "{culprit}"
     );
 }
 

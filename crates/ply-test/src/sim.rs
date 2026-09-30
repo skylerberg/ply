@@ -1,8 +1,7 @@
 //! What a run's searches are written under, and what it reports about them.
 
-use crate::key::{result_key, seed_key, writes_seed_keys};
 use ply_eval::explore::Interleaving;
-use ply_eval::{Exploration, Machine, Plan, Seed};
+use ply_eval::{Exploration, Machine, Seed};
 use ply_span::Diagnostic;
 use ply_ty::DefHash;
 
@@ -46,15 +45,9 @@ impl Record {
     }
 }
 
-/// `run` is the plan the result is published under; `ran` is what this test searched, which
-/// differs only when `random` narrowed a widened root set.
-pub fn record_under(
-    test_hash: DefHash,
-    seeded: bool,
-    run: &Plan,
-    ran: &Plan,
-    exploration: Option<&Exploration>,
-) -> Record {
+/// Whether a green verdict may be written under the keys the program filed it under: a search that
+/// spent its budget, or one that was never observed, proved nothing.
+pub fn record_under(filed: &[DefHash], seeded: bool, exploration: Option<&Exploration>) -> Record {
     if seeded && exploration.is_none() {
         return Record::Unobserved;
     }
@@ -62,19 +55,7 @@ pub fn record_under(
     if exploration.is_some_and(|e| !e.is_cacheable()) {
         return Record::Exhausted;
     }
-    if !seeded {
-        return Record::Under(vec![result_key(test_hash, false, run)]);
-    }
-    let mut keys = Vec::with_capacity(ran.roots.len() + 1);
-    if writes_seed_keys(run) {
-        keys.extend(
-            ran.roots
-                .iter()
-                .map(|&root| seed_key(test_hash, &Seed::root(root))),
-        );
-    }
-    keys.push(result_key(test_hash, true, run));
-    Record::Under(keys)
+    Record::Under(filed.to_vec())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
