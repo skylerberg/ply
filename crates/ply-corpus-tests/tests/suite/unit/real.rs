@@ -1,7 +1,7 @@
 //! The real-code row, end to end: the checkout's compiler and CLI, front-ended by the product
 //! itself, with the digest each member is pinned by beside the verdicts.
 
-use crate::support::{corpus, document, repo};
+use crate::support::{corpus, document, measured, outcome, repo, row};
 use std::path::Path;
 
 /// The pin, taken here the way the program says it takes it: BLAKE3 over every `.ply` file and
@@ -55,6 +55,12 @@ fn the_toolchain_trees_frontend_clean_at_their_pins() {
     assert_eq!(report["ok"].as_bool(), Some(true), "{report:#}");
     let members = report["members"].as_array().expect("members is an array");
     assert_eq!(members.len(), 2);
+    let rows = report["rows"].as_array().expect("rows is an array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "one check row for each member, the tests skipped: {report:#}"
+    );
 
     let compiler = &members[0];
     assert_eq!(compiler["name"].as_str(), Some("compiler"));
@@ -63,10 +69,12 @@ fn the_toolchain_trees_frontend_clean_at_their_pins() {
         Some(pin_of(&["crates/ply-compiler/ply"]).as_str()),
         "{compiler:#}"
     );
-    assert_eq!(compiler["check"]["ok"].as_bool(), Some(true));
+    let checked = row(&report, "compiler check");
+    assert_eq!(outcome(checked), "pass", "{checked:#}");
+    assert_eq!(checked["detail"], compiler["digest"], "{checked:#}");
     assert!(
-        compiler["definitions"].as_i64().unwrap_or(0) > 1000,
-        "the compiler is the real one: {compiler:#}"
+        measured(checked, "definitions") > 1000.0,
+        "the compiler is the real one: {checked:#}"
     );
 
     // The CLI reads the packages its manifest names by path, so its pin covers them too.
@@ -93,5 +101,5 @@ fn the_toolchain_trees_frontend_clean_at_their_pins() {
         ),
         "{cli:#}"
     );
-    assert_eq!(cli["check"]["ok"].as_bool(), Some(true));
+    assert_eq!(outcome(row(&report, "cli check")), "pass", "{report:#}");
 }
