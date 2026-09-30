@@ -36,6 +36,7 @@ jobs:
     outputs:
       partitions: ${{ steps.tables.outputs.partitions }}
       solo: ${{ steps.tables.outputs.solo }}
+      corpus: ${{ steps.tables.outputs.corpus }}
       shards: ${{ steps.cut.outputs.shards }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -91,6 +92,7 @@ jobs:
         run: |
           echo "partitions=$(.github/ci-shards.sh partitions)" >> "$GITHUB_OUTPUT"
           echo "solo=$(.github/ci-shards.sh solo-matrix)" >> "$GITHUB_OUTPUT"
+          echo "corpus=$(.github/ci-shards.sh corpus-matrix)" >> "$GITHUB_OUTPUT"
 
   fmt:
     name: cargo fmt --all --check
@@ -175,14 +177,6 @@ jobs:
       - name: cargo test --workspace --no-run
         if: steps.reuse.outputs.reused != 'true'
         run: cargo test --locked --workspace --no-run
-      # No test target of its own package builds the corpus executor, so nothing else would; the
-      # archive takes it by name (`.config/nextest.toml`).
-      - name: The corpus executor
-        if: steps.reuse.outputs.reused != 'true'
-        run: |
-          set -euo pipefail
-          cargo build --locked -p ply-corpus --bin ply-corpus
-          strip --strip-debug target/debug/ply-corpus
       # nextest does not run doctests.
       - name: cargo test --doc
         if: steps.reuse.outputs.reused != 'true'
@@ -362,10 +356,9 @@ jobs:
 
   # `build-ply`'s self-test is the run's first `ply`, so the emitter's own unit is emitted and
   # compiled there, under the compiler every suite job compiles it with, and saved under this
-  # run's emitter key. That leaves the corpus program's unit, which only a run of the program by the
-  # archive's `ply` builds, and this is the job with the archive: it restores the emission, adds the
-  # corpus program to it, and republishes the set under this run's key for the shards and, from
-  # main, under the tree's key for a later run whose sources have not moved.
+  # run's emitter key. This job, which holds the archive, restores that emission and republishes it
+  # under this run's key for the shards and, from main, under the tree's key for a later run whose
+  # sources have not moved.
   stage:
     name: the emitter's stage
     needs: [build, build-ply]
@@ -393,9 +386,9 @@ jobs:
 
   test:
     name: test ${{ matrix.shard }}/${{ matrix.of }}
-    # The stage is a cache, not an input: a shard restores the emitter's own key from `build-ply`
-    # and warms the corpus program's itself, so it does not wait the emitter's whole stage out. On a
-    # pull request, where `refresh` does not run, this is the run's critical path.
+    # The stage is a cache, not an input: a shard restores the emitter's own key from `build-ply`,
+    # so it does not wait the emitter's whole stage out. On a pull request, where `refresh` does not
+    # run, this is the run's critical path.
     needs: [plan, build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -676,6 +669,71 @@ jobs:
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --no-fail-fast --success-output immediate -E "$filter"
 
+  # The corpus's Ply tests, a runner an entry of `ci-shards.sh corpus-matrix`: the program's own, then
+  # each module of `crates/ply-corpus/checks`, whose checks spawn this run's `ply` over corpora, desks
+  # and floors with the grants `benches/corpus.sh` gives the program. Postgres beside it holds the
+  # desk's schema, and the database checks are handed its URL as `CORPUS_DB`.
+  corpus:
+    name: test corpus ${{ matrix.id }}
+    needs: [plan, build, build-ply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.corpus) }}
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: desk
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/suite
+      - name: psql, and the libpq the floor links
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client libpq-dev
+      - name: The desk's schema
+        run: psql -v ON_ERROR_STOP=1 -q -h 127.0.0.1 -U postgres -d desk -f examples/desk.sql
+      # Built as `benches/corpus.sh` builds them, and named bound in `CORPUS_BOUND` as it names them.
+      - name: The floors the served tables are compared with
+        run: |
+          set -euo pipefail
+          cc -O2 -o target/http-floor benches/http-floor/floor.c -lpthread
+          cc -O2 -o target/pg-floor benches/pg-floor/pg.c -I"$(pg_config --includedir)" -L"$(pg_config --libdir)" -lpq
+      # A check may take minutes and make any number of calls; a quarter of an hour abandons one.
+      - name: ply test
+        env:
+          ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          read -r path filter < <(.github/ci-shards.sh corpus-line "$ID")
+          ply="$PWD/target/debug/ply"
+          "$ply" test "$path" ${filter:+--filter "$filter"} --host --timeout 900000 --steps 0 \
+            --exec "ply=$ply" --exec "http_floor=$PWD/target/http-floor" --exec "pg_floor=$PWD/target/pg-floor" \
+            --allow machine --allow claims --fs work=. --fs "repo=$PWD" \
+            --set CORPUS_BOUND=http_floor,pg_floor \
+            --set CORPUS_DB=postgres://postgres@127.0.0.1:5432/desk
+      # The programs under `fixtures/` the corpus runs: each checks, and tests something that passes.
+      - name: The fixtures' own tests
+        if: matrix.id == 'program'
+        run: |
+          set -euo pipefail
+          for fixture in crates/ply-corpus/fixtures/*.ply; do
+            target/debug/ply test "$fixture" --no-cache --json > /tmp/fixture.json || { cat /tmp/fixture.json; exit 1; }
+            jq -e '.summary.passed > 0' /tmp/fixture.json > /dev/null || { echo "$fixture tested nothing" >&2; exit 1; }
+          done
+
   ucontext-probe:
     name: ./probes/ucontext/run.sh
     runs-on: ubuntu-24.04
@@ -696,7 +754,7 @@ jobs:
   sweep:
     name: give back this run's caches
     if: ${{ always() && !failure() && !cancelled() }}
-    needs: [stage, test, solo, gates, test-hosts, refresh]
+    needs: [stage, test, solo, gates, test-hosts, corpus, refresh]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -734,6 +792,7 @@ jobs:
         solo,
         gates,
         test-hosts,
+        corpus,
         ucontext-probe,
         sweep,
       ]

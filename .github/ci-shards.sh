@@ -20,6 +20,8 @@
 #                                nextest JUnit report
 #   ci-shards.sh solo-matrix     the JSON matrix of tests that run alone
 #   ci-shards.sh solo-filter ID  the nextest filterset selecting one solo test
+#   ci-shards.sh corpus-matrix   the JSON matrix of the corpus's Ply test runs
+#   ci-shards.sh corpus-line ID  the package one of them tests and its filter
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the other
 #                                jobs: the solo tests, the shutdown suite and
 #                                the postgres packages
@@ -49,13 +51,13 @@ SOLO=(
   "archive-round-trip:ply-cli-tests:suite:bootstrap_archive::an_archive_is_written_and_verifies_against_the_tree_it_came_from"
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
   "corpus-session-audit:ply-cli-tests:suite:incremental_audit::a_long_session_over_the_example_corpus_agrees_at_every_step"
-  # The corpus's own served benches, which nothing in a shard reaches: each binds real listeners, and
-  # the CLI's reservations do not cover another crate's, so each gets a runner of its own.
-  "corpus-socket-bench:ply-corpus-tests:suite:served::the_socket_bench_serves_the_desk_and_its_floor"
-  "corpus-database-bench:ply-corpus-tests:suite:served::the_database_bench_takes_what_needs_no_database_and_names_what_does"
-  "corpus-lifecycle-bench:ply-corpus-tests:suite:served::the_lifecycle_bench_drains_and_deploys_and_names_what_needs_a_database"
-  "corpus-ladder:ply-corpus-tests:suite:served::the_ladder_serves_the_desk_and_holds_the_shipped_allocation_figure"
 )
+
+# The corpus's Ply tests, a runner an entry: the program's own, then each module of the checks package
+# that declares a test, selected by its name. Every check spawns `ply`, so one run takes them one after
+# another, and the modules run side by side.
+CORPUS_PROGRAM=crates/ply-corpus/ply
+CORPUS_CHECKS=crates/ply-corpus/checks
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.
 # `test-hosts` runs them in one job. The set was named for postgres when the driver lived in the
@@ -164,6 +166,42 @@ cmd_solo_filter() {
     fi
   done < <(cmd_solo)
   echo "no solo test named '$1'" >&2
+  return 1
+}
+
+# One entry id a line: `program`, then every checks module that declares a test.
+corpus_entries() {
+  local file
+  printf 'program\n'
+  for file in "$root/$CORPUS_CHECKS"/*.ply; do
+    if grep -qE '^test(/[a-z]+)? "' "$file"; then basename "$file" .ply; fi
+  done
+}
+
+cmd_corpus_matrix() {
+  local id first=1
+  printf '{"include":['
+  while read -r id; do
+    ((first)) || printf ','
+    first=0
+    printf '{"id":"%s"}' "$id"
+  done < <(corpus_entries)
+  printf ']}\n'
+}
+
+# `path filter`: the program's entry takes every test of its package, a checks module's its own.
+cmd_corpus_line() {
+  local entry
+  while read -r entry; do
+    [[ $entry == "$1" ]] || continue
+    if [[ $entry == program ]]; then
+      printf '%s\n' "$CORPUS_PROGRAM"
+    else
+      printf '%s %s.\n' "$CORPUS_CHECKS" "$entry"
+    fi
+    return 0
+  done < <(corpus_entries)
+  echo "no corpus entry named '$1'" >&2
   return 1
 }
 
@@ -872,6 +910,34 @@ cmd_verify() {
     done
   fi
 
+  # --- the corpus's Ply tests -------------------------------------------------
+  local corpus_job
+  for dir in "$CORPUS_PROGRAM" "$CORPUS_CHECKS"; do
+    if [[ ! -f "$root/$dir/ply.pkg" ]]; then
+      echo "FAIL: $dir holds no ply.pkg, and a corpus run tests it as a package" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ -f "$root/$CORPUS_CHECKS/program.ply" ]]; then
+    echo "FAIL: $CORPUS_CHECKS/program.ply would be run under the id of the program's own tests" >&2
+    failures=$((failures + 1))
+  fi
+  if [[ $(corpus_entries | grep -c .) -lt 2 ]]; then
+    echo "FAIL: no module of $CORPUS_CHECKS declares a test, so the corpus's checks run nowhere" >&2
+    failures=$((failures + 1))
+  fi
+  corpus_job=$(awk '
+    /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
+    /ci-shards\.sh corpus-line/ { print job; exit }
+  ' "$workflow")
+  if [[ -z $corpus_job ]]; then
+    echo "FAIL: no job in $workflow runs \`ci-shards.sh corpus-line\`, so the corpus's tests run nowhere" >&2
+    failures=$((failures + 1))
+  elif [[ " ${needs//[][,]/ } " != *" $corpus_job "* ]]; then
+    echo "FAIL: job '$corpus_job' runs the corpus's tests, and is not in the \`ci\` job's needs list" >&2
+    failures=$((failures + 1))
+  fi
+
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
   cmd_cache_payloads || failures=$((failures + 1))
@@ -896,7 +962,7 @@ cmd_verify() {
   fi
   local cut="by test count, with nothing measured"
   [[ -s $TIMINGS ]] && cut="from $(grep -c . "$TIMINGS") measured durations"
-  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $PARTITIONS partitions cut $cut"
+  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs; $PARTITIONS partitions cut $cut"
 }
 
 case "${1:-}" in
@@ -907,6 +973,8 @@ case "${1:-}" in
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
   solo-matrix) cmd_solo_matrix ;;
   solo-filter) cmd_solo_filter "${2:?a solo id}" ;;
+  corpus-matrix) cmd_corpus_matrix ;;
+  corpus-line) cmd_corpus_line "${2:?a corpus entry}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
   host-filter) cmd_host_filter ;;
@@ -914,7 +982,7 @@ case "${1:-}" in
   tree-check-filter) cmd_tree_check_filter ;;
   give-back) cmd_give_back "${2:?a run id}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|corpus-matrix|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
     exit 2
     ;;
 esac
