@@ -87,6 +87,7 @@ type Options = {
 }
 type Refusal = Unit
 type Collection = Unit
+type Choice = Unit
 type Verdicts = Unit
 type Baseline = Unit
 type Accepted = Unit
