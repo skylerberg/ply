@@ -91,6 +91,9 @@ pub enum Boundary<'a> {
     EntryPoint {
         name: &'a str,
     },
+    EntryAnswer {
+        name: &'a str,
+    },
 }
 
 impl Boundary<'_> {
@@ -114,6 +117,7 @@ impl Boundary<'_> {
             Boundary::EntryPoint { name } => {
                 format!("`{name}` was called with {what}{reached}")
             }
+            Boundary::EntryAnswer { name } => format!("`{name}` answered {what}{reached}"),
         }
     }
 
@@ -122,6 +126,7 @@ impl Boundary<'_> {
             Boundary::HostArgument { .. } => "performed here",
             Boundary::HostAnswer { .. } | Boundary::HostToken { .. } => "the answer to this",
             Boundary::EntryPoint { .. } => "entered here",
+            Boundary::EntryAnswer { .. } => "answered here",
         }
     }
 
@@ -144,6 +149,10 @@ impl Boundary<'_> {
                  the fixture's generations — so a slot carried out of an earlier run resolves \
                  here and reads whatever this run put at that position",
             ),
+            Boundary::EntryAnswer { .. } => Cow::Borrowed(
+                "an entry point's answer goes to its caller, which keeps it after the entry has \
+                 ended and closed every region it opened",
+            ),
         }
     }
 
@@ -164,6 +173,14 @@ impl Boundary<'_> {
             (Boundary::EntryPoint { .. }, _) => {
                 "call the entry point with data, and let the program make its own cells, tasks \
                  and continuations"
+            }
+            (Boundary::EntryAnswer { .. }, Handle::Cell | Handle::Task) => {
+                "read the value inside the region and answer with something that does not reach \
+                 a region"
+            }
+            (Boundary::EntryAnswer { .. }, Handle::Continuation) => {
+                "resume the continuation before the entry answers, and answer with what it \
+                 answers"
             }
         }
     }

@@ -15,6 +15,10 @@ fn cell() -> Value {
     )
 }
 
+fn task() -> Value {
+    Value::Task(ply_eval::TaskHandle::unowned(ply_eval::sim::TaskId(0)))
+}
+
 fn closure(kind: ClosureKind) -> Value {
     Value::Closure(Arc::new(Closure { name: None, kind }))
 }
@@ -102,11 +106,7 @@ fn a_secret_is_not_a_place_to_hide_a_handle_and_its_shape_stays_redacted() {
 #[test]
 fn a_task_and_a_continuation_are_handles_too() {
     assert_eq!(
-        carries(&Value::Task(ply_eval::TaskHandle::unowned(
-            ply_eval::sim::TaskId(0)
-        )))
-        .expect("a task is a handle")
-        .handle,
+        carries(&task()).expect("a task is a handle").handle,
         Handle::Task
     );
     let found = carries(&continuation()).expect("a continuation is a handle");
@@ -154,6 +154,7 @@ fn every_boundary_refuses_a_continuation_and_names_it() {
         Boundary::EntryPoint {
             name: "m.resume_it",
         },
+        Boundary::EntryAnswer { name: "m.parked" },
     ];
     for boundary in boundaries {
         let d = check(&boundary, &value, Span::DUMMY).expect_err("a continuation is refused");
@@ -169,6 +170,42 @@ fn every_boundary_refuses_a_continuation_and_names_it() {
             d.notes
         );
     }
+}
+
+/// The boundary a handle leaves by rather than enters by: it names the definition that answered,
+/// and its remedy is what to answer instead.
+#[test]
+fn an_entry_points_answer_refuses_every_handle_and_lets_data_cross() {
+    let boundary = Boundary::EntryAnswer { name: "m.parked" };
+    let unreached = "answer with something that does not reach a region";
+    let resumed = "resume the continuation before the entry answers";
+    for (handle, noun, remedy) in [
+        (cell(), "a `Cell`", unreached),
+        (task(), "a `Task`", unreached),
+        (continuation(), "a continuation", resumed),
+    ] {
+        let d = check(&boundary, &Value::ctor("m.Just", vec![handle]), Span::DUMMY)
+            .expect_err("a handle does not leave the entry that made it");
+        assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{noun}");
+        assert_eq!(
+            d.message,
+            format!("`m.parked` answered {noun}, reached through `m.Just`'s argument 1")
+        );
+        assert_eq!(d.labels[0].message, "answered here", "{noun}");
+        assert!(
+            d.notes.iter().any(|n| n.contains("goes to its caller")),
+            "{noun}: {:#?}",
+            d.notes
+        );
+        assert!(
+            d.notes.iter().any(|n| n.contains(remedy)),
+            "{noun}: {:#?}",
+            d.notes
+        );
+    }
+
+    let data = Value::ctor("m.Just", vec![Value::Int(41)]);
+    assert!(check(&boundary, &data, Span::DUMMY).is_ok());
 }
 
 #[test]
