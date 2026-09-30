@@ -401,6 +401,10 @@ impl std::fmt::Debug for Held {
     }
 }
 
+/// Entries begun in this process, every context's: contexts share a unit's memo, so an entry's
+/// number must be unique across them, not just within one.
+static ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[repr(C)]
 pub struct Ctx {
     pub failed: i64,
@@ -451,6 +455,9 @@ pub struct Ctx {
     /// The detached bodies this entry has opened, named by index from their frames and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
+    /// The running entry's number, which no other entry in the process shares: a continuation
+    /// carries it, since its index names a body of that entry alone.
+    pub(crate) entry: u64,
     /// The host boundary: what a `perform` nothing on the stack answers reaches.
     pub(crate) binding: Arc<ply_eval::HostBinding>,
     pub(crate) runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
@@ -508,6 +515,7 @@ impl Ctx {
             sims: Vec::new(),
             detached: Vec::new(),
             starting_detached: None,
+            entry: 0,
             binding: Arc::new(ply_eval::HostBinding::hermetic()),
             runtime: None,
             declared: None,
@@ -561,6 +569,7 @@ impl Ctx {
             self.end();
         }
         self.detached.clear();
+        self.entry = ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         // After the recovery above, which gives back what that entry held.
         self.cells_baseline = self.cell_extent();
         heap::enter(&mut self.heap);
@@ -2076,7 +2085,7 @@ pub unsafe extern "C" fn rt_handle_detached(
 }
 
 /// The `k` a `resume`-binding clause gets: a tail call records the value for `rt_perform`.
-unsafe extern "C" fn rt_resume_entry(ctx: *mut Ctx, args: *const i64) -> i64 {
+pub(crate) unsafe extern "C" fn rt_resume_entry(ctx: *mut Ctx, args: *const i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let v = unsafe { *args.add(1) };
     c.resumed = Some(v);
@@ -2106,18 +2115,23 @@ fn resume_token(c: &mut Ctx, stack: usize, depth: usize) -> Word {
     closure_of(
         c,
         rt_resume_entry as *const () as usize,
-        ((stack << 32) | depth) as i64,
+        &[((stack << 32) | depth) as i64],
     )
 }
 
-/// A unary closure over one immediate capture whose entry is a runtime function.
-pub(crate) fn closure_of(c: &mut Ctx, entry: usize, capture: i64) -> Word {
-    let o = c
-        .heap
-        .alloc(KIND_CLOSURE, 0, (1 + CLOSURE_CAPTURES) as u32, 1);
+/// A unary closure over immediate captures whose entry is a runtime function.
+pub(crate) fn closure_of(c: &mut Ctx, entry: usize, captures: &[i64]) -> Word {
+    let o = c.heap.alloc(
+        KIND_CLOSURE,
+        0,
+        (captures.len() + CLOSURE_CAPTURES) as u32,
+        1,
+    );
     unsafe {
         set_word(o, CLOSURE_CODE, entry as Word);
-        set_word(o, CLOSURE_CAPTURES, heap::imm(capture));
+        for (i, capture) in captures.iter().enumerate() {
+            set_word(o, CLOSURE_CAPTURES + i, heap::imm(*capture));
+        }
     }
     o as Word
 }
