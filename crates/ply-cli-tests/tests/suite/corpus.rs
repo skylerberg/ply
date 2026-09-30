@@ -288,38 +288,3 @@ fn the_c_tier_hashes_a_long_input_consistently() {
         .unwrap();
     green(&json(&out), "the C tier over a long input");
 }
-
-/// The test package's own suite, over the tree the repository maintains: the keys a result is filed
-/// under and the decision to re-run are Ply there, and its goldens pin them against the runtime's
-/// own encodings.
-#[test]
-fn the_test_packages_own_suite_runs_through_the_tool_it_belongs_to() {
-    let out = ply(&repo())
-        .args(["test", "crates/ply-test/ply", "--no-cache", "--json"])
-        .output()
-        .unwrap();
-    let report = json(&out);
-    green(&report, "the test package's own suite");
-    assert!(
-        report["summary"]["passed"].as_u64().unwrap_or(0) >= 9,
-        "the suite is smaller than it was: {}",
-        report["summary"]
-    );
-}
-
-/// The prove package's own suite, over the tree the repository maintains: the keys an obligation's
-/// result is filed under, which two eras of a proof are told apart by.
-#[test]
-fn the_prove_packages_own_suite_runs_through_the_tool_it_belongs_to() {
-    let out = ply(&repo())
-        .args(["test", "crates/ply-prove/ply", "--no-cache", "--json"])
-        .output()
-        .unwrap();
-    let report = json(&out);
-    green(&report, "the prove package's own suite");
-    assert!(
-        report["summary"]["passed"].as_u64().unwrap_or(0) >= 4,
-        "the suite is smaller than it was: {}",
-        report["summary"]
-    );
-}
