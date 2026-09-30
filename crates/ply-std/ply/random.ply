@@ -6,7 +6,7 @@
 // program reads. A `Rand` below is the third thing: a value, drawn by a pure function of its root,
 // for code that wants a seeded stream without a `simulate` region.
 
-import std.bytes (hex_of, u64_at, u64_le)
+import std.bytes (hex_of, u32_le, u64_at, u64_le)
 import std.hash (blake3)
 
 pub nondet effect entropy {
@@ -51,22 +51,35 @@ test "a nonce is two draws, so a server cannot predict it from one" {
 // Counter-mode BLAKE3, the construction ADR 0006 chose for the simulation's own stream, so a result
 // is a function of the root on every machine and every version rather than of a dependency's
 // generator. `Rand` carries the counter, so a stream is a value a caller threads through its own
-// code and can rewind by holding an earlier one.
+// code and can rewind by holding an earlier one, or start at any draw by setting it.
+//
+// A key names one stream among many from one root — a claim's own draws, say, apart from every
+// other claim's — so two keys never share a draw. The empty key is the simulation's own stream.
 
-pub type Rand = { root: Int, counter: Int }
+pub type Rand = { root: Int, key: Bytes, counter: Int }
 
-pub fn rand(root: Int) -> Rand = { root: root, counter: 0 }
+pub fn rand(root: Int) -> Rand = rand_keyed(root, b"")
+
+pub fn rand_keyed(root: Int, key: Bytes) -> Rand = { root: root, key: key, counter: 0 }
 
 /// One draw: a non-negative integer, sixty-three bits wide, and the stream that follows it.
 pub fn rand_int(r: Rand) -> { value: Int, rand: Rand } = {
-  let b = block(r.root, r.counter);
+  let b = block(r);
   // The top bit is cleared so the eight bytes are an `Int`; a draw is sixty-three bits, like the
   // effect's.
   let eight = bytes_concat_all([bytes_slice(b, 0, 7), byte_of_int(bytes_at(b, 7) & 0x7F)]);
   {
     value: match u64_at(eight, 0) { Some(v) -> v, None -> 0 },
-    rand: { root: r.root, counter: r.counter + 1 },
+    rand: { ..r, counter: r.counter + 1 },
   }
+}
+
+/// One draw of all sixty-four bits: the same eight bytes `rand_int` reads, its top bit kept.
+pub fn rand_u64(r: Rand) -> { value: U64, rand: Rand } = {
+  let b = block(r);
+  let low = u64_of_int(int_of_u32(bytes_u32_le(b, 0)));
+  let high = u64_of_int(int_of_u32(bytes_u32_le(b, 4)));
+  { value: high * 4294967296u64 + low, rand: { ..r, counter: r.counter + 1 } }
 }
 
 /// `n` bytes of the stream, advanced by the blocks they need.
@@ -74,8 +87,8 @@ pub fn rand_bytes(r: Rand, n: Int) -> { bytes: Bytes, rand: Rand } =
   if n <= 0 { { bytes: b"", rand: r } } else {
     let blocks = (n + 31) / 32;
     let raw = fold(range(0, blocks), b"", |acc: Bytes, i: Int|
-      bytes_concat(acc, block(r.root, r.counter + i)));
-    { bytes: bytes_slice(raw, 0, n), rand: { root: r.root, counter: r.counter + blocks } }
+      bytes_concat(acc, block({ ..r, counter: r.counter + i })));
+    { bytes: bytes_slice(raw, 0, n), rand: { ..r, counter: r.counter + blocks } }
   }
 
 /// Uniform over `0..n` by rejection: a draw in the last, partial multiple of `n` is thrown away
@@ -95,14 +108,17 @@ fn below_draw(r: Rand, n: Int, limit: Int) -> { value: Int, rand: Rand } = {
 }
 
 // The four words of one block: the domain `ply-eval`'s `sim::Stream` uses, the root, the random
-// domain's tag, and the counter, each little-endian as that stream writes them.
-fn block(root: Int, counter: Int) -> Bytes =
+// domain's tag, and the counter, each little-endian as that stream writes them. A keyed stream
+// takes tag 2, which the simulation never writes, and its key length-prefixed, so no two keys and
+// no key and the simulation share a block.
+fn block(r: Rand) -> Bytes =
   blake3(
     bytes_concat_all([
       bytes_of_string("ply.sim.stream.1"),
-      u64_le(root),
-      byte_of_int(1),
-      u64_le(counter),
+      u64_le(r.root),
+      if bytes_len(r.key) == 0 { byte_of_int(1) }
+      else { bytes_concat_all([byte_of_int(2), u32_le(bytes_len(r.key)), r.key]) },
+      u64_le(r.counter),
     ]),
   )
 
@@ -138,7 +154,37 @@ test "a draw is in range, and `below` refuses a bound it cannot honour" {
 test "a block is BLAKE3 over the simulation's own four words" {
   // `blake3("ply.sim.stream.1" ++ 0u64_le ++ rand_tag ++ 0u64_le)`, so the domain, the tag and the
   // endianness are pinned here rather than diverging from `ply-eval`'s stream silently.
-  assert_eq(hex_of(block(0, 0)), "242257320a1f4f4c9f0b62a52348f099e6f3738dcc4c2a85040607361f7cb92b")
+  assert_eq(
+    hex_of(block(rand(0))),
+    "242257320a1f4f4c9f0b62a52348f099e6f3738dcc4c2a85040607361f7cb92b",
+  )
+}
+
+// Computed outside Ply, over `domain ++ 0u64_le ++ 2 ++ 3u32_le ++ "key" ++ 0u64_le`.
+test "a keyed block is BLAKE3 over the domain, the root, tag 2, the key and the counter" {
+  assert_eq(
+    hex_of(block(rand_keyed(0, b"key"))),
+    "56841b1e69751f400d9eae9e6759921b6b4edff34e08dd5452b693fc6e2862d5",
+  )
+}
+
+test "a key names its own stream, and the empty key is the simulation's" {
+  assert_eq(rand_int(rand_keyed(3, b"")).value, rand_int(rand(3)).value);
+  assert(rand_int(rand_keyed(3, b"a")).value != rand_int(rand(3)).value);
+  assert(rand_int(rand_keyed(3, b"a")).value != rand_int(rand_keyed(3, b"b")).value);
+  assert_eq(rand_int(rand_keyed(3, b"a")).value, rand_int(rand_keyed(3, b"a")).value)
+}
+
+test "a sixty-four-bit draw is the eight bytes rand_int reads, with the top bit kept" {
+  let r = rand_keyed(9, b"k");
+  let wide = rand_u64(r).value;
+  assert_eq(int_of_u64(wide & 0x7FFF_FFFF_FFFF_FFFFu64), rand_int(r).value);
+  assert_eq(rand_u64(r).rand, rand_int(r).rand)
+}
+
+test "a stream started at a counter draws what the stream reaches there" {
+  let third = rand_int(rand_int(rand_int(rand_keyed(5, b"k")).rand).rand);
+  assert_eq(rand_int({ ..rand_keyed(5, b"k"), counter: 2 }).value, third.value)
 }
 
 fn main() -> Int = 0
