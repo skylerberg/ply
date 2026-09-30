@@ -1,11 +1,12 @@
+//! Region isolation, held to real programs: the atoms the front end leaves for `suite.schedule` to
+//! colour, and the runtime running a class the program coloured without its tests observing each
+//! other. How atoms become classes is the program's, and its tests pin it.
+
 use crate::fixture::Compiled;
-use ply_eval::{Plan, TaskRegions, Value};
+use ply_eval::{TaskRegions, Value};
 use ply_span::SourceId;
 use ply_store::Store;
-use ply_test::{
-    GroupRegion, Isolation, contends_only_over_regions, group_by_conflict, is_region_scoped,
-    region_isolated, shared_footprint,
-};
+use ply_test::{GroupRegion, Selection};
 use ply_ty::Footprint;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -41,14 +42,13 @@ impl Compiled {
     fn rejected(src: &str) -> Vec<ply_span::Diagnostic> {
         crate::fixture::port_diagnostics(&[(String::new(), src.to_string())], &[SourceId(0)])
     }
+}
 
-    fn scheduled(&self) -> Vec<(usize, Footprint)> {
-        self.footprints()
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (i, (*f).clone()))
-            .collect()
-    }
+/// `suite.schedule`'s region-scoped and ambient effects: what it trusts an atom's effect name for.
+const SCHEDULER_NAMES: [&str; 2] = ["cell", "sim"];
+
+fn names_a_region(f: &Footprint) -> bool {
+    f.atoms().any(|a| a.effect.as_str() == "cell")
 }
 
 /// Every test allocates its cell at the same id, writes it, and checks every value it wrote.
@@ -96,7 +96,7 @@ fn a_label_each(i: usize) -> String {
 
 #[test]
 fn a_program_cannot_declare_either_effect_the_scheduler_names() {
-    for name in ply_test::REGION_SCOPED.iter().chain(ply_test::AMBIENT) {
+    for name in SCHEDULER_NAMES {
         let diags = Compiled::rejected(&format!(
             r#"
 effect {name} {{
@@ -129,7 +129,7 @@ test "claim the name" {{
 }
 
 #[test]
-fn an_effect_whose_name_merely_resembles_the_builtin_is_not_region_scoped() {
+fn an_effect_whose_name_merely_resembles_the_builtin_names_no_region() {
     let compiled = Compiled::anonymous(
         r#"
 effect cells {
@@ -141,42 +141,42 @@ test "one" { cells.put[rows](1) }
 test "two" { cells.put[rows](2) }
 "#,
     );
-    for f in &compiled.footprints() {
-        assert!(!region_isolated(f), "`cells` names a real resource: {f:?}");
-        assert!(f.atoms().all(|a| !is_region_scoped(a)));
-        assert!(!contends_only_over_regions(f));
+    let footprints = compiled.footprints();
+    for f in &footprints {
+        assert!(!f.is_empty(), "`cells` names a real resource: {f:?}");
+        assert!(!names_a_region(f), "{f:?}");
     }
-    assert_eq!(
-        group_by_conflict(&compiled.scheduled()).len(),
-        2,
-        "two writers of one resource must not share a group"
+    assert!(
+        footprints[0].conflicts_with(&footprints[1]),
+        "two writers of one resource must never share a class"
     );
 }
 
 #[test]
-fn tests_naming_one_region_label_are_coloured_apart_and_reported_as_shared() {
+fn tests_naming_one_region_label_all_conflict() {
     let compiled = Compiled::anonymous(&contending_source(6, one_label));
     let footprints = compiled.footprints();
     assert!(
-        footprints.iter().all(|f| f.atoms().any(is_region_scoped)),
+        footprints.iter().all(names_a_region),
         "the corpus must retain cell atoms, or it is not exercising anything"
     );
-    assert!(footprints.iter().all(|f| !region_isolated(f)));
-    assert!(footprints.iter().all(contends_only_over_regions));
-    assert!(
-        footprints
-            .iter()
-            .all(|f| Isolation::of(f) == Isolation::Shared)
-    );
-
-    assert_eq!(group_by_conflict(&compiled.scheduled()).len(), 6);
+    for (i, a) in footprints.iter().enumerate() {
+        for b in &footprints[i + 1..] {
+            assert!(a.conflicts_with(b), "{a:?} vs {b:?}");
+        }
+    }
 }
 
 #[test]
-fn tests_on_distinct_region_labels_still_share_one_group() {
+fn tests_on_distinct_region_labels_never_conflict() {
     let compiled = Compiled::anonymous(&contending_source(16, a_label_each));
-    assert!(compiled.footprints().iter().all(contends_only_over_regions));
-    assert_eq!(group_by_conflict(&compiled.scheduled()).len(), 1);
+    let footprints = compiled.footprints();
+    assert!(footprints.iter().all(names_a_region));
+    for (i, a) in footprints.iter().enumerate() {
+        for b in &footprints[i + 1..] {
+            assert!(!a.conflicts_with(b), "{a:?} vs {b:?}");
+        }
+    }
 }
 
 #[test]
@@ -207,79 +207,29 @@ test "a real read" {
     );
 
     let footprints = compiled.footprints();
-    let isolation: Vec<Isolation> = footprints.iter().map(Isolation::of).collect();
-    assert_eq!(isolation, vec![Isolation::Shared; 3]);
-    assert!(contends_only_over_regions(&footprints[0]));
-    assert!(
-        !contends_only_over_regions(&footprints[1]),
-        "a test that also reaches `users` must not be blamed on its label"
-    );
-
-    let shared = shared_footprint(&footprints[1]);
-    let atoms: Vec<String> = shared.atoms().map(|a| a.to_string()).collect();
+    let atoms: Vec<String> = footprints[1].atoms().map(|a| a.to_string()).collect();
     assert_eq!(
         atoms,
         vec!["cell.read[table]".to_string(), "db.put[users]".to_string()]
     );
-    assert!(shared.conflicts_with(&shared_footprint(&footprints[2])));
-
-    let groups = group_by_conflict(&compiled.scheduled());
-    assert_eq!(groups.len(), 2, "{groups:?}");
-    let group_of = |t: usize| groups.iter().position(|g| g.contains(&t)).unwrap();
-    assert_ne!(group_of(1), group_of(2), "a writer and a reader of `users`");
-    assert_eq!(
-        group_of(0),
-        group_of(1),
-        "a region label is readers-writers like any resource: two readers of \
-         `cell[table]` still share a group"
+    assert!(
+        footprints[1].conflicts_with(&footprints[2]),
+        "a writer and a reader of `users`"
+    );
+    assert!(
+        !footprints[0].conflicts_with(&footprints[1]),
+        "a region label is readers-writers like any resource: two readers of `cell[table]` \
+         do not conflict"
     );
 }
 
 #[test]
-fn no_pair_in_a_group_conflicts_at_all() {
-    let source = format!(
-        r#"
-effect db {{
-  read  get[users]() -> Int
-  write put[users](v: Int) -> Unit
-  write log[audit](v: Int) -> Unit
-}}
-
-test "real reader" {{ assert_eq(db.get[users](), 0) }}
-
-test "real writer" {{ db.put[users](1) }}
-
-test "other writer" {{ db.log[audit](1) }}
-{}
-"#,
-        contending_source(6, |i| format!("table{}", i % 3))
-    );
-    let compiled = Compiled::anonymous(&source);
-    let scheduled = compiled.scheduled();
-
-    for group in group_by_conflict(&scheduled) {
-        for (n, &a) in group.iter().enumerate() {
-            for &b in &group[n + 1..] {
-                let (fa, fb) = (&scheduled[a].1, &scheduled[b].1);
-                assert!(
-                    !shared_footprint(fa).conflicts_with(&shared_footprint(fb)),
-                    "tests {a} and {b} share a group and conflict: {fa:?} vs {fb:?}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
+fn a_class_of_isolated_tests_running_at_once_never_observe_each_other() {
     const TESTS: usize = 32;
     let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
 
     assert!(
-        compiled
-            .footprints()
-            .iter()
-            .all(|f| f.atoms().any(is_region_scoped)),
+        compiled.footprints().iter().all(names_a_region),
         "the corpus must retain cell atoms by inference, not by injection"
     );
 
@@ -287,17 +237,7 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
     for round in 0..3 {
         let root = TempRoot::new();
         let mut store = root.store();
-        let selection =
-            crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
-
-        assert_eq!(
-            selection.groups.len(),
-            1,
-            "round {round}: {TESTS} tests on {TESTS} labels must be one group"
-        );
-        assert_eq!(selection.parallelism.region_contended, TESTS);
-        assert!(selection.parallelism.holds());
-
+        let selection = compiled.every();
         let executor = ply_test::InterpExecutor::new(&compiled.port)
             .with_backend(unit)
             .with_search(ply_test::Search::of(&selection))
@@ -325,9 +265,7 @@ fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {
     let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection =
-        crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
-    assert_eq!(selection.groups.len(), 1);
+    let selection = compiled.every();
 
     let executor = FixtureProbe::default();
     let pool = rayon::ThreadPoolBuilder::new()
@@ -425,9 +363,7 @@ fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
     let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection =
-        crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
-    assert_eq!(selection.groups.len(), 1);
+    let selection = compiled.every();
 
     let executor = FixtureProbe::default();
     let pool = rayon::ThreadPoolBuilder::new()
@@ -471,9 +407,10 @@ fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
 
 #[test]
 fn verdicts_do_not_move_between_one_worker_and_eight() {
+    const SHARING: usize = 6;
     let source = format!(
         "{}{}{}",
-        contending_source(6, one_label),
+        contending_source(SHARING, one_label),
         contending_source(10, |i| format!("own{i}")),
         (0..8)
             .map(|i| format!("\ntest \"pure {i}\" {{ assert_eq({i} + 1, {}) }}\n", i + 1))
@@ -481,14 +418,22 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
     );
     let compiled = Compiled::new(&source);
     let unit = compiled.tier();
+    // As a program colours it: each test sharing `table` in a class of its own, the rest together.
+    let classes = {
+        let mut first = vec![0];
+        first.extend(SHARING..compiled.check.tests.len());
+        let mut classes = vec![first];
+        classes.extend((1..SHARING).map(|i| vec![i]));
+        classes
+    };
 
     let run_at = |jobs: usize| {
         let root = TempRoot::new();
         let mut store = root.store();
-        let selection =
-            crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
-        let groups = selection.groups.clone();
-        let parallelism = selection.parallelism;
+        let selection = Selection {
+            groups: classes.clone(),
+            ..compiled.every()
+        };
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
             .build()
@@ -512,61 +457,19 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
             .map(|r| (r.index, r.status, r.group))
             .collect();
         verdicts.sort_by_key(|v| v.0);
-        (groups, parallelism, report.passed, report.failed, verdicts)
+        (report.passed, report.failed, verdicts)
     };
 
     let one = run_at(1);
     let eight = run_at(8);
 
     assert_eq!(
-        one.3, 0,
+        one.1, 0,
         "the corpus must be green before it proves anything"
     );
+    assert_eq!((one.0, one.1), (eight.0, eight.1));
     assert_eq!(
-        one.0, eight.0,
-        "the colouring is a function of the footprints and may not move with --jobs"
-    );
-    assert_eq!(one.1, eight.1);
-    assert_eq!((one.2, one.3), (eight.2, eight.3));
-    assert_eq!(
-        one.4, eight.4,
+        one.2, eight.2,
         "a verdict moved between one worker and eight"
     );
-    assert_eq!(
-        one.0.len(),
-        6,
-        "six tests share `table`, so the corpus must need six rounds: {:?}",
-        one.0
-    );
-}
-
-#[test]
-fn adding_isolated_tests_never_adds_a_group() {
-    let shared = r#"
-effect db {
-  read  get[users]() -> Int
-  write put[users](v: Int) -> Unit
-}
-
-test "real reader" { assert_eq(db.get[users](), 0) }
-
-test "real writer" { db.put[users](1) }
-"#;
-
-    let mut counts = Vec::new();
-    for extra in [0usize, 1, 8, 64] {
-        let pure: String = (0..extra)
-            .map(|i| format!("\ntest \"pure {i}\" {{ assert_eq({i} + 1, {}) }}\n", i + 1))
-            .collect();
-        let compiled = Compiled::anonymous(&format!("{shared}{pure}"));
-        let root = TempRoot::new();
-        let store = root.store();
-        let selection =
-            crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
-        assert_eq!(selection.parallelism.isolated, extra);
-        assert_eq!(selection.parallelism.region_contended, 0);
-        assert!(selection.parallelism.holds(), "{:?}", selection.parallelism);
-        counts.push(selection.groups.len());
-    }
-    assert_eq!(counts, vec![2, 2, 2, 2]);
 }
