@@ -14,9 +14,7 @@ pub mod world;
 pub use sort::Sort;
 pub use world::World;
 
-use ply_eval::{Plan, Race, Seed};
-use ply_span::{Diagnostic, Span, Symbol};
-use ply_ty::DefHash;
+use ply_eval::{DefHash, Diagnostic, Plan, Race, Seed, Span, Symbol};
 use serde::Serialize;
 use std::fmt;
 use std::time::Duration;

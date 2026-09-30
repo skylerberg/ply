@@ -8,16 +8,14 @@ mod term;
 
 use crate::checked::{binders_of, world_of};
 use ply_codegen::c::producer;
-use ply_eval::Value;
 use ply_eval::decode::{At, Error};
+use ply_eval::{SourceId, SpecKind, Symbol, Value};
 use ply_prove::prove::claims::{Clause, Code, Definition, Law};
 use ply_prove::prove::{
     Blocker, Claims, Context, Decision, Goal, Limits, Proof, Reason, decide, decide_and_diagnose,
     read_claims,
 };
 use ply_prove::{Binder, Rule, Sort, UNFOLD_DEPTH, World};
-use ply_span::{SourceId, Symbol};
-use ply_ty::SpecKind;
 
 const SRC: SourceId = SourceId(0);
 

@@ -3,9 +3,8 @@
 use crate::pool::Bell;
 use crate::signal::{self, Accepting, Shutdown};
 use crate::{certgen, config, fs, process, random, sched, tcp, time, trace};
-use ply_eval::Value;
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
-use ply_span::{Diagnostic, Span, codes};
+use ply_eval::{Diagnostic, Span, Value, codes};
 use std::rc::Rc;
 use std::sync::Arc;
 

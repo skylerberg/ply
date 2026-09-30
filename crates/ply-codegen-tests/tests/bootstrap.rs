@@ -24,7 +24,7 @@ fn emitter_source() -> (&'static Source, String) {
     let unused: Vec<&str> = front
         .diagnostics
         .iter()
-        .filter(|d| d.code == ply_span::codes::UNUSED_DEFINITION)
+        .filter(|d| d.code == ply_eval::codes::UNUSED_DEFINITION)
         .map(|d| d.message.as_str())
         .collect();
     assert!(
@@ -32,7 +32,7 @@ fn emitter_source() -> (&'static Source, String) {
         "the emitter's program carries definitions nothing reaches; delete them:\n  {}",
         unused.join("\n  ")
     );
-    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
     let texts: HashMap<String, String> = answered.modules.into_iter().collect();
     let source: &'static Source = Box::leak(Box::new(Source::from_front(front).with_texts(texts)));
     (source, identity)

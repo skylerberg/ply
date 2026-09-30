@@ -196,7 +196,7 @@ fn echo(k: Int) -> Int / {db.read[main]}
         error
             .diagnostics
             .iter()
-            .any(|d| d.code == ply_span::codes::EFFECT_IN_SPEC),
+            .any(|d| d.code == ply_eval::codes::EFFECT_IN_SPEC),
         "{:?}",
         error
             .diagnostics

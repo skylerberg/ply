@@ -1,7 +1,7 @@
+use ply_eval::DefHash;
 use ply_machine::load::{Found, Loaded, stamp_of};
 use ply_machine::warm::*;
 use ply_store::ContentHash;
-use ply_ty::DefHash;
 
 fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -167,7 +167,7 @@ fn a_held_unit_is_reused_only_for_the_program_it_was_compiled_from() {
         fn offers(&self) -> ply_eval::backend::Offers {
             ply_eval::backend::Offers::default()
         }
-        fn relocate(&self, _: &ply_ty::Front, _: &ply_span::SourceMap) -> bool {
+        fn relocate(&self, _: &ply_eval::Front, _: &ply_eval::SourceMap) -> bool {
             true
         }
     }
@@ -176,11 +176,11 @@ fn a_held_unit_is_reused_only_for_the_program_it_was_compiled_from() {
     // The digest is the compiler's now: a program that moved is a different digest, so the unit
     // is kept only under the identity it was compiled from.
     let unit_for = |warm: &Warm, digest: DefHash| {
-        let front = ply_ty::Front {
+        let front = ply_eval::Front {
             hashes_digest: digest,
             ..Default::default()
         };
-        warm.unit_for(&front, &ply_span::SourceMap::new())
+        warm.unit_for(&front, &ply_eval::SourceMap::new())
     };
 
     let compiled = DefHash([9; 32]);
@@ -212,7 +212,7 @@ fn fake_loaded(root: &std::path::Path, files: &[&str]) -> Loaded {
                 }
             })
             .collect(),
-        sources: ply_span::SourceMap::new(),
+        sources: ply_eval::SourceMap::new(),
         front: Default::default(),
         check: Default::default(),
         hashes: Default::default(),

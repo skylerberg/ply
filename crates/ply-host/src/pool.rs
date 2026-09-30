@@ -1,8 +1,7 @@
 //! Where a host operation goes when it has to wait.
 //! One [`Pool`] per facility, minting in disjoint token ranges.
 
-use ply_eval::{Pending, Value};
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_eval::{Diagnostic, Pending, Span, Symbol, Value, codes};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};

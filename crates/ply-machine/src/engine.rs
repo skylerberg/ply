@@ -2,7 +2,10 @@
 
 use crate::load::{LoadError, Loaded};
 use ply_eval::host::{HostBinding, HostRuntime};
-use ply_eval::{DEFAULT_MAX_CALLS, Machine, Seed, Value};
+use ply_eval::{
+    CheckOutput, DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Literal, Machine, Seed,
+    Span, SpecKind, Symbol, Value, codes,
+};
 use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
 use ply_prove::domain::Finite;
 use ply_prove::property::{
@@ -14,9 +17,7 @@ use ply_prove::{
     Binder, Binding, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation,
     ObligationKind, ProvePlan, Rule, Sort, Vacuity, VacuityKind, World,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_store::Store;
-use ply_ty::{CheckOutput, DefInfo, Front, LawInfo, Literal, SpecKind};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

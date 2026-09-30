@@ -1,5 +1,5 @@
+use ply_eval::{Diagnostic, Span, codes};
 use ply_host::tls::*;
-use ply_span::{Diagnostic, Span, codes};
 use rustls::crypto::CryptoProvider;
 use rustls::server::ServerConfig;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};

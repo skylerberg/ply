@@ -1,5 +1,5 @@
+use ply_eval::codes;
 use ply_machine::migrate::*;
-use ply_span::codes;
 use ply_store::Store;
 
 fn store(dir: &std::path::Path) -> Store {

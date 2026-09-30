@@ -1,7 +1,6 @@
 use crate::fixture::Compiled;
 use ply_eval::arena::Slot;
-use ply_eval::{Fixture, Machine, TaskRegions, Value};
-use ply_ty::Footprint;
+use ply_eval::{Fixture, Footprint, Machine, TaskRegions, Value};
 use std::marker::PhantomData;
 
 impl Compiled {
@@ -24,7 +23,7 @@ fn one_cell() -> Fixture {
 fn cell_of(fixture: &Fixture) -> Slot {
     fixture
         .handle()
-        .as_cell(ply_span::Span::DUMMY, "the fixture handle")
+        .as_cell(ply_eval::Span::DUMMY, "the fixture handle")
         .expect("the handle is a cell")
 }
 
@@ -73,7 +72,7 @@ fn no_amount_of_writing_to_an_open_stack_moves_what_the_fixture_seeds() {
         Value::List(items) => items
             .iter()
             .map(|v| {
-                v.as_cell(ply_span::Span::DUMMY, "a handle")
+                v.as_cell(ply_eval::Span::DUMMY, "a handle")
                     .expect("a cell")
             })
             .collect(),
@@ -264,7 +263,7 @@ test "a constructor carries the cell out of its region" {
     assert!(
         diags
             .iter()
-            .any(|d| d.code == ply_span::codes::REGION_ESCAPE),
+            .any(|d| d.code == ply_eval::codes::REGION_ESCAPE),
         "a declared `Cell` field is a brand with nowhere to appear: {diags:#?}"
     );
 }
@@ -286,7 +285,7 @@ test "two regions through one variant" {
     assert!(
         diags
             .iter()
-            .any(|d| d.code == ply_span::codes::TYPE_MISMATCH),
+            .any(|d| d.code == ply_eval::codes::TYPE_MISMATCH),
         "a second region must not quietly reuse the first one's tag: {diags:#?}"
     );
 }
@@ -334,7 +333,7 @@ fn a_region_stack_and_the_values_in_it_cannot_cross_a_thread() {
     assert!(!is_send!(Machine<'static>));
     // The sanity half: the probe reports `true` for something that is `Send`.
     assert!(is_send!(Slot));
-    assert!(is_send!(ply_span::Span));
+    assert!(is_send!(ply_eval::Span));
 }
 
 /// Autoref specialization: the inherent method exists only for `T: Send`, else the trait's applies.

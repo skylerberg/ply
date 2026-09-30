@@ -3,12 +3,11 @@
 
 use crate::load::Loaded;
 use ply_eval::decode::{self, At};
-use ply_eval::{Fields, Value};
-use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
+use ply_eval::{
+    DefHash, DefInfo, Diagnostic, Fields, Front, HashOutput, ModuleName, Severity, SourceMap, Span,
+    Symbol, Value, codes,
+};
 use ply_store::body::StoredBody;
-use ply_ty::ModuleName;
-use ply_ty::{DefHash, HashOutput};
-use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -929,7 +928,7 @@ struct Answered {
 /// pulls in the ones the closure imports and places them after it.
 fn ask_the_port(
     own: &[(String, String)],
-    ids: &mut Vec<ply_span::SourceId>,
+    ids: &mut Vec<ply_eval::SourceId>,
     sources: &mut SourceMap,
 ) -> Result<Answered, Vec<Diagnostic>> {
     ply_codegen::c::producer::ensure_default();
@@ -949,7 +948,7 @@ fn ask_the_port(
 fn place_and_read(
     modules: &[String],
     dump: &ply_eval::Value,
-    ids: &mut Vec<ply_span::SourceId>,
+    ids: &mut Vec<ply_eval::SourceId>,
     sources: &mut SourceMap,
 ) -> Result<Front, Vec<Diagnostic>> {
     for module in modules {
@@ -1032,7 +1031,7 @@ fn file_front(at: &Path, modules: &[String], dump: &ply_eval::Value) {
 /// file is only ever written after that check passed on this machine.
 fn cached_front(
     at: &Path,
-    ids: &mut Vec<ply_span::SourceId>,
+    ids: &mut Vec<ply_eval::SourceId>,
     sources: &mut SourceMap,
 ) -> Option<Front> {
     let answer = ply_eval::codec::decode(&std::fs::read(at).ok()?).ok()?;
@@ -1060,7 +1059,7 @@ fn cached_front(
 fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     let mut sources = SourceMap::new();
     let mut own: Vec<(String, String)> = Vec::new();
-    let mut ids: Vec<ply_span::SourceId> = Vec::new();
+    let mut ids: Vec<ply_eval::SourceId> = Vec::new();
     for (file, text) in &artifact.closure {
         let relative = PathBuf::from(file);
         let name = ModuleName::from_relative_path(&relative).map_err(|d| vec![d])?;
@@ -1260,7 +1259,7 @@ fn evaluate(
     span: Span,
     plan: &ply_eval::Plan,
     hosts: &crate::hosts::Hosts,
-    declared: Option<&ply_ty::ty::Footprint>,
+    declared: Option<&ply_eval::Footprint>,
     tier: &'static dyn ply_eval::Provider,
 ) -> Result<ply_eval::Value, Diagnostic> {
     let mut machine = ply_eval::Machine::new(&opened.front);

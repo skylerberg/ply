@@ -6,8 +6,7 @@ use super::context::Context;
 use super::term::{self, Arm, ArmTest, CmpOp, Node, TermId, Terms};
 use crate::sort::Sort;
 use crate::world::Ctor;
-use ply_eval::{BinOp, Lit, UnOp};
-use ply_span::Symbol;
+use ply_eval::{BinOp, Lit, Symbol, UnOp};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_TERMS: usize = 20_000;

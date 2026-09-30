@@ -2,9 +2,8 @@
 //! `proof.domain`'s decision and its tests'; these pin that the runtime builds exactly the values the
 //! program counted, once each, in the program's order.
 
-use ply_eval::{Fixed, IntTy, Value};
+use ply_eval::{Fixed, IntTy, Symbol, Value};
 use ply_prove::domain::{Case, Finite, Shape};
-use ply_span::Symbol;
 
 fn scalar(name: &str, size: u64) -> Shape {
     Shape::Scalar {

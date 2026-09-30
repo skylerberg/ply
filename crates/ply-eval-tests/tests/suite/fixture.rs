@@ -1,7 +1,4 @@
-use ply_eval::{Machine, Provider};
-use ply_span::{Diagnostic, SourceId};
-use ply_ty::ModuleName;
-use ply_ty::{CheckOutput, Front};
+use ply_eval::{CheckOutput, Diagnostic, Front, Machine, ModuleName, Provider, SourceId};
 use std::collections::HashMap;
 
 /// `sources[i]` is `(module name, text)` for `SourceId(i)`.

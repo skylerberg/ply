@@ -1,7 +1,7 @@
 //! What this binary ships: the `ply` program built from `crates/ply-cli/ply`.
 
 use ply_codegen::c::{bundle, producer};
-use ply_span::{Diagnostic, Span, codes};
+use ply_eval::{Diagnostic, Span, codes};
 use std::path::{Path, PathBuf};
 
 include!(concat!(env!("OUT_DIR"), "/program_sources.rs"));

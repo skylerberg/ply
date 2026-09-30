@@ -1,6 +1,5 @@
-use ply_eval::Value;
 use ply_eval::memo::*;
-use ply_span::Symbol;
+use ply_eval::{Symbol, Value};
 
 fn nested(levels: usize, bottom: Value) -> Value {
     (0..levels).fold(bottom, |inner, _| Value::Ctor {

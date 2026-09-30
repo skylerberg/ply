@@ -33,12 +33,12 @@ pub fn checked_front_with_std(
     path: &Path,
     module: &str,
     text: &str,
-) -> Result<(ply_ty::Front, ply_span::SourceMap)> {
+) -> Result<(ply_eval::Front, ply_eval::SourceMap)> {
     let answered = ply_codegen::c::producer::checked_front_with_std(&[(
         module.to_string(),
         text.to_string(),
     )])?;
-    let mut sources = ply_span::SourceMap::new();
+    let mut sources = ply_eval::SourceMap::new();
     for (name, text) in &answered.modules {
         let path = if ply_std::is_std(name) {
             ply_std::pseudo_path(name)
@@ -52,8 +52,8 @@ pub fn checked_front_with_std(
 
 /// A machine over the program with the default tier attached.
 pub fn tier_machine<'a>(
-    port: &'a ply_ty::Front,
-    sources: &ply_span::SourceMap,
+    port: &'a ply_eval::Front,
+    sources: &ply_eval::SourceMap,
 ) -> ply_eval::Machine<'a> {
     ply_codegen::c::producer::ensure_default();
     let texts = ply_machine::support::module_texts(&port.check, sources);

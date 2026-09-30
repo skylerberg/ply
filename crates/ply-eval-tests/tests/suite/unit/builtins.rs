@@ -1,7 +1,6 @@
 use ply_eval::builtins::*;
 use ply_eval::task_regions::TaskRegions;
-use ply_eval::{Frame, Value};
-use ply_span::{Diagnostic, Span, codes};
+use ply_eval::{Diagnostic, Frame, Span, Value, codes};
 
 fn ints(xs: &[i64]) -> Value {
     Value::list(xs.iter().copied().map(Value::Int).collect())

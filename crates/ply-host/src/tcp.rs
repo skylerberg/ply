@@ -8,11 +8,9 @@ pub use sim::SimNet;
 pub use socket::TcpHost;
 
 use ply_eval::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
-    HostRuntime, Linearity,
+    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest,
+    HostResource, HostRuntime, Linearity, Resource, Span, Symbol, codes,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::Resource;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};

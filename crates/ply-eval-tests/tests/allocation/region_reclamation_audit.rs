@@ -2,9 +2,8 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use crate::counting::charge;
-use ply_eval::Value;
 use ply_eval::arena::{Arena, Reclaim, RegionKind};
-use ply_span::Span;
+use ply_eval::{Span, Value};
 use std::sync::Arc;
 
 fn counted<R>(f: impl FnOnce() -> R) -> (usize, R) {

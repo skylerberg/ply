@@ -1,11 +1,9 @@
-use ply_eval::{Exploration, Plan, Seed, SimMode};
+use ply_eval::{DefHash, Exploration, Plan, Seed, SimMode, Span};
 use ply_prove::{
     CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, MIN_PROPERTY_CASES,
     Obligation, ObligationKind, ProvePlan, ProveReport, Rule, Tier, Vacuity, VacuityKind,
     interleaving_proves,
 };
-use ply_span::Span;
-use ply_ty::DefHash;
 use std::time::Duration;
 
 fn cases(kept: u32) -> Evidence {

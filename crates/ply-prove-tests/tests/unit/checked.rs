@@ -2,10 +2,10 @@
 //! checker's tables: its types from their constructors, its signatures, and a claim's binders
 //! numbered together. A test here has no program to build one for it.
 
+use ply_eval::Symbol;
 use ply_eval::decode::{At, Error};
 use ply_prove::world::{Decl, Signature, Variant, World};
 use ply_prove::{Binder, Sort};
-use ply_span::Symbol;
 
 /// A record's fields in the order the printer reads them: a tuple's by position.
 fn fields(list: At<'_>) -> Result<Vec<(&str, At<'_>)>, Error> {

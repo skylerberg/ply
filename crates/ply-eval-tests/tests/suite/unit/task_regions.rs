@@ -1,8 +1,7 @@
-use ply_eval::Value;
 use ply_eval::arena::RegionKind;
 use ply_eval::arena::Slot;
 use ply_eval::task_regions::*;
-use ply_span::Span;
+use ply_eval::{Span, Value};
 
 fn int_of(regions: &TaskRegions, slot: Slot) -> i64 {
     match regions.get(slot) {

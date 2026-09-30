@@ -1,6 +1,5 @@
-use ply_span::{Diagnostic, Severity, Span, Symbol, codes as span_codes};
+use ply_eval::{DefHash, Diagnostic, Severity, Span, Symbol, codes as span_codes};
 use ply_store::*;
-use ply_ty::DefHash;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,7 +53,7 @@ fn failure() -> Outcome {
         diagnostic: Some(
             Diagnostic::error(span_codes::ASSERTION_FAILED, "assertion failed")
                 .primary(
-                    Span::new(ply_span::SourceId(3), 88, 97),
+                    Span::new(ply_eval::SourceId(3), 88, 97),
                     "expected 0, found -5",
                 )
                 .note("suspects: apply_debit"),
@@ -100,7 +99,7 @@ fn round_trips_pass_and_failure_through_disk() {
     assert_eq!(d.code, span_codes::ASSERTION_FAILED);
     assert_eq!(d.severity, Severity::Error);
     assert_eq!(d.notes, vec!["suspects: apply_debit".to_string()]);
-    assert_eq!(d.labels[0].span, Span::new(ply_span::SourceId(3), 88, 97));
+    assert_eq!(d.labels[0].span, Span::new(ply_eval::SourceId(3), 88, 97));
     assert!(d.labels[0].primary);
 }
 
@@ -639,7 +638,7 @@ fn row() -> Vec<u8> {
 fn fingerprint(n: u8) -> SourceFingerprint {
     let mut fp = SourceFingerprint::new(content(n));
     fp.defs.push(DefEntry {
-        name: ply_span::Symbol::new("active_users"),
+        name: ply_eval::Symbol::new("active_users"),
         hash: hash(n),
         span: FileSpan { start: 10, end: 42 },
         kind: DefKind::Fn,
@@ -1602,8 +1601,8 @@ fn only_the_latest_claims_parts_are_kept_and_a_damaged_file_keeps_none() {
 
 #[test]
 fn a_file_span_survives_the_source_ids_of_the_next_run() {
-    let first = ply_span::SourceId(3);
-    let later = ply_span::SourceId(0);
+    let first = ply_eval::SourceId(3);
+    let later = ply_eval::SourceId(0);
     let span = Span::new(first, 88, 97);
 
     let stored = FileSpan::of(span);
@@ -1999,12 +1998,12 @@ fn one_body_serves_every_definition_that_shares_its_hash() {
     assert_eq!(reopened.bodies_len(), 1, "one body");
     assert!(
         reopened
-            .def_of(hash(1), &ply_span::Symbol::new("a.f"))
+            .def_of(hash(1), &ply_eval::Symbol::new("a.f"))
             .is_some()
     );
     assert!(
         reopened
-            .def_of(hash(1), &ply_span::Symbol::new("b.g"))
+            .def_of(hash(1), &ply_eval::Symbol::new("b.g"))
             .is_some()
     );
 }
@@ -2016,7 +2015,7 @@ fn lookup_finds_a_definition_by_full_name_simple_name_or_hash_prefix() {
     let mut store = root.open();
     let mut fp = SourceFingerprint::new(content(1));
     fp.defs.push(DefEntry {
-        name: ply_span::Symbol::new("user.active_users"),
+        name: ply_eval::Symbol::new("user.active_users"),
         hash: hash(9),
         span: FileSpan { start: 10, end: 42 },
         kind: DefKind::Fn,
@@ -2076,7 +2075,7 @@ fn lookup_returns_every_match_rather_than_refusing() {
     for (module, n) in [("a", 1u8), ("b", 2)] {
         let mut fp = SourceFingerprint::new(content(n));
         fp.defs.push(DefEntry {
-            name: ply_span::Symbol::new(format!("{module}.place")),
+            name: ply_eval::Symbol::new(format!("{module}.place")),
             hash: hash(n),
             span: FileSpan { start: 0, end: 1 },
             kind: DefKind::Fn,
@@ -2211,7 +2210,7 @@ fn opening_a_ten_thousand_definition_cache_decodes_nothing() {
             bytes[0..4].copy_from_slice(&file.to_le_bytes());
             bytes[4..8].copy_from_slice(&n.to_le_bytes());
             let hash = DefHash(bytes);
-            let name = ply_span::Symbol::new(format!("m{file}.d{n}"));
+            let name = ply_eval::Symbol::new(format!("m{file}.d{n}"));
             fp.defs.push(DefEntry {
                 name: name.clone(),
                 hash,

@@ -3,14 +3,12 @@
 //! checker's own atoms, its label variables numbered where they first appear, so an answer reads to
 //! one structure however the checker happened to number them.
 
-use ply_eval::Value;
 use ply_eval::decode::{At, Error};
-use ply_span::{Diagnostic, Edit, Fix, Label, Severity, SourceId, Span, Symbol, intern_code};
-use ply_ty::front::{EmitterRoot, Pinned};
-use ply_ty::{
-    DefHash, DefInfo, DefWritten, EffectAtom, EffectInfo, EffectSet, Footprint, Front, HashOutput,
-    Hashed, LawInfo, Literal, Mode, ModuleInfo, ModuleName, OpInfo, Ordinal, Resource, SpecInfo,
-    SpecKind, TestInfo, TypeDecl, Visibility, WrittenParam,
+use ply_eval::{
+    DefHash, DefInfo, DefWritten, Diagnostic, Edit, EffectAtom, EffectInfo, EffectSet, EmitterRoot,
+    Fix, Footprint, Front, HashOutput, Hashed, Label, LawInfo, Literal, Mode, ModuleInfo,
+    ModuleName, OpInfo, Ordinal, Pinned, Resource, Severity, SourceId, Span, SpecInfo, SpecKind,
+    Symbol, TestInfo, TypeDecl, Value, Visibility, WrittenParam, intern_code,
 };
 use std::collections::BTreeMap;
 

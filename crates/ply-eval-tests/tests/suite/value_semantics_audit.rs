@@ -3,9 +3,9 @@
 
 use crate::fixture::Compiled;
 use ply_eval::{
-    ARGUMENT_VECTOR_CLASSES, Decimal, SECRET_REDACTED, Value, first_difference, values_equal,
+    ARGUMENT_VECTOR_CLASSES, Decimal, Diagnostic, SECRET_REDACTED, Span, Value, first_difference,
+    values_equal,
 };
-use ply_span::{Diagnostic, Span};
 use std::sync::Arc;
 
 impl Compiled {
@@ -113,7 +113,7 @@ fn the_assertion_differ_never_descends_into_a_credential() {
     let secret = |s: &str| Value::secret(Value::str(s));
     let record = |s: Value| {
         Value::Record(Arc::new(
-            [(ply_span::Symbol::new("password"), s)]
+            [(ply_eval::Symbol::new("password"), s)]
                 .into_iter()
                 .collect(),
         ))
@@ -200,7 +200,7 @@ fn probe_values() -> Vec<(&'static str, Value)> {
         (
             "record {a: 1.5m}",
             Value::Record(Arc::new(
-                [(ply_span::Symbol::new("a"), dec(15, 1))]
+                [(ply_eval::Symbol::new("a"), dec(15, 1))]
                     .into_iter()
                     .collect(),
             )),
@@ -208,7 +208,7 @@ fn probe_values() -> Vec<(&'static str, Value)> {
         (
             "record {a: 1.50m}",
             Value::Record(Arc::new(
-                [(ply_span::Symbol::new("a"), dec(150, 2))]
+                [(ply_eval::Symbol::new("a"), dec(150, 2))]
                     .into_iter()
                     .collect(),
             )),
@@ -386,10 +386,10 @@ fn canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it() {
     let secret = Value::Secret(Arc::clone(&payload));
     let key = Value::Record(Arc::new(
         [
-            (ply_span::Symbol::new("d"), {
+            (ply_eval::Symbol::new("d"), {
                 Value::Decimal(Decimal::try_from_i128_with_scale(150, 2).expect("1.50"))
             }),
-            (ply_span::Symbol::new("p"), secret),
+            (ply_eval::Symbol::new("p"), secret),
         ]
         .into_iter()
         .collect(),
@@ -406,13 +406,13 @@ fn canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it() {
 
     assert_eq!(
         fields
-            .get(&ply_span::Symbol::new("d"))
+            .get(&ply_eval::Symbol::new("d"))
             .expect("the decimal field")
             .render(),
         "1.5",
         "the key was not canonicalized, so this test is not exercising the rebuild"
     );
-    match fields.get(&ply_span::Symbol::new("p")) {
+    match fields.get(&ply_eval::Symbol::new("p")) {
         Some(Value::Secret(held)) => assert!(
             Arc::ptr_eq(held, &payload),
             "canonicalization rebuilt a credential's payload instead of cloning the `Arc`"

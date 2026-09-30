@@ -1,8 +1,7 @@
 //! How a run is told what its configuration is, and what it refuses before it starts.
 
+use ply_eval::{CheckOutput, Diagnostic, Span, Symbol, codes};
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::CheckOutput;
 use serde_json::{Value as Json, json};
 use std::path::PathBuf;
 use std::sync::Arc;

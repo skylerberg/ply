@@ -2,7 +2,7 @@
 
 use crate::arena::Slot;
 use crate::value::Value;
-use ply_span::{Diagnostic, Span, codes};
+use crate::{Diagnostic, Span, codes};
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
 

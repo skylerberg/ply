@@ -1,7 +1,6 @@
 use ply_codegen::c::cache::{decode, encode, file_digest};
 use ply_codegen::c::tables::{Defined, Tables};
-use ply_eval::Value;
-use ply_span::Symbol;
+use ply_eval::{Symbol, Value};
 
 /// The binary a body is keyed under is identified by its bytes: a build that writes the same ones
 /// keeps the cache it filled, and a change of the same length moves it.

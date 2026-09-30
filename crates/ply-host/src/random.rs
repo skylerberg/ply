@@ -6,9 +6,9 @@
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, Linearity, Value,
+    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, Linearity,
+    Span, Symbol, Value, codes,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
 // `fill` is the trait's method, not the struct's.
 use ring::rand::SecureRandom;
 use std::sync::Arc;

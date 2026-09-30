@@ -5,9 +5,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
 };
-use ply_eval::{Pending, Value};
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::Resource;
+use ply_eval::{Diagnostic, Pending, Resource, Span, Symbol, Value, codes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -684,7 +682,7 @@ fn negative_range(offset: i64, len: i64, span: Span) -> Diagnostic {
 pub fn unbound(op: Op, at: &Resource, span: Span) -> Diagnostic {
     let label = match at {
         Resource::Named(name) => name.as_str().to_string(),
-        Resource::Var(v) => ply_ty::label_var_name(*v),
+        Resource::Var(v) => ply_eval::label_var_name(*v),
         Resource::Singleton => "the singleton resource".to_string(),
         Resource::Every => "every label".to_string(),
     };

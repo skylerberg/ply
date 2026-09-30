@@ -1,5 +1,4 @@
-use ply_span::Symbol;
-use ply_ty::*;
+use ply_eval::{EffectAtom, Footprint, Mode, Resource, Symbol, atom_texts, label_var_name};
 
 fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
     EffectAtom::new(

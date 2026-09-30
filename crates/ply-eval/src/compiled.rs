@@ -4,14 +4,12 @@ use crate::host::{HostBinding, HostRuntime, HostUse};
 use crate::region::Record;
 use crate::sim::Seed;
 use crate::value::Value;
-use ply_span::{Diagnostic, Symbol};
-use ply_ty::Footprint;
-use ply_ty::{DefHash, EffectAtom};
+use crate::{DefHash, Diagnostic, EffectAtom, Footprint, Symbol};
 use std::rc::Rc;
 use std::sync::Arc;
 
 pub trait Compiled {
-    /// Whether this was built over the program [`ply_ty::HashOutput::digest`] names.
+    /// Whether this was built over the program [`crate::Front::hashes_digest`] names.
     fn describes(&self, program: DefHash) -> bool;
 
     /// Runs `name`'s body over `args`, or declines for any reason at all.

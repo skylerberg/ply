@@ -14,9 +14,7 @@ mod selector_reads;
 mod tiers;
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{Machine, Provider, Value};
-use ply_span::{SourceId, Span};
-use ply_ty::Front;
+use ply_eval::{Front, Machine, Provider, SourceId, Span, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 

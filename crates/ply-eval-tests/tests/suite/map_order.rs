@@ -1,8 +1,7 @@
 // `Value`'s `Arc` payloads are deliberately not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_eval::{Map, Value, values_equal};
-use ply_span::Span;
+use ply_eval::{Map, Span, Value, values_equal};
 use rust_decimal::Decimal;
 use std::cmp::Ordering;
 use std::process::Command;
@@ -240,8 +239,8 @@ fn corpus() -> Vec<Value> {
     out.push(Value::builtin(ply_eval::Builtin::Push));
     out.push(Value::Record(std::sync::Arc::new(
         [
-            (ply_span::Symbol::new("a"), Value::Int(1)),
-            (ply_span::Symbol::new("b"), Value::Int(2)),
+            (ply_eval::Symbol::new("a"), Value::Int(1)),
+            (ply_eval::Symbol::new("b"), Value::Int(2)),
         ]
         .into_iter()
         .collect(),
@@ -318,7 +317,7 @@ fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
 fn a_decimal_anywhere_under_a_key_is_canonical() {
     let field = |d: &str| {
         Value::Record(std::sync::Arc::new(ply_eval::Fields::from_iter([(
-            ply_span::Symbol::new("price"),
+            ply_eval::Symbol::new("price"),
             dec(d),
         )])))
     };

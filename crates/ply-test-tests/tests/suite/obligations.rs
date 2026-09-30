@@ -1,11 +1,10 @@
+use ply_eval::{DefHash, Span, Symbol};
 use ply_prove::{
     Binder, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation,
     ObligationKind, ProvePlan, Rule, Sort, Tier, Vacuity, VacuityKind,
 };
-use ply_span::{Span, Symbol};
 use ply_store::{CachedCases, CachedEvidence, CachedObligation, Store};
 use ply_test::obligation::{self, Choice, Discharger, from_cached, to_cached};
-use ply_ty::DefHash;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;

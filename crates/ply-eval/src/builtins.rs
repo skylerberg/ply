@@ -2,11 +2,9 @@
 
 use crate::arena::{Arena, Slot};
 use crate::cont::Frame;
-use crate::map;
 use crate::semantics::arity_error;
 use crate::value::{Decimal, Fixed, List, Value, first_difference, type_error, values_equal};
-use crate::{INT_TYPES, IntTy};
-use ply_span::{Diagnostic, Span, codes};
+use crate::{Diagnostic, INT_TYPES, IntTy, Span, codes, map};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use std::fmt;

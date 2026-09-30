@@ -2,9 +2,7 @@
 //! reports about its searches.
 
 use ply_eval::explore::Interleaving;
-use ply_eval::{Exploration, Machine, Seed};
-use ply_span::Diagnostic;
-use ply_ty::{DefHash, EffectAtom, Footprint};
+use ply_eval::{DefHash, Diagnostic, EffectAtom, Exploration, Footprint, Machine, Seed};
 
 /// The effect whose atom a `simulate` region leaves in a footprint: the seed it reads.
 const SIM_EFFECT: &str = "sim";

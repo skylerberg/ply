@@ -1,8 +1,7 @@
-use ply_span::Symbol;
+use ply_eval::{DefHash, Symbol};
 use ply_store::{
     CachedCertificate, CachedEvidence, CachedObligation, CachedRule, Outcome, Store, Upstream,
 };
-use ply_ty::DefHash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 

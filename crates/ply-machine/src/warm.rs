@@ -1,8 +1,8 @@
 //! What survives one iteration of a warm process, so the next need not re-establish it.
 
 use crate::load::{Found, Loaded, Stamp, stamp_of};
+use ply_eval::DefHash;
 use ply_store::ContentHash;
-use ply_ty::DefHash;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +18,8 @@ pub struct Warm {
 /// A compiled unit and the definitions it was compiled from.
 pub struct HeldUnit {
     provider: &'static dyn ply_eval::Provider,
-    /// [`HashOutput::digest`], which a machine checks the unit against before entering it.
+    /// [`ply_eval::Front::hashes_digest`], which a machine checks the unit against before
+    /// entering it.
     key: DefHash,
 }
 
@@ -92,8 +93,8 @@ impl Warm {
     /// compile the same one.
     pub fn unit_for(
         &self,
-        front: &ply_ty::Front,
-        sources: &ply_span::SourceMap,
+        front: &ply_eval::Front,
+        sources: &ply_eval::SourceMap,
     ) -> Option<&'static dyn ply_eval::Provider> {
         let held = self.unit.as_ref()?;
         (held.key == front.hashes_digest && held.provider.relocate(front, sources))

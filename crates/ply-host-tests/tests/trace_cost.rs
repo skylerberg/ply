@@ -1,11 +1,8 @@
 use ply_eval::host::{
     HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostRuntime, MachineId, Pending,
 };
-use ply_eval::{TaskId, Value};
+use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value};
 use ply_host::trace::{Clock, Discard, Json, Level, Op, Sink, Trace};
-use ply_span::{Diagnostic, Span, Symbol};
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Resource};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;

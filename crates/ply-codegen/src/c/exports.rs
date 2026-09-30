@@ -6,8 +6,7 @@ use super::load::Library;
 use super::prelude::HELPERS;
 use super::tables::Defined;
 use anyhow::{Result, anyhow};
-use ply_eval::Value;
-use ply_span::Symbol;
+use ply_eval::{Symbol, Value};
 
 /// The symbol the table is read from.
 pub const SYMBOL: &str = "ply_exports";

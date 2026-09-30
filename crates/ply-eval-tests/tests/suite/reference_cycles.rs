@@ -1,5 +1,5 @@
 use crate::fixture::Compiled;
-use ply_span::codes;
+use ply_eval::codes;
 
 /// Storing the cell inside itself structurally asks for `T = List<Cell<T>>`.
 #[test]
@@ -43,8 +43,7 @@ test "a cell that reaches itself through a variant" {
 
 #[test]
 fn the_detector_still_finds_the_shape_it_guards_against() {
-    use ply_eval::TaskRegions;
-    use ply_span::Span;
+    use ply_eval::{Span, TaskRegions};
 
     let mut regions = TaskRegions::new();
     let id = regions.alloc_cell(ply_eval::Value::Unit);

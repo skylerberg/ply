@@ -1,6 +1,6 @@
 //! A deserializable `Diagnostic`: its `&'static str` code cannot borrow from a runtime file.
 
-use ply_span::{Diagnostic, Fix, Label, Severity, intern_code};
+use ply_eval::{Diagnostic, Fix, Label, Severity, intern_code};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]

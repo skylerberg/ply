@@ -1,8 +1,9 @@
 use ply_eval::host::MachineId;
-use ply_eval::{HostAnswer, HostRequest, HostRuntime, Value};
+use ply_eval::{
+    Diagnostic, EffectAtom, HostAnswer, HostRequest, HostRuntime, Mode, Resource, Span, Symbol,
+    Value, codes,
+};
 use ply_host::fs::*;
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::{EffectAtom, Mode, Resource};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

@@ -1,6 +1,6 @@
 //! What an obligation was discharged with, on disk.
 
-use ply_span::Symbol;
+use ply_eval::Symbol;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

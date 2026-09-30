@@ -94,7 +94,7 @@ pub trait Provider: Send + Sync {
     /// Moves where failures are reported to `front`'s layout of the program this was built from;
     /// `false`, moving nothing, when a definition's own text in `sources` changed, since a site is
     /// an offset into it.
-    fn relocate(&self, front: &ply_ty::Front, sources: &ply_span::SourceMap) -> bool;
+    fn relocate(&self, front: &crate::Front, sources: &crate::SourceMap) -> bool;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

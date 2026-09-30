@@ -1,10 +1,9 @@
 use ply_eval::host::MachineId;
 use ply_eval::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity, Value,
+    Determinism, Diagnostic, EffectAtom, HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime,
+    Linearity, Mode, Resource, Span, Symbol, Value, codes,
 };
 use ply_host::time::*;
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::{EffectAtom, Mode, Resource};
 use std::sync::Arc;
 
 struct Nothing;

@@ -4,15 +4,12 @@
 use ply_eval::host::{
     HostAnswer, HostOp, HostRegistry, HostRequest, HostRuntime, MachineId, Pending,
 };
-use ply_eval::{TaskId, Value};
+use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value, codes};
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
 use ply_host::signal::{Accepting, Bounds, Shutdown, Signal};
 use ply_host::tcp::{Net, TcpHost};
 use ply_host::trace::sink::Recording;
 use ply_host::trace::{Clock, Kept, Kind, Level, Op, Outcome, Sink, Trace};
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Resource};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};

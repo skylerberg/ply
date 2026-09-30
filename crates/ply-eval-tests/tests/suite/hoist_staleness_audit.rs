@@ -1,6 +1,5 @@
 use crate::fixture::Compiled;
-use ply_eval::Value;
-use ply_span::Span;
+use ply_eval::{Span, Value};
 
 impl Compiled {
     #[track_caller]

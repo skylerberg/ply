@@ -4,7 +4,7 @@
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, FAILED_UNWIND, FrameClause, HandlerFrame, call_value, drop_frame};
 use crate::stack::{Stack, switch};
-use ply_span::{Diagnostic, Symbol, codes};
+use ply_eval::{Diagnostic, Symbol, codes};
 
 pub struct Detached {
     stack: Option<Stack>,

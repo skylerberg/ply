@@ -16,7 +16,7 @@ use super::{
 use super::{solve, uninterpreted_sorts};
 use crate::Rule;
 use crate::sort::Sort;
-use ply_span::Symbol;
+use ply_eval::Symbol;
 use std::collections::BTreeSet;
 
 pub(super) fn attempt(

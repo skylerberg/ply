@@ -1,10 +1,8 @@
 use ply_codegen::Unit;
-use ply_eval::{Provider, Value};
-use ply_span::Symbol;
-use ply_ty::ModuleName;
+use ply_eval::{ModuleName, Provider, Symbol, Value};
 
 /// As `ply test benches/kernel` loads it: the project's own `.ply` files, and no standard library.
-fn kernel() -> (&'static ply_ty::Front, &'static Unit) {
+fn kernel() -> (&'static ply_eval::Front, &'static Unit) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -18,7 +16,7 @@ fn kernel() -> (&'static ply_ty::Front, &'static Unit) {
     files.sort();
     assert_eq!(files.len(), 2, "benches/kernel changed shape: {files:?}");
 
-    let mut sources = ply_span::SourceMap::new();
+    let mut sources = ply_eval::SourceMap::new();
     let mut inputs = Vec::new();
     for path in &files {
         let stem = path.file_stem().and_then(|s| s.to_str()).expect("a stem");
@@ -36,7 +34,7 @@ fn kernel() -> (&'static ply_ty::Front, &'static Unit) {
         .collect();
     let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
     let front = ply_codegen::c::producer::checked_front(&named, &ids).expect("the kernel checks");
-    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
     let unit =
         Unit::over_front(front, named.into_iter().collect()).expect("this host has a C compiler");
     (front, unit)

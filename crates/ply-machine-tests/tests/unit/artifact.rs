@@ -1,7 +1,6 @@
+use ply_eval::{DefHash, codes};
 use ply_machine::artifact::*;
-use ply_span::codes;
 use ply_store::body::StoredBody;
-use ply_ty::DefHash;
 use std::collections::BTreeMap;
 use std::path::Path;
 

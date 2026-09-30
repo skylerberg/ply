@@ -1,6 +1,6 @@
 //! Footprint-guided interleaving exploration.
 
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use crate::{Diagnostic, Span, Symbol, codes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 

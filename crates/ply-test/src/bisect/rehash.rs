@@ -2,8 +2,7 @@
 
 use super::{Baseline, DefKey, Ns};
 use ply_eval::decode::{self, At};
-use ply_span::Symbol;
-use ply_ty::DefHash;
+use ply_eval::{DefHash, Symbol};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Default)]

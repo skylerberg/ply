@@ -1,10 +1,8 @@
-use ply_span::{SourceId, Symbol};
+use ply_eval::{CheckOutput, DefHash, HashOutput, SourceId, Symbol};
 use ply_test::bisect::{
     Baseline, ChangeSet, Classify, DefKey, Regression, Rehashed, Row, StoreClassify, Unknown,
     change_set,
 };
-use ply_ty::CheckOutput;
-use ply_ty::{DefHash, HashOutput};
 use std::collections::BTreeMap;
 
 struct Compiled {

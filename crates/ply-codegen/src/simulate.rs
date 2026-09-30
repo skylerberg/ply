@@ -4,12 +4,10 @@
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, FAILED_UNWIND, call_value, drop_frame, inherit_frames, values_taken};
 use crate::stack::{Stack, switch};
-use ply_eval::Unbound;
 use ply_eval::host::Pending;
 use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, Turn};
 use ply_eval::sim::{Access, Answer, Handlers, OpSignature, TaskId, signature};
-use ply_eval::{SimId, Value};
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_eval::{Diagnostic, SimId, Span, Symbol, Unbound, Value, codes};
 
 pub struct Simulation {
     sched: Scheduler<usize, Word>,
@@ -472,8 +470,7 @@ pub fn seeded_region(c: &Ctx) -> Option<Span> {
 }
 
 pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
-    use ply_eval::Builtin;
-    use ply_ty::Mode;
+    use ply_eval::{Builtin, Mode};
     let mode = match b {
         Builtin::CellGet => Mode::Read,
         Builtin::CellSet | Builtin::CellUpdate => Mode::Write,

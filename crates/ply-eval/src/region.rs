@@ -4,7 +4,7 @@ use crate::explore::{Interleaving, Step, Verdict};
 use crate::sched::StepRecord;
 use crate::sim::{Access, Domain, Seed, Stream};
 
-use ply_span::{Diagnostic, Span, Symbol};
+use crate::{Diagnostic, Span, Symbol};
 
 pub struct StepSite {
     pub definition: Option<Symbol>,

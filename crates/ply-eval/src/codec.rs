@@ -2,8 +2,7 @@
 //! or secret has no bytes.
 
 use crate::value::{Decimal, Fields, Fixed, Value};
-use crate::{INT_TYPES, IntTy, List};
-use ply_span::Symbol;
+use crate::{INT_TYPES, IntTy, List, Symbol};
 use std::collections::HashMap;
 use std::sync::Arc;
 

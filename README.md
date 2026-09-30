@@ -20,9 +20,7 @@ of it next.
 
 | path | holds |
 | --- | --- |
-| `crates/ply-span` | spans, diagnostics and the constants for diagnostic codes |
-| `crates/ply-ty` | what the runtime reads of a checked program: names, rows, hashes and tables |
-| `crates/ply-eval` | values, the evaluator, the scheduler and the simulator |
+| `crates/ply-eval` | values, the evaluator, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
 | `crates/ply-codegen` | the compiled tier: emits C, builds it and loads it |
 | `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its bootstrap bundle (`bootstrap/`) |
 | `crates/ply-store` | the result and front-end caches under `.ply-cache` |

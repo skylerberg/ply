@@ -2,12 +2,11 @@
 //! tests, beside the TLS code that loads the ones a run is given.
 
 use crate::tls;
-use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     Linearity,
 };
-use ply_span::{Diagnostic, Symbol, codes};
+use ply_eval::{Diagnostic, Symbol, Value, codes};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -136,7 +135,7 @@ impl HostHandler for Operation {
 }
 
 #[cold]
-fn arity(op: Op, got: usize, span: ply_span::Span) -> Diagnostic {
+fn arity(op: Op, got: usize, span: ply_eval::Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!(

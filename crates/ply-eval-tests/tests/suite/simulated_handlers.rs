@@ -1,9 +1,10 @@
 use crate::fixture::port_check;
 use ply_codegen::c::producer;
 use ply_eval::decode::At;
-use ply_eval::{Answer, Handlers, SEEDED_OPS, SimTy, TaskId, Value};
-use ply_span::{SourceId, Span, Symbol};
-use ply_ty::{CheckOutput, EffectInfo};
+use ply_eval::{
+    Answer, CheckOutput, EffectInfo, Handlers, SEEDED_OPS, SimTy, SourceId, Span, Symbol, TaskId,
+    Value,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

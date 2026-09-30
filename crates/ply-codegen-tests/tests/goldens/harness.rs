@@ -130,8 +130,7 @@ pub mod golden {
 
 /// The self-hosted compiler the binary carries; `PLY_C_EMITTER=ply:<dir>` enters a working copy of its `.ply` sources instead.
 pub mod port {
-    use ply_eval::{Fields, Value};
-    use ply_span::Symbol;
+    use ply_eval::{Fields, Symbol, Value};
     use std::sync::Arc;
 
     /// `name` is `module.function`; a raise, a missing entry or a non-string answer panics.
