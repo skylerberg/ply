@@ -494,7 +494,7 @@ fn pulled_and_loaded(dir: &Path) -> (Vec<String>, ply_ty::Front, Result<Loaded, 
     let ids: Vec<SourceId> = (0..user.len() + pulled.modules.len())
         .map(|i| SourceId(i as u32))
         .collect();
-    let ours = ply_ty::read_front(&pulled.dump, &ids)
+    let ours = ply_codegen::c::dump::read(&pulled.dump, &ids)
         .unwrap_or_else(|e| panic!("{}: the port's answer does not read: {e}", dir.display()));
 
     let theirs = load(dir);
