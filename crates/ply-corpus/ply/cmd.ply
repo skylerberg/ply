@@ -1,8 +1,8 @@
 // The corpus's command line and its entry point. The line is declared once as a cmdline spec — the
 // CLI package's library, not a copy of it — and `main` answers it: help, a version and a refusal
-// here; `gen`, `bench`, `sweep` and `real` in this package; and every other subcommand as a JSON
-// plan handed to the Rust executor bound as `executor`, whose output and exit code are this
-// program's own.
+// here; `gen`, `bench`, `sweep`, `real`, `serve` and `w3` in this package; and every other
+// subcommand as a JSON plan handed to the Rust executor bound as `executor`, whose output and exit
+// code are this program's own.
 //
 // It runs under `ply run` (`benches/corpus.sh` holds the whole line) with two filesystem roots:
 // `work`, bound at the working directory, which every path this program reads, writes or spawns in
@@ -15,11 +15,15 @@ import bench
 import gbuild
 import gen
 import real
+import serve
 import spine
 import sweep
+import w3
+import std.certgen (certgen)
 import std.json (Json, Str, Number, Bool, Null, object, array)
 import std.json
 import std.fs (fs)
+import std.net (net)
 import std.process (process, exit_code)
 import std.config (config)
 import std.time (time)
@@ -123,12 +127,59 @@ fn shape_flags() -> List<cmdline::Flag> = {
   ]
 }
 
-fn serve_flags() -> List<cmdline::Flag> =
+fn pos(long: String, default: Int, help: String) -> cmdline::Flag =
+  cmdline::with_default(cmdline::valued(long, "N", cmdline::Pos, help), int_to_string(default))
+
+fn is_positive(entry: String) -> Bool =
+  match cmdline::parse_nat(entry) { Some(n) -> n > 0, None -> false }
+
+fn counts(long: String, default: String, help: String) -> cmdline::Flag =
+  cmdline::checking(
+    cmdline::with_default(cmdline::valued(long, "N,N,…", cmdline::Text, help), default),
+    |v: String| every(v, is_positive, " is not a count above zero"),
+  )
+
+fn joined(xs: List<String>) -> String =
+  fold(xs, "", |acc: String, x: String| if acc == "" { x } else { acc ++ ", " ++ x })
+
+fn sections_flag(taken: List<String>, default: String) -> cmdline::Flag =
+  cmdline::checking(
+    cmdline::with_default(
+      cmdline::valued(
+        "sections",
+        "NAME,…",
+        cmdline::Text,
+        "The tables to take, of " ++ joined(taken),
+      ),
+      default,
+    ),
+    |v: String|
+      every(
+        v,
+        |entry: String| fold(taken, false, |seen: Bool, t: String| seen || t == entry),
+        " is not a table this command takes",
+      ),
+  )
+
+// What every served subcommand takes: where the repository is, which the children are handed paths
+// into, and where a run keeps what it makes, which this program writes through `work`.
+fn served_flags() -> List<cmdline::Flag> =
   [
-    text("repo", ".", "The repository root the fixtures are read from"),
-    opt("ply", "The `ply` binary the load tables drive; the executor's sibling when left off"),
-    nat("requests", 2000, "Requests per point"),
-    nat("repeats", 3, "Repeats per point; the fastest is reported"),
+    text(
+      "repo",
+      ".",
+      "The repository: its example, fixtures and floor are what is run, from the working directory or an absolute path",
+    ),
+    cmdline::checking(
+      text(
+        "scratch",
+        "target/corpus",
+        "Where a run keeps its logs, certificates, reports and the floor it builds",
+      ),
+      inside,
+    ),
+    pos("repeats", 3, "Runs of each point; the fastest is reported"),
+    pos("iterations", 2000, "Calls in each round of an in-process table"),
     json_switch(),
   ]
 
@@ -242,22 +293,17 @@ pub fn spec() -> cmdline::Spec =
         ),
         cmdline::command(
           "serve",
-          "Price a request: its cost per layer, and what the endpoint sustains under load",
+          "Price a request: its cost per layer in one process, and served against a floor in C",
           cats([
-            serve_flags(),
+            served_flags(),
             [
-              nat("ladder-requests", 2000, "Requests per ladder rung; each is one connection"),
-              nats("concurrency", "1,2,4,8,16,32,64", "Simultaneous client connections to sweep"),
-              nats(
-                "load-headers",
-                "0",
-                "Filler header lines the client's request carries, per load point",
-              ),
-              sw("no-ladder", "Drop the per-request ladder, which is the slow half"),
-              sw("no-load", "Drop the load table, which is the half that needs a built `ply`"),
-              sw(
-                "baseline",
-                "Also measure the endpoint with `fold`-based scans instead of the byte builtins",
+              sections_flag(serve::sections(), "layers,load"),
+              pos("requests", 2000, "Requests in each served point"),
+              pos("per-conn", 1, "Requests one connection carries in the served table"),
+              counts(
+                "concurrency",
+                "1,2,4,8,16,32,64",
+                "Clients the desk's task-per-connection loop and the threaded floor are loaded with",
               ),
             ],
           ]),
@@ -294,22 +340,35 @@ pub fn spec() -> cmdline::Spec =
           "w3",
           "Price routing, HTTP/1.1 framing, keep-alive and TLS on the request path",
           cats([
-            serve_flags(),
+            served_flags(),
             [
-              nat("per-conn", 32, "Requests one connection carries in the throughput sweep"),
-              nat(
+              sections_flag(w3::sections(), "mix,routes,keep-alive,tls,shape"),
+              cmdline::with_default(
+                cmdline::valued(
+                  "accept",
+                  "LOOP",
+                  cmdline::Choice(["sequential", "task-per-connection"]),
+                  "The loop the desk accepts connections with",
+                ),
+                "sequential",
+              ),
+              counts("concurrency", "1,2,4,8,16,32,64", "Clients the read mix is loaded with"),
+              pos(
+                "per-conn",
+                32,
+                "Requests one connection carries in the read mix and one route at a time",
+              ),
+              pos(
                 "requests-per-point",
                 4000,
-                "Requests per point in the throughput sweep, held constant across concurrencies",
+                "Requests in each point of the read mix and one route at a time",
               ),
-              nat("ladder-requests", 3200, "Requests per point in the keep-alive and TLS ladders"),
-              nat("ladder-concurrency", 8, "Client threads in the keep-alive and TLS ladders"),
-              nats("concurrency", "1,2,4,8,16,32,64", "Simultaneous client connections to sweep"),
-              sw("concurrent", "Also serve the task-per-connection variant"),
-              sw("w2-baseline", "Also re-take W2's single-endpoint load number on this machine"),
-              sw("no-load", "Drop the load tables"),
-              sw("no-shape", "Drop the per-route and shape tables"),
-              sw("no-tls", "Drop the TLS ladder"),
+              pos(
+                "ladder-requests",
+                3200,
+                "Requests in each point of the keep-alive and TLS tables",
+              ),
+              pos("ladder-concurrency", 8, "Clients in the keep-alive and TLS tables"),
             ],
           ]),
         ),
@@ -517,12 +576,48 @@ pub type Asked =
   | Bench(BenchArgs)
   | Sweep(SweepArgs)
   | Real(RealArgs)
+  | Serve({ args: serve::ServeArgs, json: Bool })
+  | W3({ args: w3::W3Args, json: Bool })
   | Plan(Json)
 
 fn nat_of(p: cmdline::Parsed, long: String) -> Int =
   match cmdline::value(p, long) {
     Some(v) -> match cmdline::parse_nat(v) { Some(n) -> n, None -> 0 },
     None -> 0,
+  }
+
+fn text_of(p: cmdline::Parsed, long: String) -> String =
+  match cmdline::value(p, long) { Some(v) -> v, None -> "" }
+
+fn nats_of(p: cmdline::Parsed, long: String) -> List<Int> =
+  map(split_commas(text_of(p, long)), |entry: String|
+    match cmdline::parse_nat(entry) { Some(n) -> n, None -> 0 })
+
+fn serve_args(p: cmdline::Parsed) -> serve::ServeArgs =
+  {
+    repo: text_of(p, "repo"),
+    scratch: text_of(p, "scratch"),
+    sections: split_commas(text_of(p, "sections")),
+    requests: nat_of(p, "requests"),
+    per_conn: nat_of(p, "per-conn"),
+    concurrency: nats_of(p, "concurrency"),
+    repeats: nat_of(p, "repeats"),
+    iterations: nat_of(p, "iterations"),
+  }
+
+fn w3_args(p: cmdline::Parsed) -> w3::W3Args =
+  {
+    repo: text_of(p, "repo"),
+    scratch: text_of(p, "scratch"),
+    sections: split_commas(text_of(p, "sections")),
+    accept: text_of(p, "accept"),
+    concurrency: nats_of(p, "concurrency"),
+    per_conn: nat_of(p, "per-conn"),
+    requests_per_point: nat_of(p, "requests-per-point"),
+    ladder_requests: nat_of(p, "ladder-requests"),
+    ladder_concurrency: nat_of(p, "ladder-concurrency"),
+    repeats: nat_of(p, "repeats"),
+    iterations: nat_of(p, "iterations"),
   }
 
 fn float_of(p: cmdline::Parsed, long: String) -> Float =
@@ -600,6 +695,8 @@ pub fn asked(argv: List<String>) -> Asked =
           }),
       },
       "real" -> Real({ tests: !cmdline::has(p, "no-tests"), json: cmdline::has(p, "json") }),
+      "serve" -> Serve({ args: serve_args(p), json: cmdline::has(p, "json") }),
+      "w3" -> W3({ args: w3_args(p), json: cmdline::has(p, "json") }),
       _ -> match run_plan(p) { Ok(j) -> Plan(j), Err(why) -> Refusal(why) },
     },
   }
@@ -636,15 +733,6 @@ fn repeated_json(p: cmdline::Parsed, long: String) -> Json =
   array(map(cmdline::values_of(p, long), |s: String| Str(s)))
 
 fn positionals_json(p: cmdline::Parsed) -> Json = array(map(p.positionals, |s: String| Str(s)))
-
-fn serve_args(p: cmdline::Parsed) -> List<{ key: String, value: Json }> =
-  [
-    { key: "repo", value: str_flag(p, "repo") },
-    { key: "ply", value: str_flag(p, "ply") },
-    { key: "requests", value: int_flag(p, "requests") },
-    { key: "repeats", value: int_flag(p, "repeats") },
-    { key: "json", value: bool_flag(p, "json") },
-  ]
 
 fn plan(command: String, args: List<{ key: String, value: Json }>) -> Json =
   object([
@@ -695,23 +783,6 @@ fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
           { key: "json", value: bool_flag(p, "json") },
         ]),
       ),
-    "serve" ->
-      Ok(
-        plan(
-          "serve",
-          cats([
-            serve_args(p),
-            [
-              { key: "ladder_requests", value: int_flag(p, "ladder-requests") },
-              { key: "concurrency", value: list_flag(p, "concurrency") },
-              { key: "load_headers", value: list_flag(p, "load-headers") },
-              { key: "no_ladder", value: bool_flag(p, "no-ladder") },
-              { key: "no_load", value: bool_flag(p, "no-load") },
-              { key: "baseline", value: bool_flag(p, "baseline") },
-            ],
-          ]),
-        ),
-      ),
     "payload" ->
       Ok(
         plan("payload", [
@@ -727,27 +798,6 @@ fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
           { key: "no_derivation", value: bool_flag(p, "no-derivation") },
           { key: "json", value: bool_flag(p, "json") },
         ]),
-      ),
-    "w3" ->
-      Ok(
-        plan(
-          "w3",
-          cats([
-            serve_args(p),
-            [
-              { key: "per_conn", value: int_flag(p, "per-conn") },
-              { key: "requests_per_point", value: int_flag(p, "requests-per-point") },
-              { key: "ladder_requests", value: int_flag(p, "ladder-requests") },
-              { key: "ladder_concurrency", value: int_flag(p, "ladder-concurrency") },
-              { key: "concurrency", value: list_flag(p, "concurrency") },
-              { key: "concurrent", value: bool_flag(p, "concurrent") },
-              { key: "w2_baseline", value: bool_flag(p, "w2-baseline") },
-              { key: "no_load", value: bool_flag(p, "no-load") },
-              { key: "no_shape", value: bool_flag(p, "no-shape") },
-              { key: "no_tls", value: bool_flag(p, "no-tls") },
-            ],
-          ]),
-        ),
       ),
     "w4" -> match required(p, "db") {
       Err(why) -> Err(why),
@@ -898,9 +948,13 @@ fn executed(
   }
 }
 
+// What serving a program takes: `ply run` children, the floor the runner built and bound as
+// `http_floor`, the kit's own connections, the clock, and certificates for a TLS run.
+effect set Serving = {process.start[ply], process.wait[ply], process.signal[ply], process.output_line[ply], process.start[http_floor], process.wait[http_floor], process.signal[http_floor], process.output_line[http_floor], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], certgen.issue, time.sleep_ms}
+
 fn code_of(
   a: Asked,
-) -> Int / {process.out[proc], process.err[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+) -> Int / {Serving, process.out[proc], process.err[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
   match a {
     Said(text) -> {
       process.out[proc](text);
@@ -936,10 +990,20 @@ fn code_of(
         Err(why) -> Err(why),
         Ok(report) -> Ok(report_text(report, r.json)),
       }),
+    Serve(s) ->
+      answered(match serve::run(s.args) {
+        Err(why) -> Err(why),
+        Ok(report) -> Ok(report_text(report, s.json)),
+      }),
+    W3(w) ->
+      answered(match w3::run(w.args) {
+        Err(why) -> Err(why),
+        Ok(report) -> Ok(report_text(report, w.json)),
+      }),
     Plan(j) -> executed(j),
   }
 
-pub fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+pub fn main() -> Unit / {Serving, process.args[proc], process.out[proc], process.err[proc], process.exit[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
   process.exit[proc](code_of(asked(process.args[proc]())))
 
 // --- Tests -----------------------------------------------------------------------
@@ -1009,6 +1073,40 @@ test "real tests unless told not to" {
 }
 
 test "w4 refuses without --db" { assert(string_contains(refusal_of(["w4"]), "--db")) }
+
+test "serve reads its tables and its load, and refuses a table it does not take" {
+  match asked(["serve", "--sections", "layers,scans", "--concurrency", "2,8", "--json"]) {
+    Serve(s) -> {
+      assert_eq(s.args.sections, ["layers", "scans"]);
+      assert_eq(s.args.concurrency, [2, 8]);
+      assert_eq(s.args.per_conn, 1);
+      assert_eq(s.args.repo, ".");
+      assert_eq(s.args.scratch, "target/corpus");
+      assert(s.json)
+    },
+    _ -> assert(false),
+  };
+  assert(
+    string_contains(refusal_of(["serve", "--sections", "layers,ladder"]), "ladder is not a table"),
+  );
+  assert(
+    string_contains(refusal_of(["serve", "--concurrency", "1,0"]), "0 is not a count above zero"),
+  );
+  assert(string_contains(refusal_of(["serve", "--scratch", "/tmp/corpus"]), "is absolute"))
+}
+
+test "w3 takes the desk's accept loops and no other" {
+  match asked(["w3", "--accept", "task-per-connection", "--sections", "keep-alive"]) {
+    W3(w) -> {
+      assert_eq(w.args.accept, "task-per-connection");
+      assert_eq(w.args.sections, ["keep-alive"]);
+      assert_eq(w.args.ladder_concurrency, 8);
+      assert(!w.json)
+    },
+    _ -> assert(false),
+  };
+  assert(string_contains(refusal_of(["w3", "--accept", "threads"]), "possible values"))
+}
 
 test "w6-ladder reads a comma list of concurrencies" {
   assert(

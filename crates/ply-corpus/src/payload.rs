@@ -753,7 +753,7 @@ fn directory_bytes(dir: &Path) -> Result<u64> {
 
 /// Where the `ply` binary is, given this one.
 pub fn ply_binary() -> Result<PathBuf> {
-    crate::serve::ply_binary()
+    crate::ply_binary()
 }
 
 #[derive(Clone, Debug, Serialize)]

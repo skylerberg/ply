@@ -2,7 +2,8 @@
 --
 --     $ createdb desk
 --     $ psql -d desk -f examples/desk.sql
---     $ examples/serve.sh --db postgres://localhost/desk
+--     $ ply run examples/desk.ply --host --config-schema desk.config \
+--         --set DESK_API_KEY=… --set DESK_DATABASE=postgres://localhost/desk
 --
 -- **This file is not the authority and must not become one.** `schema()` in
 -- `examples/desk.ply` is, and the statements below are what `db::create_schema`
