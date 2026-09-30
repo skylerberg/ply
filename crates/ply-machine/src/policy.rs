@@ -83,9 +83,7 @@ fn own(effect: &str) -> String {
 /// The operations one family lends.
 pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
     Some(match family {
-        "machine" => {
-            crate::registrations_for(crate::drive::RunOptions::default(), &declared("machine"))
-        }
+        "machine" => crate::registrations_with(crate::drive::RunOptions::default()),
         "tester" => crate::tester::Session::new(&TestOptions::default()).lent(),
         "claims" => crate::claims::lent(&declared("prover")),
         "builder" => crate::builder::lent(),

@@ -132,11 +132,11 @@ fn a_foreign_slot_is_answered_by_the_reading_stack_and_never_by_its_owner() {
     let in_b = b.alloc_cell(Value::str("b's secret"));
     assert_eq!(in_a, in_b, "two fresh stacks bump from the same floor");
 
-    assert_eq!(a.get(in_b).map(Value::render).unwrap(), "\"a's secret\"");
-    assert_eq!(b.get(in_a).map(Value::render).unwrap(), "\"b's secret\"");
+    assert_eq!(a.get(in_b).cloned().unwrap(), Value::str("a's secret"));
+    assert_eq!(b.get(in_a).cloned().unwrap(), Value::str("b's secret"));
 
     assert!(a.set(in_b, Value::str("clobbered")));
-    assert_eq!(b.get(in_b).map(Value::render).unwrap(), "\"b's secret\"");
+    assert_eq!(b.get(in_b).cloned().unwrap(), Value::str("b's secret"));
 }
 
 #[test]
@@ -161,8 +161,8 @@ fn a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor()
         "a write through it is refused"
     );
     assert_eq!(
-        regions.get(fresh).map(Value::render).unwrap(),
-        "\"the second run's secret\""
+        regions.get(fresh).cloned().unwrap(),
+        Value::str("the second run's secret")
     );
 }
 

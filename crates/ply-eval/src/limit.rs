@@ -12,7 +12,7 @@ pub const DEFAULT_STEP_BUDGET: i64 = 1_000_000_000;
 pub const MAX_VALUE_DEPTH: usize = DEFAULT_MAX_CALLS;
 
 /// Grows the stack: unoptimized native recursion exhausts a worker's stack before either bound.
-pub(crate) fn grow<R>(f: impl FnOnce() -> R) -> R {
+pub fn grow<R>(f: impl FnOnce() -> R) -> R {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
     stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, f)

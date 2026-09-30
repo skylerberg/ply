@@ -39,7 +39,7 @@ fn front_of(source: &str) -> Front {
     ply_codegen::c::producer::checked_front(&named, &ids).expect("the program checks")
 }
 
-fn ask() -> String {
+fn ask() -> ply_eval::Value {
     let front = front_of(ASKER);
     let texts: HashMap<String, String> =
         [("m".to_string(), ASKER.to_string())].into_iter().collect();
@@ -55,7 +55,6 @@ fn ask() -> String {
     machine
         .call("m.main", Vec::new(), Span::DUMMY)
         .expect("the entry ran")
-        .to_string()
 }
 
 #[test]
@@ -63,7 +62,7 @@ fn a_program_reads_its_environment() {
     // Safety: the test is alone in its process (nextest), so the variable is its own.
     unsafe { std::env::set_var("PLY_LAUNCHER_TEST_MARK", "here") };
     let answer = ask();
-    assert_eq!(answer, "\"here|absent|piped|9.9.9-test\"");
+    assert_eq!(answer, ply_eval::Value::str("here|absent|piped|9.9.9-test"));
     unsafe { std::env::remove_var("PLY_LAUNCHER_TEST_MARK") };
 }
 

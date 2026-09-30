@@ -1,12 +1,10 @@
-//! `machine.Value`: what a `machine.call` argument or answer is, on the way across.
+//! `std.value.Value`: what a `machine.call` argument or answer is, and what a raise carries.
 
 // A `Value` pins `Arc` for shared payloads and `Rc` for shared code, so none of these `Arc`s can be `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_eval::{Span, Symbol, Value};
-use ply_machine::payload::{
-    adt_to_wire, machine_value, value_from_wire, value_of_adt, value_to_wire, wire_to_adt,
-};
+use ply_eval::{Diagnostic, Fixed, IntTy, Plain, Span, Symbol, Value, codes, slot};
+use ply_machine::payload::{diag_value, plain_value, raised_value, value_plain};
 
 /// A record with the fields a program declared, as a value.
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -18,98 +16,143 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
     ))
 }
 
+fn field(value: &Value, name: &str) -> Value {
+    let Value::Record(fields) = value else {
+        panic!("not a record: {value:?}");
+    };
+    fields.named(name).cloned().expect("the field is there")
+}
+
+/// The whole trip a `machine.call` argument takes, and its answer takes back.
+fn crossed(value: &Value) -> Value {
+    let data = plain_value(&Plain::of(value));
+    value_plain(&data, Span::DUMMY)
+        .expect("`std.value` data reads back")
+        .into_value()
+        .expect("a crossable value becomes one again")
+}
+
 #[test]
-fn every_crossable_value_survives_the_wire() {
+fn every_crossable_value_survives_the_crossing() {
     let values = vec![
         Value::Unit,
         Value::Bool(true),
         Value::Int(-7),
+        Value::Float(1.5),
         Value::str("hello"),
         Value::bytes([0u8, 1, 254, 255]),
         Value::list(vec![Value::Int(1), Value::Int(2)]),
         record(vec![("a", Value::Int(1)), ("b", Value::str("two"))]),
         Value::ctor(Symbol::new("std.json.Number"), vec![Value::Int(3)]),
         Value::map(vec![(Value::str("k"), Value::Int(9))]),
-        Value::Fixed(ply_eval::Fixed::of(ply_eval::IntTy::U32, 4000000000).unwrap()),
-        Value::Fixed(ply_eval::Fixed::of(ply_eval::IntTy::I8, -5).unwrap()),
+        Value::Fixed(Fixed::of(IntTy::U32, 4000000000).unwrap()),
+        Value::Fixed(Fixed::of(IntTy::I8, -5).unwrap()),
+        Value::Fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX))),
+        Value::Fixed(Fixed::new(IntTy::U128, u128::MAX)),
+        Value::Fixed(Fixed::of(IntTy::I128, i128::MIN).unwrap()),
     ];
     for value in values {
-        let wire = value_to_wire(&value);
-        let back = value_from_wire(&wire, Span::DUMMY).expect("the wire reads back");
-        assert_eq!(
-            back.to_string(),
-            value.to_string(),
-            "{} did not survive",
-            value.type_name()
-        );
+        assert_eq!(crossed(&value), value, "{value:?} did not survive");
     }
 }
 
 #[test]
-fn a_fixed_width_integer_crosses_with_its_type() {
-    let value = Value::Fixed(ply_eval::Fixed::of(ply_eval::IntTy::U32, 4_000_000_000).unwrap());
-    let adt = machine_value(&value, "m").unwrap();
-    assert_eq!(adt.to_string(), "m.VFixed(\"U32\", 4000000000)");
+fn a_fixed_width_integer_crosses_as_the_pattern_its_width_reads() {
+    let data = plain_value(&Plain::of(&Value::Fixed(Fixed::of(IntTy::I8, -5).unwrap())));
     assert_eq!(
-        value_of_adt(&adt, Span::DUMMY, "m").unwrap().to_string(),
-        "4000000000"
+        data,
+        Value::ctor(
+            "std.value.VFixed",
+            vec![
+                Value::str("I8"),
+                Value::Fixed(Fixed::new(IntTy::U128, 0xFB))
+            ]
+        )
     );
-    // A U64 above `Int`'s range has no `Int` to cross as.
-    let too_big = Value::Fixed(ply_eval::Fixed::new(
-        ply_eval::IntTy::U64,
-        u128::from(u64::MAX),
-    ));
-    machine_value(&too_big, "m").expect_err("a U64 above i64::MAX does not cross");
 }
 
 #[test]
-fn a_value_that_cannot_cross_is_refused_by_name() {
+fn a_generated_function_crosses_as_its_rule_and_is_callable_again() {
+    let table = Plain::Fn(ply_eval::Fun::Table {
+        arity: 1,
+        entries: vec![(Plain::Int(1), Plain::Bool(true))],
+        default: Box::new(Plain::Bool(false)),
+    });
+    let back = value_plain(&plain_value(&table), Span::DUMMY).expect("reads back");
+    assert_eq!(back, table);
+    let called = back
+        .into_value()
+        .expect("a generated function is one again");
+    let Value::Closure(c) = &called else {
+        panic!("not a function");
+    };
+    let ply_eval::ClosureKind::Synth { rule, .. } = &c.kind else {
+        panic!("not a generated function");
+    };
+    assert_eq!(
+        rule.apply(&[Value::Int(1)]).expect("total"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        rule.apply(&[Value::Int(2)]).expect("total"),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn a_value_only_its_own_run_can_hold_is_refused_by_what_it_is() {
     let closure = Value::Closure(std::sync::Arc::new(ply_eval::Closure {
-        name: None,
+        name: Some(Symbol::new("m.Wrapped")),
         kind: ply_eval::ClosureKind::Ctor {
             name: Symbol::new("m.Wrapped"),
             arity: 1,
         },
     }));
-    let err = machine_value(&closure, "m").expect_err("a closure does not cross");
-    assert!(
-        err.message.contains("cannot cross"),
-        "the refusal names the reason: {}",
-        err.message
-    );
-}
-
-#[test]
-fn a_value_names_its_constructors_after_the_callers_module() {
-    let value = Value::list(vec![Value::Int(1)]);
-    let adt = machine_value(&value, "m").expect("an int list crosses");
-    // The constructors are the caller's: `m.VList` over `m.VInt`.
-    assert_eq!(adt.to_string(), "m.VList([m.VInt(1)])");
-
-    let back = value_of_adt(&adt, Span::DUMMY, "m").expect("the ADT reads back");
-    assert_eq!(back.to_string(), value.to_string());
-}
-
-#[test]
-fn an_adt_of_a_foreign_module_is_refused() {
-    // `VInt` of another module is not this program's `Value`.
-    let foreign = Value::ctor(Symbol::new("other.VInt"), vec![Value::Int(1)]);
-    value_of_adt(&foreign, Span::DUMMY, "m").expect_err("a foreign ctor is not a `machine.Value`");
-}
-
-#[test]
-fn the_adt_wire_carries_records_and_ctors_both_ways() {
-    let value = record(vec![
-        ("n", Value::Int(4)),
-        (
-            "c",
-            Value::ctor(Symbol::new("m.Some"), vec![Value::str("x")]),
-        ),
-    ]);
-    let wire = adt_to_wire(&machine_value(&value, "m").unwrap(), Span::DUMMY, "m").unwrap();
-    let back = wire_to_adt(&wire, Span::DUMMY, "m").unwrap();
+    let copied = Plain::of(&closure);
     assert_eq!(
-        back.to_string(),
-        machine_value(&value, "m").unwrap().to_string()
+        copied,
+        Plain::Fn(ply_eval::Fun::Named("m.Wrapped".to_string()))
+    );
+    let why = copied
+        .into_value()
+        .expect_err("a program's own function does not cross");
+    assert!(why.contains("only its own run"), "{why}");
+    let secret = Plain::of(&Value::secret(Value::str("hunter2")));
+    assert_eq!(secret, Plain::Secret);
+    assert!(secret.into_value().is_err());
+}
+
+#[test]
+fn an_answer_that_is_no_std_value_is_refused() {
+    let foreign = Value::ctor(Symbol::new("other.Thing"), vec![Value::Int(1)]);
+    value_plain(&foreign, Span::DUMMY)
+        .expect_err("a foreign constructor is not a `std.value.Value`");
+}
+
+#[test]
+fn a_raise_hands_over_its_values_and_a_plain_crossing_says_what_they_are() {
+    let d = Diagnostic::error(
+        codes::ASSERTION_FAILED,
+        format!("expected {}, found {}", slot(0), slot(1)),
+    )
+    .showing(vec![Plain::Int(1), Plain::Str("a".to_string())]);
+
+    let raised = raised_value(&d);
+    let message = field(&field(&raised, "diag"), "message");
+    assert_eq!(
+        message,
+        Value::bytes(format!("expected {}, found {}", slot(0), slot(1)))
+    );
+    assert_eq!(
+        field(&raised, "values"),
+        Value::list(vec![
+            plain_value(&Plain::Int(1)),
+            plain_value(&Plain::Str("a".to_string()))
+        ])
+    );
+
+    assert_eq!(
+        field(&diag_value(&d), "message"),
+        Value::bytes("expected an `Int`, found a `String`")
     );
 }

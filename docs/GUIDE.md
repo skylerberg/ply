@@ -2391,6 +2391,36 @@ nothing here raises. `is_sign_negative` holds for `-0.0` and a negative NaN too.
 is. `pow2(k)` is `2^k` exactly, through the subnormals down to `2^-1074`, zero
 below that and an infinity above `2^1023`.
 
+### 13.35 `std.value`
+
+```ply
+pub type Value =
+  | VUnit | VBool(Bool) | VInt(Int) | VFloat(Float) | VDecimal(Decimal)
+  | VFixed(String, U128) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
+  | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
+  | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
+pub type Field = { name: String, value: Value }
+pub type Entry = { key: Value, value: Value }
+pub type Fun =
+  | FNamed(String) | FAnonymous | FConst({ arity: Int, value: Value })
+  | FProject({ arity: Int, index: Int })
+  | FTable({ arity: Int, entries: List<Entry>, default: Value })
+pub fn render(v: Value) -> String
+pub fn filled(text: String, values: List<Value>) -> String
+pub fn shown_items() -> Int
+pub fn shown_depth() -> Int
+```
+
+A value of any type as data: what `machine.call` takes and answers, what a
+runtime diagnostic carries, and what a counterexample binds. `render` is the one
+way a value is shown, in the language's own spelling. A list or map past
+`shown_items` items counts the rest, nesting past `shown_depth` shows as `…`,
+and a credential shows as `Secret(****)`. A fixed width holds the bit pattern it
+reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
+a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
+and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each
+value a runtime diagnostic's text names in its place.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the

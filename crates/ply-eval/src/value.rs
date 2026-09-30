@@ -3,7 +3,7 @@ use crate::builtins::Builtin;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::sched::TaskHandle;
 use crate::sim::TaskId;
-use crate::{Diagnostic, IntTy, Span, Symbol, codes, render_float};
+use crate::{Diagnostic, IntTy, Span, Symbol, codes};
 use rpds::RedBlackTreeMap;
 pub use rust_decimal::Decimal;
 use std::cell::RefCell;
@@ -13,15 +13,11 @@ thread_local! {
 }
 use std::cmp::Ordering;
 use std::fmt;
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 pub use crate::list::List;
 
 pub type Map = RedBlackTreeMap<Value, Value>;
-
-const RENDER_MAX_ITEMS: usize = 32;
-const RENDER_MAX_DEPTH: usize = 16;
 
 thread_local! {
     /// Indexed by [`Builtin`]'s discriminant.
@@ -409,137 +405,7 @@ impl Value {
             other => Err(type_error(span, what, "Task", other)),
         }
     }
-
-    pub fn render(&self) -> String {
-        let mut out = String::new();
-        self.write(&mut out, 0);
-        out
-    }
-
-    fn write(&self, out: &mut String, depth: usize) {
-        if depth > RENDER_MAX_DEPTH {
-            out.push('…');
-            return;
-        }
-        match self {
-            Value::Int(i) => {
-                let _ = write!(out, "{i}");
-            }
-            Value::Fixed(f) => {
-                let _ = write!(out, "{f}");
-            }
-            Value::Bool(b) => {
-                let _ = write!(out, "{b}");
-            }
-            Value::Float(f) => out.push_str(&render_float(*f)),
-            // The scale as stored, so `1.50m` renders `1.50`.
-            Value::Decimal(d) => {
-                let _ = write!(out, "{d}");
-            }
-            Value::Str(s) => {
-                out.push('"');
-                out.push_str(&escape(s));
-                out.push('"');
-            }
-            Value::Bytes(b) => {
-                out.push_str("b\"");
-                for byte in b.iter().take(RENDER_MAX_ITEMS) {
-                    out.push_str(&escape_byte(*byte));
-                }
-                out.push('"');
-                if b.len() > RENDER_MAX_ITEMS {
-                    let _ = write!(out, " … {} more", b.len() - RENDER_MAX_ITEMS);
-                }
-            }
-            Value::Unit => out.push_str("()"),
-            Value::List(items) => {
-                out.push('[');
-                for (i, item) in items.iter().take(RENDER_MAX_ITEMS).enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    item.write(out, depth + 1);
-                }
-                if items.len() > RENDER_MAX_ITEMS {
-                    let _ = write!(out, ", … {} more", items.len() - RENDER_MAX_ITEMS);
-                }
-                out.push(']');
-            }
-            Value::Map(entries) => {
-                out.push('{');
-                for (i, (k, v)) in entries.iter().take(RENDER_MAX_ITEMS).enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    k.write(out, depth + 1);
-                    out.push_str(": ");
-                    v.write(out, depth + 1);
-                }
-                if entries.size() > RENDER_MAX_ITEMS {
-                    let _ = write!(out, ", … {} more", entries.size() - RENDER_MAX_ITEMS);
-                }
-                out.push('}');
-            }
-            Value::Record(fields) => {
-                // A tuple is the record `{_0: a, _1: b}` and renders as one.
-                let tuple = fields.len() >= 2
-                    && (0..fields.len())
-                        .all(|i| fields.get(&Symbol::new(format!("_{i}"))).is_some());
-                if tuple {
-                    out.push('(');
-                    for i in 0..fields.len() {
-                        if i > 0 {
-                            out.push_str(", ");
-                        }
-                        if let Some(v) = fields.get(&Symbol::new(format!("_{i}"))) {
-                            v.write(out, depth + 1);
-                        }
-                    }
-                    out.push(')');
-                    return;
-                }
-                out.push('{');
-                for (i, (k, v)) in fields.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    let _ = write!(out, "{k}: ");
-                    v.write(out, depth + 1);
-                }
-                out.push('}');
-            }
-            Value::Ctor { name, args } => {
-                let _ = write!(out, "{name}");
-                if !args.is_empty() {
-                    out.push('(');
-                    for (i, a) in args.iter().enumerate() {
-                        if i > 0 {
-                            out.push_str(", ");
-                        }
-                        a.write(out, depth + 1);
-                    }
-                    out.push(')');
-                }
-            }
-            Value::Closure(c) => {
-                let _ = match &c.name {
-                    Some(n) => write!(out, "<fn {n}>"),
-                    None => write!(out, "<fn>"),
-                };
-            }
-            Value::Cell(slot) => {
-                let _ = write!(out, "<cell {slot}>");
-            }
-            Value::Task(handle) => {
-                let _ = write!(out, "<task {}>", handle.id());
-            }
-            // No recursion into the payload, so the redaction holds at any depth.
-            Value::Secret(_) => out.push_str(SECRET_REDACTED),
-        }
-    }
 }
-
-pub const SECRET_REDACTED: &str = "Secret(****)";
 
 // Drop glue recurses per nesting level, so a deep value would overflow the stack when dropped.
 const DISMANTLE_KEEP: usize = 256;
@@ -612,43 +478,10 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
     }
 }
 
-impl fmt::Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.render())
-    }
-}
-
+/// Structural, for a developer; a reader is shown a value by `std.value.render`.
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.render())
-    }
-}
-
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn escape_byte(b: u8) -> String {
-    match b {
-        b'\n' => "\\n".to_string(),
-        b'\t' => "\\t".to_string(),
-        b'\r' => "\\r".to_string(),
-        b'\\' => "\\\\".to_string(),
-        b'"' => "\\\"".to_string(),
-        0x20..=0x7e => (b as char).to_string(),
-        _ => format!("\\x{b:02x}"),
+        fmt::Debug::fmt(&crate::Plain::of(self), f)
     }
 }
 
@@ -680,6 +513,15 @@ impl Fixed {
         match i128::try_from(v) {
             Ok(v) => Fixed::of(ty, v),
             Err(_) => (!ty.signed() && v <= ty.max()).then(|| Fixed::new(ty, v)),
+        }
+    }
+
+    /// `int_to_string`'s spelling, for `u128_to_string` and `i128_to_string`.
+    pub fn to_decimal(self) -> String {
+        if self.ty.signed() {
+            (self.bits() as i128).to_string()
+        } else {
+            self.bits().to_string()
         }
     }
 
@@ -777,16 +619,6 @@ pub enum FixedOp {
     Mul,
     Div,
     Rem,
-}
-
-impl fmt::Display for Fixed {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.ty.signed() {
-            write!(f, "{}", self.bits() as i128)
-        } else {
-            write!(f, "{}", self.bits())
-        }
-    }
 }
 
 /// A variant's position in the total order below.
@@ -942,7 +774,8 @@ pub(crate) fn type_error(span: Span, what: &str, expected: &str, got: &Value) ->
         codes::RUNTIME_ERROR,
         format!("{what} expects {expected}, but got {}", got.type_name()),
     )
-    .primary(span, format!("this is {}", got.render()))
+    .primary(span, format!("this is {}", crate::slot(0)))
+    .showing(vec![crate::Plain::shown(got)])
 }
 
 /// Comparing functions is an error rather than a silently-false answer.
@@ -1060,77 +893,83 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn first_difference(actual: &Value, expected: &Value) -> Option<(String, String, String)> {
+/// Where two unequal values first part, and what each holds there.
+#[derive(Debug)]
+pub struct Difference {
+    pub path: Vec<Step>,
+    pub expected: Value,
+    pub actual: Value,
+}
+
+/// One step into a value.
+#[derive(Debug)]
+pub enum Step {
+    Index(usize),
+    Key(Value),
+    Field(Symbol),
+    Arg(Symbol, usize),
+}
+
+pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> {
     fn go(
         actual: &Value,
         expected: &Value,
-        path: &mut String,
+        path: &mut Vec<Step>,
         depth: usize,
-    ) -> Option<(String, String, String)> {
+    ) -> Option<Difference> {
         if depth >= MAX_VALUE_DEPTH {
             return None;
         }
+        let within = |step: Step, x: &Value, y: &Value, path: &mut Vec<Step>| {
+            path.push(step);
+            let found = go(x, y, path, depth + 1);
+            if found.is_none() {
+                path.pop();
+            }
+            found
+        };
         match (actual, expected) {
             (Value::List(a), Value::List(e)) if a.len() == e.len() => grow(|| {
-                for (i, (x, y)) in a.iter().zip(e.iter()).enumerate() {
-                    let mark = path.len();
-                    let _ = write!(path, "[{i}]");
-                    if let Some(found) = go(x, y, path, depth + 1) {
-                        return Some(found);
-                    }
-                    path.truncate(mark);
-                }
-                None
+                a.iter()
+                    .zip(e.iter())
+                    .enumerate()
+                    .find_map(|(i, (x, y))| within(Step::Index(i), x, y, path))
             }),
             // Only when key sets agree, so a differing shape reports the whole maps.
             (Value::Map(a), Value::Map(e)) if a.size() == e.size() && a.keys().eq(e.keys()) => {
                 grow(|| {
-                    for ((k, x), y) in a.iter().zip(e.values()) {
-                        let mark = path.len();
-                        let _ = write!(path, "[{}]", k.render());
-                        if let Some(found) = go(x, y, path, depth + 1) {
-                            return Some(found);
-                        }
-                        path.truncate(mark);
-                    }
-                    None
+                    a.iter()
+                        .zip(e.values())
+                        .find_map(|((k, x), y)| within(Step::Key(k.clone()), x, y, path))
                 })
             }
             (Value::Record(a), Value::Record(e)) if a.keys().eq(e.keys()) => grow(|| {
-                for ((k, x), y) in a.iter().zip(e.values()) {
-                    let mark = path.len();
-                    let _ = write!(path, ".{k}");
-                    if let Some(found) = go(x, y, path, depth + 1) {
-                        return Some(found);
-                    }
-                    path.truncate(mark);
-                }
-                None
+                a.iter()
+                    .zip(e.values())
+                    .find_map(|((k, x), y)| within(Step::Field(k.clone()), x, y, path))
             }),
             (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 })
                 if n1 == n2 && a1.len() == a2.len() =>
             {
                 grow(|| {
-                    for (i, (x, y)) in a1.iter().zip(a2.iter()).enumerate() {
-                        let mark = path.len();
-                        let _ = write!(path, ".{n1}.{i}");
-                        if let Some(found) = go(x, y, path, depth + 1) {
-                            return Some(found);
-                        }
-                        path.truncate(mark);
-                    }
-                    None
+                    a1.iter()
+                        .zip(a2.iter())
+                        .enumerate()
+                        .find_map(|(i, (x, y))| within(Step::Arg(n1.clone(), i), x, y, path))
                 })
             }
             (a, e) => {
                 if equal_at(a, e, Span::DUMMY, depth).unwrap_or(false) || path.is_empty() {
                     None
                 } else {
-                    Some((path.clone(), e.render(), a.render()))
+                    Some(Difference {
+                        path: std::mem::take(path),
+                        expected: e.clone(),
+                        actual: a.clone(),
+                    })
                 }
             }
         }
     }
-    let mut path = String::new();
-    go(actual, expected, &mut path, 0)
+    go(actual, expected, &mut Vec::new(), 0)
 }

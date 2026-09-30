@@ -6,7 +6,7 @@ use crate::semantics::arity_error;
 use crate::value::{
     Decimal, Fixed, FixedOp, List, Value, first_difference, type_error, values_equal,
 };
-use crate::{Diagnostic, INT_TYPES, IntTy, Span, codes, map};
+use crate::{Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, map, slot};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use std::fmt;
@@ -657,9 +657,9 @@ pub enum Step {
 impl fmt::Debug for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Step::Done(v) => write!(f, "Done({v})"),
+            Step::Done(v) => write!(f, "Done({v:?})"),
             Step::Apply { callee, args, .. } => {
-                write!(f, "Apply({callee} to {} arguments)", args.len())
+                write!(f, "Apply({callee:?} to {} arguments)", args.len())
             }
         }
     }
@@ -896,18 +896,19 @@ fn call_with(
                 Some(n) => Ok(Step::Done(Value::Int(n))),
                 None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    format!("`{}` was given {f}", t.to_int_name()),
+                    format!("`{}` was given {}", t.to_int_name(), slot(0)),
                 )
                 .primary(span, "outside what an `Int` holds")
                 .note(format!(
                     "an `Int` is 64 bits and signed, so it does not hold every `{t}`"
-                ))),
+                ))
+                .showing(vec![Plain::shown(&args[0])])),
             }
         }
 
         Builtin::U128ToString | Builtin::I128ToString => {
             let f = args[0].as_fixed(span, &format!("`{}`", b.name()))?;
-            Ok(Step::Done(Value::str(f.to_string())))
+            Ok(Step::Done(Value::str(f.to_decimal())))
         }
 
         Builtin::U128OfString | Builtin::I128OfString => {
@@ -1210,14 +1211,14 @@ fn call_with(
                 Some(at) => Ok(Step::Done(Value::Int(s[..at].chars().count() as i64))),
                 None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    format!(
-                        "`string_find` did not find {} in {}",
-                        Value::str(needle).render(),
-                        Value::str(s).render()
-                    ),
+                    format!("`string_find` did not find {} in {}", slot(0), slot(1)),
                 )
                 .primary(span, "this substring does not occur")
-                .note("guard with `string_contains`, which answers the same question as a `Bool`")),
+                .note("guard with `string_contains`, which answers the same question as a `Bool`")
+                .showing(vec![
+                    Plain::Str(needle.to_string()),
+                    Plain::Str(s.to_string()),
+                ])),
             }
         }
 
@@ -1399,13 +1400,14 @@ fn call_with(
         }
 
         Builtin::Panic => {
-            let message = match &args[0] {
-                Value::Str(s) => s.to_string(),
-                other => other.render(),
+            let (message, values) = match &args[0] {
+                Value::Str(s) => (s.to_string(), Vec::new()),
+                other => (slot(0), vec![Plain::shown(other)]),
             };
             Err(
                 Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
-                    .primary(span, "`panic` called here"),
+                    .primary(span, "`panic` called here")
+                    .showing(values),
             )
         }
 
@@ -1941,28 +1943,41 @@ fn out_of_range(span: Span, what: &str, index: i64, len: usize, unit: &str) -> D
 }
 
 pub fn assertion_failure(actual: &Value, expected: &Value, span: Span) -> Diagnostic {
+    let (e, a) = (slot(0), slot(1));
+    let mut values = vec![Plain::shown(expected), Plain::shown(actual)];
     let mut diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
-        format!(
-            "assertion failed: expected {}, found {}",
-            expected.render(),
-            actual.render()
-        ),
+        format!("assertion failed: expected {e}, found {a}"),
     )
     .primary(span, "these values are not equal")
-    .note(format!("expected: {}", expected.render()))
-    .note(format!("actual:   {}", actual.render()));
+    .note(format!("expected: {e}"))
+    .note(format!("actual:   {a}"));
 
-    if let Some((path, exp, act)) = first_difference(actual, expected) {
+    if let Some(d) = first_difference(actual, expected) {
+        let mut path = String::new();
+        for step in d.path {
+            match step {
+                PathStep::Index(i) => path.push_str(&format!("[{i}]")),
+                PathStep::Key(k) => {
+                    path.push_str(&format!("[{}]", slot(values.len())));
+                    values.push(Plain::shown(&k));
+                }
+                PathStep::Field(name) => path.push_str(&format!(".{name}")),
+                PathStep::Arg(ctor, i) => path.push_str(&format!(".{ctor}.{i}")),
+            }
+        }
+        let (de, da) = (slot(values.len()), slot(values.len() + 1));
+        values.push(Plain::shown(&d.expected));
+        values.push(Plain::shown(&d.actual));
         diag = diag.note(format!(
-            "first difference at `{path}`: expected {exp}, found {act}"
+            "first difference at `{path}`: expected {de}, found {da}"
         ));
     }
-    diag
+    diag.showing(values)
 }
 
 pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
-    let mut diag = Diagnostic::error(
+    let diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
         "assertion failed: condition is false",
     )
@@ -1973,13 +1988,11 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
         // A non-`Option` message comes only from an unchecked call.
         other => Some(other),
     };
-    if let Some(message) = carried {
-        diag = diag.note(match message {
-            Value::Str(s) => s.to_string(),
-            other => other.render(),
-        });
+    match carried {
+        Some(Value::Str(s)) => diag.note(s.to_string()),
+        Some(other) => diag.note(slot(0)).showing(vec![Plain::shown(other)]),
+        None => diag,
     }
-    diag
 }
 
 #[cold]

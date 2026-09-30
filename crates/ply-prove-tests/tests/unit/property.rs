@@ -178,7 +178,7 @@ pub(crate) fn ints(values: &[Value]) -> Vec<i64> {
         .iter()
         .map(|v| match v {
             Value::Int(n) => *n,
-            other => panic!("expected an Int, got {}", other.render()),
+            other => panic!("expected an Int, got {other:?}"),
         })
         .collect()
 }
@@ -226,7 +226,7 @@ fn every_ply_type_generates() {
     ];
     for (sort, shaped) in cases {
         for value in draw(&sort, &world, 40) {
-            assert!(shaped(&value), "{sort:?} generated {}", value.render());
+            assert!(shaped(&value), "{sort:?} generated {value:?}");
         }
     }
 }
@@ -281,7 +281,7 @@ fn bytes_generation_reaches_every_byte_and_the_empty_value() {
     let mut high = false;
     for value in &drawn {
         let Value::Bytes(b) = value else {
-            panic!("expected Bytes, got {}", value.render());
+            panic!("expected Bytes, got {value:?}");
         };
         seen_len.insert(b.len());
         low |= b.iter().any(|byte| *byte < 0x10);
@@ -363,8 +363,8 @@ fn a_root_replays_exactly() {
     ];
     let once = cases_of(&binders, &world, key(9), 41, 50);
     let again = cases_of(&binders, &world, key(9), 41, 50);
-    assert_eq!(rendered(&once), rendered(&again));
-    assert!(!rendered(&once).is_empty());
+    assert_eq!(shapes(&once), shapes(&again));
+    assert!(!shapes(&once).is_empty());
 }
 
 #[test]
@@ -373,7 +373,7 @@ fn another_root_draws_another_run() {
     let binders = vec![binder("n", Sort::int(), "Int")];
     let a = cases_of(&binders, &world, key(9), 41, 60);
     let b = cases_of(&binders, &world, key(9), 42, 60);
-    assert_ne!(rendered(&a), rendered(&b));
+    assert_ne!(shapes(&a), shapes(&b));
 }
 
 /// Otherwise adding a law would shift every later law's cases.
@@ -383,7 +383,7 @@ fn the_obligation_keys_the_stream() {
     let binders = vec![binder("n", Sort::int(), "Int")];
     let a = cases_of(&binders, &world, key(1), 0, 60);
     let b = cases_of(&binders, &world, key(2), 0, 60);
-    assert_ne!(rendered(&a), rendered(&b));
+    assert_ne!(shapes(&a), shapes(&b));
 }
 
 /// Two streams over one root and one obligation draw alike, and moving either moves the draws.
@@ -398,10 +398,10 @@ fn a_draw_is_a_function_of_root_key_and_counter_only() {
     assert_ne!(drawn(7, 3)[0], drawn(7, 4)[0]);
 }
 
-pub(crate) fn rendered(cases: &[Vec<Value>]) -> Vec<Vec<String>> {
+pub(crate) fn shapes(cases: &[Vec<Value>]) -> Vec<Vec<String>> {
     cases
         .iter()
-        .map(|tuple| tuple.iter().map(|v| v.render()).collect())
+        .map(|tuple| tuple.iter().map(|v| format!("{v:?}")).collect())
         .collect()
 }
 
@@ -418,7 +418,7 @@ fn a_generated_function_is_total_pure_and_deterministic() {
                 .unwrap_or_else(|d| panic!("a generated function must be total: {d:?}"));
             let second = apply(&tier, "apply1", vec![f.clone(), Value::Int(x)])
                 .expect("a generated function must be total");
-            assert_eq!(first.render(), second.render());
+            assert_eq!(first, second);
             assert!(matches!(first, Value::Int(_)));
             applied += 1;
         }
@@ -448,13 +448,22 @@ fn a_generated_function_over_a_compound_argument_applies() {
 }
 
 #[test]
-fn a_generated_function_prints_what_it_does() {
+fn a_generated_function_is_copied_out_as_its_rule() {
     let world = World::default();
     let ty = Sort::func(vec![Sort::int()], Sort::int(), true);
     for f in draw(&ty, &world, 32) {
-        let text = f.render();
-        assert!(text.contains("|"), "{text} is not a description");
-        assert!(!text.contains("<fn>"), "{text} says nothing");
+        let copied = ply_eval::Plain::of(&f);
+        assert!(
+            matches!(
+                copied,
+                ply_eval::Plain::Fn(
+                    ply_eval::Fun::Const { .. }
+                        | ply_eval::Fun::Project { .. }
+                        | ply_eval::Fun::Table { .. }
+                )
+            ),
+            "{copied:?} says nothing of what it does"
+        );
     }
 }
 
@@ -564,7 +573,7 @@ fn the_guard_decides_before_the_body_is_ever_evaluated() {
     for pair in judge.asked.windows(2) {
         if pair[1].0 == "body" {
             assert_eq!(pair[0].0, "guard");
-            assert_eq!(rendered_one(&pair[0].1), rendered_one(&pair[1].1));
+            assert_eq!(shapes_one(&pair[0].1), shapes_one(&pair[1].1));
         }
     }
     let bodies: Vec<_> = judge
@@ -575,8 +584,8 @@ fn the_guard_decides_before_the_body_is_ever_evaluated() {
     assert!(bodies.iter().all(|(_, v)| ints(v)[0] > 0));
 }
 
-fn rendered_one(values: &[Value]) -> Vec<String> {
-    values.iter().map(|v| v.render()).collect()
+fn shapes_one(values: &[Value]) -> Vec<String> {
+    values.iter().map(|v| format!("{v:?}")).collect()
 }
 
 #[test]
@@ -645,7 +654,9 @@ fn a_raising_case_is_a_gap_with_a_shrunk_input() {
             ..
         }) => {
             assert_eq!(diagnostic.message, "divided by zero");
-            let value: i64 = bindings[0].rendered.parse().expect("an Int renders as one");
+            let ply_eval::Plain::Int(value) = bindings[0].value else {
+                panic!("an Int binder holds an Int, not {:?}", bindings[0].value);
+            };
             // The runtime reports the input the body raised at, not a smaller one: the walk that
             // makes a counterexample small is the program's now, and it is driven through the
             // shrink operations. What this side owes is that the input still raises.
@@ -743,12 +754,12 @@ fn two_runs_over_one_refutation_agree_byte_for_byte() {
     assert_eq!(a.shrinks, b.shrinks);
     assert_eq!(a.case, b.case);
     assert_eq!(
-        a.bindings.iter().map(|x| &x.rendered).collect::<Vec<_>>(),
-        b.bindings.iter().map(|x| &x.rendered).collect::<Vec<_>>()
+        a.bindings.iter().map(|x| &x.value).collect::<Vec<_>>(),
+        b.bindings.iter().map(|x| &x.value).collect::<Vec<_>>()
     );
     assert_eq!(
-        a.original.iter().map(|x| &x.rendered).collect::<Vec<_>>(),
-        b.original.iter().map(|x| &x.rendered).collect::<Vec<_>>()
+        a.original.iter().map(|x| &x.value).collect::<Vec<_>>(),
+        b.original.iter().map(|x| &x.value).collect::<Vec<_>>()
     );
 }
 
