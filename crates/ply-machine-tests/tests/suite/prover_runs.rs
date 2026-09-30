@@ -2,13 +2,11 @@
 //! the last one was left doing, and each run's static tier answers for that run's claims.
 
 use crate::fixture::{handed, project, proving, world_value};
-use ply_eval::Value;
 use ply_eval::host::{
     HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, MachineId, Pending,
 };
+use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, Value};
 use ply_machine::payload::{field_of, option, record};
-use ply_span::{Diagnostic, Span, Symbol};
-use ply_ty::{EffectAtom, Mode, Resource};
 use std::path::Path;
 use std::sync::Arc;
 

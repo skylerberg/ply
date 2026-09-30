@@ -1,11 +1,10 @@
 //! Where a run's configuration comes from, and what it refuses at start-up.
 
-use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_eval::{Diagnostic, Span, Symbol, Value, codes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};

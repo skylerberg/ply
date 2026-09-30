@@ -2,7 +2,7 @@
 
 use crate::limit::grow;
 use crate::value::{ClosureKind, Value};
-use ply_span::{Diagnostic, Span, codes};
+use crate::{Diagnostic, Span, codes};
 use std::borrow::Cow;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

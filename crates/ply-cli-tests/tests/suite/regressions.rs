@@ -1,6 +1,6 @@
 use crate::harness::{json_of, ply, warm_agrees, write};
+use ply_eval::codes;
 use ply_machine::load::{Loaded, load};
-use ply_span::codes;
 use std::fs;
 
 /// An imported but unused name is in no `deps` entry, so deleting it leaves every hash the importer names untouched.
@@ -135,7 +135,7 @@ fn three_operations_sharing_one_atom_are_three_reachable_clauses() {
     assert_eq!(
         err.diagnostics
             .iter()
-            .filter(|d| d.severity == ply_span::Severity::Error)
+            .filter(|d| d.severity == ply_eval::Severity::Error)
             .count(),
         1,
         "only `nope` is an error"

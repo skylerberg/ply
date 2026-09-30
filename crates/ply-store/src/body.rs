@@ -2,8 +2,7 @@
 //! (Definition, Type, Footprint)` the store never held.
 
 use indexmap::IndexMap;
-use ply_span::Symbol;
-use ply_ty::DefHash;
+use ply_eval::{DefHash, Symbol};
 
 use crate::{BODY_ENCODING, DefBody, Store};
 
@@ -108,7 +107,7 @@ impl StoredBody {
 /// back, so `key()` re-derives the hash the definition is filed under rather than being told it. A
 /// name declared in two namespaces has two bodies and one entry per hash, which is the case
 /// `verify` settles.
-pub fn of_front(front: &ply_ty::Front) -> BodySet {
+pub fn of_front(front: &ply_eval::Front) -> BodySet {
     let hashes = &front.hashes;
     let mut by_name: std::collections::BTreeMap<&Symbol, Vec<StoredBody>> = Default::default();
     for (name, bytes) in &front.bodies {
@@ -143,7 +142,7 @@ pub fn of_front(front: &ply_ty::Front) -> BodySet {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BodySet {
     defs: IndexMap<DefHash, StoredBody>,
-    /// Parallel to [`ply_ty::HashOutput::tests`].
+    /// Parallel to [`ply_eval::HashOutput::tests`].
     tests: Vec<StoredBody>,
 }
 

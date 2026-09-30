@@ -298,7 +298,7 @@ fn deleting_a_file_is_reported_rather_than_skipped_past() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|d| d["code"] == ply_span::codes::UNKNOWN_MODULE),
+            .any(|d| d["code"] == ply_eval::codes::UNKNOWN_MODULE),
         "{answer}"
     );
 }
@@ -349,7 +349,7 @@ fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
     );
     for name in ["a.peel", "b.peel"] {
         assert!(
-            store.def_of(shared, &ply_span::Symbol::new(name)).is_some(),
+            store.def_of(shared, &ply_eval::Symbol::new(name)).is_some(),
             "`{name}` has a slot of its own under the shared hash"
         );
     }
@@ -677,7 +677,7 @@ fn a_promise_is_known_on_every_run_and_still_refused() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|d| d["code"] == ply_span::codes::REUSE_BROKEN),
+                .any(|d| d["code"] == ply_eval::codes::REUSE_BROKEN),
             "{run}: {answer}"
         );
     }

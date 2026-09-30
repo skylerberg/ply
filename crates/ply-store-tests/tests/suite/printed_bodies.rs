@@ -3,15 +3,14 @@
 
 use ply_codegen::c::producer::{self, PrintedName, print_bodies};
 use ply_eval::decode::At;
-use ply_span::{Diagnostic, Severity, SourceId, Symbol, codes};
+use ply_eval::{CheckOutput, DefHash, Diagnostic, HashOutput, Severity, SourceId, Symbol, codes};
 use ply_store::body::{BodySet, StoredBody};
-use ply_ty::{CheckOutput, DefHash, HashOutput};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `files[i]` is `(module name, text)` for `SourceId(i)`: the front end's answer, and every
 /// definition's scheme as the compiler prints it.
 #[track_caller]
-fn port_front(files: &[(&str, &str)]) -> (ply_ty::Front, BTreeMap<Symbol, String>) {
+fn port_front(files: &[(&str, &str)]) -> (ply_eval::Front, BTreeMap<Symbol, String>) {
     // A printed program carries the toolchain's modules inline; re-fronting pulls them.
     let named: Vec<(String, String)> = files
         .iter()
@@ -110,7 +109,7 @@ fn print(
     bodies: &BodySet,
     names: &[(Symbol, DefHash)],
     shipped: &[&str],
-    checked_tests: &[ply_ty::TestInfo],
+    checked_tests: &[ply_eval::TestInfo],
 ) -> Result<Vec<(String, String)>, Diagnostic> {
     let bytes: Vec<&[u8]> = bodies.defs().map(|(_, body)| body.as_bytes()).collect();
     // A toolchain test prints into `ply_tests` with a call to a shelf private; it stays on

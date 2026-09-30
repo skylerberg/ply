@@ -1,9 +1,9 @@
-use ply_span::{Diagnostic, Severity, Span, codes};
+use ply_eval::{Diagnostic, Severity, Span, codes};
 use ply_store::diag::*;
 
 #[test]
 fn round_trip_preserves_every_field() {
-    let source = ply_span::SourceId(7);
+    let source = ply_eval::SourceId(7);
     let original = Diagnostic::error(codes::ASSERTION_FAILED, "expected 0, found -5")
         .primary(Span::new(source, 12, 20), "here")
         .secondary(Span::new(source, 4, 8), "from this call")

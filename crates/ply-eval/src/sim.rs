@@ -1,8 +1,6 @@
 //! Deterministic simulation: seeds, plans, the dependence relation, and seeded `clock`/`random`.
 
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Resource};
+use crate::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, codes};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -234,7 +232,7 @@ impl SimMode {
 /// The default interleavings explored per root under [`SimMode::Dpor`].
 pub const DEFAULT_BUDGET: u32 = 256;
 
-/// Default scheduling steps per interleaving before the region is [`ply_span::codes::DEADLOCK`].
+/// Default scheduling steps per interleaving before the region is [`crate::codes::DEADLOCK`].
 pub const DEFAULT_STEPS: u32 = 100_000;
 
 pub const DEFAULT_RANDOM_ROOTS: u32 = 64;

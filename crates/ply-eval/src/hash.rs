@@ -1,8 +1,8 @@
 //! What content addressing publishes: the definition hash and the table a hashed program answers.
 //! The hashing itself is the front end's, in `crates/ply-compiler/ply/hash.ply`.
 
+use crate::Symbol;
 use indexmap::IndexMap;
-use ply_span::Symbol;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
 use std::fmt;

@@ -1,7 +1,6 @@
 use ply_codegen::heap::*;
 use ply_codegen::{list, map};
-use ply_eval::{Fields, Value};
-use ply_span::Symbol;
+use ply_eval::{Fields, Symbol, Value};
 use std::sync::Arc;
 
 fn layouts() -> Layouts {

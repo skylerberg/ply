@@ -4,8 +4,7 @@
 //! needs a value a server cannot predict — a SASL nonce, a key — reads this instead, and the host
 //! is what draws it.
 
-use ply_eval::{Machine, Value};
-use ply_span::Span;
+use ply_eval::{Machine, Span, Value};
 use std::sync::Arc;
 
 const PROGRAM: &str = r#"
@@ -23,7 +22,7 @@ pub fn named() -> String / {entropy.next} = nonce()
 pub fn no_range() -> Int / {entropy.below} = below(0)
 "#;
 
-fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
+fn tiered(service: &str) -> (ply_eval::Front, &'static ply_codegen::Unit) {
     let answered =
         ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), service.to_string())])
             .unwrap_or_else(|e| panic!("they check: {e:#}"));
@@ -33,7 +32,7 @@ fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
     (front, unit)
 }
 
-fn call(entry: &str) -> Result<Value, ply_span::Diagnostic> {
+fn call(entry: &str) -> Result<Value, ply_eval::Diagnostic> {
     let host = ply_host::Host::new();
     let (front, unit) = tiered(PROGRAM);
     let binding = host

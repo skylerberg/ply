@@ -5,8 +5,8 @@
 //! big-stack thread, the artifact open, the `cwd` and `shelf` roots, the process and environment
 //! bindings, and the exit code.
 
+use ply_eval::{Diagnostic, codes};
 use ply_machine::artifact::{self, Binds};
-use ply_span::{Diagnostic, codes};
 use std::path::{Path, PathBuf};
 
 /// The front end and emitter recurse once per node on the native stack.
@@ -56,7 +56,7 @@ pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
             ),
         )
         .primary(
-            ply_span::Span::DUMMY,
+            ply_eval::Span::DUMMY,
             "this is Ply's fault, not the program's",
         )
     })?;
@@ -160,7 +160,7 @@ pub fn run(
             codes::INTERNAL_ERROR,
             format!("the program could not be started on a thread of its own: {e}"),
         )
-        .primary(ply_span::Span::DUMMY, "this is Ply's fault")),
+        .primary(ply_eval::Span::DUMMY, "this is Ply's fault")),
     }
 }
 
