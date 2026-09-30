@@ -1,0 +1,724 @@
+// The serving kit: a server started as a child of this run — `ply run --host` over a program, or a
+// floor the runner built and bound — found by the port it says it listens on, proved to accept a
+// connection, loaded by the corpus's Ply client and stopped, with the certificates a TLS run needs
+// and the programs under `fixtures/` that time themselves. Nothing here knows which program it
+// serves; the command that measures one names its settings.
+//
+// Every path is relative to the working directory, which is the `work` root and the directory every
+// child starts in: the repository's files under `Kit.repo`, and what a run makes under
+// `Kit.scratch`.
+
+import report
+import report (Row, Criterion, Measurement, Pass, Fail, Holds, holding, number, row)
+import spine
+import spine (under)
+import stats
+import std.certgen
+import std.certgen (certgen)
+import std.config (config)
+import std.fs (fs)
+import std.http
+import std.json
+import std.json (Json, Object, Number, Str, Null)
+import std.net (net)
+import std.process
+import std.process (process, Finished, Ended, Exited, Signalled)
+import std.router (int_of_text)
+import std.time (time)
+
+pub type Kit = { repo: String, scratch: String }
+
+pub fn at_repo(k: Kit, relative: String) -> String = under(k.repo, relative)
+
+pub fn fixture(k: Kit, name: String) -> String = at_repo(k, "crates/ply-corpus/fixtures/" ++ name)
+
+fn client_dir(k: Kit) -> String = under(k.scratch, "client")
+
+fn tls_dir(k: Kit) -> String = under(k.scratch, "tls")
+
+pub fn prepare(k: Kit) -> Result<Unit, String> / {fs.create_dir[work]} =
+  if fs.create_dir[work](client_dir(k)) && fs.create_dir[work](tls_dir(k)) { Ok(()) }
+  else { Err("the scratch directory `" ++ k.scratch ++ "` could not be made") }
+
+fn cats<a>(xss: List<List<a>>) -> List<a> =
+  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
+
+pub fn set(key: String, value: String) -> List<String> = ["--set", key ++ "=" ++ value]
+
+// A first `ply run` of a program compiles it before the program can say where it listens.
+fn startup_ms() -> Int = 180000
+
+fn ready_ms() -> Int = 30000
+
+// Past `ply run`'s default drain window, so a stop that runs out is the server's doing.
+fn drain_ms() -> Int = 45000
+
+// --- A server ----------------------------------------------------------------------------
+
+// A child that said where it listens and accepted a connection there.
+pub type Server = { name: String, child: Int, port: Int, log: String }
+
+// How a server ended once it was told to stop: as it ended, or killed when it had not drained.
+pub type Stop = | Stopped(Ended) | Killed
+
+// A check of a child: an answer, the child still running and in the way, or the child gone and
+// reaped, so its handle is spent.
+type Check<a> = | Up(a) | Stuck(String) | Gone(String)
+
+// The port in the line a server says it listens with: `listening on 8137`.
+pub fn port_in(line: String) -> Option<Int> =
+  if string_starts_with(line, "listening on ") {
+    int_of_text(string_trim(string_slice(line, 13, string_len(line))))
+  } else { None }
+
+pub fn ended_text(e: Ended) -> String =
+  match e {
+    Exited(code) -> "exited " ++ int_to_string(code),
+    Signalled(signal) -> "was killed by signal " ++ int_to_string(signal),
+  }
+
+// Lines up to the one that says where the server listens; the lines `ply run` writes about the run
+// come first, and none of them says that.
+fn listening<[l]>(
+  child: Int,
+  deadline: Int,
+) -> Check<Int> / {process.output_line[l], process.wait[l], time.elapsed_ms} =
+  match process.output_line[l](child, 250) {
+    process::Said(line) -> match port_in(line) {
+      Some(port) -> Up(port),
+      None -> listening[l](child, deadline),
+    },
+    process::Quiet -> if time.elapsed_ms() >= deadline {
+      Stuck("it said no `listening on` line in time")
+    } else { listening[l](child, deadline) },
+    process::Closed -> match process.wait[l](child, ready_ms()) {
+      Some(f) -> Gone(ended_text(f.ended) ++ " before it said where it listens"),
+      None -> Stuck("it closed its output without saying where it listens"),
+    },
+  }
+
+fn answering<[l]>(
+  child: Int,
+  port: Int,
+  deadline: Int,
+) -> Check<Unit> / {process.wait[l], net.connect[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
+  match net.connect[probe]("127.0.0.1", port, 1000) {
+    Some(c) -> {
+      net.close[probe](c);
+      Up(())
+    },
+    None -> match process.wait[l](child, 0) {
+      Some(f) ->
+        Gone(ended_text(f.ended) ++ " after it said it listens on " ++ int_to_string(port)),
+      None -> if time.elapsed_ms() >= deadline {
+        Stuck("nothing accepted a connection on port " ++ int_to_string(port))
+      } else {
+        time.sleep_ms(20);
+        answering[l](child, port, deadline)
+      },
+    },
+  }
+
+fn killed<[l]>(child: Int) -> Unit / {process.signal[l], process.wait[l]} = {
+  let _ = process.signal[l](child, process::Kill);
+  let _ = process.wait[l](child, -1);
+  ()
+}
+
+// The end of a log, which is where a server says why it stopped.
+fn tail_of(log: String) -> String / {fs.read_file[work]} =
+  match fs.read_file[work](log) {
+    None -> "",
+    Some(bytes) -> {
+      let n = bytes_len(bytes);
+      string_of_bytes_lossy(bytes_slice(bytes, if n > 2000 { n - 2000 } else { 0 }, n))
+    },
+  }
+
+fn failed(name: String, why: String, log: String) -> String / {fs.read_file[work]} =
+  "`" ++ name ++ "` " ++ why ++ "; its log, " ++ log ++ ", ends:\n" ++ tail_of(log)
+
+// A server started from `args` under the label `l`, its stderr written to `name.log` in the scratch
+// directory. It is answered only once it listens and accepts, and a child that never gets there
+// is stopped before the refusal is.
+pub fn start<[l]>(
+  k: Kit,
+  name: String,
+  args: List<String>,
+) -> Result<Server, String> / {process.start[l], process.output_line[l], process.wait[l], process.signal[l], net.connect[probe], net.close[probe], config.get[env], fs.read_file[work], time.elapsed_ms, time.sleep_ms} = {
+  let log = under(k.scratch, name ++ ".log");
+  let io = { input: false, out: process::Lines, err: process::File(log) };
+  match process.start[l](args, "", spine::inherited_env(), io) {
+    Err(why) -> Err("`" ++ name ++ "` did not start: " ++ why),
+    Ok(child) -> match listening[l](child, time.elapsed_ms() + startup_ms()) {
+      Gone(why) -> Err(failed(name, why, log)),
+      Stuck(why) -> {
+        killed[l](child);
+        Err(failed(name, why, log))
+      },
+      Up(port) -> match answering[l](child, port, time.elapsed_ms() + ready_ms()) {
+        Gone(why) -> Err(failed(name, why, log)),
+        Stuck(why) -> {
+          killed[l](child);
+          Err(failed(name, why, log))
+        },
+        Up(_) -> Ok({ name: name, child: child, port: port, log: log }),
+      },
+    },
+  }
+}
+
+// Told to stop with `SIGTERM`, given the drain to end in, and killed if it does not.
+pub fn stop<[l]>(s: Server) -> Stop / {process.signal[l], process.wait[l]} = {
+  let _ = process.signal[l](s.child, process::Terminate);
+  match process.wait[l](s.child, drain_ms()) {
+    Some(f) -> Stopped(f.ended),
+    None -> {
+      killed[l](s.child);
+      Killed
+    },
+  }
+}
+
+pub fn stop_text(s: Stop) -> String =
+  match s {
+    Stopped(e) -> "stopped on SIGTERM and " ++ ended_text(e),
+    Killed -> "was still running when the drain ran out, and was killed",
+  }
+
+// How a server stopped, as numbers: whether it had to be killed, and the code it exited with or
+// the signal that ended it.
+pub fn stop_measurements(s: Stop) -> List<Measurement> =
+  match s {
+    Stopped(Exited(code)) -> [number("killed", 0, ""), number("exit_code", code, "")],
+    Stopped(Signalled(signal)) -> [number("killed", 0, ""), number("signal", signal, "")],
+    Killed -> [number("killed", 1, "")],
+  }
+
+// A server written in the language drains on `SIGTERM` and exits 0 within the drain.
+pub fn drained() -> Criterion =
+  Holds("drains on SIGTERM and exits 0 within the drain", |ms: List<Measurement>|
+    if report::value_of(ms, "exit_code") == Some(0m) { Pass } else { Fail(ms) })
+
+// A floor has no drain: it may end however `SIGTERM` ends it, as long as it was not killed.
+pub fn ended() -> Criterion =
+  Holds("ends on SIGTERM without being killed", |ms: List<Measurement>|
+    if report::value_of(ms, "killed") == Some(0m) { Pass } else { Fail(ms) })
+
+pub fn stop_row(name: String, s: Stop, c: Criterion) -> Row =
+  { ..row(name ++ " stops", c, stop_measurements(s)), detail: Str(stop_text(s)) }
+
+pub type Served<a> = { value: a, stop: Stop }
+
+// `body` over a server, which is stopped whatever `body` answers.
+pub fn serving<a, [l] | e>(
+  k: Kit,
+  name: String,
+  args: List<String>,
+  body: (Server) -> Result<a, String> / e,
+) -> Result<Served<a>, String> / {process.start[l], process.output_line[l], process.wait[l], process.signal[l], net.connect[probe], net.close[probe], config.get[env], fs.read_file[work], time.elapsed_ms, time.sleep_ms | e} =
+  match start[l](k, name, args) {
+    Err(why) -> Err(why),
+    Ok(s) -> {
+      let got = body(s);
+      let stopped = stop[l](s);
+      match got {
+        Ok(value) -> Ok({ value: value, stop: stopped }),
+        Err(why) -> Err(failed(name, "was being measured when " ++ why, s.log)),
+      }
+    },
+  }
+
+// One exchange with a server on a connection of the kit's own, for a check before the load.
+pub fn fetch(
+  port: Int,
+  path: String,
+) -> Result<http::Response, String> / {net.connect[probe], net.send[probe], net.recv[probe], net.close[probe]} =
+  match http::request[probe](
+      "localhost",
+      port,
+      http::request_to(http::Get, "localhost", path, b""),
+      http::default_limits(),
+    ) {
+    Ok(r) -> Ok(r),
+    Err(_) -> Err("`GET " ++ path ++ "` on port " ++ int_to_string(port) ++ " got no answer"),
+  }
+
+// --- The load client -------------------------------------------------------------------
+
+// One run of the client: `connections` connections, at most `concurrency` open at once, each
+// carrying `per_conn` requests over `routes`. Naming a certificate to trust is what makes it TLS.
+pub type Load = {
+  port: Int,
+  routes: List<String>,
+  connections: Int,
+  concurrency: Int,
+  per_conn: Int,
+  trust: Option<String>,
+}
+
+// What one run found, as the client wrote it down: every latency, connect and handshake in
+// microseconds, and every status it was answered with.
+pub type Sample = {
+  requests: Int,
+  answered: Int,
+  connections: Int,
+  wall_us: Int,
+  latencies: List<Int>,
+  connects: List<Int>,
+  handshakes: List<Int>,
+  statuses: List<{ status: Int, count: Int }>,
+  failures: List<String>,
+}
+
+fn joined(parts: List<String>) -> String =
+  fold(parts, "", |acc: String, p: String| if acc == "" { p } else { acc ++ "," ++ p })
+
+pub fn load_args(k: Kit, l: Load) -> List<String> =
+  cats([
+    [
+      "run",
+      fixture(k, "load.ply"),
+      "--host",
+      "--color",
+      "never",
+      "--fs",
+      "report=" ++ client_dir(k),
+    ],
+    // The name a certificate is issued for, which is what TLS verifies; plaintext reaches it too.
+    set("LOAD_HOST", "localhost"),
+    set("LOAD_PORT", int_to_string(l.port)),
+    set("LOAD_ROUTES", joined(l.routes)),
+    set("LOAD_CONNECTIONS", int_to_string(l.connections)),
+    set("LOAD_CONCURRENCY", int_to_string(l.concurrency)),
+    set("LOAD_PER_CONN", int_to_string(l.per_conn)),
+    set("LOAD_TLS", match l.trust { Some(_) -> "true", None -> "false" }),
+    set("LOAD_REPORT", "load.json"),
+    match l.trust { Some(certificate) -> ["--trust", certificate], None -> [] },
+  ])
+
+fn ints(m: Map<String, Json>, key: String) -> List<Int> =
+  map(spine::array_field(m, key), |j: Json|
+    match j { Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }, _ -> 0 })
+
+fn texts(m: Map<String, Json>, key: String) -> List<String> =
+  map(spine::array_field(m, key), |j: Json| match j { Str(s) -> s, _ -> "" })
+
+pub fn sample_of(j: Json) -> Result<Sample, String> =
+  match j {
+    Object(m) ->
+      Ok({
+        requests: spine::int_field(m, "requests"),
+        answered: spine::int_field(m, "answered"),
+        connections: spine::int_field(m, "connections"),
+        wall_us: spine::int_field(m, "wall_micros"),
+        latencies: ints(m, "latencies"),
+        connects: ints(m, "connects"),
+        handshakes: ints(m, "handshakes"),
+        statuses: map(spine::array_field(m, "statuses"), |s: Json|
+          match s {
+            Object(one) ->
+              { status: spine::int_field(one, "status"), count: spine::int_field(one, "count") },
+            _ -> { status: 0, count: 0 },
+          }),
+        failures: texts(m, "failures"),
+      }),
+    _ -> Err("the load client's report is not an object"),
+  }
+
+// One run of the load client, and the sample it wrote.
+pub fn load(
+  k: Kit,
+  l: Load,
+) -> Result<Sample, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work]} = {
+  let report = under(client_dir(k), "load.json");
+  // A stale report would read as this run's.
+  let _ = fs.remove[work](report);
+  let done = process.spawn[ply](load_args(k, l), "", spine::inherited_env());
+  if !spine::exit_zero(done) { Err("the load client failed: " ++ string_of_bytes_lossy(done.err)) } else {
+    match fs.read_file[work](report) {
+      None -> Err("the load client wrote no report to " ++ report),
+      Some(bytes) -> match json::parse(bytes) {
+        Err(e) -> Err("the load client's report is not JSON: " ++ e.message),
+        Ok(j) -> sample_of(j),
+      },
+    }
+  }
+}
+
+// The fastest of `repeats` runs of one point, by the wall clock around them.
+pub fn measured(
+  k: Kit,
+  l: Load,
+  repeats: Int,
+) -> Result<Sample, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work]} =
+  match all_of(map(range(0, if repeats < 1 { 1 } else { repeats }), |_r: Int| load(k, l))) {
+    Err(why) -> Err(why),
+    Ok(samples) -> match stats::best_by(samples, |s: Sample| s.wall_us) {
+      Some(s) -> Ok(s),
+      None -> Err("no run of the load client was taken"),
+    },
+  }
+
+pub fn all_of<a>(results: List<Result<a, String>>) -> Result<List<a>, String> =
+  fold(results, Ok([]), |acc: Result<List<a>, String>, r: Result<a, String>|
+    match acc {
+      Err(why) -> Err(why),
+      Ok(xs) -> match r { Err(why) -> Err(why), Ok(x) -> Ok(push(xs, x)) },
+    })
+
+pub fn asked(l: Load) -> Int = l.connections * l.per_conn
+
+fn right(status: Int) -> String = "answered_" ++ int_to_string(status)
+
+fn answered_with(s: Sample, status: Int) -> Int =
+  fold(s.statuses, 0, |n: Int, one: { status: Int, count: Int }|
+    if one.status == status { n + one.count } else { n })
+
+// Every request answered with `status` and no exchange failed: a partial answer is a different
+// measurement, not a slower server.
+pub fn complete(status: Int) -> Criterion =
+  holding(
+    "every request answered " ++ int_to_string(status) ++ ", none failed",
+    ["asked", "answered", right(status), "failed"],
+    |vs: List<Decimal>|
+      match vs {
+        [wanted, answered, rightly, failed] ->
+          answered == wanted && rightly == wanted && failed == 0m,
+        _ -> false,
+      },
+  )
+
+// An empty sample has no percentile, and its row leaves it out rather than reading a zero.
+fn percentile_of(name: String, xs: List<Int>, p: Int) -> List<Measurement> =
+  match stats::percentile(xs, p) { Some(v) -> [number(name, v, "µs")], None -> [] }
+
+// The numbers a served row is read off: what was asked and how it was answered, the rate, the
+// latencies, and over TLS the handshakes the client timed apart from the requests.
+pub fn measurements_of(l: Load, s: Sample, status: Int) -> List<Measurement> =
+  cats([
+    [
+      number("asked", asked(l), "requests"),
+      number("answered", s.answered, "requests"),
+      number(right(status), answered_with(s, status), "requests"),
+      number("failed", len(s.failures), "exchanges"),
+      number("connections", s.connections, "connections"),
+      number("per_second", stats::per_second(s.answered, s.wall_us), "requests/s"),
+    ],
+    percentile_of("p50", s.latencies, 50),
+    percentile_of("p95", s.latencies, 95),
+    percentile_of("p99", s.latencies, 99),
+    percentile_of("max", s.latencies, 100),
+    percentile_of("connect_p50", s.connects, 50),
+    match l.trust {
+      None -> [],
+      Some(_) ->
+        cats([
+          [number("handshakes", len(s.handshakes), "handshakes")],
+          percentile_of("handshake_p50", s.handshakes, 50),
+          percentile_of("handshake_p99", s.handshakes, 99),
+        ]),
+    },
+  ])
+
+// What the first exchange that failed was told, when one did.
+pub fn detail_of(s: Sample) -> Json =
+  match list_at(s.failures, 0) { Some(why) -> Str(why), None -> Null }
+
+// A served point's row: every request of the load answered 200.
+pub fn answered_row(name: String, l: Load, s: Sample) -> Row =
+  { ..row(name, complete(200), measurements_of(l, s, 200)), detail: detail_of(s) }
+
+// --- Certificates, bindings and the programs that time themselves -----------------------------
+
+pub type Credential = { name: String, certificate: String, key: String }
+
+// A certificate for `localhost`, issued for this run, as the two PEM files `--tls NAME=CERT,KEY`
+// wants; a client trusts the first with `--trust`.
+pub fn credential(
+  k: Kit,
+  name: String,
+) -> Result<Credential, String> / {certgen.issue, fs.write_file[work]} = {
+  let issued = certgen::localhost();
+  let c = {
+    name: name,
+    certificate: under(tls_dir(k), name ++ ".pem"),
+    key: under(tls_dir(k), name ++ ".key"),
+  };
+  if fs.write_file[work](c.certificate, bytes_of_string(issued.certificate))
+      && fs.write_file[work](c.key, bytes_of_string(issued.key)) { Ok(c) }
+  else { Err("the credential could not be written under " ++ tls_dir(k)) }
+}
+
+pub fn tls_args(c: Credential) -> List<String> =
+  ["--tls", c.name ++ "=" ++ c.certificate ++ "," ++ c.key]
+
+// Whether the runner bound `label` to a program, by its own word in `CORPUS_BOUND`: performing an
+// unbound label raises `E0456` and ends the run, and a program cannot ask which labels are bound.
+pub fn bound(label: String) -> Bool / {config.get[env]} =
+  match config.get[env]("CORPUS_BOUND") {
+    None -> false,
+    Some(labels) ->
+      fold(string_split(labels, ","), false, |seen: Bool, l: String|
+        seen || string_trim(l) == label),
+  }
+
+// The one JSON object a program printed on a line of its own; the lines `ply run` writes about the
+// run are indented, and the program's are not.
+pub fn printed(f: Finished, what: String) -> Result<Json, String> =
+  if !spine::exit_zero(f) { Err(what ++ " failed: " ++ string_of_bytes_lossy(f.err)) } else {
+    match filter(string_split(string_of_bytes_lossy(f.out), "\n"), |line: String|
+        string_starts_with(line, "{")) {
+      [line] -> match json::parse_string(line) {
+        Ok(j) -> Ok(j),
+        Err(e) -> Err(what ++ " printed a report that is not JSON: " ++ e.message),
+      },
+      _ -> Err(what ++ " did not print one report"),
+    }
+  }
+
+// A program under `fixtures/` that times itself, run once.
+pub fn timed(
+  k: Kit,
+  name: String,
+  iterations: Int,
+  repeats: Int,
+) -> Result<Json, String> / {process.spawn[ply], config.get[env]} =
+  printed(
+    process.spawn[ply](
+      cats([
+        ["run", fixture(k, name), "--host", "--color", "never"],
+        set("BENCH_ITERATIONS", int_to_string(iterations)),
+        set("BENCH_REPEATS", int_to_string(repeats)),
+      ]),
+      "",
+      spine::inherited_env(),
+    ),
+    name,
+  )
+
+// --- Tests ---------------------------------------------------------------------------------
+
+fn kit() -> Kit = { repo: "../repo", scratch: "scratch/serve" }
+
+// `start`, `stop` and `serving` with the children answered by the twin, one planned child, a
+// network whose connect always succeeds, and a clock that never moves.
+fn supervised<a>(
+  planned: process::Script,
+  body: () -> a / {process.start[srv], process.output_line[srv], process.wait[srv], process.signal[srv], net.connect[probe], net.close[probe], config.get[env], fs.read_file[work], time.elapsed_ms, time.sleep_ms},
+) -> { answer: a, child: process::Child } =
+  with_cell[kids](process::children([planned])) { kids -> {
+    let answer = handle {
+      body()
+    } with {
+      process.start[srv](args, dir, env, io) -> {
+        let step = process::start_step(cell_get(kids), { args: args, dir: dir, env: env }, io);
+        cell_set(kids, step.children);
+        step.answer
+      },
+      process.output_line[srv](child, timeout_ms) -> {
+        let step = process::output_line_step(cell_get(kids), child);
+        cell_set(kids, step.children);
+        step.answer
+      },
+      process.signal[srv](child, signal) -> {
+        let step = process::signal_step(cell_get(kids), child, signal);
+        cell_set(kids, step.children);
+        step.answer
+      },
+      process.wait[srv](child, timeout_ms) -> {
+        let step = process::wait_step(cell_get(kids), child);
+        cell_set(kids, step.children);
+        step.answer
+      },
+      net.connect[probe](host, port, timeout_ms) -> Some(3),
+      net.close[probe](c) -> (),
+      config.get[env](key) -> None,
+      fs.read_file[work](path) -> Some(b"the desk will not start: DESK_API_KEY is unset\n"),
+      time.elapsed_ms() -> 0,
+      time.sleep_ms(ms) -> (),
+    };
+    match cell_get(kids).started {
+      [one] -> { answer: answer, child: one },
+      _ -> panic("one child was started"),
+    }
+  } }
+
+fn said(lines: List<String>) -> List<process::Heard> =
+  map(lines, |line: String| process::Said(line))
+
+test "a server is found by the line it says it listens with, past the run's own lines" {
+  let ran = supervised(
+    process::script(
+      0,
+      process::exited(0, b"", b""),
+      said(["   binding host · 9 operations", "listening on 40123"]),
+    ),
+    || start[srv](kit(), "desk", ["run", "desk.ply", "--host"]),
+  );
+  match ran.answer {
+    Err(why) -> panic(why),
+    Ok(s) -> {
+      assert_eq(s.port, 40123);
+      assert_eq(s.log, "scratch/serve/desk.log")
+    },
+  };
+  assert_eq(ran.child.launch.args, ["run", "desk.ply", "--host"]);
+  assert_eq(ran.child.io.err, process::File("scratch/serve/desk.log"));
+  assert_eq(ran.child.signals, [])
+}
+
+test "a server that drains is stopped by the signal, and one that does not is killed" {
+  let drained = supervised(
+    process::script(0, process::exited(0, b"", b""), said(["listening on 40123"])),
+    || match start[srv](kit(), "desk", []) { Ok(s) -> stop[srv](s), Err(why) -> panic(why) },
+  );
+  assert_eq(drained.answer, Stopped(Exited(0)));
+  assert_eq(drained.child.signals, [process::Terminate]);
+  let stuck = supervised(
+    process::script(1, process::signalled(9, b"", b""), said(["listening on 40123"])),
+    || match start[srv](kit(), "desk", []) { Ok(s) -> stop[srv](s), Err(why) -> panic(why) },
+  );
+  assert_eq(stuck.answer, Killed);
+  assert_eq(stuck.child.signals, [process::Terminate, process::Kill])
+}
+
+test "a server that ends before it listens is refused with how it ended and its log" {
+  let ran = supervised(
+    process::script(0, process::exited(2, b"", b""), said(["   binding host · 9 operations"])),
+    || start[srv](kit(), "desk", []),
+  );
+  match ran.answer {
+    Ok(_) -> panic("a server that never listened was answered"),
+    Err(why) -> {
+      assert(string_contains(why, "exited 2 before it said where it listens"));
+      assert(string_contains(why, "DESK_API_KEY is unset"))
+    },
+  };
+  // It was gone already, so nothing was sent to it.
+  assert_eq(ran.child.signals, [])
+}
+
+test "a measurement that fails stops its server before the failure is answered" {
+  let ran = supervised(
+    process::script(0, process::exited(0, b"", b""), said(["listening on 40123"])),
+    ||
+      serving[srv](kit(), "desk", [], |s: Server|
+        if s.port == 40123 { Err("the client failed") } else { Ok(s.port) }),
+  );
+  match ran.answer {
+    Ok(_) -> panic("the body's failure is the answer"),
+    Err(why) -> assert(string_contains(why, "the client failed")),
+  };
+  assert_eq(ran.child.signals, [process::Terminate])
+}
+
+test "the load client's line carries every setting, and only a trusted certificate makes it TLS" {
+  let l = {
+    port: 40123,
+    routes: ["/health", "/items"],
+    connections: 12,
+    concurrency: 4,
+    per_conn: 8,
+    trust: None,
+  };
+  let plain = load_args(kit(), l);
+  assert_eq(list_at(plain, 1), Some("../repo/crates/ply-corpus/fixtures/load.ply"));
+  assert(
+    fold(
+      [
+        "LOAD_PORT=40123",
+        "LOAD_ROUTES=/health,/items",
+        "LOAD_CONNECTIONS=12",
+        "LOAD_CONCURRENCY=4",
+        "LOAD_PER_CONN=8",
+        "LOAD_TLS=false",
+        "report=scratch/serve/client",
+      ],
+      true,
+      |ok: Bool, want: String|
+        ok && fold(plain, false, |seen: Bool, arg: String| seen || arg == want),
+    ),
+  );
+  let tls = load_args(kit(), { ..l, trust: Some("scratch/serve/tls/desk.pem") });
+  assert(fold(tls, false, |seen: Bool, arg: String| seen || arg == "LOAD_TLS=true"));
+  assert_eq(list_at(tls, len(tls) - 1), Some("scratch/serve/tls/desk.pem"))
+}
+
+fn verdict_of(r: Row) -> report::Verdict =
+  match report::judge([r]) { [j] -> j.verdict, _ -> panic("one row is judged as one") }
+
+test "a report is a sample, and a partial or wrong answer fails with its counts" {
+  let text = "{\"requests\":3,\"answered\":3,\"connections\":1,\"per_conn\":3,\"wall_micros\":300,\"latencies\":[30,10,20],\"connects\":[5],\"handshakes\":[],\"statuses\":[{\"count\":3,\"status\":200}],\"failures\":[]}";
+  let l = { port: 1, routes: ["/items"], connections: 1, concurrency: 1, per_conn: 3, trust: None };
+  match json::parse_string(text) {
+    Err(_) -> panic("the report is JSON"),
+    Ok(j) -> match sample_of(j) {
+      Err(why) -> panic(why),
+      Ok(s) -> {
+        assert_eq(verdict_of(answered_row("p", l, s)), Pass);
+        assert_eq(
+          verdict_of(answered_row("p", { ..l, per_conn: 4 }, s)),
+          Fail([
+            number("asked", 4, "requests"),
+            number("answered", 3, "requests"),
+            number("answered_200", 3, "requests"),
+            number("failed", 0, "exchanges"),
+          ]),
+        );
+        assert(verdict_of(row("p", complete(404), measurements_of(l, s, 404))) != Pass);
+        let broken = { ..s, failures: ["/items: the server closed the connection"] };
+        assert(verdict_of(answered_row("p", l, broken)) != Pass);
+        assert_eq(
+          answered_row("p", l, broken).detail,
+          Str("/items: the server closed the connection"),
+        );
+        let taken = measurements_of(l, s, 200);
+        assert_eq(report::value_of(taken, "per_second"), Some(10000m));
+        assert_eq(report::value_of(taken, "p50"), Some(20m));
+        assert_eq(report::value_of(taken, "handshakes"), None);
+        assert_eq(
+          report::value_of(measurements_of({ ..l, trust: Some("desk.pem") }, s, 200), "handshakes"),
+          Some(0m),
+        )
+      },
+    },
+  }
+}
+
+test "a server of the language's own must drain, and a floor only must not be killed" {
+  let judged = |s: Stop, c: Criterion| verdict_of(stop_row("it", s, c));
+  assert_eq(judged(Stopped(Exited(0)), drained()), Pass);
+  assert(judged(Stopped(Signalled(15)), drained()) != Pass);
+  assert_eq(judged(Killed, drained()), Fail([number("killed", 1, "")]));
+  assert_eq(judged(Stopped(Signalled(15)), ended()), Pass);
+  assert(judged(Killed, ended()) != Pass);
+  assert_eq(stop_row("the floor,", Killed, ended()).name, "the floor, stops")
+}
+
+test "a program's report is the one line it printed past the run's own" {
+  let out = b"   binding host - 3 operations\n{\"iterations\":10}\n   ()\n";
+  assert_eq(
+    match printed(process::exited(0, out, b""), "layers.ply") {
+      Ok(j) -> json::to_string(j),
+      Err(why) -> why,
+    },
+    "{\"iterations\":10}",
+  );
+  assert(printed(process::exited(1, out, b"it raised"), "layers.ply") != Ok(json::Null));
+  assert_eq(port_in("listening on 8137"), Some(8137));
+  assert_eq(port_in("   listening on 8137"), None)
+}
+
+test "a label is bound when the runner says so, and not otherwise" {
+  let asked = |given: Option<String>, label: String|
+    handle {
+      bound(label)
+    } with {
+      config.get[env](key) -> if key == "CORPUS_BOUND" { given } else { None },
+    };
+  assert(asked(Some("http_floor"), "http_floor"));
+  assert(asked(Some("pg_floor, http_floor"), "http_floor"));
+  assert(!asked(Some("pg_floor"), "http_floor"));
+  assert(!asked(None, "http_floor"))
+}
