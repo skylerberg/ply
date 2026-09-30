@@ -110,12 +110,7 @@ fn passed_with(before: &Compiled, key: &str, filed: &[DefHash]) -> (TempRoot, St
     for (hash, body) in before.bodies.defs() {
         store.put_body(hash, ply_store::DefBody::of(body.clone()));
     }
-    crate::fixture::file_interfaces(
-        &mut store,
-        &root.0.join("m.ply"),
-        &before.check,
-        &before.hashes,
-    );
+    crate::fixture::file_interfaces(&mut store, &root.0.join("m.ply"), &before.sources());
     let baseline = before.baseline(key);
     store.put(baseline.test_hash, Outcome::Pass);
     for mixture in filed {
@@ -154,12 +149,7 @@ fn asked_with<R>(
 ) -> R {
     let (root, mut store) = passed_with(before, key, filed);
     // The CLI files the program it loaded before the tests run.
-    crate::fixture::file_interfaces(
-        &mut store,
-        &root.0.join("m.ply"),
-        &after.check,
-        &after.hashes,
-    );
+    crate::fixture::file_interfaces(&mut store, &root.0.join("m.ply"), &after.sources());
     let baseline = before.baseline(key);
     let rehashed = Rehashed::under(
         &after.sources(),

@@ -1,10 +1,7 @@
 use ply_codegen::c::{dump, producer};
 use ply_eval::{Fields, Value};
 use ply_span::{Edit, Fix, Severity, SourceId, Span, Symbol, codes};
-use ply_ty::{
-    EffectAtom, Footprint, Hashed, LabelVar, Literal, Mode, Ordinal, Resource, Row, RowVar, Scheme,
-    TyVar, Type, Visibility, print_footprint, print_scheme,
-};
+use ply_ty::{EffectAtom, Footprint, Hashed, Literal, Mode, Ordinal, Resource, Visibility};
 use std::sync::Arc;
 
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -73,8 +70,9 @@ fn a_real_answer_reads_to_the_program_it_describes() {
     let named = |name: &str| Symbol::new(name);
 
     let say = &front.check.defs[&named("m.say")];
-    assert_eq!(print_scheme(&say.scheme), "(Bytes) -> Unit / {m.log.write}");
-    assert_eq!(print_footprint(&say.footprint), "m.log.write");
+    let log_write =
+        Footprint::from_atoms([EffectAtom::new("m.log", Resource::Singleton, Mode::Write)]);
+    assert_eq!(say.footprint, log_write);
     // An operation atom takes the mode its declaration gives it.
     assert_eq!(
         say.performed,
@@ -92,38 +90,27 @@ fn a_real_answer_reads_to_the_program_it_describes() {
     );
 
     let pick = &front.check.defs[&named("m.pick")];
-    assert_eq!(print_scheme(&pick.scheme), "<a, b>(a, b) -> a");
-    assert_eq!(pick.scheme.ty_vars, vec![TyVar(0), TyVar(1)]);
     assert!(pick.footprint.is_empty());
 
     let test = &front.check.tests[0];
     assert_eq!(test.key, named("m.says"));
-    assert_eq!(print_footprint(&test.footprint), "m.log.write");
+    assert_eq!(test.footprint, log_write);
     assert_eq!(front.test_name_spans[0].source, SourceId(0));
 
     let law = &front.check.laws[0];
     assert_eq!(law.key, named("m.picks the first"));
     assert!(law.has_guard);
-    assert_eq!(law.binders.len(), 1);
-    assert_eq!(law.binders[0].name, named("n"));
-    assert_eq!(law.binders[0].ty, Type::int());
     assert_eq!(front.law_literals, vec![vec![Literal::Int(2)]]);
 
     let log = &front.check.effects[&named("m.log")];
     let emit = &log.ops[&named("emit")];
     assert_eq!(emit.mode, Mode::Write);
-    assert_eq!(emit.params, vec![Type::bytes()]);
-    assert_eq!(emit.ret, Type::unit());
+    assert!(!emit.resource_param);
     assert_eq!(front.effects_written[&named("m.log")], Visibility::Public);
 
-    let line = &front.check.ctors[&named("m.Line")];
-    assert_eq!((line.index, line.arity), (1, 1));
-    assert_eq!(line.fields, vec![Type::int()]);
-    assert_eq!(print_scheme(&line.scheme), "(Int) -> m.Shape");
-    assert_eq!(
-        front.check.ctors[&named("m.Dot")].scheme.ty,
-        Type::con("m.Shape")
-    );
+    for ctor in [(named("m.Dot"), 0), (named("m.Line"), 1)] {
+        assert!(front.emitter_ctors.contains(&ctor), "{ctor:?}");
+    }
     assert_eq!(front.types[&named("m.Shape")].arity, 0);
 
     for def in ["m.say", "m.pick", "m.positive"] {
@@ -230,10 +217,13 @@ fn a_malformed_answer_names_the_path_to_what_is_wrong() {
     let ids = [SourceId(0)];
     dump::read(&good, &ids).unwrap_or_else(|e| panic!("{e}"));
 
-    let def = with(&first(field(&good, "defs")), "scheme", Value::Int(7));
+    let def = with(&first(field(&good, "defs")), "row_aliases", Value::Int(7));
     let err = dump::read(&with(&good, "defs", Value::list(vec![def])), &ids).unwrap_err();
-    assert_eq!(err.path, "the front end's answer.defs[0].scheme", "{err}");
-    assert!(err.message.contains("a `ty` field"), "{err}");
+    assert_eq!(
+        err.path, "the front end's answer.defs[0].row_aliases",
+        "{err}"
+    );
+    assert!(err.message.contains("expected a list"), "{err}");
 
     let short = with(&good, "hashes_digest", Value::bytes([0u8; 31]));
     let err = dump::read(&short, &ids).unwrap_err();
@@ -385,7 +375,7 @@ fn an_error_is_the_whole_answer_with_its_labels_notes_and_fixes() {
     );
 }
 
-// --- A type's numbering ---------------------------------------------------------------
+// --- A footprint's numbering ----------------------------------------------------------
 
 fn some(v: Value) -> Value {
     Value::ctor("Some", vec![v])
@@ -393,20 +383,6 @@ fn some(v: Value) -> Value {
 
 fn none() -> Value {
     Value::ctor("None", vec![])
-}
-
-fn var(v: i64) -> Value {
-    Value::ctor("TyVar", vec![Value::Int(v)])
-}
-
-fn con(name: &str, args: Vec<Value>) -> Value {
-    Value::ctor(
-        "TyCon",
-        vec![record(vec![
-            ("name", Value::bytes(name)),
-            ("args", Value::list(args)),
-        ])],
-    )
 }
 
 fn atom(effect: &str, resource: Value, mode: &str, op: Option<&str>) -> Value {
@@ -418,10 +394,6 @@ fn atom(effect: &str, resource: Value, mode: &str, op: Option<&str>) -> Value {
     ])
 }
 
-fn ints(xs: &[i64]) -> Value {
-    Value::list(xs.iter().map(|x| Value::Int(*x)).collect())
-}
-
 fn nowhere() -> Value {
     record(vec![
         ("module", Value::Int(4294967295)),
@@ -431,7 +403,7 @@ fn nowhere() -> Value {
 }
 
 /// A whole answer holding one definition and nothing else.
-fn holding(scheme: Value, footprint: Value) -> Value {
+fn holding(footprint: Value) -> Value {
     let empty = || Value::list(vec![]);
     let def = record(vec![
         ("name", Value::bytes("m.f")),
@@ -439,10 +411,8 @@ fn holding(scheme: Value, footprint: Value) -> Value {
         ("simple_name", Value::bytes("f")),
         ("public", Value::Bool(true)),
         ("reuse", Value::Bool(false)),
-        ("scheme", scheme),
         ("footprint", footprint.clone()),
         ("performed", footprint),
-        ("constraints", empty()),
         ("internally_effectful", Value::Bool(false)),
         ("row_aliases", empty()),
         ("params", empty()),
@@ -461,7 +431,6 @@ fn holding(scheme: Value, footprint: Value) -> Value {
         "tests",
         "laws",
         "effects",
-        "ctors",
         "hashes",
         "keys",
         "emit_roots",
@@ -479,105 +448,38 @@ fn holding(scheme: Value, footprint: Value) -> Value {
     record(tables)
 }
 
-/// However the checker numbered a scheme's variables, it reads back as its printed text would
-/// have: the head first, in order, then each as the body names it; a cell's unnamed region as a
-/// variable of its own; and a label the head does not bind as a resource under the printer's name
-/// for it, which steps past the resource `l` the text already names and the `m` the head holds.
+/// However the checker numbered a footprint's label variables, they read back numbered where they
+/// first appear, and each prints as the first letter no resource beside it holds.
 #[test]
-fn a_scheme_reads_back_numbered_as_its_text_would() {
-    let atoms = Value::list(vec![
+fn a_footprint_reads_back_numbered_as_its_labels_first_appear() {
+    let var = |v: i64| Value::ctor("RVar", vec![Value::Int(v)]);
+    let footprint = Value::list(vec![
+        atom("m.net", var(30), "MWrite", Some("recv")),
+        atom("m.net", var(12), "MWrite", Some("send")),
+        atom("m.net", var(30), "MRead", None),
         atom(
             "m.net",
             Value::ctor("RNamed", vec![Value::bytes("l")]),
             "MRead",
             None,
         ),
-        atom(
-            "m.net",
-            Value::ctor("RVar", vec![Value::Int(5)]),
-            "MWrite",
-            Some("send"),
-        ),
-        atom(
-            "m.net",
-            Value::ctor("RVar", vec![Value::Int(8)]),
-            "MWrite",
-            Some("recv"),
-        ),
     ]);
-    let ty = Value::ctor(
-        "TyFn",
-        vec![record(vec![
-            (
-                "params",
-                Value::list(vec![var(17), con("Cell", vec![var(3), var(42)])]),
-            ),
-            ("ret", var(99)),
-            (
-                "effects",
-                record(vec![("atoms", atoms), ("tail", some(Value::Int(9)))]),
-            ),
-        ])],
-    );
-    let scheme = record(vec![
-        ("ty_vars", ints(&[42, 17])),
-        ("row_vars", ints(&[9])),
-        ("label_vars", ints(&[5])),
-        ("ty", ty),
-    ]);
-    let footprint = Value::list(vec![
-        atom(
-            "m.net",
-            Value::ctor("RVar", vec![Value::Int(30)]),
-            "MWrite",
-            Some("recv"),
-        ),
-        atom(
-            "m.net",
-            Value::ctor("RVar", vec![Value::Int(12)]),
-            "MWrite",
-            Some("send"),
-        ),
-    ]);
-    let front = dump::read(&holding(scheme, footprint), &[]).unwrap_or_else(|e| panic!("{e}"));
+    let front = dump::read(&holding(footprint), &[]).unwrap_or_else(|e| panic!("{e}"));
     let f = &front.check.defs[&Symbol::new("m.f")];
 
     let net =
         |resource: Resource, op: &str| EffectAtom::operation("m.net", resource, Mode::Write, op);
-    let named = |name: &str| Resource::Named(Symbol::new(name));
-    assert_eq!(
-        f.scheme,
-        Scheme {
-            ty_vars: vec![TyVar(0), TyVar(1)],
-            row_vars: vec![RowVar(0)],
-            label_vars: vec![LabelVar(0)],
-            ty: Type::Fn {
-                params: vec![
-                    Type::Var(TyVar(1)),
-                    Type::Con(
-                        Symbol::new("Cell"),
-                        vec![Type::Var(TyVar(2)), Type::Var(TyVar(0))]
-                    ),
-                ],
-                ret: Box::new(Type::Var(TyVar(3))),
-                effects: Row {
-                    atoms: [
-                        EffectAtom::new("m.net", named("l"), Mode::Read),
-                        net(Resource::Var(LabelVar(0)), "send"),
-                        net(named("n"), "recv"),
-                    ]
-                    .into(),
-                    tail: Some(RowVar(0)),
-                },
-            },
-        }
-    );
-    // A footprint binds each label it names, in the order they first appear.
     assert_eq!(
         f.footprint,
         Footprint::from_atoms([
-            net(Resource::Var(LabelVar(0)), "recv"),
-            net(Resource::Var(LabelVar(1)), "send"),
+            net(Resource::Var(0), "recv"),
+            net(Resource::Var(1), "send"),
+            EffectAtom::new("m.net", Resource::Var(0), Mode::Read),
+            EffectAtom::new("m.net", Resource::Named(Symbol::new("l")), Mode::Read),
         ])
+    );
+    assert_eq!(
+        f.footprint.to_string(),
+        "{m.net.read[l], m.net.read[m], m.net.recv[m], m.net.send[n]}"
     );
 }
