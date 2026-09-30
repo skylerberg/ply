@@ -203,27 +203,18 @@ fn a_served_example_with_the_tier_holding_its_accept_loop() {
     let mut reserved = Reservation::take();
     let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
-    let source = std::fs::read_to_string(repo().join("examples/hello.ply")).unwrap();
-    assert!(
-        source.contains("fn port() -> Int = 8080\n")
-            && source.contains("fn connections() -> Int = 64\n"),
-        "examples/hello.ply no longer declares its port and connection count as this test rewrites them"
-    );
-    let source = source
-        .replace(
-            "fn port() -> Int = 8080\n",
-            &format!("fn port() -> Int = {port}\n"),
-        )
-        .replace(
-            "fn connections() -> Int = 64\n",
-            "fn connections() -> Int = 1\n",
-        );
-    std::fs::write(dir.path().join("hello.ply"), source).unwrap();
+    std::fs::copy(
+        repo().join("examples/hello.ply"),
+        dir.path().join("hello.ply"),
+    )
+    .unwrap();
 
     let mut child = process(dir.path())
         .env("PLY_C_CACHE", dir.path().join("cache"))
         .env("PLY_C_REFUSALS", "1")
-        .args(["--color", "never", "run", "--host"])
+        .args(["--color", "never", "run", "--host", "--set"])
+        .arg(format!("HELLO_PORT={port}"))
+        .args(["--set", "HELLO_CONNECTIONS=1"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -232,7 +223,7 @@ fn a_served_example_with_the_tier_holding_its_accept_loop() {
         connect_when_ready(&mut reserved, &mut child, Duration::from_secs(120), |_| {
             true
         })
-        .unwrap_or_else(|why| panic!("{why}"));
+        .unwrap_or_else(|why| panic!("{why}\nthe run was given `--set HELLO_PORT={port}`"));
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();

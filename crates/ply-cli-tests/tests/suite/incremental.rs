@@ -1,94 +1,12 @@
-use ply_machine::driver;
-use ply_machine::load::Loaded;
-use ply_store::Store;
+//! The front-end cache on the path every command takes: a load reads what the last one filed before
+//! it analyses, and files what it answered after. A warm check answers what a cold one does; that a
+//! seeded analysis is sound through every kind of edit is the compiler's own property, and
+//! `crates/ply-compiler/ply/front.ply` tests it over sessions of edits.
 
-use crate::harness::{ply, write};
-/// The binary, at the directory under test.
-use std::collections::BTreeMap;
+use crate::harness::{ply, seeding, warm_agrees, write};
+use ply_store::{ContentHash, Store};
 use std::fs;
 use std::path::{Path, PathBuf};
-
-/// `{:?}`, not a printed signature: `print_scheme` renames variables per item and would hide a numbering divergence.
-fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for (name, hash) in &loaded.hashes.defs {
-        out.insert(format!("hash {name}"), hash.to_hex());
-    }
-    for (name, hash) in &loaded.hashes.decls {
-        out.insert(format!("decl {name}"), hash.to_hex());
-    }
-    for (name, def) in &loaded.check.defs {
-        out.insert(format!("scheme {name}"), format!("{:?}", def.scheme));
-        out.insert(format!("footprint {name}"), def.footprint.to_string());
-    }
-    for (name, ctor) in &loaded.check.ctors {
-        out.insert(
-            format!("ctor {name}"),
-            format!("{} {:?} {:?}", ctor.index, ctor.fields, ctor.scheme),
-        );
-    }
-    for (name, effect) in &loaded.check.effects {
-        let ops: Vec<String> = effect
-            .ops
-            .values()
-            .map(|op| format!("{} {:?} {:?} {:?}", op.name, op.mode, op.params, op.ret))
-            .collect();
-        out.insert(
-            format!("effect {name}"),
-            format!("{} {ops:?}", effect.nondet),
-        );
-    }
-    for (i, test) in loaded.check.tests.iter().enumerate() {
-        let hash = loaded
-            .hashes
-            .tests
-            .get(i)
-            .map(|h| h.to_hex())
-            .unwrap_or_default();
-        out.insert(
-            format!("test {i}"),
-            format!("{} {} {} {hash}", test.key, test.nondet, test.footprint),
-        );
-    }
-    out
-}
-
-/// The incremental run goes first so it sees the store as an edit-test loop would.
-#[track_caller]
-fn agree(dir: &Path, what: &str) -> Loaded {
-    let mut store = Store::open(dir).expect("the cache directory must be creatable");
-    let incremental = driver::load_incremental(dir, &mut store)
-        .unwrap_or_else(|e| panic!("{what}: the incremental path failed: {:?}", codes(&e)));
-    let full = driver::load_full(dir)
-        .unwrap_or_else(|e| panic!("{what}: the full path failed: {:?}", codes(&e)));
-
-    let a = snapshot(&full);
-    let b = snapshot(&incremental);
-    let mut differences = Vec::new();
-    for key in a.keys().chain(b.keys()) {
-        if a.get(key) != b.get(key) {
-            differences.push(format!(
-                "  {key}\n    full        {:?}\n    incremental {:?}",
-                a.get(key),
-                b.get(key)
-            ));
-        }
-    }
-    differences.dedup();
-    assert!(
-        differences.is_empty(),
-        "{what}: the incremental path disagreed with a from-scratch check:\n{}",
-        differences.join("\n")
-    );
-    incremental
-}
-
-fn codes(e: &ply_machine::load::LoadError) -> Vec<String> {
-    e.diagnostics
-        .iter()
-        .map(|d| format!("{}: {}", d.code, d.message))
-        .collect()
-}
 
 fn edit(dir: &Path, name: &str, from: &str, to: &str) {
     let path = dir.join(name);
@@ -159,6 +77,69 @@ fn corpus() -> tempfile::TempDir {
     dir
 }
 
+/// Nothing in the corpus imports a shipped module, so every definition is the project's own.
+#[test]
+fn a_second_check_is_seeded_whole_and_an_edit_checks_only_what_it_moved() {
+    let dir = corpus();
+    let (seeded, checked) = seeding(dir.path());
+    assert_eq!(seeded, 0, "a cold cache seeds nothing");
+    let all = checked;
+    assert!(all > 0);
+
+    assert_eq!(
+        seeding(dir.path()),
+        (all, 0),
+        "a warm check takes every definition from its filed rows"
+    );
+
+    // Nothing references `two`, so its own hash is the only one the edit moves.
+    edit(dir.path(), "leaf.ply", "one() + one()", "one() + one() + 0");
+    assert_eq!(
+        seeding(dir.path()),
+        (all - 1, 1),
+        "the edited definition is checked and every other one is seeded"
+    );
+    warm_agrees(dir.path(), "after the edit");
+}
+
+#[test]
+fn a_whole_editing_session_agrees_at_every_step() {
+    let dir = corpus();
+    warm_agrees(dir.path(), "step 0");
+    warm_agrees(dir.path(), "step 0, warm");
+
+    edit(dir.path(), "leaf.ply", "one() + one()", "one() + 1");
+    warm_agrees(dir.path(), "step 1: body");
+
+    edit(dir.path(), "core.ply", "pub fn label(", "pub fn title(");
+    warm_agrees(dir.path(), "step 2: rename");
+
+    edit(dir.path(), "core.ply", "Money", "Cost");
+    warm_agrees(dir.path(), "step 3: rename a type");
+
+    write(
+        dir.path(),
+        "extra.ply",
+        "import leaf\npub fn four() -> Int = leaf::two() + 2\n",
+    );
+    warm_agrees(dir.path(), "step 4: add a file");
+
+    edit(
+        dir.path(),
+        "extra.ply",
+        "leaf::two() + 2",
+        "leaf::two() + 3",
+    );
+    warm_agrees(dir.path(), "step 5: edit the new file");
+
+    fs::remove_file(dir.path().join("extra.ply")).unwrap();
+    warm_agrees(dir.path(), "step 6: delete it again");
+
+    edit(dir.path(), "core.ply", "effect db", "effect ledger");
+    edit(dir.path(), "shop.ply", "core::db.", "core::ledger.");
+    warm_agrees(dir.path(), "step 7: rename an effect");
+}
+
 fn examples() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
@@ -173,112 +154,132 @@ fn examples() -> tempfile::TempDir {
 }
 
 #[test]
-fn a_cold_run_and_a_warm_run_agree() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    agree(dir.path(), "warm");
-}
-
-#[test]
 fn the_example_corpus_agrees_cold_and_warm() {
     let dir = examples();
-    agree(dir.path(), "cold");
-    agree(dir.path(), "warm");
+    warm_agrees(dir.path(), "cold");
+    warm_agrees(dir.path(), "warm");
 }
 
-#[test]
-fn editing_a_body_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(dir.path(), "leaf.ply", "one() + one()", "one() + one() + 0");
-    agree(dir.path(), "body edit");
+/// Renames every whole-identifier `from` in `name`, so which occurrences move is the program's
+/// business and not its layout's.
+fn rename(dir: &Path, name: &str, from: &str, to: &str) {
+    let path = dir.join(name);
+    let text = fs::read_to_string(&path).unwrap();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut renamed = String::with_capacity(text.len());
+    let mut kept = 0;
+    for (at, _) in text.match_indices(from) {
+        let before = text[..at].chars().next_back();
+        let after = text[at + from.len()..].chars().next();
+        if before.is_some_and(word) || after.is_some_and(word) {
+            continue;
+        }
+        renamed.push_str(&text[kept..at]);
+        renamed.push_str(to);
+        kept = at + from.len();
+    }
+    renamed.push_str(&text[kept..]);
+    fs::write(path, renamed).unwrap();
 }
 
-#[test]
-fn changing_a_signature_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(
-        dir.path(),
-        "leaf.ply",
-        "pub fn one() -> Int = 1",
-        "pub fn one() -> Money = 1",
+/// Whether a step's edit landed, asked of the checker rather than of the files: `module` declares
+/// every name in `now` and none in `gone`, and the program still checks.
+#[track_caller]
+fn landed(answer: &serde_json::Value, step: &str, module: &str, now: &[&str], gone: &[&str]) {
+    let declared: Vec<&str> = answer["modules"]
+        .as_array()
+        .expect("a module table")
+        .iter()
+        .find(|m| m["name"] == module)
+        .and_then(|m| m["items"].as_array())
+        .unwrap_or_else(|| panic!("{step}: the answer has no module `{module}`"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        answer["ok"] == true
+            && now.iter().all(|n| declared.contains(n))
+            && !gone.iter().any(|g| declared.contains(g)),
+        "{step}: `{module}` should declare {now:?} and not {gone:?} in a program that checks; it \
+         declares {declared:?}, with diagnostics {}",
+        answer["diagnostics"]
     );
-    edit(
-        dir.path(),
-        "leaf.ply",
-        "pub fn two()",
-        "pub type Money = Int\npub fn two()",
+}
+
+/// One cache for every mutation: an invalidation is only ever wrong in some sequence of edits.
+///
+/// Real code exercises handlers, regions, `nondet` effects and cross-module types the synthetic
+/// corpora do not, and the session ends by undoing every edit so a wrong answer shows up as a
+/// final state that is not the one it began in. No edit depends on how the examples are laid out.
+#[test]
+fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
+    let dir = examples();
+    let start = warm_agrees(dir.path(), "step 0");
+    let original = |name: &str| fs::read_to_string(dir.path().join(name)).unwrap();
+    let (clock, report, ledger) = (
+        original("clock.ply"),
+        original("report.ply"),
+        original("ledger.ply"),
     );
-    agree(dir.path(), "signature change");
-}
 
-#[test]
-fn renaming_a_definition_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(dir.path(), "core.ply", "pub fn label(", "pub fn title(");
-    agree(dir.path(), "rename a function");
-}
-
-/// A `type` rename changes no hash, so only the resolution witness can tell the front end.
-#[test]
-fn renaming_a_type_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(dir.path(), "core.ply", "Money", "Cost");
-    edit(dir.path(), "shop.ply", "core::Item", "core::Item");
-    agree(dir.path(), "rename a type");
-}
-
-#[test]
-fn renaming_an_effect_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(dir.path(), "core.ply", "effect db", "effect audit");
-    edit(dir.path(), "shop.ply", "core::db.", "core::audit.");
-    agree(dir.path(), "rename an effect");
-}
-
-#[test]
-fn moving_a_definition_between_modules_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(
-        dir.path(),
-        "core.ply",
-        "pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n",
-        "",
-    );
-    edit(
-        dir.path(),
-        "leaf.ply",
-        "pub fn one() -> Int = 1",
-        "pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\npub fn one() -> Int = 1",
-    );
-    edit(
-        dir.path(),
-        "shop.ply",
-        "import core",
-        "import core\nimport leaf",
-    );
-    edit(dir.path(), "shop.ply", "core::twice", "leaf::twice");
-    agree(dir.path(), "move between modules");
-}
-
-#[test]
-fn adding_a_file_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
     write(
         dir.path(),
-        "extra.ply",
-        "import leaf\nfn three() -> Int = leaf::two() + leaf::one()\n",
+        "clock.ply",
+        &format!("{clock}\npub fn ticks() -> Int = 0\n"),
     );
-    agree(dir.path(), "file added");
+    let step = "step 1: a definition appeared";
+    landed(
+        &warm_agrees(dir.path(), step),
+        step,
+        "clock",
+        &["clock.ticks"],
+        &[],
+    );
+
+    write(dir.path(), "report.ply", &format!("// a note\n{report}"));
+    warm_agrees(dir.path(), "step 2: a comment");
+
+    rename(dir.path(), "ledger.ply", "presented", "presented_value");
+    rename(dir.path(), "report.ply", "presented", "presented_value");
+    let step = "step 3: a rename across modules";
+    landed(
+        &warm_agrees(dir.path(), step),
+        step,
+        "ledger",
+        &["ledger.presented_value"],
+        &["ledger.presented"],
+    );
+
+    rename(dir.path(), "report.ply", "Line", "Row");
+    let step = "step 4: a type rename";
+    landed(
+        &warm_agrees(dir.path(), step),
+        step,
+        "report",
+        &["report.Row"],
+        &["report.Line"],
+    );
+
+    write(dir.path(), "spare.ply", "pub fn spare() -> Int = 9\n");
+    warm_agrees(dir.path(), "step 5: a module appeared");
+
+    fs::rename(dir.path().join("spare.ply"), dir.path().join("kept.ply")).unwrap();
+    warm_agrees(dir.path(), "step 6: it was renamed");
+
+    fs::remove_file(dir.path().join("kept.ply")).unwrap();
+    warm_agrees(dir.path(), "step 7: and deleted");
+
+    write(dir.path(), "clock.ply", &clock);
+    write(dir.path(), "report.ply", &report);
+    write(dir.path(), "ledger.ply", &ledger);
+    let end = warm_agrees(dir.path(), "step 8: back to where it started");
+    assert_eq!(
+        start, end,
+        "an undone session must land on the state it began in"
+    );
 }
 
-/// The referencing file did not change, so nothing about its bytes says its dependency is gone.
+/// A deleted import is an error however much of the program the cache still holds rows for.
 #[test]
 fn deleting_a_file_is_reported_rather_than_skipped_past() {
     let dir = corpus();
@@ -287,220 +288,292 @@ fn deleting_a_file_is_reported_rather_than_skipped_past() {
         "extra.ply",
         "import leaf\npub fn three() -> Int = leaf::two()\n",
     );
-    agree(dir.path(), "cold");
+    warm_agrees(dir.path(), "cold");
 
     fs::remove_file(dir.path().join("leaf.ply")).unwrap();
-    let mut store = Store::open(dir.path()).unwrap();
-    let err = driver::load_incremental(dir.path(), &mut store)
-        .expect_err("a dangling import must be an error, not a skipped file");
+    let answer = warm_agrees(dir.path(), "a dangling import");
+    assert_eq!(answer["exit_code"], 2, "{answer}");
     assert!(
-        err.diagnostics
+        answer["diagnostics"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|d| d.code == ply_span::codes::UNKNOWN_MODULE),
-        "expected UNKNOWN_MODULE, got {:?}",
-        codes(&err)
+            .any(|d| d["code"] == ply_eval::codes::UNKNOWN_MODULE),
+        "{answer}"
     );
 }
 
+/// Structurally identical definitions in two modules share a hash while their schemes name
+/// different types: each is filed under its own name, and each is seeded with its own row.
 #[test]
-fn deleting_an_unreferenced_file_agrees() {
-    let dir = corpus();
-    write(dir.path(), "spare.ply", "pub fn spare() -> Int = 9\n");
-    agree(dir.path(), "cold");
-    fs::remove_file(dir.path().join("spare.ply")).unwrap();
-    agree(dir.path(), "file deleted");
-}
+fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
+    let dir = tempfile::tempdir().unwrap();
+    let body =
+        "pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
+    write(dir.path(), "a.ply", body);
+    write(dir.path(), "b.ply", body);
 
-#[test]
-fn adding_and_removing_an_import_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(
-        dir.path(),
-        "shop.ply",
-        "import core",
-        "import core\nimport leaf",
-    );
-    agree(dir.path(), "import added");
-    edit(
-        dir.path(),
-        "shop.ply",
-        "import core\nimport leaf",
-        "import core",
-    );
-    agree(dir.path(), "import removed");
-}
-
-#[test]
-fn reformatting_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(
-        dir.path(),
-        "leaf.ply",
-        "pub fn one()",
-        "// a comment\npub fn  one()",
-    );
-    agree(dir.path(), "reformatted");
-}
-
-#[test]
-fn a_dependencys_change_reaches_its_dependents() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(
-        dir.path(),
-        "core.ply",
-        "pub fn price(i: Item) -> Money =",
-        "pub fn price(i: Item) -> Int =",
-    );
-    agree(dir.path(), "dependency changed");
-}
-
-#[test]
-fn a_warm_load_answers_as_the_cold_one_did_and_an_edit_is_seen() {
-    let dir = corpus();
-    let load = || {
-        let mut store = Store::open(dir.path()).unwrap();
-        driver::load_incremental(dir.path(), &mut store)
-            .unwrap_or_else(|e| panic!("the load failed: {:?}", codes(&e)))
+    warm_agrees(dir.path(), "cold");
+    let warm = warm_agrees(dir.path(), "warm");
+    let type_of = |name: &str| {
+        warm["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == name)
+            .map(|d| d["type"].clone())
+            .unwrap_or_else(|| panic!("`{name}` is in the answer"))
     };
-
-    let cold = load();
-    let warm = load();
-    assert_eq!(snapshot(&warm), snapshot(&cold));
-
-    let three = ply_span::Symbol::new("leaf.three");
-    edit(
-        dir.path(),
-        "leaf.ply",
-        "pub fn two()",
-        "pub fn three() -> Int = 3\npub fn two()",
+    assert_ne!(
+        type_of("a.peel"),
+        type_of("b.peel"),
+        "each definition's scheme must name its own module's type"
     );
-    let edited = load();
-    assert!(!warm.check.defs.contains_key(&three));
+
+    let store = Store::open(dir.path()).unwrap();
+    let hash_of = |file: &str, name: &str| {
+        store
+            .fingerprint(&dir.path().join(file))
+            .expect("the file is on record")
+            .defs
+            .iter()
+            .find(|e| e.name.as_str() == name)
+            .expect("the definition is on record")
+            .hash
+    };
+    let shared = hash_of("a.ply", "a.peel");
+    assert_eq!(
+        shared,
+        hash_of("b.ply", "b.peel"),
+        "the fixture is only interesting while the two hash alike"
+    );
+    for name in ["a.peel", "b.peel"] {
+        assert!(
+            store.def_of(shared, &ply_eval::Symbol::new(name)).is_some(),
+            "`{name}` has a slot of its own under the shared hash"
+        );
+    }
+}
+
+#[test]
+fn a_corrupt_front_end_cache_degrades_to_a_cold_check_and_is_repaired() {
+    let dir = corpus();
+    warm_agrees(dir.path(), "cold");
+    fs::write(
+        dir.path().join(".ply-cache/frontend.idx"),
+        "not an index at all",
+    )
+    .unwrap();
+
+    let out = ply(dir.path()).args(["check", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let answer: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(
-        edited.check.defs.contains_key(&three),
-        "the load after an edit does not see it"
+        answer["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"].as_str().unwrap_or("").starts_with("W06")),
+        "a discarded cache is reported: {answer}"
     );
-    assert_eq!(snapshot(&load()), snapshot(&edited));
+    assert_eq!(
+        answer["front_end"]["definitions"]["seeded"], 0,
+        "nothing is taken from a cache that did not read"
+    );
+    warm_agrees(dir.path(), "after the cache was rewritten");
+    let (_, checked) = seeding(dir.path());
+    assert_eq!(
+        checked, 0,
+        "the run that met the damage filed a whole cache"
+    );
 }
 
-fn answer(loaded: &Loaded) -> String {
-    format!("{:?}", loaded.front)
-}
-
-/// Seeding must not change an answer: a load handed what the last one published says exactly what
-/// a load handed nothing says, through every kind of edit.
+/// Mangled in the payload rather than replaced: a valid header over undecodable entries is what a
+/// half-written append leaves.
 #[test]
-fn a_seeded_load_answers_as_a_full_load_through_every_kind_of_edit() {
+fn a_cache_mangled_mid_session_degrades_and_recovers() {
     let dir = corpus();
-    let step = |what: &str| {
-        let mut store = Store::open(dir.path()).unwrap();
-        let incremental = driver::load_incremental(dir.path(), &mut store)
-            .unwrap_or_else(|e| panic!("{what}: the incremental load failed: {:?}", codes(&e)));
-        let full = driver::load_full(dir.path())
-            .unwrap_or_else(|e| panic!("{what}: the full load failed: {:?}", codes(&e)));
-        assert_eq!(answer(&incremental), answer(&full), "{what}");
-    };
-
-    step("cold");
-    step("unchanged");
-
-    edit(dir.path(), "leaf.ply", "one() + one()", "one() + one() + 0");
-    step("a body edit in a leaf");
+    warm_agrees(dir.path(), "cold");
     edit(
         dir.path(),
         "leaf.ply",
-        "pub fn two() -> Int = one() + one() + 0",
-        "pub fn two(k: Int) -> Int = one() + k",
+        "pub fn one() -> Int = 1",
+        "pub fn one() -> Int = 2",
     );
-    step("a signature edit in a leaf");
-    edit(dir.path(), "leaf.ply", "pub fn one()", "fn one()");
-    step("`pub` removed in a leaf");
+    warm_agrees(dir.path(), "edited");
 
+    let data = dir.path().join(".ply-cache/frontend.dat");
+    let mut bytes = fs::read(&data).unwrap();
+    for byte in bytes.iter_mut().skip(64) {
+        *byte ^= 0x5a;
+    }
+    fs::write(&data, &bytes).unwrap();
+    warm_agrees(dir.path(), "the cache was mangled");
+    warm_agrees(dir.path(), "and the run after that");
+}
+
+/// The shape a half-finished garbage collection would leave: an index whose data file is gone.
+#[test]
+fn fingerprints_without_their_interfaces_are_refused_rather_than_believed() {
+    let dir = corpus();
+    warm_agrees(dir.path(), "cold");
+    fs::remove_file(dir.path().join(".ply-cache/frontend.dat")).unwrap();
+    warm_agrees(dir.path(), "fingerprints with no interfaces behind them");
+    warm_agrees(dir.path(), "and the run after that");
+}
+
+/// Only a load of the whole project drops what the cache holds for files it did not read.
+#[test]
+fn a_single_file_run_does_not_spoil_the_whole_project_run_after_it() {
+    let dir = corpus();
+    warm_agrees(dir.path(), "cold");
+    let out = ply(dir.path())
+        .args(["check", "leaf.ply"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        Store::open(dir.path()).unwrap().sources_len() >= 3,
+        "a single-file run must not have pruned the rest of the project"
+    );
+    warm_agrees(dir.path(), "whole project after a single-file run");
+}
+
+#[test]
+fn two_overlapping_runs_leave_a_cache_that_still_agrees() {
+    let dir = corpus();
+    let root = dir.path();
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| ply(root).arg("check").output().unwrap());
+        let second = scope.spawn(|| ply(root).args(["check", "."]).output().unwrap());
+        assert_eq!(first.join().unwrap().status.code(), Some(0));
+        assert_eq!(second.join().unwrap().status.code(), Some(0));
+    });
+    warm_agrees(root, "after two overlapping runs");
     edit(
-        dir.path(),
+        root,
         "leaf.ply",
-        "fn one() -> Int = 1",
-        "fn one() -> Int = \"1\"",
+        "pub fn one() -> Int = 1",
+        "pub fn one() -> Int = 3",
     );
-    let mut store = Store::open(dir.path()).unwrap();
-    let incremental = driver::load_incremental(dir.path(), &mut store).expect_err("a type error");
-    let full = driver::load_full(dir.path()).expect_err("a type error");
-    assert_eq!(codes(&incremental), codes(&full));
-    edit(
-        dir.path(),
-        "leaf.ply",
-        "fn one() -> Int = \"1\"",
-        "fn one() -> Int = 1",
-    );
-    step("the error undone");
+    warm_agrees(root, "and an edit after them");
+}
 
-    edit(dir.path(), "core.ply", "pub fn label(", "pub fn title(");
-    step("a rename in a module another imports");
-    edit(
-        dir.path(),
-        "core.ply",
-        "Book(_, p) -> p,",
-        "Book(_, p) -> p + 0,",
-    );
-    step("a body edit in a module another imports");
-    edit(
-        dir.path(),
-        "shop.ply",
-        "acc + core::price(i)",
-        "acc + core::price(i) + 0",
-    );
-    step("a body edit in a module that imports another");
-
-    edit(
-        dir.path(),
-        "shop.ply",
-        "import core\n",
-        "import core\nimport leaf\n",
-    );
-    step("an import added");
-    edit(
-        dir.path(),
-        "shop.ply",
-        "import core\nimport leaf\n",
-        "import core\n",
-    );
-    step("an import removed");
-
+/// What turns caching off files nothing: `ply build`, `ply hosts`, `--no-cache` and a program's own
+/// load of a program.
+#[test]
+fn a_load_that_does_not_cache_files_nothing() {
+    let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
-        "extra.ply",
-        "import leaf\npub fn four() -> Int = leaf::two(2) + 2\n",
+        "m.ply",
+        "pub fn main() -> Int = 1\ntest \"one\" { assert_eq(main(), 1) }\n",
     );
-    step("a file added");
-    edit(dir.path(), "extra.ply", "+ 2\n", "+ 3\n");
-    step("an edit to the added file, which imports the leaf");
-    edit(dir.path(), "leaf.ply", "one() + k", "one() + k + 0");
-    step("an edit to the leaf the added file imports");
-    edit(
-        dir.path(),
-        "leaf.ply",
-        "fn one() -> Int = 1",
-        "import core\n\nfn one() -> Int = core::price(core::Note(\"n\")) + 1",
-    );
-    edit(
-        dir.path(),
-        "core.ply",
-        "Book(_, p) -> p + 0,",
-        "Book(_, p) -> p + 1,",
-    );
-    step("an import added to a module edited with the one it now imports");
-    fs::remove_file(dir.path().join("extra.ply")).unwrap();
-    step("the added file deleted");
-
-    step("unchanged again");
+    let untouched = |what: &str| {
+        let cache = dir.path().join(".ply-cache");
+        let filed = cache.join("frontend.idx").exists() || cache.join("frontend.dat").exists();
+        assert!(!filed, "{what} filed a front-end cache");
+    };
+    ply_machine::load::load(dir.path()).expect("the program loads");
+    untouched("a program's own load");
+    let out = ply(dir.path())
+        .args(["test", "--no-cache"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    untouched("`ply test --no-cache`");
+    let out = ply(dir.path()).args(["hosts"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    untouched("`ply hosts`");
+    let out = ply(dir.path())
+        .args(["build", ".", "--digest"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    untouched("`ply build`");
 }
 
+/// A dependency's module is filed under its package's identity, so moving the package keeps what
+/// was filed for it, and a changed dependency is checked again.
+#[test]
+fn a_dependency_module_is_filed_under_its_package_and_survives_the_package_moving() {
+    let manifest = |name: &str, deps: &str| {
+        format!(
+            "import std.pkg (Manifest)\nfn package() -> Manifest = {{name: \"{name}\", version: {{major: 0, minor: 0, patch: 1}}, prefix: None, runtime: {{major: 0, minor: 0, patch: 1}}, dependencies: [{deps}], entry: None}}\n"
+        )
+    };
+    let dep = |path: &str| {
+        format!(
+            "{{name: \"lib\", prefix: None, min: {{major: 0, minor: 0, patch: 1}}, source: Path(\"{path}\")}}"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "app/ply.pkg", &manifest("app", &dep("../lib")));
+    write(
+        root,
+        "app/main.ply",
+        "import lib.answer\nfn main() -> Int = answer::answer()\n",
+    );
+    let lib_manifest = manifest("lib", "");
+    write(root, "lib/ply.pkg", &lib_manifest);
+    write(root, "lib/answer.ply", "pub fn answer() -> Int = 42\n");
+    let app = root.join("app");
+
+    let out = ply(&app).arg("check").output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let identity = ContentHash::of(lib_manifest.as_bytes()).to_hex();
+    let mut store = Store::open(&app).unwrap();
+    assert!(
+        store
+            .source_keys()
+            .contains(&format!("{identity}/answer.ply")),
+        "the dependency's module is keyed by its package's identity: {:?}",
+        store.source_keys()
+    );
+    store.set_packages(vec![(PathBuf::from("/anywhere"), identity.clone())]);
+    let filed = store
+        .fingerprint(Path::new("/anywhere/answer.ply"))
+        .expect("found by the package it belongs to");
+    assert_eq!(
+        filed.module, "lib.answer",
+        "filed under the name the front end gave it"
+    );
+    drop(store);
+
+    // The package is checked out somewhere else, and its manifest is unchanged: the rows filed for
+    // it are the moved package's too.
+    fs::create_dir_all(root.join("vendor")).unwrap();
+    fs::rename(root.join("lib"), root.join("vendor/lib")).unwrap();
+    write(root, "app/ply.pkg", &manifest("app", &dep("../vendor/lib")));
+    let (_, checked) = seeding(&app);
+    assert_eq!(checked, 0, "a moved package keeps the rows filed for it");
+
+    // A changed dependency is a different program: its edited definition and the one calling it
+    // are checked.
+    write(
+        root,
+        "vendor/lib/answer.ply",
+        "pub fn answer() -> Int = 43\n",
+    );
+    let (_, checked) = seeding(&app);
+    assert_eq!(
+        checked, 2,
+        "the edit and its caller are checked, and nothing else"
+    );
+}
+
+/// `ply prove` lowers a module's claims only when it has something to discharge there, and keeps
+/// what it lowered keyed by the texts the module reaches.
 #[test]
 fn prove_asks_for_claims_only_when_something_is_discharged_and_only_where_an_edit_reached() {
     use ply_codegen::c::producer;
+    use ply_machine::driver;
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -536,11 +609,17 @@ fn zero(x: Int) -> Int
 ",
     );
 
+    // What a load the CLI cached answers with: its claims are kept beside the front-end cache.
+    let cached = || {
+        let mut loaded = ply_machine::load::load(dir.path()).expect("the project loads");
+        loaded.frontend.incremental = true;
+        loaded
+    };
     // `ply prove` lowers claims on the thread its prover runs on, and the port's census is that
     // thread's, so it is read here, where the claims are asked for.
     let lowered = |what: &str, claimed: usize| {
         let mut store = Store::open(dir.path()).unwrap();
-        let loaded = driver::load_incremental(dir.path(), &mut store).expect("the project loads");
+        let loaded = cached();
         producer::reset_census();
         driver::claims(&loaded, Some(&mut store)).expect("the claims lower");
         assert_eq!(
@@ -558,12 +637,8 @@ fn zero(x: Int) -> Int
     edit(dir.path(), "base.ply", "x + one()", "x + one() + 0");
     lowered("an edit to a module another imports", 2);
 
-    let prove = |what: &str| {
-        ply(dir.path()).args(["prove", "."]).assert().success();
-        let _ = what;
-    };
-    prove("cold");
-    prove("warm");
+    ply(dir.path()).args(["prove", "."]).assert().success();
+    ply(dir.path()).args(["prove", "."]).assert().success();
 
     // What the run reads the cache for: every obligation is answered from it, whatever became of
     // the claims the prover lowered.
@@ -581,307 +656,29 @@ fn zero(x: Int) -> Int
     );
 }
 
-#[test]
-fn the_full_path_writes_no_front_end_cache() {
-    let dir = corpus();
-    driver::load_full(dir.path()).unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    assert!(
-        store.frontend_is_empty(),
-        "the full path must not populate the front-end cache"
-    );
-}
-
-#[test]
-fn a_corrupt_front_end_cache_degrades_to_the_full_path() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    fs::write(
-        dir.path().join(".ply-cache/frontend.idx"),
-        "not an index at all",
-    )
-    .unwrap();
-    agree(dir.path(), "corrupt cache");
-}
-
-#[test]
-fn a_definition_removed_outright_agrees() {
-    let dir = corpus();
-    agree(dir.path(), "cold");
-    edit(
-        dir.path(),
-        "shop.ply",
-        "fn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\n",
-        "",
-    );
-    edit(
-        dir.path(),
-        "core.ply",
-        "pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n",
-        "",
-    );
-    agree(dir.path(), "definition removed");
-}
-
-/// One store for every step: each step's fingerprints are whatever the step before left behind.
-#[test]
-fn a_whole_editing_session_agrees_at_every_step() {
-    let dir = corpus();
-    agree(dir.path(), "step 0");
-
-    edit(dir.path(), "leaf.ply", "one() + one()", "one() + 1");
-    agree(dir.path(), "step 1: body");
-
-    edit(dir.path(), "core.ply", "pub fn label(", "pub fn title(");
-    agree(dir.path(), "step 2: rename");
-
-    edit(dir.path(), "core.ply", "Money", "Cost");
-    agree(dir.path(), "step 3: rename a type");
-
-    write(
-        dir.path(),
-        "extra.ply",
-        "import leaf\npub fn four() -> Int = leaf::two() + 2\n",
-    );
-    agree(dir.path(), "step 4: add a file");
-
-    edit(
-        dir.path(),
-        "extra.ply",
-        "leaf::two() + 2",
-        "leaf::two() + 3",
-    );
-    agree(dir.path(), "step 5: edit the new file");
-
-    fs::remove_file(dir.path().join("extra.ply")).unwrap();
-    agree(dir.path(), "step 6: delete it again");
-
-    edit(dir.path(), "core.ply", "effect db", "effect ledger");
-    edit(dir.path(), "shop.ply", "core::db.", "core::ledger.");
-    agree(dir.path(), "step 7: rename an effect");
-}
-
-/// Structurally identical definitions in two modules share a `DefHash` while their schemes name different types.
-#[test]
-fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
-    let dir = tempfile::tempdir().unwrap();
-    let body =
-        "pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
-    write(dir.path(), "a.ply", body);
-    write(dir.path(), "b.ply", body);
-
-    let cold = agree(dir.path(), "cold");
-    assert_eq!(
-        cold.hashes.defs[&ply_span::Symbol::new("a.peel")],
-        cold.hashes.defs[&ply_span::Symbol::new("b.peel")],
-        "the fixture is only interesting while the two hash alike"
-    );
-    let warm = agree(dir.path(), "warm");
-    assert_ne!(
-        format!(
-            "{:?}",
-            warm.check.defs[&ply_span::Symbol::new("a.peel")].scheme
-        ),
-        format!(
-            "{:?}",
-            warm.check.defs[&ply_span::Symbol::new("b.peel")].scheme
-        ),
-        "each definition's scheme must name its own module's type"
-    );
-}
-
-/// `x.look` and `y.look` are one definition: they differ only by which of two identical effects they name.
-#[test]
-fn identically_declared_effects_in_two_modules_agree() {
-    let dir = tempfile::tempdir().unwrap();
-    let body = "pub effect db { read get[r](key: Int) -> Int }\n\
-                pub fn look(k: Int) -> Int / {db.read[t]} = db.get[t](k)\n";
-    write(dir.path(), "x.ply", body);
-    write(dir.path(), "y.ply", body);
-    write(dir.path(), "z.ply", "pub fn plain() -> Int = 7\n");
-    let pick = |m: &str| {
-        format!(
-            "import x\nimport y\n\
-             pub fn pick(k: Int) -> Int =\n\
-               handle x::look(k) + y::look(k) with {{ {m}::db.get[t](j) -> j, }}\n"
-        )
-    };
-    write(dir.path(), "w.ply", &pick("x"));
-
-    agree(dir.path(), "cold");
-    let warm = agree(dir.path(), "warm");
-    assert_eq!(
-        warm.hashes.defs[&ply_span::Symbol::new("x.look")],
-        warm.hashes.defs[&ply_span::Symbol::new("y.look")],
-        "two performers that differ only by which look-alike they name are one definition"
-    );
-    let via_x = warm.hashes.defs[&ply_span::Symbol::new("w.pick")];
-
-    write(dir.path(), "w.ply", &pick("y"));
-    let after = agree(dir.path(), "the handler switched to the other capability");
-    assert_ne!(
-        after.hashes.defs[&ply_span::Symbol::new("w.pick")],
-        via_x,
-        "two effects of the same shape are still different capabilities"
-    );
-
-    write(dir.path(), "z.ply", "pub fn plain() -> Int = 8\n");
-    agree(dir.path(), "an unrelated edit");
-}
-
-/// A `type` alias has no constructors, so nothing about it survives in a cached declaration beyond its arity.
-#[test]
-fn a_module_declaring_a_type_alias_agrees() {
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "alias.ply",
-        "pub type Cents = Int\npub fn zero() -> Cents = 0\n",
-    );
-    write(
-        dir.path(),
-        "user.ply",
-        "import alias\nfn take() -> alias::Cents = alias::zero()\n",
-    );
-    write(dir.path(), "lone.ply", "fn lone() -> Int = 1\n");
-
-    agree(dir.path(), "cold");
-    agree(dir.path(), "warm");
-
-    write(dir.path(), "lone.ply", "fn lone() -> Int = 2\n");
-    agree(dir.path(), "an unrelated edit");
-}
-
-#[test]
-fn a_file_whose_tests_changed_agrees() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = "fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n";
-    write(dir.path(), "m.ply", base);
-    agree(dir.path(), "cold");
-
-    write(
-        dir.path(),
-        "m.ply",
-        &format!("{base}test \"twice\" {{ assert_eq(f() + f(), 2) }}\n"),
-    );
-    agree(dir.path(), "a test added");
-}
-
-#[test]
-fn a_test_added_with_a_body_already_present_agrees() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = "fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n";
-    write(dir.path(), "m.ply", base);
-    let cold = agree(dir.path(), "cold");
-
-    write(
-        dir.path(),
-        "m.ply",
-        &format!("{base}test \"still one\" {{ assert_eq(f(), 1) }}\n"),
-    );
-    let after = agree(dir.path(), "a duplicate test added");
-    assert_eq!(
-        cold.hashes.tests[0], after.hashes.tests[0],
-        "the first test's body did not move, so its hash may not either"
-    );
-    assert_eq!(
-        after.hashes.tests[0], after.hashes.tests[1],
-        "two tests with one body are one computation"
-    );
-}
-const PALETTE: &str = r#"
-pub type Color = Red | Green
-
-pub fn paint(what: String, shade: Color = Red) -> String =
-  match shade {
-    Red -> string_concat(what, " red"),
-    Green -> string_concat(what, " green"),
-  }
-"#;
-
-const WALL: &str = r#"
-import palette
-
-pub fn wall() -> String = palette::paint("wall")
-pub fn given() -> String = palette::paint("wall", palette::Green)
-
-test "the default crosses the module boundary" {
-  assert_eq(wall(), "wall red")
-}
-"#;
-
-#[test]
-fn editing_a_cross_module_default_agrees_and_moves_the_importer() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "palette.ply", PALETTE);
-    write(dir.path(), "wall.ply", WALL);
-
-    let cold = agree(dir.path(), "cold");
-    let before = cold.hashes.defs[&ply_span::Symbol::new("wall.wall")];
-
-    // Only the default moves.
-    edit(
-        dir.path(),
-        "palette.ply",
-        "shade: Color = Red",
-        "shade: Color = Green",
-    );
-
-    let after = agree(dir.path(), "default edit");
-    assert_ne!(
-        before,
-        after.hashes.defs[&ply_span::Symbol::new("wall.wall")],
-        "`wall` was expanded against a default that changed, so its hash has to move"
-    );
-}
-
-#[test]
-fn the_three_spellings_of_one_call_are_one_definition() {
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "m.ply",
-        r#"
-pub fn greet(name: String, greeting: String = "hello") -> String =
-  string_concat(greeting, name)
-
-pub fn omitted() -> String = greet("ada")
-pub fn written() -> String = greet("ada", "hello")
-pub fn by_name() -> String = greet("ada", greeting: "hello")
-pub fn different() -> String = greet("ada", "hi")
-"#,
-    );
-    let loaded = agree(dir.path(), "cold");
-    let of = |n: &str| loaded.hashes.defs[&ply_span::Symbol::new(format!("m.{n}"))];
-    assert_eq!(of("omitted"), of("written"));
-    assert_eq!(of("omitted"), of("by_name"));
-    assert_ne!(
-        of("omitted"),
-        of("different"),
-        "a call that really does pass another value must not collide with one that does not"
-    );
-}
-
-/// A `reuse fn` is checked whole-program, so every load must know the module holds one and have its body.
+/// A `reuse fn` is checked whole-program, so a warm check must refuse a broken promise as a cold one
+/// does.
 #[test]
 fn a_promise_is_known_on_every_run_and_still_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let dir = dir.path();
     write(
-        dir,
+        dir.path(),
         "grow.ply",
         "reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {\n\
          \x20 let ys = push(xs, n);\n\
          \x20 if len(xs) < 0 { xs } else { ys }\n\
          }\n",
     );
-    let first = agree(dir, "first run");
-    assert!(first.promised);
-
-    let second = agree(dir, "second run");
-    assert!(second.promised, "the promise was lost on the second run");
-
-    let broken = ply_machine::costs::promises(&second);
-    assert_eq!(broken.len(), 1, "{broken:#?}");
-    assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
+    for run in ["first", "second"] {
+        let answer = warm_agrees(dir.path(), run);
+        assert_eq!(answer["exit_code"], 2, "{run}: {answer}");
+        assert!(
+            answer["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"] == ply_eval::codes::REUSE_BROKEN),
+            "{run}: {answer}"
+        );
+    }
 }

@@ -1,8 +1,7 @@
 //! The prover's term language: one hash-consed DAG per obligation.
 
-use ply_eval::IntTy;
-use ply_span::Symbol;
-use ply_ty::Type;
+use crate::sort::Sort;
+use ply_eval::{IntTy, Symbol};
 use std::collections::HashMap;
 
 pub type TermId = usize;
@@ -197,7 +196,7 @@ pub enum Node {
 
 pub struct Terms {
     nodes: Vec<Node>,
-    sorts: Vec<Option<Type>>,
+    sorts: Vec<Option<Sort>>,
     /// Set for anything the type system has already proved is an `Int`.
     int: Vec<bool>,
     index: HashMap<Node, TermId>,
@@ -242,7 +241,7 @@ impl Terms {
         self.nodes.iter().enumerate()
     }
 
-    pub fn sort(&self, t: TermId) -> Option<&Type> {
+    pub fn sort(&self, t: TermId) -> Option<&Sort> {
         self.sorts[t].as_ref()
     }
 
@@ -254,7 +253,7 @@ impl Terms {
         self.int[t] = true;
     }
 
-    pub fn mk(&mut self, node: Node, sort: Option<Type>) -> TermId {
+    pub fn mk(&mut self, node: Node, sort: Option<Sort>) -> TermId {
         if let Some(&existing) = self.index.get(&node) {
             if self.sorts[existing].is_none() {
                 self.sorts[existing] = sort;
@@ -272,15 +271,15 @@ impl Terms {
     }
 
     pub fn int_lit(&mut self, k: i64) -> TermId {
-        self.mk(Node::Int(k), Some(Type::int()))
+        self.mk(Node::Int(k), Some(Sort::int()))
     }
 
     pub fn boolean(&mut self, b: bool) -> TermId {
-        self.mk(Node::Bool(b), Some(Type::bool()))
+        self.mk(Node::Bool(b), Some(Sort::bool()))
     }
 
     pub fn string(&mut self, s: String) -> TermId {
-        self.mk(Node::Str(s), Some(Type::string()))
+        self.mk(Node::Str(s), Some(Sort::string()))
     }
 
     /// Trailing zeros are stripped so equal literals are one term.
@@ -290,27 +289,27 @@ impl Terms {
             mantissa /= 10;
             scale -= 1;
         }
-        self.mk(Node::Decimal { mantissa, scale }, Some(Type::decimal()))
+        self.mk(Node::Decimal { mantissa, scale }, Some(Sort::decimal()))
     }
 
     pub fn fixed(&mut self, ty: IntTy, bits: u64) -> TermId {
         let bits = ty.normalize(bits);
-        self.mk(Node::Fixed { ty, bits }, Some(Type::con(ty.name())))
+        self.mk(Node::Fixed { ty, bits }, Some(Sort::con(ty.name())))
     }
 
     pub fn unit(&mut self) -> TermId {
-        self.mk(Node::Unit, Some(Type::unit()))
+        self.mk(Node::Unit, Some(Sort::unit()))
     }
 
-    pub fn nil(&mut self, sort: Option<Type>) -> TermId {
+    pub fn nil(&mut self, sort: Option<Sort>) -> TermId {
         self.mk(Node::Nil, sort)
     }
 
-    pub fn cons(&mut self, head: TermId, tail: TermId, sort: Option<Type>) -> TermId {
+    pub fn cons(&mut self, head: TermId, tail: TermId, sort: Option<Sort>) -> TermId {
         self.mk(Node::Cons { head, tail }, sort)
     }
 
-    pub fn sym(&mut self, sort: Option<Type>) -> TermId {
+    pub fn sym(&mut self, sort: Option<Sort>) -> TermId {
         let n = self.next_sym;
         self.next_sym += 1;
         self.mk(Node::Sym(n), sort)
@@ -335,7 +334,7 @@ impl Terms {
         if p.monomials.len() == 1 && p.monomials[0].1 == 1 && p.konst == 0 {
             return Some(p.monomials[0].0);
         }
-        let id = self.mk(Node::Lin(p), Some(Type::int()));
+        let id = self.mk(Node::Lin(p), Some(Sort::int()));
         self.force_int(id);
         Some(id)
     }
@@ -374,10 +373,10 @@ impl Terms {
         {
             return *v;
         }
-        let sort = match self.sorts[base].as_ref() {
-            Some(Type::Record(fields)) => fields.get(&field).cloned(),
-            _ => None,
-        };
+        let sort = self.sorts[base]
+            .as_ref()
+            .and_then(|s| s.field(&field))
+            .cloned();
         self.mk(Node::Field { base, field }, sort)
     }
 
@@ -385,27 +384,27 @@ impl Terms {
         match self.nodes[a] {
             Node::Bool(b) => self.boolean(!b),
             Node::Not(inner) => inner,
-            _ => self.mk(Node::Not(a), Some(Type::bool())),
+            _ => self.mk(Node::Not(a), Some(Sort::bool())),
         }
     }
 
     pub fn eq(&mut self, lhs: TermId, rhs: TermId) -> TermId {
         let (lhs, rhs) = if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) };
         self.project_fields(lhs, rhs);
-        self.mk(Node::Eq { lhs, rhs }, Some(Type::bool()))
+        self.mk(Node::Eq { lhs, rhs }, Some(Sort::bool()))
     }
 
     /// Interns both sides' fields so the solver's extensionality rule has projections to compare.
     fn project_fields(&mut self, a: TermId, b: TermId) {
-        let (Some(Type::Record(left)), Some(Type::Record(right))) =
+        let (Some(Sort::Record(left)), Some(Sort::Record(right))) =
             (self.sorts[a].clone(), self.sorts[b].clone())
         else {
             return;
         };
-        if left.keys().ne(right.keys()) {
+        if left.iter().map(|(n, _)| n).ne(right.iter().map(|(n, _)| n)) {
             return;
         }
-        for name in left.keys() {
+        for (name, _) in &left {
             let x = self.field(a, name.clone());
             let y = self.field(b, name.clone());
             if x != y {
@@ -414,18 +413,15 @@ impl Terms {
         }
     }
 
-    pub fn opaque(&mut self, name: &str, sort: Option<Type>) -> TermId {
+    pub fn opaque(&mut self, name: &str, sort: Option<Sort>) -> TermId {
         self.mk(Node::Opaque(Symbol::new(name)), sort)
     }
 }
 
-pub fn is_int_type(t: &Type) -> bool {
-    matches!(t, Type::Con(name, args) if name.as_str() == "Int" && args.is_empty())
+pub fn is_int_type(t: &Sort) -> bool {
+    t.is_con("Int")
 }
 
-pub fn list_elem(t: &Type) -> Option<&Type> {
-    match t {
-        Type::Con(name, args) if name.as_str() == "List" && args.len() == 1 => Some(&args[0]),
-        _ => None,
-    }
+pub fn list_elem(t: &Sort) -> Option<&Sort> {
+    t.list_elem()
 }

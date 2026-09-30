@@ -11,7 +11,7 @@ use crate::rt::Entry;
 use crate::rt::{Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, bail};
-use ply_span::{Span, Symbol};
+use ply_eval::{Span, Symbol};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::Ordering::Relaxed;

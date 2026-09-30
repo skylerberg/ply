@@ -473,7 +473,7 @@ test "the second region's shape depends on what the first raced to" {
     if let Some(diagnostic) = &explored.diagnostic {
         assert_ne!(
             diagnostic.code,
-            ply_span::codes::SIMULATION_DIVERGENCE,
+            ply_eval::codes::SIMULATION_DIVERGENCE,
             "a legal program was blamed on Ply's simulation: {}\nnotes: {:?}",
             diagnostic.message,
             diagnostic.notes

@@ -2,8 +2,7 @@
 
 use ply_codegen::Source;
 use ply_codegen::c::producer::{self, PlyProducer, Sources};
-use ply_eval::Value;
-use ply_span::SourceId;
+use ply_eval::{SourceId, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -24,7 +23,7 @@ fn repo() -> PathBuf {
 }
 
 struct Loaded {
-    front: &'static ply_ty::Front,
+    front: &'static ply_eval::Front,
     texts: HashMap<String, String>,
 }
 
@@ -302,7 +301,7 @@ impl ply_eval::HostHandler for Doubler {
         &self,
         _rt: &dyn ply_eval::HostRuntime,
         req: &ply_eval::HostRequest<'_>,
-    ) -> Result<ply_eval::HostAnswer, ply_span::Diagnostic> {
+    ) -> Result<ply_eval::HostAnswer, ply_eval::Diagnostic> {
         let Some(Value::Int(n)) = req.args.first() else {
             panic!("ping takes an Int");
         };
@@ -325,8 +324,8 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     let mut registry = ply_eval::HostRegistry::new();
     registry.register(
         ply_eval::HostOp {
-            effect: ply_span::Symbol::new("m.served"),
-            op: ply_span::Symbol::new("ping"),
+            effect: ply_eval::Symbol::new("m.served"),
+            op: ply_eval::Symbol::new("ping"),
             resource: ply_eval::HostResource::Any,
             determinism: ply_eval::Determinism::Nondeterministic,
             linearity: ply_eval::Linearity::Repeatable,
@@ -824,7 +823,7 @@ impl ply_eval::HostHandler for Slow {
         &self,
         _rt: &dyn ply_eval::HostRuntime,
         req: &ply_eval::HostRequest<'_>,
-    ) -> Result<ply_eval::HostAnswer, ply_span::Diagnostic> {
+    ) -> Result<ply_eval::HostAnswer, ply_eval::Diagnostic> {
         let Some(Value::Int(n)) = req.args.first() else {
             panic!("fetch takes an Int");
         };
@@ -839,15 +838,15 @@ impl ply_eval::HostHandler for Slow {
 struct Reactor;
 
 impl ply_eval::HostRuntime for Reactor {
-    fn poll(&self, pending: &ply_eval::Pending) -> Result<Option<Value>, ply_span::Diagnostic> {
+    fn poll(&self, pending: &ply_eval::Pending) -> Result<Option<Value>, ply_eval::Diagnostic> {
         Ok(Some(Value::Int(pending.token as i64 * 3)))
     }
 
-    fn park(&self) -> Result<(), ply_span::Diagnostic> {
+    fn park(&self) -> Result<(), ply_eval::Diagnostic> {
         Ok(())
     }
 
-    fn block_on(&self, pending: ply_eval::Pending) -> Result<Value, ply_span::Diagnostic> {
+    fn block_on(&self, pending: ply_eval::Pending) -> Result<Value, ply_eval::Diagnostic> {
         Ok(Value::Int(pending.token as i64 * 3))
     }
 }
@@ -867,8 +866,8 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     let mut registry = ply_eval::HostRegistry::new();
     registry.register(
         ply_eval::HostOp {
-            effect: ply_span::Symbol::new("m.slow"),
-            op: ply_span::Symbol::new("fetch"),
+            effect: ply_eval::Symbol::new("m.slow"),
+            op: ply_eval::Symbol::new("fetch"),
             resource: ply_eval::HostResource::Any,
             determinism: ply_eval::Determinism::Nondeterministic,
             linearity: ply_eval::Linearity::Repeatable,
@@ -882,8 +881,8 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     for op in ply_eval::sim::TASK_OPS {
         registry.register(
             ply_eval::HostOp {
-                effect: ply_span::Symbol::new("task"),
-                op: ply_span::Symbol::new(*op),
+                effect: ply_eval::Symbol::new("task"),
+                op: ply_eval::Symbol::new(*op),
                 resource: ply_eval::HostResource::Any,
                 determinism: ply_eval::Determinism::Nondeterministic,
                 linearity: ply_eval::Linearity::Repeatable,
@@ -1002,8 +1001,8 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
     assert!(refused.is_empty(), "{refused:?}");
     let account = |balance: i64| {
         Value::Record(std::sync::Arc::new(ply_eval::Fields::from_unsorted(vec![
-            (ply_span::Symbol::new("name"), Value::str("a")),
-            (ply_span::Symbol::new("balance"), Value::Int(balance)),
+            (ply_eval::Symbol::new("name"), Value::str("a")),
+            (ply_eval::Symbol::new("balance"), Value::Int(balance)),
         ])))
     };
     let cases: Vec<(&str, Vec<Value>, bool)> = vec![
@@ -1062,10 +1061,10 @@ fn standard_library() -> (&'static Source, Vec<String>) {
     let unused: Vec<String> = front
         .diagnostics
         .iter()
-        .filter(|d| d.code == ply_span::codes::UNUSED_DEFINITION)
+        .filter(|d| d.code == ply_eval::codes::UNUSED_DEFINITION)
         .map(|d| d.message.clone())
         .collect();
-    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let front: &'static ply_eval::Front = Box::leak(Box::new(front));
     let source: &'static Source = Box::leak(Box::new(
         Source::from_front(front).with_texts(modules.into_iter().collect()),
     ));
@@ -1176,100 +1175,4 @@ fn the_shipped_blake3_is_blake3() {
             "`std.hash.blake3` is not BLAKE3 over {length} bytes"
         );
     }
-}
-
-/// What the front end published for each `fn`, by program-wide name.
-fn footprints(dump: &str, count: usize) -> std::collections::BTreeMap<String, String> {
-    let ids: Vec<SourceId> = (0..count).map(|i| SourceId(i as u32)).collect();
-    let front = ply_ty::read_front(dump, &ids).unwrap_or_else(|e| panic!("{e}"));
-    front
-        .check
-        .defs
-        .iter()
-        .map(|(name, d)| (name.to_string(), ply_ty::print_footprint(&d.footprint)))
-        .collect()
-}
-
-/// The recompute unit is the definition, not the module: handing the front end a row for every
-/// definition and then editing one body must leave every definition whose hash did not move
-/// published from its row, including the ones beside the edit and the ones importing them.
-#[test]
-fn an_edit_walks_the_definitions_that_depend_on_it_and_no_others() {
-    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    // A row nothing performs, so a definition published from its row is told from a walked one.
-    const SENTINEL: &str = "base.probe.read";
-    let base = |body: &str| {
-        format!(
-            "effect probe {{ read peek() -> Int }}\n\
-             pub fn poke() -> Int / {{probe.read}} = probe.peek()\n\
-             pub fn one() -> Int = {body}\n\
-             pub fn two() -> Int = 2\n\
-             pub fn three() -> Int = one() + 1\n"
-        )
-    };
-    const APP: &str = "import base\n\
-                       pub fn four() -> Int = base::one() + 3\n\
-                       pub fn five() -> Int = base::two() + 4\n";
-    let program = |body: &str| {
-        vec![
-            ("base".to_string(), base(body)),
-            ("app".to_string(), APP.to_string()),
-        ]
-    };
-
-    let before = producer::front_pulling_std(&program("1"), &[]).expect("the program checks");
-    let ids: Vec<SourceId> = (0..2).map(|i| SourceId(i as u32)).collect();
-    let checked = ply_ty::read_front(&before.dump, &ids).unwrap_or_else(|e| panic!("{e}"));
-    let known: Vec<producer::KnownDef> = checked
-        .hashes
-        .defs
-        .iter()
-        .map(|(name, hash)| producer::KnownDef {
-            name: name.to_string(),
-            hash: *hash,
-            witness: vec![(
-                "base.probe".to_string(),
-                checked.hashes.decls[&ply_span::Symbol::new("base.probe")],
-            )],
-            footprint: SENTINEL.to_string(),
-            performed: SENTINEL.to_string(),
-        })
-        .collect();
-
-    let kept = producer::front_pulling_std_with(
-        &program("1"),
-        &[],
-        &known,
-        &[],
-        &producer::Packages::anonymous(String::new()),
-    )
-    .expect("the program checks");
-    for (name, footprint) in footprints(&kept.dump, 2) {
-        assert_eq!(footprint, SENTINEL, "`{name}` was walked, not taken");
-    }
-
-    // One body edited: `one` moves, and with it everything that reaches it, and nothing else.
-    let after = producer::front_pulling_std_with(
-        &program("11"),
-        &[],
-        &known,
-        &[],
-        &producer::Packages::anonymous(String::new()),
-    )
-    .expect("the program checks");
-    let walked: Vec<String> = footprints(&after.dump, 2)
-        .into_iter()
-        .filter(|(_, footprint)| footprint != SENTINEL)
-        .map(|(name, _)| name)
-        .collect();
-    assert_eq!(
-        walked,
-        vec![
-            "app.four".to_string(),
-            "base.one".to_string(),
-            "base.three".to_string()
-        ],
-        "the recompute unit is not the definition"
-    );
 }

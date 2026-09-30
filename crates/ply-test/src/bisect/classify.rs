@@ -1,10 +1,8 @@
 //! The judgements delta construction cannot make from hashes alone.
 
 use super::{DefKey, Ns, Rehashed};
-use ply_span::Symbol;
-use ply_store::{Store, canonicalize_scheme};
-use ply_ty::CheckOutput;
-use ply_ty::DefHash;
+use ply_eval::{CheckOutput, DefHash, Symbol, Value};
+use ply_store::{DefKind, Found, Store};
 use std::collections::BTreeSet;
 
 pub trait Classify {
@@ -54,17 +52,15 @@ impl Classify for StoreClassify<'_> {
         self.rehashed.rehash_test(key)
     }
 
-    /// Only a `fn` is compared.
+    /// Only a `fn` is compared, as the front end filed both sides: the CLI files a program before
+    /// its tests run, so the store holds the current hash's interface beside the baseline's.
     fn interface_stable(&mut self, key: &DefKey, before: DefHash) -> Option<bool> {
         if key.ns == Ns::Decl {
             return Some(false);
         }
-        let now = self.check.defs.get(&key.name)?;
-        let then = self.store.def_of(before, &key.name)?;
-        Some(
-            canonicalize_scheme(&now.scheme) == canonicalize_scheme(&then.scheme)
-                && now.footprint == then.footprint,
-        )
+        self.check.defs.get(&key.name)?;
+        let now = current_hash(self.store, &key.name)?;
+        Some(interface(self.store, before, &key.name)? == interface(self.store, now, &key.name)?)
     }
 
     fn component(&mut self, key: &DefKey) -> Vec<DefKey> {
@@ -73,6 +69,41 @@ impl Classify for StoreClassify<'_> {
 
     fn baseline_image(&mut self) -> BTreeSet<DefHash> {
         self.rehashed.image()
+    }
+}
+
+/// The one hash the store's fingerprints file `name` under; a name filed under two is not one this
+/// can answer for.
+fn current_hash(store: &Store, name: &Symbol) -> Option<DefHash> {
+    let hashes: BTreeSet<DefHash> = store
+        .lookup(name.as_str())
+        .into_iter()
+        .filter_map(|found| match found {
+            Found::Def(def) if def.name == *name && def.kind == DefKind::Fn => Some(def.hash),
+            _ => None,
+        })
+        .collect();
+    match hashes.len() {
+        1 => hashes.into_iter().next(),
+        _ => None,
+    }
+}
+
+/// A definition's scheme and published footprint as the front end printed and filed them.
+fn interface(store: &Store, hash: DefHash, name: &Symbol) -> Option<(Value, Value)> {
+    let value = ply_eval::codec::decode(&store.def_of(hash, name)?.value).ok()?;
+    let scheme = field(&value, "scheme")?.clone();
+    let footprint = field(field(&value, "row")?, "footprint")?.clone();
+    Some((scheme, footprint))
+}
+
+fn field<'v>(value: &'v Value, name: &str) -> Option<&'v Value> {
+    match value {
+        Value::Record(fields) => fields
+            .iter()
+            .find(|(k, _)| k.as_str() == name)
+            .map(|(_, v)| v),
+        _ => None,
     }
 }
 

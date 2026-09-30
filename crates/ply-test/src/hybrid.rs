@@ -2,11 +2,9 @@
 
 use crate::bisect::{DefKey, Trial, Unresolved};
 use crate::sim::seed_run;
-use ply_eval::{Plan, Provider, Seed};
-use ply_span::{Diagnostic, SourceId, Symbol};
+use ply_eval::{DefHash, Diagnostic, HashOutput, Plan, Provider, Seed, SourceId, Symbol};
 use ply_store::body::{BodySet, StoredBody};
 use ply_store::{Outcome, Store};
-use ply_ty::{DefHash, HashOutput};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 

@@ -10,10 +10,10 @@ use ply_eval::host::{
 };
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{
-    Unbound, carries_secret, check_host_answer, err_footprint_escape, err_host_in_simulation,
-    err_no_runtime, err_secret_to_host, err_unenumerated_atom,
+    Diagnostic, Span, Symbol, Unbound, carries_secret, check_host_answer, codes,
+    err_footprint_escape, err_host_in_simulation, err_no_runtime, err_secret_to_host,
+    err_unenumerated_atom,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::sync::Arc;
 
 /// An at-most-once host operation an entry performed, which a second resumption would replay.
@@ -88,10 +88,10 @@ pub unsafe fn perform(
                     hermetic
                 }
             }
-            Some(path) if binding.withholds(effect, op, resource).is_some() => {
-                err_withheld(span, &operation, effect, path)
-            }
-            Some(path) => err_unenumerated_atom(span, &operation, path),
+            Some(path) => match binding.withholds(effect, op, resource) {
+                Some(served) => err_withheld(span, &operation, effect, path, served),
+                None => err_unenumerated_atom(span, &operation, path),
+            },
         };
         return c.fail(d);
     };

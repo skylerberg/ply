@@ -3,12 +3,11 @@
 
 use crate::load::Loaded;
 use ply_eval::decode::{self, At};
-use ply_eval::{Fields, Value};
-use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
+use ply_eval::{
+    DefHash, DefInfo, Diagnostic, Fields, Front, HashOutput, ModuleName, Severity, SourceMap, Span,
+    Symbol, Value, codes,
+};
 use ply_store::body::StoredBody;
-use ply_ty::ModuleName;
-use ply_ty::{DefHash, HashOutput};
-use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -922,14 +921,14 @@ fn front_failed(why: String) -> Vec<Diagnostic> {
 struct Answered {
     front: Front,
     modules: Vec<String>,
-    dump: String,
+    dump: ply_eval::Value,
 }
 
 /// Shipped modules live in this binary, pinned by the header's `ply_std::digest()`; the port
 /// pulls in the ones the closure imports and places them after it.
 fn ask_the_port(
     own: &[(String, String)],
-    ids: &mut Vec<ply_span::SourceId>,
+    ids: &mut Vec<ply_eval::SourceId>,
     sources: &mut SourceMap,
 ) -> Result<Answered, Vec<Diagnostic>> {
     ply_codegen::c::producer::ensure_default();
@@ -948,8 +947,8 @@ fn ask_the_port(
 /// indexes land where it wrote them, and the dump read back against those very ids.
 fn place_and_read(
     modules: &[String],
-    dump: &str,
-    ids: &mut Vec<ply_span::SourceId>,
+    dump: &ply_eval::Value,
+    ids: &mut Vec<ply_eval::SourceId>,
     sources: &mut SourceMap,
 ) -> Result<Front, Vec<Diagnostic>> {
     for module in modules {
@@ -959,7 +958,7 @@ fn place_and_read(
         })?;
         ids.push(sources.add(crate::shelf::pseudo_path(&name), text));
     }
-    let front = ply_ty::read_front(dump, ids.as_slice())
+    let front = ply_codegen::c::dump::read(dump, ids.as_slice())
         .map_err(|e| front_failed(format!("the front end's answer does not read: {e}")))?;
     let errors: Vec<Diagnostic> = front
         .diagnostics
@@ -987,6 +986,8 @@ pub fn front_cache(artifact: &Artifact) -> PathBuf {
         ..artifact.clone()
     };
     let mut hasher = blake3::Hasher::new();
+    // What the entry is written as is part of its key.
+    hasher.update(b"front.FrontAnswer as ply_eval::codec\0");
     hasher.update(&closure.digest());
     hasher.update(ply_store::FRONTEND_VERSION.as_bytes());
     hasher.update(&[0]);
@@ -997,34 +998,32 @@ pub fn front_cache(artifact: &Artifact) -> PathBuf {
         .join(format!("front.{}", &hasher.finalize().to_hex()[..16]))
 }
 
-/// The pulled module names, then the dump: the two halves a `Front` is rebuilt from in process.
-fn file_front(at: &Path, modules: &[String], dump: &str) {
+/// The pulled module names and the dump, as `front.answer_pulling_std_with` answers them: the two
+/// halves a `Front` is rebuilt from in process.
+fn file_front(at: &Path, modules: &[String], dump: &ply_eval::Value) {
     let Some(parent) = at.parent() else { return };
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let mut bytes = format!("{}\n", modules.len()).into_bytes();
-    for module in modules {
-        bytes.extend_from_slice(module.as_bytes());
-        bytes.push(b'\n');
-    }
-    bytes.extend_from_slice(dump.as_bytes());
+    let answer = crate::payload::record(vec![
+        (
+            "pulled",
+            ply_eval::Value::list(
+                modules
+                    .iter()
+                    .map(|m| ply_eval::Value::bytes(m.as_bytes()))
+                    .collect(),
+            ),
+        ),
+        ("dump", dump.clone()),
+    ]);
+    let Ok(bytes) = ply_eval::codec::encode(&answer) else {
+        return;
+    };
     let tmp = parent.join(format!("front.{}.tmp", std::process::id()));
     if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, at).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-}
-
-fn split_front(text: &str) -> Option<(Vec<String>, &str)> {
-    let (count, mut rest) = text.split_once('\n')?;
-    let count: usize = count.parse().ok()?;
-    let mut modules = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (name, tail) = rest.split_once('\n')?;
-        modules.push(name.to_string());
-        rest = tail;
-    }
-    Some((modules, rest))
 }
 
 /// The `Front` an earlier run answered for this very artifact. A hit skips the check below that
@@ -1032,11 +1031,16 @@ fn split_front(text: &str) -> Option<(Vec<String>, &str)> {
 /// file is only ever written after that check passed on this machine.
 fn cached_front(
     at: &Path,
-    ids: &mut Vec<ply_span::SourceId>,
+    ids: &mut Vec<ply_eval::SourceId>,
     sources: &mut SourceMap,
 ) -> Option<Front> {
-    let text = std::fs::read_to_string(at).ok()?;
-    let (modules, dump) = split_front(&text)?;
+    let answer = ply_eval::codec::decode(&std::fs::read(at).ok()?).ok()?;
+    let filed = ply_eval::decode::At::new("a filed front end", &answer);
+    let modules = filed
+        .field("pulled")
+        .and_then(|m| m.items(|name| Ok(name.utf8()?.to_string())))
+        .ok()?;
+    let dump = filed.field("dump").ok()?.value();
     let kept_ids = ids.clone();
     let kept_sources = sources.clone();
     match place_and_read(&modules, dump, ids, sources) {
@@ -1055,7 +1059,7 @@ fn cached_front(
 fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     let mut sources = SourceMap::new();
     let mut own: Vec<(String, String)> = Vec::new();
-    let mut ids: Vec<ply_span::SourceId> = Vec::new();
+    let mut ids: Vec<ply_eval::SourceId> = Vec::new();
     for (file, text) in &artifact.closure {
         let relative = PathBuf::from(file);
         let name = ModuleName::from_relative_path(&relative).map_err(|d| vec![d])?;
@@ -1141,6 +1145,8 @@ pub struct Binds {
     pub roots: Vec<ply_host::fs::RootSpec>,
     pub executables: ply_host::process::Executables,
     pub lent: Vec<crate::hosts::Lent>,
+    /// Certificates its `net.connect_tls` accepts beside the built-in roots, as `--trust` names them.
+    pub trust: Vec<PathBuf>,
 }
 
 /// One entry into an opened artifact, with no line of its own on either stream: the program's
@@ -1159,6 +1165,7 @@ pub fn enter(
         roots,
         executables,
         lent,
+        trust,
     } = binds;
     // A unit built for another runtime is left aside and the bodies serve.
     let unit = if servable(artifact) {
@@ -1183,7 +1190,10 @@ pub fn enter(
     let hosts = crate::hosts::Hosts::open_stopping(
         &opened.front.check,
         true,
-        &crate::options::TlsOptions::default(),
+        &crate::options::TlsOptions {
+            tls: Vec::new(),
+            trust,
+        },
         &roots,
         crate::config::Configuration::default(),
         &crate::trace::TraceOptions::default(),
@@ -1255,7 +1265,7 @@ fn evaluate(
     span: Span,
     plan: &ply_eval::Plan,
     hosts: &crate::hosts::Hosts,
-    declared: Option<&ply_ty::ty::Footprint>,
+    declared: Option<&ply_eval::Footprint>,
     tier: &'static dyn ply_eval::Provider,
 ) -> Result<ply_eval::Value, Diagnostic> {
     let mut machine = ply_eval::Machine::new(&opened.front);

@@ -4,6 +4,7 @@
 mod build;
 pub mod bundle;
 pub mod cache;
+pub mod dump;
 pub mod exports;
 mod load;
 mod prelude;
@@ -74,20 +75,20 @@ pub fn fatal_refusals<'a>(offered: &[&str], refusals: &'a [Refused]) -> Vec<&'a 
 /// admitted set has, so it is raised where the unit is built rather than left to the entry that
 /// would find no body.
 #[derive(Debug)]
-pub struct Refusals(ply_span::Diagnostic);
+pub struct Refusals(ply_eval::Diagnostic);
 
 impl Refusals {
     /// `source` places each refused definition; without a place the label is `Span::DUMMY`.
     pub fn over(source: &crate::source::Source, refused: &[&Refused]) -> Refusals {
-        let place = |r: &Refused| source.span_of(&r.function).unwrap_or(ply_span::Span::DUMMY);
+        let place = |r: &Refused| source.span_of(&r.function).unwrap_or(ply_eval::Span::DUMMY);
         let mut listed = String::from("the emitter refused, in the order it dropped them:");
         for r in refused {
             listed.push_str(&format!("\n  `{}` ({})", r.function, r.construct));
         }
         // In drop order, so the first is a cause and the rest are what that cause carried.
         let (head, rest) = refused.split_first().expect("a refusal to report");
-        let mut diagnostic = ply_span::Diagnostic::error(
-            ply_span::codes::DEFINITION_REFUSED,
+        let mut diagnostic = ply_eval::Diagnostic::error(
+            ply_eval::codes::DEFINITION_REFUSED,
             format!(
                 "the compiled tier cannot compile {} of the definitions this program reaches",
                 refused.len()
@@ -104,11 +105,11 @@ impl Refusals {
         ))
     }
 
-    pub fn diagnostic(&self) -> &ply_span::Diagnostic {
+    pub fn diagnostic(&self) -> &ply_eval::Diagnostic {
         &self.0
     }
 
-    pub fn into_diagnostic(self) -> ply_span::Diagnostic {
+    pub fn into_diagnostic(self) -> ply_eval::Diagnostic {
         self.0
     }
 }

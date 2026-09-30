@@ -5,8 +5,8 @@
 //! big-stack thread, the artifact open, the `cwd` and `shelf` roots, the process and environment
 //! bindings, and the exit code.
 
+use ply_eval::{Diagnostic, codes};
 use ply_machine::artifact::{self, Binds};
-use ply_span::{Diagnostic, codes};
 use std::path::{Path, PathBuf};
 
 /// The front end and emitter recurse once per node on the native stack.
@@ -27,6 +27,18 @@ pub struct Program {
 /// one. Not a `.ply` file, so the program's own listing passes over it.
 const SHELF_MARKER: &str = "SHELF.ok";
 
+/// The PEM files `PLY_TRUST` names, separated as `PATH` separates directories: roots the program's
+/// own `net.connect_tls` accepts beside the built-in ones, as `--trust` gives a program a command
+/// runs. One that does not load is `E0430` before the program runs.
+pub fn trust() -> Vec<PathBuf> {
+    match std::env::var_os("PLY_TRUST") {
+        None => Vec::new(),
+        Some(value) => std::env::split_paths(&value)
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect(),
+    }
+}
+
 /// The shelf laid out once per identity. Each file lands by a rename and the marker lands last,
 /// so a run that finds the marker finds every module whole.
 pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
@@ -44,7 +56,7 @@ pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
             ),
         )
         .primary(
-            ply_span::Span::DUMMY,
+            ply_eval::Span::DUMMY,
             "this is Ply's fault, not the program's",
         )
     })?;
@@ -148,7 +160,7 @@ pub fn run(
             codes::INTERNAL_ERROR,
             format!("the program could not be started on a thread of its own: {e}"),
         )
-        .primary(ply_span::Span::DUMMY, "this is Ply's fault")),
+        .primary(ply_eval::Span::DUMMY, "this is Ply's fault")),
     }
 }
 

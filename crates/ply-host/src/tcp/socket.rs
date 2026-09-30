@@ -3,9 +3,7 @@
 use super::{Handles, Net, Op, not_a_listener, not_a_stream, unknown_handle};
 use crate::pool::{Bell, Done, NET_FIRST_TOKEN, Pool};
 use crate::tls::{self, Credentials, Handshakes};
-use ply_eval::{HostAnswer, HostRuntime, Pending, Value};
-use ply_span::{Diagnostic, Span};
-use ply_ty::Resource;
+use ply_eval::{Diagnostic, HostAnswer, HostRuntime, Pending, Resource, Span, Value};
 use rustls::pki_types::ServerName;
 use rustls::server::ServerConfig;
 use std::collections::BTreeMap;

@@ -1,43 +1,48 @@
 // `ply build` — a deployable artifact, or what a build changes against a deployed one. The front
-// end and the emitter are the Rust side's: a front end or a compiled unit is not a value a
-// program can hold. Everything below decides which entry is built, what the container carries,
-// where it lands, and what both forms say. The container itself is `compiler.plyx`, which owns
-// the magic, the header and the section table.
+// end is this program's own load, handed to the Rust side; the emitter is the Rust side's: a
+// compiled unit is not a value a program can hold. Everything below decides which entry is built,
+// what the container carries, where it lands, and what both forms say. The container itself is
+// `compiler.plyx`, which owns the magic, the header and the section table.
 
 import args (Flags, no_flags, style_of)
-import builder (Compiled, Def, Loaded, Made, Named, Previous, Reach, Refusal)
+import builder (Compiled, Loaded, Made, Named, Previous, Reach, Refusal)
 import builder (builder)
+import config_schema
 import lock
-import paths (Resolved, here)
-import compiler.hash (hex)
-import compiler.plyx (Head, Section, Range, covers, domain, encode, encode_named, format,
+import paths (Resolved, Rooted, displayed, here, write_file)
+import compiler.diag (parse_all)
+import compiler.infer (DefInfo)
+import compiler.plyx (Head, digest_of, digest_text, domain, encode, encode_named, format,
                       library_domain, library_magic, off_digest)
 import compiler.resolve (Diag, Label, diag, diag1)
+import compiler.tycore (TyFn)
 import diagnostic (Place, all_to_json, all_to_text)
 import entry (At, Main, Module, entry_point, marked, no_module, nowhere)
 import env (env)
 import sources (File)
-import program (Program, load_program)
+import program (Front, Program, Timed, front_of, is_shipped, no_front, timed_uncached)
+import plyz
 import report (Answer, ind, ok_code, count_of, plural, refused, reported, warning_lines)
 import std.fs (fs, Missing)
-import std.hash (blake3)
-import std.path (is_absolute)
+import std.time (time)
+import std.list (sort_by)
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string)
 import std.pkg (Manifest, render_version)
-import compiler.front (Whole)
+import compiler.front (Whole, Analysed, Refused, analyse)
 import style (Style, plain, bold, green, red)
 
-// The container with its digest written into the field no range of the digest covers.
-pub type Sealed = { bytes: Bytes, digest: String }
+// The container with its digest written into the field no range of the digest covers: `digest`
+// is the short form a report prints, and `full` the digest itself.
+pub type Sealed = { bytes: Bytes, digest: String, full: Bytes }
 
-// The digest is the writer's own work: `compiler.plyx` says the domain, the field and the ranges,
-// and the hash is `std.hash`'s. Sealing is hashing and a splice, so the program does it itself.
+// The digest is `compiler.plyx`'s, which says the domain, the field and the ranges; sealing is that
+// digest and a splice, so the program does it itself.
 fn seal(container: Bytes) -> Result<Sealed, Refusal> = sealed_at(container, domain())
 
 // A library's container is the same file under a domain of its own: a library digest is never read
 // as a program digest, and the ranges `compiler.plyx` covers are the same ones.
 fn sealed_at(container: Bytes, into: Bytes) -> Result<Sealed, Refusal> =
-  match covers(bytes_len(container)) {
+  match digest_of(into, container) {
     None ->
       Err({
         diags: [
@@ -53,17 +58,16 @@ fn sealed_at(container: Bytes, into: Bytes) -> Result<Sealed, Refusal> =
         ],
         places: [],
       }),
-    Some(ranges) -> {
-      let parts = map(ranges, |r: Range| bytes_slice(container, r.at, r.at + r.len));
-      let digest = blake3(bytes_concat_all(appended([into], parts)));
+    Some(d) -> {
       let at = off_digest();
       Ok({
         bytes: bytes_concat_all([
           bytes_slice(container, 0, at),
-          digest,
+          d,
           bytes_slice(container, at + 32, bytes_len(container)),
         ]),
-        digest: "b3:" ++ string_slice(string_of_bytes(hex(digest)), 0, 12),
+        digest: string_slice(digest_text(d), 0, 15),
+        full: d,
       })
     },
   }
@@ -137,6 +141,27 @@ fn default_output(entry: String) -> String = {
 
 // --- Which entry is built ---------------------------------------------------
 
+// One definition `--entry` may name.
+pub type Def = { name: String, simple: String, module: String, at: At, arity: Int }
+
+fn def_of(d: DefInfo) -> Def =
+  {
+    name: string_of_bytes_lossy(d.name),
+    simple: string_of_bytes_lossy(d.simple_name),
+    module: string_of_bytes_lossy(d.module),
+    at: { module: d.at.module, start: d.at.span.start, end: d.at.span.end },
+    arity: match d.scheme.ty { TyFn(f) -> len(f.params), _ -> 0 },
+  }
+
+// The program's own definitions, a shipped module's left out, in the order its files were read and
+// then as written.
+pub fn defs_of(w: Whole) -> List<Def> =
+  sort_by(
+    map(filter(w.checked.defs, |d: DefInfo| !is_shipped(string_of_bytes_lossy(d.module))), def_of),
+    |a: Def, b: Def|
+      a.at.module < b.at.module || (a.at.module == b.at.module && a.at.start <= b.at.start),
+  )
+
 fn matching(defs: List<Def>, named: String) -> List<Def> =
   filter(defs, |d: Def| d.name == named || d.simple == named)
 
@@ -177,30 +202,6 @@ fn no_entry(named: String) -> Diag =
     [b"`--entry` takes a program-wide name (`app.serve`) or a simple one"],
   )
 
-fn schema_arity(d: Def, flag: String) -> Diag =
-  diag(
-    b"E0201",
-    bytes_of_string(
-      "`" ++ d.name ++ "` takes " ++ count_of(d.arity, "argument") ++ ", and `" ++ flag
-        ++ "` names a nullary function",
-    ),
-    [marked(d.at, true, b"this cannot be a schema")],
-    [],
-  )
-
-fn no_schema(flag: String, named: String) -> Diag =
-  diag1(
-    b"E0101",
-    no_module(),
-    { start: 0, end: 0 },
-    bytes_of_string("`" ++ flag ++ " " ++ named ++ "` names no definition in this program"),
-    b"there is nothing to ship",
-    [
-      bytes_of_string("`" ++ flag ++ "` takes a program-wide name (`desk.config`) or a simple one"),
-      b"a schema shipped at build time is what lets the deployed artifact be run with the same flag, and therefore what keeps its start-up refusal",
-    ],
-  )
-
 fn entry_named(defs: List<Def>, named: String) -> Result<String, Diag> = {
   let hits = matching(defs, named);
   match hits {
@@ -211,39 +212,22 @@ fn entry_named(defs: List<Def>, named: String) -> Result<String, Diag> = {
   }
 }
 
-fn schema_named(defs: List<Def>, flag: String, named: String) -> Result<String, Diag> = {
-  let hits = matching(defs, named);
-  match hits {
-    [] -> Err(no_schema(flag, named)),
-    [only, ..rest] -> if len(rest) > 0 { Err(ambiguous(named, hits)) }
-    else if only.arity > 0 { Err(schema_arity(only, flag)) }
-    else { Ok(only.name) },
-  }
-}
-
-fn entry_of(p: Loaded, flags: Flags) -> Result<String, Diag> =
+fn entry_of(p: Loaded, defs: List<Def>, flags: Flags) -> Result<String, Diag> =
   match flags.entry {
     None -> match entry_point(p.mains, p.modules) { Ok(m) -> Ok(m.name), Err(d) -> Err(d) },
-    Some(named) -> entry_named(p.defs, named),
+    Some(named) -> entry_named(defs, named),
   }
 
-type Asked = { flag: String, name: String }
-
-// `--config-schema`, which is the only schema a run names now.
-fn asked(flags: Flags) -> List<Asked> =
-  match flags.config_schema { Some(v) -> [{ flag: "--config-schema", name: v }], None -> [] }
-
-fn startup_of(p: Loaded, flags: Flags) -> Result<List<String>, Diag> = {
-  let start: Result<List<String>, Diag> = Ok([]);
-  fold(asked(flags), start, |acc: Result<List<String>, Diag>, a: Asked|
-    match acc {
+// The schema shipped at build time is what lets the deployed artifact be run with the same flag,
+// so the flag is resolved as a run resolves it.
+fn startup_of(w: Whole, flags: Flags) -> Result<List<String>, Diag> =
+  match flags.config_schema {
+    None -> Ok([]),
+    Some(named) -> match config_schema::resolved(w, named) {
       Err(d) -> Err(d),
-      Ok(names) -> match schema_named(p.defs, a.flag, a.name) {
-        Err(d) -> Err(d),
-        Ok(name) -> Ok(push(names, name)),
-      },
-    })
-}
+      Ok(name) -> Ok([name]),
+    },
+  }
 
 // --- What a build changes ---------------------------------------------------
 
@@ -405,21 +389,30 @@ fn digest_json(m: Made, x: Sealed) -> Json =
 
 // --- The command ------------------------------------------------------------
 
+fn unstamped(path: String) -> Diag =
+  diag1(
+    b"E0502",
+    no_module(),
+    { start: 0, end: 0 },
+    bytes_of_string("could not write `" ++ path ++ "`"),
+    b"the launcher's gate was not written",
+    [
+      b"the artifact was written; point `--stamp` at a file in a directory that exists and can be written",
+    ],
+  )
+
 // The launcher's gate, written beside the artifact the CLI's own build lands: the digest this
 // binary runs the committed artifact under.
 fn stamped(
+  s: Style,
   flags: Flags,
+  p: Loaded,
   answer: Answer,
 ) -> Answer / {env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs]} =
-  if flags.shipped_digest == "" { answer } else {
-    let digest = env.shipped_digest[sys]() ++ "\n";
-    if is_absolute(flags.shipped_digest) {
-      fs.write_file[abs](
-        string_slice(flags.shipped_digest, 1, string_len(flags.shipped_digest)),
-        bytes_of_string(digest),
-      )
-    } else { fs.write_file[cwd](flags.shipped_digest, bytes_of_string(digest)) };
-    answer
+  match flags.stamp {
+    None -> answer,
+    Some(at) -> if write_file(at, bytes_of_string(env.shipped_digest[sys]() ++ "\n")) { answer }
+    else { reported(s, "build", [unstamped(displayed(at))], p.places) },
   }
 
 fn written(
@@ -433,7 +426,7 @@ fn written(
   match builder.stored[build](out, x.bytes) {
     Err(why) -> reported(s, "build", why.diags, p.places),
     Ok(_) ->
-      stamped(flags, {
+      stamped(s, flags, p, {
         json: built_json(p, m, x, out),
         lines: built_lines(s, p, m, x, out),
         errs: all_to_text(s, m.warnings, p.places),
@@ -505,33 +498,53 @@ fn assembled(
 fn chosen(
   s: Style,
   flags: Flags,
+  loaded: Program,
   p: Loaded,
-) -> Answer / {builder.git[vcs], builder.made[build], builder.previous[build], builder.stored[build], builder.unit[build], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} =
-  match entry_of(p, flags) {
+  defs: List<Def>,
+  startup: Result<List<String>, Diag>,
+) -> Answer / {builder.made[build], builder.previous[build], builder.stored[build], builder.unit[build], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs]} =
+  match entry_of(p, defs, flags) {
     // Nothing to build as a program. A library — a package that names no entry and declares no
     // `main` — is built as the package itself; anything else keeps the entry point's refusal.
-    Err(d) -> if flags.entry == None && len(p.mains) == 0 { library(s, flags, p, d) }
+    Err(d) -> if flags.entry == None && len(p.mains) == 0 { library(s, flags, loaded, p, defs, d) }
     else { reported(s, "build", [d], p.places) },
-    Ok(entry) -> match startup_of(p, flags) {
+    Ok(entry) -> match startup {
       Err(d) -> reported(s, "build", [d], p.places),
-      Ok(startup) -> assembled(s, flags, p, entry, startup),
+      Ok(roots) -> assembled(s, flags, p, entry, roots),
     },
   }
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], builder.loaded[build], builder.made[build], builder.previous[build], builder.stored[build], builder.unit[build], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} = {
+) -> Answer / {builder.git[vcs], builder.loaded[build], builder.made[build], builder.previous[build], builder.stored[build], builder.unit[build], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, time.elapsed_us} = {
   let s: Style = style_of(flags);
+  let t: Timed = timed_uncached(flags.paths);
+  match t.program.whole {
+    None -> refused(s, "build", t.program.diags, t.program.places),
+    Some(w) -> built_over(s, flags, t.program, defs_of(w), startup_of(w, flags), front_of(t, w)),
+  }
+}
+
+// The build, over the program `run` loaded, what it decided of it, and the front end it handed the
+// Rust side.
+fn built_over(
+  s: Style,
+  flags: Flags,
+  loaded: Program,
+  defs: List<Def>,
+  startup: Result<List<String>, Diag>,
+  front: Front,
+) -> Answer / {builder.loaded[build], builder.made[build], builder.previous[build], builder.stored[build], builder.unit[build], env.shipped_digest[sys], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs]} = {
   let r = resolved_root(flags);
   let locked: Result<Option<lock::Lock>, String> = lock::read(r);
-  match builder.loaded[build](root_of(flags)) {
+  match builder.loaded[build](root_of(flags), front) {
     Err(why) -> refused(s, "build", why.diags, why.places),
     Ok(p) -> match locked {
       Err(why) -> reported(s, "build", [lock::refused(r, why)], p.places),
       Ok(existing) -> match pinned_ok(r, existing, p) {
         Some(d) -> reported(s, "build", [d], p.places),
         None -> {
-          let answer = chosen(s, flags, p);
+          let answer = chosen(s, flags, loaded, p, defs, startup);
           if answer.code == ok_code() { pinned(r, existing, p) };
           answer
         },
@@ -549,7 +562,10 @@ fn pinned_ok(r: Resolved, existing: Option<lock::Lock>, p: Loaded) -> Option<Dia
   }
 
 fn unchanged(existing: Option<lock::Lock>, pins: List<lock::Pinned>) -> Bool =
-  match existing { None -> false, Some(l) -> l.version == lock::format() && l.packages == pins }
+  match existing {
+    None -> false,
+    Some(l) -> l.version == lock::format() && map(l.packages, lock::pin_of) == pins,
+  }
 
 fn pinned(
   r: Resolved,
@@ -557,9 +573,7 @@ fn pinned(
   p: Loaded,
 ) -> Unit / {fs.write_file[cwd], fs.write_file[abs]} =
   if unchanged(existing, p.pins) { () } else {
-    let text = bytes_of_string(lock::text(existing, p.pins));
-    if r.label == "cwd" { fs.write_file[cwd](lock::path_of(r), text) }
-    else { fs.write_file[abs](lock::path_of(r), text) };
+    write_file(lock::path_of(r), bytes_of_string(lock::text(existing, p.pins, [])));
     ()
   }
 
@@ -568,25 +582,6 @@ fn resolved_root(flags: Flags) -> Resolved =
   match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
 
 // --- A library ----------------------------------------------------------------------
-
-// One module's source, framed as `module <name> <length>` and its bytes: the front end's own
-// framing, so a reader of the container is a reader of the dump.
-fn source_frame(f: File) -> Bytes =
-  bytes_concat_all([
-    b"module ",
-    bytes_of_string(f.module),
-    b" ",
-    bytes_of_string(int_to_string(bytes_len(f.text))),
-    b"\n",
-    f.text,
-  ])
-
-fn library_sections(files: List<File>, manifest: Bytes, unit: Compiled) -> List<Section> =
-  [
-    { name: b"sources", count: len(files), payload: bytes_concat_all(map(files, source_frame)) },
-    { name: b"manifest", count: 1, payload: manifest },
-    { name: b"unit", count: unit.count, payload: unit.payload },
-  ]
 
 fn member(xs: List<String>, x: String) -> Bool =
   fold(xs, false, |found: Bool, y: String| found || y == x)
@@ -602,10 +597,11 @@ fn library_output(flags: Flags, name: String) -> String =
 fn library(
   s: Style,
   flags: Flags,
+  loaded: Program,
   p: Loaded,
+  defs: List<Def>,
   refused: Diag,
-) -> Answer / {builder.git[vcs], builder.stored[build], builder.unit[build], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} = {
-  let loaded: Program = load_program(flags.paths);
+) -> Answer / {builder.stored[build], builder.unit[build], fs.write_file[cwd], fs.write_file[abs]} =
   match loaded.whole {
     // The load behind this report found no entry point; a package that cannot be read keeps that.
     None -> reported(s, "build", [refused], p.places),
@@ -613,7 +609,31 @@ fn library(
       // An anonymous directory is not a library: there is no package to write down.
       None -> reported(s, "build", [refused], p.places),
       Some(m) -> if m.entry != None { reported(s, "build", [refused], p.places) }
-      else { library_writing(s, flags, p, loaded, w, m) },
+      else { library_writing(s, flags, p, loaded, defs, m) },
+    },
+  }
+
+/// A library's archive, sealed, with what a report says of it: the definitions its unit compiled.
+pub type Packed = { own: List<Def>, unit: Compiled, x: Sealed }
+
+/// The archive a library ships as: what `ply build` writes and `ply publish` uploads, one function
+/// so the two are the same bytes.
+pub fn packed(loaded: Program, defs: List<Def>) -> Result<Packed, Refusal> / {builder.unit[build]} = {
+  let owned = map(loaded.files, |f: File| f.module);
+  let own = filter(defs, |d: Def| member(owned, d.module));
+  match builder.unit[build](map(own, |d: Def| d.name)) {
+    Err(why) -> Err(why),
+    Ok(compiled) -> {
+      let manifest = match loaded.pkgs.manifest { Some(text) -> text, None -> b"" };
+      let container = encode_named(
+        library_magic(),
+        compiled.head,
+        plyz::sections(loaded.files, manifest, compiled),
+      );
+      match sealed_at(container, library_domain()) {
+        Err(why) -> Err(why),
+        Ok(x) -> Ok({ own: own, unit: compiled, x: x }),
+      }
     },
   }
 }
@@ -623,42 +643,25 @@ fn library_writing(
   flags: Flags,
   p: Loaded,
   loaded: Program,
-  w: Whole,
+  defs: List<Def>,
   m: Manifest,
-) -> Answer / {builder.stored[build], builder.unit[build], fs.write_file[cwd], fs.write_file[abs]} = {
-  let owned = map(loaded.files, |f: File| f.module);
-  let own = filter(p.defs, |d: Def| member(owned, d.module));
-  match builder.unit[build](map(own, |d: Def| d.name)) {
+) -> Answer / {builder.stored[build], builder.unit[build], fs.write_file[cwd], fs.write_file[abs]} =
+  match packed(loaded, defs) {
     Err(why) -> reported(s, "build", why.diags, p.places),
-    Ok(compiled) -> {
-      let container = encode_named(
-        library_magic(),
-        compiled.head,
-        library_sections(
-          loaded.files,
-          match loaded.pkgs.manifest { Some(text) -> text, None -> b"" },
-          compiled,
-        ),
-      );
-      match sealed_at(container, library_domain()) {
-        Err(why) -> refused(s, "build", why.diags, why.places),
-        Ok(x) -> {
-          let out = library_output(flags, m.name);
-          match builder.stored[build](out, x.bytes) {
-            Err(why) -> reported(s, "build", why.diags, p.places),
-            Ok(_) ->
-              {
-                json: library_json(p, m, own, compiled, x, out),
-                lines: library_lines(s, m, len(loaded.files), own, compiled, x, out),
-                errs: [],
-                code: ok_code(),
-              },
-          }
-        },
+    Ok(k) -> {
+      let out = library_output(flags, m.name);
+      match builder.stored[build](out, k.x.bytes) {
+        Err(why) -> reported(s, "build", why.diags, p.places),
+        Ok(_) ->
+          {
+            json: library_json(p, m, k.own, k.unit, k.x, out),
+            lines: library_lines(s, m, len(loaded.files), k.own, k.unit, k.x, out),
+            errs: [],
+            code: ok_code(),
+          },
       }
     },
   }
-}
 
 fn library_lines(
   s: Style,
@@ -703,40 +706,6 @@ fn library_json(
     { key: "diagnostics", value: all_to_json([], p.places) },
   ])
 
-/// A library's sources section is each module's own framing: `module <name> <length>` and the
-/// bytes, so a reader of the container reads the same shape the front-end dump writes.
-test "a library frames every module's source under its name" {
-  let first: File = {
-    path: "core.ply",
-    module: "core",
-    text: b"pub fn double(n: Int) -> Int = n * 2\n",
-  };
-  let second: File = {
-    path: "math.ply",
-    module: "math",
-    text: b"pub fn half(n: Int) -> Int = n / 2\n",
-  };
-  assert_eq(
-    source_frame(first),
-    bytes_concat_all([b"module core 37\n", b"pub fn double(n: Int) -> Int = n * 2\n"]),
-  );
-  let sections = library_sections([first, second], b"manifest text", {
-    head: a_head(),
-    count: 1,
-    payload: b"unit",
-  });
-  assert_eq(len(sections), 3);
-  assert_eq(nth(sections, 0).name, b"sources");
-  assert_eq(nth(sections, 0).count, 2);
-  assert_eq(nth(sections, 1).name, b"manifest");
-  assert_eq(nth(sections, 1).payload, b"manifest text");
-  assert_eq(nth(sections, 2).name, b"unit");
-  assert_eq(nth(sections, 2).payload, b"unit")
-}
-
-fn nth<a>(xs: List<a>, i: Int) -> a =
-  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
-
 // --- Tests ------------------------------------------------------------------
 
 fn a_def(name: String, simple: String, module: String, arity: Int) -> Def =
@@ -756,7 +725,6 @@ fn a_main() -> Main = { name: "m.main", module: "m", path: "m.ply", at: nowhere(
 fn a_load() -> Loaded =
   {
     root: "/p",
-    defs: some_defs(),
     mains: [a_main()],
     modules: [{ name: "m", path: "m.ply", at: nowhere() }],
     places: [],
@@ -835,17 +803,42 @@ test "a simple name two modules declare says which two" {
   }
 }
 
-test "a schema the program does not declare stops the build, and names both flags" {
-  let flags: Flags = { ..no_flags(), config_schema: Some("m.absent") };
-  match startup_of(a_load(), flags) {
+fn a_whole() -> Whole = {
+  let src = b"type Key = { name: String }\ntype ConfigSpec = { keys: List<Key> }\npub fn spec() -> ConfigSpec = { keys: [] }\nfn main() -> Int = 1\nfn serve(port: Int) -> Int = port\n";
+  match analyse(parse_all([{ name: b"m", src: src }])) {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(w) -> w,
+  }
+}
+
+test "the definitions `--entry` may name are the program's own, as written, with their arity" {
+  assert_eq(map(defs_of(a_whole()), |d: Def| (d.name, d.simple, d.module, d.arity)), [
+    ("m.spec", "spec", "m", 0),
+    ("m.main", "main", "m", 0),
+    ("m.serve", "serve", "m", 1),
+  ])
+}
+
+test "a schema is resolved as a run resolves it, and one that is not stops the build" {
+  match startup_of(a_whole(), { ..no_flags(), config_schema: Some("m.absent") }) {
     Ok(_) -> panic("a schema nothing declares cannot ship"),
     Err(d) -> {
-      assert_eq(d.code, b"E0101");
-      assert(string_contains(string_of_bytes_lossy(d.message), "`--config-schema m.absent`"))
+      assert_eq(d.code, b"E0440");
+      assert_eq(d.message, b"`--config-schema m.absent` names no definition in this program");
+      assert_eq(d.notes_text, [b"this program has: m.spec"])
     },
   };
-  assert_eq(startup_of(a_load(), { ..no_flags(), config_schema: Some("spec") }), Ok(["m.spec"]));
-  assert_eq(startup_of(a_load(), no_flags()), Ok([]))
+  // The artifact is run with the flag it was built with, so a simple name is no more a schema here.
+  match startup_of(a_whole(), { ..no_flags(), config_schema: Some("spec") }) {
+    Ok(_) -> panic("a simple name is not the name a run takes"),
+    Err(d) -> assert_eq(d.code, b"E0440"),
+  };
+  match startup_of(a_whole(), { ..no_flags(), config_schema: Some("m.serve") }) {
+    Ok(_) -> panic("a function that takes an argument is no schema"),
+    Err(d) -> assert_eq(d.code, b"E0440"),
+  };
+  assert_eq(startup_of(a_whole(), { ..no_flags(), config_schema: Some("m.spec") }), Ok(["m.spec"]));
+  assert_eq(startup_of(a_whole(), no_flags()), Ok([]))
 }
 
 test "a rename adds a name and drops one without changing a body" {
@@ -906,7 +899,17 @@ test "the diff reads as three rows, a tally, and what a change is reached by" {
   ])
 }
 
-// The run's own answer, over a build the test hands it in place of the Rust side.
+// A program the fixture never loads: the Rust side's answer, which the test hands in, is the load.
+fn no_program() -> Program =
+  {
+    files: [],
+    places: [],
+    diags: [],
+    whole: None,
+    pkgs: { root: b"", manifest: None, supplied: [] },
+  }
+
+// The build's own answer, over a load the test hands it in place of the Rust side.
 fn answered_over(
   flags: Flags,
   p: Result<Loaded, Refusal>,
@@ -915,9 +918,9 @@ fn answered_over(
   put: Result<Unit, Refusal>,
 ) -> Answer =
   handle {
-    run(flags)
+    built_over(style_of(flags), flags, no_program(), some_defs(), Ok([]), no_front())
   } with {
-    builder.loaded[build](root) -> p,
+    builder.loaded[build](root, front) -> p,
     builder.made[build](entry, startup, reaches) -> m,
     builder.previous[build](diff) -> was,
     builder.stored[build](path, body) -> put,
@@ -930,13 +933,6 @@ fn answered_over(
     fs.write_file[abs](path, body) -> true,
     // A library's path is only reached by a test that means it: the fixture is a program.
     builder.unit[build](names) -> no_unit(names),
-    builder.git[vcs](root, key) -> Err(nothing()),
-    fs.kind[cwd](path) -> Missing,
-    fs.kind[abs](path) -> Missing,
-    fs.list_dir[cwd](path) -> None,
-    fs.list_dir[abs](path) -> None,
-    fs.list_dir[shelf](path) -> None,
-    fs.read_file[shelf](path) -> None,
   }
 
 // The fixture has no library to compile: a test that asks for a unit is asking about a path the
@@ -1066,6 +1062,38 @@ test "a refusal after the load is exit 2 with no tally, and writes no file" {
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, []);
   assert_eq(answer.errs, ["Error[E0502]: could not write `dist/m.plyx`"])
+}
+
+test "a stamp lands where `--stamp` resolved, and one that cannot be written fails the build" {
+  let built: Answer = { json: Null, lines: ["   built m.main"], errs: [], code: ok_code() };
+  let gate: Rooted = { label: "abs", path: "srv/gate" };
+  let flags: Flags = { ..no_flags(), stamp: Some(gate) };
+  let landed = handle {
+    stamped(plain(), flags, a_load(), built)
+  } with {
+    env.shipped_digest[sys]() -> "b3:shipped",
+    fs.write_file[cwd](path, body) -> panic("a stamp under `abs` is written under `abs`"),
+    fs.write_file[abs](path, body) -> path == "srv/gate" && body == b"b3:shipped\n",
+  };
+  assert_eq(landed, built);
+  let refused = handle {
+    stamped(plain(), flags, a_load(), built)
+  } with {
+    env.shipped_digest[sys]() -> "b3:shipped",
+    fs.write_file[cwd](path, body) -> panic("a stamp under `abs` is written under `abs`"),
+    fs.write_file[abs](path, body) -> false,
+  };
+  assert_eq(refused.code, 2);
+  assert_eq(refused.lines, []);
+  assert_eq(at(refused.errs, 0, ""), "Error[E0502]: could not write `/srv/gate`");
+  let unasked = handle {
+    stamped(plain(), no_flags(), a_load(), built)
+  } with {
+    env.shipped_digest[sys]() -> panic("no stamp was asked for"),
+    fs.write_file[cwd](path, body) -> panic("no stamp was asked for"),
+    fs.write_file[abs](path, body) -> panic("no stamp was asked for"),
+  };
+  assert_eq(unasked, built)
 }
 
 test "an entry point the flags name badly stops the build before anything is made" {

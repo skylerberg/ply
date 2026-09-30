@@ -5,11 +5,10 @@
 //!
 //! Colour is decided here and nowhere else: a program has no terminal to ask.
 
-use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, codes};
+use ply_eval::{Diagnostic, Symbol, Value, codes};
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -49,8 +48,6 @@ fn registration(op: &str, path: &'static str) -> HostOp {
         path,
     }
 }
-
-use ply_span::Symbol;
 
 struct Site {
     version: String,

@@ -4,16 +4,19 @@
 
 import args (Flags, from_argv, style_of)
 import claims
-import program (Front, Timed, front_of, timed_load)
-import claims (Broken, Options, prover, Accepted, Claim, Collection, Discharged, Row, Verdicts,
-               a_claim, a_counter, a_place, also, claim_rows, code_of, coverage_json,
-               coverage_lines, decided, detail_of, diagnostics_of, failure, label_of, laws_in,
-               mark_of, nth, num, obligation_json, a_plan, once_each, outcome_word, pad_right,
-               plan_json, proved, refusal, rows_of)
+import program (Front, Timed, front_of, is_shipped, no_front, timed_load, timed_uncached)
+import proof.world (Built, World, world_of)
+import claims (Broken, Options, prover, Accepted, Claim, Claimed, Collected, Collection, Discharged,
+               Row, Verdicts, a_claim, a_counter, a_place, also, claim_rows, claimed_part, code_of,
+               collected_part, collection_of, coverage_json, coverage_lines, decided, detail_of,
+               diagnostics_of, failure, label_of, laws_in, mark_of, no_world, nth, num,
+               obligation_json, a_plan, once_each, outcome_word, own_claims, pad_right, plan_json,
+               proved, refusal, rows_of)
 import proof.obligation (Change, Changed, Changes, Coverage, Def, Ensures, Fresh, Gap, Moved, Never,
                          Outcome, Record, Refuted, Tier, Unattempted, Unchanged, UnhandledEffect,
                          record_map, records, review)
 import builder (builder)
+import cache (store)
 import std.fs (fs)
 import std.time (time)
 import compiler.resolve (Diag)
@@ -170,7 +173,10 @@ fn change_json(e: Change, rows: List<Row>, places: List<Place>) -> Json =
       key: "obligations",
       value: Array(
         fold(e.obligations, [], |acc: List<Json>, index: Int|
-          match at(rows, index) { None -> acc, Some(r) -> push(acc, obligation_json(r, places)) }),
+          match at(rows, index) {
+            None -> acc,
+            Some(r) -> push(acc, obligation_json(r, places, false)),
+          }),
       ),
     },
   ])
@@ -271,7 +277,7 @@ fn changed_answer(
   s: Style,
   c: Collection,
   use_cache: Bool,
-) -> Answer / {prover.discharged[claims], prover.record[claims], prover.baselines[claims], prover.outcomes[claims], prover.typed[claims]} = {
+) -> Answer / {prover.discharged[claims], prover.record[claims], prover.baselines[claims], prover.outcomes[claims]} = {
   let wanted = all_of(c.claims);
   match decided(c, wanted, use_cache) {
     Err(why) -> refusal(s, "review", why),
@@ -292,39 +298,46 @@ fn changed_answer(
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.baselines[claims], prover.accepted[claims], prover.outcomes[claims], prover.typed[claims]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.baselines[claims], prover.accepted[claims], prover.outcomes[claims], store.known[cache], store.file[cache]} = {
   let s: Style = style_of(flags);
-  let t: Timed = timed_load(flags.paths);
+  let t: Timed = if options.no_incremental { timed_uncached(flags.paths) }
+  else { timed_load(flags.paths) };
   match t.program.whole {
     // A load refusal is the same kind of answer the machine's own refusals are, so it
     // reads through the one renderer: nothing was proved, and the diagnostics say why.
     None -> refusal(s, "review", Broken({ diags: t.program.diags, places: t.program.places })),
-    Some(w) -> review_over(s, flags, options, front_of(t, w)),
+    Some(w) -> {
+      // The shipped modules' claims are the toolchain's, unless the run asks for them too.
+      let built: Built = world_of(w, |m: Bytes|
+        options.std || !is_shipped(string_of_bytes_lossy(m)));
+      review_over(s, flags, options, front_of(t, w), built.world, own_claims(w, built))
+    },
   }
 }
 
-// The review itself, over the front end `run` loaded.
+// The review itself, over the front end `run` loaded and the claims it built from it.
 fn review_over(
   s: Style,
   flags: Flags,
   options: Options,
   front: Front,
-) -> Answer / {prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.baselines[claims], prover.accepted[claims], prover.outcomes[claims], prover.typed[claims]} = {
-  prover.configure[claims](options, front);
+  world: World,
+  mine: Claimed,
+) -> Answer / {prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.baselines[claims], prover.accepted[claims], prover.outcomes[claims]} = {
+  prover.configure[claims](options, front, world);
   match prover.collected[claims]() {
     Err(why) -> refusal(s, "review", why),
     // What a reader accepts is every definition's claims as they stand now.
-    Ok(c) -> if flags.action == "accept" {
-      accepted_answer(s, c, prover.accepted[claims](records(c.defs, laws_in(c))))
-    } else { changed_answer(s, c, !options.no_cache) },
+    Ok(got) -> {
+      let c = collection_of(got, mine);
+      if flags.action == "accept" {
+        accepted_answer(s, c, prover.accepted[claims](records(c.defs, laws_in(c))))
+      } else { changed_answer(s, c, !options.no_cache) }
+    },
   }
 }
 
 // --- Tests ------------------------------------------------------------------
-
-/// The front end a test's run is handed: these tests read what a report says about a run it was
-/// given, so nothing loads, and the record exists only because the effect takes one.
-fn no_front() -> Front = { dump: b"", files: [], packages: [], read_ms: 0, front_ms: 0 }
 
 // One definition per claim's owner, each carrying no spec of its own.
 fn a_collection(cs: List<Claim>) -> Collection =
@@ -332,6 +345,7 @@ fn a_collection(cs: List<Claim>) -> Collection =
     places: [a_place()],
     warnings: [],
     claims: cs,
+    decls: [],
     defs: map(cs, |c: Claim| { name: c.owner, hash: Some(c.key), specs: [] }),
     laws: [],
     plan: a_plan(),
@@ -343,6 +357,7 @@ fn covering(definitions: Int) -> Coverage =
 fn verdicts(outcomes: List<Outcome>, definitions: Int) -> Verdicts =
   {
     outcomes: outcomes,
+    reaches: None,
     reasons: map(outcomes, |o: Outcome| Fresh),
     coverage: covering(definitions),
     cached: 0,
@@ -383,13 +398,18 @@ fn ran_over(
   a: Accepted,
 ) -> Answer =
   handle {
-    review_over(style_of(flags), flags, claims::no_options(), no_front())
+    review_over(
+      style_of(flags),
+      flags,
+      claims::no_options(),
+      no_front(),
+      no_world(),
+      claimed_part(c),
+    )
   } with {
-    prover.configure[claims](options, front) -> (),
-    prover.collected[claims]() -> Ok(c),
+    prover.configure[claims](options, front, world) -> (),
+    prover.collected[claims]() -> Ok(collected_part(c)),
     prover.outcomes[claims](keys) -> map(keys, |_k: String| None),
-    // A fixture's types are not what a run measures: no domain, so every claim samples.
-    prover.typed[claims]() -> Ok({ decls: [], claims: [] }),
     prover.discharged[claims](choice) -> Ok(d),
     prover.record[claims](entries) -> [],
     prover.baselines[claims]() -> held,
