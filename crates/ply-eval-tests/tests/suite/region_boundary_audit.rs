@@ -201,18 +201,21 @@ fn a_constant_the_seam_refuses_keeps_no_continuation_for_the_next_entry() {
         .expect("the test parks and resumes a continuation of its own");
 }
 
-/// A closure's type does not mention the task it captures, so `spawned`'s task reaches its answer
-/// past the checker.
-const CAPTURED: &str = r#"
-fn spawned() -> () -> Int / {task.join} = simulate {
-  let t = task.spawn(|| 1);
-  || task.join(t)
-}
+/// A callback's row is its caller's to choose, so the `simulate` region that hands it a task cannot
+/// see the task stored in an older cell, and `spawned`'s task reaches its answer past the checker.
+const HANDED: &str = r#"
+fn simulated<| e>(on: (Task<Int>) -> Unit / e) -> Unit / {sim.read | e} =
+  simulate { on(task.spawn(|| 1)) }
+
+fn spawned() -> Option<Task<Int>> = with_cell[slot](None) { kept -> {
+  simulated(|t: Task<Int>| cell_set(kept, Some(t)));
+  cell_get(kept)
+} }
 "#;
 
 #[test]
 fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
-    let compiled = Compiled::new(CAPTURED);
+    let compiled = Compiled::new(HANDED);
     let (mut machine, tier) = compiled.machine_and_tier();
 
     let d = machine
