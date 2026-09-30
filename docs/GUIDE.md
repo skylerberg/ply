@@ -1156,6 +1156,7 @@ pub nondet effect net {
   write recv[s](conn: Int, max: Int, timeout_ms: Int) -> Option<Bytes>
   write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
   write close[s](socket: Int) -> Unit
+  read  local_port[s](socket: Int) -> Option<Int>
 }
 pub fn drain<[l]>(c: Int, so_far: Bytes, timeout_ms: Int) -> Bytes / {net.recv[l]}
 pub fn send_all<[l]>(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.send[l]}
@@ -1174,7 +1175,10 @@ itself is left to the first `send` or `recv`, so a peer that connects and says
 nothing costs nothing; `handshake` completes it there and then and answers what
 it took in microseconds, which is what a program that times a connection wants
 (`None` for a connection with none to complete: a plaintext one, or a session
-whose handshake failed, which ends it).
+whose handshake failed, which ends it). `local_port` answers the port a socket
+is bound to on its own end — for a listener asked for port `0`, the one it was
+given, so a server can listen anywhere free and say where — and `None` for a
+listener the drain has closed.
 
 ### 13.2 `std.http` — HTTP/1.1
 
@@ -1333,6 +1337,10 @@ records with `Sink` and `event_step`, `enter_step`, `exit_step`, `count_step`,
 pub type Var = { name: String, value: String }
 pub type Ended = Exited(Int) | Signalled(Int)
 pub type Finished = { ended: Ended, out: Bytes, err: Bytes }
+pub type Output = Keep | Discard | Inherit | Lines | File(String)
+pub type Io = { input: Bool, out: Output, err: Output }
+pub type Signal = Hangup | Interrupt | Terminate | Kill
+pub type Heard = Said(String) | Quiet | Closed
 
 pub nondet effect process {
   read  args[p]()             -> List<String>
@@ -1341,6 +1349,12 @@ pub nondet effect process {
   write line[p]()             -> Option<String>
   write exit[p](code: Int)    -> Unit
   write spawn[e](args: List<String>, dir: String, env: List<Var>) -> Finished
+  write start[e](args: List<String>, dir: String, env: List<Var>, io: Io) -> Result<Int, String>
+  write wait[e](child: Int, timeout_ms: Int)        -> Option<Finished>
+  write signal[e](child: Int, signal: Signal)       -> Bool
+  write input[e](child: Int, bytes: Bytes)          -> Bool
+  write end_input[e](child: Int)                    -> Unit
+  write output_line[e](child: Int, timeout_ms: Int) -> Heard
 }
 ```
 
@@ -1350,12 +1364,13 @@ line, `line` reads one line of the program's standard input without its line
 ending and answers `None` at end of input (a `write`, because each line is
 consumed and two readers of one input race for it), and `exit` ends the program
 there: nothing after it runs, no value is
-printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). It is
-bound only by `ply run --host`; `ply test` withholds it, even with `--host`
-(`E0424`), except for `spawn` under `ply test --host --exec`. Under
-`ply run --json` the lines `out` writes go to stderr, so stdout still carries
-the one object. Handle it over a `Captured` value: `captured(args)`,
-`args_step`, `out_step`, `err_step`, `line_step` and `exit_step` keep each line,
+printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). These
+are bound only by `ply run --host`; `ply test` withholds them, even with
+`--host` (`E0424`). The operations whose label is an executable — `spawn`,
+`start` and those on a started child — are bound by `ply test --host` too, for
+the labels `--exec` names. Under `ply run --json` the lines `out` writes go to
+stderr, so stdout still carries the one object. Handle it over a `Captured`
+value: `captured(args)`, `args_step`, `out_step`, `err_step`, `line_step` and `exit_step` keep each line,
 hand out `with_input`'s scripted input lines, and the first exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
 ends the handled body as the host would.
 
@@ -1369,10 +1384,10 @@ a program, so the run decides what a footprint's `process.spawn[cc]` may do.
 `args` is the argument vector after the program; `dir` is the working
 directory, and `""` is the run's own. `env` is the *whole* environment: a spawn
 inherits none of the run's, so what the child reads is in the program's text and
-its configuration rather than in the shell that started `ply`. Both streams are
-captured whole — Ply has no file handles, so there is no streaming and no
-interleaving of the two — and a stream over 64MiB is `E0458`. A spawned program's standard input
-is empty; the run's own is what `line` reads.
+its configuration rather than in the shell that started `ply`. A spawn captures
+both streams whole, and a stream over 64MiB is `E0458`; its standard input is
+empty, and the run's own is what `line` reads. A program that reads a child as it
+runs, writes to it or stops it starts it instead.
 `Exited(code)` is the program's own answer and `Signalled(n)` the signal that
 killed it; neither is a diagnostic, because what a compiler says about a source
 file is a value the driver reads. The label is the capability and nothing
@@ -1382,6 +1397,52 @@ hands out planned `Finished` values in order and records each `Launch`; a spawn
 with no reply planned answers `Exited(127)`, as a shell does for a command it
 could not run. Build replies with `exited(code, out, err)` and
 `signalled(signal, out, err)`, and read one back with `exit_code`.
+
+`start` launches a child beside the program, by the same label, `dir` and `env`
+rules, and answers its handle — an `Int`, as a socket's is — or `Err` with why
+it could not start, such as a missing directory or a `File` that cannot be
+opened. With `io.input` the program writes the child's input: `input` answers
+`false` once that input is closed, by `end_input` or by the child, or once the
+child has ended; without it the input is empty and `input` always answers
+`false`. Each output stream goes where its `Output` says. `Keep` holds it for
+`wait`, drained as the child writes, so a chatty child never blocks on a full
+pipe. `Lines` hands it over a line at a time: `output_line` answers `Said(line)`
+from any `Lines` stream in the order the host read them, without the line's
+`\n` or `\r\n` and with anything not UTF-8 read as U+FFFD, `Quiet` when the
+timeout passes first, and `Closed` once every `Lines` stream has ended and each
+line has been read — at once for a child with none. `Inherit` writes where the
+program's own `out` and `err` do, `Discard` drops it, and `File(path)` writes it
+to `path`, relative to `dir`, from empty; one path named for both streams is
+shared, as `2>&1` shares it. What the host holds of a stream, kept or unread, is
+bounded at 64MiB: the excess is dropped, and the next `wait` or `output_line` is
+`E0458`.
+
+`wait` answers `Some(Finished)` once the child has ended and every stream the
+host holds has reached its end — a grandchild that keeps one open keeps `wait`
+waiting — with a `Keep` stream whole and a `Lines` stream's unread lines. It
+reaps the child, and the handle is spent. It answers `None` when the timeout
+passes first; a negative timeout, here and in `output_line`, waits for as long
+as it takes. `signal` delivers `SIGHUP`, `SIGINT`, `SIGTERM` or `SIGKILL` and
+answers `false` when the child had already ended. None of these stops the
+machine while it waits. A handle `start` never answered, one already waited on,
+and one used under another label than it was started under are each `E0502`.
+
+No child outlives the run that started it. However the run ends — its entry
+returns, `exit`, a raise, a drain that ran out of time, a second `SIGINT` or
+`SIGTERM` — every child still running is killed with `SIGKILL` and reaped by
+the host, so a program that stops what it started does so for its own reasons,
+not to avoid a leak.
+
+Handle the children over a `Children` value: `children(planned)` hands each
+`start` the next planned `Script` — `script(polls, finished, heard)`: how many
+`wait`s find the child running, the `Finished` the next one answers, and what
+`output_line` hears in order, `Closed` once that runs out — and a start with
+none planned answers `Err`. `start_step`, `wait_step`, `signal_step`,
+`input_step` and `output_line_step` each answer an `Answered` of the twin and
+what the host would have said, `end_input_step` answers the twin, and each
+`Child` records its launch, the bytes written to it, whether its input is open
+and the signals it was sent. A `Kill` ends a scripted child, so the next `wait` hands it back, and
+a spent or unknown handle panics, as the host refuses one.
 
 ### 13.10 `std.time`
 
@@ -2139,8 +2200,8 @@ always runs and is never cached. An operation performed inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
-test run binds `process.spawn` for the labels `--exec` names. All flags below
-require `--host`.
+test run binds `process.spawn`, `process.start` and the operations on a started
+child for the labels `--exec` names. All flags below require `--host`.
 
 `ply hosts` lists every bindable operation (`effect.op[resource]`: one row per
 operation and label some row of the program names, where a written mode atom
@@ -2155,8 +2216,8 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
-| `--exec NAME=PATH` | repeatable program a `process.spawn` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect the family lends: `machine`, `tester`, `builder` and `edit` lend the effect of their name, `claims` lends `prover`, `cache` `store`, `bootstrap` `archive` and `hosts` `tcb` (`ply run`, `ply test`); `E0459` otherwise |
+| `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `cache` (`store`), `bootstrap` (`archive`), `hosts` (`tcb`) or `edit` (`ply run`, `ply test`); `E0459` otherwise |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -2427,7 +2488,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0453` | read over the bound |
 | `E0454` | `--fs` root that is not a directory |
 | `E0455` | the program asked to exit with a code |
-| `E0456` | `process.spawn` label with no executable bound |
+| `E0456` | `process.spawn` or `process.start` label with no executable bound |
 | `E0457` | `--exec` path that cannot be executed |
 | `E0458` | captured output over the bound |
 | `E0459` | `--allow` family the program does not declare |

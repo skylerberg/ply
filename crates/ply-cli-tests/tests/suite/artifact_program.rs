@@ -36,7 +36,10 @@ fn the_corpus_tree_is_a_package_over_the_cli() {
     assert_eq!(
         loaded.front.packages,
         vec![
-            ("corpus".to_string(), vec!["cli".to_string()]),
+            (
+                "corpus".to_string(),
+                vec!["cli".to_string(), "suite".to_string(), "proof".to_string()]
+            ),
             (
                 "cli".to_string(),
                 vec!["suite".to_string(), "proof".to_string()]
@@ -46,8 +49,8 @@ fn the_corpus_tree_is_a_package_over_the_cli() {
             ("std".to_string(), Vec::new()),
             ("compiler".to_string(), vec!["std".to_string()]),
         ],
-        "the corpus tree's ply.pkg names it the `corpus` package over the CLI's, which is over the \
-         suite and the prove package"
+        "the corpus tree's ply.pkg names it the `corpus` package over the CLI's and the two packages \
+         it reads as the CLI does, the suite and the prove package"
     );
 }
 

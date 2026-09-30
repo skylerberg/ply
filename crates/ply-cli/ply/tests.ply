@@ -28,10 +28,11 @@ import suite.schedule (Atom, Counts, contends_only_over_regions, counts, group_b
 // The keys a mixture's result is filed under are the suite's, like every other test result's.
 import suite.keys (mixture_key)
 // What decides a cause: the change set, the search over it, and the verdict it reaches.
-import suite.bisect (Auto, Bisection, Budget, Mode, NotAttempted, NotRequested, SearchStats,
-                     Skipped, Trial, confidence_word, is_conclusive, mode_parse, skipped_word,
-                     verdict_skipped, verdict_word)
-import suite.delta (Delta, DefKey, Edited, Facts, classified, flipped_keys, kind_word, ns_word)
+import suite.bisect (Auto, Bisection, Budget, Mode, NoBodies, NotAttempted, NotRequested,
+                     SearchStats, Skipped, Trial, a_failure, a_pass, confidence_word, is_conclusive,
+                     mode_parse, skipped_word, verdict_skipped, verdict_word)
+import suite.delta (Delta, DefKey, Edited, Facts, Value, classified, flipped_keys, kind_word,
+                    ns_word)
 import suite.diagnose (Attribution, Evidence, Suspect, diagnose)
 import suite.select
 import suite.select (Cached, Decision, New, Nondet, PreviousFailure, Reason, Row, Search, Unhashed,
@@ -1260,19 +1261,17 @@ fn case_json(r: Ran, c: Case, d: Decided) -> Json =
     // Whether this test reaches the binding, and so always runs uncached.
     { key: "host", value: Bool(covers(r.reaches, c.index)) },
     { key: "shared_atoms", value: strings(shared_texts(c)) },
-    // The same atoms unprinted, as a scheduler compares them.
-    {
-      key: "contends",
-      value: Array(
-        map(shared(atoms_of(c)), |a: Atom|
-          object([
-            { key: "effect", value: Str(a.effect) },
-            { key: "resource", value: Str(a.resource) },
-            { key: "writes", value: Bool(a.writes) },
-          ])),
-      ),
-    },
+    // The same atoms unprinted, as the scheduler compares them, and whether the test is handed a
+    // seed: what a program re-colouring the run needs, without parsing a printed atom.
+    { key: "contends", value: Array(map(shared(atoms_of(c)), atom_json)) },
     { key: "seeded", value: Bool(c.seeded) },
+  ])
+
+fn atom_json(a: Atom) -> Json =
+  object([
+    { key: "effect", value: Str(a.effect) },
+    { key: "resource", value: Str(a.resource) },
+    { key: "writes", value: Bool(a.writes) },
   ])
 
 fn group_json(d: Decided, i: Int) -> Json = {
@@ -1704,7 +1703,7 @@ fn tests_over(
           // The run is over, so the runtime can be asked about mixtures of what it found; every
           // failure's cause is decided here, before anything renders one.
           let r = tester.ran[corpus]();
-          let faults = decided_faults(r, options);
+          let faults = decided_faults(r, diagnosing(options));
           let stored = tester.record[corpus]();
           answered(s, flags, p, { ..r, warnings: appended(r.warnings, stored) }, faults, decided)
         },
@@ -1757,14 +1756,23 @@ fn no_row() -> Row =
 // --- What decided each cause -------------------------------------------------
 
 /// Every failure's cause, decided before anything renders one.
-fn decided_faults(r: Ran, options: Options) -> List<Fault> / {tester.trial[corpus]} =
+fn decided_faults(r: Ran, asked: Diagnosing) -> List<Fault> / {tester.trial[corpus]} =
   flat_map(range(0, len(r.failures)), |i: Int|
-    match list_at(r.failures, i) { None -> [], Some(f) -> [fault_of(f, i, options)] })
+    match list_at(r.failures, i) { None -> [], Some(f) -> [fault_of(f, i, asked)] })
+
+// What this run's flags ask of a cause: the search mode and the trial budget.
+type Diagnosing = { bisect: Mode, budget: Budget }
+
+fn diagnosing(options: Options) -> Diagnosing =
+  {
+    bisect: match mode_parse(options.bisect) { Some(m) -> m, None -> Auto },
+    budget: { max_trials: Some(options.bisect_budget) },
+  }
 
 /// One failure's cause. The gate, the change set, the search over it and the ranking of the
 /// suspects are `suite.diagnose`'s, over the facts the runtime handed over and a closure that asks
 /// it for one mixture at a time.
-fn fault_of(f: Failed, index: Int, options: Options) -> Fault / {tester.trial[corpus]} = {
+fn fault_of(f: Failed, index: Int, asked: Diagnosing) -> Fault / {tester.trial[corpus]} = {
   let diff = match f.search { Some(e) -> Some(classified(e.facts)), None -> None };
   let evidence: Evidence = {
     nondet: match f.nondet { Some(x) -> x, None -> false },
@@ -1773,13 +1781,9 @@ fn fault_of(f: Failed, index: Int, options: Options) -> Fault / {tester.trial[co
     suspects: f.suspects,
     baseline: match f.search { Some(_) -> true, None -> false },
   };
-  let plan = {
-    bisect: match mode_parse(options.bisect) { Some(m) -> m, None -> Auto },
-    budget: { max_trials: Some(options.bisect_budget) },
-  };
   let a: Attribution = diagnose(
     evidence,
-    plan,
+    asked,
     match diff { Some(d) -> Some(d.delta), None -> None },
     match diff { Some(d) -> len(d.unclassified), None -> 0 },
     match diff { Some(d) -> !d.test_unclassified, None -> true },
@@ -2040,6 +2044,70 @@ fn a_fault() -> Fault =
 fn a_suspect(name: String) -> Suspect =
   { name: name, hash: None, before: None, change: None, culprit: false }
 
+// A failure the runtime reports with two edits since its test last passed.
+fn a_failed(defect: Bool, host: Bool, absent: Option<Skipped>) -> Failed =
+  {
+    key: "m.two is two",
+    name: "two is two",
+    diagnostic: a_diag(b"E0501", b"assertion failed", [], []),
+    defect: defect,
+    host: host,
+    search: Some({
+      facts: {
+        own: { name: "m.two is two", before: "01", after: Some("02"), rehashed: Some("01") },
+        rows: [
+          {
+            name: "m.a",
+            ns: Value,
+            before: Some("a1"),
+            after: Some("a2"),
+            rehashed: Some("a2"),
+            stable: None,
+            kept: false,
+            renamed: false,
+            component: [],
+            referrers: [],
+          },
+          {
+            name: "m.b",
+            ns: Value,
+            before: Some("b1"),
+            after: Some("b2"),
+            rehashed: Some("b2"),
+            stable: None,
+            kept: false,
+            renamed: false,
+            component: [],
+            referrers: [],
+          },
+        ],
+      },
+      absent: absent,
+      at: [],
+    }),
+    suspects: [{ name: "m.a", hash: Some("a2") }, { name: "m.b", hash: Some("b2") }],
+    unchanged: false,
+    seed: None,
+    race: None,
+    module: Some("m"),
+    test_hash: None,
+    nondet: Some(false),
+    status: Some("failed"),
+    declared: None,
+  }
+
+// The verdict on one failure, from a runtime whose mixtures fail exactly when they take `m.b`.
+fn caused(f: Failed) -> Bisect =
+  handle {
+    fault_of(f, 0, { bisect: Auto, budget: { max_trials: Some(64) } }).bisect
+  } with {
+    tester.trial[corpus](failure, keys, filed) -> taking_b_fails(keys),
+  }
+
+fn taking_b_fails(keys: List<{ name: String, ns: String }>) -> Trial =
+  if len(filter(keys, |k: { name: String, ns: String }| k.name == "m.b")) > 0 { a_failure() }
+  else { a_pass() }
+
 test "a green run is exit 0, and the head says what was selected of what" {
   let p = a_program([a_case(0, "one"), a_case(1, "two")]);
   let keys = [a_key(0, "one", false, false, false), a_key(1, "two", true, false, false)];
@@ -2095,6 +2163,21 @@ test "a bisection nobody asked for says nothing, and one that failed says why" {
     }),
     ["  no culprit: no baseline to compare"],
   )
+}
+
+test "the runtime's marks decide whether a failure is searched, and a search names the edit" {
+  assert_eq(caused(a_failed(false, false, None)).groups, [["m.b"]]);
+  // A defect in Ply and a run that reached the host are refused before any mixture is tried.
+  let defect = caused(a_failed(true, false, None));
+  assert_eq(defect.skipped, Some("panicked"));
+  assert_eq(defect.search.evaluated, 0);
+  let host = caused(a_failed(false, true, None));
+  assert_eq(host.skipped, Some("host"));
+  assert_eq(host.search.evaluated, 0);
+  // Two edits need a mixture to tell apart, so a store that cannot build one is the reason.
+  let pruned = caused(a_failed(false, false, Some(NoBodies)));
+  assert_eq(pruned.skipped, Some("no_bodies"));
+  assert_eq(pruned.search.evaluated, 0)
 }
 
 test "a test the clock stopped is abandoned rather than judged, and the run is not a success" {
@@ -2229,6 +2312,29 @@ test "the document keys off `command` and `exit_code` and names the schema it pu
   assert(string_contains(text, "\"root\":\"/p\""));
   assert(string_contains(text, "\"duration_ms\":1.5"));
   assert(string_contains(text, "\"reason\":\"new\""))
+}
+
+// The seed a test reads is handed to it alone, so it is no atom another test contends over.
+test "a test's contended atoms are in the document unprinted, beside whether it is seeded" {
+  let c = {
+    ..a_case(0, "one"),
+    atoms: [
+      { atom: { effect: "cell", resource: "users", writes: true }, text: "cell.write[users]" },
+      { atom: { effect: "sim", resource: "", writes: false }, text: "sim.read" },
+    ],
+    seeded: true,
+  };
+  let text = to_string(
+    case_json(a_run([], 0), c, a_decided(a_program([c]), [a_key(0, "one", false, false, false)])),
+  );
+  assert(
+    string_contains(
+      text,
+      "\"contends\":[{\"effect\":\"cell\",\"resource\":\"users\",\"writes\":true}]",
+    ),
+  );
+  assert(string_contains(text, "\"seeded\":true"));
+  assert(string_contains(text, "\"shared_atoms\":[\"cell.write[users]\"]"))
 }
 
 // Everything a reader or an agent needs to act on a failure is in its artifact: what failed, whether

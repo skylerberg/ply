@@ -47,7 +47,7 @@ type Db = { url: Option<String>, pool: Option<Int>, acquire_ms: Option<Int>, sta
 type Config = { set: List<String>, files: List<String>, schema: Option<String> }
 type Trace = { sink: String, level: String }
 type ProveOpts = { cases: Option<Int>, roots: Option<Int>, budget: Option<Int>, shrink_budget: Option<Int>, steps: Option<Int> }
-type SimOpts = { seed: Option<String>, mode: String, seeds: Option<Int>, budget: Option<Int>, steps: Option<Int>, measure_reduction: Bool }
+type SimOpts = { seed: Option<String>, mode: String, roots: Option<{ from: Int, to: Int }>, budget: Option<Int>, steps: Option<Int>, measure_reduction: Bool }
 type Options = {
   path: String,
   no_incremental: Bool,
@@ -138,7 +138,7 @@ fn main(root: String, index: Int, front: Front) -> Answer / {prover.configure[cl
     sim: {
       seed: None,
       mode: "dpor",
-      seeds: None,
+      roots: None,
       budget: None,
       steps: None,
       measure_reduction: false,

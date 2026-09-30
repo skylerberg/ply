@@ -1,17 +1,16 @@
-// The bench: where a `ply test` run's time goes, answered from the product's own reports. Every
-// scenario declares its criterion up front; the report is the verdicts with the numbers attached,
-// beside the harness's own phases (`pipeline`) and what the machine costs in-process (`measure`).
+// The bench: where a `ply test` run's time goes over a generated corpus, answered from the product's
+// own reports. Every scenario is a row that declares its criterion before anything runs, and one more
+// row sets the harness's own walk and read of the tree beside the toolchain's phases (`pipeline`).
 //
 // `dir`, everywhere below, is the corpus's path relative to the working directory: the `work` root
 // the files are read and written through, and the directory `ply` is spawned in.
 
-import cli.machine
-import cli.machine (machine)
-import measure
 import pipeline
+import report
+import report (Row, Measurement, AtMost, holding, number, row, untaken)
 import spine
 import spine (under)
-import std.json (Json, Str, Number, Bool, Null, Object, object, array)
+import std.json (Json, Str, Number, Object, object)
 import std.json
 import std.fs (fs)
 import std.fs
@@ -44,9 +43,9 @@ pub fn corpus_at(dir: String) -> Result<Corpus, String> / {fs.read_file[work]} =
           match map_get(m, key) {
             Some(Object(e)) ->
               Ok({
-                path: str_field(e, "path"),
-                find: str_field(e, "find"),
-                replace: str_field(e, "replace"),
+                path: spine::str_field(e, "path"),
+                find: spine::str_field(e, "find"),
+                replace: spine::str_field(e, "replace"),
                 dependents: spine::int_field(e, "dependents"),
               }),
             _ -> Err("the manifest's `" ++ key ++ "` is not an edit site"),
@@ -64,8 +63,8 @@ pub fn corpus_at(dir: String) -> Result<Corpus, String> / {fs.read_file[work]} =
                   bytes: spine::int_field(m, "bytes"),
                   leaf: leaf,
                   hub: hub,
-                  rename_symbol: str_field(r, "symbol"),
-                  rename_replacement: str_field(r, "replacement"),
+                  rename_symbol: spine::str_field(r, "symbol"),
+                  rename_replacement: spine::str_field(r, "replacement"),
                 }),
               _ -> Err("the manifest carries no `rename`"),
             },
@@ -76,15 +75,10 @@ pub fn corpus_at(dir: String) -> Result<Corpus, String> / {fs.read_file[work]} =
     },
   }
 
-fn str_field(m: Map<String, Json>, key: String) -> String =
-  match map_get(m, key) { Some(Str(s)) -> s, _ -> "" }
-
 // --- Mutations, applied and undone ----------------------------------------------------
 
 pub type Applied = List<{ path: String, text: Bytes }>
 
-// The rename is a whole-corpus textual substitution; the edit is one site, once. Both answer
-// what they changed so the scenario can put it back.
 // Every `.ply` file under the corpus, as a path under the root: the walk `ply test` itself takes.
 pub fn ply_files(dir: String) -> List<String> / {fs.list_dir[work], fs.kind[work]} = walk(dir, [])
 
@@ -103,6 +97,8 @@ fn walk(dir: String, acc: List<String>) -> List<String> / {fs.list_dir[work], fs
         }),
   }
 
+// The rename is a whole-corpus textual substitution; the edit is one site, once. Both answer what
+// they changed so the scenario can put it back.
 pub fn apply_rename(
   dir: String,
   from: String,
@@ -180,7 +176,7 @@ fn occurrences(text: Bytes, find: Bytes) -> Int =
     Some(i) -> 1 + occurrences(bytes_slice(text, i + bytes_len(find), bytes_len(text)), find),
   }
 
-// --- The scenarios ---------------------------------------------------------------------
+// --- The runs -------------------------------------------------------------------------
 
 // The result cache under a corpus root, held whole in memory so restoring it is not measured
 // as disk work.
@@ -239,156 +235,40 @@ pub fn once(
   }
 }
 
-// The scenarios, in order: each resets what it must, repeats, and keeps its fastest run.
-pub fn run(
-  dir: String,
-  repeats: Int,
-) -> Result<spine::Report, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
-  match corpus_at(dir) {
-    Err(why) -> Err(why),
-    Ok(corpus) -> {
-      let cold = go_repeat(dir, repeats, "clear", []);
-      let warm = go_repeat(dir, repeats, "none", []);
-      let rename = mutated_scenario(rename_scenario(), dir, corpus, repeats, "rename");
-      let leaf = mutated_scenario(leaf_scenario(), dir, corpus, repeats, "leaf");
-      let hub = mutated_scenario(hub_scenario(), dir, corpus, repeats, "hub");
-      match cold {
-        Err(e) -> Err(e),
-        Ok(c) -> match warm {
-          Err(e) -> Err(e),
-          Ok(w) -> match rename {
-            Err(e) -> Err(e),
-            Ok(r) -> match leaf {
-              Err(e) -> Err(e),
-              Ok(l) -> match hub {
-                Err(e) -> Err(e),
-                Ok(h) ->
-                  Ok(
-                    report_of(
-                      dir,
-                      corpus,
-                      measure::measure_json(dir, repeats),
-                      pipeline::pipeline_json(dir),
-                      [{ ..cold_scenario(), runs: c }, { ..warm_scenario(), runs: w }, r, l, h],
-                    ),
-                  ),
-              },
-            },
-          },
-        },
-      }
-    },
-  }
-
-// --- Verdicts ------------------------------------------------------------------------------
-
-// The rows and their criteria, judged on each scenario's fastest run.
-fn rows_of(corpus: Corpus, scenarios: List<Scenario>) -> List<spine::Row> =
-  map(scenarios, |s: Scenario| {
-    let best = spine::best_of(s.runs);
-    { name: s.name, criterion: s.criterion, best: best, verdict: (s.judge)(best, corpus) }
-  })
-
-pub type Scenario = {
-  name: String,
-  criterion: String,
-  runs: List<spine::TestReport>,
-  judge: (spine::TestReport, Corpus) -> Result<Unit, String>,
-}
-
-fn cold_scenario() -> Scenario =
-  {
-    name: "cold",
-    criterion: "empty cache: every test runs, and passes",
-    runs: [],
-    judge: |r: spine::TestReport, c: Corpus|
-      if !r.ok { Err("the run failed") } else if r.cached != 0 {
-        Err(int_to_string(r.cached) ++ " were served from a cache that was cleared")
-      } else if r.passed != r.total { Err(int_to_string(r.failed) ++ " failed") }
-      else { Ok(()) },
-  }
-
-fn warm_scenario() -> Scenario =
-  {
-    name: "warm",
-    criterion: "nothing changed: every test is a cache hit",
-    runs: [],
-    judge: |r: spine::TestReport, c: Corpus|
-      if !r.ok { Err("the run failed") } else if r.selected != 0 {
-        Err(int_to_string(r.selected) ++ " ran again though nothing changed")
-      } else { Ok(()) },
-  }
-
-fn rename_scenario() -> Scenario =
-  {
-    name: "rename",
-    criterion: "a rename selects nothing",
-    runs: [],
-    judge: |r: spine::TestReport, c: Corpus|
-      if !r.ok { Err("the run failed") } else if r.selected != 0 {
-        Err(int_to_string(r.selected) ++ " selected by a rename, which no body hash covers")
-      } else { Ok(()) },
-  }
-
-fn leaf_scenario() -> Scenario =
-  {
-    name: "edit-leaf",
-    criterion: "editing a leaf selects what it reaches and no more",
-    runs: [],
-    judge: |r: spine::TestReport, c: Corpus|
-      if !r.ok { Err("the run failed") }
-      else if r.selected == 0 { Err("an edit selected nothing") }
-      else if r.selected * 2 > r.total { Err("a leaf edit re-ran most of the corpus") }
-      else { Ok(()) },
-  }
-
-fn hub_scenario() -> Scenario =
-  {
-    name: "edit-hub",
-    criterion: "a hub edit re-runs at least its dependents' share of the tests",
-    runs: [],
-    judge: |r: spine::TestReport, c: Corpus|
-      if !r.ok { Err("the run failed") } else if r.selected * c.definitions
-          < c.hub.dependents * r.total {
-        Err(
-          "a hub edit re-ran " ++ int_to_string(r.selected) ++ " of " ++ int_to_string(r.total)
-            ++ " tests, under the "
-            ++ int_to_string(c.hub.dependents)
-            ++ " dependent(s) the manifest counts",
-        )
-      } else { Ok(()) },
-  }
-
-// --- The runs -------------------------------------------------------------------------------
-
 fn go_repeat(
   dir: String,
   left: Int,
-  reset: String,
+  clear: Bool,
   acc: List<spine::TestReport>,
 ) -> Result<List<spine::TestReport>, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, fs.list_dir[work], fs.remove[work]} =
   if left <= 0 { Ok(acc) } else {
-    let _ = if reset == "clear" { clear_cache(dir) } else { () };
-    match once(dir) { Err(e) -> Err(e), Ok(r) -> go_repeat(dir, left - 1, reset, push(acc, r)) }
+    let _ = if clear { clear_cache(dir) } else { () };
+    match once(dir) { Err(e) -> Err(e), Ok(r) -> go_repeat(dir, left - 1, clear, push(acc, r)) }
   }
 
-// A scenario with the corpus mutated: the warm cache restored before each repeat, the mutation
-// undone after, so the next scenario starts from the state everyone chose.
-fn mutated_scenario(
-  base: Scenario,
+pub type Mutation = | Rename | Leaf | Hub
+
+// A mutated scenario's runs: the warm cache restored before each repeat, the mutation undone after,
+// so the next scenario starts from the state everyone chose.
+fn mutated(
   dir: String,
   corpus: Corpus,
   repeats: Int,
-  which: String,
-) -> Result<Scenario, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, fs.read[work], fs.write[work]} = {
+  which: Mutation,
+) -> Result<List<spine::TestReport>, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, fs.read[work], fs.write[work]} = {
   let snap = take_snapshot(dir);
-  match apply_mutation(dir, corpus, which) {
+  let applied = match which {
+    Rename -> apply_rename(dir, corpus.rename_symbol, corpus.rename_replacement),
+    Leaf -> apply_edit(dir, corpus.leaf),
+    Hub -> apply_edit(dir, corpus.hub),
+  };
+  match applied {
     Err(e) -> Err(e),
-    Ok(applied) -> {
+    Ok(changed) -> {
       let runs = go_mutation(if repeats < 1 { 1 } else { repeats }, dir, snap, []);
-      undo(applied);
+      undo(changed);
       let _ = restore_snapshot(dir, snap);
-      match runs { Err(e) -> Err(e), Ok(rs) -> Ok({ ..base, runs: rs }) }
+      runs
     },
   }
 }
@@ -404,142 +284,164 @@ fn go_mutation(
     match once(dir) { Err(e) -> Err(e), Ok(r) -> go_mutation(left - 1, dir, snap, push(acc, r)) }
   }
 
-fn apply_mutation(
-  dir: String,
-  corpus: Corpus,
-  which: String,
-) -> Result<Applied, String> / {fs.list_dir[work], fs.kind[work], fs.read_file[work], fs.write_file[work]} =
-  if which == "rename" { apply_rename(dir, corpus.rename_symbol, corpus.rename_replacement) }
-  else if which == "leaf" { apply_edit(dir, corpus.leaf) }
-  else { apply_edit(dir, corpus.hub) }
+// --- The rows -------------------------------------------------------------------------------
 
-// --- The report -------------------------------------------------------------------------------
+// What one scenario's fastest run reported.
+pub fn scenario_measurements(r: spine::TestReport) -> List<Measurement> =
+  [
+    number("wall", r.duration_ms, "ms"),
+    number("tests", r.total, "tests"),
+    number("selected", r.selected, "tests"),
+    number("cached", r.cached, "tests"),
+    number("passed", r.passed, "tests"),
+    number("failed", r.failed, "tests"),
+    number("groups", r.groups, "groups"),
+    number("read", r.read_ms, "ms"),
+    number("front", r.front_ms, "ms"),
+    number("write_back", r.write_back_ms, "ms"),
+  ]
 
-pub fn report_of(
-  dir: String,
-  corpus: Corpus,
-  measured: Json,
-  pipelined: Json,
-  scenarios: List<Scenario>,
-) -> spine::Report = {
-  let rows = rows_of(corpus, scenarios);
-  let rendered = render(dir, corpus, rows);
-  {
-    json: object([
-      { key: "root", value: Str(dir) },
-      { key: "modules", value: Number(decimal_of_int(corpus.modules)) },
-      { key: "definitions", value: Number(decimal_of_int(corpus.definitions)) },
-      { key: "tests", value: Number(decimal_of_int(corpus.tests)) },
-      { key: "source_bytes", value: Number(decimal_of_int(corpus.bytes)) },
-      { key: "ok", value: Bool(all_pass(rows)) },
-      { key: "measure", value: measured },
-      { key: "pipeline", value: pipelined },
-      { key: "scenarios", value: array(map(rows, |row: spine::Row| scenario_json(row))) },
-      { key: "rendered", value: Str(rendered) },
-    ]),
-    rendered: rendered,
+fn cold_row(r: spine::TestReport) -> Row =
+  row(
+    "cold",
+    holding(
+      "empty cache: every test runs, and passes",
+      ["cached", "failed", "passed", "tests"],
+      |vs: List<Decimal>|
+        match vs {
+          [cached, failed, passed, total] -> cached == 0m && failed == 0m && passed == total,
+          _ -> false,
+        },
+    ),
+    scenario_measurements(r),
+  )
+
+fn warm_row(r: spine::TestReport) -> Row =
+  row("warm", AtMost("selected", 0m), scenario_measurements(r))
+
+fn rename_row(r: spine::TestReport) -> Row =
+  row("rename", AtMost("selected", 0m), scenario_measurements(r))
+
+fn leaf_row(r: spine::TestReport) -> Row =
+  row(
+    "edit-leaf",
+    holding(
+      "editing a leaf selects what it reaches and no more",
+      ["selected", "tests"],
+      |vs: List<Decimal>|
+        match vs { [selected, total] -> selected > 0m && selected * 2m <= total, _ -> false },
+    ),
+    scenario_measurements(r),
+  )
+
+// The dependents and the definitions they are a share of are the manifest's, and they are in the row
+// so its verdict is a function of the numbers it shows.
+fn hub_row(c: Corpus, r: spine::TestReport) -> Row =
+  row(
+    "edit-hub",
+    holding(
+      "a hub edit re-runs at least its dependents' share of the tests",
+      ["selected", "tests", "dependents", "definitions"],
+      |vs: List<Decimal>|
+        match vs {
+          [selected, total, dependents, definitions] ->
+            selected * definitions >= dependents * total,
+          _ -> false,
+        },
+    ),
+    push(
+      push(scenario_measurements(r), number("dependents", c.hub.dependents, "definitions")),
+      number("definitions", c.definitions, "definitions"),
+    ),
+  )
+
+fn pipeline_row(staged: Result<pipeline::Stages, String>) -> Row = {
+  let criterion = holding(
+    "the harness walked and read the tree the toolchain compiled",
+    ["files"],
+    |vs: List<Decimal>| match vs { [files] -> files > 0m, _ -> false },
+  );
+  match staged {
+    Err(why) -> untaken("pipeline", criterion, why),
+    Ok(s) -> row("pipeline", criterion, pipeline::stage_measurements(s)),
   }
 }
 
-fn scenario_json(row: spine::Row) -> Json = {
-  let best = row.best;
-  object([
-    { key: "name", value: Str(row.name) },
-    { key: "criterion", value: Str(row.criterion) },
-    { key: "verdict", value: Str(spine::verdict_text(row.verdict)) },
-    { key: "total_ms", value: Number(decimal_of_int(best.duration_ms)) },
-    { key: "tests_total", value: Number(decimal_of_int(best.total)) },
-    { key: "tests_selected", value: Number(decimal_of_int(best.selected)) },
-    { key: "tests_cached", value: Number(decimal_of_int(best.cached)) },
-    { key: "groups", value: Number(decimal_of_int(best.groups)) },
-    { key: "passed", value: Number(decimal_of_int(best.passed)) },
-    { key: "failed", value: Number(decimal_of_int(best.failed)) },
-    {
-      key: "phases",
-      value: object([
-        { key: "read", value: Number(decimal_of_int(best.read_ms)) },
-        { key: "front", value: Number(decimal_of_int(best.front_ms)) },
-        { key: "write_back", value: Number(decimal_of_int(best.write_back_ms)) },
-      ]),
+// What `bench` measured: the corpus it read, and one row per scenario.
+pub type Benched = { corpus: Corpus, rows: List<Row> }
+
+pub fn measured(
+  dir: String,
+  repeats: Int,
+) -> Result<Benched, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work]} =
+  match corpus_at(dir) {
+    Err(why) -> Err(why),
+    Ok(corpus) -> match go_repeat(dir, repeats, true, []) {
+      Err(e) -> Err(e),
+      Ok(cold) -> match go_repeat(dir, repeats, false, []) {
+        Err(e) -> Err(e),
+        Ok(warm) -> match mutated(dir, corpus, repeats, Rename) {
+          Err(e) -> Err(e),
+          Ok(renamed) -> match mutated(dir, corpus, repeats, Leaf) {
+            Err(e) -> Err(e),
+            Ok(leaf) -> match mutated(dir, corpus, repeats, Hub) {
+              Err(e) -> Err(e),
+              Ok(hub) ->
+                Ok({
+                  corpus: corpus,
+                  rows: [
+                    cold_row(spine::best_of(cold)),
+                    warm_row(spine::best_of(warm)),
+                    rename_row(spine::best_of(renamed)),
+                    leaf_row(spine::best_of(leaf)),
+                    hub_row(corpus, spine::best_of(hub)),
+                    pipeline_row(pipeline::stages(dir)),
+                  ],
+                }),
+            },
+          },
+        },
+      },
     },
-  ])
-}
+  }
 
-fn all_pass(rows: List<spine::Row>) -> Bool =
-  fold(rows, true, |acc: Bool, row: spine::Row| acc && spine::passed(row))
+// --- The report -------------------------------------------------------------------------------
 
-pub fn render(dir: String, corpus: Corpus, rows: List<spine::Row>) -> String = {
-  let title = dir ++ "\n" ++ int_to_string(corpus.modules) ++ " modules · "
+pub fn title_of(dir: String, corpus: Corpus) -> String =
+  dir ++ "\n" ++ int_to_string(corpus.modules) ++ " modules · "
     ++ int_to_string(corpus.definitions)
     ++ " definitions · "
     ++ int_to_string(corpus.tests)
     ++ " tests · "
     ++ int_to_string(corpus.bytes / 1024)
-    ++ " KiB of source";
-  let head = title ++ "\n\n";
-  fold(zip_rows(rows), head, |acc: String, line: String| acc ++ line)
-}
+    ++ " KiB of source"
 
-fn zip_rows(rows: List<spine::Row>) -> List<String> =
-  map(rows, |row: spine::Row| {
-    let best = row.best;
-    "  " ++ spine::verdict_text(row.verdict) ++ "  " ++ row.name ++ "  "
-      ++ spine::ms(best.duration_ms)
-      ++ "  selected "
-      ++ int_to_string(best.selected)
-      ++ " of "
-      ++ int_to_string(best.total)
-      ++ " ("
-      ++ int_to_string(best.cached)
-      ++ " cached) — "
-      ++ row.criterion
-      ++ "\n"
-  })
+pub fn corpus_json(dir: String, corpus: Corpus) -> Json =
+  object([
+    { key: "root", value: Str(dir) },
+    { key: "modules", value: Number(decimal_of_int(corpus.modules)) },
+    { key: "definitions", value: Number(decimal_of_int(corpus.definitions)) },
+    { key: "tests", value: Number(decimal_of_int(corpus.tests)) },
+    { key: "source_bytes", value: Number(decimal_of_int(corpus.bytes)) },
+  ])
+
+// The scenarios, in order: each resets what it must, repeats, and keeps its fastest run.
+pub fn run(
+  dir: String,
+  repeats: Int,
+) -> Result<report::Report, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo]} =
+  match measured(dir, repeats) {
+    Err(why) -> Err(why),
+    Ok(b) ->
+      report::made("bench", title_of(dir, b.corpus), b.rows, [
+        { key: "corpus", value: corpus_json(dir, b.corpus) },
+      ]),
+  }
 
 // --- Tests -------------------------------------------------------------------------------------
 
-test "the manifest's edit sites decode" {
-  let m = "{\"modules\": 2, \"definitions\": 5, \"tests\": 4, \"bytes\": 100, \"leaf_edit\": {\"path\": \"a.ply\", \"find\": \"x\", \"replace\": \"y\", \"dependents\": 1}, \"hub_edit\": {\"path\": \"b.ply\", \"find\": \"p\", \"replace\": \"q\", \"dependents\": 4}, \"rename\": {\"symbol\": \"s\", \"replacement\": \"t\"}}";
-  match json::parse(bytes_of_string(m)) { Ok(Object(_)) -> assert(true), _ -> assert(false) }
-}
-
-test "replace_all substitutes every occurrence" {
-  assert_eq(replace_all(b"a.b.c", b".", b"-"), b"a-b-c");
-  assert_eq(replace_all(b"nothing here", b"zzz", b"y"), b"nothing here");
-}
-
-test "the rename row's criterion fires" {
-  let s = rename_scenario();
-  let r: spine::TestReport = {
-    ok: true,
-    duration_ms: 1,
-    total: 4,
-    selected: 2,
-    passed: 4,
-    failed: 0,
-    cached: 2,
-    groups: 1,
-    read_ms: 0,
-    front_ms: 1,
-    write_back_ms: 0,
-  };
-  let c: Corpus = {
-    modules: 1,
-    definitions: 1,
-    tests: 4,
-    bytes: 1,
-    leaf: { path: "a", find: "x", replace: "y", dependents: 1 },
-    hub: { path: "b", find: "p", replace: "q", dependents: 3 },
-    rename_symbol: "s",
-    rename_replacement: "t",
-  };
-  assert(match (s.judge)(r, c) { Err(_) -> true, Ok(_) -> false });
-  let clear: spine::TestReport = { ..r, selected: 0, cached: 4 };
-  assert(match (s.judge)(clear, c) { Ok(_) -> true, Err(_) -> false });
-}
-
-test "the report's table is the text it carries" {
-  let r: spine::TestReport = {
+fn a_run() -> spine::TestReport =
+  {
     ok: true,
     duration_ms: 12,
     total: 4,
@@ -551,8 +453,10 @@ test "the report's table is the text it carries" {
     read_ms: 0,
     front_ms: 1,
     write_back_ms: 0,
-  };
-  let c: Corpus = {
+  }
+
+fn a_corpus() -> Corpus =
+  {
     modules: 2,
     definitions: 5,
     tests: 4,
@@ -561,9 +465,59 @@ test "the report's table is the text it carries" {
     hub: { path: "b", find: "p", replace: "q", dependents: 3 },
     rename_symbol: "s",
     rename_replacement: "t",
-  };
-  let report = report_of("sweep/m2", c, Null, Null, [{ ..warm_scenario(), runs: [r] }]);
-  assert(string_starts_with(report.rendered, "sweep/m2\n2 modules · 5 definitions"));
-  assert(string_contains(report.rendered, "pass  warm  12ms  selected 0 of 4 (4 cached)"));
-  assert(string_contains(json::to_string(report.json), "\"root\":\"sweep/m2\""))
+  }
+
+fn verdict_of(r: Row) -> report::Verdict =
+  match report::judge([r]) { [j] -> j.verdict, _ -> report::Inconclusive("no row") }
+
+test "the manifest's edit sites decode" {
+  let m = "{\"modules\": 2, \"definitions\": 5, \"tests\": 4, \"bytes\": 100, \"leaf_edit\": {\"path\": \"a.ply\", \"find\": \"x\", \"replace\": \"y\", \"dependents\": 1}, \"hub_edit\": {\"path\": \"b.ply\", \"find\": \"p\", \"replace\": \"q\", \"dependents\": 4}, \"rename\": {\"symbol\": \"s\", \"replacement\": \"t\"}}";
+  match json::parse(bytes_of_string(m)) { Ok(Object(_)) -> assert(true), _ -> assert(false) }
+}
+
+test "replace_all substitutes every occurrence" {
+  assert_eq(replace_all(b"a.b.c", b".", b"-"), b"a-b-c");
+  assert_eq(replace_all(b"nothing here", b"zzz", b"y"), b"nothing here");
+}
+
+test "a rename that selects anything fails with the count it selected" {
+  assert_eq(
+    verdict_of(rename_row({ ..a_run(), selected: 2, cached: 2 })),
+    report::Fail([number("selected", 2, "tests")]),
+  );
+  assert_eq(verdict_of(rename_row(a_run())), report::Pass)
+}
+
+test "a cold run fails when anything was cached or failed" {
+  let cold = { ..a_run(), selected: 4, cached: 0 };
+  assert_eq(verdict_of(cold_row(cold)), report::Pass);
+  assert(verdict_of(cold_row({ ..cold, cached: 1 })) != report::Pass);
+  assert(verdict_of(cold_row({ ..cold, failed: 1, passed: 3 })) != report::Pass)
+}
+
+test "a leaf edit selects some tests and not most of them" {
+  assert(verdict_of(leaf_row(a_run())) != report::Pass);
+  assert_eq(verdict_of(leaf_row({ ..a_run(), selected: 2 })), report::Pass);
+  assert(verdict_of(leaf_row({ ..a_run(), selected: 3 })) != report::Pass)
+}
+
+test "a hub edit is judged against the share the manifest counts" {
+  // Three dependents of five definitions: at least three fifths of four tests, so three.
+  assert_eq(verdict_of(hub_row(a_corpus(), { ..a_run(), selected: 3 })), report::Pass);
+  assert(verdict_of(hub_row(a_corpus(), { ..a_run(), selected: 2 })) != report::Pass)
+}
+
+test "the report's title is the corpus it benched" {
+  let r = report::report_of(
+    "bench",
+    title_of("sweep/m2", a_corpus()),
+    { corpus: "b3:c0", runtime: "ply 1" },
+    [warm_row(a_run())],
+    [{ key: "corpus", value: corpus_json("sweep/m2", a_corpus()) }],
+  );
+  assert(string_starts_with(report::rendered(r), "sweep/m2\n2 modules · 5 definitions"));
+  assert(
+    string_contains(report::rendered(r), "✓ warm  wall 12ms · 4 tests · selected 0 tests"),
+  );
+  assert(string_contains(json::to_string(report::to_json(r)), "\"root\":\"sweep/m2\""))
 }

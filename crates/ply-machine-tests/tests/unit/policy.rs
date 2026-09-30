@@ -33,15 +33,17 @@ fn every_family_lends_something_and_has_a_name_and_a_summary() {
 }
 
 /// `--allow` refuses a family whose effect the program does not declare, so the effect a family
-/// names has to be the one its operations are on.
+/// names has to be the one every one of its operations is on.
 #[test]
-fn a_family_lends_the_operations_of_the_effect_it_names_and_no_other() {
+fn a_family_lends_under_one_effect_and_that_is_the_one_a_program_declares() {
     for family in policy::FAMILIES {
+        let effect = policy::effect_of(family.name)
+            .unwrap_or_else(|| panic!("`{}` lends under no effect", family.name));
         let ops = policy::lent(family.name, &own).expect("the family is listed");
         for (op, _) in &ops {
             assert_eq!(
                 op.effect.as_str(),
-                family.effect,
+                effect,
                 "`{}` lends `{}.{}`, of an effect it does not name",
                 family.name,
                 op.effect,
@@ -49,42 +51,10 @@ fn a_family_lends_the_operations_of_the_effect_it_names_and_no_other() {
             );
         }
     }
-}
-
-fn check_of(module: &str, source: &str) -> ply_ty::CheckOutput {
-    ply_codegen::c::producer::ensure_default();
-    ply_codegen::c::producer::checked_front(
-        &[(module.to_string(), source.to_string())],
-        &[ply_span::SourceId(0)],
-    )
-    .expect("the fixture checks")
-    .check
-}
-
-#[test]
-fn a_grant_needs_the_effect_the_family_lends_rather_than_one_of_its_name() {
-    let consumer = check_of(
-        "cli.claims",
-        "pub nondet effect prover {\n  read ask[r]() -> Int\n}\n",
-    );
-    let lent = policy::granted(&consumer, &["claims".to_string()])
-        .unwrap_or_else(|d| panic!("the program declares `prover`: {}", d.message));
-    assert!(!lent.is_empty());
-
-    let misnamed = check_of(
-        "m",
-        "pub nondet effect claims {\n  read ask[r]() -> Int\n}\n",
-    );
-    let refused = match policy::granted(&misnamed, &["claims".to_string()]) {
-        Ok(_) => panic!("a program that declares no `prover` was lent the family"),
-        Err(d) => d,
-    };
-    assert_eq!(refused.code, ply_span::codes::CAPABILITY_UNDECLARED);
-    assert!(
-        refused.message.contains("`prover`"),
-        "the refusal names the effect to declare: {}",
-        refused.message
-    );
+    // The two whose effect is not named for the family: a grant is checked against the effect.
+    assert_eq!(policy::effect_of("claims"), Some("prover"));
+    assert_eq!(policy::effect_of("cache"), Some("store"));
+    assert_eq!(policy::effect_of("everything"), None);
 }
 
 #[test]

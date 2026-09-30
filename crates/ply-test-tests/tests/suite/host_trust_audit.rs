@@ -267,7 +267,7 @@ fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
     assert!(!report.failures[0].defect);
     assert!(
         report.failures[0].host,
-        "a failure a handler produced is a host-backed failure, which the program's gate never searches"
+        "a failure a handler produced is a host-backed failure"
     );
     assert!(
         report.failures[0]
@@ -400,7 +400,7 @@ fn a_footprint_claim_is_restated_for_every_test_the_worker_runs() {
 }
 
 #[test]
-fn a_host_backed_failure_is_skipped_rather_than_attributed() {
+fn a_host_backed_failure_is_marked_and_diagnosing_it_reaches_no_handler() {
     // v1 never reaches the host, so its hermetic pass is the baseline the failure below bisects against.
     let before = Compiled::new(
         r#"
@@ -426,6 +426,10 @@ test "the regression" { assert_eq(ask(1), expected()) }
             .is_some_and(|r| r.is_written()),
         "the baseline pass has to be recorded or there is nothing to bisect against"
     );
+    // A real run's driver stores every body it checked; this harness runs the runner alone.
+    for (hash, body) in ply_store::body::of_front(&before.port).defs() {
+        store.put_body(hash, ply_store::DefBody::of(body.clone()));
+    }
 
     // v2: `ask` reaches the host on the taken branch, and the handler's answer fails the assertion.
     let after = Compiled::new(
@@ -462,21 +466,21 @@ test "the regression" { assert_eq(ask(1), expected()) }
     sources.sort();
     let hybrids = ply_test::diagnose_failures(&report, &sources, &after.port, &store);
 
-    // The failure says it reached the host, and no mixture is offered for one: a re-run would
-    // repeat whatever was done outside the program. Refusing to search it is the program's gate.
+    // Searching it or not is the program's gate; the runtime says only what it could build.
     assert!(report.failures[0].host);
     let input = hybrids.per_failure[0]
         .as_ref()
         .expect("the test passed before, so its facts are handed over");
     assert!(
-        input.runnable.is_none(),
-        "a mixture was offered for a failure that reached the host"
+        input.runnable.is_some(),
+        "every body is on hand, so a mixture can be built: {:?}",
+        input.absent
     );
-    assert_eq!(input.absent, Some(ply_test::Absent::NoHybrids));
+    assert_eq!(input.absent, None);
     assert_eq!(
         calls.load(Ordering::SeqCst),
         during_the_run,
-        "diagnosis reached the handler, which is the packet sent once per candidate set"
+        "diagnosing the failure reached the handler"
     );
     // Suspects need no run: they are the closure intersected with what changed.
     assert!(

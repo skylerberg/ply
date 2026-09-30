@@ -106,7 +106,12 @@ test_source_file() {
     printf '%s\n' "$dir/$target.rs"
   elif [[ $test == *::* ]]; then
     modpath=${test%::*}
-    printf '%s\n' "$dir/$target/${modpath//:://}.rs"
+    modpath=$dir/$target/${modpath//:://}
+    if [[ -f $modpath/mod.rs ]]; then
+      printf '%s\n' "$modpath/mod.rs"
+    else
+      printf '%s\n' "$modpath.rs"
+    fi
   else
     printf '%s\n' "$dir/$target/main.rs"
   fi
@@ -270,35 +275,36 @@ priority_blocks() {
   done
 }
 
-# One `shard-<i>.toml` per partition: the tests it runs as its profile's `default-filter`, and the
-# order to start them in. 3 when there is nothing measured to cut, so the caller slices by count.
-# The rows of $1 whose binary and test the tree still has, on $2. A rename or a deletion leaves
-# stale rows in the cached table, and a filter naming a binary id nothing builds is a nextest
-# error; what the table does not name, the catch-all shard runs.
-living_durations() {
-  local id test ms package target file dropped=0
-  : > "$2"
-  while IFS="$TAB" read -r id test ms; do
-    case "$id" in
-      *::*) package=${id%%::*}; target=${id#*::} ;;
-      *) package=$id; target=lib ;;
-    esac
-    if [[ $target == lib ]]; then
-      [[ -d $root/crates/$package/src ]] || { dropped=$((dropped + 1)); continue; }
-    elif [[ $target == bin/* ]]; then
-      name=${target#bin/}
-      [[ -f $root/crates/$package/src/main.rs || -f $root/crates/$package/src/bin/$name.rs || -f $root/crates/$package/src/bin/$name/main.rs ]] \
-        || grep -q "name = \"$name\"" "$root/crates/$package/Cargo.toml" 2>/dev/null \
-        || { dropped=$((dropped + 1)); continue; }
-    else
-      file=$(test_source_file "$package" "$target" "$test")
-      [[ -f $file ]] || { dropped=$((dropped + 1)); continue; }
-    fi
-    printf '%s\t%s\t%s\n' "$id" "$test" "$ms" >> "$2"
-  done < "$1"
-  [[ $dropped -eq 0 ]]     || echo "$dropped measured row(s) name tests the tree no longer has; left to the catch-all" >&2
+# The nextest binary id of every test binary the tree builds: the package for a library's unit
+# tests, `package::target` for an integration test, `package::kind/name` for any other target.
+built_binary_ids() {
+  cargo metadata --no-deps --format-version 1 --manifest-path "$root/Cargo.toml" |
+    jq -r '.packages[] | .name as $p | .targets[] | select(.test)
+      | if .kind[0] == "test" then "\($p)::\(.name)"
+        elif (.kind[0] | IN("bin", "example", "bench")) then "\($p)::\(.kind[0])/\(.name)"
+        else $p end'
 }
 
+# The rows of $1 whose binary the tree still builds, on $2. Judged by binary, not by test: a filter
+# naming a binary id nothing builds is a nextest error, one naming a test its binary no longer has
+# matches nothing, and a test's source file cannot be read off its name.
+living_durations() {
+  local built dropped
+  built=$(built_binary_ids) && [[ -n $built ]] || {
+    echo "FAIL: cargo metadata named no test binary in $root" >&2
+    return 1
+  }
+  dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" '
+    NR == FNR { live[$0] = 1; next }
+    $1 in live { print > out; next }
+    { n++ }
+    END { printf "%d", n }
+  ' - "$1")
+  [[ $dropped -eq 0 ]] || echo "$dropped measured row(s) name binaries the tree no longer builds; left to the catch-all" >&2
+}
+
+# One `shard-<i>.toml` per partition: the tests it runs as its profile's `default-filter`, and the
+# order to start them in. 3 when there is nothing measured to cut, so the caller slices by count.
 shard_configs() {
   local dir=$1 timings=$2 tmp catchall first i
   if [[ ! -s $timings ]]; then
@@ -310,9 +316,10 @@ shard_configs() {
     return 1
   fi
   tmp=$(mktemp -d)
-  living_durations "$timings" "$tmp/living"
+  : > "$tmp/living"
+  living_durations "$timings" "$tmp/living" || { rm -rf "$tmp"; return 1; }
   if [[ ! -s $tmp/living ]]; then
-    echo "no measured durations name a test the tree still has" >&2
+    echo "no measured durations name a binary the tree still builds" >&2
     rm -rf "$tmp"
     return 3
   fi

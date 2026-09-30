@@ -818,7 +818,6 @@ fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
         .find(|r| r.index == doomed)
         .expect("reported");
     assert_eq!(result.status, Status::Panicked);
-    // The fact the program's gate reads: a defect in Ply is never a change in the program.
     assert!(report.failures[0].defect);
 }
 

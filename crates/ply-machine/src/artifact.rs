@@ -2,8 +2,8 @@
 //! content-addressed store already holds.
 
 use crate::load::Loaded;
+use ply_eval::decode::{self, At};
 use ply_eval::{Fields, Value};
-use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
 use ply_store::body::StoredBody;
 use ply_ty::ModuleName;
@@ -21,8 +21,8 @@ pub const LIBRARY_EXTENSION: &str = "plyz";
 /// The container is `crates/ply-compiler/ply/plyx.ply`: the magic, every header offset, the
 /// section table and what a digest covers are written there and nowhere else.
 const ENCODE: &str = "plyx.encode";
-const DECODE: &str = "plyx.decode_dump";
-const PLAN: &str = "plyx.plan_dump";
+const DECODE: &str = "plyx.decode";
+const PLAN: &str = "plyx.plan";
 const FORMAT: &str = "plyx.format";
 
 /// The emitted C, compressed; left aside when its helper table is not a prefix of this runtime's.
@@ -215,49 +215,20 @@ impl Plan {
 /// `None` when a file that long is too short to carry a digest at all.
 fn plan(len: usize) -> Result<Option<Plan>, Diagnostic> {
     let answered = answer(PLAN, &[Value::Int(len as i64)])?;
-    let Value::Bytes(dump) = &answered else {
-        return Err(container_failed(format!(
-            "`{PLAN}` answered something that is not a byte string"
-        )));
+    let what = format!("`{PLAN}`'s answer");
+    let read = || -> Result<Option<Plan>, decode::Error> {
+        let Some(plan) = At::new(&what, &answered).option()? else {
+            return Ok(None);
+        };
+        Ok(Some(Plan {
+            domain: plan.field("domain")?.bytes()?.to_vec(),
+            at: plan.field("at")?.number()?,
+            covers: plan
+                .field("covers")?
+                .items(|range| Ok((range.field("at")?.number()?, range.field("len")?.number()?)))?,
+        }))
     };
-    let unreadable = |e: String| container_failed(format!("`{PLAN}`'s answer does not read: {e}"));
-    let mut frames = Cursor::new(dump, "frame");
-    let (words, payload) = frames.unit().map_err(unreadable)?;
-    match words[..] {
-        ["refused", _] => return Ok(None),
-        ["plan", _] => {}
-        _ => return Err(unreadable(format!("a `{}` frame", words.join(" ")))),
-    }
-    // Not defaulted: a plan missing its field would write the digest over the magic.
-    let mut domain = None;
-    let mut at = None;
-    let mut covers = Vec::new();
-    let mut fields = Cursor::new(payload, "field");
-    while !fields.done() {
-        let (key, body) = fields.unit().map_err(unreadable)?;
-        match key[..] {
-            ["domain"] => domain = Some(body.to_vec()),
-            ["at"] => at = Some(number(body).map_err(unreadable)?),
-            ["covers"] => {
-                let text = std::str::from_utf8(body).map_err(|e| unreadable(e.to_string()))?;
-                let Some((start, len)) = text.split_once(' ') else {
-                    return Err(unreadable(format!("a range spelled `{text}`")));
-                };
-                let read = |what: &str, n: &str| {
-                    n.parse::<usize>()
-                        .map_err(|_| unreadable(format!("{what} `{n}`")))
-                };
-                covers.push((read("an offset", start)?, read("a length", len)?));
-            }
-            _ => return Err(unreadable(format!("a `{}` field", key.join(" ")))),
-        }
-    }
-    match (domain, at) {
-        (Some(domain), Some(at)) => Ok(Some(Plan { domain, at, covers })),
-        _ => Err(unreadable(
-            "a plan with no domain or no digest field".to_string(),
-        )),
-    }
+    read().map_err(|e| container_failed(format!("the answer does not read: {e}")))
 }
 
 /// One section as the container placed it; the records inside its payload are this file's to read.
@@ -287,106 +258,49 @@ impl Container {
 
 fn container(bytes: &[u8], path: &Path) -> Result<Container, Diagnostic> {
     let answered = answer(DECODE, &[Value::bytes(bytes)])?;
-    let Value::Bytes(dump) = &answered else {
-        return Err(container_failed(format!(
-            "`{DECODE}` answered something that is not a byte string"
-        )));
-    };
-    let unreadable =
-        |e: String| container_failed(format!("`{DECODE}`'s answer does not read: {e}"));
-    let mut frames = Cursor::new(dump, "frame");
-    let (words, payload) = frames.unit().map_err(unreadable)?;
-    match words[..] {
-        ["refused", _] => return Err(refused(path, payload, false)?),
-        ["stale", _] => return Err(refused(path, payload, true)?),
-        ["head", _] => {}
-        _ => return Err(unreadable(format!("a `{}` frame", words.join(" ")))),
-    }
-
-    let mut out = Container {
-        frontend: [0; 32],
-        runtime: [0; 32],
-        body_encoding: 0,
-        std: [0; 32],
-        entry: DefHash([0; 32]),
-        digest: [0; 32],
-        sections: Vec::new(),
-    };
-    let mut fields = Cursor::new(payload, "field");
-    while !fields.done() {
-        let (key, body) = fields.unit().map_err(unreadable)?;
-        let hash = |what: &str| {
-            <[u8; 32]>::try_from(body)
-                .map_err(|_| unreadable(format!("a `{what}` of {} bytes", body.len())))
+    let what = format!("`{DECODE}`'s answer");
+    let read = || -> Result<Result<Container, Diagnostic>, decode::Error> {
+        let opened = match At::new(&what, &answered).result()? {
+            Ok(opened) => opened,
+            Err(refusal) => return Ok(Err(refused(path, refusal)?)),
         };
-        match key[..] {
-            ["frontend"] => out.frontend = hash("frontend")?,
-            ["runtime"] => out.runtime = hash("runtime")?,
-            ["stdlib"] => out.std = hash("stdlib")?,
-            ["entry"] => out.entry = DefHash(hash("entry")?),
-            ["digest"] => out.digest = hash("digest")?,
-            ["body_encoding"] => out.body_encoding = number(body).map_err(unreadable)? as u32,
-            _ => return Err(unreadable(format!("a `{}` field", key.join(" ")))),
-        }
-    }
-
-    while !frames.done() {
-        let (words, payload) = frames.unit().map_err(unreadable)?;
-        if !matches!(words[..], ["section", _]) {
-            return Err(unreadable(format!("a `{}` frame", words.join(" "))));
-        }
-        let mut placed = Placed {
-            name: String::new(),
-            count: 0,
-            at: 0,
-            len: 0,
-        };
-        let mut fields = Cursor::new(payload, "field");
-        while !fields.done() {
-            let (key, body) = fields.unit().map_err(unreadable)?;
-            match key[..] {
-                ["name"] => placed.name = String::from_utf8_lossy(body).into_owned(),
-                ["count"] => placed.count = number(body).map_err(unreadable)?,
-                ["at"] => placed.at = number(body).map_err(unreadable)?,
-                ["len"] => placed.len = number(body).map_err(unreadable)?,
-                _ => return Err(unreadable(format!("a `{}` field", key.join(" ")))),
-            }
-        }
-        out.sections.push(placed);
-    }
-    Ok(out)
+        let hash = |name: &str| opened.field(name)?.byte_array::<32>();
+        Ok(Ok(Container {
+            frontend: hash("frontend")?,
+            runtime: hash("runtime")?,
+            body_encoding: opened.field("body_encoding")?.number()?,
+            std: hash("stdlib")?,
+            entry: DefHash(hash("entry")?),
+            digest: hash("digest")?,
+            sections: opened.field("sections")?.items(|section| {
+                Ok(Placed {
+                    name: section.field("name")?.utf8()?.to_string(),
+                    count: section.field("count")?.number()?,
+                    at: section.field("at")?.number()?,
+                    len: section.field("len")?.number()?,
+                })
+            })?,
+        }))
+    };
+    read().map_err(|e| container_failed(format!("the answer does not read: {e}")))?
 }
 
-/// The container's own refusal, as the diagnostic the reader would have raised: a `stale` one is
-/// a file no transfer will mend, and every other is a file that arrived damaged.
-fn refused(path: &Path, payload: &[u8], stale: bool) -> Result<Diagnostic, Diagnostic> {
-    let unreadable =
-        |e: String| container_failed(format!("`{DECODE}`'s refusal does not read: {e}"));
-    let mut fields = Cursor::new(payload, "field");
-    let mut message = String::new();
-    let mut notes: Vec<String> = Vec::new();
-    while !fields.done() {
-        let (key, body) = fields.unit().map_err(unreadable)?;
-        let text = String::from_utf8_lossy(body).into_owned();
-        match key[..] {
-            ["message"] => message = text,
-            ["note"] => notes.push(text),
-            _ => return Err(unreadable(format!("a `{}` field", key.join(" ")))),
-        }
-    }
-    let base = if stale {
+/// The container's own refusal, as the diagnostic the reader would have raised: a stale one is a
+/// file no transfer will mend, and every other is a file that arrived damaged.
+fn refused(path: &Path, refusal: At<'_>) -> Result<Diagnostic, decode::Error> {
+    let lossy = |text: &[u8]| String::from_utf8_lossy(text).into_owned();
+    let message = lossy(refusal.field("message")?.bytes()?);
+    let base = if refusal.field("stale")?.bool()? {
         version(path, message)
     } else {
         invalid(path, message)
     };
-    Ok(notes.into_iter().fold(base, |d, note| d.note(note)))
-}
-
-fn number(body: &[u8]) -> Result<usize, String> {
-    std::str::from_utf8(body)
-        .ok()
-        .and_then(|text| text.parse().ok())
-        .ok_or_else(|| format!("a number spelled `{}`", String::from_utf8_lossy(body)))
+    let note = refusal.field("note")?.bytes()?;
+    Ok(if note.is_empty() {
+        base
+    } else {
+        base.note(lossy(note))
+    })
 }
 
 // `Value::Record` holds an `Arc`, and `Fields` is not `Send`; every construction site says so.

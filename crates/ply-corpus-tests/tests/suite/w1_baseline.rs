@@ -1,10 +1,5 @@
+use crate::support::{product, product_document, repo};
 use ply_corpus::serve::{Endpoint, Parser};
-use ply_eval::Plan;
-use std::path::PathBuf;
-
-fn repo() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 #[test]
 fn the_reconstructed_parser_passes_every_test_the_shipped_one_does() {
@@ -18,46 +13,20 @@ fn the_reconstructed_parser_passes_every_test_the_shipped_one_does() {
     )
     .unwrap();
 
-    let loaded = match ply_machine::driver::load_full(dir.path()) {
-        Ok(loaded) => loaded,
-        Err(e) => panic!(
-            "the reconstruction does not compile: {}",
-            e.diagnostics
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        ),
-    };
-
-    let mut store = ply_store::Store::open(dir.path()).expect("a cache");
-    let selection = ply_corpus::regions::every_test(
-        &loaded.check,
-        &(0..loaded.check.tests.len()).collect::<Vec<_>>(),
-        &Plan::default(),
+    let out = product(
+        dir.path(),
+        &["test", ".", "--json", "--no-cache", "--color", "never"],
     );
+    let report = product_document(&out);
     assert!(
-        selection.total >= 16,
-        "the example declares {} tests; this comparison is worth what they cover",
-        selection.total
+        out.status.success() && report["summary"]["failed"].as_u64() == Some(0),
+        "the reconstruction is not a twin: {:#}\n{:#}",
+        report["failures"],
+        report["diagnostics"]
     );
-
-    let report = ply_machine::support::run_on_tier(
-        &loaded,
-        &selection,
-        ply_test::Hosting::hermetic(),
-        &mut store,
-    );
-
-    assert_eq!(
-        report.failed,
-        0,
-        "the reconstruction is not a twin: {}",
-        report
-            .failures
-            .iter()
-            .map(|f| format!("{}: {}", f.key, f.diagnostic.message))
-            .collect::<Vec<_>>()
-            .join("\n  ")
+    let total = report["selection"]["total"].as_u64().unwrap_or(0);
+    assert!(
+        total >= 16,
+        "the example declares {total} tests; this comparison is worth what they cover"
     );
 }

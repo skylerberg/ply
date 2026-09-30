@@ -2410,15 +2410,24 @@ fn a_root_range_searches_exactly_those_seeds() {
     assert_eq!(refused.status.code(), Some(2));
 }
 
-/// A test is no process: it may start the programs `--exec` names, and nothing else of `process`.
+/// A test is no process: it may start and drive the programs `--exec` names, and nothing else of
+/// `process`.
 const SPAWNS: &str = "\
-import std.process (process)
+import std.process (process, Discard, Keep)
 
 fn echoed() -> Bytes / {process.spawn[echo]} = process.spawn[echo]([\"hi\"], \"\", []).out
+
+fn started() -> Option<Bytes> / {process.start[echo], process.wait[echo]} =
+  match process.start[echo]([\"hi\"], \"\", [], { input: false, out: Keep, err: Discard }) {
+    Err(_) -> None,
+    Ok(child) -> match process.wait[echo](child, 0 - 1) { Some(f) -> Some(f.out), None -> None },
+  }
 
 fn said() -> Unit / {process.out[proc]} = process.out[proc](\"hi\")
 
 test/nondet \"spawns echo\" { assert_eq(echoed(), b\"hi\\n\") }
+
+test/nondet \"starts echo and waits for it\" { assert_eq(started(), Some(b\"hi\\n\")) }
 
 test/nondet \"writes a line\" { said() }
 ";
@@ -2442,6 +2451,7 @@ fn a_test_run_binds_what_exec_names_and_withholds_the_rest_of_process() {
             .unwrap_or(Value::Null)
     };
     assert_eq!(status("spawns echo"), "passed", "{v}");
+    assert_eq!(status("starts echo and waits for it"), "passed", "{v}");
     assert_eq!(status("writes a line"), "failed", "{v}");
     assert_eq!(v["failures"][0]["diagnostic"]["code"], "E0424", "{v}");
 
