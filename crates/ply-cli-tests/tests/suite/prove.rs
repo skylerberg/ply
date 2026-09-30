@@ -585,6 +585,81 @@ fn bounded(x: Int) -> Int
     );
 }
 
+/// The seam carries no fixed width, so the tier declines `low_bit`; `inc` raises on its own.
+#[test]
+fn a_proposition_the_tier_declines_is_a_defect_in_ply_and_not_a_gap() {
+    const SOURCE: &str = "\
+fn low_bit(b: U8) -> Int
+  ensures result < 2
+= int_of_u8(b & 1u8)
+
+fn inc(x: Int) -> Int
+  ensures result > x
+= x + 1
+";
+    let dir = project(SOURCE);
+    let out = ply(dir.path())
+        .args(["prove", "--no-cache", "--json"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    let by_label = |needle: &str| -> Value {
+        v["obligations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["label"].as_str().unwrap_or_default().contains(needle))
+            .cloned()
+            .unwrap_or_else(|| panic!("no obligation for `{needle}`: {v}"))
+    };
+    let declined = by_label("m.low_bit");
+    assert_eq!(
+        declined["outcome"], "defect",
+        "the control must be an entry the tier declines: {declined}"
+    );
+    assert!(declined["tier"].is_null(), "{declined}");
+    assert!(
+        declined["gap"].is_null() && declined["gap_kind"].is_null(),
+        "Ply's failure is no gap in the claim: {declined}"
+    );
+    assert_eq!(declined["defect"]["code"], "E0505", "{declined}");
+    assert!(
+        declined["defect"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("declined")),
+        "{declined}"
+    );
+    assert!(
+        declined["defect"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("this is a defect in Ply")),
+        "{declined}"
+    );
+    let raised = by_label("m.inc");
+    assert_eq!(raised["outcome"], "unattempted", "{raised}");
+    assert_eq!(raised["gap_kind"], "raised", "{raised}");
+    assert_eq!(v["summary"]["defect"], 1, "{v}");
+    assert_eq!(v["summary"]["unattempted"], 1, "{v}");
+    let codes: Vec<&str> = v["diagnostics"]
+        .as_array()
+        .expect("a diagnostic array")
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert_eq!(
+        codes.iter().filter(|code| **code == "W0604").count(),
+        1,
+        "only the program's gap is W0604: {codes:?}"
+    );
+    assert!(codes.contains(&"E0505"), "{codes:?}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a defect fails the run, as one fails `ply test`: {v}"
+    );
+    assert_eq!(v["ok"], false, "{v}");
+}
+
 #[test]
 fn a_law_host_is_unattempted_under_a_hermetic_run_and_never_green() {
     const SOURCE: &str = "\

@@ -25,15 +25,16 @@ import style (Style, plain, dim, red, green, yellow)
 // What a run decides lives in the suite, which is where the runtime reads it from; these are the
 // names and the words it marshals, so a program that reports on them shares the one definition.
 import proof.obligation (Binding, CacheRefused, Cases, Certificate, Change, Changed, ClaimRow,
-                         Counter, Coverage, Def, Ensures, Evidence, Example, Falsified, Frame,
-                         Fresh, FromProof, FromSample, Gap, GuardNotSampled, Held, Instantiation,
-                         Kept, Kind, Law, Laws, Moved, Never, NoCaseKept, NotDrawn, Outcome, Point,
-                         Proof, Property, Proved, Pure, Raised, ReachesHost, Reason, Record,
-                         Refuted, Rejected, Sampled, Tier, Unattempted, Uncached, Unchanged,
+                         Counter, Coverage, Def, Defect, Ensures, Evidence, Example, Falsified,
+                         Fault, Frame, Fresh, FromProof, FromSample, Gap, GuardNotSampled, Held,
+                         Instantiation, Kept, Kind, Law, Laws, Moved, Never, NoCaseKept, NotDrawn,
+                         Outcome, Point, Proof, Property, Proved, Pure, Raised, ReachesHost, Reason,
+                         Record, Refuted, Rejected, Sampled, Tier, Unattempted, Uncached, Unchanged,
                          Undrawn, Ungeneratable, UnhandledEffect, Unsatisfiable, Vacuity, Vacuous,
                          Writes, Written, cases_summary, certificate_summary, coverage,
-                         evidence_summary, filings, frame_summary, gap_summary, hits, laws_of,
-                         reason_word, select, specified, tier_word, vacuity_summary, verdict_of)
+                         evidence_summary, fault_summary, filings, frame_summary, gap_summary,
+                         gap_word, hits, laws_of, reason_word, select, specified, tier_word,
+                         vacuity_summary, verdict_of)
 
 // What the Rust side collects, discharges, reviews and accepts, in that order. Collecting comes
 // first and once; a run then either accepts a baseline or discharges what it was asked for, and
@@ -357,6 +358,7 @@ pub fn outcome_word(o: Outcome) -> String =
     Refuted(_) -> "refuted",
     Vacuous(_) -> "vacuous",
     Unattempted(_) -> "unattempted",
+    Defect(_) -> "defect",
   }
 
 pub fn holds(o: Outcome) -> Bool = match o { Held(_) -> true, _ -> false }
@@ -377,10 +379,17 @@ pub fn detail_of(r: Row, places: List<Place>) -> String =
     Unattempted(gap) -> gap_summary(gap),
     Vacuous(v) -> vacuity_summary(v.why),
     Refuted(_) -> match located(places, r.claim.at) { Some(at) -> at, None -> "" },
+    Defect(f) -> fault_summary(f),
   }
 
+// `!` for Ply's own failure, as `ply test` marks a defect.
 pub fn mark_of(s: Style, o: Outcome) -> String =
-  match o { Held(_) -> green(s, "✓"), Unattempted(_) -> yellow(s, "~"), _ -> red(s, "✗") }
+  match o {
+    Held(_) -> green(s, "✓"),
+    Unattempted(_) -> yellow(s, "~"),
+    Defect(_) -> yellow(s, "!"),
+    _ -> red(s, "✗"),
+  }
 
 // --- Counting ---------------------------------------------------------------
 
@@ -399,12 +408,16 @@ pub fn vacuous_of(rows: List<Row>) -> Int =
 pub fn unattempted_of(rows: List<Row>) -> Int =
   count_where(rows, |o: Outcome| match o { Unattempted(_) -> true, _ -> false })
 
+pub fn defect_of(rows: List<Row>) -> Int =
+  count_where(rows, |o: Outcome| match o { Defect(_) -> true, _ -> false })
+
 pub fn held_of(rows: List<Row>) -> Int = count_where(rows, |o: Outcome| holds(o))
 
-// A refuted or vacuous claim is a failure; a gap is not one, and never was.
-pub fn failed(rows: List<Row>) -> Bool = refuted_of(rows) > 0 || vacuous_of(rows) > 0
+// A refuted or vacuous claim fails the run, as Ply's own failure on one does; a gap does not.
+pub fn failed(rows: List<Row>) -> Bool =
+  refuted_of(rows) > 0 || vacuous_of(rows) > 0 || defect_of(rows) > 0
 
-// At least one claim the program makes does not hold.
+// At least one claim the program makes does not hold, or Ply failed discharging one.
 pub fn failure() -> Int = 1
 
 pub fn code_of(rows: List<Row>) -> Int = if failed(rows) { failure() } else { ok_code() }
@@ -466,7 +479,7 @@ fn claim_row(c: Claim, o: Outcome) -> ClaimRow =
     kind: c.kind,
     tier: tier_of(o),
     holds: holds(o),
-    attempted: match o { Unattempted(_) -> false, _ -> true },
+    discharged: match o { Unattempted(_) -> false, Defect(_) -> false, _ -> true },
   }
 
 /// The rows a run's accounting reads, parallel to the claims it asked for.
@@ -655,16 +668,28 @@ fn outcome_members(o: Outcome) -> List<Member> =
     },
     Refuted(cx) -> [{ key: "counterexample", value: counterexample_json(cx) }],
     Vacuous(v) -> [{ key: "vacuity", value: Str(vacuity_summary(v.why)) }],
-    Unattempted(gap) -> match gap {
-      Raised(r) -> if len(r.bindings) == 0 { [{ key: "gap", value: Str(gap_summary(gap)) }] } else {
+    Unattempted(gap) ->
+      also(
         [
           { key: "gap", value: Str(gap_summary(gap)) },
-          { key: "raised_at", value: bindings_json(r.bindings) },
-        ]
-      },
-      _ -> [{ key: "gap", value: Str(gap_summary(gap)) }],
-    },
+          { key: "gap_kind", value: Str(gap_word(gap)) },
+        ],
+        match gap {
+          Raised(r) -> if len(r.bindings) == 0 { [] }
+          else { [{ key: "raised_at", value: bindings_json(r.bindings) }] },
+          _ -> [],
+        },
+      ),
+    Defect(f) -> [{ key: "defect", value: fault_json(f) }],
   }
+
+fn fault_json(f: Fault) -> Json =
+  object([
+    { key: "code", value: Str(f.code) },
+    { key: "message", value: Str(f.message) },
+    { key: "bindings", value: bindings_json(f.bindings) },
+    { key: "summary", value: Str(fault_summary(f)) },
+  ])
 
 fn index_members(c: Claim) -> List<Member> =
   match c.kind { Ensures(index) -> [{ key: "index", value: num(index) }], Law(_) -> [] }
@@ -816,6 +841,19 @@ fn undischarged(r: Row, gap: Gap) -> Diag = {
   { ..d, severity: b"warning" }
 }
 
+// Ply's own code over the claim it stopped, never the `W0604` that blames the program.
+fn defect(r: Row, f: Fault) -> Diag = {
+  let at = if len(f.bindings) == 0 { [] } else { [bytes_of_string("at " ++ rendered(f.bindings))] };
+  diag1(
+    bytes_of_string(f.code),
+    r.claim.at.module,
+    span_of(r.claim.at),
+    bytes_of_string(label_of(r.claim) ++ " was not discharged: " ++ fault_summary(f)),
+    b"Ply failed discharging this",
+    also(map(f.notes, bytes_of_string), at),
+  )
+}
+
 pub fn diagnostics_of(rows: List<Row>) -> List<Diag> =
   fold(rows, [], |acc: List<Diag>, r: Row|
     match r.outcome {
@@ -823,6 +861,7 @@ pub fn diagnostics_of(rows: List<Row>) -> List<Diag> =
       Refuted(cx) -> push(acc, refutation(r, cx)),
       Vacuous(v) -> push(acc, vacuity(r, v.guard, v.why)),
       Unattempted(gap) -> push(acc, undischarged(r, gap)),
+      Defect(f) -> push(acc, defect(r, f)),
     })
 
 // --- Refusals -----------------------------------------------------------------
@@ -1046,6 +1085,51 @@ test "a refuted claim is E0419 over the claim, and a gap is W0604 over the same 
     b"m.stored ensures #0 was not discharged: performs {db.read[rows]}: no handler",
   )
 }
+
+pub fn a_fault() -> Fault =
+  {
+    code: "E0505",
+    message: "the compiled tier declined to enter `m.law`",
+    notes: ["this is Ply's fault, not the program's"],
+    bindings: [{ name: "b", ty: "Bool", rendered: "true" }],
+  }
+
+test "Ply's failure is its own error over the claim, never the program's gap" {
+  let r: Row = {
+    claim: a_claim("m.one", Ensures(0)),
+    outcome: Defect(a_fault()),
+    reason: Fresh,
+    reach: None,
+  };
+  let d: Diag = match diagnostics_of([r]) { [x] -> x, _ -> panic("one diagnostic") };
+  assert_eq(d.code, b"E0505");
+  assert_eq(d.severity, b"error");
+  assert_eq(
+    d.message,
+    b"m.one ensures #0 was not discharged: Ply failed rather than the program, so this is a defect in Ply: the compiled tier declined to enter `m.law`",
+  );
+  assert_eq(d.notes_text, [b"this is Ply's fault, not the program's", b"at b = true"]);
+  assert_eq(unattempted_of([r]), 0);
+  assert_eq(defect_of([r]), 1);
+  // It fails the run, as a defect fails `ply test`, and it establishes nothing.
+  assert_eq(code_of([r]), failure());
+  assert(
+    string_starts_with(
+      row_head(plain(), r, [a_place()]),
+      "   ! defect      m.one ensures #0                         Ply failed rather than the program",
+    ),
+  );
+  let row: ClaimRow = match claim_rows(a_collection_of([r.claim]), [0], [r.outcome]) {
+    [x] -> x,
+    _ -> panic("one row"),
+  };
+  assert_eq(row.holds, false);
+  assert_eq(row.discharged, false);
+  assert_eq(row.tier, None)
+}
+
+fn a_collection_of(cs: List<Claim>) -> Collection =
+  { places: [a_place()], warnings: [], claims: cs, defs: [], laws: [], plan: a_plan() }
 
 test "a claim that holds raises nothing at all" {
   let held: Row = {
