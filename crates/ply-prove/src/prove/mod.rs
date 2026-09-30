@@ -13,10 +13,10 @@ pub use claims::{Claims, read_claims};
 pub use context::Context;
 pub use lower::Blocker;
 
-use crate::{Certificate, DEFAULT_PROVE_BUDGET, Rule, UNFOLD_DEPTH};
+use crate::sort::Sort;
+use crate::{Binder, Certificate, DEFAULT_PROVE_BUDGET, Rule, UNFOLD_DEPTH};
 use claims::Code;
 use ply_span::Symbol;
-use ply_ty::{LawBinder, TyVar, Type};
 use std::collections::BTreeSet;
 
 pub const SPLIT_DEPTH: u32 = 48;
@@ -24,7 +24,7 @@ pub const SPLIT_DEPTH: u32 = 48;
 /// Binder `i` is slot `i` of every clause's window.
 pub struct Goal<'a> {
     /// For an `ensures`, the owner's parameters and `result`; for a law, its `forall` binders.
-    pub binders: &'a [LawBinder],
+    pub binders: &'a [Binder],
     /// The `requires` clauses beside this one, or a law's `where`.
     pub guards: &'a [&'a Code],
     /// For an `ensures`: the definition's body, which the last binder, `result`, equals.
@@ -126,7 +126,7 @@ pub fn decide_and_diagnose(
     let bound: Vec<term::TermId> = goal
         .binders
         .iter()
-        .map(|binder| lowering.bind_symbolic(&binder.ty))
+        .map(|binder| lowering.bind_symbolic(&binder.sort))
         .collect();
     let mut guards: Vec<term::TermId> = Vec::with_capacity(goal.guards.len());
     for guard in goal.guards {
@@ -200,7 +200,7 @@ pub fn decide_and_diagnose(
     }
 
     let claim = match conjunction(&mut terms, body_needs) {
-        Some(conjoined) => terms.mk(term::Node::And(body, conjoined), Some(Type::bool())),
+        Some(conjoined) => terms.mk(term::Node::And(body, conjoined), Some(Sort::bool())),
         None => body,
     };
     let mut assertions = ranges.clone();
@@ -249,7 +249,7 @@ pub fn decide_and_diagnose(
         Decision::Proved(Proof {
             rules: rules.into_rules(),
             steps: spent,
-            sorts: uninterpreted_sorts(ctx, goal.binders),
+            sorts: uninterpreted_sorts(goal.binders),
             guard_satisfiable,
         }),
         blockers,
@@ -322,7 +322,7 @@ fn ranges_of(
                 lhs: atom,
                 rhs: lo,
             },
-            Some(Type::bool()),
+            Some(Sort::bool()),
         );
         let high = terms.mk(
             term::Node::Cmp {
@@ -330,7 +330,7 @@ fn ranges_of(
                 lhs: atom,
                 rhs: hi,
             },
-            Some(Type::bool()),
+            Some(Sort::bool()),
         );
         out.push((low, true));
         out.push((high, true));
@@ -426,10 +426,7 @@ fn conjunction(terms: &mut term::Terms, guards: &[term::TermId]) -> Option<term:
     for guard in guards {
         out = Some(match out {
             None => *guard,
-            Some(previous) => terms.mk(
-                term::Node::And(previous, *guard),
-                Some(ply_ty::Type::bool()),
-            ),
+            Some(previous) => terms.mk(term::Node::And(previous, *guard), Some(Sort::bool())),
         });
     }
     out
@@ -449,30 +446,20 @@ fn run(
     (answer, left)
 }
 
-fn domain_inhabited(ctx: &Context<'_>, binders: &[LawBinder]) -> bool {
-    binders.iter().all(|b| ctx.inhabited(&b.ty))
+fn domain_inhabited(ctx: &Context<'_>, binders: &[Binder]) -> bool {
+    binders.iter().all(|b| ctx.inhabited(&b.sort))
 }
 
-fn uninterpreted_sorts(ctx: &Context<'_>, binders: &[LawBinder]) -> Vec<Symbol> {
-    let mut vars: BTreeSet<TyVar> = BTreeSet::new();
+/// The binders' variables, each named as the claim's binders print it.
+fn uninterpreted_sorts(binders: &[Binder]) -> Vec<Symbol> {
+    let mut vars: Vec<u32> = Vec::new();
     for binder in binders {
-        collect_vars(&binder.ty, &mut vars);
+        binder.sort.vars(&mut vars);
     }
-    vars.into_iter().map(|v| ctx.sort_name(v)).collect()
-}
-
-fn collect_vars(ty: &Type, out: &mut BTreeSet<TyVar>) {
-    match ty {
-        Type::Var(v) => {
-            out.insert(*v);
-        }
-        Type::Con(_, args) => args.iter().for_each(|a| collect_vars(a, out)),
-        Type::Fn { params, ret, .. } => {
-            params.iter().for_each(|p| collect_vars(p, out));
-            collect_vars(ret, out);
-        }
-        Type::Record(fields) => fields.values().for_each(|t| collect_vars(t, out)),
-    }
+    let vars: BTreeSet<u32> = vars.into_iter().collect();
+    vars.into_iter()
+        .map(|v| Symbol::new(Sort::Var(v).to_string()))
+        .collect()
 }
 
 /// In application order, without repeats.

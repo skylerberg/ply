@@ -8,13 +8,16 @@ pub mod domain;
 pub mod property;
 pub mod prove;
 pub mod shrink;
+pub mod sort;
+pub mod world;
+
+pub use sort::Sort;
+pub use world::World;
 
 use ply_eval::{Plan, Race, Seed};
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_ty::DefHash;
-use ply_ty::{Footprint, LawBinder, Resource, Type};
 use serde::Serialize;
-use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -137,7 +140,8 @@ impl Evidence {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Binding {
     pub name: Symbol,
-    pub ty: Type,
+    /// The binder's type as the compiler prints it.
+    pub ty: String,
     pub rendered: String,
 }
 
@@ -166,11 +170,13 @@ pub struct Vacuity {
 
 #[derive(Clone, Debug)]
 pub enum Gap {
-    /// Checking an `ensures` calls the definition, whose footprint needs an unsupplied handler.
-    UnhandledEffect(Footprint),
+    /// Checking an `ensures` calls the definition, whose row needs an unsupplied handler: the row as
+    /// a report prints it, or `None` when it names nothing to hold a handler for.
+    UnhandledEffect(Option<String>),
     Ungeneratable {
         param: Symbol,
-        ty: Type,
+        /// As the compiler prints it.
+        ty: String,
     },
     Raised {
         bindings: Vec<Binding>,
@@ -185,8 +191,8 @@ pub enum Gap {
         generated: u32,
         witness: Vec<Binding>,
     },
-    /// A `law/host` under a hermetic run.
-    ReachesHost(Footprint),
+    /// A `law/host` under a hermetic run, with its row as a report prints it.
+    ReachesHost(Option<String>),
     /// The obligation's points are not drawn one at a time, so there is no case to re-run: a
     /// concurrency law's points are interleavings that the search chooses.
     NotDrawn,
@@ -221,34 +227,35 @@ impl Discharge {
     }
 }
 
-/// What a definition leaves alone, from its checked footprint.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Frame {
-    /// The `ensures` is a total specification: the result depends only on the arguments.
-    Pure,
-    Writes(BTreeSet<(Symbol, Resource)>),
-}
-
-/// A read changes nothing, so it does not narrow a frame.
-pub fn frame_of(footprint: &Footprint) -> Frame {
-    let writes: BTreeSet<(Symbol, Resource)> = footprint
-        .atoms()
-        .filter(|a| a.mode == ply_ty::Mode::Write)
-        .map(|a| (a.effect.clone(), a.resource.clone()))
-        .collect();
-    if writes.is_empty() {
-        Frame::Pure
-    } else {
-        Frame::Writes(writes)
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObligationKind {
-    Ensures { index: usize },
+    /// Its place among the owner's `ensures` clauses.
+    Ensures {
+        index: usize,
+    },
     Law,
 }
 
+/// One binder of a claim, numbered with the claim's other binders.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Binder {
+    pub name: Symbol,
+    pub sort: Sort,
+    /// Its type as the compiler prints it, with the letters [`Sort`]'s `Display` gives its variables.
+    pub text: String,
+}
+
+impl Binder {
+    pub fn new(name: &str, sort: Sort) -> Binder {
+        Binder {
+            name: Symbol::new(name),
+            text: sort.to_string(),
+            sort,
+        }
+    }
+}
+
+/// A claim the program owes, as `proof.world` built it.
 #[derive(Clone, Debug)]
 pub struct Obligation {
     /// `spec_hash` for a clause, the law's own `DefHash` for a law.
@@ -257,23 +264,23 @@ pub struct Obligation {
     pub owner: Symbol,
     pub kind: ObligationKind,
     pub span: Span,
-    pub frame: Frame,
     /// The owner's parameters then `result` for a clause; the `forall` binders for a law.
-    pub binders: Vec<LawBinder>,
+    pub binders: Vec<Binder>,
     pub guarded: bool,
     /// `law/host`: the body reaches the world.
     pub host: bool,
-    /// `{}`, or `{sim.read}` for a concurrency law, or any row at all for a `law/host`.
-    pub footprint: Footprint,
+    /// The claim's own row as a report prints it, when it performs anything: `{sim.read}` for a
+    /// concurrency law, or any row at all for a `law/host`.
+    pub footprint: Option<String>,
 }
 
 impl Obligation {
     /// A law whose body reaches a `simulate` region.
     pub fn is_concurrency_law(&self) -> bool {
-        matches!(self.kind, ObligationKind::Law) && !self.host && !self.footprint.is_empty()
+        matches!(self.kind, ObligationKind::Law) && !self.host && self.footprint.is_some()
     }
 
-    pub fn generated(&self) -> &[LawBinder] {
+    pub fn generated(&self) -> &[Binder] {
         match self.kind {
             ObligationKind::Ensures { .. } => &self.binders[..self.binders.len().saturating_sub(1)],
             ObligationKind::Law => &self.binders,
@@ -281,7 +288,7 @@ impl Obligation {
     }
 
     /// The return-value binder that [`Obligation::generated`] withholds.
-    pub fn result_binder(&self) -> Option<&LawBinder> {
+    pub fn result_binder(&self) -> Option<&Binder> {
         match self.kind {
             ObligationKind::Ensures { .. } => self.binders.last(),
             ObligationKind::Law => None,

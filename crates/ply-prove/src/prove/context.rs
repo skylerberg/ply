@@ -1,59 +1,51 @@
 //! The facts about a program that the prover reads, indexed once per run.
 
 use super::claims::{Claims, Code, Definition};
+use crate::sort::Sort;
+use crate::world::{Ctor, Decl, Signature, World};
 use ply_span::Symbol;
-use ply_ty::{CheckOutput, CtorInfo, TyVar, Type};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-/// The constructors of one sum type, in declaration order.
-pub struct Variants<'a> {
-    pub type_name: Symbol,
-    pub ctors: Vec<&'a CtorInfo>,
-}
+use std::collections::{BTreeSet, HashMap};
 
 pub struct Context<'a> {
     claims: Claims,
-    check: &'a CheckOutput,
+    world: &'a World,
     recursive: BTreeSet<Symbol>,
     /// A component of one definition calling itself: the shape induction unrolls.
     self_recursive: BTreeSet<Symbol>,
-    by_type: BTreeMap<Symbol, Vec<Symbol>>,
+    /// The sum types a case split may range over.
+    sums: BTreeSet<Symbol>,
     inhabited_types: BTreeSet<Symbol>,
     /// Nominal types whose declaration reaches a `Float`.
     float_types: BTreeSet<Symbol>,
-    sort_names: BTreeMap<TyVar, Symbol>,
 }
 
 impl<'a> Context<'a> {
-    pub fn new(claims: Claims, check: &'a CheckOutput) -> Context<'a> {
-        let mut by_type: BTreeMap<Symbol, Vec<(usize, Symbol)>> = BTreeMap::new();
-        for (name, info) in &check.ctors {
-            by_type
-                .entry(info.type_name.clone())
-                .or_default()
-                .push((info.index, name.clone()));
-        }
-        // Aliases and builtins contribute no `CtorInfo`, so they are never split on.
-        let mut sums: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-        for (ty, mut ctors) in by_type {
-            ctors.sort();
-            sums.insert(ty, ctors.into_iter().map(|(_, name)| name).collect());
-        }
-        drop_incomplete(check, &claims, &mut sums);
-
+    pub fn new(claims: Claims, world: &'a World) -> Context<'a> {
+        // A split over a partial list is unsound, so a type the lowered claims count otherwise is
+        // never split on; aliases and builtins have no constructors, so they are not sums at all.
+        let sums: BTreeSet<Symbol> = world
+            .decls()
+            .filter(|d| {
+                !d.variants.is_empty()
+                    && claims
+                        .sums
+                        .get(&d.name)
+                        .is_none_or(|n| *n == d.variants.len())
+            })
+            .map(|d| d.name.clone())
+            .collect();
         let (recursive, self_recursive) = recursive_definitions(&claims.defs);
-        let inhabited_types = inhabited_sum_types(check, &sums);
-        let float_types = float_reaching_types(check);
+        let inhabited_types = inhabited_sum_types(world, &sums);
+        let float_types = float_reaching_types(world);
 
         Context {
             claims,
-            check,
+            world,
             recursive,
             self_recursive,
-            by_type: sums,
+            sums,
             inhabited_types,
             float_types,
-            sort_names: BTreeMap::new(),
         }
     }
 
@@ -62,58 +54,42 @@ impl<'a> Context<'a> {
     }
 
     /// Through its arguments, its fields, or its own declaration.
-    pub fn reaches_float(&self, ty: &Type) -> bool {
-        reaches_float(ty, &self.float_types)
+    pub fn reaches_float(&self, sort: &Sort) -> bool {
+        reaches_float(sort, &self.float_types)
     }
 
-    pub fn sort_name(&self, v: TyVar) -> Symbol {
-        self.sort_names
-            .get(&v)
-            .cloned()
-            .unwrap_or_else(|| Symbol::new(Type::Var(v).to_string()))
-    }
-
-    pub fn ctor(&self, name: &Symbol) -> Option<&'a CtorInfo> {
-        self.check.ctors.get(name)
+    pub fn ctor(&self, name: &Symbol) -> Option<Ctor<'a>> {
+        self.world.ctor(name)
     }
 
     /// `None` unless every constructor is in hand: a split over a partial list is unsound.
-    pub fn variants(&self, type_name: &Symbol) -> Option<Variants<'a>> {
-        let names = self.by_type.get(type_name)?;
-        let mut ctors = Vec::with_capacity(names.len());
-        for name in names {
-            ctors.push(self.check.ctors.get(name)?);
-        }
-        Some(Variants {
-            type_name: type_name.clone(),
-            ctors,
-        })
+    pub fn variants(&self, type_name: &Symbol) -> Option<&'a Decl> {
+        self.world
+            .decl(type_name)
+            .filter(|_| self.sums.contains(type_name))
     }
 
-    pub fn scheme(&self, name: &Symbol) -> Option<&'a ply_ty::Scheme> {
-        self.check.defs.get(name).map(|d| &d.scheme)
+    pub fn signature(&self, name: &Symbol) -> Option<&'a Signature> {
+        self.world.signature(name)
     }
 
-    pub fn inhabited(&self, ty: &Type) -> bool {
-        match ty {
-            Type::Var(_) => true,
-            Type::Fn { ret, .. } => self.inhabited(ret),
-            Type::Record(fields) => fields.values().all(|t| self.inhabited(t)),
-            Type::Con(name, _) => match self.by_type.get(name) {
-                None => true,
-                Some(_) => self.inhabited_types.contains(name),
-            },
+    pub fn inhabited(&self, sort: &Sort) -> bool {
+        match sort {
+            Sort::Var(_) => true,
+            Sort::Fn { ret, .. } => self.inhabited(ret),
+            Sort::Record(fields) => fields.iter().all(|(_, t)| self.inhabited(t)),
+            Sort::Con(name, _) => !self.sums.contains(name) || self.inhabited_types.contains(name),
         }
     }
 
     /// Whether equal calls must answer equally, so they may share one term.
     pub fn is_pure(&self, name: &Symbol) -> bool {
-        let Some(def) = self.check.defs.get(name) else {
+        let Some(signature) = self.world.signature(name) else {
             return false;
         };
-        def.footprint.is_empty()
-            && match &def.scheme.ty {
-                Type::Fn { effects, .. } => effects.is_pure(),
+        signature.pure
+            && match &signature.sort {
+                Sort::Fn { pure, .. } => *pure,
                 _ => true,
             }
     }
@@ -140,7 +116,7 @@ impl<'a> Context<'a> {
     }
 
     fn reached_pure(&self, name: &Symbol) -> Option<&Definition> {
-        if !self.check.defs.get(name)?.footprint.is_empty() {
+        if !self.world.signature(name)?.pure {
             return None;
         }
         self.claims
@@ -150,50 +126,36 @@ impl<'a> Context<'a> {
     }
 }
 
-fn drop_incomplete(check: &CheckOutput, claims: &Claims, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) {
-    // The prelude's ADTs have no `type` item, so their counts come from its anonymous-module
-    // constructors; `claims.sums` holds every declared one.
-    let mut declared: BTreeMap<Symbol, usize> = BTreeMap::new();
-    for info in check.ctors.values().filter(|c| c.module.is_anonymous()) {
-        *declared.entry(info.type_name.clone()).or_default() += 1;
-    }
-    declared.extend(claims.sums.iter().map(|(ty, n)| (ty.clone(), *n)));
-    sums.retain(|ty, ctors| declared.get(ty) == Some(&ctors.len()) && !ctors.is_empty());
-}
-
-fn reaches_float(ty: &Type, declared: &BTreeSet<Symbol>) -> bool {
-    match ty {
-        Type::Con(name, args) => {
+fn reaches_float(sort: &Sort, declared: &BTreeSet<Symbol>) -> bool {
+    match sort {
+        Sort::Con(name, args) => {
             (name.as_str() == "Float" && args.is_empty())
                 || declared.contains(name)
                 || args.iter().any(|a| reaches_float(a, declared))
         }
-        Type::Fn { params, ret, .. } => {
+        Sort::Fn { params, ret, .. } => {
             params.iter().any(|p| reaches_float(p, declared)) || reaches_float(ret, declared)
         }
-        Type::Record(fields) => fields.values().any(|f| reaches_float(f, declared)),
-        Type::Var(_) => false,
+        Sort::Record(fields) => fields.iter().any(|(_, f)| reaches_float(f, declared)),
+        Sort::Var(_) => false,
     }
 }
 
 /// A least fixed point, so chains of declarations and recursive ones both settle.
-fn float_reaching_types(check: &CheckOutput) -> BTreeSet<Symbol> {
-    let mut fields: BTreeMap<Symbol, Vec<&Type>> = BTreeMap::new();
-    for ctor in check.ctors.values() {
-        fields
-            .entry(ctor.type_name.clone())
-            .or_default()
-            .extend(ctor.fields.iter());
-    }
+fn float_reaching_types(world: &World) -> BTreeSet<Symbol> {
     let mut found: BTreeSet<Symbol> = BTreeSet::new();
     loop {
         let mut grew = false;
-        for (type_name, fields) in &fields {
-            if found.contains(type_name) {
+        for decl in world.decls() {
+            if found.contains(&decl.name) {
                 continue;
             }
-            if fields.iter().any(|f| reaches_float(f, &found)) {
-                found.insert(type_name.clone());
+            if decl
+                .variants
+                .iter()
+                .any(|v| v.fields.iter().any(|f| reaches_float(f, &found)))
+            {
+                found.insert(decl.name.clone());
                 grew = true;
             }
         }
@@ -204,26 +166,20 @@ fn float_reaching_types(check: &CheckOutput) -> BTreeSet<Symbol> {
 }
 
 /// Least fixed point: a type is inhabited once every field of some constructor is.
-fn inhabited_sum_types(
-    check: &CheckOutput,
-    sums: &BTreeMap<Symbol, Vec<Symbol>>,
-) -> BTreeSet<Symbol> {
+fn inhabited_sum_types(world: &World, sums: &BTreeSet<Symbol>) -> BTreeSet<Symbol> {
     let mut inhabited: BTreeSet<Symbol> = BTreeSet::new();
     loop {
         let mut grew = false;
-        for (type_name, ctors) in sums {
-            if inhabited.contains(type_name) {
+        for decl in world.decls().filter(|d| sums.contains(&d.name)) {
+            if inhabited.contains(&decl.name) {
                 continue;
             }
-            let any = ctors.iter().any(|name| {
-                check.ctors.get(name).is_some_and(|ctor| {
-                    ctor.fields
-                        .iter()
-                        .all(|field| field_inhabited(field, sums, &inhabited))
-                })
-            });
-            if any {
-                inhabited.insert(type_name.clone());
+            if decl.variants.iter().any(|v| {
+                v.fields
+                    .iter()
+                    .all(|field| field_inhabited(field, sums, &inhabited))
+            }) {
+                inhabited.insert(decl.name.clone());
                 grew = true;
             }
         }
@@ -233,17 +189,15 @@ fn inhabited_sum_types(
     }
 }
 
-fn field_inhabited(
-    ty: &Type,
-    sums: &BTreeMap<Symbol, Vec<Symbol>>,
-    inhabited: &BTreeSet<Symbol>,
-) -> bool {
-    match ty {
-        Type::Var(_) => true,
-        Type::Fn { ret, .. } => field_inhabited(ret, sums, inhabited),
-        Type::Record(fields) => fields.values().all(|t| field_inhabited(t, sums, inhabited)),
-        Type::Con(name, _) if sums.contains_key(name) => inhabited.contains(name),
-        Type::Con(..) => true,
+fn field_inhabited(sort: &Sort, sums: &BTreeSet<Symbol>, inhabited: &BTreeSet<Symbol>) -> bool {
+    match sort {
+        Sort::Var(_) => true,
+        Sort::Fn { ret, .. } => field_inhabited(ret, sums, inhabited),
+        Sort::Record(fields) => fields
+            .iter()
+            .all(|(_, t)| field_inhabited(t, sums, inhabited)),
+        Sort::Con(name, _) if sums.contains(name) => inhabited.contains(name),
+        Sort::Con(..) => true,
     }
 }
 

@@ -119,14 +119,14 @@ fn answering<[l]>(
     },
   }
 
-fn killed<[l]>(child: Int) -> Unit / {process.signal[l], process.wait[l]} = {
+pub fn killed<[l]>(child: Int) -> Unit / {process.signal[l], process.wait[l]} = {
   let _ = process.signal[l](child, process::Kill);
   let _ = process.wait[l](child, -1);
   ()
 }
 
 // The end of a log, which is where a server says why it stopped.
-fn tail_of(log: String) -> String / {fs.read_file[work]} =
+pub fn tail_of(log: String) -> String / {fs.read_file[work]} =
   match fs.read_file[work](log) {
     None -> "",
     Some(bytes) -> {
@@ -138,16 +138,20 @@ fn tail_of(log: String) -> String / {fs.read_file[work]} =
 fn failed(name: String, why: String, log: String) -> String / {fs.read_file[work]} =
   "`" ++ name ++ "` " ++ why ++ "; its log, " ++ log ++ ", ends:\n" ++ tail_of(log)
 
-// A server started from `args` under the label `l`, its stderr written to `name.log` in the scratch
-// directory. It is answered only once it listens and accepts, and a child that never gets there
-// is stopped before the refusal is.
+// Where a server's stderr goes unless a table routes it elsewhere: `name.log` in the scratch
+// directory.
+pub fn log_of(k: Kit, name: String) -> String = under(k.scratch, name ++ ".log")
+
+// A server started from `args` under the label `l`, its stderr routed to `err`. It is answered only
+// once it listens and accepts, and a child that never gets there is stopped before the refusal is.
 pub fn start<[l]>(
   k: Kit,
   name: String,
   args: List<String>,
+  err: process::Output,
 ) -> Result<Server, String> / {process.start[l], process.output_line[l], process.wait[l], process.signal[l], net.connect[probe], net.close[probe], config.get[env], fs.read_file[work], time.elapsed_ms, time.sleep_ms} = {
-  let log = under(k.scratch, name ++ ".log");
-  let io = { input: false, out: process::Lines, err: process::File(log) };
+  let log = match err { process::File(path) -> path, _ -> log_of(k, name) };
+  let io = { input: false, out: process::Lines, err: err };
   match process.start[l](args, "", spine::inherited_env(), io) {
     Err(why) -> Err("`" ++ name ++ "` did not start: " ++ why),
     Ok(child) -> match listening[l](child, time.elapsed_ms() + startup_ms()) {
@@ -210,14 +214,14 @@ pub fn stop_row(name: String, s: Stop, c: Criterion) -> Row =
 
 pub type Served<a> = { value: a, stop: Stop }
 
-// `body` over a server, which is stopped whatever `body` answers.
+// `body` over a server whose stderr is its log, which is stopped whatever `body` answers.
 pub fn serving<a, [l] | e>(
   k: Kit,
   name: String,
   args: List<String>,
   body: (Server) -> Result<a, String> / e,
 ) -> Result<Served<a>, String> / {process.start[l], process.output_line[l], process.wait[l], process.signal[l], net.connect[probe], net.close[probe], config.get[env], fs.read_file[work], time.elapsed_ms, time.sleep_ms | e} =
-  match start[l](k, name, args) {
+  match start[l](k, name, args, process::File(log_of(k, name))) {
     Err(why) -> Err(why),
     Ok(s) -> {
       let got = body(s);
@@ -478,6 +482,17 @@ pub fn printed(f: Finished, what: String) -> Result<Json, String> =
     }
   }
 
+// A program under `fixtures/` run once over the host with `settings`, each a `set` pair.
+pub fn fixture_args(k: Kit, name: String, settings: List<List<String>>) -> List<String> =
+  cats([["run", fixture(k, name), "--host", "--color", "never"], cats(settings)])
+
+pub fn ran(
+  k: Kit,
+  name: String,
+  settings: List<List<String>>,
+) -> Finished / {process.spawn[ply], config.get[env]} =
+  process.spawn[ply](fixture_args(k, name, settings), "", spine::inherited_env())
+
 // A program under `fixtures/` that times itself, run once, with any settings of its own.
 pub fn timed(
   k: Kit,
@@ -487,16 +502,11 @@ pub fn timed(
   settings: List<String> = [],
 ) -> Result<Json, String> / {process.spawn[ply], config.get[env]} =
   printed(
-    process.spawn[ply](
-      cats([
-        ["run", fixture(k, name), "--host", "--color", "never"],
-        set("BENCH_ITERATIONS", int_to_string(iterations)),
-        set("BENCH_REPEATS", int_to_string(repeats)),
-        settings,
-      ]),
-      "",
-      spine::inherited_env(),
-    ),
+    ran(k, name, [
+      set("BENCH_ITERATIONS", int_to_string(iterations)),
+      set("BENCH_REPEATS", int_to_string(repeats)),
+      settings,
+    ]),
     name,
   )
 
@@ -557,7 +567,13 @@ test "a server is found by the line it says it listens with, past the run's own 
       process::exited(0, b"", b""),
       said(["   binding host · 9 operations", "listening on 40123"]),
     ),
-    || start[srv](kit(), "desk", ["run", "desk.ply", "--host"]),
+    ||
+      start[srv](
+        kit(),
+        "desk",
+        ["run", "desk.ply", "--host"],
+        process::File(log_of(kit(), "desk")),
+      ),
   );
   match ran.answer {
     Err(why) -> panic(why),
@@ -574,22 +590,44 @@ test "a server is found by the line it says it listens with, past the run's own 
 test "a server that drains is stopped by the signal, and one that does not is killed" {
   let drained = supervised(
     process::script(0, process::exited(0, b"", b""), said(["listening on 40123"])),
-    || match start[srv](kit(), "desk", []) { Ok(s) -> stop[srv](s), Err(why) -> panic(why) },
+    ||
+      match start[srv](kit(), "desk", [], process::Discard) {
+        Ok(s) -> stop[srv](s),
+        Err(why) -> panic(why),
+      },
   );
   assert_eq(drained.answer, Stopped(Exited(0)));
   assert_eq(drained.child.signals, [process::Terminate]);
   let stuck = supervised(
     process::script(1, process::signalled(9, b"", b""), said(["listening on 40123"])),
-    || match start[srv](kit(), "desk", []) { Ok(s) -> stop[srv](s), Err(why) -> panic(why) },
+    ||
+      match start[srv](kit(), "desk", [], process::Discard) {
+        Ok(s) -> stop[srv](s),
+        Err(why) -> panic(why),
+      },
   );
   assert_eq(stuck.answer, Killed);
   assert_eq(stuck.child.signals, [process::Terminate, process::Kill])
 }
 
+test "a server's stderr goes where a table routes it, and its log is where that is" {
+  let routed = |err: process::Output|
+    supervised(
+      process::script(0, process::exited(0, b"", b""), said(["listening on 40123"])),
+      || match start[srv](kit(), "desk", [], err) { Ok(s) -> s.log, Err(why) -> panic(why) },
+    );
+  let filed = routed(process::File("scratch/serve/trace.jsonl"));
+  assert_eq(filed.answer, "scratch/serve/trace.jsonl");
+  assert_eq(filed.child.io.err, process::File("scratch/serve/trace.jsonl"));
+  let dropped = routed(process::Discard);
+  assert_eq(dropped.answer, "scratch/serve/desk.log");
+  assert_eq(dropped.child.io.err, process::Discard)
+}
+
 test "a server that ends before it listens is refused with how it ended and its log" {
   let ran = supervised(
     process::script(0, process::exited(2, b"", b""), said(["   binding host · 9 operations"])),
-    || start[srv](kit(), "desk", []),
+    || start[srv](kit(), "desk", [], process::File(log_of(kit(), "desk"))),
   );
   match ran.answer {
     Ok(_) -> panic("a server that never listened was answered"),
@@ -697,6 +735,23 @@ test "a server of the language's own must drain, and a floor only must not be ki
   assert_eq(judged(Stopped(Signalled(15)), ended()), Pass);
   assert(judged(Killed, ended()) != Pass);
   assert_eq(stop_row("the floor,", Killed, ended()).name, "the floor, stops")
+}
+
+test "a fixture is run over the host with every setting it was given, in order" {
+  assert_eq(
+    fixture_args(kit(), "statements.ply", [set("BENCH_SECTION", "schema"), set("BENCH_ROWS", "8")]),
+    [
+      "run",
+      "../repo/crates/ply-corpus/fixtures/statements.ply",
+      "--host",
+      "--color",
+      "never",
+      "--set",
+      "BENCH_SECTION=schema",
+      "--set",
+      "BENCH_ROWS=8",
+    ],
+  )
 }
 
 test "a program's report is the one line it printed past the run's own" {

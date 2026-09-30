@@ -1,17 +1,18 @@
 //! The property tier: seeded generation of every Ply type, run against an obligation's guard.
 
 use crate::shrink::{self, Target};
+use crate::sort::Sort;
+use crate::world::{Variant, World};
 use crate::{
-    Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan, Vacuity,
-    VacuityKind,
+    Binder, Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan,
+    Vacuity, VacuityKind,
 };
 use ply_eval::IntTy;
 use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Synth, Value};
 use ply_eval::{SECRET, TASK_TYPE};
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_ty::DefHash;
-use ply_ty::{CtorInfo, LawBinder, Row, TyVar, Type};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -117,186 +118,13 @@ impl GenStream {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Variant {
-    pub name: Symbol,
-    pub index: usize,
-    /// Written in the owning type's parameters.
-    pub fields: Vec<Type>,
-    /// Nested constructor applications a value of this variant needs.
-    pub depth: Option<u64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct TypeDecl {
-    pub params: Vec<TyVar>,
-    pub variants: Vec<Variant>,
-    pub depth: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct TypeWorld {
-    types: BTreeMap<Symbol, TypeDecl>,
-    ctors: BTreeMap<Symbol, (Symbol, usize)>,
-}
-
-impl TypeWorld {
-    /// Every declared type, ascending by name: what a program needs to size a binder it was handed,
-    /// since a type's name alone does not say how many values it holds.
-    pub fn declared(&self) -> impl Iterator<Item = (&Symbol, &TypeDecl)> {
-        self.types.iter()
-    }
-
-    pub fn new<'a>(ctors: impl IntoIterator<Item = &'a CtorInfo>) -> TypeWorld {
-        let mut world = TypeWorld::default();
-        for info in ctors {
-            let decl = world
-                .types
-                .entry(info.type_name.clone())
-                .or_insert_with(|| TypeDecl {
-                    params: info.scheme.ty_vars.clone(),
-                    variants: Vec::new(),
-                    depth: None,
-                });
-            decl.variants.push(Variant {
-                name: info.name.clone(),
-                index: info.index,
-                fields: info.fields.clone(),
-                depth: None,
-            });
-            world
-                .ctors
-                .insert(info.name.clone(), (info.type_name.clone(), info.index));
-        }
-        for decl in world.types.values_mut() {
-            decl.variants.sort_by_key(|v| v.index);
-        }
-        world.solve_depths();
-        world
-    }
-
-    fn solve_depths(&mut self) {
-        let names: Vec<Symbol> = self.types.keys().cloned().collect();
-        // Each round settles at least one type, so one round per type suffices.
-        for _ in 0..=names.len() {
-            let mut changed = false;
-            for name in &names {
-                let variants = self.types[name].variants.clone();
-                let mut best: Option<u64> = None;
-                let mut depths: Vec<Option<u64>> = Vec::with_capacity(variants.len());
-                for variant in &variants {
-                    let depth = variant
-                        .fields
-                        .iter()
-                        .try_fold(0u64, |acc, field| {
-                            self.type_depth(field).map(|d| acc.max(d))
-                        })
-                        .map(|d| d.saturating_add(1));
-                    depths.push(depth);
-                    if let Some(d) = depth {
-                        best = Some(best.map_or(d, |b: u64| b.min(d)));
-                    }
-                }
-                let decl = self
-                    .types
-                    .get_mut(name)
-                    .expect("the name came from this map");
-                if decl.depth != best {
-                    decl.depth = best;
-                    changed = true;
-                }
-                for (variant, depth) in decl.variants.iter_mut().zip(depths) {
-                    if variant.depth != depth {
-                        variant.depth = depth;
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-    }
-
-    fn type_depth(&self, ty: &Type) -> Option<u64> {
-        match ty {
-            Type::Var(_) => Some(0),
-            Type::Record(fields) => fields
-                .values()
-                .try_fold(0u64, |acc, f| self.type_depth(f).map(|d| acc.max(d))),
-            Type::Fn { ret, effects, .. } if effects.is_pure() => self.type_depth(ret),
-            Type::Fn { .. } => None,
-            Type::Con(name, _) => match name.as_str() {
-                "Int" | "Bool" | "String" | "Bytes" | "Unit" | "Float" | "Decimal" => Some(0),
-                n if IntTy::from_name(n).is_some() => Some(0),
-                "List" | "Map" => Some(0),
-                "Cell" => None,
-                _ if name.as_str() == TASK_TYPE => None,
-                _ if name.as_str() == SECRET => None,
-                _ => self.types.get(name).and_then(|d| d.depth),
-            },
-        }
-    }
-
-    pub fn variants(&self, ty: &Symbol) -> Option<&[Variant]> {
-        self.types.get(ty).map(|d| d.variants.as_slice())
-    }
-
-    pub fn ctor(&self, name: &Symbol) -> Option<(&Symbol, usize)> {
-        self.ctors.get(name).map(|(ty, index)| (ty, *index))
-    }
-
-    pub fn fields(&self, ty: &Symbol, variant: &Variant, args: &[Type]) -> Vec<Type> {
-        let Some(decl) = self.types.get(ty) else {
-            return variant.fields.clone();
-        };
-        let subst: BTreeMap<TyVar, Type> = decl
-            .params
-            .iter()
-            .copied()
-            .zip(args.iter().cloned())
-            .collect();
-        variant
-            .fields
-            .iter()
-            .map(|f| substitute(f, &subst))
-            .collect()
-    }
-}
-
-fn substitute(ty: &Type, subst: &BTreeMap<TyVar, Type>) -> Type {
-    match ty {
-        Type::Var(v) => subst.get(v).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Con(name, args) => Type::Con(
-            name.clone(),
-            args.iter().map(|a| substitute(a, subst)).collect(),
-        ),
-        Type::Record(fields) => Type::Record(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), substitute(v, subst)))
-                .collect(),
-        ),
-        Type::Fn {
-            params,
-            ret,
-            effects,
-        } => Type::Fn {
-            params: params.iter().map(|p| substitute(p, subst)).collect(),
-            ret: Box::new(substitute(ret, subst)),
-            effects: effects.clone(),
-        },
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ungeneratable {
     Cell,
     Task,
     Secret,
-    /// Applying it would make the spec impure.
-    Effectful(Row),
-    RowVariable,
+    /// Its row is not empty, so applying it would make the spec impure.
+    Effectful,
     Uninhabited(Symbol),
     Unknown(Symbol),
     TooDeep,
@@ -310,11 +138,8 @@ impl fmt::Display for Ungeneratable {
             Ungeneratable::Secret => {
                 f.write_str("a `Secret` is a credential, and nothing may generate one")
             }
-            Ungeneratable::Effectful(row) => {
-                write!(f, "a function performing {row} cannot be applied in a spec")
-            }
-            Ungeneratable::RowVariable => {
-                f.write_str("an effect-row variable is not pure for every instantiation")
+            Ungeneratable::Effectful => {
+                f.write_str("a function whose row is not empty cannot be applied in a spec")
             }
             Ungeneratable::Uninhabited(name) => write!(f, "no finite value inhabits `{name}`"),
             Ungeneratable::Unknown(name) => write!(f, "no type named `{name}` is declared"),
@@ -323,26 +148,17 @@ impl fmt::Display for Ungeneratable {
     }
 }
 
-pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
-    match ty {
+pub fn generatable(sort: &Sort, world: &World) -> Result<(), Ungeneratable> {
+    match sort {
         // Monomorphised to `Int` and recorded in `CaseReport::instantiations`.
-        Type::Var(_) => Ok(()),
-        Type::Record(fields) => fields.values().try_for_each(|f| generatable(f, world)),
-        Type::Fn {
-            params,
-            ret,
-            effects,
-        } => {
-            if effects.tail.is_some() {
-                return Err(Ungeneratable::RowVariable);
-            }
-            if !effects.atoms.is_empty() {
-                return Err(Ungeneratable::Effectful(effects.clone()));
-            }
+        Sort::Var(_) => Ok(()),
+        Sort::Record(fields) => fields.iter().try_for_each(|(_, f)| generatable(f, world)),
+        Sort::Fn { pure: false, .. } => Err(Ungeneratable::Effectful),
+        Sort::Fn { params, ret, .. } => {
             params.iter().try_for_each(|p| generatable(p, world))?;
             generatable(ret, world)
         }
-        Type::Con(name, args) => match name.as_str() {
+        Sort::Con(name, args) => match name.as_str() {
             "Int" | "Bool" | "String" | "Bytes" | "Unit" | "Float" | "Decimal" => Ok(()),
             n if IntTy::from_name(n).is_some() => Ok(()),
             "List" | "Map" => args.iter().try_for_each(|a| generatable(a, world)),
@@ -350,7 +166,7 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
             _ if name.as_str() == TASK_TYPE => Err(Ungeneratable::Task),
             _ if name.as_str() == SECRET => Err(Ungeneratable::Secret),
             _ => {
-                let Some(decl) = world.types.get(name) else {
+                let Some(decl) = world.decl(name) else {
                     return Err(Ungeneratable::Unknown(name.clone()));
                 };
                 if decl.depth.is_none() {
@@ -363,8 +179,8 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
 }
 
 pub fn generate(
-    ty: &Type,
-    world: &TypeWorld,
+    sort: &Sort,
+    world: &World,
     stream: &mut GenStream,
     case: u32,
 ) -> Result<Value, Ungeneratable> {
@@ -374,12 +190,12 @@ pub fn generate(
         size: size_for(case),
         edge: edge_for(case),
     };
-    draw.value(ty, 0)
+    draw.value(sort, 0)
 }
 
 pub fn draw_cases(
-    binders: &[LawBinder],
-    world: &TypeWorld,
+    binders: &[Binder],
+    world: &World,
     key: DefHash,
     root: u64,
     cases: u32,
@@ -389,7 +205,7 @@ pub fn draw_cases(
     for case in 0..cases {
         let mut tuple = Vec::with_capacity(binders.len());
         for binder in binders {
-            tuple.push(generate(&binder.ty, world, &mut stream, case)?);
+            tuple.push(generate(&binder.sort, world, &mut stream, case)?);
         }
         out.push(tuple);
     }
@@ -405,7 +221,7 @@ fn edge_for(case: u32) -> Option<u32> {
 }
 
 struct Gen<'a> {
-    world: &'a TypeWorld,
+    world: &'a World,
     stream: &'a mut GenStream,
     size: u64,
     /// `Some(i)` for an edge case: leaves take their `i`th edge point.
@@ -413,33 +229,22 @@ struct Gen<'a> {
 }
 
 impl Gen<'_> {
-    fn value(&mut self, ty: &Type, depth: u32) -> Result<Value, Ungeneratable> {
+    fn value(&mut self, sort: &Sort, depth: u32) -> Result<Value, Ungeneratable> {
         if depth >= HARD_GEN_DEPTH {
             return Err(Ungeneratable::TooDeep);
         }
-        match ty {
-            Type::Var(_) => self.int(),
-            Type::Record(fields) => {
+        match sort {
+            Sort::Var(_) => self.int(),
+            Sort::Record(fields) => {
                 let mut out = BTreeMap::new();
                 for (name, field) in fields {
                     out.insert(name.clone(), self.value(field, depth + 1)?);
                 }
                 Ok(Value::Record(Arc::new(out.into_iter().collect())))
             }
-            Type::Fn {
-                params,
-                ret,
-                effects,
-            } => {
-                if effects.tail.is_some() {
-                    return Err(Ungeneratable::RowVariable);
-                }
-                if !effects.atoms.is_empty() {
-                    return Err(Ungeneratable::Effectful(effects.clone()));
-                }
-                self.function(params, ret, depth)
-            }
-            Type::Con(name, args) => match name.as_str() {
+            Sort::Fn { pure: false, .. } => Err(Ungeneratable::Effectful),
+            Sort::Fn { params, ret, .. } => self.function(params, ret, depth),
+            Sort::Con(name, args) => match name.as_str() {
                 "Int" => self.int(),
                 n if IntTy::from_name(n).is_some() => {
                     let t = IntTy::from_name(n).expect("just checked");
@@ -452,12 +257,12 @@ impl Gen<'_> {
                 "Bytes" => Ok(self.bytes()),
                 "Unit" => Ok(Value::Unit),
                 "List" => {
-                    let elem = args.first().cloned().unwrap_or_else(Type::int);
+                    let elem = args.first().cloned().unwrap_or_else(Sort::int);
                     self.list(&elem, depth)
                 }
                 "Map" => {
-                    let key = args.first().cloned().unwrap_or_else(Type::int);
-                    let value = args.get(1).cloned().unwrap_or_else(Type::int);
+                    let key = args.first().cloned().unwrap_or_else(Sort::int);
+                    let value = args.get(1).cloned().unwrap_or_else(Sort::int);
                     self.map(&key, &value, depth)
                 }
                 "Cell" => Err(Ungeneratable::Cell),
@@ -576,7 +381,7 @@ impl Gen<'_> {
         Value::bytes(out)
     }
 
-    fn list(&mut self, elem: &Type, depth: u32) -> Result<Value, Ungeneratable> {
+    fn list(&mut self, elem: &Sort, depth: u32) -> Result<Value, Ungeneratable> {
         let len = if depth >= GEN_DEPTH { 0 } else { self.length() };
         let mut items = Vec::with_capacity(len);
         for _ in 0..len {
@@ -585,7 +390,7 @@ impl Gen<'_> {
         Ok(Value::list(items))
     }
 
-    fn map(&mut self, key: &Type, value: &Type, depth: u32) -> Result<Value, Ungeneratable> {
+    fn map(&mut self, key: &Sort, value: &Sort, depth: u32) -> Result<Value, Ungeneratable> {
         let len = if depth >= GEN_DEPTH {
             0
         } else {
@@ -600,17 +405,17 @@ impl Gen<'_> {
         Ok(Value::map(entries))
     }
 
-    fn adt(&mut self, name: &Symbol, args: &[Type], depth: u32) -> Result<Value, Ungeneratable> {
-        let Some(decl) = self.world.types.get(name) else {
+    fn adt(&mut self, name: &Symbol, args: &[Sort], depth: u32) -> Result<Value, Ungeneratable> {
+        let world = self.world;
+        let Some(decl) = world.decl(name) else {
             return Err(Ungeneratable::Unknown(name.clone()));
         };
-        let variants = decl.variants.clone();
 
         // Check substituted fields: `Box<a>` is generatable at `Box<Int>`, not `Box<Cell<Int>>`.
-        let mut usable: Vec<(&Variant, Vec<Type>)> = Vec::new();
-        for variant in &variants {
-            let fields = self.world.fields(name, variant, args);
-            if fields.iter().all(|f| generatable(f, self.world).is_ok()) {
+        let mut usable: Vec<(&Variant, Vec<Sort>)> = Vec::new();
+        for variant in &decl.variants {
+            let fields = world.fields(variant, args);
+            if fields.iter().all(|f| generatable(f, world).is_ok()) {
                 usable.push((variant, fields));
             }
         }
@@ -647,8 +452,8 @@ impl Gen<'_> {
     /// From a fixed family of pure, total, printable functions, so counterexamples are readable.
     fn function(
         &mut self,
-        params: &[Type],
-        ret: &Type,
+        params: &[Sort],
+        ret: &Sort,
         depth: u32,
     ) -> Result<Value, Ungeneratable> {
         let projection = params.iter().position(|p| p == ret);
@@ -681,12 +486,12 @@ impl Gen<'_> {
     }
 }
 
-fn comparable(ty: &Type) -> bool {
-    match ty {
-        Type::Fn { .. } => false,
-        Type::Var(_) => true,
-        Type::Record(fields) => fields.values().all(comparable),
-        Type::Con(_, args) => args.iter().all(comparable),
+fn comparable(sort: &Sort) -> bool {
+    match sort {
+        Sort::Fn { .. } => false,
+        Sort::Var(_) => true,
+        Sort::Record(fields) => fields.iter().all(|(_, f)| comparable(f)),
+        Sort::Con(_, args) => args.iter().all(comparable),
     }
 }
 
@@ -738,7 +543,7 @@ fn table_fn(arity: usize, entries: Vec<(Value, Value)>, default: Value) -> Value
     closure(arity, Synth::Table { entries, default }, description)
 }
 
-pub(crate) fn fn_size(value: &Value, world: &TypeWorld) -> Option<u64> {
+pub(crate) fn fn_size(value: &Value, world: &World) -> Option<u64> {
     let Value::Closure(closure) = value else {
         return None;
     };
@@ -802,25 +607,30 @@ pub fn judge_case(judge: &mut dyn Judge, values: &[Value]) -> Outcome {
     }
 }
 
+/// Why a binder has no value to draw: its type, as a report prints it.
+pub fn ungeneratable(binder: &Binder) -> Gap {
+    Gap::Ungeneratable {
+        param: binder.name.clone(),
+        ty: binder.text.clone(),
+    }
+}
+
 pub fn run_property(
     key: DefHash,
-    binders: &[LawBinder],
-    world: &TypeWorld,
+    binders: &[Binder],
+    world: &World,
     plan: &ProvePlan,
     guard_span: Span,
     judge: &mut dyn Judge,
 ) -> Discharge {
-    for binder in binders {
-        if generatable(&binder.ty, world).is_err() {
-            return Discharge::Unattempted(Gap::Ungeneratable {
-                param: binder.name.clone(),
-                ty: binder.ty.clone(),
-            });
-        }
+    if let Some(binder) = binders
+        .iter()
+        .find(|b| generatable(&b.sort, world).is_err())
+    {
+        return Discharge::Unattempted(ungeneratable(binder));
     }
 
     let plan = plan.clone().normalized();
-    let types: Vec<Type> = binders.iter().map(|b| b.ty.clone()).collect();
     let mut generated: u32 = 0;
     let mut kept: u32 = 0;
 
@@ -829,14 +639,9 @@ pub fn run_property(
         for case in 0..plan.cases {
             let mut values = Vec::with_capacity(binders.len());
             for binder in binders {
-                match generate(&binder.ty, world, &mut stream, case) {
+                match generate(&binder.sort, world, &mut stream, case) {
                     Ok(v) => values.push(v),
-                    Err(_) => {
-                        return Discharge::Unattempted(Gap::Ungeneratable {
-                            param: binder.name.clone(),
-                            ty: binder.ty.clone(),
-                        });
-                    }
+                    Err(_) => return Discharge::Unattempted(ungeneratable(binder)),
                 }
             }
             generated = generated.saturating_add(1);
@@ -859,16 +664,6 @@ pub fn run_property(
                     });
                 }
                 Outcome::Raised(diagnostic) => {
-                    // An evaluation that spent its steps is not shrunk: every candidate would
-                    // spend the whole budget again.
-                    if diagnostic.code == ply_span::codes::STEP_BUDGET {
-                        return Discharge::Unattempted(Gap::Raised {
-                            bindings: bindings(binders, &values),
-                            diagnostic: Box::new(diagnostic),
-                            root,
-                            case,
-                        });
-                    }
                     return Discharge::Unattempted(Gap::Raised {
                         bindings: bindings(binders, &values),
                         diagnostic: Box::new(diagnostic),
@@ -892,47 +687,35 @@ pub fn run_property(
         kept,
         rejected: generated - kept,
         roots: plan.roots.clone(),
-        instantiations: instantiations(&types),
+        instantiations: instantiations(binders),
     }))
 }
 
-fn bindings(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
+/// Each binder beside the value it was given, as a report prints them.
+pub fn bindings(binders: &[Binder], values: &[Value]) -> Vec<Binding> {
     binders
         .iter()
         .zip(values)
         .map(|(binder, value)| Binding {
             name: binder.name.clone(),
-            ty: binder.ty.clone(),
+            ty: binder.text.clone(),
             rendered: value.render(),
         })
         .collect()
 }
 
-pub fn instantiations(types: &[Type]) -> Vec<(Symbol, String)> {
-    let mut seen: BTreeSet<TyVar> = BTreeSet::new();
-    let mut out = Vec::new();
-    for ty in types {
-        collect_vars(ty, &mut seen, &mut out);
+/// Every variable of the binders, in the order they first appear, each drawn as an `Int`.
+pub fn instantiations(binders: &[Binder]) -> Vec<(Symbol, String)> {
+    let mut vars: Vec<u32> = Vec::new();
+    for binder in binders {
+        binder.sort.vars(&mut vars);
     }
-    out
-}
-
-fn collect_vars(ty: &Type, seen: &mut BTreeSet<TyVar>, out: &mut Vec<(Symbol, String)>) {
-    match ty {
-        Type::Var(v) => {
-            if seen.insert(*v) {
-                // Monomorphised to `Int`; rendered here, so nothing downstream needs the type.
-                out.push((
-                    Symbol::new(Type::Var(*v).to_string()),
-                    Type::int().to_string(),
-                ));
-            }
-        }
-        Type::Con(_, args) => args.iter().for_each(|a| collect_vars(a, seen, out)),
-        Type::Record(fields) => fields.values().for_each(|f| collect_vars(f, seen, out)),
-        Type::Fn { params, ret, .. } => {
-            params.iter().for_each(|p| collect_vars(p, seen, out));
-            collect_vars(ret, seen, out);
-        }
-    }
+    vars.into_iter()
+        .map(|v| {
+            (
+                Symbol::new(Sort::Var(v).to_string()),
+                Sort::int().to_string(),
+            )
+        })
+        .collect()
 }

@@ -2,20 +2,18 @@ use ply_eval::Plan;
 use ply_span::{Diagnostic, SourceId};
 use ply_store::Store;
 use ply_test::{Choice, Reason, Selection};
-use ply_ty::{CheckOutput, DefHash, Footprint, HashOutput, ModuleName};
+use ply_ty::{CheckOutput, DefHash, HashOutput, ModuleName};
 use std::collections::{BTreeMap, HashMap};
 
-/// Files a checked program's definitions as the CLI does before its tests run: each one's row and
-/// scheme under its hash and name, and the file's fingerprint naming the hashes it has now.
+/// Files a program's definitions as the CLI does before its tests run: each one's row and scheme,
+/// as the compiler prints them, under its hash and name, and the file's fingerprint naming the
+/// hashes it has now. `sources[i]` is `(module name, text)` for `SourceId(i)`.
 ///
 /// `Value::Record` holds an `Arc`, and its fields are not `Send`.
 #[allow(clippy::arc_with_non_send_sync)]
-pub fn file_interfaces(
-    store: &mut Store,
-    file: &std::path::Path,
-    check: &CheckOutput,
-    hashes: &HashOutput,
-) {
+pub fn file_interfaces(store: &mut Store, file: &std::path::Path, sources: &[(String, String)]) {
+    use ply_codegen::c::producer;
+    use ply_eval::decode::At;
     use ply_eval::{Fields, Value};
     use ply_span::Symbol;
     let record = |fields: Vec<(&str, Value)>| {
@@ -26,24 +24,52 @@ pub fn file_interfaces(
                 .collect(),
         )))
     };
+    producer::ensure_default();
+    let pulled = producer::front_pulling_std(sources, &[])
+        .unwrap_or_else(|e| panic!("the front end answers: {e:#}"));
+    let ids: Vec<SourceId> = (0..sources.len() + pulled.modules.len())
+        .map(|i| SourceId(i as u32))
+        .collect();
+    let hashes = ply_codegen::c::dump::read(&pulled.dump, &ids)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .hashes;
+    let printed = |entry: &str, args: Vec<Value>| {
+        producer::call(entry, &args).unwrap_or_else(|e| panic!("the compiler prints: {e:#}"))
+    };
+    let defs = At::new("the front end's answer", &pulled.dump)
+        .field("defs")
+        .and_then(|d| d.list())
+        .unwrap_or_else(|e| panic!("{e}"));
     let mut fingerprint = ply_store::SourceFingerprint::new(ply_store::ContentHash::of(b""));
-    for (name, info) in &check.defs {
-        let Some(hash) = hashes.defs.get(name) else {
+    for def in defs {
+        let read = |field: &str| {
+            def.field(field)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .value()
+                .clone()
+        };
+        let name = Symbol::new(
+            def.field("name")
+                .and_then(|n| n.utf8())
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        let Some(hash) = hashes.defs.get(&name) else {
             continue;
         };
-        let footprint = |f: &Footprint| Value::bytes(ply_ty::print_footprint(f).as_bytes());
+        let atoms =
+            |field: &str| printed("tycore.atoms_text", vec![read(field), Value::bytes(",")]);
         let row = record(vec![
             ("name", Value::bytes(name.as_str().as_bytes())),
             ("hash", Value::bytes(hash.0)),
             ("witness", Value::list(Vec::new())),
-            ("footprint", footprint(&info.footprint)),
-            ("performed", footprint(&info.performed)),
+            ("footprint", atoms("footprint")),
+            ("performed", atoms("performed")),
         ]);
         let filed = record(vec![
             ("row", row),
             (
                 "scheme",
-                Value::bytes(ply_ty::print_scheme(&info.scheme).as_bytes()),
+                printed("tycore.scheme_text", vec![read("scheme")]),
             ),
         ]);
         store.put_def(

@@ -1876,7 +1876,7 @@ fn site_view(site: &ply_eval::RaceSite) -> SiteView {
 }
 
 fn atoms(footprint: &Footprint) -> Vec<String> {
-    ply_ty::Printer::new().atoms(&footprint.0)
+    ply_ty::atom_texts(&footprint.0)
 }
 
 fn mutants_view(report: &crate::mutate::Report, loaded: &Loaded) -> MutantsView {
