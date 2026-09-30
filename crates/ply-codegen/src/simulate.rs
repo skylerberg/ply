@@ -209,22 +209,6 @@ fn release(c: &mut Ctx, at: usize) {
     c.release_regions(frames);
 }
 
-/// For the stack a live region's task runs on, the stack the region was entered from, where the
-/// task's body was written: the one that ran `simulate`, or a production region's root, which a
-/// production task's frames do not chain to.
-pub(crate) fn entered_from(c: &Ctx, stack: usize) -> Option<usize> {
-    c.sims.iter().find_map(|sim| {
-        let runs = sim
-            .tasks
-            .iter()
-            .any(|task| task.stack.is_some() && task.frames == stack);
-        runs.then(|| match sim.policy {
-            Policy::Host => sim.tasks[ROOT.0 as usize].frames,
-            Policy::Seeded => sim.stack,
-        })
-    })
-}
-
 /// Pops the innermost region and releases each task it never finished, which will not run again.
 pub(crate) fn end(c: &mut Ctx) -> Simulation {
     let tasks = c.sims.last().expect("a region is running").tasks.len();
@@ -376,9 +360,14 @@ unsafe fn start(ctx: *mut Ctx, at: usize, closure: Word) -> usize {
     let stack = Stack::new();
     let sp = stack.prepare(task_entry, ctx as usize);
     let parent = sim.stack;
+    let entered_from = match sim.policy {
+        Policy::Host => sim.tasks[ROOT.0 as usize].frames,
+        Policy::Seeded => sim.stack,
+    };
     let inherited = std::mem::take(&mut sim.tasks[at].inherited);
     let frames = c.open_stack(Some(parent));
     c.stacks[frames].list = inherited;
+    c.stacks[frames].entered_from = Some(entered_from);
     let sim = c.sims.last_mut().expect("a region is running");
     let floor = stack.floor();
     sim.tasks[at] = TaskStack {

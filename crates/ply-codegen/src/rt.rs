@@ -269,6 +269,9 @@ pub(crate) struct Frames {
     /// The detached body this stack is the own stack of; its frame at the bottom of `list` is
     /// hidden while one of its clauses runs, so it cannot say.
     pub(crate) body: Option<usize>,
+    /// For a task's stack, the stack its region was entered from, where the task's body was
+    /// written; a production task's `parent` is the scheduler loop's, which does not lead there.
+    pub(crate) entered_from: Option<usize>,
 }
 
 impl Frames {
@@ -277,6 +280,7 @@ impl Frames {
             list: Vec::new(),
             parent,
             body: None,
+            entered_from: None,
         }
     }
 }
