@@ -1,5 +1,6 @@
 // std.http — HTTP/1.1 framing.
 
+import std.bytes (int_of_ascii)
 import std.net (net, send_all)
 
 // --- The message ------------------------------------------------------------
@@ -596,17 +597,17 @@ fn length_of(raw: String, limits: Limits) -> Result<Framing, Refusal> = {
   let b = bytes_of_string(raw);
   if !all_digits(b) {
     Err({ status: 400, reason: "a `Content-Length` is one or more ASCII digits" })
-  } else if bytes_len(b) > 18 || digits_to_int(b, 0, 0) > limits.max_body {
-    Err({
-      status: 413,
-      reason: "the body is longer than " ++ int_to_string(limits.max_body) ++ " bytes",
-    })
-  } else { Ok(Length(digits_to_int(b, 0, 0))) }
+  } else {
+    // Only a length past what an `Int` holds fails to read, and it is past any limit too.
+    match int_of_ascii(b) {
+      Some(n) -> if n > limits.max_body { Err(too_long(limits)) } else { Ok(Length(n)) },
+      None -> Err(too_long(limits)),
+    }
+  }
 }
 
-// At most 18 digits by the guard above, so this cannot overflow.
-fn digits_to_int(b: Bytes, i: Int, acc: Int) -> Int =
-  if i >= bytes_len(b) { acc } else { digits_to_int(b, i + 1, acc * 10 + (bytes_at(b, i) - 48)) }
+fn too_long(limits: Limits) -> Refusal =
+  { status: 413, reason: "the body is longer than " ++ int_to_string(limits.max_body) ++ " bytes" }
 
 // --- Expect and Connection --------------------------------------------------
 
@@ -1210,16 +1211,18 @@ fn status_line(line: Bytes) -> Result<StatusLine, Refusal> = {
     let version = response_version(bytes_slice(line, 0, sp))?;
     let code = bytes_slice(line, sp + 1, min_int(sp + 4, n));
     let after = sp + 4;
-    if bytes_len(code) != 3 || !all_digits(code) {
-      Err({ status: 502, reason: "a status is three digits" })
-    } else if after < n && bytes_at(line, after) != 32 {
-      Err({ status: 502, reason: "a status line is `VERSION SP STATUS SP REASON`" })
-    } else {
-      Ok({
-        version: version,
-        status: digits_to_int(code, 0, 0),
-        reason: string_of_bytes_lossy(bytes_slice(line, min_int(after + 1, n), n)),
-      })
+    let status = if bytes_len(code) == 3 && all_digits(code) { int_of_ascii(code) } else { None };
+    match status {
+      None -> Err({ status: 502, reason: "a status is three digits" }),
+      Some(s) -> if after < n && bytes_at(line, after) != 32 {
+        Err({ status: 502, reason: "a status line is `VERSION SP STATUS SP REASON`" })
+      } else {
+        Ok({
+          version: version,
+          status: s,
+          reason: string_of_bytes_lossy(bytes_slice(line, min_int(after + 1, n), n)),
+        })
+      },
     }
   }
 }
@@ -2200,7 +2203,7 @@ fn values_of(lines: List<String>, prefix: String) -> List<String> =
 
 fn reference_int(raw: String) -> Int = {
   let b = bytes_of_string(raw);
-  if all_digits(b) && bytes_len(b) <= 18 { digits_to_int(b, 0, 0) } else { -1 }
+  if !all_digits(b) { -1 } else { match int_of_ascii(b) { Some(n) -> n, None -> -1 } }
 }
 
 test "no accepted head admits two framings" {
