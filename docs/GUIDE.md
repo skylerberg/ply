@@ -806,9 +806,9 @@ not license it, because no type records the join.
   binding, handed to an operation, put in a declared type, or handed to a
   `task.spawn` whose scheduler is older than the region).
 * `E0449`: a region handle (a cell, a task, or the continuation a clause's
-  `resume` binds) reaches a host operation, a host answer or an entry point's
-  argument (at run time). A continuation's type is an ordinary function's, so
-  this is the one check that sees it.
+  `resume` binds) reaches a host operation, a host answer, or an entry point's
+  argument or answer (at run time). A continuation's type is an ordinary
+  function's, so this is the one check that sees it.
 * `W0610`: a reference cycle; cycles are never freed.
 
 ## 8. Tests
