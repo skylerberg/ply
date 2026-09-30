@@ -3,8 +3,10 @@
 use crate::arena::{Arena, Slot};
 use crate::cont::Frame;
 use crate::semantics::arity_error;
-use crate::value::{Decimal, Fixed, List, Value, first_difference, type_error, values_equal};
-use crate::{Diagnostic, INT_TYPES, IntTy, Span, codes, map};
+use crate::value::{
+    Decimal, Fixed, FixedOp, List, Value, first_difference, type_error, values_equal,
+};
+use crate::{Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, map, slot};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use std::fmt;
@@ -128,6 +130,20 @@ pub enum Builtin {
     SecretOfString,
     SecretVerify,
     SecretIsEmpty,
+    // Appended, so every earlier builtin keeps its cache index.
+    U128OfInt,
+    I128OfInt,
+    IntOfU128,
+    IntOfI128,
+    U128ToString,
+    I128ToString,
+    U128OfString,
+    I128OfString,
+    /// Over any integer type: the exact answer, or `None` where it leaves the type.
+    CheckedAdd,
+    CheckedSub,
+    CheckedMul,
+    CheckedNeg,
 }
 
 impl Builtin {
@@ -224,6 +240,14 @@ impl Builtin {
             "secret_of_string" => Builtin::SecretOfString,
             "secret_verify" => Builtin::SecretVerify,
             "secret_is_empty" => Builtin::SecretIsEmpty,
+            "u128_to_string" => Builtin::U128ToString,
+            "i128_to_string" => Builtin::I128ToString,
+            "u128_of_string" => Builtin::U128OfString,
+            "i128_of_string" => Builtin::I128OfString,
+            "checked_add" => Builtin::CheckedAdd,
+            "checked_sub" => Builtin::CheckedSub,
+            "checked_mul" => Builtin::CheckedMul,
+            "checked_neg" => Builtin::CheckedNeg,
             _ => return None,
         })
     }
@@ -331,6 +355,18 @@ impl Builtin {
             Builtin::SecretOfString => "secret_of_string",
             Builtin::SecretVerify => "secret_verify",
             Builtin::SecretIsEmpty => "secret_is_empty",
+            Builtin::U128OfInt => "u128_of_int",
+            Builtin::I128OfInt => "i128_of_int",
+            Builtin::IntOfU128 => "int_of_u128",
+            Builtin::IntOfI128 => "int_of_i128",
+            Builtin::U128ToString => "u128_to_string",
+            Builtin::I128ToString => "i128_to_string",
+            Builtin::U128OfString => "u128_of_string",
+            Builtin::I128OfString => "i128_of_string",
+            Builtin::CheckedAdd => "checked_add",
+            Builtin::CheckedSub => "checked_sub",
+            Builtin::CheckedMul => "checked_mul",
+            Builtin::CheckedNeg => "checked_neg",
         }
     }
 
@@ -378,6 +414,15 @@ impl Builtin {
             | Builtin::I16OfInt
             | Builtin::I32OfInt
             | Builtin::I64OfInt
+            | Builtin::U128OfInt
+            | Builtin::I128OfInt
+            | Builtin::IntOfU128
+            | Builtin::IntOfI128
+            | Builtin::U128ToString
+            | Builtin::I128ToString
+            | Builtin::U128OfString
+            | Builtin::I128OfString
+            | Builtin::CheckedNeg
             | Builtin::IntOfU8
             | Builtin::IntOfU16
             | Builtin::IntOfU32
@@ -417,6 +462,9 @@ impl Builtin {
             | Builtin::SecretVerify
             | Builtin::Assert
             | Builtin::WrapAdd
+            | Builtin::CheckedAdd
+            | Builtin::CheckedSub
+            | Builtin::CheckedMul
             | Builtin::Min
             | Builtin::Max
             | Builtin::WrapSub
@@ -449,6 +497,8 @@ impl Builtin {
             IntTy::I16 => Builtin::I16OfInt,
             IntTy::I32 => Builtin::I32OfInt,
             IntTy::I64 => Builtin::I64OfInt,
+            IntTy::U128 => Builtin::U128OfInt,
+            IntTy::I128 => Builtin::I128OfInt,
         }
     }
 
@@ -462,6 +512,8 @@ impl Builtin {
             IntTy::I16 => Builtin::IntOfI16,
             IntTy::I32 => Builtin::IntOfI32,
             IntTy::I64 => Builtin::IntOfI64,
+            IntTy::U128 => Builtin::IntOfU128,
+            IntTy::I128 => Builtin::IntOfI128,
         }
     }
 
@@ -576,6 +628,18 @@ impl Builtin {
             Builtin::SecretOfString,
             Builtin::SecretVerify,
             Builtin::SecretIsEmpty,
+            Builtin::U128OfInt,
+            Builtin::I128OfInt,
+            Builtin::IntOfU128,
+            Builtin::IntOfI128,
+            Builtin::U128ToString,
+            Builtin::I128ToString,
+            Builtin::U128OfString,
+            Builtin::I128OfString,
+            Builtin::CheckedAdd,
+            Builtin::CheckedSub,
+            Builtin::CheckedMul,
+            Builtin::CheckedNeg,
         ]
     }
 }
@@ -593,9 +657,9 @@ pub enum Step {
 impl fmt::Debug for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Step::Done(v) => write!(f, "Done({v})"),
+            Step::Done(v) => write!(f, "Done({v:?})"),
             Step::Apply { callee, args, .. } => {
-                write!(f, "Apply({callee} to {} arguments)", args.len())
+                write!(f, "Apply({callee:?} to {} arguments)", args.len())
             }
         }
     }
@@ -797,7 +861,9 @@ fn call_with(
         | Builtin::I8OfInt
         | Builtin::I16OfInt
         | Builtin::I32OfInt
-        | Builtin::I64OfInt => {
+        | Builtin::I64OfInt
+        | Builtin::U128OfInt
+        | Builtin::I128OfInt => {
             let t = b.converts_into().expect("every `_of_int` names its type");
             let n = args[0].as_int(span, &format!("`{}`", t.of_int_name()))?;
             match Fixed::of(t, i128::from(n)) {
@@ -821,18 +887,73 @@ fn call_with(
         | Builtin::IntOfI8
         | Builtin::IntOfI16
         | Builtin::IntOfI32
-        | Builtin::IntOfI64 => {
+        | Builtin::IntOfI64
+        | Builtin::IntOfU128
+        | Builtin::IntOfI128 => {
             let t = b.converts_from().expect("every `int_of_` names its type");
             let f = args[0].as_fixed(span, &format!("`{}`", t.to_int_name()))?;
-            match i64::try_from(f.value()) {
-                Ok(n) => Ok(Step::Done(Value::Int(n))),
-                Err(_) => Err(Diagnostic::error(
+            match f.to_i128().and_then(|v| i64::try_from(v).ok()) {
+                Some(n) => Ok(Step::Done(Value::Int(n))),
+                None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    format!("`{}` was given {f}", t.to_int_name()),
+                    format!("`{}` was given {}", t.to_int_name(), slot(0)),
                 )
-                .primary(span, "past the largest `Int`")
-                .note("an `Int` is 64 bits and signed, so it does not hold every `U64`")),
+                .primary(span, "outside what an `Int` holds")
+                .note(format!(
+                    "an `Int` is 64 bits and signed, so it does not hold every `{t}`"
+                ))
+                .showing(vec![Plain::shown(&args[0])])),
             }
+        }
+
+        Builtin::U128ToString | Builtin::I128ToString => {
+            let f = args[0].as_fixed(span, &format!("`{}`", b.name()))?;
+            Ok(Step::Done(Value::str(f.to_decimal())))
+        }
+
+        Builtin::U128OfString | Builtin::I128OfString => {
+            let text = args[0].as_str(span, &format!("`{}`", b.name()))?;
+            let t = if b == Builtin::U128OfString {
+                IntTy::U128
+            } else {
+                IntTy::I128
+            };
+            Ok(Step::Done(option(fixed_of_text(t, text).map(Value::Fixed))))
+        }
+
+        Builtin::CheckedAdd | Builtin::CheckedSub | Builtin::CheckedMul => {
+            let answer = match (&args[0], &args[1]) {
+                (Value::Fixed(x), Value::Fixed(y)) if x.ty == y.ty => {
+                    let op = match b {
+                        Builtin::CheckedAdd => FixedOp::Add,
+                        Builtin::CheckedSub => FixedOp::Sub,
+                        _ => FixedOp::Mul,
+                    };
+                    x.checked(*y, op).map(Value::Fixed)
+                }
+                _ => {
+                    let x = args[0].as_int(span, &format!("`{}`", b.name()))?;
+                    let y = args[1].as_int(span, &format!("`{}`", b.name()))?;
+                    match b {
+                        Builtin::CheckedAdd => x.checked_add(y),
+                        Builtin::CheckedSub => x.checked_sub(y),
+                        _ => x.checked_mul(y),
+                    }
+                    .map(Value::Int)
+                }
+            };
+            Ok(Step::Done(option(answer)))
+        }
+
+        Builtin::CheckedNeg => {
+            let answer = match &args[0] {
+                Value::Fixed(x) => x.checked_neg().map(Value::Fixed),
+                other => other
+                    .as_int(span, "`checked_neg`")?
+                    .checked_neg()
+                    .map(Value::Int),
+            };
+            Ok(Step::Done(option(answer)))
         }
 
         // Raises rather than masking: a silent `& 0xFF` would write a byte nobody chose.
@@ -889,7 +1010,7 @@ fn call_with(
             match four {
                 Some(w) => Ok(Step::Done(Value::Fixed(Fixed::new(
                     IntTy::U32,
-                    u64::from(u32::from_le_bytes(w)),
+                    u128::from(u32::from_le_bytes(w)),
                 )))),
                 // Reported at the last index it would read: that is the one past the end.
                 None => Err(out_of_range(span, "bytes_u32_le", i + 3, b.len(), "bytes")),
@@ -1090,14 +1211,14 @@ fn call_with(
                 Some(at) => Ok(Step::Done(Value::Int(s[..at].chars().count() as i64))),
                 None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    format!(
-                        "`string_find` did not find {} in {}",
-                        Value::str(needle).render(),
-                        Value::str(s).render()
-                    ),
+                    format!("`string_find` did not find {} in {}", slot(0), slot(1)),
                 )
                 .primary(span, "this substring does not occur")
-                .note("guard with `string_contains`, which answers the same question as a `Bool`")),
+                .note("guard with `string_contains`, which answers the same question as a `Bool`")
+                .showing(vec![
+                    Plain::Str(needle.to_string()),
+                    Plain::Str(s.to_string()),
+                ])),
             }
         }
 
@@ -1279,13 +1400,14 @@ fn call_with(
         }
 
         Builtin::Panic => {
-            let message = match &args[0] {
-                Value::Str(s) => s.to_string(),
-                other => other.render(),
+            let (message, values) = match &args[0] {
+                Value::Str(s) => (s.to_string(), Vec::new()),
+                other => (slot(0), vec![Plain::shown(other)]),
             };
             Err(
                 Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
-                    .primary(span, "`panic` called here"),
+                    .primary(span, "`panic` called here")
+                    .showing(values),
             )
         }
 
@@ -1323,6 +1445,22 @@ fn call_with(
 
 fn at(xs: &List, i: i64) -> Option<&Value> {
     usize::try_from(i).ok().and_then(|i| xs.get(i))
+}
+
+/// Digits, after a `-` only for a signed width, and a value the width holds.
+fn fixed_of_text(t: IntTy, text: &str) -> Option<Fixed> {
+    let digits = match text.strip_prefix('-') {
+        Some(rest) if t.signed() => rest,
+        _ => text,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if t.signed() {
+        Fixed::of(t, text.parse::<i128>().ok()?)
+    } else {
+        Fixed::of_unsigned(t, text.parse::<u128>().ok()?)
+    }
 }
 
 fn option(v: Option<Value>) -> Value {
@@ -1805,28 +1943,41 @@ fn out_of_range(span: Span, what: &str, index: i64, len: usize, unit: &str) -> D
 }
 
 pub fn assertion_failure(actual: &Value, expected: &Value, span: Span) -> Diagnostic {
+    let (e, a) = (slot(0), slot(1));
+    let mut values = vec![Plain::shown(expected), Plain::shown(actual)];
     let mut diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
-        format!(
-            "assertion failed: expected {}, found {}",
-            expected.render(),
-            actual.render()
-        ),
+        format!("assertion failed: expected {e}, found {a}"),
     )
     .primary(span, "these values are not equal")
-    .note(format!("expected: {}", expected.render()))
-    .note(format!("actual:   {}", actual.render()));
+    .note(format!("expected: {e}"))
+    .note(format!("actual:   {a}"));
 
-    if let Some((path, exp, act)) = first_difference(actual, expected) {
+    if let Some(d) = first_difference(actual, expected) {
+        let mut path = String::new();
+        for step in d.path {
+            match step {
+                PathStep::Index(i) => path.push_str(&format!("[{i}]")),
+                PathStep::Key(k) => {
+                    path.push_str(&format!("[{}]", slot(values.len())));
+                    values.push(Plain::shown(&k));
+                }
+                PathStep::Field(name) => path.push_str(&format!(".{name}")),
+                PathStep::Arg(ctor, i) => path.push_str(&format!(".{ctor}.{i}")),
+            }
+        }
+        let (de, da) = (slot(values.len()), slot(values.len() + 1));
+        values.push(Plain::shown(&d.expected));
+        values.push(Plain::shown(&d.actual));
         diag = diag.note(format!(
-            "first difference at `{path}`: expected {exp}, found {act}"
+            "first difference at `{path}`: expected {de}, found {da}"
         ));
     }
-    diag
+    diag.showing(values)
 }
 
 pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
-    let mut diag = Diagnostic::error(
+    let diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
         "assertion failed: condition is false",
     )
@@ -1837,13 +1988,11 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
         // A non-`Option` message comes only from an unchecked call.
         other => Some(other),
     };
-    if let Some(message) = carried {
-        diag = diag.note(match message {
-            Value::Str(s) => s.to_string(),
-            other => other.render(),
-        });
+    match carried {
+        Some(Value::Str(s)) => diag.note(s.to_string()),
+        Some(other) => diag.note(slot(0)).showing(vec![Plain::shown(other)]),
+        None => diag,
     }
-    diag
 }
 
 #[cold]

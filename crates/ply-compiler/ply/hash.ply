@@ -2,14 +2,14 @@
 // A float literal hashes by its IEEE bit pattern.
 
 import spine (Span, Ident, QName, num)
-import lexer (byte_of, widths)
+import lexer (byte_of, widths, wide_decimal)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
               MWrite, MBad)
-import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LFixed, LBool,
-                 LStr, LBytes, LFloat, LDec, LUnit, LBad)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
+                 LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate, EBad,
-              Stmt, SLet, SExpr, Param, MatchArm, HandleClause, ReturnClause, RecField)
+              Stmt, SLet, SLetElse, SExpr, Param, MatchArm, HandleClause, ReturnClause, RecField)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, DJson, DEq, DOrd, SpecKind, SRequires, SEnsures, SpecClause,
@@ -584,6 +584,7 @@ fn t_lit_float() -> Int = 45
 fn t_lit_decimal() -> Int = 46
 // A tag of its own: `5` and `5u32` are different definitions. Tags never renumber, or stored hashes move.
 fn t_lit_fixed() -> Int = 96
+fn t_lit_wide() -> Int = 99
 fn t_e_lit() -> Int = 50
 fn t_e_var() -> Int = 51
 fn t_e_binary() -> Int = 52
@@ -603,12 +604,14 @@ fn t_e_simulate() -> Int = 65
 fn t_e_record_update() -> Int = 67
 fn t_s_let() -> Int = 70
 fn t_s_expr() -> Int = 71
+fn t_s_let_else() -> Int = 72
 fn t_p_wildcard() -> Int = 80
 fn t_p_var() -> Int = 81
 fn t_p_lit() -> Int = 82
 fn t_p_ctor() -> Int = 83
 fn t_p_record() -> Int = 84
 fn t_p_list() -> Int = 85
+fn t_p_or() -> Int = 86
 fn t_row() -> Int = 90
 fn t_atom() -> Int = 91
 fn t_atom_op() -> Int = 97
@@ -923,15 +926,18 @@ pub fn sort_bytes(xs: List<Bytes>) -> List<Bytes> =
     append(push(take(acc, i), x), map(range(i, n), |j: Int| at(acc, j)))
   })
 
+// An effect's operations share one encoder, so each one's type parameters go out of scope after it.
 fn op_def(z: Nz, op: OpDef) -> Nz = {
-  let z1: Nz = boolv(
-    emit(strv(tag(z, t_op()), op.name.name), byte_of(mode_byte(op.mode))),
-    op.resource_param,
+  let z1: Nz = u32v(
+    boolv(emit(strv(tag(z, t_op()), op.name.name), byte_of(mode_byte(op.mode))), op.resource_param),
+    len(op.ty_params),
   );
-  type_expr(
-    fold(op.params, u32v(z1, len(op.params)), |acc: Nz, p: TypeExpr| type_expr(acc, p)),
+  let bound: Nz = { ..z1, ty_params: append(z1.ty_params, map(op.ty_params, |p: Ident| p.name)) };
+  let encoded: Nz = type_expr(
+    fold(op.params, u32v(bound, len(op.params)), |acc: Nz, p: TypeExpr| type_expr(acc, p)),
     op.ret,
-  )
+  );
+  { ..encoded, ty_params: z.ty_params }
 }
 
 pub fn test_def(z: Nz, d: TestDef) -> Nz = expr(boolv(tag(z, t_test()), d.is_nondet), d.body)
@@ -1229,6 +1235,8 @@ fn sorted_run(z: Nz, stmts: List<Stmt>, from: Int, to: Int) -> { z: Nz, order: L
 fn stmt(z: Nz, s: Stmt) -> Nz =
   match s {
     SLet(l) -> pattern(expr(opt_type(tag(z, t_s_let()), l.ty), l.value), l.pat),
+    SLetElse(l) ->
+      expr(pattern(expr(opt_type(tag(z, t_s_let_else()), l.ty), l.value), l.pat), l.fallback),
     SExpr(e) -> expr(tag(z, t_s_expr()), e),
   }
 
@@ -1236,6 +1244,8 @@ fn lit(z: Nz, l: Lit) -> Nz =
   match l {
     LInt(i) -> emit(tag(z, t_lit_int()), i64_le(i)),
     LFixed(ty, v) -> emit(emit(tag(z, t_lit_fixed()), width_index(ty)), i64_le(v)),
+    LWide(ty, high, low) ->
+      emit(emit(emit(tag(z, t_lit_wide()), width_index(ty)), i64_le(high)), i64_le(low)),
     LBool(b) -> boolv(tag(z, t_lit_bool()), b),
     LStr(s) -> strv(tag(z, t_lit_str()), s),
     LBytes(b) -> emit(u32v(tag(z, t_lit_bytes()), bytes_len(b)), b),
@@ -1282,6 +1292,8 @@ fn pattern(z: Nz, p: Pattern) -> Nz =
         Some(rest) -> pattern(tag(items, t_some()), rest),
       }
     },
+    POr(o) ->
+      fold(o.alts, u32v(tag(z, t_p_or()), len(o.alts)), |acc: Nz, a: Pattern| pattern(acc, a)),
     PBad(_) -> panic("a placeholder pattern reached the hasher"),
   }
 
@@ -1359,6 +1371,11 @@ fn pattern_binders(p: Pattern, out: List<Bytes>) -> { count: Int, bound: List<By
         None -> items,
       }
     },
+    // Every alternative binds the same names, which the checker holds them to.
+    POr(o) -> match list_at(o.alts, 0) {
+      Some(a) -> pattern_binders(a, out),
+      None -> { count: 0, bound: out },
+    },
   }
 
 pub fn is_pure(e: Expr) -> Bool =
@@ -1382,7 +1399,12 @@ pub fn is_pure(e: Expr) -> Bool =
           acc && is_pure(a.body) && (match a.guard { Some(g) -> is_pure(g), None -> true })),
     EBlock(b) ->
       fold(b.stmts, true, |acc: Bool, s: Stmt|
-          acc && (match s { SLet(l) -> is_pure(l.value), SExpr(x) -> is_pure(x) }))
+          acc
+            && (match s {
+              SLet(l) -> is_pure(l.value),
+              SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
+              SExpr(x) -> is_pure(x),
+            }))
         && (match b.tail { Some(t) -> is_pure(t), None -> true }),
     ERecord(r) -> fold(r.fields, true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
     ERecordUpdate(r) ->
@@ -1418,6 +1440,9 @@ fn mentions(e: Expr, names: List<Bytes>) -> Bool =
           acc
             || (match s {
               SLet(l) -> pattern_mentions(l.pat, names) || mentions(l.value, names),
+              SLetElse(l) ->
+                pattern_mentions(l.pat, names) || mentions(l.value, names)
+                  || mentions(l.fallback, names),
               SExpr(x) -> mentions(x, names),
             }))
         || (match b.tail { Some(t) -> mentions(t, names), None -> false }),
@@ -1458,6 +1483,7 @@ fn pattern_mentions(p: Pattern, names: List<Bytes>) -> Bool =
     PList(l) ->
       fold(l.items, false, |acc: Bool, i: Pattern| acc || pattern_mentions(i, names))
         || (match l.rest { Some(rest) -> pattern_mentions(rest, names), None -> false }),
+    POr(o) -> fold(o.alts, false, |acc: Bool, a: Pattern| acc || pattern_mentions(a, names)),
   }
 
 // --- The hash table ----------------------------------------------------------------------
@@ -2162,7 +2188,11 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
         lambda_rets(arm.body, match arm.guard { Some(g) -> lambda_rets(g, acc), None -> acc })),
     EBlock(b) -> {
       let walked = fold(b.stmts, out, |acc: List<TypeExpr>, s: Stmt|
-        match s { SLet(x) -> lambda_rets(x.value, acc), SExpr(x) -> lambda_rets(x, acc) });
+        match s {
+          SLet(x) -> lambda_rets(x.value, acc),
+          SLetElse(x) -> lambda_rets(x.fallback, lambda_rets(x.value, acc)),
+          SExpr(x) -> lambda_rets(x, acc),
+        });
       match b.tail { Some(t) -> lambda_rets(t, walked), None -> walked }
     },
     ERecord(r) -> fold(r.fields, out, |acc: List<TypeExpr>, f: RecField| lambda_rets(f.value, acc)),
@@ -2697,6 +2727,21 @@ fn fixed_text(which: Int, v: Int) -> Bytes =
       ),
   }
 
+fn wide_text(which: Int, high: Int, low: Int) -> Bytes =
+  match list_at(widths(), which) {
+    None -> panic("a byte that is not a fixed-width integer type"),
+    Some(w) ->
+      bytes_concat(
+        if w.signed && high < 0 {
+          bytes_concat(
+            hex_int(high, 64),
+            bytes_concat_all(map(range(0, 16), |i: Int| hex_digit(low >>> 4 * (15 - i) & 15))),
+          )
+        } else { wide_decimal(false, high, low) },
+        w.name,
+      ),
+  }
+
 fn big_mul(n: List<Int>, f: Int, add: Int) -> List<Int> = {
   let r = fold(n, { limbs: [], carry: add }, |s: { limbs: List<Int>, carry: Int }, limb: Int| {
     let v = limb * f + s.carry;
@@ -2855,6 +2900,11 @@ fn p_lit(d: Dc) -> Got = {
     let w = rd_u8(e);
     let v = rd_int(w.d, 8);
     { d: v.d, t: fixed_text(w.v, v.v) }
+  } else if t.v == t_lit_wide() {
+    let w = rd_u8(e);
+    let high = rd_int(w.d, 8);
+    let low = rd_int(high.d, 8);
+    { d: low.d, t: wide_text(w.v, high.v, low.v) }
   } else if t.v == t_lit_unit() { { d: e, t: b"()" } }
   else { panic("a tag that is not a literal") }
 }
@@ -3274,6 +3324,10 @@ fn p_fn(x: Pr, d: Dc, name: Bytes) -> Got = {
   }
 }
 
+fn type_binders(count: Int) -> Bytes =
+  if count > 0 { bytes_concat_all([b"<", joined(map(range(0, count), tname), b", "), b">"]) }
+  else { b"" }
+
 fn p_type_def(x: Pr, d: Dc, name: Bytes) -> Got = {
   let n: Rd = rd_binders(expect(d, t_type(), b"a type"));
   let k = rd_u8({ ..n.d, typs: n.v });
@@ -3299,17 +3353,7 @@ fn p_type_def(x: Pr, d: Dc, name: Bytes) -> Got = {
     });
     { d: vs.d, t: bytes_concat_all(vs.ts) }
   } else { panic("a tag that does not begin a type body") };
-  {
-    d: body.d,
-    t: bytes_concat_all([
-      b"type ",
-      name,
-      if n.v > 0 { bytes_concat_all([b"<", joined(map(range(0, n.v), tname), b", "), b">"]) }
-      else { b"" },
-      b" = ",
-      body.t,
-    ]),
-  }
+  { d: body.d, t: bytes_concat_all([b"type ", name, type_binders(n.v), b" = ", body.t]) }
 }
 
 fn p_effect(x: Pr, d: Dc, name: Bytes) -> Got = {
@@ -3322,17 +3366,19 @@ fn p_effect(x: Pr, d: Dc, name: Bytes) -> Got = {
     let op = rd_text(expect(g, t_op(), b"an operation"));
     let m = rd_mode(op.d);
     let r = rd_bool(m.d);
-    let pc = rd_count(r.d);
+    let tc = rd_binders(r.d);
+    let pc = rd_count({ ..tc.d, typs: tc.v });
     let ps = rd_many(pc.d, pc.v, |h: Dc| p_type(x, h));
     let ret = p_type(x, ps.d);
     {
-      d: ret.d,
+      d: { ..ret.d, typs: g.typs },
       t: bytes_concat_all([
         nl(1),
         m.t,
         b" ",
         op.t,
         if r.v { b"[r]" } else { b"" },
+        type_binders(tc.v),
         b"(",
         joined(ps.ts, b", "),
         b") -> ",
@@ -3904,6 +3950,8 @@ test "a literal is spelled so it reads back to its bits" {
   );
   assert_eq(int_text(0 - 1), b"0xffffffffffffffff");
   assert_eq(fixed_text(4, 0 - 1), b"0xffi8");
+  assert_eq(wide_text(8, 1, 0), b"18446744073709551616u128");
+  assert_eq(wide_text(9, 0 - 1, 5), b"0xffffffffffffffff0000000000000005i128");
   assert_eq(bytes_lit(b"\x00\"q\xff"), b"b\"\\0\\\"q\\xff\"")
 }
 
@@ -4101,6 +4149,26 @@ test "a label binder, the resources it names and the labels a call fills print b
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "renaming an operation's type parameter does not move a hash, and it prints back bound" {
+  let boxed = |v: Bytes|
+    bytes_concat_all([
+      b"pub effect box { read take[k]<",
+      v,
+      b">(xs: List<",
+      v,
+      b">) -> ",
+      v,
+      b" }",
+    ]);
+  let out = hash_index(indexed([{ name: b"m", src: boxed(b"a") }]));
+  let renamed = hash_index(indexed([{ name: b"m", src: boxed(b"b") }]));
+  assert_eq(by_name(named_hashes(renamed)), by_name(named_hashes(out)));
+  let ms = printed_of(out, []);
+  assert(holds_text(at(ms, 0).text, b"read take[r]<_t0>(List<_t0>) -> _t0"));
+  let again = hash_index(indexed([{ name: b"m", src: at(ms, 0).text }]));
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 

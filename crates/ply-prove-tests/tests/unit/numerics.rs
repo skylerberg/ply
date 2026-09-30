@@ -26,7 +26,7 @@ fn floats(cases: u32) -> Vec<f64> {
         .into_iter()
         .map(|v| match v {
             Value::Float(f) => f,
-            other => panic!("expected a Float, got {other}"),
+            other => panic!("expected a Float, got {other:?}"),
         })
         .collect()
 }
@@ -36,7 +36,7 @@ fn decimals(cases: u32) -> Vec<Decimal> {
         .into_iter()
         .map(|v| match v {
             Value::Decimal(d) => d,
-            other => panic!("expected a Decimal, got {other}"),
+            other => panic!("expected a Decimal, got {other:?}"),
         })
         .collect()
 }
@@ -153,9 +153,7 @@ fn every_numeric_candidate_is_strictly_smaller() {
         for candidate in candidates(&subject, &ty, &world) {
             assert!(
                 size(&candidate, &world) < here,
-                "{} offered {} which is not smaller",
-                subject.render(),
-                candidate.render()
+                "{subject:?} offered {candidate:?} which is not smaller"
             );
         }
     }

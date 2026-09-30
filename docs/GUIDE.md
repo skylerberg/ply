@@ -96,7 +96,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | form | type | notes |
 | --- | --- | --- |
 | `42`, `1_000_000`, `0xFF` | `Int` | 64-bit signed; `_` between digits. Hex is bounded as a 64-bit pattern, so `0xFFFF_FFFF_FFFF_FFFF` is `-1`. |
-| `255u8`, `0x6A09_E667u32`, `-1i8` | fixed width | Suffix `u8` `u16` `u32` `u64` `i8` `i16` `i32` `i64`. Decimal spellings are bounded by range (`256u8` is `E0211`), hex by width (`0xFFu8` is 255). |
+| `255u8`, `0x6A09_E667u32`, `-1i8` | fixed width | Suffix `u8` `u16` `u32` `u64` `u128` `i8` `i16` `i32` `i64` `i128`. Decimal spellings are bounded by range (`256u8` is `E0211`), hex by width (`0xFFu8` is 255). |
 | `1.5`, `1e9`, `2.5e-3` | `Float` | IEEE-754 binary64. |
 | `1.50m`, `0m` | `Decimal` | Exact base 10; up to 28 fractional digits, 96-bit mantissa; keeps its written scale. |
 | `"text"` | `String` | UTF-8; no line breaks. |
@@ -322,7 +322,7 @@ signatures are checked, not inferred (§4.7).
 | type | values |
 | --- | --- |
 | `Int` | 64-bit signed; the type to count and index with |
-| `U8` `U16` `U32` `U64` `I8` `I16` `I32` `I64` | fixed widths, for data defined in a width |
+| `U8` `U16` `U32` `U64` `U128` `I8` `I16` `I32` `I64` `I128` | fixed widths, for data defined in a width and for exact answers past `Int` |
 | `Float` | IEEE-754 binary64 |
 | `Decimal` | exact base 10; `+ - * %` are exact or raise |
 | `Bool`, `Unit` | `true`/`false`, `()` |
@@ -334,7 +334,8 @@ definition, so `fn h(a: U32) -> U32 = a + 1u32` checks and `a + 1` does not. An
 operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210` — the same
 code a `++` that says neither `String` nor `Bytes` raises; there is no default. Conversions are explicit builtins (§12.3). `u32_of_int` and its
 siblings raise when the value does not fit (mask to truncate:
-`u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`.
+`u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`, and a 128-bit
+value past `Int` through its decimal text (`u128_of_string`).
 `string_of_bytes` raises on invalid UTF-8.
 
 ### 4.2 Records and tuples
@@ -477,7 +478,19 @@ fn sum_two(input: Bytes) -> Int = {
 }
 ```
 
-A record pattern names every field or ends with `..` (`E0201`).
+A record pattern names every field or ends with `..` (`E0201`). A `let` whose
+pattern does not match raises; `let <pattern> = <expr> else { .. };` says what
+happens instead. Where the pattern misses, the `else` block is the value of the
+block the statement is in, and the statements after it do not run; it has that
+block's type and sees none of the pattern's names. `?` in the `else` exits as it
+would from the block's tail.
+
+```ply
+fn first_word(line: String) -> String = {
+  let [word, ..] = string_split(line, " ") else { "" };
+  word
+}
+```
 
 `if a { x } else if b { y } else { z }` requires braces and one type for every
 branch; without `else` its type is `Unit`.
@@ -505,6 +518,13 @@ guard: `[x, y, ..rest] if x > y -> x + len(rest),`. A `match` must be exhaustive
 | `[]`, `[a, b]`, `[a, ..]`, `[a, ..rest]` | a list of exact length, or a prefix |
 | `{a, b}`, `{a: p, b: q}`, `{a, ..}` | a record; `..` allows other fields |
 | `(p, q)` | a tuple |
+| `p \| q` | either alternative, the leftmost first; parentheses nest a choice |
+
+Every alternative binds the same names at one type (`E0212`). An arm is tried
+once per alternative, so a guard runs again for a later alternative when an
+earlier one matched and the guard refused it. A plain `let` may use an
+or-pattern only where its alternatives cover the type, as in
+`let Ok(v) | Err(v) = r;`; one that can fail needs an `else` (`E0213`).
 
 ### 5.3 Lambdas
 
@@ -642,6 +662,12 @@ Each operation is `read` or `write`. `[r]` makes it resource-parameterized: a
 perform must supply a label (`E0304`). `nondet` marks results that are not a
 function of program state (§8.3). Effects are nominal. `task`, `clock`,
 `random`, `sim` and `cell` are taken (`E0105`).
+
+An operation's type parameters sit just before its parameters,
+`read take[r]<a>(key: Int) -> a`, and are its only type variables: its
+signature resolves names as a `fn` signature does, so a lowercase name its list
+does not declare, or a type name not in scope, is `E0102`. Each perform picks
+its own `a`, so a clause for the operation has to answer every type (`E0201`).
 
 ### 6.2 Atoms and rows
 
@@ -1186,9 +1212,13 @@ Strings are indexed by character, bytes by byte.
 | `float_of_string(s: String) -> Option<Float>` | `Float` literal syntax with a sign; `None` for `inf`/`NaN` |
 | `decimal_to_string(d: Decimal) -> String` | |
 | `bits_of_float(f: Float) -> Int`, `float_of_bits(n: Int) -> Float` | IEEE-754 bit pattern; total |
-| `u8_of_int(n: Int) -> U8` … `i64_of_int(n: Int) -> I64` | eight; raise if out of range |
-| `int_of_u8(n: U8) -> Int` … `int_of_i64(n: I64) -> Int` | eight; total but `int_of_u64` |
+| `u8_of_int(n: Int) -> U8` … `i128_of_int(n: Int) -> I128` | ten; raise if out of range |
+| `int_of_u8(n: U8) -> Int` … `int_of_i128(n: I128) -> Int` | ten; total but `int_of_u64`, `int_of_u128` and `int_of_i128` |
+| `u128_to_string(n: U128) -> String`, `i128_to_string(n: I128) -> String` | decimal |
+| `u128_of_string(s: String) -> Option<U128>`, `i128_of_string(s: String) -> Option<I128>` | decimal digits, after a `-` only for `I128`; `None` otherwise or out of range |
 | `wrap_add`, `wrap_sub`, `wrap_mul` `(a: t, b: t) -> t` | any integer `t`; wraps at `t`'s width |
+| `checked_add`, `checked_sub`, `checked_mul` `(a: t, b: t) -> Option<t>` | any integer `t`, `Int` too; `None` where the exact answer leaves `t` |
+| `checked_neg(a: t) -> Option<t>` | any integer `t`; `None` for an unsigned nonzero `a` and a signed type's least value |
 | `rotr(x: t, n: Int) -> t` | rotate right at `t`'s width, count modulo the width |
 | `rotr32(x: Int, n: Int) -> Int` | rotate the low 32 bits of an `Int` |
 
@@ -2373,6 +2403,36 @@ nothing here raises. `is_sign_negative` holds for `-0.0` and a negative NaN too.
 is. `pow2(k)` is `2^k` exactly, through the subnormals down to `2^-1074`, zero
 below that and an infinity above `2^1023`.
 
+### 13.35 `std.value`
+
+```ply
+pub type Value =
+  | VUnit | VBool(Bool) | VInt(Int) | VFloat(Float) | VDecimal(Decimal)
+  | VFixed(String, U128) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
+  | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
+  | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
+pub type Field = { name: String, value: Value }
+pub type Entry = { key: Value, value: Value }
+pub type Fun =
+  | FNamed(String) | FAnonymous | FConst({ arity: Int, value: Value })
+  | FProject({ arity: Int, index: Int })
+  | FTable({ arity: Int, entries: List<Entry>, default: Value })
+pub fn render(v: Value) -> String
+pub fn filled(text: String, values: List<Value>) -> String
+pub fn shown_items() -> Int
+pub fn shown_depth() -> Int
+```
+
+A value of any type as data: what `machine.call` takes and answers, what a
+runtime diagnostic carries, and what a counterexample binds. `render` is the one
+way a value is shown, in the language's own spelling. A list or map past
+`shown_items` items counts the rest, nesting past `shown_depth` shows as `…`,
+and a credential shows as `Secret(****)`. A fixed width holds the bit pattern it
+reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
+a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
+and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each
+value a runtime diagnostic's text names in its place.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
@@ -2737,6 +2797,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0209` | `/` on `Decimal` |
 | `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
+| `E0212` | the alternatives of an or-pattern bind different names |
+| `E0213` | a `let` whose or-pattern can fail has no `else` |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |

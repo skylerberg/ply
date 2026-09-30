@@ -214,7 +214,7 @@ fn the_goldens_reach_every_tag_the_parser_can_emit() {
 }
 
 /// Every tag the parser's dump can emit.
-const EMITTABLE: [&str; 103] = [
+const EMITTABLE: [&str; 106] = [
     // nodes
     "arm",
     "atm",
@@ -256,6 +256,7 @@ const EMITTABLE: [&str; 103] = [
     "prec",
     "prm",
     "pvar",
+    "por",
     "pwld",
     "qname",
     "rcl",
@@ -263,6 +264,7 @@ const EMITTABLE: [&str; 103] = [
     "set",
     "sexp",
     "slet",
+    "slete",
     "spc",
     "tcon",
     "tfn",
@@ -319,5 +321,6 @@ const EMITTABLE: [&str; 103] = [
     "%true",
     "%unit",
     "%ushr",
+    "%wide",
     "%write",
 ];

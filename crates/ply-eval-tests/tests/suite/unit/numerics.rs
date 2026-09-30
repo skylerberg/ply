@@ -27,11 +27,11 @@ fn the_language_equality_and_the_map_order_part_only_at_nan_and_signed_zero() {
 }
 
 #[test]
-fn a_float_renders_so_it_cannot_be_read_as_an_int() {
-    assert_eq!(Value::Float(1.0).render(), "1.0");
-    assert_eq!(Value::Float(-0.0).render(), "-0.0");
-    assert_eq!(Value::Float(f64::NAN).render(), "NaN");
-    assert_eq!(Value::Float(f64::INFINITY).render(), "Infinity");
-    assert_eq!(Value::Float(f64::NEG_INFINITY).render(), "-Infinity");
+fn a_floats_text_cannot_be_read_as_an_int() {
+    assert_eq!(ply_eval::render_float(1.0), "1.0");
+    assert_eq!(ply_eval::render_float(-0.0), "-0.0");
+    assert_eq!(ply_eval::render_float(f64::NAN), "NaN");
+    assert_eq!(ply_eval::render_float(f64::INFINITY), "Infinity");
+    assert_eq!(ply_eval::render_float(f64::NEG_INFINITY), "-Infinity");
     assert_eq!(Value::Float(1.0).type_name(), "Float");
 }

@@ -14,13 +14,14 @@ mod selector_reads;
 mod strategy;
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{Front, Machine, Provider, SourceId, Span, Value};
-use std::collections::HashMap;
+use ply_eval::{Front, Machine, Provider, Span, Value};
 use std::sync::Arc;
 
 /// The outer program: load the root it is handed, bind and enter `inner.main`, answer with how
 /// that ended. The effect, and the record shapes crossing it, are the program's own declarations.
 const OUTER: &str = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -34,8 +35,7 @@ nondet effect machine {
 }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Raised = { diag: Diag, values: List<Value> }
 
 type Options = { host: Bool, trace: TraceOpts }
 type TraceOpts = { sink: String, level: String }
@@ -119,8 +119,8 @@ type Json = | Null
 
 type Ended = {
   exit: Option<Int>,
-  value: Option<String>,
-  raised: Option<Diag>,
+  value: Option<Value>,
+  raised: Option<Raised>,
   counters: Counters,
   cycles: List<Diag>,
   stopping: Option<Stopping>,
@@ -160,11 +160,16 @@ fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m
 }
 "#;
 
-fn front_of(source: &str) -> Front {
-    let named = vec![("m".to_string(), source.to_string())];
-    let ids = vec![SourceId(0)];
+/// The program checked with the standard library it imports, and compiled.
+fn built(source: &str) -> (Front, &'static ply_codegen::Unit) {
     ply_codegen::c::producer::ensure_default();
-    ply_codegen::c::producer::checked_front(&named, &ids).expect("the outer program checks")
+    let answered =
+        ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), source.to_string())])
+            .expect("the outer program checks");
+    let unit =
+        ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
+            .expect("this host has a C toolchain");
+    (answered.front, unit)
 }
 
 /// The inner program's home: a directory with `inner.ply` in it.
@@ -176,10 +181,7 @@ fn project(inner: &str) -> tempfile::TempDir {
 
 fn entered_with(inner: &str, host: bool) -> Value {
     let project = project(inner);
-    let front = front_of(OUTER);
-    let texts: HashMap<String, String> =
-        [("m".to_string(), OUTER.to_string())].into_iter().collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
@@ -219,14 +221,17 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("the answer holds `{name}`"))
 }
 
-fn option_text(value: &Value) -> Option<String> {
+fn option_value(value: &Value) -> Option<&Value> {
     match value {
-        Value::Ctor { name, args } if name.as_str() == "Some" => args
-            .first()
-            .map(|v| v.as_str(Span::DUMMY, "text").unwrap().to_string()),
+        Value::Ctor { name, args } if name.as_str() == "Some" => args.first(),
         Value::Ctor { name, .. } if name.as_str() == "None" => None,
         other => panic!("an Option, not {}", other.type_name()),
     }
+}
+
+/// A nested program's `Int` answer, as `std.value` carries it.
+fn vint(n: i64) -> Value {
+    Value::ctor("std.value.VInt", vec![Value::Int(n)])
 }
 
 fn option_int(value: &Value) -> Option<i64> {
@@ -246,9 +251,9 @@ fn main() -> Int = 40 + 2
 #[test]
 fn a_program_loads_binds_and_enters_a_program() {
     let answer = entered(INNER);
-    assert_eq!(option_text(field(&answer, "value")).as_deref(), Some("42"));
+    assert_eq!(option_value(field(&answer, "value")), Some(&vint(42)));
     assert_eq!(option_int(field(&answer, "exit")), None);
-    assert_eq!(option_text(field(&answer, "raised")), None);
+    assert_eq!(option_value(field(&answer, "raised")), None);
 }
 
 #[test]
@@ -262,8 +267,8 @@ fn main() -> Unit / {process.exit[proc]} = process.exit[proc](7)
         true,
     );
     assert_eq!(option_int(field(&answer, "exit")), Some(7));
-    assert_eq!(option_text(field(&answer, "value")), None);
-    assert_eq!(option_text(field(&answer, "raised")), None);
+    assert_eq!(option_value(field(&answer, "value")), None);
+    assert_eq!(option_value(field(&answer, "raised")), None);
 }
 
 #[test]
@@ -275,9 +280,9 @@ fn main() -> Int = panic("the inner program's own bug")
     );
     // A raise is a diagnostic value; the outer program does not read inside it.
     assert!(option_int(field(&answer, "exit")).is_none());
-    assert_eq!(option_text(field(&answer, "value")), None);
+    assert_eq!(option_value(field(&answer, "value")), None);
     let raised = match field(&answer, "raised") {
-        Value::Ctor { name, args } if name.as_str() == "Some" => &args[0],
+        Value::Ctor { name, args } if name.as_str() == "Some" => field(&args[0], "diag"),
         other => panic!("the raise is reported, not unwound: {other:?}"),
     };
     let text = |name: &str| {
@@ -297,10 +302,7 @@ fn main() -> Int = panic("the inner program's own bug")
 #[test]
 fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
     // The outer program panics with the refusal's first message; the outer machine raises it.
-    let front = front_of(OUTER);
-    let texts: HashMap<String, String> =
-        [("m".to_string(), OUTER.to_string())].into_iter().collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
@@ -324,6 +326,8 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
 /// A load, a bound entry, then a reload after the tree moved: the second answer is the new
 /// program's.
 const OUTER_TWICE: &str = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -337,8 +341,8 @@ nondet effect machine {
 }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
+type Raised = { diag: Diag, values: List<Value> }
 
 type Options = { host: Bool, trace: TraceOpts }
 type TraceOpts = { sink: String, level: String }
@@ -399,19 +403,19 @@ type Front = {
 }
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
 
-type Ended = { exit: Option<Int>, value: Option<String>, raised: Option<Diag>, rest: Int }
+type Ended = { exit: Option<Int>, value: Option<Value>, raised: Option<Raised>, rest: Int }
 
-fn once() -> Option<String> / {machine.bound[m], machine.enter[m]} = {
+fn once() -> Option<Value> / {machine.bound[m], machine.enter[m]} = {
   let _b = machine.bound[m]("inner.main");
   (machine.enter[m]()).value
 }
 
-fn main(root: String, front: Front) -> Option<String> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
+fn main(root: String, front: Front) -> Option<Value> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
   let _loaded = machine.load[m](root, Some(front), None);
   once()
 }
 
-fn again(front: Front) -> Option<String> / {machine.reload[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+fn again(front: Front) -> Option<Value> / {machine.reload[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
   let _again = machine.reload[m](front);
   let value = once();
   machine.drop[m]();
@@ -425,11 +429,7 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     let inner = project.path().join("inner.ply");
     std::fs::write(&inner, "fn main() -> Int = 1\n").unwrap();
 
-    let front = front_of(OUTER_TWICE);
-    let texts: HashMap<String, String> = [("m".to_string(), OUTER_TWICE.to_string())]
-        .into_iter()
-        .collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER_TWICE);
 
     let mut registry = HostRegistry::new();
     ply_machine::register_with(&mut registry, ply_machine::drive::RunOptions::default());
@@ -449,7 +449,7 @@ fn a_reload_after_an_edit_enters_the_new_program() {
         "m.main",
         vec![Value::str(root), crate::fixture::handed(project.path())],
     );
-    assert_eq!(option_text(&first).as_deref(), Some("1"));
+    assert_eq!(option_value(&first), Some(&vint(1)));
     assert!(
         !project.path().join(".ply-cache").exists(),
         "a machine's load reads the answer it was handed and files nothing"
@@ -458,8 +458,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     std::fs::write(&inner, "fn main() -> Int = 2\n").unwrap();
     let second = call("m.again", vec![crate::fixture::handed(project.path())]);
     assert_eq!(
-        option_text(&second).as_deref(),
-        Some("2"),
+        option_value(&second),
+        Some(&vint(2)),
         "the reload read the edited program"
     );
 }
@@ -469,6 +469,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
 #[test]
 fn a_configured_machine_binds_what_the_options_say() {
     let outer = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -483,8 +485,7 @@ nondet effect machine {
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Raised = { diag: Diag, values: List<Value> }
 
 type TlsCred = { name: String, cert: String, key: String }
 type Named = { name: String, path: String }
@@ -574,7 +575,7 @@ type Front = {
   cached: Bool,
 }
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
-type Ended = { exit: Option<Int>, value: Option<String>, raised: Option<Diag>, rest: Int }
+type Ended = { exit: Option<Int>, value: Option<Value>, raised: Option<Raised>, rest: Int }
 
 fn opts(host: Bool) -> Options =
   {
@@ -618,7 +619,7 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
         Ok(b) -> {
           let ended = machine.enter[m]();
           machine.drop[m]();
-          !b.hermetic && ended.value == Some("77")
+          !b.hermetic && ended.value == Some(VInt(77))
         },
       }
     },
@@ -629,10 +630,7 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
     let project = tempfile::tempdir().expect("a temporary directory");
     std::fs::write(project.path().join("inner.ply"), "fn main() -> Int = 77\n").unwrap();
 
-    let front = front_of(outer);
-    let texts: HashMap<String, String> =
-        [("m".to_string(), outer.to_string())].into_iter().collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(outer);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
@@ -649,7 +647,7 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
             Span::DUMMY,
         )
         .expect("the outer main ran");
-    assert_eq!(answer.to_string(), "true", "the configured host bound");
+    assert_eq!(answer, Value::Bool(true), "the configured host bound");
 }
 
 // --- `machine.call` ----------------------------------------------------------
@@ -658,6 +656,8 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
 /// with one argument. The machine module here is `m`, so the values it is handed are `m.VInt`
 /// and the like.
 const OUTER_CALL: &str = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -686,8 +686,20 @@ type Front = {
 }
 type Refusal = Unit
 type Ended = Unit
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+type Fix = { title: Bytes, edits: List<Edit> }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+type Raised = { diag: Diag, values: List<Value> }
 type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
 fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
@@ -703,7 +715,7 @@ fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[
         match doubled {
           Ok(v) -> match v {
             VInt(i) -> match raised {
-              Err(r) -> if string_contains(r.message, "oh no") {
+              Err(r) -> if bytes_index_of(r.diag.message, b"oh no") != None {
                 { value: i, steps: first.steps, reset: again.steps, raised_steps: after_raised.steps }
               } else { { value: 0 - 4, steps: 0, reset: 0, raised_steps: 0 } },
               Ok(_) -> { value: 0 - 3, steps: 0, reset: 0, raised_steps: 0 },
@@ -731,21 +743,16 @@ pub fn boom() -> Int = panic("oh no")
 #[test]
 fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
     let project = project(INNER_CALL);
-    let front = front_of(OUTER_CALL);
-    let texts: HashMap<String, String> = [("m".to_string(), OUTER_CALL.to_string())]
-        .into_iter()
-        .collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER_CALL);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
-    ply_machine::register_with_for(
+    ply_machine::register_with(
         &mut registry,
         ply_machine::drive::RunOptions {
             host: false,
             ..Default::default()
         },
-        "m",
     );
     let binding = registry.bind(&front.check).expect("the machine ops bind");
     machine.set_host_binding(Arc::new(binding));
@@ -760,7 +767,7 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
         )
         .expect("the outer main ran");
     let Value::Record(fields) = &answer else {
-        panic!("the outer program answers a record, not {answer}");
+        panic!("the outer program answers a record, not {answer:?}");
     };
     let field = |name: &str| {
         fields
@@ -774,7 +781,7 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
     let Value::Int(steps) = field("steps") else {
         panic!("steps is an int");
     };
-    assert!(*steps > 0, "the call's steps were not counted: {answer}");
+    assert!(*steps > 0, "the call's steps were not counted: {answer:?}");
     assert_eq!(
         field("reset"),
         &Value::Int(0),
@@ -786,13 +793,15 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
     };
     assert!(
         *raised_steps > 0,
-        "the raising call's steps were not counted: {answer}"
+        "the raising call's steps were not counted: {answer:?}"
     );
 }
 
 /// The outer program: call the constant `inner.constant` twice, reading the accounting after
 /// each; its twin twice under one read; then a name the inner program never defined.
 const OUTER_TOTAL: &str = r#"
+import std.value (Value, VInt)
+
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
@@ -821,8 +830,20 @@ type Front = {
 }
 type Refusal = Unit
 type Ended = Unit
-type Raised = { code: String, message: String }
-type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+type Fix = { title: Bytes, edits: List<Edit> }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+type Raised = { diag: Diag, values: List<Value> }
 type Spent = { answers: List<Int>, ran: Int, remembered: Int, both: Int, declined: Int }
 
 fn spent() -> Int / {machine.accounting[m]} = (machine.accounting[m]()).steps
@@ -868,19 +889,11 @@ pub fn twin() -> Int = deep(50)
 #[test]
 fn a_memo_answer_and_a_decline_add_no_steps_to_the_accounting() {
     let project = project(INNER_TOTAL);
-    let front = front_of(OUTER_TOTAL);
-    let texts: HashMap<String, String> = [("m".to_string(), OUTER_TOTAL.to_string())]
-        .into_iter()
-        .collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER_TOTAL);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
-    ply_machine::register_with_for(
-        &mut registry,
-        ply_machine::drive::RunOptions::default(),
-        "m",
-    );
+    ply_machine::register_with(&mut registry, ply_machine::drive::RunOptions::default());
     let binding = registry.bind(&front.check).expect("the machine ops bind");
     machine.set_host_binding(Arc::new(binding));
     let answer = machine
@@ -896,32 +909,35 @@ fn a_memo_answer_and_a_decline_add_no_steps_to_the_accounting() {
     let int = |value: &Value| {
         value
             .as_int(Span::DUMMY, "a count")
-            .unwrap_or_else(|d| panic!("{d}: {answer}"))
+            .unwrap_or_else(|d| panic!("{d}: {answer:?}"))
     };
     let Value::List(answers) = field(&answer, "answers") else {
-        panic!("the answers are a list: {answer}");
+        panic!("the answers are a list: {answer:?}");
     };
     // `inner.absent` is declined, which the machine answers as a raise.
     assert_eq!(
         answers.iter().map(int).collect::<Vec<_>>(),
         [50, 50, 50, 50, -1],
-        "{answer}"
+        "{answer:?}"
     );
     let ran = int(field(&answer, "ran"));
-    assert!(ran > 0, "the first call's steps were not counted: {answer}");
+    assert!(
+        ran > 0,
+        "the first call's steps were not counted: {answer:?}"
+    );
     assert_eq!(
         int(field(&answer, "remembered")),
         0,
-        "the memo's answer added the call before it to the accounting: {answer}"
+        "the memo's answer added the call before it to the accounting: {answer:?}"
     );
     assert_eq!(
         int(field(&answer, "both")),
         ran,
-        "a run and the memo's answer after it were totalled as two runs: {answer}"
+        "a run and the memo's answer after it were totalled as two runs: {answer:?}"
     );
     assert_eq!(
         int(field(&answer, "declined")),
         0,
-        "the declined call added the call before it to the accounting: {answer}"
+        "the declined call added the call before it to the accounting: {answer:?}"
     );
 }

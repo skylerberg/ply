@@ -64,17 +64,23 @@ fn a_lower_constructor_is_smaller_than_a_higher_one() {
 #[test]
 fn the_floor_of_every_type_is_its_smallest_value() {
     let world = adts();
-    assert_eq!(minimal(&Sort::int(), &world).unwrap().render(), "0");
-    assert_eq!(minimal(&Sort::bool(), &world).unwrap().render(), "false");
-    assert_eq!(minimal(&Sort::string(), &world).unwrap().render(), "\"\"");
-    assert_eq!(minimal(&Sort::bytes(), &world).unwrap().render(), "b\"\"");
-    assert_eq!(minimal(&Sort::unit(), &world).unwrap().render(), "()");
+    assert_eq!(minimal(&Sort::int(), &world).unwrap(), Value::Int(0));
+    assert_eq!(minimal(&Sort::bool(), &world).unwrap(), Value::Bool(false));
+    assert_eq!(minimal(&Sort::string(), &world).unwrap(), Value::str(""));
+    assert_eq!(minimal(&Sort::bytes(), &world).unwrap(), Value::bytes(b""));
+    assert_eq!(minimal(&Sort::unit(), &world).unwrap(), Value::Unit);
     assert_eq!(
-        minimal(&Sort::list(Sort::int()), &world).unwrap().render(),
-        "[]"
+        minimal(&Sort::list(Sort::int()), &world).unwrap(),
+        Value::list(Vec::new())
     );
-    assert_eq!(minimal(&con("Opt"), &world).unwrap().render(), "Nothing");
-    assert_eq!(minimal(&con("Tree"), &world).unwrap().render(), "Leaf");
+    assert_eq!(
+        minimal(&con("Opt"), &world).unwrap(),
+        Value::ctor("Nothing", Vec::new())
+    );
+    assert_eq!(
+        minimal(&con("Tree"), &world).unwrap(),
+        Value::ctor("Leaf", Vec::new())
+    );
 }
 
 #[test]
@@ -91,7 +97,10 @@ fn a_recursive_types_floor_terminates() {
         )],
         [],
     );
-    assert_eq!(minimal(&con("Tree"), &world).unwrap().render(), "Leaf");
+    assert_eq!(
+        minimal(&con("Tree"), &world).unwrap(),
+        Value::ctor("Leaf", Vec::new())
+    );
 }
 
 #[test]
@@ -117,44 +126,46 @@ fn a_value_the_type_does_not_describe_offers_nothing() {
 #[test]
 fn a_candidate_order_is_fixed() {
     let world = World::default();
-    let rendered = |v: &Value, t: &Sort| {
-        candidates(v, t, &world)
-            .iter()
-            .map(|c| c.render())
-            .collect::<Vec<_>>()
-    };
+    let offered = |v: &Value, t: &Sort| candidates(v, t, &world);
+    let ints = |xs: &[i64]| xs.iter().map(|&i| Value::Int(i)).collect::<Vec<_>>();
+    let list = |xs: &[i64]| Value::list(ints(xs));
     assert_eq!(
-        rendered(&Value::Int(9), &Sort::int()),
-        vec!["0", "4", "2", "1", "8"]
+        offered(&Value::Int(9), &Sort::int()),
+        ints(&[0, 4, 2, 1, 8])
     );
     assert_eq!(
-        rendered(&Value::Int(-4), &Sort::int()),
-        vec!["0", "-2", "-1", "-3", "4"]
+        offered(&Value::Int(-4), &Sort::int()),
+        ints(&[0, -2, -1, -3, 4])
     );
     assert_eq!(
-        rendered(
-            &Value::list(vec![Value::Int(1), Value::Int(2)]),
-            &Sort::list(Sort::int())
-        ),
+        offered(&list(&[1, 2]), &Sort::list(Sort::int())),
         vec![
-            "[]", "[1]", "[2]", "[2]", "[1]", "[0, 2]", "[1, 0]", "[1, 1]"
+            list(&[]),
+            list(&[1]),
+            list(&[2]),
+            list(&[2]),
+            list(&[1]),
+            list(&[0, 2]),
+            list(&[1, 0]),
+            list(&[1, 1])
         ]
     );
     assert_eq!(
-        rendered(&Value::str("bc"), &Sort::string())[..3],
-        ["\"\"".to_string(), "\"b\"".to_string(), "\"c\"".to_string()]
+        offered(&Value::str("bc"), &Sort::string())[..3],
+        [Value::str(""), Value::str("b"), Value::str("c")]
     );
     // Length first, then content: `b""`, the two halves, then each byte lowered toward zero.
     assert_eq!(
-        rendered(&Value::bytes([2, 4]), &Sort::bytes()),
+        offered(&Value::bytes([2, 4]), &Sort::bytes()),
         [
-            "b\"\"",
-            "b\"\\x02\"",
-            "b\"\\x04\"",
-            "b\"\\x00\\x04\"",
-            "b\"\\x01\\x04\"",
-            "b\"\\x02\\x00\"",
-            "b\"\\x02\\x02\""
+            &b""[..],
+            b"\x02",
+            b"\x04",
+            b"\x00\x04",
+            b"\x01\x04",
+            b"\x02\x00",
+            b"\x02\x02"
         ]
+        .map(Value::bytes)
     );
 }

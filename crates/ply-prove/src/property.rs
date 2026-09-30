@@ -216,19 +216,27 @@ impl Gen<'_> {
     }
 
     fn fixed(&mut self, t: IntTy) -> Fixed {
-        let edges = [0i128, 1, -1, t.min(), t.max() as i128, t.max() as i128 - 1];
-        let pick = |i: u64| {
-            let v = edges[i as usize % edges.len()];
-            Fixed::of(t, v).unwrap_or_else(|| Fixed::new(t, v as u64))
-        };
+        // `-1` is all ones, which an unsigned width reads as its largest value.
+        let edges = [
+            Fixed::new(t, 0),
+            Fixed::new(t, 1),
+            Fixed::new(t, u128::MAX),
+            Fixed::new(t, t.min() as u128),
+            Fixed::new(t, t.max()),
+            Fixed::new(t, t.max() - 1),
+        ];
+        let pick = |i: u64| edges[i as usize % edges.len()];
         match self.edge {
             Some(i) => pick(u64::from(i)),
             None => {
                 let selector = self.stream.next_u64() % 32;
                 if (selector as usize) < edges.len() {
                     pick(selector)
+                } else if t.bits() == 128 {
+                    let high = u128::from(self.stream.next_u64());
+                    Fixed::new(t, high << 64 | u128::from(self.stream.next_u64()))
                 } else {
-                    Fixed::new(t, self.stream.next_u64())
+                    Fixed::new(t, u128::from(self.stream.next_u64()))
                 }
             }
         }
@@ -437,52 +445,24 @@ fn comparable(sort: &Sort) -> bool {
     }
 }
 
-fn param_names(arity: usize) -> Vec<Symbol> {
-    (0..arity).map(|i| Symbol::new(format!("x{i}"))).collect()
-}
-
-fn closure(arity: usize, rule: Synth, description: String) -> Value {
+/// Unnamed: `std.value.render` spells a generated function from its rule.
+fn closure(arity: usize, rule: Synth) -> Value {
     Value::Closure(Arc::new(Closure {
-        name: Some(Symbol::new(description)),
+        name: None,
         kind: ClosureKind::Synth { arity, rule },
     }))
 }
 
-fn binder_list(arity: usize, names: &[Symbol]) -> String {
-    if names.is_empty() {
-        return (0..arity).map(|_| "_").collect::<Vec<_>>().join(", ");
-    }
-    names
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 pub(crate) fn const_fn(arity: usize, value: Value) -> Value {
-    let description = format!("|{}| {}", binder_list(arity, &[]), value.render());
-    closure(arity, Synth::Const(value), description)
+    closure(arity, Synth::Const(value))
 }
 
 fn projection_fn(arity: usize, index: usize) -> Value {
-    let names = param_names(arity);
-    let description = format!("|{}| {}", binder_list(arity, &names), names[index]);
-    closure(arity, Synth::Project(index), description)
+    closure(arity, Synth::Project(index))
 }
 
 fn table_fn(arity: usize, entries: Vec<(Value, Value)>, default: Value) -> Value {
-    let names = param_names(arity);
-    let subject = &names[0];
-    let mut description = default.render();
-    for (key, value) in entries.iter().rev() {
-        description = format!(
-            "if {subject} == {} {{ {} }} else {{ {description} }}",
-            key.render(),
-            value.render()
-        );
-    }
-    let description = format!("|{}| {description}", binder_list(arity, &names));
-    closure(arity, Synth::Table { entries, default }, description)
+    closure(arity, Synth::Table { entries, default })
 }
 
 pub(crate) fn fn_size(value: &Value, world: &World) -> Option<u64> {
@@ -662,7 +642,7 @@ pub fn bindings(binders: &[Binder], values: &[Value]) -> Vec<Binding> {
         .map(|(binder, value)| Binding {
             name: binder.name.clone(),
             ty: binder.text.clone(),
-            rendered: value.render(),
+            value: ply_eval::Plain::shown(value),
         })
         .collect()
 }
