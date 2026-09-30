@@ -7,9 +7,9 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               ImportDecl, ImportKind, IModule, IAlias, INames, Derived, parse, dump_module)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate, EBad,
-              Stmt, SLet, SExpr, Param, NamedArg, MatchArm, HandleClause, ReturnClause, RecField,
-              expr_span)
-import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad)
+              Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause, ReturnClause,
+              RecField, expr_span)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad)
 
 // --- The tables ---------------------------------------------------------------
 
@@ -861,7 +861,12 @@ fn is_default_expr(e: Expr) -> Bool =
             && (match arm.guard { None -> true, Some(g) -> is_default_expr(g) })),
     EBlock(b) ->
       fold(b.stmts, true, |acc: Bool, s: Stmt|
-          acc && (match s { SLet(l) -> is_default_expr(l.value), SExpr(x) -> is_default_expr(x) }))
+          acc
+            && (match s {
+              SLet(l) -> is_default_expr(l.value),
+              SLetElse(l) -> is_default_expr(l.value) && is_default_expr(l.fallback),
+              SExpr(x) -> is_default_expr(x),
+            }))
         && (match b.tail { None -> true, Some(t) -> is_default_expr(t) }),
     ERecord(r) -> fold(r.fields, true, |acc: Bool, f: RecField| acc && is_default_expr(f.value)),
     ERecordUpdate(r) ->
@@ -886,7 +891,10 @@ fn pattern_binders(p: Pattern, out: List<Bytes>) -> List<Bytes> =
       let items = fold(l.items, out, |acc: List<Bytes>, x: Pattern| pattern_binders(x, acc));
       match l.rest { None -> items, Some(r) -> pattern_binders(r, items) }
     },
-    _ -> out,
+    POr(o) -> fold(o.alts, out, |acc: List<Bytes>, a: Pattern| pattern_binders(a, acc)),
+    PWild(_) -> out,
+    PLit(_) -> out,
+    PBad(_) -> out,
   }
 
 // Which of `params` the expression names free, in evaluation order.
@@ -932,6 +940,17 @@ fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Bytes>) 
               {
                 bound: pattern_binders(l.pat, acc.bound),
                 out: mentions(l.value, params, acc.bound, acc.out),
+              },
+            // The `else` block runs where the pattern bound nothing.
+            SLetElse(l) ->
+              {
+                bound: pattern_binders(l.pat, acc.bound),
+                out: mentions(
+                  l.fallback,
+                  params,
+                  acc.bound,
+                  mentions(l.value, params, acc.bound, acc.out),
+                ),
               },
             SExpr(x) -> { ..acc, out: mentions(x, params, acc.bound, acc.out) },
           },
@@ -1077,6 +1096,14 @@ fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut =
               {
                 q: { ..o.q, bound: pattern_binders(l.pat, o.q.bound) },
                 xs: push(acc.xs, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })),
+              }
+            },
+            SLetElse(l) -> {
+              let o: QOut = qexpr(r, acc.q, l.value);
+              let fb: QOut = qexpr(r, o.q, l.fallback);
+              {
+                q: { ..fb.q, bound: pattern_binders(l.pat, fb.q.bound) },
+                xs: push(acc.xs, SLetElse({ ..l, value: o.e, fallback: fb.e })),
               }
             },
             SExpr(x) -> {
@@ -1427,6 +1454,14 @@ fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut =
               {
                 cx: { ..o.cx, scope: pattern_binders(l.pat, o.cx.scope) },
                 xs: push(acc.xs, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })),
+              }
+            },
+            SLetElse(l) -> {
+              let o: COut = cexpr(f, acc.cx, l.value);
+              let fb: COut = cexpr(f, o.cx, l.fallback);
+              {
+                cx: { ..fb.cx, scope: pattern_binders(l.pat, fb.cx.scope) },
+                xs: push(acc.xs, SLetElse({ ..l, value: o.e, fallback: fb.e })),
               }
             },
             SExpr(x) -> {
