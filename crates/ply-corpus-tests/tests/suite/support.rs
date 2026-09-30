@@ -1,6 +1,5 @@
-//! Driving the corpus program the way `benches/corpus.sh` does: `ply run` over the artifact
-//! `benches/corpus-program.sh` builds from the package, with the grants it runs under and the
-//! working directory as its `work` root.
+//! Driving the corpus program the way `benches/corpus.sh` does: `ply run` over the package, with the
+//! grants it runs under and the working directory as its `work` root.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -37,34 +36,37 @@ fn hermetic(program: &Path) -> Command {
     cmd
 }
 
-/// The corpus program as `benches/corpus-program.sh` builds it for these sources and this `ply`:
-/// built once across every test process, since each runs on its own, by whichever takes the lock
-/// first, and found by the rest. CI's suite action builds it before any test runs.
+/// The corpus package, run once across every test process before any test runs it, by whichever
+/// takes the lock first: that run's front end files the answer every later run takes, where test
+/// processes starting together would each run one of their own. CI's suite action has usually
+/// filed it already.
 fn program() -> &'static Path {
-    static BUILT: OnceLock<PathBuf> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/corpus-program");
-        std::fs::create_dir_all(&dir).expect("the corpus program's directory is made");
-        let lock = std::fs::File::create(dir.join(".lock")).expect("the build lock opens");
-        lock.lock().expect("the build lock is taken");
-        let out = hermetic(Path::new("bash"))
-            .arg(repo().join("benches/corpus-program.sh"))
-            .arg(ply())
-            .arg(&dir)
+    static WARM: OnceLock<PathBuf> = OnceLock::new();
+    WARM.get_or_init(|| {
+        let package = repo().join("crates/ply-corpus/ply");
+        let lock = std::fs::File::create(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/corpus-warm.lock"),
+        )
+        .expect("the warm-up lock opens");
+        lock.lock().expect("the warm-up lock is taken");
+        let out = hermetic(&ply())
+            .arg("run")
+            .arg(&package)
+            .args(GRANTS)
+            .args(["--", "--version"])
             .output()
-            .expect("the build starts");
+            .expect("`ply run` starts");
         assert!(
             out.status.success(),
-            "the corpus program did not build:\n{}",
+            "the corpus program did not run:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        PathBuf::from(
-            String::from_utf8(out.stdout)
-                .expect("the artifact's path is text")
-                .trim(),
-        )
+        package
     })
 }
+
+/// What the program's own subcommands are run with, whatever else a caller binds.
+const GRANTS: [&str; 5] = ["--host", "--allow", "machine", "--allow", "claims"];
 
 /// `ply run` over the corpus program in `dir`, with the grants the program's own subcommands are
 /// run with, and `args` after `--`.
@@ -208,7 +210,7 @@ fn run(dir: &Path, grants: &[String], args: &[&str]) -> Output {
     hermetic(&ply())
         .arg("run")
         .arg(program())
-        .args(["--host", "--allow", "machine", "--allow", "claims"])
+        .args(GRANTS)
         .arg(format!("--exec=ply={}", ply().display()))
         .args(grants)
         .args(["--fs", "work=."])
