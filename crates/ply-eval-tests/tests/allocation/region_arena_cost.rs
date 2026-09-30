@@ -145,6 +145,44 @@ fn a_pinned_region_parked_and_reopened_costs_the_allocator_nothing_once_warm() {
     assert_eq!((arena.total_depth(), arena.live()), (0, 0));
 }
 
+/// Renewing between entries, as the tier does, keeps what earlier entries warmed: the chunks, the
+/// heap of free indices and the list of taken slots.
+#[test]
+fn renewing_a_warm_store_costs_the_allocator_nothing() {
+    const FLOOR: usize = 2;
+    let (first, second) = (Owner(0), Owner(1));
+    let mut arena = Arena::new();
+    for _ in 0..FLOOR {
+        arena.open(first, RegionKind::Shared);
+    }
+    let entry = |arena: &mut Arena| {
+        let older = arena.open(first, RegionKind::Shared);
+        let younger = arena.open(second, RegionKind::Shared);
+        for i in 0..300 {
+            arena.alloc(first, Value::Int(i));
+            arena.alloc(second, Value::Int(i));
+        }
+        let unfinished = arena.alloc(first, Value::Int(-1)).expect("inside a region");
+        arena.take(unfinished).expect("the cell is live");
+        arena.close(older);
+        arena.close(younger);
+        assert!(arena.renew(first, FLOOR));
+    };
+    for _ in 0..2 {
+        entry(&mut arena);
+    }
+    let chunks = arena.stats().chunks_allocated;
+
+    let (allocations, bytes, ()) = counted(|| {
+        for _ in 0..100 {
+            entry(&mut arena);
+        }
+    });
+
+    assert_eq!((allocations, bytes), (0, 0));
+    assert_eq!(arena.stats().chunks_allocated, chunks);
+}
+
 #[test]
 fn a_region_against_the_persistent_map_it_replaced() {
     const CELLS: usize = 10_000;
