@@ -2445,7 +2445,7 @@ fn a_test_run_binds_what_exec_names_and_withholds_the_rest_of_process() {
         .output()
         .unwrap();
     let text = stdout_of(&bare);
-    assert!(text.contains("E0456"), "{text}");
+    assert!(text.contains("no executable is bound to it"), "{text}");
     assert!(text.contains("--exec echo="), "{text}");
 }
 
