@@ -1,19 +1,18 @@
 //! The front end's answer, a `front.Dump` as `crates/ply-compiler/ply/front.ply` builds it, read
-//! into a [`Front`]. Types, rows and footprints are read from the checker's own values, numbered as
-//! the printer and parser that carried them before numbered them, so an answer reads to one
-//! structure however the checker happened to number its variables.
+//! into a [`Front`]. No type is read: the runtime reasons about none. A footprint is read from the
+//! checker's own atoms, its label variables numbered where they first appear, so an answer reads to
+//! one structure however the checker happened to number them.
 
 use ply_eval::Value;
 use ply_eval::decode::{At, Error};
 use ply_span::{Diagnostic, Edit, Fix, Label, Severity, SourceId, Span, Symbol, intern_code};
 use ply_ty::front::{EmitterRoot, Pinned};
 use ply_ty::{
-    CtorInfo, DefConstraint, DefHash, DefInfo, DefWritten, Deriver, EffectAtom, EffectInfo,
-    EffectSet, Footprint, Front, HashOutput, Hashed, LabelVar, LawBinder, LawInfo, Literal, Mode,
-    ModuleInfo, ModuleName, OpInfo, Ordinal, Resource, Row, RowVar, Scheme, SpecInfo, SpecKind,
-    TestInfo, TyVar, Type, TypeDecl, Visibility, WrittenParam, label_var_name,
+    DefHash, DefInfo, DefWritten, EffectAtom, EffectInfo, EffectSet, Footprint, Front, HashOutput,
+    Hashed, LawInfo, Literal, Mode, ModuleInfo, ModuleName, OpInfo, Ordinal, Resource, SpecInfo,
+    SpecKind, TestInfo, TypeDecl, Visibility, WrittenParam,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 /// What every failure's path starts from.
 const ANSWER: &str = "the front end's answer";
@@ -104,10 +103,6 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
         let (effect, vis) = r.effect(e)?;
         front.effects_written.insert(effect.name.clone(), vis);
         front.check.effects.insert(effect.name.clone(), effect);
-    }
-    for c in d.field("ctors")?.list()? {
-        let ctor = r.ctor(c)?;
-        front.check.ctors.insert(ctor.name.clone(), ctor);
     }
     hashes(d.field("hashes")?, &mut front)?;
     front.hashes_digest = DefHash(d.field("hashes_digest")?.byte_array()?);
@@ -421,22 +416,9 @@ impl Reader<'_> {
             name: Symbol::new(d.field("name")?.utf8()?),
             module: ModuleName::from_dotted(d.field("module")?.utf8()?),
             simple_name: Symbol::new(d.field("simple_name")?.utf8()?),
-            scheme: scheme(d.field("scheme")?)?,
             footprint: footprint(d.field("footprint")?)?,
             performed: footprint(d.field("performed")?)?,
             row_aliases: symbols(d.field("row_aliases")?)?,
-            constraints: d.field("constraints")?.items(|c| {
-                let deriver = c.field("deriver")?.ctor()?;
-                Ok(DefConstraint {
-                    deriver: match deriver.name() {
-                        "DJson" => Deriver::Json,
-                        "DEq" => Deriver::Eq,
-                        "DOrd" => Deriver::Ord,
-                        _ => return Err(deriver.unknown()),
-                    },
-                    param: c.field("param")?.number()?,
-                })
-            })?,
             spec: d.field("spec")?.items(|s| {
                 Ok(SpecInfo {
                     kind: spec_kind(s.field("kind")?)?,
@@ -502,13 +484,6 @@ impl Reader<'_> {
             module: ModuleName::from_dotted(l.field("module")?.utf8()?),
             key: Symbol::new(l.field("key")?.utf8()?),
             index: self.placed(l, at)?,
-            binders: l.field("binders")?.items(|b| {
-                Ok(LawBinder {
-                    name: Symbol::new(b.field("name")?.utf8()?),
-                    ty: standalone(b.field("ty")?)?,
-                    span: self.span(b.field("at")?)?,
-                })
-            })?,
             has_guard: l.field("has_guard")?.bool()?,
             host: l.field("host")?.bool()?,
             footprint: footprint(l.field("footprint")?)?,
@@ -536,7 +511,6 @@ impl Reader<'_> {
         Ok((effect, visibility(e.field("public")?.bool()?)))
     }
 
-    /// Each parameter and the answer is a text of its own, numbered apart from the others.
     fn op(&self, o: At<'_>) -> Result<OpInfo, Error> {
         let mode = o.field("mode")?;
         Ok(OpInfo {
@@ -547,299 +521,61 @@ impl Reader<'_> {
                 other => return Err(mode.error(format!("`{other}` is not `read` or `write`"))),
             },
             resource_param: o.field("resource_param")?.bool()?,
-            params: o.field("params")?.items(standalone)?,
-            ret: standalone(o.field("ret")?)?,
             span: self.span(o.field("at")?)?,
-            scheme: o.field("scheme")?.option()?.map(scheme).transpose()?,
-        })
-    }
-
-    fn ctor(&self, k: At<'_>) -> Result<CtorInfo, Error> {
-        let scheme = scheme(k.field("scheme")?)?;
-        // From the scheme, so the fields share its numbering.
-        let fields: Vec<Type> = match &scheme.ty {
-            Type::Fn { params, .. } => params.clone(),
-            _ => Vec::new(),
-        };
-        let written = k.field("fields")?;
-        if written.list()?.len() != fields.len() {
-            return Err(written.error(format!(
-                "{} field(s), and {} in the scheme",
-                written.list()?.len(),
-                fields.len()
-            )));
-        }
-        Ok(CtorInfo {
-            name: Symbol::new(k.field("name")?.utf8()?),
-            module: ModuleName::from_dotted(k.field("module")?.utf8()?),
-            simple_name: Symbol::new(k.field("simple_name")?.utf8()?),
-            type_name: Symbol::new(k.field("type_name")?.utf8()?),
-            index: k.field("index")?.number()?,
-            arity: k.field("arity")?.number()?,
-            fields,
-            scheme,
-            span: self.span(k.field("at")?)?,
         })
     }
 }
 
-// --- Types ---------------------------------------------------------------------------------
+// --- Footprints ----------------------------------------------------------------------------
 
-/// A scheme's head binds its variables in order; the rest are numbered where they first appear.
-fn scheme(s: At<'_>) -> Result<Scheme, Error> {
-    let ty = s.field("ty")?;
-    let mut n = Numbering::of_text(ty)?;
-    let ty_vars = s.field("ty_vars")?.items(|v| Ok(n.ty(v.int()?)))?;
-    let label_vars = s.field("label_vars")?.items(|v| Ok(n.bind(v.int()?)))?;
-    let row_vars = s.field("row_vars")?.items(|v| Ok(n.row(v.int()?)))?;
-    Ok(Scheme {
-        ty_vars,
-        row_vars,
-        label_vars,
-        ty: n.ty_of(ty)?,
-    })
-}
-
-/// A type with no head of its own, as an operation's parameter or a law's binder is.
-fn standalone(t: At<'_>) -> Result<Type, Error> {
-    Numbering::of_text(t)?.ty_of(t)
-}
-
-/// A footprint binds every label variable it names, in the order they first appear.
+/// A footprint binds every label variable it names, numbered in the order they first appear.
 fn footprint(atoms: At<'_>) -> Result<Footprint, Error> {
-    let mut n = Numbering {
-        binds_on_sight: true,
-        ..Numbering::default()
+    let mut labels: Vec<i64> = Vec::new();
+    Ok(Footprint::from_atoms(
+        atoms.items(|a| atom(a, &mut labels))?,
+    ))
+}
+
+/// An operation atom takes its declaration's mode, which [`resolve_op_modes`] gives it.
+fn atom(a: At<'_>, labels: &mut Vec<i64>) -> Result<EffectAtom, Error> {
+    let effect = Symbol::new(a.field("effect")?.utf8()?);
+    let resource = resource(a.field("resource")?, labels)?;
+    if let Some(op) = a.field("op")?.option()? {
+        return Ok(EffectAtom::operation(
+            effect,
+            resource,
+            Mode::Write,
+            op.utf8()?,
+        ));
+    }
+    let mode = a.field("mode")?.ctor()?;
+    let mode = match mode.name() {
+        "MRead" => Mode::Read,
+        "MWrite" => Mode::Write,
+        _ => return Err(mode.unknown()),
     };
-    Ok(Footprint::from_atoms(atoms.items(|a| n.atom(a))?))
+    Ok(EffectAtom::new(effect, resource, mode))
 }
 
-/// The variables of one text, numbered as a reader of it numbers them. A label variable the text
-/// does not bind reads back as a resource under the name the printer gave it.
-#[derive(Default)]
-struct Numbering {
-    tys: HashMap<i64, u32>,
-    /// Counts the region variable each cell without a named region reads back with, too.
-    next_ty: u32,
-    rows: HashMap<i64, u32>,
-    bound: HashMap<i64, u32>,
-    binds_on_sight: bool,
-    /// Every label variable's name, bound or not, which no later one may take.
-    names: HashMap<i64, String>,
-    /// The resources the text names, which no label variable may take.
-    taken: HashSet<String>,
-}
-
-impl Numbering {
-    fn of_text(t: At<'_>) -> Result<Numbering, Error> {
-        let mut n = Numbering::default();
-        n.reserve(t)?;
-        Ok(n)
-    }
-
-    fn reserve(&mut self, t: At<'_>) -> Result<(), Error> {
-        let c = t.ctor()?;
-        match c.name() {
-            "TyVar" => {}
-            "TyCon" => {
-                for a in c.arg(0)?.field("args")?.list()? {
-                    self.reserve(a)?;
+fn resource(r: At<'_>, labels: &mut Vec<i64>) -> Result<Resource, Error> {
+    let c = r.ctor()?;
+    Ok(match c.name() {
+        "RNamed" => Resource::Named(Symbol::new(c.arg(0)?.utf8()?)),
+        "RSingleton" => Resource::Singleton,
+        "RAny" => Resource::Every,
+        "RVar" => {
+            let v = c.arg(0)?.int()?;
+            let at = match labels.iter().position(|held| *held == v) {
+                Some(at) => at,
+                None => {
+                    labels.push(v);
+                    labels.len() - 1
                 }
-            }
-            "TyFn" => {
-                let f = c.arg(0)?;
-                for p in f.field("params")?.list()? {
-                    self.reserve(p)?;
-                }
-                self.reserve(f.field("ret")?)?;
-                for a in f.field("effects")?.field("atoms")?.list()? {
-                    let r = a.field("resource")?.ctor()?;
-                    if r.name() == "RNamed" {
-                        self.taken.insert(r.arg(0)?.utf8()?.to_string());
-                    }
-                }
-            }
-            "TyRecord" => {
-                for f in c.arg(0)?.list()? {
-                    self.reserve(f.field("ty")?)?;
-                }
-            }
-            _ => return Err(c.unknown()),
+            };
+            Resource::Var(at as u32)
         }
-        Ok(())
-    }
-
-    fn ty(&mut self, v: i64) -> TyVar {
-        if let Some(&n) = self.tys.get(&v) {
-            return TyVar(n);
-        }
-        let n = self.fresh();
-        self.tys.insert(v, n.0);
-        n
-    }
-
-    fn fresh(&mut self) -> TyVar {
-        let n = TyVar(self.next_ty);
-        self.next_ty += 1;
-        n
-    }
-
-    fn row(&mut self, v: i64) -> RowVar {
-        let next = self.rows.len() as u32;
-        RowVar(*self.rows.entry(v).or_insert(next))
-    }
-
-    fn bind(&mut self, v: i64) -> LabelVar {
-        let next = self.bound.len() as u32;
-        let bound = LabelVar(*self.bound.entry(v).or_insert(next));
-        self.name(v);
-        bound
-    }
-
-    /// The first label letter, then round, that no resource and no other label here holds.
-    fn name(&mut self, v: i64) -> String {
-        if let Some(name) = self.names.get(&v) {
-            return name.clone();
-        }
-        let name = (0..)
-            .map(|i| label_var_name(LabelVar(i)))
-            .find(|n| !self.taken.contains(n) && !self.names.values().any(|held| held == n))
-            .expect("the letters and their rounds do not run out");
-        self.names.insert(v, name.clone());
-        name
-    }
-
-    fn ty_of(&mut self, t: At<'_>) -> Result<Type, Error> {
-        let c = t.ctor()?;
-        Ok(match c.name() {
-            "TyVar" => Type::Var(self.ty(c.arg(0)?.int()?)),
-            "TyCon" => {
-                let con = c.arg(0)?;
-                let name = con.field("name")?.utf8()?;
-                let args: Vec<At<'_>> = con.field("args")?.list()?.collect();
-                let unnamed_cell = name == "Cell"
-                    && match args[..] {
-                        [_] => true,
-                        [region, _] => !is_region(region)?,
-                        _ => false,
-                    };
-                if unnamed_cell {
-                    // A cell prints its region only when it is a named one; otherwise it reads back
-                    // with a variable of its own, placed after its element's.
-                    let elem = self.ty_of(args[args.len() - 1])?;
-                    let region = Type::Var(self.fresh());
-                    Type::Con(Symbol::new(name), vec![region, elem])
-                } else {
-                    let args = args
-                        .into_iter()
-                        .map(|a| self.ty_of(a))
-                        .collect::<Result<_, _>>()?;
-                    Type::Con(Symbol::new(name), args)
-                }
-            }
-            "TyFn" => {
-                let f = c.arg(0)?;
-                let params = f.field("params")?.items(|p| self.ty_of(p))?;
-                let ret = self.ty_of(f.field("ret")?)?;
-                let effects = self.row_of(f.field("effects")?)?;
-                Type::Fn {
-                    params,
-                    ret: Box::new(ret),
-                    effects,
-                }
-            }
-            "TyRecord" => {
-                let list = c.arg(0)?;
-                let fields: Vec<(&str, At<'_>)> =
-                    list.items(|f| Ok((f.field("name")?.utf8()?, f.field("ty")?)))?;
-                // A tuple prints its items by position, and they are read back in that order.
-                let position = |i: usize| {
-                    let name = format!("_{i}");
-                    fields.iter().position(|(n, _)| *n == name)
-                };
-                let order: Vec<usize> =
-                    if fields.len() >= 2 && (0..fields.len()).all(|i| position(i).is_some()) {
-                        (0..fields.len()).filter_map(position).collect()
-                    } else {
-                        (0..fields.len()).collect()
-                    };
-                let mut out = BTreeMap::new();
-                for i in order {
-                    let (name, ty) = fields[i];
-                    if out.insert(Symbol::new(name), self.ty_of(ty)?).is_some() {
-                        return Err(list.error(format!("the field `{name}` twice")));
-                    }
-                }
-                Type::Record(out)
-            }
-            _ => return Err(c.unknown()),
-        })
-    }
-
-    fn row_of(&mut self, r: At<'_>) -> Result<Row, Error> {
-        let mut row = Row::empty();
-        for a in r.field("atoms")?.list()? {
-            row.atoms.insert(self.atom(a)?);
-        }
-        row.tail = match r.field("tail")?.option()? {
-            Some(v) => Some(self.row(v.int()?)),
-            None => None,
-        };
-        Ok(row)
-    }
-
-    /// An operation atom takes its declaration's mode, which [`resolve_op_modes`] gives it.
-    fn atom(&mut self, a: At<'_>) -> Result<EffectAtom, Error> {
-        let effect = Symbol::new(a.field("effect")?.utf8()?);
-        let resource = self.resource(a.field("resource")?)?;
-        if let Some(op) = a.field("op")?.option()? {
-            return Ok(EffectAtom::operation(
-                effect,
-                resource,
-                Mode::Write,
-                op.utf8()?,
-            ));
-        }
-        let mode = a.field("mode")?.ctor()?;
-        let mode = match mode.name() {
-            "MRead" => Mode::Read,
-            "MWrite" => Mode::Write,
-            _ => return Err(mode.unknown()),
-        };
-        Ok(EffectAtom::new(effect, resource, mode))
-    }
-
-    fn resource(&mut self, r: At<'_>) -> Result<Resource, Error> {
-        let c = r.ctor()?;
-        Ok(match c.name() {
-            "RNamed" => Resource::Named(Symbol::new(c.arg(0)?.utf8()?)),
-            "RSingleton" => Resource::Singleton,
-            "RAny" => Resource::Every,
-            "RVar" => {
-                let v = c.arg(0)?.int()?;
-                match self.bound.get(&v) {
-                    Some(&bound) => Resource::Var(LabelVar(bound)),
-                    None if self.binds_on_sight => Resource::Var(self.bind(v)),
-                    None => Resource::Named(Symbol::new(self.name(v))),
-                }
-            }
-            _ => return Err(c.unknown()),
-        })
-    }
-}
-
-/// A named region: a constructor of no arguments under the region prefix.
-fn is_region(t: At<'_>) -> Result<bool, Error> {
-    let c = t.ctor()?;
-    if c.name() != "TyCon" {
-        return Ok(false);
-    }
-    let con = c.arg(0)?;
-    Ok(con.field("args")?.list()?.next().is_none()
-        && con
-            .field("name")?
-            .utf8()?
-            .starts_with(ply_ty::print::REGION_PREFIX))
+        _ => return Err(c.unknown()),
+    })
 }
 
 /// Every row and footprint names an operation without its mode; the declaration gives it one.
@@ -858,7 +594,6 @@ fn resolve_op_modes(front: &mut Front) {
     for def in front.check.defs.values_mut() {
         def.footprint.resolve_modes(&mode_of);
         def.performed.resolve_modes(&mode_of);
-        def.scheme.ty.resolve_modes(&mode_of);
         for spec in &mut def.spec {
             spec.footprint.resolve_modes(&mode_of);
         }
@@ -868,26 +603,6 @@ fn resolve_op_modes(front: &mut Front) {
     }
     for law in &mut front.check.laws {
         law.footprint.resolve_modes(&mode_of);
-        for binder in &mut law.binders {
-            binder.ty.resolve_modes(&mode_of);
-        }
-    }
-    for ctor in front.check.ctors.values_mut() {
-        ctor.scheme.ty.resolve_modes(&mode_of);
-        for field in &mut ctor.fields {
-            field.resolve_modes(&mode_of);
-        }
-    }
-    for effect in front.check.effects.values_mut() {
-        for op in effect.ops.values_mut() {
-            for param in &mut op.params {
-                param.resolve_modes(&mode_of);
-            }
-            op.ret.resolve_modes(&mode_of);
-            if let Some(scheme) = &mut op.scheme {
-                scheme.ty.resolve_modes(&mode_of);
-            }
-        }
     }
     for sets in front.effect_sets.values_mut() {
         for set in sets {

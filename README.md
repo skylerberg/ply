@@ -21,7 +21,7 @@ of it next.
 | path | holds |
 | --- | --- |
 | `crates/ply-span` | spans, diagnostics and the constants for diagnostic codes |
-| `crates/ply-ty` | the type vocabulary the checker produces and everything else reads |
+| `crates/ply-ty` | what the runtime reads of a checked program: names, rows, hashes and tables |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator |
 | `crates/ply-codegen` | the compiled tier: emits C, builds it and loads it |
 | `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its bootstrap bundle (`bootstrap/`) |

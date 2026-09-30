@@ -1,23 +1,27 @@
-use crate::harness::{Reservation, connect_when_ready, process, repo};
+use crate::harness::{Reservation, connect_when_ready, json_of, ply, process, repo};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const STARTUP: Duration = Duration::from_secs(30);
 
-/// Plus the `main` the example deliberately lacks: `examples/hello.ply` holds the only one under `examples/`.
-fn project(port: u16, connections: u32) -> tempfile::TempDir {
+/// The example, verbatim.
+fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
-    let orders =
-        std::fs::read_to_string(repo().join("examples/orders.ply")).expect("examples/orders.ply");
-    assert!(
-        orders.contains("derive json for Order"),
-        "`examples/orders.ply` no longer derives its codec, which is the whole claim here"
-    );
-    std::fs::write(dir.path().join("orders.ply"), orders).unwrap();
+    std::fs::copy(
+        repo().join("examples/orders.ply"),
+        dir.path().join("orders.ply"),
+    )
+    .expect("examples/orders.ply is copied");
+    dir
+}
+
+/// The `main` the example deliberately lacks, as a module of the test's own beside it.
+fn entry(dir: &Path, port: u16, connections: u32) {
     std::fs::write(
-        dir.path().join("serve.ply"),
+        dir.join("serve.ply"),
         format!(
             "import std.net (net)\n\
              import orders\n\
@@ -27,7 +31,29 @@ fn project(port: u16, connections: u32) -> tempfile::TempDir {
         ),
     )
     .unwrap();
-    dir
+}
+
+/// The claim the socket test rests on: `ply show` finds no `fn` written for the codec a request is
+/// decoded with or the one its answer is encoded with, and names the `derive` declaring each.
+#[track_caller]
+fn the_codecs_are_derived(dir: &Path) {
+    for (codec, declaration) in [
+        ("order_json", "derive json for Order"),
+        ("reply_json", "derive json for Reply"),
+    ] {
+        let shown = json_of(
+            &ply(dir)
+                .args(["show", codec, "--json"])
+                .output()
+                .expect("`ply show` runs"),
+        );
+        let refusal = &shown["diagnostics"][0];
+        assert!(
+            refusal["code"] == "E0101" && refusal["labels"][0]["snippet"] == declaration,
+            "`{codec}` should be declared by `{declaration}` and written by no `fn`; \
+             `ply show` answered {shown}"
+        );
+    }
 }
 
 struct Server {
@@ -131,8 +157,10 @@ fn body_of(response: &str) -> &str {
 
 #[test]
 fn a_json_payload_over_a_real_socket_is_decoded_and_answered_by_a_derived_codec() {
+    let dir = project();
+    the_codecs_are_derived(dir.path());
     let reserved = Reservation::take();
-    let dir = project(reserved.port(), 2);
+    entry(dir.path(), reserved.port(), 2);
     let mut server = Server::start(dir.path(), reserved);
 
     let first = server.connect();

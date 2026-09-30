@@ -106,39 +106,6 @@ pub fn is_ident_continue(c: char) -> bool {
     is_ident_start(c) || c.is_ascii_digit()
 }
 
-/// The derivations the language defines.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Deriver {
-    Json,
-    Eq,
-    Ord,
-}
-
-impl Deriver {
-    pub fn from_name(name: &str) -> Option<Deriver> {
-        Some(match name {
-            "json" => Deriver::Json,
-            "eq" => Deriver::Eq,
-            "ord" => Deriver::Ord,
-            _ => return None,
-        })
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Deriver::Json => "json",
-            Deriver::Eq => "eq",
-            Deriver::Ord => "ord",
-        }
-    }
-}
-
-impl fmt::Display for Deriver {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// `pub` exports an item.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Visibility {

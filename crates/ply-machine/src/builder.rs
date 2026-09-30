@@ -229,18 +229,10 @@ impl Site {
                 );
             }
         };
-        let defs: Vec<PlyValue> = loaded
-            .check
-            .defs
-            .values()
-            .filter(|d| !crate::shelf::is_shipped(&d.module))
-            .map(def_value)
-            .collect();
         PlyValue::ctor(
             "Ok",
             vec![record(vec![
                 ("root", PlyValue::str(loaded.root.display().to_string())),
-                ("defs", PlyValue::list(defs)),
                 ("mains", crate::drive::mains_value(loaded)),
                 ("modules", crate::drive::modules_value(loaded)),
                 ("places", places_value(&loaded.sources)),
@@ -293,30 +285,6 @@ impl Site {
         };
         let built = aside(|| build(loaded, entry, startup));
         answered(built.map(|built| made_value(&built, reaches)))
-    }
-}
-
-fn def_value(def: &DefInfo) -> PlyValue {
-    record(vec![
-        ("name", PlyValue::str(def.name.as_str())),
-        ("simple", PlyValue::str(def.simple_name.as_str())),
-        ("module", PlyValue::str(def.module.as_str())),
-        (
-            "at",
-            record(vec![
-                ("module", PlyValue::Int(i64::from(def.span.source.0))),
-                ("start", PlyValue::Int(i64::from(def.span.start))),
-                ("end", PlyValue::Int(i64::from(def.span.end))),
-            ]),
-        ),
-        ("arity", count(arity(def))),
-    ])
-}
-
-fn arity(def: &DefInfo) -> usize {
-    match &def.scheme.ty {
-        ply_ty::ty::Type::Fn { params, .. } => params.len(),
-        _ => 0,
     }
 }
 
