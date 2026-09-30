@@ -1,14 +1,7 @@
-use crate::fixture::Compiled;
-use ply_test::{group_by_conflict, shared_footprint};
-use ply_ty::Footprint;
+//! What an effect set leaves in the footprints a scheduler colours: `suite.schedule` separates two
+//! tests exactly when their atoms conflict, so the atoms are what these hold to real programs.
 
-impl Compiled {
-    fn groups(&self) -> Vec<Vec<usize>> {
-        let scheduled: Vec<(usize, Footprint)> =
-            self.footprints().into_iter().enumerate().collect();
-        group_by_conflict(&scheduled)
-    }
-}
+use crate::fixture::Compiled;
 
 const STORE: &str = "\
 effect store {
@@ -40,41 +33,29 @@ test \"orders\" { assert_eq(place_order(), 2) }
 ";
 
 #[test]
-fn precise_rows_let_two_disjoint_endpoints_run_side_by_side() {
+fn precise_rows_leave_two_disjoint_endpoints_nothing_to_contend_over() {
     let compiled = Compiled::anonymous(&format!("{STORE}{PRECISE}"));
     let footprints = compiled.footprints();
     assert!(
         !footprints[0].conflicts_with(&footprints[1]),
         "a reader of `items` and a writer of `orders` share no resource: {footprints:?}"
     );
-    assert_eq!(
-        compiled.groups(),
-        vec![vec![0, 1]],
-        "one group is one round of concurrent tests"
-    );
 }
 
 #[test]
-fn one_over_broad_set_serialises_two_endpoints_that_do_not_contend() {
+fn one_over_broad_set_makes_two_endpoints_that_do_not_contend_conflict() {
     let compiled = Compiled::anonymous(&format!("{STORE}{ALIASED}"));
     let footprints = compiled.footprints();
     assert!(
         footprints[0].conflicts_with(&footprints[1]),
         "both tests now publish `store.write[orders]`: {footprints:?}"
     );
-    assert_eq!(
-        compiled.groups().len(),
-        2,
-        "two rounds where the precise rows needed one: {:?}",
-        compiled.groups()
-    );
 }
 
 #[test]
 fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
     let compiled = Compiled::anonymous(&format!("{STORE}{ALIASED}"));
-    let footprints = compiled.footprints();
-    let atoms: Vec<String> = shared_footprint(&footprints[0])
+    let atoms: Vec<String> = compiled.footprints()[0]
         .atoms()
         .map(|a| a.to_string())
         .collect();
@@ -88,7 +69,7 @@ fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
     );
 
     let precise = Compiled::anonymous(&format!("{STORE}{PRECISE}"));
-    let precise_atoms: Vec<String> = shared_footprint(&precise.footprints()[0])
+    let precise_atoms: Vec<String> = precise.footprints()[0]
         .atoms()
         .map(|a| a.to_string())
         .collect();

@@ -29,23 +29,51 @@ pub type Variant = { name: String, fields: List<Ty> }
 // the same declaration under `Pair<Int>` is not finite at all.
 pub type Decl = { name: String, params: Int, variants: List<Variant> }
 
-// What a finite domain came to: each binder's type, how many values it holds, and the product. The
-// sizes are kept because a point is named by index, and only the sizes say what an index means.
-pub type Domain = { types: List<Ty>, sizes: List<Int>, points: Int }
+// What a finite type came to, as the runtime builds its values from an index: a builtin by name, a
+// declared type's cases in declaration order, or a record's fields in the order the type lists them.
+// Every node carries how many values it holds, so decoding a point counts nothing: the sizes are
+// decided here, once.
+pub type Shape =
+  | Scalar(String, Int)
+  | Cases(Int, List<{ name: String, size: Int, fields: List<Shape> }>)
+  | Fields(Int, List<{ name: String, shape: Shape }>)
+
+pub fn shape_size(s: Shape) -> Int =
+  match s { Scalar(_, n) -> n, Cases(n, _) -> n, Fields(n, _) -> n }
+
+// What a finite domain came to: each binder's shape, and the product of their sizes. A point is
+// named by index, and only the sizes say what an index means.
+pub type Domain = { shapes: List<Shape>, points: Int }
+
+pub fn sizes_of(domain: Domain) -> List<Int> = map(domain.shapes, shape_size)
 
 // The largest number of points a proof may walk. Past it the domain is not a proof anyone can pay
 // for, and sampling is the honest answer rather than a long silence.
 pub fn bound() -> Int = 4096
 
+// What a type came to, or `None` when it is infinite, unknown, or past [`bound`].
+pub fn shape_of(ty: Ty, decls: List<Decl>) -> Option<Shape> = shaped(ty, decls, [], [])
+
 // How many values inhabit a type, or `None` when it is infinite, unknown, or past [`bound`].
-pub fn size(ty: Ty, decls: List<Decl>) -> Option<Int> = sized(ty, decls, [], [])
+pub fn size(ty: Ty, decls: List<Decl>) -> Option<Int> =
+  match shape_of(ty, decls) { Some(s) -> Some(shape_size(s)), None -> None }
 
 // The binders' domain, when every one of them is finite and the product is within [`bound`].
 pub fn finite(binders: List<Ty>, decls: List<Decl>) -> Option<Domain> =
-  match sizes_within(binders, decls) {
-    None -> None,
-    Some(seen) -> Some({ types: binders, sizes: seen.sizes, points: seen.points }),
-  }
+  fold(binders, Some({ shapes: [], points: 1 }), |acc: Option<Domain>, ty: Ty|
+    match acc {
+      None -> None,
+      Some(seen) -> match shape_of(ty, decls) {
+        None -> None,
+        Some(shape) -> {
+          let n = shape_size(shape);
+          let points = seen.points * n;
+          // A domain of no points is a vacuity, not a proof.
+          if n == 0 || points > bound() { None }
+          else { Some({ shapes: push(seen.shapes, shape), points: points }) }
+        },
+      },
+    })
 
 // What a domain is called in an artifact: the name of a product with no binders is `unit`, since a
 // ground claim still has exactly one point. The texts are the compiler's own printing of each
@@ -62,9 +90,11 @@ fn joined(parts: List<String>, sep: String) -> String =
 
 // The point an index names, one value index per binder: the last binder varies fastest, so the
 // sequence of points is a function of the domain and nothing else.
-pub fn point_indices(domain: Domain, index: Int) -> Option<List<Int>> =
+pub fn point_indices(domain: Domain, index: Int) -> Option<List<Int>> = {
+  let sizes = sizes_of(domain);
   if index < 0 || index >= domain.points { None }
-  else { Some(tuple_at(domain.sizes, len(domain.sizes) - 1, index)) }
+  else { Some(tuple_at(sizes, len(sizes) - 1, index)) }
+}
 
 // `sizes` right to left, each dividing what is left: the tuple an index names, left to right.
 fn tuple_at(sizes: List<Int>, at: Int, rest: Int) -> List<Int> =
@@ -75,58 +105,33 @@ fn tuple_at(sizes: List<Int>, at: Int, rest: Int) -> List<Int> =
     }
   }
 
-// Each binder's size, with the product checked as it grows, so a wide domain is refused before any
-// arithmetic can overflow.
-fn sizes_within(binders: List<Ty>, decls: List<Decl>) -> Option<{ sizes: List<Int>, points: Int }> =
-  fold(
-    binders,
-    Some({ sizes: [], points: 1 }),
-    |acc: Option<{ sizes: List<Int>, points: Int }>, ty: Ty|
-      match acc {
-        None -> None,
-        Some(seen) -> match size(ty, decls) {
-          // A domain of no points is a vacuity, not a proof.
-          None -> None,
-          Some(0) -> None,
-          Some(n) -> {
-            let points = seen.points * n;
-            if points > bound() { None }
-            else { Some({ sizes: push(seen.sizes, n), points: points }) }
-          },
-        },
-      },
-  )
-
-// How many values inhabit a type, with the names whose variants are already being walked: a type
-// that mentions itself has no finite size even when it has a nullary case.
-fn sized(ty: Ty, decls: List<Decl>, open: List<String>, subst: List<Ty>) -> Option<Int> =
+// What a type came to, with the names whose variants are already being walked: a type that mentions
+// itself has no finite size even when it has a nullary case.
+fn shaped(ty: Ty, decls: List<Decl>, open: List<String>, subst: List<Ty>) -> Option<Shape> =
   match ty {
-    // A parameter of the declaration being walked: the argument it was applied to, written in the
-    // claim's own terms, where a variable is the claim's and has no size.
+    // Arguments arrive already substituted into the scope that wrote them, so one read settles a
+    // parameter; reading it against `subst` again would let `Var(0)` name itself forever.
     Var(index) -> match list_at(subst, index) {
-      Some(argument) -> sized(argument, decls, open, []),
+      Some(argument) -> shaped(argument, decls, open, []),
       None -> None,
     },
     Fn(_, _, _) -> None,
-    Record(fields) ->
-      product_of(map(fields, |f: { name: String, ty: Ty }| f.ty), decls, open, subst),
+    Record(fields) -> match fields_of(fields, decls, open, subst) {
+      None -> None,
+      Some(fs) -> Some(Fields(fs.size, fs.fields)),
+    },
     Con(name, args) -> {
-      if name == "Unit" { Some(1) }
-      else if name == "Bool" { Some(2) }
+      if name == "Unit" { Some(Scalar(name, 1)) }
+      else if name == "Bool" { Some(Scalar(name, 2)) }
       // `Float` and `Decimal` are finite but far too large to enumerate, and a 64-bit width does not
       // fit the arithmetic here.
       else if is_unbounded(name) { None }
-      else if width_of(name) != 0 { Some(two_to(width_of(name))) }
+      else if width_of(name) != 0 { Some(Scalar(name, two_to(width_of(name)))) }
       else if contains_text(open, name) { None } else {
         match find_decl(decls, name) {
           None -> None,
           Some(decl) ->
-            sum_of_variants(
-              decl,
-              decls,
-              push(open, name),
-              map(args, |a: Ty| substituted(a, subst)),
-            ),
+            cases_of(decl, decls, push(open, name), map(args, |a: Ty| substituted(a, subst))),
         }
       }
     },
@@ -150,42 +155,74 @@ fn width_of(name: String) -> Int =
 fn two_to(bits: Int) -> Int = fold(range(0, bits), 1, |acc: Int, _i: Int| acc * 2)
 
 // Every case of one declared type, summed: a type with no variants has no values at all.
-fn sum_of_variants(
-  decl: Decl,
-  decls: List<Decl>,
-  open: List<String>,
-  args: List<Ty>,
-) -> Option<Int> =
-  fold(decl.variants, Some(0), |acc: Option<Int>, variant: Variant|
-    match acc {
-      None -> None,
-      Some(total) -> match product_of(variant.fields, decls, open, args) {
-        None -> None,
-        Some(n) -> {
-          let next = total + n;
-          if next > bound() { None } else { Some(next) }
+fn cases_of(decl: Decl, decls: List<Decl>, open: List<String>, args: List<Ty>) -> Option<Shape> =
+  match fold(
+      decl.variants,
+      Some({ total: 0, cases: [] }),
+      |acc: Option<{ total: Int, cases: List<{ name: String, size: Int, fields: List<Shape> }> }>, variant: Variant|
+        match acc {
+          None -> None,
+          Some(seen) -> match product_of(variant.fields, decls, open, args) {
+            None -> None,
+            Some(p) -> {
+              let total = seen.total + p.size;
+              if total > bound() { None } else {
+                Some({
+                  total: total,
+                  cases: push(seen.cases, { name: variant.name, size: p.size, fields: p.shapes }),
+                })
+              }
+            },
+          },
         },
-      },
-    })
+    ) {
+    None -> None,
+    Some(all) -> Some(Cases(all.total, all.cases)),
+  }
 
-// A tuple's size is the product of its fields', refused as soon as it is past the bound.
+// A tuple's shapes and the product of their sizes, refused as soon as it is past the bound.
 fn product_of(
   types: List<Ty>,
   decls: List<Decl>,
   open: List<String>,
   subst: List<Ty>,
-) -> Option<Int> =
-  fold(types, Some(1), |acc: Option<Int>, ty: Ty|
-    match acc {
-      None -> None,
-      Some(total) -> match sized(ty, decls, open, subst) {
+) -> Option<{ size: Int, shapes: List<Shape> }> =
+  fold(
+    types,
+    Some({ size: 1, shapes: [] }),
+    |acc: Option<{ size: Int, shapes: List<Shape> }>, ty: Ty|
+      match acc {
         None -> None,
-        Some(n) -> {
-          let next = total * n;
-          if next > bound() { None } else { Some(next) }
+        Some(seen) -> match shaped(ty, decls, open, subst) {
+          None -> None,
+          Some(shape) -> {
+            let next = seen.size * shape_size(shape);
+            if next > bound() { None }
+            else { Some({ size: next, shapes: push(seen.shapes, shape) }) }
+          },
         },
       },
-    })
+  )
+
+// A record's fields in the order the type lists them, with the product of their sizes.
+fn fields_of(
+  fields: List<{ name: String, ty: Ty }>,
+  decls: List<Decl>,
+  open: List<String>,
+  subst: List<Ty>,
+) -> Option<{ size: Int, fields: List<{ name: String, shape: Shape }> }> =
+  match product_of(map(fields, |f: { name: String, ty: Ty }| f.ty), decls, open, subst) {
+    None -> None,
+    Some(p) ->
+      Some({
+        size: p.size,
+        fields: map(range(0, len(fields)), |i: Int|
+          {
+            name: match list_at(fields, i) { Some(f) -> f.name, None -> "" },
+            shape: match list_at(p.shapes, i) { Some(sh) -> sh, None -> Scalar("Unit", 1) },
+          }),
+      }),
+  }
 
 // A type written inside a declaration, with the arguments it was applied to in place of its
 // parameters. An argument is put in as it is, so a variable in it is never read as a parameter.
@@ -286,6 +323,65 @@ test "a case with fields multiplies them into its type's size" {
     },
   ]);
   assert_eq(size(con("Wrap"), declared), Some(7))
+}
+
+fn kind_cases() -> Shape =
+  Cases(3, [
+    { name: "Asset", size: 1, fields: [] },
+    { name: "Liability", size: 1, fields: [] },
+    { name: "Equity", size: 1, fields: [] },
+  ])
+
+// The runtime decodes a point through the shape alone, so every node says how many values it holds
+// and a case its own share of its type's.
+test "a shape carries each node's size, so decoding a point counts nothing" {
+  let declared = appended(kinds(), [
+    {
+      name: "Wrap",
+      params: 0,
+      variants: [
+        { name: "Nothing", fields: [] },
+        { name: "Held", fields: [Con("Kind", []), Con("Bool", [])] },
+      ],
+    },
+  ]);
+  assert_eq(
+    shape_of(con("Wrap"), declared),
+    Some(
+      Cases(7, [
+        { name: "Nothing", size: 1, fields: [] },
+        { name: "Held", size: 6, fields: [kind_cases(), Scalar("Bool", 2)] },
+      ]),
+    ),
+  );
+  // A record's fields in the order the type lists them, and their product.
+  assert_eq(
+    shape_of(Record([{ name: "k", ty: con("Kind") }, { name: "b", ty: con("Bool") }]), declared),
+    Some(Fields(6, [{ name: "k", shape: kind_cases() }, { name: "b", shape: Scalar("Bool", 2) }])),
+  );
+  assert_eq(shape_of(con("U8"), declared), Some(Scalar("U8", 256)));
+  assert_eq(shape_of(con("Unit"), declared), Some(Scalar("Unit", 1)));
+  // A parameter is the argument's own shape.
+  let pair = appended(kinds(), [
+    { name: "Pair", params: 1, variants: [{ name: "Both", fields: [Var(0), Var(0)] }] },
+  ]);
+  assert_eq(
+    shape_of(Con("Pair", [con("Bool")]), pair),
+    Some(Cases(4, [{ name: "Both", size: 4, fields: [Scalar("Bool", 2), Scalar("Bool", 2)] }])),
+  );
+  // What is not finite has no shape at all.
+  assert_eq(shape_of(con("Int"), declared), None)
+}
+
+test "a domain is the binders' shapes and the product of their sizes" {
+  match finite([con("Bool"), con("Kind")], kinds()) {
+    None -> assert_eq(false, true),
+    Some(domain) -> {
+      assert_eq(domain.shapes, [Scalar("Bool", 2), kind_cases()]);
+      assert_eq(sizes_of(domain), [2, 3]);
+      assert_eq(domain.points, 6)
+    },
+  }
 }
 
 test "a product beyond the bound is refused rather than walked" {

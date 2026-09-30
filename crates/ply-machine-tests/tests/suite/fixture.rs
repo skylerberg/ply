@@ -111,35 +111,144 @@ pub fn repo() -> PathBuf {
         .expect("the crate lives two levels below the repository root")
 }
 
-/// What a program measures for one obligation: each binder's cardinality, and the name its binders'
-/// texts join to. In a real run the decision is Ply's — `prove.domain`'s `size`/`finite`/`name_of`
-/// over the world `proof.world` builds — and these audits make the same decision, so what they
-/// assert is about a *measured* domain rather than a sampled one. Past the bound, or a product of no
-/// points, there is no domain to walk and the obligation is sampled.
+/// What a program measures for one obligation, decided by `proof.domain` itself: the package is
+/// compiled once and its `finite` and `name_of` are entered with the obligation's binders and the
+/// world's declared types, as the CLI measures them. Past the bound, or a product of no points,
+/// there is no domain to walk and the obligation is sampled.
 pub fn measured(
     prover: &ply_machine::engine::Prover<'_>,
     obligation: &ply_prove::Obligation,
 ) -> Option<ply_test::obligation::Domain> {
-    let sizes: Vec<u64> = obligation
-        .generated()
-        .iter()
-        .map(|binder| ply_prove::domain::cardinality(&binder.sort, prover.world()))
-        .collect::<Option<Vec<_>>>()?;
-    let points = sizes.iter().try_fold(1u64, |acc, n| acc.checked_mul(*n))?;
-    if points == 0 || points > ply_prove::ENUMERATION_BOUND {
-        return None;
-    }
-    let name = if obligation.generated().is_empty() {
-        "unit".to_string()
-    } else {
+    use ply_eval::Value;
+    use ply_machine::payload::{field_of, option_of, record};
+    let package = measuring();
+    let module = package.module.as_str();
+    let binders = Value::list(
         obligation
             .generated()
             .iter()
-            .map(|binder| binder.text.clone())
-            .collect::<Vec<_>>()
-            .join(" × ")
-    };
-    Some(ply_test::obligation::Domain { sizes, name })
+            .map(|b| sort_value(module, &b.sort))
+            .collect(),
+    );
+    let decls = Value::list(
+        prover
+            .world()
+            .decls()
+            .map(|decl| {
+                record(vec![
+                    ("name", Value::str(decl.name.as_str())),
+                    ("params", Value::Int(decl.params as i64)),
+                    (
+                        "variants",
+                        Value::list(
+                            decl.variants
+                                .iter()
+                                .map(|variant| {
+                                    record(vec![
+                                        ("name", Value::str(variant.name.as_str())),
+                                        (
+                                            "fields",
+                                            Value::list(
+                                                variant
+                                                    .fields
+                                                    .iter()
+                                                    .map(|t| sort_value(module, t))
+                                                    .collect(),
+                                            ),
+                                        ),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })
+            .collect(),
+    );
+    let answer = package.enter("finite", vec![binders, decls]);
+    let domain = option_of(&answer, "a domain", ply_span::Span::DUMMY)
+        .expect("`finite` answers an option")?;
+    let shapes = field_of(domain, "shapes", ply_span::Span::DUMMY)
+        .expect("a domain has shapes")
+        .as_list(ply_span::Span::DUMMY, "the shapes")
+        .expect("a list")
+        .iter()
+        .map(|shape| ply_machine::claims::shape_of(shape, ply_span::Span::DUMMY).expect("a shape"))
+        .collect();
+    let texts = Value::list(
+        obligation
+            .generated()
+            .iter()
+            .map(|b| Value::str(&b.text))
+            .collect(),
+    );
+    let name = package
+        .enter("name_of", vec![texts])
+        .as_str(ply_span::Span::DUMMY, "a domain's name")
+        .expect("`name_of` answers text")
+        .to_string();
+    Some(ply_test::obligation::Domain { shapes, name })
+}
+
+/// The most points `proof.domain` lets a proof walk.
+pub fn bound() -> u64 {
+    let bound = measuring()
+        .enter("bound", Vec::new())
+        .as_int(ply_span::Span::DUMMY, "the bound")
+        .expect("`bound` answers a number");
+    u64::try_from(bound).expect("a bound is a count")
+}
+
+/// `proof.domain`, compiled once for every test that measures a domain.
+struct Measuring {
+    unit: &'static ply_codegen::Unit,
+    /// The name `domain.ply` loads under, which every value handed to it is named by.
+    module: String,
+}
+
+impl Measuring {
+    fn enter(&self, name: &str, args: Vec<ply_eval::Value>) -> ply_eval::Value {
+        thread_local! {
+            static BODIES: std::cell::OnceCell<std::rc::Rc<dyn ply_eval::Compiled>> =
+                const { std::cell::OnceCell::new() };
+        }
+        let qualified = ply_span::Symbol::new(format!("{}.{name}", self.module));
+        BODIES.with(|bodies| {
+            let compiled = bodies.get_or_init(|| ply_eval::Provider::attach(self.unit));
+            match compiled.enter_whole(&qualified, &args, ply_eval::DEFAULT_MAX_CALLS) {
+                ply_eval::Entered::Answered(value) => value,
+                ply_eval::Entered::Raised(d) => panic!("`{qualified}` raised: {}", d.message),
+                ply_eval::Entered::Declined => panic!("the tier declined `{qualified}`"),
+            }
+        })
+    }
+}
+
+fn measuring() -> &'static Measuring {
+    static PACKAGE: std::sync::OnceLock<Measuring> = std::sync::OnceLock::new();
+    PACKAGE.get_or_init(|| {
+        // `domain.ply` imports nothing, so it loads alone rather than beside the compiler that
+        // `proof.world` reads.
+        let dir = scratch();
+        std::fs::copy(
+            repo().join("crates/ply-prove/ply/domain.ply"),
+            dir.path().join("domain.ply"),
+        )
+        .expect("the prove package keeps `domain.ply`");
+        let loaded = ply_machine::load::load(dir.path())
+            .unwrap_or_else(|e| panic!("`proof.domain` loads: {:?}", e.diagnostics));
+        let module = loaded
+            .check
+            .defs
+            .values()
+            .find(|d| d.simple_name.as_str() == "finite" && d.module.as_str().ends_with("domain"))
+            .map(|d| d.module.to_string())
+            .expect("`proof.domain` measures domains");
+        let texts = ply_machine::support::module_texts(&loaded.check, &loaded.sources);
+        let unit = ply_codegen::Unit::over_front(&loaded.front, texts)
+            .expect("this host has a C compiler");
+        Measuring { unit, module }
+    })
 }
 
 /// The world and the obligations of a loaded program, read off its checked front the way
@@ -306,7 +415,7 @@ pub fn world_value(obligations: &[ply_prove::Obligation]) -> ply_eval::Value {
                         .map(|b| {
                             record(vec![
                                 ("name", Value::str(b.name.as_str())),
-                                ("ty", sort_value(&b.sort)),
+                                ("ty", sort_value("proof.domain", &b.sort)),
                                 ("text", Value::str(&b.text)),
                             ])
                         })
@@ -329,32 +438,22 @@ pub fn world_value(obligations: &[ply_prove::Obligation]) -> ply_eval::Value {
     ])
 }
 
-/// A `proof.domain.Ty`.
-fn sort_value(sort: &ply_prove::Sort) -> ply_eval::Value {
+/// A `proof.domain.Ty`, named by the module `proof.domain` loaded under.
+fn sort_value(module: &str, sort: &ply_prove::Sort) -> ply_eval::Value {
     use ply_eval::Value;
     use ply_machine::payload::{ctor, record};
     use ply_prove::Sort;
+    let each = |sorts: &[Sort]| Value::list(sorts.iter().map(|s| sort_value(module, s)).collect());
     match sort {
-        Sort::Var(v) => ctor("proof.domain", "Var", vec![Value::Int(i64::from(*v))]),
-        Sort::Con(name, args) => ctor(
-            "proof.domain",
-            "Con",
-            vec![
-                Value::str(name.as_str()),
-                Value::list(args.iter().map(sort_value).collect()),
-            ],
-        ),
+        Sort::Var(v) => ctor(module, "Var", vec![Value::Int(i64::from(*v))]),
+        Sort::Con(name, args) => ctor(module, "Con", vec![Value::str(name.as_str()), each(args)]),
         Sort::Fn { params, ret, pure } => ctor(
-            "proof.domain",
+            module,
             "Fn",
-            vec![
-                Value::list(params.iter().map(sort_value).collect()),
-                sort_value(ret),
-                Value::Bool(*pure),
-            ],
+            vec![each(params), sort_value(module, ret), Value::Bool(*pure)],
         ),
         Sort::Record(fields) => ctor(
-            "proof.domain",
+            module,
             "Record",
             vec![Value::list(
                 fields
@@ -362,7 +461,7 @@ fn sort_value(sort: &ply_prove::Sort) -> ply_eval::Value {
                     .map(|(name, field)| {
                         record(vec![
                             ("name", Value::str(name.as_str())),
-                            ("ty", sort_value(field)),
+                            ("ty", sort_value(module, field)),
                         ])
                     })
                     .collect(),

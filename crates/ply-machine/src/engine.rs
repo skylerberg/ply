@@ -378,15 +378,7 @@ impl<'a> Prover<'a> {
         measured: Option<&ply_test::obligation::Domain>,
     ) -> Discharge {
         let measured_domain = measured.and_then(|d| {
-            ply_prove::domain::Finite::of_sizes(
-                obligation
-                    .generated()
-                    .iter()
-                    .map(|b| b.sort.clone())
-                    .collect(),
-                d.sizes.clone(),
-            )
-            .map(|finite| (finite, d.name.clone()))
+            Finite::of_shapes(d.shapes.clone()).map(|finite| (finite, d.name.clone()))
         });
         let measured_domain = measured_domain.as_ref();
         let Some(claim) = self.claim(obligation) else {
@@ -711,7 +703,7 @@ impl<'a> Prover<'a> {
         let mut kept = 0u64;
         for point in 0..finite.points {
             // A domain that cannot produce its own point has not been covered.
-            let Some(values) = finite.point(self.world, point) else {
+            let Some(values) = finite.point(point) else {
                 return Discharge::Unattempted(ungeneratable(&obligation.generated()[0]));
             };
             match judge_case(cases, &values) {
@@ -817,7 +809,7 @@ impl<'a> Prover<'a> {
 
         if let Some((finite, name)) = measured {
             for point in 0..finite.points {
-                let Some(values) = finite.point(self.world, point) else {
+                let Some(values) = finite.point(point) else {
                     continue;
                 };
                 if self.admits(cases, &values)? {
