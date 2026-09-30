@@ -94,8 +94,7 @@ fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>
         None => Hosting::hermetic(),
     };
     let unit = compiled.tier();
-    let executor = InterpExecutor::new(&compiled.port)
-        .with_backend(unit)
+    let executor = InterpExecutor::new(&compiled.port, unit)
         .with_search(Search::default())
         .with_hosts(hosting);
     ply_test::run_with(

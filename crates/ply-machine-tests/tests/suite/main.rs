@@ -180,8 +180,8 @@ fn entered_with(inner: &str, host: bool) -> Value {
     let texts: HashMap<String, String> =
         [("m".to_string(), OUTER.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     ply_machine::register_with(
         &mut registry,
@@ -276,10 +276,21 @@ fn main() -> Int = panic("the inner program's own bug")
     // A raise is a diagnostic value; the outer program does not read inside it.
     assert!(option_int(field(&answer, "exit")).is_none());
     assert_eq!(option_text(field(&answer, "value")), None);
-    let raised = field(&answer, "raised");
+    let raised = match field(&answer, "raised") {
+        Value::Ctor { name, args } if name.as_str() == "Some" => &args[0],
+        other => panic!("the raise is reported, not unwound: {other:?}"),
+    };
+    let text = |name: &str| {
+        let bytes = field(raised, name)
+            .as_bytes(Span::DUMMY, name)
+            .expect("a diagnostic's fields are bytes");
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    assert_eq!(text("code"), ply_eval::codes::RUNTIME_ERROR);
     assert!(
-        matches!(raised, Value::Ctor { name, .. } if name.as_str() == "Some"),
-        "the raise is reported, not unwound"
+        text("message").contains("the inner program's own bug"),
+        "the inner program's panic is what was raised: {}",
+        text("message")
     );
 }
 
@@ -290,8 +301,8 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
     let texts: HashMap<String, String> =
         [("m".to_string(), OUTER.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     ply_machine::register(&mut registry);
     let binding = registry.bind(&front.check).expect("the machine ops bind");
@@ -425,8 +436,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     let binding = Arc::new(registry.bind(&front.check).expect("the machine ops bind"));
 
     let call = |entry: &str, args: Vec<Value>| {
-        let mut machine = Machine::new(&front);
-        machine.set_compiled(unit.attach());
+        let mut machine =
+            Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
         machine.set_host_binding(Arc::clone(&binding));
         machine
             .call(entry, args, Span::DUMMY)
@@ -622,8 +633,8 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
     let texts: HashMap<String, String> =
         [("m".to_string(), outer.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     ply_machine::register(&mut registry);
     let binding = registry.bind(&front.check).expect("the machine ops bind");
@@ -725,8 +736,8 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
         .into_iter()
         .collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     ply_machine::register_with_for(
         &mut registry,

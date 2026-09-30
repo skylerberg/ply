@@ -129,10 +129,13 @@ fn a_whole_search_is_one_artifact_across_separate_processes() {
             "process {run} searched differently"
         );
     }
-    // The artifact must carry a failure with a seed, or this test would pass on an empty run.
+    // The artifact must carry the race's own failure with a seed, or this test would pass on an
+    // empty run, or on one the tier declined.
     let failures = first["failures"].as_array().expect("failures is an array");
     assert!(
-        failures.iter().any(|f| f["seed"].is_string()),
+        failures
+            .iter()
+            .any(|f| f["seed"].is_string() && f["diagnostic"]["code"] == "E0501"),
         "the corpus must produce a seeded failure, or these comparisons prove nothing: {first}"
     );
 }
@@ -191,6 +194,10 @@ fn the_seed_a_failure_prints_replays_that_failure() {
         .iter()
         .find(|f| f["seed"].is_string())
         .expect("the racy test must fail with a seed");
+    assert_eq!(
+        failure["diagnostic"]["code"], "E0501",
+        "the race's own assertion is what the seed names: {failure}"
+    );
     let seed = failure["seed"].as_str().expect("a seed").to_string();
     let message = failure["diagnostic"]["message"].clone();
 

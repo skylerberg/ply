@@ -236,8 +236,7 @@ fn a_class_of_isolated_tests_running_at_once_never_observe_each_other() {
         let root = TempRoot::new();
         let mut store = root.store();
         let selection = compiled.every();
-        let executor = ply_test::InterpExecutor::new(&compiled.port)
-            .with_backend(unit)
+        let executor = ply_test::InterpExecutor::new(&compiled.port, unit)
             .with_search(ply_test::Search::of(&selection))
             .with_hosts(ply_test::Hosting::hermetic());
         let report = ply_test::run_with(
@@ -319,11 +318,11 @@ struct FixtureProbe {
 impl ply_test::Executor for FixtureProbe {
     type Worker = GroupRegion;
 
-    fn worker(&self) -> GroupRegion {
+    fn worker(&self) -> Result<GroupRegion, ply_eval::Diagnostic> {
         self.built.fetch_add(1, Ordering::Relaxed);
-        GroupRegion::build(|regions: &mut TaskRegions| {
+        Ok(GroupRegion::build(|regions: &mut TaskRegions| {
             Value::Cell(regions.alloc_cell(Value::Int(-1)))
-        })
+        }))
     }
 
     fn execute(&self, region: &mut GroupRegion, index: usize) -> Result<(), ply_eval::Diagnostic> {
@@ -436,8 +435,7 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
             .num_threads(jobs)
             .build()
             .expect("the worker pool");
-        let executor = ply_test::InterpExecutor::new(&compiled.port)
-            .with_backend(unit)
+        let executor = ply_test::InterpExecutor::new(&compiled.port, unit)
             .with_search(ply_test::Search::of(&selection))
             .with_hosts(ply_test::Hosting::hermetic());
         let report = pool.install(|| {
