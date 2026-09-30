@@ -743,6 +743,66 @@ pub fn generalize(s: Subst, e: TypeEnv, t: Type) -> { e: TypeEnv, sc: Scheme } =
   }
 }
 
+// --- One numbering per text ------------------------------------------------------------------
+// The checker numbers variables as it meets them, so two answers about one program may number
+// them apart. Renamed in the order their text names them, a scheme's head first, the two are one
+// value.
+
+type Naming = { tys: Map<Int, Int>, rows: Map<Int, Int> }
+
+fn no_naming() -> Naming = { tys: map_new(), rows: map_new() }
+
+// A label variable is a type variable's id, so the two share one numbering.
+fn name_ty(n: Naming, v: Int) -> Naming =
+  if map_contains(n.tys, v) { n } else { { ..n, tys: map_insert(n.tys, v, map_len(n.tys)) } }
+
+fn name_row(n: Naming, v: Int) -> Naming =
+  if map_contains(n.rows, v) { n } else { { ..n, rows: map_insert(n.rows, v, map_len(n.rows)) } }
+
+fn name_atoms(n: Naming, atoms: List<Atom>) -> Naming =
+  fold(atoms, n, |m: Naming, a: Atom| match a.resource { RVar(v) -> name_ty(m, v), _ -> m })
+
+fn name_in(n: Naming, t: Type) -> Naming =
+  match t {
+    TyVar(v) -> name_ty(n, v),
+    TyCon(c) -> fold(c.args, n, name_in),
+    TyFn(f) -> {
+      let m = name_atoms(name_in(fold(f.params, n, name_in), f.ret), f.effects.atoms);
+      match f.effects.tail { Some(v) -> name_row(m, v), None -> m }
+    },
+    TyRecord(fs) -> fold(fs, n, |m: Naming, x: Field| name_in(m, x.ty)),
+  }
+
+fn as_types(n: Naming) -> Map<Int, Type> =
+  map_fold(n.tys, map_new(), |m: Map<Int, Type>, k: Int, v: Int| map_insert(m, k, TyVar(v)))
+
+fn renamed(m: Map<Int, Int>, v: Int) -> Int = match map_get(m, v) { Some(w) -> w, None -> v }
+
+pub fn canonical_type(t: Type) -> Type = {
+  let n = name_in(no_naming(), t);
+  rename(t, as_types(n), n.rows)
+}
+
+pub fn canonical_atoms(atoms: List<Atom>) -> List<Atom> = {
+  let tys = as_types(name_atoms(no_naming(), atoms));
+  fold(atoms, [], |acc: List<Atom>, a: Atom| atoms_insert(acc, rename_atom(a, tys)))
+}
+
+pub fn canonical_scheme(sc: Scheme) -> Scheme = {
+  let head = fold(
+    sc.row_vars,
+    fold(sc.label_vars, fold(sc.ty_vars, no_naming(), name_ty), name_ty),
+    name_row,
+  );
+  let n = name_in(head, sc.ty);
+  {
+    ty_vars: map(sc.ty_vars, |v: Int| renamed(n.tys, v)),
+    row_vars: map(sc.row_vars, |v: Int| renamed(n.rows, v)),
+    label_vars: map(sc.label_vars, |v: Int| renamed(n.tys, v)),
+    ty: rename(sc.ty, as_types(n), n.rows),
+  }
+}
+
 // --- The printer --------------------------------------------------------------------------
 
 // `taken` holds the concrete resource names the text names: a label variable may take none of them.
@@ -769,6 +829,9 @@ fn letter_name(letters: Bytes, i: Int) -> Bytes = {
   let letter = bytes_slice(letters, i % n, i % n + 1);
   if i < n { letter } else { bytes_concat(letter, bytes_of_string(int_to_string(i / n))) }
 }
+
+// The name the `i`th type variable a fresh printer meets is printed under.
+pub fn ty_letter(i: Int) -> Bytes = letter_name(ty_letters(), i)
 
 fn ty_name(p: Printer, v: Int) -> { p: Printer, name: Bytes } =
   match map_get(p.ty_names, v) {
@@ -1147,6 +1210,36 @@ test "the printer names variables in the order it meets them, rows apart" {
   )
 }
 
+test "two schemes alike but for how their variables are numbered are one scheme renamed" {
+  let send = |v: Int| { effect: b"net", resource: RVar(v), mode: MWrite, op: Some(b"send") };
+  let one = {
+    ty_vars: [7, 3],
+    row_vars: [12],
+    label_vars: [5],
+    ty: t_fn([TyVar(3), t_list(TyVar(7))], TyVar(3), { atoms: [send(5)], tail: Some(12) }),
+  };
+  let two = {
+    ty_vars: [40, 21],
+    row_vars: [2],
+    label_vars: [9],
+    ty: t_fn([TyVar(21), t_list(TyVar(40))], TyVar(21), { atoms: [send(9)], tail: Some(2) }),
+  };
+  assert(one != two);
+  assert_eq(canonical_scheme(one), canonical_scheme(two));
+  assert_eq(canonical_scheme(one), {
+    ty_vars: [0, 1],
+    row_vars: [0],
+    label_vars: [2],
+    ty: t_fn([TyVar(1), t_list(TyVar(0))], TyVar(1), { atoms: [send(2)], tail: Some(0) }),
+  });
+  // Renaming is invisible to the printer.
+  assert_eq(scheme_text(canonical_scheme(one)), scheme_text(one));
+  assert_eq(canonical_type(t_list(TyVar(8))), t_list(TyVar(0)));
+  // A footprint's labels are numbered as its sorted atoms name them, and stay sorted.
+  let recv = { ..send(30), op: Some(b"recv") };
+  assert_eq(canonical_atoms([send(12), recv]), [send(0), { ..send(1), op: Some(b"recv") }])
+}
+
 test "a label variable sorts between a name and the singleton, and resolves to what it binds" {
   let named = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") };
   let var_ = { effect: b"net", resource: RVar(4), mode: MWrite, op: Some(b"send") };
@@ -1182,7 +1275,7 @@ test "a footprint's text binds the labels its atoms name" {
   assert_eq(atoms_text([named, second], b","), b"<[l]>net.send[conn],net.send[l]")
 }
 
-// The shape `crates/ply-ty-tests` pins for the Rust printer: the two must answer it alike, or a
+// The shape `crates/ply-eval-tests` pins for the Rust printer: the two must answer it alike, or a
 // text one of them wrote reads back as something else in the other.
 test "a label variable steps past a resource of its name" {
   let named = { effect: b"net", resource: RNamed(b"l"), mode: MWrite, op: Some(b"send") };

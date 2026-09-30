@@ -1,14 +1,10 @@
 //! An adversarial audit of the front-end cache's binary format.
 
-use ply_span::{Symbol, codes};
+use ply_eval::{DefHash, Symbol, codes};
 use ply_store::{
-    BODY_ENCODING, CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody,
-    DefBody, DefEntry, DefKind, FileSpan, NameRef, Outcome, SourceFingerprint, Store,
+    BODY_ENCODING, ContentHash, DefBody, DefEntry, DefKind, FileSpan, Outcome, Slot,
+    SourceFingerprint, Store, TestEntry,
 };
-use ply_ty::DefHash;
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const DATA_HEADER: usize = 56;
@@ -80,51 +76,35 @@ fn hash(n: u8) -> DefHash {
     DefHash([n; 32])
 }
 
-fn footprint() -> Footprint {
-    Footprint::from_atoms([
-        EffectAtom::new("db", Resource::Named(Symbol::new("users")), Mode::Read),
-        EffectAtom::new("clock", Resource::Singleton, Mode::Write),
-    ])
+fn m_f() -> Symbol {
+    Symbol::new("m.f")
 }
 
-/// A different row from [`footprint`], so a frame that transposed the two would be visible.
-fn performed() -> Footprint {
-    Footprint::from_atoms([EffectAtom::new(
-        "db",
-        Resource::Named(Symbol::new("orders")),
-        Mode::Write,
-    )])
+fn m_t() -> Symbol {
+    Symbol::new("m.T")
 }
 
-fn scheme() -> Scheme {
-    Scheme {
-        ty_vars: vec![TyVar(0)],
-        row_vars: vec![RowVar(0)],
-        label_vars: vec![],
-        ty: Type::Fn {
-            params: vec![Type::Var(TyVar(0))],
-            ret: Box::new(Type::int()),
-            effects: Row::open(RowVar(0)),
-        },
+fn def() -> Slot {
+    Slot {
+        name: m_f(),
+        value: b"m.f's interface".to_vec(),
     }
 }
 
-fn def() -> CachedDef {
-    CachedDef::new(scheme(), footprint(), performed())
-        .witnessed_by(vec![NameRef::new("user.User", hash(9))])
+/// Another value for the same name, under another hash.
+fn other_def() -> Slot {
+    Slot {
+        name: m_f(),
+        value: b"another interface".to_vec(),
+    }
 }
 
-fn decl() -> CachedDecl {
-    CachedDecl::new(DeclBody::Effect {
-        nondet: true,
-        ops: vec![CachedOp {
-            name: Symbol::new("get"),
-            mode: Mode::Read,
-            resource_param: true,
-            params: vec![Type::int()],
-            ret: Type::unit(),
-        }],
-    })
+/// Longer than either definition's, so its bytes cut to a definition's length do not decode.
+fn decl() -> Slot {
+    Slot {
+        name: m_t(),
+        value: b"a declaration of m.T, longer than a definition's".to_vec(),
+    }
 }
 
 fn fingerprint() -> SourceFingerprint {
@@ -141,15 +121,15 @@ fn fingerprint() -> SourceFingerprint {
                 span: FileSpan { start: 12, end: 18 },
             }],
         }],
-        tests: vec![CachedTest {
+        tests: vec![TestEntry {
             name: "active_users excludes inactive".to_string(),
             hash: hash(5),
             nondet: false,
-            footprint: footprint(),
             span: FileSpan {
                 start: 50,
                 end: 120,
             },
+            row: b"the front end's row".to_vec(),
         }],
     }
 }
@@ -161,10 +141,7 @@ fn seeded(name: &str) -> TempRoot {
     store.put(hash(200), Outcome::Pass);
     store.put_source(&root.source_file(), fingerprint());
     store.put_def(hash(1), def());
-    store.put_def(
-        hash(2),
-        CachedDef::new(scheme(), Footprint::empty(), Footprint::empty()),
-    );
+    store.put_def(hash(2), other_def());
     store.put_decl(hash(9), decl());
     store.put_body(hash(1), DefBody::new(BODY_ENCODING, vec![0x20, 0xca, 0xfe]));
     store.flush().expect("the seed should flush");
@@ -175,8 +152,8 @@ fn seeded(name: &str) -> TempRoot {
 }
 
 fn assert_seed_is_whole(store: &Store, root: &TempRoot, what: &str) {
-    assert!(store.def(hash(1)).is_some(), "{what}");
-    assert!(store.decl(hash(9)).is_some(), "{what}");
+    assert!(store.def_of(hash(1), &m_f()).is_some(), "{what}");
+    assert!(store.decl_of(hash(9), &m_t()).is_some(), "{what}");
     assert!(store.body(hash(1)).is_some(), "{what}");
     assert!(store.fingerprint(&root.source_file()).is_some(), "{what}");
 }
@@ -280,8 +257,8 @@ fn assert_degraded(store: &Store, root: &TempRoot, what: &str) {
         store.frontend_is_empty(),
         "{what}: the front-end cache should have degraded to empty"
     );
-    assert!(store.def(hash(1)).is_none(), "{what}");
-    assert!(store.decl(hash(9)).is_none(), "{what}");
+    assert!(store.def_of(hash(1), &m_f()).is_none(), "{what}");
+    assert!(store.decl_of(hash(9), &m_t()).is_none(), "{what}");
     assert!(store.body(hash(1)).is_none(), "{what}");
     assert!(store.fingerprint(&root.source_file()).is_none(), "{what}");
     let warnings = store.warnings();
@@ -321,7 +298,7 @@ fn assert_repairs_itself(root: &TempRoot, what: &str) {
         "{what}: it must repair itself, got {:?}",
         repaired.warnings()
     );
-    assert!(repaired.def(hash(42)).is_some(), "{what}");
+    assert!(repaired.def_of(hash(42), &m_f()).is_some(), "{what}");
 }
 
 /// A killed writer's half frame, then a later index that vouches for all of it.
@@ -430,11 +407,11 @@ fn every_field_of_a_frame_header_is_checked_before_its_payload_is_believed() {
             "{what}: the damage is below the index, so opening cannot see it"
         );
         assert!(
-            store.def(hash(1)).is_none() || store.def(hash(2)).is_none(),
+            store.def_of(hash(1), &m_f()).is_none() || store.def_of(hash(2), &m_f()).is_none(),
             "{what}: a frame whose header disagrees with the index must not answer"
         );
         // The other entries are untouched: one bad frame is one missing entry.
-        assert!(store.decl(hash(9)).is_some(), "{what}");
+        assert!(store.decl_of(hash(9), &m_t()).is_some(), "{what}");
         assert!(store.body(hash(1)).is_some(), "{what}");
         assert!(store.fingerprint(&root.source_file()).is_some(), "{what}");
 
@@ -460,7 +437,7 @@ fn a_single_damaged_byte_in_a_payload_costs_that_entry_and_no_other() {
 
         let mut store = root.open();
         assert!(store.warnings().is_empty());
-        let answered = [store.def(hash(1)), store.def(hash(2))]
+        let answered = [store.def_of(hash(1), &m_f()), store.def_of(hash(2), &m_f())]
             .into_iter()
             .flatten()
             .count();
@@ -511,17 +488,14 @@ fn an_index_offset_moved_into_the_interior_of_a_frame_is_refused() {
         );
 
         let mut store = root.open();
-        let answers: Vec<CachedDef> = [store.def(hash(1)), store.def(hash(2))]
+        let answers: Vec<Slot> = [store.def_of(hash(1), &m_f()), store.def_of(hash(2), &m_f())]
             .into_iter()
             .flatten()
             .map(|d| (*d).clone())
             .collect();
         for answer in &answers {
             assert!(
-                *answer == def().canonicalized()
-                    || *answer
-                        == CachedDef::new(scheme(), Footprint::empty(), Footprint::empty())
-                            .canonicalized(),
+                *answer == def() || *answer == other_def(),
                 "slide {slide}: the store answered with a value nobody stored"
             );
         }
@@ -642,7 +616,7 @@ fn an_older_index_over_an_appended_data_file_still_reads_its_own_entries() {
     );
     assert_seed_is_whole(&store, &root, "an older index over an appended data file");
     assert!(
-        store.def(hash(42)).is_none(),
+        store.def_of(hash(42), &m_f()).is_none(),
         "an entry the older index never named must not appear"
     );
 }
@@ -696,7 +670,7 @@ fn a_frame_carrying_another_shapes_payload_is_refused_rather_than_misread() {
     write(&root.data_file(), &bytes);
 
     let mut store = root.open();
-    let answered = [store.def(hash(1)), store.def(hash(2))]
+    let answered = [store.def_of(hash(1), &m_f()), store.def_of(hash(2), &m_f())]
         .into_iter()
         .flatten()
         .count();
@@ -722,7 +696,7 @@ fn an_index_record_pointed_at_a_frame_of_another_kind_is_refused() {
     );
 
     let mut store = root.open();
-    let answered = [store.def(hash(1)), store.def(hash(2))]
+    let answered = [store.def_of(hash(1), &m_f()), store.def_of(hash(2), &m_f())]
         .into_iter()
         .flatten()
         .count();
@@ -736,7 +710,7 @@ fn an_index_record_pointed_at_a_frame_of_another_kind_is_refused() {
     );
     let store = root.open();
     assert!(
-        store.decl(hash(9)).is_some(),
+        store.decl_of(hash(9), &m_t()).is_some(),
         "the declaration itself is fine"
     );
 }
@@ -803,122 +777,42 @@ fn no_whole_byte_mutation_of_a_fingerprint_decodes_into_something_it_does_not_sa
     no_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say(0xff);
 }
 
-/// What the schema exemplars do not encode, they do not pin.
+/// A slot's value is the front end's, and whatever bytes it is, it comes back as.
 #[test]
-fn shapes_no_schema_exemplar_reaches_still_round_trip() {
-    let root = TempRoot::new("uncovered-shapes");
-    let closed = Scheme {
-        ty_vars: vec![],
-        row_vars: vec![],
-        label_vars: vec![],
-        // `Row::empty` — a closed row. Every exemplar's row carries a tail.
-        ty: Type::Fn {
-            params: vec![],
-            ret: Box::new(Type::Record(BTreeMap::from([
-                (Symbol::new("id"), Type::int()),
-                (Symbol::new("name"), Type::string()),
-                (Symbol::new("tags"), Type::list(Type::string())),
-            ]))),
-            effects: Row::empty(),
-        },
-    };
-    let many_ctors = CachedDecl::new(DeclBody::Type {
-        arity: 2,
-        ctors: vec![
-            CachedCtor {
-                fields: vec![],
-                scheme: closed.clone(),
-            },
-            CachedCtor {
-                fields: vec![Type::Var(TyVar(0)), Type::Var(TyVar(1))],
-                scheme: closed.clone(),
-            },
-            CachedCtor {
-                fields: vec![Type::int()],
-                scheme: closed.clone(),
-            },
-        ],
-    });
-    let many_ops = CachedDecl::new(DeclBody::Effect {
-        nondet: false,
-        ops: vec![
-            CachedOp {
-                name: Symbol::new("get"),
-                mode: Mode::Read,
-                resource_param: false,
-                params: vec![],
-                ret: Type::unit(),
-            },
-            CachedOp {
-                name: Symbol::new("put"),
-                mode: Mode::Write,
-                resource_param: true,
-                params: vec![Type::int(), Type::string()],
-                ret: Type::unit(),
-            },
-        ],
-    });
+fn a_slots_value_round_trips_whatever_bytes_it_holds() {
+    let root = TempRoot::new("opaque-values");
+    let every_byte: Vec<u8> = (0..=255u8).collect();
+    let values = [Vec::new(), every_byte.clone(), every_byte.repeat(4096)];
     let bare = SourceFingerprint::new(ContentHash::of(b""));
-    let empty_footprint = CachedDef::new(closed.clone(), Footprint::empty(), Footprint::empty());
 
     let mut store = root.open();
-    store.put_def(hash(1), empty_footprint.clone());
-    store.put_decl(hash(2), many_ctors.clone());
-    store.put_decl(hash(3), many_ops.clone());
+    for (n, value) in values.iter().enumerate() {
+        store.put_def(
+            hash(n as u8 + 1),
+            Slot {
+                name: m_f(),
+                value: value.clone(),
+            },
+        );
+    }
     store.put_source(&root.source_file(), bare.clone());
     store.flush().expect("it should flush");
 
     let reopened = root.open();
     assert!(reopened.warnings().is_empty(), "{:?}", reopened.warnings());
-    assert_eq!(
-        reopened.def(hash(1)).as_deref(),
-        Some(&empty_footprint.canonicalized())
-    );
-    assert_eq!(
-        reopened.decl(hash(2)).as_deref(),
-        Some(&many_ctors.canonicalized()),
-        "constructors are matched by position, so their order must survive"
-    );
-    assert_eq!(
-        reopened.decl(hash(3)).as_deref(),
-        Some(&many_ops.canonicalized())
-    );
+    for (n, value) in values.iter().enumerate() {
+        assert_eq!(
+            reopened
+                .def_of(hash(n as u8 + 1), &m_f())
+                .map(|slot| slot.value.clone()),
+            Some(value.clone()),
+            "value {n}"
+        );
+    }
     assert_eq!(
         reopened.fingerprint(&root.source_file()).as_deref(),
         Some(&bare)
     );
-}
-
-/// A definition generic over a label: the atom's resource is a variable the head binds.
-#[test]
-fn a_scheme_quantified_over_a_label_round_trips_with_its_atoms() {
-    let root = TempRoot::new("label-scheme");
-    let generic = Scheme {
-        ty_vars: vec![],
-        row_vars: vec![RowVar(0)],
-        label_vars: vec![LabelVar(0)],
-        ty: Type::Fn {
-            params: vec![Type::int()],
-            ret: Box::new(Type::unit()),
-            effects: Row {
-                atoms: [
-                    EffectAtom::operation("net", Resource::Var(LabelVar(0)), Mode::Write, "send"),
-                    EffectAtom::new("net", Resource::Var(LabelVar(0)), Mode::Read),
-                ]
-                .into(),
-                tail: Some(RowVar(0)),
-            },
-        },
-    };
-    let def = CachedDef::new(generic, footprint(), performed());
-
-    let mut store = root.open();
-    store.put_def(hash(1), def.clone());
-    store.flush().expect("it should flush");
-
-    let reopened = root.open();
-    assert!(reopened.warnings().is_empty(), "{:?}", reopened.warnings());
-    assert_eq!(reopened.def(hash(1)).as_deref(), Some(&def.canonicalized()));
 }
 
 /// A symbol is length-prefixed UTF-8, and a span is a pair of `u32`s.
@@ -940,12 +834,12 @@ fn the_edges_of_every_scalar_field_survive_a_round_trip() {
             span: FileSpan { start: 0, end: 0 },
         }],
     });
-    fp.tests.push(CachedTest {
+    fp.tests.push(TestEntry {
         name: String::new(),
         hash: DefHash([0; 32]),
         nondet: true,
-        footprint: Footprint::empty(),
         span: FileSpan { start: 0, end: 0 },
+        row: Vec::new(),
     });
 
     let mut store = root.open();
@@ -958,42 +852,6 @@ fn the_edges_of_every_scalar_field_survive_a_round_trip() {
         reopened.fingerprint(&root.source_file()).as_deref(),
         Some(&fp)
     );
-}
-
-#[test]
-fn a_deeply_nested_type_round_trips_rather_than_reporting_a_healthy_cache_corrupt() {
-    for depth in [1usize, 8, 64, 122, 132, 400, 800] {
-        let root = TempRoot::new(&format!("deep-type-{depth}"));
-        let mut ty = Type::int();
-        for _ in 0..depth {
-            ty = Type::list(ty);
-        }
-        let deep = CachedDef::new(
-            Scheme {
-                ty_vars: vec![],
-                row_vars: vec![],
-                label_vars: vec![],
-                ty,
-            },
-            Footprint::empty(),
-            Footprint::empty(),
-        );
-
-        let mut store = root.open();
-        store.put_def(hash(1), deep.clone());
-        store.flush().expect("it should flush");
-
-        let reopened = root.open();
-        let back = reopened
-            .def(hash(1))
-            .unwrap_or_else(|| panic!("depth {depth} was written and must read back"));
-        assert_eq!(&*back, &deep.canonicalized(), "depth {depth}");
-        assert!(
-            reopened.warnings().is_empty(),
-            "depth {depth}: {:?}",
-            reopened.warnings()
-        );
-    }
 }
 
 /// Two independent gates: the frame checksum, and `body_set`'s key check.
@@ -1084,7 +942,7 @@ fn concurrent_writers_never_interleave_their_frames() {
                 for i in 0u8..10 {
                     let n = 60 + w * 10 + i;
                     let mut store = root.open();
-                    store.put_def(hash(n), CachedDef::new(scheme(), footprint(), performed()));
+                    store.put_def(hash(n), def());
                     store.put_body(hash(n), DefBody::new(BODY_ENCODING, vec![n; 8]));
                     store.flush().expect("a writer should flush");
                 }
@@ -1118,11 +976,11 @@ fn a_damaged_section_count_loses_entries_but_never_invents_one() {
         assert!(store.decls_len() <= 1, "count {count}");
         assert!(store.bodies_len() <= 1, "count {count}");
         assert!(store.sources_len() <= 1, "count {count}");
-        if let Some(found) = store.def(hash(1)) {
-            assert_eq!(&*found, &def().canonicalized(), "count {count}");
+        if let Some(found) = store.def_of(hash(1), &m_f()) {
+            assert_eq!(&*found, &def(), "count {count}");
         }
-        if let Some(found) = store.decl(hash(9)) {
-            assert_eq!(&*found, &decl().canonicalized(), "count {count}");
+        if let Some(found) = store.decl_of(hash(9), &m_t()) {
+            assert_eq!(&*found, &decl(), "count {count}");
         }
         if let Some(found) = store.fingerprint(&root.source_file()) {
             assert_eq!(&*found, &fingerprint(), "count {count}");

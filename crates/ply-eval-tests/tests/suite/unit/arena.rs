@@ -1,6 +1,5 @@
-use ply_eval::Value;
 use ply_eval::arena::*;
-use ply_span::Span;
+use ply_eval::{Span, Value};
 use std::sync::Arc;
 
 /// Behind an `Arc`, so `strong_count` shows whether the arena freed it.

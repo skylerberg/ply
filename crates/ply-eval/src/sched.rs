@@ -5,7 +5,7 @@ use crate::host::{HostBinding, HostRuntime, Pending};
 use crate::region::Trail;
 use crate::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use crate::value::Value;
-use ply_span::{Diagnostic, Span, codes};
+use crate::{Diagnostic, Span, codes};
 
 /// The task a `simulate` region's own body runs as.
 pub const ROOT: TaskId = TaskId(0);

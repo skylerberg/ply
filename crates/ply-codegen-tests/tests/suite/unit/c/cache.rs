@@ -1,7 +1,6 @@
 use ply_codegen::c::cache::{decode, encode};
 use ply_codegen::c::tables::{Defined, Tables};
-use ply_eval::Value;
-use ply_span::Symbol;
+use ply_eval::{Symbol, Value};
 
 /// Table names can be spelled anything, `text` included, so the text's start is an offset rather than a marker.
 #[test]

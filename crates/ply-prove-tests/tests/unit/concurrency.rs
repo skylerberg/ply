@@ -1,21 +1,17 @@
 use ply_eval::arena::Slot;
 use ply_eval::explore::Step;
 use ply_eval::{
-    Access, Domain, Interleaving, Plan, Seed, SimId, SimMode, Simulation, StepFootprint, Stream,
-    TaskId, explore,
+    Access, DefHash, Diagnostic, Domain, Interleaving, Mode, Plan, Seed, SimId, SimMode,
+    Simulation, Span, StepFootprint, Stream, Symbol, TaskId, codes, explore,
 };
 use ply_prove::concurrency::{
     BodyRun, LawSearch, Searched, ValueDomain, audit_interleaving_proof, discharge, refutation,
     replay_command,
 };
 use ply_prove::{
-    Binding, Certificate, Discharge, Evidence, Frame, Gap, Obligation, ObligationKind, Rule, Tier,
-    Vacuity, VacuityKind, interleaving_proves,
+    Binder, Binding, Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, Rule, Sort,
+    Tier, Vacuity, VacuityKind, interleaving_proves,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::DefHash;
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, LawBinder, Resource, Type};
 
 fn body_was_false(span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -124,7 +120,7 @@ impl LawSearch for Model {
     fn bindings(&self, point: u64) -> Vec<Binding> {
         vec![Binding {
             name: Symbol::new("n"),
-            ty: Type::int(),
+            ty: "Int".to_string(),
             rendered: point.to_string(),
         }]
     }
@@ -136,17 +132,12 @@ fn law(binders: usize) -> Obligation {
         owner: Symbol::new("bank.transfers conserve value"),
         kind: ObligationKind::Law,
         span: Span::DUMMY,
-        frame: Frame::Pure,
         binders: (0..binders)
-            .map(|i| LawBinder {
-                name: Symbol::new(format!("n{i}")),
-                ty: Type::int(),
-                span: Span::DUMMY,
-            })
+            .map(|i| Binder::new(&format!("n{i}"), Sort::int()))
             .collect(),
         guarded: false,
         host: false,
-        footprint: Footprint::from_atoms([EffectAtom::new("sim", Resource::Singleton, Mode::Read)]),
+        footprint: Some("{sim.read}".to_string()),
     }
 }
 
@@ -544,7 +535,7 @@ fn a_refutation_reports_the_seed_the_race_and_the_replay() {
 fn only_a_law_carrying_sim_read_is_routed_to_a_search() {
     assert!(law(0).is_concurrency_law());
     let pure = Obligation {
-        footprint: Footprint::empty(),
+        footprint: None,
         ..law(0)
     };
     assert!(!pure.is_concurrency_law());

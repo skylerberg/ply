@@ -1,7 +1,6 @@
-use ply_eval::Value;
+use ply_eval::{SourceId, Symbol, Value, codes};
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
 use ply_machine::config::*;
-use ply_span::{SourceId, Symbol, codes};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,65 +18,43 @@ fn a_hermetic_run_opens_no_source() {
     assert!(!Configuration::default().is_opened());
 }
 
-#[test]
-fn a_config_schema_that_is_not_a_qualified_name_is_refused() {
-    for bad in ["config", "desk.", ".config", "desk..config", "1desk.config"] {
-        let error = schema::check_shape(bad).expect_err("`{bad}` is not `<module>.<fn>`");
-        assert_eq!(error.code, codes::CONFIG_UNAVAILABLE, "{bad}");
-    }
-    assert!(schema::check_shape("desk.config").is_ok());
-    assert!(schema::check_shape("store.orders.config").is_ok());
-}
-
-fn check(source: &str) -> ply_ty::CheckOutput {
+fn check(source: &str) -> ply_eval::CheckOutput {
     ply_codegen::c::producer::checked_front(&[(String::new(), source.to_string())], &[SourceId(0)])
         .expect("the fixture typechecks")
         .check
 }
 
-const SPEC_SOURCE: &str = "\
-type Shape = SText | SInt | SBool | SSecret
-type Key = { name: String, shape: Shape, required: Bool, default: Option<String> }
-type ConfigSpec = { keys: List<Key> }
-fn config() -> ConfigSpec = { keys: [] }
-fn two(a: Int) -> ConfigSpec = { keys: [] }
-fn number() -> Int = 1
-";
-
+/// The machine evaluates and decodes the definition it is handed, and refuses a name its program
+/// does not carry: an artifact built without the schema carries none.
 #[test]
-fn a_nullary_pure_function_returning_a_spec_resolves() {
-    let program = check(SPEC_SOURCE);
-    assert_eq!(
-        schema::resolve(&program, "config")
-            .expect("it is a schema function")
-            .as_str(),
-        "config"
-    );
-}
+fn a_schema_is_evaluated_and_decoded_and_one_the_program_does_not_carry_is_refused() {
+    let program = check("fn config() -> Int = 1\n");
+    let spec = spec_value(vec![key("DESK_PORT", "SInt", true, None)]);
+    let answered = |_: &str| Ok(spec.clone());
+    let decoded = schema::materialise(&program, "config", &answered).expect("it decodes");
+    assert_eq!(decoded.keys.len(), 1);
 
-/// The fix is a different argument, not an edit to the program, so each refusal is about the argument.
-#[test]
-fn a_schema_function_that_is_not_one_is_refused_with_the_reason() {
-    let program = check(SPEC_SOURCE);
-    for (name, why) in [
-        ("two", "argument"),
-        ("number", "rather than a `ConfigSpec`"),
-    ] {
-        let error = schema::resolve(&program, name).expect_err("`{name}` is not a schema function");
-        assert_eq!(error.code, codes::CONFIG_UNAVAILABLE, "{name}");
-        assert!(error.message.contains(why), "{name}: {}", error.message);
-    }
-}
-
-#[test]
-fn an_unknown_schema_function_lists_the_candidates() {
-    let program = check(SPEC_SOURCE);
-    let error = schema::resolve(&program, "desk.config").expect_err("no such definition");
-    assert_eq!(error.code, codes::CONFIG_UNAVAILABLE);
+    let absent =
+        schema::materialise(&program, "desk.config", &answered).expect_err("nothing is named so");
+    assert_eq!(absent.code, codes::CONFIG_UNAVAILABLE);
     assert!(
-        error.notes.iter().any(|n| n.contains("config")),
-        "{:?}",
-        error.notes
+        absent.message.contains("names no definition"),
+        "{}",
+        absent.message
+    );
+
+    let raised = |_: &str| {
+        Err(ply_eval::Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            "it raised",
+        ))
+    };
+    let failed = schema::materialise(&program, "config", &raised).expect_err("it raised");
+    assert_eq!(failed.code, codes::CONFIG_UNAVAILABLE);
+    assert!(failed.message.contains("could not be evaluated: it raised"));
+    assert!(
+        !failed.labels[0].span.is_dummy(),
+        "it points at the definition"
     );
 }
 

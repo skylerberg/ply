@@ -6,8 +6,9 @@ use super::egraph::{Classes, conflict, shape_of};
 use super::term::{Arm, ArmTest, CmpOp, Node, Poly, TermId, Terms};
 use super::{RuleLog, arith};
 use crate::Rule;
-use ply_span::Symbol;
-use ply_ty::Type;
+use crate::sort::Sort;
+use crate::world::Ctor;
+use ply_eval::Symbol;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,7 +32,7 @@ enum Split {
     Constructor {
         scrutinee: TermId,
         type_name: Symbol,
-        ctors: Vec<(Symbol, Vec<Option<Type>>)>,
+        ctors: Vec<(Symbol, Vec<Option<Sort>>)>,
     },
     Literal(TermId, TermId),
     Disequality(TermId, TermId),
@@ -141,7 +142,7 @@ impl<'a, 'p> Solver<'a, 'p> {
                     arms: 2,
                 });
                 let sort = self.terms.sort(scrutinee).cloned();
-                let elem = sort.as_ref().and_then(super::term::list_elem).cloned();
+                let elem = sort.as_ref().and_then(Sort::list_elem).cloned();
                 let nil = self.terms.nil(sort.clone());
                 let head = self.terms.sym(elem);
                 let tail = self.terms.sym(sort.clone());
@@ -446,8 +447,7 @@ impl<'a, 'p> Solver<'a, 'p> {
     }
 
     fn is_bool(&self, term: TermId) -> bool {
-        matches!(self.terms.sort(term), Some(Type::Con(name, args))
-            if name.as_str() == "Bool" && args.is_empty())
+        self.terms.sort(term).is_some_and(|s| s.is_con("Bool"))
     }
 
     /// `&&` when `dominant` is `true`, `||` when it is `false`.
@@ -650,15 +650,15 @@ impl<'a, 'p> Solver<'a, 'p> {
     }
 
     fn fields_all_equal(&self, branch: &Branch, a: TermId, b: TermId) -> bool {
-        let (Some(Type::Record(left)), Some(Type::Record(right))) =
+        let (Some(Sort::Record(left)), Some(Sort::Record(right))) =
             (self.terms.sort(a), self.terms.sort(b))
         else {
             return false;
         };
-        if left.is_empty() || left.keys().ne(right.keys()) {
+        if left.is_empty() || left.iter().map(|(n, _)| n).ne(right.iter().map(|(n, _)| n)) {
             return false;
         }
-        left.keys().all(|name| {
+        left.iter().all(|(name, _)| {
             match (
                 self.projection(branch, a, name),
                 self.projection(branch, b, name),
@@ -833,18 +833,24 @@ impl<'a, 'p> Solver<'a, 'p> {
 
     fn constructor_split(&self, scrutinee: TermId) -> Option<Split> {
         let sort = self.terms.sort(scrutinee)?.clone();
-        let Type::Con(type_name, _) = &sort else {
+        let Sort::Con(type_name, _) = &sort else {
             return None;
         };
-        let variants = self.ctx.variants(type_name)?;
-        let ctors = variants
-            .ctors
+        let decl = self.ctx.variants(type_name)?;
+        let ctors = decl
+            .variants
             .iter()
-            .map(|c| (c.name.clone(), super::lower::field_sorts(c, Some(&sort))))
+            .map(|variant| {
+                let ctor = Ctor { decl, variant };
+                (
+                    variant.name.clone(),
+                    super::lower::field_sorts(ctor, Some(&sort)),
+                )
+            })
             .collect();
         Some(Split::Constructor {
             scrutinee,
-            type_name: variants.type_name,
+            type_name: decl.name.clone(),
             ctors,
         })
     }

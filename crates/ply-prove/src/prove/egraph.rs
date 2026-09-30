@@ -123,7 +123,7 @@ pub fn conflict(a: &Shape<'_>, b: &Shape<'_>) -> Option<bool> {
             Some(x != y)
         }
         (Shape::Record(Node::Record(x)), Shape::Record(Node::Record(y))) => {
-            let names = |fields: &Vec<(ply_span::Symbol, TermId)>| {
+            let names = |fields: &Vec<(ply_eval::Symbol, TermId)>| {
                 fields.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
             };
             Some(names(x) != names(y))

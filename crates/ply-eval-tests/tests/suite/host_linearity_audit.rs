@@ -1,10 +1,9 @@
 use crate::fixture::Compiled;
-use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, Pending,
 };
-use ply_span::{Diagnostic, Symbol, codes};
+use ply_eval::{Diagnostic, Symbol, Value, codes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

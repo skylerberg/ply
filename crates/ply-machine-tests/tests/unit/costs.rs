@@ -26,7 +26,7 @@ fn a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes() {
     );
     let broken = ply_machine::costs::promises(&loaded);
     assert_eq!(broken.len(), 1, "{broken:#?}");
-    assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
+    assert_eq!(broken[0].code, ply_eval::codes::REUSE_BROKEN);
     assert!(broken[0].message.contains("`grow` is a `reuse fn`"));
     assert!(broken[0].notes.iter().any(|n| n.contains("last use")));
 
@@ -59,14 +59,14 @@ fn the_port_keeps_a_promise_over_a_fresh_list_and_refuses_one_over_a_map_entry()
     let broken = ply_machine::costs::promises(&loaded);
     assert_eq!(broken.len(), 1, "{broken:#?}");
     let d = &broken[0];
-    assert_eq!(d.code, ply_span::codes::REUSE_BROKEN);
+    assert_eq!(d.code, ply_eval::codes::REUSE_BROKEN);
     assert_eq!(
         d.message,
         "`grow` is a `reuse fn`, and this append copies its list: `map_get` answers a clone the \
          map still holds"
     );
     assert_eq!(d.notes, ["fix: `map_update`"]);
-    let text = |span: ply_span::Span| {
+    let text = |span: ply_eval::Span| {
         let file = loaded
             .sources
             .get(span.source)

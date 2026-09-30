@@ -2,8 +2,7 @@
 //! append-only data file that is mapped and whose entries are decoded one at a time.
 
 use crate::{ContentHash, FRONTEND_FORMAT, FRONTEND_VERSION, disk};
-use ply_span::Diagnostic;
-use ply_ty::DefHash;
+use ply_eval::{DefHash, Diagnostic};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::path::Path;

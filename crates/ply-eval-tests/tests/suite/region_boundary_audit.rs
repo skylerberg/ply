@@ -7,8 +7,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Arena, RegionKind, TaskRegions, Value};
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_eval::{Arena, Diagnostic, RegionKind, Span, Symbol, TaskRegions, Value, codes};
 use std::sync::Arc;
 
 /// A cell over a still-open region's slot, so what is under test is the boundary and not staleness.

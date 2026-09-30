@@ -1,8 +1,8 @@
 //! The region stack a task allocates in, and the fixture it starts from.
 
+use crate::Span;
 use crate::arena::{Arena, Reclaim, RegionId, RegionKind, Slot};
 use crate::value::Value;
-use ply_span::Span;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;

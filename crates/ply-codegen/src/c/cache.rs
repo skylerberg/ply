@@ -2,8 +2,7 @@
 //! (`@@c3@@`), so a cached body is a function of the body alone.
 
 use super::tables::{Defined, Tables};
-use ply_eval::Value;
-use ply_span::Symbol;
+use ply_eval::{Symbol, Value};
 use std::path::PathBuf;
 
 fn dir() -> PathBuf {

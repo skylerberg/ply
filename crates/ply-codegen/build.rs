@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-const CRATES: &[&str] = &["ply-codegen", "ply-eval", "ply-ty", "ply-span"];
+const CRATES: &[&str] = &["ply-codegen", "ply-eval"];
 
 fn main() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");

@@ -2,8 +2,7 @@
 
 use super::sink::Field;
 use super::{Level, Outcome};
-use ply_eval::Value;
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_eval::{Diagnostic, Span, Symbol, Value, codes};
 
 const MODULE: &str = super::MODULE;
 

@@ -1,11 +1,11 @@
 use ply_eval::sched::{HostPolicy, Scheduler};
 use ply_eval::sched::{Policy, Resumption, Turn};
 use ply_eval::sim::TASK_OPS;
-use ply_eval::{HostBinding, HostRequest, HostRuntime, SimId};
-use ply_eval::{HostRegistry, Pending, TaskId, Value};
+use ply_eval::{
+    Diagnostic, HostBinding, HostRegistry, HostRequest, HostRuntime, Pending, SimId, SourceId,
+    Span, Symbol, TaskId, Value, codes,
+};
 use ply_host::sched::*;
-use ply_span::SourceId;
-use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -261,7 +261,7 @@ fn refused<T>(outcome: Result<T, Diagnostic>, why: &str) -> Diagnostic {
     }
 }
 
-fn check(source: &str) -> ply_ty::CheckOutput {
+fn check(source: &str) -> ply_eval::CheckOutput {
     ply_codegen::c::producer::checked_front(
         &[("m".to_string(), source.to_string())],
         &[SourceId(0)],
@@ -341,7 +341,7 @@ fn the_task_registrations_are_what_ply_hosts_prints() {
     assert_eq!(rows, vec!["task.join", "task.spawn", "task.yield"]);
     for row in &listing.rows {
         assert_eq!(row.atom.to_string(), row.to_string());
-        assert_eq!(row.atom.mode, ply_ty::Mode::Write);
+        assert_eq!(row.atom.mode, ply_eval::Mode::Write);
         assert!(!row.deterministic);
         assert!(!row.linearity.is_linear());
         assert!(!row.blocking);

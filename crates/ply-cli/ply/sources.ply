@@ -8,10 +8,17 @@ import compiler.resolve (Source, Diag, Label, diag1)
 import builder (builder)
 import compiler.pkg (Supplied, wants)
 import paths
-import walk (Failure, Found, sweep, sweep_l, is_ply)
+import paths (Rooted, displayed, read_file)
+import walk (Failure, Found, named, nothing, is_ply)
 
-// One module of the program: where it was read from, what it is called, and its bytes.
-pub type File = { path: String, module: String, text: Bytes }
+// One module of the program: its place below the root, which names it, and its bytes.
+pub type File = {
+  path: String,
+  module: String,
+  text: Bytes,
+  // Where it was read, which is where a rewrite of it goes.
+  at: Rooted,
+}
 
 // A dependency package the walk read: its manifest text and its modules, as files for
 // placing and as sources for the front end.
@@ -76,106 +83,64 @@ pub fn nothing_here(path: String) -> Diag =
   ])
 
 // A refused file joins `files` so a label can point at it, and never joins `sources`.
-fn refused_file(p: Project, path: String, text: Bytes, d: Diag) -> Project =
-  { ..p, files: push(p.files, { path: path, module: "", text: text }), diags: push(p.diags, d) }
+fn refused_file(p: Project, f: File, d: Diag) -> Project =
+  { ..p, files: push(p.files, f), diags: push(p.diags, d) }
 
-fn placed(p: Project, path: String, text: Bytes) -> Project = {
+fn placed(p: Project, at: Rooted, path: String, text: Bytes) -> Project = {
   let here = len(p.files);
   match module_of(path) {
-    Err(why) -> refused_file(p, path, text, unaddressable(here, path, why)),
+    Err(why) ->
+      refused_file(
+        p,
+        { path: path, module: "", text: text, at: at },
+        unaddressable(here, path, why),
+      ),
     // The built-in packages' prefixes collide at the front end, which reports them.
     Ok(name) -> {
       {
         ..p,
-        files: push(p.files, { path: path, module: name, text: text }),
+        files: push(p.files, { path: path, module: name, text: text, at: at }),
         sources: push(p.sources, { name: bytes_of_string(name), src: text }),
       }
     },
   }
 }
 
-fn read_at(
-  label: String,
-  path: String,
-) -> Option<Bytes> / {builder.git[vcs], fs.read_file[cwd], fs.read_file[abs]} =
-  if label == "cwd" { fs.read_file[cwd](path) } else { fs.read_file[abs](path) }
-
+// One file the walk found, read through its own root and named by its place below `strip`.
 fn one_file(
-  p: Project,
-  path: String,
-) -> Project / {builder.git[vcs], fs.read_file[cwd], fs.read_file[abs]} =
-  one_file_l("cwd", "", p, path)
-
-fn one_file_l(
-  label: String,
   strip: String,
   p: Project,
-  path: String,
-) -> Project / {builder.git[vcs], fs.read_file[cwd], fs.read_file[abs]} =
-  match read_at(label, path) {
-    None -> { ..p, diags: push(p.diags, unreadable(path)) },
+  at: Rooted,
+) -> Project / {fs.read_file[cwd], fs.read_file[abs]} =
+  match read_file(at) {
+    None -> { ..p, diags: push(p.diags, unreadable(displayed(at))) },
     Some(text) -> {
-      let display = match paths::strip_prefix(path, strip) {
-        Some(rest) -> if rest == "" { path } else { rest },
-        None -> path,
+      let display = match paths::strip_prefix(at.path, strip) {
+        Some(rest) -> if rest == "" { at.path } else { rest },
+        None -> at.path,
       };
-      placed(p, display, text)
+      placed(p, at, display, text)
     },
   }
 
-// Every `.ply` file the paths name, in path order, with the ones that cannot be modules refused.
-pub fn read(found: Found) -> Project / {builder.git[vcs], fs.read_file[cwd], fs.read_file[abs]} = {
-  let start: Project = {
-    files: [],
-    sources: [],
-    diags: [],
-    manifest: None,
-    packages: [],
-    root_key: "",
-  };
-  let filed: Project = fold(map_keys(found.files), start, |acc: Project, path: String|
-    one_file(acc, path));
+fn empty() -> Project =
+  { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "" }
+
+// Every `.ply` file the walk found, in path order, with the ones that cannot be modules refused.
+fn read(found: Found, strip: String) -> Project / {fs.read_file[cwd], fs.read_file[abs]} = {
+  let filed: Project = fold(map_values(found.files), empty(), |acc: Project, at: Rooted|
+    one_file(strip, acc, at));
   fold(found.errors, filed, |acc: Project, e: Failure|
     { ..acc, diags: push(acc.diags, unreadable(e.path)) })
 }
 
-pub fn load(
-  paths: List<String>,
-) -> Project / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} =
-  read(sweep(paths))
-
-// The same under a label that may leave the working directory.
-pub fn load_l(
-  label: String,
-  root: String,
-  paths: List<String>,
-) -> Project / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
-  let found = sweep_l(label, paths);
-  let start: Project = {
-    files: [],
-    sources: [],
-    diags: [],
-    manifest: None,
-    packages: [],
-    root_key: "",
-  };
-  let filed: Project = fold(map_keys(found.files), start, |acc: Project, path: String|
-    one_file_l(label, root, acc, path));
-  fold(found.errors, filed, |acc: Project, e: Failure|
-    { ..acc, diags: push(acc.diags, unreadable(e.path)) })
-}
-
-// Every path a command was given, each resolved against the working directory, loaded and merged.
+// Every path a command was given, each found and read under the root it resolved to, and merged.
 pub fn load_resolved(
   rs: List<paths::Resolved>,
 ) -> Project / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
   let rs = if len(rs) == 0 { [paths::here()] } else { rs };
-  let merged = fold(
-    rs,
-    { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "" },
-    |acc: Project, r: paths::Resolved|
-      merge(acc, with_manifest(r, load_l(r.label, paths::root_prefix(r), [paths::address(r)]))),
-  );
+  let merged = fold(rs, empty(), |acc: Project, r: paths::Resolved|
+    merge(acc, with_manifest(r, read(named(nothing(), paths::rooted(r)), paths::root_prefix(r)))));
   match list_at(rs, 0) {
     None -> merged,
     Some(first) ->
@@ -195,17 +160,16 @@ pub fn load_resolved(
 fn read_dep_modules(
   root: String,
 ) -> List<File> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
-  let swept = under_abs(root);
-  let found = sweep_l("abs", [swept]);
-  let ordered = map_keys(found.files);
-  fold(ordered, [], |acc: List<File>, path: String|
-    match paths::strip_prefix(path, swept) {
+  let swept = at_abs(root);
+  let found = named(nothing(), swept);
+  fold(map_values(found.files), [], |acc: List<File>, at: Rooted|
+    match paths::strip_prefix(at.path, swept.path) {
       None -> acc,
-      Some(rest) -> match read_at("abs", path) {
+      Some(rest) -> match read_file(at) {
         None -> acc,
         Some(text) -> match module_of(rest) {
           Err(_) -> acc,
-          Ok(name) -> push(acc, { path: root ++ "/" ++ rest, module: name, text: text }),
+          Ok(name) -> push(acc, { path: root ++ "/" ++ rest, module: name, text: text, at: at }),
         },
       },
     })
@@ -216,12 +180,14 @@ fn read_dep_modules(
 pub fn under_abs(path: String) -> String =
   if string_starts_with(path, "/") { string_slice(path, 1, string_len(path)) } else { path }
 
+fn at_abs(path: String) -> Rooted = { label: "abs", path: under_abs(path) }
+
 fn read_dep(
   root: Bytes,
   dir: String,
 ) -> DepPackage / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
   let here = string_of_bytes_lossy(root);
-  match read_at("abs", under_abs(dir) ++ "/ply.pkg") {
+  match read_file(at_abs(join(dir, "ply.pkg"))) {
     None -> { root: here, dir: dir, manifest: None, files: [] },
     Some(text) -> { root: here, dir: dir, manifest: Some(text), files: read_dep_modules(dir) },
   }
@@ -238,7 +204,7 @@ pub fn index_path(project: String) -> String = join(project, "vendor/index")
 pub fn vendored(
   project: String,
 ) -> List<Vendored> / {builder.git[vcs], fs.read_file[cwd], fs.read_file[abs]} =
-  match read_at("abs", under_abs(index_path(project))) { None -> [], Some(text) -> index_of(text) }
+  match read_file(at_abs(index_path(project))) { None -> [], Some(text) -> index_of(text) }
 
 // One line per package: `<want>\t<dir>`, in the order `ply vendor` wrote them.
 fn index_of(text: Bytes) -> List<Vendored> =
@@ -254,7 +220,7 @@ fn index_of(text: Bytes) -> List<Vendored> =
 
 // The index holds a directory relative to the project, so it survives the project moving; what the
 // walk needs is where that is *here*, which is why the root is an argument.
-fn from_vendor(project: String, items: List<Vendored>, want: Bytes) -> Option<String> =
+pub fn from_vendor(project: String, items: List<Vendored>, want: Bytes) -> Option<String> =
   fold(items, None, |found: Option<String>, v: Vendored|
     match found {
       Some(_) -> found,
@@ -343,22 +309,20 @@ fn fetched(project: String, want: Bytes) -> Option<String> / {builder.git[vcs]} 
     }
   } else { Some(string_of_bytes_lossy(want)) }
 
-fn manifest_spelling(r: paths::Resolved) -> String =
-  if r.spelling == "." || r.spelling == "" { "ply.pkg" } else { r.spelling ++ "/ply.pkg" }
-
-fn manifest_display(r: paths::Resolved) -> String =
-  if r.display == "." || r.display == "" { "ply.pkg" } else { r.display ++ "/ply.pkg" }
-
 // The root's `ply.pkg`, when there is one; the first root to have one wins the merge.
 fn with_manifest(
   r: paths::Resolved,
   p: Project,
-) -> Project / {builder.git[vcs], fs.read_file[cwd], fs.read_file[abs]} =
+) -> Project / {fs.read_file[cwd], fs.read_file[abs]} =
   match p.manifest {
     Some(_) -> p,
-    None -> match read_at(r.label, manifest_spelling(r)) {
-      None -> p,
-      Some(text) -> { ..p, manifest: Some({ path: manifest_display(r), module: "", text: text }) },
+    None -> {
+      let at = paths::in_root(r, "ply.pkg");
+      match read_file(at) {
+        None -> p,
+        Some(text) ->
+          { ..p, manifest: Some({ path: displayed(at), module: "", text: text, at: at }) },
+      }
     },
   }
 
@@ -416,17 +380,20 @@ test "the reserved roots are the ones this binary ships under" {
   assert(!is_compiler("compilers"))
 }
 
-test "a file that cannot be a module is refused and does not reach the front end" {
-  let found: Found = {
-    files: map_insert(map_insert(map_new(), "m.ply", true), "my-file.ply", true),
+// The walk's answer for files it found in the working directory.
+fn found_here(names: List<String>) -> Found =
+  {
+    files: fold(names, map_new(), |acc: Map<String, Rooted>, path: String|
+      map_insert(acc, path, { label: "cwd", path: path })),
     errors: [],
-  };
+  }
+
+test "a file that cannot be a module is refused and does not reach the front end" {
   let p = handle {
-    read(found)
+    read(found_here(["m.ply", "my-file.ply"]), "")
   } with {
-    builder.git[vcs](root, key) -> Err({ diags: [], places: [] }),
     fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
-    fs.read_file[abs](path) -> Some(b"fn f() -> Int = 1\n"),
+    fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
   };
   assert_eq(len(p.sources), 1);
   assert_eq(len(p.diags), 1);
@@ -440,29 +407,71 @@ test "a file that cannot be a module is refused and does not reach the front end
 }
 
 test "a project file under the compiler root walks on to the front end's collision" {
-  let found: Found = { files: map_insert(map_new(), "compiler/fmt.ply", true), errors: [] };
   let p = handle {
-    read(found)
+    read(found_here(["compiler/fmt.ply"]), "")
   } with {
-    builder.git[vcs](root, key) -> Err({ diags: [], places: [] }),
     fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
-    fs.read_file[abs](path) -> Some(b"fn f() -> Int = 1\n"),
+    fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
   };
   assert_eq(len(p.diags), 0);
   assert_eq(match list_at(p.sources, 0) { Some(s) -> s.name, None -> b"" }, b"compiler.fmt")
 }
 
 test "a project file under std walks on to the front end's collision" {
-  let found: Found = { files: map_insert(map_new(), "std/json.ply", true), errors: [] };
   let p = handle {
-    read(found)
+    read(found_here(["std/json.ply"]), "")
   } with {
-    builder.git[vcs](root, key) -> Err({ diags: [], places: [] }),
     fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
-    fs.read_file[abs](path) -> Some(b"fn f() -> Int = 1\n"),
+    fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
   };
   assert_eq(len(p.diags), 0);
   assert_eq(match list_at(p.sources, 0) { Some(s) -> s.name, None -> b"" }, b"std.json")
+}
+
+test "a file found outside the working directory is read there, named below its root" {
+  let found: Found = {
+    files: map_insert(map_new(), "/srv/app/store/orders.ply", {
+      label: "abs",
+      path: "srv/app/store/orders.ply",
+    }),
+    errors: [],
+  };
+  let p = handle {
+    read(found, "srv/app")
+  } with {
+    fs.read_file[cwd](path) -> panic("a file found under `abs` is read under `abs`"),
+    fs.read_file[abs](path) -> if path == "srv/app/store/orders.ply" {
+      Some(b"fn f() -> Int = 1\n")
+    } else { None },
+  };
+  assert_eq(len(p.diags), 0);
+  assert_eq(map(p.files, |f: File| f.path), ["store/orders.ply"]);
+  assert_eq(map(p.files, |f: File| f.at), [{ label: "abs", path: "srv/app/store/orders.ply" }]);
+  assert_eq(match list_at(p.sources, 0) { Some(s) -> s.name, None -> b"" }, b"store.orders")
+}
+
+test "the manifest is the one in the root's directory, whichever file in it the path named" {
+  let file: paths::Resolved = {
+    label: "abs",
+    spelling: "srv/app",
+    display: "/srv/app",
+    inside: "main.ply",
+    absolute: "/srv/app",
+    machine: "/srv/app/main.ply",
+  };
+  let p = handle {
+    with_manifest(file, empty())
+  } with {
+    fs.read_file[cwd](path) -> panic("a root under `abs` is read under `abs`"),
+    fs.read_file[abs](path) -> if path == "srv/app/ply.pkg" { Some(b"manifest") } else { None },
+  };
+  match p.manifest {
+    None -> panic("the manifest beside the file was not read"),
+    Some(f) -> {
+      assert_eq(f.path, "/srv/app/ply.pkg");
+      assert_eq(f.at, { label: "abs", path: "srv/app/ply.pkg" })
+    },
+  }
 }
 
 test "the shelf hands back one source per `.ply` file, named by its stem" {

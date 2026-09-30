@@ -1,15 +1,49 @@
 // `examples/desk.ply` as the corpus serves it: the command line that runs it with the settings a
-// table asks for, and the routes its loads are made of. Every table that loads the desk starts it
-// through here.
+// table asks for, the routes its loads are made of, and the check that `ply` takes a line before a
+// table depends on it. Every table that runs the desk builds its line here.
 
 import kit
 import kit (Kit, Credential)
+import report
+import report (Row, holding, number)
+import spine
+import std.json
+import std.json (Json, Object, Str, Null)
+import std.config (config)
+import std.process
+import std.process (process, Finished)
 
-// How a table runs the desk: its accept loop and its store as the desk's settings name them, and
-// the credential it listens with over TLS.
-pub type Desk = { accept: String, store: String, tls: Option<Credential>, database: Option<String> }
+// How a table runs the desk: its accept loop and its store as the desk's settings name them, the
+// credential it listens with over TLS, the database it reaches, where its trace records go, and
+// the drain a table that stops it on purpose gives it.
+pub type Desk = {
+  accept: String,
+  store: String,
+  tls: Option<Credential>,
+  database: Option<String>,
+  trace: Trace,
+  drain: Option<Drain>,
+}
 
-pub fn twin(accept: String) -> Desk = { accept: accept, store: "memory", tls: None, database: None }
+// `--trace off`, a sink that writes nothing, or `--trace json`, a line a record on stderr.
+pub type Trace = | NoTrace | JsonTrace
+
+// `--drain-ms` and `--drain-lead-ms`.
+pub type Drain = { drain_ms: Int, lead_ms: Int }
+
+pub fn twin(accept: String) -> Desk =
+  { accept: accept, store: "memory", tls: None, database: None, trace: NoTrace, drain: None }
+
+// The desk over the database at `url`, which must hold the desk's schema.
+pub fn over(accept: String, url: String) -> Desk =
+  { ..twin(accept), store: "postgres", database: Some(url) }
+
+// What the desk is configured to take from a client that places an order.
+pub fn api_key() -> String = "bench-key"
+
+// The database a line names when a table has none to run it against: `ply hosts` opens no
+// connection, so any well-formed one checks the rest of the line.
+pub fn unreached() -> String = "postgres://corpus@127.0.0.1:1/unreached"
 
 fn cats<a>(xss: List<List<a>>) -> List<a> =
   fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
@@ -27,15 +61,20 @@ pub fn desk_args(k: Kit, d: Desk) -> List<String> =
       "--config-schema",
       "desk.config",
       "--trace",
-      "off",
+      match d.trace { NoTrace -> "off", JsonTrace -> "json" },
     ],
     kit::set("DESK_PORT", "0"),
     kit::set("DESK_CONNECTIONS", "1000000"),
-    kit::set("DESK_API_KEY", "bench-key"),
+    kit::set("DESK_API_KEY", api_key()),
     kit::set("DESK_STORE", d.store),
     kit::set("DESK_ACCEPT", d.accept),
     match d.database { Some(url) -> kit::set("DESK_DATABASE", url), None -> [] },
     match d.tls { Some(c) -> cats([kit::set("DESK_TLS", c.name), kit::tls_args(c)]), None -> [] },
+    match d.drain {
+      Some(g) ->
+        ["--drain-ms", int_to_string(g.drain_ms), "--drain-lead-ms", int_to_string(g.lead_ms)],
+      None -> [],
+    },
   ])
 
 // The routes a read-only load cycles through, each answered 200 by the twin.
@@ -62,6 +101,120 @@ pub fn share(concurrency: Int, per_conn: Int, requests: Int) -> Int = {
   if wanted < 1 { 1 } else if wanted > most { most } else { wanted }
 }
 
+// --- The lines, checked by the CLI --------------------------------------------------------
+
+// A line a table runs the desk with, under the name its row gives it.
+pub type Line = { label: String, args: List<String> }
+
+// What `ply hosts` made of a line: nothing to say, or why it would not do.
+pub type Checked = { label: String, refusal: Option<String> }
+
+// `ply hosts` over the line, as a document: the CLI parses the same flags and resolves the same
+// settings without serving anything or opening a connection, so a line a table would be refused
+// is found where no table can run.
+pub fn hosts_args(args: List<String>) -> List<String> =
+  match args { ["run", ..rest] -> cats([["hosts"], rest, ["--json"]]), other -> other }
+
+type Setting = { key: String, value: String }
+
+fn setting_of(pair: String) -> Option<Setting> =
+  if string_contains(pair, "=") {
+    let at = string_find(pair, "=");
+    Some({ key: string_slice(pair, 0, at), value: string_slice(pair, at + 1, string_len(pair)) })
+  } else { None }
+
+// The settings a line gives, as its `--set` pairs name them.
+fn settings_of(args: List<String>) -> List<Setting> =
+  fold(range(1, len(args)), [], |acc: List<Setting>, i: Int|
+    match ((list_at(args, i - 1), list_at(args, i))) {
+      (Some("--set"), Some(pair)) -> match setting_of(pair) {
+        Some(s) -> push(acc, s),
+        None -> acc,
+      },
+      _ -> acc,
+    })
+
+type Listed = { key: String, value: String, secret: Bool }
+
+fn listed_of(doc: Json) -> List<Listed> =
+  match doc {
+    Object(m) -> match spine::field(m, "configuration") {
+      Err(_) -> [],
+      Ok(c) ->
+        map(spine::objects(spine::array_field(c, "keys")), |one: Map<String, Json>|
+          {
+            key: spine::str_field(one, "name"),
+            value: spine::str_field(one, "value"),
+            secret: spine::bool_field(one, "secret"),
+          }),
+    },
+    _ -> [],
+  }
+
+// The first setting the listing does not carry as the line gave it; a secret is listed without its
+// value, so only its name is looked for.
+fn unlisted(given: List<Setting>, listed: List<Listed>) -> Option<String> =
+  fold(given, None, |found: Option<String>, s: Setting|
+    match found {
+      Some(_) -> found,
+      None -> match filter(listed, |l: Listed| l.key == s.key) {
+        [] -> Some("`" ++ s.key ++ "` is not in its configuration"),
+        [l, ..] -> if l.secret || l.value == s.value { None }
+        else {
+          Some("`" ++ s.key ++ "` is listed as `" ++ l.value ++ "`, not `" ++ s.value ++ "`")
+        },
+      },
+    })
+
+fn first_line(text: String) -> String =
+  match filter(string_split(text, "\n"), |line: String| string_trim(line) != "") {
+    [line, ..] -> string_trim(line),
+    [] -> "it said nothing",
+  }
+
+// Why `ply hosts` did not take a line, or nothing when it took it and listed every setting.
+pub fn refusal_of(args: List<String>, f: Finished) -> Option<String> =
+  if !spine::exit_zero(f) {
+    Some("`ply hosts` refused it: " ++ first_line(string_of_bytes_lossy(f.err)))
+  } else {
+    match json::parse(f.out) {
+      Err(e) -> Some("`ply hosts --json` wrote no document: " ++ e.message),
+      Ok(doc) -> unlisted(settings_of(args), listed_of(doc)),
+    }
+  }
+
+pub fn checked(lines: List<Line>) -> List<Checked> / {process.spawn[ply], config.get[env]} =
+  map(lines, |l: Line|
+    {
+      label: l.label,
+      refusal: refusal_of(
+        l.args,
+        process.spawn[ply](hosts_args(l.args), "", spine::inherited_env()),
+      ),
+    })
+
+// Every line a command's tables run the desk with is one `ply` takes, even the lines a table
+// cannot run for want of a database.
+pub fn lines_row(name: String, cs: List<Checked>) -> Row = {
+  let refused = filter(cs, |c: Checked| c.refusal != None);
+  let taken = report::row(
+    name,
+    holding(
+      "`ply hosts` takes every line, and lists each setting as the line gives it",
+      ["lines", "taken"],
+      |vs: List<Decimal>| match vs { [lines, taken] -> lines > 0m && taken == lines, _ -> false },
+    ),
+    [number("lines", len(cs), "lines"), number("taken", len(cs) - len(refused), "lines")],
+  );
+  {
+    ..taken,
+    detail: match refused {
+      [c, ..] -> Str(c.label ++ ": " ++ (match c.refusal { Some(why) -> why, None -> "" })),
+      [] -> Null,
+    },
+  }
+}
+
 // --- Tests ---------------------------------------------------------------------------------
 
 test "the desk is run on a port it reports, with the store, loop and credential a table names" {
@@ -86,9 +239,81 @@ test "the desk is run on a port it reports, with the store, loop and credential 
   )
 }
 
+test "a desk over a database names it, and its sink and drain are flags" {
+  let k = { repo: "../repo", scratch: "scratch" };
+  let d = {
+    ..over("task-per-connection", "postgres://u@db/desk"),
+    trace: JsonTrace,
+    drain: Some({ drain_ms: 5000, lead_ms: 1500 }),
+  };
+  let args = desk_args(k, d);
+  let has = |want: String| fold(args, false, |seen: Bool, a: String| seen || a == want);
+  assert(has("DESK_STORE=postgres") && has("DESK_DATABASE=postgres://u@db/desk"));
+  assert_eq(
+    filter(args, |a: String| a == "json" || a == "5000" || a == "1500" || a == "--drain-lead-ms"),
+    ["json", "5000", "--drain-lead-ms", "1500"],
+  );
+  assert(
+    !fold(desk_args(k, twin("sequential")), false, |seen: Bool, a: String|
+      seen || a == "--drain-ms"),
+  )
+}
+
+test "the desk's trace sink is off unless a table names one" {
+  let k = { repo: ".", scratch: "target/corpus/w6" };
+  let sink = |args: List<String>|
+    fold(range(1, len(args)), None, |found: Option<String>, i: Int|
+      match found {
+        Some(_) -> found,
+        None -> if list_at(args, i - 1) == Some("--trace") { list_at(args, i) } else { None },
+      });
+  assert_eq(sink(desk_args(k, twin("sequential"))), Some("off"));
+  assert_eq(sink(desk_args(k, { ..twin("sequential"), trace: JsonTrace })), Some("json"))
+}
+
 test "a point's share keeps its requests near the ask and its connections under a thousand" {
   assert_eq(share(1, 32, 4000), 125);
   assert_eq(share(8, 32, 4000), 16);
   assert_eq(share(64, 1, 4000), 15);
   assert_eq(share(4, 100, 10), 1)
+}
+
+fn listing(keys: String) -> Bytes =
+  bytes_of_string("{\"command\":\"hosts\",\"configuration\":{\"keys\":[" ++ keys ++ "]}}")
+
+test "a line is taken when `ply hosts` takes it and lists each of its settings as given" {
+  let line = desk_args({ repo: ".", scratch: "s" }, over("sequential", "postgres://u@db/desk"));
+  assert_eq(list_at(hosts_args(line), 0), Some("hosts"));
+  assert_eq(list_at(hosts_args(line), len(line)), Some("--json"));
+  let key = |name: String, value: String, secret: Bool|
+    "{\"name\":\"" ++ name ++ "\",\"value\":\"" ++ value ++ "\",\"secret\":"
+      ++ (if secret { "true" } else { "false" })
+      ++ "}";
+  let every = key("DESK_PORT", "0", false) ++ "," ++ key("DESK_CONNECTIONS", "1000000", false)
+    ++ ","
+    ++ key("DESK_API_KEY", "****", true)
+    ++ ","
+    ++ key("DESK_STORE", "postgres", false)
+    ++ ","
+    ++ key("DESK_ACCEPT", "sequential", false)
+    ++ ","
+    ++ key("DESK_DATABASE", "postgres://u@db/desk", false);
+  assert_eq(refusal_of(line, process::exited(0, listing(every), b"")), None);
+  let short = key("DESK_PORT", "0", false);
+  assert_eq(
+    refusal_of(line, process::exited(0, listing(short), b"")),
+    Some("`DESK_CONNECTIONS` is not in its configuration"),
+  );
+  assert_eq(
+    refusal_of(line, process::exited(2, b"", b"\nerror: unexpected argument '--db'\n")),
+    Some("`ply hosts` refused it: error: unexpected argument '--db'"),
+  );
+  let judged = report::judge([
+    lines_row("lines", [{ label: "a", refusal: None }, { label: "b", refusal: Some("no") }]),
+  ]);
+  assert(match judged { [j] -> !report::passed(j) && j.row.detail == Str("b: no"), _ -> false });
+  assert(match report::judge([lines_row("lines", [{ label: "a", refusal: None }])]) {
+    [j] -> report::passed(j),
+    _ -> false,
+  })
 }

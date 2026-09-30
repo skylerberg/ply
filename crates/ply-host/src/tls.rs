@@ -1,6 +1,6 @@
 //! TLS credentials and sessions, terminated through rustls.
 
-use ply_span::{Diagnostic, Span, codes};
+use ply_eval::{Diagnostic, Span, codes};
 use rustls::client::ClientConnection;
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::hash::HashAlgorithm;
@@ -116,7 +116,7 @@ impl Credentials {
         for path in trusted {
             match certificates(path) {
                 Ok(chain) => anchors.extend(chain),
-                Err(diagnostic) => diagnostics.push(diagnostic),
+                Err(why) => diagnostics.push(err_untrusted(path, why)),
             }
         }
         for spec in specs {
@@ -143,7 +143,7 @@ impl Credentials {
         })
     }
 
-    /// How many `--trust` certificates join the roots.
+    /// How many trusted certificates join the roots.
     pub fn trusted(&self) -> usize {
         self.trusted
     }
@@ -185,7 +185,8 @@ impl fmt::Debug for Credentials {
 }
 
 fn load_one(spec: &CredentialSpec) -> Result<Credential, Diagnostic> {
-    let chain = certificates(&spec.certificate)?;
+    let chain =
+        certificates(&spec.certificate).map_err(|why| err_invalid(&spec.certificate, why))?;
     let key = private_key(&spec.key)?;
     let fingerprint = fingerprint(&chain[0]);
     let certificates = chain.len();
@@ -232,17 +233,14 @@ fn client_config(trusted: Vec<CertificateDer<'static>>) -> Result<Arc<ClientConf
     Ok(Arc::new(config))
 }
 
-fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, Diagnostic> {
-    let file = std::fs::File::open(path).map_err(|e| err_unreadable(path, &e))?;
+/// The certificates a PEM file holds, or why it holds none a caller can use.
+fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("it could not be read: {e}"))?;
     let chain: Result<Vec<CertificateDer<'static>>, io::Error> =
         rustls_pemfile::certs(&mut BufReader::new(file)).collect();
-    let chain = chain
-        .map_err(|e| err_invalid(path, format!("the PEM in this file does not parse: {e}")))?;
+    let chain = chain.map_err(|e| format!("the PEM in this file does not parse: {e}"))?;
     if chain.is_empty() {
-        return Err(err_invalid(
-            path,
-            "this file holds no `BEGIN CERTIFICATE` block".to_string(),
-        ));
+        return Err("this file holds no `BEGIN CERTIFICATE` block".to_string());
     }
     Ok(chain)
 }
@@ -737,10 +735,22 @@ fn err_mismatch(spec: &CredentialSpec, error: &TlsError) -> Diagnostic {
 fn err_trust(ignored: usize) -> Diagnostic {
     Diagnostic::error(
         codes::TLS_CREDENTIAL_INVALID,
-        format!("{ignored} `--trust` certificate(s) could not be parsed"),
+        format!("{ignored} certificate(s) to trust could not be parsed"),
     )
-    .note("`--trust CERT.pem` wants one or more certificates in PEM, each a root `net.connect_tls` may accept")
+    .note(TRUSTED)
 }
+
+#[cold]
+fn err_untrusted(path: &Path, why: String) -> Diagnostic {
+    Diagnostic::error(
+        codes::TLS_CREDENTIAL_INVALID,
+        format!("`{}` is not a certificate to trust: {why}", path.display()),
+    )
+    .note(TRUSTED)
+    .note("roots are loaded before anything runs, so this is refused rather than discovered on the first handshake")
+}
+
+const TRUSTED: &str = "`--trust CERT.pem` and `PLY_TRUST` name PEM files of certificates, each a root `net.connect_tls` may accept";
 
 #[cold]
 fn err_duplicate(name: &str) -> Diagnostic {
