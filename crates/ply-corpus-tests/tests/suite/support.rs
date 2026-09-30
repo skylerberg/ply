@@ -131,17 +131,13 @@ pub fn delegated(dir: &Path, args: &[&str]) -> Output {
 }
 
 /// The same, with the floors a served subcommand compares the product with built and bound as
-/// `benches/corpus.sh` binds them, and named in `CORPUS_BOUND` as that script names them: the HTTP
-/// floor always, and the libpq tool where `pg_config` says where libpq is.
+/// `benches/corpus.sh` binds them: the HTTP floor always, and the libpq tool where `pg_config` says
+/// where libpq is.
 pub fn served(dir: &Path, args: &[&str]) -> Output {
     let mut grants = vec![format!("--exec=http_floor={}", floor().display())];
-    let mut bound = vec!["http_floor"];
     if let Some(tool) = pg_floor() {
         grants.push(format!("--exec=pg_floor={}", tool.display()));
-        bound.push("pg_floor");
     }
-    grants.push("--set".to_string());
-    grants.push(format!("CORPUS_BOUND={}", bound.join(",")));
     run(dir, &grants, args)
 }
 

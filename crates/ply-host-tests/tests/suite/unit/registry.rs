@@ -51,6 +51,8 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
             "std.signal.signal.stopping[..]",
             "std.signal.signal.deadline_ms[..]",
             "std.process.process.args[..]",
+            // `--exec` is resolved once, before anything runs.
+            "std.process.process.bound[..]",
         ]
     );
 }
