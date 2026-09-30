@@ -103,6 +103,28 @@ fn a_reset_closes_a_region_the_last_entry_point_abandoned() {
     assert_eq!(regions.live(), 0);
 }
 
+/// The tier's store, whose floor holds no cell, renews once its entry's regions are closed; a
+/// fixture's cells are named by its handle, so a store holding them is never renewed.
+#[test]
+fn only_a_store_whose_floor_holds_no_cell_renews() {
+    let mut regions: TaskRegions = TaskRegions::new();
+    let task = Owner(1);
+    regions.open(task, RegionKind::Shared);
+    let earlier = regions.alloc(task, Value::Int(1)).expect("inside a region");
+    regions.close_program_regions();
+
+    assert!(regions.renew());
+
+    regions.open(task, RegionKind::Shared);
+    assert_eq!(regions.alloc(task, Value::Int(2)), Some(earlier));
+
+    let fixture = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(7))));
+    let (mut seeded, handle) = fixture.open();
+    let cell = handle.as_cell(Span::DUMMY, "the handle").expect("a cell");
+    assert!(!seeded.renew());
+    assert_eq!(int_of(&seeded, cell), 7);
+}
+
 #[test]
 fn a_shared_region_reclaims_its_slots_at_its_close() {
     let mut regions: TaskRegions = TaskRegions::new();
