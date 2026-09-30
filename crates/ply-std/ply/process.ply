@@ -2,6 +2,8 @@
 // one beside the program.
 pub nondet effect process {
   read args[p]() -> List<String>
+  // Whether the run bound an executable to the label, which is settled before anything runs.
+  read bound[e]() -> Bool
   write out[p](text: String) -> Unit
   write err[p](text: String) -> Unit
   // One line of the program's standard input, without its line ending, or `None` at end of input.
@@ -96,9 +98,13 @@ pub fn exit_step(c: Captured, code: Int) -> Captured =
 pub type Launch = { args: List<String>, dir: String, env: List<Var> }
 
 // What a test answers spawns with, and what it has been asked to run; replies are handed out in order.
-pub type Runs = { replies: List<Finished>, launched: List<Launch> }
+// The label is bound once a reply is planned unless the test sets `bound`, and no step changes it.
+pub type Runs = { replies: List<Finished>, launched: List<Launch>, bound: Bool }
 
-pub fn runs(replies: List<Finished>) -> Runs = { replies: replies, launched: [] }
+pub fn runs(replies: List<Finished>) -> Runs =
+  { replies: replies, launched: [], bound: len(replies) > 0 }
+
+pub fn runs_bound_step(r: Runs) -> Bool = r.bound
 
 // One spawn's answer and the twin that recorded it.
 pub type Ran = { runs: Runs, finished: Finished }
@@ -144,9 +150,13 @@ pub type Child = {
 
 // What a test hands the children's clauses in place of the host: the children it planned, handed
 // to `start`s in order, and each child started, whose handle is its place in `started` from 1.
-pub type Children = { planned: List<Script>, started: List<Child> }
+// The label is bound once a child is planned unless the test sets `bound`, and no step changes it.
+pub type Children = { planned: List<Script>, started: List<Child>, bound: Bool }
 
-pub fn children(planned: List<Script>) -> Children = { planned: planned, started: [] }
+pub fn children(planned: List<Script>) -> Children =
+  { planned: planned, started: [], bound: len(planned) > 0 }
+
+pub fn bound_step(c: Children) -> Bool = c.bound
 
 // One step of the twin: the twin with the step recorded, and what the host would have answered.
 pub type Answered<a> = { children: Children, answer: a }
@@ -167,7 +177,7 @@ pub fn start_step(c: Children, launch: Launch, io: Io) -> Answered<Result<Int, S
         spent: false,
       };
       let started = push(c.started, child);
-      { children: { planned: rest, started: started }, answer: Ok(len(started)) }
+      { children: { ..c, planned: rest, started: started }, answer: Ok(len(started)) }
     },
   }
 
@@ -556,4 +566,36 @@ test "a child runs through its polls, then hands back how it ended, and its line
   let third = wait_step(heard.children, 1);
   assert_eq(third.answer, Some(exited(3, b"", b"")));
   assert(only_child(third.children).spent)
+}
+
+// What a driver that can do without its compiler and its server asks before it reaches for either.
+fn tools_bound() -> List<Bool> / {process.bound[cc], process.bound[srv]} =
+  [process.bound[cc](), process.bound[srv]()]
+
+test "`bound` answers true for a label the twin binds and false for one it does not" {
+  handle {
+    assert_eq(tools_bound(), [true, false])
+  } with {
+    process.bound[cc]() -> runs_bound_step(runs([exited(0, b"", b"")])),
+    process.bound[srv]() -> bound_step(children([])),
+  };
+  handle {
+    assert_eq(tools_bound(), [false, true])
+  } with {
+    process.bound[cc]() -> runs_bound_step(runs([])),
+    process.bound[srv]() -> bound_step(children([script(0, exited(0, b"", b""), [])])),
+  }
+}
+
+test "a label stays bound however its twin moves, and a test may say otherwise" {
+  let launch = { args: [], dir: "", env: [] };
+  let spent = spawn_step(runs([exited(0, b"", b"")]), launch).runs;
+  assert_eq(spent.replies, []);
+  assert(runs_bound_step(spent));
+  let planned = children([script(0, exited(0, b"", b""), [])]);
+  let started = start_step(planned, launch, { input: false, out: Keep, err: Keep });
+  assert_eq(started.children.planned, []);
+  assert(bound_step(wait_step(started.children, 1).children));
+  assert(!bound_step({ ..planned, bound: false }));
+  assert(runs_bound_step({ ..runs([]), bound: true }))
 }

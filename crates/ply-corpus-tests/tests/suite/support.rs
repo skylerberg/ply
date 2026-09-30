@@ -131,15 +131,11 @@ pub fn delegated(dir: &Path, args: &[&str]) -> Output {
 }
 
 /// The same, with the floor a served subcommand compares the desk with built and bound as
-/// `benches/corpus.sh` binds it, and named in `CORPUS_BOUND` as that script names it.
+/// `benches/corpus.sh` binds it.
 pub fn served(dir: &Path, args: &[&str]) -> Output {
     run(
         dir,
-        &[
-            format!("--exec=http_floor={}", floor().display()),
-            "--set".to_string(),
-            "CORPUS_BOUND=http_floor".to_string(),
-        ],
+        &[format!("--exec=http_floor={}", floor().display())],
         args,
     )
 }
