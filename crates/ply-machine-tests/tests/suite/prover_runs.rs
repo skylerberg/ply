@@ -14,8 +14,12 @@ use std::sync::Arc;
 struct InHand;
 
 impl HostRuntime for InHand {
-    fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
-        Ok(None)
+    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+        unreachable!("the claims family answers in hand")
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {

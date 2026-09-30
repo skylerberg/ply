@@ -70,11 +70,11 @@ test "the parked continuation still reads its region's cell" {
 }
 "#;
 
-/// A constant whose value is a slot in *this run's* arena.
+/// A constant whose body reads a cell of the region it opens.
 const CONSTANT_OVER_A_CELL: &str = r#"
 fn boxed() -> Int = with_cell[log](41) { c -> cell_get(c) }
 
-test "the constant reads this run's cell" {
+test "the constant answers what its cell held" {
   assert_eq(boxed(), 41)
 }
 "#;
@@ -264,16 +264,16 @@ fn a_handle_in_a_trace_field_is_the_host_boundary_and_nothing_further() {
     assert!(!rendered.contains("41"), "the slot's contents are not read");
 }
 
-/// `boxed` is nullary with an empty row, so the memo's rule makes it a constant.
+/// `boxed` is nullary with an empty row, so it is a constant: the memo keeps what its cell held.
 #[test]
-fn a_constant_whose_value_reaches_a_region_is_not_remembered_across_runs() {
+fn a_constant_whose_body_opens_a_region_answers_every_run() {
     let compiled = Compiled::new(CONSTANT_OVER_A_CELL);
     let mut machine = compiled.machine();
 
     for run in 0..3 {
         machine
             .eval_test(0)
-            .unwrap_or_else(|d| panic!("run {run} must read this run's own cell: {d:#?}"));
+            .unwrap_or_else(|d| panic!("run {run} must answer what the cell held: {d:#?}"));
     }
 }
 

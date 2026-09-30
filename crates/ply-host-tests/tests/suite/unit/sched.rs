@@ -1,11 +1,14 @@
+use ply_eval::host::MachineId;
 use ply_eval::sched::{HostPolicy, Scheduler};
 use ply_eval::sched::{Policy, Resumption, Turn};
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{
-    Diagnostic, HostBinding, HostRegistry, HostRequest, HostRuntime, Pending, SimId, SourceId,
-    Span, Symbol, TaskId, Value, codes,
+    Diagnostic, EffectAtom, HostBinding, HostRegistry, HostRequest, HostRuntime, Mode, Pending,
+    Resource, SimId, SourceId, Span, Symbol, TaskHandle, TaskId, Value, codes,
 };
 use ply_host::sched::*;
+use ply_host::trace::sink::Recording;
+use ply_host::trace::{self, Kind, Level, Outcome, Sink, Trace};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -21,6 +24,7 @@ fn suspended() -> usize {
 struct Slots {
     outstanding: BTreeSet<u64>,
     done: BTreeMap<u64, i64>,
+    watched: BTreeSet<u64>,
 }
 
 /// Jobs produce an `i64`; only the machine's polling thread builds a `Value`.
@@ -63,10 +67,8 @@ impl Threads {
     fn outstanding(&self) -> usize {
         lock(&self.slots).outstanding.len()
     }
-}
 
-impl HostRuntime for Threads {
-    fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
+    fn take(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
         let mut slots = lock(&self.slots);
         match slots.done.remove(&pending.token) {
             Some(value) => {
@@ -74,11 +76,45 @@ impl HostRuntime for Threads {
                 Ok(Some(Value::Int(value)))
             }
             None if slots.outstanding.contains(&pending.token) => Ok(None),
-            None => Err(Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("nothing minted host token {}", pending.token),
-            )),
+            None => Err(unminted(pending)),
         }
+    }
+}
+
+fn unminted(pending: &Pending) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("nothing minted host token {}", pending.token),
+    )
+}
+
+impl HostRuntime for Threads {
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        let mut slots = lock(&self.slots);
+        if !slots.outstanding.contains(&pending.token) {
+            return Err(unminted(pending));
+        }
+        slots.watched.insert(pending.token);
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        let mut slots = lock(&self.slots);
+        let ready: Vec<u64> = slots
+            .done
+            .keys()
+            .copied()
+            .filter(|token| slots.watched.contains(token))
+            .collect();
+        ready
+            .into_iter()
+            .map(|token| {
+                slots.watched.remove(&token);
+                slots.outstanding.remove(&token);
+                let value = slots.done.remove(&token).expect("it was done");
+                (token, Ok(Value::Int(value)))
+            })
+            .collect()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
@@ -100,7 +136,7 @@ impl HostRuntime for Threads {
 
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
         loop {
-            if let Some(value) = self.poll(&pending)? {
+            if let Some(value) = self.take(&pending)? {
                 return Ok(value);
             }
             self.park()?;
@@ -112,8 +148,12 @@ impl HostRuntime for Threads {
 struct NeverResolves;
 
 impl HostRuntime for NeverResolves {
-    fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
-        Ok(None)
+    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
@@ -135,7 +175,7 @@ enum Act {
     Yield,
     /// Spawn the script at this index.
     Spawn(usize),
-    Join(u32),
+    Join(u64),
     /// Park on a host operation that answers after this delay.
     Wait(Duration),
     Fail,
@@ -145,12 +185,12 @@ type Program = Vec<Vec<Act>>;
 
 struct Run {
     /// `(task, mark)` in the order the marks were reached.
-    marks: Vec<(u32, &'static str)>,
+    marks: Vec<(u64, &'static str)>,
     steps: u32,
 }
 
 impl Run {
-    fn of(&self, task: u32) -> Vec<&'static str> {
+    fn of(&self, task: u64) -> Vec<&'static str> {
         self.marks
             .iter()
             .filter(|(t, _)| *t == task)
@@ -164,12 +204,14 @@ impl Run {
 }
 
 fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
-    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
+    let mut sched = production();
     let mut marks = Vec::new();
     let mut steps = 0u32;
     // Which script each task runs, and how far into it that task has got.
     let mut script: Vec<usize> = vec![0];
     let mut pc: Vec<usize> = vec![0];
+    // Every handle, kept, so a script may join any task whenever it likes.
+    let mut held: Vec<TaskHandle> = Vec::new();
 
     loop {
         match sched.next_host(rt)? {
@@ -201,17 +243,18 @@ fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
                         }
                         Act::Yield => sched.suspend(suspended(), Value::Unit)?,
                         Act::Spawn(index) => {
-                            let id = sched.spawn(Value::Int(index as i64), Span::DUMMY);
-                            while script.len() <= id.0 as usize {
+                            let handle = sched.spawn(Value::Int(index as i64), Span::DUMMY);
+                            while script.len() <= handle.id().0 as usize {
                                 script.push(0);
                                 pc.push(0);
                             }
-                            sched.suspend(suspended(), Value::Task(id))?;
+                            held.push(handle.clone());
+                            sched.suspend(suspended(), Value::Task(handle))?;
                         }
                         Act::Join(id) => sched.join(suspended(), TaskId(id), Span::DUMMY)?,
                         Act::Wait(delay) => {
                             let pending = jobs().submit(delay, task.0 as i64);
-                            sched.park_on_host(suspended(), pending, Span::DUMMY)?;
+                            sched.park_on_host(suspended(), pending, Span::DUMMY, rt)?;
                         }
                         Act::Fail => {
                             return Err(sched.fail(
@@ -293,6 +336,10 @@ fn permit() -> HostPolicy {
     HostPolicy::of(&bound()).expect("a bound binding mints a permit")
 }
 
+fn production() -> Sched {
+    Scheduler::production(SimId(0), Span::DUMMY, permit(), MachineId::next())
+}
+
 #[test]
 fn a_hermetic_binding_mints_no_permit() {
     let hermetic = HostBinding::hermetic_with(registry());
@@ -315,14 +362,14 @@ fn the_default_binding_is_the_one_that_refuses() {
 
 #[test]
 fn a_bound_binding_opens_a_production_region() {
-    let sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
+    let sched = production();
     assert_eq!(sched.policy(), Policy::Host);
     assert!(!sched.records_steps());
 }
 
 #[test]
 fn a_production_region_answers_task_and_not_the_clock() {
-    let sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
+    let sched = production();
     for op in TASK_OPS {
         assert!(sched.answers("task", op), "task.{op}");
     }
@@ -397,13 +444,13 @@ fn many_concurrent_tasks_all_make_progress() {
         ]);
     }
     for i in 0..WORKERS {
-        program[0].push(Act::Join(i as u32 + 1));
+        program[0].push(Act::Join(i as u64 + 1));
     }
     program[0].push(Act::Mark("joined"));
 
     let run = with_jobs(|rt| run(&program, &**rt))
         .unwrap_or_else(|e| panic!("every task finishes: {}", e.message));
-    for worker in 1..=WORKERS as u32 {
+    for worker in 1..=WORKERS as u64 {
         assert_eq!(
             run.of(worker),
             vec!["start", "middle", "end"],
@@ -486,7 +533,7 @@ fn a_task_failing_stops_the_region_and_names_it() {
 #[test]
 fn a_failed_production_region_answers_with_its_failure_forever() {
     let rt = Threads::new();
-    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
+    let mut sched = production();
     let Turn::Run { .. } = sched.next_host(&*rt).expect("the root is enabled") else {
         panic!("expected the root's step");
     };
@@ -513,7 +560,7 @@ fn a_join_cycle_deadlocks_rather_than_parking_forever() {
 
 #[test]
 fn a_runtime_whose_park_never_resolves_is_named_rather_than_spun_on() {
-    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
+    let mut sched = production();
     let Turn::Run { .. } = sched
         .next_host(&NeverResolves)
         .expect("the root is enabled")
@@ -528,6 +575,7 @@ fn a_runtime_whose_park_never_resolves_is_named_rather_than_spun_on() {
                 label: "forever",
             },
             Span::DUMMY,
+            &NeverResolves,
         )
         .expect("the root is running");
     let err = refused(sched.next_host(&NeverResolves), "nothing will ever resolve");
@@ -546,8 +594,7 @@ fn a_production_region_spends_a_budget_only_when_one_was_set() {
         .unwrap_or_else(|e| panic!("64 yields is not a livelock: {}", e.message));
     assert_eq!(unbounded.steps, 65);
 
-    let mut sched: Sched =
-        Scheduler::production(SimId(0), Span::DUMMY, permit()).with_step_budget(4);
+    let mut sched = production().with_step_budget(4);
     let rt = Threads::new();
     for _ in 0..4 {
         let Turn::Run { .. } = sched.next_host(&*rt).expect("within the budget") else {
@@ -561,5 +608,77 @@ fn a_production_region_spends_a_budget_only_when_one_was_set() {
         err.message.contains("4 scheduling steps"),
         "{}",
         err.message
+    );
+}
+
+/// `trace.enter[http](name, {})`, performed by `task` of `machine` against the run's own runtime.
+fn enter_span(trace: &Arc<Trace>, rt: &dyn HostRuntime, machine: MachineId, task: TaskId) {
+    let declaration = trace::Op::Enter.declaration("ply_host::trace::tests");
+    let args = [Value::str("request"), Value::empty_map()];
+    let request = HostRequest {
+        atom: EffectAtom::new(
+            Symbol::new(trace::EFFECT),
+            Resource::Named(Symbol::new("http")),
+            Mode::Write,
+        ),
+        op: &declaration,
+        args: &args,
+        span: Span::DUMMY,
+        machine,
+        task: Some(task),
+        declared: None,
+    };
+    trace::handler(trace::Op::Enter, Arc::clone(trace))
+        .call(rt, &request)
+        .unwrap_or_else(|d| panic!("the span opens: {d:?}"));
+}
+
+/// Through the runtime the host itself builds, which is what a `--host` run retires against.
+#[test]
+fn a_retired_tasks_open_span_is_closed_abandoned_at_retirement() {
+    let sink = Arc::new(Recording::new(Level::Debug));
+    let trace = Arc::new(Trace::new(Arc::clone(&sink) as Arc<dyn Sink>));
+    let rt = ply_host::Host::new().traced(Arc::clone(&trace)).runtime();
+    let machine = MachineId::next();
+    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit(), machine);
+    let Turn::Run { .. } = sched.next_host(&*rt).expect("the root is enabled") else {
+        panic!("expected the root's step");
+    };
+    let child = sched.spawn(Value::Unit, Span::DUMMY).id();
+    sched
+        .suspend(suspended(), Value::Unit)
+        .expect("the root is running");
+    let Turn::Run { task, .. } = sched.next_host(&*rt).expect("the child is enabled") else {
+        panic!("expected the child's step");
+    };
+    assert_eq!(task, child);
+    enter_span(&trace, &*rt, machine, child);
+    sched.finish(Value::Unit).expect("the child is running");
+    assert_eq!(trace.open_spans(), 1, "open until the task retires");
+
+    let Turn::Run { task, .. } = sched.next_host(&*rt).expect("the root is enabled") else {
+        panic!("expected the root's step");
+    };
+    assert_eq!(task, ply_eval::sched::ROOT);
+    assert_eq!(trace.open_spans(), 0, "the retirement closed it");
+    let last = sink.records().pop().expect("the span's records");
+    assert_eq!(
+        (last.kind, last.name.as_str(), last.outcome),
+        (Kind::Exit, "request", Outcome::Abandoned)
+    );
+    let records = sink.records().len();
+    let warning = rt
+        .end_entry_point(machine)
+        .expect_err("the retired task's span is still `W0609`");
+    assert_eq!(warning.code, codes::SPAN_ABANDONED);
+    assert!(
+        warning.message.contains("`request` on `http`"),
+        "{}",
+        warning.message
+    );
+    assert_eq!(
+        sink.records().len(),
+        records,
+        "the span was written at retirement, not again at the end"
     );
 }

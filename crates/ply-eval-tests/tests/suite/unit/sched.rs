@@ -1,11 +1,11 @@
 use ply_eval::arena::Slot;
 use ply_eval::cont::SimId;
-use ply_eval::host::{HostRuntime, Pending};
+use ply_eval::host::{HostRuntime, MachineId, Pending};
 use ply_eval::region::Trail;
 use ply_eval::sched::*;
 use ply_eval::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use ply_eval::sim::{Answer, Handlers, signature};
-use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, Value, codes};
+use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskHandle, Value, codes};
 
 type Sched = Scheduler<usize, Value>;
 type Choice = Turn<usize, Value>;
@@ -22,7 +22,7 @@ enum Act {
     Yield,
     /// Spawn the script at this index.
     Spawn(usize),
-    Join(u32),
+    Join(u64),
     Sleep(i64),
     /// Serve `rand` without ending the step, so runs with and without draws share a step structure.
     Draw,
@@ -51,11 +51,11 @@ fn refused(turn: Result<Choice, Diagnostic>, why: &str) -> Diagnostic {
 #[derive(Debug)]
 struct Run {
     /// `(task, mark)` in the order reached: the observable that tells interleavings apart.
-    marks: Vec<(u32, &'static str)>,
+    marks: Vec<(u64, &'static str)>,
     /// Virtual time at the end.
     clock: i64,
     choices: Vec<u16>,
-    steps: Vec<(u32, Vec<u32>, u16)>,
+    steps: Vec<(u64, Vec<u64>, u16)>,
     /// `(task, stamp)` per step, which the search reads to decide whether two steps could reorder.
     stamps: Vec<(TaskId, Stamp)>,
 }
@@ -136,7 +136,7 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                         }
                         Act::Yield => sched.suspend(suspended(), Value::Unit)?,
                         Act::Spawn(index) => {
-                            let id = sched.spawn(Value::Int(index as i64), Span::DUMMY);
+                            let id = sched.spawn(Value::Int(index as i64), Span::DUMMY).id();
                             while script.len() <= id.0 as usize {
                                 script.push(0);
                                 pc.push(0);
@@ -211,7 +211,7 @@ fn one_seed_produces_one_interleaving_however_often_it_is_run() {
 #[test]
 fn different_seeds_produce_different_interleavings() {
     let program = two_workers();
-    let mut seen: Vec<Vec<(u32, &'static str)>> = Vec::new();
+    let mut seen: Vec<Vec<(u64, &'static str)>> = Vec::new();
     for root in 0..32 {
         let run = run(&program, Seed::root(root)).expect("completes");
         if !seen.contains(&run.marks) {
@@ -229,7 +229,7 @@ fn every_interleaving_runs_every_task_in_its_own_order() {
     let program = two_workers();
     for root in 0..64 {
         let run = run(&program, Seed::root(root)).expect("completes");
-        let of = |task: u32| -> Vec<&'static str> {
+        let of = |task: u64| -> Vec<&'static str> {
             run.marks
                 .iter()
                 .filter(|(t, _)| *t == task)
@@ -334,14 +334,14 @@ fn a_join_orders_the_child_before_the_parent_and_siblings_against_nobody() {
     ];
     for root in 0..8 {
         let run = run(&program, Seed::root(root)).expect("completes");
-        let last = |task: u32| {
+        let last = |task: u64| {
             run.stamps
                 .iter()
                 .rposition(|(t, _)| t.0 == task)
                 .expect("every task takes a step")
         };
         let (parent, a, b) = (last(0), last(1), last(2));
-        for child in [1u32, 2] {
+        for child in [1u64, 2] {
             let (t, stamp) = &run.stamps[last(child)];
             assert!(
                 happens_before(stamp, *t, &run.stamps[parent].1),
@@ -503,11 +503,11 @@ fn tasks_sleeping_to_one_deadline_wake_together_and_their_order_is_explored() {
         vec![Act::Sleep(50), Act::Mark("a")],
         vec![Act::Sleep(50), Act::Mark("b")],
     ];
-    let mut orders: Vec<Vec<u32>> = Vec::new();
+    let mut orders: Vec<Vec<u64>> = Vec::new();
     for root in 0..32 {
         let run = run(&program, Seed::root(root)).expect("completes");
         assert_eq!(run.clock, 50, "seed {root}");
-        let order: Vec<u32> = run
+        let order: Vec<u64> = run
             .marks
             .iter()
             .filter(|(t, _)| *t != 0)
@@ -747,8 +747,15 @@ impl HostHandler for Never {
 struct Idle;
 
 impl HostRuntime for Idle {
-    fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
-        Ok(None)
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("the idle runtime was asked to watch `{pending}`"),
+        ))
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
@@ -769,7 +776,7 @@ impl HostRuntime for Idle {
 fn production() -> Sched {
     let binding = binding();
     let permit = HostPolicy::of(&binding).expect("a bound binding mints a permit");
-    Scheduler::production(SimId(0), Span::DUMMY, permit)
+    Scheduler::production(SimId(0), Span::DUMMY, permit, MachineId::next())
 }
 
 #[test]
@@ -824,6 +831,7 @@ fn a_seeded_region_refuses_to_park_a_task_on_a_host_token() {
                 label: "read",
             },
             Span::DUMMY,
+            &Idle,
         )
         .expect_err("a simulated region may not wait on the host");
     assert_eq!(err.code, codes::INTERNAL_ERROR);
@@ -874,6 +882,7 @@ fn a_lazily_opened_region_roots_on_the_control_that_opened_it() {
 
     // Answered through the same path every later perform takes, so `spawn` means one thing.
     let child = sched.spawn(Value::Unit, Span::DUMMY);
+    let id = child.id();
     sched
         .suspend(suspended(), Value::Task(child))
         .expect("the root is running");
@@ -884,7 +893,7 @@ fn a_lazily_opened_region_roots_on_the_control_that_opened_it() {
     };
     assert_eq!(task, ROOT);
     assert!(
-        matches!(resumption, Resumption::Resume { value: Value::Task(id), .. } if id == child),
+        matches!(&resumption, Resumption::Resume { value: Value::Task(handle), .. } if handle.id() == id),
         "a lazily-opened root resumes with the answer, never evaluates a body it does not have"
     );
 
@@ -918,8 +927,15 @@ struct Stopping {
 }
 
 impl HostRuntime for Stopping {
-    fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
-        Ok(None)
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("the stopping runtime was asked to watch `{pending}`"),
+        ))
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
@@ -943,7 +959,7 @@ impl HostRuntime for Stopping {
 
 /// Two tasks each waiting on the other, with no host wait and no virtual clock.
 fn deadlock(sched: &mut Sched) {
-    let other = sched.spawn(Value::Unit, Span::DUMMY);
+    let other = sched.spawn(Value::Unit, Span::DUMMY).id();
     sched
         .join(suspended(), other, Span::DUMMY)
         .expect("the root is running");
@@ -1032,4 +1048,323 @@ fn a_region_that_is_not_stopping_still_deadlocks() {
     deadlock(&mut sched);
     let err = refused(sched.next_host(&Idle), "nothing can make progress");
     assert_eq!(err.code, codes::DEADLOCK);
+}
+
+/// Finishes each task the region hands out until it hands out the root, and answers how the root
+/// resumes.
+fn until_root(sched: &mut Sched, rt: &dyn HostRuntime) -> Resumption<usize, Value> {
+    loop {
+        let Turn::Run { task, resumption } = sched.next_host(rt).expect("a task is enabled") else {
+            panic!("the region ended while its root was still running");
+        };
+        if task == ROOT {
+            return resumption;
+        }
+        sched
+            .finish(Value::Int(task.0 as i64))
+            .expect("the task is running");
+    }
+}
+
+fn root_step(sched: &mut Sched, rt: &dyn HostRuntime) {
+    let Turn::Run { task, .. } = sched.next_host(rt).expect("the root is enabled") else {
+        panic!("expected the root's step");
+    };
+    assert_eq!(task, ROOT);
+}
+
+#[test]
+fn a_production_region_keeps_only_the_tasks_that_can_still_run_or_be_joined() {
+    let mut sched = production();
+    root_step(&mut sched, &Idle);
+    for round in 0..200 {
+        drop(sched.spawn(Value::Unit, Span::DUMMY));
+        let joined = sched.spawn(Value::Unit, Span::DUMMY);
+        let target = joined.id();
+        sched
+            .suspend(suspended(), Value::Unit)
+            .expect("the root is running");
+        until_root(&mut sched, &Idle);
+        sched
+            .join(suspended(), target, Span::DUMMY)
+            .expect("a task whose handle is held is kept");
+        drop(joined);
+        let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
+            panic!("the root resumes from its join");
+        };
+        assert_eq!(value, Value::Int(target.0 as i64));
+        assert_eq!(
+            sched.tasks(),
+            1,
+            "round {round} left a finished task behind"
+        );
+    }
+}
+
+/// Host state is keyed by task, so a reused id would hand a new task a retired one's state.
+#[test]
+fn a_retired_tasks_id_is_never_handed_out_again() {
+    let mut sched = production();
+    root_step(&mut sched, &Idle);
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..100 {
+        let handle = sched.spawn(Value::Unit, Span::DUMMY);
+        assert!(
+            seen.insert(handle.id()),
+            "{} was handed out twice",
+            handle.id()
+        );
+        drop(handle);
+        sched
+            .suspend(suspended(), Value::Unit)
+            .expect("the root is running");
+        until_root(&mut sched, &Idle);
+        assert_eq!(sched.tasks(), 1, "the task retired before the next spawn");
+    }
+}
+
+#[test]
+fn a_kept_handle_keeps_its_finished_task_joinable_and_every_join_answers() {
+    let mut sched = production();
+    root_step(&mut sched, &Idle);
+    let kept: Vec<TaskHandle> = (0..8)
+        .map(|_| sched.spawn(Value::Unit, Span::DUMMY))
+        .collect();
+    for _ in 0..4 {
+        sched
+            .suspend(suspended(), Value::Unit)
+            .expect("the root is running");
+        until_root(&mut sched, &Idle);
+    }
+    assert_eq!(
+        sched.tasks(),
+        9,
+        "a finished task whose handle is held stays"
+    );
+    for handle in &kept {
+        for join in 0..2 {
+            sched
+                .join(suspended(), handle.id(), Span::DUMMY)
+                .expect("the task is kept");
+            let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
+                panic!("the root resumes from its join");
+            };
+            assert_eq!(
+                value,
+                Value::Int(handle.id().0 as i64),
+                "join {join} of {}",
+                handle.id()
+            );
+        }
+    }
+    drop(kept);
+    sched
+        .suspend(suspended(), Value::Unit)
+        .expect("the root is running");
+    until_root(&mut sched, &Idle);
+    assert_eq!(
+        sched.tasks(),
+        1,
+        "the last handles going retired their tasks"
+    );
+}
+
+/// Records each task the region retired, and the machine it ran on.
+#[derive(Default)]
+struct Ends {
+    ended: std::cell::RefCell<Vec<(MachineId, TaskId)>>,
+}
+
+impl HostRuntime for Ends {
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("nothing here parks, yet `{pending}` was watched"),
+        ))
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "nothing here waits",
+        ))
+    }
+
+    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "nothing here waits",
+        ))
+    }
+
+    fn end_task(&self, machine: MachineId, task: TaskId) {
+        self.ended.borrow_mut().push((machine, task));
+    }
+}
+
+#[test]
+fn retiring_a_task_ends_its_host_state_once_and_a_held_task_is_not_retired() {
+    let machine = MachineId::next();
+    let permit = HostPolicy::of(&binding()).expect("a bound binding mints a permit");
+    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit, machine);
+    let rt = Ends::default();
+    root_step(&mut sched, &rt);
+    let forgotten = sched.spawn(Value::Unit, Span::DUMMY).id();
+    let kept = sched.spawn(Value::Unit, Span::DUMMY);
+    sched
+        .suspend(suspended(), Value::Unit)
+        .expect("the root is running");
+    until_root(&mut sched, &rt);
+    assert_eq!(*rt.ended.borrow(), vec![(machine, forgotten)]);
+
+    let held = kept.id();
+    drop(kept);
+    for _ in 0..2 {
+        sched
+            .suspend(suspended(), Value::Unit)
+            .expect("the root is running");
+        until_root(&mut sched, &rt);
+    }
+    assert_eq!(
+        *rt.ended.borrow(),
+        vec![(machine, forgotten), (machine, held)]
+    );
+}
+
+#[test]
+fn a_region_hands_back_the_bodies_of_the_tasks_it_never_started() {
+    let mut sched = production();
+    root_step(&mut sched, &Idle);
+    let started = sched.spawn(Value::Int(1), Span::DUMMY);
+    let _never = sched.spawn(Value::Int(2), Span::DUMMY);
+    sched
+        .suspend(suspended(), Value::Unit)
+        .expect("the root is running");
+    let Turn::Run {
+        task,
+        resumption: Resumption::Start { .. },
+    } = sched.next_host(&Idle).expect("a spawned task is enabled")
+    else {
+        panic!("the first spawned task starts");
+    };
+    assert_eq!(task, started.id());
+    sched
+        .suspend(suspended(), Value::Unit)
+        .expect("the started task is running");
+    assert_eq!(sched.unstarted(), vec![Value::Int(2)]);
+    assert!(sched.unstarted().is_empty(), "a body is handed back once");
+}
+
+/// Resolves every watched token at the next look, newest first, beside a token nothing here
+/// parked on, as one a region of this machine that already ended left behind.
+#[derive(Default)]
+struct Backwards {
+    watched: std::cell::RefCell<Vec<u64>>,
+}
+
+const STALE: u64 = 999;
+
+impl HostRuntime for Backwards {
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        self.watched.borrow_mut().push(pending.token);
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        let mut resolved: Vec<(u64, Result<Value, Diagnostic>)> = self
+            .watched
+            .take()
+            .into_iter()
+            .rev()
+            .map(|token| (token, Ok(Value::Int(token as i64 * 10))))
+            .collect();
+        resolved.push((STALE, Ok(Value::Int(-1))));
+        resolved
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+        Err(Diagnostic::error(codes::INTERNAL_ERROR, "a task parks"))
+    }
+}
+
+#[test]
+fn each_parked_task_wakes_with_what_its_own_token_resolved_to() {
+    let rt = Backwards::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let children: Vec<TaskHandle> = (0..3)
+        .map(|_| sched.spawn(Value::Unit, Span::DUMMY))
+        .collect();
+    let parked = |sched: &mut Sched, token: u64| {
+        sched
+            .park_on_host(
+                suspended(),
+                Pending {
+                    token,
+                    label: "test",
+                },
+                Span::DUMMY,
+                &rt,
+            )
+            .expect("the task is running")
+    };
+    parked(&mut sched, 100);
+    for _ in &children {
+        let Turn::Run { task, .. } = sched.next_host(&rt).expect("a child starts") else {
+            panic!("expected a child's first step");
+        };
+        parked(&mut sched, 200 + task.0);
+    }
+
+    let mut woke = std::collections::BTreeMap::new();
+    loop {
+        match sched.next_host(&rt).expect("every task wakes") {
+            Turn::Complete(_) => break,
+            Turn::Run {
+                task,
+                resumption: Resumption::Resume { value, .. },
+            } => {
+                woke.insert(task, value);
+                sched.finish(Value::Unit).expect("the task is running");
+            }
+            Turn::Run { task, .. } => panic!("{task} ran without its token resolving"),
+        }
+    }
+    let mut expected = std::collections::BTreeMap::from([(ROOT, Value::Int(1000))]);
+    for child in &children {
+        let id = child.id();
+        expected.insert(id, Value::Int((200 + id.0 as i64) * 10));
+    }
+    assert_eq!(woke, expected);
+}
+
+#[test]
+fn a_task_cannot_park_on_a_token_its_runtime_did_not_mint() {
+    let mut sched = production();
+    root_step(&mut sched, &Idle);
+    let err = sched
+        .park_on_host(
+            suspended(),
+            Pending {
+                token: 7,
+                label: "stray",
+            },
+            Span::DUMMY,
+            &Idle,
+        )
+        .expect_err("the idle runtime mints nothing");
+    assert_eq!(err.code, codes::INTERNAL_ERROR);
+    assert_eq!(
+        sched.current(),
+        Some(ROOT),
+        "the refused task was parked anyway"
+    );
 }
