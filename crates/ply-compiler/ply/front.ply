@@ -14,7 +14,7 @@ import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecor
 import tycore (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
                atoms_text, atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new,
                print_ty, Field, at, append, take, contains_bytes, contains_int, canonical_atoms,
-               canonical_scheme, canonical_type)
+               canonical_scheme, canonical_type, t_bool, t_unit)
 import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEffect,
                 resolve_modules, qualify, lookup, find, is_bare, diag1, backticked,
                 import_module_name, path_span)
@@ -760,6 +760,27 @@ fn emit_signature(t: Type) -> { params: List<Type>, ret: Type } =
 fn emit_scalar_params(ts: List<Type>) -> Bool =
   fold(ts, true, |ok: Bool, t: Type| ok && emit_is_scalar(t))
 
+// Every root is built here, so what the seam reads of it comes from the types it carries.
+fn emit_root(
+  root: Bytes,
+  params: List<Type>,
+  answer: Type,
+  labels: Int,
+  pure: Bool,
+  place: At,
+) -> EmitRoot =
+  {
+    root: root,
+    arity: len(params) + labels,
+    scalar: emit_scalar_params(params) && emit_is_scalar(answer),
+    width: fold(push(params, answer), false, |acc: Bool, t: Type| acc || mentions_width(t)),
+    pure: pure,
+    at: place,
+  }
+
+fn emit_proposition(root: Bytes, params: List<Type>, place: At) -> EmitRoot =
+  emit_root(root, params, t_bool(), 0, false, place)
+
 // Every root the emitter offers: the functions in source order, then the tests, then the spec
 // clauses and law parts. A label parameter is a trailing `Word` of the emitted body, so an
 // arity counts it.
@@ -779,47 +800,31 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
               None -> a,
               Some(def) -> {
                 let sig = emit_signature(def.scheme.ty);
-                let scalar_params = emit_scalar_params(sig.params);
-                let fn_row = {
-                  root: name,
-                  arity: len(sig.params) + len(def.scheme.label_vars),
-                  scalar: scalar_params && emit_is_scalar(sig.ret),
-                  width: mentions_width(def.scheme.ty),
-                  pure: published_pure(def),
-                  at: span_at(def.at.module, def.at.span),
-                };
+                let place = span_at(def.at.module, def.at.span);
+                let fn_row = emit_root(
+                  name,
+                  sig.params,
+                  sig.ret,
+                  len(def.scheme.label_vars),
+                  published_pure(def),
+                  place,
+                );
                 let clauses = fold(
                   range(0, len(d.spec)),
                   { rows: [], requires: 0, ensures: 0 },
                   |b: { rows: List<EmitRoot>, requires: Int, ensures: Int }, i: Int| {
                     match at(d.spec, i).kind {
-                      SRequires ->
-                        {
-                          rows: push(b.rows, {
-                            root: key_clause_root(name, b"requires", b.requires),
-                            arity: len(sig.params),
-                            scalar: scalar_params,
-                            width: false,
-                            pure: false,
-                            at: span_at(def.at.module, def.at.span),
-                          }),
-                          requires: b.requires + 1,
-                          ensures: b.ensures,
-                        },
-                      SEnsures ->
-                        {
-                          rows: push(b.rows, {
-                            root: key_clause_root(name, b"ensures", b.ensures),
-                            // `ensures` also takes `result`.
-                            arity: len(sig.params) + 1,
-                            scalar: scalar_params && emit_is_scalar(sig.ret),
-                            width: false,
-                            pure: false,
-                            at: span_at(def.at.module, def.at.span),
-                          }),
-                          requires: b.requires,
-                          ensures: b.ensures + 1,
-                        },
+                      SRequires -> {
+                        let root = key_clause_root(name, b"requires", b.requires);
+                        let row = emit_proposition(root, sig.params, place);
+                        { rows: push(b.rows, row), requires: b.requires + 1, ensures: b.ensures }
+                      },
+                      // `ensures` also takes `result`.
+                      SEnsures -> {
+                        let root = key_clause_root(name, b"ensures", b.ensures);
+                        let row = emit_proposition(root, push(sig.params, sig.ret), place);
+                        { rows: push(b.rows, row), requires: b.requires, ensures: b.ensures + 1 }
+                      },
                     }
                   },
                 );
@@ -828,38 +833,22 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
             }
           },
           ITest(d) -> {
-            let row = {
-              root: qualify(m.name, key_test_root(a.ordinal)),
-              arity: 0,
-              scalar: false,
-              width: false,
-              pure: false,
-              at: match map_get(tests, qualify(m.name, d.name)) {
-                Some(t) -> span_at(t.at.module, t.at.span),
-                None -> no_at(),
-              },
+            let place = match map_get(tests, qualify(m.name, d.name)) {
+              Some(t) -> span_at(t.at.module, t.at.span),
+              None -> no_at(),
             };
+            let root = qualify(m.name, key_test_root(a.ordinal));
+            let row = emit_root(root, [], t_unit(), 0, false, place);
             { ..a, tests: push(a.tests, row), ordinal: a.ordinal + 1 }
           },
           ILaw(d) -> {
             let name = qualify(m.name, d.name);
             let law = map_get(laws, name);
             let guarded = match law { Some(l) -> l.has_guard, None -> false };
-            let binders = match law { Some(l) -> l.binders, None -> [] };
-            let scalar = fold(binders, true, |ok: Bool, b: LawBinder| ok && emit_is_scalar(b.ty));
-            let rows = fold(
-              if guarded { [b"guard", b"body"] } else { [b"body"] },
-              [],
-              |acc2: List<EmitRoot>, part: Bytes|
-                push(acc2, {
-                  root: qualify(m.name, key_law_root(a.law_ordinal, part)),
-                  arity: len(binders),
-                  scalar: scalar,
-                  width: false,
-                  pure: false,
-                  at: match law { Some(l) -> span_at(l.at.module, l.at.span), None -> no_at() },
-                }),
-            );
+            let binders = match law { Some(l) -> map(l.binders, |b: LawBinder| b.ty), None -> [] };
+            let place = match law { Some(l) -> span_at(l.at.module, l.at.span), None -> no_at() };
+            let rows = map(if guarded { [b"guard", b"body"] } else { [b"body"] }, |part: Bytes|
+              emit_proposition(qualify(m.name, key_law_root(a.law_ordinal, part)), binders, place));
             { ..a, specs: append(a.specs, rows), law_ordinal: a.law_ordinal + 1 }
           },
           _ -> a,
@@ -2187,6 +2176,27 @@ test "a root is pure only as a definition with no row and no constraint" {
     { root: b"m.test#0", pure: false },
     { root: b"m.positive#requires#0", pure: false },
     { root: b"m.law#0.body", pure: false },
+  ])
+}
+
+test "a root mentions a width only where a value it is entered with or answers does" {
+  let src = b"fn low_bit(b: U8) -> Int requires int_of_u8(b) < 200 ensures result < 2 = int_of_u8(b & 1u8)\nfn narrow(n: Int) -> U8 requires n >= 0 ensures int_of_u8(result) == n = u8_of_int(n)\nfn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\ntest \"t\" { assert_eq(inc(1), 2) }\nlaw \"low\" forall (b: U8) where int_of_u8(b) > 0 { low_bit(b) < 2 }\nlaw \"grows\" forall (x: Int) where x > 0 { inc(x) > x }";
+  let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
+  assert_eq(map(d.emit_roots, |r: EmitRoot| { root: r.root, width: r.width }), [
+    { root: b"m.low_bit", width: true },
+    { root: b"m.narrow", width: true },
+    { root: b"m.inc", width: false },
+    { root: b"m.test#0", width: false },
+    { root: b"m.low_bit#requires#0", width: true },
+    { root: b"m.low_bit#ensures#0", width: true },
+    { root: b"m.narrow#requires#0", width: false },
+    { root: b"m.narrow#ensures#0", width: true },
+    { root: b"m.inc#requires#0", width: false },
+    { root: b"m.inc#ensures#0", width: false },
+    { root: b"m.law#0.guard", width: true },
+    { root: b"m.law#0.body", width: true },
+    { root: b"m.law#1.guard", width: false },
+    { root: b"m.law#1.body", width: false },
   ])
 }
 

@@ -205,6 +205,43 @@ fn each_root_reads_the_purity_the_compiler_published() {
     assert_eq!(constants, ["m.origin"]);
 }
 
+const WIDTHS: &str = "fn low_bit(b: U8) -> Int requires int_of_u8(b) < 200 ensures result < 2 = int_of_u8(b & 1u8)\n\
+fn narrow(n: Int) -> U8 requires n >= 0 ensures int_of_u8(result) == n = u8_of_int(n)\n\
+fn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\n\
+law \"low\" forall (b: U8) where int_of_u8(b) > 0 { low_bit(b) < 2 }\n\
+law \"grows\" forall (x: Int) where x > 0 { inc(x) > x }\n";
+
+/// A clause carries its owner's parameters, and `result` too for an `ensures`, and a law part its
+/// binders: each mentions a width exactly where those types do.
+#[test]
+fn each_root_reads_the_width_the_compiler_published() {
+    let front =
+        dump::read(&answer(&[("m", WIDTHS)]), &[SourceId(0)]).unwrap_or_else(|e| panic!("{e}"));
+    let read: Vec<(&str, bool)> = front
+        .emitter_roots
+        .iter()
+        .map(|r| (r.root.as_str(), r.width))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("m.low_bit", true),
+            ("m.narrow", true),
+            ("m.inc", false),
+            ("m.low_bit#requires#0", true),
+            ("m.low_bit#ensures#0", true),
+            ("m.narrow#requires#0", false),
+            ("m.narrow#ensures#0", true),
+            ("m.inc#requires#0", false),
+            ("m.inc#ensures#0", false),
+            ("m.law#0.guard", true),
+            ("m.law#0.body", true),
+            ("m.law#1.guard", false),
+            ("m.law#1.body", false),
+        ]
+    );
+}
+
 fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
     let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
