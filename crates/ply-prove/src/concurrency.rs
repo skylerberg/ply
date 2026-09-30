@@ -1,8 +1,8 @@
 //! Concurrency laws: the bridge from an obligation to the interleaving search.
 
 use crate::{
-    Binding, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, Rule,
-    Vacuity, VacuityKind,
+    Binding, CaseReport, Certificate, Counterexample, Discharge, Evidence, Fault, Gap, Obligation,
+    Rule, Vacuity, VacuityKind,
 };
 use ply_eval::{
     Diagnostic, Exploration, Interleaving, Plan, Seed, Span, Symbol, Value, Verdict, codes, explore,
@@ -184,22 +184,30 @@ pub fn discharge(
                 )
                 .primary(obligation.span, "this law's search")
             });
-            // A raise is not a refutation.
-            return totals.finish(if failing.unwrap_or(Failing::Raised) == Failing::Raised {
+            let bindings = search.bindings(point);
+            let case = u32::try_from(point).unwrap_or(u32::MAX);
+            // Ply's failure outranks the seed's verdict: a search it cannot trust decides nothing.
+            return totals.finish(if codes::is_defect(diagnostic.code) {
+                Discharge::Faulted(Fault {
+                    bindings,
+                    diagnostic: Box::new(diagnostic),
+                })
+            } else if failing.unwrap_or(Failing::Raised) == Failing::Raised {
+                // A raise is not a refutation.
                 Discharge::Unattempted(Gap::Raised {
-                    bindings: search.bindings(point),
+                    bindings,
                     diagnostic: Box::new(diagnostic),
                     // A race's counterexample is an interleaving: there is no draw to go back to.
                     root: seed.root,
-                    case: u32::try_from(point).unwrap_or(u32::MAX),
+                    case,
                 })
             } else {
                 Discharge::Refuted(Counterexample {
-                    bindings: search.bindings(point),
-                    original: search.bindings(point),
+                    original: bindings.clone(),
+                    bindings,
                     shrinks: 0,
                     root: seed.root,
-                    case: u32::try_from(point).unwrap_or(u32::MAX),
+                    case,
                     race: explored.exploration.race.clone(),
                     sim_seed: Some(seed),
                 })
@@ -320,7 +328,7 @@ impl Totals {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Failing {
     Refuted,
-    /// The body raised, or the search caught its own driver diverging.
+    /// The body raised, or the search failed a seed the driver never saw fail.
     Raised,
 }
 
