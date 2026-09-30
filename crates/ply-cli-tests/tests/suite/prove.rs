@@ -571,6 +571,12 @@ fn bounded(x: Int) -> Int
     };
     assert_eq!(by_label("m.inc")["outcome"], "unattempted");
     assert_eq!(by_label("m.inc")["tier"], Value::Null);
+    assert!(
+        by_label("m.inc")["gap"]
+            .as_str()
+            .is_some_and(|gap| gap.contains("overflow")),
+        "`x + 1 > x` has no answer at `i64::MAX`, so no tier covers every input: {v}"
+    );
     assert_eq!(by_label("m.bounded")["tier"], "proved");
     assert_eq!(
         v["coverage"]["uncovered"].as_array().unwrap(),
@@ -712,6 +718,33 @@ law \"shift agrees with base\" forall (x: Int) where x > 0 && x < 1000
     }
 }
 
+/// A finite domain is walked in a fixed order, so the point that fails is the one reported: there
+/// is no draw to walk down from, and one regenerated in its place would be a point that holds.
+#[test]
+fn an_enumerated_refutation_is_reported_at_the_point_that_fails() {
+    let source = "\
+type Day = Mon | Tue | Wed | Thu | Fri | Sat | Sun
+
+fn rank(d: Day) -> Int =
+  match d { Mon -> 1, Tue -> 2, Wed -> 3, Thu -> 4, Fri -> 5, Sat -> 6, Sun -> 7 }
+
+law \"every day is early\" forall (d: Day) { rank(d) / 1 < 7 }
+";
+    let dir = project(source);
+    let v = json_of(
+        &ply(dir.path())
+            .args(["prove", "--no-cache", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let o = &v["obligations"][0];
+    assert_eq!(o["outcome"], "refuted", "{o}");
+    let counterexample = &o["counterexample"];
+    assert_eq!(counterexample["bindings"][0]["value"], "m.Sun", "{o}");
+    assert_eq!(counterexample["original"][0]["value"], "m.Sun", "{o}");
+    assert_eq!(counterexample["shrinks"], 0, "{o}");
+}
+
 /// A counterexample is not finished when it is found: the walk that makes it small is the
 /// program's, driven one question at a time through the shrink operations, and what a report shows
 /// is what the walk settled on. This is the end-to-end claim for that — the fixture
@@ -757,5 +790,11 @@ law \"the bound holds\"
     assert!(
         settled < started,
         "the walk settled on {settled}, no smaller than the {started} it started from: {text}"
+    );
+    // The draw is `i64::MAX`, whose size is past what an `Int` holds: read as one, the walk still
+    // halves its way down to where the claim starts to fail.
+    assert_eq!(
+        settled, 100,
+        "the walk stopped short of the boundary: {text}"
     );
 }
