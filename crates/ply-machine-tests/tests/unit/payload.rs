@@ -55,7 +55,10 @@ fn a_fixed_width_integer_crosses_with_its_type() {
         "4000000000"
     );
     // A U64 above `Int`'s range has no `Int` to cross as.
-    let too_big = Value::Fixed(ply_eval::Fixed::new(ply_eval::IntTy::U64, u64::MAX));
+    let too_big = Value::Fixed(ply_eval::Fixed::new(
+        ply_eval::IntTy::U64,
+        u128::from(u64::MAX),
+    ));
     machine_value(&too_big, "m").expect_err("a U64 above i64::MAX does not cross");
 }
 

@@ -158,6 +158,7 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
             "rt_tick" => rt::rt_tick as *const (),
             "rt_binary" => rt::rt_binary as *const (),
             "rt_negate" => rt::rt_negate as *const (),
+            "rt_bitnot" => rt::rt_bitnot as *const (),
             "rt_arith" => rt::rt_arith as *const (),
             "rt_lit" => rt::rt_lit as *const (),
             "rt_no_match" => rt::rt_no_match as *const (),
