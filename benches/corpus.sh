@@ -22,15 +22,13 @@ cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p ply-launcher
 program=$("$root/benches/corpus-program.sh" "$bin/ply" "$bin/corpus-program")
 
 # The program starts only what is bound here, so the floors its tables are compared with are built
-# here too; `CORPUS_BOUND` names the labels bound, since starting an unbound one ends the run. The
-# libpq tool is built only where `pg_config` says where libpq is, and without it the rows that need
-# it are inconclusive.
+# here too; it asks `process.bound` for each. The libpq tool is built only where `pg_config` says
+# where libpq is, and without it the rows that need it are inconclusive.
 floor="$root/benches/http-floor/floor.c"
 if [ "$floor" -nt "$bin/http-floor" ]; then
   cc -O2 -o "$bin/http-floor" "$floor" -lpthread
 fi
 execs=(--exec "ply=$bin/ply" --exec "http_floor=$bin/http-floor")
-bound=http_floor
 
 pg="$root/benches/pg-floor/pg.c"
 if command -v pg_config >/dev/null; then
@@ -38,9 +36,7 @@ if command -v pg_config >/dev/null; then
     cc -O2 -o "$bin/pg-floor" "$pg" -I"$(pg_config --includedir)" -L"$(pg_config --libdir)" -lpq
   fi
   execs+=(--exec "pg_floor=$bin/pg-floor")
-  bound="$bound,pg_floor"
 fi
 
 exec "$bin/ply" run "$program" --host --allow machine --allow claims "${execs[@]}" \
-  --set "CORPUS_BOUND=$bound" \
   --fs work=. --fs "repo=$root" -- "$@"

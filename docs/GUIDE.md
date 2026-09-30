@@ -1391,6 +1391,7 @@ pub type Heard = Said(String) | Quiet | Closed
 
 pub nondet effect process {
   read  args[p]()             -> List<String>
+  read  bound[e]()            -> Bool
   write out[p](text: String)  -> Unit
   write err[p](text: String)  -> Unit
   write line[p]()             -> Option<String>
@@ -1413,9 +1414,10 @@ consumed and two readers of one input race for it), and `exit` ends the program
 there: nothing after it runs, no value is
 printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). These
 are bound only by `ply run --host`; `ply test` withholds them, even with
-`--host` (`E0424`). The operations whose label is an executable — `spawn`,
-`start` and those on a started child — are bound by `ply test --host` too, for
-the labels `--exec` names. Under `ply run --json` the lines `out` writes go to
+`--host` (`E0424`). The operations whose label is an executable — `bound`,
+`spawn`, `start` and those on a started child — are bound by `ply test --host`
+too: a label `--exec` does not name is unbound (`E0456`), and `bound` answers
+`false` for it. Under `ply run --json` the lines `out` writes go to
 stderr, so stdout still carries the one object. Handle it over a `Captured`
 value: `captured(args)`, `args_step`, `out_step`, `err_step`, `line_step` and `exit_step` keep each line,
 hand out `with_input`'s scripted input lines, and the first exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
@@ -1427,6 +1429,9 @@ but the executable: `--exec cc=/usr/bin/cc` binds one program to `cc`, and
 executable bound is `E0456`, and an `--exec` path that is missing, is not a file
 or has no execute bit is `E0457` before anything runs. Nothing in the call names
 a program, so the run decides what a footprint's `process.spawn[cc]` may do.
+`bound` answers whether the run bound a program to its label, so a program that
+can do without one asks `process.bound[cc]()` rather than ending at `E0456`; the
+table is settled before anything runs, so the answer holds for the whole run.
 
 `args` is the argument vector after the program; `dir` is the working
 directory, and `""` is the run's own. `env` is the *whole* environment: a spawn
@@ -1444,6 +1449,8 @@ hands out planned `Finished` values in order and records each `Launch`; a spawn
 with no reply planned answers `Exited(127)`, as a shell does for a command it
 could not run. Build replies with `exited(code, out, err)` and
 `signalled(signal, out, err)`, and read one back with `exit_code`.
+`runs_bound_step` answers `bound`: `true` once a reply is planned, unless the
+test sets the twin's `bound`, and no spawn changes it.
 
 `start` launches a child beside the program, by the same label, `dir` and `env`
 rules, and answers its handle — an `Int`, as a socket's is — or `Err` with why
@@ -1486,9 +1493,10 @@ Handle the children over a `Children` value: `children(planned)` hands each
 `output_line` hears in order, `Closed` once that runs out — and a start with
 none planned answers `Err`. `start_step`, `wait_step`, `signal_step`,
 `input_step` and `output_line_step` each answer an `Answered` of the twin and
-what the host would have said, `end_input_step` answers the twin, and each
-`Child` records its launch, the bytes written to it, whether its input is open
-and the signals it was sent. A `Kill` ends a scripted child, so the next `wait` hands it back, and
+what the host would have said, `end_input_step` answers the twin, `bound_step`
+answers `bound` as `runs_bound_step` does, `true` once a script is planned, and
+each `Child` records its launch, the bytes written to it, whether its input is
+open and the signals it was sent. A `Kill` ends a scripted child, so the next `wait` hands it back, and
 a spent or unknown handle panics, as the host refuses one.
 
 ### 13.10 `std.time`
@@ -2256,8 +2264,9 @@ always runs and is never cached. An operation performed inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
-test run binds `process.spawn`, `process.start` and the operations on a started
-child for the labels `--exec` names. All flags below require `--host`.
+test run binds `process.bound`, `process.spawn`, `process.start` and the
+operations on a started child, which reach only the programs `--exec` names. All
+flags below require `--host`.
 
 `ply hosts` lists every bindable operation (`effect.op[resource]`: one row per
 operation and label some row of the program names, where a written mode atom
