@@ -1,97 +1,31 @@
-use crate::support::generate;
-use ply_machine::engine::Prover;
-use ply_machine::load::load;
-use ply_machine::obligations;
-use ply_prove::{Discharge, Gap, ProvePlan, Tier};
+//! The statistical gate on the prover's tiers, as CI runs it: the corpus program's `tiers`, whose
+//! criteria are the gate — no draw contradicts a proof, and enough proofs were drawn from.
+
+use crate::support::{corpus, document, measured, outcome, row};
 
 #[test]
 fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
-    let wide = ProvePlan {
-        cases: 1_000,
-        roots: (0..8).collect(),
-        ..ProvePlan::default()
-    };
-    let mut audited = 0;
-    for seed in 1..=6u64 {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("corpus");
-        let seed_text = seed.to_string();
-        generate(
-            &root,
-            &[
-                "--seed",
-                &seed_text,
-                "--modules",
-                "6",
-                "--defs-per-module",
-                "10",
-                "--tests",
-                "20",
-                "--depth",
-                "3",
-                "--spec-fraction",
-                "0.4",
-                "--specimens-per-module",
-                "3",
-            ],
+    let dir = tempfile::tempdir().unwrap();
+    let out = corpus(dir.path(), &["tiers", "--out", "tiers", "--json"]);
+    assert!(
+        out.status.success(),
+        "the audit refused:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = document(&out);
+    for seed in 1..=6 {
+        let audited = row(&report, &format!("seed {seed}"));
+        assert_eq!(
+            outcome(audited),
+            "pass",
+            "seed {seed}: a proof a sampled run contradicts is a defect in Ply: {audited:#}"
         );
-
-        let loaded = load(&root).expect("a generated corpus compiles");
-        let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-        let backend =
-            ply_machine::support::prover_backend(&loaded).expect("the corpus compiles to a tier");
-        let prover = Prover::new(&loaded)
-            .expect("the port lowers the claims")
-            .with_backend(Some(backend));
-        for obligation in &collected.obligations {
-            if prover
-                .discharge_with(obligation, &ProvePlan::default(), None)
-                .tier()
-                != Some(Tier::Proved)
-            {
-                continue;
-            }
-            audited += 1;
-            // A refutation and a raise are both defects.
-            if let Some(defect) = disagreement(&prover.resample(obligation, &wide)) {
-                panic!(
-                    "seed {seed}: `{}` is reported `proved` and a sampled run {defect} — a \
-                     defect in Ply",
-                    obligation.owner
-                );
-            }
-        }
     }
-    eprintln!("{audited} generated proofs re-sampled at 1,000 cases across 8 roots");
-    assert!(audited >= 100, "only {audited} proofs were audited");
-}
-
-/// How a sampled run contradicts a proof, or `None` when it does not.
-pub fn disagreement(discharge: &Discharge) -> Option<String> {
-    match discharge {
-        Discharge::Refuted(counterexample) => Some(format!(
-            "refutes it at {}",
-            counterexample
-                .bindings
-                .iter()
-                .map(|b| format!("{} = {}", b.name, b.rendered))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-        Discharge::Unattempted(Gap::Raised {
-            bindings,
-            diagnostic,
-            ..
-        }) => Some(format!(
-            "raises `{}` at {}",
-            diagnostic.message,
-            bindings
-                .iter()
-                .map(|b| format!("{} = {}", b.name, b.rendered))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-        _ => None,
-    }
+    let total = row(&report, "audited");
+    assert_eq!(outcome(total), "pass", "{total:#}");
+    eprintln!(
+        "{} generated proofs re-drawn at 1,000 cases across 8 roots",
+        measured(total, "proved")
+    );
+    assert_eq!(report["ok"].as_bool(), Some(true), "{report:#}");
 }

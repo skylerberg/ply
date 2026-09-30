@@ -1,0 +1,305 @@
+// What the corpus drives in-process: the compiler's front end over sources the program read itself,
+// with the checkout's standard library as the shelf the way `ply` reads a program and its shelf, and a
+// fixture written, front-ended and loaded into the machine the program is lent. The two phases before
+// a load are timed here, so an in-process number also says what it cost to get to it.
+
+import cli.machine
+import cli.machine (Value, machine, default_options)
+import cli.program (Front, pseudo_path)
+import compiler.front (Analysed, Pulled, Refused, analyse_pulling_std_with, dump_of, dump_text,
+                       module_of)
+import compiler.resolve (Diag, Mod, Source)
+import spine (under)
+import std.fs (fs)
+import std.fs
+import std.list (sort)
+import std.time (time)
+
+// What sources cost before a machine or a prover held them: reading them and the shelf, then the
+// front end.
+pub type Loaded = { read_us: Int, front_us: Int }
+
+// One source to front-end: its path under the `work` root, and the module it is.
+pub type Named = { path: String, module: String }
+
+// Where the standard library the sources are checked against lives under the `repo` root.
+fn std_tree() -> String = "crates/ply-std/ply"
+
+// --- The shelf ----------------------------------------------------------------------
+
+// Every `.ply` under `dir` of the `repo` root as the shipped module it is: `std.json` is `json.ply`,
+// `std.http.server` is `http/server.ply`.
+fn shelved(dir: String, module: String, acc: List<Source>) -> List<Source> / {fs.read[repo]} =
+  match fs.list_dir[repo](dir) {
+    None -> acc,
+    Some(names) ->
+      fold(sort(names), acc, |found: List<Source>, name: String| {
+        let path = under(dir, name);
+        match fs.kind[repo](path) {
+          fs::Dir -> shelved(path, module ++ "." ++ name, found),
+          fs::File -> if !string_ends_with(name, ".ply") { found } else {
+            match fs.read_file[repo](path) {
+              None -> found,
+              Some(src) ->
+                push(found, {
+                  name: bytes_of_string(
+                    module ++ "." ++ string_slice(name, 0, string_len(name) - 4),
+                  ),
+                  src: src,
+                }),
+            }
+          },
+          _ -> found,
+        }
+      }),
+  }
+
+fn shelf() -> Result<List<Source>, String> / {fs.read[repo]} =
+  match shelved(std_tree(), "std", []) {
+    [] ->
+      Err(
+        "no standard library under `" ++ std_tree()
+          ++ "` of the `repo` root: bind the checkout as `--fs repo=PATH`",
+      ),
+    found -> Ok(found),
+  }
+
+pub fn joined_diags(diags: List<Diag>) -> String =
+  fold(diags, "", |acc: String, d: Diag|
+    if acc == "" { string_of_bytes_lossy(d.message) }
+    else { acc ++ "; " ++ string_of_bytes_lossy(d.message) })
+
+// --- The front end --------------------------------------------------------------------
+
+// The places a front end numbered, as a Front files them: the sources in the order they were handed
+// over, then the shelf modules it pulled, each under the module the front end named it.
+fn front_of(
+  read: List<{ path: String, text: Bytes }>,
+  shipped: List<Source>,
+  pulled: List<Bytes>,
+  names: List<Bytes>,
+) -> List<{ path: String, name: String, text: Bytes }> = {
+  let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  let places = fold(pulled, read, |acc: List<{ path: String, text: Bytes }>, n: Bytes|
+    push(acc, {
+      path: pseudo_path(string_of_bytes_lossy(n)),
+      text: match map_get(texts, n) { Some(t) -> t, None -> b"" },
+    }));
+  map(range(0, len(places)), |i: Int| {
+    let place = match list_at(places, i) {
+      Some(p) -> p,
+      None -> panic("a place for every module"),
+    };
+    {
+      path: place.path,
+      name: match list_at(names, i) {
+        Some(n) -> string_of_bytes_lossy(n),
+        None -> panic("a module for every place"),
+      },
+      text: place.text,
+    }
+  })
+}
+
+// `sources` read back and the shelf beside them, through the compiler's own front end: the Front a
+// machine or a prover is handed, and what the two phases before it cost.
+pub fn fronted(
+  sources: List<Named>,
+) -> Result<(Front, Loaded), String> / {fs.read[work], fs.read[repo], time.elapsed_us} = {
+  let started = time.elapsed_us();
+  let read = fold(
+    sources,
+    Ok([]),
+    |acc: Result<List<{ path: String, text: Bytes }>, String>, n: Named|
+      match acc {
+        Err(e) -> Err(e),
+        Ok(done) -> match fs.read_file[work](n.path) {
+          None -> Err("`" ++ n.path ++ "` could not be read back"),
+          Some(text) -> Ok(push(done, { path: n.path, text: text })),
+        },
+      },
+  );
+  match read {
+    Err(why) -> Err(why),
+    Ok(texts) -> match shelf() {
+      Err(why) -> Err(why),
+      Ok(shipped) -> {
+        let read_at = time.elapsed_us();
+        let user = map(range(0, len(sources)), |i: Int|
+          {
+            name: bytes_of_string(match list_at(sources, i) { Some(n) -> n.module, None -> "" }),
+            src: match list_at(texts, i) { Some(t) -> t.text, None -> b"" },
+          });
+        let pulled: Pulled = analyse_pulling_std_with(user, shipped, [], []);
+        let analysed_at = time.elapsed_us();
+        match pulled.out {
+          Refused(diags) -> Err(joined_diags(diags)),
+          Analysed(w) -> {
+            let loaded: Loaded = { read_us: read_at - started, front_us: analysed_at - read_at };
+            let front: Front = {
+              dump: dump_text(dump_of(Analysed(w))),
+              files: front_of(texts, shipped, pulled.pulled, map(w.mods, |mo: Mod| mo.name)),
+              read_ms: loaded.read_us / 1000,
+              front_ms: loaded.front_us / 1000,
+              file_ms: 0,
+              cached: false,
+            };
+            Ok((front, loaded))
+          },
+        }
+      },
+    },
+  }
+}
+
+// Every `.ply` file under `dir`, past any hidden directory, in path order, as the module its path
+// under `dir` names: the project `ply` would load from there.
+pub fn project(dir: String) -> Result<List<Named>, String> / {fs.list_dir[work], fs.kind[work]} =
+  fold(sort(ply_under(dir, "", [])), Ok([]), |acc: Result<List<Named>, String>, relative: String|
+    match acc {
+      Err(e) -> Err(e),
+      Ok(found) -> match module_of(relative) {
+        Err(why) -> Err("`" ++ under(dir, relative) ++ "` cannot be a module: " ++ why),
+        Ok(module) -> Ok(push(found, { path: under(dir, relative), module: module })),
+      },
+    })
+
+fn ply_under(
+  dir: String,
+  prefix: String,
+  acc: List<String>,
+) -> List<String> / {fs.list_dir[work], fs.kind[work]} =
+  match fs.list_dir[work](if prefix == "" { dir } else { under(dir, prefix) }) {
+    None -> acc,
+    Some(names) ->
+      fold(names, acc, |found: List<String>, name: String|
+        if string_starts_with(name, ".") { found } else {
+          let relative = under(prefix, name);
+          match fs.kind[work](under(dir, relative)) {
+            fs::Dir -> ply_under(dir, relative, found),
+            fs::File -> if string_ends_with(name, ".ply") { push(found, relative) } else { found },
+            _ -> found,
+          }
+        }),
+  }
+
+// --- A fixture --------------------------------------------------------------------------
+
+// Writes a fixture into a directory of its own under `dir` and hands back that directory, which the
+// machine is handed too: both are relative to the working directory, which is the `work` root. The
+// directory is the fixture's by name, so one a stopped run left behind is taken out first.
+fn written(
+  dir: String,
+  name: String,
+  source: String,
+) -> Result<String, String> / {fs.read[work], fs.write[work]} = {
+  let here = scratch_of(dir, name);
+  if !fresh(here) { Err("the fixture directory could not be made: " ++ here) } else if !fs.write_file[work](
+      under(here, name ++ ".ply"),
+      bytes_of_string(source),
+    ) { Err("the fixture could not be written: " ++ here) }
+  else { Ok(here) }
+}
+
+pub fn scratch_of(dir: String, name: String) -> String = under(dir, "fixture-" ++ name)
+
+// A scratch directory made empty: one a stopped run left behind is the same scratch, taken out first.
+pub fn fresh(here: String) -> Bool / {fs.read[work], fs.write[work]} = {
+  removed(here);
+  fs.create_dir[work](here)
+}
+
+// Takes a scratch directory back out, contents first: `remove` on a directory is `remove_dir`, which
+// wants it empty.
+pub fn removed(here: String) -> Unit / {fs.list_dir[work], fs.kind[work], fs.remove[work]} = {
+  let _ = match fs.list_dir[work](here) {
+    None -> [],
+    Some(names) ->
+      map(names, |entry: String| {
+        let path = under(here, entry);
+        match fs.kind[work](path) {
+          fs::Dir -> removed(path),
+          _ -> {
+            let _ = fs.remove[work](path);
+            ()
+          },
+        }
+      }),
+  };
+  let _ = fs.remove[work](here);
+  ()
+}
+
+fn refusal_text(refusal: machine::Refusal) -> String = joined_diags(refusal.diags)
+
+// Write the fixture, front-end it, load it, bind it, run `body`, and let go of the machine either way.
+// The scratch directory is taken back out whatever happened, so a tree the fixture was written into is
+// left as it was found.
+pub fn with_fixture<a | e>(
+  dir: String,
+  name: String,
+  source: String,
+  entry: String,
+  body: (Loaded) -> Result<a, String> / e,
+) -> Result<a, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.drop[bench] | e} =
+  match written(dir, name, source) {
+    Err(why) -> Err(why),
+    Ok(scratch) -> {
+      let finish = |outcome: Result<a, String>| -> Result<a, String> {
+        removed(scratch);
+        outcome
+      };
+      match fronted([{ path: under(scratch, name ++ ".ply"), module: name }]) {
+        Err(why) -> finish(Err("the " ++ name ++ " fixture would not check: " ++ why)),
+        Ok(pair) -> {
+          let (front, loaded) = pair;
+          // Whatever the machine files beside the fixture goes out with the scratch directory.
+          machine.configure[bench](default_options());
+          match machine.load[bench](scratch, Some(front)) {
+            Err(refusal) ->
+              finish(Err("the " ++ name ++ " fixture would not load: " ++ refusal_text(refusal))),
+            Ok(_) -> match machine.bound[bench](entry) {
+              Err(refusal) -> {
+                machine.drop[bench]();
+                finish(Err("the " ++ name ++ " fixture would not bind: " ++ refusal_text(refusal)))
+              },
+              Ok(_) -> {
+                let outcome = body(loaded);
+                machine.drop[bench]();
+                finish(outcome)
+              },
+            },
+          }
+        },
+      }
+    },
+  }
+
+// One call of a loaded fixture's definition, or what it raised.
+pub fn called(name: String, args: List<Value>) -> Result<Value, String> / {machine.call[bench]} =
+  match machine.call[bench](name, args) {
+    Ok(v) -> Ok(v),
+    Err(raised) -> Err("`" ++ name ++ "` raised " ++ raised.code ++ ": " ++ raised.message),
+  }
+
+// --- Tests --------------------------------------------------------------------------------
+
+test "the places a front end numbered are the sources, then the shelf it pulled" {
+  let files = front_of(
+    [{ path: "p/a.ply", text: b"a" }, { path: "p/b/c.ply", text: b"c" }],
+    [{ name: b"std.json", src: b"json" }, { name: b"std.list", src: b"list" }],
+    [b"std.json"],
+    [b"a", b"b.c", b"std.json"],
+  );
+  assert_eq(files, [
+    { path: "p/a.ply", name: "a", text: b"a" },
+    { path: "p/b/c.ply", name: "b.c", text: b"c" },
+    { path: "<std>/json.ply", name: "std.json", text: b"json" },
+  ])
+}
+
+test "a fixture's scratch directory is named for it under the tree it was written into" {
+  assert_eq(scratch_of(".", "multishot"), "fixture-multishot");
+  assert_eq(scratch_of("corpora/m4", "work"), "corpora/m4/fixture-work")
+}

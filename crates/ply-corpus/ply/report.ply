@@ -1,0 +1,463 @@
+// What every measuring subcommand answers: rows, each declaring before anything runs the criterion it
+// will be judged by, the numbers it took with their units, and the verdict the criterion gives those
+// numbers. A report reads as a table and as one JSON document, and both carry what took the
+// measurements: the corpus package's pin and the runtime's version. A subcommand is its rows; nothing
+// here knows what any of them measure.
+
+import pin
+import spine
+import std.json (Json, Str, Number, Bool, Null, Member, object, array)
+import std.json
+import std.fs (fs)
+import std.process (process)
+import std.config (config)
+
+// --- A row -----------------------------------------------------------------------------
+
+// One number, in the unit it was taken in.
+pub type Measurement = { name: String, value: Decimal, unit: String }
+
+// What a row must show. The judge applies it and the renderer prints it from the one value, so a check
+// and its words cannot drift apart.
+pub type Criterion =
+  | AtMost(String, Decimal)
+  | AtLeast(String, Decimal)
+  // This row's measurement is at most `ratio` times the same measurement of the row named.
+  | WithinRatio(String, String, Decimal)
+  // A predicate over the row's measurements, and the words it is read as.
+  | Holds(String, (List<Measurement>) -> Verdict)
+
+pub type Verdict =
+  | Pass
+  // The numbers that broke the criterion.
+  | Fail(List<Measurement>)
+  // Why the numbers cannot decide it.
+  | Inconclusive(String)
+
+// A row as a subcommand declares it: the numbers it took, or why it took none, and whatever it found
+// that is not a number (`Null` when there is nothing).
+pub type Row = {
+  name: String,
+  criterion: Criterion,
+  taken: Result<List<Measurement>, String>,
+  detail: Json,
+}
+
+pub type Judged = { row: Row, verdict: Verdict }
+
+// What took the measurements.
+pub type Provenance = { corpus: String, runtime: String }
+
+pub type Report = {
+  command: String,
+  title: String,
+  provenance: Provenance,
+  rows: List<Judged>,
+  // The subcommand's own members of the document, beside the rows.
+  context: List<Member>,
+}
+
+// --- Measurements ------------------------------------------------------------------------
+
+pub fn number(name: String, n: Int, unit: String) -> Measurement =
+  { name: name, value: decimal_of_int(n), unit: unit }
+
+pub fn exact(name: String, d: Decimal, unit: String) -> Measurement =
+  { name: name, value: d, unit: unit }
+
+// Microseconds, read as milliseconds to the microsecond.
+pub fn ms_of_us(name: String, us: Int) -> Measurement =
+  { name: name, value: decimal_div(decimal_of_int(us), 1000m, 3, HalfEven), unit: "ms" }
+
+pub fn measurement(ms: List<Measurement>, name: String) -> Option<Measurement> =
+  fold(ms, None, |found: Option<Measurement>, m: Measurement|
+    match found { Some(_) -> found, None -> if m.name == name { Some(m) } else { None } })
+
+pub fn value_of(ms: List<Measurement>, name: String) -> Option<Decimal> =
+  match measurement(ms, name) { Some(m) -> Some(m.value), None -> None }
+
+// The measurements named, in that order: what a predicate fails with.
+pub fn named(ms: List<Measurement>, names: List<String>) -> List<Measurement> =
+  fold(names, [], |acc: List<Measurement>, name: String|
+    match measurement(ms, name) { Some(m) -> push(acc, m), None -> acc })
+
+// A predicate over named measurements: it fails with those numbers, and is inconclusive when one of
+// them was not taken.
+pub fn holding(text: String, names: List<String>, holds: (List<Decimal>) -> Bool) -> Criterion =
+  Holds(text, |ms: List<Measurement>| {
+    let found = named(ms, names);
+    if len(found) != len(names) {
+      Inconclusive("not every one of " ++ joined(names, ", ") ++ " was measured")
+    } else if holds(map(found, |m: Measurement| m.value)) { Pass }
+    else { Fail(found) }
+  })
+
+pub fn row(name: String, criterion: Criterion, measured: List<Measurement>) -> Row =
+  { name: name, criterion: criterion, taken: Ok(measured), detail: Null }
+
+// A row whose numbers could not be taken, and why.
+pub fn untaken(name: String, criterion: Criterion, why: String) -> Row =
+  { name: name, criterion: criterion, taken: Err(why), detail: Null }
+
+// --- The judge ---------------------------------------------------------------------------
+
+pub fn judge(rows: List<Row>) -> List<Judged> =
+  map(rows, |r: Row| { row: r, verdict: verdict_of(r, rows) })
+
+fn verdict_of(r: Row, all: List<Row>) -> Verdict =
+  match r.taken {
+    Err(why) -> Inconclusive(why),
+    Ok(ms) -> match r.criterion {
+      AtMost(name, bound) -> bounded(ms, name, |v: Decimal| v <= bound),
+      AtLeast(name, bound) -> bounded(ms, name, |v: Decimal| v >= bound),
+      WithinRatio(name, other, ratio) -> match measurement(ms, name) {
+        None -> unmeasured(name),
+        Some(m) -> match row_named(all, other) {
+          None -> Inconclusive("there is no `" ++ other ++ "` row to compare with"),
+          Some(o) -> match o.taken {
+            Err(why) -> Inconclusive("`" ++ other ++ "` measured nothing: " ++ why),
+            Ok(theirs) -> match measurement(theirs, name) {
+              None -> Inconclusive("`" ++ other ++ "` measured no `" ++ name ++ "`"),
+              Some(base) -> if m.value <= base.value * ratio { Pass }
+              else { Fail([m, { ..base, name: other ++ "." ++ name }]) },
+            },
+          },
+        },
+      },
+      Holds(_, check) -> check(ms),
+    },
+  }
+
+fn bounded(ms: List<Measurement>, name: String, within: (Decimal) -> Bool) -> Verdict =
+  match measurement(ms, name) {
+    None -> unmeasured(name),
+    Some(m) -> if within(m.value) { Pass } else { Fail([m]) },
+  }
+
+fn unmeasured(name: String) -> Verdict = Inconclusive("`" ++ name ++ "` was not measured")
+
+fn row_named(rows: List<Row>, name: String) -> Option<Row> =
+  fold(rows, None, |found: Option<Row>, r: Row|
+    match found { Some(_) -> found, None -> if r.name == name { Some(r) } else { None } })
+
+pub fn passed(j: Judged) -> Bool = match j.verdict { Pass -> true, _ -> false }
+
+pub fn all_passed(rows: List<Judged>) -> Bool =
+  fold(rows, true, |acc: Bool, j: Judged| acc && passed(j))
+
+// Rows taken under a prefix — one size of a sweep, say — with every reference between them following
+// the rename, so a ratio still compares the rows it was declared against.
+pub fn prefixed(prefix: String, rows: List<Row>) -> List<Row> =
+  map(rows, |r: Row|
+    {
+      ..r,
+      name: prefix ++ r.name,
+      criterion: match r.criterion {
+        WithinRatio(name, other, ratio) -> WithinRatio(name, prefix ++ other, ratio),
+        c -> c,
+      },
+    })
+
+// --- Assembling one ------------------------------------------------------------------------
+
+fn corpus_tree() -> String = "crates/ply-corpus/ply"
+
+// What took the measurements: the corpus package, pinned with every tree it reads, and the runtime
+// that ran it.
+pub fn provenance() -> Result<Provenance, String> / {process.spawn[ply], config.get[env], fs.read[repo]} =
+  match pin::member[repo]("corpus", corpus_tree()) {
+    Err(why) ->
+      Err(
+        "the corpus's own sources could not be pinned under the `repo` root (bind the checkout as `--fs repo=PATH`): "
+          ++ why,
+      ),
+    Ok(m) -> {
+      let done = spine::ply(["--version"], ".");
+      if spine::exit_zero(done) {
+        Ok({ corpus: m.digest, runtime: string_trim(string_of_bytes_lossy(done.out)) })
+      } else { Err("`ply --version` failed: " ++ string_of_bytes_lossy(done.err)) }
+    },
+  }
+
+pub fn report_of(
+  command: String,
+  title: String,
+  provenance: Provenance,
+  rows: List<Row>,
+  context: List<Member>,
+) -> Report =
+  { command: command, title: title, provenance: provenance, rows: judge(rows), context: context }
+
+// The rows judged, under what took them.
+pub fn made(
+  command: String,
+  title: String,
+  rows: List<Row>,
+  context: List<Member>,
+) -> Result<Report, String> / {process.spawn[ply], config.get[env], fs.read[repo]} =
+  match provenance() {
+    Err(why) -> Err(why),
+    Ok(p) -> Ok(report_of(command, title, p, rows, context)),
+  }
+
+// --- The words ----------------------------------------------------------------------------
+
+fn joined(parts: List<String>, sep: String) -> String =
+  fold(parts, "", |acc: String, p: String| if acc == "" { p } else { acc ++ sep ++ p })
+
+// A symbol sits against its number; a word is spaced from it.
+fn unit_text(unit: String) -> String =
+  if unit == "" { "" } else if fold(
+      ["ms", "µs", "ns", "s", "%", "×", "MB/s"],
+      false,
+      |hit: Bool, u: String| hit || u == unit,
+    ) { unit }
+  else { " " ++ unit }
+
+pub fn amount(value: Decimal, unit: String) -> String = decimal_to_string(value) ++ unit_text(unit)
+
+// A count named for what it counts reads as `4 tests`, not `tests 4 tests`.
+fn measurement_text(m: Measurement) -> String =
+  if m.name == m.unit { amount(m.value, m.unit) } else { m.name ++ " " ++ amount(m.value, m.unit) }
+
+fn unit_of(ms: List<Measurement>, name: String) -> String =
+  match measurement(ms, name) { Some(m) -> m.unit, None -> "" }
+
+pub fn criterion_text(c: Criterion, ms: List<Measurement>) -> String =
+  match c {
+    AtMost(name, bound) -> name ++ " at most " ++ amount(bound, unit_of(ms, name)),
+    AtLeast(name, bound) -> name ++ " at least " ++ amount(bound, unit_of(ms, name)),
+    WithinRatio(name, other, ratio) ->
+      name ++ " at most " ++ decimal_to_string(ratio) ++ "× " ++ other ++ "'s",
+    Holds(text, _) -> text,
+  }
+
+fn taken_of(r: Row) -> List<Measurement> = match r.taken { Ok(ms) -> ms, Err(_) -> [] }
+
+fn mark(v: Verdict) -> String = match v { Pass -> "✓", Fail(_) -> "✗", Inconclusive(_) -> "?" }
+
+fn verdict_note(v: Verdict) -> String =
+  match v {
+    Pass -> "",
+    Fail(ms) -> " — FAIL: " ++ joined(map(ms, measurement_text), ", "),
+    Inconclusive(why) -> " — inconclusive: " ++ why,
+  }
+
+fn padded(text: String, width: Int) -> String =
+  fold(range(string_len(text), width), text, |acc: String, i: Int| acc ++ " ")
+
+fn line(j: Judged, width: Int) -> String = {
+  let ms = taken_of(j.row);
+  let numbers = if len(ms) == 0 { "" }
+  else { joined(map(ms, measurement_text), " · ") ++ " — " };
+  "  " ++ mark(j.verdict) ++ " " ++ padded(j.row.name, width) ++ "  " ++ numbers
+    ++ criterion_text(j.row.criterion, ms)
+    ++ verdict_note(j.verdict)
+}
+
+pub fn rendered(r: Report) -> String = {
+  let width = fold(r.rows, 0, |w: Int, j: Judged| max(w, string_len(j.row.name)));
+  let head = r.title ++ "\nmeasured by " ++ r.provenance.runtime ++ " · corpus "
+    ++ r.provenance.corpus
+    ++ "\n\n";
+  fold(r.rows, head, |acc: String, j: Judged| acc ++ line(j, width) ++ "\n")
+}
+
+// --- The document ---------------------------------------------------------------------------
+
+pub fn measurement_json(m: Measurement) -> Json =
+  object([
+    { key: "name", value: Str(m.name) },
+    { key: "value", value: Number(m.value) },
+    { key: "unit", value: Str(m.unit) },
+  ])
+
+fn criterion_json(c: Criterion, ms: List<Measurement>) -> Json = {
+  let text = { key: "text", value: Str(criterion_text(c, ms)) };
+  match c {
+    AtMost(name, bound) ->
+      object([
+        { key: "rule", value: Str("at_most") },
+        { key: "measure", value: Str(name) },
+        { key: "bound", value: Number(bound) },
+        text,
+      ]),
+    AtLeast(name, bound) ->
+      object([
+        { key: "rule", value: Str("at_least") },
+        { key: "measure", value: Str(name) },
+        { key: "bound", value: Number(bound) },
+        text,
+      ]),
+    WithinRatio(name, other, ratio) ->
+      object([
+        { key: "rule", value: Str("within_ratio") },
+        { key: "measure", value: Str(name) },
+        { key: "of", value: Str(other) },
+        { key: "ratio", value: Number(ratio) },
+        text,
+      ]),
+    Holds(_, _) -> object([{ key: "rule", value: Str("holds") }, text]),
+  }
+}
+
+fn verdict_json(v: Verdict) -> Json =
+  match v {
+    Pass -> object([{ key: "outcome", value: Str("pass") }]),
+    Fail(ms) ->
+      object([
+        { key: "outcome", value: Str("fail") },
+        { key: "failed", value: array(map(ms, measurement_json)) },
+      ]),
+    Inconclusive(why) ->
+      object([{ key: "outcome", value: Str("inconclusive") }, { key: "why", value: Str(why) }]),
+  }
+
+fn judged_json(j: Judged) -> Json =
+  object([
+    { key: "name", value: Str(j.row.name) },
+    { key: "criterion", value: criterion_json(j.row.criterion, taken_of(j.row)) },
+    { key: "measurements", value: array(map(taken_of(j.row), measurement_json)) },
+    { key: "verdict", value: verdict_json(j.verdict) },
+    { key: "detail", value: j.row.detail },
+  ])
+
+pub fn to_json(r: Report) -> Json =
+  object(
+    fold(
+      r.context,
+      [
+        { key: "command", value: Str(r.command) },
+        { key: "title", value: Str(r.title) },
+        { key: "ok", value: Bool(all_passed(r.rows)) },
+        {
+          key: "provenance",
+          value: object([
+            { key: "corpus", value: Str(r.provenance.corpus) },
+            { key: "runtime", value: Str(r.provenance.runtime) },
+          ]),
+        },
+        { key: "rows", value: array(map(r.rows, judged_json)) },
+      ],
+      |acc: List<Member>, m: Member| push(acc, m),
+    ),
+  )
+
+// --- Tests ----------------------------------------------------------------------------------
+
+fn wall(ms: Int) -> Measurement = number("wall", ms, "ms")
+
+fn verdicts(rows: List<Row>) -> List<Verdict> = map(judge(rows), |j: Judged| j.verdict)
+
+fn a_provenance() -> Provenance = { corpus: "b3:c0ffee", runtime: "ply 0.16.0" }
+
+test "a bound passes at the bound and fails past it, with the number that broke it" {
+  assert_eq(verdicts([row("a", AtMost("wall", 10m), [wall(10)])]), [Pass]);
+  assert_eq(verdicts([row("a", AtMost("wall", 10m), [wall(11)])]), [Fail([wall(11)])]);
+  assert_eq(verdicts([row("a", AtLeast("wall", 10m), [wall(9)])]), [Fail([wall(9)])]);
+  assert_eq(verdicts([row("a", AtLeast("wall", 10m), [wall(12)])]), [Pass])
+}
+
+test "a criterion over a number nobody took is inconclusive, and says which" {
+  assert_eq(verdicts([row("a", AtMost("groups", 1m), [wall(1)])]), [
+    Inconclusive("`groups` was not measured"),
+  ]);
+  assert_eq(verdicts([untaken("a", AtMost("wall", 1m), "the run failed")]), [
+    Inconclusive("the run failed"),
+  ])
+}
+
+test "a ratio is judged against the row it names, and fails with both numbers" {
+  let first = row("first", holding("anything", [], |vs: List<Decimal>| true), [wall(100)]);
+  let slow = row("steady", WithinRatio("wall", "first", 2m), [wall(250)]);
+  let fine = row("steady", WithinRatio("wall", "first", 2m), [wall(150)]);
+  assert_eq(verdicts([first, fine]), [Pass, Pass]);
+  assert_eq(verdicts([first, slow]), [
+    Pass,
+    Fail([wall(250), { ..wall(100), name: "first.wall" }]),
+  ]);
+  assert_eq(verdicts([slow]), [Inconclusive("there is no `first` row to compare with")])
+}
+
+test "a predicate fails with the numbers it named" {
+  let c = holding(
+    "a leaf edit selects some and not most",
+    ["selected", "tests"],
+    |vs: List<Decimal>| match vs { [s, t] -> s > 0m && s * 2m <= t, _ -> false },
+  );
+  let ms = [number("selected", 7, "tests"), number("tests", 10, "tests"), wall(3)];
+  assert_eq(verdicts([row("leaf", c, ms)]), [
+    Fail([number("selected", 7, "tests"), number("tests", 10, "tests")]),
+  ]);
+  assert_eq(
+    verdicts([row("leaf", c, [number("selected", 2, "tests"), number("tests", 10, "tests")])]),
+    [Pass],
+  );
+  assert_eq(verdicts([row("leaf", c, [wall(1)])]), [
+    Inconclusive("not every one of selected, tests was measured"),
+  ])
+}
+
+test "a prefix renames a row and the row its ratio is against" {
+  let rows = prefixed("m4 ", [
+    row("first", AtMost("wall", 1m), [wall(1)]),
+    row("steady", WithinRatio("wall", "first", 2m), [wall(1)]),
+  ]);
+  assert_eq(map(rows, |r: Row| r.name), ["m4 first", "m4 steady"]);
+  assert_eq(verdicts(rows), [Pass, Pass])
+}
+
+test "the table leads with what measured it, and a failure shows its numbers" {
+  let r = report_of(
+    "bench",
+    "corpora/m4",
+    a_provenance(),
+    [
+      row("warm", AtMost("selected", 0m), [number("selected", 0, "tests"), wall(12)]),
+      row("rename", AtMost("selected", 0m), [number("selected", 3, "tests")]),
+    ],
+    [],
+  );
+  let text = rendered(r);
+  assert(string_starts_with(text, "corpora/m4\nmeasured by ply 0.16.0 · corpus b3:c0ffee\n"));
+  assert(
+    string_contains(
+      text,
+      "✓ warm    selected 0 tests · wall 12ms — selected at most 0 tests\n",
+    ),
+  );
+  assert(
+    string_contains(
+      text,
+      "✗ rename  selected 3 tests — selected at most 0 tests — FAIL: selected 3 tests\n",
+    ),
+  )
+}
+
+test "the document carries the rows, their criteria as rules, and the verdict's numbers" {
+  let r = report_of(
+    "bench",
+    "t",
+    a_provenance(),
+    [row("rename", AtMost("selected", 0m), [number("selected", 3, "tests")])],
+    [{ key: "root", value: Str("corpora/m4") }],
+  );
+  let doc = json::to_string(to_json(r));
+  assert(string_contains(doc, "\"ok\":false"));
+  assert(string_contains(doc, "\"root\":\"corpora/m4\""));
+  assert(
+    string_contains(doc, "\"provenance\":{\"corpus\":\"b3:c0ffee\",\"runtime\":\"ply 0.16.0\"}"),
+  );
+  assert(
+    string_contains(
+      doc,
+      "\"criterion\":{\"bound\":0,\"measure\":\"selected\",\"rule\":\"at_most\",\"text\":\"selected at most 0 tests\"}",
+    ),
+  );
+  assert(
+    string_contains(
+      doc,
+      "\"verdict\":{\"failed\":[{\"name\":\"selected\",\"unit\":\"tests\",\"value\":3}],\"outcome\":\"fail\"}",
+    ),
+  )
+}

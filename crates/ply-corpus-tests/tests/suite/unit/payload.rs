@@ -1,67 +1,90 @@
-use ply_corpus::payload::{
-    Checked, JSON_SRC, MAP_SRC, ORDER_SRC, derivation_cost, derived_module, json_shape, run_tests,
-    write_project,
-};
-use ply_store::Store;
+//! `payload`, end to end at sizes small enough for a test: the measurement programs verified by the
+//! product, a derived codec and `Map` priced in-process, `map_keys` compared across processes, and
+//! derivation priced by the product's own reports.
+
+use crate::support::{corpus, document, measured, outcome, row};
 
 #[test]
-fn every_measurement_program_compiles_and_its_own_test_passes() {
-    for (name, source) in [
-        ("payload.ply", JSON_SRC),
-        ("maps.ply", MAP_SRC),
-        ("order.ply", ORDER_SRC),
-    ] {
-        let dir = write_project(&[(name, source.to_string())]).unwrap();
-        let checked = Checked::open(dir.path())
-            .unwrap_or_else(|e| panic!("`{name}` does not compile: {e:#}"));
-        let mut store = Store::open(dir.path()).unwrap();
-        run_tests(&checked.loaded, &mut store)
-            .unwrap_or_else(|e| panic!("`{name}`'s own test failed: {e:#}"));
-    }
-}
-
-#[test]
-fn widening_a_field_grows_the_bytes_and_not_the_field_count() {
-    let points = json_shape(&[(2, 0), (2, 200), (8, 0)], 2, 1).unwrap();
-    let [narrow, wide, longer] = &points[..] else {
-        panic!("three points were asked for and {} came back", points.len());
-    };
-    assert_eq!(narrow.fields, wide.fields);
-    assert!(wide.payload_bytes > narrow.payload_bytes + 200);
-    assert!(longer.fields > narrow.fields && longer.payload_bytes > narrow.payload_bytes);
-    // Each half is timed on its own, so a zero means a half that did not run.
-    assert!(
-        narrow.parse_micros > 0.0 && narrow.codec_micros > 0.0,
-        "parse {} µs, codec {} µs of a {} µs decode",
-        narrow.parse_micros,
-        narrow.codec_micros,
-        narrow.decode_micros
+fn payload_prices_its_codec_maps_and_derivation_and_every_criterion_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = corpus(
+        dir.path(),
+        &[
+            "payload",
+            "--lines",
+            "2",
+            // Enough rounds that a microsecond clock sees each half of a decode on its own.
+            "--iterations",
+            "50",
+            "--shape",
+            "2:0,2:64",
+            "--entries",
+            "16",
+            "--types",
+            "4",
+            "--types-per-module",
+            "4",
+            "--processes",
+            "2",
+            "--repeats",
+            "1",
+            "--json",
+        ],
     );
-}
-
-#[test]
-fn the_two_derivation_variants_declare_the_same_types_and_the_same_tests() {
-    let plain = derived_module(0, 3, false);
-    let derived = derived_module(0, 3, true);
-    for i in 0..3 {
-        let decl = format!("pub type T0x{i} = ");
-        assert!(plain.contains(&decl) && derived.contains(&decl));
-        assert!(plain.contains(&format!("t0x{i} round-trips")));
-        assert!(derived.contains(&format!("t0x{i} round-trips")));
-    }
-    assert!(!plain.contains("derive json"));
-    assert_eq!(derived.matches("derive json for").count(), 3);
-}
-
-#[test]
-fn a_derivation_point_is_produced_for_both_variants() {
-    let points = derivation_cost(&[4], 4, 1).unwrap();
-    assert_eq!(points.len(), 2);
-    let derived = points.iter().find(|p| p.variant == "derived").unwrap();
-    let plain = points.iter().find(|p| p.variant == "plain").unwrap();
-    assert_eq!(derived.tests, plain.tests);
     assert!(
-        derived.definitions > plain.definitions,
-        "a derivation that added no definition is not a derivation"
+        out.status.success(),
+        "payload refused:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let report = document(&out);
+
+    // Every measurement program compiles and its own tests pass, run by the product.
+    let fixtures = row(&report, "fixtures");
+    assert_eq!(outcome(fixtures), "pass", "{fixtures:#}");
+
+    let json = row(&report, "json 2");
+    assert_eq!(outcome(json), "pass", "{json:#}");
+    assert!(measured(json, "payload") > 0.0);
+
+    // Widening a field grows the bytes and not the fields; each half of a decode was timed apart.
+    let narrow = row(&report, "shape 2:0");
+    let wide = row(&report, "shape 2:64");
+    for shape in [narrow, wide] {
+        assert_eq!(outcome(shape), "pass", "{shape:#}");
+    }
+    assert_eq!(measured(narrow, "fields"), measured(wide, "fields"));
+    assert_eq!(
+        measured(wide, "payload"),
+        measured(narrow, "payload") + 128.0,
+        "two lines each widened by 64 bytes"
+    );
+
+    let map = row(&report, "map 16");
+    assert_eq!(outcome(map), "pass", "{map:#}");
+
+    let order = row(&report, "order");
+    assert_eq!(outcome(order), "pass", "{order:#}");
+    assert_eq!(measured(order, "processes"), 2.0);
+
+    // The same types with and without a `derive`: the derived variant adds definitions and no test.
+    let derive = row(&report, "derive 4");
+    assert_eq!(outcome(derive), "pass", "{derive:#}");
+    assert_eq!(measured(derive, "plain_tests"), 4.0, "{derive:#}");
+    assert!(measured(derive, "derived_cache") > 0.0, "{derive:#}");
+
+    assert_eq!(report["ok"].as_bool(), Some(true), "{report:#}");
+    let left: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "payload left scratch behind: {left:?}");
+}
+
+#[test]
+fn a_shape_that_is_not_two_counts_is_refused_before_anything_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = corpus(dir.path(), &["payload", "--shape", "2:x"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("2:x"), "{stderr}");
 }
