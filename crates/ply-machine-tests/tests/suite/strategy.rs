@@ -3,13 +3,13 @@
 //! discharged each way, whatever the claim itself would have been decided to be.
 
 use crate::fixture::{loaded, project};
-use ply_eval::{DefHash, Span, Symbol, Value, codes};
+use ply_eval::{DefHash, SourceId, Span, Symbol, Value, codes};
 use ply_machine::engine::{Point, Prover};
 use ply_prove::domain::{Finite, Shape};
 use ply_prove::property::Outcome;
 use ply_prove::{
-    Binder, Discharge, Evidence, Gap, Obligation, ObligationKind, Points, ProvePlan, Rule, Sort,
-    Strategy, Unsettled, World,
+    Binder, Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, Points, ProvePlan,
+    Rule, Sort, Static, Strategy, Unsettled, Vacuity, VacuityKind, World,
 };
 
 const SOURCE: &str = r#"
@@ -52,6 +52,7 @@ fn law(owner: &str, binders: Vec<Binder>, strategy: Strategy) -> Obligation {
         variables: Vec::new(),
         footprint: Some("{m.db.read[users]}".to_string()),
         strategy,
+        guards: Vec::new(),
     }
 }
 
@@ -87,12 +88,25 @@ fn with_prover<R>(f: impl FnOnce(&Prover<'_>) -> R) -> R {
     let world = World::default();
     let backend =
         ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier");
-    let prover = Prover::new(&loaded, &world, backend).expect("the port lowers the claims");
-    f(&prover)
+    f(&Prover::new(&loaded, &world, backend))
 }
 
+/// Discharged with nothing settled statically, so the strategy is all there is.
 fn discharged(obligation: &Obligation) -> Discharge {
-    with_prover(|prover| prover.discharge_with(obligation, &ProvePlan::default()))
+    settled_as(obligation, &Static::Inconclusive)
+}
+
+fn settled_as(obligation: &Obligation, settled: &Static) -> Discharge {
+    with_prover(|prover| prover.discharge_with(obligation, &ProvePlan::default(), settled))
+}
+
+fn certificate() -> Certificate {
+    Certificate {
+        rules: vec![Rule::Propositional],
+        steps: 3,
+        guard_satisfiable: true,
+        sorts: Vec::new(),
+    }
 }
 
 #[test]
@@ -151,7 +165,7 @@ fn a_proposition_whose_entry_the_tier_declines_is_plys_failure_and_not_a_gap() {
     );
     with_prover(|prover| {
         let plan = ProvePlan::default();
-        let discharge = prover.discharge_with(&mismatched, &plan);
+        let discharge = prover.discharge_with(&mismatched, &plan, &Static::Inconclusive);
         let Discharge::Faulted(fault) = &discharge else {
             panic!("a declined entry was reported as {discharge:?}");
         };
@@ -194,14 +208,51 @@ fn a_proposition_that_raises_is_still_a_gap() {
     }
 }
 
-/// A proof never calls the owner, so the static attempt comes before the gap.
+/// A proof never calls the owner, so what the static prover settled comes before the gap.
 #[test]
 fn a_claim_the_static_prover_settles_is_proved_whatever_would_follow() {
-    let discharge = discharged(&over_a_bool("m.excluded middle", unhandled()));
-    let Discharge::Held(Evidence::Proof(certificate)) = &discharge else {
-        panic!("the static prover decides this: {discharge:?}");
+    let discharge = settled_as(
+        &over_a_bool("m.excluded middle", unhandled()),
+        &Static::Proved(certificate()),
+    );
+    assert!(
+        matches!(&discharge, Discharge::Held(Evidence::Proof(c)) if *c == certificate()),
+        "{discharge:?}"
+    );
+}
+
+#[test]
+fn a_guard_the_static_prover_refutes_is_vacuous_where_the_guard_is_written() {
+    let guard = Span::new(SourceId(0), 3, 8);
+    let guarded = Obligation {
+        guards: vec![guard],
+        ..over_a_bool(HALVING, Strategy::Static(Unsettled::Run(Points::Drawn)))
     };
-    assert!(certificate.rules.contains(&Rule::Propositional));
+    let discharge = settled_as(&guarded, &Static::Vacuous);
+    assert!(
+        matches!(
+            &discharge,
+            Discharge::Vacuous(Vacuity { guard: at, kind: VacuityKind::ProvedUnsatisfiable })
+                if *at == guard
+        ),
+        "{discharge:?}"
+    );
+}
+
+/// A proof over a domain the prover could not show inhabited stands once a case is kept there,
+/// however the points were run.
+#[test]
+fn an_unwitnessed_proof_stands_once_a_case_is_kept() {
+    for points in [both(), Points::Drawn] {
+        let discharge = settled_as(
+            &over_a_bool(HALVING, Strategy::Static(Unsettled::Run(points))),
+            &Static::NeedsWitness(certificate()),
+        );
+        assert!(
+            matches!(&discharge, Discharge::Held(Evidence::Proof(c)) if *c == certificate()),
+            "{discharge:?}"
+        );
+    }
 }
 
 #[test]
@@ -228,16 +279,13 @@ fn a_claim_handed_an_interleaving_search_is_searched_at_each_of_its_points() {
 }
 
 #[test]
-fn a_claim_searched_over_interleavings_has_no_static_reach_and_no_point_to_draw() {
+fn a_claim_searched_over_interleavings_has_no_point_to_draw() {
     with_prover(|prover| {
         let searched = over_a_bool(HALVING, Strategy::Interleave(Points::Drawn));
-        assert!(prover.reach(&searched, &ProvePlan::default()).is_none());
         assert!(matches!(
             prover.point_at(&searched, 0, 0, &ProvePlan::default()),
             Point::Undrawn(Gap::NotDrawn)
         ));
-        let attempted = over_a_bool(HALVING, Strategy::Static(Unsettled::Run(Points::Drawn)));
-        assert!(prover.reach(&attempted, &ProvePlan::default()).is_some());
     });
 }
 
@@ -280,7 +328,7 @@ fn a_refutation_is_re_run_at_the_root_and_case_it_came_from() {
             Strategy::Static(Unsettled::Run(Points::Drawn)),
         );
         let Discharge::Refuted(counterexample) =
-            prover.discharge_with(&obligation, &ProvePlan::default())
+            prover.discharge_with(&obligation, &ProvePlan::default(), &Static::Inconclusive)
         else {
             panic!("a false law over `Int` must be refuted, not skipped");
         };

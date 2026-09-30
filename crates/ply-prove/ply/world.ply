@@ -10,8 +10,8 @@
 import compiler.diag (parse_all)
 import compiler.front (Whole, Analysed, Refused, analyse)
 import compiler.infer (CtorInfo, DefInfo, LawBinder, LawInfo, SpecInfo)
-import compiler.items (Item, IFn, SEnsures, SRequires)
-import compiler.exprs (Param)
+import compiler.items (Item, IFn, ILaw, SEnsures, SRequires, SpecClause)
+import compiler.exprs (Param, expr_span)
 import compiler.hash (HashOutput, hex)
 import compiler.resolve (Diag, Mod, diag1, qualify)
 import compiler.spine (Span)
@@ -63,8 +63,8 @@ pub type Obligation = {
   result: Option<Binder>,
   // The name each type variable of the binders and the result prints as, by its number.
   variables: List<String>,
-  // A clause beside a `requires`, or a law with a `where`.
-  guarded: Bool,
+  // Where each guard is written: the owner's `requires` clauses in order, or a law's `where`.
+  guards: List<{ module: Int, start: Int, end: Int }>,
   // `law/host`: the body reaches the world.
   host: Bool,
   // The claim's own row as a report prints it, when it performs anything: `{sim.read}` for a law
@@ -87,6 +87,8 @@ pub type Built = { world: World, defs: List<Def>, laws: List<Written>, warnings:
 pub fn world_of(w: Whole, owned: (Bytes) -> Bool) -> Built = {
   let decls = decls_of(w.checked.ctors);
   let written = written_params(w.mods);
+  let wheres = law_guards(w.mods);
+  let requires = requires_of(w.mods);
   let keys = fold(
     w.hashes.specs,
     map_new(),
@@ -96,8 +98,9 @@ pub fn world_of(w: Whole, owned: (Bytes) -> Bool) -> Built = {
   let defs = filter(w.checked.defs, |d: DefInfo| owned(d.module));
   let laws = filter(w.checked.laws, |l: LawInfo| owned(l.module));
   let clauses = fold(defs, { obligations: [], warnings: [] }, |acc: Owed, d: DefInfo|
-    clauses_of(acc, d, written, keys, decls));
-  let owed = fold(laws, clauses, |acc: Owed, l: LawInfo| law_of(acc, l, w.hashes.laws, decls));
+    clauses_of(acc, d, written, requires, keys, decls));
+  let owed = fold(laws, clauses, |acc: Owed, l: LawInfo|
+    law_of(acc, l, w.hashes.laws, wheres, decls));
   {
     world: {
       decls: decls,
@@ -326,6 +329,33 @@ fn written_params(mods: List<Mod>) -> Map<Bytes, List<Bytes>> =
         _ -> a,
       }))
 
+// Each definition's `requires` expressions, in order, by program-wide name.
+fn requires_of(mods: List<Mod>) -> Map<Bytes, List<Span>> =
+  fold(mods, map_new(), |acc: Map<Bytes, List<Span>>, m: Mod|
+    fold(m.module.items, acc, |a: Map<Bytes, List<Span>>, it: Item|
+      match it {
+        IFn(d) ->
+          map_insert(
+            a,
+            qualify(m.name, d.name.name),
+            map(filter(d.spec, |c: SpecClause| c.kind == SRequires), |c: SpecClause|
+              expr_span(c.expr)),
+          ),
+        _ -> a,
+      }))
+
+// Each law's `where`, by program-wide name.
+fn law_guards(mods: List<Mod>) -> Map<Bytes, Span> =
+  fold(mods, map_new(), |acc: Map<Bytes, Span>, m: Mod|
+    fold(m.module.items, acc, |a: Map<Bytes, Span>, it: Item|
+      match it {
+        ILaw(d) -> match d.guard {
+          Some(g) -> map_insert(a, qualify(m.name, d.name), expr_span(g)),
+          None -> a,
+        },
+        _ -> a,
+      }))
+
 // What an `ensures` leaves alone is everything outside the resources its owner's row writes; one
 // printer names them, so two label variables read apart.
 fn frame_of(footprint: List<Atom>) -> Frame = {
@@ -376,6 +406,7 @@ fn clauses_of(
   acc: Owed,
   d: DefInfo,
   written: Map<Bytes, List<Bytes>>,
+  requires: Map<Bytes, List<Span>>,
   keys: Map<Bytes, List<Bytes>>,
   decls: List<Decl>,
 ) -> Owed = {
@@ -391,7 +422,8 @@ fn clauses_of(
     let printed = binders_of(push(params, { name: b"result", ty: shape.ret }));
     let binders = map(range(0, len(params)), |i: Int| at(printed.binders, i));
     let result = list_at(printed.binders, len(params));
-    let guarded = fold(d.spec, false, |g: Bool, s: SpecInfo| g || s.kind == SRequires);
+    let guards = map(match map_get(requires, d.name) { Some(ss) -> ss, None -> [] }, |g: Span|
+      at_of(d.at.module, g));
     let frame = frame_of(d.footprint);
     let strategy = clause_strategy(footprint_text(d.footprint), binders, decls);
     let hashed = match map_get(keys, d.name) { Some(hs) -> hs, None -> [] };
@@ -410,7 +442,7 @@ fn clauses_of(
               binders: binders,
               result: result,
               variables: printed.variables,
-              guarded: guarded,
+              guards: guards,
               host: false,
               footprint: footprint_text(clause.footprint),
               frame: frame,
@@ -424,7 +456,13 @@ fn clauses_of(
 
 // A law's own row is empty, or a read of a simulation no program can write, so it leaves
 // everything alone.
-fn law_of(acc: Owed, l: LawInfo, hashes: List<Bytes>, decls: List<Decl>) -> Owed =
+fn law_of(
+  acc: Owed,
+  l: LawInfo,
+  hashes: List<Bytes>,
+  wheres: Map<Bytes, Span>,
+  decls: List<Decl>,
+) -> Owed =
   match list_at(hashes, l.index) {
     None -> { ..acc, warnings: push(acc.warnings, unhashed(l.key, l.at.module, l.at.span)) },
     Some(key) -> {
@@ -440,7 +478,7 @@ fn law_of(acc: Owed, l: LawInfo, hashes: List<Bytes>, decls: List<Decl>) -> Owed
           binders: printed.binders,
           result: None,
           variables: printed.variables,
-          guarded: l.has_guard,
+          guards: match map_get(wheres, l.key) { Some(g) -> [at_of(l.at.module, g)], None -> [] },
           host: l.host,
           footprint: footprint,
           frame: Pure,
@@ -531,7 +569,8 @@ test "a clause's binders are its owner's parameters as written, and its result i
   ]);
   assert_eq(o.result, Some({ name: "result", ty: Var(0), text: "a" }));
   assert_eq(o.variables, ["a", "b"]);
-  assert(o.guarded);
+  // One `requires`, where its proposition is written.
+  assert_eq(map(o.guards, |g: { module: Int, start: Int, end: Int }| g.start), [49]);
   assert_eq(o.frame, Pure);
   assert_eq(o.footprint, None);
   assert_eq(string_len(o.key), 64);
@@ -557,7 +596,7 @@ test "every binder of one law shares one numbering, so two variables never read 
   assert_eq(map(o.binders, |b: Binder| b.text), ["a", "b", "(a) -> List<b>"]);
   assert_eq(o.variables, ["a", "b"]);
   assert_eq(o.result, None);
-  assert(!o.guarded)
+  assert_eq(o.guards, [])
 }
 
 // A report names a sampled variable, and one a proof left uninterpreted, by these names.
@@ -684,4 +723,16 @@ test "only a counterexample drawn one point at a time is walked down" {
   assert(!walks(Static(Unhandled("{m.store.read}"))));
   assert(!walks(Interleave(Drawn)));
   assert(!walks(Interleave(every)))
+}
+
+test "a law's guard is its `where`, where it is written" {
+  let os = owned_by(
+    built_of(b"law \"bounded\" forall (x: Int) where x > 0 { x + 0 == x }\n").world.obligations,
+    "m.bounded",
+  );
+  assert_eq(
+    map(os, |o: Obligation|
+      map(o.guards, |g: { module: Int, start: Int, end: Int }| (g.start, g.end))),
+    [[(36, 41)]],
+  )
 }

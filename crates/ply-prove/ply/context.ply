@@ -1,0 +1,286 @@
+// `context` — the facts about a program the static prover reads, indexed once per run: each lowered
+// body and clause from `compiler.front.claims`, and the declared types and signatures of the world.
+
+import compiler.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
+                      NPerform, NLabel, NCell, NLambda, NSim, NHandle, NField, NUpd, CStmt, CLet,
+                      CLetPat, CDo, CField, CArm, CClause)
+import compiler.front (Claim, ClaimDef, ClaimSum, ClaimLaw, ClaimClause, Lowered)
+import compiler.hash (tarjan)
+import domain (Ty, Var, Fn, Record, Con, Decl, Variant)
+import sort (canonical, is_pure_fn)
+import world (Signature, World)
+
+// A definition as the prover reads it: its body (`None` when the lowering did not take it), its
+// clauses, and every global its body names, which is what its place in the call graph is made of.
+pub type Def = { params: Int, body: Option<Code>, spec: List<ClaimClause>, refs: List<String> }
+
+pub type Law = { guard: Option<Lowered>, body: Option<Code> }
+
+pub type Claims = { defs: Map<String, Def>, laws: Map<String, Law>, sums: Map<String, Int> }
+
+// A constructor beside the type it builds.
+pub type Ctor = { decl: Decl, variant: Variant }
+
+pub type Context = {
+  claims: Claims,
+  decls: Map<String, Decl>,
+  ctors: Map<String, Ctor>,
+  signatures: Map<String, Signature>,
+  recursive: Map<String, Bool>,
+  // A component of one definition calling itself: the shape induction unrolls.
+  self_recursive: Map<String, Bool>,
+  // The sum types a case split may range over.
+  sums: Map<String, Bool>,
+  inhabited: Map<String, Bool>,
+  // Nominal types whose declaration reaches a `Float`.
+  float_types: Map<String, Bool>,
+}
+
+fn text(b: Bytes) -> String = string_of_bytes_lossy(b)
+
+pub fn claims_of(cs: List<Claim>) -> Claims =
+  fold(cs, { defs: map_new(), laws: map_new(), sums: map_new() }, |acc: Claims, c: Claim|
+    match c {
+      ClaimDef(d) ->
+        {
+          ..acc,
+          defs: map_insert(acc.defs, text(d.name), {
+            params: d.params,
+            body: d.body,
+            spec: d.spec,
+            refs: match d.body { Some(b) -> refs_of(b, []), None -> [] },
+          }),
+        },
+      ClaimLaw(l) ->
+        { ..acc, laws: map_insert(acc.laws, text(l.key), { guard: l.guard, body: l.body }) },
+      ClaimSum(s) -> { ..acc, sums: map_insert(acc.sums, text(s.name), s.variants) },
+    })
+
+// Every global a body names, even under an effect the prover treats as opaque.
+pub fn refs_of(c: Code, acc: List<String>) -> List<String> =
+  match c.node {
+    NVar(v) -> match v.slot { Some(_) -> acc, None -> push(acc, text(v.name)) },
+    NLit(_) -> acc,
+    NLabel(_) -> acc,
+    NUnary(u) -> refs_of(u.operand, acc),
+    NBinary(b) -> refs_of(b.rhs, refs_of(b.lhs, acc)),
+    NApp(a) -> fold(a.args, refs_of(a.func, acc), |s: List<String>, x: Code| refs_of(x, s)),
+    NIf(i) -> refs_of(i.else_branch, refs_of(i.then_branch, refs_of(i.cond, acc))),
+    NBlock(b) -> {
+      let stmts = fold(b.stmts, acc, |s: List<String>, st: CStmt|
+        match st {
+          CLet(l) -> refs_of(l.value, s),
+          CLetPat(l) -> refs_of(l.value, s),
+          CDo(d) -> refs_of(d.code, s),
+        });
+      match b.tail { Some(t) -> refs_of(t, stmts), None -> stmts }
+    },
+    NList(l) -> fold(l.items, acc, |s: List<String>, x: Code| refs_of(x, s)),
+    NRecord(r) -> fold(r.fields, acc, |s: List<String>, f: CField| refs_of(f.value, s)),
+    NMatch(m) ->
+      fold(m.arms, refs_of(m.scrutinee, acc), |s: List<String>, a: CArm|
+        refs_of(a.body, match a.guard { Some(g) -> refs_of(g, s), None -> s })),
+    NPerform(p) -> fold(p.args, acc, |s: List<String>, x: Code| refs_of(x, s)),
+    NCell(cell) -> refs_of(cell.body, refs_of(cell.init, acc)),
+    NLambda(l) -> refs_of(l.body, acc),
+    NSim(s) -> refs_of(s.body, acc),
+    NHandle(h) -> {
+      let clauses = fold(h.clauses, refs_of(h.body, acc), |s: List<String>, cl: CClause|
+        refs_of(cl.body, s));
+      match h.ret { Some(r) -> refs_of(r.body, clauses), None -> clauses }
+    },
+    NField(f) -> refs_of(f.base, acc),
+    NUpd(u) -> fold(u.sets, refs_of(u.base, acc), |s: List<String>, f: CField| refs_of(f.value, s)),
+  }
+
+fn set_of(names: List<String>) -> Map<String, Bool> =
+  fold(names, map_new(), |m: Map<String, Bool>, n: String| map_insert(m, n, true))
+
+fn holds(set: Map<String, Bool>, name: String) -> Bool = map_contains(set, name)
+
+fn canonical_decl(d: Decl) -> Decl =
+  { ..d, variants: map(d.variants, |v: Variant| { ..v, fields: map(v.fields, canonical) }) }
+
+pub fn context(claims: Claims, world: World) -> Context = {
+  let decls = map(world.decls, canonical_decl);
+  let by_name = fold(decls, map_new(), |m: Map<String, Decl>, d: Decl| map_insert(m, d.name, d));
+  let ctors = fold(decls, map_new(), |m: Map<String, Ctor>, d: Decl|
+    fold(d.variants, m, |acc: Map<String, Ctor>, v: Variant|
+      map_insert(acc, v.name, { decl: d, variant: v })));
+  // A split over a partial list is unsound, so a type the lowered claims count otherwise is never
+  // split on; aliases and builtins have no constructors, so they are not sums at all.
+  let sums = set_of(
+    map(
+      filter(decls, |d: Decl|
+        len(d.variants) > 0
+          && (match map_get(claims.sums, d.name) {
+            Some(n) -> n == len(d.variants),
+            None -> true,
+          })),
+      |d: Decl| d.name,
+    ),
+  );
+  let rec = recursive_definitions(claims.defs);
+  {
+    claims: claims,
+    decls: by_name,
+    ctors: ctors,
+    signatures: fold(world.signatures, map_new(), |m: Map<String, Signature>, s: Signature|
+      map_insert(m, s.name, { ..s, ty: canonical(s.ty) })),
+    recursive: rec.recursive,
+    self_recursive: rec.alone,
+    sums: sums,
+    inhabited: inhabited_sum_types(decls, sums),
+    float_types: float_reaching_types(decls),
+  }
+}
+
+// Through its arguments, its fields, or its own declaration.
+pub fn reaches_float(cx: Context, t: Ty) -> Bool = reaches(t, cx.float_types)
+
+fn reaches(t: Ty, declared: Map<String, Bool>) -> Bool =
+  match t {
+    Con(name, args) ->
+      (name == "Float" && len(args) == 0) || holds(declared, name)
+        || fold(args, false, |f: Bool, a: Ty| f || reaches(a, declared)),
+    Fn(params, ret, _) ->
+      fold(params, false, |f: Bool, p: Ty| f || reaches(p, declared)) || reaches(ret, declared),
+    Record(fields) ->
+      fold(fields, false, |f: Bool, x: { name: String, ty: Ty }| f || reaches(x.ty, declared)),
+    Var(_) -> false,
+  }
+
+pub fn ctor(cx: Context, name: String) -> Option<Ctor> = map_get(cx.ctors, name)
+
+pub fn arity(c: Ctor) -> Int = len(c.variant.fields)
+
+// The type over its own parameters.
+pub fn decl_sort(d: Decl) -> Ty = Con(d.name, map(range(0, d.params), |p: Int| Var(p)))
+
+// As a value: the type it builds, or a pure function to it from its fields.
+pub fn ctor_sort(c: Ctor) -> Ty =
+  if len(c.variant.fields) == 0 { decl_sort(c.decl) }
+  else { Fn(c.variant.fields, decl_sort(c.decl), true) }
+
+// `None` unless every constructor is in hand: a split over a partial list is unsound.
+pub fn variants(cx: Context, type_name: String) -> Option<Decl> =
+  if holds(cx.sums, type_name) { map_get(cx.decls, type_name) } else { None }
+
+pub fn signature(cx: Context, name: String) -> Option<Signature> = map_get(cx.signatures, name)
+
+pub fn inhabited(cx: Context, t: Ty) -> Bool =
+  match t {
+    Var(_) -> true,
+    Fn(_, ret, _) -> inhabited(cx, ret),
+    Record(fields) ->
+      fold(fields, true, |ok: Bool, f: { name: String, ty: Ty }| ok && inhabited(cx, f.ty)),
+    Con(name, _) -> !holds(cx.sums, name) || holds(cx.inhabited, name),
+  }
+
+// Whether equal calls must answer equally, so they may share one term.
+pub fn is_pure(cx: Context, name: String) -> Bool =
+  match signature(cx, name) {
+    None -> false,
+    Some(s) -> s.pure && (match s.ty { Fn(_, _, pure) -> pure, _ -> true }),
+  }
+
+pub fn is_recursive(cx: Context, name: String) -> Bool = holds(cx.recursive, name)
+
+// Not in a recursive component, with an empty footprint, and with a body the lowering reached.
+pub fn unfoldable(cx: Context, name: String) -> Option<Def> =
+  if holds(cx.recursive, name) { None } else { reached_pure(cx, name) }
+
+// Calling only itself, with an empty footprint, and with a body the lowering reached: what induction
+// may unroll once it has shown the recursion decreases.
+pub fn self_recursive(cx: Context, name: String) -> Option<Def> =
+  if holds(cx.self_recursive, name) { reached_pure(cx, name) } else { None }
+
+fn reached_pure(cx: Context, name: String) -> Option<Def> =
+  match signature(cx, name) {
+    None -> None,
+    Some(s) -> if !s.pure { None } else {
+      match map_get(cx.claims.defs, name) {
+        Some(d) -> match d.body { Some(_) -> Some(d), None -> None },
+        None -> None,
+      }
+    },
+  }
+
+// A least fixed point, so chains of declarations and recursive ones both settle.
+fn float_reaching_types(decls: List<Decl>) -> Map<String, Bool> =
+  iterate(map_new(), len(decls) + 1, |found: Map<String, Bool>| {
+    let grown = fold(decls, found, |acc: Map<String, Bool>, d: Decl|
+      if holds(acc, d.name) { acc }
+      else if fold(d.variants, false, |f: Bool, v: Variant|
+          f || fold(v.fields, false, |g: Bool, t: Ty| g || reaches(t, found))) {
+        map_insert(acc, d.name, true)
+      } else { acc });
+    if map_len(grown) == map_len(found) { Stop(found) } else { Continue(grown) }
+  })
+
+// Least fixed point: a type is inhabited once every field of some constructor is.
+fn inhabited_sum_types(decls: List<Decl>, sums: Map<String, Bool>) -> Map<String, Bool> =
+  iterate(map_new(), len(decls) + 1, |found: Map<String, Bool>| {
+    let grown = fold(
+      filter(decls, |d: Decl| holds(sums, d.name)),
+      found,
+      |acc: Map<String, Bool>, d: Decl|
+        if holds(acc, d.name) { acc }
+        else if fold(d.variants, false, |f: Bool, v: Variant|
+            f || fold(v.fields, true, |ok: Bool, t: Ty| ok && field_inhabited(t, sums, found))) {
+          map_insert(acc, d.name, true)
+        } else { acc },
+    );
+    if map_len(grown) == map_len(found) { Stop(found) } else { Continue(grown) }
+  })
+
+fn field_inhabited(t: Ty, sums: Map<String, Bool>, inhabited: Map<String, Bool>) -> Bool =
+  match t {
+    Var(_) -> true,
+    Fn(_, ret, _) -> field_inhabited(ret, sums, inhabited),
+    Record(fields) ->
+      fold(fields, true, |ok: Bool, f: { name: String, ty: Ty }|
+        ok && field_inhabited(f.ty, sums, inhabited)),
+    Con(name, _) -> if holds(sums, name) { holds(inhabited, name) } else { true },
+  }
+
+// Definitions in a call-graph cycle, and among them the ones whose cycle is only themselves.
+fn recursive_definitions(
+  defs: Map<String, Def>,
+) -> { recursive: Map<String, Bool>, alone: Map<String, Bool> } = {
+  let names = map_keys(defs);
+  let index = fold(range(0, len(names)), map_new(), |m: Map<String, Int>, i: Int|
+    match list_at(names, i) { Some(n) -> map_insert(m, n, i), None -> m });
+  let edges = map(names, |n: String|
+    match map_get(defs, n) {
+      Some(d) ->
+        fold(d.refs, [], |acc: List<Int>, r: String|
+          match map_get(index, r) {
+            Some(i) -> if fold(acc, false, |f: Bool, x: Int| f || x == i) { acc }
+            else { push(acc, i) },
+            None -> acc,
+          }),
+      None -> [],
+    });
+  fold(
+    tarjan(len(names), edges),
+    { recursive: map_new(), alone: map_new() },
+    |acc: { recursive: Map<String, Bool>, alone: Map<String, Bool> }, component: List<Int>| {
+      let self_loop = match component {
+        [v] -> match list_at(edges, v) {
+          Some(es) -> fold(es, false, |f: Bool, w: Int| f || w == v),
+          None -> false,
+        },
+        _ -> false,
+      };
+      let named = map(component, |v: Int| match list_at(names, v) { Some(n) -> n, None -> "" });
+      let alone = if self_loop {
+        fold(named, acc.alone, |m: Map<String, Bool>, n: String| map_insert(m, n, true))
+      } else { acc.alone };
+      let recursive = if len(component) > 1 || self_loop {
+        fold(named, acc.recursive, |m: Map<String, Bool>, n: String| map_insert(m, n, true))
+      } else { acc.recursive };
+      { recursive: recursive, alone: alone }
+    },
+  )
+}

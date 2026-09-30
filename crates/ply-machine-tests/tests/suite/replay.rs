@@ -24,7 +24,6 @@ nondet effect prover {
   read discharged[claims](choice: Choice) -> Result<Verdicts, Refusal>
   write record[claims](entries: List<{ at: Int, key: String }>) -> List<Unit>
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
-  read reaches[claims](claims: List<Int>) -> Result<List<Unit>, Refusal>
   read baselines[claims](names: List<String>) -> List<Baseline>
   write accepted[claims](records: List<Baseline>) -> Accepted
 }

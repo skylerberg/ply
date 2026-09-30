@@ -7,14 +7,8 @@ use crate::load::{
     unreadable,
 };
 use ply_codegen::c::producer;
-use ply_eval::decode::{self, At};
-use ply_eval::{
-    Diagnostic, Front, ModuleInfo, ModuleName, SourceId, SourceMap, Span, Symbol,
-    Value as PlyValue, codes,
-};
-use ply_prove::prove::{Claims, read_claims};
-use ply_store::{ContentHash, Store};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use ply_eval::{Diagnostic, Front, ModuleName, SourceId, SourceMap, Span, codes};
+use ply_store::ContentHash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -152,147 +146,6 @@ pub fn load_over_front(path: &Path, handed: &HandedFront) -> Result<Loaded, Load
 pub(crate) fn run(path: &Path) -> Result<Loaded, LoadError> {
     let (root, discovered) = discover(path).map_err(LoadError::bare)?;
     Driver::new(root, discovered)?.finish()
-}
-
-/// The port's lowered claims, kept per module: a module's part is reused while its text and the
-/// texts of all it imports are unchanged, and the rest are asked with all they import, so the port
-/// sees a closed program.
-pub fn claims(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, String> {
-    let modules: Vec<&ModuleInfo> = loaded.check.modules.values().collect();
-    let texts = modules
-        .iter()
-        .map(|m| {
-            loaded
-                .sources
-                .get(m.source)
-                .map(|f| f.text.clone())
-                .ok_or_else(|| format!("module `{}` has no source text", m.name))
-        })
-        .collect::<Result<Vec<Arc<str>>, String>>()?;
-    let by_module: BTreeMap<Symbol, usize> = modules
-        .iter()
-        .enumerate()
-        .map(|(i, m)| (m.name.as_symbol().clone(), i))
-        .collect();
-    let reach = |from: &[usize]| reaching(from, |i| modules[i].imports.as_slice(), &by_module);
-
-    let store = store.filter(|_| loaded.frontend.incremental);
-    let keys: Vec<ContentHash> = if store.is_some() {
-        let emitter = ply_codegen::c::producer::emitter();
-        let contents: Vec<ContentHash> = texts
-            .iter()
-            .map(|t| ContentHash::of(t.as_bytes()))
-            .collect();
-        (0..modules.len())
-            .map(|i| {
-                let reached = reach(&[i]).into_iter();
-                let reached = reached.map(|j| (modules[j].name.as_str(), &contents[j]));
-                module_key("claims", &emitter, &modules[i].name, reached)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut parts: Vec<Option<(Vec<u8>, Claims)>> = (0..modules.len())
-        .map(|i| {
-            let bytes = store.as_deref()?.claims_part(keys[i])?;
-            let part = ply_eval::codec::decode(&bytes).ok()?;
-            let read = claims_part(&part, modules[i].source).ok()?;
-            Some((bytes, read))
-        })
-        .collect();
-
-    let missed: Vec<usize> = (0..parts.len()).filter(|&i| parts[i].is_none()).collect();
-    if !missed.is_empty() {
-        let asked = reach(&missed);
-        let sources: Vec<(String, String)> = asked
-            .iter()
-            .map(|&i| (modules[i].name.to_string(), texts[i].to_string()))
-            .collect();
-        let mod_pkg: Vec<usize> = asked
-            .iter()
-            .map(|&i| loaded.front.mod_pkg.get(i).copied().unwrap_or(0))
-            .collect();
-        let answer = producer::claims(&sources, &loaded.front.packages, &mod_pkg)
-            .map_err(|e| format!("{e:#}"))?;
-        let items: HashMap<&str, usize> = modules
-            .iter()
-            .enumerate()
-            .flat_map(|(i, m)| m.items.iter().map(move |name| (name.as_str(), i)))
-            .collect();
-        let laws: HashMap<&str, usize> = loaded
-            .check
-            .laws
-            .iter()
-            .filter_map(|law| Some((law.key.as_str(), *by_module.get(law.module.as_symbol())?)))
-            .collect();
-        let unread = |e: decode::Error| format!("its answer does not read: {e}");
-        let answer = At::new("`front.claims`' answer", &answer);
-        for (&i, part) in asked
-            .iter()
-            .zip(split_claims(answer, &asked, &items, &laws).map_err(unread)?)
-        {
-            let read = claims_part(&part, modules[i].source).map_err(unread)?;
-            let bytes = ply_eval::codec::encode(&part)
-                .map_err(|e| format!("a module's claims do not encode: {e}"))?;
-            parts[i] = Some((bytes, read));
-        }
-        if let Some(store) = store {
-            let filed = keys
-                .iter()
-                .zip(&parts)
-                .filter_map(|(key, part)| Some((*key, part.as_ref()?.0.clone())))
-                .collect();
-            store.put_claims_parts(filed);
-        }
-    }
-
-    let mut claims = Claims::default();
-    for (_, read) in parts.into_iter().flatten() {
-        claims.defs.extend(read.defs);
-        claims.laws.extend(read.laws);
-        claims.sums.extend(read.sums);
-    }
-    Ok(claims)
-}
-
-/// Each asked module's part, as the store keeps it: its position among `asked`, which its spans
-/// index, and the claims it owns.
-fn split_claims(
-    answer: At<'_>,
-    asked: &[usize],
-    items: &HashMap<&str, usize>,
-    laws: &HashMap<&str, usize>,
-) -> Result<Vec<PlyValue>, decode::Error> {
-    let mut owned: Vec<Vec<PlyValue>> = vec![Vec::new(); asked.len()];
-    for claim in answer.list()? {
-        let c = claim.ctor()?;
-        let owner = match c.name() {
-            "ClaimLaw" => laws.get(c.arg(0)?.field("key")?.utf8()?),
-            _ => items.get(c.arg(0)?.field("name")?.utf8()?),
-        };
-        let at = owner
-            .and_then(|i| asked.iter().position(|j| j == i))
-            .ok_or_else(|| claim.error("a claim of no module asked"))?;
-        owned[at].push(claim.value().clone());
-    }
-    Ok(owned
-        .into_iter()
-        .enumerate()
-        .map(|(at, claims)| {
-            crate::payload::record(vec![
-                ("at", crate::payload::count(at)),
-                ("claims", PlyValue::list(claims)),
-            ])
-        })
-        .collect())
-}
-
-/// A module's claims span only it, so every position up to its own reads as its source.
-fn claims_part(part: &PlyValue, source: SourceId) -> Result<Claims, decode::Error> {
-    let part = At::new("a module's claims", part);
-    let at: usize = part.field("at")?.number()?;
-    read_claims(part.field("claims")?, &vec![source; at + 1])
 }
 
 struct FileState {
@@ -714,45 +567,6 @@ fn port_failed(why: &str) -> Diagnostic {
     .primary(Span::DUMMY, "nothing was checked, so nothing is claimed")
     .note("this is Ply's fault: the compiler's own front end is what failed here")
     .note("the emitter comes from `crates/ply-compiler/bootstrap`; sources with no bundle are emitted by the one this binary carries")
-}
-
-/// `from` and every module it imports, transitively, in order.
-fn reaching<'a>(
-    from: &[usize],
-    imports: impl Fn(usize) -> &'a [ModuleName],
-    by_module: &BTreeMap<Symbol, usize>,
-) -> Vec<usize> {
-    let mut seen: BTreeSet<usize> = from.iter().copied().collect();
-    let mut stack = from.to_vec();
-    while let Some(i) = stack.pop() {
-        for imported in imports(i) {
-            if let Some(&j) = by_module.get(imported.as_symbol())
-                && seen.insert(j)
-            {
-                stack.push(j);
-            }
-        }
-    }
-    seen.into_iter().collect()
-}
-
-/// A module's `kind` of answer is fixed by the emitter and the texts of all the module reaches.
-fn module_key<'a>(
-    kind: &str,
-    emitter: &str,
-    module: &ModuleName,
-    reached: impl Iterator<Item = (&'a str, &'a ContentHash)>,
-) -> ContentHash {
-    let mut reached: Vec<(&str, &ContentHash)> = reached.collect();
-    reached.sort_unstable();
-    let mut key = format!("{kind}\0{emitter}\0{module}").into_bytes();
-    for (name, content) in reached {
-        key.push(0);
-        key.extend_from_slice(name.as_bytes());
-        key.push(0);
-        key.extend_from_slice(&content.0);
-    }
-    ContentHash::of(&key)
 }
 
 /// Files in load order, then items as written; the port answers dependency-first.

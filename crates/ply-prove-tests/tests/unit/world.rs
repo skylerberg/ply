@@ -105,7 +105,14 @@ fn obligation(
             "variables",
             Value::list(variables.iter().map(|v| Value::str(*v)).collect()),
         ),
-        ("guarded", Value::Bool(true)),
+        (
+            "guards",
+            Value::list(vec![record(vec![
+                ("module", Value::Int(0)),
+                ("start", Value::Int(3)),
+                ("end", Value::Int(9)),
+            ])]),
+        ),
         ("host", Value::Bool(false)),
         ("footprint", none()),
         ("frame", Value::ctor("proof.obligation.Pure", Vec::new())),
@@ -468,9 +475,11 @@ fn a_world_reads_its_types_its_signatures_and_its_obligations() {
     assert_eq!(o.kind, ObligationKind::Ensures { index: 1 });
     assert_eq!(o.span, Span::new(SourceId(0), 12, 30));
     assert!(o.footprint.is_none());
+    assert_eq!(o.guards, [Span::new(SourceId(0), 3, 9)]);
     assert_eq!(
-        o.all_binders()
+        o.binders
             .iter()
+            .chain(&o.result)
             .map(|b| (b.name.as_str(), b.sort.clone(), b.text.as_str()))
             .collect::<Vec<_>>(),
         [
