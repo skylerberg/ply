@@ -33,6 +33,32 @@ fn every_marshalled_type_is_declared_where_this_side_says() {
     }
 }
 
+/// The claims family names a refusal by the module that declares `prover`, so the program has to
+/// declare its `Refusal` there too.
+#[test]
+fn the_refusal_is_declared_beside_the_effect_it_is_named_by() {
+    let loaded = ply_machine::load::load(&cli_root()).expect("the CLI tree loads");
+    let prover = loaded
+        .check
+        .effects
+        .values()
+        .find(|e| e.simple_name.as_str() == "prover")
+        .expect("the CLI declares `prover`");
+    assert!(
+        loaded
+            .check
+            .ctors
+            .values()
+            .any(
+                |c| c.type_name.as_str().rsplit('.').next() == Some("Refusal")
+                    && c.module == prover.module
+            ),
+        "`Refusal` is not declared in `{}`, where `prover` is, so a refusal names nothing the \
+         program matches",
+        prover.module
+    );
+}
+
 /// Every case the tester builds has to be one the program declares, of the type and in the module
 /// the tester says: a case name that names nothing is a placeless `no arm of this match matched`
 /// the moment the program matches the value.

@@ -376,3 +376,72 @@ fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
         ]
     );
 }
+
+fn manifest(name: &str, deps: &str) -> String {
+    format!(
+        "import std.pkg (Manifest)\nfn package() -> Manifest = {{name: \"{name}\", version: {{major: 0, minor: 0, patch: 1}}, prefix: None, runtime: {{major: 0, minor: 0, patch: 1}}, dependencies: [{deps}], entry: None}}\n"
+    )
+}
+
+/// Derived, because a filter naming no test runs nothing and exits 0, which reads as a pass.
+fn own_test_name(leaf: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_binary, module)) => format!("{module}::{leaf}"),
+        None => leaf.to_string(),
+    }
+}
+
+/// A load rooted at `.` joins the directory `ply vendor` wrote onto `.`, and the vendored package
+/// still supplies its modules. `.` is only ever the working directory, which a process shares with
+/// every test in it, so the load runs in a process of its own, inside the project.
+#[test]
+fn a_project_rooted_at_the_working_directory_reads_what_it_vendored() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app");
+    let lib = "{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"../lib\")}";
+    write(&app, "ply.pkg", &manifest("app", lib));
+    write(
+        &app,
+        "main.ply",
+        "import lib.answer\nfn main() -> Int = answer::answer()\n",
+    );
+    // No `../lib` exists: only the vendored copy can answer the want.
+    write(&app, "vendor/index", "../lib\tvendor/lib\n");
+    write(&app, "vendor/lib/ply.pkg", &manifest("lib", ""));
+    write(
+        &app,
+        "vendor/lib/answer.ply",
+        "pub fn answer() -> Int = 7\n",
+    );
+
+    let name = own_test_name("the_vendored_project_here_loads");
+    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([name.as_str(), "--exact", "--ignored", "--nocapture"])
+        .current_dir(&app)
+        .output()
+        .expect("the test binary runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the load rooted at `.` refused:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran no test matching `{name}`, and a filter that matches nothing exits 0:\n{stdout}"
+    );
+}
+
+#[test]
+#[ignore = "run by the vendoring test above, from inside the project it lays out"]
+fn the_vendored_project_here_loads() {
+    let loaded = load(Path::new(".")).unwrap_or_else(|err| panic!("{:?}", err.diagnostics));
+    assert!(
+        loaded
+            .check
+            .defs
+            .contains_key(&Symbol::new("lib.answer.answer")),
+        "the vendored package supplied no `answer`: {:?}",
+        loaded.check.defs.keys().collect::<Vec<_>>()
+    );
+}
