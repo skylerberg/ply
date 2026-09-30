@@ -1,7 +1,7 @@
 //! The claims family over more than one run: every `configure` begins a run of its own, whatever
 //! the last one was left doing, and each run's static tier answers for that run's claims.
 
-use crate::fixture::{handed, project};
+use crate::fixture::{handed, project, proving, world_value};
 use ply_eval::host::{
     HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, MachineId, Pending,
 };
@@ -113,14 +113,15 @@ fn decision_of(reach: &Value) -> String {
         .expect("a reach names its decision")
 }
 
+/// The laws a run collected, by key: the project's own, never an earlier run's.
 fn owners(collection: &Value) -> Vec<String> {
-    let claims = field_of(collection, "claims", Span::DUMMY).expect("a collection's claims");
-    list(claims)
+    let laws = field_of(collection, "laws", Span::DUMMY).expect("a collection's laws");
+    list(laws)
         .iter()
-        .map(|claim| {
-            field_of(claim, "owner", Span::DUMMY)
-                .and_then(|o| o.as_str(Span::DUMMY, "an owner").map(str::to_string))
-                .expect("a claim's owner")
+        .map(|law| {
+            field_of(law, "key", Span::DUMMY)
+                .and_then(|k| k.as_str(Span::DUMMY, "a law's key").map(str::to_string))
+                .expect("a law's key")
         })
         .collect()
 }
@@ -152,10 +153,17 @@ fn a_second_configuration_is_a_second_run_over_its_own_project() {
     let mut seen: Vec<Vec<String>> = Vec::new();
     for (source, laws) in [(ONE_LAW, 1), (TWO_LAWS, 2)] {
         let dir = project(source);
+        let Ok((_, _, obligations)) = proving(dir.path()) else {
+            panic!("the fixture loads");
+        };
         ask(
             &lent,
             "configure",
-            vec![options(dir.path()), handed(dir.path())],
+            vec![
+                options(dir.path()),
+                handed(dir.path()),
+                world_value(&obligations),
+            ],
         );
         let collection = ok(ask(&lent, "collected", Vec::new()));
         let named = owners(&collection);

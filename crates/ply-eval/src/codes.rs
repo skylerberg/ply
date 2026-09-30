@@ -54,7 +54,7 @@ pub const DEPENDENCY_NOT_DECLARED: &str = "E0132";
 pub const PREFIX_COLLISION: &str = "E0133";
 /// `ply.pkg` files depending on one another in a cycle.
 pub const DEPENDENCY_CYCLE: &str = "E0134";
-/// A dependency whose path is missing, that holds no `ply.pkg`, or that is not a path.
+/// A dependency whose path is missing, that holds no `ply.pkg`, or that was never fetched.
 pub const DEPENDENCY_UNUSABLE: &str = "E0135";
 /// A dependency below the version floor the manifest importing it asks for.
 pub const DEPENDENCY_VERSION: &str = "E0136";
@@ -66,6 +66,16 @@ pub const LOCK_MISMATCH: &str = "E0138";
 pub const LOCK_UNREADABLE: &str = "E0139";
 /// A git dependency that could not be fetched.
 pub const DEPENDENCY_FETCH: &str = "E0140";
+/// A registry that could not be asked: `PLY_REGISTRY` unset or malformed, or no answer.
+pub const REGISTRY_UNASKED: &str = "E0141";
+/// A registry archive whose bytes are not the ones the lock pins or the index lists.
+pub const REGISTRY_ARCHIVE: &str = "E0142";
+/// A registry dependency no published, unyanked version satisfies.
+pub const REGISTRY_UNSATISFIED: &str = "E0143";
+/// A publish or a yank the registry refused.
+pub const REGISTRY_REFUSED: &str = "E0144";
+/// A package or a version no registry takes: a program, a non-registry dependency, a bad name.
+pub const REGISTRY_UNTAKEABLE: &str = "E0145";
 pub const TYPE_MISMATCH: &str = "E0201";
 pub const ARITY_MISMATCH: &str = "E0202";
 pub const OCCURS_CHECK: &str = "E0203";
