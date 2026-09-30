@@ -344,8 +344,11 @@ fn the_handler_answers_the_flag_and_the_clock() {
 
     struct Nothing;
     impl HostRuntime for Nothing {
-        fn poll(&self, _: &ply_eval::Pending) -> Result<Option<Value>, Diagnostic> {
-            Ok(None)
+        fn watch(&self, _: &ply_eval::Pending) -> Result<(), Diagnostic> {
+            Ok(())
+        }
+        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+            Vec::new()
         }
         fn park(&self) -> Result<(), Diagnostic> {
             Ok(())

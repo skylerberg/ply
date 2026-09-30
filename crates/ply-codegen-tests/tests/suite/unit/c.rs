@@ -202,7 +202,7 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
 }
 
 /// `PLY_C_CACHE`, `PLY_C_SKIP` and `cache::UNITS_REUSED` are process-wide: a test that changes or counts them takes this for writing, every other build for reading.
-static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
+pub(super) static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 pub mod tests_support {
     use ply_codegen::c::Native;

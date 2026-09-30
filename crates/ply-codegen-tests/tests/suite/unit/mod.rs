@@ -7,4 +7,5 @@ mod c;
 mod heap;
 mod list;
 mod map;
+mod simulate;
 mod stack;
