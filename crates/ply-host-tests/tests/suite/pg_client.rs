@@ -3,7 +3,7 @@
 //! `SimNet` hands the client the bytes a server would have sent and records what it sent back,
 //! so the framing, the handshake and both query cycles are decided without a socket.
 
-use ply_eval::{Machine, Span, Value};
+use ply_eval::{Machine, Span, Symbol, Value};
 use ply_host::tcp::{Net, SimNet};
 use std::sync::Arc;
 
@@ -168,16 +168,12 @@ fn run(entry: &str, args: Vec<Value>, script: Vec<Vec<u8>>) -> Result<Ran, Strin
     let mut machine = Machine::new(&front);
     machine.set_compiled(ply_eval::Provider::attach(unit));
     machine.set_host_binding(Arc::new(binding));
-    let simple = entry.rsplit('.').next().expect("an entry has a name");
-    if let Some(declared) = front
+    let declared = front
         .check
         .defs
-        .values()
-        .find(|d| d.simple_name.as_str() == simple)
-        .map(|d| d.footprint.clone())
-    {
-        machine.set_declared_footprint(declared);
-    }
+        .get(&Symbol::new(entry))
+        .expect("the entry is a definition of the program");
+    machine.set_declared_footprint(declared.footprint.clone());
     let answered = machine
         .call(entry, args, Span::DUMMY)
         .unwrap_or_else(|e| panic!("the call answers: {e}"));
@@ -199,16 +195,12 @@ fn run_over_tcp(entry: &str, args: Vec<Value>) -> Result<Ran, String> {
     machine.set_host_binding(Arc::new(binding));
     // The real socket answers `Pending`, so the machine needs something to wait on.
     machine.set_host_runtime(host.runtime());
-    let simple = entry.rsplit('.').next().expect("an entry has a name");
-    if let Some(declared) = front
+    let declared = front
         .check
         .defs
-        .values()
-        .find(|d| d.simple_name.as_str() == simple)
-        .map(|d| d.footprint.clone())
-    {
-        machine.set_declared_footprint(declared);
-    }
+        .get(&Symbol::new(entry))
+        .expect("the entry is a definition of the program");
+    machine.set_declared_footprint(declared.footprint.clone());
     let answered = machine
         .call(entry, args, Span::DUMMY)
         .unwrap_or_else(|e| panic!("the call answers: {e}"));
