@@ -1386,12 +1386,10 @@ fn evidence_value(evidence: &Evidence) -> PlyValue {
 
 fn gap_value(gap: &Gap) -> PlyValue {
     match gap {
-        Gap::UnhandledEffect(footprint) => ctor(
+        Gap::UnhandledEffect(row) => ctor(
             home("Gap"),
             "UnhandledEffect",
-            vec![option(
-                (!footprint.is_empty()).then(|| PlyValue::str(footprint.to_string())),
-            )],
+            vec![option(row.as_deref().map(PlyValue::str))],
         ),
         Gap::Ungeneratable { param, ty } => ctor(
             home("Gap"),
@@ -1421,10 +1419,10 @@ fn gap_value(gap: &Gap) -> PlyValue {
                 ("witness", bindings_value(witness)),
             ])],
         ),
-        Gap::ReachesHost(footprint) => ctor(
+        Gap::ReachesHost(row) => ctor(
             home("Gap"),
             "ReachesHost",
-            vec![PlyValue::str(footprint.to_string())],
+            vec![PlyValue::str(row.as_deref().unwrap_or("{}"))],
         ),
         Gap::NotDrawn => ctor(home("Gap"), "NotDrawn", Vec::new()),
     }

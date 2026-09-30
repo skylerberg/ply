@@ -6,7 +6,6 @@ use ply_prove::{
 };
 use ply_span::Span;
 use ply_ty::DefHash;
-use ply_ty::Footprint;
 use std::time::Duration;
 
 fn cases(kept: u32) -> Evidence {
@@ -67,7 +66,7 @@ fn nothing_but_a_hold_has_a_tier_or_is_cached() {
             guard: Span::DUMMY,
             kind: VacuityKind::ProvedUnsatisfiable,
         }),
-        Discharge::Unattempted(Gap::UnhandledEffect(Footprint::empty())),
+        Discharge::Unattempted(Gap::UnhandledEffect(None)),
     ];
     for outcome in outcomes {
         assert_eq!(outcome.tier(), None);
@@ -143,19 +142,14 @@ fn a_report_fails_on_a_refutation_or_a_vacuity_and_not_on_a_gap() {
         binders: Vec::new(),
         guarded: false,
         host: false,
-        footprint: Footprint::empty(),
+        footprint: None,
     };
     let report = |discharge| ProveReport {
         obligations: vec![(obligation.clone(), discharge)],
         plan: ProvePlan::default(),
         duration: Duration::ZERO,
     };
-    assert!(
-        !report(Discharge::Unattempted(Gap::UnhandledEffect(
-            Footprint::empty()
-        )))
-        .failed()
-    );
+    assert!(!report(Discharge::Unattempted(Gap::UnhandledEffect(None))).failed());
     assert!(
         report(Discharge::Vacuous(Vacuity {
             guard: Span::DUMMY,
