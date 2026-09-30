@@ -1,0 +1,94 @@
+// `examples/desk.ply` as the corpus serves it: the command line that runs it with the settings a
+// table asks for, and the routes its loads are made of. Every table that loads the desk starts it
+// through here.
+
+import kit
+import kit (Kit, Credential)
+
+// How a table runs the desk: its accept loop and its store as the desk's settings name them, and
+// the credential it listens with over TLS.
+pub type Desk = { accept: String, store: String, tls: Option<Credential>, database: Option<String> }
+
+pub fn twin(accept: String) -> Desk = { accept: accept, store: "memory", tls: None, database: None }
+
+fn cats<a>(xss: List<List<a>>) -> List<a> =
+  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
+
+// `ply run` over the desk on a port it picks and reports, with a budget no load reaches: the kit
+// stops it with a signal rather than by running it out.
+pub fn desk_args(k: Kit, d: Desk) -> List<String> =
+  cats([
+    [
+      "run",
+      kit::at_repo(k, "examples/desk.ply"),
+      "--host",
+      "--color",
+      "never",
+      "--config-schema",
+      "desk.config",
+      "--trace",
+      "off",
+    ],
+    kit::set("DESK_PORT", "0"),
+    kit::set("DESK_CONNECTIONS", "1000000"),
+    kit::set("DESK_API_KEY", "bench-key"),
+    kit::set("DESK_STORE", d.store),
+    kit::set("DESK_ACCEPT", d.accept),
+    match d.database { Some(url) -> kit::set("DESK_DATABASE", url), None -> [] },
+    match d.tls { Some(c) -> cats([kit::set("DESK_TLS", c.name), kit::tls_args(c)]), None -> [] },
+  ])
+
+// The routes a read-only load cycles through, each answered 200 by the twin.
+pub fn read_mix() -> List<String> =
+  [
+    "/health",
+    "/items",
+    "/items/featured",
+    "/items/bolt",
+    "/orders",
+    "/orders/1",
+    "/docs/orders/placing",
+    "/orders/1/receipt",
+  ]
+
+// Connections for each of `concurrency` clients so a point carries about `requests` requests of
+// `per_conn` each, and no more than a thousand connections in all.
+pub fn share(concurrency: Int, per_conn: Int, requests: Int) -> Int = {
+  let c = if concurrency < 1 { 1 } else { concurrency };
+  let p = if per_conn < 1 { 1 } else { per_conn };
+  let wanted = (requests + c * p - 1) / (c * p);
+  let cap = 1000 / c;
+  let most = if cap < 1 { 1 } else { cap };
+  if wanted < 1 { 1 } else if wanted > most { most } else { wanted }
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+test "the desk is run on a port it reports, with the store, loop and credential a table names" {
+  let k = { repo: ".", scratch: "target/corpus/w3" };
+  let cred = {
+    name: "desk",
+    certificate: "target/corpus/w3/tls/desk.pem",
+    key: "target/corpus/w3/tls/desk.key",
+  };
+  let args = desk_args(k, { ..twin("task-per-connection"), tls: Some(cred) });
+  let has = |want: String| fold(args, false, |seen: Bool, a: String| seen || a == want);
+  assert_eq(list_at(args, 1), Some("examples/desk.ply"));
+  assert(has("DESK_PORT=0"));
+  assert(has("DESK_STORE=memory"));
+  assert(has("DESK_ACCEPT=task-per-connection"));
+  assert(has("DESK_TLS=desk"));
+  assert(has("desk=target/corpus/w3/tls/desk.pem,target/corpus/w3/tls/desk.key"));
+  assert(
+    !has("DESK_DATABASE=")
+      && !fold(desk_args(k, twin("sequential")), false, |seen: Bool, a: String|
+        seen || a == "--tls"),
+  )
+}
+
+test "a point's share keeps its requests near the ask and its connections under a thousand" {
+  assert_eq(share(1, 32, 4000), 125);
+  assert_eq(share(8, 32, 4000), 16);
+  assert_eq(share(64, 1, 4000), 15);
+  assert_eq(share(4, 100, 10), 1)
+}

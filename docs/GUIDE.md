@@ -2345,9 +2345,11 @@ filed by a compiler whose shipped modules differed says so once, as `W0605`.
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
-directory whose name starts with `.`, and one named `target`, are not walked; a
-symlink found while walking is passed over, and one named on the command line is
-an error rather than a file to rewrite.
+file it cannot read or write back is an error too, exiting 2, so `--check`
+never passes over a file it did not read. A directory whose name starts with
+`.`, and one named `target`, are not walked; a symlink found while walking is
+passed over, and one named on the command line is an error rather than a file to
+rewrite.
 
 `ply show NAME` and `ply replace NAME` are the edit loop for one definition: read
 it, rewrite it, and touch nothing else in the file. The replacement is one item
@@ -2529,5 +2531,5 @@ and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
 `relay.ply` (one forwarder generic over the label it writes under);
 `store.ply` (a handler as a capability grant); `agreement.ply` and
 `twin_divergence_audit.ply` (`std.db`'s twin against recorded PostgreSQL
-answers); `desk.ply` (a PostgreSQL service with TLS, config, tracing and
-shutdown).
+answers); `desk.ply` (a service over PostgreSQL or its in-memory twin, whose
+store, TLS and accept loop are configuration, with tracing and shutdown).

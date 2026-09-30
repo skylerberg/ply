@@ -1,4 +1,5 @@
 mod cache;
+mod dump;
 mod sweep;
 mod toolchain;
 mod upgrade;
