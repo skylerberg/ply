@@ -203,6 +203,25 @@ fn served_flags() -> List<cmdline::Flag> =
     json_switch(),
   ]
 
+fn tiers_seeds() -> Int = 6
+
+// A command's check runs before the defaults are filled, so an unwritten `--seeds` is read here at
+// its default.
+fn seed_taken(p: cmdline::Parsed) -> Result<Unit, String> =
+  match cmdline::value(p, "seed") {
+    None -> Ok(()),
+    Some(v) -> {
+      let seeds = match cmdline::value(p, "seeds") {
+        Some(_) -> nat_of(p, "seeds"),
+        None -> tiers_seeds(),
+      };
+      match tiers::taken(seeds, cmdline::parse_nat(v)) {
+        Ok(_) -> Ok(()),
+        Err(why) -> Err("invalid value '" ++ v ++ "' for '--seed <N>': " ++ why),
+      }
+    },
+  }
+
 // --- The spec --------------------------------------------------------------------
 
 pub fn spec() -> cmdline::Spec =
@@ -544,21 +563,43 @@ pub fn spec() -> cmdline::Spec =
                 Ok(_) -> if root == "" { Ok(()) } else { inside(root) },
               }),
         ),
-        cmdline::command(
-          "tiers",
-          "Re-draw every proof the prover makes over generated corpora, which one contradiction fails",
-          [
-            dir_flag("out", "Where the corpora are written, one directory a seed"),
-            nat("seeds", 6, "Corpora to generate and audit, seeded one after another from 1"),
-            nat("cases", 1000, "Cases each proof is re-drawn at, from every root"),
-            nat("roots", 8, "Roots each proof is re-drawn from"),
-            json_switch(),
-          ],
+        cmdline::with_extra(
+          cmdline::command(
+            "tiers",
+            "Re-draw every proof the prover makes over generated corpora, which one contradiction fails",
+            [
+              dir_flag("out", "Where the corpora are written, one directory a seed"),
+              pos(
+                "seeds",
+                tiers_seeds(),
+                "Corpora to generate and audit, seeded one after another from 1, each owing its share of the proofs",
+              ),
+              cmdline::valued(
+                "seed",
+                "N",
+                cmdline::Pos,
+                "The one of those seeds to audit alone; every one when left off",
+              ),
+              nat("cases", 1000, "Cases each proof is re-drawn at, from every root"),
+              nat("roots", 8, "Roots each proof is re-drawn from"),
+              json_switch(),
+            ],
+          ),
+          seed_taken,
         ),
         cmdline::command(
           "real",
           "The compiler and the CLI themselves, pinned by digest, front-ended and tested; run from the repository's root",
-          [sw("no-tests", "Front-end only; skip the test suites"), json_switch()],
+          [
+            cmdline::valued(
+              "member",
+              "NAME",
+              cmdline::Choice(real::names()),
+              "The one member to take; every one when left off",
+            ),
+            sw("no-tests", "Front-end only; skip the test suites"),
+            json_switch(),
+          ],
         ),
       ],
     ),
@@ -572,7 +613,7 @@ pub type BenchArgs = { corpus: String, repeats: Int, json: Bool }
 
 pub type SweepArgs = { out: String, sizes: List<String>, seed: Int, repeats: Int, json: Bool }
 
-pub type RealArgs = { tests: Bool, json: Bool }
+pub type RealArgs = { tests: Bool, member: Option<String>, json: Bool }
 
 pub type MeasureArgs = { corpus: String, repeats: Int, only_throughput: Bool, json: Bool }
 
@@ -727,7 +768,12 @@ pub fn asked(argv: List<String>) -> Asked =
             json: cmdline::has(p, "json"),
           }),
       },
-      "real" -> Real({ tests: !cmdline::has(p, "no-tests"), json: cmdline::has(p, "json") }),
+      "real" ->
+        Real({
+          tests: !cmdline::has(p, "no-tests"),
+          member: cmdline::value(p, "member"),
+          json: cmdline::has(p, "json"),
+        }),
       "measure" ->
         Measure({
           corpus: cmdline::nth_of(p.positionals, 0, ""),
@@ -772,6 +818,10 @@ pub fn asked(argv: List<String>) -> Asked =
             args: {
               out: out,
               seeds: nat_of(p, "seeds"),
+              seed: match cmdline::value(p, "seed") {
+                Some(v) -> cmdline::parse_nat(v),
+                None -> None,
+              },
               cases: nat_of(p, "cases"),
               roots: nat_of(p, "roots"),
             },
@@ -988,7 +1038,7 @@ fn code_of(
         Err(why) -> Err(why),
         Ok(sizes) -> reported(sweep::run(s.out, sizes, s.repeats), s.json),
       }),
-    Real(r) -> answered(reported(real::run(r.tests), r.json)),
+    Real(r) -> answered(reported(real::run(r.tests, r.member), r.json)),
     Measure(m) -> answered(reported(measure::run(m.corpus, m.repeats, m.only_throughput), m.json)),
     Payload(p) -> answered(reported(payload::run(p.args), p.json)),
     Regions(r) -> answered(reported(regions::run(r.args), r.json)),
@@ -1061,12 +1111,25 @@ test "sweep reads its sizes and its seed" {
   }
 }
 
-test "real tests unless told not to" {
-  match asked(["real"]) { Real(r) -> assert(r.tests && !r.json), _ -> assert(false) };
+test "real takes every member and tests it unless told otherwise" {
+  match asked(["real"]) {
+    Real(r) -> assert(r.tests && !r.json && r.member == None),
+    _ -> assert(false),
+  };
   match asked(["real", "--no-tests", "--json"]) {
     Real(r) -> assert(!r.tests && r.json),
     _ -> assert(false),
   }
+}
+
+test "real takes one member when it is named, and refuses a name that is none" {
+  match asked(["real", "--member", "cli", "--no-tests"]) {
+    Real(r) -> assert_eq(r.member, Some("cli")),
+    _ -> assert(false),
+  };
+  assert(
+    string_contains(refusal_of(["real", "--member", "std"]), "[possible values: compiler, cli]"),
+  )
 }
 
 test "w4 refuses without --db" { assert(string_contains(refusal_of(["w4"]), "--db")) }
@@ -1186,11 +1249,32 @@ test "regions reads its roots and its hypotheticals, and a root outside is refus
 
 test "tiers audits six seeds at a thousand cases from eight roots unless told otherwise" {
   match asked(["tiers", "--out", "tiers"]) {
-    Tiers(t) ->
-      assert_eq((t.args.out, t.args.seeds, t.args.cases, t.args.roots), ("tiers", 6, 1000, 8)),
+    Tiers(t) -> {
+      assert_eq((t.args.out, t.args.seeds, t.args.cases, t.args.roots), ("tiers", 6, 1000, 8));
+      assert_eq(t.args.seed, None)
+    },
     _ -> assert(false),
   };
   assert(string_contains(refusal_of(["tiers"]), "--out"))
+}
+
+test "tiers audits one of its seeds alone when asked, and refuses a seed it does not take" {
+  match asked(["tiers", "--out", "t", "--seed", "6"]) {
+    Tiers(t) -> assert_eq((t.args.seeds, t.args.seed), (6, Some(6))),
+    _ -> assert(false),
+  };
+  match asked(["tiers", "--out", "t", "--seeds", "8", "--seed", "8"]) {
+    Tiers(t) -> assert_eq((t.args.seeds, t.args.seed), (8, Some(8))),
+    _ -> assert(false),
+  };
+  assert(
+    string_contains(
+      refusal_of(["tiers", "--out", "t", "--seed", "7"]),
+      "invalid value '7' for '--seed <N>': the audit takes seeds 1 to 6",
+    ),
+  );
+  assert(string_contains(refusal_of(["tiers", "--out", "t", "--seed", "0"]), "'--seed <N>'"));
+  assert(string_contains(refusal_of(["tiers", "--out", "t", "--seeds", "0"]), "'--seeds <N>'"))
 }
 
 test "what is still Rust's is planned for the executor" {

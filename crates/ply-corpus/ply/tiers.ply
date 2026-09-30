@@ -11,7 +11,7 @@ import gbuild
 import gen
 import harness
 import report
-import report (Row, Measurement, AtLeast, AtMost, number, row, untaken)
+import report (Row, Criterion, holding, number, row, untaken)
 import spine (under)
 import proof.obligation (Binding, Falsified, Held, Kept, NotDrawn, Outcome, Point, Proved, Raised,
                          Rejected, Undrawn)
@@ -25,6 +25,10 @@ import std.time (time)
 
 // The fewest proofs an audit may draw from and still be a gate.
 fn least_audited() -> Int = 100
+
+// Each seed's share of that floor, rounded up: every seed carrying its share meets the floor, whether
+// the seeds are audited in one run or a run each.
+fn share(seeds: Int) -> Int = (least_audited() + seeds - 1) / seeds
 
 // One corpus's shape: small enough to discharge quickly, specified enough that the prover proves some
 // of what it carries.
@@ -189,12 +193,25 @@ pub fn audited(
 
 // --- The rows ---------------------------------------------------------------------------
 
-pub fn audit_row(name: String, audit: Result<Audit, String>) -> Row =
+fn carried(owed: Int) -> Criterion =
+  holding(
+    "no draw contradicts a proof, and at least " ++ int_to_string(owed)
+      ++ " proofs are drawn from, a seed's share of "
+      ++ int_to_string(least_audited()),
+    ["disagreements", "proved"],
+    |vs: List<Decimal>|
+      match vs {
+        [disagreements, proved] -> disagreements == 0m && proved >= decimal_of_int(owed),
+        _ -> false,
+      },
+  )
+
+pub fn audit_row(name: String, owed: Int, audit: Result<Audit, String>) -> Row =
   match audit {
-    Err(why) -> untaken(name, AtMost("disagreements", 0m), why),
+    Err(why) -> untaken(name, carried(owed), why),
     Ok(a) ->
       {
-        ..row(name, AtMost("disagreements", 0m), [number("obligations", a.obligations, "obligations"), number("proved", a.proved, "obligations"), number("draws", a.draws, "draws"), number("disagreements", len(a.defects), "obligations")]),
+        ..row(name, carried(owed), [number("obligations", a.obligations, "obligations"), number("proved", a.proved, "obligations"), number("draws", a.draws, "draws"), number("disagreements", len(a.defects), "obligations")]),
         detail: array(
           map(a.defects, |d: Defect|
             object([{ key: "claim", value: Str(d.claim) }, { key: "how", value: Str(d.how) }])),
@@ -202,61 +219,67 @@ pub fn audit_row(name: String, audit: Result<Audit, String>) -> Row =
       },
   }
 
-pub fn total_row(audits: List<Result<Audit, String>>) -> Row = {
-  let taken = fold(audits, [], |acc: List<Audit>, a: Result<Audit, String>|
-    match a { Ok(x) -> push(acc, x), Err(_) -> acc });
-  row("audited", AtLeast("proved", decimal_of_int(least_audited())), [
-    number("corpora", len(taken), "corpora"),
-    number("proved", fold(taken, 0, |n: Int, a: Audit| n + a.proved), "obligations"),
-    number("draws", fold(taken, 0, |n: Int, a: Audit| n + a.draws), "draws"),
-  ])
-}
+// `seed`, when given, is the one of `seeds` to audit alone.
+pub type Args = { out: String, seeds: Int, seed: Option<Int>, cases: Int, roots: Int }
 
-pub type Args = { out: String, seeds: Int, cases: Int, roots: Int }
+pub fn taken(seeds: Int, seed: Option<Int>) -> Result<List<Int>, String> =
+  match seed {
+    None -> Ok(range(1, seeds + 1)),
+    Some(one) -> if one >= 1 && one <= seeds { Ok([one]) }
+    else { Err("the audit takes seeds 1 to " ++ int_to_string(seeds)) },
+  }
 
-// Each seed's corpus generated under `out` and audited, in order, and the proofs they carried counted.
-// A corpus that would not generate is a row that says why; a prover that refused stops the audit,
-// since the run it was in cannot be ended for the next one to start.
+fn title_of(a: Args) -> String =
+  "every proof re-drawn at " ++ int_to_string(a.cases) ++ " cases from each of "
+    ++ int_to_string(a.roots)
+    ++ " roots, over "
+    ++ (match a.seed {
+      Some(one) -> "seed " ++ int_to_string(one) ++ " of " ++ int_to_string(a.seeds),
+      None -> "all " ++ int_to_string(a.seeds) ++ " seeds",
+    })
+
+// Each seed taken has its corpus generated under `out` and audited, in order, and is judged by its
+// share of the floor. A corpus that would not generate is a row that says why; a prover that refused
+// stops the audit, since the run it was in cannot be ended for the next one to start.
 pub fn run(
   a: Args,
 ) -> Result<report::Report, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, process.spawn[ply], config.get[env], prover.configure[claims], prover.collected[claims], prover.outcomes[claims], prover.discharged[claims], prover.record[claims], prover.replay[claims], prover.accepted[claims]} =
-  match fold(
-      range(1, a.seeds + 1),
-      Ok([]),
-      |acc: Result<List<{ seed: Int, audit: Result<Audit, String> }>, String>, seed: Int|
-        match acc {
-          Err(e) -> Err(e),
-          Ok(done) -> {
-            let dir = under(a.out, "seed" ++ int_to_string(seed));
-            match gen::run(dir, spec_for(seed), false) {
-              Err(why) ->
-                Ok(push(done, { seed: seed, audit: Err("the corpus did not generate: " ++ why) })),
-              Ok(_) -> match audited(dir, a.cases, a.roots) {
-                Err(why) -> Err("seed " ++ int_to_string(seed) ++ ": " ++ why),
-                Ok(audit) -> Ok(push(done, { seed: seed, audit: Ok(audit) })),
-              },
-            }
-          },
-        },
-    ) {
+  match taken(a.seeds, a.seed) {
     Err(why) -> Err(why),
-    Ok(results) -> {
-      let rows = map(results, |r: { seed: Int, audit: Result<Audit, String> }|
-        audit_row("seed " ++ int_to_string(r.seed), r.audit));
-      report::made(
-        "tiers",
-        "every proof re-drawn at " ++ int_to_string(a.cases) ++ " cases from each of "
-          ++ int_to_string(a.roots)
-          ++ " roots",
-        push(
-          rows,
-          total_row(map(results, |r: { seed: Int, audit: Result<Audit, String> }| r.audit)),
+    Ok(chosen) -> match fold(
+        chosen,
+        Ok([]),
+        |acc: Result<List<{ seed: Int, audit: Result<Audit, String> }>, String>, seed: Int|
+          match acc {
+            Err(e) -> Err(e),
+            Ok(done) -> {
+              let dir = under(a.out, "seed" ++ int_to_string(seed));
+              match gen::run(dir, spec_for(seed), false) {
+                Err(why) ->
+                  Ok(
+                    push(done, { seed: seed, audit: Err("the corpus did not generate: " ++ why) }),
+                  ),
+                Ok(_) -> match audited(dir, a.cases, a.roots) {
+                  Err(why) -> Err("seed " ++ int_to_string(seed) ++ ": " ++ why),
+                  Ok(audit) -> Ok(push(done, { seed: seed, audit: Ok(audit) })),
+                },
+              }
+            },
+          },
+      ) {
+      Err(why) -> Err(why),
+      Ok(results) ->
+        report::made(
+          "tiers",
+          title_of(a),
+          map(results, |r: { seed: Int, audit: Result<Audit, String> }|
+            audit_row("seed " ++ int_to_string(r.seed), share(a.seeds), r.audit)),
+          [
+            { key: "cases", value: Number(decimal_of_int(a.cases)) },
+            { key: "roots", value: Number(decimal_of_int(a.roots)) },
+            { key: "seeds", value: Number(decimal_of_int(a.seeds)) },
+          ],
         ),
-        [
-          { key: "cases", value: Number(decimal_of_int(a.cases)) },
-          { key: "roots", value: Number(decimal_of_int(a.roots)) },
-        ],
-      )
     },
   }
 
@@ -277,13 +300,36 @@ test "a draw contradicts a proof by refuting it or by raising under it, and in n
   assert_eq(contradiction(Undrawn(NotDrawn)), None)
 }
 
-test "one disagreement fails a corpus's row, and too few proofs fail the audit" {
-  let clean: Audit = { obligations: 40, proved: 60, draws: 480000, defects: [] };
+test "a seed's row fails on one disagreement, and on a corpus short of its share of proofs" {
+  let clean: Audit = { obligations: 40, proved: 17, draws: 136000, defects: [] };
   let broken = { ..clean, defects: [{ claim: "law \"x\"", how: "refutes it at n = 3" }] };
-  assert_eq(verdicts([audit_row("seed 1", Ok(clean))]), [report::Pass]);
-  assert(verdicts([audit_row("seed 1", Ok(broken))]) != [report::Pass]);
-  assert_eq(verdicts([total_row([Ok(clean), Ok(clean)])]), [report::Pass]);
-  assert(verdicts([total_row([Ok(clean), Err("did not generate")])]) != [report::Pass])
+  assert_eq(verdicts([audit_row("seed 1", 17, Ok(clean))]), [report::Pass]);
+  assert(verdicts([audit_row("seed 1", 17, Ok(broken))]) != [report::Pass]);
+  assert_eq(verdicts([audit_row("seed 1", 17, Ok({ ..clean, proved: 16 }))]), [
+    report::Fail([number("disagreements", 0, "obligations"), number("proved", 16, "obligations")]),
+  ]);
+  assert(verdicts([audit_row("seed 1", 17, Err("did not generate"))]) != [report::Pass])
+}
+
+test "every seed carrying its share meets the floor, and no share is more than that needs" {
+  assert(
+    fold(range(1, 2 * least_audited()), true, |held: Bool, seeds: Int|
+      held && share(seeds) * seeds >= least_audited()
+        && (share(seeds) - 1) * seeds < least_audited()),
+  )
+}
+
+test "a run audits every seed, or the one asked for when it is among them" {
+  assert_eq(taken(6, None), Ok([1, 2, 3, 4, 5, 6]));
+  assert_eq(taken(6, Some(6)), Ok([6]));
+  assert_eq(taken(6, Some(7)), Err("the audit takes seeds 1 to 6"));
+  assert_eq(taken(6, Some(0)), Err("the audit takes seeds 1 to 6"))
+}
+
+test "a seed audited alone is named as one of the seeds" {
+  let a: Args = { out: "t", seeds: 6, seed: Some(3), cases: 1000, roots: 8 };
+  assert(string_ends_with(title_of(a), "over seed 3 of 6"));
+  assert(string_ends_with(title_of({ ..a, seed: None }), "over all 6 seeds"))
 }
 
 test "the audited corpora are the generator's, specified" {
