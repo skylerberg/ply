@@ -9,6 +9,7 @@ mod claims;
 mod fixture;
 mod prover_runs;
 mod replay;
+mod reused;
 mod selector_reads;
 mod strategy;
 
@@ -22,7 +23,8 @@ use std::sync::Arc;
 const OUTER: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -42,6 +44,7 @@ type At = { module: Int, start: Int, end: Int }
 type Main = { name: String, module: String, path: String, at: At }
 type Module = { name: String, path: String, at: At }
 type Place = { path: String, text: Bytes }
+type Walked = { key: String, modules: List<Place>, manifests: List<Place> }
 type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
 type Fix = { title: Bytes, edits: List<Edit> }
 type Edit = { module: Int, start: Int, end: Int, text: Bytes }
@@ -129,7 +132,7 @@ type Ended = {
 }
 
 fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
-  match machine.load[m](root, Some(front)) {
+  match machine.load[m](root, Some(front), None) {
     Ok(_t) -> {
       match machine.bound[m]("inner.main") {
         Ok(_b) -> {
@@ -312,7 +315,8 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
 const OUTER_TWICE: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -332,6 +336,7 @@ type At = { module: Int, start: Int, end: Int }
 type Main = { name: String, module: String, path: String, at: At }
 type Module = { name: String, path: String, at: At }
 type Place = { path: String, text: Bytes }
+type Walked = { key: String, modules: List<Place>, manifests: List<Place> }
 type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
 type Diag = {
   code: Bytes,
@@ -391,7 +396,7 @@ fn once() -> Option<String> / {machine.bound[m], machine.enter[m]} = {
 }
 
 fn main(root: String, front: Front) -> Option<String> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
-  let _loaded = machine.load[m](root, Some(front));
+  let _loaded = machine.load[m](root, Some(front), None);
   once()
 }
 
@@ -455,7 +460,8 @@ fn a_configured_machine_binds_what_the_options_say() {
     let outer = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -509,6 +515,7 @@ type At = { module: Int, start: Int, end: Int }
 type Main = { name: String, module: String, path: String, at: At }
 type Module = { name: String, path: String, at: At }
 type Place = { path: String, text: Bytes }
+type Walked = { key: String, modules: List<Place>, manifests: List<Place> }
 type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
 type Diag = {
   code: Bytes,
@@ -591,7 +598,7 @@ fn opts(host: Bool) -> Options =
 
 fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
   machine.configure[m](opts(true));
-  match machine.load[m](root, Some(front)) {
+  match machine.load[m](root, Some(front), None) {
     Err(_) -> false,
     Ok(_t) -> {
       let bound = machine.bound[m]("inner.main");
@@ -642,7 +649,8 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
 const OUTER_CALL: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -655,6 +663,7 @@ type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Options = Unit
 type Target = Unit
+type Walked = Unit
 type Bound = Unit
 type Front = {
   dump: Bytes,
@@ -671,7 +680,7 @@ type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value
 type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
 fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  match machine.load[m](root, Some(front)) {
+  match machine.load[m](root, Some(front), None) {
     Ok(_) -> match machine.bound[m]("inner.main") {
       Ok(_) -> {
         let doubled = machine.call[m]("inner.double", [VInt(21)]);
