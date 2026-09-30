@@ -266,6 +266,12 @@ impl HandlerFrame {
 pub(crate) struct Frames {
     pub(crate) list: Vec<HandlerFrame>,
     pub(crate) parent: Option<usize>,
+    /// The detached body this stack is the own stack of; its frame at the bottom of `list` is
+    /// hidden while one of its clauses runs, so it cannot say.
+    pub(crate) body: Option<usize>,
+    /// For a task's stack, the stack its region was entered from, where the task's body was
+    /// written; a production task's `parent` is the scheduler loop's, which does not lead there.
+    pub(crate) entered_from: Option<usize>,
 }
 
 impl Frames {
@@ -273,6 +279,8 @@ impl Frames {
         Frames {
             list: Vec::new(),
             parent,
+            body: None,
+            entered_from: None,
         }
     }
 }
@@ -419,7 +427,7 @@ pub struct Ctx {
     time_budget_ms: u64,
     /// The cells, holding heap words: declared before the heap, so their counts go back first.
     /// Each stack in `stacks` owns the regions it opens, under the index that names it.
-    cells: ply_eval::TaskRegions<Held>,
+    pub(crate) cells: ply_eval::TaskRegions<Held>,
     /// The arena's `(total depth, live)` when the running entry began, for [`Ctx::cells_balanced`].
     cells_baseline: (usize, usize),
     /// The arena `ply_eval::builtins::call` insists on; nothing reaching it uses it.
@@ -537,17 +545,18 @@ impl Ctx {
         self.current = 0;
         self.performed.clear();
         self.sims.clear();
-        self.detached.clear();
         self.starting_detached = None;
         self.trail = ply_eval::region::Trail::new(self.seed.clone());
         self.record = None;
         self.entered_sims = 0;
         self.unwind = None;
         self.resumed = None;
-        // Every path out of an entry calls `end`; this catches one that did not.
+        // Every path out of an entry calls `end`; this catches one that did not, before the
+        // detached bodies that pin regions are dropped.
         if self.heap.allocated() != 0 {
             self.end();
         }
+        self.detached.clear();
         // After the recovery above, which gives back what that entry held.
         self.cells_baseline = self.cell_extent();
         heap::enter(&mut self.heap);
@@ -599,9 +608,10 @@ impl Ctx {
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
-        // Only this runs on every exit, so a region a failure or an unwind jumped past, or a
-        // suspended stack still holds, closes here; the cells go back before the heap their words
-        // live in.
+        // Only this runs on every exit, so a region a failure or an unwind jumped past, a
+        // suspended stack still holds, or a detached body pins, closes here; the cells go back
+        // before the heap their words live in.
+        crate::detached::release_all(self);
         self.cells.close_program_regions();
         debug_assert!(
             self.cells_balanced(),
@@ -817,9 +827,10 @@ pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, unique: i64) -> i64 {
     ctx.cells.open(owner, kind).to_bits() as i64
 }
 
-/// Closes a region, reclaiming its cells. The emitter puts it after the body, on the stack that
-/// opened it, so only a body that ran to its end reaches it; an abandoned one is closed by its
-/// `handle`, by its stack's release, or by [`Ctx::end`].
+/// Closes a region, reclaiming its cells unless something that can still run reaches them: a
+/// snapshot of its stack, or a detached body opened inside it. The emitter puts it after the body,
+/// on the stack that opened it, so only a body that ran to its end reaches it; an abandoned one is
+/// closed by its `handle`, by its stack's release, or by [`Ctx::end`].
 pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
     let ctx = unsafe { &mut *ctx };
     ctx.cells.close(RegionId::from_bits(region as u64));

@@ -2,7 +2,9 @@
 //! switches back to the machine's scheduler loop to perform `task`, `clock` or `random`.
 
 use crate::heap::{self, Word};
-use crate::rt::{Ctx, FAILED_UNWIND, call_value, drop_frame, inherit_frames, values_taken};
+use crate::rt::{
+    Ctx, FAILED_UNWIND, Frames, HandlerFrame, call_value, drop_frame, inherit_frames, values_taken,
+};
 use crate::stack::{Stack, switch};
 use ply_eval::host::Pending;
 use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, Turn};
@@ -39,8 +41,8 @@ struct TaskStack {
     frames: usize,
     floor: usize,
     sp: usize,
-    /// The stack its spawn was performed on; a task performs against the handlers around its spawn.
-    inherits: Option<usize>,
+    /// Copies of the handlers around its spawn as they stood then, held until the task starts.
+    inherited: Vec<HandlerFrame>,
 }
 
 enum Request {
@@ -118,7 +120,7 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
         frames: c.current,
         floor: c.stack_floor,
         sp: 0,
-        inherits: None,
+        inherited: Vec::new(),
     };
     let site = c.site();
     c.sims.push(Simulation {
@@ -190,10 +192,13 @@ fn ended_under_root(c: &mut Ctx) -> Word {
     sim.answer
 }
 
-/// Drops a task's stack, its frames, and the regions a failure or an unwind left open on it; the
-/// production root runs on the opening stack and keeps all three.
+/// Drops a task's stack, frames and the regions a failure or an unwind left open on it, or the
+/// frames it holds unstarted; the production root runs on the opening stack and keeps all three.
 fn release(c: &mut Ctx, at: usize) {
     let sim = c.sims.last_mut().expect("a region is running");
+    for f in std::mem::take(&mut sim.tasks[at].inherited) {
+        drop_frame(f);
+    }
     if sim.tasks[at].stack.take().is_none() {
         return;
     }
@@ -286,9 +291,10 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
     let k = sim.tasks[at].sp;
     let applied = match request {
         Request::Spawn(closure, from) => {
+            let inherited = handlers_around(&c.stacks, from, sim.stack);
             let id = sim.sched.spawn(closure, site);
             sim.tasks.push(TaskStack {
-                inherits: Some(from),
+                inherited,
                 ..TaskStack::default()
             });
             sim.sched.suspend(k, Value::Task(id))
@@ -331,29 +337,37 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
     applied.map_err(Some)
 }
 
+/// Copies of the handlers around a spawn on `from`, outermost first, short of the region's own.
+fn handlers_around(stacks: &[Frames], from: usize, region: usize) -> Vec<HandlerFrame> {
+    let mut chain = vec![from];
+    let mut s = from;
+    while let Some(p) = stacks[s].parent
+        && p != region
+    {
+        chain.push(p);
+        s = p;
+    }
+    chain
+        .into_iter()
+        .rev()
+        .flat_map(|s| inherit_frames(&stacks[s].list))
+        .collect()
+}
+
 unsafe fn start(ctx: *mut Ctx, at: usize, closure: Word) -> usize {
     let c = unsafe { &mut *ctx };
     let sim = c.sims.last_mut().expect("a region is running");
     let stack = Stack::new();
     let sp = stack.prepare(task_entry, ctx as usize);
-    let (parent, inherits) = (sim.stack, sim.tasks[at].inherits);
+    let parent = sim.stack;
+    let entered_from = match sim.policy {
+        Policy::Host => sim.tasks[ROOT.0 as usize].frames,
+        Policy::Seeded => sim.stack,
+    };
+    let inherited = std::mem::take(&mut sim.tasks[at].inherited);
     let frames = c.open_stack(Some(parent));
-    if let Some(from) = inherits {
-        let mut chain = Vec::new();
-        let mut s = from;
-        loop {
-            chain.push(s);
-            match c.stacks[s].parent {
-                Some(p) if p != parent => s = p,
-                _ => break,
-            }
-        }
-        let mut list = Vec::new();
-        for s in chain.into_iter().rev() {
-            list.extend(inherit_frames(&c.stacks[s].list));
-        }
-        c.stacks[frames].list = list;
-    }
+    c.stacks[frames].list = inherited;
+    c.stacks[frames].entered_from = Some(entered_from);
     let sim = c.sims.last_mut().expect("a region is running");
     let floor = stack.floor();
     sim.tasks[at] = TaskStack {
@@ -361,7 +375,7 @@ unsafe fn start(ctx: *mut Ctx, at: usize, closure: Word) -> usize {
         frames,
         floor,
         sp,
-        inherits,
+        inherited: Vec::new(),
     };
     sim.starting = Some(closure);
     sp

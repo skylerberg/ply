@@ -1,11 +1,12 @@
-//! The cell store: one slot per cell, freed exactly when the region holding it closes. Regions
-//! nest per control stack, an [`Owner`], so a close never reaches another stack's regions, while a
-//! [`Slot`] names one cell for every stack.
+//! The cell store: one slot per cell, freed when the region holding it closes, or, for a region a
+//! [`Pin`] holds, when the last pin goes. Regions nest per control stack, an [`Owner`], so a close
+//! never reaches another stack's regions, while a [`Slot`] names one cell for every stack.
 
 use crate::value::Value;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt;
+use std::num::NonZeroU32;
 
 pub const CHUNK: usize = 256;
 
@@ -53,7 +54,7 @@ impl fmt::Display for RegionKind {
     }
 }
 
-/// A region's scope and the scope's generation when it opened, so the id of a closed region never
+/// A region's scope and the scope's generation when it opened, so the id of a freed region never
 /// names the region that reuses its scope.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RegionId {
@@ -89,6 +90,14 @@ impl Owner {
     /// The stack an entry point starts on, which holds the fixture's region and the entry's.
     pub const ENTRY: Owner = Owner(0);
 }
+
+/// A hold on a region by something that may run inside it again, such as a continuation. While
+/// any is held, the region's close only takes it off its owner's nesting, keeping its slots and
+/// its id, and the last [`Arena::unpin`] frees it. Only [`Arena::pin`] and [`Arena::repin`] make
+/// one and only [`Arena::unpin`] takes one back, so no region is freed while a pin names it.
+#[must_use = "a pin that is never given back keeps its region's slots for the arena's life"]
+#[derive(Debug)]
+pub struct Pin(RegionId);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Slot {
@@ -126,15 +135,34 @@ struct Meta {
 
 struct Scope {
     kind: RegionKind,
-    owner: Owner,
-    /// Rises at every close.
+    /// Rises each time the scope is freed.
     generation: u32,
-    open: bool,
-    /// While open, the region its owner opened before it; while free, the next free scope.
-    below: u32,
+    state: State,
     /// The region's newest slot, from which [`Meta::link`] reaches the rest.
     newest: u32,
     cells: usize,
+}
+
+impl Scope {
+    /// The region its owner opened before this one.
+    fn below(&self) -> u32 {
+        match self.state {
+            State::Open { below, .. } => below,
+            State::Parked { .. } | State::Free { .. } => {
+                unreachable!("a nesting links open regions only")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum State {
+    /// On `owner`'s nesting, above `below`; `pins` holders keep it past its close.
+    Open { owner: Owner, below: u32, pins: u32 },
+    /// Closed while pinned: on no nesting, its slots and its id kept until the last pin goes.
+    Parked { pins: NonZeroU32 },
+    /// Holds no slot; `next` is the next free scope.
+    Free { next: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -186,7 +214,7 @@ pub struct Arena<V = Value> {
     free_scopes: u32,
     /// Indexed by [`Owner`].
     owners: Vec<Nesting>,
-    /// Regions open across every owner.
+    /// Regions open across every owner; a parked one counts on none.
     depth: usize,
     stats: Stats,
     /// Slots a `cell_update` has taken out; touching one meanwhile is refused.
@@ -238,59 +266,132 @@ impl<V: Clone + Default> Arena<V> {
     }
 
     pub fn open(&mut self, owner: Owner, kind: RegionKind) -> RegionId {
-        if owner.0 >= self.owners.len() {
-            self.owners.resize(owner.0 + 1, Nesting::EMPTY);
-        }
         let at = if self.free_scopes == NIL {
             self.scopes.push(Scope {
                 kind,
-                owner,
                 generation: 0,
-                open: false,
-                below: NIL,
+                state: State::Free { next: NIL },
                 newest: NIL,
                 cells: 0,
             });
             (self.scopes.len() - 1) as u32
         } else {
             let at = self.free_scopes;
-            self.free_scopes = self.scopes[at as usize].below;
+            let State::Free { next } = self.scopes[at as usize].state else {
+                unreachable!("the free list links free scopes only")
+            };
+            self.free_scopes = next;
             at
         };
-        let nesting = &mut self.owners[owner.0];
         let scope = &mut self.scopes[at as usize];
         scope.kind = kind;
-        scope.owner = owner;
-        scope.open = true;
-        scope.below = nesting.innermost;
         scope.newest = NIL;
         scope.cells = 0;
-        nesting.innermost = at;
-        nesting.depth += 1;
-        self.depth += 1;
+        self.push(owner, at, 0);
         self.stats.regions_opened += 1;
         RegionId {
             scope: at,
-            generation: scope.generation,
+            generation: self.scopes[at as usize].generation,
         }
     }
 
+    /// `None` once the region is freed; a parked one still answers.
     pub fn kind(&self, region: RegionId) -> Option<RegionKind> {
-        self.scope(region).map(|at| self.scopes[at].kind)
+        self.named(region).map(|at| self.scopes[at].kind)
     }
 
     /// Slots this region and the regions its owner opened inside it are holding.
     pub fn extent(&self, region: RegionId) -> Option<usize> {
-        let at = self.scope(region)?;
+        let (at, owner) = self.scope(region)?;
         let mut cells = 0;
-        let mut s = self.owners[self.scopes[at].owner.0].innermost as usize;
+        let mut s = self.owners[owner.0].innermost as usize;
         loop {
             cells += self.scopes[s].cells;
             if s == at {
                 return Some(cells);
             }
-            s = self.scopes[s].below as usize;
+            s = self.scopes[s].below() as usize;
         }
+    }
+
+    /// The regions `owner` holds open, innermost first.
+    pub fn nesting(&self, owner: Owner) -> impl Iterator<Item = RegionId> + '_ {
+        let mut at = self.owners.get(owner.0).map_or(NIL, |n| n.innermost);
+        std::iter::from_fn(move || {
+            if at == NIL {
+                return None;
+            }
+            let scope = &self.scopes[at as usize];
+            let id = RegionId {
+                scope: at,
+                generation: scope.generation,
+            };
+            at = scope.below();
+            Some(id)
+        })
+    }
+
+    /// Holds an open region past its close until the pin comes back; `None` unless it is open.
+    pub fn pin(&mut self, region: RegionId) -> Option<Pin> {
+        let (at, _) = self.scope(region)?;
+        match &mut self.scopes[at].state {
+            State::Open { pins, .. } => *pins += 1,
+            State::Parked { .. } | State::Free { .. } => unreachable!("`scope` finds open regions"),
+        }
+        Some(Pin(region))
+    }
+
+    /// Another hold on the region `pin` holds, open or parked.
+    pub fn repin(&mut self, pin: &Pin) -> Pin {
+        let at = self.named(pin.0).expect("a pinned region is never freed");
+        let scope = &mut self.scopes[at];
+        scope.state = match scope.state {
+            State::Open { owner, below, pins } => State::Open {
+                owner,
+                below,
+                pins: pins + 1,
+            },
+            State::Parked { pins } => State::Parked {
+                pins: pins.saturating_add(1),
+            },
+            State::Free { .. } => unreachable!("`named` finds open or parked regions"),
+        };
+        Pin(pin.0)
+    }
+
+    /// Gives a pin back, and answers how many slots that freed: the last pin of a parked region
+    /// frees it, while an open one is left for its own close to free.
+    pub fn unpin(&mut self, pin: Pin) -> usize {
+        let at = self.named(pin.0).expect("a pinned region is never freed");
+        match self.scopes[at].state {
+            State::Open { owner, below, pins } => {
+                self.scopes[at].state = State::Open {
+                    owner,
+                    below,
+                    pins: pins - 1,
+                };
+                0
+            }
+            State::Parked { pins } => match NonZeroU32::new(pins.get() - 1) {
+                Some(pins) => {
+                    self.scopes[at].state = State::Parked { pins };
+                    0
+                }
+                None => self.release(at as u32),
+            },
+            State::Free { .. } => unreachable!("`named` finds open or parked regions"),
+        }
+    }
+
+    /// Puts the parked region `pin` holds back on `owner`'s nesting as its innermost, with the
+    /// slots and the id it kept; `false` when the region is open.
+    pub fn reopen(&mut self, pin: &Pin, owner: Owner) -> bool {
+        let at = self.named(pin.0).expect("a pinned region is never freed");
+        let State::Parked { pins } = self.scopes[at].state else {
+            return false;
+        };
+        self.push(owner, at as u32, pins.get());
+        true
     }
 
     /// A slot in `owner`'s innermost region; `None` when it holds none open.
@@ -341,7 +442,7 @@ impl<V: Clone + Default> Arena<V> {
         Some(&self.chunks[chunk_of(index)][offset_of(index)])
     }
 
-    /// `false` when the slot's region has closed.
+    /// `false` when the slot's region has been freed.
     pub fn set(&mut self, slot: Slot, value: V) -> bool {
         let Some(index) = self.resolve(slot) else {
             return false;
@@ -370,18 +471,18 @@ impl<V: Clone + Default> Arena<V> {
         ))
     }
 
-    /// Stores a `cell_update`'s answer and clears the mark, even when the region has closed.
+    /// Stores a `cell_update`'s answer and clears the mark, even when the region has been freed.
     pub fn put_back(&mut self, slot: Slot, value: V) -> bool {
         self.taken.retain(|s| *s != slot);
         self.set(slot, value)
     }
 
-    /// Closes `region` and every region its owner opened after it, and no other owner's.
+    /// Closes `region` and every region its owner opened after it, and no other owner's: each is
+    /// freed, or parked while a pin holds it.
     pub fn close(&mut self, region: RegionId) -> Reclaim {
-        let Some(at) = self.scope(region) else {
+        let Some((at, owner)) = self.scope(region) else {
             return Reclaim::NotOpen;
         };
-        let owner = self.scopes[at].owner;
         let mut freed = 0;
         loop {
             let innermost = self.owners[owner.0].innermost as usize;
@@ -430,13 +531,24 @@ impl<V: Clone + Default> Arena<V> {
         })
     }
 
-    fn scope(&self, region: RegionId) -> Option<usize> {
-        let at = region.scope as usize;
-        let scope = self.scopes.get(at)?;
-        (scope.open && scope.generation == region.generation).then_some(at)
+    /// An open region's scope, and the owner whose nesting holds it.
+    fn scope(&self, region: RegionId) -> Option<(usize, Owner)> {
+        let at = self.named(region)?;
+        match self.scopes[at].state {
+            State::Open { owner, .. } => Some((at, owner)),
+            State::Parked { .. } | State::Free { .. } => None,
+        }
     }
 
-    /// The live index a slot names, or `None` if its region has closed.
+    /// The scope `region` still names: open or parked, never freed.
+    fn named(&self, region: RegionId) -> Option<usize> {
+        let at = region.scope as usize;
+        let scope = self.scopes.get(at)?;
+        let freed = matches!(scope.state, State::Free { .. });
+        (!freed && scope.generation == region.generation).then_some(at)
+    }
+
+    /// The live index a slot names, or `None` once its region has been freed.
     fn resolve(&self, slot: Slot) -> Option<usize> {
         let index = slot.index as usize;
         if index >= self.top {
@@ -446,21 +558,54 @@ impl<V: Clone + Default> Arena<V> {
         (meta.link != FREE && meta.generation == slot.generation).then_some(index)
     }
 
-    /// Frees `owner`'s innermost region and answers how many slots it held.
+    /// Puts scope `at` on `owner`'s nesting as its innermost.
+    fn push(&mut self, owner: Owner, at: u32, pins: u32) {
+        if owner.0 >= self.owners.len() {
+            self.owners.resize(owner.0 + 1, Nesting::EMPTY);
+        }
+        let nesting = &mut self.owners[owner.0];
+        self.scopes[at as usize].state = State::Open {
+            owner,
+            below: nesting.innermost,
+            pins,
+        };
+        nesting.innermost = at;
+        nesting.depth += 1;
+        self.depth += 1;
+    }
+
+    /// Takes `owner`'s innermost region off its nesting, parked while a pin holds it and freed
+    /// otherwise, and answers how many slots that freed.
     fn pop(&mut self, owner: Owner) -> usize {
         let nesting = &mut self.owners[owner.0];
-        let at = nesting.innermost as usize;
-        let scope = &mut self.scopes[at];
-        nesting.innermost = scope.below;
+        let at = nesting.innermost;
+        let State::Open { below, pins, .. } = self.scopes[at as usize].state else {
+            unreachable!("a nesting links open regions only")
+        };
+        nesting.innermost = below;
         nesting.depth -= 1;
         self.depth -= 1;
+        match NonZeroU32::new(pins) {
+            Some(pins) => {
+                self.scopes[at as usize].state = State::Parked { pins };
+                0
+            }
+            None => self.release(at),
+        }
+    }
+
+    /// Frees a region on no nesting: drops its slots, and moves its scope's generation on so no id
+    /// of it matches again. Answers how many slots it held.
+    fn release(&mut self, at: u32) -> usize {
+        let scope = &mut self.scopes[at as usize];
         let (mut slot, cells) = (scope.newest, scope.cells);
-        scope.open = false;
         scope.generation = scope.generation.wrapping_add(1);
-        scope.below = self.free_scopes;
+        scope.state = State::Free {
+            next: self.free_scopes,
+        };
         scope.newest = NIL;
         scope.cells = 0;
-        self.free_scopes = at as u32;
+        self.free_scopes = at;
         // Newest first, so while one owner allocates each free lowers `top`.
         while slot != NIL {
             slot = self.free(slot as usize);
