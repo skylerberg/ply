@@ -380,6 +380,7 @@ const MAINTAINED: &[&str] = &[
     "crates/ply-cli/ply",
     "crates/ply-std/ply",
     "crates/ply-corpus/ply",
+    "crates/ply-corpus/checks",
     "crates/ply-test/ply",
     "crates/ply-prove/ply",
     "crates/ply-registry/ply",
