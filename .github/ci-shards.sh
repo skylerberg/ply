@@ -997,6 +997,13 @@ cmd_verify() {
       fi
     done <<< "$names"
   done
+  # Every entry that does not run alone is some partition's, so the round robin stays total.
+  local placed k
+  placed=$(for ((k = 1; k <= PARTITIONS; k++)); do cmd_corpus_for_partition "$k"; done | sort)
+  if [[ $placed != "$(grep -vxF -f <(printf '%s\n' "${CORPUS_ALONE[@]}") <<< "$entries" | sort)" ]]; then
+    echo "FAIL: the partitions' corpus runs are not every entry that does not run alone" >&2
+    failures=$((failures + 1))
+  fi
   if ! grep -q 'ci-corpus\.sh' "$workflow"; then
     echo "FAIL: no job in $workflow runs ci-corpus.sh, so the partitions' corpus runs run nowhere" >&2
     failures=$((failures + 1))
