@@ -4,6 +4,7 @@
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, FAILED_UNWIND, FrameClause, HandlerFrame, call_value, drop_frame};
 use crate::stack::{Stack, switch};
+use ply_eval::arena::{Owner, Pin, RegionId};
 use ply_eval::{Diagnostic, Symbol, codes};
 
 pub struct Detached {
@@ -27,6 +28,9 @@ pub struct Detached {
     state: State,
     captures: Vec<Capture>,
     live: Option<usize>,
+    /// The regions around the `handle` whose cells the body reaches, from [`pin_enclosing`]:
+    /// pinned for as long as the body's own stack can run again.
+    enclosing: Vec<Pin>,
 }
 
 /// What a stop on the body's own stack leaves behind, so the body can be run from it again.
@@ -38,6 +42,9 @@ struct Capture {
     frames: Vec<HandlerFrame>,
     /// The snapshot's live heap words, held once for it and once more per restore.
     pins: Vec<Word>,
+    /// With a snapshot, the regions open on the body's own stack at the stop, outermost first,
+    /// which a restore runs inside again: pinned, so their closes keep their cells.
+    regions: Vec<Pin>,
     /// The entry's count of at-most-once host operations when this stop was captured.
     born: u64,
     resumes: u32,
@@ -63,7 +70,10 @@ const ONE_SHOT: &str = "the region this continuation was captured in has already
 pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, body: Word) -> Word {
     let c = unsafe { &mut *ctx };
     let id = c.detached.len();
-    let frames = c.open_stack(Some(c.current));
+    let opener = c.current;
+    let enclosing = pin_enclosing(c, opener);
+    let frames = c.open_stack(Some(opener));
+    c.stacks[frames].body = Some(id);
     c.stacks[frames]
         .list
         .push(HandlerFrame::detached(clauses, id));
@@ -87,6 +97,7 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
         state: State::Fresh,
         captures: Vec::new(),
         live: None,
+        enclosing,
     });
     let answer = unsafe { resume(ctx, id, None, None) };
     let c = unsafe { &mut *ctx };
@@ -98,12 +109,60 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
     answer
 }
 
-/// Once the entry has returned no body can be resumed, so none holds a region any longer.
+/// Once the entry has returned no body can be resumed, so none holds a region any longer and none
+/// pins one.
 pub(crate) fn release_all(c: &mut Ctx) {
     for id in 0..c.detached.len() {
         let frames = c.detached[id].frames;
         c.release_regions(frames);
+        let d = &mut c.detached[id];
+        for capture in &mut d.captures {
+            for pin in capture.regions.drain(..) {
+                c.cells.unpin(pin);
+            }
+        }
+        for pin in d.enclosing.drain(..) {
+            c.cells.unpin(pin);
+        }
     }
+}
+
+/// Pins every region whose cells code written on `stack` reaches: those open on it, then, for a
+/// detached body's stack, the regions that body pins around its own `handle`, and for a task's,
+/// those around the region it runs in.
+fn pin_enclosing(c: &mut Ctx, stack: usize) -> Vec<Pin> {
+    let mut pins = Vec::new();
+    let mut at = stack;
+    loop {
+        pins.extend(pin_open(c, at));
+        if at == Owner::ENTRY.0 {
+            break;
+        }
+        if let Some(body) = c.stacks[at].body {
+            // Its own open walked on from here, and its regions may have parked since.
+            let held = &c.detached[body].enclosing;
+            pins.extend(held.iter().map(|pin| c.cells.repin(pin)));
+            break;
+        }
+        match c.stacks[at].entered_from {
+            Some(outer) => at = outer,
+            None => break,
+        }
+    }
+    pins
+}
+
+/// Pins every region `stack` holds open, outermost first.
+fn pin_open(c: &mut Ctx, stack: usize) -> Vec<Pin> {
+    let open: Vec<RegionId> = c.cells.nesting(Owner(stack)).collect();
+    open.into_iter()
+        .rev()
+        .map(|region| {
+            c.cells
+                .pin(region)
+                .expect("a region on its owner's nesting is open")
+        })
+        .collect()
 }
 
 /// Runs the body from where it stopped, `answer` returned from its `perform`, until it stops again.
@@ -201,12 +260,14 @@ pub(crate) unsafe fn resume(
     }
 }
 
-/// A finished body keeps its stack, closures and the regions it left open only while a snapshot
-/// could be restored onto it.
+/// A finished body gives back the regions it left open, those its snapshots pin staying parked for
+/// a restore, and keeps its stack, closures and enclosing regions only while a snapshot could be
+/// restored onto it.
 fn finish(c: &mut Ctx, id: usize) {
     let d = &mut c.detached[id];
     d.state = State::Done;
     d.live = None;
+    let frames = d.frames;
     if d.captures.iter().all(|k| k.bytes.is_none()) {
         d.stack = None;
         if d.body != 0 {
@@ -217,23 +278,25 @@ fn finish(c: &mut Ctx, id: usize) {
             heap::dec(d.ret);
             d.ret = 0;
         }
-        let frames = d.frames;
-        c.release_regions(frames);
+        for pin in d.enclosing.drain(..) {
+            c.cells.unpin(pin);
+        }
     }
+    c.release_regions(frames);
 }
 
 /// Records the stop the body just made and answers its capture's index.
 fn capture_stop(c: &mut Ctx, id: usize) -> usize {
     let d = &c.detached[id];
-    let (sp, floor) = (d.sp, d.saved_floor);
+    let (sp, floor, own) = (d.sp, d.saved_floor, d.frames);
     // A stop from a task's stack has none to copy, and so has one the body grew onto: the frames
     // waiting there are not the ones a restore would write back.
-    let live = if d.saved_current == d.frames {
+    let live = if d.saved_current == own {
         d.stack.as_ref().and_then(|stack| stack.live(sp))
     } else {
         None
     };
-    let (bytes, frames, pins) = if let Some(live) = live {
+    let (bytes, frames, pins, regions) = if let Some(live) = live {
         let bytes = live.to_vec();
         let mut pins = Vec::new();
         for chunk in bytes.chunks_exact(8) {
@@ -243,10 +306,10 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
                 pins.push(w);
             }
         }
-        let frames = crate::rt::clone_frames(&c.stacks[d.frames].list);
-        (Some(bytes), frames, pins)
+        let frames = crate::rt::clone_frames(&c.stacks[own].list);
+        (Some(bytes), frames, pins, pin_open(c, own))
     } else {
-        (None, Vec::new(), Vec::new())
+        (None, Vec::new(), Vec::new(), Vec::new())
     };
     let born = c.host_ops;
     let d = &mut c.detached[id];
@@ -256,6 +319,7 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
         bytes,
         frames,
         pins,
+        regions,
         born,
         resumes: 0,
     });
@@ -281,7 +345,8 @@ fn replayed(c: &mut Ctx, id: usize, k: usize) -> Option<Diagnostic> {
     None
 }
 
-/// Puts capture `k`'s snapshot back on the body's stack; `false` when it has none.
+/// Puts capture `k`'s snapshot back on the body's stack; `false` when it has none. The cells stay
+/// as they are: a restored body reads what the runs before it wrote.
 fn restore(c: &mut Ctx, id: usize, k: usize) -> bool {
     let d = &c.detached[id];
     let Some(bytes) = d.captures[k].bytes.as_ref() else {
@@ -299,6 +364,16 @@ fn restore(c: &mut Ctx, id: usize, k: usize) -> bool {
     let (own, sp, floor) = (d.frames, d.captures[k].sp, d.captures[k].floor);
     for f in std::mem::replace(&mut c.stacks[own].list, frames) {
         drop_frame(f);
+    }
+    // The restored frames close the regions open at the stop, so those go back on, over nothing
+    // the stack still holds.
+    c.release_regions(own);
+    for pin in &c.detached[id].captures[k].regions {
+        let reopened = c.cells.reopen(pin, Owner(own));
+        debug_assert!(
+            reopened,
+            "a capture's region is parked once its stack lets it go"
+        );
     }
     let d = &mut c.detached[id];
     d.sp = sp;
@@ -354,7 +429,7 @@ extern "C" fn entry(arg: usize) {
     let frames = c.detached[id].frames;
     let frame = c.stacks[frames].list.pop();
     // A zero-shot clause of this frame unwinds to it; `return` is not applied. What the body left
-    // open goes back with its stack in `finish`, since a snapshot may still resume into it.
+    // open goes back in `finish`.
     if c.failed == FAILED_UNWIND
         && let Some((stack, depth, v)) = c.unwind.take()
     {

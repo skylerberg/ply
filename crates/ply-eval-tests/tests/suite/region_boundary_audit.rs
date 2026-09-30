@@ -111,6 +111,21 @@ fn boxed() -> Boxed = with_cell[log](41) { c -> Wrap(|| cell_get(c)) }
     );
 }
 
+/// The body reads a cell of the region enclosing its `handle`, and is resumed only once that region
+/// has closed: the region's cell outlives its close for as long as the body can run.
+#[test]
+fn the_parked_continuation_runs_on_the_tier_and_reads_its_regions_cell() {
+    let compiled = Compiled::new(PARKED);
+    let (mut machine, tier) = compiled.machine_and_tier();
+    let test = compiled.index_of("the parked continuation still reads its region's cell");
+
+    machine
+        .eval_test(test)
+        .expect("the resumed body reads 41 from the closed region's cell");
+
+    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+}
+
 #[test]
 fn a_cell_from_another_arena_is_refused_at_the_entry_point() {
     let compiled = Compiled::new(PARKED);

@@ -167,3 +167,38 @@ fn the_program_regions_close_on_every_stack_down_to_the_fixture() {
     assert_eq!(int_of(&regions, seeded), 7);
     assert_eq!((regions.total_depth(), regions.live()), (2, 1));
 }
+
+/// A `handle` opened on the entry's own stack pins the fixture's region and the entry's, which no
+/// close during a run reaches: giving the pins back leaves both open, and a reset then frees the
+/// entry's region as it would an unpinned one.
+#[test]
+fn the_floor_regions_stay_open_through_their_pins_and_a_reset_still_frees_the_entry_region() {
+    let fixture = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(7))));
+    let (mut regions, handle) = fixture.open();
+    let seeded = handle.as_cell(Span::DUMMY, "the handle").expect("a cell");
+    let floor: Vec<_> = regions.nesting(Owner::ENTRY).collect();
+    let pins: Vec<_> = floor
+        .iter()
+        .map(|&region| regions.pin(region).expect("the floor is open"))
+        .collect();
+    let scratch = regions.alloc_cell(Value::Int(1));
+
+    regions.close_program_regions();
+    for pin in pins {
+        assert_eq!(
+            regions.unpin(pin),
+            0,
+            "an open region's unpin frees nothing"
+        );
+    }
+
+    assert_eq!(regions.depth(Owner::ENTRY), 2);
+    assert_eq!(int_of(&regions, scratch), 1);
+
+    regions.reset();
+
+    assert!(!regions.contains(scratch));
+    assert_eq!(regions.kind(floor[0]), None, "the entry's region was freed");
+    assert_eq!(int_of(&regions, seeded), 7);
+    assert_eq!((regions.depth(Owner::ENTRY), regions.live()), (2, 1));
+}
