@@ -368,7 +368,7 @@ nondet effect net {
 }
 
 test/nondet "lexically enclosing" {
-  simulate { net.send[socket](1) }
+  simulate { assert_eq(net.send[socket](1), 1) }
 }
 "#,
         r#"
@@ -379,7 +379,7 @@ nondet effect net {
 fn shout() -> Int / {net.write[socket]} = net.send[socket](1)
 
 test/nondet "reached through a call" {
-  simulate { shout() }
+  simulate { assert_eq(shout(), 1) }
 }
 "#,
     ] {
@@ -410,7 +410,7 @@ nondet effect net {
 }
 
 test/nondet "hermetic, in a region" {
-  simulate { net.send[socket](1) }
+  simulate { assert_eq(net.send[socket](1), 1) }
 }
 "#,
     );
@@ -439,7 +439,7 @@ nondet effect net {
 }
 
 test/nondet "a socket under a seed" {
-  simulate { net.send[socket](1) }
+  simulate { assert_eq(net.send[socket](1), 1) }
 }
 "#,
         );
@@ -733,7 +733,7 @@ nondet effect net {
 }
 
 test "a det test reaching a socket" {
-  net.send[socket](1)
+  assert_eq(net.send[socket](1), 1)
 }
 "#;
     let diagnostics = Compiled::rejected_in("t", source);

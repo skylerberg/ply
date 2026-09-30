@@ -33,8 +33,9 @@ pub use upstream::Upstream;
 pub const RUNTIME_VERSION: &str = "0.16.0";
 
 /// Bumping this discards every filed row and interface, source fingerprint and front-end answer.
-/// What a slot holds is the compiler's `front.Filing` shape, so a change to it is a bump here.
-pub const FRONTEND_VERSION: &str = "0.30.0";
+/// A slot holds a `front.Filing` the checker accepted, so a change to that shape or to what the
+/// checker accepts is a bump here.
+pub const FRONTEND_VERSION: &str = "0.31.0";
 
 /// Bumping this re-attempts every obligation and re-runs no test.
 pub const PROVER_VERSION: &str = "0.8.0";
