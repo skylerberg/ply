@@ -8,19 +8,28 @@
 // A deployed artifact runs out of its own verified definitions rather than a source tree, so it
 // is a second shape of the same report: the same keys wherever the two agree, the file and its
 // digest where they do not.
+//
+// A run of sources walks them first and hashes what it read: when an earlier run of the same
+// closure filed its front end's answer under that key, the machine takes it, and this run runs no
+// front end at all. Either way the machine is handed the same answer over this run's own files,
+// so the run reports the same whichever it was.
 
 import args (Flags, from_argv, style_of)
 import config_schema
 import compiler.resolve (Diag, Label)
 import diagnostic (Place, Spot, spot_of, all_to_json, all_to_text)
 import entry (Main, Module, entry_point, no_module)
-import program (Front, Timed, front_of, no_front, timed_load)
+import env (env)
+import program (Timed, front_of, timed_over, usable)
 import builder (builder)
 import cache (store)
+import reused (Toolchain, short, walked)
+import sources
+import sources (load_resolved)
 import std.fs (fs)
 import std.time (time)
 import report (Answer, ind, ok_code, compile_error, count_of, refused, warning_lines)
-import std.json (Json, Null, Str, Bool, Number, Array, Member, object, to_string)
+import std.json (Json, Null, Str, Bool, Number, Array, Member, Object, object, to_string)
 import std.process (process, Captured, captured, out_step, err_step)
 import style (Style, dim, plain, red)
 
@@ -28,7 +37,7 @@ import style (Style, dim, plain, red)
 // the path the line named, or `.`.
 
 import machine (Artifact, Deployed, Bound, Counters, Ended, Options, Program, Project, Refusal,
-                Signals, Stopping, Target, Teardown, Trace, machine, default_options)
+                Signals, Stopping, Target, Teardown, Trace, Walked, machine)
 
 // --- Small things -----------------------------------------------------------
 
@@ -477,7 +486,7 @@ fn chosen(
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, machine.configure[run], machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], store.known[cache], store.file[cache]} = {
+) -> Answer / {builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.configure[run], machine.load[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], store.known[cache], store.file[cache]} = {
   let s: Style = style_of(flags);
   // An artifact is not a program to analyse: what it holds is its own definitions, and the front
   // end never sees it. Only sources are a load this side runs, so only their schema is resolved
@@ -485,20 +494,12 @@ pub fn run(
   if is_artifact(root_of(flags)) {
     match config_schema::misspelled(options.config.schema) {
       Some(d) -> unbound(s, { diags: [d], places: [], artifact: None }),
-      None -> running(s, flags, options, None),
-    }
-  } else {
-    let t: Timed = timed_load(flags.paths);
-    match t.program.whole {
-      // A load refusal, in the shape the machine's own refusals take: nothing ran, and the
-      // diagnostics say why.
-      None -> unloaded(s, { diags: t.program.diags, places: t.program.places, artifact: None }),
-      Some(w) -> match config_schema::refusal(w, options.config.schema) {
-        Some(d) -> unbound(s, { diags: [d], places: t.program.places, artifact: None }),
-        None -> running(s, flags, options, Some(front_of(t, w))),
+      None -> {
+        machine.configure[run](options);
+        over(s, flags, machine.load[run](root_of(flags), None, None))
       },
     }
-  }
+  } else { sourced(s, flags, options) }
 }
 
 /// Whether a path names a built artifact rather than sources. `ply build` writes them, and the
@@ -506,19 +507,146 @@ pub fn run(
 fn is_artifact(path: String) -> Bool =
   string_ends_with(path, ".plyx") || string_ends_with(path, ".plyz")
 
-// The run itself, over the front end `run` loaded, or over the artifact the machine reads.
-fn running(
+// A run of sources: the walk, then the machine over the answer an earlier run of the same closure
+// filed under what the walk hashes to, or over this run's own front end when none is filed.
+fn sourced(
   s: Style,
   flags: Flags,
   options: Options,
-  front: Option<Front>,
-) -> Answer / {machine.configure[run], machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} = {
+) -> Answer / {builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.configure[run], machine.load[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], store.known[cache], store.file[cache]} = {
+  let started = time.elapsed_ms();
+  let project: sources::Project = load_resolved(flags.paths);
+  let tools: Toolchain = { stamp: env.shipped_digest[sys](), version: env.binary_version[sys]() };
+  let walk: Walked = walked(tools, project, options.config.schema);
   machine.configure[run](options);
-  match machine.load[run](root_of(flags), front) {
-    Err(why) -> unloaded(s, why),
-    Ok(t) -> chosen(s, flags, t),
+  let asked = time.elapsed_ms();
+  let kept: Option<Target> = if usable(project) { machine.reuse[run](root_of(flags), walk) }
+  else { None };
+  match kept {
+    Some(t) ->
+      loaded_over(s, flags, Ok(t), {
+        reused: true,
+        key: walk.key,
+        read_ms: asked - started,
+        front_ms: 0,
+        file_ms: 0,
+        load_ms: time.elapsed_ms() - asked,
+      }),
+    None -> built(s, flags, options, project, walk.key, started),
   }
 }
+
+// This run's own front end, and the machine over its answer, which the machine files under the
+// walk's key once the load holds.
+fn built(
+  s: Style,
+  flags: Flags,
+  options: Options,
+  project: sources::Project,
+  key: String,
+  started: Int,
+) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], store.known[cache], store.file[cache]} = {
+  let t: Timed = timed_over(flags.paths, project, started);
+  match t.program.whole {
+    // A load refusal, in the shape the machine's own refusals take: nothing ran, and the
+    // diagnostics say why.
+    None -> unloaded(s, { diags: t.program.diags, places: t.program.places, artifact: None }),
+    Some(w) -> match config_schema::refusal(w, options.config.schema) {
+      Some(d) -> unbound(s, { diags: [d], places: t.program.places, artifact: None }),
+      None -> {
+        let asked = time.elapsed_ms();
+        let target = machine.load[run](root_of(flags), Some(front_of(t, w)), Some(key));
+        loaded_over(s, flags, target, {
+          reused: false,
+          key: key,
+          read_ms: t.read_ms,
+          front_ms: t.front_ms,
+          file_ms: t.file_ms,
+          load_ms: time.elapsed_ms() - asked,
+        })
+      },
+    },
+  }
+}
+
+// The run over the target the machine loaded, or the machine's refusal of it.
+fn over(
+  s: Style,
+  flags: Flags,
+  target: Result<Target, Refusal>,
+) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} =
+  match target { Err(why) -> unloaded(s, why), Ok(t) -> chosen(s, flags, t) }
+
+// The same over sources, saying where the load's time went when `--explain` asks: aloud before
+// the entry runs, or in the one document under `--json`.
+fn loaded_over(
+  s: Style,
+  flags: Flags,
+  target: Result<Target, Refusal>,
+  l: Loading,
+) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} =
+  match target {
+    Err(why) -> unloaded(s, why),
+    Ok(t) -> {
+      if flags.explain && !flags.json { process.err[proc](loading_line(s, l)) };
+      explained(flags, l, chosen(s, flags, t))
+    },
+  }
+
+// --- Where a load's time went --------------------------------------------------
+
+// A load over sources: whether its front end ran or the answer an earlier run filed under its key
+// was taken, and what each phase cost.
+type Loading = {
+  reused: Bool,
+  key: String,
+  read_ms: Int,
+  front_ms: Int,
+  file_ms: Int,
+  load_ms: Int,
+}
+
+fn ms(n: Int) -> String = int_to_string(n) ++ "ms"
+
+fn loading_line(s: Style, l: Loading) -> String = {
+  let phases = if l.reused { ["read " ++ ms(l.read_ms), "load " ++ ms(l.load_ms)] } else {
+    [
+      "read " ++ ms(l.read_ms),
+      "front " ++ ms(l.front_ms),
+      "write back " ++ ms(l.file_ms),
+      "load " ++ ms(l.load_ms),
+    ]
+  };
+  ind()
+    ++ dim(
+      s,
+      "front end   " ++ (if l.reused { "reused " } else { "built " }) ++ short(l.key) ++ " · "
+        ++ joined(phases, " · "),
+    )
+}
+
+fn loading_json(l: Loading) -> Json =
+  object([
+    { key: "reused", value: Bool(l.reused) },
+    { key: "key", value: Str(l.key) },
+    {
+      key: "phases",
+      value: object([
+        { key: "read", value: num(l.read_ms) },
+        { key: "front", value: num(l.front_ms) },
+        { key: "write_back", value: num(l.file_ms) },
+        { key: "load", value: num(l.load_ms) },
+      ]),
+    },
+  ])
+
+fn explained(flags: Flags, l: Loading, a: Answer) -> Answer =
+  if !(flags.explain && flags.json) { a } else {
+    match a.json {
+      Object(members) -> { ..a, json: Object(map_insert(members, "front_end", loading_json(l))) },
+      _ -> a,
+    }
+  }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -612,12 +740,20 @@ fn nothing() -> Refusal = { diags: [], places: [], artifact: None }
 type Ran = { answer: Answer, out: List<String>, err: List<String> }
 
 fn ran_over(flags: Flags, t: Result<Target, Refusal>, b: Result<Bound, Refusal>, e: Ended) -> Ran =
+  ran_loaded(flags, t, b, e, None)
+
+// The same over sources, whose load `l` says where the time went, when there is one to say.
+fn ran_loaded(
+  flags: Flags,
+  t: Result<Target, Refusal>,
+  b: Result<Bound, Refusal>,
+  e: Ended,
+  l: Option<Loading>,
+) -> Ran =
   with_cell[twin](captured([])) { io -> {
     let answer: Answer = handle {
-      running(plain(), flags, default_options(), Some(no_front()))
+      match l { None -> over(plain(), flags, t), Some(l) -> loaded_over(plain(), flags, t, l) }
     } with {
-      machine.configure[run](_options) -> (),
-      machine.load[run](_root, _front) -> t,
       machine.bound[run](named) -> b,
       machine.enter[run]() -> e,
       process.out[proc](text) -> cell_set(io, out_step(cell_get(io), text)),
@@ -863,4 +999,61 @@ test "what the machine reused is a count and a ratio, and no ratio at all over n
 test "a definition's module is its name without its own last segment" {
   assert_eq(module_of("m.main"), "m");
   assert_eq(module_of("store.orders.main"), "store.orders")
+}
+
+fn a_key() -> String = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+fn a_reuse() -> Loading =
+  { reused: true, key: a_key(), read_ms: 9, front_ms: 0, file_ms: 0, load_ms: 41 }
+
+fn a_build() -> Loading =
+  { reused: false, key: a_key(), read_ms: 7, front_ms: 1774, file_ms: 44, load_ms: 1392 }
+
+fn explaining() -> Flags = from_argv("run", ["--explain"])
+
+fn loaded(flags: Flags, l: Loading) -> Ran =
+  ran_loaded(flags, Ok(a_program()), Ok(a_binding()), answered_with("42"), Some(l))
+
+test "a run over a reused front end answers exactly as one over a front end it ran" {
+  assert_eq(loaded(bare(), a_reuse()), loaded(bare(), a_build()));
+  assert_eq(loaded(as_json(), a_reuse()), loaded(as_json(), a_build()));
+  assert_eq(
+    loaded(bare(), a_reuse()),
+    ran_over(bare(), Ok(a_program()), Ok(a_binding()), answered_with("42")),
+  )
+}
+
+test "`--explain` says whether the front end ran, under which key, and where the time went" {
+  let reused = loaded(explaining(), a_reuse());
+  assert_eq(nth(reused.err, 0), "   front end   reused b3:0123456789ab · read 9ms · load 41ms");
+  let built = loaded(explaining(), a_build());
+  assert_eq(
+    nth(built.err, 0),
+    "   front end   built b3:0123456789ab · read 7ms · front 1774ms · write back 44ms · load 1392ms",
+  );
+  // Said before the entry runs, ahead of what the binding discloses on the same stream.
+  assert_eq(nth(built.err, 1), nth(loaded(bare(), a_build()).err, 0));
+  assert_eq(built.answer, loaded(bare(), a_build()).answer)
+}
+
+test "`--json --explain` carries the load in the one document and says nothing aloud" {
+  let ran = loaded(from_argv("run", ["--json", "--explain"]), a_reuse());
+  assert_eq(ran.out, []);
+  assert_eq(ran.err, []);
+  let text = to_string(ran.answer.json);
+  assert(string_contains(text, "\"front_end\":{\"key\":\"" ++ a_key() ++ "\""));
+  assert(string_contains(text, "\"phases\":{\"front\":0,\"load\":41,\"read\":9,\"write_back\":0}"));
+  assert(string_contains(text, "\"reused\":true"));
+  assert(!string_contains(to_string(loaded(as_json(), a_reuse()).answer.json), "front_end"))
+}
+
+test "a load the machine refused says nothing about where its time went" {
+  let why: Refusal = {
+    diags: [a_diag(b"E0201", b"type mismatch", [])],
+    places: [],
+    artifact: None,
+  };
+  let ran = ran_loaded(explaining(), Err(why), Err(nothing()), answered_with(""), Some(a_build()));
+  assert_eq(ran.err, []);
+  assert_eq(ran.answer.code, 2)
 }

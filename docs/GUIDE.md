@@ -889,8 +889,8 @@ rather than raised.
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
 | `PLY_C_CACHE=DIR` | compiled unit cache (default under the temp directory) |
-| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them (default under the temp directory) |
-| `PLY_C_CACHE_MAX=BYTES` | cap on that cache, oldest entries swept first; `0` is no cap |
+| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them, and the front-end answers `ply run` files (§16) (default under the temp directory) |
+| `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_DUMP=NAME` | print one body's emitted C, or `*` for the unit's largest bodies |
@@ -2452,7 +2452,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, and how many definitions the front-end cache seeded and how many were checked; with `--types`, effect sets and provenance) |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, host, simulation |
-| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
+| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
@@ -2522,6 +2522,27 @@ time. `ply build`, `ply hosts`, `ply test
 `machine.load` of a program runs the whole front end. A cache that will not read
 is a warning and a cold check, never a failure; the run that files over one
 filed by a compiler whose shipped modules differed says so once, as `W0605`.
+
+`ply run` over sources goes further: once a load holds, the front end's answer
+is filed under a key of everything it and the `reuse fn` promise check (`E0127`)
+read — the name and bytes of every module the walk read, the root's manifest,
+each dependency's key, manifest and modules, the root's absolute path, the `ply`
+program and the modules it ships as the launcher gates them (so `PLY_C_EMITTER`
+too), the binary's version, and `--config-schema`. A later run whose walk hashes
+the same takes that answer and runs neither the front end nor the promise check,
+which the filed load passed; it binds, grants (`--allow`, `--exec`, `--fs`) and
+picks its entry anew, and reports exactly what a run that built the answer
+reports. Any edit to a module, a dependency or a manifest, another schema or
+another `ply` is a new key, and the front end runs again; `ply.lock` is not
+read by a run and is not in the key. A single `.ply` file keys that one module.
+The answers live under the stage root (`PLY_C_STAGE`, §8.6) in `run-fronts/`,
+one file per key, each written beside itself and renamed into place, so two runs
+of one package never read half of one; an entry that does not read is rebuilt
+and written over. They are swept with the stages, least recently used first, down to
+`PLY_C_CACHE_MAX`, never one used within the hour, and deleting them is always
+safe. `ply run --explain` says `reused` or `built`, the key, and what reading,
+the front end, filing into `.ply-cache` and the machine's load each took, on
+stderr before the entry runs, or as `front_end` in the `--json` document.
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed

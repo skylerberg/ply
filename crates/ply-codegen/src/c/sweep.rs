@@ -130,10 +130,17 @@ pub const USED: &str = ".used";
 /// The stage-directory entry holding one file per opened artifact, each swept on its own.
 pub const FRONTS: &str = "artifact-fronts";
 
+/// The stage-directory entry holding one file per closure `ply run` loaded, each swept on its own.
+pub const RUNS: &str = "run-fronts";
+
+/// The stage-directory entries that hold files swept one by one, where any other is a stage swept
+/// whole.
+const BY_FILE: [&str; 2] = [FRONTS, RUNS];
+
 /// An entry used within this long is never swept: a run may still be reading it.
 const RECENT: Duration = Duration::from_secs(3600);
 
-/// Records that a stage directory, or a file in [`FRONTS`], was just used.
+/// Records that a stage directory, or a file in one of [`BY_FILE`], was just used.
 pub fn used(path: &Path) {
     if path.is_dir() {
         let _ = std::fs::write(path.join(USED), b"");
@@ -143,7 +150,7 @@ pub fn used(path: &Path) {
 }
 
 /// Remove stage-directory entries, least recently used first, until the rest fits in `budget`.
-/// Each stage directory goes whole; each file under [`FRONTS`] goes on its own. Errors are
+/// Each stage directory goes whole; each file under one of [`BY_FILE`] goes on its own. Errors are
 /// ignored.
 pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
     let Ok(read) = std::fs::read_dir(root) else {
@@ -157,7 +164,7 @@ pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
         if !meta.is_dir() {
             continue;
         }
-        if e.file_name() == FRONTS {
+        if BY_FILE.iter().any(|name| e.file_name() == *name) {
             let Ok(fronts) = std::fs::read_dir(&path) else {
                 continue;
             };
