@@ -50,7 +50,7 @@ impl Model {
         loop {
             let enabled: Vec<TaskId> = (0..self.tasks)
                 .filter(|&t| pc[t] < 2)
-                .map(|t| TaskId(t as u32))
+                .map(|t| TaskId(t as u64))
                 .collect();
             if enabled.is_empty() {
                 break;

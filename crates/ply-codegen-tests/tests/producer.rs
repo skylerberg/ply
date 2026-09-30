@@ -869,12 +869,24 @@ impl ply_eval::HostHandler for Slow {
     }
 }
 
-/// A reactor that resolves every pending answer to three times its token on the next poll.
-struct Reactor;
+/// A reactor that resolves every pending answer to three times its token when next asked.
+#[derive(Default)]
+struct Reactor {
+    watched: std::cell::RefCell<Vec<u64>>,
+}
 
 impl ply_eval::HostRuntime for Reactor {
-    fn poll(&self, pending: &ply_eval::Pending) -> Result<Option<Value>, ply_eval::Diagnostic> {
-        Ok(Some(Value::Int(pending.token as i64 * 3)))
+    fn watch(&self, pending: &ply_eval::Pending) -> Result<(), ply_eval::Diagnostic> {
+        self.watched.borrow_mut().push(pending.token);
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, ply_eval::Diagnostic>)> {
+        self.watched
+            .take()
+            .into_iter()
+            .map(|token| (token, Ok(Value::Int(token as i64 * 3))))
+            .collect()
     }
 
     fn park(&self) -> Result<(), ply_eval::Diagnostic> {
@@ -960,7 +972,7 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
-        ctx.set_host(binding, Some(std::rc::Rc::new(Reactor)));
+        ctx.set_host(binding, Some(std::rc::Rc::new(Reactor::default())));
         ctx.begin(10_000);
         let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
         let words: Vec<i64> = args

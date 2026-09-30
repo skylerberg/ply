@@ -1,10 +1,10 @@
 //! The trusted computing base, as one list.
 
-use crate::pool::Bell;
+use crate::pool::{Bell, Inbox};
 use crate::signal::{self, Accepting, Shutdown};
 use crate::{certgen, config, fs, process, random, sched, tcp, time, trace};
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
-use ply_eval::{Diagnostic, Span, Value, codes};
+use ply_eval::{Diagnostic, Span, TaskId, Value, codes};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -124,7 +124,7 @@ impl Host {
         registry
     }
 
-    /// What a [`ply_eval::host::HostAnswer::Pending`] is polled on.
+    /// One per machine: the pools are shared, but a runtime collects only the tokens it watches.
     pub fn runtime(&self) -> Rc<dyn HostRuntime> {
         Rc::new(Facilities {
             net: Arc::clone(&self.net),
@@ -133,6 +133,7 @@ impl Host {
             trace: Arc::clone(&self.trace),
             shutdown: self.shutdown.clone(),
             bell: Arc::clone(&self.bell),
+            inboxes: Inboxes::default(),
         })
     }
 
@@ -186,22 +187,40 @@ struct Facilities {
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
     bell: Arc<Bell>,
+    inboxes: Inboxes,
+}
+
+/// Per facility, the tokens this runtime watches, as they resolve.
+#[derive(Default)]
+struct Inboxes {
+    net: Arc<Inbox>,
+    fs: Arc<Inbox>,
+    process: Arc<Inbox>,
 }
 
 impl HostRuntime for Facilities {
-    fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
         if self.net.owns(pending) {
-            return self.net.poll(pending);
+            return self.net.watch_into(pending, &self.inboxes.net);
         }
         if self.fs.owns(pending) {
-            return self.fs.poll(pending);
+            return self.fs.watch_into(pending, &self.inboxes.fs);
         }
         if let Some(process) = &self.process
             && process.owns(pending)
         {
-            return process.poll(pending);
+            return process.watch_into(pending, &self.inboxes.process);
         }
         Err(err_unowned(pending))
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        let mut resolved = self.net.collect(&self.inboxes.net);
+        resolved.extend(self.fs.collect(&self.inboxes.fs));
+        if let Some(process) = &self.process {
+            resolved.extend(process.collect(&self.inboxes.process));
+        }
+        resolved
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
@@ -326,6 +345,11 @@ impl HostRuntime for Facilities {
             None => Ok(()),
             Some(spans) => Err(spans),
         }
+    }
+
+    /// Closes the spans the retired task left open.
+    fn end_task(&self, machine: MachineId, task: TaskId) {
+        self.trace.end_task(machine, task);
     }
 }
 

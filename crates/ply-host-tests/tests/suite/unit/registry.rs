@@ -68,7 +68,7 @@ fn a_registry_and_a_runtime_come_from_one_host() {
     };
     assert_eq!(
         runtime
-            .poll(&stray)
+            .watch(&stray)
             .expect_err("a token nothing minted is refused")
             .code,
         codes::INTERNAL_ERROR

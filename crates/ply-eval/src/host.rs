@@ -154,8 +154,10 @@ pub trait HostHandler: Send + Sync {
 }
 
 pub trait HostRuntime {
-    /// `Ok(None)` when the token has not resolved.
-    fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic>;
+    /// Hands `pending` back through `resolved` once it resolves; refuses a token it did not mint.
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic>;
+    /// The watched tokens that resolved since the last call, each with its answer.
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)>;
     /// Waits until at least one outstanding token resolves.
     fn park(&self) -> Result<(), Diagnostic>;
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic>;
@@ -164,6 +166,11 @@ pub trait HostRuntime {
     fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic> {
         let _ = machine;
         Ok(())
+    }
+
+    /// Called when a production region retires `task`, whose id nothing will name again.
+    fn end_task(&self, machine: MachineId, task: crate::sim::TaskId) {
+        let _ = (machine, task);
     }
 
     fn stopping(&self) -> bool {

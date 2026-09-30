@@ -192,11 +192,11 @@ impl Simulation for Model {
                     Model::absorb(&mut tasks, i, on);
                 }
             }
-            order.push(TaskId(t as u32));
+            order.push(TaskId(t as u64));
             steps.push(Step {
                 region: SimId(0),
-                task: TaskId(t as u32),
-                enabled: enabled.iter().map(|&t| TaskId(t as u32)).collect(),
+                task: TaskId(t as u64),
+                enabled: enabled.iter().map(|&t| TaskId(t as u64)).collect(),
                 choice: chosen as u16,
                 accesses,
                 definition: Some(tasks[t].name.clone()),
@@ -665,7 +665,7 @@ fn the_backtrack_rule_queues_alternatives_when_the_racer_is_not_enabled() {
             mode,
         }])
     };
-    let step = |task: u32, enabled: &[u32], choice: u16, accesses: StepFootprint| Step {
+    let step = |task: u64, enabled: &[u64], choice: u16, accesses: StepFootprint| Step {
         region: SimId(0),
         task: TaskId(task),
         enabled: enabled.iter().map(|&t| TaskId(t)).collect(),
@@ -904,7 +904,7 @@ fn a_replay_that_does_not_reproduce_the_enabled_set_is_a_divergence() {
                 Mode::Write,
             ))])
         };
-        let step = |task: u32, choice: u16, accesses| Step {
+        let step = |task: u64, choice: u16, accesses| Step {
             region: SimId(0),
             task: TaskId(task),
             enabled: enabled.clone(),
@@ -916,7 +916,7 @@ fn a_replay_that_does_not_reproduce_the_enabled_set_is_a_divergence() {
         };
         Interleaving::passed(vec![
             step(
-                seed.choice(0).unwrap_or(0) as u32,
+                seed.choice(0).unwrap_or(0) as u64,
                 seed.choice(0).unwrap_or(0),
                 write("x"),
             ),
