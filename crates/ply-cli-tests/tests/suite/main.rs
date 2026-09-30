@@ -53,6 +53,7 @@ mod refcount_counters;
 mod registry;
 mod regressions;
 mod replace;
+mod reuse;
 mod routing_audit;
 mod shutdown;
 mod stdlib;

@@ -49,6 +49,16 @@ pub struct HandedFront {
     pub front: Duration,
     pub write_back: Duration,
     pub cached: bool,
+    pub promises: Promises,
+}
+
+/// Whether a front's `reuse fn` promises are known to hold. A front a caller hands over is checked
+/// by the load that takes it; one a run filed under its closure's key was filed only once that
+/// check passed, and the entry carries the fact to the load that reads it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Promises {
+    Unchecked,
+    Held,
 }
 
 /// The answer is read as it is handed over: a `Value` may not cross to another thread, and the load
@@ -85,6 +95,7 @@ pub fn handed_front_of(v: &ply_eval::Value, span: Span) -> Result<HandedFront, D
         front: millis("front_ms")? + started.elapsed(),
         write_back: millis("file_ms")?,
         cached: field_of(v, "cached", span)?.as_bool(span, "whether the load was cached")?,
+        promises: Promises::Unchecked,
     })
 }
 
