@@ -1,11 +1,8 @@
-use ply_eval::{Plan, Seed};
+use ply_eval::{Plan, SimMode};
 use ply_span::{Diagnostic, SourceId};
 use ply_store::{Outcome, Store};
-use ply_test::{
-    Isolation, Reason, Selection, group_by_conflict, is_seeded, parallelism, result_key, seed_key,
-    writes_seed_keys,
-};
-use ply_ty::{CheckOutput, Footprint, HashOutput, ModuleName};
+use ply_test::{Isolation, Reason, Selection, group_by_conflict, is_seeded, parallelism};
+use ply_ty::{CheckOutput, DefHash, Footprint, HashOutput, ModuleName};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Files a checked program's definitions as the CLI does before its tests run: each one's row and
@@ -145,11 +142,32 @@ fn test_hash(hashes: &HashOutput, index: usize) -> Option<ply_ty::DefHash> {
     hashes.tests.get(index).copied()
 }
 
-/// What a program decides for a run of tests, as a model: for each test, look its result key up in
-/// the store, and take a pass as the answer while anything else runs. The decision itself is the
-/// program's — `suite.select` in Ply — and this is here so a runner test can state the same choice
-/// without a program to ask. `plan` keys seeded tests, so a selection made against one plan says
-/// nothing about another.
+/// A stand-in for the key a program files a seeded test's result under. The runtime reads and
+/// writes under whatever it is handed, so a runner test needs only a key that moves with the plan;
+/// the encoding a program uses is `suite.keys`'s, and its tests pin it.
+pub fn plan_key(test: DefHash, plan: &Plan) -> DefHash {
+    stand_in(&format!("{test:?} {:?}", plan.clone().normalized()))
+}
+
+/// The same for one root of a plan answered root by root.
+pub fn root_key(test: DefHash, root: u64) -> DefHash {
+    stand_in(&format!("{test:?} root {root}"))
+}
+
+fn stand_in(text: &str) -> DefHash {
+    DefHash(*blake3::hash(text.as_bytes()).as_bytes())
+}
+
+fn per_root(plan: &Plan) -> bool {
+    plan.mode == SimMode::Random
+        && plan.budget == 1
+        && plan.steps == ply_eval::sim::DEFAULT_STEPS
+        && plan.path.is_empty()
+}
+
+/// What a program decides for a run of tests, as a model, so a runner test can hand the runtime a
+/// choice without a program to ask: a stored pass is the answer and anything else runs, filed under
+/// the stand-in keys above. The decision itself is the program's — `suite.select` in Ply.
 pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Plan) -> Selection {
     let plan = plan.clone().normalized();
     let total = check.tests.len();
@@ -157,24 +175,21 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
     let mut cached = Vec::new();
     let mut to_run = Vec::new();
     let mut narrowed: BTreeMap<usize, Plan> = BTreeMap::new();
+    let mut filed: BTreeMap<usize, Vec<DefHash>> = BTreeMap::new();
 
     for (index, test) in check.tests.iter().enumerate() {
         let seeded = is_seeded(&test.footprint);
         let hash = test_hash(hashes, index);
-        let stored = hash.map(|hash| store.get(result_key(hash, seeded, &plan)));
+        let key = |hash: DefHash| if seeded { plan_key(hash, &plan) } else { hash };
+        let stored = hash.map(|hash| store.get(key(hash)));
 
         // A `random` plan is one claim per root, so a widened root set owes only unanswered roots.
-        let owed = match (seeded, hash) {
-            (true, Some(hash)) if writes_seed_keys(&plan) => plan
+        let owed: Vec<u64> = match (seeded, hash) {
+            (true, Some(hash)) if per_root(&plan) => plan
                 .roots
                 .iter()
                 .copied()
-                .filter(|&root| {
-                    !matches!(
-                        store.get(seed_key(hash, &Seed::root(root))),
-                        Some(Outcome::Pass)
-                    )
-                })
+                .filter(|&root| !matches!(store.get(root_key(hash, root)), Some(Outcome::Pass)))
                 .collect(),
             _ => plan.roots.clone(),
         };
@@ -197,15 +212,29 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
             (Reason::Cached, Some(Some(outcome))) => cached.push((index, outcome)),
             (Reason::Cached, _) => cached.push((index, Outcome::Pass)),
             _ => {
-                if owed.len() < plan.roots.len() {
+                let ran = if !owed.is_empty() && owed.len() < plan.roots.len() {
                     narrowed.insert(
                         index,
                         Plan {
-                            roots: owed,
+                            roots: owed.clone(),
                             ..plan.clone()
                         }
                         .normalized(),
                     );
+                    owed
+                } else {
+                    plan.roots.clone()
+                };
+                if let Some(hash) = hash
+                    && !test.nondet
+                {
+                    let mut keys: Vec<DefHash> = if seeded && per_root(&plan) {
+                        ran.iter().map(|&root| root_key(hash, root)).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    keys.push(key(hash));
+                    filed.insert(index, keys);
                 }
                 to_run.push(index)
             }
@@ -238,6 +267,7 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
         parallelism,
         plan,
         narrowed,
+        filed,
         out_of_scope: BTreeSet::new(),
     }
 }

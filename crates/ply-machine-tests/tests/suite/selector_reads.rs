@@ -1,5 +1,6 @@
 //! `tester.keys`, `tester.hashed` and `tester.searched`: what a selector reads before anything
-//! runs. The selection itself is the program's to compute, so the host answers inputs only.
+//! runs. The selection and every key it is made with are the program's to compute, so the host
+//! answers inputs only.
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{Machine, Provider};
@@ -8,14 +9,14 @@ use ply_ty::Front;
 use std::collections::HashMap;
 
 /// A program that configures the tester over the directory it is handed, loads it, and reports
-/// what the tree holds: one test, its hash and its key, and the plan.
+/// what the tree holds: one test and its hash, and the plan.
 const OUTER: &str = r#"
 nondet effect tester {
   write configure[r](options: Options, front: Front) -> Unit
   read loaded[r]() -> Result<Program, Refusal>
   read bound[r]() -> Result<Unit, Refusal>
   read ran[r]() -> Ran
-  read trial[r](failure: Int, keys: List<{ name: String, ns: String }>) -> Trial
+  read trial[r](failure: Int, keys: List<{ name: String, ns: String }>, filed: Option<String>) -> Trial
   read stamped[r]() -> Option<List<String>>
   read keys[r]() -> List<Key>
   read hashed[r]() -> List<Hashed>
@@ -27,7 +28,7 @@ type Refusal = Unit
 type Ran = Unit
 type Key = {
   index: Int, label: String, name: String, module: String,
-  cache_key: Option<String>, seeded: Bool, nondet: Bool, cached: Option<String>,
+  hash: Option<String>, seeded: Bool, nondet: Bool,
 }
 type Hashed = { name: String, hash: String, test: Bool }
 type Trial = { outcome: TrialOutcome, cached: Bool }
@@ -83,13 +84,11 @@ fn main(root: String, front: Front) -> Bool / {
       let keys = tester.keys[r]();
       let hashed = tester.hashed[r]();
       let plan = tester.searched[r]();
-      // The project has one test: it is named program-wide, it has a key, nothing is cached
-      // under it yet, and the key is the test's own hash rather than a search's.
+      // The project has one test: it is named program-wide and hashed, and it reads no seed, so
+      // its own hash is what its result is keyed on.
       let one = match list_at(keys, 0) {
-        Some(k) -> match k.cache_key {
-          // The test is deterministic, so a selection may trust the store about it.
-          Some(_) -> !k.seeded && !k.nondet && k.cached == None && k.name == "p.doubles"
-            && k.label == "doubles",
+        Some(k) -> match k.hash {
+          Some(_) -> !k.seeded && !k.nondet && k.name == "p.doubles" && k.label == "doubles",
           None -> false,
         },
         None -> false,

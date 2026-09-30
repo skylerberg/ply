@@ -161,6 +161,48 @@ fn a_cached_run_reports_exactly_what_a_fresh_one_does() {
     assert_eq!(fresh, artifact(warm));
 }
 
+/// A law nothing proves is sampled, and a sample is filed under its plan's key: the next run reads it
+/// back from there rather than refusing it and sampling again.
+const SAMPLED: &str = "\
+fn size(m: Map<String, Int>) -> Int = map_len(m)
+
+law \"a map's key count is its length\"
+  forall (m: Map<String, Int>) {
+    len(map_keys(m)) == size(m)
+  }
+";
+
+#[test]
+fn a_sampled_obligation_is_read_back_as_a_cached_sample_rather_than_sampled_again() {
+    let dir = project(SAMPLED);
+    let cold = ply(dir.path()).args(["prove", "--json"]).output().unwrap();
+    let first = json_of(&cold);
+    assert_eq!(first["obligations"][0]["tier"], "property", "{first}");
+    assert_eq!(first["cached"], 0, "{first}");
+
+    let warm = ply(dir.path()).args(["prove", "--json"]).output().unwrap();
+    let second = json_of(&warm);
+    assert_eq!(
+        second["cached"], 1,
+        "the sample under its plan's key is the answer: {second}"
+    );
+    assert_eq!(
+        second["warnings"],
+        serde_json::json!([]),
+        "and nothing was refused: {second}"
+    );
+    assert_eq!(artifact(&cold), artifact(&warm));
+
+    let explained = stdout_of(
+        &ply(dir.path())
+            .args(["prove", "--explain"])
+            .output()
+            .unwrap(),
+    );
+    assert!(explained.contains("from: cached sample"), "{explained}");
+    assert!(!explained.contains("cache refused"), "{explained}");
+}
+
 #[test]
 fn review_reports_everything_as_unreviewed_until_something_is_accepted() {
     let dir = project(UNSPECIFIED);
@@ -189,6 +231,28 @@ fn accepting_a_review_makes_the_next_one_quiet() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
+    assert!(
+        stdout_of(&out).contains("no definition changed since the last accepted review"),
+        "{}",
+        stdout_of(&out)
+    );
+}
+
+/// A definition's spec is the set of its claims, however they were gathered: a baseline read back
+/// from the store is the same spec it was accepted as.
+#[test]
+fn accepting_a_review_of_claims_makes_the_next_one_quiet() {
+    let dir = project(SPECIFIED);
+    let accepted = ply(dir.path())
+        .args(["review", "--accept"])
+        .output()
+        .unwrap();
+    assert_eq!(accepted.status.code(), Some(0));
+
+    let out = ply(dir.path())
+        .args(["review", "--changed"])
+        .output()
+        .unwrap();
     assert!(
         stdout_of(&out).contains("no definition changed since the last accepted review"),
         "{}",

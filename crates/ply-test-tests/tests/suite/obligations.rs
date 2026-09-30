@@ -1,14 +1,12 @@
-use ply_prove::key::prove_key;
 use ply_prove::{
     CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, ObligationKind,
     ProvePlan, Rule, Tier, Vacuity, VacuityKind,
 };
 use ply_span::{Span, Symbol};
-use ply_store::{CachedCases, CachedEvidence, CachedObligation, ReviewRecord, Store};
-use ply_test::obligation::{self, Discharger, Laws, Moved, Reason};
-use ply_ty::ModuleName;
-use ply_ty::{CheckOutput, DefInfo, Footprint, LawBinder, Scheme, Type};
-use ply_ty::{DefHash, HashOutput};
+use ply_store::{CachedCases, CachedEvidence, CachedObligation, Store};
+use ply_test::obligation::{self, Choice, Discharger, from_cached, to_cached};
+use ply_ty::DefHash;
+use ply_ty::{Footprint, LawBinder, Type};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -41,30 +39,6 @@ fn hash(byte: u8) -> DefHash {
     DefHash([byte; 32])
 }
 
-fn check_of(names: &[&str]) -> CheckOutput {
-    let mut check = CheckOutput::default();
-    for name in names {
-        let (module, simple) = name.rsplit_once('.').unwrap_or(("m", name));
-        check.defs.insert(
-            Symbol::new(*name),
-            DefInfo {
-                name: Symbol::new(*name),
-                module: ModuleName::from_dotted(module),
-                simple_name: Symbol::new(simple),
-                scheme: Scheme::mono(Type::int()),
-                footprint: Footprint::empty(),
-                performed: Footprint::empty(),
-                row_aliases: Vec::new(),
-                constraints: Vec::new(),
-                spec: Vec::new(),
-                internally_effectful: true,
-                span: Span::DUMMY,
-            },
-        );
-    }
-    check
-}
-
 fn ensures(key: u8, owner: &str, index: usize) -> Obligation {
     Obligation {
         key: hash(key),
@@ -77,20 +51,6 @@ fn ensures(key: u8, owner: &str, index: usize) -> Obligation {
             ty: Type::int(),
             span: Span::DUMMY,
         }],
-        guarded: false,
-        host: false,
-        footprint: Footprint::empty(),
-    }
-}
-
-fn law(key: u8, label: &str) -> Obligation {
-    Obligation {
-        key: hash(key),
-        owner: Symbol::new(label),
-        kind: ObligationKind::Law,
-        span: Span::DUMMY,
-        frame: ply_prove::Frame::Pure,
-        binders: Vec::new(),
         guarded: false,
         host: false,
         footprint: Footprint::empty(),
@@ -110,14 +70,14 @@ fn proved() -> Discharge {
     Discharge::Held(Evidence::Proof(certificate()))
 }
 
-fn sampled(kept: u32) -> Discharge {
-    Discharge::Held(Evidence::Cases(CaseReport {
+fn cases(kept: u32) -> CaseReport {
+    CaseReport {
         generated: kept.max(200),
         kept,
         rejected: kept.max(200) - kept,
         roots: vec![0],
         instantiations: Vec::new(),
-    }))
+    }
 }
 
 fn refuted() -> Discharge {
@@ -157,7 +117,7 @@ impl Scripted {
         }
     }
 
-    /// Sorted: `obligation::prove` discharges over a `par_iter`, so arrival order is the pool's.
+    /// Sorted: a discharge runs over a `par_iter`, so arrival order is the pool's.
     fn asked(&self) -> Vec<DefHash> {
         let mut asked = self.asked.lock().unwrap().clone();
         asked.sort();
@@ -182,847 +142,126 @@ impl Discharger for Scripted {
     }
 }
 
-fn run(
+/// The program's decision, carried out: every answered obligation's evidence is read back from the
+/// key the program named, and only the rest are discharged.
+fn carried_out(
     obligations: Vec<Obligation>,
-    check: &CheckOutput,
-    laws: &Laws,
-    store: &mut Store,
-    plan: &ProvePlan,
+    store: &Store,
+    read: Vec<(usize, DefHash)>,
+    to_discharge: Vec<usize>,
     discharger: &Scripted,
 ) -> ply_prove::ProveReport {
-    obligation::prove(obligations, check, laws, store, plan, true, discharger).report
+    let choice = Choice {
+        claims: (0..obligations.len()).collect(),
+        domains: Vec::new(),
+        to_discharge,
+        read,
+    };
+    obligation::Asked::chosen(obligations, &choice, store, &ProvePlan::default())
+        .discharge(discharger)
 }
 
 #[test]
-fn an_obligation_discharges_once_and_stays_discharged() {
+fn evidence_is_read_back_from_the_key_the_program_named_and_only_the_rest_is_discharged() {
     let dir = TempRoot::new();
-    let check = check_of(&["m.f"]);
-    let laws = Laws::default();
-    let plan = ProvePlan::default();
-
-    let first = Scripted::new([(hash(1), proved())]);
     let mut store = dir.store();
-    let report = run(
-        vec![ensures(1, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &plan,
-        &first,
-    );
-    assert_eq!(
-        first.asked(),
-        vec![hash(1)],
-        "the first run has to do the work"
-    );
-    assert_eq!(report.count(Tier::Proved), 1);
-    assert_eq!(report.cached, 0);
+    // A sample, filed under a key of the program's choosing: nothing here encodes one.
+    store.put_obligation(hash(40), to_cached(&Evidence::Cases(cases(200))));
     store.flush().unwrap();
 
-    let second = Scripted::new([]);
-    let mut store = dir.store();
-    let report = run(
-        vec![ensures(1, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &plan,
-        &second,
+    let store = dir.store();
+    let scripted = Scripted::new([(hash(2), proved())]);
+    let report = carried_out(
+        vec![ensures(1, "m.f", 0), ensures(2, "m.g", 0)],
+        &store,
+        vec![(0, hash(40))],
+        vec![1],
+        &scripted,
     );
-    assert!(
-        second.asked().is_empty(),
-        "a discharged obligation must not be attempted again"
+    assert_eq!(
+        scripted.asked(),
+        vec![hash(2)],
+        "an answered obligation is not attempted"
     );
-    assert_eq!(report.cached, 1);
-    assert_eq!(report.count(Tier::Proved), 1);
+    let tiers: Vec<Option<Tier>> = report.obligations.iter().map(|(_, d)| d.tier()).collect();
+    assert_eq!(tiers, vec![Some(Tier::Property), Some(Tier::Proved)]);
 }
 
 #[test]
 fn every_tier_survives_a_reload_as_itself() {
     let dir = TempRoot::new();
-    let check = check_of(&["m.f", "m.g", "m.h"]);
-    let laws = Laws::default();
-    let plan = ProvePlan::default();
-    let obligations = || {
-        vec![
-            ensures(1, "m.f", 0),
-            ensures(2, "m.g", 0),
-            ensures(3, "m.h", 0),
-        ]
-    };
-
-    let first = Scripted::new([
-        (hash(1), proved()),
-        (hash(2), sampled(200)),
-        (hash(3), sampled(7)),
-    ]);
     let mut store = dir.store();
-    let before = run(obligations(), &check, &laws, &mut store, &plan, &first);
+    let evidence = [
+        Evidence::Proof(certificate()),
+        Evidence::Cases(cases(200)),
+        Evidence::Cases(cases(7)),
+    ];
+    for (i, e) in evidence.iter().enumerate() {
+        store.put_obligation(hash(i as u8), to_cached(e));
+    }
     store.flush().unwrap();
 
-    let second = Scripted::new([]);
-    let mut store = dir.store();
-    let after = run(obligations(), &check, &laws, &mut store, &plan, &second);
-
-    assert!(second.asked().is_empty());
-    let tiers = |report: &ply_prove::ProveReport| -> Vec<Option<Tier>> {
-        report.obligations.iter().map(|(_, d)| d.tier()).collect()
-    };
-    assert_eq!(
-        tiers(&after),
-        vec![
-            Some(Tier::Proved),
-            Some(Tier::Property),
-            Some(Tier::Example)
-        ]
-    );
-    assert_eq!(tiers(&before), tiers(&after));
+    let store = dir.store();
+    let tiers: Vec<Tier> = (0..evidence.len())
+        .map(|i| {
+            from_cached(&store.obligation(hash(i as u8)).expect("filed"))
+                .expect("readable")
+                .tier()
+        })
+        .collect();
+    assert_eq!(tiers, vec![Tier::Proved, Tier::Property, Tier::Example]);
 }
 
 #[test]
-fn widening_the_plan_re_runs_the_samples_and_none_of_the_proofs() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f", "m.g"]);
-    let laws = Laws::default();
-    let narrow = ProvePlan::default();
-    let wide = ProvePlan {
-        cases: narrow.cases * 4,
-        ..narrow.clone()
+fn an_entry_whose_label_disagrees_with_its_evidence_cannot_be_read() {
+    let entry = CachedObligation {
+        tier: "proved".to_string(),
+        evidence: CachedEvidence::Cases(CachedCases {
+            generated: 200,
+            kept: 200,
+            rejected: 0,
+            roots: vec![0],
+            instantiations: Vec::new(),
+        }),
     };
-    let obligations = || vec![ensures(1, "m.f", 0), ensures(2, "m.g", 0)];
-
-    let first = Scripted::new([(hash(1), proved()), (hash(2), sampled(200))]);
-    let mut store = dir.store();
-    run(obligations(), &check, &laws, &mut store, &narrow, &first);
-    store.flush().unwrap();
-
-    let second = Scripted::new([(hash(2), sampled(800))]);
-    let mut store = dir.store();
-    let report = run(obligations(), &check, &laws, &mut store, &wide, &second);
-    assert_eq!(
-        second.asked(),
-        vec![hash(2)],
-        "widening must re-open the sample and leave the proof alone"
-    );
-    assert_eq!(report.cached, 1);
-    assert_eq!(report.count(Tier::Proved), 1);
-    assert_eq!(report.count(Tier::Property), 1);
-}
-
-/// Under the bare key, `--prove-cases 10` would satisfy a run that asked for a thousand.
-#[test]
-fn a_sample_is_never_written_under_the_bare_key() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f"]);
-    let laws = Laws::default();
-    let plan = ProvePlan::default();
-
-    let mut store = dir.store();
-    let scripted = Scripted::new([(hash(1), sampled(200))]);
-    run(
-        vec![ensures(1, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &plan,
-        &scripted,
-    );
-
-    assert!(
-        store.obligation(hash(1)).is_none(),
-        "the bare key belongs to proofs alone"
-    );
-    assert!(store.obligation(prove_key(hash(1), &plan)).is_some());
+    assert!(from_cached(&entry).is_err());
 }
 
 #[test]
-fn a_refutation_a_vacuity_and_a_gap_are_never_cached() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f", "m.g", "m.h"]);
-    let laws = Laws::default();
-    let plan = ProvePlan::default();
-    let obligations = || {
-        vec![
-            ensures(1, "m.f", 0),
-            ensures(2, "m.g", 0),
-            ensures(3, "m.h", 0),
-        ]
-    };
+fn a_proof_that_did_not_establish_its_guard_cannot_be_read() {
+    let mut entry = to_cached(&Evidence::Proof(certificate()));
+    if let CachedEvidence::Proof(c) = &mut entry.evidence {
+        c.guard_satisfiable = false;
+    }
+    assert!(from_cached(&entry).is_err());
+}
 
-    let first = Scripted::new([
+#[test]
+fn only_what_was_asked_about_is_discharged_and_every_outcome_comes_back() {
+    let dir = TempRoot::new();
+    let store = dir.store();
+    let scripted = Scripted::new([
         (hash(1), refuted()),
         (hash(2), vacuous()),
         (hash(3), unattempted()),
     ]);
-    let mut store = dir.store();
-    run(obligations(), &check, &laws, &mut store, &plan, &first);
-    store.flush().unwrap();
-    assert_eq!(store.obligations_len(), 0);
-
-    let second = Scripted::new([]);
-    let mut store = dir.store();
-    run(obligations(), &check, &laws, &mut store, &plan, &second);
-    assert_eq!(
-        second.asked(),
-        vec![hash(1), hash(2), hash(3)],
-        "a red obligation re-runs until it goes green"
-    );
-}
-
-#[test]
-fn editing_the_implementation_moves_the_key_and_re_opens_the_obligation() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f"]);
-    let laws = Laws::default();
-    let plan = ProvePlan::default();
-
-    let first = Scripted::new([(hash(1), proved())]);
-    let mut store = dir.store();
-    run(
-        vec![ensures(1, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &plan,
-        &first,
-    );
-    store.flush().unwrap();
-
-    // Same clause after the body changed: the key covers the owner's hash, so it moves.
-    let second = Scripted::new([(hash(2), sampled(200))]);
-    let mut store = dir.store();
-    let report = run(
-        vec![ensures(2, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &plan,
-        &second,
-    );
-    assert_eq!(second.asked(), vec![hash(2)]);
-    assert_eq!(report.cached, 0);
-    assert_eq!(report.count(Tier::Proved), 0);
-}
-
-#[test]
-fn an_entry_whose_label_disagrees_with_its_evidence_is_refused() {
-    let dir = TempRoot::new();
-    let plan = ProvePlan::default();
-    let mut store = dir.store();
-    store.put_obligation(
-        hash(1),
-        CachedObligation {
-            tier: "proved".to_string(),
-            evidence: CachedEvidence::Cases(CachedCases {
-                generated: 200,
-                kept: 200,
-                rejected: 0,
-                roots: vec![0],
-                instantiations: Vec::new(),
-            }),
-        },
-    );
-
-    let answer = obligation::lookup(&store, hash(1), &plan);
-    assert_eq!(answer.reason, Reason::Refused);
-    assert!(answer.evidence.is_none());
-    assert!(answer.warning.is_some());
-}
-
-#[test]
-fn a_proof_written_under_a_plan_key_is_refused_rather_than_believed() {
-    let dir = TempRoot::new();
-    let plan = ProvePlan::default();
-    let mut store = dir.store();
-    store.put_obligation(
-        prove_key(hash(1), &plan),
-        obligation::to_cached(&Evidence::Proof(certificate())),
-    );
-
-    let answer = obligation::lookup(&store, hash(1), &plan);
-    assert_eq!(answer.reason, Reason::Refused);
-    assert!(answer.evidence.is_none());
-}
-
-#[test]
-fn a_proof_that_did_not_establish_its_guard_is_refused() {
-    let dir = TempRoot::new();
-    let plan = ProvePlan::default();
-    let mut store = dir.store();
-    let mut entry = obligation::to_cached(&Evidence::Proof(certificate()));
-    if let CachedEvidence::Proof(c) = &mut entry.evidence {
-        c.guard_satisfiable = false;
-    }
-    store.put_obligation(hash(1), entry);
-
-    assert_eq!(
-        obligation::lookup(&store, hash(1), &plan).reason,
-        Reason::Refused
-    );
-}
-
-#[test]
-fn a_refused_entry_reaches_the_caller_and_the_obligation_is_attempted_again() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f"]);
-    let laws = Laws::default();
-    let plan = ProvePlan::default();
-
-    let mut store = dir.store();
-    store.put_obligation(
-        hash(1),
-        CachedObligation {
-            tier: "proved".to_string(),
-            evidence: CachedEvidence::Cases(CachedCases {
-                generated: 200,
-                kept: 200,
-                rejected: 0,
-                roots: vec![0],
-                instantiations: Vec::new(),
-            }),
-        },
-    );
-
-    let scripted = Scripted::new([(hash(1), sampled(200))]);
-    let proved = obligation::prove(
-        vec![ensures(1, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &plan,
-        true,
+    let report = carried_out(
+        vec![
+            ensures(1, "m.f", 0),
+            ensures(2, "m.g", 0),
+            ensures(3, "m.h", 0),
+        ],
+        &store,
+        Vec::new(),
+        vec![0, 1, 2],
         &scripted,
     );
-    assert_eq!(scripted.asked(), vec![hash(1)]);
-    assert_eq!(proved.reasons, vec![Reason::Refused]);
-    assert_eq!(proved.report.cached, 0);
+    assert_eq!(scripted.asked(), vec![hash(1), hash(2), hash(3)]);
+    assert_eq!(report.refuted(), 1);
+    assert_eq!(report.vacuous(), 1);
+    assert_eq!(report.unattempted(), 1);
     assert!(
-        proved
-            .warnings
-            .iter()
-            .any(|w| w.code == ply_span::codes::CACHE_CORRUPT),
-        "a refusal has to be reported: {:?}",
-        proved.warnings
-    );
-    assert_eq!(proved.report.count(Tier::Property), 1);
-}
-
-#[test]
-fn narrowing_the_plan_re_opens_a_sample_and_leaves_a_proof_alone() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f", "m.g"]);
-    let laws = Laws::default();
-    let wide = ProvePlan {
-        cases: 800,
-        roots: vec![0, 1, 2, 3],
-        ..ProvePlan::default()
-    };
-    let narrow = ProvePlan::default();
-    let obligations = || vec![ensures(1, "m.f", 0), ensures(2, "m.g", 0)];
-
-    let first = Scripted::new([(hash(1), proved()), (hash(2), sampled(800))]);
-    let mut store = dir.store();
-    run(obligations(), &check, &laws, &mut store, &wide, &first);
-    store.flush().unwrap();
-
-    let second = Scripted::new([(hash(2), sampled(200))]);
-    let mut store = dir.store();
-    let report = run(obligations(), &check, &laws, &mut store, &narrow, &second);
-    assert_eq!(
-        second.asked(),
-        vec![hash(2)],
-        "a sample keyed by another plan is not this run's evidence"
-    );
-    assert_eq!(report.count(Tier::Proved), 1);
-}
-
-#[test]
-fn a_sample_is_keyed_by_the_root_set_as_well_as_the_case_count() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f"]);
-    let laws = Laws::default();
-    let one_root = ProvePlan::default();
-    let respelled = ProvePlan {
-        roots: vec![0, 0],
-        ..ProvePlan::default()
-    };
-    let two_roots = ProvePlan {
-        roots: vec![0, 1],
-        ..ProvePlan::default()
-    };
-
-    let first = Scripted::new([(hash(1), sampled(200))]);
-    let mut store = dir.store();
-    run(
-        vec![ensures(1, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &one_root,
-        &first,
-    );
-    store.flush().unwrap();
-
-    let same = Scripted::new([]);
-    let mut store = dir.store();
-    run(
-        vec![ensures(1, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &respelled,
-        &same,
-    );
-    assert!(same.asked().is_empty(), "two spellings of one plan are one");
-
-    let wider = Scripted::new([(hash(1), sampled(400))]);
-    let mut store = dir.store();
-    run(
-        vec![ensures(1, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &two_roots,
-        &wider,
-    );
-    assert_eq!(wider.asked(), vec![hash(1)]);
-}
-
-#[test]
-fn a_run_that_decides_nothing_claims_nothing_and_caches_nothing() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f", "m.g"]);
-    let laws = Laws::default();
-    let plan = ProvePlan::default();
-
-    let mut store = dir.store();
-    let proved = obligation::prove(
-        vec![ensures(1, "m.f", 0), ensures(2, "m.g", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &plan,
-        true,
-        &ply_test::obligation::Undecided,
-    );
-    assert_eq!(proved.report.unattempted(), 2);
-    assert_eq!(proved.report.count(Tier::Proved), 0);
-    assert_eq!(proved.report.coverage.covered, 0);
-    assert_eq!(proved.report.coverage.uncovered.len(), 2);
-    assert!(!proved.report.failed(), "a gap is not a failure");
-    store.flush().unwrap();
-    assert_eq!(store.obligations_len(), 0);
-}
-
-#[test]
-fn no_cache_reads_nothing_and_writes_nothing() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f"]);
-    let laws = Laws::default();
-    let plan = ProvePlan::default();
-
-    let mut store = dir.store();
-    let scripted = Scripted::new([(hash(1), proved())]);
-    let report = obligation::prove(
-        vec![ensures(1, "m.f", 0)],
-        &check,
-        &laws,
-        &mut store,
-        &plan,
-        false,
-        &scripted,
-    )
-    .report;
-    assert_eq!(scripted.asked(), vec![hash(1)]);
-    assert_eq!(report.cached, 0);
-    assert_eq!(store.obligations_len(), 0);
-}
-
-fn coverage_of(
-    names: &[&str],
-    laws: &Laws,
-    results: Vec<(Obligation, Discharge)>,
-) -> ply_prove::Coverage {
-    obligation::coverage(&check_of(names), laws, &results)
-}
-
-#[test]
-fn only_an_obligation_that_holds_covers_its_definition() {
-    let coverage = coverage_of(
-        &["m.f", "m.g", "m.h", "m.i"],
-        &Laws::default(),
-        vec![
-            (ensures(1, "m.f", 0), proved()),
-            (ensures(2, "m.g", 0), refuted()),
-            (ensures(3, "m.h", 0), unattempted()),
-        ],
-    );
-    assert_eq!(coverage.definitions, 4);
-    assert_eq!(coverage.covered, 1);
-    assert_eq!(
-        coverage.uncovered,
-        vec![Symbol::new("m.g"), Symbol::new("m.h"), Symbol::new("m.i")],
-        "a claim the machine could not establish is not evidence"
-    );
-}
-
-#[test]
-fn coverage_counts_a_definition_at_its_strongest_holding_tier() {
-    let coverage = coverage_of(
-        &["m.f", "m.g"],
-        &Laws::default(),
-        vec![
-            (ensures(1, "m.f", 0), sampled(7)),
-            (ensures(2, "m.f", 1), proved()),
-            (ensures(3, "m.g", 0), sampled(200)),
-        ],
-    );
-    assert_eq!(coverage.covered, 2);
-    assert_eq!(coverage.by_tier.get(&Tier::Proved), Some(&1));
-    assert_eq!(coverage.by_tier.get(&Tier::Property), Some(&1));
-    assert_eq!(coverage.by_tier.get(&Tier::Example), None);
-    assert_eq!(
-        coverage.by_tier.values().sum::<usize>(),
-        coverage.covered,
-        "every covered definition is counted at exactly one tier"
-    );
-}
-
-#[test]
-fn a_law_covers_the_definitions_it_names_directly_and_no_others() {
-    let mut laws = Laws::default();
-    laws.insert(
-        Symbol::new("m.cancel"),
-        hash(9),
-        hash(9),
-        [Symbol::new("m.credited"), Symbol::new("m.debited")],
-    );
-    let coverage = coverage_of(
-        &["m.credited", "m.debited", "m.helper"],
-        &laws,
-        vec![(law(9, "m.cancel"), proved())],
-    );
-    assert_eq!(coverage.covered, 2);
-    assert_eq!(coverage.uncovered, vec![Symbol::new("m.helper")]);
-}
-
-#[test]
-fn a_law_that_does_not_hold_covers_nothing() {
-    let mut laws = Laws::default();
-    laws.insert(
-        Symbol::new("m.cancel"),
-        hash(9),
-        hash(9),
-        [Symbol::new("m.credited")],
-    );
-    let coverage = coverage_of(
-        &["m.credited"],
-        &laws,
-        vec![(law(9, "m.cancel"), refuted())],
-    );
-    assert_eq!(coverage.covered, 0);
-    assert_eq!(coverage.uncovered, vec![Symbol::new("m.credited")]);
-}
-
-/// A `requires` only filters the `ensures` domain, so preconditions alone are no obligation.
-#[test]
-fn a_definition_with_no_obligation_is_never_covered() {
-    let coverage = coverage_of(&["m.f"], &Laws::default(), Vec::new());
-    assert_eq!(coverage.covered, 0);
-    assert_eq!(coverage.uncovered, vec![Symbol::new("m.f")]);
-    assert_eq!(coverage.uncovered_count(), 1);
-}
-
-/// `specs` and `laws` are the claims *as written*.
-fn hashes_of(defs: &[(&str, u8)], specs: &[(&str, Vec<u8>)], laws: &[u8]) -> HashOutput {
-    let mut out = HashOutput::default();
-    for (name, byte) in defs {
-        out.defs.insert(Symbol::new(*name), hash(*byte));
-    }
-    for (name, bytes) in specs {
-        let hashes: Vec<_> = bytes.iter().copied().map(hash).collect();
-        out.specs.insert(Symbol::new(*name), hashes.clone());
-        out.spec_texts.insert(Symbol::new(*name), hashes);
-    }
-    out.laws = laws.iter().copied().map(hash).collect();
-    out.law_texts = out.laws.clone();
-    out
-}
-
-fn review_after_accept(
-    before: &HashOutput,
-    after: &HashOutput,
-    names: &[&str],
-    laws_before: &Laws,
-    laws_after: &Laws,
-    results: Vec<(Obligation, Discharge)>,
-) -> ply_test::obligation::ReviewReport {
-    let dir = TempRoot::new();
-    let check = check_of(names);
-    let mut store = dir.store();
-    obligation::accept(&check, before, laws_before, &mut store);
-
-    let report = ply_prove::ProveReport {
-        coverage: obligation::coverage(&check, laws_after, &results),
-        obligations: results,
-        plan: ProvePlan::default(),
-        cached: 0,
-        duration: std::time::Duration::ZERO,
-    };
-    obligation::review(&check, after, laws_after, &store, &report)
-}
-
-#[test]
-fn a_changed_body_under_an_unchanged_spec_reports_the_obligations() {
-    let before = hashes_of(&[("m.f", 1)], &[("m.f", vec![7])], &[]);
-    let after = hashes_of(&[("m.f", 2)], &[("m.f", vec![7])], &[]);
-    let review = review_after_accept(
-        &before,
-        &after,
-        &["m.f"],
-        &Laws::default(),
-        &Laws::default(),
-        vec![(ensures(7, "m.f", 0), proved())],
-    );
-
-    assert_eq!(review.changed.len(), 1);
-    let entry = &review.changed[0];
-    assert_eq!(entry.implementation, Moved::Changed);
-    assert_eq!(entry.spec, Moved::Unchanged);
-    assert!(entry.specified());
-    assert_eq!(review.broken, 0);
-    assert_eq!(review.unspecified(), 0);
-    assert_eq!(review.specified(), 1);
-}
-
-#[test]
-fn an_unchanged_body_under_a_changed_spec_reports_the_spec_diff() {
-    let before = hashes_of(&[("m.f", 1)], &[("m.f", vec![7])], &[]);
-    let after = hashes_of(&[("m.f", 1)], &[("m.f", vec![8])], &[]);
-    let review = review_after_accept(
-        &before,
-        &after,
-        &["m.f"],
-        &Laws::default(),
-        &Laws::default(),
-        vec![(ensures(8, "m.f", 0), sampled(200))],
-    );
-    let entry = &review.changed[0];
-    assert_eq!(entry.implementation, Moved::Unchanged);
-    assert_eq!(entry.spec, Moved::Changed);
-}
-
-#[test]
-fn an_unchanged_definition_is_not_reported_at_all() {
-    let hashes = hashes_of(&[("m.f", 1)], &[("m.f", vec![7])], &[]);
-    let review = review_after_accept(
-        &hashes,
-        &hashes,
-        &["m.f"],
-        &Laws::default(),
-        &Laws::default(),
-        vec![(ensures(7, "m.f", 0), proved())],
-    );
-    assert!(review.changed.is_empty());
-    assert_eq!(review.reviewed, 1);
-}
-
-#[test]
-fn editing_a_law_is_a_spec_change_on_every_definition_it_names() {
-    let mut before_laws = Laws::default();
-    before_laws.insert(
-        Symbol::new("m.cancel"),
-        hash(9),
-        hash(9),
-        [Symbol::new("m.f")],
-    );
-    let mut after_laws = Laws::default();
-    after_laws.insert(
-        Symbol::new("m.cancel"),
-        hash(10),
-        hash(10),
-        [Symbol::new("m.f")],
-    );
-
-    let hashes = hashes_of(&[("m.f", 1)], &[], &[9]);
-    let after = hashes_of(&[("m.f", 1)], &[], &[10]);
-    let review = review_after_accept(
-        &hashes,
-        &after,
-        &["m.f"],
-        &before_laws,
-        &after_laws,
-        vec![(law(10, "m.cancel"), proved())],
-    );
-    assert_eq!(review.changed.len(), 1);
-    assert_eq!(review.changed[0].implementation, Moved::Unchanged);
-    assert_eq!(review.changed[0].spec, Moved::Changed);
-}
-
-#[test]
-fn a_definition_with_no_baseline_is_unreviewed_rather_than_unchanged() {
-    let before = hashes_of(&[("m.old", 1)], &[], &[]);
-    let after = hashes_of(&[("m.new", 1)], &[], &[]);
-    let review = review_after_accept(
-        &before,
-        &after,
-        &["m.new"],
-        &Laws::default(),
-        &Laws::default(),
-        Vec::new(),
-    );
-    assert_eq!(review.changed.len(), 1);
-    assert_eq!(review.changed[0].implementation, Moved::Never);
-    assert_eq!(review.reviewed, 0);
-}
-
-#[test]
-fn a_changed_definition_no_obligation_covers_is_counted_as_unspecified() {
-    let before = hashes_of(&[("m.f", 1), ("m.g", 3)], &[("m.f", vec![7])], &[]);
-    let after = hashes_of(&[("m.f", 2), ("m.g", 4)], &[("m.f", vec![7])], &[]);
-    let review = review_after_accept(
-        &before,
-        &after,
-        &["m.f", "m.g"],
-        &Laws::default(),
-        &Laws::default(),
-        vec![(ensures(7, "m.f", 0), proved())],
-    );
-
-    // What the headline is written from: one of the two changed definitions is covered by a
-    // claim that holds, and the other is a change this run says nothing about.
-    assert_eq!(review.changed.len(), 2);
-    assert_eq!(review.specified(), 1);
-    assert_eq!(review.unspecified(), 1);
-    assert_eq!(review.broken, 0);
-}
-
-#[test]
-fn a_changed_definition_whose_obligation_broke_says_so() {
-    let before = hashes_of(&[("m.f", 1)], &[("m.f", vec![7])], &[]);
-    let after = hashes_of(&[("m.f", 2)], &[("m.f", vec![7])], &[]);
-    let review = review_after_accept(
-        &before,
-        &after,
-        &["m.f"],
-        &Laws::default(),
-        &Laws::default(),
-        vec![(ensures(7, "m.f", 0), refuted())],
-    );
-    // Discharged and refuted, which is not the same as never discharged at all.
-    assert_eq!(review.broken, 1);
-    assert_eq!(review.undischarged, 0);
-}
-
-#[test]
-fn a_law_moved_between_modules_leaves_every_baseline_where_it_was() {
-    let mut before_laws = Laws::default();
-    before_laws.insert(
-        Symbol::new("a.cancel"),
-        hash(9),
-        hash(9),
-        [Symbol::new("m.f")],
-    );
-    let mut after_laws = Laws::default();
-    after_laws.insert(
-        Symbol::new("b.cancel"),
-        hash(9),
-        hash(9),
-        [Symbol::new("m.f")],
-    );
-
-    let hashes = hashes_of(&[("m.f", 1)], &[], &[9]);
-    let review = review_after_accept(
-        &hashes,
-        &hashes,
-        &["m.f"],
-        &before_laws,
-        &after_laws,
-        vec![(law(9, "b.cancel"), proved())],
-    );
-    assert!(review.changed.is_empty(), "{:?}", review.changed);
-    assert_eq!(review.coverage.covered, 1);
-}
-
-#[test]
-fn deleting_a_law_reads_as_a_spec_change_on_what_it_named() {
-    let mut before_laws = Laws::default();
-    before_laws.insert(
-        Symbol::new("m.cancel"),
-        hash(9),
-        hash(9),
-        [Symbol::new("m.f")],
-    );
-
-    let before = hashes_of(&[("m.f", 1)], &[], &[9]);
-    let after = hashes_of(&[("m.f", 1)], &[], &[]);
-    let review = review_after_accept(
-        &before,
-        &after,
-        &["m.f"],
-        &before_laws,
-        &Laws::default(),
-        Vec::new(),
-    );
-    assert_eq!(review.changed.len(), 1);
-    assert_eq!(review.changed[0].implementation, Moved::Unchanged);
-    assert_eq!(review.changed[0].spec, Moved::Changed);
-    assert_eq!(review.coverage.covered, 0);
-}
-
-#[test]
-fn a_changed_definition_whose_only_obligation_is_a_gap_gains_no_evidence() {
-    let before = hashes_of(&[("m.f", 1)], &[("m.f", vec![7])], &[]);
-    let after = hashes_of(&[("m.f", 2)], &[("m.f", vec![7])], &[]);
-    let review = review_after_accept(
-        &before,
-        &after,
-        &["m.f"],
-        &Laws::default(),
-        &Laws::default(),
-        vec![(ensures(7, "m.f", 0), unattempted())],
-    );
-
-    assert_eq!(review.changed.len(), 1);
-    assert_eq!(review.changed[0].implementation, Moved::Changed);
-    assert_eq!(review.changed[0].spec, Moved::Unchanged);
-    assert_eq!(review.coverage.covered, 0);
-    assert_eq!(review.coverage.uncovered, vec![Symbol::new("m.f")]);
-    assert_eq!(
-        review.broken, 1,
-        "an obligation nothing established must not read as one that held"
-    );
-    assert_eq!(review.undischarged, 1);
-
-    // The count `ply review --changed` derives its advice from.
-    assert!(
-        !review.changed[0].specified(),
-        "an undischarged obligation is not a specification that holds"
-    );
-    assert!(
-        review.changed[0].claimed(),
-        "it does carry a clause, and the report must not say it carries none"
-    );
-    assert_eq!(review.specified(), 0);
-    assert_eq!(review.unspecified(), 1);
-}
-
-#[test]
-fn accepting_records_one_baseline_per_definition_keyed_by_name() {
-    let dir = TempRoot::new();
-    let check = check_of(&["m.f", "m.g"]);
-    let hashes = hashes_of(&[("m.f", 1), ("m.g", 2)], &[("m.f", vec![7])], &[]);
-    let mut store = dir.store();
-    assert_eq!(
-        obligation::accept(&check, &hashes, &Laws::default(), &mut store),
-        2
-    );
-    assert_eq!(
-        store.review_record(&Symbol::new("m.f")),
-        Some(&ReviewRecord::new(hash(1), [hash(7)]))
-    );
-    assert_eq!(
-        store.review_record(&Symbol::new("m.g")),
-        Some(&ReviewRecord::new(hash(2), []))
+        report.failed(),
+        "a refutation and a vacuity fail a run, and a gap does not"
     );
 }
