@@ -1,0 +1,482 @@
+// The rest of the corpus's subcommands end to end: `real` over the toolchain's own trees, `regions`
+// over projects the product measures, `payload`, `measure` with no corpus, `w6` over the evidence the
+// tree ships, `prove` over a law and over nothing, and the program itself, built and run.
+
+import support
+import support (scratch, cats, joined, shown, refused, reported, named, value, passes,
+                why_inconclusive, all_pass, context, criterion_of)
+import corpus.cmd
+import corpus.discharge
+import corpus.kit
+import corpus.measure
+import corpus.payload
+import corpus.pin
+import corpus.real
+import corpus.regions
+import corpus.report
+import corpus.report (Report, Judged, Fail)
+import corpus.spine
+import corpus.spine (under)
+import corpus.w6
+import std.fs (fs)
+import std.fs
+import std.json
+import std.json (Json, Object, Array, Str, Bool)
+import std.list
+import std.process (process, Finished, exit_code)
+
+// --- real ----------------------------------------------------------------------------------------
+
+// Every `.ply` file and manifest under `dir`, outside hidden directories: what a pin covers, walked
+// here apart from the program's own walk so the two can disagree.
+fn sources_under(dir: String, acc: List<String>) -> List<String> =
+  match fs.list_dir[work](dir) {
+    None -> acc,
+    Some(names) ->
+      fold(names, acc, |found: List<String>, name: String|
+        if string_starts_with(name, ".") { found } else {
+          let path = under(dir, name);
+          match fs.kind[work](path) {
+            fs::Dir -> sources_under(path, found),
+            fs::File -> if string_ends_with(name, ".ply") || name == "ply.pkg" { push(found, path) }
+            else { found },
+            _ -> found,
+          }
+        }),
+  }
+
+fn pinned(trees: List<String>) -> String =
+  pin::pin_of(
+    map(fold(trees, [], |acc: List<String>, t: String| sources_under(t, acc)), |p: String|
+      { path: p, text: match fs.read_file[work](p) { Some(t) -> t, None -> b"" } }),
+  )
+
+// One member of the toolchain, front-ended by the product with its tests skipped: the report, and the
+// member as the report pins it.
+fn front_ended(member: String) -> (Report, Map<String, Json>) = {
+  let r = match cmd::asked(["real", "--member", member, "--no-tests"]) {
+    cmd::Real(a) -> reported("real --member " ++ member, real::run(a.tests, a.member)),
+    other -> refused(other),
+  };
+  all_pass(r);
+  let m = match context(r, "members") {
+    Array([Object(m)]) -> m,
+    _ -> panic("only the member asked for is pinned: " ++ shown(r)),
+  };
+  assert(spine::str_field(m, "name") == member, Some(shown(r)));
+  assert(len(r.rows) == 1, Some("one check row, the tests skipped: " ++ shown(r)));
+  let checked = named(r, member ++ " check");
+  assert(
+    checked.row.detail == Str(spine::str_field(m, "digest")),
+    Some(report::judged_text(checked)),
+  );
+  (r, m)
+}
+
+test/nondet "the compiler front-ends clean at its pin" {
+  let (r, m) = front_ended("compiler");
+  assert_eq(spine::str_field(m, "digest"), pinned(["crates/ply-compiler/ply"]));
+  let checked = named(r, "compiler check");
+  assert(
+    value(checked, "definitions") > 1000m,
+    Some("the compiler is the real one: " ++ report::judged_text(checked)),
+  )
+}
+
+// The CLI reads the packages its manifest names by path, so its pin covers them too.
+test/nondet "the CLI front-ends clean at its pin, over the packages its manifest names" {
+  let (_, m) = front_ended("cli");
+  let trees = ["crates/ply-cli/ply", "crates/ply-test/ply", "crates/ply-prove/ply"];
+  assert_eq(map(spine::array_field(m, "trees"), |t: Json| match t { Str(s) -> s, _ -> "" }), trees);
+  assert_eq(spine::str_field(m, "digest"), pinned(trees))
+}
+
+// --- regions ----------------------------------------------------------------------------------
+
+// `cells` tests each writing the cell of one of `labels` labels, then `pure` tests touching nothing.
+fn cell_project(name: String, cells: Int, labels: Int, pure: Int) -> String = {
+  let dir = scratch(name);
+  let celled = fold(range(0, cells), "", |acc: String, i: Int| {
+    let n = int_to_string(i);
+    let label = "r" ++ int_to_string(i % labels);
+    acc ++ "fn touch" ++ n ++ "() -> Int / {cell.read[" ++ label ++ "], cell.write[" ++ label
+      ++ "]} =\n  with_cell["
+      ++ label
+      ++ "](0) { c -> {\n    cell_set(c, "
+      ++ n
+      ++ ");\n    cell_get(c)\n  } }\n\ntest \"cell test "
+      ++ n
+      ++ "\" { assert_eq(touch"
+      ++ n
+      ++ "(), "
+      ++ n
+      ++ ") }\n\n"
+  });
+  let pured = fold(range(0, pure), "", |acc: String, i: Int|
+    acc ++ "test \"pure test " ++ int_to_string(i) ++ "\" { assert_eq(" ++ int_to_string(i)
+      ++ " + 1, "
+      ++ int_to_string(i + 1)
+      ++ ") }\n");
+  assert(
+    fs.create_dir[work](dir)
+      && fs.write_file[work](under(dir, "main.ply"), bytes_of_string(celled ++ pured)),
+    Some("the project could not be written under " ++ dir),
+  );
+  dir
+}
+
+fn regioned(argv: List<String>) -> Report =
+  match cmd::asked(argv) {
+    cmd::Regions(a) -> reported(joined(argv, " "), regions::run(a.args)),
+    other -> refused(other),
+  }
+
+fn effects(j: Judged) -> List<String> =
+  match j.row.detail {
+    Object(d) -> map(spine::array_field(d, "effects"), |e: Json| match e { Str(s) -> s, _ -> "" }),
+    _ -> [],
+  }
+
+test/nondet "a cell atom reaches a footprint, and only forking hides it" {
+  let dir = cell_project("regions-shared", 24, 4, 8);
+  let r = regioned(["regions", dir, "--jobs", "4"]);
+  let cost = named(r, dir);
+  let text = report::judged_text(cost);
+  assert(
+    list::contains(effects(cost), "cell"),
+    Some("the project was written so that a `cell` atom reaches a footprint: " ++ text),
+  );
+  assert(value(cost, "tests") == 32m && value(cost, "isolated") == 32m, Some(text));
+  // Six tests share each of four labels, so the clique is six colours wide.
+  assert(
+    value(cost, "groups_forked") == 1m && value(cost, "groups_regions") == 6m
+      && value(cost, "newly_serialized") == 24m,
+    Some(text),
+  );
+  assert(value(cost, "critical_regions") > value(cost, "critical_forked"), Some(text));
+  assert(
+    match cost.verdict { Fail(_) -> true, _ -> false },
+    Some("the region model serializes every one, which its criterion refuses: " ++ text),
+  );
+  passes(named(r, dir ++ " colouring"))
+}
+
+test/nondet "cell tests on distinct labels are free to lose the exemption" {
+  let dir = cell_project("regions-distinct", 16, 16, 8);
+  let r = regioned(["regions", dir, "--jobs", "4"]);
+  let cost = named(r, dir);
+  assert(
+    value(cost, "cell") == 16m && value(cost, "newly_serialized") == 0m
+      && value(cost, "groups_forked") == value(cost, "groups_regions"),
+    Some(report::judged_text(cost)),
+  );
+  all_pass(r)
+}
+
+test/nondet "the examples suite loses nothing to the region model" {
+  let r = regioned(["regions", "examples", "--jobs", "8"]);
+  let cost = named(r, "examples");
+  let text = report::judged_text(cost);
+  assert(
+    !list::contains(effects(cost), "cell"),
+    Some(
+      "no test in `examples/` carries a `cell` atom; if one now does, the cost is no longer zero: "
+        ++ text,
+    ),
+  );
+  let tests = value(cost, "tests");
+  assert(
+    tests > 0m && value(cost, "pure") <= value(cost, "isolated") && value(cost, "isolated") <= tests
+      && value(cost, "seeded") <= tests,
+    Some(text),
+  );
+  assert(value(cost, "cell") == 0m && value(cost, "newly_serialized") == 0m, Some(text));
+  assert(
+    value(cost, "groups_forked") == value(cost, "groups_regions")
+      && value(cost, "critical_forked") == value(cost, "critical_regions"),
+    Some(text),
+  );
+  passes(cost);
+  passes(named(r, "examples colouring"))
+}
+
+test/nondet "a hypothetical is priced without a tree" {
+  let r = regioned(["regions", "--hypothetical", "12:3"]);
+  assert(len(r.rows) == 1, Some("one hypothetical asked for is one row: " ++ shown(r)));
+  let cost = named(r, "hypothetical 12:3");
+  assert(
+    value(cost, "tests") == decimal_of_int(12 + 10 + 165) && value(cost, "newly_serialized") > 0m,
+    Some(report::judged_text(cost)),
+  )
+}
+
+test/nondet "regions with nothing to analyse is an error" {
+  match cmd::asked(["regions"]) {
+    cmd::Regions(a) -> match regions::run(a.args) {
+      Ok(r) -> panic("regions analysed nothing and answered: " ++ shown(r)),
+      Err(why) -> assert(string_contains(why, "nothing to analyse"), Some(why)),
+    },
+    other -> refused(other),
+  }
+}
+
+// --- payload and measure ---------------------------------------------------------------------------
+
+// The scratch a subcommand writes into the working directory, which it takes back out.
+fn fixtures_left() -> List<String> =
+  filter(match fs.list_dir[work](".") { Some(names) -> names, None -> [] }, |name: String|
+    string_starts_with(name, "fixture-"))
+
+test/nondet "payload prices its codec, maps and derivation, and every criterion holds" {
+  let r = match cmd::asked([
+      "payload",
+      "--lines",
+      "2",
+      // Enough rounds that a microsecond clock sees each half of a decode on its own.
+      "--iterations",
+      "50",
+      "--shape",
+      "2:0,2:64",
+      "--entries",
+      "16",
+      "--types",
+      "4",
+      "--types-per-module",
+      "4",
+      "--processes",
+      "2",
+      "--repeats",
+      "1",
+    ]) {
+    cmd::Payload(p) -> reported("payload", payload::run(p.args)),
+    other -> refused(other),
+  };
+  all_pass(r);
+  assert(value(named(r, "json 2"), "payload") > 0m, Some(shown(r)));
+  // Widening a field grows the bytes and not the fields.
+  let narrow = named(r, "shape 2:0");
+  let wide = named(r, "shape 2:64");
+  assert(
+    value(narrow, "fields") == value(wide, "fields")
+      && value(wide, "payload") == value(narrow, "payload") + 128m,
+    Some("two lines, each widened by 64 bytes: " ++ shown(r)),
+  );
+  assert_eq(value(named(r, "order"), "processes"), 2m);
+  // The same types with and without a `derive`: the derived variant adds definitions and no test.
+  let derive = named(r, "derive 4");
+  assert(
+    value(derive, "plain_tests") == 4m && value(derive, "derived_cache") > 0m,
+    Some(report::judged_text(derive)),
+  );
+  let left = fixtures_left();
+  assert(len(left) == 0, Some("payload left scratch behind: " ++ joined(left, ", ")))
+}
+
+test/nondet "measure's throughput needs a corpus to time" {
+  match cmd::asked(["measure", "--only-throughput"]) {
+    cmd::Measure(m) -> match measure::run(m.corpus, m.repeats, m.only_throughput) {
+      Ok(r) -> panic("measure timed no corpus and answered: " ++ shown(r)),
+      Err(why) -> assert(string_contains(why, "name the corpus"), Some(why)),
+    },
+    other -> refused(other),
+  }
+}
+
+// --- w6 ---------------------------------------------------------------------------------------
+
+// What only a judgement carries: a criterion or a verdict, and the words either is made of.
+fn judging(key: String) -> Bool =
+  list::contains(["verdict", "criterion", "criteria", "outcome", "rule", "bound", "ok"], key)
+
+fn judging_keys(j: Json) -> List<String> =
+  match j {
+    Object(m) ->
+      map_fold(m, [], |found: List<String>, key: String, v: Json|
+        cats([found, if judging(key) { [key] } else { [] }, judging_keys(v)])),
+    Array(xs) -> fold(xs, [], |found: List<String>, x: Json| cats([found, judging_keys(x)])),
+    _ -> [],
+  }
+
+test/nondet "neither shipped W6 file carries a verdict or a criterion" {
+  let _ = map([w6::ladder_file(), w6::figure_file()], |name: String|
+    match fs.read_file[repo](name) {
+      None -> panic("`" ++ name ++ "` is W6 evidence the tree ships, and it is not there"),
+      Some(bytes) -> match json::parse(bytes) {
+        Err(e) -> panic("`" ++ name ++ "` is not JSON: " ++ e.message),
+        Ok(j) ->
+          assert(
+            len(judging_keys(j)) == 0,
+            Some(
+              "`" ++ name ++ "` carries " ++ joined(judging_keys(j), ", ")
+                ++ ", which judge a measurement rather than being one",
+            ),
+          ),
+      },
+    });
+  ()
+}
+
+test/nondet "the shipped ladder is what the command writes, and is judged rung by rung" {
+  let r = match cmd::asked(["w6"]) {
+    cmd::W6(_) -> reported("w6", w6::run()),
+    other -> refused(other),
+  };
+  let written = named(r, w6::ladder_file());
+  assert(
+    report::passed(written),
+    Some(
+      "`benches/w6-ladder.json` is not what `w6-ladder --out` writes, so a hand has been in it: "
+        ++ report::judged_text(written),
+    ),
+  );
+  let _ = map(w6::layers(), |l: w6::Layer| {
+    let rung = named(r, "layer " ++ l.label);
+    assert(
+      criterion_of(rung) != "",
+      Some("every rung carries its criterion: " ++ report::judged_text(rung)),
+    )
+  });
+  let _ = map(["total", "residue", "share"], |name: String| named(r, name));
+  ()
+}
+
+// --- prove ------------------------------------------------------------------------------------
+
+fn proved_report(argv: List<String>) -> Report =
+  match cmd::asked(argv) {
+    cmd::Prove(p) -> reported(joined(argv, " "), discharge::run(p.args)),
+    other -> refused(other),
+  }
+
+test/nondet "prove reports a law's one obligation, proved by the static tier alone" {
+  let dir = scratch("prove");
+  let laws = under(dir, "laws.ply");
+  assert(
+    fs.create_dir[work](dir)
+      && fs.write_file[work](
+        laws,
+        b"law \"doubling is adding\"\n  forall (n: Int) {\n    n + n == n * 2\n  }\n",
+      ),
+    Some("the law could not be written under " ++ dir),
+  );
+  let r = proved_report(["prove", laws, "--cases", "20"]);
+  let tiers = named(r, laws);
+  passes(tiers);
+  assert(
+    value(tiers, "obligations") == 1m && value(tiers, "proved") == 1m,
+    Some(report::judged_text(tiers)),
+  );
+  let reach = named(r, laws ++ " reach");
+  passes(reach);
+  assert(
+    value(reach, "attempted") == 1m && value(reach, "decided") == 1m,
+    Some(report::judged_text(reach)),
+  )
+}
+
+test/nondet "prove refuses a project that does not load, and names it" {
+  let missing = under(scratch("prove"), "missing.ply");
+  match cmd::asked(["prove", missing]) {
+    cmd::Prove(p) -> match discharge::run(p.args) {
+      Ok(r) -> panic("a project that is not there was proved: " ++ shown(r)),
+      Err(why) -> assert(string_contains(why, missing), Some(why)),
+    },
+    other -> refused(other),
+  }
+}
+
+// --- The program itself ---------------------------------------------------------------------
+
+// The corpus built as `benches/corpus-program.sh` builds it, from a tree with no lock an earlier
+// build left, which would pin other sources.
+fn built() -> String = {
+  let dir = scratch("program");
+  let out = under(dir, "corpus.plyx");
+  let _ = fs.remove[work]("crates/ply-corpus/ply/ply.lock");
+  assert(fs.create_dir[work](dir), Some("`" ++ dir ++ "` could not be made"));
+  let f = spine::ply(
+    ["build", "crates/ply-corpus/ply", "--entry", "cmd.main", "-o", out, "--color", "never"],
+    "",
+  );
+  assert(
+    spine::exit_zero(f),
+    Some("the corpus program did not build: " ++ string_of_bytes_lossy(f.err)),
+  );
+  out
+}
+
+// The program run as `benches/corpus.sh` runs it, with `argv` after `--`.
+fn ran(program: String, argv: List<String>) -> Finished =
+  spine::ply(
+    cats([
+      [
+        "run",
+        program,
+        "--host",
+        "--allow",
+        "machine",
+        "--allow",
+        "claims",
+        "--fs",
+        "work=.",
+        "--color",
+        "never",
+        "--",
+      ],
+      argv,
+    ]),
+    "",
+  )
+
+fn said(f: Finished) -> String =
+  "exit " ++ (match exit_code(f) { Some(c) -> int_to_string(c), None -> "by a signal" })
+    ++ ", stdout "
+    ++ string_of_bytes_lossy(f.out)
+    ++ ", stderr "
+    ++ string_of_bytes_lossy(f.err)
+
+test/nondet "the program answers its line: a version, a refusal with exit 2, a failure with exit 1, and a report on stdout" {
+  let program = built();
+  let version = ran(program, ["--version"]);
+  assert(
+    spine::exit_zero(version) && string_contains(string_of_bytes_lossy(version.out), "0.1.0"),
+    Some(said(version)),
+  );
+  let nonsense = ran(program, ["nonsense"]);
+  assert(
+    exit_code(nonsense) == Some(2)
+      && string_contains(string_of_bytes_lossy(nonsense.err), "unrecognized subcommand"),
+    Some(said(nonsense)),
+  );
+  let unmeasured = ran(program, ["measure", "--only-throughput"]);
+  assert(
+    exit_code(unmeasured) == Some(1)
+      && string_contains(string_of_bytes_lossy(unmeasured.err), "ply-corpus: `--only-throughput`"),
+    Some(said(unmeasured)),
+  );
+  let out = under(scratch("program"), "corpus");
+  let generated = ran(program, [
+    "gen",
+    "--out",
+    out,
+    "--modules",
+    "2",
+    "--defs-per-module",
+    "3",
+    "--tests",
+    "2",
+    "--depth",
+    "1",
+    "--no-verify",
+    "--json",
+  ]);
+  match kit::printed(generated, "`gen --json`") {
+    Err(why) -> panic(why ++ ": " ++ said(generated)),
+    Ok(Object(m)) ->
+      assert(
+        spine::str_field(m, "root") == out && map_get(m, "verified") == Some(Bool(false)),
+        Some(said(generated)),
+      ),
+    Ok(_) -> panic("`gen --json` printed a report that is not an object: " ++ said(generated)),
+  }
+}

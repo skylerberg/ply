@@ -1,9 +1,7 @@
 // The corpus's command line and its entry point. The line is declared once as a cmdline spec — the
 // CLI package's library, not a copy of it — and `main` answers it: help, a version and a refusal
-// here; `gen`, and `bench`, `sweep`, `real`, `measure`, `payload`, `regions`, `tiers`, `serve`,
-// `w3`, `w4`, `w5`, `w6` and `w6-ladder`, each answering a report, in this package; and `sim` and
-// `prove` as a JSON plan handed to the Rust executor bound as `executor`, whose output and exit
-// code are this program's own.
+// here; `gen`, and `bench`, `sweep`, `real`, `measure`, `payload`, `regions`, `tiers`, `sim`,
+// `prove`, `serve`, `w3`, `w4`, `w5`, `w6` and `w6-ladder`, each answering a report.
 //
 // It runs under `ply run` (`benches/corpus.sh` holds the whole line) with two filesystem roots:
 // `work`, bound at the working directory, which every path this program reads, writes or spawns in
@@ -17,6 +15,7 @@ import cli.claims (prover)
 import cli.cmdline
 import cli.machine (machine)
 import bench
+import discharge
 import gbuild
 import gen
 import ladder
@@ -25,8 +24,8 @@ import payload
 import real
 import regions
 import report
+import search
 import serve
-import spine
 import sweep
 import tiers
 import w3
@@ -34,11 +33,10 @@ import w4
 import w5
 import w6
 import std.certgen (certgen)
-import std.json (Json, Str, Number, Bool, Null, object, array)
 import std.json
 import std.fs (fs)
 import std.net (net)
-import std.process (process, exit_code)
+import std.process (process)
 import std.config (config)
 import std.random (entropy)
 import std.time (time)
@@ -317,9 +315,9 @@ pub fn spec() -> cmdline::Spec =
             "Price the search: pruning, seeds to the first failure, and seeds per second",
             [
               nat("trials", 32, "Roots per strategy in the race-finding table; zero drops it"),
-              nat("budget", 4096, "Interleavings a search may run per root, pruned or not"),
-              nat("steps", 100000, "Scheduling steps one interleaving may take"),
-              nat("rate-seeds", 64, "Seeds the throughput table times"),
+              pos("budget", 4096, "Interleavings a search may run per root, pruned or not"),
+              pos("steps", 100000, "Scheduling steps one interleaving may take"),
+              nat("rate-seeds", 64, "Seeds the throughput table times; zero drops it"),
               sw("no-reduction", "Drop the reduction table, which is the expensive one"),
               json_switch(),
             ],
@@ -331,8 +329,8 @@ pub fn spec() -> cmdline::Spec =
             "prove",
             "Price the spec tier: where obligations land, and why some fell short",
             [
-              nat("cases", 200, "Cases the prover generates per obligation"),
-              nat("prove-budget", 10000, "The prover's budget per obligation"),
+              pos("cases", 200, "Cases the prover generates per obligation"),
+              pos("prove-budget", 10000, "The prover's budget per obligation"),
               json_switch(),
             ],
           ),
@@ -627,8 +625,7 @@ pub type MeasureArgs = { corpus: String, repeats: Int, only_throughput: Bool, js
 // A subcommand whose arguments are its module's own, and whether its report is wanted as JSON.
 pub type Reported<a> = { args: a, json: Bool }
 
-// A line, answered: text for stdout (help, a version), a refusal for stderr, a subcommand this
-// package runs, or the plan the executor runs.
+// A line, answered: text for stdout (help, a version), a refusal for stderr, or a subcommand.
 pub type Asked =
   | Said(String)
   | Refusal(String)
@@ -640,6 +637,8 @@ pub type Asked =
   | Payload(Reported<payload::Args>)
   | Regions(Reported<regions::Args>)
   | Tiers(Reported<tiers::Args>)
+  | Sim(Reported<search::Args>)
+  | Prove(Reported<discharge::Args>)
   | Serve(Reported<serve::Args>)
   | W3(Reported<w3::Args>)
   | W4(Reported<w4::Args>)
@@ -647,7 +646,6 @@ pub type Asked =
   // Whether the shipped ladder's judgement is wanted as JSON.
   | W6(Bool)
   | W6Ladder(Reported<ladder::Args>)
-  | Plan(Json)
 
 fn nat_of(p: cmdline::Parsed, long: String) -> Int =
   match cmdline::value(p, long) {
@@ -870,13 +868,34 @@ pub fn asked(argv: List<String>) -> Asked =
             json: cmdline::has(p, "json"),
           }),
       },
+      "sim" ->
+        Sim({
+          args: {
+            corpus: cmdline::nth_of(p.positionals, 0, ""),
+            trials: nat_of(p, "trials"),
+            budget: nat_of(p, "budget"),
+            steps: nat_of(p, "steps"),
+            rate_seeds: nat_of(p, "rate-seeds"),
+            reduction: !cmdline::has(p, "no-reduction"),
+          },
+          json: cmdline::has(p, "json"),
+        }),
+      "prove" ->
+        Prove({
+          args: {
+            projects: p.positionals,
+            cases: nat_of(p, "cases"),
+            prove_budget: nat_of(p, "prove-budget"),
+          },
+          json: cmdline::has(p, "json"),
+        }),
       "serve" -> Serve({ args: serve_args(p), json: cmdline::has(p, "json") }),
       "w3" -> W3({ args: w3_args(p), json: cmdline::has(p, "json") }),
       "w4" -> W4({ args: w4_args(p), json: cmdline::has(p, "json") }),
       "w5" -> W5({ args: w5_args(p), json: cmdline::has(p, "json") }),
       "w6" -> W6(cmdline::has(p, "json")),
       "w6-ladder" -> W6Ladder({ args: ladder_args(p), json: cmdline::has(p, "json") }),
-      _ -> match run_plan(p) { Ok(j) -> Plan(j), Err(why) -> Refusal(why) },
+      other -> Refusal(cmdline::refused(spec(), p.path, "no command named " ++ other)),
     },
   }
 
@@ -901,53 +920,6 @@ fn shapes_of(p: cmdline::Parsed) -> Result<List<payload::Shape>, String> =
             Ok(s) -> Ok(push(done, s)),
           },
         }),
-  }
-
-// --- The plan the executor runs ------------------------------------------------
-
-fn int_flag(p: cmdline::Parsed, long: String) -> Json =
-  match cmdline::value(p, long) {
-    Some(v) -> match cmdline::parse_nat(v) { Some(n) -> Number(decimal_of_int(n)), None -> Null },
-    None -> Null,
-  }
-
-fn bool_flag(p: cmdline::Parsed, long: String) -> Json = Bool(cmdline::has(p, long))
-
-fn positionals_json(p: cmdline::Parsed) -> Json = array(map(p.positionals, |s: String| Str(s)))
-
-fn plan(command: String, args: List<{ key: String, value: Json }>) -> Json =
-  object([
-    { key: "outcome", value: Str("run") },
-    { key: "command", value: Str(command) },
-    { key: "args", value: object(args) },
-  ])
-
-// Every knob of a subcommand the executor runs, materialized: defaults filled, numbers parsed and
-// comma lists split, so the executor only decodes.
-fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
-  match cmdline::nth_of(p.path, 0, "") {
-    "sim" ->
-      Ok(
-        plan("sim", [
-          { key: "corpus", value: Str(cmdline::nth_of(p.positionals, 0, "")) },
-          { key: "trials", value: int_flag(p, "trials") },
-          { key: "budget", value: int_flag(p, "budget") },
-          { key: "steps", value: int_flag(p, "steps") },
-          { key: "rate_seeds", value: int_flag(p, "rate-seeds") },
-          { key: "no_reduction", value: bool_flag(p, "no-reduction") },
-          { key: "json", value: bool_flag(p, "json") },
-        ]),
-      ),
-    "prove" ->
-      Ok(
-        plan("prove", [
-          { key: "projects", value: positionals_json(p) },
-          { key: "cases", value: int_flag(p, "cases") },
-          { key: "prove_budget", value: int_flag(p, "prove-budget") },
-          { key: "json", value: bool_flag(p, "json") },
-        ]),
-      ),
-    other -> Err(cmdline::refused(spec(), p.path, "no command named " ++ other)),
   }
 
 // --- Running what was asked ------------------------------------------------------
@@ -984,23 +956,6 @@ fn reported(outcome: Result<report::Report, String>, json_wanted: Bool) -> Resul
       Ok(if json_wanted { json::to_string(report::to_json(r)) } else { report::rendered(r) }),
   }
 
-// The executor runs the plan with the few variables the toolchain reads, in the working directory,
-// and what it wrote and the code it exited with are this program's.
-fn executed(
-  plan: Json,
-) -> Int / {process.spawn[executor], config.get[env], process.out[proc], process.err[proc]} = {
-  let done = process.spawn[executor](["--plan", json::to_string(plan)], "", spine::inherited_env());
-  say(string_of_bytes_lossy(done.out));
-  complain(string_of_bytes_lossy(done.err));
-  match exit_code(done) {
-    Some(code) -> if code >= 0 && code <= 125 { code } else { 1 },
-    None -> {
-      complain("ply-corpus: the executor was stopped by a signal");
-      1
-    },
-  }
-}
-
 // What serving a program takes: `ply run` children, the floor the runner built and bound as
 // `http_floor`, the kit's own connections, the clock, and certificates for a TLS run.
 effect set Serving = {process.start[ply], process.wait[ply], process.signal[ply], process.output_line[ply], process.start[http_floor], process.wait[http_floor], process.signal[http_floor], process.output_line[http_floor], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], certgen.issue, time.sleep_ms}
@@ -1011,7 +966,7 @@ effect set Database = {process.spawn[pg_floor], process.start[pg_floor], process
 
 fn code_of(
   a: Asked,
-) -> Int / {process.out[proc], process.err[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], Serving, Database, prover.outcomes[claims], prover.typed[claims], prover.record[claims], prover.accepted[claims]} =
+) -> Int / {process.out[proc], process.err[proc], process.spawn[ply], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], Serving, Database, prover.outcomes[claims], prover.typed[claims], prover.record[claims], prover.accepted[claims]} =
   match a {
     Said(text) -> {
       process.out[proc](text);
@@ -1038,22 +993,20 @@ fn code_of(
     Payload(p) -> answered(reported(payload::run(p.args), p.json)),
     Regions(r) -> answered(reported(regions::run(r.args), r.json)),
     Tiers(t) -> answered(reported(tiers::run(t.args), t.json)),
+    Sim(s) -> answered(reported(search::run(s.args), s.json)),
+    Prove(p) -> answered(reported(discharge::run(p.args), p.json)),
     Serve(s) -> answered(reported(serve::run(s.args), s.json)),
     W3(w) -> answered(reported(w3::run(w.args), w.json)),
     W4(w) -> answered(reported(w4::run(w.args), w.json)),
     W5(w) -> answered(reported(w5::run(w.args), w.json)),
     W6(json_wanted) -> answered(reported(w6::run(), json_wanted)),
     W6Ladder(l) -> answered(reported(ladder::run(l.args), l.json)),
-    Plan(j) -> executed(j),
   }
 
-pub fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], Serving, Database, prover.outcomes[claims], prover.typed[claims], prover.record[claims], prover.accepted[claims]} =
+pub fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], process.spawn[ply], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], Serving, Database, prover.outcomes[claims], prover.typed[claims], prover.record[claims], prover.accepted[claims]} =
   process.exit[proc](code_of(asked(process.args[proc]())))
 
 // --- Tests -----------------------------------------------------------------------
-
-fn plan_text(argv: List<String>) -> String =
-  match asked(argv) { Plan(j) -> json::to_string(j), _ -> "" }
 
 fn refusal_of(argv: List<String>) -> String = match asked(argv) { Refusal(text) -> text, _ -> "" }
 
@@ -1308,13 +1261,46 @@ test "tiers audits one of its seeds alone when asked, and refuses a seed it does
   assert(string_contains(refusal_of(["tiers", "--out", "t", "--seeds", "0"]), "'--seeds <N>'"))
 }
 
-test "what is still Rust's is planned for the executor" {
-  assert(string_contains(plan_text(["prove", "a.ply", "--cases", "7"]), "\"cases\":7"));
-  assert(string_contains(plan_text(["sim", "a.ply"]), "\"command\":\"sim\""));
-  assert_eq(
-    map(["measure", "serve", "w3", "w4", "w5", "w6", "w6-ladder"], |c: String| plan_text([c])),
-    ["", "", "", "", "", "", ""],
-  )
+test "sim takes its tables at their defaults, and drops one asked for zero" {
+  match asked(["sim", "corpora/c4"]) {
+    Sim(s) ->
+      assert_eq(s.args, {
+        corpus: "corpora/c4",
+        trials: 32,
+        budget: 4096,
+        steps: 100000,
+        rate_seeds: 64,
+        reduction: true,
+      }),
+    _ -> assert(false),
+  };
+  match asked(["sim", "a.ply", "--trials", "0", "--rate-seeds", "0", "--no-reduction", "--json"]) {
+    Sim(s) -> assert(s.args.trials == 0 && s.args.rate_seeds == 0 && !s.args.reduction && s.json),
+    _ -> assert(false),
+  };
+  assert(string_contains(refusal_of(["sim", "a.ply", "--budget", "0"]), "'--budget <N>'"))
+}
+
+test "prove takes every project named, each on rows of its own" {
+  match asked(["prove", "a.ply", "corpora/c4", "--cases", "7"]) {
+    Prove(p) ->
+      assert_eq(p.args, { projects: ["a.ply", "corpora/c4"], cases: 7, prove_budget: 10000 }),
+    _ -> assert(false),
+  };
+  assert(string_contains(refusal_of(["prove", "a.ply", "--cases", "0"]), "'--cases <N>'"))
+}
+
+test "a subcommand that could not answer exits 1, and says why under the program's name" {
+  let written = with_cell[said]([]) { lines -> {
+    let code = handle {
+      answered(Err("the corpus does not check"))
+    } with {
+      process.out[proc](text) -> cell_set(lines, push(cell_get(lines), "out: " ++ text)),
+      process.err[proc](text) -> cell_set(lines, push(cell_get(lines), "err: " ++ text)),
+    };
+    (code, cell_get(lines))
+  } };
+  assert_eq(written, (1, ["err: ply-corpus: the corpus does not check"]))
 }
 
 test "an unknown flag is a refusal, not a panic" {
