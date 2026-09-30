@@ -2,8 +2,7 @@
 
 use serde_json::Value;
 
-/// The programs under `fixtures/` the corpus runs on their own: each checks, and its tests pass.
-/// The two `w6-*` files are appended to the desk rather than run alone, so they are not here.
+/// The programs under `fixtures/` the corpus runs: each checks, and its tests pass.
 #[test]
 fn every_fixture_the_corpus_runs_checks_and_passes_its_own_tests() {
     for fixture in [
@@ -12,6 +11,7 @@ fn every_fixture_the_corpus_runs_checks_and_passes_its_own_tests() {
         "shape.ply",
         "scans.ply",
         "statements.ply",
+        "rungs.ply",
     ] {
         let path = format!("crates/ply-corpus/fixtures/{fixture}");
         let out = std::process::Command::new(crate::support::ply())
