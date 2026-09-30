@@ -11,8 +11,11 @@ use std::time::{Duration, Instant};
 struct Nothing;
 
 impl HostRuntime for Nothing {
-    fn poll(&self, _: &ply_eval::Pending) -> Result<Option<Value>, Diagnostic> {
-        Ok(None)
+    fn watch(&self, _: &ply_eval::Pending) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
     }
     fn park(&self) -> Result<(), Diagnostic> {
         Ok(())
@@ -1157,6 +1160,7 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
     };
 
     let runtime = facilities.runtime();
+    runtime.watch(&waiting).expect("the wait is this host's");
     let parked = Instant::now();
     runtime.park().expect("two operations are outstanding");
     assert!(
@@ -1166,9 +1170,9 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
     );
     assert!(
         runtime
-            .poll(&waiting)
-            .expect("the wait is this host's")
-            .is_some(),
+            .resolved()
+            .iter()
+            .any(|(token, answer)| *token == waiting.token && answer.is_ok()),
         "the child's end is what woke the park"
     );
 

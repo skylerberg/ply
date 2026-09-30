@@ -12,7 +12,7 @@ pub use spans::{Owner, Spans};
 use ply_eval::host::MachineId;
 use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest,
-    HostResource, HostRuntime, Linearity, Resource, Span, Symbol, codes,
+    HostResource, HostRuntime, Linearity, Resource, Span, Symbol, TaskId, codes,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -177,16 +177,26 @@ impl Trace {
         lock(&self.spans).total_open()
     }
 
-    /// Closes every span this machine still has open, `Abandoned`, innermost first per task.
+    /// Closes this machine's open spans `Abandoned` and warns of them with its retired tasks'.
     pub fn end_entry_point(&self, machine: MachineId) -> Option<Diagnostic> {
-        let closings = lock(&self.spans).end_entry_point(machine);
-        if closings.is_empty() {
-            return None;
-        }
+        let (closings, abandoned) = lock(&self.spans).end_entry_point(machine);
         for closing in &closings {
             self.emit_close(closing);
         }
-        Some(spans::warn_abandoned(&closings))
+        (!abandoned.is_empty()).then(|| spans::warn_abandoned(&abandoned))
+    }
+
+    /// Closes a retired task's open spans `Abandoned`, innermost first: it can never close them.
+    pub fn end_task(&self, machine: MachineId, task: TaskId) {
+        let closings = lock(&self.spans).end_task(machine, task);
+        for closing in &closings {
+            self.emit_close(closing);
+        }
+    }
+
+    /// The performers the span table keeps a stack for, which a retired task no longer is.
+    pub fn span_owners(&self) -> usize {
+        lock(&self.spans).owners()
     }
 
     pub fn flush(&self) {

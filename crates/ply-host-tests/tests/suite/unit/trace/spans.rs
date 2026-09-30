@@ -157,7 +157,7 @@ fn teardown_closes_this_machines_spans_and_leaves_every_other_machines_alone() {
     let inner = enter(&mut spans, (mine, Some(TaskId(1))), "db", "query");
     enter(&mut spans, (theirs, None), "http", "request");
 
-    let closed = spans.end_entry_point(mine);
+    let (closed, abandoned) = spans.end_entry_point(mine);
     let ids: Vec<i64> = closed.iter().map(|c| c.open.id).collect();
     assert_eq!(ids.len(), 2, "both of this machine's owners");
     assert!(ids.contains(&outer) && ids.contains(&inner));
@@ -165,7 +165,7 @@ fn teardown_closes_this_machines_spans_and_leaves_every_other_machines_alone() {
     assert_eq!(spans.total_open(), 1, "the other machine is untouched");
     assert_eq!(spans.abandoned(), 2);
 
-    let warning = warn_abandoned(&closed);
+    let warning = warn_abandoned(&abandoned);
     assert_eq!(warning.code, codes::SPAN_ABANDONED);
     assert!(warning.message.contains('2'), "{}", warning.message);
 }
@@ -179,11 +179,116 @@ fn teardown_reports_the_innermost_span_first() {
     enter(&mut spans, owner, "http", "request");
     enter(&mut spans, owner, "http", "query");
 
-    let closed = spans.end_entry_point(mine);
+    let (closed, abandoned) = spans.end_entry_point(mine);
     assert_eq!(closed[0].open.name.as_ref(), "query");
     assert!(
-        warn_abandoned(&closed).message.contains("`query`"),
+        warn_abandoned(&abandoned).message.contains("`query`"),
         "the warning names the innermost span"
+    );
+}
+
+#[test]
+fn a_retired_task_closes_its_own_spans_innermost_first_and_nothing_else() {
+    let mut spans = Spans::new();
+    let mine = machine();
+    let retired = (mine, Some(TaskId(1)));
+    let running = (mine, Some(TaskId(2)));
+    let outer = enter(&mut spans, retired, "http", "request");
+    let inner = enter(&mut spans, retired, "db", "query");
+    let other = enter(&mut spans, running, "http", "request");
+    enter(&mut spans, (mine, None), "http", "serve");
+
+    let closed = spans.end_task(mine, TaskId(1));
+    let ids: Vec<i64> = closed.iter().map(|c| c.open.id).collect();
+    assert_eq!(ids, [inner, outer], "innermost first");
+    assert!(closed.iter().all(|c| c.outcome == Outcome::Abandoned));
+    assert_eq!(spans.abandoned(), 2);
+    assert_eq!(spans.depth(retired), 0);
+    assert_eq!(
+        spans.innermost(running),
+        (other, 0),
+        "another task's span stays"
+    );
+    assert_eq!(spans.depth((mine, None)), 1, "the entry point's span stays");
+    assert!(
+        spans.end_task(mine, TaskId(1)).is_empty(),
+        "retiring twice closes nothing"
+    );
+    assert_eq!(
+        spans.retired(mine).map(|noted| noted.count),
+        Some(2),
+        "noted once, for the entry point's warning"
+    );
+}
+
+/// A stack a task emptied would otherwise stay keyed by it until its entry point ends.
+#[test]
+fn retiring_a_task_that_closed_every_span_drops_its_stack() {
+    let mut spans = Spans::new();
+    let mine = machine();
+    let owner = (mine, Some(TaskId(1)));
+    let id = enter(&mut spans, owner, "http", "request");
+    spans
+        .exit(owner, id, &channel("http"), Outcome::Ok)
+        .unwrap_or_else(|_| panic!("it is open"));
+    assert_eq!(spans.owners(), 1);
+    assert!(spans.end_task(mine, TaskId(1)).is_empty());
+    assert_eq!(spans.owners(), 0);
+    assert_eq!(spans.abandoned(), 0);
+    assert!(spans.retired(mine).is_none(), "nothing was left open");
+}
+
+/// A server retires tasks for as long as it runs, so what they abandoned is a count and a few
+/// names however many there were.
+#[test]
+fn ten_thousand_retired_tasks_each_abandoning_a_span_keep_the_summary_bounded() {
+    let mut spans = Spans::new();
+    let mine = machine();
+    for task in 0..10_000 {
+        enter(&mut spans, (mine, Some(TaskId(task))), "http", "request");
+        assert_eq!(spans.end_task(mine, TaskId(task)).len(), 1);
+    }
+    let noted = spans.retired(mine).expect("the tasks left spans open");
+    assert_eq!(noted.count, 10_000);
+    assert_eq!(noted.first.len(), NAMED);
+    assert_eq!(spans.owners(), 0, "no retired task keeps a stack");
+
+    let (closed, abandoned) = spans.end_entry_point(mine);
+    assert!(closed.is_empty());
+    assert_eq!(abandoned.count, 10_000);
+    assert_eq!(abandoned.first.len(), NAMED);
+    assert!(
+        spans.retired(mine).is_none(),
+        "the entry point reports them once"
+    );
+    let message = warn_abandoned(&abandoned).message;
+    assert!(
+        message.contains("10000 spans were still open when their task or the entry point ended"),
+        "{message}"
+    );
+    assert!(message.contains("9997 more"), "{message}");
+}
+
+/// The span the entry point itself was inside is named first; its retired tasks' follow.
+#[test]
+fn an_entry_points_own_spans_are_named_before_its_retired_tasks_and_no_other_machines() {
+    let mut spans = Spans::new();
+    let mine = machine();
+    let theirs = machine();
+    enter(&mut spans, (mine, Some(TaskId(1))), "db", "query");
+    spans.end_task(mine, TaskId(1));
+    enter(&mut spans, (theirs, Some(TaskId(1))), "http", "elsewhere");
+    spans.end_task(theirs, TaskId(1));
+    enter(&mut spans, (mine, None), "http", "serve");
+
+    let (_, abandoned) = spans.end_entry_point(mine);
+    let named: Vec<&str> = abandoned.first.iter().map(|(n, _)| n.as_ref()).collect();
+    assert_eq!(abandoned.count, 2);
+    assert_eq!(named, ["serve", "query"]);
+    assert_eq!(
+        spans.retired(theirs).map(|noted| noted.count),
+        Some(1),
+        "another machine's retired tasks wait for its own entry point"
     );
 }
 

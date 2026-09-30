@@ -2715,7 +2715,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `W0605` | standard library changed since the cache was written |
 | `W0607` | supplied configuration key the schema does not declare |
 | `W0608` | drain deadline expired with requests in flight |
-| `W0609` | spans still open when an entry point ended |
+| `W0609` | spans still open when their task or the entry point ended |
 | `W0610` | reference cycle, never freed |
 | `W0611` | definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps it quiet |
 | `W0612` | run abandoned at its wall clock; nothing recorded |
