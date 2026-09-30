@@ -107,6 +107,20 @@ impl Compiled {
         Machine::new(&self.front, tier).expect("the tier was compiled from this program")
     }
 
+    /// The unit over every definition, loaded bare, so a test enters its bodies without a machine.
+    pub fn native(&self) -> ply_codegen::c::Native {
+        ply_codegen::c::producer::ensure_default();
+        let front: &'static Front = Box::leak(Box::new(self.front.clone()));
+        let source: &'static ply_codegen::Source = Box::leak(Box::new(
+            ply_codegen::Source::from_front(front).with_texts(self.texts.clone()),
+        ));
+        let names = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        ply_codegen::c::build(source, &refs)
+            .expect("the unit builds")
+            .0
+    }
+
     pub fn machine_on_tier(&self) -> Machine<'_> {
         self.machine()
     }
