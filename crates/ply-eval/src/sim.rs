@@ -98,8 +98,9 @@ impl fmt::Display for Seed {
     }
 }
 
+/// Never reused within a region, and wide enough that a server spawning without pause never wraps.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct TaskId(pub u32);
+pub struct TaskId(pub u64);
 
 impl fmt::Display for TaskId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

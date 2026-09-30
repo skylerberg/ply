@@ -32,10 +32,45 @@ pub enum Unbalanced {
     OtherChannel(Resource),
 }
 
+/// How many abandoned spans a warning names.
+pub const NAMED: usize = 3;
+
+/// How many spans were closed `Abandoned`, and the first few by name, however many there were.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Abandoned {
+    pub count: u64,
+    /// At most [`NAMED`] spans' names and channels, in the order they were abandoned.
+    pub first: Vec<(std::sync::Arc<str>, Resource)>,
+}
+
+impl Abandoned {
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn note(&mut self, open: &Open) {
+        self.count += 1;
+        if self.first.len() < NAMED {
+            self.first
+                .push((std::sync::Arc::clone(&open.name), open.channel.clone()));
+        }
+    }
+
+    /// `self`, then `later`: the count of both, and as many names as there is room for.
+    fn then(mut self, later: Abandoned) -> Abandoned {
+        self.count += later.count;
+        let room = NAMED.saturating_sub(self.first.len());
+        self.first.extend(later.first.into_iter().take(room));
+        self
+    }
+}
+
 pub struct Spans {
     open: BTreeMap<Owner, Vec<Open>>,
     /// The next id each entry point mints; dropped by [`Spans::end_entry_point`].
     next: BTreeMap<MachineId, i64>,
+    /// Per machine, what its retired tasks left open, for the warning its entry point ends with.
+    retired: BTreeMap<MachineId, Abandoned>,
     opened: u64,
     abandoned: u64,
 }
@@ -51,6 +86,7 @@ impl Spans {
         Spans {
             open: BTreeMap::new(),
             next: BTreeMap::new(),
+            retired: BTreeMap::new(),
             opened: 0,
             abandoned: 0,
         }
@@ -143,8 +179,8 @@ impl Spans {
         Ok(closings)
     }
 
-    /// Removes every span this machine still has open, innermost first per task.
-    pub fn end_entry_point(&mut self, machine: MachineId) -> Vec<Closing> {
+    /// Closes this machine's open spans, innermost first per task, with its retired tasks' after.
+    pub fn end_entry_point(&mut self, machine: MachineId) -> (Vec<Closing>, Abandoned) {
         self.next.remove(&machine);
         let mine: Vec<Owner> = self
             .open
@@ -154,18 +190,52 @@ impl Spans {
             .collect();
         let mut closings = Vec::new();
         for owner in mine {
-            let Some(stack) = self.open.remove(&owner) else {
-                continue;
-            };
-            for open in stack.into_iter().rev() {
-                self.abandoned += 1;
-                closings.push(Closing {
-                    open,
-                    outcome: Outcome::Abandoned,
-                });
+            closings.extend(self.end_owner(owner));
+        }
+        let mut abandoned = Abandoned::default();
+        for closing in &closings {
+            abandoned.note(&closing.open);
+        }
+        let retired = self.retired.remove(&machine).unwrap_or_default();
+        (closings, abandoned.then(retired))
+    }
+
+    /// Removes a retired task's spans, innermost first, noting them for its entry point's warning.
+    pub fn end_task(&mut self, machine: MachineId, task: TaskId) -> Vec<Closing> {
+        let closings = self.end_owner((machine, Some(task)));
+        if !closings.is_empty() {
+            let noted = self.retired.entry(machine).or_default();
+            for closing in &closings {
+                noted.note(&closing.open);
             }
         }
         closings
+    }
+
+    /// What this machine's retired tasks have abandoned since its entry point began.
+    pub fn retired(&self, machine: MachineId) -> Option<&Abandoned> {
+        self.retired.get(&machine)
+    }
+
+    /// Removes every span `owner` still has open, innermost first, and the owner with them.
+    fn end_owner(&mut self, owner: Owner) -> Vec<Closing> {
+        let Some(stack) = self.open.remove(&owner) else {
+            return Vec::new();
+        };
+        self.abandoned += stack.len() as u64;
+        stack
+            .into_iter()
+            .rev()
+            .map(|open| Closing {
+                open,
+                outcome: Outcome::Abandoned,
+            })
+            .collect()
+    }
+
+    /// The owners a stack is kept for, open spans or not.
+    pub fn owners(&self) -> usize {
+        self.open.len()
     }
 
     fn why(&self, owner: Owner, id: i64) -> Unbalanced {
@@ -210,21 +280,32 @@ pub fn err_unbalanced(span: Span, operation: &str, id: i64, why: &Unbalanced) ->
 
 #[cold]
 #[inline(never)]
-pub fn warn_abandoned(closings: &[Closing]) -> Diagnostic {
-    let innermost = closings
-        .first()
-        .map(|c| c.open.name.to_string())
-        .unwrap_or_default();
+pub fn warn_abandoned(abandoned: &Abandoned) -> Diagnostic {
+    let mut named: Vec<String> = abandoned
+        .first
+        .iter()
+        .map(|(name, channel)| format!("`{name}` on `{}`", label(channel)))
+        .collect();
+    let unnamed = abandoned.count.saturating_sub(abandoned.first.len() as u64);
+    if unnamed > 0 {
+        named.push(format!("{unnamed} more"));
+    }
+    let (spans, whose) = if abandoned.count == 1 {
+        ("span was", "its task")
+    } else {
+        ("spans were", "their task")
+    };
     Diagnostic::warning(
         codes::SPAN_ABANDONED,
         format!(
-            "{} {} still open when the entry point ended; the innermost was `{innermost}`",
-            closings.len(),
-            if closings.len() == 1 { "span was" } else { "spans were" }
+            "{} {spans} still open when {whose} or the entry point ended: {}",
+            abandoned.count,
+            named.join(", ")
         ),
     )
     .note("each was closed `Abandoned` and written, so the last records a dying computation produced say what it was doing")
     .note("a body that raises, or that rolls back, never reaches its own `trace.exit`; close the span where the value comes out, or read the `Abandoned` records as the report")
+    .note("a task's spans close when it retires: once it has finished and no handle to it is left")
 }
 
 fn describe(owner: Owner) -> String {

@@ -91,9 +91,27 @@ impl Bell {
     }
 }
 
+/// One runtime's watched tokens as they resolve, so it collects what resolved, not all it awaits.
+#[derive(Default)]
+pub struct Inbox {
+    tokens: Mutex<Vec<u64>>,
+}
+
+impl Inbox {
+    fn deliver(&self, token: u64) {
+        lock(&self.tokens).push(token);
+    }
+
+    fn take(&self) -> Vec<u64> {
+        std::mem::take(&mut *lock(&self.tokens))
+    }
+}
+
 struct Waiting {
     span: Span,
     what: &'static str,
+    /// Where the token goes once it resolves, once a runtime watches it.
+    inbox: Option<Arc<Inbox>>,
 }
 
 #[derive(Default)]
@@ -163,7 +181,14 @@ impl Pool {
                 ))
                 .note("W1 has no cancellation, so an operation that never completes holds its thread until the run ends"));
             }
-            state.waiting.insert(token, Waiting { span, what });
+            state.waiting.insert(
+                token,
+                Waiting {
+                    span,
+                    what,
+                    inbox: None,
+                },
+            );
         }
 
         let shared = Arc::clone(&self.shared);
@@ -173,7 +198,15 @@ impl Pool {
                 let outcome = job();
                 let mut state = lock(&shared.state);
                 state.done.insert(token, outcome);
+                let inbox = state
+                    .waiting
+                    .get(&token)
+                    .and_then(|waiting| waiting.inbox.clone());
                 drop(state);
+                // Delivered before the wake, so a runtime that wakes finds its token.
+                if let Some(inbox) = inbox {
+                    inbox.deliver(token);
+                }
                 shared.finished.notify_all();
                 if let Some(bell) = shared.bell.get() {
                     bell.ring();
@@ -194,6 +227,38 @@ impl Pool {
     pub fn owns(&self, pending: &Pending) -> bool {
         let state = lock(&self.shared.state);
         state.waiting.contains_key(&pending.token) || state.done.contains_key(&pending.token)
+    }
+
+    /// Delivers `pending` to `inbox` once it resolves, or now if it has.
+    pub fn watch(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
+        let mut state = lock(&self.shared.state);
+        if state.done.contains_key(&pending.token) {
+            inbox.deliver(pending.token);
+            return Ok(());
+        }
+        match state.waiting.get_mut(&pending.token) {
+            Some(waiting) => {
+                waiting.inbox = Some(Arc::clone(inbox));
+                Ok(())
+            }
+            None => Err(unknown_token(pending)),
+        }
+    }
+
+    /// The answers of the tokens this pool delivered to `inbox` since it was last collected.
+    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        let tokens = inbox.take();
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let mut state = lock(&self.shared.state);
+        tokens
+            .into_iter()
+            .filter_map(|token| match take(&mut state, token) {
+                Taken::Ready(result) => Some((token, result)),
+                Taken::Waiting | Taken::Unknown => None,
+            })
+            .collect()
     }
 
     pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
@@ -326,9 +391,9 @@ fn option(v: Option<Value>) -> Value {
 fn unknown_token(pending: &Pending) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("the host runtime was polled for `{pending}`, which it did not mint"),
+        format!("the host runtime was asked about `{pending}`, which it did not mint"),
     )
-    .note("a pending token belongs to the facility that answered the operation; polling the wrong one loses the result rather than waiting for it")
+    .note("a pending token belongs to the facility that answered the operation; asking the wrong one loses the result rather than waiting for it")
 }
 
 /// A poisoned lock means a job thread panicked.

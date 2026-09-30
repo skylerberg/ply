@@ -39,11 +39,23 @@ impl HostHandler for Waits {
 }
 
 /// A reactor whose tokens are already resolved.
-struct Ready;
+#[derive(Default)]
+struct Ready {
+    watched: std::cell::RefCell<Vec<u64>>,
+}
 
 impl HostRuntime for Ready {
-    fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
-        Ok(Some(Value::Int(7)))
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        self.watched.borrow_mut().push(pending.token);
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        self.watched
+            .take()
+            .into_iter()
+            .map(|token| (token, Ok(Value::Int(7))))
+            .collect()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
@@ -114,7 +126,7 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     if runtime {
-        machine.set_host_runtime(std::rc::Rc::new(Ready));
+        machine.set_host_runtime(std::rc::Rc::new(Ready::default()));
     }
     let outcome = machine.eval_test(0);
     Run {

@@ -433,6 +433,8 @@ pub struct Ctx {
     pub builtin_calls: u64,
     /// One per stack run in this entry, the entry's own first; `current` is the one running.
     pub(crate) stacks: Vec<Frames>,
+    /// Indices of `stacks` a finished production task gave back, which nothing names any longer.
+    free_stacks: Vec<usize>,
     pub(crate) current: usize,
     /// Every atom a compiled `perform` performed since the entry began, for the machine's trace.
     pub performed: Vec<EffectAtom>,
@@ -492,6 +494,7 @@ impl Ctx {
             diagnostic: None,
             builtin_calls: 0,
             stacks: vec![Frames::under(None)],
+            free_stacks: Vec::new(),
             current: 0,
             performed: Vec::new(),
             sims: Vec::new(),
@@ -534,6 +537,7 @@ impl Ctx {
         self.diagnostic = None;
         self.stacks.clear();
         self.stacks.push(Frames::under(None));
+        self.free_stacks.clear();
         self.current = 0;
         self.performed.clear();
         self.sims.clear();
@@ -702,8 +706,35 @@ impl Ctx {
 
     /// A new stack's frames, chained under `parent`; its index names it.
     pub(crate) fn open_stack(&mut self, parent: Option<usize>) -> usize {
-        self.stacks.push(Frames::under(parent));
-        self.stacks.len() - 1
+        match self.free_stacks.pop() {
+            Some(stack) => {
+                self.stacks[stack] = Frames::under(parent);
+                stack
+            }
+            None => {
+                self.stacks.push(Frames::under(parent));
+                self.stacks.len() - 1
+            }
+        }
+    }
+
+    /// Gives back a dead stack's index, its frames and regions already gone; nothing may name it.
+    pub(crate) fn close_stack(&mut self, stack: usize) {
+        debug_assert!(
+            self.stacks[stack].list.is_empty() && self.cells.depth(Owner(stack)) == 0,
+            "a stack gave its index back while still holding frames or regions"
+        );
+        self.free_stacks.push(stack);
+    }
+
+    /// The stacks' frame tables this entry holds, given-back ones included: what a leak grows.
+    pub fn stack_slots(&self) -> usize {
+        self.stacks.len()
+    }
+
+    /// The stacks the cell arena keeps a nesting for: what a leak grows.
+    pub fn cell_owners(&self) -> usize {
+        self.cells.owners()
     }
 
     pub(crate) fn fail(&mut self, d: Diagnostic) -> i64 {
