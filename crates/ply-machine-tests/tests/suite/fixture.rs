@@ -24,21 +24,26 @@ pub fn write(dir: &Path, name: &str, text: &str) {
     std::fs::write(path, text).expect("the fixture is written");
 }
 
-/// The front end the CLI would hand a machine: the project walked, the compiler run once over it,
-/// and both marshalled into the record the effects take.
+/// The front end the CLI would hand a machine: the file, or the project walked, the compiler run
+/// once over it, and both marshalled into the record the effects take.
 ///
 /// A test that drives an effect directly has no CLI to do this for it, and every effect that reads a
 /// program now takes one. The fixture's module mirrors the package's, so what the machine names has
 /// to be what this declares -- `replay`'s own check says so for the payload.
-pub fn handed(root: &Path) -> ply_eval::Value {
+pub fn handed(path: &Path) -> ply_eval::Value {
     use ply_codegen::c::producer::{self, Packages};
     producer::ensure_default();
+    let root = ply_machine::load::project_root(path);
     let mut paths = Vec::new();
-    collect(root, &mut paths);
+    if path.is_file() {
+        paths.push(path.to_path_buf());
+    } else {
+        collect(path, &mut paths);
+    }
     paths.sort();
     let mut files: Vec<(String, String, String)> = Vec::new();
     for path in paths {
-        let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+        let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
         let module = ply_ty::ModuleName::from_relative_path(&relative)
             .expect("a fixture's file is a module");
         let text = std::fs::read_to_string(&path).expect("the fixture is read");
@@ -87,7 +92,8 @@ pub fn handed(root: &Path) -> ply_eval::Value {
     ])
 }
 
-/// Every `.ply` file under `root`.
+/// Every `.ply` file under `root`, a directory whose name starts with `.` passed over as a walk
+/// passes it.
 fn collect(root: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -96,7 +102,9 @@ fn collect(root: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect(&path, out);
+            if !entry.file_name().to_string_lossy().starts_with('.') {
+                collect(&path, out);
+            }
         } else if path.extension().is_some_and(|e| e == "ply") {
             out.push(path);
         }
@@ -251,44 +259,63 @@ fn measuring() -> &'static Measuring {
     })
 }
 
-/// The world and the obligations of a loaded program, read off its checked front the way
-/// `proof.world` reads the compiler's answer, in the order it builds them: every definition's
-/// `ensures` clauses, then every law. An audit here drives the prover with no program to build them.
-pub fn world_of(
+/// The file or project at `path` loaded as the CLI hands one to a machine, and the world and
+/// obligations `proof.world` builds of the same answer: every definition's `ensures` clauses, then
+/// every law. An audit here drives the prover with no program to build them, so the types are read
+/// off the compiler's answer the way `proof.world` reads the checker's tables.
+pub fn proving(
+    path: &Path,
+) -> Result<
+    (
+        ply_machine::load::Loaded,
+        ply_prove::World,
+        Vec<ply_prove::Obligation>,
+    ),
+    ply_machine::load::LoadError,
+> {
+    let handed = handed(path);
+    let front =
+        ply_machine::driver::handed_front_of(&handed, ply_span::Span::DUMMY).map_err(|d| {
+            ply_machine::load::LoadError {
+                sources: ply_span::SourceMap::new(),
+                diagnostics: vec![d],
+            }
+        })?;
+    let loaded = ply_machine::driver::load_over_front(path, &front)?;
+    let dump = ply_machine::payload::field_of(&handed, "dump", ply_span::Span::DUMMY)
+        .expect("the front end's answer is handed over");
+    let (world, obligations) = world_of(
+        ply_eval::decode::At::new("the front end's answer", dump),
+        &loaded,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    Ok((loaded, world, obligations))
+}
+
+fn world_of(
+    answer: ply_eval::decode::At<'_>,
     loaded: &ply_machine::load::Loaded,
-) -> (ply_prove::World, Vec<ply_prove::Obligation>) {
+) -> Result<(ply_prove::World, Vec<ply_prove::Obligation>), ply_eval::decode::Error> {
+    use ply_eval::decode::At;
     use ply_prove::world::{Decl, Signature, Variant};
     use ply_prove::{Obligation, ObligationKind, World};
     use ply_span::Symbol;
-    use ply_ty::{SpecKind, Type};
+    use ply_ty::SpecKind;
 
-    let check = &loaded.check;
     let mut decls: Vec<Decl> = Vec::new();
-    for ctor in check.ctors.values() {
-        let answer = match &ctor.scheme.ty {
-            Type::Fn { ret, .. } => ret.as_ref(),
-            other => other,
-        };
-        let params: Vec<ply_ty::TyVar> = match answer {
-            Type::Con(_, args) => args
-                .iter()
-                .map(|a| match a {
-                    Type::Var(v) => *v,
-                    _ => ply_ty::TyVar(u32::MAX),
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
+    for ctor in answer.field("ctors")?.list()? {
+        let params = params_of(ctor.field("scheme")?)?;
+        let type_name = Symbol::new(ctor.field("type_name")?.utf8()?);
         let variant = Variant {
-            name: ctor.name.clone(),
-            index: ctor.index,
-            fields: ctor.fields.iter().map(|f| sort_of(f, &params)).collect(),
+            name: Symbol::new(ctor.field("name")?.utf8()?),
+            index: ctor.field("index")?.number()?,
+            fields: ctor.field("fields")?.items(|f| sort_of(f, &params))?,
             depth: None,
         };
-        match decls.iter_mut().find(|d| d.name == ctor.type_name) {
+        match decls.iter_mut().find(|d| d.name == type_name) {
             Some(decl) => decl.variants.push(variant),
             None => decls.push(Decl {
-                name: ctor.type_name.clone(),
+                name: type_name,
                 params: params.len(),
                 variants: vec![variant],
                 depth: None,
@@ -298,24 +325,45 @@ pub fn world_of(
     for decl in &mut decls {
         decl.variants.sort_by_key(|v| v.index);
     }
-    let signatures: Vec<Signature> = check
-        .defs
-        .values()
-        .map(|def| Signature {
+    // Each definition's type, by program-wide name.
+    let mut types: std::collections::HashMap<&str, At<'_>> = std::collections::HashMap::new();
+    for def in answer.field("defs")?.list()? {
+        types.insert(
+            def.field("name")?.utf8()?,
+            def.field("scheme")?.field("ty")?,
+        );
+    }
+    let type_of = |name: &Symbol| {
+        types
+            .get(name.as_str())
+            .copied()
+            .unwrap_or_else(|| panic!("the answer holds no row for `{name}`"))
+    };
+    let mut signatures: Vec<Signature> = Vec::new();
+    for def in loaded.check.defs.values() {
+        let ty = type_of(&def.name);
+        let mut vars = Vec::new();
+        met(ty, &mut vars)?;
+        signatures.push(Signature {
             name: def.name.clone(),
-            sort: sort_of(&def.scheme.ty, &met(&[&def.scheme.ty])),
+            sort: sort_of(ty, &vars)?,
             pure: def.footprint.is_empty(),
-        })
-        .collect();
+        });
+    }
 
+    let row =
+        |footprint: &ply_ty::Footprint| (!footprint.is_empty()).then(|| footprint.to_string());
     let mut obligations = Vec::new();
-    for (name, info) in &check.defs {
+    for (name, info) in &loaded.check.defs {
         if !info.spec.iter().any(|s| s.kind == SpecKind::Ensures) {
             continue;
         }
-        let (params, ret) = match &info.scheme.ty {
-            Type::Fn { params, ret, .. } => (params.as_slice(), ret.as_ref()),
-            other => (&[][..], other),
+        let ty = type_of(name).ctor()?;
+        let (params, ret) = if ty.name() == "TyFn" {
+            let f = ty.arg(0)?;
+            (f.field("params")?.list()?.collect(), f.field("ret")?)
+        } else {
+            (Vec::new(), type_of(name))
         };
         let written = loaded
             .front
@@ -323,9 +371,9 @@ pub fn world_of(
             .get(name)
             .map(|w| w.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
-        let mut named: Vec<(Symbol, &Type)> = written.into_iter().zip(params).collect();
+        let mut named: Vec<(Symbol, At<'_>)> = written.into_iter().zip(params).collect();
         named.push((Symbol::new("result"), ret));
-        let binders = binders_of(&named);
+        let binders = binders_of(&named)?;
         let guarded = info.spec.iter().any(|s| s.kind == SpecKind::Requires);
         let keys = loaded.hashes.specs.get(name);
         for (ordinal, clause) in info
@@ -349,33 +397,28 @@ pub fn world_of(
             });
         }
     }
-    for law in &check.laws {
+    let laws: Vec<At<'_>> = answer.field("laws")?.list()?.collect();
+    for law in &loaded.check.laws {
         let key = *loaded
             .hashes
             .laws
             .get(law.index)
             .unwrap_or_else(|| panic!("the law `{}` was not hashed", law.key));
-        let named: Vec<(Symbol, &Type)> = law
-            .binders
-            .iter()
-            .map(|b| (b.name.clone(), &b.ty))
-            .collect();
+        let named = laws[law.index]
+            .field("binders")?
+            .items(|b| Ok((Symbol::new(b.field("name")?.utf8()?), b.field("ty")?)))?;
         obligations.push(Obligation {
             key,
             owner: law.key.clone(),
             kind: ObligationKind::Law,
             span: law.span,
-            binders: binders_of(&named),
+            binders: binders_of(&named)?,
             guarded: law.has_guard,
             host: law.host,
             footprint: row(&law.footprint),
         });
     }
-    (World::new(decls, signatures), obligations)
-}
-
-fn row(footprint: &ply_ty::Footprint) -> Option<String> {
-    (!footprint.is_empty()).then(|| footprint.to_string())
+    Ok((World::new(decls, signatures), obligations))
 }
 
 /// The obligations as the program hands them over with `configure`, in a world of no declarations
@@ -470,70 +513,135 @@ fn sort_value(module: &str, sort: &ply_prove::Sort) -> ply_eval::Value {
     }
 }
 
-/// Each variable of `types` once, where it first appears.
-fn met(types: &[&ply_ty::Type]) -> Vec<ply_ty::TyVar> {
-    fn walk(ty: &ply_ty::Type, seen: &mut Vec<ply_ty::TyVar>) {
-        match ty {
-            ply_ty::Type::Var(v) => {
-                if !seen.contains(v) {
-                    seen.push(*v);
-                }
-            }
-            ply_ty::Type::Con(_, args) => args.iter().for_each(|a| walk(a, seen)),
-            ply_ty::Type::Fn { params, ret, .. } => {
-                params.iter().for_each(|p| walk(p, seen));
-                walk(ret, seen);
-            }
-            ply_ty::Type::Record(fields) => fields.values().for_each(|f| walk(f, seen)),
-        }
+/// A record's fields in the order the printer reads them: a tuple's by position.
+fn fields(
+    list: ply_eval::decode::At<'_>,
+) -> Result<Vec<(&str, ply_eval::decode::At<'_>)>, ply_eval::decode::Error> {
+    let fields: Vec<(&str, ply_eval::decode::At<'_>)> =
+        list.items(|f| Ok((f.field("name")?.utf8()?, f.field("ty")?)))?;
+    let position = |i: usize| fields.iter().position(|(name, _)| *name == format!("_{i}"));
+    if fields.len() >= 2 && (0..fields.len()).all(|i| position(i).is_some()) {
+        return Ok((0..fields.len())
+            .filter_map(position)
+            .map(|at| fields[at])
+            .collect());
     }
-    let mut seen = Vec::new();
-    for ty in types {
-        walk(ty, &mut seen);
-    }
-    seen
+    Ok(fields)
 }
 
-fn sort_of(ty: &ply_ty::Type, vars: &[ply_ty::TyVar]) -> ply_prove::Sort {
-    use ply_prove::Sort;
-    match ty {
-        ply_ty::Type::Var(v) => {
-            Sort::Var(vars.iter().position(|x| x == v).unwrap_or(vars.len()) as u32)
+/// Each variable of a `tycore.Type` once, where the printer meets it, after the ones already met.
+fn met(ty: ply_eval::decode::At<'_>, seen: &mut Vec<i64>) -> Result<(), ply_eval::decode::Error> {
+    let c = ty.ctor()?;
+    match c.name() {
+        "TyVar" => {
+            let v = c.arg(0)?.int()?;
+            if !seen.contains(&v) {
+                seen.push(v);
+            }
         }
-        ply_ty::Type::Con(name, args) => Sort::Con(
-            name.clone(),
-            args.iter().map(|a| sort_of(a, vars)).collect(),
-        ),
-        ply_ty::Type::Fn {
-            params,
-            ret,
-            effects,
-        } => Sort::func(
-            params.iter().map(|p| sort_of(p, vars)).collect(),
-            sort_of(ret, vars),
-            effects.is_pure(),
-        ),
-        ply_ty::Type::Record(fields) => Sort::record(
-            fields
-                .iter()
-                .map(|(name, f)| (name.clone(), sort_of(f, vars))),
-        ),
+        "TyCon" => {
+            for arg in c.arg(0)?.field("args")?.list()? {
+                met(arg, seen)?;
+            }
+        }
+        "TyFn" => {
+            let f = c.arg(0)?;
+            for param in f.field("params")?.list()? {
+                met(param, seen)?;
+            }
+            met(f.field("ret")?, seen)?;
+        }
+        "TyRecord" => {
+            for (_, field) in fields(c.arg(0)?)? {
+                met(field, seen)?;
+            }
+        }
+        _ => return Err(c.unknown()),
     }
+    Ok(())
+}
+
+/// A variable the numbering does not hold is numbered past all of them, as `proof.world` does.
+fn sort_of(
+    ty: ply_eval::decode::At<'_>,
+    vars: &[i64],
+) -> Result<ply_prove::Sort, ply_eval::decode::Error> {
+    use ply_prove::Sort;
+    let c = ty.ctor()?;
+    Ok(match c.name() {
+        "TyVar" => {
+            let v = c.arg(0)?.int()?;
+            Sort::Var(vars.iter().position(|x| *x == v).unwrap_or(vars.len()) as u32)
+        }
+        "TyCon" => {
+            let con = c.arg(0)?;
+            Sort::Con(
+                ply_span::Symbol::new(con.field("name")?.utf8()?),
+                con.field("args")?.items(|a| sort_of(a, vars))?,
+            )
+        }
+        "TyFn" => {
+            let f = c.arg(0)?;
+            let effects = f.field("effects")?;
+            let pure = effects.field("atoms")?.list()?.len() == 0
+                && effects.field("tail")?.option()?.is_none();
+            Sort::func(
+                f.field("params")?.items(|p| sort_of(p, vars))?,
+                sort_of(f.field("ret")?, vars)?,
+                pure,
+            )
+        }
+        "TyRecord" => Sort::record(
+            fields(c.arg(0)?)?
+                .into_iter()
+                .map(|(name, field)| Ok((ply_span::Symbol::new(name), sort_of(field, vars)?)))
+                .collect::<Result<Vec<_>, ply_eval::decode::Error>>()?,
+        ),
+        _ => return Err(c.unknown()),
+    })
+}
+
+/// The type's parameters as one constructor's scheme binds them: the arguments its answer is
+/// applied to. An argument that is not a variable holds a place no variable is.
+fn params_of(scheme: ply_eval::decode::At<'_>) -> Result<Vec<i64>, ply_eval::decode::Error> {
+    let ty = scheme.field("ty")?;
+    let c = ty.ctor()?;
+    let answer = if c.name() == "TyFn" {
+        c.arg(0)?.field("ret")?
+    } else {
+        ty
+    };
+    let c = answer.ctor()?;
+    if c.name() != "TyCon" {
+        return Ok(Vec::new());
+    }
+    c.arg(0)?.field("args")?.items(|arg| {
+        let arg = arg.ctor()?;
+        Ok(if arg.name() == "TyVar" {
+            arg.arg(0)?.int()?
+        } else {
+            -1
+        })
+    })
 }
 
 /// One claim's binders, numbered together, each printed with its variables' letters.
-fn binders_of(named: &[(ply_span::Symbol, &ply_ty::Type)]) -> Vec<ply_prove::Binder> {
-    let types: Vec<&ply_ty::Type> = named.iter().map(|(_, ty)| *ty).collect();
-    let vars = met(&types);
+fn binders_of(
+    named: &[(ply_span::Symbol, ply_eval::decode::At<'_>)],
+) -> Result<Vec<ply_prove::Binder>, ply_eval::decode::Error> {
+    let mut vars = Vec::new();
+    for (_, ty) in named {
+        met(*ty, &mut vars)?;
+    }
     named
         .iter()
         .map(|(name, ty)| {
-            let sort = sort_of(ty, &vars);
-            ply_prove::Binder {
+            let sort = sort_of(*ty, &vars)?;
+            Ok(ply_prove::Binder {
                 name: name.clone(),
                 text: sort.to_string(),
                 sort,
-            }
+            })
         })
         .collect()
 }

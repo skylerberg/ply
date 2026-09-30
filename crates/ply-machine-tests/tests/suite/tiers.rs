@@ -1,6 +1,5 @@
 use crate::fixture::{project, repo};
 use ply_machine::engine::{Point, Prover};
-use ply_machine::load::load;
 use ply_prove::{
     Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, ProvePlan, Rule, Tier,
     UNFOLD_DEPTH,
@@ -17,15 +16,14 @@ impl Run {
     }
 
     fn with(path: &Path, plan: &ProvePlan) -> Run {
-        let loaded = match load(path) {
-            Ok(loaded) => loaded,
+        let (loaded, world, obligations) = match crate::fixture::proving(path) {
+            Ok(proving) => proving,
             Err(e) => panic!(
                 "`{}` did not compile: {:?}",
                 path.display(),
                 e.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
             ),
         };
-        let (world, obligations) = crate::fixture::world_of(&loaded);
         let prover = Prover::new(&loaded, &world)
             .expect("the port lowers the claims")
             .with_backend(Some(
@@ -160,8 +158,8 @@ fn the_differential_tier_audit() {
     };
     let mut audited = 0;
     for path in corpus() {
-        let loaded = load(&path).expect("the corpus compiles");
-        let (world, obligations) = crate::fixture::world_of(&loaded);
+        let (loaded, world, obligations) =
+            crate::fixture::proving(&path).expect("the corpus compiles");
         let prover = Prover::new(&loaded, &world)
             .expect("the port lowers the claims")
             .with_backend(Some(
@@ -629,15 +627,14 @@ law "a raising index does not"
 /// The prover over a fixture and the obligations it collected, in name order: what a per-point
 /// re-run needs, and the same prover a whole-run discharge is driven with.
 fn points<R>(path: &Path, f: impl FnOnce(&Prover<'_>, &[Obligation]) -> R) -> R {
-    let loaded = match load(path) {
-        Ok(loaded) => loaded,
+    let (loaded, world, obligations) = match crate::fixture::proving(path) {
+        Ok(proving) => proving,
         Err(e) => panic!(
             "`{}` did not compile: {:?}",
             path.display(),
             e.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
         ),
     };
-    let (world, obligations) = crate::fixture::world_of(&loaded);
     let prover = Prover::new(&loaded, &world)
         .expect("the port lowers the claims")
         .with_backend(Some(

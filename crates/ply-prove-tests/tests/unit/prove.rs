@@ -7,6 +7,9 @@ mod numerics;
 mod term;
 
 use crate::checked::{binders_of, world_of};
+use ply_codegen::c::producer;
+use ply_eval::Value;
+use ply_eval::decode::{At, Error};
 use ply_prove::prove::claims::{Clause, Code, Definition, Law};
 use ply_prove::prove::{
     Blocker, Claims, Context, Decision, Goal, Limits, Proof, Reason, decide, decide_and_diagnose,
@@ -14,12 +17,13 @@ use ply_prove::prove::{
 };
 use ply_prove::{Binder, Rule, Sort, UNFOLD_DEPTH, World};
 use ply_span::{SourceId, Symbol};
-use ply_ty::{CheckOutput, DefInfo, SpecKind, Type};
+use ply_ty::SpecKind;
 
 const SRC: SourceId = SourceId(0);
 
 struct Fixture {
-    check: CheckOutput,
+    /// The front end's answer, which a claim's binders are read from.
+    answer: Value,
     world: World,
     claims: Claims,
 }
@@ -27,16 +31,18 @@ struct Fixture {
 fn fixture(source: &str) -> Fixture {
     // Anonymous, so the checker's keys are the bare ones `ply-prove`'s API is written against.
     let sources = [(String::new(), source.to_string())];
-    let check = ply_codegen::c::producer::checked_front(&sources, &[SRC])
+    producer::ensure_default();
+    let answer = producer::front_pulling_std(&sources, &[])
         .unwrap_or_else(|e| panic!("check: {e:#}"))
-        .check;
-    let answer = ply_codegen::c::producer::claims(&sources, &[], &[])
-        .unwrap_or_else(|e| panic!("claims: {e:#}"));
-    let claims = read_claims(ply_eval::decode::At::new("the claims", &answer), &[SRC])
+        .dump;
+    let front = ply_codegen::c::dump::read(&answer, &[SRC]).unwrap_or_else(|e| panic!("{e}"));
+    assert!(!front.has_error(), "check: {:?}", front.diagnostics);
+    let claimed = producer::claims(&sources, &[], &[]).unwrap_or_else(|e| panic!("claims: {e:#}"));
+    let claims = read_claims(At::new("the claims", &claimed), &[SRC])
         .unwrap_or_else(|e| panic!("claims: {e}"));
     Fixture {
-        world: world_of(&check),
-        check,
+        world: world_of(At::new("the front end's answer", &answer)),
+        answer,
         claims,
     }
 }
@@ -46,35 +52,51 @@ impl Fixture {
         Context::new(self.claims.clone(), &self.world)
     }
 
+    /// The row the answer's `table` holds under `name` in the field `by`.
+    fn row(&self, table: &str, by: &str, name: &str) -> At<'_> {
+        At::new("the front end's answer", &self.answer)
+            .field(table)
+            .and_then(|rows| rows.list())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .find(|row| row.field(by).and_then(|n| n.utf8()).ok() == Some(name))
+            .unwrap_or_else(|| panic!("no `{table}` row named `{name}`"))
+    }
+
     fn law(&self, label: &str) -> (Vec<Binder>, &Law) {
-        let info = self
-            .check
-            .laws
-            .iter()
-            .find(|law| law.name == label)
-            .unwrap_or_else(|| panic!("no law labelled `{label}`"));
-        (
-            binders_of(info.binders.iter().map(|b| (b.name.clone(), &b.ty))),
-            &self.claims.laws[&info.key],
-        )
+        let law = self.row("laws", "name", label);
+        let read = || -> Result<(Vec<(Symbol, At<'_>)>, Symbol), Error> {
+            let named = law
+                .field("binders")?
+                .items(|b| Ok((Symbol::new(b.field("name")?.utf8()?), b.field("ty")?)))?;
+            Ok((named, Symbol::new(law.field("key")?.utf8()?)))
+        };
+        let (named, key) = read().unwrap_or_else(|e| panic!("{e}"));
+        (binders_of(&named), &self.claims.laws[&key])
     }
 
     fn def(&self, name: &str) -> &Definition {
         &self.claims.defs[&Symbol::new(name)]
     }
-}
 
-fn clause_binders(info: &DefInfo) -> Vec<Binder> {
-    let Type::Fn { params, ret, .. } = &info.scheme.ty else {
-        panic!("`{}` is not a function", info.name);
-    };
-    binders_of(
-        params
-            .iter()
-            .chain([&**ret])
-            .enumerate()
-            .map(|(i, ty)| (Symbol::new(format!("_{i}")), ty)),
-    )
+    /// A definition's parameters, then its answer, numbered together as a clause's binders are.
+    fn clause_binders(&self, name: &str) -> Vec<Binder> {
+        let def = self.row("defs", "name", name);
+        let read = || -> Result<Vec<(Symbol, At<'_>)>, Error> {
+            let ty = def.field("scheme")?.field("ty")?.ctor()?;
+            if ty.name() != "TyFn" {
+                panic!("`{name}` is not a function");
+            }
+            let f = ty.arg(0)?;
+            let mut types: Vec<At<'_>> = f.field("params")?.list()?.collect();
+            types.push(f.field("ret")?);
+            Ok(types
+                .into_iter()
+                .enumerate()
+                .map(|(i, ty)| (Symbol::new(format!("_{i}")), ty))
+                .collect())
+        };
+        binders_of(&read().unwrap_or_else(|e| panic!("{e}")))
+    }
 }
 
 fn clauses(def: &Definition, kind: SpecKind) -> Vec<&Clause> {
@@ -742,7 +764,7 @@ fn ensures_goal(index: usize) -> Decision {
     let f = fixture(LEDGER);
     let ctx = f.context();
     let def = f.def("withdraw");
-    let binders = clause_binders(&f.check.defs[&Symbol::new("withdraw")]);
+    let binders = f.clause_binders("withdraw");
     let guards: Vec<&Code> = clauses(def, SpecKind::Requires)
         .into_iter()
         .map(|g| &g.code)
@@ -771,7 +793,7 @@ fn a_postcondition_without_the_definition_is_unknown() {
     let f = fixture(LEDGER);
     let ctx = f.context();
     let def = f.def("withdraw");
-    let binders = clause_binders(&f.check.defs[&Symbol::new("withdraw")]);
+    let binders = f.clause_binders("withdraw");
     let decision = decide(
         &ctx,
         &Goal {

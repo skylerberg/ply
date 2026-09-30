@@ -19,7 +19,7 @@ impl Run {
     }
 
     fn at(path: &Path, plan: &ProvePlan) -> Run {
-        let loaded = load(path).unwrap_or_else(|e| {
+        let (loaded, world, obligations) = crate::fixture::proving(path).unwrap_or_else(|e| {
             panic!(
                 "the fixture did not compile: {:?}",
                 e.diagnostics
@@ -28,7 +28,6 @@ impl Run {
                     .collect::<Vec<_>>()
             )
         });
-        let (world, obligations) = crate::fixture::world_of(&loaded);
         let prover = Prover::new(&loaded, &world)
             .expect("the port lowers the claims")
             .with_backend(Some(
@@ -296,8 +295,8 @@ fn nothing_proved_here_is_refutable_by_sampling() {
     let mut audited = 0;
     for source in sources {
         let dir = project(source);
-        let loaded = load(dir.path()).expect("the fixture compiles");
-        let (world, obligations) = crate::fixture::world_of(&loaded);
+        let (loaded, world, obligations) =
+            crate::fixture::proving(dir.path()).expect("the fixture compiles");
         let prover = Prover::new(&loaded, &world)
             .expect("the port lowers the claims")
             .with_backend(Some(
@@ -525,8 +524,8 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
     // And nothing is covered, which is the half a reviewer reads: coverage counts only a claim
     // that holds, which is `proof.obligation`'s rule, over these discharges.
     let dir = project(SOURCE);
-    let loaded = load(dir.path()).expect("the fixture compiles");
-    let (world, obligations) = crate::fixture::world_of(&loaded);
+    let (loaded, world, obligations) =
+        crate::fixture::proving(dir.path()).expect("the fixture compiles");
     let prover = Prover::new(&loaded, &world)
         .expect("the port lowers the claims")
         .with_backend(Some(
@@ -683,8 +682,8 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
                   law \"hidden in a variant\" forall (m: Money) { m == m }\n\
                   law \"hidden in a record type\" forall (r: Row) { r == r }\n";
     let dir = project(source);
-    let loaded = load(dir.path()).expect("the fixture compiles");
-    let (world, obligations) = crate::fixture::world_of(&loaded);
+    let (loaded, world, obligations) =
+        crate::fixture::proving(dir.path()).expect("the fixture compiles");
     let prover = Prover::new(&loaded, &world)
         .expect("the port lowers the claims")
         .with_backend(Some(
