@@ -1,4 +1,4 @@
-use ply_eval::{DefHash, Span, Symbol};
+use ply_eval::{DefHash, Span, Symbol, codes};
 use ply_prove::{
     Binder, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation,
     ObligationKind, Points, ProvePlan, Rule, Sort, Strategy, Tier, Unsettled, Vacuity, VacuityKind,
@@ -270,6 +270,7 @@ fn only_what_was_asked_about_is_discharged_and_every_outcome_comes_back() {
                 Discharge::Vacuous(_) => "vacuous",
                 Discharge::Unattempted(_) => "unattempted",
                 Discharge::Held(_) => "held",
+                Discharge::Faulted(_) => "defect",
             };
             (o.owner.as_str(), outcome)
         })
@@ -282,4 +283,30 @@ fn only_what_was_asked_about_is_discharged_and_every_outcome_comes_back() {
             ("m.h", "unattempted")
         ]
     );
+}
+
+/// A claim said to be cached whose evidence does not read back was lost by Ply, not left a gap.
+#[test]
+fn a_claim_neither_read_back_nor_discharged_is_plys_failure() {
+    let dir = TempRoot::new();
+    let store = dir.store();
+    let scripted = Scripted::new([]);
+    let report = carried_out(
+        vec![ensures(1, "m.f", 0)],
+        &store,
+        vec![(0, hash(40))],
+        Vec::new(),
+        &scripted,
+    );
+    assert!(
+        scripted.asked().is_empty(),
+        "a claim the cache answered is not discharged"
+    );
+    match &report.obligations[..] {
+        [(_, Discharge::Faulted(fault))] => {
+            assert_eq!(fault.diagnostic.code, codes::INTERNAL_ERROR);
+            assert!(fault.bindings.is_empty(), "no point was judged: {fault:?}");
+        }
+        other => panic!("a lost claim is Ply's failure, not {other:?}"),
+    }
 }

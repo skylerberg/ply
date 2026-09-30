@@ -806,7 +806,7 @@ pub fn run_with<E: Executor>(
             let defect = executed
                 .failure
                 .as_ref()
-                .is_some_and(|d| executed.panicked || is_defect(d));
+                .is_some_and(|d| executed.panicked || codes::is_defect(d.code));
             let status = match (&executed.failure, defect) {
                 (None, _) => Status::Passed,
                 (Some(_), _) if abandoned_run => Status::Abandoned,
@@ -1060,13 +1060,6 @@ fn execute_group<E: Executor>(
     let mut out: Vec<Executed> = per_thread.into_iter().flatten().collect();
     out.sort_by_key(|e| e.index);
     out
-}
-
-fn is_defect(d: &Diagnostic) -> bool {
-    d.code == codes::INTERNAL_ERROR
-        || d.code == codes::HOST_FOOTPRINT_ESCAPE
-        || d.code == codes::SECRET_TO_HOST
-        || d.code == codes::SIMULATION_DIVERGENCE
 }
 
 /// The wall clock stopped this run: it is about the machine, so it is no verdict on the test.

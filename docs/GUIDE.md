@@ -995,6 +995,7 @@ law "a credit and a matching debit leave an account exactly as it was"
 | `property` | randomized cases passed; failures shrink |
 | `example` | concrete cases passed |
 | `unattempted` (`W0604`) | undecided; never green, never cached |
+| `defect` | Ply failed rather than the program: nothing is claimed, never cached, exit 1 |
 
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
@@ -1009,7 +1010,14 @@ view and `len` known to lie below `i64::MAX`.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
-values. A claim's type variables are lettered by where they first appear among
+values. A proposition that raises is a gap in the claim; one the compiled tier
+declines, or any other failure that is Ply's own, is a `defect` reported under
+Ply's code (`E0505`), as `ply test` reports one. Under `--json` a gap carries
+its sentence as `gap` and its kind as `gap_kind` (`unhandled_effect`,
+`ungeneratable`, `raised`, `guard_not_sampled`, `reaches_host`, `not_drawn`), a
+defect carries `defect` — its `code`, `message`, the `bindings` Ply failed at,
+and a `summary` — and `summary` counts defects as `defect`. A claim's type
+variables are lettered by where they first appear among
 its binders (`forall (x: a, y: List<b>)`); a sample draws each as `Int`
 (`a := Int`), and a proof leaves each an uninterpreted sort
 (`uninterpreted a, b`). Flags: `--prove-cases N` (below 25 kept cases only `example`),

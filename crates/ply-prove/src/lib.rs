@@ -167,6 +167,7 @@ pub enum Gap {
         /// As the compiler prints it.
         ty: String,
     },
+    /// The program's own raise; a diagnostic that is Ply's failure is a [`Discharge::Faulted`].
     Raised {
         bindings: Vec<Binding>,
         diagnostic: Box<Diagnostic>,
@@ -187,12 +188,22 @@ pub enum Gap {
     NotDrawn,
 }
 
+/// Ply's own failure while discharging a claim, as [`ply_eval::codes::is_defect`] tells it apart.
+#[derive(Clone, Debug)]
+pub struct Fault {
+    /// The point being judged when Ply failed, or none when it failed before a point was drawn.
+    pub bindings: Vec<Binding>,
+    pub diagnostic: Box<Diagnostic>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Discharge {
     Held(Evidence),
     Refuted(Counterexample),
     Vacuous(Vacuity),
     Unattempted(Gap),
+    /// Neither a verdict on the claim nor a gap in it: Ply failed rather than the program.
+    Faulted(Fault),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
