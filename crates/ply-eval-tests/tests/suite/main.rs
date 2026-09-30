@@ -19,6 +19,7 @@ mod region_meaning_adversarial;
 mod region_stacks_audit;
 mod secrets;
 mod simulated_handlers;
+mod spawn_handlers;
 mod unit;
 mod use_after_free_audit;
 mod value_semantics_audit;
