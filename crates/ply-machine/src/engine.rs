@@ -14,7 +14,7 @@ use ply_prove::property::{
 use ply_prove::prove::claims::{Clause, Code, Definition, Law};
 use ply_prove::prove::{self, Blocker, Claims, Decision, Goal, Limits, Proof};
 use ply_prove::{
-    Binder, Binding, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation,
+    Binder, Binding, Certificate, Counterexample, Discharge, Evidence, Fault, Gap, Obligation,
     ObligationKind, Points, ProvePlan, Rule, Sort, Strategy, Unsettled, Vacuity, VacuityKind,
     World,
 };
@@ -241,19 +241,17 @@ impl<'a> Prover<'a> {
 
     /// What an owner is called through to produce `result`: the tier its propositions are entered
     /// on, attached afresh.
-    fn machine(&self) -> Result<Machine<'a>, Gap> {
+    fn machine(&self) -> Result<Machine<'a>, Fault> {
         Machine::new(self.front, self.backend.attach())
             .map(|machine| machine.with_max_calls(DEFAULT_MAX_CALLS))
-            .map_err(|refused| Gap::Raised {
+            .map_err(|refused| Fault {
                 bindings: Vec::new(),
                 diagnostic: Box::new(refused),
-                root: 0,
-                case: 0,
             })
     }
 
     /// The machine a `law/host`'s body runs on: the run's binding and a reactor for this thread.
-    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'a>, Gap> {
+    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'a>, Fault> {
         let mut machine = self.machine()?;
         machine.set_host_binding(Arc::clone(&hosting.binding));
         if let Some(factory) = &hosting.runtime {
@@ -333,6 +331,64 @@ pub enum Point {
     Rejected,
     /// No point was drawn, and the gap says why.
     Undrawn(Gap),
+    /// Ply failed rather than the program, before the point was drawn or while judging it.
+    Faulted(Fault),
+}
+
+/// Why an obligation stops before any point decides it: a gap in the claim, or Ply's failure.
+enum Stop {
+    Gap(Gap),
+    Fault(Fault),
+}
+
+impl From<Gap> for Stop {
+    fn from(gap: Gap) -> Stop {
+        Stop::Gap(gap)
+    }
+}
+
+impl From<Fault> for Stop {
+    fn from(fault: Fault) -> Stop {
+        Stop::Fault(fault)
+    }
+}
+
+impl Stop {
+    fn discharge(self) -> Discharge {
+        match self {
+            Stop::Gap(gap) => Discharge::Unattempted(gap),
+            Stop::Fault(fault) => Discharge::Faulted(fault),
+        }
+    }
+
+    fn point(self) -> Point {
+        match self {
+            Stop::Gap(gap) => Point::Undrawn(gap),
+            Stop::Fault(fault) => Point::Faulted(fault),
+        }
+    }
+}
+
+/// The world named an obligation no claim of the front end's states: Ply disagreeing with itself.
+#[cold]
+fn unclaimed(obligation: &Obligation) -> Fault {
+    Fault {
+        bindings: Vec::new(),
+        diagnostic: Box::new(
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the prover holds no claim for `{}`", obligation.owner),
+            )
+            .primary(
+                obligation.span,
+                "this obligation was named, and no claim states it",
+            )
+            .note(
+                "`proof.world` and the front end's claims are read from one program; this is \
+                 Ply's fault",
+            ),
+        ),
+    }
 }
 
 /// What the static tier had to say, before anything ran.
@@ -361,12 +417,12 @@ impl<'a> Prover<'a> {
     /// counterexample small drives this rather than running here.
     pub fn judge_at(&self, obligation: &Obligation, plan: &ProvePlan, values: &[Value]) -> Outcome {
         let Some(claim) = self.claim(obligation) else {
-            return Outcome::Rejected;
+            return Outcome::Faulted(*unclaimed(obligation).diagnostic);
         };
         match self.cases(obligation, &claim, plan) {
             Ok(mut cases) => judge_case(&mut cases, values),
-            Err(Gap::Raised { diagnostic, .. }) => Outcome::Raised(*diagnostic),
-            Err(_) => Outcome::Rejected,
+            Err(Stop::Fault(fault)) => Outcome::Faulted(*fault.diagnostic),
+            Err(Stop::Gap(_)) => Outcome::Rejected,
         }
     }
 
@@ -374,7 +430,7 @@ impl<'a> Prover<'a> {
     /// demonstrate.
     pub fn discharge_with(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
         let Some(claim) = self.claim(obligation) else {
-            return Discharge::Unattempted(Gap::UnhandledEffect(obligation.footprint.clone()));
+            return Discharge::Faulted(unclaimed(obligation));
         };
         match &obligation.strategy {
             Strategy::Interleave(points) => {
@@ -414,7 +470,7 @@ impl<'a> Prover<'a> {
         };
         let mut cases = match self.cases(obligation, claim, plan) {
             Ok(cases) => cases,
-            Err(gap) => return Discharge::Unattempted(gap),
+            Err(stop) => return stop.discharge(),
         };
         match points {
             Points::Every(finite) => self.enumerate(obligation, claim, finite, &mut cases, witness),
@@ -447,7 +503,7 @@ impl<'a> Prover<'a> {
                 kind: VacuityKind::NoCaseKept { generated },
                 ..
             }) => match self.witness(obligation, claim, cases) {
-                Some(values) => {
+                Ok(Some(values)) => {
                     match witness.and_then(|proof| proof.certify(true, &obligation.variables)) {
                         Some(certificate) => Discharge::Held(Evidence::Proof(certificate)),
                         None => Discharge::Unattempted(Gap::GuardNotSampled {
@@ -456,7 +512,8 @@ impl<'a> Prover<'a> {
                         }),
                     }
                 }
-                None => discharge,
+                Ok(None) => discharge,
+                Err(fault) => Discharge::Faulted(fault),
             },
             other => upgrade(other, witness, &obligation.variables),
         }
@@ -474,14 +531,14 @@ impl<'a> Prover<'a> {
         plan: &ProvePlan,
     ) -> Point {
         let Some(claim) = self.claim(obligation) else {
-            return Point::Undrawn(Gap::UnhandledEffect(obligation.footprint.clone()));
+            return Point::Faulted(unclaimed(obligation));
         };
         if let Strategy::Interleave(_) = obligation.strategy {
             return Point::Undrawn(Gap::NotDrawn);
         }
         let mut cases = match self.cases(obligation, &claim, plan) {
             Ok(cases) => cases,
-            Err(gap) => return Point::Undrawn(gap),
+            Err(stop) => return stop.point(),
         };
         match &obligation.strategy {
             Strategy::Hosted => {
@@ -490,7 +547,7 @@ impl<'a> Prover<'a> {
                 };
                 cases.machine = match self.host_machine(hosting) {
                     Ok(machine) => machine,
-                    Err(gap) => return Point::Undrawn(gap),
+                    Err(fault) => return Point::Faulted(fault),
                 };
             }
             Strategy::Static(Unsettled::Unhandled(row)) => {
@@ -524,6 +581,10 @@ impl<'a> Prover<'a> {
                 root: 0,
                 case: 0,
             }),
+            Outcome::Faulted(diagnostic) => Point::Faulted(Fault {
+                bindings,
+                diagnostic: Box::new(diagnostic),
+            }),
         }
     }
 
@@ -539,11 +600,11 @@ impl<'a> Prover<'a> {
         };
         let mut cases = match self.cases(obligation, claim, plan) {
             Ok(cases) => cases,
-            Err(gap) => return Discharge::Unattempted(gap),
+            Err(stop) => return stop.discharge(),
         };
         cases.machine = match self.host_machine(hosting) {
             Ok(machine) => machine,
-            Err(gap) => return Discharge::Unattempted(gap),
+            Err(fault) => return Discharge::Faulted(fault),
         };
         run_property(
             obligation.key,
@@ -562,7 +623,7 @@ impl<'a> Prover<'a> {
         obligation: &Obligation,
         claim: &Claim<'_>,
         cases: &mut Cases<'a>,
-    ) -> Option<Vec<Value>> {
+    ) -> Result<Option<Vec<Value>>, Fault> {
         let literals = self.literals(claim);
         let mut stream = GenStream::new(0, obligation.key);
         let mut columns: Vec<Vec<Value>> = Vec::with_capacity(cases.binders.len());
@@ -571,12 +632,15 @@ impl<'a> Prover<'a> {
             let column = match self.candidates(&binder.sort, &literals) {
                 Some(column) => column,
                 // A shape the guard's literals cannot name: a list, record, ADT or function.
-                None => vec![property::generate(&binder.sort, self.world, &mut stream, 0).ok()?],
+                None => match property::generate(&binder.sort, self.world, &mut stream, 0) {
+                    Ok(value) => vec![value],
+                    Err(_) => return Ok(None),
+                },
             };
-            points = points.checked_mul(column.len())?;
-            if points > WITNESS_POINTS {
-                return None;
-            }
+            points = match points.checked_mul(column.len()) {
+                Some(points) if points <= WITNESS_POINTS => points,
+                _ => return Ok(None),
+            };
             columns.push(column);
         }
 
@@ -587,12 +651,20 @@ impl<'a> Prover<'a> {
                 values.push(column[rest % column.len()].clone());
                 rest /= column.len();
             }
-            // A point the guard raises at is not admitted; the property tier reports the raise.
-            if cases.guard(&values).unwrap_or(false) {
-                return Some(values);
+            match cases.guard(&values) {
+                Ok(true) => return Ok(Some(values)),
+                Ok(false) => {}
+                Err(diagnostic) if codes::is_defect(diagnostic.code) => {
+                    return Err(Fault {
+                        bindings: bindings(&cases.binders, &values),
+                        diagnostic: Box::new(diagnostic),
+                    });
+                }
+                // A point the guard raises at is not admitted; the property tier reports the raise.
+                Err(_) => {}
             }
         }
-        None
+        Ok(None)
     }
 
     fn literals(&self, claim: &Claim<'_>) -> Literals {
@@ -651,7 +723,7 @@ impl<'a> Prover<'a> {
         obligation: &Obligation,
         claim: &Claim<'_>,
         plan: &ProvePlan,
-    ) -> Result<Cases<'a>, Gap> {
+    ) -> Result<Cases<'a>, Stop> {
         let call = match claim {
             Claim::Ensures { .. } => Some(obligation.owner.clone()),
             Claim::Law { .. } => None,
@@ -662,7 +734,7 @@ impl<'a> Prover<'a> {
             .iter()
             .find(|b| property::generatable(&b.sort, self.world).is_err())
         {
-            return Err(ungeneratable(binder));
+            return Err(ungeneratable(binder).into());
         }
         Ok(Cases {
             machine: self.machine()?,
@@ -716,6 +788,12 @@ impl<'a> Prover<'a> {
                         case: u32::try_from(point).unwrap_or(u32::MAX),
                     });
                 }
+                Outcome::Faulted(diagnostic) => {
+                    return Discharge::Faulted(Fault {
+                        bindings: bindings(&obligation.binders, &values),
+                        diagnostic: Box::new(diagnostic),
+                    });
+                }
             }
         }
 
@@ -760,12 +838,12 @@ impl<'a> Prover<'a> {
     ) -> Discharge {
         let mut cases = match self.cases(obligation, claim, plan) {
             Ok(cases) => cases,
-            Err(gap) => return Discharge::Unattempted(gap),
+            Err(stop) => return stop.discharge(),
         };
 
         let (points, domain) = match self.law_domain(obligation, &mut cases, plan, points) {
             Ok(kept) => kept,
-            Err(gap) => return Discharge::Unattempted(gap),
+            Err(stop) => return stop.discharge(),
         };
 
         let mut search = Search {
@@ -787,7 +865,7 @@ impl<'a> Prover<'a> {
         cases: &mut Cases<'a>,
         plan: &ProvePlan,
         points: &Points,
-    ) -> Result<(Vec<Vec<Value>>, ValueDomain), Gap> {
+    ) -> Result<(Vec<Vec<Value>>, ValueDomain), Stop> {
         let binders = &obligation.binders;
         let mut kept: Vec<Vec<Value>> = Vec::new();
 
@@ -817,7 +895,7 @@ impl<'a> Prover<'a> {
                 for binder in binders {
                     match property::generate(&binder.sort, self.world, &mut stream, case) {
                         Ok(value) => values.push(value),
-                        Err(_) => return Err(ungeneratable(binder)),
+                        Err(_) => return Err(ungeneratable(binder).into()),
                     }
                 }
                 generated = generated.saturating_add(1);
@@ -835,13 +913,22 @@ impl<'a> Prover<'a> {
         Ok((kept, domain))
     }
 
-    fn admits(&self, cases: &mut Cases<'a>, values: &[Value]) -> Result<bool, Gap> {
-        cases.guard(values).map_err(|diagnostic| Gap::Raised {
-            bindings: bindings(&cases.binders, values),
-            diagnostic: Box::new(diagnostic),
-            // A guard that raised while values were handed in: nothing here knows the draw.
-            root: 0,
-            case: 0,
+    fn admits(&self, cases: &mut Cases<'a>, values: &[Value]) -> Result<bool, Stop> {
+        cases.guard(values).map_err(|diagnostic| {
+            let bindings = bindings(&cases.binders, values);
+            if codes::is_defect(diagnostic.code) {
+                return Stop::Fault(Fault {
+                    bindings,
+                    diagnostic: Box::new(diagnostic),
+                });
+            }
+            Stop::Gap(Gap::Raised {
+                bindings,
+                diagnostic: Box::new(diagnostic),
+                // A guard that raised while values were handed in: nothing here knows the draw.
+                root: 0,
+                case: 0,
+            })
         })
     }
 }

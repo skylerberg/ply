@@ -214,3 +214,14 @@ pub const UNUSED_DEFINITION: &str = "W0611";
 /// A run the harness stopped at its wall clock: a fact about the machine, not about the
 /// program, so nothing it did is recorded.
 pub const RUN_ABANDONED: &str = "W0612";
+
+/// Whether a failure under `code` is Ply's own rather than the program's.
+pub fn is_defect(code: &str) -> bool {
+    [
+        INTERNAL_ERROR,
+        HOST_FOOTPRINT_ESCAPE,
+        SECRET_TO_HOST,
+        SIMULATION_DIVERGENCE,
+    ]
+    .contains(&code)
+}

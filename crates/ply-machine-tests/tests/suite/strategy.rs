@@ -3,9 +3,10 @@
 //! discharged each way, whatever the claim itself would have been decided to be.
 
 use crate::fixture::{loaded, project};
-use ply_eval::{DefHash, Span, Symbol};
+use ply_eval::{DefHash, Span, Symbol, Value, codes};
 use ply_machine::engine::{Point, Prover};
 use ply_prove::domain::{Finite, Shape};
+use ply_prove::property::Outcome;
 use ply_prove::{
     Binder, Discharge, Evidence, Gap, Obligation, ObligationKind, Points, ProvePlan, Rule, Sort,
     Strategy, Unsettled, World,
@@ -21,10 +22,15 @@ law "doubling is tripling" forall (n: Int) { n + n == n * 3 }
 law "concatenation preserves length" forall (a: Bytes, b: Bytes) {
   bytes_len(bytes_concat(a, b)) == bytes_len(a) + bytes_len(b)
 }
+
+law "dividing by a choice" forall (b: Bool) { 12 / (if b { 3 } else { 0 }) > 1 }
 "#;
 
 /// The claim the static prover leaves open: an uninterpreted `/` over a `Bool`, true at both points.
 const HALVING: &str = "m.halving a choice";
+
+/// Left open the same way, and the program divides by zero at `false`.
+const DIVIDING: &str = "m.dividing by a choice";
 
 fn binder(name: &str, sort: Sort, text: &str) -> Binder {
     Binder {
@@ -130,6 +136,62 @@ fn a_claim_the_static_prover_leaves_open_is_the_gap_its_strategy_names() {
         ),
         "{discharge:?}"
     );
+}
+
+/// A binder the law does not take makes the tier decline every entry: Ply's failure, never a gap.
+#[test]
+fn a_proposition_whose_entry_the_tier_declines_is_plys_failure_and_not_a_gap() {
+    let mismatched = law(
+        HALVING,
+        vec![
+            binder("b", Sort::bool(), "Bool"),
+            binder("spare", Sort::bool(), "Bool"),
+        ],
+        Strategy::Static(Unsettled::Run(Points::Drawn)),
+    );
+    with_prover(|prover| {
+        let plan = ProvePlan::default();
+        let discharge = prover.discharge_with(&mismatched, &plan);
+        let Discharge::Faulted(fault) = &discharge else {
+            panic!("a declined entry was reported as {discharge:?}");
+        };
+        assert_eq!(fault.diagnostic.code, codes::INTERNAL_ERROR, "{fault:?}");
+        assert!(
+            fault.diagnostic.message.contains("declined"),
+            "{}",
+            fault.diagnostic.message
+        );
+        assert_eq!(
+            fault.bindings.len(),
+            2,
+            "the point it was judging: {fault:?}"
+        );
+        let point = prover.point_at(&mismatched, 0, 0, &plan);
+        assert!(matches!(point, Point::Faulted(_)), "{point:?}");
+        let judged = prover.judge_at(&mismatched, &plan, &[Value::Bool(true), Value::Bool(false)]);
+        assert!(matches!(judged, Outcome::Faulted(_)), "{judged:?}");
+    });
+}
+
+/// The control: the program dividing by zero is its own raise, a gap however the points are run.
+#[test]
+fn a_proposition_that_raises_is_still_a_gap() {
+    for points in [both(), Points::Drawn] {
+        let discharge = discharged(&over_a_bool(
+            DIVIDING,
+            Strategy::Static(Unsettled::Run(points)),
+        ));
+        let Discharge::Unattempted(Gap::Raised {
+            bindings,
+            diagnostic,
+            ..
+        }) = &discharge
+        else {
+            panic!("the program's raise was reported as {discharge:?}");
+        };
+        assert_eq!(diagnostic.code, codes::RUNTIME_ERROR, "{diagnostic:?}");
+        assert_eq!(bindings[0].rendered, "false", "{bindings:?}");
+    }
 }
 
 /// A proof never calls the owner, so the static attempt comes before the gap.

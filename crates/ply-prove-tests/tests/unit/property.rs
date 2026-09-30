@@ -3,8 +3,10 @@ use ply_eval::{
     Value,
 };
 use ply_prove::property::{
-    EDGE_CASES, EDGE_INTS, GenStream, Judge, Ungeneratable, generatable, generate, run_property,
+    EDGE_CASES, EDGE_INTS, GenStream, Judge, Outcome, Ungeneratable, generatable, generate,
+    run_property,
 };
+use ply_prove::shrink::Target;
 use ply_prove::world::{Decl, World};
 use ply_prove::{
     Binder, DEFAULT_SHRINK_BUDGET, Discharge, Evidence, GEN_DEPTH, Gap, MIN_PROPERTY_CASES,
@@ -654,6 +656,47 @@ fn a_raising_case_is_a_gap_with_a_shrunk_input() {
         }
         other => panic!("expected a raised gap, got {other:?}"),
     }
+}
+
+/// Ply failing on the guard or the body is its own failure, neither a gap nor a verdict.
+#[test]
+fn a_case_ply_fails_on_is_its_failure_and_never_the_programs_gap() {
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int(), "Int")];
+    let declined = |_: &[Value]| -> Result<bool, Diagnostic> {
+        Err(Diagnostic::error(
+            ply_eval::codes::INTERNAL_ERROR,
+            "the compiled tier declined to enter `m.law`",
+        ))
+    };
+    for discharge in [
+        run(&binders, &world, 200, declined, |_| Ok(true)),
+        run(&binders, &world, 200, |_| Ok(true), declined),
+    ] {
+        match discharge {
+            Discharge::Faulted(fault) => {
+                assert_eq!(fault.diagnostic.code, ply_eval::codes::INTERNAL_ERROR);
+                assert_eq!(fault.bindings.len(), 1, "the point it failed at: {fault:?}");
+            }
+            other => panic!("Ply's failure was reported as {other:?}"),
+        }
+    }
+}
+
+/// A walk keeps a candidate that still raises or refutes, and Ply failing on it does neither.
+#[test]
+fn a_candidate_ply_fails_on_matches_no_walk() {
+    let failed = Outcome::stopped(Diagnostic::error(
+        ply_eval::codes::INTERNAL_ERROR,
+        "declined",
+    ));
+    assert!(matches!(failed, Outcome::Faulted(_)), "{failed:?}");
+    assert!(!failed.matches(Target::Raises) && !failed.matches(Target::Falsifies));
+    let raised = Outcome::stopped(Diagnostic::error(
+        ply_eval::codes::RUNTIME_ERROR,
+        "division by zero",
+    ));
+    assert!(raised.matches(Target::Raises), "{raised:?}");
 }
 
 #[test]
