@@ -434,8 +434,6 @@ fn suspect_json(suspect: &Suspect) -> Value {
     json!({
         "name": suspect.name,
         "hash": suspect.hash.map(|h| h.to_hex()),
-        "before": suspect.before.map(|h| h.to_hex()),
-        "change": suspect.change.map(|c| c.as_str()),
         "ran": suspect.ran,
         "depth": suspect.depth,
         "culprit": suspect.culprit,

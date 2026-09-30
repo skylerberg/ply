@@ -178,7 +178,7 @@ fn the_empty_step_commutes_with_everything() {
 }
 
 #[test]
-fn a_plan_digest_ignores_the_order_roots_were_written_in() {
+fn a_normalized_plan_forgets_the_order_roots_were_written_in() {
     let a = Plan {
         roots: vec![3, 1, 1, 2],
         ..Plan::default()
@@ -187,41 +187,7 @@ fn a_plan_digest_ignores_the_order_roots_were_written_in() {
         roots: vec![1, 2, 3],
         ..Plan::default()
     };
-    assert_eq!(a.digest(), b.digest());
-}
-
-#[test]
-fn every_plan_field_reaches_the_digest() {
-    let base = Plan::default();
-    let variants = [
-        Plan {
-            mode: SimMode::Random,
-            ..base.clone()
-        },
-        Plan {
-            roots: vec![0, 1],
-            ..base.clone()
-        },
-        Plan {
-            budget: base.budget + 1,
-            ..base.clone()
-        },
-        Plan {
-            steps: base.steps + 1,
-            ..base.clone()
-        },
-        Plan::once(Seed::at(0, vec![1])),
-        Plan::once(Seed::at(0, vec![2])),
-    ];
-    let mut seen = vec![base.digest()];
-    for plan in variants {
-        let digest = plan.digest();
-        assert!(
-            !seen.contains(&digest),
-            "{plan:?} collided with an earlier plan"
-        );
-        seen.push(digest);
-    }
+    assert_eq!(a.normalized(), b.normalized());
 }
 
 #[test]

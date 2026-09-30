@@ -1,8 +1,6 @@
 //! Building and running one mixed definition graph.
 
 use crate::bisect::{DefKey, Trial, Unresolved};
-use crate::key::result_key;
-use crate::schedule::is_seeded;
 use crate::sim::seed_run;
 use ply_eval::{Plan, Provider, Seed};
 use ply_span::{Diagnostic, SourceId, Symbol};
@@ -110,7 +108,7 @@ pub struct BodyHybrid<'a> {
     mixture: Mixture,
     test: StoredBody,
     signature: Signature,
-    /// Hybrid test hashes that went green.
+    /// The keys of mixtures that went green.
     proved: Vec<DefHash>,
     /// Pinned to the interleaving the failure happened in.
     plan: Plan,
@@ -194,9 +192,14 @@ struct Chosen {
 }
 
 impl BodyHybrid<'_> {
-    /// The same trial, from the keys themselves: whoever holds the delta does the flipping, so a
-    /// caller that decided which definitions to swap does not have to hand a `Delta` over.
-    pub fn trial_over(&mut self, wanted: BTreeSet<DefKey>) -> Trial {
+    /// The mixture that takes `wanted` from the post-edit side. `filed` is the key the caller files
+    /// this mixture's pass under: one already there answers without building anything.
+    pub fn trial_over(&mut self, wanted: BTreeSet<DefKey>, filed: Option<DefHash>) -> Trial {
+        if let Some(key) = filed
+            && matches!(self.store.get(key), Some(Outcome::Pass))
+        {
+            return Trial::passes().from_cache();
+        }
         let chosen = match self.choose(&wanted) {
             Ok(chosen) => chosen,
             Err(why) => return Trial::unresolved(why),
@@ -237,27 +240,14 @@ impl BodyHybrid<'_> {
         let Ok(front) = ply_codegen::c::producer::checked_front(&printed, &ids) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
-        let check = &front.check;
-        let rehashed = &front.hashes;
-        let Some(index) = check
+        let Some(index) = front
+            .check
             .tests
             .iter()
             .position(|t| t.key.as_str() == HYBRID_TEST)
         else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
-
-        // The hybrid's test hash covers its whole closure, so a `Pass` is about this mixture.
-        let seeded = is_seeded(&check.tests[index].footprint);
-        let hash = rehashed
-            .tests
-            .first()
-            .map(|hash| result_key(*hash, seeded, &self.plan));
-        if let Some(hash) = hash
-            && matches!(self.store.get(hash), Some(Outcome::Pass))
-        {
-            return Trial::passes().from_cache();
-        }
 
         let plan = self.plan.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -273,9 +263,7 @@ impl BodyHybrid<'_> {
         }));
         match outcome {
             Ok(Ok(())) => {
-                if let Some(hash) = hash {
-                    self.proved.push(hash);
-                }
+                self.proved.extend(filed);
                 Trial::passes()
             }
             Ok(Err(d)) if Signature::of(&d) == self.signature => Trial::fails(),
