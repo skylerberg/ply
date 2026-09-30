@@ -1,12 +1,13 @@
-// `ply fmt`, as one command of the program in this directory. The walk is `walk.ply`'s, the
-// command line is `args.ply`'s, and every path here is relative to the working directory the run
-// binds as the root `cwd`, so one that leaves it is the host's refusal.
+// `ply fmt`, as one command of the program in this directory. The walk is `walk.ply`'s and the
+// command line `args.ply`'s; each file is read and written back through the root its path resolved
+// to, so a path outside the working directory is formatted where it points.
 
-import std.fs (fs, mem_of, mem_read, mem_kind, mem_list, mem_write, MemFs, Written)
+import std.fs (fs, mem_empty, mem_of, mem_read, mem_kind, mem_list, mem_write, MemFs, Written)
 import std.json (Json, Str, Bool, Number, Array, object, to_string)
 import args (Flags, from_argv)
+import paths (Resolved, Rooted, displayed, read_file, write_file)
 import report (Answer, schema_version, ok_code, compile_error)
-import walk (Failure, Found, sweep, sweep_r)
+import walk (Failure, Found, sweep)
 import compiler.fmt (fmt_source)
 
 type Outcome = { path: String, changed: Bool }
@@ -23,31 +24,33 @@ fn failed(report: Report, path: String, why: String) -> Report =
 fn format_one(
   report: Report,
   check: Bool,
-  path: String,
-) -> Report / {fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs]} =
-  match fs.read_file[cwd](path) {
+  at: Rooted,
+) -> Report / {fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs]} = {
+  let path = displayed(at);
+  match read_file(at) {
     None -> failed(report, path, "could not read"),
     Some(src) -> match fmt_source(src) {
       Err(why) -> failed(report, path, string_of_bytes_lossy(why)),
       Ok(out) -> if out == src { noted(report, path, false) }
       else if check { noted(report, path, true) }
-      else if fs.write_file[cwd](path, out) { noted(report, path, true) }
+      else if write_file(at, out) { noted(report, path, true) }
       else { failed(report, path, "could not write") },
     },
   }
+}
 
 // The paths as given, or `.`; each is found first, so the files are formatted in path order.
 fn rewrite(
   flags: Flags,
 ) -> Report / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs]} = {
-  let found: Found = sweep_r(flags.paths);
+  let found: Found = sweep(flags.paths);
   let start: Report = { files: [], errors: found.errors };
-  fold(map_keys(found.files), start, |acc: Report, path: String| format_one(acc, flags.check, path))
+  fold(map_values(found.files), start, |acc: Report, at: Rooted| format_one(acc, flags.check, at))
 }
 
 fn changed_of(report: Report) -> List<Outcome> = filter(report.files, |f: Outcome| f.changed)
 
-// An error is `2` whatever else happened; `--check` with work left to do is `1`.
+// Any error is `2`, so `--check` never passes over a file it did not read; work left is `1`.
 fn exit_code(report: Report, check: Bool) -> Int =
   if len(report.errors) > 0 { compile_error() }
   else if check && len(changed_of(report)) > 0 { 1 }
@@ -96,35 +99,52 @@ pub fn run(
 
 // --- Tests ------------------------------------------------------------------
 
-// One tree, the answer over it, and what was written back.
-type World = { tree: MemFs, answer: Answer }
+// A tree under each root, the answer over them, and what each held afterwards.
+type World = { here: MemFs, root: MemFs, answer: Answer }
 
 fn unformatted() -> Bytes = b"fn  add(a: Int,b: Int)->Int = a+b\n"
 
+// `here` is the working directory's tree and `root` the filesystem's, each behind its own label.
+fn run_in(here: MemFs, root: MemFs, flags: Flags) -> World =
+  with_cell[twin](here) { h ->
+    with_cell[twin](root) { a -> {
+      let answer = handle {
+        run(flags)
+      } with {
+        fs.kind[cwd](p) -> mem_kind(cell_get(h), p),
+        fs.kind[abs](p) -> mem_kind(cell_get(a), p),
+        fs.list_dir[cwd](p) -> mem_list(cell_get(h), p),
+        fs.list_dir[abs](p) -> mem_list(cell_get(a), p),
+        fs.read_file[cwd](p) -> mem_read(cell_get(h), p),
+        fs.read_file[abs](p) -> mem_read(cell_get(a), p),
+        fs.write_file[cwd](p, body) -> {
+          let written: Written = mem_write(cell_get(h), p, body);
+          cell_set(h, written.fs);
+          written.ok
+        },
+        fs.write_file[abs](p, body) -> {
+          let written: Written = mem_write(cell_get(a), p, body);
+          cell_set(a, written.fs);
+          written.ok
+        },
+      };
+      { here: cell_get(h), root: cell_get(a), answer: answer }
+    } }
+  }
+
 fn run_over(files: List<{ path: String, body: Bytes }>, argv: List<String>) -> World =
-  with_cell[twin](mem_of(files)) { w -> {
-    let answer = handle {
-      run(from_argv("fmt", argv))
-    } with {
-      fs.kind[cwd](p) -> mem_kind(cell_get(w), p),
-      fs.kind[abs](p) -> mem_kind(cell_get(w), p),
-      fs.list_dir[cwd](p) -> mem_list(cell_get(w), p),
-      fs.list_dir[abs](p) -> mem_list(cell_get(w), p),
-      fs.read_file[cwd](p) -> mem_read(cell_get(w), p),
-      fs.read_file[abs](p) -> mem_read(cell_get(w), p),
-      fs.write_file[cwd](p, body) -> {
-        let written: Written = mem_write(cell_get(w), p, body);
-        cell_set(w, written.fs);
-        written.ok
-      },
-      fs.write_file[abs](p, body) -> {
-        let written: Written = mem_write(cell_get(w), p, body);
-        cell_set(w, written.fs);
-        written.ok
-      },
-    };
-    { tree: cell_get(w), answer: answer }
-  } }
+  run_in(mem_of(files), mem_empty(), from_argv("fmt", argv))
+
+// A directory outside the working directory, as `paths::resolve` answers one.
+fn outside(spelling: String) -> Resolved =
+  {
+    label: "abs",
+    spelling: spelling,
+    display: "/" ++ spelling,
+    inside: ".",
+    absolute: "/" ++ spelling,
+    machine: "/" ++ spelling,
+  }
 
 fn line_at(lines: List<String>, i: Int) -> String =
   match list_at(lines, i) { Some(line) -> line, None -> "" }
@@ -134,14 +154,14 @@ test "a file is rewritten once, and a second run over the answer changes nothing
   assert_eq(once.answer.lines, ["formatted m.ply"]);
   assert_eq(once.answer.errs, []);
   assert_eq(once.answer.code, 0);
-  match mem_read(once.tree, "m.ply") {
+  match mem_read(once.here, "m.ply") {
     None -> panic("the file was written back"),
     Some(body) -> {
       assert(body != unformatted());
       let twice = run_over([{ path: "m.ply", body: body }], []);
       assert_eq(twice.answer.lines, []);
       assert_eq(twice.answer.code, 0);
-      assert_eq(mem_read(twice.tree, "m.ply"), Some(body))
+      assert_eq(mem_read(twice.here, "m.ply"), Some(body))
     },
   }
 }
@@ -150,7 +170,27 @@ test "`--check` names what would change, writes nothing and exits 1" {
   let run = run_over([{ path: "m.ply", body: unformatted() }], ["--check"]);
   assert_eq(run.answer.lines, ["would format m.ply"]);
   assert_eq(run.answer.code, 1);
-  assert_eq(mem_read(run.tree, "m.ply"), Some(unformatted()))
+  assert_eq(mem_read(run.here, "m.ply"), Some(unformatted()))
+}
+
+test "a directory outside the working directory is read and rewritten there, named absolutely" {
+  let root = mem_of([{ path: "srv/app/m.ply", body: unformatted() }]);
+  let checked = run_in(mem_empty(), root, {
+    ..from_argv("fmt", ["--check"]),
+    paths: [outside("srv/app")],
+  });
+  assert_eq(checked.answer.errs, []);
+  assert_eq(checked.answer.lines, ["would format /srv/app/m.ply"]);
+  assert_eq(checked.answer.code, 1);
+  let formatted = run_in(mem_empty(), root, {
+    ..from_argv("fmt", []),
+    paths: [outside("srv/app")],
+  });
+  assert_eq(formatted.answer.errs, []);
+  assert_eq(formatted.answer.lines, ["formatted /srv/app/m.ply"]);
+  assert_eq(formatted.answer.code, 0);
+  assert(mem_read(formatted.root, "srv/app/m.ply") != Some(unformatted()));
+  assert_eq(mem_read(formatted.here, "srv/app/m.ply"), None)
 }
 
 test "a file that does not parse is reported with its diagnostic and left as it was" {
@@ -158,7 +198,7 @@ test "a file that does not parse is reported with its diagnostic and left as it 
   let run = run_over([{ path: "m.ply", body: broken }], []);
   assert_eq(run.answer.lines, []);
   assert_eq(run.answer.code, 2);
-  assert_eq(mem_read(run.tree, "m.ply"), Some(broken));
+  assert_eq(mem_read(run.here, "m.ply"), Some(broken));
   assert_eq(len(run.answer.errs), 1);
   assert(string_starts_with(line_at(run.answer.errs, 0), "error: m.ply: "));
   assert(string_contains(line_at(run.answer.errs, 0), "E0001"))
@@ -170,7 +210,45 @@ test "a path that names nothing is an error, and the run exits 2" {
   assert_eq(run.answer.errs, ["error: absent.ply: could not read"]);
   assert_eq(run.answer.code, 2);
   // Nothing else was reached, so the file the walk would have found is untouched.
-  assert_eq(mem_read(run.tree, "m.ply"), Some(unformatted()))
+  assert_eq(mem_read(run.here, "m.ply"), Some(unformatted()))
+}
+
+test "a file the walk found but could not read fails `--check`, which never passes over it" {
+  let tree = mem_of([{ path: "m.ply", body: unformatted() }]);
+  let answer = handle {
+    run(from_argv("fmt", ["--check"]))
+  } with {
+    fs.kind[cwd](p) -> mem_kind(tree, p),
+    fs.kind[abs](p) -> panic("nothing here leaves the working directory"),
+    fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.list_dir[abs](p) -> panic("nothing here leaves the working directory"),
+    fs.read_file[cwd](p) -> None,
+    fs.read_file[abs](p) -> panic("nothing here leaves the working directory"),
+    fs.write_file[cwd](p, body) -> panic("`--check` writes nothing"),
+    fs.write_file[abs](p, body) -> panic("`--check` writes nothing"),
+  };
+  assert_eq(answer.lines, []);
+  assert_eq(answer.errs, ["error: m.ply: could not read"]);
+  assert_eq(answer.code, 2)
+}
+
+test "a file that could not be written back fails the run" {
+  let tree = mem_of([{ path: "m.ply", body: unformatted() }]);
+  let answer = handle {
+    run(from_argv("fmt", []))
+  } with {
+    fs.kind[cwd](p) -> mem_kind(tree, p),
+    fs.kind[abs](p) -> panic("nothing here leaves the working directory"),
+    fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.list_dir[abs](p) -> panic("nothing here leaves the working directory"),
+    fs.read_file[cwd](p) -> mem_read(tree, p),
+    fs.read_file[abs](p) -> panic("nothing here leaves the working directory"),
+    fs.write_file[cwd](p, body) -> false,
+    fs.write_file[abs](p, body) -> panic("nothing here leaves the working directory"),
+  };
+  assert_eq(answer.lines, []);
+  assert_eq(answer.errs, ["error: m.ply: could not write"]);
+  assert_eq(answer.code, 2)
 }
 
 test "the JSON document is one object, its keys in order, and nothing else is written" {
@@ -191,5 +269,6 @@ test "the exit code is 2 for an error, 1 for `--check` with work left, and 0 oth
   assert_eq(exit_code(clean, true), 0);
   assert_eq(exit_code(moved, false), 0);
   assert_eq(exit_code(moved, true), 1);
+  assert_eq(exit_code(broken, false), 2);
   assert_eq(exit_code(broken, true), 2)
 }
