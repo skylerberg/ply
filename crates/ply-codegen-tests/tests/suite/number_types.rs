@@ -212,11 +212,17 @@ fn each_width_answers_what_its_type_means() {
 #[test]
 fn a_signature_naming_a_width_is_declined_rather_than_answered() {
     let (_, unit) = unit(CROSSES);
+    let bodies = unit.bodies().expect("the unit builds");
     for (name, args) in [
         ("m.narrows", vec![Value::Int(7)]),
         ("m.widens", vec![Value::Int(7)]),
         ("m.boxed", vec![Value::Int(7)]),
     ] {
+        assert!(
+            unit.compiled().iter().any(|f| f == name),
+            "`{name}`'s body was refused, so its crossing never was"
+        );
+        assert!(!bodies.admits(name), "`{name}` is offered to the machine");
         assert_eq!(
             call(unit, name, &args),
             None,

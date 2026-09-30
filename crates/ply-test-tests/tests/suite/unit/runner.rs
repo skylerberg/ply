@@ -81,15 +81,23 @@ impl Program {
         crate::fixture::choose(&self.check, &self.hashes, runs, &Plan::default())
     }
 
-    /// Runs on the compiled C tier; `Unit::over_front` leaks a `&'static Unit`.
+    /// Runs on the compiled C tier; `Unit::over_front` leaks a `&'static Unit`. Every failure is
+    /// the fixture's own: one of Ply's would leave what a test says about failures about nothing.
     fn run(&self, selection: &Selection, store: &mut Store) -> ply_test::RunReport {
         let unit = ply_codegen::Unit::over_front(&self.port, self.texts())
             .expect("this host has a C compiler");
-        let executor = InterpExecutor::new(&self.port)
-            .with_backend(unit)
+        let executor = InterpExecutor::new(&self.port, unit)
             .with_hosts(Hosting::hermetic())
             .with_search(Search::of(selection));
-        run_with(selection, &self.check, &self.hashes, store, &executor)
+        let report = run_with(selection, &self.check, &self.hashes, store, &executor);
+        for failure in &report.failures {
+            assert!(
+                !failure.defect,
+                "`{}` failed in Ply rather than as written: {:?}",
+                failure.name, failure.diagnostic
+            );
+        }
+        report
     }
 
     fn def_hash(&self, name: &str) -> DefHash {
@@ -682,7 +690,9 @@ struct PanickingExecutor {
 impl Executor for PanickingExecutor {
     type Worker = ();
 
-    fn worker(&self) {}
+    fn worker(&self) -> Result<(), Diagnostic> {
+        Ok(())
+    }
 
     fn execute(&self, _worker: &mut (), index: usize) -> Result<(), Diagnostic> {
         if index == self.panic_on {
@@ -784,7 +794,9 @@ struct InternalErrorExecutor {
 impl Executor for InternalErrorExecutor {
     type Worker = ();
 
-    fn worker(&self) {}
+    fn worker(&self) -> Result<(), Diagnostic> {
+        Ok(())
+    }
 
     fn execute(&self, _worker: &mut (), index: usize) -> Result<(), Diagnostic> {
         if index == self.fail_on {
@@ -820,6 +832,55 @@ fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
         .expect("reported");
     assert_eq!(result.status, Status::Panicked);
     assert!(report.failures[0].defect);
+}
+
+/// An executor with nothing to run a test on, as a unit built from another program leaves one.
+struct RefusingExecutor;
+
+impl Executor for RefusingExecutor {
+    type Worker = ();
+
+    fn worker(&self) -> Result<(), Diagnostic> {
+        Err(Diagnostic::error(
+            ply_eval::codes::INTERNAL_ERROR,
+            "the worker's tier was built from another program",
+        ))
+    }
+
+    fn execute(&self, _worker: &mut (), index: usize) -> Result<(), Diagnostic> {
+        panic!("test {index} ran on a worker that was refused")
+    }
+}
+
+#[test]
+fn a_worker_that_cannot_be_built_fails_every_test_as_a_defect_and_caches_none() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(ARITHMETIC);
+    let selection = program.every();
+
+    let report = run_with(
+        &selection,
+        &program.check,
+        &program.hashes,
+        &mut store,
+        &RefusingExecutor,
+    );
+
+    assert_eq!(report.passed, 0);
+    assert_eq!(report.failed, selection.to_run.len());
+    for result in &report.results {
+        assert_eq!(result.status, Status::Panicked, "{}", result.name);
+        let diagnostic = result.failure.as_ref().expect("a refusal is the failure");
+        assert_eq!(
+            diagnostic.message,
+            "the worker's tier was built from another program"
+        );
+    }
+    assert!(report.failures.iter().all(|f| f.defect));
+    for index in &selection.to_run {
+        assert!(store.get(program.hashes.tests[*index]).is_none());
+    }
 }
 
 /// Reports a search without running one.
@@ -863,8 +924,8 @@ impl SimExecutor {
 impl Executor for SimExecutor {
     type Worker = Option<Exploration>;
 
-    fn worker(&self) -> Option<Exploration> {
-        None
+    fn worker(&self) -> Result<Option<Exploration>, Diagnostic> {
+        Ok(None)
     }
 
     fn execute(&self, worker: &mut Option<Exploration>, index: usize) -> Result<(), Diagnostic> {

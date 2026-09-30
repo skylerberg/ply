@@ -44,8 +44,8 @@ fn ask() -> String {
     let texts: HashMap<String, String> =
         [("m".to_string(), ASKER.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     for (op, handler) in ply_launcher::env::registrations("9.9.9-test") {
         registry.register(op, handler);

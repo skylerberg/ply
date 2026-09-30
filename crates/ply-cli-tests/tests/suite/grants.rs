@@ -117,7 +117,10 @@ fn without_the_grant_the_machine_is_not_bound() {
         "a program drove a machine with no grant"
     );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("E0424") || err.contains("machine"), "{err}");
+    assert!(
+        (err.contains("E0303") || err.contains("E0424")) && err.contains("`m.machine.load[m]`"),
+        "the ungranted operation is what refused: {err}"
+    );
 }
 
 /// A program that declares the prover and reaches one of its operations behind a branch never taken:

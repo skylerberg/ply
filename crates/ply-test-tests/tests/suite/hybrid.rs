@@ -67,13 +67,19 @@ impl Compiled {
     /// The signature every hybrid is judged against.
     fn failure(&self, key: &str) -> ply_eval::Diagnostic {
         let index = self.test_index(key);
-        let mut machine = ply_eval::Machine::new(&self.port);
         let unit = ply_codegen::Unit::over_front(&self.port, self.texts.clone())
             .expect("this host has a C compiler");
-        machine.set_compiled(unit.attach());
-        machine
+        let mut machine = ply_eval::Machine::new(&self.port, unit.attach())
+            .expect("the unit was compiled from this program");
+        let failure = machine
             .eval_test(index)
-            .expect_err("the fixture must fail as written")
+            .expect_err("the fixture must fail as written");
+        assert_ne!(
+            failure.code,
+            ply_eval::codes::INTERNAL_ERROR,
+            "the fixture failed in Ply rather than as written: {failure:?}"
+        );
+        failure
     }
 }
 

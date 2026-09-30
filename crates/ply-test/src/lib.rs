@@ -283,7 +283,9 @@ impl RunReport {
 pub trait Executor: Sync {
     type Worker;
 
-    fn worker(&self) -> Self::Worker;
+    /// Refused when nothing can run a test here: each test that worker would have run fails with
+    /// the refusal.
+    fn worker(&self) -> Result<Self::Worker, Diagnostic>;
 
     fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic>;
 
@@ -370,8 +372,8 @@ pub struct InterpExecutor<'a> {
     front: &'a ply_eval::Front,
     fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
     hosts: Hosting<'a>,
-    /// The backend this run installs.
-    backend: Option<&'static dyn ply_eval::Provider>,
+    /// The unit every worker attaches the tier its machines run on from.
+    provider: &'static dyn ply_eval::Provider,
     search: Search,
 }
 
@@ -381,8 +383,8 @@ pub struct Worker<'a> {
     host: Option<ply_eval::host::HostUse>,
     /// The region this worker's tests run in, built once and mutated in place.
     region: GroupRegion,
-    /// Built once and installed on every machine the worker builds, per-interleaving ones too.
-    backend: Option<Rc<dyn ply_eval::Compiled>>,
+    /// Attached once and installed on every machine the worker builds, per-interleaving ones too.
+    tier: Rc<dyn ply_eval::Compiled>,
     backend_use: Option<BackendUse>,
     performs: u64,
 }
@@ -396,29 +398,19 @@ pub struct BackendUse {
 }
 
 impl<'a> Worker<'a> {
-    pub fn new(machine: Box<Machine<'a>>) -> Worker<'a> {
+    fn in_region(
+        machine: Box<Machine<'a>>,
+        tier: Rc<dyn ply_eval::Compiled>,
+        region: GroupRegion,
+    ) -> Worker<'a> {
         Worker {
             machine,
             exploration: None,
             host: None,
-            region: GroupRegion::empty(),
-            backend: None,
+            region,
+            tier,
             backend_use: None,
             performs: 0,
-        }
-    }
-
-    fn backed(&self) -> Option<&Machine<'a>> {
-        match (&self.machine, self.backend.is_some()) {
-            (m, true) => Some(m.as_ref()),
-            _ => None,
-        }
-    }
-
-    pub fn in_region(machine: Box<Machine<'a>>, region: GroupRegion) -> Worker<'a> {
-        Worker {
-            region,
-            ..Worker::new(machine)
         }
     }
 
@@ -456,23 +448,22 @@ impl<'a> Worker<'a> {
 }
 
 impl<'a> InterpExecutor<'a> {
-    pub fn new(front: &'a ply_eval::Front) -> InterpExecutor<'a> {
+    /// Every test runs on a tier attached from `provider`, the unit built from `front`.
+    pub fn new(
+        front: &'a ply_eval::Front,
+        provider: &'static dyn ply_eval::Provider,
+    ) -> InterpExecutor<'a> {
         InterpExecutor {
             front,
             fixture: None,
             hosts: Hosting::hermetic(),
-            backend: None,
+            provider,
             search: Search::default(),
         }
     }
 
     pub fn with_fixture(mut self, fixture: &'a (dyn Fn(&mut TaskRegions) -> Value + Sync)) -> Self {
         self.fixture = Some(fixture);
-        self
-    }
-
-    pub fn with_backend(mut self, provider: &'static dyn ply_eval::Provider) -> Self {
-        self.backend = Some(provider);
         self
     }
 
@@ -494,22 +485,15 @@ impl<'a> InterpExecutor<'a> {
         }
     }
 
-    fn backend(&self) -> Option<Rc<dyn ply_eval::Compiled>> {
-        Some(self.backend?.attach())
-    }
-
-    fn machine(&self, backend: Option<Rc<dyn ply_eval::Compiled>>) -> Box<Machine<'a>> {
-        let mut machine = Machine::new(self.front);
-        if let Some(backend) = backend {
-            machine.set_compiled(backend);
-        }
+    fn machine(&self, tier: Rc<dyn ply_eval::Compiled>) -> Result<Box<Machine<'a>>, Diagnostic> {
+        let mut machine = Machine::new(self.front, tier)?;
         if let Some(binding) = &self.hosts.binding {
             machine.set_host_binding(Arc::clone(binding));
         }
         if let Some(runtime) = self.hosts.runtime {
             machine.set_host_runtime(runtime());
         }
-        Box::new(machine)
+        Ok(Box::new(machine))
     }
 
     /// States this entry point's footprint claim, so a host answer outside it is `E0427`.
@@ -551,9 +535,15 @@ impl<'a> InterpExecutor<'a> {
         let mut used: Option<BackendUse> = None;
         let mut performs = 0u64;
         let region = &worker.region;
-        let backend = worker.backend.clone();
+        let tier = &worker.tier;
         let mut interleaving = |seed: &Seed| {
-            let mut machine = self.machine(backend.clone());
+            let mut machine = match self.machine(Rc::clone(tier)) {
+                Ok(machine) => machine,
+                Err(refused) => {
+                    observed = false;
+                    return Interleaving::failed(Vec::new(), refused);
+                }
+            };
             if !region.is_empty() {
                 machine.set_regions(region.open().0);
             }
@@ -567,12 +557,10 @@ impl<'a> InterpExecutor<'a> {
                 into.atoms = into.atoms.union(&reached.atoms);
                 into.operations = into.operations.saturating_add(reached.operations);
             }
-            if backend.is_some() {
-                let (entries, declines) = machine.compiled_counts();
-                let into = used.get_or_insert_with(Default::default);
-                into.entries = into.entries.saturating_add(entries);
-                into.declines = into.declines.saturating_add(declines);
-            }
+            let (entries, declines) = machine.compiled_counts();
+            let into = used.get_or_insert_with(Default::default);
+            into.entries = into.entries.saturating_add(entries);
+            into.declines = into.declines.saturating_add(declines);
             match sim::interleaving_of(machine.as_ref(), &outcome) {
                 Some(interleaving) => interleaving,
                 None => {
@@ -607,13 +595,13 @@ impl<'a> InterpExecutor<'a> {
 impl<'a> Executor for InterpExecutor<'a> {
     type Worker = Worker<'a>;
 
-    fn worker(&self) -> Worker<'a> {
-        let backend = self.backend();
-        let mut worker = Worker::in_region(self.machine(backend.clone()), self.build_region());
-        worker.backend = backend;
+    fn worker(&self) -> Result<Worker<'a>, Diagnostic> {
+        let tier = self.provider.attach();
+        let machine = self.machine(Rc::clone(&tier))?;
+        let mut worker = Worker::in_region(machine, tier, self.build_region());
         // So the worker holds the group's region from creation, not only from its first test.
         worker.open_region();
-        worker
+        Ok(worker)
     }
 
     fn exploration(&self, worker: &Worker<'a>) -> Option<Exploration> {
@@ -643,7 +631,7 @@ impl<'a> Executor for InterpExecutor<'a> {
         worker.exploration = None;
         worker.host = None;
         // Cumulative over the machine's life, so this test's own is the difference.
-        let before = worker.backed().map(Machine::compiled_counts);
+        let (e0, d0) = worker.machine.compiled_counts();
         worker.backend_use = None;
         if self.searches(index) {
             let (outcome, exploration, host, searched, performs) = self.search(worker, index);
@@ -657,13 +645,11 @@ impl<'a> Executor for InterpExecutor<'a> {
         worker.open_region();
         let outcome = self.execute_directly(worker, index);
         worker.performs = worker.machine.trace().performs();
-        worker.backend_use = match (before, worker.backed().map(Machine::compiled_counts)) {
-            (Some((e0, d0)), Some((e1, d1))) => Some(BackendUse {
-                entries: e1.saturating_sub(e0),
-                declines: d1.saturating_sub(d0),
-            }),
-            _ => None,
-        };
+        let (e1, d1) = worker.machine.compiled_counts();
+        worker.backend_use = Some(BackendUse {
+            entries: e1.saturating_sub(e0),
+            declines: d1.saturating_sub(d0),
+        });
         worker.host = worker.machine.host_use().cloned();
         // A failing test still closes its region so the next test does not inherit it.
         worker.close_region();
@@ -989,6 +975,23 @@ struct Executed {
     performs: u64,
 }
 
+impl Executed {
+    /// A test no worker could be built for: nothing ran, so nothing but the refusal is known.
+    fn refused(index: usize, refusal: Diagnostic) -> Executed {
+        Executed {
+            index,
+            duration: Duration::ZERO,
+            failure: Some(refusal),
+            panicked: false,
+            exploration: None,
+            host: None,
+            teardown: Vec::new(),
+            backend: None,
+            performs: 0,
+        }
+    }
+}
+
 /// One worker per pool thread, built lazily so a small group builds no idle interpreters.
 fn execute_group<E: Executor>(
     executor: &E,
@@ -1007,7 +1010,17 @@ fn execute_group<E: Executor>(
             let Some(&index) = indices.get(next.fetch_add(1, Ordering::Relaxed)) else {
                 return out;
             };
-            let w = worker.get_or_insert_with(|| executor.worker());
+            let built = match worker.take() {
+                Some(built) => built,
+                None => match executor.worker() {
+                    Ok(built) => built,
+                    Err(refused) => {
+                        out.push(Executed::refused(index, refused));
+                        continue;
+                    }
+                },
+            };
+            let w = worker.insert(built);
             let started = Instant::now();
             let result = catch_unwind(AssertUnwindSafe(|| executor.execute(w, index)));
             let duration = started.elapsed();

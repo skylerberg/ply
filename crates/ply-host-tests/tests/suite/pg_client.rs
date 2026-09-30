@@ -165,8 +165,8 @@ fn run(entry: &str, args: Vec<Value>, script: Vec<Vec<u8>>) -> Result<Ran, Strin
         .bind(&front.check)
         .expect("the declaration and the registration agree");
 
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(ply_eval::Provider::attach(unit));
+    let mut machine = Machine::new(&front, ply_eval::Provider::attach(unit))
+        .expect("the unit was compiled from this program");
     machine.set_host_binding(Arc::new(binding));
     let declared = front
         .check
@@ -190,8 +190,8 @@ fn run_over_tcp(entry: &str, args: Vec<Value>) -> Result<Ran, String> {
         .bind(&front.check)
         .expect("the declaration and the registration agree");
 
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(ply_eval::Provider::attach(unit));
+    let mut machine = Machine::new(&front, ply_eval::Provider::attach(unit))
+        .expect("the unit was compiled from this program");
     machine.set_host_binding(Arc::new(binding));
     // The real socket answers `Pending`, so the machine needs something to wait on.
     machine.set_host_runtime(host.runtime());
