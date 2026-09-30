@@ -433,7 +433,11 @@ ordered, and reaches a host operation only if that operation's registration
 allows it (`E0439`).
 
 **`Cell<a>`** (§7) and **`Task<a>`** (§9) are branded by their region and cannot
-outlive it; the brand prints as `Cell[users]<Int>`.
+outlive it; the brand prints as `Cell[users]<Int>`. A declaration is outside
+every region, so a variant's field or an operation's parameter or result that
+mentions either, at any depth, is `E0446`. Take it as a type parameter instead,
+`type Held<t> = Held(t)`: the type argument carries the brand where the escape
+checks see it.
 
 ### 4.7 Function types, and what is written
 
@@ -802,9 +806,10 @@ nobody joined after the region's `}`, and a `task.join` inside the region does
 not license it, because no type records the join.
 
 * `E0201`: the cell escapes its `with_cell[r]` region.
-* `E0446`: a region-branded value outlives the region (stored in an older
-  binding, handed to an operation, put in a declared type, or handed to a
-  `task.spawn` whose scheduler is older than the region).
+* `E0446`: a value branded by the region outlives it (stored in an older
+  binding, handed to an operation, or handed to a `task.spawn` whose scheduler
+  is older than the region), or a declared type's field or an operation's
+  signature mentions a `Cell` or a `Task` (§4.6).
 * `E0449`: a region handle (a cell, a task, or the continuation a clause's
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
