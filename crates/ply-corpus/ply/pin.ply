@@ -1,0 +1,152 @@
+// A package's pin: BLAKE3 over every source `ply` reads for it — its own `.ply` files and manifest,
+// and those of every package its manifest names by path — so a number names exactly the code it was
+// taken over. Generic over the root the trees are read through: `real` pins the checkout's own trees
+// under the working directory, and a report pins the corpus under the `repo` root.
+
+import spine (under)
+import compiler.pkg (check_source)
+import std.bytes (hex_of)
+import std.hash (blake3)
+import std.pkg
+import std.fs (fs)
+import std.fs
+
+// A pinned package: the tree `ply` is run over, every tree it reads, and the digest of their sources.
+pub type Member = { name: String, dir: String, trees: List<String>, digest: String }
+
+// A path under a root with its `.` and `..` segments spelled out of it; `None` when it climbs above
+// the root, which nothing bound there reaches.
+pub fn normalized(path: String) -> Option<String> = {
+  let kept = fold(
+    string_split(path, "/"),
+    Some([]),
+    |acc: Option<List<String>>, segment: String|
+      match acc {
+        None -> None,
+        Some(parts) -> if segment == "" || segment == "." { Some(parts) } else if segment == ".." {
+          if len(parts) == 0 { None } else {
+            Some(
+              fold(range(0, len(parts) - 1), [], |out: List<String>, i: Int|
+                match list_at(parts, i) { Some(p) -> push(out, p), None -> out }),
+            )
+          }
+        } else { Some(push(parts, segment)) },
+      },
+  );
+  match kept {
+    None -> None,
+    Some(parts) ->
+      Some(if len(parts) == 0 { "." }
+      else {
+        fold(parts, "", |acc: String, p: String| if acc == "" { p } else { acc ++ "/" ++ p })
+      }),
+  }
+}
+
+// The trees `ply` reads for the package at `dir`: the package itself, then every package its manifest
+// names by path, transitively, each once.
+fn trees_of<[l]>(
+  dir: String,
+  seen: List<String>,
+) -> Result<List<String>, String> / {fs.read_file[l]} =
+  if fold(seen, false, |found: Bool, s: String| found || s == dir) { Ok(seen) } else {
+    let here = push(seen, dir);
+    match fs.read_file[l](under(dir, "ply.pkg")) {
+      None -> Ok(here),
+      Some(text) -> match check_source(text).manifest {
+        None -> Err("`" ++ under(dir, "ply.pkg") ++ "` does not check as a manifest"),
+        Some(m) ->
+          fold(m.dependencies, Ok(here), |acc: Result<List<String>, String>, d: pkg::Dep|
+            match acc {
+              Err(e) -> Err(e),
+              Ok(found) -> match d.source {
+                pkg::Path(relative) -> match normalized(under(dir, relative)) {
+                  None ->
+                    Err(
+                      "`" ++ dir ++ "` depends on `" ++ relative ++ "`, which is outside the root",
+                    ),
+                  Some(dep) -> trees_of(dep, found),
+                },
+                _ -> Ok(found),
+              },
+            }),
+      },
+    }
+  }
+
+// Every source `ply` reads under `dir`: the `.ply` files and the manifest, past any hidden directory.
+fn sources_under<[l]>(
+  dir: String,
+  acc: List<String>,
+) -> List<String> / {fs.list_dir[l], fs.kind[l]} =
+  match fs.list_dir[l](dir) {
+    None -> acc,
+    Some(names) ->
+      fold(names, acc, |found: List<String>, name: String|
+        if string_starts_with(name, ".") { found } else {
+          let path = under(dir, name);
+          match fs.kind[l](path) {
+            fs::Dir -> sources_under(path, found),
+            fs::File -> if string_ends_with(name, ".ply") || name == "ply.pkg" { push(found, path) }
+            else { found },
+            _ -> found,
+          }
+        }),
+  }
+
+// BLAKE3 over every source's path and text, each closed by a zero byte, in path order, so neither a
+// walk's order nor anything but those bytes can move it.
+pub fn pin_of(files: List<{ path: String, text: Bytes }>) -> String = {
+  let texts = fold(files, map_new(), |acc: Map<String, Bytes>, f: { path: String, text: Bytes }|
+    map_insert(acc, f.path, f.text));
+  let parts = map_fold(texts, [], |acc: List<Bytes>, path: String, text: Bytes|
+    push(push(push(push(acc, bytes_of_string(path)), b"\0"), text), b"\0"));
+  "b3:" ++ hex_of(blake3(bytes_concat_all(parts)))
+}
+
+// The package at `dir` under the root `l`, pinned.
+pub fn member<[l]>(name: String, dir: String) -> Result<Member, String> / {fs.read[l]} =
+  match fs.kind[l](dir) {
+    fs::Dir -> match trees_of[l](dir, []) {
+      Err(e) -> Err(e),
+      Ok(trees) -> {
+        let paths = fold(trees, [], |acc: List<String>, t: String| sources_under[l](t, acc));
+        let files = fold(
+          paths,
+          Ok([]),
+          |acc: Result<List<{ path: String, text: Bytes }>, String>, p: String|
+            match acc {
+              Err(e) -> Err(e),
+              Ok(read) -> match fs.read_file[l](p) {
+                Some(text) -> Ok(push(read, { path: p, text: text })),
+                None -> Err("`" ++ p ++ "` could not be read"),
+              },
+            },
+        );
+        match files {
+          Err(e) -> Err(e),
+          Ok(read) -> Ok({ name: name, dir: dir, trees: trees, digest: pin_of(read) }),
+        }
+      },
+    },
+    _ -> Err("`" ++ dir ++ "` is not a directory under the root"),
+  }
+
+// --- Tests -----------------------------------------------------------------------------
+
+test "a pin is over the sources' bytes and paths, whatever order they were read in" {
+  let a = { path: "t/a.ply", text: b"fn a() -> Int = 1\n" };
+  let b = { path: "t/b.ply", text: b"fn b() -> Int = 2\n" };
+  assert_eq(pin_of([a, b]), pin_of([b, a]));
+  assert(pin_of([a, b]) != pin_of([a, { ..b, text: b"fn b() -> Int = 3\n" }]));
+  assert(pin_of([a, b]) != pin_of([a, { ..b, path: "t/c.ply" }]));
+  assert(string_starts_with(pin_of([a]), "b3:"));
+  assert_eq(string_len(pin_of([a])), 67)
+}
+
+test "a dependency's path is read under the root, and one above it is not" {
+  assert_eq(normalized("crates/ply-cli/ply/../../ply-test/ply"), Some("crates/ply-test/ply"));
+  assert_eq(normalized("./crates/ply-cli/ply"), Some("crates/ply-cli/ply"));
+  assert_eq(normalized("crates/.."), Some("."));
+  assert_eq(normalized("crates/../.."), None)
+}
