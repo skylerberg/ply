@@ -209,9 +209,114 @@ fn a_dead_object_is_reused_by_the_next_of_its_class_within_an_entry() {
     let bridged = h.bridge(Value::Float(1.5));
     dec(bridged);
     let bridged_again = h.bridge(Value::Float(2.5));
-    assert_ne!(bridged_again, bridged, "a bridged slot is never reused");
+    assert_eq!(
+        bridged_again, bridged,
+        "a dead bridge's block is the next bridge's"
+    );
+    assert_eq!(Heap::to_value(&l, bridged_again), Value::Float(2.5));
     leave();
     h.end();
+}
+
+/// The end drops what the table lists, so a block listed twice would drop its tenant twice.
+#[test]
+fn the_bridge_table_lists_each_live_bridge_once_and_the_end_drops_each_once() {
+    let mut h = Heap::new();
+    let l = layouts();
+    let held: Arc<str> = Arc::from("held");
+    enter(&mut h);
+    let words: Vec<Word> = (0..8).map(|_| h.bridge(Value::Str(held.clone()))).collect();
+    for i in [3, 0, 7, 4] {
+        dec(words[i]);
+    }
+    assert_eq!(h.bridges(), 4, "a dead bridge stayed in the table");
+    assert_eq!(Arc::strong_count(&held), 5);
+
+    let reused: Vec<Word> = (0..4).map(|i| h.bridge(Value::Int(i))).collect();
+    assert!(
+        reused.iter().all(|w| words.contains(w)),
+        "a bridge took fresh memory with dead bridges' blocks on hand"
+    );
+    assert_eq!(h.bridges(), 8);
+    for (i, w) in reused.iter().enumerate() {
+        assert_eq!(Heap::to_value(&l, *w), Value::Int(i as i64));
+    }
+    for i in [1, 2, 5, 6] {
+        assert_eq!(Heap::to_value(&l, words[i]), Value::Str(held.clone()));
+    }
+
+    // Out of listing order, so removals move entries into the holes they leave.
+    for w in [reused[1], words[6], reused[3], words[1], reused[0]] {
+        dec(w);
+    }
+    assert_eq!(h.bridges(), 3);
+    assert_eq!(Arc::strong_count(&held), 3);
+
+    // With no heap entered the block cannot go back, so it stays listed, dead.
+    leave();
+    dec(words[5]);
+    assert_eq!(h.bridges(), 3);
+    assert_eq!(Arc::strong_count(&held), 2);
+    h.end();
+    assert_eq!(h.bridges(), 0);
+    assert_eq!(
+        Arc::strong_count(&held),
+        1,
+        "the end dropped a bridged value other than once"
+    );
+}
+
+/// Derived, because a filter naming no test runs nothing and exits 0, which reads as a pass.
+fn own_test_name(leaf: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_binary, module)) => format!("{module}::{leaf}"),
+        None => leaf.to_string(),
+    }
+}
+
+/// `PLY_HEAP_POISON` is read once per process, so the poisoned heap runs in a process of its own.
+#[test]
+fn under_poisoning_a_stale_word_that_reaches_a_reused_bridge_block_is_caught() {
+    let name = own_test_name("a_stale_word_meets_a_reused_bridge_block_poisoned");
+    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([name.as_str(), "--exact", "--ignored", "--nocapture"])
+        .env("PLY_HEAP_POISON", "1")
+        .env_remove("PLY_HEAP_DELAY")
+        .output()
+        .expect("the test binary runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the stale read was not caught:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran no test matching `{name}`, and a filter that matches nothing exits 0:\n{stdout}"
+    );
+}
+
+#[test]
+#[ignore = "run under `PLY_HEAP_POISON` by the test above"]
+#[should_panic(expected = "a stale read: an object that has died")]
+fn a_stale_word_meets_a_reused_bridge_block_poisoned() {
+    assert!(poisoning(), "`PLY_HEAP_POISON` is not set");
+    let mut h = Heap::new();
+    let l = layouts();
+    enter(&mut h);
+    let stale = h.bridge(Value::Float(1.5));
+    dec(stale);
+    let tenant = h.bridge(Value::Float(2.5));
+    assert_eq!(tenant, stale, "the dead bridge's block was not reused");
+    assert_eq!(Heap::to_value(&l, tenant), Value::Float(2.5));
+    dec(tenant);
+    let payload = unsafe { word_at(stale as *mut Obj, 0) };
+    assert_eq!(
+        payload,
+        poison::word(),
+        "the dead bridge's payload was not poisoned"
+    );
+    Heap::to_value(&l, stale);
 }
 
 #[test]

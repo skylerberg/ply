@@ -270,6 +270,9 @@ pub unsafe fn set_word(o: *mut Obj, i: usize, w: Word) {
 pub const CLOSURE_CODE: usize = 0;
 pub const CLOSURE_CAPTURES: usize = 1;
 
+/// A bridge's payload: one owned `Value`.
+const BRIDGE_BYTES: usize = std::mem::size_of::<Value>();
+
 /// The bridged value lives in the payload as an owned `Value`.
 unsafe fn bridge_slot(o: *mut Obj) -> *mut Value {
     unsafe { words(o) as *mut Value }
@@ -451,7 +454,7 @@ pub struct Heap {
     starts: Vec<Vec<u64>>,
     /// Which chunk `cur` is in.
     chunk: usize,
-    /// Bridged values allocated since the last reset, to drop at the end.
+    /// The bridges whose `Value` the end drops, each block's `layout` its index here.
     bridges: Vec<*mut Obj>,
     persistent: bool,
     /// Objects allocated since the last reset, and the same by kind.
@@ -499,19 +502,21 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
             KIND_MLEAF => (*o).layout as usize * 16,
             KIND_MBRANCH => 2 * map::KEYS * 8,
             KIND_STR | KIND_BYTES => (*o).layout as usize,
+            KIND_BRIDGE => BRIDGE_BYTES,
             _ => usize::MAX,
         }
     }
 }
 
-/// Returns a dead object to its free list; never a bridge, which the drop log would drop twice.
+/// Returns a dead object to its free list; a bridge leaves the table first, so the bridge that
+/// takes its block next is not listed twice.
 unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
     if heap.is_null() {
         return;
     }
     unsafe {
         if (*o).kind == KIND_BRIDGE {
-            return;
+            (*heap).unlist(o);
         }
         let size = payload_bytes(o);
         if size == usize::MAX {
@@ -623,7 +628,7 @@ impl Heap {
                     }
                     let e = tally.entry(kind).or_insert((0, 0));
                     e.0 += 1;
-                    // `usize::MAX` means unsized (a bridge, a singleton): count the header alone.
+                    // `usize::MAX` means unsized: count the header alone.
                     e.1 += if size == usize::MAX { HEADER } else { size };
                 }
             }
@@ -657,6 +662,36 @@ impl Heap {
     /// Allocations served from a free list rather than fresh memory.
     pub fn recycled(&self) -> usize {
         self.recycled
+    }
+
+    /// How many bridges the table lists: what a leak of them grows.
+    pub fn bridges(&self) -> usize {
+        self.bridges.len()
+    }
+
+    /// Takes a dying bridge out of the table, the last entry moving into its place.
+    unsafe fn unlist(&mut self, o: *mut Obj) {
+        let at = unsafe { (*o).layout } as usize;
+        debug_assert!(
+            self.bridges.get(at) == Some(&o),
+            "a bridge died into a heap whose table does not hold it"
+        );
+        self.bridges.swap_remove(at);
+        if let Some(&moved) = self.bridges.get(at) {
+            unsafe { (*moved).layout = at as u32 };
+        }
+    }
+
+    /// Drops the `Value` of every bridge still listed; one released with no heap entered stays
+    /// listed, dead, and is skipped.
+    fn drop_bridges(&mut self) {
+        for o in self.bridges.drain(..) {
+            unsafe {
+                if (*o).kind == KIND_BRIDGE {
+                    std::ptr::drop_in_place(bridge_slot(o));
+                }
+            }
+        }
     }
 
     /// Moves to a chunk with `need` bytes free: the next fitting one on hand, or a new, larger one.
@@ -852,7 +887,8 @@ impl Heap {
     }
 
     pub fn bridge(&mut self, v: Value) -> Word {
-        let o = self.raw_alloc(KIND_BRIDGE, 0, 0, 0, std::mem::size_of::<Value>());
+        let at = u32::try_from(self.bridges.len()).expect("a bridge table a header can index");
+        let o = self.raw_alloc(KIND_BRIDGE, 0, 0, at, BRIDGE_BYTES);
         unsafe { bridge_slot(o).write(v) };
         self.bridges.push(o);
         o as Word
@@ -938,13 +974,7 @@ impl Heap {
         if self.persistent {
             return;
         }
-        for o in self.bridges.drain(..) {
-            unsafe {
-                if (*o).kind == KIND_BRIDGE {
-                    std::ptr::drop_in_place(bridge_slot(o));
-                }
-            }
-        }
+        self.drop_bridges();
         if let Some((p, cap)) = self.chunks.first() {
             self.cur = *p;
             self.end = unsafe { p.add(*cap) };
@@ -1121,13 +1151,7 @@ pub struct Walked {
 
 impl Drop for Heap {
     fn drop(&mut self) {
-        for o in self.bridges.drain(..) {
-            unsafe {
-                if (*o).kind == KIND_BRIDGE {
-                    std::ptr::drop_in_place(bridge_slot(o));
-                }
-            }
-        }
+        self.drop_bridges();
         for (p, cap) in self.chunks.drain(..) {
             unsafe { dealloc(p, Layout::from_size_align(cap, 16).expect("a chunk layout")) };
         }
