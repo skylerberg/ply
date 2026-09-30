@@ -444,6 +444,71 @@ fn a_build_pins_its_dependencies_and_refuses_what_the_lock_pins_differently() {
     );
 }
 
+/// A file argument's package is its directory: resolving the file pins what that directory's
+/// manifest declares, in the lock beside it.
+#[test]
+fn resolving_a_file_writes_the_lock_beside_it() {
+    let dir = graph();
+    let app = dir.path().join("app");
+    let out = ply(&app).args(["resolve", "main.ply"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("resolved 2 packages · ply.lock"),
+        "{stdout}"
+    );
+    let lock = std::fs::read_to_string(app.join("ply.lock")).expect("the lock is beside the file");
+    assert!(lock.contains("\"name\":\"lib\""), "{lock}");
+    assert!(lock.contains("\"name\":\"base\""), "{lock}");
+    assert!(app.join("main.ply").is_file());
+}
+
+/// A build of one file is held to the lock beside it, as a build of its directory is.
+#[test]
+fn building_a_file_is_held_to_the_lock_beside_it() {
+    let dir = graph();
+    let built = |args: &[&str]| ply(dir.path()).args(args).output().unwrap();
+    let lock_path = dir.path().join("app/ply.lock");
+
+    let out = built(&["resolve", "app"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    let out = built(&["build", "app/main.ply", "-o", "app.plyx"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock);
+
+    std::fs::write(
+        dir.path().join("lib/answer.ply"),
+        "import base.deep\npub fn answer() -> Int = deep::deep() + 1\n",
+    )
+    .unwrap();
+    let out = built(&["build", "app/main.ply", "-o", "stale.plyx"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0138"), "{err}");
+    assert!(err.contains("`lib` is not what `ply.lock` pins"), "{err}");
+    assert!(
+        !dir.path().join("stale.plyx").exists(),
+        "an artifact was written"
+    );
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock);
+}
+
 #[test]
 fn a_lockfile_nothing_can_read_is_refused_rather_than_ignored() {
     let dir = graph();
