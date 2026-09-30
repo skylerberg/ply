@@ -5573,7 +5573,8 @@ fn check_tests(cx: Cx, m: Mod) -> Cx = {
               };
               let pushed: Cx = { ..c1, env: env_push(c1.env) };
               let o: Inferred = infer(pushed, def.body);
-              let popped: Cx = { ..o.cx, env: env_pop(o.cx.env) };
+              let answered: Cx = check_test_answer(o.cx, def, o.ty);
+              let popped: Cx = { ..answered, env: env_pop(answered.env) };
               let row = resolve_r(popped, o.row);
               {
                 cx: if def.is_nondet { popped } else { check_determinism(popped, def, row.atoms) },
@@ -5603,6 +5604,36 @@ fn check_tests(cx: Cx, m: Mod) -> Cx = {
   );
   walked.cx
 }
+
+fn check_test_answer(cx: Cx, def: TestDef, ty: Type) -> Cx = {
+  let u = unify(cx.subst, cx.fresh, t_unit(), ty);
+  let c = with_unified(cx, u);
+  match u.err {
+    None -> c,
+    Some(_) -> {
+      let span = expr_span(tail_value(def.body));
+      let found = resolve(c, ty);
+      let shown = print_ty(printer_new(), found).s;
+      let d = diag1(
+        b"E0201",
+        c.module,
+        span,
+        bytes_concat_all([b"type mismatch: the body of test `", def.name, b"`"]),
+        bytes_concat_all([b"expected `Unit`, found `", shown, b"`"]),
+        [b"a test passes when its body finishes, so a value it ends on is never read"],
+      );
+      report(c, if found == t_bool() {
+        with_fix(d, b"wrap it in `assert`", [
+          insertion(c.module, span.start, b"assert("),
+          insertion(c.module, span.end, b")"),
+        ])
+      } else { with_fix(d, b"end the body with `()`", [insertion(c.module, span.end, b"; ()")]) })
+    },
+  }
+}
+
+fn tail_value(e: Expr) -> Expr =
+  match e { EBlock(b) -> match b.tail { Some(t) -> tail_value(t), None -> e }, _ -> e }
 
 type WithAtoms = { cx: Cx, atoms: List<Atom> }
 
@@ -7862,6 +7893,53 @@ fn check_codes(src: Bytes) -> List<Bytes> = map(check_diags(src), |dg: Diag| dg.
 
 fn fixes_of(diags: List<Diag>) -> List<Fix> =
   fold(diags, [], |acc: List<Fix>, dg: Diag| append(acc, dg.fixes))
+
+// Last edit first, so each offset still points where it did.
+fn fixed_by(src: Bytes, f: Fix) -> Bytes = {
+  let n = len(f.edits);
+  fold(range(0, n), src, |s: Bytes, i: Int| {
+    let e = at(f.edits, n - 1 - i);
+    bytes_concat_all([bytes_slice(s, 0, e.start), e.text, bytes_slice(s, e.end, bytes_len(s))])
+  })
+}
+
+fn refuses_a_value(form: Bytes) -> Unit = {
+  let src = |body: Bytes| bytes_concat_all([form, b" \"t\" { ", body, b" }"]);
+  let start = bytes_len(form) + 7;
+  assert_eq(check_codes(src(b"assert(true)")), []);
+  assert_eq(check_codes(src(b"let x = 1; ()")), []);
+  let valued = check_diags(src(b"1"));
+  assert_eq(map(valued, |dg: Diag| dg.code), [b"E0201"]);
+  assert_eq(map(valued, |dg: Diag| dg.message), [b"type mismatch: the body of test `t`"]);
+  assert_eq(map(valued, |dg: Diag| dg.labels), [
+    [
+      {
+        module: 0,
+        start: start,
+        end: start + 1,
+        primary: true,
+        text: b"expected `Unit`, found `Int`",
+      },
+    ],
+  ]);
+  assert_eq(map(fixes_of(valued), |f: Fix| f.title), [b"end the body with `()`"]);
+  assert_eq(map(fixes_of(valued), |f: Fix| fixed_by(src(b"1"), f)), [src(b"1; ()")]);
+  assert_eq(check_codes(src(b"1; ()")), []);
+  let compared = check_diags(src(b"let x = 1; x == 2"));
+  assert_eq(map(compared, |dg: Diag| map(dg.labels, |l: Label| (l.start, l.end, l.text))), [
+    [(start + 11, start + 17, b"expected `Unit`, found `Bool`")],
+  ]);
+  assert_eq(map(fixes_of(compared), |f: Fix| f.title), [b"wrap it in `assert`"]);
+  assert_eq(map(fixes_of(compared), |f: Fix| fixed_by(src(b"let x = 1; x == 2"), f)), [
+    src(b"let x = 1; assert(x == 2)"),
+  ]);
+  assert_eq(check_codes(src(b"let x = 1; assert(x == 2)")), [])
+}
+
+test "a test body is `Unit`, so one that ends on a value is refused with a fix that makes it check" {
+  refuses_a_value(b"test");
+  refuses_a_value(b"test/nondet")
+}
 
 fn net_src(rest: Bytes) -> Bytes =
   bytes_concat(
