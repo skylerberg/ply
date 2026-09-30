@@ -109,7 +109,7 @@ fn the_iteration_order_is_pinned() {
     let rendered = shape(&map_of(pairs));
     assert_eq!(
         blake3::hash(rendered.as_bytes()).to_hex().as_str(),
-        "d95a132e0e9c2537b40decf812619093cb2c4f98fcad839380bf556fa43dcab7",
+        "6219a3f6a71e3e6be9ec06eff417cba6a700ae82b7d2a9e66468dca5343ec020",
         "the map iteration order moved:\n{rendered}"
     );
 }

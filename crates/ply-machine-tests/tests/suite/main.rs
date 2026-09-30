@@ -14,8 +14,7 @@ mod selector_reads;
 mod strategy;
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{Front, Machine, Provider, SourceId, Span, Value};
-use std::collections::HashMap;
+use ply_eval::{Front, Machine, Provider, Span, Value};
 use std::sync::Arc;
 
 /// The outer program: load the root it is handed, bind and enter `inner.main`, answer with how
@@ -36,19 +35,6 @@ nondet effect machine {
 }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
-type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
-type Edit = { module: Int, start: Int, end: Int, text: Bytes }
-type Fix = { title: Bytes, edits: List<Edit> }
-type Diag = {
-  code: Bytes,
-  notes: Int,
-  labels: List<Label>,
-  text: Bytes,
-  message: Bytes,
-  notes_text: List<Bytes>,
-  severity: Bytes,
-  fixes: List<Fix>,
-}
 type Raised = { diag: Diag, values: List<Value> }
 
 type Options = { host: Bool, trace: TraceOpts }
@@ -133,8 +119,8 @@ type Json = | Null
 
 type Ended = {
   exit: Option<Int>,
-  value: Option<String>,
-  raised: Option<Diag>,
+  value: Option<Value>,
+  raised: Option<Raised>,
   counters: Counters,
   cycles: List<Diag>,
   stopping: Option<Stopping>,
@@ -174,11 +160,16 @@ fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m
 }
 "#;
 
-fn front_of(source: &str) -> Front {
-    let named = vec![("m".to_string(), source.to_string())];
-    let ids = vec![SourceId(0)];
+/// The program checked with the standard library it imports, and compiled.
+fn built(source: &str) -> (Front, &'static ply_codegen::Unit) {
     ply_codegen::c::producer::ensure_default();
-    ply_codegen::c::producer::checked_front(&named, &ids).expect("the outer program checks")
+    let answered =
+        ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), source.to_string())])
+            .expect("the outer program checks");
+    let unit =
+        ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
+            .expect("this host has a C toolchain");
+    (answered.front, unit)
 }
 
 /// The inner program's home: a directory with `inner.ply` in it.
@@ -190,10 +181,7 @@ fn project(inner: &str) -> tempfile::TempDir {
 
 fn entered_with(inner: &str, host: bool) -> Value {
     let project = project(inner);
-    let front = front_of(OUTER);
-    let texts: HashMap<String, String> =
-        [("m".to_string(), OUTER.to_string())].into_iter().collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
@@ -233,14 +221,17 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("the answer holds `{name}`"))
 }
 
-fn option_text(value: &Value) -> Option<String> {
+fn option_value(value: &Value) -> Option<&Value> {
     match value {
-        Value::Ctor { name, args } if name.as_str() == "Some" => args
-            .first()
-            .map(|v| v.as_str(Span::DUMMY, "text").unwrap().to_string()),
+        Value::Ctor { name, args } if name.as_str() == "Some" => args.first(),
         Value::Ctor { name, .. } if name.as_str() == "None" => None,
         other => panic!("an Option, not {}", other.type_name()),
     }
+}
+
+/// A nested program's `Int` answer, as `std.value` carries it.
+fn vint(n: i64) -> Value {
+    Value::ctor("std.value.VInt", vec![Value::Int(n)])
 }
 
 fn option_int(value: &Value) -> Option<i64> {
@@ -260,9 +251,9 @@ fn main() -> Int = 40 + 2
 #[test]
 fn a_program_loads_binds_and_enters_a_program() {
     let answer = entered(INNER);
-    assert_eq!(option_text(field(&answer, "value")).as_deref(), Some("42"));
+    assert_eq!(option_value(field(&answer, "value")), Some(&vint(42)));
     assert_eq!(option_int(field(&answer, "exit")), None);
-    assert_eq!(option_text(field(&answer, "raised")), None);
+    assert_eq!(option_value(field(&answer, "raised")), None);
 }
 
 #[test]
@@ -276,8 +267,8 @@ fn main() -> Unit / {process.exit[proc]} = process.exit[proc](7)
         true,
     );
     assert_eq!(option_int(field(&answer, "exit")), Some(7));
-    assert_eq!(option_text(field(&answer, "value")), None);
-    assert_eq!(option_text(field(&answer, "raised")), None);
+    assert_eq!(option_value(field(&answer, "value")), None);
+    assert_eq!(option_value(field(&answer, "raised")), None);
 }
 
 #[test]
@@ -289,9 +280,9 @@ fn main() -> Int = panic("the inner program's own bug")
     );
     // A raise is a diagnostic value; the outer program does not read inside it.
     assert!(option_int(field(&answer, "exit")).is_none());
-    assert_eq!(option_text(field(&answer, "value")), None);
+    assert_eq!(option_value(field(&answer, "value")), None);
     let raised = match field(&answer, "raised") {
-        Value::Ctor { name, args } if name.as_str() == "Some" => &args[0],
+        Value::Ctor { name, args } if name.as_str() == "Some" => field(&args[0], "diag"),
         other => panic!("the raise is reported, not unwound: {other:?}"),
     };
     let text = |name: &str| {
@@ -311,10 +302,7 @@ fn main() -> Int = panic("the inner program's own bug")
 #[test]
 fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
     // The outer program panics with the refusal's first message; the outer machine raises it.
-    let front = front_of(OUTER);
-    let texts: HashMap<String, String> =
-        [("m".to_string(), OUTER.to_string())].into_iter().collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
@@ -353,19 +341,6 @@ nondet effect machine {
 }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
-type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
-type Edit = { module: Int, start: Int, end: Int, text: Bytes }
-type Fix = { title: Bytes, edits: List<Edit> }
-type Diag = {
-  code: Bytes,
-  notes: Int,
-  labels: List<Label>,
-  text: Bytes,
-  message: Bytes,
-  notes_text: List<Bytes>,
-  severity: Bytes,
-  fixes: List<Fix>,
-}
 type Raised = { diag: Diag, values: List<Value> }
 
 type Options = { host: Bool, trace: TraceOpts }
@@ -427,19 +402,19 @@ type Front = {
 }
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
 
-type Ended = { exit: Option<Int>, value: Option<String>, raised: Option<Diag>, rest: Int }
+type Ended = { exit: Option<Int>, value: Option<Value>, raised: Option<Raised>, rest: Int }
 
-fn once() -> Option<String> / {machine.bound[m], machine.enter[m]} = {
+fn once() -> Option<Value> / {machine.bound[m], machine.enter[m]} = {
   let _b = machine.bound[m]("inner.main");
   (machine.enter[m]()).value
 }
 
-fn main(root: String, front: Front) -> Option<String> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
+fn main(root: String, front: Front) -> Option<Value> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
   let _loaded = machine.load[m](root, Some(front), None);
   once()
 }
 
-fn again(front: Front) -> Option<String> / {machine.reload[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+fn again(front: Front) -> Option<Value> / {machine.reload[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
   let _again = machine.reload[m](front);
   let value = once();
   machine.drop[m]();
@@ -453,11 +428,7 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     let inner = project.path().join("inner.ply");
     std::fs::write(&inner, "fn main() -> Int = 1\n").unwrap();
 
-    let front = front_of(OUTER_TWICE);
-    let texts: HashMap<String, String> = [("m".to_string(), OUTER_TWICE.to_string())]
-        .into_iter()
-        .collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER_TWICE);
 
     let mut registry = HostRegistry::new();
     ply_machine::register_with(&mut registry, ply_machine::drive::RunOptions::default());
@@ -477,7 +448,7 @@ fn a_reload_after_an_edit_enters_the_new_program() {
         "m.main",
         vec![Value::str(root), crate::fixture::handed(project.path())],
     );
-    assert_eq!(option_text(&first).as_deref(), Some("1"));
+    assert_eq!(option_value(&first), Some(&vint(1)));
     assert!(
         !project.path().join(".ply-cache").exists(),
         "a machine's load reads the answer it was handed and files nothing"
@@ -486,8 +457,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     std::fs::write(&inner, "fn main() -> Int = 2\n").unwrap();
     let second = call("m.again", vec![crate::fixture::handed(project.path())]);
     assert_eq!(
-        option_text(&second).as_deref(),
-        Some("2"),
+        option_value(&second),
+        Some(&vint(2)),
         "the reload read the edited program"
     );
 }
@@ -513,19 +484,6 @@ nondet effect machine {
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
-type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
-type Edit = { module: Int, start: Int, end: Int, text: Bytes }
-type Fix = { title: Bytes, edits: List<Edit> }
-type Diag = {
-  code: Bytes,
-  notes: Int,
-  labels: List<Label>,
-  text: Bytes,
-  message: Bytes,
-  notes_text: List<Bytes>,
-  severity: Bytes,
-  fixes: List<Fix>,
-}
 type Raised = { diag: Diag, values: List<Value> }
 
 type TlsCred = { name: String, cert: String, key: String }
@@ -616,7 +574,7 @@ type Front = {
   cached: Bool,
 }
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
-type Ended = { exit: Option<Int>, value: Option<String>, raised: Option<Diag>, rest: Int }
+type Ended = { exit: Option<Int>, value: Option<Value>, raised: Option<Raised>, rest: Int }
 
 fn opts(host: Bool) -> Options =
   {
@@ -660,7 +618,7 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
         Ok(b) -> {
           let ended = machine.enter[m]();
           machine.drop[m]();
-          !b.hermetic && ended.value == Some("77")
+          !b.hermetic && ended.value == Some(VInt(77))
         },
       }
     },
@@ -671,10 +629,7 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
     let project = tempfile::tempdir().expect("a temporary directory");
     std::fs::write(project.path().join("inner.ply"), "fn main() -> Int = 77\n").unwrap();
 
-    let front = front_of(outer);
-    let texts: HashMap<String, String> =
-        [("m".to_string(), outer.to_string())].into_iter().collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(outer);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
@@ -787,11 +742,7 @@ pub fn boom() -> Int = panic("oh no")
 #[test]
 fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
     let project = project(INNER_CALL);
-    let front = front_of(OUTER_CALL);
-    let texts: HashMap<String, String> = [("m".to_string(), OUTER_CALL.to_string())]
-        .into_iter()
-        .collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER_CALL);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
@@ -937,11 +888,7 @@ pub fn twin() -> Int = deep(50)
 #[test]
 fn a_memo_answer_and_a_decline_add_no_steps_to_the_accounting() {
     let project = project(INNER_TOTAL);
-    let front = front_of(OUTER_TOTAL);
-    let texts: HashMap<String, String> = [("m".to_string(), OUTER_TOTAL.to_string())]
-        .into_iter()
-        .collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let (front, unit) = built(OUTER_TOTAL);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
