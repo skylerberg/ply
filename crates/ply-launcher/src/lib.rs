@@ -27,6 +27,18 @@ pub struct Program {
 /// one. Not a `.ply` file, so the program's own listing passes over it.
 const SHELF_MARKER: &str = "SHELF.ok";
 
+/// The PEM files `PLY_TRUST` names, separated as `PATH` separates directories: roots the program's
+/// own `net.connect_tls` accepts beside the built-in ones, as `--trust` gives a program a command
+/// runs. One that does not load is `E0430` before the program runs.
+pub fn trust() -> Vec<PathBuf> {
+    match std::env::var_os("PLY_TRUST") {
+        None => Vec::new(),
+        Some(value) => std::env::split_paths(&value)
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect(),
+    }
+}
+
 /// The shelf laid out once per identity. Each file lands by a rename and the marker lands last,
 /// so a run that finds the marker finds every module whole.
 pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
