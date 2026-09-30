@@ -3,16 +3,30 @@
 
 pub mod discharge;
 pub mod pg;
-pub mod serve;
 pub mod simulate;
-pub mod w3;
 pub mod w4;
 pub mod w5;
 pub mod w6;
 pub mod w6_run;
 
-use anyhow::Result;
-use std::path::Path;
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
+
+/// Where the `ply` binary is, given this binary: its sibling.
+pub fn ply_binary() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("locating this binary")?;
+    let path = exe
+        .parent()
+        .map(|dir| dir.join("ply"))
+        .context("this binary has no parent directory")?;
+    if !path.exists() {
+        bail!(
+            "`{}` does not exist; build it with `cargo build --release -p ply-launcher --bin ply`",
+            path.display()
+        );
+    }
+    Ok(path)
+}
 
 /// The front end over one caller-written module that imports the standard library: the
 /// caller's source alone, with the shipped std pulled as the built-in package rather than

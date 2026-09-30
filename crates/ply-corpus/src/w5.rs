@@ -17,14 +17,33 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::serve::{Server, reserve_port};
-use crate::w3;
+use crate::w4::{
+    Server, Variant, load_point_over, project, reserve_port, served_args, share,
+    wait_until_serving, wait_until_serving_over,
+};
 
 /// The program [`events`] runs.
 const BENCH: &str = include_str!("../ply/w5.ply");
 
-/// The TLS credential name the served project uses, matching `w3`'s.
+/// The TLS credential name the served project uses.
 const CREDENTIAL: &str = "desk";
+
+pub struct Material {
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+}
+
+/// Generated per run rather than checked in: the server is given the two files and a client is
+/// told to trust the certificate, which is what `--trust` is.
+pub fn credential(dir: &Path) -> Result<Material> {
+    let issued =
+        ply_host::certgen::issue(&["localhost".to_string()]).map_err(|why| anyhow::anyhow!(why))?;
+    let certificate = dir.join("desk.pem");
+    let key = dir.join("desk.key");
+    std::fs::write(&certificate, &issued.certificate)?;
+    std::fs::write(&key, &issued.key)?;
+    Ok(Material { certificate, key })
+}
 
 fn micros(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
@@ -355,11 +374,11 @@ impl Sinking {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Stack {
-    /// `run_memory`: the twin behind the routes, no host database, no host sink.
+    /// `DESK_STORE=memory`: the twin behind the routes, no host database, no host sink.
     Twin,
-    /// `run`: postgres behind the routes, over plaintext.
+    /// `DESK_STORE=postgres`: postgres behind the routes, over plaintext.
     Postgres,
-    /// `run_tls`: the same, with the transport terminated by `ply_host::tls`.
+    /// The same with `DESK_TLS`, the transport terminated by `ply_host::tls`.
     PostgresTls,
 }
 
@@ -371,20 +390,6 @@ impl Stack {
             Stack::PostgresTls => "postgres, https",
         }
     }
-}
-
-/// The corpus's own program for one stack, copied into a project `ply run --host` can be pointed
-/// at. There is nothing to rewrite: each stack's entry point is written down.
-pub fn project(dir: &Path, repo: &Path, stack: Stack, variant: w3::Variant) -> Result<()> {
-    let mode = match stack {
-        Stack::Postgres => "postgres",
-        Stack::PostgresTls => "tls",
-        Stack::Twin => "memory",
-    };
-    let name = format!("desk-{}-{mode}.ply", variant.label());
-    let source = std::fs::read_to_string(repo.join("crates/ply-corpus/fixtures").join(name))?;
-    std::fs::write(dir.join("desk.ply"), source)?;
-    Ok(())
 }
 
 fn replace(source: &str, from: &str, to: &str) -> Result<String> {
@@ -415,20 +420,21 @@ impl Serving {
         ply: &Path,
         url: &str,
         stack: Stack,
-        variant: w3::Variant,
+        variant: Variant,
         sinking: Sinking,
         connections: u32,
         api_key: &str,
     ) -> Result<Serving> {
         let dir = tempfile::tempdir().context("a temp dir for the served project")?;
         let port = reserve_port()?;
-        project(dir.path(), repo, stack, variant)?;
+        project(dir.path(), repo)?;
 
-        let mut args = crate::w4::served_args(
+        let mut args = served_args(
             port,
             connections,
             api_key,
             (stack != Stack::Twin).then_some(url),
+            variant,
         );
         args.extend([
             "--trace".to_string(),
@@ -439,7 +445,9 @@ impl Serving {
         ]);
         let mut trust = None;
         if stack == Stack::PostgresTls {
-            let material = w3::credential(dir.path())?;
+            let material = credential(dir.path())?;
+            args.push("--set".into());
+            args.push(format!("DESK_TLS={CREDENTIAL}"));
             args.push("--tls".into());
             args.push(format!(
                 "{CREDENTIAL}={},{}",
@@ -461,7 +469,7 @@ impl Serving {
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut server = Server::start_with(ply, dir.path(), &borrowed, stderr)?;
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        w3::wait_until_serving_over(&mut server, addr, trust.as_deref())?;
+        wait_until_serving_over(&mut server, addr, trust.as_deref())?;
         Ok(Serving {
             _dir: dir,
             server,
@@ -507,7 +515,7 @@ pub fn tracing(
     ply: &Path,
     url: &str,
     stacks: &[Stack],
-    variant: w3::Variant,
+    variant: Variant,
     sinks: &[Sinking],
     routes: &[(&'static str, &'static str)],
     concurrencies: &[u32],
@@ -519,7 +527,7 @@ pub fn tracing(
     for &stack in stacks {
         for &sinking in sinks {
             for &concurrency in concurrencies {
-                let conns = w3::share(concurrency, per_conn, requests_per_point);
+                let conns = share(concurrency, per_conn, requests_per_point);
                 // One spare for the probe that proves the server answers.
                 let budget = concurrency * conns * routes.len() as u32 + 1;
                 let mut serving =
@@ -527,7 +535,7 @@ pub fn tracing(
                 let before = serving.records_written();
                 for (label, path) in routes {
                     let trust = serving.trust.clone();
-                    let point = w3::load_point_over(
+                    let point = load_point_over(
                         &mut serving.server,
                         serving.addr,
                         trust.as_deref(),
@@ -648,11 +656,17 @@ fn one_drain(
 ) -> Result<DrainPoint> {
     let dir = tempfile::tempdir().context("a temp dir for the served project")?;
     let port = reserve_port()?;
-    project(dir.path(), repo, Stack::Postgres, w3::Variant::TaskPerConn)?;
+    project(dir.path(), repo)?;
 
     let drain = drain_ms.to_string();
     let lead = lead_ms.to_string();
-    let mut args = crate::w4::served_args(port, in_flight + 8, api_key, Some(url));
+    let mut args = served_args(
+        port,
+        in_flight + 8,
+        api_key,
+        Some(url),
+        Variant::TaskPerConn,
+    );
     args.extend([
         "--trace".to_string(),
         "off".to_string(),
@@ -664,7 +678,7 @@ fn one_drain(
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut server = Server::start_with(ply, dir.path(), &borrowed, Stdio::piped())?;
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    w3::wait_until_serving(&mut server, addr)?;
+    wait_until_serving(&mut server, addr)?;
 
     let mut held = Vec::new();
     for _ in 0..in_flight {
@@ -795,10 +809,10 @@ pub fn transaction_at_deadline(
 ) -> Result<TxnOutcome> {
     let dir = tempfile::tempdir().context("a temp dir for the served project")?;
     let port = reserve_port()?;
-    project(dir.path(), repo, Stack::Postgres, w3::Variant::TaskPerConn)?;
+    project(dir.path(), repo)?;
 
     let drain = drain_ms.to_string();
-    let mut args = crate::w4::served_args(port, 8, api_key, Some(url));
+    let mut args = served_args(port, 8, api_key, Some(url), Variant::TaskPerConn);
     args.extend([
         "--trace".to_string(),
         "off".to_string(),
@@ -814,7 +828,7 @@ pub fn transaction_at_deadline(
 
     let mut server = Server::start_with(ply, dir.path(), &borrowed, Stdio::piped())?;
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    w3::wait_until_serving(&mut server, addr)?;
+    wait_until_serving(&mut server, addr)?;
 
     let order = post_order(addr, api_key)?;
     queries.wait_until_blocked(Duration::from_secs(30))?;

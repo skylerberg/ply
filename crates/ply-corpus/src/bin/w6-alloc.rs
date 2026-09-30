@@ -28,7 +28,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let ply = ply_corpus::serve::ply_binary()?;
+    let ply = ply_corpus::ply_binary()?;
     let dir = ply_corpus::w6_run::counting_project(&repo)?;
 
     // Two windows, because one cannot tell a request from a run: a window's total charges the
