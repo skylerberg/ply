@@ -2,7 +2,7 @@
 // built on -- `size`, and the candidates it offers -- and neither is about the walk: the order is
 // fixed, and a type's floor is its smallest value.
 
-use ply_eval::Value;
+use ply_eval::{Fixed, IntTy, Value};
 use ply_prove::Sort;
 use ply_prove::shrink::{candidates, minimal, size};
 use ply_prove::world::{Decl, World};
@@ -41,6 +41,30 @@ fn a_negative_outweighs_its_own_magnitude() {
     assert!(size(&Value::Int(5), &world) > size(&Value::Int(2), &world));
     // Saturating, so the boundary does not wrap the measure that terminates the walk.
     assert_eq!(size(&Value::Int(i64::MIN), &world), u64::MAX);
+}
+
+#[test]
+fn a_width_shrinks_toward_zero_and_stays_a_value_of_its_type() {
+    let world = World::default();
+    let fixed = |ty: IntTy, n: i128| Value::Fixed(Fixed::of(ty, n).expect("a value of the width"));
+    let offered = |v: &Value, t: &str| candidates(v, &con(t), &world);
+    assert_eq!(
+        offered(&fixed(IntTy::U8, 9), "U8"),
+        [0, 4, 2, 1, 8].map(|n| fixed(IntTy::U8, n))
+    );
+    // `128` is no `I8`, so the smallest byte offers no magnitude.
+    assert_eq!(
+        offered(&fixed(IntTy::I8, -128), "I8"),
+        [0, -64, -32, -16, -8, -4, -2, -1, -127].map(|n| fixed(IntTy::I8, n))
+    );
+    assert!(offered(&fixed(IntTy::U32, 0), "U32").is_empty());
+    // Past what an `Int` holds, the measure still orders the walk toward zero.
+    let top = fixed(IntTy::U64, i128::from(u64::MAX));
+    let halves = offered(&top, "U64");
+    assert_eq!(halves[0], fixed(IntTy::U64, 0));
+    assert_eq!(halves[1], fixed(IntTy::U64, i128::from(u64::MAX / 2)));
+    assert!(size(&top, &world) > size(&halves[1], &world));
+    assert!(size(&fixed(IntTy::I8, -5), &world) > size(&fixed(IntTy::I8, 5), &world));
 }
 
 #[test]

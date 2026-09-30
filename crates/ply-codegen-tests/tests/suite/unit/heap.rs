@@ -1,6 +1,6 @@
 use ply_codegen::heap::*;
 use ply_codegen::{list, map};
-use ply_eval::{Fields, Symbol, Value};
+use ply_eval::{Carry, CtorCarries, Fields, Fixed, IntTy, Symbol, Value};
 use std::sync::Arc;
 
 fn layouts() -> Layouts {
@@ -144,6 +144,55 @@ fn every_value_kind_round_trips() {
         let w = h.to_word(&l, &v);
         assert_eq!(Heap::to_value(&l, w), v, "{v:?}");
     }
+    h.end();
+}
+
+/// Below 64 bits a width is the immediate compiled code computes with, which reads back as the
+/// width only where its carry says so; at 64 bits it is the runtime's own object and says itself.
+#[test]
+fn a_width_crosses_as_the_word_compiled_code_holds_and_reads_back_by_its_carry() {
+    let mut h = Heap::new();
+    let l = layouts();
+    let ctors = CtorCarries::from([
+        (Symbol::new("Some"), vec![Carry::Var(0)]),
+        (Symbol::new("None"), vec![]),
+    ]);
+    let fixed = |ty: IntTy, n: i128| Value::Fixed(Fixed::of(ty, n).expect("a value of the width"));
+    let read = |w: Word, carry: &Carry| {
+        let mut walked = Walked::default();
+        let v = Heap::read(&l, w, carry, &ctors, &mut walked);
+        (v, walked.unread)
+    };
+    for (ty, n) in [
+        (IntTy::U8, 255),
+        (IntTy::I8, -128),
+        (IntTy::U16, 65_535),
+        (IntTy::I16, -300),
+        (IntTy::U32, 4_294_967_295),
+        (IntTy::I32, -2_147_483_648),
+    ] {
+        let w = h.to_word(&l, &fixed(ty, n));
+        assert_eq!(w, imm(n as i64), "{ty} {n}");
+        assert_eq!(read(w, &Carry::Width(ty)), (fixed(ty, n), false));
+        assert_eq!(read(w, &Carry::Plain), (Value::Int(n as i64), false));
+    }
+    for n in [i128::from(u64::MAX), 1 << 63, 0] {
+        let v = fixed(IntTy::U64, n);
+        let w = h.to_word(&l, &v);
+        assert!(!is_imm(w), "a `U64` is no immediate");
+        assert_eq!(read(w, &Carry::Plain), (v, false));
+    }
+    let bytes = Value::list(vec![fixed(IntTy::U8, 1), fixed(IntTy::U8, 200)]);
+    let w = h.to_word(&l, &bytes);
+    let carry = Carry::List(Box::new(Carry::Width(IntTy::U8)));
+    assert_eq!(read(w, &carry), (bytes, false));
+    let some = Value::ctor("Some", vec![fixed(IntTy::I16, -3)]);
+    let w = h.to_word(&l, &some);
+    let option = Carry::Sum(vec![Carry::Width(IntTy::I16)]);
+    assert_eq!(read(w, &option), (some, false));
+    // Nothing says whether this `Int` word is an `Int` or a width, and 300 is no `U8`.
+    assert!(read(imm(3), &Carry::Open).1);
+    assert!(read(imm(300), &Carry::Width(IntTy::U8)).1);
     h.end();
 }
 

@@ -460,6 +460,9 @@ pub struct Ctx {
     pub(crate) entry: u64,
     /// The host boundary: what a `perform` nothing on the stack answers reaches.
     pub(crate) binding: Arc<ply_eval::HostBinding>,
+    /// The program this context's entries run, whose declarations say how a host operation's
+    /// arguments read; `None` for one entered without its program's answer.
+    pub(crate) program: Option<&'static ply_eval::Front>,
     pub(crate) runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
     pub(crate) declared: Option<ply_eval::Footprint>,
     pub(crate) re_executed: bool,
@@ -517,6 +520,7 @@ impl Ctx {
             starting_detached: None,
             entry: 0,
             binding: Arc::new(ply_eval::HostBinding::hermetic()),
+            program: None,
             runtime: None,
             declared: None,
             re_executed: false,
