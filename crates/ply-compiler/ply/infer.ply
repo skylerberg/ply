@@ -155,6 +155,10 @@ type LabelApp = {
 }
 // What the emitter needs: the labels a call fills, in declaration order.
 pub type LabelSite = { module: Int, span: Span, labels: List<Bytes> }
+// The type an operator reads its operands at, which is all its meaning turns on: the name of a
+// type with no arguments, `""` for any other. A wrapping builtin's site is its name.
+pub type OperandSite = { module: Int, span: Span, ty: Bytes }
+type OperandAt = { module: Int, span: Span, ty: Type }
 type Assumed = { deriver: Deriver, vars: List<Int> }
 type SpawnSite = { span: Span, ty: Type }
 type HandoffSite = { span: Span, ty: Type, op: Bytes }
@@ -254,6 +258,7 @@ type Cx = {
   constraints: Map<Bytes, List<DefConstraint>>,
   numerics: List<Numeric>,
   bit_ops: List<BitOp>,
+  operands: List<OperandAt>,
   concats: List<ConcatSite>,
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
@@ -2334,6 +2339,10 @@ fn expect(cx: Cx, span: Span, expected: Type, found: Type, context: Bytes) -> { 
 fn note_bits(cx: Cx, span: Span, found: Type, what: Bytes) -> Cx =
   { ..cx, bit_ops: push(cx.bit_ops, { span: span, what: what, ty: found }) }
 
+// Resolved once the whole program is checked, so a variable here is read as what it settled to.
+fn note_operand(cx: Cx, span: Span, ty: Type) -> Cx =
+  { ..cx, operands: push(cx.operands, { module: cx.module, span: span, ty: ty }) }
+
 fn settle_bit_ops(cx: Cx) -> Cx = {
   let entries = cx.bit_ops;
   fold(entries, { ..cx, bit_ops: [] }, |c: Cx, entry: BitOp| {
@@ -2428,18 +2437,38 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
       let o: WithTy = new_ty(cx);
       { cx: o.cx, ty: o.t, row: row_empty() }
     },
-    EVar(v) -> infer_var(cx, v.name),
+    EVar(v) -> {
+      let o: Inferred = infer_var(cx, v.name);
+      // Called or passed as a value, a wrapping builtin wraps at its first parameter's type.
+      if !is_int_builtin(e) { o } else {
+        match o.ty {
+          TyFn(f) -> match list_at(f.params, 0) {
+            Some(t) -> { cx: note_operand(o.cx, v.span, t), ty: o.ty, row: o.row },
+            None -> o,
+          },
+          _ -> o,
+        }
+      }
+    },
     EUnary(u) -> {
       let o: Inferred = infer(cx, u.operand);
       if u.op == b"neg" {
         {
-          cx: { ..o.cx, numerics: push(o.cx.numerics, { span: u.span, op: b"sub", ty: o.ty }) },
+          cx: note_operand(
+            { ..o.cx, numerics: push(o.cx.numerics, { span: u.span, op: b"sub", ty: o.ty }) },
+            u.span,
+            o.ty,
+          ),
           ty: o.ty,
           row: o.row,
         }
       } else if u.op == b"bitnot" {
         {
-          cx: note_bits(o.cx, expr_span(u.operand), o.ty, b"the operand of `~`"),
+          cx: note_operand(
+            note_bits(o.cx, expr_span(u.operand), o.ty, b"the operand of `~`"),
+            u.span,
+            o.ty,
+          ),
           ty: o.ty,
           row: o.row,
         }
@@ -2812,7 +2841,9 @@ fn infer_binary(cx: Cx, span: Span, op: Bytes, lhs: Expr, rhs: Expr) -> Inferred
   let l: Inferred = infer(cx, lhs);
   let r: Inferred = infer(l.cx, rhs);
   let j: WithRow = join(r.cx, span, l.row, r.row);
-  let c: Cx = j.cx;
+  // A shift's operand is its left; every other operator here reads both sides at one type.
+  let c: Cx = if op == b"and" || op == b"or" || op == b"concat" { j.cx }
+  else { note_operand(j.cx, span, l.ty) };
   if is_arithmetic(op) || is_ordered(op) {
     let x: Expected = expect(
       c,
@@ -7113,6 +7144,7 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
     constraints: map_new(),
     numerics: [],
     bit_ops: [],
+    operands: [],
     concats: [],
     updates: [],
     update_shapes: [],
@@ -7182,8 +7214,13 @@ pub fn check_front_with(r: Resolved, mods: List<Mod>, known: Known) -> Front = {
 pub fn published_pure(d: DefInfo) -> Bool = len(d.footprint) == 0 && len(d.constraints) == 0
 
 // What the emitter needs from the checker: the definitions published pure, for its constant table,
-// the labels every call fills, and the shape of every record update.
-pub type EmitFacts = { pure: List<Bytes>, label_sites: List<LabelSite>, updates: List<UpdateShape> }
+// the labels every call fills, the shape of every record update, and every operator's operand type.
+pub type EmitFacts = {
+  pure: List<Bytes>,
+  label_sites: List<LabelSite>,
+  updates: List<UpdateShape>,
+  operands: List<OperandSite>,
+}
 
 // What the checker answers a lowering: the facts it asked for, or the diagnostics that stopped it.
 // The caller is the one that reports them, so the caller is the one that gets them.
@@ -7197,9 +7234,14 @@ pub fn emit_facts(r: Resolved, mods: List<Mod>) -> CheckedFacts = {
         if published_pure(d) { push(acc, d.name) } else { acc }),
       label_sites: out.cx.label_sites,
       updates: out.cx.update_shapes,
+      operands: map(out.cx.operands, |o: OperandAt|
+        { module: o.module, span: o.span, ty: operand_name(resolve(out.cx, o.ty)) }),
     })
   }
 }
+
+fn operand_name(t: Type) -> Bytes =
+  match t { TyCon(k) -> if len(k.args) == 0 { k.name } else { b"" }, _ -> b"" }
 
 // The record-update shapes of a checked program, for a caller that lowers bodies but emits no C.
 pub fn update_shapes(r: Resolved, mods: List<Mod>) -> Option<List<UpdateShape>> = {

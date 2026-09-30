@@ -12,7 +12,7 @@ import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, Ty
 import resolve (Mod, Source, Resolved_, Failed, Diag, resolve_modules, Resolved, Scope, Binding,
                 ModBind, Pkg, resolve_packaged, no_pkgs, default_binder, find_modbind, qualify)
 import derive (expand_derives)
-import infer (emit_facts, Facts, Refuses, LabelSite, expanded_mods, sccs)
+import infer (emit_facts, Facts, Refuses, LabelSite, OperandSite, expanded_mods, sccs)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock,
               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EWithCell, HandleClause,
               MatchArm, RecField, Stmt, SLet, SExpr)
@@ -76,8 +76,25 @@ fn as_num(v: V, w: Width) -> Bytes =
 // An emitted value: the kind it is held at and the C expression naming it.
 pub type V = { k: Kind, c: Bytes, ty: Ty }
 
-// `TyOpaque` is a `Float` or `Decimal`: operators on it go through the runtime, never through `Int`.
-pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyOpaque
+pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList
+
+// The type the checker settled an operator's operands at, which alone decides what the operator
+// means; how an operand happens to be held only decides how it is read. `OWord` is read by the
+// runtime's own operators: `Float`, `Decimal`, and whatever `==` compares structurally.
+type Operand = | OInt | OBool | OWidth(Width) | OWord
+
+// `None` where the checker settled no type, which it does for every operator of a checked program.
+fn operand_at(em: Em, s: Span) -> Option<Operand> =
+  match map_get(em.operands, span_key(s)) {
+    None -> None,
+    Some(name) -> if name == unsettled() { None }
+    else if name == b"Int" { Some(OInt) }
+    else if name == b"Bool" { Some(OBool) }
+    else { match width_named(name) { Some(w) -> Some(OWidth(w)), None -> Some(OWord) } },
+  }
+
+fn unsettled_operator(em: Em, what: Bytes) -> Out =
+  refused(em, bytes_concat(b"an operator the checker settled no operand type for: ", what))
 
 // Fields in written order; a field's kind decides whether reading it unboxes, so it must not default to `KInt`.
 pub type FieldTy = { name: Bytes, k: Kind, ty: Ty }
@@ -144,6 +161,8 @@ pub type Em = {
   bound: List<Bytes>,
   // The full names of the definitions sharing this C function, in case order; empty outside a group.
   group: List<Bytes>,
+  // The checker's operand type at each operator's site, as `operand_at` reads it.
+  operands: Map<Bytes, Bytes>,
 }
 
 // `ret_ty` keeps a record answer's fields so later reads get offsets; `pure` lets a nullary call come from the constant table.
@@ -224,6 +243,7 @@ fn line(em: Em, text: Bytes) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn at<a>(xs: List<a>, i: Int) -> a =
@@ -270,6 +290,7 @@ fn indent(em: Em) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn outdent(em: Em) -> Em =
@@ -311,6 +332,7 @@ fn outdent(em: Em) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 // Restoring the node's own `tail` makes an arm a tail again after its scrutinee or condition.
@@ -354,6 +376,7 @@ fn withtail(em: Em, t: Bool) -> Em =
       pinned: em.pinned,
       bound: em.bound,
       group: em.group,
+      operands: em.operands,
     }
   }
 
@@ -397,6 +420,7 @@ fn notail(em: Em) -> Em =
       pinned: em.pinned,
       bound: em.bound,
       group: em.group,
+      operands: em.operands,
     }
   }
 
@@ -440,6 +464,7 @@ fn rescope(em: Em, conv: List<Conv>) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn fresh(em: Em) -> { em: Em, name: Bytes } =
@@ -482,6 +507,7 @@ fn fresh(em: Em) -> { em: Em, name: Bytes } =
       pinned: em.pinned,
       bound: em.bound,
       group: em.group,
+      operands: em.operands,
     },
     name: bytes_concat(b"t", num(em.n + 1)),
   }
@@ -627,6 +653,7 @@ fn with_reads(em: Em, reads: List<Int>) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn with_out(em: Em, out: List<Bytes>) -> Em =
@@ -668,6 +695,7 @@ fn with_out(em: Em, out: List<Bytes>) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn with_landing(em: Em, landing: Option<Bytes>) -> Em =
@@ -709,6 +737,7 @@ fn with_landing(em: Em, landing: Option<Bytes>) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn note_performs(em: Em, eff: Bytes) -> Em =
@@ -750,6 +779,7 @@ fn note_performs(em: Em, eff: Bytes) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn note_handles(em: Em, eff: Bytes) -> Em =
@@ -791,6 +821,7 @@ fn note_handles(em: Em, eff: Bytes) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn note_deferred(em: Em, d: Deferred) -> Em = note_holder(note_deferred0(em, d), d.name)
@@ -834,6 +865,7 @@ fn note_deferred0(em: Em, d: Deferred) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 // A flat record (all widths or `Bool`) built from locals is held back; others are built now, from a reuse token if one fits.
@@ -998,6 +1030,7 @@ fn note_alias(em: Em, local: Bytes, root: Bytes) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 // Charge a slot's reads to the object the local holds, once per (object, slot).
@@ -1047,6 +1080,7 @@ fn charge(em: Em, slot: Int, local: Bytes) -> Em = {
       pinned: em.pinned,
       bound: em.bound,
       group: em.group,
+      operands: em.operands,
     }
   }
 }
@@ -1118,6 +1152,7 @@ fn poison(em: Em, why: Bytes) -> Em =
         pinned: em.pinned,
         bound: em.bound,
         group: em.group,
+        operands: em.operands,
       },
   }
 
@@ -1172,6 +1207,7 @@ fn lambda_of(em: Em, sym: Bytes) -> { em: Em, i: Int } =
           pinned: em.pinned,
           bound: em.bound,
           group: em.group,
+          operands: em.operands,
         },
         i: len(em.lambdas),
       },
@@ -1216,6 +1252,7 @@ fn note_call(em: Em, full: Bytes) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn spend_made(em: Em, name: Bytes) -> Em =
@@ -1661,11 +1698,6 @@ fn all_read(xs: List<Code>) -> List<Int> =
 fn concat(a: List<Int>, b: List<Int>) -> List<Int> =
   fold(b, a, |acc: List<Int>, x: Int| push(acc, x))
 
-fn opaque_from_table(em: Em, l: Lit) -> Out = {
-  let o = from_table(em, l);
-  { em: o.em, v: { k: KBoxed, c: o.v.c, ty: TyOpaque } }
-}
-
 fn from_table(em: Em, l: Lit) -> Out = {
   let c = const_of(em, l);
   let o = bind(c.em, KBoxed, bytes_concat_all([b"rt_lit_p(ctx, @@c", num(c.i), b"@@)"]));
@@ -1713,6 +1745,7 @@ fn const_of(em: Em, l: Lit) -> { em: Em, i: Int } =
       pinned: em.pinned,
       bound: em.bound,
       group: em.group,
+      operands: em.operands,
     },
     i: len(em.consts),
   }
@@ -2555,16 +2588,62 @@ fn int_of_width(name: Bytes) -> Option<Width> =
   else if name == b"int_of_i64" { width_named(b"I64") }
   else { None }
 
-// Wrapping arithmetic and conversions over a carried width, in place; otherwise the runtime's call on the evaluated values.
+fn is_width_builtin(name: Bytes) -> Bool =
+  is_wrap(name) || of_int_width(name) != None || int_of_width(name) != None
+
+// A width builtin used as a value is a lambda around its own call, so the call is compiled at the
+// type the checker settled, as a direct one is: the runtime's builtin would read the words untyped.
+fn width_closure(c: Code, name: Bytes) -> Code = {
+  let n = if is_wrap(name) { 2 } else { 1 };
+  let at = |node: Node| { own: Borrowed, node: node, span: c.span };
+  at(
+    NLambda({
+      params: n,
+      size: n,
+      caps: [],
+      body: at(
+        NApp({
+          func: at(NVar({ name: name, slot: None })),
+          args: map(range(0, n), |i: Int|
+            at(NVar({ name: bytes_concat(b"p", num(i)), slot: Some(i) }))),
+        }),
+      ),
+    }),
+  )
+}
+
+// Wrapping arithmetic and conversions over a carried width, in place; otherwise the runtime's call on
+// the evaluated values. The wrapping family wraps at the type the checker settled at `at`, its name.
 fn width_builtin(
   em: Em,
   name: Bytes,
   args: List<Code>,
   params: List<P>,
   span: Span,
+  at: Span,
 ) -> Option<Out> =
-  if !((is_wrap(name) && len(args) == 2)
-      || ((of_int_width(name) != None || int_of_width(name) != None) && len(args) == 1)) { None }
+  if is_wrap(name) && len(args) == 2 {
+    match operand_at(em, at) {
+      None -> Some(unsettled_operator(em, name)),
+      Some(t) -> match args_evaled(em, args, params, 0, []) {
+        None -> None,
+        Some(e0) -> match list_at(e0.vals, 0) {
+          None -> None,
+          Some(v0) -> match list_at(e0.vals, 1) {
+            None -> None,
+            Some(v1) -> {
+              let e = site(e0.em, span);
+              match t {
+                OWidth(w) -> if carried(w) { Some(wrapped(e, name, v0, v1, w)) }
+                else { Some(builtin_call(e, name, e0.vals)) },
+                _ -> Some(builtin_call(e, name, e0.vals)),
+              }
+            },
+          },
+        },
+      },
+    }
+  } else if !((of_int_width(name) != None || int_of_width(name) != None) && len(args) == 1) { None }
   else {
     match args_evaled(em, args, params, 0, []) {
       None -> None,
@@ -2572,126 +2651,111 @@ fn width_builtin(
         None -> None,
         Some(v0) -> {
           let e = { em: site(e0.em, span), vals: e0.vals };
-          if is_wrap(name) {
-            match v0.k {
-              KNum(t) -> match list_at(e.vals, 1) {
-                None -> None,
-                Some(v1) -> {
-                  let u = utype(t);
-                  let a = as_num(v0, t);
-                  if name == b"rotr" {
-                    let n = as_int(v1);
-                    let k = bind(
-                      e.em,
-                      KInt,
-                      bytes_concat_all([
-                        b"((",
-                        n,
-                        b") % ",
-                        num(t.bits),
-                        b" + ",
-                        num(t.bits),
-                        b") % ",
-                        num(t.bits),
-                      ]),
-                    );
-                    Some(
-                      bind(
-                        k.em,
-                        KNum(t),
-                        bytes_concat_all([
-                          b"(",
-                          u,
-                          b")(",
-                          k.v.c,
-                          b" == 0 ? (",
-                          u,
-                          b")(",
-                          a,
-                          b") : ((",
-                          u,
-                          b")(",
-                          a,
-                          b") >> ",
-                          k.v.c,
-                          b") | ((",
-                          u,
-                          b")(",
-                          a,
-                          b") << (",
-                          num(t.bits),
-                          b" - ",
-                          k.v.c,
-                          b")))",
-                        ]),
-                      ),
-                    )
-                  } else {
-                    let n = as_num(v1, t);
-                    let c = if name == b"wrap_add" { b"+" }
-                    else if name == b"wrap_sub" { b"-" }
-                    else { b"*" };
-                    Some(
-                      bind(
-                        e.em,
-                        KNum(t),
-                        bytes_concat_all([
-                          b"(",
-                          u,
-                          b")((",
-                          u,
-                          b")(",
-                          a,
-                          b") ",
-                          c,
-                          b" (",
-                          u,
-                          b")(",
-                          n,
-                          b"))",
-                        ]),
-                      ),
-                    )
-                  }
-                },
-              },
-              _ -> Some(builtin_call(e.em, name, e.vals)),
-            }
-          } else {
-            match of_int_width(name) {
-              Some(t) -> if carried(t) {
-                let held = bind(e.em, KInt, as_int(v0));
-                let g = line(
-                  held.em,
-                  bytes_concat_all([
-                    b"if (",
-                    held.v.c,
-                    b" < ",
-                    int_lit(width_min(t)),
-                    b" || ",
-                    held.v.c,
-                    b" > ",
-                    int_lit(width_max(t)),
-                    b") { rt_not_that_width_p(ctx, ",
-                    num(width_index(t)),
-                    b", ",
-                    held.v.c,
-                    b"); return 0; }",
-                  ]),
-                );
-                Some(bind(g, KNum(t), bytes_concat_all([b"(", ctype(KNum(t)), b")", held.v.c])))
-              } else { Some(builtin_call(e.em, name, e.vals)) },
-              None -> match int_of_width(name) {
-                Some(t) -> if carried(t) { Some(bind(e.em, KInt, as_int(v0))) }
-                else { Some(builtin_call(e.em, name, e.vals)) },
-                None -> None,
-              },
-            }
+          match of_int_width(name) {
+            Some(t) -> if carried(t) {
+              let held = bind(e.em, KInt, as_int(v0));
+              let g = line(
+                held.em,
+                bytes_concat_all([
+                  b"if (",
+                  held.v.c,
+                  b" < ",
+                  int_lit(width_min(t)),
+                  b" || ",
+                  held.v.c,
+                  b" > ",
+                  int_lit(width_max(t)),
+                  b") { rt_not_that_width_p(ctx, ",
+                  num(width_index(t)),
+                  b", ",
+                  held.v.c,
+                  b"); return 0; }",
+                ]),
+              );
+              Some(bind(g, KNum(t), bytes_concat_all([b"(", ctype(KNum(t)), b")", held.v.c])))
+            } else { Some(builtin_call(e.em, name, e.vals)) },
+            None -> match int_of_width(name) {
+              Some(t) -> if carried(t) { Some(bind(e.em, KInt, as_int(v0))) }
+              else { Some(builtin_call(e.em, name, e.vals)) },
+              None -> None,
+            },
           }
         },
       },
     }
   }
+
+fn wrapped(em: Em, name: Bytes, v0: V, v1: V, t: Width) -> Out = {
+  let u = utype(t);
+  let a = as_num(v0, t);
+  if name == b"rotr" {
+    let k = bind(
+      em,
+      KInt,
+      bytes_concat_all([
+        b"((",
+        as_int(v1),
+        b") % ",
+        num(t.bits),
+        b" + ",
+        num(t.bits),
+        b") % ",
+        num(t.bits),
+      ]),
+    );
+    bind(
+      k.em,
+      KNum(t),
+      bytes_concat_all([
+        b"(",
+        u,
+        b")(",
+        k.v.c,
+        b" == 0 ? (",
+        u,
+        b")(",
+        a,
+        b") : ((",
+        u,
+        b")(",
+        a,
+        b") >> ",
+        k.v.c,
+        b") | ((",
+        u,
+        b")(",
+        a,
+        b") << (",
+        num(t.bits),
+        b" - ",
+        k.v.c,
+        b")))",
+      ]),
+    )
+  } else {
+    let c = if name == b"wrap_add" { b"+" } else if name == b"wrap_sub" { b"-" } else { b"*" };
+    // Below 32 bits C would promote the operands to `int`, where a product can overflow.
+    bind(
+      em,
+      KNum(t),
+      bytes_concat_all([
+        b"(",
+        u,
+        b")((uint64_t)(",
+        u,
+        b")(",
+        a,
+        b") ",
+        c,
+        b" (uint64_t)(",
+        u,
+        b")(",
+        as_num(v1, t),
+        b"))",
+      ]),
+    )
+  }
+}
 
 // A kind test: the header's field (or a bounds-tested byte) fast, the runtime's call slow, which raises on a wrong kind.
 fn kind_tested(em: Em, name: Bytes, v: V, index: Option<V>) -> Out = {
@@ -2988,6 +3052,7 @@ fn builtin_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
           pinned: em.pinned,
           bound: em.bound,
           group: em.group,
+          operands: em.operands,
         },
         i: len(em.met),
       },
@@ -3044,16 +3109,19 @@ fn args_owned(
   i: Int,
   acc: List<Bytes>,
 ) -> Option<{ em: Em, names: List<Bytes> }> =
-  match args_owned_typed(em, xs, params, i, acc) {
+  match args_evaled(em, xs, params, i, []) {
     None -> None,
-    Some(w) -> Some({ em: w.em, names: w.names }),
+    Some(e) ->
+      Some(
+        fold(e.vals, { em: e.em, names: acc }, |a: { em: Em, names: List<Bytes> }, v: V| {
+          let w = owned(a.em, v);
+          { em: w.em, names: push(a.names, w.v.c) }
+        }),
+      ),
   }
 
-// A builtin with no helper goes through the runtime by this body's index for it; the answer is opaque when any argument was.
+// A builtin with no helper goes through the runtime by this body's index for it.
 fn builtin_call(em: Em, name: Bytes, vals: List<V>) -> Out = {
-  // A conversion into an uncarried width answers a word operators must not unbox as `Int`.
-  let widened = match of_int_width(name) { Some(t) -> !carried(t), None -> false };
-  let opaque = widened || fold(vals, false, |acc: Bool, v: V| acc || v.ty == TyOpaque);
   let w = fold(vals, { em: em, names: [] }, |a: { em: Em, names: List<Bytes> }, v: V| {
     let o = owned(a.em, v);
     { em: o.em, names: push(a.names, o.v.c) }
@@ -3070,10 +3138,9 @@ fn builtin_call(em: Em, name: Bytes, vals: List<V>) -> Out = {
       b"};",
     ]),
   );
-  let o = bind_keeping(
+  let o = bind(
     e,
     KBoxed,
-    if opaque { TyOpaque } else { TyOpen },
     bytes_concat_all([
       b"rt_builtin_p(ctx, @@b",
       num(bi.i),
@@ -3086,30 +3153,6 @@ fn builtin_call(em: Em, name: Bytes, vals: List<V>) -> Out = {
   );
   { em: check(o.em), v: o.v }
 }
-
-fn args_owned_typed(
-  em: Em,
-  xs: List<Code>,
-  params: List<P>,
-  i: Int,
-  acc: List<Bytes>,
-) -> Option<{ em: Em, names: List<Bytes>, opaque: Bool }> =
-  match args_evaled(em, xs, params, i, []) {
-    None -> None,
-    Some(e) -> {
-      let opaque = fold(e.vals, false, |acc2: Bool, v: V| acc2 || v.ty == TyOpaque);
-      Some(
-        fold(
-          e.vals,
-          { em: e.em, names: acc, opaque: opaque },
-          |a: { em: Em, names: List<Bytes>, opaque: Bool }, v: V| {
-            let w = owned(a.em, v);
-            { em: w.em, names: push(a.names, w.v.c), opaque: a.opaque }
-          },
-        ),
-      )
-    },
-  }
 
 // Whatever the callee evaluates to, called through the runtime: the callee is duplicated, then each argument as evaluated.
 fn call_value(em: Em, func: Code, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
@@ -3242,6 +3285,7 @@ fn emit_lambda(
     pinned: [],
     bound: [],
     group: em.group,
+    operands: em.operands,
   };
   let charged = fold(window, start, |acc: Em, w: Conv|
     note_bound(note_holder(charge(acc, w.slot, w.c), w.c), w.c));
@@ -3381,6 +3425,7 @@ fn field_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
           pinned: em.pinned,
           bound: em.bound,
           group: em.group,
+          operands: em.operands,
         },
         i: len(em.fields),
       },
@@ -3435,6 +3480,7 @@ fn remember_built(em: Em, local: Bytes, names: List<Bytes>, vals: List<V>) -> Em
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn shape_of(em: Em, names: List<Bytes>) -> { em: Em, i: Int } =
@@ -3484,6 +3530,7 @@ fn shape_of(em: Em, names: List<Bytes>) -> { em: Em, i: Int } =
           pinned: em.pinned,
           bound: em.bound,
           group: em.group,
+          operands: em.operands,
         },
         i: len(em.shapes),
       },
@@ -3547,6 +3594,7 @@ fn note_tok(em: Em, w: Int) -> Em =
       pinned: em.pinned,
       bound: em.bound,
       group: em.group,
+      operands: em.operands,
     }
   }
 
@@ -3589,6 +3637,7 @@ fn note_released(em: Em, root: Bytes) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 fn count_of(reads: List<Int>, slot: Int) -> Int =
@@ -3655,7 +3704,8 @@ fn binary_code(op: Bytes) -> Int =
   else if op == b"bitor" { 13 }
   else if op == b"bitxor" { 14 }
   else if op == b"shl" { 15 }
-  else { 16 }
+  else if op == b"shr" { 16 }
+  else { 17 }
 
 fn is_add_or_sub(op: Bytes) -> Bool = op == b"add" || op == b"sub"
 
@@ -3709,9 +3759,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         } else { Some(from_table(em, l)) },
       },
       LUnit -> Some(from_table(em, l)),
-      // A `Float` or `Decimal` is an opaque runtime constant; every operator over it goes through the runtime.
-      LFloat(_) -> Some(opaque_from_table(em, l)),
-      LDec(_) -> Some(opaque_from_table(em, l)),
+      LFloat(_) -> Some(from_table(em, l)),
+      LDec(_) -> Some(from_table(em, l)),
       _ -> Some(refused(em, b"a literal this port does not pool")),
     },
     NVar(v) -> match v.slot {
@@ -3749,7 +3798,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
             );
             Some({ em: note_made(check(o.em), o.v.c), v: o.v })
           },
-          None -> if fold(em.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == v.name) {
+          None -> if is_width_builtin(v.name) { expr(em, width_closure(c, v.name), params) }
+          else if fold(em.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == v.name) {
             let bi = builtin_of(em, v.name);
             let o = bind(
               bi.em,
@@ -3832,17 +3882,21 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
             && !is_shift(b.op) {
           Some(refused(em, bytes_concat(b"an operator this port does not emit: ", b.op)))
         } else {
-          match secured(expr(notail(em), b.lhs, params)) {
-            None -> None,
-            Some(l) -> match expr(notail(l.em), b.rhs, params) {
+          match operand_at(em, c.span) {
+            None -> Some(unsettled_operator(em, b.op)),
+            Some(t) -> match secured(expr(notail(em), b.lhs, params)) {
               None -> None,
-              Some(r) ->
-                binary_rest(
-                  if is_arith(b.op) || is_shift(b.op) { site(r.em, c.span) } else { r.em },
-                  b.op,
-                  l.v,
-                  r.v,
-                ),
+              Some(l) -> match expr(notail(l.em), b.rhs, params) {
+                None -> None,
+                Some(r) ->
+                  binary_rest(
+                    if is_arith(b.op) || is_shift(b.op) { site(r.em, c.span) } else { r.em },
+                    b.op,
+                    l.v,
+                    r.v,
+                    t,
+                  ),
+              },
             },
           }
         },
@@ -3862,62 +3916,21 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         },
       },
     },
-    NUnary(u) -> match expr(notail(em), u.operand, params) {
-      None -> None,
-      Some(o) -> if u.op == b"not" {
-        Some(bind(o.em, KBool, bytes_concat_all([b"!(", as_bool(o.v), b")"])))
-      } else if u.op == b"neg" {
-        match o.v.k {
-          // A width negates wide and narrows back, under the same guard as a subtraction.
-          KNum(w) ->
-            narrow(
-              bind(
-                site(o.em, c.span),
-                KInt,
-                bytes_concat_all([b"-(int64_t)(", as_num(o.v, w), b")"]),
-              ),
-              w,
-              2,
-            ),
-          // A word may be a `Float` or `Decimal`: negate through the runtime.
-          KBoxed -> {
-            let held = owned(o.em, o.v);
-            let out = bind_keeping(
-              site(held.em, c.span),
-              KBoxed,
-              o.v.ty,
-              bytes_concat_all([b"rt_negate_p(ctx, ", held.v.c, b")"]),
-            );
-            Some({ em: check(out.em), v: out.v })
-          },
-          _ -> {
-            // Negation overflows at one input; the guard runs before the value exists (code 2, `rt_arith_p`'s numbering).
-            let a = as_int(o.v);
-            let g = line(
-              site(o.em, c.span),
-              bytes_concat_all([
-                b"if (",
-                a,
-                b" == INT64_MIN) { rt_overflow_p(ctx, 2); return 0; }",
-              ]),
-            );
-            Some(bind(g, KInt, bytes_concat_all([b"-(", a, b")"])))
-          },
-        }
-      } else if u.op == b"bitnot" {
-        match o.v.k {
-          KNum(w) ->
-            Some(
-              bind(
-                o.em,
-                KNum(w),
-                bytes_concat_all([b"(", ctype(KNum(w)), b") ~(", as_num(o.v, w), b")"]),
-              ),
-            ),
-          _ -> Some(bind(o.em, KInt, bytes_concat_all([b"~(", as_int(o.v), b")"]))),
-        }
-      } else { None },
-    },
+    NUnary(u) -> if u.op == b"not" {
+      match expr(notail(em), u.operand, params) {
+        None -> None,
+        Some(o) -> Some(bind(o.em, KBool, bytes_concat_all([b"!(", as_bool(o.v), b")"]))),
+      }
+    } else if u.op == b"neg" || u.op == b"bitnot" {
+      match operand_at(em, c.span) {
+        None -> Some(unsettled_operator(em, u.op)),
+        Some(t) -> match expr(notail(em), u.operand, params) {
+          None -> None,
+          Some(o) -> if u.op == b"neg" { negated(o.em, o.v, t, c.span) }
+          else { inverted(o.em, o.v, t) },
+        },
+      }
+    } else { None },
     // A lambda is a closure and also a function written after the one that builds it.
     // A nested lambda is one more of the owner's: numbered after its container, its entry interned before its body.
     NLambda(l) -> {
@@ -3984,6 +3997,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                 pinned: e.pinned,
                 bound: e.bound,
                 group: e.group,
+                operands: e.operands,
               };
               let o = bind(
                 grown,
@@ -4329,7 +4343,14 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                     Some(o) -> Some(o),
                     None -> match position_call(em, fv.name, a.args, params, c.span) {
                       Some(o) -> Some(o),
-                      None -> match width_builtin(em, fv.name, a.args, params, c.span) {
+                      None -> match width_builtin(
+                          em,
+                          fv.name,
+                          a.args,
+                          params,
+                          c.span,
+                          a.func.span,
+                        ) {
                         Some(o) -> Some(o),
                         None -> match inline_len(em, fv.name, a.args, params, c.span) {
                           Some(o) -> Some(o),
@@ -4558,6 +4579,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                         pinned: js.em.pinned,
                         bound: js.em.bound,
                         group: js.em.group,
+                        operands: js.em.operands,
                       },
                       names,
                       js.names,
@@ -4604,6 +4626,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                         pinned: e.em.pinned,
                         bound: e.em.bound,
                         group: e.em.group,
+                        operands: e.em.operands,
                       },
                       bytes_concat_all([ctype(kt), b" ", j.name, b" = 0;"]),
                     );
@@ -4662,6 +4685,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                       pinned: fin.pinned,
                       bound: fin.bound,
                       group: fin.group,
+                      operands: fin.operands,
                     };
                     Some({
                       em: if kt == KBoxed { note_holder(fin_em, j.name) } else { fin_em },
@@ -5861,6 +5885,7 @@ fn blank(em: Em) -> Em =
     pinned: em.pinned,
     bound: em.bound,
     group: em.group,
+    operands: em.operands,
   }
 
 // The shape both arms answer when both built a record of the same shape; otherwise the join is one local.
@@ -5950,7 +5975,14 @@ fn is_shift(op: Bytes) -> Bool = op == b"shl" || op == b"shr" || op == b"ushr"
 fn bitop_c(op: Bytes) -> Bytes =
   if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else { b"^" }
 
-// `code` is `rt_overflow_p`'s: 0 an addition, 1 a subtraction, 2 a negation.
+// `rt_overflow`'s numbering of the operation that overflowed; a remainder never leaves its width.
+fn overflow_code(op: Bytes) -> Int =
+  if op == b"add" { 0 }
+  else if op == b"sub" { 1 }
+  else if op == b"neg" { 2 }
+  else if op == b"mul" { 3 }
+  else { 4 }
+
 fn narrow(wide: Out, w: Width, code: Int) -> Option<Out> = {
   let g = line(
     wide.em,
@@ -5970,6 +6002,56 @@ fn narrow(wide: Out, w: Width, code: Int) -> Option<Out> = {
   );
   Some(bind(g, KNum(w), bytes_concat_all([b"(", ctype(KNum(w)), b")", wide.v.c])))
 }
+
+fn negated(em: Em, v: V, t: Operand, s: Span) -> Option<Out> =
+  match t {
+    // A width negates wide and narrows back, under the same guard as a subtraction.
+    OWidth(w) -> if carried(w) {
+      narrow(
+        bind(site(em, s), KInt, bytes_concat_all([b"-(int64_t)(", as_num(v, w), b")"])),
+        w,
+        overflow_code(b"neg"),
+      )
+    } else { negated_by_runtime(em, v, s) },
+    OInt -> {
+      // Negation overflows at one input; the guard runs before the value exists.
+      let a = as_int(v);
+      let g = line(
+        site(em, s),
+        bytes_concat_all([
+          b"if (",
+          a,
+          b" == INT64_MIN) { rt_overflow_p(ctx, ",
+          num(overflow_code(b"neg")),
+          b"); return 0; }",
+        ]),
+      );
+      Some(bind(g, KInt, bytes_concat_all([b"-(", a, b")"])))
+    },
+    _ -> negated_by_runtime(em, v, s),
+  }
+
+fn negated_by_runtime(em: Em, v: V, s: Span) -> Option<Out> = {
+  let held = owned(em, v);
+  let out = bind(
+    site(held.em, s),
+    KBoxed,
+    bytes_concat_all([b"rt_negate_p(ctx, ", held.v.c, b")"]),
+  );
+  Some({ em: check(out.em), v: out.v })
+}
+
+fn inverted(em: Em, v: V, t: Operand) -> Option<Out> =
+  match t {
+    OWidth(w) -> if carried(w) {
+      Some(bind(em, KNum(w), bytes_concat_all([b"(", ctype(KNum(w)), b") ~(", as_num(v, w), b")"])))
+    } else {
+      // The runtime has no `~`, so every bit is turned over by `^` with the width's own `-1`.
+      let ones = from_table(em, LFixed(if w.signed { b"I64" } else { b"U64" }, 0 - 1));
+      word_binary(ones.em, b"bitxor", v, ones.v)
+    },
+    _ -> Some(bind(em, KInt, bytes_concat_all([b"~(", as_int(v), b")"]))),
+  }
 
 // The count is tested against the width (64 for `Int`), and the shift done unsigned where C would leave it undefined.
 fn shift(em: Em, op: Bytes, l: V, r: V, width: Option<Width>) -> Out = {
@@ -6034,7 +6116,7 @@ fn width_binary(em: Em, op: Bytes, l: V, r: V, t: Width) -> Option<Out> = {
       );
       { em: check(w.em), v: w.v }
     };
-    narrow(wide, t, if op == b"sub" { 1 } else { 0 })
+    narrow(wide, t, overflow_code(op))
   } else if is_bitop(op) {
     Some(bind(em, KNum(t), bytes_concat_all([b"(", a, b") ", bitop_c(op), b" (", bb, b")"])))
   } else if is_shift(op) { Some(shift(em, op, l, r, Some(t))) }
@@ -6048,85 +6130,84 @@ fn width_binary(em: Em, op: Bytes, l: V, r: V, t: Width) -> Option<Out> = {
   }
 }
 
-// A width on either side decides the whole operator; otherwise `Int` and `Bool` equality are C's own, and words go through the runtime.
-fn binary_rest(em: Em, op: Bytes, l: V, r: V) -> Option<Out> = {
-  let width = match l.k { KNum(t) -> Some(t), _ -> match r.k { KNum(t) -> Some(t), _ -> None } };
-  match width {
-    Some(t) -> width_binary(em, op, l, r, t),
-    None -> {
-      let native = (l.k == KInt && r.k == KInt) || (l.k == KBool && r.k == KBool);
-      // Equality over words goes through the runtime: C's `==` would compare pointers and answer no for equal values.
-      if (op == b"eq" || op == b"ne") && !native {
-        // Under release both are handed over as held, and a temporary among them is released at its scope's end.
-        let lo = if em.release {
-          let w = word_of(em, l);
-          { em: w.em, v: { k: KBoxed, c: w.c, ty: l.ty } }
-        } else { owned(em, l) };
-        let ro = if lo.em.release {
-          let w = word_of(lo.em, r);
-          { em: w.em, v: { k: KBoxed, c: w.c, ty: r.ty } }
-        } else { owned(lo.em, r) };
-        let e = bind(
-          ro.em,
+// The operand type decides the whole operator, wherever the operands came from.
+fn binary_rest(em: Em, op: Bytes, l: V, r: V, t: Operand) -> Option<Out> =
+  match t {
+    OInt -> Some(int_binary(em, op, l, r)),
+    OWidth(w) -> if carried(w) { width_binary(em, op, l, r, w) } else { word_binary(em, op, l, r) },
+    OBool -> if op == b"eq" || op == b"ne" {
+      Some(
+        bind(
+          em,
           KBool,
-          bytes_concat_all([b"rt_equal_p(ctx, ", lo.v.c, b", ", ro.v.c, b")"]),
-        );
-        // For `!=` the answer's binding is the negation.
-        Some(
-          bind(check(e.em), KBool, if op == b"ne" { bytes_concat_all([b"!(", e.v.c, b")"]) }
-          else { e.v.c }),
-        )
-      } else if is_shift(op) && (l.ty == TyOpaque || r.ty == TyOpaque) {
-        Some(refused(em, b"`a shift` over a value whose type the fragment does not fix"))
-      } else if (l.k == KBoxed && r.k == KBoxed && (is_arith(op) || compare_op(op) != None))
-          || (is_bitop(op) && (l.ty == TyOpaque || r.ty == TyOpaque)) {
-        {
-          // A `Float`/`Decimal` operand, or two words that may both be `Decimal`s: the runtime's own operator. One operand in a register means both are checked `Int`s.
-          let lo = owned(em, l);
-          let ro = owned(lo.em, r);
-          // A comparison answers `Bool`, an opaque left operand answers opaque, and otherwise the right's type.
-          let o = bind_keeping(
-            ro.em,
-            KBoxed,
-            if compare_op(op) != None { TyOpen }
-            else if l.ty == TyOpaque { TyOpaque }
-            else { r.ty },
-            bytes_concat_all([
-              b"rt_binary_p(ctx, ",
-              num(binary_code(op)),
-              b", ",
-              lo.v.c,
-              b", ",
-              ro.v.c,
-              b")",
-            ]),
-          );
-          Some({ em: check(o.em), v: o.v })
-        }
-      } else if is_shift(op) { Some(shift(em, op, l, r, None)) } else if is_bitop(op) {
-        Some(
-          bind(
-            em,
-            KInt,
-            bytes_concat_all([b"(", as_int(l), b") ", bitop_c(op), b" (", as_int(r), b")"]),
-          ),
-        )
-      } else {
-        let a = { k: KInt, c: as_int(l), ty: TyOpen };
-        let bb = { k: KInt, c: as_int(r), ty: TyOpen };
-        match compare_op(op) {
-          Some(c) ->
-            Some(
-              bind(em, KBool, if op == b"ne" {
-                bytes_concat_all([b"!((", a.c, b") == (", bb.c, b"))"])
-              } else { bytes_concat_all([b"(", a.c, b") ", c, b" (", bb.c, b")"]) }),
-            ),
-          None -> Some(arithmetic(em, op, a, bb)),
-        }
-      }
-    },
+          bytes_concat_all([
+            if op == b"ne" { b"!((" } else { b"((" },
+            as_bool(l),
+            b") == (",
+            as_bool(r),
+            b"))",
+          ]),
+        ),
+      )
+    } else { Some(unsettled_operator(em, op)) },
+    OWord -> word_binary(em, op, l, r),
   }
-}
+
+fn int_binary(em: Em, op: Bytes, l: V, r: V) -> Out =
+  if is_shift(op) { shift(em, op, l, r, None) } else if is_bitop(op) {
+    bind(em, KInt, bytes_concat_all([b"(", as_int(l), b") ", bitop_c(op), b" (", as_int(r), b")"]))
+  } else {
+    let a = { k: KInt, c: as_int(l), ty: TyOpen };
+    let bb = { k: KInt, c: as_int(r), ty: TyOpen };
+    match compare_op(op) {
+      Some(c) ->
+        bind(em, KBool, if op == b"ne" { bytes_concat_all([b"!((", a.c, b") == (", bb.c, b"))"]) }
+        else { bytes_concat_all([b"(", a.c, b") ", c, b" (", bb.c, b")"]) }),
+      None -> arithmetic(em, op, a, bb),
+    }
+  }
+
+// Equality is structural, and every other operator is the runtime's own over the words, which a
+// 64-bit width, a `Float` and a `Decimal` are.
+fn word_binary(em: Em, op: Bytes, l: V, r: V) -> Option<Out> =
+  if op == b"eq" || op == b"ne" {
+    // Under release both are handed over as held, and a temporary among them is released at its scope's end.
+    let lo = if em.release {
+      let w = word_of(em, l);
+      { em: w.em, v: { k: KBoxed, c: w.c, ty: l.ty } }
+    } else { owned(em, l) };
+    let ro = if lo.em.release {
+      let w = word_of(lo.em, r);
+      { em: w.em, v: { k: KBoxed, c: w.c, ty: r.ty } }
+    } else { owned(lo.em, r) };
+    let e = bind(
+      ro.em,
+      KBool,
+      bytes_concat_all([b"rt_equal_p(ctx, ", lo.v.c, b", ", ro.v.c, b")"]),
+    );
+    // For `!=` the answer's binding is the negation.
+    Some(
+      bind(check(e.em), KBool, if op == b"ne" { bytes_concat_all([b"!(", e.v.c, b")"]) }
+      else { e.v.c }),
+    )
+  } else {
+    let lo = owned(em, l);
+    let ro = owned(lo.em, r);
+    let o = bind(
+      ro.em,
+      KBoxed,
+      bytes_concat_all([
+        b"rt_binary_p(ctx, ",
+        num(binary_code(op)),
+        b", ",
+        lo.v.c,
+        b", ",
+        ro.v.c,
+        b")",
+      ]),
+    );
+    Some({ em: check(o.em), v: o.v })
+  }
 
 // The six orderings compile to C's own on untagged integers: an `Int` comparison cannot raise.
 fn compare_op(op: Bytes) -> Option<Bytes> =
@@ -6155,7 +6236,7 @@ fn arithmetic(em: Em, op: Bytes, l: V, r: V) -> Out =
         b", &",
         f.name,
         b")) { rt_overflow_p(ctx, ",
-        if op == b"sub" { b"1" } else { b"0" },
+        num(overflow_code(op)),
         b"); return 0; }",
       ]),
     );
@@ -6460,14 +6541,11 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
       // The inline builtins ask about these two: with the kind known the read is a plain load.
       else if c.name.name.name == b"Bytes" && len(c.args) == 0 { Some({ k: KBoxed, ty: TyBytes }) }
       else if c.name.name.name == b"List" && len(c.args) == 1 { Some({ k: KBoxed, ty: TyList }) }
-      else if (c.name.name.name == b"Float" || c.name.name.name == b"Decimal") && len(c.args) == 0 {
-        Some({ k: KBoxed, ty: TyOpaque })
-      }
-      // A width below 64 bits is carried in a register; the 64-bit widths are opaque words.
+      // A width below 64 bits is carried in a register; the 64-bit widths are the runtime's own words.
       else if len(c.args) == 0 && width_named(c.name.name.name) != None {
         match width_named(c.name.name.name) {
           Some(w) -> if carried(w) { Some({ k: KNum(w), ty: TyOpen }) }
-          else { Some({ k: KBoxed, ty: TyOpaque }) },
+          else { Some({ k: KBoxed, ty: TyOpen }) },
           None -> Some({ k: KBoxed, ty: TyOpen }),
         }
       } else { Some({ k: KBoxed, ty: TyOpen }) },
@@ -6500,7 +6578,20 @@ pub fn emit_fn(
   params: List<P>,
   body: Code,
 ) -> Option<Bytes> =
-  match emit_fn_full(module, 0, here, imports, ctors, builtins, full, params, body, [], false) {
+  match emit_fn_full(
+      module,
+      0,
+      here,
+      imports,
+      ctors,
+      builtins,
+      full,
+      params,
+      body,
+      [],
+      false,
+      map_new(),
+    ) {
     None -> None,
     Some(f) -> Some(f.text),
   }
@@ -6519,6 +6610,7 @@ pub fn emit_fn_full(
   body: Code,
   effects: List<EffectName>,
   release: Bool,
+  operands: Map<Bytes, Bytes>,
 ) -> Option<{ text: Bytes, tables: Tables }> = {
   let name = symbol_of(full);
   let start = {
@@ -6559,6 +6651,7 @@ pub fn emit_fn_full(
     pinned: [],
     bound: [],
     group: [],
+    operands: operands,
   };
   match emit_body(start, params, body) {
     None -> None,
@@ -6624,6 +6717,7 @@ pub fn emit_fn_why(
   body: Code,
   effects: List<EffectName>,
   release: Bool,
+  operands: Map<Bytes, Bytes>,
 ) -> Option<Bytes> = {
   let start = {
     out: [],
@@ -6663,6 +6757,7 @@ pub fn emit_fn_why(
     pinned: [],
     bound: [],
     group: [],
+    operands: operands,
   };
   match emit_body(start, params, body) {
     None -> Some(b"refused without a reason"),
@@ -6685,6 +6780,7 @@ pub fn emit_group_full(
   members: List<Member>,
   effects: List<EffectName>,
   release: Bool,
+  operands: Map<Bytes, Bytes>,
 ) -> Option<{ text: Bytes, tables: Tables }> = {
   let names = map(members, |m: Member| m.full);
   let first = match list_at(members, 0) { Some(m) -> m.full, None -> b"" };
@@ -6729,6 +6825,7 @@ pub fn emit_group_full(
     pinned: [],
     bound: [],
     group: names,
+    operands: operands,
   };
   match group_cases(start, members, 0) {
     None -> None,
@@ -7024,7 +7121,7 @@ test "a body that answers a literal" {
 }
 
 test "a body that would overrun this thread's stack runs the same call on a stack of its own" {
-  let out = emit_all_in(b"m", [], [], b"fn g(n: Int) -> Int = n + 1\n", true);
+  let out = emit_all_program([{ name: b"m", src: b"fn g(n: Int) -> Int = n + 1\n" }], [], [], true);
   let text = match list_at(out, 0) { Some(e) -> e.text, None -> b"" };
   assert_eq(
     bytes_index_of(
@@ -7058,7 +7155,7 @@ test "a self call in tail position restarts the body instead of nesting" {
     b"fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }\n",
     b"fn inner(n: Int) -> Int = { let k = if n > 5 { inner(n - 1) } else { 0 }; k + 1 }\n",
   ]);
-  let out = emit_all_in(b"m", [], [], src, true);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
   assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None]);
   assert_eq(map(out, |e: Emitted| bytes_index_of(e.text, b"ply_loop: if") != None), [
     true,
@@ -7112,7 +7209,7 @@ test "a tail call into a definition's own recursive group jumps instead of nesti
     b"fn parity(n: Int) -> Bool = even(n)\n",
     b"fn count(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { count(n - 1, acc + n) }\n",
   ]);
-  let out = emit_all_in(b"m", [], [], src, true);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
   assert_eq(map(out, |e: Emitted| e.name), [b"m.even", b"m.parity", b"m.count"]);
   assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
   let group = match list_at(out, 0) {
@@ -7240,23 +7337,42 @@ test "the emitter answers each root it was asked for, a body's tables as values"
 
 test "guarded arms and every literal pattern are emitted rather than refused" {
   let src = b"fn f(n: Int, m: Int) -> Int = match n { x if x > m -> x, 0 -> 1, x if x < 0 - m -> m, _ -> m }\nfn g(s: String) -> Int = match s { t if t == \"a\" -> 1, \"b\" -> 2, _ -> 3 }\nfn h(u: Unit, b: Bytes, f: Float, d: Decimal, w: U64, n: Int) -> Int = match u { () -> match b { b\"x\" -> 1, _ -> match f { -1.5 -> 2, _ -> match d { 2.50m -> 3, _ -> match w { 7u64 -> 4, _ -> match n { 4611686018427387904 -> 5, _ -> 6 } } } } } }\n";
-  assert_eq(map(emit_all_in(b"m", [], [], src, true), |e: Emitted| e.why), [None, None, None])
+  assert_eq(map(emit_all_program([{ name: b"m", src: src }], [], [], true), |e: Emitted| e.why), [
+    None,
+    None,
+    None,
+  ])
+}
+
+test "an operator is compiled at the type the checker settled, whatever holds its operands" {
+  let src = bytes_concat_all([
+    b"fn bytes(xs: List<U8>) -> U8 = match xs { [a, b, ..] -> a + b, _ -> 0u8 }\n",
+    b"fn ints(xs: List<Int>) -> Int = match xs { [a, b, ..] -> a + b, _ -> 0 }\n",
+    b"fn folded(xs: List<U8>) -> U8 = fold(xs, 0u8, wrap_add)\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
+  // The runtime's operator reads its words untyped, and a builtin value is the runtime's too.
+  assert_eq(has(b"rt_binary_p"), [false, false, false]);
+  assert_eq(has(b"rt_builtin_value_p"), [false, false, false]);
+  assert_eq(has(b" > INT64_C(255)) { rt_overflow_p"), [true, false, false]);
+  assert_eq(has(b"ply_add_ov("), [false, true, false]);
+  assert_eq(has(b"(uint8_t)((uint64_t)(uint8_t)("), [false, false, true])
+}
+
+test "two operators on one span that the checker settled apart are left unsettled" {
+  let at = { start: 3, end: 9 };
+  let sites = [
+    { module: 0, span: at, ty: b"Int" },
+    { module: 0, span: at, ty: b"U8" },
+    { module: 1, span: at, ty: b"U8" },
+  ];
+  assert_eq(map_get(operands_in(sites, 0), span_key(at)), Some(unsettled()));
+  assert_eq(map_get(operands_in(sites, 1), span_key(at)), Some(b"U8"))
 }
 
 // --- the emitter's entry ----------------------------------------------------
-
-// One module's bodies, parsed and rewritten with no defaults filled.
-fn emit_all_in(
-  module: Bytes,
-  ctors: List<Bytes>,
-  builtins: List<Bytes>,
-  src: Bytes,
-  release: Bool,
-) -> List<Emitted> = {
-  let r = parse(src);
-  let x = expand(r.node, r.p.uses_sets, r.p.diags);
-  emit_module(module, x.module, ctors, builtins, [], [], [], release, None, map_new(), None, 0, [])
-}
 
 fn aliases_in(m: Module) -> List<Alias> =
   fold(m.items, [], |acc: List<Alias>, it: Item|
@@ -7429,7 +7545,8 @@ fn emit_program(
                       release,
                       wanted,
                       sites_in(facts.label_sites, i),
-                      Some(x.r),
+                      operands_in(facts.operands, i),
+                      x.r,
                       i,
                       mods,
                     ),
@@ -7474,6 +7591,21 @@ fn sites_in(all: List<LabelSite>, module: Int) -> Map<Bytes, List<Bytes>> =
   fold(all, map_new(), |acc: Map<Bytes, List<Bytes>>, s: LabelSite|
     if s.module != module { acc } else { map_insert(acc, span_key(s.span), s.labels) })
 
+// Each operator's operand type in this module, by its span. A default argument is written in its
+// own module's positions, so two sites can share a span: where their types differ, neither is read.
+fn operands_in(all: List<OperandSite>, module: Int) -> Map<Bytes, Bytes> =
+  fold(all, map_new(), |acc: Map<Bytes, Bytes>, s: OperandSite|
+    if s.module != module { acc } else {
+      let key = span_key(s.span);
+      match map_get(acc, key) {
+        None -> map_insert(acc, key, s.ty),
+        Some(t) -> if t == s.ty { acc } else { map_insert(acc, key, unsettled()) },
+      }
+    })
+
+// Never a type's name.
+fn unsettled() -> Bytes = b"?"
+
 fn wants(wanted: Option<Map<Bytes, Bool>>, name: Bytes) -> Bool =
   match wanted { None -> true, Some(m) -> map_contains(m, name) }
 
@@ -7488,7 +7620,8 @@ fn emit_module(
   release: Bool,
   wanted: Option<Map<Bytes, Bool>>,
   sites: Map<Bytes, List<Bytes>>,
-  resolved: Option<Resolved>,
+  operands: Map<Bytes, Bytes>,
+  resolved: Resolved,
   index: Int,
   mods: List<Mod>,
 ) -> List<Emitted> = {
@@ -7496,10 +7629,7 @@ fn emit_module(
   let defs_of = |path: Bytes|
     fold(program, [], |acc: List<Def>, md: ModDefs| if md.module == path { md.defs } else { acc });
   let others = others_of(x.module, program);
-  let imports = match resolved {
-    None -> [],
-    Some(r) -> resolved_imports(r, index, mods, x_module, defs_of),
-  };
+  let imports = resolved_imports(resolved, index, mods, x_module, defs_of);
   let aliases = fold(x.module.items, [], |acc: List<Alias>, it: Item|
     match it {
       IType(t) -> match t.body {
@@ -7547,6 +7677,7 @@ fn emit_module(
                   builtins,
                   effects,
                   release,
+                  operands,
                   p.full,
                   p.ps,
                   p.known,
@@ -7566,6 +7697,7 @@ fn emit_module(
                   builtins,
                   effects,
                   release,
+                  operands,
                   map(g, |i: Int| match list_at(fns, i) { Some(q) -> q, None -> p }),
                 ),
                 acc.out,
@@ -7585,6 +7717,7 @@ fn emit_module(
             builtins,
             effects,
             release,
+            operands,
             aliases,
             others,
             wanted,
@@ -7606,6 +7739,7 @@ fn emit_module(
                 builtins,
                 effects,
                 release,
+                operands,
                 full,
                 [],
                 [],
@@ -7640,6 +7774,7 @@ fn emit_module(
                   builtins,
                   effects,
                   release,
+                  operands,
                   part(b".guard"),
                   names,
                   ps,
@@ -7663,6 +7798,7 @@ fn emit_module(
                   builtins,
                   effects,
                   release,
+                  operands,
                   part(b".body"),
                   names,
                   ps,
@@ -7830,6 +7966,7 @@ fn group_emitted(
   builtins: List<Bytes>,
   effects: List<EffectName>,
   release: Bool,
+  operands: Map<Bytes, Bytes>,
   members: List<Prepared>,
 ) -> List<Emitted> = {
   let ms = fold(members, [], |acc: List<Member>, p: Prepared|
@@ -7839,7 +7976,7 @@ fn group_emitted(
     });
   let first = match list_at(members, 0) { Some(p) -> p.full, None -> b"" };
   let whole = if len(ms) == len(members) {
-    emit_group_full(module, here, imports, ctors, builtins, ms, effects, release)
+    emit_group_full(module, here, imports, ctors, builtins, ms, effects, release, operands)
   } else { None };
   match whole {
     Some(c) -> [{ name: first, text: c.text, tables: c.tables, why: None, handles: [] }],
@@ -7854,6 +7991,7 @@ fn group_emitted(
           builtins,
           effects,
           release,
+          operands,
           p.full,
           p.ps,
           p.known,
@@ -7881,6 +8019,7 @@ fn root_emitted(
   builtins: List<Bytes>,
   effects: List<EffectName>,
   release: Bool,
+  operands: Map<Bytes, Bytes>,
   full: Bytes,
   names: List<Bytes>,
   ps: List<P>,
@@ -7897,6 +8036,7 @@ fn root_emitted(
     builtins,
     effects,
     release,
+    operands,
     full,
     ps,
     known,
@@ -7914,6 +8054,7 @@ fn emitted_from(
   builtins: List<Bytes>,
   effects: List<EffectName>,
   release: Bool,
+  operands: Map<Bytes, Bytes>,
   full: Bytes,
   ps: List<P>,
   known: Bool,
@@ -7942,6 +8083,7 @@ fn emitted_from(
         c,
         effects,
         release,
+        operands,
       ) {
       None ->
         {
@@ -7961,6 +8103,7 @@ fn emitted_from(
             c,
             effects,
             release,
+            operands,
           ),
         },
       Some(o) -> { name: full, text: o.text, tables: o.tables, why: None, handles: [] },
@@ -7980,6 +8123,7 @@ fn clause_roots(
   builtins: List<Bytes>,
   effects: List<EffectName>,
   release: Bool,
+  operands: Map<Bytes, Bytes>,
   aliases: List<Alias>,
   others: List<ModAliases>,
   wanted: Option<Map<Bytes, Bool>>,
@@ -8008,6 +8152,7 @@ fn clause_roots(
                   builtins,
                   effects,
                   release,
+                  operands,
                   full,
                   names,
                   params_of(names, kinds),
@@ -8041,6 +8186,7 @@ fn clause_roots(
                     builtins,
                     effects,
                     release,
+                    operands,
                     full,
                     rnames,
                     params_of(rnames, rkinds),
