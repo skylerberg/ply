@@ -887,10 +887,9 @@ pub fn diagnose_failures(
             let mixture = hybrid::mixture_for(hashes, &failure.key, &baseline);
             let complete = hybrid::bodies_available(store, &fresh, &mixture);
             let test_body = test_hash.and_then(|hash| BodyHybrid::test_body(&fresh, hash));
-            // Runnable when every body the mixture needs is available and the failing run reached
-            // nothing outside the program.
+            // Refusing a host-backed failure is the program's gate; a mixture runs hermetically.
             let runnable = match test_body {
-                Some(test) if complete && !failure.host => Some((mixture, test)),
+                Some(test) if complete => Some((mixture, test)),
                 _ => None,
             };
             let absent = match (&runnable, complete) {
