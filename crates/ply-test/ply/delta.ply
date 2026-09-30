@@ -8,9 +8,9 @@
 // a name that is both a `fn` and a `type` fuses across both, while the cluster keeps the keys apart
 // so the search knows which namespace to swap.
 //
-// Nothing here decides whether a change was *edited* or merely *derived* (its hash moved because a
-// dependency's did). That is a judgment about normalized bodies, so the rehasher makes it and
-// answers a row this module builds on.
+// Whether a change was *edited* or merely *derived* (its hash moved because a dependency's did) is
+// read off what the rehasher answers — today's body hashed as the baseline wrote references — and
+// decided here, with everything else a change set is made of, from the runtime's rows.
 
 // Which namespace a definition is in: a `fn`/`let`, or a `type`/`effect` declaration.
 pub type Ns = | Value | Decl
@@ -124,8 +124,8 @@ pub type Cluster = {
 
 pub fn is_singleton(c: Cluster) -> Bool = len(c.members) == 1
 
-// Which definitions mention which, unioned over both configurations. `map_get` answers `None` for
-// a name nothing mentions, so the referrers of an untouched name are the empty list.
+// Which definitions mention which. `map_get` answers `None` for a name nothing mentions, so the
+// referrers of an untouched name are the empty list.
 pub type DepEdges = Map<String, List<String>>
 
 pub fn no_edges() -> DepEdges = map_new()
@@ -303,10 +303,6 @@ fn first_of<a>(xs: List<a>, p: (a) -> Bool) -> Option<a> =
   match filter(xs, p) { [] -> None, hits -> Some(at_or(hits, 0)) }
 
 // The definitions a mixture takes from the post-edit side, given the chosen cluster indices.
-pub fn flipped_names(d: Delta, flipped: List<Int>) -> List<String> =
-  sorted_names(flat(map(flipped, |i: Int| list_at(d.clusters, i)), |c: Cluster| c.members))
-
-// `flipped_names` without the namespace collapse.
 pub fn flipped_keys(d: Delta, flipped: List<Int>) -> List<DefKey> =
   sorted_keys(flat(map(flipped, |i: Int| list_at(d.clusters, i)), |c: Cluster| c.keys))
 
@@ -314,6 +310,149 @@ pub fn flipped_keys(d: Delta, flipped: List<Int>) -> List<DefKey> =
 fn flat<a, b>(cs: List<Option<a>>, of: (a) -> List<b>) -> List<b> =
   fold(cs, [], |acc: List<b>, c: Option<a>|
     match c { None -> acc, Some(x) -> fold(of(x), acc, |out: List<b>, y: b| push(out, y)) })
+
+// --- What the runtime knows, and the change set it makes ------------------------
+
+/// One definition in a failing test's closure, in either era, with everything the runtime can say
+/// about it that a change set is classified from.
+pub type Row = {
+  name: String,
+  ns: Ns,
+  /// Its hash when the test last passed, and now.
+  before: Option<String>,
+  after: Option<String>,
+  /// Its current body hashed as the baseline wrote references: `before` again when only something
+  /// under it moved. `None` when the rehasher had no answer.
+  rehashed: Option<String>,
+  /// Whether its published interface is the same on both sides; `None` when nothing could say, or
+  /// when its body did not move on its own.
+  stable: Option<Bool>,
+  /// Its baseline hash is still somewhere in the current program.
+  kept: Bool,
+  /// Its baseline hash is one the current program re-normalizes to.
+  renamed: Bool,
+  /// The members of its recursive component, when it has more than one.
+  component: List<DefKey>,
+  /// The closure's names that mention it.
+  referrers: List<String>,
+}
+
+/// The test's own hash when it last passed and now, and its current body hashed as the baseline wrote
+/// references.
+pub type Own = { name: String, before: String, after: Option<String>, rehashed: Option<String> }
+
+pub type Facts = { own: Own, rows: List<Row> }
+
+pub type Diff = {
+  delta: Delta,
+  /// The definitions whose edited-or-derived split could not be decided.
+  unclassified: List<String>,
+  /// The test's own hash moved and nothing could say whether its body was edited.
+  test_unclassified: Bool,
+}
+
+/// What moved since the test last passed. A name that vanished while its hash stayed in the program,
+/// or appeared with a hash the baseline already held, was renamed rather than changed; a body that
+/// re-normalizes to its baseline hash is derived; and a change nothing could classify is an edit, the
+/// wider answer and never a wrong one.
+pub fn classified(f: Facts) -> Diff = {
+  let then = fold(f.rows, [], |acc: List<String>, r: Row|
+    match r.before { Some(h) -> push(acc, h), None -> acc });
+  let rows = sorted_rows(filter(f.rows, |r: Row| r.name != f.own.name));
+  let judged = fold(
+    rows,
+    { changes: [], unclassified: [] },
+    |acc: { changes: List<Change>, unclassified: List<String> }, r: Row|
+      match judged_row(r, then) {
+        None -> acc,
+        Some(j) ->
+          {
+            changes: push(acc.changes, in_namespace(j.change, r.ns)),
+            unclassified: if j.unclassified { push(acc.unclassified, r.name) }
+            else { acc.unclassified },
+          },
+      },
+  );
+  let components = fold(judged.changes, [], |acc: List<List<DefKey>>, c: Change|
+    if !change_is_candidate(c) { acc } else {
+      let members = component_of(rows, change_key(c));
+      if len(members) > 1 && !some(acc, |known: List<DefKey>| known == members) {
+        push(acc, members)
+      } else { acc }
+    });
+  let edges = fold(rows, no_edges(), |e: DepEdges, r: Row|
+    fold(r.referrers, e, |into: DepEdges, from: String| add_edge(into, from, r.name)));
+  let own = judged_own(f.own);
+  let delta = with_components(own.change, judged.changes, edges, components);
+  {
+    delta: {
+      ..delta,
+      unclassified: len(judged.unclassified) + (if own.unclassified { 1 } else { 0 }),
+    },
+    unclassified: judged.unclassified,
+    test_unclassified: own.unclassified,
+  }
+}
+
+fn judged_row(r: Row, then: List<String>) -> Option<{ change: Change, unclassified: Bool }> =
+  match r.before {
+    None -> match r.after {
+      None -> None,
+      Some(now) -> if any_text(then, now) { None } else {
+        match r.rehashed {
+          // Renamed, and its hash moved as well because something under it was edited.
+          Some(was) -> if any_text(then, was) { Some(plain(derived(r.name, was, now))) }
+          else { Some(plain(added(r.name, now))) },
+          None -> Some(plain(added(r.name, now))),
+        }
+      },
+    },
+    Some(was) -> match r.after {
+      None -> if r.kept || r.renamed { None } else { Some(plain(removed(r.name, was))) },
+      Some(now) -> if now == was { None } else {
+        match r.rehashed {
+          Some(rehashed) -> if rehashed == was { Some(plain(derived(r.name, was, now))) }
+          else { Some(plain(edited(r.name, was, now, r.stable == Some(true)))) },
+          None ->
+            Some({ change: edited(r.name, was, now, r.stable == Some(true)), unclassified: true }),
+        }
+      },
+    },
+  }
+
+fn plain(c: Change) -> { change: Change, unclassified: Bool } = { change: c, unclassified: false }
+
+// The test's own edit is the one change a hash that moved does not accuse: an unclassifiable test
+// hash is said as such rather than read as an edit.
+fn judged_own(o: Own) -> { change: Option<Change>, unclassified: Bool } =
+  match o.after {
+    None -> { change: None, unclassified: false },
+    Some(now) -> if now == o.before { { change: None, unclassified: false } } else {
+      match o.rehashed {
+        Some(rehashed) -> if rehashed == o.before { { change: None, unclassified: false } }
+        else { { change: Some(edited(o.name, o.before, now, true)), unclassified: false } },
+        None -> { change: None, unclassified: true },
+      }
+    },
+  }
+
+fn component_of(rows: List<Row>, key: DefKey) -> List<DefKey> =
+  match filter(rows, |r: Row| r.name == key.name && ns_rank(r.ns) == ns_rank(key.ns)) {
+    [] -> [],
+    hits -> at_or(hits, 0).component,
+  }
+
+// Ascending by key, which is the order a change set lists its changes in.
+fn sorted_rows(rows: List<Row>) -> List<Row> =
+  fold(rows, [], |acc: List<Row>, r: Row| {
+    let key = { name: r.name, ns: r.ns };
+    let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+      if i < len(acc) { i }
+      else if key_before(key, { name: at_or(acc, j).name, ns: at_or(acc, j).ns }) { j }
+      else { i });
+    let before = map(range(0, at), |j: Int| at_or(acc, j));
+    fold(range(at, len(acc)), push(before, r), |out: List<Row>, j: Int| push(out, at_or(acc, j)))
+  })
 
 // --- Union-find, over an immutable parent list ---------------------------------
 //
@@ -465,11 +604,10 @@ test "fusing is by name, so a mention reaches either namespace" {
       reason: InterfaceChanged,
     },
   ]);
-  // Members are names, deduplicated; keys keep both namespaces; both are ascending.
-  assert_eq(flipped_names(d, [0, 1, 9]), ["helper", "x"]);
+  // A mixture takes keys, which keep both namespaces, in ascending order.
   assert_eq(flipped_keys(d, [0, 1, 9]), [value_key("helper"), value_key("x"), decl_key("x")]);
   // An index nothing holds contributes nothing rather than failing.
-  assert_eq(flipped_names(d, [4]), [])
+  assert_eq(flipped_keys(d, [4]), [])
 }
 
 test "the change a report shows is the edit, not the hash that moved under it" {
@@ -528,4 +666,238 @@ test "every word a report prints, as the Rust side prints it" {
     "they are mutually recursive and share one component hash, so no hybrid can flip one without the other",
   );
   assert_eq(is_singleton({ members: ["a"], keys: [value_key("a")], reason: Independent }), true)
+}
+
+// A row as the runtime answers one: the fields a fixture does not name are what an ordinary edit
+// leaves them as.
+fn a_row(
+  name: String,
+  before: Option<String>,
+  after: Option<String>,
+  rehashed: Option<String>,
+) -> Row =
+  {
+    name: name,
+    ns: Value,
+    before: before,
+    after: after,
+    rehashed: rehashed,
+    stable: Some(true),
+    kept: false,
+    renamed: false,
+    component: [],
+    referrers: [],
+  }
+
+fn moved(name: String, before: String, after: String, rehashed: String) -> Row =
+  a_row(name, Some(before), Some(after), Some(rehashed))
+
+fn still(name: String, hash: String) -> Row = a_row(name, Some(hash), Some(hash), Some(hash))
+
+fn untouched(named: String) -> Own =
+  { name: named, before: "t1", after: Some("t2"), rehashed: Some("t1") }
+
+fn kinds(d: Diff) -> List<String> =
+  map(d.delta.changes, |c: Change| c.name ++ " " ++ kind_word(c.kind))
+
+// `leaf` was edited; `mid` and `top` only reference it, so their hashes moved and their bodies did not.
+fn chain(leaf: Row, top: Row) -> Facts =
+  {
+    own: untouched("chain"),
+    rows: [
+      top,
+      { ..moved("mid", "m1", "m2", "m1"), referrers: ["top"] },
+      { ..leaf, referrers: ["mid"] },
+    ],
+  }
+
+test "an edit to a leaf leaves what only references it derived" {
+  let d = classified(chain(moved("leaf", "l1", "l2", "l3"), moved("top", "t1", "t2", "t1")));
+  assert_eq(kinds(d), ["leaf edited", "mid derived", "top derived"]);
+  assert_eq(d.unclassified, []);
+  // Three hashes moved and exactly one is worth a mixture.
+  assert_eq(candidates(d.delta), 1);
+  assert_eq(map(d.delta.clusters, |c: Cluster| c.members), [["leaf"]]);
+  // A closure that moved under the test is not an edit to the test.
+  assert_eq(d.delta.own, None);
+  assert_eq(d.test_unclassified, false)
+}
+
+test "two edits are two candidates, each on its own" {
+  let d = classified(chain(moved("leaf", "l1", "l2", "l3"), moved("top", "t1", "t2", "t3")));
+  assert_eq(kinds(d), ["leaf edited", "mid derived", "top edited"]);
+  assert_eq(map(d.delta.clusters, |c: Cluster| c.members), [["leaf"], ["top"]])
+}
+
+test "a rename moves a name and no hash, so it is no change at all" {
+  let d = classified({
+    own: untouched("chain"),
+    rows: [
+      // `leaf` is gone and its hash is still in the program; `first` is new with a hash the baseline held.
+      { ..a_row("leaf", Some("l1"), None, None), kept: true },
+      a_row("first", None, Some("l1"), Some("l1")),
+      still("mid", "m1"),
+    ],
+  });
+  assert_eq(d.delta.changes, []);
+  assert_eq(d.delta.clusters, []);
+  // A vanished name whose hash the current program re-normalizes to was renamed too.
+  let renamed = classified({
+    own: untouched("chain"),
+    rows: [{ ..a_row("leaf", Some("l1"), None, None), renamed: true }],
+  });
+  assert_eq(renamed.delta.changes, [])
+}
+
+test "a renamed definition whose body moved under it is derived from what it was" {
+  let d = classified({
+    own: untouched("chain"),
+    rows: [
+      { ..a_row("leaf", Some("l1"), None, None), kept: true },
+      a_row("first", None, Some("f2"), Some("l1")),
+    ],
+  });
+  assert_eq(kinds(d), ["first derived"])
+}
+
+test "an edit to the test's body is recorded on the test rather than on a definition" {
+  let d = classified({
+    own: { name: "chain", before: "t1", after: Some("t2"), rehashed: Some("t3") },
+    rows: [still("leaf", "l1")],
+  });
+  assert_eq(
+    match d.delta.own { Some(c) -> c.name ++ " " ++ kind_word(c.kind), None -> "none" },
+    "chain edited",
+  );
+  assert_eq(d.delta.changes, []);
+  assert_eq(d.test_unclassified, false);
+  // The test's own row, when the closure names it, is the test and not a definition.
+  let own = classified({
+    own: { name: "chain", before: "t1", after: Some("t2"), rehashed: Some("t1") },
+    rows: [moved("chain", "c1", "c2", "c3")],
+  });
+  assert_eq(own.delta.changes, [])
+}
+
+test "an added definition is a candidate and fuses with what mentions it" {
+  let d = classified({
+    own: untouched("chain"),
+    rows: [
+      { ..a_row("bump", None, Some("b1"), Some("b1")), referrers: ["mid"] },
+      moved("mid", "m1", "m2", "m3"),
+    ],
+  });
+  assert_eq(kinds(d), ["bump added", "mid edited"]);
+  assert_eq(d.delta.clusters, [
+    { members: ["bump", "mid"], keys: [value_key("bump"), value_key("mid")], reason: Existence },
+  ])
+}
+
+test "a removed definition is a candidate, and fuses with what still mentions it" {
+  let d = classified({
+    own: untouched("chain"),
+    rows: [a_row("spare", Some("s1"), None, None), moved("mid", "m1", "m2", "m3")],
+  });
+  assert_eq(kinds(d), ["mid edited", "spare removed"]);
+  assert_eq(map(d.delta.clusters, |c: Cluster| c.members), [["mid"], ["spare"]]);
+  let kept = classified({
+    own: untouched("chain"),
+    rows: [
+      { ..a_row("gone", Some("g1"), None, None), referrers: ["keeper"] },
+      moved("keeper", "k1", "k2", "k3"),
+    ],
+  });
+  assert_eq(kept.delta.clusters, [
+    {
+      members: ["gone", "keeper"],
+      keys: [value_key("gone"), value_key("keeper")],
+      reason: Existence,
+    },
+  ])
+}
+
+test "a recursive component is fused, and a pair that did not move is not a change" {
+  let pair = [value_key("even"), value_key("odd")];
+  let d = classified({
+    own: untouched("parity holds"),
+    rows: [
+      { ..moved("even", "e1", "e2", "e3"), component: pair },
+      { ..moved("odd", "o1", "o2", "o3"), component: pair },
+      still("parity", "p1"),
+    ],
+  });
+  assert_eq(kinds(d), ["even edited", "odd edited"]);
+  assert_eq(d.delta.clusters, [{ members: ["even", "odd"], keys: pair, reason: Component }]);
+  let quiet = classified({
+    own: untouched("parity holds"),
+    rows: [
+      { ..still("even", "e1"), component: pair },
+      { ..still("odd", "o1"), component: pair },
+      moved("parity", "p1", "p2", "p3"),
+    ],
+  });
+  assert_eq(kinds(quiet), ["parity edited"]);
+  assert_eq(quiet.unclassified, [])
+}
+
+test "a rehasher with no answer calls everything edited, and nothing independent" {
+  let unknown = |name: String, before: String, after: String|
+    { ..a_row(name, Some(before), Some(after), None), stable: None };
+  let d = classified({
+    own: { name: "chain", before: "t1", after: Some("t2"), rehashed: None },
+    rows: [
+      unknown("top", "t1", "t2"),
+      { ..unknown("mid", "m1", "m2"), referrers: ["top"] },
+      { ..unknown("leaf", "l1", "l2"), referrers: ["mid"] },
+    ],
+  });
+  assert_eq(candidates(d.delta), 3);
+  assert_eq(d.unclassified, ["leaf", "mid", "top"]);
+  assert_eq(d.test_unclassified, true);
+  assert_eq(d.delta.unclassified, 4);
+  // An unclassifiable test is not accused.
+  assert_eq(d.delta.own, None);
+  // Nothing is independent without an interface to compare, so the three fuse.
+  assert_eq(map(d.delta.clusters, |c: Cluster| c.members), [["leaf", "mid", "top"]])
+}
+
+test "an interface that moved fuses with its callers, and one that did not stands alone" {
+  let rows = |stable: Option<Bool>|
+    [
+      { ..moved("scale", "s1", "s2", "s3"), stable: stable, referrers: ["total"] },
+      moved("total", "t1", "t2", "t3"),
+    ];
+  let independent = classified({ own: untouched("totals"), rows: rows(Some(true)) });
+  assert_eq(map(independent.delta.clusters, |c: Cluster| c.members), [["scale"], ["total"]]);
+  let moved_interface = classified({ own: untouched("totals"), rows: rows(Some(false)) });
+  assert_eq(moved_interface.delta.clusters, [
+    {
+      members: ["scale", "total"],
+      keys: [value_key("scale"), value_key("total")],
+      reason: InterfaceChanged,
+    },
+  ]);
+  // An interface nothing could compare is not independent either.
+  let unknown = classified({ own: untouched("totals"), rows: rows(None) });
+  assert_eq(len(unknown.delta.clusters), 1)
+}
+
+test "a declaration and a value of one name are two changes in one change set" {
+  let d = classified({
+    own: untouched("app"),
+    rows: [
+      {
+        ..moved("store.db", "d1", "d2", "d3"),
+        ns: Decl,
+        stable: Some(false),
+        referrers: ["store.lookup"],
+      },
+      moved("store.lookup", "k1", "k2", "k1"),
+    ],
+  });
+  assert_eq(
+    map(d.delta.changes, |c: Change| c.name ++ " " ++ ns_word(c.ns) ++ " " ++ kind_word(c.kind)),
+    ["store.db declaration edited", "store.lookup value derived"],
+  );
+  assert_eq(map(d.delta.clusters, |c: Cluster| c.keys), [[decl_key("store.db")]])
 }

@@ -32,3 +32,26 @@ fn every_marshalled_type_is_declared_where_this_side_says() {
         );
     }
 }
+
+/// Every case the tester builds has to be one the program declares, of the type and in the module
+/// the tester says: a case name that names nothing is a placeless `no arm of this match matched`
+/// the moment the program matches the value.
+#[test]
+fn every_case_the_tester_builds_is_declared_where_it_says() {
+    let loaded = ply_machine::load::load(&cli_root()).expect("the CLI tree loads");
+    for (home, ty, cases) in ply_machine::tester::MARSHALLED {
+        for case in *cases {
+            assert!(
+                loaded
+                    .check
+                    .ctors
+                    .values()
+                    .any(|c| c.simple_name.as_str() == *case
+                        && c.module.as_str() == *home
+                        && c.type_name.as_str().rsplit('.').next() == Some(*ty)),
+                "`{home}` declares no case `{case}` of `{ty}`, so the tester builds a value no \
+                 arm matches"
+            );
+        }
+    }
+}
