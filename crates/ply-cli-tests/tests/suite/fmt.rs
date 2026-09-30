@@ -384,6 +384,7 @@ const MAINTAINED: [&str; 9] = [
     "crates/ply-corpus/checks",
     "crates/ply-test/ply",
     "crates/ply-prove/ply",
+    "crates/ply-registry/ply",
     "benches",
     "tests/lang",
 ];

@@ -1,34 +1,22 @@
-//! The front end: the port parses, resolves and checks the program. Every run hands it what the
-//! last one published, definition by definition, so it walks what moved and what depends on it.
+//! The front end: the port parses, resolves and checks the program. The CLI runs it, seeded from
+//! and filed into the front-end cache, and hands its answer here; a program loading a program runs
+//! it here, from nothing.
 
 use crate::load::{
     Discovered, Found, LoadError, Loaded, Stamp, anchor, discover, project_root, stamp_of,
     unreadable,
 };
-use ply_codegen::c::producer::{self, KnownDef, KnownTest};
+use ply_codegen::c::producer;
 use ply_eval::Value as PlyValue;
 use ply_eval::decode::{self, At};
 use ply_prove::prove::{Claims, read_claims};
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
-use ply_store::body::StoredBody;
-use ply_store::{
-    CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody, DefBody,
-    DefEntry, DefKind, FileSpan, Member, NameRef, SourceFingerprint, Store,
-};
-use ply_ty::ModuleName;
-use ply_ty::{DefHash, HashOutput};
-use ply_ty::{Front, ModuleInfo};
+use ply_store::{ContentHash, Store};
+use ply_ty::{Front, ModuleInfo, ModuleName};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// Whether a run may consult the front-end cache.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Mode {
-    Full,
-    Incremental,
-}
 
 /// Where a front-end run's time went.
 #[derive(Clone, Copy, Debug, Default)]
@@ -36,54 +24,37 @@ pub struct Phases {
     pub read: Duration,
     /// The port's whole front end over this program, or its answer read back.
     pub front: Duration,
+    /// Filing the answer into the front-end cache, which the CLI does.
     pub write_back: Duration,
-}
-
-impl Phases {
-    pub fn total(&self) -> Duration {
-        self.read + self.front + self.write_back
-    }
-
-    pub fn labelled(&self) -> [(&'static str, Duration); 3] {
-        [
-            ("read", self.read),
-            ("front", self.front),
-            ("write back", self.write_back),
-        ]
-    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct FrontEnd {
+    /// Whether the load read and filed the front-end cache.
     pub incremental: bool,
     pub phases: Phases,
     pub warnings: Vec<Diagnostic>,
 }
 
-pub fn load_full(path: &Path) -> Result<Loaded, LoadError> {
-    run(path, Mode::Full, None)
-}
-
-pub fn load_incremental(path: &Path, store: &mut Store) -> Result<Loaded, LoadError> {
-    run(path, Mode::Incremental, Some(store))
-}
-
-/// The front end a CLI ran and handed over: the compiler's frames, every source they name in
-/// the order its ids run, the package roots the store files a dependency's sources under, and what
-/// the CLI's own load cost. This side reads the answer rather than walking and analysing again.
+/// The front end a CLI ran and handed over: the compiler's answer, every source it names in the
+/// order its ids run, what the CLI's own load cost, and whether it read and filed the front-end
+/// cache for it. This side reads the answer rather than walking and analysing again.
 #[derive(Clone, Debug)]
 pub struct HandedFront {
-    pub dump: String,
+    pub answer: Front,
     pub files: Vec<FrontFile>,
-    pub packages: Vec<(String, String)>,
     pub read: Duration,
+    /// The CLI's front end, and reading its answer here.
     pub front: Duration,
+    pub write_back: Duration,
+    pub cached: bool,
 }
 
+/// The answer is read as it is handed over: a `Value` may not cross to another thread, and the load
+/// it is for runs on a machine's own. [`load_over_front`] adds the files to a fresh map in order, so
+/// file `i` is `SourceId(i)`.
 pub fn handed_front_of(v: &ply_eval::Value, span: Span) -> Result<HandedFront, Diagnostic> {
     use crate::payload::field_of;
-    let dump = String::from_utf8_lossy(field_of(v, "dump", span)?.as_bytes(span, "the frames")?)
-        .into_owned();
     let mut files = Vec::new();
     for item in field_of(v, "files", span)?.as_list(span, "files")?.iter() {
         let text = String::from_utf8_lossy(field_of(item, "text", span)?.as_bytes(span, "a text")?)
@@ -98,32 +69,24 @@ pub fn handed_front_of(v: &ply_eval::Value, span: Span) -> Result<HandedFront, D
             text,
         });
     }
-    let mut packages = Vec::new();
-    for item in field_of(v, "packages", span)?
-        .as_list(span, "packages")?
-        .iter()
-    {
-        packages.push((
-            field_of(item, "root", span)?
-                .as_str(span, "a root")?
-                .to_string(),
-            field_of(item, "digest", span)?
-                .as_str(span, "a digest")?
-                .to_string(),
-        ));
-    }
     let millis = |name: &str| -> Result<Duration, Diagnostic> {
         let ms = field_of(v, name, span)?.as_int(span, name)?;
         Ok(Duration::from_millis(u64::try_from(ms).unwrap_or(0)))
     };
+    let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
+    let started = Instant::now();
+    let answer = ply_codegen::c::dump::read(field_of(v, "dump", span)?, &ids)
+        .map_err(|e| port_failed(&format!("the front end's answer does not read: {e}")))?;
     Ok(HandedFront {
-        dump,
+        answer,
         files,
-        packages,
         read: millis("read_ms")?,
-        front: millis("front_ms")?,
+        front: millis("front_ms")? + started.elapsed(),
+        write_back: millis("file_ms")?,
+        cached: field_of(v, "cached", span)?.as_bool(span, "whether the load was cached")?,
     })
 }
+
 /// One source as a caller's load found it: its path, the module the front end named it, and the text
 /// it read.
 #[derive(Clone, Debug)]
@@ -133,29 +96,13 @@ pub struct FrontFile {
     pub text: String,
 }
 
-/// The load over a front end a caller already ran.
-///
-/// `ply test` walks the tree and runs the compiler in order to report on both, so this side is
-/// handed the answer -- the frames, every source they name in the order their ids run, and the
-/// package roots the store files a dependency's sources under -- rather than walking and analysing a
-/// second time. The store's own bookkeeping is unchanged: it needs the files and the front end, and
-/// both are here.
-#[allow(clippy::too_many_arguments)]
-pub fn load_over_front(
-    path: &Path,
-    files: &[FrontFile],
-    packages: &[(String, String)],
-    dump: &str,
-    read: Duration,
-    front: Duration,
-    mode: Mode,
-    mut store: Option<&mut Store>,
-) -> Result<Loaded, LoadError> {
-    let root = project_root(path);
-    let whole_project = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+/// The load over a front end a caller already ran: `ply test` walks the tree and runs the compiler
+/// in order to report on both, so this side is handed the answer — the tables, and every source
+/// they name in the order their ids run — rather than walking and analysing a second time.
+pub fn load_over_front(path: &Path, handed: &HandedFront) -> Result<Loaded, LoadError> {
     let mut sources = SourceMap::new();
-    let mut states = Vec::with_capacity(files.len());
-    for file in files {
+    let mut states = Vec::with_capacity(handed.files.len());
+    for file in &handed.files {
         let path = PathBuf::from(&file.path);
         let module = ModuleName::from_dotted(&file.name);
         let content = ContentHash::of(file.text.as_bytes());
@@ -171,39 +118,28 @@ pub fn load_over_front(
             shipped: crate::shelf::source(&module).is_some(),
         });
     }
-    if let Some(store) = store.as_deref_mut() {
-        store.set_packages(
-            packages
-                .iter()
-                .map(|(root, digest)| (PathBuf::from(root), digest.clone()))
-                .collect(),
-        );
-    }
     Driver {
-        root,
-        mode,
-        store,
-        whole_project,
-        answer: Some(dump.to_string()),
+        root: project_root(path),
+        incremental: handed.cached,
+        answer: Some(handed.answer.clone()),
         project: SourceMap::new(),
         manifest: None,
         packages: Vec::new(),
         sources,
         files: states,
         phases: Phases {
-            read,
-            front,
-            write_back: Duration::ZERO,
+            read: handed.read,
+            front: handed.front,
+            write_back: handed.write_back,
         },
     }
     .finish()
 }
 
-pub fn run(path: &Path, mode: Mode, store: Option<&mut Store>) -> Result<Loaded, LoadError> {
+/// The load a program runs of a program of its own: the walk and the whole front end, from nothing.
+pub(crate) fn run(path: &Path) -> Result<Loaded, LoadError> {
     let (root, discovered) = discover(path).map_err(LoadError::bare)?;
-    // Pruning deletes every fingerprint the run did not see, so it needs the whole project.
-    let whole_project = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
-    Driver::new(root, discovered, mode, store, whole_project)?.finish()
+    Driver::new(root, discovered)?.finish()
 }
 
 /// The port's lowered claims, kept per module: a module's part is reused while its text and the
@@ -359,15 +295,13 @@ struct FileState {
     shipped: bool,
 }
 
-struct Driver<'s> {
+struct Driver {
     root: PathBuf,
-    mode: Mode,
-    store: Option<&'s mut Store>,
-    whole_project: bool,
-    /// The front end a caller already ran, which [`Driver::ask_the_port`] reads rather than pulls.
+    incremental: bool,
+    /// The front end a caller already ran, which [`Driver::ask_the_port`] takes rather than pulls.
     /// Nothing here walks or analyses when it is set: the caller did both, and the answer is the
     /// one the report is about.
-    answer: Option<String>,
+    answer: Option<Front>,
     /// The project's own files, which every placement of the shipped modules follows.
     project: SourceMap,
     /// The root's `ply.pkg`, when there is one: the front end checks it and places it last.
@@ -392,12 +326,14 @@ struct DepPackage {
 /// One package root as a walk found it: the key it is named by, and the directory its files are in.
 /// They are the same thing for a path dependency, and a fetched tree's directory for a git one.
 fn read_package(root: &str, dir: &Path) -> DepPackage {
+    // The walk records its paths tidied, so `./vendor/x` is stripped from them as `vendor/x`.
+    let dir = crate::load::tidy(dir);
     let manifest = std::fs::read_to_string(dir.join("ply.pkg")).ok();
     let files = if manifest.is_some() {
         let mut out = Vec::new();
-        if let Ok(paths) = crate::load::ply_files(dir) {
+        if let Ok(paths) = crate::load::ply_files(&dir) {
             for path in paths {
-                let Ok(relative) = path.strip_prefix(dir) else {
+                let Ok(relative) = path.strip_prefix(&dir) else {
                     continue;
                 };
                 let Ok(module) = ModuleName::from_relative_path(relative) else {
@@ -417,21 +353,6 @@ fn read_package(root: &str, dir: &Path) -> DepPackage {
         manifest,
         files,
     }
-}
-
-/// Each dependency's root and identity, for the store to key its sources by. A package's identity
-/// is its manifest: that is what names it, grants its prefix and declares what it depends on, so
-/// two checkouts of one package agree and two different packages do not. A package with no readable
-/// manifest contributes no modules and is left unkeyed.
-fn package_roots(packages: &[DepPackage]) -> Vec<(PathBuf, String)> {
-    packages
-        .iter()
-        .filter_map(|package| {
-            let text = package.manifest.as_ref()?;
-            let digest = ply_store::ContentHash::of(text.as_bytes());
-            Some((PathBuf::from(&package.root), digest.to_hex()))
-        })
-        .collect()
 }
 
 /// What the manifests on hand ask for, round by round, until nothing is new: the closure of
@@ -500,14 +421,8 @@ fn timed<T>(slot: &mut Duration, f: impl FnOnce() -> T) -> T {
     value
 }
 
-impl<'s> Driver<'s> {
-    fn new(
-        root: PathBuf,
-        discovered: Vec<Discovered>,
-        mode: Mode,
-        mut store: Option<&'s mut Store>,
-        whole_project: bool,
-    ) -> Result<Driver<'s>, LoadError> {
+impl Driver {
+    fn new(root: PathBuf, discovered: Vec<Discovered>) -> Result<Driver, LoadError> {
         let mut phases = Phases::default();
         let mut sources = SourceMap::new();
         let mut diagnostics = Vec::new();
@@ -580,17 +495,10 @@ impl<'s> Driver<'s> {
                 format!("the package walk could not answer for this project: {e}"),
             )],
         })?;
-        // The store keys a dependency's sources under the package's identity, so the walk's
-        // answer is what tells it which directories those are.
-        if let Some(store) = store.as_deref_mut() {
-            store.set_packages(package_roots(&packages));
-        }
         let mut driver = Driver {
             packages,
             root,
-            mode,
-            store,
-            whole_project,
+            incremental: false,
             answer: None,
             manifest,
             project: sources.clone(),
@@ -611,37 +519,12 @@ impl<'s> Driver<'s> {
             });
         }
 
-        // The front end named the dependency modules by prefix; take the names it gave them,
-        // matched by source, so cache fingerprints key the same modules it answered for.
-        for i in self.own()..self.files.len() {
-            if self.files[i].shipped {
-                continue;
-            }
-            if let Some(info) = front
-                .check
-                .modules
-                .values()
-                .find(|m| m.source == self.files[i].source)
-            {
-                self.files[i].module = info.name.clone();
-            }
-        }
-
-        let stdlib = self.stdlib_notice(&front.hashes);
-        let writing = Instant::now();
-        let cache = self.write_back(&front);
-        self.phases.write_back += writing.elapsed();
-
-        let mut warnings = stdlib;
-        warnings.extend(
-            front
-                .diagnostics
-                .iter()
-                .filter(|d| !self.in_shipped(d))
-                .cloned(),
-        );
-        warnings.extend(cache);
-
+        let warnings = front
+            .diagnostics
+            .iter()
+            .filter(|d| !self.in_shipped(d))
+            .cloned()
+            .collect();
         let files = self
             .files
             .iter()
@@ -661,7 +544,7 @@ impl<'s> Driver<'s> {
             hashes: front.hashes.clone(),
             front,
             frontend: FrontEnd {
-                incremental: self.mode == Mode::Incremental,
+                incremental: self.incremental,
                 phases: self.phases,
                 warnings,
             },
@@ -670,14 +553,8 @@ impl<'s> Driver<'s> {
     }
 
     fn ask_the_port(&mut self) -> Result<Front, LoadError> {
-        if let Some(dump) = self.answer.take() {
-            let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
-            let started = Instant::now();
-            let answer = ply_ty::read_front(&dump, &ids).map_err(|e| {
-                self.seam_failed(&format!("the front end's answer does not read: {e}"))
-            });
-            self.phases.front += started.elapsed();
-            return answer;
+        if let Some(front) = self.answer.take() {
+            return Ok(front);
         }
         ply_codegen::c::producer::ensure_default();
         let started = Instant::now();
@@ -697,7 +574,6 @@ impl<'s> Driver<'s> {
             .map(|f| (f.module.to_string(), f.text.to_string()))
             .collect();
         let shelf = crate::shelf::sources();
-        let (defs, tests) = self.known();
         let packages = producer::Packages {
             root: self.root.to_string_lossy().into_owned(),
             manifest: self.manifest.as_ref().map(|(_, text)| text.to_string()),
@@ -715,9 +591,8 @@ impl<'s> Driver<'s> {
                 })
                 .collect(),
         };
-        let pulled =
-            ply_codegen::c::producer::front_pulling_std_with(&own, shelf, &defs, &tests, &packages)
-                .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
+        let pulled = ply_codegen::c::producer::front_pulling_std_with(&own, shelf, &packages)
+            .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
         self.place(&pulled.modules);
         // The front end parses the root's modules, then the dependency modules in walk order,
         // then the pulled shelf; the manifest slots follow them all.
@@ -768,101 +643,8 @@ impl<'s> Driver<'s> {
             });
         }
         let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
-        let front = ply_ty::read_front(&pulled.dump, &ids)
-            .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))?;
-        // What the front end called each file, which for a dependency's is not what the walk called
-        // it: the walk names it relative to its own package, and the prefix that reaches it is the
-        // front end's to decide from the manifest closure. Without this its rows cannot be filed,
-        // and the next run cannot reuse them.
-        self.name_files(&front);
-        Ok(front)
-    }
-
-    /// Every file the front end read is filed under the module the front end gave it. A file it did
-    /// not answer for — a manifest, whose frame is not a module — keeps the name the walk gave it.
-    fn name_files(&mut self, front: &Front) {
-        let named: BTreeMap<SourceId, ModuleName> = front
-            .check
-            .modules
-            .values()
-            .map(|m| (m.source, m.name.clone()))
-            .collect();
-        for file in &mut self.files {
-            if let Some(name) = named.get(&file.source) {
-                file.module = name.clone();
-            }
-        }
-    }
-
-    /// What the last answer published, definition by definition and test by test. The front end
-    /// takes a row wherever this program hashes that item the same, so a run walks what moved and
-    /// what depends on it, and nothing else. A row filed under a hash nothing has now is ignored.
-    fn known(&self) -> (Vec<KnownDef>, Vec<KnownTest>) {
-        let (mut defs, mut tests) = (Vec::new(), Vec::new());
-        if self.mode != Mode::Incremental {
-            return (defs, tests);
-        }
-        let Some(store) = self.store.as_deref() else {
-            return (defs, tests);
-        };
-        let filed: Vec<Arc<SourceFingerprint>> = self
-            .fingerprinted()
-            .into_iter()
-            .filter_map(|path| store.fingerprint(&path))
-            .collect();
-        // What each effect hashed to when these rows were filed, which is what witnesses them.
-        let recorded: BTreeMap<Symbol, DefHash> = filed
-            .iter()
-            .flat_map(|f| f.defs.iter())
-            .filter(|e| e.kind == DefKind::Effect)
-            .map(|e| (e.name.clone(), e.hash))
-            .collect();
-
-        for fingerprint in &filed {
-            for entry in &fingerprint.defs {
-                if entry.kind != DefKind::Fn {
-                    continue;
-                }
-                let Some(cached) = store.def_of(entry.hash, &entry.name) else {
-                    continue;
-                };
-                defs.push(KnownDef {
-                    name: entry.name.to_string(),
-                    hash: entry.hash,
-                    witness: witness_for(&recorded, &[&cached.footprint, &cached.performed]),
-                    footprint: ply_ty::print_footprint(&cached.footprint),
-                    performed: ply_ty::print_footprint(&cached.performed),
-                });
-            }
-            for test in &fingerprint.tests {
-                tests.push(KnownTest {
-                    key: format!("{}.{}", fingerprint.module, test.name),
-                    hash: test.hash,
-                    witness: witness_for(&recorded, &[&test.footprint]),
-                    footprint: ply_ty::print_footprint(&test.footprint),
-                });
-            }
-        }
-        (defs, tests)
-    }
-
-    /// The files a fingerprint may be on record for, before the port says which are in play: the
-    /// project's own, each dependency's, then every module this binary ships, under the path each is
-    /// keyed by.
-    fn fingerprinted(&self) -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = self.files[..self.own()]
-            .iter()
-            .map(|f| f.path.clone())
-            .collect();
-        for package in &self.packages {
-            out.extend(package.files.iter().map(|(path, _, _)| path.clone()));
-        }
-        out.extend(
-            crate::shelf::sources()
-                .iter()
-                .map(|(name, _)| crate::shelf::pseudo_path(&ModuleName::from_dotted(name))),
-        );
-        out
+        ply_codegen::c::dump::read(&pulled.dump, &ids)
+            .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))
     }
 
     /// Shipped modules follow the project's files, placed as the port pulls them in.
@@ -907,179 +689,19 @@ impl<'s> Driver<'s> {
     fn seam_failed(&self, why: &str) -> LoadError {
         LoadError {
             sources: self.sources.clone(),
-            diagnostics: vec![
-                Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    format!("the front end could not answer for this program: {why}"),
-                )
-                .primary(Span::DUMMY, "nothing was checked, so nothing is claimed")
-                .note("this is Ply's fault: the compiler's own front end is what failed here")
-                .note("the emitter comes from `crates/ply-compiler/bootstrap`; sources with no bundle are emitted by the one this binary carries"),
-            ],
+            diagnostics: vec![port_failed(why)],
         }
-    }
-
-    /// What a compiler upgrade did to this project, said once.
-    fn stdlib_notice(&self, hashes: &HashOutput) -> Vec<Diagnostic> {
-        if self.mode != Mode::Incremental {
-            return Vec::new();
-        }
-        let Some(store) = self.store.as_deref() else {
-            return Vec::new();
-        };
-        let current = ply_std::digest_short();
-        let Some(previous) = store.stdlib_digest() else {
-            return Vec::new();
-        };
-        if previous == current {
-            return Vec::new();
-        }
-
-        let mut moved: BTreeSet<Symbol> = BTreeSet::new();
-        // Keyed, not placed: a shipped module's key is not relative to this run's root.
-        for path in store.source_keys().into_iter().map(PathBuf::from) {
-            if !ply_std::is_pseudo_path(&path) {
-                continue;
-            }
-            let Some(fingerprint) = store.fingerprint(&path) else {
-                continue;
-            };
-            for entry in &fingerprint.defs {
-                let now = hashes
-                    .defs
-                    .get(&entry.name)
-                    .or_else(|| hashes.decls.get(&entry.name));
-                if now != Some(&entry.hash) {
-                    moved.insert(entry.name.clone());
-                }
-            }
-        }
-
-        let reached = hashes
-            .defs
-            .keys()
-            .chain(hashes.decls.keys())
-            .filter(|name| {
-                hashes
-                    .closure
-                    .get(*name)
-                    .is_some_and(|closure| closure.iter().any(|n| moved.contains(n)))
-            })
-            .count();
-
-        let what = match reached {
-            0 => "no definition this program reaches changed".to_string(),
-            1 => "1 definition this program reaches changed".to_string(),
-            n => format!("{n} definitions this program reaches changed"),
-        };
-        vec![
-            Diagnostic::warning(
-                codes::STDLIB_CHANGED,
-                format!("the modules that ship with `ply` moved: {previous} -> {current}"),
-            )
-            .note(what)
-            .note("a `std` definition hashes like any other, so only what a change reached re-runs")
-            .note("`ply std` lists the shipped modules and this digest"),
-        ]
-    }
-
-    fn write_back(&mut self, front: &Front) -> Vec<Diagnostic> {
-        if self.mode != Mode::Incremental {
-            return Vec::new();
-        }
-        let witnesses = witnesses(&front.hashes);
-        let paths: Vec<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
-        let whole_project = self.whole_project;
-
-        let fingerprints: Vec<(usize, SourceFingerprint)> = (0..self.files.len())
-            .filter_map(|i| self.fingerprint_of(i, front).map(|f| (i, f)))
-            .collect();
-        let interfaces = interfaces(front, &witnesses);
-        let bodies = stored_bodies(front);
-
-        let Some(store) = self.store.as_deref_mut() else {
-            return Vec::new();
-        };
-        for (hash, entry) in interfaces {
-            match entry {
-                Interface::Def(def) => store.put_def(hash, def),
-                Interface::Decl(decl) => store.put_decl(hash, decl),
-            }
-        }
-        for (hash, body) in bodies {
-            store.put_body(hash, body);
-        }
-        for (i, fingerprint) in fingerprints {
-            store.put_source(&paths[i], fingerprint);
-        }
-        // A `std` module no longer imported is pruned like any file that left the program.
-        if whole_project {
-            store.prune(&paths);
-        }
-        store.set_stdlib_digest(ply_std::digest_short());
-        match store.flush() {
-            Ok(()) => Vec::new(),
-            // A flush writes both caches, so naming the one that failed would be a guess.
-            Err(e) => vec![
-                Diagnostic::warning(
-                    codes::CACHE_UNREADABLE,
-                    format!("could not update the cache: {e:#}"),
-                )
-                .note("this run is unaffected; the next one will do this work again"),
-            ],
-        }
-    }
-
-    fn fingerprint_of(&self, i: usize, front: &Front) -> Option<SourceFingerprint> {
-        let file = &self.files[i];
-        let info = front.check.modules.get(file.module.as_symbol())?;
-        let hashes = &front.hashes;
-        let mut fingerprint = SourceFingerprint::new(file.content);
-        fingerprint.module = file.module.to_string();
-
-        // A name in two namespaces is in `items` twice and gets one entry per namespace.
-        let mut seen: BTreeSet<&Symbol> = BTreeSet::new();
-        for name in &info.items {
-            if seen.insert(name) {
-                fingerprint.defs.extend(def_entries(front, name));
-            }
-        }
-
-        for (index, test) in front
-            .check
-            .tests
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.module == file.module)
-        {
-            fingerprint.tests.push(CachedTest {
-                name: test.name.clone(),
-                hash: *hashes.tests.get(index)?,
-                nondet: test.nondet,
-                footprint: test.footprint.clone(),
-                span: FileSpan::of(test.span),
-            });
-        }
-        Some(fingerprint)
     }
 }
 
-/// The declaration each effect these rows name had, by name and hash. A row is about the program
-/// that filed it only while the effects it names are still those declarations; a prelude effect is
-/// declared by no source, so it has no entry and no edit can rename it.
-fn witness_for(
-    recorded: &BTreeMap<Symbol, DefHash>,
-    rows: &[&ply_ty::Footprint],
-) -> Vec<(String, DefHash)> {
-    let named: BTreeSet<&Symbol> = rows
-        .iter()
-        .flat_map(|row| row.atoms())
-        .map(|a| &a.effect)
-        .collect();
-    named
-        .into_iter()
-        .filter_map(|effect| Some((effect.to_string(), *recorded.get(effect)?)))
-        .collect()
+fn port_failed(why: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the front end could not answer for this program: {why}"),
+    )
+    .primary(Span::DUMMY, "nothing was checked, so nothing is claimed")
+    .note("this is Ply's fault: the compiler's own front end is what failed here")
+    .note("the emitter comes from `crates/ply-compiler/bootstrap`; sources with no bundle are emitted by the one this binary carries")
 }
 
 /// `from` and every module it imports, transitively, in order.
@@ -1121,11 +743,6 @@ fn module_key<'a>(
     ContentHash::of(&key)
 }
 
-enum Interface {
-    Def(CachedDef),
-    Decl(CachedDecl),
-}
-
 /// Files in load order, then items as written; the port answers dependency-first.
 fn published_order(front: &Front) -> ply_ty::CheckOutput {
     let mut check = front.check.clone();
@@ -1142,185 +759,4 @@ fn published_order(front: &Front) -> ply_ty::CheckOutput {
     defs.extend(check.defs.drain(..));
     check.defs = defs;
     check
-}
-
-/// Two entries when the source spells one name in two namespaces.
-fn def_entries(front: &Front, name: &Symbol) -> Vec<DefEntry> {
-    let hashes = &front.hashes;
-    let mut out = Vec::new();
-    let mut entry = |kind: DefKind, hash: DefHash, span: Span, members: Vec<Member>| {
-        out.push(DefEntry {
-            name: name.clone(),
-            hash,
-            span: FileSpan::of(span),
-            kind,
-            members,
-        });
-    };
-
-    if let (Some(def), Some(&hash)) = (front.check.defs.get(name), hashes.defs.get(name)) {
-        entry(DefKind::Fn, hash, def.span, Vec::new());
-    }
-    if let (Some(ty), Some(&hash)) = (front.types.get(name), hashes.decls.get(name)) {
-        entry(DefKind::Type, hash, ty.span, ctor_members(front, name));
-    }
-    if let (Some(effect), Some(&hash)) = (front.check.effects.get(name), hashes.decls.get(name)) {
-        let ops = effect
-            .ops
-            .values()
-            .map(|op| Member {
-                name: op.name.clone(),
-                span: FileSpan::of(op.span),
-            })
-            .collect();
-        entry(DefKind::Effect, hash, effect.span, ops);
-    }
-    out
-}
-
-/// A sum type's constructors in declaration order; an alias has none.
-fn ctors_of<'a>(front: &'a Front, type_name: &Symbol) -> Vec<&'a ply_ty::CtorInfo> {
-    let mut out: Vec<&ply_ty::CtorInfo> = front
-        .check
-        .ctors
-        .values()
-        .filter(|c| &c.type_name == type_name)
-        .collect();
-    out.sort_by_key(|c| c.index);
-    out
-}
-
-fn ctor_members(front: &Front, type_name: &Symbol) -> Vec<Member> {
-    ctors_of(front, type_name)
-        .into_iter()
-        .map(|c| Member {
-            name: c.simple_name.clone(),
-            span: FileSpan::of(c.span),
-        })
-        .collect()
-}
-
-/// Slots are keyed by the witnessed name, so definitions sharing a hash keep their own entries.
-fn witnesses(hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
-    let mut out = BTreeMap::new();
-    let named = |name: &Symbol| -> Option<NameRef> {
-        hashes
-            .defs
-            .get(name)
-            .or_else(|| hashes.decls.get(name))
-            .map(|hash| NameRef::new(name.clone(), *hash))
-    };
-    let is_decl = |name: &Symbol| hashes.decls.contains_key(name);
-
-    for (name, hash) in hashes.defs.iter().chain(hashes.decls.iter()) {
-        let mut witness = vec![NameRef::new(name.clone(), *hash)];
-        if let Some(deps) = hashes.deps.get(name) {
-            witness.extend(deps.iter().filter(|d| is_decl(d)).filter_map(&named));
-        }
-        if let Some(closure) = hashes.closure.get(name) {
-            witness.extend(closure.iter().filter(|d| is_decl(d)).filter_map(&named));
-        }
-        out.insert(name.clone(), witness);
-    }
-    out
-}
-
-fn interfaces(
-    front: &Front,
-    witnesses: &BTreeMap<Symbol, Vec<NameRef>>,
-) -> Vec<(DefHash, Interface)> {
-    let hashes = &front.hashes;
-    let mut out = Vec::new();
-
-    for (name, d) in &front.check.defs {
-        let (Some(&hash), Some(names)) = (hashes.defs.get(name), witnesses.get(name)) else {
-            continue;
-        };
-        out.push((
-            hash,
-            Interface::Def(
-                CachedDef::new(d.scheme.clone(), d.footprint.clone(), d.performed.clone())
-                    .witnessed_by(names.clone()),
-            ),
-        ));
-    }
-
-    for (name, t) in &front.types {
-        let (Some(&hash), Some(names)) = (hashes.decls.get(name), witnesses.get(name)) else {
-            continue;
-        };
-        let ctors = ctors_of(front, name)
-            .into_iter()
-            .map(|c| CachedCtor {
-                fields: c.fields.clone(),
-                scheme: c.scheme.clone(),
-            })
-            .collect();
-        out.push((
-            hash,
-            Interface::Decl(
-                CachedDecl::new(DeclBody::Type {
-                    arity: t.arity,
-                    ctors,
-                })
-                .witnessed_by(names.clone()),
-            ),
-        ));
-    }
-
-    // A prelude effect is declared by no source, so it has no `decls` entry.
-    for (name, e) in &front.check.effects {
-        let (Some(&hash), Some(names)) = (hashes.decls.get(name), witnesses.get(name)) else {
-            continue;
-        };
-        let ops = e
-            .ops
-            .values()
-            .map(|o| CachedOp {
-                name: o.name.clone(),
-                mode: o.mode,
-                resource_param: o.resource_param,
-                params: o.params.clone(),
-                ret: o.ret.clone(),
-            })
-            .collect();
-        out.push((
-            hash,
-            Interface::Decl(
-                CachedDecl::new(DeclBody::Effect {
-                    nondet: e.nondet,
-                    ops,
-                })
-                .witnessed_by(names.clone()),
-            ),
-        ));
-    }
-    out
-}
-
-/// A name in two namespaces has two bodies, so each body is matched to its hash, not assumed.
-fn stored_bodies(front: &Front) -> Vec<(DefHash, DefBody)> {
-    let hashes = &front.hashes;
-    let mut by_name: BTreeMap<&Symbol, Vec<StoredBody>> = BTreeMap::new();
-    for (name, bytes) in &front.bodies {
-        if let Some(body) = StoredBody::from_bytes(bytes.clone()) {
-            by_name.entry(name).or_default().push(body);
-        }
-    }
-    let mut out = Vec::new();
-    for (name, stored) in by_name {
-        for hash in [hashes.defs.get(name), hashes.decls.get(name)]
-            .into_iter()
-            .flatten()
-        {
-            let found = match stored.as_slice() {
-                [only] => Some(only),
-                many => many.iter().find(|b| b.verify(*hash)),
-            };
-            if let Some(body) = found {
-                out.push((*hash, DefBody::of(body.clone())));
-            }
-        }
-    }
-    out
 }

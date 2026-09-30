@@ -32,6 +32,7 @@ of it next.
 | `crates/ply-machine` | the nested-entry capability: a program loading and entering another program |
 | `crates/ply-std` | the standard library, as Ply source in `ply/` |
 | `crates/ply-cli` | the `ply` program, as Ply source in `ply/` and the artifact it builds (`bootstrap/`); not a cargo crate |
+| `crates/ply-registry` | the package registry `ply publish` and `ply resolve` talk to, as Ply source in `ply/`; not a cargo crate |
 | `crates/ply-launcher` | the `ply` binary: enters the program the artifact holds |
 | `crates/ply-corpus` | the benchmark corpus as a Ply program (`ply/`), the checks that run it end to end (`checks/`) and the programs it measures (`fixtures/`); not a cargo crate |
 | `crates/<crate>-tests` | that crate's tests |

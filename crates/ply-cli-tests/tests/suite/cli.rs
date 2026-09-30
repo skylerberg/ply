@@ -1683,11 +1683,7 @@ fn cache_inspect_prints_a_resolved_type_rather_than_a_serialization() {
         "effect db {\n  read all[t]() -> List<Int>\n}\n\
          fn active(n: Int) -> List<Int> / {db.read[users]} = db.all[users]()\n",
     );
-    // Populates the front-end cache without running anything, as `ply check` once did.
-    ply(dir.path())
-        .args(["test", "--filter", "nonexistent"])
-        .assert()
-        .success();
+    ply(dir.path()).arg("check").assert().success();
 
     let out = ply(dir.path())
         .args(["cache", "inspect", "active"])
@@ -1716,11 +1712,7 @@ fn cache_inspect_prints_a_resolved_type_rather_than_a_serialization() {
 #[test]
 fn cache_inspect_accepts_a_hash_prefix_and_emits_json() {
     let dir = project(GREEN);
-    // Populates the front-end cache without running anything, as `ply check` once did.
-    ply(dir.path())
-        .args(["test", "--filter", "nonexistent"])
-        .assert()
-        .success();
+    ply(dir.path()).arg("check").assert().success();
 
     let v = json_of(
         &ply(dir.path())
@@ -1761,11 +1753,7 @@ fn cache_inspect_accepts_a_hash_prefix_and_emits_json() {
 #[test]
 fn cache_inspect_of_an_unknown_name_is_e0101_and_exits_two() {
     let dir = project(GREEN);
-    // Populates the front-end cache without running anything, as `ply check` once did.
-    ply(dir.path())
-        .args(["test", "--filter", "nonexistent"])
-        .assert()
-        .success();
+    ply(dir.path()).arg("check").assert().success();
 
     let out = ply(dir.path())
         .args(["cache", "inspect", "no_such_thing"])
@@ -1787,11 +1775,7 @@ fn cache_inspect_of_an_unknown_name_is_e0101_and_exits_two() {
 #[test]
 fn cache_inspect_reports_a_test_and_whether_it_is_proven() {
     let dir = project(GREEN);
-    // Populates the front-end cache without running anything, as `ply check` once did.
-    ply(dir.path())
-        .args(["test", "--filter", "nonexistent"])
-        .assert()
-        .success();
+    ply(dir.path()).arg("check").assert().success();
     let v = json_of(
         &ply(dir.path())
             .args(["cache", "inspect", "double doubles", "--json"])
