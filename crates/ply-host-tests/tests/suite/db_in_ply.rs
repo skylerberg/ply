@@ -173,7 +173,7 @@ fn call_err(entry: &str, url: &str) -> String {
 
 fn cluster() -> Option<(crate::support::cluster::Cluster, String)> {
     if !crate::support::cluster::available() {
-        eprintln!("skipping: this machine has no initdb and postgres");
+        eprintln!("skipping: postgres is not installed here");
         return None;
     }
     // A password, so the connection is SCRAM rather than trust.
