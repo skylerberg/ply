@@ -3,7 +3,8 @@
 // hands them back where it put them.
 
 import spine (num)
-import std.bytes (u32_le, u64_le, u32_at, u64_at, slice_at)
+import std.bytes (u32_le, u64_le, u32_at, u64_at, slice_at, hex_of)
+import std.hash (blake3)
 
 fn at<a>(xs: List<a>, i: Int) -> a =
   match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
@@ -238,14 +239,24 @@ fn table_of(b: Bytes, count: Int, table: Int, n: Int) -> Result<List<Placed>, Re
     })
 
 // The header and the section table of `b`, believed only as far as `b` reaches.
-pub fn decode(b: Bytes) -> Result<Opened, Refusal> = {
+pub fn decode(b: Bytes) -> Result<Opened, Refusal> = decode_as(magic(), b"program artifact", b)
+
+// A library's `.plyz`, read by the same rules under its own magic.
+pub fn decode_library(b: Bytes) -> Result<Opened, Refusal> =
+  decode_as(library_magic(), b"library", b)
+
+fn decode_as(container_magic: Bytes, what: Bytes, b: Bytes) -> Result<Opened, Refusal> = {
   let n = bytes_len(b);
   if n < header_len() { Err(truncated(0, header_len(), n)) } else if slice_at(b, 0, 8)
-      != Some(magic()) {
+      != Some(container_magic) {
     Err({
       stale: false,
-      note: b"`ply build` writes one; the first eight bytes are `PLYPROG1`",
-      message: b"this file is not a Ply program artifact",
+      note: bytes_concat_all([
+        b"`ply build` writes one; the first eight bytes are `",
+        container_magic,
+        b"`",
+      ]),
+      message: bytes_concat(b"this file is not a Ply ", what),
     })
   } else {
     let written = word(b, off_format());
@@ -292,6 +303,24 @@ pub fn decode(b: Bytes) -> Result<Opened, Refusal> = {
 pub fn covers(n: Int) -> Option<List<Range>> =
   if n < off_sections() { None }
   else { Some([{ at: off_entry(), len: 32 }, { at: off_sections(), len: n - off_sections() }]) }
+
+// What a container is sealed with under `into`, its domain: the one digest a writer splices in, a
+// reader checks, and a registry names a library by. `None` for a file too short to be a container.
+pub fn digest_of(into: Bytes, container: Bytes) -> Option<Bytes> =
+  match covers(bytes_len(container)) {
+    None -> None,
+    Some(ranges) ->
+      Some(
+        blake3(
+          bytes_concat_all(
+            append([into], map(ranges, |r: Range| bytes_slice(container, r.at, r.at + r.len))),
+          ),
+        ),
+      ),
+  }
+
+// A digest as a lock, an index and a report spell it.
+pub fn digest_text(d: Bytes) -> String = "b3:" ++ hex_of(d)
 
 // The domain a program digest is taken under, where it is written, and the ranges of the file it
 // covers, so a host hashes what this module says and nothing else.
@@ -370,6 +399,46 @@ test "the digest covers the entry point and the sections, and never its own fiel
       assert_eq(at(rs, 1), { at: off_sections(), len: bytes_len(bytes) - off_sections() });
       assert(off_digest() >= off_entry() + 32);
       assert(off_digest() + 32 <= off_sections())
+    },
+  }
+}
+
+test "a digest is its domain and the covered ranges, whatever its own field holds" {
+  let bytes = encode_named(library_magic(), sample(), [
+    { name: b"sources", count: 0, payload: b"" },
+  ]);
+  let tail = bytes_slice(bytes, off_sections(), bytes_len(bytes));
+  let want = blake3(bytes_concat_all([library_domain(), fill(0x44), tail]));
+  assert_eq(digest_of(library_domain(), bytes), Some(want));
+  let spliced = bytes_concat_all([
+    bytes_slice(bytes, 0, off_digest()),
+    want,
+    bytes_slice(bytes, off_digest() + 32, bytes_len(bytes)),
+  ]);
+  assert_eq(digest_of(library_domain(), spliced), Some(want));
+  assert(digest_of(domain(), bytes) != Some(want));
+  assert_eq(digest_of(library_domain(), b"short"), None);
+  assert_eq(digest_text(b"\x01\xab"), "b3:01ab")
+}
+
+test "a library reads back under its own magic, and a program is not a library" {
+  let lib = encode_named(library_magic(), sample(), [
+    { name: b"manifest", count: 1, payload: b"m" },
+  ]);
+  let x = match decode_library(lib) {
+    Ok(x) -> x,
+    Err(_) -> panic("a library this module wrote must read back"),
+  };
+  assert_eq(len(x.sections), 1);
+  match decode(lib) {
+    Ok(_) -> panic("a library is not a program"),
+    Err(e) -> assert(says(e.message, b"not a Ply program artifact")),
+  };
+  match decode_library(encode(sample(), [])) {
+    Ok(_) -> panic("a program is not a library"),
+    Err(e) -> {
+      assert(says(e.message, b"not a Ply library"));
+      assert(says(e.note, b"PLYLIB01"))
     },
   }
 }
