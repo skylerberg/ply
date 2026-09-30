@@ -789,3 +789,139 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
         "the raising call's steps were not counted: {answer}"
     );
 }
+
+/// The outer program: call the constant `inner.constant` twice, reading the accounting after
+/// each; its twin twice under one read; then a name the inner program never defined.
+const OUTER_TOTAL: &str = r#"
+nondet effect machine {
+  write configure[m](options: Options) -> Unit
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
+  read reload[m](front: Front) -> Result<Target, Refusal>
+  read bound[m](entry: String) -> Result<Bound, Refusal>
+  write enter[m]() -> Ended
+  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read accounting[m]() -> Accounting
+  write drop[m]() -> Unit
+}
+
+type Accounting = { steps: Int, micros: Int, counters: Counters }
+type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
+type Options = Unit
+type Target = Unit
+type Walked = Unit
+type Bound = Unit
+type Front = {
+  dump: Bytes,
+  files: List<{ path: String, name: String, text: Bytes }>,
+  read_ms: Int,
+  front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
+}
+type Refusal = Unit
+type Ended = Unit
+type Raised = { code: String, message: String }
+type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Spent = { answers: List<Int>, ran: Int, remembered: Int, both: Int, declined: Int }
+
+fn spent() -> Int / {machine.accounting[m]} = (machine.accounting[m]()).steps
+
+fn answered(r: Result<Value, Raised>) -> Int =
+  match r { Ok(v) -> match v { VInt(i) -> i, _ -> 0 - 2 }, Err(_) -> 0 - 1 }
+
+fn main(root: String, front: Front) -> Spent / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
+  let _loaded = machine.load[m](root, Some(front), None);
+  let _bound = machine.bound[m]("inner.main");
+  let first = answered(machine.call[m]("inner.constant", []));
+  let ran = spent();
+  let again = answered(machine.call[m]("inner.constant", []));
+  let remembered = spent();
+  let twin = answered(machine.call[m]("inner.twin", []));
+  let twin_again = answered(machine.call[m]("inner.twin", []));
+  let both = spent();
+  let absent = answered(machine.call[m]("inner.absent", []));
+  let declined = spent();
+  machine.drop[m]();
+  {
+    answers: [first, again, twin, twin_again, absent],
+    ran: ran,
+    remembered: remembered,
+    both: both,
+    declined: declined,
+  }
+}
+"#;
+
+const INNER_TOTAL: &str = r#"
+fn main() -> Int = 0
+
+fn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }
+
+pub fn constant() -> Int = deep(50)
+
+pub fn twin() -> Int = deep(50)
+"#;
+
+/// A driver totals each entry's own steps: a memo's answer and a declined call add none, so a
+/// constant run and then answered from the memo costs one run of its body, not two.
+#[test]
+fn a_memo_answer_and_a_decline_add_no_steps_to_the_accounting() {
+    let project = project(INNER_TOTAL);
+    let front = front_of(OUTER_TOTAL);
+    let texts: HashMap<String, String> = [("m".to_string(), OUTER_TOTAL.to_string())]
+        .into_iter()
+        .collect();
+    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
+    let mut registry = HostRegistry::new();
+    ply_machine::register_with_for(
+        &mut registry,
+        ply_machine::drive::RunOptions::default(),
+        "m",
+    );
+    let binding = registry.bind(&front.check).expect("the machine ops bind");
+    machine.set_host_binding(Arc::new(binding));
+    let answer = machine
+        .call(
+            "m.main",
+            vec![
+                Value::str(project.path().display().to_string()),
+                crate::fixture::handed(project.path()),
+            ],
+            Span::DUMMY,
+        )
+        .expect("the outer main ran");
+    let int = |value: &Value| {
+        value
+            .as_int(Span::DUMMY, "a count")
+            .unwrap_or_else(|d| panic!("{d}: {answer}"))
+    };
+    let Value::List(answers) = field(&answer, "answers") else {
+        panic!("the answers are a list: {answer}");
+    };
+    // `inner.absent` is declined, which the machine answers as a raise.
+    assert_eq!(
+        answers.iter().map(int).collect::<Vec<_>>(),
+        [50, 50, 50, 50, -1],
+        "{answer}"
+    );
+    let ran = int(field(&answer, "ran"));
+    assert!(ran > 0, "the first call's steps were not counted: {answer}");
+    assert_eq!(
+        int(field(&answer, "remembered")),
+        0,
+        "the memo's answer added the call before it to the accounting: {answer}"
+    );
+    assert_eq!(
+        int(field(&answer, "both")),
+        ran,
+        "a run and the memo's answer after it were totalled as two runs: {answer}"
+    );
+    assert_eq!(
+        int(field(&answer, "declined")),
+        0,
+        "the declined call added the call before it to the accounting: {answer}"
+    );
+}
