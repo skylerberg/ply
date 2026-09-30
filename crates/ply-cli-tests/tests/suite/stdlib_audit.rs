@@ -1,5 +1,4 @@
-use crate::harness::{ply, write};
-use ply_machine::driver;
+use crate::harness::{json_of, ply, warm_agrees, write};
 use ply_machine::load::{Loaded, load};
 use ply_span::{Symbol, codes};
 use ply_store::{ContentHash, DefEntry, Store};
@@ -256,18 +255,8 @@ fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
     });
     assert!(aged, "`std.net.drain` is in the shipped fingerprint");
 
-    let mut store = Store::open(dir.path()).unwrap();
-    let loaded = driver::load_incremental(dir.path(), &mut store).unwrap();
-
-    // A cache written under an older `std.net` may be believed by none of the published hashes.
-    let scratch = load(dir.path()).unwrap();
-    for name in ["app.read_all", "std.net.drain", "elsewhere.untouched"] {
-        assert_eq!(
-            hash_of(&loaded, name),
-            hash_of(&scratch, name),
-            "`{name}` is stale after an upgrade"
-        );
-    }
+    // A cache written under an older `std.net` may be believed for none of what it moved.
+    warm_agrees(dir.path(), "after an upgrade that moved `std.net.drain`");
 }
 
 /// Zero here, and it must be said as zero rather than implied.
@@ -283,31 +272,27 @@ fn the_upgrade_notice_counts_what_moved_rather_than_what_exists() {
         store.flush().unwrap();
     }
 
-    let mut store = Store::open(dir.path()).unwrap();
-    let loaded = driver::load_incremental(dir.path(), &mut store).unwrap();
-    let warning = loaded
-        .frontend
-        .warnings
-        .iter()
-        .find(|d| d.code == codes::STDLIB_CHANGED)
+    let notices = |dir: &Path| -> Vec<serde_json::Value> {
+        let answer = json_of(&ply(dir).args(["check", "--json"]).output().unwrap());
+        answer["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["code"] == codes::STDLIB_CHANGED)
+            .cloned()
+            .collect()
+    };
+    let warned = notices(dir.path());
+    let warning = warned
+        .first()
         .expect("a cache written under another digest warns");
     assert!(
-        warning.notes.iter().any(|n| n.contains("no definition")),
-        "the notice implied work that did not happen: {:?}",
-        warning.notes
+        warning.to_string().contains("no definition"),
+        "the notice implied work that did not happen: {warning}"
     );
 
     // Once, not on every subsequent run: the digest is rewritten on the way out.
-    let mut store = Store::open(dir.path()).unwrap();
-    let again = driver::load_incremental(dir.path(), &mut store).unwrap();
-    assert!(
-        !again
-            .frontend
-            .warnings
-            .iter()
-            .any(|d| d.code == codes::STDLIB_CHANGED),
-        "W0605 repeats"
-    );
+    assert!(notices(dir.path()).is_empty(), "W0605 repeats");
 }
 
 #[test]

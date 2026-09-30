@@ -1,51 +1,8 @@
 use ply_store::schema::*;
-use ply_store::{
-    BODY_ENCODING, ContentHash, DeclBody, DefKind, FRONTEND_FORMAT, FRONTEND_VERSION, Outcome,
-};
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, Resource, Type};
+use ply_store::{BODY_ENCODING, DefKind, FRONTEND_FORMAT, FRONTEND_VERSION, Outcome};
 
 mod variant {
     use super::*;
-
-    pub(super) fn ty(t: &Type) -> &'static str {
-        match t {
-            Type::Var(_) => "Type::Var",
-            Type::Con(..) => "Type::Con",
-            Type::Fn { .. } => "Type::Fn",
-            Type::Record(_) => "Type::Record",
-        }
-    }
-
-    pub(super) fn resource(r: &Resource) -> &'static str {
-        match r {
-            Resource::Named(_) => "Resource::Named",
-            Resource::Var(_) => "Resource::Var",
-            Resource::Singleton => "Resource::Singleton",
-            Resource::Every => "Resource::Every",
-        }
-    }
-
-    pub(super) fn mode(m: Mode) -> &'static str {
-        match m {
-            Mode::Read => "Mode::Read",
-            Mode::Write => "Mode::Write",
-        }
-    }
-
-    pub(super) fn atom(a: &EffectAtom) -> &'static str {
-        match a.op {
-            Some(_) => "EffectAtom::op",
-            None => "EffectAtom::mode",
-        }
-    }
-
-    pub(super) fn decl_body(b: &DeclBody) -> &'static str {
-        match b {
-            DeclBody::Type { .. } => "DeclBody::Type",
-            DeclBody::Effect { .. } => "DeclBody::Effect",
-        }
-    }
 
     pub(super) fn def_kind(k: DefKind) -> &'static str {
         match k {
@@ -71,63 +28,8 @@ fn mentioned() -> Vec<&'static str> {
             seen.push(name);
         }
     };
-
-    fn walk_ty(t: &Type, note: &mut impl FnMut(&'static str)) {
-        note(variant::ty(t));
-        match t {
-            Type::Var(_) => {}
-            Type::Con(_, args) => args.iter().for_each(|a| walk_ty(a, note)),
-            Type::Fn {
-                params,
-                ret,
-                effects,
-            } => {
-                params.iter().for_each(|p| walk_ty(p, note));
-                walk_ty(ret, note);
-                for a in &effects.atoms {
-                    note(variant::atom(a));
-                    note(variant::resource(&a.resource));
-                    note(variant::mode(a.mode));
-                }
-            }
-            Type::Record(fields) => fields.values().for_each(|t| walk_ty(t, note)),
-        }
-    }
-
-    fn walk_footprint(f: &Footprint, note: &mut impl FnMut(&'static str)) {
-        for a in f.atoms() {
-            note(variant::atom(a));
-            note(variant::resource(&a.resource));
-            note(variant::mode(a.mode));
-        }
-    }
-
     for d in &e.fingerprint.defs {
         note(variant::def_kind(d.kind));
-    }
-    for t in &e.fingerprint.tests {
-        walk_footprint(&t.footprint, &mut note);
-    }
-    walk_ty(&e.def.scheme.ty, &mut note);
-    walk_footprint(&e.def.footprint, &mut note);
-    walk_footprint(&e.def.performed, &mut note);
-    for decl in [&e.type_decl, &e.effect_decl] {
-        note(variant::decl_body(&decl.body));
-        match &decl.body {
-            DeclBody::Type { ctors, .. } => {
-                for c in ctors {
-                    c.fields.iter().for_each(|f| walk_ty(f, &mut note));
-                    walk_ty(&c.scheme.ty, &mut note);
-                }
-            }
-            DeclBody::Effect { ops, .. } => {
-                for op in ops {
-                    note(variant::mode(op.mode));
-                    op.params.iter().for_each(|p| walk_ty(p, &mut note));
-                    walk_ty(&op.ret, &mut note);
-                }
-            }
-        }
     }
     for o in &e.outcomes {
         note(variant::outcome(o));
@@ -135,18 +37,134 @@ fn mentioned() -> Vec<&'static str> {
     seen
 }
 
-/// The digest of the shapes this build stores.
-const PINNED: &str = "a96375bfcc1f6f516f2ef560848bbb0c361e33a99ce7178e2c230c3c21ff5847";
+const BUMP: &str = "the on-disk schema changed. Update the bytes pinned here and bump the constant \
+                    it is keyed on: `FRONTEND_FORMAT` for a change to what an entry holds, \
+                    `FRONTEND_VERSION` for a change to what the front end files";
+
+fn le(n: u32) -> [u8; 4] {
+    n.to_le_bytes()
+}
+
+/// Every exemplar as its encoder writes it, spelled out field by field: a change to an encoder
+/// moves these bytes, so it cannot move the digest without a test saying so.
+fn pinned() -> Vec<Vec<u8>> {
+    let entry =
+        |name: &[u8], hash: u8, span: (u32, u32), kind: u8, members: &[(&[u8], u32, u32)]| {
+            let mut out: Vec<u8> =
+                [&[0x44][..], &le(name.len() as u32), name, &[hash; 32]].concat();
+            out.extend(
+                [
+                    &[0x43][..],
+                    &le(span.0),
+                    &le(span.1),
+                    &[kind],
+                    &le(members.len() as u32),
+                ]
+                .concat(),
+            );
+            for (member, start, end) in members {
+                out.extend(
+                    [
+                        &[0x41][..],
+                        &le(member.len() as u32),
+                        member,
+                        &[0x43],
+                        &le(*start),
+                        &le(*end),
+                        &[0xee],
+                    ]
+                    .concat(),
+                );
+            }
+            out.push(0xee);
+            out
+        };
+    let mut fingerprint: Vec<u8> = [&[0x67][..], &[1; 32], &le(1), b"m", &le(3)].concat();
+    fingerprint.extend(entry(b"m.f", 2, (1, 2), 0x50, &[]));
+    fingerprint.extend(entry(b"m.T", 3, (3, 4), 0x51, &[(b"A", 5, 6)]));
+    fingerprint.extend(entry(b"m.e", 4, (7, 8), 0x52, &[(b"op", 9, 10)]));
+    fingerprint.extend(
+        [
+            &le(1)[..],
+            &[0x45],
+            &le(1),
+            b"t",
+            &[5; 32],
+            &[1],
+            &[0x43],
+            &le(11),
+            &le(12),
+            &le(2),
+            &[0xa1, 0xa2],
+            &[0xee],
+            &[0xee],
+        ]
+        .concat(),
+    );
+    vec![
+        fingerprint,
+        [&[0x60][..], &le(3), b"m.f", &le(1), &[0xd1], &[0xee]].concat(),
+        [&[0x60][..], &le(3), b"m.T", &le(2), &[0xd2, 0xd3], &[0xee]].concat(),
+        [
+            &[0x66][..],
+            &le(BODY_ENCODING),
+            &le(3),
+            &[0x20, 0x01, 0xff],
+            &[0xee],
+        ]
+        .concat(),
+    ]
+}
 
 #[test]
-fn the_stored_schema_is_pinned() {
+fn the_exemplars_encode_to_the_pinned_bytes() {
+    let e = exemplars();
+    let found = vec![
+        ply_store::codec::encode_fingerprint(&e.fingerprint),
+        ply_store::codec::encode_slot(&e.def),
+        ply_store::codec::encode_slot(&e.decl),
+        ply_store::codec::encode_body(&e.body),
+    ];
+    assert_eq!(found, pinned(), "{BUMP}");
+    // The result cache stores `Outcome` as JSON, and the digest reads it in that form.
     assert_eq!(
-        fingerprint().to_hex(),
-        PINNED,
-        "the on-disk schema changed. Update PINNED to the digest above and bump the constant it \
-         is keyed on: `FRONTEND_FORMAT` (currently {FRONTEND_FORMAT}) for a change to what an \
-         entry holds, `FRONTEND_VERSION` (currently `{FRONTEND_VERSION}`) for a change to what \
-         the front end answers"
+        serde_json::to_value(&e.outcomes).unwrap(),
+        serde_json::json!([
+            { "outcome": "pass" },
+            {
+                "outcome": "fail",
+                "message": "assertion failed: expected 0, found -5",
+                "diagnostic": {
+                    "severity": "error",
+                    "code": "E0501",
+                    "message": "assertion failed",
+                    "labels": [{
+                        "span": { "source": 3, "start": 88, "end": 97 },
+                        "message": "expected 0, found -5",
+                        "primary": true
+                    }],
+                    "notes": [],
+                    "fixes": [{
+                        "title": "expect -5",
+                        "edits": [{ "span": { "source": 3, "start": 88, "end": 89 }, "text": "-5" }]
+                    }]
+                }
+            }
+        ]),
+        "{BUMP}"
+    );
+}
+
+/// The digest the index header carries is the pinned bytes' and nothing else's.
+#[test]
+fn the_stored_schema_is_the_digest_of_the_pinned_exemplars() {
+    let mut encoded = pinned();
+    encoded.push(serde_json::to_vec(&exemplars().outcomes).unwrap());
+    assert_eq!(
+        fingerprint(),
+        digest_of(BODY_ENCODING, &encoded),
+        "the schema digest reads something the pins do not: FRONTEND_FORMAT is {FRONTEND_FORMAT}, \
+         FRONTEND_VERSION is `{FRONTEND_VERSION}`"
     );
 }
 
@@ -185,37 +203,13 @@ fn the_digest_follows_the_body_encoding_generation() {
     assert_eq!(fingerprint_at(BODY_ENCODING), fingerprint());
 }
 
-/// What a body performs and what its signature publishes are two rows, and a seeded check reads
-/// them apart: an encoder that filed one where the other belongs would answer with the wrong one.
-#[test]
-fn a_definitions_published_and_performed_rows_are_not_interchangeable() {
-    let e = exemplars();
-    assert_ne!(
-        e.def.footprint, e.def.performed,
-        "the exemplar decides nothing if the two agree"
-    );
-    let transposed = ply_store::CachedDef::new(
-        e.def.scheme.clone(),
-        e.def.performed.clone(),
-        e.def.footprint.clone(),
-    )
-    .witnessed_by(e.def.names.clone());
-    assert_ne!(
-        ply_store::codec::encode_def(&e.def),
-        ply_store::codec::encode_def(&transposed)
-    );
-}
-
 #[test]
 fn the_digest_moves_when_a_stored_value_changes() {
-    let before = fingerprint();
+    let mut encoded = pinned();
+    encoded.push(serde_json::to_vec(&exemplars().outcomes).unwrap());
+    let before = digest_of(BODY_ENCODING, &encoded);
     let mut e = exemplars();
-    e.def.footprint = Footprint::empty();
-    let after = {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"ply-store schema v1");
-        hasher.update(&ply_store::codec::encode_def(&e.def));
-        ContentHash(*hasher.finalize().as_bytes())
-    };
-    assert_ne!(before, after);
+    e.def.value = vec![0xd4];
+    encoded[1] = ply_store::codec::encode_slot(&e.def);
+    assert_ne!(before, digest_of(BODY_ENCODING, &encoded));
 }
