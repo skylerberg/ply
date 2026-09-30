@@ -412,14 +412,15 @@ pub struct Race {
     pub at: u32,
 }
 
-/// What an unpruned search would have explored.
+/// What a search run beside the pruned one explored; `bounded` when a spent budget or a failure
+/// stopped it short of its frontier, so the count is a lower bound.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Naive {
+pub struct Cost {
     pub explored: u32,
     pub bounded: bool,
 }
 
-impl fmt::Display for Naive {
+impl fmt::Display for Cost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.bounded {
             write!(f, ">= {}", self.explored)
@@ -436,8 +437,10 @@ pub struct Exploration {
     pub exhaustive: bool,
     /// The budget was spent.
     pub exhausted: bool,
-    /// `--measure-reduction` only.
-    pub naive: Option<Naive>,
+    /// `--measure-reduction` only: the same search with every pair of steps dependent.
+    pub naive: Option<Cost>,
+    /// `--measure-reduction` only: the same search with every step's vector clock withheld.
+    pub blind: Option<Cost>,
     pub steps: u64,
     /// Nanoseconds of virtual time the last interleaving consumed.
     pub virtual_time: i64,
