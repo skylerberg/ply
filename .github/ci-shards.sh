@@ -54,6 +54,7 @@ SOLO=(
   "corpus-socket-bench:ply-corpus-tests:suite:served::the_socket_bench_serves_the_desk_and_its_floor"
   "corpus-database-bench:ply-corpus-tests:suite:served::the_database_bench_takes_what_needs_no_database_and_names_what_does"
   "corpus-lifecycle-bench:ply-corpus-tests:suite:served::the_lifecycle_bench_drains_and_deploys_and_names_what_needs_a_database"
+  "corpus-ladder:ply-corpus-tests:suite:served::the_ladder_serves_the_desk_and_holds_the_shipped_allocation_figure"
 )
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.

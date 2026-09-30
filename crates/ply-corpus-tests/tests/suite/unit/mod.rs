@@ -8,7 +8,6 @@ mod payload;
 mod real;
 mod regions;
 mod simulate;
-mod w6;
 
 use crate::support::{generate, product, product_document};
 use serde_json::Value;
