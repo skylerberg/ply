@@ -1,22 +1,29 @@
 // The corpus's command line and its entry point. The line is declared once as a cmdline spec — the
 // CLI package's library, not a copy of it — and `main` answers it: help, a version and a refusal
-// here; `gen`, `bench`, `sweep` and `real` in this package; and every other subcommand as a JSON
-// plan handed to the Rust executor bound as `executor`, whose output and exit code are this
-// program's own.
+// here; `gen`, and `bench`, `sweep`, `real`, `measure`, `payload`, `regions` and `tiers`, each
+// answering a report, in this package; and `sim`, `prove` and the request path as a JSON plan
+// handed to the Rust executor bound as `executor`, whose output and exit code are this program's own.
 //
 // It runs under `ply run` (`benches/corpus.sh` holds the whole line) with two filesystem roots:
 // `work`, bound at the working directory, which every path this program reads, writes or spawns in
 // is relative to, and `repo`, the checkout whose standard library the in-process measurements are
-// checked against.
+// checked against and whose corpus sources a report is pinned by. It is lent the `machine` family
+// for the in-process measurements and the `claims` family for `tiers`.
 
+import cli.claims (prover)
 import cli.cmdline
 import cli.machine (machine)
 import bench
 import gbuild
 import gen
+import measure
+import payload
 import real
+import regions
+import report
 import spine
 import sweep
+import tiers
 import std.json (Json, Str, Number, Bool, Null, object, array)
 import std.json
 import std.fs (fs)
@@ -97,7 +104,7 @@ fn inside(v: String) -> Result<Unit, String> =
 fn dir_flag(long: String, help: String) -> cmdline::Flag =
   cmdline::checking(cmdline::valued(long, "DIR", cmdline::Text, help), inside)
 
-fn json_switch() -> cmdline::Flag = sw("json", "The measurements as JSON rather than a table")
+fn json_switch() -> cmdline::Flag = sw("json", "The report as JSON rather than a table")
 
 // The knobs a generated corpus's shape takes, at the generator's own defaults.
 fn shape_flags() -> List<cmdline::Flag> = {
@@ -182,28 +189,29 @@ pub fn spec() -> cmdline::Spec =
             json_switch(),
           ],
         ),
-        cmdline::with_positionals(
-          cmdline::command(
-            "measure",
-            "Price interpreter throughput, fixture open against rebuild, and resumption cost",
+        cmdline::with_extra(
+          cmdline::with_positionals(
+            cmdline::command(
+              "measure",
+              "Price a call and a resumption in-process, and a corpus's store, throughput and schedule",
+              [
+                nat("repeats", 3, "Repeats per measurement; the fastest is reported"),
+                sw("only-throughput", "Only the corpus's tests on one worker, first and steady"),
+                json_switch(),
+              ],
+            ),
             [
-              nat("repeats", 3, "Repeats per measurement; the fastest is reported"),
-              nats(
-                "cells",
-                "1,100,1000,10000,100000",
-                "Fixture sizes for the open-against-rebuild comparison",
+              cmdline::defaulted(
+                "corpus",
+                "A directory a previous `gen` wrote; omit it for the in-process rows alone",
+                "",
               ),
-              sw("only-throughput", "Skip everything but the throughput table"),
-              json_switch(),
             ],
           ),
-          [
-            cmdline::defaulted(
-              "corpus",
-              "A directory a previous `gen` wrote; omit it for fixture and resumption cost",
-              "",
-            ),
-          ],
+          |p: cmdline::Parsed| {
+            let corpus = cmdline::nth_of(p.positionals, 0, "");
+            if corpus == "" { Ok(()) } else { inside(corpus) }
+          },
         ),
         cmdline::with_positionals(
           cmdline::command(
@@ -223,11 +231,10 @@ pub fn spec() -> cmdline::Spec =
         cmdline::with_positionals(
           cmdline::command(
             "prove",
-            "Price the spec tier: where obligations land, why some fell short, what shrinking bought",
+            "Price the spec tier: where obligations land, and why some fell short",
             [
               nat("cases", 200, "Cases the prover generates per obligation"),
               nat("prove-budget", 10000, "The prover's budget per obligation"),
-              nat("shrink-budget", 500, "The shrinker's budget per failure"),
               json_switch(),
             ],
           ),
@@ -280,10 +287,6 @@ pub fn spec() -> cmdline::Spec =
               "processes",
               4,
               "Processes the `map_keys` order check spawns; two is the minimum to see a hasher seed",
-            ),
-            opt(
-              "ply",
-              "The `ply` binary the order check drives; the executor's sibling when left off",
             ),
             nat("repeats", 3, "Repeats per point; the fastest is reported"),
             sw("no-derivation", "Drop the derivation comparison, the slow half"),
@@ -455,38 +458,57 @@ pub fn spec() -> cmdline::Spec =
             opt("write-control", "Where the control measurement is written"),
           ],
         ),
-        cmdline::with_positionals(
-          cmdline::command(
-            "regions",
-            "Price region isolation: colour the tests with and without the world-backed exemption",
+        cmdline::with_extra(
+          cmdline::with_positionals(
+            cmdline::command(
+              "regions",
+              "Price region isolation: colour the tests with and without the world-backed exemption",
+              [
+                nat(
+                  "jobs",
+                  8,
+                  "Workers the wall-clock columns are modelled at and the suite is measured with",
+                ),
+                texts(
+                  "hypothetical",
+                  "A hypothetical footprint, `cells:labels`; repeat for each row",
+                ),
+                nat(
+                  "hypothetical-shared",
+                  10,
+                  "Tests carrying a contending resource atom in each hypothetical row",
+                ),
+                nat("hypothetical-pure", 165, "Pure tests in each hypothetical row"),
+                sw("std", "Include shipped modules' tests, as `ply test --std` does"),
+                json_switch(),
+              ],
+            ),
             [
-              nat(
-                "jobs",
-                8,
-                "Workers the wall-clock columns are modelled at and the suite is measured with",
+              cmdline::many(
+                cmdline::defaulted(
+                  "roots",
+                  "Projects to analyse, each run the way `ply test` runs one",
+                  "",
+                ),
               ),
-              texts(
-                "hypothetical",
-                "A hypothetical footprint, `cells:labels`; repeat for each row",
-              ),
-              nat(
-                "hypothetical-shared",
-                10,
-                "Tests carrying a contending resource atom in each hypothetical row",
-              ),
-              nat("hypothetical-pure", 165, "Pure tests in each hypothetical row"),
-              sw("std", "Include shipped modules' tests, as `ply test --std` does"),
-              json_switch(),
             ],
           ),
+          |p: cmdline::Parsed|
+            fold(p.positionals, Ok(()), |acc: Result<Unit, String>, root: String|
+              match acc {
+                Err(e) -> Err(e),
+                Ok(_) -> if root == "" { Ok(()) } else { inside(root) },
+              }),
+        ),
+        cmdline::command(
+          "tiers",
+          "Re-draw every proof the prover makes over generated corpora, which one contradiction fails",
           [
-            cmdline::many(
-              cmdline::defaulted(
-                "roots",
-                "Projects to analyse, each loaded the way `ply` loads one",
-                "",
-              ),
-            ),
+            dir_flag("out", "Where the corpora are written, one directory a seed"),
+            nat("seeds", 6, "Corpora to generate and audit, seeded one after another from 1"),
+            nat("cases", 1000, "Cases each proof is re-drawn at, from every root"),
+            nat("roots", 8, "Roots each proof is re-drawn from"),
+            json_switch(),
           ],
         ),
         cmdline::command(
@@ -508,6 +530,11 @@ pub type SweepArgs = { out: String, sizes: List<String>, seed: Int, repeats: Int
 
 pub type RealArgs = { tests: Bool, json: Bool }
 
+pub type MeasureArgs = { corpus: String, repeats: Int, only_throughput: Bool, json: Bool }
+
+// A subcommand whose arguments are its module's own, and whether its report is wanted as JSON.
+pub type Reported<a> = { args: a, json: Bool }
+
 // A line, answered: text for stdout (help, a version), a refusal for stderr, a subcommand this
 // package runs, or the plan the executor runs.
 pub type Asked =
@@ -517,6 +544,10 @@ pub type Asked =
   | Bench(BenchArgs)
   | Sweep(SweepArgs)
   | Real(RealArgs)
+  | Measure(MeasureArgs)
+  | Payload(Reported<payload::Args>)
+  | Regions(Reported<regions::Args>)
+  | Tiers(Reported<tiers::Args>)
   | Plan(Json)
 
 fn nat_of(p: cmdline::Parsed, long: String) -> Int =
@@ -600,8 +631,81 @@ pub fn asked(argv: List<String>) -> Asked =
           }),
       },
       "real" -> Real({ tests: !cmdline::has(p, "no-tests"), json: cmdline::has(p, "json") }),
+      "measure" ->
+        Measure({
+          corpus: cmdline::nth_of(p.positionals, 0, ""),
+          repeats: nat_of(p, "repeats"),
+          only_throughput: cmdline::has(p, "only-throughput"),
+          json: cmdline::has(p, "json"),
+        }),
+      "payload" -> match shapes_of(p) {
+        Err(why) -> Refusal(why),
+        Ok(shapes) ->
+          Payload({
+            args: {
+              lines: nats_of(p, "lines"),
+              iterations: nat_of(p, "iterations"),
+              shapes: shapes,
+              entries: nats_of(p, "entries"),
+              types: nats_of(p, "types"),
+              types_per_module: nat_of(p, "types-per-module"),
+              processes: nat_of(p, "processes"),
+              repeats: nat_of(p, "repeats"),
+              derivation: !cmdline::has(p, "no-derivation"),
+            },
+            json: cmdline::has(p, "json"),
+          }),
+      },
+      "regions" ->
+        Regions({
+          args: {
+            roots: filter(p.positionals, |r: String| r != ""),
+            jobs: nat_of(p, "jobs"),
+            hypothetical: cmdline::values_of(p, "hypothetical"),
+            hypothetical_shared: nat_of(p, "hypothetical-shared"),
+            hypothetical_pure: nat_of(p, "hypothetical-pure"),
+            std: cmdline::has(p, "std"),
+          },
+          json: cmdline::has(p, "json"),
+        }),
+      "tiers" -> match required(p, "out") {
+        Err(why) -> Refusal(why),
+        Ok(out) ->
+          Tiers({
+            args: {
+              out: out,
+              seeds: nat_of(p, "seeds"),
+              cases: nat_of(p, "cases"),
+              roots: nat_of(p, "roots"),
+            },
+            json: cmdline::has(p, "json"),
+          }),
+      },
       _ -> match run_plan(p) { Ok(j) -> Plan(j), Err(why) -> Refusal(why) },
     },
+  }
+
+// A comma list the spec already checked entry by entry, as the numbers it holds.
+fn nats_of(p: cmdline::Parsed, long: String) -> List<Int> =
+  match cmdline::value(p, long) {
+    None -> [],
+    Some(v) ->
+      fold(split_commas(v), [], |acc: List<Int>, s: String|
+        match cmdline::parse_nat(s) { Some(n) -> push(acc, n), None -> acc }),
+  }
+
+fn shapes_of(p: cmdline::Parsed) -> Result<List<payload::Shape>, String> =
+  match cmdline::value(p, "shape") {
+    None -> Ok([]),
+    Some(v) ->
+      fold(split_commas(v), Ok([]), |acc: Result<List<payload::Shape>, String>, text: String|
+        match acc {
+          Err(e) -> Err(e),
+          Ok(done) -> match payload::shape_of(text) {
+            Err(e) -> Err(e),
+            Ok(s) -> Ok(push(done, s)),
+          },
+        }),
   }
 
 // --- The plan the executor runs ------------------------------------------------
@@ -626,15 +730,6 @@ fn nats_json(text: String) -> Json =
 fn list_flag(p: cmdline::Parsed, long: String) -> Json =
   match cmdline::value(p, long) { Some(v) -> nats_json(v), None -> array([]) }
 
-fn texts_flag(p: cmdline::Parsed, long: String) -> Json =
-  match cmdline::value(p, long) {
-    Some(v) -> array(map(split_commas(v), |s: String| Str(s))),
-    None -> array([]),
-  }
-
-fn repeated_json(p: cmdline::Parsed, long: String) -> Json =
-  array(map(cmdline::values_of(p, long), |s: String| Str(s)))
-
 fn positionals_json(p: cmdline::Parsed) -> Json = array(map(p.positionals, |s: String| Str(s)))
 
 fn serve_args(p: cmdline::Parsed) -> List<{ key: String, value: Json }> =
@@ -657,22 +752,6 @@ fn plan(command: String, args: List<{ key: String, value: Json }>) -> Json =
 // comma lists split, so the executor only decodes.
 fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
   match cmdline::nth_of(p.path, 0, "") {
-    "measure" ->
-      Ok(
-        plan("measure", [
-          {
-            key: "corpus",
-            value: match list_at(p.positionals, 0) {
-              Some(c) -> if c == "" { Null } else { Str(c) },
-              None -> Null,
-            },
-          },
-          { key: "repeats", value: int_flag(p, "repeats") },
-          { key: "cells", value: list_flag(p, "cells") },
-          { key: "only_throughput", value: bool_flag(p, "only-throughput") },
-          { key: "json", value: bool_flag(p, "json") },
-        ]),
-      ),
     "sim" ->
       Ok(
         plan("sim", [
@@ -691,7 +770,6 @@ fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
           { key: "projects", value: positionals_json(p) },
           { key: "cases", value: int_flag(p, "cases") },
           { key: "prove_budget", value: int_flag(p, "prove-budget") },
-          { key: "shrink_budget", value: int_flag(p, "shrink-budget") },
           { key: "json", value: bool_flag(p, "json") },
         ]),
       ),
@@ -711,22 +789,6 @@ fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
             ],
           ]),
         ),
-      ),
-    "payload" ->
-      Ok(
-        plan("payload", [
-          { key: "lines", value: list_flag(p, "lines") },
-          { key: "iterations", value: int_flag(p, "iterations") },
-          { key: "shape", value: texts_flag(p, "shape") },
-          { key: "entries", value: list_flag(p, "entries") },
-          { key: "types", value: list_flag(p, "types") },
-          { key: "types_per_module", value: int_flag(p, "types-per-module") },
-          { key: "processes", value: int_flag(p, "processes") },
-          { key: "ply", value: str_flag(p, "ply") },
-          { key: "repeats", value: int_flag(p, "repeats") },
-          { key: "no_derivation", value: bool_flag(p, "no-derivation") },
-          { key: "json", value: bool_flag(p, "json") },
-        ]),
       ),
     "w3" ->
       Ok(
@@ -837,18 +899,6 @@ fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
           ]),
         ),
     },
-    "regions" ->
-      Ok(
-        plan("regions", [
-          { key: "roots", value: positionals_json(p) },
-          { key: "jobs", value: int_flag(p, "jobs") },
-          { key: "hypothetical", value: repeated_json(p, "hypothetical") },
-          { key: "hypothetical_shared", value: int_flag(p, "hypothetical-shared") },
-          { key: "hypothetical_pure", value: int_flag(p, "hypothetical-pure") },
-          { key: "std", value: bool_flag(p, "std") },
-          { key: "json", value: bool_flag(p, "json") },
-        ]),
-      ),
     other -> Err(cmdline::refused(spec(), p.path, "no command named " ++ other)),
   }
 
@@ -878,8 +928,13 @@ fn answered(outcome: Result<String, String>) -> Int / {process.out[proc], proces
     },
   }
 
-fn report_text(report: spine::Report, json_wanted: Bool) -> String =
-  if json_wanted { json::to_string(report.json) } else { report.rendered }
+// A subcommand's report, as the line asked for it.
+fn reported(outcome: Result<report::Report, String>, json_wanted: Bool) -> Result<String, String> =
+  match outcome {
+    Err(why) -> Err(why),
+    Ok(r) ->
+      Ok(if json_wanted { json::to_string(report::to_json(r)) } else { report::rendered(r) }),
+  }
 
 // The executor runs the plan with the few variables the toolchain reads, in the working directory,
 // and what it wrote and the code it exited with are this program's.
@@ -900,7 +955,7 @@ fn executed(
 
 fn code_of(
   a: Asked,
-) -> Int / {process.out[proc], process.err[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+) -> Int / {process.out[proc], process.err[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], prover.reviewed[claims]} =
   match a {
     Said(text) -> {
       process.out[proc](text);
@@ -916,30 +971,21 @@ fn code_of(
         Ok(made) ->
           Ok(if g.json { json::to_string(gen::report_json(made)) } else { gen::summary(made) }),
       }),
-    Bench(b) ->
-      answered(match bench::run(b.corpus, b.repeats) {
-        Err(why) -> Err(why),
-        Ok(report) -> Ok(report_text(report, b.json)),
-      }),
+    Bench(b) -> answered(reported(bench::run(b.corpus, b.repeats), b.json)),
     Sweep(s) ->
       answered(match sweep::sizes_of(s.sizes, s.seed) {
         Err(why) -> Err(why),
-        Ok(sizes) -> match sweep::run(s.out, sizes, s.repeats) {
-          Err(why) -> Err(why),
-          Ok(reports) ->
-            Ok(if s.json { json::to_string(array(map(reports, |r: spine::Report| r.json))) }
-            else { fold(reports, "", |acc: String, r: spine::Report| acc ++ r.rendered) }),
-        },
+        Ok(sizes) -> reported(sweep::run(s.out, sizes, s.repeats), s.json),
       }),
-    Real(r) ->
-      answered(match real::run(r.tests) {
-        Err(why) -> Err(why),
-        Ok(report) -> Ok(report_text(report, r.json)),
-      }),
+    Real(r) -> answered(reported(real::run(r.tests), r.json)),
+    Measure(m) -> answered(reported(measure::run(m.corpus, m.repeats, m.only_throughput), m.json)),
+    Payload(p) -> answered(reported(payload::run(p.args), p.json)),
+    Regions(r) -> answered(reported(regions::run(r.args), r.json)),
+    Tiers(t) -> answered(reported(tiers::run(t.args), t.json)),
     Plan(j) -> executed(j),
   }
 
-pub fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+pub fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], prover.reviewed[claims]} =
   process.exit[proc](code_of(asked(process.args[proc]())))
 
 // --- Tests -----------------------------------------------------------------------
@@ -1019,18 +1065,69 @@ test "w6-ladder reads a comma list of concurrencies" {
   )
 }
 
-test "payload's shape is a list of `lines:pad` texts, as the executor reads it" {
-  assert(
-    string_contains(
-      plan_text(["payload"]),
-      "\"shape\":[\"40:0\",\"40:100\",\"40:400\",\"40:1600\"]",
-    ),
-  );
+test "payload reads its lists at their defaults, and its shape as `lines:pad` pairs" {
+  match asked(["payload"]) {
+    Payload(p) -> {
+      assert_eq(p.args.lines, [1, 10, 40, 200, 1000]);
+      assert_eq(p.args.shapes, [
+        { lines: 40, pad: 0 },
+        { lines: 40, pad: 100 },
+        { lines: 40, pad: 400 },
+        { lines: 40, pad: 1600 },
+      ]);
+      assert_eq(p.args.entries, [16, 256, 4096, 65536]);
+      assert(p.args.derivation && !p.json)
+    },
+    _ -> assert(false),
+  };
   assert(string_contains(refusal_of(["payload", "--shape", "40:0,40"]), "40 is not two numbers"))
 }
 
-test "a list entry that is not a number is refused rather than planned as a null" {
-  assert(string_contains(refusal_of(["measure", "--cells", "1,x"]), "x is not a number"))
+test "a list entry that is not a number is refused rather than read as nothing" {
+  assert(string_contains(refusal_of(["payload", "--lines", "1,x"]), "x is not a number"))
+}
+
+test "measure's corpus is optional, and one named is under the working directory" {
+  match asked(["measure"]) {
+    Measure(m) -> assert(m.corpus == "" && !m.only_throughput),
+    _ -> assert(false),
+  };
+  match asked(["measure", "corpora/m4", "--only-throughput", "--repeats", "2"]) {
+    Measure(m) -> assert(m.corpus == "corpora/m4" && m.only_throughput && m.repeats == 2),
+    _ -> assert(false),
+  };
+  assert(string_contains(refusal_of(["measure", "/tmp/m4"]), "is absolute"))
+}
+
+test "regions reads its roots and its hypotheticals, and a root outside is refused" {
+  match asked(["regions", "examples", "--hypothetical", "12:3", "--hypothetical", "40:4"]) {
+    Regions(r) -> {
+      assert_eq(r.args.roots, ["examples"]);
+      assert_eq(r.args.hypothetical, ["12:3", "40:4"]);
+      assert_eq((r.args.jobs, r.args.hypothetical_shared, r.args.hypothetical_pure), (8, 10, 165))
+    },
+    _ -> assert(false),
+  };
+  match asked(["regions", "--hypothetical", "12:3"]) {
+    Regions(r) -> assert_eq(r.args.roots, []),
+    _ -> assert(false),
+  };
+  assert(string_contains(refusal_of(["regions", "../elsewhere"]), "climbs out"))
+}
+
+test "tiers audits six seeds at a thousand cases from eight roots unless told otherwise" {
+  match asked(["tiers", "--out", "tiers"]) {
+    Tiers(t) ->
+      assert_eq((t.args.out, t.args.seeds, t.args.cases, t.args.roots), ("tiers", 6, 1000, 8)),
+    _ -> assert(false),
+  };
+  assert(string_contains(refusal_of(["tiers"]), "--out"))
+}
+
+test "what is still Rust's is planned for the executor" {
+  assert(string_contains(plan_text(["prove", "a.ply", "--cases", "7"]), "\"cases\":7"));
+  assert(string_contains(plan_text(["sim", "a.ply"]), "\"command\":\"sim\""));
+  assert_eq(plan_text(["measure"]), "")
 }
 
 test "an unknown flag is a refusal, not a panic" {
@@ -1041,7 +1138,8 @@ test "help is text for stdout, and names every subcommand" {
   match asked(["--help"]) {
     Said(text) -> {
       assert(string_contains(text, "w6-ladder"));
-      assert(string_contains(text, "sweep"))
+      assert(string_contains(text, "sweep"));
+      assert(string_contains(text, "tiers"))
     },
     _ -> assert(false),
   }
