@@ -6,19 +6,21 @@ mod egraph;
 mod numerics;
 mod term;
 
+use crate::checked::{binders_of, world_of};
 use ply_prove::prove::claims::{Clause, Code, Definition, Law};
 use ply_prove::prove::{
     Blocker, Claims, Context, Decision, Goal, Limits, Proof, Reason, decide, decide_and_diagnose,
     read_claims,
 };
-use ply_prove::{Rule, UNFOLD_DEPTH};
-use ply_span::{SourceId, Span, Symbol};
-use ply_ty::{CheckOutput, DefInfo, LawBinder, SpecKind, Type};
+use ply_prove::{Binder, Rule, Sort, UNFOLD_DEPTH, World};
+use ply_span::{SourceId, Symbol};
+use ply_ty::{CheckOutput, DefInfo, SpecKind, Type};
 
 const SRC: SourceId = SourceId(0);
 
 struct Fixture {
     check: CheckOutput,
+    world: World,
     claims: Claims,
 }
 
@@ -32,22 +34,29 @@ fn fixture(source: &str) -> Fixture {
         .unwrap_or_else(|e| panic!("claims: {e:#}"));
     let claims = read_claims(ply_eval::decode::At::new("the claims", &answer), &[SRC])
         .unwrap_or_else(|e| panic!("claims: {e}"));
-    Fixture { check, claims }
+    Fixture {
+        world: world_of(&check),
+        check,
+        claims,
+    }
 }
 
 impl Fixture {
     fn context(&self) -> Context<'_> {
-        Context::new(self.claims.clone(), &self.check)
+        Context::new(self.claims.clone(), &self.world)
     }
 
-    fn law(&self, label: &str) -> (Vec<LawBinder>, &Law) {
+    fn law(&self, label: &str) -> (Vec<Binder>, &Law) {
         let info = self
             .check
             .laws
             .iter()
             .find(|law| law.name == label)
             .unwrap_or_else(|| panic!("no law labelled `{label}`"));
-        (info.binders.clone(), &self.claims.laws[&info.key])
+        (
+            binders_of(info.binders.iter().map(|b| (b.name.clone(), &b.ty))),
+            &self.claims.laws[&info.key],
+        )
     }
 
     fn def(&self, name: &str) -> &Definition {
@@ -55,20 +64,17 @@ impl Fixture {
     }
 }
 
-fn clause_binders(info: &DefInfo) -> Vec<LawBinder> {
+fn clause_binders(info: &DefInfo) -> Vec<Binder> {
     let Type::Fn { params, ret, .. } = &info.scheme.ty else {
         panic!("`{}` is not a function", info.name);
     };
-    params
-        .iter()
-        .chain([&**ret])
-        .enumerate()
-        .map(|(i, ty)| LawBinder {
-            name: Symbol::new(format!("_{i}")),
-            ty: ty.clone(),
-            span: Span::DUMMY,
-        })
-        .collect()
+    binders_of(
+        params
+            .iter()
+            .chain([&**ret])
+            .enumerate()
+            .map(|(i, ty)| (Symbol::new(format!("_{i}")), ty)),
+    )
 }
 
 fn clauses(def: &Definition, kind: SpecKind) -> Vec<&Clause> {
@@ -398,7 +404,13 @@ fn congruence_over_an_uninterpreted_function_decides_both_directions() {
 fn a_polymorphic_proof_records_its_sorts() {
     let f = fixture(CONGRUENCE);
     let proved = proof(&f, "congruence is polymorphic");
-    assert_eq!(proved.sorts.len(), 2, "{:?}", proved.sorts);
+    // Named as the claim's binders print them: `g: (a) -> b, u: a, v: a`.
+    assert_eq!(
+        proved.sorts,
+        vec![Symbol::new("a"), Symbol::new("b")],
+        "{:?}",
+        proved.sorts
+    );
 }
 
 #[test]
@@ -649,11 +661,7 @@ fn two_calls_to_an_effectful_definition_are_not_one_term() {
 fn returns_zero(fixture: &Fixture, owner: &str) -> Decision {
     let ctx = fixture.context();
     let def = fixture.def(owner);
-    let binders = vec![LawBinder {
-        name: Symbol::new("result"),
-        ty: Type::int(),
-        span: Span::DUMMY,
-    }];
+    let binders = vec![Binder::new("result", Sort::int())];
     decide(
         &ctx,
         &Goal {

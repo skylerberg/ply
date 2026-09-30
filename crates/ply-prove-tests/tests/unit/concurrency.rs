@@ -9,13 +9,13 @@ use ply_prove::concurrency::{
     replay_command,
 };
 use ply_prove::{
-    Binding, Certificate, Discharge, Evidence, Frame, Gap, Obligation, ObligationKind, Rule, Tier,
-    Vacuity, VacuityKind, interleaving_proves,
+    Binder, Binding, Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, Rule, Sort,
+    Tier, Vacuity, VacuityKind, interleaving_proves,
 };
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::DefHash;
 use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, LawBinder, Resource, Type};
+use ply_ty::{EffectAtom, Footprint, Resource};
 
 fn body_was_false(span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -124,7 +124,7 @@ impl LawSearch for Model {
     fn bindings(&self, point: u64) -> Vec<Binding> {
         vec![Binding {
             name: Symbol::new("n"),
-            ty: Type::int(),
+            ty: "Int".to_string(),
             rendered: point.to_string(),
         }]
     }
@@ -136,13 +136,8 @@ fn law(binders: usize) -> Obligation {
         owner: Symbol::new("bank.transfers conserve value"),
         kind: ObligationKind::Law,
         span: Span::DUMMY,
-        frame: Frame::Pure,
         binders: (0..binders)
-            .map(|i| LawBinder {
-                name: Symbol::new(format!("n{i}")),
-                ty: Type::int(),
-                span: Span::DUMMY,
-            })
+            .map(|i| Binder::new(&format!("n{i}"), Sort::int()))
             .collect(),
         guarded: false,
         host: false,

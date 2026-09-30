@@ -1,12 +1,12 @@
-//! What `ply prove` and `ply review` load, collect, discharge, review and accept, as the program
-//! in `crates/ply-cli/ply` performs it.
+//! What `ply prove` and `ply review` load, discharge, review and accept, as the program in
+//! `crates/ply-cli/ply` performs it.
 //!
-//! The front end, the store and the prover stay here: a front end is not a value a program can hold,
-//! discharging a claim enters compiled bodies, and an entry does not nest on the thread the `ply`
-//! program itself runs on. Which claims are asked for, the keys their evidence is read and filed
-//! under, what the review, the coverage and the baseline come to, every line and key of both
-//! reports and the code each run exits with are the program's, in `crates/ply-cli/ply/claims.ply`,
-//! `prove.ply` and `review.ply`.
+//! The store and the prover stay here: discharging a claim enters compiled bodies, and an entry does
+//! not nest on the thread the `ply` program itself runs on. The obligations and the types they are
+//! written over are the program's (`proof.world`), handed over with the front end; which claims
+//! are asked for, the keys their evidence is read and filed under, what the review, the coverage and
+//! the baseline come to, every line and key of both reports and the code each run exits with are the
+//! program's too, in `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
 
 use crate::config::Configuration;
 use crate::engine::Point;
@@ -19,11 +19,11 @@ use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_prove::property::{GenStream, TypeWorld, generate};
+use ply_prove::property::{GenStream, generate};
 use ply_prove::shrink::Target;
 use ply_prove::{
-    Discharge, Evidence, Frame, Gap, Obligation, ObligationKind, ProvePlan, ProveReport, Tier,
-    Vacuity, VacuityKind,
+    Binder, Discharge, Evidence, Gap, Obligation, ProvePlan, ProveReport, Tier, Vacuity,
+    VacuityKind, World,
 };
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_store::ReviewRecord;
@@ -31,7 +31,6 @@ use ply_store::Store;
 use ply_test::obligation::{self, from_cached, to_cached};
 use ply_ty::CheckOutput;
 use ply_ty::DefHash;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -48,13 +47,10 @@ const EFFECT: &str = "prover";
 /// match matched` the moment the program matches the value.
 pub const MARSHALLED: &[(&str, &str)] = &[
     ("claims", "Refusal"),
-    ("proof.domain", "Ty"),
-    ("proof.obligation", "Frame"),
     ("proof.obligation", "Evidence"),
     ("proof.obligation", "Outcome"),
     ("proof.obligation", "Point"),
     ("proof.obligation", "Gap"),
-    ("proof.obligation", "Kind"),
     ("proof.obligation", "Tier"),
     ("proof.obligation", "Vacuity"),
 ];
@@ -68,10 +64,9 @@ fn home(ty: &str) -> &'static str {
         .0
 }
 
-const OPERATIONS: [(&str, &str); 14] = [
+const OPERATIONS: [(&str, &str); 13] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
-    ("typed", "ply_machine::claims::typed"),
     ("outcomes", "ply_machine::claims::outcomes"),
     ("discharged", "ply_machine::claims::discharged"),
     ("record", "ply_machine::claims::record"),
@@ -95,6 +90,9 @@ pub struct Job {
     /// The front end the CLI ran. A run without one is refused rather than loading again: `ply
     /// prove` and `ply review` start one and hand its answer over.
     pub front: Option<crate::driver::HandedFront>,
+    /// The program as the prover reads it, and the obligations it owes, as the program built them.
+    pub world: World,
+    pub obligations: Vec<Obligation>,
     pub use_cache: bool,
     /// Also discharge what the shipped modules declare.
     pub std: bool,
@@ -155,14 +153,16 @@ impl HostHandler for Site {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
-            ("configure", [options, front]) => {
+            ("configure", [options, front, world]) => {
                 let mut job = job_of(options, span)?;
                 job.front = Some(crate::driver::handed_front_of(front, span)?);
+                (job.world, job.obligations) =
+                    World::decode(ply_eval::decode::At::new("the world", world))
+                        .map_err(|e| unread_world(&e, span))?;
                 *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job);
                 PlyValue::Unit
             }
             ("collected", _) => self.collected()?,
-            ("typed", _) => self.typed()?,
             ("discharged", [choice]) => self.discharged(choice_of(choice, span)?)?,
             ("record", [entries]) => self.record(filed_of(entries, span)?)?,
             ("outcomes", [keys]) => {
@@ -275,12 +275,12 @@ fn key_of(hex: &str, span: Span) -> Result<DefHash, Diagnostic> {
 
 /// The tuple a counterexample's draw gives, regenerated: the values a walk needs are the ones the
 /// generator produced, and a draw is reproducible from where it was made.
-fn drawn(obligation: &Obligation, root: u64, case: u32, world: &TypeWorld) -> Option<Vec<Value>> {
+fn drawn(obligation: &Obligation, root: u64, case: u32, world: &World) -> Option<Vec<Value>> {
     let mut stream = GenStream::new(root, obligation.key);
     obligation
         .generated()
         .iter()
-        .map(|binder| generate(&binder.ty, world, &mut stream, case).ok())
+        .map(|binder| generate(&binder.sort, world, &mut stream, case).ok())
         .collect()
 }
 
@@ -292,7 +292,7 @@ fn walkable(
     claim: usize,
     obligations: &[Obligation],
     report: &Option<ProveReport>,
-    world: &TypeWorld,
+    world: &World,
 ) -> Option<Shrinking> {
     let obligation = obligations.get(claim)?;
     let report = report.as_ref()?;
@@ -327,22 +327,18 @@ fn walkable(
     Some(Shrinking {
         claim,
         values,
-        types: obligation
-            .generated()
-            .iter()
-            .map(|b| b.ty.clone())
-            .collect(),
+        binders: obligation.generated().to_vec(),
         target,
         original,
     })
 }
 
 /// The value at `i` as it stands, with its candidates and each one's size.
-fn offer(s: &Shrinking, i: usize, world: &TypeWorld) -> Option<Offer> {
+fn offer(s: &Shrinking, i: usize, world: &World) -> Option<Offer> {
     let value = s.values.get(i)?;
-    let ty = s.types.get(i)?;
+    let binder = s.binders.get(i)?;
     let here = ply_prove::shrink::size(value, world);
-    let candidates = ply_prove::shrink::candidates(value, ty, world)
+    let candidates = ply_prove::shrink::candidates(value, &binder.sort, world)
         .iter()
         .enumerate()
         .map(|(position, candidate)| (position as u64, ply_prove::shrink::size(candidate, world)))
@@ -351,10 +347,10 @@ fn offer(s: &Shrinking, i: usize, world: &TypeWorld) -> Option<Offer> {
 }
 
 /// The tuple with the candidate at `position` of the value at `i` taken.
-fn candidate_at(s: &Shrinking, i: usize, position: i64, world: &TypeWorld) -> Option<Vec<Value>> {
+fn candidate_at(s: &Shrinking, i: usize, position: i64, world: &World) -> Option<Vec<Value>> {
     let value = s.values.get(i)?;
-    let ty = s.types.get(i)?;
-    let candidates = ply_prove::shrink::candidates(value, ty, world);
+    let binder = s.binders.get(i)?;
+    let candidates = ply_prove::shrink::candidates(value, &binder.sort, world);
     let picked = usize::try_from(position)
         .ok()
         .and_then(|position| candidates.get(position))
@@ -366,29 +362,26 @@ fn candidate_at(s: &Shrinking, i: usize, position: i64, world: &TypeWorld) -> Op
 
 /// The counterexample as it now stands: the walk's accepted values, and the ones it started from.
 fn settled_of(s: &Shrinking) -> Settled {
-    let bind = |values: &[Value]| -> Vec<(String, String, String)> {
-        s.types
-            .iter()
-            .zip(values)
-            .enumerate()
-            .map(|(i, (ty, value))| {
-                let name = match s.original.get(i) {
-                    Some(binding) => binding.name.as_str().to_string(),
-                    None => format!("v{i}"),
-                };
-                (name, ty.to_string(), value.render())
-            })
-            .collect()
-    };
     Settled {
-        bindings: bind(&s.values),
+        bindings: s
+            .binders
+            .iter()
+            .zip(&s.values)
+            .map(|(binder, value)| {
+                (
+                    binder.name.as_str().to_string(),
+                    binder.text.clone(),
+                    value.render(),
+                )
+            })
+            .collect(),
         original: s
             .original
             .iter()
             .map(|binding| {
                 (
                     binding.name.as_str().to_string(),
-                    binding.ty.to_string(),
+                    binding.ty.clone(),
                     binding.rendered.clone(),
                 )
             })
@@ -430,177 +423,10 @@ struct Settled {
 struct Shrinking {
     claim: usize,
     values: Vec<Value>,
-    types: Vec<ply_ty::Type>,
+    /// Parallel to `values`: what each is a value of, and how a report prints that.
+    binders: Vec<Binder>,
     target: Target,
     original: Vec<ply_prove::Binding>,
-}
-
-/// The types the laws are written over, as the machine's thread hands them over: plain data, because
-/// a `PlyValue` cannot cross a thread and this side has no need of one.
-struct Typed {
-    decls: Vec<TypedDecl>,
-    claims: Vec<TypedClaim>,
-}
-
-struct TypedDecl {
-    name: String,
-    variants: Vec<TypedVariant>,
-}
-
-struct TypedVariant {
-    name: String,
-    fields: Vec<ply_ty::Type>,
-}
-
-struct TypedClaim {
-    claim: usize,
-    /// Each binder's name, the text the runtime would print for its type, and the type itself.
-    binders: Vec<(String, String, ply_ty::Type)>,
-}
-
-fn typed_of(
-    world: &ply_prove::property::TypeWorld,
-    obligations: &[ply_prove::Obligation],
-) -> Typed {
-    Typed {
-        decls: world
-            .declared()
-            .map(|(name, decl)| TypedDecl {
-                name: name.as_str().to_string(),
-                variants: decl
-                    .variants
-                    .iter()
-                    .map(|variant| TypedVariant {
-                        name: variant.name.as_str().to_string(),
-                        fields: variant.fields.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        claims: obligations
-            .iter()
-            .enumerate()
-            .map(|(claim, obligation)| TypedClaim {
-                claim,
-                binders: obligation
-                    .generated()
-                    .iter()
-                    .map(|binder| {
-                        (
-                            binder.name.as_str().to_string(),
-                            binder.ty.to_string(),
-                            binder.ty.clone(),
-                        )
-                    })
-                    .collect(),
-            })
-            .collect(),
-    }
-}
-
-fn typed_value(typed: Typed) -> PlyValue {
-    record(vec![
-        (
-            "decls",
-            PlyValue::list(
-                typed
-                    .decls
-                    .iter()
-                    .map(|decl| {
-                        record(vec![
-                            ("name", PlyValue::str(&decl.name)),
-                            (
-                                "variants",
-                                PlyValue::list(
-                                    decl.variants
-                                        .iter()
-                                        .map(|variant| {
-                                            record(vec![
-                                                ("name", PlyValue::str(&variant.name)),
-                                                (
-                                                    "fields",
-                                                    PlyValue::list(
-                                                        variant
-                                                            .fields
-                                                            .iter()
-                                                            .map(ty_value)
-                                                            .collect(),
-                                                    ),
-                                                ),
-                                            ])
-                                        })
-                                        .collect(),
-                                ),
-                            ),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-        (
-            "claims",
-            PlyValue::list(
-                typed
-                    .claims
-                    .iter()
-                    .map(|claim| {
-                        record(vec![
-                            ("claim", PlyValue::Int(claim.claim as i64)),
-                            (
-                                "binders",
-                                PlyValue::list(
-                                    claim
-                                        .binders
-                                        .iter()
-                                        .map(|(name, text, ty)| {
-                                            record(vec![
-                                                ("name", PlyValue::str(name)),
-                                                ("text", PlyValue::str(text)),
-                                                ("ty", ty_value(ty)),
-                                            ])
-                                        })
-                                        .collect(),
-                                ),
-                            ),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-    ])
-}
-
-fn ty_value(ty: &ply_ty::Type) -> PlyValue {
-    use ply_ty::Type;
-    match ty {
-        Type::Var(var) => {
-            crate::payload::ctor(home("Ty"), "Var", vec![PlyValue::Int(i64::from(var.0))])
-        }
-        Type::Fn { .. } => crate::payload::ctor(home("Ty"), "Fn", Vec::new()),
-        Type::Record(fields) => crate::payload::ctor(
-            home("Ty"),
-            "Record",
-            vec![PlyValue::list(
-                fields
-                    .iter()
-                    .map(|(name, field)| {
-                        record(vec![
-                            ("name", PlyValue::str(name.as_str())),
-                            ("ty", ty_value(field)),
-                        ])
-                    })
-                    .collect(),
-            )],
-        ),
-        Type::Con(name, args) => crate::payload::ctor(
-            home("Ty"),
-            "Con",
-            vec![
-                PlyValue::str(name.as_str()),
-                PlyValue::list(args.iter().map(ty_value).collect()),
-            ],
-        ),
-    }
 }
 
 fn indices(value: &PlyValue, span: Span) -> Result<Vec<usize>, Diagnostic> {
@@ -634,25 +460,11 @@ impl Site {
         match machine.step()? {
             Step::Collected(answer) => {
                 if let Ok(collection) = &*answer {
-                    *self.claims.lock().unwrap_or_else(|e| e.into_inner()) =
-                        collection.claims.len();
+                    *self.claims.lock().unwrap_or_else(|e| e.into_inner()) = collection.obligations;
                 }
                 Ok(answered((*answer).map(collection_value)))
             }
             _ => Err(out_of_step("collected")),
-        }
-    }
-
-    /// The types the laws are written over: every declared type, and each collected obligation's
-    /// binders with the text the runtime would print for them. A program sizes a domain from this
-    /// and never spells a type out, so nothing in Ply can disagree with the compiler about one.
-    fn typed(&self) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("typed"))?;
-        machine.ask(Go::Typed)?;
-        match machine.step()? {
-            Step::Typed(answer) => Ok(answered((*answer).map(typed_value))),
-            _ => Err(out_of_step("typed")),
         }
     }
 
@@ -835,9 +647,6 @@ fn answered(answer: Result<PlyValue, Refused>) -> PlyValue {
 
 /// What the program asks the machine for next.
 enum Go {
-    /// The types the obligations are written over, so a program can measure a binder's domain
-    /// rather than sample it. The decision is the program's; the type world is not.
-    Typed,
     /// Start walking this claim's counterexample down. The answer is how many values it has, or
     /// nothing when there is nothing to walk — a race, an enumerated point, a claim that held.
     Shrink(usize),
@@ -876,7 +685,6 @@ enum Go {
 
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
-    Typed(Box<Result<Typed, Refused>>),
     Shrink(Box<Result<Option<usize>, Refused>>),
     Offers(Box<Result<Option<Offer>, Refused>>),
     Would(Box<Result<bool, Refused>>),
@@ -971,19 +779,13 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     warnings.extend(loaded.frontend.warnings.iter().cloned());
 
     let hashes = loaded.hashes.clone();
-    let scoped = crate::obligations::project_view(&loaded.check, job.std);
-    let collected = crate::obligations::collect(&loaded.front, &scoped, &hashes);
-    warnings.extend(collected.warnings);
-    let obligations = collected.obligations;
-    let labels = law_labels(&loaded.check);
+    let scoped = project_view(&loaded.check, job.std);
+    let obligations: &[Obligation] = &job.obligations;
 
     let _ = told.send(Step::Collected(Box::new(Ok(Collection {
         sources: loaded.sources.clone(),
         warnings: std::mem::take(&mut warnings),
-        claims: obligations
-            .iter()
-            .map(|o| claim_of(o, &loaded, &labels))
-            .collect(),
+        obligations: obligations.len(),
         defs: defs_of(&scoped, &hashes),
         laws: laws_of(&scoped, &hashes),
         plan: job.plan.clone(),
@@ -1021,7 +823,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                     prepared = Some(prepare(&job, &loaded, &mut store));
                 }
                 let start = match prepared.as_ref() {
-                    Some(Ok(ready)) => walkable(claim, &obligations, &report, ready.prover.world()),
+                    Some(Ok(ready)) => walkable(claim, obligations, &report, ready.prover.world()),
                     Some(Err(refused)) => {
                         let _ = told.send(Step::Shrink(Box::new(Err(refused.clone()))));
                         return;
@@ -1071,22 +873,6 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
             Ok(Go::Settled) => {
                 let answer = shrinking.as_ref().map(settled_of);
                 let _ = told.send(Step::Settled(Box::new(Ok(answer))));
-            }
-            Ok(Go::Typed) => {
-                if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &mut store));
-                }
-                match prepared.as_ref() {
-                    Some(Ok(ready)) => {
-                        let typed = typed_of(ready.prover.world(), &obligations);
-                        let _ = told.send(Step::Typed(Box::new(Ok(typed))));
-                    }
-                    Some(Err(refused)) => {
-                        let _ = told.send(Step::Typed(Box::new(Err(refused.clone()))));
-                        return;
-                    }
-                    None => return,
-                }
             }
             Ok(Go::Discharge(wanted)) => {
                 if prepared.is_none() {
@@ -1207,15 +993,6 @@ fn flushed(store: &mut Store) -> Vec<Diagnostic> {
     out
 }
 
-/// The label each law was written with, not its `<module>.<label>` key.
-fn law_labels(check: &CheckOutput) -> BTreeMap<Symbol, String> {
-    check
-        .laws
-        .iter()
-        .map(|law| (law.key.clone(), law.name.clone()))
-        .collect()
-}
-
 // --- Discharging ---------------------------------------------------------------
 
 /// The prover and the hosts a run discharges and re-runs points with, built when the first step
@@ -1228,7 +1005,11 @@ struct Prepared<'a> {
     warnings: Vec<Diagnostic>,
 }
 
-fn prepare<'a>(job: &Job, loaded: &'a Loaded, store: &mut Store) -> Result<Prepared<'a>, Refused> {
+fn prepare<'a>(
+    job: &'a Job,
+    loaded: &'a Loaded,
+    store: &mut Store,
+) -> Result<Prepared<'a>, Refused> {
     let unbound = |diagnostics: Vec<Diagnostic>| Refused {
         why: Why::Unbound,
         diagnostics,
@@ -1267,12 +1048,13 @@ fn prepare<'a>(job: &Job, loaded: &'a Loaded, store: &mut Store) -> Result<Prepa
                     as Arc<dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync + Send>
             }),
         });
-    let prover =
-        crate::engine::prover(loaded, hosting, Some(backend), store).map_err(|err| Refused {
+    let prover = crate::engine::prover(loaded, &job.world, hosting, Some(backend), store).map_err(
+        |err| Refused {
             why: Why::Broken,
             diagnostics: err.diagnostics,
             sources: err.sources,
-        })?;
+        },
+    )?;
     Ok(Prepared {
         _hosts: hosts,
         prover,
@@ -1332,21 +1114,19 @@ impl At {
     }
 }
 
-enum Kind {
-    Ensures(usize),
-    Law(Option<String>),
-}
-
-struct Claim {
-    key: String,
-    /// `law/host`: a verdict against the world, which is never cached.
-    host: bool,
-    owner: String,
-    kind: Kind,
-    guarded: bool,
-    frame: Frame,
-    at: At,
-    unperformed: Vec<String>,
+/// The checked program without the shipped modules' definitions and laws, unless `std`.
+fn project_view(check: &CheckOutput, std: bool) -> std::borrow::Cow<'_, CheckOutput> {
+    if std {
+        return std::borrow::Cow::Borrowed(check);
+    }
+    let mut scoped = check.clone();
+    scoped
+        .defs
+        .retain(|_, info| !crate::shelf::is_shipped(&info.module));
+    scoped
+        .laws
+        .retain(|law| !crate::shelf::is_shipped(&law.module));
+    std::borrow::Cow::Owned(scoped)
 }
 
 /// A definition in scope: its hash, when the front end produced one, and the spec text of each of its
@@ -1364,10 +1144,12 @@ struct Written {
     mentions: Vec<String>,
 }
 
+/// What loading the run came to. The obligations are the program's; this counts them, so a re-run
+/// can refuse an index that names none.
 struct Collection {
     sources: SourceMap,
     warnings: Vec<Diagnostic>,
-    claims: Vec<Claim>,
+    obligations: usize,
     defs: Vec<Def>,
     laws: Vec<Written>,
     plan: ProvePlan,
@@ -1383,22 +1165,6 @@ struct Accepted {
     definitions: usize,
     stored: bool,
     warnings: Vec<Diagnostic>,
-}
-
-fn claim_of(o: &Obligation, loaded: &Loaded, labels: &BTreeMap<Symbol, String>) -> Claim {
-    Claim {
-        key: o.key.to_hex(),
-        host: o.host,
-        owner: o.owner.as_str().to_string(),
-        kind: match o.kind {
-            ObligationKind::Ensures { index } => Kind::Ensures(index),
-            ObligationKind::Law => Kind::Law(labels.get(&o.owner).cloned()),
-        },
-        guarded: o.guarded,
-        frame: o.frame.clone(),
-        at: At::of(o.span),
-        unperformed: unperformed_of(o, loaded),
-    }
 }
 
 /// Every definition in scope, in name order, with its hash and its own clauses' spec text.
@@ -1435,20 +1201,6 @@ fn laws_of(scoped: &CheckOutput, hashes: &ply_ty::HashOutput) -> Vec<Written> {
             })
         })
         .collect()
-}
-
-/// The declared atoms an `ensures`'s owner never touched: a frame wider than the body is a weaker
-/// claim than it looks. A law states its own frame, so it has none of this.
-fn unperformed_of(o: &Obligation, loaded: &Loaded) -> Vec<String> {
-    if o.kind == ObligationKind::Law {
-        return Vec::new();
-    }
-    loaded
-        .check
-        .defs
-        .get(&o.owner)
-        .map(crate::signature::unperformed)
-        .unwrap_or_default()
 }
 
 fn verdicts_of(report: &ProveReport, warnings: Vec<Diagnostic>) -> Verdicts {
@@ -1489,50 +1241,6 @@ fn at_value(at: &At) -> PlyValue {
     ])
 }
 
-fn kind_value(kind: &Kind) -> PlyValue {
-    match kind {
-        Kind::Ensures(index) => ctor(home("Kind"), "Ensures", vec![count(*index)]),
-        Kind::Law(label) => ctor(
-            home("Kind"),
-            "Law",
-            vec![option(label.as_deref().map(PlyValue::str))],
-        ),
-    }
-}
-
-fn frame_value(frame: &Frame) -> PlyValue {
-    match frame {
-        Frame::Pure => ctor(home("Frame"), "Pure", Vec::new()),
-        Frame::Writes(writes) => {
-            let named: Vec<String> = writes
-                .iter()
-                .map(|(effect, resource)| format!("{effect}{resource}"))
-                .collect();
-            ctor(
-                home("Frame"),
-                "Writes",
-                vec![strings(named.iter().map(String::as_str))],
-            )
-        }
-    }
-}
-
-fn claim_value(claim: &Claim) -> PlyValue {
-    record(vec![
-        ("key", PlyValue::str(&claim.key)),
-        ("host", PlyValue::Bool(claim.host)),
-        ("owner", PlyValue::str(&claim.owner)),
-        ("kind", kind_value(&claim.kind)),
-        ("guarded", PlyValue::Bool(claim.guarded)),
-        ("frame", frame_value(&claim.frame)),
-        ("at", at_value(&claim.at)),
-        (
-            "unperformed",
-            strings(claim.unperformed.iter().map(String::as_str)),
-        ),
-    ])
-}
-
 fn roots_value(roots: &[u64]) -> PlyValue {
     PlyValue::list(roots.iter().map(|&root| tally(root)).collect())
 }
@@ -1568,10 +1276,6 @@ fn collection_value(collection: Collection) -> PlyValue {
     record(vec![
         ("places", places_value(&collection.sources)),
         ("warnings", diags_value(&collection.warnings)),
-        (
-            "claims",
-            PlyValue::list(collection.claims.iter().map(claim_value).collect()),
-        ),
         (
             "defs",
             PlyValue::list(
@@ -1624,7 +1328,7 @@ fn bindings_value(bindings: &[ply_prove::Binding]) -> PlyValue {
             .map(|b| {
                 record(vec![
                     ("name", PlyValue::str(b.name.as_str())),
-                    ("ty", PlyValue::str(b.ty.to_string())),
+                    ("ty", PlyValue::str(&b.ty)),
                     ("rendered", PlyValue::str(&b.rendered)),
                 ])
             })
@@ -1694,7 +1398,7 @@ fn gap_value(gap: &Gap) -> PlyValue {
             "Ungeneratable",
             vec![record(vec![
                 ("param", PlyValue::str(param.as_str())),
-                ("ty", PlyValue::str(ty.to_string())),
+                ("ty", PlyValue::str(ty)),
             ])],
         ),
         Gap::Raised {
@@ -1926,6 +1630,16 @@ fn unasked(op: &str, span: Span) -> Diagnostic {
     .note("the effect and its handler are written together; this is Ply's fault")
 }
 
+#[cold]
+fn unread_world(why: &ply_eval::decode::Error, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the program's world does not read: {why}"),
+    )
+    .primary(span, "the program handed this over")
+    .note("`proof.world` and this reader are written together; this is Ply's fault")
+}
+
 // --- The job the program parses ---------------------------------------------------
 
 /// The job record as the program builds it from the parsed line, read field by field.
@@ -2030,6 +1744,8 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
     Ok(Job {
         path: PathBuf::from(str_at("path")?),
         front: None,
+        world: World::default(),
+        obligations: Vec::new(),
         use_cache: !bool_at("no_cache")?,
         std: bool_at("std")?,
         jobs: opt_int_at(v, "jobs", span)?.map(|n| n as u32),

@@ -2,7 +2,6 @@ use crate::fixture::{project, repo};
 use ply_eval::Plan;
 use ply_machine::engine::Prover;
 use ply_machine::load::load;
-use ply_machine::obligations;
 use ply_prove::{Discharge, Evidence, Gap, Obligation, ProvePlan, Rule, Tier, VacuityKind};
 use std::path::Path;
 
@@ -29,16 +28,14 @@ impl Run {
                     .collect::<Vec<_>>()
             )
         });
-        let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-        let prover = Prover::new(&loaded)
+        let (world, obligations) = crate::fixture::world_of(&loaded);
+        let prover = Prover::new(&loaded, &world)
             .expect("the port lowers the claims")
             .with_backend(Some(
                 ply_machine::support::prover_backend(&loaded)
                     .expect("the program compiles to a tier"),
             ));
-        let results = collected
-            .obligations
+        let results = obligations
             .into_iter()
             .map(|o| {
                 let domain = crate::fixture::measured(&prover, &o);
@@ -300,15 +297,14 @@ fn nothing_proved_here_is_refutable_by_sampling() {
     for source in sources {
         let dir = project(source);
         let loaded = load(dir.path()).expect("the fixture compiles");
-        let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-        let prover = Prover::new(&loaded)
+        let (world, obligations) = crate::fixture::world_of(&loaded);
+        let prover = Prover::new(&loaded, &world)
             .expect("the port lowers the claims")
             .with_backend(Some(
                 ply_machine::support::prover_backend(&loaded)
                     .expect("the program compiles to a tier"),
             ));
-        for obligation in &collected.obligations {
+        for obligation in &obligations {
             if prover
                 .discharge_with(
                     obligation,
@@ -530,15 +526,13 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
     // that holds, which is `proof.obligation`'s rule, over these discharges.
     let dir = project(SOURCE);
     let loaded = load(dir.path()).expect("the fixture compiles");
-    let hashes = loaded.hashes.clone();
-    let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-    let prover = Prover::new(&loaded)
+    let (world, obligations) = crate::fixture::world_of(&loaded);
+    let prover = Prover::new(&loaded, &world)
         .expect("the port lowers the claims")
         .with_backend(Some(
             ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier"),
         ));
-    let results: Vec<(Obligation, Discharge)> = collected
-        .obligations
+    let results: Vec<(Obligation, Discharge)> = obligations
         .into_iter()
         .map(|o| {
             let d = prover.discharge_with(
@@ -690,9 +684,8 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
                   law \"hidden in a record type\" forall (r: Row) { r == r }\n";
     let dir = project(source);
     let loaded = load(dir.path()).expect("the fixture compiles");
-    let hashes = loaded.hashes.clone();
-    let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-    let prover = Prover::new(&loaded)
+    let (world, obligations) = crate::fixture::world_of(&loaded);
+    let prover = Prover::new(&loaded, &world)
         .expect("the port lowers the claims")
         .with_backend(Some(
             ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier"),
@@ -704,7 +697,7 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
     };
 
     let mut lies = Vec::new();
-    for obligation in &collected.obligations {
+    for obligation in &obligations {
         if prover
             .discharge_with(
                 obligation,

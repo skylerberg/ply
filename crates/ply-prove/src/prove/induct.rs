@@ -15,8 +15,8 @@ use super::{
 };
 use super::{solve, uninterpreted_sorts};
 use crate::Rule;
+use crate::sort::Sort;
 use ply_span::Symbol;
-use ply_ty::Type;
 use std::collections::BTreeSet;
 
 pub(super) fn attempt(
@@ -57,8 +57,8 @@ pub(super) fn attempt(
     }
     let result_slot = goal.result.map(|_| goal.binders.len().saturating_sub(1));
     for (slot, binder) in goal.binders.iter().enumerate() {
-        let over_list = list_elem(&binder.ty).is_some();
-        if !(is_int_type(&binder.ty) || over_list) || Some(slot) == result_slot {
+        let over_list = list_elem(&binder.sort).is_some();
+        if !(is_int_type(&binder.sort) || over_list) || Some(slot) == result_slot {
             continue;
         }
         let (proved, used) = if over_list {
@@ -94,7 +94,7 @@ fn terminating(
     budget: u32,
 ) -> Option<(bool, u32)> {
     let def = ctx.self_recursive(name)?;
-    let Type::Fn { params, .. } = &ctx.scheme(name)?.ty else {
+    let Sort::Fn { params, .. } = &ctx.signature(name)?.sort else {
         return None;
     };
     if params.len() != def.params {
@@ -162,7 +162,7 @@ fn induct_on(
     let bound: Vec<TermId> = goal
         .binders
         .iter()
-        .map(|binder| lowering.bind_symbolic(&binder.ty))
+        .map(|binder| lowering.bind_symbolic(&binder.sort))
         .collect();
 
     let mut guards: Vec<TermId> = Vec::with_capacity(goal.guards.len());
@@ -259,18 +259,18 @@ fn induct_on(
     }
 
     let claim = match conjunction(&mut terms, body_needs) {
-        Some(conjoined) => terms.mk(term::Node::And(body, conjoined), Some(Type::bool())),
+        Some(conjoined) => terms.mk(term::Node::And(body, conjoined), Some(Sort::bool())),
         None => body,
     };
     let hypothesis = {
         let held = match conjunction(&mut terms, &hypothesis_needs) {
-            Some(needs) => terms.mk(term::Node::And(prior_body, needs), Some(Type::bool())),
+            Some(needs) => terms.mk(term::Node::And(prior_body, needs), Some(Sort::bool())),
             None => prior_body,
         };
         match conjunction(&mut terms, &prior_guards) {
             Some(guard) => {
                 let unguarded = terms.not(guard);
-                terms.mk(term::Node::Or(unguarded, held), Some(Type::bool()))
+                terms.mk(term::Node::Or(unguarded, held), Some(Sort::bool()))
             }
             None => held,
         }
@@ -282,7 +282,7 @@ fn induct_on(
             lhs: bound[slot],
             rhs: zero,
         },
-        Some(Type::bool()),
+        Some(Sort::bool()),
     );
     let step = terms.mk(
         term::Node::Cmp {
@@ -290,7 +290,7 @@ fn induct_on(
             lhs: bound[slot],
             rhs: zero,
         },
-        Some(Type::bool()),
+        Some(Sort::bool()),
     );
 
     let mut common = ranges.clone();
@@ -354,7 +354,7 @@ fn induct_on(
         Some(Proof {
             rules: rules.into_rules(),
             steps: spent,
-            sorts: uninterpreted_sorts(ctx, goal.binders),
+            sorts: uninterpreted_sorts(goal.binders),
             guard_satisfiable,
         }),
         spent,
@@ -390,9 +390,9 @@ fn induct_list(
     let bound: Vec<TermId> = goal
         .binders
         .iter()
-        .map(|binder| lowering.bind_symbolic(&binder.ty))
+        .map(|binder| lowering.bind_symbolic(&binder.sort))
         .collect();
-    let sort = goal.binders[slot].ty.clone();
+    let sort = goal.binders[slot].sort.clone();
     let elem = list_elem(&sort).cloned();
     let nil = lowering.terms.nil(Some(sort.clone()));
     let head = lowering.terms.sym(elem);
@@ -472,7 +472,7 @@ fn induct_list(
         match conjunction(&mut terms, &hyp.guards) {
             Some(guard) => {
                 let unguarded = terms.not(guard);
-                terms.mk(term::Node::Or(unguarded, held), Some(Type::bool()))
+                terms.mk(term::Node::Or(unguarded, held), Some(Sort::bool()))
             }
             None => held,
         }
@@ -536,7 +536,7 @@ fn induct_list(
         Some(Proof {
             rules: rules.into_rules(),
             steps: spent,
-            sorts: uninterpreted_sorts(ctx, goal.binders),
+            sorts: uninterpreted_sorts(goal.binders),
             guard_satisfiable,
         }),
         spent,
@@ -554,7 +554,7 @@ struct Instance {
 impl Instance {
     fn claim(&self, terms: &mut term::Terms) -> TermId {
         match conjunction(terms, &self.needs) {
-            Some(needs) => terms.mk(term::Node::And(self.body, needs), Some(Type::bool())),
+            Some(needs) => terms.mk(term::Node::And(self.body, needs), Some(Sort::bool())),
             None => self.body,
         }
     }

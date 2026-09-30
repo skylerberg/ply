@@ -6,10 +6,14 @@
 // line and key of both reports, and the code each run exits with are decided here.
 
 import cmdline (Parsed, has, parse_nat, value, values_of)
-import proof.domain (Decl, Ty, finite, name_of, size)
+import proof.domain (Con, Decl, finite, name_of)
 import proof.shrink (Offer, Reply)
+import proof.world (Binder, Built, Obligation, World, generated)
 import machine
+import compiler.front (Whole)
+import compiler.infer (DefInfo)
 import compiler.resolve (Diag, diag, diag1)
+import signature (provenance)
 import std.bytes (bytes_of_hex, hex_of)
 // An obligation's key folds in the simulation's digest, which is the suite's own encoding.
 import suite.select (Search, digest_of)
@@ -70,12 +74,10 @@ pub type SimOpts = {
 }
 
 pub nondet effect prover {
-  write configure[claims](options: Options, front: Front) -> Unit
-  read collected[claims]() -> Result<Collection, Refusal>
-  // The types the obligations are written over: what a domain is measured from. Whether the binders
-  // are finite, how many points that is, and whether walking them is a proof is `prove.domain`'s
-  // rule; the runtime only says what the types are.
-  read typed[claims]() -> Result<Typed, Refusal>
+  // The world is the program as the prover reads it, built here: its declared types, its
+  // definitions' signatures, and the obligations it owes, which `discharged` names by position.
+  write configure[claims](options: Options, front: Front, world: World) -> Unit
+  read collected[claims]() -> Result<Collected, Refusal>
   // What the obligation cache holds under each key the program names, spelled out: a proof, a
   // sample, or something the runtime cannot read. Every key is the program's: this is the only side
   // that encodes one.
@@ -169,6 +171,8 @@ pub type Claim = {
   at: Loc,
   // Declared atoms the owner's body never touched, which `--explain` lays out under the row.
   unperformed: List<String>,
+  // The binders a point of the claim's domain assigns, which is what a domain is measured over.
+  binders: List<Binder>,
 }
 
 // What the program decided about a run of obligations: which ones it reports on, by collection
@@ -187,12 +191,6 @@ pub type Choice = {
 // what an artifact calls the domain.
 pub type Measured = { claim: Int, sizes: List<Int>, name: String }
 
-// One binder of one obligation: its name, the type as the runtime prints it, and the type itself.
-pub type Binder = { name: String, text: String, ty: Ty }
-
-// Every obligation's binders, by collection index, and every declared type a size needs.
-pub type Typed = { decls: List<Decl>, claims: List<{ claim: Int, binders: List<Binder> }> }
-
 pub type Sim = { mode: String, roots: List<Int>, budget: Int, steps: Int, path: List<Int> }
 
 // What an obligation weaker than a proof was discharged against, and cached under.
@@ -205,14 +203,71 @@ pub type Plan = {
   sim: Sim,
 }
 
-pub type Collection = {
+// What the runtime loaded for a run: the places its spans point into, what loading it had to say,
+// the definitions and laws in scope, and the plan the run discharges under.
+pub type Collected = {
   places: List<Place>,
   warnings: List<Diag>,
-  claims: List<Claim>,
   // Every definition in scope, in name order.
   defs: List<Def>,
   laws: List<Written>,
   plan: Plan,
+}
+
+// What this side built of its own claims: one per obligation of the world, in its order, the types
+// their binders are written over, and the trouble that cost it an obligation.
+pub type Claimed = { claims: List<Claim>, decls: List<Decl>, warnings: List<Diag> }
+
+pub type Collection = {
+  places: List<Place>,
+  warnings: List<Diag>,
+  claims: List<Claim>,
+  // Every type a claim's binder can be written over: what a domain is measured from.
+  decls: List<Decl>,
+  // Every definition in scope, in name order.
+  defs: List<Def>,
+  laws: List<Written>,
+  plan: Plan,
+}
+
+pub fn collection_of(got: Collected, mine: Claimed) -> Collection =
+  {
+    places: got.places,
+    warnings: also(got.warnings, mine.warnings),
+    claims: mine.claims,
+    decls: mine.decls,
+    defs: got.defs,
+    laws: got.laws,
+    plan: got.plan,
+  }
+
+// Every obligation of the world as a claim a report reads, with what its owner's row declares and its
+// body never performs.
+pub fn own_claims(w: Whole, built: Built) -> Claimed = {
+  let defs = fold(w.checked.defs, map_new(), |acc: Map<String, DefInfo>, d: DefInfo|
+    map_insert(acc, string_of_bytes_lossy(d.name), d));
+  {
+    claims: map(built.world.obligations, |o: Obligation|
+      {
+        key: o.key,
+        host: o.host,
+        owner: o.owner,
+        kind: o.kind,
+        guarded: o.guarded,
+        frame: o.frame,
+        at: o.at,
+        unperformed: match o.kind {
+          Law(_) -> [],
+          Ensures(_) -> match map_get(defs, o.owner) {
+            Some(d) -> provenance(d).unperformed,
+            None -> [],
+          },
+        },
+        binders: generated(o),
+      }),
+    decls: built.world.decls,
+    warnings: built.warnings,
+  }
 }
 
 // What the runtime discharged, parallel to the claims the run asked for.
@@ -446,7 +501,7 @@ pub fn decided(
   c: Collection,
   wanted: List<Int>,
   use_cache: Bool,
-) -> Result<Verdicts, Refusal> / {prover.outcomes[claims], prover.typed[claims], prover.discharged[claims], prover.record[claims]} = {
+) -> Result<Verdicts, Refusal> / {prover.outcomes[claims], prover.discharged[claims], prover.record[claims]} = {
   let digest = plan_digest_of(c.plan);
   let asked = map(wanted, |i: Int| blank_claim(c.claims, i));
   let keys = map(asked, |claim: Claim|
@@ -516,6 +571,7 @@ pub fn blank_claim(cs: List<Claim>, i: Int) -> Claim =
         frame: Pure,
         at: { module: 0, start: 0, end: 0 },
         unperformed: [],
+        binders: [],
       },
   }
 
@@ -796,6 +852,7 @@ pub fn a_claim(owner: String, kind: Kind) -> Claim =
     frame: Pure,
     at: a_loc(),
     unperformed: [],
+    binders: [],
   }
 
 pub fn a_place() -> Place = { path: "m.ply", text: b"fn f() -> Int = 1\nfn g() -> Int = 2\n" }
@@ -1038,49 +1095,76 @@ pub fn no_options() -> Options =
     },
   }
 
-// The domains this side measured for the obligations it will discharge: the binders' types are the
-// runtime's, and what a domain *is* — how many points each binder holds, whether that is a domain at
-// all, and what it is called — is `prove.domain`'s rule. A claim whose binders are not finite, or
-// whose product is past the bound, is left out and sampled instead.
-pub fn measured(
-  c: Collection,
-  wanted: List<Int>,
-  to_discharge: List<Int>,
-) -> List<Measured> / {prover.typed[claims]} = {
-  let typed = match prover.typed[claims]() { Err(_) -> { decls: [], claims: [] }, Ok(t) -> t };
+// A collection with nothing of this side's in it yet, from what the runtime loaded: what a fixture
+// hands a run that is told what the runtime answered.
+pub fn collected_part(c: Collection) -> Collected =
+  { places: c.places, warnings: c.warnings, defs: c.defs, laws: c.laws, plan: c.plan }
+
+pub fn claimed_part(c: Collection) -> Claimed = { claims: c.claims, decls: c.decls, warnings: [] }
+
+// The world a run whose claims a fixture spells out hands the runtime: the fixture's runtime reads
+// none of it.
+pub fn no_world() -> World = { decls: [], signatures: [], obligations: [] }
+
+// The domains this side measured for the obligations it will discharge: what a domain *is* — how
+// many points each binder holds, whether that is a domain at all, and what it is called — is
+// `prove.domain`'s rule over the claim's binders. A claim whose binders are not finite, or whose
+// product is past the bound, is left out and sampled instead.
+pub fn measured(c: Collection, wanted: List<Int>, to_discharge: List<Int>) -> List<Measured> =
   fold(to_discharge, [], |acc: List<Measured>, place: Int|
-    appended(acc, measured_one(typed, c.claims, wanted, place)))
-}
+    also(acc, measured_one(c, wanted, place)))
 
-fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
-  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
-
-fn measured_one(typed: Typed, cs: List<Claim>, wanted: List<Int>, place: Int) -> List<Measured> =
+fn measured_one(c: Collection, wanted: List<Int>, place: Int) -> List<Measured> =
   match list_at(wanted, place) {
     None -> [],
-    Some(claim) -> match find_entry(typed.claims, claim) {
+    Some(index) -> match list_at(c.claims, index) {
       None -> [],
-      Some(entry) -> match finite(map(entry.binders, |b: Binder| b.ty), typed.decls) {
+      Some(claim) -> match finite(map(claim.binders, |b: Binder| b.ty), c.decls) {
         None -> [],
         Some(domain) ->
           [
             {
-              claim: claim,
+              claim: index,
               sizes: domain.sizes,
-              name: name_of(map(entry.binders, |b: Binder| b.text)),
+              name: name_of(map(claim.binders, |b: Binder| b.text)),
             },
           ],
       },
     },
   }
 
-fn find_entry(
-  entries: List<{ claim: Int, binders: List<Binder> }>,
-  claim: Int,
-) -> Option<{ claim: Int, binders: List<Binder> }> =
-  fold(
-    entries,
-    None,
-    |found: Option<{ claim: Int, binders: List<Binder> }>, e: { claim: Int, binders: List<Binder> }|
-      match found { Some(_) -> found, None -> if e.claim == claim { Some(e) } else { None } },
-  )
+test "a claim over finite binders is measured from its own binders, and one over an Int is not" {
+  let kind: Decl = {
+    name: "m.Kind",
+    params: 0,
+    variants: [
+      { name: "m.Asset", fields: [] },
+      { name: "m.Liability", fields: [] },
+      { name: "m.Equity", fields: [] },
+    ],
+  };
+  let small = {
+    ..a_claim("m.small", Law(Some("small"))),
+    binders: [
+      { name: "k", ty: Con("m.Kind", []), text: "m.Kind" },
+      { name: "b", ty: Con("Bool", []), text: "Bool" },
+    ],
+  };
+  let wide = {
+    ..a_claim("m.wide", Law(Some("wide"))),
+    binders: [{ name: "n", ty: Con("Int", []), text: "Int" }],
+  };
+  let c: Collection = {
+    places: [],
+    warnings: [],
+    claims: [small, wide],
+    decls: [kind],
+    defs: [],
+    laws: [],
+    plan: a_plan(),
+  };
+  assert_eq(measured(c, [0, 1], [0, 1]), [{ claim: 0, sizes: [3, 2], name: "m.Kind × Bool" }]);
+  // Only what the run discharges is measured, and it is named by its place in the collection.
+  assert_eq(measured(c, [1, 0], [1]), [{ claim: 0, sizes: [3, 2], name: "m.Kind × Bool" }]);
+  assert_eq(measured(c, [1, 0], [0]), [])
+}

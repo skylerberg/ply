@@ -1,12 +1,12 @@
 use ply_prove::{
-    CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, ObligationKind,
-    ProvePlan, Rule, Tier, Vacuity, VacuityKind,
+    Binder, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation,
+    ObligationKind, ProvePlan, Rule, Sort, Tier, Vacuity, VacuityKind,
 };
 use ply_span::{Span, Symbol};
 use ply_store::{CachedCases, CachedEvidence, CachedObligation, Store};
 use ply_test::obligation::{self, Choice, Discharger, from_cached, to_cached};
 use ply_ty::DefHash;
-use ply_ty::{Footprint, LawBinder, Type};
+use ply_ty::Footprint;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -45,12 +45,7 @@ fn ensures(key: u8, owner: &str, index: usize) -> Obligation {
         owner: Symbol::new(owner),
         kind: ObligationKind::Ensures { index },
         span: Span::DUMMY,
-        frame: ply_prove::Frame::Pure,
-        binders: vec![LawBinder {
-            name: Symbol::new("x"),
-            ty: Type::int(),
-            span: Span::DUMMY,
-        }],
+        binders: vec![Binder::new("x", Sort::int())],
         guarded: false,
         host: false,
         footprint: Footprint::empty(),
