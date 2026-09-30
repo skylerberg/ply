@@ -17,8 +17,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::w4::{Variant, reserve_port};
-use crate::{w5, w6};
+use crate::w6;
 
 fn micros(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
@@ -701,13 +700,13 @@ pub fn served(
         [("health (no db)", ROUTE), ("items (1 select)", DB_ROUTE)];
     let mut rounds = Vec::new();
     for _ in 0..repeats.max(1) {
-        let points = w5::tracing(
+        let points = tracing(
             repo,
             ply,
             url,
-            &[w5::Stack::Twin, w5::Stack::Postgres, w5::Stack::PostgresTls],
+            &[Stack::Twin, Stack::Postgres, Stack::PostgresTls],
             variant,
-            &[w5::Sinking::Off, w5::Sinking::JsonNull],
+            &[Sinking::Off, Sinking::JsonNull],
             &routes,
             concurrencies,
             per_conn,
@@ -908,13 +907,13 @@ pub fn memo_lever(
                 (repo, &mut with, &mut with_health),
                 (dir.path(), &mut without, &mut without_health),
             ] {
-                let points = w5::tracing(
+                let points = tracing(
                     root,
                     ply,
                     url,
-                    &[w5::Stack::PostgresTls],
+                    &[Stack::PostgresTls],
                     loop_variant,
-                    &[w5::Sinking::JsonNull],
+                    &[Sinking::JsonNull],
                     &routes,
                     &[concurrency],
                     per_conn,
@@ -992,11 +991,11 @@ pub fn report(
 ) -> Result<w6::Report> {
     let route = "items (1 select)";
     let health = "health (no db)";
-    let off = w5::Sinking::Off.label();
-    let json = w5::Sinking::JsonNull.label();
-    let twin = w5::Stack::Twin.label();
-    let pg = w5::Stack::Postgres.label();
-    let tls = w5::Stack::PostgresTls.label();
+    let off = Sinking::Off.label();
+    let json = Sinking::JsonNull.label();
+    let twin = Stack::Twin.label();
+    let pg = Stack::Postgres.label();
+    let tls = Stack::PostgresTls.label();
 
     let total = best(served, tls, json, route).with_context(|| {
         format!("the served sweep has no `{tls}` x `{json}` x `{route}` row to read the total off")
@@ -1568,4 +1567,564 @@ pub fn counted(
         )
     })?;
     serde_json::from_str(&text).with_context(|| format!("reading `{}`", out.display()))
+}
+
+// --- The served sweep: the desk under `ply run --host`, loaded by the corpus's Ply client ------
+
+/// Which accept loop a served desk runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Variant {
+    /// One connection at a time.
+    Sequential,
+    /// A task per connection on the production scheduler.
+    TaskPerConn,
+}
+
+impl Variant {
+    pub fn label(self) -> &'static str {
+        match self {
+            Variant::Sequential => "sequential",
+            Variant::TaskPerConn => "task-per-conn",
+        }
+    }
+
+    /// What `DESK_ACCEPT` calls it.
+    fn setting(self) -> &'static str {
+        match self {
+            Variant::Sequential => "sequential",
+            Variant::TaskPerConn => "task-per-connection",
+        }
+    }
+}
+
+/// Which trace sink a served point runs under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sinking {
+    /// `--trace off`, the discarding handler.
+    Off,
+    /// `--trace json`, with stderr on `/dev/null`: the encoder without the destination.
+    JsonNull,
+}
+
+impl Sinking {
+    pub fn label(self) -> &'static str {
+        match self {
+            Sinking::Off => "off (discard)",
+            Sinking::JsonNull => "json → /dev/null",
+        }
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            Sinking::Off => "off",
+            Sinking::JsonNull => "json",
+        }
+    }
+}
+
+/// How much of the operable stack a point runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stack {
+    /// `DESK_STORE=memory`: the twin behind the routes.
+    Twin,
+    /// `DESK_STORE=postgres`: postgres behind the routes, over plaintext.
+    Postgres,
+    /// The same with `DESK_TLS`.
+    PostgresTls,
+}
+
+impl Stack {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stack::Twin => "twin, http",
+            Stack::Postgres => "postgres, http",
+            Stack::PostgresTls => "postgres, https",
+        }
+    }
+}
+
+/// A port nothing is listening on.
+fn reserve_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("reserving an ephemeral port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// The command line a served desk runs on: its settings, and where its database is when it has one.
+fn served_args(
+    port: u16,
+    connections: u32,
+    api_key: &str,
+    database: Option<&str>,
+    variant: Variant,
+) -> Vec<String> {
+    let mut args = vec![
+        "--config-schema".to_string(),
+        "desk.config".to_string(),
+        "--set".to_string(),
+        format!("DESK_PORT={port}"),
+        "--set".to_string(),
+        format!("DESK_CONNECTIONS={connections}"),
+        "--set".to_string(),
+        format!("DESK_API_KEY={api_key}"),
+        "--set".to_string(),
+        format!(
+            "DESK_STORE={}",
+            if database.is_some() {
+                "postgres"
+            } else {
+                "memory"
+            }
+        ),
+        "--set".to_string(),
+        format!("DESK_ACCEPT={}", variant.setting()),
+    ];
+    if let Some(url) = database {
+        args.push("--set".to_string());
+        args.push(format!("DESK_DATABASE={url}"));
+    }
+    args
+}
+
+/// `ply run --host`, killed however the harness leaves.
+struct Server {
+    child: Option<std::process::Child>,
+    ply: PathBuf,
+}
+
+impl Server {
+    fn start_with(
+        ply: &Path,
+        dir: &Path,
+        extra: &[&str],
+        stderr: std::process::Stdio,
+    ) -> Result<Server> {
+        let child = Command::new(ply)
+            .args(["run", "--host", "--color", "never"])
+            .args(extra)
+            .current_dir(dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .with_context(|| format!("starting `{} run --host`", ply.display()))?;
+        Ok(Server {
+            child: Some(child),
+            ply: ply.to_path_buf(),
+        })
+    }
+
+    fn exited(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        let child = self.child.as_mut().expect("the server has not been reaped");
+        Ok(child.try_wait()?)
+    }
+
+    /// The output if the server has died; never blocks on a live process's pipe.
+    fn output_if_exited(&mut self) -> String {
+        match self.exited() {
+            Ok(Some(status)) => format!("the server exited {status}:\n{}", self.take()),
+            Ok(None) => "the server was still running".to_string(),
+            Err(e) => format!("the server could not be waited on: {e}"),
+        }
+    }
+
+    /// The server was given its connection count, so it must exit on its own.
+    fn finish(mut self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let child = self.child.as_mut().expect("the server has not been reaped");
+            match child.try_wait()? {
+                Some(status) if status.success() => return Ok(()),
+                Some(status) => bail!("the server exited {status}:\n{}", self.take()),
+                None if Instant::now() >= deadline => {
+                    bail!("the server was still running a minute after every connection")
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    fn take(&mut self) -> String {
+        let Some(child) = self.child.take() else {
+            return String::new();
+        };
+        match child.wait_with_output() {
+            Ok(out) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => format!("(the server's output could not be read: {e})"),
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The load client's own source, so the file the harness runs and the file the corpus checks are
+/// one file.
+const LOAD_CLIENT: &str = include_str!("../fixtures/load.ply");
+
+/// What one run of the load client found, as the program wrote it down.
+#[derive(Clone, Debug, Deserialize)]
+struct LoadReport {
+    answered: u32,
+    wall_micros: i64,
+    latencies: Vec<i64>,
+    statuses: Vec<LoadStatus>,
+    failures: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct LoadStatus {
+    status: u16,
+    count: u32,
+}
+
+/// The load client: the program on disk and a root its report is written under.
+struct LoadClient {
+    ply: PathBuf,
+    dir: tempfile::TempDir,
+    root: tempfile::TempDir,
+}
+
+impl LoadClient {
+    fn new(ply: &Path) -> Result<LoadClient> {
+        let dir = tempfile::tempdir().context("a temp dir for the load client")?;
+        std::fs::write(dir.path().join("load.ply"), LOAD_CLIENT)
+            .context("writing the load client")?;
+        let root = tempfile::tempdir().context("a temp dir for the load client's report")?;
+        Ok(LoadClient {
+            ply: ply.to_path_buf(),
+            dir,
+            root,
+        })
+    }
+
+    /// One run over TLS when `trust` names the certificate to accept.
+    fn measure(
+        &self,
+        addr: SocketAddr,
+        paths: &str,
+        connections: u32,
+        per_conn: u32,
+        trust: Option<&Path>,
+    ) -> Result<LoadReport> {
+        let report = "load.json";
+        let _ = std::fs::remove_file(self.root.path().join(report));
+        let mut command = Command::new(&self.ply);
+        command
+            .args(["run", "--host", "--color", "never"])
+            .arg("--fs")
+            .arg(format!("report={}", self.root.path().display()))
+            .args(["--set", "LOAD_HOST=localhost"])
+            .args(["--set", &format!("LOAD_PORT={}", addr.port())])
+            .args(["--set", &format!("LOAD_ROUTES={paths}")])
+            .args(["--set", &format!("LOAD_CONNECTIONS={connections}")])
+            .args(["--set", &format!("LOAD_PER_CONN={per_conn}")])
+            .args(["--set", &format!("LOAD_TLS={}", trust.is_some())])
+            .args(["--set", &format!("LOAD_REPORT={report}")])
+            .current_dir(self.dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(certificate) = trust {
+            command.arg("--trust").arg(certificate);
+        }
+        let out = command.output().with_context(|| {
+            format!(
+                "running `{} run --host` as a load client",
+                self.ply.display()
+            )
+        })?;
+        if !out.status.success() {
+            bail!(
+                "the load client exited {} at {connections}x{per_conn} on {paths}:\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let path = self.root.path().join(report);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("the load client wrote no report to `{}`", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("reading `{}`", path.display()))
+    }
+}
+
+/// Connections per client for a point, so each carries about `requests_per_point` requests.
+fn share(concurrency: u32, per_conn: u32, requests_per_point: u32) -> u32 {
+    let wanted = requests_per_point.div_ceil(concurrency * per_conn).max(1);
+    wanted.min((1000 / concurrency).max(1))
+}
+
+/// Nearest-rank.
+fn percentile(of: &[i64], p: f64) -> f64 {
+    if of.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = of.to_vec();
+    sorted.sort_unstable();
+    let rank = ((p * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1] as f64
+}
+
+/// A partial answer is a different measurement, not a slower server.
+fn require(report: &LoadReport, requests: u32) -> Result<()> {
+    if !report.failures.is_empty() || report.answered != requests {
+        bail!(
+            "{} of {requests} requests were answered ({} failures); first: {}",
+            report.answered,
+            report.failures.len(),
+            report
+                .failures
+                .first()
+                .map(String::as_str)
+                .unwrap_or("none recorded")
+        );
+    }
+    let bad: Vec<String> = report
+        .statuses
+        .iter()
+        .filter(|s| s.status != 200)
+        .map(|s| format!("{}x {}", s.count, s.status))
+        .collect();
+    if !bad.is_empty() {
+        bail!("the server answered {}", bad.join(", "));
+    }
+    Ok(())
+}
+
+/// Block until the server answers a real request over the transport it was started with, so
+/// timing does not race its typecheck.
+fn wait_until_serving_over(
+    server: &mut Server,
+    addr: SocketAddr,
+    trust: Option<&Path>,
+) -> Result<()> {
+    let client = LoadClient::new(&server.ply)?;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Some(status) = server.exited()? {
+            bail!(
+                "the server exited {status} before listening:\n{}",
+                server.take()
+            );
+        }
+        if let Ok(report) = client.measure(addr, "/health", 1, 1, trust)
+            && report.answered == 1
+            && report.failures.is_empty()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("nothing answering on {addr} after three minutes");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What one load against a served desk took.
+struct LoadPoint {
+    requests: u32,
+    per_second: f64,
+    p50_micros: f64,
+    p95_micros: f64,
+    p99_micros: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_point_over(
+    server: &mut Server,
+    addr: SocketAddr,
+    trust: Option<&Path>,
+    label: &'static str,
+    path: &str,
+    concurrency: u32,
+    per_conn: u32,
+    conns_per_thread: u32,
+) -> Result<LoadPoint> {
+    let connections = concurrency * conns_per_thread;
+    let requests = connections * per_conn;
+    let client = LoadClient::new(&server.ply)?;
+    let measured = client.measure(addr, path, connections, per_conn, trust);
+    let report = measured.with_context(|| {
+        format!(
+            "{label} at concurrency {concurrency}\n{}",
+            server.output_if_exited()
+        )
+    })?;
+    require(&report, requests).with_context(|| {
+        format!(
+            "{label} at concurrency {concurrency}\n{}",
+            server.output_if_exited()
+        )
+    })?;
+    let seconds = report.wall_micros as f64 / 1e6;
+    Ok(LoadPoint {
+        requests,
+        per_second: if seconds > 0.0 {
+            requests as f64 / seconds
+        } else {
+            0.0
+        },
+        p50_micros: percentile(&report.latencies, 0.50),
+        p95_micros: percentile(&report.latencies, 0.95),
+        p99_micros: percentile(&report.latencies, 0.99),
+    })
+}
+
+/// The TLS credential name the served desk listens with.
+const CREDENTIAL: &str = "desk";
+
+/// Generated per run: the server is given the two files and a client trusts the certificate.
+fn credential(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let issued =
+        ply_host::certgen::issue(&["localhost".to_string()]).map_err(|why| anyhow::anyhow!(why))?;
+    let certificate = dir.join("desk.pem");
+    let key = dir.join("desk.key");
+    std::fs::write(&certificate, &issued.certificate)?;
+    std::fs::write(&key, &issued.key)?;
+    Ok((certificate, key))
+}
+
+struct Serving {
+    _dir: tempfile::TempDir,
+    server: Server,
+    addr: SocketAddr,
+    /// The certificate a client of this server trusts, which is the one this run issued it.
+    trust: Option<PathBuf>,
+}
+
+impl Serving {
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        repo: &Path,
+        ply: &Path,
+        url: &str,
+        stack: Stack,
+        variant: Variant,
+        sinking: Sinking,
+        connections: u32,
+        api_key: &str,
+    ) -> Result<Serving> {
+        let dir = tempfile::tempdir().context("a temp dir for the served project")?;
+        let port = reserve_port()?;
+        std::fs::copy(repo.join("examples/desk.ply"), dir.path().join("desk.ply"))
+            .context("copying `examples/desk.ply`")?;
+        let mut args = served_args(
+            port,
+            connections,
+            api_key,
+            (stack != Stack::Twin).then_some(url),
+            variant,
+        );
+        args.extend([
+            "--trace".to_string(),
+            sinking.flag().to_string(),
+            "--trace-level".to_string(),
+            "info".to_string(),
+        ]);
+        let mut trust = None;
+        if stack == Stack::PostgresTls {
+            let (certificate, key) = credential(dir.path())?;
+            args.push("--set".into());
+            args.push(format!("DESK_TLS={CREDENTIAL}"));
+            args.push("--tls".into());
+            args.push(format!(
+                "{CREDENTIAL}={},{}",
+                certificate.display(),
+                key.display()
+            ));
+            trust = Some(certificate);
+        }
+        let stderr = match sinking {
+            Sinking::JsonNull => std::process::Stdio::from(std::fs::File::create("/dev/null")?),
+            // A discarding sink writes nothing, so a pipe cannot fill.
+            Sinking::Off => std::process::Stdio::piped(),
+        };
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut server = Server::start_with(ply, dir.path(), &borrowed, stderr)?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        wait_until_serving_over(&mut server, addr, trust.as_deref())?;
+        Ok(Serving {
+            _dir: dir,
+            server,
+            addr,
+            trust,
+        })
+    }
+}
+
+/// One served point: which stack, loop, sink and route, and what its load took.
+struct ServedPoint {
+    stack: &'static str,
+    accept: &'static str,
+    sink: &'static str,
+    route: String,
+    concurrency: u32,
+    requests: u32,
+    per_second: f64,
+    p50_micros: f64,
+    p95_micros: f64,
+    p99_micros: f64,
+}
+
+/// The same routes under the same load with only `--trace` moved.
+#[allow(clippy::too_many_arguments)]
+fn tracing(
+    repo: &Path,
+    ply: &Path,
+    url: &str,
+    stacks: &[Stack],
+    variant: Variant,
+    sinks: &[Sinking],
+    routes: &[(&'static str, &'static str)],
+    concurrencies: &[u32],
+    per_conn: u32,
+    requests_per_point: u32,
+    api_key: &str,
+) -> Result<Vec<ServedPoint>> {
+    let mut out = Vec::new();
+    for &stack in stacks {
+        for &sinking in sinks {
+            for &concurrency in concurrencies {
+                let conns = share(concurrency, per_conn, requests_per_point);
+                // One spare for the probe that proves the server answers.
+                let budget = concurrency * conns * routes.len() as u32 + 1;
+                let mut serving =
+                    Serving::start(repo, ply, url, stack, variant, sinking, budget, api_key)?;
+                for (label, path) in routes {
+                    let trust = serving.trust.clone();
+                    let point = load_point_over(
+                        &mut serving.server,
+                        serving.addr,
+                        trust.as_deref(),
+                        label,
+                        path,
+                        concurrency,
+                        per_conn,
+                        conns,
+                    )?;
+                    out.push(ServedPoint {
+                        stack: stack.label(),
+                        accept: variant.label(),
+                        sink: sinking.label(),
+                        route: label.to_string(),
+                        concurrency,
+                        requests: point.requests,
+                        per_second: point.per_second,
+                        p50_micros: point.p50_micros,
+                        p95_micros: point.p95_micros,
+                        p99_micros: point.p99_micros,
+                    });
+                }
+                serving.server.finish()?;
+            }
+        }
+    }
+    Ok(out)
 }

@@ -1,0 +1,396 @@
+// What a statement costs through `std.db`: this program's own statements over its own `part`
+// table, performed one after another or spread over tasks, against the in-memory twin or against a
+// database it opens itself. It times itself and prints one JSON object a run: how many statements
+// each repeat answered, how many the pool refused and how many otherwise failed, and the
+// microseconds each repeat took. The corpus's `w4` runs it once a point.
+//
+// `std.db` runs no DDL, so the `schema` section prints the statements that make the table and fill
+// it, and the runner runs them with the C tool it compares this program with.
+//
+// Settings: `BENCH_SECTION` (`schema`, `twin` or `postgres`), `BENCH_WORKLOAD` (`select`,
+// `select $1`, `insert` or `transaction`), `BENCH_TASKS`, `BENCH_PER` (statements a task),
+// `BENCH_ROWS` (what the table holds before each repeat), `BENCH_BASE` (the first key a write
+// takes), `BENCH_REPEATS`, and for `postgres` `BENCH_DATABASE` and `BENCH_POOL`.
+
+import std.config
+import std.config (config)
+import std.db
+import std.db (db, with_server)
+import std.json
+import std.json (Json)
+import std.net (net)
+import std.process (process)
+import std.random (entropy)
+import std.router (int_of_text)
+import std.time (time)
+
+// --- The table and its statements --------------------------------------------------------
+
+pub fn schema() -> db::Schema = { tables: [part()] }
+
+pub fn part() -> db::Table =
+  {
+    name: "part",
+    columns: [
+      db::column("sku", db::TText, false),
+      db::column("name", db::TText, false),
+      db::column("price", db::TNumeric(10, 4), false),
+      db::column("n", db::TInt, false),
+    ],
+    primary_key: ["sku"],
+    unique: [],
+    foreign_keys: [],
+    checks: [],
+  }
+
+pub fn select_all() -> db::Stmt =
+  db::stmt("select sku, name, price, n from part order by sku limit 1")
+
+pub fn select_by() -> db::Stmt = db::stmt("select sku, name, price, n from part where sku = $1")
+
+pub fn insert_one() -> db::Stmt =
+  db::stmt("insert into part (sku, name, price, n) values ($1, $2, $3, $4)")
+
+pub fn clear() -> db::Stmt = db::stmt("delete from part")
+
+fn sku_of(i: Int) -> String = "sku-" ++ int_to_string(i)
+
+fn row_params(i: Int) -> List<db::Param> =
+  [db::PText(sku_of(i)), db::PText("a part"), db::PNumeric(1.2500m), db::PInt(i)]
+
+// The rows a table of `rows` holds: `sku-0` onwards, in one statement whose values are written out,
+// since the reader refuses a set-returning function in `from`.
+pub fn fill(rows: Int) -> Option<db::Stmt> =
+  if rows <= 0 { None } else {
+    Some(
+      db::stmt(
+        "insert into part (sku, name, price, n) values "
+          ++ fold(range(0, rows), "", |acc: String, i: Int| {
+            let tuple = "('" ++ sku_of(i) ++ "', 'a part', 1.2500, " ++ int_to_string(i) ++ ")";
+            if acc == "" { tuple } else { acc ++ ", " ++ tuple }
+          }),
+      ),
+    )
+  }
+
+// --- What a run of statements answered ------------------------------------------------------
+
+// Rows and counts a statement answered, statements the pool refused because every connection was
+// taken, and statements that failed any other way.
+pub type Tally = { answered: Int, refused: Int, failed: Int }
+
+pub fn none() -> Tally = { answered: 0, refused: 0, failed: 0 }
+
+pub fn plus(a: Tally, b: Tally) -> Tally =
+  { answered: a.answered + b.answered, refused: a.refused + b.refused, failed: a.failed + b.failed }
+
+fn failure(e: db::DbError) -> Tally =
+  if e.code == "53300" { { ..none(), refused: 1 } } else { { ..none(), failed: 1 } }
+
+pub fn tally_of(a: db::Answer) -> Tally =
+  match a {
+    db::Rows(rows) -> { ..none(), answered: len(rows) },
+    db::Count(n) -> { ..none(), answered: n },
+    db::Failed(e) -> failure(e),
+  }
+
+// --- The four workloads -------------------------------------------------------------------
+
+pub type Workload = | Select | SelectBy | Insert | Transaction
+
+pub fn workload_of(label: String) -> Option<Workload> =
+  match label {
+    "select" -> Some(Select),
+    "select $1" -> Some(SelectBy),
+    "insert" -> Some(Insert),
+    "transaction" -> Some(Transaction),
+    _ -> None,
+  }
+
+// Every operation a workload performs on the table, whichever it is.
+effect set Part = {db.query[part], db.execute[part], db.begin, db.commit, db.abort}
+
+fn selects(n: Int) -> Tally / {db.query[part]} =
+  fold(range(0, n), none(), |acc: Tally, i: Int|
+    plus(acc, tally_of(db.query[part](select_all(), []))))
+
+// The key varies over the rows the table holds, so every execution binds a different value and
+// finds a row.
+fn selects_by(n: Int, rows: Int) -> Tally / {db.query[part]} =
+  fold(range(0, n), none(), |acc: Tally, i: Int|
+    plus(
+      acc,
+      tally_of(
+        db.query[part](select_by(), [db::PText(sku_of(i % (if rows < 1 { 1 } else { rows })))]),
+      ),
+    ))
+
+fn inserts(base: Int, n: Int) -> Tally / {db.execute[part]} =
+  fold(range(0, n), none(), |acc: Tally, i: Int|
+    plus(acc, tally_of(db.execute[part](insert_one(), row_params(base + i)))))
+
+// One transaction an iteration: begin, one insert, commit. A begin the pool refused is a refusal;
+// any other rollback is a failure.
+fn transactions(base: Int, n: Int) -> Tally / {db.execute[part], db.begin, db.commit, db.abort} =
+  fold(range(0, n), none(), |acc: Tally, i: Int|
+    plus(
+      acc,
+      match db::transaction(db::ReadCommitted, db::ReadWrite, || {
+          tally_of(db.execute[part](insert_one(), row_params(base + i)))
+        }) {
+        Ok(t) -> t,
+        Err(rolled) -> match rolled.error {
+          Some(e) -> failure(e),
+          None -> { ..none(), failed: 1 },
+        },
+      },
+    ))
+
+pub fn performed(w: Workload, base: Int, n: Int, rows: Int) -> Tally / {Part} =
+  match w {
+    Select -> selects(n),
+    SelectBy -> selects_by(n, rows),
+    Insert -> inserts(base, n),
+    Transaction -> transactions(base, n),
+  }
+
+// `tasks` tasks of `per` statements each, a write's keys starting past the tasks before it.
+fn spread(
+  w: Workload,
+  base: Int,
+  tasks: Int,
+  per: Int,
+  rows: Int,
+) -> Tally / {Part, task.spawn, task.join} =
+  if tasks <= 1 { performed(w, base, per, rows) } else {
+    fold(
+      map(range(0, tasks), |t: Int| task.spawn(|| performed(w, base + t * per, per, rows))),
+      none(),
+      |acc: Tally, running: Task<Tally>| plus(acc, task.join(running)),
+    )
+  }
+
+// --- The twin, answering the table the way `examples/desk.ply` installs one --------------------
+
+pub fn seeded(rows: Int) -> db::MemDb =
+  fold(range(0, rows), db::open(schema()), |d: db::MemDb, i: Int|
+    db::step(d, insert_one(), row_params(i)).db)
+
+pub fn on_twin<a>(d: db::MemDb, body: () -> a / {Part}) -> a =
+  with_cell[store](d) { c -> {
+    let step = |s: db::Stmt, ps: List<db::Param>| {
+      let o = db::step(cell_get(c), s, ps);
+      cell_set(c, o.db);
+      o.out
+    };
+    let opened = |level: db::Isolation, access: db::Access| {
+      let o = db::begin_step(cell_get(c), level, access);
+      cell_set(c, o.db);
+      o.out
+    };
+    let committed = || {
+      let o = db::commit_step(cell_get(c));
+      cell_set(c, o.db);
+      o.out
+    };
+    let aborted = || {
+      let o = db::abort_step(cell_get(c));
+      cell_set(c, o.db);
+      o.out
+    };
+    handle {
+      body()
+    } with {
+      db.query[part](s, ps) -> step(s, ps),
+      db.execute[part](s, ps) -> step(s, ps),
+      db.begin(level, access) -> opened(level, access),
+      db.commit() -> committed(),
+      db.abort() -> aborted(),
+    }
+  } }
+
+// --- A point ---------------------------------------------------------------------------------
+
+pub type Point = { workload: Workload, tasks: Int, per: Int, rows: Int, base: Int, repeats: Int }
+
+// Every repeat's microseconds, and what all of them answered together.
+pub type Taken = { runs_us: List<Int>, tally: Tally }
+
+fn nothing_taken() -> Taken = { runs_us: [], tally: none() }
+
+// The table's rows put back before a repeat, so every repeat runs over the same table; not timed.
+fn refilled(rows: Int) -> Unit / {db.execute[part]} = {
+  let cleared = tally_of(db.execute[part](clear(), []));
+  let filled = match fill(rows) { Some(s) -> tally_of(db.execute[part](s, [])), None -> none() };
+  if cleared.failed + cleared.refused + filled.failed + filled.refused > 0 {
+    panic("the `part` table could not be refilled: has the runner made it?")
+  } else { () }
+}
+
+// One statement a task before the clock starts, so the connections the timed tasks draw on are
+// open and the clock runs around statements, not connects.
+fn warmed(tasks: Int, rows: Int) -> Unit / {Part, task.spawn, task.join} = {
+  let _ = spread(Select, 0, tasks, 1, rows);
+  ()
+}
+
+pub fn over_twin(p: Point) -> Taken / {time.elapsed_us} =
+  fold(range(0, p.repeats), nothing_taken(), |acc: Taken, r: Int| {
+    let d = seeded(p.rows);
+    let began = time.elapsed_us();
+    let t = on_twin(d, || performed(p.workload, p.base, p.tasks * p.per, p.rows));
+    let us = time.elapsed_us() - began;
+    { runs_us: push(acc.runs_us, us), tally: plus(acc.tally, t) }
+  })
+
+pub fn over_database(
+  p: Point,
+  url: String,
+  pool: Int,
+) -> Taken / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join, time.elapsed_us} =
+  match with_server(url, pool, ||
+      fold(range(0, p.repeats), nothing_taken(), |acc: Taken, r: Int| {
+        refilled(p.rows);
+        warmed(p.tasks, p.rows);
+        let began = time.elapsed_us();
+        let t = spread(p.workload, p.base, p.tasks, p.per, p.rows);
+        let us = time.elapsed_us() - began;
+        { runs_us: push(acc.runs_us, us), tally: plus(acc.tally, t) }
+      })) {
+    Ok(taken) -> taken,
+    Err(why) -> panic("the database would not open: " ++ why),
+  }
+
+// --- What a run prints ------------------------------------------------------------------------
+
+fn number(n: Int) -> Json = json::Number(decimal_of_int(n))
+
+fn texts(stmts: List<db::Stmt>) -> Json = json::array(map(stmts, |s: db::Stmt| json::Str(s.sql)))
+
+// The statements that make the table and the ones that put `rows` rows back in it.
+pub fn schema_report(rows: Int) -> Json =
+  json::object([
+    { key: "drop", value: texts(db::drop_schema(schema())) },
+    { key: "create", value: texts(db::create_schema(schema())) },
+    { key: "fill", value: texts(match fill(rows) { Some(s) -> [clear(), s], None -> [clear()] }) },
+  ])
+
+pub fn report(section: String, p: Point, t: Taken) -> Json =
+  json::object([
+    { key: "section", value: json::Str(section) },
+    { key: "tasks", value: number(p.tasks) },
+    { key: "per", value: number(p.per) },
+    { key: "rows", value: number(p.rows) },
+    { key: "repeats", value: number(p.repeats) },
+    { key: "asked", value: number(p.tasks * p.per * p.repeats) },
+    { key: "answered", value: number(t.tally.answered) },
+    { key: "refused", value: number(t.tally.refused) },
+    { key: "failed", value: number(t.tally.failed) },
+    { key: "runs_us", value: json::array(map(t.runs_us, number)) },
+  ])
+
+// --- The run's settings ---------------------------------------------------------------------
+
+fn text_setting(key: String) -> String / {config.get[bench]} =
+  match config.get[bench](key) { Some(text) -> text, None -> panic(key ++ " is unset") }
+
+fn setting(key: String, fallback: Int) -> Int / {config.get[bench]} =
+  match config.get[bench](key) {
+    None -> fallback,
+    Some(text) -> match int_of_text(text) {
+      Some(n) -> if n >= 0 { n } else { panic(key ++ " is below zero") },
+      None -> panic(key ++ " is `" ++ text ++ "`, which is not a number"),
+    },
+  }
+
+fn point_of() -> Point / {config.get[bench]} =
+  {
+    workload: match workload_of(text_setting("BENCH_WORKLOAD")) {
+      Some(w) -> w,
+      None -> panic("BENCH_WORKLOAD is not `select`, `select $1`, `insert` or `transaction`"),
+    },
+    tasks: setting("BENCH_TASKS", 1),
+    per: setting("BENCH_PER", 1),
+    rows: setting("BENCH_ROWS", 64),
+    base: setting("BENCH_BASE", 1000000),
+    repeats: setting("BENCH_REPEATS", 1),
+  }
+
+fn main() -> Unit / {config.get[bench], process.out[proc], net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join, time.elapsed_us} = {
+  let section = text_setting("BENCH_SECTION");
+  let printed = match section {
+    "schema" -> schema_report(setting("BENCH_ROWS", 64)),
+    "twin" -> {
+      let p = point_of();
+      report(section, p, over_twin(p))
+    },
+    "postgres" -> {
+      let p = point_of();
+      report(section, p, over_database(p, text_setting("BENCH_DATABASE"), setting("BENCH_POOL", 1)))
+    },
+    other ->
+      panic("BENCH_SECTION is `" ++ other ++ "`; the sections are schema, twin and postgres"),
+  };
+  process.out[proc](json::to_string(printed))
+}
+
+// --- Tests ------------------------------------------------------------------------------------
+
+fn point(w: Workload, per: Int) -> Point =
+  { workload: w, tasks: 1, per: per, rows: 64, base: 1000000, repeats: 1 }
+
+fn on_seeded(w: Workload, n: Int) -> Tally = on_twin(seeded(64), || performed(w, 1000000, n, 64))
+
+test "the table's DDL and its fill are the program's own statements" {
+  let written = json::to_string(schema_report(2));
+  assert(string_contains(written, "drop table if exists \\\"part\\\" cascade"));
+  assert(string_contains(written, "create table \\\"part\\\""));
+  assert(string_contains(written, "numeric(10,4)"));
+  assert(
+    string_contains(
+      written,
+      "\"fill\":[\"delete from part\",\"insert into part (sku, name, price, n) values ('sku-0', 'a part', 1.2500, 0), ('sku-1', 'a part', 1.2500, 1)\"]",
+    ),
+  );
+  assert_eq(fill(0), None)
+}
+
+test "every workload answers a row or a count for every statement, over the twin" {
+  assert_eq(on_seeded(Select, 3), { ..none(), answered: 3 });
+  assert_eq(on_seeded(SelectBy, 70), { ..none(), answered: 70 });
+  assert_eq(on_seeded(Insert, 4), { ..none(), answered: 4 });
+  assert_eq(on_seeded(Transaction, 2), { ..none(), answered: 2 })
+}
+
+test "a key already held is a failure, and a busy pool is a refusal" {
+  assert_eq(on_twin(seeded(64), || performed(Insert, 0, 1, 64)), { ..none(), failed: 1 });
+  assert_eq(
+    tally_of(db::Failed(db::db_error("53300", "", "the pool of 1 connection(s) is busy"))),
+    { ..none(), refused: 1 },
+  );
+  assert_eq(plus({ ..none(), answered: 2 }, { ..none(), refused: 1 }), {
+    answered: 2,
+    refused: 1,
+    failed: 0,
+  })
+}
+
+test "a point over the twin is timed a repeat at a time and tallied across them" {
+  let t = handle { over_twin({ ..point(Insert, 5), repeats: 2 }) } with { time.elapsed_us() -> 7 };
+  assert_eq(t.runs_us, [0, 0]);
+  assert_eq(t.tally, { ..none(), answered: 10 });
+  let written = json::to_string(report("twin", { ..point(Insert, 5), repeats: 2 }, t));
+  assert(string_contains(written, "\"asked\":10"));
+  assert(string_contains(written, "\"answered\":10"));
+  assert(string_contains(written, "\"runs_us\":[0,0]"))
+}
+
+test "a workload is named as the floor names it" {
+  assert_eq(map(["select", "select $1", "insert", "transaction", "update"], workload_of), [
+    Some(Select),
+    Some(SelectBy),
+    Some(Insert),
+    Some(Transaction),
+    None,
+  ])
+}
