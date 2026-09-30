@@ -1066,6 +1066,318 @@ fn taken(
     }
   }
 
+// --- What the front-end cache files ----------------------------------------------
+// The CLI files these after an analysis and hands the rows back to the next one. The store keeps
+// them without reading them: a slot under its hash and name, a file's entries under its path. What
+// a slot holds beyond the row is what `ply cache inspect` prints.
+
+// Each effect a row names, under the hash its declaration has. A prelude effect is declared by no
+// source, so it has no entry and no edit can rename it.
+fn row_witness(decls: Map<Bytes, Bytes>, atoms: List<Atom>) -> List<Witness> =
+  map_fold(
+    fold(atoms, map_new(), |acc: Map<Bytes, Bytes>, a: Atom|
+      match map_get(decls, a.effect) { Some(h) -> map_insert(acc, a.effect, h), None -> acc }),
+    [],
+    |acc: List<Witness>, name: Bytes, hash: Bytes| push(acc, { name: name, hash: hash }),
+  )
+
+fn def_known_row(decls: Map<Bytes, Bytes>, d: DefInfo, hash: Bytes) -> KnownDefRow =
+  {
+    name: d.name,
+    hash: hash,
+    witness: row_witness(decls, append(d.footprint, d.performed)),
+    footprint: atoms_text(d.footprint, b","),
+    performed: atoms_text(d.performed, b","),
+  }
+
+fn test_known_row(decls: Map<Bytes, Bytes>, t: TestInfo, hash: Bytes) -> KnownTestRow =
+  {
+    key: t.key,
+    hash: hash,
+    witness: row_witness(decls, t.footprint),
+    footprint: atoms_text(t.footprint, b","),
+  }
+
+pub type Rows = { defs: List<KnownDefRow>, tests: List<KnownTestRow> }
+
+// What an analysis publishes, as the rows the next one is handed, each under the hash it has now.
+pub fn rows_of(w: Whole) -> Rows = {
+  let hashed = by_name_one(w.hashes.defs);
+  let decls = by_name_one(w.hashes.decls);
+  {
+    defs: fold(w.checked.defs, [], |acc: List<KnownDefRow>, d: DefInfo|
+      match map_get(hashed, d.name) {
+        Some(h) -> push(acc, def_known_row(decls, d, h)),
+        None -> acc,
+      }),
+    tests: map(range(0, len(w.checked.tests)), |i: Int|
+      test_known_row(decls, at(w.checked.tests, i), at(w.hashes.tests, i))),
+  }
+}
+
+pub type FiledSpan = { start: Int, end: Int }
+
+pub type DefInterface = { row: KnownDefRow, scheme: Bytes }
+
+pub type FiledVariant = { name: Bytes, fields: List<Bytes> }
+
+pub type FiledOp = { name: Bytes, mode: Bytes, resource: Bool, params: List<Bytes>, ret: Bytes }
+
+// A `type` has its parameter count and variants, an `effect` its operations and whether it is
+// `nondet`.
+pub type DeclInterface = {
+  effect: Bool,
+  arity: Int,
+  nondet: Bool,
+  variants: List<FiledVariant>,
+  ops: List<FiledOp>,
+}
+
+pub type FiledDef = { name: Bytes, hash: Bytes, interface: DefInterface }
+
+pub type FiledDecl = { name: Bytes, hash: Bytes, interface: DeclInterface }
+
+pub type FiledMember = { name: Bytes, span: FiledSpan }
+
+// `kind` is `fn`, `type` or `effect`: a name declared in two namespaces has an entry in each.
+pub type FiledEntry = {
+  name: Bytes,
+  hash: Bytes,
+  kind: Bytes,
+  span: FiledSpan,
+  members: List<FiledMember>,
+}
+
+pub type FiledTest = { name: Bytes, hash: Bytes, nondet: Bool, span: FiledSpan, row: KnownTestRow }
+
+// `source` is the module's index among the analysis's modules, and so its file's among the places.
+pub type FiledModule = {
+  name: Bytes,
+  source: Int,
+  entries: List<FiledEntry>,
+  tests: List<FiledTest>,
+}
+
+pub type FiledBody = { hash: Bytes, body: Bytes }
+
+pub type Filing = {
+  modules: List<FiledModule>,
+  defs: List<FiledDef>,
+  decls: List<FiledDecl>,
+  bodies: List<FiledBody>,
+}
+
+fn filed_span(s: Span) -> FiledSpan = { start: s.start, end: s.end }
+
+// A type's constructors in declaration order, which is each one's index.
+fn ctors_of_type(ctors: List<CtorInfo>, name: Bytes) -> List<CtorInfo> = {
+  let mine = filter(ctors, |k: CtorInfo| k.type_name == name);
+  fold(range(0, len(mine)), [], |acc: List<CtorInfo>, i: Int|
+    fold(mine, acc, |a: List<CtorInfo>, k: CtorInfo| if k.index == i { push(a, k) } else { a }))
+}
+
+fn filed_op(o: OpInfo) -> FiledOp =
+  {
+    name: o.name,
+    mode: mode_text(o.mode),
+    resource: o.resource_param,
+    params: map(o.params, type_text),
+    ret: type_text(o.ret),
+  }
+
+type Filers = {
+  defs: Map<Bytes, DefInfo>,
+  types: Map<Bytes, TypeRow>,
+  effects: Map<Bytes, EffectInfo>,
+  ctors: List<CtorInfo>,
+  hashed: Map<Bytes, Bytes>,
+  decls: Map<Bytes, Bytes>,
+}
+
+fn fn_entries(f: Filers, name: Bytes) -> List<FiledEntry> =
+  match map_get(f.defs, name) {
+    None -> [],
+    Some(d) -> match map_get(f.hashed, name) {
+      None -> [],
+      Some(h) -> [{ name: name, hash: h, kind: b"fn", span: filed_span(d.at.span), members: [] }],
+    },
+  }
+
+fn decl_entries(f: Filers, name: Bytes) -> List<FiledEntry> =
+  match map_get(f.decls, name) {
+    None -> [],
+    Some(h) -> match map_get(f.types, name) {
+      Some(t) ->
+        [
+          {
+            name: name,
+            hash: h,
+            kind: b"type",
+            span: { start: t.at.start, end: t.at.end },
+            members: map(ctors_of_type(f.ctors, name), |k: CtorInfo|
+              { name: k.simple_name, span: filed_span(k.at.span) }),
+          },
+        ],
+      None -> match map_get(f.effects, name) {
+        None -> [],
+        Some(e) ->
+          [
+            {
+              name: name,
+              hash: h,
+              kind: b"effect",
+              span: filed_span(e.at.span),
+              members: map(e.ops, |o: OpInfo| { name: o.name, span: filed_span(o.at.span) }),
+            },
+          ],
+      },
+    },
+  }
+
+// What a module declares, in source order, each name once.
+fn module_entries(f: Filers, m: Mod) -> List<FiledEntry> = {
+  let walked = fold(
+    module_items(m),
+    { seen: map_new(), out: [] },
+    |acc: { seen: Map<Bytes, Bool>, out: List<FiledEntry> }, name: Bytes|
+      if map_contains(acc.seen, name) { acc } else {
+        {
+          seen: map_insert(acc.seen, name, true),
+          out: append(append(acc.out, fn_entries(f, name)), decl_entries(f, name)),
+        }
+      },
+  );
+  walked.out
+}
+
+fn tests_by_module(
+  tests: List<TestInfo>,
+  hashes: List<Bytes>,
+  decls: Map<Bytes, Bytes>,
+) -> Map<Bytes, List<FiledTest>> =
+  fold(range(0, len(tests)), map_new(), |acc: Map<Bytes, List<FiledTest>>, i: Int| {
+    let t = at(tests, i);
+    let h = at(hashes, i);
+    let filed = {
+      name: t.name,
+      hash: h,
+      nondet: t.nondet,
+      span: filed_span(t.at.span),
+      row: test_known_row(decls, t, h),
+    };
+    map_insert(
+      acc,
+      t.module,
+      push(match map_get(acc, t.module) { Some(xs) -> xs, None -> [] }, filed),
+    )
+  })
+
+// The hash a stored body is filed under, which its envelope fixes: a definition alone in its
+// component is its bytes' hash, and a cycle's member the hash of the cycle's with its class.
+pub fn body_key(body: Bytes) -> Option<Bytes> = {
+  let n = bytes_len(body);
+  let tag = if n == 0 { -1 } else { bytes_at(body, 0) };
+  if tag == 0 { Some(blake3(bytes_slice(body, 1, n))) } else if tag == 1 && n >= 5 {
+    Some(blake3(bytes_concat(blake3(bytes_slice(body, 5, n)), bytes_slice(body, 1, 5))))
+  } else { None }
+}
+
+fn listed(h: Option<Bytes>) -> List<Bytes> = match h { Some(x) -> [x], None -> [] }
+
+// A name's one body answers for each hash the name has; a `fn` and a declaration sharing a name
+// have a body each, and each is filed under the hash it verifies as.
+fn filed_bodies(h: HashOutput) -> List<FiledBody> = {
+  let defs = by_name_one(h.defs);
+  let decls = by_name_one(h.decls);
+  let counted = fold(
+    h.bodies,
+    map_new(),
+    |acc: Map<Bytes, Int>, b: { name: Bytes, body: Bytes }|
+      map_insert(acc, b.name, match map_get(acc, b.name) { Some(n) -> n + 1, None -> 1 }),
+  );
+  fold(h.bodies, [], |acc: List<FiledBody>, b: { name: Bytes, body: Bytes }| {
+    let alone = match map_get(counted, b.name) { Some(n) -> n == 1, None -> false };
+    fold(
+      append(listed(map_get(defs, b.name)), listed(map_get(decls, b.name))),
+      acc,
+      |a: List<FiledBody>, hash: Bytes|
+        if alone || body_key(b.body) == Some(hash) { push(a, { hash: hash, body: b.body }) }
+        else { a },
+    )
+  })
+}
+
+// Everything the front-end cache files after an analysis, as plain data.
+pub fn filing(w: Whole) -> Filing = {
+  let hashed = by_name_one(w.hashes.defs);
+  let decls = by_name_one(w.hashes.decls);
+  let types = type_rows(w.mods);
+  let f: Filers = {
+    defs: map_of_entries(map(w.checked.defs, |d: DefInfo| { key: d.name, value: d })),
+    types: map_of_entries(map(types, |t: TypeRow| { key: t.name, value: t })),
+    effects: map_of_entries(map(w.checked.effects, |e: EffectInfo| { key: e.name, value: e })),
+    ctors: w.checked.ctors,
+    hashed: hashed,
+    decls: decls,
+  };
+  let tests = tests_by_module(w.checked.tests, w.hashes.tests, decls);
+  let typed = fold(types, [], |acc: List<FiledDecl>, t: TypeRow|
+    match map_get(decls, t.name) {
+      None -> acc,
+      Some(h) ->
+        push(acc, {
+          name: t.name,
+          hash: h,
+          interface: {
+            effect: false,
+            arity: t.arity,
+            nondet: false,
+            variants: map(ctors_of_type(w.checked.ctors, t.name), |k: CtorInfo|
+              { name: k.simple_name, fields: map(k.fields, type_text) }),
+            ops: [],
+          },
+        }),
+    });
+  {
+    modules: map(range(0, len(w.mods)), |i: Int| {
+      let m = at(w.mods, i);
+      {
+        name: m.name,
+        source: i,
+        entries: module_entries(f, m),
+        tests: match map_get(tests, m.name) { Some(ts) -> ts, None -> [] },
+      }
+    }),
+    defs: fold(w.checked.defs, [], |acc: List<FiledDef>, d: DefInfo|
+      match map_get(hashed, d.name) {
+        None -> acc,
+        Some(h) ->
+          push(acc, {
+            name: d.name,
+            hash: h,
+            interface: { row: def_known_row(decls, d, h), scheme: scheme_text(d.scheme) },
+          }),
+      }),
+    decls: fold(w.checked.effects, typed, |acc: List<FiledDecl>, e: EffectInfo|
+      match map_get(decls, e.name) {
+        None -> acc,
+        Some(h) ->
+          push(acc, {
+            name: e.name,
+            hash: h,
+            interface: {
+              effect: true,
+              arity: 0,
+              nondet: e.nondet,
+              variants: [],
+              ops: map(e.ops, filed_op),
+            },
+          }),
+      }),
+    bodies: filed_bodies(w.hashes),
+  }
+}
+
 pub fn analyse(parsed: List<Parsed>) -> Analysis = analyse_with(parsed, [], [])
 
 pub fn analyse_with(
@@ -2326,7 +2638,7 @@ test "a row alias and its expansion are one program: the same hashes, bodies and
   let aliased = rows_written_as(b"Io");
   let expanded = rows_written_as(b"log.write");
   // The published rows, each under its definition's hash.
-  assert_eq(rows_of(aliased), rows_of(expanded));
+  assert_eq(rows_of(whole_of(aliased)), rows_of(whole_of(expanded)));
   let a = dump_of(analyse(parse_all(aliased)));
   let e = dump_of(analyse(parse_all(expanded)));
   assert_eq(def_hashes(a), def_hashes(e));
@@ -2591,46 +2903,11 @@ test "a refused program's answer is its diagnostics, with no rows" {
   )
 }
 
-type Rows = { defs: List<KnownDefRow>, tests: List<KnownTestRow> }
+fn whole_of(sources: List<Source>) -> Whole =
+  match analyse(parse_all(sources)) { Refused(_) -> panic("the program checks"), Analysed(w) -> w }
 
-// Each effect a row names, under the hash its declaration has: what the driver files beside a row.
-fn row_witness(decls: Map<Bytes, Bytes>, atoms: List<Atom>) -> List<Witness> =
-  map_fold(
-    fold(atoms, map_new(), |acc: Map<Bytes, Bytes>, a: Atom|
-      match map_get(decls, a.effect) { Some(h) -> map_insert(acc, a.effect, h), None -> acc }),
-    [],
-    |acc: List<Witness>, name: Bytes, hash: Bytes| push(acc, { name: name, hash: hash }),
-  )
-
-// What the driver files after a run, built the way it builds it: each published row under the hash
-// the definition or test had, and the declarations the row's atoms name.
-fn rows_of(sources: List<Source>) -> Rows =
-  match analyse(parse_all(sources)) {
-    Refused(_) -> panic("the program checks"),
-    Analysed(w) -> {
-      let hashed = by_name_one(w.hashes.defs);
-      let decls = by_name_one(w.hashes.decls);
-      {
-        defs: map(w.checked.defs, |d: DefInfo|
-          {
-            name: d.name,
-            hash: match map_get(hashed, d.name) { Some(x) -> x, None -> b"" },
-            witness: row_witness(decls, append(d.footprint, d.performed)),
-            footprint: atoms_text(d.footprint, b","),
-            performed: atoms_text(d.performed, b","),
-          }),
-        tests: map(range(0, len(w.checked.tests)), |i: Int| {
-          let t: TestInfo = at(w.checked.tests, i);
-          {
-            key: t.key,
-            hash: at(w.hashes.tests, i),
-            witness: row_witness(decls, t.footprint),
-            footprint: atoms_text(t.footprint, b","),
-          }
-        }),
-      }
-    },
-  }
+fn seeded_of(a: Analysis) -> List<Bytes> =
+  match a { Refused(_) -> panic("the program checks"), Analysed(w) -> w.checked.seeded }
 
 fn effectful() -> List<Source> =
   [
@@ -2648,23 +2925,22 @@ fn effectful() -> List<Source> =
 fn published(a: Analysis) -> Bytes = dump_text(dump_of(a))
 
 test "a definition whose hash has not moved is published from its rows, not from its body" {
-  let rows = rows_of(effectful());
+  let rows = rows_of(whole_of(effectful()));
   assert(len(rows.defs) > 0);
   assert(len(rows.tests) > 0);
-  assert_eq(
-    published(analyse_with(parse_all(effectful()), rows.defs, rows.tests)),
-    published(analyse(parse_all(effectful()))),
-  )
+  let seeded = analyse_with(parse_all(effectful()), rows.defs, rows.tests);
+  assert_eq(seeded_of(seeded), [b"base.say", b"app.twice"]);
+  assert_eq(published(seeded), published(analyse(parse_all(effectful()))));
+  assert_eq(seeded_of(analyse(parse_all(effectful()))), [])
 }
 
 test "rows filed under a hash this program no longer has are walked instead" {
-  let rows = rows_of(effectful());
+  let rows = rows_of(whole_of(effectful()));
   let stale = map(rows.defs, |r: KnownDefRow|
     { ..r, hash: b"moved", footprint: b"nowhere.read", performed: b"nowhere.read" });
-  assert_eq(
-    published(analyse_with(parse_all(effectful()), stale, [])),
-    published(analyse(parse_all(effectful()))),
-  )
+  let walked = analyse_with(parse_all(effectful()), stale, []);
+  assert_eq(seeded_of(walked), []);
+  assert_eq(published(walked), published(analyse(parse_all(effectful()))))
 }
 
 // The same program with the effect under another name. An effect is nominal, so `say` and `twice`
@@ -2690,7 +2966,7 @@ fn test_footprint_of(a: Analysis, key: Bytes) -> Bytes =
   }
 
 test "a row filed before an effect was renamed is not a row about this program" {
-  let rows = rows_of(effectful());
+  let rows = rows_of(whole_of(effectful()));
   assert(fold(rows.defs, false, |acc: Bool, r: KnownDefRow| acc || len(r.witness) > 0));
   assert(fold(rows.tests, false, |acc: Bool, r: KnownTestRow| acc || len(r.witness) > 0));
   let seeded = analyse_with(parse_all(renamed()), rows.defs, rows.tests);
@@ -2745,7 +3021,726 @@ test "a row that will not unify walks the body rather than reporting" {
   assert_eq(footprint_of(seeded, b"m.quiet"), b"m.other.write");
   // `say` writes `{log.write}`, which the handed row contradicts. Walking it is the whole answer.
   assert_eq(footprint_of(seeded, b"m.say"), b"m.log.write");
-  assert_eq(footprint_of(seeded, b"m.say"), footprint_of(analyse(parse_all(sources)), b"m.say"))
+  assert_eq(footprint_of(seeded, b"m.say"), footprint_of(analyse(parse_all(sources)), b"m.say"));
+  // A row that was walked past is not counted as one that seeded.
+  assert_eq(seeded_of(seeded), [b"m.quiet"])
+}
+
+fn filed_tests(f: Filing) -> List<KnownTestRow> =
+  fold(f.modules, [], |acc: List<KnownTestRow>, m: FiledModule|
+    append(acc, map(m.tests, |t: FiledTest| t.row)))
+
+fn has_test_row(rows: List<KnownTestRow>, r: KnownTestRow) -> Bool =
+  fold(rows, false, |acc: Bool, x: KnownTestRow| acc || x == r)
+
+test "a filing carries exactly the rows the analysis publishes" {
+  let w = whole_of(effectful());
+  let f = filing(w);
+  let rows = rows_of(w);
+  assert_eq(map(f.defs, |d: FiledDef| d.interface.row), rows.defs);
+  assert_eq(map(f.defs, |d: FiledDef| d.name), map(rows.defs, |r: KnownDefRow| r.name));
+  assert_eq(map(f.defs, |d: FiledDef| d.hash), map(rows.defs, |r: KnownDefRow| r.hash));
+  assert_eq(len(filed_tests(f)), len(rows.tests));
+  assert(
+    fold(filed_tests(f), true, |acc: Bool, r: KnownTestRow| acc && has_test_row(rows.tests, r)),
+  )
+}
+
+test "an analysis seeded from its own filing answers exactly what a fresh one does" {
+  let f = filing(whole_of(effectful()));
+  let defs = map(f.defs, |d: FiledDef| d.interface.row);
+  let seeded = analyse_with(parse_all(effectful()), defs, filed_tests(f));
+  assert_eq(len(seeded_of(seeded)), len(defs));
+  assert_eq(published(seeded), published(analyse(parse_all(effectful()))));
+  // The test is taken from its row too: the row carries the footprint the walk would find.
+  assert_eq(test_footprint_of(seeded, b"app.says"), b"base.log.write")
+}
+
+// A row nothing performs, so a definition published from its row is told from a walked one.
+fn probed(body: Bytes) -> List<Source> =
+  [
+    {
+      name: b"base",
+      src: bytes_concat_all([
+        b"effect probe { read peek() -> Int }\npub fn poke() -> Int / {probe.read} = probe.peek()\npub fn one() -> Int = ",
+        body,
+        b"\npub fn two() -> Int = 2\npub fn three() -> Int = one() + 1\n",
+      ]),
+    },
+    {
+      name: b"app",
+      src: b"import base\npub fn four() -> Int = base::one() + 3\npub fn five() -> Int = base::two() + 4\n",
+    },
+  ]
+
+fn sentinel_rows(w: Whole) -> List<KnownDefRow> = {
+  let probe = held(by_name_one(w.hashes.decls), b"base.probe");
+  map(w.hashes.defs, |x: { name: Bytes, hash: Bytes }|
+    {
+      name: x.name,
+      hash: x.hash,
+      witness: [{ name: b"base.probe", hash: probe }],
+      footprint: b"base.probe.read",
+      performed: b"base.probe.read",
+    })
+}
+
+test "an edit walks the definitions that depend on it and no others" {
+  let rows = sentinel_rows(whole_of(probed(b"1")));
+  let kept = analyse_with(parse_all(probed(b"1")), rows, []);
+  assert_eq(len(seeded_of(kept)), len(rows));
+  assert_eq(footprint_of(kept, b"base.one"), b"base.probe.read");
+  // One body edited: `one` moves, and with it everything that reaches it, and nothing else.
+  let after = analyse_with(parse_all(probed(b"11")), rows, []);
+  let seeded = seeded_of(after);
+  assert(contains_bytes(seeded, b"base.poke"));
+  assert(contains_bytes(seeded, b"base.two"));
+  assert(contains_bytes(seeded, b"app.five"));
+  assert_eq(len(seeded), 3);
+  assert_eq(footprint_of(after, b"base.one"), b"");
+  assert_eq(footprint_of(after, b"base.three"), b"");
+  assert_eq(footprint_of(after, b"app.four"), b"");
+  assert_eq(footprint_of(after, b"app.five"), b"base.probe.read")
+}
+
+test "seeded from the last answer's filing, an edited program answers what a fresh check does" {
+  let before = filing(whole_of(probed(b"1")));
+  let rows = map(before.defs, |d: FiledDef| d.interface.row);
+  let seeded = analyse_with(parse_all(probed(b"two() + 5")), rows, filed_tests(before));
+  assert_eq(published(seeded), published(analyse(parse_all(probed(b"two() + 5")))));
+  assert(len(seeded_of(seeded)) > 0)
+}
+
+fn performing(extra: List<Source>) -> List<Source> =
+  append(extra, [
+    { name: b"core", src: b"pub effect db {\n  read get[r](key: Int) -> Int\n}\n" },
+    {
+      name: b"shop",
+      src: b"import core\npub fn touch(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"touch is handled\" {\n  assert_eq(handle touch(1) with { core::db.get[cart](k) -> k + 1, }, 2)\n}\n",
+    },
+  ])
+
+// A row names its effects by name, so a new declaration that looks like one must not be taken
+// for it: the seeded answer stays the fresh one.
+fn seeded_agrees(before: List<Source>, after: List<Source>) -> Bool = {
+  let f = filing(whole_of(before));
+  published(
+      analyse_with(parse_all(after), map(f.defs, |d: FiledDef| d.interface.row), filed_tests(f)),
+    )
+    == published(analyse(parse_all(after)))
+}
+
+test "adding a look-alike effect keeps a seeded answer the fresh one" {
+  let alike = [{ name: b"aaa", src: b"pub effect alpha {\n  read get[r](key: Int) -> Int\n}\n" }];
+  assert(seeded_agrees(performing([]), performing([])));
+  assert(seeded_agrees(performing([]), performing(alike)))
+}
+
+test "adding an unrelated effect keeps a seeded answer the fresh one" {
+  let other = [{ name: b"aaa", src: b"pub effect alpha {\n  write put(key: Int) -> Int\n}\n" }];
+  assert(seeded_agrees(performing([]), performing(other)))
+}
+
+fn declared() -> List<Source> =
+  [
+    {
+      name: b"m",
+      src: b"pub type Shape = | Circle(Int) | Empty\npub nondet effect wall { read now() -> Int\n write set[r](Int) -> Unit }\npub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\ntest \"two is even\" { assert(even(2)) }",
+    },
+  ]
+
+fn entry_named(f: Filing, name: Bytes) -> FiledEntry = {
+  let found = fold(f.modules, None, |acc: Option<FiledEntry>, m: FiledModule|
+    fold(m.entries, acc, |a: Option<FiledEntry>, e: FiledEntry|
+      if e.name == name { Some(e) } else { a }));
+  match found { Some(e) -> e, None -> panic("no entry of that name") }
+}
+
+fn decl_named(f: Filing, name: Bytes) -> DeclInterface = {
+  let found = fold(f.decls, None, |acc: Option<DeclInterface>, d: FiledDecl|
+    if d.name == name { Some(d.interface) } else { acc });
+  match found { Some(i) -> i, None -> panic("no declaration of that name") }
+}
+
+test "a module's entries name each item's kind, and a declaration's members in declaration order" {
+  let f = filing(whole_of(declared()));
+  assert_eq(map(f.modules, |m: FiledModule| m.name), [b"m"]);
+  assert_eq(entry_named(f, b"m.even").kind, b"fn");
+  assert_eq(entry_named(f, b"m.Shape").kind, b"type");
+  assert_eq(map(entry_named(f, b"m.Shape").members, |x: FiledMember| x.name), [
+    b"Circle",
+    b"Empty",
+  ]);
+  assert_eq(entry_named(f, b"m.wall").kind, b"effect");
+  assert_eq(map(entry_named(f, b"m.wall").members, |x: FiledMember| x.name), [b"now", b"set"]);
+  let tests = fold(f.modules, [], |acc: List<FiledTest>, m: FiledModule| append(acc, m.tests));
+  assert_eq(map(tests, |t: FiledTest| t.row.key), [b"m.two is even"]);
+  let shape = decl_named(f, b"m.Shape");
+  assert_eq(shape.arity, 0);
+  assert_eq(shape.variants, [
+    { name: b"Circle", fields: [b"Int"] },
+    { name: b"Empty", fields: [] },
+  ]);
+  let wall = decl_named(f, b"m.wall");
+  assert(wall.effect && wall.nondet);
+  assert_eq(wall.ops, [
+    { name: b"now", mode: b"read", resource: false, params: [], ret: b"Int" },
+    { name: b"set", mode: b"write", resource: true, params: [b"Int"], ret: b"Unit" },
+  ])
+}
+
+test "every body is filed under the hash it verifies as, a cycle's members included" {
+  let w = whole_of(declared());
+  let f = filing(w);
+  assert(len(f.bodies) > 0);
+  assert(fold(f.bodies, true, |acc: Bool, b: FiledBody| acc && body_key(b.body) == Some(b.hash)));
+  // One body per hashed name: nothing here declares a name twice.
+  assert_eq(len(f.bodies), len(w.hashes.defs) + len(w.hashes.decls));
+  let even = held(by_name_one(w.hashes.defs), b"m.even");
+  assert(fold(f.bodies, false, |acc: Bool, b: FiledBody| acc || b.hash == even))
+}
+
+// --- Seeding through a session of edits -----------------------------------------
+// Each step is analysed from nothing and seeded with what the step before it filed: the two answers
+// must be one answer, whatever the edit was. A step that does not check files nothing, so the next
+// is seeded from the last that did.
+
+type Step = { what: Bytes, sources: List<Source> }
+
+type Session = { rows: Rows, off: List<Bytes> }
+
+fn filed_rows(f: Filing) -> Rows =
+  { defs: map(f.defs, |d: FiledDef| d.interface.row), tests: filed_tests(f) }
+
+// The steps whose seeded answer is not the fresh one.
+fn disagreements(steps: List<Step>) -> List<Bytes> = {
+  let walked = fold(steps, { rows: { defs: [], tests: [] }, off: [] }, |s: Session, step: Step| {
+    let seeded = analyse_with(parse_all(step.sources), s.rows.defs, s.rows.tests);
+    let fresh = analyse(parse_all(step.sources));
+    let off = if published(seeded) == published(fresh) { s.off } else { push(s.off, step.what) };
+    match seeded {
+      Refused(_) -> { rows: s.rows, off: off },
+      Analysed(w) -> { rows: filed_rows(filing(w)), off: off },
+    }
+  });
+  walked.off
+}
+
+fn step(what: Bytes, sources: List<Source>) -> Step = { what: what, sources: sources }
+
+// Every occurrence of `from` in module `name`, as `to`.
+fn edited(sources: List<Source>, name: Bytes, from: Bytes, to: Bytes) -> List<Source> =
+  map(sources, |s: Source|
+    if s.name != name { s } else if bytes_index_of(s.src, from) == None {
+      panic("the fixture drifted: the text to edit is not there")
+    } else { { name: s.name, src: joined(bytes_split(s.src, from), to) } })
+
+fn with_module(sources: List<Source>, name: Bytes, src: Bytes) -> List<Source> =
+  push(filter(sources, |s: Source| s.name != name), { name: name, src: src })
+
+fn without(sources: List<Source>, name: Bytes) -> List<Source> =
+  filter(sources, |s: Source| s.name != name)
+
+fn shop_core() -> Bytes =
+  b"pub type Money = Int\npub type Item =\n  | Book(String, Money)\n  | Note(String)\npub effect db {\n  read get[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Int\n}\npub fn price(i: Item) -> Money =\n  match i {\n    Book(_, p) -> p,\n    Note(_) -> 0,\n  }\npub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\npub fn label(i: Item) -> String =\n  match i {\n    Book(t, _) -> t,\n    Note(t) -> t,\n  }\ntest \"a note is free\" {\n  assert_eq(price(Note(\"n\")), 0)\n}\n"
+
+fn shop_shop() -> Bytes =
+  b"import core\nfn total(items: List<core::Item>) -> Int =\n  fold(items, 0, |acc, i: core::Item| acc + core::price(i))\nfn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\nfn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"a shelf adds up\" {\n  assert_eq(total([core::Book(\"b\", 3), core::Note(\"n\")]), 3)\n}\n"
+
+fn shop_leaf() -> Bytes = b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n"
+
+fn shop() -> List<Source> =
+  [
+    { name: b"core", src: shop_core() },
+    { name: b"shop", src: shop_shop() },
+    { name: b"leaf", src: shop_leaf() },
+  ]
+
+test "a seeded answer is the fresh one through every kind of edit a session makes" {
+  let s0 = shop();
+  let s1 = edited(s0, b"leaf", b"one() + one()", b"one() + one() + 0");
+  let s2 = edited(
+    s1,
+    b"leaf",
+    b"pub fn two() -> Int = one() + one() + 0",
+    b"pub fn two(k: Int) -> Int = one() + k",
+  );
+  let s3 = edited(s2, b"leaf", b"pub fn one()", b"fn one()");
+  let broken = edited(s3, b"leaf", b"fn one() -> Int = 1", b"fn one() -> Int = \"1\"");
+  let s4 = edited(s3, b"core", b"pub fn label(", b"pub fn title(");
+  let s5 = edited(s4, b"core", b"Book(_, p) -> p,", b"Book(_, p) -> p + 0,");
+  let s6 = edited(s5, b"shop", b"acc + core::price(i)", b"acc + core::price(i) + 0");
+  let s7 = edited(s6, b"shop", b"import core\n", b"import core\nimport leaf\n");
+  let s8 = with_module(s6, b"extra", b"import leaf\npub fn four() -> Int = leaf::two(2) + 2\n");
+  let s9 = edited(s8, b"extra", b"+ 2\n", b"+ 3\n");
+  let s10 = edited(s9, b"leaf", b"one() + k", b"one() + k + 0");
+  let s11 = edited(
+    edited(
+      s10,
+      b"leaf",
+      b"fn one() -> Int = 1",
+      b"import core\n\nfn one() -> Int = core::price(core::Note(\"n\")) + 1",
+    ),
+    b"core",
+    b"Book(_, p) -> p + 0,",
+    b"Book(_, p) -> p + 1,",
+  );
+  let s12 = without(s11, b"extra");
+  let s13 = edited(s12, b"core", b"Money", b"Cost");
+  let s14 = edited(
+    edited(s13, b"core", b"effect db", b"effect ledger"),
+    b"shop",
+    b"core::db.",
+    b"core::ledger.",
+  );
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"unchanged", s0),
+      step(b"a body edit in a leaf", s1),
+      step(b"a signature edit in a leaf", s2),
+      step(b"`pub` removed in a leaf", s3),
+      step(b"a type error", broken),
+      step(b"the error undone", s3),
+      step(b"a rename in a module another imports", s4),
+      step(b"a body edit in a module another imports", s5),
+      step(b"a body edit in a module that imports another", s6),
+      step(b"an import added", s7),
+      step(b"an import removed", s6),
+      step(b"a file added", s8),
+      step(b"an edit to the added file", s9),
+      step(b"an edit to the leaf the added file imports", s10),
+      step(b"an import added to a module edited with the one it now imports", s11),
+      step(b"the added file deleted", s12),
+      step(b"a type renamed", s13),
+      step(b"an effect renamed", s14),
+      step(b"unchanged again", s14),
+    ]),
+    [],
+  )
+}
+
+test "moving, removing and re-signing definitions leaves a seeded answer the fresh one" {
+  let s0 = shop();
+  let twice = b"pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n";
+  let moved = edited(
+    edited(
+      edited(
+        edited(s0, b"core", twice, b""),
+        b"leaf",
+        b"pub fn one()",
+        bytes_concat(twice, b"pub fn one()"),
+      ),
+      b"shop",
+      b"import core",
+      b"import core\nimport leaf",
+    ),
+    b"shop",
+    b"core::twice",
+    b"leaf::twice",
+  );
+  let removed = edited(
+    edited(s0, b"shop", b"fn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\n", b""),
+    b"core",
+    twice,
+    b"",
+  );
+  let spare = with_module(s0, b"spare", b"pub fn spare() -> Int = 9\n");
+  let referenced = with_module(s0, b"extra", b"import leaf\npub fn three() -> Int = leaf::two()\n");
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"a definition moved between modules", moved),
+      step(b"back", s0),
+      step(b"a definition removed outright", removed),
+      step(b"back again", s0),
+      step(
+        b"a dependency's signature changed",
+        edited(s0, b"core", b"pub fn price(i: Item) -> Money =", b"pub fn price(i: Item) -> Int ="),
+      ),
+      step(b"reformatted", edited(s0, b"leaf", b"pub fn one()", b"// a comment\npub fn  one()")),
+      step(b"an unreferenced file", spare),
+      step(b"deleted", s0),
+      step(b"a file importing the leaf", referenced),
+      step(b"the leaf deleted under it", without(referenced, b"leaf")),
+      step(b"the leaf restored", referenced),
+    ]),
+    [],
+  )
+}
+
+test "names shared, declarations alike and tests edited leave a seeded answer the fresh one" {
+  let peel = b"pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
+  let shared = [{ name: b"a", src: peel }, { name: b"b", src: peel }];
+  let look = b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / {db.read[t]} = db.get[t](k)\n";
+  let pick = |m: Bytes|
+    bytes_concat_all([
+      b"import x\nimport y\npub fn pick(k: Int) -> Int =\n  handle x::look(k) + y::look(k) with { ",
+      m,
+      b"::db.get[t](j) -> j, }\n",
+    ]);
+  let alike = [
+    { name: b"x", src: look },
+    { name: b"y", src: look },
+    { name: b"z", src: b"pub fn plain() -> Int = 7\n" },
+    { name: b"w", src: pick(b"x") },
+  ];
+  let alias = [
+    { name: b"alias", src: b"pub type Cents = Int\npub fn zero() -> Cents = 0\n" },
+    { name: b"user", src: b"import alias\nfn take() -> alias::Cents = alias::zero()\n" },
+    { name: b"lone", src: b"fn lone() -> Int = 1\n" },
+  ];
+  let tested = b"fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n";
+  let palette = b"pub type Color = Red | Green\npub fn paint(what: String, shade: Color = Red) -> String =\n  match shade {\n    Red -> string_concat(what, \" red\"),\n    Green -> string_concat(what, \" green\"),\n  }\n";
+  let wall = b"import palette\npub fn wall() -> String = palette::paint(\"wall\")\npub fn given() -> String = palette::paint(\"wall\", palette::Green)\ntest \"the default crosses the module boundary\" {\n  assert_eq(wall(), \"wall red\")\n}\n";
+  let painted = [{ name: b"palette", src: palette }, { name: b"wall", src: wall }];
+  assert_eq(
+    disagreements([
+      step(b"two definitions sharing a hash", shared),
+      step(b"warm", shared),
+      step(b"identically declared effects", alike),
+      step(b"warm", alike),
+      step(b"the handler switched to the other capability", with_module(alike, b"w", pick(b"y"))),
+      step(
+        b"an unrelated edit",
+        with_module(with_module(alike, b"w", pick(b"y")), b"z", b"pub fn plain() -> Int = 8\n"),
+      ),
+      step(b"a type alias", alias),
+      step(b"warm", alias),
+      step(b"an unrelated edit", with_module(alias, b"lone", b"fn lone() -> Int = 2\n")),
+      step(b"a test", [{ name: b"m", src: tested }]),
+      step(b"a test added", [
+        { name: b"m", src: bytes_concat(tested, b"test \"twice\" { assert_eq(f() + f(), 2) }\n") },
+      ]),
+      step(b"a test with a body already present", [
+        { name: b"m", src: bytes_concat(tested, b"test \"still one\" { assert_eq(f(), 1) }\n") },
+      ]),
+      step(b"a cross-module default", painted),
+      step(
+        b"the default edited",
+        edited(painted, b"palette", b"shade: Color = Red", b"shade: Color = Green"),
+      ),
+    ]),
+    [],
+  )
+}
+
+fn performer(module: Bytes) -> Bytes =
+  bytes_concat_all([
+    b"import ",
+    module,
+    b"\npub fn look(k: Int) -> Int / {",
+    module,
+    b"::db.read[t]} = ",
+    module,
+    b"::db.get[t](k)\ntest \"looks\" { handle { assert_eq(look(1), 0) } with { ",
+    module,
+    b"::db.get[t](k) -> 0 } }\n",
+  ])
+
+fn effect_decl() -> Bytes = b"pub effect db { read get[r](key: Int) -> Int }\n"
+
+test "a structurally identical effect appearing, renamed or deleted leaves a seeded answer the fresh one" {
+  let one = [{ name: b"x", src: effect_decl() }, { name: b"p", src: performer(b"x") }];
+  let twins = [
+    { name: b"a", src: effect_decl() },
+    { name: b"x", src: effect_decl() },
+    { name: b"p", src: performer(b"a") },
+  ];
+  let survivors = [
+    { name: b"a", src: effect_decl() },
+    { name: b"x", src: effect_decl() },
+    { name: b"p", src: performer(b"x") },
+  ];
+  assert_eq(
+    disagreements([
+      step(b"cold", one),
+      step(b"warm", one),
+      step(b"an identical effect appeared", with_module(one, b"a", effect_decl())),
+      step(b"twins", twins),
+      step(
+        b"the twin renamed to sort first",
+        with_module(twins, b"x", b"pub effect audit { read get[r](key: Int) -> Int }\n"),
+      ),
+      step(b"survivors", survivors),
+      step(b"the module that ranked first deleted", without(survivors, b"a")),
+    ]),
+    [],
+  )
+}
+
+test "reordering, relabelling and re-exporting leave a seeded answer the fresh one" {
+  let ops = |first: Bytes, second: Bytes|
+    [
+      {
+        name: b"m",
+        src: bytes_concat_all([
+          b"pub effect db {\n  ",
+          first,
+          b"\n  ",
+          second,
+          b"\n}\npub fn f() -> Int = 1\n",
+        ]),
+      },
+    ];
+  let get = b"read get[r](key: Int) -> Int";
+  let put = b"write put[r](key: Int, value: String) -> Unit";
+  let variants = |body: Bytes| [{ name: b"m", src: bytes_concat(b"pub type T =\n", body) }];
+  let labelled = |label: Bytes|
+    [
+      {
+        name: b"m",
+        src: bytes_concat_all([
+          b"fn f() -> Int = 1\ntest \"",
+          label,
+          b"\" { assert_eq(f(), 1) }\n",
+        ]),
+      },
+    ];
+  let exported = [
+    { name: b"a", src: b"pub fn one() -> Int = 1\n" },
+    { name: b"b", src: b"import a\nfn two() -> Int = a::one() + a::one()\n" },
+  ];
+  assert_eq(
+    disagreements([
+      step(b"operations", ops(get, put)),
+      step(b"the operations reordered", ops(put, get)),
+      step(b"variants", variants(b"  | A(Int)\n  | B(String)\n")),
+      step(b"the variants reordered", variants(b"  | B(String)\n  | A(Int)\n")),
+      step(b"a test", labelled(b"f is one")),
+      step(b"its label changed", labelled(b"f is really one")),
+      step(b"and the run after that", labelled(b"f is really one")),
+      step(b"an exported name", exported),
+      step(b"its `pub` removed", with_module(exported, b"a", b"fn one() -> Int = 1\n")),
+      step(
+        b"a selective import",
+        with_module(exported, b"b", b"import a (one)\nfn two() -> Int = one() + one()\n"),
+      ),
+      step(b"back to a module import", exported),
+    ]),
+    [],
+  )
+}
+
+test "edits undone, modules renamed and files emptied leave a seeded answer the fresh one" {
+  let s0 = shop();
+  let leaf2 = b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n";
+  let aliased = edited(
+    edited(s0, b"shop", b"import core", b"import core as c"),
+    b"shop",
+    b"core::",
+    b"c::",
+  );
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"a body edited", with_module(s0, b"leaf", leaf2)),
+      step(b"and reverted", s0),
+      step(
+        b"a definition added",
+        with_module(
+          s0,
+          b"leaf",
+          bytes_concat(shop_leaf(), b"pub fn three() -> Int = two() + one()\n"),
+        ),
+      ),
+      step(b"and deleted", s0),
+      step(b"a module renamed", with_module(without(s0, b"leaf"), b"frond", shop_leaf())),
+      step(b"and renamed back", s0),
+      step(b"an imported module deleted", without(s0, b"core")),
+      step(b"and restored", s0),
+      step(b"a comment", with_module(s0, b"leaf", bytes_concat(b"// a note\n", shop_leaf()))),
+      step(b"an import aliased", aliased),
+      step(b"the alias removed", s0),
+      step(b"an empty module", with_module(s0, b"empty", b"")),
+      step(b"which gained a definition", with_module(s0, b"empty", b"pub fn now() -> Int = 1\n")),
+      step(b"and went away", s0),
+      step(b"a nested module beside a flat one", [
+        { name: b"a", src: b"pub fn x() -> Int = 1\n" },
+        { name: b"a.b", src: b"pub fn y() -> Int = 2\n" },
+      ]),
+      step(b"the nested module changed", [
+        { name: b"a", src: b"pub fn x() -> Int = 1\n" },
+        { name: b"a.b", src: b"pub fn y() -> Int = 3\n" },
+      ]),
+    ]),
+    [],
+  )
+}
+
+test "a shuffle of module states leaves a seeded answer the fresh one at every step" {
+  let leaves = [
+    shop_leaf(),
+    bytes_concat(b"// reformatted\n\n", shop_leaf()),
+    b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n",
+  ];
+  let cores = [
+    shop_core(),
+    joined(bytes_split(shop_core(), b"Money"), b"Cost"),
+    joined(bytes_split(shop_core(), b"pub fn label("), b"pub fn title("),
+  ];
+  let shops = [
+    shop_shop(),
+    joined(bytes_split(shop_shop(), b"import core\n"), b"import core\nimport leaf\n"),
+    joined(bytes_split(shop_shop(), b"acc + core::price(i)"), b"acc + core::price(i) + 0"),
+  ];
+  // Each step sets one module to one of its states: which, and to what, cycles through every pair.
+  let picks = [
+    [0, 1],
+    [1, 2],
+    [2, 1],
+    [0, 2],
+    [1, 1],
+    [2, 2],
+    [0, 0],
+    [1, 0],
+    [2, 0],
+    [0, 1],
+    [1, 2],
+    [0, 2],
+  ];
+  let states = fold(picks, [shop()], |acc: List<List<Source>>, p: List<Int>| {
+    let now = at(acc, len(acc) - 1);
+    let module = at(p, 0);
+    let pick = at(p, 1);
+    push(acc, if module == 0 { with_module(now, b"leaf", at(leaves, pick)) }
+    else if module == 1 { with_module(now, b"core", at(cores, pick)) }
+    else { with_module(now, b"shop", at(shops, pick)) })
+  });
+  assert_eq(disagreements(map(states, |s: List<Source>| step(b"a shuffle step", s))), [])
+}
+
+fn chain_lib(base: Bytes) -> Bytes =
+  bytes_concat_all([
+    b"pub effect log { write note[r](msg: String) -> Int }\npub fn base(n: Int) -> Int = ",
+    base,
+    b"\npub fn mid(n: Int) -> Int = base(n) + 1\n",
+  ])
+
+test "a row that moves under a caller leaves a seeded answer the fresh one" {
+  let before = [
+    { name: b"lib", src: chain_lib(b"log.note[a](\"n\") + n") },
+    {
+      name: b"top",
+      src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[a]} = lib::mid(n) + 1\n",
+    },
+  ];
+  let after = [
+    { name: b"lib", src: chain_lib(b"log.note[b](\"n\") + n") },
+    {
+      name: b"top",
+      src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[b]} = lib::mid(n) + 2\n",
+    },
+  ];
+  assert_eq(
+    disagreements([step(b"cold", before), step(b"the row moved under a checked caller", after)]),
+    [],
+  );
+  let open = [
+    { name: b"lib", src: chain_lib(b"log.note[a](\"n\") + n") },
+    { name: b"top", src: b"import lib\npub fn top(n: Int) -> Int = lib::mid(n) + 1\n" },
+  ];
+  let moved = with_module(open, b"lib", chain_lib(b"log.note[b](\"n\") + n"));
+  assert_eq(
+    disagreements([step(b"cold", open), step(b"the edited body performs elsewhere", moved)]),
+    [],
+  );
+  let seeded = analyse_with(parse_all(moved), filed_rows(filing(whole_of(open))).defs, []);
+  assert_eq(footprint_of(seeded, b"top.top"), b"lib.log.note[b]")
+}
+
+test "an unused selectively imported name deleted is refused seeded as it is fresh" {
+  let s0 = [
+    { name: b"lib", src: b"pub fn used() -> Int = 1\npub fn spare() -> Int = 2\n" },
+    { name: b"app", src: b"import lib (used, spare)\nfn go() -> Int = used()\n" },
+  ];
+  let gone = with_module(s0, b"lib", b"pub fn used() -> Int = 1\n");
+  assert_eq(
+    disagreements([step(b"cold", s0), step(b"warm", s0), step(b"the name deleted", gone)]),
+    [],
+  );
+  match analyse_with(parse_all(gone), filed_rows(filing(whole_of(s0))).defs, []) {
+    Analysed(_) -> panic("an import of a deleted name checked"),
+    Refused(ds) -> assert(fold(ds, false, |acc: Bool, d: Diag| acc || d.code == b"E0101")),
+  }
+}
+
+test "a narrowed annotation and a relabelled resource leave a seeded answer the fresh one" {
+  let narrowing = |row: Bytes|
+    [
+      {
+        name: b"m",
+        src: bytes_concat_all([
+          b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / ",
+          row,
+          b" = db.get[a](k)\n",
+        ]),
+      },
+    ];
+  let labelled = |label: Bytes|
+    [
+      {
+        name: b"m",
+        src: bytes_concat_all([
+          b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / {db.read[",
+          label,
+          b"]} = db.get[",
+          label,
+          b"](k)\n",
+        ]),
+      },
+      {
+        name: b"u",
+        src: bytes_concat_all([
+          b"import m\nfn use_it() -> Int / {m::db.read[",
+          label,
+          b"]} = m::look(1)\n",
+        ]),
+      },
+    ];
+  let renamed = |ty: Bytes|
+    [
+      {
+        name: b"a",
+        src: bytes_concat_all([
+          b"pub type ",
+          ty,
+          b" = | Mk(Int)\npub fn mk() -> ",
+          ty,
+          b" = Mk(1)\n",
+        ]),
+      },
+      {
+        name: b"b",
+        src: bytes_concat_all([b"import a\npub fn get() -> a::", ty, b" = a::mk()\n"]),
+      },
+      { name: b"c", src: b"import b\npub fn top() -> Bool = { b::get(); true }\n" },
+    ];
+  assert_eq(
+    disagreements([
+      step(b"a wide annotation", narrowing(b"{db.read[a], db.read[b]}")),
+      step(b"the annotation narrowed", narrowing(b"{db.read[a]}")),
+      step(b"a resource", labelled(b"a")),
+      step(b"the resource relabelled", labelled(b"z")),
+      step(b"a type", renamed(b"T")),
+      step(b"the type renamed two modules away", renamed(b"Renamed")),
+    ]),
+    [],
+  )
+}
+
+test "the order an answer publishes in is the same seeded as fresh" {
+  let s0 = [
+    {
+      name: b"app",
+      src: b"import lib\npub effect audit { write note[log](m: Int) -> Unit }\npub type Wrapped = | Wrap(Int) | Empty\nfn second() -> Int = lib::base()\nfn first() -> Int = second()\n",
+    },
+    {
+      name: b"lib",
+      src: b"pub effect db { read get[t](k: Int) -> Int }\npub type Row = | Cell(Int)\npub fn base() -> Int = 1\n",
+    },
+  ];
+  assert_eq(disagreements([step(b"cold", s0), step(b"warm", s0)]), [])
 }
 
 // Hashed without being checked, so a program that no longer compiles still has hashes to compare.

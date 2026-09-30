@@ -843,16 +843,7 @@ impl Assembled {
                 SourceMap::new(),
             );
         };
-        let loaded = match crate::driver::load_over_front(
-            &args.path,
-            &front.files,
-            &front.packages,
-            &front.dump,
-            front.read,
-            front.front,
-            crate::driver::Mode::Full,
-            None,
-        ) {
+        let loaded = match crate::driver::load_over_front(&args.path, front) {
             Ok(loaded) => loaded,
             Err(err) => {
                 return Assembled::refused(
