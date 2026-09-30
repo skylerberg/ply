@@ -5,8 +5,6 @@ pub mod pg;
 pub mod simulate;
 pub mod w4;
 pub mod w5;
-pub mod w6;
-pub mod w6_run;
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
