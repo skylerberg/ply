@@ -47,6 +47,7 @@ fn exploration(exhaustive: bool, exhausted: bool) -> Exploration {
         exhaustive,
         exhausted,
         naive: None,
+        blind: None,
         steps: 40,
         virtual_time: 0,
         failure: None,

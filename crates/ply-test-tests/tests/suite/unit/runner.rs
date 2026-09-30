@@ -5,7 +5,7 @@
 
 use crate::fixture::{handed, plan_key, root_key};
 use ply_eval::{
-    CheckOutput, DefHash, Diagnostic, EffectAtom, Exploration, Footprint, HashOutput, Mode, Naive,
+    CheckOutput, Cost, DefHash, Diagnostic, EffectAtom, Exploration, Footprint, HashOutput, Mode,
     Plan, Race, RaceSite, Resource, Seed, SourceId, Symbol,
 };
 use ply_store::{Outcome, Store};
@@ -1232,13 +1232,18 @@ fn a_measured_reduction_is_carried_on_the_result_and_a_spent_naive_budget_is_a_l
     let (program, seeded) = seeded_program();
 
     let selection = seeded_choice(&program, &[seeded], &Plan::default(), false);
-    let naive = Naive {
+    let blind = Cost {
+        explored: 30,
+        bounded: false,
+    };
+    let naive = Cost {
         explored: 720,
         bounded: false,
     };
     let executor = SimExecutor::new(&selection).exploring(
         seeded,
         Exploration {
+            blind: Some(blind),
             naive: Some(naive),
             ..exhaustive(12)
         },
@@ -1260,8 +1265,12 @@ fn a_measured_reduction_is_carried_on_the_result_and_a_spent_naive_budget_is_a_l
         result.simulation.as_ref().and_then(|e| e.naive),
         Some(naive)
     );
+    assert_eq!(
+        result.simulation.as_ref().and_then(|e| e.blind),
+        Some(blind)
+    );
 
-    let bounded = Naive {
+    let bounded = Cost {
         explored: 4096,
         bounded: true,
     };

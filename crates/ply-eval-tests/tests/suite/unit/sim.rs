@@ -231,9 +231,9 @@ fn an_exhausted_search_is_not_cacheable() {
 }
 
 #[test]
-fn a_bounded_naive_count_renders_as_a_lower_bound() {
+fn a_bounded_count_renders_as_a_lower_bound() {
     assert_eq!(
-        Naive {
+        Cost {
             explored: 4096,
             bounded: true
         }
@@ -241,7 +241,7 @@ fn a_bounded_naive_count_renders_as_a_lower_bound() {
         ">= 4096"
     );
     assert_eq!(
-        Naive {
+        Cost {
             explored: 720,
             bounded: false
         }
@@ -251,13 +251,22 @@ fn a_bounded_naive_count_renders_as_a_lower_bound() {
 }
 
 #[test]
-fn reduction_is_none_until_it_is_measured() {
+fn reduction_is_none_until_the_naive_search_is_measured() {
     let mut e = Exploration {
         explored: 12,
         ..Exploration::default()
     };
     assert_eq!(e.reduction(), None);
-    e.naive = Some(Naive {
+    e.blind = Some(Cost {
+        explored: 30,
+        bounded: false,
+    });
+    assert_eq!(
+        e.reduction(),
+        None,
+        "the reduction is against the naive search alone"
+    );
+    e.naive = Some(Cost {
         explored: 720,
         bounded: false,
     });

@@ -1,4 +1,4 @@
-use ply_eval::{DefHash, EffectAtom, Exploration, Footprint, Mode, Naive, Resource, Symbol};
+use ply_eval::{Cost, DefHash, EffectAtom, Exploration, Footprint, Mode, Resource, Symbol};
 use ply_test::sim::{Record, is_seeded, record_under};
 
 fn hash(byte: u8) -> DefHash {
@@ -74,7 +74,11 @@ fn a_test_is_searched_exactly_when_its_footprint_reads_a_seed() {
 #[test]
 fn a_measured_reduction_does_not_change_what_is_written() {
     let measured = Exploration {
-        naive: Some(Naive {
+        blind: Some(Cost {
+            explored: 30,
+            bounded: false,
+        }),
+        naive: Some(Cost {
             explored: 720,
             bounded: false,
         }),

@@ -3,7 +3,7 @@ use ply_eval::cont::SimId;
 use ply_eval::explore::*;
 use ply_eval::sched::{Stamp, happens_before};
 use ply_eval::sim::{Access, Domain, Stream};
-use ply_eval::sim::{Naive, Plan, Seed, StepFootprint, TaskId};
+use ply_eval::sim::{Cost, Plan, Seed, StepFootprint, TaskId};
 use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, codes};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -290,7 +290,7 @@ fn the_naive_count_for_the_same_program_is_larger() {
     assert_eq!(explored.exploration.explored, 1);
     assert_eq!(
         explored.exploration.naive,
-        Some(Naive {
+        Some(Cost {
             explored: 71,
             bounded: false
         })
@@ -328,8 +328,16 @@ fn the_naive_count_is_exact_on_a_fixture_that_can_be_counted_by_hand() {
     assert_eq!(explored.exploration.explored, 1);
     assert_eq!(
         explored.exploration.naive,
-        Some(Naive {
+        Some(Cost {
             explored: 3,
+            bounded: false
+        })
+    );
+    // No two steps conflict, so there is no race for a missing clock to invent.
+    assert_eq!(
+        explored.exploration.blind,
+        Some(Cost {
+            explored: 1,
             bounded: false
         })
     );
@@ -723,21 +731,74 @@ fn asserting_on_what_a_joined_task_wrote_costs_no_interleavings() {
     assert!(explored.exploration.exhaustive);
 
     // The same program with the recording's clocks withheld.
-    struct Blind(Model);
-    impl Simulation for Blind {
+    let mut unclocked = program();
+    let unsynchronized = explore(&dpor(NAIVE_BUDGET), &mut Blind(&mut unclocked));
+    assert!(unsynchronized.passed());
+    // Pinned rather than bounded: this number moving is the news.
+    assert_eq!(unsynchronized.exploration.explored, 6);
+
+    // `--measure-reduction` reports that search beside the pruned one, at the naive search's budget
+    // rather than the plan's, so a plan too small to hold it does not bound it.
+    let measured = measure_reduction(&dpor(2), &mut program());
+    assert!(measured.passed());
+    assert_eq!(measured.exploration.explored, 1);
+    assert_eq!(
+        measured.exploration.blind,
+        Some(Cost {
+            explored: 6,
+            bounded: false
+        })
+    );
+}
+
+#[test]
+fn a_failure_only_the_clock_blind_search_reaches_is_reported() {
+    // Every step claims to have observed every other, so the clocks order away a race the run has.
+    struct Overclaimed(Model);
+    impl Simulation for Overclaimed {
         fn run(&mut self, seed: &Seed) -> Interleaving {
             let mut run = self.0.run(seed);
             for step in &mut run.steps {
-                step.stamp.clear();
+                // Wider than this program's task ids.
+                step.stamp = vec![1; 8];
             }
             run
         }
     }
-    let mut blind = Blind(program());
-    let unsynchronized = explore(&dpor(NAIVE_BUDGET), &mut blind);
-    assert!(unsynchronized.passed());
-    // Pinned rather than bounded: this number moving is the news.
-    assert_eq!(unsynchronized.exploration.explored, 6);
+    let lost_update = || {
+        Overclaimed(
+            Model::new(vec![
+                Op::Spawn("a", vec![Op::Load(1), Op::Store(1)]),
+                Op::Spawn("b", vec![Op::Load(1), Op::Store(1)]),
+                Op::Join(0),
+                Op::Join(1),
+            ])
+            .expecting(&[(1, 2)]),
+        )
+    };
+    let pruned = explore(&dpor(256), &mut lost_update());
+    assert!(
+        pruned.passed(),
+        "clocks that order everything prune every race"
+    );
+    assert_eq!(pruned.exploration.explored, 1);
+
+    let measured = measure_reduction(&dpor(256), &mut lost_update());
+    assert!(!measured.passed(), "the clock-blind search reaches it");
+    assert!(
+        measured
+            .exploration
+            .blind
+            .is_some_and(|blind| blind.bounded),
+        "a search that stopped at a failure counts a lower bound"
+    );
+    let diagnostic = measured.diagnostic.expect("a diagnostic");
+    assert_eq!(diagnostic.code, codes::ASSERTION_FAILED);
+    assert!(
+        diagnostic.notes.iter().any(|n| n.contains("vector clock")),
+        "the report must blame the clocks rather than the footprints: {:?}",
+        diagnostic.notes
+    );
 }
 
 #[test]

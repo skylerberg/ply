@@ -19,7 +19,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{
-    CheckOutput, Diagnostic, Footprint, HashOutput, Mode, SourceMap, Span, Symbol,
+    CheckOutput, Cost, Diagnostic, Footprint, HashOutput, Mode, SourceMap, Span, Symbol,
     Value as PlyValue, codes,
 };
 use ply_store::Store;
@@ -1578,7 +1578,8 @@ struct SearchView {
     explored: u64,
     exhaustive: bool,
     exhausted: bool,
-    naive: Option<(u64, bool, String)>,
+    blind: Option<Cost>,
+    naive: Option<Cost>,
     reduction_tenths: Option<i64>,
     steps: u64,
     virtual_time_ns: i64,
@@ -1778,9 +1779,8 @@ fn outcome(result: &TestResult) -> OutcomeView {
             explored: u64::from(e.explored),
             exhaustive: e.exhaustive,
             exhausted: e.exhausted,
-            naive: e
-                .naive
-                .map(|naive| (u64::from(naive.explored), naive.bounded, naive.to_string())),
+            blind: e.blind,
+            naive: e.naive,
             // Tenths, so one division answers both the line and the document.
             reduction_tenths: e.reduction().map(|r| (r * 10.0).round() as i64),
             steps: e.steps,
@@ -2070,21 +2070,21 @@ fn knowledge_value(value: &KnowledgeValue) -> PlyValue {
     }
 }
 
+fn cost_value(cost: Cost) -> PlyValue {
+    record(vec![
+        ("explored", tally(u64::from(cost.explored))),
+        ("bounded", PlyValue::Bool(cost.bounded)),
+        ("rendered", PlyValue::str(cost.to_string())),
+    ])
+}
+
 fn search_value(search: &SearchView) -> PlyValue {
     record(vec![
         ("explored", tally(search.explored)),
         ("exhaustive", PlyValue::Bool(search.exhaustive)),
         ("exhausted", PlyValue::Bool(search.exhausted)),
-        (
-            "naive",
-            option(search.naive.as_ref().map(|(explored, bounded, rendered)| {
-                record(vec![
-                    ("explored", tally(*explored)),
-                    ("bounded", PlyValue::Bool(*bounded)),
-                    ("rendered", PlyValue::str(rendered)),
-                ])
-            })),
-        ),
+        ("blind", option(search.blind.map(cost_value))),
+        ("naive", option(search.naive.map(cost_value))),
         (
             "reduction_tenths",
             option(search.reduction_tenths.map(PlyValue::Int)),
