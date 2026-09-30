@@ -13,8 +13,10 @@ fn fp(atoms: impl IntoIterator<Item = EffectAtom>) -> Footprint {
     Footprint::from_atoms(atoms)
 }
 
+/// The largest projected footprint claims the first class, a seed contends with nothing, and a test
+/// takes the first class it clears every member of.
 #[test]
-fn colouring_reproduces_the_runners_own_grouping() {
+fn colouring_is_greedy_over_the_projected_footprints() {
     let tests: Vec<(usize, Footprint)> = vec![
         (0, fp([atom("db", "a", Mode::Write)])),
         (1, fp([atom("db", "a", Mode::Read)])),
@@ -30,7 +32,7 @@ fn colouring_reproduces_the_runners_own_grouping() {
     let projected: Vec<Footprint> = tests.iter().map(|(_, f)| region_footprint(f)).collect();
     assert_eq!(
         colour(&tests, &projected),
-        ply_test::group_by_conflict(&tests)
+        vec![vec![3, 4, 5, 6], vec![0, 2], vec![1]]
     );
 }
 

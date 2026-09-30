@@ -358,7 +358,8 @@ fn verify(root: &Path) -> anyhow::Result<Verified> {
     let mut store = Store::open(root)?;
     store.clear()?;
 
-    let selection = ply_test::fresh(&front.check, &visible_of(&front.check), &Plan::default());
+    let selection =
+        ply_corpus::regions::every_test(&front.check, &visible_of(&front.check), &Plan::default());
     let report = run_on_tier(
         &front,
         &selection,

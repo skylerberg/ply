@@ -1,12 +1,14 @@
-use ply_eval::Plan;
+//! The runtime carrying out a choice it was handed: running exactly the tests named, in the classes
+//! given, filing each pass under the keys given and nothing else, and saying what it saw. Which
+//! tests a run owes, how they are coloured and where a pass belongs are `suite`'s to decide, and its
+//! own tests pin them; these state the choice and check what the runtime did with it.
+
+use crate::fixture::{handed, plan_key, root_key};
+use ply_eval::{Exploration, Naive, Plan, Race, RaceSite, Seed};
 use ply_span::{Diagnostic, SourceId, Symbol};
-use ply_store::Store;
-use ply_test::{
-    Executor, Hosting, InterpExecutor, Isolation, Parallelism, Reason, Search, Selection, Status,
-    group_by_conflict, run_with,
-};
-use ply_ty::Mode;
-use ply_ty::{CheckOutput, DefHash, EffectAtom, Footprint, HashOutput, Resource};
+use ply_store::{Outcome, Store};
+use ply_test::{Executor, Hosting, InterpExecutor, Reason, Search, Selection, Status, run_with};
+use ply_ty::{CheckOutput, DefHash, EffectAtom, Footprint, HashOutput, Mode, Resource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,12 +69,15 @@ impl Program {
             .unwrap_or_else(|| panic!("no test named {name:?}"))
     }
 
-    fn select(&self, store: &Store) -> Selection {
-        self.select_under(store, &Plan::default())
+    /// Every test, as a cold cache has it.
+    fn every(&self) -> Selection {
+        crate::fixture::every(&self.check, &self.hashes, &Plan::default())
     }
 
-    fn select_under(&self, store: &Store, plan: &Plan) -> Selection {
-        crate::fixture::select(&self.check, &self.hashes, store, plan)
+    /// `runs` alone and every other test cached: what a program hands over once the store holds a
+    /// pass for the rest.
+    fn choose(&self, runs: &[usize]) -> Selection {
+        crate::fixture::choose(&self.check, &self.hashes, runs, &Plan::default())
     }
 
     /// Runs on the compiled C tier; `Unit::over_front` leaks a `&'static Unit`.
@@ -93,374 +98,20 @@ impl Program {
             .copied()
             .expect("a definition by that name")
     }
-}
 
-fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
-    EffectAtom::new(
-        effect,
-        resource
-            .map(|r| Resource::Named(Symbol::new(r)))
-            .unwrap_or(Resource::Singleton),
-        mode,
-    )
-}
-
-fn writes(resources: &[&str]) -> Footprint {
-    Footprint::from_atoms(resources.iter().map(|r| atom("db", Some(r), Mode::Write)))
-}
-
-fn reads(resources: &[&str]) -> Footprint {
-    Footprint::from_atoms(resources.iter().map(|r| atom("db", Some(r), Mode::Read)))
-}
-
-/// Source-order colouring, the baseline that largest-footprint-first must beat.
-fn colours_in_source_order(tests: &[(usize, Footprint)]) -> usize {
-    let mut classes: Vec<Vec<usize>> = Vec::new();
-    for (p, (_, footprint)) in tests.iter().enumerate() {
-        let slot = classes.iter().position(|class| {
-            class
-                .iter()
-                .all(|&q| !footprint.conflicts_with(&tests[q].1))
-        });
-        match slot {
-            Some(k) => classes[k].push(p),
-            None => classes.push(vec![p]),
-        }
-    }
-    classes.len()
-}
-
-/// A seed is an input to one test, never a resource two tests contend over.
-fn assert_groups_are_conflict_free(groups: &[Vec<usize>], tests: &[(usize, Footprint)]) {
-    let footprint = |index: usize| {
-        ply_test::shared_footprint(
-            &tests
-                .iter()
-                .find(|(i, _)| *i == index)
-                .expect("index came from the input")
-                .1,
-        )
-    };
-    for group in groups {
-        for (a, &i) in group.iter().enumerate() {
-            for &j in &group[a + 1..] {
-                assert!(
-                    !footprint(i).conflicts_with(&footprint(j)),
-                    "tests {i} and {j} share a group but conflict: {} vs {}",
-                    footprint(i),
-                    footprint(j)
-                );
-            }
-        }
+    /// Whether the store holds a pass under this test's own hash: the fact a program's choice of
+    /// what to run is made from.
+    fn filed(&self, store: &Store, name: &str) -> bool {
+        passed(store, self.hashes.tests[self.index_of(name)])
     }
 }
 
-fn sorted(indices: impl IntoIterator<Item = usize>) -> Vec<usize> {
-    let mut out: Vec<usize> = indices.into_iter().collect();
-    out.sort_unstable();
-    out
+fn passed(store: &Store, key: DefHash) -> bool {
+    matches!(store.get(key), Some(Outcome::Pass))
 }
 
-#[test]
-fn pure_tests_all_land_in_the_first_group() {
-    let tests: Vec<(usize, Footprint)> = (0..5).map(|i| (i, Footprint::empty())).collect();
-    assert_eq!(group_by_conflict(&tests), vec![vec![0, 1, 2, 3, 4]]);
-}
-
-#[test]
-fn a_pure_test_joins_the_group_of_an_effectful_one() {
-    let tests = vec![
-        (0, writes(&["users"])),
-        (1, Footprint::empty()),
-        (2, Footprint::empty()),
-    ];
-    assert_eq!(group_by_conflict(&tests), vec![vec![0, 1, 2]]);
-}
-
-#[test]
-fn writes_to_disjoint_resources_group_together() {
-    let tests = vec![
-        (0, writes(&["users"])),
-        (1, writes(&["orders"])),
-        (2, writes(&["ledger"])),
-    ];
-    assert_eq!(group_by_conflict(&tests), vec![vec![0, 1, 2]]);
-}
-
-#[test]
-fn readers_of_one_resource_group_and_the_writer_is_separated() {
-    let tests = vec![
-        (0, reads(&["users"])),
-        (1, reads(&["users"])),
-        (2, writes(&["users"])),
-        (3, reads(&["users"])),
-    ];
-    let groups = group_by_conflict(&tests);
-    assert_eq!(groups.len(), 2);
-    assert!(
-        groups.contains(&vec![2]),
-        "the writer runs alone: {groups:?}"
-    );
-    assert!(
-        groups.contains(&vec![0, 1, 3]),
-        "the readers share a group: {groups:?}"
-    );
-    assert_groups_are_conflict_free(&groups, &tests);
-}
-
-#[test]
-fn a_write_to_one_resource_does_not_separate_readers_of_another() {
-    let tests = vec![
-        (0, reads(&["users"])),
-        (1, writes(&["orders"])),
-        (2, reads(&["users"])),
-    ];
-    assert_eq!(group_by_conflict(&tests), vec![vec![0, 1, 2]]);
-}
-
-#[test]
-fn the_largest_footprint_claims_the_first_group() {
-    let tests = vec![
-        (0, writes(&["a"])),
-        (1, writes(&["b"])),
-        (2, writes(&["a", "b"])),
-    ];
-    // Source order would pair 0 and 1; colouring the two-atom test first inverts the groups.
-    assert_eq!(group_by_conflict(&tests), vec![vec![2], vec![0, 1]]);
-}
-
-#[test]
-fn largest_footprint_first_uses_fewer_groups_than_source_order() {
-    // A 6-cycle, 2-colourable, laid out so that index-order colouring needs three groups.
-    let tests = vec![
-        (
-            0,
-            Footprint::from_atoms([
-                atom("db", Some("e03"), Mode::Write),
-                atom("db", Some("e05"), Mode::Write),
-                atom("db", Some("p0"), Mode::Read),
-            ]),
-        ),
-        (1, writes(&["e12", "e14"])),
-        (
-            2,
-            Footprint::from_atoms([
-                atom("db", Some("e12"), Mode::Write),
-                atom("db", Some("e25"), Mode::Write),
-                atom("db", Some("p2"), Mode::Read),
-            ]),
-        ),
-        (3, writes(&["e03", "e34"])),
-        (
-            4,
-            Footprint::from_atoms([
-                atom("db", Some("e14"), Mode::Write),
-                atom("db", Some("e34"), Mode::Write),
-                atom("db", Some("p4"), Mode::Read),
-            ]),
-        ),
-        (5, writes(&["e05", "e25"])),
-    ];
-
-    let groups = group_by_conflict(&tests);
-    assert_groups_are_conflict_free(&groups, &tests);
-    assert_eq!(groups, vec![vec![0, 2, 4], vec![1, 3, 5]]);
-    assert_eq!(colours_in_source_order(&tests), 3);
-}
-
-#[test]
-fn grouping_partitions_every_selected_test_exactly_once() {
-    let tests = vec![
-        (3, writes(&["users"])),
-        (7, reads(&["users"])),
-        (8, Footprint::empty()),
-        (11, writes(&["users", "orders"])),
-        (12, reads(&["orders"])),
-    ];
-    let groups = group_by_conflict(&tests);
-    assert_eq!(
-        sorted(groups.iter().flatten().copied()),
-        vec![3, 7, 8, 11, 12]
-    );
-    assert_groups_are_conflict_free(&groups, &tests);
-}
-
-#[test]
-fn grouping_is_deterministic_and_handles_an_empty_input() {
-    assert_eq!(group_by_conflict(&[]), Vec::<Vec<usize>>::new());
-    let tests = vec![(0, writes(&["a"])), (1, reads(&["a"])), (2, writes(&["b"]))];
-    assert_eq!(group_by_conflict(&tests), group_by_conflict(&tests));
-}
-
-fn cells(resources: &[&str]) -> Footprint {
-    Footprint::from_atoms(resources.iter().map(|r| atom("cell", Some(r), Mode::Write)))
-}
-
-fn seeds() -> Footprint {
-    Footprint::from_atoms([atom(ply_test::SIM_EFFECT, None, Mode::Read)])
-}
-
-#[test]
-fn a_cell_atom_is_region_scoped_and_a_db_atom_is_not() {
-    assert!(ply_test::is_region_scoped(&atom(
-        "cell",
-        Some("users"),
-        Mode::Write
-    )));
-    assert!(!ply_test::is_region_scoped(&atom(
-        "db",
-        Some("users"),
-        Mode::Write
-    )));
-
-    // User effects are module-qualified and `cell` is reserved, so the name cannot be impersonated.
-    assert!(!ply_test::is_region_scoped(&atom(
-        "m.cell",
-        Some("users"),
-        Mode::Write
-    )));
-
-    assert!(ply_test::region_isolated(&Footprint::empty()));
-    assert!(ply_test::region_isolated(&seeds()));
-    assert!(
-        !ply_test::region_isolated(&cells(&["users", "orders"])),
-        "a region label names state a sibling test can write; only the fork hid that"
-    );
-
-    let mixed = cells(&["users"]).union(&writes(&["orders"]));
-    assert_eq!(ply_test::shared_footprint(&mixed), mixed);
-    assert!(!ply_test::contends_only_over_regions(&mixed));
-    assert!(ply_test::contends_only_over_regions(&cells(&["users"])));
-    assert!(!ply_test::contends_only_over_regions(&Footprint::empty()));
-}
-
-#[test]
-fn tests_naming_one_region_label_are_coloured_apart() {
-    let tests = vec![
-        (0, cells(&["users"])),
-        (1, cells(&["users"])),
-        (2, cells(&["orders"])),
-    ];
-    let groups = group_by_conflict(&tests);
-    assert_eq!(groups.len(), 2, "{groups:?}");
-    assert_ne!(
-        groups.iter().position(|g| g.contains(&0)),
-        groups.iter().position(|g| g.contains(&1))
-    );
-    assert_groups_are_conflict_free(&groups, &tests);
-}
-
-#[test]
-fn a_region_label_and_a_real_resource_conflict_independently() {
-    let tests = vec![
-        (0, cells(&["users"]).union(&writes(&["accounts"]))),
-        (1, cells(&["orders"]).union(&reads(&["accounts"]))),
-        (2, cells(&["ledger"])),
-    ];
-    let groups = group_by_conflict(&tests);
-    assert_eq!(groups.len(), 2, "{groups:?}");
-    assert_ne!(
-        groups.iter().position(|g| g.contains(&0)),
-        groups.iter().position(|g| g.contains(&1)),
-        "a real write and a real read of `accounts` may not share a group"
-    );
-    assert!(
-        groups[0].contains(&2),
-        "a label nobody else names is still free: {groups:?}"
-    );
-    assert_groups_are_conflict_free(&groups, &tests);
-}
-
-#[test]
-fn a_real_resource_still_separates_its_writers() {
-    let tests = vec![
-        (0, writes(&["users"])),
-        (1, writes(&["users"])),
-        (2, Footprint::empty()),
-    ];
-    let groups = group_by_conflict(&tests);
-    assert_eq!(
-        groups.len(),
-        2,
-        "the two real writers cannot share: {groups:?}"
-    );
-    assert!(
-        groups[0].contains(&2),
-        "the isolated test is free: {groups:?}"
-    );
-    assert_groups_are_conflict_free(&groups, &tests);
-}
-
-#[test]
-fn every_region_isolated_test_lands_in_group_zero() {
-    let mut tests: Vec<(usize, Footprint)> = vec![(0, writes(&["a"])), (1, writes(&["a"]))];
-    for i in 2..40 {
-        tests.push((
-            i,
-            if i % 2 == 0 {
-                Footprint::empty()
-            } else {
-                seeds()
-            },
-        ));
-    }
-    let groups = group_by_conflict(&tests);
-    assert_eq!(groups.len(), 2);
-    for (i, footprint) in &tests {
-        if ply_test::region_isolated(footprint) {
-            assert!(groups[0].contains(i), "test {i} is free but not in group 0");
-        }
-    }
-}
-
-#[test]
-fn adding_region_isolated_tests_does_not_change_the_group_count() {
-    let shared: Vec<(usize, Footprint)> = vec![
-        (0, writes(&["users"])),
-        (1, reads(&["users"])),
-        (2, writes(&["orders"])),
-    ];
-    let baseline = group_by_conflict(&shared).len();
-    assert_eq!(baseline, 2);
-
-    for n in [0usize, 1, 100] {
-        let mut tests = shared.clone();
-        for i in 0..n {
-            tests.push((3 + i, seeds()));
-        }
-        let groups = group_by_conflict(&tests);
-        assert_eq!(
-            groups.len(),
-            baseline,
-            "adding {n} region-isolated tests changed the group count"
-        );
-        assert_groups_are_conflict_free(&groups, &tests);
-        assert_eq!(
-            sorted(groups.iter().flatten().copied()).len(),
-            tests.len(),
-            "every test is still scheduled exactly once"
-        );
-
-        let p = ply_test::parallelism(tests.iter().map(|(_, f)| f), &tests, &groups);
-        assert_eq!(p.isolated, n);
-        assert_eq!(p.shared, 3);
-        assert_eq!(p.shared_groups, baseline);
-        assert!(p.holds(), "{p:?}");
-    }
-}
-
-#[test]
-fn a_selection_of_only_isolated_tests_needs_one_group_and_no_shared_ones() {
-    let tests: Vec<(usize, Footprint)> = (0..4).map(|i| (i, seeds())).collect();
-    let groups = group_by_conflict(&tests);
-    let p = ply_test::parallelism(tests.iter().map(|(_, f)| f), &tests, &groups);
-    assert_eq!((p.total, p.isolated, p.shared), (4, 4, 0));
-    assert_eq!((p.groups, p.shared_groups), (1, 0));
-    assert!(p.holds(), "{p:?}");
-
-    let empty = ply_test::parallelism(std::iter::empty(), &[], &[]);
-    assert_eq!((empty.groups, empty.shared_groups), (0, 0));
-    assert!(empty.holds(), "{empty:?}");
+fn suspects(failure: &ply_test::Failure) -> Vec<&str> {
+    failure.suspects.iter().map(|s| s.as_str()).collect()
 }
 
 const ARITHMETIC: &str = r#"
@@ -481,53 +132,60 @@ test "twice is right" {
 }
 "#;
 
+const ARITHMETIC_TESTS: [&str; 3] = ["add is right", "mul is right", "twice is right"];
+
 #[test]
-fn a_warm_cache_selects_nothing() {
+fn a_pass_is_filed_under_its_key_and_a_choice_of_nothing_runs_nothing() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
 
-    let first = program.select(&store);
-    let report = program.run(&first, &mut store);
+    let report = program.run(&program.every(), &mut store);
     assert_eq!(
         (report.passed, report.failed),
         (3, 0),
         "{:#?}",
         report.failures
     );
+    for name in ARITHMETIC_TESTS {
+        assert!(
+            program.filed(&store, name),
+            "`{name}` passed and was not filed"
+        );
+    }
 
-    let second = program.select(&store);
-    assert!(second.to_run.is_empty());
-    assert_eq!(second.cached.len(), 3);
-    assert!(second.groups.is_empty());
-    assert!(second.reasons.iter().all(|r| *r == Reason::Cached));
-
-    let report = program.run(&second, &mut store);
+    let warm = program.choose(&[]);
+    assert!(warm.groups.is_empty());
+    assert!(warm.reasons.iter().all(|r| *r == Reason::Cached));
+    let report = program.run(&warm, &mut store);
     assert_eq!((report.passed, report.failed, report.cached), (0, 0, 3));
     assert!(report.results.is_empty());
 }
 
 #[test]
-fn a_warm_cache_survives_reopening_the_store() {
+fn a_filed_pass_survives_reopening_the_store() {
     let root = TempRoot::new();
     let program = Program::compile(ARITHMETIC);
     {
         let mut store = root.store();
-        let selection = program.select(&store);
-        program.run(&selection, &mut store);
+        program.run(&program.every(), &mut store);
     }
     let store = root.store();
-    assert!(program.select(&store).to_run.is_empty());
+    for name in ARITHMETIC_TESTS {
+        assert!(
+            program.filed(&store, name),
+            "`{name}` was lost with the store"
+        );
+    }
 }
 
 #[test]
-fn an_edit_selects_only_the_tests_that_reach_it() {
+fn an_edit_moves_the_keys_of_exactly_the_tests_that_reach_it() {
     let root = TempRoot::new();
     let mut store = root.store();
 
     let before = Program::compile(ARITHMETIC);
-    let selection = before.select(&store);
-    let report = before.run(&selection, &mut store);
+    let report = before.run(&before.every(), &mut store);
     assert_eq!(report.failed, 0, "{:#?}", report.failures);
 
     // `mul` changes and `twice` calls it, so both hashes move.
@@ -535,35 +193,27 @@ fn an_edit_selects_only_the_tests_that_reach_it() {
         "fn mul(a: Int, b: Int) -> Int = a * b",
         "fn mul(a: Int, b: Int) -> Int = a * b * 1",
     ));
-    let selection = after.select(&store);
-
-    let add = after.index_of("add is right");
-    let mul = after.index_of("mul is right");
-    let twice = after.index_of("twice is right");
-
-    assert_eq!(selection.reason(add), Some(Reason::Cached));
-    assert_eq!(selection.reason(mul), Some(Reason::New));
-    assert_eq!(selection.reason(twice), Some(Reason::New));
-    assert_eq!(selection.to_run, sorted([mul, twice]));
+    assert!(after.filed(&store, "add is right"));
+    assert!(!after.filed(&store, "mul is right"));
+    assert!(!after.filed(&store, "twice is right"));
 }
 
 #[test]
-fn renaming_a_definition_selects_nothing() {
+fn renaming_a_definition_moves_no_key() {
     let root = TempRoot::new();
     let mut store = root.store();
 
     let before = Program::compile(ARITHMETIC);
-    let selection = before.select(&store);
-    assert_eq!(before.run(&selection, &mut store).failed, 0);
+    assert_eq!(before.run(&before.every(), &mut store).failed, 0);
 
     let after = Program::compile(&ARITHMETIC.replace("mul(", "product("));
     assert!(after.hashes.defs.contains_key(&Symbol::new("product")));
-
-    let selection = after.select(&store);
-    assert!(
-        selection.to_run.is_empty(),
-        "a rename changes no behaviour, so nothing may re-run: {selection:?}"
-    );
+    for name in ARITHMETIC_TESTS {
+        assert!(
+            after.filed(&store, name),
+            "a rename changes no behaviour, so `{name}`'s pass still answers for it"
+        );
+    }
 }
 
 const ONE_RED: &str = r#"
@@ -580,62 +230,54 @@ test "bad is one" {
 "#;
 
 #[test]
-fn a_failure_is_never_cached_and_re_runs_until_it_goes_green() {
+fn a_failure_never_reaches_the_store_and_a_pass_does() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ONE_RED);
-    let good = program.index_of("good is one");
     let bad = program.index_of("bad is one");
 
     for round in 0..3 {
-        let selection = program.select(&store);
-        assert!(
-            selection.to_run.contains(&bad),
-            "round {round}: a red test must be selected every single time"
-        );
-        if round > 0 {
-            assert_eq!(selection.to_run, vec![bad], "round {round}");
-            assert_eq!(selection.reason(good), Some(Reason::Cached));
-        }
-
+        // Once `good` is filed, a program runs the red test alone.
+        let selection = if round == 0 {
+            program.every()
+        } else {
+            program.choose(&[bad])
+        };
         let report = program.run(&selection, &mut store);
         assert_eq!(report.failed, 1, "round {round}");
         assert_eq!(report.failures[0].name, "bad is one");
-
         assert!(
             store.get(program.hashes.tests[bad]).is_none(),
             "round {round}: a failure must never reach the store"
         );
         assert!(
-            store.get(program.hashes.tests[good]).is_some(),
+            program.filed(&store, "good is one"),
             "round {round}: a pass must reach the store"
         );
     }
 
     let fixed =
         Program::compile(&ONE_RED.replace("fn bad() -> Int = 2", "fn bad() -> Int = 3 - 2"));
-    let selection = fixed.select(&store);
-    assert!(selection.to_run.contains(&bad));
-    let report = fixed.run(&selection, &mut store);
-    assert_eq!((report.passed, report.failed), (selection.to_run.len(), 0));
+    assert!(!fixed.filed(&store, "bad is one"));
+    let report = fixed.run(&fixed.choose(&[fixed.index_of("bad is one")]), &mut store);
+    assert_eq!((report.passed, report.failed), (1, 0));
     assert!(
-        fixed.select(&store).to_run.is_empty(),
-        "only going green may stop a test from being selected"
+        fixed.filed(&store, "bad is one"),
+        "going green is what files the pass"
     );
 }
 
 #[test]
-fn a_fix_that_reproduces_a_green_definition_is_green_without_running() {
+fn a_fix_that_reproduces_a_green_definition_is_already_on_file() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ONE_RED);
-    let selection = program.select(&store);
-    assert_eq!(program.run(&selection, &mut store).failed, 1);
+    assert_eq!(program.run(&program.every(), &mut store).failed, 1);
 
     // `bad` repaired into a copy of `good`, so it and its test hash identically.
     let fixed = Program::compile(&ONE_RED.replace("fn bad() -> Int = 2", "fn bad() -> Int = 1"));
     assert_eq!(fixed.def_hash("bad"), fixed.def_hash("good"));
-    assert!(fixed.select(&store).to_run.is_empty());
+    assert!(fixed.filed(&store, "bad is one"));
 }
 
 #[test]
@@ -643,8 +285,7 @@ fn a_red_test_does_not_vouch_for_the_definitions_it_exercised() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ONE_RED);
-    let selection = program.select(&store);
-    program.run(&selection, &mut store);
+    program.run(&program.every(), &mut store);
 
     assert!(!store.knows_definition(program.def_hash("bad")));
     assert!(store.knows_definition(program.def_hash("good")));
@@ -655,8 +296,7 @@ fn definitions_are_recorded_apart_from_test_results() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
-    let selection = program.select(&store);
-    assert_eq!(program.run(&selection, &mut store).failed, 0);
+    assert_eq!(program.run(&program.every(), &mut store).failed, 0);
 
     for name in ["add", "mul", "twice"] {
         let hash = program.def_hash(name);
@@ -689,26 +329,18 @@ fn a_failure_names_only_the_changed_definitions_in_its_closure() {
     let mut store = root.store();
 
     let green = Program::compile(LEDGER);
-    let selection = green.select(&store);
-    let report = green.run(&selection, &mut store);
+    let report = green.run(&green.every(), &mut store);
     assert_eq!(report.failed, 0, "{:#?}", report.failures);
 
     let red = Program::compile(&LEDGER.replace(
         "fn debit(balance: Int, amount: Int) -> Int = balance - amount",
         "fn debit(balance: Int, amount: Int) -> Int = balance - amount - 1",
     ));
-    let selection = red.select(&store);
-    assert_eq!(selection.to_run, vec![red.index_of("settle nets out")]);
-
-    let report = red.run(&selection, &mut store);
+    assert!(red.filed(&store, "credit adds"));
+    let report = red.run(&red.choose(&[red.index_of("settle nets out")]), &mut store);
     assert_eq!(report.failed, 1);
-    let suspects: Vec<&str> = report.failures[0]
-        .suspects
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
     assert_eq!(
-        suspects,
+        suspects(&report.failures[0]),
         vec!["debit", "settle"],
         "only the edited definition and the one carrying it are suspect"
     );
@@ -720,8 +352,7 @@ fn suspects_are_computed_against_the_cache_as_it_was_before_the_run() {
     let mut store = root.store();
 
     let green = Program::compile(LEDGER);
-    let selection = green.select(&store);
-    assert_eq!(green.run(&selection, &mut store).failed, 0);
+    assert_eq!(green.run(&green.every(), &mut store).failed, 0);
 
     // `credit` is rewritten so that its own test stays green while its hash moves.
     let red = Program::compile(
@@ -732,24 +363,13 @@ fn suspects_are_computed_against_the_cache_as_it_was_before_the_run() {
             )
             .replace("assert_eq(settle(0), 6)", "assert_eq(settle(0), 99)"),
     );
-    let selection = red.select(&store);
-    assert_eq!(selection.to_run.len(), 2);
-    assert_eq!(
-        selection.groups,
-        vec![vec![0, 1]],
-        "both are pure, so they share a group"
-    );
-
-    let report = red.run(&selection, &mut store);
+    // Both in one class, so the green sibling can finish first.
+    let report = red.run(&red.every(), &mut store);
     assert_eq!(report.failed, 1);
-    let suspects: Vec<&str> = report.failures[0]
-        .suspects
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let named = suspects(&report.failures[0]);
     assert!(
-        suspects.contains(&"credit"),
-        "a sibling test passing first must not clear a suspect: {suspects:?}"
+        named.contains(&"credit"),
+        "a sibling test passing first must not clear a suspect: {named:?}"
     );
 }
 
@@ -770,29 +390,23 @@ fn a_green_sibling_never_clears_a_suspect_on_a_later_run() {
     let mut store = root.store();
 
     let green = Program::compile(&shared("x + 1", "base(x) + 10"));
-    let selection = green.select(&store);
-    assert_eq!(green.run(&selection, &mut store).failed, 0);
+    assert_eq!(green.run(&green.every(), &mut store).failed, 0);
 
     // `base` stays value-identical, so its hash moves and its test stays green; `total` breaks.
     let red = Program::compile(&shared("1 + x", "base(x) + 11"));
     let doomed = red.index_of("total is right");
 
     for round in 0..3 {
-        let selection = red.select(&store);
-        assert!(
-            selection.to_run.contains(&doomed),
-            "round {round}: a red test always re-runs"
-        );
-
+        let selection = if round == 0 {
+            red.every()
+        } else {
+            assert!(red.filed(&store, "base is right"), "round {round}");
+            red.choose(&[doomed])
+        };
         let report = red.run(&selection, &mut store);
         assert_eq!(report.failed, 1, "round {round}: {:#?}", report.results);
-        let suspects: Vec<&str> = report.failures[0]
-            .suspects
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
         assert_eq!(
-            suspects,
+            suspects(&report.failures[0]),
             vec!["base", "total"],
             "round {round}: a passing sibling must not vouch for a red test's definitions"
         );
@@ -809,15 +423,14 @@ fn a_run_that_skipped_a_test_does_not_vouch_for_what_it_would_have_covered() {
     let mut store = root.store();
 
     let green = Program::compile(&shared("x + 1", "base(x) + 10"));
-    let selection = green.select(&store);
-    assert_eq!(green.run(&selection, &mut store).failed, 0);
+    assert_eq!(green.run(&green.every(), &mut store).failed, 0);
 
     let red = Program::compile(&shared("1 + x", "base(x) + 11"));
     let base = red.index_of("base is right");
     let doomed = red.index_of("total is right");
 
     // What `--filter base` narrows to: `total is right` keeps its reason but never reaches a group.
-    let mut filtered = red.select(&store);
+    let mut filtered = red.every();
     filtered.to_run.retain(|&i| i == base);
     filtered.groups = vec![vec![base]];
     let report = red.run(&filtered, &mut store);
@@ -827,16 +440,10 @@ fn a_run_that_skipped_a_test_does_not_vouch_for_what_it_would_have_covered() {
         "the narrowed run must not have executed `total is right`"
     );
 
-    let selection = red.select(&store);
-    let report = red.run(&selection, &mut store);
+    let report = red.run(&red.choose(&[doomed]), &mut store);
     assert_eq!(report.failed, 1);
-    let suspects: Vec<&str> = report.failures[0]
-        .suspects
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
     assert_eq!(
-        suspects,
+        suspects(&report.failures[0]),
         vec!["base", "total"],
         "a test that never ran cannot have cleared its own closure"
     );
@@ -848,33 +455,56 @@ fn going_green_ends_the_suspicion_a_failure_kept_alive() {
     let mut store = root.store();
 
     let green = Program::compile(&shared("x + 1", "base(x) + 10"));
-    let selection = green.select(&store);
-    assert_eq!(green.run(&selection, &mut store).failed, 0);
+    assert_eq!(green.run(&green.every(), &mut store).failed, 0);
 
     let red = Program::compile(&shared("1 + x", "base(x) + 11"));
-    let selection = red.select(&store);
-    assert_eq!(red.run(&selection, &mut store).failed, 1);
+    assert_eq!(red.run(&red.every(), &mut store).failed, 1);
 
     let fixed = Program::compile(&shared("1 + x", "base(x) + 10"));
-    let selection = fixed.select(&store);
-    let report = fixed.run(&selection, &mut store);
+    assert!(fixed.filed(&store, "base is right"));
+    let report = fixed.run(
+        &fixed.choose(&[fixed.index_of("total is right")]),
+        &mut store,
+    );
     assert_eq!(report.failed, 0, "{:#?}", report.failures);
     assert!(store.knows_definition(fixed.def_hash("base")));
     assert!(store.knows_definition(fixed.def_hash("total")));
 
     // Only `total` moves now, so it is the only thing the next failure may name.
     let broken = Program::compile(&shared("1 + x", "base(x) + 12"));
-    let selection = broken.select(&store);
-    assert_eq!(selection.to_run, vec![broken.index_of("total is right")]);
-
-    let report = broken.run(&selection, &mut store);
+    assert!(broken.filed(&store, "base is right"));
+    let report = broken.run(
+        &broken.choose(&[broken.index_of("total is right")]),
+        &mut store,
+    );
     assert_eq!(report.failed, 1);
-    let suspects: Vec<&str> = report.failures[0]
-        .suspects
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    assert_eq!(suspects, vec!["total"]);
+    assert_eq!(suspects(&report.failures[0]), vec!["total"]);
+}
+
+#[test]
+fn a_failure_whose_test_alone_moved_names_no_suspect() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+
+    let green = Program::compile(LEDGER);
+    assert_eq!(green.run(&green.every(), &mut store).failed, 0);
+
+    let red =
+        Program::compile(&LEDGER.replace("assert_eq(settle(0), 6)", "assert_eq(settle(0), 7)"));
+    let report = red.run(&red.choose(&[red.index_of("settle nets out")]), &mut store);
+    assert_eq!((report.failed, report.passed, report.cached), (1, 0, 1));
+    assert!(!report.is_success());
+
+    let failure = &report.failures[0];
+    assert_eq!(failure.name, "settle nets out");
+    assert_eq!(failure.diagnostic.code, ply_span::codes::ASSERTION_FAILED);
+    assert!(
+        failure.suspects.is_empty(),
+        "only the expectation inside the test moved, so the test is the change: {:?}",
+        failure.suspects
+    );
+    assert_eq!(report.results[0].status, Status::Failed);
+    assert!(report.results[0].hash.is_some());
 }
 
 #[test]
@@ -883,15 +513,29 @@ fn the_report_accounts_for_every_selected_test_exactly_once() {
     let mut store = root.store();
     let program = Program::compile(ONE_RED);
 
-    let selection = program.select(&store);
+    let selection = program.every();
     let report = program.run(&selection, &mut store);
     assert_eq!(report.passed + report.failed, selection.to_run.len());
-    assert_eq!(
-        sorted(report.results.iter().map(|r| r.index)),
-        selection.to_run
-    );
+    let mut ran: Vec<usize> = report.results.iter().map(|r| r.index).collect();
+    ran.sort_unstable();
+    assert_eq!(ran, selection.to_run);
     assert!(report.warnings.is_empty(), "{:#?}", report.warnings);
     assert!(!report.is_success());
+}
+
+/// A selection whose every field is spelled out, for a run over a choice no program would make.
+fn literal(to_run: Vec<usize>, groups: Vec<Vec<usize>>, reason: Reason) -> Selection {
+    Selection {
+        total: 3,
+        cached: Vec::new(),
+        to_run,
+        groups,
+        reasons: vec![reason; 3],
+        plan: Plan::default(),
+        narrowed: BTreeMap::new(),
+        filed: BTreeMap::new(),
+        out_of_scope: BTreeSet::new(),
+    }
 }
 
 #[test]
@@ -899,20 +543,7 @@ fn an_empty_selection_runs_nothing() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
-    let selection = Selection {
-        total: 3,
-        cached: Vec::new(),
-        to_run: Vec::new(),
-        groups: Vec::new(),
-        reasons: vec![Reason::Cached; 3],
-        isolation: vec![Isolation::Region; 3],
-        parallelism: Parallelism::default(),
-        plan: Plan::default(),
-        narrowed: BTreeMap::new(),
-        filed: BTreeMap::new(),
-        out_of_scope: BTreeSet::new(),
-    };
-    let report = program.run(&selection, &mut store);
+    let report = program.run(&literal(Vec::new(), Vec::new(), Reason::Cached), &mut store);
     assert_eq!((report.passed, report.failed, report.cached), (0, 0, 0));
     assert!(report.warnings.is_empty());
 }
@@ -922,20 +553,10 @@ fn a_selected_test_left_out_of_every_group_is_still_run() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
-    let selection = Selection {
-        total: 3,
-        cached: Vec::new(),
-        to_run: vec![0, 1, 2],
-        groups: vec![vec![0]],
-        reasons: vec![Reason::New; 3],
-        isolation: vec![Isolation::Region; 3],
-        parallelism: Parallelism::default(),
-        plan: Plan::default(),
-        narrowed: BTreeMap::new(),
-        filed: BTreeMap::new(),
-        out_of_scope: BTreeSet::new(),
-    };
-    let report = program.run(&selection, &mut store);
+    let report = program.run(
+        &literal(vec![0, 1, 2], vec![vec![0]], Reason::New),
+        &mut store,
+    );
     assert_eq!(report.passed, 3, "no selected test may be silently skipped");
     assert_eq!(report.warnings.len(), 1);
 }
@@ -945,23 +566,112 @@ fn a_selection_naming_a_test_that_does_not_exist_warns_instead_of_panicking() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
-    let selection = Selection {
-        total: 3,
-        cached: Vec::new(),
-        to_run: vec![0, 99],
-        groups: vec![vec![0, 99]],
-        reasons: vec![Reason::New; 3],
-        isolation: vec![Isolation::Region; 3],
-        parallelism: Parallelism::default(),
-        plan: Plan::default(),
-        narrowed: BTreeMap::new(),
-        filed: BTreeMap::new(),
-        out_of_scope: BTreeSet::new(),
-    };
-    let report = program.run(&selection, &mut store);
+    let report = program.run(
+        &literal(vec![0, 99], vec![vec![0, 99]], Reason::New),
+        &mut store,
+    );
     assert_eq!((report.passed, report.failed), (1, 0));
     assert_eq!(report.warnings.len(), 1);
     assert!(report.warnings[0].message.contains("99"));
+}
+
+#[test]
+fn every_group_is_run_in_sequence() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(ARITHMETIC);
+
+    let mut selection = program.every();
+    selection.groups = vec![vec![0], vec![1, 2]];
+    let report = program.run(&selection, &mut store);
+    assert_eq!(report.passed, 3);
+    assert_eq!(report.results.iter().filter(|r| r.group == 0).count(), 1);
+    assert_eq!(report.results.iter().filter(|r| r.group == 1).count(), 2);
+}
+
+const DISJOINT_CELLS: &str = r#"
+test "users cell" {
+  with_cell[users](1) { c ->
+    assert_eq(cell_get(c), 1)
+  }
+}
+
+test "orders cell" {
+  with_cell[orders](2) { c ->
+    assert_eq(cell_get(c), 2)
+  }
+}
+
+test "pure one" {
+  assert_eq(1, 1)
+}
+
+test "pure two" {
+  assert_eq(2, 2)
+}
+"#;
+
+#[test]
+fn tests_whose_regions_discharge_their_cells_run_as_one_class() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(DISJOINT_CELLS);
+
+    // `with_cell` discharges its atoms at the region boundary, so nothing is left to contend over.
+    assert!(program.check.tests.iter().all(|t| t.footprint.is_empty()));
+
+    let report = program.run(&program.every(), &mut store);
+    assert_eq!(
+        (report.passed, report.failed),
+        (4, 0),
+        "{:#?}",
+        report.failures
+    );
+    assert!(report.results.iter().all(|r| r.group == 0));
+}
+
+const PERFORMING: &str = r#"
+effect disk {
+  read peek[r](key: Int) -> Int
+}
+
+test "peeks three times" {
+  let n = handle {
+    disk.peek[log](1) + disk.peek[log](2) + disk.peek[log](3)
+  } with {
+    disk.peek[log](k) -> k,
+  };
+  assert_eq(n, 6)
+}
+
+test "peeks at nothing" { assert_eq(1, 1) }
+"#;
+
+#[test]
+fn a_result_counts_the_operations_its_own_test_performed() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let program = Program::compile(PERFORMING);
+    let report = program.run(&program.every(), &mut store);
+    assert_eq!(report.failed, 0, "{:#?}", report.failures);
+    let performs = |name: &str| {
+        report
+            .results
+            .iter()
+            .find(|r| r.name == name)
+            .expect("reported")
+            .performs
+    };
+    assert_eq!(
+        performs("peeks three times"),
+        3,
+        "a handled operation is performed all the same"
+    );
+    assert_eq!(
+        performs("peeks at nothing"),
+        0,
+        "a worker's count starts over with each test"
+    );
 }
 
 struct PanickingExecutor {
@@ -986,7 +696,7 @@ fn a_panicking_test_is_contained_and_reported_as_a_failure() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
-    let selection = program.select(&store);
+    let selection = program.every();
     let doomed = program.index_of("mul is right");
 
     let executor = PanickingExecutor { panic_on: doomed };
@@ -1041,19 +751,7 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
     let program = Program::compile(ARITHMETIC);
 
     // One group per test forces the sequential path, so the unwound worker runs the next test.
-    let selection = Selection {
-        total: 3,
-        cached: Vec::new(),
-        to_run: vec![0, 1, 2],
-        groups: vec![vec![0], vec![1], vec![2]],
-        reasons: vec![Reason::New; 3],
-        isolation: vec![Isolation::Region; 3],
-        parallelism: Parallelism::default(),
-        plan: Plan::default(),
-        narrowed: BTreeMap::new(),
-        filed: BTreeMap::new(),
-        out_of_scope: BTreeSet::new(),
-    };
+    let selection = literal(vec![0, 1, 2], vec![vec![0], vec![1], vec![2]], Reason::New);
     let executor = PanickingExecutor { panic_on: 0 };
     let report = run_with(
         &selection,
@@ -1104,11 +802,10 @@ fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
     let doomed = program.index_of("mul is right");
-    let selection = program.select(&store);
 
     let executor = InternalErrorExecutor { fail_on: doomed };
     let report = run_with(
-        &selection,
+        &program.every(),
         &program.check,
         &program.hashes,
         &mut store,
@@ -1121,537 +818,9 @@ fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
         .find(|r| r.index == doomed)
         .expect("reported");
     assert_eq!(result.status, Status::Panicked);
-    let failure = &report.failures[0];
-    assert!(failure.defect);
-    // The run classifies what it can see how far it can see it: a defect in Ply is never a change
-    // in the program. Whether a search happens at all is the program reading the report's call.
-    assert_eq!(
-        failure.attribution.bisection.verdict,
-        ply_test::Verdict::NotAttempted(ply_test::Skipped::Panicked)
-    );
+    // The fact the program's gate reads: a defect in Ply is never a change in the program.
+    assert!(report.failures[0].defect);
 }
-
-#[test]
-fn the_json_report_carries_the_diagnostic_and_the_suspects() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-
-    let green = Program::compile(LEDGER);
-    let selection = green.select(&store);
-    green.run(&selection, &mut store);
-
-    let red =
-        Program::compile(&LEDGER.replace("assert_eq(settle(0), 6)", "assert_eq(settle(0), 7)"));
-    let selection = red.select(&store);
-    let report = red.run(&selection, &mut store);
-
-    let json = report.to_json();
-    assert_eq!(json["failed"], 1);
-    assert_eq!(json["success"], false);
-    assert!(json["duration_ms"].is_number());
-
-    let failure = &json["failures"][0];
-    assert_eq!(failure["name"], "settle nets out");
-    assert_eq!(
-        failure["diagnostic"]["code"],
-        ply_span::codes::ASSERTION_FAILED
-    );
-    // Only the expectation inside the test moved, so the test is the change and nothing is suspect.
-    assert_eq!(failure["suspects"], serde_json::json!([]));
-
-    assert_eq!(json["tests"][0]["status"], "failed");
-    assert!(
-        json["tests"][0]["hash"]
-            .as_str()
-            .is_some_and(|h| h.len() == 64)
-    );
-
-    let summary = report.summary();
-    assert!(
-        summary[0].starts_with("1 failed, 0 passed, 1 cached"),
-        "{summary:#?}"
-    );
-    assert!(
-        summary.iter().any(|l| l.contains("expected 7, found 6")),
-        "{summary:#?}"
-    );
-    assert!(report.results[0].line().starts_with('✗'));
-}
-
-#[test]
-fn the_summary_lists_the_suspects_for_a_failure() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-
-    let green = Program::compile(LEDGER);
-    let selection = green.select(&store);
-    assert_eq!(green.run(&selection, &mut store).failed, 0);
-
-    let red = Program::compile(&LEDGER.replace(
-        "fn debit(balance: Int, amount: Int) -> Int = balance - amount",
-        "fn debit(balance: Int, amount: Int) -> Int = balance - amount - 1",
-    ));
-    let selection = red.select(&store);
-    let summary = red.run(&selection, &mut store).summary();
-    assert!(
-        summary.iter().any(|l| l == "  suspects: debit, settle"),
-        "{summary:#?}"
-    );
-}
-
-#[test]
-fn explain_covers_every_test_and_every_group() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(ARITHMETIC);
-
-    let selection = program.select(&store);
-    let lines = selection.explain(&program.check, &program.hashes);
-    let per_test = |lines: &[String]| {
-        lines
-            .iter()
-            .filter(|l| l.starts_with("run ") || l.starts_with("skip"))
-            .count()
-    };
-    assert_eq!(per_test(&lines), selection.total);
-    assert_eq!(
-        lines.iter().filter(|l| l.starts_with("group ")).count(),
-        selection.groups.len()
-    );
-    assert!(
-        lines.iter().take(3).all(|l| l.starts_with("run ")),
-        "{lines:#?}"
-    );
-    assert!(
-        lines.iter().any(|l| l.starts_with("isolated: 3 of 3")),
-        "{lines:#?}"
-    );
-
-    program.run(&selection, &mut store);
-    let selection = program.select(&store);
-    let lines = selection.explain(&program.check, &program.hashes);
-    assert_eq!(per_test(&lines), 3);
-    assert!(
-        lines.iter().take(3).all(|l| l.starts_with("skip")),
-        "{lines:#?}"
-    );
-
-    let json = selection.to_json(&program.check, &program.hashes);
-    assert_eq!(json["selected"], 0);
-    assert_eq!(json["cached"], 3);
-    assert_eq!(json["tests"][0]["reason"], "cached");
-}
-
-const DISJOINT_CELLS: &str = r#"
-test "users cell" {
-  with_cell[users](1) { c ->
-    assert_eq(cell_get(c), 1)
-  }
-}
-
-test "orders cell" {
-  with_cell[orders](2) { c ->
-    assert_eq(cell_get(c), 2)
-  }
-}
-
-test "pure one" {
-  assert_eq(1, 1)
-}
-
-test "pure two" {
-  assert_eq(2, 2)
-}
-"#;
-
-#[test]
-fn a_module_whose_tests_are_all_isolated_runs_as_a_single_group() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(DISJOINT_CELLS);
-
-    // `with_cell` discharges its atoms at the region boundary, so these tests are pure and share a group.
-    assert!(program.check.tests.iter().all(|t| t.footprint.is_empty()));
-
-    let selection = program.select(&store);
-    assert_eq!(selection.groups, vec![vec![0, 1, 2, 3]]);
-
-    let report = program.run(&selection, &mut store);
-    assert_eq!(
-        (report.passed, report.failed),
-        (4, 0),
-        "{:#?}",
-        report.failures
-    );
-    assert!(report.results.iter().all(|r| r.group == 0));
-}
-
-/// Injected: no program can yet leave a `cell` atom in a test's footprint.
-fn with_footprint(program: &mut Program, name: &str, footprint: Footprint) {
-    let index = program.index_of(name);
-    program.check.tests[index].footprint = footprint;
-}
-
-#[test]
-fn two_tests_retaining_the_same_cell_resource_are_coloured_apart() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let mut program = Program::compile(DISJOINT_CELLS);
-    with_footprint(&mut program, "users cell", cells(&["users"]));
-    with_footprint(&mut program, "orders cell", cells(&["users"]));
-
-    let selection = program.select(&store);
-    assert_eq!(selection.groups, vec![vec![0, 2, 3], vec![1]]);
-    assert_eq!(selection.parallelism.isolated, 2);
-    assert_eq!(selection.parallelism.region_contended, 2);
-    assert_eq!(selection.parallelism.shared_groups, 2);
-    assert!(selection.parallelism.holds(), "{:?}", selection.parallelism);
-
-    let report = program.run(&selection, &mut store);
-    assert_eq!(
-        (report.passed, report.failed),
-        (4, 0),
-        "{:#?}",
-        report.failures
-    );
-}
-
-#[test]
-fn two_tests_on_distinct_cell_resources_still_run_in_one_group() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let mut program = Program::compile(DISJOINT_CELLS);
-    with_footprint(&mut program, "users cell", cells(&["users"]));
-    with_footprint(&mut program, "orders cell", cells(&["orders"]));
-
-    let selection = program.select(&store);
-    assert_eq!(selection.groups, vec![vec![0, 1, 2, 3]]);
-    assert_eq!(selection.parallelism.region_contended, 2);
-    assert_eq!(selection.parallelism.shared_groups, 1);
-
-    let report = program.run(&selection, &mut store);
-    assert_eq!(
-        (report.passed, report.failed),
-        (4, 0),
-        "{:#?}",
-        report.failures
-    );
-    assert!(report.results.iter().all(|r| r.group == 0));
-}
-
-#[test]
-fn a_test_that_reaches_a_real_resource_is_still_serialized_against_its_writer() {
-    let root = TempRoot::new();
-    let store = root.store();
-    let mut program = Program::compile(DISJOINT_CELLS);
-    with_footprint(
-        &mut program,
-        "users cell",
-        cells(&["users"]).union(&writes(&["accounts"])),
-    );
-    with_footprint(&mut program, "orders cell", reads(&["accounts"]));
-    with_footprint(&mut program, "pure one", cells(&["accounts"]));
-
-    let selection = program.select(&store);
-    assert_eq!(selection.groups.len(), 2);
-    assert!(
-        selection.group_of(0) != selection.group_of(1),
-        "a real write and a real read of `accounts` must not share a group: {:?}",
-        selection.groups
-    );
-    assert_eq!(selection.group_of(2), Some(0));
-    assert_eq!(selection.group_of(3), Some(0));
-
-    let p = &selection.parallelism;
-    assert_eq!((p.total, p.isolated, p.shared), (4, 1, 3));
-    assert_eq!(
-        p.region_contended, 1,
-        "`pure one` names a label and nothing else"
-    );
-    assert_eq!((p.groups, p.shared_groups), (2, 2));
-    assert!(p.holds(), "{p:?}");
-}
-
-#[test]
-fn the_artifact_reports_isolation_per_test_and_in_total() {
-    let root = TempRoot::new();
-    let store = root.store();
-    let mut program = Program::compile(DISJOINT_CELLS);
-    with_footprint(&mut program, "users cell", cells(&["users"]));
-    with_footprint(
-        &mut program,
-        "orders cell",
-        cells(&["orders"]).union(&writes(&["ledger"])),
-    );
-
-    let selection = program.select(&store);
-    let json = selection.to_json(&program.check, &program.hashes);
-    assert_eq!(json["isolated"], 2);
-    assert_eq!(json["parallelism"]["total"], 4);
-    assert_eq!(json["parallelism"]["shared"], 2);
-    assert_eq!(json["parallelism"]["region_contended"], 1);
-    assert_eq!(json["parallelism"]["shared_groups"], 1);
-    assert_eq!(json["tests"][0]["isolation"], "shared");
-    assert_eq!(json["tests"][0]["shared_atoms"][0], "cell.write[users]");
-    assert_eq!(json["tests"][1]["isolation"], "shared");
-    assert_eq!(json["tests"][1]["shared_atoms"][1], "db.write[ledger]");
-    assert_eq!(json["tests"][2]["isolation"], "region");
-    assert_eq!(
-        json["tests"][2]["shared_atoms"].as_array().unwrap().len(),
-        0
-    );
-
-    for (index, test) in program.check.tests.iter().enumerate() {
-        let reported = json["tests"][index]["isolation"].as_str().unwrap();
-        let expected = if ply_test::region_isolated(&test.footprint) {
-            "region"
-        } else {
-            "shared"
-        };
-        assert_eq!(
-            reported, expected,
-            "test {index} disagrees with its footprint"
-        );
-    }
-
-    let lines = selection.explain(&program.check, &program.hashes);
-    assert!(
-        lines.iter().any(|l| l.starts_with("isolated: 2 of 4")),
-        "{lines:#?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("isolation: shared {cell.write[users]} (region labels)")),
-        "a test that contends only over a label must say so: {lines:#?}"
-    );
-    assert!(
-        lines.iter().any(|l| l
-            .contains("isolation: shared {cell.write[orders], db.write[ledger]}")
-            && !l.contains("(region labels)")),
-        "a test that also reaches a real resource must not be blamed on its label: {lines:#?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("1 of the 2 contend only over a region label")),
-        "the cost of losing the fork is reported per run: {lines:#?}"
-    );
-
-    let mut store = root.store();
-    let summary = program.run(&selection, &mut store).summary();
-    assert!(
-        summary.iter().any(|l| l == "isolated: 2 of 4"),
-        "{summary:#?}"
-    );
-}
-
-#[test]
-fn every_group_is_run_in_sequence() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(ARITHMETIC);
-
-    let mut selection = program.select(&store);
-    selection.groups = vec![vec![0], vec![1, 2]];
-    let report = program.run(&selection, &mut store);
-    assert_eq!(report.passed, 3);
-    assert_eq!(report.results.iter().filter(|r| r.group == 0).count(), 1);
-    assert_eq!(report.results.iter().filter(|r| r.group == 1).count(), 2);
-}
-
-#[test]
-fn the_attribution_covers_exactly_the_suspect_set() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-
-    let green = Program::compile(LEDGER);
-    let selection = green.select(&store);
-    assert_eq!(green.run(&selection, &mut store).failed, 0);
-
-    let red = Program::compile(&LEDGER.replace(
-        "fn debit(balance: Int, amount: Int) -> Int = balance - amount",
-        "fn debit(balance: Int, amount: Int) -> Int = balance - amount - 1",
-    ));
-    let selection = red.select(&store);
-    let report = red.run(&selection, &mut store);
-
-    let failure = &report.failures[0];
-    let mut rich: Vec<&str> = failure
-        .attribution
-        .suspects
-        .iter()
-        .map(|s| s.name.as_str())
-        .collect();
-    rich.sort_unstable();
-    let flat: Vec<&str> = failure.suspects.iter().map(|s| s.as_str()).collect();
-    assert_eq!(rich, flat);
-    assert!(
-        failure
-            .attribution
-            .suspects
-            .iter()
-            .all(|s| s.hash.is_some())
-    );
-    // Nothing traced yet, so every judgement is withheld.
-    assert!(failure.attribution.suspects.iter().all(|s| s.ran.is_none()));
-    assert!(failure.attribution.slice.is_none());
-}
-
-#[test]
-fn a_run_that_did_not_bisect_says_so_rather_than_naming_nobody() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program =
-        Program::compile(&LEDGER.replace("assert_eq(settle(0), 6)", "assert_eq(settle(0), 7)"));
-    let selection = program.select(&store);
-    let report = program.run(&selection, &mut store);
-
-    let bisection = &report.failures[0].attribution.bisection;
-    assert_eq!(
-        bisection.verdict,
-        ply_test::Verdict::NotAttempted(ply_test::Skipped::NotRequested)
-    );
-    assert_eq!(bisection.confidence, ply_test::Confidence::None);
-    assert!(bisection.culprits().is_empty());
-    assert!(!bisection.is_conclusive());
-}
-
-#[test]
-fn resolving_an_attribution_ranks_the_culprit_first_and_marks_what_ran() {
-    use ply_test::bisect::{Bisection, Confidence, SearchStats, Verdict};
-    use ply_test::slice::{CausalSlice, Entered, Frame};
-
-    let hashes = HashOutput::default();
-    let names = [
-        Symbol::new("m.formats"),
-        Symbol::new("m.debit"),
-        Symbol::new("m.settle"),
-    ];
-    let mut attribution = ply_test::Attribution::from_suspects(&names, &hashes);
-
-    let frame = |name: &str| Frame {
-        name: Symbol::new(name),
-        hash: None,
-        call_site: ply_span::Span::new(SourceId(0), 0, 1),
-    };
-    let slice = CausalSlice {
-        traced: true,
-        reproduced: true,
-        entered: ["m.settle", "m.debit"]
-            .iter()
-            .map(|n| Entered {
-                name: Symbol::new(n),
-                hash: None,
-                calls: 1,
-            })
-            .collect(),
-        stack: vec![frame("m.settle"), frame("m.debit")],
-        observed: Footprint::empty(),
-        truncated: false,
-    };
-    attribution.resolve(
-        Bisection {
-            verdict: Verdict::Bisected,
-            confidence: Confidence::Minimal,
-            groups: vec![vec![Symbol::new("m.debit")]],
-            reason: "narrowed 3 changed definitions to m.debit".into(),
-            search: SearchStats::default(),
-        },
-        Some(slice),
-    );
-
-    let order: Vec<&str> = attribution
-        .suspects
-        .iter()
-        .map(|s| s.name.as_str())
-        .collect();
-    assert_eq!(order, ["m.debit", "m.settle", "m.formats"]);
-    assert!(attribution.suspects[0].culprit);
-    assert_eq!(attribution.suspects[0].depth, Some(0));
-    assert_eq!(attribution.suspects[1].depth, Some(1));
-    assert_eq!(attribution.suspects[2].ran, Some(false));
-    assert_eq!(attribution.culprits(), vec![Symbol::new("m.debit")]);
-}
-
-#[test]
-fn a_culprit_outside_the_suspect_set_is_added_rather_than_dropped() {
-    let mut attribution =
-        ply_test::Attribution::from_suspects(&[Symbol::new("m.a")], &HashOutput::default());
-    attribution.resolve(
-        ply_test::Bisection {
-            verdict: ply_test::Verdict::Bisected,
-            confidence: ply_test::Confidence::Minimal,
-            groups: vec![vec![Symbol::new("m.z")]],
-            reason: String::new(),
-            search: ply_test::SearchStats::default(),
-        },
-        None,
-    );
-    let names: Vec<&str> = attribution
-        .suspects
-        .iter()
-        .map(|s| s.name.as_str())
-        .collect();
-    assert_eq!(names, ["m.z", "m.a"]);
-    assert!(attribution.suspects[0].culprit);
-}
-
-#[test]
-fn the_summary_leads_with_the_culprit_and_the_artifact_carries_the_verdict() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program =
-        Program::compile(&LEDGER.replace("assert_eq(settle(0), 6)", "assert_eq(settle(0), 7)"));
-    let selection = program.select(&store);
-    let mut report = program.run(&selection, &mut store);
-
-    report.failures[0].attribution.resolve(
-        ply_test::Bisection {
-            verdict: ply_test::Verdict::Bisected,
-            confidence: ply_test::Confidence::Minimal,
-            groups: vec![vec![Symbol::new("debit")]],
-            reason: "narrowed 2 changed definitions to debit in 2 runs (1 answered from the cache)"
-                .into(),
-            search: ply_test::SearchStats {
-                evaluated: 2,
-                cached: 1,
-                ..Default::default()
-            },
-        },
-        None,
-    );
-
-    let summary = report.summary();
-    let culprit = summary
-        .iter()
-        .position(|l| l.contains("culprit: debit"))
-        .expect("a culprit line");
-    let diff = summary
-        .iter()
-        .position(|l| l.contains("expected 7"))
-        .expect("the assertion line");
-    assert!(
-        culprit < diff,
-        "the culprit must come before the diff:\n{summary:#?}"
-    );
-
-    let json = report.to_json();
-    assert_eq!(json["schema_version"], ply_test::report::SCHEMA_VERSION);
-    let failure = &json["failures"][0];
-    assert_eq!(failure["culprit"]["verdict"], "bisected");
-    assert_eq!(failure["culprit"]["confidence"], "minimal");
-    assert_eq!(
-        failure["culprit"]["definitions"],
-        serde_json::json!(["debit"])
-    );
-    assert_eq!(failure["culprit"]["search"]["evaluated"], 2);
-    assert_eq!(failure["culprit"]["skipped"], serde_json::Value::Null);
-    assert!(failure["causal_slice"].is_null());
-    assert!(failure["assertion"].is_null());
-}
-
-use ply_eval::{Exploration, Naive, Race, RaceSite, Seed};
 
 /// Reports a search without running one.
 struct SimExecutor {
@@ -1746,14 +915,10 @@ fn failed_at(seed: Seed, explored: u32) -> Exploration {
 /// Injects the seed atom; none of the rules below depend on the source that produced it.
 fn make_seeded(program: &mut Program, name: &str) -> usize {
     let index = program.index_of(name);
-    program.check.tests[index].footprint =
-        program.check.tests[index]
-            .footprint
-            .union(&Footprint::from_atoms([atom(
-                ply_test::SIM_EFFECT,
-                None,
-                Mode::Read,
-            )]));
+    let seed = EffectAtom::new("sim", Resource::Singleton, Mode::Read);
+    program.check.tests[index].footprint = program.check.tests[index]
+        .footprint
+        .union(&Footprint::from_atoms([seed]));
     index
 }
 
@@ -1763,14 +928,41 @@ fn seeded_program() -> (Program, usize) {
     (program, index)
 }
 
+/// Every test runs under `plan`, a seeded one's pass filed under the plan's key and, when the plan
+/// is answered root by root, each root's too; the rest under their own hashes.
+fn seeded_choice(program: &Program, seeded: &[usize], plan: &Plan, per_root: bool) -> Selection {
+    let plan = plan.clone().normalized();
+    let runs: Vec<usize> = (0..program.check.tests.len()).collect();
+    let filed = runs
+        .iter()
+        .map(|&i| {
+            let hash = program.hashes.tests[i];
+            let keys = if !seeded.contains(&i) {
+                vec![hash]
+            } else if per_root {
+                plan.roots
+                    .iter()
+                    .map(|&r| root_key(hash, r))
+                    .chain([plan_key(hash, &plan)])
+                    .collect()
+            } else {
+                vec![plan_key(hash, &plan)]
+            };
+            (i, keys)
+        })
+        .collect();
+    handed(&program.check, &plan, &runs, BTreeMap::new(), filed)
+}
+
 #[test]
-fn widening_a_random_root_set_runs_only_the_roots_nothing_answered_for() {
+fn a_narrowed_choice_searches_only_the_roots_it_owes_and_files_the_widened_plan() {
     let root = TempRoot::new();
     let mut store = root.store();
     let (program, seeded) = seeded_program();
+    let hash = program.hashes.tests[seeded];
 
     let four = Plan::random(4);
-    let selection = program.select_under(&store, &four);
+    let selection = seeded_choice(&program, &[seeded], &four, true);
     let executor = SimExecutor::new(&selection).exploring(seeded, exhaustive(4));
     run_with(
         &selection,
@@ -1783,15 +975,26 @@ fn widening_a_random_root_set_runs_only_the_roots_nothing_answered_for() {
         executor.searched(seeded).map(|p| p.roots),
         Some(vec![0, 1, 2, 3])
     );
+    for r in 0..4 {
+        assert!(passed(&store, root_key(hash, r)), "root {r}'s own key");
+    }
 
+    // The first four roots each hold a pass of their own, so widening to eight owes the rest.
     let eight = Plan::random(8);
-    let widened = program.select_under(&store, &eight);
-    assert_eq!(widened.to_run, vec![seeded]);
-    assert_eq!(
-        widened.plan_for(seeded).roots,
-        vec![4, 5, 6, 7],
-        "the first four roots each hold a pass of their own"
+    let owed: Vec<u64> = vec![4, 5, 6, 7];
+    let keys: Vec<DefHash> = owed
+        .iter()
+        .map(|&r| root_key(hash, r))
+        .chain([plan_key(hash, &eight)])
+        .collect();
+    let widened = handed(
+        &program.check,
+        &eight,
+        &[seeded],
+        BTreeMap::from([(seeded, owed.clone())]),
+        BTreeMap::from([(seeded, keys)]),
     );
+    assert_eq!(widened.plan_for(seeded).roots, owed);
 
     let executor = SimExecutor::new(&widened).exploring(seeded, exhaustive(4));
     run_with(
@@ -1803,21 +1006,23 @@ fn widening_a_random_root_set_runs_only_the_roots_nothing_answered_for() {
     );
     assert_eq!(
         executor.searched(seeded).map(|p| p.roots),
-        Some(vec![4, 5, 6, 7]),
+        Some(owed),
         "the run must search only what it owes"
     );
-    // The widened plan's key is published even though only half the roots ran.
-    assert!(program.select_under(&store, &eight).to_run.is_empty());
+    assert!(
+        passed(&store, plan_key(hash, &eight)),
+        "the widened plan's key is filed even though only half its roots ran"
+    );
 }
 
 #[test]
-fn an_exhausted_search_reports_green_writes_nothing_and_re_runs() {
+fn an_exhausted_search_reports_green_and_writes_nothing() {
     let root = TempRoot::new();
     let mut store = root.store();
     let (program, seeded) = seeded_program();
     let plan = Plan::default();
 
-    let selection = program.select_under(&store, &plan);
+    let selection = seeded_choice(&program, &[seeded], &plan, false);
     let executor = SimExecutor::new(&selection).exploring(seeded, spent(256));
     let report = run_with(
         &selection,
@@ -1840,9 +1045,8 @@ fn an_exhausted_search_reports_green_writes_nothing_and_re_runs() {
 
     let hash = program.hashes.tests[seeded];
     assert!(store.get(hash).is_none());
-    assert!(store.get(crate::fixture::plan_key(hash, &plan)).is_none());
-    assert_eq!(program.select_under(&store, &plan).to_run, vec![seeded]);
-    assert!(report.simulation.line().unwrap().contains("not cached"));
+    assert!(store.get(plan_key(hash, &plan)).is_none());
+    assert_eq!(report.simulation.exhausted, 1);
 }
 
 #[test]
@@ -1853,7 +1057,7 @@ fn a_simulated_failure_is_never_cached_under_any_key() {
     let plan = Plan::random(2);
     let seed = Seed::at(0, vec![1, 0, 3]);
 
-    let selection = program.select_under(&store, &plan);
+    let selection = seeded_choice(&program, &[seeded], &plan, true);
     let executor = SimExecutor::new(&selection)
         .exploring(seeded, failed_at(seed.clone(), 47))
         .failing(seeded);
@@ -1868,38 +1072,33 @@ fn a_simulated_failure_is_never_cached_under_any_key() {
     assert_eq!(report.failed, 1);
     let hash = program.hashes.tests[seeded];
     assert!(store.get(hash).is_none());
-    assert!(store.get(crate::fixture::plan_key(hash, &plan)).is_none());
+    assert!(store.get(plan_key(hash, &plan)).is_none());
     for root in &plan.roots {
-        assert!(store.get(crate::fixture::root_key(hash, *root)).is_none());
+        assert!(store.get(root_key(hash, *root)).is_none());
     }
-    assert_eq!(program.select_under(&store, &plan).to_run, vec![seeded]);
 }
 
 #[test]
-fn a_failure_carries_the_seed_that_replays_it() {
+fn a_failure_carries_the_seed_and_the_race_that_explain_it() {
     let root = TempRoot::new();
     let mut store = root.store();
     let (program, seeded) = seeded_program();
     let seed = Seed::at(0, vec![1, 0, 3]);
+    let site = |task: u32| RaceSite {
+        task: ply_eval::TaskId(task),
+        definition: Some(Symbol::new("apply_debit")),
+        access: "db.write[accounts]".into(),
+        span: ply_span::Span::DUMMY,
+    };
 
-    let selection = program.select_under(&store, &Plan::default());
+    let selection = seeded_choice(&program, &[seeded], &Plan::default(), false);
     let executor = SimExecutor::new(&selection)
         .exploring(
             seeded,
             Exploration {
                 race: Some(Race {
-                    left: RaceSite {
-                        task: ply_eval::TaskId(1),
-                        definition: Some(Symbol::new("apply_debit")),
-                        access: "db.write[accounts]".into(),
-                        span: ply_span::Span::DUMMY,
-                    },
-                    right: RaceSite {
-                        task: ply_eval::TaskId(2),
-                        definition: Some(Symbol::new("apply_debit")),
-                        access: "db.write[accounts]".into(),
-                        span: ply_span::Span::DUMMY,
-                    },
+                    left: site(1),
+                    right: site(2),
                     at: 3,
                 }),
                 ..failed_at(seed.clone(), 47)
@@ -1917,30 +1116,12 @@ fn a_failure_carries_the_seed_that_replays_it() {
     let failure = &report.failures[0];
     assert_eq!(failure.seed, Some(seed));
     assert_eq!(
-        failure.replay().unwrap(),
-        "ply test --seed 0:1.0.3 --filter \"mul is right\""
-    );
-
-    let summary = report.summary();
-    assert!(summary.iter().any(|l| l.contains("seed: 0:1.0.3")));
-    assert!(summary.iter().any(|l| l.contains("race: @1")));
-    assert!(summary.iter().any(|l| l.contains("@2")));
-    let replay = summary
-        .iter()
-        .position(|l| l.contains("replay: ply test --seed 0:1.0.3"))
-        .expect("the artifact prints the command rather than describing it");
-    assert!(replay > 0);
-
-    let json = report.to_json();
-    assert_eq!(json["schema_version"], 4);
-    assert_eq!(json["failures"][0]["seed"], "0:1.0.3");
-    assert_eq!(json["failures"][0]["race"]["left"]["task"], "@1");
-    assert_eq!(json["failures"][0]["race"]["at"], 3);
-    assert!(
-        json["failures"][0]["replay"]
-            .as_str()
-            .unwrap()
-            .contains("--seed 0:1.0.3")
+        failure.race,
+        Some(Race {
+            left: site(1),
+            right: site(2),
+            at: 3,
+        })
     );
 }
 
@@ -1949,19 +1130,12 @@ fn an_unsimulated_failure_carries_no_seed_and_no_race() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ONE_RED);
-    let selection = program.select(&store);
-    let report = program.run(&selection, &mut store);
+    let report = program.run(&program.every(), &mut store);
 
     assert_eq!(report.failed, 1);
     assert_eq!(report.failures[0].seed, None);
     assert_eq!(report.failures[0].race, None);
-    assert!(report.failures[0].replay().is_none());
-    assert!(!report.summary().iter().any(|l| l.contains("replay:")));
-
-    let json = report.to_json();
-    assert!(json["failures"][0]["seed"].is_null());
-    assert!(json["failures"][0]["race"].is_null());
-    assert!(json["simulation"]["simulated"] == 0);
+    assert_eq!(report.simulation.simulated, 0);
 }
 
 #[test]
@@ -1971,7 +1145,7 @@ fn a_seeded_test_with_no_observed_search_warns_and_is_not_cached() {
     let (program, seeded) = seeded_program();
     let plan = Plan::default();
 
-    let selection = program.select_under(&store, &plan);
+    let selection = seeded_choice(&program, &[seeded], &plan, false);
     let executor = SimExecutor::new(&selection);
     let report = run_with(
         &selection,
@@ -1984,10 +1158,7 @@ fn a_seeded_test_with_no_observed_search_warns_and_is_not_cached() {
     assert_eq!(report.failed, 0);
     assert!(
         store
-            .get(crate::fixture::plan_key(
-                program.hashes.tests[seeded],
-                &plan
-            ))
+            .get(plan_key(program.hashes.tests[seeded], &plan))
             .is_none()
     );
     assert_eq!(
@@ -2000,7 +1171,6 @@ fn a_seeded_test_with_no_observed_search_warns_and_is_not_cached() {
     );
     assert_eq!(report.warnings.len(), 1);
     assert!(report.warnings[0].message.contains("reported no search"));
-    assert_eq!(program.select_under(&store, &plan).to_run, vec![seeded]);
 }
 
 #[test]
@@ -2012,7 +1182,7 @@ fn the_summary_counts_the_seeds_the_interleavings_and_the_exhaustive_searches() 
     let two = make_seeded(&mut program, "twice is right");
     let plan = Plan::random(4);
 
-    let selection = program.select_under(&store, &plan);
+    let selection = seeded_choice(&program, &[one, two], &plan, true);
     let executor = SimExecutor::new(&selection)
         .exploring(one, exhaustive(12))
         .exploring(two, spent(256));
@@ -2032,42 +1202,44 @@ fn the_summary_counts_the_seeds_the_interleavings_and_the_exhaustive_searches() 
     assert_eq!(summary.exhaustive, 1);
     assert_eq!(summary.exhausted, 1);
 
-    let json = report.to_json();
-    assert_eq!(json["simulation"]["seeds"], 8);
-    assert_eq!(json["simulation"]["interleavings"], 268);
-    let simulated = json["tests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["index"] == one)
-        .expect("reported");
-    assert_eq!(simulated["simulation"]["explored"], 12);
-    assert_eq!(simulated["simulation"]["exhaustive"], true);
-    assert_eq!(simulated["cached"], true);
+    let result = |index: usize| {
+        report
+            .results
+            .iter()
+            .find(|r| r.index == index)
+            .expect("reported")
+    };
+    let searched = result(one).simulation.as_ref().expect("a search");
+    assert_eq!((searched.explored, searched.exhaustive), (12, true));
+    assert!(
+        result(one)
+            .recorded
+            .as_ref()
+            .is_some_and(|r| r.is_written())
+    );
     // Absent, never zeroed: zero explored is not the same as never simulated.
-    let plain = json["tests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["index"] == program.index_of("add is right"))
-        .expect("reported");
-    assert!(plain["simulation"].is_null());
+    assert!(
+        result(program.index_of("add is right"))
+            .simulation
+            .is_none()
+    );
 }
 
 #[test]
-fn a_measured_reduction_is_reported_and_a_spent_naive_budget_is_a_lower_bound() {
+fn a_measured_reduction_is_carried_on_the_result_and_a_spent_naive_budget_is_a_lower_bound() {
     let root = TempRoot::new();
     let mut store = root.store();
     let (program, seeded) = seeded_program();
 
-    let selection = program.select_under(&store, &Plan::default());
+    let selection = seeded_choice(&program, &[seeded], &Plan::default(), false);
+    let naive = Naive {
+        explored: 720,
+        bounded: false,
+    };
     let executor = SimExecutor::new(&selection).exploring(
         seeded,
         Exploration {
-            naive: Some(Naive {
-                explored: 720,
-                bounded: false,
-            }),
+            naive: Some(naive),
             ..exhaustive(12)
         },
     );
@@ -2079,16 +1251,15 @@ fn a_measured_reduction_is_reported_and_a_spent_naive_budget_is_a_lower_bound() 
         &executor,
     );
 
-    let json = report.to_json();
-    let simulated = json["tests"]
-        .as_array()
-        .unwrap()
+    let result = report
+        .results
         .iter()
-        .find(|t| t["index"] == seeded)
+        .find(|r| r.index == seeded)
         .expect("reported");
-    assert_eq!(simulated["simulation"]["naive"]["explored"], 720);
-    assert_eq!(simulated["simulation"]["naive"]["rendered"], "720");
-    assert_eq!(simulated["simulation"]["reduction"], 60.0);
+    assert_eq!(
+        result.simulation.as_ref().and_then(|e| e.naive),
+        Some(naive)
+    );
 
     let bounded = Naive {
         explored: 4096,

@@ -1,5 +1,6 @@
 //! Discharging obligations, and the evidence they are filed and read back under.
 
+use ply_prove::prove::Reach;
 use ply_prove::{
     CaseReport, Certificate, Discharge, Evidence, Obligation, ProvePlan, ProveReport, Rule,
 };
@@ -138,24 +139,25 @@ pub struct Choice {
     pub read: Vec<(usize, DefHash)>,
 }
 
-/// A finite domain, as the program measured it: how many values each binder's type holds, in binder
-/// order, and what the domain is called in an artifact. The runtime materialises a point from these
-/// and walks them itself; whether there are points to walk is not its decision.
+/// A finite domain, as the program measured it: each binder's shape, in binder order, and what the
+/// domain is called in an artifact. The runtime materialises a point from these and walks them
+/// itself; whether there are points to walk, and how many, is not its decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Domain {
-    pub sizes: Vec<u64>,
+    pub shapes: Vec<ply_prove::domain::Shape>,
     pub name: String,
 }
 
 pub trait Discharger: Sync {
     /// `domain` is the program's own measurement of the obligation's binders, or `None` when it
-    /// decided to sample instead.
+    /// decided to sample instead. What the static tier alone answered on the way comes back beside
+    /// the discharge, when it answered at all.
     fn discharge(
         &self,
         obligation: &Obligation,
         plan: &ProvePlan,
         domain: Option<&Domain>,
-    ) -> Discharge;
+    ) -> (Discharge, Option<Reach>);
 }
 
 /// A program's decision, carried out up to what the cache answered, so a discharger is built only
@@ -215,7 +217,7 @@ impl Asked {
             domains,
         } = self;
 
-        let fresh: Vec<(usize, Discharge)> = to_discharge
+        let fresh: Vec<(usize, (Discharge, Option<Reach>))> = to_discharge
             .par_iter()
             .filter(|&&index| index < obligations.len())
             .map(|&index| {
@@ -230,8 +232,10 @@ impl Asked {
             .into_iter()
             .map(|evidence| evidence.map(Discharge::Held))
             .collect();
-        for (index, discharge) in fresh {
+        let mut reaches: Vec<Option<Reach>> = vec![None; discharges.len()];
+        for (index, (discharge, reach)) in fresh {
             discharges[index] = Some(discharge);
+            reaches[index] = reach;
         }
 
         // Every index either came from the cache or was discharged, so no `None` survives.
@@ -250,6 +254,7 @@ impl Asked {
 
         ProveReport {
             obligations: paired,
+            reaches,
             plan,
             duration: started.elapsed(),
         }

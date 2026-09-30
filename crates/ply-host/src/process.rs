@@ -202,6 +202,8 @@ pub struct ProcessHost {
     executables: Executables,
     /// Where a spawn waits, so a driver that starts a compiler does not stop the machine.
     pool: Pool,
+    /// Whether the run is a process of its own; one that is not only starts other programs.
+    whole: bool,
 }
 
 impl ProcessHost {
@@ -212,7 +214,23 @@ impl ProcessHost {
             exit: Mutex::new(None),
             executables: Executables::new(),
             pool: Pool::new(PROCESS_FIRST_TOKEN),
+            whole: true,
         }
+    }
+
+    /// A host for a run that is not itself a process, such as a test: it starts the programs
+    /// `executables` binds, and its arguments, streams, input and exit code stay withheld.
+    pub fn spawning(executables: Executables) -> ProcessHost {
+        ProcessHost {
+            whole: false,
+            ..ProcessHost::new(Vec::new(), Sink::captured())
+        }
+        .executing(executables)
+    }
+
+    /// Whether this host serves `op`, rather than leaving it withheld.
+    pub fn serves(&self, op: Op) -> bool {
+        self.whole || op == Op::Spawn
     }
 
     pub fn executing(self, executables: Executables) -> ProcessHost {
@@ -277,12 +295,13 @@ pub fn registrations(host: Option<&Arc<ProcessHost>>) -> Vec<(HostOp, Arc<dyn Ho
         .collect()
 }
 
-/// Withheld without a host, so a run that was given no arguments never binds a process it is not.
+/// Withheld without a host, so a run that was given no arguments never binds a process it is not;
+/// a host that only spawns withholds everything else.
 pub fn register(registry: &mut HostRegistry, host: Option<&Arc<ProcessHost>>) {
-    for (op, handler) in registrations(host) {
+    for (op, (declared, handler)) in Op::ALL.into_iter().zip(registrations(host)) {
         match host {
-            Some(_) => registry.register(op, handler),
-            None => registry.register_withheld(op, handler),
+            Some(host) if host.serves(op) => registry.register(declared, handler),
+            _ => registry.register_withheld(declared, handler),
         }
     }
 }

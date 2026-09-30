@@ -69,9 +69,9 @@ impl Hosts {
         )
     }
 
-    /// [`Hosts::open`] for a run that listens for a stop and is a process; only `ply run`, so
-    /// ctrl-C ends no test and `process` is withheld from one. `lent` joins the registrations
-    /// this binary compiles in, for an entry whose caller serves an effect of its own.
+    /// [`Hosts::open`] with the rest of what a run may bind: a stop to listen for (only `ply run`, so
+    /// ctrl-C ends no test), a `process` host, and `lent`, the registrations of the families a
+    /// caller serves beside the ones this binary compiles in.
     #[allow(clippy::too_many_arguments)]
     pub fn open_stopping(
         check: &CheckOutput,
@@ -291,33 +291,6 @@ where
     match runtime {
         Some(factory) => hosting.with_runtime(factory),
         None => hosting,
-    }
-}
-
-/// How the corpus splits once the binding is taken into account.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Counts {
-    pub total: usize,
-    pub isolated: usize,
-    pub shared: usize,
-    pub host: usize,
-}
-
-impl Counts {
-    /// `tests` pairs each footprint with whether it classified as region-isolated.
-    pub fn of<'a>(hosts: &Hosts, tests: impl IntoIterator<Item = (&'a Footprint, bool)>) -> Counts {
-        let mut counts = Counts::default();
-        for (footprint, isolated) in tests {
-            counts.total += 1;
-            if hosts.reaches(footprint) {
-                counts.host += 1;
-            } else if isolated {
-                counts.isolated += 1;
-            } else {
-                counts.shared += 1;
-            }
-        }
-        counts
     }
 }
 

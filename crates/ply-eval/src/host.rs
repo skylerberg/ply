@@ -761,14 +761,20 @@ pub fn err_withheld(
         .rsplit_once('.')
         .map(|(module, _)| module.to_string())
         .unwrap_or_else(|| effect.to_string());
+    // A test is no process, but it may start the programs `--exec` names.
+    let withheld = if path == "ply_host::process::spawn" {
+        format!("`{path}` serves this under `--host` for a label `--exec` binds to a program")
+    } else {
+        format!(
+            "`{path}` serves this under `ply run --host`, and `ply test` withholds it whether or not `--host` was passed"
+        )
+    };
     Diagnostic::error(
         codes::HERMETIC_BOUNDARY,
         format!("`{operation}` reached the host boundary in a run that binds no handler for it"),
     )
     .primary(span, "no handler here, and this run bound none")
-    .note(format!(
-        "`{path}` serves this under `ply run --host`, and `ply test` withholds it whether or not `--host` was passed"
-    ))
+    .note(withheld)
     .note(format!(
         "handle `{operation}` over `{module}`'s twin, which is what makes a test that reads it `det`, cached and hermetic"
     ))

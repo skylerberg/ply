@@ -1,8 +1,7 @@
 use crate::fixture::Compiled;
-use ply_eval::Plan;
 use ply_span::{Diagnostic, Severity, SourceId, Span, codes};
 use ply_store::Store;
-use ply_test::{Executor, RunReport, Skipped, Status, Verdict, run_with};
+use ply_test::{Executor, RunReport, Status, run_with};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -64,10 +63,8 @@ fn report_for(executor: &Answering) -> RunReport {
     let root = TempRoot::new();
     let mut store = root.store();
     let compiled = Compiled::anonymous(CORPUS);
-    let selection =
-        crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     run_with(
-        &selection,
+        &compiled.every(),
         &compiled.check,
         &compiled.hashes,
         &mut store,
@@ -75,7 +72,8 @@ fn report_for(executor: &Answering) -> RunReport {
     )
 }
 
-fn classified(code: &'static str) -> (bool, Status, Verdict) {
+/// The facts the program's gate reads: whether the failure is Ply's, and how the run ended.
+fn classified(code: &'static str) -> (bool, Status) {
     let report = report_for(&Answering {
         diagnostic: Some(
             Diagnostic::error(code, "the fixture's failure")
@@ -84,11 +82,7 @@ fn classified(code: &'static str) -> (bool, Status, Verdict) {
         unwind: false,
     });
     assert_eq!(report.failures.len(), 1, "{code} must produce one failure");
-    (
-        report.failures[0].defect,
-        report.results[0].status,
-        report.failures[0].attribution.bisection.verdict,
-    )
+    (report.failures[0].defect, report.results[0].status)
 }
 
 #[test]
@@ -103,23 +97,17 @@ fn no_program_level_code_is_read_as_a_defect_in_ply() {
         codes::UNKNOWN_NAME,
         codes::UNKNOWN_OPERATION,
     ] {
-        let (defect, status, verdict) = classified(code);
+        let (defect, status) = classified(code);
         assert!(!defect, "{code} was read as a defect in Ply");
         assert_eq!(status, Status::Failed, "{code}");
-        assert_ne!(
-            verdict,
-            Verdict::NotAttempted(Skipped::Panicked),
-            "{code} had its bisection suppressed"
-        );
     }
 }
 
 #[test]
 fn an_internal_error_and_an_unwind_are_both_defects() {
-    let (defect, status, verdict) = classified(codes::INTERNAL_ERROR);
+    let (defect, status) = classified(codes::INTERNAL_ERROR);
     assert!(defect);
     assert_eq!(status, Status::Panicked);
-    assert_eq!(verdict, Verdict::NotAttempted(Skipped::Panicked));
 
     let report = report_for(&Answering {
         diagnostic: None,
@@ -127,10 +115,6 @@ fn an_internal_error_and_an_unwind_are_both_defects() {
     });
     assert!(report.failures[0].defect, "an unwind is a defect");
     assert_eq!(report.results[0].status, Status::Panicked);
-    assert_eq!(
-        report.failures[0].attribution.bisection.verdict,
-        Verdict::NotAttempted(Skipped::Panicked)
-    );
     assert_eq!(
         report.failures[0].diagnostic.code,
         codes::INTERNAL_ERROR,
@@ -157,10 +141,8 @@ fn an_abandoned_run_is_no_verdict_and_is_recorded_nowhere() {
     let root = TempRoot::new();
     let mut store = root.store();
     let compiled = Compiled::anonymous(CORPUS);
-    let selection =
-        crate::fixture::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     let report = run_with(
-        &selection,
+        &compiled.every(),
         &compiled.check,
         &compiled.hashes,
         &mut store,
@@ -184,27 +166,9 @@ fn an_abandoned_run_is_no_verdict_and_is_recorded_nowhere() {
 
 #[test]
 fn a_simulation_divergence_is_a_defect_in_ply() {
-    let (defect, status, verdict) = classified(codes::SIMULATION_DIVERGENCE);
+    let (defect, status) = classified(codes::SIMULATION_DIVERGENCE);
     assert!(defect, "a divergence is Ply's fault, not the program's");
     assert_eq!(status, Status::Panicked);
-    assert_eq!(verdict, Verdict::NotAttempted(Skipped::Panicked));
-}
-
-#[test]
-fn the_panicked_description_still_describes_only_ply_defects() {
-    let described = Skipped::Panicked.describe();
-    assert!(described.contains("defect in Ply"), "{described}");
-    assert!(
-        described.contains("no change in the program explains it"),
-        "{described}"
-    );
-    for code in [codes::RUNTIME_ERROR, codes::ASSERTION_FAILED] {
-        assert_ne!(
-            classified(code).2,
-            Verdict::NotAttempted(Skipped::Panicked),
-            "{code} would be handed a sentence that is false about it"
-        );
-    }
 }
 
 #[test]
