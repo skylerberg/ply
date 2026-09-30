@@ -73,6 +73,14 @@ pub fn lent(family: &str, machine_module: &str) -> Option<Vec<Lent>> {
     })
 }
 
+/// The effect a family's operations are performed under, which is what a program must declare to
+/// be lent it: `claims` lends `prover` and `cache` lends `store`, so the family's name is not it.
+pub fn effect_of(family: &str) -> Option<String> {
+    lent(family, "machine")?
+        .first()
+        .map(|(op, _)| op.effect.to_string())
+}
+
 /// The operations of the named families, or why one of them is not a family.
 pub fn lent_for(families: &[&str], machine_module: &str) -> Result<Vec<Lent>, String> {
     let mut out = Vec::new();

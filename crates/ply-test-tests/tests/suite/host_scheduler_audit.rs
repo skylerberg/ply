@@ -529,7 +529,7 @@ test "a det test over a deterministic host handler" {
     let wanted = mixture.keys();
     let mut hybrid = BodyHybrid::new(&store, &fresh, mixture, test_body, signature);
     // Every definition at its current hash: the mixture as the program is now.
-    let trial = hybrid.trial_over(wanted);
+    let trial = hybrid.trial_over(wanted, None);
 
     assert_eq!(
         counter.calls(),

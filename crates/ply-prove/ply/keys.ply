@@ -6,10 +6,9 @@
 // sit under the obligation's own key. That single rule is why an entry can be read back at all: the
 // reader recomputes the key, and an entry under the wrong one is a refusal rather than a mistake.
 //
-// The plan's own digest is here too, because the two must agree: the runtime digests a plan to
-// decide what a *test* is keyed on, and an obligation's key folds that digest in. The simulation's
-// digest is an input rather than a re-derivation — it is the test package's own encoding, and one
-// place should own it.
+// This is the only encoding of them: the runtime reads and writes evidence under the keys the program
+// hands it. The simulation's digest is an input rather than a re-derivation — it is the test package's
+// own encoding, and one place owns it.
 
 import std.bytes (bytes_of_hex, hex_of, u32_le, u64_le)
 import std.hash (blake3)
@@ -21,26 +20,43 @@ pub fn plan_domain() -> Bytes = b"ply.prove.key.1"
 pub fn digest_domain() -> Bytes = b"ply.prove.plan.1"
 
 // The digest of everything that makes a discharge the one it is: the cases, the budgets, the roots,
-// and the simulation the cases were drawn from. `sim_digest` is the runtime's own digest of that
-// plan, which the test package computes for the search a seeded test is keyed on.
+// and the simulation the cases were drawn from. `sim_digest` is that simulation's own digest, which
+// the test package computes for the search a seeded test is keyed on. The shrink budget is not in it:
+// a failure is never cached, so it cannot change a cached claim.
 pub fn plan_digest(
   cases: Int,
   prove_budget: Int,
   step_budget: Int,
   roots: List<Int>,
   sim_digest: Bytes,
-) -> Bytes =
+) -> Bytes = {
+  // Two spellings of one root set are one plan.
+  let normal = sorted_ints(roots);
   blake3(
     bytes_concat_all([
       digest_domain(),
       u32_le(cases),
       u32_le(prove_budget),
       i64_le(step_budget),
-      u32_le(len(roots)),
-      bytes_concat_all(map(roots, u64_le)),
+      u32_le(len(normal)),
+      bytes_concat_all(map(normal, u64_le)),
       sim_digest,
     ]),
   )
+}
+
+fn sorted_ints(xs: List<Int>) -> List<Int> =
+  fold(xs, [], |acc: List<Int>, x: Int| {
+    if fold(acc, false, |found: Bool, y: Int| found || y == x) { acc } else {
+      let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+        if i < len(acc) { i } else if x < nth(acc, j) { j } else { i });
+      let before = map(range(0, at), |j: Int| nth(acc, j));
+      fold(range(at, len(acc)), push(before, x), |out: List<Int>, j: Int| push(out, nth(acc, j)))
+    }
+  })
+
+fn nth(xs: List<Int>, i: Int) -> Int =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list holds") }
 
 // The key everything weaker than a proof is filed under.
 pub fn prove_key(key: Bytes, plan_digest: Bytes) -> Bytes =
@@ -57,38 +73,70 @@ fn i64_le(n: Int) -> Bytes =
 
 // --- Tests ------------------------------------------------------------------
 //
-// The expectations are the runtime's own keys for one fixed plan, printed from a scratch run against
-// it. A key is the only thing standing between two eras of a proof, so it is pinned whole.
+// A key is the only thing standing between two eras of a proof, so it is pinned whole: the bytes
+// every obligation cache already written holds.
 
 fn a_hash() -> Bytes =
   bytes_of_hex("1111111111111111111111111111111111111111111111111111111111111111")
 
+fn sevens() -> Bytes =
+  bytes_of_hex("0707070707070707070707070707070707070707070707070707070707070707")
+
+// The default simulation's digest.
 fn sim() -> Bytes = bytes_of_hex("3fd52dde1cf3697764f69bc85a2f911e96beccbee26bd7961190b298f4694469")
 
+// The default plan: 200 cases from root 0, a budget of 10000, a step bound of 1000000000.
 fn the_plan() -> Bytes = plan_digest(200, 10000, 1000000000, [0], sim())
 
-test "a plan's digest is the fields the runtime digests, in its order" {
-  assert_eq(hex_of(the_plan()), "9ed1cdc7058a8c37ab8a26b8058dfaef51440f94f29b3c57d33074ab9bc118a0")
+test "a plan's digest is the fields a cached discharge was keyed on, in their order" {
+  assert_eq(hex_of(the_plan()), "9ed1cdc7058a8c37ab8a26b8058dfaef51440f94f29b3c57d33074ab9bc118a0");
+  assert_eq(
+    hex_of(prove_key(sevens(), the_plan())),
+    "d5f153c294a0df9a1b74ce1142aa99ce6779d0a9e612ef67a3e2086be3a06ee7",
+  )
 }
 
 test "a key is the domain, the obligation, and the plan it was discharged under" {
   assert_eq(
     hex_of(prove_key(a_hash(), the_plan())),
     "d0a5aa5c92cc239f36b4a2fcf96ba09d0eceb86dd501ebef8e341825c1d0a16d",
-  )
+  );
+  // And it separates obligations.
+  assert(prove_key(a_hash(), the_plan()) != prove_key(sevens(), the_plan()))
 }
 
-test "only a proof sits under the obligation's own key" {
+test "only a proof sits under the obligation's own key, whatever the plan" {
   assert_eq(hex_of(result_key(a_hash(), true, the_plan())), hex_of(a_hash()));
+  let wide = plan_digest(1600, 10000, 1000000000, [0, 1, 2, 3], sim());
+  assert_eq(result_key(a_hash(), true, wide), a_hash());
   // A sample — any tier but a proof — is filed under the plan's key instead.
   assert_eq(
     hex_of(result_key(a_hash(), false, the_plan())),
     "d0a5aa5c92cc239f36b4a2fcf96ba09d0eceb86dd501ebef8e341825c1d0a16d",
-  )
+  );
+  assert(result_key(a_hash(), false, the_plan()) != a_hash())
 }
 
-test "a moved plan moves the key" {
-  let other = plan_digest(200, 10000, 1000000000, [0, 1], sim());
-  assert_eq(hex_of(other) == hex_of(the_plan()), false);
-  assert_eq(hex_of(prove_key(a_hash(), other)) == hex_of(prove_key(a_hash(), the_plan())), false)
+test "two spellings of one root set are one plan, and every other field moves the key" {
+  assert_eq(
+    hex_of(plan_digest(200, 10000, 1000000000, [2, 0, 2, 1], sim())),
+    "3d5ee17a457ddecef2231d7ecb826e49b830d53dc97e1ee1f5248e1033b5c5ea",
+  );
+  assert_eq(
+    plan_digest(200, 10000, 1000000000, [2, 0, 2, 1], sim()),
+    plan_digest(200, 10000, 1000000000, [0, 1, 2], sim()),
+  );
+  let moved = [
+    plan_digest(400, 10000, 1000000000, [0], sim()),
+    plan_digest(200, 20000, 1000000000, [0], sim()),
+    plan_digest(200, 10000, 4000000000, [0], sim()),
+    plan_digest(200, 10000, 1000000000, [0, 1], sim()),
+    plan_digest(200, 10000, 1000000000, [0], sevens()),
+  ];
+  assert_eq(len(filter(moved, |d: Bytes| d == the_plan())), 0);
+  assert_eq(len(filter(moved, |d: Bytes| len(filter(moved, |o: Bytes| o == d)) == 1)), len(moved));
+  assert_eq(
+    len(filter(moved, |d: Bytes| prove_key(a_hash(), d) == prove_key(a_hash(), the_plan()))),
+    0,
+  )
 }
