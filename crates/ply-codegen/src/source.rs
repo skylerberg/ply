@@ -104,7 +104,7 @@ impl Tables {
 }
 
 /// The prelude's constructors, then each module's in program order, as the compiler emits them:
-/// not `CheckOutput::ctors`' dependency order, or emitted tags would move with the import graph.
+/// not the checker's dependency order, or emitted tags would move with the import graph.
 fn ctors_of(front: &Front) -> Vec<(Symbol, usize)> {
     front.emitter_ctors.clone()
 }

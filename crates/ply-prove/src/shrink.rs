@@ -1,11 +1,12 @@
 //! Shrinking a counterexample.
 
-use crate::property::{HARD_GEN_DEPTH, TypeWorld, Ungeneratable, const_fn, fn_size};
+use crate::property::{HARD_GEN_DEPTH, Ungeneratable, const_fn, fn_size};
+use crate::sort::Sort;
+use crate::world::World;
 use ply_eval::IntTy;
 use ply_eval::{Decimal, Fixed, List, Value};
 use ply_eval::{SECRET, TASK_TYPE};
 use ply_span::Symbol;
-use ply_ty::Type;
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::BTreeMap;
@@ -19,7 +20,7 @@ pub enum Target {
 }
 
 /// A saturating structural measure, and the reason the walk terminates.
-pub fn size(value: &Value, world: &TypeWorld) -> u64 {
+pub fn size(value: &Value, world: &World) -> u64 {
     let mut total: u64 = 0;
     let mut pending: Vec<&Value> = vec![value];
     while let Some(v) = pending.pop() {
@@ -52,7 +53,7 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
             }
             Value::Ctor { name, args } => {
                 pending.extend(args.iter());
-                let index = world.ctor(name).map(|(_, i)| i).unwrap_or(0) as u64;
+                let index = world.ctor(name).map_or(0, |c| c.variant.index) as u64;
                 1u64.saturating_add(index).saturating_add(args.len() as u64)
             }
             // Only closures this crate generated carry a size.
@@ -98,38 +99,29 @@ fn int_size(n: i64) -> u64 {
 }
 
 /// The smallest value of a type: the shrinker's floor.
-pub fn minimal(ty: &Type, world: &TypeWorld) -> Result<Value, Ungeneratable> {
-    minimal_at(ty, world, 0)
+pub fn minimal(sort: &Sort, world: &World) -> Result<Value, Ungeneratable> {
+    minimal_at(sort, world, 0)
 }
 
-fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungeneratable> {
+fn minimal_at(sort: &Sort, world: &World, depth: u32) -> Result<Value, Ungeneratable> {
     if depth >= HARD_GEN_DEPTH {
         return Err(Ungeneratable::TooDeep);
     }
-    match ty {
-        Type::Var(_) => Ok(Value::Int(0)),
-        Type::Record(fields) => {
+    match sort {
+        Sort::Var(_) => Ok(Value::Int(0)),
+        Sort::Record(fields) => {
             let mut out = BTreeMap::new();
             for (name, field) in fields {
                 out.insert(name.clone(), minimal_at(field, world, depth + 1)?);
             }
             Ok(Value::Record(Arc::new(out.into_iter().collect())))
         }
-        Type::Fn {
-            params,
-            ret,
-            effects,
-        } => {
-            if effects.tail.is_some() {
-                return Err(Ungeneratable::RowVariable);
-            }
-            if !effects.atoms.is_empty() {
-                return Err(Ungeneratable::Effectful(effects.clone()));
-            }
+        Sort::Fn { pure: false, .. } => Err(Ungeneratable::Effectful),
+        Sort::Fn { params, ret, .. } => {
             let value = minimal_at(ret, world, depth + 1)?;
             Ok(const_fn(params.len(), value))
         }
-        Type::Con(name, args) => match name.as_str() {
+        Sort::Con(name, args) => match name.as_str() {
             "Int" => Ok(Value::Int(0)),
             n if IntTy::from_name(n).is_some() => Ok(Value::Fixed(Fixed::new(
                 IntTy::from_name(n).expect("just checked"),
@@ -161,12 +153,12 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
     }
 }
 
-fn shallowest(name: &Symbol, args: &[Type], world: &TypeWorld) -> Option<(Symbol, Vec<Type>)> {
+fn shallowest(name: &Symbol, args: &[Sort], world: &World) -> Option<(Symbol, Vec<Sort>)> {
     let variants = world.variants(name)?;
     variants
         .iter()
         .filter_map(|v| {
-            let fields = world.fields(name, v, args);
+            let fields = world.fields(v, args);
             let usable = fields
                 .iter()
                 .all(|f| crate::property::generatable(f, world).is_ok());
@@ -177,15 +169,15 @@ fn shallowest(name: &Symbol, args: &[Type], world: &TypeWorld) -> Option<(Symbol
 }
 
 /// Candidates for one value, in the order two runs must agree on.
-pub fn candidates(value: &Value, ty: &Type, world: &TypeWorld) -> Vec<Value> {
-    candidates_at(value, ty, world, 0)
+pub fn candidates(value: &Value, sort: &Sort, world: &World) -> Vec<Value> {
+    candidates_at(value, sort, world, 0)
 }
 
-fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec<Value> {
+fn candidates_at(value: &Value, sort: &Sort, world: &World, depth: u32) -> Vec<Value> {
     if depth >= HARD_GEN_DEPTH {
         return Vec::new();
     }
-    match (value, ty) {
+    match (value, sort) {
         (Value::Int(n), _) => int_candidates(*n),
         (Value::Float(f), _) => float_candidates(*f),
         (Value::Decimal(d), _) => decimal_candidates(*d),
@@ -194,30 +186,30 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
         (Value::Str(s), _) => string_candidates(s),
         (Value::Bytes(b), _) => bytes_candidates(b),
         (Value::List(items), _) => {
-            let elem = match ty {
-                Type::Con(name, args) if name.as_str() == "List" => {
-                    args.first().cloned().unwrap_or_else(Type::int)
+            let elem = match sort {
+                Sort::Con(name, args) if name.as_str() == "List" => {
+                    args.first().cloned().unwrap_or_else(Sort::int)
                 }
-                _ => Type::int(),
+                _ => Sort::int(),
             };
             list_candidates(items, &elem, world, depth)
         }
         (Value::Map(entries), _) => {
-            let (key, value) = match ty {
-                Type::Con(name, args) if name.as_str() == "Map" && args.len() == 2 => {
+            let (key, value) = match sort {
+                Sort::Con(name, args) if name.as_str() == "Map" && args.len() == 2 => {
                     (args[0].clone(), args[1].clone())
                 }
-                _ => (Type::int(), Type::int()),
+                _ => (Sort::int(), Sort::int()),
             };
             map_candidates(entries, &key, &value, world, depth)
         }
-        (Value::Record(fields), Type::Record(types)) => {
+        (Value::Record(fields), Sort::Record(_)) => {
             let mut out = Vec::new();
             for (name, field) in fields.iter() {
-                let Some(field_ty) = types.get(name) else {
+                let Some(field_sort) = sort.field(name) else {
                     continue;
                 };
-                for candidate in candidates_at(field, field_ty, world, depth + 1) {
+                for candidate in candidates_at(field, field_sort, world, depth + 1) {
                     let mut next = (**fields).clone();
                     next.insert(name.clone(), candidate);
                     out.push(Value::Record(Arc::new(next)));
@@ -225,11 +217,11 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
             }
             out
         }
-        (Value::Ctor { name, args }, Type::Con(ty_name, ty_args)) => {
-            ctor_candidates(name, args, ty_name, ty_args, ty, world, depth)
+        (Value::Ctor { name, args }, Sort::Con(ty_name, ty_args)) => {
+            ctor_candidates(name, args, ty_name, ty_args, sort, world, depth)
         }
         // The constant function is the floor, so the size test ends the walk on the next pass.
-        (Value::Closure(_), Type::Fn { params, ret, .. }) => minimal(ret, world)
+        (Value::Closure(_), Sort::Fn { params, ret, .. }) => minimal(ret, world)
             .map(|v| vec![const_fn(params.len(), v)])
             .unwrap_or_default(),
         _ => Vec::new(),
@@ -374,7 +366,7 @@ fn string_candidates(s: &str) -> Vec<Value> {
     out
 }
 
-fn list_candidates(items: &List, elem: &Type, world: &TypeWorld, depth: u32) -> Vec<Value> {
+fn list_candidates(items: &List, elem: &Sort, world: &World, depth: u32) -> Vec<Value> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -401,9 +393,9 @@ fn list_candidates(items: &List, elem: &Type, world: &TypeWorld, depth: u32) -> 
 
 fn map_candidates(
     entries: &ply_eval::Map,
-    key: &Type,
-    value: &Type,
-    world: &TypeWorld,
+    key: &Sort,
+    value: &Sort,
+    world: &World,
     depth: u32,
 ) -> Vec<Value> {
     if entries.is_empty() {
@@ -440,9 +432,9 @@ fn ctor_candidates(
     ctor: &Symbol,
     args: &Arc<Vec<Value>>,
     ty_name: &Symbol,
-    ty_args: &[Type],
-    ty: &Type,
-    world: &TypeWorld,
+    ty_args: &[Sort],
+    sort: &Sort,
+    world: &World,
     depth: u32,
 ) -> Vec<Value> {
     let Some(variants) = world.variants(ty_name) else {
@@ -451,20 +443,20 @@ fn ctor_candidates(
     let Some(variant) = variants.iter().find(|v| &v.name == ctor) else {
         return Vec::new();
     };
-    let fields = world.fields(ty_name, variant, ty_args);
+    let fields = world.fields(variant, ty_args);
     if fields.len() != args.len() {
         return Vec::new();
     }
     let mut out = Vec::new();
 
     for (i, field) in fields.iter().enumerate() {
-        if field == ty {
+        if field == sort {
             out.push(args[i].clone());
         }
     }
 
     for lower in variants.iter().filter(|v| v.index < variant.index) {
-        let wanted = world.fields(ty_name, lower, ty_args);
+        let wanted = world.fields(lower, ty_args);
         let mut used = vec![false; args.len()];
         let mut filled = Vec::with_capacity(wanted.len());
         let mut buildable = true;
