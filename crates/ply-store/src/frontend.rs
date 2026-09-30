@@ -1,6 +1,6 @@
-//! The front-end cache: `path -> SourceFingerprint` and `DefHash -> interface`.
+//! The front-end cache: `path -> SourceFingerprint`, and `(DefHash, name) -> Slot` for the values
+//! the front end files and reads back, which this crate keeps without interpreting.
 
-use crate::canonical::{canonicalize_decl_body, canonicalize_scheme};
 use crate::codec;
 use crate::idx::{
     self, Appender, CacheError, DATA_HEADER, Data, Directory, HashSlot, Index, KIND_BODY,
@@ -9,8 +9,6 @@ use crate::idx::{
 use crate::{ContentHash, DefBody, Pruned, disk};
 use ply_span::{Diagnostic, SourceId, Span, Symbol};
 use ply_ty::DefHash;
-use ply_ty::Mode;
-use ply_ty::{Footprint, Scheme, Type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -46,21 +44,6 @@ impl FileSpan {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct NameRef {
-    pub name: Symbol,
-    pub hash: DefHash,
-}
-
-impl NameRef {
-    pub fn new(name: impl Into<Symbol>, hash: DefHash) -> NameRef {
-        NameRef {
-            name: name.into(),
-            hash,
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DefKind {
     Fn,
@@ -85,27 +68,28 @@ pub struct DefEntry {
     pub members: Vec<Member>,
 }
 
+/// One `test` a file declared. `row` is what the front end filed for it, which it reads back and
+/// this crate does not.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct CachedTest {
+pub struct TestEntry {
     pub name: String,
     pub hash: DefHash,
     pub nondet: bool,
-    pub footprint: Footprint,
     pub span: FileSpan,
+    pub row: Vec<u8>,
 }
 
 /// What one file declared when it was last checked, and the bytes it was checked as.
 ///
 /// `module` is the program-wide name the file was checked under, which is not derivable from the
 /// file: a dependency's module is named under the prefix its manifest grants, and what grants it
-/// is the importing project's manifest closure. It is kept here so a later run can file the rows
-/// again without the front end's answer — the run that reads them has not asked for one yet.
+/// is the importing project's manifest closure.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SourceFingerprint {
     pub content_hash: ContentHash,
     pub module: String,
     pub defs: Vec<DefEntry>,
-    pub tests: Vec<CachedTest>,
+    pub tests: Vec<TestEntry>,
 }
 
 impl SourceFingerprint {
@@ -127,117 +111,12 @@ impl SourceFingerprint {
     }
 }
 
-/// The published interface of one `fn`, keyed by its [`DefHash`]: everything a check that is
-/// handed this entry instead of the body must answer with.
-#[derive(Clone, PartialEq, Debug)]
-pub struct CachedDef {
-    pub scheme: Scheme,
-    /// The published row: the `/ {..}` annotation if written, else the inferred row.
-    pub footprint: Footprint,
-    /// The row inference computed for the body, which an annotation may widen.
-    pub performed: Footprint,
-    pub names: Vec<NameRef>,
-}
-
-impl CachedDef {
-    pub fn new(scheme: Scheme, footprint: Footprint, performed: Footprint) -> CachedDef {
-        CachedDef {
-            scheme,
-            footprint,
-            performed,
-            names: Vec::new(),
-        }
-    }
-
-    pub fn witnessed_by(mut self, names: Vec<NameRef>) -> CachedDef {
-        self.names = names;
-        self
-    }
-
-    pub fn canonicalized(self) -> CachedDef {
-        CachedDef {
-            scheme: canonicalize_scheme(&self.scheme),
-            footprint: self.footprint,
-            performed: self.performed,
-            names: canonical_names(self.names),
-        }
-    }
-}
-
-/// A witness is a set, so recording order must not change the bytes on disk.
-fn canonical_names(mut names: Vec<NameRef>) -> Vec<NameRef> {
-    names.sort_by(|a, b| a.name.cmp(&b.name).then(a.hash.cmp(&b.hash)));
-    names.dedup();
-    names
-}
-
-/// The published interface of one `type` or `effect`, keyed by its [`DefHash`].
-#[derive(Clone, PartialEq, Debug)]
-pub struct CachedDecl {
-    pub body: DeclBody,
-    pub names: Vec<NameRef>,
-}
-
-impl CachedDecl {
-    pub fn new(body: DeclBody) -> CachedDecl {
-        CachedDecl {
-            body,
-            names: Vec::new(),
-        }
-    }
-
-    pub fn witnessed_by(mut self, names: Vec<NameRef>) -> CachedDecl {
-        self.names = names;
-        self
-    }
-
-    pub fn canonicalized(self) -> CachedDecl {
-        CachedDecl {
-            body: canonicalize_decl_body(&self.body),
-            names: canonical_names(self.names),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Debug)]
-pub enum DeclBody {
-    Type {
-        /// Type parameters, by count: their names are binders and never escape.
-        arity: usize,
-        ctors: Vec<CachedCtor>,
-    },
-    Effect {
-        nondet: bool,
-        ops: Vec<CachedOp>,
-    },
-}
-
-#[derive(Clone, PartialEq, Debug)]
-pub struct CachedCtor {
-    pub fields: Vec<Type>,
-    pub scheme: Scheme,
-}
-
-/// Named because normalization reorders ops; pairing them by position would mismatch signatures.
-#[derive(Clone, PartialEq, Debug)]
-pub struct CachedOp {
+/// What the front end filed under a hash for one name. Two definitions may share a hash, so a
+/// slot is found by both.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Slot {
     pub name: Symbol,
-    pub mode: Mode,
-    pub resource_param: bool,
-    pub params: Vec<Type>,
-    pub ret: Type,
-}
-
-/// The name an interface was written for: its witness entry at the interface's own hash.
-pub fn self_name(names: &[NameRef], hash: DefHash) -> Option<&Symbol> {
-    names.iter().find(|n| n.hash == hash).map(|n| &n.name)
-}
-
-pub fn declares(names: &[NameRef], name: &Symbol, hash: DefHash) -> bool {
-    match self_name(names, hash) {
-        Some(found) => found == name,
-        None => names.is_empty(),
-    }
+    pub value: Vec<u8>,
 }
 
 struct Staged<T> {
@@ -247,13 +126,12 @@ struct Staged<T> {
     supersedes: bool,
 }
 
-/// A hash and the name the interface filed under it was written for.
-type Slot = (DefHash, Option<Symbol>);
+type SlotKey = (DefHash, Symbol);
 
 #[derive(Default)]
 struct Pending {
-    defs: BTreeMap<Slot, Staged<CachedDef>>,
-    decls: BTreeMap<Slot, Staged<CachedDecl>>,
+    defs: BTreeMap<SlotKey, Staged<Slot>>,
+    decls: BTreeMap<SlotKey, Staged<Slot>>,
     bodies: BTreeMap<DefHash, Staged<DefBody>>,
     sources: BTreeMap<String, Staged<SourceFingerprint>>,
 }
@@ -265,16 +143,31 @@ impl Pending {
             && self.bodies.is_empty()
             && self.sources.is_empty()
     }
+
+    fn slots(&self, kind: u8) -> &BTreeMap<SlotKey, Staged<Slot>> {
+        if kind == KIND_DEF {
+            &self.defs
+        } else {
+            &self.decls
+        }
+    }
+
+    fn slots_mut(&mut self, kind: u8) -> &mut BTreeMap<SlotKey, Staged<Slot>> {
+        if kind == KIND_DEF {
+            &mut self.defs
+        } else {
+            &mut self.decls
+        }
+    }
 }
 
 /// Entries decoded during this run, keyed by where their frame lies.
 #[derive(Default)]
 struct Memo {
-    defs: BTreeMap<u64, Arc<CachedDef>>,
-    decls: BTreeMap<u64, Arc<CachedDecl>>,
+    slots: BTreeMap<u64, Arc<Slot>>,
     bodies: BTreeMap<u64, Arc<DefBody>>,
     sources: BTreeMap<u64, Arc<SourceFingerprint>>,
-    names: BTreeMap<u64, Arc<Vec<NameRef>>>,
+    names: BTreeMap<u64, Symbol>,
 }
 
 /// What a `prune` decided, held until a flush can act on it.
@@ -299,73 +192,20 @@ impl Retained {
 }
 
 trait Cached: Sized {
-    const KIND: u8;
     fn decode(bytes: &[u8]) -> crate::binary::Decoded<Self>;
     fn memo(memo: &mut Memo) -> &mut BTreeMap<u64, Arc<Self>>;
 }
 
-trait Interface: Cached + PartialEq {
-    const TAG: u8;
-    fn encode(&self) -> Vec<u8>;
-    fn names(&self) -> &[NameRef];
-    fn pending(pending: &Pending) -> &BTreeMap<Slot, Staged<Self>>;
-    fn pending_mut(pending: &mut Pending) -> &mut BTreeMap<Slot, Staged<Self>>;
-}
-
-impl Cached for CachedDef {
-    const KIND: u8 = KIND_DEF;
+impl Cached for Slot {
     fn decode(bytes: &[u8]) -> crate::binary::Decoded<Self> {
-        codec::decode_def(bytes)
+        codec::decode_slot(bytes)
     }
     fn memo(memo: &mut Memo) -> &mut BTreeMap<u64, Arc<Self>> {
-        &mut memo.defs
-    }
-}
-
-impl Interface for CachedDef {
-    const TAG: u8 = codec::DEF_TAG;
-    fn encode(&self) -> Vec<u8> {
-        codec::encode_def(self)
-    }
-    fn names(&self) -> &[NameRef] {
-        &self.names
-    }
-    fn pending(pending: &Pending) -> &BTreeMap<Slot, Staged<Self>> {
-        &pending.defs
-    }
-    fn pending_mut(pending: &mut Pending) -> &mut BTreeMap<Slot, Staged<Self>> {
-        &mut pending.defs
-    }
-}
-
-impl Cached for CachedDecl {
-    const KIND: u8 = KIND_DECL;
-    fn decode(bytes: &[u8]) -> crate::binary::Decoded<Self> {
-        codec::decode_decl(bytes)
-    }
-    fn memo(memo: &mut Memo) -> &mut BTreeMap<u64, Arc<Self>> {
-        &mut memo.decls
-    }
-}
-
-impl Interface for CachedDecl {
-    const TAG: u8 = codec::DECL_TAG;
-    fn encode(&self) -> Vec<u8> {
-        codec::encode_decl(self)
-    }
-    fn names(&self) -> &[NameRef] {
-        &self.names
-    }
-    fn pending(pending: &Pending) -> &BTreeMap<Slot, Staged<Self>> {
-        &pending.decls
-    }
-    fn pending_mut(pending: &mut Pending) -> &mut BTreeMap<Slot, Staged<Self>> {
-        &mut pending.decls
+        &mut memo.slots
     }
 }
 
 impl Cached for DefBody {
-    const KIND: u8 = KIND_BODY;
     fn decode(bytes: &[u8]) -> crate::binary::Decoded<Self> {
         codec::decode_body(bytes)
     }
@@ -375,7 +215,6 @@ impl Cached for DefBody {
 }
 
 impl Cached for SourceFingerprint {
-    const KIND: u8 = KIND_SOURCE;
     fn decode(bytes: &[u8]) -> crate::binary::Decoded<Self> {
         codec::decode_fingerprint(bytes)
     }
@@ -419,10 +258,8 @@ fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn frame_self_name(data: &Data, at: Located, kind: u8, tag: u8, hash: DefHash) -> Option<Symbol> {
-    let payload = data.frame(at, kind).ok()?;
-    let names = codec::peek_names(tag, payload).ok()?;
-    self_name(&names, hash).cloned()
+fn frame_slot_name(data: &Data, at: Located, kind: u8) -> Option<Symbol> {
+    codec::peek_slot_name(data.frame(at, kind).ok()?).ok()
 }
 
 impl Frontend {
@@ -472,11 +309,11 @@ impl Frontend {
         );
     }
 
-    fn decode_at<T: Cached>(&self, at: Located) -> Option<Arc<T>> {
+    fn decode_at<T: Cached>(&self, at: Located, kind: u8) -> Option<Arc<T>> {
         if let Some(found) = T::memo(&mut guard(&self.memo)).get(&at.offset) {
             return Some(found.clone());
         }
-        let payload = match self.data.frame(at, T::KIND) {
+        let payload = match self.data.frame(at, kind) {
             Ok(payload) => payload,
             Err(why) => {
                 self.refuse(why);
@@ -494,60 +331,45 @@ impl Frontend {
         Some(value)
     }
 
-    fn slot_name<T: Interface>(&self, at: Located, hash: DefHash) -> Option<Symbol> {
+    fn slot_name(&self, at: Located, kind: u8) -> Option<Symbol> {
         if let Some(found) = guard(&self.memo).names.get(&at.offset) {
-            return self_name(found, hash).cloned();
+            return Some(found.clone());
         }
-        let payload = self.data.frame(at, T::KIND).ok()?;
-        let names = codec::peek_names(T::TAG, payload).ok()?;
-        let found = self_name(&names, hash).cloned();
-        guard(&self.memo).names.insert(at.offset, Arc::new(names));
-        found
+        let name = frame_slot_name(&self.data, at, kind)?;
+        guard(&self.memo).names.insert(at.offset, name.clone());
+        Some(name)
     }
 
-    /// Every interface stored under this hash, index order first.
-    fn interfaces<T: Interface>(&self, hash: DefHash) -> Vec<Arc<T>> {
-        let mut out = Vec::new();
+    /// The slot filed under `hash` for `name`, a pending one first. Every slot under the hash is
+    /// decoded, so one that no longer reads is reported whichever name it was filed for.
+    fn slot(&self, kind: u8, hash: DefHash, name: &Symbol) -> Option<Arc<Slot>> {
         if !self.retained.hash(hash) {
-            return out;
+            return None;
         }
-        let staged = T::pending(&self.pending);
-        for slot in self.index.slots(T::KIND, hash) {
-            let name = self.slot_name::<T>(slot.at, hash);
-            if staged.contains_key(&(hash, name)) {
-                continue;
-            }
-            if let Some(entry) = self.decode_at::<T>(slot.at) {
-                out.push(entry);
-            }
+        if let Some(staged) = self.pending.slots(kind).get(&(hash, name.clone())) {
+            return Some(staged.value.clone());
         }
-        for ((filed, _), entry) in staged.range((hash, None)..) {
-            if *filed != hash {
-                break;
-            }
-            out.push(entry.value.clone());
-        }
-        out
+        self.index
+            .slots(kind, hash)
+            .into_iter()
+            .filter_map(|slot| self.decode_at::<Slot>(slot.at, kind))
+            .find(|slot| slot.name == *name)
     }
 
-    fn interface(&self, hash: DefHash) -> Option<Arc<CachedDef>> {
-        self.interfaces::<CachedDef>(hash).into_iter().next()
-    }
+    fn put_slot(&mut self, kind: u8, hash: DefHash, slot: Slot) -> bool {
+        let bytes = codec::encode_slot(&slot);
+        let key = (hash, slot.name.clone());
 
-    fn put_interface<T: Interface>(&mut self, hash: DefHash, value: T) -> bool {
-        let bytes = value.encode();
-        let key = (hash, self_name(value.names(), hash).cloned());
-
-        if let Some(staged) = T::pending(&self.pending).get(&key) {
+        if let Some(staged) = self.pending.slots(kind).get(&key) {
             if staged.bytes == bytes {
                 return false;
             }
             let supersedes = staged.supersedes;
-            T::pending_mut(&mut self.pending).insert(
+            self.pending.slots_mut(kind).insert(
                 key,
                 Staged {
                     bytes,
-                    value: Arc::new(value),
+                    value: Arc::new(slot),
                     supersedes,
                 },
             );
@@ -555,12 +377,12 @@ impl Frontend {
         }
 
         let mut supersedes = false;
-        for slot in self.index.slots(T::KIND, hash) {
-            if self.slot_name::<T>(slot.at, hash) != key.1 {
+        for stored in self.index.slots(kind, hash) {
+            if self.slot_name(stored.at, kind).as_ref() != Some(&key.1) {
                 continue;
             }
             supersedes = true;
-            if self.data.frame(slot.at, T::KIND).is_ok_and(|p| p == bytes) {
+            if self.data.frame(stored.at, kind).is_ok_and(|p| p == bytes) {
                 return false;
             }
             break;
@@ -568,64 +390,54 @@ impl Frontend {
         if let Some(keep) = self.retained.hashes.as_mut() {
             keep.insert(hash);
         }
-        T::pending_mut(&mut self.pending).insert(
+        self.pending.slots_mut(kind).insert(
             key,
             Staged {
                 bytes,
-                value: Arc::new(value),
+                value: Arc::new(slot),
                 supersedes,
             },
         );
         true
     }
 
-    fn interfaces_len<T: Interface>(&self) -> usize {
+    fn slots_len(&self, kind: u8) -> usize {
         let stored = self
             .index
-            .all_slots(T::KIND)
+            .all_slots(kind)
             .filter(|slot| self.retained.hash(slot.hash))
             .count();
-        let staged = T::pending(&self.pending)
+        let staged = self
+            .pending
+            .slots(kind)
             .iter()
             .filter(|((hash, _), entry)| self.retained.hash(*hash) && !entry.supersedes)
             .count();
         stored + staged
     }
 
-    pub(crate) fn def(&self, hash: DefHash) -> Option<Arc<CachedDef>> {
-        self.interface(hash)
+    pub(crate) fn def_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<Slot>> {
+        self.slot(KIND_DEF, hash, name)
     }
 
-    pub(crate) fn def_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<CachedDef>> {
-        self.interfaces::<CachedDef>(hash)
-            .into_iter()
-            .find(|d| declares(&d.names, name, hash))
-    }
-
-    pub(crate) fn put_def(&mut self, hash: DefHash, def: CachedDef) -> bool {
-        self.put_interface(hash, def.canonicalized())
+    pub(crate) fn put_def(&mut self, hash: DefHash, slot: Slot) -> bool {
+        self.put_slot(KIND_DEF, hash, slot)
     }
 
     pub(crate) fn defs_len(&self) -> usize {
-        self.interfaces_len::<CachedDef>()
+        self.slots_len(KIND_DEF)
     }
 
-    pub(crate) fn decl(&self, hash: DefHash) -> Option<Arc<CachedDecl>> {
-        self.interfaces::<CachedDecl>(hash).into_iter().next()
+    pub(crate) fn decl_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<Slot>> {
+        self.slot(KIND_DECL, hash, name)
     }
 
-    pub(crate) fn decl_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<CachedDecl>> {
-        self.interfaces::<CachedDecl>(hash)
-            .into_iter()
-            .find(|d| declares(&d.names, name, hash))
-    }
-
-    pub(crate) fn put_decl(&mut self, hash: DefHash, decl: CachedDecl) -> bool {
-        self.put_interface(hash, decl.canonicalized())
+    pub(crate) fn put_decl(&mut self, hash: DefHash, slot: Slot) -> bool {
+        self.put_slot(KIND_DECL, hash, slot)
     }
 
     pub(crate) fn decls_len(&self) -> usize {
-        self.interfaces_len::<CachedDecl>()
+        self.slots_len(KIND_DECL)
     }
 
     pub(crate) fn body(&self, hash: DefHash) -> Option<Arc<DefBody>> {
@@ -636,7 +448,7 @@ impl Frontend {
             return Some(staged.value.clone());
         }
         let slot = self.index.slots(KIND_BODY, hash).into_iter().next()?;
-        self.decode_at::<DefBody>(slot.at)
+        self.decode_at::<DefBody>(slot.at, KIND_BODY)
     }
 
     pub(crate) fn put_body(&mut self, hash: DefHash, body: DefBody) -> StoredBody {
@@ -694,7 +506,7 @@ impl Frontend {
         if let Some(staged) = self.pending.sources.get(key) {
             return Some(staged.value.clone());
         }
-        self.decode_at::<SourceFingerprint>(self.index.find_source(key)?)
+        self.decode_at::<SourceFingerprint>(self.index.find_source(key)?, KIND_SOURCE)
     }
 
     pub(crate) fn put_source(&mut self, key: String, fingerprint: SourceFingerprint) -> bool {
@@ -856,6 +668,21 @@ impl Frontend {
         }
     }
 
+    /// The index records of `kind` a flush keeps: the retained ones no pending slot replaces.
+    fn kept_slots(&self, index: &Index, data: &Data, kind: u8) -> Vec<HashSlot> {
+        let pending = self.pending.slots(kind);
+        let pending_hashes: BTreeSet<DefHash> = pending.keys().map(|(h, _)| *h).collect();
+        index
+            .all_slots(kind)
+            .filter(|slot| self.retained.hash(slot.hash))
+            .filter(|slot| {
+                !pending_hashes.contains(&slot.hash)
+                    || frame_slot_name(data, slot.at, kind)
+                        .is_none_or(|name| !pending.contains_key(&(slot.hash, name)))
+            })
+            .collect()
+    }
+
     pub(crate) fn flush(
         &mut self,
         dir: &Path,
@@ -883,34 +710,11 @@ impl Frontend {
             }
         };
 
-        let mut directory = Directory::default();
-        let def_hashes: BTreeSet<DefHash> = self.pending.defs.keys().map(|(h, _)| *h).collect();
-        let decl_hashes: BTreeSet<DefHash> = self.pending.decls.keys().map(|(h, _)| *h).collect();
-
-        for slot in index.all_slots(KIND_DEF) {
-            if !self.retained.hash(slot.hash) {
-                continue;
-            }
-            if def_hashes.contains(&slot.hash) {
-                let name = frame_self_name(&data, slot.at, KIND_DEF, codec::DEF_TAG, slot.hash);
-                if self.pending.defs.contains_key(&(slot.hash, name)) {
-                    continue;
-                }
-            }
-            directory.defs.push(slot);
-        }
-        for slot in index.all_slots(KIND_DECL) {
-            if !self.retained.hash(slot.hash) {
-                continue;
-            }
-            if decl_hashes.contains(&slot.hash) {
-                let name = frame_self_name(&data, slot.at, KIND_DECL, codec::DECL_TAG, slot.hash);
-                if self.pending.decls.contains_key(&(slot.hash, name)) {
-                    continue;
-                }
-            }
-            directory.decls.push(slot);
-        }
+        let mut directory = Directory {
+            defs: self.kept_slots(&index, &data, KIND_DEF),
+            decls: self.kept_slots(&index, &data, KIND_DECL),
+            ..Directory::default()
+        };
         let mut stored_bodies: BTreeSet<DefHash> = BTreeSet::new();
         for slot in index.all_slots(KIND_BODY) {
             if !self.retained.hash(slot.hash) {

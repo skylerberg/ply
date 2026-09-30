@@ -48,7 +48,7 @@ SOLO=(
   "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
   "archive-round-trip:ply-cli-tests:suite:bootstrap_archive::an_archive_is_written_and_verifies_against_the_tree_it_came_from"
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
-  "corpus-session-audit:ply-cli-tests:suite:incremental_audit::a_long_session_over_the_example_corpus_agrees_at_every_step"
+  "corpus-session-audit:ply-cli-tests:suite:incremental::a_long_session_over_the_example_corpus_agrees_at_every_step"
   # The corpus's own served benches, which nothing in a shard reaches: each binds real listeners, and
   # the CLI's reservations do not cover another crate's, so each gets a runner of its own.
   "corpus-socket-bench:ply-corpus-tests:suite:served::the_socket_bench_serves_the_desk_and_its_floor"

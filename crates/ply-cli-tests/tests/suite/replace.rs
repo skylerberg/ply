@@ -126,6 +126,30 @@ fn three() -> Int = two() + 1
 }
 
 #[test]
+fn replace_pointed_at_a_file_rewrites_that_file() {
+    let dir = project(SOURCE);
+    let out = ply(dir.path())
+        .args(["replace", "two", "m.ply"])
+        .write_stdin("pub fn two() -> Int = one() * 2\n")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "replaced m.two in m.ply\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("m.ply")).unwrap(),
+        SOURCE.replace(TWO, "pub fn two() -> Int = one() * 2\n")
+    );
+}
+
+#[test]
 fn a_replacement_that_renames_or_breaks_the_program_is_refused_and_writes_nothing() {
     let dir = project(SOURCE);
     let out = ply(dir.path())
