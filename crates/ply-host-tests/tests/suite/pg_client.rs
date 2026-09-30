@@ -11,10 +11,25 @@ use std::sync::Arc;
 const CLIENT: &str = r#"
 import std.net (net)
 import std.pg (connect, simple_query, extended_query, finish, default_client, Answer, ClientError, client_error_text, server_text, Rejected)
+import std.db (db, serve, server_of, stmt, Rows, Count, Failed)
+
+// The driver over the same script: what a connection string asks of every connection it opens.
+pub fn told(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match server_of(url) {
+    Err(why) -> Err(why),
+    Ok(cfg) ->
+      Ok(serve(cfg, 1, "test-nonce", ||
+        match db.query[items](stmt("select count(*) as n from items"), []) {
+          Rows(_) -> "rows",
+          Count(_) -> "a count",
+          Failed(e) -> e.detail,
+        })),
+  }
 
 pub fn ask(host: String, port: Int) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match connect[link](host, port, "ply", "ply", None, "test-nonce", default_client()) {
+  match connect[link](host, port, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
       Err(e) -> Err(client_error_text(e)),
@@ -27,7 +42,7 @@ pub fn ask(host: String, port: Int) -> Result<String, String>
 
 pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match connect[link](host, port, "ply", "ply", None, "test-nonce", default_client()) {
+  match connect[link](host, port, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match extended_query[link](session, "select $1", [Some(value)], default_client()) {
       Err(e) -> Err(client_error_text(e)),
@@ -42,7 +57,7 @@ pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String
 // one came back with.
 pub fn refuse_then_ask(host: String, port: Int) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match connect[link](host, port, "ply", "ply", None, "test-nonce", default_client()) {
+  match connect[link](host, port, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select nope", default_client()) {
       Ok(_) -> Err("the server accepted what it should have refused"),
@@ -66,7 +81,7 @@ pub fn ask_scram(
   password: String,
   nonce: String,
 ) -> Result<String, String> / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match connect[link](host, port, user, "ply", Some(password), nonce, default_client()) {
+  match connect[link](host, port, user, "ply", [], Some(password), nonce, default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
       Err(e) -> Err(client_error_text(e)),
@@ -382,6 +397,38 @@ fn a_refusal_comes_back_with_its_sqlstate_and_leaves_the_connection_usable() {
     let text = sent_text(&outcome.sent);
     assert!(text.contains("select nope"), "{text}");
     assert!(text.contains("select 1"), "{text}");
+}
+
+/// `std.db` tells the server a connection string's timeouts and name in the start-up message, so a
+/// statement is bounded by the server without a `SET` the driver's reader refuses.
+#[test]
+fn a_connection_strings_settings_are_in_the_start_up_message() {
+    let outcome = run(
+        "m.told",
+        vec![Value::str(
+            "postgres://ply@127.0.0.1:5432/ply?statement_timeout=250\
+             &idle_in_transaction_session_timeout=1000&application_name=desk",
+        )],
+        vec![greeting(), extended_one("3")],
+    )
+    .expect("the server refused nothing");
+    assert_eq!(outcome.text, "rows");
+
+    let sent = &outcome.sent;
+    let declared = u32::from_be_bytes([sent[0], sent[1], sent[2], sent[3]]) as usize;
+    let startup = sent_text(&sent[..declared]);
+    assert!(
+        startup.ends_with(
+            "user\x00ply\x00database\x00ply\x00application_name\x00desk\x00\
+             statement_timeout\x00250\x00idle_in_transaction_session_timeout\x001000\x00\x00"
+        ),
+        "{startup:?}"
+    );
+    assert!(
+        !sent_text(&sent[declared..]).contains("statement_timeout"),
+        "a setting went out as a statement rather than at start-up: {:?}",
+        sent_text(sent)
+    );
 }
 
 #[test]
