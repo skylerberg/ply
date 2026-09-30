@@ -337,6 +337,7 @@ nondet effect machine {
 }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
+type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
