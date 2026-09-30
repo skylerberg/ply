@@ -983,39 +983,79 @@ fn changing_a_signature_asks_the_emitter_for_the_definition_and_its_callers() {
     );
 }
 
-/// Asserted on the memo, not a clock: without the emitted `rt_constant` the slot stays empty however long the run takes.
+/// Counted in calls, never timed: whatever a pure nullary root answers, reads ask the runtime for it.
 #[test]
-fn a_pure_nullary_root_that_answers_a_handle_is_asked_once() {
+fn a_pure_nullary_root_runs_its_body_once_whatever_it_answers() {
+    const READS: i64 = 64;
     let source = r#"
-pub fn table() -> List<Int> = map(range(0, 32), |i: Int| i * 7 + 1)
-pub fn probe(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + len(table()))
+fn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }
+pub fn a_list() -> List<Int> = [deep(32)]
+pub fn an_int() -> Int = deep(32)
+pub fn a_bool() -> Bool = deep(32) > 0
+pub fn a_u8() -> U8 = u8_of_int(deep(32))
+pub fn reads_a_list(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + len(a_list()))
+pub fn reads_an_int(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + an_int())
+pub fn reads_a_bool(n: Int) -> Int =
+  fold(range(0, n), 0, |acc: Int, _x: Int| if a_bool() { acc + 1 } else { acc })
+pub fn reads_a_u8(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + int_of_u8(a_u8()))
 "#;
     let Some((loaded, native)) = tests_support::unit(source) else {
         return;
     };
-    let slot = native
-        .constant_index("m.table")
-        .expect("a pure nullary root is given a memo slot");
-    assert!(
-        slot < native.tables().functions.len(),
-        "the memo slot is not a row of the code table `rt_constant` calls through"
-    );
-    assert!(
-        native.tables().memoized(slot).is_none(),
-        "something was remembered before the root ever ran"
-    );
-
-    let entry: ply_codegen::rt::Entry = native.entry("m.probe").expect("`probe` was refused");
-    let mut ctx = native.context();
-    ctx.fuel = 100_000;
-    let args = [ply_codegen::heap::imm(64)];
-    let answer = unsafe { entry(&mut ctx, args.as_ptr()) };
-    assert_eq!(ctx.failed, 0, "`probe` raised");
-    assert_eq!(ply_codegen::heap::imm_value(answer), 32 * 64);
-    assert!(
-        native.tables().memoized(slot).is_some(),
-        "`probe` called the root directly instead of asking the runtime for its answer"
-    );
+    // An entry's answer and the calls it made; entering a root itself leaves its memo slot alone.
+    let run = |name: &str, args: &[i64]| -> (i64, i64) {
+        let entry: ply_codegen::rt::Entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was refused"));
+        let mut ctx = native.context();
+        ctx.begin(100_000);
+        let words: Vec<i64> = args.iter().map(|a| ply_codegen::heap::imm(*a)).collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        let (failed, ticks) = (ctx.failed, ctx.ticks);
+        ctx.end();
+        assert_eq!(failed, 0, "`{name}` raised");
+        (answer, ticks)
+    };
+    for (root, reader, each) in [
+        ("m.a_list", "m.reads_a_list", 1),
+        ("m.an_int", "m.reads_an_int", 32),
+        ("m.a_bool", "m.reads_a_bool", 1),
+        ("m.a_u8", "m.reads_a_u8", 32),
+    ] {
+        let slot = native
+            .constant_index(root)
+            .unwrap_or_else(|| panic!("`{root}` was given no memo slot"));
+        assert!(
+            slot < native.tables().functions.len(),
+            "`{root}`'s memo slot is not a row of the code table `rt_constant` calls through"
+        );
+        assert!(
+            native.tables().memoized(slot).is_none(),
+            "something was remembered before `{root}` ever ran"
+        );
+        let (_, body) = run(root, &[]);
+        let (answer, paid) = run(reader, &[READS]);
+        assert_eq!(
+            ply_codegen::heap::imm_value(answer),
+            READS * each,
+            "`{reader}`"
+        );
+        assert!(
+            native.tables().memoized(slot).is_some(),
+            "`{reader}` called `{root}` directly instead of asking the runtime for its answer"
+        );
+        let (again, unpaid) = run(reader, &[READS]);
+        assert_eq!(
+            again, answer,
+            "`{reader}` read the remembered answer differently"
+        );
+        assert_eq!(
+            paid - unpaid,
+            body,
+            "`{reader}` ran `{root}`'s body of {body} calls {} times, not once",
+            (paid - unpaid) / body.max(1)
+        );
+    }
     let _ = loaded;
 }
 
