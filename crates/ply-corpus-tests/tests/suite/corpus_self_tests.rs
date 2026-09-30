@@ -10,6 +10,7 @@ fn every_fixture_the_corpus_runs_checks_and_passes_its_own_tests() {
         "layers.ply",
         "shape.ply",
         "scans.ply",
+        "statements.ply",
         "rungs.ply",
     ] {
         let path = format!("crates/ply-corpus/fixtures/{fixture}");

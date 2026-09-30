@@ -109,6 +109,45 @@ fn shown(row: Row) -> String =
     Some(CInt(n)) -> int_to_string(n),
     _ -> "not a count",
   }
+
+// The two timeouts as the server holds them for this session, which the connection string set.
+pub fn timeouts(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
+  match with_server(url, 1, || {
+    match db.query[pg_settings](
+      stmt("select name, setting from pg_settings where name = 'statement_timeout' or name = 'idle_in_transaction_session_timeout' order by name"),
+      [],
+    ) {
+      Failed(e) -> Err(e.detail),
+      Count(_) -> Err("a count where rows were due"),
+      Rows(rows) -> Ok(fold(rows, "", |acc: String, row: Row| acc ++ setting(row) ++ ";")),
+    }
+  }) {
+    Err(why) -> Err(why),
+    Ok(answered) -> answered,
+  }
+
+fn setting(row: Row) -> String =
+  match (map_get(row, "name"), map_get(row, "setting")) {
+    (Some(CText(name)), Some(CText(value))) -> name ++ "=" ++ value,
+    _ -> "not a setting",
+  }
+
+// A statement that runs far past the timeout the connection string set, and what ended it.
+pub fn overrun(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
+  match with_server(url, 1, || {
+    match db.query[pg_class](
+      stmt("select count(*) as n from pg_class a, pg_class b, pg_class c, pg_class d"),
+      [],
+    ) {
+      Failed(e) -> Ok(e.detail),
+      _ -> Err("the statement finished inside its timeout"),
+    }
+  }) {
+    Err(why) -> Err(why),
+    Ok(answered) -> answered,
+  }
 "#;
 
 fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
@@ -244,5 +283,27 @@ fn a_transaction_commits_what_it_did() {
     match call("m.commit_one", &url) {
         Ok(text) => assert_eq!(text, "2"),
         Err(why) => panic!("the transaction did not commit: {why}"),
+    }
+}
+
+#[test]
+fn a_connection_strings_timeouts_bound_every_statement_on_the_server() {
+    let Some((_cluster, url)) = cluster() else {
+        return;
+    };
+    let bounded = format!("{url}&statement_timeout=200&idle_in_transaction_session_timeout=1500");
+    match call("m.timeouts", &bounded) {
+        Ok(text) => assert_eq!(
+            text,
+            "idle_in_transaction_session_timeout=1500;statement_timeout=200;"
+        ),
+        Err(why) => panic!("the settings could not be read back: {why}"),
+    }
+    match call("m.overrun", &bounded) {
+        Ok(why) => assert!(
+            why.contains("57014"),
+            "the statement ended for another reason: {why}"
+        ),
+        Err(why) => panic!("the timeout did not bound the statement: {why}"),
     }
 }

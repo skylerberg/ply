@@ -130,14 +130,53 @@ pub fn delegated(dir: &Path, args: &[&str]) -> Output {
     )
 }
 
-/// The same, with the floor a served subcommand compares the desk with built and bound as
-/// `benches/corpus.sh` binds it.
+/// The same, with the floors a served subcommand compares the product with built and bound as
+/// `benches/corpus.sh` binds them: the HTTP floor always, and the libpq tool where `pg_config` says
+/// where libpq is.
 pub fn served(dir: &Path, args: &[&str]) -> Output {
-    run(
-        dir,
-        &[format!("--exec=http_floor={}", floor().display())],
-        args,
-    )
+    let mut grants = vec![format!("--exec=http_floor={}", floor().display())];
+    if let Some(tool) = pg_floor() {
+        grants.push(format!("--exec=pg_floor={}", tool.display()));
+    }
+    run(dir, &grants, args)
+}
+
+/// `benches/pg-floor/pg.c`, compiled once a test process against the libpq `pg_config` names, and
+/// nothing on a machine with no `pg_config`.
+fn pg_floor() -> Option<&'static Path> {
+    static BUILT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let config = |flag: &str| {
+                let out = Command::new("pg_config").arg(flag).output().ok()?;
+                out.status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            };
+            let include = config("--includedir")?;
+            let libdir = config("--libdir")?;
+            let built = ply().with_file_name("pg-floor");
+            // Renamed into place, so another test process never starts a half-written binary.
+            let staged = built.with_file_name(format!("pg-floor.{}", std::process::id()));
+            let out = Command::new("cc")
+                .arg("-O2")
+                .arg("-o")
+                .arg(&staged)
+                .arg(repo().join("benches/pg-floor/pg.c"))
+                .arg(format!("-I{include}"))
+                .arg(format!("-L{libdir}"))
+                .arg("-lpq")
+                .output()
+                .expect("`cc` starts");
+            assert!(
+                out.status.success(),
+                "compiling the libpq tool failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::rename(&staged, &built).expect("the libpq tool moves into place");
+            Some(built)
+        })
+        .as_deref()
 }
 
 /// `benches/http-floor/floor.c`, compiled once a test process beside the `ply` the tests run.
