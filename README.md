@@ -54,8 +54,9 @@ CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
 cut from the durations its last run measured.
 Tests that need a runner of their own are `SOLO` in `.github/ci-shards.sh`; run one
 with `cargo nextest run --workspace -E "$(.github/ci-shards.sh solo-filter <id>)"`.
-The corpus's tests are Ply tests, run by the `corpus` job as `ply test` over the package and the
-filter `.github/ci-shards.sh corpus-line <id>` names, with the grants that job passes.
+The corpus's tests are the Ply package `crates/ply-corpus/checks`, run by `.github/ci-corpus.sh`:
+each shard runs its share of them beside its nextest run, and the `corpus` job runs `serving` and
+`database` against a postgres. `.github/ci-corpus.sh run <id>` runs one with the grants CI passes.
 The postgres tests in `ply-host-tests` skip unless `PLY_PG_URL` and `PLY_TEST_DB`
 name a server.
 
