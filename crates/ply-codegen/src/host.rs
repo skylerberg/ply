@@ -88,10 +88,10 @@ pub unsafe fn perform(
                     hermetic
                 }
             }
-            Some(path) if binding.withholds(effect, op, resource).is_some() => {
-                err_withheld(span, &operation, effect, path)
-            }
-            Some(path) => err_unenumerated_atom(span, &operation, path),
+            Some(path) => match binding.withholds(effect, op, resource) {
+                Some(served) => err_withheld(span, &operation, effect, path, served),
+                None => err_unenumerated_atom(span, &operation, path),
+            },
         };
         return c.fail(d);
     };
