@@ -30,7 +30,7 @@ fn host(argv: &[&str]) -> Arc<ProcessHost> {
 }
 
 fn atom(op: Op) -> EffectAtom {
-    let mode = if op == Op::Args {
+    let mode = if matches!(op, Op::Args | Op::Bound) {
         Mode::Read
     } else {
         Mode::Write
@@ -98,7 +98,8 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
         assert_eq!(op.blocking, waits, "{op}");
         assert!(!op.secrets, "a line or a code is never a credential");
         assert!(op.path.starts_with("ply_host::process::"));
-        let expected = if op.op.as_str() == "args" {
+        // Neither the arguments nor the executables a run was given change while it runs.
+        let expected = if matches!(op.op.as_str(), "args" | "bound") {
             Linearity::Repeatable
         } else {
             Linearity::AtMostOnce
@@ -107,10 +108,11 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
     }
     assert!(DECLARATION.contains("pub nondet effect process"));
     for op in Op::ALL {
-        // The label is the process for its own streams, and the executable for a child.
+        // The label is the process for its own streams, and the executable for a child or `bound`.
         let executes = matches!(
             op,
-            Op::Spawn
+            Op::Bound
+                | Op::Spawn
                 | Op::Start
                 | Op::Wait
                 | Op::Signal
@@ -383,9 +385,39 @@ fn a_spawn_of_an_unbound_label_names_the_flag_that_would_bind_it() {
         "the diagnostic should name the flag: {:?}",
         refused.notes
     );
+    assert!(
+        refused
+            .notes
+            .iter()
+            .any(|n| n.contains("process.bound[cc]()")),
+        "the diagnostic should name the question a program can ask first: {:?}",
+        refused.notes
+    );
     // And the same refusal is what the shared constructor produces for any label.
     let direct = unbound(Op::Spawn, &Resource::Named(Symbol::new("cc")), Span::DUMMY);
     assert_eq!(direct.code, codes::PROCESS_EXEC_UNBOUND);
+}
+
+/// The table the run was given is the whole answer, and asking again reads the same one.
+#[test]
+fn bound_answers_whether_the_run_bound_a_program_to_the_label() {
+    let shell = spawning("sh", SH);
+    for _ in 0..2 {
+        assert_eq!(
+            perform(&shell, Op::Bound, "sh", Vec::new()).expect("an answer"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            perform(&shell, Op::Bound, "cc", Vec::new()).expect("an answer"),
+            Value::Bool(false)
+        );
+    }
+    let bare = host(&[]);
+    assert_eq!(
+        perform(&bare, Op::Bound, "sh", Vec::new()).expect("an answer"),
+        Value::Bool(false),
+        "a run given no `--exec` binds nothing"
+    );
 }
 
 #[test]

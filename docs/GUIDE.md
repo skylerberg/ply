@@ -1299,9 +1299,11 @@ The resource label is a table (`db.query[items]` is `db.read[items]`).
 Transaction control is on the singleton resource, so transactions conflict.
 `transaction` handles `rollback`; a `rollback` performed in its body still
 reaches the caller's row through `e`, so a handler around a transaction names
-it too. SQL errors are values; `is_retryable(e)`
-covers serialization failures. `MemDb` is an in-memory twin (`open`, `step`,
-`begin_step`, `commit_step`, `abort_step`). 
+it too. SQL errors are values: a `DbError`'s `code` is the SQLSTATE,
+`constraint` the constraint a violation names, and `detail` the server's message
+and detail. `is_retryable(e)` is true for a serialization failure (`40001`) and
+a deadlock (`40P01`). `MemDb` is an in-memory twin (`open`, `step`,
+`begin_step`, `commit_step`, `abort_step`).
 The driver that runs in Ply reads a statement before it sends it. A statement
 that writes, performed as `db.query`, is refused because the endpoints that
 perform it would be scheduled as if they only read, and text the reader cannot
@@ -1326,6 +1328,29 @@ the language's, and the host is left with `net`. The effect is nominal, so a
 program that wants a server handles it: `with_server` is how, and
 `{db.read[*], db.write[*] | e}` in its signature is what lets one handler answer
 every table at once.
+
+A statement outside a transaction takes an idle connection, or opens one while
+fewer than `size` are open, and gives it back once the server has answered; with
+none to take it is `53300`. A `begin` takes a connection for its transaction, a
+`begin` inside it is a savepoint on that connection, and the `commit` or `abort`
+that closes the transaction gives the connection back whatever the server
+answered. A `commit` the server turned into a rollback, because a statement in
+the transaction had failed, is `25P02`, as it is in the twin. Tasks in
+transactions at once each hold their own connection. A handler cannot see which
+task performs an operation, so `serve` takes an operation to belong to the one
+open transaction whose connection is not waiting on the server, and to no
+transaction when every one is: a task holding a transaction open must wait on
+nothing but its own statements. One that waits on anything else — `task.yield`,
+`task.join`, `clock.sleep`, another host operation — leaves its transaction
+between statements while other tasks run, so an operation from a task with no
+transaction is taken for its own, and one performed while two transactions are
+between statements is raised.
+
+A connection that fails is class `08`: `08001` it could not be opened, `08006`
+it broke, `08P01` a reply could not be read, `08003` the transaction's
+connection is gone and the transaction with it, and `08007` a `commit` whose
+outcome is unknown. A server that asks for a password when none was given is
+`28000`.
 
 The connection string is `postgres://user[:password]@host[:port]/database`,
 and its query carries what every connection the pool opens starts with, told
@@ -1391,6 +1416,7 @@ pub type Heard = Said(String) | Quiet | Closed
 
 pub nondet effect process {
   read  args[p]()             -> List<String>
+  read  bound[e]()            -> Bool
   write out[p](text: String)  -> Unit
   write err[p](text: String)  -> Unit
   write line[p]()             -> Option<String>
@@ -1413,9 +1439,10 @@ consumed and two readers of one input race for it), and `exit` ends the program
 there: nothing after it runs, no value is
 printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). These
 are bound only by `ply run --host`; `ply test` withholds them, even with
-`--host` (`E0424`). The operations whose label is an executable — `spawn`,
-`start` and those on a started child — are bound by `ply test --host` too, for
-the labels `--exec` names. Under `ply run --json` the lines `out` writes go to
+`--host` (`E0424`). The operations whose label is an executable — `bound`,
+`spawn`, `start` and those on a started child — are bound by `ply test --host`
+too: a label `--exec` does not name is unbound (`E0456`), and `bound` answers
+`false` for it. Under `ply run --json` the lines `out` writes go to
 stderr, so stdout still carries the one object. Handle it over a `Captured`
 value: `captured(args)`, `args_step`, `out_step`, `err_step`, `line_step` and `exit_step` keep each line,
 hand out `with_input`'s scripted input lines, and the first exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
@@ -1427,6 +1454,9 @@ but the executable: `--exec cc=/usr/bin/cc` binds one program to `cc`, and
 executable bound is `E0456`, and an `--exec` path that is missing, is not a file
 or has no execute bit is `E0457` before anything runs. Nothing in the call names
 a program, so the run decides what a footprint's `process.spawn[cc]` may do.
+`bound` answers whether the run bound a program to its label, so a program that
+can do without one asks `process.bound[cc]()` rather than ending at `E0456`; the
+table is settled before anything runs, so the answer holds for the whole run.
 
 `args` is the argument vector after the program; `dir` is the working
 directory, and `""` is the run's own. `env` is the *whole* environment: a spawn
@@ -1444,6 +1474,8 @@ hands out planned `Finished` values in order and records each `Launch`; a spawn
 with no reply planned answers `Exited(127)`, as a shell does for a command it
 could not run. Build replies with `exited(code, out, err)` and
 `signalled(signal, out, err)`, and read one back with `exit_code`.
+`runs_bound_step` answers `bound`: `true` once a reply is planned, unless the
+test sets the twin's `bound`, and no spawn changes it.
 
 `start` launches a child beside the program, by the same label, `dir` and `env`
 rules, and answers its handle — an `Int`, as a socket's is — or `Err` with why
@@ -1486,9 +1518,10 @@ Handle the children over a `Children` value: `children(planned)` hands each
 `output_line` hears in order, `Closed` once that runs out — and a start with
 none planned answers `Err`. `start_step`, `wait_step`, `signal_step`,
 `input_step` and `output_line_step` each answer an `Answered` of the twin and
-what the host would have said, `end_input_step` answers the twin, and each
-`Child` records its launch, the bytes written to it, whether its input is open
-and the signals it was sent. A `Kill` ends a scripted child, so the next `wait` hands it back, and
+what the host would have said, `end_input_step` answers the twin, `bound_step`
+answers `bound` as `runs_bound_step` does, `true` once a script is planned, and
+each `Child` records its launch, the bytes written to it, whether its input is
+open and the signals it was sent. A `Kill` ends a scripted child, so the next `wait` hands it back, and
 a spent or unknown handle panics, as the host refuses one.
 
 ### 13.10 `std.time`
@@ -1787,7 +1820,11 @@ clear-text password, and SCRAM-SHA-256; md5 is refused with a message naming it.
 bound as text, and both answer the columns, the rows and the command tag; NULL is
 `None` and every column is `Some` bytes. A statement the server refuses is
 `Rejected(session, server)`, which carries the connection back because it is
-still usable — the SQLSTATE is what a program branches on. `finish` sends
+still usable; one the server hangs up after, as it does after a `FATAL` error, is
+`Refused(server)`. A `Server` is the refusal's `severity`, its SQLSTATE `code` —
+what a program branches on — its `message` and `detail`, and the `constraint` a
+violation names. A session's `status` is where its transaction stood at the last
+`ReadyForQuery`: `Idle`, `InTransaction` or `FailedTransaction`. `finish` sends
 `Terminate` and closes.
 
 The SCRAM steps are exposed because they are pure: `scram_first_bare` writes the
@@ -2256,8 +2293,9 @@ always runs and is never cached. An operation performed inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
-test run binds `process.spawn`, `process.start` and the operations on a started
-child for the labels `--exec` names. All flags below require `--host`.
+test run binds `process.bound`, `process.spawn`, `process.start` and the
+operations on a started child, which reach only the programs `--exec` names. All
+flags below require `--host`.
 
 `ply hosts` lists every bindable operation (`effect.op[resource]`: one row per
 operation and label some row of the program names, where a written mode atom
