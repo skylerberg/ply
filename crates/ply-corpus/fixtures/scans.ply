@@ -1,0 +1,176 @@
+// What the byte builtins are worth: `examples/hello.ply`'s request-line parser, once over its three
+// scans as the byte builtins do them and once as `fold`s over `range`, which is how the endpoint
+// scanned before the builtins existed, timed over heads a filler field longer each point.
+//
+// It times itself and prints one JSON object: for each point, the microseconds each of `repeats`
+// rounds of `iterations` parses took. `BENCH_ITERATIONS` and `BENCH_REPEATS` are its settings; the
+// folds, which are slower, parse a tenth as many.
+
+import std.config
+import std.config (config)
+import std.json
+import std.json (Json)
+import std.process (process)
+import std.router (int_of_text)
+import std.time (time)
+
+// The three scans the parser is written over.
+pub type Scans = {
+  name: String,
+  // The first byte of `set` at or after `from`, or the length when there is none.
+  index_of: (Bytes, Bytes, Int) -> Int,
+  // Just past the first CRLF CRLF, or -1 while the head is unfinished.
+  head_end: (Bytes) -> Int,
+  all_upper: (Bytes) -> Bool,
+}
+
+pub fn builtins() -> Scans =
+  {
+    name: "builtins",
+    index_of: |hay: Bytes, set: Bytes, from: Int| bytes_scan_until(hay, from, set, bytes_len(hay)),
+    head_end: |head: Bytes|
+      match bytes_index_of(head, b"\r\n\r\n") { Some(at) -> at + 4, None -> -1 },
+    all_upper: |b: Bytes|
+      bytes_scan(b, 0, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ", bytes_len(b)) == bytes_len(b),
+  }
+
+pub fn folds() -> Scans =
+  {
+    name: "folds",
+    index_of: |hay: Bytes, set: Bytes, from: Int|
+      fold(range(0, bytes_len(hay)), bytes_len(hay), |best: Int, i: Int|
+        if best < bytes_len(hay) || i < from || bytes_at(hay, i) != bytes_at(set, 0) { best }
+        else { i }),
+    head_end: |head: Bytes|
+      fold(range(0, bytes_len(head)), -1, |best: Int, i: Int|
+        if best >= 0 || i + 3 >= bytes_len(head) { best } else if bytes_at(head, i) == 13
+            && bytes_at(head, i + 1) == 10
+            && bytes_at(head, i + 2) == 13
+            && bytes_at(head, i + 3) == 10 { i + 4 }
+        else { best }),
+    all_upper: |b: Bytes|
+      fold(range(0, bytes_len(b)), true, |ok: Bool, i: Int|
+        ok && bytes_at(b, i) >= 65 && bytes_at(b, i) <= 90),
+  }
+
+// The request line's three parts, or 0 for a head the parser refuses: `hello.ply`'s `parse`.
+pub fn parsed(s: Scans, head: Bytes) -> Int =
+  if (s.head_end)(head) < 0 { 0 } else {
+    let lf = (s.index_of)(head, b"\n", 0);
+    if lf < 1 || bytes_at(head, lf - 1) != 13 { 0 }
+    else { request_line(s, bytes_slice(head, 0, lf - 1)) }
+  }
+
+fn request_line(s: Scans, line: Bytes) -> Int = {
+  let n = bytes_len(line);
+  let sp1 = (s.index_of)(line, b" ", 0);
+  let sp2 = if sp1 >= n { n } else { (s.index_of)(line, b" ", sp1 + 1) };
+  if sp1 >= n || sp2 >= n || (s.index_of)(line, b" ", sp2 + 1) < n { 0 } else {
+    let method = bytes_slice(line, 0, sp1);
+    let target = bytes_slice(line, sp1 + 1, sp2);
+    let version = bytes_slice(line, sp2 + 1, n);
+    if bytes_len(method) == 0 || !(s.all_upper)(method) { 0 }
+    else if bytes_len(target) == 0 || bytes_at(target, 0) != 47 { 0 }
+    else if version != b"HTTP/1.1" && version != b"HTTP/1.0" { 0 }
+    else { bytes_len(method) + bytes_len(target) + bytes_len(version) }
+  }
+}
+
+// The benchmark's request line with `headers` filler fields under it.
+pub fn padded_head(headers: Int) -> Bytes =
+  bytes_of_string(
+    "GET /hello HTTP/1.1\r\n"
+      ++ fold(range(0, headers), "", |acc: String, i: Int|
+        acc ++ "X-Pad-" ++ (if i < 10 { "0" } else { "" }) ++ int_to_string(i)
+          ++ ": 0123456789abcdef0123456789abcdef0123456789abcdef\r\n")
+      ++ "\r\n",
+  )
+
+// --- The clock --------------------------------------------------------------------------
+
+fn spin(left: Int, acc: Int, s: Scans, head: Bytes) -> Int =
+  if left <= 0 { acc } else { spin(left - 1, acc + parsed(s, observe(head)), s, head) }
+
+fn timed(n: Int, s: Scans, head: Bytes) -> Int / {time.elapsed_us} = {
+  let started = time.elapsed_us();
+  let _ = observe(spin(n, 0, s, head));
+  time.elapsed_us() - started
+}
+
+pub type Point = { scans: String, headers: Int, bytes: Int, iterations: Int, runs_us: List<Int> }
+
+// Heads up to the 2048 bytes `hello.ply` holds; past that the endpoint refuses, a different path.
+fn points(n: Int, repeats: Int) -> List<Point> / {time.elapsed_us} =
+  fold(
+    filter([0, 1, 2, 4, 8, 16, 32], |headers: Int| bytes_len(padded_head(headers)) <= 2048),
+    [],
+    |acc: List<Point>, headers: Int| {
+      let head = padded_head(headers);
+      fold([builtins(), folds()], acc, |inner: List<Point>, s: Scans| {
+        let times = if s.name == "folds" { if n / 10 < 1 { 1 } else { n / 10 } } else { n };
+        push(inner, {
+          scans: s.name,
+          headers: headers,
+          bytes: bytes_len(head),
+          iterations: times,
+          runs_us: map(range(0, repeats), |_r: Int| timed(times, s, head)),
+        })
+      })
+    },
+  )
+
+// --- The report ------------------------------------------------------------------------
+
+fn number(n: Int) -> Json = json::Number(decimal_of_int(n))
+
+pub fn report(repeats: Int, ps: List<Point>) -> Json =
+  json::object([
+    { key: "repeats", value: number(repeats) },
+    {
+      key: "points",
+      value: json::array(
+        map(ps, |p: Point|
+          json::object([
+            { key: "scans", value: json::Str(p.scans) },
+            { key: "headers", value: number(p.headers) },
+            { key: "bytes", value: number(p.bytes) },
+            { key: "iterations", value: number(p.iterations) },
+            { key: "runs_us", value: json::array(map(p.runs_us, |us: Int| number(us))) },
+          ])),
+      ),
+    },
+  ])
+
+fn setting(key: String, fallback: Int) -> Int / {config.get[bench]} =
+  match config.get[bench](key) {
+    None -> fallback,
+    Some(text) -> match int_of_text(text) {
+      Some(n) -> if n > 0 { n } else { fallback },
+      None -> panic(key ++ " is `" ++ text ++ "`, which is not a number"),
+    },
+  }
+
+fn main() -> Unit / {config.get[bench], time.elapsed_us, process.out[proc]} = {
+  let n = setting("BENCH_ITERATIONS", 2000);
+  let repeats = setting("BENCH_REPEATS", 3);
+  process.out[proc](json::to_string(report(repeats, points(n, repeats))))
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+test "both scans parse every head alike" {
+  let heads = [
+    padded_head(0),
+    padded_head(8),
+    b"GET / HTTP/1.1\r\n",
+    b"get / HTTP/1.1\r\n\r\n",
+    b"GET /\r\n\r\n",
+    b"GET / HTTP/2\r\n\r\n",
+    b"GET x HTTP/1.1\r\n\r\n",
+  ];
+  assert_eq(
+    map(heads, |h: Bytes| parsed(builtins(), h)),
+    map(heads, |h: Bytes| parsed(folds(), h)),
+  );
+  assert_eq(parsed(builtins(), padded_head(0)), 3 + 6 + 8)
+}
