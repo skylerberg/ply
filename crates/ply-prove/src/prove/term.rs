@@ -142,7 +142,7 @@ pub enum Node {
     /// Distinct from [`Node::Int`]: `5` and `5u32` must not be congruent. Arithmetic stays opaque.
     Fixed {
         ty: IntTy,
-        bits: u64,
+        bits: u128,
     },
     Unit,
     /// A `forall` binder, `result`, a constructor field exposed by a case split, or an opaque
@@ -292,7 +292,7 @@ impl Terms {
         self.mk(Node::Decimal { mantissa, scale }, Some(Sort::decimal()))
     }
 
-    pub fn fixed(&mut self, ty: IntTy, bits: u64) -> TermId {
+    pub fn fixed(&mut self, ty: IntTy, bits: u128) -> TermId {
         let bits = ty.normalize(bits);
         self.mk(Node::Fixed { ty, bits }, Some(Sort::con(ty.name())))
     }

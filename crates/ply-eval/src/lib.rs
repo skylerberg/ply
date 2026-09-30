@@ -93,6 +93,6 @@ pub use span::{
 };
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Fields, Fixed, Map, SECRET_REDACTED, Synth, Value,
+    Closure, ClosureKind, Decimal, Fields, Fixed, FixedOp, Map, SECRET_REDACTED, Synth, Value,
     constant_time_eq, first_difference, values_equal,
 };
