@@ -86,6 +86,30 @@ pub enum Blocker {
     Induction(String),
 }
 
+impl Blocker {
+    /// The kind a report prints, and the definition or reason it names, if any.
+    pub fn parts(&self) -> (&'static str, Option<String>) {
+        match self {
+            Blocker::RecursiveCall(def) => ("recursive_call", Some(def.to_string())),
+            Blocker::EffectfulCall(def) => ("effectful_call", Some(def.to_string())),
+            Blocker::UnfoldLimit(def) => ("unfold_limit", Some(def.to_string())),
+            Blocker::OpaqueCall(def) => ("opaque_call", Some(def.to_string())),
+            Blocker::Division => ("division", None),
+            Blocker::NonlinearMultiplication => ("nonlinear_multiplication", None),
+            Blocker::CoefficientRange => ("coefficient_range", None),
+            Blocker::Lambda => ("lambda", None),
+            Blocker::Concat => ("concat", None),
+            Blocker::BitOperator => ("bit_operator", None),
+            Blocker::FloatTerm => ("float_term", None),
+            Blocker::DecimalArithmetic => ("decimal_arithmetic", None),
+            Blocker::Region => ("region", None),
+            Blocker::UndecidableMatchArm => ("undecidable_match_arm", None),
+            Blocker::DestructuringLet => ("destructuring_let", None),
+            Blocker::Induction(why) => ("induction", Some(why.clone())),
+        }
+    }
+}
+
 /// A non-`Int` numeric operand type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Numeric {

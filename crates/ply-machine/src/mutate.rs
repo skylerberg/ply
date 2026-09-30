@@ -367,15 +367,13 @@ where
         return Verdict::Unresolved("the C backend could not be built");
     };
     // The mutant's selection is the program's decision over tests whose hashes this store has never
-    // seen, so a test the program found in the cache is new here. Everything else — the classes they
-    // share, the roots a seeded test owes, the reason for a nondet one — is the program's.
-    // Nothing is known about this program yet, so every test the run reports on runs, and the
-    // classes are one: a mutant's verdict is behaviour, and a class is only a way to overlap
-    // behaviour that does not conflict. Nothing it proves is filed, since the keys the program named
+    // seen, so a test the program found in the cache is new here and every test that reaches the
+    // mutant runs, in the classes the program coloured over every test the run reports on: a subset
+    // of a class shares nothing either. Nothing it proves is filed, since the keys the program named
     // are the unmutated tests'. The reasons stay the program's, with `cached` read as `new`.
     let mut fresh = choice.clone();
     fresh.runs = plan.visible.clone();
-    fresh.groups = vec![plan.visible.clone()];
+    fresh.groups = choice.every.clone();
     fresh.narrowed.clear();
     fresh.filed.clear();
     fresh.reasons = fresh

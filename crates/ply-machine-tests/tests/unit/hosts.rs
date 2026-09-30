@@ -261,8 +261,10 @@ fn hermetic_is_the_default_and_reaches_nothing() {
     }
 }
 
+/// Which tests a binding reaches is the runtime's fact; what that makes of the counts a report
+/// prints is `suite.schedule`'s.
 #[test]
-fn a_host_backed_test_leaves_the_trivially_parallel_count() {
+fn a_binding_reaches_the_tests_whose_footprint_it_serves_and_a_hermetic_one_reaches_none() {
     let program = check(DB);
     let hosts = Hosts::bind(full(), &program, true).unwrap();
     assert_eq!(hosts.label(), "host");
@@ -276,16 +278,6 @@ fn a_host_backed_test_leaves_the_trivially_parallel_count() {
     assert!(hosts.reaches(&reads.footprint));
     assert!(!hosts.reaches(&pure));
 
-    let counts = Counts::of(
-        &hosts,
-        [(&reads.footprint, true), (&pure, true), (&pure, false)],
-    );
-    assert_eq!(counts.total, 3);
-    assert_eq!(counts.host, 1);
-    assert_eq!(counts.isolated, 1);
-    assert_eq!(counts.shared, 1);
-
-    // Under a hermetic binding the host column is empty.
     let hermetic = Hosts::open(
         &program,
         false,
@@ -295,13 +287,7 @@ fn a_host_backed_test_leaves_the_trivially_parallel_count() {
         &ply_machine::trace::TraceOptions::silent(),
     )
     .unwrap();
-    let counts = Counts::of(
-        &hermetic,
-        [(&reads.footprint, true), (&pure, true), (&pure, false)],
-    );
-    assert_eq!(counts.host, 0);
-    assert_eq!(counts.isolated, 2);
-    assert_eq!(counts.shared, 1);
+    assert!(!hermetic.reaches(&reads.footprint));
 }
 
 fn transport_only(transport: Transport) -> Disclosures {

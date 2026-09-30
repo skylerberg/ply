@@ -402,7 +402,7 @@ pub fn register(registry: &mut HostRegistry, shutdown: Option<&Arc<Shutdown>>) {
     for (op, handler) in registrations(shutdown) {
         match shutdown {
             Some(_) => registry.register(op, handler),
-            None => registry.register_withheld(op, handler),
+            None => registry.register_withheld(op, handler, crate::process::ONLY_A_RUN),
         }
     }
 }
