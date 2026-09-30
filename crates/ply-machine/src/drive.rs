@@ -135,6 +135,9 @@ impl Target {
             sources: err.sources,
             artifact: None,
         })?;
+        if front.is_some_and(|f| f.promises == crate::driver::Promises::Held) {
+            return Ok(Target::Project(Box::new(loaded)));
+        }
         match crate::costs::broken_promises(&loaded) {
             Some(err) => Err(Refused {
                 diagnostics: err.diagnostics,
