@@ -23,8 +23,6 @@ pub const MIN_PROPERTY_CASES: u32 = 25;
 
 pub const UNFOLD_DEPTH: u32 = 3;
 
-pub const ENUMERATION_BOUND: u64 = 4096;
-
 /// Past this depth only non-recursive constructors are drawn, so generation terminates.
 pub const GEN_DEPTH: u32 = 4;
 

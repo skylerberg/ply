@@ -1885,13 +1885,13 @@ fn cache_stats_reports_a_discarded_front_end_cache_too() {
 }
 
 #[test]
-fn test_json_carries_schema_version_five_and_a_ranked_suspect_object() {
+fn test_json_carries_schema_version_six_and_a_ranked_suspect_object() {
     let dir = project(RED);
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let v = json_of(&out);
 
-    assert_eq!(v["schema_version"], 5);
+    assert_eq!(v["schema_version"], 6);
     let f = &v["failures"][0];
     assert_eq!(f["key"], "m.balance never goes negative");
     assert_eq!(f["name"], "balance never goes negative");
@@ -1918,9 +1918,10 @@ fn test_json_carries_schema_version_five_and_a_ranked_suspect_object() {
     );
 
     assert_eq!(f["footprint"]["declared"], serde_json::json!([]));
-    assert!(f["footprint"]["observed"].is_null());
-    assert!(f["assertion"].is_null());
-    assert!(f["causal_slice"].is_null());
+    assert_eq!(f["defect"], false);
+    // The run searched nothing, so there is no interleaving to replay and no race to name.
+    assert!(f["replay"].is_null());
+    assert!(f["race"].is_null());
 }
 
 #[test]
@@ -1953,7 +1954,6 @@ fn bisect_never_reports_not_requested_and_is_still_one_json_object() {
     let v = json_of(&out);
     assert_eq!(v["options"]["bisect"], "never");
     assert_eq!(v["options"]["bisect_budget"], 64);
-    assert_eq!(v["options"]["trace"], "auto");
     assert_eq!(v["failures"][0]["culprit"]["verdict"], "not_attempted");
     assert_eq!(v["failures"][0]["culprit"]["skipped"], "not_requested");
     assert_eq!(v["failures"][0]["culprit"]["confidence"], "none");
@@ -2357,6 +2357,176 @@ fn a_seeded_test_whose_every_root_passed_alone_is_cached_under_a_narrower_plan()
     assert_eq!(
         v["simulation"]["simulated"], 0,
         "no root was searched again: {v}"
+    );
+}
+
+/// A measurement asks for one root's trial by naming it: the roots searched are the ones named, and
+/// each passes on its own, so a narrower range inside it is answered without searching again.
+#[test]
+fn a_root_range_searches_exactly_those_seeds() {
+    let dir = project(ONE_SPAWN);
+    let out = ply(dir.path())
+        .args(["test", "--json", "--sim", "random", "--sim-roots", "5..7"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    assert_eq!(v["summary"]["passed"], 1, "{v}");
+    assert_eq!(
+        v["options"]["sim"]["roots"],
+        serde_json::json!([5, 6]),
+        "{v}"
+    );
+    assert_eq!(v["options"]["sim"]["seeds"], 2, "{v}");
+
+    let one = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--sim", "random", "--sim-roots", "6..7"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(one["selection"]["tests"][0]["reason"], "cached", "{one}");
+    assert_eq!(one["simulation"]["simulated"], 0, "{one}");
+
+    let refused = ply(dir.path())
+        .args(["test", "--sim-roots", "7..5"])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+}
+
+/// A test is no process: it may start and drive the programs `--exec` names, and nothing else of
+/// `process`.
+const SPAWNS: &str = "\
+import std.process (process, Discard, Keep)
+
+fn echoed() -> Bytes / {process.spawn[echo]} = process.spawn[echo]([\"hi\"], \"\", []).out
+
+fn started() -> Option<Bytes> / {process.start[echo], process.wait[echo]} =
+  match process.start[echo]([\"hi\"], \"\", [], { input: false, out: Keep, err: Discard }) {
+    Err(_) -> None,
+    Ok(child) -> match process.wait[echo](child, 0 - 1) { Some(f) -> Some(f.out), None -> None },
+  }
+
+fn said() -> Unit / {process.out[proc]} = process.out[proc](\"hi\")
+
+test/nondet \"spawns echo\" { assert_eq(echoed(), b\"hi\\n\") }
+
+test/nondet \"starts echo and waits for it\" { assert_eq(started(), Some(b\"hi\\n\")) }
+
+test/nondet \"writes a line\" { said() }
+";
+
+#[test]
+fn a_test_run_binds_what_exec_names_and_withholds_the_rest_of_process() {
+    let dir = project(SPAWNS);
+    let v = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--host", "--exec", "echo=/bin/echo"])
+            .output()
+            .unwrap(),
+    );
+    let status = |label: &str| -> Value {
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == label)
+            .map(|r| r["status"].clone())
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(status("spawns echo"), "passed", "{v}");
+    assert_eq!(status("starts echo and waits for it"), "passed", "{v}");
+    assert_eq!(status("writes a line"), "failed", "{v}");
+    assert_eq!(v["failures"][0]["diagnostic"]["code"], "E0424", "{v}");
+
+    // Without `--exec`, the spawn is withheld too, and the refusal says what binds it.
+    let bare = ply(dir.path())
+        .args(["test", "--host", "--filter", "spawns"])
+        .output()
+        .unwrap();
+    let text = stdout_of(&bare);
+    assert!(text.contains("`--exec`"), "{text}");
+}
+
+#[test]
+fn a_family_the_program_does_not_declare_is_refused_to_a_test_run() {
+    let dir = project(GREEN);
+    let out = ply(dir.path())
+        .args(["test", "--json", "--host", "--allow", "machine"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let v = json_of(&out);
+    assert_eq!(v["diagnostics"][0]["code"], "E0459", "{v}");
+}
+
+/// What a test performed is counted, so a measurement can price the operations a suite makes.
+#[test]
+fn each_result_counts_the_operations_its_test_performed() {
+    let dir = project(
+        "effect counter {\n  read tick[c]() -> Int\n}\n\n\
+         fn twice() -> Int / {counter.read[c]} = counter.tick[c]() + counter.tick[c]()\n\n\
+         test \"ticks\" { assert_eq(handle { twice() } with { counter.tick[c]() -> 1 }, 2) }\n\n\
+         test \"pure\" { assert_eq(1 + 1, 2) }\n",
+    );
+    let v = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--no-cache"])
+            .output()
+            .unwrap(),
+    );
+    let performs = |label: &str| -> u64 {
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == label)
+            .and_then(|r| r["performs"].as_u64())
+            .unwrap_or_else(|| panic!("`{label}` carries no count: {v}"))
+    };
+    assert_eq!(performs("pure"), 0, "{v}");
+    assert_eq!(performs("ticks"), 2, "{v}");
+}
+
+/// What a bisection's mixtures proved is written after the run's own write, so the next process
+/// answers them from the cache rather than building them again.
+#[test]
+fn a_bisections_proven_mixtures_outlive_the_process_that_tried_them() {
+    let dir = project(
+        "fn a(n: Int) -> Int = n + 1\n\
+         fn b(n: Int) -> Int = n + 2\n\
+         fn c(n: Int) -> Int = n + 3\n\
+         fn all(n: Int) -> Int = a(n) + b(n) + c(n)\n\n\
+         test \"sums\" { assert_eq(all(0), 6) }\n",
+    );
+    assert!(
+        ply(dir.path())
+            .arg("test")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    std::fs::write(
+        dir.path().join("m.ply"),
+        "fn a(n: Int) -> Int = n + 1\n\
+         fn b(n: Int) -> Int = n + 5\n\
+         fn c(n: Int) -> Int = n + 4\n\
+         fn all(n: Int) -> Int = a(n) + b(n) + c(n)\n\n\
+         test \"sums\" { assert_eq(all(0), 6) }\n",
+    )
+    .unwrap();
+    let first = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
+    assert_eq!(
+        first["failures"][0]["culprit"]["search"]["cached"], 0,
+        "{first}"
+    );
+    let second = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
+    assert!(
+        second["failures"][0]["culprit"]["search"]["cached"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "nothing the first bisection proved was read back: {second}"
     );
 }
 
