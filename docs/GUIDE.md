@@ -254,18 +254,42 @@ package root: `rev` may be a commit, a tag or a branch, and a branch means what
 it means the day it is fetched — the fetched tree is reused without asking the
 remote again, so a cleared cache is what picks up a moved branch, and `ply.lock`'s
 digest is what catches it when that happens. A fetch that git cannot do is
-`E0140`. `Registry` sources arrive with resolution.
+`E0140`.
+
+A `Registry` dependency is the package of that `name` from the registry
+`PLY_REGISTRY` names (§15.1), at least `min`; its `name` must be a package name
+(`E0131`). `ply resolve` is the one command that fetches from the registry: it
+selects a version, fetches its archive, checks it and unpacks it into the
+project's own cache, `.ply-cache/registry/<name>`, one directory per name,
+where every other command reads it without the network. A registry dependency the cache does not
+hold, or holds below a floor the closure asks for, is `E0135` or `E0136`, and
+`ply resolve` is what fixes either. The archives themselves are kept beside it
+as `<name>@<version>.plyz`, and one the cache already holds is not fetched
+again. What the registry answered is checked before anything in it is read:
+an archive whose bytes are not the digest the index lists, not the digest
+`ply.lock` pins for that version, or not the package and version it was asked
+for is `E0142` — a published version never changes, so different bytes for a
+pinned one are refused rather than accepted. An unset, malformed or silent
+registry is `E0141`, and a name the registry does not hold, or a floor no
+unyanked version meets, is `E0143`.
 
 The manifest is checked on every load. Resolution is minimal version selection:
 two manifests may ask different floors of one package — the highest floor wins —
 and a dependency below its importer's floor is `E0136`. One version of a package
 serves a whole closure, so a package *of one name at two places* is `E0137`,
 naming both requesters and both paths, while a package two others both depend on
-is an ordinary diamond and resolves to the one version they agree on.
+is an ordinary diamond and resolves to the one version they agree on. Over a
+registry the same rule selects: each floor reaches the lowest published version
+at or above it that is not yanked — or the version `ply.lock` already pins, while
+that is at or above it — each version reached adds its own manifest's floors, and
+each name settles on the highest version reached. The order the manifests are
+read in changes none of it. A yanked version is passed over by a new resolution
+and kept by a lock that already pins it.
 
 `ply build` records what it resolved in `ply.lock`, beside the package's own
 `ply.pkg`: every dependency's name, its version, and the BLAKE3 digest of the
-modules it contributed, sorted by name. A package is pinned by *what* it is and
+modules it contributed, sorted by name, and for a registry dependency the
+`archive` digest it was fetched as. A package is pinned by *what* it is and
 never by where it was found, so a moved checkout keeps its pin. A build verifies
 the lock before it writes an artifact — a dependency whose sources moved since it
 was pinned is `E0138`, and a lock this `ply` cannot read is `E0139` — and writes
@@ -278,10 +302,11 @@ but not the repository a fetch came from — plus `vendor/index`, one line per
 package saying which want that directory answers. A walk that finds the index
 reads those trees and asks for nothing else, so a vendored checkout builds with
 no cache, no network and no git; the lockfile's digest still says the sources are
-the ones that were pinned. `ply why
+the ones that were pinned. A registry dependency is vendored like any other, and
+`ply resolve` in a vendored project writes the version it selects into the
+vendored copy as well as the cache, so the next walk reads what the lock pins. `ply why
 NAME` says how a package got here: the path from the root package to it through
-the packages that declare it, then the version and digest it resolved to. `Git`
-and `Registry` sources arrive with resolution.
+the packages that declare it, then the version and digest it resolved to.
 
 A command acts on the root package, the one whose tree it was given: a
 dependency's `main` is no entry point, and `ply test` runs the root package's
@@ -1666,14 +1691,20 @@ type Manifest = {
   dependencies: List<Dep>,
   entry: Option<String>,
 }
+type Release = { version: Version, digest: String, yanked: Bool, runtime: Version }
+type Index = { name: String, versions: List<Release> }
 ```
 
 The package manifest as typed data: a `ply.pkg` file is one literal of
 `Manifest`, checked with the same judgment §3.1 states for parameter defaults
-(`E0129`–`E0131` when it is not). Every type derives `json`; `Version` also
-derives `ord`, ordered major, then minor, then patch. `prefix_of` and
-`entry_of` answer the defaults (`name` and `main`), and `render_version`
-writes a version dotted.
+(`E0129`–`E0131` when it is not). Every manifest type derives `json`; `Version`
+also derives `ord`, ordered major, then minor, then patch. `prefix_of` and
+`entry_of` answer the defaults (`name` and `main`), `render_version` writes a
+version dotted and `parse_version` reads one back (three counts, no leading
+zero, nothing else). `Index` is a registry's `index.json` (§15.1): every
+published `Release` of one package, newest last, read and written by
+`index_json` (`release_json` for one entry), with each version as its dotted
+text.
 
 ### 13.16 `std.pg` — the postgres wire protocol
 
@@ -2215,7 +2246,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | flag | meaning |
 | --- | --- |
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
-| `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `cache` (`store`), `bootstrap` (`archive`), `hosts` (`tcb`) or `edit` (`ply run`, `ply test`); `E0459` otherwise |
@@ -2261,12 +2292,84 @@ holds two identical declarations it cannot tell apart (two effects, or two
 members of one recursive group); an artifact from another version is `E0444`.
 `--config-schema` ships that function too.
 
+### 15.1 The registry
+
+A library is published to a registry and depended on from it (§3.3). A registry
+is a directory of files behind an HTTP server, laid out statically:
+
+```
+GET  /<name>/index.json                  every version of <name>, newest last
+GET  /<name>/<version>/package.plyz      the library's `.plyz`, as `ply build` writes it
+GET  /<name>/<version>/package.plyz.b3   its digest, one `b3:<hex>` line
+PUT  /<name>/<version>                   publish: the `.plyz` as the body
+POST /<name>/<version>/yank              mark the version yanked
+```
+
+`index.json` is `{"name": .., "versions": [{"version": "0.2.0", "digest":
+"b3:..", "yanked": false, "runtime": {"major": .., "minor": .., "patch": ..}}]}`
+in publication order, `runtime` being the toolchain the version's manifest
+declares. It is advisory: a resolve checks every archive against it and against
+the lock, so a stale or hostile index can cause a refusal and never a wrong
+build. A version's identity is the digest `ply build` seals its `.plyz` with —
+BLAKE3 under the library domain over the entry field and every byte from the
+section table on, the same framing a `.plyx` digest takes — written out in full.
+
+`ply publish [path]` builds the library's `.plyz` exactly as `ply build` does and
+sends it to the registry `PLY_REGISTRY` names, under the token
+`PLY_REGISTRY_TOKEN` holds, as `Authorization: Bearer <token>` with
+`X-Ply-Digest: b3:<hex>`. Only a library is published, and one whose
+dependencies are all `Registry` ones, since whoever depends on it resolves them
+from the registry alone; a program, the anonymous package or a path or git
+dependency is `E0145`, as is a `ply yank` name or version that is not one. The
+registry recomputes the digest from the body and refuses a mismatch, refuses a
+version it already lists — a published version never changes, and the fix is a
+new version — and refuses an archive whose manifest is not the package and
+version it was sent as, names an entry, or depends on anything but the
+registry; each refusal is `E0144` with the registry's reason.
+`ply yank NAME VERSION` sets the version's `yanked` field under the same token:
+a new resolution passes it over and a lock that pins it keeps it, and its archive
+is served exactly as before. Nothing is ever deleted.
+
+`PLY_REGISTRY` is one base URL, `https://host[:port][/prefix]`; the client
+verifies the server against the built-in roots and the certificates `PLY_TRUST`
+names (§16), so a registry under a private CA is reached by pointing `PLY_TRUST`
+at the CA's certificate. A handshake the client cannot complete is `E0141`, and
+says so. `http://` is accepted only for a registry on this machine
+(`localhost`, `127.x.x.x`, `[::1]`), because a publish carries a token.
+
+The registry is a Ply program, `crates/ply-registry/ply`:
+
+```
+$ ply run crates/ply-registry/ply --host --fs store=/srv/ply \
+    --tls registry=cert.pem,key.pem --set tls=registry --set port=8443 \
+    --config tokens.conf
+```
+
+`store` is the tree above; `port` is where it listens (default `8080`); `tls`
+names the `--tls` credential it serves with, and without it the registry serves
+plain HTTP, for a proxy that terminates TLS in front of it or a registry on this
+machine. Each package's token is the configuration key `token.<name>` — one exact
+name per key, so a `--config` file of `token.orders=...` lines is the whole of
+who may publish what. It serves one connection at a time, and takes a package's
+lock around every write, so two registries over one store never interleave one.
+Like every Ply listener it binds `127.0.0.1`: another machine reaches it through a
+proxy in front of it, one that passes TLS through to a `--tls` registry or
+terminates it for a plain one.
+
 ## 16. The `ply` command
 
 `ply [--color auto|always|never] <command> [path] [options]`. `--color` is
 global; `auto` colours only a terminal with `NO_COLOR` unset. The path defaults
 to `.`. Every command takes `--json` and then prints exactly one JSON object on
 stdout, compact and with its keys sorted.
+
+The command reads its own environment: `NO_COLOR`, `PLY_CACHE_UPSTREAM` (§1),
+`PLY_REGISTRY` and `PLY_REGISTRY_TOKEN` (§15.1), the backend's `PLY_C_*`
+(§8.6), and `PLY_TRUST` — PEM files, colon-separated, whose certificates the
+command's own HTTPS connections (a registry's, for `ply publish`, `ply yank` and
+`ply resolve`) accept beside the built-in roots, as `--trust` does for a
+program's `net.connect_tls`. Every file it names must load: one that does not is
+`E0430` before the command runs.
 
 | exit | meaning |
 | --- | --- |
@@ -2297,9 +2400,11 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
-| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest; the one command that fetches registry dependencies, from `PLY_REGISTRY` |
 | `ply vendor [path]` | copy the closure into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
+| `ply publish [path]` | build this library's `.plyz` and upload it to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN` (§15.1) |
+| `ply yank NAME VERSION` | mark a published version yanked, under `PLY_REGISTRY_TOKEN`; no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |
@@ -2308,7 +2413,8 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
-`ply show`, `ply replace`, `ply resolve`, `ply vendor`, `ply why`, `ply callers`,
+`ply show`, `ply replace`, `ply resolve`, `ply vendor`, `ply why`, `ply publish`,
+`ply yank`, `ply callers`,
 `ply std`, `ply explain`, `ply hosts`, `ply cache` and `ply bootstrap` are one
 Ply program (`crates/ply-cli/ply`, entered at `ply.main`). The program itself parses the command line, prints help and
 refusals, and resolves the paths it is given against the working directory — a
@@ -2437,12 +2543,17 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0132` | an import of a package the manifest does not declare as a dependency |
 | `E0133` | two packages granting one module prefix |
 | `E0134` | packages depending on one another in a cycle |
-| `E0135` | a dependency that is missing, unmanifested or not a path |
+| `E0135` | a dependency that is missing, unmanifested or not fetched |
 | `E0136` | a dependency below the version floor its importer asks for |
 | `E0137` | one package reached at two places, where a closure pins one version |
 | `E0138` | a dependency whose sources are not what `ply.lock` pinned |
 | `E0139` | a `ply.lock` that does not decode or is from another format |
 | `E0140` | a git dependency that could not be fetched |
+| `E0141` | a registry that could not be asked: unset, malformed or not answering |
+| `E0142` | a registry archive that is not the one the lock pins or the index lists |
+| `E0143` | a registry dependency no published version satisfies |
+| `E0144` | a publish or a yank the registry refused |
+| `E0145` | a package or a version no registry takes |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
@@ -2480,7 +2591,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0427` | host handler answered an atom outside the entry point's footprint |
 | `E0428` | `blocking` host handler answered inline |
 | `E0429` | `net.listen_tls` named a credential the run lacks |
-| `E0430` | `--tls` credential that does not load |
+| `E0430` | `--tls` credential, or certificate to trust, that does not load |
 | `E0439` | `Secret` passed to a host operation not allowed one |
 | `E0440` | configuration source unreadable |
 | `E0441` | required configuration key missing |
