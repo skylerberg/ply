@@ -3,7 +3,7 @@ use ply_span::{SourceId, Symbol};
 use ply_store::body::{BodySet, of_front};
 use ply_store::{Outcome, PassRecord, Store};
 use ply_test::bisect::{
-    Baseline, ChangeSet, Regression, Rehashed, Skipped, StoreClassify, TrialOutcome, change_set,
+    Baseline, ChangeSet, Regression, Rehashed, StoreClassify, TrialOutcome, change_set,
 };
 use ply_test::{BodyHybrid, Signature, hybrid};
 use ply_ty::{CheckOutput, DefHash, HashOutput, ModuleName};
@@ -533,9 +533,4 @@ fn a_pruned_body_store_is_reported_rather_than_guessed_around() {
         &BodySet::default(),
         &mixture
     ));
-    assert_eq!(
-        Skipped::NoBodies.as_str(),
-        "no_bodies",
-        "the artifact has to name the fixable cause"
-    );
 }

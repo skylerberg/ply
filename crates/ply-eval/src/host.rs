@@ -197,8 +197,8 @@ impl ShutdownReport {}
 #[derive(Default)]
 pub struct HostRegistry {
     entries: Vec<(HostOp, Arc<dyn HostHandler>)>,
-    /// Indices of `entries` this run declines to bind.
-    withheld: BTreeSet<usize>,
+    /// Indices of `entries` this run declines to bind, each with where a run does bind it.
+    withheld: BTreeMap<usize, &'static str>,
 }
 
 impl HostRegistry {
@@ -210,8 +210,14 @@ impl HostRegistry {
         self.entries.push((op, handler));
     }
 
-    pub fn register_withheld(&mut self, op: HostOp, handler: Arc<dyn HostHandler>) {
-        self.withheld.insert(self.entries.len());
+    /// `served` finishes the sentence "`<path>` serves this ..." that a refusal says.
+    pub fn register_withheld(
+        &mut self,
+        op: HostOp,
+        handler: Arc<dyn HostHandler>,
+        served: &'static str,
+    ) {
+        self.withheld.insert(self.entries.len(), served);
         self.entries.push((op, handler));
     }
 
@@ -263,7 +269,7 @@ impl HostRegistry {
 /// Rows ascending by `(effect, op, resource)`, with every registration-time check applied.
 fn resolve(
     entries: &[(HostOp, Arc<dyn HostHandler>)],
-    withheld: &BTreeSet<usize>,
+    withheld: &BTreeMap<usize, &'static str>,
     check: &CheckOutput,
 ) -> Result<Vec<HostRow>, Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
@@ -273,7 +279,7 @@ fn resolve(
 
     for (index, (op, _)) in entries.iter().enumerate() {
         // A withheld registration must not appear in the listing, footprint or index.
-        if withheld.contains(&index) {
+        if withheld.contains_key(&index) {
             continue;
         }
         // A handler `ply hosts` cannot name is one no reviewer can find.
@@ -488,7 +494,7 @@ pub struct Bound<'a> {
 
 pub struct HostBinding {
     entries: Vec<(HostOp, Arc<dyn HostHandler>)>,
-    withheld: BTreeSet<usize>,
+    withheld: BTreeMap<usize, &'static str>,
     listing: HostListing,
     footprint: Footprint,
     atoms: BTreeSet<EffectAtom>,
@@ -578,7 +584,7 @@ impl HostBinding {
             .map(|(_, candidate)| candidate.path)
     }
 
-    /// The path of a handler this run could serve the operation with but declined to bind.
+    /// Where a run does bind the handler this run could serve the operation with but declined to.
     pub fn withholds(
         &self,
         effect: &Symbol,
@@ -586,8 +592,7 @@ impl HostBinding {
         resource: Option<&Symbol>,
     ) -> Option<&'static str> {
         self.matching(effect, op, resource)
-            .filter(|(index, _)| self.withheld.contains(index))
-            .map(|(_, candidate)| candidate.path)
+            .and_then(|(index, _)| self.withheld.get(&index).copied())
     }
 
     fn matching(
@@ -755,6 +760,7 @@ pub fn err_withheld(
     operation: &str,
     effect: &Symbol,
     path: &'static str,
+    served: &'static str,
 ) -> Diagnostic {
     let module = effect
         .as_str()
@@ -766,9 +772,7 @@ pub fn err_withheld(
         format!("`{operation}` reached the host boundary in a run that binds no handler for it"),
     )
     .primary(span, "no handler here, and this run bound none")
-    .note(format!(
-        "`{path}` serves this under `ply run --host`, and `ply test` withholds it whether or not `--host` was passed"
-    ))
+    .note(format!("`{path}` serves this {served}"))
     .note(format!(
         "handle `{operation}` over `{module}`'s twin, which is what makes a test that reads it `det`, cached and hermetic"
     ))

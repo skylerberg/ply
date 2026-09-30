@@ -69,6 +69,40 @@ fn a_path_dependency_serves_its_modules_and_runs_them() {
     }
 }
 
+/// A project's test run tests the project: a dependency's tests are that package's own to run.
+#[test]
+fn a_test_run_tests_the_root_package_and_never_a_dependencys() {
+    let dir = graph();
+    let root = dir.path();
+    std::fs::write(
+        root.join("lib/extra.ply"),
+        "pub fn hidden() -> Int = 35
+test \"hidden is 35\" { assert_eq(hidden(), 35) }
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("base/deep.ply"),
+        "pub fn deep() -> Int = 7
+test \"deep is 7\" { assert_eq(deep(), 7) }
+",
+    )
+    .unwrap();
+
+    let app: Value = json_of(&ply(root).args(["test", "app", "--json"]).output().unwrap());
+    assert_eq!(app["selection"]["total"], 1, "{app}");
+    assert_eq!(app["summary"]["passed"], 1, "{app}");
+    // Not hidden by a filter either: the dependencies' tests are no part of this run at all.
+    assert_eq!(app["selection"]["filtered_out"], 0, "{app}");
+
+    let lib: Value = json_of(&ply(root).args(["test", "lib", "--json"]).output().unwrap());
+    assert_eq!(lib["selection"]["total"], 1, "{lib}");
+    assert_eq!(
+        lib["selection"]["tests"][0]["key"], "extra.hidden is 35",
+        "{lib}"
+    );
+}
+
 #[test]
 fn a_transitive_dependency_the_importer_does_not_declare_is_refused() {
     let dir = graph();
@@ -156,9 +190,9 @@ fn a_git_dependency_that_cannot_be_fetched_says_so() {
     assert!(err.contains("glib"), "{err}");
 }
 
-/// The one source that still has no resolver: a registry arrives with resolution (P15).
+/// A registry dependency is read from the project's cache, and only `ply resolve` fills it.
 #[test]
-fn a_registry_dependency_is_told_what_resolves_today() {
+fn a_registry_dependency_nothing_fetched_says_what_fetches_it() {
     let dir = tempfile::tempdir().expect("a temp dir");
     std::fs::write(
         dir.path().join("ply.pkg"),
@@ -173,7 +207,15 @@ fn a_registry_dependency_is_told_what_resolves_today() {
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("E0135"), "{err}");
-    assert!(err.contains("path dependencies"), "{err}");
+    assert!(err.contains("`glib` has not been fetched"), "{err}");
+    assert!(err.contains("`ply resolve`"), "{err}");
+
+    // Resolving needs a registry to ask, and says which variable names it.
+    let out = ply(dir.path()).arg("resolve").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0141"), "{err}");
+    assert!(err.contains("`PLY_REGISTRY` is not set"), "{err}");
 }
 
 #[test]
