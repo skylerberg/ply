@@ -30,15 +30,14 @@ pub fn prover<'a>(
     loaded: &'a Loaded,
     world: &'a World,
     hosting: Option<Hosting>,
-    backend: Option<&'static dyn ply_eval::Provider>,
+    backend: &'static dyn ply_eval::Provider,
     store: &mut Store,
 ) -> Result<Prover<'a>, LoadError> {
-    let prover = Prover::over(loaded, world, Some(store))?;
-    let prover = match hosting {
+    let prover = Prover::over(loaded, world, backend, Some(store))?;
+    Ok(match hosting {
         Some(hosting) => prover.with_hosting(hosting),
         None => prover,
-    };
-    Ok(prover.with_backend(backend))
+    })
 }
 
 fn claims_of(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, LoadError> {
@@ -108,7 +107,7 @@ pub struct Prover<'a> {
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
-    backend: Option<&'static dyn ply_eval::Provider>,
+    backend: &'static dyn ply_eval::Provider,
 }
 
 /// The binding and the reactor a `law/host` runs against. The factory is owned rather than
@@ -120,13 +119,19 @@ pub struct Hosting {
 }
 
 impl<'a> Prover<'a> {
-    pub fn new(loaded: &'a Loaded, world: &'a World) -> Result<Prover<'a>, LoadError> {
-        Prover::over(loaded, world, None)
+    /// `backend` is the unit built from `loaded`, laws' and clauses' roots included.
+    pub fn new(
+        loaded: &'a Loaded,
+        world: &'a World,
+        backend: &'static dyn ply_eval::Provider,
+    ) -> Result<Prover<'a>, LoadError> {
+        Prover::over(loaded, world, backend, None)
     }
 
     fn over(
         loaded: &'a Loaded,
         world: &'a World,
+        backend: &'static dyn ply_eval::Provider,
         store: Option<&mut Store>,
     ) -> Result<Prover<'a>, LoadError> {
         let check = &loaded.check;
@@ -144,30 +149,24 @@ impl<'a> Prover<'a> {
             ctx: prove::Context::new(claims_of(loaded, store)?, world),
             laws,
             hosting: None,
-            backend: None,
+            backend,
         })
     }
 
-    pub fn with_backend(mut self, backend: Option<&'static dyn ply_eval::Provider>) -> Prover<'a> {
-        self.backend = backend;
-        self
-    }
-
     /// The unit, attached once per thread: obligations are discharged on pool threads.
-    fn compiled(&self) -> Option<Rc<dyn ply_eval::Compiled>> {
+    fn compiled(&self) -> Rc<dyn ply_eval::Compiled> {
         thread_local! {
             static ATTACHED: RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
                 const { RefCell::new(Vec::new()) };
         }
-        let provider = self.backend.as_ref()?;
-        let key = std::ptr::from_ref(*provider).cast::<()>() as usize;
+        let key = std::ptr::from_ref(self.backend).cast::<()>() as usize;
         ATTACHED.with(|attached| {
             if let Some((_, c)) = attached.borrow().iter().find(|(k, _)| *k == key) {
-                return Some(Rc::clone(c));
+                return Rc::clone(c);
             }
-            let c = provider.attach();
+            let c = self.backend.attach();
             attached.borrow_mut().push((key, Rc::clone(&c)));
-            Some(c)
+            c
         })
     }
 
@@ -240,24 +239,27 @@ impl<'a> Prover<'a> {
         }
     }
 
-    fn machine(&self) -> Machine<'a> {
-        let mut machine = Machine::new(self.front).with_max_calls(DEFAULT_MAX_CALLS);
-        // An owner is called through the machine to produce `result`, so the machine must hold the
-        // tier its propositions are entered on, or that call declines with no body.
-        if let Some(provider) = self.backend.as_ref() {
-            machine.set_compiled(provider.attach());
-        }
-        machine
+    /// What an owner is called through to produce `result`: the tier its propositions are entered
+    /// on, attached afresh.
+    fn machine(&self) -> Result<Machine<'a>, Gap> {
+        Machine::new(self.front, self.backend.attach())
+            .map(|machine| machine.with_max_calls(DEFAULT_MAX_CALLS))
+            .map_err(|refused| Gap::Raised {
+                bindings: Vec::new(),
+                diagnostic: Box::new(refused),
+                root: 0,
+                case: 0,
+            })
     }
 
     /// The machine a `law/host`'s body runs on: the run's binding and a reactor for this thread.
-    fn host_machine(&self, hosting: &Hosting) -> Machine<'a> {
-        let mut machine = self.machine();
+    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'a>, Gap> {
+        let mut machine = self.machine()?;
         machine.set_host_binding(Arc::clone(&hosting.binding));
         if let Some(factory) = &hosting.runtime {
             machine.set_host_runtime(factory());
         }
-        machine
+        Ok(machine)
     }
 
     fn decide(
@@ -363,6 +365,7 @@ impl<'a> Prover<'a> {
         };
         match self.cases(obligation, &claim, plan) {
             Ok(mut cases) => judge_case(&mut cases, values),
+            Err(Gap::Raised { diagnostic, .. }) => Outcome::Raised(*diagnostic),
             Err(_) => Outcome::Rejected,
         }
     }
@@ -485,7 +488,10 @@ impl<'a> Prover<'a> {
                 let Some(hosting) = &self.hosting else {
                     return Point::Undrawn(Gap::ReachesHost(obligation.footprint.clone()));
                 };
-                cases.machine = self.host_machine(hosting);
+                cases.machine = match self.host_machine(hosting) {
+                    Ok(machine) => machine,
+                    Err(gap) => return Point::Undrawn(gap),
+                };
             }
             Strategy::Static(Unsettled::Unhandled(row)) => {
                 return Point::Undrawn(Gap::UnhandledEffect(Some(row.clone())));
@@ -535,7 +541,10 @@ impl<'a> Prover<'a> {
             Ok(cases) => cases,
             Err(gap) => return Discharge::Unattempted(gap),
         };
-        cases.machine = self.host_machine(hosting);
+        cases.machine = match self.host_machine(hosting) {
+            Ok(machine) => machine,
+            Err(gap) => return Discharge::Unattempted(gap),
+        };
         run_property(
             obligation.key,
             &obligation.binders,
@@ -656,7 +665,7 @@ impl<'a> Prover<'a> {
             return Err(ungeneratable(binder));
         }
         Ok(Cases {
-            machine: self.machine(),
+            machine: self.machine()?,
             compiled: self.compiled(),
             guard_roots: self.guard_roots(claim),
             body_root: self.body_root(claim),
@@ -885,7 +894,7 @@ fn upgrade(discharge: Discharge, witness: Option<Proof>, variables: &[Symbol]) -
 /// How a tuple of binder values is judged: guard first, always.
 struct Cases<'a> {
     machine: Machine<'a>,
-    compiled: Option<Rc<dyn ply_eval::Compiled>>,
+    compiled: Rc<dyn ply_eval::Compiled>,
     guard_roots: Vec<Symbol>,
     body_root: Symbol,
     binders: Vec<Binder>,
@@ -899,12 +908,9 @@ struct Cases<'a> {
 impl Cases<'_> {
     /// The proposition entered on the tier, the only evaluator a proposition has.
     fn on_tier(&self, root: &Symbol, args: &[Value]) -> Result<Value, Diagnostic> {
-        let entered = match &self.compiled {
-            Some(compiled) => ply_codegen::rt::with_step_budget(self.step_budget, || {
-                compiled.enter_whole(root, args, DEFAULT_MAX_CALLS)
-            }),
-            None => ply_eval::Entered::Declined,
-        };
+        let entered = ply_codegen::rt::with_step_budget(self.step_budget, || {
+            self.compiled.enter_whole(root, args, DEFAULT_MAX_CALLS)
+        });
         match entered {
             ply_eval::Entered::Answered(value) => Ok(value),
             ply_eval::Entered::Raised(d) => Err(d),
@@ -952,7 +958,7 @@ impl Judge for Cases<'_> {
 
 /// One law body, run at a point of its value domain under a seed the interleaving search chooses.
 struct Search {
-    compiled: Option<Rc<dyn ply_eval::Compiled>>,
+    compiled: Rc<dyn ply_eval::Compiled>,
     body_root: Symbol,
     binders: Vec<Binder>,
     /// The points the guard kept, in order.
@@ -967,20 +973,18 @@ struct Search {
 impl LawSearch for Search {
     fn run(&mut self, point: u64, seed: &Seed) -> BodyRun {
         let values = self.points.get(point as usize).cloned().unwrap_or_default();
-        let declined = || ply_eval::err_not_compiled(&self.body_root, self.span);
-        let (value, record) = match &self.compiled {
-            Some(compiled) => {
-                compiled.set_seed(seed.clone(), self.steps);
-                let entered = ply_codegen::rt::with_step_budget(self.step_budget, || {
-                    compiled.enter_whole(&self.body_root, &values, DEFAULT_MAX_CALLS)
-                });
-                match entered {
-                    ply_eval::Entered::Answered(value) => (Ok(value), compiled.simulated()),
-                    ply_eval::Entered::Raised(raised) => (Err(raised), compiled.simulated()),
-                    ply_eval::Entered::Declined => (Err(declined()), None),
-                }
-            }
-            None => (Err(declined()), None),
+        let compiled = &self.compiled;
+        compiled.set_seed(seed.clone(), self.steps);
+        let entered = ply_codegen::rt::with_step_budget(self.step_budget, || {
+            compiled.enter_whole(&self.body_root, &values, DEFAULT_MAX_CALLS)
+        });
+        let (value, record) = match entered {
+            ply_eval::Entered::Answered(value) => (Ok(value), compiled.simulated()),
+            ply_eval::Entered::Raised(raised) => (Err(raised), compiled.simulated()),
+            ply_eval::Entered::Declined => (
+                Err(ply_eval::err_not_compiled(&self.body_root, self.span)),
+                None,
+            ),
         };
         concurrency::body_run(record.as_ref(), value, self.span)
     }

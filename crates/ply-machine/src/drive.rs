@@ -615,8 +615,7 @@ fn evaluate(
     declared: Option<&ply_eval::Footprint>,
     compiled: std::rc::Rc<dyn ply_eval::Compiled>,
 ) -> Result<PlyValue, Diagnostic> {
-    let mut machine = ply_eval::Machine::new(front);
-    machine.set_compiled(compiled);
+    let mut machine = ply_eval::Machine::new(front, compiled)?;
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);

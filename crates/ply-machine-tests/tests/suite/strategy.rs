@@ -79,11 +79,9 @@ fn with_prover<R>(f: impl FnOnce(&Prover<'_>) -> R) -> R {
     let dir = project(SOURCE);
     let loaded = loaded(dir.path());
     let world = World::default();
-    let prover = Prover::new(&loaded, &world)
-        .expect("the port lowers the claims")
-        .with_backend(Some(
-            ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier"),
-        ));
+    let backend =
+        ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier");
+    let prover = Prover::new(&loaded, &world, backend).expect("the port lowers the claims");
     f(&prover)
 }
 

@@ -90,14 +90,21 @@ impl Compiled {
         port_errors(&[(module, source)])
     }
 
-    /// A machine with a compiled tier attached: a bare machine holds no evaluator.
+    /// A machine on the tier compiled from this program.
     pub fn machine(&self) -> Machine<'_> {
+        self.machine_on(self.unit().attach())
+    }
+
+    /// The unit compiled from this program; each [`Provider::attach`] is a tier of its own.
+    pub fn unit(&self) -> &'static ply_codegen::Unit {
         ply_codegen::c::producer::ensure_default();
-        let mut m = Machine::new(&self.front);
-        let unit = ply_codegen::Unit::over_front(&self.front, self.texts.clone())
-            .expect("this host has a C compiler");
-        m.set_compiled(unit.attach());
-        m
+        ply_codegen::Unit::over_front(&self.front, self.texts.clone())
+            .expect("this host has a C compiler")
+    }
+
+    /// A machine on `tier`, attached from [`Compiled::unit`].
+    pub fn machine_on(&self, tier: Rc<dyn ply_eval::Compiled>) -> Machine<'_> {
+        Machine::new(&self.front, tier).expect("the tier was compiled from this program")
     }
 
     pub fn machine_on_tier(&self) -> Machine<'_> {
@@ -106,13 +113,8 @@ impl Compiled {
 
     /// [`Compiled::machine`], and the tier it runs on, which counts what it declined and why.
     pub fn machine_and_tier(&self) -> (Machine<'_>, Rc<ply_codegen::Bodies>) {
-        ply_codegen::c::producer::ensure_default();
-        let unit = ply_codegen::Unit::over_front(&self.front, self.texts.clone())
-            .expect("this host has a C compiler");
-        let tier = unit.bodies().expect("the unit builds");
-        let mut m = Machine::new(&self.front);
-        m.set_compiled(tier.clone());
-        (m, tier)
+        let tier = self.unit().bodies().expect("the unit builds");
+        (self.machine_on(tier.clone()), tier)
     }
 
     pub fn index_of(&self, name: &str) -> usize {

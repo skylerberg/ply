@@ -191,6 +191,14 @@ fn a_handler_may_not_answer_with_the_boundarys_own_code() {
         codes::RUNTIME_ERROR,
         "the classification is taken back from the handler"
     );
+    assert_eq!(d.message, "a handler claiming the machine's own verdict");
+    assert!(
+        d.notes
+            .iter()
+            .any(|n| n.contains(codes::REGION_ESCAPE_AT_BOUNDARY)),
+        "the code the handler claimed is not reported: {:?}",
+        d.notes
+    );
 }
 
 #[test]

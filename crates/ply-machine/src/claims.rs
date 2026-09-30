@@ -1083,13 +1083,14 @@ fn prepare<'a>(
                     as Arc<dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync + Send>
             }),
         });
-    let prover = crate::engine::prover(loaded, &job.world, hosting, Some(backend), store).map_err(
-        |err| Refused {
-            why: Why::Broken,
-            diagnostics: err.diagnostics,
-            sources: err.sources,
-        },
-    )?;
+    let prover =
+        crate::engine::prover(loaded, &job.world, hosting, backend, store).map_err(|err| {
+            Refused {
+                why: Why::Broken,
+                diagnostics: err.diagnostics,
+                sources: err.sources,
+            }
+        })?;
     Ok(Prepared {
         _hosts: hosts,
         prover,
