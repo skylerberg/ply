@@ -3,21 +3,21 @@
 // is a file the Rust side was pointed at, or this process's own stdin.
 
 import builder (builder)
+import cache (store)
 import args (Flags, no_flags, style_of)
-import paths (Resolved, address, here, shown)
-import diagnostic (Place, all_to_json, all_to_text, errors_of)
+import paths (Rooted, displayed, write_file)
+import diagnostic (all_to_json, all_to_text, errors_of)
 import program (Program, load_program, outside)
 import report (Answer, schema_version, ok_code, compile_error, refused)
 import show (Shown, locate)
-import sources (shelf)
+import sources (File, shelf)
 import style (Style)
-import compiler.front (Whole, Pulled, Refused, Analysed, analyse_pulling_std_with)
+import compiler.front (Whole, Pulled, Refused, Analysed, Rows, analyse_pulling_std_with, rows_of)
 import compiler.fmt (replace_item)
 import compiler.hash (HashOutput)
 import compiler.pkg (Pkgs)
 import compiler.resolve (Source, Diag, diag1)
 import std.fs (fs)
-import std.path (join)
 import std.json (Json, Null, Str, Bool, Number, object)
 
 // The item to put in place of the one named, as the Rust side reads it: `--with FILE`, else
@@ -151,17 +151,20 @@ fn spliced(p: Program, at: Int, text: Bytes) -> List<Source> =
 
 fn still_the_same(
   p: Program,
-  before: HashOutput,
+  w: Whole,
   shown: Shown,
   text: Bytes,
 ) -> Option<Diag> / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf]} = {
   // The same package closure the load used, so a project with dependencies re-checks the way it
-  // first checked: without it a dependency's bare imports have nothing to resolve against.
+  // first checked: without it a dependency's bare imports have nothing to resolve against. Seeded
+  // with what the load published, so only what the replacement moved is walked again.
+  let rows: Rows = rows_of(w);
+  let before: HashOutput = w.hashes;
   let out: Pulled = analyse_pulling_std_with(
     spliced(p, shown.at.module, text),
     shelf(),
-    [],
-    [],
+    rows.defs,
+    rows.tests,
     p.pkgs,
   );
   match out.out {
@@ -181,11 +184,14 @@ fn still_the_same(
 
 // --- The answer -------------------------------------------------------------------
 
-fn said(flags: Flags, shown: Option<Shown>, changed: Bool) -> List<String> =
+// The file of this program that holds the definition, as the load read it; none for a shipped one.
+fn file_of(p: Program, shown: Shown) -> Option<File> = list_at(p.files, shown.at.module)
+
+fn said(p: Program, flags: Flags, shown: Option<Shown>, changed: Bool) -> List<String> =
   match shown {
     None -> [],
     Some(x) -> {
-      let path = shown_path(root_of(flags), x.path);
+      let path = match file_of(p, x) { Some(f) -> displayed(f.at), None -> x.path };
       if !changed { [x.name ++ " in " ++ path ++ " is unchanged"] }
       else if flags.check { ["would replace " ++ path] }
       else { ["replaced " ++ x.name ++ " in " ++ path] }
@@ -199,13 +205,13 @@ fn file_json(shown: Option<Shown>) -> Json = match shown { Some(x) -> Str(x.path
 pub fn answered(
   s: Style,
   flags: Flags,
+  p: Program,
   shown: Option<Shown>,
   changed: Bool,
   diags: List<Diag>,
-  places: List<Place>,
 ) -> Answer = {
   let code = if len(diags) == 0 { ok_code() } else { compile_error() };
-  let lines = if len(diags) > 0 { [] } else { said(flags, shown, changed) };
+  let lines = if len(diags) > 0 { [] } else { said(p, flags, shown, changed) };
   {
     json: object([
       { key: "command", value: Str("replace") },
@@ -215,66 +221,44 @@ pub fn answered(
       { key: "name", value: name_json(shown) },
       { key: "file", value: file_json(shown) },
       { key: "changed", value: Bool(changed) },
-      { key: "diagnostics", value: all_to_json(diags, places) },
+      { key: "diagnostics", value: all_to_json(diags, p.places) },
     ]),
     lines: lines,
-    errs: all_to_text(s, diags, places),
+    errs: all_to_text(s, diags, p.places),
     code: code,
   }
 }
 
 fn stopped(s: Style, flags: Flags, p: Program, shown: Shown, d: Diag) -> Answer =
-  answered(s, flags, Some(shown), false, [d], p.places)
-
-// The root the run was pointed at. The loader already defaulted an empty path list to the working
-// directory, so a run that named none is the one it read.
-fn root_of(flags: Flags) -> Resolved =
-  match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
-
-// Where a file of the loaded program lives as the label spells it: the load names its files
-// relative to the root, and the root is not always the working directory.
-fn address_of(r: Resolved, inside: String) -> String = join(address(r), inside)
-
-// The path a report prints, the way the other commands print the files they touched.
-fn shown_path(r: Resolved, inside: String) -> String = shown(r, address_of(r, inside))
-
-fn write_label(
-  r: Resolved,
-  path: String,
-  text: Bytes,
-) -> Bool / {fs.write_file[cwd], fs.write_file[abs]} =
-  if r.label == "cwd" { fs.write_file[cwd](path, text) } else { fs.write_file[abs](path, text) }
+  answered(s, flags, p, Some(shown), false, [d])
 
 fn written(
   s: Style,
   flags: Flags,
   p: Program,
   shown: Shown,
+  file: File,
   text: Bytes,
-) -> Answer / {fs.write_file[cwd], fs.write_file[abs]} = {
-  let path = address_of(root_of(flags), shown.path);
-  if flags.check { answered(s, flags, Some(shown), true, [], p.places) } else if write_label(
-      root_of(flags),
-      path,
-      text,
-    ) { answered(s, flags, Some(shown), true, [], p.places) }
-  else { stopped(s, flags, p, shown, unwritable(shown_path(root_of(flags), shown.path))) }
-}
+) -> Answer / {fs.write_file[cwd], fs.write_file[abs]} =
+  if flags.check { answered(s, flags, p, Some(shown), true, []) }
+  else if write_file(file.at, text) { answered(s, flags, p, Some(shown), true, []) }
+  else { stopped(s, flags, p, shown, unwritable(displayed(file.at))) }
 
 fn replaced(
   s: Style,
   flags: Flags,
   p: Program,
-  before: HashOutput,
+  w: Whole,
   shown: Shown,
+  file: File,
   item: String,
 ) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} =
   match replace_item(shown.text, bytes_of_string(shown.simple), bytes_of_string(item)) {
     Err(why) -> stopped(s, flags, p, shown, not_one_item(shown, string_of_bytes_lossy(why))),
-    Ok(text) -> if text == shown.text { answered(s, flags, Some(shown), false, [], p.places) } else {
-      match still_the_same(p, before, shown, text) {
+    Ok(text) -> if text == shown.text { answered(s, flags, p, Some(shown), false, []) } else {
+      match still_the_same(p, w, shown, text) {
         Some(d) -> stopped(s, flags, p, shown, d),
-        None -> written(s, flags, p, shown, text),
+        None -> written(s, flags, p, shown, file, text),
       }
     },
   }
@@ -286,33 +270,33 @@ fn rewritten(
   w: Whole,
   shown: Shown,
 ) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs], edit.item[replace]} =
-  if shown.at.module >= len(p.files) {
-    stopped(
-      s,
-      flags,
-      p,
-      shown,
-      not_the_same(
+  match file_of(p, shown) {
+    None ->
+      stopped(
+        s,
+        flags,
+        p,
         shown,
-        "`" ++ shown.name ++ "` ships with the compiler, and no file of this program holds it",
+        not_the_same(
+          shown,
+          "`" ++ shown.name ++ "` ships with the compiler, and no file of this program holds it",
+        ),
       ),
-    )
-  } else {
-    match edit.item[replace](flags.out) {
+    Some(file) -> match edit.item[replace](flags.out) {
       Err(why) -> stopped(s, flags, p, shown, unreadable(why)),
-      Ok(item) -> replaced(s, flags, p, w.hashes, shown, item),
-    }
+      Ok(item) -> replaced(s, flags, p, w, shown, file, item),
+    },
   }
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], edit.item[replace]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], edit.item[replace], store.known[cache], store.file[cache]} = {
   let loaded: Program = load_program(flags.paths);
   let s = style_of(flags);
   match loaded.whole {
     None -> refused(s, "replace", loaded.diags, loaded.places),
     Some(w) -> match locate(loaded, w, flags.query) {
-      Err(d) -> answered(s, flags, None, false, [d], loaded.places),
+      Err(d) -> answered(s, flags, loaded, None, false, [d]),
       Ok(shown) -> rewritten(s, flags, loaded, w, shown),
     },
   }
@@ -360,6 +344,18 @@ fn a_shown() -> Shown =
 
 fn flags_of(check: Bool) -> Flags = { ..no_flags(), check: check }
 
+// The file `a_shown` is in, as the load read it from `at`.
+fn a_file(at: Rooted) -> File = { path: "m.ply", module: "m", text: a_shown().text, at: at }
+
+fn a_program(at: Rooted) -> Program =
+  {
+    files: [a_file(at)],
+    places: [],
+    diags: [],
+    whole: None,
+    pkgs: { root: b"", manifest: None, supplied: [] },
+  }
+
 test "a replacement that moves only the definition named leaves the same program behind" {
   assert_eq(compared(one_fn(b"bb"), one_fn(b"cc"), "m.two"), None)
 }
@@ -398,20 +394,49 @@ test "replacing a `fn` may move no declaration's hash, and replacing a declarati
 }
 
 test "the line a run writes says what it did, and a run that located nothing writes none" {
-  assert_eq(said(flags_of(false), Some(a_shown()), false), ["m.two in m.ply is unchanged"]);
-  assert_eq(said(flags_of(false), Some(a_shown()), true), ["replaced m.two in m.ply"]);
-  assert_eq(said(flags_of(true), Some(a_shown()), true), ["would replace m.ply"]);
-  assert_eq(said(flags_of(false), None, false), [])
+  let p = a_program({ label: "cwd", path: "m.ply" });
+  assert_eq(said(p, flags_of(false), Some(a_shown()), false), ["m.two in m.ply is unchanged"]);
+  assert_eq(said(p, flags_of(false), Some(a_shown()), true), ["replaced m.two in m.ply"]);
+  assert_eq(said(p, flags_of(true), Some(a_shown()), true), ["would replace m.ply"]);
+  assert_eq(said(p, flags_of(false), None, false), [])
+}
+
+test "the file a run names is the one the load read, wherever its root is" {
+  let under = a_program({ label: "cwd", path: "app/m.ply" });
+  assert_eq(said(under, flags_of(false), Some(a_shown()), true), ["replaced m.two in app/m.ply"]);
+  let outside_it = a_program({ label: "abs", path: "srv/app/m.ply" });
+  assert_eq(said(outside_it, flags_of(true), Some(a_shown()), true), [
+    "would replace /srv/app/m.ply",
+  ])
+}
+
+test "a replacement is written back where the load read the file, through its own root" {
+  let at: Rooted = { label: "abs", path: "srv/app/m.ply" };
+  let answer = handle {
+    written(
+      { styled: false },
+      flags_of(false),
+      a_program(at),
+      a_shown(),
+      a_file(at),
+      b"fn two() -> Int = 1 + 1\n",
+    )
+  } with {
+    fs.write_file[cwd](path, body) -> panic("a file read under `abs` is written under `abs`"),
+    fs.write_file[abs](path, body) -> path == "srv/app/m.ply",
+  };
+  assert_eq(answer.code, 0);
+  assert_eq(answer.lines, ["replaced m.two in /srv/app/m.ply"])
 }
 
 test "a refusal exits 2, writes no line, and renders the diagnostic to the error stream" {
   let answer = answered(
     { styled: false },
     flags_of(false),
+    a_program({ label: "cwd", path: "m.ply" }),
     Some(a_shown()),
     false,
     [not_the_same(a_shown(), "the replacement of `m.two` adds `m.twice`")],
-    [],
   );
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, []);

@@ -1,0 +1,99 @@
+# One of the corpus's served benches on a runner, with postgres beside it holding the desk's schema:
+#
+#   gh workflow run bench.yml -f subcommand=w6-ladder [-f flags='--served-repeats 5'] [-f ref=<branch>]
+#
+# The judged report is the `report` artifact. `w6-ladder` also writes its evidence, which carries the
+# run that took it, as the `evidence` artifact; a figure under `benches/` is re-taken by replacing it
+# with that artifact's file (`gh run download <run-id> -n evidence -D benches`) and committing it.
+name: bench
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: the branch or commit whose tree is measured
+        default: main
+        type: string
+      subcommand:
+        description: the corpus subcommand benches/corpus.sh runs
+        default: w6-ladder
+        type: choice
+        options:
+          - w6-ladder
+          - serve
+          - w3
+      flags:
+        description: "the subcommand's own flags, separated by spaces; w6-ladder's --db, --out and --machine are the job's"
+        default: ""
+        type: string
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+jobs:
+  bench:
+    name: benches/corpus.sh ${{ inputs.subcommand }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: desk
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.93.1"
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: tcc, the development profile's C compiler, and psql
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tcc postgresql-client
+      - name: The desk's schema
+        run: psql -v ON_ERROR_STOP=1 -q -h 127.0.0.1 -U postgres -d desk -f examples/desk.sql
+      - name: benches/corpus.sh ${{ inputs.subcommand }}
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+          SUBCOMMAND: ${{ inputs.subcommand }}
+          FLAGS: ${{ inputs.flags }}
+          MACHINE: "GitHub-hosted ubuntu-24.04 ${{ runner.arch }}, run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          mkdir -p evidence report
+          read -r -a flags <<< "$FLAGS"
+          postgres=$(psql -h 127.0.0.1 -U postgres -d desk -tAc 'show server_version')
+          case "$SUBCOMMAND" in
+            w6-ladder)
+              own=(--db postgres://postgres@127.0.0.1:5432/desk --out evidence --machine "$MACHINE, postgres $postgres")
+              ;;
+            *) own=() ;;
+          esac
+          benches/corpus.sh "$SUBCOMMAND" "${flags[@]}" "${own[@]}" --json > run.out
+          # The program's report is its one unindented line; the lines `ply run` writes are indented.
+          grep '^{' run.out > "report/$SUBCOMMAND.json"
+          jq -r '.rows[] | "\(.verdict.outcome)\t\(.name)"' "report/$SUBCOMMAND.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: report
+          path: report
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.subcommand == 'w6-ladder'
+        with:
+          name: evidence
+          path: evidence
+          if-no-files-found: error

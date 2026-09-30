@@ -19,6 +19,7 @@ use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
+use ply_prove::domain::Shape;
 use ply_prove::property::{GenStream, TypeWorld, generate};
 use ply_prove::shrink::Target;
 use ply_prove::{
@@ -43,11 +44,12 @@ const EFFECT: &str = "prover";
 ///
 /// A constructor crosses the substrate boundary by its program-wide name -- `claims.Raised` is not
 /// `proof.obligation.Raised` -- so building one says which module declares its type, and this is
-/// the only place that says it. `every_marshalled_type_is_declared_where_this_side_says` holds
-/// every row to the program, because a tag that names no declaration is a placeless `no arm of this
-/// match matched` the moment the program matches the value.
+/// the only place that says it, save `Refusal`: that is declared beside `prover`, so it is named by
+/// the module the lent program declares `prover` in.
+/// `every_marshalled_type_is_declared_where_this_side_says` holds every row to the program, because
+/// a tag that names no declaration is a placeless `no arm of this match matched` the moment the
+/// program matches the value.
 pub const MARSHALLED: &[(&str, &str)] = &[
-    ("claims", "Refusal"),
     ("proof.domain", "Ty"),
     ("proof.obligation", "Frame"),
     ("proof.obligation", "Evidence"),
@@ -68,7 +70,7 @@ fn home(ty: &str) -> &'static str {
         .0
 }
 
-const OPERATIONS: [(&str, &str); 14] = [
+const OPERATIONS: [(&str, &str); 15] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
     ("typed", "ply_machine::claims::typed"),
@@ -76,6 +78,7 @@ const OPERATIONS: [(&str, &str); 14] = [
     ("discharged", "ply_machine::claims::discharged"),
     ("record", "ply_machine::claims::record"),
     ("replay", "ply_machine::claims::replay"),
+    ("reaches", "ply_machine::claims::reaches"),
     ("shrink", "ply_machine::claims::shrink"),
     ("offers", "ply_machine::claims::offers"),
     ("would", "ply_machine::claims::would"),
@@ -95,7 +98,6 @@ pub struct Job {
     /// The front end the CLI ran. A run without one is refused rather than loading again: `ply
     /// prove` and `ply review` start one and hand its answer over.
     pub front: Option<crate::driver::HandedFront>,
-    pub incremental: bool,
     pub use_cache: bool,
     /// Also discharge what the shipped modules declare.
     pub std: bool,
@@ -114,11 +116,14 @@ pub struct Binding {
     pub trace: crate::trace::TraceOptions,
 }
 
-pub fn lent() -> Vec<Lent> {
+/// The operations, for a program that declares `prover` in `module`: a value this side builds of a
+/// type that module declares is named as that program names it.
+pub fn lent(module: &str) -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         job: Mutex::new(None),
         machine: Mutex::new(None),
         claims: Mutex::new(0),
+        module: module.to_string(),
     });
     OPERATIONS
         .into_iter()
@@ -150,6 +155,8 @@ struct Site {
     /// How many claims the collection held, so a re-run can refuse an index that names none
     /// before reaching the thread.
     claims: Mutex<usize>,
+    /// Where the lent program declares `prover`, and so the `Refusal` it matches.
+    module: String,
 }
 
 impl HostHandler for Site {
@@ -159,6 +166,11 @@ impl HostHandler for Site {
             ("configure", [options, front]) => {
                 let mut job = job_of(options, span)?;
                 job.front = Some(crate::driver::handed_front_of(front, span)?);
+                // A configuration begins a run, whatever the last one was left doing: its machine
+                // is dropped, which joins its thread, and its claims are no longer this run's.
+                let previous = self.held().take();
+                drop(previous);
+                *self.claims.lock().unwrap_or_else(|e| e.into_inner()) = 0;
                 *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job);
                 PlyValue::Unit
             }
@@ -194,6 +206,7 @@ impl HostHandler for Site {
                 u64::try_from(root.as_int(span, "the generator's root")?).unwrap_or(0),
                 u32::try_from(case.as_int(span, "the case to draw")?).unwrap_or(u32::MAX),
             )?,
+            ("reaches", [claims]) => self.reaches(indices(claims, span)?)?,
             ("baselines", _) => self.baselines()?,
             ("accepted", [records]) => self.accepted(records_of(records, span)?)?,
             (other, _) => return Err(unasked(other, span)),
@@ -209,18 +222,18 @@ fn choice_of(value: &PlyValue, span: Span) -> Result<obligation::Choice, Diagnos
     let mut domains = Vec::new();
     for entry in field_of(value, "domains", span)?.as_list(span, "the measured domains")? {
         let claim = field_of(entry, "claim", span)?.as_int(span, "a claim's place")? as usize;
-        let sizes = field_of(entry, "sizes", span)?
-            .as_list(span, "a binder's size")?
+        let shapes = field_of(entry, "shapes", span)?
+            .as_list(span, "a binder's shape")?
             .iter()
-            .map(|size| Ok(u64::try_from(size.as_int(span, "a binder's size")?).unwrap_or(0)))
-            .collect::<Result<Vec<u64>, Diagnostic>>()?;
+            .map(|shape| shape_of(shape, span))
+            .collect::<Result<Vec<Shape>, Diagnostic>>()?;
         let name = field_of(entry, "name", span)?
             .as_str(span, "a domain's name")?
             .to_string();
         // Keyed by the obligation's position in the run, which is how the discharge reads it back.
         // A domain for a claim this run does not report on is dropped rather than refused.
         if let Some(position) = claims.iter().position(|&c| c == claim) {
-            domains.push((position, obligation::Domain { sizes, name }));
+            domains.push((position, obligation::Domain { shapes, name }));
         }
     }
     Ok(obligation::Choice {
@@ -229,6 +242,67 @@ fn choice_of(value: &PlyValue, span: Span) -> Result<obligation::Choice, Diagnos
         read: filed_of(field_of(value, "read", span)?, span)?,
         domains,
     })
+}
+
+/// One binder's shape as `proof.domain` measured it: a builtin, a declared type's cases or a
+/// record's fields, each node with the size the program decided.
+pub fn shape_of(value: &PlyValue, span: Span) -> Result<Shape, Diagnostic> {
+    use crate::payload::field_of;
+    let size = |v: &PlyValue| -> Result<u64, Diagnostic> {
+        Ok(u64::try_from(v.as_int(span, "a size")?).unwrap_or(0))
+    };
+    let PlyValue::Ctor { name, args } = value else {
+        return Err(unshaped(span));
+    };
+    let arg = |i: usize| args.get(i).ok_or_else(|| unshaped(span));
+    match name.as_str().rsplit('.').next().unwrap_or("") {
+        "Scalar" => Ok(Shape::Scalar {
+            name: arg(0)?.as_str(span, "a builtin's name")?.to_string(),
+            size: size(arg(1)?)?,
+        }),
+        "Cases" => Ok(Shape::Cases {
+            size: size(arg(0)?)?,
+            cases: arg(1)?
+                .as_list(span, "a type's cases")?
+                .iter()
+                .map(|case| {
+                    Ok(ply_prove::domain::Case {
+                        name: Symbol::new(field_of(case, "name", span)?.as_str(span, "a case")?),
+                        size: size(field_of(case, "size", span)?)?,
+                        fields: field_of(case, "fields", span)?
+                            .as_list(span, "a case's fields")?
+                            .iter()
+                            .map(|field| shape_of(field, span))
+                            .collect::<Result<_, Diagnostic>>()?,
+                    })
+                })
+                .collect::<Result<_, Diagnostic>>()?,
+        }),
+        "Fields" => Ok(Shape::Fields {
+            size: size(arg(0)?)?,
+            fields: arg(1)?
+                .as_list(span, "a record's fields")?
+                .iter()
+                .map(|field| {
+                    Ok((
+                        Symbol::new(field_of(field, "name", span)?.as_str(span, "a field")?),
+                        shape_of(field_of(field, "shape", span)?, span)?,
+                    ))
+                })
+                .collect::<Result<_, Diagnostic>>()?,
+        }),
+        _ => Err(unshaped(span)),
+    }
+}
+
+#[cold]
+fn unshaped(span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "a measured domain holds something that is not a shape",
+    )
+    .primary(span, "the program handed this domain over")
+    .note("the program and the thread it drives are written together; this is Ply's fault")
 }
 
 /// Positions in the run's claims, each with the key the program named for it.
@@ -638,7 +712,7 @@ impl Site {
                     *self.claims.lock().unwrap_or_else(|e| e.into_inner()) =
                         collection.claims.len();
                 }
-                Ok(answered((*answer).map(collection_value)))
+                Ok(self.answered((*answer).map(collection_value)))
             }
             _ => Err(out_of_step("collected")),
         }
@@ -652,7 +726,7 @@ impl Site {
         let machine = held.as_ref().ok_or_else(|| unstarted("typed"))?;
         machine.ask(Go::Typed)?;
         match machine.step()? {
-            Step::Typed(answer) => Ok(answered((*answer).map(typed_value))),
+            Step::Typed(answer) => Ok(self.answered((*answer).map(typed_value))),
             _ => Err(out_of_step("typed")),
         }
     }
@@ -665,9 +739,9 @@ impl Site {
         let machine = held.as_ref().ok_or_else(|| unstarted("shrink"))?;
         machine.ask(Go::Shrink(claim))?;
         match machine.step()? {
-            Step::Shrink(answer) => Ok(answered(
-                (*answer).map(|width| crate::payload::option(width.map(count))),
-            )),
+            Step::Shrink(answer) => {
+                Ok(self.answered((*answer).map(|width| crate::payload::option(width.map(count)))))
+            }
             _ => Err(out_of_step("shrink")),
         }
     }
@@ -698,7 +772,7 @@ impl Site {
                 ])
             }))
         });
-        Ok(answered(value))
+        Ok(self.answered(value))
     }
 
     fn would(&self, i: usize, position: i64) -> Result<PlyValue, Diagnostic> {
@@ -706,7 +780,7 @@ impl Site {
         let machine = held.as_ref().ok_or_else(|| unstarted("would"))?;
         machine.ask(Go::Would { i, position })?;
         match machine.step()? {
-            Step::Would(answer) => Ok(answered((*answer).map(PlyValue::Bool))),
+            Step::Would(answer) => Ok(self.answered((*answer).map(PlyValue::Bool))),
             _ => Err(out_of_step("would")),
         }
     }
@@ -716,7 +790,7 @@ impl Site {
         let machine = held.as_ref().ok_or_else(|| unstarted("accept"))?;
         machine.ask(Go::Take { i, position })?;
         match machine.step()? {
-            Step::Took(answer) => Ok(answered((*answer).map(|_| PlyValue::Unit))),
+            Step::Took(answer) => Ok(self.answered((*answer).map(|_| PlyValue::Unit))),
             _ => Err(out_of_step("accept")),
         }
     }
@@ -737,7 +811,7 @@ impl Site {
                 ])
             }))
         });
-        Ok(answered(value))
+        Ok(self.answered(value))
     }
 
     /// The store's answer under each key, as a report prints one: `passed`, `failed`, or nothing.
@@ -761,7 +835,7 @@ impl Site {
         let machine = held.as_ref().ok_or_else(|| unstarted("discharged"))?;
         machine.ask(Go::Discharge(choice))?;
         match machine.step()? {
-            Step::Discharged(answer) => Ok(answered((*answer).map(|v| verdicts_value(&v)))),
+            Step::Discharged(answer) => Ok(self.answered((*answer).map(|v| verdicts_value(&v)))),
             _ => Err(out_of_step("discharged")),
         }
     }
@@ -787,8 +861,32 @@ impl Site {
         let machine = held.as_ref().ok_or_else(|| unstarted("replay"))?;
         machine.ask(Go::Replay { index, root, case })?;
         match machine.step()? {
-            Step::Replayed(answer) => Ok(answered((*answer).map(|point| point_value(&point)))),
+            Step::Replayed(answer) => Ok(self.answered((*answer).map(|point| point_value(&point)))),
             _ => Err(out_of_step("replay")),
+        }
+    }
+
+    /// What the static tier alone answers for each claim, cached or not: `None` for one it never
+    /// sees, such as a law over interleavings.
+    fn reaches(&self, wanted: Vec<usize>) -> Result<PlyValue, Diagnostic> {
+        let held = self.claims.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&index) = wanted.iter().find(|&&index| index >= *held) {
+            return Err(no_such_claim(index, *held));
+        }
+        drop(held);
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("reaches"))?;
+        machine.ask(Go::Reaches(wanted))?;
+        match machine.step()? {
+            Step::Reached(answer) => Ok(self.answered((*answer).map(|reached| {
+                PlyValue::list(
+                    reached
+                        .iter()
+                        .map(|reach| option(reach.as_ref().map(reach_value)))
+                        .collect(),
+                )
+            }))),
+            _ => Err(out_of_step("reaches")),
         }
     }
 
@@ -825,10 +923,12 @@ impl Site {
 }
 
 /// `Ok(v)` or `Err(Refusal)`, as the program reads an operation's answer.
-fn answered(answer: Result<PlyValue, Refused>) -> PlyValue {
-    match answer {
-        Ok(value) => PlyValue::ctor("Ok", vec![value]),
-        Err(refused) => PlyValue::ctor("Err", vec![refusal_value(&refused)]),
+impl Site {
+    fn answered(&self, answer: Result<PlyValue, Refused>) -> PlyValue {
+        match answer {
+            Ok(value) => PlyValue::ctor("Ok", vec![value]),
+            Err(refused) => PlyValue::ctor("Err", vec![refusal_value(&refused, &self.module)]),
+        }
     }
 }
 
@@ -871,6 +971,9 @@ enum Go {
         root: u64,
         case: u32,
     },
+    /// What the static tier alone answers for each of these claims, by its place in the
+    /// collection, whether or not anything discharged it this run.
+    Reaches(Vec<usize>),
     Baselines,
     Accept(Vec<(Symbol, ReviewRecord)>),
 }
@@ -888,6 +991,7 @@ enum Step {
     Discharged(Box<Result<Verdicts, Refused>>),
     Recorded(Vec<Diagnostic>),
     Replayed(Box<Result<Point, Refused>>),
+    Reached(Box<Result<Vec<Option<crate::engine::Reach>>, Refused>>),
     Baselines(Vec<(String, ReviewRecord)>),
     Accepted(Box<Accepted>),
 }
@@ -957,7 +1061,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
         }
     };
     let mut warnings = store.take_warnings();
-    let loaded = match load(&job, &mut store) {
+    let loaded = match load(&job) {
         Ok(loaded) => loaded,
         Err(err) => {
             let _ = told.send(Step::Collected(Box::new(Err(Refused {
@@ -1140,6 +1244,24 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                 };
                 let _ = told.send(Step::Replayed(Box::new(answer)));
             }
+            Ok(Go::Reaches(wanted)) => {
+                if prepared.is_none() {
+                    prepared = Some(prepare(&job, &loaded, &mut store));
+                }
+                let answer = match prepared.as_ref() {
+                    Some(Ok(ready)) => Ok(wanted
+                        .iter()
+                        .map(|&index| {
+                            obligations
+                                .get(index)
+                                .and_then(|obligation| ready.prover.reach(obligation, &job.plan))
+                        })
+                        .collect()),
+                    Some(Err(refused)) => Err(refused.clone()),
+                    None => return,
+                };
+                let _ = told.send(Step::Reached(Box::new(answer)));
+            }
             Ok(Go::Baselines) => {
                 let baselines = scoped
                     .defs
@@ -1176,9 +1298,8 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
 
 /// Every module parsed: a clause the run did not read is a claim nobody checked.
 ///
-/// The walk and the compiler are the CLI's, and what it answered is what this reads. `incremental`
-/// still decides whether the store takes part, exactly as it did when this side ran the front end.
-fn load(job: &Job, store: &mut Store) -> Result<Loaded, LoadError> {
+/// The walk and the compiler are the CLI's, and what it answered is what this reads.
+fn load(job: &Job) -> Result<Loaded, LoadError> {
     let Some(front) = &job.front else {
         return Err(LoadError {
             sources: ply_span::SourceMap::new(),
@@ -1194,22 +1315,7 @@ fn load(job: &Job, store: &mut Store) -> Result<Loaded, LoadError> {
             ],
         });
     };
-    let mode = if job.incremental {
-        crate::driver::Mode::Incremental
-    } else {
-        crate::driver::Mode::Full
-    };
-    let store = job.incremental.then_some(store);
-    crate::driver::load_over_front(
-        &job.path,
-        &front.files,
-        &front.packages,
-        &front.dump,
-        front.read,
-        front.front,
-        mode,
-        store,
-    )
+    crate::driver::load_over_front(&job.path, front)
 }
 
 fn flushed(store: &mut Store) -> Vec<Diagnostic> {
@@ -1482,14 +1588,14 @@ fn verdicts_of(report: &ProveReport, warnings: Vec<Diagnostic>) -> Verdicts {
 
 // --- The values the program reads -------------------------------------------------
 
-fn refusal_value(refused: &Refused) -> PlyValue {
+fn refusal_value(refused: &Refused, module: &str) -> PlyValue {
     let named = match refused.why {
         Why::Broken => "Broken",
         Why::Unbound => "Unbound",
         Why::Trouble => "Trouble",
     };
     ctor(
-        home("Refusal"),
+        module,
         named,
         vec![record(vec![
             ("diags", diags_value(&refused.diagnostics)),
@@ -1818,6 +1924,30 @@ fn verdicts_value(verdicts: &Verdicts) -> PlyValue {
     ])
 }
 
+/// What the static tier alone answered for one obligation, as the product carries it.
+fn reach_value(reach: &crate::engine::Reach) -> PlyValue {
+    record(vec![
+        ("decision", PlyValue::str(reach.decision.as_str())),
+        ("steps", tally(u64::from(reach.decision.steps()))),
+        (
+            "blockers",
+            PlyValue::list(
+                reach
+                    .blockers
+                    .iter()
+                    .map(|blocker| {
+                        let (kind, about) = blocker.parts();
+                        record(vec![
+                            ("kind", PlyValue::str(kind)),
+                            ("about", option(about.map(PlyValue::str))),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
 /// A baseline as the program reads one: the definition's hash and its spec, keyed by its name.
 fn record_value(name: &str, baseline: &ReviewRecord) -> PlyValue {
     record(vec![
@@ -1963,25 +2093,7 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
         shrink_budget: opt_int_at(prove, "shrink_budget", span)?.map(|n| n as u32),
         prove_steps: opt_int_at(prove, "steps", span)?,
     };
-    let sim_opts = crate::simulation::SimOptions {
-        seed: match opt_str_at(sim, "seed", span)? {
-            Some(text) => Some(
-                ply_eval::Seed::parse(&text)
-                    .ok_or_else(|| crate::payload::missing("a parsed seed", span))?,
-            ),
-            None => None,
-        },
-        sim: match field_of(sim, "mode", span)?.as_str(span, "the simulation's mode")? {
-            "once" => ply_eval::SimMode::Once,
-            "random" => ply_eval::SimMode::Random,
-            _ => ply_eval::SimMode::Dpor,
-        },
-        seeds: opt_int_at(sim, "seeds", span)?.map(|n| n as u32),
-        sim_budget: opt_int_at(sim, "budget", span)?.map(|n| n as u32),
-        sim_steps: opt_int_at(sim, "steps", span)?.map(|n| n as u32),
-        measure_reduction: field_of(sim, "measure_reduction", span)?
-            .as_bool(span, "measure_reduction")?,
-    };
+    let sim_opts = crate::simulation::sim_options_of(sim, span)?;
     let host = bool_at("host")?;
     let binding = if host {
         let tls_list = field_of(v, "tls", span)?;
@@ -2047,7 +2159,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
     Ok(Job {
         path: PathBuf::from(str_at("path")?),
         front: None,
-        incremental: !bool_at("no_incremental")?,
         use_cache: !bool_at("no_cache")?,
         std: bool_at("std")?,
         jobs: opt_int_at(v, "jobs", span)?.map(|n| n as u32),

@@ -1,0 +1,804 @@
+// `w6`: where a request's time goes, a layer at a time, and how much of it the language runs — the
+// part a faster way of running the language could reach. A ladder is nine rungs, each one layer
+// measured with it and without it, read against a total served end to end and a floor that answers
+// the same bytes with no language in the path. This module judges a ladder into rows — the one
+// `w6-ladder` has just taken, or the one `benches/w6-ladder.json` ships — and reads and writes the
+// evidence files, which hold measurements and what took them and nothing that judges them.
+
+import report
+import report (Row, Criterion, Measurement, Verdict, Pass, Fail, Inconclusive, Holds, holding,
+               exact, number, row, untaken)
+import std.config (config)
+import std.fs (fs)
+import std.json
+import std.json (Json, Number, Str, Array, Object, Member, object)
+import std.process (process)
+
+fn cats<a>(xss: List<List<a>>) -> List<a> =
+  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
+
+// --- The layers --------------------------------------------------------------------------
+
+// One layer of the stack: what its rung's difference is the cost of, the one thing that changes
+// between the rung's two measurements, and whether the language runs it.
+pub type Layer = { label: String, isolates: String, substitution: String, language: Bool }
+
+// Every layer, in request order.
+pub fn layers() -> List<Layer> =
+  [
+    {
+      label: "call",
+      isolates: "an iteration of an in-process loop: its body called and returned",
+      substitution: "the loop around a body that does nothing, against no loop",
+      language: true,
+    },
+    {
+      label: "endpoint",
+      isolates: "the /health endpoint's response, which the constant memo holds",
+      substitution: "the endpoint answered inside the loop, against the bare loop",
+      language: true,
+    },
+    {
+      label: "framing",
+      isolates: "HTTP/1.1: the request's head parsed and the response encoded",
+      substitution: "`parse_head` and `encode` around the endpoint, against the endpoint alone",
+      language: true,
+    },
+    {
+      label: "routing",
+      isolates: "the path matched against the route table, which the constant memo holds",
+      substitution: "the path routed before the endpoint answers, against the framed endpoint",
+      language: true,
+    },
+    {
+      label: "machine",
+      isolates: "std.http's connection loop around the pieces: read, answer, write",
+      substitution: "connections through `serve_connection`, each net operation a handler clause, against the routed request",
+      language: true,
+    },
+    {
+      label: "socket",
+      isolates: "serving: the socket, the host's reactor and pool, and what the desk's own loop does past the in-process shapes",
+      substitution: "the desk's twin served over loopback, against the in-process connection",
+      language: false,
+    },
+    {
+      label: "tls",
+      isolates: "the TLS record layer in steady state, each handshake timed apart",
+      substitution: "the desk over TLS, against plaintext, on /items",
+      language: false,
+    },
+    {
+      label: "database",
+      isolates: "the postgres boundary, the wire and the server",
+      substitution: "/items, which reads the store, against /health, which does not",
+      language: false,
+    },
+    {
+      label: "tracing",
+      isolates: "the trace sink: each record encoded and written",
+      substitution: "`--trace json` onto the desk's log, against `--trace off`",
+      language: false,
+    },
+  ]
+
+fn rank(label: String) -> Option<Int> =
+  fold(range(0, len(layers())), None, |found: Option<Int>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> match list_at(layers(), i) {
+        Some(l) -> if l.label == label { Some(i) } else { None },
+        None -> None,
+      },
+    })
+
+// --- The evidence ------------------------------------------------------------------------
+
+// What took a file's measurements: the corpus's pin, the runtime, and the machine and run the
+// command line named.
+pub type Taken = { corpus: String, runtime: String, machine: String }
+
+derive json for Taken
+
+// One rung as taken: per request, the configuration with its layer and without it, each the best
+// and the worst of the repeats.
+pub type Rung = {
+  layer: String,
+  taken_on: String,
+  with_us: Decimal,
+  with_worst_us: Decimal,
+  without_us: Decimal,
+  without_worst_us: Decimal,
+  requests: Int,
+}
+
+derive json for Rung
+
+// A served point read end to end: per request, the best and the worst of the repeats.
+pub type End = { taken_on: String, us: Decimal, worst_us: Decimal, requests: Int }
+
+derive json for End
+
+// What a ladder leaves: the rungs taken, in request order, the total and the floor when they were
+// taken, and what took them.
+pub type Evidence = { taken: Taken, rungs: List<Rung>, total: Option<End>, floor: Option<End> }
+
+derive json for Evidence
+
+// What one request of `route` allocates, the slope between two served windows the larger of which
+// is `requests` long, over an answer whose body is `body_bytes`.
+pub type Figure = {
+  taken: Taken,
+  route: String,
+  requests: Int,
+  body_bytes: Int,
+  allocations_per_request: Decimal,
+  bytes_per_request: Decimal,
+}
+
+derive json for Figure
+
+pub fn ladder_file() -> String = "benches/w6-ladder.json"
+
+pub fn figure_file() -> String = "benches/w6-alloc.json"
+
+fn joined(parts: List<String>, sep: String) -> String =
+  match parts {
+    [] -> "",
+    [first, ..rest] -> fold(rest, first, |acc: String, p: String| acc ++ sep ++ p),
+  }
+
+// JSON as a reader diffs it: a member or an element a line, two spaces a level, keys in order.
+pub fn pretty(j: Json) -> String = pretty_at(j, "")
+
+fn pretty_at(j: Json, indent: String) -> String = {
+  let inner = indent ++ "  ";
+  match j {
+    Array(items) -> if len(items) == 0 { "[]" } else {
+      "[\n" ++ joined(map(items, |x: Json| inner ++ pretty_at(x, inner)), ",\n") ++ "\n" ++ indent
+        ++ "]"
+    },
+    Object(m) -> if map_len(m) == 0 { "{}" } else {
+      "{\n"
+        ++ joined(
+          map(map_entries(m), |e: Member|
+            inner ++ json::to_string(Str(e.key)) ++ ": " ++ pretty_at(e.value, inner)),
+          ",\n",
+        )
+        ++ "\n"
+        ++ indent
+        ++ "}"
+    },
+    scalar -> json::to_string(scalar),
+  }
+}
+
+pub fn evidence_text(e: Evidence) -> String = pretty(evidence_json().encode(e)) ++ "\n"
+
+pub fn figure_text(f: Figure) -> String = pretty(figure_json().encode(f)) ++ "\n"
+
+pub fn evidence_of(bytes: Bytes) -> Result<Evidence, String> =
+  match json::decode_bytes(bytes, evidence_json()) {
+    Ok(e) -> Ok(e),
+    Err(e) -> Err(json::error_to_string(e)),
+  }
+
+pub fn figure_of(bytes: Bytes) -> Result<Figure, String> =
+  match json::decode_bytes(bytes, figure_json()) {
+    Ok(f) -> Ok(f),
+    Err(e) -> Err(json::error_to_string(e)),
+  }
+
+// --- A ladder ----------------------------------------------------------------------------
+
+pub type Step = { layer: Layer, rung: Result<Rung, String> }
+
+// A ladder to judge: a step for every layer, in request order, and the two ends a share is read
+// between.
+pub type Ladder = { steps: List<Step>, total: Result<End, String>, floor: Result<End, String> }
+
+// The rungs taken, laid against the layers; a layer with none was not taken, for `why`.
+pub fn ladder(
+  rungs: List<Rung>,
+  total: Result<End, String>,
+  floor: Result<End, String>,
+  why: (Layer) -> String,
+) -> Ladder =
+  {
+    steps: map(layers(), |l: Layer|
+      match filter(rungs, |r: Rung| r.layer == l.label) {
+        [r, ..] -> { layer: l, rung: Ok(r) },
+        [] -> { layer: l, rung: Err(why(l)) },
+      }),
+    total: total,
+    floor: floor,
+  }
+
+fn end_checked(name: String, e: Option<End>) -> Result<Unit, String> =
+  match e {
+    None -> Ok(()),
+    Some(x) -> if x.requests <= 0 { Err("the " ++ name ++ " was averaged over no requests") } else if x.us
+        <= 0m
+        || x.worst_us < x.us { Err("the " ++ name ++ "'s time is not a measurement") } else if string_trim(
+          x.taken_on,
+        )
+        == "" { Err("the " ++ name ++ " does not say what it was taken on") }
+    else { Ok(()) },
+  }
+
+// A file's rungs as a ladder, refused where a share could not honestly be read off them: a rung out
+// of request order or taken twice, one averaged over nothing, or one that does not say what it was
+// taken on.
+pub fn shipped(e: Evidence) -> Result<Ladder, String> = {
+  let _ = fold(e.rungs, Ok(-1), |acc: Result<Int, String>, r: Rung|
+    match acc {
+      Err(why) -> Err(why),
+      Ok(last) -> match rank(r.layer) {
+        None -> Err("`" ++ r.layer ++ "` is not a layer of the ladder"),
+        Some(i) -> if i <= last {
+          Err("the `" ++ r.layer ++ "` rung is out of request order, or there twice")
+        } else if r.requests <= 0 {
+          Err("the `" ++ r.layer ++ "` rung was averaged over no requests")
+        } else if string_trim(r.taken_on) == "" {
+          Err("the `" ++ r.layer ++ "` rung does not say what it was taken on")
+        } else { Ok(i) },
+      },
+    })?;
+  let _ = end_checked("total", e.total)?;
+  let _ = end_checked("floor", e.floor)?;
+  Ok(
+    ladder(
+      e.rungs,
+      match e.total { Some(t) -> Ok(t), None -> Err("the ladder it ships carries no total") },
+      match e.floor { Some(f) -> Ok(f), None -> Err("the ladder it ships carries no floor") },
+      |l: Layer| "the ladder it ships carries no `" ++ l.label ++ "` rung",
+    ),
+  )
+}
+
+// --- The judge ---------------------------------------------------------------------------
+
+// A layer more than this percentage of the request negative is one its substitution did not
+// separate, and no share read off its ladder is trustworthy.
+fn negative_bound() -> Decimal = 5m
+
+// The percentage of a request the language has to run before a faster way of running it is worth
+// building: below it, even an infinitely fast one is worth less than twice the request.
+fn share_bar() -> Decimal = 50m
+
+fn us(name: String, d: Decimal) -> Measurement = exact(name, d, "µs")
+
+fn percent(name: String, d: Decimal) -> Measurement = exact(name, d, "%")
+
+fn percent_of(part: Decimal, whole: Decimal) -> Decimal =
+  if whole == 0m { 0m } else { decimal_div(part * 100m, whole, 2, HalfEven) }
+
+fn layer_us(r: Rung) -> Decimal = r.with_us - r.without_us
+
+// The layer at its smallest, the fastest `with` against the slowest `without`, and at its largest.
+fn low_us(r: Rung) -> Decimal = r.with_us - r.without_worst_us
+
+fn high_us(r: Rung) -> Decimal = r.with_worst_us - r.without_us
+
+fn below_resolution(low: Decimal, high: Decimal) -> String = {
+  let band = report::amount(low, "µs") ++ " to " ++ report::amount(high, "µs");
+  if high < 0m {
+    "it came out negative over every repeat (" ++ band ++ "), finer than its substitution resolves"
+  } else { "its repeats run " ++ band ++ ", which does not resolve its sign" }
+}
+
+// A rung isolates its layer when the layer is positive over every repeat; one more than
+// `negative_bound` of the request negative was not isolated at all.
+pub fn separated() -> Criterion =
+  Holds(
+    "positive over every repeat; a layer more than 5% of the request negative is one its substitution did not separate",
+    |ms: List<Measurement>|
+      match ((report::value_of(ms, "low"), report::value_of(ms, "high"))) {
+        (Some(low), Some(high)) -> if low > 0m { Pass } else {
+          match report::value_of(ms, "share") {
+            Some(share) -> if share < 0m - negative_bound() {
+              Fail(report::named(ms, ["layer", "share"]))
+            } else { Inconclusive(below_resolution(low, high)) },
+            None ->
+              Inconclusive(
+                below_resolution(low, high)
+                  ++ ", and with no total a negative layer has nothing to be held to",
+              ),
+          }
+        },
+        _ -> Inconclusive("its band over the repeats was not measured"),
+      },
+  )
+
+fn layer_detail(l: Layer, r: Option<Rung>) -> Json =
+  object(
+    cats([
+      [
+        { key: "isolates", value: Str(l.isolates) },
+        { key: "substitution", value: Str(l.substitution) },
+      ],
+      match r {
+        Some(x) ->
+          [
+            { key: "taken_on", value: Str(x.taken_on) },
+            { key: "requests", value: Number(decimal_of_int(x.requests)) },
+          ],
+        None -> [],
+      },
+    ]),
+  )
+
+fn layer_row(s: Step, total: Result<End, String>) -> Row = {
+  let name = "layer " ++ s.layer.label;
+  match s.rung {
+    Err(why) -> { ..untaken(name, separated(), why), detail: layer_detail(s.layer, None) },
+    Ok(r) -> {
+      let shares = match total {
+        Ok(t) -> [percent("share", percent_of(layer_us(r), t.us))],
+        Err(_) -> [],
+      };
+      let taken = cats([
+        [
+          us("with", r.with_us),
+          us("without", r.without_us),
+          us("layer", layer_us(r)),
+          us("low", low_us(r)),
+          us("high", high_us(r)),
+        ],
+        shares,
+      ]);
+      { ..row(name, separated(), taken), detail: layer_detail(s.layer, Some(r)) }
+    },
+  }
+}
+
+fn floor_text() -> String = "more than the floor, which answers with no language in the path"
+
+// The total is a request served end to end, and a floor that costs more than it is no floor.
+pub fn above_floor(floor: Result<End, String>) -> Criterion =
+  match floor {
+    Err(why) -> Holds(floor_text(), |ms: List<Measurement>| Inconclusive("no floor: " ++ why)),
+    Ok(_) ->
+      holding(floor_text(), ["us", "floor"], |vs: List<Decimal>|
+        match vs { [total, floor] -> total > floor, _ -> false }),
+  }
+
+fn total_row(total: Result<End, String>, floor: Result<End, String>) -> Row =
+  match total {
+    Err(why) -> untaken("total", above_floor(floor), why),
+    Ok(t) -> {
+      let against = match floor {
+        Ok(f) ->
+          [us("floor", f.us), exact("over_floor", decimal_div(t.us, f.us, 2, HalfEven), "×")],
+        Err(_) -> [],
+      };
+      {
+        ..row("total", above_floor(floor), cats([[us("us", t.us), us("worst", t.worst_us)], against])),
+        detail: object([
+          { key: "taken_on", value: Str(t.taken_on) },
+          { key: "floor", value: Str(match floor { Ok(f) -> f.taken_on, Err(why) -> why }) },
+        ]),
+      }
+    },
+  }
+
+type Whole = { rungs: List<{ layer: Layer, rung: Rung }>, total: End }
+
+fn whole(l: Ladder) -> Result<Whole, String> = {
+  let t = (match l.total { Ok(t) -> Ok(t), Err(why) -> Err("the total was not taken: " ++ why) })?;
+  let rungs = fold(
+    l.steps,
+    Ok([]),
+    |acc: Result<List<{ layer: Layer, rung: Rung }>, String>, s: Step|
+      match acc {
+        Err(why) -> Err(why),
+        Ok(done) -> match s.rung {
+          Ok(r) -> Ok(push(done, { layer: s.layer, rung: r })),
+          Err(why) -> Err("the `" ++ s.layer.label ++ "` rung was not taken: " ++ why),
+        },
+      },
+  )?;
+  Ok({ rungs: rungs, total: t })
+}
+
+fn summed(xs: List<{ layer: Layer, rung: Rung }>) -> Decimal =
+  fold(xs, 0m, |acc: Decimal, x: { layer: Layer, rung: Rung }| acc + layer_us(x.rung))
+
+fn language_of(w: Whole) -> List<{ layer: Layer, rung: Rung }> =
+  filter(w.rungs, |x: { layer: Layer, rung: Rung }| x.layer.language)
+
+fn residue_us(w: Whole) -> Decimal = w.total.us - summed(w.rungs)
+
+// Only a negative residue moves the share: a positive one was never attributed to anything.
+fn seam(w: Whole) -> Decimal = if residue_us(w) < 0m { residue_us(w) } else { 0m }
+
+pub fn lower_bound() -> Criterion =
+  holding(
+    "the layers sum to no more than the request, so the share is a lower bound",
+    ["residue"],
+    |vs: List<Decimal>| match vs { [r] -> r >= 0m, _ -> false },
+  )
+
+fn residue_row(l: Ladder) -> Row =
+  match whole(l) {
+    Err(why) -> untaken("residue", lower_bound(), why),
+    Ok(w) ->
+      row("residue", lower_bound(), [
+        us("residue", residue_us(w)),
+        us("attributed", summed(w.rungs)),
+        us("total", w.total.us),
+        percent("share", percent_of(residue_us(w), w.total.us)),
+      ]),
+  }
+
+// Whether the language's rungs chain, each one's `without` the `with` of the one below and the
+// first's nothing, so the top rung's own absolute is their sum.
+fn chains(xs: List<{ layer: Layer, rung: Rung }>) -> Bool = {
+  let walked = fold(
+    xs,
+    { below: 0m, ok: true },
+    |acc: { below: Decimal, ok: Bool }, x: { layer: Layer, rung: Rung }|
+      { below: x.rung.with_us, ok: acc.ok && x.rung.without_us == acc.below },
+  );
+  walked.ok
+}
+
+// The most negative layer, as a positive percentage of the request.
+fn worst_negative(w: Whole) -> Decimal =
+  fold(w.rungs, 0m, |worst: Decimal, x: { layer: Layer, rung: Rung }| {
+    let past = percent_of(0m - layer_us(x.rung), w.total.us);
+    if past > worst { past } else { worst }
+  })
+
+fn at_bar(ms: List<Measurement>, share: Decimal) -> Verdict =
+  if share >= share_bar() { Pass } else { Fail(report::named(ms, ["share", "ceiling"])) }
+
+// What a faster way of running the language could win is bounded by the share of a request it runs,
+// and a ladder whose layers did not separate, or whose repeats put the share either side of the bar,
+// has not answered.
+pub fn reachable() -> Criterion =
+  Holds(
+    "at least 50%: below it, an infinitely fast way of running the language's part of a request is worth less than 2×",
+    |ms: List<Measurement>|
+      match ((report::value_of(ms, "share"), report::value_of(ms, "worst_negative"))) {
+        (Some(share), Some(negative)) -> if negative > negative_bound() {
+          Inconclusive(
+            "a layer came out " ++ report::amount(negative, "%")
+              ++ " of the request negative, past the 5% a ladder may carry, so no share read off it is trustworthy",
+          )
+        } else {
+          match ((report::value_of(ms, "low"), report::value_of(ms, "high"))) {
+            (Some(low), Some(high)) -> if low < share_bar() && high >= share_bar() {
+              Inconclusive(
+                "over its repeats the share runs " ++ report::amount(low, "%") ++ " to "
+                  ++ report::amount(high, "%")
+                  ++ ", either side of 50%",
+              )
+            } else { at_bar(ms, share) },
+            _ -> at_bar(ms, share),
+          }
+        },
+        _ -> Inconclusive("the share was not measured"),
+      },
+  )
+
+fn share_row(l: Ladder) -> Row =
+  match whole(l) {
+    Err(why) -> untaken("share", reachable(), why),
+    Ok(w) -> {
+      let t = w.total;
+      let language = language_of(w);
+      let share = percent_of(summed(language) + seam(w), t.us);
+      // When the rungs chain, the top one's own absolute and its band are the language's.
+      let band = match list_at(language, len(language) - 1) {
+        Some(top) -> if chains(language) {
+          [
+            percent("low", percent_of(top.rung.with_us + seam(w), t.worst_us)),
+            percent("high", percent_of(top.rung.with_worst_us + seam(w), t.us)),
+          ]
+        } else { [] },
+        None -> [],
+      };
+      let ceiling = if share < 100m {
+        [exact("ceiling", decimal_div(100m, 100m - share, 2, HalfEven), "×")]
+      } else { [] };
+      row(
+        "share",
+        reachable(),
+        cats([
+          [
+            percent("share", share),
+            percent("attributed_share", percent_of(summed(language), t.us)),
+          ],
+          band,
+          ceiling,
+          [percent("worst_negative", worst_negative(w))],
+        ]),
+      )
+    },
+  }
+
+pub fn judged(l: Ladder) -> List<Row> =
+  push(
+    push(
+      push(map(l.steps, |s: Step| layer_row(s, l.total)), total_row(l.total, l.floor)),
+      residue_row(l),
+    ),
+    share_row(l),
+  )
+
+// --- `w6`: the shipped ladder, judged ------------------------------------------------------
+
+// A file `w6-ladder --out` wrote reads back and writes out as the same bytes; one that does not was
+// edited by a hand, or written by something else.
+pub fn as_written() -> Criterion =
+  holding(
+    "is what `w6-ladder --out` writes, byte for byte, so no hand has moved a number in it",
+    ["same_bytes"],
+    |vs: List<Decimal>| vs == [1m],
+  )
+
+pub fn written_row(name: String, text: Bytes, rewritten: String) -> Row =
+  row(name, as_written(), [
+    number("same_bytes", if string_of_bytes_lossy(text) == rewritten { 1 } else { 0 }, ""),
+    number("bytes", bytes_len(text), "bytes"),
+  ])
+
+pub fn run() -> Result<report::Report, String> / {process.spawn[ply], config.get[env], fs.read[repo]} = {
+  let bytes = (match fs.read_file[repo](ladder_file()) {
+    Some(b) -> Ok(b),
+    None ->
+      Err(ladder_file() ++ " is not under the `repo` root; `w6-ladder --out benches` takes one"),
+  })?;
+  let e = (match evidence_of(bytes) {
+    Ok(e) -> Ok(e),
+    Err(why) -> Err(ladder_file() ++ " is not a ladder `w6-ladder` wrote: " ++ why),
+  })?;
+  let l = (match shipped(e) {
+    Ok(l) -> Ok(l),
+    Err(why) -> Err(ladder_file() ++ " cannot be judged: " ++ why),
+  })?;
+  report::made(
+    "w6",
+    "w6 — the ladder " ++ ladder_file() ++ " ships, judged rung by rung",
+    push(judged(l), written_row(ladder_file(), bytes, evidence_text(e))),
+    [{ key: "taken", value: taken_json().encode(e.taken) }],
+  )
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+fn rung(layer: String, on: Decimal, off: Decimal) -> Rung =
+  {
+    layer: layer,
+    taken_on: "/health",
+    with_us: on,
+    with_worst_us: on + on * 0.01m,
+    without_us: off,
+    without_worst_us: off + off * 0.01m,
+    requests: 1000,
+  }
+
+// One rung a layer: 100µs of layers in a 120µs request, 60µs of them the language's.
+fn full() -> List<Rung> =
+  [
+    rung("call", 5m, 0m),
+    rung("endpoint", 20m, 5m),
+    rung("framing", 45m, 20m),
+    rung("routing", 55m, 45m),
+    rung("machine", 60m, 55m),
+    rung("socket", 80m, 60m),
+    rung("tls", 90m, 80m),
+    rung("database", 95m, 90m),
+    rung("tracing", 100m, 95m),
+  ]
+
+fn end_at(u: Decimal) -> End = { taken_on: "/items", us: u, worst_us: u, requests: 3000 }
+
+fn over(rungs: List<Rung>) -> Ladder =
+  ladder(rungs, Ok(end_at(120m)), Ok(end_at(4m)), |l: Layer| "not taken here")
+
+fn judged_named(l: Ladder, name: String) -> report::Judged =
+  match filter(report::judge(judged(l)), |j: report::Judged| j.row.name == name) {
+    [j] -> j,
+    _ -> panic("one row is named " ++ name),
+  }
+
+fn verdict(l: Ladder, name: String) -> Verdict = judged_named(l, name).verdict
+
+fn value(l: Ladder, name: String, measure: String) -> Option<Decimal> =
+  match judged_named(l, name).row.taken { Ok(ms) -> report::value_of(ms, measure), Err(_) -> None }
+
+fn with_rung(rungs: List<Rung>, r: Rung) -> List<Rung> =
+  map(rungs, |x: Rung| if x.layer == r.layer { r } else { x })
+
+test "every layer is in request order, and the language runs the first five" {
+  assert_eq(map(layers(), |l: Layer| l.label), [
+    "call",
+    "endpoint",
+    "framing",
+    "routing",
+    "machine",
+    "socket",
+    "tls",
+    "database",
+    "tracing",
+  ]);
+  assert_eq(map(filter(layers(), |l: Layer| l.language), |l: Layer| l.label), [
+    "call",
+    "endpoint",
+    "framing",
+    "routing",
+    "machine",
+  ])
+}
+
+test "a ladder reads its residue and its share off its layers, against the total and the floor" {
+  let l = over(full());
+  assert_eq(len(judged(l)), 12);
+  assert_eq(value(l, "residue", "residue"), Some(20m));
+  assert_eq(verdict(l, "residue"), Pass);
+  assert_eq(value(l, "share", "share"), Some(50m));
+  assert_eq(value(l, "share", "ceiling"), Some(2m));
+  assert_eq(verdict(l, "share"), Pass);
+  assert_eq(value(l, "total", "over_floor"), Some(30m));
+  assert_eq(verdict(l, "total"), Pass);
+  assert_eq(verdict(l, "layer framing"), Pass);
+  assert_eq(value(l, "layer framing", "share"), Some(20.83m))
+}
+
+test "a layer past 5% of the request negative fails, and one within it is inconclusive" {
+  let broken = over(with_rung(full(), rung("tls", 70m, 80m)));
+  assert_eq(
+    verdict(broken, "layer tls"),
+    Fail([exact("layer", 0m - 10m, "µs"), exact("share", 0m - 8.33m, "%")]),
+  );
+  assert(match verdict(broken, "share") {
+    Inconclusive(why) -> string_contains(why, "past the 5% a ladder may carry"),
+    _ -> false,
+  });
+  let slight = over(with_rung(full(), rung("tls", 78m, 80m)));
+  assert(match verdict(slight, "layer tls") {
+    Inconclusive(why) -> string_contains(why, "negative over every repeat"),
+    _ -> false,
+  })
+}
+
+test "a layer whose repeats run either side of zero has not resolved its sign" {
+  let wide = { ..rung("tracing", 100m, 99m), with_worst_us: 112m, without_worst_us: 110m };
+  let l = over(with_rung(full(), wide));
+  assert_eq(value(l, "layer tracing", "layer"), Some(1m));
+  assert(match verdict(l, "layer tracing") {
+    Inconclusive(why) -> string_contains(why, "does not resolve its sign"),
+    _ -> false,
+  })
+}
+
+test "a negative residue fails, and is charged to the share rather than to nobody" {
+  let over_counted = over(
+    with_rung(with_rung(full(), rung("database", 125m, 90m)), rung("tracing", 130m, 125m)),
+  );
+  assert_eq(value(over_counted, "residue", "residue"), Some(0m - 10m));
+  assert(verdict(over_counted, "residue") != Pass);
+  assert_eq(value(over_counted, "share", "attributed_share"), Some(50m));
+  assert_eq(value(over_counted, "share", "share"), Some(41.67m));
+  assert(verdict(over_counted, "share") != Pass)
+}
+
+test "a share whose repeats straddle the bar has not answered it" {
+  let l = over(with_rung(full(), { ..rung("machine", 60m, 55m), with_worst_us: 66m }));
+  let straddling = { ..l, total: Ok({ ..end_at(120m), worst_us: 132m }) };
+  assert_eq(value(straddling, "share", "low"), Some(45.45m));
+  assert_eq(value(straddling, "share", "high"), Some(55m));
+  assert(match verdict(straddling, "share") {
+    Inconclusive(why) -> string_contains(why, "either side of 50%"),
+    _ -> false,
+  })
+}
+
+test "a small share fails with what an infinitely fast strategy is worth" {
+  let small = over([
+    rung("call", 1m, 0m),
+    rung("endpoint", 4m, 1m),
+    rung("framing", 9m, 4m),
+    rung("routing", 11m, 9m),
+    rung("machine", 12m, 11m),
+    rung("socket", 32m, 12m),
+    rung("tls", 52m, 32m),
+    rung("database", 96m, 52m),
+    rung("tracing", 100m, 96m),
+  ]);
+  assert_eq(
+    verdict(small, "share"),
+    Fail([exact("share", 10m, "%"), exact("ceiling", 1.11m, "×")]),
+  )
+}
+
+test "a rung not taken leaves the residue and the share inconclusive, and says which and why" {
+  let partial = ladder(
+    filter(full(), |r: Rung| r.layer != "tls"),
+    Ok(end_at(120m)),
+    Ok(end_at(4m)),
+    |l: Layer| "no database",
+  );
+  assert_eq(verdict(partial, "layer tls"), Inconclusive("no database"));
+  assert_eq(verdict(partial, "residue"), Inconclusive("the `tls` rung was not taken: no database"));
+  assert_eq(verdict(partial, "share"), Inconclusive("the `tls` rung was not taken: no database"));
+  let untotalled = { ..over(full()), total: Err("no database") };
+  assert_eq(verdict(untotalled, "total"), Inconclusive("no database"));
+  assert_eq(verdict(untotalled, "residue"), Inconclusive("the total was not taken: no database"));
+  assert(match verdict(untotalled, "layer call") { Pass -> true, _ -> false })
+}
+
+test "the total is held to the floor, and with none it is inconclusive" {
+  let unfloored = { ..over(full()), floor: Err("the floor is not bound") };
+  assert_eq(verdict(unfloored, "total"), Inconclusive("no floor: the floor is not bound"));
+  let upside_down = { ..over(full()), floor: Ok(end_at(200m)) };
+  assert(verdict(upside_down, "total") != Pass)
+}
+
+fn evidence() -> Evidence =
+  {
+    taken: { corpus: "b3:c0ffee", runtime: "ply 0.16.0", machine: "a laptop" },
+    rungs: full(),
+    total: Some(end_at(120.5m)),
+    floor: None,
+  }
+
+fn verdict_of(r: Row) -> Verdict =
+  match report::judge([r]) { [j] -> j.verdict, _ -> panic("one row is judged as one") }
+
+test "evidence reads back as it was written, and an edited file is not what the command writes" {
+  let text = evidence_text(evidence());
+  assert_eq(evidence_of(bytes_of_string(text)), Ok(evidence()));
+  assert_eq(verdict_of(written_row("f", bytes_of_string(text), text)), Pass);
+  let edited = bytes_of_string(string_trim(text) ++ " \n");
+  assert(verdict_of(written_row("f", edited, text)) != Pass);
+  assert(!string_contains(text, "verdict") && !string_contains(text, "criterion"))
+}
+
+test "a file is laid out one member a line, and its absent ends are null" {
+  assert_eq(
+    pretty(object([{ key: "b", value: Array([]) }, { key: "a", value: Number(1.50m) }])),
+    "{\n  \"a\": 1.50,\n  \"b\": []\n}",
+  );
+  assert(string_contains(evidence_text(evidence()), "\n  \"floor\": null,\n"))
+}
+
+test "a file out of request order, with a layer twice, or with a rung over nothing is refused" {
+  let e = evidence();
+  assert(match shipped(e) { Ok(_) -> true, Err(_) -> false });
+  let reversed = { ..e, rungs: [rung("endpoint", 20m, 5m), rung("call", 5m, 0m)] };
+  assert_eq(shipped(reversed), Err("the `call` rung is out of request order, or there twice"));
+  let twice = { ..e, rungs: [rung("call", 5m, 0m), rung("call", 5m, 0m)] };
+  assert_eq(shipped(twice), Err("the `call` rung is out of request order, or there twice"));
+  let empty = { ..e, rungs: [{ ..rung("call", 5m, 0m), requests: 0 }] };
+  assert_eq(shipped(empty), Err("the `call` rung was averaged over no requests"));
+  let unknown = { ..e, rungs: [rung("interpreter", 5m, 0m)] };
+  assert_eq(shipped(unknown), Err("`interpreter` is not a layer of the ladder"))
+}
+
+test "a shipped ladder names what it does not carry" {
+  match shipped({ ..evidence(), rungs: filter(full(), |r: Rung| r.layer != "socket") }) {
+    Err(why) -> panic(why),
+    Ok(l) -> {
+      assert_eq(
+        verdict(l, "layer socket"),
+        Inconclusive("the ladder it ships carries no `socket` rung"),
+      );
+      assert_eq(verdict(l, "total"), Inconclusive("no floor: the ladder it ships carries no floor"))
+    },
+  }
+}
+
+test "a figure reads back as it was written" {
+  let f = {
+    taken: evidence().taken,
+    route: "/health",
+    requests: 200,
+    body_bytes: 36,
+    allocations_per_request: 50.767m,
+    bytes_per_request: 3863.694m,
+  };
+  assert_eq(figure_of(bytes_of_string(figure_text(f))), Ok(f))
+}
