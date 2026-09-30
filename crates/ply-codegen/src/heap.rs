@@ -1043,6 +1043,11 @@ impl Heap {
                     code,
                     arity,
                     captured,
+                }
+                | ClosureKind::Continuation {
+                    code,
+                    arity,
+                    captured,
                 } => {
                     let o = self.alloc(
                         KIND_CLOSURE,
@@ -1057,7 +1062,9 @@ impl Heap {
                     }
                     o as Word
                 }
-                _ => self.bridge(v.clone()),
+                ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) | ClosureKind::Synth { .. } => {
+                    self.bridge(v.clone())
+                }
             },
             _ => self.bridge(v.clone()),
         }
@@ -1117,17 +1124,26 @@ impl Heap {
                 })),
                 KIND_CLOSURE => {
                     walked.handle = true;
+                    let code = word_at(o, CLOSURE_CODE) as usize;
+                    let arity = (*o).layout as usize;
                     let captured: Vec<Value> = (CLOSURE_CAPTURES..(*o).len as usize)
                         .map(|i| Heap::to_value_counted(layouts, word_at(o, i), walked))
                         .collect();
-                    Value::Closure(Arc::new(Closure {
-                        name: None,
-                        kind: ClosureKind::Native {
-                            code: word_at(o, CLOSURE_CODE) as usize,
-                            arity: (*o).layout as usize,
+                    // Only the code tells: a continuation's captures are plain immediates.
+                    let kind = if crate::detached::is_continuation(code) {
+                        ClosureKind::Continuation {
+                            code,
+                            arity,
                             captured,
-                        },
-                    }))
+                        }
+                    } else {
+                        ClosureKind::Native {
+                            code,
+                            arity,
+                            captured,
+                        }
+                    };
+                    Value::Closure(Arc::new(Closure { name: None, kind }))
                 }
                 KIND_BRIDGE => {
                     let v = bridged(o).clone();

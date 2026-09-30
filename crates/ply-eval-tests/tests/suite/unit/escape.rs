@@ -1,6 +1,6 @@
 use ply_eval::arena::{Arena, Owner, RegionKind};
 use ply_eval::escape::*;
-use ply_eval::{ClosureKind, Span, Symbol, Value, codes};
+use ply_eval::{Closure, ClosureKind, Span, Symbol, Value, codes};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -13,6 +13,20 @@ fn cell() -> Value {
             .alloc(Owner::ENTRY, Value::Int(0))
             .expect("the region is open"),
     )
+}
+
+fn closure(kind: ClosureKind) -> Value {
+    Value::Closure(Arc::new(Closure { name: None, kind }))
+}
+
+/// Assembled, since only the compiled tier has a continuation's code; its captures are numbers, as
+/// the tier's are.
+fn continuation() -> Value {
+    closure(ClosureKind::Continuation {
+        code: 0,
+        arity: 1,
+        captured: vec![Value::Int(3), Value::Int(1)],
+    })
 }
 
 #[test]
@@ -95,6 +109,66 @@ fn a_task_and_a_continuation_are_handles_too() {
         .handle,
         Handle::Task
     );
+    let found = carries(&continuation()).expect("a continuation is a handle");
+    assert_eq!(found.handle, Handle::Continuation);
+    assert!(found.route.is_empty());
+}
+
+/// Only the kind tells the two apart: a native closure over the very numbers a continuation
+/// captures is data, and one that captures a continuation carries it.
+#[test]
+fn a_native_closure_carries_a_continuation_only_by_capturing_one() {
+    let native = |captured: Vec<Value>| {
+        closure(ClosureKind::Native {
+            code: 0,
+            arity: 1,
+            captured,
+        })
+    };
+    assert_eq!(carries(&native(vec![Value::Int(3), Value::Int(1)])), None);
+
+    let wrapped = native(vec![Value::Int(2), continuation()]);
+    let found = carries(&wrapped).expect("the capture is a continuation");
+    assert_eq!(found.handle, Handle::Continuation);
+}
+
+/// One classification: each boundary refuses a continuation as it refuses a cell, and names it as
+/// what it is rather than as a type it does not have.
+#[test]
+fn every_boundary_refuses_a_continuation_and_names_it() {
+    let value = Value::ctor("m.Just", vec![continuation()]);
+    let boundaries = [
+        Boundary::HostArgument {
+            operation: "ext.keep[s]",
+            path: "test::keep",
+            position: 0,
+        },
+        Boundary::HostAnswer {
+            operation: "ext.keep[s]",
+            path: "test::keep",
+        },
+        Boundary::HostToken {
+            label: "keep",
+            token: 7,
+        },
+        Boundary::EntryPoint {
+            name: "m.resume_it",
+        },
+    ];
+    for boundary in boundaries {
+        let d = check(&boundary, &value, Span::DUMMY).expect_err("a continuation is refused");
+        assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{boundary:?}");
+        assert!(
+            d.message.contains(" a continuation") && d.message.contains("`m.Just`'s argument 1"),
+            "{boundary:?}: {}",
+            d.message
+        );
+        assert!(
+            !d.notes.iter().any(|n| n.contains("escape brand")),
+            "{boundary:?}: a continuation's type is a function's and has no brand: {:#?}",
+            d.notes
+        );
+    }
 }
 
 #[test]
@@ -106,7 +180,7 @@ fn a_builtin_closure_carries_nothing() {
 /// The generator never draws a handle, so this value is assembled directly.
 #[test]
 fn a_generated_function_holding_a_handle_is_found() {
-    use ply_eval::{Closure, Synth};
+    use ply_eval::Synth;
 
     let closure = Value::Closure(Arc::new(Closure {
         name: Some(Symbol::new("|_| c")),

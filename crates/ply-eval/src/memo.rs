@@ -30,6 +30,7 @@ pub fn world_independent(value: &Value) -> bool {
             Value::Closure(closure) => match &closure.kind {
                 ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => {}
                 ClosureKind::Native { captured, .. } => pending.extend(captured.iter()),
+                ClosureKind::Continuation { .. } => return false,
                 ClosureKind::Synth { rule, .. } => pending.extend(rule.values()),
             },
         }

@@ -179,6 +179,12 @@ pub enum ClosureKind {
         arity: usize,
         captured: Vec<Value>,
     },
+    /// A clause's `k`: native code whose captures name a body only the capturing entry holds.
+    Continuation {
+        code: usize,
+        arity: usize,
+        captured: Vec<Value>,
+    },
     /// A function the prover generated: data rather than a body, so the compiled tier applies it.
     Synth {
         arity: usize,
@@ -233,6 +239,7 @@ impl Closure {
             ClosureKind::Builtin(b) => b.arity().0,
             ClosureKind::Ctor { arity, .. }
             | ClosureKind::Native { arity, .. }
+            | ClosureKind::Continuation { arity, .. }
             | ClosureKind::Synth { arity, .. } => *arity,
         }
     }
