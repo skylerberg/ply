@@ -1,333 +1,779 @@
-// The W4 measurement program: one table, four workloads, two handlers.
-import std.db
-import std.db (db, with_server)
+// `w4`: what a statement costs through the effect boundary. The statements are those of
+// `fixtures/statements.ply`, which times itself over its own `part` table: against the in-memory
+// twin, which needs no server; against a database it opens itself, one statement after another or
+// spread over tasks; and beside a floor in C over libpq that runs the same statements with no
+// language in the path. Then what a pool of each size carries, what one smaller than the
+// transactions open at once does, and the desk served over each store and loaded. The runner
+// builds the floor and binds it as `pg_floor`; without a database, or without the floor, the rows
+// that need one are inconclusive and say which.
+
+import kit
+import kit (Kit, Server, Sample)
+import report
+import report (Row, Criterion, Measurement, Pass, Fail, Inconclusive, Holds, holding, number, exact,
+               row, untaken)
+import served
+import spine
+import spine (under)
+import stats
+import std.config (config)
+import std.fs (fs)
+import std.json
+import std.json (Json, Object, Number, Str, Bool, array)
 import std.net (net)
-import std.random (entropy)
+import std.process
+import std.process (process, Finished)
+import std.router (int_of_text)
+import std.time (time)
 
-pub fn schema() -> db::Schema = { tables: [part()] }
-
-pub fn part() -> db::Table =
-  {
-    name: "part",
-    columns: [
-      db::column("sku", db::TText, false),
-      db::column("name", db::TText, false),
-      db::column("price", db::TNumeric(10, 4), false),
-      db::column("n", db::TInt, false),
-    ],
-    primary_key: ["sku"],
-    unique: [],
-    foreign_keys: [],
-    checks: [],
-  }
-
-pub fn ddl() -> List<db::Stmt> = db::create_schema(schema())
-
-test "the fixture's DDL is the program's own" {
-  let stmts = ddl();
-  assert_eq(len(stmts), 1);
-  let sql = match list_at(stmts, 0) { Some(s) -> s.sql, None -> "" };
-  assert(string_starts_with(sql, "create table \"part\""));
-  assert(string_contains(sql, "numeric(10,4)"))
+pub type Args = {
+  repo: String,
+  scratch: String,
+  db: Option<String>,
+  // Which sections: `ops`, `sizes`, `pool`, `exhaustion` and `crud`.
+  sections: List<String>,
+  concurrency: List<Int>,
+  operations: Int,
+  rows: List<Int>,
+  pool_sizes: List<Int>,
+  pool: Int,
+  load_concurrency: List<Int>,
+  per_conn: Int,
+  requests_per_point: Int,
+  repeats: Int,
 }
 
-pub fn select_all() -> db::Stmt =
-  db::stmt("select sku, name, price, n from part order by sku limit 1")
+pub fn sections() -> List<String> = ["ops", "sizes", "pool", "exhaustion", "crud"]
 
-pub fn select_by() -> db::Stmt = db::stmt("select sku, name, price, n from part where sku = $1")
+fn has(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |seen: Bool, y: String| seen || y == x)
 
-pub fn insert_one() -> db::Stmt =
-  db::stmt("insert into part (sku, name, price, n) values ($1, $2, $3, $4)")
+fn cats<a>(xss: List<List<a>>) -> List<a> =
+  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
 
-fn sku_of(i: Int) -> String = "sku-" ++ int_to_string(i)
+fn joined(parts: List<String>, sep: String) -> String =
+  fold(parts, "", |acc: String, p: String| if acc == "" { p } else { acc ++ sep ++ p })
 
-fn row_params(i: Int) -> List<db::Param> =
-  [db::PText(sku_of(i)), db::PText("a part"), db::PNumeric(1.2500m), db::PInt(i)]
+fn tasks_text(n: Int) -> String = if n == 1 { "1 task" } else { int_to_string(n) ++ " tasks" }
 
-fn counted(a: db::Answer) -> Int =
-  match a { db::Rows(rows) -> len(rows), db::Count(n) -> n, db::Failed(_) -> 0 }
+// --- The workloads, as the program and the floor both name them ----------------------------
 
-// --- The four workloads, as the program performs them ------------------------
+pub type Workload = | Select | SelectBy | Insert | Transaction
 
-pub fn selects(n: Int) -> Int / {db.read[part]} =
-  fold(range(0, n), 0, |acc: Int, i: Int| acc + counted(db.query[part](select_all(), [])))
+pub fn workloads() -> List<Workload> = [Select, SelectBy, Insert, Transaction]
 
-// The parameter varies over the keys the fixture holds, so every execution binds a different value
-// and finds a row.
-pub fn keys() -> Int = 64
-
-pub fn selects_by(n: Int) -> Int / {db.read[part]} =
-  fold(range(0, n), 0, |acc: Int, i: Int|
-    acc + counted(db.query[part](select_by(), [db::PText(sku_of(i % keys()))])))
-
-pub fn inserts(base: Int, n: Int) -> Int / {db.write[part]} =
-  fold(range(0, n), 0, |acc: Int, i: Int|
-    acc + counted(db.execute[part](insert_one(), row_params(base + i))))
-
-// One transaction per iteration: begin, one insert, commit.
-pub fn transactions(base: Int, n: Int) -> Int / {db.write[part], db.write} =
-  fold(range(0, n), 0, |acc: Int, i: Int|
-    acc
-      + (match db::transaction(db::ReadCommitted, db::ReadWrite, || {
-          counted(db.execute[part](insert_one(), row_params(base + i)))
-        }) {
-        Ok(k) -> k,
-        Err(_) -> 0,
-      }))
-
-// --- The same four, spread over tasks ----------------------------------------
-
-pub fn selects_at(tasks: Int, per: Int) -> Int / {db.read[part], task.write} =
-  joined(map(range(0, tasks), |t: Int| task.spawn(|| selects(per))))
-
-pub fn selects_by_at(tasks: Int, per: Int) -> Int / {db.read[part], task.write} =
-  joined(map(range(0, tasks), |t: Int| task.spawn(|| selects_by(per))))
-
-pub fn inserts_at(base: Int, tasks: Int, per: Int) -> Int / {db.write[part], task.write} =
-  joined(map(range(0, tasks), |t: Int| task.spawn(|| inserts(base + t * per, per))))
-
-pub fn transactions_at(
-  base: Int,
-  tasks: Int,
-  per: Int,
-) -> Int / {db.write[part], db.write, task.write} =
-  joined(map(range(0, tasks), |t: Int| task.spawn(|| transactions(base + t * per, per))))
-
-fn joined(ts: List<Task<Int>>) -> Int / {task.write} =
-  fold(ts, 0, |acc: Int, t: Task<Int>| acc + task.join(t))
-
-// --- Serving the workloads from a database the program opens itself -----------
-
-// Where to reach the database and how many connections to keep are arguments rather than flags a
-// host reads: the program answers its own `db` — `std.db`'s reader, label check and driver are all
-// Ply — so a caller that wants a pool of a given size says so.
-effect set Served = {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next}
-
-fn served<a | e>(
-  url: String,
-  size: Int,
-  body: () -> a / {db.read[*], db.write[*] | e},
-) -> a / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
-  match with_server(url, size, body) {
-    Ok(answered) -> answered,
-    Err(why) -> panic("the database would not open: " ++ why),
+pub fn label(w: Workload) -> String =
+  match w {
+    Select -> "select",
+    SelectBy -> "select $1",
+    Insert -> "insert",
+    Transaction -> "transaction",
   }
 
-pub fn selects_served(url: String, size: Int, n: Int) -> Int / {Served} =
-  served(url, size, || selects(n))
+// The first key a write takes, past every key a fill puts in the table.
+fn base() -> Int = 1000000
 
-pub fn selects_by_served(url: String, size: Int, n: Int) -> Int / {Served} =
-  served(url, size, || selects_by(n))
+// The rows the table holds before every repeat, which is also how many keys a keyed select cycles.
+fn keys() -> Int = 64
 
-pub fn inserts_served(url: String, size: Int, base: Int, n: Int) -> Int / {Served} =
-  served(url, size, || inserts(base, n))
+// One point: `tasks` tasks of `per` statements each, over a table of `rows` rows, `repeats` times.
+pub type Point = { workload: Workload, tasks: Int, per: Int, rows: Int, repeats: Int }
 
-pub fn transactions_served(url: String, size: Int, base: Int, n: Int) -> Int / {Served} =
-  served(url, size, || transactions(base, n))
+pub fn point_settings(section: String, p: Point) -> List<List<String>> =
+  [
+    kit::set("BENCH_SECTION", section),
+    kit::set("BENCH_WORKLOAD", label(p.workload)),
+    kit::set("BENCH_TASKS", int_to_string(p.tasks)),
+    kit::set("BENCH_PER", int_to_string(p.per)),
+    kit::set("BENCH_ROWS", int_to_string(p.rows)),
+    kit::set("BENCH_BASE", int_to_string(base())),
+    kit::set("BENCH_REPEATS", int_to_string(p.repeats)),
+  ]
 
-pub fn selects_at_served(
-  url: String,
-  size: Int,
-  tasks: Int,
-  per: Int,
-) -> Int / {Served, task.write} = served(url, size, || selects_at(tasks, per))
+// --- What a point took ------------------------------------------------------------------------
 
-pub fn selects_by_at_served(
-  url: String,
-  size: Int,
-  tasks: Int,
-  per: Int,
-) -> Int / {Served, task.write} = served(url, size, || selects_by_at(tasks, per))
+// Every statement asked across the repeats, what they answered, what the pool refused and what
+// otherwise failed, and each repeat's microseconds.
+pub type Took = { asked: Int, answered: Int, refused: Int, failed: Int, runs_us: List<Int> }
 
-pub fn inserts_at_served(
-  url: String,
-  size: Int,
-  base: Int,
-  tasks: Int,
-  per: Int,
-) -> Int / {Served, task.write} = served(url, size, || inserts_at(base, tasks, per))
+fn int_of(j: Json) -> Int =
+  match j { Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }, _ -> 0 }
 
-pub fn transactions_at_served(
-  url: String,
-  size: Int,
-  base: Int,
-  tasks: Int,
-  per: Int,
-) -> Int / {Served, task.write} = served(url, size, || transactions_at(base, tasks, per))
+pub fn took_of(j: Json) -> Result<Took, String> =
+  match j {
+    Object(m) ->
+      Ok({
+        asked: spine::int_field(m, "asked"),
+        answered: spine::int_field(m, "answered"),
+        refused: spine::int_field(m, "refused"),
+        failed: spine::int_field(m, "failed"),
+        runs_us: map(spine::array_field(m, "runs_us"), int_of),
+      }),
+    _ -> Err("the program's report is not an object"),
+  }
 
-// --- The twin, installed the way `examples/desk.ply` installs it --------------
+// A point the program timed, one it ended by raising, which is itself the measurement, or one whose
+// report could not be read.
+pub type Ran = | Timed(Took) | Raised(String) | Unread(String)
 
-// The row a handler clause list discharges is the whole of what the twin answers, and a Ply row is
-// invariant in argument position, so each workload reaches the twin through a wrapper that
-// publishes the whole set.
-pub fn twin_seed() -> Int = twinned(|| wide_selects(0))
+fn first_line(text: String) -> String =
+  match filter(string_split(text, "\n"), |line: String| string_trim(line) != "") {
+    [line, ..] -> string_trim(line),
+    [] -> "it said nothing",
+  }
 
-pub fn twin_selects(n: Int) -> Int = twinned(|| wide_selects(n))
+// The diagnostic a run ended with, past any warning written before it.
+fn raised_line(text: String) -> String =
+  match filter(string_split(text, "\n"), |line: String| string_contains(line, "error[")) {
+    [line, ..] -> string_trim(line),
+    [] -> first_line(text),
+  }
 
-pub fn twin_selects_by(n: Int) -> Int = twinned(|| wide_selects_by(n))
-
-pub fn twin_inserts(base: Int, n: Int) -> Int = twinned(|| wide_inserts(base, n))
-
-pub fn twin_transactions(base: Int, n: Int) -> Int = twinned(|| wide_transactions(base, n))
-
-fn wide_selects(n: Int) -> Int / {db.read[part], db.write[part], db.write} = selects(n)
-
-fn wide_selects_by(n: Int) -> Int / {db.read[part], db.write[part], db.write} = selects_by(n)
-
-fn wide_inserts(base: Int, n: Int) -> Int / {db.read[part], db.write[part], db.write} =
-  inserts(base, n)
-
-fn wide_transactions(base: Int, n: Int) -> Int / {db.read[part], db.write[part], db.write} =
-  transactions(base, n)
-
-fn twinned(body: () -> Int / {db.read[part], db.write[part], db.write}) -> Int = sized(keys(), body)
-
-// The same twin over a table of a chosen size.
-pub fn twin_scan(k: Int, n: Int) -> Int = sized(k, || wide_selects(n))
-
-pub fn twin_scan_seed(k: Int) -> Int = sized(k, || wide_selects(0))
-
-fn sized(k: Int, body: () -> Int / {db.read[part], db.write[part], db.write}) -> Int =
-  with_cell[store](seeded_to(k)) { c -> {
-    let step = |s: db::Stmt, ps: List<db::Param>| {
-      let o = db::step(cell_get(c), s, ps);
-      cell_set(c, o.db);
-      o.out
-    };
-    let opened = |level: db::Isolation, access: db::Access| {
-      let o = db::begin_step(cell_get(c), level, access);
-      cell_set(c, o.db);
-      o.out
-    };
-    let committed = || {
-      let o = db::commit_step(cell_get(c));
-      cell_set(c, o.db);
-      o.out
-    };
-    let aborted = || {
-      let o = db::abort_step(cell_get(c));
-      cell_set(c, o.db);
-      o.out
-    };
-    handle {
-      body()
-    } with {
-      db.query[part](s, ps) -> step(s, ps),
-      db.execute[part](s, ps) -> step(s, ps),
-      db.returning[part](s, ps) -> step(s, ps),
-      db.begin(level, access) -> opened(level, access),
-      db.commit() -> committed(),
-      db.abort() -> aborted(),
-      db.rollback(reason) -> (),
+pub fn ran_of(f: Finished) -> Ran =
+  if !spine::exit_zero(f) { Raised(raised_line(string_of_bytes_lossy(f.err))) } else {
+    match kit::printed(f, "statements.ply") {
+      Err(why) -> Unread(why),
+      Ok(j) -> match took_of(j) { Err(why) -> Unread(why), Ok(t) -> Timed(t) },
     }
-  } }
-
-// The twin holding the same rows the fixture holds, put there through the same insert statement the
-// write workloads use.
-pub fn seeded() -> db::MemDb = seeded_to(keys())
-
-pub fn seeded_to(k: Int) -> db::MemDb =
-  fold(range(0, k), db::open(schema()), |d: db::MemDb, i: Int|
-    db::step(d, insert_one(), row_params(i)).db)
-
-test "the twin answers every workload" {
-  assert_eq(twin_selects(3), 3);
-  assert_eq(twin_selects_by(1), 1);
-  assert_eq(twin_inserts(100, 4), 4);
-  assert_eq(twin_transactions(200, 2), 2)
-}
-
-// --- What the harness asks the database, which is not a measurement --------
-
-// The harness's own database work is this program's, not a second client's: the same `std.db`, over
-// the same `net`, through the same pool the served rungs use. Nothing here is timed, and the table
-// it prepares and inspects is the one the workloads read and the desk serves.
-
-/// One number out of a counting statement, by the name its SQL gives the column.
-fn only_int(answered: db::Answer, column: String) -> Int =
-  match answered {
-    db::Rows(rows) -> match rows {
-      [row, ..] -> match map_get(row, column) {
-        Some(db::CInt(n)) -> n,
-        Some(db::CNumeric(d)) -> match int_of_decimal(d, Down) {
-          Some(n) -> n,
-          None -> panic("`" ++ column ++ "` does not fit an Int"),
-        },
-        Some(other) -> panic("`" ++ column ++ "` is not a number"),
-        None -> panic("the answer has no column `" ++ column ++ "`"),
-      },
-      [] -> panic("the statement answered no rows"),
-    },
-    db::Count(n) -> n,
-    db::Failed(why) -> panic("the harness's query failed: " ++ why.code ++ " " ++ why.detail),
   }
 
-fn counted_row(answered: db::Answer, column: String) -> Int =
-  match answered { db::Failed(_) -> 0, other -> only_int(other, column) }
+fn over_twin(k: Kit, p: Point) -> Ran / {process.spawn[ply], config.get[env]} =
+  ran_of(kit::ran(k, "statements.ply", point_settings("twin", p)))
 
-/// The rows the twin holds, so a keyed select hits on both sides.
-///
-/// One statement, and its `values` written out rather than generated by the server: the driver
-/// refuses a set-returning function in `from`, which is the rule that keeps the tables a labelled
-/// statement touches nameable.
-pub fn refill(url: String, size: Int, rows: Int) -> Int / {Served} =
-  served(url, size, || {
-    let cleared = counted_row(db.execute[part](db::stmt("delete from part"), []), "n");
-    cleared + counted_row(db.execute[part](db::stmt(seed_sql(rows)), []), "n")
+fn over_database(
+  k: Kit,
+  url: String,
+  pool: Int,
+  p: Point,
+) -> Ran / {process.spawn[ply], config.get[env]} =
+  ran_of(
+    kit::ran(
+      k,
+      "statements.ply",
+      cats([
+        point_settings("postgres", p),
+        [kit::set("BENCH_DATABASE", url), kit::set("BENCH_POOL", int_to_string(pool))],
+      ]),
+    ),
+  )
+
+// --- The criteria -------------------------------------------------------------------------------
+
+// A run that raised fails on that alone; otherwise `holds` is asked of what was asked, answered,
+// refused and failed.
+fn statements(text: String, holds: (Decimal, Decimal, Decimal, Decimal) -> Bool) -> Criterion =
+  Holds(text, |ms: List<Measurement>|
+    match report::measurement(ms, "raised") {
+      None -> Inconclusive("`raised` was not measured"),
+      Some(r) -> if r.value != 0m { Fail([r]) } else {
+        let counts = report::named(ms, ["asked", "answered", "refused", "failed"]);
+        match map(counts, |m: Measurement| m.value) {
+          [asked, answered, refused, failed] -> if holds(asked, answered, refused, failed) { Pass }
+          else { Fail(counts) },
+          _ -> Inconclusive("not every count was measured"),
+        }
+      },
+    })
+
+pub fn every_answered() -> Criterion =
+  statements(
+    "every statement answered, none refused by the pool or failed",
+    |asked: Decimal, answered: Decimal, refused: Decimal, failed: Decimal|
+      answered == asked && refused == 0m && failed == 0m,
+  )
+
+// A pool smaller than the tasks drawing on it may refuse a checkout, and that is its answer rather
+// than a lost statement; anything else that fails is lost.
+pub fn nothing_lost() -> Criterion =
+  statements(
+    "every statement answered or refused by the pool at once, none otherwise failed",
+    |asked: Decimal, answered: Decimal, refused: Decimal, failed: Decimal|
+      answered + refused == asked && failed == 0m,
+  )
+
+fn floor_ran() -> Criterion =
+  holding("the floor ran every statement", ["asked", "ran"], |vs: List<Decimal>|
+    match vs { [asked, ran] -> ran == asked, _ -> false })
+
+// --- The rows -----------------------------------------------------------------------------------
+
+fn best_us(runs: List<Int>) -> Option<Int> = stats::best(runs)
+
+fn per_statement(us: Int, statements: Int) -> Decimal =
+  decimal_div(
+    decimal_of_int(us),
+    decimal_of_int(if statements < 1 { 1 } else { statements }),
+    3,
+    HalfEven,
+  )
+
+// The counts a row is judged by, and its fastest repeat as microseconds a statement and a rate.
+pub fn took_measurements(t: Took, per_repeat: Int) -> List<Measurement> =
+  cats([
+    [
+      number("raised", 0, ""),
+      number("asked", t.asked, "statements"),
+      number("answered", t.answered, "statements"),
+      number("refused", t.refused, "statements"),
+      number("failed", t.failed, "statements"),
+    ],
+    match best_us(t.runs_us) {
+      Some(us) ->
+        [
+          exact("us_per_statement", per_statement(us, per_repeat), "µs"),
+          number("per_second", stats::per_second(per_repeat, us), "statements/s"),
+        ],
+      None -> [],
+    },
+  ])
+
+pub fn point_row(
+  name: String,
+  c: Criterion,
+  per_repeat: Int,
+  r: Ran,
+  beside: List<Measurement>,
+) -> Row =
+  match r {
+    Timed(t) -> row(name, c, cats([took_measurements(t, per_repeat), beside])),
+    Raised(why) -> { ..row(name, c, [number("raised", 1, "")]), detail: Str(why) },
+    Unread(why) -> untaken(name, c, why),
+  }
+
+// What running the statements over a database needs, and why a row that needs it was not taken.
+pub type Prepared = | NoDatabase | NoFloor | Unprepared(String) | Ready(Database)
+
+// The database, and the statements that put its table back as the program fills it.
+pub type Database = { url: String, fill: String }
+
+pub fn unready(p: Prepared) -> String =
+  match p {
+    NoDatabase ->
+      "no database was given: pass `--db` with a URL the corpus may make its `part` table in",
+    NoFloor ->
+      "the `part` table is made and refilled by the libpq tool, which is not bound (benches/corpus.sh builds it where `pg_config` is)",
+    Unprepared(why) -> "the `part` table could not be made: " ++ why,
+    Ready(_) -> "",
+  }
+
+// --- The floor ------------------------------------------------------------------------------
+
+fn tool(args: List<String>) -> Result<String, String> / {process.spawn[pg_floor], config.get[env]} = {
+  let f = process.spawn[pg_floor](args, "", spine::inherited_env());
+  if spine::exit_zero(f) { Ok(string_of_bytes_lossy(f.out)) } else {
+    Err(
+      "the libpq tool's `" ++ (match args { [mode, ..] -> mode, [] -> "" }) ++ "` failed: "
+        ++ first_line(string_of_bytes_lossy(f.err)),
+    )
+  }
+}
+
+// `floor 1234`: the microseconds around the statements.
+pub fn floor_us(out: String) -> Option<Int> =
+  match filter(string_split(string_trim(out), " "), |w: String| w != "") {
+    ["floor", us] -> int_of_text(us),
+    _ -> None,
+  }
+
+// The table put back as the program fills it, then the floor's run; the fastest of the repeats.
+fn floored(
+  d: Database,
+  w: Workload,
+  tasks: Int,
+  per: Int,
+  repeats: Int,
+) -> Result<Int, String> / {process.spawn[pg_floor], config.get[env]} =
+  match kit::all_of(
+      map(range(0, if repeats < 1 { 1 } else { repeats }), |r: Int|
+        match tool(["sql", d.url, d.fill]) {
+          Err(why) -> Err(why),
+          Ok(_) -> match tool([
+              "floor",
+              d.url,
+              label(w),
+              int_to_string(tasks),
+              int_to_string(per),
+              int_to_string(base()),
+            ]) {
+            Err(why) -> Err(why),
+            Ok(out) -> match floor_us(out) {
+              Some(us) -> Ok(us),
+              None -> Err("the floor printed `" ++ string_trim(out) ++ "`, not a duration"),
+            },
+          },
+        }),
+    ) {
+    Err(why) -> Err(why),
+    Ok(runs) -> match stats::best(runs) {
+      Some(us) -> Ok(us),
+      None -> Err("no floor run was taken"),
+    },
+  }
+
+// --- Making the table -----------------------------------------------------------------------
+
+fn texts_of(m: Map<String, Json>, key: String) -> List<String> =
+  map(spine::array_field(m, key), |j: Json| match j { Str(s) -> s, _ -> "" })
+
+// The program's own `drop` and `create`, run by the tool, which runs what `std.db` will not.
+fn prepared(
+  k: Kit,
+  db: Option<String>,
+) -> Prepared / {process.spawn[ply], process.spawn[pg_floor], config.get[env]} =
+  match db {
+    None -> NoDatabase,
+    Some(url) -> if !kit::bound("pg_floor") { NoFloor } else {
+      match kit::printed(
+          kit::ran(k, "statements.ply", [
+            kit::set("BENCH_SECTION", "schema"),
+            kit::set("BENCH_ROWS", int_to_string(keys())),
+          ]),
+          "statements.ply",
+        ) {
+        Err(why) -> Unprepared(why),
+        Ok(Object(m)) -> match tool([
+            "sql",
+            url,
+            joined(cats([texts_of(m, "drop"), texts_of(m, "create")]), "; "),
+          ]) {
+          Err(why) -> Unprepared(why),
+          Ok(_) -> Ready({ url: url, fill: joined(texts_of(m, "fill"), "; ") }),
+        },
+        Ok(_) -> Unprepared("the schema report is not an object"),
+      }
+    },
+  }
+
+// --- ops: every workload at every concurrency, on three rungs ----------------------------------
+
+fn per_task(operations: Int, tasks: Int) -> Int = {
+  let per = operations / (if tasks < 1 { 1 } else { tasks });
+  if per < 1 { 1 } else { per }
+}
+
+fn ops_name(w: Workload, tasks: Int, rung: String) -> String =
+  "ops, " ++ label(w) ++ ", " ++ tasks_text(tasks) ++ ", " ++ rung
+
+// The floor's microseconds a statement, and the program's as a multiple of them.
+fn over_floor(floor: Option<Decimal>, mine: Ran, statements: Int) -> List<Measurement> =
+  match ((floor, mine)) {
+    (Some(f), Timed(t)) -> match best_us(t.runs_us) {
+      Some(us) -> if f > 0m {
+        [exact("over_floor", decimal_div(per_statement(us, statements), f, 3, HalfEven), "×")]
+      } else { [] },
+      None -> [],
+    },
+    _ -> [],
+  }
+
+fn ops_point(
+  k: Kit,
+  a: Args,
+  p: Prepared,
+  w: Workload,
+  tasks: Int,
+  twin: Bool,
+) -> List<Row> / {process.spawn[ply], process.spawn[pg_floor], config.get[env]} = {
+  let per = per_task(a.operations, tasks);
+  let statements = per * tasks;
+  let point = { workload: w, tasks: tasks, per: per, rows: keys(), repeats: a.repeats };
+  let database = match p {
+    Ready(d) -> {
+      let floor = floored(d, w, tasks, per, a.repeats);
+      let mine = over_database(k, d.url, a.pool, point);
+      let floor_each = match floor {
+        Ok(us) -> Some(per_statement(us, statements)),
+        Err(_) -> None,
+      };
+      [
+        match floor {
+          Ok(us) ->
+            row(ops_name(w, tasks, "libpq floor"), floor_ran(), [
+              number("asked", statements, "statements"),
+              number("ran", statements, "statements"),
+              exact("us_per_statement", per_statement(us, statements), "µs"),
+              number("per_second", stats::per_second(statements, us), "statements/s"),
+            ]),
+          Err(why) -> {
+            let failed = row(ops_name(w, tasks, "libpq floor"), floor_ran(), [
+              number("asked", statements, "statements"),
+              number("ran", 0, "statements"),
+            ]);
+            { ..failed, detail: Str(why) }
+          },
+        },
+        point_row(
+          ops_name(w, tasks, "std.db"),
+          every_answered(),
+          statements,
+          mine,
+          over_floor(floor_each, mine, statements),
+        ),
+      ]
+    },
+    other ->
+      [
+        untaken(ops_name(w, tasks, "libpq floor"), floor_ran(), unready(other)),
+        untaken(ops_name(w, tasks, "std.db"), every_answered(), unready(other)),
+      ],
+  };
+  // The twin has no server to be concurrent against: the same statements, one after another.
+  if twin {
+    push(
+      database,
+      point_row(
+        "ops, " ++ label(w) ++ ", twin",
+        every_answered(),
+        statements,
+        over_twin(k, { ..point, tasks: 1, per: statements }),
+        [],
+      ),
+    )
+  } else { database }
+}
+
+fn ops_rows(
+  k: Kit,
+  a: Args,
+  p: Prepared,
+) -> List<Row> / {process.spawn[ply], process.spawn[pg_floor], config.get[env]} =
+  cats(
+    map(workloads(), |w: Workload|
+      cats(
+        map(range(0, len(a.concurrency)), |i: Int|
+          match list_at(a.concurrency, i) {
+            Some(tasks) -> ops_point(k, a, p, w, tasks, i == 0),
+            None -> [],
+          }),
+      )),
+  )
+
+// --- sizes: one ordered select against the rows it sorts ---------------------------------------
+
+fn sizes_rows(k: Kit, a: Args, p: Prepared) -> List<Row> / {process.spawn[ply], config.get[env]} =
+  cats(
+    map(a.rows, |n: Int| {
+      let point = { workload: Select, tasks: 1, per: a.operations, rows: n, repeats: a.repeats };
+      let name = |rung: String| "sizes, " ++ int_to_string(n) ++ " rows, " ++ rung;
+      [
+        point_row(name("twin"), every_answered(), a.operations, over_twin(k, point), []),
+        match p {
+          Ready(d) ->
+            point_row(
+              name("std.db"),
+              every_answered(),
+              a.operations,
+              over_database(k, d.url, 4, point),
+              [],
+            ),
+          other -> untaken(name("std.db"), every_answered(), unready(other)),
+        },
+      ]
+    }),
+  )
+
+// --- pool: throughput against pool size, and a pool smaller than its open transactions ----------
+
+fn pool_tasks() -> Int = 8
+
+fn pool_rows(k: Kit, a: Args, p: Prepared) -> List<Row> / {process.spawn[ply], config.get[env]} =
+  cats(
+    map([Select, Transaction], |w: Workload|
+      map(a.pool_sizes, |size: Int| {
+        let per = per_task(a.operations, pool_tasks());
+        let name = "pool of " ++ int_to_string(size) ++ ", " ++ label(w) ++ ", "
+          ++ tasks_text(pool_tasks());
+        let c = if size >= pool_tasks() { every_answered() } else { nothing_lost() };
+        match p {
+          Ready(d) ->
+            point_row(
+              name,
+              c,
+              per * pool_tasks(),
+              over_database(k, d.url, size, {
+                workload: w,
+                tasks: pool_tasks(),
+                per: per,
+                rows: keys(),
+                repeats: a.repeats,
+              }),
+              [],
+            ),
+          other -> untaken(name, c, unready(other)),
+        }
+      })),
+  )
+
+// Pools smaller than the transactions open at once, and one that holds them all.
+pub fn exhaustion_points() -> List<{ pool: Int, tasks: Int }> =
+  [{ pool: 1, tasks: 8 }, { pool: 1, tasks: 32 }, { pool: 8, tasks: 32 }]
+
+fn exhaustion_rows(k: Kit, p: Prepared) -> List<Row> / {process.spawn[ply], config.get[env]} =
+  map(exhaustion_points(), |e: { pool: Int, tasks: Int }| {
+    let name = "exhaustion, pool of " ++ int_to_string(e.pool) ++ ", " ++ tasks_text(e.tasks)
+      ++ " in transactions";
+    match p {
+      Ready(d) -> {
+        let r = over_database(k, d.url, e.pool, {
+          workload: Transaction,
+          tasks: e.tasks,
+          per: 8,
+          rows: keys(),
+          repeats: 1,
+        });
+        point_row(name, nothing_lost(), e.tasks * 8, r, match r {
+          Timed(t) -> match best_us(t.runs_us) {
+            Some(us) -> [report::ms_of_us("wall", us)],
+            None -> [],
+          },
+          _ -> [],
+        })
+      },
+      other -> untaken(name, nothing_lost(), unready(other)),
+    }
   })
 
-fn seed_sql(rows: Int) -> String =
-  if rows <= 0 { "delete from part" } else {
-    let tuples = map(range(0, rows), |i: Int|
-      "('sku-" ++ int_to_string(i) ++ "', 'a part', 1.2500, " ++ int_to_string(i) ++ ")");
-    "insert into part (sku, name, price, n) values "
-      ++ fold(tuples, "", |acc: String, tuple: String|
-        if string_len(acc) == 0 { tuple } else { acc ++ ", " ++ tuple })
+// --- crud: the desk over each store, loaded --------------------------------------------------
+
+pub fn crud_routes() -> List<String> = ["/health", "/items", "/orders/1"]
+
+fn clients_text(c: Int) -> String = if c == 1 { "1 client" } else { int_to_string(c) ++ " clients" }
+
+fn crud_load(a: Args, port: Int, route: String, clients: Int) -> kit::Load =
+  {
+    port: port,
+    routes: [route],
+    connections: clients * served::share(clients, a.per_conn, a.requests_per_point),
+    concurrency: clients,
+    per_conn: a.per_conn,
+    trust: None,
   }
 
-// The four questions W5's drain test asks of the desk's own schema, each its own statement so the
-// column it reads is the statement's to name.
+type Pointed = { name: String, load: kit::Load, sample: Sample }
 
-pub fn order_count(url: String, size: Int) -> Int / {Served} =
-  served(url, size, ||
-    only_int(db.query[orders](db::stmt("select count(*) as n from orders"), []), "n"))
-
-pub fn last_order_id(url: String, size: Int) -> Int / {Served} =
-  served(url, size, ||
-    only_int(
-      db.query[orders_id_seq](db::stmt("select last_value as n from orders_id_seq"), []),
-      "n",
-    ))
-
-pub fn idle_in_transaction(url: String, size: Int) -> Int / {Served} =
-  served(url, size, ||
-    only_int(
-      db.query[pg_stat_activity](
-        db::stmt(
-          "select count(*) as n from pg_stat_activity where state = 'idle in transaction' and application_name <> 'ply-corpus'",
-        ),
-        [],
-      ),
-      "n",
-    ))
-
-pub fn waiting_on_lock(url: String, size: Int) -> Int / {Served} =
-  served(url, size, ||
-    only_int(
-      db.query[pg_stat_activity](
-        db::stmt(
-          "select count(*) as n from pg_stat_activity where wait_event_type = 'Lock' and state = 'active'",
-        ),
-        [],
-      ),
-      "n",
-    ))
-
-test "the harness's counting helper reads the column its SQL names" {
-  assert_eq(only_int(db::Count(3), "n"), 3);
-  assert_eq(only_int(db::Rows([map_of_entries([{ key: "n", value: db::CInt(7) }])]), "n"), 7);
-  assert_eq(
-    counted_row(db::Failed({ code: "42P01", constraint: "", detail: "no such table" }), "n"),
-    0,
+fn loaded(
+  k: Kit,
+  a: Args,
+  store: String,
+  s: Server,
+) -> Result<List<Pointed>, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work]} =
+  kit::all_of(
+    cats(
+      map(crud_routes(), |route: String|
+        map(a.load_concurrency, |c: Int| {
+          let l = crud_load(a, s.port, route, c);
+          match kit::measured(k, l, a.repeats) {
+            Err(why) -> Err(why),
+            Ok(sample) ->
+              Ok({
+                name: "crud, " ++ store ++ ", GET " ++ route ++ ", " ++ clients_text(c),
+                load: l,
+                sample: sample,
+              }),
+          }
+        })),
+    ),
   )
+
+fn crud_names(a: Args, store: String) -> List<String> =
+  cats(
+    map(crud_routes(), |route: String|
+      map(a.load_concurrency, |c: Int|
+        "crud, " ++ store ++ ", GET " ++ route ++ ", " ++ clients_text(c))),
+  )
+
+fn stop_name(store: String) -> String = "the desk over the " ++ store ++ ","
+
+// One store's rows: every point answered and the desk drained, or every row untaken with why.
+fn store_rows(
+  k: Kit,
+  a: Args,
+  store: String,
+  d: served::Desk,
+) -> List<Row> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
+  match kit::serving[ply](k, "desk-" ++ store, served::desk_args(k, d), |s: Server|
+      loaded(k, a, store, s)) {
+    Err(why) ->
+      push(
+        map(crud_names(a, store), |name: String| untaken(name, kit::complete(200), why)),
+        untaken(stop_name(store) ++ " stops", kit::drained(), why),
+      ),
+    Ok(done) ->
+      push(
+        map(done.value, |p: Pointed| kit::answered_row(p.name, p.load, p.sample)),
+        kit::stop_row(stop_name(store), done.stop, kit::drained()),
+      ),
+  }
+
+fn crud_desks(a: Args) -> List<{ store: String, desk: served::Desk }> =
+  [
+    { store: "twin", desk: served::twin("sequential") },
+    {
+      store: "postgres",
+      desk: served::over("sequential", match a.db {
+        Some(url) -> url,
+        None -> served::unreached(),
+      }),
+    },
+  ]
+
+fn crud_rows(
+  k: Kit,
+  a: Args,
+) -> List<Row> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
+  cats(
+    map(crud_desks(a), |one: { store: String, desk: served::Desk }|
+      if one.store == "postgres" && a.db == None {
+        push(
+          map(crud_names(a, one.store), |name: String|
+            untaken(name, kit::complete(200), unready(NoDatabase))),
+          untaken(stop_name(one.store) ++ " stops", kit::drained(), unready(NoDatabase)),
+        )
+      } else { store_rows(k, a, one.store, one.desk) }),
+  )
+
+// Every line `crud` runs the desk with, taken by `ply hosts` whether or not a database is there to
+// run it against.
+fn lines(k: Kit, a: Args) -> List<served::Line> =
+  map(crud_desks(a), |one: { store: String, desk: served::Desk }|
+    { label: "the desk over the " ++ one.store, args: served::desk_args(k, one.desk) })
+
+// --- The report ------------------------------------------------------------------------
+
+pub fn run(
+  a: Args,
+) -> Result<report::Report, String> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], process.spawn[pg_floor], config.get[env], fs.read_file[work], fs.remove[work], fs.create_dir[work], fs.read[repo], net.connect[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} = {
+  let k = { repo: a.repo, scratch: under(a.scratch, "w4") };
+  match kit::prepare(k) {
+    Err(why) -> Err(why),
+    Ok(_) -> {
+      let tabled = has(a.sections, "ops") || has(a.sections, "sizes") || has(a.sections, "pool")
+        || has(a.sections, "exhaustion");
+      let p = if tabled { prepared(k, a.db) } else { NoDatabase };
+      let rows = cats([
+        if has(a.sections, "crud") {
+          [served::lines_row("the desk lines `crud` runs", served::checked(lines(k, a)))]
+        } else { [] },
+        if has(a.sections, "ops") { ops_rows(k, a, p) } else { [] },
+        if has(a.sections, "sizes") { sizes_rows(k, a, p) } else { [] },
+        if has(a.sections, "pool") { pool_rows(k, a, p) } else { [] },
+        if has(a.sections, "exhaustion") { exhaustion_rows(k, p) } else { [] },
+        if has(a.sections, "crud") { crud_rows(k, a) } else { [] },
+      ]);
+      report::made("w4", "w4 — a statement through the effect boundary, beside libpq", rows, [
+        { key: "sections", value: array(map(a.sections, |s: String| Str(s))) },
+        { key: "database", value: Bool(a.db != None) },
+        { key: "operations", value: Number(decimal_of_int(a.operations)) },
+        { key: "pool", value: Number(decimal_of_int(a.pool)) },
+      ])
+    },
+  }
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+fn took(asked: Int, answered: Int, refused: Int, failed: Int) -> Took =
+  { asked: asked, answered: answered, refused: refused, failed: failed, runs_us: [900, 400] }
+
+fn verdict_of(r: Row) -> report::Verdict =
+  match report::judge([r]) { [j] -> j.verdict, _ -> panic("one row is judged as one") }
+
+test "a point is judged by its counts, and a run that raised fails on that alone" {
+  assert_eq(
+    verdict_of(point_row("p", every_answered(), 200, Timed(took(400, 400, 0, 0)), [])),
+    Pass,
+  );
+  assert(
+    verdict_of(point_row("p", every_answered(), 200, Timed(took(400, 399, 1, 0)), [])) != Pass,
+  );
+  assert_eq(verdict_of(point_row("p", nothing_lost(), 200, Timed(took(400, 399, 1, 0)), [])), Pass);
+  assert(verdict_of(point_row("p", nothing_lost(), 200, Timed(took(400, 399, 0, 1)), [])) != Pass);
+  let raised = point_row("p", nothing_lost(), 200, Raised("error[E0502]: the pool panicked"), []);
+  assert_eq(verdict_of(raised), Fail([number("raised", 1, "")]));
+  assert_eq(raised.detail, Str("error[E0502]: the pool panicked"));
+  assert_eq(
+    verdict_of(point_row("p", every_answered(), 200, Unread("no report"), [])),
+    Inconclusive("no report"),
+  )
+}
+
+test "a point's fastest repeat is its microseconds a statement and its rate" {
+  let ms = took_measurements(took(400, 400, 0, 0), 200);
+  assert_eq(report::value_of(ms, "us_per_statement"), Some(2.000m));
+  assert_eq(report::value_of(ms, "per_second"), Some(500000m));
+  assert_eq(over_floor(Some(0.500m), Timed(took(400, 400, 0, 0)), 200), [
+    exact("over_floor", 4.000m, "×"),
+  ]);
+  assert_eq(over_floor(None, Timed(took(400, 400, 0, 0)), 200), [])
+}
+
+test "the program's report is read into what it took, and its failure is what it raised" {
+  let out = b"   binding host\n{\"answered\":8,\"asked\":8,\"failed\":0,\"refused\":0,\"runs_us\":[30,20]}\n";
+  assert_eq(
+    ran_of(process::exited(0, out, b"")),
+    Timed({ asked: 8, answered: 8, refused: 0, failed: 0, runs_us: [30, 20] }),
+  );
+  assert_eq(
+    ran_of(
+      process::exited(
+        1,
+        b"",
+        b"warning[W0607]: an undeclared key\nerror[E0502]: the database would not open\n   raised at\n",
+      ),
+    ),
+    Raised("error[E0502]: the database would not open"),
+  );
+  assert_eq(floor_us("floor 1234\n"), Some(1234));
+  assert_eq(floor_us("connecting: refused"), None)
+}
+
+test "a point is the program's settings, and every write starts past the fill's keys" {
+  let settings = cats(
+    point_settings("postgres", { workload: SelectBy, tasks: 4, per: 100, rows: 64, repeats: 3 }),
+  );
+  assert(
+    fold(
+      ["BENCH_WORKLOAD=select $1", "BENCH_TASKS=4", "BENCH_PER=100", "BENCH_BASE=1000000"],
+      true,
+      |ok: Bool, want: String| ok && has(settings, want),
+    ),
+  );
+  assert(base() > keys());
+  assert_eq(per_task(400, 16), 25);
+  assert_eq(per_task(4, 16), 1)
+}
+
+test "without a database the rows that need one are inconclusive, and say why" {
+  let a = {
+    repo: ".",
+    scratch: "s",
+    db: None,
+    sections: sections(),
+    concurrency: [1, 4],
+    operations: 8,
+    rows: [8],
+    pool_sizes: [1, 8],
+    pool: 16,
+    load_concurrency: [1],
+    per_conn: 1,
+    requests_per_point: 1,
+    repeats: 1,
+  };
+  let k = { repo: ".", scratch: "s" };
+  let pooled = handle {
+    pool_rows(k, a, NoDatabase)
+  } with {
+    process.spawn[ply](args, dir, env) -> panic("nothing is run without a database"),
+    config.get[env](key) -> None,
+  };
+  assert_eq(map(report::judge(pooled), |j: report::Judged| j.verdict), [
+    Inconclusive(unready(NoDatabase)),
+    Inconclusive(unready(NoDatabase)),
+    Inconclusive(unready(NoDatabase)),
+    Inconclusive(unready(NoDatabase)),
+  ]);
+  assert_eq(map(crud_desks(a), |one: { store: String, desk: served::Desk }| one.desk.database), [
+    None,
+    Some(served::unreached()),
+  ])
 }

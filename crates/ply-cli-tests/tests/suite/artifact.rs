@@ -1,4 +1,4 @@
-use crate::harness::{json_of, ply, project};
+use crate::harness::{json_of, ply, project, write};
 use ply_host::process::Executables;
 use ply_machine::artifact::{self, Artifact, Binds};
 use ply_machine::load::{Loaded, load};
@@ -739,6 +739,44 @@ fn the_output_directory_is_created() {
     assert!(dir.path().join("dist/nested/m.plyx").exists());
 }
 
+/// `--stamp` is a path like any other: one that leaves the working directory is written where it
+/// points, and holds the digest the launcher gates its shipped artifact on.
+#[test]
+fn a_stamp_outside_the_working_directory_is_written_where_it_points() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "sub/m.ply", PROGRAM);
+    let out = ply(&dir.path().join("sub"))
+        .args(["build", "-o", "m.plyx", "--stamp", "../gate"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.path().join("sub/m.plyx").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("gate")).expect("the stamp was written"),
+        format!("{}\n", ply_launcher::shipped::identity())
+    );
+}
+
+/// A stamp that cannot be written is the build's error, naming where it was going.
+#[test]
+fn a_stamp_that_cannot_be_written_fails_the_build() {
+    let dir = project(PROGRAM);
+    std::fs::create_dir(dir.path().join("gate")).unwrap();
+    let out = ply(dir.path())
+        .args(["build", ".", "-o", "m.plyx", "--stamp", "gate"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0502"), "{err}");
+    assert!(err.contains("could not write `gate`"), "{err}");
+}
+
 const SERVICE: &str = r#"
 import std.net (net)
 
@@ -989,7 +1027,8 @@ fn a_build_schema_that_names_nothing_is_refused_at_build_time() {
     assert!(!out.status.success());
     let text =
         String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains(codes::UNKNOWN_NAME), "{text}");
+    assert!(text.contains(codes::CONFIG_UNAVAILABLE), "{text}");
+    assert!(text.contains("this program has: m.spec"), "{text}");
     assert!(!dir.path().join("x.plyx").exists());
 }
 

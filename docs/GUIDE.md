@@ -1009,7 +1009,10 @@ view and `len` known to lie below `i64::MAX`.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
-values. Flags: `--prove-cases N` (below 25 kept cases only `example`),
+values. A claim's type variables are lettered by where they first appear among
+its binders (`forall (x: a, y: List<b>)`); a sample draws each as `Int`
+(`a := Int`), and a proof leaves each an uninterpreted sort
+(`uninterpreted a, b`). Flags: `--prove-cases N` (below 25 kept cases only `example`),
 `--prove-roots N`, `--prove-budget N` (spent reports `property`),
 `--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
 1000000000; an evaluation past it leaves the obligation `unattempted`, and the
@@ -1323,6 +1326,24 @@ the language's, and the host is left with `net`. The effect is nominal, so a
 program that wants a server handles it: `with_server` is how, and
 `{db.read[*], db.write[*] | e}` in its signature is what lets one handler answer
 every table at once.
+
+The connection string is `postgres://user[:password]@host[:port]/database`,
+and its query carries what every connection the pool opens starts with, told
+to the server in the start-up message rather than by a `SET` the reader would
+refuse:
+
+| parameter | meaning |
+| --- | --- |
+| `statement_timeout=MS` | the server cancels a statement running longer (`57014`) |
+| `idle_in_transaction_session_timeout=MS` | the server ends a session idle this long inside a transaction |
+| `application_name=NAME` | what the server lists the sessions under |
+| `sslmode=disable\|prefer` | read and nothing more: TLS to postgres is not wired up |
+
+A timeout is a whole number of milliseconds, `0` for none, as postgres reads
+one; any other key, a key given twice, or a timeout past 2147483647 is refused.
+The same settings are the `Server` record's `statement_timeout_ms`,
+`idle_in_transaction_timeout_ms` and `application_name` for a program that
+calls `serve` itself, and `startup_parameters` is what they are sent as.
 
 ### 13.6 `std.config`
 
@@ -1709,7 +1730,7 @@ text.
 ### 13.16 `std.pg` — the postgres wire protocol
 
 ```ply
-pub fn startup(user: String, database: String) -> Bytes
+pub fn startup(user: String, database: String, parameters: List<Set>) -> Bytes
 pub fn query(sql: String) -> Bytes
 pub fn parse(statement: String, sql: String, param_types: List<Int>) -> Bytes
 pub fn bind(portal: String, statement: String, params: List<Option<String>>) -> Bytes
@@ -1720,7 +1741,7 @@ pub fn terminate() -> Bytes
 pub fn read(buf: Bytes) -> Frames
 
 pub fn connect<[l]>(
-  host: String, port: Int, user: String, database: String,
+  host: String, port: Int, user: String, database: String, parameters: List<Set>,
   password: Option<String>, nonce: String, client: Client,
 ) -> Result<Session, ClientError> / {net.connect[l], net.send[l], net.recv[l], net.close[l]}
 pub fn simple_query<[l]>(s: Session, sql: String, client: Client)
@@ -1756,6 +1777,9 @@ A kind this module does not name is kept as `Other(byte)` rather than dropped.
 `connect` opens the socket and gets to where the server will answer a query:
 start-up, whatever authentication it asks for, its parameters, and
 `ReadyForQuery`; the parameters are left on the session and `setting` reads one.
+`parameters` are run-time settings the start-up message carries after `user`
+and `database` (`statement_timeout`, say), which the server applies to the
+session before it answers.
 The client's SCRAM nonce is the caller's to draw, so a run's `random` seed decides
 it and a test can fix it. Authentication is answered for `AuthenticationOk`, a
 clear-text password, and SCRAM-SHA-256; md5 is refused with a message naming it.
@@ -2290,7 +2314,8 @@ leaves it unchanged; a failure raised by a run of it carries no line number. A
 body or closure that fails verification is `E0443`, as is a build whose closure
 holds two identical declarations it cannot tell apart (two effects, or two
 members of one recursive group); an artifact from another version is `E0444`.
-`--config-schema` ships that function too.
+`--config-schema` ships that function too, resolved as a run resolves it: a name
+that is not a nullary pure function returning a `ConfigSpec` is `E0440`.
 
 ### 15.1 The registry
 
