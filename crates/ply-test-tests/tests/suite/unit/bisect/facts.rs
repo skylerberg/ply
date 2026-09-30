@@ -1,10 +1,8 @@
-use ply_span::{SourceId, Symbol};
+use ply_eval::{CheckOutput, DefHash, HashOutput, SourceId, Symbol};
 use ply_test::bisect::{
     Baseline, ChangeSet, Classify, DefKey, Regression, Rehashed, Row, StoreClassify, Unknown,
     change_set,
 };
-use ply_ty::CheckOutput;
-use ply_ty::{DefHash, HashOutput};
 use std::collections::BTreeMap;
 
 struct Compiled {
@@ -388,8 +386,8 @@ fn stored(before: &Compiled, after: &Compiled) -> (TempRoot, ply_store::Store) {
     let root = TempRoot::new();
     let mut store = ply_store::Store::open(&root.0).expect("open store");
     let file = root.0.join("m.ply");
-    crate::fixture::file_interfaces(&mut store, &file, &before.check, &before.hashes);
-    crate::fixture::file_interfaces(&mut store, &file, &after.check, &after.hashes);
+    crate::fixture::file_interfaces(&mut store, &file, &before.sources);
+    crate::fixture::file_interfaces(&mut store, &file, &after.sources);
     (root, store)
 }
 

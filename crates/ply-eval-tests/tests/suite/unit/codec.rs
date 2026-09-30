@@ -1,6 +1,5 @@
 use ply_eval::codec::{decode, encode};
-use ply_eval::{Decimal, Fields, Fixed, IntTy, Value};
-use ply_span::Symbol;
+use ply_eval::{Decimal, Fields, Fixed, IntTy, Symbol, Value};
 use std::sync::Arc;
 
 fn record(fields: Vec<(&str, Value)>) -> Value {

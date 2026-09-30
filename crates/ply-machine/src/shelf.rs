@@ -4,7 +4,7 @@
 //! A shelved module is resolved by its full dotted name like any other, is kept out of a
 //! program's listings and closures, and cannot be shadowed by a file in a project.
 
-use ply_ty::ModuleName;
+use ply_eval::ModuleName;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 

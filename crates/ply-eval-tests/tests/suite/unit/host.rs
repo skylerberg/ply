@@ -1,8 +1,6 @@
 use crate::fixture::port_check;
 use ply_eval::host::*;
-use ply_span::{Diagnostic, Symbol, codes};
-use ply_ty::CheckOutput;
-use ply_ty::{EffectAtom, Footprint, Resource};
+use ply_eval::{CheckOutput, Diagnostic, EffectAtom, Footprint, Resource, Symbol, codes};
 use std::sync::Arc;
 
 struct Never;
@@ -83,7 +81,7 @@ fn hermetic_is_not_bound_and_serves_nothing() {
     assert!(!binding.serves(&EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("users")),
-        ply_ty::Mode::Read
+        ply_eval::Mode::Read
     )));
 }
 
@@ -338,12 +336,12 @@ fn store(k: Int) -> Int = db.put[orders](k, 1)
     assert!(binding.serves(&EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("users")),
-        ply_ty::Mode::Read,
+        ply_eval::Mode::Read,
     )));
     assert!(!binding.serves(&EffectAtom::operation(
         "db",
         Resource::Named(Symbol::new("users")),
-        ply_ty::Mode::Read,
+        ply_eval::Mode::Read,
         "peek",
     )));
 }
@@ -374,7 +372,7 @@ fn the_footprint_is_exactly_what_resolve_answers() {
     let absent = EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("customers")),
-        ply_ty::Mode::Read,
+        ply_eval::Mode::Read,
     );
     assert!(!binding.serves(&absent));
     assert!(
@@ -432,7 +430,7 @@ fn reaches_is_footprint_intersection() {
     let touched = Footprint::from_atoms([EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("users")),
-        ply_ty::Mode::Read,
+        ply_eval::Mode::Read,
     )]);
     assert!(binding.reaches(&touched));
     assert!(!binding.reaches(&Footprint::empty()));
@@ -653,7 +651,7 @@ fn host_use_records_what_actually_happened() {
     let atom = EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("users")),
-        ply_ty::Mode::Read,
+        ply_eval::Mode::Read,
     );
     use_.record(&atom);
     use_.record(&atom);

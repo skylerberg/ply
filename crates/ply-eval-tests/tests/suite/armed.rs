@@ -1,0 +1,1831 @@
+//! Gates against a mechanism that is declared and registered but constructed nowhere.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Registered codes no production source constructs, each with the reason it may stay so.
+const UNARMED_CODES: &[(&str, &str)] = &[];
+
+/// Variants of a covered enum that no production source constructs.
+const UNARMED_VARIANTS: &[(&str, &str)] = &[(
+    "Severity::Note",
+    "Two consumers and no producer: `Diagnostic`'s Display in \
+         crates/ply-eval/src/span.rs heads a diagnostic \"Note\", and \
+         crates/ply-machine/src/payload.rs hands the program a \"note\". \
+         Nothing builds one. Severity also derives Deserialize, so a Note could \
+         in principle arrive from a stored diagnostic rather than from a \
+         constructor — nothing in the workspace writes one, and the gate cannot \
+         see serde either way. Disposition not decided here.",
+)];
+
+/// Functions that take a code and hand it to `Diagnostic::error`/`warning` unchanged.
+const CODE_INDIRECTION: &[Indirection] = &[];
+
+/// Covered enum names that more than one covered enum declares.
+const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[
+    (
+        "Reason",
+        "crates/ply-test/src/lib.rs's Reason (why a test runs) and crates/ply-prove/src/prove/mod.rs's \
+         Reason (why the static tier stopped) share no variant name, so a `Reason::X` hit can only \
+         arm the enum that has X. If one of them gains a variant the other has, this gate stops \
+         telling them apart.",
+    ),
+    (
+        "Shape",
+        "crates/ply-prove/src/domain.rs's Shape (a domain the program measured) and \
+         crates/ply-prove/src/prove/egraph.rs's Shape (an e-graph node's constructor) share no \
+         variant name, so a `Shape::X` hit can only arm the enum that has X. If one of them gains \
+         a variant the other has, this gate stops telling them apart.",
+    ),
+];
+
+struct Indirection {
+    file: &'static str,
+    function: &'static str,
+    /// `no_allowlist_entry_has_outlived_its_reason` requires a real one.
+    reason: &'static str,
+}
+
+/// Every `pub enum` under these directories is covered by the variant half: the runtimes the test
+/// and prove packages drive, whose decisions are the packages' and whose mechanisms are these.
+const COVERED_ENUM_ROOTS: &[&str] = &["crates/ply-test/src", "crates/ply-prove/src"];
+
+/// Individually covered enums outside `COVERED_ENUM_ROOTS`, as `(file, name)`.
+const COVERED_ENUMS: &[(&str, &str)] = &[("crates/ply-eval/src/span.rs", "Severity")];
+
+/// Blanks comments and string, raw-string and char literals, preserving offsets and newlines.
+fn blank_literals_and_comments(src: &[u8]) -> Vec<u8> {
+    let mut out = src.to_vec();
+    let n = src.len();
+    let mut i = 0;
+    while i < n {
+        match src[i] {
+            b'/' if i + 1 < n && src[i + 1] == b'/' => {
+                let mut j = i;
+                while j < n && src[j] != b'\n' {
+                    j += 1;
+                }
+                blank(&mut out, i, j);
+                i = j;
+            }
+            b'/' if i + 1 < n && src[i + 1] == b'*' => {
+                let mut depth = 1usize;
+                let mut j = i + 2;
+                while j < n && depth > 0 {
+                    if src[j] == b'/' && j + 1 < n && src[j + 1] == b'*' {
+                        depth += 1;
+                        j += 2;
+                    } else if src[j] == b'*' && j + 1 < n && src[j + 1] == b'/' {
+                        depth -= 1;
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                blank(&mut out, i, j);
+                i = j;
+            }
+            b'r' if i + 1 < n
+                && (src[i + 1] == b'#' || src[i + 1] == b'"')
+                && !(i > 0 && is_ident_byte(src[i - 1])) =>
+            {
+                let mut k = i + 1;
+                let mut hashes = 0usize;
+                while k < n && src[k] == b'#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < n && src[k] == b'"' {
+                    let mut j = k + 1;
+                    let mut end = n;
+                    while j < n {
+                        if src[j] == b'"' && (1..=hashes).all(|z| src.get(j + z) == Some(&b'#')) {
+                            end = j + 1 + hashes;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    let end = end.min(n);
+                    blank(&mut out, i, end);
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < n {
+                    if src[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if src[j] == b'"' {
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                let j = j.min(n);
+                blank(&mut out, i, j);
+                i = j;
+            }
+            b'\'' => match char_literal_end(src, i) {
+                Some(end) => {
+                    blank(&mut out, i, end);
+                    i = end;
+                }
+                None => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+fn blank(out: &mut [u8], from: usize, to: usize) {
+    let n = out.len();
+    for b in &mut out[from.min(n)..to.min(n)] {
+        if *b != b'\n' {
+            *b = b' ';
+        }
+    }
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `Some(end)` for a character literal starting at `i`, `None` for a lifetime.
+fn char_literal_end(src: &[u8], i: usize) -> Option<usize> {
+    let n = src.len();
+    if src.get(i + 1) == Some(&b'\\') {
+        let mut j = i + 2;
+        while j < n && j - i < 12 && src[j] != b'\'' && src[j] != b'\n' {
+            j += 1;
+        }
+        return (src.get(j) == Some(&b'\'')).then_some(j + 1);
+    }
+    let lead = *src.get(i + 1)?;
+    let width = match lead {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    };
+    (src.get(i + 1 + width) == Some(&b'\'')).then_some(i + 2 + width)
+}
+
+/// Blanks every `#[cfg(test)]` item.
+fn blank_cfg_test_blocks(text: &[u8]) -> Vec<u8> {
+    const ATTR: &[u8] = b"#[cfg(test)]";
+    let mut out = text.to_vec();
+    let mut i = 0;
+    while i + ATTR.len() <= text.len() {
+        if &text[i..i + ATTR.len()] != ATTR {
+            i += 1;
+            continue;
+        }
+        let mut j = i + ATTR.len();
+        let mut delimiter = None;
+        while j < text.len() {
+            match text[j] {
+                b'(' | b'[' => j = delim_close(text, j),
+                b'{' | b';' => {
+                    delimiter = Some(j);
+                    break;
+                }
+                _ => j += 1,
+            }
+        }
+        let Some(j) = delimiter else { break };
+        if text[j] == b'{' {
+            let end = delim_close(text, j);
+            blank(&mut out, i, end);
+            i = end;
+        } else if header_declares_a_module(&text[i + ATTR.len()..j]) {
+            i += ATTR.len();
+        } else {
+            // A `;`-terminated item that is not a `mod` declaration.
+            blank(&mut out, i, j + 1);
+            i = j + 1;
+        }
+    }
+    out
+}
+
+/// Whether an item header between `#[cfg(test)]` and its `;` is a `mod` declaration.
+fn header_declares_a_module(header: &[u8]) -> bool {
+    let mut i = 0;
+    while i < header.len() {
+        if !(header[i].is_ascii_alphabetic() || header[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let (word, end) = ident_at(header, i);
+        if word == b"mod" && (i == 0 || !is_ident_byte(header[i - 1])) {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+/// `text[i]` is an opening delimiter; the index just past its match.
+fn delim_close(text: &[u8], i: usize) -> usize {
+    let mut depth = 0usize;
+    let mut j = i;
+    while j < text.len() {
+        match text[j] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    text.len()
+}
+
+/// The matching opener for the closer at `i`, scanning backwards.
+fn delim_open(text: &[u8], i: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut j = i;
+    loop {
+        match text[j] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+        if j == 0 {
+            return None;
+        }
+        j -= 1;
+    }
+}
+
+fn ident_at(text: &[u8], i: usize) -> (&[u8], usize) {
+    let mut end = i;
+    while end < text.len() && is_ident_byte(text[end]) {
+        end += 1;
+    }
+    (&text[i..end], end)
+}
+
+fn skip_ws(text: &[u8], mut i: usize, hi: usize) -> usize {
+    while i < hi && text[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn line_of(text: &[u8], offset: usize) -> usize {
+    text[..offset.min(text.len())]
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count()
+        + 1
+}
+
+/// Pattern positions and `use` paths: where a `Type::Variant` appears without being constructed.
+fn pattern_and_use_regions(text: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    scan(text, 0, text.len(), &mut out);
+    out
+}
+
+fn scan(text: &[u8], lo: usize, hi: usize, out: &mut Vec<(usize, usize)>) {
+    let mut i = lo;
+    while i < hi {
+        let c = text[i];
+        if !(c.is_ascii_alphabetic() || c == b'_') {
+            i += 1;
+            continue;
+        }
+        if i > lo && is_ident_byte(text[i - 1]) {
+            let (_, end) = ident_at(text, i);
+            i = end;
+            continue;
+        }
+        let (word, end) = ident_at(text, i);
+        match word {
+            b"match" => {
+                let mut j = end;
+                while j < hi {
+                    match text[j] {
+                        b'(' | b'[' => j = delim_close(text, j),
+                        b'{' | b';' => break,
+                        _ => j += 1,
+                    }
+                }
+                if j < hi && text[j] == b'{' {
+                    let close = delim_close(text, j).min(hi);
+                    scan_match(text, j, close, out);
+                    i = close;
+                } else {
+                    i = end;
+                }
+            }
+            // `if let`, `while let` and `let` all put a pattern between the keyword and the `=`.
+            b"let" => {
+                let mut j = end;
+                while j < hi {
+                    match text[j] {
+                        b'(' | b'[' | b'{' => j = delim_close(text, j),
+                        b';' => break,
+                        b'=' if text.get(j + 1) != Some(&b'=')
+                            && text.get(j + 1) != Some(&b'>') =>
+                        {
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                out.push((end, j));
+                i = j;
+            }
+            b"for" => {
+                let mut j = end;
+                while j < hi {
+                    match text[j] {
+                        b'(' | b'[' => j = delim_close(text, j),
+                        b'{' | b';' => break,
+                        c if c.is_ascii_alphabetic() || c == b'_' => {
+                            let (w, e) = ident_at(text, j);
+                            if w == b"in" {
+                                break;
+                            }
+                            j = e;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                out.push((end, j));
+                i = j;
+            }
+            b"use" => {
+                let mut j = end;
+                while j < hi && text[j] != b';' {
+                    j += 1;
+                }
+                out.push((end, j));
+                i = j;
+            }
+            b"matches" => {
+                let k = skip_ws(text, end, hi);
+                if text.get(k) == Some(&b'!') {
+                    let k = skip_ws(text, k + 1, hi);
+                    if matches!(text.get(k), Some(b'(') | Some(b'[')) {
+                        let close = delim_close(text, k).min(hi);
+                        let mut p = k + 1;
+                        while p + 1 < close {
+                            match text[p] {
+                                b'(' | b'[' | b'{' => p = delim_close(text, p),
+                                b',' => break,
+                                _ => p += 1,
+                            }
+                        }
+                        out.push((p, close.saturating_sub(1)));
+                        i = close;
+                        continue;
+                    }
+                }
+                i = end;
+            }
+            _ => i = end,
+        }
+    }
+}
+
+#[derive(PartialEq)]
+enum Arm {
+    Head,
+    Guard,
+}
+
+fn scan_match(text: &[u8], brace: usize, close: usize, out: &mut Vec<(usize, usize)>) {
+    let end = close.saturating_sub(1);
+    let mut i = brace + 1;
+    let mut state = Arm::Head;
+    let mut head_start = i;
+    while i < end {
+        let c = text[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        match state {
+            Arm::Head => {
+                // A pattern's own groups already lie inside the head range.
+                if matches!(c, b'(' | b'[' | b'{') {
+                    i = delim_close(text, i).min(end);
+                } else if c == b'=' && text.get(i + 1) == Some(&b'>') {
+                    out.push((head_start, i));
+                    i = consume_arm_body(text, i + 2, end, out);
+                    head_start = i;
+                } else if c.is_ascii_alphabetic() || c == b'_' {
+                    let (w, e) = ident_at(text, i);
+                    // A guard is an expression, not a pattern.
+                    if w == b"if" {
+                        out.push((head_start, i));
+                        state = Arm::Guard;
+                    }
+                    i = e;
+                } else {
+                    i += 1;
+                }
+            }
+            Arm::Guard => {
+                if matches!(c, b'(' | b'[' | b'{') {
+                    let j = delim_close(text, i).min(end);
+                    scan(text, i + 1, j.saturating_sub(1), out);
+                    i = j;
+                } else if c == b'=' && text.get(i + 1) == Some(&b'>') {
+                    i = consume_arm_body(text, i + 2, end, out);
+                    state = Arm::Head;
+                    head_start = i;
+                } else if c.is_ascii_alphabetic() || c == b'_' {
+                    let (_, e) = ident_at(text, i);
+                    i = e;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    if state == Arm::Head && head_start < end {
+        out.push((head_start, end));
+    }
+}
+
+/// A block body ends at its `}`, comma optional; any other body at the next ungrouped comma.
+fn consume_arm_body(text: &[u8], i: usize, end: usize, out: &mut Vec<(usize, usize)>) -> usize {
+    let mut i = skip_ws(text, i, end);
+    if text.get(i) == Some(&b'{') {
+        let j = delim_close(text, i).min(end);
+        scan(text, i + 1, j.saturating_sub(1), out);
+        i = skip_ws(text, j, end);
+        if text.get(i) == Some(&b',') {
+            i += 1;
+        }
+        return i;
+    }
+    let start = i;
+    while i < end {
+        match text[i] {
+            b'(' | b'[' | b'{' => i = delim_close(text, i).min(end),
+            b',' => break,
+            _ => i += 1,
+        }
+    }
+    scan(text, start, i, out);
+    if i < end { i + 1 } else { i }
+}
+
+struct Source {
+    rel: String,
+    text: Vec<u8>,
+    masked: Vec<bool>,
+}
+
+impl Source {
+    fn is_pattern_or_use(&self, at: usize) -> bool {
+        self.masked.get(at).copied().unwrap_or(false)
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("the workspace root is two directories above crates/ply-eval-tests")
+}
+
+/// Package names from `[workspace] members`, read out of the root manifest as text.
+fn workspace_members(root: &Path) -> Vec<String> {
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("a workspace manifest");
+    let list = manifest
+        .split_once("members = [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(list, _)| list)
+        .expect("[workspace] members is a bracketed list");
+    list.lines()
+        .filter_map(|line| line.trim().strip_prefix("\"crates/"))
+        .filter_map(|line| line.split_once('"'))
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// Every `mod NAME;` in a file, with whether `#[cfg(test)]` sits on it.
+fn mod_declarations(text: &[u8]) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if !(text[i].is_ascii_alphabetic() || text[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let (word, end) = ident_at(text, i);
+        if word != b"mod" || (i > 0 && is_ident_byte(text[i - 1])) {
+            i = end;
+            continue;
+        }
+        let name_at = skip_ws(text, end, text.len());
+        let (name, name_end) = ident_at(text, name_at);
+        let after = skip_ws(text, name_end, text.len());
+        if !name.is_empty() && text.get(after) == Some(&b';') {
+            out.push((
+                String::from_utf8_lossy(name).into_owned(),
+                attributes_include_cfg_test(text, i),
+            ));
+        }
+        i = end;
+    }
+    out
+}
+
+fn attributes_include_cfg_test(text: &[u8], mod_at: usize) -> bool {
+    let mut p = mod_at;
+    loop {
+        while p > 0 && text[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        // `pub(crate)` and friends.
+        if p > 0
+            && text[p - 1] == b')'
+            && let Some(open) = delim_open(text, p - 1)
+        {
+            let mut q = open;
+            while q > 0 && text[q - 1].is_ascii_whitespace() {
+                q -= 1;
+            }
+            if q >= 3 && &text[q - 3..q] == b"pub" {
+                p = q - 3;
+                continue;
+            }
+        }
+        if p >= 3 && &text[p - 3..p] == b"pub" && (p == 3 || !is_ident_byte(text[p - 4])) {
+            p -= 3;
+            continue;
+        }
+        if p > 0
+            && text[p - 1] == b']'
+            && let Some(open) = delim_open(text, p - 1)
+            && open > 0
+            && text[open - 1] == b'#'
+        {
+            let attr: Vec<u8> = text[open + 1..p - 1]
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
+            if attr == b"cfg(test)" {
+                return true;
+            }
+            p = open - 1;
+            continue;
+        }
+        return false;
+    }
+}
+
+/// Files reachable from a crate root's `mod` declarations without passing a `#[cfg(test)] mod`.
+fn production_sources(root: &Path) -> Vec<Source> {
+    let mut reached: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    let mut queue: Vec<(PathBuf, bool)> = Vec::new();
+
+    for member in workspace_members(root) {
+        let src = root.join("crates").join(&member).join("src");
+        for entry in ["lib.rs", "main.rs"] {
+            let path = src.join(entry);
+            if path.is_file() {
+                queue.push((path, false));
+            }
+        }
+        if let Ok(bins) = std::fs::read_dir(src.join("bin")) {
+            for bin in bins.flatten() {
+                if bin.path().extension().is_some_and(|e| e == "rs") {
+                    queue.push((bin.path(), false));
+                }
+            }
+        }
+    }
+
+    while let Some((path, test_only)) = queue.pop() {
+        match reached.get(&path) {
+            // Reachable by any production path means it compiles into the library.
+            Some(&seen) if seen == test_only || !seen => continue,
+            _ => {}
+        }
+        reached.insert(path.clone(), test_only);
+        let raw = std::fs::read(&path).expect("a readable source file");
+        assert!(
+            !contains(&raw, b"#[path"),
+            "{} uses #[path], which this resolver does not follow — teach it, or the \
+             module it names silently drops out of the production set",
+            path.display()
+        );
+        // Blanking recognises `#[cfg(test)]` exactly.
+        for spelling in [b"cfg(all(test".as_slice(), b"cfg(any(test".as_slice()] {
+            assert!(
+                !contains(&blank_literals_and_comments(&raw), spelling),
+                "{} uses `{}`, which blank_cfg_test_blocks does not recognise — teach it, \
+                 or that item is scanned as production source",
+                path.display(),
+                String::from_utf8_lossy(spelling)
+            );
+        }
+        let blanked = blank_literals_and_comments(&raw);
+        let dir = path.parent().expect("a source file has a directory");
+        let stem = path.file_stem().expect("a source file has a stem");
+        let base = if matches!(stem.to_str(), Some("lib") | Some("main") | Some("mod")) {
+            dir.to_path_buf()
+        } else {
+            dir.join(stem)
+        };
+        for (name, is_test) in mod_declarations(&blanked) {
+            for candidate in [
+                base.join(format!("{name}.rs")),
+                base.join(&name).join("mod.rs"),
+            ] {
+                if candidate.is_file() {
+                    queue.push((candidate, test_only || is_test));
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut sources: Vec<Source> = reached
+        .into_iter()
+        .filter(|(_, test_only)| !test_only)
+        .map(|(path, _)| {
+            let raw = std::fs::read(&path).expect("a readable source file");
+            let text = blank_cfg_test_blocks(&blank_literals_and_comments(&raw));
+            let mut masked = vec![false; text.len()];
+            for (from, to) in pattern_and_use_regions(&text) {
+                for m in &mut masked[from.min(text.len())..to.min(text.len())] {
+                    *m = true;
+                }
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            Source { rel, text, masked }
+        })
+        .collect();
+    sources.sort_by(|a, b| a.rel.cmp(&b.rel));
+    sources
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Every `.ply` source a workspace member ships, which is production the same way `src/` is.
+fn ply_sources(root: &Path) -> Vec<Source> {
+    let mut out = Vec::new();
+    // ply-cli is the CLI's sources without a crate of its own; ply-launcher ships them, so its
+    // directory answers for both.
+    let mut owners: Vec<String> = workspace_members(root);
+    owners.retain(|member| member != "ply-launcher");
+    owners.push("ply-cli".to_string());
+    for member in owners {
+        let dir = root.join("crates").join(&member).join("ply");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "ply"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(text) = std::fs::read(&path) else {
+                continue;
+            };
+            let rel = format!(
+                "crates/{member}/ply/{}",
+                path.file_name().unwrap().to_string_lossy()
+            );
+            let masked = ply_item_bodies_masked(&text);
+            out.push(Source { rel, text, masked });
+        }
+    }
+    out
+}
+
+/// True where a byte sits inside a `test` or `law` body, which is not production any more than
+/// `#[cfg(test)]` is. Brace-counted from the item's `{`, with string and byte literals skipped so a
+/// brace inside one cannot close it.
+fn ply_item_bodies_masked(text: &[u8]) -> Vec<bool> {
+    let mut masked = vec![false; text.len()];
+    let mut starts: Vec<usize> = Vec::new();
+    for keyword in [&b"test "[..], &b"law "[..]] {
+        for at in find_all(text, keyword) {
+            // Only an item at the start of a line declares one.
+            if at == 0 || text[at - 1] == b'\n' {
+                starts.push(at);
+            }
+        }
+    }
+    for at in starts {
+        let mut i = at;
+        while i < text.len() && text[i] != b'{' {
+            if text[i] == b'\n' && i > at {
+                break;
+            }
+            i += 1;
+        }
+        if i >= text.len() || text[i] != b'{' {
+            continue;
+        }
+        let mut depth = 0usize;
+        while i < text.len() {
+            match text[i] {
+                b'"' => {
+                    i += 1;
+                    while i < text.len() && text[i] != b'"' {
+                        i += if text[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'/' if text.get(i + 1) == Some(&b'/') => {
+                    // A brace in a comment closes nothing.
+                    while i < text.len() && text[i] != b'\n' {
+                        masked[i] = true;
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        masked[i] = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if i < text.len() {
+                masked[i] = true;
+            }
+            i += 1;
+        }
+    }
+    masked
+}
+
+/// A code a `.ply` source raises. Ply passes the code as a byte literal — `diag1(b"E0128", ..)`,
+/// `err1(cx, b"E0201", ..)` — so the number itself is the arming, and a plain `"E0128"` in a
+/// rendered-text assertion or in `explain`'s table is not one.
+fn ply_armed_numbers(sources: &[Source]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for source in sources {
+        for at in find_all(&source.text, b"b\"") {
+            let body = at + 2;
+            if body + 5 > source.text.len() || source.masked[at] {
+                continue;
+            }
+            let number = &source.text[body..body + 5];
+            let shaped = matches!(number[0], b'E' | b'W')
+                && number[1..].iter().all(|b| b.is_ascii_digit())
+                && source.text.get(body + 5) == Some(&b'"');
+            if shaped {
+                out.insert(String::from_utf8_lossy(number).to_string());
+            }
+        }
+    }
+    out
+}
+
+fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    (0..=haystack.len() - needle.len())
+        .filter(|&i| &haystack[i..i + needle.len()] == needle)
+        .collect()
+}
+
+/// `ply_eval::codes`, a module that is the whole of its file.
+const CODES: &str = "crates/ply-eval/src/codes.rs";
+
+/// `NAME -> ("E0435", line)` for every `pub const` in `ply_eval::codes`.
+fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
+    let raw = std::fs::read(root.join(CODES)).expect("ply-eval's codes.rs");
+    let blanked = blank_literals_and_comments(&raw);
+    let close = blanked.len();
+
+    let mut out = BTreeMap::new();
+    for start in find_all(&blanked, b"pub const") {
+        let name_at = skip_ws(&blanked, start + b"pub const".len(), close);
+        let (name, name_end) = ident_at(&blanked, name_at);
+        // `skip_ws` over `blanked` would skip the blanked literal and land on the `;`.
+        let value_at = match blanked[name_end..close].iter().position(|b| *b == b'=') {
+            Some(eq) => skip_ws(&raw, name_end + eq + 1, close),
+            None => continue,
+        };
+        if raw.get(value_at) != Some(&b'"') {
+            continue;
+        }
+        let end = raw[value_at + 1..close]
+            .iter()
+            .position(|b| *b == b'"')
+            .map(|p| value_at + 1 + p)
+            .expect("a terminated code literal");
+        out.insert(
+            String::from_utf8_lossy(name).into_owned(),
+            (
+                String::from_utf8_lossy(&raw[value_at + 1..end]).into_owned(),
+                line_of(&raw, start),
+            ),
+        );
+    }
+    out
+}
+
+/// The registry of codes: the table `ply explain` answers from, one `m("E0000", "...")` per code.
+const REGISTRY: &str = "crates/ply-cli/ply/explain.ply";
+
+/// `(code, line)` for every row of the registry's `meanings()`, in the table's order. A row this
+/// cannot read fails the read rather than being skipped, so no code hides behind another shape.
+fn registry_rows(root: &Path) -> Vec<(String, usize)> {
+    let text = std::fs::read(root.join(REGISTRY)).expect("the registry is readable");
+    let head = find_all(&text, b"pub fn meanings()")
+        .into_iter()
+        .next()
+        .expect("the registry declares `pub fn meanings()`");
+    let open = text[head..]
+        .iter()
+        .position(|b| *b == b'[')
+        .map(|p| head + p)
+        .expect("`meanings()` is a list");
+    let mut rows = Vec::new();
+    let mut i = open + 1;
+    loop {
+        i = skip_ply_space(&text, i);
+        if text.get(i) == Some(&b']') {
+            return rows;
+        }
+        if !text[i..].starts_with(b"m(") {
+            unreadable_row(&text, i);
+        }
+        let row = i;
+        let (code, after) = ply_string(&text, skip_ply_space(&text, i + 2))
+            .unwrap_or_else(|| unreadable_row(&text, i));
+        i = skip_ply_space(&text, after);
+        if text.get(i) != Some(&b',') {
+            unreadable_row(&text, i);
+        }
+        let (_, after) = ply_string(&text, skip_ply_space(&text, i + 1))
+            .unwrap_or_else(|| unreadable_row(&text, i));
+        i = skip_ply_space(&text, after);
+        if text.get(i) == Some(&b',') {
+            i = skip_ply_space(&text, i + 1);
+        }
+        if text.get(i) != Some(&b')') {
+            unreadable_row(&text, i);
+        }
+        rows.push((code, line_of(&text, row)));
+        i = skip_ply_space(&text, i + 1);
+        match text.get(i) {
+            Some(b',') => i += 1,
+            Some(b']') => return rows,
+            _ => unreadable_row(&text, i),
+        }
+    }
+}
+
+fn unreadable_row(text: &[u8], at: usize) -> ! {
+    panic!(
+        "{REGISTRY}:{}: `meanings()` holds something other than an `m(\"E0000\", \"meaning\")` \
+         row, which the registry gates cannot read",
+        line_of(text, at)
+    )
+}
+
+/// Past whitespace and `//` comments.
+fn skip_ply_space(text: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < text.len() && text[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if !text[i..].starts_with(b"//") {
+            return i;
+        }
+        while i < text.len() && text[i] != b'\n' {
+            i += 1;
+        }
+    }
+}
+
+/// The string literal opening at `i`, undecoded, and the offset past its closing quote.
+fn ply_string(text: &[u8], i: usize) -> Option<(String, usize)> {
+    if text.get(i) != Some(&b'"') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < text.len() {
+        match text[j] {
+            b'\\' => j += 2,
+            b'"' => return Some((String::from_utf8_lossy(&text[i + 1..j]).into_owned(), j + 1)),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+fn is_code_shaped(code: &str) -> bool {
+    code.len() == 5
+        && matches!(code.as_bytes()[0], b'E' | b'W')
+        && code.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+}
+
+/// Every production `Diagnostic::error`/`warning` call, as `(source, offset, first argument)`.
+fn constructor_calls(sources: &[Source]) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    for (idx, source) in sources.iter().enumerate() {
+        for name in [b"Diagnostic::error".as_slice(), b"Diagnostic::warning"] {
+            for at in find_all(&source.text, name) {
+                let paren = skip_ws(&source.text, at + name.len(), source.text.len());
+                if source.text.get(paren) != Some(&b'(') {
+                    continue;
+                }
+                let arg_at = skip_ws(&source.text, paren + 1, source.text.len());
+                let mut end = arg_at;
+                while end < source.text.len()
+                    && (is_ident_byte(source.text[end]) || source.text[end] == b':')
+                {
+                    end += 1;
+                }
+                out.push((
+                    idx,
+                    at,
+                    String::from_utf8_lossy(&source.text[arg_at..end]).into_owned(),
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn code_from_path(arg: &str) -> Option<&str> {
+    let (prefix, name) = arg.rsplit_once("::")?;
+    (prefix == "codes" || prefix.ends_with("::codes")).then_some(name)
+}
+
+/// The `fn` a byte offset sits in: the nearest `fn NAME` before it.
+fn enclosing_function(text: &[u8], at: usize) -> String {
+    find_all(&text[..at], b"fn ")
+        .into_iter()
+        .rev()
+        .find(|&p| p == 0 || !is_ident_byte(text[p - 1]))
+        .map(|p| {
+            let (name, _) = ident_at(text, skip_ws(text, p + 3, at));
+            String::from_utf8_lossy(name).into_owned()
+        })
+        .unwrap_or_else(|| "<no enclosing fn>".to_string())
+}
+
+fn armed_codes(sources: &[Source]) -> BTreeSet<String> {
+    let mut armed: BTreeSet<String> = constructor_calls(sources)
+        .iter()
+        .filter_map(|(_, _, arg)| code_from_path(arg).map(str::to_string))
+        .collect();
+    for wrapper in CODE_INDIRECTION {
+        assert!(
+            wrapper.reason.len() > 40,
+            "CODE_INDIRECTION entry `{}::{}` has no real reason",
+            wrapper.file,
+            wrapper.function
+        );
+        let Some(source) = sources.iter().find(|s| s.rel == wrapper.file) else {
+            continue;
+        };
+        let needle = format!(".{}(", wrapper.function).into_bytes();
+        for at in find_all(&source.text, &needle) {
+            let arg_at = skip_ws(&source.text, at + needle.len(), source.text.len());
+            let mut end = arg_at;
+            while end < source.text.len()
+                && (is_ident_byte(source.text[end]) || source.text[end] == b':')
+            {
+                end += 1;
+            }
+            let arg = String::from_utf8_lossy(&source.text[arg_at..end]);
+            if let Some(code) = code_from_path(&arg) {
+                armed.insert(code.to_string());
+            }
+        }
+    }
+    armed
+}
+
+struct CoveredEnum {
+    name: String,
+    file: String,
+    line: usize,
+    variants: Vec<String>,
+}
+
+fn variant_names(body: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        match body[i] {
+            b'#' if body.get(i + 1) == Some(&b'[') => i = delim_close(body, i + 1),
+            b'(' | b'[' | b'{' => i = delim_close(body, i),
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let (name, end) = ident_at(body, i);
+                out.push(String::from_utf8_lossy(name).into_owned());
+                // A discriminant — `Foo = 1,` — is not a variant name.
+                let after = skip_ws(body, end, body.len());
+                if body.get(after) == Some(&b'=') {
+                    i = after;
+                    while i < body.len() && body[i] != b',' {
+                        i += 1;
+                    }
+                } else {
+                    i = end;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+fn covered_enums(sources: &[Source]) -> Vec<CoveredEnum> {
+    let mut out = Vec::new();
+    for source in sources {
+        let in_root = COVERED_ENUM_ROOTS
+            .iter()
+            .any(|root| source.rel.starts_with(root));
+        let named: Vec<&str> = COVERED_ENUMS
+            .iter()
+            .filter(|(file, _)| *file == source.rel)
+            .map(|(_, name)| *name)
+            .collect();
+        if !in_root && named.is_empty() {
+            continue;
+        }
+        for at in find_all(&source.text, b"pub enum ") {
+            let name_at = skip_ws(&source.text, at + b"pub enum ".len(), source.text.len());
+            let (name, name_end) = ident_at(&source.text, name_at);
+            let name = String::from_utf8_lossy(name).into_owned();
+            if !in_root && !named.contains(&name.as_str()) {
+                continue;
+            }
+            let Some(brace) = source.text[name_end..]
+                .iter()
+                .position(|b| *b == b'{')
+                .map(|p| name_end + p)
+            else {
+                continue;
+            };
+            let close = delim_close(&source.text, brace);
+            out.push(CoveredEnum {
+                name,
+                file: source.rel.clone(),
+                line: line_of(&source.text, at),
+                variants: variant_names(&source.text[brace + 1..close.saturating_sub(1)]),
+            });
+        }
+    }
+    out
+}
+
+/// Every production `Ident::Ident` outside patterns and `use` paths: `(before, after, source)`.
+fn path_occurrences(sources: &[Source]) -> BTreeSet<(String, String, usize)> {
+    let mut out = BTreeSet::new();
+    for (idx, source) in sources.iter().enumerate() {
+        let text = &source.text;
+        for at in find_all(text, b"::") {
+            let mut start = at;
+            while start > 0 && is_ident_byte(text[start - 1]) {
+                start -= 1;
+            }
+            if start == at {
+                continue;
+            }
+            let (after, after_end) = ident_at(text, at + 2);
+            if after.is_empty() || after_end == at + 2 {
+                continue;
+            }
+            if source.is_pattern_or_use(start) {
+                continue;
+            }
+            out.insert((
+                String::from_utf8_lossy(&text[start..at]).into_owned(),
+                String::from_utf8_lossy(after).into_owned(),
+                idx,
+            ));
+        }
+    }
+    out
+}
+
+/// Whether production builds `Enum::Variant` outside a pattern or `use` path.
+fn variant_is_armed(tree: &Tree, covered: &CoveredEnum, variant: &str) -> bool {
+    (0..tree.sources.len()).any(|idx| {
+        tree.paths
+            .contains(&(covered.name.clone(), variant.to_string(), idx))
+            || (tree.sources[idx].rel == covered.file
+                && tree
+                    .paths
+                    .contains(&("Self".to_string(), variant.to_string(), idx)))
+    })
+}
+
+/// Everything the gates read, scanned once.
+struct Tree {
+    sources: Vec<Source>,
+    declared: BTreeMap<String, (String, usize)>,
+    /// The numbers a `.ply` source raises.
+    raised: BTreeSet<String>,
+    registry: Vec<(String, usize)>,
+    armed: BTreeSet<String>,
+    covered: Vec<CoveredEnum>,
+    paths: BTreeSet<(String, String, usize)>,
+    calls: Vec<(usize, usize, String)>,
+}
+
+fn tree() -> &'static Tree {
+    static TREE: OnceLock<Tree> = OnceLock::new();
+    TREE.get_or_init(|| {
+        let root = workspace_root();
+        let sources = production_sources(&root);
+        let declared = declared_codes(&root);
+        let registry = registry_rows(&root);
+        // A Ply source raises a code by its number, so an arming there is matched against the
+        // constant's number rather than against `codes::NAME`.
+        let raised = ply_armed_numbers(&ply_sources(&root));
+        let mut armed = armed_codes(&sources);
+        for (name, (number, _)) in &declared {
+            if raised.contains(number) {
+                armed.insert(name.clone());
+            }
+        }
+        let covered = covered_enums(&sources);
+        let paths = path_occurrences(&sources);
+        let calls = constructor_calls(&sources);
+        Tree {
+            sources,
+            declared,
+            raised,
+            registry,
+            armed,
+            covered,
+            paths,
+            calls,
+        }
+    })
+}
+
+fn how_to_fix(what: &str, list: &str) -> String {
+    format!(
+        "\n\nEither construct it — {what} — or, if it is reserved on purpose, add a row to \
+         `{list}` in crates/ply-eval-tests/tests/suite/armed.rs with a reason. \
+         An entry there is not absolution: it is what makes \"reserved on purpose\" and \
+         \"we forgot\" stop looking identical. Do NOT loosen the rule to make an entry \
+         disappear; that inverts the point of this gate."
+    )
+}
+
+#[test]
+fn every_registered_code_is_constructed_in_production() {
+    let Tree {
+        sources,
+        declared,
+        armed,
+        ..
+    } = tree();
+
+    assert!(
+        sources.len() > 100,
+        "scanned {} production files — the scan root is wrong and every assertion below \
+         would pass over nothing",
+        sources.len()
+    );
+    assert!(
+        declared.len() > 50,
+        "parsed {} codes out of ply_eval::codes — the parser is broken",
+        declared.len()
+    );
+    assert!(
+        armed.len() > 50,
+        "found {} armed codes — the constructor scan is broken",
+        armed.len()
+    );
+
+    let allowed: BTreeSet<&str> = UNARMED_CODES.iter().map(|(name, _)| *name).collect();
+    let mut dead: Vec<(&String, &(String, usize))> = declared
+        .iter()
+        .filter(|(name, _)| !armed.contains(*name) && !allowed.contains(name.as_str()))
+        .collect();
+    dead.sort_by_key(|(_, (number, _))| number.clone());
+
+    if !dead.is_empty() {
+        let mut message = format!(
+            "{} registered diagnostic code(s) are declared and registered but constructed \
+             nowhere in production source:\n",
+            dead.len()
+        );
+        for (name, (number, line)) in &dead {
+            let _ = writeln!(message, "  {number} {name}    declared at {CODES}:{line}");
+        }
+        message.push_str(
+            "\nA code is ARMED iff a production Rust source calls Diagnostic::error(codes::NAME, ..) \
+             or Diagnostic::warning(codes::NAME, ..), or passes codes::NAME to a wrapper listed \
+             in CODE_INDIRECTION, or a `.ply` source a member ships raises its number as a byte \
+             literal, as `diag1(b\"E0128\", ..)` does. A row in the registry table, an entry in \
+             crates/ply-eval/src/host.rs's RESERVED_CODES, a `\"E0128\"` string rather than a byte \
+             literal, and any mention under #[cfg(test)], inside a Ply `test` or `law` body, or \
+             under crates/*/tests/ are NOT armings.",
+        );
+        message.push_str(&how_to_fix(
+            "raise it where the condition it names is detected",
+            "UNARMED_CODES",
+        ));
+        panic!("{message}");
+    }
+}
+
+#[test]
+fn every_variant_of_a_covered_enum_is_constructed_in_production() {
+    let tree = tree();
+    let covered = &tree.covered;
+
+    assert!(
+        covered.len() > 10,
+        "found {} covered enums — COVERED_ENUM_ROOTS resolved to nothing",
+        covered.len()
+    );
+    let total: usize = covered.iter().map(|e| e.variants.len()).sum();
+    assert!(
+        total > 40,
+        "found {total} variants across the covered enums"
+    );
+
+    let allowed: BTreeSet<&str> = UNARMED_VARIANTS.iter().map(|(name, _)| *name).collect();
+    let mut dead = Vec::new();
+    for enumeration in covered.iter() {
+        for variant in &enumeration.variants {
+            let key = format!("{}::{variant}", enumeration.name);
+            if allowed.contains(key.as_str()) {
+                continue;
+            }
+            if !variant_is_armed(tree, enumeration, variant) {
+                dead.push((key, enumeration.file.clone(), enumeration.line));
+            }
+        }
+    }
+    dead.sort();
+    dead.dedup();
+
+    assert!(
+        dead.len() < total,
+        "every covered variant looks unarmed, which is a broken scan and not a finding"
+    );
+
+    if !dead.is_empty() {
+        let mut message = format!(
+            "{} variant(s) of a covered enum are declared and matched on but constructed \
+             nowhere in production source:\n",
+            dead.len()
+        );
+        for (key, file, line) in &dead {
+            let _ = writeln!(message, "  {key}    declared at {file}:{line}");
+        }
+        message.push_str(
+            "\nA variant is ARMED iff it appears in production source outside a pattern \
+             position. A match arm, an `if let`, a `while let`, a `matches!` and a `use` path \
+             are all consumers: they prove something reads the variant, never that anything \
+             builds one.",
+        );
+        message.push_str(&how_to_fix(
+            "build one where the condition it names occurs",
+            "UNARMED_VARIANTS",
+        ));
+        panic!("{message}");
+    }
+}
+
+/// A pass-through wrapper would otherwise disarm the rule for every code routed through it.
+#[test]
+fn every_diagnostic_constructor_call_names_its_code_literally() {
+    let Tree { sources, calls, .. } = tree();
+
+    assert!(
+        calls.len() > 200,
+        "found {} Diagnostic::error/warning calls — the scan is broken",
+        calls.len()
+    );
+
+    let mut unlisted = Vec::new();
+    for (idx, at, arg) in calls.iter() {
+        if code_from_path(arg).is_some() {
+            continue;
+        }
+        let source = &sources[*idx];
+        let function = enclosing_function(&source.text, *at);
+        if CODE_INDIRECTION
+            .iter()
+            .any(|w| w.file == source.rel && w.function == function)
+        {
+            continue;
+        }
+        unlisted.push(format!(
+            "  {}:{} in fn {function} — first argument is `{arg}`",
+            source.rel,
+            line_of(&source.text, *at)
+        ));
+    }
+
+    assert!(
+        unlisted.is_empty(),
+        "{} Diagnostic constructor call(s) take their code indirectly, and are not in \
+         CODE_INDIRECTION:\n{}\n\nEvery code that reaches Diagnostic only through an unlisted \
+         wrapper is invisible to every_registered_code_is_constructed_in_production, which \
+         would then report it dead — or, if the wrapper were quietly allowlisted by file, hide \
+         a real death. Add the wrapper to CODE_INDIRECTION in \
+         crates/ply-eval-tests/tests/suite/armed.rs with a reason, or pass codes::NAME literally.",
+        unlisted.len(),
+        unlisted.join("\n")
+    );
+}
+
+/// Tooling matches on codes, so a number is published once, with one meaning, and never shared.
+#[test]
+fn every_code_declared_or_raised_has_one_row_in_the_registry() {
+    let Tree {
+        declared,
+        raised,
+        registry,
+        ..
+    } = tree();
+
+    assert!(
+        declared.len() > 50 && raised.len() > 50 && registry.len() > 50,
+        "parsed {} constants, {} numbers raised in Ply and {} registry rows — one of the three \
+         parsers is broken",
+        declared.len(),
+        raised.len(),
+        registry.len()
+    );
+
+    let mut named: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (name, (number, _)) in declared {
+        named
+            .entry(number.as_str())
+            .or_default()
+            .push(name.as_str());
+    }
+    let shared: Vec<String> = named
+        .iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(number, names)| format!("{number}: {}", names.join(", ")))
+        .collect();
+    assert!(
+        shared.is_empty(),
+        "constants in ply_eval::codes share a number, which nothing reading a code can tell \
+         apart: {shared:?}"
+    );
+
+    let mut rows: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (code, line) in registry {
+        rows.entry(code.as_str()).or_default().push(*line);
+    }
+    let twice: Vec<String> = rows
+        .iter()
+        .filter(|(_, lines)| lines.len() > 1)
+        .map(|(code, lines)| format!("{code} at lines {lines:?}"))
+        .collect();
+    assert!(
+        twice.is_empty(),
+        "{REGISTRY} explains a code twice: {twice:?}"
+    );
+
+    let wanted: BTreeSet<&str> = named
+        .keys()
+        .copied()
+        .chain(raised.iter().map(String::as_str))
+        .collect();
+    let missing: Vec<&&str> = wanted.iter().filter(|c| !rows.contains_key(**c)).collect();
+    assert!(
+        missing.is_empty(),
+        "{} code(s) declared in ply_eval::codes or raised from a `.ply` source have no row in \
+         `meanings()` in {REGISTRY}, so `ply explain` cannot say what they mean: {missing:?}\n\n\
+         Add a row m(\"E0000\", \"what it means\") — adding a row moves no existing number.",
+        missing.len()
+    );
+}
+
+#[test]
+fn the_registry_has_no_row_for_a_code_nothing_declares_or_raises() {
+    let Tree {
+        declared,
+        raised,
+        registry,
+        ..
+    } = tree();
+
+    assert!(
+        registry.len() > 50,
+        "parsed {} registry rows — the parser is broken",
+        registry.len()
+    );
+    let malformed: Vec<&str> = registry
+        .iter()
+        .map(|(code, _)| code.as_str())
+        .filter(|code| !is_code_shaped(code))
+        .collect();
+    assert!(
+        malformed.is_empty(),
+        "{REGISTRY} has rows whose code is not shaped E0000 or W0000: {malformed:?}"
+    );
+
+    let wanted: BTreeSet<&str> = declared
+        .values()
+        .map(|(number, _)| number.as_str())
+        .chain(raised.iter().map(String::as_str))
+        .collect();
+    let stale: Vec<String> = registry
+        .iter()
+        .filter(|(code, _)| !wanted.contains(code.as_str()))
+        .map(|(code, line)| format!("{code} at {REGISTRY}:{line}"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "the registry explains {} code(s) that nothing declares in ply_eval::codes or raises from \
+         a `.ply` source: {stale:?}\n\nDelete the row, or raise the code where the condition it \
+         names is detected.",
+        stale.len()
+    );
+}
+
+#[test]
+fn no_allowlist_entry_has_outlived_its_reason() {
+    let tree = tree();
+    let Tree {
+        sources,
+        declared,
+        armed,
+        covered,
+        ..
+    } = tree;
+
+    let mut stale = Vec::new();
+
+    for (name, reason) in UNARMED_CODES {
+        assert!(
+            reason.len() > 40,
+            "UNARMED_CODES entry `{name}` has no real reason"
+        );
+        if !declared.contains_key(*name) {
+            stale.push(format!(
+                "  UNARMED_CODES has `{name}`, which ply_eval::codes no longer declares — \
+                 delete the row"
+            ));
+        } else if armed.contains(*name) {
+            stale.push(format!(
+                "  UNARMED_CODES has `{name}`, which production source now constructs — \
+                 delete the row"
+            ));
+        }
+    }
+
+    for (key, reason) in UNARMED_VARIANTS {
+        assert!(
+            reason.len() > 40,
+            "UNARMED_VARIANTS entry `{key}` has no real reason"
+        );
+        let Some((enum_name, variant)) = key.split_once("::") else {
+            panic!("UNARMED_VARIANTS entry `{key}` is not `Enum::Variant`");
+        };
+        let declarations: Vec<&CoveredEnum> =
+            covered.iter().filter(|e| e.name == enum_name).collect();
+        if declarations.is_empty() {
+            stale.push(format!(
+                "  UNARMED_VARIANTS has `{key}`, but no covered enum is called `{enum_name}` \
+                 any more — delete the row"
+            ));
+            continue;
+        }
+        if !declarations
+            .iter()
+            .any(|e| e.variants.iter().any(|v| v == variant))
+        {
+            stale.push(format!(
+                "  UNARMED_VARIANTS has `{key}`, but `{enum_name}` has no variant \
+                 `{variant}` any more — delete the row"
+            ));
+            continue;
+        }
+        if declarations
+            .iter()
+            .any(|e| variant_is_armed(tree, e, variant))
+        {
+            stale.push(format!(
+                "  UNARMED_VARIANTS has `{key}`, which production source now constructs — \
+                 delete the row"
+            ));
+        }
+    }
+
+    for wrapper in CODE_INDIRECTION {
+        assert!(
+            wrapper.reason.len() > 40,
+            "CODE_INDIRECTION entry `{}::{}` has no real reason",
+            wrapper.file,
+            wrapper.function
+        );
+        let Some(source) = sources.iter().find(|s| s.rel == wrapper.file) else {
+            stale.push(format!(
+                "  CODE_INDIRECTION names {}, which is not a production source any more",
+                wrapper.file
+            ));
+            continue;
+        };
+        let needle = format!("fn {}", wrapper.function).into_bytes();
+        if !contains(&source.text, &needle) {
+            stale.push(format!(
+                "  CODE_INDIRECTION names fn {} in {}, which does not define it any more",
+                wrapper.function, wrapper.file
+            ));
+        }
+    }
+
+    assert!(
+        stale.is_empty(),
+        "{} allowlist entry(s) no longer describe the tree:\n{}",
+        stale.len(),
+        stale.join("\n")
+    );
+}
+
+/// Two covered enums with the same name cannot be told apart by a lexical scan.
+#[test]
+fn ambiguous_enum_names_are_declared() {
+    let covered = &tree().covered;
+
+    let mut counts: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for enumeration in covered.iter() {
+        counts
+            .entry(enumeration.name.as_str())
+            .or_default()
+            .push(format!("{}:{}", enumeration.file, enumeration.line));
+    }
+    let declared: BTreeSet<&str> = AMBIGUOUS_ENUM_NAMES.iter().map(|(name, _)| *name).collect();
+
+    let undeclared: Vec<String> = counts
+        .iter()
+        .filter(|(name, sites)| sites.len() > 1 && !declared.contains(*name))
+        .map(|(name, sites)| format!("  {name} — {}", sites.join(", ")))
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "{} covered enum name(s) are declared more than once, so `Name::Variant` cannot be \
+         attributed to one of them and a hit arms the variant in all of them:\n{}\n\nRename one, \
+         or add it to AMBIGUOUS_ENUM_NAMES with the reason the false negative is acceptable.",
+        undeclared.len(),
+        undeclared.join("\n")
+    );
+
+    let gone: Vec<&str> = AMBIGUOUS_ENUM_NAMES
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| counts.get(name).is_none_or(|sites| sites.len() < 2))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "AMBIGUOUS_ENUM_NAMES lists {gone:?}, which is no longer ambiguous — delete the row"
+    );
+}
+
+fn mask_of(src: &str) -> Vec<bool> {
+    let text = blank_cfg_test_blocks(&blank_literals_and_comments(src.as_bytes()));
+    let mut masked = vec![false; text.len()];
+    for (from, to) in pattern_and_use_regions(&text) {
+        for m in &mut masked[from.min(text.len())..to.min(text.len())] {
+            *m = true;
+        }
+    }
+    masked
+}
+
+#[track_caller]
+fn assert_pattern(src: &str, needle: &str, expected: bool) {
+    let text = blank_cfg_test_blocks(&blank_literals_and_comments(src.as_bytes()));
+    let at = find_all(&text, needle.as_bytes())
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("`{needle}` does not survive blanking in:\n{src}"));
+    assert_eq!(
+        mask_of(src)[at],
+        expected,
+        "`{needle}` should {} be a pattern position in:\n{src}",
+        if expected { "" } else { "not" }
+    );
+}
+
+#[test]
+fn arm_bodies_are_expressions_and_arm_heads_are_patterns() {
+    // A block-bodied arm with no trailing comma, followed by another arm.
+    assert_pattern(
+        "fn f(e: E) { match e { E::A => { g(); } E::B => { h(); } } }",
+        "E::B",
+        true,
+    );
+    assert_pattern(
+        "fn f(e: E) { match e { E::A => E::B, _ => x } }",
+        "E::B",
+        false,
+    );
+    assert_pattern(
+        "fn f(e: E) { match e { E::A => E::B, _ => x } }",
+        "E::A",
+        true,
+    );
+    assert_pattern(
+        "fn f(e: E) { match e { E::A => match g() { E::C => 1, _ => 2 }, _ => 3 } }",
+        "E::C",
+        true,
+    );
+    // A guard is an expression, not a pattern.
+    assert_pattern(
+        "fn f(e: E) { match e { x if x == E::A => 1, _ => 2 } }",
+        "E::A",
+        false,
+    );
+    assert_pattern(
+        "fn f(e: E) { match e { E::A | E::B => 1, _ => 2 } }",
+        "E::B",
+        true,
+    );
+    assert_pattern(
+        "fn f(e: E) { match e { E::A { x } => x, _ => 2 } }",
+        "E::A",
+        true,
+    );
+    assert_pattern("fn f(e: E) { if let E::A = e { g() } }", "E::A", true);
+    assert_pattern("fn f(e: E) { while let E::A = e { g() } }", "E::A", true);
+    assert_pattern("fn f(e: E) -> bool { matches!(e, E::A) }", "E::A", true);
+    assert_pattern("use crate::e::E::A;", "E::A", true);
+    // Producers.
+    assert_pattern("fn f() -> E { E::A }", "E::A", false);
+    assert_pattern("fn f(v: &mut Vec<E>) { v.push(E::A); }", "E::A", false);
+    assert_pattern("fn f() -> E { E::A { x: 1 } }", "E::A", false);
+    assert_pattern("fn f() { let x = E::A; }", "E::A", false);
+}
+
+#[test]
+fn comments_and_literals_are_not_source() {
+    let src = "/// codes::GHOST and E::Ghost\nfn f() { let s = \"codes::GHOST\"; }";
+    let text = blank_literals_and_comments(src.as_bytes());
+    assert_eq!(text.len(), src.len(), "blanking changed the byte offsets");
+    assert!(
+        !contains(&text, b"codes::GHOST"),
+        "a doc comment or a string literal survived blanking"
+    );
+    assert!(!contains(&text, b"E::Ghost"));
+
+    let raw = "fn f() { let s = r#\"codes::GHOST\"#; let c = '\\''; let d = 'é'; }";
+    let text = blank_literals_and_comments(raw.as_bytes());
+    assert_eq!(text.len(), raw.len());
+    assert!(!contains(&text, b"codes::GHOST"), "a raw string survived");
+    // A lifetime is not a character literal.
+    let lifetime = "fn f<'a>(x: &'a str) -> E { E::A }";
+    let text = blank_literals_and_comments(lifetime.as_bytes());
+    assert!(
+        contains(&text, b"E::A"),
+        "a lifetime was mistaken for a character literal and ate the rest of the file"
+    );
+
+    let nested = "/* a /* b */ codes::GHOST */ fn f() {}";
+    assert!(!contains(
+        &blank_literals_and_comments(nested.as_bytes()),
+        b"codes::GHOST"
+    ));
+}
+
+#[test]
+fn cfg_test_items_and_modules_are_not_production() {
+    let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    use codes::GHOST;\n}\nfn b() {}";
+    let text = blank_cfg_test_blocks(src.as_bytes());
+    assert_eq!(text.len(), src.len());
+    assert!(!contains(&text, b"GHOST"), "a #[cfg(test)] block survived");
+    assert!(contains(&text, b"fn a()") && contains(&text, b"fn b()"));
+
+    // A `#[cfg(test)] mod x;` declaration must survive: the resolver reads it.
+    let decl = "#[cfg(test)]\nmod tests;\nfn a() {}";
+    assert!(contains(
+        &blank_cfg_test_blocks(decl.as_bytes()),
+        b"mod tests;"
+    ));
+    assert_eq!(
+        mod_declarations(decl.as_bytes()),
+        vec![("tests".to_string(), true)]
+    );
+    assert_eq!(
+        mod_declarations(b"pub mod slice;\nmod key;"),
+        vec![("slice".to_string(), false), ("key".to_string(), false)]
+    );
+    assert_eq!(
+        mod_declarations(b"#[cfg(not(test))]\npub(crate) mod real;"),
+        vec![("real".to_string(), false)]
+    );
+    // A `mod x { .. }` with a body is not a file and must not be resolved.
+    assert!(mod_declarations(b"mod inline { fn f() {} }").is_empty());
+}
+
+#[test]
+fn a_cfg_test_item_is_not_production_whatever_its_header_looks_like() {
+    // A `;` inside an array type in the return position.
+    let array_return =
+        "#[cfg(test)]\nfn kept() -> [usize; CLASSES] {\n    codes::GHOST\n}\nfn after() {}";
+    let text = blank_cfg_test_blocks(array_return.as_bytes());
+    assert_eq!(text.len(), array_return.len(), "blanking moved the offsets");
+    assert!(
+        !contains(&text, b"GHOST"),
+        "a #[cfg(test)] fn survived because its return type held a `;`"
+    );
+    assert!(contains(&text, b"fn after()"), "blanking ran past the item");
+
+    // The same `;` in an argument type.
+    assert!(!contains(
+        &blank_cfg_test_blocks(b"#[cfg(test)]\nfn f(a: [u8; 4]) {\n    codes::GHOST\n}"),
+        b"GHOST"
+    ));
+
+    // Non-module `;`-terminated items are test-only source too.
+    for src in [
+        "#[cfg(test)]\nconst K: E = E::GHOST;\nfn after() {}",
+        "#[cfg(test)]\nstatic K: E = E::GHOST;\nfn after() {}",
+        "#[cfg(test)]\nuse crate::e::E::GHOST;\nfn after() {}",
+    ] {
+        let text = blank_cfg_test_blocks(src.as_bytes());
+        assert_eq!(text.len(), src.len());
+        assert!(
+            !contains(&text, b"GHOST"),
+            "a #[cfg(test)] item survived: {src}"
+        );
+        assert!(
+            contains(&text, b"fn after()"),
+            "blanking ran past the item: {src}"
+        );
+    }
+
+    // A `mod` declaration survives however it is spelled: the resolver reads it.
+    for src in [
+        "#[cfg(test)]\nmod tests;",
+        "#[cfg(test)]\npub(crate) mod delta_tests;",
+    ] {
+        assert!(
+            contains(&blank_cfg_test_blocks(src.as_bytes()), b"mod "),
+            "the resolver's `mod` declaration was blanked: {src}"
+        );
+    }
+    assert!(header_declares_a_module(b" pub(crate) mod tests"));
+    assert!(!header_declares_a_module(b" const MODE: u8 = 1"));
+}
+
+#[test]
+fn a_variant_list_is_read_off_an_enum_body() {
+    let src = "#[derive(Clone)]\npub enum E {\n    /// d\n    A,\n    B { x: u8 },\n    C(Vec<(u8, u8)>),\n    D = 7,\n}";
+    let text = blank_literals_and_comments(src.as_bytes());
+    let brace = find_all(&text, b"pub enum E")[0]
+        + text[find_all(&text, b"pub enum E")[0]..]
+            .iter()
+            .position(|b| *b == b'{')
+            .expect("the enum has a body");
+    let close = delim_close(&text, brace);
+    assert_eq!(
+        variant_names(&text[brace + 1..close - 1]),
+        vec!["A", "B", "C", "D"]
+    );
+}
+
+#[test]
+fn a_codes_path_is_recognised_however_it_is_qualified() {
+    assert_eq!(code_from_path("codes::X"), Some("X"));
+    assert_eq!(code_from_path("crate::codes::X"), Some("X"));
+    assert_eq!(code_from_path("ply_eval::codes::X"), Some("X"));
+    assert_eq!(code_from_path("code"), None);
+    assert_eq!(code_from_path("self.code"), None);
+    assert_eq!(code_from_path("other::X"), None);
+}

@@ -123,20 +123,20 @@ fn without_the_grant_the_machine_is_not_bound() {
 /// `prover`, so a grant checked against the family's name could never be made.
 const PROVING: &str = "\
 nondet effect prover {
-  write configure[claims](options: Unit, front: Unit) -> Unit
+  write configure[claims](options: Unit, front: Unit, world: Unit) -> Unit
   read collected[claims]() -> Result<Unit, Unit>
-  read typed[claims]() -> Result<Unit, Unit>
   read outcomes[claims](keys: List<String>) -> List<Option<String>>
   read discharged[claims](choice: Unit) -> Result<Unit, Unit>
-  write record[claims](entries: Unit) -> Unit
+  write record[claims](entries: List<Unit>) -> List<Unit>
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Unit, Unit>
+  read reaches[claims](claims: List<Int>) -> Result<Unit, Unit>
   read shrink[claims](claim: Int) -> Result<Option<Int>, Unit>
   read offers[claims](i: Int) -> Result<Option<Unit>, Unit>
   read would[claims](i: Int, position: Int) -> Result<Bool, Unit>
   write accept[claims](i: Int, position: Int) -> Result<Unit, Unit>
   read settled[claims]() -> Result<Option<Unit>, Unit>
-  read baselines[claims]() -> Unit
-  write accepted[claims](records: Unit) -> Unit
+  read baselines[claims]() -> List<Unit>
+  write accepted[claims](records: List<Unit>) -> Unit
 }
 
 fn main() -> Int / {prover.collected[claims]} =

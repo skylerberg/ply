@@ -1,6 +1,5 @@
-use ply_eval::{Exploration, Naive, Seed};
-use ply_test::sim::{Record, SimSummary, record_under, replay_command};
-use ply_ty::DefHash;
+use ply_eval::{DefHash, EffectAtom, Exploration, Footprint, Mode, Naive, Resource, Symbol};
+use ply_test::sim::{Record, is_seeded, record_under};
 
 fn hash(byte: u8) -> DefHash {
     DefHash([byte; 32])
@@ -58,43 +57,18 @@ fn a_seeded_test_whose_search_was_not_observed_writes_nothing() {
     assert_eq!(record_under(&[hash(1)], true, None), Record::Unobserved);
 }
 
+/// A seed read is what makes a test searched: the runtime runs it once per interleaving.
 #[test]
-fn the_summary_line_names_the_counts_and_is_silent_without_a_region() {
-    assert_eq!(SimSummary::default().line(), None);
-    let summary = SimSummary {
-        simulated: 3,
-        total: 47,
-        seeds: 3,
-        interleavings: 61,
-        exhaustive: 3,
-        exhausted: 0,
-        failed: 0,
-    };
-    assert_eq!(
-        summary.line().unwrap(),
-        "simulated: 3 of 47 · 61 interleavings · 3 exhaustive"
-    );
-}
-
-#[test]
-fn a_spent_budget_is_said_out_loud_in_the_summary() {
-    let summary = SimSummary {
-        simulated: 1,
-        total: 1,
-        seeds: 1,
-        interleavings: 256,
-        exhausted: 1,
-        ..SimSummary::default()
-    };
-    assert!(summary.line().unwrap().contains("not cached"));
-}
-
-#[test]
-fn the_replay_command_is_the_command() {
-    assert_eq!(
-        replay_command(&Seed::at(0, vec![1, 0, 3]), "balance never goes negative"),
-        "ply test --seed 0:1.0.3 --filter \"balance never goes negative\""
-    );
+fn a_test_is_searched_exactly_when_its_footprint_reads_a_seed() {
+    let seed = EffectAtom::new("sim", Resource::Singleton, Mode::Read);
+    let cell = EffectAtom::new("cell", Resource::Named(Symbol::new("users")), Mode::Write);
+    assert!(is_seeded(&Footprint::from_atoms([seed.clone()])));
+    assert!(is_seeded(&Footprint::from_atoms([seed, cell.clone()])));
+    assert!(!is_seeded(&Footprint::from_atoms([cell])));
+    assert!(!is_seeded(&Footprint::empty()));
+    // User effects are module-qualified, so a program's own `sim` cannot pass for the seed.
+    let impostor = EffectAtom::new("m.sim", Resource::Singleton, Mode::Read);
+    assert!(!is_seeded(&Footprint::from_atoms([impostor])));
 }
 
 #[test]

@@ -27,7 +27,7 @@ pub const DERIVE: &str = include_str!("../ply/derive.ply");
 
 pub const DIAG: &str = include_str!("../ply/diag.ply");
 
-/// The front end's whole answer, framed for the driver.
+/// The front end's whole answer, as the rows the driver reads.
 pub const FRONT: &str = include_str!("../ply/front.ply");
 
 pub const HASH: &str = include_str!("../ply/hash.ply");

@@ -4,13 +4,13 @@
 use crate::compiled::{Compiled, Entered};
 use crate::host::{HostBinding, HostRuntime, HostUse, MachineId, Pending};
 use crate::limit::DEFAULT_MAX_CALLS;
-use crate::region;
 use crate::sim::{DEFAULT_STEPS, Seed};
 use crate::trace::Trace;
 use crate::value::Value;
-use crate::{Arena, TaskRegions};
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::{EffectAtom, Footprint, Front, ModuleName};
+use crate::{
+    Arena, Diagnostic, EffectAtom, Footprint, Front, ModuleName, Span, Symbol, TaskRegions, codes,
+    region,
+};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;

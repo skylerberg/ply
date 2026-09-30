@@ -1,11 +1,11 @@
 //! Turning a path into the front end's checked answer.
 
 use crate::driver::FrontEnd;
-use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
+use ply_eval::{
+    CheckOutput, DefInfo, Diagnostic, Front, HashOutput, ModuleInfo, ModuleName, SourceId,
+    SourceMap, Span, Symbol, TestInfo, codes,
+};
 use ply_store::ContentHash;
-use ply_ty::HashOutput;
-use ply_ty::ModuleName;
-use ply_ty::{CheckOutput, DefInfo, Front, ModuleInfo, TestInfo};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -154,31 +154,48 @@ impl Loaded {
     }
 
     /// Every root-package definition named `main`. A dependency's `main` is its own business:
-    /// only the package being loaded offers an entry point. A project without packages keeps the
-    /// old rule, every module the toolchain does not ship.
+    /// only the package being loaded offers an entry point.
     pub fn entry_points(&self) -> Vec<&DefInfo> {
         let main = Symbol::new("main");
-        let packaged = !self.front.packages.is_empty();
-        let roots: std::collections::HashSet<String> = self
-            .front
-            .ordinals
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.front.mod_pkg.get(*i) == Some(&0))
-            .map(|(_, (module, _))| module.to_string())
-            .collect();
+        let root = self.root_package();
         self.check
             .defs
             .values()
-            .filter(|d| {
-                d.simple_name == main
-                    && if packaged {
-                        roots.contains(d.module.as_str())
-                    } else {
-                        !crate::shelf::is_shipped(&d.module)
-                    }
-            })
+            .filter(|d| d.simple_name == main && root.contains(&d.module))
             .collect()
+    }
+
+    /// Which modules are the package being loaded, rather than a dependency or the shelf: what a
+    /// run offers as an entry point and what a test run tests. A project without packages is every
+    /// module the toolchain does not ship.
+    pub fn root_package(&self) -> RootPackage {
+        let packaged = !self.front.packages.is_empty();
+        RootPackage {
+            modules: packaged.then(|| {
+                self.front
+                    .ordinals
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| self.front.mod_pkg.get(*i) == Some(&0))
+                    .map(|(_, (module, _))| module.to_string())
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// The modules of the package being loaded.
+pub struct RootPackage {
+    /// `None` for a project without packages.
+    modules: Option<std::collections::HashSet<String>>,
+}
+
+impl RootPackage {
+    pub fn contains(&self, module: &ModuleName) -> bool {
+        match &self.modules {
+            Some(modules) => modules.contains(module.as_str()),
+            None => !crate::shelf::is_shipped(module),
+        }
     }
 }
 

@@ -1,59 +1,124 @@
-use ply_prove::domain::cardinality;
-use ply_prove::property::TypeWorld;
-use ply_span::{Span, Symbol};
-use ply_ty::{CtorInfo, Scheme, Type};
+//! Decoding a point of a domain the program measured. Which types are finite, and how large, is
+//! `proof.domain`'s decision and its tests'; these pin that the runtime builds exactly the values the
+//! program counted, once each, in the program's order.
 
-fn con(name: &str) -> Type {
-    Type::Con(Symbol::new(name), Vec::new())
-}
+use ply_eval::{Fixed, IntTy, Symbol, Value};
+use ply_prove::domain::{Case, Finite, Shape};
 
-fn ctor(ty: &str, name: &str, index: usize, fields: Vec<Type>) -> CtorInfo {
-    CtorInfo {
-        name: Symbol::new(name),
-        module: ply_ty::ModuleName::anonymous(),
-        simple_name: Symbol::new(name),
-        type_name: Symbol::new(ty),
-        index,
-        arity: fields.len(),
-        fields,
-        scheme: Scheme::mono(Type::Con(Symbol::new(ty), Vec::new())),
-        span: Span::DUMMY,
+fn scalar(name: &str, size: u64) -> Shape {
+    Shape::Scalar {
+        name: name.to_string(),
+        size,
     }
 }
 
-fn kinds() -> TypeWorld {
-    let ctors = vec![
-        ctor("Kind", "Asset", 0, Vec::new()),
-        ctor("Kind", "Liability", 1, Vec::new()),
-        ctor("Kind", "Equity", 2, Vec::new()),
-    ];
-    TypeWorld::new(&ctors)
+fn kinds() -> Shape {
+    let nullary = |name: &str| Case {
+        name: Symbol::new(name),
+        size: 1,
+        fields: Vec::new(),
+    };
+    Shape::Cases {
+        size: 3,
+        cases: vec![nullary("Asset"), nullary("Liability"), nullary("Equity")],
+    }
+}
+
+fn ctor(name: &str, args: Vec<Value>) -> Value {
+    Value::ctor(name, args)
 }
 
 #[test]
-fn a_nullary_enum_and_bool_are_finite_and_everything_unbounded_is_not() {
-    let world = kinds();
-    assert_eq!(cardinality(&con("Bool"), &world), Some(2));
-    assert_eq!(cardinality(&con("Unit"), &world), Some(1));
-    assert_eq!(cardinality(&con("Kind"), &world), Some(3));
-    assert_eq!(cardinality(&con("Int"), &world), None);
-    assert_eq!(cardinality(&con("String"), &world), None);
+fn a_point_is_every_binder_decoded_the_last_varying_fastest() {
+    let finite = Finite::of_shapes(vec![scalar("Bool", 2), kinds()]).expect("six points");
+    assert_eq!(finite.points, 6);
     assert_eq!(
-        cardinality(&Type::Con(Symbol::new("List"), vec![con("Bool")]), &world),
-        None
+        finite.point(0),
+        Some(vec![Value::Bool(false), ctor("Asset", vec![])])
     );
+    assert_eq!(
+        finite.point(4),
+        Some(vec![Value::Bool(true), ctor("Liability", vec![])])
+    );
+    assert_eq!(finite.point(6), None);
+    // Every point is named once: a repeated tuple would be a domain walked short.
+    let points: Vec<_> = (0..finite.points).map(|i| finite.point(i)).collect();
+    for (i, a) in points.iter().enumerate() {
+        assert!(a.is_some());
+        assert!(!points[i + 1..].contains(a), "point {i} repeats");
+    }
 }
 
 #[test]
-fn a_type_variable_is_never_finite() {
-    assert_eq!(cardinality(&Type::Var(ply_ty::TyVar(0)), &kinds()), None);
+fn a_case_takes_its_share_of_its_type_and_decodes_its_fields() {
+    let wrap = Shape::Cases {
+        size: 7,
+        cases: vec![
+            Case {
+                name: Symbol::new("Nothing"),
+                size: 1,
+                fields: Vec::new(),
+            },
+            Case {
+                name: Symbol::new("Held"),
+                size: 6,
+                fields: vec![kinds(), scalar("Bool", 2)],
+            },
+        ],
+    };
+    let finite = Finite::of_shapes(vec![wrap]).expect("seven points");
+    assert_eq!(finite.point(0), Some(vec![ctor("Nothing", vec![])]));
+    assert_eq!(
+        finite.point(1),
+        Some(vec![ctor(
+            "Held",
+            vec![ctor("Asset", vec![]), Value::Bool(false)]
+        )])
+    );
+    assert_eq!(
+        finite.point(6),
+        Some(vec![ctor(
+            "Held",
+            vec![ctor("Equity", vec![]), Value::Bool(true)]
+        )])
+    );
+    assert_eq!(finite.point(7), None);
 }
 
 #[test]
-fn a_recursive_type_is_infinite_even_with_a_nullary_base_case() {
-    let ctors = vec![
-        ctor("Nat", "Zero", 0, Vec::new()),
-        ctor("Nat", "Succ", 1, vec![con("Nat")]),
-    ];
-    assert_eq!(cardinality(&con("Nat"), &TypeWorld::new(&ctors)), None);
+#[allow(clippy::arc_with_non_send_sync)]
+fn a_record_and_a_fixed_width_are_built_from_their_shapes() {
+    let record = Shape::Fields {
+        size: 512,
+        fields: vec![
+            (Symbol::new("flag"), scalar("Bool", 2)),
+            (Symbol::new("n"), scalar("U8", 256)),
+        ],
+    };
+    let finite = Finite::of_shapes(vec![record]).expect("a record's points");
+    let fixed = |n: i128| Value::Fixed(Fixed::of(IntTy::U8, n).expect("a byte"));
+    let built = |flag: bool, n: i128| {
+        Value::Record(std::sync::Arc::new(
+            [
+                (Symbol::new("flag"), Value::Bool(flag)),
+                (Symbol::new("n"), fixed(n)),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+    };
+    assert_eq!(finite.point(0), Some(vec![built(false, 0)]));
+    assert_eq!(finite.point(257), Some(vec![built(true, 1)]));
+}
+
+#[test]
+fn a_domain_of_no_points_is_no_domain_and_a_ground_claim_has_one() {
+    let empty = Shape::Cases {
+        size: 0,
+        cases: Vec::new(),
+    };
+    assert!(Finite::of_shapes(vec![scalar("Bool", 2), empty]).is_none());
+    let ground = Finite::of_shapes(Vec::new()).expect("one point");
+    assert_eq!(ground.points, 1);
+    assert_eq!(ground.point(0), Some(Vec::new()));
 }

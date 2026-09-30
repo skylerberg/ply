@@ -1,10 +1,9 @@
 use ply_codegen::Unit;
-use ply_eval::{Provider, Value};
-use ply_span::Symbol;
+use ply_eval::{Provider, Symbol, Value};
 use std::collections::HashMap;
 
 pub struct Loaded {
-    pub front: &'static ply_ty::Front,
+    pub front: &'static ply_eval::Front,
     /// Each module's text by name: what the Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
 }

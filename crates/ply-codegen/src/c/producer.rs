@@ -6,10 +6,7 @@ use super::tables::{Defined, Tables};
 use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::decode::{self, At};
-use ply_eval::{Fields, Value};
-use ply_span::frames::Cursor;
-use ply_span::{Diagnostic, Severity, SourceId, Symbol, codes};
-use ply_ty::{DefHash, Front, read_front};
+use ply_eval::{DefHash, Diagnostic, Fields, Front, Severity, SourceId, Symbol, Value, codes};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -251,7 +248,8 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
     let ids: Vec<SourceId> = (0..own.len() + pulled.modules.len())
         .map(|i| SourceId(i as u32))
         .collect();
-    let front = read_front(&pulled.dump, &ids).map_err(|e| format!("{e:#}"))?;
+    let front = super::dump::read(&pulled.dump, &ids)
+        .map_err(|e| format!("the front end's answer does not read: {e}"))?;
     let mut texts: HashMap<String, String> = own.iter().cloned().collect();
     texts.extend(shipped.iter().cloned());
     // Diagnostics index modules in the dump's order: the program's own, then the pulled ones.
@@ -279,7 +277,7 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
 
 /// The error with its place: the module, the line and column of its primary label, and what the
 /// label says, since nothing else about the emitter's own sources reaches a reader.
-fn placed(error: &ply_span::Diagnostic, modules: &[(String, String)]) -> String {
+fn placed(error: &ply_eval::Diagnostic, modules: &[(String, String)]) -> String {
     let mut out = error.message.clone();
     if let Some(label) = error
         .labels
@@ -698,11 +696,9 @@ pub fn census() -> Census {
     CENSUS.with(|c| c.borrow().clone())
 }
 
-/// The front end's whole answer, as `ply_ty::front` reads it.
-const FRONT: &str = "front.front_dump";
-
-/// The front end over a program; `ids[i]` is module `i`'s source. Program errors are in
-/// `diagnostics`, not the `Err`; use [`checked_front`] to raise them.
+/// The front end over a program that ships its own modules, pulling none; `ids[i]` is module
+/// `i`'s source. Program errors are in `diagnostics`, not the `Err`; use [`checked_front`] to
+/// raise them.
 pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
     if sources.len() != ids.len() {
         bail!(
@@ -711,14 +707,13 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
             ids.len()
         );
     }
-    let dump = front_dump(sources)?;
-    read_front(&dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))
+    let pulled = front_pulling_std(sources, &[])?;
+    read_front(&pulled.dump, ids)
 }
 
-/// The front end's raw answer, before [`read_front`].
-pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
-    tally(|census| census.modules += sources.len());
-    dump_over(FRONT, sources)
+/// [`super::dump::read`], its failure the front end's.
+fn read_front(dump: &Value, ids: &[SourceId]) -> Result<Front> {
+    super::dump::read(dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))
 }
 
 const CLAIMS: &str = "front.claims";
@@ -772,10 +767,6 @@ pub fn claims(
     call(CLAIMS, &[source_list(sources), pkgs, mods, shelf])
 }
 
-fn dump_over(entry: &str, sources: &[(String, String)]) -> Result<String> {
-    string_answer(entry, call(entry, &[source_list(sources)])?)
-}
-
 fn source_list(sources: &[(String, String)]) -> Value {
     Value::list(
         sources
@@ -797,16 +788,6 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
             .map(|(name, value)| (Symbol::new(name), value))
             .collect(),
     )))
-}
-
-fn string_answer(entry: &str, answer: Value) -> Result<String> {
-    let Value::Str(text) = &answer else {
-        bail!(
-            "`{entry}` answered a {} rather than a string",
-            answer.type_name()
-        );
-    };
-    Ok(text.to_string())
 }
 
 const REHASH: &str = "front.rehash";
@@ -911,15 +892,16 @@ pub fn print_bodies(
     read().map_err(|e| refused(format!("the answer does not read: {e}")))?
 }
 
-/// [`FRONT`], pulling in the shipped modules the program imports itself.
-const FRONT_PULLING: &str = "front.front_pulling_std_with";
+/// The front end over a program, pulling in the shipped modules it imports.
+const ANSWER: &str = "front.answer_pulling_std_with";
 
 /// What [`front_pulling_std`] answered.
 pub struct Pulled {
     /// The shipped modules pulled in, in the positions they took after the user's.
     pub modules: Vec<String>,
-    /// [`front_dump`]'s answer over the user's modules followed by [`Pulled::modules`].
-    pub dump: String,
+    /// The `front.Dump` over the user's modules followed by [`Pulled::modules`], which
+    /// [`super::dump::read`] reads.
+    pub dump: Value,
 }
 
 const WANTS: &str = "pkg.wants";
@@ -1026,8 +1008,8 @@ impl Packages {
     }
 }
 
-/// [`front_dump`] over `user` plus each module of `shipped` it imports, transitively, placed
-/// as the CLI driver places them: a round of newly imported modules at a time, each in byte order.
+/// The front end over `user` plus each module of `shipped` it imports, transitively, placed as
+/// the CLI driver places them: a round of newly imported modules at a time, each in byte order.
 /// Nothing is handed in: the rows a previous answer published are the CLI's to seed it with.
 pub fn front_pulling_std_with(
     user: &[(String, String)],
@@ -1035,7 +1017,7 @@ pub fn front_pulling_std_with(
     packages: &Packages,
 ) -> Result<Pulled> {
     let answer = call(
-        FRONT_PULLING,
+        ANSWER,
         &[
             source_list(user),
             source_list(shipped),
@@ -1044,52 +1026,21 @@ pub fn front_pulling_std_with(
             packages.value(),
         ],
     )?;
-    let Value::Str(answer) = &answer else {
-        bail!(
-            "`{FRONT_PULLING}` answered a {} rather than a string",
-            answer.type_name()
-        );
-    };
-    let answer: &str = answer;
-    let mut frames = Cursor::new(answer.as_bytes(), "frame");
-    let (words, payload) = frames
-        .unit()
-        .map_err(|e| anyhow!("`{FRONT_PULLING}`'s answer: {e}"))?;
-    if words != ["pulled", "_"] {
-        bail!(
-            "`{FRONT_PULLING}` led with `{}` rather than the modules it pulled in",
-            words.join(" ")
-        );
-    }
-    let mut fields = Cursor::new(payload, "field");
-    let mut modules = Vec::new();
-    while !fields.done() {
-        let (key, name) = fields
-            .unit()
-            .map_err(|e| anyhow!("the modules `{FRONT_PULLING}` pulled in: {e}"))?;
-        if key != ["module"] {
-            bail!(
-                "the modules `{FRONT_PULLING}` pulled in hold a `{}` field",
-                key.join(" ")
-            );
-        }
-        modules.push(
-            std::str::from_utf8(name)
-                .context("a pulled module's name")?
-                .to_string(),
-        );
-    }
+    let what = format!("`{ANSWER}`'s answer");
+    let at = At::new(&what, &answer);
+    let modules = strings(at.field("pulled")?)?;
+    let dump = at.field("dump")?.value().clone();
     tally(|census| census.modules += user.len() + modules.len());
-    Ok(Pulled {
-        modules,
-        dump: answer[frames.at()..].to_string(),
-    })
+    Ok(Pulled { modules, dump })
 }
 
 /// [`front`] over the default producer, with the program's errors raised rather than answered.
 pub fn checked_front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
     ensure_default();
-    let front = front(sources, ids)?;
+    checked(front(sources, ids)?)
+}
+
+fn checked(front: Front) -> Result<Front> {
     let errors: Vec<String> = front
         .diagnostics
         .iter()
@@ -1125,17 +1076,7 @@ pub fn checked_front_with_std(user: &[(String, String)]) -> Result<FrontWithStd>
         modules.push((name.clone(), text.to_string()));
     }
     let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let front = ply_ty::read_front(&pulled.dump, &ids)
-        .map_err(|e| anyhow!("the front end's answer does not read: {e}"))?;
-    let errors: Vec<String> = front
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .map(|d| format!("{} [{}]", d.message, d.code))
-        .collect();
-    if !errors.is_empty() {
-        bail!("the program does not check: {}", errors.join("; "));
-    }
+    let front = checked(read_front(&pulled.dump, &ids)?)?;
     Ok(FrontWithStd { front, modules })
 }
 

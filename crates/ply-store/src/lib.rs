@@ -15,8 +15,7 @@ pub mod schema;
 pub mod upstream;
 
 use anyhow::Context;
-use ply_span::{Diagnostic, Symbol};
-use ply_ty::DefHash;
+use ply_eval::{DefHash, Diagnostic, Symbol};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -105,7 +104,7 @@ impl<'de> Deserialize<'de> for ContentHash {
     }
 }
 
-pub use ply_span::codes;
+pub use ply_eval::codes;
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct DefBody {

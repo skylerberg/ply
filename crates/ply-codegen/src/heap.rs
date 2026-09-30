@@ -3,8 +3,7 @@
 
 use crate::list;
 use crate::map;
-use ply_eval::{Closure, ClosureKind, Fields, Value};
-use ply_span::Symbol;
+use ply_eval::{Closure, ClosureKind, Fields, Symbol, Value};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
 use std::cmp::Ordering;

@@ -23,12 +23,10 @@ pub mod hosts;
 pub mod load;
 pub mod migrate;
 pub mod mutate;
-pub mod obligations;
 pub mod options;
 pub mod payload;
 pub mod policy;
 pub mod shelf;
-pub mod signature;
 pub mod simulation;
 pub mod support;
 pub mod tester;
@@ -36,12 +34,11 @@ pub mod trace;
 pub mod vcs;
 pub mod warm;
 
-use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_eval::{Diagnostic, Span, Symbol, Value, codes};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
@@ -194,7 +191,7 @@ enum Go {
         reply: Sender<drive::Measured>,
     },
     Reload {
-        front: crate::driver::HandedFront,
+        front: Box<crate::driver::HandedFront>,
         reply: Sender<Result<drive::FoundData, drive::Refused>>,
     },
 }
@@ -207,7 +204,7 @@ impl HostHandler for Site {
             ("configure", [options]) => self.configure(&label, options, span)?,
             ("load", [root, front]) => self.load(&label, root, front, span)?,
             ("reload", [front]) => {
-                let front = crate::driver::handed_front_of(front, span)?;
+                let front = Box::new(crate::driver::handed_front_of(front, span)?);
                 let answer: Result<drive::FoundData, drive::Refused> =
                     self.ask(&label, span, |reply| Go::Reload { reply, front })?;
                 match answer {
@@ -274,7 +271,7 @@ impl HostHandler for Site {
 
 fn label_of(req: &HostRequest<'_>, span: Span) -> Result<String, Diagnostic> {
     match &req.atom.resource {
-        ply_ty::Resource::Named(name) => Ok(name.to_string()),
+        ply_eval::Resource::Named(name) => Ok(name.to_string()),
         _ => Err(Diagnostic::error(
             codes::INTERNAL_ERROR,
             "`machine` operations name a label: `machine.load[m](..)`".to_string(),
