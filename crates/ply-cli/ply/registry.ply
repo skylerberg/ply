@@ -1,0 +1,323 @@
+// The registry `PLY_REGISTRY` names: one base URL, reached over HTTPS through the TLS stack the
+// host boundary uses, and the static layout every request below it takes. Plaintext is for a
+// registry on this machine and nowhere else, since a publish carries a bearer token.
+
+import compiler.resolve (Diag, diag1)
+import std.http
+import std.http (Get, Limits, Post, Put, Request, Response, default_limits, request_to, set_header)
+import std.net (net)
+
+pub type Base = {
+  secure: Bool,
+  // As `net.connect` takes it: an IPv6 literal without its brackets.
+  host: String,
+  port: Int,
+  // What `Host` carries: the host and port as the URL wrote them.
+  authority: String,
+  // The path the registry is served under, `""` or `/ply`; every target is below it.
+  prefix: String,
+  url: String,
+}
+
+pub fn variable() -> String = "PLY_REGISTRY"
+
+pub fn token_variable() -> String = "PLY_REGISTRY_TOKEN"
+
+// --- The base URL ---------------------------------------------------------------
+
+/// `https://host[:port][/prefix]`, or `http://` for a registry on this machine.
+pub fn base_of(text: String) -> Result<Base, String> = {
+  let url = trimmed_slash(text);
+  if string_starts_with(url, "https://") {
+    authority_of(url, true, string_slice(url, 8, string_len(url)))
+  } else if string_starts_with(url, "http://") {
+    authority_of(url, false, string_slice(url, 7, string_len(url)))
+  } else { Err("`" ++ text ++ "` is not an `https://` URL") }
+}
+
+fn trimmed_slash(text: String) -> String =
+  if string_ends_with(text, "/") { trimmed_slash(string_slice(text, 0, string_len(text) - 1)) }
+  else { text }
+
+fn authority_of(url: String, secure: Bool, rest: String) -> Result<Base, String> = {
+  let cut = match string_split(rest, "/") { [] -> "", [first, ..] -> first };
+  let prefix = string_slice(rest, string_len(cut), string_len(rest));
+  match host_port(cut, if secure { 443 } else { 80 }) {
+    Err(why) -> Err("`" ++ url ++ "` " ++ why),
+    Ok(hp) -> if !secure && !loopback(hp.host) {
+      Err(
+        "`" ++ url
+          ++ "` is plaintext to another machine; a registry is reached over `https://`, and `http://` only on this one",
+      )
+    } else if string_contains(prefix, "?") || string_contains(prefix, "#") {
+      Err("`" ++ url ++ "` carries a query or a fragment, and a base URL is a host and a path")
+    } else {
+      Ok({ secure: secure, host: hp.host, port: hp.port, authority: cut, prefix: prefix, url: url })
+    },
+  }
+}
+
+fn host_port(cut: String, default: Int) -> Result<{ host: String, port: Int }, String> =
+  if cut == "" { Err("names no host") } else if string_starts_with(cut, "[") {
+    match string_split(string_slice(cut, 1, string_len(cut)), "]") {
+      [host, ""] -> Ok({ host: host, port: default }),
+      [host, tail] -> if string_starts_with(tail, ":") {
+        match port_of(string_slice(tail, 1, string_len(tail))) {
+          None -> Err("names a port that is not one"),
+          Some(p) -> Ok({ host: host, port: p }),
+        }
+      } else { Err("names a host that is not one") },
+      _ -> Err("names a host that is not one"),
+    }
+  } else {
+    match string_split(cut, ":") {
+      [host] -> Ok({ host: host, port: default }),
+      [host, p] -> if host == "" { Err("names no host") } else {
+        match port_of(p) {
+          None -> Err("names a port that is not one"),
+          Some(n) -> Ok({ host: host, port: n }),
+        }
+      },
+      _ -> Err("names a host that is not one"),
+    }
+  }
+
+fn port_of(text: String) -> Option<Int> = {
+  let bs = bytes_of_string(text);
+  if bytes_len(bs) == 0 || bytes_len(bs) > 5 { None } else {
+    let n = fold(range(0, bytes_len(bs)), Some(0), |acc: Option<Int>, i: Int|
+      match acc {
+        None -> None,
+        Some(v) -> {
+          let d = bytes_at(bs, i);
+          if d < 48 || d > 57 { None } else { Some(v * 10 + d - 48) }
+        },
+      });
+    match n { Some(p) -> if p >= 1 && p <= 65535 { Some(p) } else { None }, None -> None }
+  }
+}
+
+fn loopback(host: String) -> Bool =
+  host == "localhost" || host == "::1" || string_starts_with(host, "127.")
+
+// --- The layout -----------------------------------------------------------------
+
+pub fn index_target(b: Base, name: String) -> String = b.prefix ++ "/" ++ name ++ "/index.json"
+
+pub fn release_target(b: Base, name: String, version: String) -> String =
+  b.prefix ++ "/" ++ name ++ "/" ++ version
+
+pub fn archive_target(b: Base, name: String, version: String) -> String =
+  release_target(b, name, version) ++ "/package.plyz"
+
+pub fn yank_target(b: Base, name: String, version: String) -> String =
+  release_target(b, name, version) ++ "/yank"
+
+// --- One exchange ----------------------------------------------------------------
+
+// A package's archive is its sources and a compiled unit: larger than a page, and bounded all the
+// same.
+fn limits() -> Limits = {
+  let base = default_limits();
+  { ..base, max_body: 67108864 }
+}
+
+pub fn get(b: Base, target: String) -> Request = request_to(Get, b.authority, target, b"")
+
+/// A publish: the archive as the body, the token that may publish the name, and the digest the
+/// registry recomputes from the body and compares.
+pub fn put(b: Base, target: String, token: String, digest: String, body: Bytes) -> Request = {
+  let req = request_to(Put, b.authority, target, body);
+  {
+    ..req,
+    headers: set_header(
+      set_header(
+        set_header(req.headers, "authorization", "Bearer " ++ token),
+        "x-ply-digest",
+        digest,
+      ),
+      "content-type",
+      "application/octet-stream",
+    ),
+  }
+}
+
+pub fn post(b: Base, target: String, token: String) -> Request = {
+  let req = request_to(Post, b.authority, target, b"");
+  { ..req, headers: set_header(req.headers, "authorization", "Bearer " ++ token) }
+}
+
+/// One request on a connection of its own. `Err` is a registry that could not be asked; an answer
+/// of any status is `Ok`, and the caller reads the status.
+pub fn exchange(
+  b: Base,
+  req: Request,
+) -> Result<Response, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]} =
+  if b.secure {
+    match http::dial_tls[registry](b.host, b.port, limits()) {
+      Err(why) -> Err(unasked(b.url ++ " " ++ why_text(why), [])),
+      // The handshake is completed before the request, so a certificate this machine does not
+      // trust is said to be that rather than a request the registry did not take.
+      Ok(c) -> match net.handshake[registry](c.handle) {
+        None -> {
+          http::close[registry](c);
+          Err(untrusted(b))
+        },
+        Some(_) -> {
+          let got = http::ask_last[registry](c, req, limits());
+          http::close[registry](c);
+          answered(b, got)
+        },
+      },
+    }
+  } else { answered(b, http::request[registry](b.host, b.port, req, limits())) }
+
+fn answered(b: Base, got: Result<Response, http::ClientError>) -> Result<Response, Diag> =
+  match got { Ok(r) -> Ok(r), Err(why) -> Err(unasked(b.url ++ " " ++ why_text(why), [])) }
+
+fn untrusted(b: Base) -> Diag =
+  unasked(b.url ++ " did not complete a TLS handshake", [
+    bytes_of_string(
+      "its certificate is not one this machine trusts, or not one issued for `" ++ b.host ++ "`",
+    ),
+    b"`PLY_TRUST` names PEM files of certificates to trust beside the built-in roots, a private CA's among them",
+  ])
+
+fn why_text(why: http::ClientError) -> String =
+  match why {
+    http::Unreachable -> "was not reachable",
+    http::NotSent -> "did not take the request",
+    http::TimedOut -> "did not answer in time",
+    http::Closed -> "closed the connection without answering",
+    http::Malformed(r) -> "answered with something that is not HTTP: " ++ r.reason,
+  }
+
+/// What an answer says for itself: its first line, which is what the registry writes a refusal as.
+pub fn said(r: Response) -> String = {
+  let text = string_of_bytes_lossy(r.body);
+  match string_split(text, "\n") { [] -> "", [first, ..] -> string_trim(first) }
+}
+
+// --- Refusals ---------------------------------------------------------------------
+
+fn outside() -> Int = 4294967295
+
+/// A registry that could not be asked: unset, malformed, or not answering.
+pub fn unasked(message: String, notes: List<Bytes>) -> Diag =
+  diag1(
+    b"E0141",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string(message),
+    b"the registry could not be asked",
+    notes,
+  )
+
+/// What the registry would not do, with the reason its answer gave and what its status means.
+pub fn refused_by(what: String, status: Int, why: String) -> Diag =
+  diag1(
+    b"E0144",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string(
+      "the registry refused to " ++ what ++ ": " ++ int_to_string(status)
+        ++ (if why == "" { "" } else { " " ++ why }),
+    ),
+    b"the registry refused",
+    status_notes(status),
+  )
+
+fn status_notes(status: Int) -> List<Bytes> =
+  if status == 401 { [b"the registry takes a write only under `Authorization: Bearer <token>`"] } else if status
+      == 403 { [b"`PLY_REGISTRY_TOKEN` is not the token the registry maps this package's name to"] } else if status
+      == 409 {
+    [b"a version is published once and never changes: publish the change as a new version"]
+  } else if status == 404 { [b"the registry holds no such version"] }
+  else { [] }
+
+/// A package or a version no registry takes, refused before anything is sent.
+pub fn untakeable(message: String, notes: List<Bytes>) -> Diag =
+  diag1(
+    b"E0145",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string(message),
+    b"not something a registry holds",
+    notes,
+  )
+
+pub fn unset(variable: String, what: String) -> Diag =
+  unasked("`" ++ variable ++ "` is not set, and " ++ what, [
+    bytes_of_string(if variable == token_variable() {
+      "set it to a token the registry maps to this package's name"
+    } else { "set it to the registry's base URL, such as `https://registry.example.com`" }),
+  ])
+
+// --- Tests ------------------------------------------------------------------
+
+fn based(text: String) -> Base = match base_of(text) { Ok(b) -> b, Err(why) -> panic(why) }
+
+test "a base URL is a scheme, a host, a port the scheme implies, and a prefix" {
+  let b = based("https://registry.example.com");
+  assert_eq(b.secure, true);
+  assert_eq(b.host, "registry.example.com");
+  assert_eq(b.port, 443);
+  assert_eq(b.authority, "registry.example.com");
+  assert_eq(b.prefix, "");
+  let c = based("https://example.com:8443/ply/");
+  assert_eq(c.port, 8443);
+  assert_eq(c.authority, "example.com:8443");
+  assert_eq(c.prefix, "/ply");
+  assert_eq(index_target(c, "orders"), "/ply/orders/index.json");
+  assert_eq(archive_target(c, "orders", "0.2.0"), "/ply/orders/0.2.0/package.plyz");
+  assert_eq(release_target(b, "orders", "0.2.0"), "/orders/0.2.0");
+  assert_eq(yank_target(b, "orders", "0.2.0"), "/orders/0.2.0/yank");
+  let v6 = based("http://[::1]:9000");
+  assert_eq(v6.host, "::1");
+  assert_eq(v6.port, 9000);
+  assert_eq(v6.authority, "[::1]:9000")
+}
+
+test "plaintext reaches this machine and nothing else" {
+  assert_eq(based("http://127.0.0.1:8080").secure, false);
+  assert_eq(based("http://localhost").port, 80);
+  match base_of("http://registry.example.com") {
+    Ok(_) -> panic("a token would cross the network in the clear"),
+    Err(why) -> assert(string_contains(why, "plaintext to another machine")),
+  };
+  match base_of("ftp://example.com") {
+    Ok(_) -> panic("ftp is not a registry"),
+    Err(why) -> assert(string_contains(why, "is not an `https://` URL")),
+  };
+  match base_of("https://:443") {
+    Ok(_) -> panic("no host"),
+    Err(why) -> assert(string_contains(why, "no host")),
+  };
+  match base_of("https://example.com:0") {
+    Ok(_) -> panic("port 0"),
+    Err(why) -> assert(string_contains(why, "port")),
+  };
+  match base_of("https://example.com/ply?x=1") {
+    Ok(_) -> panic("a query"),
+    Err(why) -> assert(string_contains(why, "query")),
+  }
+}
+
+test "a publish carries the token, the digest and the archive" {
+  let req = put(based("https://example.com"), "/orders/0.2.0", "t0k", "b3:ab", b"PLYLIB01");
+  assert_eq(http::header(req.headers, "authorization"), Some("Bearer t0k"));
+  assert_eq(http::header(req.headers, "x-ply-digest"), Some("b3:ab"));
+  assert_eq(req.body, b"PLYLIB01");
+  assert_eq(req.target, "/orders/0.2.0");
+  let yank = post(based("https://example.com"), "/orders/0.2.0/yank", "t0k");
+  assert_eq(http::header(yank.headers, "authorization"), Some("Bearer t0k"));
+  assert_eq(yank.method, Post)
+}
+
+test "a refusal is read as its first line" {
+  assert_eq(
+    said(http::text_response(409, "orders 0.2.0 is already published\n")),
+    "orders 0.2.0 is already published",
+  );
+  assert_eq(said(http::response(500, b"")), "")
+}
