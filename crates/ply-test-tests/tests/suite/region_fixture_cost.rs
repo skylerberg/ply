@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 const TEST_CELLS: usize = 4;
 
-/// Records rather than integers, so a copy copies something; matches `ply_corpus::measure::seeded`.
+/// Records rather than integers, so a copy copies something.
 fn seed(cells: usize) -> impl Fn(&mut TaskRegions) -> Value {
     move |regions: &mut TaskRegions| {
         Value::list(

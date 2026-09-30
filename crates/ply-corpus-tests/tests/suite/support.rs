@@ -30,6 +30,61 @@ pub fn corpus(dir: &Path, args: &[&str]) -> Output {
     run(dir, &[], args)
 }
 
+/// The product itself in `dir`, as the corpus drives it: `ply` with `args`, and the same few
+/// variables from the environment.
+pub fn product(dir: &Path, args: &[&str]) -> Output {
+    let mut cmd = Command::new(ply());
+    cmd.env_clear();
+    for key in INHERITED {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.args(args)
+        .current_dir(dir)
+        .output()
+        .expect("`ply` starts")
+}
+
+/// The one JSON document a `--json` run of the product wrote, whatever it exited with.
+pub fn product_document(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout was not one JSON document: {e}\n---\n{}\n---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// A report's row by name.
+#[track_caller]
+pub fn row<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["rows"]
+        .as_array()
+        .expect("rows is an array")
+        .iter()
+        .find(|r| r["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("the report carries no `{name}` row: {report:#}"))
+}
+
+/// A row's measurement by name, as a number.
+#[track_caller]
+pub fn measured(row: &serde_json::Value, name: &str) -> f64 {
+    row["measurements"]
+        .as_array()
+        .expect("measurements is an array")
+        .iter()
+        .find(|m| m["name"].as_str() == Some(name))
+        .and_then(|m| m["value"].as_f64())
+        .unwrap_or_else(|| panic!("the row measured no `{name}`: {row:#}"))
+}
+
+/// A row's verdict: `pass`, `fail` or `inconclusive`.
+pub fn outcome(row: &serde_json::Value) -> &str {
+    row["verdict"]["outcome"].as_str().unwrap_or("")
+}
+
 /// The same, with the executor bound too, for a subcommand the program hands to it.
 pub fn delegated(dir: &Path, args: &[&str]) -> Output {
     run(
@@ -49,7 +104,7 @@ fn run(dir: &Path, grants: &[String], args: &[&str]) -> Output {
     }
     cmd.arg("run")
         .arg(repo().join("crates/ply-corpus/ply"))
-        .args(["--host", "--allow", "machine"])
+        .args(["--host", "--allow", "machine", "--allow", "claims"])
         .arg(format!("--exec=ply={}", ply().display()))
         .args(grants)
         .args(["--fs", "work=."])
