@@ -379,6 +379,48 @@ fn an_immortal_word_survives_the_end_of_every_entry_and_counts_nothing() {
     );
 }
 
+/// A continuation's captures are immediates, so only its code tells the memo it names a body its
+/// entry alone holds; an ordinary closure over an immediate is kept.
+#[test]
+fn a_continuation_however_deep_in_a_word_leaves_it_to_its_entry() {
+    const NESTED: &str = r#"
+effect amb { read flip[coin]() -> Bool }
+
+type Saved = Nothing | Just((Bool) -> Int)
+
+fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
+  let inner = handle {
+    if amb.flip[coin]() { 41 } else { 0 }
+  } with { amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 } };
+  assert_eq(inner, 0);
+  cell_get(s)
+} }
+
+pub fn continuation_inside() -> { saved: List<Saved> } = { saved: [Nothing, parked()] }
+
+pub fn closure_inside(n: Int) -> { saved: List<Saved> } =
+  { saved: [Nothing, Just(|b: Bool| if b { n } else { 0 })] }
+"#;
+    let Some((_source, native)) = super::c::tests_support::unit(NESTED) else {
+        return;
+    };
+    let cases: [(&str, &[Word], bool); 2] = [
+        ("m.continuation_inside", &[], false),
+        ("m.closure_inside", &[imm(41)], true),
+    ];
+    let mut ctx = native.context();
+    for (name, args, independent) in cases {
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` compiled"));
+        ctx.begin(10_000);
+        let out = unsafe { entry(&mut ctx, args.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}`: {:?}", ctx.diagnostic);
+        assert_eq!(world_independent(out), independent, "`{name}`");
+        ctx.end();
+    }
+}
+
 #[test]
 fn a_word_is_an_object_only_at_a_live_start() {
     let mut heap = Heap::new();
