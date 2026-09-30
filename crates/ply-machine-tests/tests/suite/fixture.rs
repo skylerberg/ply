@@ -75,7 +75,7 @@ pub fn handed(root: &Path) -> ply_eval::Value {
         ])
     };
     ply_machine::payload::record(vec![
-        ("dump", ply_eval::Value::bytes(pulled.dump.as_bytes())),
+        ("dump", pulled.dump),
         (
             "files",
             ply_eval::Value::list(files.into_iter().map(file).collect()),
