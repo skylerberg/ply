@@ -1,6 +1,5 @@
 //! Discharging obligations, and the evidence they are filed and read back under.
 
-use ply_prove::prove::Reach;
 use ply_prove::{
     CaseReport, Certificate, Discharge, Evidence, Obligation, ProvePlan, ProveReport, Rule,
 };
@@ -150,14 +149,13 @@ pub struct Domain {
 
 pub trait Discharger: Sync {
     /// `domain` is the program's own measurement of the obligation's binders, or `None` when it
-    /// decided to sample instead. What the static tier alone answered on the way comes back beside
-    /// the discharge, when it answered at all.
+    /// decided to sample instead.
     fn discharge(
         &self,
         obligation: &Obligation,
         plan: &ProvePlan,
         domain: Option<&Domain>,
-    ) -> (Discharge, Option<Reach>);
+    ) -> Discharge;
 }
 
 /// A program's decision, carried out up to what the cache answered, so a discharger is built only
@@ -217,7 +215,7 @@ impl Asked {
             domains,
         } = self;
 
-        let fresh: Vec<(usize, (Discharge, Option<Reach>))> = to_discharge
+        let fresh: Vec<(usize, Discharge)> = to_discharge
             .par_iter()
             .filter(|&&index| index < obligations.len())
             .map(|&index| {
@@ -232,10 +230,8 @@ impl Asked {
             .into_iter()
             .map(|evidence| evidence.map(Discharge::Held))
             .collect();
-        let mut reaches: Vec<Option<Reach>> = vec![None; discharges.len()];
-        for (index, (discharge, reach)) in fresh {
+        for (index, discharge) in fresh {
             discharges[index] = Some(discharge);
-            reaches[index] = reach;
         }
 
         // Every index either came from the cache or was discharged, so no `None` survives.
@@ -254,7 +250,6 @@ impl Asked {
 
         ProveReport {
             obligations: paired,
-            reaches,
             plan,
             duration: started.elapsed(),
         }

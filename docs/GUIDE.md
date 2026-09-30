@@ -988,11 +988,12 @@ values. Flags: `--prove-cases N` (below 25 kept cases only `example`),
 `--prove-roots N`, `--prove-budget N` (spent reports `property`),
 `--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
 1000000000; an evaluation past it leaves the obligation `unattempted`, and the
-number keys the cached result, so more budget is a stronger claim). Under
-`--json` each obligation carries `reach`: what the static tier alone decided
-(`proved`, `guard_unsatisfiable`, `open` or `budget_spent`), the steps it spent,
-and each place it left the decidable fragment as `{kind, about}` — `null` for an
-obligation answered from the cache or searched over interleavings.
+number keys the cached result, so more budget is a stronger claim). `--reach`
+asks the static tier alone about every obligation the run reports on, cached or
+not, and under `--json` each then carries `reach`: what it decided (`proved`,
+`guard_unsatisfiable`, `open` or `budget_spent`), the steps it spent, and each
+place it left the decidable fragment as `{kind, about}` — `null` for a law over
+interleavings, which the static tier never sees.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
@@ -2286,7 +2287,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance) |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
-| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, host, trace, prove, simulation |
+| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |

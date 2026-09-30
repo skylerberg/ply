@@ -1,5 +1,5 @@
 //! The claims family over more than one run: every `configure` begins a run of its own, whatever
-//! the last one was left doing.
+//! the last one was left doing, and each run's static tier answers for that run's claims.
 
 use crate::fixture::{handed, project};
 use ply_eval::Value;
@@ -100,6 +100,21 @@ fn list(value: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// The decision a claim's reach names; a law the static tier sees always has one.
+fn decision_of(reach: &Value) -> String {
+    let Value::Ctor { name, args } = reach else {
+        panic!("a reach is an `Option`: {reach:?}");
+    };
+    assert_eq!(
+        name.as_str(),
+        "Some",
+        "the static tier saw nothing of a law"
+    );
+    field_of(&args[0], "decision", Span::DUMMY)
+        .and_then(|d| d.as_str(Span::DUMMY, "a decision").map(str::to_string))
+        .expect("a reach names its decision")
+}
+
 fn owners(collection: &Value) -> Vec<String> {
     let claims = field_of(collection, "claims", Span::DUMMY).expect("a collection's claims");
     list(claims)
@@ -157,6 +172,17 @@ fn a_second_configuration_is_a_second_run_over_its_own_project() {
         let verdicts = ok(ask(&lent, "discharged", vec![choice]));
         let outcomes = field_of(&verdicts, "outcomes", Span::DUMMY).expect("the outcomes");
         assert_eq!(list(outcomes).len(), laws);
+        // The static tier is asked about each claim on its own, after anything discharged it.
+        let asked = Value::list((0..laws).map(|i| Value::Int(i as i64)).collect());
+        let reached = ok(ask(&lent, "reaches", vec![asked]));
+        let decisions: Vec<String> = list(&reached).iter().map(decision_of).collect();
+        assert_eq!(decisions.len(), laws, "{decisions:?}");
+        assert!(
+            decisions.iter().all(
+                |d| ["proved", "guard_unsatisfiable", "open", "budget_spent"].contains(&d.as_str())
+            ),
+            "{decisions:?}"
+        );
         seen.push(named);
     }
     assert!(

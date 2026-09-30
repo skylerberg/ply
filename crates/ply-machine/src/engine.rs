@@ -6,7 +6,6 @@ use ply_eval::{DEFAULT_MAX_CALLS, Machine, Seed, Value};
 use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
 use ply_prove::domain::Finite;
 use ply_prove::property::{self, GenStream, Judge, Outcome, TypeWorld, judge_case, run_property};
-pub use ply_prove::prove::Reach;
 use ply_prove::prove::claims::{Clause, Code, Definition, Law};
 use ply_prove::prove::{self, Blocker, Claims, Decision, Goal, Limits, Proof};
 use ply_prove::{
@@ -276,6 +275,22 @@ impl<'a> Prover<'a> {
         prove::decide_and_diagnose(&self.ctx, &goal, &limits)
     }
 
+    fn attempt_static(
+        &self,
+        obligation: &Obligation,
+        claim: &Claim<'_>,
+        plan: &ProvePlan,
+    ) -> Static {
+        match self.decide(obligation, claim, plan).0 {
+            Decision::GuardUnsatisfiable { .. } => Static::Vacuous,
+            Decision::Proved(proof) => match proof.certify(false) {
+                Some(certificate) => Static::Proved(certificate),
+                None => Static::NeedsWitness(proof),
+            },
+            Decision::Unknown { .. } => Static::Inconclusive,
+        }
+    }
+
     /// What the static tier alone answered, and where the obligation left the fragment on the way.
     pub fn reach(&self, obligation: &Obligation, plan: &ProvePlan) -> Option<Reach> {
         if obligation.is_concurrency_law() {
@@ -287,16 +302,10 @@ impl<'a> Prover<'a> {
     }
 }
 
-/// What the static tier's decision makes of a discharge before anything runs.
-fn static_of(decision: Decision) -> Static {
-    match decision {
-        Decision::GuardUnsatisfiable { .. } => Static::Vacuous,
-        Decision::Proved(proof) => match proof.certify(false) {
-            Some(certificate) => Static::Proved(certificate),
-            None => Static::NeedsWitness(proof),
-        },
-        Decision::Unknown { .. } => Static::Inconclusive,
-    }
+/// What the static tier answered, and the fragment boundaries it crossed.
+pub struct Reach {
+    pub decision: Decision,
+    pub blockers: Vec<Blocker>,
 }
 
 /// One point of one obligation's guard, as `claims.ply` reads it: what a search over cases is
@@ -328,8 +337,8 @@ impl ply_test::obligation::Discharger for Prover<'_> {
         obligation: &Obligation,
         plan: &ProvePlan,
         domain: Option<&ply_test::obligation::Domain>,
-    ) -> (Discharge, Option<Reach>) {
-        self.discharge_reaching(obligation, plan, domain)
+    ) -> Discharge {
+        self.discharge_with(obligation, plan, domain)
     }
 }
 
@@ -361,50 +370,23 @@ impl<'a> Prover<'a> {
         plan: &ProvePlan,
         measured: Option<&ply_test::obligation::Domain>,
     ) -> Discharge {
-        self.discharge_reaching(obligation, plan, measured).0
-    }
-
-    /// [`Prover::discharge_with`], and what the static tier alone answered on the way: `None` for
-    /// a concurrency law, which the static tier never sees.
-    pub fn discharge_reaching(
-        &self,
-        obligation: &Obligation,
-        plan: &ProvePlan,
-        measured: Option<&ply_test::obligation::Domain>,
-    ) -> (Discharge, Option<Reach>) {
         let measured_domain = measured.and_then(|d| {
             Finite::of_shapes(d.shapes.clone()).map(|finite| (finite, d.name.clone()))
         });
         let measured_domain = measured_domain.as_ref();
         let Some(claim) = self.claim(obligation) else {
-            let unhandled = Gap::UnhandledEffect(obligation.footprint.clone());
-            return (Discharge::Unattempted(unhandled), None);
+            return Discharge::Unattempted(Gap::UnhandledEffect(obligation.footprint.clone()));
         };
 
         if obligation.is_concurrency_law() {
-            let searched = self.search_interleavings(obligation, &claim, plan, measured_domain);
-            return (searched, None);
+            return self.search_interleavings(obligation, &claim, plan, measured_domain);
         }
 
-        let (decision, blockers) = self.decide(obligation, &claim, plan);
-        let discharge = if obligation.host {
-            self.discharge_host(obligation, &claim, plan)
-        } else {
-            self.discharge_decided(obligation, &claim, plan, measured_domain, decision.clone())
-        };
-        (discharge, Some(Reach { decision, blockers }))
-    }
+        if obligation.host {
+            return self.discharge_host(obligation, &claim, plan);
+        }
 
-    /// The rest of a discharge, once the static tier has decided what it could.
-    fn discharge_decided(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        plan: &ProvePlan,
-        measured_domain: Option<&(Finite, String)>,
-        decision: Decision,
-    ) -> Discharge {
-        let witness = match static_of(decision) {
+        let witness = match self.attempt_static(obligation, &claim, plan) {
             Static::Proved(certificate) => return Discharge::Held(Evidence::Proof(certificate)),
             Static::Vacuous => {
                 return Discharge::Vacuous(Vacuity {
@@ -421,7 +403,7 @@ impl<'a> Prover<'a> {
             return Discharge::Unattempted(Gap::UnhandledEffect(footprint));
         }
 
-        let mut cases = match self.cases(obligation, claim, plan) {
+        let mut cases = match self.cases(obligation, &claim, plan) {
             Ok(cases) => cases,
             Err(gap) => return Discharge::Unattempted(gap),
         };
@@ -429,7 +411,7 @@ impl<'a> Prover<'a> {
         if let Some((finite, name)) = measured_domain {
             return self.enumerate(
                 obligation,
-                claim,
+                &claim,
                 finite,
                 name.as_str(),
                 &mut cases,
@@ -450,7 +432,7 @@ impl<'a> Prover<'a> {
             Discharge::Vacuous(Vacuity {
                 kind: VacuityKind::NoCaseKept { generated },
                 ..
-            }) => match self.witness(obligation, claim, &mut cases) {
+            }) => match self.witness(obligation, &claim, &mut cases) {
                 Some(values) => match witness.and_then(|proof| proof.certify(true)) {
                     Some(certificate) => Discharge::Held(Evidence::Proof(certificate)),
                     None => Discharge::Unattempted(Gap::GuardNotSampled {

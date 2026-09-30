@@ -112,14 +112,6 @@ impl Decision {
     }
 }
 
-/// What the static tier alone answered for one obligation, and where it left the fragment on the
-/// way.
-#[derive(Clone, Debug)]
-pub struct Reach {
-    pub decision: Decision,
-    pub blockers: Vec<Blocker>,
-}
-
 pub fn decide(ctx: &Context<'_>, goal: &Goal<'_>, limits: &Limits) -> Decision {
     decide_and_diagnose(ctx, goal, limits).0
 }

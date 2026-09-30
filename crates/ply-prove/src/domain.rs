@@ -96,8 +96,12 @@ impl Finite {
         Some(Finite { shapes, points })
     }
 
-    /// The `index`-th point, in a fixed order — the first binder varying slowest.
+    /// The `index`-th point, in a fixed order — the first binder varying slowest — and `None` past
+    /// the last, where decoding would wrap round to a point already named.
     pub fn point(&self, index: u64) -> Option<Vec<Value>> {
+        if index >= self.points {
+            return None;
+        }
         tuple_at(&self.shapes, index)
     }
 }
