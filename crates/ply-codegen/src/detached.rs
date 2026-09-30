@@ -144,7 +144,7 @@ fn pin_enclosing(c: &mut Ctx, stack: usize) -> Vec<Pin> {
             pins.extend(held.iter().map(|pin| c.cells.repin(pin)));
             break;
         }
-        match crate::simulate::entered_from(c, at) {
+        match c.stacks[at].entered_from {
             Some(outer) => at = outer,
             None => break,
         }
