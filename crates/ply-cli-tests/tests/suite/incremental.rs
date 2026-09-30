@@ -160,41 +160,105 @@ fn the_example_corpus_agrees_cold_and_warm() {
     warm_agrees(dir.path(), "warm");
 }
 
+/// Renames every whole-identifier `from` in `name`, so which occurrences move is the program's
+/// business and not its layout's.
+fn rename(dir: &Path, name: &str, from: &str, to: &str) {
+    let path = dir.join(name);
+    let text = fs::read_to_string(&path).unwrap();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut renamed = String::with_capacity(text.len());
+    let mut kept = 0;
+    for (at, _) in text.match_indices(from) {
+        let before = text[..at].chars().next_back();
+        let after = text[at + from.len()..].chars().next();
+        if before.is_some_and(word) || after.is_some_and(word) {
+            continue;
+        }
+        renamed.push_str(&text[kept..at]);
+        renamed.push_str(to);
+        kept = at + from.len();
+    }
+    renamed.push_str(&text[kept..]);
+    fs::write(path, renamed).unwrap();
+}
+
+/// Whether a step's edit landed, asked of the checker rather than of the files: `module` declares
+/// every name in `now` and none in `gone`, and the program still checks.
+#[track_caller]
+fn landed(answer: &serde_json::Value, step: &str, module: &str, now: &[&str], gone: &[&str]) {
+    let declared: Vec<&str> = answer["modules"]
+        .as_array()
+        .expect("a module table")
+        .iter()
+        .find(|m| m["name"] == module)
+        .and_then(|m| m["items"].as_array())
+        .unwrap_or_else(|| panic!("{step}: the answer has no module `{module}`"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        answer["ok"] == true
+            && now.iter().all(|n| declared.contains(n))
+            && !gone.iter().any(|g| declared.contains(g)),
+        "{step}: `{module}` should declare {now:?} and not {gone:?} in a program that checks; it \
+         declares {declared:?}, with diagnostics {}",
+        answer["diagnostics"]
+    );
+}
+
 /// One cache for every mutation: an invalidation is only ever wrong in some sequence of edits.
 ///
 /// Real code exercises handlers, regions, `nondet` effects and cross-module types the synthetic
 /// corpora do not, and the session ends by undoing every edit so a wrong answer shows up as a
-/// final state that is not the one it began in.
+/// final state that is not the one it began in. No edit depends on how the examples are laid out.
 #[test]
 fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
     let dir = examples();
     let start = warm_agrees(dir.path(), "step 0");
+    let original = |name: &str| fs::read_to_string(dir.path().join(name)).unwrap();
+    let (clock, report, ledger) = (
+        original("clock.ply"),
+        original("report.ply"),
+        original("ledger.ply"),
+    );
 
-    let clock = fs::read_to_string(dir.path().join("clock.ply")).unwrap();
     write(
         dir.path(),
         "clock.ply",
         &format!("{clock}\npub fn ticks() -> Int = 0\n"),
     );
-    warm_agrees(dir.path(), "step 1: a definition appeared");
-
-    edit(
-        dir.path(),
-        "report.ply",
-        "fn assets() -> List<String>",
-        "// a note\nfn assets() -> List<String>",
+    let step = "step 1: a definition appeared";
+    landed(
+        &warm_agrees(dir.path(), step),
+        step,
+        "clock",
+        &["clock.ticks"],
+        &[],
     );
+
+    write(dir.path(), "report.ply", &format!("// a note\n{report}"));
     warm_agrees(dir.path(), "step 2: a comment");
 
-    edit(dir.path(), "ledger.ply", "presented", "presented_value");
-    edit(dir.path(), "report.ply", "presented", "presented_value");
-    warm_agrees(dir.path(), "step 3: a rename across modules");
+    rename(dir.path(), "ledger.ply", "presented", "presented_value");
+    rename(dir.path(), "report.ply", "presented", "presented_value");
+    let step = "step 3: a rename across modules";
+    landed(
+        &warm_agrees(dir.path(), step),
+        step,
+        "ledger",
+        &["ledger.presented_value"],
+        &["ledger.presented"],
+    );
 
-    edit(dir.path(), "report.ply", "type Line = ", "type Row = ");
-    edit(dir.path(), "report.ply", "-> Line =", "-> Row =");
-    edit(dir.path(), "report.ply", "List<Line>", "List<Row>");
-    edit(dir.path(), "report.ply", "l: Line|", "l: Row|");
-    warm_agrees(dir.path(), "step 4: a type rename");
+    rename(dir.path(), "report.ply", "Line", "Row");
+    let step = "step 4: a type rename";
+    landed(
+        &warm_agrees(dir.path(), step),
+        step,
+        "report",
+        &["report.Row"],
+        &["report.Line"],
+    );
 
     write(dir.path(), "spare.ply", "pub fn spare() -> Int = 9\n");
     warm_agrees(dir.path(), "step 5: a module appeared");
@@ -206,18 +270,8 @@ fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
     warm_agrees(dir.path(), "step 7: and deleted");
 
     write(dir.path(), "clock.ply", &clock);
-    edit(
-        dir.path(),
-        "report.ply",
-        "// a note\nfn assets()",
-        "fn assets()",
-    );
-    edit(dir.path(), "ledger.ply", "presented_value", "presented");
-    edit(dir.path(), "report.ply", "presented_value", "presented");
-    edit(dir.path(), "report.ply", "type Row = ", "type Line = ");
-    edit(dir.path(), "report.ply", "-> Row =", "-> Line =");
-    edit(dir.path(), "report.ply", "List<Row>", "List<Line>");
-    edit(dir.path(), "report.ply", "l: Row|", "l: Line|");
+    write(dir.path(), "report.ply", &report);
+    write(dir.path(), "ledger.ply", &ledger);
     let end = warm_agrees(dir.path(), "step 8: back to where it started");
     assert_eq!(
         start, end,
