@@ -22,6 +22,10 @@ pub const CSV: &str = include_str!("../ply/csv.ply");
 
 pub const DB: &str = include_str!("../ply/db.ply");
 
+pub const DECIMAL: &str = include_str!("../ply/decimal.ply");
+
+pub const FLOAT: &str = include_str!("../ply/float.ply");
+
 pub const FS: &str = include_str!("../ply/fs.ply");
 
 pub const HASH: &str = include_str!("../ply/hash.ply");
@@ -81,6 +85,8 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.config", CONFIG),
     ("std.csv", CSV),
     ("std.db", DB),
+    ("std.decimal", DECIMAL),
+    ("std.float", FLOAT),
     ("std.fs", FS),
     ("std.hash", HASH),
     ("std.http", HTTP),
