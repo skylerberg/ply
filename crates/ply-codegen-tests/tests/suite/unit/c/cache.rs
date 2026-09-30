@@ -11,7 +11,7 @@ fn a_body_round_trips_through_the_encoding() {
     t.consts.push(Value::bytes([0u8, 255, 10]));
     t.consts.push(Value::Fixed(ply_eval::Fixed::new(
         ply_eval::IntTy::I8,
-        -3i64 as u64,
+        -3i128 as u128,
     )));
     t.consts.push(Value::Float(-1.5));
     t.consts.push(Value::Decimal("2.50".parse().unwrap()));

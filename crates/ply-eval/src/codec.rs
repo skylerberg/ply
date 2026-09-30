@@ -74,7 +74,11 @@ impl<'v> Encoder<'v> {
             Value::Fixed(f) => {
                 self.out.push(FIXED);
                 self.out.push(width_index(f.ty));
-                self.varint(f.bits());
+                // The low word is all a narrower width has; decoding sign-extends it again.
+                self.varint(f.bits() as u64);
+                if f.ty.bits() == 128 {
+                    self.varint((f.bits() >> 64) as u64);
+                }
             }
             Value::Str(s) => {
                 self.out.push(STR);
@@ -171,7 +175,13 @@ impl Decoder<'_> {
                 let ty = *INT_TYPES
                     .get(self.byte()? as usize)
                     .ok_or("a fixed width this format does not have")?;
-                Value::Fixed(Fixed::new(ty, self.varint()?))
+                let low = u128::from(self.varint()?);
+                let high = if ty.bits() == 128 {
+                    u128::from(self.varint()?) << 64
+                } else {
+                    0
+                };
+                Value::Fixed(Fixed::new(ty, high | low))
             }
             STR => {
                 let b = self.blob()?;

@@ -375,16 +375,16 @@ fn lit(l: At<'_>) -> Result<Lit, Error> {
     Ok(match l.name() {
         "LInt" => Lit::Int(l.arg(0)?.int()?),
         "LFixed" => {
-            let width = l.arg(0)?;
-            let name = width.utf8()?;
-            let Some(ty) = IntTy::from_name(&name.to_ascii_uppercase()) else {
-                return Err(width.error(format!("`{name}` is no width")));
-            };
+            let ty = width(l.arg(0)?)?;
             Lit::Fixed {
                 ty,
-                bits: ty.normalize(l.arg(1)?.int()? as u64),
+                bits: ty.normalize(l.arg(1)?.int()? as u128),
             }
         }
+        "LWide" => Lit::Fixed {
+            ty: width(l.arg(0)?)?,
+            bits: (u128::from(l.arg(1)?.int()? as u64) << 64) | u128::from(l.arg(2)?.int()? as u64),
+        },
         "LBool" => Lit::Bool(l.arg(0)?.bool()?),
         "LStr" => Lit::Str(l.arg(0)?.utf8()?.to_string()),
         "LBytes" => Lit::Bytes(l.arg(0)?.bytes()?.to_vec()),
@@ -398,6 +398,12 @@ fn lit(l: At<'_>) -> Result<Lit, Error> {
         "LUnit" => Lit::Unit,
         _ => return Err(l.unknown()),
     })
+}
+
+fn width(w: At<'_>) -> Result<IntTy, Error> {
+    let name = w.utf8()?;
+    IntTy::from_name(&name.to_ascii_uppercase())
+        .ok_or_else(|| w.error(format!("`{name}` is no width")))
 }
 
 /// `1.50m` is `(150, 2)`; a pattern's `-` is part of its source, and negates it.

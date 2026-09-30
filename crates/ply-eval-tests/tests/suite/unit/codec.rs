@@ -37,7 +37,18 @@ fn every_plain_value_comes_back_equal() {
         ),
         ("float", Value::Float(-0.5)),
         ("decimal", Value::Decimal(Decimal::new(-12345, 3))),
-        ("fixed", Value::Fixed(Fixed::new(IntTy::U64, u64::MAX))),
+        (
+            "fixed",
+            Value::Fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX))),
+        ),
+        (
+            "wide",
+            Value::Fixed(Fixed::new(IntTy::I128, i128::MIN as u128)),
+        ),
+        (
+            "unsigned wide",
+            Value::Fixed(Fixed::new(IntTy::U128, u128::MAX)),
+        ),
         ("text", Value::str("né")),
         ("rows", Value::list((0..40).map(|i| row("r", i)).collect())),
         (
