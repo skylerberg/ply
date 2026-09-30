@@ -398,46 +398,9 @@ impl Drive {
             Ok(process) => process,
             Err(diagnostic) => return Err(refuse(vec![diagnostic])),
         };
-        // What the program declared: a family it does not declare reaches nothing, and a grant
-        // for one is a mistake worth refusing rather than ignoring.
-        let declared_effects: Vec<&str> = target
-            .check()
-            .effects
-            .values()
-            .map(|e| e.simple_name.as_str())
-            .collect();
-        if let Some((family, effect)) = options.allow.iter().find_map(|family| {
-            let effect = crate::policy::effect_of(family)?;
-            (!declared_effects.contains(&effect.as_str())).then_some((family, effect))
-        }) {
-            return Err(refuse(vec![Diagnostic::error(
-                codes::CAPABILITY_UNDECLARED,
-                format!("`--allow {family}` was granted and the program declares no `{effect}` effect"),
-            )
-            .primary(
-                Span::DUMMY,
-                "a family the program does not declare reaches nothing",
-            )
-            .note("a run lends only what the program it runs can reach")]));
-        }
-        let machine_module = target
-            .check()
-            .effects
-            .values()
-            .find(|e| e.simple_name.as_str() == "machine")
-            .map(|e| e.module.to_string())
-            .unwrap_or_else(|| "machine".to_string());
-        let lent = match crate::policy::lent_for(
-            &options.allow.iter().map(String::as_str).collect::<Vec<_>>(),
-            &machine_module,
-        ) {
+        let lent = match crate::policy::granted(target.check(), &options.allow) {
             Ok(lent) => lent,
-            Err(why) => {
-                return Err(refuse(vec![Diagnostic::error(
-                    codes::CAPABILITY_UNDECLARED,
-                    why,
-                )]));
-            }
+            Err(diagnostic) => return Err(refuse(vec![diagnostic])),
         };
         let hosts = match Hosts::open_stopping(
             target.check(),

@@ -7,7 +7,7 @@ fn options() -> SimOptions {
     SimOptions {
         seed: None,
         sim: SimMode::default(),
-        seeds: None,
+        roots: None,
         sim_budget: None,
         sim_steps: None,
         measure_reduction: false,
@@ -27,7 +27,7 @@ fn the_default_plan_is_one_dpor_seed_at_the_default_budget() {
 #[test]
 fn seeds_widens_the_root_set_under_either_mode() {
     let built = plan(&SimOptions {
-        seeds: Some(8),
+        roots: Some(0..8),
         ..options()
     });
     assert_eq!(built.roots, (0..8).collect::<Vec<u64>>());
@@ -53,6 +53,24 @@ fn a_seed_replays_exactly_one_interleaving() {
     assert_eq!(built.seeds(), vec![Seed::at(7, vec![3, 0, 2])]);
 }
 
+/// A measurement asks for one root's search by naming it, with nothing below it searched too.
+#[test]
+fn a_root_range_searches_exactly_those_roots() {
+    let one = plan(&SimOptions {
+        roots: Some(5..6),
+        ..options()
+    });
+    assert_eq!(one.roots, vec![5]);
+    assert_eq!(one.mode, SimMode::Dpor);
+    let sampled = plan(&SimOptions {
+        sim: SimMode::Random,
+        roots: Some(3..7),
+        ..options()
+    });
+    assert_eq!(sampled.roots, vec![3, 4, 5, 6]);
+    assert_eq!(sampled.budget, 1);
+}
+
 /// A replay still needs the step bound; it is the only search flag `--seed` leaves alone.
 #[test]
 fn a_replay_keeps_its_step_bound() {
@@ -71,7 +89,11 @@ fn every_flag_that_widens_the_search_changes_the_plan() {
     let base = plan(&options());
     let variants = [
         plan(&SimOptions {
-            seeds: Some(2),
+            roots: Some(0..2),
+            ..options()
+        }),
+        plan(&SimOptions {
+            roots: Some(1..2),
             ..options()
         }),
         plan(&SimOptions {

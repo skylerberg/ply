@@ -124,7 +124,7 @@ fn the_certificate_audit() {
                         obligation.owner
                     ),
                     Rule::ExhaustiveEnumeration { points, .. } => assert!(
-                        *points <= ply_prove::ENUMERATION_BOUND,
+                        *points <= crate::fixture::bound(),
                         "`{}` claims to have enumerated {points} points",
                         obligation.owner
                     ),
@@ -152,7 +152,8 @@ fn the_certificate_audit() {
                 }
             }
             assert!(
-                certificate.steps <= plan.prove_budget.max(ply_prove::ENUMERATION_BOUND as u32),
+                u64::from(certificate.steps)
+                    <= u64::from(plan.prove_budget).max(crate::fixture::bound()),
                 "`{}` spent {} steps",
                 obligation.owner,
                 certificate.steps
