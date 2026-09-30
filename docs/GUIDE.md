@@ -434,7 +434,11 @@ ordered, and reaches a host operation only if that operation's registration
 allows it (`E0439`).
 
 **`Cell<a>`** (§7) and **`Task<a>`** (§9) are branded by their region and cannot
-outlive it; the brand prints as `Cell[users]<Int>`.
+outlive it; the brand prints as `Cell[users]<Int>`. A declaration is outside
+every region, so a variant's field or an operation's parameter or result that
+mentions either, at any depth, is `E0446`. Take it as a type parameter instead,
+`type Held<t> = Held(t)`: the type argument carries the brand where the escape
+checks see it.
 
 ### 4.7 Function types, and what is written
 
@@ -474,7 +478,19 @@ fn sum_two(input: Bytes) -> Int = {
 }
 ```
 
-A record pattern names every field or ends with `..` (`E0201`).
+A record pattern names every field or ends with `..` (`E0201`). A `let` whose
+pattern does not match raises; `let <pattern> = <expr> else { .. };` says what
+happens instead. Where the pattern misses, the `else` block is the value of the
+block the statement is in, and the statements after it do not run; it has that
+block's type and sees none of the pattern's names. `?` in the `else` exits as it
+would from the block's tail.
+
+```ply
+fn first_word(line: String) -> String = {
+  let [word, ..] = string_split(line, " ") else { "" };
+  word
+}
+```
 
 `if a { x } else if b { y } else { z }` requires braces and one type for every
 branch; without `else` its type is `Unit`.
@@ -502,6 +518,13 @@ guard: `[x, y, ..rest] if x > y -> x + len(rest),`. A `match` must be exhaustive
 | `[]`, `[a, b]`, `[a, ..]`, `[a, ..rest]` | a list of exact length, or a prefix |
 | `{a, b}`, `{a: p, b: q}`, `{a, ..}` | a record; `..` allows other fields |
 | `(p, q)` | a tuple |
+| `p \| q` | either alternative, the leftmost first; parentheses nest a choice |
+
+Every alternative binds the same names at one type (`E0212`). An arm is tried
+once per alternative, so a guard runs again for a later alternative when an
+earlier one matched and the guard refused it. A plain `let` may use an
+or-pattern only where its alternatives cover the type, as in
+`let Ok(v) | Err(v) = r;`; one that can fail needs an `else` (`E0213`).
 
 ### 5.3 Lambdas
 
@@ -803,9 +826,10 @@ nobody joined after the region's `}`, and a `task.join` inside the region does
 not license it, because no type records the join.
 
 * `E0201`: the cell escapes its `with_cell[r]` region.
-* `E0446`: a region-branded value outlives the region (stored in an older
-  binding, handed to an operation, put in a declared type, or handed to a
-  `task.spawn` whose scheduler is older than the region).
+* `E0446`: a value branded by the region outlives it (stored in an older
+  binding, handed to an operation, or handed to a `task.spawn` whose scheduler
+  is older than the region), or a declared type's field or an operation's
+  signature mentions a `Cell` or a `Task` (§4.6).
 * `E0449`: a region handle (a cell, a task, or the continuation a clause's
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
@@ -2755,6 +2779,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0209` | `/` on `Decimal` |
 | `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
+| `E0212` | the alternatives of an or-pattern bind different names |
+| `E0213` | a `let` whose or-pattern can fail has no `else` |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
