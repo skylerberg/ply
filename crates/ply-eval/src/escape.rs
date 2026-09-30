@@ -9,13 +9,16 @@ use std::borrow::Cow;
 pub enum Handle {
     Cell,
     Task,
+    Continuation,
 }
 
 impl Handle {
-    pub fn as_str(self) -> &'static str {
+    /// A continuation has no type of its own to name: its type is a function's.
+    fn noun(self) -> &'static str {
         match self {
-            Handle::Cell => "Cell",
-            Handle::Task => "Task",
+            Handle::Cell => "a `Cell`",
+            Handle::Task => "a `Task`",
+            Handle::Continuation => "a continuation",
         }
     }
 
@@ -28,6 +31,25 @@ impl Handle {
             Handle::Task => {
                 "a `Task` is a key into a scheduler, and the scheduler dies with the region that \
                  opened it"
+            }
+            Handle::Continuation => {
+                "a continuation resumes a body that lives only as long as the entry that captured \
+                 it, and that body reaches every region open at the capture"
+            }
+        }
+    }
+
+    /// Why no type refused it before the boundary did.
+    fn unseen(self) -> &'static str {
+        match self {
+            Handle::Cell | Handle::Task => {
+                "the escape brand makes this a type error wherever a type still mentions the \
+                 brand; this is the boundary where none does, so it is refused here instead of \
+                 read later"
+            }
+            Handle::Continuation => {
+                "no type records that a function is a continuation, so it is refused at the \
+                 boundary instead of wherever it would be resumed"
             }
         }
     }
@@ -73,24 +95,24 @@ pub enum Boundary<'a> {
 
 impl Boundary<'_> {
     fn headline(&self, handle: Handle, reached: &str) -> String {
-        let what = handle.as_str();
+        let what = handle.noun();
         match self {
             Boundary::HostArgument {
                 operation,
                 position,
                 ..
             } => format!(
-                "`{operation}` was handed a `{what}` in argument {}{reached}",
+                "`{operation}` was handed {what} in argument {}{reached}",
                 position + 1
             ),
             Boundary::HostAnswer { operation, .. } => {
-                format!("`{operation}` answered with a `{what}`{reached}")
+                format!("`{operation}` answered with {what}{reached}")
             }
             Boundary::HostToken { label, token } => {
-                format!("the host runtime resolved `{label}` (#{token}) to a `{what}`{reached}")
+                format!("the host runtime resolved `{label}` (#{token}) to {what}{reached}")
             }
             Boundary::EntryPoint { name } => {
-                format!("`{name}` was called with a `{what}`{reached}")
+                format!("`{name}` was called with {what}{reached}")
             }
         }
     }
@@ -125,18 +147,23 @@ impl Boundary<'_> {
         }
     }
 
-    fn remedy(&self) -> &'static str {
-        match self {
-            Boundary::HostArgument { .. } => {
+    fn remedy(&self, handle: Handle) -> &'static str {
+        match (self, handle) {
+            (Boundary::HostArgument { .. }, Handle::Cell | Handle::Task) => {
                 "read the value inside the region and perform the operation with something that \
                  does not reach a region"
             }
-            Boundary::HostAnswer { .. } | Boundary::HostToken { .. } => {
+            (Boundary::HostArgument { .. }, Handle::Continuation) => {
+                "resume the continuation inside the clause that bound it, and perform the \
+                 operation with what it answers"
+            }
+            (Boundary::HostAnswer { .. } | Boundary::HostToken { .. }, _) => {
                 "a handler answers with data; a handle into the program's memory is not data it \
                  is in a position to have"
             }
-            Boundary::EntryPoint { .. } => {
-                "call the entry point with data, and let the program allocate its own cells"
+            (Boundary::EntryPoint { .. }, _) => {
+                "call the entry point with data, and let the program make its own cells, tasks \
+                 and continuations"
             }
         }
     }
@@ -186,11 +213,8 @@ fn refuse(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic 
     .primary(span, boundary.label())
     .note(escapee.handle.why())
     .note(boundary.outlives())
-    .note(
-        "the escape brand makes this a type error wherever a type still mentions the brand; this is \
-         the boundary where none does, so it is refused here instead of read later",
-    )
-    .note(boundary.remedy())
+    .note(escapee.handle.unseen())
+    .note(boundary.remedy(escapee.handle))
 }
 
 /// Builds `route` innermost-first as the `Some` unwinds, so a clean value allocates nothing.
@@ -255,6 +279,7 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
         Value::Closure(closure) => grow(|| match &closure.kind {
             ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => None,
             ClosureKind::Native { captured, .. } => captured.iter().find_map(|v| find(v, route)),
+            ClosureKind::Continuation { .. } => Some(Handle::Continuation),
             ClosureKind::Synth { rule, .. } => {
                 rule.values().into_iter().find_map(|v| find(v, route))
             }

@@ -211,6 +211,34 @@ fn a_cell_from_another_arena_is_refused_at_the_entry_point() {
     assert!(d.message.contains("`Cell`"), "{}", d.message);
 }
 
+/// `k` converted out of the entry that parked it is refused where a smuggled cell is, before the
+/// run begins, rather than resumed into a body that is gone.
+#[test]
+fn a_continuation_from_another_entry_is_refused_at_the_entry_point() {
+    let compiled = Compiled::new(PARKED);
+    let native = compiled.native();
+    let entry = native.entry("m.parked").expect("`parked` compiled");
+    let mut ctx = native.context();
+    ctx.begin(10_000);
+    let out = unsafe { entry(&mut ctx, std::ptr::null()) };
+    assert_eq!(ctx.failed, 0, "`parked`: {:?}", ctx.diagnostic);
+    let saved = ply_codegen::heap::Heap::to_value(&native.tables().layouts, out);
+    ctx.end();
+
+    let d = compiled
+        .machine()
+        .call("m.resume_it", vec![saved], Span::DUMMY)
+        .expect_err("a continuation may not enter a run");
+
+    assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{}", d.message);
+    assert!(
+        d.message.contains("was called with a continuation"),
+        "{}",
+        d.message
+    );
+    assert!(d.message.contains("Just`'s argument 1"), "{}", d.message);
+}
+
 #[test]
 fn data_still_crosses_the_entry_point() {
     let compiled = Compiled::new(PARKED);
