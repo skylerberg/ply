@@ -1027,7 +1027,8 @@ fn a_build_schema_that_names_nothing_is_refused_at_build_time() {
     assert!(!out.status.success());
     let text =
         String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains(codes::UNKNOWN_NAME), "{text}");
+    assert!(text.contains(codes::CONFIG_UNAVAILABLE), "{text}");
+    assert!(text.contains("this program has: m.spec"), "{text}");
     assert!(!dir.path().join("x.plyx").exists());
 }
 

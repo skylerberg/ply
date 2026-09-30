@@ -1,6 +1,5 @@
 use ply_span::Symbol;
 use ply_ty::*;
-use std::collections::BTreeSet;
 
 fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
     EffectAtom::new(
@@ -42,12 +41,14 @@ fn an_operation_atom_takes_its_mode_from_the_declaration() {
         (effect.as_str() == "net" && op.as_str() == "peek").then_some(Mode::Read)
     };
     assert_eq!(peek.clone().with_declared_mode(&declared).mode, Mode::Read);
-    let mut footprint = Footprint::from_atoms([peek.clone(), atom("net", None, Mode::Write)]);
+    let mut footprint = Footprint::from_atoms([peek, atom("net", None, Mode::Write)]);
     footprint.resolve_modes(&declared);
     assert_eq!(footprint.to_string(), "{net.peek, net.write}");
-    let mut row = Row::closed([peek]);
-    row.resolve_modes(&declared);
-    assert!(row.atoms.iter().all(|a| a.mode == Mode::Read));
+    assert!(
+        footprint
+            .atoms()
+            .any(|a| a.op.is_some() && a.mode == Mode::Read)
+    );
 }
 
 #[test]
@@ -98,27 +99,65 @@ fn the_empty_footprint_conflicts_with_nothing() {
 }
 
 #[test]
-fn row_display_round_trips_the_surface_syntax() {
-    let r = Row::closed([atom("db", Some("users"), Mode::Read)]);
-    assert_eq!(r.to_string(), "{db.read[users]}");
-    let open = Row {
-        atoms: r.atoms.clone(),
-        tail: Some(RowVar(3)),
-    };
-    assert_eq!(open.to_string(), "{db.read[users] | e3}");
-    assert_eq!(Row::empty().to_string(), "{}");
+fn an_operation_atom_prints_its_operation_in_place_of_the_mode() {
+    let conn = || Resource::Named(Symbol::new("conn"));
+    let footprint = Footprint::from_atoms([
+        EffectAtom::operation("net", conn(), Mode::Write, "send"),
+        EffectAtom::new("net", conn(), Mode::Write),
+    ]);
+    assert_eq!(footprint.to_string(), "{net.write[conn], net.send[conn]}");
 }
 
+/// A footprint names its labels in the order its atoms name them.
 #[test]
-fn without_removes_handled_atoms_and_keeps_the_tail() {
-    let read = atom("db", Some("users"), Mode::Read);
-    let write = atom("db", Some("users"), Mode::Write);
-    let row = Row {
-        atoms: [read.clone(), write.clone()].into(),
-        tail: Some(RowVar(1)),
-    };
-    let handled: BTreeSet<_> = [read].into();
-    let out = row.without(&handled);
-    assert_eq!(out.atoms, [write].into());
-    assert_eq!(out.tail, Some(RowVar(1)));
+fn a_footprints_labels_are_named_in_the_order_its_atoms_name_them() {
+    let bound = Footprint::from_atoms([
+        EffectAtom::operation("net", Resource::Var(0), Mode::Write, "recv"),
+        EffectAtom::operation("net", Resource::Var(1), Mode::Write, "send"),
+        EffectAtom::new("net", Resource::Named(Symbol::new("conn")), Mode::Write),
+    ]);
+    assert_eq!(
+        atom_texts(&bound.0),
+        ["net.write[conn]", "net.recv[l]", "net.send[m]"]
+    );
+    assert!(atom_texts(&Footprint::empty().0).is_empty());
+}
+
+/// A label variable may not take the name of a resource in the same text, or the text would say
+/// the two are one; it steps to the next letter, and past the last to the round.
+#[test]
+fn a_label_variable_steps_past_a_resource_of_its_name() {
+    let op =
+        |resource: Resource, name: &str| EffectAtom::operation("net", resource, Mode::Write, name);
+    let named = |name: &str| Resource::Named(Symbol::new(name));
+    let send = op(named("l"), "send");
+    let recv = op(Resource::Var(0), "recv");
+    let texts = |atoms: Vec<EffectAtom>| atom_texts(&Footprint::from_atoms(atoms).0);
+    assert_eq!(
+        texts(vec![send.clone(), recv.clone()]),
+        ["net.send[l]", "net.recv[m]"]
+    );
+    // One operation under a resource and under the variable: two atoms, and two names.
+    assert_eq!(
+        texts(vec![send.clone(), op(Resource::Var(0), "send")]),
+        ["net.send[l]", "net.send[m]"]
+    );
+    let close = op(named("m"), "close");
+    assert_eq!(
+        texts(vec![send.clone(), close.clone(), recv.clone()]),
+        ["net.send[l]", "net.close[m]", "net.recv[n]"]
+    );
+    let connect = op(named("n"), "connect");
+    assert_eq!(
+        texts(vec![send, close, connect, recv]),
+        [
+            "net.send[l]",
+            "net.close[m]",
+            "net.connect[n]",
+            "net.recv[l1]"
+        ]
+    );
+    // On its own a label has no resource to step past.
+    assert_eq!(label_var_name(0), "l");
+    assert_eq!(label_var_name(3), "l1");
 }
