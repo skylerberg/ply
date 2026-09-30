@@ -3,7 +3,7 @@
 # Is this binary built from the tree it sits in?
 #
 #   .github/binary-is-current.sh                    # target/release/ply, or $PLY_BIN
-#   .github/binary-is-current.sh target/debug/ply target/release/ply-corpus
+#   .github/binary-is-current.sh target/debug/ply target/release/ply
 #   .github/binary-is-current.sh --self-test        # watch the check go red
 #
 # Exit 0 the binary is current · 1 it is STALE · 2 the question cannot be

@@ -137,7 +137,7 @@ nondet effect prover {
   read would[claims](i: Int, position: Int) -> Result<Bool, Unit>
   write accept[claims](i: Int, position: Int) -> Result<Unit, Unit>
   read settled[claims]() -> Result<Option<Unit>, Unit>
-  read baselines[claims]() -> List<Unit>
+  read baselines[claims](names: List<String>) -> List<Unit>
   write accepted[claims](records: List<Unit>) -> Unit
 }
 

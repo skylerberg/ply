@@ -2,11 +2,12 @@
 //! `crates/ply-cli/ply` performs it.
 //!
 //! The store and the prover stay here: discharging a claim enters compiled bodies, and an entry does
-//! not nest on the thread the `ply` program itself runs on. The obligations and the types they are
-//! written over are the program's (`proof.world`), handed over with the front end; which claims
-//! are asked for, the keys their evidence is read and filed under, what the review, the coverage and
-//! the baseline come to, every line and key of both reports and the code each run exits with are the
-//! program's too, in `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
+//! not nest on the thread the `ply` program itself runs on. The obligations, the types they are
+//! written over and the search each one goes to are the program's (`proof.world`), handed over with
+//! the front end; which claims are asked for, the keys their evidence is read and filed under, what
+//! the review, the coverage and the baseline come to, every line and key of both reports and the
+//! code each run exits with are the program's too, in `crates/ply-cli/ply/claims.ply`, `prove.ply`
+//! and `review.ply`.
 
 use crate::config::Configuration;
 use crate::engine::Point;
@@ -17,10 +18,7 @@ use crate::support::{build_pool, enter_constant, prover_backend};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{
-    CheckOutput, DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes,
-};
-use ply_prove::domain::Shape;
+use ply_eval::{DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes};
 use ply_prove::property::{GenStream, generate};
 use ply_prove::shrink::Target;
 use ply_prove::{
@@ -95,8 +93,6 @@ pub struct Job {
     pub world: World,
     pub obligations: Vec<Obligation>,
     pub use_cache: bool,
-    /// Also discharge what the shipped modules declare.
-    pub std: bool,
     pub jobs: Option<u32>,
     pub plan: ProvePlan,
     /// `None` for a command that binds nothing at all, which is every `ply review`.
@@ -205,7 +201,7 @@ impl HostHandler for Site {
                 u32::try_from(case.as_int(span, "the case to draw")?).unwrap_or(u32::MAX),
             )?,
             ("reaches", [claims]) => self.reaches(indices(claims, span)?)?,
-            ("baselines", _) => self.baselines()?,
+            ("baselines", [names]) => self.baselines(names_of(names, span)?)?,
             ("accepted", [records]) => self.accepted(records_of(records, span)?)?,
             (other, _) => return Err(unasked(other, span)),
         };
@@ -216,91 +212,11 @@ impl HostHandler for Site {
 /// The decision, as the program sent it.
 fn choice_of(value: &PlyValue, span: Span) -> Result<obligation::Choice, Diagnostic> {
     use crate::payload::field_of;
-    let claims = indices(field_of(value, "claims", span)?, span)?;
-    let mut domains = Vec::new();
-    for entry in field_of(value, "domains", span)?.as_list(span, "the measured domains")? {
-        let claim = field_of(entry, "claim", span)?.as_int(span, "a claim's place")? as usize;
-        let shapes = field_of(entry, "shapes", span)?
-            .as_list(span, "a binder's shape")?
-            .iter()
-            .map(|shape| shape_of(shape, span))
-            .collect::<Result<Vec<Shape>, Diagnostic>>()?;
-        let name = field_of(entry, "name", span)?
-            .as_str(span, "a domain's name")?
-            .to_string();
-        // Keyed by the obligation's position in the run, which is how the discharge reads it back.
-        // A domain for a claim this run does not report on is dropped rather than refused.
-        if let Some(position) = claims.iter().position(|&c| c == claim) {
-            domains.push((position, obligation::Domain { shapes, name }));
-        }
-    }
     Ok(obligation::Choice {
-        claims,
+        claims: indices(field_of(value, "claims", span)?, span)?,
         to_discharge: indices(field_of(value, "runs", span)?, span)?,
         read: filed_of(field_of(value, "read", span)?, span)?,
-        domains,
     })
-}
-
-/// One binder's shape as `proof.domain` measured it: a builtin, a declared type's cases or a
-/// record's fields, each node with the size the program decided.
-pub fn shape_of(value: &PlyValue, span: Span) -> Result<Shape, Diagnostic> {
-    use crate::payload::field_of;
-    let size = |v: &PlyValue| -> Result<u64, Diagnostic> {
-        Ok(u64::try_from(v.as_int(span, "a size")?).unwrap_or(0))
-    };
-    let PlyValue::Ctor { name, args } = value else {
-        return Err(unshaped(span));
-    };
-    let arg = |i: usize| args.get(i).ok_or_else(|| unshaped(span));
-    match name.as_str().rsplit('.').next().unwrap_or("") {
-        "Scalar" => Ok(Shape::Scalar {
-            name: arg(0)?.as_str(span, "a builtin's name")?.to_string(),
-            size: size(arg(1)?)?,
-        }),
-        "Cases" => Ok(Shape::Cases {
-            size: size(arg(0)?)?,
-            cases: arg(1)?
-                .as_list(span, "a type's cases")?
-                .iter()
-                .map(|case| {
-                    Ok(ply_prove::domain::Case {
-                        name: Symbol::new(field_of(case, "name", span)?.as_str(span, "a case")?),
-                        size: size(field_of(case, "size", span)?)?,
-                        fields: field_of(case, "fields", span)?
-                            .as_list(span, "a case's fields")?
-                            .iter()
-                            .map(|field| shape_of(field, span))
-                            .collect::<Result<_, Diagnostic>>()?,
-                    })
-                })
-                .collect::<Result<_, Diagnostic>>()?,
-        }),
-        "Fields" => Ok(Shape::Fields {
-            size: size(arg(0)?)?,
-            fields: arg(1)?
-                .as_list(span, "a record's fields")?
-                .iter()
-                .map(|field| {
-                    Ok((
-                        Symbol::new(field_of(field, "name", span)?.as_str(span, "a field")?),
-                        shape_of(field_of(field, "shape", span)?, span)?,
-                    ))
-                })
-                .collect::<Result<_, Diagnostic>>()?,
-        }),
-        _ => Err(unshaped(span)),
-    }
-}
-
-#[cold]
-fn unshaped(span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        "a measured domain holds something that is not a shape",
-    )
-    .primary(span, "the program handed this domain over")
-    .note("the program and the thread it drives are written together; this is Ply's fault")
 }
 
 /// Positions in the run's claims, each with the key the program named for it.
@@ -351,16 +267,15 @@ fn key_of(hex: &str, span: Span) -> Result<DefHash, Diagnostic> {
 fn drawn(obligation: &Obligation, root: u64, case: u32, world: &World) -> Option<Vec<Value>> {
     let mut stream = GenStream::new(root, obligation.key);
     obligation
-        .generated()
+        .binders
         .iter()
         .map(|binder| generate(&binder.sort, world, &mut stream, case).ok())
         .collect()
 }
 
-/// What a claim's discharge left to walk: a refutation shrinks from the values its draw gives, a
-/// raise from the values it reported. Everything else has nothing to walk — a race is an
-/// interleaving, an enumerated point is already the smallest its search saw, and a claim that held
-/// has no counterexample at all.
+/// The counterexample a claim's discharge left, regenerated from the draw it reports: a refutation's
+/// or a raise's. Which claims are walked at all is the program's decision, since only a point drawn
+/// one at a time has a draw to regenerate; an outcome with no counterexample has nothing here.
 fn walkable(
     claim: usize,
     obligations: &[Obligation],
@@ -374,12 +289,10 @@ fn walkable(
         .iter()
         .find(|(o, _)| o.key == obligation.key)
         .map(|(_, discharge)| discharge)?;
-    let (values, original, root, case, target) = match discharge {
+    let (values, original, target) = match discharge {
         Discharge::Refuted(cx) => (
             drawn(obligation, cx.root, cx.case, world)?,
             cx.original.clone(),
-            cx.root,
-            cx.case,
             Target::Falsifies,
         ),
         Discharge::Unattempted(Gap::Raised {
@@ -390,17 +303,14 @@ fn walkable(
         }) => (
             drawn(obligation, *root, *case, world)?,
             bindings.clone(),
-            *root,
-            *case,
             Target::Raises,
         ),
         _ => return None,
     };
-    let _ = (root, case);
     Some(Shrinking {
         claim,
         values,
-        binders: obligation.generated().to_vec(),
+        binders: obligation.binders.clone(),
         target,
         original,
     })
@@ -502,6 +412,15 @@ struct Shrinking {
     original: Vec<ply_prove::Binding>,
 }
 
+/// Definitions by program-wide name, as the program handed them over.
+fn names_of(value: &PlyValue, span: Span) -> Result<Vec<Symbol>, Diagnostic> {
+    value
+        .as_list(span, "the definitions to read baselines for")?
+        .iter()
+        .map(|item| Ok(Symbol::new(item.as_str(span, "a definition's name")?)))
+        .collect()
+}
+
 fn indices(value: &PlyValue, span: Span) -> Result<Vec<usize>, Diagnostic> {
     value
         .as_list(span, "the claims to discharge")?
@@ -541,9 +460,8 @@ impl Site {
         }
     }
 
-    /// Start walking this claim's counterexample down, and answer how many values it has. Nothing is
-    /// a claim with nothing to walk: a race is an interleaving, an enumerated point is already the
-    /// smallest thing its search saw, and a claim that held has no counterexample at all.
+    /// Start walking this claim's counterexample down, and answer how many values it has, or nothing
+    /// for an outcome that is no counterexample.
     fn shrink(&self, claim: usize) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("shrink"))?;
@@ -572,12 +490,12 @@ impl Site {
                     .map(|(position, size)| {
                         record(vec![
                             ("position", PlyValue::Int(*position as i64)),
-                            ("size", PlyValue::Int(*size as i64)),
+                            ("size", size_value(*size)),
                         ])
                     })
                     .collect();
                 record(vec![
-                    ("here", PlyValue::Int(offer.here as i64)),
+                    ("here", size_value(offer.here)),
                     ("candidates", PlyValue::list(candidates)),
                 ])
             }))
@@ -700,11 +618,11 @@ impl Site {
         }
     }
 
-    /// The baseline a reader accepted for each definition in scope, where there is one.
-    fn baselines(&self) -> Result<PlyValue, Diagnostic> {
+    /// The baseline a reader accepted for each of these definitions, where there is one.
+    fn baselines(&self, names: Vec<Symbol>) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("baselines"))?;
-        machine.ask(Go::Baselines)?;
+        machine.ask(Go::Baselines(names))?;
         match machine.step()? {
             Step::Baselines(baselines) => Ok(PlyValue::list(
                 baselines
@@ -747,7 +665,7 @@ impl Site {
 /// What the program asks the machine for next.
 enum Go {
     /// Start walking this claim's counterexample down. The answer is how many values it has, or
-    /// nothing when there is nothing to walk — a race, an enumerated point, a claim that held.
+    /// nothing for an outcome that is no counterexample.
     Shrink(usize),
     /// The value at `i` as it now stands: its size and its candidates with theirs.
     Offers(usize),
@@ -781,7 +699,8 @@ enum Go {
     /// What the static tier alone answers for each of these claims, by its place in the
     /// collection, whether or not anything discharged it this run.
     Reaches(Vec<usize>),
-    Baselines,
+    /// The baseline a reader accepted for each of these definitions.
+    Baselines(Vec<Symbol>),
     Accept(Vec<(Symbol, ReviewRecord)>),
 }
 
@@ -881,16 +800,12 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     warnings.extend(store.take_warnings());
     warnings.extend(loaded.frontend.warnings.iter().cloned());
 
-    let hashes = loaded.hashes.clone();
-    let scoped = project_view(&loaded.check, job.std);
     let obligations: &[Obligation] = &job.obligations;
 
     let _ = told.send(Step::Collected(Box::new(Ok(Collection {
         sources: loaded.sources.clone(),
         warnings: std::mem::take(&mut warnings),
         obligations: obligations.len(),
-        defs: defs_of(&scoped, &hashes),
-        laws: laws_of(&scoped, &hashes),
         plan: job.plan.clone(),
     }))));
 
@@ -1046,10 +961,9 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                 };
                 let _ = told.send(Step::Reached(Box::new(answer)));
             }
-            Ok(Go::Baselines) => {
-                let baselines = scoped
-                    .defs
-                    .keys()
+            Ok(Go::Baselines(names)) => {
+                let baselines = names
+                    .iter()
                     .filter_map(|name| {
                         Some((
                             name.as_str().to_string(),
@@ -1235,44 +1149,12 @@ impl At {
     }
 }
 
-/// The checked program without the shipped modules' definitions and laws, unless `std`.
-fn project_view(check: &CheckOutput, std: bool) -> std::borrow::Cow<'_, CheckOutput> {
-    if std {
-        return std::borrow::Cow::Borrowed(check);
-    }
-    let mut scoped = check.clone();
-    scoped
-        .defs
-        .retain(|_, info| !crate::shelf::is_shipped(&info.module));
-    scoped
-        .laws
-        .retain(|law| !crate::shelf::is_shipped(&law.module));
-    std::borrow::Cow::Owned(scoped)
-}
-
-/// A definition in scope: its hash, when the front end produced one, and the spec text of each of its
-/// own clauses.
-struct Def {
-    name: String,
-    hash: Option<DefHash>,
-    specs: Vec<DefHash>,
-}
-
-/// A law as the program wrote it: the hash of its text, and every name it mentions.
-struct Written {
-    key: String,
-    text: DefHash,
-    mentions: Vec<String>,
-}
-
-/// What loading the run came to. The obligations are the program's; this counts them, so a re-run
-/// can refuse an index that names none.
+/// What loading the run came to. The obligations, and the definitions and laws a run answers for,
+/// are the program's; this counts the obligations, so a re-run can refuse an index that names none.
 struct Collection {
     sources: SourceMap,
     warnings: Vec<Diagnostic>,
     obligations: usize,
-    defs: Vec<Def>,
-    laws: Vec<Written>,
     plan: ProvePlan,
 }
 
@@ -1286,42 +1168,6 @@ struct Accepted {
     definitions: usize,
     stored: bool,
     warnings: Vec<Diagnostic>,
-}
-
-/// Every definition in scope, in name order, with its hash and its own clauses' spec text.
-fn defs_of(scoped: &CheckOutput, hashes: &ply_eval::HashOutput) -> Vec<Def> {
-    scoped
-        .defs
-        .keys()
-        .map(|name| Def {
-            name: name.as_str().to_string(),
-            hash: hashes.defs.get(name).copied(),
-            specs: hashes.spec_texts.get(name).cloned().unwrap_or_default(),
-        })
-        .collect()
-}
-
-/// Every law in scope the front end hashed: the hash of its text, or of the law when its text has
-/// none, and every name it mentions.
-fn laws_of(scoped: &CheckOutput, hashes: &ply_eval::HashOutput) -> Vec<Written> {
-    scoped
-        .laws
-        .iter()
-        .filter_map(|law| {
-            let hash = *hashes.laws.get(law.index)?;
-            Some(Written {
-                key: law.key.as_str().to_string(),
-                text: hashes.law_texts.get(law.index).copied().unwrap_or(hash),
-                mentions: hashes
-                    .deps
-                    .get(&law.key)
-                    .into_iter()
-                    .flatten()
-                    .map(|name| name.as_str().to_string())
-                    .collect(),
-            })
-        })
-        .collect()
 }
 
 fn verdicts_of(report: &ProveReport, warnings: Vec<Diagnostic>) -> Verdicts {
@@ -1397,38 +1243,6 @@ fn collection_value(collection: Collection) -> PlyValue {
     record(vec![
         ("places", places_value(&collection.sources)),
         ("warnings", diags_value(&collection.warnings)),
-        (
-            "defs",
-            PlyValue::list(
-                collection
-                    .defs
-                    .iter()
-                    .map(|d| {
-                        record(vec![
-                            ("name", PlyValue::str(&d.name)),
-                            ("hash", option(d.hash.map(|h| PlyValue::str(h.to_hex())))),
-                            ("specs", hashes_value(&d.specs)),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-        (
-            "laws",
-            PlyValue::list(
-                collection
-                    .laws
-                    .iter()
-                    .map(|w| {
-                        record(vec![
-                            ("key", PlyValue::str(&w.key)),
-                            ("text", PlyValue::str(w.text.to_hex())),
-                            ("mentions", strings(w.mentions.iter().map(String::as_str))),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
         ("plan", plan_value(&collection.plan)),
     ])
 }
@@ -1674,6 +1488,12 @@ fn tally(n: u64) -> PlyValue {
     PlyValue::Int(n as i64)
 }
 
+/// A size past what an `Int` holds is the largest one: the walk only takes a strictly smaller
+/// candidate, and a size that wrapped would read as smaller than every other.
+fn size_value(size: u64) -> PlyValue {
+    PlyValue::Int(i64::try_from(size).unwrap_or(i64::MAX))
+}
+
 /// Milliseconds to three places, which is what both reports publish as `duration_ms`.
 fn millis(d: std::time::Duration) -> PlyValue {
     let ms = (d.as_secs_f64() * 1_000_000.0).round() / 1000.0;
@@ -1872,7 +1692,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
         world: World::default(),
         obligations: Vec::new(),
         use_cache: !bool_at("no_cache")?,
-        std: bool_at("std")?,
         jobs: opt_int_at(v, "jobs", span)?.map(|n| n as u32),
         plan: crate::simulation::prove_plan(&prove_opts, &sim_opts),
         binding,
