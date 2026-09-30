@@ -1333,6 +1333,7 @@ pub type Heard = Said(String) | Quiet | Closed
 
 pub nondet effect process {
   read  args[p]()             -> List<String>
+  read  bound[e]()            -> Bool
   write out[p](text: String)  -> Unit
   write err[p](text: String)  -> Unit
   write line[p]()             -> Option<String>
@@ -1367,6 +1368,9 @@ but the executable: `--exec cc=/usr/bin/cc` binds one program to `cc`, and
 executable bound is `E0456`, and an `--exec` path that is missing, is not a file
 or has no execute bit is `E0457` before anything runs. Nothing in the call names
 a program, so the run decides what a footprint's `process.spawn[cc]` may do.
+`bound` answers whether the run bound a program to its label, so a program that
+can do without one asks `process.bound[cc]()` rather than ending at `E0456`; the
+table is settled before anything runs, so the answer holds for the whole run.
 
 `args` is the argument vector after the program; `dir` is the working
 directory, and `""` is the run's own. `env` is the *whole* environment: a spawn
@@ -1384,6 +1388,8 @@ hands out planned `Finished` values in order and records each `Launch`; a spawn
 with no reply planned answers `Exited(127)`, as a shell does for a command it
 could not run. Build replies with `exited(code, out, err)` and
 `signalled(signal, out, err)`, and read one back with `exit_code`.
+`runs_bound_step` answers `bound`: `true` once a reply is planned, unless the
+test sets the twin's `bound`, and no spawn changes it.
 
 `start` launches a child beside the program, by the same label, `dir` and `env`
 rules, and answers its handle — an `Int`, as a socket's is — or `Err` with why
@@ -1426,9 +1432,10 @@ Handle the children over a `Children` value: `children(planned)` hands each
 `output_line` hears in order, `Closed` once that runs out — and a start with
 none planned answers `Err`. `start_step`, `wait_step`, `signal_step`,
 `input_step` and `output_line_step` each answer an `Answered` of the twin and
-what the host would have said, `end_input_step` answers the twin, and each
-`Child` records its launch, the bytes written to it, whether its input is open
-and the signals it was sent. A `Kill` ends a scripted child, so the next `wait` hands it back, and
+what the host would have said, `end_input_step` answers the twin, `bound_step`
+answers `bound` as `runs_bound_step` does, `true` once a script is planned, and
+each `Child` records its launch, the bytes written to it, whether its input is
+open and the signals it was sent. A `Kill` ends a scripted child, so the next `wait` hands it back, and
 a spent or unknown handle panics, as the host refuses one.
 
 ### 13.10 `std.time`

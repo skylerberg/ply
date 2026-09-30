@@ -187,6 +187,47 @@ fn main() -> Int / {process.read[proc]} = len(process.args[proc]())
     assert_eq!(v["value"], "2");
 }
 
+/// Says, for two labels, whether the run bound a program to each; it starts neither.
+const ASKS_WHAT_IS_BOUND: &str = r#"
+import std.process (process)
+
+fn said(label: String, bound: Bool) -> String =
+  label ++ (if bound { " is bound" } else { " is not bound" })
+
+fn main() -> Unit / {process.bound[sh], process.bound[cc], process.out[proc]} = {
+  process.out[proc](said("sh", process.bound[sh]()));
+  process.out[proc](said("cc", process.bound[cc]()))
+}
+"#;
+
+#[test]
+fn bound_answers_from_the_exec_table_the_run_was_given() {
+    let dir = project(ASKS_WHAT_IS_BOUND);
+    for (exec, sh) in [
+        (&["--exec", "sh=/bin/sh"][..], "sh is bound"),
+        (&[][..], "sh is not bound"),
+    ] {
+        let out = ply(dir.path())
+            .args(["run", "m.ply", "--host"])
+            .args(exec)
+            .output()
+            .unwrap();
+        let stdout = text_of(&out.stdout);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{stdout}\n{}",
+            text_of(&out.stderr)
+        );
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(lines.contains(&sh), "run with {exec:?}:\n{stdout}");
+        assert!(
+            lines.contains(&"cc is not bound"),
+            "run with {exec:?}:\n{stdout}"
+        );
+    }
+}
+
 /// Starts a child that says its pid and sleeps, says that pid, then ends as `ENDING` says.
 const LEAVES_A_CHILD: &str = r#"
 import std.process

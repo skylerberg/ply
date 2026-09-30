@@ -20,7 +20,7 @@ cargo build --release --quiet --manifest-path "$root/Cargo.toml" \
 program=$("$root/benches/corpus-program.sh" "$bin/ply" "$bin/corpus-program")
 
 # The program starts only what is bound here, so the floor its served tables are compared with is
-# built here too; `CORPUS_BOUND` names the labels bound, since starting an unbound one ends the run.
+# built here too.
 floor="$root/benches/http-floor/floor.c"
 if [ "$floor" -nt "$bin/http-floor" ]; then
   cc -O2 -o "$bin/http-floor" "$floor" -lpthread
@@ -28,5 +28,4 @@ fi
 
 exec "$bin/ply" run "$program" --host --allow machine --allow claims \
   --exec "ply=$bin/ply" --exec "executor=$bin/ply-corpus" --exec "http_floor=$bin/http-floor" \
-  --set CORPUS_BOUND=http_floor \
   --fs work=. --fs "repo=$root" -- "$@"
