@@ -211,6 +211,8 @@ pub struct ProcessHost {
     pool: Pool,
     /// Held nowhere else, so the children go when the host does.
     children: Arc<Children>,
+    /// Whether the run is a process of its own; one that is not only starts other programs.
+    whole: bool,
 }
 
 impl ProcessHost {
@@ -222,7 +224,24 @@ impl ProcessHost {
             executables: Executables::new(),
             pool: Pool::new(PROCESS_FIRST_TOKEN),
             children: Arc::new(Children::new()),
+            whole: true,
         }
+    }
+
+    /// A host for a run that is not itself a process, such as a test: it starts and drives the
+    /// programs `executables` binds, and its own arguments, streams, input and exit code stay
+    /// withheld.
+    pub fn spawning(executables: Executables) -> ProcessHost {
+        ProcessHost {
+            whole: false,
+            ..ProcessHost::new(Vec::new(), Sink::captured())
+        }
+        .executing(executables)
+    }
+
+    /// Whether this host serves `op`, rather than leaving it withheld.
+    pub fn serves(&self, op: Op) -> bool {
+        self.whole || op.names_an_executable()
     }
 
     pub fn executing(self, executables: Executables) -> ProcessHost {
@@ -304,12 +323,27 @@ pub fn registrations(host: Option<&Arc<ProcessHost>>) -> Vec<(HostOp, Arc<dyn Ho
         .collect()
 }
 
-/// Withheld without a host, so a run that was given no arguments never binds a process it is not.
+/// Where an operation about the run's own process is served, for a refusal to say.
+pub const ONLY_A_RUN: &str =
+    "under `ply run --host`, and `ply test` withholds it whether or not `--host` was passed";
+
+/// Where an operation on a program `--exec` binds is served.
+const AN_EXECUTABLE: &str = "under `--host` for a label `--exec` binds to a program";
+
+/// Withheld without a host, so a run that was given no arguments never binds a process it is not;
+/// a host that only starts programs withholds what is about the run's own process.
 pub fn register(registry: &mut HostRegistry, host: Option<&Arc<ProcessHost>>) {
-    for (op, handler) in registrations(host) {
+    for (op, (declared, handler)) in Op::ALL.into_iter().zip(registrations(host)) {
         match host {
-            Some(_) => registry.register(op, handler),
-            None => registry.register_withheld(op, handler),
+            Some(host) if host.serves(op) => registry.register(declared, handler),
+            _ => {
+                let served = if op.names_an_executable() {
+                    AN_EXECUTABLE
+                } else {
+                    ONLY_A_RUN
+                };
+                registry.register_withheld(declared, handler, served)
+            }
         }
     }
 }
@@ -409,6 +443,20 @@ impl Op {
             Op::Wait | Op::Signal | Op::Input | Op::OutputLine => 2,
             Op::Spawn => 3,
             Op::Start => 4,
+        }
+    }
+
+    /// Labelled by the program `--exec` bound rather than by the run's own process.
+    pub fn names_an_executable(self) -> bool {
+        match self {
+            Op::Spawn
+            | Op::Start
+            | Op::Wait
+            | Op::Signal
+            | Op::Input
+            | Op::EndInput
+            | Op::OutputLine => true,
+            Op::Args | Op::Out | Op::Err | Op::Line | Op::Exit => false,
         }
     }
 

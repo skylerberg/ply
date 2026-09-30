@@ -1,9 +1,9 @@
 use crate::fixture::Compiled;
+use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Plan, Value};
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::Store;
 use ply_test::{Hosting, InterpExecutor, Record, RunReport, Search};
@@ -90,8 +90,7 @@ fn bind(compiled: &Compiled, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> Ar
 }
 
 fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>>) -> RunReport {
-    let selection =
-        crate::fixture::select(&compiled.check, &compiled.hashes, store, &Plan::default());
+    let selection = compiled.every();
     let hosting = match binding {
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
@@ -141,13 +140,19 @@ fn documents_two_tests_a_writing_handler_couples_are_scheduled_into_one_group() 
         )],
     );
 
+    let footprints = compiled.footprints();
+    assert!(
+        !footprints[0].conflicts_with(&footprints[1]),
+        "both declare a read, so nothing a scheduler colours from keeps them apart"
+    );
+
     let report = run(&compiled, &mut store, Some(&binding));
 
     assert_eq!(report.failed, 0, "{:?}", report.failures);
     assert_eq!(report.passed, 2);
     assert_eq!(
         report.results[0].group, report.results[1].group,
-        "two tests that share a resource one of them writes were put in one concurrency group"
+        "two tests that share a resource one of them writes ran in one concurrency group"
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -197,10 +202,10 @@ fn a_det_pass_over_a_lying_deterministic_handler_is_never_written_to_the_cache()
             Some(Record::Host),
             "attempt {attempt}: a host-backed pass was recorded under a cache key"
         );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            attempt,
-            "attempt {attempt}: the test was skipped, so a lie was cached as a truth"
+        assert_eq!(calls.load(Ordering::SeqCst), attempt, "attempt {attempt}");
+        assert!(
+            store.get(compiled.hashes.tests[0]).is_none(),
+            "attempt {attempt}: a lie was filed as a truth under the key the run was handed"
         );
     }
 
@@ -479,17 +484,8 @@ test "the regression" { assert_eq(ask(1), expected()) }
     );
     // Suspects need no run: they are the closure intersected with what changed.
     assert!(
-        report.failures[0]
-            .attribution
-            .suspects
-            .iter()
-            .any(|s| s.name == Symbol::new("m.ask")),
+        report.failures[0].suspects.contains(&Symbol::new("m.ask")),
         "the suspect set was thrown away with the search: {:?}",
-        report.failures[0]
-            .attribution
-            .suspects
-            .iter()
-            .map(|s| s.name.clone())
-            .collect::<Vec<_>>()
+        report.failures[0].suspects
     );
 }

@@ -154,31 +154,48 @@ impl Loaded {
     }
 
     /// Every root-package definition named `main`. A dependency's `main` is its own business:
-    /// only the package being loaded offers an entry point. A project without packages keeps the
-    /// old rule, every module the toolchain does not ship.
+    /// only the package being loaded offers an entry point.
     pub fn entry_points(&self) -> Vec<&DefInfo> {
         let main = Symbol::new("main");
-        let packaged = !self.front.packages.is_empty();
-        let roots: std::collections::HashSet<String> = self
-            .front
-            .ordinals
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.front.mod_pkg.get(*i) == Some(&0))
-            .map(|(_, (module, _))| module.to_string())
-            .collect();
+        let root = self.root_package();
         self.check
             .defs
             .values()
-            .filter(|d| {
-                d.simple_name == main
-                    && if packaged {
-                        roots.contains(d.module.as_str())
-                    } else {
-                        !crate::shelf::is_shipped(&d.module)
-                    }
-            })
+            .filter(|d| d.simple_name == main && root.contains(&d.module))
             .collect()
+    }
+
+    /// Which modules are the package being loaded, rather than a dependency or the shelf: what a
+    /// run offers as an entry point and what a test run tests. A project without packages is every
+    /// module the toolchain does not ship.
+    pub fn root_package(&self) -> RootPackage {
+        let packaged = !self.front.packages.is_empty();
+        RootPackage {
+            modules: packaged.then(|| {
+                self.front
+                    .ordinals
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| self.front.mod_pkg.get(*i) == Some(&0))
+                    .map(|(_, (module, _))| module.to_string())
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// The modules of the package being loaded.
+pub struct RootPackage {
+    /// `None` for a project without packages.
+    modules: Option<std::collections::HashSet<String>>,
+}
+
+impl RootPackage {
+    pub fn contains(&self, module: &ModuleName) -> bool {
+        match &self.modules {
+            Some(modules) => modules.contains(module.as_str()),
+            None => !crate::shelf::is_shipped(module),
+        }
     }
 }
 
@@ -194,9 +211,9 @@ pub fn project_root(path: &Path) -> PathBuf {
     }
 }
 
-/// The from-scratch path: no cache is read and none is written.
+/// A program's load of a program of its own, from scratch: no cache is read and none is written.
 pub fn load(path: &Path) -> Result<Loaded, LoadError> {
-    crate::driver::load_full(path)
+    crate::driver::run(path)
 }
 
 pub(crate) struct Discovered {

@@ -4,7 +4,7 @@
 
 import args (Flags, from_argv, style_of)
 import claims
-import program (Front, Timed, front_of, timed_load)
+import program (Front, Timed, front_of, timed_load, timed_uncached)
 import proof.domain (finite, name_of)
 import proof.shrink (Ask, Descent, Offer, Offered, Reply, Take, Taken, Tries, Would, descend)
 import proof.obligation (Binding, Frame, Gap, Held, Outcome, Pure, Raised, ReachesHost, Refuted,
@@ -18,6 +18,7 @@ import claims (Binder, Measured, Settled, Typed, measured, Options, prover, Clai
 import proof.obligation (Coverage, Ensures, Example, Fresh, FromProof, Kind, Law, Property, Proved,
                          Tier, reason_word)
 import builder (builder)
+import cache (store)
 import std.fs (fs)
 import std.time (time)
 import compiler.resolve (Diag)
@@ -186,7 +187,13 @@ fn document(
     { key: "filtered_out", value: num(filtered_out) },
     { key: "duration_ms", value: Number(v.duration_ms) },
     { key: "summary", value: summary_json(rows) },
-    { key: "obligations", value: Array(map(rows, |r: Row| obligation_json(r, c.places))) },
+    {
+      key: "obligations",
+      value: Array(
+        map(rows, |r: Row|
+          obligation_json(r, c.places, match v.reaches { Some(_) -> true, None -> false })),
+      ),
+    },
     { key: "diagnostics", value: all_to_json(diagnostics_of(rows), c.places) },
     { key: "warnings", value: all_to_json(warnings, c.places) },
   ])
@@ -217,18 +224,36 @@ fn asked(
   flags: Flags,
   c: Collection,
   use_cache: Bool,
-) -> Answer / {prover.discharged[claims], prover.record[claims], prover.outcomes[claims], prover.typed[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} = {
+) -> Answer / {prover.discharged[claims], prover.record[claims], prover.outcomes[claims], prover.typed[claims], prover.reaches[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} = {
   let wanted = wanted_of(c.claims, flags);
   match decided(c, wanted, use_cache) {
     Err(why) -> refusal(s, "prove", why),
-    Ok(v) -> {
-      // A counterexample is not finished when it is found: the walk that makes it small is this
-      // side's, and it runs before anything is read.
-      let v = { ..v, outcomes: walked(c.claims, wanted, v, c.plan.shrink_budget) };
-      answered(s, flags, c, rows_of(c.claims, wanted, v), v, len(c.claims) - len(wanted))
+    Ok(decision) -> match reached(decision, wanted, flags.reach) {
+      Err(why) -> refusal(s, "prove", why),
+      Ok(v) -> {
+        // A counterexample is not finished when it is found: the walk that makes it small is this
+        // side's, and it runs before anything is read.
+        let v = { ..v, outcomes: walked(c.claims, wanted, v, c.plan.shrink_budget) };
+        answered(s, flags, c, rows_of(c.claims, wanted, v), v, len(c.claims) - len(wanted))
+      },
     },
   }
 }
+
+/// What the static tier alone answers for every claim the run reports on, when `--reach` asks:
+/// asked of the static tier whether the cache or a discharge answered the claim, so a cached run
+/// reports what a fresh one does.
+fn reached(
+  v: Verdicts,
+  wanted: List<Int>,
+  asked: Bool,
+) -> Result<Verdicts, Refusal> / {prover.reaches[claims]} =
+  if !asked { Ok(v) } else {
+    match prover.reaches[claims](wanted) {
+      Err(why) -> Err(why),
+      Ok(answered) -> Ok({ ..v, reaches: Some(answered) }),
+    }
+  }
 
 /// Every counterexample walked down before it is read: a refutation keeps the draw it failed at and
 /// gains the tuple the walk settled on, and a raise keeps its gap and gains its own.
@@ -320,9 +345,10 @@ fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) ->
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.outcomes[claims], prover.typed[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.outcomes[claims], prover.typed[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims], store.known[cache], store.file[cache], prover.reaches[claims]} = {
   let s: Style = style_of(flags);
-  let t: Timed = timed_load(flags.paths);
+  let t: Timed = if options.no_incremental { timed_uncached(flags.paths) }
+  else { timed_load(flags.paths) };
   match t.program.whole {
     // A load refusal is the same kind of answer the machine's own refusals are, so it
     // reads through the one renderer: nothing was proved, and the diagnostics say why.
@@ -337,7 +363,7 @@ fn prove_over(
   flags: Flags,
   options: Options,
   front: Front,
-) -> Answer / {prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.outcomes[claims], prover.typed[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} = {
+) -> Answer / {prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.outcomes[claims], prover.typed[claims], prover.reaches[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} = {
   prover.configure[claims](options, front);
   match prover.collected[claims]() {
     Err(why) -> refusal(s, "prove", why),
@@ -349,7 +375,8 @@ fn prove_over(
 
 /// The front end a test's run is handed: these tests read what a report says about a run it was
 /// given, so nothing loads, and the record exists only because the effect takes one.
-fn no_front() -> Front = { dump: b"", files: [], packages: [], read_ms: 0, front_ms: 0 }
+fn no_front() -> Front =
+  { dump: b"", files: [], read_ms: 0, front_ms: 0, file_ms: 0, cached: false }
 
 // One definition per claim's owner, each carrying no spec of its own.
 fn a_collection(cs: List<Claim>) -> Collection =
@@ -377,6 +404,15 @@ fn held_over(
   c: Result<Collection, Refusal>,
   v: Result<Discharged, Refusal>,
   held: List<Option<String>>,
+) -> Answer = reached_over(flags, c, v, held, None)
+
+// The same, with the static tier answering `reach` for every claim it is asked about.
+fn reached_over(
+  flags: Flags,
+  c: Result<Collection, Refusal>,
+  v: Result<Discharged, Refusal>,
+  held: List<Option<String>>,
+  reach: Option<claims::Reach>,
 ) -> Answer =
   handle {
     prove_over(style_of(flags), flags, claims::no_options(), no_front())
@@ -386,6 +422,7 @@ fn held_over(
     prover.outcomes[claims](keys) -> held,
     // A fixture's types are not what a report reads: no domain is measured, so every claim samples.
     prover.typed[claims]() -> Ok({ decls: [], claims: [] }),
+    prover.reaches[claims](asked) -> Ok(map(asked, |_i: Int| reach)),
     // A fixture's claims have no runtime-held values, so there is nothing to walk.
     prover.shrink[claims](claim) -> Ok(None),
     prover.offers[claims](i) -> Ok(None),
@@ -507,6 +544,42 @@ fn sampled() -> List<Outcome> =
       evidence: Sampled({ generated: 200, kept: 200, rejected: 0, roots: [0], instantiations: [] }),
     }),
   ]
+
+// What the static tier alone answers is a measurement a run asks for, of every claim it reports on:
+// a claim the cache answered is asked like one a discharge answered.
+test "under `--reach` each obligation carries what the static tier answered and where it stopped" {
+  let reach = {
+    decision: "open",
+    steps: 12,
+    blockers: [{ kind: "division", about: None }, { kind: "recursive_call", about: Some("m.f") }],
+  };
+  let said = "\"reach\":{\"blockers\":[{\"about\":null,\"kind\":\"division\"},{\"about\":\"m.f\",\"kind\":\"recursive_call\"}],\"decision\":\"open\",\"steps\":12}";
+  let asked = from_argv("prove", ["--json", "--reach"]);
+  let fresh = reached_over(
+    asked,
+    Ok(a_collection(one_claim())),
+    Ok(verdicts(sampled())),
+    [None, None],
+    Some(reach),
+  );
+  assert(string_contains(to_string(fresh.json), said));
+  let cached = reached_over(
+    asked,
+    Ok(a_collection(one_claim())),
+    Ok(verdicts(sampled())),
+    [None, Some("sample")],
+    Some(reach),
+  );
+  assert(string_contains(to_string(cached.json), "\"cached\":1"));
+  assert(string_contains(to_string(cached.json), said));
+  // Unasked, no claim carries a reach at all.
+  let unasked = proved_over(
+    from_argv("prove", ["--json"]),
+    Ok(a_collection(one_claim())),
+    Ok(verdicts(one_proved())),
+  );
+  assert(!string_contains(to_string(unasked.json), "\"reach\""))
+}
 
 test "a sample under its plan's key is read back as a cached sample, and counted as one" {
   let answer = held_over(
