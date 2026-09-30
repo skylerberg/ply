@@ -3,11 +3,9 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Plan, Value};
-use ply_span::{Diagnostic, SourceId, Symbol};
+use ply_eval::{Diagnostic, Resource, SourceId, Symbol, Value};
 use ply_store::Store;
 use ply_test::{Hosting, InterpExecutor, Record, RunReport, Search};
-use ply_ty::Resource;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -90,8 +88,7 @@ fn bind(compiled: &Compiled, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> Ar
 }
 
 fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>>) -> RunReport {
-    let selection =
-        crate::fixture::select(&compiled.check, &compiled.hashes, store, &Plan::default());
+    let selection = compiled.every();
     let hosting = match binding {
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
@@ -141,13 +138,19 @@ fn documents_two_tests_a_writing_handler_couples_are_scheduled_into_one_group() 
         )],
     );
 
+    let footprints = compiled.footprints();
+    assert!(
+        !footprints[0].conflicts_with(&footprints[1]),
+        "both declare a read, so nothing a scheduler colours from keeps them apart"
+    );
+
     let report = run(&compiled, &mut store, Some(&binding));
 
     assert_eq!(report.failed, 0, "{:?}", report.failures);
     assert_eq!(report.passed, 2);
     assert_eq!(
         report.results[0].group, report.results[1].group,
-        "two tests that share a resource one of them writes were put in one concurrency group"
+        "two tests that share a resource one of them writes ran in one concurrency group"
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -197,10 +200,10 @@ fn a_det_pass_over_a_lying_deterministic_handler_is_never_written_to_the_cache()
             Some(Record::Host),
             "attempt {attempt}: a host-backed pass was recorded under a cache key"
         );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            attempt,
-            "attempt {attempt}: the test was skipped, so a lie was cached as a truth"
+        assert_eq!(calls.load(Ordering::SeqCst), attempt, "attempt {attempt}");
+        assert!(
+            store.get(compiled.hashes.tests[0]).is_none(),
+            "attempt {attempt}: a lie was filed as a truth under the key the run was handed"
         );
     }
 
@@ -222,7 +225,7 @@ fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
             req: &HostRequest<'_>,
         ) -> Result<HostAnswer, Diagnostic> {
             Err(
-                Diagnostic::error(ply_span::codes::INTERNAL_ERROR, "the evaluator is broken")
+                Diagnostic::error(ply_eval::codes::INTERNAL_ERROR, "the evaluator is broken")
                     .primary(req.span, "here"),
             )
         }
@@ -251,7 +254,7 @@ fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
     assert_eq!(report.failed, 1);
     assert_eq!(
         report.failures[0].diagnostic.code,
-        ply_span::codes::RUNTIME_ERROR,
+        ply_eval::codes::RUNTIME_ERROR,
         "a handler's chosen code decided how this failure is classified"
     );
     assert_eq!(
@@ -299,7 +302,7 @@ fn the_same_det_test_is_refused_hermetically() {
     assert_eq!(report.failed, 1);
     assert_eq!(
         report.failures[0].diagnostic.code,
-        ply_span::codes::HERMETIC_BOUNDARY,
+        ply_eval::codes::HERMETIC_BOUNDARY,
         "the shape `ply test` uses names the handler that would have served this"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -308,7 +311,7 @@ fn the_same_det_test_is_refused_hermetically() {
     assert_eq!(report.failed, 1);
     assert_eq!(
         report.failures[0].diagnostic.code,
-        ply_span::codes::UNHANDLED_EFFECT,
+        ply_eval::codes::UNHANDLED_EFFECT,
         "a binding carrying no registry cannot tell a hermetic refusal from a front-end bug"
     );
 }
@@ -339,7 +342,7 @@ fn an_operation_a_partial_clause_set_leaves_is_refused_by_the_checker() {
     );
     assert_eq!(
         diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
-        [ply_span::codes::HANDLER_CLAUSE_MISSING],
+        [ply_eval::codes::HANDLER_CLAUSE_MISSING],
         "{diagnostics:?}"
     );
 }
@@ -479,17 +482,8 @@ test "the regression" { assert_eq(ask(1), expected()) }
     );
     // Suspects need no run: they are the closure intersected with what changed.
     assert!(
-        report.failures[0]
-            .attribution
-            .suspects
-            .iter()
-            .any(|s| s.name == Symbol::new("m.ask")),
+        report.failures[0].suspects.contains(&Symbol::new("m.ask")),
         "the suspect set was thrown away with the search: {:?}",
-        report.failures[0]
-            .attribution
-            .suspects
-            .iter()
-            .map(|s| s.name.clone())
-            .collect::<Vec<_>>()
+        report.failures[0].suspects
     );
 }

@@ -1,8 +1,7 @@
 //! The program a unit compiles out of: the front end's answer over it, and each module's text.
 //! Every table here is read from a [`Front`].
 
-use ply_span::{SourceId, SourceMap, Span, Symbol};
-use ply_ty::Front;
+use ply_eval::{Front, SourceId, SourceMap, Span, Symbol};
 use std::collections::{HashMap, HashSet};
 use std::sync::{PoisonError, RwLock};
 
@@ -82,12 +81,12 @@ impl Tables {
                 t.modules.push((module.clone(), info.source));
             }
         }
-        // Each root's span, which the emitter's own frame carries. The root name the frame holds is
-        // the name a site is reported under, so nothing here rebuilds one.
+        // Each root's span, which the emitter's own row carries. The root name the row holds is the
+        // name a site is reported under, so nothing here rebuilds one.
         t.spans = front
             .emitter_roots
             .iter()
-            .filter_map(|r| r.span.map(|span| (r.root.to_string(), span)))
+            .map(|r| (r.root.to_string(), r.span))
             .collect();
         t
     }
@@ -104,7 +103,7 @@ impl Tables {
 }
 
 /// The prelude's constructors, then each module's in program order, as the compiler emits them:
-/// not `CheckOutput::ctors`' dependency order, or emitted tags would move with the import graph.
+/// not the checker's dependency order, or emitted tags would move with the import graph.
 fn ctors_of(front: &Front) -> Vec<(Symbol, usize)> {
     front.emitter_ctors.clone()
 }

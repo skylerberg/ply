@@ -3,9 +3,7 @@
 use crate::rt::Entry;
 use crate::source::Source;
 use anyhow::{Context, Result, bail};
-use ply_eval::{Compilation, Counters, Entered, Provider, Value};
-use ply_span::{Diagnostic, Symbol};
-use ply_ty::DefHash;
+use ply_eval::{Compilation, Counters, DefHash, Diagnostic, Entered, Provider, Symbol, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -46,7 +44,8 @@ impl Declines {
 
 /// One run's compiled unit, shared by every worker's backend.
 pub struct Unit {
-    /// [`ply_ty::HashOutput::digest`] of the program this was built over, for `Compiled::describes`.
+    /// [`ply_eval::Front::hashes_digest`] of the program this was built over, for
+    /// `Compiled::describes`.
     identity: DefHash,
     source: &'static Source,
     /// The set the emitter compiles as one unit, closed under calls.
@@ -69,11 +68,11 @@ pub struct Unit {
 impl Unit {
     /// `texts` is each module's source by name, which the cache keys cover.
     pub fn over_front(
-        front: &ply_ty::Front,
+        front: &ply_eval::Front,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
         let identity = front.hashes_digest;
-        let front: &'static ply_ty::Front = Box::leak(Box::new(front.clone()));
+        let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
         let source: &'static Source =
             Box::leak(Box::new(Source::from_front(front).with_texts(texts)));
         let candidates = source.functions();
@@ -103,10 +102,10 @@ impl Unit {
     }
 
     /// An artifact's unit, produced elsewhere; loaded once here to read its table.
-    pub fn embedded(front: &ply_ty::Front, text: String) -> Result<&'static Unit> {
+    pub fn embedded(front: &ply_eval::Front, text: String) -> Result<&'static Unit> {
         let exports = crate::c::Exports::read(&crate::c::compile_and_load(&text, "artifact")?)?;
         let identity = front.hashes_digest;
-        let front: &'static ply_ty::Front = Box::leak(Box::new(front.clone()));
+        let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
         let source: &'static Source = Box::leak(Box::new(Source::from_front(front)));
         let compiled = exports.names();
         let members: BTreeSet<Symbol> = compiled
@@ -223,7 +222,7 @@ impl Provider for Unit {
         self.poisoned()
     }
 
-    fn relocate(&self, front: &ply_ty::Front, sources: &ply_span::SourceMap) -> bool {
+    fn relocate(&self, front: &ply_eval::Front, sources: &ply_eval::SourceMap) -> bool {
         self.source.relocate(front, sources)
     }
 }
@@ -403,8 +402,8 @@ impl Bodies {
             let raised = if ctx.failed == crate::rt::FAILED_OUT_OF_FUEL {
                 // Tier-only: no machine follows, so the budget is reported from here.
                 Some(
-                    ply_span::Diagnostic::error(
-                        ply_span::codes::RUNTIME_ERROR,
+                    ply_eval::Diagnostic::error(
+                        ply_eval::codes::RUNTIME_ERROR,
                         format!("recursion limit of {fuel} nested calls exceeded"),
                     )
                     .primary(ctx.site(), "the call that overran it"),
@@ -412,8 +411,8 @@ impl Bodies {
             } else {
                 ctx.diagnostic.take().or_else(|| {
                     (ctx.failed == crate::rt::FAILED_UNWIND).then(|| {
-                        ply_span::Diagnostic::error(
-                            ply_span::codes::RUNTIME_ERROR,
+                        ply_eval::Diagnostic::error(
+                            ply_eval::codes::RUNTIME_ERROR,
                             "a `handle` clause unwound past the compiled fragment's entry",
                         )
                     })
@@ -501,7 +500,7 @@ impl ply_eval::Compiled for Bodies {
     }
 
     // A borrowed context means a nested entry, which `run` declines, so there is nothing to take.
-    fn take_performed(&self) -> Vec<ply_ty::EffectAtom> {
+    fn take_performed(&self) -> Vec<ply_eval::EffectAtom> {
         self.ctx
             .try_borrow_mut()
             .map(|mut ctx| std::mem::take(&mut ctx.performed))
@@ -540,7 +539,7 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
-    fn set_declared(&self, declared: Option<ply_ty::Footprint>) {
+    fn set_declared(&self, declared: Option<ply_eval::Footprint>) {
         if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
             ctx.declared = declared;
         }
@@ -562,7 +561,7 @@ impl ply_eval::Compiled for Bodies {
         )
     }
 
-    fn take_teardown(&self) -> Vec<ply_span::Diagnostic> {
+    fn take_teardown(&self) -> Vec<ply_eval::Diagnostic> {
         self.ctx
             .try_borrow_mut()
             .map(|mut ctx| std::mem::take(&mut ctx.teardown))

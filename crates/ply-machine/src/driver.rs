@@ -7,12 +7,13 @@ use crate::load::{
     unreadable,
 };
 use ply_codegen::c::producer;
-use ply_eval::Value as PlyValue;
 use ply_eval::decode::{self, At};
+use ply_eval::{
+    Diagnostic, Front, ModuleInfo, ModuleName, SourceId, SourceMap, Span, Symbol,
+    Value as PlyValue, codes,
+};
 use ply_prove::prove::{Claims, read_claims};
-use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_store::{ContentHash, Store};
-use ply_ty::{Front, ModuleInfo, ModuleName};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,23 +37,25 @@ pub struct FrontEnd {
     pub warnings: Vec<Diagnostic>,
 }
 
-/// The front end a CLI ran and handed over: the compiler's frames, every source they name in the
+/// The front end a CLI ran and handed over: the compiler's answer, every source it names in the
 /// order its ids run, what the CLI's own load cost, and whether it read and filed the front-end
 /// cache for it. This side reads the answer rather than walking and analysing again.
 #[derive(Clone, Debug)]
 pub struct HandedFront {
-    pub dump: String,
+    pub answer: Front,
     pub files: Vec<FrontFile>,
     pub read: Duration,
+    /// The CLI's front end, and reading its answer here.
     pub front: Duration,
     pub write_back: Duration,
     pub cached: bool,
 }
 
+/// The answer is read as it is handed over: a `Value` may not cross to another thread, and the load
+/// it is for runs on a machine's own. [`load_over_front`] adds the files to a fresh map in order, so
+/// file `i` is `SourceId(i)`.
 pub fn handed_front_of(v: &ply_eval::Value, span: Span) -> Result<HandedFront, Diagnostic> {
     use crate::payload::field_of;
-    let dump = String::from_utf8_lossy(field_of(v, "dump", span)?.as_bytes(span, "the frames")?)
-        .into_owned();
     let mut files = Vec::new();
     for item in field_of(v, "files", span)?.as_list(span, "files")?.iter() {
         let text = String::from_utf8_lossy(field_of(item, "text", span)?.as_bytes(span, "a text")?)
@@ -71,11 +74,15 @@ pub fn handed_front_of(v: &ply_eval::Value, span: Span) -> Result<HandedFront, D
         let ms = field_of(v, name, span)?.as_int(span, name)?;
         Ok(Duration::from_millis(u64::try_from(ms).unwrap_or(0)))
     };
+    let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
+    let started = Instant::now();
+    let answer = ply_codegen::c::dump::read(field_of(v, "dump", span)?, &ids)
+        .map_err(|e| port_failed(&format!("the front end's answer does not read: {e}")))?;
     Ok(HandedFront {
-        dump,
+        answer,
         files,
         read: millis("read_ms")?,
-        front: millis("front_ms")?,
+        front: millis("front_ms")? + started.elapsed(),
         write_back: millis("file_ms")?,
         cached: field_of(v, "cached", span)?.as_bool(span, "whether the load was cached")?,
     })
@@ -91,7 +98,7 @@ pub struct FrontFile {
 }
 
 /// The load over a front end a caller already ran: `ply test` walks the tree and runs the compiler
-/// in order to report on both, so this side is handed the answer — the frames, and every source
+/// in order to report on both, so this side is handed the answer — the tables, and every source
 /// they name in the order their ids run — rather than walking and analysing a second time.
 pub fn load_over_front(path: &Path, handed: &HandedFront) -> Result<Loaded, LoadError> {
     let mut sources = SourceMap::new();
@@ -115,7 +122,7 @@ pub fn load_over_front(path: &Path, handed: &HandedFront) -> Result<Loaded, Load
     Driver {
         root: project_root(path),
         incremental: handed.cached,
-        answer: Some(handed.dump.clone()),
+        answer: Some(handed.answer.clone()),
         project: SourceMap::new(),
         manifest: None,
         packages: Vec::new(),
@@ -292,10 +299,10 @@ struct FileState {
 struct Driver {
     root: PathBuf,
     incremental: bool,
-    /// The front end a caller already ran, which [`Driver::ask_the_port`] reads rather than pulls.
+    /// The front end a caller already ran, which [`Driver::ask_the_port`] takes rather than pulls.
     /// Nothing here walks or analyses when it is set: the caller did both, and the answer is the
     /// one the report is about.
-    answer: Option<String>,
+    answer: Option<Front>,
     /// The project's own files, which every placement of the shipped modules follows.
     project: SourceMap,
     /// The root's `ply.pkg`, when there is one: the front end checks it and places it last.
@@ -320,12 +327,14 @@ struct DepPackage {
 /// One package root as a walk found it: the key it is named by, and the directory its files are in.
 /// They are the same thing for a path dependency, and a fetched tree's directory for a git one.
 fn read_package(root: &str, dir: &Path) -> DepPackage {
+    // The walk records its paths tidied, so `./vendor/x` is stripped from them as `vendor/x`.
+    let dir = crate::load::tidy(dir);
     let manifest = std::fs::read_to_string(dir.join("ply.pkg")).ok();
     let files = if manifest.is_some() {
         let mut out = Vec::new();
-        if let Ok(paths) = crate::load::ply_files(dir) {
+        if let Ok(paths) = crate::load::ply_files(&dir) {
             for path in paths {
-                let Ok(relative) = path.strip_prefix(dir) else {
+                let Ok(relative) = path.strip_prefix(&dir) else {
                     continue;
                 };
                 let Ok(module) = ModuleName::from_relative_path(relative) else {
@@ -545,14 +554,8 @@ impl Driver {
     }
 
     fn ask_the_port(&mut self) -> Result<Front, LoadError> {
-        if let Some(dump) = self.answer.take() {
-            let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
-            let started = Instant::now();
-            let answer = ply_ty::read_front(&dump, &ids).map_err(|e| {
-                self.seam_failed(&format!("the front end's answer does not read: {e}"))
-            });
-            self.phases.front += started.elapsed();
-            return answer;
+        if let Some(front) = self.answer.take() {
+            return Ok(front);
         }
         ply_codegen::c::producer::ensure_default();
         let started = Instant::now();
@@ -641,7 +644,7 @@ impl Driver {
             });
         }
         let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
-        ply_ty::read_front(&pulled.dump, &ids)
+        ply_codegen::c::dump::read(&pulled.dump, &ids)
             .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))
     }
 
@@ -687,17 +690,19 @@ impl Driver {
     fn seam_failed(&self, why: &str) -> LoadError {
         LoadError {
             sources: self.sources.clone(),
-            diagnostics: vec![
-                Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    format!("the front end could not answer for this program: {why}"),
-                )
-                .primary(Span::DUMMY, "nothing was checked, so nothing is claimed")
-                .note("this is Ply's fault: the compiler's own front end is what failed here")
-                .note("the emitter comes from `crates/ply-compiler/bootstrap`; sources with no bundle are emitted by the one this binary carries"),
-            ],
+            diagnostics: vec![port_failed(why)],
         }
     }
+}
+
+fn port_failed(why: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the front end could not answer for this program: {why}"),
+    )
+    .primary(Span::DUMMY, "nothing was checked, so nothing is claimed")
+    .note("this is Ply's fault: the compiler's own front end is what failed here")
+    .note("the emitter comes from `crates/ply-compiler/bootstrap`; sources with no bundle are emitted by the one this binary carries")
 }
 
 /// `from` and every module it imports, transitively, in order.
@@ -740,12 +745,12 @@ fn module_key<'a>(
 }
 
 /// Files in load order, then items as written; the port answers dependency-first.
-fn published_order(front: &Front) -> ply_ty::CheckOutput {
+fn published_order(front: &Front) -> ply_eval::CheckOutput {
     let mut check = front.check.clone();
     let mut defs = indexmap::IndexMap::with_capacity(check.defs.len());
     for (_, items) in &front.ordinals {
         for item in items {
-            if let ply_ty::Ordinal::Fn(name, _) = item
+            if let ply_eval::Ordinal::Fn(name, _) = item
                 && let Some(info) = check.defs.shift_remove(name)
             {
                 defs.insert(name.clone(), info);

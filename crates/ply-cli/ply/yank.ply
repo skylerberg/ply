@@ -1,0 +1,135 @@
+// `ply yank NAME VERSION` — mark a published version yanked. A yank is one field of the registry's
+// index: a new resolution passes the version over, a lock that already pins it keeps it, and the
+// archive stays exactly as it was, since nothing that depends on it may break.
+
+import args (Flags, no_flags, style_of)
+import cmdline (Parsed, nth_of)
+import env (env)
+import registry (base_of, exchange, post, refused_by, said, token_variable, unasked, unset,
+                 untakeable, variable, yank_target)
+import report (Answer, ind, ok_code, reported)
+import style (green)
+import compiler.pkg (is_dotted_path)
+import compiler.resolve (Diag)
+import std.json (Json, Bool, Number, Str, object)
+import std.net (net)
+import std.pkg (parse_version)
+
+// The line's own words: which package, and which of its versions.
+pub type Opts = { name: String, version: String }
+
+pub fn options_from(p: Parsed) -> Opts =
+  { name: nth_of(p.positionals, 0, ""), version: nth_of(p.positionals, 1, "") }
+
+/// Why a line names no version a registry could hold, when it does not; both words become a path
+/// on the registry, so neither may be anything but what it claims to be.
+pub fn malformed(opts: Opts) -> Option<Diag> =
+  if !is_dotted_path(opts.name) {
+    Some(
+      untakeable("`" ++ opts.name ++ "` is not a package name", [
+        b"a package name is lower-case identifier segments joined by dots",
+      ]),
+    )
+  } else {
+    match parse_version(opts.version) {
+      None ->
+        Some(
+          untakeable("`" ++ opts.version ++ "` is not a version", [
+            b"a version reads like `0.2.0`",
+          ]),
+        ),
+      Some(_) -> None,
+    }
+  }
+
+pub fn run(
+  flags: Flags,
+  opts: Opts,
+) -> Answer / {env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]} = {
+  let s = style_of(flags);
+  match malformed(opts) {
+    Some(d) -> reported(s, "yank", [d], []),
+    None -> match env.var[sys](variable()) {
+      None ->
+        reported(s, "yank", [unset(variable(), "a yank needs the registry to send it to")], []),
+      Some(text) -> match base_of(text) {
+        Err(why) -> reported(s, "yank", [unasked(why, [])], []),
+        Ok(base) -> match env.var[sys](token_variable()) {
+          None ->
+            reported(s, "yank", [unset(token_variable(), "a yank is made under a token")], []),
+          Some(token) -> {
+            let target = yank_target(base, opts.name, opts.version);
+            match exchange(base, post(base, target, token)) {
+              Err(d) -> reported(s, "yank", [d], []),
+              Ok(answer) -> if answer.status == 200 {
+                {
+                  json: json_of(opts, base.url),
+                  lines: [
+                    ind() ++ green(s, "yanked") ++ " " ++ opts.name ++ " " ++ opts.version ++ " · "
+                      ++ base.url,
+                  ],
+                  errs: [],
+                  code: ok_code(),
+                }
+              } else {
+                reported(
+                  s,
+                  "yank",
+                  [
+                    refused_by(
+                      "yank `" ++ opts.name ++ "` " ++ opts.version,
+                      answer.status,
+                      said(answer),
+                    ),
+                  ],
+                  [],
+                )
+              },
+            }
+          },
+        },
+      },
+    },
+  }
+}
+
+fn json_of(opts: Opts, url: String) -> Json =
+  object([
+    { key: "command", value: Str("yank") },
+    { key: "ok", value: Bool(true) },
+    { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
+    { key: "name", value: Str(opts.name) },
+    { key: "version", value: Str(opts.version) },
+    { key: "registry", value: Str(url) },
+  ])
+
+// --- Tests ------------------------------------------------------------------
+
+test "a yank names a package and a version, and nothing that would leave the registry's path" {
+  assert_eq(malformed({ name: "orders", version: "0.2.0" }), None);
+  assert_eq(malformed({ name: "acme.billing", version: "10.0.1" }), None);
+  match malformed({ name: "../orders", version: "0.2.0" }) {
+    None -> panic("a name that climbs out of the registry's path was taken"),
+    Some(d) -> assert_eq(d.code, b"E0145"),
+  };
+  match malformed({ name: "orders", version: "latest" }) {
+    None -> panic("`latest` was taken for a version"),
+    Some(d) -> assert(string_contains(string_of_bytes_lossy(d.message), "is not a version")),
+  }
+}
+
+test "an unset registry is refused before anything is sent" {
+  let answer = handle {
+    run(no_flags(), { name: "orders", version: "0.2.0" })
+  } with {
+    env.var[sys](name) -> None,
+    net.connect[registry](host, port, timeout_ms) -> panic("nothing may be sent"),
+    net.connect_tls[registry](host, port, timeout_ms) -> panic("nothing may be sent"),
+    net.handshake[registry](c) -> panic("nothing may be sent"),
+    net.send[registry](c, payload, timeout_ms) -> panic("nothing may be sent"),
+    net.recv[registry](c, max, timeout_ms) -> panic("nothing may be sent"),
+    net.close[registry](c) -> panic("nothing may be sent"),
+  };
+  assert_eq(answer.code, 2);
+  assert(string_contains(match list_at(answer.errs, 0) { Some(l) -> l, None -> "" }, "E0141"))
+}

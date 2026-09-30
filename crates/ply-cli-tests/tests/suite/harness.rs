@@ -134,7 +134,7 @@ pub fn check_answer(dir: &Path) -> Value {
         }
     }
     if let Some(Value::Array(diagnostics)) = object.get_mut("diagnostics") {
-        use ply_span::codes;
+        use ply_eval::codes;
         let about_the_cache = [
             codes::CACHE_UNREADABLE,
             codes::CACHE_CORRUPT,

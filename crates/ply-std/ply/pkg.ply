@@ -1,5 +1,5 @@
-// std.pkg — the package manifest as typed data: what a `ply.pkg` file parses to, and what a
-// lockfile pins a resolution of.
+// std.pkg — the package manifest as typed data: what a `ply.pkg` file parses to, what a lockfile
+// pins a resolution of, and what a registry's index lists.
 
 import std.json
 
@@ -41,6 +41,108 @@ pub fn entry_of(m: Manifest) -> String = match m.entry { None -> "main", Some(e)
 
 pub fn render_version(v: Version) -> String =
   int_to_string(v.major) ++ "." ++ int_to_string(v.minor) ++ "." ++ int_to_string(v.patch)
+
+/// The inverse of `render_version`: three counts, dot-joined, each digits with no leading zero.
+pub fn parse_version(text: String) -> Option<Version> =
+  match string_split(text, ".") {
+    [a, b, c] -> match count_of(a) {
+      None -> None,
+      Some(major) -> match count_of(b) {
+        None -> None,
+        Some(minor) -> match count_of(c) {
+          None -> None,
+          Some(patch) -> Some({ major: major, minor: minor, patch: patch }),
+        },
+      },
+    },
+    _ -> None,
+  }
+
+// Nine digits at most, so a count never nears the top of an `Int`.
+fn count_of(text: String) -> Option<Int> = {
+  let bs = bytes_of_string(text);
+  let n = bytes_len(bs);
+  if n == 0 || n > 9 || (n > 1 && bytes_at(bs, 0) == 48) { None } else {
+    fold(range(0, n), Some(0), |acc: Option<Int>, i: Int|
+      match acc {
+        None -> None,
+        Some(v) -> {
+          let d = bytes_at(bs, i);
+          if d < 48 || d > 57 { None } else { Some(v * 10 + d - 48) }
+        },
+      })
+  }
+}
+
+// --- A registry's index ------------------------------------------------------
+// `GET /<name>/index.json` answers every published version of one package, newest last. The index
+// is advisory: a digest in it is checked against the archive it names before anything is used.
+
+/// One published version: the digest of its `.plyz`, whether its publisher yanked it, and the
+/// toolchain its manifest declares.
+pub type Release = { version: Version, digest: String, yanked: Bool, runtime: Version }
+
+pub type Index = { name: String, versions: List<Release> }
+
+derive eq for Release
+derive eq for Index
+
+// A version on the wire is its rendered text, as a lockfile and a URL spell it.
+fn version_text_json() -> json::JsonCodec<Version> =
+  {
+    encode: |v: Version| json::string_json().encode(render_version(v)),
+    decode: |j: json::Json|
+      match json::string_json().decode(j) {
+        Err(_) -> Err(json::expected("a version such as \"0.1.0\"", j)),
+        Ok(text) -> match parse_version(text) {
+          Some(v) -> Ok(v),
+          None -> Err(json::decode_error("`" ++ text ++ "` is not a version such as `0.1.0`")),
+        },
+      },
+  }
+
+pub fn release_json() -> json::JsonCodec<Release> =
+  {
+    encode: |r: Release|
+      json::object([
+        { key: "version", value: version_text_json().encode(r.version) },
+        { key: "digest", value: json::string_json().encode(r.digest) },
+        { key: "yanked", value: json::bool_json().encode(r.yanked) },
+        { key: "runtime", value: version_json().encode(r.runtime) },
+      ]),
+    decode: |j: json::Json|
+      match json::field(j, "version", version_text_json()) {
+        Err(e) -> Err(e),
+        Ok(version) -> match json::field(j, "digest", json::string_json()) {
+          Err(e) -> Err(e),
+          Ok(digest) -> match json::field(j, "yanked", json::bool_json()) {
+            Err(e) -> Err(e),
+            Ok(yanked) -> match json::field(j, "runtime", version_json()) {
+              Err(e) -> Err(e),
+              Ok(runtime) ->
+                Ok({ version: version, digest: digest, yanked: yanked, runtime: runtime }),
+            },
+          },
+        },
+      },
+  }
+
+pub fn index_json() -> json::JsonCodec<Index> =
+  {
+    encode: |x: Index|
+      json::object([
+        { key: "name", value: json::string_json().encode(x.name) },
+        { key: "versions", value: json::list_json(release_json()).encode(x.versions) },
+      ]),
+    decode: |j: json::Json|
+      match json::field(j, "name", json::string_json()) {
+        Err(e) -> Err(e),
+        Ok(name) -> match json::field(j, "versions", json::list_json(release_json())) {
+          Err(e) -> Err(e),
+          Ok(versions) -> Ok({ name: name, versions: versions }),
+        },
+      },
+  }
 
 test "a version renders dotted" {
   assert_eq(render_version({ major: 1, minor: 23, patch: 4 }), "1.23.4")
@@ -102,4 +204,54 @@ test "a version orders major, then minor, then patch" {
     Greater,
   );
   assert_eq((c.compare)({ major: 1, minor: 2, patch: 3 }, { major: 1, minor: 2, patch: 3 }), Equal)
+}
+
+test "a version parses from the text it renders as, and nothing looser" {
+  assert_eq(parse_version("1.23.4"), Some({ major: 1, minor: 23, patch: 4 }));
+  assert_eq(parse_version("0.0.0"), Some({ major: 0, minor: 0, patch: 0 }));
+  assert_eq(
+    parse_version(render_version({ major: 10, minor: 0, patch: 7 })),
+    Some({ major: 10, minor: 0, patch: 7 }),
+  );
+  assert_eq(parse_version("1.2"), None);
+  assert_eq(parse_version("1.2.3.4"), None);
+  assert_eq(parse_version("1..3"), None);
+  assert_eq(parse_version("01.2.3"), None);
+  assert_eq(parse_version("1.2.-3"), None);
+  assert_eq(parse_version("1.2.3 "), None);
+  assert_eq(parse_version("v1.2.3"), None);
+  assert_eq(parse_version("1234567890.0.0"), None)
+}
+
+fn a_release(version: String, yanked: Bool) -> Release =
+  {
+    version: match parse_version(version) { Some(v) -> v, None -> panic("a fixture's version") },
+    digest: "b3:" ++ version,
+    yanked: yanked,
+    runtime: { major: 0, minor: 16, patch: 0 },
+  }
+
+test "an index round-trips through the document a registry serves, versions in order" {
+  let x: Index = {
+    name: "orders",
+    versions: [a_release("0.2.0", false), a_release("0.1.0", true)],
+  };
+  let text = json::to_string(index_json().encode(x));
+  assert_eq(
+    text,
+    "{\"name\":\"orders\",\"versions\":[{\"digest\":\"b3:0.2.0\",\"runtime\":{\"major\":0,\"minor\":16,\"patch\":0},\"version\":\"0.2.0\",\"yanked\":false},{\"digest\":\"b3:0.1.0\",\"runtime\":{\"major\":0,\"minor\":16,\"patch\":0},\"version\":\"0.1.0\",\"yanked\":true}]}",
+  );
+  assert_eq(json::decode_string(text, index_json()), Ok(x))
+}
+
+test "an index whose version is not a version names where it is" {
+  let text = "{\"name\":\"orders\",\"versions\":[{\"digest\":\"b3:ab\",\"runtime\":{\"major\":0,\"minor\":1,\"patch\":0},\"version\":\"latest\",\"yanked\":false}]}";
+  match json::decode_string(text, index_json()) {
+    Ok(_) -> panic("`latest` is not a version"),
+    Err(e) ->
+      assert_eq(
+        json::error_to_string(e),
+        "$.versions[0].version: `latest` is not a version such as `0.1.0`",
+      ),
+  }
 }

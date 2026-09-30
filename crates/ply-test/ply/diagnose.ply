@@ -1,12 +1,10 @@
-// `diagnose` — turning one failure into its failure artifact: the suspects, ranked and annotated with
-// what changed since the test last passed, with what bisection proved, and with what the traced
-// re-run saw.
+// `diagnose` — turning one failure into its cause: the suspects, ranked and annotated with what
+// changed since the test last passed and with what bisection proved.
 //
 // The ranking is the whole point of the module. A person reads the list from the top, so the order
-// is: what bisection named a culprit, then the frames of the failing stack innermost first, then
-// whatever else the trace entered, then the definitions nothing is known about, then what provably
-// did *not* run — and within a tier, a body that was edited outranks one whose hash merely moved,
-// because a moved hash is what an untouched dependency looks like.
+// is: what bisection named a culprit, then everything else — and among those, a body that was edited
+// outranks one whose hash merely moved, because a moved hash is what an untouched dependency looks
+// like.
 //
 // A cause need not look changed, so a culprit outside the suspect set is added rather than dropped:
 // the test's own closure is where suspicion starts, not where it ends.
@@ -17,8 +15,6 @@ import bisect (Auto, Bisected, DoesNotCheck, a_failure, a_pass, Host, Minimal, N
                culprits, default_budget, mode_budget, not_attempted, precheck, unresolved_trial)
 import delta (Added, Change, ChangeKind, Delta, Derived, Edited, added, change, change_is_candidate,
               derived, edited, is_candidate, kind_word, no_edges, with_components)
-import slice (CausalSlice, Enter, TraceAuto, TraceNever, Tracing, did_run, depth_of, failed, finish,
-              new_builder, record, untraced)
 
 // One definition a failure might be explained by, with everything the run knows about it.
 pub type Suspect = {
@@ -28,41 +24,18 @@ pub type Suspect = {
   before: Option<String>,
   /// Absent when the configurations were never compared, so an edit looks like a moved hash.
   change: Option<ChangeKind>,
-  /// Absent when the failing execution was not traced.
-  ran: Option<Bool>,
-  /// Distance above the failing frame, zero being where it happened.
-  depth: Option<Int>,
   /// Whether bisection put it in the minimal failure-inducing set.
   culprit: Bool,
 }
 
 pub fn suspect(name: String, hash: Option<String>) -> Suspect =
-  { name: name, hash: hash, before: None, change: None, ran: None, depth: None, culprit: false }
+  { name: name, hash: hash, before: None, change: None, culprit: false }
 
-// Most-likely-first, as a tier: a bisected culprit, the stack innermost first, whatever else ran, an
-// unknown, then what provably did not run.
-fn tier(s: Suspect) -> Int =
-  if s.culprit { 0 } else {
-    match s.depth {
-      Some(_) -> 1,
-      None -> match s.ran { Some(true) -> 2, None -> 3, Some(false) -> 4 },
-    }
-  }
-
-// Within a tier: shallower first, then an edit before a hash that merely moved, then the name.
-fn before(a: Suspect, b: Suspect) -> Bool = {
-  let ta = tier(a);
-  let tb = tier(b);
-  if ta != tb { ta < tb }
-  else if a.depth != b.depth { shallower(a.depth, b.depth) }
+// Most-likely-first: a bisected culprit, then an edit before a hash that merely moved, then the name.
+fn before(a: Suspect, b: Suspect) -> Bool =
+  if a.culprit != b.culprit { a.culprit }
   else if inherited(a) != inherited(b) { inherited(a) < inherited(b) }
   else { compare(a.name, b.name) == Less }
-}
-
-// An absent depth is the deepest thing there is: a definition not on the stack is behind every
-// definition that is.
-fn shallower(a: Option<Int>, b: Option<Int>) -> Bool =
-  match a { None -> false, Some(x) -> match b { None -> true, Some(y) -> x < y } }
 
 fn inherited(s: Suspect) -> Int =
   match s.change { Some(k) -> if is_candidate(k) { 0 } else { 1 }, None -> 0 }
@@ -79,8 +52,6 @@ pub type Attribution = {
   /// The same set as the failure's suspects, ranked and annotated.
   suspects: List<Suspect>,
   bisection: Bisection,
-  /// Absent until a traced re-run has happened.
-  slice: Option<CausalSlice>,
 }
 
 // `found` is each suspect's current hash, which the caller read out of the hash table: a name that is
@@ -91,26 +62,17 @@ pub fn from_suspects(found: List<{ name: String, hash: Option<String> }>) -> Att
       map(found, |f: { name: String, hash: Option<String> }| suspect(f.name, f.hash)),
     ),
     bisection: not_attempted(NotRequested),
-    slice: None,
   }
 
-/// Folds a bisection and a trace into the suspects, then re-ranks.
-pub fn resolve(a: Attribution, bisection: Bisection, slice: Option<CausalSlice>) -> Attribution = {
+/// Folds a bisection into the suspects, then re-ranks.
+pub fn resolve(a: Attribution, bisection: Bisection) -> Attribution = {
   let named = culprits(bisection);
-  let marked = map(a.suspects, |s: Suspect| {
-    let extra = match slice {
-      Some(seen) -> if seen.traced && seen.reproduced {
-        { ran: did_run(seen, s.name), depth: depth_of(seen, s.name) }
-      } else { { ran: s.ran, depth: s.depth } },
-      None -> { ran: s.ran, depth: s.depth },
-    };
-    { ..s, culprit: contains_text(named, s.name), ran: extra.ran, depth: extra.depth }
-  });
+  let marked = map(a.suspects, |s: Suspect| { ..s, culprit: contains_text(named, s.name) });
   // A culprit outside the suspect set is still the answer: a cause need not look changed.
   let added = fold(named, marked, |acc: List<Suspect>, name: String|
     if some(acc, |s: Suspect| s.name == name) { acc }
     else { push(acc, { ..suspect(name, None), culprit: true }) });
-  { ..a, suspects: sorted_suspects(added), bisection: bisection, slice: slice }
+  { suspects: sorted_suspects(added), bisection: bisection }
 }
 
 /// Folds what changed since the test last passed into the suspects, then re-ranks. A candidate the
@@ -131,9 +93,9 @@ pub fn attribution_culprits(a: Attribution) -> List<String> = culprits(a.bisecti
 
 // --- The pipeline -------------------------------------------------------------
 
-pub type Options = { bisect: Mode, trace: Tracing, budget: Budget }
+pub type Options = { bisect: Mode, budget: Budget }
 
-pub fn never() -> Options = { bisect: Never, trace: TraceNever, budget: default_budget() }
+pub fn never() -> Options = { bisect: Never, budget: default_budget() }
 
 /// One failure, and everything a run knows about it that is not in the diagnostic.
 pub type Evidence = {
@@ -146,7 +108,6 @@ pub type Evidence = {
   suspects: List<{ name: String, hash: Option<String> }>,
   /// Whether an earlier, passing run is on record.
   baseline: Bool,
-  slice: Option<CausalSlice>,
 }
 
 /// One cluster and an unedited test is the common case, decided by counting, not evaluating.
@@ -196,7 +157,7 @@ pub fn diagnose<a | e>(
     },
   };
   let annotated = match delta { Some(d) -> annotate(start, d), None -> start };
-  resolve(annotated, bisection, evidence.slice)
+  resolve(annotated, bisection)
 }
 
 // What a search's verdict needs to say about the classification it could not finish.
@@ -244,9 +205,8 @@ fn at_or<a>(xs: List<a>, i: Int) -> a =
 
 // --- Tests ------------------------------------------------------------------
 //
-// The expectations are the runtime's own answers for the same fixtures, printed from a scratch run
-// against it. The ranking is what a person reads top-down, so it is pinned whole — including the
-// case a culprit the closure never held, which must be added rather than dropped.
+// The ranking is what a person reads top-down, so it is pinned whole — including the case a culprit
+// the closure never held, which must be added rather than dropped.
 
 // The same scripted mixture `bisect`'s own tests use: it fails exactly when every culprit index is
 // in the mixture, which is the rule ddmin is built for.
@@ -257,30 +217,18 @@ fn scripted(culprit: List<Int>, unanswerable: List<Int>, flipped: List<Int>) -> 
 
 fn all_of<a>(xs: List<a>, p: (a) -> Bool) -> Bool = fold(xs, true, |ok: Bool, x: a| ok && p(x))
 
-fn a_suspect(name: String, tier: String) -> Suspect =
-  match tier {
+fn a_suspect(name: String, kind: String) -> Suspect =
+  match kind {
     "culprit" -> { ..suspect(name, Some("h1")), culprit: true },
-    "depth0" -> { ..suspect(name, Some("h1")), ran: Some(true), depth: Some(0) },
-    "depth2" -> { ..suspect(name, Some("h1")), ran: Some(true), depth: Some(2) },
-    "ran" -> { ..suspect(name, Some("h1")), ran: Some(true) },
     "unknown" -> suspect(name, Some("h1")),
-    "did-not-run" -> { ..suspect(name, Some("h1")), ran: Some(false) },
-    "derived" ->
-      { ..suspect(name, Some("h1")), ran: Some(true), depth: Some(1), change: Some(Derived) },
-    "edited" ->
-      { ..suspect(name, Some("h1")), ran: Some(true), depth: Some(1), change: Some(Edited) },
-    _ -> panic("no such tier"),
+    "derived" -> { ..suspect(name, Some("h1")), change: Some(Derived) },
+    "edited" -> { ..suspect(name, Some("h1")), change: Some(Edited) },
+    _ -> panic("no such kind"),
   }
 
 fn describe(xs: List<Suspect>) -> List<String> =
-  map(xs, |s: Suspect| s.name ++ ":" ++ ran_word(s.ran, s.depth) ++ ":" ++ change_word(s.change))
-
-fn ran_word(ran: Option<Bool>, depth: Option<Int>) -> String =
-  match ran {
-    Some(true) -> match depth { Some(d) -> "ran" ++ int_to_string(d), None -> "ran" },
-    Some(false) -> "no",
-    None -> "?",
-  }
+  map(xs, |s: Suspect|
+    s.name ++ ":" ++ (if s.culprit { "culprit" } else { "-" }) ++ ":" ++ change_word(s.change))
 
 fn change_word(c: Option<ChangeKind>) -> String = match c { Some(k) -> kind_word(k), None -> "-" }
 
@@ -288,67 +236,41 @@ fn scripted_bisection(verdict: Verdict, names: List<List<String>>) -> Bisection 
   { ..not_attempted(NotRequested), verdict: verdict, groups: names }
 
 fn with_suspects(xs: List<Suspect>) -> Attribution =
-  { suspects: xs, bisection: not_attempted(NotRequested), slice: None }
+  { suspects: xs, bisection: not_attempted(NotRequested) }
 
-test "the order a person reads is culprits, the stack, what ran, unknowns, then what did not" {
+test "the order a person reads is culprits, then an edit before a moved hash, then the name" {
   let mixed = [
-    a_suspect("z-did-not-run", "did-not-run"),
+    a_suspect("z-derived", "derived"),
     a_suspect("y-unknown", "unknown"),
-    a_suspect("x-ran", "ran"),
-    a_suspect("w-depth2", "depth2"),
-    a_suspect("v-depth0", "depth0"),
-    a_suspect("u-culprit", "culprit"),
+    a_suspect("x-edited", "edited"),
+    a_suspect("w-derived", "derived"),
+    a_suspect("v-culprit", "unknown"),
   ];
   // The culprit flag comes from the bisection, not from a hand-built field.
-  let a = resolve(with_suspects(mixed), scripted_bisection(Bisected, [["u-culprit"]]), None);
+  let a = resolve(with_suspects(mixed), scripted_bisection(Bisected, [["v-culprit"]]));
   assert_eq(describe(a.suspects), [
-    "u-culprit:?:-",
-    "v-depth0:ran0:-",
-    "w-depth2:ran2:-",
-    "x-ran:ran:-",
-    "y-unknown:?:-",
-    "z-did-not-run:no:-",
+    "v-culprit:culprit:-",
+    "x-edited:-:edited",
+    "y-unknown:-:-",
+    "w-derived:-:derived",
+    "z-derived:-:derived",
   ])
 }
 
-test "within a tier an edit outranks a hash that merely moved, and then the name decides" {
-  let same = with_suspects([
-    a_suspect("zeta", "derived"),
-    a_suspect("beta", "derived"),
-    a_suspect("alpha", "edited"),
-  ]);
-  let a = resolve(same, scripted_bisection(Bisected, []), None);
-  assert_eq(describe(a.suspects), ["alpha:ran1:edited", "beta:ran1:derived", "zeta:ran1:derived"])
+test "a verdict that names nobody marks nobody, and a hand-set flag is the bisection's to overrule" {
+  let a = resolve(
+    with_suspects([a_suspect("zeta", "culprit"), a_suspect("alpha", "unknown")]),
+    scripted_bisection(Bisected, []),
+  );
+  assert_eq(describe(a.suspects), ["alpha:-:-", "zeta:-:-"])
 }
 
 test "a culprit the closure never held is added, not dropped" {
   let a = resolve(
     with_suspects([a_suspect("known", "unknown")]),
     scripted_bisection(Sole, [["unlooked-for"]]),
-    None,
   );
-  assert_eq(describe(a.suspects), ["unlooked-for:?:-", "known:?:-"])
-}
-
-test "a trace fills what ran and how deep, and an untraced one leaves it alone" {
-  let b = new_builder();
-  let b = record(b, Enter("main", Some("h1"), None));
-  let b = record(b, Enter("work", Some("h2"), None));
-  let b = record(b, Enter("deep", None, None));
-  let seen = finish(failed(b), true);
-  let traced = resolve(
-    with_suspects([a_suspect("work", "unknown"), a_suspect("nope", "unknown")]),
-    scripted_bisection(Bisected, []),
-    Some(seen),
-  );
-  assert_eq(describe(traced.suspects), ["work:ran1:-", "nope:no:-"]);
-  // A trace that did not reproduce is not evidence about what ran.
-  let kept = resolve(
-    with_suspects([a_suspect("work", "unknown")]),
-    scripted_bisection(Bisected, []),
-    Some(untraced()),
-  );
-  assert_eq(describe(kept.suspects), ["work:?:-"])
+  assert_eq(describe(a.suspects), ["unlooked-for:culprit:-", "known:-:-"])
 }
 
 test "annotation fills in what changed and ranks candidates it did not know about" {
@@ -364,7 +286,7 @@ test "annotation fills in what changed and ranks candidates it did not know abou
   );
   // The known name keeps its place; the two the closure never held are added, an edit before a
   // hash that only moved.
-  assert_eq(describe(a.suspects), ["known:?:edited", "new:?:added", "moved:?:derived"]);
+  assert_eq(describe(a.suspects), ["known:-:edited", "new:-:added", "moved:-:derived"]);
   // A name that is both a `fn` and a `type` is one suspect, and it is the edit that shows.
   let two = annotate(with_suspects([a_suspect("x", "unknown")]), delta);
   assert_eq(len(two.suspects), 4)
@@ -402,7 +324,6 @@ fn evidence(
     host: defects.host,
     suspects: map(suspects, |s: Suspect| { name: s.name, hash: s.hash }),
     baseline: defects.baseline,
-    slice: None,
   }
 
 // `nondet` is a keyword, so the flag a `test/nondet` sets is named for what it means here.
@@ -411,7 +332,7 @@ fn a_gate(nondet_test: Bool, defect: Bool, host: Bool, baseline: Bool) -> Eviden
 
 test "the gate decides before any hybrid is built" {
   let one = with_components(None, [edited("a", "h1", "h2", true)], no_edges(), []);
-  let options = { bisect: Never, trace: TraceNever, budget: default_budget() };
+  let options = { bisect: Never, budget: default_budget() };
   // `--bisect=never` is not attempted, with the reason a caller can look up.
   let a = diagnose(
     a_gate(false, false, false, true),
@@ -459,7 +380,7 @@ test "the gate decides before any hybrid is built" {
 test "one cluster with no test edit is decided by counting, even with no hybrid to build" {
   // Nothing can mix two eras, but nothing needs to: one cluster and an unedited test is the answer.
   let one = with_components(None, [edited("a", "h1", "h2", true)], no_edges(), []);
-  let options = { bisect: Auto, trace: TraceNever, budget: default_budget() };
+  let options = { bisect: Auto, budget: default_budget() };
   let a = diagnose(
     a_gate(false, false, false, true),
     options,
@@ -499,7 +420,7 @@ test "the reason says what could not be classified, and when a test edit was not
     ..with_components(None, [edited("a", "h1", "h2", true), edited("b", "h1", "h2", true)], no_edges(), []),
     unclassified: 2,
   };
-  let options = { bisect: Auto, trace: TraceNever, budget: default_budget() };
+  let options = { bisect: Auto, budget: default_budget() };
   let culprit = [1];
   let mix = |_d: Delta, flipped: List<Int>| scripted(culprit, [], flipped);
   let a = diagnose(a_gate(false, false, false, true), options, Some(two), 2, true, mix, None);
@@ -521,9 +442,9 @@ test "the reason says what could not be classified, and when a test edit was not
   )
 }
 
-test "a diagnosis ranks the suspects it was handed and keeps the order the slice gives it" {
+test "a diagnosis ranks the suspects it was handed, the culprit first" {
   let one = with_components(None, [edited("a", "h1", "h2", true)], no_edges(), []);
-  let options = { bisect: Auto, trace: TraceNever, budget: default_budget() };
+  let options = { bisect: Auto, budget: default_budget() };
   let a = diagnose(
     evidence([a_suspect("b", "unknown"), a_suspect("a", "unknown")], {
       nondet: false,
@@ -539,11 +460,10 @@ test "a diagnosis ranks the suspects it was handed and keeps the order the slice
     Some(NoHybrids),
   );
   // `a` is the sole culprit, so it is first; `b` is an unknown, ranked behind it.
-  assert_eq(describe(a.suspects), ["a:?:edited", "b:?:-"])
+  assert_eq(describe(a.suspects), ["a:culprit:edited", "b:-:-"])
 }
 
 test "an options value starts from the mode that asks for nothing" {
   assert_eq(never().bisect, Never);
-  assert_eq(never().trace, TraceNever);
   assert_eq(never().budget, default_budget())
 }

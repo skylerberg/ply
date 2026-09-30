@@ -161,6 +161,46 @@ fn a_cached_run_reports_exactly_what_a_fresh_one_does() {
     assert_eq!(fresh, artifact(warm));
 }
 
+/// `--reach` asks the static tier about every obligation, whatever answered it, so a claim the cache
+/// answered carries what a fresh discharge's would; unasked, no claim carries one.
+#[test]
+fn a_cached_run_reports_the_same_reach_as_a_fresh_one() {
+    let dir = project(SPECIFIED);
+    let fresh = artifact(
+        &ply(dir.path())
+            .args(["prove", "--json", "--reach", "--no-cache"])
+            .output()
+            .unwrap(),
+    );
+    let unasked = json_of(&ply(dir.path()).args(["prove", "--json"]).output().unwrap());
+    assert!(
+        unasked["obligations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|o| o.get("reach").is_none()),
+        "{unasked}"
+    );
+    let warm = &ply(dir.path())
+        .args(["prove", "--json", "--reach"])
+        .output()
+        .unwrap();
+    assert!(
+        json_of(warm)["cached"].as_u64().unwrap_or(0) > 0,
+        "the second run has to have read something"
+    );
+    let warm = artifact(warm);
+    assert_eq!(fresh, warm);
+    assert!(
+        warm["obligations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|o| o["reach"]["decision"].is_string()),
+        "every claim here is one the static tier sees: {warm}"
+    );
+}
+
 /// A law nothing proves is sampled, and a sample is filed under its plan's key: the next run reads it
 /// back from there rather than refusing it and sampling again.
 const SAMPLED: &str = "\

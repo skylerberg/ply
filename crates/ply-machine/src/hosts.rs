@@ -2,15 +2,12 @@
 
 use crate::config::Configuration;
 use crate::payload::{count, diags_value, option, places_value, record, strings};
-use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
     HostRequest, HostResource, HostRow, HostRuntime, Linearity,
 };
+use ply_eval::{CheckOutput, Diagnostic, Footprint, SourceMap, Span, Symbol, Value as PlyValue};
 use ply_host::tls;
-use ply_span::{Diagnostic, SourceMap, Span, Symbol};
-use ply_ty::CheckOutput;
-use ply_ty::ty::Footprint;
 use serde_json::{Value, json};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -69,9 +66,9 @@ impl Hosts {
         )
     }
 
-    /// [`Hosts::open`] for a run that listens for a stop and is a process; only `ply run`, so
-    /// ctrl-C ends no test and `process` is withheld from one. `lent` joins the registrations
-    /// this binary compiles in, for an entry whose caller serves an effect of its own.
+    /// [`Hosts::open`] with the rest of what a run may bind: a stop to listen for (only `ply run`, so
+    /// ctrl-C ends no test), a `process` host, and `lent`, the registrations of the families a
+    /// caller serves beside the ones this binary compiles in.
     #[allow(clippy::too_many_arguments)]
     pub fn open_stopping(
         check: &CheckOutput,
@@ -294,33 +291,6 @@ where
     }
 }
 
-/// How the corpus splits once the binding is taken into account.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Counts {
-    pub total: usize,
-    pub isolated: usize,
-    pub shared: usize,
-    pub host: usize,
-}
-
-impl Counts {
-    /// `tests` pairs each footprint with whether it classified as region-isolated.
-    pub fn of<'a>(hosts: &Hosts, tests: impl IntoIterator<Item = (&'a Footprint, bool)>) -> Counts {
-        let mut counts = Counts::default();
-        for (footprint, isolated) in tests {
-            counts.total += 1;
-            if hosts.reaches(footprint) {
-                counts.host += 1;
-            } else if isolated {
-                counts.isolated += 1;
-            } else {
-                counts.shared += 1;
-            }
-        }
-        counts
-    }
-}
-
 /// The roots the run bound: what each `fs` label in a row actually names.
 pub struct Filesystem {
     /// By name, ascending. Empty is reported, since an `fs` operation with no root is `E0451`.
@@ -487,12 +457,12 @@ impl Observability {
             .iter()
             .filter(|row| row.effect.as_str() == ply_host::trace::EFFECT)
             .filter_map(|row| match &row.resource {
-                ply_ty::ty::Resource::Named(name) => Some(name.as_str().to_string()),
+                ply_eval::Resource::Named(name) => Some(name.as_str().to_string()),
                 // A host row names a resource or none: nothing holds a label a caller fills,
                 // and a binding that answers every label has no one name to list.
-                ply_ty::ty::Resource::Var(_)
-                | ply_ty::ty::Resource::Singleton
-                | ply_ty::ty::Resource::Every => None,
+                ply_eval::Resource::Var(_)
+                | ply_eval::Resource::Singleton
+                | ply_eval::Resource::Every => None,
             })
             .collect();
         channels.sort();
@@ -833,7 +803,7 @@ impl Assembled {
                 String::new(),
                 vec![
                     Diagnostic::error(
-                        ply_span::codes::INTERNAL_ERROR,
+                        ply_eval::codes::INTERNAL_ERROR,
                         "the CLI handed no front end over, and this side runs none",
                     )
                     .note(
@@ -1003,10 +973,10 @@ fn row_value(row: &HostRow) -> PlyValue {
         (
             "resource",
             option(match &row.resource {
-                ply_ty::ty::Resource::Named(name) => Some(PlyValue::str(name.as_str())),
-                ply_ty::ty::Resource::Var(_)
-                | ply_ty::ty::Resource::Singleton
-                | ply_ty::ty::Resource::Every => None,
+                ply_eval::Resource::Named(name) => Some(PlyValue::str(name.as_str())),
+                ply_eval::Resource::Var(_)
+                | ply_eval::Resource::Singleton
+                | ply_eval::Resource::Every => None,
             }),
         ),
         ("triple", PlyValue::str(row.to_string())),
@@ -1154,7 +1124,7 @@ fn shutdown_value(shutdown: &Shutdown) -> PlyValue {
 #[cold]
 fn unregistered(op: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
-        ply_span::codes::INTERNAL_ERROR,
+        ply_eval::codes::INTERNAL_ERROR,
         format!("`{EFFECT}.{op}` reached the binding, and nothing here serves it"),
     )
     .primary(span, "this perform reached `ply hosts`")

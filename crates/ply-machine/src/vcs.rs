@@ -7,7 +7,7 @@
 //! moved branch is caught by the lockfile, whose digest of the fetched sources is checked before a
 //! build writes anything.
 
-use ply_span::{Diagnostic, codes};
+use ply_eval::{Diagnostic, codes};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

@@ -1,0 +1,205 @@
+// The registry's tree, under the root `--fs store=DIR` binds: a directory per package holding its
+// `index.json`, and a directory per version holding the archive and the line naming its digest.
+//
+//   <name>/index.json
+//   <name>/<version>/package.plyz
+//   <name>/<version>/package.plyz.b3
+//
+// Every write goes through here, and a version is published by the index write that lists it: an
+// archive the index does not list is one a publish did not finish, and the next publish of that
+// version writes over it.
+
+import std.fs
+import std.fs (fs)
+import std.json (decode_bytes, error_to_string, to_bytes)
+import std.pkg (Index, Release, Version, index_json, parse_version, render_version)
+import twin
+
+pub fn index_path(name: String) -> String = name ++ "/index.json"
+
+pub fn archive_path(name: String, version: String) -> String =
+  name ++ "/" ++ version ++ "/package.plyz"
+
+pub fn digest_path(name: String, version: String) -> String = archive_path(name, version) ++ ".b3"
+
+// Beside the index, so a lock never needs a directory of its own; no route reads it.
+fn lock_path(name: String) -> String = name ++ "/index.lock"
+
+/// A file as the static layout serves it, or `None` for one that is not there.
+pub fn served(path: String) -> Option<Bytes> / {fs.read_file[store]} = fs.read_file[store](path)
+
+/// The package's index: `None` for a name nothing was published under, `Err` for an index that does
+/// not read, which a write must not paper over with a fresh one.
+pub fn index_of(name: String) -> Result<Option<Index>, String> / {fs.read_file[store]} =
+  match fs.read_file[store](index_path(name)) {
+    None -> Ok(None),
+    Some(bytes) -> match decode_bytes(bytes, index_json()) {
+      Err(e) -> Err("`" ++ index_path(name) ++ "` does not read: " ++ error_to_string(e)),
+      Ok(x) -> Ok(Some(x)),
+    },
+  }
+
+pub fn release_of(x: Index, v: Version) -> Option<Release> =
+  fold(x.versions, None, |found: Option<Release>, r: Release|
+    match found { Some(_) -> found, None -> if r.version == v { Some(r) } else { None } })
+
+/// The index with one more version, newest last: publication order, which is what a reader of
+/// the index can rely on, whatever the version numbers say.
+pub fn appended(x: Index, r: Release) -> Index = { ..x, versions: push(x.versions, r) }
+
+/// The index with one version yanked, every other field of every version as it was.
+pub fn yanked(x: Index, v: Version) -> Index =
+  {
+    ..x,
+    versions: map(x.versions, |r: Release| if r.version == v { { ..r, yanked: true } } else { r }),
+  }
+
+// --- Writing ------------------------------------------------------------------------
+
+pub type Trouble = | Busy | Unreadable(String) | Unwritten(String) | Exists | Absent
+
+// Written beside its place and renamed into it, so a reader sees the old file or the new one.
+fn replaced(path: String, body: Bytes) -> Bool / {fs.write_file[store], fs.rename[store]} = {
+  let staged = path ++ ".tmp";
+  fs.write_file[store](staged, body) && fs.rename[store](staged, path)
+}
+
+// One writer of a package at a time, whichever process it is.
+fn locked<a | e>(
+  name: String,
+  f: () -> Result<a, Trouble> / e,
+) -> Result<a, Trouble> / {fs.create_dir[store], fs.lock[store], fs.unlock[store] | e} =
+  if !fs.create_dir[store](name) { Err(Unwritten(name)) }
+  else if !fs.lock[store](lock_path(name)) { Err(Busy) } else {
+    let answer = f();
+    fs.unlock[store](lock_path(name));
+    answer
+  }
+
+/// A version published: the archive and its digest line written, then the index that lists it.
+/// A version the index already lists is refused, whatever the bytes: a version never changes.
+pub fn published(
+  name: String,
+  r: Release,
+  archive: Bytes,
+) -> Result<Index, Trouble> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store]} =
+  locked(name, || {
+    let version = render_version(r.version);
+    match index_of(name) {
+      Err(why) -> Err(Unreadable(why)),
+      Ok(held) -> {
+        let before = match held { Some(x) -> x, None -> { name: name, versions: [] } };
+        match release_of(before, r.version) {
+          Some(_) -> Err(Exists),
+          None -> {
+            let after = appended(before, r);
+            if !fs.create_dir[store](name ++ "/" ++ version) {
+              Err(Unwritten(name ++ "/" ++ version))
+            } else if !replaced(archive_path(name, version), archive) {
+              Err(Unwritten(archive_path(name, version)))
+            } else if !replaced(digest_path(name, version), bytes_of_string(r.digest ++ "\n")) {
+              Err(Unwritten(digest_path(name, version)))
+            } else if !replaced(index_path(name), to_bytes(index_json().encode(after))) {
+              Err(Unwritten(index_path(name)))
+            } else { Ok(after) }
+          },
+        }
+      },
+    }
+  })
+
+/// A version yanked. Yanking one already yanked is the same answer, and the archive is untouched.
+pub fn yank(
+  name: String,
+  v: Version,
+) -> Result<Index, Trouble> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store]} =
+  locked(name, ||
+    match index_of(name) {
+      Err(why) -> Err(Unreadable(why)),
+      Ok(None) -> Err(Absent),
+      Ok(Some(x)) -> match release_of(x, v) {
+        None -> Err(Absent),
+        Some(_) -> {
+          let after = yanked(x, v);
+          if replaced(index_path(name), to_bytes(index_json().encode(after))) { Ok(after) }
+          else { Err(Unwritten(index_path(name))) }
+        },
+      },
+    })
+
+// --- Tests ------------------------------------------------------------------
+
+fn at_version(text: String) -> Version =
+  match parse_version(text) { Some(v) -> v, None -> panic("a fixture's version") }
+
+fn a_release(version: String) -> Release =
+  {
+    version: at_version(version),
+    digest: "b3:" ++ version,
+    yanked: false,
+    runtime: at_version("0.16.0"),
+  }
+
+fn versions_of(x: Index) -> List<String> =
+  map(x.versions, |r: Release| render_version(r.version) ++ (if r.yanked { " yanked" } else { "" }))
+
+test "a publish writes the archive and its digest line, and the index lists it newest last" {
+  let ran = twin::over(fs::mem_empty(), || {
+    let first = published("orders", a_release("0.2.0"), b"two");
+    let second = published("orders", a_release("0.1.1"), b"backport");
+    (first, second)
+  });
+  match ran.value {
+    (Ok(_), Ok(x)) -> assert_eq(versions_of(x), ["0.2.0", "0.1.1"]),
+    _ -> panic("two new versions were refused"),
+  };
+  assert_eq(fs::mem_read(ran.tree, "orders/0.2.0/package.plyz"), Some(b"two"));
+  assert_eq(fs::mem_read(ran.tree, "orders/0.1.1/package.plyz.b3"), Some(b"b3:0.1.1\n"));
+  match fs::mem_read(ran.tree, "orders/index.json") {
+    None -> panic("no index was written"),
+    Some(bytes) -> assert(string_contains(string_of_bytes_lossy(bytes), "\"version\":\"0.1.1\"")),
+  }
+}
+
+test "a version is published once, and a second publish of it changes nothing" {
+  let ran = twin::over(fs::mem_empty(), || {
+    let first = published("orders", a_release("0.2.0"), b"two");
+    let again = published("orders", { ..a_release("0.2.0"), digest: "b3:other" }, b"other");
+    (first, again)
+  });
+  match ran.value {
+    (Ok(_), Err(Exists)) -> (),
+    _ -> panic("a published version was published again"),
+  };
+  assert_eq(fs::mem_read(ran.tree, "orders/0.2.0/package.plyz"), Some(b"two"))
+}
+
+test "a yank sets one field and keeps the archive; a version never published cannot be yanked" {
+  let ran = twin::over(fs::mem_empty(), || {
+    published("orders", a_release("0.1.0"), b"one");
+    published("orders", a_release("0.2.0"), b"two");
+    let once = yank("orders", at_version("0.1.0"));
+    let twice = yank("orders", at_version("0.1.0"));
+    let absent = yank("orders", at_version("9.9.9"));
+    let unknown = yank("billing", at_version("0.1.0"));
+    (once, twice, absent, unknown)
+  });
+  match ran.value {
+    (Ok(x), Ok(y), Err(Absent), Err(Absent)) -> {
+      assert_eq(versions_of(x), ["0.1.0 yanked", "0.2.0"]);
+      assert_eq(x, y)
+    },
+    _ -> panic("a yank did not answer as it should"),
+  };
+  assert_eq(fs::mem_read(ran.tree, "orders/0.1.0/package.plyz"), Some(b"one"))
+}
+
+test "an index that does not read is never written over" {
+  let start = fs::mem_of([{ path: "orders/index.json", body: b"{ not json" }]);
+  let ran = twin::over(start, || published("orders", a_release("0.2.0"), b"two"));
+  match ran.value {
+    Err(Unreadable(why)) -> assert(string_contains(why, "orders/index.json")),
+    _ -> panic("an unreadable index was replaced"),
+  };
+  assert_eq(fs::mem_read(ran.tree, "orders/index.json"), Some(b"{ not json"))
+}

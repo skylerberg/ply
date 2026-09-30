@@ -1,12 +1,10 @@
-use ply_eval::Provider;
-use ply_span::{SourceId, Symbol};
+use ply_eval::{CheckOutput, DefHash, HashOutput, ModuleName, Provider, SourceId, Symbol};
 use ply_store::body::{BodySet, of_front};
 use ply_store::{Outcome, PassRecord, Store};
 use ply_test::bisect::{
-    Baseline, ChangeSet, Regression, Rehashed, Skipped, StoreClassify, TrialOutcome, change_set,
+    Baseline, ChangeSet, Regression, Rehashed, StoreClassify, TrialOutcome, change_set,
 };
 use ply_test::{BodyHybrid, Signature, hybrid};
-use ply_ty::{CheckOutput, DefHash, HashOutput, ModuleName};
 use std::collections::BTreeMap;
 
 fn sym(s: &str) -> Symbol {
@@ -14,7 +12,7 @@ fn sym(s: &str) -> Symbol {
 }
 
 struct Compiled {
-    port: ply_ty::Front,
+    port: ply_eval::Front,
     check: CheckOutput,
     hashes: HashOutput,
     bodies: BodySet,
@@ -67,7 +65,7 @@ impl Compiled {
     }
 
     /// The signature every hybrid is judged against.
-    fn failure(&self, key: &str) -> ply_span::Diagnostic {
+    fn failure(&self, key: &str) -> ply_eval::Diagnostic {
         let index = self.test_index(key);
         let mut machine = ply_eval::Machine::new(&self.port);
         let unit = ply_codegen::Unit::over_front(&self.port, self.texts.clone())
@@ -110,12 +108,7 @@ fn passed_with(before: &Compiled, key: &str, filed: &[DefHash]) -> (TempRoot, St
     for (hash, body) in before.bodies.defs() {
         store.put_body(hash, ply_store::DefBody::of(body.clone()));
     }
-    crate::fixture::file_interfaces(
-        &mut store,
-        &root.0.join("m.ply"),
-        &before.check,
-        &before.hashes,
-    );
+    crate::fixture::file_interfaces(&mut store, &root.0.join("m.ply"), &before.sources());
     let baseline = before.baseline(key);
     store.put(baseline.test_hash, Outcome::Pass);
     for mixture in filed {
@@ -154,12 +147,7 @@ fn asked_with<R>(
 ) -> R {
     let (root, mut store) = passed_with(before, key, filed);
     // The CLI files the program it loaded before the tests run.
-    crate::fixture::file_interfaces(
-        &mut store,
-        &root.0.join("m.ply"),
-        &after.check,
-        &after.hashes,
-    );
+    crate::fixture::file_interfaces(&mut store, &root.0.join("m.ply"), &after.sources());
     let baseline = before.baseline(key);
     let rehashed = Rehashed::under(
         &after.sources(),
@@ -342,7 +330,7 @@ fn a_regression_that_introduces_runaway_recursion_fails_alone() {
     );
 
     let diagnostic = after.failure("m.terminates");
-    assert_eq!(diagnostic.code, ply_span::codes::RUNTIME_ERROR);
+    assert_eq!(diagnostic.code, ply_eval::codes::RUNTIME_ERROR);
     assert!(
         diagnostic.message.contains("recursion limit"),
         "{}",
@@ -533,9 +521,4 @@ fn a_pruned_body_store_is_reported_rather_than_guessed_around() {
         &BodySet::default(),
         &mixture
     ));
-    assert_eq!(
-        Skipped::NoBodies.as_str(),
-        "no_bodies",
-        "the artifact has to name the fixable cause"
-    );
 }

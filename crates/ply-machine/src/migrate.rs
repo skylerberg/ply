@@ -1,6 +1,6 @@
 //! What a run says when it could not use the front-end cache it found.
 
-use ply_span::{Diagnostic, codes};
+use ply_eval::{Diagnostic, codes};
 use ply_store::Store;
 
 /// The superseded single-document front-end cache.

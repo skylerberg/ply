@@ -912,6 +912,12 @@ fn copied(
 fn product(args: List<String>) -> Finished / {process.spawn[ply], config.get[env]} =
   process.spawn[ply](args, "", spine::inherited_env())
 
+// The definition the deploy edits, as `ply build --diff` names it.
+fn edited_name() -> String = "desk.store_reachable"
+
+fn member(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |seen: Bool, y: String| seen || y == x)
+
 pub fn replace_args(k: Kit) -> List<String> =
   [
     "replace",
@@ -966,13 +972,16 @@ fn reproducible_criterion() -> Criterion =
     |vs: List<Decimal>| match vs { [same] -> same == 1m, _ -> false },
   )
 
+// A definition's hash covers what it calls, so an edit moves every definition that reaches it: what
+// a deploy ships is the edit's reach, and anything else that moved is a leak.
 fn shipped_criterion() -> Criterion =
   holding(
-    "the edit ships as one changed definition, none added or dropped",
-    ["changed", "added", "dropped"],
+    "the edited definition changed and every changed one reaches it, none added or dropped",
+    ["edited", "outside_reach", "added", "dropped"],
     |vs: List<Decimal>|
       match vs {
-        [changed, added, dropped] -> changed == 1m && added == 0m && dropped == 0m,
+        [edited, outside, added, dropped] ->
+          edited == 1m && outside == 0m && added == 0m && dropped == 0m,
         _ -> false,
       },
   )
@@ -981,7 +990,7 @@ pub fn deploy_names() -> List<String> =
   [
     "deploy: the edit is one `ply replace`",
     "deploy: the build is reproducible",
-    "deploy: the edit ships as one definition",
+    "deploy: the edit ships only what reaches it",
   ]
 
 fn deploy_name(i: Int) -> String = match list_at(deploy_names(), i) { Some(n) -> n, None -> "" }
@@ -1030,15 +1039,23 @@ pub fn shipped_row(replaced: Bool, diff: Result<Map<String, Json>, String>) -> R
     match diff {
       Err(why) -> untaken(deploy_name(2), shipped_criterion(), why),
       Ok(m) -> {
+        let changed = names_in(m, "changed");
+        let reached = names_in(m, "reached");
         let taken = row(deploy_name(2), shipped_criterion(), [
-          number("changed", len(names_in(m, "changed")), "definitions"),
+          number("edited", if member(changed, edited_name()) { 1 } else { 0 }, "definitions"),
+          number(
+            "outside_reach",
+            len(filter(changed, |n: String| !member(reached, n))),
+            "definitions",
+          ),
+          number("changed", len(changed), "definitions"),
           number("added", len(names_in(m, "added")), "definitions"),
           number("dropped", len(names_in(m, "dropped")), "definitions"),
           number("unchanged", spine::int_field(m, "unchanged"), "definitions"),
-          number("reached", len(names_in(m, "reached")), "definitions"),
+          number("reached", len(reached), "definitions"),
           number("artifact_bytes", spine::int_field(m, "artifact_bytes"), "bytes"),
         ]);
-        { ..taken, detail: Str(joined(names_in(m, "changed"), ", ")) }
+        { ..taken, detail: Str(joined(changed, ", ")) }
       },
     }
   }
@@ -1323,6 +1340,44 @@ test "a deploy's rows read the builds and the diff the product wrote" {
   let shipped = shipped_row(true, diff);
   assert_eq(verdict_of(shipped), report::Pass);
   assert_eq(shipped.detail, Str("desk.store_reachable"));
+  let diffed = |text: String|
+    match json::parse_string(text) { Ok(Object(m)) -> Ok(m), _ -> Err("not an object") };
+  // Its callers move with it, which is the edit's reach and what a deploy ships.
+  assert_eq(
+    verdict_of(
+      shipped_row(
+        true,
+        diffed(
+          "{\"added\":[],\"changed\":[\"desk.ready\",\"desk.store_reachable\"],\"dropped\":[],\"unchanged\":398,\"reached\":[\"desk.ready\",\"desk.store_reachable\"],\"artifact_bytes\":900010}",
+        ),
+      ),
+    ),
+    report::Pass,
+  );
+  // A definition that moved without reaching the edit leaked into the deploy.
+  assert(
+    verdict_of(
+        shipped_row(
+          true,
+          diffed(
+            "{\"added\":[],\"changed\":[\"desk.health\",\"desk.store_reachable\"],\"dropped\":[],\"unchanged\":398,\"reached\":[\"desk.ready\",\"desk.store_reachable\"],\"artifact_bytes\":900010}",
+          ),
+        ),
+      )
+      != report::Pass,
+  );
+  // An edit that left its own definition's hash alone did not ship.
+  assert(
+    verdict_of(
+        shipped_row(
+          true,
+          diffed(
+            "{\"added\":[],\"changed\":[],\"dropped\":[],\"unchanged\":400,\"reached\":[],\"artifact_bytes\":900000}",
+          ),
+        ),
+      )
+      != report::Pass,
+  );
   assert(verdict_of(shipped_row(false, diff)) != report::Pass);
   assert_eq(verdict_of(replaced_row(process::exited(0, b"", b""))), report::Pass);
   assert(verdict_of(replaced_row(process::exited(2, b"", b"error[E0128]: no\n"))) != report::Pass);

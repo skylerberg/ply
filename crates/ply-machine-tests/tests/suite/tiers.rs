@@ -1,7 +1,5 @@
 use crate::fixture::{project, repo};
 use ply_machine::engine::{Point, Prover};
-use ply_machine::load::load;
-use ply_machine::obligations;
 use ply_prove::{
     Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, ProvePlan, Rule, Tier,
     UNFOLD_DEPTH,
@@ -18,33 +16,21 @@ impl Run {
     }
 
     fn with(path: &Path, plan: &ProvePlan) -> Run {
-        let loaded = match load(path) {
-            Ok(loaded) => loaded,
+        let (loaded, world, obligations) = match crate::fixture::proving(path) {
+            Ok(proving) => proving,
             Err(e) => panic!(
                 "`{}` did not compile: {:?}",
                 path.display(),
                 e.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
             ),
         };
-        let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-        assert!(
-            collected.warnings.is_empty(),
-            "an obligation was not collected: {:?}",
-            collected
-                .warnings
-                .iter()
-                .map(|d| d.message.clone())
-                .collect::<Vec<_>>()
-        );
-        let prover = Prover::new(&loaded)
+        let prover = Prover::new(&loaded, &world)
             .expect("the port lowers the claims")
             .with_backend(Some(
                 ply_machine::support::prover_backend(&loaded)
                     .expect("the program compiles to a tier"),
             ));
-        let results = collected
-            .obligations
+        let results = obligations
             .into_iter()
             .map(|o| {
                 let domain = crate::fixture::measured(&prover, &o);
@@ -124,7 +110,7 @@ fn the_certificate_audit() {
                         obligation.owner
                     ),
                     Rule::ExhaustiveEnumeration { points, .. } => assert!(
-                        *points <= ply_prove::ENUMERATION_BOUND,
+                        *points <= crate::fixture::bound(),
                         "`{}` claims to have enumerated {points} points",
                         obligation.owner
                     ),
@@ -152,7 +138,8 @@ fn the_certificate_audit() {
                 }
             }
             assert!(
-                certificate.steps <= plan.prove_budget.max(ply_prove::ENUMERATION_BOUND as u32),
+                u64::from(certificate.steps)
+                    <= u64::from(plan.prove_budget).max(crate::fixture::bound()),
                 "`{}` spent {} steps",
                 obligation.owner,
                 certificate.steps
@@ -171,16 +158,15 @@ fn the_differential_tier_audit() {
     };
     let mut audited = 0;
     for path in corpus() {
-        let loaded = load(&path).expect("the corpus compiles");
-        let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-        let prover = Prover::new(&loaded)
+        let (loaded, world, obligations) =
+            crate::fixture::proving(&path).expect("the corpus compiles");
+        let prover = Prover::new(&loaded, &world)
             .expect("the port lowers the claims")
             .with_backend(Some(
                 ply_machine::support::prover_backend(&loaded)
                     .expect("the program compiles to a tier"),
             ));
-        for obligation in &collected.obligations {
+        for obligation in &obligations {
             if prover
                 .discharge_with(
                     obligation,
@@ -641,22 +627,20 @@ law "a raising index does not"
 /// The prover over a fixture and the obligations it collected, in name order: what a per-point
 /// re-run needs, and the same prover a whole-run discharge is driven with.
 fn points<R>(path: &Path, f: impl FnOnce(&Prover<'_>, &[Obligation]) -> R) -> R {
-    let loaded = match load(path) {
-        Ok(loaded) => loaded,
+    let (loaded, world, obligations) = match crate::fixture::proving(path) {
+        Ok(proving) => proving,
         Err(e) => panic!(
             "`{}` did not compile: {:?}",
             path.display(),
             e.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
         ),
     };
-    let hashes = loaded.hashes.clone();
-    let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-    let prover = Prover::new(&loaded)
+    let prover = Prover::new(&loaded, &world)
         .expect("the port lowers the claims")
         .with_backend(Some(
             ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier"),
         ));
-    f(&prover, &collected.obligations)
+    f(&prover, &obligations)
 }
 
 /// The point a refutation came from, re-run at its own root and case, draws the same values the

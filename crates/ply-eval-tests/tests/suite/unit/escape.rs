@@ -1,8 +1,6 @@
 use ply_eval::arena::{Arena, RegionKind};
 use ply_eval::escape::*;
-use ply_eval::{ClosureKind, Value};
-use ply_span::Symbol;
-use ply_span::{Span, codes};
+use ply_eval::{ClosureKind, Span, Symbol, Value, codes};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

@@ -4,10 +4,11 @@
 //! needs postgres is inconclusive and says so.
 //!
 //! Only the rows whose criterion is about correctness are asserted — every request answered, the
-//! floor answering the desk's bytes, each handshake timed apart, each server stopping on its signal.
-//! A rate on a shared runner is a reading, not a verdict this test can own.
+//! floor answering the desk's bytes, each handshake timed apart, each server stopping on its signal —
+//! and what a request allocates, which is a count. A rate on a shared runner is a reading, not a
+//! verdict this test can own.
 
-use crate::support::{document, measured, outcome, repo, served};
+use crate::support::{document, measured, outcome, repo, row, served};
 use serde_json::Value;
 use std::path::Path;
 
@@ -259,7 +260,87 @@ fn the_lifecycle_bench_drains_and_deploys_and_names_what_needs_a_database() {
             "drain, 1 request, a 1500ms lead",
             "deploy: the edit is one `ply replace`",
             "deploy: the build is reproducible",
-            "deploy: the edit ships as one definition",
+            "deploy: the edit ships only what reaches it",
         ],
+    );
+}
+
+/// The ladder with no database: its in-process rungs taken, the twin and the floor served, the rungs
+/// postgres would carry saying why they are not, and the desk as it is written counted over two
+/// served windows and held to the figure `benches/w6-alloc.json` ships.
+#[test]
+fn the_ladder_serves_the_desk_and_holds_the_shipped_allocation_figure() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo();
+    let repo = repo.to_str().expect("the checkout's path is text");
+
+    let ladder = run(
+        dir.path(),
+        &[
+            "w6-ladder",
+            "--repo",
+            repo,
+            "--repeats",
+            "1",
+            "--served-repeats",
+            "1",
+            "--concurrency",
+            "1,2",
+            "--per-conn",
+            "4",
+            "--requests-per-point",
+            "8",
+            "--json",
+        ],
+    );
+    assert_correct(&ladder);
+    let taken = rows(&ladder);
+    for layer in ["call", "endpoint", "framing", "routing", "machine"] {
+        let rung = row(&ladder, &format!("layer {layer}"));
+        assert!(
+            measured(rung, "with") > 0.0,
+            "the in-process `{layer}` rung was timed: {rung:#}"
+        );
+    }
+    for prefix in [
+        "the twin in plaintext, /health, 1 client",
+        "the twin in plaintext, /health, 2 clients",
+        "the floor, one connection at a time, /health, 2 clients",
+    ] {
+        let found = named(&taken, prefix);
+        assert_eq!(found.len(), 1, "{prefix}: {ladder:#}");
+        assert_eq!(
+            measured(found[0], "answered"),
+            measured(found[0], "asked"),
+            "{prefix}: {ladder:#}"
+        );
+    }
+    for untaken in [
+        "layer socket",
+        "layer tls",
+        "layer database",
+        "layer tracing",
+        "total",
+        "residue",
+        "share",
+    ] {
+        let judged = row(&ladder, untaken);
+        assert_eq!(outcome(judged), "inconclusive", "{judged:#}");
+        assert!(
+            judged["verdict"]["why"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no database"),
+            "a rung postgres would carry says so: {judged:#}"
+        );
+    }
+
+    let allocations = row(&ladder, "allocations, one /health request");
+    assert_eq!(
+        outcome(allocations),
+        "pass",
+        "the request path allocates more than `benches/w6-alloc.json` ships, or the figure is not \
+         one this tree takes. Lower it, or re-take it: `benches/corpus.sh w6-ladder --sections alloc \
+         --out benches`, or `.github/workflows/bench.yml`. {allocations:#}"
     );
 }

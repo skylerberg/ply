@@ -5,8 +5,7 @@
 //! sees only `net`. A program serves itself: `with_server` reads the connection string, so nothing
 //! about the effect comes from the host.
 
-use ply_eval::{Machine, Value};
-use ply_span::Span;
+use ply_eval::{Machine, Span, Value};
 use std::sync::Arc;
 
 /// A program that handles its own `db` from a connection string.
@@ -231,7 +230,7 @@ fn both_written(left: Int) -> Unit =
   }
 "#;
 
-fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
+fn tiered(service: &str) -> (ply_eval::Front, &'static ply_codegen::Unit) {
     let answered =
         ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), service.to_string())])
             .unwrap_or_else(|e| panic!("they check: {e:#}"));
@@ -242,7 +241,7 @@ fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
 }
 
 /// The entry, over the real network: the host's only part in this is the socket and the entropy.
-fn call_outcome(entry: &str, url: &str) -> Result<Value, ply_span::Diagnostic> {
+fn call_outcome(entry: &str, url: &str) -> Result<Value, ply_eval::Diagnostic> {
     let host = ply_host::Host::new();
     let (front, unit) = tiered(PROGRAM);
     let binding = host
@@ -293,7 +292,7 @@ fn call_err(entry: &str, url: &str) -> String {
 
 fn cluster() -> Option<(crate::support::cluster::Cluster, String)> {
     if !crate::support::cluster::available() {
-        eprintln!("skipping: this machine has no initdb and postgres");
+        eprintln!("skipping: postgres is not installed here");
         return None;
     }
     // A password, so the connection is SCRAM rather than trust.
