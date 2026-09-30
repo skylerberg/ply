@@ -49,7 +49,7 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
         modules.push((name.clone(), text.to_string()));
     }
     let ids: Vec<_> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let front = ply_ty::read_front(&pulled.dump, &ids).expect("the dump reads");
+    let front = ply_codegen::c::dump::read(&pulled.dump, &ids).expect("the dump reads");
     if front.has_error() {
         return Err(front.diagnostics);
     }

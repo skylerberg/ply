@@ -1,0 +1,96 @@
+// The registry's world as values, for its tests: the store a `MemFs`, the configuration a table,
+// and an archive sealed the way `ply build` seals one.
+
+import compiler.plyx (Head, digest_of, digest_text, encode_named, library_domain, library_magic,
+                      off_digest)
+import std.config
+import std.config (config)
+import std.fs
+import std.fs (fs, MemFs)
+
+pub type Ran<a> = { value: a, tree: fs::MemFs }
+
+/// `body` run over `start`: what it answered, and the tree it left.
+pub fn over<a | e>(
+  start: MemFs,
+  body: () -> a / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store] | e},
+) -> Ran<a> / e =
+  with_cell[tree](start) { t -> {
+    let value = handle {
+      body()
+    } with {
+      fs.read_file[store](p) -> fs::mem_read(cell_get(t), p),
+      fs.write_file[store](p, b) -> {
+        let w = fs::mem_write(cell_get(t), p, b);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.create_dir[store](p) -> {
+        let w = fs::mem_create_dir(cell_get(t), p);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.rename[store](from, to) -> {
+        let w = fs::mem_rename(cell_get(t), from, to);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.lock[store](p) -> {
+        let w = fs::mem_lock(cell_get(t), p);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.unlock[store](p) -> {
+        let w = fs::mem_unlock(cell_get(t), p);
+        cell_set(t, w.fs);
+        w.ok
+      },
+    };
+    { value: value, tree: cell_get(t) }
+  } }
+
+/// `body` run with `tokens()` as the configuration its writes are authorised against.
+pub fn configured<a | e>(body: () -> a / {config.secret[tokens] | e}) -> a / e =
+  handle { body() } with { config.secret[tokens](k) -> config::secret_step(tokens(), k) }
+
+/// The configuration a test's registry runs under: `orders` published with `t0k`.
+pub fn tokens() -> config::Values =
+  config::values([], [{ key: "token.orders", value: "t0k" }, { key: "token.money", value: "m0n" }])
+
+/// A manifest as `ply new --lib` would write it, at `0.<minor>.0`.
+pub fn manifest(name: String, minor: Int, rest: String) -> Bytes =
+  bytes_of_string(
+    "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name
+      ++ "\", version: {major: 0, minor: "
+      ++ int_to_string(minor)
+      ++ ", patch: 0}, prefix: None, runtime: {major: 0, minor: 16, patch: 0}, "
+      ++ rest
+      ++ "}",
+  )
+
+pub fn library(name: String, minor: Int) -> Bytes =
+  manifest(name, minor, "dependencies: [], entry: None")
+
+fn a_head() -> Head = { frontend: b"", runtime: b"", body_encoding: 1, stdlib: b"", entry: b"" }
+
+/// An archive holding `manifest` and one module, sealed as `ply build` seals a library.
+pub fn archive(manifest: Bytes) -> Bytes = {
+  let container = encode_named(library_magic(), a_head(), [
+    { name: b"sources", count: 1, payload: b"module core 24\npub fn one() -> Int = 1\n" },
+    { name: b"manifest", count: 1, payload: manifest },
+    { name: b"unit", count: 0, payload: b"" },
+  ]);
+  match digest_of(library_domain(), container) {
+    None -> panic("a container this twin built is long enough to seal"),
+    Some(d) ->
+      bytes_concat_all([
+        bytes_slice(container, 0, off_digest()),
+        d,
+        bytes_slice(container, off_digest() + 32, bytes_len(container)),
+      ]),
+  }
+}
+
+/// The digest a publish of `archive` carries.
+pub fn digest(archive: Bytes) -> String =
+  match digest_of(library_domain(), archive) { Some(d) -> digest_text(d), None -> "" }

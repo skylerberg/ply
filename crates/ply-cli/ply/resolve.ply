@@ -1,18 +1,25 @@
 // `ply resolve` — write the lockfile from the manifest closure. This is the deliberate act that
 // accepts a dependency whose sources moved: a build refuses one (`E0138`) and points here, and what
 // this writes is the closure it just read, so a lock can only ever describe a closure that was
-// loaded.
+// loaded. It is also the one command that asks a registry: the registry dependencies the closure
+// selects are fetched into the project's cache first, and every later walk reads them there.
 
 import builder (builder)
+import cache (store)
 import args (Flags, style_of)
-import lock (Lock, Pinned, from_front, path_of, text)
+import env (env)
+import lock
+import lock (Archived, Pinned, from_front, path_of, text)
 import paths (Resolved, here)
 import program (Program, load_program)
+import remote
 import report (Answer, ind, ok_code, count_of, refused, reported)
+import sources (load_resolved)
 import style (Style, bold, green, plain)
 import compiler.resolve (Diag, diag1)
 import std.fs (fs)
-import std.json (Json, Array, Bool, Number, Str, object, to_string)
+import std.json (Json, Array, Bool, Member, Number, Str, object, to_string)
+import std.net (net)
 
 // The root the command was pointed at, as the resolved path the lock is written under.
 fn root_of(flags: Flags) -> Resolved =
@@ -37,13 +44,28 @@ fn written(
 ) -> Bool / {fs.write_file[cwd], fs.write_file[abs]} =
   if r.label == "cwd" { fs.write_file[cwd](path, body) } else { fs.write_file[abs](path, body) }
 
-fn one(p: Pinned) -> String = p.name ++ " " ++ p.version ++ " · " ++ p.digest
+fn archive_of(archives: List<Archived>, p: Pinned) -> Option<String> =
+  fold(archives, None, |found: Option<String>, a: Archived|
+    match found {
+      Some(_) -> found,
+      None -> if a.name == p.name && a.version == p.version { Some(a.archive) } else { None },
+    })
+
+fn one(p: Pinned, archive: Option<String>) -> String =
+  p.name ++ " " ++ p.version ++ " · " ++ p.digest
+    ++ (match archive { Some(_) -> " · registry", None -> "" })
 
 // The head names the lock and how many packages it pins. `--json` prints the object instead.
 fn lines(s: Style, pins: List<Pinned>, path: String) -> List<String> =
   [ind() ++ green(s, "resolved") ++ " " ++ count_of(len(pins), "package") ++ " · " ++ path]
 
-fn json_of(pins: List<Pinned>, path: String, code: Int, wrote: Bool) -> Json =
+fn json_of(
+  pins: List<Pinned>,
+  archives: List<Archived>,
+  path: String,
+  code: Int,
+  wrote: Bool,
+) -> Json =
   object([
     { key: "command", value: Str("resolve") },
     { key: "ok", value: Bool(code == ok_code()) },
@@ -54,11 +76,20 @@ fn json_of(pins: List<Pinned>, path: String, code: Int, wrote: Bool) -> Json =
       key: "packages",
       value: Array(
         map(pins, |p: Pinned|
-          object([
-            { key: "name", value: Str(p.name) },
-            { key: "version", value: Str(p.version) },
-            { key: "digest", value: Str(p.digest) },
-          ])),
+          object(
+            fold(
+              match archive_of(archives, p) {
+                None -> [],
+                Some(a) -> [{ key: "archive", value: Str(a) }],
+              },
+              [
+                { key: "name", value: Str(p.name) },
+                { key: "version", value: Str(p.version) },
+                { key: "digest", value: Str(p.digest) },
+              ],
+              |acc: List<Member>, m: Member| push(acc, m),
+            ),
+          )),
       ),
     },
   ])
@@ -68,14 +99,15 @@ fn json_of(pins: List<Pinned>, path: String, code: Int, wrote: Bool) -> Json =
 fn answered(
   s: Style,
   pins: List<Pinned>,
+  archives: List<Archived>,
   path: String,
   code: Int,
   wrote: Bool,
   more: Bool,
 ) -> Answer = {
-  let body: List<String> = map(pins, |p: Pinned| ind() ++ "  " ++ one(p));
+  let body: List<String> = map(pins, |p: Pinned| ind() ++ "  " ++ one(p, archive_of(archives, p)));
   {
-    json: json_of(pins, path, code, wrote),
+    json: json_of(pins, archives, path, code, wrote),
     lines: append_lines(lines(s, pins, path), if more { body } else { [] }),
     errs: [],
     code: code,
@@ -87,18 +119,35 @@ fn append_lines(a: List<String>, b: List<String>) -> List<String> =
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs], store.known[cache], store.file[cache], env.var[sys], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.create_dir[abs], fs.remove[abs], fs.rename[abs]} = {
   let s = style_of(flags);
   let r = root_of(flags);
+  // The lock is read before anything is fetched: the archive digests it pins are what a registry's
+  // answer for a pinned version is checked against.
+  match lock::read(r) {
+    Err(why) -> reported(s, "resolve", [lock::refused(r, why)], []),
+    Ok(existing) -> match remote::resolved(load_resolved(flags.paths), existing) {
+      Err(d) -> reported(s, "resolve", [d], []),
+      Ok(archives) -> pinned(s, flags, r, archives),
+    },
+  }
+}
+
+fn pinned(
+  s: Style,
+  flags: Flags,
+  r: Resolved,
+  archives: List<Archived>,
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs], store.known[cache], store.file[cache]} = {
   let loaded: Program = load_program(flags.paths);
   match loaded.whole {
     None -> refused(s, "resolve", loaded.diags, loaded.places),
     Some(w) -> {
       let pins = from_front(w.pins);
       let path = path_of(r);
-      let body = bytes_of_string(text(None, pins));
+      let body = bytes_of_string(text(None, pins, archives));
       if !written(r, path, body) { reported(s, "resolve", [unwritable(path)], loaded.places) }
-      else { answered(s, pins, path, ok_code(), true, !flags.json) }
+      else { answered(s, pins, archives, path, ok_code(), true, !flags.json) }
     },
   }
 }
@@ -110,27 +159,44 @@ fn a_pin(name: String, version: String, digest: String) -> Pinned =
 
 test "a resolve names what it pinned, one line per package" {
   let pins = [a_pin("lib", "0.1.0", "b3:1f2e3d4c5b6a"), a_pin("base", "0.0.1", "b3:99aa")];
-  let answer = answered(plain(), pins, "app/ply.lock", ok_code(), true, true);
+  let answer = answered(
+    plain(),
+    pins,
+    [{ name: "base", version: "0.0.1", archive: "b3:77" }],
+    "app/ply.lock",
+    ok_code(),
+    true,
+    true,
+  );
   assert_eq(answer.code, 0);
   assert_eq(answer.lines, [
     "   resolved 2 packages · app/ply.lock",
     "     lib 0.1.0 · b3:1f2e3d4c5b6a",
-    "     base 0.0.1 · b3:99aa",
+    "     base 0.0.1 · b3:99aa · registry",
   ])
 }
 
 test "the json answer carries every pin, and `--json` prints no lines" {
   let pins = [a_pin("lib", "0.1.0", "b3:1f2e3d4c5b6a")];
-  let text = to_string(json_of(pins, "app/ply.lock", ok_code(), true));
+  let text = to_string(
+    json_of(
+      pins,
+      [{ name: "lib", version: "0.1.0", archive: "b3:77" }],
+      "app/ply.lock",
+      ok_code(),
+      true,
+    ),
+  );
   assert(string_contains(text, "\"command\":\"resolve\""));
   assert(string_contains(text, "\"lockfile\":\"app/ply.lock\""));
   assert(string_contains(text, "\"written\":true"));
   assert(string_contains(text, "\"name\":\"lib\""));
   assert(string_contains(text, "\"digest\":\"b3:1f2e3d4c5b6a\""));
+  assert(string_contains(text, "\"archive\":\"b3:77\""));
   assert_eq(lines(plain(), pins, "app/ply.lock"), ["   resolved 1 package · app/ply.lock"])
 }
 
 test "a project with no dependencies resolves to an empty lock" {
-  let answer = answered(plain(), [], "ply.lock", ok_code(), true, false);
+  let answer = answered(plain(), [], [], "ply.lock", ok_code(), true, false);
   assert_eq(answer.lines, ["   resolved 0 packages · ply.lock"])
 }

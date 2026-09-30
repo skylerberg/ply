@@ -12,14 +12,15 @@ import report (Answer, ok_code, schema_version)
 import compiler.pkg
 import compiler.resolve (Diag, diag1)
 import std.fs (fs)
-import std.json (Json, error_to_string, object, parse, to_string)
+import std.json (Json, Member, Number, Str, JsonCodec, error_to_string, field, int_json, list_json,
+                 object, optional_field, parse, string_json, to_string)
 import std.path (join)
 
-// One package as the lock records it: the front end's pin, as text, because the file is JSON.
+// One package as the front end pins it, as text, because the file is JSON.
 pub type Pinned = { name: String, version: String, digest: String }
 
-// The front end's answer carries bytes — it crosses as frames — so the boundary converts once,
-// here, rather than at every caller.
+// The front end's answer carries bytes, so the boundary converts once, here, rather than at every
+// caller.
 pub fn from_front(ps: List<pkg::Pinned>) -> List<Pinned> =
   map(ps, |p: pkg::Pinned|
     {
@@ -28,12 +29,70 @@ pub fn from_front(ps: List<pkg::Pinned>) -> List<Pinned> =
       digest: string_of_bytes_lossy(p.digest),
     })
 
-pub type Lock = { version: Int, packages: List<Pinned> }
+/// One package as the file records it: its pin and, for a registry package, the digest of the
+/// archive it was fetched as, which the next fetch of that version must match.
+pub type Entry = { name: String, version: String, digest: String, archive: Option<String> }
+
+/// A registry package's archive, as `ply resolve` fetched and checked it.
+pub type Archived = { name: String, version: String, archive: String }
+
+pub type Lock = { version: Int, packages: List<Entry> }
 
 derive eq for Pinned
+derive eq for Entry
+derive eq for Archived
 derive eq for Lock
-derive json for Pinned
-derive json for Lock
+
+pub fn pin_of(e: Entry) -> Pinned = { name: e.name, version: e.version, digest: e.digest }
+
+// `archive` is written only for a registry package: a lock over path and git dependencies holds no
+// field it does not use.
+fn entry_json() -> JsonCodec<Entry> =
+  {
+    encode: |e: Entry|
+      object(
+        fold(
+          match e.archive { None -> [], Some(a) -> [{ key: "archive", value: Str(a) }] },
+          [
+            { key: "name", value: Str(e.name) },
+            { key: "version", value: Str(e.version) },
+            { key: "digest", value: Str(e.digest) },
+          ],
+          |acc: List<Member>, m: Member| push(acc, m),
+        ),
+      ),
+    decode: |j: Json|
+      match field(j, "name", string_json()) {
+        Err(e) -> Err(e),
+        Ok(name) -> match field(j, "version", string_json()) {
+          Err(e) -> Err(e),
+          Ok(version) -> match field(j, "digest", string_json()) {
+            Err(e) -> Err(e),
+            Ok(digest) -> match optional_field(j, "archive", string_json()) {
+              Err(e) -> Err(e),
+              Ok(archive) -> Ok({ name: name, version: version, digest: digest, archive: archive }),
+            },
+          },
+        },
+      },
+  }
+
+fn lock_json() -> JsonCodec<Lock> =
+  {
+    encode: |l: Lock|
+      object([
+        { key: "version", value: Number(decimal_of_int(l.version)) },
+        { key: "packages", value: list_json(entry_json()).encode(l.packages) },
+      ]),
+    decode: |j: Json|
+      match field(j, "version", int_json()) {
+        Err(e) -> Err(e),
+        Ok(version) -> match field(j, "packages", list_json(entry_json())) {
+          Err(e) -> Err(e),
+          Ok(packages) -> Ok({ version: version, packages: packages }),
+        },
+      },
+  }
 
 // The format this file writes. A lock from another version is refused rather than half-read.
 pub fn format() -> Int = 1
@@ -70,15 +129,9 @@ pub fn read(r: Resolved) -> Result<Option<Lock>, String> / {fs.read_file[cwd], f
   }
 
 /// What the lock says about one package, when it says anything.
-fn entry_of(lock: Lock, name: String) -> Option<Pinned> =
-  fold(lock.packages, None, |found: Option<Pinned>, p: Pinned|
-    match found { Some(_) -> found, None -> if p.name == name { Some(p) } else { None } })
-
-/// Every pin the lock records that the closure no longer holds, by name: a stale entry, which a
-/// write drops.
-fn stale(lock: Lock, pins: List<Pinned>) -> List<String> =
-  filter(map(lock.packages, |p: Pinned| p.name), |name: String|
-    !fold(pins, false, |held: Bool, p: Pinned| held || p.name == name))
+pub fn entry_of(lock: Lock, name: String) -> Option<Entry> =
+  fold(lock.packages, None, |found: Option<Entry>, e: Entry|
+    match found { Some(_) -> found, None -> if e.name == name { Some(e) } else { None } })
 
 // --- The judgment ----------------------------------------------------------------
 
@@ -94,7 +147,7 @@ pub fn refused(r: Resolved, why: String) -> Diag =
     [b"delete it to pin what is on disk now, or restore it from version control"],
   )
 
-pub fn mismatch(r: Resolved, name: String, pinned: Pinned, found: Pinned) -> Diag =
+pub fn mismatch(r: Resolved, name: String, pinned: Entry, found: Pinned) -> Diag =
   diag1(
     b"E0138",
     outside(),
@@ -132,37 +185,47 @@ pub fn verified(r: Resolved, lock: Lock, pins: List<Pinned>) -> Result<(), Diag>
 // --- Writing -----------------------------------------------------------------------
 
 /// The lock a run's closure pins, with every package the closure holds and no stale entries: what
-/// `ply build` writes, so a lock can only ever describe a build that happened.
-pub fn text(lock: Option<Lock>, pins: List<Pinned>) -> String = {
-  let kept = match lock {
-    None -> [],
-    Some(l) -> filter(l.packages, |p: Pinned| !held(stale(l, pins), p.name)),
-  };
-  let added = fold(pins, kept, |acc: List<Pinned>, p: Pinned|
-    match entry_of({ version: format(), packages: acc }, p.name) {
-      Some(_) -> acc,
-      None -> push(acc, p),
-    });
-  to_string(lock_json().encode({ version: format(), packages: sorted(added) })) ++ "\n"
+/// `ply build` writes, so a lock can only ever describe a build that happened. A package the lock
+/// already records under the same digest keeps its entry, archive and all; one `archives` names is
+/// recorded with the archive `ply resolve` fetched it as.
+pub fn text(lock: Option<Lock>, pins: List<Pinned>, archives: List<Archived>) -> String = {
+  let entries = map(pins, |p: Pinned| entry_for(lock, archives, p));
+  to_string(lock_json().encode({ version: format(), packages: sorted(entries) })) ++ "\n"
 }
 
-fn held(stale_names: List<String>, name: String) -> Bool =
-  fold(stale_names, false, |found: Bool, s: String| found || s == name)
+fn entry_for(lock: Option<Lock>, archives: List<Archived>, p: Pinned) -> Entry = {
+  let fetched = fold(archives, None, |found: Option<String>, a: Archived|
+    match found {
+      Some(_) -> found,
+      None -> if a.name == p.name && a.version == p.version { Some(a.archive) } else { None },
+    });
+  let recorded = match lock { None -> None, Some(l) -> entry_of(l, p.name) };
+  match fetched {
+    Some(archive) -> { name: p.name, version: p.version, digest: p.digest, archive: Some(archive) },
+    None -> match recorded {
+      Some(e) -> if e.digest == p.digest && e.version == p.version { e } else { fresh(p) },
+      None -> fresh(p),
+    },
+  }
+}
+
+fn fresh(p: Pinned) -> Entry = { name: p.name, version: p.version, digest: p.digest, archive: None }
 
 // By name, so two runs that pinned the same closure write the same file and a diff is a change in
 // the closure rather than in a walk order.
-fn sorted(pins: List<Pinned>) -> List<Pinned> =
-  fold(pins, [], |acc: List<Pinned>, p: Pinned| {
+fn sorted(entries: List<Entry>) -> List<Entry> =
+  fold(entries, [], |acc: List<Entry>, p: Entry| {
     let n = len(acc);
     let i = fold(range(0, n), n, |at_i: Int, j: Int|
       if at_i < n { at_i } else if name_lt(p.name, at(acc, j).name) { j } else { at_i });
     inserted(acc, i, p)
   })
 
-fn inserted(pins: List<Pinned>, i: Int, p: Pinned) -> List<Pinned> = {
-  let before = fold(range(0, i), [], |acc: List<Pinned>, j: Int| push(acc, at(pins, j)));
-  let after = fold(range(i, len(pins)), [], |acc: List<Pinned>, j: Int| push(acc, at(pins, j)));
-  fold(after, push(before, p), |acc: List<Pinned>, x: Pinned| push(acc, x))
+fn inserted(entries: List<Entry>, i: Int, p: Entry) -> List<Entry> = {
+  let before = fold(range(0, i), [], |acc: List<Entry>, j: Int| push(acc, at(entries, j)));
+  let after = fold(range(i, len(entries)), [], |acc: List<Entry>, j: Int|
+    push(acc, at(entries, j)));
+  fold(after, push(before, p), |acc: List<Entry>, x: Entry| push(acc, x))
 }
 
 // `String` has no ordered comparison: bytes do, and a name's bytes are its order.
@@ -177,9 +240,12 @@ fn at<a>(xs: List<a>, i: Int) -> a =
 fn a_pin(name: String, version: String, digest: String) -> Pinned =
   { name: name, version: version, digest: digest }
 
+fn an_entry(name: String, version: String, digest: String, archive: Option<String>) -> Entry =
+  { name: name, version: version, digest: digest, archive: archive }
+
 test "a lock is written sorted by name, so a walk order cannot change it" {
   let pins = [a_pin("zebra", "1.0.0", "b3:z"), a_pin("alpha", "0.2.0", "b3:a")];
-  let text = text(None, pins);
+  let text = text(None, pins, []);
   assert(string_contains(text, "\"name\":\"alpha\""));
   // `string_find` raises when the needle is absent, which is itself the failure this test means.
   assert(string_find(text, "\"alpha\"") < string_find(text, "\"zebra\""))
@@ -187,17 +253,35 @@ test "a lock is written sorted by name, so a walk order cannot change it" {
 
 test "a lock round-trips through the format it writes" {
   let pins = [a_pin("lib", "0.1.0", "b3:1f2e")];
-  match decoded(text(None, pins)) {
+  match decoded(text(None, pins, [])) {
     Err(why) -> panic(why),
     Ok(lock) -> {
       assert_eq(lock.version, 1);
-      assert_eq(lock.packages, pins)
+      assert_eq(lock.packages, [an_entry("lib", "0.1.0", "b3:1f2e", None)])
     },
   }
 }
 
+test "only a registry package records an archive, and a path package's entry holds three fields" {
+  let text = text(None, [a_pin("lib", "0.1.0", "b3:1f"), a_pin("orders", "0.2.0", "b3:9a")], [
+    { name: "orders", version: "0.2.0", archive: "b3:77" },
+  ]);
+  assert_eq(
+    text,
+    "{\"packages\":[{\"digest\":\"b3:1f\",\"name\":\"lib\",\"version\":\"0.1.0\"},{\"archive\":\"b3:77\",\"digest\":\"b3:9a\",\"name\":\"orders\",\"version\":\"0.2.0\"}],\"version\":1}\n",
+  );
+  match decoded(text) {
+    Err(why) -> panic(why),
+    Ok(lock) ->
+      assert_eq(lock.packages, [
+        an_entry("lib", "0.1.0", "b3:1f", None),
+        an_entry("orders", "0.2.0", "b3:9a", Some("b3:77")),
+      ]),
+  }
+}
+
 test "a pinned package whose sources moved is refused, and one the lock does not hold is not" {
-  let lock: Lock = { version: 1, packages: [a_pin("lib", "0.1.0", "b3:old")] };
+  let lock: Lock = { version: 1, packages: [an_entry("lib", "0.1.0", "b3:old", None)] };
   let r: Resolved = {
     label: "cwd",
     spelling: ".",
@@ -224,12 +308,40 @@ test "a pinned package whose sources moved is refused, and one the lock does not
 test "writing a lock keeps what the closure still holds and drops what it left" {
   let before: Lock = {
     version: 1,
-    packages: [a_pin("gone", "0.1.0", "b3:g"), a_pin("lib", "0.1.0", "b3:old")],
+    packages: [
+      an_entry("gone", "0.1.0", "b3:g", None),
+      an_entry("lib", "0.1.0", "b3:old", None),
+      an_entry("orders", "0.2.0", "b3:o", Some("b3:77")),
+    ],
   };
-  let text = text(Some(before), [a_pin("lib", "0.1.0", "b3:old"), a_pin("new", "0.2.0", "b3:n")]);
+  let text = text(
+    Some(before),
+    [
+      a_pin("lib", "0.1.0", "b3:old"),
+      a_pin("new", "0.2.0", "b3:n"),
+      a_pin("orders", "0.2.0", "b3:o"),
+    ],
+    [],
+  );
   match decoded(text) {
     Err(why) -> panic(why),
     Ok(lock) ->
-      assert_eq(lock.packages, [a_pin("lib", "0.1.0", "b3:old"), a_pin("new", "0.2.0", "b3:n")]),
+      assert_eq(lock.packages, [
+        an_entry("lib", "0.1.0", "b3:old", None),
+        an_entry("new", "0.2.0", "b3:n", None),
+        an_entry("orders", "0.2.0", "b3:o", Some("b3:77")),
+      ]),
   }
+}
+
+test "an archive is kept only for the sources it was fetched as" {
+  let before: Lock = { version: 1, packages: [an_entry("orders", "0.2.0", "b3:o", Some("b3:77"))] };
+  // The sources moved or the version did: the old archive no longer describes what is pinned.
+  let moved = text(Some(before), [a_pin("orders", "0.2.0", "b3:other")], []);
+  assert(!string_contains(moved, "b3:77"));
+  let raised = text(Some(before), [a_pin("orders", "0.3.0", "b3:o3")], [
+    { name: "orders", version: "0.3.0", archive: "b3:88" },
+  ]);
+  assert(string_contains(raised, "\"archive\":\"b3:88\""));
+  assert(!string_contains(raised, "b3:77"))
 }

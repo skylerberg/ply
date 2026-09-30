@@ -53,9 +53,8 @@ pub fn handed(root: &Path) -> ply_eval::Value {
         manifest: None,
         supplied: Vec::new(),
     };
-    let pulled =
-        producer::front_pulling_std_with(&own, ply_machine::shelf::sources(), &[], &[], &packages)
-            .expect("the front end runs");
+    let pulled = producer::front_pulling_std_with(&own, ply_machine::shelf::sources(), &packages)
+        .expect("the front end runs");
     for name in &pulled.modules {
         let module = ply_ty::ModuleName::from_dotted(name);
         if let Some(text) = ply_machine::shelf::source(&module) {
@@ -76,14 +75,15 @@ pub fn handed(root: &Path) -> ply_eval::Value {
         ])
     };
     ply_machine::payload::record(vec![
-        ("dump", ply_eval::Value::bytes(pulled.dump.as_bytes())),
+        ("dump", pulled.dump),
         (
             "files",
             ply_eval::Value::list(files.into_iter().map(file).collect()),
         ),
-        ("packages", ply_eval::Value::list(Vec::new())),
         ("read_ms", ply_eval::Value::Int(0)),
         ("front_ms", ply_eval::Value::Int(0)),
+        ("file_ms", ply_eval::Value::Int(0)),
+        ("cached", ply_eval::Value::Bool(false)),
     ])
 }
 
