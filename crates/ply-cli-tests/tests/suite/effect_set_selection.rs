@@ -129,38 +129,7 @@ fn widening_a_set_selects_exactly_the_tests_that_reach_it() {
 
 /// A cold cache never exercises an invalidation, and an invalidation is the only thing that can be wrong.
 #[test]
-fn incremental_and_from_scratch_agree_across_a_sequence_of_set_edits() {
-    use ply_machine::driver;
-    use ply_machine::load::Loaded;
-    use ply_store::Store;
-    use std::collections::BTreeMap;
-
-    fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
-        let mut out = BTreeMap::new();
-        for (name, hash) in &loaded.hashes.defs {
-            out.insert(format!("hash {name}"), hash.to_hex());
-        }
-        for (name, def) in &loaded.check.defs {
-            out.insert(format!("scheme {name}"), format!("{:?}", def.scheme));
-            out.insert(format!("footprint {name}"), def.footprint.to_string());
-            out.insert(format!("performed {name}"), def.performed.to_string());
-            out.insert(format!("aliases {name}"), format!("{:?}", def.row_aliases));
-        }
-        for (i, test) in loaded.check.tests.iter().enumerate() {
-            let hash = loaded
-                .hashes
-                .tests
-                .get(i)
-                .map(|h| h.to_hex())
-                .unwrap_or_default();
-            out.insert(
-                format!("test {i}"),
-                format!("{} {} {hash}", test.key, test.footprint),
-            );
-        }
-        out
-    }
-
+fn a_warm_check_agrees_with_a_cold_one_across_a_sequence_of_set_edits() {
     let dir = project(NARROW);
     let sequence = [
         NARROW,
@@ -174,15 +143,6 @@ fn incremental_and_from_scratch_agree_across_a_sequence_of_set_edits() {
     ];
     for (step, web) in sequence.iter().enumerate() {
         std::fs::write(dir.path().join("m.ply"), source(web)).expect("the module is writable");
-        let mut store = Store::open(dir.path()).expect("the cache is creatable");
-        let incremental = driver::load_incremental(dir.path(), &mut store)
-            .unwrap_or_else(|e| panic!("step {step}: incremental failed: {e:?}"));
-        let full = driver::load_full(dir.path())
-            .unwrap_or_else(|e| panic!("step {step}: from scratch failed: {e:?}"));
-        assert_eq!(
-            snapshot(&incremental),
-            snapshot(&full),
-            "step {step}: the two paths disagreed"
-        );
+        crate::harness::warm_agrees(dir.path(), &format!("step {step}"));
     }
 }

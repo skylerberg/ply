@@ -1,27 +1,45 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn binary(name: &str) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    for prefix in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/lib/postgresql"] {
-        let candidate = Path::new(prefix).join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+const TOOLS: [&str; 3] = ["initdb", "postgres", "psql"];
+
+/// The directory holding postgres and its tools: the first on PATH, else Homebrew's, else the
+/// newest of Debian's per-version directories, which are off PATH.
+fn bin_dir() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    candidates.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    let mut debian: Vec<(u32, PathBuf)> = std::fs::read_dir("/usr/lib/postgresql")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let major = entry.file_name().to_str()?.parse().ok()?;
+            Some((major, entry.path().join("bin")))
+        })
+        .collect();
+    debian.sort();
+    candidates.extend(debian.into_iter().rev().map(|(_, dir)| dir));
+    candidates
+        .into_iter()
+        .find(|dir| TOOLS.iter().all(|tool| dir.join(tool).is_file()))
 }
 
+fn binary(name: &str) -> PathBuf {
+    bin_dir().expect("postgres is installed").join(name)
+}
+
+/// Whether this machine can run a cluster. CI promises one, so there a missing one fails the test
+/// that asked rather than skipping it.
 pub fn available() -> bool {
-    binary("initdb").is_some() && binary("postgres").is_some()
+    let found = bin_dir().is_some();
+    assert!(
+        found || std::env::var_os("CI").is_none(),
+        "CI runs the postgres-backed tests, and this runner has no initdb, postgres and psql"
+    );
+    found
 }
 
 /// Stopped on drop, including during a panic unwind, so a failing test leaks no postgres.
@@ -46,7 +64,7 @@ impl Cluster {
     fn launch(database: &str, auth: &[&str], password: Option<&str>) -> Cluster {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let data = directory.path().join("data");
-        let initdb = binary("initdb").expect("initdb");
+        let initdb = binary("initdb");
 
         let status = Command::new(&initdb)
             .args([
@@ -71,7 +89,7 @@ impl Cluster {
         );
 
         let port = free_port();
-        let postgres = binary("postgres").expect("postgres");
+        let postgres = binary("postgres");
         // Run directly, not via `pg_ctl`, so the server is our child and dies with the harness.
         let server = Command::new(&postgres)
             .args([
@@ -115,7 +133,7 @@ impl Cluster {
     }
 
     pub fn psql(&self, database: &str, sql: &str) -> String {
-        let psql = binary("psql").expect("psql");
+        let psql = binary("psql");
         let out = Command::new(&psql)
             .args([
                 "-h",
@@ -145,7 +163,7 @@ impl Cluster {
 
     fn wait_until_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
-        let psql = binary("psql").expect("psql");
+        let psql = binary("psql");
         while Instant::now() < deadline {
             let out = Command::new(&psql)
                 .args([
@@ -175,7 +193,8 @@ impl Cluster {
 impl Drop for Cluster {
     fn drop(&mut self) {
         // Not `kill`: SIGKILL stops the postmaster signalling backends and freeing shared memory.
-        if let Some(pg_ctl) = binary("pg_ctl") {
+        let pg_ctl = binary("pg_ctl");
+        if pg_ctl.is_file() {
             let stopped = Command::new(pg_ctl)
                 .args([
                     "-D",
