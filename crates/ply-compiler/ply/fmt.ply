@@ -304,8 +304,8 @@ fn members(atoms: List<AtomExpr>, names: List<QName>) -> List<Bytes> = {
     { i: 0, j: 0, out: [] },
     len(xs) + len(ys) + 1,
     |s: { i: Int, j: Int, out: List<Bytes> }|
-      if s.i >= len(xs) && s.j >= len(ys) { Stop(s.out) } else if s.j >= len(ys)
-          || (s.i < len(xs) && at(xs, s.i).start < at(ys, s.j).start) {
+      if s.i >= len(xs) && s.j >= len(ys) { Stop(s.out) }
+      else if s.j >= len(ys) || (s.i < len(xs) && at(xs, s.i).start < at(ys, s.j).start) {
         Continue({ i: s.i + 1, j: s.j, out: push(s.out, at(xs, s.i).text) })
       } else { Continue({ i: s.i, j: s.j + 1, out: push(s.out, at(ys, s.j).text) }) },
   );
@@ -467,10 +467,10 @@ fn pattern_text(p: Pr, x: Pattern) -> Bytes =
 
 fn bp(op: Bytes) -> Int =
   if op == b"or" { 1 }
-  else if op == b"and" { 2 } else if op == b"eq" || op == b"ne" || op == b"lt" || op == b"le"
-      || op == b"gt"
-      || op == b"ge" { 3 }
-  else if op == b"bitor" { 4 }
+  else if op == b"and" { 2 }
+  else if op == b"eq" || op == b"ne" || op == b"lt" || op == b"le" || op == b"gt" || op == b"ge" {
+    3
+  } else if op == b"bitor" { 4 }
   else if op == b"bitxor" { 5 }
   else if op == b"bitand" { 6 }
   else if op == b"shl" || op == b"shr" || op == b"ushr" { 7 }
@@ -846,7 +846,8 @@ fn block(p: Pr, st: St, e: Expr, indent: Int) -> St =
   match e {
     EBlock(v) -> {
       let has_tail = match v.tail { Some(_) -> true, None -> false };
-      if len(v.stmts) == 0 && !has_tail && !comment_before(p, st, v.span.end) { emit(st, b"{}") } else {
+      if len(v.stmts) == 0 && !has_tail && !comment_before(p, st, v.span.end) { emit(st, b"{}") }
+      else {
         let s1 = set_prev(trail(p, emit(st, b"{"), v.span.start + 1), v.span.start + 1);
         let s2 = fold(v.stmts, s1, |s: St, x: Stmt| stmt(p, s, x, indent + 2));
         let s3 = match v.tail {
@@ -1019,25 +1020,34 @@ fn branch(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> Branch = {
   }
 }
 
-// The line an `else` would open: a further `if` down to its own branch, or the branch alone.
-fn else_head(p: Pr, e: Expr) -> Option<Bytes> =
-  match e {
+// What follows a branch on its line: the chain's follower once no `else` comes after it.
+fn ending(o: Expr, after: Int) -> Int = match o { ELit(_) -> after, _ -> 0 }
+
+fn fits_alone(p: Pr, e: Expr, indent: Int, after: Int) -> Bool = {
+  let head = match e {
     EIf(v) ->
       cat([Some(b"if "), flat_scrutinee(p, v.cond), Some(b" "), flat_expr(p, v.then_branch)]),
     _ -> flat_expr(p, e),
-  }
+  };
+  let tail = match e { EIf(v) -> ending(v.else_branch, after), _ -> after };
+  match head { Some(f) -> indent + 5 + bytes_len(f) + tail <= width(), None -> false }
+}
 
-// `else` opens a line of its own between two branches that each stay on one, so a chain of short
-// branches reads one to a line; a branch that opened a block takes the keyword onto its brace's
-// line, on whichever side of it that branch is. Comments above the `else` keep their lines above it
-// rather than landing inside the branch that follows, which is not where a second pass finds them.
-fn otherwise(p: Pr, b: Branch, e: Expr, indent: Int) -> St = {
+fn fits_opening(p: Pr, st: St, e: Expr) -> Bool = {
+  let opening = match e {
+    EIf(v) -> cat([Some(b" else if "), flat_scrutinee(p, v.cond), Some(b" {")]),
+    _ -> Some(b" else {"),
+  };
+  match opening { Some(o) -> fits(st, o, 0), None -> false }
+}
+
+// Before a block, `else` joins the line only where the opening fits: no condition breaks for it.
+fn otherwise(p: Pr, b: Branch, e: Expr, indent: Int, after: Int) -> St = {
   let start = expr_span(e).start;
-  let alone = !b.opened
-    && (match else_head(p, e) { Some(f) -> indent + 5 + bytes_len(f) <= width(), None -> false });
   if comment_before(p, b.st, start) { emit(open_line(p, b.st, start, indent, false), b"else ") }
-  else if alone { emit(nl(b.st, indent, false), b"else ") }
-  else { emit(b.st, b" else ") }
+  else if b.opened || (!fits_alone(p, e, indent, after) && fits_opening(p, b.st, e)) {
+    emit(b.st, b" else ")
+  } else { emit(nl(b.st, indent, false), b"else ") }
 }
 
 // A chain the width forced open, one branch to a line.
@@ -1045,12 +1055,12 @@ fn if_chain(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St =
   match e {
     EIf(v) -> {
       let s1 = scrutinee(p, emit(st, b"if "), v.cond, indent + 2, 2);
-      let b = branch(p, emit(s1, b" "), v.then_branch, indent, 0);
       let o = v.else_branch;
+      let b = branch(p, emit(s1, b" "), v.then_branch, indent, ending(o, after));
       match o {
         ELit(_) -> b.st,
-        EIf(_) -> if_chain(p, otherwise(p, b, o, indent), o, indent, after),
-        _ -> branch(p, otherwise(p, b, o, indent), o, indent, after).st,
+        EIf(_) -> if_chain(p, otherwise(p, b, o, indent, after), o, indent, after),
+        _ -> branch(p, otherwise(p, b, o, indent, after), o, indent, after).st,
       }
     },
     _ -> expr(p, st, e, indent, after),
@@ -1601,10 +1611,8 @@ pub fn replace_item(src: Bytes, name: Bytes, item: Bytes) -> Result<Bytes, Bytes
     Some(d) -> Err(bytes_concat(b"the replacement does not parse: ", render_diag(item, d))),
     None -> {
       let m = r.node;
-      if len(m.imports) > 0 { Err(b"the replacement holds an import; it must be one item") } else if len(
-            m.items,
-          )
-          != 1 {
+      if len(m.imports) > 0 { Err(b"the replacement holds an import; it must be one item") }
+      else if len(m.items) != 1 {
         Err(
           bytes_concat_all([
             b"the replacement holds ",
@@ -1650,6 +1658,15 @@ fn formatted(src: Bytes) -> Bytes =
 fn stable(src: Bytes) -> Bool = {
   let out = formatted(src);
   fmt_source(out) == Ok(out)
+}
+
+fn tree_of(src: Bytes) -> Bytes = erase_spans(dump_module(parse(src).node))
+
+// `src` prints as `out`, which prints as itself and parses to the tree `src` does.
+fn lays_out(src: Bytes, out: Bytes) -> Unit = {
+  assert_eq(formatted(src), out);
+  assert_eq(formatted(out), out);
+  assert_eq(tree_of(out), tree_of(src))
 }
 
 test "a program is printed back with its comments, and printing it again changes nothing" {
@@ -1765,6 +1782,202 @@ test "a comment written above an `else` keeps its line above it" {
   );
   assert_eq(formatted(src), src);
   assert(stable(src))
+}
+
+test "an `if` chain past the width breaks into branches before any condition in it breaks" {
+  lays_out(
+    bytes_concat_all([
+      b"fn request_line(line: Bytes) -> Parsed = {\n",
+      b"  let len = bytes_len(line);\n",
+      b"  let sp1 = index_of(line, b\" \", 0);\n",
+      b"  if sp1 >= len { Malformed(\"a request line is `METHOD TARGET VERSION`\") } else {\n",
+      b"    let sp2 = index_of(line, b\" \", sp1 + 1);\n",
+      b"    if sp2 >= len { Malformed(\"a request line is `METHOD TARGET VERSION`\") } else if index_of(\n",
+      b"          line,\n",
+      b"          b\" \",\n",
+      b"          sp2 + 1,\n",
+      b"        )\n",
+      b"        < len { Malformed(\"a request line holds exactly two spaces\") } else {\n",
+      b"      parts(\n",
+      b"        bytes_slice(line, 0, sp1),\n",
+      b"        bytes_slice(line, sp1 + 1, sp2),\n",
+      b"        bytes_slice(line, sp2 + 1, len),\n",
+      b"      )\n",
+      b"    }\n",
+      b"  }\n",
+      b"}\n",
+    ]),
+    bytes_concat_all([
+      b"fn request_line(line: Bytes) -> Parsed = {\n",
+      b"  let len = bytes_len(line);\n",
+      b"  let sp1 = index_of(line, b\" \", 0);\n",
+      b"  if sp1 >= len { Malformed(\"a request line is `METHOD TARGET VERSION`\") } else {\n",
+      b"    let sp2 = index_of(line, b\" \", sp1 + 1);\n",
+      b"    if sp2 >= len { Malformed(\"a request line is `METHOD TARGET VERSION`\") }\n",
+      b"    else if index_of(line, b\" \", sp2 + 1) < len {\n",
+      b"      Malformed(\"a request line holds exactly two spaces\")\n",
+      b"    } else {\n",
+      b"      parts(\n",
+      b"        bytes_slice(line, 0, sp1),\n",
+      b"        bytes_slice(line, sp1 + 1, sp2),\n",
+      b"        bytes_slice(line, sp2 + 1, len),\n",
+      b"      )\n",
+      b"    }\n",
+      b"  }\n",
+      b"}\n",
+    ]),
+  )
+}
+
+test "a condition in a chain breaks, one level in, only when its branch's opening overflows its own line" {
+  lays_out(
+    bytes_concat(
+      b"fn f(a: Int, b: Int) -> Int = if a == 0 { 1 } else if some_long_condition_name(a, b) ",
+      b"&& another_long_condition_name(a, b) && third_condition_name(a, b) && fourth_condition(a) { 2 } else { 3 }\n",
+    ),
+    bytes_concat_all([
+      b"fn f(a: Int, b: Int) -> Int =\n",
+      b"  if a == 0 { 1 }\n",
+      b"  else if some_long_condition_name(a, b) && another_long_condition_name(a, b)\n",
+      b"      && third_condition_name(a, b)\n",
+      b"      && fourth_condition(a) { 2 }\n",
+      b"  else { 3 }\n",
+    ]),
+  )
+}
+
+test "an `if` with a long condition and no `else if` keeps its body on the condition's last line" {
+  lays_out(
+    bytes_concat(
+      b"fn f(a: Int, b: Int) -> Int = if some_long_condition_name(a, b) ",
+      b"&& another_long_condition_name(a, b) && third_one(a) { 1 } else { 2 }\n",
+    ),
+    bytes_concat_all([
+      b"fn f(a: Int, b: Int) -> Int =\n",
+      b"  if some_long_condition_name(a, b) && another_long_condition_name(a, b) && third_one(a) { 1 }\n",
+      b"  else { 2 }\n",
+    ]),
+  );
+  lays_out(
+    bytes_concat(
+      b"fn g(a: Int, b: Int) -> Int = if some_long_condition_name(a, b) ",
+      b"&& another_long_condition_name(a, b) && third_condition_name(a, b) && fourth(a) { 1 } else { 2 }\n",
+    ),
+    bytes_concat_all([
+      b"fn g(a: Int, b: Int) -> Int =\n",
+      b"  if some_long_condition_name(a, b) && another_long_condition_name(a, b)\n",
+      b"      && third_condition_name(a, b)\n",
+      b"      && fourth(a) { 1 }\n",
+      b"  else { 2 }\n",
+    ]),
+  )
+}
+
+test "a chain in a `let`, a match arm or a call argument puts each `else` where the chain's line began" {
+  let chain = bytes_concat(
+    b"if a == 0 { first(a, b) } else if some_long_condition_name(a, b) ",
+    b"&& another_long_condition_name(a, b) { second_value_with_a_longer_name(a, b) } else { third(a, b) }",
+  );
+  lays_out(
+    bytes_concat_all([b"fn f(a: Int, b: Int) -> Int = { let x = ", chain, b"; x }\n"]),
+    bytes_concat_all([
+      b"fn f(a: Int, b: Int) -> Int = {\n",
+      b"  let x = if a == 0 { first(a, b) }\n",
+      b"  else if some_long_condition_name(a, b) && another_long_condition_name(a, b) {\n",
+      b"    second_value_with_a_longer_name(a, b)\n",
+      b"  } else { third(a, b) };\n",
+      b"  x\n",
+      b"}\n",
+    ]),
+  );
+  lays_out(
+    bytes_concat_all([
+      b"fn g(o: Option<Int>, b: Int) -> Int = match o { Some(a) -> ",
+      chain,
+      b", None -> 0 }\n",
+    ]),
+    bytes_concat_all([
+      b"fn g(o: Option<Int>, b: Int) -> Int =\n",
+      b"  match o {\n",
+      b"    Some(a) -> if a == 0 { first(a, b) }\n",
+      b"    else if some_long_condition_name(a, b) && another_long_condition_name(a, b) {\n",
+      b"      second_value_with_a_longer_name(a, b)\n",
+      b"    } else { third(a, b) },\n",
+      b"    None -> 0,\n",
+      b"  }\n",
+    ]),
+  );
+  lays_out(
+    bytes_concat_all([b"fn h(a: Int, b: Int) -> Int = combine(a, ", chain, b")\n"]),
+    bytes_concat_all([
+      b"fn h(a: Int, b: Int) -> Int =\n",
+      b"  combine(a, if a == 0 { first(a, b) }\n",
+      b"  else if some_long_condition_name(a, b) && another_long_condition_name(a, b) {\n",
+      b"    second_value_with_a_longer_name(a, b)\n",
+      b"  } else { third(a, b) })\n",
+    ]),
+  );
+  lays_out(
+    bytes_concat_all([b"fn k(a: Int, b: Int) -> Int = combine(", chain, b", a)\n"]),
+    bytes_concat_all([
+      b"fn k(a: Int, b: Int) -> Int =\n",
+      b"  combine(\n",
+      b"    if a == 0 { first(a, b) }\n",
+      b"    else if some_long_condition_name(a, b) && another_long_condition_name(a, b) {\n",
+      b"      second_value_with_a_longer_name(a, b)\n",
+      b"    } else { third(a, b) },\n",
+      b"    a,\n",
+      b"  )\n",
+    ]),
+  )
+}
+
+test "an `else` with no room before the block it opens takes a line of its own" {
+  lays_out(
+    bytes_concat(
+      b"fn pick(n: Int) -> Bytes = if n == 0 { b\"a body long enough that the else and its brace ",
+      b"no longer fit on its one line\" } else { let m = n * 2; num(m) }\n",
+    ),
+    bytes_concat_all([
+      b"fn pick(n: Int) -> Bytes =\n",
+      b"  if n == 0 { b\"a body long enough that the else and its brace no longer fit on its one line\" }\n",
+      b"  else {\n",
+      b"    let m = n * 2;\n",
+      b"    num(m)\n",
+      b"  }\n",
+    ]),
+  )
+}
+
+test "the branch that ends a chain leaves room on its line for what follows the chain" {
+  lays_out(
+    bytes_concat(
+      b"fn f(a: Int, b: Int) -> Unit = { if some_long_condition_name(a, b) ",
+      b"&& another_long_condition_name(a, b) { note(a, b, 12345678901) }; done(a) }\n",
+    ),
+    bytes_concat_all([
+      b"fn f(a: Int, b: Int) -> Unit = {\n",
+      b"  if some_long_condition_name(a, b) && another_long_condition_name(a, b) {\n",
+      b"    note(a, b, 12345678901)\n",
+      b"  };\n",
+      b"  done(a)\n",
+      b"}\n",
+    ]),
+  );
+  lays_out(
+    bytes_concat(
+      b"fn g(a: Int, b: Int) -> Int = { let x = if a > b { a } else { combine(first_argument_name, ",
+      b"second_argument_name, third_argument_name, fourth_arguments) }; x }\n",
+    ),
+    bytes_concat_all([
+      b"fn g(a: Int, b: Int) -> Int = {\n",
+      b"  let x = if a > b { a } else {\n",
+      b"    combine(first_argument_name, second_argument_name, third_argument_name, fourth_arguments)\n",
+      b"  };\n",
+      b"  x\n",
+      b"}\n",
+    ]),
+  )
 }
 
 test "every item kind prints back to the same tree" {
