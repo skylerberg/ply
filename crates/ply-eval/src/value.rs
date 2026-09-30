@@ -41,6 +41,14 @@ impl Fields {
             .map(|i| &self.0[i].1)
     }
 
+    /// [`Fields::get`] by the name's text, for a reader holding no symbol.
+    pub fn named(&self, name: &str) -> Option<&Value> {
+        self.0
+            .binary_search_by(|(k, _)| k.as_str().cmp(name))
+            .ok()
+            .map(|i| &self.0[i].1)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&Symbol, &Value)> {
         self.0.iter().map(|(k, v)| (k, v))
     }
