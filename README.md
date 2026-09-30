@@ -20,9 +20,7 @@ of it next.
 
 | path | holds |
 | --- | --- |
-| `crates/ply-span` | spans, diagnostics and the constants for diagnostic codes |
-| `crates/ply-ty` | the type vocabulary the checker produces and everything else reads |
-| `crates/ply-eval` | values, the evaluator, the scheduler and the simulator |
+| `crates/ply-eval` | values, the evaluator, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
 | `crates/ply-codegen` | the compiled tier: emits C, builds it and loads it |
 | `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its bootstrap bundle (`bootstrap/`) |
 | `crates/ply-store` | the result and front-end caches under `.ply-cache` |
@@ -32,6 +30,7 @@ of it next.
 | `crates/ply-machine` | the nested-entry capability: a program loading and entering another program |
 | `crates/ply-std` | the standard library, as Ply source in `ply/` |
 | `crates/ply-cli` | the `ply` program, as Ply source in `ply/` and the artifact it builds (`bootstrap/`); not a cargo crate |
+| `crates/ply-registry` | the package registry `ply publish` and `ply resolve` talk to, as Ply source in `ply/`; not a cargo crate |
 | `crates/ply-launcher` | the `ply` binary: enters the program the artifact holds |
 | `crates/ply-corpus` | synthetic projects and the benchmark harnesses |
 | `crates/<crate>-tests` | that crate's tests |

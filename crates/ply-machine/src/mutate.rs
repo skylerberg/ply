@@ -1,9 +1,7 @@
 use crate::hosts::{Hosts, hosting};
 use crate::load::Loaded;
-use ply_eval::HostRuntime;
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
+use ply_eval::{DefInfo, Diagnostic, HashOutput, HostRuntime, SourceId, Span, Symbol, codes};
 use ply_test::RunReport;
-use ply_ty::{DefInfo, HashOutput};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -257,7 +255,7 @@ pub fn mutants(loaded: &Loaded, def: &DefInfo) -> Vec<Mutant> {
 
 /// The program with one span replaced, as the front end reads it.
 fn spliced(loaded: &Loaded, mutant: &Mutant) -> (Vec<(String, String)>, Vec<SourceId>) {
-    let mut modules: Vec<&ply_ty::ModuleInfo> = loaded.check.modules.values().collect();
+    let mut modules: Vec<&ply_eval::ModuleInfo> = loaded.check.modules.values().collect();
     modules.sort_by_key(|m| m.source.0);
     let sources: Vec<(String, String)> = modules
         .iter()
@@ -367,15 +365,13 @@ where
         return Verdict::Unresolved("the C backend could not be built");
     };
     // The mutant's selection is the program's decision over tests whose hashes this store has never
-    // seen, so a test the program found in the cache is new here. Everything else — the classes they
-    // share, the roots a seeded test owes, the reason for a nondet one — is the program's.
-    // Nothing is known about this program yet, so every test the run reports on runs, and the
-    // classes are one: a mutant's verdict is behaviour, and a class is only a way to overlap
-    // behaviour that does not conflict. Nothing it proves is filed, since the keys the program named
+    // seen, so a test the program found in the cache is new here and every test that reaches the
+    // mutant runs, in the classes the program coloured over every test the run reports on: a subset
+    // of a class shares nothing either. Nothing it proves is filed, since the keys the program named
     // are the unmutated tests'. The reasons stay the program's, with `cached` read as `new`.
     let mut fresh = choice.clone();
     fresh.runs = plan.visible.clone();
-    fresh.groups = vec![plan.visible.clone()];
+    fresh.groups = choice.every.clone();
     fresh.narrowed.clear();
     fresh.filed.clear();
     fresh.reasons = fresh

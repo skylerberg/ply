@@ -3,11 +3,9 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Plan, Value};
-use ply_span::{Diagnostic, Symbol};
-use ply_store::Store;
-use ply_test::{Hosting, InterpExecutor, Reason, Search};
-use ply_ty::Resource;
+use ply_eval::{Diagnostic, Resource, Symbol, Value};
+use ply_store::{Outcome, Store};
+use ply_test::{Hosting, InterpExecutor, Search};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,7 +37,7 @@ impl Drop for TempRoot {
 }
 
 impl Compiled {
-    fn footprint_of_test(&self, name: &str) -> &ply_ty::Footprint {
+    fn footprint_of_test(&self, name: &str) -> &ply_eval::Footprint {
         &self
             .check
             .tests
@@ -91,8 +89,6 @@ fn run(
     store: &mut Store,
     binding: Option<&Arc<HostBinding>>,
 ) -> ply_test::RunReport {
-    let selection =
-        crate::fixture::select(&compiled.check, &compiled.hashes, store, &Plan::default());
     let hosting = match binding {
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
@@ -103,7 +99,7 @@ fn run(
         .with_search(Search::default())
         .with_hosts(hosting);
     ply_test::run_with(
-        &selection,
+        &compiled.every(),
         &compiled.check,
         &compiled.hashes,
         store,
@@ -111,16 +107,9 @@ fn run(
     )
 }
 
-fn reason(compiled: &Compiled, store: &Store, name: &str) -> Reason {
-    let selection =
-        crate::fixture::select(&compiled.check, &compiled.hashes, store, &Plan::default());
-    let index = compiled
-        .check
-        .tests
-        .iter()
-        .position(|t| t.name == name)
-        .expect("the test exists");
-    selection.reasons[index]
+/// Whether the store holds a pass under the test's own key, whatever key a program handed over.
+fn on_file(compiled: &Compiled, store: &Store) -> bool {
+    matches!(store.get(compiled.hashes.tests[0]), Some(Outcome::Pass))
 }
 
 const NONDET: &str = r#"
@@ -156,10 +145,9 @@ fn a_pass_earned_over_a_host_handler_is_never_written_to_the_cache() {
         );
     }
 
-    assert_eq!(
-        reason(&compiled, &store, "reaches the host"),
-        Reason::Nondet,
-        "a host-backed pass was written and read back"
+    assert!(
+        !on_file(&compiled, &store),
+        "a host-backed pass was written under the key it was handed"
     );
 }
 
@@ -205,8 +193,10 @@ fn a_deterministic_registration_binds_and_the_test_footprint_reaches_it() {
     );
 }
 
+/// `suite.select` is handed what the store holds, and no reach: a hermetic pass of a test the
+/// binding reaches is still on file, so a `--host` run reports it cached and never consults the host.
 #[test]
-fn documents_a_host_reaching_test_is_skipped_when_its_hermetic_pass_was_cached() {
+fn documents_a_hermetic_pass_stays_on_file_for_a_test_the_binding_reaches() {
     let compiled = Compiled::new(DETERMINISTIC);
     let name = "its footprint reaches the host, its path does not";
     let root = TempRoot::new();
@@ -217,28 +207,12 @@ fn documents_a_host_reaching_test_is_skipped_when_its_hermetic_pass_was_cached()
     assert_eq!(report.failed, 0, "{:?}", report.failures);
     assert_eq!(report.passed, 1);
 
-    let binding = Arc::new(
-        registry("disk", "peek", Determinism::Deterministic, &calls)
-            .bind(&compiled.check)
-            .expect("the registration binds"),
-    );
-
-    assert_eq!(
-        reason(&compiled, &store, name),
-        Reason::Cached,
-        "hermetic by default requires `Reason::Host` here: a test whose footprint reaches the binding \
-         always runs"
-    );
-
-    let report = run(&compiled, &mut store, Some(&binding));
-    assert_eq!(
-        report.passed + report.failed,
-        0,
-        "the test ran, so this file is out of date and the gap it documents is closed"
-    );
-    assert_eq!(
-        calls.load(Ordering::Relaxed),
-        0,
-        "the host was consulted, so the gap this documents is closed"
+    let binding = registry("disk", "peek", Determinism::Deterministic, &calls)
+        .bind(&compiled.check)
+        .expect("the registration binds");
+    assert!(binding.reaches(compiled.footprint_of_test(name)));
+    assert!(
+        on_file(&compiled, &store),
+        "the hermetic pass is gone, so the gap this documents is closed"
     );
 }

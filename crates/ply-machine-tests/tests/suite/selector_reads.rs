@@ -3,9 +3,7 @@
 //! answers inputs only.
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{Machine, Provider};
-use ply_span::{SourceId, Span};
-use ply_ty::Front;
+use ply_eval::{Front, Machine, Provider, SourceId, Span};
 use std::collections::HashMap;
 
 /// A program that configures the tester over the directory it is handed, loads it, and reports
@@ -44,33 +42,35 @@ type DbOpts = {
 type ConfigOpts = { set: List<String>, files: List<String>, schema: Option<String> }
 type TraceOpts = { sink: String, level: String }
 type SimOpts = {
-  seed: Option<String>, mode: String, seeds: Option<Int>, budget: Option<Int>, steps: Option<Int>,
-  measure_reduction: Bool,
+  seed: Option<String>, mode: String, roots: Option<{ from: Int, to: Int }>, budget: Option<Int>,
+  steps: Option<Int>, measure_reduction: Bool,
 }
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
-  packages: List<{ root: String, digest: String }>,
   read_ms: Int,
   front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
 }
 type Options = {
   path: String, json: Bool, explain: Bool, no_cache: Bool, filter: Option<String>, jobs: Option<Int>,
   steps: Int, timeout: Int, bisect: String, bisect_budget: Int, coverage: Bool, mutate: Option<String>,
-  mutate_budget: Int, trace: String, profile: String, watch: Bool, std: Bool, host: Bool,
-  tls: List<TlsCred>, trust: List<String>, fs: List<Named>, db: DbOpts, config: ConfigOpts, sim: SimOpts,
+  mutate_budget: Int, profile: String, watch: Bool, std: Bool, host: Bool,
+  tls: List<TlsCred>, trust: List<String>, fs: List<Named>, exec: List<Named>, allow: List<String>,
+  db: DbOpts, config: ConfigOpts, sim: SimOpts,
 }
 
 fn options(root: String) -> Options =
   {
     path: root, json: false, explain: false, no_cache: false, filter: None, jobs: None,
     steps: 1000000000, timeout: 60000, bisect: "auto", bisect_budget: 500, coverage: false,
-    mutate: None, mutate_budget: 32, trace: "auto", profile: "development", watch: false,
-    std: false, host: false, tls: [], trust: [], fs: [],
+    mutate: None, mutate_budget: 32, profile: "development", watch: false,
+    std: false, host: false, tls: [], trust: [], fs: [], exec: [], allow: [],
     db: { url: None, pool: None, acquire_ms: None, statement_ms: None, idle_txn_ms: None,
           connect_ms: None, statement_cache: None, schema: None },
     config: { set: [], files: [], schema: None },
-    sim: { seed: None, mode: "exhaustive", seeds: None, budget: None, steps: None, measure_reduction: false },
+    sim: { seed: None, mode: "exhaustive", roots: None, budget: None, steps: None, measure_reduction: false },
   }
 
 fn main(root: String, front: Front) -> Bool / {
@@ -125,7 +125,9 @@ fn a_selector_reads_the_keys_the_hashes_and_the_plan_before_anything_runs() {
 
     let mut registry = HostRegistry::new();
     // Only the operations this program declares: the reads it makes, and the two that start it.
-    for (op, handler) in ply_machine::policy::lent("tester", "tester").expect("the family") {
+    for (op, handler) in
+        ply_machine::policy::lent("tester", &|e: &str| e.to_string()).expect("the family")
+    {
         if ["configure", "loaded", "keys", "hashed", "searched"].contains(&op.op.as_str()) {
             registry.register(op, handler);
         }

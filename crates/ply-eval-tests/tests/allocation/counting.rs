@@ -1,5 +1,4 @@
 //! Counters are thread-local, so the tests in this binary measure in parallel.
-//! Duplicated in crates/ply-corpus-tests/tests/allocation/counting.rs; keep the two in step.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

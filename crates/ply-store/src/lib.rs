@@ -4,7 +4,6 @@
 mod answer;
 mod binary;
 pub mod body;
-mod canonical;
 pub mod codec;
 pub mod diag;
 pub mod disk;
@@ -16,18 +15,13 @@ pub mod schema;
 pub mod upstream;
 
 use anyhow::Context;
-use ply_span::{Diagnostic, Symbol};
-use ply_ty::DefHash;
+use ply_eval::{DefHash, Diagnostic, Symbol};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub use canonical::{canonicalize_decl_body, canonicalize_scheme};
-pub use frontend::{
-    CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, DeclBody, DefEntry, DefKind, FileSpan,
-    Member, NameRef, SourceFingerprint,
-};
+pub use frontend::{DefEntry, DefKind, FileSpan, Member, Slot, SourceFingerprint, TestEntry};
 pub use obligations::{
     CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule,
 };
@@ -38,15 +32,16 @@ pub use upstream::Upstream;
 /// Bumping this discards every cached result; a file from another runtime is never merged.
 pub const RUNTIME_VERSION: &str = "0.16.0";
 
-/// Bumping this discards every cached type, footprint, source fingerprint and front-end answer.
-pub const FRONTEND_VERSION: &str = "0.28.0";
+/// Bumping this discards every filed row and interface, source fingerprint and front-end answer.
+/// What a slot holds is the compiler's `front.Filing` shape, so a change to it is a bump here.
+pub const FRONTEND_VERSION: &str = "0.29.0";
 
 /// Bumping this re-attempts every obligation and re-runs no test.
 pub const PROVER_VERSION: &str = "0.8.0";
 
-/// Bumped when a stored fingerprint gained its module name: a cache from before it holds rows
-/// nothing can file again, and every source is re-checked once.
-pub const FRONTEND_FORMAT: u32 = 10;
+/// What an entry holds: a fingerprint's plain entries, and a slot's name beside the value the
+/// front end filed.
+pub const FRONTEND_FORMAT: u32 = 11;
 
 pub const BODY_ENCODING: u32 = 7;
 
@@ -109,7 +104,7 @@ impl<'de> Deserialize<'de> for ContentHash {
     }
 }
 
-pub use ply_span::codes;
+pub use ply_eval::codes;
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct DefBody {
@@ -565,7 +560,8 @@ pub struct FoundTest {
     pub hash: DefHash,
     pub name: String,
     pub nondet: bool,
-    pub footprint: ply_ty::Footprint,
+    /// What the front end filed for the test, as [`TestEntry::row`] holds it.
+    pub row: Vec<u8>,
     pub path: PathBuf,
     pub span: FileSpan,
 }
@@ -1079,35 +1075,26 @@ impl Store {
         self.frontend.sources_len()
     }
 
-    /// Some interface stored under this hash.
-    pub fn def(&self, hash: DefHash) -> Option<Arc<CachedDef>> {
-        self.frontend.def(hash)
-    }
-
-    pub fn def_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<CachedDef>> {
+    /// What was filed for the definition `name` under `hash`.
+    pub fn def_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<Slot>> {
         self.frontend.def_of(hash, name)
     }
 
-    pub fn decl(&self, hash: DefHash) -> Option<Arc<CachedDecl>> {
-        self.frontend.decl(hash)
-    }
-
-    pub fn decl_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<CachedDecl>> {
+    pub fn decl_of(&self, hash: DefHash, name: &Symbol) -> Option<Arc<Slot>> {
         self.frontend.decl_of(hash, name)
     }
 
-    /// Stores the canonical form of `def`, which is what comes back out.
-    pub fn put_def(&mut self, hash: DefHash, def: CachedDef) {
-        self.frontend.put_def(hash, def);
+    /// Replaces what was filed for the slot's name under `hash`, and nothing filed for another.
+    pub fn put_def(&mut self, hash: DefHash, slot: Slot) {
+        self.frontend.put_def(hash, slot);
     }
 
     pub fn defs_len(&self) -> usize {
         self.frontend.defs_len()
     }
 
-    /// Canonicalizes on the way in, as [`Store::put_def`] does.
-    pub fn put_decl(&mut self, hash: DefHash, decl: CachedDecl) {
-        self.frontend.put_decl(hash, decl);
+    pub fn put_decl(&mut self, hash: DefHash, slot: Slot) {
+        self.frontend.put_decl(hash, slot);
     }
 
     pub fn decls_len(&self) -> usize {
@@ -1231,7 +1218,7 @@ impl Store {
                         hash: test.hash,
                         name: test.name.clone(),
                         nondet: test.nondet,
-                        footprint: test.footprint.clone(),
+                        row: test.row.clone(),
                         path: path.clone(),
                         span: test.span,
                     }));

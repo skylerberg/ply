@@ -1,20 +1,19 @@
 //! Drawing and shrinking `Float` and `Decimal`.
 
-use ply_eval::{Decimal, Value};
-use ply_prove::property::{EDGE_CASES, GenStream, TypeWorld, generatable, generate};
+use ply_eval::{Decimal, DefHash, Value};
+use ply_prove::property::{EDGE_CASES, GenStream, generatable, generate};
 use ply_prove::shrink::{candidates, minimal, size};
-use ply_ty::DefHash;
-use ply_ty::Type;
+use ply_prove::{Sort, World};
 
-fn world() -> TypeWorld {
-    TypeWorld::new(&[])
+fn world() -> World {
+    World::default()
 }
 
 fn key() -> DefHash {
     DefHash([7u8; 32])
 }
 
-fn draw(ty: &Type, cases: u32) -> Vec<Value> {
+fn draw(ty: &Sort, cases: u32) -> Vec<Value> {
     let world = world();
     let mut stream = GenStream::new(1, key());
     (0..cases)
@@ -23,7 +22,7 @@ fn draw(ty: &Type, cases: u32) -> Vec<Value> {
 }
 
 fn floats(cases: u32) -> Vec<f64> {
-    draw(&Type::float(), cases)
+    draw(&Sort::float(), cases)
         .into_iter()
         .map(|v| match v {
             Value::Float(f) => f,
@@ -33,7 +32,7 @@ fn floats(cases: u32) -> Vec<f64> {
 }
 
 fn decimals(cases: u32) -> Vec<Decimal> {
-    draw(&Type::decimal(), cases)
+    draw(&Sort::decimal(), cases)
         .into_iter()
         .map(|v| match v {
             Value::Decimal(d) => d,
@@ -45,9 +44,9 @@ fn decimals(cases: u32) -> Vec<Decimal> {
 #[test]
 fn both_numeric_types_are_generatable() {
     let world = world();
-    assert!(generatable(&Type::float(), &world).is_ok());
-    assert!(generatable(&Type::decimal(), &world).is_ok());
-    assert!(generatable(&Type::list(Type::float()), &world).is_ok());
+    assert!(generatable(&Sort::float(), &world).is_ok());
+    assert!(generatable(&Sort::decimal(), &world).is_ok());
+    assert!(generatable(&Sort::list(Sort::float()), &world).is_ok());
 }
 
 #[test]
@@ -124,10 +123,10 @@ fn a_numeric_draw_is_a_function_of_its_root_and_case() {
 #[test]
 fn the_floor_of_each_numeric_type_is_its_smallest_value() {
     let world = world();
-    let zero = minimal(&Type::float(), &world).unwrap();
+    let zero = minimal(&Sort::float(), &world).unwrap();
     assert!(matches!(zero, Value::Float(f) if f == 0.0 && f.is_sign_positive()));
     assert_eq!(
-        minimal(&Type::decimal(), &world).unwrap(),
+        minimal(&Sort::decimal(), &world).unwrap(),
         Value::Decimal(Decimal::ZERO)
     );
 }
@@ -147,8 +146,8 @@ fn every_numeric_candidate_is_strictly_smaller() {
     ];
     for subject in subjects {
         let ty = match subject {
-            Value::Float(_) => Type::float(),
-            _ => Type::decimal(),
+            Value::Float(_) => Sort::float(),
+            _ => Sort::decimal(),
         };
         let here = size(&subject, &world);
         for candidate in candidates(&subject, &ty, &world) {
@@ -167,7 +166,7 @@ fn a_float_shrinks_all_the_way_to_zero() {
     let world = world();
     let mut current = Value::Float(-1234.5);
     let mut steps = 0;
-    while let Some(next) = candidates(&current, &Type::float(), &world)
+    while let Some(next) = candidates(&current, &Sort::float(), &world)
         .into_iter()
         .next()
     {
@@ -182,7 +181,7 @@ fn a_float_shrinks_all_the_way_to_zero() {
 fn a_decimal_sheds_its_trailing_zeros_before_its_digits() {
     let world = world();
     let padded = Value::Decimal(Decimal::new(1_500_000, 6));
-    let offered = candidates(&padded, &Type::decimal(), &world);
+    let offered = candidates(&padded, &Sort::decimal(), &world);
     assert!(
         offered
             .iter()
@@ -192,7 +191,7 @@ fn a_decimal_sheds_its_trailing_zeros_before_its_digits() {
 
     let mut current = padded;
     let mut steps = 0;
-    while let Some(next) = candidates(&current, &Type::decimal(), &world)
+    while let Some(next) = candidates(&current, &Sort::decimal(), &world)
         .into_iter()
         .next()
     {

@@ -1,7 +1,7 @@
 //! The helpers the machines share: backend selection, the compiled tier over a load, schema
 //! materialisation, the worker pool, and `plural`.
 
-use ply_span::{Diagnostic, SourceMap, Span, codes};
+use ply_eval::{Diagnostic, SourceMap, Span, codes};
 use std::collections::BTreeSet;
 
 /// The worker pool's frames recurse per node on the native stack.
@@ -59,7 +59,7 @@ pub fn run_on_tier(
 }
 
 pub fn module_texts(
-    check: &ply_ty::CheckOutput,
+    check: &ply_eval::CheckOutput,
     sources: &SourceMap,
 ) -> std::collections::HashMap<String, String> {
     check
@@ -83,7 +83,7 @@ pub fn prover_backend(
 
 /// Every command that loaded a program uses this, so an invocation runs one front end.
 pub fn build_backend_over(
-    front: &ply_ty::Front,
+    front: &ply_eval::Front,
     texts: std::collections::HashMap<String, String>,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
@@ -102,7 +102,7 @@ pub fn enter_constant(
     provider: Option<&'static dyn ply_eval::Provider>,
     name: &str,
 ) -> Result<ply_eval::Value, Diagnostic> {
-    let name = ply_span::Symbol::new(name);
+    let name = ply_eval::Symbol::new(name);
     let entered = match provider {
         Some(provider) => provider.attach().enter_whole(&name, &[], 10_000),
         None => ply_eval::Entered::Declined,
@@ -150,7 +150,7 @@ pub fn build_pool(
         Err(e) => {
             warnings.push(
                 Diagnostic::warning(
-                    ply_span::codes::RUNTIME_ERROR,
+                    ply_eval::codes::RUNTIME_ERROR,
                     format!("could not start {requested} worker threads: {e}"),
                 )
                 .note("the run continued on the default thread pool"),

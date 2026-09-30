@@ -9,12 +9,12 @@ use crate::heap::{
 use crate::list;
 use crate::map;
 use crate::stack::{Stack, switch};
-use ply_eval::BinOp;
 use ply_eval::arena::Slot;
 use ply_eval::builtins::{cell_in_update, no_such_cell};
-use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::{EffectAtom, Mode, Resource};
+use ply_eval::{
+    BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Resource, Span, Step,
+    Symbol, Value, codes, values_equal,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -440,7 +440,7 @@ pub struct Ctx {
     /// The host boundary: what a `perform` nothing on the stack answers reaches.
     pub(crate) binding: Arc<ply_eval::HostBinding>,
     pub(crate) runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
-    pub(crate) declared: Option<ply_ty::Footprint>,
+    pub(crate) declared: Option<ply_eval::Footprint>,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_eval::host::HostUse,
     pub(crate) host_ops: u64,

@@ -3,7 +3,7 @@
 //! names its bytes, so a racing write is idempotent, and a reader sees a whole file or none.
 
 use crate::obligations::CachedObligation;
-use ply_ty::DefHash;
+use ply_eval::DefHash;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

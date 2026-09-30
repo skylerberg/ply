@@ -21,16 +21,39 @@ fn every_marshalled_type_is_declared_where_this_side_says() {
     let loaded = ply_machine::load::load(&cli_root()).expect("the CLI tree loads");
     for (home, ty) in MARSHALLED {
         assert!(
-            loaded
-                .check
-                .ctors
-                .values()
-                .any(|c| c.type_name.as_str().rsplit('.').next() == Some(*ty)
-                    && c.module.as_str() == *home),
-            "no constructor of `{ty}` is declared in `{home}`, so a tag built from it names \
-             nothing the program matches"
+            declares(&loaded, home, ty),
+            "`{ty}` is not declared in `{home}`, so a tag built from it names nothing the \
+             program matches"
         );
     }
+}
+
+/// Whether `module` declares a type whose simple name is `ty`: a constructor of it is `module`'s.
+fn declares(loaded: &ply_machine::load::Loaded, module: &str, ty: &str) -> bool {
+    loaded
+        .front
+        .types
+        .values()
+        .any(|t| t.simple_name.as_str() == ty && t.module.as_str() == module)
+}
+
+/// The claims family names a refusal by the module that declares `prover`, so the program has to
+/// declare its `Refusal` there too.
+#[test]
+fn the_refusal_is_declared_beside_the_effect_it_is_named_by() {
+    let loaded = ply_machine::load::load(&cli_root()).expect("the CLI tree loads");
+    let prover = loaded
+        .check
+        .effects
+        .values()
+        .find(|e| e.simple_name.as_str() == "prover")
+        .expect("the CLI declares `prover`");
+    assert!(
+        declares(&loaded, prover.module.as_str(), "Refusal"),
+        "`Refusal` is not declared in `{}`, where `prover` is, so a refusal names nothing the \
+         program matches",
+        prover.module
+    );
 }
 
 /// Every case the tester builds has to be one the program declares, of the type and in the module
@@ -40,17 +63,19 @@ fn every_marshalled_type_is_declared_where_this_side_says() {
 fn every_case_the_tester_builds_is_declared_where_it_says() {
     let loaded = ply_machine::load::load(&cli_root()).expect("the CLI tree loads");
     for (home, ty, cases) in ply_machine::tester::MARSHALLED {
+        assert!(
+            declares(&loaded, home, ty),
+            "`{home}` does not declare `{ty}`, so the tester builds a value no arm matches"
+        );
         for case in *cases {
+            let tag = format!("{home}.{case}");
             assert!(
                 loaded
-                    .check
-                    .ctors
-                    .values()
-                    .any(|c| c.simple_name.as_str() == *case
-                        && c.module.as_str() == *home
-                        && c.type_name.as_str().rsplit('.').next() == Some(*ty)),
-                "`{home}` declares no case `{case}` of `{ty}`, so the tester builds a value no \
-                 arm matches"
+                    .front
+                    .emitter_ctors
+                    .iter()
+                    .any(|(name, _)| name.as_str() == tag),
+                "`{home}` declares no case `{case}`, so the tester builds a value no arm matches"
             );
         }
     }

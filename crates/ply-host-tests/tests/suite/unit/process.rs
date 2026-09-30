@@ -1,12 +1,10 @@
 use ply_eval::host::MachineId;
 use ply_eval::{
-    Determinism, Fields, HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity,
-    Value,
+    Determinism, Diagnostic, EffectAtom, Fields, HostAnswer, HostHandler, HostOp, HostRequest,
+    HostRuntime, Linearity, Mode, Resource, Span, Symbol, Value, codes,
 };
 use ply_host::pool::Heard;
 use ply_host::process::*;
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::{EffectAtom, Mode, Resource};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

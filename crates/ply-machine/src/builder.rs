@@ -1,22 +1,20 @@
-//! What `ply build` loads, builds, hashes and writes, as the program in `crates/ply-cli/ply`
-//! performs it.
+//! What `ply build` builds, hashes and writes, as the program in `crates/ply-cli/ply` performs it,
+//! over the front end that program ran and handed over.
 //!
-//! The front end and the emitter stay here: a front end or a compiled unit is not a value a
-//! program can hold. Which entry is built, what the
-//! container carries, where it lands and what the report says are the program's, in
-//! `crates/ply-cli/ply/build.ply`.
+//! The emitter stays here: a compiled unit is not a value a program can hold. Which entry is
+//! built, what the container carries, where it lands and what the report says are the program's,
+//! in `crates/ply-cli/ply/build.ply`.
 
 use crate::artifact::{self, Built};
 
+use crate::driver::{HandedFront, handed_front_of, load_over_front};
 use crate::hosts::Lent;
-use crate::load::{LoadError, Loaded, load};
+use crate::load::{LoadError, Loaded};
 use crate::payload::{count, diags_value, option, places_value, record};
-use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, Severity, Span, Symbol, codes};
-use ply_ty::{DefHash, DefInfo};
+use ply_eval::{DefHash, DefInfo, Diagnostic, Severity, Span, Symbol, Value as PlyValue, codes};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -47,7 +45,7 @@ pub struct BuildOptions {
 }
 
 /// The ops and the one handler serving them. Nothing is read before the program asks: `loaded`
-/// loads the path it is handed, `previous` the artifact it names.
+/// reads the front end it is handed, `previous` the artifact it names.
 pub fn lent() -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         program: Mutex::new(None),
@@ -85,9 +83,10 @@ impl HostHandler for Site {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
-            ("loaded", [path]) => {
+            ("loaded", [path, front]) => {
                 let path = PathBuf::from(path.as_str(span, "the program's root")?);
-                let loaded = self.load_once(path);
+                let front = handed_front_of(front, span)?;
+                let loaded = self.load_once(&path, &front);
                 self.loaded(loaded)
             }
             ("made", [entry, startup, reaches]) => self.made(
@@ -201,11 +200,12 @@ impl Site {
     /// The load runs at most once, on the op that asks for it.
     fn load_once(
         &self,
-        path: PathBuf,
+        path: &Path,
+        front: &HandedFront,
     ) -> std::sync::MutexGuard<'_, Option<Result<Loaded, LoadError>>> {
         let mut program = self.program.lock().unwrap_or_else(|e| e.into_inner());
         if program.is_none() {
-            *program = Some(load(&path));
+            *program = Some(load_over_front(path, front));
         }
         program
     }
@@ -227,18 +227,10 @@ impl Site {
                 );
             }
         };
-        let defs: Vec<PlyValue> = loaded
-            .check
-            .defs
-            .values()
-            .filter(|d| !crate::shelf::is_shipped(&d.module))
-            .map(def_value)
-            .collect();
         PlyValue::ctor(
             "Ok",
             vec![record(vec![
                 ("root", PlyValue::str(loaded.root.display().to_string())),
-                ("defs", PlyValue::list(defs)),
                 ("mains", crate::drive::mains_value(loaded)),
                 ("modules", crate::drive::modules_value(loaded)),
                 ("places", places_value(&loaded.sources)),
@@ -294,36 +286,12 @@ impl Site {
     }
 }
 
-fn def_value(def: &DefInfo) -> PlyValue {
-    record(vec![
-        ("name", PlyValue::str(def.name.as_str())),
-        ("simple", PlyValue::str(def.simple_name.as_str())),
-        ("module", PlyValue::str(def.module.as_str())),
-        (
-            "at",
-            record(vec![
-                ("module", PlyValue::Int(i64::from(def.span.source.0))),
-                ("start", PlyValue::Int(i64::from(def.span.start))),
-                ("end", PlyValue::Int(i64::from(def.span.end))),
-            ]),
-        ),
-        ("arity", count(arity(def))),
-    ])
-}
-
-fn arity(def: &DefInfo) -> usize {
-    match &def.scheme.ty {
-        ply_ty::ty::Type::Fn { params, .. } => params.len(),
-        _ => 0,
-    }
-}
-
 // --- The build ----------------------------------------------------------------
 
 /// Each dependency as the front end pinned it: its name, its version, and the digest of the
 /// modules it contributed. `E0131`'s judgments decide what a package is, so the pin is the front
 /// end's answer rather than anything this side derives from a path.
-fn pins_value(pins: &[ply_ty::front::Pinned]) -> PlyValue {
+fn pins_value(pins: &[ply_eval::Pinned]) -> PlyValue {
     PlyValue::list(
         pins.iter()
             .map(|pin| {

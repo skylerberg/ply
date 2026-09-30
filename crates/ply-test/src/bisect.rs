@@ -6,8 +6,7 @@ pub mod rehash;
 pub use classify::{Classify, StoreClassify, Unknown};
 pub use rehash::Rehashed;
 
-use ply_span::Symbol;
-use ply_ty::{DefHash, HashOutput};
+use ply_eval::{DefHash, HashOutput, Symbol};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
@@ -225,121 +224,13 @@ pub fn change_set(regression: &Regression<'_>, classify: &mut dyn Classify) -> C
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct SearchStats {
-    pub candidates: usize,
-    pub clusters: usize,
-    /// Hybrids actually built and run.
-    pub evaluated: usize,
-    pub cached: usize,
-    /// Subsets the search would have asked about twice.
-    pub memoized: usize,
-    pub unresolved: usize,
-    /// The budget ran out, so the result is a superset of the cause rather than a minimal set.
-    pub exhausted: bool,
-}
-
+/// Why no mixture of a failure's two eras can be tried.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Skipped {
-    /// `--bisect=never`, or a run that never asked.
-    NotRequested,
-    NeverPassed,
-    Host,
-    /// `test/nondet` outcomes are not a function of the definition set, so a hybrid proves nothing.
-    Nondet,
-    Panicked,
-    /// Baseline and current agree on every definition in the closure.
-    NoChanges,
-    /// The store cannot produce the bodies a hybrid needs.
+pub enum Absent {
+    /// The store cannot produce the bodies a mixture needs.
     NoBodies,
-    /// The bodies are there, but this build cannot assemble them into a mixed program.
+    /// The bodies are there, and the failure still cannot be re-run as a mixture.
     NoHybrids,
-}
-
-impl Skipped {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Skipped::NotRequested => "not_requested",
-            Skipped::NeverPassed => "never_passed",
-            Skipped::Host => "host",
-            Skipped::Nondet => "nondet",
-            Skipped::Panicked => "panicked",
-            Skipped::NoChanges => "no_changes",
-            Skipped::NoBodies => "no_bodies",
-            Skipped::NoHybrids => "no_hybrids",
-        }
-    }
-
-    pub fn describe(self) -> &'static str {
-        match self {
-            Skipped::NotRequested => "bisection was not requested for this run",
-            Skipped::NeverPassed => {
-                "this test has never passed, so there is no earlier definition set to compare against"
-            }
-            Skipped::Host => {
-                "this failure came from a run that reached a host handler, and bisecting it would re-run the test — and repeat whatever it did outside the program — once per candidate definition set"
-            }
-            Skipped::Nondet => {
-                "`test/nondet` is not a function of the definition set, so bisecting it would prove nothing"
-            }
-            Skipped::Panicked => {
-                "the interpreter failed rather than the program; this is a defect in Ply, and no change in the program explains it"
-            }
-            Skipped::NoChanges => {
-                "no definition in this test's closure changed since it last passed"
-            }
-            Skipped::NoBodies => {
-                "the store does not hold the definition bodies a hybrid program would need"
-            }
-            Skipped::NoHybrids => {
-                "this build cannot mix two eras of a definition graph, so the change set could not be narrowed by running it"
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Verdict {
-    Bisected,
-    /// Exactly one change could be flipped, so the answer needed no runs at all.
-    Sole,
-    /// The baseline definitions with this test's current body already fail: the test edit matters.
-    TestChanged,
-    /// The same, but the test was not edited, so nothing in the definition graph explains it.
-    NotInTheGraph,
-    NotReproduced,
-    /// Every hybrid the search could form was unresolved.
-    Inconclusive,
-    NotAttempted(Skipped),
-}
-
-impl Verdict {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Verdict::Bisected => "bisected",
-            Verdict::Sole => "sole",
-            Verdict::TestChanged => "test_changed",
-            Verdict::NotInTheGraph => "not_in_the_graph",
-            Verdict::NotReproduced => "not_reproduced",
-            Verdict::Inconclusive => "inconclusive",
-            Verdict::NotAttempted(_) => "not_attempted",
-        }
-    }
-
-    pub fn skipped(self) -> Option<Skipped> {
-        match self {
-            Verdict::NotAttempted(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    /// Whether the culprit set is an answer rather than a fallback.
-    pub fn names_a_culprit(self) -> bool {
-        matches!(
-            self,
-            Verdict::Bisected | Verdict::Sole | Verdict::TestChanged
-        )
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -349,7 +240,6 @@ pub enum Unresolved {
     /// It failed, but not with the failure being explained.
     DifferentFailure,
     MissingBody,
-    BudgetSpent,
 }
 
 impl Unresolved {
@@ -358,7 +248,6 @@ impl Unresolved {
             Unresolved::DoesNotCheck => "does not typecheck",
             Unresolved::DifferentFailure => "a different failure",
             Unresolved::MissingBody => "a body is missing from the store",
-            Unresolved::BudgetSpent => "budget spent",
         }
     }
 }
@@ -400,67 +289,5 @@ impl Trial {
     pub fn from_cache(mut self) -> Trial {
         self.cached = true;
         self
-    }
-}
-
-/// How much the culprit set may be trusted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Confidence {
-    /// One definition per group, and dropping any group makes the failure go away: 1-minimal.
-    Minimal,
-    /// Some group could not be split, because its members' interfaces changed together.
-    Fused,
-    Partial,
-    None,
-}
-
-impl Confidence {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Confidence::Minimal => "minimal",
-            Confidence::Fused => "fused",
-            Confidence::Partial => "partial",
-            Confidence::None => "none",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Bisection {
-    pub verdict: Verdict,
-    pub confidence: Confidence,
-    /// The minimal failure-inducing change set, one entry per fused group.
-    pub groups: Vec<Vec<Symbol>>,
-    /// One sentence saying what happened and what to do about it.
-    pub reason: String,
-    pub search: SearchStats,
-}
-
-impl Bisection {
-    pub fn not_attempted(why: Skipped) -> Bisection {
-        Bisection {
-            verdict: Verdict::NotAttempted(why),
-            confidence: Confidence::None,
-            groups: Vec::new(),
-            reason: why.describe().to_string(),
-            search: SearchStats::default(),
-        }
-    }
-
-    pub fn culprits(&self) -> Vec<Symbol> {
-        let mut out: Vec<Symbol> = self.groups.iter().flatten().cloned().collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    pub fn is_conclusive(&self) -> bool {
-        self.verdict.names_a_culprit() && !self.groups.is_empty()
-    }
-}
-
-impl Default for Bisection {
-    fn default() -> Bisection {
-        Bisection::not_attempted(Skipped::NotRequested)
     }
 }

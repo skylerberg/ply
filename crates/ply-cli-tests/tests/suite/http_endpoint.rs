@@ -9,34 +9,15 @@ use std::time::{Duration, Instant};
 /// How long the server has to typecheck the program and bind.
 const STARTUP: Duration = Duration::from_secs(30);
 
-/// The example, verbatim, with the two numbers a test needs to choose.
-fn project(port: u16, connections: u32) -> tempfile::TempDir {
+/// The example, verbatim: the port and the connection count a test chooses are the run's settings.
+fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
-    let hello =
-        std::fs::read_to_string(repo().join("examples/hello.ply")).expect("examples/hello.ply");
-
-    let source = replace(
-        &hello,
-        "fn port() -> Int = 8080",
-        &format!("fn port() -> Int = {port}"),
-    );
-    let source = replace(
-        &source,
-        "fn connections() -> Int = 64",
-        &format!("fn connections() -> Int = {connections}"),
-    );
-
-    std::fs::write(dir.path().join("hello.ply"), source).unwrap();
+    std::fs::copy(
+        repo().join("examples/hello.ply"),
+        dir.path().join("hello.ply"),
+    )
+    .expect("examples/hello.ply is copied");
     dir
-}
-
-fn replace(source: &str, from: &str, to: &str) -> String {
-    assert!(
-        source.contains(from),
-        "`examples/hello.ply` no longer contains `{from}`; this test rewrites it and must be \
-         updated with it rather than silently listening on the example's own port"
-    );
-    source.replace(from, to)
 }
 
 /// Kills the server whatever the test does, including panicking out of an assertion.
@@ -46,9 +27,13 @@ struct Server {
 }
 
 impl Server {
-    fn start(dir: &std::path::Path, reserved: Reservation) -> Server {
+    /// Listens on the reserved port and answers `connections` connections before it returns.
+    fn start(dir: &std::path::Path, reserved: Reservation, connections: u32) -> Server {
         let child = process(dir)
-            .args(["run", "--host"])
+            .args(["run", "--host", "--set"])
+            .arg(format!("HELLO_PORT={}", reserved.port()))
+            .arg("--set")
+            .arg(format!("HELLO_CONNECTIONS={connections}"))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -66,7 +51,9 @@ impl Server {
     fn connect(&mut self) -> TcpStream {
         let Server { child, reserved } = self;
         let child = child.as_mut().expect("the server has not been reaped");
-        connect_when_ready(reserved, child, STARTUP, |_| true).unwrap_or_else(|why| panic!("{why}"))
+        let port = reserved.port();
+        connect_when_ready(reserved, child, STARTUP, |_| true)
+            .unwrap_or_else(|why| panic!("{why}\nthe run was given `--set HELLO_PORT={port}`"))
     }
 
     /// Asked for a fixed number of connections and given them, the server must return on its own.
@@ -128,8 +115,8 @@ fn exchange(mut stream: TcpStream, request: &[u8]) -> String {
 #[test]
 fn a_request_over_a_real_socket_is_answered_by_a_ply_program() {
     let reserved = Reservation::take();
-    let dir = project(reserved.port(), 1);
-    let mut server = Server::start(dir.path(), reserved);
+    let dir = project();
+    let mut server = Server::start(dir.path(), reserved, 1);
     let stream = server.connect();
 
     let response = exchange(
@@ -160,8 +147,8 @@ fn a_request_over_a_real_socket_is_answered_by_a_ply_program() {
 #[test]
 fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
     let reserved = Reservation::take();
-    let dir = project(reserved.port(), 2);
-    let mut server = Server::start(dir.path(), reserved);
+    let dir = project();
+    let mut server = Server::start(dir.path(), reserved, 2);
 
     let first = server.connect();
     let response = exchange(first, b"GET /\r\n\r\n");
@@ -187,8 +174,8 @@ fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
 #[test]
 fn a_request_split_across_writes_is_read_to_its_terminator() {
     let reserved = Reservation::take();
-    let dir = project(reserved.port(), 1);
-    let mut server = Server::start(dir.path(), reserved);
+    let dir = project();
+    let mut server = Server::start(dir.path(), reserved, 1);
     let mut stream = server.connect();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -218,8 +205,7 @@ fn a_request_split_across_writes_is_read_to_its_terminator() {
 
 #[test]
 fn the_same_program_is_hermetic_under_ply_test() {
-    let reserved = Reservation::take();
-    let dir = project(reserved.port(), 1);
+    let dir = project();
     let out = process(dir.path())
         .arg("test")
         .output()
@@ -232,7 +218,8 @@ fn the_same_program_is_hermetic_under_ply_test() {
     assert_eq!(out.status.code(), Some(0), "got:\n{text}");
     assert!(
         !text.contains("E0424"),
-        "the tests handle every `net` operation themselves, so none reaches the boundary:\n{text}"
+        "the tests handle every `net` and `config` operation themselves, so none reaches the \
+         boundary:\n{text}"
     );
 }
 
@@ -240,8 +227,11 @@ fn the_same_program_is_hermetic_under_ply_test() {
 fn without_the_flag_the_program_never_reaches_the_socket() {
     let reserved = Reservation::take();
     let port = reserved.port();
-    let dir = project(port, 1);
+    let dir = project();
+    // `--set` needs `--host`; a run that read this environment would listen where the check looks.
     let out = process(dir.path())
+        .env("HELLO_PORT", port.to_string())
+        .env("HELLO_CONNECTIONS", "1")
         .arg("run")
         .output()
         .expect("`ply run` runs");
@@ -252,7 +242,10 @@ fn without_the_flag_the_program_never_reaches_the_socket() {
     );
     assert_ne!(out.status.code(), Some(0), "got:\n{text}");
     assert!(text.contains("E0424"), "got:\n{text}");
-    assert!(text.contains("net.listen"), "got:\n{text}");
+    assert!(
+        text.contains("ply_host::config::get") && !text.contains("net.listen"),
+        "the run should be refused reading its settings, before any socket; got:\n{text}"
+    );
 
     assert!(
         TcpStream::connect_timeout(

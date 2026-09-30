@@ -48,6 +48,12 @@ SOLO=(
   # length on top of the shard's share.
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
   "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
+  # The corpus's own served benches, which nothing in a shard reaches: each binds real listeners, and
+  # the CLI's reservations do not cover another crate's, so each gets a runner of its own.
+  "corpus-socket-bench:ply-corpus-tests:suite:served::the_socket_bench_serves_the_desk_and_its_floor"
+  "corpus-database-bench:ply-corpus-tests:suite:served::the_database_bench_takes_what_needs_no_database_and_names_what_does"
+  "corpus-lifecycle-bench:ply-corpus-tests:suite:served::the_lifecycle_bench_drains_and_deploys_and_names_what_needs_a_database"
+  "corpus-ladder:ply-corpus-tests:suite:served::the_ladder_serves_the_desk_and_holds_the_shipped_allocation_figure"
 )
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.
@@ -70,13 +76,13 @@ declare -a KNOWN_OUTSIDE=(
 # Checks on the tree, as `package:target:test` (`target` is `lib` for a unit test, named by full
 # module path). The gates job asserts each ran, since a check that stops running reports nothing.
 TREE_CHECKS=(
-  "ply-span-tests:armed:every_registered_code_is_constructed_in_production"
-  "ply-span-tests:armed:every_variant_of_a_covered_enum_is_constructed_in_production"
-  "ply-span-tests:armed:every_diagnostic_constructor_call_names_its_code_literally"
-  "ply-span-tests:armed:every_code_declared_or_raised_has_one_row_in_the_registry"
-  "ply-span-tests:armed:the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
-  "ply-span-tests:armed:no_allowlist_entry_has_outlived_its_reason"
-  "ply-span-tests:armed:ambiguous_enum_names_are_declared"
+  "ply-eval-tests:suite:armed::every_registered_code_is_constructed_in_production"
+  "ply-eval-tests:suite:armed::every_variant_of_a_covered_enum_is_constructed_in_production"
+  "ply-eval-tests:suite:armed::every_diagnostic_constructor_call_names_its_code_literally"
+  "ply-eval-tests:suite:armed::every_code_declared_or_raised_has_one_row_in_the_registry"
+  "ply-eval-tests:suite:armed::the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
+  "ply-eval-tests:suite:armed::no_allowlist_entry_has_outlived_its_reason"
+  "ply-eval-tests:suite:armed::ambiguous_enum_names_are_declared"
   "ply-cli-tests:suite:fmt::the_maintained_sources_are_committed_formatted"
   "ply-cli-tests:suite:tree::every_test_file_is_declared_and_every_declaration_has_a_file"
   "ply-cli-tests:suite:tree::the_harness_is_the_only_place_the_ply_binary_is_named"
@@ -534,12 +540,15 @@ cmd_give_back() {
 }
 
 cmd_solo_matrix() {
-  local id package target test first=1
+  local id package target test corpus first=1
   printf '{"include":['
   while read -r id package target test; do
     ((first)) || printf ','
     first=0
-    printf '{"id":"%s"}' "$id"
+    # Whether the job builds the corpus program: its tests run it, and a test that built it itself
+    # would spend its own deadline on the build.
+    if [[ $package == ply-corpus-tests ]]; then corpus=true; else corpus=false; fi
+    printf '{"id":"%s","corpus":"%s"}' "$id" "$corpus"
   done < <(cmd_solo)
   printf ']}\n'
 }

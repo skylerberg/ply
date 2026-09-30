@@ -1,6 +1,6 @@
 use ply_eval::host::{Determinism, Linearity};
+use ply_eval::{Diagnostic, Symbol, codes};
 use ply_host::config::*;
-use ply_span::{Diagnostic, Symbol, codes};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -572,8 +572,7 @@ fn a_report_lists_only_the_declared_keys() {
 
 #[test]
 fn two_configuration_readers_never_conflict() {
-    use ply_ty::Mode;
-    use ply_ty::{EffectAtom, Footprint, Resource};
+    use ply_eval::{EffectAtom, Footprint, Mode, Resource};
 
     let effect = Symbol::new(EFFECT);
     let atom = |namespace: &str| {

@@ -1,23 +1,22 @@
-use ply_eval::TASK_TYPE;
-use ply_eval::{Compiled, DEFAULT_MAX_CALLS, Entered, Value};
+use ply_eval::{
+    Compiled, DEFAULT_MAX_CALLS, DefHash, Diagnostic, Entered, SourceId, Span, Symbol, TASK_TYPE,
+    Value,
+};
 use ply_prove::property::{
-    EDGE_CASES, EDGE_INTS, GenStream, Judge, TypeWorld, Ungeneratable, draw_cases, generatable,
-    generate, run_property,
+    EDGE_CASES, EDGE_INTS, GenStream, Judge, Ungeneratable, draw_cases, generatable, generate,
+    run_property,
 };
+use ply_prove::world::{Decl, World};
 use ply_prove::{
-    DEFAULT_SHRINK_BUDGET, Discharge, Evidence, GEN_DEPTH, Gap, MIN_PROPERTY_CASES, ProvePlan,
-    Tier, VacuityKind,
+    Binder, DEFAULT_SHRINK_BUDGET, Discharge, Evidence, GEN_DEPTH, Gap, MIN_PROPERTY_CASES,
+    ProvePlan, Sort, Tier, VacuityKind,
 };
-use ply_span::{Diagnostic, SourceId, Span, Symbol};
-use ply_ty::DefHash;
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 pub(crate) struct Fixture {
     source: String,
-    front: ply_ty::Front,
+    front: ply_eval::Front,
 }
 
 impl Fixture {
@@ -34,10 +33,6 @@ impl Fixture {
         }
     }
 
-    pub(crate) fn world(&self) -> TypeWorld {
-        TypeWorld::new(self.front.check.ctors.values())
-    }
-
     /// Leaks the unit, as every tier does.
     fn tier(&self) -> Rc<ply_codegen::Bodies> {
         let texts = HashMap::from([(String::new(), self.source.clone())]);
@@ -52,16 +47,50 @@ pub(crate) fn key(byte: u8) -> DefHash {
     DefHash([byte; 32])
 }
 
-pub(crate) fn binder(name: &str, ty: Type) -> LawBinder {
-    LawBinder {
-        name: Symbol::new(name),
-        ty,
-        span: Span::DUMMY,
-    }
+pub(crate) fn binder(name: &str, sort: Sort) -> Binder {
+    Binder::new(name, sort)
 }
 
-fn con(name: &str) -> Type {
-    Type::Con(Symbol::new(name), Vec::new())
+fn con(name: &str) -> Sort {
+    Sort::con(name)
+}
+
+/// The types `ADTS` declares, as the program would hand them over.
+fn adts() -> World {
+    World::new(
+        [
+            Decl::new(
+                "Color",
+                0,
+                vec![("Red", vec![]), ("Green", vec![]), ("Blue", vec![])],
+            ),
+            Decl::new(
+                "Opt",
+                0,
+                vec![("Nothing", vec![]), ("Just", vec![Sort::int()])],
+            ),
+            Decl::new(
+                "Tree",
+                0,
+                vec![
+                    ("Leaf", vec![]),
+                    ("Node", vec![con("Tree"), Sort::int(), con("Tree")]),
+                ],
+            ),
+            Decl::new(
+                "Pair",
+                1,
+                vec![("MkPair", vec![Sort::Var(0), Sort::Var(0)])],
+            ),
+            Decl::new("Never", 0, vec![("Forever", vec![con("Never")])]),
+            Decl::new(
+                "Rose",
+                0,
+                vec![("Rose", vec![Sort::int(), Sort::list(con("Rose"))])],
+            ),
+        ],
+        [],
+    )
 }
 
 /// `name` entered whole on the tier, which applies the generated functions among `args`.
@@ -73,10 +102,10 @@ fn apply(tier: &ply_codegen::Bodies, name: &str, args: Vec<Value>) -> Result<Val
     }
 }
 
-fn draw(ty: &Type, world: &TypeWorld, cases: u32) -> Vec<Value> {
+fn draw(sort: &Sort, world: &World, cases: u32) -> Vec<Value> {
     let mut stream = GenStream::new(0, key(1));
     (0..cases)
-        .map(|case| generate(ty, world, &mut stream, case).expect("must generate"))
+        .map(|case| generate(sort, world, &mut stream, case).expect("must generate"))
         .collect()
 }
 
@@ -137,61 +166,47 @@ type Shaped = fn(&Value) -> bool;
 
 #[test]
 fn every_ply_type_generates() {
-    let fixture = Fixture::compile(ADTS);
-    let world = fixture.world();
-    let record = Type::Record(
-        [
-            (Symbol::new("balance"), Type::int()),
-            (Symbol::new("open"), Type::bool()),
-        ]
-        .into_iter()
-        .collect(),
-    );
-    let cases: Vec<(Type, Shaped)> = vec![
-        (Type::int(), |v| matches!(v, Value::Int(_))),
-        (Type::bool(), |v| matches!(v, Value::Bool(_))),
-        (Type::string(), |v| matches!(v, Value::Str(_))),
-        (Type::bytes(), |v| matches!(v, Value::Bytes(_))),
-        (Type::unit(), |v| matches!(v, Value::Unit)),
-        (Type::list(Type::int()), |v| matches!(v, Value::List(_))),
+    let world = adts();
+    let record = Sort::record([
+        (Symbol::new("balance"), Sort::int()),
+        (Symbol::new("open"), Sort::bool()),
+    ]);
+    let cases: Vec<(Sort, Shaped)> = vec![
+        (Sort::int(), |v| matches!(v, Value::Int(_))),
+        (Sort::bool(), |v| matches!(v, Value::Bool(_))),
+        (Sort::string(), |v| matches!(v, Value::Str(_))),
+        (Sort::bytes(), |v| matches!(v, Value::Bytes(_))),
+        (Sort::unit(), |v| matches!(v, Value::Unit)),
+        (Sort::list(Sort::int()), |v| matches!(v, Value::List(_))),
         (record, |v| matches!(v, Value::Record(_))),
         (con("Color"), |v| matches!(v, Value::Ctor { .. })),
         (con("Opt"), |v| matches!(v, Value::Ctor { .. })),
         (con("Tree"), |v| matches!(v, Value::Ctor { .. })),
-        (Type::Con(Symbol::new("Pair"), vec![Type::bool()]), |v| {
+        (Sort::Con(Symbol::new("Pair"), vec![Sort::bool()]), |v| {
             matches!(v, Value::Ctor { .. })
         }),
         (con("Rose"), |v| matches!(v, Value::Ctor { .. })),
-        (
-            Type::Fn {
-                params: vec![Type::int()],
-                ret: Box::new(Type::int()),
-                effects: Row::empty(),
-            },
-            |v| matches!(v, Value::Closure(_)),
-        ),
+        (Sort::func(vec![Sort::int()], Sort::int(), true), |v| {
+            matches!(v, Value::Closure(_))
+        }),
         // A type variable is monomorphised to `Int`.
-        (Type::Var(TyVar(0)), |v| matches!(v, Value::Int(_))),
+        (Sort::Var(0), |v| matches!(v, Value::Int(_))),
     ];
-    for (ty, shaped) in cases {
-        for value in draw(&ty, &world, 40) {
-            assert!(shaped(&value), "{ty} generated {}", value.render());
+    for (sort, shaped) in cases {
+        for value in draw(&sort, &world, 40) {
+            assert!(shaped(&value), "{sort} generated {}", value.render());
         }
     }
 }
 
 #[test]
 fn a_record_generates_every_field_in_the_types_order() {
-    let world = TypeWorld::default();
-    let ty = Type::Record(
-        [
-            (Symbol::new("b"), Type::bool()),
-            (Symbol::new("a"), Type::int()),
-        ]
-        .into_iter()
-        .collect(),
-    );
-    for value in draw(&ty, &world, 20) {
+    let world = World::default();
+    let sort = Sort::record([
+        (Symbol::new("b"), Sort::bool()),
+        (Symbol::new("a"), Sort::int()),
+    ]);
+    for value in draw(&sort, &world, 20) {
         let Value::Record(fields) = &value else {
             panic!("expected a record");
         };
@@ -204,8 +219,7 @@ fn a_record_generates_every_field_in_the_types_order() {
 
 #[test]
 fn an_adt_draws_every_constructor() {
-    let fixture = Fixture::compile(ADTS);
-    let world = fixture.world();
+    let world = adts();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for value in draw(&con("Color"), &world, 60) {
         let Value::Ctor { name, .. } = &value else {
@@ -219,8 +233,8 @@ fn an_adt_draws_every_constructor() {
 /// The prover reasons over ℤ while `Int` is an `i64`, so sampling must meet the boundary.
 #[test]
 fn the_integer_boundary_is_drawn_on_every_run() {
-    let world = TypeWorld::default();
-    let drawn = ints(&draw(&Type::int(), &world, EDGE_CASES));
+    let world = World::default();
+    let drawn = ints(&draw(&Sort::int(), &world, EDGE_CASES));
     for edge in EDGE_INTS {
         assert!(drawn.contains(&edge), "{edge} was never drawn: {drawn:?}");
     }
@@ -228,8 +242,8 @@ fn the_integer_boundary_is_drawn_on_every_run() {
 
 #[test]
 fn bytes_generation_reaches_every_byte_and_the_empty_value() {
-    let world = TypeWorld::default();
-    let drawn = draw(&Type::bytes(), &world, 400);
+    let world = World::default();
+    let drawn = draw(&Sort::bytes(), &world, 400);
     let mut seen_len: BTreeSet<usize> = BTreeSet::new();
     let mut low = false;
     let mut high = false;
@@ -249,8 +263,7 @@ fn bytes_generation_reaches_every_byte_and_the_empty_value() {
 
 #[test]
 fn a_recursive_type_terminates_and_stays_within_the_depth_bound() {
-    let fixture = Fixture::compile(ADTS);
-    let world = fixture.world();
+    let world = adts();
     for ty in [con("Tree"), con("Rose")] {
         let mut deepest = 0;
         for value in draw(&ty, &world, 200) {
@@ -278,8 +291,7 @@ fn value_depth(value: &Value) -> usize {
 
 #[test]
 fn a_type_no_finite_value_inhabits_is_not_generatable() {
-    let fixture = Fixture::compile(ADTS);
-    let world = fixture.world();
+    let world = adts();
     assert_eq!(
         generatable(&con("Never"), &world),
         Err(Ungeneratable::Uninhabited(Symbol::new("Never")))
@@ -288,36 +300,20 @@ fn a_type_no_finite_value_inhabits_is_not_generatable() {
 
 #[test]
 fn the_types_a_binder_may_not_have_are_named() {
-    let world = TypeWorld::default();
-    let cell = Type::Con(Symbol::new("Cell"), vec![Type::Var(TyVar(0)), Type::int()]);
-    let task = Type::Con(Symbol::new(TASK_TYPE), vec![Type::int()]);
+    let world = World::default();
+    let cell = Sort::Con(Symbol::new("Cell"), vec![Sort::Var(0), Sort::int()]);
+    let task = Sort::Con(Symbol::new(TASK_TYPE), vec![Sort::int()]);
     assert_eq!(generatable(&cell, &world), Err(Ungeneratable::Cell));
     assert_eq!(generatable(&task, &world), Err(Ungeneratable::Task));
     assert_eq!(
-        generatable(&Type::list(cell.clone()), &world),
+        generatable(&Sort::list(cell.clone()), &world),
         Err(Ungeneratable::Cell),
         "a type reaching a `Cell` is no more generatable than a `Cell`"
     );
-
-    let atom = EffectAtom::new("db", Resource::Named("users".into()), Mode::Read);
-    let effectful = Type::Fn {
-        params: vec![Type::int()],
-        ret: Box::new(Type::int()),
-        effects: Row::singleton(atom.clone()),
-    };
+    // A row that performs something, or one open to anything, is not empty either way.
     assert_eq!(
-        generatable(&effectful, &world),
-        Err(Ungeneratable::Effectful(Row::singleton(atom)))
-    );
-
-    let polymorphic = Type::Fn {
-        params: vec![Type::int()],
-        ret: Box::new(Type::int()),
-        effects: Row::open(RowVar(3)),
-    };
-    assert_eq!(
-        generatable(&polymorphic, &world),
-        Err(Ungeneratable::RowVariable)
+        generatable(&Sort::func(vec![Sort::int()], Sort::int(), false), &world),
+        Err(Ungeneratable::Effectful)
     );
     assert_eq!(
         generatable(&con("Nowhere"), &world),
@@ -327,11 +323,10 @@ fn the_types_a_binder_may_not_have_are_named() {
 
 #[test]
 fn a_root_replays_exactly() {
-    let fixture = Fixture::compile(ADTS);
-    let world = fixture.world();
+    let world = adts();
     let binders = vec![
-        binder("n", Type::int()),
-        binder("xs", Type::list(Type::string())),
+        binder("n", Sort::int()),
+        binder("xs", Sort::list(Sort::string())),
         binder("t", con("Tree")),
     ];
     let once = draw_cases(&binders, &world, key(9), 41, 50).expect("must generate");
@@ -342,8 +337,8 @@ fn a_root_replays_exactly() {
 
 #[test]
 fn another_root_draws_another_run() {
-    let world = TypeWorld::default();
-    let binders = vec![binder("n", Type::int())];
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int())];
     let a = draw_cases(&binders, &world, key(9), 41, 60).expect("must generate");
     let b = draw_cases(&binders, &world, key(9), 42, 60).expect("must generate");
     assert_ne!(rendered(&a), rendered(&b));
@@ -352,8 +347,8 @@ fn another_root_draws_another_run() {
 /// Otherwise adding a law would shift every later law's cases.
 #[test]
 fn the_obligation_keys_the_stream() {
-    let world = TypeWorld::default();
-    let binders = vec![binder("n", Type::int())];
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int())];
     let a = draw_cases(&binders, &world, key(1), 0, 60).expect("must generate");
     let b = draw_cases(&binders, &world, key(2), 0, 60).expect("must generate");
     assert_ne!(rendered(&a), rendered(&b));
@@ -386,12 +381,8 @@ pub(crate) fn rendered(cases: &[Vec<Value>]) -> Vec<Vec<String>> {
 #[test]
 fn a_generated_function_is_total_pure_and_deterministic() {
     let fixture = Fixture::compile(ADTS);
-    let world = fixture.world();
-    let ty = Type::Fn {
-        params: vec![Type::int()],
-        ret: Box::new(Type::int()),
-        effects: Row::empty(),
-    };
+    let world = adts();
+    let ty = Sort::func(vec![Sort::int()], Sort::int(), true);
     let tier = fixture.tier();
     let mut applied = 0u64;
     for f in draw(&ty, &world, 40) {
@@ -416,12 +407,8 @@ fn a_generated_function_is_total_pure_and_deterministic() {
 #[test]
 fn a_generated_function_over_a_compound_argument_applies() {
     let fixture = Fixture::compile(ADTS);
-    let world = fixture.world();
-    let ty = Type::Fn {
-        params: vec![Type::string()],
-        ret: Box::new(Type::bool()),
-        effects: Row::empty(),
-    };
+    let world = adts();
+    let ty = Sort::func(vec![Sort::string()], Sort::bool(), true);
     let tier = fixture.tier();
     for f in draw(&ty, &world, 24) {
         for x in ["", "a", "hello"] {
@@ -435,12 +422,8 @@ fn a_generated_function_over_a_compound_argument_applies() {
 
 #[test]
 fn a_generated_function_prints_what_it_does() {
-    let world = TypeWorld::default();
-    let ty = Type::Fn {
-        params: vec![Type::int()],
-        ret: Box::new(Type::int()),
-        effects: Row::empty(),
-    };
+    let world = World::default();
+    let ty = Sort::func(vec![Sort::int()], Sort::int(), true);
     for f in draw(&ty, &world, 32) {
         let text = f.render();
         assert!(text.contains("|"), "{text} is not a description");
@@ -459,7 +442,7 @@ fn plan(cases: u32) -> ProvePlan {
     }
 }
 
-fn run<G, B>(binders: &[LawBinder], world: &TypeWorld, cases: u32, guard: G, body: B) -> Discharge
+fn run<G, B>(binders: &[Binder], world: &World, cases: u32, guard: G, body: B) -> Discharge
 where
     G: FnMut(&[Value]) -> Result<bool, Diagnostic>,
     B: FnMut(&[Value]) -> Result<bool, Diagnostic>,
@@ -477,8 +460,8 @@ where
 
 #[test]
 fn a_guard_that_admits_nothing_is_reported_rather_than_passed() {
-    let world = TypeWorld::default();
-    let binders = vec![binder("n", Type::int())];
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int())];
     let discharge = run(&binders, &world, 200, |_| Ok(false), |_| Ok(true));
     assert_eq!(discharge.tier(), None, "a vacuity has no tier to report");
     match discharge {
@@ -491,8 +474,8 @@ fn a_guard_that_admits_nothing_is_reported_rather_than_passed() {
 
 #[test]
 fn a_tight_guard_reports_example_and_a_loose_one_property() {
-    let world = TypeWorld::default();
-    let binders = vec![binder("n", Type::int())];
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int())];
 
     let tight = run(
         &binders,
@@ -522,8 +505,8 @@ fn a_tight_guard_reports_example_and_a_loose_one_property() {
 
 #[test]
 fn the_guard_decides_before_the_body_is_ever_evaluated() {
-    let world = TypeWorld::default();
-    let binders = vec![binder("n", Type::int())];
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int())];
     let mut judge = Fn2::new(|v: &[Value]| Ok(ints(v)[0] > 0), |_: &[Value]| Ok(true));
     run_property(key(5), &binders, &world, &plan(50), Span::DUMMY, &mut judge);
     for pair in judge.asked.windows(2) {
@@ -546,8 +529,8 @@ fn rendered_one(values: &[Value]) -> Vec<String> {
 
 #[test]
 fn a_refutation_names_its_root_its_case_and_what_it_started_from() {
-    let world = TypeWorld::default();
-    let binders = vec![binder("n", Type::int())];
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int())];
     let discharge = run(
         &binders,
         &world,
@@ -565,19 +548,24 @@ fn a_refutation_names_its_root_its_case_and_what_it_started_from() {
     // that narrows it is the program's (`proof.shrink`'s `descend` over the shrink operations).
     assert_eq!(counterexample.shrinks, 0);
     assert_eq!(counterexample.bindings[0].name.as_str(), "n");
-    assert_eq!(counterexample.bindings[0].ty, Type::int());
+    assert_eq!(counterexample.bindings[0].ty, "Int");
 }
 
 #[test]
 fn a_binder_the_generator_cannot_inhabit_is_a_gap_rather_than_a_verdict() {
-    let world = TypeWorld::default();
-    let cell = Type::Con(Symbol::new("Cell"), vec![Type::Var(TyVar(0)), Type::int()]);
-    let binders = vec![binder("c", cell.clone())];
+    let world = World::default();
+    let cell = Sort::Con(Symbol::new("Cell"), vec![Sort::Var(0), Sort::int()]);
+    let binders = vec![Binder {
+        name: Symbol::new("c"),
+        sort: cell,
+        text: "Cell<Int>".to_string(),
+    }];
     let discharge = run(&binders, &world, 200, |_| Ok(true), |_| Ok(false));
     match discharge {
+        // The type is named as the binder prints it, which is the compiler's text and not a sort's.
         Discharge::Unattempted(Gap::Ungeneratable { param, ty }) => {
             assert_eq!(param.as_str(), "c");
-            assert_eq!(ty, cell);
+            assert_eq!(ty, "Cell<Int>");
         }
         other => panic!("expected a gap, got {other:?}"),
     }
@@ -585,12 +573,12 @@ fn a_binder_the_generator_cannot_inhabit_is_a_gap_rather_than_a_verdict() {
 
 #[test]
 fn a_raising_case_is_a_gap_with_a_shrunk_input() {
-    let world = TypeWorld::default();
-    let binders = vec![binder("n", Type::int())];
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int())];
     let boom = |v: &[Value]| {
         if ints(v)[0].unsigned_abs() > 100 {
             Err(Diagnostic::error(
-                ply_span::codes::RUNTIME_ERROR,
+                ply_eval::codes::RUNTIME_ERROR,
                 "divided by zero",
             ))
         } else {
@@ -620,31 +608,31 @@ fn a_raising_case_is_a_gap_with_a_shrunk_input() {
 
 #[test]
 fn a_polymorphic_binder_is_monomorphised_and_recorded() {
-    let world = TypeWorld::default();
+    let world = World::default();
     let binders = vec![
-        binder("x", Type::Var(TyVar(4))),
-        binder("xs", Type::list(Type::Var(TyVar(4)))),
-        binder("y", Type::Var(TyVar(9))),
+        binder("x", Sort::Var(0)),
+        binder("xs", Sort::list(Sort::Var(0))),
+        binder("y", Sort::Var(1)),
     ];
     let discharge = run(&binders, &world, 40, |_| Ok(true), |_| Ok(true));
     let Discharge::Held(Evidence::Cases(report)) = discharge else {
         panic!("expected a hold");
     };
+    // Each variable once, under the letter its binders print it with.
     assert_eq!(
         report.instantiations,
         vec![
-            (Symbol::new("t4"), "Int".to_string()),
-            (Symbol::new("t9"), "Int".to_string()),
+            (Symbol::new("a"), "Int".to_string()),
+            (Symbol::new("b"), "Int".to_string()),
         ]
     );
 }
 
 #[test]
 fn two_runs_over_one_refutation_agree_byte_for_byte() {
-    let fixture = Fixture::compile(ADTS);
-    let world = fixture.world();
+    let world = adts();
     let binders = vec![
-        binder("xs", Type::list(Type::int())),
+        binder("xs", Sort::list(Sort::int())),
         binder("t", con("Tree")),
     ];
     let falsify = |v: &[Value]| {
@@ -672,8 +660,8 @@ fn two_runs_over_one_refutation_agree_byte_for_byte() {
 
 #[test]
 fn every_root_in_the_plan_is_drawn_and_reported() {
-    let world = TypeWorld::default();
-    let binders = vec![binder("n", Type::int())];
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int())];
     let mut judge = Fn2::new(|_: &[Value]| Ok(true), |_: &[Value]| Ok(true));
     let plan = ProvePlan {
         cases: 30,
