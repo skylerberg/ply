@@ -40,6 +40,10 @@ struct Tables {
     scalars: HashSet<String>,
     /// Roots whose scheme mentions a fixed-width type, which the compiled seam cannot carry.
     widths: HashSet<String>,
+    /// Roots the compiler published pure.
+    pures: HashSet<String>,
+    /// Pure roots of no arguments, which a unit gives memo slots.
+    constants: HashSet<String>,
     modules: Vec<(Symbol, SourceId)>,
     /// Each root's definition span; a clause's is its owner's.
     spans: HashMap<String, Span>,
@@ -69,6 +73,18 @@ impl Tables {
                 .emitter_roots
                 .iter()
                 .filter(|r| r.width)
+                .map(|r| r.root.to_string())
+                .collect(),
+            pures: front
+                .emitter_roots
+                .iter()
+                .filter(|r| r.pure)
+                .map(|r| r.root.to_string())
+                .collect(),
+            constants: front
+                .emitter_roots
+                .iter()
+                .filter(|r| r.constant())
                 .map(|r| r.root.to_string())
                 .collect(),
             modules: Vec::new(),
@@ -186,14 +202,24 @@ impl Source {
         self.tables.arities.get(name).copied()
     }
 
-    /// Whether every parameter and the answer are `Int` or `Bool`.
     /// Whether the root's scheme mentions a fixed-width type.
     pub fn mentions_width(&self, name: &str) -> bool {
         self.tables.widths.contains(name)
     }
 
+    /// Whether every parameter and the answer are `Int` or `Bool`.
     pub fn scalar_signature(&self, name: &str) -> bool {
         self.tables.scalars.contains(name)
+    }
+
+    /// Whether the compiler published the root pure.
+    pub fn pure(&self, name: &str) -> bool {
+        self.tables.pures.contains(name)
+    }
+
+    /// Whether the root is pure and takes no arguments, so a unit gives it a memo slot.
+    pub fn constant(&self, name: &str) -> bool {
+        self.tables.constants.contains(name)
     }
 
     pub fn module_count(&self) -> usize {
