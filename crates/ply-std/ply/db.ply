@@ -1,5 +1,6 @@
 // The database effect.
 
+import std.bytes (u32_be, u32_be_at)
 import std.json
 import std.net (net)
 import std.random (entropy, nonce)
@@ -2672,62 +2673,58 @@ fn delete_walk(rows: List<Row>, q: DeleteQ, ps: List<Param>, acc: DelAcc) -> Del
 // --- The scope stack -------------------------------------------------------------
 
 // A refused `begin` does not abort the transaction it is nested inside.
-pub fn begin_step(d: MemDb, level: Isolation, access: Access) -> Outcome =
-  if len(d.stack) == 0 {
-    done(
-      memdb(
-        d.tables,
-        d.sequences,
-        [{ tables: d.tables, failed: false, level: level, access: access }],
-        false,
-      ),
-      Count(0),
-    )
-  } else if d.failed { fail_open(d, in_failed_txn()) } else if len(d.stack) > max_savepoints() {
-    fail_open(
-      d,
-      db_error("54000", "", "savepoint stack deeper than " ++ int_to_string(max_savepoints())),
-    )
-  } else {
-    match nth(d.stack, 0) {
-      None -> done(d, Count(0)),
-      Some(outer) -> if !same_isolation(outer.level, level) {
-        fail_open(
-          d,
-          db_error(
-            "25001",
-            "",
-            "the open transaction is " ++ isolation_name(outer.level)
-              ++ " and this nested `begin` asks for "
-              ++ isolation_name(level),
-          ),
-        )
-      } else if widens(outer.access, access) {
-        // A savepoint has no access mode, so it cannot widen the transaction's.
-        fail_open(
-          d,
-          db_error(
-            "25001",
-            "",
-            "the open transaction is " ++ access_name(outer.access)
-              ++ " and this nested `begin` asks for "
-              ++ access_name(access)
-              ++ "; a savepoint cannot widen what the transaction may do",
-          ),
-        )
-      } else {
-        done(
-          memdb(
-            d.tables,
-            d.sequences,
-            push(d.stack, { tables: d.tables, failed: false, level: level, access: access }),
-            d.failed,
-          ),
-          Count(0),
-        )
-      },
-    }
+pub fn begin_step(d: MemDb, level: Isolation, access: Access) -> Outcome = {
+  let frame = { tables: d.tables, failed: false, level: level, access: access };
+  match nth(d.stack, 0) {
+    None -> done(memdb(d.tables, d.sequences, [frame], false), Count(0)),
+    Some(outer) -> match nested_refusal(
+        d.failed,
+        len(d.stack),
+        outer.level,
+        outer.access,
+        level,
+        access,
+      ) {
+      Some(e) -> fail_open(d, e),
+      None -> done(memdb(d.tables, d.sequences, push(d.stack, frame), d.failed), Count(0)),
+    },
   }
+}
+
+// Why a `begin` cannot be a savepoint of the transaction it is nested in, where `depth` scopes are
+// open and `outer` is what the transaction's own `begin` asked for; the twin and the driver share it.
+fn nested_refusal(
+  failed: Bool,
+  depth: Int,
+  outer: Isolation,
+  outer_access: Access,
+  level: Isolation,
+  access: Access,
+) -> Option<DbError> =
+  if failed { Some(in_failed_txn()) } else if depth > max_savepoints() {
+    Some(db_error("54000", "", "savepoint stack deeper than " ++ int_to_string(max_savepoints())))
+  } else if !same_isolation(outer, level) {
+    Some(
+      db_error(
+        "25001",
+        "",
+        "the open transaction is " ++ isolation_name(outer) ++ " and this nested `begin` asks for "
+          ++ isolation_name(level),
+      ),
+    )
+  } else if widens(outer_access, access) {
+    // A savepoint has no access mode, so it cannot widen the transaction's.
+    Some(
+      db_error(
+        "25001",
+        "",
+        "the open transaction is " ++ access_name(outer_access)
+          ++ " and this nested `begin` asks for "
+          ++ access_name(access)
+          ++ "; a savepoint cannot widen what the transaction may do",
+      ),
+    )
+  } else { None }
 
 fn widens(outer: Access, inner: Access) -> Bool =
   match outer {
@@ -3209,12 +3206,23 @@ fn parameter(name: String, value: Option<String>) -> List<pg::Set> =
 fn millis_text(ms: Option<Int>) -> Option<String> =
   match ms { Some(n) -> Some(int_to_string(n)), None -> None }
 
-// A connection with a transaction open, and how deep: depth 0 is between transactions.
-type Open = { session: pg::Session, depth: Int }
+// `n` numbers a connection among every one the pool has opened.
+type Link = { n: Int, session: pg::Session }
 
-// What the handler holds between performs: the connections it may hand out, the one a transaction
-// has taken, and how many it has opened, which is what bounds it.
-type Pool = { idle: List<pg::Session>, open: Option<Open>, opened: Int }
+// A transaction on connection `n`: `session` is `None` once the connection is lost, which ended the
+// transaction on the server; `depth` counts the transaction and its savepoints; `level` and
+// `access` are its outermost `begin`'s; `busy` while one of its operations is on the wire.
+type Scope = {
+  n: Int,
+  session: Option<pg::Session>,
+  depth: Int,
+  level: Isolation,
+  access: Access,
+  busy: Bool,
+}
+
+// `opened` counts the connections open, which `size` bounds, and `made` every one ever opened.
+type Pool = { idle: List<Link>, opened: Int, made: Int, open: List<Scope> }
 
 // --- The text of a value ---------------------------------------------------------
 
@@ -3407,42 +3415,151 @@ fn access_sql(access: Access) -> String =
 
 fn savepoint_name(depth: Int) -> String = "ply_sp" ++ int_to_string(depth)
 
-// --- The handler -----------------------------------------------------------------
+// --- The handler's decisions -----------------------------------------------------
+//
+// Every operation takes what it will use from the pool before it sends a byte and settles what it
+// used after, because a task parked on the wire lets another task's operation run in between.
 
-type Taken = { session: pg::Session, pool: Pool }
+// A handler cannot see which task performs an operation, so it goes by which transactions are
+// between statements: the performer's own is never on the wire, because its task is the one running.
+type Route = | Own(Scope) | NoTransaction | Ambiguous
 
-// A connection to run one statement on: the open transaction's, or one of the pool's.
-fn checkout(
-  cfg: Server,
-  size: Int,
-  pool: Pool,
-  nonce: String,
-) -> Result<Taken, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match pool.idle {
-    [first, ..rest] -> Ok({ session: first, pool: { ..pool, idle: rest } }),
-    [] -> if pool.opened >= size {
-      Err(db_error("53300", "", "the pool of " ++ int_to_string(size) ++ " connection(s) is busy"))
-    } else {
-      match pg::connect[link](
-          cfg.host,
-          cfg.port,
-          cfg.user,
-          cfg.database,
-          startup_parameters(cfg),
-          cfg.password,
-          nonce ++ "-" ++ int_to_string(pool.opened),
-          cfg.client,
-        ) {
-        Err(e) -> Err(db_error("", "", pg::client_error_text(e))),
-        Ok(session) -> Ok({ session: session, pool: { ..pool, opened: pool.opened + 1 } }),
-      }
+fn route(open: List<Scope>) -> Route =
+  match filter(open, |s: Scope| !s.busy) { [] -> NoTransaction, [s] -> Own(s), _ -> Ambiguous }
+
+fn ambiguous(what: String) -> String =
+  what
+    ++ " was performed while two transactions were between statements, so which one it belongs to is unknown: a transaction is told apart by being the one not waiting on the server, so a task that holds one open must wait on nothing but its own statements"
+
+// A connection for an operation outside any transaction, idle or still to be opened.
+type Claim = | Idle(Link) | Fresh(Int)
+
+fn claim_n(c: Claim) -> Int = match c { Idle(l) -> l.n, Fresh(n) -> n }
+
+type Plan = | Answered(Answer) | Outside(Claim) | Within(Scope, pg::Session)
+
+type Decided = { pool: Pool, plan: Plan }
+
+fn outside(p: Pool, size: Int) -> Decided =
+  match p.idle {
+    [first, ..rest] -> { pool: { ..p, idle: rest }, plan: Outside(Idle(first)) },
+    [] -> if p.opened >= size { { pool: p, plan: Answered(Failed(pool_busy(size))) } }
+    else {
+      { pool: { ..p, opened: p.opened + 1, made: p.made + 1 }, plan: Outside(Fresh(p.made)) }
     },
   }
 
-fn release(session: pg::Session, pool: Pool) -> Pool = { ..pool, idle: push(pool.idle, session) }
+fn pool_busy(size: Int) -> DbError =
+  db_error("53300", "", "the pool of " ++ int_to_string(size) ++ " connection(s) is busy")
 
-fn give_back(session: pg::Session, pool: Pool) -> Pool =
-  release(session, { ..pool, opened: pool.opened - 1 })
+fn within(p: Pool, scope: Scope) -> Decided =
+  match scope.session {
+    None -> { pool: p, plan: Answered(Failed(connection_lost())) },
+    Some(session) -> { pool: busy(p, scope.n), plan: Within(scope, session) },
+  }
+
+fn busy(p: Pool, n: Int) -> Pool =
+  { ..p, open: map(p.open, |s: Scope| if s.n == n { { ..s, busy: true } } else { s }) }
+
+fn for_statement(p: Pool, size: Int, what: String) -> Decided =
+  match route(p.open) {
+    Ambiguous -> panic(ambiguous(what)),
+    Own(scope) -> within(p, scope),
+    NoTransaction -> outside(p, size),
+  }
+
+// A `begin` inside the performer's transaction is a savepoint of it; any other opens a transaction
+// on a connection of its own.
+fn for_begin(p: Pool, size: Int, level: Isolation, access: Access) -> Decided =
+  match route(p.open) {
+    Ambiguous -> panic(ambiguous("`db.begin`")),
+    NoTransaction -> outside(p, size),
+    Own(scope) -> match scope.session {
+      None -> within(p, scope),
+      Some(s) -> match nested_refusal(
+          s.status == pg::FailedTransaction,
+          scope.depth,
+          scope.level,
+          scope.access,
+          level,
+          access,
+        ) {
+        Some(e) -> { pool: p, plan: Answered(Failed(e)) },
+        None -> within(p, scope),
+      },
+    },
+  }
+
+type Closing = | Settled(Answer) | Closes(Scope, pg::Session)
+
+type ToClose = { pool: Pool, closing: Closing }
+
+// A transaction whose connection is lost has nothing to send: the server ended it when the
+// connection went, and `lost` is the answer.
+fn for_close(p: Pool, what: String, lost: Answer) -> ToClose =
+  match route(p.open) {
+    Ambiguous -> panic(ambiguous(what)),
+    NoTransaction -> { pool: p, closing: Settled(Failed(no_transaction(what))) },
+    Own(scope) -> match scope.session {
+      None -> { pool: { ..p, open: without_scope(p.open, scope) }, closing: Settled(lost) },
+      Some(session) -> { pool: busy(p, scope.n), closing: Closes(scope, session) },
+    },
+  }
+
+fn without_scope(open: List<Scope>, scope: Scope) -> List<Scope> = {
+  let others = filter(open, |s: Scope| s.n != scope.n);
+  if scope.depth > 1 { push(others, { ..scope, depth: scope.depth - 1 }) } else { others }
+}
+
+// A connection let go of: still talking, and so back to the pool, or closed.
+type Freed = | Reuse(Link) | Lost
+
+// What an operation on connection `n` leaves: `scope` is its transaction as it now stands, `None`
+// when there is none or it ended.
+type Left = { answer: Answer, n: Int, scope: Option<Scope>, freed: Option<Freed> }
+
+fn settle(p: Pool, left: Left) -> Pool = {
+  let others = filter(p.open, |s: Scope| s.n != left.n);
+  let q = { ..p, open: match left.scope { Some(s) -> push(others, s), None -> others } };
+  match left.freed {
+    None -> q,
+    Some(Reuse(l)) -> { ..q, idle: push(q.idle, l) },
+    Some(Lost) -> { ..q, opened: q.opened - 1 },
+  }
+}
+
+// --- The errors a connection makes -----------------------------------------------
+
+// A refusal is the server's own SQLSTATE; a conversation that failed is class `08`, the connection
+// exceptions.
+fn client_error(e: pg::ClientError) -> DbError =
+  match e {
+    pg::Rejected(_, s) -> server_error(s),
+    pg::Refused(s) -> server_error(s),
+    pg::Unreachable -> db_error("08001", "", pg::client_error_text(e)),
+    pg::Unexpected(what) -> db_error("08P01", "", what),
+    _ -> db_error("08006", "", pg::client_error_text(e)),
+  }
+
+fn server_error(s: pg::Server) -> DbError = {
+  let said = if s.detail == "" { s.message } else { s.message ++ ": " ++ s.detail };
+  db_error(s.code, s.constraint, said)
+}
+
+fn connection_lost() -> DbError =
+  db_error(
+    "08003",
+    "",
+    "the connection this transaction ran on was lost, and the transaction with it",
+  )
+
+// A `commit` the connection failed under may have been applied or not.
+fn unresolved(e: pg::ClientError) -> DbError =
+  db_error(
+    "08007",
+    "",
+    "the connection failed before the server answered the commit: " ++ pg::client_error_text(e),
+  )
 
 fn is_space_byte(c: Int) -> Bool = c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
 
@@ -4808,18 +4925,10 @@ fn sql_nothing_left(p: SqlAt) -> Result<(), DbError> =
 
 type Ran = { session: pg::Session, answer: Answer }
 
-// The statement's own check, before it costs a round trip. A statement's tables are a function of
+// The statement's own check, before it takes a connection. A statement's tables are a function of
 // its text rather than of the call site's label, so a join reaches tables the label never named —
 // and the atom the scheduler records is the label's, so the label has to be one of them.
-fn run_statement(
-  session: pg::Session,
-  s: Stmt,
-  ps: List<Param>,
-  rows: Bool,
-  reads_only: Bool,
-  label: String,
-  cfg: Server,
-) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link]} = {
+fn check_statement(s: Stmt, reads_only: Bool, label: String) -> Unit = {
   let scanned = match scan_statement(s.sql) { Err(e) -> panic(e.detail), Ok(scanned) -> scanned };
   if !sql_has_table(scan_table_names(scanned.tables), label) {
     panic(
@@ -4832,8 +4941,7 @@ fn run_statement(
     panic(
       "this statement writes, and `db.query` is a read: perform it as `db.execute` or `db.returning`, or two endpoints that both write would be run beside each other",
     )
-  };
-  run_checked(session, s, ps, rows, cfg)
+  }
 }
 
 // What a statement touches, for a refusal that says why a label does not fit.
@@ -4862,133 +4970,218 @@ fn run_checked(
       }),
   }
 
-// A statement the driver itself sends, which only has to have worked.
+// A statement the driver itself sends.
 fn control(
   session: pg::Session,
   sql: String,
   cfg: Server,
-) -> Result<pg::Session, pg::ClientError> / {net.send[link], net.recv[link]} =
-  match pg::simple_query[link](session, sql, cfg.client) {
-    Err(e) -> Err(e),
-    Ok(reply) -> Ok(reply.session),
+) -> Result<pg::Reply, pg::ClientError> / {net.send[link], net.recv[link]} =
+  pg::simple_query[link](session, sql, cfg.client)
+
+fn linked(
+  cfg: Server,
+  nonce: String,
+  c: Claim,
+) -> Result<Link, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match c {
+    Idle(l) -> Ok(l),
+    Fresh(n) -> match pg::connect[link](
+        cfg.host,
+        cfg.port,
+        cfg.user,
+        cfg.database,
+        startup_parameters(cfg),
+        cfg.password,
+        nonce ++ "-" ++ int_to_string(n),
+        cfg.client,
+      ) {
+      Err(e) -> Err(client_error(e)),
+      Ok(session) -> Ok({ n: n, session: session }),
+    },
   }
 
-fn statement_on(
+// An exchange outside any transaction that failed: a refusal leaves the server talking on the
+// connection, and anything else ends it.
+fn let_go(l: Link, e: pg::ClientError, cfg: Server) -> Left / {net.send[link], net.close[link]} =
+  match e {
+    pg::Rejected(session, server) ->
+      {
+        answer: Failed(server_error(server)),
+        n: l.n,
+        scope: None,
+        freed: Some(Reuse({ ..l, session: session })),
+      },
+    _ -> {
+      pg::finish[link](l.session, cfg.client);
+      { answer: Failed(client_error(e)), n: l.n, scope: None, freed: Some(Lost) }
+    },
+  }
+
+// A transaction's scope after an exchange on its connection, `deeper` scopes more or fewer.
+fn kept(scope: Scope, session: pg::Session, deeper: Int) -> Scope =
+  { ..scope, session: Some(session), depth: scope.depth + deeper, busy: false }
+
+// An exchange inside a transaction that failed: a refusal leaves the transaction where it stood,
+// and anything else loses its connection and the transaction with it.
+fn failed_within(
+  scope: Scope,
+  session: pg::Session,
+  e: pg::ClientError,
   cfg: Server,
-  size: Int,
+  deeper: Int,
+) -> Left / {net.send[link], net.close[link]} =
+  match e {
+    pg::Rejected(after, server) ->
+      {
+        answer: Failed(server_error(server)),
+        n: scope.n,
+        scope: Some(kept(scope, after, deeper)),
+        freed: None,
+      },
+    _ -> {
+      pg::finish[link](session, cfg.client);
+      {
+        answer: Failed(client_error(e)),
+        n: scope.n,
+        scope: Some({ ..scope, session: None, depth: scope.depth + deeper, busy: false }),
+        freed: Some(Lost),
+      }
+    },
+  }
+
+fn statement_outside(
+  cfg: Server,
   nonce: String,
-  pool: Pool,
+  c: Claim,
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
-  reads_only: Bool,
-  label: String,
-) -> { answer: Answer, pool: Pool } / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match pool.open {
-    Some(open) -> match run_statement(open.session, s, ps, rows, reads_only, label, cfg) {
-      Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
-      Ok(ran) -> {
-        let held = { ..open, session: ran.session };
-        { answer: ran.answer, pool: { ..pool, open: Some(held) } }
-      },
-    },
-    None -> match checkout(cfg, size, pool, nonce) {
-      Err(e) -> { answer: Failed(e), pool: pool },
-      Ok(taken) -> match run_statement(taken.session, s, ps, rows, reads_only, label, cfg) {
-        Err(e) -> {
-          pg::finish[link](taken.session, cfg.client);
-          {
-            answer: Failed(db_error("", "", pg::client_error_text(e))),
-            pool: give_back(taken.session, taken.pool),
-          }
+) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match linked(cfg, nonce, c) {
+    Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
+    Ok(l) -> match run_checked(l.session, s, ps, rows, cfg) {
+      Ok(ran) ->
+        {
+          answer: ran.answer,
+          n: l.n,
+          scope: None,
+          freed: Some(Reuse({ ..l, session: ran.session })),
         },
-        Ok(ran) -> { answer: ran.answer, pool: release(ran.session, taken.pool) },
-      },
+      Err(e) -> let_go(l, e, cfg),
     },
   }
 
-fn begin_txn(
+fn statement_within(
   cfg: Server,
-  size: Int,
+  scope: Scope,
+  session: pg::Session,
+  s: Stmt,
+  ps: List<Param>,
+  rows: Bool,
+) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+  match run_checked(session, s, ps, rows, cfg) {
+    Ok(ran) ->
+      { answer: ran.answer, n: scope.n, scope: Some(kept(scope, ran.session, 0)), freed: None },
+    Err(e) -> failed_within(scope, session, e, cfg, 0),
+  }
+
+fn opening(
+  cfg: Server,
   nonce: String,
-  pool: Pool,
+  c: Claim,
   level: Isolation,
   access: Access,
-) -> { answer: Answer, pool: Pool } / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match pool.open {
-    // A nested begin is a savepoint on the connection the outer transaction holds.
-    Some(open) -> match control(open.session, "savepoint " ++ savepoint_name(open.depth + 1), cfg) {
-      Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
-      Ok(session) -> {
-        let deeper = { ..open, session: session, depth: open.depth + 1 };
-        { answer: Count(0), pool: { ..pool, open: Some(deeper) } }
-      },
-    },
-    None -> match checkout(cfg, size, pool, nonce) {
-      Err(e) -> { answer: Failed(e), pool: pool },
-      Ok(taken) -> match control(
-          taken.session,
-          "begin isolation level " ++ isolation_sql(level) ++ " " ++ access_sql(access),
-          cfg,
-        ) {
-        Err(e) -> {
-          pg::finish[link](taken.session, cfg.client);
-          {
-            answer: Failed(db_error("", "", pg::client_error_text(e))),
-            pool: give_back(taken.session, taken.pool),
-          }
+) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match linked(cfg, nonce, c) {
+    Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
+    Ok(l) -> match control(
+        l.session,
+        "begin isolation level " ++ isolation_sql(level) ++ " " ++ access_sql(access),
+        cfg,
+      ) {
+      Ok(reply) ->
+        {
+          answer: Count(0),
+          n: l.n,
+          scope: Some({
+            n: l.n,
+            session: Some(reply.session),
+            depth: 1,
+            level: level,
+            access: access,
+            busy: false,
+          }),
+          freed: None,
         },
-        Ok(session) -> {
-          let open = { session: session, depth: 1 };
-          { answer: Count(0), pool: { ..taken.pool, open: Some(open) } }
-        },
-      },
+      Err(e) -> let_go(l, e, cfg),
     },
   }
 
-fn commit_txn(
+fn nesting(
   cfg: Server,
-  pool: Pool,
-) -> { answer: Answer, pool: Pool } / {net.send[link], net.recv[link]} =
-  match pool.open {
-    None -> { answer: Count(0), pool: pool },
-    Some(open) -> if open.depth > 1 {
-      match control(open.session, "release savepoint " ++ savepoint_name(open.depth), cfg) {
-        Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
-        Ok(session) -> {
-          let shallower = { ..open, session: session, depth: open.depth - 1 };
-          { answer: Count(0), pool: { ..pool, open: Some(shallower) } }
-        },
-      }
-    } else {
-      match control(open.session, "commit", cfg) {
-        Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
-        Ok(session) -> { answer: Count(0), pool: release(session, { ..pool, open: None }) },
-      }
-    },
+  scope: Scope,
+  session: pg::Session,
+) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+  match control(session, "savepoint " ++ savepoint_name(scope.depth + 1), cfg) {
+    Ok(reply) ->
+      { answer: Count(0), n: scope.n, scope: Some(kept(scope, reply.session, 1)), freed: None },
+    Err(e) -> failed_within(scope, session, e, cfg, 0),
   }
 
-fn abort_txn(
+// A transaction that has ended, its connection back in the pool.
+fn ended(scope: Scope, session: pg::Session, answer: Answer) -> Left =
+  { answer: answer, n: scope.n, scope: None, freed: Some(Reuse({ n: scope.n, session: session })) }
+
+// A `commit` closes its scope whatever the server answers: a savepoint's leaves the scope around
+// it, and a transaction's gives its connection back.
+fn committing(
   cfg: Server,
-  pool: Pool,
-) -> { answer: Answer, pool: Pool } / {net.send[link], net.recv[link]} =
-  match pool.open {
-    None -> { answer: Count(0), pool: pool },
-    Some(open) -> if open.depth > 1 {
-      // The savepoint is still open after a rollback to it, so the scope stays as deep.
-      match control(open.session, "rollback to savepoint " ++ savepoint_name(open.depth), cfg) {
-        Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
-        Ok(session) -> {
-          let same = { ..open, session: session };
-          { answer: Count(0), pool: { ..pool, open: Some(same) } }
-        },
-      }
-    } else {
-      match control(open.session, "rollback", cfg) {
-        Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
-        Ok(session) -> { answer: Count(0), pool: release(session, { ..pool, open: None }) },
-      }
-    },
+  scope: Scope,
+  session: pg::Session,
+) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+  if scope.depth > 1 {
+    match control(session, "release savepoint " ++ savepoint_name(scope.depth), cfg) {
+      Ok(reply) ->
+        { answer: Count(0), n: scope.n, scope: Some(kept(scope, reply.session, -1)), freed: None },
+      Err(e) -> failed_within(scope, session, e, cfg, -1),
+    }
+  } else {
+    match control(session, "commit", cfg) {
+      Ok(reply) -> ended(scope, reply.session, committed(reply.answer.tag)),
+      Err(pg::Rejected(after, server)) -> ended(scope, after, Failed(server_error(server))),
+      Err(e) -> {
+        pg::finish[link](session, cfg.client);
+        { answer: Failed(unresolved(e)), n: scope.n, scope: None, freed: Some(Lost) }
+      },
+    }
+  }
+
+// The server ends an aborted transaction's `COMMIT` with a rollback, and no error.
+fn committed(tag: String) -> Answer =
+  if tag == "ROLLBACK" { Failed(in_failed_txn()) } else { Count(0) }
+
+fn aborting(
+  cfg: Server,
+  scope: Scope,
+  session: pg::Session,
+) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+  if scope.depth > 1 {
+    // A savepoint outlives a rollback to it, so it is released too.
+    let name = savepoint_name(scope.depth);
+    match control(
+        session,
+        "rollback to savepoint " ++ name ++ "; release savepoint " ++ name,
+        cfg,
+      ) {
+      Ok(reply) ->
+        { answer: Count(0), n: scope.n, scope: Some(kept(scope, reply.session, -1)), freed: None },
+      Err(e) -> failed_within(scope, session, e, cfg, -1),
+    }
+  } else {
+    match control(session, "rollback", cfg) {
+      Ok(reply) -> ended(scope, reply.session, Count(0)),
+      Err(e) -> let_go({ n: scope.n, session: session }, e, cfg),
+    }
   }
 
 // The `db` effect served from a live server. `nonce` is the caller's, so a run's seed decides it
@@ -4999,42 +5192,57 @@ pub fn serve<a | e>(
   nonce: String,
   body: () -> a / {db.read[*], db.write[*] | e},
 ) -> a / {net.connect[link], net.send[link], net.recv[link], net.close[link] | e} =
-  with_cell[dbpool]({ idle: [], open: None, opened: 0 }) { pool ->
+  with_cell[dbpool]({ idle: [], opened: 0, made: 0, open: [] }) { pool -> {
+    let taken = |d: Decided| {
+      cell_set(pool, d.pool);
+      d.plan
+    };
+    let settled = |left: Left| {
+      cell_set(pool, settle(cell_get(pool), left));
+      left.answer
+    };
+    let statement = |s: Stmt, ps: List<Param>, rows: Bool, what: String|
+      match taken(for_statement(cell_get(pool), size, what)) {
+        Answered(a) -> a,
+        Outside(c) -> settled(statement_outside(cfg, nonce, c, s, ps, rows)),
+        Within(scope, session) -> settled(statement_within(cfg, scope, session, s, ps, rows)),
+      };
+    let closing = |d: ToClose| {
+      cell_set(pool, d.pool);
+      d.closing
+    };
     handle {
       body()
     } with {
       db.query[*t](s, ps) -> {
-        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true, true, t);
-        cell_set(pool, ran.pool);
-        ran.answer
+        check_statement(s, true, t);
+        statement(s, ps, true, "`db.query`")
       },
       db.execute[*t](s, ps) -> {
-        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, false, false, t);
-        cell_set(pool, ran.pool);
-        ran.answer
+        check_statement(s, false, t);
+        statement(s, ps, false, "`db.execute`")
       },
       db.returning[*t](s, ps) -> {
-        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true, false, t);
-        cell_set(pool, ran.pool);
-        ran.answer
+        check_statement(s, false, t);
+        statement(s, ps, true, "`db.returning`")
       },
-      db.begin(level, access) -> {
-        let ran = begin_txn(cfg, size, nonce, cell_get(pool), level, access);
-        cell_set(pool, ran.pool);
-        ran.answer
+      db.begin(level, access) -> match taken(for_begin(cell_get(pool), size, level, access)) {
+        Answered(a) -> a,
+        Outside(c) -> settled(opening(cfg, nonce, c, level, access)),
+        Within(scope, session) -> settled(nesting(cfg, scope, session)),
       },
-      db.commit() -> {
-        let ran = commit_txn(cfg, cell_get(pool));
-        cell_set(pool, ran.pool);
-        ran.answer
+      db.commit() -> match closing(
+          for_close(cell_get(pool), "`db.commit`", Failed(connection_lost())),
+        ) {
+        Settled(a) -> a,
+        Closes(scope, session) -> settled(committing(cfg, scope, session)),
       },
-      db.abort() -> {
-        let ran = abort_txn(cfg, cell_get(pool));
-        cell_set(pool, ran.pool);
-        ran.answer
+      db.abort() -> match closing(for_close(cell_get(pool), "`db.abort`", Count(0))) {
+        Settled(a) -> a,
+        Closes(scope, session) -> settled(aborting(cfg, scope, session)),
       },
     }
-  }
+  } }
 
 // --- Where the server is ---------------------------------------------------------
 
@@ -5784,3 +5992,548 @@ fn assert_err(url: String, wanted: String) -> Unit =
         ),
       ),
   }
+
+// --- The driver over a scripted server -------------------------------------------
+//
+// A postgres that answers what the driver sends as a server would, one conversation a connection:
+// a statement completes, `BEGIN`, `COMMIT` and a refusal move the transaction's status, and a
+// statement the script names is refused. A statement's reply is read after a `task.yield`, which is
+// where a socket parks the task waiting on it.
+
+// A refusal the script holds for the first statement that begins with `on`; a `fatal` one ends the
+// session rather than the statement.
+type Refusal = {
+  on: String,
+  code: String,
+  constraint: String,
+  message: String,
+  detail: String,
+  fatal: Bool,
+}
+
+fn refuse(
+  on: String,
+  code: String,
+  constraint: String,
+  message: String,
+  detail: String,
+) -> Refusal =
+  { on: on, code: code, constraint: constraint, message: message, detail: detail, fatal: false }
+
+fn hang_up(on: String, code: String) -> Refusal =
+  { on: on, code: code, constraint: "", message: "terminating connection", detail: "", fatal: true }
+
+// One connection: the bytes sent that are not yet a whole message, the replies not yet read, the
+// transaction's status (73 idle, 84 in one, 69 in a failed one), the statement the extended cycle
+// parsed, what it was sent, and whether the server still talks on it.
+type Wire = {
+  inbox: Bytes,
+  outbox: Bytes,
+  started: Bool,
+  status: Int,
+  parsed: String,
+  said: List<String>,
+  open: Bool,
+}
+
+type Fake = { wires: List<Wire>, refusals: List<Refusal> }
+
+type Fed = { wire: Wire, refusals: List<Refusal> }
+
+type Scripted<a> = { value: a, wires: List<Wire> }
+
+fn t_frame(kind: Int, body: Bytes) -> Bytes =
+  bytes_concat_all([byte_of_int(kind), u32_be(bytes_len(body) + 4), body])
+
+fn t_text(s: String) -> Bytes = bytes_concat(bytes_of_string(s), b"\x00")
+
+fn t_ready(status: Int) -> Bytes = t_frame(90, byte_of_int(status))
+
+fn t_done(tag: String) -> Bytes = t_frame(67, t_text(tag))
+
+fn t_field(code: String, text: String) -> Bytes =
+  if text == "" { b"" } else { bytes_concat(bytes_of_string(code), t_text(text)) }
+
+fn t_error(severity: String, r: Refusal) -> Bytes =
+  t_frame(
+    69,
+    bytes_concat_all([
+      t_field("S", severity),
+      t_field("C", r.code),
+      t_field("M", r.message),
+      t_field("D", r.detail),
+      t_field("n", r.constraint),
+      b"\x00",
+    ]),
+  )
+
+fn t_aborted() -> Refusal =
+  refuse(
+    "",
+    "25P02",
+    "",
+    "current transaction is aborted, commands ignored until end of transaction block",
+    "",
+  )
+
+fn t_greeted() -> Wire =
+  {
+    inbox: b"",
+    outbox: bytes_concat(t_frame(82, u32_be(0)), t_ready(73)),
+    started: false,
+    status: 73,
+    parsed: "",
+    said: [],
+    open: true,
+  }
+
+type Said = { bytes: Bytes, status: Int }
+
+fn t_tagged(tag: String, status: Int) -> Said = { bytes: t_done(tag), status: status }
+
+fn t_in_failed() -> Said = { bytes: t_error("ERROR", t_aborted()), status: 69 }
+
+// Rolling back to a savepoint un-aborts the transaction, and the release that follows closes it.
+fn t_rolled_back_to() -> Said =
+  { bytes: bytes_concat(t_done("ROLLBACK"), t_done("RELEASE")), status: 84 }
+
+fn t_answer(sql: String, status: Int, extended: Bool) -> Said =
+  if extended { t_extended(sql, status) } else { t_simple(sql, status) }
+
+fn t_extended(sql: String, status: Int) -> Said =
+  if status == 69 { t_in_failed() } else {
+    {
+      bytes: bytes_concat_all([
+        t_frame(49, b""),
+        t_frame(50, b""),
+        t_frame(110, b""),
+        t_done(t_tag(sql)),
+      ]),
+      status: status,
+    }
+  }
+
+fn t_simple(sql: String, status: Int) -> Said =
+  if string_starts_with(sql, "begin") { t_tagged("BEGIN", 84) }
+  else if sql == "commit" { t_tagged(if status == 69 { "ROLLBACK" } else { "COMMIT" }, 73) }
+  else if sql == "rollback" { t_tagged("ROLLBACK", 73) }
+  else if string_starts_with(sql, "rollback to") { t_rolled_back_to() }
+  else if status == 69 { t_in_failed() }
+  else if string_starts_with(sql, "savepoint") { t_tagged("SAVEPOINT", status) }
+  else { t_tagged("RELEASE", status) }
+
+fn t_tag(sql: String) -> String =
+  if string_starts_with(sql, "insert") { "INSERT 0 1" }
+  else if string_starts_with(sql, "update") { "UPDATE 1" }
+  else { "DELETE 1" }
+
+// An error in a transaction fails it, and a `COMMIT` that errs ends it.
+fn t_after_error(sql: String, status: Int) -> Int =
+  if sql == "commit" { 73 } else if status == 84 { 69 } else { status }
+
+type Picked = { found: Option<Refusal>, rest: List<Refusal> }
+
+fn t_pick(refusals: List<Refusal>, sql: String) -> Picked =
+  fold(refusals, { found: None, rest: [] }, |acc: Picked, r: Refusal|
+    match acc.found {
+      None -> if string_starts_with(sql, r.on) { { ..acc, found: Some(r) } }
+      else { { ..acc, rest: push(acc.rest, r) } },
+      Some(_) -> { ..acc, rest: push(acc.rest, r) },
+    })
+
+fn t_statement(w: Wire, refusals: List<Refusal>, sql: String, extended: Bool) -> Fed = {
+  let heard = { ..w, said: push(w.said, sql) };
+  let picked = t_pick(refusals, sql);
+  match picked.found {
+    Some(r) -> if r.fatal {
+      {
+        wire: { ..heard, outbox: bytes_concat(heard.outbox, t_error("FATAL", r)), open: false },
+        refusals: picked.rest,
+      }
+    } else {
+      let status = t_after_error(sql, w.status);
+      {
+        wire: {
+          ..heard,
+          outbox: bytes_concat_all([heard.outbox, t_error("ERROR", r), t_ready(status)]),
+          status: status,
+        },
+        refusals: picked.rest,
+      }
+    },
+    None -> {
+      let a = t_answer(sql, w.status, extended);
+      {
+        wire: {
+          ..heard,
+          outbox: bytes_concat_all([heard.outbox, a.bytes, t_ready(a.status)]),
+          status: a.status,
+        },
+        refusals: picked.rest,
+      }
+    },
+  }
+}
+
+fn t_cstring(b: Bytes, at: Int) -> String =
+  match pg::read_cstring(b, at) { Some(c) -> c.text, None -> "" }
+
+// A `Query` or a `Parse` while a reply is unread is a second conversation on the connection.
+fn t_message(w: Wire, refusals: List<Refusal>, kind: Int, body: Bytes) -> Fed =
+  if (kind == 81 || kind == 80) && bytes_len(w.outbox) > 0 {
+    panic("a connection was sent a statement before its last one was answered")
+  } else if kind == 81 { t_statement(w, refusals, t_cstring(body, 0), false) } else if kind == 80 {
+    // A `Parse` names its statement before its text.
+    match pg::read_cstring(body, 0) {
+      Some(name) -> { wire: { ..w, parsed: t_cstring(body, name.next) }, refusals: refusals },
+      None -> { wire: w, refusals: refusals },
+    }
+  } else if kind == 83 { t_statement(w, refusals, w.parsed, true) }
+  else if kind == 88 { { wire: { ..w, open: false }, refusals: refusals } }
+  else { { wire: w, refusals: refusals } }
+
+// Every whole message in the inbox; the start-up message has no kind byte.
+fn t_feed(w: Wire, refusals: List<Refusal>) -> Fed =
+  if !w.started {
+    match u32_be_at(w.inbox, 0) {
+      None -> { wire: w, refusals: refusals },
+      Some(n) -> if bytes_len(w.inbox) < n { { wire: w, refusals: refusals } } else {
+        t_feed({ ..w, inbox: bytes_slice(w.inbox, n, bytes_len(w.inbox)), started: true }, refusals)
+      },
+    }
+  } else {
+    match u32_be_at(w.inbox, 1) {
+      None -> { wire: w, refusals: refusals },
+      Some(n) -> if bytes_len(w.inbox) < 1 + n { { wire: w, refusals: refusals } } else {
+        let fed = t_message(
+          { ..w, inbox: bytes_slice(w.inbox, 1 + n, bytes_len(w.inbox)) },
+          refusals,
+          bytes_at(w.inbox, 0),
+          bytes_slice(w.inbox, 5, 1 + n),
+        );
+        t_feed(fed.wire, fed.refusals)
+      },
+    }
+  }
+
+fn t_sent(f: Fake, c: Int, payload: Bytes) -> Fake =
+  match list_at(f.wires, c) {
+    None -> panic("a send on a connection the script never opened"),
+    Some(w) -> if !w.open { f } else {
+      let fed = t_feed({ ..w, inbox: bytes_concat(w.inbox, payload) }, f.refusals);
+      { wires: list_set(f.wires, c, fed.wire), refusals: fed.refusals }
+    },
+  }
+
+type Heard = { fake: Fake, bytes: Bytes }
+
+fn t_read(f: Fake, c: Int) -> Heard =
+  match list_at(f.wires, c) {
+    None -> panic("a read on a connection the script never opened"),
+    Some(w) -> if bytes_len(w.outbox) > 0 {
+      { fake: { ..f, wires: list_set(f.wires, c, { ..w, outbox: b"" }) }, bytes: w.outbox }
+    } else if w.open { panic("the driver waited on a reply the script never sends") }
+    else { { fake: f, bytes: b"" } },
+  }
+
+fn t_closed(f: Fake, c: Int) -> Fake =
+  match list_at(f.wires, c) {
+    None -> f,
+    Some(w) -> { ..f, wires: list_set(f.wires, c, { ..w, open: false }) },
+  }
+
+// `body` served by `serve` over the script; a test runs it in a `simulate` region, so every
+// interleaving of its tasks at the replies is run.
+fn over_script<a | e>(
+  size: Int,
+  refusals: List<Refusal>,
+  body: () -> a / {db.read[*], db.write[*] | e},
+) -> Scripted<a> / {task.yield | e} =
+  with_cell[wire]({ wires: [], refusals: refusals }) { fake -> {
+    let value = handle {
+      serve(server("db", 5432, "ply", "ply", None), size, "t", body)
+    } with {
+      net.connect[link](host, port, timeout_ms) -> {
+        let f = cell_get(fake);
+        cell_set(fake, { ..f, wires: push(f.wires, t_greeted()) });
+        Some(len(f.wires))
+      },
+      net.send[link](c, payload, timeout_ms) -> {
+        cell_set(fake, t_sent(cell_get(fake), c, payload));
+        Some(bytes_len(payload))
+      },
+      net.recv[link](c, max, timeout_ms) -> {
+        if t_talking(cell_get(fake), c) { task.yield() };
+        let heard = t_read(cell_get(fake), c);
+        cell_set(fake, heard.fake);
+        Some(heard.bytes)
+      },
+      net.close[link](c) -> cell_set(fake, t_closed(cell_get(fake), c)),
+    };
+    { value: value, wires: cell_get(fake).wires }
+  } }
+
+// A connection past its greeting, whose replies park the task reading them.
+fn t_talking(f: Fake, c: Int) -> Bool =
+  match list_at(f.wires, c) { Some(w) -> len(w.said) > 0, None -> false }
+
+fn t_said(wires: List<Wire>) -> List<List<String>> = map(wires, |w: Wire| w.said)
+
+fn t_insert(sku: String) -> Stmt = stmt("insert into part (sku) values ('" ++ sku ++ "')")
+
+fn t_begin(level: String) -> String = "begin isolation level " ++ level ++ " read write"
+
+// Every connection's statements, cut where a transaction ends.
+fn t_runs(wires: List<Wire>) -> List<List<String>> =
+  fold(wires, [], |acc: List<List<String>>, w: Wire| concat_lists(acc, t_cut(w.said, [], [])))
+
+fn t_cut(said: List<String>, run: List<String>, acc: List<List<String>>) -> List<List<String>> =
+  match said {
+    [] -> if len(run) == 0 { acc } else { push(acc, run) },
+    [s, ..rest] -> if s == "commit" || s == "rollback" { t_cut(rest, [], push(acc, push(run, s))) }
+    else { t_cut(rest, push(run, s), acc) },
+  }
+
+fn t_has_run(runs: List<List<String>>, run: List<String>) -> Bool =
+  fold(runs, false, |acc: Bool, r: List<String>| acc || r == run)
+
+// A serialization failure is the server asking for the transaction again, from its `begin`.
+fn retried(
+  left: Int,
+  seen: List<String>,
+) -> { result: Result<Int, Rollback>, seen: List<String> } / {db.begin, db.commit, db.abort, db.execute[part]} =
+  match transaction(Serializable, ReadWrite, || {
+      db.execute[part](t_insert("a"), []);
+      1
+    }) {
+    Ok(v) -> { result: Ok(v), seen: seen },
+    Err(rolled) -> match rolled.error {
+      None -> { result: Err(rolled), seen: seen },
+      Some(e) -> if is_retryable(e) && left > 1 { retried(left - 1, push(seen, e.code)) }
+      else { { result: Err(rolled), seen: push(seen, e.code) } },
+    },
+  }
+
+test "a refusal from the server is its SQLSTATE, the constraint it names and its message" {
+  simulate {
+    let r = over_script(
+      1,
+      [
+        refuse(
+          t_insert("a").sql,
+          "23505",
+          "part_pkey",
+          "duplicate key value violates unique constraint \"part_pkey\"",
+          "Key (sku)=(a) already exists.",
+        ),
+      ],
+      || [db.execute[part](t_insert("a"), []), db.execute[part](t_insert("b"), [])],
+    );
+    assert_eq(r.value, [
+      Failed({
+        code: "23505",
+        constraint: "part_pkey",
+        detail: "duplicate key value violates unique constraint \"part_pkey\": Key (sku)=(a) already exists.",
+      }),
+      Count(1),
+    ]);
+    // The refusal left the server talking on the connection, so the next statement ran on it.
+    assert_eq(t_said(r.wires), [[t_insert("a").sql, t_insert("b").sql]])
+  }
+}
+
+test "a serialization failure at commit is retryable, and the retry begins a transaction afresh" {
+  simulate {
+    let r = over_script(
+      1,
+      [
+        refuse(
+          "commit",
+          "40001",
+          "",
+          "could not serialize access due to read/write dependencies among transactions",
+          "",
+        ),
+      ],
+      || retried(3, []),
+    );
+    assert_eq(r.value, { result: Ok(1), seen: ["40001"] });
+    let begin = t_begin("serializable");
+    assert_eq(t_said(r.wires), [
+      [begin, t_insert("a").sql, "commit", begin, t_insert("a").sql, "commit"],
+    ])
+  }
+}
+
+test "two tasks' transactions each hold a connection of their own, whichever order they run in" {
+  simulate {
+    let r = over_script(2, [], || {
+      let a = task.spawn(||
+        transaction(ReadCommitted, ReadWrite, || {
+          db.execute[part](t_insert("a1"), []);
+          "a"
+        }));
+      let b = task.spawn(||
+        transaction(ReadCommitted, ReadWrite, || {
+          db.execute[part](t_insert("b1"), []);
+          db.rollback("b gave up")
+        }));
+      { a: task.join(a), b: task.join(b) }
+    });
+    assert_eq(r.value.a, Ok("a"));
+    assert_eq(r.value.b, Err({ reason: "b gave up", error: None }));
+    let begin = t_begin("read committed");
+    let runs = t_runs(r.wires);
+    assert_eq(len(runs), 2);
+    assert(t_has_run(runs, [begin, t_insert("a1").sql, "commit"]));
+    assert(t_has_run(runs, [begin, t_insert("b1").sql, "rollback"]))
+  }
+}
+
+test "an operation belongs to the one transaction not waiting on the server, and to none when all are" {
+  let s = { n: 0, session: None, depth: 1, level: ReadCommitted, access: ReadWrite, busy: false };
+  let waiting = { ..s, n: 1, busy: true };
+  assert_eq(route([]), NoTransaction);
+  assert_eq(route([waiting]), NoTransaction);
+  assert_eq(route([waiting, s]), Own(s));
+  assert_eq(route([s, { ..s, n: 2 }]), Ambiguous)
+}
+
+test "a pool lends a connection to one statement at a time, and says so when it has none left" {
+  simulate {
+    let r = over_script(1, [], || {
+      let a = task.spawn(|| db.execute[part](t_insert("t1"), []));
+      let b = task.spawn(|| db.execute[part](t_insert("t2"), []));
+      let c = task.spawn(|| db.execute[part](t_insert("t3"), []));
+      [task.join(a), task.join(b), task.join(c)]
+    });
+    assert(
+      fold(r.value, true, |acc: Bool, a: Answer| acc && (a == Count(1) || t_code(a) == "53300")),
+    );
+    assert(fold(r.value, false, |acc: Bool, a: Answer| acc || a == Count(1)));
+    assert_eq(len(r.wires), 1)
+  }
+}
+
+test "an inner abort closes its savepoint, and the transaction around it still commits" {
+  simulate {
+    let r = over_script(1, [], || {
+      let out = transaction(ReadCommitted, ReadWrite, || {
+        db.execute[part](t_insert("x"), []);
+        let inner = transaction(ReadCommitted, ReadWrite, || {
+          db.execute[part](t_insert("y"), []);
+          db.rollback("inner gave up")
+        });
+        db.execute[part](t_insert("z"), []);
+        inner
+      });
+      let after = transaction(ReadCommitted, ReadWrite, || db.execute[part](t_insert("w"), []));
+      { out: out, after: after }
+    });
+    assert_eq(r.value.out, Ok(Err({ reason: "inner gave up", error: None })));
+    assert_eq(r.value.after, Ok(Count(1)));
+    let begin = t_begin("read committed");
+    assert_eq(t_said(r.wires), [
+      [
+        begin,
+        t_insert("x").sql,
+        "savepoint ply_sp2",
+        t_insert("y").sql,
+        "rollback to savepoint ply_sp2; release savepoint ply_sp2",
+        t_insert("z").sql,
+        "commit",
+        begin,
+        t_insert("w").sql,
+        "commit",
+      ],
+    ])
+  }
+}
+
+test "a commit the server turns into a rollback is 25P02, and gives the connection back" {
+  simulate {
+    let r = over_script(
+      1,
+      [
+        refuse(
+          t_insert("a").sql,
+          "23505",
+          "part_pkey",
+          "duplicate key value violates unique constraint \"part_pkey\"",
+          "",
+        ),
+      ],
+      || {
+        let out = transaction(ReadCommitted, ReadWrite, || db.execute[part](t_insert("a"), []));
+        { out: out, next: db.execute[part](t_insert("b"), []) }
+      },
+    );
+    assert_eq(r.value.out, Err({ reason: "commit", error: Some(in_failed_txn()) }));
+    assert_eq(r.value.next, Count(1));
+    assert_eq(t_said(r.wires), [
+      [t_begin("read committed"), t_insert("a").sql, "commit", t_insert("b").sql],
+    ])
+  }
+}
+
+test "a nested begin the transaction cannot take is refused before anything is sent" {
+  simulate {
+    let r = over_script(
+      1,
+      [refuse(t_insert("a").sql, "23505", "part_pkey", "duplicate key", "")],
+      || {
+        let bounded = transaction(ReadCommitted, ReadOnly, ||
+          [db.begin(Serializable, ReadOnly), db.begin(ReadCommitted, ReadWrite)]);
+        let failed = sandbox(|| {
+          db.execute[part](t_insert("a"), []);
+          db.begin(ReadCommitted, ReadWrite)
+        });
+        { bounded: bounded, failed: failed }
+      },
+    );
+    assert_eq(match r.value.bounded { Ok(answers) -> map(answers, t_code), Err(_) -> [] }, [
+      "25001",
+      "25001",
+    ]);
+    assert_eq(t_code(r.value.failed), "25P02");
+    assert_eq(t_said(r.wires), [
+      [
+        "begin isolation level read committed read only",
+        "commit",
+        t_begin("read committed"),
+        t_insert("a").sql,
+        "rollback",
+      ],
+    ])
+  }
+}
+
+test "a connection lost inside a transaction fails the rest of it, and nothing of it runs elsewhere" {
+  simulate {
+    let r = over_script(
+      1,
+      [hang_up(t_insert("a").sql, "57P01"), hang_up(t_insert("d").sql, "57P01")],
+      || {
+        let rest = sandbox(||
+          [
+            db.execute[part](t_insert("a"), []),
+            db.execute[part](t_insert("b"), []),
+            db.begin(ReadCommitted, ReadWrite),
+          ]);
+        let next = db.execute[part](t_insert("c"), []);
+        let committed = transaction(ReadCommitted, ReadWrite, ||
+          db.execute[part](t_insert("d"), []));
+        { rest: map(rest, t_code), next: next, committed: committed }
+      },
+    );
+    assert_eq(r.value.rest, ["57P01", "08003", "08003"]);
+    assert_eq(r.value.next, Count(1));
+    assert_eq(r.value.committed, Err({ reason: "commit", error: Some(connection_lost()) }));
+    let begin = t_begin("read committed");
+    assert_eq(t_said(r.wires), [
+      [begin, t_insert("a").sql],
+      [t_insert("c").sql, begin, t_insert("d").sql],
+    ]);
+    assert_eq(map(r.wires, |w: Wire| w.open), [false, false])
+  }
+}

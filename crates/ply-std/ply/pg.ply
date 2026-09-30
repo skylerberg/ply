@@ -380,7 +380,8 @@ fn oids(body: Bytes, at: Int, left: Int, acc: List<Int>) -> Option<List<Int>> =
   }
 
 // An `ErrorResponse` and a `NoticeResponse` are the same shape: a field type byte, the field's
-// text, and a zero byte at the end. `S` is severity, `C` the SQLSTATE, `M` the message.
+// text, and a zero byte at the end. `S` is severity, `C` the SQLSTATE, `M` the message, `D` its
+// detail and `n` the constraint a violation names.
 pub type Field = { code: Int, text: String }
 
 pub fn diagnostic_fields(m: Message) -> List<Field> = fields_of(m.body, 0, [])
@@ -407,20 +408,34 @@ pub fn default_client() -> Client = { connect_ms: 5000, read_ms: 30000, write_ms
 
 pub fn read_size() -> Int = 65536
 
-// What the server said when it refused: the SQLSTATE is what a program branches on, and the
-// severity and message are what it prints.
-pub type Server = { severity: String, code: String, message: String }
+// What the server said when it refused: the SQLSTATE is what a program branches on, the
+// constraint is the one a violation names, and the rest is what it prints.
+pub type Server = {
+  severity: String,
+  code: String,
+  message: String,
+  detail: String,
+  constraint: String,
+}
 
-// A connection with a server, the bytes read from it that are not yet a whole frame, and the
-// parameters it set at start-up.
-pub type Session = { conn: Int, buffer: Bytes, user: String, database: String, settings: List<Set> }
+// A connection with a server, the bytes read from it that are not yet a whole frame, the
+// parameters it set at start-up, and where its transaction stood at the last `ReadyForQuery`.
+pub type Session = {
+  conn: Int,
+  buffer: Bytes,
+  user: String,
+  database: String,
+  settings: List<Set>,
+  status: Status,
+}
 
 pub type ClientError =
   | Unreachable
   | NotSent
   | TimedOut
   | Closed
-  // The server refused before it would talk, so there is no connection left to use.
+  // The server refused and there is no connection left to use: it refused before it would talk,
+  // or its error ended the session.
   | Refused(Server)
   // A statement was refused. The connection is still usable — the server is waiting for the
   // next one — so the session comes back with the refusal for the caller to decide about.
@@ -465,7 +480,17 @@ fn read_message<[l]>(
 }
 
 fn server_of(m: Message) -> Server =
-  { severity: field_or(m, 83, "ERROR"), code: field_or(m, 67, ""), message: field_or(m, 77, "") }
+  {
+    severity: field_or(m, 83, "ERROR"),
+    code: field_or(m, 67, ""),
+    message: field_or(m, 77, ""),
+    detail: field_or(m, 68, ""),
+    constraint: field_or(m, 110, ""),
+  }
+
+// A `ReadyForQuery` without its status byte says nothing about the transaction.
+fn status_after(m: Message) -> Status =
+  match ready_status(m) { Some(b) -> status_of(b), None -> Unknown(0) }
 
 fn field_or(m: Message, code: Int, fallback: String) -> String =
   match field_of(m, code) { Some(text) -> text, None -> fallback }
@@ -491,6 +516,7 @@ pub fn connect<[l]>(
         user: user,
         database: database,
         settings: [],
+        status: Idle,
       };
       if !send_all[l](conn, startup(user, database, parameters), client.write_ms) {
         net.close[l](conn);
@@ -556,7 +582,7 @@ fn greet<[l]>(
         BackendKeyData -> greet[l](rest, password, nonce, client, acc),
         NoticeResponse -> greet[l](rest, password, nonce, client, acc),
         ErrorResponse -> Err(Refused(server_of(m))),
-        ReadyForQuery -> Ok({ ..rest, settings: acc.settings }),
+        ReadyForQuery -> Ok({ ..rest, settings: acc.settings, status: status_after(m) }),
         _ -> Err(Unexpected("a " ++ backend_name(m.kind) ++ " before the server was ready")),
       }
     },
@@ -565,8 +591,10 @@ fn greet<[l]>(
 fn no_password(user: String, what: String) -> Server =
   {
     severity: "ERROR",
-    code: "",
+    code: "28000",
     message: "the server wants " ++ what ++ " for `" ++ user ++ "`, and none was given",
+    detail: "",
+    constraint: "",
   }
 
 // `PasswordMessage`, which is also the frame a SASL step travels in.
@@ -798,14 +826,15 @@ type Reading = {
 fn nothing() -> Reading = { columns: [], rows: [], tag: "", refused: None }
 
 // Everything a query answers, up to the `ReadyForQuery` that ends it. A refusal is carried to
-// that point rather than raised where it arrives, so the connection is left usable.
+// that point rather than raised where it arrives, so the connection is left usable; a server that
+// hangs up after its refusal instead, as a `FATAL` one does, is answered with that refusal.
 fn gather<[l]>(
   s: Session,
   client: Client,
   acc: Reading,
 ) -> Result<Reply, ClientError> / {net.recv[l]} =
   match read_message[l](s.conn, s.buffer, client.read_ms) {
-    Err(e) -> Err(e),
+    Err(e) -> match acc.refused { Some(server) -> Err(Refused(server)), None -> Err(e) },
     Ok(got) -> {
       let m = got.message;
       let rest: Session = { ..s, buffer: got.rest };
@@ -827,10 +856,16 @@ fn gather<[l]>(
           }),
         ErrorResponse -> gather[l](rest, client, { ..acc, refused: Some(server_of(m)) }),
         NoticeResponse -> gather[l](rest, client, acc),
-        ReadyForQuery -> match acc.refused {
-          Some(server) -> Err(Rejected(rest, server)),
-          None ->
-            Ok({ session: rest, answer: { columns: acc.columns, rows: acc.rows, tag: acc.tag } }),
+        ReadyForQuery -> {
+          let ready = { ..rest, status: status_after(m) };
+          match acc.refused {
+            Some(server) -> Err(Rejected(ready, server)),
+            None ->
+              Ok({
+                session: ready,
+                answer: { columns: acc.columns, rows: acc.rows, tag: acc.tag },
+              }),
+          }
         },
         _ -> gather[l](rest, client, acc),
       }
@@ -1048,4 +1083,87 @@ test "the mechanisms an authentication message offers" {
   assert(offers_scram({ kind: Authentication, body: bytes_concat(u32_be(10), offered) }));
   let plain = bytes_concat_all([b"PLAIN\x00", b"\x00"]);
   assert(!offers_scram({ kind: Authentication, body: bytes_concat(u32_be(10), plain) }))
+}
+
+fn t_frame(kind: Int, body: Bytes) -> Bytes = bytes_concat(byte_of_int(kind), counted(body))
+
+fn t_session() -> Session =
+  { conn: 1, buffer: b"", user: "ply", database: "ply", settings: [], status: Idle }
+
+// Simple queries over a scripted connection: each `recv` takes the next chunk, and once they run
+// out the server has hung up.
+fn t_queries(chunks: List<Bytes>, sqls: List<String>) -> List<Result<Reply, ClientError>> =
+  with_cell[inbox](chunks) { inbox ->
+    handle {
+      fold(
+        sqls,
+        { session: t_session(), answers: [] },
+        |acc: { session: Session, answers: List<Result<Reply, ClientError>> }, sql: String| {
+          let answer = simple_query[conn](acc.session, sql, default_client());
+          let next = match answer {
+            Ok(r) -> r.session,
+            Err(Rejected(s, _)) -> s,
+            Err(_) -> acc.session,
+          };
+          { session: next, answers: push(acc.answers, answer) }
+        },
+      ).answers
+    } with {
+      net.send[conn](c, payload, timeout_ms) -> Some(bytes_len(payload)),
+      net.recv[conn](c, max, timeout_ms) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, match queued { [_, ..rest] -> rest, [] -> [] });
+        match queued { [first, ..] -> Some(first), [] -> Some(b"") }
+      },
+    }
+  }
+
+test "a refusal carries its SQLSTATE, the constraint it names and its detail" {
+  let body = bytes_concat_all([
+    b"SERROR\x00",
+    b"C23505\x00",
+    b"Mduplicate key value violates unique constraint \"part_pkey\"\x00",
+    b"DKey (sku)=(a) already exists.\x00",
+    b"npart_pkey\x00",
+    b"\x00",
+  ]);
+  assert_eq(server_of({ kind: ErrorResponse, body: body }), {
+    severity: "ERROR",
+    code: "23505",
+    message: "duplicate key value violates unique constraint \"part_pkey\"",
+    detail: "Key (sku)=(a) already exists.",
+    constraint: "part_pkey",
+  })
+}
+
+// A `FATAL` refusal is followed by the server hanging up rather than by `ReadyForQuery`.
+test "a refusal that ends the session keeps its SQLSTATE" {
+  let fatal = t_frame(
+    69,
+    b"SFATAL\x00C57P01\x00Mterminating connection due to administrator command\x00\x00",
+  );
+  match t_queries([fatal], ["select 1"]) {
+    [Err(Refused(s))] -> {
+      assert_eq(s.code, "57P01");
+      assert_eq(s.severity, "FATAL")
+    },
+    _ -> panic("the refusal was lost to the hang-up"),
+  }
+}
+
+test "a session knows where its transaction stood when the server was last ready" {
+  let refused = bytes_concat(
+    t_frame(69, b"SERROR\x00C22012\x00Mdivision by zero\x00\x00"),
+    t_frame(90, b"E"),
+  );
+  let rolled = bytes_concat(t_frame(67, b"ROLLBACK\x00"), t_frame(90, b"I"));
+  match t_queries([refused, rolled], ["select 1/0", "rollback"]) {
+    [Err(Rejected(failed, s)), Ok(r)] -> {
+      assert_eq(s.code, "22012");
+      assert_eq(failed.status, FailedTransaction);
+      assert_eq(r.session.status, Idle);
+      assert_eq(r.answer.tag, "ROLLBACK")
+    },
+    _ -> panic("the two exchanges did not answer a refusal and then a rollback"),
+  }
 }

@@ -1259,9 +1259,11 @@ The resource label is a table (`db.query[items]` is `db.read[items]`).
 Transaction control is on the singleton resource, so transactions conflict.
 `transaction` handles `rollback`; a `rollback` performed in its body still
 reaches the caller's row through `e`, so a handler around a transaction names
-it too. SQL errors are values; `is_retryable(e)`
-covers serialization failures. `MemDb` is an in-memory twin (`open`, `step`,
-`begin_step`, `commit_step`, `abort_step`). 
+it too. SQL errors are values: a `DbError`'s `code` is the SQLSTATE,
+`constraint` the constraint a violation names, and `detail` the server's message
+and detail. `is_retryable(e)` is true for a serialization failure (`40001`) and
+a deadlock (`40P01`). `MemDb` is an in-memory twin (`open`, `step`,
+`begin_step`, `commit_step`, `abort_step`).
 The driver that runs in Ply reads a statement before it sends it. A statement
 that writes, performed as `db.query`, is refused because the endpoints that
 perform it would be scheduled as if they only read, and text the reader cannot
@@ -1286,6 +1288,29 @@ the language's, and the host is left with `net`. The effect is nominal, so a
 program that wants a server handles it: `with_server` is how, and
 `{db.read[*], db.write[*] | e}` in its signature is what lets one handler answer
 every table at once.
+
+A statement outside a transaction takes an idle connection, or opens one while
+fewer than `size` are open, and gives it back once the server has answered; with
+none to take it is `53300`. A `begin` takes a connection for its transaction, a
+`begin` inside it is a savepoint on that connection, and the `commit` or `abort`
+that closes the transaction gives the connection back whatever the server
+answered. A `commit` the server turned into a rollback, because a statement in
+the transaction had failed, is `25P02`, as it is in the twin. Tasks in
+transactions at once each hold their own connection. A handler cannot see which
+task performs an operation, so `serve` takes an operation to belong to the one
+open transaction whose connection is not waiting on the server, and to no
+transaction when every one is: a task holding a transaction open must wait on
+nothing but its own statements. One that waits on anything else — `task.yield`,
+`task.join`, `clock.sleep`, another host operation — leaves its transaction
+between statements while other tasks run, so an operation from a task with no
+transaction is taken for its own, and one performed while two transactions are
+between statements is raised.
+
+A connection that fails is class `08`: `08001` it could not be opened, `08006`
+it broke, `08P01` a reply could not be read, `08003` the transaction's
+connection is gone and the transaction with it, and `08007` a `commit` whose
+outcome is unknown. A server that asks for a password when none was given is
+`28000`.
 
 The connection string is `postgres://user[:password]@host[:port]/database`,
 and its query carries what every connection the pool opens starts with, told
@@ -1739,7 +1764,11 @@ clear-text password, and SCRAM-SHA-256; md5 is refused with a message naming it.
 bound as text, and both answer the columns, the rows and the command tag; NULL is
 `None` and every column is `Some` bytes. A statement the server refuses is
 `Rejected(session, server)`, which carries the connection back because it is
-still usable — the SQLSTATE is what a program branches on. `finish` sends
+still usable; one the server hangs up after, as it does after a `FATAL` error, is
+`Refused(server)`. A `Server` is the refusal's `severity`, its SQLSTATE `code` —
+what a program branches on — its `message` and `detail`, and the `constraint` a
+violation names. A session's `status` is where its transaction stood at the last
+`ReadyForQuery`: `Idle`, `InTransaction` or `FailedTransaction`. `finish` sends
 `Terminate` and closes.
 
 The SCRAM steps are exposed because they are pure: `scram_first_bare` writes the
