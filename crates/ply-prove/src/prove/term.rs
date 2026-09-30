@@ -1,8 +1,7 @@
 //! The prover's term language: one hash-consed DAG per obligation.
 
 use crate::sort::Sort;
-use ply_eval::IntTy;
-use ply_span::Symbol;
+use ply_eval::{IntTy, Symbol};
 use std::collections::HashMap;
 
 pub type TermId = usize;

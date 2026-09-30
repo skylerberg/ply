@@ -1,5 +1,5 @@
 use crate::fixture::Compiled;
-use ply_span::{Diagnostic, Severity, SourceId, Span, codes};
+use ply_eval::{Diagnostic, Severity, SourceId, Span, codes};
 use ply_store::Store;
 use ply_test::{Executor, RunReport, Status, run_with};
 use std::path::PathBuf;

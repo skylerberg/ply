@@ -1,8 +1,7 @@
 //! Tagged, length-prefixed primitives for the front-end cache's entry payloads.
 
 use crate::ContentHash;
-use ply_span::Symbol;
-use ply_ty::DefHash;
+use ply_eval::{DefHash, Symbol};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct DecodeError {

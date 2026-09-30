@@ -1,5 +1,7 @@
-use ply_eval::TASK_TYPE;
-use ply_eval::{Compiled, DEFAULT_MAX_CALLS, Entered, Value};
+use ply_eval::{
+    Compiled, DEFAULT_MAX_CALLS, DefHash, Diagnostic, Entered, SourceId, Span, Symbol, TASK_TYPE,
+    Value,
+};
 use ply_prove::property::{
     EDGE_CASES, EDGE_INTS, GenStream, Judge, Ungeneratable, draw_cases, generatable, generate,
     run_property,
@@ -9,14 +11,12 @@ use ply_prove::{
     Binder, DEFAULT_SHRINK_BUDGET, Discharge, Evidence, GEN_DEPTH, Gap, MIN_PROPERTY_CASES,
     ProvePlan, Sort, Tier, VacuityKind,
 };
-use ply_span::{Diagnostic, SourceId, Span, Symbol};
-use ply_ty::DefHash;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 pub(crate) struct Fixture {
     source: String,
-    front: ply_ty::Front,
+    front: ply_eval::Front,
 }
 
 impl Fixture {
@@ -578,7 +578,7 @@ fn a_raising_case_is_a_gap_with_a_shrunk_input() {
     let boom = |v: &[Value]| {
         if ints(v)[0].unsigned_abs() > 100 {
             Err(Diagnostic::error(
-                ply_span::codes::RUNTIME_ERROR,
+                ply_eval::codes::RUNTIME_ERROR,
                 "divided by zero",
             ))
         } else {

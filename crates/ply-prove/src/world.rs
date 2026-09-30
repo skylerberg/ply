@@ -4,9 +4,7 @@
 use crate::sort::Sort;
 use crate::{Binder, Obligation, ObligationKind};
 use ply_eval::decode::{At, Error};
-use ply_eval::{IntTy, SECRET, TASK_TYPE};
-use ply_span::{SourceId, Span, Symbol};
-use ply_ty::DefHash;
+use ply_eval::{DefHash, IntTy, SECRET, SourceId, Span, Symbol, TASK_TYPE};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug)]

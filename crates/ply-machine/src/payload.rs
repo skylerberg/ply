@@ -1,7 +1,6 @@
 //! Ply values, as a lent effect hands them to the program in `crates/ply-cli/ply`.
 
-use ply_eval::Value as PlyValue;
-use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
+use ply_eval::{Diagnostic, Severity, SourceMap, Span, Symbol, Value as PlyValue, codes};
 use std::sync::Arc;
 
 /// `Value::Record` holds an `Arc`, and its fields are not `Send`; every construction site says so.

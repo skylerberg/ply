@@ -3,11 +3,10 @@
 // A `Value` pins `Arc` for shared payloads and `Rc` for shared code, so none of these `Arc`s can be `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_eval::Value;
+use ply_eval::{Span, Symbol, Value};
 use ply_machine::payload::{
     adt_to_wire, machine_value, value_from_wire, value_of_adt, value_to_wire, wire_to_adt,
 };
-use ply_span::{Span, Symbol};
 
 /// A record with the fields a program declared, as a value.
 fn record(fields: Vec<(&str, Value)>) -> Value {

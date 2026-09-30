@@ -2,9 +2,9 @@
 
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
+    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
+    HostRuntime, Linearity, Symbol, codes,
 };
-use ply_span::{Diagnostic, Symbol, codes};
 use std::sync::Arc;
 
 const TASK: &str = "task";

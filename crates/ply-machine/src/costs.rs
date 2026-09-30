@@ -2,9 +2,8 @@
 //! the same pass, in the program that answers it.
 
 use crate::load::Loaded;
-use ply_eval::Value;
 use ply_eval::decode::{self, At};
-use ply_span::{Diagnostic, SourceId, Span, codes};
+use ply_eval::{Diagnostic, SourceId, Span, Value, codes};
 use std::collections::HashMap;
 
 const ENTRY: &str = "costs.costs";

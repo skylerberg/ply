@@ -1,12 +1,10 @@
-use ply_eval::Provider;
-use ply_span::{SourceId, Symbol};
+use ply_eval::{CheckOutput, DefHash, HashOutput, ModuleName, Provider, SourceId, Symbol};
 use ply_store::body::{BodySet, of_front};
 use ply_store::{Outcome, PassRecord, Store};
 use ply_test::bisect::{
     Baseline, ChangeSet, Regression, Rehashed, StoreClassify, TrialOutcome, change_set,
 };
 use ply_test::{BodyHybrid, Signature, hybrid};
-use ply_ty::{CheckOutput, DefHash, HashOutput, ModuleName};
 use std::collections::BTreeMap;
 
 fn sym(s: &str) -> Symbol {
@@ -14,7 +12,7 @@ fn sym(s: &str) -> Symbol {
 }
 
 struct Compiled {
-    port: ply_ty::Front,
+    port: ply_eval::Front,
     check: CheckOutput,
     hashes: HashOutput,
     bodies: BodySet,
@@ -67,7 +65,7 @@ impl Compiled {
     }
 
     /// The signature every hybrid is judged against.
-    fn failure(&self, key: &str) -> ply_span::Diagnostic {
+    fn failure(&self, key: &str) -> ply_eval::Diagnostic {
         let index = self.test_index(key);
         let mut machine = ply_eval::Machine::new(&self.port);
         let unit = ply_codegen::Unit::over_front(&self.port, self.texts.clone())
@@ -332,7 +330,7 @@ fn a_regression_that_introduces_runaway_recursion_fails_alone() {
     );
 
     let diagnostic = after.failure("m.terminates");
-    assert_eq!(diagnostic.code, ply_span::codes::RUNTIME_ERROR);
+    assert_eq!(diagnostic.code, ply_eval::codes::RUNTIME_ERROR);
     assert!(
         diagnostic.message.contains("recursion limit"),
         "{}",

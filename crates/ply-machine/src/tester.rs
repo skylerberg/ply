@@ -15,14 +15,15 @@ use crate::payload::{count, diag_value, diags_value, json, option, places_value,
 use crate::support::{
     build_backend_over, build_pool, enter_constant, module_texts, once_each, select_profile,
 };
-use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
+use ply_eval::{
+    CheckOutput, Diagnostic, Footprint, HashOutput, Mode, SourceMap, Span, Symbol,
+    Value as PlyValue, codes,
+};
 use ply_store::Store;
 use ply_test::{Record, RunReport, Selection, Status, TestResult};
-use ply_ty::{CheckOutput, Footprint, HashOutput, Mode};
 use serde_json::{Value, json as jsonlit};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -195,8 +196,8 @@ fn choice_of(v: &PlyValue, span: Span) -> Result<ply_test::Choice, Diagnostic> {
 }
 
 /// A key the program computed, as the store is keyed.
-fn hash_of(hex: &str, span: Span) -> Result<ply_ty::DefHash, Diagnostic> {
-    ply_ty::DefHash::from_hex(hex).ok_or_else(|| {
+fn hash_of(hex: &str, span: Span) -> Result<ply_eval::DefHash, Diagnostic> {
+    ply_eval::DefHash::from_hex(hex).ok_or_else(|| {
         Diagnostic::error(
             codes::INTERNAL_ERROR,
             format!("`{hex}` is not a key the store could be read or written under"),
@@ -432,7 +433,7 @@ impl Site {
         &self,
         failure: usize,
         keys: Vec<(String, String)>,
-        filed: Option<ply_ty::DefHash>,
+        filed: Option<ply_eval::DefHash>,
     ) -> Result<PlyValue, Diagnostic> {
         let (reply, answers) = mpsc::channel();
         let held = self.held();
@@ -515,7 +516,7 @@ enum Go {
     Trial {
         failure: usize,
         keys: Vec<(String, String)>,
-        filed: Option<ply_ty::DefHash>,
+        filed: Option<ply_eval::DefHash>,
         reply: mpsc::Sender<Result<ply_test::bisect::Trial, Diagnostic>>,
     },
     /// Write what the trials since the run filed, and answer what storing it had to say.
@@ -676,7 +677,7 @@ fn iterate(
         None => match &args.front {
             Some(front) => crate::driver::load_over_front(&args.path, front),
             None => Err(crate::load::LoadError {
-                sources: ply_span::SourceMap::new(),
+                sources: ply_eval::SourceMap::new(),
                 diagnostics: vec![Diagnostic::error(
                     codes::INTERNAL_ERROR,
                     "`ply test` handed no front end over, and this side runs none",
@@ -773,7 +774,7 @@ struct Knowledge {
 fn outcomes_of(store: &ply_store::Store, keys: &[String]) -> Vec<Option<String>> {
     keys.iter()
         .map(|key| {
-            ply_ty::DefHash::from_hex(key)
+            ply_eval::DefHash::from_hex(key)
                 .and_then(|hash| store.get(hash))
                 .map(|outcome| {
                     if outcome.is_pass() {
@@ -1281,11 +1282,11 @@ impl Plan {
     pub fn new(loaded: &Loaded, filter: Option<&str>, std_tests: bool) -> Plan {
         let check = &loaded.check;
         let root = loaded.root_package();
-        let in_scope = |t: &ply_ty::TestInfo| {
+        let in_scope = |t: &ply_eval::TestInfo| {
             root.contains(&t.module) || (std_tests && crate::shelf::is_shipped(&t.module))
         };
         // Against `<module>.<label>`, so `--filter store.` narrows to a module.
-        let matches = |t: &ply_ty::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
+        let matches = |t: &ply_eval::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
 
         let scoped = check.tests.iter().filter(|t| in_scope(t)).count();
         let out_of_scope: BTreeSet<usize> = check
@@ -1877,7 +1878,7 @@ fn site_view(site: &ply_eval::RaceSite) -> SiteView {
 }
 
 fn atoms(footprint: &Footprint) -> Vec<String> {
-    ply_ty::atom_texts(&footprint.0)
+    ply_eval::atom_texts(&footprint.0)
 }
 
 fn mutants_view(report: &crate::mutate::Report, loaded: &Loaded) -> MutantsView {
@@ -2481,7 +2482,7 @@ fn trial(
     hybrids: Option<&ply_test::Hybrids>,
     failure: usize,
     keys: &[(String, String)],
-    filed: Option<ply_ty::DefHash>,
+    filed: Option<ply_eval::DefHash>,
 ) -> Result<ply_test::bisect::Trial, Diagnostic> {
     let Some(hybrids) = hybrids else {
         return Err(Diagnostic::error(
@@ -2581,7 +2582,7 @@ fn trial_value(trial: &ply_test::bisect::Trial) -> PlyValue {
 /// One failure's facts, as the program reads them.
 fn change_set_value(view: &ChangeSetView) -> PlyValue {
     let facts = &view.facts;
-    let hex = |hash: Option<ply_ty::DefHash>| option(hash.map(|h| PlyValue::str(h.to_hex())));
+    let hex = |hash: Option<ply_eval::DefHash>| option(hash.map(|h| PlyValue::str(h.to_hex())));
     record(vec![
         (
             "facts",

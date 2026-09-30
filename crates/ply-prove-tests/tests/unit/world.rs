@@ -1,10 +1,9 @@
 //! Reading the world `proof.world` hands over: every shape it can take, and every one it must not.
 
-use ply_eval::Value;
 use ply_eval::decode::At;
+use ply_eval::{SourceId, Span, Symbol, Value};
 use ply_prove::sort::var_name;
 use ply_prove::{ObligationKind, Sort, World};
-use ply_span::{SourceId, Span, Symbol};
 use std::sync::Arc;
 
 #[allow(clippy::arc_with_non_send_sync)]

@@ -1,11 +1,8 @@
 //! The judgements delta construction cannot make from hashes alone.
 
 use super::{DefKey, Ns, Rehashed};
-use ply_eval::Value;
-use ply_span::Symbol;
+use ply_eval::{CheckOutput, DefHash, Symbol, Value};
 use ply_store::{DefKind, Found, Store};
-use ply_ty::CheckOutput;
-use ply_ty::DefHash;
 use std::collections::BTreeSet;
 
 pub trait Classify {

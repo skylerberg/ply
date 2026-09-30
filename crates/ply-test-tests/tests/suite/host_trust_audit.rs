@@ -1,13 +1,11 @@
 use crate::fixture::Compiled;
-use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, SourceId, Symbol};
+use ply_eval::{Diagnostic, Resource, SourceId, Symbol, Value};
 use ply_store::Store;
 use ply_test::{Hosting, InterpExecutor, Record, RunReport, Search};
-use ply_ty::Resource;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -227,7 +225,7 @@ fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
             req: &HostRequest<'_>,
         ) -> Result<HostAnswer, Diagnostic> {
             Err(
-                Diagnostic::error(ply_span::codes::INTERNAL_ERROR, "the evaluator is broken")
+                Diagnostic::error(ply_eval::codes::INTERNAL_ERROR, "the evaluator is broken")
                     .primary(req.span, "here"),
             )
         }
@@ -256,7 +254,7 @@ fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
     assert_eq!(report.failed, 1);
     assert_eq!(
         report.failures[0].diagnostic.code,
-        ply_span::codes::RUNTIME_ERROR,
+        ply_eval::codes::RUNTIME_ERROR,
         "a handler's chosen code decided how this failure is classified"
     );
     assert_eq!(
@@ -304,7 +302,7 @@ fn the_same_det_test_is_refused_hermetically() {
     assert_eq!(report.failed, 1);
     assert_eq!(
         report.failures[0].diagnostic.code,
-        ply_span::codes::HERMETIC_BOUNDARY,
+        ply_eval::codes::HERMETIC_BOUNDARY,
         "the shape `ply test` uses names the handler that would have served this"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -313,7 +311,7 @@ fn the_same_det_test_is_refused_hermetically() {
     assert_eq!(report.failed, 1);
     assert_eq!(
         report.failures[0].diagnostic.code,
-        ply_span::codes::UNHANDLED_EFFECT,
+        ply_eval::codes::UNHANDLED_EFFECT,
         "a binding carrying no registry cannot tell a hermetic refusal from a front-end bug"
     );
 }
@@ -344,7 +342,7 @@ fn an_operation_a_partial_clause_set_leaves_is_refused_by_the_checker() {
     );
     assert_eq!(
         diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
-        [ply_span::codes::HANDLER_CLAUSE_MISSING],
+        [ply_eval::codes::HANDLER_CLAUSE_MISSING],
         "{diagnostics:?}"
     );
 }

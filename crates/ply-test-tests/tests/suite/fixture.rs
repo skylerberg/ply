@@ -1,8 +1,6 @@
-use ply_eval::Plan;
-use ply_span::{Diagnostic, SourceId};
+use ply_eval::{CheckOutput, DefHash, Diagnostic, HashOutput, ModuleName, Plan, SourceId};
 use ply_store::Store;
 use ply_test::{Choice, Reason, Selection};
-use ply_ty::{CheckOutput, DefHash, HashOutput, ModuleName};
 use std::collections::{BTreeMap, HashMap};
 
 /// Files a program's definitions as the CLI does before its tests run: each one's row and scheme,
@@ -14,8 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 pub fn file_interfaces(store: &mut Store, file: &std::path::Path, sources: &[(String, String)]) {
     use ply_codegen::c::producer;
     use ply_eval::decode::At;
-    use ply_eval::{Fields, Value};
-    use ply_span::Symbol;
+    use ply_eval::{Fields, Symbol, Value};
     let record = |fields: Vec<(&str, Value)>| {
         Value::Record(std::sync::Arc::new(Fields::from_unsorted(
             fields
@@ -91,7 +88,7 @@ pub fn file_interfaces(store: &mut Store, file: &std::path::Path, sources: &[(St
 }
 
 #[track_caller]
-pub fn port_front(sources: &[(String, String)], ids: &[SourceId]) -> ply_ty::Front {
+pub fn port_front(sources: &[(String, String)], ids: &[SourceId]) -> ply_eval::Front {
     ply_codegen::c::producer::checked_front(sources, ids)
         .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
 }
@@ -107,7 +104,7 @@ pub fn port_diagnostics(sources: &[(String, String)], ids: &[SourceId]) -> Vec<D
 
 pub struct Compiled {
     /// What the tier is built over and the executor runs.
-    pub port: ply_ty::Front,
+    pub port: ply_eval::Front,
     pub check: CheckOutput,
     pub hashes: HashOutput,
     /// Keyed by `m.name.to_string()`; the Ply emitter re-parses these.
@@ -149,7 +146,7 @@ impl Compiled {
         }
     }
 
-    pub fn footprints(&self) -> Vec<ply_ty::Footprint> {
+    pub fn footprints(&self) -> Vec<ply_eval::Footprint> {
         self.check
             .tests
             .iter()
