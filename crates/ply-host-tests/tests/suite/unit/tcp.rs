@@ -15,9 +15,11 @@ const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
 
 /// Registrations resolve against the atoms the program performs; the declaration names no label.
 const DRIVER: &str = r#"
-fn every_op(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn]} = {
+fn every_op(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn], net.local_port[listener], net.local_port[conn]} = {
   let l = net.listen[listener](port);
+  let _ = net.local_port[listener](l);
   let c = net.accept[listener](l);
+  let _ = net.local_port[conn](c);
   let got = net.recv[conn](c, 16, 5000);
   let sent = net.send[conn](c, payload, 5000);
   net.close[conn](c);
@@ -176,6 +178,8 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.listen[listener] ply_host::tcp::listen",
             "std.net.net.listen_tls[conn] ply_host::tls::listen",
             "std.net.net.listen_tls[listener] ply_host::tls::listen",
+            "std.net.net.local_port[conn] ply_host::tcp::local_port",
+            "std.net.net.local_port[listener] ply_host::tcp::local_port",
             "std.net.net.recv[conn] ply_host::tcp::recv",
             "std.net.net.recv[listener] ply_host::tcp::recv",
             "std.net.net.send[conn] ply_host::tcp::send",
@@ -210,17 +214,20 @@ fn the_twin_declares_the_same_signature_and_differs_only_where_it_must() {
     assert!(script.listing().rows.iter().all(|r| !r.blocking));
 }
 
+/// Reading a socket's port changes nothing; every other operation opens, moves or closes bytes.
 #[test]
-fn no_operation_claims_to_be_repeatable() {
+fn only_reading_a_port_is_repeatable() {
     for net in [
         Arc::new(TcpHost::new()) as Arc<dyn Net>,
         Arc::new(SimNet::new(Vec::new())),
     ] {
         for op in Op::ALL {
-            assert_eq!(
-                op.declaration(net.as_ref()).linearity,
+            let expected = if op == Op::LocalPort {
+                Linearity::Repeatable
+            } else {
                 Linearity::AtMostOnce
-            );
+            };
+            assert_eq!(op.declaration(net.as_ref()).linearity, expected, "{op:?}");
         }
     }
 }
@@ -632,6 +639,123 @@ fn the_socket_and_the_script_answer_the_same_program() {
     assert_eq!(simulated.sent, real.sent);
     assert_eq!(script.sent(simulated.conn), RESPONSE);
     assert_eq!(peer.join().expect("the peer finished"), RESPONSE);
+}
+
+/// What `local_port` answered, where `None` is a listener the drain has closed.
+fn local_port(
+    binding: &HostBinding,
+    rt: &dyn HostRuntime,
+    handle: i64,
+    resource: &str,
+) -> Option<i64> {
+    let answer = perform(
+        binding,
+        rt,
+        Op::LocalPort,
+        resource,
+        vec![Value::Int(handle)],
+    )
+    .expect("a port is read of an open socket");
+    match &answer {
+        Value::Ctor { name, args } if name.as_str() == "Some" => {
+            Some(args[0].as_int(Span::DUMMY, "a port").expect("an Int"))
+        }
+        Value::Ctor { name, .. } if name.as_str() == "None" => None,
+        other => panic!("not an `Option`: {}", other.render()),
+    }
+}
+
+#[test]
+fn a_listener_asked_for_any_port_answers_the_one_it_was_given() {
+    let net = Arc::new(TcpHost::new());
+    let binding = bind(net.clone());
+    let listener = listen(&binding, net.as_ref());
+    let given = net.local_addr(listener).expect("a bound port").port();
+    assert_ne!(given, 0, "the kernel chose a port");
+    assert_eq!(
+        local_port(&binding, net.as_ref(), listener, "listener"),
+        Some(i64::from(given))
+    );
+
+    let peer = speak(SocketAddr::from(([127, 0, 0, 1], given)));
+    let conn = accept(&binding, net.as_ref(), listener);
+    assert_eq!(
+        local_port(&binding, net.as_ref(), conn, "conn"),
+        Some(i64::from(given)),
+        "an accepted connection's own end is the port it was accepted on"
+    );
+    assert_eq!(read_to_end(&binding, net.as_ref(), conn), REQUEST);
+    close(&binding, net.as_ref(), conn, "conn");
+    close(&binding, net.as_ref(), listener, "listener");
+    peer.join().expect("the peer finished");
+
+    let closed = perform(
+        &binding,
+        net.as_ref(),
+        Op::LocalPort,
+        "listener",
+        vec![Value::Int(listener)],
+    )
+    .expect_err("a closed socket names nothing");
+    assert_eq!(closed.code, codes::RUNTIME_ERROR);
+}
+
+#[test]
+fn a_listener_the_drain_closed_listens_on_no_port() {
+    use ply_host::signal::Accepting;
+    let net = Arc::new(TcpHost::new());
+    let binding = bind(net.clone());
+    let listener = listen(&binding, net.as_ref());
+    assert!(local_port(&binding, net.as_ref(), listener, "listener").is_some());
+    assert_eq!(net.stop_accepting(), 1);
+    assert_eq!(
+        local_port(&binding, net.as_ref(), listener, "listener"),
+        None
+    );
+}
+
+/// Deterministic, so a program that listens on any port reads the same one in every simulated run.
+#[test]
+fn the_script_assigns_ports_as_the_kernel_would_and_keeps_the_ones_asked_for() {
+    let net = Arc::new(SimNet::new(vec![
+        vec![b"in".to_vec()],
+        vec![b"out".to_vec()],
+    ]));
+    let binding = bind(net.clone());
+    let any = listen(&binding, net.as_ref());
+    assert_eq!(
+        local_port(&binding, net.as_ref(), any, "listener"),
+        Some(49152)
+    );
+    let fixed = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::Listen,
+        "listener",
+        vec![Value::Int(8080)],
+    )
+    .expect("a listen"));
+    assert_eq!(
+        local_port(&binding, net.as_ref(), fixed, "listener"),
+        Some(8080)
+    );
+    let inbound = accept(&binding, net.as_ref(), fixed);
+    assert_eq!(
+        local_port(&binding, net.as_ref(), inbound, "conn"),
+        Some(8080)
+    );
+    let outbound = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::Connect,
+        "conn",
+        vec![Value::str("localhost"), Value::Int(9000), Value::Int(1000)],
+    )
+    .expect("a connect"));
+    assert_eq!(
+        local_port(&binding, net.as_ref(), outbound, "conn"),
+        Some(49153)
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! The `signal` effect, and the coordinator that turns a stop into a shutdown.
 
+use crate::process::Children;
 use ply_eval::host::HostRegistry;
 use ply_eval::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime,
@@ -8,7 +9,7 @@ use ply_eval::{
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 /// The Ply declaration the registrations below are checked against.
@@ -113,6 +114,8 @@ pub struct Shutdown {
     signals: Vec<Signal>,
     net: Mutex<Option<Arc<dyn Accepting>>>,
     db: Mutex<Option<Arc<dyn Transactions>>>,
+    /// Weak, so the children still go when their host does.
+    children: Mutex<Option<Weak<Children>>>,
 }
 
 impl Shutdown {
@@ -127,6 +130,7 @@ impl Shutdown {
             signals: signals_of_this_platform(),
             net: Mutex::new(None),
             db: Mutex::new(None),
+            children: Mutex::new(None),
         })
     }
 
@@ -154,6 +158,18 @@ impl Shutdown {
         // An `accept` posted before the close may still be parked inside it.
         wake_parked_accepts(net.as_ref());
         self.woke.notify_all();
+    }
+
+    /// The children a second signal ends before it exits, since that exit skips the teardown.
+    pub fn attach_children(&self, children: &Arc<Children>) {
+        *lock(&self.children) = Some(Arc::downgrade(children));
+    }
+
+    fn end_children(&self) {
+        let children = lock(&self.children).as_ref().and_then(Weak::upgrade);
+        if let Some(children) = children {
+            children.end_all();
+        }
     }
 
     pub fn stopping(&self) -> bool {
@@ -365,6 +381,7 @@ fn exit_now(shutdown: &Arc<Shutdown>, which: Signal) -> ! {
         if connections == 1 { "" } else { "s" },
         if scopes == 1 { "" } else { "s" },
     );
+    shutdown.end_children();
     std::process::exit(which.exit_code());
 }
 
@@ -385,7 +402,7 @@ pub fn register(registry: &mut HostRegistry, shutdown: Option<&Arc<Shutdown>>) {
     for (op, handler) in registrations(shutdown) {
         match shutdown {
             Some(_) => registry.register(op, handler),
-            None => registry.register_withheld(op, handler),
+            None => registry.register_withheld(op, handler, crate::process::ONLY_A_RUN),
         }
     }
 }

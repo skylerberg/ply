@@ -98,6 +98,12 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
     })
 }
 
+/// The effect a family's operations are performed under, which is what a program must declare to
+/// be lent it: `claims` lends `prover` and `cache` lends `store`, so the family's name is not it.
+pub fn effect_of(family: &str) -> Option<&'static str> {
+    FAMILIES.iter().find(|f| f.name == family).map(|f| f.effect)
+}
+
 /// The operations of the named families, or why one of them is not a family.
 pub fn lent_for(families: &[&str], declared: Declared<'_>) -> Result<Vec<Lent>, String> {
     let mut out = Vec::new();
@@ -127,26 +133,22 @@ pub fn granted(check: &CheckOutput, allow: &[String]) -> Result<Vec<Lent>, Diagn
     };
     let families: Vec<&str> = allow.iter().map(String::as_str).collect();
     for name in &families {
-        let Some(family) = FAMILIES.iter().find(|f| f.name == *name) else {
-            // Named by `lent_for`, which says what the families are.
+        // A name that is no family is refused by `lent_for`, which says what the families are.
+        let Some(effect) = effect_of(name) else {
             continue;
         };
-        if declared(family.effect).is_none() {
+        if declared(effect).is_none() {
             return Err(Diagnostic::error(
                 codes::CAPABILITY_UNDECLARED,
-                format!(
-                    "`--allow {name}` was granted and the program declares no `{}` effect",
-                    family.effect
-                ),
+                format!("`--allow {name}` was granted and the program declares no `{effect}` effect"),
             )
             .primary(
                 Span::DUMMY,
                 "a family the program does not declare reaches nothing",
             )
             .note(format!(
-                "`{name}` lends the operations of `{}`, and a run lends only what the program it \
-                 runs can reach",
-                family.effect
+                "`{name}` lends the operations of `{effect}`, and a run lends only what the program \
+                 it runs can reach"
             )));
         }
     }

@@ -215,12 +215,7 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
                 let (ty, bits) = rest.split_once(' ')?;
                 let n: u8 = ty.parse().ok()?;
                 let ty = ply_eval::INT_TYPES.iter().find(|t| **t as u8 == n)?;
-                // Unsigned from `encode_tables`, signed from the Ply emitter: same bit pattern.
-                let bits: u64 = match bits.parse::<u64>() {
-                    Ok(b) => b,
-                    Err(_) => bits.parse::<i64>().ok()? as u64,
-                };
-                Value::Fixed(ply_eval::Fixed::new(*ty, bits))
+                Value::Fixed(ply_eval::Fixed::new(*ty, bits.parse().ok()?))
             }
             "x" => Value::Float(f64::from_bits(u64::from_str_radix(rest, 16).ok()?)),
             "d" => {
@@ -233,14 +228,6 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
                     .ok()?,
                 )
             }
-            // The Ply emitter keeps these literals as source text; parse as the lexer does.
-            "X" => Value::Float(rest.replace('_', "").parse().ok()?),
-            "D" => Value::Decimal(
-                rest.replace('_', "")
-                    .trim_end_matches('m')
-                    .parse::<ply_eval::Decimal>()
-                    .ok()?,
-            ),
             _ => return None,
         });
     }
@@ -288,27 +275,19 @@ pub fn decode(s: &str) -> Option<(String, Tables)> {
     for _ in 0..n {
         t.handles.push(line(s, &mut at)?.to_string());
     }
-    // The committed emitter stages the sources of one that writes members; its frames have none.
-    let mut next = line(s, &mut at)?;
-    if let Some(n) = count(next, "members") {
-        for _ in 0..n {
-            t.members.push(line(s, &mut at)?.to_string());
-        }
-        next = line(s, &mut at)?;
+    let n = count(line(s, &mut at)?, "members")?;
+    for _ in 0..n {
+        t.members.push(line(s, &mut at)?.to_string());
     }
-    // Likewise for the symbols a body publishes; a frame without them is read at the spelling
-    // that emitted it.
-    if let Some(n) = count(next, "symbols") {
-        for _ in 0..n {
-            let (symbol, entry) = line(s, &mut at)?.split_once(' ')?;
-            t.symbols.push(Defined {
-                symbol: symbol.to_string(),
-                entry: entry.to_string(),
-            });
-        }
-        next = line(s, &mut at)?;
+    let n = count(line(s, &mut at)?, "symbols")?;
+    for _ in 0..n {
+        let (symbol, entry) = line(s, &mut at)?.split_once(' ')?;
+        t.symbols.push(Defined {
+            symbol: symbol.to_string(),
+            entry: entry.to_string(),
+        });
     }
-    if next != "text" {
+    if line(s, &mut at)? != "text" {
         return None;
     }
     Some((s.get(at..)?.to_string(), t))

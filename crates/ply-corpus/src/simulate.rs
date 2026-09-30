@@ -1,12 +1,29 @@
 //! Prices the simulation search: reduction, race-finding power and seed rate.
 
-use crate::pipeline::{Front, front};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use ply_eval::explore::{Dependence, Interleaving, Simulation, explore_under};
 use ply_eval::{Plan, Seed, SimMode};
+use ply_machine::load::Loaded;
 use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+/// The project under `root`, loaded the way `ply` loads one.
+fn front(root: &Path) -> Result<Loaded> {
+    ply_machine::load::load(root).map_err(|e| {
+        anyhow::anyhow!(
+            "`{}` does not compile ({} diagnostic(s)): {}",
+            root.display(),
+            e.diagnostics.len(),
+            e.diagnostics
+                .iter()
+                .take(3)
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })
+}
 
 /// A test whose footprint carries `sim.read`, so its outcome depends on a seed.
 struct Seeded {
@@ -14,7 +31,7 @@ struct Seeded {
     index: usize,
 }
 
-fn seeded_tests(front: &Front) -> Vec<Seeded> {
+fn seeded_tests(front: &Loaded) -> Vec<Seeded> {
     front
         .check
         .tests
@@ -30,7 +47,7 @@ fn seeded_tests(front: &Front) -> Vec<Seeded> {
 
 /// Whole-test replay at one seed, without the runner's thread pool and cache.
 struct Driver<'a> {
-    front: &'a Front,
+    front: &'a Loaded,
     test: &'a Seeded,
     steps: u32,
     /// Interleavings run.
@@ -40,7 +57,7 @@ struct Driver<'a> {
 }
 
 impl<'a> Driver<'a> {
-    fn new(front: &'a Front, test: &'a Seeded, steps: u32) -> Driver<'a> {
+    fn new(front: &'a Loaded, test: &'a Seeded, steps: u32) -> Driver<'a> {
         Driver {
             front,
             test,
@@ -59,7 +76,7 @@ impl<'a> Driver<'a> {
 impl Simulation for Driver<'_> {
     fn run(&mut self, seed: &Seed) -> Interleaving {
         self.runs += 1;
-        let mut machine = self.front.machine();
+        let mut machine = crate::tier_machine(&self.front.front, &self.front.sources);
         ply_test::sim::seed_run(&mut machine, seed, self.steps);
         let outcome = machine.eval_test(self.test.index);
         match ply_test::sim::interleaving_of(&machine, &outcome) {
@@ -440,20 +457,4 @@ fn clip(s: &str, width: usize) -> String {
     }
     let head: String = s.chars().take(width.saturating_sub(1)).collect();
     format!("{head}…")
-}
-
-pub fn measure(
-    root: &Path,
-    trials: u32,
-    budget: u32,
-    steps: u32,
-    rate_seeds: u32,
-) -> Result<SimMeasurements> {
-    Ok(SimMeasurements {
-        root: root.display().to_string(),
-        reduction: reduction(root, budget, steps)
-            .with_context(|| format!("measuring the reduction over `{}`", root.display()))?,
-        race: race_power(root, trials, budget, steps)?,
-        rate: seed_rate(root, rate_seeds, steps)?,
-    })
 }

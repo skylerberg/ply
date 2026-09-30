@@ -166,6 +166,11 @@ impl HostHandler for Site {
             ("configure", [options, front]) => {
                 let mut job = job_of(options, span)?;
                 job.front = Some(crate::driver::handed_front_of(front, span)?);
+                // A configuration begins a run, whatever the last one was left doing: its machine
+                // is dropped, which joins its thread, and its claims are no longer this run's.
+                let previous = self.held().take();
+                drop(previous);
+                *self.claims.lock().unwrap_or_else(|e| e.into_inner()) = 0;
                 *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job);
                 PlyValue::Unit
             }

@@ -1,7 +1,6 @@
 // The corpus's orchestration spine. A measurement is the product's own report: a real `ply`
-// subprocess, its JSON read back, repeated, and judged against a criterion the row declares up
-// front. Nothing here reaches inside the toolchain; what `ply` does not report, the spine does
-// not know.
+// subprocess, its JSON read back. Nothing here reaches inside the toolchain; what `ply` does not
+// report, the spine does not know.
 
 import std.json (Json, Str, Number, Bool, Null, Object, Array, object, array)
 import std.json
@@ -31,15 +30,67 @@ pub fn exit_zero(f: Finished) -> Bool = exit_code(f) == Some(0)
 // The stdout of a run that succeeded, decoded; a failure carries the child's stderr.
 pub fn report_json(f: Finished) -> Result<Json, String> =
   match exit_code(f) {
-    Some(0) -> match json::parse(f.out) {
-      Ok(j) -> Ok(j),
-      Err(e) -> Err("the report was not JSON: " ++ e.message),
-    },
+    Some(0) -> document(f),
     Some(code) -> Err("ply exited " ++ int_to_string(code) ++ ": " ++ string_of_bytes_lossy(f.err)),
     None -> Err("ply was signalled: " ++ string_of_bytes_lossy(f.err)),
   }
 
-// --- Reading a `ply test` report ----------------------------------------------------
+// The one document a `--json` run wrote, whatever it exited with: a report that says no is still a
+// report, and its `ok` is what says so.
+pub fn document(f: Finished) -> Result<Json, String> =
+  match exit_code(f) {
+    None -> Err("ply was signalled: " ++ string_of_bytes_lossy(f.err)),
+    Some(code) -> match json::parse(f.out) {
+      Ok(j) -> Ok(j),
+      Err(e) ->
+        Err(
+          "ply exited " ++ int_to_string(code) ++ " and its report was not JSON (" ++ e.message
+            ++ "): "
+            ++ string_of_bytes_lossy(f.err),
+        ),
+    },
+  }
+
+// --- Reading a report --------------------------------------------------------------
+
+pub fn field(m: Map<String, Json>, key: String) -> Result<Map<String, Json>, String> =
+  match map_get(m, key) {
+    Some(Object(inner)) -> Ok(inner),
+    _ -> Err("the report's `" ++ key ++ "` is not an object"),
+  }
+
+pub fn int_field(m: Map<String, Json>, key: String) -> Int =
+  match map_get(m, key) {
+    Some(Number(d)) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 },
+    _ -> 0,
+  }
+
+// A number the report may leave out, or write as `null`.
+pub fn opt_int_field(m: Map<String, Json>, key: String) -> Option<Int> =
+  match map_get(m, key) { Some(Number(d)) -> int_of_decimal(d, Down), _ -> None }
+
+pub fn decimal_field(m: Map<String, Json>, key: String) -> Decimal =
+  match map_get(m, key) { Some(Number(d)) -> d, _ -> 0m }
+
+pub fn bool_field(m: Map<String, Json>, key: String) -> Bool =
+  match map_get(m, key) { Some(Bool(b)) -> b, _ -> false }
+
+pub fn str_field(m: Map<String, Json>, key: String) -> String =
+  match map_get(m, key) { Some(Str(s)) -> s, _ -> "" }
+
+pub fn array_field(m: Map<String, Json>, key: String) -> List<Json> =
+  match map_get(m, key) { Some(Array(xs)) -> xs, _ -> [] }
+
+// The members of each object in a list; anything else in it is skipped.
+pub fn objects(xs: List<Json>) -> List<Map<String, Json>> =
+  fold(xs, [], |acc: List<Map<String, Json>>, x: Json|
+    match x { Object(m) -> push(acc, m), _ -> acc })
+
+// Milliseconds as the product writes them, to the microsecond, as whole microseconds.
+pub fn us_of_ms(ms: Decimal) -> Int =
+  match int_of_decimal(ms * 1000m, HalfEven) { Some(n) -> n, None -> 0 }
+
+// --- A `ply test` report --------------------------------------------------------------
 
 pub type TestReport = {
   ok: Bool,
@@ -86,43 +137,6 @@ pub fn test_report(j: Json) -> Result<TestReport, String> =
     _ -> Err("the report is not an object"),
   }
 
-pub fn field(m: Map<String, Json>, key: String) -> Result<Map<String, Json>, String> =
-  match map_get(m, key) {
-    Some(Object(inner)) -> Ok(inner),
-    _ -> Err("the report's `" ++ key ++ "` is not an object"),
-  }
-
-pub fn int_field(m: Map<String, Json>, key: String) -> Int =
-  match map_get(m, key) {
-    Some(Number(d)) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 },
-    _ -> 0,
-  }
-
-pub fn bool_field(m: Map<String, Json>, key: String) -> Bool =
-  match map_get(m, key) { Some(Bool(b)) -> b, _ -> false }
-
-pub fn array_field(m: Map<String, Json>, key: String) -> List<Json> =
-  match map_get(m, key) { Some(Array(xs)) -> xs, _ -> [] }
-
-// --- Repeats and verdicts ----------------------------------------------------------
-
-// What a subcommand answers: its report, and the table a reader is shown instead of it.
-pub type Report = { json: Json, rendered: String }
-
-// A row's criterion, declared up front: the verdict is the criterion on the numbers, never a
-// number dressed as one after the fact.
-pub type Row = {
-  name: String,
-  // What the row must show, in one line.
-  criterion: String,
-  // The run the row reports: the fastest of its repeats.
-  best: TestReport,
-  // The criterion judged: Ok(()) is a pass, Err(why) says what the numbers did instead.
-  verdict: Result<Unit, String>,
-}
-
-pub fn passed(row: Row) -> Bool = match row.verdict { Ok(_) -> true, Err(_) -> false }
-
 // The fastest of `n` runs; a bench reports its best case, and the repeats are what make the
 // best a measurement rather than a reading.
 pub fn best_of(runs: List<TestReport>) -> TestReport =
@@ -134,27 +148,6 @@ pub fn best_of(runs: List<TestReport>) -> TestReport =
     Some(b) -> b,
     None -> panic("best of no runs"),
   }
-
-pub fn verdict_text(v: Result<Unit, String>) -> String =
-  match v { Ok(_) -> "pass", Err(why) -> "FAIL: " ++ why }
-
-pub fn ms(ms_value: Int) -> String = int_to_string(ms_value) ++ "ms"
-
-// --- The report -----------------------------------------------------------------------
-
-pub fn render(title: String, rows: List<Row>) -> String = {
-  let head = title ++ "\n\n";
-  let body = map(rows, |row: Row|
-    "  " ++ verdict_letter(row) ++ "  " ++ row.name ++ "  " ++ ms(row.best.duration_ms) ++ "  — "
-      ++ row.criterion
-      ++ verdict_note(row)
-      ++ "\n");
-  head ++ fold(body, "", |acc: String, line: String| acc ++ line)
-}
-
-fn verdict_letter(row: Row) -> String = if passed(row) { "✓" } else { "✗" }
-
-fn verdict_note(row: Row) -> String = match row.verdict { Ok(_) -> "", Err(why) -> " — " ++ why }
 
 // --- Tests -----------------------------------------------------------------------------
 
@@ -181,26 +174,8 @@ test "best_of keeps the fastest" {
   assert_eq(best_of([r1, r2]).duration_ms, 40);
 }
 
-test "a row's verdict is its criterion" {
-  let r: TestReport = {
-    ok: true,
-    duration_ms: 1,
-    total: 2,
-    selected: 0,
-    passed: 2,
-    failed: 0,
-    cached: 2,
-    groups: 1,
-    read_ms: 0,
-    front_ms: 1,
-    write_back_ms: 0,
-  };
-  let row: Row = {
-    name: "warm",
-    criterion: "everything cached",
-    best: r,
-    verdict: if r.cached == r.total { Ok(()) } else { Err("some ran") },
-  };
-  assert(passed(row));
-  assert(string_contains(render("t", [row]), "✓"));
+test "a millisecond reading is whole microseconds" {
+  assert_eq(us_of_ms(12.345m), 12345);
+  assert_eq(us_of_ms(0.0004m), 0);
+  assert_eq(us_of_ms(0m), 0)
 }

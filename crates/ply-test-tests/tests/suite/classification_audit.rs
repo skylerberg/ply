@@ -72,7 +72,7 @@ fn report_for(executor: &Answering) -> RunReport {
     )
 }
 
-/// The facts the program's gate reads: whether the failure is Ply's, and how the run ended.
+/// The runtime's two marks on a failure; the verdict they lead to is `suite.bisect`'s.
 fn classified(code: &'static str) -> (bool, Status) {
     let report = report_for(&Answering {
         diagnostic: Some(

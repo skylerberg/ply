@@ -4,39 +4,7 @@
 //! corpus.
 
 use anyhow::{Context, Result};
-use ply_corpus::measure;
-use ply_corpus::regions;
 use std::path::PathBuf;
-
-#[derive(Debug, serde::Deserialize)]
-struct RegionsArgs {
-    /// Projects to analyse, each loaded the way `ply` loads one.
-    roots: Vec<PathBuf>,
-    /// Workers the wall-clock columns are modelled at and the suite is measured with.
-    jobs: usize,
-    /// Hypothetical footprints, `cells:labels`, appended as their own rows.
-    hypothetical: Vec<String>,
-    /// Tests carrying a contending resource atom in each hypothetical row.
-    hypothetical_shared: usize,
-    /// Pure tests in each hypothetical row.
-    hypothetical_pure: usize,
-    /// Include shipped modules' tests, as `ply test --std` does.
-    std: bool,
-    json: bool,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct MeasureArgs {
-    /// A directory a previous `gen` wrote. Omit it for fixture and resumption cost.
-    corpus: Option<PathBuf>,
-    /// Repeats per measurement; the fastest is reported.
-    repeats: usize,
-    /// Fixture sizes for the open-against-rebuild comparison.
-    cells: Vec<usize>,
-    /// Skip everything but the throughput table.
-    only_throughput: bool,
-    json: bool,
-}
 
 #[derive(Debug, serde::Deserialize)]
 struct SimArgs {
@@ -708,81 +676,11 @@ fn w6(args: W6Args) -> Result<()> {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct PayloadArgs {
-    /// Line items per JSON payload.
-    lines: Vec<usize>,
-    /// Encodes and decodes per payload size.
-    iterations: u32,
-    /// `lines:pad` pairs separating a decode's per-field cost from its per-byte one.
-    shape: Vec<String>,
-    /// Entries per `Map` measurement.
-    entries: Vec<usize>,
-    /// Type counts the derivation comparison is taken at.
-    types: Vec<usize>,
-    /// Types per module in that comparison.
-    types_per_module: usize,
-    /// Processes the `map_keys` order check spawns; two is the minimum to see a hasher seed.
-    processes: usize,
-    /// The `ply` binary the order check drives.
-    ply: Option<PathBuf>,
-    repeats: usize,
-    /// Drop the derivation comparison, the slow half.
-    no_derivation: bool,
-    json: bool,
-}
-
-fn payload(args: PayloadArgs) -> Result<()> {
-    let ply = match &args.ply {
-        Some(path) => path.clone(),
-        None => ply_corpus::payload::ply_binary()?,
-    };
-    let shape: Vec<(usize, usize)> = args
-        .shape
-        .iter()
-        .map(|s| parse_shape(s))
-        .collect::<Result<_>>()?;
-    let out = ply_corpus::payload::Measurements {
-        json: ply_corpus::payload::json_throughput(&args.lines, args.iterations, args.repeats)?,
-        shape: ply_corpus::payload::json_shape(&shape, args.iterations, args.repeats)?,
-        maps: ply_corpus::payload::map_ops(&args.entries, args.repeats)?,
-        order: Some(ply_corpus::payload::map_order(&ply, args.processes)?),
-        derivation: if args.no_derivation {
-            Vec::new()
-        } else {
-            ply_corpus::payload::derivation_cost(&args.types, args.types_per_module, args.repeats)?
-        },
-    };
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        print!("{}", ply_corpus::payload::render(&out));
-    }
-    Ok(())
-}
-
-/// Parses `lines:pad`.
-fn parse_shape(point: &str) -> Result<(usize, usize)> {
-    let (lines, pad) = point
-        .split_once(':')
-        .with_context(|| format!("`{point}` is not `lines:pad`"))?;
-    Ok((
-        lines
-            .trim()
-            .parse()
-            .with_context(|| format!("`{lines}` is not a number"))?,
-        pad.trim()
-            .parse()
-            .with_context(|| format!("`{pad}` is not a number"))?,
-    ))
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct ProveArgs {
     /// `.ply` files or directories, each reported on its own row.
     projects: Vec<PathBuf>,
     cases: u32,
     prove_budget: u32,
-    shrink_budget: u32,
     json: bool,
 }
 
@@ -790,7 +688,6 @@ fn prove(args: ProveArgs) -> Result<()> {
     let plan = ply_prove::ProvePlan {
         cases: args.cases,
         prove_budget: args.prove_budget,
-        shrink_budget: args.shrink_budget,
         ..ply_prove::ProvePlan::default()
     }
     .normalized();
@@ -803,36 +700,6 @@ fn prove(args: ProveArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&runs)?);
     } else {
         print!("{}", ply_corpus::discharge::render(&runs));
-    }
-    Ok(())
-}
-
-fn measure(args: MeasureArgs) -> Result<()> {
-    let mut out = measure::Measurements {
-        throughput: None,
-        scheduling: None,
-        store_open: None,
-        fixture: Vec::new(),
-        multi_shot: None,
-    };
-    if !args.only_throughput {
-        out.fixture = measure::fixture_cost(&args.cells, args.repeats);
-        out.multi_shot = Some(measure::multi_shot(args.repeats)?);
-    }
-
-    if let Some(root) = &args.corpus {
-        out.throughput = Some(measure::throughput(root, args.repeats)?);
-        if !args.only_throughput {
-            // Scheduling clears the cache, so the store is timed before it.
-            out.store_open = Some(measure::store_open(root, args.repeats)?);
-            out.scheduling = Some(measure::scheduling(root)?);
-        }
-    }
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        print!("{}", measure::render(&out));
     }
     Ok(())
 }
@@ -861,54 +728,14 @@ fn run(plan: serde_json::Value) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("the plan carries no command"))?;
     let args = plan["args"].clone();
     match command {
-        "measure" => measure(serde_json::from_value(args)?),
         "sim" => simulate(serde_json::from_value(args)?),
         "prove" => prove(serde_json::from_value(args)?),
         "serve" => serve(serde_json::from_value(args)?),
-        "payload" => payload(serde_json::from_value(args)?),
         "w3" => w3(serde_json::from_value(args)?),
         "w4" => w4(serde_json::from_value(args)?),
         "w5" => w5(serde_json::from_value(args)?),
         "w6" => w6(serde_json::from_value(args)?),
         "w6-ladder" => w6_ladder(serde_json::from_value(args)?),
-        "regions" => regions(serde_json::from_value(args)?),
         other => anyhow::bail!("the executor runs no `{other}` command"),
     }
-}
-
-fn regions(args: RegionsArgs) -> Result<()> {
-    let mut costs = Vec::new();
-    for root in &args.roots {
-        let corpus = regions::measure(root, args.jobs, args.std)
-            .with_context(|| format!("measuring `{}`", root.display()))?;
-        eprintln!(
-            "{}: effects reaching a test footprint: {:?}",
-            root.display(),
-            regions::effects_present(&corpus.footprints)
-        );
-        costs.push(regions::analyse(&corpus, args.jobs));
-    }
-    for shape in &args.hypothetical {
-        let (cells, labels) = shape
-            .split_once(':')
-            .context("`--hypothetical` takes `cells:labels`")?;
-        let corpus = regions::hypothetical(regions::Hypothetical {
-            cell_tests: cells.parse().context("`--hypothetical` cell count")?,
-            labels: labels.parse().context("`--hypothetical` label count")?,
-            shared_tests: args.hypothetical_shared,
-            shared_labels: 3,
-            pure_tests: args.hypothetical_pure,
-            seed: 1,
-        });
-        costs.push(regions::analyse(&corpus, args.jobs));
-    }
-    if costs.is_empty() {
-        anyhow::bail!("nothing to analyse: pass a project root or `--hypothetical cells:labels`");
-    }
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&costs)?);
-    } else {
-        print!("{}", regions::render(&costs));
-    }
-    Ok(())
 }

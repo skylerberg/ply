@@ -11,6 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+/// Where the ports the twin assigns start: the first of the dynamic range.
+const EPHEMERAL: u16 = 49152;
+
 fn some(v: Value) -> Value {
     Value::ctor("Some", vec![v])
 }
@@ -22,6 +25,19 @@ struct SimState {
     inbound: VecDeque<VecDeque<Vec<u8>>>,
     conns: BTreeMap<i64, VecDeque<Vec<u8>>>,
     sent: BTreeMap<i64, Vec<u8>>,
+    /// Each open socket's own port: a listener's, which an accepted connection shares, or one
+    /// assigned as the kernel would assign it.
+    ports: BTreeMap<i64, u16>,
+    assigned: u16,
+}
+
+impl SimState {
+    /// Ports from [`EPHEMERAL`] up, in the order they are asked for, wrapping within the range.
+    fn assign(&mut self) -> u16 {
+        let port = EPHEMERAL + self.assigned % (u16::MAX - EPHEMERAL + 1);
+        self.assigned = self.assigned.wrapping_add(1);
+        port
+    }
 }
 
 pub struct SimNet {
@@ -54,9 +70,12 @@ impl SimNet {
         }
     }
 
-    fn bind(&self, at: &Resource) -> i64 {
+    fn bind(&self, at: &Resource, port: u16) -> i64 {
         let handle = self.handles.open(Some(at));
-        lock(&self.state).listeners.push(handle);
+        let mut state = lock(&self.state);
+        state.listeners.push(handle);
+        let port = if port == 0 { state.assign() } else { port };
+        state.ports.insert(handle, port);
         handle
     }
 
@@ -85,18 +104,19 @@ impl Net for SimNet {
             Op::Recv => "ply_host::tcp::sim::recv",
             Op::Send => "ply_host::tcp::sim::send",
             Op::Close => "ply_host::tcp::sim::close",
+            Op::LocalPort => "ply_host::tcp::sim::local_port",
         }
     }
 
-    fn listen(&self, at: &Resource, _port: u16, _span: Span) -> Result<HostAnswer, Diagnostic> {
-        Ok(HostAnswer::Value(Value::Int(self.bind(at))))
+    fn listen(&self, at: &Resource, port: u16, _span: Span) -> Result<HostAnswer, Diagnostic> {
+        Ok(HostAnswer::Value(Value::Int(self.bind(at, port))))
     }
 
     /// Checks the credential, then binds an ordinary listener: TLS changes none of the bytes read.
     fn listen_tls(
         &self,
         at: &Resource,
-        _port: u16,
+        port: u16,
         credential: &str,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic> {
@@ -107,7 +127,7 @@ impl Net for SimNet {
                 span,
             ));
         }
-        Ok(HostAnswer::Value(Value::Int(self.bind(at))))
+        Ok(HostAnswer::Value(Value::Int(self.bind(at, port))))
     }
 
     /// The next scripted connection, as `accept` would hand it out; none left is a host not reached.
@@ -125,6 +145,8 @@ impl Net for SimNet {
         };
         let handle = self.handles.open(Some(at));
         state.conns.insert(handle, chunks);
+        let port = state.assign();
+        state.ports.insert(handle, port);
         Ok(HostAnswer::Value(some(Value::Int(handle))))
     }
 
@@ -158,6 +180,9 @@ impl Net for SimNet {
         };
         let handle = self.handles.open(None);
         state.conns.insert(handle, chunks);
+        if let Some(port) = state.ports.get(&listener).copied() {
+            state.ports.insert(handle, port);
+        }
         Ok(HostAnswer::Value(Value::Int(handle)))
     }
 
@@ -210,6 +235,7 @@ impl Net for SimNet {
         self.handles.check(socket, at, span)?;
         self.handles.close(socket);
         let mut state = lock(&self.state);
+        state.ports.remove(&socket);
         if state.conns.remove(&socket).is_some() {
             return Ok(HostAnswer::Value(Value::Unit));
         }
@@ -220,6 +246,16 @@ impl Net for SimNet {
             }
             None => Err(unknown_handle(socket, span)),
         }
+    }
+
+    fn local_port(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
+        self.handles.check(socket, at, span)?;
+        Ok(HostAnswer::Value(
+            match lock(&self.state).ports.get(&socket).copied() {
+                Some(port) => some(Value::Int(i64::from(port))),
+                None => Value::ctor("None", Vec::new()),
+            },
+        ))
     }
 }
 
