@@ -1,0 +1,196 @@
+// `--config-schema <module>.<fn>`: which definition a run's configuration schema is. Every command
+// that takes the flag resolves it here, over the program it loaded, before it configures a machine,
+// and `ply build` ships what it resolves; the machine only evaluates the definition.
+
+import compiler.diag (parse_all)
+import compiler.front (Whole, Analysed, Refused, analyse, module_of)
+import compiler.infer (DefInfo)
+import compiler.resolve (Diag, diag1)
+import compiler.tycore (Type, TyCon, TyFn, TyRecord, field_get, row_text, type_text)
+import entry (no_module)
+import report (count_of)
+import std.list (sort)
+import std.string (join)
+
+fn text(b: Bytes) -> String = string_of_bytes_lossy(b)
+
+fn flag(name: String) -> String = "`--config-schema " ++ name ++ "`"
+
+fn refused(message: String, notes: List<Bytes>) -> Diag =
+  diag1(
+    b"E0440",
+    no_module(),
+    { start: 0, end: 0 },
+    bytes_of_string(message),
+    b"this argument is the run's configuration",
+    notes,
+  )
+
+// Two segments or more, each an identifier by the rule a module's path is held to.
+fn well_spelled(name: String) -> Bool = {
+  let segments = string_split(name, ".");
+  len(segments) >= 2 && (match module_of(join(segments, "/")) { Ok(_) -> true, Err(_) -> false })
+}
+
+// The flag's spelling, which is all a run of a deployed artifact can check before the machine
+// opens it.
+pub fn spelled(name: String) -> Result<String, Diag> =
+  if well_spelled(name) { Ok(name) } else {
+    let note = b"write the program-wide name of the function, as `ply hash` prints it";
+    Err(refused(flag(name) ++ " is not a `<module>.<fn>` name", [note]))
+  }
+
+// The name after the last `.`, which a type keeps under whatever its module is imported as.
+fn simple_of(name: Bytes) -> Bytes = {
+  let segments = bytes_split(name, b".");
+  match list_at(segments, len(segments) - 1) { Some(last) -> last, None -> name }
+}
+
+// By name as well as by shape: inference expands `std.config`'s `ConfigSpec` record alias away.
+fn returns_spec(t: Type) -> Bool =
+  match t {
+    TyCon(c) -> len(c.args) == 0 && simple_of(c.name) == b"ConfigSpec",
+    TyRecord(fs) ->
+      len(fs) == 1
+        && (match field_get(fs, b"keys") {
+          Some(TyCon(k)) -> k.name == b"List" && len(k.args) == 1,
+          _ -> false,
+        }),
+    _ -> false,
+  }
+
+// Why `d` cannot be a schema, when it cannot: a schema is called with nothing, answers a spec, and
+// performs nothing, since it is read before anything is bound.
+fn unfit(d: DefInfo) -> Option<String> =
+  match d.scheme.ty {
+    TyFn(f) -> if len(f.params) > 0 {
+      Some(
+        "it takes " ++ count_of(len(f.params), "argument") ++ ", and the run has nothing to pass",
+      )
+    } else if !returns_spec(f.ret) {
+      Some("it returns `" ++ text(type_text(f.ret)) ++ "` rather than a `ConfigSpec`")
+    } else if len(d.footprint) > 0 {
+      Some(
+        "its row is `" ++ text(row_text({ atoms: d.footprint, tail: None }))
+          ++ "`, and the schema is read before anything is bound, so it must be pure",
+      )
+    } else { None },
+    _ -> Some("it is not a function, and a schema is materialised by calling one"),
+  }
+
+fn unknown(w: Whole, name: String) -> Diag = {
+  let found = sort(
+    map(filter(w.checked.defs, |d: DefInfo| unfit(d) == None), |d: DefInfo| text(d.name)),
+  );
+  let notes = if len(found) == 0 {
+    [
+      b"this program declares no nullary function returning a `ConfigSpec`",
+      b"drop `--config-schema`: without it a missing key is a `None` at the call site, later and per key and still the program's to handle",
+    ]
+  } else { [bytes_of_string("this program has: " ++ join(found, ", "))] };
+  refused(flag(name) ++ " names no definition in this program", notes)
+}
+
+fn not_a_schema(name: String, why: String) -> Diag =
+  refused(flag(name) ++ " does not name a configuration schema: " ++ why, [
+    bytes_of_string(
+      "it must be a nullary pure function returning `std.config.ConfigSpec` — a record `{keys: List<Key>}`",
+    ),
+  ])
+
+fn defined(defs: List<DefInfo>, name: String) -> Option<DefInfo> =
+  fold(defs, None, |found: Option<DefInfo>, d: DefInfo|
+    match found { Some(_) -> found, None -> if text(d.name) == name { Some(d) } else { None } })
+
+// The definition the flag names, checked to be one a schema is materialised from.
+pub fn resolved(w: Whole, name: String) -> Result<String, Diag> =
+  match spelled(name) {
+    Err(d) -> Err(d),
+    Ok(_) -> match defined(w.checked.defs, name) {
+      None -> Err(unknown(w, name)),
+      Some(d) -> match unfit(d) { Some(why) -> Err(not_a_schema(name, why)), None -> Ok(name) },
+    },
+  }
+
+// What a command refuses before it configures a machine over `w`: nothing when no schema is named.
+pub fn refusal(w: Whole, named: Option<String>) -> Option<Diag> =
+  match named {
+    None -> None,
+    Some(name) -> match resolved(w, name) { Ok(_) -> None, Err(d) -> Some(d) },
+  }
+
+// The same for a run of a deployed artifact, whose definitions the machine alone reads.
+pub fn misspelled(named: Option<String>) -> Option<Diag> =
+  match named {
+    None -> None,
+    Some(name) -> match spelled(name) { Ok(_) -> None, Err(d) -> Some(d) },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn whole_of(src: Bytes) -> Whole =
+  match analyse(parse_all([{ name: b"m", src: src }])) {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(w) -> w,
+  }
+
+fn specs() -> Whole =
+  whole_of(
+    b"type Shape = | SText | SInt | SBool | SSecret\ntype Key = { name: String, shape: Shape, required: Bool, default: Option<String> }\ntype ConfigSpec = { keys: List<Key> }\neffect log { write emit(Bytes) -> Unit }\nfn config() -> ConfigSpec = { keys: [] }\nfn two(a: Int) -> ConfigSpec = { keys: [] }\nfn number() -> Int = 1\nfn loud() -> ConfigSpec / {log.write} = { log.emit(b\"x\"); config() }\n",
+  )
+
+fn refusal_of(r: Result<String, Diag>) -> Diag =
+  match r { Ok(_) -> panic("the flag took a name it should refuse"), Err(d) -> d }
+
+test "a nullary pure function returning a spec resolves" {
+  assert_eq(resolved(specs(), "m.config"), Ok("m.config"));
+  assert_eq(refusal(specs(), Some("m.config")), None);
+  assert_eq(refusal(specs(), None), None)
+}
+
+test "a name that is not `<module>.<fn>` is refused before any program is read" {
+  let bad = ["config", "desk.", ".config", "desk..config", "1desk.config"];
+  assert_eq(
+    map(bad, |name: String| refusal_of(spelled(name)).message),
+    map(bad, |name: String| bytes_of_string(flag(name) ++ " is not a `<module>.<fn>` name")),
+  );
+  assert_eq(
+    map(bad, |name: String| refusal_of(spelled(name)).code),
+    map(bad, |name: String| b"E0440"),
+  );
+  assert_eq(spelled("desk.config"), Ok("desk.config"));
+  assert_eq(spelled("store.orders.config"), Ok("store.orders.config"));
+  assert(match misspelled(Some("config")) { Some(d) -> d.code == b"E0440", None -> false });
+  assert_eq(misspelled(Some("desk.config")), None);
+  assert_eq(misspelled(None), None)
+}
+
+// The fix is a different argument, not an edit to the program, so each refusal is about the argument.
+test "a definition that is not a schema is refused with the reason" {
+  let why = |name: String| text(refusal_of(resolved(specs(), name)).message);
+  assert_eq(
+    why("m.two"),
+    "`--config-schema m.two` does not name a configuration schema: it takes 1 argument, and the run has nothing to pass",
+  );
+  assert_eq(
+    why("m.number"),
+    "`--config-schema m.number` does not name a configuration schema: it returns `Int` rather than a `ConfigSpec`",
+  );
+  assert_eq(
+    why("m.loud"),
+    "`--config-schema m.loud` does not name a configuration schema: its row is `{m.log.write}`, and the schema is read before anything is bound, so it must be pure",
+  );
+  assert_eq(refusal_of(resolved(specs(), "m.two")).code, b"E0440")
+}
+
+test "a name the program does not declare lists the schemas it does" {
+  let d = refusal_of(resolved(specs(), "desk.config"));
+  assert_eq(d.code, b"E0440");
+  assert_eq(d.message, b"`--config-schema desk.config` names no definition in this program");
+  assert_eq(d.notes_text, [b"this program has: m.config"]);
+  let none = refusal_of(resolved(whole_of(b"fn number() -> Int = 1\n"), "m.config"));
+  assert_eq(none.notes_text, [
+    b"this program declares no nullary function returning a `ConfigSpec`",
+    b"drop `--config-schema`: without it a missing key is a `None` at the call site, later and per key and still the program's to handle",
+  ])
+}

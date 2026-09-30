@@ -4,9 +4,10 @@ use super::RuleLog;
 use super::claims::{self, Code, Pat, Stmt};
 use super::context::Context;
 use super::term::{self, Arm, ArmTest, CmpOp, Node, TermId, Terms};
+use crate::sort::Sort;
+use crate::world::Ctor;
 use ply_eval::{BinOp, Lit, UnOp};
 use ply_span::Symbol;
-use ply_ty::{CtorInfo, Scheme, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_TERMS: usize = 20_000;
@@ -115,10 +116,6 @@ impl Blocker {
 enum Numeric {
     Float,
     Decimal,
-}
-
-fn is_con(ty: &Type, name: &str) -> bool {
-    matches!(ty, Type::Con(n, args) if n.as_str() == name && args.is_empty())
 }
 
 /// A self call whose argument in `slot` must be non-negative and below `bound`, the parameter it
@@ -286,7 +283,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         let mut out = cond;
         for i in (0..self.path.len()).rev() {
             let negated = self.terms.not(self.path[i]);
-            out = self.terms.mk(Node::Or(negated, out), Some(Type::bool()));
+            out = self.terms.mk(Node::Or(negated, out), Some(Sort::bool()));
         }
         out
     }
@@ -308,7 +305,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 lhs: t,
                 rhs: min,
             },
-            Some(Type::bool()),
+            Some(Sort::bool()),
         );
         let high = self.terms.mk(
             Node::Cmp {
@@ -316,9 +313,9 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 lhs: t,
                 rhs: max,
             },
-            Some(Type::bool()),
+            Some(Sort::bool()),
         );
-        let both = self.terms.mk(Node::And(low, high), Some(Type::bool()));
+        let both = self.terms.mk(Node::And(low, high), Some(Sort::bool()));
         self.require(both);
     }
 
@@ -346,7 +343,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         let rhs_minus_one = self.terms.eq(rhs, minus_one);
         let overflows = self
             .terms
-            .mk(Node::And(lhs_min, rhs_minus_one), Some(Type::bool()));
+            .mk(Node::And(lhs_min, rhs_minus_one), Some(Sort::bool()));
         let safe = self.terms.not(overflows);
         self.require(safe);
     }
@@ -361,7 +358,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 lhs: count,
                 rhs: zero,
             },
-            Some(Type::bool()),
+            Some(Sort::bool()),
         );
         let high = self.terms.mk(
             Node::Cmp {
@@ -369,9 +366,9 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 lhs: count,
                 rhs: width,
             },
-            Some(Type::bool()),
+            Some(Sort::bool()),
         );
-        let both = self.terms.mk(Node::And(low, high), Some(Type::bool()));
+        let both = self.terms.mk(Node::And(low, high), Some(Sort::bool()));
         self.require(both);
     }
 
@@ -382,11 +379,11 @@ impl<'a, 'p> Lowering<'a, 'p> {
         out
     }
 
-    pub fn bind_symbolic(&mut self, ty: &Type) -> TermId {
-        if self.ctx.reaches_float(ty) {
+    pub fn bind_symbolic(&mut self, sort: &Sort) -> TermId {
+        if self.ctx.reaches_float(sort) {
             self.float();
         }
-        self.terms.sym(Some(ty.clone()))
+        self.terms.sym(Some(sort.clone()))
     }
 
     pub fn finish(self) -> Terms {
@@ -438,7 +435,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                                 head,
                                 args: vec![t],
                             },
-                            Some(Type::int()),
+                            Some(Sort::int()),
                         );
                         self.terms.force_int(term);
                         term
@@ -453,7 +450,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                             None => {
                                 self.blocked(Blocker::CoefficientRange);
                                 self.undefined();
-                                self.terms.sym(Some(Type::int()))
+                                self.terms.sym(Some(Sort::int()))
                             }
                         }
                     }
@@ -503,7 +500,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 let sort = items
                     .first()
                     .and_then(|t| self.terms.sort(*t).cloned())
-                    .map(Type::list);
+                    .map(Sort::list);
                 let mut out = self.terms.nil(sort.clone());
                 for item in items.into_iter().rev() {
                     out = self.terms.cons(item, out, sort.clone());
@@ -527,11 +524,11 @@ impl<'a, 'p> Lowering<'a, 'p> {
             Lit::Bool(b) => self.terms.boolean(*b),
             Lit::Str(s) => self.terms.string(s.clone()),
             // Not `Node::Str`: `b"ab"` and `"ab"` must not be congruent.
-            Lit::Bytes(_) => self.terms.sym(Some(Type::bytes())),
+            Lit::Bytes(_) => self.terms.sym(Some(Sort::bytes())),
             // No shared node: congruence needs a reflexive `==`, which `Float` lacks.
             Lit::Float(_) => {
                 self.float();
-                self.terms.sym(Some(Type::float()))
+                self.terms.sym(Some(Sort::float()))
             }
             Lit::Decimal { mantissa, scale } => self.terms.decimal(*mantissa, *scale),
             Lit::Fixed { ty, bits } => self.terms.fixed(*ty, *bits),
@@ -562,8 +559,8 @@ impl<'a, 'p> Lowering<'a, 'p> {
 
     fn global(&mut self, name: &Symbol) -> TermId {
         if let Some(ctor) = self.ctx.ctor(name) {
-            let sort = scheme_sort(&ctor.scheme);
-            if ctor.arity == 0 {
+            let sort = Some(ctor.sort());
+            if ctor.arity() == 0 {
                 return self.terms.mk(
                     Node::Ctor {
                         name: name.clone(),
@@ -574,10 +571,10 @@ impl<'a, 'p> Lowering<'a, 'p> {
             }
             return self.terms.mk(Node::Opaque(name.clone()), sort);
         }
-        match self.ctx.scheme(name) {
-            Some(scheme) => self
+        match self.ctx.signature(name) {
+            Some(signature) => self
                 .terms
-                .mk(Node::Opaque(name.clone()), scheme_sort(scheme)),
+                .mk(Node::Opaque(name.clone()), Some(signature.sort.clone())),
             None if TOTAL_BUILTINS.contains(&name.as_str()) => {
                 self.terms.opaque(name.as_str(), None)
             }
@@ -588,8 +585,8 @@ impl<'a, 'p> Lowering<'a, 'p> {
     fn operand_type(&self, lhs: TermId, rhs: TermId) -> Option<Numeric> {
         for side in [lhs, rhs] {
             match self.terms.sort(side) {
-                Some(t) if is_con(t, "Float") => return Some(Numeric::Float),
-                Some(t) if is_con(t, "Decimal") => return Some(Numeric::Decimal),
+                Some(t) if t.is_con("Float") => return Some(Numeric::Float),
+                Some(t) if t.is_con("Decimal") => return Some(Numeric::Decimal),
                 _ => {}
             }
         }
@@ -625,11 +622,11 @@ impl<'a, 'p> Lowering<'a, 'p> {
             _ => term::GE,
         };
         let sort = if comparison {
-            Type::bool()
+            Sort::bool()
         } else {
             match numeric {
-                Numeric::Float => Type::float(),
-                Numeric::Decimal => Type::decimal(),
+                Numeric::Float => Sort::float(),
+                Numeric::Decimal => Sort::decimal(),
             }
         };
         let head = self.terms.opaque(symbol, None);
@@ -702,7 +699,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                                 head,
                                 args: vec![lhs, rhs],
                             },
-                            Some(Type::int()),
+                            Some(Sort::int()),
                         );
                         self.terms.force_int(term);
                         term
@@ -719,10 +716,10 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     _ => CmpOp::Ge,
                 };
                 self.terms
-                    .mk(Node::Cmp { op, lhs, rhs }, Some(Type::bool()))
+                    .mk(Node::Cmp { op, lhs, rhs }, Some(Sort::bool()))
             }
-            BinOp::And => self.terms.mk(Node::And(lhs, rhs), Some(Type::bool())),
-            BinOp::Or => self.terms.mk(Node::Or(lhs, rhs), Some(Type::bool())),
+            BinOp::And => self.terms.mk(Node::And(lhs, rhs), Some(Sort::bool())),
+            BinOp::Or => self.terms.mk(Node::Or(lhs, rhs), Some(Sort::bool())),
             // `==` on functions is a type error, so it needs no requirement here.
             BinOp::Eq => self.terms.eq(lhs, rhs),
             BinOp::Ne => {
@@ -757,7 +754,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                         head,
                         args: vec![lhs, rhs],
                     },
-                    Some(Type::int()),
+                    Some(Sort::int()),
                 );
                 self.terms.force_int(term);
                 term
@@ -768,7 +765,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 // Both sides share one sort, so either side that has one gives the answer's.
                 let sort = match self.terms.sort(lhs).or(self.terms.sort(rhs)) {
                     Some(t) => t.clone(),
-                    None => Type::string(),
+                    None => Sort::string(),
                 };
                 self.terms.mk(
                     Node::App {
@@ -806,7 +803,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
 
         let head = self.lower(func);
         let sort = match self.terms.sort(head) {
-            Some(Type::Fn { ret, .. }) => Some((**ret).clone()),
+            Some(Sort::Fn { ret, .. }) => Some((**ret).clone()),
             _ => None,
         };
 
@@ -824,7 +821,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
             && !total_builtin
         {
             if let Some(ctor) = self.ctx.ctor(&name) {
-                if ctor.arity == lowered.len() {
+                if ctor.arity() == lowered.len() {
                     let sort = ctor_result_sort(ctor, &lowered, &self.terms);
                     return self.terms.mk(
                         Node::Ctor {
@@ -901,7 +898,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 head,
                 args: vec![at],
             },
-            Some(Type::int()),
+            Some(Sort::int()),
         );
         let k = self.terms.int_lit(count);
         let sum = self.terms.add(k, rest)?;
@@ -952,7 +949,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         match func {
             Code::Local(_) => Callee::Local,
             Code::Global(name)
-                if self.ctx.ctor(name).is_some() || self.ctx.scheme(name).is_some() =>
+                if self.ctx.ctor(name).is_some() || self.ctx.signature(name).is_some() =>
             {
                 Callee::Named(name.clone())
             }
@@ -965,10 +962,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
 
     fn callee_is_total(&self, callee: &Callee, head: TermId) -> bool {
         match callee {
-            Callee::Local => matches!(
-                self.terms.sort(head),
-                Some(Type::Fn { effects, .. }) if effects.is_pure()
-            ),
+            Callee::Local => matches!(self.terms.sort(head), Some(Sort::Fn { pure: true, .. })),
             // A definition whose body was not inlined is not known to be total.
             Callee::Named(name) => self.ctx.ctor(name).is_some() || self.total.contains(name),
             Callee::Unresolved(name) => TOTAL_BUILTINS.contains(&name.as_str()),
@@ -977,7 +971,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
     }
 
     fn head_is_pure(&self, head: TermId) -> bool {
-        matches!(self.terms.sort(head), Some(Type::Fn { effects, .. }) if effects.is_pure())
+        matches!(self.terms.sort(head), Some(Sort::Fn { pure: true, .. }))
     }
 
     /// Why [`Lowering::try_unfold`] declined; keep in its decision order.
@@ -1026,7 +1020,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 lhs: arg,
                 rhs: zero,
             },
-            Some(Type::bool()),
+            Some(Sort::bool()),
         );
         let high = self.terms.mk(
             Node::Cmp {
@@ -1034,9 +1028,9 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 lhs: arg,
                 rhs: measure.bound,
             },
-            Some(Type::bool()),
+            Some(Sort::bool()),
         );
-        let both = self.terms.mk(Node::And(low, high), Some(Type::bool()));
+        let both = self.terms.mk(Node::And(low, high), Some(Sort::bool()));
         let owed = self.under_path(both);
         self.measures.push(owed);
         true
@@ -1046,7 +1040,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         &mut self,
         name: &Symbol,
         head: TermId,
-        sort: Option<Type>,
+        sort: Option<Sort>,
         args: &[TermId],
     ) -> Option<TermId> {
         if self.depth >= self.unfold_depth || self.terms.len() >= MAX_TERMS {
@@ -1109,7 +1103,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         }
     }
 
-    fn bind_opaque(&mut self, pat: &Pat, sort: Option<&Type>) {
+    fn bind_opaque(&mut self, pat: &Pat, sort: Option<&Sort>) {
         if sort.is_some_and(|s| self.ctx.reaches_float(s)) {
             self.float();
         }
@@ -1184,7 +1178,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         &mut self,
         pat: &Pat,
         scrutinee: TermId,
-        scrutinee_sort: Option<&Type>,
+        scrutinee_sort: Option<&Sort>,
     ) -> Option<(ArmTest, Vec<TermId>)> {
         match pat {
             Pat::Wild => Some((ArmTest::Always, Vec::new())),
@@ -1198,7 +1192,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
             }
             Pat::Ctor(name, args) => {
                 let ctor = self.ctx.ctor(name)?;
-                if ctor.arity != args.len() {
+                if ctor.arity() != args.len() {
                     return None;
                 }
                 if !args.iter().all(|a| matches!(a, Pat::Wild | Pat::Var(_))) {
@@ -1220,7 +1214,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 if !inner.clone().all(|a| matches!(a, Pat::Wild | Pat::Var(_))) {
                     return None;
                 }
-                let elem = scrutinee_sort.and_then(super::term::list_elem).cloned();
+                let elem = scrutinee_sort.and_then(Sort::list_elem).cloned();
                 let mut binds = Vec::with_capacity(items.len() + 1);
                 // A spine in view binds its own heads and tail, so a call over the tail is the
                 // same term wherever the tail is named; a symbol gets fresh fields.
@@ -1266,12 +1260,12 @@ impl<'a, 'p> Lowering<'a, 'p> {
         }
     }
 
-    fn record_sort(&self, fields: &[(Symbol, TermId)]) -> Option<Type> {
-        let mut out = BTreeMap::new();
+    fn record_sort(&self, fields: &[(Symbol, TermId)]) -> Option<Sort> {
+        let mut out = Vec::with_capacity(fields.len());
         for (name, value) in fields {
-            out.insert(name.clone(), self.terms.sort(*value)?.clone());
+            out.push((name.clone(), self.terms.sort(*value)?.clone()));
         }
-        Some(Type::Record(out))
+        Some(Sort::record(out))
     }
 }
 
@@ -1302,132 +1296,82 @@ fn pattern_slots(pat: &Pat) -> Vec<usize> {
     out
 }
 
-fn scheme_sort(scheme: &Scheme) -> Option<Type> {
-    Some(scheme.ty.clone())
-}
-
-/// The owning sum type's parameters, in argument order.
-fn type_parameters(ctor: &CtorInfo) -> Option<Vec<TyVar>> {
-    let ret = match &ctor.scheme.ty {
-        Type::Fn { ret, .. } => ret.as_ref(),
-        other => other,
-    };
-    let Type::Con(name, args) = ret else {
-        return None;
-    };
-    if *name != ctor.type_name {
-        return None;
-    }
-    args.iter()
-        .map(|a| match a {
-            Type::Var(v) => Some(*v),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Instantiated against the scrutinee's sort when it is known.
 /// What a total builtin answers, read off its arguments' sorts where the answer depends on them.
-fn builtin_sort(name: &str, args: &[TermId], terms: &Terms) -> Option<Type> {
+fn builtin_sort(name: &str, args: &[TermId], terms: &Terms) -> Option<Sort> {
     let first = args.first().and_then(|a| terms.sort(*a).cloned());
     match name {
-        "len" | "min" | "max" | "bytes_len" | "string_len" => Some(Type::int()),
-        "int_to_string" => Some(Type::string()),
+        "len" | "min" | "max" | "bytes_len" | "string_len" => Some(Sort::int()),
+        "int_to_string" => Some(Sort::string()),
         "push" => first,
         "list_at" => first
             .as_ref()
-            .and_then(super::term::list_elem)
-            .map(|elem| Type::Con(Symbol::new("Option"), vec![elem.clone()])),
+            .and_then(Sort::list_elem)
+            .map(|elem| Sort::Con(Symbol::new("Option"), vec![elem.clone()])),
         _ => None,
     }
 }
 
-pub(super) fn field_sorts(ctor: &CtorInfo, sort: Option<&Type>) -> Vec<Option<Type>> {
-    let subst = match (sort, type_parameters(ctor)) {
-        (Some(Type::Con(name, args)), Some(params))
-            if *name == ctor.type_name && args.len() == params.len() =>
+/// A constructor's fields, instantiated against the scrutinee's sort when it is known.
+pub(super) fn field_sorts(ctor: Ctor<'_>, sort: Option<&Sort>) -> Vec<Option<Sort>> {
+    let args: &[Sort] = match sort {
+        Some(Sort::Con(name, args))
+            if *name == ctor.decl.name && args.len() == ctor.decl.params =>
         {
-            params.into_iter().zip(args.iter().cloned()).collect()
+            args
         }
-        _ => BTreeMap::new(),
+        _ => &[],
     };
-    ctor.fields
+    ctor.variant
+        .fields
         .iter()
-        .map(|f| Some(substitute(f, &subst)))
+        .map(|f| Some(f.substituted(args)))
         .collect()
 }
 
-fn ctor_result_sort(ctor: &CtorInfo, args: &[TermId], terms: &Terms) -> Option<Type> {
-    let params = type_parameters(ctor)?;
-    let mut subst: BTreeMap<TyVar, Type> = BTreeMap::new();
-    for (field, arg) in ctor.fields.iter().zip(args) {
+fn ctor_result_sort(ctor: Ctor<'_>, args: &[TermId], terms: &Terms) -> Option<Sort> {
+    let mut subst: BTreeMap<u32, Sort> = BTreeMap::new();
+    for (field, arg) in ctor.variant.fields.iter().zip(args) {
         if let Some(actual) = terms.sort(*arg) {
-            match_type(field, actual, &mut subst);
+            match_sort(field, actual, &mut subst);
         }
     }
-    let args = params
-        .into_iter()
-        .map(|p| subst.get(&p).cloned().unwrap_or(Type::Var(p)))
+    let args = (0..ctor.decl.params as u32)
+        .map(|p| subst.get(&p).cloned().unwrap_or(Sort::Var(p)))
         .collect();
-    Some(Type::Con(ctor.type_name.clone(), args))
+    Some(Sort::Con(ctor.decl.name.clone(), args))
 }
 
 /// One-way matching of `pattern` against `actual`; silently declines where they disagree.
-fn match_type(pattern: &Type, actual: &Type, subst: &mut BTreeMap<TyVar, Type>) {
+fn match_sort(pattern: &Sort, actual: &Sort, subst: &mut BTreeMap<u32, Sort>) {
     match (pattern, actual) {
-        (Type::Var(v), _) => {
+        (Sort::Var(v), _) => {
             subst.entry(*v).or_insert_with(|| actual.clone());
         }
-        (Type::Con(a, xs), Type::Con(b, ys)) if a == b && xs.len() == ys.len() => {
+        (Sort::Con(a, xs), Sort::Con(b, ys)) if a == b && xs.len() == ys.len() => {
             for (x, y) in xs.iter().zip(ys) {
-                match_type(x, y, subst);
+                match_sort(x, y, subst);
             }
         }
         (
-            Type::Fn {
+            Sort::Fn {
                 params: ps, ret: r, ..
             },
-            Type::Fn {
+            Sort::Fn {
                 params: qs, ret: s, ..
             },
         ) if ps.len() == qs.len() => {
             for (p, q) in ps.iter().zip(qs) {
-                match_type(p, q, subst);
+                match_sort(p, q, subst);
             }
-            match_type(r, s, subst);
+            match_sort(r, s, subst);
         }
-        (Type::Record(xs), Type::Record(ys)) => {
+        (Sort::Record(xs), Sort::Record(_)) => {
             for (name, x) in xs {
-                if let Some(y) = ys.get(name) {
-                    match_type(x, y, subst);
+                if let Some(y) = actual.field(name) {
+                    match_sort(x, y, subst);
                 }
             }
         }
         _ => {}
-    }
-}
-
-fn substitute(ty: &Type, subst: &BTreeMap<TyVar, Type>) -> Type {
-    match ty {
-        Type::Var(v) => subst.get(v).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Con(name, args) => Type::Con(
-            name.clone(),
-            args.iter().map(|a| substitute(a, subst)).collect(),
-        ),
-        Type::Fn {
-            params,
-            ret,
-            effects,
-        } => Type::Fn {
-            params: params.iter().map(|p| substitute(p, subst)).collect(),
-            ret: Box::new(substitute(ret, subst)),
-            effects: effects.clone(),
-        },
-        Type::Record(fields) => Type::Record(
-            fields
-                .iter()
-                .map(|(n, t)| (n.clone(), substitute(t, subst)))
-                .collect(),
-        ),
     }
 }

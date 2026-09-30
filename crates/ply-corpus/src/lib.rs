@@ -1,7 +1,6 @@
 //! The benchmark harnesses the corpus program (`crates/ply-corpus/ply`) still hands to Rust: the
 //! transitional executor's subcommands, each run from the plan the program writes.
 
-pub mod discharge;
 pub mod simulate;
 
 use anyhow::{Context, Result, bail};

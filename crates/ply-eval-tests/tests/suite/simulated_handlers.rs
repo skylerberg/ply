@@ -1,7 +1,10 @@
 use crate::fixture::port_check;
+use ply_codegen::c::producer;
+use ply_eval::decode::At;
 use ply_eval::{Answer, Handlers, SEEDED_OPS, SimTy, TaskId, Value};
 use ply_span::{SourceId, Span, Symbol};
-use ply_ty::{CheckOutput, EffectInfo, Type};
+use ply_ty::{CheckOutput, EffectInfo};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// The prelude's two effects the seeded handlers answer, plus a hand-written handler.
@@ -41,15 +44,57 @@ fn effect<'a>(check: &'a CheckOutput, simple: &str) -> &'a EffectInfo {
         .unwrap_or_else(|| panic!("`{simple}` is declared"))
 }
 
+/// Each declared operation's parameter and answer types as the compiler prints them, by its
+/// program-wide `effect.op`: what a seeded handler's signature has to agree with.
+fn declared() -> HashMap<String, (Vec<String>, String)> {
+    producer::ensure_default();
+    let dump = producer::front_pulling_std(&[("sig".to_string(), SOURCE.to_string())], &[])
+        .expect("the front end answers")
+        .dump;
+    let printed = |t: At<'_>| -> String {
+        let text = producer::call("tycore.type_text", &[t.value().clone()])
+            .expect("the compiler prints a type");
+        At::new("a printed type", &text)
+            .utf8()
+            .expect("a type prints as text")
+            .to_string()
+    };
+    let mut out = HashMap::new();
+    let effects = At::new("the answer", &dump)
+        .field("effects")
+        .and_then(|e| e.list())
+        .expect("the answer declares effects");
+    for effect in effects {
+        let effect_name = effect
+            .field("name")
+            .and_then(|n| n.utf8())
+            .expect("an effect is named");
+        for op in effect
+            .field("ops")
+            .and_then(|o| o.list())
+            .expect("an effect declares operations")
+        {
+            let name = op.field("name").and_then(|n| n.utf8()).expect("named");
+            let params = op
+                .field("params")
+                .and_then(|p| p.items(|t| Ok(printed(t))))
+                .expect("an operation lists its parameters");
+            let ret = printed(op.field("ret").expect("an operation answers"));
+            out.insert(format!("{effect_name}.{name}"), (params, ret));
+        }
+    }
+    out
+}
+
 fn span() -> Span {
     Span::new(SourceId(0), 0, 1)
 }
 
 /// What the run would report a value's type as.
-fn type_of(value: &Value) -> Option<Type> {
+fn type_of(value: &Value) -> Option<&'static str> {
     match value {
-        Value::Int(_) => Some(Type::int()),
-        Value::Unit => Some(Type::unit()),
+        Value::Int(_) => Some("Int"),
+        Value::Unit => Some("Unit"),
         _ => None,
     }
 }
@@ -79,6 +124,7 @@ fn the_clause_set_covers_each_declared_effect_exactly() {
 #[test]
 fn every_seeded_operation_has_the_declared_mode_and_types() {
     let check = checked();
+    let declared = declared();
     for sig in SEEDED_OPS {
         let info = effect(&check, sig.effect);
         let op = info
@@ -86,45 +132,37 @@ fn every_seeded_operation_has_the_declared_mode_and_types() {
             .get(&Symbol::new(sig.op))
             .unwrap_or_else(|| panic!("`{sig}` is declared"));
         assert_eq!(op.mode, sig.mode, "`{sig}` disagrees about its mode");
-        let params: Vec<Type> = sig.params.iter().map(|p| Type::con(p.as_str())).collect();
-        assert_eq!(op.params, params, "`{sig}` disagrees about its parameters");
-        assert_eq!(
-            op.ret,
-            Type::con(sig.ret.as_str()),
-            "`{sig}` disagrees about its result"
-        );
+        let (params, ret) = &declared[&format!("sig.{sig}")];
+        let seeded: Vec<&str> = sig.params.iter().map(|p| p.as_str()).collect();
+        assert_eq!(params, &seeded, "`{sig}` disagrees about its parameters");
+        assert_eq!(ret, sig.ret.as_str(), "`{sig}` disagrees about its result");
     }
 }
 
 #[test]
 fn what_the_handlers_answer_has_the_declared_type() {
-    let check = checked();
+    let declared = declared();
     let mut handlers = Handlers::new(11);
     for sig in SEEDED_OPS {
-        let op = effect(&check, sig.effect)
-            .ops
-            .get(&Symbol::new(sig.op))
-            .unwrap_or_else(|| panic!("`{sig}` is declared"))
-            .clone();
-        let args: Vec<Value> = op
-            .params
+        let (params, ret) = &declared[&format!("sig.{sig}")];
+        let args: Vec<Value> = params
             .iter()
             .map(|param| {
-                assert_eq!(*param, Type::int(), "`{sig}` takes something else now");
+                assert_eq!(param, "Int", "`{sig}` takes something else now");
                 // Positive: `random.below` cannot answer below zero, and a zero sleep is a yield.
                 Value::Int(3)
             })
             .collect();
         match handlers.dispatch(sig, TaskId(0), &args, span()) {
             Ok(Answer::Value(v)) => assert_eq!(
-                type_of(&v).as_ref(),
-                Some(&op.ret),
+                type_of(&v),
+                Some(ret.as_str()),
                 "`{sig}` answered {}",
                 v.render()
             ),
             // A woken sleeper is resumed with `clock.sleep`'s declared return.
             Ok(Answer::Sleeping { .. }) => {
-                assert_eq!(op.ret, Type::unit());
+                assert_eq!(ret, "Unit");
                 assert_eq!(sig.ret, SimTy::Unit);
             }
             Err(d) => panic!("`{sig}` refused its own declared arguments: {}", d.message),

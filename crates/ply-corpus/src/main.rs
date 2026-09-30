@@ -50,35 +50,6 @@ fn simulate(args: SimArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ProveArgs {
-    /// `.ply` files or directories, each reported on its own row.
-    projects: Vec<PathBuf>,
-    cases: u32,
-    prove_budget: u32,
-    json: bool,
-}
-
-fn prove(args: ProveArgs) -> Result<()> {
-    let plan = ply_prove::ProvePlan {
-        cases: args.cases,
-        prove_budget: args.prove_budget,
-        ..ply_prove::ProvePlan::default()
-    }
-    .normalized();
-    let runs: Vec<ply_corpus::discharge::Discharged> = args
-        .projects
-        .iter()
-        .map(|p| ply_corpus::discharge::discharge(p, &plan))
-        .collect::<Result<_>>()?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&runs)?);
-    } else {
-        print!("{}", ply_corpus::discharge::render(&runs));
-    }
-    Ok(())
-}
-
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let ran = match argv.as_slice() {
@@ -104,7 +75,6 @@ fn run(plan: serde_json::Value) -> Result<()> {
     let args = plan["args"].clone();
     match command {
         "sim" => simulate(serde_json::from_value(args)?),
-        "prove" => prove(serde_json::from_value(args)?),
         other => anyhow::bail!("the executor runs no `{other}` command"),
     }
 }
