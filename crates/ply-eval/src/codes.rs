@@ -207,7 +207,7 @@ pub const CONFIG_UNDECLARED: &str = "W0607";
 pub const DRAIN_INCOMPLETE: &str = "W0608";
 /// A value was made to reach itself; cycles are not collected, so it leaks.
 pub const REFERENCE_CYCLE: &str = "W0610";
-/// Spans still open when an entry point ended, closed by teardown.
+/// Spans still open when their task or the entry point ended, reported when the entry point ends.
 pub const SPAN_ABANDONED: &str = "W0609";
 /// A definition no `pub` item, `main`, test or law reaches.
 pub const UNUSED_DEFINITION: &str = "W0611";

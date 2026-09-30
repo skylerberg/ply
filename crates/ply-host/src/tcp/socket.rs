@@ -1,7 +1,7 @@
 //! `net` over loopback TCP, plaintext or TLS.
 
 use super::{Handles, Net, Op, not_a_listener, not_a_stream, unknown_handle};
-use crate::pool::{Bell, Done, NET_FIRST_TOKEN, Pool};
+use crate::pool::{Bell, Done, Inbox, NET_FIRST_TOKEN, Pool};
 use crate::tls::{self, Credentials, Handshakes};
 use ply_eval::{Diagnostic, HostAnswer, HostRuntime, Pending, Resource, Span, Value};
 use rustls::pki_types::ServerName;
@@ -86,6 +86,8 @@ pub struct TcpHost {
     accepts: Arc<AtomicUsize>,
     /// Where the listeners phase 2 closed were bound.
     closed_at: Mutex<Vec<SocketAddr>>,
+    /// The tokens a machine parks on when this host is itself its runtime.
+    inbox: Arc<Inbox>,
 }
 
 impl Default for TcpHost {
@@ -111,6 +113,7 @@ impl TcpHost {
             stopping: Arc::new(AtomicBool::new(false)),
             accepts: Arc::new(AtomicUsize::new(0)),
             closed_at: Mutex::new(Vec::new()),
+            inbox: Arc::new(Inbox::default()),
         }
     }
 
@@ -132,6 +135,18 @@ impl TcpHost {
 
     pub fn owns(&self, pending: &Pending) -> bool {
         self.pool.owns(pending)
+    }
+
+    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
+        self.pool.watch(pending, inbox)
+    }
+
+    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        self.pool.collect(inbox)
+    }
+
+    pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
+        self.pool.poll(pending)
     }
 
     pub fn outstanding(&self) -> usize {
@@ -456,8 +471,12 @@ impl crate::signal::Accepting for TcpHost {
 }
 
 impl HostRuntime for TcpHost {
-    fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        self.pool.poll(pending)
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        self.pool.watch(pending, &self.inbox)
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        self.pool.collect(&self.inbox)
     }
 
     fn park(&self) -> Result<(), Diagnostic> {

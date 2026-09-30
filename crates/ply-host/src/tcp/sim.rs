@@ -259,8 +259,12 @@ impl Net for SimNet {
 
 /// Mints no token, so any token it is handed belongs to another facility.
 impl HostRuntime for SimNet {
-    fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
         Err(foreign_token(pending))
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
@@ -279,7 +283,7 @@ impl HostRuntime for SimNet {
 fn foreign_token(pending: &Pending) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("the simulated network was polled for `{pending}`, which it did not mint"),
+        format!("the simulated network was asked about `{pending}`, which it did not mint"),
     )
     .note("every simulated answer is a value; a pending token here means two host facilities were composed and the wrong one was asked")
 }

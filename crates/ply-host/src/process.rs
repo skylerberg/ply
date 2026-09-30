@@ -5,7 +5,7 @@ mod children;
 
 pub(crate) use children::{Children, Io, Output, Signal};
 
-use crate::pool::{Bell, Done, Exit, PROCESS_FIRST_TOKEN, Pool};
+use crate::pool::{Bell, Done, Exit, Inbox, PROCESS_FIRST_TOKEN, Pool};
 use children::{Child, Launch, Refusal, Unusable};
 use ply_eval::host::HostRegistry;
 use ply_eval::{
@@ -251,6 +251,14 @@ impl ProcessHost {
 
     pub fn owns(&self, pending: &Pending) -> bool {
         self.pool.owns(pending)
+    }
+
+    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
+        self.pool.watch(pending, inbox)
+    }
+
+    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        self.pool.collect(inbox)
     }
 
     pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
