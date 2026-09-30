@@ -82,12 +82,12 @@ impl Tables {
                 t.modules.push((module.clone(), info.source));
             }
         }
-        // Each root's span, which the emitter's own frame carries. The root name the frame holds is
-        // the name a site is reported under, so nothing here rebuilds one.
+        // Each root's span, which the emitter's own row carries. The root name the row holds is the
+        // name a site is reported under, so nothing here rebuilds one.
         t.spans = front
             .emitter_roots
             .iter()
-            .filter_map(|r| r.span.map(|span| (r.root.to_string(), span)))
+            .map(|r| (r.root.to_string(), r.span))
             .collect();
         t
     }

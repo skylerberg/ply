@@ -6,7 +6,7 @@
 // line and key of both reports, and the code each run exits with are decided here.
 
 import cmdline (Parsed, has, parse_nat, value, values_of)
-import proof.domain (Decl, Ty, finite, name_of, size)
+import proof.domain (Decl, Shape, Ty, finite, name_of, size)
 import proof.shrink (Offer, Reply)
 import machine
 import compiler.resolve (Diag, diag, diag1)
@@ -49,7 +49,7 @@ pub type Options = {
   config: machine::ConfigOpts,
   trace: machine::TraceOpts,
   prove: ProveOpts,
-  sim: SimOpts,
+  sim: machine::SimOpts,
 }
 
 pub type ProveOpts = {
@@ -58,15 +58,6 @@ pub type ProveOpts = {
   budget: Option<Int>,
   shrink_budget: Option<Int>,
   steps: Option<Int>,
-}
-
-pub type SimOpts = {
-  seed: Option<String>,
-  mode: String,
-  seeds: Option<Int>,
-  budget: Option<Int>,
-  steps: Option<Int>,
-  measure_reduction: Bool,
 }
 
 pub nondet effect prover {
@@ -88,6 +79,10 @@ pub nondet effect prover {
   // cases is made of, one case at a time. The index is the claim's place in the collection, as
   // `discharged` reads its wants, and the root is the seed a counterexample reports.
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
+  // What the static tier alone answers for each of these claims, by its place in the collection,
+  // whether or not anything discharged it this run: `None` for one it never sees, such as a law over
+  // interleavings. A measurement a run asks for, not a step of a discharge.
+  read reaches[claims](claims: List<Int>) -> Result<List<Option<Reach>>, Refusal>
   // A counterexample is not finished when it is found: the walk that makes it small is this side's,
   // and it drives it one question at a time. The runtime keeps the values — a program cannot hold a
   // value of a type it never named — and regenerates them from the draw it reports.
@@ -132,14 +127,7 @@ pub fn options_from(p: Parsed, root: String) -> Options = {
       shrink_budget: opt_nat(p, "shrink-budget"),
       steps: opt_nat(p, "prove-steps"),
     },
-    sim: {
-      seed: value(p, "seed"),
-      mode: match value(p, "sim") { Some(v) -> v, None -> "dpor" },
-      seeds: opt_nat(p, "seeds"),
-      budget: opt_nat(p, "sim-budget"),
-      steps: opt_nat(p, "sim-steps"),
-      measure_reduction: has(p, "measure-reduction"),
-    },
+    sim: machine::sim_options_from(p),
   }
 }
 
@@ -183,9 +171,9 @@ pub type Choice = {
   domains: List<Measured>,
 }
 
-// What this side measured about one obligation's binders. The sizes are in binder order; the name is
+// What this side measured about one obligation's binders: each binder's shape, in binder order, and
 // what an artifact calls the domain.
-pub type Measured = { claim: Int, sizes: List<Int>, name: String }
+pub type Measured = { claim: Int, shapes: List<Shape>, name: String }
 
 // One binder of one obligation: its name, the type as the runtime prints it, and the type itself.
 pub type Binder = { name: String, text: String, ty: Ty }
@@ -218,11 +206,21 @@ pub type Collection = {
 // What the runtime discharged, parallel to the claims the run asked for.
 pub type Discharged = { outcomes: List<Outcome>, duration_ms: Decimal, warnings: List<Diag> }
 
+// What the static tier alone answered for one obligation, and every place it left the decidable
+// fragment on the way: `kind` names the construct, and `about` the definition or reason it names.
+pub type Reach = {
+  decision: String,
+  steps: Int,
+  blockers: List<{ kind: String, about: Option<String> }>,
+}
+
 // A run of obligations as a report reads it: what became of each claim it asked for, where each
 // answer came from, and the accounting over them.
 pub type Verdicts = {
   // Parallel to the indices the run asked for.
   outcomes: List<Outcome>,
+  // What the static tier alone answers for each, when the run asked: parallel to `outcomes`.
+  reaches: Option<List<Option<Reach>>>,
   reasons: List<Reason>,
   coverage: Coverage,
   cached: Int,
@@ -235,7 +233,7 @@ pub type Verdicts = {
 pub type Accepted = { definitions: Int, stored: Bool, warnings: List<Diag> }
 
 // One claim and what became of it, which is what every row and every object is written from.
-pub type Row = { claim: Claim, outcome: Outcome, reason: Reason }
+pub type Row = { claim: Claim, outcome: Outcome, reason: Reason, reach: Option<Reach> }
 
 // --- Small things -----------------------------------------------------------
 
@@ -385,6 +383,10 @@ pub fn rows_of(claims: List<Claim>, wanted: List<Int>, v: Verdicts) -> List<Row>
             claim: c,
             outcome: o,
             reason: match list_at(v.reasons, i) { Some(r) -> r, None -> Fresh },
+            reach: match v.reaches {
+              Some(reached) -> match list_at(reached, i) { Some(r) -> r, None -> None },
+              None -> None,
+            },
           }),
       },
     })
@@ -482,6 +484,7 @@ pub fn decided(
       let names = map(c.defs, |x: Def| x.name);
       Ok({
         outcomes: d.outcomes,
+        reaches: None,
         reasons: selection.reasons,
         coverage: coverage(names, laws, claim_rows(c, wanted, d.outcomes)),
         cached: hits(selection),
@@ -628,32 +631,59 @@ fn outcome_members(o: Outcome) -> List<Member> =
 fn index_members(c: Claim) -> List<Member> =
   match c.kind { Ensures(index) -> [{ key: "index", value: num(index) }], Law(_) -> [] }
 
-pub fn obligation_json(r: Row, places: List<Place>) -> Json =
+// `reached` is whether the run asked the static tier about every claim, which is when a claim carries
+// what it answered.
+pub fn obligation_json(r: Row, places: List<Place>, reached: Bool) -> Json =
   object(
     also(
       also(
-        [
-          { key: "key", value: Str(r.claim.key) },
-          { key: "owner", value: Str(r.claim.owner) },
-          { key: "label", value: Str(label_of(r.claim)) },
-          { key: "kind", value: Str(kind_word(r.claim)) },
-          { key: "guarded", value: Bool(r.claim.guarded) },
-          { key: "frame", value: Str(frame_summary(r.claim.frame)) },
-          {
-            key: "location",
-            value: match located(places, r.claim.at) { Some(at) -> Str(at), None -> Null },
-          },
-          { key: "outcome", value: Str(outcome_word(r.outcome)) },
-          {
-            key: "tier",
-            value: match tier_of(r.outcome) { Some(t) -> Str(tier_word(t)), None -> Null },
-          },
-        ],
+        also(
+          [
+            { key: "key", value: Str(r.claim.key) },
+            { key: "owner", value: Str(r.claim.owner) },
+            { key: "label", value: Str(label_of(r.claim)) },
+            { key: "kind", value: Str(kind_word(r.claim)) },
+            { key: "guarded", value: Bool(r.claim.guarded) },
+            { key: "frame", value: Str(frame_summary(r.claim.frame)) },
+            {
+              key: "location",
+              value: match located(places, r.claim.at) { Some(at) -> Str(at), None -> Null },
+            },
+            { key: "outcome", value: Str(outcome_word(r.outcome)) },
+            {
+              key: "tier",
+              value: match tier_of(r.outcome) { Some(t) -> Str(tier_word(t)), None -> Null },
+            },
+          ],
+          if reached { [{ key: "reach", value: reach_json(r.reach) }] } else { [] },
+        ),
         index_members(r.claim),
       ),
       outcome_members(r.outcome),
     ),
   )
+
+// What the static tier alone answered: `null` for a claim it never sees, such as a law over
+// interleavings.
+fn reach_json(v: Option<Reach>) -> Json =
+  match v {
+    None -> Null,
+    Some(reach) ->
+      object([
+        { key: "decision", value: Str(reach.decision) },
+        { key: "steps", value: num(reach.steps) },
+        {
+          key: "blockers",
+          value: Array(
+            map(reach.blockers, |b: { kind: String, about: Option<String> }|
+              object([
+                { key: "kind", value: Str(b.kind) },
+                { key: "about", value: match b.about { Some(a) -> Str(a), None -> Null } },
+              ])),
+          ),
+        },
+      ]),
+  }
 
 pub fn coverage_json(cov: Coverage) -> Json =
   object([
@@ -936,6 +966,7 @@ test "a row is the tier, the claim and what it rests on, in fixed columns" {
     claim: a_claim("m.one", Ensures(0)),
     outcome: proved(Array([Str("congruence")]), 2),
     reason: Fresh,
+    reach: None,
   };
   assert_eq(
     row_head(plain(), r, [a_place()]),
@@ -948,6 +979,7 @@ test "a refuted claim is E0419 over the claim, and a gap is W0604 over the same 
     claim: a_claim("m.short", Law(Some("a batch is small"))),
     outcome: Refuted(a_counter()),
     reason: Fresh,
+    reach: None,
   };
   let ds = diagnostics_of([refuted]);
   assert_eq(len(ds), 1);
@@ -964,6 +996,7 @@ test "a refuted claim is E0419 over the claim, and a gap is W0604 over the same 
     claim: a_claim("m.stored", Ensures(0)),
     outcome: Unattempted(UnhandledEffect(Some("{db.read[rows]}"))),
     reason: Fresh,
+    reach: None,
   };
   let warnings = diagnostics_of([gap]);
   let w: Diag = match list_at(warnings, 0) { Some(x) -> x, None -> panic("one diagnostic") };
@@ -980,6 +1013,7 @@ test "a claim that holds raises nothing at all" {
     claim: a_claim("m.one", Ensures(0)),
     outcome: proved(Array([]), 1),
     reason: FromProof,
+    reach: None,
   };
   assert_eq(len(diagnostics_of([held])), 0)
 }
@@ -1028,14 +1062,7 @@ pub fn no_options() -> Options =
     config: machine::default_options().config,
     trace: machine::default_options().trace,
     prove: { cases: None, roots: None, budget: None, shrink_budget: None, steps: None },
-    sim: {
-      seed: None,
-      mode: "dpor",
-      seeds: None,
-      budget: None,
-      steps: None,
-      measure_reduction: false,
-    },
+    sim: machine::no_sim_options(),
   }
 
 // The domains this side measured for the obligations it will discharge: the binders' types are the
@@ -1066,7 +1093,7 @@ fn measured_one(typed: Typed, cs: List<Claim>, wanted: List<Int>, place: Int) ->
           [
             {
               claim: claim,
-              sizes: domain.sizes,
+              shapes: domain.shapes,
               name: name_of(map(entry.binders, |b: Binder| b.text)),
             },
           ],
