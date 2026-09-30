@@ -360,9 +360,14 @@ unsafe fn start(ctx: *mut Ctx, at: usize, closure: Word) -> usize {
     let stack = Stack::new();
     let sp = stack.prepare(task_entry, ctx as usize);
     let parent = sim.stack;
+    let entered_from = match sim.policy {
+        Policy::Host => sim.tasks[ROOT.0 as usize].frames,
+        Policy::Seeded => sim.stack,
+    };
     let inherited = std::mem::take(&mut sim.tasks[at].inherited);
     let frames = c.open_stack(Some(parent));
     c.stacks[frames].list = inherited;
+    c.stacks[frames].entered_from = Some(entered_from);
     let sim = c.sims.last_mut().expect("a region is running");
     let floor = stack.floor();
     sim.tasks[at] = TaskStack {
