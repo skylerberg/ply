@@ -1,39 +1,76 @@
 //! Definition bodies printed back to source: the third element of `Hash -> (Definition, Type,
 //! Footprint)`.
 
-use ply_codegen::c::producer::{PrintedName, print_bodies};
-use ply_span::{Diagnostic, Symbol, codes};
+use ply_codegen::c::producer::{self, PrintedName, print_bodies};
+use ply_eval::decode::At;
+use ply_span::{Diagnostic, Severity, SourceId, Symbol, codes};
 use ply_store::body::{BodySet, StoredBody};
 use ply_ty::{CheckOutput, DefHash, HashOutput};
-use ply_ty::{LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// `files[i]` is `(module name, text)` for `SourceId(i)`.
+/// `files[i]` is `(module name, text)` for `SourceId(i)`: the front end's answer, and every
+/// definition's scheme as the compiler prints it.
 #[track_caller]
-fn port_front(files: &[(&str, &str)]) -> ply_ty::Front {
+fn port_front(files: &[(&str, &str)]) -> (ply_ty::Front, BTreeMap<Symbol, String>) {
     // A printed program carries the toolchain's modules inline; re-fronting pulls them.
     let named: Vec<(String, String)> = files
         .iter()
         .filter(|(name, _)| ply_std::source(name).is_none())
         .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
         .collect();
-    ply_codegen::c::producer::checked_front_with_std(&named)
-        .unwrap_or_else(|e| panic!("the program must typecheck: {e:#}"))
-        .front
+    let shipped: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    producer::ensure_default();
+    let pulled = producer::front_pulling_std(&named, &shipped)
+        .unwrap_or_else(|e| panic!("the front end answers: {e:#}"));
+    let ids: Vec<SourceId> = (0..named.len() + pulled.modules.len())
+        .map(|i| SourceId(i as u32))
+        .collect();
+    let front = ply_codegen::c::dump::read(&pulled.dump, &ids).unwrap_or_else(|e| panic!("{e}"));
+    let errors: Vec<&str> = front
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(errors.is_empty(), "the program must typecheck: {errors:?}");
+    let schemes = At::new("the front end's answer", &pulled.dump)
+        .field("defs")
+        .and_then(|defs| {
+            defs.items(|def| {
+                let text = producer::call(
+                    "tycore.scheme_text",
+                    &[def.field("scheme")?.value().clone()],
+                )
+                .unwrap_or_else(|e| panic!("the compiler prints a scheme: {e:#}"));
+                Ok((
+                    Symbol::new(def.field("name")?.utf8()?),
+                    At::new("a printed scheme", &text).utf8()?.to_string(),
+                ))
+            })
+        })
+        .unwrap_or_else(|e| panic!("{e}"))
+        .into_iter()
+        .collect();
+    (front, schemes)
 }
 
 struct Checked {
     hashes: HashOutput,
     check: CheckOutput,
     bodies: BodySet,
+    /// Each definition's type, as the compiler prints it.
+    schemes: BTreeMap<Symbol, String>,
 }
 
 fn compile(files: &[(&str, &str)]) -> Checked {
-    let front = port_front(files);
+    let (front, schemes) = port_front(files);
     Checked {
         bodies: ply_store::body::of_front(&front),
         hashes: front.hashes,
         check: front.check,
+        schemes,
     }
 }
 
@@ -89,98 +126,6 @@ fn print(
     print_bodies(&bytes, &names, &tests, &[], shipped)
 }
 
-/// Quantified variables renumbered from zero in traversal order.
-fn canonical(scheme: &Scheme) -> Scheme {
-    let mut tys: BTreeMap<TyVar, TyVar> = BTreeMap::new();
-    let mut rows: BTreeMap<RowVar, RowVar> = BTreeMap::new();
-    // Labels first, in the head's order: an atom sorts by the number its label holds.
-    let mut labels: BTreeMap<LabelVar, LabelVar> = BTreeMap::new();
-    for v in &scheme.label_vars {
-        let next = LabelVar(labels.len() as u32);
-        labels.entry(*v).or_insert(next);
-    }
-    let ty = renumber(&scheme.ty, &mut tys, &mut rows, &mut labels);
-    Scheme {
-        ty_vars: scheme
-            .ty_vars
-            .iter()
-            .filter_map(|v| tys.get(v))
-            .copied()
-            .collect(),
-        row_vars: scheme
-            .row_vars
-            .iter()
-            .filter_map(|v| rows.get(v))
-            .copied()
-            .collect(),
-        label_vars: scheme
-            .label_vars
-            .iter()
-            .filter_map(|v| labels.get(v))
-            .copied()
-            .collect(),
-        ty,
-    }
-}
-
-fn renumber(
-    ty: &Type,
-    tys: &mut BTreeMap<TyVar, TyVar>,
-    rows: &mut BTreeMap<RowVar, RowVar>,
-    labels: &mut BTreeMap<LabelVar, LabelVar>,
-) -> Type {
-    match ty {
-        Type::Var(v) => {
-            let next = TyVar(tys.len() as u32);
-            Type::Var(*tys.entry(*v).or_insert(next))
-        }
-        Type::Con(name, args) => Type::Con(
-            name.clone(),
-            args.iter()
-                .map(|a| renumber(a, tys, rows, labels))
-                .collect(),
-        ),
-        Type::Fn {
-            params,
-            ret,
-            effects,
-        } => {
-            let params = params
-                .iter()
-                .map(|p| renumber(p, tys, rows, labels))
-                .collect();
-            let ret = Box::new(renumber(ret, tys, rows, labels));
-            let tail = effects.tail.map(|t| {
-                let next = RowVar(rows.len() as u32);
-                *rows.entry(t).or_insert(next)
-            });
-            let atoms = effects
-                .atoms
-                .iter()
-                .map(|atom| {
-                    let mut out = atom.clone();
-                    if let Resource::Var(v) = atom.resource {
-                        let next = LabelVar(labels.len() as u32);
-                        out.resource = Resource::Var(*labels.entry(v).or_insert(next));
-                    }
-                    out
-                })
-                .collect();
-            Type::Fn {
-                params,
-                ret,
-                effects: Row { atoms, tail },
-            }
-        }
-        Type::Record(fields) => Type::Record(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), renumber(v, tys, rows, labels)))
-                .collect(),
-        ),
-    }
-}
-
 #[track_caller]
 fn round_trip(files: &[(&str, &str)]) -> (Checked, Vec<(String, String)>) {
     let original = compile(files);
@@ -219,8 +164,7 @@ fn round_trip(files: &[(&str, &str)]) -> (Checked, Vec<(String, String)>) {
     for (name, info) in &original.check.defs {
         let after = &again.check.defs[name];
         assert_eq!(
-            canonical(&info.scheme),
-            canonical(&after.scheme),
+            original.schemes[name], again.schemes[name],
             "`{name}` came back with a different type"
         );
         assert_eq!(
