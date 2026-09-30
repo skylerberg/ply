@@ -23,7 +23,11 @@ pub fn size(value: &Value, world: &World) -> u64 {
     while let Some(v) = pending.pop() {
         let here = match v {
             Value::Int(n) => int_size(*n),
-            Value::Fixed(f) => int_size(f.value().clamp(i64::MIN as i128, i64::MAX as i128) as i64),
+            Value::Fixed(f) => int_size(
+                f.to_i128()
+                    .unwrap_or(i128::MAX)
+                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+            ),
             Value::Bool(b) => u64::from(*b),
             Value::Unit => 0,
             Value::Float(f) => float_size(*f),

@@ -18,7 +18,7 @@ import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, E
               MatchArm, RecField, Stmt, SLet, SLetElse, SExpr)
 import types (MWrite, TypeExpr, TVar, TCon, TRecord)
 import rewrite (expand)
-import patterns (Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
+import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
 
 // `KBoxed` is a tagged word; `KInt` is the untagged 64 bits inside one.
 pub type Kind =
@@ -51,11 +51,15 @@ fn width_named(name: Bytes) -> Option<Width> =
   else if name == b"I16" { Some({ bits: 16, signed: true }) }
   else if name == b"I32" { Some({ bits: 32, signed: true }) }
   else if name == b"I64" { Some({ bits: 64, signed: true }) }
+  else if name == b"U128" { Some({ bits: 128, signed: false }) }
+  else if name == b"I128" { Some({ bits: 128, signed: true }) }
   else { None }
 
 fn width_index(w: Width) -> Int =
-  (if w.signed { 4 } else { 0 })
-    + (if w.bits == 8 { 0 } else if w.bits == 16 { 1 } else if w.bits == 32 { 2 } else { 3 })
+  if w.bits == 128 { if w.signed { 9 } else { 8 } } else {
+    (if w.signed { 4 } else { 0 })
+      + (if w.bits == 8 { 0 } else if w.bits == 16 { 1 } else if w.bits == 32 { 2 } else { 3 })
+  }
 
 fn carried(w: Width) -> Bool = w.bits < 64
 
@@ -2533,6 +2537,81 @@ fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span
 fn is_wrap(name: Bytes) -> Bool =
   name == b"wrap_add" || name == b"wrap_sub" || name == b"wrap_mul" || name == b"rotr"
 
+fn is_checked(name: Bytes) -> Bool =
+  name == b"checked_add" || name == b"checked_sub" || name == b"checked_mul"
+    || name == b"checked_neg"
+
+// Exact in 64 bits, then tested against the width; only an unsigned 32-bit product needs the unsigned word.
+fn checked_num(em: Em, name: Bytes, vals: List<V>, t: Width) -> Option<Out> =
+  match tag_of(em, b"Some") {
+    None -> None,
+    Some(some) -> match tag_of(em, b"None") {
+      None -> None,
+      Some(none) -> match list_at(vals, 0) {
+        None -> None,
+        Some(v0) -> {
+          let wide = if !t.signed && name == b"checked_mul" { b"uint64_t" } else { b"int64_t" };
+          let a = bytes_concat_all([b"(", wide, b")(", as_num(v0, t), b")"]);
+          let exact = if name == b"checked_neg" { Some(bytes_concat(b"-", a)) } else {
+            match list_at(vals, 1) {
+              None -> None,
+              Some(v1) -> {
+                let b = bytes_concat_all([b"(", wide, b")(", as_num(v1, t), b")"]);
+                let op = if name == b"checked_add" { b" + " }
+                else if name == b"checked_sub" { b" - " }
+                else { b" * " };
+                Some(bytes_concat_all([a, op, b]))
+              },
+            }
+          };
+          match exact {
+            None -> None,
+            Some(x) -> {
+              let r = fresh(em);
+              let computed = line(r.em, bytes_concat_all([wide, b" ", r.name, b" = ", x, b";"]));
+              let ans = fresh(computed);
+              let declared = line(
+                ans.em,
+                bytes_concat_all([b"Word ", ans.name, b" = rt_nullary_p(ctx, ", num(none), b");"]),
+              );
+              let fits = if wide == b"uint64_t" {
+                bytes_concat_all([r.name, b" <= (uint64_t)", int_lit(width_max(t))])
+              } else {
+                bytes_concat_all([
+                  r.name,
+                  b" >= ",
+                  int_lit(width_min(t)),
+                  b" && ",
+                  r.name,
+                  b" <= ",
+                  int_lit(width_max(t)),
+                ])
+              };
+              let made = line(
+                declared,
+                bytes_concat_all([
+                  b"if (",
+                  fits,
+                  b") { Word w[] = { ply_imm((int64_t)",
+                  r.name,
+                  b") }; ",
+                  ans.name,
+                  b" = rt_ctor_p(ctx, ",
+                  num(some),
+                  b", (Word)(intptr_t)w, 1); }",
+                ]),
+              );
+              Some({
+                em: note_holder(check(made), ans.name),
+                v: { k: KBoxed, c: ans.name, ty: TyOpen },
+              })
+            },
+          }
+        },
+      },
+    },
+  }
+
 fn of_int_width(name: Bytes) -> Option<Width> =
   if name == b"u8_of_int" { width_named(b"U8") }
   else if name == b"u16_of_int" { width_named(b"U16") }
@@ -2542,6 +2621,8 @@ fn of_int_width(name: Bytes) -> Option<Width> =
   else if name == b"i16_of_int" { width_named(b"I16") }
   else if name == b"i32_of_int" { width_named(b"I32") }
   else if name == b"i64_of_int" { width_named(b"I64") }
+  else if name == b"u128_of_int" { width_named(b"U128") }
+  else if name == b"i128_of_int" { width_named(b"I128") }
   else { None }
 
 fn int_of_width(name: Bytes) -> Option<Width> =
@@ -2553,6 +2634,8 @@ fn int_of_width(name: Bytes) -> Option<Width> =
   else if name == b"int_of_i16" { width_named(b"I16") }
   else if name == b"int_of_i32" { width_named(b"I32") }
   else if name == b"int_of_i64" { width_named(b"I64") }
+  else if name == b"int_of_u128" { width_named(b"U128") }
+  else if name == b"int_of_i128" { width_named(b"I128") }
   else { None }
 
 // Wrapping arithmetic and conversions over a carried width, in place; otherwise the runtime's call on the evaluated values.
@@ -2564,6 +2647,7 @@ fn width_builtin(
   span: Span,
 ) -> Option<Out> =
   if !((is_wrap(name) && len(args) == 2)
+      || (is_checked(name) && len(args) == (if name == b"checked_neg" { 1 } else { 2 }))
       || ((of_int_width(name) != None || int_of_width(name) != None) && len(args) == 1)) { None }
   else {
     match args_evaled(em, args, params, 0, []) {
@@ -2572,7 +2656,12 @@ fn width_builtin(
         None -> None,
         Some(v0) -> {
           let e = { em: site(e0.em, span), vals: e0.vals };
-          if is_wrap(name) {
+          if is_checked(name) {
+            match v0.k {
+              KNum(t) -> checked_num(e.em, name, e.vals, t),
+              _ -> Some(builtin_call(e.em, name, e.vals)),
+            }
+          } else if is_wrap(name) {
             match v0.k {
               KNum(t) -> match list_at(e.vals, 1) {
                 None -> None,
@@ -3655,7 +3744,8 @@ fn binary_code(op: Bytes) -> Int =
   else if op == b"bitor" { 13 }
   else if op == b"bitxor" { 14 }
   else if op == b"shl" { 15 }
-  else { 16 }
+  else if op == b"shr" { 16 }
+  else { 17 }
 
 fn is_add_or_sub(op: Bytes) -> Bool = op == b"add" || op == b"sub"
 
@@ -3694,7 +3784,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       // A literal the tag cannot hold is read from the unit's constant table; the helper can raise.
       LStr(_) -> Some(from_table(em, l)),
       LBytes(_) -> Some(from_table(em, l)),
-      // Below 64 bits a literal is its C type's own; at 64 bits it comes from the constant table.
+      // Below 64 bits a literal is its C type's own; wider, it is an opaque word from the constant table, as a parameter of its type is.
       LFixed(name, bits) -> match width_named(name) {
         None -> Some(refused(em, b"a fixed-width literal of no known width")),
         Some(w) -> if carried(w) {
@@ -3706,8 +3796,9 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
               ty: TyOpen,
             },
           })
-        } else { Some(from_table(em, l)) },
+        } else { Some(opaque_from_table(em, l)) },
       },
+      LWide(_, _, _) -> Some(opaque_from_table(em, l)),
       LUnit -> Some(from_table(em, l)),
       // A `Float` or `Decimal` is an opaque runtime constant; every operator over it goes through the runtime.
       LFloat(_) -> Some(opaque_from_table(em, l)),
@@ -3914,7 +4005,16 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                 bytes_concat_all([b"(", ctype(KNum(w)), b") ~(", as_num(o.v, w), b")"]),
               ),
             ),
-          _ -> Some(bind(o.em, KInt, bytes_concat_all([b"~(", as_int(o.v), b")"]))),
+          _ -> if o.v.ty == TyOpaque {
+            let held = owned(o.em, o.v);
+            let out = bind_keeping(
+              held.em,
+              KBoxed,
+              TyOpaque,
+              bytes_concat_all([b"rt_bitnot_p(ctx, ", held.v.c, b")"]),
+            );
+            Some({ em: check(out.em), v: out.v })
+          } else { Some(bind(o.em, KInt, bytes_concat_all([b"~(", as_int(o.v), b")"]))) },
         }
       } else { None },
     },
@@ -6076,12 +6176,10 @@ fn binary_rest(em: Em, op: Bytes, l: V, r: V) -> Option<Out> = {
           bind(check(e.em), KBool, if op == b"ne" { bytes_concat_all([b"!(", e.v.c, b")"]) }
           else { e.v.c }),
         )
-      } else if is_shift(op) && (l.ty == TyOpaque || r.ty == TyOpaque) {
-        Some(refused(em, b"`a shift` over a value whose type the fragment does not fix"))
       } else if (l.k == KBoxed && r.k == KBoxed && (is_arith(op) || compare_op(op) != None))
-          || (is_bitop(op) && (l.ty == TyOpaque || r.ty == TyOpaque)) {
+          || ((is_bitop(op) || is_shift(op)) && (l.ty == TyOpaque || r.ty == TyOpaque)) {
         {
-          // A `Float`/`Decimal` operand, or two words that may both be `Decimal`s: the runtime's own operator. One operand in a register means both are checked `Int`s.
+          // An opaque operand (a `Float`, a `Decimal` or a width past 32 bits), or two words that may both be `Decimal`s: the runtime's own operator. One operand in a register means both are checked `Int`s.
           let lo = owned(em, l);
           let ro = owned(lo.em, r);
           // A comparison answers `Bool`, an opaque left operand answers opaque, and otherwise the right's type.
@@ -6463,7 +6561,7 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
       else if (c.name.name.name == b"Float" || c.name.name.name == b"Decimal") && len(c.args) == 0 {
         Some({ k: KBoxed, ty: TyOpaque })
       }
-      // A width below 64 bits is carried in a register; the 64-bit widths are opaque words.
+      // A width below 64 bits is carried in a register; the wider ones are opaque words.
       else if len(c.args) == 0 && width_named(c.name.name.name) != None {
         match width_named(c.name.name.name) {
           Some(w) -> if carried(w) { Some({ k: KNum(w), ty: TyOpen }) }
@@ -6855,6 +6953,7 @@ pub type Const =
   | ConstStr(Bytes)
   | ConstBytes(Bytes)
   | ConstFixed({ width: Int, bits: Int })
+  | ConstWide({ width: Int, high: Int, low: Int })
   | ConstFloat(Bytes)
   | ConstDecimal(Bytes)
   | ConstUnit
@@ -6897,6 +6996,10 @@ fn const_of_lit(l: Lit) -> Const =
     LBytes(x) -> ConstBytes(x),
     LFixed(name, bits) -> match width_named(name) {
       Some(w) -> ConstFixed({ width: width_index(w), bits: bits }),
+      None -> ConstUnit,
+    },
+    LWide(name, high, low) -> match width_named(name) {
+      Some(w) -> ConstWide({ width: width_index(w), high: high, low: low }),
       None -> ConstUnit,
     },
     LFloat(x) -> ConstFloat(unspaced(x)),
