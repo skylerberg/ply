@@ -59,6 +59,15 @@ const TOTAL_BUILTINS: &[&str] = &[
     "wrap_sub",
     "wrap_mul",
     "rotr32",
+    "checked_add",
+    "checked_sub",
+    "checked_mul",
+    "checked_neg",
+    "i128_of_int",
+    "u128_to_string",
+    "i128_to_string",
+    "u128_of_string",
+    "i128_of_string",
 ];
 
 /// Where lowering left the decidable fragment.

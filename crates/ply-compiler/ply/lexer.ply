@@ -31,6 +31,8 @@ pub type Tok =
   | TInt(Int)
   // The width's name and the value normalized to that width.
   | TFixed(Bytes, Int)
+  // A 128-bit literal: the width's name, then its high and low 64 bits as `Int` patterns.
+  | TWide(Bytes, Int, Int)
   | TFloat(Bytes)
   | TDec(Bytes, Int)
   | TStr(Bytes)
@@ -242,7 +244,11 @@ fn hex_literal(src: Bytes, s: Scan, start: Int) -> Scan = {
   }
 }
 
-fn hex_fixed(s: Scan, start: Int, fin: Int, digits: Bytes, w: Width) -> Scan = {
+fn hex_fixed(s: Scan, start: Int, fin: Int, digits: Bytes, w: Width) -> Scan =
+  if w.bits == 128 { hex_wide(s, start, fin, digits, w) }
+  else { hex_narrow(s, start, fin, digits, w) }
+
+fn hex_narrow(s: Scan, start: Int, fin: Int, digits: Bytes, w: Width) -> Scan = {
   let d = strip_zeros(digits);
   if bytes_len(d) > 16 || (w.bits < 64 && bytes_len(d) * 4 > w.bits && hex_over(d, w)) {
     emit(
@@ -259,6 +265,39 @@ fn hex_fixed(s: Scan, start: Int, fin: Int, digits: Bytes, w: Width) -> Scan = {
       TFixed(width_upper(w), 0),
     )
   } else { emit(s, start, fin, TFixed(width_upper(w), width_normalize(w, hex_of_digits(d)))) }
+}
+
+// Thirty-two digits at most, the high sixteen and the low sixteen each one `Int` pattern.
+fn hex_wide(s: Scan, start: Int, fin: Int, digits: Bytes, w: Width) -> Scan = {
+  let d = strip_zeros(digits);
+  let n = bytes_len(d);
+  if n > 32 {
+    emit(
+      err(
+        s,
+        start,
+        fin,
+        out_of_range(),
+        bytes_concat_all([b"`0x", digits, b"` does not fit in `", width_upper(w), b"`"]),
+        bytes_concat_all([b"a `", width_upper(w), b"` is 128 bits"]),
+      ),
+      start,
+      fin,
+      TWide(width_upper(w), 0, 0),
+    )
+  } else {
+    let split = if n > 16 { n - 16 } else { 0 };
+    emit(
+      s,
+      start,
+      fin,
+      TWide(
+        width_upper(w),
+        hex_of_digits(bytes_slice(d, 0, split)),
+        hex_of_digits(bytes_slice(d, split, n)),
+      ),
+    )
+  }
 }
 
 // Decided on the digit string so no `Int` has to hold the pattern.
@@ -314,7 +353,10 @@ fn number_tail(src: Bytes, s: Scan, m: Num) -> Scan =
   } else { number_value(s, m, m.cur) }
 
 // A decimal spelling is a value, so its bound is the type's range.
-fn fixed_value(s: Scan, m: Num, fin: Int, w: Width) -> Scan = {
+fn fixed_value(s: Scan, m: Num, fin: Int, w: Width) -> Scan =
+  if w.bits == 128 { wide_value(s, m, fin, w) } else { narrow_value(s, m, fin, w) }
+
+fn narrow_value(s: Scan, m: Num, fin: Int, w: Width) -> Scan = {
   let d = strip_zeros(m.whole);
   let k = bytes_len(d);
   let too_long = k > 19 || (k == 19 && compare(d, int_max()) == Greater);
@@ -335,12 +377,86 @@ fn fixed_value(s: Scan, m: Num, fin: Int, w: Width) -> Scan = {
   } else { emit(s, m.start, fin, TFixed(width_upper(w), width_normalize(w, int_of_digits(d)))) }
 }
 
+// Read into four 32-bit limbs, so no `Int` overflows on the way; a signed width keeps its top bit clear.
+fn wide_value(s: Scan, m: Num, fin: Int, w: Width) -> Scan =
+  match limbs_of_digits(strip_zeros(m.whole)) {
+    Some(ls) -> if w.signed && limb(ls, 3) >= two_to(31) { wide_out_of_range(s, m, fin, w) } else {
+      emit(
+        s,
+        m.start,
+        fin,
+        TWide(width_upper(w), limb(ls, 3) << 32 | limb(ls, 2), limb(ls, 1) << 32 | limb(ls, 0)),
+      )
+    },
+    None -> wide_out_of_range(s, m, fin, w),
+  }
+
+fn wide_out_of_range(s: Scan, m: Num, fin: Int, w: Width) -> Scan =
+  emit(
+    err(
+      s,
+      m.start,
+      fin,
+      out_of_range(),
+      bytes_concat_all([b"`", m.whole, b"` is not a value of `", width_upper(w), b"`"]),
+      bytes_concat_all([b"`", width_upper(w), b"` holds ", width_range(w)]),
+    ),
+    m.start,
+    fin,
+    TWide(width_upper(w), 0, 0),
+  )
+
+// Least significant first; `None` once the value passes 128 bits.
+fn limbs_of_digits(d: Bytes) -> Option<List<Int>> =
+  fold(range(0, bytes_len(d)), Some([0, 0, 0, 0]), |acc: Option<List<Int>>, i: Int|
+    match acc { None -> None, Some(ls) -> times_ten_plus(ls, bytes_at(d, i) - 48) })
+
+fn times_ten_plus(ls: List<Int>, digit: Int) -> Option<List<Int>> = {
+  let step = fold(ls, { carry: digit, out: [] }, |acc: { carry: Int, out: List<Int> }, l: Int| {
+    let v = l * 10 + acc.carry;
+    { carry: v >>> 32, out: push(acc.out, v & 0xFFFF_FFFF) }
+  });
+  if step.carry == 0 { Some(step.out) } else { None }
+}
+
+fn limb(ls: List<Int>, i: Int) -> Int = match list_at(ls, i) { Some(l) -> l, None -> 0 }
+
+// The decimal spelling of a 128-bit value given as its high and low 64-bit patterns.
+pub fn wide_decimal(signed: Bool, high: Int, low: Int) -> Bytes =
+  if signed && high < 0 {
+    bytes_concat(
+      b"-",
+      limbs_decimal(
+        high_first(if low == 0 { wrap_sub(0, high) } else { ~high }, wrap_sub(0, low)),
+        b"",
+      ),
+    )
+  } else { limbs_decimal(high_first(high, low), b"") }
+
+fn high_first(high: Int, low: Int) -> List<Int> =
+  [high >>> 32, high & 0xFFFF_FFFF, low >>> 32, low & 0xFFFF_FFFF]
+
+// Divides by ten down the limbs, most significant first, until the quotient is zero.
+fn limbs_decimal(ls: List<Int>, acc: Bytes) -> Bytes = {
+  let step = fold(ls, { rem: 0, out: [] }, |a: { rem: Int, out: List<Int> }, l: Int| {
+    let cur = a.rem << 32 | l;
+    { rem: cur % 10, out: push(a.out, cur / 10) }
+  });
+  let digits = bytes_concat(num(step.rem), acc);
+  if fold(step.out, true, |z: Bool, l: Int| z && l == 0) { digits }
+  else { limbs_decimal(step.out, digits) }
+}
+
 // At 64 bits the caller's `int_max` check is the only bound.
 fn over_width(d: Bytes, w: Width) -> Bool =
   if w.bits == 64 { false } else { int_of_digits(d) > width_max(w) }
 
 fn width_range(w: Width) -> Bytes =
-  if w.bits == 64 {
+  if w.bits == 128 {
+    if w.signed {
+      b"-170141183460469231731687303715884105728 to 170141183460469231731687303715884105727"
+    } else { b"0 to 340282366920938463463374607431768211455" }
+  } else if w.bits == 64 {
     if w.signed { b"-9223372036854775808 to 9223372036854775807" }
     else { b"0 to 18446744073709551615" }
   } else if w.signed {
@@ -407,6 +523,9 @@ pub fn widths() -> List<Width> =
     { name: b"i16", bits: 16, signed: true },
     { name: b"i32", bits: 32, signed: true },
     { name: b"i64", bits: 64, signed: true },
+    // Last, so every narrower width keeps the number a hash and the runtime know it by.
+    { name: b"u128", bits: 128, signed: false },
+    { name: b"i128", bits: 128, signed: true },
   ]
 
 pub fn width_named(suffix: Bytes) -> Option<Width> =
@@ -424,7 +543,7 @@ fn width_max(w: Width) -> Int = if w.signed { two_to(w.bits - 1) - 1 } else { tw
 
 // The low `bits` kept, sign-extended when the width is signed.
 pub fn width_normalize(w: Width, v: Int) -> Int =
-  if w.bits == 64 { v } else {
+  if w.bits >= 64 { v } else {
     let low = v & two_to(w.bits) - 1;
     if w.signed && low >>> w.bits - 1 == 1 { low | 0 - two_to(w.bits) } else { low }
   }
@@ -736,6 +855,7 @@ fn body(t: Tok) -> Bytes =
     TIdent(b) -> bytes_concat(b"i:", b),
     TInt(v) -> bytes_concat(b"n:", num(v)),
     TFixed(ty, v) -> bytes_concat_all([b"w:", ty, b":", num(v)]),
+    TWide(ty, high, low) -> bytes_concat_all([b"W:", ty, b":", num(high), b":", num(low)]),
     TFloat(txt) -> bytes_concat(b"f:", txt),
     TDec(m, sc) -> bytes_concat_all([b"d:", m, b":", num(sc)]),
     TStr(b) -> bytes_concat(b"s:", hex(b)),
@@ -828,6 +948,45 @@ test "the bit operators are tokens, and a byte nothing claims is reported and sk
 test "a hex literal is an Int bounded as a 64-bit pattern" {
   assert_eq(dump(b"0x10 0xff"), "0:4:n:16;5:9:n:255;9:9:e;");
   assert_eq(dump(b"0xFFFF_FFFF_FFFF_FFFF"), "0:21:n:-1;21:21:e;")
+}
+
+test "a 128-bit literal is carried as its high and low 64-bit patterns" {
+  assert_eq(dump(b"1u128"), "0:5:W:U128:0:1;5:5:e;");
+  assert_eq(dump(b"18446744073709551616u128"), "0:24:W:U128:1:0;24:24:e;");
+  assert_eq(dump(b"340282366920938463463374607431768211455u128"), "0:43:W:U128:-1:-1;43:43:e;");
+  assert_eq(
+    dump(b"170141183460469231731687303715884105727i128"),
+    "0:43:W:I128:9223372036854775807:-1;43:43:e;",
+  );
+  assert_eq(dump(b"0x1_0000_0000_0000_0000u128"), "0:27:W:U128:1:0;27:27:e;");
+  assert_eq(dump(b"0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFi128"), "0:38:W:I128:-1:-1;38:38:e;")
+}
+
+test "a 128-bit value spells in decimal from its two halves" {
+  assert_eq(wide_decimal(false, 0, 0), b"0");
+  assert_eq(wide_decimal(false, 1, 0), b"18446744073709551616");
+  assert_eq(wide_decimal(false, -1, -1), b"340282366920938463463374607431768211455");
+  assert_eq(wide_decimal(true, -1, -1), b"-1");
+  assert_eq(
+    wide_decimal(true, 0 - 9223372036854775807 - 1, 0),
+    b"-170141183460469231731687303715884105728",
+  );
+  assert_eq(wide_decimal(true, 9223372036854775807, -1), b"170141183460469231731687303715884105727")
+}
+
+test "a 128-bit literal past its width is a diagnostic and a zero" {
+  assert_eq(
+    dump(b"340282366920938463463374607431768211456u128"),
+    "0:43:W:U128:0:0;43:43:e;0:43:!:E0211;",
+  );
+  assert_eq(
+    dump(b"170141183460469231731687303715884105728i128"),
+    "0:43:W:I128:0:0;43:43:e;0:43:!:E0211;",
+  );
+  assert_eq(
+    dump(b"0x1FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFu128"),
+    "0:39:W:U128:0:0;39:39:e;0:39:!:E0211;",
+  )
 }
 
 test "a comment runs to the end of its line" {
