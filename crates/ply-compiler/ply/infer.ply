@@ -1385,10 +1385,7 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
       None -> {
         let g: WithName = global(cx1, NType, name);
         match g.name {
-          None -> if is_bare(name) {
-            if len(args) == 0 && g.cx.auto_ty_params { type_param(g.cx, name.name) }
-            else { new_ty(unknown_type(g.cx, name)) }
-          } else { new_ty(g.cx) },
+          None -> if is_bare(name) { new_ty(unknown_type(g.cx, name)) } else { new_ty(g.cx) },
           Some(qualified) -> match map_get(g.cx.types, qualified) {
             None -> new_ty(g.cx),
             Some(decl) -> if len(converted.ts) != len(decl.params) {
@@ -1854,10 +1851,10 @@ fn collect_effects(cx: Cx, m: Mod) -> Cx =
                       ops: acc.ops,
                     }
                   } else {
-                    let c1: Cx = { ..acc.cx, ty_params: map_new(), auto_ty_params: true };
+                    let c1: Cx = bind_ty_params({ ..acc.cx, ty_params: map_new() }, op.ty_params);
                     let ps: WithTys = conv_types(c1, op.params);
                     let r: WithTy = conv_type(ps.cx, op.ret);
-                    let c2: Cx = { ..r.cx, auto_ty_params: false, ty_params: map_new() };
+                    let c2: Cx = { ..r.cx, ty_params: map_new() };
                     let c3: Cx = fold(range(0, len(ps.ts)), c2, |cc: Cx, i: Int|
                       reject_declared_brand(
                         cc,
@@ -2073,6 +2070,17 @@ fn check_where(cx: Cx, def: FnDef) -> Cx =
       )
     })
 
+// A signature's type parameters: only these names are type variables in it, each rigid.
+fn bind_ty_params(cx: Cx, names: List<Ident>) -> Cx =
+  fold(names, cx, |c: Cx, p: Ident| {
+    let o: WithVar = new_ty_var(c);
+    {
+      ..o.cx,
+      subst: mark_rigid_ty(o.cx.subst, o.v),
+      ty_params: map_insert(o.cx.ty_params, p.name, TyVar(o.v)),
+    }
+  })
+
 // `shared` holds the label and row variables the recursive group is checked with: a member's
 // binders take them in order, so a call inside the group passes the caller's along.
 fn signature_sharing(cx0: Cx, def: FnDef, shared: Shared) -> { cx: Cx, sig: Sig } = {
@@ -2083,14 +2091,7 @@ fn signature_sharing(cx0: Cx, def: FnDef, shared: Shared) -> { cx: Cx, sig: Sig 
     row_params: map_new(),
     label_params: map_new(),
   };
-  let tys: Cx = fold(def.generics.types, cx, |c: Cx, p: Ident| {
-    let o: WithVar = new_ty_var(c);
-    {
-      ..o.cx,
-      subst: mark_rigid_ty(o.cx.subst, o.v),
-      ty_params: map_insert(o.cx.ty_params, p.name, TyVar(o.v)),
-    }
-  });
+  let tys: Cx = bind_ty_params(cx, def.generics.types);
   let rows: Cx = fold(range(0, len(def.generics.effects)), tys, |c: Cx, i: Int| {
     let p: Ident = at(def.generics.effects, i);
     match list_at(shared.rows, i) {
@@ -8142,6 +8143,60 @@ fn net_src(rest: Bytes) -> Bytes =
     b"effect net { write send[s](payload: Bytes) -> Unit\n write recv[s](max: Int) -> Bytes\n write close[s]() -> Unit\n read peek[s]() -> Int }\n",
     rest,
   )
+
+// Each diagnostic a one-module program draws: its code, its message, and whether its first label
+// spans the first place `src` writes `name`.
+fn refused_at(src: Bytes, name: Bytes) -> List<{ code: Bytes, message: Bytes, on_name: Bool }> = {
+  let start = match bytes_index_of(src, name) {
+    Some(i) -> i,
+    None -> panic("the source names what it is refused for"),
+  };
+  map(check_diags(src), |dg: Diag| {
+    let l: Label = at(dg.labels, 0);
+    {
+      code: dg.code,
+      message: dg.message,
+      on_name: l.start == start && l.end == start + bytes_len(name),
+    }
+  })
+}
+
+test "an operation naming a type nothing declares is refused at the name" {
+  let unknown = [{ code: b"E0102", message: b"unknown type `Frnt`", on_name: true }];
+  assert_eq(
+    refused_at(b"effect prover { write configure(front: Frnt) -> Unit }", b"Frnt"),
+    unknown,
+  );
+  assert_eq(refused_at(b"effect prover { read collected() -> Frnt }", b"Frnt"), unknown);
+  assert_eq(refused_at(b"effect prover { read collected() -> List<Frnt> }", b"Frnt"), unknown)
+}
+
+test "an unknown type in an operation is the error it is in a function's signature" {
+  let unlabelled = |ds: List<Diag>| map(ds, |dg: Diag| { ..dg, labels: [] });
+  assert_eq(
+    unlabelled(check_diags(b"effect e { write put(x: Frnt) -> Unit }")),
+    unlabelled(check_diags(b"fn put(x: Frnt) -> Unit = ()")),
+  )
+}
+
+test "an operation's type variables are the ones its own list declares" {
+  assert_eq(refused_at(b"effect box { read take[k]() -> elem }", b"elem"), [
+    { code: b"E0102", message: b"unknown type variable `elem`", on_name: true },
+  ]);
+  assert_eq(
+    check_codes(
+      b"effect box { read take[k]<elem>(xs: List<elem>) -> elem }\nfn first(xs: List<Int>) -> Int / {box.read[k]} = box.take[k](xs)\nfn named(xs: List<String>) -> String / {box.read[k]} = box.take[k](xs)",
+    ),
+    [],
+  )
+}
+
+test "a law binder naming a type nothing declares is refused, and a lowercase one is a variable" {
+  assert_eq(refused_at(b"law \"l\" forall (x: Acount) { true }", b"Acount"), [
+    { code: b"E0102", message: b"unknown type `Acount`", on_name: true },
+  ]);
+  assert_eq(check_codes(b"law \"l\" forall (x: a, y: List<a>) { true }"), [])
+}
 
 test "a handle must have a clause for every operation its body performs on an atom it handles" {
   assert_eq(
