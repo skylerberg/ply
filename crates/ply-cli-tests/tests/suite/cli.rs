@@ -2341,6 +2341,41 @@ fn the_search_plan_is_published_so_two_runs_can_be_compared() {
     assert_eq!(sim["budget"], 1);
 }
 
+/// A `random` search files a pass under each root it ran as well as under the whole plan, so a
+/// narrower plan whose every root already passed on its own is answered without searching again.
+const ONE_SPAWN: &str = "\
+test \"a sleeper costs no wall clock\" {
+  simulate {
+    let t = task.spawn(|| { clock.sleep(30000000000); clock.now() });
+    assert_eq(task.join(t), 30000000000)
+  }
+}
+";
+
+#[test]
+fn a_seeded_test_whose_every_root_passed_alone_is_cached_under_a_narrower_plan() {
+    let dir = project(ONE_SPAWN);
+    let wide = ply(dir.path())
+        .args(["test", "--json", "--sim", "random", "--seeds", "8"])
+        .output()
+        .unwrap();
+    let v = json_of(&wide);
+    assert_eq!(v["summary"]["passed"], 1, "{v}");
+    assert_eq!(v["simulation"]["simulated"], 1, "the test searched: {v}");
+
+    let narrow = ply(dir.path())
+        .args(["test", "--json", "--sim", "random", "--seeds", "4"])
+        .output()
+        .unwrap();
+    let v = json_of(&narrow);
+    assert_eq!(v["selection"]["selected"], 0, "{v}");
+    assert_eq!(v["selection"]["tests"][0]["reason"], "cached", "{v}");
+    assert_eq!(
+        v["simulation"]["simulated"], 0,
+        "no root was searched again: {v}"
+    );
+}
+
 #[test]
 fn a_replay_names_one_interleaving_and_says_so() {
     let dir = project(GREEN);

@@ -501,8 +501,6 @@ fn a_seeded_load_answers_as_a_full_load_through_every_kind_of_edit() {
 #[test]
 fn prove_asks_for_claims_only_when_something_is_discharged_and_only_where_an_edit_reached() {
     use ply_codegen::c::producer;
-    use ply_prove::ProvePlan;
-    use ply_test::obligation::Asked;
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -567,23 +565,19 @@ fn zero(x: Int) -> Int
     prove("cold");
     prove("warm");
 
-    // What the run reads the cache for: every obligation answered is a run that builds no prover,
-    // and so lowers no claims however stale the answer file is.
+    // What the run reads the cache for: every obligation is answered from it, whatever became of
+    // the claims the prover lowered.
     fs::remove_file(dir.path().join(".ply-cache/claims.answer")).unwrap();
-    let mut store = Store::open(dir.path()).unwrap();
-    let loaded = driver::load_incremental(dir.path(), &mut store).expect("the project loads");
-    let scoped = ply_machine::obligations::project_view(&loaded.check, false);
-    let collected = ply_machine::obligations::collect(&loaded.front, &scoped, &loaded.hashes);
-    assert_eq!(collected.obligations.len(), 3);
-    let asked = Asked::new(
-        collected.obligations,
-        &store,
-        &ProvePlan::default().normalized(),
-        true,
-    );
-    assert!(
-        !asked.pending(),
-        "every obligation is answered from the cache, so no prover is built"
+    let out = ply(dir.path())
+        .args(["prove", ".", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!(v["obligations"].as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        v["cached"], 3,
+        "every obligation is answered from the cache: {v}"
     );
 }
 

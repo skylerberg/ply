@@ -1,5 +1,6 @@
-//! Driving the corpus program the way `benches/corpus.sh` does: `ply run` over the package, with
-//! the grants it runs under and the working directory as its `work` root.
+//! Driving the corpus program the way `benches/corpus.sh` does: `ply run` over the artifact
+//! `benches/corpus-program.sh` builds from the package, with the grants it runs under and the
+//! working directory as its `work` root.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -25,10 +26,99 @@ pub fn repo() -> PathBuf {
 /// What `ply` and the program read from the environment, and nothing else from the test's.
 const INHERITED: &[&str] = &["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "NEXTEST"];
 
-/// `ply run` over the corpus package in `dir`, with the grants the program's own subcommands are
+fn hermetic(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    for key in INHERITED {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd
+}
+
+/// The corpus program as `benches/corpus-program.sh` builds it for these sources and this `ply`:
+/// built once across every test process, since each runs on its own, by whichever takes the lock
+/// first, and found by the rest. CI's suite action builds it before any test runs.
+fn program() -> &'static Path {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/corpus-program");
+        std::fs::create_dir_all(&dir).expect("the corpus program's directory is made");
+        let lock = std::fs::File::create(dir.join(".lock")).expect("the build lock opens");
+        lock.lock().expect("the build lock is taken");
+        let out = hermetic(Path::new("bash"))
+            .arg(repo().join("benches/corpus-program.sh"))
+            .arg(ply())
+            .arg(&dir)
+            .output()
+            .expect("the build starts");
+        assert!(
+            out.status.success(),
+            "the corpus program did not build:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        PathBuf::from(
+            String::from_utf8(out.stdout)
+                .expect("the artifact's path is text")
+                .trim(),
+        )
+    })
+}
+
+/// `ply run` over the corpus program in `dir`, with the grants the program's own subcommands are
 /// run with, and `args` after `--`.
 pub fn corpus(dir: &Path, args: &[&str]) -> Output {
     run(dir, &[], args)
+}
+
+/// The product itself in `dir`, as the corpus drives it: `ply` with `args`, and the same few
+/// variables from the environment.
+pub fn product(dir: &Path, args: &[&str]) -> Output {
+    hermetic(&ply())
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("`ply` starts")
+}
+
+/// The one JSON document a `--json` run of the product wrote, whatever it exited with.
+pub fn product_document(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout was not one JSON document: {e}\n---\n{}\n---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// A report's row by name.
+#[track_caller]
+pub fn row<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["rows"]
+        .as_array()
+        .expect("rows is an array")
+        .iter()
+        .find(|r| r["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("the report carries no `{name}` row: {report:#}"))
+}
+
+/// A row's measurement by name, as a number.
+#[track_caller]
+pub fn measured(row: &serde_json::Value, name: &str) -> f64 {
+    row["measurements"]
+        .as_array()
+        .expect("measurements is an array")
+        .iter()
+        .find(|m| m["name"].as_str() == Some(name))
+        .and_then(|m| m["value"].as_f64())
+        .unwrap_or_else(|| panic!("the row measured no `{name}`: {row:#}"))
+}
+
+/// A row's verdict: `pass`, `fail` or `inconclusive`.
+pub fn outcome(row: &serde_json::Value) -> &str {
+    row["verdict"]["outcome"].as_str().unwrap_or("")
 }
 
 /// The same, with the executor bound too, for a subcommand the program hands to it.
@@ -80,16 +170,10 @@ fn floor() -> &'static Path {
 }
 
 fn run(dir: &Path, grants: &[String], args: &[&str]) -> Output {
-    let mut cmd = Command::new(ply());
-    cmd.env_clear();
-    for key in INHERITED {
-        if let Some(value) = std::env::var_os(key) {
-            cmd.env(key, value);
-        }
-    }
-    cmd.arg("run")
-        .arg(repo().join("crates/ply-corpus/ply"))
-        .args(["--host", "--allow", "machine"])
+    hermetic(&ply())
+        .arg("run")
+        .arg(program())
+        .args(["--host", "--allow", "machine", "--allow", "claims"])
         .arg(format!("--exec=ply={}", ply().display()))
         .args(grants)
         .args(["--fs", "work=."])

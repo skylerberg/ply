@@ -6,7 +6,7 @@
 //! floor answering the desk's bytes, each handshake timed apart, each server stopping on its signal.
 //! A rate on a shared runner is a reading, not a verdict this test can own.
 
-use crate::support::{document, repo, served};
+use crate::support::{document, measured, outcome, repo, served};
 use serde_json::Value;
 use std::path::Path;
 
@@ -22,25 +22,15 @@ fn run(dir: &Path, args: &[&str]) -> Value {
     document(&out)
 }
 
-/// Every row of every table, beside the title of the table it is in.
-fn rows(report: &Value) -> Vec<(String, Value)> {
-    report["tables"]
+fn rows(report: &Value) -> Vec<Value> {
+    report["rows"]
         .as_array()
-        .expect("a report carries its tables")
-        .iter()
-        .flat_map(|table| {
-            let title = table["title"].as_str().unwrap_or_default().to_string();
-            table["rows"]
-                .as_array()
-                .expect("a table carries its rows")
-                .iter()
-                .map(move |row| (title.clone(), row.clone()))
-        })
-        .collect()
+        .expect("a report carries its rows")
+        .clone()
 }
 
 fn criterion(row: &Value) -> &str {
-    row["criterion"].as_str().unwrap_or_default()
+    row["criterion"]["text"].as_str().unwrap_or_default()
 }
 
 /// The rows a correct run passes whatever the machine: answered, agreed, handshook, stopped.
@@ -52,19 +42,15 @@ fn correctness(row: &Value) -> bool {
 }
 
 fn assert_correct(report: &Value) {
-    let checked: Vec<(String, Value)> = rows(report)
-        .into_iter()
-        .filter(|(_, row)| correctness(row))
-        .collect();
+    let checked: Vec<Value> = rows(report).into_iter().filter(correctness).collect();
     assert!(!checked.is_empty(), "no correctness row: {report:#}");
-    for (table, row) in checked {
-        assert_eq!(row["passed"], Value::Bool(true), "{table}: {row:#}");
+    for row in checked {
+        assert_eq!(outcome(&row), "pass", "{row:#}");
     }
 }
 
-fn named<'a>(rows: &'a [(String, Value)], prefix: &str) -> Vec<&'a Value> {
+fn named<'a>(rows: &'a [Value], prefix: &str) -> Vec<&'a Value> {
     rows.iter()
-        .map(|(_, row)| row)
         .filter(|row| row["name"].as_str().unwrap_or_default().starts_with(prefix))
         .collect()
 }
@@ -97,12 +83,12 @@ fn the_socket_bench_serves_the_desk_and_its_floor() {
     assert_correct(&serve);
     let taken = rows(&serve);
     assert_eq!(
-        named(&taken, "handled").len(),
+        named(&taken, "layer handled").len(),
         1,
         "the layers table has its whole-request rung: {serve:#}"
     );
     assert!(
-        !named(&taken, "0 filler field(s)").is_empty(),
+        !named(&taken, "scans, 0 filler field(s)").is_empty(),
         "the scans table has its first head: {serve:#}"
     );
     for prefix in [
@@ -113,7 +99,8 @@ fn the_socket_bench_serves_the_desk_and_its_floor() {
     ] {
         let found = named(&taken, prefix);
         assert_eq!(found.len(), 1, "{prefix}: {serve:#}");
-        assert_eq!(found[0]["figures"]["requests"], 8, "{prefix}: {serve:#}");
+        assert_eq!(measured(found[0], "asked"), 8.0, "{prefix}: {serve:#}");
+        assert_eq!(measured(found[0], "answered"), 8.0, "{prefix}: {serve:#}");
     }
 
     let w3 = run(
@@ -148,7 +135,7 @@ fn the_socket_bench_serves_the_desk_and_its_floor() {
     );
     for row in secured {
         assert!(
-            row["figures"]["handshakes"].as_i64().is_some_and(|n| n > 0),
+            measured(row, "handshakes") > 0.0,
             "a TLS row times its handshakes: {row:#}"
         );
     }

@@ -5,7 +5,6 @@
 
 pub mod concurrency;
 pub mod domain;
-pub mod key;
 pub mod property;
 pub mod prove;
 pub mod shrink;
@@ -15,7 +14,7 @@ use ply_span::{Diagnostic, Span, Symbol};
 use ply_ty::DefHash;
 use ply_ty::{Footprint, LawBinder, Resource, Type};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -292,22 +291,6 @@ impl Obligation {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Coverage {
-    pub definitions: usize,
-    /// Carries an `ensures` that holds, or is named directly by a law that holds.
-    pub covered: usize,
-    /// Sorted, so two runs produce one artifact.
-    pub uncovered: Vec<Symbol>,
-    pub by_tier: BTreeMap<Tier, usize>,
-}
-
-impl Coverage {
-    pub fn uncovered_count(&self) -> usize {
-        self.definitions.saturating_sub(self.covered)
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProvePlan {
     /// Per root.
@@ -344,29 +327,12 @@ impl ProvePlan {
         self.sim = self.sim.normalized();
         self
     }
-
-    pub fn digest(&self) -> [u8; 32] {
-        let plan = self.clone().normalized();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"ply.prove.plan.1");
-        hasher.update(&plan.cases.to_le_bytes());
-        hasher.update(&plan.prove_budget.to_le_bytes());
-        hasher.update(&plan.step_budget.to_le_bytes());
-        hasher.update(&(plan.roots.len() as u32).to_le_bytes());
-        for root in &plan.roots {
-            hasher.update(&root.to_le_bytes());
-        }
-        hasher.update(&plan.sim.digest());
-        *hasher.finalize().as_bytes()
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ProveReport {
     pub obligations: Vec<(Obligation, Discharge)>,
-    pub coverage: Coverage,
     pub plan: ProvePlan,
-    pub cached: usize,
     pub duration: Duration,
 }
 

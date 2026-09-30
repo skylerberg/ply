@@ -1077,25 +1077,34 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
     }
 }
 
-/// Each builtin's parameter count in the scheme the port's checker binds it to.
+/// Each builtin's parameter count in the scheme the port's checker binds it to: its `tycore.Type`,
+/// which is a `TyFn` whose `params` are the parameters.
 fn prelude_arities() -> std::collections::BTreeMap<String, usize> {
+    ply_codegen::c::producer::ensure_default();
+    let answer = ply_codegen::c::producer::call("front.builtin_rows", &[])
+        .expect("the port publishes its builtins");
+    let rows = ply_eval::decode::At::new("`front.builtin_rows`' answer", &answer);
     let mut out = std::collections::BTreeMap::new();
-    for builtin in ply_codegen::c::producer::builtins().expect("the port publishes its builtins") {
-        let name = &builtin.name;
-        let ply_ty::Type::Fn { params, .. } = &builtin.scheme.ty else {
-            panic!(
-                "`{name}`'s scheme `{}` is not a function",
-                ply_ty::print_scheme(&builtin.scheme)
-            );
-        };
+    for row in rows.list().unwrap() {
+        let name = row.field("name").and_then(|n| n.utf8()).unwrap();
+        let documented = row.field("params").and_then(|p| p.list()).unwrap().len();
+        let ty = row
+            .field("scheme")
+            .and_then(|s| s.field("ty"))
+            .and_then(|t| t.ctor())
+            .unwrap();
+        assert_eq!(ty.name(), "TyFn", "`{name}`'s scheme is not a function");
+        let params = ty
+            .arg(0)
+            .and_then(|f| f.field("params"))
+            .and_then(|p| p.list())
+            .unwrap()
+            .len();
         assert_eq!(
-            builtin.params.len(),
-            params.len(),
-            "`{name}` is documented with {} parameter names for {} parameters",
-            builtin.params.len(),
-            params.len()
+            documented, params,
+            "`{name}` is documented with {documented} parameter names for {params} parameters"
         );
-        let twice = out.insert(name.to_string(), params.len()).is_some();
+        let twice = out.insert(name.to_string(), params).is_some();
         assert!(!twice, "the prelude binds `{name}` twice");
     }
     out
