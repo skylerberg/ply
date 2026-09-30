@@ -84,6 +84,12 @@ impl<V: Clone + Default> TaskRegions<V> {
         self.arena.close_all_but(Owner::ENTRY, FLOOR);
     }
 
+    /// [`Arena::renew`] down to the fixture's region and the entry's, so refused while either
+    /// holds a cell.
+    pub fn renew(&mut self) -> bool {
+        self.arena.renew(Owner::ENTRY, FLOOR)
+    }
+
     /// Closes every region `owner` opened since it stood `depth` deep, for control that jumped
     /// back past their closes or a stack that will not run again.
     pub fn close_regions_above(&mut self, owner: Owner, depth: usize) {
