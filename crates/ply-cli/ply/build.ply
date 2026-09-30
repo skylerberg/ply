@@ -9,7 +9,7 @@ import builder (Compiled, Loaded, Made, Named, Previous, Reach, Refusal)
 import builder (builder)
 import config_schema
 import lock
-import paths (Resolved, here)
+import paths (Resolved, Rooted, displayed, here, write_file)
 import compiler.diag (parse_all)
 import compiler.infer (DefInfo)
 import compiler.plyx (Head, digest_of, digest_text, domain, encode, encode_named, format,
@@ -25,9 +25,7 @@ import plyz
 import report (Answer, ind, ok_code, count_of, plural, refused, reported, warning_lines)
 import std.fs (fs, Missing)
 import std.time (time)
-import std.hash (blake3)
 import std.list (sort_by)
-import std.path (is_absolute)
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string)
 import std.pkg (Manifest, render_version)
 import compiler.front (Whole, Analysed, Refused, analyse)
@@ -391,21 +389,30 @@ fn digest_json(m: Made, x: Sealed) -> Json =
 
 // --- The command ------------------------------------------------------------
 
+fn unstamped(path: String) -> Diag =
+  diag1(
+    b"E0502",
+    no_module(),
+    { start: 0, end: 0 },
+    bytes_of_string("could not write `" ++ path ++ "`"),
+    b"the launcher's gate was not written",
+    [
+      b"the artifact was written; point `--stamp` at a file in a directory that exists and can be written",
+    ],
+  )
+
 // The launcher's gate, written beside the artifact the CLI's own build lands: the digest this
 // binary runs the committed artifact under.
 fn stamped(
+  s: Style,
   flags: Flags,
+  p: Loaded,
   answer: Answer,
 ) -> Answer / {env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs]} =
-  if flags.shipped_digest == "" { answer } else {
-    let digest = env.shipped_digest[sys]() ++ "\n";
-    if is_absolute(flags.shipped_digest) {
-      fs.write_file[abs](
-        string_slice(flags.shipped_digest, 1, string_len(flags.shipped_digest)),
-        bytes_of_string(digest),
-      )
-    } else { fs.write_file[cwd](flags.shipped_digest, bytes_of_string(digest)) };
-    answer
+  match flags.stamp {
+    None -> answer,
+    Some(at) -> if write_file(at, bytes_of_string(env.shipped_digest[sys]() ++ "\n")) { answer }
+    else { reported(s, "build", [unstamped(displayed(at))], p.places) },
   }
 
 fn written(
@@ -419,7 +426,7 @@ fn written(
   match builder.stored[build](out, x.bytes) {
     Err(why) -> reported(s, "build", why.diags, p.places),
     Ok(_) ->
-      stamped(flags, {
+      stamped(s, flags, p, {
         json: built_json(p, m, x, out),
         lines: built_lines(s, p, m, x, out),
         errs: all_to_text(s, m.warnings, p.places),
@@ -566,9 +573,7 @@ fn pinned(
   p: Loaded,
 ) -> Unit / {fs.write_file[cwd], fs.write_file[abs]} =
   if unchanged(existing, p.pins) { () } else {
-    let text = bytes_of_string(lock::text(existing, p.pins, []));
-    if r.label == "cwd" { fs.write_file[cwd](lock::path_of(r), text) }
-    else { fs.write_file[abs](lock::path_of(r), text) };
+    write_file(lock::path_of(r), bytes_of_string(lock::text(existing, p.pins, [])));
     ()
   }
 
@@ -1057,6 +1062,38 @@ test "a refusal after the load is exit 2 with no tally, and writes no file" {
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, []);
   assert_eq(answer.errs, ["Error[E0502]: could not write `dist/m.plyx`"])
+}
+
+test "a stamp lands where `--stamp` resolved, and one that cannot be written fails the build" {
+  let built: Answer = { json: Null, lines: ["   built m.main"], errs: [], code: ok_code() };
+  let gate: Rooted = { label: "abs", path: "srv/gate" };
+  let flags: Flags = { ..no_flags(), stamp: Some(gate) };
+  let landed = handle {
+    stamped(plain(), flags, a_load(), built)
+  } with {
+    env.shipped_digest[sys]() -> "b3:shipped",
+    fs.write_file[cwd](path, body) -> panic("a stamp under `abs` is written under `abs`"),
+    fs.write_file[abs](path, body) -> path == "srv/gate" && body == b"b3:shipped\n",
+  };
+  assert_eq(landed, built);
+  let refused = handle {
+    stamped(plain(), flags, a_load(), built)
+  } with {
+    env.shipped_digest[sys]() -> "b3:shipped",
+    fs.write_file[cwd](path, body) -> panic("a stamp under `abs` is written under `abs`"),
+    fs.write_file[abs](path, body) -> false,
+  };
+  assert_eq(refused.code, 2);
+  assert_eq(refused.lines, []);
+  assert_eq(at(refused.errs, 0, ""), "Error[E0502]: could not write `/srv/gate`");
+  let unasked = handle {
+    stamped(plain(), no_flags(), a_load(), built)
+  } with {
+    env.shipped_digest[sys]() -> panic("no stamp was asked for"),
+    fs.write_file[cwd](path, body) -> panic("no stamp was asked for"),
+    fs.write_file[abs](path, body) -> panic("no stamp was asked for"),
+  };
+  assert_eq(unasked, built)
 }
 
 test "an entry point the flags name badly stops the build before anything is made" {

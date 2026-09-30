@@ -1,16 +1,17 @@
 // The corpus's command line and its entry point. The line is declared once as a cmdline spec — the
 // CLI package's library, not a copy of it — and `main` answers it: help, a version and a refusal
 // here; `gen`, and `bench`, `sweep`, `real`, `measure`, `payload`, `regions`, `tiers`, `serve`,
-// `w3`, `w6` and `w6-ladder`, each answering a report, in this package; and `sim`, `prove` and the
-// database benches as a JSON plan handed to the Rust executor bound as `executor`, whose output and
-// exit code are this program's own.
+// `w3`, `w4`, `w5`, `w6` and `w6-ladder`, each answering a report, in this package; and `sim` and
+// `prove` as a JSON plan handed to the Rust executor bound as `executor`, whose output and exit
+// code are this program's own.
 //
 // It runs under `ply run` (`benches/corpus.sh` holds the whole line) with two filesystem roots:
 // `work`, bound at the working directory, which every path this program reads, writes or spawns in
 // is relative to, and `repo`, the checkout whose standard library the in-process measurements are
 // checked against and whose corpus sources a report is pinned by. It is lent the `machine` family
-// for the in-process measurements and the `claims` family for `tiers`, and `serve`, `w3` and
-// `w6-ladder` start the programs the runner binds by path.
+// for the in-process measurements and the `claims` family for `tiers`; `serve`, `w3`, `w4`, `w5`
+// and `w6-ladder` start the programs the runner binds by path, and `w4`, `w5` and `w6-ladder` reach
+// the database they measure.
 
 import cli.claims (prover)
 import cli.cmdline
@@ -29,6 +30,8 @@ import spine
 import sweep
 import tiers
 import w3
+import w4
+import w5
 import w6
 import std.certgen (certgen)
 import std.json (Json, Str, Number, Bool, Null, object, array)
@@ -37,6 +40,7 @@ import std.fs (fs)
 import std.net (net)
 import std.process (process, exit_code)
 import std.config (config)
+import std.random (entropy)
 import std.time (time)
 
 fn cats<a>(xss: List<List<a>>) -> List<a> =
@@ -199,7 +203,6 @@ fn served_flags() -> List<cmdline::Flag> =
       inside,
     ),
     pos("repeats", 3, "Runs of each point; the fastest is reported"),
-    pos("iterations", 2000, "Calls in each round of an in-process table"),
     json_switch(),
   ]
 
@@ -221,6 +224,18 @@ fn seed_taken(p: cmdline::Parsed) -> Result<Unit, String> =
       }
     },
   }
+
+fn iterations_flag() -> cmdline::Flag =
+  pos("iterations", 2000, "Calls in each round of an in-process table")
+
+// Where the database benches reach postgres: one URL both the language's driver and libpq read.
+fn db_flag(help: String) -> cmdline::Flag = cmdline::valued("db", "URL", cmdline::Text, help)
+
+fn accept_flag(help: String) -> cmdline::Flag =
+  cmdline::with_default(
+    cmdline::valued("accept", "LOOP", cmdline::Choice(["sequential", "task-per-connection"]), help),
+    "sequential",
+  )
 
 // --- The spec --------------------------------------------------------------------
 
@@ -317,6 +332,7 @@ pub fn spec() -> cmdline::Spec =
           cats([
             served_flags(),
             [
+              iterations_flag(),
               sections_flag(serve::sections(), "layers,load"),
               pos("requests", 2000, "Requests in each served point"),
               pos("per-conn", 1, "Requests one connection carries in the served table"),
@@ -358,16 +374,9 @@ pub fn spec() -> cmdline::Spec =
           cats([
             served_flags(),
             [
+              iterations_flag(),
               sections_flag(w3::sections(), "mix,routes,keep-alive,tls,shape"),
-              cmdline::with_default(
-                cmdline::valued(
-                  "accept",
-                  "LOOP",
-                  cmdline::Choice(["sequential", "task-per-connection"]),
-                  "The loop the desk accepts connections with",
-                ),
-                "sequential",
-              ),
+              accept_flag("The loop the desk accepts connections with"),
               counts("concurrency", "1,2,4,8,16,32,64", "Clients the read mix is loaded with"),
               pos(
                 "per-conn",
@@ -391,76 +400,55 @@ pub fn spec() -> cmdline::Spec =
         cmdline::command(
           "w4",
           "Price a statement through the effect boundary against one with no Ply in the path",
-          [
-            text(
-              "repo",
-              ".",
-              "The repository root, where `examples/desk.ply` is read from for `crud`",
-            ),
-            text(
-              "db",
-              "",
-              "The database; its own `part` table is created and dropped, and `crud` needs the desk schema",
-            ),
-            opt(
-              "ply",
-              "The `ply` binary the load table drives; the executor's sibling when left off",
-            ),
-            nats("concurrency", "1,2,4,8,16", "Concurrent tasks in the `ops` sweep"),
-            nat("operations", 400, "Statements per point in the `ops` sweep"),
-            nats("rows", "8,32,128,512", "Table sizes the `sizes` section sweeps, in rows"),
-            nats("pool-sizes", "1,2,4,8,16", "Pool sizes the `pool` section sweeps"),
-            nat("pool", 16, "Connections the `ops` sweep's pool holds, constant across its rows"),
-            nat("repeats", 3, "Repeats per point; the fastest is reported"),
-            nats("load-concurrency", "1,8,32", "Client concurrencies in the `crud` section"),
-            nat("per-conn", 32, "Requests one connection carries in the load table"),
-            nat("requests-per-point", 3000, "Requests per point in the load table"),
-            sw("no-ops", "Drop the `ops` sweep"),
-            sw("no-sizes", "Drop the `sizes` section"),
-            sw("no-pool", "Drop the `pool` section"),
-            sw("no-load", "Drop the `crud` load table"),
-            json_switch(),
-          ],
+          cats([
+            served_flags(),
+            [
+              sections_flag(w4::sections(), "ops,sizes,pool,exhaustion,crud"),
+              db_flag(
+                "Where the corpus makes its `part` table, and where `crud` finds the desk's schema; without it their rows are inconclusive",
+              ),
+              counts("concurrency", "1,2,4,8,16", "Concurrent tasks in the `ops` sweep"),
+              pos(
+                "operations",
+                400,
+                "Statements per point in the `ops`, `sizes` and `pool` sections",
+              ),
+              counts("rows", "8,32,128,512", "Table sizes the `sizes` section sweeps, in rows"),
+              counts("pool-sizes", "1,2,4,8,16", "Pool sizes the `pool` section sweeps"),
+              pos("pool", 16, "Connections the `ops` sweep's pool holds, constant across its rows"),
+              counts("load-concurrency", "1,8,32", "Client concurrencies in the `crud` section"),
+              pos("per-conn", 32, "Requests one connection carries in the `crud` section"),
+              pos("requests-per-point", 3000, "Requests per point in the `crud` section"),
+            ],
+          ]),
         ),
         cmdline::command(
           "w5",
-          "Price tracing, a drain with requests in flight, the deadline, and a deploy",
-          [
-            text("repo", ".", "The repository root, where `examples/desk.ply` is read from"),
-            opt(
-              "ply",
-              "The `ply` binary the served sections drive; the executor's sibling when left off",
-            ),
-            opt(
-              "db",
-              "The database the served sections run against; it must hold the desk's schema",
-            ),
-            nat("operations", 20000, "Trace operations per point in the `events` table"),
-            nat(
-              "twin-operations",
-              200,
-              "Operations per twin point; small because `Sink` appends are quadratic in records held",
-            ),
-            nat("repeats", 3, "Repeats per point; the fastest is reported"),
-            nats("concurrency", "1,8,32", "Client concurrencies in the `served` table"),
-            nat("per-conn", 32, "Requests one connection carries in the served table"),
-            nat("requests-per-point", 3000, "Requests per point in the served table"),
-            nats("in-flight", "1,8,32", "Requests in flight when the signal arrives"),
-            nat("drain-ms", 5000, "The drain's deadline, in milliseconds"),
-            nat(
-              "hold-ms",
-              500,
-              "How long a client holds its half-sent request before finishing it",
-            ),
-            text("api-key", "bench-key", "The credential the served desk is configured with"),
-            sw("concurrent", "Serve the `served` table from the task-per-connection accept loop"),
-            sw("no-events", "Drop the `events` table"),
-            sw("no-served", "Drop the `served` table"),
-            sw("no-drain", "Drop the drain measurement"),
-            sw("no-transaction", "Drop the transaction measurement"),
-            sw("no-deploy", "Drop the deploy measurement"),
-            json_switch(),
-          ],
+          "Price tracing, a drain with requests in flight, the drain's deadline, and a deploy",
+          cats([
+            served_flags(),
+            [
+              sections_flag(w5::sections(), "sinks,drain,transaction,deploy"),
+              db_flag(
+                "A database holding the desk's schema, for the `sinks` and `transaction` sections; without it their rows are inconclusive",
+              ),
+              accept_flag("The loop the `sinks` table's desk accepts connections with"),
+              counts("concurrency", "1,8,32", "Client concurrencies in the `sinks` table"),
+              pos("per-conn", 32, "Requests one connection carries in the `sinks` table"),
+              pos("requests-per-point", 3000, "Requests per point in the `sinks` table"),
+              counts("in-flight", "1,8,32", "Requests held in flight when the signal arrives"),
+              pos(
+                "drain-ms",
+                5000,
+                "The drain's deadline, in milliseconds; shorter than the desk waits for a request's body, or the held requests time out before the drain runs out",
+              ),
+              pos(
+                "hold-ms",
+                500,
+                "How long a held request's body is held back when the drain completes",
+              ),
+            ],
+          ]),
         ),
         cmdline::command("w6", "Judge the W6 ladder benches/w6-ladder.json ships, rung by rung", [
           json_switch(),
@@ -635,6 +623,8 @@ pub type Asked =
   | Tiers(Reported<tiers::Args>)
   | Serve(Reported<serve::Args>)
   | W3(Reported<w3::Args>)
+  | W4(Reported<w4::Args>)
+  | W5(Reported<w5::Args>)
   // Whether the shipped ladder's judgement is wanted as JSON.
   | W6(Bool)
   | W6Ladder(Reported<ladder::Args>)
@@ -674,6 +664,39 @@ fn w3_args(p: cmdline::Parsed) -> w3::Args =
     ladder_concurrency: nat_of(p, "ladder-concurrency"),
     repeats: nat_of(p, "repeats"),
     iterations: nat_of(p, "iterations"),
+  }
+
+fn w4_args(p: cmdline::Parsed) -> w4::Args =
+  {
+    repo: text_of(p, "repo"),
+    scratch: text_of(p, "scratch"),
+    db: cmdline::value(p, "db"),
+    sections: split_commas(text_of(p, "sections")),
+    concurrency: nats_of(p, "concurrency"),
+    operations: nat_of(p, "operations"),
+    rows: nats_of(p, "rows"),
+    pool_sizes: nats_of(p, "pool-sizes"),
+    pool: nat_of(p, "pool"),
+    load_concurrency: nats_of(p, "load-concurrency"),
+    per_conn: nat_of(p, "per-conn"),
+    requests_per_point: nat_of(p, "requests-per-point"),
+    repeats: nat_of(p, "repeats"),
+  }
+
+fn w5_args(p: cmdline::Parsed) -> w5::Args =
+  {
+    repo: text_of(p, "repo"),
+    scratch: text_of(p, "scratch"),
+    db: cmdline::value(p, "db"),
+    sections: split_commas(text_of(p, "sections")),
+    accept: text_of(p, "accept"),
+    concurrency: nats_of(p, "concurrency"),
+    per_conn: nat_of(p, "per-conn"),
+    requests_per_point: nat_of(p, "requests-per-point"),
+    in_flight: nats_of(p, "in-flight"),
+    drain_ms: nat_of(p, "drain-ms"),
+    hold_ms: nat_of(p, "hold-ms"),
+    repeats: nat_of(p, "repeats"),
   }
 
 fn ladder_args(p: cmdline::Parsed) -> ladder::Args =
@@ -830,6 +853,8 @@ pub fn asked(argv: List<String>) -> Asked =
       },
       "serve" -> Serve({ args: serve_args(p), json: cmdline::has(p, "json") }),
       "w3" -> W3({ args: w3_args(p), json: cmdline::has(p, "json") }),
+      "w4" -> W4({ args: w4_args(p), json: cmdline::has(p, "json") }),
+      "w5" -> W5({ args: w5_args(p), json: cmdline::has(p, "json") }),
       "w6" -> W6(cmdline::has(p, "json")),
       "w6-ladder" -> W6Ladder({ args: ladder_args(p), json: cmdline::has(p, "json") }),
       _ -> match run_plan(p) { Ok(j) -> Plan(j), Err(why) -> Refusal(why) },
@@ -861,9 +886,6 @@ fn shapes_of(p: cmdline::Parsed) -> Result<List<payload::Shape>, String> =
 
 // --- The plan the executor runs ------------------------------------------------
 
-fn str_flag(p: cmdline::Parsed, long: String) -> Json =
-  match cmdline::value(p, long) { Some(v) -> Str(v), None -> Null }
-
 fn int_flag(p: cmdline::Parsed, long: String) -> Json =
   match cmdline::value(p, long) {
     Some(v) -> match cmdline::parse_nat(v) { Some(n) -> Number(decimal_of_int(n)), None -> Null },
@@ -871,15 +893,6 @@ fn int_flag(p: cmdline::Parsed, long: String) -> Json =
   }
 
 fn bool_flag(p: cmdline::Parsed, long: String) -> Json = Bool(cmdline::has(p, long))
-
-fn nats_json(text: String) -> Json =
-  array(
-    map(split_commas(text), |s: String|
-      match cmdline::parse_nat(s) { Some(n) -> Number(decimal_of_int(n)), None -> Null }),
-  )
-
-fn list_flag(p: cmdline::Parsed, long: String) -> Json =
-  match cmdline::value(p, long) { Some(v) -> nats_json(v), None -> array([]) }
 
 fn plan(command: String, args: List<{ key: String, value: Json }>) -> Json =
   object([
@@ -901,56 +914,6 @@ fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
           { key: "steps", value: int_flag(p, "steps") },
           { key: "rate_seeds", value: int_flag(p, "rate-seeds") },
           { key: "no_reduction", value: bool_flag(p, "no-reduction") },
-          { key: "json", value: bool_flag(p, "json") },
-        ]),
-      ),
-    "w4" -> match required(p, "db") {
-      Err(why) -> Err(why),
-      Ok(_) ->
-        Ok(
-          plan("w4", [
-            { key: "repo", value: str_flag(p, "repo") },
-            { key: "db", value: str_flag(p, "db") },
-            { key: "ply", value: str_flag(p, "ply") },
-            { key: "concurrency", value: list_flag(p, "concurrency") },
-            { key: "operations", value: int_flag(p, "operations") },
-            { key: "rows", value: list_flag(p, "rows") },
-            { key: "pool_sizes", value: list_flag(p, "pool-sizes") },
-            { key: "pool", value: int_flag(p, "pool") },
-            { key: "repeats", value: int_flag(p, "repeats") },
-            { key: "load_concurrency", value: list_flag(p, "load-concurrency") },
-            { key: "per_conn", value: int_flag(p, "per-conn") },
-            { key: "requests_per_point", value: int_flag(p, "requests-per-point") },
-            { key: "no_ops", value: bool_flag(p, "no-ops") },
-            { key: "no_sizes", value: bool_flag(p, "no-sizes") },
-            { key: "no_pool", value: bool_flag(p, "no-pool") },
-            { key: "no_load", value: bool_flag(p, "no-load") },
-            { key: "json", value: bool_flag(p, "json") },
-          ]),
-        ),
-    },
-    "w5" ->
-      Ok(
-        plan("w5", [
-          { key: "repo", value: str_flag(p, "repo") },
-          { key: "ply", value: str_flag(p, "ply") },
-          { key: "db", value: str_flag(p, "db") },
-          { key: "operations", value: int_flag(p, "operations") },
-          { key: "twin_operations", value: int_flag(p, "twin-operations") },
-          { key: "repeats", value: int_flag(p, "repeats") },
-          { key: "concurrency", value: list_flag(p, "concurrency") },
-          { key: "per_conn", value: int_flag(p, "per-conn") },
-          { key: "requests_per_point", value: int_flag(p, "requests-per-point") },
-          { key: "in_flight", value: list_flag(p, "in-flight") },
-          { key: "drain_ms", value: int_flag(p, "drain-ms") },
-          { key: "hold_ms", value: int_flag(p, "hold-ms") },
-          { key: "api_key", value: str_flag(p, "api-key") },
-          { key: "concurrent", value: bool_flag(p, "concurrent") },
-          { key: "no_events", value: bool_flag(p, "no-events") },
-          { key: "no_served", value: bool_flag(p, "no-served") },
-          { key: "no_drain", value: bool_flag(p, "no-drain") },
-          { key: "no_transaction", value: bool_flag(p, "no-transaction") },
-          { key: "no_deploy", value: bool_flag(p, "no-deploy") },
           { key: "json", value: bool_flag(p, "json") },
         ]),
       ),
@@ -1012,9 +975,13 @@ fn executed(
 // `http_floor`, the kit's own connections, the clock, and certificates for a TLS run.
 effect set Serving = {process.start[ply], process.wait[ply], process.signal[ply], process.output_line[ply], process.start[http_floor], process.wait[http_floor], process.signal[http_floor], process.output_line[http_floor], net.connect[probe], net.send[probe], net.recv[probe], net.close[probe], certgen.issue, time.sleep_ms}
 
+// What measuring a database takes besides: the libpq tool the runner built and bound as
+// `pg_floor`, and the harness's own connections to the database, through the driver it measures.
+effect set Database = {process.spawn[pg_floor], process.start[pg_floor], process.wait[pg_floor], process.signal[pg_floor], process.output_line[pg_floor], process.end_input[pg_floor], net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next}
+
 fn code_of(
   a: Asked,
-) -> Int / {process.out[proc], process.err[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], Serving, prover.outcomes[claims], prover.record[claims], prover.accepted[claims]} =
+) -> Int / {process.out[proc], process.err[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], Serving, prover.outcomes[claims], prover.record[claims], prover.accepted[claims], Database} =
   match a {
     Said(text) -> {
       process.out[proc](text);
@@ -1043,12 +1010,14 @@ fn code_of(
     Tiers(t) -> answered(reported(tiers::run(t.args), t.json)),
     Serve(s) -> answered(reported(serve::run(s.args), s.json)),
     W3(w) -> answered(reported(w3::run(w.args), w.json)),
+    W4(w) -> answered(reported(w4::run(w.args), w.json)),
+    W5(w) -> answered(reported(w5::run(w.args), w.json)),
     W6(json_wanted) -> answered(reported(w6::run(), json_wanted)),
     W6Ladder(l) -> answered(reported(ladder::run(l.args), l.json)),
     Plan(j) -> executed(j),
   }
 
-pub fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], Serving, prover.outcomes[claims], prover.record[claims], prover.accepted[claims]} =
+pub fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], process.spawn[ply], process.spawn[executor], config.get[env], time.elapsed_ms, time.elapsed_us, fs.read[work], fs.write[work], fs.read[repo], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.replay[claims], Serving, prover.outcomes[claims], prover.record[claims], prover.accepted[claims], Database} =
   process.exit[proc](code_of(asked(process.args[proc]())))
 
 // --- Tests -----------------------------------------------------------------------
@@ -1130,7 +1099,41 @@ test "real takes one member when it is named, and refuses a name that is none" {
   )
 }
 
-test "w4 refuses without --db" { assert(string_contains(refusal_of(["w4"]), "--db")) }
+test "w4 runs every table without a database, and takes one when it is named" {
+  match asked(["w4"]) {
+    W4(w) -> {
+      assert_eq(w.args.db, None);
+      assert_eq(w.args.sections, w4::sections());
+      assert_eq(w.args.concurrency, [1, 2, 4, 8, 16]);
+      assert_eq((w.args.operations, w.args.pool, w.args.repeats), (400, 16, 3))
+    },
+    _ -> assert(false),
+  };
+  match asked(["w4", "--db", "postgres://u@db/bench", "--sections", "ops", "--rows", "8"]) {
+    W4(w) -> {
+      assert_eq(w.args.db, Some("postgres://u@db/bench"));
+      assert_eq(w.args.sections, ["ops"]);
+      assert_eq(w.args.rows, [8])
+    },
+    _ -> assert(false),
+  };
+  assert(string_contains(refusal_of(["w4", "--sections", "events"]), "events is not a table"));
+  assert(string_contains(refusal_of(["w4", "--pool-sizes", "0"]), "0 is not a count above zero"))
+}
+
+test "w5 reads its drain and its sinks' loop, and has no events table" {
+  match asked(["w5", "--sections", "drain,deploy", "--drain-ms", "2000", "--in-flight", "4"]) {
+    W5(w) -> {
+      assert_eq(w.args.sections, ["drain", "deploy"]);
+      assert_eq((w.args.drain_ms, w.args.hold_ms, w.args.in_flight), (2000, 500, [4]));
+      assert_eq(w.args.accept, "sequential");
+      assert_eq(w.args.db, None)
+    },
+    _ -> assert(false),
+  };
+  assert(string_contains(refusal_of(["w5", "--sections", "events"]), "events is not a table"));
+  assert(string_contains(refusal_of(["w5", "--accept", "threads"]), "possible values"))
+}
 
 test "serve reads its tables and its load, and refuses a table it does not take" {
   match asked(["serve", "--sections", "layers,scans", "--concurrency", "2,8", "--json"]) {
@@ -1277,13 +1280,10 @@ test "tiers audits one of its seeds alone when asked, and refuses a seed it does
 
 test "what is still Rust's is planned for the executor" {
   assert(string_contains(plan_text(["sim", "a.ply"]), "\"command\":\"sim\""));
-  assert_eq(map(["measure", "serve", "w3", "w6", "w6-ladder"], |c: String| plan_text([c])), [
-    "",
-    "",
-    "",
-    "",
-    "",
-  ])
+  assert_eq(
+    map(["measure", "serve", "w3", "w4", "w5", "w6", "w6-ladder"], |c: String| plan_text([c])),
+    ["", "", "", "", "", "", ""],
+  )
 }
 
 test "an unknown flag is a refusal, not a panic" {
