@@ -11,8 +11,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               LawDef, parse, dump_module)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate, EBad,
-              Stmt, SLet, SExpr, Param, NamedArg, MatchArm, HandleClause, ReturnClause, RecField,
-              expr_span)
+              Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause, ReturnClause,
+              RecField, expr_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit)
 
 // --- Shared ---------------------------------------------------------------------
@@ -66,7 +66,12 @@ pub fn is_pure(e: Expr) -> Bool =
           acc && is_pure(arm.body) && (match arm.guard { None -> true, Some(g) -> is_pure(g) })),
     EBlock(b) ->
       fold(b.stmts, true, |acc: Bool, s: Stmt|
-          acc && (match s { SLet(l) -> is_pure(l.value), SExpr(x) -> is_pure(x) }))
+          acc
+            && (match s {
+              SLet(l) -> is_pure(l.value),
+              SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
+              SExpr(x) -> is_pure(x),
+            }))
         && (match b.tail { None -> true, Some(t) -> is_pure(t) }),
     ERecord(r) -> fold(r.fields, true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
     ERecordUpdate(r) ->
@@ -589,6 +594,18 @@ fn walk_expr(s: Sets, e: Expr) -> { s: Sets, e: Expr } =
             let v = walk_expr(t.s, l.value);
             { s: v.s, ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: t.t, value: v.e })) }
           },
+          SLetElse(l) -> {
+            let t = opt_ty(acc.s, l.ty);
+            let v = walk_expr(t.s, l.value);
+            let f = walk_expr(v.s, l.fallback);
+            {
+              s: f.s,
+              ss: push(
+                acc.ss,
+                SLetElse({ span: l.span, pat: l.pat, ty: t.t, value: v.e, fallback: f.e }),
+              ),
+            }
+          },
           SExpr(x) -> {
             let o = walk_expr(acc.s, x);
             { s: o.s, ss: push(acc.ss, SExpr(o.e)) }
@@ -874,6 +891,14 @@ fn ru_opt(sh: Map<Bytes, List<Bytes>>, e: Option<Expr>) -> Option<Expr> =
 fn ru_stmt(sh: Map<Bytes, List<Bytes>>, s: Stmt) -> Stmt =
   match s {
     SLet(l) -> SLet({ span: l.span, pat: l.pat, ty: l.ty, value: ru_expr(sh, l.value) }),
+    SLetElse(l) ->
+      SLetElse({
+        span: l.span,
+        pat: l.pat,
+        ty: l.ty,
+        value: ru_expr(sh, l.value),
+        fallback: ru_expr(sh, l.fallback),
+      }),
     SExpr(x) -> SExpr(ru_expr(sh, x)),
   }
 
@@ -1478,6 +1503,52 @@ fn split_at(
 
 fn take_stmt(cx: TryCx, st: Stmt) -> Taken =
   match st {
+    // Never consumed, since its pattern is not the success arm's. Its `else` block is the block's
+    // value, so it is a return position: expanded once, when no `?` is left in the initializer.
+    SLetElse(l) -> match l.value {
+      ETry(t) -> {
+        let fb = fresh_binder(cx, t.span);
+        let o = take_try(fb.cx, t.operand, t.span, var_pattern(fb.b));
+        if o.take.consumes {
+          {
+            cx: o.cx,
+            stmt: SLetElse({ ..l, value: var_of(fb.b) }),
+            take: Some({
+              operand: o.take.operand,
+              at: o.take.at,
+              pat: o.take.pat,
+              consumes: false,
+            }),
+          }
+        } else {
+          {
+            cx: o.cx,
+            stmt: SLetElse({ ..l, value: ETry({ span: t.span, operand: o.operand_left }) }),
+            take: Some(o.take),
+          }
+        }
+      },
+      _ -> {
+        let o = scan(cx, l.value);
+        match o.s {
+          SFound(lift) ->
+            {
+              cx: o.cx,
+              stmt: SLetElse({ ..l, value: o.e }),
+              take: Some({
+                operand: lift.operand,
+                at: lift.at,
+                pat: var_pattern(lift.binder),
+                consumes: false,
+              }),
+            },
+          _ -> {
+            let f = ret(o.cx, l.fallback);
+            { cx: f.cx, stmt: SLetElse({ ..l, fallback: f.e }), take: None }
+          },
+        }
+      },
+    },
     SLet(l) -> match l.value {
       ETry(t) -> match l.ty {
         // The annotation stays: the `let` now binds the success arm's binder.
@@ -1741,6 +1812,11 @@ fn sweep_inner(cx: TryCx, e: Expr, scope: Option<Bytes>, barrier: Option<Bytes>)
                 ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })),
               }
             },
+            SLetElse(l) -> {
+              let v = sweep(acc.cx, l.value, scope, barrier);
+              let f = sweep(v.cx, l.fallback, scope, barrier);
+              { cx: f.cx, ss: push(acc.ss, SLetElse({ ..l, value: v.e, fallback: f.e })) }
+            },
             SExpr(x) -> {
               let o = sweep(acc.cx, x, scope, barrier);
               { cx: o.cx, ss: push(acc.ss, SExpr(o.e)) }
@@ -1994,7 +2070,12 @@ fn any_in(e: Expr, p: (Expr) -> Bool) -> Bool =
               || (match arm.guard { None -> false, Some(g) -> any_in(g, p) })),
       EBlock(b) ->
         fold(b.stmts, false, |acc: Bool, s: Stmt|
-            acc || (match s { SLet(l) -> any_in(l.value, p), SExpr(x) -> any_in(x, p) }))
+            acc
+              || (match s {
+                SLet(l) -> any_in(l.value, p),
+                SLetElse(l) -> any_in(l.value, p) || any_in(l.fallback, p),
+                SExpr(x) -> any_in(x, p),
+              }))
           || (match b.tail { None -> false, Some(t) -> any_in(t, p) }),
       ERecord(r) -> fold(r.fields, false, |b: Bool, f: RecField| b || any_in(f.value, p)),
       ERecordUpdate(r) ->
