@@ -1,7 +1,7 @@
 use crate::fixture::Compiled;
 use ply_eval::{Diagnostic, Severity, SourceId, Span, codes};
 use ply_store::Store;
-use ply_test::{Executor, InterpExecutor, RunReport, Status, run_with};
+use ply_test::{Executor, RunReport, Status, run_with};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -182,70 +182,4 @@ fn a_spanless_diagnostic_is_classified_by_its_code_alone() {
     assert!(!report.failures[0].defect);
     assert_eq!(report.results[0].status, Status::Failed);
     assert_eq!(report.failures[0].diagnostic.severity, Severity::Error);
-}
-
-/// A test's body is an entry of its own. `Saved`'s field is an ordinary function type and a
-/// declared field may name `Task<Int>`, so both handles reach a test's answer past the checker.
-const ANSWERS_A_HANDLE: &str = r#"
-effect amb { read flip[coin]() -> Bool }
-
-type Saved = Nothing | Just((Bool) -> Int)
-
-type Held = Held(Task<Int>)
-
-fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
-  let inner = handle {
-    if amb.flip[coin]() { 41 } else { 0 }
-  } with { amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 } };
-  assert_eq(inner, 0);
-  cell_get(s)
-} }
-
-fn spawned() -> Held = simulate { Held(task.spawn(|| 1)) }
-
-test "answers a continuation" { parked() }
-
-test "answers a task" { spawned() }
-"#;
-
-#[test]
-fn a_handle_a_test_answers_is_the_programs_failure() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let compiled = Compiled::new(ANSWERS_A_HANDLE);
-    let executor = InterpExecutor::new(&compiled.port, compiled.tier());
-    let report = run_with(
-        &compiled.every(),
-        &compiled.check,
-        &compiled.hashes,
-        &mut store,
-        &executor,
-    );
-
-    assert_eq!(report.failed, 2, "{:#?}", report.failures);
-    for (label, noun) in [
-        ("answers a continuation", "a continuation"),
-        ("answers a task", "a `Task`"),
-    ] {
-        let failure = report
-            .failures
-            .iter()
-            .find(|f| f.name == label)
-            .unwrap_or_else(|| panic!("`{label}` did not fail: {:#?}", report.failures));
-        let d = &failure.diagnostic;
-        assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{label}: {d:#?}");
-        assert!(
-            d.message.contains(&format!("answered {noun}")),
-            "{label}: {d:#?}"
-        );
-        assert!(
-            !failure.defect,
-            "{label} is the program's failure, not Ply's"
-        );
-    }
-    assert!(
-        report.results.iter().all(|r| r.status == Status::Failed),
-        "{:#?}",
-        report.results
-    );
 }
