@@ -118,6 +118,63 @@ fn without_the_grant_the_machine_is_not_bound() {
     assert!(err.contains("E0424") || err.contains("machine"), "{err}");
 }
 
+/// A program that declares the prover and reaches one of its operations behind a branch never taken:
+/// what is under test is whether the grant binds at all. The family is `claims` and its effect is
+/// `prover`, so a grant checked against the family's name could never be made.
+const PROVING: &str = "\
+nondet effect prover {
+  write configure[claims](options: Unit, front: Unit) -> Unit
+  read collected[claims]() -> Result<Unit, Unit>
+  read typed[claims]() -> Result<Unit, Unit>
+  read outcomes[claims](keys: List<String>) -> List<Option<String>>
+  read discharged[claims](choice: Unit) -> Result<Unit, Unit>
+  read replay[claims](index: Int, root: Int, case: Int) -> Result<Unit, Unit>
+  read shrink[claims](claim: Int) -> Result<Option<Int>, Unit>
+  read offers[claims](i: Int) -> Result<Option<Unit>, Unit>
+  read would[claims](i: Int, position: Int) -> Result<Bool, Unit>
+  write accept[claims](i: Int, position: Int) -> Result<Unit, Unit>
+  read settled[claims]() -> Result<Option<Unit>, Unit>
+  read reviewed[claims]() -> Unit
+  read accepted[claims]() -> Unit
+}
+
+fn main() -> Int / {prover.collected[claims]} =
+  if 1 > 2 { match prover.collected[claims]() { Ok(_) -> 1, Err(_) -> 2 } } else { 7 }
+";
+
+#[test]
+fn a_family_is_granted_to_a_program_declaring_the_effect_it_lends() {
+    let dir = project(PROVING);
+    let out = ply(dir.path())
+        .args(["run", "--host", "--allow", "claims", "m.ply"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        crate::harness::stdout_of(&out)
+            .lines()
+            .any(|l| l.trim() == "7"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_refused_grant_names_the_effect_the_program_would_have_to_declare() {
+    let dir = project(PROVING);
+    let out = ply(dir.path())
+        .args(["run", "--host", "--allow", "cache", "m.ply"])
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0), "an undeclared grant ran");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0459"), "{err}");
+    assert!(
+        err.contains("`--allow cache`") && err.contains("no `store` effect"),
+        "{err}"
+    );
+}
+
 #[test]
 fn the_grant_requires_a_host() {
     let dir = driving();

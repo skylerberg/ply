@@ -2,8 +2,7 @@ use crate::fixture::Compiled;
 use ply_span::SourceId;
 use ply_span::{Span, Symbol};
 use ply_test::bisect::{
-    Baseline, ChangeKind, Classify, DefKey, DepEdges, Diff, FusionReason, Regression, Rehashed,
-    Skipped, diff,
+    Baseline, ChangeSet, Classify, DefKey, Regression, Rehashed, Row, change_set,
 };
 use ply_test::{Attribution, CausalSlice, Entered, Event, Frame, SliceBuilder};
 use ply_ty::{DefHash, HashOutput};
@@ -82,7 +81,9 @@ impl Classify for Renormalizing {
     }
 }
 
-fn diff_of(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> Diff {
+/// The facts a failing `ply test` hands the program about one failure. Which kind of change they
+/// make is `suite.delta`'s to decide; this audit holds the facts to real programs.
+fn facts_of(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> ChangeSet {
     let baseline = before.baseline(key);
     let mut classify = Renormalizing::new(after, &baseline, independent);
     let key = sym(key);
@@ -92,47 +93,34 @@ fn diff_of(before: &Compiled, after: &Compiled, key: &str, independent: bool) ->
         baseline: &baseline,
         hashes: &after.hashes,
     };
-    diff(&regression, &mut classify, &DepEdges::from(&after.hashes))
+    change_set(&regression, &mut classify)
 }
 
-fn kind_of(diff: &Diff, name: &str) -> Option<ChangeKind> {
-    diff.delta.change(&sym(name)).map(|c| c.kind)
-}
-
-fn members(diff: &Diff) -> Vec<Vec<String>> {
-    diff.delta
-        .clusters
+#[track_caller]
+fn row<'a>(facts: &'a ChangeSet, key: &DefKey) -> &'a Row {
+    facts
+        .rows
         .iter()
-        .map(|c| c.members.iter().map(|m| m.to_string()).collect())
-        .collect()
+        .find(|r| &r.key == key)
+        .unwrap_or_else(|| panic!("no row for {key:?}"))
 }
 
-/// What the report does for one failure when the program owns the search: the change set, the
-/// annotation, and a verdict that says whose the search was.
-fn attribute(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> Attribution {
-    let baseline = before.baseline(key);
-    let mut classify = Renormalizing::new(after, &baseline, independent);
-    let key = sym(key);
-    let suspects: Vec<Symbol> = after
-        .hashes
-        .closure
-        .get(&key)
-        .into_iter()
-        .flatten()
-        .filter(|n| **n != key)
-        .cloned()
-        .collect();
-    let regression = Regression {
-        key: &key,
-        test_hash: after.test_hash(key.as_str()),
-        baseline: &baseline,
-        hashes: &after.hashes,
-    };
-    let diff = diff(&regression, &mut classify, &DepEdges::from(&after.hashes));
-    let mut attribution = Attribution::from_suspects(&suspects, &after.hashes);
-    attribution.annotate(&diff.delta);
-    attribution.resolve(ply_test::Bisection::not_attempted(Skipped::Delegated), None);
-    attribution
+fn value(name: &str) -> DefKey {
+    DefKey::value(sym(name))
+}
+
+/// Its body is today's, hashed as the baseline wrote references: what an edit leaves.
+fn edited(r: &Row) -> bool {
+    r.before != r.after && r.rehashed.is_some() && r.rehashed != r.before
+}
+
+/// Its hash moved and its body did not: what an edit beneath it leaves.
+fn derived(r: &Row) -> bool {
+    r.before != r.after && r.rehashed == r.before
+}
+
+fn untouched(r: &Row) -> bool {
+    r.before.is_some() && r.before == r.after
 }
 
 /// A chain of  definitions, each calling the one below it, so an edit at the leaf reaches
@@ -158,18 +146,13 @@ fn a_deep_chain_yields_one_candidate_and_sixty_three_derived_ones() {
     let before = Compiled::new(&chain(64, "n + 1"));
     let after = Compiled::new(&chain(64, "n + 2"));
 
-    let diff = diff_of(&before, &after, "m.deep", true);
-    assert_eq!(diff.delta.changes.len(), 64);
-    assert_eq!(diff.delta.candidates(), 1);
-    assert_eq!(kind_of(&diff, "m.f000"), Some(ChangeKind::Edited));
-    assert_eq!(kind_of(&diff, "m.f063"), Some(ChangeKind::Derived));
-    assert!(diff.unclassified.is_empty(), "{:?}", diff.unclassified);
-
-    let out = attribute(&before, &after, "m.deep", true);
+    let facts = facts_of(&before, &after, "m.deep", true);
+    assert_eq!(facts.rows.len(), 64);
+    assert!(edited(row(&facts, &value("m.f000"))));
     assert_eq!(
-        out.suspects[0].name,
-        sym("m.f000"),
-        "the edited definition ranks above the sixty-three that only moved under it"
+        facts.rows.iter().filter(|r| derived(r)).count(),
+        63,
+        "every caller above the edit only moved under it"
     );
 }
 
@@ -192,24 +175,13 @@ fn editing_an_effect_handler_names_the_definition_that_carries_it() {
     let before = Compiled::new(HANDLED);
     let after = Compiled::new(&HANDLED.replace("n * 10", "n * 11"));
 
-    let diff = diff_of(&before, &after, "m.handled", true);
-    assert_eq!(kind_of(&diff, "m.seeded"), Some(ChangeKind::Edited));
-    assert_eq!(
-        kind_of(&diff, "m.lookup"),
-        None,
+    let facts = facts_of(&before, &after, "m.handled", true);
+    assert!(edited(row(&facts, &value("m.seeded"))));
+    assert!(
+        untouched(row(&facts, &value("m.lookup"))),
         "the performer did not move"
     );
-    assert_eq!(kind_of(&diff, "m.twice"), None);
-    assert!(diff.unclassified.is_empty());
-
-    let out = attribute(&before, &after, "m.handled", true);
-    assert!(
-        out.suspects
-            .iter()
-            .any(|s| s.name == sym("m.seeded") && s.change == Some(ChangeKind::Edited)),
-        "the definition carrying the handler is a ranked suspect: {:?}",
-        out.suspects
-    );
+    assert!(untouched(row(&facts, &value("m.twice"))));
 }
 
 #[test]
@@ -220,12 +192,11 @@ fn editing_an_effect_declaration_makes_the_declaration_the_candidate() {
         "read get[users](key: Int) -> Int\n  read peek[users](key: Int) -> Int",
     ));
 
-    let diff = diff_of(&before, &after, "m.handled", true);
-    assert_eq!(kind_of(&diff, "m.db"), Some(ChangeKind::Edited));
+    let facts = facts_of(&before, &after, "m.handled", true);
+    assert!(edited(row(&facts, &DefKey::decl(sym("m.db")))));
     for user in ["m.lookup", "m.twice", "m.seeded"] {
-        assert_eq!(kind_of(&diff, user), Some(ChangeKind::Derived), "{user}");
+        assert!(derived(row(&facts, &value(user))), "{user}");
     }
-    assert_eq!(diff.delta.candidates(), 1);
 }
 
 #[test]
@@ -249,30 +220,21 @@ test "chain" { assert_eq(top(1), 4) }
 "#,
     );
 
-    let diff = diff_of(&before, &after, "m.chain", true);
-    assert_eq!(kind_of(&diff, "m.leaf"), Some(ChangeKind::Edited));
-    assert_eq!(
-        kind_of(&diff, "m.mid"),
-        None,
-        "`mid` was renamed, not removed"
+    let facts = facts_of(&before, &after, "m.chain", true);
+    assert!(edited(row(&facts, &value("m.leaf"))));
+    let mid = row(&facts, &value("m.mid"));
+    assert_eq!(mid.after, None);
+    assert!(
+        mid.renamed,
+        "`mid` was renamed, not removed: the program re-normalizes to its baseline hash"
     );
+    let middle = row(&facts, &value("m.middle"));
+    assert_eq!(middle.before, None);
     assert_eq!(
-        kind_of(&diff, "m.middle"),
-        Some(ChangeKind::Derived),
+        middle.rehashed, mid.before,
         "and `middle` is that same definition, its hash moved by the edit below it"
     );
-    assert_eq!(
-        kind_of(&diff, "m.top"),
-        Some(ChangeKind::Derived),
-        "nobody edited `top`"
-    );
-    assert_eq!(members(&diff), vec![vec!["m.leaf".to_string()]]);
-
-    let out = attribute(&before, &after, "m.chain", true);
-    assert_eq!(
-        out.bisection.search.evaluated, 0,
-        "a rename beside one edit is still a one-cluster delta"
-    );
+    assert!(derived(row(&facts, &value("m.top"))), "nobody edited `top`");
 }
 
 #[test]
@@ -289,48 +251,16 @@ test "parity" { assert(even(4)) }
         "fn odd(n: Int) -> Bool = if n == 0 { true } else { even(n - 1) }",
     ));
 
-    let diff = diff_of(&before, &after, "m.parity", true);
-    assert_eq!(kind_of(&diff, "m.even"), Some(ChangeKind::Edited));
-    assert_eq!(kind_of(&diff, "m.odd"), Some(ChangeKind::Edited));
+    let facts = facts_of(&before, &after, "m.parity", true);
+    assert!(edited(row(&facts, &value("m.even"))));
+    assert!(edited(row(&facts, &value("m.odd"))));
+    let pair = vec![value("m.even"), value("m.odd")];
     assert_eq!(
-        members(&diff),
-        vec![vec!["m.even".to_string(), "m.odd".to_string()]],
-        "the component is one atom of the search"
+        row(&facts, &value("m.even")).component,
+        pair,
+        "the component is named, so the search can take it as one atom"
     );
-    assert!(
-        diff.delta
-            .clusters
-            .iter()
-            .all(|c| c.reason == FusionReason::Component),
-        "and says so: {:?}",
-        diff.delta.clusters
-    );
-}
-
-/// The right answer for the wrong reason: `StoreClassify` fuses whenever the baseline interface is missing.
-#[test]
-fn a_recursive_pair_with_no_baseline_interface_fuses_into_the_right_group() {
-    let src = r#"
-fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
-fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
-
-test "parity" { assert(even(4)) }
-"#;
-    let before = Compiled::new(src);
-    let after = Compiled::new(&src.replace("{ false }", "{ true }"));
-
-    let diff = diff_of(&before, &after, "m.parity", false);
-    assert_eq!(
-        members(&diff),
-        vec![vec!["m.even".to_string(), "m.odd".to_string()]]
-    );
-
-    let out = attribute(&before, &after, "m.parity", false);
-    assert_eq!(
-        out.suspects.len(),
-        2,
-        "both members of the fused component are suspects"
-    );
+    assert_eq!(row(&facts, &value("m.odd")).component, pair);
 }
 
 const COLLIDE: &str = r#"
@@ -369,30 +299,16 @@ fn a_name_shared_by_a_fn_and_a_type_still_names_the_edited_one() {
         before.hashes.defs.get(&name).copied()
     );
 
-    let diff = diff_of(&before, &after, "m.t", true);
-    assert_eq!(kind_of(&diff, "m.Amount"), Some(ChangeKind::Edited));
-    assert_eq!(
-        diff.delta
-            .change_of(&DefKey::value(name.clone()))
-            .map(|c| c.kind),
-        None,
+    let facts = facts_of(&before, &after, "m.t", true);
+    assert!(edited(row(&facts, &DefKey::decl(name.clone()))));
+    assert!(
+        untouched(row(&facts, &DefKey::value(name.clone()))),
         "the function of that name did not change"
     );
-    assert_eq!(
-        kind_of(&diff, "m.use_it"),
-        Some(ChangeKind::Derived),
+    assert!(
+        derived(row(&facts, &value("m.use_it"))),
         "nobody edited `use_it`; it only mentions the type"
     );
-    assert!(diff.unclassified.is_empty(), "{:?}", diff.unclassified);
-
-    let out = attribute(&before, &after, "m.t", true);
-    let innocent = out
-        .suspects
-        .iter()
-        .find(|s| s.name == sym("m.use_it"))
-        .expect("the dependent is still a suspect");
-    assert!(!innocent.culprit);
-    assert_eq!(innocent.change, Some(ChangeKind::Derived));
 }
 
 #[test]
@@ -418,58 +334,23 @@ test "t" { assert_eq(use_it(1), 2) }
     assert!(after.hashes.defs.contains_key(&sym("m.spare")));
     assert!(before.baseline("m.t").hash(&sym("m.spare")).is_none());
 
-    let diff = diff_of(&before, &after, "m.t", true);
+    let facts = facts_of(&before, &after, "m.t", true);
     assert_eq!(
-        kind_of(&diff, "m.spare"),
-        None,
-        "a genuinely added definition is read as a rename of `plain`"
+        row(&facts, &value("m.spare")).after,
+        row(&facts, &value("m.plain")).before,
+        "a genuinely added definition hashes as `plain` did, so it reads as a rename of it"
     );
-    assert_eq!(kind_of(&diff, "m.use_it"), Some(ChangeKind::Edited));
+    assert!(edited(row(&facts, &value("m.use_it"))));
 }
 
 #[test]
-fn documents_a_single_unrelated_change_is_named_without_asking_whether_it_matters() {
-    let before = Compiled::new(&chain(4, "n + 1"));
-    let after = Compiled::new(&chain(4, "n + 2"));
-
-    let out = attribute(&before, &after, "m.deep", true);
-    assert_eq!(
-        out.suspects[0].name,
-        sym("m.f000"),
-        "the edited definition ranks above the sixty-three that only moved under it"
-    );
-    assert_eq!(
-        out.bisection.search.evaluated, 0,
-        "nothing was ever run to check that this change is the cause"
-    );
-}
-
-#[test]
-fn two_diagnoses_of_one_real_failure_agree_byte_for_byte() {
+fn two_readings_of_one_real_failure_agree() {
     let before = Compiled::new(&chain(16, "n + 1"));
     let after = Compiled::new(&chain(16, "n + 2"));
-    let render = || {
-        let out = attribute(&before, &after, "m.deep", true);
-        assert_eq!(
-            out.suspects[0].name,
-            sym("m.f000"),
-            "the edited definition ranks above the sixty-three that only moved under it"
-        );
-        ply_test::report::failure_json(&ply_test::Failure {
-            name: "deep".to_string(),
-            key: sym("m.deep"),
-            diagnostic: ply_span::Diagnostic::error(ply_span::codes::ASSERTION_FAILED, "x"),
-            defect: false,
-            host: false,
-            suspects: Vec::new(),
-            assertion: None,
-            attribution: out,
-            seed: None,
-            race: None,
-        })
-        .to_string()
-    };
-    assert_eq!(render(), render());
+    assert_eq!(
+        facts_of(&before, &after, "m.deep", true),
+        facts_of(&before, &after, "m.deep", true)
+    );
 }
 
 fn enter(name: &str) -> Event {

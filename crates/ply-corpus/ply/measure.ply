@@ -1,48 +1,47 @@
-// `measure` — how fast the machine is, in-process.
+// `measure` — what a call costs the machine in-process, and what a corpus costs the product.
 //
 // A number about the interpreter has to come from *inside* the process: a subprocess costs
 // milliseconds before a program does anything, and the things worth measuring — a continuation
-// resumed, a definition called, a cell opened — take microseconds. So each scenario writes a small
-// fixture, drives it through the machine the corpus program itself holds, and reads both the clock
-// and the accounting the runtime keeps. Every measured value is pinned with `observe`, so a tier
-// that can see through the work still has to do it.
+// resumed, a definition called — take microseconds. So each fixture is written, front-ended by this
+// program and driven through the machine it is lent, and both the clock and the runtime's own
+// accounting are read. Every measured value is pinned with `observe`, so a tier that can see through
+// the work still has to do it. The fixtures are Ply, and they *are* the artifact: the resumption
+// fixture resumes one handler's continuation 0, 1, 2 and 4 times, so the difference between two
+// points is what one resumption costs.
 //
-// The fixture's front end is this module's own: it reads the fixture back and the checkout's
-// standard library the way `ply` reads a program and its shelf, runs the compiler's front end over
-// them, and hands the machine what that answered — so the two phases before a load are timed here.
-//
-// The fixtures are Ply, and they *are* the artifact: `multi_shot` resumes a handler's continuation
-// 0, 1, 2 and 4 times, so the difference between two rows is what one resumption costs.
+// Over a corpus the rest is the product's own reports: what opening the store a run filled costs
+// (`ply cache stats`), every test on one worker, taken first and then again (`ply test --jobs 1`),
+// and the schedule a cold run needs (the same report's selection).
 
 import cli.machine
-import cli.machine (Accounting, Value, VInt, machine, default_options)
-import cli.cache (SourceFile)
-import cli.program (Front, pseudo_path)
-import compiler.front (Analysed, Pulled, Refused, analyse_pulling_std_with, dump_of)
-import compiler.resolve (Diag, Source)
-import spine (under)
+import cli.machine (Accounting, Value, VInt, machine)
+import compiler.front (Analysed, Pulled, Refused, analyse_pulling_std_with)
+import harness
+import harness (Loaded)
+import report
+import report (Row, Measurement, AtLeast, WithinRatio, holding, number, ms_of_us, exact, row,
+               untaken)
+import spine
+import suite.schedule
 import std.fs (fs)
-import std.fs
-import std.json (Json, Str, Number, Bool, Null, Object, object, array)
+import std.json (Json, Str, Number, Null, Object, object, array)
 import std.json
-import std.list (sort)
+import std.process (process)
+import std.config (config)
 import std.time (time)
 
 // One point on a curve: the count that names it, and what one call cost. Wall time and the runtime's
 // own step count say different things — one is what a user feels, the other is the work done.
 pub type Point = {
   n: Int,
-  /// Nanoseconds a call took, from the fastest of several rounds.
+  // Nanoseconds a call took, from the fastest of several rounds.
   nanos: Int,
-  /// Runtime steps a call took.
+  // Runtime steps a call took.
   steps: Int,
-  /// What this point cost over the previous one, per unit of `n`.
+  // What this point cost over the previous one, per unit of `n`.
   marginal_nanos: Int,
   marginal_steps: Int,
 }
-
-/// What the fixture cost before the machine held it: reading its sources, then the front end.
-pub type Loaded = { read_us: Int, front_us: Int }
 
 pub type Curve = { label: String, unit: String, loaded: Loaded, points: List<Point> }
 
@@ -50,13 +49,10 @@ pub type Curve = { label: String, unit: String, loaded: Loaded, points: List<Poi
 // calls of a few microseconds each is a millisecond, which even a microsecond clock resolves.
 fn calls_per_round() -> Int = 200
 
-// Where the standard library the fixtures are checked against lives under the `repo` root.
-fn std_tree() -> String = "crates/ply-std/ply"
-
 // --- The fixtures -----------------------------------------------------------
 
-/// The same residual computation, resumed a varying number of times. This is the whole experiment:
-/// `r0` resumes nothing, `r4` resumes four times, and the rest of each body is identical.
+// The same residual computation, resumed a varying number of times. This is the whole experiment:
+// `r0` resumes nothing, `r4` resumes four times, and the rest of each body is identical.
 pub fn resumption_source() -> String =
   "effect amb { read pick[coin]() -> Int }\n" ++ "\n"
     ++ "fn residual(b: Int) -> Int = fold(range(0, 200), 0, |acc, x| acc + x + b)\n"
@@ -81,152 +77,23 @@ pub fn resumption_source() -> String =
     ++ "  return x -> x\n"
     ++ "}\n"
 
-/// A call that does a fixed amount of arithmetic, so a throughput number has an obvious unit.
+// A call that does a fixed amount of arithmetic, so a throughput number has an obvious unit.
 pub fn work_source() -> String =
   "pub fn work(n: Int) -> Int =\n" ++ "  fold(range(0, 200), 0, |acc, x| acc + x * n)\n"
 
-// --- The front end, over sources read here ----------------------------------------
-
-/// Every `.ply` under `dir` of the `repo` root as the shipped module it is: `std.json` is
-/// `json.ply`, `std.http.server` is `http/server.ply`.
-fn shelved(dir: String, module: String, acc: List<Source>) -> List<Source> / {fs.read[repo]} =
-  match fs.list_dir[repo](dir) {
-    None -> acc,
-    Some(names) ->
-      fold(sort(names), acc, |found: List<Source>, name: String| {
-        let path = under(dir, name);
-        match fs.kind[repo](path) {
-          fs::Dir -> shelved(path, module ++ "." ++ name, found),
-          fs::File -> if !string_ends_with(name, ".ply") { found } else {
-            match fs.read_file[repo](path) {
-              None -> found,
-              Some(src) ->
-                push(found, {
-                  name: bytes_of_string(
-                    module ++ "." ++ string_slice(name, 0, string_len(name) - 4),
-                  ),
-                  src: src,
-                }),
-            }
-          },
-          _ -> found,
-        }
-      }),
-  }
-
-fn shelf() -> Result<List<Source>, String> / {fs.read[repo]} =
-  match shelved(std_tree(), "std", []) {
-    [] ->
-      Err(
-        "no standard library under `" ++ std_tree()
-          ++ "` of the `repo` root: bind the checkout as `--fs repo=PATH`",
-      ),
-    found -> Ok(found),
-  }
-
-fn joined_diags(diags: List<Diag>) -> String =
-  fold(diags, "", |acc: String, d: Diag|
-    if acc == "" { string_of_bytes_lossy(d.message) }
-    else { acc ++ "; " ++ string_of_bytes_lossy(d.message) })
-
-/// The fixture `name` in `scratch`, read back, and the shelf beside it, through the compiler's own
-/// front end: the front end the machine is handed, and what the two phases before it cost.
-fn front_end(
-  scratch: String,
-  name: String,
-) -> Result<(Front, Loaded), String> / {fs.read[work], fs.read[repo], time.elapsed_us} = {
-  let started = time.elapsed_us();
-  let path = under(scratch, name ++ ".ply");
-  match fs.read_file[work](path) {
-    None -> Err("the " ++ name ++ " fixture could not be read back from `" ++ path ++ "`"),
-    Some(text) -> match shelf() {
-      Err(why) -> Err(why),
-      Ok(shipped) -> {
-        let read = time.elapsed_us();
-        let pulled: Pulled = analyse_pulling_std_with(
-          [{ name: bytes_of_string(name), src: text }],
-          shipped,
-          [],
-          [],
-        );
-        let analysed = time.elapsed_us();
-        match pulled.out {
-          // The corpus writes these fixtures itself, so one that does not check is a defect in the
-          // corpus rather than a user's mistake, and it says so in the fixture's own words.
-          Refused(diags) ->
-            Err("the " ++ name ++ " fixture would not check: " ++ joined_diags(diags)),
-          Analysed(w) -> {
-            let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
-              map_insert(acc, s.name, s.src));
-            // One place per module the front end numbered: the fixture, then the shelf it pulled.
-            let places: List<{ path: String, text: Bytes }> = fold(
-              pulled.pulled,
-              [{ path: path, text: text }],
-              |acc: List<{ path: String, text: Bytes }>, n: Bytes|
-                push(acc, {
-                  path: pseudo_path(string_of_bytes_lossy(n)),
-                  text: match map_get(texts, n) { Some(t) -> t, None -> b"" },
-                }),
-            );
-            let files: List<SourceFile> = map(range(0, len(places)), |i: Int| {
-              let place = match list_at(places, i) {
-                Some(p) -> p,
-                None -> panic("a place for every module"),
-              };
-              {
-                path: place.path,
-                name: match list_at(w.mods, i) {
-                  Some(mo) -> string_of_bytes_lossy(mo.name),
-                  None -> panic("a module for every place"),
-                },
-                text: place.text,
-              }
-            });
-            let loaded: Loaded = { read_us: read - started, front_us: analysed - read };
-            let front: Front = {
-              dump: dump_of(Analysed(w)),
-              files: files,
-              read_ms: loaded.read_us / 1000,
-              front_ms: loaded.front_us / 1000,
-              file_ms: 0,
-              cached: false,
-            };
-            Ok((front, loaded))
-          },
-        }
-      },
-    },
-  }
-}
-
 // --- Driving one ------------------------------------------------------------
 
-/// Writes a fixture into a directory of its own under `dir` and hands back that directory, which the
-/// machine is handed too: both are relative to the working directory, which is the `work` root.
-fn written(
-  dir: String,
-  name: String,
-  source: String,
-) -> Result<String, String> / {fs.create_dir[work], fs.write_file[work]} = {
-  let here = under(dir, "measure-" ++ name);
-  if !fs.create_dir[work](here) { Err("the fixture directory could not be made: " ++ here) } else if !fs.write_file[work](
-      under(here, name ++ ".ply"),
-      bytes_of_string(source),
-    ) { Err("the fixture could not be written: " ++ here) }
-  else { Ok(here) }
-}
-
-/// One entry of a loaded fixture, measured over `repeats` rounds, the fastest kept. The first call
-/// is outside the clock: lazy lowering is not what a caller pays per call, and neither is its
-/// accounting.
+// One entry of a loaded fixture, measured over `repeats` rounds, the fastest kept. The first call
+// is outside the clock: lazy lowering is not what a caller pays per call, and neither is its
+// accounting.
 fn point_at(
   n: Int,
   name: String,
   args: List<Value>,
   repeats: Int,
-) -> Result<Point, String> / {time.elapsed_us, machine.call[bench], machine.accounting[bench]} = {
-  match machine.call[bench](name, args) {
-    Err(raised) -> Err("`" ++ name ++ "` raised " ++ raised.code ++ ": " ++ raised.message),
+) -> Result<Point, String> / {time.elapsed_us, machine.call[bench], machine.accounting[bench]} =
+  match harness::called(name, args) {
+    Err(why) -> Err(why),
     Ok(_) -> {
       let _ = machine.accounting[bench]();
       let best = fold(range(0, if repeats < 1 { 1 } else { repeats }), -1, |acc: Int, _r: Int| {
@@ -258,16 +125,15 @@ fn point_at(
       }
     },
   }
-}
 
-/// How many of `times` calls raised, with every one of them pinned.
+// How many of `times` calls raised, with every one of them pinned.
 fn calls(name: String, args: List<Value>, times: Int) -> Int / {machine.call[bench]} =
   observe(
     fold(range(0, times), 0, |bad: Int, _i: Int|
       match machine.call[bench](name, args) { Ok(_) -> bad, Err(_) -> bad + 1 }),
   )
 
-/// Every point, or the first failure: a curve with a missing row says less than the reason for it.
+// Every point, or the first failure: a curve with a missing row says less than the reason for it.
 fn all_points(rows: List<Result<Point, String>>) -> Result<List<Point>, String> =
   fold(rows, Ok([]), |acc: Result<List<Point>, String>, row: Result<Point, String>|
     match acc {
@@ -275,7 +141,7 @@ fn all_points(rows: List<Result<Point, String>>) -> Result<List<Point>, String> 
       Ok(points) -> match row { Err(why) -> Err(why), Ok(p) -> Ok(push(points, p)) },
     })
 
-/// What each point cost over the one before it, per unit of `n`.
+// What each point cost over the one before it, per unit of `n`.
 fn margined(points: List<Point>) -> List<Point> =
   fold(points, [], |acc: List<Point>, p: Point|
     match acc {
@@ -291,14 +157,12 @@ fn margined(points: List<Point>) -> List<Point> =
       },
     })
 
-// --- The scenarios ----------------------------------------------------------
-
-/// What one continuation resumption costs, by resuming it a varying number of times.
+// What one continuation resumption costs, by resuming it a varying number of times.
 pub fn resumptions(
   dir: String,
   repeats: Int,
 ) -> Result<Curve, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
-  with_fixture(dir, "multishot", resumption_source(), "multishot.r0", |loaded: Loaded|
+  harness::with_fixture(dir, "multishot", resumption_source(), "multishot.r0", |loaded: Loaded|
     match all_points(
         map([0, 1, 2, 4], |n: Int| point_at(n, "multishot.r" ++ int_to_string(n), [], repeats)),
       ) {
@@ -307,76 +171,19 @@ pub fn resumptions(
         Ok({ label: "resumptions", unit: "resumption", loaded: loaded, points: margined(points) }),
     })
 
-/// The interpreter's throughput on one definition: the unit is a call, and the work inside it is
-/// fixed, so the step count is what the runtime saw.
-pub fn throughput(
+// The interpreter's throughput on one definition: the unit is a call, and the work inside it is
+// fixed, so the step count is what the runtime saw.
+pub fn call(
   dir: String,
   repeats: Int,
 ) -> Result<Curve, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
-  with_fixture(dir, "work", work_source(), "work.work", |loaded: Loaded|
+  harness::with_fixture(dir, "work", work_source(), "work.work", |loaded: Loaded|
     match point_at(1, "work.work", [VInt(1)], repeats) {
       Err(why) -> Err(why),
-      Ok(point) -> Ok({ label: "throughput", unit: "call", loaded: loaded, points: [point] }),
+      Ok(point) -> Ok({ label: "call", unit: "call", loaded: loaded, points: [point] }),
     })
 
-/// Take the fixture back out of the corpus: the bench's own scenarios compile this tree, and a
-/// stray `.ply` under it would be read as a module of the program.
-fn removed(dir: String, name: String) -> Unit / {fs.list_dir[work], fs.remove[work]} = {
-  // The contents go first: `remove` on a directory is `remove_dir`, which wants it empty.
-  let here = under(dir, "measure-" ++ name);
-  let _ = match fs.list_dir[work](here) {
-    None -> [],
-    Some(names) -> map(names, |entry: String| fs.remove[work](under(here, entry))),
-  };
-  let _ = fs.remove[work](here);
-  ()
-}
-
-/// Write the fixture, front-end it, load it, bind it, run `body`, and let go of the machine either
-/// way.
-fn with_fixture<a>(
-  dir: String,
-  name: String,
-  source: String,
-  entry: String,
-  body: (Loaded) -> Result<a, String> / {machine.accounting[bench], machine.call[bench], time.elapsed_us},
-) -> Result<a, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
-  match written(dir, name, source) {
-    Err(why) -> Err(why),
-    Ok(scratch) -> {
-      // Whatever happens below, the corpus is left as it was found.
-      let finish = |outcome: Result<a, String>| -> Result<a, String> {
-        removed(dir, name);
-        outcome
-      };
-      match front_end(scratch, name) {
-        Err(why) -> finish(Err(why)),
-        Ok(pair) -> {
-          let (front, loaded) = pair;
-          machine.configure[bench](default_options());
-          match machine.load[bench](scratch, Some(front)) {
-            Err(refusal) ->
-              finish(Err("the " ++ name ++ " fixture would not load: " ++ refusal_text(refusal))),
-            Ok(_) -> match machine.bound[bench](entry) {
-              Err(refusal) -> {
-                machine.drop[bench]();
-                finish(Err("the " ++ name ++ " fixture would not bind: " ++ refusal_text(refusal)))
-              },
-              Ok(_) -> {
-                let outcome = body(loaded);
-                machine.drop[bench]();
-                finish(outcome)
-              },
-            },
-          }
-        },
-      }
-    },
-  }
-
-fn refusal_text(refusal: machine::Refusal) -> String = joined_diags(refusal.diags)
-
-// --- The report -------------------------------------------------------------
+// --- The in-process rows ---------------------------------------------------------
 
 pub fn curve_json(c: Curve) -> Json =
   object([
@@ -404,47 +211,347 @@ pub fn curve_json(c: Curve) -> Json =
     },
   ])
 
-/// The whole section, or the reason there is none.
-pub fn measure_json(
+// A curve's numbers: what loading its fixture cost, then each point's call and steps under its name.
+fn curve_measurements(c: Curve, name_of: (Point) -> String) -> List<Measurement> =
+  fold(
+    c.points,
+    [number("read", c.loaded.read_us, "µs"), number("front", c.loaded.front_us, "µs")],
+    |acc: List<Measurement>, p: Point|
+      push(
+        push(acc, number(name_of(p), p.nanos, "ns")),
+        number(name_of(p) ++ "_steps", p.steps, "steps"),
+      ),
+  )
+
+fn resumed(p: Point) -> String = "r" ++ int_to_string(p.n)
+
+fn resumption_criterion() -> report::Criterion =
+  holding(
+    "each resumption does work: the steps climb with the count",
+    ["r0_steps", "r1_steps", "r2_steps", "r4_steps"],
+    |vs: List<Decimal>| climbing(vs),
+  )
+
+fn climbing(vs: List<Decimal>) -> Bool =
+  match fold(vs, Some(None), |acc: Option<Option<Decimal>>, v: Decimal|
+      match acc {
+        None -> None,
+        Some(None) -> Some(Some(v)),
+        Some(Some(before)) -> if before < v { Some(Some(v)) } else { None },
+      }) {
+    None -> false,
+    Some(_) -> true,
+  }
+
+pub fn resumption_row(curve: Result<Curve, String>) -> Row =
+  match curve {
+    Err(why) -> untaken("resumptions", resumption_criterion(), why),
+    Ok(c) ->
+      {
+        ..row("resumptions", resumption_criterion(), curve_measurements(c, resumed)),
+        detail: curve_json(c),
+      },
+  }
+
+pub fn call_row(curve: Result<Curve, String>) -> Row =
+  match curve {
+    Err(why) -> untaken("call", AtLeast("call_steps", 1m), why),
+    Ok(c) ->
+      {
+        ..row("call", AtLeast("call_steps", 1m), curve_measurements(c, |p: Point| "call")),
+        detail: curve_json(c),
+      },
+  }
+
+// --- The product's rows -------------------------------------------------------------
+
+// One `ply test --json` run of every test, read for what the throughput and schedule rows need.
+pub type Pass = {
+  tests: Int,
+  passed: Int,
+  failed: Int,
+  workers: Int,
+  // Every test's own duration, summed: the pass without the front end or the process around it.
+  execute_us: Int,
+  // What the backend cost before any test ran, when it compiled anything: analysis, and the code
+  // one worker is generated.
+  setup_us: Option<Int>,
+  wall_ms: Int,
+  selection: Map<String, Json>,
+}
+
+pub fn pass_of(j: Json, wall_ms: Int) -> Result<Pass, String> =
+  match j {
+    Object(m) -> match spine::field(m, "selection") {
+      Err(e) -> Err(e),
+      Ok(selection) -> match spine::field(m, "summary") {
+        Err(e) -> Err(e),
+        Ok(summary) ->
+          Ok({
+            tests: spine::int_field(selection, "total"),
+            passed: spine::int_field(summary, "passed"),
+            failed: spine::int_field(summary, "failed"),
+            workers: spine::int_field(m, "workers"),
+            execute_us: fold(
+              spine::objects(spine::array_field(m, "results")),
+              0,
+              |acc: Int, r: Map<String, Json>|
+                acc + spine::us_of_ms(spine::decimal_field(r, "duration_ms")),
+            ),
+            setup_us: match spine::field(m, "backend") {
+              Err(_) -> None,
+              Ok(b) -> match ((
+                  spine::opt_int_field(b, "analysis_nanos"),
+                  spine::opt_int_field(b, "codegen_nanos"),
+                )) {
+                (Some(a), Some(c)) -> Some((a + c) / 1000),
+                _ -> None,
+              },
+            },
+            wall_ms: wall_ms,
+            selection: selection,
+          }),
+      },
+    },
+    _ -> Err("the test report is not an object"),
+  }
+
+// Every test of the corpus on one worker, nothing read from a cache.
+fn one_pass(
+  dir: String,
+) -> Result<Pass, String> / {process.spawn[ply], config.get[env], time.elapsed_ms} = {
+  let started = time.elapsed_ms();
+  let done = spine::ply(
+    ["test", ".", "--json", "--no-cache", "--jobs", "1", "--color", "never"],
+    dir,
+  );
+  let wall = time.elapsed_ms() - started;
+  match spine::document(done) { Err(why) -> Err(why), Ok(j) -> pass_of(j, wall) }
+}
+
+fn passes(
+  dir: String,
+  left: Int,
+  acc: List<Pass>,
+) -> Result<List<Pass>, String> / {process.spawn[ply], config.get[env], time.elapsed_ms} =
+  if left <= 0 { Ok(acc) }
+  else { match one_pass(dir) { Err(e) -> Err(e), Ok(p) -> passes(dir, left - 1, push(acc, p)) } }
+
+fn fastest(ps: List<Pass>) -> Option<Pass> =
+  fold(ps, None, |acc: Option<Pass>, p: Pass|
+    match acc {
+      None -> Some(p),
+      Some(best) -> Some(if p.execute_us < best.execute_us { p } else { best }),
+    })
+
+pub fn pass_measurements(p: Pass) -> List<Measurement> = {
+  let counts = [
+    number("tests", p.tests, "tests"),
+    number("passed", p.passed, "tests"),
+    number("failed", p.failed, "tests"),
+    number("workers", p.workers, "workers"),
+    ms_of_us("execute", p.execute_us),
+  ];
+  let timed = match p.setup_us { Some(us) -> push(counts, ms_of_us("setup", us)), None -> counts };
+  push(timed, number("wall", p.wall_ms, "ms"))
+}
+
+fn first_criterion() -> report::Criterion =
+  holding(
+    "every test ran on one worker, and passed",
+    ["workers", "failed", "passed", "tests"],
+    |vs: List<Decimal>| match vs { [w, f, p, t] -> w == 1m && f == 0m && p == t, _ -> false },
+  )
+
+// The steady pass is the fastest of the later ones: a first pass that pays for what the machine
+// defers is no reading of the interpreter's speed, and neither is a steady one twice as slow as it.
+fn steady_criterion() -> report::Criterion = WithinRatio("execute", "first-pass", 2m)
+
+fn scheduling_criterion() -> report::Criterion =
+  holding(
+    "a cold run needs exactly the groups its shared tests alone need, and every test is isolated or shared",
+    ["tests", "isolated", "shared", "scheduled", "groups", "shared_groups"],
+    |vs: List<Decimal>|
+      match map(vs, |d: Decimal| match int_of_decimal(d, Down) { Some(n) -> n, None -> -1 }) {
+        [total, isolated, shared, scheduled, groups, shared_groups] ->
+          isolated + shared == total
+            && schedule::holds({
+              total: total,
+              isolated: isolated,
+              shared: shared,
+              region_contended: 0,
+              scheduled: scheduled,
+              groups: groups,
+              shared_groups: shared_groups,
+            }),
+        _ -> false,
+      },
+  )
+
+pub fn scheduling_measurements(selection: Map<String, Json>) -> List<Measurement> = {
+  let p = match spine::field(selection, "parallelism") { Ok(inner) -> inner, Err(_) -> map_new() };
+  let sizes = map(
+    spine::objects(spine::array_field(selection, "groups")),
+    |g: Map<String, Json>| len(spine::array_field(g, "tests")),
+  );
+  let largest = fold(sizes, 0, |acc: Int, n: Int| max(acc, n));
+  let smallest = fold(sizes, largest, |acc: Int, n: Int| min(acc, n));
+  let scheduled = spine::int_field(p, "scheduled");
+  [
+    number("tests", spine::int_field(p, "total"), "tests"),
+    number("isolated", spine::int_field(p, "isolated"), "tests"),
+    number("shared", spine::int_field(p, "shared"), "tests"),
+    number("region_contended", spine::int_field(p, "region_contended"), "tests"),
+    number("scheduled", scheduled, "tests"),
+    number("groups", spine::int_field(p, "groups"), "groups"),
+    number("shared_groups", spine::int_field(p, "shared_groups"), "groups"),
+    number("largest_group", largest, "tests"),
+    number("smallest_group", smallest, "tests"),
+    exact(
+      "largest_share",
+      if scheduled == 0 { 0m }
+      else { decimal_div(decimal_of_int(largest * 100), decimal_of_int(scheduled), 1, HalfEven) },
+      "%",
+    ),
+  ]
+}
+
+// What `ply cache stats` reports of the store under `dir`, the open timed at its fastest.
+fn store_measurements(
   dir: String,
   repeats: Int,
-) -> Json / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
-  match resumptions(dir, repeats) {
-    Err(why) -> object([{ key: "ok", value: Bool(false) }, { key: "why", value: Str(why) }]),
-    Ok(resumed) -> match throughput(dir, repeats) {
-      Err(why) -> object([{ key: "ok", value: Bool(false) }, { key: "why", value: Str(why) }]),
-      Ok(through) ->
-        object([
-          { key: "ok", value: Bool(true) },
-          { key: "resumptions", value: curve_json(resumed) },
-          { key: "throughput", value: curve_json(through) },
-        ]),
+) -> Result<List<Measurement>, String> / {process.spawn[ply], config.get[env]} =
+  stats_of(
+    fold(
+      range(0, if repeats < 1 { 1 } else { repeats }),
+      Ok(None),
+      |acc: Result<Option<Map<String, Json>>, String>, _i: Int|
+        match acc {
+          Err(e) -> Err(e),
+          Ok(best) -> match spine::report_json(spine::ply(["cache", "stats", ".", "--json"], dir)) {
+            Err(why) -> Err(why),
+            Ok(Object(m)) ->
+              Ok(
+                Some(match best {
+                  None -> m,
+                  Some(b) -> if spine::decimal_field(m, "open_ms")
+                      < spine::decimal_field(b, "open_ms") { m }
+                  else { b },
+                }),
+              ),
+            Ok(_) -> Err("the cache report is not an object"),
+          },
+        },
+    ),
+  )
+
+fn stats_of(best: Result<Option<Map<String, Json>>, String>) -> Result<List<Measurement>, String> =
+  match best {
+    Err(e) -> Err(e),
+    Ok(None) -> Err("the store was never opened"),
+    Ok(Some(m)) -> {
+      let frontend = match spine::field(m, "frontend") { Ok(f) -> f, Err(_) -> map_new() };
+      Ok([
+        exact("open", spine::decimal_field(m, "open_ms"), "ms"),
+        number("entries", spine::int_field(m, "entries"), "results"),
+        number("definitions_seen", spine::int_field(m, "definitions_seen"), "definitions"),
+        number("results_bytes", spine::int_field(m, "results_bytes"), "bytes"),
+        number("index_bytes", spine::int_field(frontend, "index_bytes"), "bytes"),
+        number("data_bytes", spine::int_field(frontend, "data_bytes"), "bytes"),
+      ])
     },
   }
 
-/// What a curve reads as: the load's two phases, then one line a point.
-pub fn curve_text(c: Curve) -> String =
-  fold(
-    c.points,
-    c.label ++ " (per " ++ c.unit ++ ") · loaded in " ++ int_to_string(c.loaded.read_us)
-      ++ "µs read + "
-      ++ int_to_string(c.loaded.front_us)
-      ++ "µs front\n",
-    |acc: String, p: Point|
-      acc ++ "  " ++ int_to_string(p.n) ++ " · " ++ int_to_string(p.nanos) ++ "ns · "
-        ++ int_to_string(p.steps)
-        ++ " steps"
-        ++ (if p.marginal_nanos == 0 { "" } else {
-          " · marginal " ++ int_to_string(p.marginal_nanos) ++ "ns, "
-            ++ int_to_string(p.marginal_steps)
-            ++ " steps"
-        })
-        ++ "\n",
-  )
+// The product's rows over a corpus: the store a run filled, opened; every test on one worker, first
+// and steady; and the schedule the first pass needed. The store is read before the passes, which
+// bypass it.
+fn product_rows(
+  corpus: String,
+  repeats: Int,
+  only_throughput: Bool,
+) -> List<Row> / {process.spawn[ply], config.get[env], time.elapsed_ms} = {
+  let store = if only_throughput { [] } else {
+    let filled = spine::report_json(
+      spine::ply(["test", ".", "--json", "--color", "never"], corpus),
+    );
+    let taken = match filled { Err(why) -> Err(why), Ok(_) -> store_measurements(corpus, repeats) };
+    [{ name: "store", criterion: AtLeast("entries", 1m), taken: taken, detail: Null }]
+  };
+  let runs = passes(corpus, 1 + (if repeats < 1 { 1 } else { repeats }), []);
+  let first = match runs {
+    Err(why) -> Err(why),
+    Ok(ps) -> match list_at(ps, 0) { Some(p) -> Ok(p), None -> Err("no pass ran") },
+  };
+  let steady = match runs {
+    Err(why) -> Err(why),
+    Ok(ps) -> match fastest(drop_first(ps)) { Some(p) -> Ok(p), None -> Err("no steady pass ran") },
+  };
+  let throughput = [
+    {
+      name: "first-pass",
+      criterion: first_criterion(),
+      taken: map_ok(first, pass_measurements),
+      detail: Null,
+    },
+    {
+      name: "steady-pass",
+      criterion: steady_criterion(),
+      taken: map_ok(steady, pass_measurements),
+      detail: Null,
+    },
+  ];
+  let scheduling = if only_throughput { [] } else {
+    [
+      {
+        name: "scheduling",
+        criterion: scheduling_criterion(),
+        taken: map_ok(first, |p: Pass| scheduling_measurements(p.selection)),
+        detail: Null,
+      },
+    ]
+  };
+  appended(appended(store, throughput), scheduling)
+}
+
+fn map_ok<a, b>(r: Result<a, String>, f: (a) -> b) -> Result<b, String> =
+  match r { Ok(x) -> Ok(f(x)), Err(e) -> Err(e) }
+
+fn drop_first<a>(xs: List<a>) -> List<a> =
+  fold(range(1, len(xs)), [], |acc: List<a>, i: Int|
+    match list_at(xs, i) { Some(x) -> push(acc, x), None -> acc })
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+// The whole subcommand: the in-process rows (unless only the throughput is asked for), then the
+// product's over the corpus when there is one.
+pub fn run(
+  corpus: String,
+  repeats: Int,
+  only_throughput: Bool,
+) -> Result<report::Report, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, time.elapsed_ms, process.spawn[ply], config.get[env], machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  if only_throughput && corpus == "" {
+    Err("`--only-throughput` times a corpus's tests: name the corpus")
+  } else {
+    // A fixture is written into the corpus it is measured beside, or the working directory without one.
+    let dir = if corpus == "" { "." } else { corpus };
+    let in_process = if only_throughput { [] }
+    else { [resumption_row(resumptions(dir, repeats)), call_row(call(dir, repeats))] };
+    let product = if corpus == "" { [] } else { product_rows(corpus, repeats, only_throughput) };
+    report::made(
+      "measure",
+      if corpus == "" { "measure" } else { "measure over " ++ corpus },
+      appended(in_process, product),
+      [{ key: "corpus", value: if corpus == "" { Null } else { Str(corpus) } }],
+    )
+  }
 
 // --- Tests ------------------------------------------------------------------
 
 fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) -> x, None -> spare }
+
+fn verdict_of(r: Row) -> report::Verdict =
+  match report::judge([r]) { [j] -> j.verdict, _ -> report::Inconclusive("no row") }
 
 test "the marginal cost is what one more resumption added, per resumption" {
   let zero: Point = { n: 0, nanos: 100, steps: 10, marginal_nanos: 0, marginal_steps: 0 };
@@ -465,15 +572,28 @@ test "the marginal cost is what one more resumption added, per resumption" {
   assert_eq(at(rows, 3, zero).marginal_steps, 20)
 }
 
-test "a curve reads as its load and then one line a point" {
-  let text = curve_text({
-    label: "work",
-    unit: "call",
-    loaded: { read_us: 40, front_us: 900 },
-    points: [{ n: 1, nanos: 250, steps: 7, marginal_nanos: 0, marginal_steps: 0 }],
-  });
-  assert(string_contains(text, "work (per call) · loaded in 40µs read + 900µs front"));
-  assert(string_contains(text, "1 · 250ns · 7 steps"))
+test "the resumption row passes only when every resumption adds steps" {
+  let curve = |steps: List<Int>| -> Curve {
+    {
+      label: "resumptions",
+      unit: "resumption",
+      loaded: { read_us: 40, front_us: 900 },
+      points: map(range(0, len(steps)), |i: Int|
+        {
+          n: at([0, 1, 2, 4], i, 0),
+          nanos: 100,
+          steps: at(steps, i, 0),
+          marginal_nanos: 0,
+          marginal_steps: 0,
+        }),
+    }
+  };
+  assert_eq(verdict_of(resumption_row(Ok(curve([10, 30, 50, 90])))), report::Pass);
+  assert(verdict_of(resumption_row(Ok(curve([10, 30, 30, 90])))) != report::Pass);
+  assert_eq(
+    verdict_of(resumption_row(Err("the fixture would not check"))),
+    report::Inconclusive("the fixture would not check"),
+  )
 }
 
 test "the fixtures check against the compiler's front end with no shelf pulled" {
@@ -488,4 +608,46 @@ test "the fixtures check against the compiler's front end with no shelf pulled" 
   };
   assert(checks("multishot", resumption_source()));
   assert(checks("work", work_source()))
+}
+
+fn a_report() -> Json =
+  match json::parse(
+      bytes_of_string(
+        "{\"workers\": 1, \"selection\": {\"total\": 3, \"parallelism\": {\"total\": 3, \"isolated\": 2, \"shared\": 1, \"region_contended\": 0, \"scheduled\": 3, \"groups\": 1, \"shared_groups\": 1}, \"groups\": [{\"tests\": [0, 1, 2]}]}, \"summary\": {\"passed\": 3, \"failed\": 0}, \"backend\": {\"analysis_nanos\": 2000000, \"codegen_nanos\": 1500000}, \"results\": [{\"duration_ms\": 1.5}, {\"duration_ms\": 0.25}, {\"duration_ms\": 0.25}]}",
+      ),
+    ) {
+    Ok(j) -> j,
+    Err(e) -> panic(e.message),
+  }
+
+test "a pass is the test report's own numbers" {
+  match pass_of(a_report(), 40) {
+    Err(why) -> panic(why),
+    Ok(p) -> {
+      assert_eq((p.tests, p.passed, p.failed, p.workers), (3, 3, 0, 1));
+      assert_eq(p.execute_us, 2000);
+      assert_eq(p.setup_us, Some(3500));
+      assert_eq(
+        verdict_of(row("first-pass", first_criterion(), pass_measurements(p))),
+        report::Pass,
+      );
+      assert(
+        verdict_of(row("first-pass", first_criterion(), pass_measurements({ ..p, workers: 4 })))
+          != report::Pass,
+      )
+    },
+  }
+}
+
+test "the schedule row is the product's own rule over its selection" {
+  match pass_of(a_report(), 40) {
+    Err(why) -> panic(why),
+    Ok(p) -> {
+      let ms = scheduling_measurements(p.selection);
+      assert_eq(report::value_of(ms, "largest_group"), Some(3m));
+      assert_eq(verdict_of(row("scheduling", scheduling_criterion(), ms)), report::Pass);
+      let split = map(ms, |m: Measurement| if m.name == "groups" { { ..m, value: 2m } } else { m });
+      assert(verdict_of(row("scheduling", scheduling_criterion(), split)) != report::Pass)
+    },
+  }
 }

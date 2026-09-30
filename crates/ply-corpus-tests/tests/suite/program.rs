@@ -16,18 +16,27 @@ fn a_line_the_program_cannot_read_is_refused_with_exit_2() {
 #[test]
 fn a_subcommand_the_executor_runs_comes_back_through_the_program() {
     let dir = tempfile::tempdir().unwrap();
-    let out = delegated(dir.path(), &["regions", "--hypothetical", "12:3", "--json"]);
+    std::fs::write(
+        dir.path().join("laws.ply"),
+        "law \"doubling is adding\"\n  forall (n: Int) {\n    n + n == n * 2\n  }\n",
+    )
+    .unwrap();
+    let out = delegated(
+        dir.path(),
+        &["prove", "laws.ply", "--cases", "20", "--json"],
+    );
     assert!(
         out.status.success(),
         "the delegated run failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let rows = document(&out);
+    let runs = document(&out);
     assert_eq!(
-        rows.as_array().map(Vec::len),
+        runs.as_array().map(Vec::len),
         Some(1),
-        "one hypothetical asked for is one row: {rows:#}"
+        "one project asked for is one row: {runs:#}"
     );
+    assert_eq!(runs[0]["obligations"].as_u64(), Some(1), "{runs:#}");
 }
 
 #[test]
