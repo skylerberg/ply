@@ -4,7 +4,7 @@
 //! reads no type.
 
 use crate::{ClosureKind, IntTy, Symbol, Synth, Value};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Carry {
@@ -27,8 +27,9 @@ pub enum Carry {
     Open,
 }
 
-/// Each constructor's fields over its type's parameters, by program-wide name.
-pub type CtorCarries = HashMap<Symbol, Vec<Carry>>;
+/// Each constructor's fields over its type's parameters, by program-wide name; ordered, so a
+/// front end reads and prints alike every time.
+pub type CtorCarries = BTreeMap<Symbol, Vec<Carry>>;
 
 impl Carry {
     /// Each variable `n` replaced by `args[n]`, and by [`Carry::Open`] past them.
