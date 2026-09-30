@@ -66,10 +66,11 @@ fn mixed(n: Int) -> Int =
 
 /// A width may not cross the seam, so these are declined rather than answered.
 const CROSSES: &str = r#"
-fn narrows(n: Int) -> U32 = u32_of_int(n)
-fn widens(w: U32) -> Int = int_of_u32(w)
+fn narrows(n: Int) -> U32 requires n >= 0 ensures int_of_u32(result) == n = u32_of_int(n)
+fn widens(w: U32) -> Int requires int_of_u32(w) > 0 = int_of_u32(w)
 type Word = { w: U32 }
 fn boxed(n: Int) -> Word = {w: u32_of_int(n)}
+law "no word is seven" forall (w: U32) { int_of_u32(w) != 7 }
 "#;
 
 #[test]
@@ -217,6 +218,10 @@ fn a_signature_naming_a_width_is_declined_rather_than_answered() {
         ("m.narrows", vec![Value::Int(7)]),
         ("m.widens", vec![Value::Int(7)]),
         ("m.boxed", vec![Value::Int(7)]),
+        // A clause is entered with its owner's parameters, and an `ensures` with `result` too.
+        ("m.narrows#ensures#0", vec![Value::Int(7), Value::Int(7)]),
+        ("m.widens#requires#0", vec![Value::Int(7)]),
+        ("m.law#0.body", vec![Value::Int(7)]),
     ] {
         assert!(
             unit.compiled().iter().any(|f| f == name),
@@ -226,7 +231,17 @@ fn a_signature_naming_a_width_is_declined_rather_than_answered() {
         assert_eq!(
             call(unit, name, &args),
             None,
-            "`{name}` crossed the seam, which would answer an `Int` where a width was declared"
+            "`{name}` crossed the seam, where a width reads as an `Int`"
         );
     }
+    // A `requires` is entered without `result`, so one over an `Int` crosses nothing wide.
+    assert!(
+        bodies.admits("m.narrows#requires#0"),
+        "refused: {:?}",
+        unit.refusals()
+    );
+    assert_eq!(
+        call(unit, "m.narrows#requires#0", &[Value::Int(7)]),
+        Some(Value::Bool(true))
+    );
 }
