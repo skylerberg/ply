@@ -263,12 +263,12 @@ fn the_json_provenance_is_the_same_on_every_run() {
 
 #[test]
 fn the_example_service_reads_as_a_map_of_the_api_to_what_it_touches() {
-    let desk = repo().join("examples/desk.ply");
-    if !desk.exists() {
-        return;
-    }
     let dir = tempfile::tempdir().expect("a temp dir");
-    std::fs::copy(&desk, dir.path().join("desk.ply")).expect("the example is copied");
+    std::fs::copy(
+        repo().join("examples/desk.ply"),
+        dir.path().join("desk.ply"),
+    )
+    .expect("the example is copied");
 
     let text = types(dir.path(), &[]);
     assert!(
@@ -284,22 +284,32 @@ fn the_example_service_reads_as_a_map_of_the_api_to_what_it_touches() {
     }
 
     // Whatever sets the example declares, `--types` alone names none of them.
-    let source = std::fs::read_to_string(&desk).expect("the example is readable");
-    for line in source.lines() {
-        let Some(rest) = line.strip_prefix("effect set ") else {
-            continue;
-        };
-        let name = rest
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .next()
-            .expect("a set name");
+    let explained = json_types(dir.path(), &["--explain"]);
+    let desk = explained["modules"]
+        .as_array()
+        .expect("a module table")
+        .iter()
+        .find(|m| m["name"] == "desk")
+        .unwrap_or_else(|| panic!("no module `desk` in {explained}"));
+    let sets: Vec<&str> = desk["effect_sets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`--explain` gave `desk` no set table: {desk}"))
+        .iter()
+        .map(|s| s["name"].as_str().expect("a set has a name"))
+        .collect();
+    assert!(
+        !sets.is_empty(),
+        "the desk declares no `effect set`, so nothing here is checked: {desk}"
+    );
+    let provenance = types(dir.path(), &["--explain"]);
+    for name in sets {
         assert!(
             !text.contains(name),
             "`ply check --types` printed the alias `{name}`:\n{text}"
         );
         assert!(
-            types(dir.path(), &["--explain"]).contains(&format!("effect set {name}")),
-            "`--explain` must add `{name}` back as provenance"
+            provenance.contains(&format!("effect set {name}")),
+            "`--explain` must add `{name}` back as provenance:\n{provenance}"
         );
     }
 }
