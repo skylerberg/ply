@@ -2730,13 +2730,14 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads.
 * No file handles — `fs` reads a range and appends by path, with nothing open
-  between calls — and no recursive walk, permissions or `stdin`; no
-  cancellation or backpressure; no migrations or live schema check; HTTP/1.1
-  only; no authentication framework.
+  between calls — and no recursive walk or permissions; no cancellation or
+  backpressure; no migrations or live schema check; HTTP/1.1 only; no
+  authentication framework.
 
-Sharp edges: `x.f(y)` with a bare variable `x` is a perform; a missing handler
-clause fails at run time; a record update needs the base's type to be known
-where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
+Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no
+`handle` names is found only when it reaches the host boundary at run time
+(`E0424`), unless its effect is `nondet` in a deterministic test (`E0412`); a
+record update needs the base's type to be known where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
 `string_find` and `list_set` raise where `list_at` answers `None`.
 
 ## 19. Examples
