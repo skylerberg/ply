@@ -1,5 +1,11 @@
-// The parts desk: a multi-route HTTP service, over postgres, whose types are its documentation —
-// and which can be started, watched, and stopped without losing a request.
+// The parts desk: a multi-route HTTP service, over postgres or an in-memory twin of it, whose types
+// are its documentation — and which can be started, watched, and stopped without losing a request.
+// How it runs is configuration (`config` below):
+//
+//   ply run examples/desk.ply --host --config-schema desk.config \
+//     --set DESK_API_KEY=… --set DESK_STORE=memory --set DESK_ACCEPT=task-per-connection
+//
+// and over TLS it is given a credential and told its name: `--tls desk=CERT,KEY --set DESK_TLS=desk`.
 
 import std.net (net, send_all)
 // Twice, and both are needed: the selective import binds the effect name, so that a row and a
@@ -18,6 +24,7 @@ import std.config
 import std.config (config)
 import std.signal
 import std.signal (signal)
+import std.process (process)
 
 // --- The store ----------------------------------------------------------------
 
@@ -54,11 +61,16 @@ effect set Running = {
   trace.event[items],
   trace.enter[http], trace.exit[http], trace.event[http],
   config.get[server], config.secret[credentials], signal.stopping,
-  net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],
+  net.listen[listener], net.listen_tls[listener], net.local_port[listener],
+  net.accept[listener], net.close[listener],
   net.recv[conn], net.send[conn], net.close[conn],
   // The driver reaches its server over connections of its own, which is what `with_server` performs.
   net.connect[link], net.send[link], net.recv[link], net.close[link],
   entropy.next,
+  // A task per connection, when the settings ask for one.
+  task.write,
+  // The line that says which port the desk landed on.
+  process.out[proc],
 }
 
 // --- What the desk sells --------------------------------------------------------
@@ -213,9 +225,18 @@ pub fn connections_key() -> String = "DESK_CONNECTIONS"
 
 pub fn api_key() -> String = "DESK_API_KEY"
 
-// Where the desk's database is. Optional because the twin (`run_memory`) has no database: the
-// postgres entry point refuses to start without it, which is what `configured_url` below is for.
+// Where the desk's database is. Optional because the twin has no database: a desk over postgres
+// refuses to start without it, which is what `configured_url` below is for.
 pub fn database_key() -> String = "DESK_DATABASE"
+
+// Which store answers the routes: `postgres`, or `memory` for the twin.
+pub fn store_key() -> String = "DESK_STORE"
+
+// The credential to listen with, as `--tls NAME=CERT,KEY` named it; plaintext when unset.
+pub fn tls_key() -> String = "DESK_TLS"
+
+// Which loop answers connections: `sequential`, or `task-per-connection`.
+pub fn accept_key() -> String = "DESK_ACCEPT"
 
 pub fn config() -> config::ConfigSpec =
   config::spec([
@@ -223,13 +244,16 @@ pub fn config() -> config::ConfigSpec =
     // on 8137 without a word of configuration.
     config::with_default(port_key(), config::SInt, "8137"),
     config::with_default(connections_key(), config::SInt, "64"),
-    // `SSecret` is the whole of §2's containment for a configured value, and it does two things at
-    // once.
+    // A secret is readable only through `config.secret`, and never printed where it came from.
     config::required(api_key(), config::SSecret),
     config::optional(database_key(), config::SText),
+    config::with_default(store_key(), config::SText, "postgres"),
+    config::optional(tls_key(), config::SText),
+    config::with_default(accept_key(), config::SText, "sequential"),
   ])
 
-// The port a run was told to listen on, or the refusal to start.
+// The port a run was told to listen on, or the refusal to start. Port 0 asks for any free one, and
+// the desk says which it got once it listens.
 pub fn port_of(configured: Option<String>) -> Result<Int, String> =
   match configured {
     None -> Err(port_key() ++ " is unset; pass `--config-schema desk.config` so the run "
@@ -238,8 +262,8 @@ pub fn port_of(configured: Option<String>) -> Result<Int, String> =
       match router::int_of_text(text) {
         None -> Err(port_key() ++ " is `" ++ text ++ "`, which is not a port number"),
         Some(port) ->
-          if port <= 0 || port > 65535 {
-            Err(port_key() ++ " is " ++ int_to_string(port) ++ ", and a port is 1..65535")
+          if port < 0 || port > 65535 {
+            Err(port_key() ++ " is " ++ int_to_string(port) ++ ", and a port is 0..65535")
           } else {
             Ok(port)
           },
@@ -255,6 +279,61 @@ pub fn connections_of(configured: Option<String>) -> Result<Int, String> =
         None -> Err(connections_key() ++ " is `" ++ text ++ "`, which is not a number"),
         Some(n) -> if n <= 0 { Err(connections_key() ++ " is not above zero") } else { Ok(n) },
       },
+  }
+
+pub type Storage = | Postgres | Memory
+
+// One connection answered at a time, or a task for each.
+pub type Accept = | Sequential | TaskPerConnection
+
+// How a run serves the desk, read once at start-up.
+pub type Settings = {
+  port: Int,
+  connections: Int,
+  store: Storage,
+  tls: Option<String>,
+  accept: Accept,
+}
+
+// Every setting a run was given, or the first refusal to start; an unset one takes its default.
+pub fn settings_of(
+  port: Option<String> = None,
+  connections: Option<String> = None,
+  store: Option<String> = None,
+  tls: Option<String> = None,
+  accept: Option<String> = None,
+) -> Result<Settings, String> = {
+  let p = port_of(port)?;
+  let n = connections_of(connections)?;
+  let s = store_of(store)?;
+  let t = tls_of(tls)?;
+  let a = accept_of(accept)?;
+  Ok({ port: p, connections: n, store: s, tls: t, accept: a })
+}
+
+fn store_of(configured: Option<String>) -> Result<Storage, String> =
+  match configured {
+    None -> Ok(Postgres),
+    Some("postgres") -> Ok(Postgres),
+    Some("memory") -> Ok(Memory),
+    Some(other) ->
+      Err(store_key() ++ " is `" ++ other ++ "`; the stores are `postgres` and `memory`"),
+  }
+
+fn tls_of(configured: Option<String>) -> Result<Option<String>, String> =
+  match configured {
+    Some("") -> Err(tls_key() ++ " is empty; name a credential `--tls NAME=CERT,KEY` gave"),
+    other -> Ok(other),
+  }
+
+fn accept_of(configured: Option<String>) -> Result<Accept, String> =
+  match configured {
+    None -> Ok(Sequential),
+    Some("sequential") -> Ok(Sequential),
+    Some("task-per-connection") -> Ok(TaskPerConnection),
+    Some(other) ->
+      Err(accept_key() ++ " is `" ++ other ++ "`; the loops are `sequential` and "
+        ++ "`task-per-connection`"),
   }
 
 // --- The statements ---------------------------------------------------------------
@@ -1109,19 +1188,52 @@ fn write_out(c: Int, l: http::Limits, m: http::Method, v: http::Version, keep: B
   ()
 }
 
+// Answer up to `count` connections one at a time, and stop early once the listener is closed under
+// the loop. A tail call, so a budget is a number rather than a stack depth.
 pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
   / {Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
-  if count <= 0 {
-    0
+  one_at_a_time(listener, l, count, 0)
+
+fn one_at_a_time(listener: Int, l: http::Limits, left: Int, served: Int) -> Int
+  / {Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
+  if left <= 0 {
+    served
   } else {
     let c = net.accept[listener](listener);
     if c == 0 {
-      0
+      served
     } else {
       serve_connection(c, l);
-      1 + serve(listener, l, count - 1)
+      one_at_a_time(listener, l, left - 1, served + 1)
     }
   }
+
+// The same budget with a task for each connection, so a slow client holds up only itself. Every
+// task is joined before the loop answers: the twin's store lives no longer than the call that
+// opened it.
+pub fn serve_each(listener: Int, l: http::Limits, count: Int) -> Int
+  / {task.write, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
+  joined(spawned(listener, l, count, []))
+
+fn spawned(listener: Int, l: http::Limits, left: Int, running: List<Task<Unit>>)
+  -> List<Task<Unit>>
+  / {task.write, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
+  if left <= 0 {
+    running
+  } else {
+    let c = net.accept[listener](listener);
+    if c == 0 {
+      running
+    } else {
+      spawned(listener, l, left - 1, push(running, task.spawn(|| serve_connection(c, l))))
+    }
+  }
+
+fn joined(tasks: List<Task<Unit>>) -> Int / {task.write} =
+  fold(tasks, 0, |n: Int, t: Task<Unit>| {
+    task.join(t);
+    n + 1
+  })
 
 pub fn listen_and_serve(port: Int, count: Int) -> Int
   / {Serving, net.listen[listener], net.accept[listener], net.close[listener],
@@ -1132,48 +1244,43 @@ pub fn listen_and_serve(port: Int, count: Int) -> Int
   served
 }
 
-// The same service over TLS.
-pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int
-  / {Serving, net.listen_tls[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn]} {
-  let listener = net.listen_tls[listener](port, credential);
-  let served = serve(listener, limits(), count);
+// The desk as a run's settings describe it: over TLS when they name a credential, answered by the
+// loop they choose, and saying on stdout which port it landed on — which is how a run asked for
+// port 0 is found.
+pub fn listening(s: Settings) -> Int
+  / {task.write, Serving, net.listen[listener], net.listen_tls[listener],
+     net.local_port[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn], process.out[proc]} {
+  let listener = match s.tls {
+    None -> net.listen[listener](s.port),
+    Some(credential) -> net.listen_tls[listener](s.port, credential),
+  };
+  match net.local_port[listener](listener) {
+    Some(port) -> process.out[proc]("listening on " ++ int_to_string(port)),
+    None -> (),
+  };
+  let served = match s.accept {
+    Sequential -> serve(listener, limits(), s.connections),
+    TaskPerConnection -> serve_each(listener, limits(), s.connections),
+  };
   net.close[listener](listener);
   served
 }
 
 // --- The desk, stocked and running ----------------------------------------------------
-pub fn run(port: Int, count: Int) -> Int
-  / {Serving, net.listen[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn]} =
-  listen_and_serve(port, count)
 
-// The same desk, over TLS, differing in one call.
-pub fn run_tls(port: Int, credential: String, count: Int) -> Int
-  / {Serving, net.listen_tls[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn]} =
-  listen_and_serve_tls(port, credential, count)
-
-// The same desk, over a database that is a value, a sink that is a value and a stop flag that is a
-// value.
+// The twin on a plain listener, one connection at a time.
 pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int
-  / {net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],
+  / {net.listen[listener], net.accept[listener], net.close[listener],
      net.recv[conn], net.send[conn], net.close[conn]} =
-  memory_serving(port, "", api, count)
-
-// The twin over TLS, which is the same sentence `run_tls` is: the credential decides the handshake
-// and nothing else, and the clauses below are written once rather than once per transport.
-pub fn run_memory_tls(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int
-  / {net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn]} =
-  memory_serving(port, tls, api, count)
+  twin(api, || listen_and_serve(port, count))
 
 // The API key the *tests* drive the twin with.
 pub fn twin_key() -> String = "twin-key-not-a-credential"
 
-fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int
-  / {net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn]} =
+// The desk over a database that is a value, a sink that is a value and a stop flag that is a value:
+// every operation `Serving` names is answered here, and the credential from `api`.
+pub fn twin<a | e>(api: Option<Secret<String>>, body: () -> a / {Serving | e}) -> a / e =
   with_cell[store](stocked(seed_shelf(), seed_orders())) { c -> {
   with_cell[sink](trace::sink()) { t -> {
   with_cell[stop](signal::running()) { s -> {
@@ -1214,11 +1321,7 @@ fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: In
       if o.ok { () } else { panic("trace.exit named a span that is not open") }
     };
     handle {
-      if tls == "" {
-        listen_and_serve(port, count)
-      } else {
-        listen_and_serve_tls(port, tls, count)
-      }
+      body()
     } with {
       db.query[items](q, ps) -> step(q, ps),
       db.execute[items](q, ps) -> step(q, ps),
@@ -1247,23 +1350,28 @@ fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: In
   } }
   } }
 
-// The entry point, which is the postgres one. Where to reach the database is a setting, and every
-// `db` operation is answered from here rather than by a host.
-//
-// A harness that stands in for a deployment swaps two lines of this: the row, which says what the
-// run must provide, and the call, which says where the desk is served from (`--memory` calls the
-// twin instead, whose row is narrower because `run_memory` discharges `db` itself).
+// The entry point: the settings, read once, and the store they name. Where to reach the database
+// is a setting too, and every `db` operation is answered from here rather than by a host.
 fn main() -> Int / {Running} = {
   let key = config.secret[credentials](api_key());
-  let port = configured(port_of(config.get[server](port_key())));
-  let count = configured(connections_of(config.get[server](connections_key())));
-  postgres(config.get[server](database_key()), port, count, key)
+  let s = configured(
+    settings_of(
+      port: config.get[server](port_key()),
+      connections: config.get[server](connections_key()),
+      store: config.get[server](store_key()),
+      tls: config.get[server](tls_key()),
+      accept: config.get[server](accept_key()),
+    ),
+  );
+  match s.store {
+    Memory -> twin(key, || listening(s)),
+    Postgres -> postgres(config.get[server](database_key()), s, key),
+  }
 }
 
-fn postgres(url: Option<String>, port: Int, count: Int, key: Option<Secret<String>>) ->
-  Int / {Running} =
+fn postgres(url: Option<String>, s: Settings, key: Option<Secret<String>>) -> Int / {Running} =
   handle {
-    match with_server(configured_url(url), count, || run(port, count)) {
+    match with_server(configured_url(url), s.connections, || listening(s)) {
       Ok(served) -> served,
       Err(why) -> panic("the desk will not start: " ++ why),
     }
@@ -1281,7 +1389,7 @@ fn configured_url(resolved: Option<String>) -> String =
         ++ database_key() ++ "=postgres://user@host/desk`"),
   }
 
-fn configured(resolved: Result<Int, String>) -> Int =
+fn configured<a>(resolved: Result<a, String>) -> a =
   match resolved {
     Ok(value) -> value,
     Err(why) -> panic("the desk will not start: " ++ why),
@@ -1908,18 +2016,26 @@ fn shown_field(f: Option<trace::Field>) -> String =
 
 test "the schema declares the keys the desk cannot start without, and defaults the rest" {
   let keys = config().keys;
-  assert_eq(len(keys), 4);
+  assert_eq(len(keys), 7);
   // The credential is `SSecret` and required.
   assert_eq(key_named(keys, api_key()),
     Some({name: "DESK_API_KEY", shape: config::SSecret, required: true, default: None}));
-  // Where to reach the database is optional in the schema and required by the postgres entry
-  // point: the twin has no database, so a run of it supplies no URL.
+  // Where to reach the database is optional in the schema and required by a desk over postgres:
+  // the twin has no database, so a run of it supplies no URL.
   assert_eq(key_named(keys, database_key()),
     Some({name: "DESK_DATABASE", shape: config::SText, required: false, default: None}));
   // The port has a default, so `ply run --host --config-schema desk.config` starts a desk with no
   // configuration written anywhere.
   assert_eq(key_named(keys, port_key()),
-    Some({name: "DESK_PORT", shape: config::SInt, required: false, default: Some("8137")}))
+    Some({name: "DESK_PORT", shape: config::SInt, required: false, default: Some("8137")}));
+  // Unset, a desk serves postgres in plaintext, one connection at a time.
+  assert_eq(key_named(keys, store_key()),
+    Some({name: "DESK_STORE", shape: config::SText, required: false, default: Some("postgres")}));
+  assert_eq(key_named(keys, tls_key()),
+    Some({name: "DESK_TLS", shape: config::SText, required: false, default: None}));
+  assert_eq(key_named(keys, accept_key()),
+    Some({name: "DESK_ACCEPT", shape: config::SText, required: false,
+          default: Some("sequential")}))
 }
 
 fn key_named(keys: List<config::Key>, name: String) -> Option<config::Key> =
@@ -1941,10 +2057,10 @@ test "a desk told nothing about its port refuses to start and says which flag to
     Ok(_) -> panic("`eight` is not a port"),
     Err(why) -> assert(mentions(why, b"eight")),
   };
-  // A port outside 1..65535 is a configuration nobody meant, and it is refused here rather than
-  // turning into a listener that never binds.
-  assert(port_of(Some("0")) != Ok(0));
-  assert(port_of(Some("70000")) != Ok(70000))
+  // A port past 65535 is a configuration nobody meant, and it is refused here rather than turning
+  // into a listener that never binds; port 0 is any free one.
+  assert(port_of(Some("70000")) != Ok(70000));
+  assert_eq(port_of(Some("0")), Ok(0))
 }
 
 test "a connection budget that is absent defaults and one that is zero refuses" {
@@ -1953,6 +2069,31 @@ test "a connection budget that is absent defaults and one that is zero refuses" 
   match connections_of(Some("0")) {
     Ok(_) -> panic("a desk that serves zero connections would look healthy"),
     Err(why) -> assert(mentions(why, b"DESK_CONNECTIONS")),
+  }
+}
+
+test "a desk given only its port serves postgres in plaintext, one connection at a time" {
+  assert_eq(settings_of(port: Some("8137")),
+    Ok({port: 8137, connections: 64, store: Postgres, tls: None, accept: Sequential}))
+}
+
+test "each way of running the desk is a setting, and a value it does not know refuses to start" {
+  assert_eq(
+    settings_of(port: Some("0"), connections: Some("9"), store: Some("memory"), tls: Some("desk"),
+                accept: Some("task-per-connection")),
+    Ok({port: 0, connections: 9, store: Memory, tls: Some("desk"), accept: TaskPerConnection}));
+  match settings_of(port: Some("8137"), store: Some("sqlite")) {
+    Ok(_) -> panic("`sqlite` is not a store the desk has"),
+    Err(why) -> assert(mentions(why, b"DESK_STORE")),
+  };
+  match settings_of(port: Some("8137"), accept: Some("threads")) {
+    Ok(_) -> panic("`threads` is not an accept loop the desk has"),
+    Err(why) -> assert(mentions(why, b"DESK_ACCEPT")),
+  };
+  // An empty credential name would listen over TLS with nothing to present.
+  match settings_of(port: Some("8137"), tls: Some("")) {
+    Ok(_) -> panic("an empty credential name is not a credential"),
+    Err(why) -> assert(mentions(why, b"DESK_TLS")),
   }
 }
 
@@ -1972,7 +2113,7 @@ test "a signal drains the accept loop with no source change" {
       against(stock(), config::one_secret(api_key(), twin_key()), || {
       handle {
         // Asked for eight connections and given one, because a stop arrived.
-        run(8137, 8)
+        listen_and_serve(8137, 8)
       } with {
         net.listen[listener](port) -> 1,
         // Phase 2 of the shutdown sequence, as this desk sees it: the listening socket is closed,
@@ -2222,20 +2363,27 @@ test "a peer that opens a connection and says nothing is closed without a respon
   assert_eq(e.closes, 1)
 }
 
-// --- The same service over TLS ----------------------------------------------------
+// --- The desk as its settings describe it ----------------------------------------------
 
-fn over_socket(inbox: List<Bytes>, tls: Bool) -> {wrote: Bytes, sent: Int} =
+// One connection's worth of the desk `listening` runs, over sockets that are values: what it
+// wrote, how many responses that was, and what it said on stdout.
+fn over_socket(inbox: List<Bytes>, s: Settings) -> {wrote: Bytes, sent: Int, said: List<String>} =
   with_cell[inbox](inbox) { queue -> {
   with_cell[outbox]([]) { sent -> {
+  with_cell[said]([]) { said -> {
     under(stock(), || {
       handle {
-        assert_eq(if tls { run_tls(8443, "desk", 1) } else { run(8137, 1) }, 1)
+        // A task per connection needs a scheduler; the sequential loop spawns nothing under it.
+        simulate {
+          assert_eq(listening(s), 1)
+        }
       } with {
         net.listen[listener](port) -> 1,
         net.listen_tls[listener](port, credential) -> {
           assert_eq(credential, "desk");
           1
         },
+        net.local_port[listener](l) -> Some(40123),
         net.accept[listener](l) -> 7,
         net.close[listener](l) -> (),
         net.recv[conn](c, max, timeout_ms) -> {
@@ -2248,26 +2396,81 @@ fn over_socket(inbox: List<Bytes>, tls: Bool) -> {wrote: Bytes, sent: Int} =
           Some(bytes_len(payload))
         },
         net.close[conn](c) -> (),
+        process.out[proc](line) -> cell_set(said, push(cell_get(said), line)),
       }
     });
     {
       wrote: bytes_concat_all(cell_get(sent)),
       sent: len(filter(cell_get(sent), |p: Bytes| bytes_starts_with(p, b"HTTP/1.1 "))),
+      said: cell_get(said),
     }
   } }
   } }
+  } }
+
+// One connection, on whatever port is free.
+fn one_connection(tls: Option<String>, accept: Accept) -> Settings =
+  {port: 0, connections: 1, store: Memory, tls: tls, accept: accept}
 
 test "the service answers the same bytes over a TLS listener as over a plain one" {
-  let encrypted = over_socket([get_line("/items")], true);
-  assert_eq(encrypted, over_socket([get_line("/items")], false));
+  let encrypted = over_socket([get_line("/items")], one_connection(Some("desk"), Sequential));
+  assert_eq(encrypted, over_socket([get_line("/items")], one_connection(None, Sequential)));
   assert_eq(status_of(encrypted.wrote), 200);
   assert(bytes_index_of(encrypted.wrote, b"\"sku\":\"gasket\"") != None)
 }
 
 test "a listener serves exactly the connections it was asked for" {
-  let e = over_socket([bytes_concat(get_line("/health"), get_line("/orders"))], false);
+  let e = over_socket([bytes_concat(get_line("/health"), get_line("/orders"))],
+    one_connection(None, Sequential));
   assert_eq(status_of(e.wrote), 200);
   assert_eq(e.sent, 2)
+}
+
+// The line a harness reads to find a desk it asked for port 0.
+test "a desk says on stdout which port it landed on" {
+  assert_eq(over_socket([get_line("/health")], one_connection(None, Sequential)).said,
+    ["listening on 40123"])
+}
+
+test "a task per connection writes the bytes one connection at a time writes" {
+  let spawned = over_socket([bytes_concat(get_line("/items"), get_line("/orders/1/receipt"))],
+    one_connection(None, TaskPerConnection));
+  assert_eq(spawned,
+    over_socket([bytes_concat(get_line("/items"), get_line("/orders/1/receipt"))],
+      one_connection(None, Sequential)));
+  assert_eq(spawned.sent, 2)
+}
+
+// The twin as `main` runs it when the settings name it: nothing granted but sockets and stdout.
+test "the twin serves the desk over TLS with a task per connection" {
+  with_cell[inbox]([get_line("/items")]) { queue -> {
+  with_cell[outbox]([]) { sent -> {
+    handle {
+      twin(Some(secret_of_string(twin_key())), || simulate {
+        assert_eq(listening(one_connection(Some("desk"), TaskPerConnection)), 1)
+      })
+    } with {
+      net.listen[listener](port) -> panic("a desk told a credential listens over TLS"),
+      net.listen_tls[listener](port, credential) -> 1,
+      net.local_port[listener](l) -> Some(40123),
+      net.accept[listener](l) -> 7,
+      net.close[listener](l) -> (),
+      net.recv[conn](c, max, timeout_ms) -> {
+        let queued = cell_get(queue);
+        cell_set(queue, rest_of(queued));
+        Some(first_of(queued))
+      },
+      net.send[conn](c, payload, timeout_ms) -> {
+        cell_set(sent, push(cell_get(sent), payload));
+        Some(bytes_len(payload))
+      },
+      net.close[conn](c) -> (),
+      process.out[proc](line) -> (),
+    };
+    assert_eq(status_of(bytes_concat_all(cell_get(sent))), 200);
+    assert(bytes_index_of(bytes_concat_all(cell_get(sent)), b"\"sku\":\"gasket\"") != None)
+  } }
+  } }
 }
 
 // The twin entry point, driven end to end with nothing granted but sockets.
@@ -2278,7 +2481,6 @@ test "run_memory serves the desk with no database bound and no host at all" {
       assert_eq(run_memory(8137, Some(secret_of_string(twin_key())), 1), 1)
     } with {
       net.listen[listener](port) -> 1,
-      net.listen_tls[listener](port, credential) -> panic("the twin never listens over TLS"),
       net.accept[listener](l) -> 7,
       net.close[listener](l) -> (),
       net.recv[conn](c, max, timeout_ms) -> {

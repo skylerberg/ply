@@ -1,6 +1,29 @@
-//! The corpus package's own `test` blocks.
+//! The corpus package's own `test` blocks, and its fixtures'.
 
 use serde_json::Value;
+
+/// The programs under `fixtures/` the corpus runs on their own: each checks, and its tests pass.
+/// The two `w6-*` files are appended to the desk rather than run alone, so they are not here.
+#[test]
+fn every_fixture_the_corpus_runs_checks_and_passes_its_own_tests() {
+    for fixture in ["load.ply", "layers.ply", "shape.ply", "scans.ply"] {
+        let path = format!("crates/ply-corpus/fixtures/{fixture}");
+        let out = std::process::Command::new(crate::support::ply())
+            .args(["test", &path, "--no-cache", "--json"])
+            .current_dir(crate::support::repo())
+            .output()
+            .expect("the CLI runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{fixture}'s tests are red:\n{stderr}");
+        let report: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{fixture}: stdout was not one JSON object: {e}"));
+        assert!(
+            report["summary"]["passed"].as_u64().is_some_and(|n| n > 0),
+            "{fixture} tested nothing: {}",
+            report["summary"]
+        );
+    }
+}
 
 /// The corpus package's `ply/*.ply` `test` blocks, run by the compiled tier.
 ///
