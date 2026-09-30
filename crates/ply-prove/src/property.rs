@@ -4,8 +4,8 @@ use crate::shrink::{self, Target};
 use crate::sort::Sort;
 use crate::world::{Variant, World};
 use crate::{
-    Binder, Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan,
-    Vacuity, VacuityKind,
+    Binder, Binding, CaseReport, Counterexample, Discharge, Evidence, Fault, GEN_DEPTH, Gap,
+    ProvePlan, Vacuity, VacuityKind,
 };
 use ply_eval::{
     Closure, ClosureKind, Decimal, DefHash, Diagnostic, Fixed, IntTy, SECRET, Span, Symbol, Synth,
@@ -509,10 +509,23 @@ pub enum Outcome {
     Rejected,
     Held,
     Failed,
+    /// The program raised.
     Raised(Diagnostic),
+    /// Ply failed rather than the program, so the tuple says nothing about the claim.
+    Faulted(Diagnostic),
 }
 
 impl Outcome {
+    /// A judgement that stopped on `diagnostic`: the program's raise unless its code is Ply's own.
+    pub fn stopped(diagnostic: Diagnostic) -> Outcome {
+        if ply_eval::codes::is_defect(diagnostic.code) {
+            Outcome::Faulted(diagnostic)
+        } else {
+            Outcome::Raised(diagnostic)
+        }
+    }
+
+    /// Ply's failure matches no target, so no walk takes a candidate that only makes Ply fail.
     pub fn matches(&self, target: Target) -> bool {
         matches!(
             (self, target),
@@ -539,10 +552,10 @@ impl<T: Judge + ?Sized> Judge for &mut T {
 
 pub fn judge_case(judge: &mut dyn Judge, values: &[Value]) -> Outcome {
     match judge.guard(values) {
-        Err(d) => Outcome::Raised(d),
+        Err(d) => Outcome::stopped(d),
         Ok(false) => Outcome::Rejected,
         Ok(true) => match judge.body(values) {
-            Err(d) => Outcome::Raised(d),
+            Err(d) => Outcome::stopped(d),
             Ok(true) => Outcome::Held,
             Ok(false) => Outcome::Failed,
         },
@@ -613,6 +626,12 @@ pub fn run_property(
                         diagnostic: Box::new(diagnostic),
                         root,
                         case,
+                    });
+                }
+                Outcome::Faulted(diagnostic) => {
+                    return Discharge::Faulted(Fault {
+                        bindings: bindings(binders, &values),
+                        diagnostic: Box::new(diagnostic),
                     });
                 }
             }

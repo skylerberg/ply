@@ -100,7 +100,13 @@ type Front = {
   cached: Bool,
 }
 type Gap = Unit
-type Point = | Kept(List<Binding>) | Falsified(List<Binding>) | Rejected | Undrawn(Gap)
+type Fault = Unit
+type Point =
+  | Kept(List<Binding>)
+  | Falsified(List<Binding>)
+  | Rejected
+  | Undrawn(Gap)
+  | Faulted(Fault)
 
 type Answer = { falsified: Int, kept: Int, rejected: Int, first: String }
 
@@ -129,6 +135,7 @@ fn scan(index: Int, case: Int, seen: Answer) -> Answer / {prover.replay[claims]}
           } else { scan(index, case + 1, { ..seen, falsified: seen.falsified + 1 }) },
         Rejected -> scan(index, case + 1, { ..seen, rejected: seen.rejected + 1 }),
         Undrawn(_) -> scan(index, case + 1, seen),
+        Faulted(_) -> scan(index, case + 1, seen),
       },
     }
   }
@@ -273,7 +280,7 @@ fn a_claim_index_the_collection_does_not_hold_is_refused_rather_than_answered() 
 fn the_fixture_declares_the_payload_where_the_machine_names_it() {
     let front = front_of(REPLAY);
     let mut checked = 0;
-    for (home, ty) in ply_machine::claims::MARSHALLED {
+    for (home, ty, _) in ply_machine::claims::MARSHALLED {
         let declared: Vec<&str> = front
             .types
             .values()

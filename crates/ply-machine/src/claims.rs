@@ -22,7 +22,7 @@ use ply_eval::{DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, 
 use ply_prove::property::{GenStream, generate};
 use ply_prove::shrink::Target;
 use ply_prove::{
-    Binder, Discharge, Evidence, Gap, Obligation, ProvePlan, ProveReport, Tier, Vacuity,
+    Binder, Discharge, Evidence, Fault, Gap, Obligation, ProvePlan, ProveReport, Tier, Vacuity,
     VacuityKind, World,
 };
 use ply_store::ReviewRecord;
@@ -35,31 +35,63 @@ use std::sync::{Arc, Mutex, mpsc};
 /// obligations and nowhere else.
 const EFFECT: &str = "prover";
 
-/// Where each type this side marshals is declared, by the type's own name.
+/// Where each type this side marshals is declared, by the type's own name, with every case of it
+/// this side builds.
 ///
 /// A constructor crosses the substrate boundary by its program-wide name -- `claims.Raised` is not
 /// `proof.obligation.Raised` -- so building one says which module declares its type, and this is
 /// the only place that says it, save `Refusal`: that is declared beside `prover`, so it is named by
-/// the module the lent program declares `prover` in.
-/// `every_marshalled_type_is_declared_where_this_side_says` holds every row to the program, because
-/// a tag that names no declaration is a placeless `no arm of this match matched` the moment the
-/// program matches the value.
-pub const MARSHALLED: &[(&str, &str)] = &[
-    ("proof.obligation", "Evidence"),
-    ("proof.obligation", "Outcome"),
-    ("proof.obligation", "Point"),
-    ("proof.obligation", "Gap"),
-    ("proof.obligation", "Tier"),
-    ("proof.obligation", "Vacuity"),
+/// the module the lent program declares `prover` in. A case is built only through [`case`], which
+/// refuses one this table does not list, and `every_marshalled_type_is_declared_where_this_side_says`
+/// holds every row to the program, because a tag that names no declaration is a placeless `no arm
+/// of this match matched` the moment the program matches the value.
+pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
+    ("proof.obligation", "Evidence", &["Proof", "Sampled"]),
+    (
+        "proof.obligation",
+        "Outcome",
+        &["Held", "Refuted", "Vacuous", "Unattempted", "Defect"],
+    ),
+    (
+        "proof.obligation",
+        "Point",
+        &["Kept", "Falsified", "Rejected", "Undrawn", "Faulted"],
+    ),
+    (
+        "proof.obligation",
+        "Gap",
+        &[
+            "UnhandledEffect",
+            "Ungeneratable",
+            "Raised",
+            "GuardNotSampled",
+            "ReachesHost",
+            "NotDrawn",
+        ],
+    ),
+    (
+        "proof.obligation",
+        "Tier",
+        &["Proved", "Property", "Example"],
+    ),
+    (
+        "proof.obligation",
+        "Vacuity",
+        &["Unsatisfiable", "NoCaseKept"],
+    ),
 ];
 
-/// The module that declares `ty`, which is where a value of it crosses by.
-fn home(ty: &str) -> &'static str {
-    MARSHALLED
+/// One case of a type this side marshals, under the name the program declares it by.
+fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
+    let (home, _, cases) = MARSHALLED
         .iter()
-        .find(|(_, name)| *name == ty)
-        .unwrap_or_else(|| panic!("`{ty}` is not a type this side marshals"))
-        .0
+        .find(|(_, declared, _)| *declared == ty)
+        .unwrap_or_else(|| panic!("`{ty}` is not a type this side marshals"));
+    assert!(
+        cases.contains(&name),
+        "`{name}` is not a case of `{ty}` this side builds"
+    );
+    ctor(home, name, args)
 }
 
 const OPERATIONS: [(&str, &str); 14] = [
@@ -1254,7 +1286,7 @@ fn tier_value(tier: Tier) -> PlyValue {
         Tier::Property => "Property",
         Tier::Example => "Example",
     };
-    ctor(home("Tier"), named, Vec::new())
+    case("Tier", named, Vec::new())
 }
 
 fn bindings_value(bindings: &[ply_prove::Binding]) -> PlyValue {
@@ -1280,8 +1312,8 @@ fn rules_value(rules: &[ply_prove::Rule]) -> PlyValue {
 
 fn evidence_value(evidence: &Evidence) -> PlyValue {
     match evidence {
-        Evidence::Proof(c) => ctor(
-            home("Evidence"),
+        Evidence::Proof(c) => case(
+            "Evidence",
             "Proof",
             vec![record(vec![
                 ("rules", rules_value(&c.rules)),
@@ -1293,8 +1325,8 @@ fn evidence_value(evidence: &Evidence) -> PlyValue {
                 ),
             ])],
         ),
-        Evidence::Cases(c) => ctor(
-            home("Evidence"),
+        Evidence::Cases(c) => case(
+            "Evidence",
             "Sampled",
             vec![record(vec![
                 ("generated", tally(u64::from(c.generated))),
@@ -1322,13 +1354,13 @@ fn evidence_value(evidence: &Evidence) -> PlyValue {
 
 fn gap_value(gap: &Gap) -> PlyValue {
     match gap {
-        Gap::UnhandledEffect(row) => ctor(
-            home("Gap"),
+        Gap::UnhandledEffect(row) => case(
+            "Gap",
             "UnhandledEffect",
             vec![option(row.as_deref().map(PlyValue::str))],
         ),
-        Gap::Ungeneratable { param, ty } => ctor(
-            home("Gap"),
+        Gap::Ungeneratable { param, ty } => case(
+            "Gap",
             "Ungeneratable",
             vec![record(vec![
                 ("param", PlyValue::str(param.as_str())),
@@ -1339,41 +1371,52 @@ fn gap_value(gap: &Gap) -> PlyValue {
             bindings,
             diagnostic,
             ..
-        } => ctor(
-            home("Gap"),
+        } => case(
+            "Gap",
             "Raised",
             vec![record(vec![
                 ("message", PlyValue::str(&diagnostic.message)),
                 ("bindings", bindings_value(bindings)),
             ])],
         ),
-        Gap::GuardNotSampled { generated, witness } => ctor(
-            home("Gap"),
+        Gap::GuardNotSampled { generated, witness } => case(
+            "Gap",
             "GuardNotSampled",
             vec![record(vec![
                 ("generated", tally(u64::from(*generated))),
                 ("witness", bindings_value(witness)),
             ])],
         ),
-        Gap::ReachesHost(row) => ctor(
-            home("Gap"),
+        Gap::ReachesHost(row) => case(
+            "Gap",
             "ReachesHost",
             vec![PlyValue::str(row.as_deref().unwrap_or("{}"))],
         ),
-        Gap::NotDrawn => ctor(home("Gap"), "NotDrawn", Vec::new()),
+        Gap::NotDrawn => case("Gap", "NotDrawn", Vec::new()),
     }
+}
+
+fn fault_value(fault: &Fault) -> PlyValue {
+    record(vec![
+        ("code", PlyValue::str(fault.diagnostic.code)),
+        ("message", PlyValue::str(&fault.diagnostic.message)),
+        (
+            "notes",
+            strings(fault.diagnostic.notes.iter().map(String::as_str)),
+        ),
+        ("bindings", bindings_value(&fault.bindings)),
+    ])
 }
 
 /// One point as `claims.ply` reads it: the same constructors the whole-run outcomes use, minus
 /// the tier, because a case that held says nothing about how the obligation as a whole was shown.
 fn point_value(point: &Point) -> PlyValue {
     match point {
-        Point::Kept(bindings) => ctor(home("Point"), "Kept", vec![bindings_value(bindings)]),
-        Point::Falsified(bindings) => {
-            ctor(home("Point"), "Falsified", vec![bindings_value(bindings)])
-        }
-        Point::Rejected => ctor(home("Point"), "Rejected", Vec::new()),
-        Point::Undrawn(gap) => ctor(home("Point"), "Undrawn", vec![gap_value(gap)]),
+        Point::Kept(bindings) => case("Point", "Kept", vec![bindings_value(bindings)]),
+        Point::Falsified(bindings) => case("Point", "Falsified", vec![bindings_value(bindings)]),
+        Point::Rejected => case("Point", "Rejected", Vec::new()),
+        Point::Undrawn(gap) => case("Point", "Undrawn", vec![gap_value(gap)]),
+        Point::Faulted(fault) => case("Point", "Faulted", vec![fault_value(fault)]),
     }
 }
 
@@ -1383,14 +1426,10 @@ fn vacuity_value(vacuity: &Vacuity) -> PlyValue {
         (
             "why",
             match vacuity.kind {
-                VacuityKind::ProvedUnsatisfiable => {
-                    ctor(home("Vacuity"), "Unsatisfiable", Vec::new())
+                VacuityKind::ProvedUnsatisfiable => case("Vacuity", "Unsatisfiable", Vec::new()),
+                VacuityKind::NoCaseKept { generated } => {
+                    case("Vacuity", "NoCaseKept", vec![tally(u64::from(generated))])
                 }
-                VacuityKind::NoCaseKept { generated } => ctor(
-                    home("Vacuity"),
-                    "NoCaseKept",
-                    vec![tally(u64::from(generated))],
-                ),
             },
         ),
     ])
@@ -1398,16 +1437,16 @@ fn vacuity_value(vacuity: &Vacuity) -> PlyValue {
 
 fn outcome_value(discharge: &Discharge) -> PlyValue {
     match discharge {
-        Discharge::Held(evidence) => ctor(
-            home("Outcome"),
+        Discharge::Held(evidence) => case(
+            "Outcome",
             "Held",
             vec![record(vec![
                 ("tier", tier_value(evidence.tier())),
                 ("evidence", evidence_value(evidence)),
             ])],
         ),
-        Discharge::Refuted(cx) => ctor(
-            home("Outcome"),
+        Discharge::Refuted(cx) => case(
+            "Outcome",
             "Refuted",
             vec![record(vec![
                 ("bindings", bindings_value(&cx.bindings)),
@@ -1421,10 +1460,9 @@ fn outcome_value(discharge: &Discharge) -> PlyValue {
                 ),
             ])],
         ),
-        Discharge::Vacuous(vacuity) => {
-            ctor(home("Outcome"), "Vacuous", vec![vacuity_value(vacuity)])
-        }
-        Discharge::Unattempted(gap) => ctor(home("Outcome"), "Unattempted", vec![gap_value(gap)]),
+        Discharge::Vacuous(vacuity) => case("Outcome", "Vacuous", vec![vacuity_value(vacuity)]),
+        Discharge::Unattempted(gap) => case("Outcome", "Unattempted", vec![gap_value(gap)]),
+        Discharge::Faulted(fault) => case("Outcome", "Defect", vec![fault_value(fault)]),
     }
 }
 

@@ -176,7 +176,8 @@ fn what_a_close_reclaims_is_decided_by_the_extent_and_never_by_the_kind() {
     }
 }
 
-/// Only the generation catches a stale read, so wrapping is the one way a wrong value returns.
+/// Only the generation catches a stale read, so between renewals wrapping is the one way a wrong
+/// value returns.
 #[test]
 fn a_positions_generation_only_rises_and_never_hands_back_an_identity() {
     const ROUNDS: u32 = 2_000;
