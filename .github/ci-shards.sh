@@ -47,14 +47,13 @@ TIMINGS=/tmp/ply-test-timings/timings.tsv
 
 TAB=$'\t'
 
-# Tests that get a runner of their own, as `id:package:target:test`.
+# Tests that get a runner of their own, as `id:package:target:test`. A long test is no reason: the
+# cut balances by duration. A test that must not share its runner is, since the cut cannot see that.
 SOLO=(
+  # Both take every test thread (nextest.toml), so in a shard they would run alone for their whole
+  # length on top of the shard's share.
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
-  "cli-program:ply-cli-tests:suite:artifact_program::the_committed_program_is_what_these_sources_build"
   "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
-  "archive-round-trip:ply-cli-tests:suite:bootstrap_archive::an_archive_is_written_and_verifies_against_the_tree_it_came_from"
-  "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
-  "corpus-session-audit:ply-cli-tests:suite:incremental::a_long_session_over_the_example_corpus_agrees_at_every_step"
 )
 
 # The corpus's Ply tests, one run an entry: the program's own, then each module of the checks package
@@ -102,7 +101,7 @@ TREE_CHECKS=(
 
 # `probes/` directories no cargo build reaches, as `dir:job`; the job must be in `ci`'s `needs`.
 declare -a PROBE_JOBS=(
-  "ucontext:ucontext-probe"
+  "ucontext:plan"
 )
 
 # What a run parks for its own jobs, as the literal ci.yml writes before `${{ github.run_id }}`:
@@ -110,7 +109,7 @@ declare -a PROBE_JOBS=(
 # name one, so a green run gives them back, and the repository's 10 GB cache stays for what does
 # outlive a run -- the stage under `ply-c-stage-sources-`, and the object cache. `test-timings-` is
 # run-scoped too and stays: a later run reads it, through `restore-keys`.
-GIVE_BACK=(nextest-archive- ply-c-stage-emitter- ply-c-stage-run- test-shards-)
+GIVE_BACK=(nextest-archive- ply-c-stage-emitter- test-shards-)
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -939,7 +938,7 @@ cmd_verify() {
         failures=$((failures + 1))
       fi
     fi
-    # Whole word, so `probe` does not match `ucontext-probe`.
+    # Whole word, so a job name does not match inside a longer one.
     if [[ " ${needs//[][,]/ } " != *" $job "* ]]; then
       echo "FAIL: job '$job' is not in the \`ci\` job's needs list, so it is not required and a green tick can be reported over it never having run" >&2
       failures=$((failures + 1))
@@ -1038,8 +1037,8 @@ cmd_verify() {
   if [[ -z $give_back_job ]]; then
     echo "FAIL: GIVE_BACK names the caches a run gives back, and no job in $workflow runs \`ci-shards.sh give-back\`" >&2
     failures=$((failures + 1))
-  elif [[ " ${needs//[][,]/ } " != *" $give_back_job "* ]]; then
-    echo "FAIL: job '$give_back_job' gives this run's own caches back, and is not in the \`ci\` job's needs list" >&2
+  elif [[ $give_back_job != ci && " ${needs//[][,]/ } " != *" $give_back_job "* ]]; then
+    echo "FAIL: job '$give_back_job' gives this run's own caches back, and is neither \`ci\` nor in its needs list" >&2
     failures=$((failures + 1))
   fi
 
