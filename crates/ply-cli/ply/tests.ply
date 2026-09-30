@@ -1,10 +1,10 @@
 // `ply test` — which tests this run had to execute, what each of them did, and what the run
-// exits with. The load, the result cache, the selection it answers, the conflict grouping, the
-// compiled backend, the host binding, the worker pool, the per-test unwind catching and the
-// bisection are the Rust side's: a front end is not a value a program can hold, a Rust unwind is
-// not a Ply value, and a reader of the store's on-disk format written here would be a second
-// implementation of it. Everything below decides what is said about all of that, in both forms,
-// and the code it exits with.
+// exits with. The load, the store, the compiled backend, the host binding, the worker pool, the
+// per-test unwind catching and the building of a mixture are the Rust side's: a front end is not a
+// value a program can hold, a Rust unwind is not a Ply value, and the store's on-disk format has one
+// reader. Which tests run, the keys each result is read and filed under, the classes they share and
+// why a failure happened are decided here, from what the runtime answers, along with everything
+// said about all of it, in both forms, and the code it exits with.
 
 import args (Flags, from_argv, style_of)
 import builder (builder)
@@ -24,19 +24,22 @@ import style (Style, plain, bold, dim, green, red, yellow)
 // The two questions a report asks about a test's contention are questions about the atoms the row
 // already carries, so the suite answers them rather than the runtime computing them twice.
 import suite.schedule (contends_only_over_regions, group_by_conflict, parallelism, region_isolated)
-// What a run decides, and the keys it decides with: the same arithmetic the runtime used to do.
-import suite.keys (writes_seed_keys)
+// The keys a mixture's result is filed under are the suite's, like every other test result's.
+import suite.keys (mixture_key)
 // What decides a cause: the change set, the search over it, and the verdict it reaches.
-import suite.bisect (Auto, Bisection, Budget, Delegated, Mode, NoHybrids, NotAttempted,
-                     NotRequested, SearchStats, Skipped, Trial, confidence_word, is_conclusive,
-                     mode_parse, skipped_parse, skipped_word, verdict_skipped, verdict_word)
-import suite.delta (Added, Change, ChangeKind, Cluster, Delta, DefKey, Derived, Edited,
-                    FusionReason, Independent, Ns, Removed, Value, flipped_keys, ns_word)
-import suite.diagnose (Attribution, Evidence, diagnose)
+import suite.bisect (Auto, Bisection, Budget, Mode, NoBodies, NotAttempted, NotRequested,
+                     SearchStats, Skipped, Trial, a_failure, a_pass, confidence_word, is_conclusive,
+                     mode_parse, skipped_word, verdict_skipped, verdict_word)
+import suite.delta (Delta, DefKey, Edited, Facts, Value, classified, flipped_keys, kind_word,
+                    ns_word)
+import suite.diagnose (Attribution, Evidence, Suspect, diagnose)
 // The tracing side of a plan is the slice's: the trace a re-run keeps is what `--trace` names.
 import suite.slice (TraceAuto, TraceAlways, TraceNever, Tracing, tracing_parse)
-import suite.select (Cached, Decision, New, Nondet, PreviousFailure, Reason, Unhashed, decide,
-                     owed_roots, seed_keys, to_run, word)
+import suite.select
+import suite.select (Cached, Decision, New, Nondet, PreviousFailure, Reason, Row, Search, Unhashed,
+                     answers_per_root, decide, digest_of, filed, key_of, narrowed, owed_roots,
+                     seed_keys, to_run, word)
+import std.bytes (bytes_of_hex, hex_of)
 
 // What the Rust side loads, binds and runs, in that order and each once per report. A run that
 // refuses at either of the first two ran nothing, which is why binding and running are two
@@ -94,24 +97,24 @@ pub nondet effect tester {
   read bound[r]() -> Result<Unit, Refusal>
   read ran[r]() -> Ran
   read stamped[r]() -> Option<List<String>>
-  // What a selector computes a selection from, before anything runs: the keys the store files
-  // results under, the definitions' hashes, and the search a seeded test is keyed on.
-  read keys[r]() -> List<Key>
+  // What a selector computes a selection from, before anything runs: each test's own hash, the
+  // definitions' hashes, and the search a seeded test is keyed on.
+  read keys[r]() -> List<Row>
   read hashed[r]() -> List<Hashed>
   read searched[r]() -> Plan
   // The printed union of a set of tests' footprints. The program colours the graph; rendering a
   // colour is the compiler's, since only its printer can keep a label variable off a name.
   read footprint[r](tests: List<Int>) -> String
-  // What the store holds under each of these keys. The keys are the program's — a per-root
-  // narrowing computes them — so no row could have carried the answers.
+  // What the store holds under each of these keys. Every key is the program's: this is the only
+  // side that encodes one.
   read outcomes[r](keys: List<String>) -> List<Option<String>>
   // What the program decided to run: which tests, the roots each still owes, the classes they
-  // share, and the reason for every test. Stated before the binding, because whether a unit has to
-  // be built at all is a function of it.
+  // share, the reason for every test, and the keys each pass is filed under. Stated before the
+  // binding, because whether a unit has to be built at all is a function of it.
   write chosen[r](choice: Choice) -> Unit
-  // One mixture of one failure, for a program that does the searching itself: the change set comes
-  // back with the report, and each trial is a set of definitions to take from the post-edit side.
-  read trial[r](failure: Int, keys: List<{ name: String, ns: String }>) -> Trial
+  // One mixture of one failure: a set of definitions to take from the post-edit side, and the key
+  // its pass is filed under, which a pass already there answers without building anything.
+  read trial[r](failure: Int, keys: List<{ name: String, ns: String }>, filed: Option<String>) -> Trial
 }
 
 // One run's decision, as the runtime reads it back.
@@ -124,25 +127,8 @@ pub type Choice = {
   narrowed: List<{ index: Int, roots: List<Int> }>,
   // Concurrency classes over `runs`.
   groups: List<List<Int>>,
-}
-
-// One test the loaded tree declares, and what the store holds under the key its result is filed
-// under. Nothing here is a selection: which of them run is the selector's to say.
-pub type Key = {
-  index: Int,
-  // The test's label, as a report prints it.
-  label: String,
-  // The test's program-wide name, `<module>.<label>`.
-  name: String,
-  module: String,
-  // The key the result is filed under; `None` when the front end produced no hash.
-  cache_key: Option<String>,
-  // Whether the key is the search's, rather than the test's own hash.
-  seeded: Bool,
-  // `test/nondet` opts out of the cache in both directions.
-  nondet: Bool,
-  // `passed`, `failed`, or nothing, when the store holds no result under that key.
-  cached: Option<String>,
+  // Every key each running test's pass is filed under.
+  filed: List<{ index: Int, keys: List<String> }>,
 }
 
 // One definition or test the loaded tree declares, and its hash.
@@ -208,7 +194,14 @@ pub type Phases = { read_us: Int, front_us: Int, write_back_us: Int }
 // The search every seeded test is keyed on. Each field is in that test's cache key.
 // `budget` and `steps` are the bounds as the search prints them, which is all a report does with
 // them; the document carries the machine's own numbers under `options`.
-pub type Plan = { mode: String, roots: List<Int>, seeds: Int, budget: Int, steps: Int }
+pub type Plan = {
+  mode: String,
+  roots: List<Int>,
+  seeds: Int,
+  budget: Int,
+  steps: Int,
+  path: List<Int>,
+}
 
 pub type ModuleView = { name: String, file: String }
 
@@ -293,14 +286,20 @@ fn classes_of(p: Program, runs: List<Int>) -> List<List<Int>> =
 fn decided_of(
   p: Program,
   decisions: List<Decision>,
-  owed: List<{ index: Int, owed: List<Int> }>,
+  search: Search,
   groups: List<Group>,
   classes: List<List<Int>>,
 ) -> Decided = {
   let runs = to_run(decisions);
   {
     reasons: map(decisions, |x: Decision| { index: x.case.index, reason: x.reason }),
-    owed: map(owed, |e: { index: Int, owed: List<Int> }| { index: e.index, owed: len(e.owed) }),
+    owed: fold(decisions, [], |acc: List<{ index: Int, owed: Int }>, x: Decision|
+      if !x.case.seeded { acc } else {
+        push(acc, {
+          index: x.case.index,
+          owed: match x.case.owed { Some(roots) -> len(roots), None -> len(search.roots) },
+        })
+      }),
     runs: runs,
     at: flattened(classes),
     classes: groups,
@@ -405,19 +404,6 @@ pub type Outcome = {
   cached: Option<Bool>,
 }
 
-pub type Suspect = {
-  name: String,
-  // The definition's current hash, which a reader matches against a build.
-  hash: Option<String>,
-  // `None` when the configurations were never compared, so an edit looks like a moved hash.
-  change: Option<String>,
-  // `None` when the failing execution was not traced.
-  ran: Option<Bool>,
-  // Distance above the failing frame, zero being where it happened.
-  depth: Option<Int>,
-  culprit: Bool,
-}
-
 pub type Culprit = { names: List<String>, at: Option<At> }
 
 // What a failure's cause came to. The runtime sends this whole shape — a program that searched
@@ -442,27 +428,27 @@ pub type Site = { task: String, definition: Option<String>, access: String, at: 
 // The two steps whose reordering flipped a passing interleaving to this one.
 pub type Race = { left: Site, right: Site }
 
-// What the runtime hands over so this program can search for the cause itself: the change set, what
-// the classifier could not tell apart, the reason to give when there is nothing to try, and where
-// each name in the change set is.
-pub type Search = {
-  delta: Delta,
-  classified: Int,
-  test_classified: Bool,
-  absent: Skipped,
+// What a failure's cause is decided from, when the test passed before: the facts its change set is
+// classified from, why no mixture can be tried when none can, and where each name the facts mention
+// is.
+pub type Evident = {
+  facts: Facts,
+  absent: Option<Skipped>,
   at: List<{ name: String, at: Option<At> }>,
 }
 
-pub type Fault = {
+// One failure as the runtime reports it: what happened, and the facts its cause is decided from.
+pub type Failed = {
   key: String,
   diagnostic: Diag,
-  // Two of the gate's three answers; the mode is this run's own flag.
+  // Two of the gate's facts; the mode is this run's own flag.
   defect: Bool,
   host: Bool,
-  search: Option<Search>,
-  bisect: Bisect,
+  // `None` when the test never passed, so there is no earlier definition set to compare against.
+  search: Option<Evident>,
   slice: Option<Slice>,
-  suspects: List<Suspect>,
+  // The definitions in the closure the store has never seen pass, each with its current hash.
+  suspects: List<{ name: String, hash: Option<String> }>,
   // Nothing in this test's closure changed, which is not the same as nothing being ranked.
   unchanged: Bool,
   seed: Option<String>,
@@ -476,6 +462,28 @@ pub type Fault = {
   status: Option<String>,
   declared: Option<List<String>>,
   // `None` rather than empty when untraced: unwatched differs from performing nothing.
+  observed: Option<List<String>>,
+}
+
+// One failure as a report shows it: the runtime's account, and what this program decided about its
+// cause.
+pub type Fault = {
+  key: String,
+  diagnostic: Diag,
+  bisect: Bisect,
+  slice: Option<Slice>,
+  // Ranked, most likely first.
+  suspects: List<Suspect>,
+  unchanged: Bool,
+  seed: Option<String>,
+  race: Option<Race>,
+  replay: Option<String>,
+  artifact: Json,
+  module: Option<String>,
+  test_hash: Option<String>,
+  nondet: Option<Bool>,
+  status: Option<String>,
+  declared: Option<List<String>>,
   observed: Option<List<String>>,
 }
 
@@ -519,7 +527,7 @@ pub type Ran = {
   workers: Int,
   backend: Option<Backend>,
   results: List<Outcome>,
-  failures: List<Fault>,
+  failures: List<Failed>,
   summary: Summary,
   simulation: Simulated,
   // Not warnings: every later run believes an escaped cache entry.
@@ -1141,7 +1149,7 @@ fn ran_lines(s: Style, f: Fault) -> List<String> =
   }
 
 fn described(x: Suspect) -> String = {
-  let changed = match x.change { Some(c) -> [c], None -> [] };
+  let changed = match x.change { Some(c) -> [kind_word(c)], None -> [] };
   let noted = match x.ran {
     Some(true) -> match x.depth { None -> push(changed, "ran, then returned"), Some(_) -> changed },
     Some(false) -> push(changed, "did not run"),
@@ -1177,8 +1185,8 @@ fn failure_lines(s: Style, places: List<Place>, f: Fault) -> List<String> =
     suspect_lines(s, f),
   )
 
-fn failure_blocks(s: Style, p: Program, r: Ran) -> List<String> =
-  fold(r.failures, [], |acc: List<String>, f: Fault|
+fn failure_blocks(s: Style, p: Program, faults: List<Fault>) -> List<String> =
+  fold(faults, [], |acc: List<String>, f: Fault|
     appended(push(acc, ""), map(failure_lines(s, p.places, f), |l: String| ind() ++ l)))
 
 // A test the clock stopped: no culprit, no suspects, nothing to bisect — the machine ran out of
@@ -1348,7 +1356,7 @@ fn with_members(doc: Json, extra: List<Member>) -> Json =
 fn fault_json(p: Program, f: Fault) -> Json =
   with_members(f.artifact, [
     { key: "culprit", value: culprit_json(f.bisect) },
-    { key: "suspects", value: Array(map(ranked(f), suspect_json)) },
+    { key: "suspects", value: Array(map(f.suspects, suspect_json)) },
     { key: "diagnostic", value: one_diagnostic(f.diagnostic, p.places) },
     { key: "module", value: opt_str(f.module) },
     { key: "test_hash", value: opt_str(f.test_hash) },
@@ -1392,27 +1400,13 @@ fn culprit_json(b: Bisect) -> Json =
     },
   ])
 
-// The suspects in the order a reader should try them, with the ones the verdict named marked.
-// The runtime's ranking is the evidence; which of them the failure came from is the answer, and
-// the answer is the program's.
-fn ranked(f: Fault) -> List<Suspect> =
-  sorted_suspects(map(f.suspects, |x: Suspect| { ..x, culprit: names_a_culprit(f.bisect, x.name) }))
-
-fn names_a_culprit(b: Bisect, name: String) -> Bool =
-  fold(b.culprits, false, |found: Bool, c: Culprit| found || contains_name(c.names, name))
-
-fn contains_name(names: List<String>, name: String) -> Bool =
-  fold(names, false, |found: Bool, n: String| found || n == name)
-
-// A culprit first, then the suspects as the runtime ranked them: a reader who stops at the first
-// line has to get the best guess.
-fn sorted_suspects(xs: List<Suspect>) -> List<Suspect> =
-  appended(filter(xs, |x: Suspect| x.culprit), filter(xs, |x: Suspect| !x.culprit))
-
 fn suspect_json(x: Suspect) -> Json =
   object([
     { key: "name", value: Str(x.name) },
-    { key: "change", value: opt_str(x.change) },
+    {
+      key: "change",
+      value: opt_str(match x.change { Some(c) -> Some(kind_word(c)), None -> None }),
+    },
     { key: "hash", value: opt_str(x.hash) },
     { key: "ran", value: opt_bool(x.ran) },
     { key: "depth", value: opt_num(x.depth) },
@@ -1499,7 +1493,15 @@ fn extra_documents(r: Ran) -> List<Member> = {
 // Bumped whenever a field in the failure artifact changes meaning or leaves.
 fn artifact_schema() -> Int = 5
 
-fn document(flags: Flags, p: Program, r: Ran, warnings: List<Diag>, ok: Bool, d: Decided) -> Json =
+fn document(
+  flags: Flags,
+  p: Program,
+  r: Ran,
+  faults: List<Fault>,
+  warnings: List<Diag>,
+  ok: Bool,
+  d: Decided,
+) -> Json =
   object(
     appended(
       [
@@ -1534,7 +1536,7 @@ fn document(flags: Flags, p: Program, r: Ran, warnings: List<Diag>, ok: Bool, d:
         { key: "selection", value: selection_json(p, r, d) },
         { key: "summary", value: summary_json(r.summary) },
         { key: "results", value: Array(map(r.results, |o: Outcome| outcome_json(p, o, d))) },
-        { key: "failures", value: Array(map(r.failures, |f: Fault| fault_json(p, f))) },
+        { key: "failures", value: Array(map(faults, |f: Fault| fault_json(p, f))) },
         // Not a warning: every later run believes an escaped entry.
         { key: "diagnostics", value: all_to_json(r.escapes, p.places) },
         { key: "warnings", value: all_to_json(warnings, p.places) },
@@ -1570,6 +1572,7 @@ fn lines_of(
   flags: Flags,
   p: Program,
   r: Ran,
+  faults: List<Fault>,
   warnings: List<Diag>,
   d: Decided,
 ) -> List<String> =
@@ -1588,7 +1591,7 @@ fn lines_of(
               ),
               warned(s, r.escapes),
             ),
-            failure_blocks(s, p, r),
+            failure_blocks(s, p, faults),
           ),
           abandoned_blocks(s, p, r),
         ),
@@ -1605,12 +1608,12 @@ fn collected(p: Program, r: Ran) -> List<Diag> =
     if len(filter(acc, |x: Diag| x.code == d.code && x.message == d.message)) > 0 { acc }
     else { push(acc, d) })
 
-fn answered(s: Style, flags: Flags, p: Program, r: Ran, d: Decided) -> Answer = {
+fn answered(s: Style, flags: Flags, p: Program, r: Ran, faults: List<Fault>, d: Decided) -> Answer = {
   let warnings = collected(p, r);
   let ok = green_run(r);
   {
-    json: document(flags, p, r, warnings, ok, d),
-    lines: lines_of(s, flags, p, r, warnings, d),
+    json: document(flags, p, r, faults, warnings, ok, d),
+    lines: lines_of(s, flags, p, r, faults, warnings, d),
     errs: [],
     code: if ok { ok_code() } else { run_failed() },
   }
@@ -1634,22 +1637,6 @@ fn unbound(s: Style, refusal: Refusal) -> Answer = {
     code: compile_error(),
   }
 }
-
-// A test the store already holds, as the runtime sends one: exactly the fields the decision is
-// arithmetic over, which is also the shape the suite's `Case` declares.
-fn key_as_case(
-  k: Key,
-) -> { index: Int, label: String, name: String, module: String, cache_key: Option<String>, seeded: Bool, nondet: Bool, cached: Option<String> } =
-  {
-    index: k.index,
-    label: k.label,
-    name: k.name,
-    module: k.module,
-    cache_key: k.cache_key,
-    seeded: k.seeded,
-    nondet: k.nondet,
-    cached: k.cached,
-  }
 
 pub fn run(
   flags: Flags,
@@ -1677,107 +1664,87 @@ fn tests_over(
   match tester.loaded[corpus]() {
     Err(refusal) -> refused(s, "test", refusal.diags, refusal.places),
     Ok(p) -> {
-      // Which tests run is the program's to say: the runtime answers what the store holds and
-      // serves; the decision is arithmetic over those rows, and the report reads it back.
-      let keys = tester.keys[corpus]();
-      let search = tester.searched[corpus]();
-      let decisions = decide(map(keys, key_as_case));
-      let runs = to_run(decisions);
-      let owing = map(filter(keys, |k: Key| k.seeded && k.cache_key != None), |k: Key| {
-        let roots = search.roots;
-        // A `random` plan is one claim per root, so a widened root set owes only the roots the
-        // store has not already answered alone. The path is `[]`: it is empty outside `once`, which
-        // writes no per-root keys at all.
-        let held = match k.cache_key {
-          Some(hash) -> if writes_seed_keys(search.mode, search.budget, search.steps, []) {
-            tester.outcomes[corpus](seed_keys(hash, roots, []))
-          } else { map(roots, |_r: Int| None) },
-          None -> map(roots, |_r: Int| None),
-        };
-        { index: k.index, owed: owed_roots(roots, held) }
-      });
+      // Which tests run is the program's to say, and so is every key the store is asked about or a
+      // pass is filed under: the runtime answers what the store holds and does what it is told.
+      let search = search_of(tester.searched[corpus]());
+      let decisions = decide(cases_of(tester.keys[corpus](), search));
       // Which tests may share a worker is the program's to say, from the atoms each row carries;
       // only the rendering of a class is the printer's.
-      let classes = classes_of(p, runs);
-      let decided = decided_of(p, decisions, owing, fold(classes, [], with_footprint), classes);
-      // Only a test whose owed roots are fewer than the plan's is narrowed: the others search the
-      // whole plan.
-      let narrowed = fold(
-        owing,
-        [],
-        |acc: List<{ index: Int, roots: List<Int> }>, e: { index: Int, owed: List<Int> }|
-          if len(e.owed) < len(search.roots) { push(acc, { index: e.index, roots: e.owed }) }
-          else { acc },
-      );
+      let classes = classes_of(p, to_run(decisions));
+      let decided = decided_of(p, decisions, search, fold(classes, [], with_footprint), classes);
       tester.chosen[corpus]({
         runs: decided.runs,
         reasons: map(decided.reasons, |e: { index: Int, reason: Reason }| word(e.reason)),
-        narrowed: narrowed,
+        narrowed: narrowed(decisions, search.roots),
         groups: classes,
+        filed: filed(decisions, search),
       });
       match tester.bound[corpus]() {
         Err(refusal) -> unbound(s, refusal),
         Ok(_) -> {
           // The run is over, so the runtime can be asked about mixtures of what it found; every
-          // failure's verdict is decided here, before anything renders one.
+          // failure's cause is decided here, before anything renders one.
           let r = tester.ran[corpus]();
-          answered(s, flags, p, { ..r, failures: decided_faults(r, options) }, decided)
+          answered(s, flags, p, r, decided_faults(r, diagnosing(options)), decided)
         },
       }
     },
   }
 }
 
+fn search_of(plan: Plan) -> Search =
+  { mode: plan.mode, roots: plan.roots, budget: plan.budget, steps: plan.steps, path: plan.path }
+
+/// What the store holds for each test, asked under the keys this program computes: the key its
+/// result is filed under, and — for a seeded test whose plan is answered root by root — each
+/// root's own.
+fn cases_of(rows: List<Row>, search: Search) -> List<select::Case> / {tester.outcomes[corpus]} = {
+  let digest = digest_of(search);
+  let keys = map(rows, |r: Row| key_of(r, digest));
+  let answers = tester.outcomes[corpus](
+    fold(keys, [], |acc: List<String>, k: Option<String>|
+      match k { Some(key) -> push(acc, key), None -> acc }),
+  );
+  // A keyed row's answer is the next one, in the order the keys were asked.
+  let held = fold(
+    keys,
+    { at: 0, out: [] },
+    |st: { at: Int, out: List<Option<String>> }, k: Option<String>|
+      match k {
+        None -> { ..st, out: push(st.out, None) },
+        Some(_) -> { at: st.at + 1, out: push(st.out, answer_at(answers, st.at)) },
+      },
+  ).out;
+  map(range(0, len(rows)), |i: Int| {
+    let r: Row = at(rows, i, no_row());
+    let owed = match r.hash {
+      Some(h) -> if answers_per_root(r, search) {
+        Some(owed_roots(search.roots, tester.outcomes[corpus](seed_keys(h, search.roots, []))))
+      } else { None },
+      None -> None,
+    };
+    select::case_of(r, at(keys, i, None), answer_at(held, i), owed)
+  })
+}
+
+fn answer_at(answers: List<Option<String>>, i: Int) -> Option<String> =
+  match list_at(answers, i) { Some(answer) -> answer, None -> None }
+
+fn no_row() -> Row =
+  { index: 0, label: "", name: "", module: "", hash: None, seeded: false, nondet: false }
+
 // --- What decided each cause -------------------------------------------------
 
-/// One failure's verdict. The runtime hands over the change set and a way to try a mixture of it;
-/// where the search goes is the program's, so `suite.bisect` runs here over a closure that asks the
-/// runtime for one trial at a time.
-fn searched(f: Fault, index: Int, options: Options) -> Bisect / {tester.trial[corpus]} =
-  match f.search {
-    None -> f.bisect,
-    Some(s) -> match diagnosis_of(f, options, s, index) {
-      Err(_) -> f.bisect,
-      Ok(verdict) ->
-        {
-          conclusive: is_conclusive(verdict),
-          // Silent when no bisection was asked for.
-          requested: match verdict.verdict { NotAttempted(NotRequested) -> false, _ -> true },
-          reason: verdict.reason,
-          culprits: map(verdict.groups, |group: List<String>|
-            { names: group, at: first_at(s.at, group) }),
-          verdict: verdict_word(verdict.verdict),
-          skipped: match verdict_skipped(verdict.verdict) {
-            Some(why) -> Some(skipped_word(why)),
-            None -> None,
-          },
-          confidence: confidence_word(verdict.confidence),
-          groups: verdict.groups,
-          search: verdict.search,
-        },
-    },
-  }
+/// Every failure's cause, decided before anything renders one.
+fn decided_faults(r: Ran, asked: Diagnosing) -> List<Fault> / {tester.trial[corpus]} =
+  flat_map(range(0, len(r.failures)), |i: Int|
+    match list_at(r.failures, i) { None -> [], Some(f) -> [fault_of(f, i, asked)] })
 
-// The gate and the plan, as T4's `diagnose` reads them: the mode and the budget are this run's flags,
-/// and the suspects are the closure the runtime already ranked.
-fn diagnosis_of(
-  f: Fault,
-  options: Options,
-  s: Search,
-  index: Int,
-) -> Result<Bisection, Unit> / {tester.trial[corpus]} = {
-  let evidence: Evidence = {
-    nondet: match f.nondet { Some(x) -> x, None -> false },
-    defect: f.defect,
-    host: f.host,
-    // The runtime ranked the suspects already; this side reads only the verdict.
-    suspects: [],
-    // The change set came with the report, so an earlier passing run is on record by construction.
-    baseline: true,
-    // The slice stays the runtime's: it ranks the suspects, and this decides what to try.
-    slice: None,
-  };
-  let plan = {
+// What this run's flags ask of a cause: the search mode, the trace, and the trial budget.
+type Diagnosing = { bisect: Mode, trace: Tracing, budget: Budget }
+
+fn diagnosing(options: Options) -> Diagnosing =
+  {
     bisect: match mode_parse(options.bisect) { Some(m) -> m, None -> Auto },
     trace: match tracing_parse(options.trace) {
       Some(TraceAuto) -> TraceAuto,
@@ -1785,22 +1752,91 @@ fn diagnosis_of(
       _ -> TraceNever,
     },
     budget: { max_trials: Some(options.bisect_budget) },
+  }
+
+/// One failure's cause. The gate, the change set, the search over it and the ranking of the
+/// suspects are `suite.diagnose`'s, over the facts the runtime handed over and a closure that asks
+/// it for one mixture at a time.
+fn fault_of(f: Failed, index: Int, asked: Diagnosing) -> Fault / {tester.trial[corpus]} = {
+  let diff = match f.search { Some(e) -> Some(classified(e.facts)), None -> None };
+  let evidence: Evidence = {
+    nondet: match f.nondet { Some(x) -> x, None -> false },
+    defect: f.defect,
+    host: f.host,
+    suspects: f.suspects,
+    baseline: match f.search { Some(_) -> true, None -> false },
+    // The slice stays the runtime's.
+    slice: None,
   };
-  Ok(
-    diagnose(
-      evidence,
-      plan,
-      Some(s.delta),
-      s.classified,
-      s.test_classified,
-      Some(|d: Delta, flipped: List<Int>| {
-        let keys = flipped_keys(d, flipped);
-        tester.trial[corpus](index, map(keys, |k: DefKey| { name: k.name, ns: ns_word(k.ns) }))
-      }),
-      s.absent,
-    ).bisection,
-  )
+  let a: Attribution = diagnose(
+    evidence,
+    asked,
+    match diff { Some(d) -> Some(d.delta), None -> None },
+    match diff { Some(d) -> len(d.unclassified), None -> 0 },
+    match diff { Some(d) -> !d.test_unclassified, None -> true },
+    |d: Delta, flipped: List<Int>| {
+      let keys = flipped_keys(d, flipped);
+      tester.trial[corpus](
+        index,
+        map(keys, |k: DefKey| { name: k.name, ns: ns_word(k.ns) }),
+        mixture_filed(f, keys),
+      )
+    },
+    match f.search { Some(e) -> e.absent, None -> None },
+  );
+  let places = match f.search { Some(e) -> e.at, None -> [] };
+  {
+    key: f.key,
+    diagnostic: f.diagnostic,
+    bisect: bisect_of(a.bisection, places),
+    slice: f.slice,
+    suspects: a.suspects,
+    unchanged: f.unchanged,
+    seed: f.seed,
+    race: f.race,
+    replay: f.replay,
+    artifact: f.artifact,
+    module: f.module,
+    test_hash: f.test_hash,
+    nondet: f.nondet,
+    status: f.status,
+    declared: f.declared,
+    observed: f.observed,
+  }
 }
+
+// A mixture's pass is filed under the test as it is now and as it last passed, the definitions
+// taken, and the interleaving the failure took.
+fn mixture_filed(f: Failed, keys: List<DefKey>) -> Option<String> =
+  match f.search {
+    None -> None,
+    Some(e) -> match e.facts.own.after {
+      None -> None,
+      Some(now) ->
+        Some(
+          hex_of(mixture_key(bytes_of_hex(now), bytes_of_hex(e.facts.own.before), keys, f.seed)),
+        ),
+    },
+  }
+
+// A verdict as the report carries it, with the place of the first of each group's definitions.
+fn bisect_of(verdict: Bisection, places: List<{ name: String, at: Option<At> }>) -> Bisect =
+  {
+    conclusive: is_conclusive(verdict),
+    // Silent when no bisection was asked for.
+    requested: match verdict.verdict { NotAttempted(NotRequested) -> false, _ -> true },
+    reason: verdict.reason,
+    culprits: map(verdict.groups, |group: List<String>|
+      { names: group, at: first_at(places, group) }),
+    verdict: verdict_word(verdict.verdict),
+    skipped: match verdict_skipped(verdict.verdict) {
+      Some(why) -> Some(skipped_word(why)),
+      None -> None,
+    },
+    confidence: confidence_word(verdict.confidence),
+    groups: verdict.groups,
+    search: verdict.search,
+  }
 
 // Where the first of a group's definitions is: the runtime knows the places and this side knows only
 // the names.
@@ -1816,20 +1852,6 @@ fn first_at(at: List<{ name: String, at: Option<At> }>, names: List<String>) -> 
 
 fn at_at(hits: List<{ name: String, at: Option<At> }>, i: Int) -> Option<At> =
   match list_at(hits, i) { Some(hit) -> hit.at, None -> None }
-
-/// Every failure's verdict, computed before anything renders them: the search is this program's, so
-/// the rows it built carry the runtime's gate and this side's answer.
-fn decided_faults(r: Ran, options: Options) -> List<Fault> / {tester.trial[corpus]} =
-  flat_map(range(0, len(r.failures)), |i: Int| decided_one(r, options, i))
-
-fn decided_one(r: Ran, options: Options, i: Int) -> List<Fault> / {tester.trial[corpus]} =
-  match list_at(r.failures, i) {
-    None -> [],
-    Some(hit) -> {
-      let f: Fault = at(r.failures, i, hit);
-      [{ ..f, bisect: searched(f, i, options) }]
-    },
-  }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -1852,17 +1874,21 @@ fn no_phases() -> Phases = { read_us: 0, front_us: 0, write_back_us: 0 }
 
 fn a_hash() -> String = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 
-fn a_key(index: Int, label: String, answered: Bool, seeded: Bool, unstable: Bool) -> Key =
+fn a_key(index: Int, label: String, answered: Bool, seeded: Bool, unstable: Bool) -> select::Case =
   {
     index: index,
     label: label,
     name: "m." ++ label,
     module: "m",
+    hash: Some(a_hash()),
     cache_key: Some(a_hash()),
     seeded: seeded,
     nondet: unstable,
     cached: if answered { Some("passed") } else { None },
+    owed: None,
   }
+
+fn a_search() -> Search = { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [] }
 
 fn a_case(index: Int, name: String) -> Case =
   {
@@ -1882,13 +1908,13 @@ fn a_case(index: Int, name: String) -> Case =
 /// The decision a fixture's keys imply: the reasons come from `decide`, so a fixture that wants a
 /// cached test says its key was answered rather than naming the reason. The classes are the ones the
 /// decision's own runs make, with a placeholder rendering — a fixture reads the shape, not the atoms.
-fn a_decided(p: Program, keys: List<Key>) -> Decided = {
-  let decisions = decide(map(keys, key_as_case));
+fn a_decided(p: Program, keys: List<select::Case>) -> Decided = {
+  let decisions = decide(keys);
   let classes = classes_of(p, to_run(decisions));
   decided_of(
     p,
     decisions,
-    [],
+    a_search(),
     map(classes, |class: List<Int>| { tests: class, footprint: "{}" }),
     classes,
   )
@@ -1905,7 +1931,7 @@ fn a_program(cases: List<Case>) -> Program =
     declared: len(cases),
     cases: cases,
     filtered_out: 0,
-    plan: { mode: "one", roots: [0], seeds: 1, budget: 64, steps: 1000 },
+    plan: { mode: "one", roots: [0], seeds: 1, budget: 64, steps: 1000, path: [] },
     warnings: [],
     options: Null,
   }
@@ -1924,7 +1950,7 @@ fn an_outcome(index: Int, name: String, status: String) -> Outcome =
 
 fn no_counts() -> Counts = { total: 0, isolated: 0, shared: 0, host: 0 }
 
-fn a_run(results: List<Outcome>, failures: List<Fault>) -> Ran =
+fn a_run(results: List<Outcome>, failed: Int) -> Ran =
   {
     hermetic: true,
     label: "hermetic",
@@ -1937,10 +1963,10 @@ fn a_run(results: List<Outcome>, failures: List<Fault>) -> Ran =
     workers: 4,
     backend: None,
     results: results,
-    failures: failures,
+    failures: [],
     summary: {
       passed: len(filter(results, |o: Outcome| o.status == "passed")),
-      failed: len(failures),
+      failed: failed,
       abandoned: len(filter(results, |o: Outcome| o.status == "abandoned")),
       cached: 0,
       duration_us: 20000,
@@ -1985,9 +2011,6 @@ fn a_fault() -> Fault =
   {
     key: "m.two is two",
     diagnostic: a_diag(b"E0502", b"assertion failed", [], []),
-    defect: false,
-    host: false,
-    search: None,
     bisect: no_bisect(),
     slice: None,
     suspects: [],
@@ -2005,7 +2028,74 @@ fn a_fault() -> Fault =
   }
 
 fn a_suspect(name: String) -> Suspect =
-  { name: name, hash: None, change: None, ran: None, depth: None, culprit: false }
+  { name: name, hash: None, before: None, change: None, ran: None, depth: None, culprit: false }
+
+// A failure the runtime reports with two edits since its test last passed.
+fn a_failed(defect: Bool, host: Bool, absent: Option<Skipped>) -> Failed =
+  {
+    key: "m.two is two",
+    diagnostic: a_diag(b"E0501", b"assertion failed", [], []),
+    defect: defect,
+    host: host,
+    search: Some({
+      facts: {
+        own: { name: "m.two is two", before: "01", after: Some("02"), rehashed: Some("01") },
+        rows: [
+          {
+            name: "m.a",
+            ns: Value,
+            before: Some("a1"),
+            after: Some("a2"),
+            rehashed: Some("a2"),
+            stable: None,
+            kept: false,
+            renamed: false,
+            component: [],
+            referrers: [],
+          },
+          {
+            name: "m.b",
+            ns: Value,
+            before: Some("b1"),
+            after: Some("b2"),
+            rehashed: Some("b2"),
+            stable: None,
+            kept: false,
+            renamed: false,
+            component: [],
+            referrers: [],
+          },
+        ],
+      },
+      absent: absent,
+      at: [],
+    }),
+    slice: None,
+    suspects: [{ name: "m.a", hash: Some("a2") }, { name: "m.b", hash: Some("b2") }],
+    unchanged: false,
+    seed: None,
+    race: None,
+    replay: None,
+    artifact: Null,
+    module: Some("m"),
+    test_hash: None,
+    nondet: Some(false),
+    status: Some("failed"),
+    declared: None,
+    observed: None,
+  }
+
+// The verdict on one failure, from a runtime whose mixtures fail exactly when they take `m.b`.
+fn caused(f: Failed) -> Bisect =
+  handle {
+    fault_of(f, 0, { bisect: Auto, trace: TraceNever, budget: { max_trials: Some(64) } }).bisect
+  } with {
+    tester.trial[corpus](failure, keys, filed) -> taking_b_fails(keys),
+  }
+
+fn taking_b_fails(keys: List<{ name: String, ns: String }>) -> Trial =
+  if len(filter(keys, |k: { name: String, ns: String }| k.name == "m.b")) > 0 { a_failure() }
+  else { a_pass() }
 
 test "a green run is exit 0, and the head says what was selected of what" {
   let p = a_program([a_case(0, "one"), a_case(1, "two")]);
@@ -2014,7 +2104,8 @@ test "a green run is exit 0, and the head says what was selected of what" {
     plain(),
     from_argv("test", []),
     p,
-    a_run([an_outcome(0, "one", "passed")], []),
+    a_run([an_outcome(0, "one", "passed")], 0),
+    [],
     a_decided(p, keys),
   );
   assert_eq(answer.code, 0);
@@ -2040,7 +2131,8 @@ test "a failure is exit 1 and the culprit is printed before the diff" {
     plain(),
     from_argv("test", []),
     p,
-    a_run([an_outcome(0, "two is two", "failed")], [culprit]),
+    a_run([an_outcome(0, "two is two", "failed")], 1),
+    [culprit],
     a_decided(p, keys),
   );
   assert_eq(answer.code, 1);
@@ -2062,6 +2154,21 @@ test "a bisection nobody asked for says nothing, and one that failed says why" {
   )
 }
 
+test "the runtime's marks decide whether a failure is searched, and a search names the edit" {
+  assert_eq(caused(a_failed(false, false, None)).groups, [["m.b"]]);
+  // A defect in Ply and a run that reached the host are refused before any mixture is tried.
+  let defect = caused(a_failed(true, false, None));
+  assert_eq(defect.skipped, Some("panicked"));
+  assert_eq(defect.search.evaluated, 0);
+  let host = caused(a_failed(false, true, None));
+  assert_eq(host.skipped, Some("host"));
+  assert_eq(host.search.evaluated, 0);
+  // Two edits need a mixture to tell apart, so a store that cannot build one is the reason.
+  let pruned = caused(a_failed(false, false, Some(NoBodies)));
+  assert_eq(pruned.skipped, Some("no_bodies"));
+  assert_eq(pruned.search.evaluated, 0)
+}
+
 test "a test the clock stopped is abandoned rather than judged, and the run is not a success" {
   let p = a_program([a_case(0, "slow")]);
   let keys = [a_key(0, "slow", false, false, false)];
@@ -2073,7 +2180,8 @@ test "a test the clock stopped is abandoned rather than judged, and the run is n
     plain(),
     from_argv("test", []),
     p,
-    a_run([stopped], []),
+    a_run([stopped], 0),
+    [],
     a_decided(p, keys),
   );
   assert_eq(answer.code, 1);
@@ -2087,17 +2195,17 @@ test "an escaped cache entry fails the run even with every test green" {
   let p = a_program([a_case(0, "one")]);
   let keys = [a_key(0, "one", false, false, false)];
   let escaped = {
-    ..a_run([an_outcome(0, "one", "passed")], []),
+    ..a_run([an_outcome(0, "one", "passed")], 0),
     escapes: [a_diag(b"E0001", b"`m.one` can reach the host binding", [], [])],
   };
-  assert_eq(answered(plain(), from_argv("test", []), p, escaped, a_decided(p, keys)).code, 1)
+  assert_eq(answered(plain(), from_argv("test", []), p, escaped, [], a_decided(p, keys)).code, 1)
 }
 
 test "a mutant no test kills fails the run and is named with what it changed" {
   let p = a_program([a_case(0, "one")]);
   let keys = [a_key(0, "one", false, false, false)];
   let mutated = {
-    ..a_run([an_outcome(0, "one", "passed")], []),
+    ..a_run([an_outcome(0, "one", "passed")], 0),
     mutants: Some({
       killed: 2,
       survived: 1,
@@ -2108,7 +2216,7 @@ test "a mutant no test kills fails the run and is named with what it changed" {
       json: Null,
     }),
   };
-  let answer = answered(plain(), from_argv("test", []), p, mutated, a_decided(p, keys));
+  let answer = answered(plain(), from_argv("test", []), p, mutated, [], a_decided(p, keys));
   assert_eq(answer.code, 1);
   assert(said(answer.lines, "   mutants 2 killed, 1 survived, 0 skipped"));
   assert(said(answer.lines, "      m.total survives `+` -> `-` at "))
@@ -2134,13 +2242,13 @@ test "a result line pads the name to the column and the reading to one decimal" 
 // The column never narrows below 24 and never widens past 64, so long names still line up.
 test "the name column is the widest name, clamped" {
   let p = a_program([]);
-  assert_eq(name_column(p, a_run([], [])), 24);
-  assert_eq(name_column(p, a_run([an_outcome(0, repeated("x", 30), "passed")], [])), 30);
-  assert_eq(name_column(p, a_run([an_outcome(0, repeated("x", 90), "passed")], [])), 64)
+  assert_eq(name_column(p, a_run([], 0)), 24);
+  assert_eq(name_column(p, a_run([an_outcome(0, repeated("x", 30), "passed")], 0)), 30);
+  assert_eq(name_column(p, a_run([an_outcome(0, repeated("x", 90), "passed")], 0)), 64)
 }
 
 test "the summary counts what was decided and how long it took" {
-  let r = a_run([an_outcome(0, "one", "passed")], []);
+  let r = a_run([an_outcome(0, "one", "passed")], 0);
   assert_eq(summary_line(plain(), r), "   0 failed, 1 passed, 0 cached (0.02s)");
   let hosted = { ..r, counts: { ..no_counts(), total: 1, host: 1 } };
   assert(string_contains(summary_line(plain(), hosted), "1 host-backed and not cached"))
@@ -2156,7 +2264,7 @@ test "a reason is spaced in the line and joined in the document" {
 test "`--explain` says why each test ran, once per reason, and how the groups formed" {
   let p = a_program([a_case(0, "one"), a_case(1, "two")]);
   let keys = [a_key(0, "one", false, false, false), a_key(1, "two", true, false, false)];
-  let lines = explain_lines(plain(), p, a_run([], []), a_decided(p, keys));
+  let lines = explain_lines(plain(), p, a_run([], 0), a_decided(p, keys));
   assert(string_contains(at(lines, 1, ""), "run  abcdef012345 new "));
   assert(string_contains(at(lines, 1, ""), "isolation: region"));
   assert(string_contains(at(lines, 2, ""), "skip abcdef012345 cached "));
@@ -2175,7 +2283,8 @@ test "the document keys off `command` and `exit_code` and names the schema it pu
       plain(),
       from_argv("test", ["--json"]),
       p,
-      a_run([an_outcome(0, "one", "passed")], []),
+      a_run([an_outcome(0, "one", "passed")], 0),
+      [],
       a_decided(p, keys),
     ).json,
   );
@@ -2212,7 +2321,7 @@ test "a program with no tests at all says so, and one narrowed to none says that
   let empty = { ..a_program([]), declared: 0 };
   assert(
     said(
-      answered(plain(), from_argv("test", []), empty, a_run([], []), a_decided(empty, [])).lines,
+      answered(plain(), from_argv("test", []), empty, a_run([], 0), [], a_decided(empty, [])).lines,
       "   no `test` items in this program",
     ),
   );
@@ -2223,7 +2332,8 @@ test "a program with no tests at all says so, and one narrowed to none says that
         plain(),
         from_argv("test", ["--filter=none"]),
         hidden,
-        a_run([], []),
+        a_run([], 0),
+        [],
         a_decided(hidden, []),
       ).lines,
       "   no test key contains that substring; nothing was verified",
@@ -2234,7 +2344,7 @@ test "a program with no tests at all says so, and one narrowed to none says that
 test "a suspect is named with what changed and whether it ran" {
   assert_eq(described(a_suspect("m.total")), "m.total");
   assert_eq(
-    described({ ..a_suspect("m.total"), change: Some("edited"), ran: Some(false) }),
+    described({ ..a_suspect("m.total"), change: Some(Edited), ran: Some(false) }),
     "m.total (edited, did not run)",
   );
   assert_eq(described({ ..a_suspect("m.total"), ran: Some(true) }), "m.total (ran, then returned)");
@@ -2285,7 +2395,7 @@ test "a phase reading is two decimals of a millisecond, longest phase first" {
 // cached, whatever its footprint says.
 test "a test the binding can reach is host rather than isolated" {
   let c = a_case(0, "one");
-  let hermetic = a_run([], []);
+  let hermetic = a_run([], 0);
   assert_eq(isolation_of(hermetic, c), "region");
   assert_eq(isolation_of({ ..hermetic, reaches: [0] }, c), "host");
   // A test is shared exactly when one of the atoms the row carries can be contended over.
@@ -2297,7 +2407,7 @@ test "a test the binding can reach is host rather than isolated" {
 
 test "a bound run says how many tests reach the host, what it bound and what it shook hands on" {
   let bound = {
-    ..a_run([], []),
+    ..a_run([], 0),
     hermetic: false,
     label: "host",
     operations: 7,
@@ -2310,7 +2420,7 @@ test "a bound run says how many tests reach the host, what it bound and what it 
     "   binding host · 7 operations · b3:aabbccddeeff",
     "   handshakes: 1 completed, 0 refused",
   ]);
-  assert_eq(binding_lines(plain(), a_run([], [])), [])
+  assert_eq(binding_lines(plain(), a_run([], 0)), [])
 }
 
 test "a label is bare in a single-module run and qualified across several" {

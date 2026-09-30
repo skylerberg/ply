@@ -65,8 +65,9 @@ fn a_replay_keeps_its_step_bound() {
     assert_eq!(built.mode, SimMode::Once);
 }
 
+/// Every field of a plan is in a seeded test's key, so a flag that reaches the plan reaches the key.
 #[test]
-fn every_flag_that_widens_the_search_changes_the_key() {
+fn every_flag_that_widens_the_search_changes_the_plan() {
     let base = plan(&options());
     let variants = [
         plan(&SimOptions {
@@ -90,11 +91,10 @@ fn every_flag_that_widens_the_search_changes_the_key() {
             ..options()
         }),
     ];
-    let mut seen = vec![base.digest()];
+    let mut seen = vec![base];
     for variant in variants {
-        let digest = variant.digest();
-        assert!(!seen.contains(&digest), "{variant:?} collided");
-        seen.push(digest);
+        assert!(!seen.contains(&variant), "{variant:?} collided");
+        seen.push(variant);
     }
 }
 
