@@ -120,8 +120,9 @@ fn body_was_false(span: Span) -> Diagnostic {
 fn body_was_not_boolean(value: &Value, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("a law body came to `{value}` rather than to a Boolean"),
+        format!("a law body came to `{}` rather than to a Boolean", ply_eval::slot(0)),
     )
+    .showing(vec![ply_eval::Plain::shown(value)])
     .primary(span, "a law is a proposition, so its body is `Bool`")
     .note("the type checker rejects a non-`Bool` law body with E0201, so reaching this is a defect in Ply")
 }

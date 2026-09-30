@@ -11,10 +11,10 @@ import spine (push_front, positional, Span, Ident, QName, Ctx, P, R, Ate, Acc, S
               t_colon, t_dot, t_dotdot, t_arrow, t_eq, t_pipe, t_pipepipe, t_question, t_star,
               k_let, k_if, k_else, k_with, rec, nlist, opt, word, dump_list, dump_opt, dump_ident,
               dump_qname, dump_diags, with_no_pipe, advance_n, tok_at, t_gt, t_lt)
-import lexer (Tok, TIdent, TInt, TFixed, TFloat, TDec, TStr, TBytes, TKw, TPunct, TEof)
+import lexer (Tok, TIdent, TInt, TFixed, TWide, TFloat, TDec, TStr, TBytes, TKw, TPunct, TEof)
 import types (TypeExpr, ty, ty_span, dump_ty)
-import patterns (Pattern, Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, pattern,
-                 pat_span, no_pattern, dump_pattern, dump_lit)
+import patterns (Pattern, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit,
+                 pattern, pat_span, no_pattern, dump_pattern, dump_lit)
 
 // --- The tree ---------------------------------------------------------------
 pub type Expr =
@@ -50,6 +50,9 @@ pub type Param = { name: Ident, ty: Option<TypeExpr>, default: Option<Expr>, spa
 
 pub type Stmt =
   | SLet({ span: Span, pat: Pattern, ty: Option<TypeExpr>, value: Expr })
+  // `let p = v else { .. };`: where `p` does not match, the `else` block is the enclosing block's
+  // value and the statements after this one do not run.
+  | SLetElse({ span: Span, pat: Pattern, ty: Option<TypeExpr>, value: Expr, fallback: Expr })
   | SExpr(Expr)
 
 pub type MatchArm = { pat: Pattern, guard: Option<Expr>, body: Expr, span: Span }
@@ -494,6 +497,7 @@ fn primary_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   match kind(c, p) {
     TInt(v) -> lit_expr(c, p, LInt(v)),
     TFixed(ty, v) -> lit_expr(c, p, LFixed(ty, v)),
+    TWide(ty, high, low) -> lit_expr(c, p, LWide(ty, high, low)),
     // Float and decimal literals keep their source text.
     TFloat(f) -> lit_expr(c, p, LFloat(src_over(c, st))),
     TDec(m, sc) -> lit_expr(c, p, LDec(src_over(c, st))),
@@ -766,9 +770,42 @@ fn let_stmt(c: Ctx, p: P) -> Result<R<Stmt>, P> = {
   let { p, node: t } = let_ty(c, p)?;
   let { p, .. } = expect(c, p, t_eq(), b"`=` and an initializer")?;
   let { p, node: value } = expr(c, p)?;
-  let { p, node: semi } = expect(c, p, t_semi(), b"`;` to end the `let`")?;
-  Ok({ p: p, node: SLet({ span: span_to(st.node, semi), pat: pat, ty: t, value: value }) })
+  let els = eat(c, p, k_else());
+  if els.ok { let_else(c, els.p, st.node, pat, t, value) }
+  else { let_end(c, p, st.node, pat, t, value) }
 }
+
+fn let_end(
+  c: Ctx,
+  p: P,
+  st: Span,
+  pat: Pattern,
+  t: Option<TypeExpr>,
+  value: Expr,
+) -> Result<R<Stmt>, P> = {
+  let { p, node: semi } = expect(c, p, t_semi(), b"`;` to end the `let`")?;
+  Ok({ p: p, node: SLet({ span: span_to(st, semi), pat: pat, ty: t, value: value }) })
+}
+
+fn let_else(
+  c: Ctx,
+  p: P,
+  st: Span,
+  pat: Pattern,
+  t: Option<TypeExpr>,
+  value: Expr,
+) -> Result<R<Stmt>, P> = {
+  let { p, node: fallback } = else_block(c, p)?;
+  let { p, node: semi } = expect(c, p, t_semi(), b"`;` to end the `let ... else`")?;
+  Ok({
+    p: p,
+    node: SLetElse({ span: span_to(st, semi), pat: pat, ty: t, value: value, fallback: fallback }),
+  })
+}
+
+fn else_block(c: Ctx, p: P) -> Result<R<Expr>, P> =
+  if at(c, p, t_lbrace()) { block_expr(c, p) }
+  else { Err(error_here(c, p, b"`{` to open the `else` block of a `let ... else`")) }
 
 pub fn fn_param(c: Ctx, p: P) -> Result<R<Param>, P> = param_inner(c, p, true)
 
@@ -1221,6 +1258,14 @@ pub fn dump_stmt(s: Stmt) -> Bytes =
         dump_opt(v.ty, dump_ty),
         dump_expr(v.value),
       ]),
+    SLetElse(v) ->
+      bytes_concat_all([
+        rec(v.span, b"slete"),
+        dump_pattern(v.pat),
+        dump_opt(v.ty, dump_ty),
+        dump_expr(v.value),
+        dump_expr(v.fallback),
+      ]),
     SExpr(e) -> bytes_concat(rec(expr_span(e), b"sexp"), dump_expr(e)),
   }
 
@@ -1312,7 +1357,11 @@ pub fn count_params(ps: List<Param>) -> Int =
 fn count_opt(o: Option<Expr>) -> Int = match o { None -> 0, Some(x) -> node_count(x) }
 
 fn count_stmt(s: Stmt) -> Int =
-  match s { SLet(v) -> 1 + node_count(v.value), SExpr(e) -> 1 + node_count(e) }
+  match s {
+    SLet(v) -> 1 + node_count(v.value),
+    SLetElse(v) -> 1 + node_count(v.value) + node_count(v.fallback),
+    SExpr(e) -> 1 + node_count(e),
+  }
 
 pub fn parse_count(src: Bytes) -> Int = {
   let s = start(src);
@@ -1623,6 +1672,22 @@ test "a block separates its statements from its tail" {
     "0:16:eblk;#1;2:12:slet;6:7:pvar;6:7:ident;@78;?0;10:11:elit;%int;@31;?1;13:14:evar;13:14:qname;?0;13:14:ident;@78;#0;",
   );
   assert_eq(dump_expr_of(b"{ 1; }"), "0:6:eblk;#1;2:3:sexp;2:3:elit;%int;@31;?0;#0;");
+}
+
+test "`let ... else` is its own statement, its `else` block after the initializer" {
+  assert_eq(
+    dump_expr_of(b"{ let Some(x) = o else { 0 }; x }"),
+    "0:33:eblk;#1;2:29:slete;6:13:pctr;6:10:qname;?0;6:10:ident;@536f6d65;#1;11:12:pvar;11:12:ident;@78;?0;16:17:evar;16:17:qname;?0;16:17:ident;@6f;23:28:eblk;#0;?1;25:26:elit;%int;@30;?1;30:31:evar;30:31:qname;?0;30:31:ident;@78;#0;",
+  );
+  // The initializer's own `else` is taken first, so this one is the statement's.
+  assert_eq(
+    dump_expr_of(b"{ let 1 = if a { 1 } else { 2 } else { 3 }; 4 }"),
+    "0:47:eblk;#1;2:43:slete;6:7:plit;%int;@31;?0;10:31:eif;13:14:evar;13:14:qname;?0;13:14:ident;@61;15:20:eblk;#0;?1;17:18:elit;%int;@31;26:31:eblk;#0;?1;28:29:elit;%int;@32;37:42:eblk;#0;?1;39:40:elit;%int;@33;?1;44:45:elit;%int;@34;#0;",
+  )
+}
+
+test "the `else` of a `let ... else` is a block" {
+  assert_eq(dump_expr_of(b"{ let Some(x) = o else 0; x }"), "#1;!E0001:23:24:1:0;=23:24:1;")
 }
 
 test "a block-like statement needs no semicolon and anything else does" {

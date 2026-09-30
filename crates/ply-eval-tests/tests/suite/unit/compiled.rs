@@ -1,7 +1,7 @@
 use crate::fixture::port_front;
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
-use ply_eval::{DefHash, Diagnostic, Front, Span, Symbol, Value, codes};
+use ply_eval::{DefHash, Diagnostic, Front, Plain, Span, Symbol, Value, codes, slot};
 use std::rc::Rc;
 
 struct Checked {
@@ -108,7 +108,11 @@ fn a_test_root_that_answers_a_value_is_plys_defect_and_counted_as_entered() {
     let (outcome, counts) = first_test_under(&c, || Entered::Answered(Value::Int(7)));
     let d = outcome.expect_err("a test answers `()`");
     assert_eq!(d.code, codes::INTERNAL_ERROR, "{d:?}");
-    assert!(d.message.contains("answered `7`"), "{d:?}");
+    assert!(
+        d.message.contains(&format!("answered `{}`", slot(0))),
+        "{d:?}"
+    );
+    assert_eq!(&*d.values, &[Plain::Int(7)], "{d:?}");
     assert_eq!(counts, (1, 0));
 }
 

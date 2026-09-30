@@ -1,6 +1,9 @@
 //! Ply values, as a lent effect hands them to the program in `crates/ply-cli/ply`.
 
-use ply_eval::{Diagnostic, Severity, SourceMap, Span, Symbol, Value as PlyValue, codes};
+use ply_eval::limit::grow;
+use ply_eval::{
+    Diagnostic, Fun, IntTy, Plain, Severity, SourceMap, Span, Symbol, Value as PlyValue, codes,
+};
 use std::sync::Arc;
 
 /// `Value::Record` holds an `Arc`, and its fields are not `Send`; every construction site says so.
@@ -74,8 +77,25 @@ fn number(n: &serde_json::Number) -> PlyValue {
 }
 
 /// `compiler.resolve.Diag`, as `crates/ply-cli/ply/diagnostic.ply` renders it. A label carries
-/// the source id its span names, which is the index of its file in `places`.
+/// the source id its span names, which is the index of its file in `places`. A carried value is
+/// said as what it is: only a crossing that hands the values over, [`raised_value`], keeps them.
 pub fn diag_value(diagnostic: &Diagnostic) -> PlyValue {
+    diag_record(diagnostic, &|text| diagnostic.described(text))
+}
+
+/// `diagnostic.Raised`: a runtime diagnostic beside the values its text names, which the
+/// program renders.
+pub fn raised_value(diagnostic: &Diagnostic) -> PlyValue {
+    record(vec![
+        ("diag", diag_record(diagnostic, &|text| text.to_string())),
+        (
+            "values",
+            PlyValue::list(diagnostic.values.iter().map(plain_value).collect()),
+        ),
+    ])
+}
+
+fn diag_record(diagnostic: &Diagnostic, text: &dyn Fn(&str) -> String) -> PlyValue {
     record(vec![
         ("code", PlyValue::bytes(diagnostic.code.as_bytes())),
         ("notes", count(diagnostic.notes.len())),
@@ -91,21 +111,24 @@ pub fn diag_value(diagnostic: &Diagnostic) -> PlyValue {
                             ("start", PlyValue::Int(l.span.start as i64)),
                             ("end", PlyValue::Int(l.span.end as i64)),
                             ("primary", PlyValue::Bool(l.primary)),
-                            ("text", PlyValue::bytes(l.message.as_bytes())),
+                            ("text", PlyValue::bytes(text(&l.message).as_bytes())),
                         ])
                     })
                     .collect(),
             ),
         ),
         ("text", PlyValue::bytes(b"")),
-        ("message", PlyValue::bytes(diagnostic.message.as_bytes())),
+        (
+            "message",
+            PlyValue::bytes(text(&diagnostic.message).as_bytes()),
+        ),
         (
             "notes_text",
             PlyValue::list(
                 diagnostic
                     .notes
                     .iter()
-                    .map(|n| PlyValue::bytes(n.as_bytes()))
+                    .map(|n| PlyValue::bytes(text(n).as_bytes()))
                     .collect(),
             ),
         ),
@@ -206,7 +229,7 @@ pub fn option_of<'v>(
         PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
         other => Err(Diagnostic::error(
             codes::INTERNAL_ERROR,
-            format!("`{what}` is an option, and this is {other}"),
+            format!("`{what}` is an option, and this is a {}", other.type_name()),
         )
         .primary(span, "an option")),
     }
@@ -267,379 +290,253 @@ pub fn shape(value: &PlyValue, span: Span) -> Diagnostic {
     )
 }
 
-// --- `machine.Value`: a definition's argument or answer, as plain data ------------------------------
+// --- `std.value.Value`: a value as the program holds it ---------------------------------------
 
-/// The runtime value as the program reads it: its machine module's `Value` constructors,
-/// named as the calling program declares them (`module` is that module's name in the caller).
-/// A closure, task, cell or secret cannot cross; trying to send one is the caller's error.
-pub fn machine_value(v: &PlyValue, module: &str) -> Result<PlyValue, Diagnostic> {
-    let c = |name: &str, args: Vec<PlyValue>| Ok(ctor(module, name, args));
-    match v {
-        PlyValue::Unit => c("VUnit", vec![]),
-        PlyValue::Bool(b) => c("VBool", vec![PlyValue::Bool(*b)]),
-        PlyValue::Int(i) => c("VInt", vec![PlyValue::Int(*i)]),
-        PlyValue::Float(f) => c("VFloat", vec![PlyValue::Float(*f)]),
-        PlyValue::Decimal(d) => c("VDecimal", vec![PlyValue::Decimal(*d)]),
-        PlyValue::Fixed(f) => {
-            let value = i64::try_from(f.value()).map_err(|_| {
-                Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    format!("a `{}` above `Int`'s range cannot cross", f.ty.name()),
-                )
-                .primary(Span::DUMMY, "the value does not fit an `Int`")
-            })?;
-            c(
-                "VFixed",
-                vec![PlyValue::str(f.ty.name()), PlyValue::Int(value)],
-            )
-        }
-        PlyValue::Str(s) => c("VStr", vec![PlyValue::str(s.as_ref())]),
-        PlyValue::Bytes(b) => c("VBytes", vec![PlyValue::bytes(b.as_ref())]),
-        PlyValue::List(items) => c(
-            "VList",
-            vec![PlyValue::list(
-                items
-                    .iter()
-                    .map(|x| machine_value(x, module))
-                    .collect::<Result<_, _>>()?,
-            )],
-        ),
-        PlyValue::Record(fields) => c(
-            "VRecord",
-            vec![PlyValue::list(
-                fields
-                    .iter()
-                    .map(|(name, value)| {
-                        Ok(record(vec![
-                            ("name", PlyValue::str(name.as_str())),
-                            ("value", machine_value(value, module)?),
-                        ]))
-                    })
-                    .collect::<Result<_, Diagnostic>>()?,
-            )],
-        ),
-        PlyValue::Ctor { name, args } => c(
-            "VCtor",
+fn value_ctor(name: &str, args: Vec<PlyValue>) -> PlyValue {
+    ctor("std.value", name, args)
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+pub fn plain_value(p: &Plain) -> PlyValue {
+    let entry =
+        |(k, v): &(Plain, Plain)| record(vec![("key", plain_value(k)), ("value", plain_value(v))]);
+    let entries = |es: &[(Plain, Plain)]| PlyValue::list(es.iter().map(entry).collect());
+    match p {
+        Plain::Unit => value_ctor("VUnit", vec![]),
+        Plain::Bool(b) => value_ctor("VBool", vec![PlyValue::Bool(*b)]),
+        Plain::Int(i) => value_ctor("VInt", vec![PlyValue::Int(*i)]),
+        Plain::Float(f) => value_ctor("VFloat", vec![PlyValue::Float(*f)]),
+        Plain::Decimal(d) => value_ctor("VDecimal", vec![PlyValue::Decimal(*d)]),
+        Plain::Fixed { ty, bits } => value_ctor(
+            "VFixed",
             vec![
-                PlyValue::str(name.as_str()),
-                PlyValue::list(
-                    args.iter()
-                        .map(|x| machine_value(x, module))
-                        .collect::<Result<_, _>>()?,
-                ),
+                PlyValue::str(ty.name()),
+                PlyValue::Fixed(ply_eval::Fixed::new(IntTy::U128, *bits)),
             ],
         ),
-        PlyValue::Map(m) => c(
-            "VMap",
-            vec![PlyValue::list(
-                m.iter()
-                    .map(|(key, value)| {
-                        Ok(record(vec![
-                            ("key", machine_value(key, module)?),
-                            ("value", machine_value(value, module)?),
-                        ]))
-                    })
-                    .collect::<Result<_, Diagnostic>>()?,
-            )],
+        Plain::Str(s) => value_ctor("VStr", vec![PlyValue::str(s)]),
+        Plain::Bytes(b) => value_ctor("VBytes", vec![PlyValue::bytes(b)]),
+        Plain::List(items) => value_ctor(
+            "VList",
+            vec![PlyValue::list(grow(|| {
+                items.iter().map(plain_value).collect()
+            }))],
         ),
-        other => Err(Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!("a {other:?}'s value cannot cross the machine boundary"),
-        )
-        .primary(Span::DUMMY, "this is Ply's fault")),
+        Plain::Record(fields) => value_ctor(
+            "VRecord",
+            vec![PlyValue::list(grow(|| {
+                fields
+                    .iter()
+                    .map(|(name, v)| {
+                        record(vec![
+                            ("name", PlyValue::str(name)),
+                            ("value", plain_value(v)),
+                        ])
+                    })
+                    .collect()
+            }))],
+        ),
+        Plain::Ctor(name, args) => value_ctor(
+            "VCtor",
+            vec![
+                PlyValue::str(name),
+                PlyValue::list(grow(|| args.iter().map(plain_value).collect())),
+            ],
+        ),
+        Plain::Map(es) => value_ctor("VMap", vec![grow(|| entries(es))]),
+        Plain::Fn(f) => value_ctor(
+            "VFn",
+            vec![match f {
+                Fun::Named(name) => value_ctor("FNamed", vec![PlyValue::str(name)]),
+                Fun::Anonymous => value_ctor("FAnonymous", vec![]),
+                Fun::Const { arity, value } => value_ctor(
+                    "FConst",
+                    vec![record(vec![
+                        ("arity", count(*arity)),
+                        ("value", grow(|| plain_value(value))),
+                    ])],
+                ),
+                Fun::Project { arity, index } => value_ctor(
+                    "FProject",
+                    vec![record(vec![
+                        ("arity", count(*arity)),
+                        ("index", count(*index)),
+                    ])],
+                ),
+                Fun::Table {
+                    arity,
+                    entries: es,
+                    default,
+                } => value_ctor(
+                    "FTable",
+                    vec![record(vec![
+                        ("arity", count(*arity)),
+                        ("entries", grow(|| entries(es))),
+                        ("default", grow(|| plain_value(default))),
+                    ])],
+                ),
+            }],
+        ),
+        Plain::Cell { index, generation } => value_ctor(
+            "VCell",
+            vec![record(vec![
+                ("index", PlyValue::Int(i64::from(*index))),
+                ("generation", PlyValue::Int(i64::from(*generation))),
+            ])],
+        ),
+        Plain::Task(id) => value_ctor("VTask", vec![PlyValue::Int(*id as i64)]),
+        Plain::Secret => value_ctor("VSecret", vec![]),
+        Plain::Elided(n) => value_ctor("VElided", vec![PlyValue::Int(*n as i64)]),
     }
 }
 
-/// The runtime value a `machine.Value` names. The constructors are the program's own; anything
-/// else is the caller's error.
-pub fn value_of_adt(v: &PlyValue, span: Span, module: &str) -> Result<PlyValue, Diagnostic> {
+/// The plain value a `std.value.Value` names; anything else is Ply's fault, since the program's
+/// types say it is one.
+pub fn value_plain(v: &PlyValue, span: Span) -> Result<Plain, Diagnostic> {
     let bad = |why: &str| {
-        Diagnostic::error(codes::RUNTIME_ERROR, format!("a call's argument {why}"))
-            .primary(span, "not a `machine.Value`")
+        Diagnostic::error(codes::INTERNAL_ERROR, format!("a `std.value.Value` {why}")).primary(
+            span,
+            "the program's types say this is a `std.value.Value`; this is Ply's fault",
+        )
     };
     let PlyValue::Ctor { name, args } = v else {
         return Err(bad("is no constructor"));
     };
-    let at = |i: usize| args.get(i);
-    let prefixed = format!("{module}.");
+    let arg = |i: usize| args.get(i).ok_or_else(|| bad("is missing an argument"));
+    let int = |x: &PlyValue| x.as_int(span, "a `std.value` count");
+    let text = |x: &PlyValue| -> Result<String, Diagnostic> {
+        match x {
+            PlyValue::Str(s) => Ok(s.to_string()),
+            _ => Err(bad("holds no text where text belongs")),
+        }
+    };
+    let list = |x: &PlyValue| -> Result<Vec<PlyValue>, Diagnostic> {
+        match x {
+            PlyValue::List(items) => Ok(items.iter().cloned().collect()),
+            _ => Err(bad("holds no list where a list belongs")),
+        }
+    };
+    let field = |x: &PlyValue, name: &str| -> Result<PlyValue, Diagnostic> {
+        match x {
+            PlyValue::Record(fields) => fields
+                .get(&Symbol::new(name))
+                .cloned()
+                .ok_or_else(|| bad(&format!("has no `{name}`"))),
+            _ => Err(bad("holds no record where a record belongs")),
+        }
+    };
+    let entries = |x: &PlyValue| -> Result<Vec<(Plain, Plain)>, Diagnostic> {
+        list(x)?
+            .iter()
+            .map(|e| {
+                Ok((
+                    value_plain(&field(e, "key")?, span)?,
+                    value_plain(&field(e, "value")?, span)?,
+                ))
+            })
+            .collect()
+    };
     let simple = name
         .as_str()
-        .strip_prefix(&prefixed)
-        .unwrap_or(name.as_str());
-    match simple {
-        "VUnit" => Ok(PlyValue::Unit),
-        "VBool" => Ok(at(0).cloned().unwrap_or_default()),
-        "VInt" => Ok(at(0).cloned().unwrap_or_default()),
-        "VFloat" => Ok(at(0).cloned().unwrap_or_default()),
-        "VDecimal" => Ok(at(0).cloned().unwrap_or_default()),
+        .rsplit_once('.')
+        .map_or(name.as_str(), |(_, s)| s);
+    Ok(match simple {
+        "VUnit" => Plain::Unit,
+        "VBool" => Plain::Bool(matches!(arg(0)?, PlyValue::Bool(true))),
+        "VInt" => Plain::Int(int(arg(0)?)?),
+        "VFloat" => Plain::Float(arg(0)?.as_float(span, "a `std.value` float")?),
+        "VDecimal" => Plain::Decimal(arg(0)?.as_decimal(span, "a `std.value` decimal")?),
         "VFixed" => {
-            let Some(PlyValue::Str(ty)) = at(0) else {
-                return Err(bad("'s fixed type is not text"));
+            let ty = text(arg(0)?)?;
+            let ty = IntTy::from_name(&ty)
+                .ok_or_else(|| bad(&format!("names `{ty}`, which is no width")))?;
+            let PlyValue::Fixed(bits) = arg(1)? else {
+                return Err(bad("holds no `U128` pattern"));
             };
-            let ty = ply_eval::IntTy::from_name(ty.as_ref())
-                .ok_or_else(|| bad("'s fixed type is unknown"))?;
-            let v = at(1)
-                .ok_or_else(|| bad("'s fixed value is missing"))?
-                .as_int(span, "a fixed-width integer")?;
-            Ok(PlyValue::Fixed(
-                ply_eval::Fixed::of(ty, i128::from(v))
-                    .ok_or_else(|| bad("'s fixed value does not fit its type"))?,
-            ))
+            Plain::Fixed {
+                ty,
+                bits: ty.normalize(bits.bits()) & mask(ty),
+            }
         }
-        "VStr" => Ok(at(0).cloned().unwrap_or_default()),
-        "VBytes" => Ok(at(0).cloned().unwrap_or_default()),
-        "VList" => {
-            let Some(PlyValue::List(items)) = at(0) else {
-                return Err(bad("'s list is not one"));
-            };
-            Ok(PlyValue::list(
-                items
+        "VStr" => Plain::Str(text(arg(0)?)?),
+        "VBytes" => Plain::Bytes(arg(0)?.as_bytes(span, "a `std.value` bytes")?.to_vec()),
+        "VList" => Plain::List(grow(|| {
+            list(arg(0)?)?
+                .iter()
+                .map(|x| value_plain(x, span))
+                .collect::<Result<_, Diagnostic>>()
+        })?),
+        "VRecord" => Plain::Record(grow(|| {
+            list(arg(0)?)?
+                .iter()
+                .map(|f| {
+                    Ok((
+                        text(&field(f, "name")?)?,
+                        value_plain(&field(f, "value")?, span)?,
+                    ))
+                })
+                .collect::<Result<_, Diagnostic>>()
+        })?),
+        "VCtor" => Plain::Ctor(
+            text(arg(0)?)?,
+            grow(|| {
+                list(arg(1)?)?
                     .iter()
-                    .map(|x| value_of_adt(x, span, module))
-                    .collect::<Result<_, _>>()?,
-            ))
-        }
-        "VRecord" => {
-            let Some(PlyValue::List(fields)) = at(0) else {
-                return Err(bad("'s fields are not a list"));
+                    .map(|x| value_plain(x, span))
+                    .collect::<Result<_, Diagnostic>>()
+            })?,
+        ),
+        "VMap" => Plain::Map(grow(|| entries(arg(0)?))?),
+        "VFn" => {
+            let PlyValue::Ctor {
+                name: f,
+                args: fargs,
+            } = arg(0)?
+            else {
+                return Err(bad("holds no `Fun`"));
             };
-            let mut out = Vec::new();
-            for field in fields.iter() {
-                let PlyValue::Record(pair) = field else {
-                    return Err(bad("'s field is not a record"));
-                };
-                let name = pair.get(&Symbol::new("name")).ok_or_else(|| bad(""))?;
-                let value = pair.get(&Symbol::new("value")).ok_or_else(|| bad(""))?;
-                let PlyValue::Str(text) = name else {
-                    return Err(bad("'s field name is not text"));
-                };
-                out.push((
-                    Symbol::new(text.as_ref()),
-                    value_of_adt(value, span, module)?,
-                ));
-            }
-            Ok(record_unsorted(out))
-        }
-        "VCtor" => {
-            let Some(PlyValue::Str(name)) = at(0) else {
-                return Err(bad("'s name is not text"));
+            let at = |i: usize| fargs.get(i).ok_or_else(|| bad("is missing an argument"));
+            let size = |x: &PlyValue, name: &str| -> Result<usize, Diagnostic> {
+                usize::try_from(int(&field(x, name)?)?)
+                    .map_err(|_| bad(&format!("has a negative `{name}`")))
             };
-            let Some(PlyValue::List(items)) = at(1) else {
-                return Err(bad("'s arguments are not a list"));
-            };
-            Ok(PlyValue::ctor(
-                name.as_ref(),
-                items
-                    .iter()
-                    .map(|x| value_of_adt(x, span, module))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            Plain::Fn(
+                match f.as_str().rsplit_once('.').map_or(f.as_str(), |(_, s)| s) {
+                    "FNamed" => Fun::Named(text(at(0)?)?),
+                    "FAnonymous" => Fun::Anonymous,
+                    "FConst" => Fun::Const {
+                        arity: size(at(0)?, "arity")?,
+                        value: Box::new(grow(|| value_plain(&field(at(0)?, "value")?, span))?),
+                    },
+                    "FProject" => Fun::Project {
+                        arity: size(at(0)?, "arity")?,
+                        index: size(at(0)?, "index")?,
+                    },
+                    "FTable" => Fun::Table {
+                        arity: size(at(0)?, "arity")?,
+                        entries: grow(|| entries(&field(at(0)?, "entries")?))?,
+                        default: Box::new(grow(|| value_plain(&field(at(0)?, "default")?, span))?),
+                    },
+                    other => return Err(bad(&format!("holds `{other}`, which is no `Fun`"))),
+                },
+            )
         }
-        "VMap" => {
-            let Some(PlyValue::List(entries)) = at(0) else {
-                return Err(bad("'s entries are not a list"));
-            };
-            let mut out = Vec::new();
-            for entry in entries.iter() {
-                let PlyValue::Record(pair) = entry else {
-                    return Err(bad("'s entry is not a record"));
-                };
-                let key = pair.get(&Symbol::new("key")).ok_or_else(|| bad(""))?;
-                let value = pair.get(&Symbol::new("value")).ok_or_else(|| bad(""))?;
-                out.push((
-                    value_of_adt(key, span, module)?,
-                    value_of_adt(value, span, module)?,
-                ));
-            }
-            Ok(PlyValue::map(out))
+        "VCell" => Plain::Cell {
+            index: u32::try_from(int(&field(arg(0)?, "index")?)?)
+                .map_err(|_| bad("names no cell"))?,
+            generation: u32::try_from(int(&field(arg(0)?, "generation")?)?)
+                .map_err(|_| bad("names no cell"))?,
+        },
+        "VTask" => Plain::Task(u64::try_from(int(arg(0)?)?).map_err(|_| bad("names no task"))?),
+        "VSecret" => Plain::Secret,
+        "VElided" => {
+            Plain::Elided(u64::try_from(int(arg(0)?)?).map_err(|_| bad("elides a negative count"))?)
         }
-        other => Err(bad(&format!(
-            "names `{other}`, which is not a `machine.Value`"
-        ))),
-    }
+        other => return Err(bad(&format!("is `{other}`, which is no `std.value.Value`"))),
+    })
 }
 
-// --- The wire: what a `machine.call` crosses on ---------------------------------------------
-// ply_eval::Value is not Send, so the crossing is a JSON-shaped encoding; the program's side
-// holds the same value as `machine.Value` constructors, and these two turn one into the other.
-
-pub fn value_to_wire(v: &PlyValue) -> serde_json::Value {
-    match v {
-        PlyValue::Int(i) => serde_json::json!({ "i": i }),
-        PlyValue::Fixed(x) => serde_json::json!({
-            "x": [x.ty.name(), i64::try_from(x.value()).ok()]
-        }),
-        PlyValue::Bool(b) => serde_json::json!({ "b": b }),
-        PlyValue::Float(f) => serde_json::json!({ "f": f.to_string() }),
-        PlyValue::Decimal(d) => serde_json::json!({ "d": d.to_string() }),
-        PlyValue::Str(s) => serde_json::json!({ "s": s.as_ref() }),
-        PlyValue::Bytes(b) => serde_json::json!({ "y": hex(b) }),
-        PlyValue::Unit => serde_json::json!({ "u": 0 }),
-        PlyValue::List(items) => {
-            serde_json::json!({ "l": items.iter().map(value_to_wire).collect::<Vec<_>>() })
-        }
-        PlyValue::Map(m) => serde_json::json!({
-            "m": m
-                .iter()
-                .map(|(k, v)| vec![value_to_wire(k), value_to_wire(v)])
-                .collect::<Vec<_>>()
-        }),
-        PlyValue::Record(fields) => serde_json::json!({
-            "r": fields
-                .iter()
-                .map(|(name, value)| (name.as_str().to_string(), value_to_wire(value)))
-                .collect::<serde_json::Map<_, _>>()
-        }),
-        PlyValue::Ctor { name, args } => serde_json::json!({
-            "c": [name.as_str(), serde_json::Value::Array(args.iter().map(value_to_wire).collect())]
-        }),
-        other => serde_json::json!({ "uncrossable": format!("{other:?}") }),
-    }
-}
-
-pub fn value_from_wire(w: &serde_json::Value, span: Span) -> Result<PlyValue, Diagnostic> {
-    let bad = |what: &str| {
-        Diagnostic::error(codes::RUNTIME_ERROR, format!("a call's wire value {what}"))
-            .primary(span, "not something `machine.Value` encodes")
-    };
-    let obj = w.as_object().ok_or_else(|| bad("is not an object"))?;
-    if let Some(i) = obj.get("i") {
-        return Ok(PlyValue::Int(
-            i.as_i64().ok_or_else(|| bad("'s int is not one"))?,
-        ));
-    }
-    if let Some(b) = obj.get("b") {
-        return Ok(PlyValue::Bool(
-            b.as_bool().ok_or_else(|| bad("'s bool is not one"))?,
-        ));
-    }
-    if let Some(f) = obj.get("f") {
-        let text = f.as_str().ok_or_else(|| bad("'s float is not text"))?;
-        let f: f64 = text.parse().map_err(|_| bad("'s float does not parse"))?;
-        return Ok(PlyValue::Float(f));
-    }
-    if let Some(d) = obj.get("d") {
-        let text = d.as_str().ok_or_else(|| bad("'s decimal is not text"))?;
-        return Ok(PlyValue::Decimal(
-            text.parse().map_err(|_| bad("'s decimal does not parse"))?,
-        ));
-    }
-    if let Some(x) = obj.get("x") {
-        let pair = x.as_array().ok_or_else(|| bad("'s fixed is not a pair"))?;
-        let ty = pair
-            .first()
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| bad("'s fixed type is not text"))?;
-        let ty = ply_eval::IntTy::from_name(ty).ok_or_else(|| bad("'s fixed type is unknown"))?;
-        let v = pair
-            .get(1)
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| bad("'s fixed value does not fit an `Int`"))?;
-        return Ok(PlyValue::Fixed(
-            ply_eval::Fixed::of(ty, i128::from(v))
-                .ok_or_else(|| bad("'s fixed value does not fit its type"))?,
-        ));
-    }
-    if let Some(s) = obj.get("s") {
-        return Ok(PlyValue::str(
-            s.as_str().ok_or_else(|| bad("'s string is not one"))?,
-        ));
-    }
-    if let Some(y) = obj.get("y") {
-        let text = y.as_str().ok_or_else(|| bad("'s bytes are not hex text"))?;
-        return Ok(PlyValue::bytes(
-            unhex(text).ok_or_else(|| bad("'s bytes are not hex"))?,
-        ));
-    }
-    if obj.contains_key("u") {
-        return Ok(PlyValue::Unit);
-    }
-    if let Some(l) = obj.get("l") {
-        let items = l.as_array().ok_or_else(|| bad("'s list is not one"))?;
-        return Ok(PlyValue::list(
-            items
-                .iter()
-                .map(|x| value_from_wire(x, span))
-                .collect::<Result<_, _>>()?,
-        ));
-    }
-    if let Some(r) = obj.get("r") {
-        let fields = r.as_object().ok_or_else(|| bad("'s record is not one"))?;
-        let mut out = Vec::new();
-        for (name, value) in fields {
-            out.push((Symbol::new(name.as_str()), value_from_wire(value, span)?));
-        }
-        return Ok(record_unsorted(out));
-    }
-    if let Some(c) = obj.get("c") {
-        let pair = c.as_array().ok_or_else(|| bad("'s ctor is not a pair"))?;
-        let name = pair
-            .first()
-            .and_then(|n| n.as_str())
-            .ok_or_else(|| bad("'s ctor names nothing"))?;
-        let args = pair
-            .get(1)
-            .and_then(|a| a.as_array())
-            .ok_or_else(|| bad("'s ctor arguments are not a list"))?;
-        return Ok(PlyValue::ctor(
-            name,
-            args.iter()
-                .map(|x| value_from_wire(x, span))
-                .collect::<Result<Vec<_>, _>>()?,
-        ));
-    }
-    if let Some(m) = obj.get("m") {
-        let entries = m.as_array().ok_or_else(|| bad("'s map is not a list"))?;
-        let mut out = Vec::new();
-        for entry in entries {
-            let pair = entry
-                .as_array()
-                .ok_or_else(|| bad("'s entry is not a pair"))?;
-            if pair.len() != 2 {
-                return Err(bad("'s entry is not a pair"));
-            }
-            out.push((
-                value_from_wire(&pair[0], span)?,
-                value_from_wire(&pair[1], span)?,
-            ));
-        }
-        return Ok(PlyValue::map(out));
-    }
-    Err(bad("names nothing"))
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..bytes.len() / 2)
-        .map(|i| {
-            let hi = (bytes[2 * i] as char).to_digit(16)?;
-            let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
-            Some((hi * 16 + lo) as u8)
-        })
-        .collect()
-}
-
-// The two hops the crossing takes: the program's `machine.Value` on the caller's thread, the
-// wire on the way, the runtime value on the machine's.
-pub fn adt_to_wire(
-    v: &PlyValue,
-    span: Span,
-    module: &str,
-) -> Result<serde_json::Value, Diagnostic> {
-    Ok(value_to_wire(&value_of_adt(v, span, module)?))
-}
-
-pub fn wire_to_adt(
-    w: &serde_json::Value,
-    span: Span,
-    module: &str,
-) -> Result<PlyValue, Diagnostic> {
-    machine_value(&value_from_wire(w, span)?, module)
+/// The bits a width reads, with nothing above it.
+fn mask(ty: IntTy) -> u128 {
+    u128::MAX >> (128 - ty.bits())
 }

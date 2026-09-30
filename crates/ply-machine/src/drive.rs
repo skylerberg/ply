@@ -380,8 +380,8 @@ impl Drive {
     pub fn call(
         &mut self,
         name: &str,
-        args_wire: Vec<serde_json::Value>,
-    ) -> Result<serde_json::Value, Diagnostic> {
+        args: Vec<ply_eval::Plain>,
+    ) -> Result<ply_eval::Plain, Diagnostic> {
         let options = &self.options;
         let target = &self.target;
         let span = target
@@ -396,9 +396,17 @@ impl Drive {
                 "`machine.call` before `machine.bound`: nothing is bound to call into".to_string(),
             ));
         };
-        let args: Vec<PlyValue> = args_wire
-            .iter()
-            .map(|w| crate::payload::value_from_wire(w, span))
+        let args: Vec<PlyValue> = args
+            .into_iter()
+            .map(|a| {
+                a.into_value().map_err(|why| {
+                    Diagnostic::error(
+                        codes::RUNTIME_ERROR,
+                        format!("`machine.call` was handed {why}"),
+                    )
+                    .primary(span, "an argument crosses as data")
+                })
+            })
             .collect::<Result<_, _>>()?;
         let plan = crate::simulation::run_plan(options.seed.as_ref());
         let compiled = bound.compiled();
@@ -419,7 +427,7 @@ impl Drive {
         });
         // A call that raised still did the work its accounting counts.
         note_measurement(&mut self.accounting, &compiled, started);
-        Ok(crate::payload::value_to_wire(&outcome?))
+        Ok(ply_eval::Plain::of(&outcome?))
     }
 
     /// What the calls since the last read measured, and the read resets it.
@@ -514,7 +522,7 @@ impl Drive {
         }
         match answer {
             Ok(value) => Outcome {
-                value: Some(value.to_string()),
+                value: Some(ply_eval::Plain::shown(&value)),
                 ..ended
             },
             Err(diagnostic) => Outcome {
@@ -883,7 +891,7 @@ pub struct Teardown {
 
 pub struct Outcome {
     exit: Option<i32>,
-    value: Option<String>,
+    value: Option<ply_eval::Plain>,
     raised: Option<Diagnostic>,
     counters: ply_eval::rc::Stats,
     cycles: Vec<Diagnostic>,
@@ -965,10 +973,13 @@ pub fn outcome_value(o: &Outcome) -> PlyValue {
             "exit",
             option(o.exit.map(|code| PlyValue::Int(code.into()))),
         ),
-        ("value", option(o.value.as_deref().map(PlyValue::str))),
+        (
+            "value",
+            option(o.value.as_ref().map(crate::payload::plain_value)),
+        ),
         (
             "raised",
-            option(o.raised.as_ref().map(crate::payload::diag_value)),
+            option(o.raised.as_ref().map(crate::payload::raised_value)),
         ),
         ("counters", counters_value(&o.counters)),
         ("cycles", diags_value(&o.cycles)),

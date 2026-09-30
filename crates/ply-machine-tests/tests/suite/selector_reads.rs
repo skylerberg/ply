@@ -145,5 +145,9 @@ fn a_selector_reads_the_keys_the_hashes_and_the_plan_before_anything_runs() {
             Span::DUMMY,
         )
         .expect("the outer main ran");
-    assert_eq!(answer.to_string(), "true", "the answers read: {answer}");
+    assert_eq!(
+        answer,
+        ply_eval::Value::Bool(true),
+        "the answers read: {answer:?}"
+    );
 }
