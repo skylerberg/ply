@@ -10,19 +10,24 @@
 // named is not something a program can build. What it can decide is which points exist, how many
 // there are, and whether asking for all of them is a proof or an enumeration nobody can afford.
 
-// A type, as the runtime publishes one: a variable, a function, a record, or a named type with its
-// arguments. The builtins arrive as names — `Unit`, `Bool`, `U8` — so this module never needs to
-// know which of them the compiler keeps in a table and which it spells out.
-pub type Ty = | Var(Int) | Fn | Record(List<{ name: String, ty: Ty }>) | Con(String, List<Ty>)
+// A type as the prover reads one: a variable, numbered by first appearance in the item it belongs
+// to; a function, with its parameters, its answer and whether its row is empty; a record; or a
+// named type with its arguments. The builtins arrive as names — `Unit`, `Bool`, `U8` — so this
+// module never needs to know which of them the compiler keeps in a table and which it spells out.
+pub type Ty =
+  | Var(Int)
+  | Fn(List<Ty>, Ty, Bool)
+  | Record(List<{ name: String, ty: Ty }>)
+  | Con(String, List<Ty>)
 
 // One case of a declared type: its name and its fields, in declaration order.
 pub type Variant = { name: String, fields: List<Ty> }
 
-// A declared type: the variants its constructors belong to. Its fields are written in terms of the
-// type's parameters, so `Con(name, args)` means the fields with `args` substituted for them by
-// position — a `Pair<Bool>` is four values, and the same declaration under `Pair<Int>` is not finite
-// at all.
-pub type Decl = { name: String, variants: List<Variant> }
+// A declared type: how many parameters it takes and the variants its constructors belong to. Its
+// fields are written in terms of those parameters, `Var(i)` being the `i`th, so `Con(name, args)`
+// means the fields with `args` substituted for them by position — a `Pair<Bool>` is four values, and
+// the same declaration under `Pair<Int>` is not finite at all.
+pub type Decl = { name: String, params: Int, variants: List<Variant> }
 
 // What a finite type came to, as the runtime builds its values from an index: a builtin by name, a
 // declared type's cases in declaration order, or a record's fields in the order the type lists them.
@@ -71,9 +76,8 @@ pub fn finite(binders: List<Ty>, decls: List<Decl>) -> Option<Domain> =
     })
 
 // What a domain is called in an artifact: the name of a product with no binders is `unit`, since a
-// ground claim still has exactly one point. The texts are the runtime's own rendering of each
-// binder's type — a program never spells a type out, so it never disagrees with the compiler about
-// how one is printed.
+// ground claim still has exactly one point. The texts are the compiler's own printing of each
+// binder's type, so a domain is named as its claim's binders read.
 pub fn name_of(texts: List<String>) -> String =
   if len(texts) == 0 { "unit" } else { joined(texts, " × ") }
 
@@ -111,7 +115,7 @@ fn shaped(ty: Ty, decls: List<Decl>, open: List<String>, subst: List<Ty>) -> Opt
       Some(argument) -> shaped(argument, decls, open, []),
       None -> None,
     },
-    Fn -> None,
+    Fn(_, _, _) -> None,
     Record(fields) -> match fields_of(fields, decls, open, subst) {
       None -> None,
       Some(fs) -> Some(Fields(fs.size, fs.fields)),
@@ -131,17 +135,6 @@ fn shaped(ty: Ty, decls: List<Decl>, open: List<String>, subst: List<Ty>) -> Opt
         }
       }
     },
-  }
-
-fn substituted(ty: Ty, subst: List<Ty>) -> Ty =
-  match ty {
-    Var(index) -> match list_at(subst, index) { Some(argument) -> argument, None -> ty },
-    Fn -> Fn,
-    Record(fields) ->
-      Record(
-        map(fields, |f: { name: String, ty: Ty }| { name: f.name, ty: substituted(f.ty, subst) }),
-      ),
-    Con(name, args) -> Con(name, map(args, |a: Ty| substituted(a, subst))),
   }
 
 // A type whose values are too many to walk, or that is not finite at all.
@@ -231,6 +224,20 @@ fn fields_of(
       }),
   }
 
+// A type written inside a declaration, with the arguments it was applied to in place of its
+// parameters. An argument is put in as it is, so a variable in it is never read as a parameter.
+fn substituted(ty: Ty, subst: List<Ty>) -> Ty =
+  match ty {
+    Var(index) -> match list_at(subst, index) { Some(argument) -> argument, None -> ty },
+    Fn(params, ret, pure) ->
+      Fn(map(params, |p: Ty| substituted(p, subst)), substituted(ret, subst), pure),
+    Record(fields) ->
+      Record(
+        map(fields, |f: { name: String, ty: Ty }| { name: f.name, ty: substituted(f.ty, subst) }),
+      ),
+    Con(name, args) -> Con(name, map(args, |a: Ty| substituted(a, subst))),
+  }
+
 fn find_decl(decls: List<Decl>, name: String) -> Option<Decl> =
   fold(decls, None, |found: Option<Decl>, d: Decl|
     match found { Some(_) -> found, None -> if d.name == name { Some(d) } else { None } })
@@ -244,6 +251,7 @@ fn kinds() -> List<Decl> =
   [
     {
       name: "Kind",
+      params: 0,
       variants: [
         { name: "Asset", fields: [] },
         { name: "Liability", fields: [] },
@@ -256,6 +264,7 @@ fn nat() -> List<Decl> =
   [
     {
       name: "Nat",
+      params: 0,
       variants: [{ name: "Zero", fields: [] }, { name: "Succ", fields: [Con("Nat", [])] }],
     },
   ]
@@ -283,7 +292,7 @@ test "a nullary enum and Bool are finite and everything unbounded is not" {
 
 test "a type variable and a function are never finite" {
   assert_eq(size(Var(0), kinds()), None);
-  assert_eq(size(Fn, kinds()), None)
+  assert_eq(size(Fn([con("Bool")], con("Bool"), true), kinds()), None)
 }
 
 test "a recursive type is infinite even with a nullary base case" {
@@ -306,6 +315,7 @@ test "a case with fields multiplies them into its type's size" {
   let declared = appended(kinds(), [
     {
       name: "Wrap",
+      params: 0,
       variants: [
         { name: "Nothing", fields: [] },
         { name: "Held", fields: [Con("Kind", []), Con("Bool", [])] },
@@ -328,6 +338,7 @@ test "a shape carries each node's size, so decoding a point counts nothing" {
   let declared = appended(kinds(), [
     {
       name: "Wrap",
+      params: 0,
       variants: [
         { name: "Nothing", fields: [] },
         { name: "Held", fields: [Con("Kind", []), Con("Bool", [])] },
@@ -352,7 +363,7 @@ test "a shape carries each node's size, so decoding a point counts nothing" {
   assert_eq(shape_of(con("Unit"), declared), Some(Scalar("Unit", 1)));
   // A parameter is the argument's own shape.
   let pair = appended(kinds(), [
-    { name: "Pair", variants: [{ name: "Both", fields: [Var(0), Var(0)] }] },
+    { name: "Pair", params: 1, variants: [{ name: "Both", fields: [Var(0), Var(0)] }] },
   ]);
   assert_eq(
     shape_of(Con("Pair", [con("Bool")]), pair),
@@ -383,7 +394,7 @@ test "a product beyond the bound is refused rather than walked" {
 }
 
 test "a domain with a binder no value inhabits is a vacuity, not a proof" {
-  let declared = [{ name: "Empty", variants: [] }];
+  let declared = [{ name: "Empty", params: 0, variants: [] }];
   assert_eq(finite([con("Empty")], declared), None)
 }
 
@@ -424,7 +435,7 @@ test "enumeration covers the domain once each in a fixed order" {
 
 test "a parameter is the argument the type was applied to" {
   let declared = appended(kinds(), [
-    { name: "Pair", variants: [{ name: "Both", fields: [Var(0), Var(0)] }] },
+    { name: "Pair", params: 1, variants: [{ name: "Both", fields: [Var(0), Var(0)] }] },
   ]);
   assert_eq(size(Con("Pair", [con("Bool")]), declared), Some(4));
   assert_eq(size(Con("Pair", [con("Kind")]), declared), Some(9));
@@ -437,22 +448,11 @@ test "a parameter is the argument the type was applied to" {
   assert_eq(size(Con("Pair", []), declared), None)
 }
 
-test "an argument is read in the scope that wrote it, so a parameter never names itself" {
-  let declared = appended(kinds(), [
-    { name: "Pair", variants: [{ name: "Both", fields: [Var(0), Var(0)] }] },
-    { name: "Box", variants: [{ name: "Box", fields: [Var(0)] }] },
-    { name: "Two", variants: [{ name: "Two", fields: [Con("Box", [Var(0)])] }] },
-  ]);
-  // A binder's own type variable, passed as an argument, has no values to walk.
-  assert_eq(size(Con("Pair", [Var(0)]), declared), None);
-  // A parameter handed on to another generic type is the caller's argument.
-  assert_eq(size(Con("Two", [con("Bool")]), declared), Some(2))
-}
-
 test "a recursive type stays infinite under an argument, not only on its own" {
   let declared = [
     {
       name: "Nest",
+      params: 1,
       variants: [
         { name: "Leaf", fields: [Var(0)] },
         { name: "More", fields: [Con("Nest", [Var(0)])] },
@@ -460,4 +460,23 @@ test "a recursive type stays infinite under an argument, not only on its own" {
     },
   ];
   assert_eq(size(Con("Nest", [con("Bool")]), declared), None)
+}
+
+// A claim's variables and a declaration's parameters are both numbered from zero, each in its own
+// item, so reading one as the other would size `Pair<a>` by itself forever.
+test "a claim's own variable has no size, even where it fills a parameter numbered the same" {
+  let declared = appended(kinds(), [
+    { name: "Pair", params: 1, variants: [{ name: "Both", fields: [Var(0), Var(0)] }] },
+  ]);
+  assert_eq(size(Con("Pair", [Var(0)]), declared), None);
+  assert_eq(finite([Con("Pair", [Var(0)]), con("Bool")], declared), None)
+}
+
+test "a parameter handed on to another declaration is what the outer one was applied to" {
+  let declared = appended(kinds(), [
+    { name: "Box", params: 1, variants: [{ name: "Boxed", fields: [Var(0)] }] },
+    { name: "Two", params: 1, variants: [{ name: "Two", fields: [Con("Box", [Var(0)]), Var(0)] }] },
+  ]);
+  assert_eq(size(Con("Two", [con("Kind")]), declared), Some(9));
+  assert_eq(size(Con("Two", [Var(0)]), declared), None)
 }

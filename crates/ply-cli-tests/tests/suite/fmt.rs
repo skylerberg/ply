@@ -374,8 +374,7 @@ fn first_difference(file: &str, once: &str, twice: &str) -> String {
 }
 
 /// Every `.ply` source the repository maintains, as against the fixtures written to be malformed
-/// or to pin a golden. `examples` is not here yet: several harnesses rewrite those files by
-/// matching their text, and they have to stop before the formatter may touch them.
+/// or to pin a golden.
 const MAINTAINED: &[&str] = &[
     "crates/ply-compiler/ply",
     "crates/ply-cli/ply",
@@ -387,6 +386,7 @@ const MAINTAINED: &[&str] = &[
     "crates/ply-registry/ply",
     "benches",
     "tests/lang",
+    "examples",
 ];
 
 /// A layout only a scratch copy is ever held to is not canonical. A source committed unformatted

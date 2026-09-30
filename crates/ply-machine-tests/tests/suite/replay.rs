@@ -15,9 +15,8 @@ use std::sync::Arc;
 /// requires, and `Point` is the shape `claims.ply` reads.
 const REPLAY: &str = r#"
 nondet effect prover {
-  write configure[claims](options: Options, front: Front) -> Unit
+  write configure[claims](options: Options, front: Front, world: World) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
-  read typed[claims]() -> Result<Typed, Refusal>
   read shrink[claims](claim: Int) -> Result<Option<Int>, Refusal>
   read offers[claims](i: Int) -> Result<Option<Offer>, Refusal>
   read would[claims](i: Int, position: Int) -> Result<Bool, Refusal>
@@ -32,15 +31,32 @@ nondet effect prover {
   write accepted[claims](records: List<Baseline>) -> Accepted
 }
 
-type Binder = { name: String, text: String, ty: Shape }
 type Offer = { here: Int, candidates: List<{ position: Int, size: Int }> }
 type Settled = { bindings: List<Binding>, original: List<Binding> }
-// The domain vocabulary is a shape this fixture only carries: it never reads one, so it names
-// the type itself rather than borrowing the name of the package's.
-type Shape = | Var(Int) | Fn | Record(List<{ name: String, ty: Shape }>) | Con(String, List<Shape>)
+// The world's vocabulary is a shape this fixture only carries: it never reads one, so it names
+// each type itself rather than borrowing the name of the package's.
+type Shape =
+  | Var(Int)
+  | Fn(List<Shape>, Shape, Bool)
+  | Record(List<{ name: String, ty: Shape }>)
+  | Con(String, List<Shape>)
 type Variant = { name: String, fields: List<Shape> }
-type Decl = { name: String, variants: List<Variant> }
-type Typed = { decls: List<Decl>, claims: List<{ claim: Int, binders: List<Binder> }> }
+type Decl = { name: String, params: Int, variants: List<Variant> }
+type Signature = { name: String, ty: Shape, pure: Bool }
+type Kind = | Ensures(Int) | Law(Option<String>)
+type Frame = | Pure | Writes(List<String>)
+type Claimed = {
+  key: String,
+  owner: String,
+  kind: Kind,
+  at: { module: Int, start: Int, end: Int },
+  binders: List<{ name: String, ty: Shape, text: String }>,
+  guarded: Bool,
+  host: Bool,
+  footprint: String,
+  frame: Frame,
+}
+type World = { decls: List<Decl>, signatures: List<Signature>, obligations: List<Claimed> }
 type Measured = { claim: Int, sizes: List<Int>, name: String }
 type Tls = Unit
 type Named = Unit
@@ -113,7 +129,7 @@ fn scan(index: Int, case: Int, seen: Answer) -> Answer / {prover.replay[claims]}
     }
   }
 
-fn main(root: String, index: Int, front: Front) -> Answer / {prover.configure[claims], prover.collected[claims], prover.replay[claims]} = {
+fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prover.configure[claims], prover.collected[claims], prover.replay[claims]} = {
   prover.configure[claims]({
     path: root,
     no_incremental: false,
@@ -145,7 +161,7 @@ fn main(root: String, index: Int, front: Front) -> Answer / {prover.configure[cl
       steps: None,
       measure_reduction: false,
     },
-  }, front);
+  }, front, world);
   match prover.collected[claims]() {
     Err(_) -> { falsified: 0 - 1, kept: 0, rejected: 0, first: "" },
     Ok(_) -> scan(index, 0, nothing()),
@@ -184,12 +200,15 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_span::Diagnostic> {
     }
     let binding = registry.bind(&front.check).expect("the prover ops bind");
     machine.set_host_binding(Arc::new(binding));
+    let (_, _, obligations) =
+        crate::fixture::proving(project.path()).expect("the program under test loads");
     machine.call(
         "proof.obligation.main",
         vec![
             Value::str(project.path().display().to_string()),
             Value::Int(index),
             crate::fixture::handed(project.path()),
+            crate::fixture::world_value(&obligations),
         ],
         Span::DUMMY,
     )
@@ -251,11 +270,10 @@ fn the_fixture_declares_the_payload_where_the_machine_names_it() {
     let mut checked = 0;
     for (home, ty) in ply_machine::claims::MARSHALLED {
         let declared: Vec<&str> = front
-            .check
-            .ctors
+            .types
             .values()
-            .filter(|c| c.type_name.as_str().rsplit('.').next() == Some(*ty))
-            .map(|c| c.module.as_str())
+            .filter(|t| t.simple_name.as_str() == *ty)
+            .map(|t| t.module.as_str())
             .collect();
         if declared.is_empty() {
             continue;

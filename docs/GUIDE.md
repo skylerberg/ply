@@ -1009,7 +1009,10 @@ view and `len` known to lie below `i64::MAX`.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
-values. Flags: `--prove-cases N` (below 25 kept cases only `example`),
+values. A claim's type variables are lettered by where they first appear among
+its binders (`forall (x: a, y: List<b>)`); a sample draws each as `Int`
+(`a := Int`), and a proof leaves each an uninterpreted sort
+(`uninterpreted a, b`). Flags: `--prove-cases N` (below 25 kept cases only `example`),
 `--prove-roots N`, `--prove-budget N` (spent reports `property`),
 `--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
 1000000000; an evaluation past it leaves the obligation `unattempted`, and the
@@ -2311,7 +2314,8 @@ leaves it unchanged; a failure raised by a run of it carries no line number. A
 body or closure that fails verification is `E0443`, as is a build whose closure
 holds two identical declarations it cannot tell apart (two effects, or two
 members of one recursive group); an artifact from another version is `E0444`.
-`--config-schema` ships that function too.
+`--config-schema` ships that function too, resolved as a run resolves it: a name
+that is not a nullary pure function returning a `ConfigSpec` is `E0440`.
 
 ### 15.1 The registry
 
