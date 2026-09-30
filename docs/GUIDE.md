@@ -816,10 +816,11 @@ not license it, because no type records the join.
 ### 8.1 Writing tests
 
 `test "label" { ... }` is an item with a block body (§6.5 shows one); it cannot
-be `pub`, referenced or given arguments. `assert(cond)` /
-`assert(cond, Some("why"))` and `assert_eq(actual, expected)` fail with `E0501`,
-the latter reporting both values and their first difference. Any other failure
-is `E0502`.
+be `pub`, referenced or given arguments. The body is `Unit`: a test passes when
+it finishes, so one that ends on a value, such as a comparison missing its
+`assert`, is `E0201`. `assert(cond)` / `assert(cond, Some("why"))` and
+`assert_eq(actual, expected)` fail with `E0501`, the latter reporting both
+values and their first difference. Any other failure is `E0502`.
 
 ### 8.2 Selection
 
