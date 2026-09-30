@@ -116,7 +116,7 @@ impl LawSearch for Model {
         vec![Binding {
             name: Symbol::new("n"),
             ty: "Int".to_string(),
-            rendered: point.to_string(),
+            value: ply_eval::Plain::Int(point as i64),
         }]
     }
 }
@@ -544,8 +544,8 @@ fn a_refutation_over_sampled_values_carries_its_seed_its_race_and_its_point() {
         counterexample
             .bindings
             .iter()
-            .map(|b| (b.name.as_str(), b.rendered.as_str()))
+            .map(|b| (b.name.as_str(), b.value.clone()))
             .collect::<Vec<_>>(),
-        [("n", "0")]
+        [("n", ply_eval::Plain::Int(0))]
     );
 }

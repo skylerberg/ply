@@ -1,6 +1,6 @@
 //! A deserializable `Diagnostic`: its `&'static str` code cannot borrow from a runtime file.
 
-use ply_eval::{Diagnostic, Fix, Label, Severity, intern_code};
+use ply_eval::{Diagnostic, Fix, Label, Plain, Severity, Sparse, intern_code};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -14,6 +14,8 @@ pub struct DiagnosticRepr {
     notes: Vec<String>,
     #[serde(default)]
     fixes: Vec<Fix>,
+    #[serde(default, skip_serializing_if = "Sparse::is_empty")]
+    values: Sparse<Plain>,
 }
 
 impl From<&Diagnostic> for DiagnosticRepr {
@@ -24,7 +26,8 @@ impl From<&Diagnostic> for DiagnosticRepr {
             message: d.message.clone(),
             labels: d.labels.clone(),
             notes: d.notes.clone(),
-            fixes: d.fixes.clone(),
+            fixes: d.fixes.to_vec(),
+            values: d.values.clone(),
         }
     }
 }
@@ -37,7 +40,8 @@ impl From<DiagnosticRepr> for Diagnostic {
             message: r.message,
             labels: r.labels,
             notes: r.notes,
-            fixes: r.fixes,
+            fixes: r.fixes.into(),
+            values: r.values,
         }
     }
 }

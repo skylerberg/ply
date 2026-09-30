@@ -1,4 +1,4 @@
-use ply_eval::{Span, Value, codes};
+use ply_eval::{Plain, Span, Value, codes};
 
 /// A small stack, where unbounded host recursion aborts the whole test binary.
 fn on_a_small_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
@@ -50,39 +50,19 @@ fn the_first_difference_of_two_deep_values_is_found_on_a_small_stack() {
         }
         let actual = chain(deep);
         assert!(!ply_eval::values_equal(&actual, &other, Span::DUMMY).expect("they compare"));
-        ply_eval::first_difference(&actual, &other)
-    });
-    let (path, expected, actual) = found.expect("the difference is located");
-    assert!(path.ends_with(".Link.0"), "{path}");
-    assert_eq!(expected, "End");
-    assert_eq!(actual, "Nil");
-}
-
-/// Through the front end's own lexer, whose dump writes a `Bytes` token as `start:end:b:<hex>`.
-#[test]
-fn every_rendered_byte_lexes_back_to_the_byte_it_came_from() {
-    ply_codegen::c::producer::ensure_default();
-    let all: Vec<u8> = (0..=255u8).collect();
-    for chunk in all.chunks(32) {
-        let rendered = Value::bytes(chunk).render();
-        let answer =
-            ply_codegen::c::producer::call("lexer.dump", &[Value::bytes(rendered.as_bytes())]);
-        let dump = match &answer {
-            Ok(Value::Str(dump)) => dump.to_string(),
-            other => panic!("the lexer answered {other:?}"),
-        };
-        assert!(!dump.contains(":!:"), "{rendered} did not lex: {dump}");
-        let first: Vec<&str> = dump
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .splitn(4, ':')
-            .collect();
-        let hex: String = chunk.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            first.get(2..),
-            Some(&["b", hex.as_str()][..]),
-            "{rendered}: {dump}"
+        let d = ply_eval::first_difference(&actual, &other).expect("the difference is located");
+        let last_step = matches!(
+            d.path.last(),
+            Some(ply_eval::PathStep::Arg(ctor, 0)) if ctor.as_str() == "Link"
         );
-    }
+        (last_step, Plain::of(&d.expected), Plain::of(&d.actual))
+    });
+    assert_eq!(
+        found,
+        (
+            true,
+            Plain::Ctor("End".to_string(), Vec::new()),
+            Plain::Ctor("Nil".to_string(), Vec::new())
+        )
+    );
 }

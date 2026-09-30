@@ -147,7 +147,8 @@ fn pair(item: &Value, span: Span) -> Result<(Value, Value), Diagnostic> {
             codes::RUNTIME_ERROR,
             "`map_of_entries` needs each entry to have a `key` and a `value` field",
         )
-        .primary(span, format!("this entry is {}", item.render()))),
+        .primary(span, format!("this entry is {}", crate::slot(0)))
+        .showing(vec![crate::Plain::shown(item)])),
     }
 }
 

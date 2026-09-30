@@ -11,7 +11,9 @@
 use crate::hosts::{self, Hosts, Lent, hosting};
 use crate::load::{Loaded, project_root};
 use crate::options::When;
-use crate::payload::{count, diag_value, diags_value, json, option, places_value, record, strings};
+use crate::payload::{
+    count, diags_value, json, option, places_value, raised_value, record, strings,
+};
 use crate::support::{
     build_backend_over, build_pool, enter_constant, module_texts, once_each, select_profile,
 };
@@ -2136,7 +2138,10 @@ fn outcome_value(o: &OutcomeView) -> PlyValue {
         ("hash", option(o.hash.as_deref().map(PlyValue::str))),
         ("duration_us", micros(o.duration_us)),
         ("status", PlyValue::str(o.status)),
-        ("diagnostic", option(o.diagnostic.as_ref().map(diag_value))),
+        (
+            "diagnostic",
+            option(o.diagnostic.as_ref().map(raised_value)),
+        ),
         ("search", option(o.search.as_ref().map(search_value))),
         ("cached", option(o.cached.map(PlyValue::Bool))),
         ("performs", tally(o.performs)),
@@ -2164,7 +2169,7 @@ fn fault_value(f: &FaultView) -> PlyValue {
     record(vec![
         ("key", PlyValue::str(&f.key)),
         ("name", PlyValue::str(&f.name)),
-        ("diagnostic", diag_value(&f.diagnostic)),
+        ("diagnostic", raised_value(&f.diagnostic)),
         ("defect", PlyValue::Bool(f.defect)),
         ("host", PlyValue::Bool(f.host)),
         ("search", option(f.search.as_ref().map(change_set_value))),
@@ -2375,7 +2380,7 @@ fn unasked(op: &str, span: Span) -> Diagnostic {
 /// program validated already, so a bad value here is an internal error.
 pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnostic> {
     if std::env::var("PLY_DEBUG_OPTIONS").is_ok() {
-        eprintln!("{v}");
+        eprintln!("{v:?}");
     }
     use crate::payload::{field_of, opt_int_at, opt_str_at, str_list_at};
     let bool_at = |name: &str| field_of(v, name, span)?.as_bool(span, name);

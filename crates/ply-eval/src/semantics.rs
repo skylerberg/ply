@@ -255,13 +255,18 @@ pub(crate) fn err_shift_count_at(span: Span, n: i64, ty: &str, width: i64) -> Di
 #[cold]
 #[inline(never)]
 pub(crate) fn err_fixed_overflow(span: Span, what: &str, a: Fixed, b: Fixed) -> Diagnostic {
+    let (x, y) = (crate::slot(0), crate::slot(1));
     let detail = if what == "negation" {
-        format!("-{a} does not fit in {}", a.ty)
+        format!("-{x} does not fit in {}", a.ty)
     } else {
-        format!("{a} and {b} overflow {}", a.ty)
+        format!("{x} and {y} overflow {}", a.ty)
     };
     Diagnostic::error(codes::RUNTIME_ERROR, format!("integer overflow in {what}"))
         .primary(span, detail)
+        .showing(vec![
+            crate::Plain::shown(&Value::Fixed(a)),
+            crate::Plain::shown(&Value::Fixed(b)),
+        ])
 }
 
 /// Exact or a diagnostic at the operands' width; wrapping is `wrap_add` and its siblings.

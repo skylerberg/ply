@@ -10,7 +10,7 @@ use children::{Child, Launch, Refusal, Unusable};
 use ply_eval::host::HostRegistry;
 use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
-    HostRuntime, Linearity, Pending, Resource, Span, Symbol, Value, codes,
+    HostRuntime, Linearity, Pending, Plain, Resource, Span, Symbol, Value, codes, slot,
 };
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -746,9 +746,10 @@ fn output_of(value: &Value, span: Span) -> Result<Output, Diagnostic> {
         _ => {
             return Err(malformed_argument(
                 Op::Start,
-                &format!("an `Output` that is {}", value.render()),
+                &format!("an `Output` that is {}", slot(0)),
                 span,
-            ));
+            )
+            .showing(vec![Plain::shown(value)]));
         }
     })
 }
@@ -762,9 +763,10 @@ fn signal_of(value: &Value, span: Span) -> Result<Signal, Diagnostic> {
         _ => {
             return Err(malformed_argument(
                 Op::Signal,
-                &format!("a `Signal` that is {}", value.render()),
+                &format!("a `Signal` that is {}", slot(0)),
                 span,
-            ));
+            )
+            .showing(vec![Plain::shown(value)]));
         }
     })
 }

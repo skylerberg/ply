@@ -66,20 +66,9 @@ const OPERATIONS: [(&str, &str); 9] = [
 const STACK: usize = 256 << 20;
 
 /// The ops and the one handler serving them, configured as the run being lent is configured.
-/// The ops as the CLI's own program declares them: its machine module is `machine`.
 pub fn registrations_with(options: drive::RunOptions) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    registrations_for(options, "machine")
-}
-
-/// The ops for a program whose machine module is named `module`: the values a host hands it are
-/// named as its declarations name them.
-pub fn registrations_for(
-    options: drive::RunOptions,
-    module: &str,
-) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         options,
-        module: module.to_string(),
         labels: Mutex::new(HashMap::new()),
         configured: Mutex::new(HashMap::new()),
     });
@@ -101,12 +90,7 @@ pub fn register(registry: &mut HostRegistry) {
 }
 
 pub fn register_with(registry: &mut HostRegistry, options: drive::RunOptions) {
-    register_with_for(registry, options, "machine");
-}
-
-/// The ops for a program whose machine module is named `module`.
-pub fn register_with_for(registry: &mut HostRegistry, options: drive::RunOptions, module: &str) {
-    for (op, handler) in registrations_for(options, module) {
+    for (op, handler) in registrations_with(options) {
         registry.register(op, handler);
     }
 }
@@ -144,9 +128,6 @@ fn refused_value(refused: &drive::Refused) -> Value {
 
 struct Site {
     options: drive::RunOptions,
-    /// The name the calling program gives the machine module: the values it is handed are named
-    /// as its declarations name them.
-    module: String,
     labels: Mutex<HashMap<String, Labelled>>,
     /// What a label was configured with before it loaded, if it was.
     configured: Mutex<HashMap<String, drive::RunOptions>>,
@@ -187,8 +168,8 @@ enum Go {
     },
     Call {
         name: String,
-        args: Vec<serde_json::Value>,
-        reply: Sender<Result<serde_json::Value, Diagnostic>>,
+        args: Vec<ply_eval::Plain>,
+        reply: Sender<Result<ply_eval::Plain, Diagnostic>>,
     },
     Accounting {
         reply: Sender<drive::Measured>,
@@ -237,22 +218,19 @@ impl HostHandler for Site {
                         codes::RUNTIME_ERROR,
                         "`machine.call`'s arguments are not a list".to_string(),
                     )
-                    .primary(span, "a `machine.Value` list"));
+                    .primary(span, "a `std.value.Value` list"));
                 };
-                // The wire, not the value: the answer to the call crosses to the machine's
-                // thread, and values do not cross.
-                let args: Vec<serde_json::Value> = args
+                // Plain data, not the value: the call crosses to the machine's thread, and
+                // runtime values do not cross threads.
+                let args: Vec<ply_eval::Plain> = args
                     .iter()
-                    .map(|a| crate::payload::adt_to_wire(a, span, &self.module))
+                    .map(|a| crate::payload::value_plain(a, span))
                     .collect::<Result<_, _>>()?;
-                let answer: Result<serde_json::Value, Diagnostic> =
+                let answer: Result<ply_eval::Plain, Diagnostic> =
                     self.ask(&label, span, |reply| Go::Call { name, args, reply })?;
                 match answer {
-                    Ok(wire) => ok(crate::payload::wire_to_adt(&wire, span, &self.module)?),
-                    Err(d) => err(crate::payload::record(vec![
-                        ("code", Value::str(d.code)),
-                        ("message", Value::str(d.message)),
-                    ])),
+                    Ok(plain) => ok(crate::payload::plain_value(&plain)),
+                    Err(d) => err(crate::payload::raised_value(&d)),
                 }
             }
             ("accounting", []) => {
