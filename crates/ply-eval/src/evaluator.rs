@@ -182,7 +182,8 @@ impl<'a> Machine<'a> {
         self.tier_test(&test.module, ordinal, test.span)
     }
 
-    /// The compiled front end is the authority: unit passes, a raise fails, a missing body fails.
+    /// The compiled front end is the authority: unit passes, a raise fails, and a missing body or
+    /// any other answer is Ply's defect.
     fn tier_test(
         &mut self,
         module: &ModuleName,
@@ -199,7 +200,11 @@ impl<'a> Machine<'a> {
                 self.compiled_entries += 1;
                 Ok(())
             }
-            Entered::Answered(_) | Entered::Declined => {
+            Entered::Answered(value) => {
+                self.compiled_entries += 1;
+                Err(err_test_answered(&root, &value, span))
+            }
+            Entered::Declined => {
                 self.compiled_declines += 1;
                 Err(err_not_compiled(&root, span))
             }
@@ -294,6 +299,23 @@ pub fn err_not_compiled(name: &Symbol, span: Span) -> Diagnostic {
         "a body the emitter cannot compile is `E0448` where the program is built, so this is the \
          seam rather than the body: a unit that failed to build, a signature the boundary does \
          not carry, the wrong number of arguments, or an entry reached while another was running",
+    )
+    .note("this is Ply's fault, not the program's")
+}
+
+#[cold]
+#[inline(never)]
+fn err_test_answered(root: &Symbol, value: &Value, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("test root `{root}` answered `{value}`, and a test body is `Unit`"),
+    )
+    .primary(
+        span,
+        "the compiled tier ran this test and it answered a value",
+    )
+    .note(
+        "the checker refuses a test whose body is not `Unit` with E0201, so no test can answer one",
     )
     .note("this is Ply's fault, not the program's")
 }
