@@ -946,7 +946,7 @@ pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut Ctx, w: i64) -> i64 {
 }
 
 /// The operator codes compiled code hands [`rt_binary`]; `emit.ply`'s `binary_code` must match.
-const BINOPS: [BinOp; 17] = [
+const BINOPS: [BinOp; 18] = [
     BinOp::Add,
     BinOp::Sub,
     BinOp::Mul,
@@ -964,6 +964,7 @@ const BINOPS: [BinOp; 17] = [
     BinOp::BitXor,
     BinOp::Shl,
     BinOp::Shr,
+    BinOp::Ushr,
 ];
 
 /// The machine's own negation of a value whose type the emitter cannot see. Takes it.
@@ -973,7 +974,7 @@ pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
     let answer = match &vals[0] {
         Value::Float(f) => Value::Float(-f),
         Value::Decimal(d) => Value::Decimal(-*d),
-        Value::Fixed(f) => match ply_eval::Fixed::of(f.ty, -f.value()) {
+        Value::Fixed(f) => match f.checked_neg() {
             Some(n) => Value::Fixed(n),
             None => return c.fail(error("negation overflowed its width")),
         },
@@ -982,6 +983,20 @@ pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
                 Some(n) => Value::Int(n),
                 None => return c.fail(error("integer overflow in negation")),
             },
+            Err(d) => return c.fail(d),
+        },
+    };
+    c.word(&answer)
+}
+
+/// `~` over a word the emitter cannot read as an `Int`: a width past 32 bits. Takes it.
+pub unsafe extern "C" fn rt_bitnot(ctx: *mut Ctx, a: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let vals = values_taken(c, &[a]);
+    let answer = match &vals[0] {
+        Value::Fixed(f) => Value::Fixed(ply_eval::Fixed::new(f.ty, !f.bits())),
+        other => match other.as_int(Span::DUMMY, "`~`") {
+            Ok(i) => Value::Int(!i),
             Err(d) => return c.fail(d),
         },
     };

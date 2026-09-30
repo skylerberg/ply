@@ -1,6 +1,6 @@
 //! An operator's meaning and the diagnostics shared by every evaluation strategy.
 
-use crate::value::{Decimal, Fixed, Value, type_error, values_equal};
+use crate::value::{Decimal, Fixed, FixedOp, Value, type_error, values_equal};
 use crate::{BinOp, Diagnostic, Span, codes};
 
 #[inline(never)]
@@ -44,7 +44,7 @@ pub fn strict_binary(
             let ordering = match (l, r) {
                 (Value::Int(a), Value::Int(b)) => a.cmp(b),
                 // By value, not bits, so `I8` puts `-1` below `0`.
-                (Value::Fixed(a), Value::Fixed(b)) if a.ty == b.ty => a.value().cmp(&b.value()),
+                (Value::Fixed(a), Value::Fixed(b)) if a.ty == b.ty => a.value_cmp(*b),
                 (Value::Str(a), Value::Str(b)) => a.as_ref().cmp(b.as_ref()),
                 (Value::Decimal(a), Value::Decimal(b)) => a.cmp(b),
                 (
@@ -130,14 +130,11 @@ pub fn strict_binary(
                     return Err(err_shift_count_at(rspan, n, a.ty.name(), width));
                 }
                 let n = n as u32;
-                let raw = a.raw();
-                let bits = match op {
-                    BinOp::Shl => raw << n,
-                    // `value()` is non-negative when unsigned, so this zero-fills there.
-                    BinOp::Shr => (a.value() >> n) as u64,
-                    _ => raw >> n,
-                };
-                return Ok(Value::Fixed(Fixed::new(a.ty, bits)));
+                return Ok(Value::Fixed(match op {
+                    BinOp::Shl => Fixed::new(a.ty, a.raw() << n),
+                    BinOp::Shr => a.shifted_right(n),
+                    _ => Fixed::new(a.ty, a.raw() >> n),
+                }));
             }
             let a = l.as_int(lspan, "a shift")?;
             if !(0..64).contains(&n) {
@@ -276,14 +273,13 @@ fn fixed_arithmetic(
     span: Span,
 ) -> Result<Value, Diagnostic> {
     let (result, what) = match op {
-        BinOp::Add => (a.checked(b, i128::checked_add), "addition"),
-        BinOp::Sub => (a.checked(b, i128::checked_sub), "subtraction"),
-        // Two large `U64`s overflow `i128` too, which is still an overflow of the narrow type.
-        BinOp::Mul => (a.checked(b, i128::checked_mul), "multiplication"),
-        BinOp::Div if b.value() == 0 => return Err(err_zero_divisor(rspan, "division")),
-        BinOp::Div => (a.checked(b, i128::checked_div), "division"),
-        _ if b.value() == 0 => return Err(err_zero_divisor(rspan, "remainder")),
-        _ => (a.checked(b, i128::checked_rem), "remainder"),
+        BinOp::Add => (a.checked(b, FixedOp::Add), "addition"),
+        BinOp::Sub => (a.checked(b, FixedOp::Sub), "subtraction"),
+        BinOp::Mul => (a.checked(b, FixedOp::Mul), "multiplication"),
+        BinOp::Div if b.is_zero() => return Err(err_zero_divisor(rspan, "division")),
+        BinOp::Div => (a.checked(b, FixedOp::Div), "division"),
+        _ if b.is_zero() => return Err(err_zero_divisor(rspan, "remainder")),
+        _ => (a.checked(b, FixedOp::Rem), "remainder"),
     };
     match result {
         Some(v) => Ok(Value::Fixed(v)),

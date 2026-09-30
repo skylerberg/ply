@@ -8,8 +8,8 @@ import spine (push_front, positional, Span, Ident, QName, Ctx, P, R, Ate, Acc, P
               t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket, t_comma, t_colon, t_dotdot,
               t_minus, t_underscore, k_true, k_false, num, rec, nlist, opt, payload, word,
               dump_list, dump_opt, dump_ident, dump_qname, dump_diags, start)
-import lexer (Tok, Token, TIdent, TInt, TFixed, TFloat, TDec, TStr, TBytes, TKw, TPunct, TEof,
-              Width, width_named, width_normalize)
+import lexer (Tok, Token, TIdent, TInt, TFixed, TWide, TFloat, TDec, TStr, TBytes, TKw, TPunct,
+              TEof, Width, width_named, width_normalize)
 
 // --- Literals ---------------------------------------------------------------
 
@@ -18,6 +18,8 @@ pub type Lit =
   | LInt(Int)
   // A width-suffixed literal: the width's name and the `Int` bit pattern the width reads.
   | LFixed(Bytes, Int)
+  // A 128-bit literal: the width's name, then its high and low 64 bits as `Int` patterns.
+  | LWide(Bytes, Int, Int)
   | LBool(Bool)
   | LStr(Bytes)
   | LBytes(Bytes)
@@ -30,6 +32,8 @@ pub fn dump_lit(l: Lit) -> Bytes =
   match l {
     LInt(v) -> bytes_concat(word(b"int"), payload(num(v))),
     LFixed(ty, v) -> bytes_concat(word(b"fixed"), payload(bytes_concat_all([ty, b":", num(v)]))),
+    LWide(ty, high, low) ->
+      bytes_concat(word(b"wide"), payload(bytes_concat_all([ty, b":", num(high), b":", num(low)]))),
     LBool(b) -> bytes_concat(word(b"bool"), payload(if b { b"1" } else { b"0" })),
     LStr(s) -> bytes_concat(word(b"str"), payload(s)),
     LBytes(b) -> bytes_concat(word(b"bytes"), payload(b)),
@@ -99,6 +103,7 @@ fn is_num_tok(t: Tok) -> Bool =
   match t {
     TInt(v) -> true,
     TFixed(ty, v) -> true,
+    TWide(ty, high, low) -> true,
     TFloat(f) -> true,
     TDec(m, sc) -> true,
     _ -> false,
@@ -109,6 +114,7 @@ fn pattern_body(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   match kind(c, p) {
     TInt(v) -> lit_pat(c, p, LInt(v)),
     TFixed(ty, v) -> lit_pat(c, p, LFixed(ty, v)),
+    TWide(ty, high, low) -> lit_pat(c, p, LWide(ty, high, low)),
     // The lexer's payload is discarded: the tree holds the source, sliced.
     TFloat(f) -> lit_pat(c, p, LFloat(src_over(c, st))),
     TDec(m, sc) -> lit_pat(c, p, LDec(src_over(c, st))),
@@ -141,6 +147,10 @@ fn neg_at_width(ty: Bytes, v: Int) -> Int =
     None -> 0 - v,
   }
 
+// Two's complement across both halves: the borrow reaches the high half only when the low one is zero.
+fn neg_wide(ty: Bytes, high: Int, low: Int) -> Lit =
+  LWide(ty, if low == 0 { wrap_sub(0, high) } else { ~high }, wrap_sub(0, low))
+
 fn neg_lit(c: Ctx, p: P, st: Span) -> Result<R<Pattern>, P> = {
   let m = advance(c, p);
   let a = advance(c, m.p);
@@ -150,6 +160,7 @@ fn neg_lit(c: Ctx, p: P, st: Span) -> Result<R<Pattern>, P> = {
     TInt(v) -> Ok({ p: a.p, node: PLit({ span: s, lit: LInt(0 - v) }) }),
     // Negated at the width, so each signed type's minimum (`-128i8`) is writable.
     TFixed(ty, v) -> Ok({ p: a.p, node: PLit({ span: s, lit: LFixed(ty, neg_at_width(ty, v)) }) }),
+    TWide(ty, high, low) -> Ok({ p: a.p, node: PLit({ span: s, lit: neg_wide(ty, high, low) }) }),
     TFloat(f) -> Ok({ p: a.p, node: PLit({ span: s, lit: LFloat(src_over(c, s)) }) }),
     TDec(mm, sc) -> Ok({ p: a.p, node: PLit({ span: s, lit: LDec(src_over(c, s)) }) }),
     // Unreachable: `is_num_tok` admitted only a number.
@@ -386,6 +397,14 @@ test "a negative literal pattern is one literal and the minus is in its span" {
   assert_eq(dump_pattern_of(b"-1.5"), "0:4:plit;%float;@2d312e35;#0;");
   assert_eq(dump_pattern_of(b"-1.50m"), "0:6:plit;%dec;@2d312e35306d;#0;");
   assert_eq(dump_pattern_of(b"- 1.5"), "0:5:plit;%float;@2d20312e35;#0;")
+}
+
+test "a negative 128-bit literal pattern borrows into its high half only past a zero low half" {
+  assert_eq(dump_pattern_of(b"-1i128"), "0:6:plit;%wide;@493132383a2d313a2d31;#0;");
+  assert_eq(
+    dump_pattern_of(b"-18446744073709551616i128"),
+    "0:25:plit;%wide;@493132383a2d313a30;#0;",
+  )
 }
 
 test "list patterns, with and without a rest binding" {

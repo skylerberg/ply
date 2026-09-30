@@ -281,13 +281,16 @@ pub fn machine_value(v: &PlyValue, module: &str) -> Result<PlyValue, Diagnostic>
         PlyValue::Float(f) => c("VFloat", vec![PlyValue::Float(*f)]),
         PlyValue::Decimal(d) => c("VDecimal", vec![PlyValue::Decimal(*d)]),
         PlyValue::Fixed(f) => {
-            let value = i64::try_from(f.value()).map_err(|_| {
-                Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    format!("a `{}` above `Int`'s range cannot cross", f.ty.name()),
-                )
-                .primary(Span::DUMMY, "the value does not fit an `Int`")
-            })?;
+            let value = f
+                .to_i128()
+                .and_then(|v| i64::try_from(v).ok())
+                .ok_or_else(|| {
+                    Diagnostic::error(
+                        codes::RUNTIME_ERROR,
+                        format!("a `{}` outside `Int`'s range cannot cross", f.ty.name()),
+                    )
+                    .primary(Span::DUMMY, "the value does not fit an `Int`")
+                })?;
             c(
                 "VFixed",
                 vec![PlyValue::str(f.ty.name()), PlyValue::Int(value)],
@@ -467,7 +470,7 @@ pub fn value_to_wire(v: &PlyValue) -> serde_json::Value {
     match v {
         PlyValue::Int(i) => serde_json::json!({ "i": i }),
         PlyValue::Fixed(x) => serde_json::json!({
-            "x": [x.ty.name(), i64::try_from(x.value()).ok()]
+            "x": [x.ty.name(), x.to_i128().and_then(|v| i64::try_from(v).ok())]
         }),
         PlyValue::Bool(b) => serde_json::json!({ "b": b }),
         PlyValue::Float(f) => serde_json::json!({ "f": f.to_string() }),

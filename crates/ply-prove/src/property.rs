@@ -216,19 +216,27 @@ impl Gen<'_> {
     }
 
     fn fixed(&mut self, t: IntTy) -> Fixed {
-        let edges = [0i128, 1, -1, t.min(), t.max() as i128, t.max() as i128 - 1];
-        let pick = |i: u64| {
-            let v = edges[i as usize % edges.len()];
-            Fixed::of(t, v).unwrap_or_else(|| Fixed::new(t, v as u64))
-        };
+        // `-1` is all ones, which an unsigned width reads as its largest value.
+        let edges = [
+            Fixed::new(t, 0),
+            Fixed::new(t, 1),
+            Fixed::new(t, u128::MAX),
+            Fixed::new(t, t.min() as u128),
+            Fixed::new(t, t.max()),
+            Fixed::new(t, t.max() - 1),
+        ];
+        let pick = |i: u64| edges[i as usize % edges.len()];
         match self.edge {
             Some(i) => pick(u64::from(i)),
             None => {
                 let selector = self.stream.next_u64() % 32;
                 if (selector as usize) < edges.len() {
                     pick(selector)
+                } else if t.bits() == 128 {
+                    let high = u128::from(self.stream.next_u64());
+                    Fixed::new(t, high << 64 | u128::from(self.stream.next_u64()))
                 } else {
-                    Fixed::new(t, self.stream.next_u64())
+                    Fixed::new(t, u128::from(self.stream.next_u64()))
                 }
             }
         }

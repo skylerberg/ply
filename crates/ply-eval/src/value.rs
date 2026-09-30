@@ -426,7 +426,7 @@ impl Value {
                 let _ = write!(out, "{i}");
             }
             Value::Fixed(f) => {
-                let _ = write!(out, "{}", f.value());
+                let _ = write!(out, "{f}");
             }
             Value::Bool(b) => {
                 let _ = write!(out, "{b}");
@@ -652,58 +652,140 @@ fn escape_byte(b: u8) -> String {
     }
 }
 
-/// A fixed-width integer; `bits` is always normalized, so derived `Eq` and `Hash` are by value.
+/// A fixed-width integer; its bits are always normalized, so derived `Eq` and `Hash` are by value.
+/// Two halves rather than a `u128`, whose 16-byte alignment would widen `Value`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Fixed {
     pub ty: IntTy,
-    bits: u64,
+    high: u64,
+    low: u64,
 }
 
 impl Fixed {
-    pub fn new(ty: IntTy, bits: u64) -> Fixed {
+    pub fn new(ty: IntTy, bits: u128) -> Fixed {
+        let bits = ty.normalize(bits);
         Fixed {
             ty,
-            bits: ty.normalize(bits),
+            high: (bits >> 64) as u64,
+            low: bits as u64,
         }
     }
 
     pub fn of(ty: IntTy, v: i128) -> Option<Fixed> {
-        ty.holds(v).then(|| Fixed::new(ty, v as u64))
+        ty.holds(v).then(|| Fixed::new(ty, v as u128))
     }
 
-    pub fn bits(self) -> u64 {
-        self.bits
-    }
-
-    /// The mathematical value, not the bits.
-    pub fn value(self) -> i128 {
-        self.ty.value(self.bits)
-    }
-
-    /// The bits with nothing above this type's width, for shifts, masks and rotates.
-    pub fn raw(self) -> u64 {
-        if self.ty.bits() == 64 {
-            self.bits
-        } else {
-            self.bits & (u64::MAX >> (64 - self.ty.bits()))
+    /// An unsigned value, which past `i128::MAX` only a `U128` holds.
+    pub fn of_unsigned(ty: IntTy, v: u128) -> Option<Fixed> {
+        match i128::try_from(v) {
+            Ok(v) => Fixed::of(ty, v),
+            Err(_) => (!ty.signed() && v <= ty.max()).then(|| Fixed::new(ty, v)),
         }
     }
 
-    /// `f` over values in `i128`; `f` must check itself, since a `U64` product overflows `i128`.
-    pub fn checked(self, other: Fixed, f: impl Fn(i128, i128) -> Option<i128>) -> Option<Fixed> {
-        let v = f(self.value(), other.value())?;
-        Fixed::of(self.ty, v)
+    /// Truncated to the width and sign-extended past it.
+    pub fn bits(self) -> u128 {
+        (u128::from(self.high) << 64) | u128::from(self.low)
+    }
+
+    /// The value, wherever an `i128` holds it: every width's but a `U128` past `i128::MAX`.
+    pub fn to_i128(self) -> Option<i128> {
+        if self.ty.signed() {
+            Some(self.bits() as i128)
+        } else {
+            i128::try_from(self.bits()).ok()
+        }
+    }
+
+    /// By value, which for a signed width is not the order of the bits.
+    pub fn value_cmp(self, other: Fixed) -> Ordering {
+        if self.ty.signed() {
+            (self.bits() as i128).cmp(&(other.bits() as i128))
+        } else {
+            self.bits().cmp(&other.bits())
+        }
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.bits() == 0
+    }
+
+    /// The bits with nothing above this type's width, for shifts, masks and rotates.
+    pub fn raw(self) -> u128 {
+        if self.ty.bits() == 128 {
+            self.bits()
+        } else {
+            self.bits() & (u128::MAX >> (128 - self.ty.bits()))
+        }
+    }
+
+    /// Exact at this width: a signed width computes in `i128` and an unsigned one in `u128`, each
+    /// wide enough for any two narrower operands, and a result outside the width is `None`.
+    pub fn checked(self, other: Fixed, op: FixedOp) -> Option<Fixed> {
+        if self.ty.signed() {
+            let (a, b) = (self.bits() as i128, other.bits() as i128);
+            let v = match op {
+                FixedOp::Add => a.checked_add(b),
+                FixedOp::Sub => a.checked_sub(b),
+                FixedOp::Mul => a.checked_mul(b),
+                FixedOp::Div => a.checked_div(b),
+                FixedOp::Rem => a.checked_rem(b),
+            }?;
+            Fixed::of(self.ty, v)
+        } else {
+            let (a, b) = (self.bits(), other.bits());
+            let v = match op {
+                FixedOp::Add => a.checked_add(b),
+                FixedOp::Sub => a.checked_sub(b),
+                FixedOp::Mul => a.checked_mul(b),
+                FixedOp::Div => a.checked_div(b),
+                FixedOp::Rem => a.checked_rem(b),
+            }?;
+            Fixed::of_unsigned(self.ty, v)
+        }
+    }
+
+    /// `None` for a signed width's least value, and for any unsigned value but zero.
+    pub fn checked_neg(self) -> Option<Fixed> {
+        if self.ty.signed() {
+            Fixed::of(self.ty, (self.bits() as i128).checked_neg()?)
+        } else {
+            self.is_zero().then_some(self)
+        }
+    }
+
+    /// `>>`: arithmetic for a signed width, so the sign fills; logical otherwise.
+    pub fn shifted_right(self, n: u32) -> Fixed {
+        if self.ty.signed() {
+            Fixed::new(self.ty, ((self.bits() as i128) >> n) as u128)
+        } else {
+            Fixed::new(self.ty, self.raw() >> n)
+        }
     }
 
     /// `f` over the bits, cut to the width; two's complement makes this right when signed too.
     pub fn wrapping(self, other: Fixed, f: impl Fn(u128, u128) -> u128) -> Fixed {
-        Fixed::new(self.ty, f(self.raw() as u128, other.raw() as u128) as u64)
+        Fixed::new(self.ty, f(self.raw(), other.raw()))
     }
+}
+
+/// The arithmetic `Fixed::checked` does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FixedOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
 }
 
 impl fmt::Display for Fixed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.value())
+        if self.ty.signed() {
+            write!(f, "{}", self.bits() as i128)
+        } else {
+            write!(f, "{}", self.bits())
+        }
     }
 }
 
@@ -741,9 +823,7 @@ impl Ord for Value {
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
             // By value rather than by bits, so `I8` orders `-1` below `0`.
-            (Value::Fixed(x), Value::Fixed(y)) => {
-                x.ty.cmp(&y.ty).then_with(|| x.value().cmp(&y.value()))
-            }
+            (Value::Fixed(x), Value::Fixed(y)) => x.ty.cmp(&y.ty).then_with(|| x.value_cmp(*y)),
             (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
             // By numeric value, so `1.50m` and `1.5m` are one key.
             (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),

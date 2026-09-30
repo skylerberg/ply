@@ -1162,8 +1162,19 @@ fn read_const(c: At<'_>) -> Result<Value, decode::Error> {
             // The bits are the `Int` the width reads, so a negative one is the same pattern.
             Value::Fixed(ply_eval::Fixed::new(
                 *ty,
-                fixed.field("bits")?.int()? as u64,
+                fixed.field("bits")?.int()? as u128,
             ))
+        }
+        // A 128-bit literal, as the two words an `Int` each holds.
+        "ConstWide" => {
+            let wide = c.arg(0)?;
+            let width = wide.field("width")?;
+            let ty = ply_eval::INT_TYPES
+                .get(width.number::<usize>()?)
+                .ok_or_else(|| width.error("a width the runtime does not number"))?;
+            let high = u128::from(wide.field("high")?.int()? as u64);
+            let low = u128::from(wide.field("low")?.int()? as u64);
+            Value::Fixed(ply_eval::Fixed::new(*ty, high << 64 | low))
         }
         "ConstFloat" => {
             let text = c.arg(0)?;
