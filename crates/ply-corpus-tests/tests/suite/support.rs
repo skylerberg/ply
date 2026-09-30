@@ -1,8 +1,10 @@
-//! Driving the corpus program the way `benches/corpus.sh` does: `ply run` over the package, with
-//! the grants it runs under and the working directory as its `work` root.
+//! Driving the corpus program the way `benches/corpus.sh` does: `ply run` over the artifact
+//! `benches/corpus-program.sh` builds from the package, with the grants it runs under and the
+//! working directory as its `work` root.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 pub fn ply() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ply")
@@ -24,7 +26,47 @@ pub fn repo() -> PathBuf {
 /// What `ply` and the program read from the environment, and nothing else from the test's.
 const INHERITED: &[&str] = &["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "NEXTEST"];
 
-/// `ply run` over the corpus package in `dir`, with the grants the program's own subcommands are
+fn hermetic(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    for key in INHERITED {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd
+}
+
+/// The corpus program as `benches/corpus-program.sh` builds it for these sources and this `ply`:
+/// built once across every test process, since each runs on its own, by whichever takes the lock
+/// first, and found by the rest. CI's suite action builds it before any test runs.
+fn program() -> &'static Path {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/corpus-program");
+        std::fs::create_dir_all(&dir).expect("the corpus program's directory is made");
+        let lock = std::fs::File::create(dir.join(".lock")).expect("the build lock opens");
+        lock.lock().expect("the build lock is taken");
+        let out = hermetic(Path::new("bash"))
+            .arg(repo().join("benches/corpus-program.sh"))
+            .arg(ply())
+            .arg(&dir)
+            .output()
+            .expect("the build starts");
+        assert!(
+            out.status.success(),
+            "the corpus program did not build:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        PathBuf::from(
+            String::from_utf8(out.stdout)
+                .expect("the artifact's path is text")
+                .trim(),
+        )
+    })
+}
+
+/// `ply run` over the corpus program in `dir`, with the grants the program's own subcommands are
 /// run with, and `args` after `--`.
 pub fn corpus(dir: &Path, args: &[&str]) -> Output {
     run(dir, &[], args)
@@ -33,14 +75,8 @@ pub fn corpus(dir: &Path, args: &[&str]) -> Output {
 /// The product itself in `dir`, as the corpus drives it: `ply` with `args`, and the same few
 /// variables from the environment.
 pub fn product(dir: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new(ply());
-    cmd.env_clear();
-    for key in INHERITED {
-        if let Some(value) = std::env::var_os(key) {
-            cmd.env(key, value);
-        }
-    }
-    cmd.args(args)
+    hermetic(&ply())
+        .args(args)
         .current_dir(dir)
         .output()
         .expect("`ply` starts")
@@ -94,16 +130,49 @@ pub fn delegated(dir: &Path, args: &[&str]) -> Output {
     )
 }
 
+/// The same, with the floor a served subcommand compares the desk with built and bound as
+/// `benches/corpus.sh` binds it, and named in `CORPUS_BOUND` as that script names it.
+pub fn served(dir: &Path, args: &[&str]) -> Output {
+    run(
+        dir,
+        &[
+            format!("--exec=http_floor={}", floor().display()),
+            "--set".to_string(),
+            "CORPUS_BOUND=http_floor".to_string(),
+        ],
+        args,
+    )
+}
+
+/// `benches/http-floor/floor.c`, compiled once a test process beside the `ply` the tests run.
+fn floor() -> &'static Path {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let built = ply().with_file_name("http-floor");
+        // Renamed into place, so another test process never starts a half-written binary.
+        let staged = built.with_file_name(format!("http-floor.{}", std::process::id()));
+        let out = Command::new("cc")
+            .arg("-O2")
+            .arg("-o")
+            .arg(&staged)
+            .arg(repo().join("benches/http-floor/floor.c"))
+            .arg("-lpthread")
+            .output()
+            .expect("`cc` starts");
+        assert!(
+            out.status.success(),
+            "compiling the floor failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::rename(&staged, &built).expect("the floor moves into place");
+        built
+    })
+}
+
 fn run(dir: &Path, grants: &[String], args: &[&str]) -> Output {
-    let mut cmd = Command::new(ply());
-    cmd.env_clear();
-    for key in INHERITED {
-        if let Some(value) = std::env::var_os(key) {
-            cmd.env(key, value);
-        }
-    }
-    cmd.arg("run")
-        .arg(repo().join("crates/ply-corpus/ply"))
+    hermetic(&ply())
+        .arg("run")
+        .arg(program())
         .args(["--host", "--allow", "machine", "--allow", "claims"])
         .arg(format!("--exec=ply={}", ply().display()))
         .args(grants)

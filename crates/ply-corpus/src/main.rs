@@ -51,213 +51,6 @@ fn simulate(args: SimArgs) -> Result<()> {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ServeArgs {
-    /// The repository root, where `examples/hello.ply` is read from.
-    repo: PathBuf,
-    /// The `ply` binary the load table drives. Defaults to this binary's sibling.
-    ply: Option<PathBuf>,
-    /// Requests per ladder rung. Each is one connection.
-    ladder_requests: u32,
-    /// Repeats per rung; the fastest is reported.
-    repeats: usize,
-    /// Requests per load point.
-    requests: u32,
-    /// Simultaneous client connections to sweep.
-    concurrency: Vec<u32>,
-    /// Filler header lines the client's request carries, per load point.
-    load_headers: Vec<usize>,
-    /// Drop the per-request ladder, which is the slow half.
-    no_ladder: bool,
-    /// Drop the load table, which is the half that needs a built `ply`.
-    no_load: bool,
-    /// Also measure the endpoint with `fold`-based scans instead of the byte builtins.
-    baseline: bool,
-    json: bool,
-}
-
-fn serve(args: ServeArgs) -> Result<()> {
-    let parsers: &[ply_corpus::serve::Parser] = if args.baseline {
-        &[
-            ply_corpus::serve::Parser::W1Folds,
-            ply_corpus::serve::Parser::Native,
-        ]
-    } else {
-        &[ply_corpus::serve::Parser::Native]
-    };
-
-    let mut ladders = Vec::new();
-    let mut heads = Vec::new();
-    if !args.no_ladder {
-        for &parser in parsers {
-            ladders.push(ply_corpus::serve::ladder(
-                &args.repo,
-                parser,
-                args.ladder_requests,
-                args.repeats,
-            )?);
-            heads.extend(ply_corpus::serve::head_sweep(
-                &args.repo,
-                parser,
-                args.ladder_requests,
-                args.repeats,
-            )?);
-        }
-    }
-
-    let mut load = Vec::new();
-    if !args.no_load {
-        let ply = match &args.ply {
-            Some(path) => path.clone(),
-            None => ply_corpus::serve::ply_binary()?,
-        };
-        for &headers in &args.load_headers {
-            for &parser in parsers {
-                // The sequential endpoint serves one connection at a time, so only concurrency 1.
-                load.push(ply_corpus::serve::load(
-                    &args.repo,
-                    &ply,
-                    ply_corpus::serve::Shape::Sequential,
-                    parser,
-                    headers,
-                    1,
-                    args.requests,
-                )?);
-                for &concurrency in &args.concurrency {
-                    load.push(ply_corpus::serve::load(
-                        &args.repo,
-                        &ply,
-                        ply_corpus::serve::Shape::Concurrent,
-                        parser,
-                        headers,
-                        concurrency,
-                        args.requests,
-                    )?);
-                }
-            }
-            for &concurrency in &args.concurrency {
-                load.push(ply_corpus::serve::load_floor(
-                    headers,
-                    concurrency,
-                    args.requests,
-                )?);
-            }
-        }
-    }
-
-    let out = ply_corpus::serve::Measurements {
-        ladders,
-        heads,
-        load,
-    };
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        print!("{}", ply_corpus::serve::render(&out));
-    }
-    Ok(())
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct W3Args {
-    /// The repository root, where `examples/desk.ply` is read from.
-    repo: PathBuf,
-    /// The `ply` binary the load tables drive. Defaults to this binary's sibling.
-    ply: Option<PathBuf>,
-    /// Simultaneous client connections to sweep.
-    concurrency: Vec<u32>,
-    /// Requests one connection carries in the throughput sweep.
-    per_conn: u32,
-    /// Requests per point in the throughput sweep, held constant across concurrencies.
-    requests_per_point: u32,
-    /// Requests per point in the keep-alive and TLS ladders.
-    ladder_requests: u32,
-    /// Client threads in the keep-alive and TLS ladders.
-    ladder_concurrency: u32,
-    /// Requests per in-process point, for the per-route and shape tables.
-    requests: u32,
-    /// Repeats per in-process point; the fastest is reported.
-    repeats: usize,
-    /// Also serve the task-per-connection variant.
-    concurrent: bool,
-    /// Also re-take W2's single-endpoint load number on this machine.
-    w2_baseline: bool,
-    /// Sections to drop, for a run pointed at one question.
-    no_load: bool,
-    no_shape: bool,
-    no_tls: bool,
-    json: bool,
-}
-
-fn w3(args: W3Args) -> Result<()> {
-    use ply_corpus::w3;
-
-    let variant = if args.concurrent {
-        w3::Variant::TaskPerConn
-    } else {
-        w3::Variant::Sequential
-    };
-    let mut out = w3::Measurements {
-        aliases: Some(w3::aliases(&args.repo)?),
-        ..w3::Measurements::default()
-    };
-    if !args.no_shape {
-        out.stages = w3::stages(&args.repo, args.requests, args.repeats)?;
-        out.per_route = w3::per_route(&args.repo, args.requests, args.repeats)?;
-        out.shape = w3::shape(&args.repo, args.requests, args.repeats)?;
-    }
-    if !args.no_load {
-        let ply = match &args.ply {
-            Some(path) => path.clone(),
-            None => ply_corpus::serve::ply_binary()?,
-        };
-        out.routes = w3::routes(
-            &args.repo,
-            &ply,
-            variant,
-            &args.concurrency,
-            args.per_conn,
-            args.requests_per_point,
-        )?;
-        out.keep_alive = w3::keep_alive(
-            &args.repo,
-            &ply,
-            variant,
-            args.ladder_concurrency,
-            args.ladder_requests,
-        )?;
-        if !args.no_tls {
-            out.tls = w3::tls(
-                &args.repo,
-                &ply,
-                variant,
-                args.ladder_concurrency,
-                args.ladder_requests,
-            )?;
-        }
-        if args.w2_baseline {
-            for &concurrency in &args.concurrency {
-                out.w2_baseline.push(ply_corpus::serve::load(
-                    &args.repo,
-                    &ply,
-                    ply_corpus::serve::Shape::Concurrent,
-                    ply_corpus::serve::Parser::Native,
-                    0,
-                    concurrency,
-                    2000,
-                )?);
-            }
-        }
-    }
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        print!("{}", w3::render(&out));
-    }
-    Ok(())
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct W4Args {
     /// The repository root, where `examples/desk.ply` is read from for `crud`.
     repo: PathBuf,
@@ -322,7 +115,7 @@ fn w4(args: W4Args) -> Result<()> {
     if !args.no_load {
         let ply = match &args.ply {
             Some(path) => path.clone(),
-            None => ply_corpus::serve::ply_binary()?,
+            None => ply_corpus::ply_binary()?,
         };
         out.crud = w4::crud(
             &args.repo,
@@ -382,7 +175,7 @@ fn w5(args: W5Args) -> Result<()> {
 
     let ply = match &args.ply {
         Some(path) => path.clone(),
-        None => ply_corpus::serve::ply_binary()?,
+        None => ply_corpus::ply_binary()?,
     };
     let mut out = w5::Measurements::default();
     if !args.no_events {
@@ -413,9 +206,9 @@ fn w5(args: W5Args) -> Result<()> {
                 url,
                 &[w5::Stack::Twin, w5::Stack::Postgres, w5::Stack::PostgresTls],
                 if args.concurrent {
-                    ply_corpus::w3::Variant::TaskPerConn
+                    ply_corpus::w4::Variant::TaskPerConn
                 } else {
-                    ply_corpus::w3::Variant::Sequential
+                    ply_corpus::w4::Variant::Sequential
                 },
                 &[
                     w5::Sinking::Off,
@@ -543,12 +336,12 @@ fn w6_ladder(args: W6LadderArgs) -> Result<()> {
     }
     let (variant, other) = match args.accept.as_str() {
         "sequential" => (
-            ply_corpus::w3::Variant::Sequential,
-            ply_corpus::w3::Variant::TaskPerConn,
+            ply_corpus::w4::Variant::Sequential,
+            ply_corpus::w4::Variant::TaskPerConn,
         ),
         "task-per-conn" => (
-            ply_corpus::w3::Variant::TaskPerConn,
-            ply_corpus::w3::Variant::Sequential,
+            ply_corpus::w4::Variant::TaskPerConn,
+            ply_corpus::w4::Variant::Sequential,
         ),
         other => anyhow::bail!("`--accept {other}`: the loops are sequential and task-per-conn"),
     };
@@ -730,8 +523,6 @@ fn run(plan: serde_json::Value) -> Result<()> {
     match command {
         "sim" => simulate(serde_json::from_value(args)?),
         "prove" => prove(serde_json::from_value(args)?),
-        "serve" => serve(serde_json::from_value(args)?),
-        "w3" => w3(serde_json::from_value(args)?),
         "w4" => w4(serde_json::from_value(args)?),
         "w5" => w5(serde_json::from_value(args)?),
         "w6" => w6(serde_json::from_value(args)?),
