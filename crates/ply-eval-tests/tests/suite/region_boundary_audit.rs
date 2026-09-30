@@ -63,9 +63,15 @@ fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
 
 fn resume_it(s: Saved) -> Int = match s { Just(k) -> k(true), Nothing -> 0 }
 
+pub fn resumed(n: Int) -> Int = n + resume_it(parked())
+
 fn identity(n: Int) -> Int = n
 
 test "the parked continuation still reads its region's cell" {
+  assert_eq(resume_it(parked()), 41)
+}
+
+test "a later entry resumes the continuation it parked itself" {
   assert_eq(resume_it(parked()), 41)
 }
 "#;
@@ -124,6 +130,71 @@ fn the_parked_continuation_runs_on_the_tier_and_reads_its_regions_cell() {
         .expect("the resumed body reads 41 from the closed region's cell");
 
     assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+}
+
+/// `parked` is pure and nullary, so the memo is offered its answer; a `k` it kept would name a
+/// body only the first entry held, and the second entry would resume nothing.
+#[test]
+fn two_entries_on_one_tier_each_resume_the_continuation_they_parked() {
+    let compiled = Compiled::new(PARKED);
+    let (mut machine, tier) = compiled.machine_and_tier();
+
+    for name in [
+        "the parked continuation still reads its region's cell",
+        "a later entry resumes the continuation it parked itself",
+    ] {
+        machine
+            .eval_test(compiled.index_of(name))
+            .unwrap_or_else(|d| panic!("{name}: {d:#?}"));
+    }
+
+    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+}
+
+/// The seam offers the memo a constant's answer before it declines one that holds a closure, and
+/// a `k` kept there would reach the next entry through the constant's every call.
+#[test]
+fn a_constant_the_seam_declines_keeps_no_continuation_for_the_next_entry() {
+    let compiled = Compiled::new(PARKED);
+    let (mut machine, tier) = compiled.machine_and_tier();
+
+    machine
+        .call("m.parked", vec![], Span::DUMMY)
+        .expect_err("a continuation does not cross out of the tier");
+    assert_eq!(tier.declines().answer, 1, "{:?}", tier.declines());
+
+    machine
+        .eval_test(compiled.index_of("the parked continuation still reads its region's cell"))
+        .expect("the test parks and resumes a continuation of its own");
+}
+
+#[test]
+fn the_constant_memo_keeps_no_answer_that_holds_a_continuation() {
+    let native = Compiled::new(PARKED).native();
+    let parked = native
+        .constant_index("m.parked")
+        .expect("`parked` is pure and nullary, so the memo is offered its answer");
+    let entry = native.entry("m.resumed").expect("`resumed` compiled");
+    let tables = native.tables().clone();
+    let mut ctx = native.context();
+
+    for n in 0..2 {
+        ctx.begin(10_000);
+        let arg = ctx.heap.to_word(&tables.layouts, &Value::Int(n));
+        let answer = unsafe { entry(&mut ctx, [arg].as_ptr()) };
+        assert_eq!(ctx.failed, 0, "entry {n}: {:?}", ctx.diagnostic);
+        assert_eq!(
+            ply_codegen::heap::Heap::to_value(&tables.layouts, answer),
+            Value::Int(n + 41),
+            "entry {n}"
+        );
+        ctx.end();
+        assert_eq!(
+            tables.memoized(parked),
+            None,
+            "entry {n} left `parked`'s continuation for the next"
+        );
+    }
 }
 
 #[test]
