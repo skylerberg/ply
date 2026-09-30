@@ -334,6 +334,7 @@ test/nondet "arithmetic on a host answer" { assert_eq(net.send[socket](1) + 1, 2
     );
 }
 
+/// No operation may declare a `Task`, so the fabricated handle arrives where an `Int` is declared.
 #[test]
 fn a_fabricated_task_handle_from_a_host_answer_is_refused() {
     struct Fake;
@@ -350,12 +351,12 @@ fn a_fabricated_task_handle_from_a_host_answer_is_refused() {
         "t",
         r#"
 nondet effect net {
-  write send[s](payload: Int) -> Task<Int>
+  write send[s](payload: Int) -> Int
 }
 
 test/nondet "a handle from nowhere" {
   let real = task.spawn(|| 1);
-  assert_eq(task.join(net.send[socket](1)) + task.join(real), 2)
+  assert_eq(net.send[socket](1) + task.join(real), 2)
 }
 "#,
     );
