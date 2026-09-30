@@ -42,7 +42,7 @@ pub struct Declines {
     pub reentered: u64,
     /// A builtin touched cells, so the compile-time refusal of `cell_get`/`cell_set` has a hole.
     pub touched_cells: u64,
-    /// The answer held a closure, cell, task, continuation or secret, which cannot cross out.
+    /// The answer held a closure or a secret, which cannot cross out; a handle raises `E0449`.
     pub answer: u64,
 }
 
@@ -475,7 +475,20 @@ impl Bodies {
         };
         ctx.end();
         drop(ctx);
+        // Covers every handle `escape` refuses; a closure or secret that holds none declines.
         if walked.handle {
+            let boundary = ply_eval::Boundary::EntryAnswer {
+                name: name.as_str(),
+            };
+            let span = self
+                .unit
+                .source
+                .span_of(name.as_str())
+                .unwrap_or(ply_eval::Span::DUMMY);
+            if let Err(refused) = ply_eval::escape::check(&boundary, &value, span) {
+                self.entered.set(self.entered.get() + 1);
+                return Run::Raised(refused);
+            }
             return self.decline(|d| d.answer += 1);
         }
         if let Some(kept) = kept {
