@@ -24,6 +24,8 @@ if [ ! -f "$artifact" ]; then
   # Renamed into place, so a run never starts a half-written artifact.
   staged="$out/.corpus-$key.$$.plyx"
   trap 'rm -f "$staged"' EXIT
+  # The key already names these sources; a lock an earlier build left would only pin stale ones.
+  rm -f "$root/crates/ply-corpus/ply/ply.lock"
   "$ply" build "$root/crates/ply-corpus/ply" --entry cmd.main -o "$staged" >&2
   mv -f "$staged" "$artifact"
 fi
