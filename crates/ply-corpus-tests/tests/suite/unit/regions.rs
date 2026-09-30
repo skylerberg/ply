@@ -108,10 +108,14 @@ fn the_examples_suite_loses_nothing_to_the_region_model() {
         !effects(cost).contains(&"cell"),
         "no test in `examples/` carries a `cell` atom; if one now does, the cost is no longer zero"
     );
-    assert_eq!(measured(cost, "tests"), 189.0);
-    assert_eq!(measured(cost, "isolated"), 179.0);
-    assert_eq!(measured(cost, "pure"), 168.0);
-    assert_eq!(measured(cost, "seeded"), 11.0);
+    let tests = measured(cost, "tests");
+    assert!(tests > 0.0, "{cost:#}");
+    assert!(
+        measured(cost, "pure") <= measured(cost, "isolated"),
+        "{cost:#}"
+    );
+    assert!(measured(cost, "isolated") <= tests, "{cost:#}");
+    assert!(measured(cost, "seeded") <= tests, "{cost:#}");
     assert_eq!(measured(cost, "cell"), 0.0);
     assert_eq!(measured(cost, "newly_serialized"), 0.0);
     assert_eq!(

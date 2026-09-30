@@ -1,4 +1,4 @@
-use ply_corpus::w4::{Program, served_args};
+use ply_corpus::w4::{Program, Variant, served_args};
 
 #[test]
 fn the_bench_program_checks() {
@@ -53,11 +53,7 @@ fn a_twin_entry_point_reaches_nothing() {
 fn a_served_run_takes_the_flags_the_sections_pass() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let dir = tempfile::tempdir().unwrap();
-    std::fs::copy(
-        root.join("crates/ply-corpus/fixtures/desk-sequential-postgres.ply"),
-        dir.path().join("desk.ply"),
-    )
-    .unwrap();
+    std::fs::copy(root.join("examples/desk.ply"), dir.path().join("desk.ply")).unwrap();
 
     let url = "postgres://nobody@127.0.0.1:1/none";
     let mut args = vec![
@@ -65,7 +61,13 @@ fn a_served_run_takes_the_flags_the_sections_pass() {
         "desk.ply".to_string(),
         "--host".to_string(),
     ];
-    args.extend(served_args(8199, 8, "bench-key", Some(url)));
+    args.extend(served_args(
+        8199,
+        8,
+        "bench-key",
+        Some(url),
+        Variant::TaskPerConn,
+    ));
     args.extend([
         "--trace".to_string(),
         "off".to_string(),
@@ -84,10 +86,16 @@ fn a_served_run_takes_the_flags_the_sections_pass() {
         "`ply hosts` refused the flags a served section passes:\n{stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains(&format!("DESK_DATABASE={url}")),
-        "the setting a served run carries did not reach the listing:\n{stdout}"
-    );
+    for setting in [
+        format!("DESK_DATABASE={url}"),
+        "DESK_STORE=postgres".to_string(),
+        "DESK_ACCEPT=task-per-connection".to_string(),
+    ] {
+        assert!(
+            stdout.contains(&setting),
+            "`{setting}` did not reach the listing:\n{stdout}"
+        );
+    }
     assert!(
         !stderr.contains("unexpected argument"),
         "the CLI does not take a flag the sections pass:\n{stderr}"

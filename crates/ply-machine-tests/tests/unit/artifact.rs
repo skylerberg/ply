@@ -97,6 +97,18 @@ fn the_digest_covers_every_byte_after_it() {
 }
 
 #[test]
+fn the_unit_a_build_embeds_leaves_its_front_where_the_build_filed_it() {
+    let mut built = sample();
+    built.unit = Some(EmbeddedUnit {
+        text: vec![1, 2, 3, 4],
+    });
+    assert_eq!(front_cache(&sample()), front_cache(&built));
+    let mut other = sample();
+    other.closure = vec![("m.ply".to_string(), "fn main() -> Int = 1\n".to_string())];
+    assert_ne!(front_cache(&sample()), front_cache(&other));
+}
+
+#[test]
 fn the_closure_is_in_the_digest() {
     let mut with = sample();
     with.closure = vec![("m.ply".to_string(), "fn main() -> Int = 1\n".to_string())];
