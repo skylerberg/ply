@@ -2342,9 +2342,11 @@ filed by a compiler whose shipped modules differed says so once, as `W0605`.
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
-directory whose name starts with `.`, and one named `target`, are not walked; a
-symlink found while walking is passed over, and one named on the command line is
-an error rather than a file to rewrite.
+file it cannot read or write back is an error too, exiting 2, so `--check`
+never passes over a file it did not read. A directory whose name starts with
+`.`, and one named `target`, are not walked; a symlink found while walking is
+passed over, and one named on the command line is an error rather than a file to
+rewrite.
 
 `ply show NAME` and `ply replace NAME` are the edit loop for one definition: read
 it, rewrite it, and touch nothing else in the file. The replacement is one item
