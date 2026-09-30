@@ -80,7 +80,7 @@ pub use program::{
 pub use rc::Stats as RcStats;
 pub use semantics::strict_binary;
 pub use sim::{
-    Access, Answer, Clock, Domain, Exploration, Handlers, Naive, OpSignature, Plan, Race, RaceSite,
+    Access, Answer, Clock, Cost, Domain, Exploration, Handlers, OpSignature, Plan, Race, RaceSite,
     Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed, SimMode, SimTy, Sleep, StepFootprint, Stream, TaskId,
     Wake,
 };
