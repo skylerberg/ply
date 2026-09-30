@@ -1,8 +1,8 @@
 use ply_eval::{Exploration, Plan, Seed, SimMode};
 use ply_prove::{
-    CaseReport, Certificate, Counterexample, Coverage, Discharge, Evidence, Frame, Gap,
-    MIN_PROPERTY_CASES, Obligation, ObligationKind, ProvePlan, ProveReport, Rule, Tier, Vacuity,
-    VacuityKind, frame_of, interleaving_proves,
+    CaseReport, Certificate, Counterexample, Discharge, Evidence, Frame, Gap, MIN_PROPERTY_CASES,
+    Obligation, ObligationKind, ProvePlan, ProveReport, Rule, Tier, Vacuity, VacuityKind, frame_of,
+    interleaving_proves,
 };
 use ply_span::Span;
 use ply_ty::DefHash;
@@ -154,39 +154,6 @@ fn a_failing_search_never_proves() {
 }
 
 #[test]
-fn a_plan_digest_ignores_the_shrink_budget_and_root_spelling() {
-    let base = ProvePlan::default();
-    let looser = ProvePlan {
-        shrink_budget: base.shrink_budget * 4,
-        ..base.clone()
-    };
-    assert_eq!(base.digest(), looser.digest());
-
-    let respelled = ProvePlan {
-        roots: vec![2, 0, 2, 1],
-        ..base.clone()
-    };
-    let sorted = ProvePlan {
-        roots: vec![0, 1, 2],
-        ..base.clone()
-    };
-    assert_eq!(respelled.digest(), sorted.digest());
-    assert_ne!(base.digest(), sorted.digest());
-
-    let wider = ProvePlan {
-        cases: base.cases * 2,
-        ..base.clone()
-    };
-    assert_ne!(base.digest(), wider.digest());
-
-    let deeper = ProvePlan {
-        prove_budget: base.prove_budget * 2,
-        ..base.clone()
-    };
-    assert_ne!(base.digest(), deeper.digest());
-}
-
-#[test]
 fn a_report_fails_on_a_refutation_or_a_vacuity_and_not_on_a_gap() {
     let obligation = Obligation {
         key: DefHash([0; 32]),
@@ -201,9 +168,7 @@ fn a_report_fails_on_a_refutation_or_a_vacuity_and_not_on_a_gap() {
     };
     let report = |discharge| ProveReport {
         obligations: vec![(obligation.clone(), discharge)],
-        coverage: Coverage::default(),
         plan: ProvePlan::default(),
-        cached: 0,
         duration: Duration::ZERO,
     };
     assert!(

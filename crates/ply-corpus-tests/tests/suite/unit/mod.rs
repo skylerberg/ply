@@ -1,30 +1,21 @@
-//! `ply-corpus`'s unit tests: a module for each harness in `crates/ply-corpus/src`, and `bench`
-//! and `real` for the corpus program's own subcommands, run the way `benches/corpus.sh` runs them.
+//! `ply-corpus`'s tests: the generator's corpora, judged by the product itself; a module for each
+//! subcommand the corpus program runs, driven the way `benches/corpus.sh` drives it; and a module for
+//! each harness still in `crates/ply-corpus/src`.
 
 mod bench;
 mod measure;
 mod payload;
-mod pipeline;
-mod r4;
 mod real;
 mod regions;
-mod rng;
 mod simulate;
 mod w4;
 mod w5;
 mod w6;
 
-use crate::support::generate;
-use ply_corpus::pipeline::{Front, front};
-use ply_corpus::run_on_tier;
-use ply_eval::Plan;
-use ply_store::Store;
+use crate::support::{generate, product, product_document};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
-
-/// Every test the module declares: what a caller with no program means by "run them all".
-fn visible_of(check: &ply_ty::CheckOutput) -> Vec<usize> {
-    (0..check.tests.len()).collect()
-}
 
 #[test]
 fn a_generated_corpus_compiles_and_every_test_passes() {
@@ -46,7 +37,7 @@ fn a_generated_corpus_compiles_and_every_test_passes() {
         ],
     );
 
-    let verified = verify(&root).unwrap();
+    let verified = verify(&root);
     assert_eq!(verified.failed, 0);
     assert_eq!(verified.passed, verified.tests);
     assert!(
@@ -76,9 +67,7 @@ fn several_seeds_all_produce_corpora_that_compile_and_pass() {
                 "2",
             ],
         );
-        let verified = verify(&root)
-            .unwrap_or_else(|e| panic!("seed {seed} produced a corpus that fails: {e:#}"));
-        assert_eq!(verified.failed, 0, "seed {seed}");
+        assert_eq!(verify(&root).failed, 0, "seed {seed}");
     }
 }
 
@@ -103,7 +92,7 @@ fn a_corpus_with_no_effects_still_compiles() {
             "0",
         ],
     );
-    let verified = verify(&root).unwrap();
+    let verified = verify(&root);
     assert_eq!(verified.failed, 0);
     assert_eq!(
         verified.groups, 1,
@@ -132,7 +121,7 @@ fn a_corpus_that_is_all_effects_still_compiles() {
             "1",
         ],
     );
-    assert_eq!(verify(&root).unwrap().failed, 0);
+    assert_eq!(verify(&root).failed, 0);
 }
 
 #[test]
@@ -154,7 +143,7 @@ fn a_single_module_corpus_is_still_a_corpus() {
             "1",
         ],
     );
-    assert_eq!(verify(&root).unwrap().failed, 0);
+    assert_eq!(verify(&root).failed, 0);
 }
 
 /// Four `simulate` tests of three tasks, two steps each, at `density`, over a small corpus.
@@ -188,7 +177,7 @@ fn verify_at(density: &str) -> Verified {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("corpus");
     concurrent(&root, density, "4");
-    verify(&root).unwrap_or_else(|e| panic!("density {density} does not compile: {e:#}"))
+    verify(&root)
 }
 
 #[test]
@@ -211,7 +200,7 @@ fn concurrent_tests_do_not_change_how_the_suite_is_scheduled() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("corpus");
         concurrent(&root, "0.5", "0");
-        verify(&root).unwrap()
+        verify(&root)
     };
     let with_concurrency = verify_at("0.5");
 
@@ -247,66 +236,114 @@ fn specified(root: &Path, fraction: &str, specimens: &str) {
     );
 }
 
-fn front_of(fraction: &str, specimens: &str, dir: &std::path::Path) -> Front {
-    let root = dir.join("corpus");
-    specified(&root, fraction, specimens);
-    front(&root).unwrap()
-}
-
 #[test]
 fn a_specified_corpus_compiles_and_every_test_still_passes() {
     for (fraction, specimens) in [("0", "3"), ("0.5", "3"), ("1", "0"), ("1", "4")] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("corpus");
         specified(&root, fraction, specimens);
-        let verified =
-            verify(&root).unwrap_or_else(|e| panic!("density {fraction}/{specimens} fails: {e:#}"));
-        assert_eq!(verified.failed, 0);
+        let verified = verify(&root);
+        assert_eq!(verified.failed, 0, "density {fraction}/{specimens}");
         assert_eq!(verified.passed, verified.tests);
     }
+}
+
+/// `ply <command> . --json` over a corpus, as the document it wrote.
+fn reported(root: &Path, command: &str) -> Value {
+    let out = product(root, &[command, ".", "--json", "--color", "never"]);
+    assert!(
+        out.status.success(),
+        "`ply {command}` failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    product_document(&out)
+}
+
+/// A specified corpus at `fraction` with no specimens, generated under `dir`, as `ply` reports it.
+fn specified_at(fraction: &str, dir: &Path, command: &str) -> Value {
+    let root = dir.join("corpus");
+    specified(&root, fraction, "0");
+    reported(&root, command)
+}
+
+fn hashes_by_name(report: &Value) -> BTreeMap<String, Value> {
+    report["definitions"]
+        .as_array()
+        .expect("definitions is an array")
+        .iter()
+        .map(|d| {
+            (
+                d["name"].as_str().unwrap_or("").to_string(),
+                d["hash"].clone(),
+            )
+        })
+        .collect()
 }
 
 #[test]
 fn raising_the_spec_density_changes_no_definition_hash() {
     let bare = tempfile::tempdir().unwrap();
     let specified = tempfile::tempdir().unwrap();
-    let bare = front_of("0", "0", bare.path());
-    let specified = front_of("1", "0", specified.path());
+    let bare = specified_at("0", bare.path(), "hash");
+    let specified = specified_at("1", specified.path(), "hash");
 
-    assert_eq!(bare.hashes.defs.len(), specified.hashes.defs.len());
-    for (name, hash) in &bare.hashes.defs {
+    let (bare_defs, specified_defs) = (hashes_by_name(&bare), hashes_by_name(&specified));
+    assert_eq!(bare_defs.len(), specified_defs.len());
+    for (name, hash) in &bare_defs {
         assert_eq!(
-            specified.hashes.defs.get(name),
+            specified_defs.get(name),
             Some(hash),
             "`{name}` moved when a clause was attached to it"
         );
     }
-    assert_eq!(bare.hashes.tests, specified.hashes.tests);
+    let tests = |r: &Value| -> Vec<Value> {
+        r["tests"]
+            .as_array()
+            .expect("tests is an array")
+            .iter()
+            .map(|t| t["hash"].clone())
+            .collect()
+    };
+    assert_eq!(tests(&bare), tests(&specified));
 }
 
 #[test]
 fn attaching_a_spec_changes_no_footprint_and_no_concurrency_group() {
     let bare = tempfile::tempdir().unwrap();
     let specified = tempfile::tempdir().unwrap();
-    let bare = front_of("0", "0", bare.path());
-    let specified = front_of("1", "0", specified.path());
+    let bare = specified_at("0", bare.path(), "check");
+    let specified = specified_at("1", specified.path(), "check");
 
-    for (name, def) in &bare.check.defs {
-        let other = specified
-            .check
-            .defs
-            .get(name)
-            .expect("the same definitions");
+    let footprints = |r: &Value| -> BTreeMap<String, Value> {
+        r["definitions"]
+            .as_array()
+            .expect("definitions is an array")
+            .iter()
+            .map(|d| {
+                (
+                    d["name"].as_str().unwrap_or("").to_string(),
+                    d["footprint"].clone(),
+                )
+            })
+            .collect()
+    };
+    let (bare_defs, specified_defs) = (footprints(&bare), footprints(&specified));
+    for (name, footprint) in &bare_defs {
         assert_eq!(
-            def.footprint.to_string(),
-            other.footprint.to_string(),
+            specified_defs.get(name),
+            Some(footprint),
             "`{name}`'s footprint moved when a clause was attached"
         );
     }
-    for (a, b) in bare.check.tests.iter().zip(&specified.check.tests) {
-        assert_eq!(a.footprint.to_string(), b.footprint.to_string());
-        assert_eq!(a.nondet, b.nondet);
-    }
+    let tests = |r: &Value| -> Vec<(Value, Value)> {
+        r["tests"]
+            .as_array()
+            .expect("tests is an array")
+            .iter()
+            .map(|t| (t["footprint"].clone(), t["nondet"].clone()))
+            .collect()
+    };
+    assert_eq!(tests(&bare), tests(&specified));
 }
 
 #[test]
@@ -314,7 +351,7 @@ fn the_manifest_reports_the_obligations_the_corpus_actually_carries() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("corpus");
     specified(&root, "0.5", "3");
-    let manifest: serde_json::Value =
+    let manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(root.join("corpus.json")).unwrap()).unwrap();
     let specs = &manifest["specs"];
 
@@ -340,56 +377,41 @@ fn the_manifest_reports_the_obligations_the_corpus_actually_carries() {
 
 #[derive(Clone, Debug)]
 struct Verified {
-    tests: usize,
-    passed: usize,
-    failed: usize,
+    tests: u64,
+    passed: u64,
+    failed: u64,
     groups: usize,
-    /// Tests whose footprint carries `sim.read`, so their result depends on a seed.
+    /// Tests the product says are handed a seed, so their result depends on one.
     seeded: usize,
 }
 
-/// Compiles and runs a corpus with the real crates. It lives here rather than in the library
-/// because nothing but these tests asked for it, and a `select` the library no longer makes is a
-/// `select` the tests should own until the decision moves to the corpus's own program.
-fn verify(root: &Path) -> anyhow::Result<Verified> {
-    let front = front(root)?;
-    let mut store = Store::open(root)?;
-    store.clear()?;
-
-    let selection = ply_test::fresh(&front.check, &visible_of(&front.check), &Plan::default());
-    let report = run_on_tier(
-        &front,
-        &selection,
-        &mut store,
-        ply_test::Search::of(&selection),
-        ply_test::Hosting::hermetic(),
+/// A corpus compiled and every one of its tests run by the product, nothing read from a cache, as
+/// the report it wrote. A failure here is the reference evaluator disagreeing with the runtime.
+fn verify(root: &Path) -> Verified {
+    let out = product(
+        root,
+        &["test", ".", "--json", "--no-cache", "--color", "never"],
     );
-
-    if report.failed > 0 {
-        let shown: Vec<String> = report
-            .failures
+    let report = product_document(&out);
+    assert!(
+        out.status.success(),
+        "the generated tests failed — the reference evaluator disagrees with the runtime:\n{:#}",
+        report["failures"]
+    );
+    let count = |v: &Value| v.as_u64().unwrap_or_else(|| panic!("not a count: {v}"));
+    Verified {
+        tests: count(&report["selection"]["total"]),
+        passed: count(&report["summary"]["passed"]),
+        failed: count(&report["summary"]["failed"]),
+        groups: report["selection"]["groups"]
+            .as_array()
+            .expect("groups is an array")
+            .len(),
+        seeded: report["selection"]["tests"]
+            .as_array()
+            .expect("tests is an array")
             .iter()
-            .take(3)
-            .map(|f| format!("{}: {}", f.key, f.diagnostic.message))
-            .collect();
-        panic!(
-            "{} of {} generated tests failed — the reference evaluator disagrees with `ply-eval`:\n  {}",
-            report.failed,
-            selection.total,
-            shown.join("\n  ")
-        );
-    }
-
-    Ok(Verified {
-        tests: front.check.tests.len(),
-        passed: report.passed,
-        failed: report.failed,
-        groups: selection.groups.len(),
-        seeded: front
-            .check
-            .tests
-            .iter()
-            .filter(|t| ply_test::is_seeded(&t.footprint))
+            .filter(|t| t["seeded"].as_bool() == Some(true))
             .count(),
-    })
+    }
 }

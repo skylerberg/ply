@@ -371,11 +371,13 @@ where
     // share, the roots a seeded test owes, the reason for a nondet one — is the program's.
     // Nothing is known about this program yet, so every test the run reports on runs, and the
     // classes are one: a mutant's verdict is behaviour, and a class is only a way to overlap
-    // behaviour that does not conflict. The reasons stay the program's, with `cached` read as `new`.
+    // behaviour that does not conflict. Nothing it proves is filed, since the keys the program named
+    // are the unmutated tests'. The reasons stay the program's, with `cached` read as `new`.
     let mut fresh = choice.clone();
     fresh.runs = plan.visible.clone();
     fresh.groups = vec![plan.visible.clone()];
     fresh.narrowed.clear();
+    fresh.filed.clear();
     fresh.reasons = fresh
         .reasons
         .iter()

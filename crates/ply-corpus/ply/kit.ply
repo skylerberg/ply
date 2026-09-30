@@ -8,17 +8,18 @@
 // child starts in: the repository's files under `Kit.repo`, and what a run makes under
 // `Kit.scratch`.
 
+import report
+import report (Row, Criterion, Measurement, Pass, Fail, Holds, holding, number, row)
 import spine
 import spine (under)
 import stats
-import gates (Figure, Verdict, Pass, Fail, figure)
 import std.certgen
 import std.certgen (certgen)
 import std.config (config)
 import std.fs (fs)
 import std.http
 import std.json
-import std.json (Json, Object, Array, Number, Str)
+import std.json (Json, Object, Number, Str, Null)
 import std.net (net)
 import std.process
 import std.process (process, Finished, Ended, Exited, Signalled)
@@ -185,6 +186,28 @@ pub fn stop_text(s: Stop) -> String =
     Killed -> "was still running when the drain ran out, and was killed",
   }
 
+// How a server stopped, as numbers: whether it had to be killed, and the code it exited with or
+// the signal that ended it.
+pub fn stop_measurements(s: Stop) -> List<Measurement> =
+  match s {
+    Stopped(Exited(code)) -> [number("killed", 0, ""), number("exit_code", code, "")],
+    Stopped(Signalled(signal)) -> [number("killed", 0, ""), number("signal", signal, "")],
+    Killed -> [number("killed", 1, "")],
+  }
+
+// A server written in the language drains on `SIGTERM` and exits 0 within the drain.
+pub fn drained() -> Criterion =
+  Holds("drains on SIGTERM and exits 0 within the drain", |ms: List<Measurement>|
+    if report::value_of(ms, "exit_code") == Some(0m) { Pass } else { Fail(ms) })
+
+// A floor has no drain: it may end however `SIGTERM` ends it, as long as it was not killed.
+pub fn ended() -> Criterion =
+  Holds("ends on SIGTERM without being killed", |ms: List<Measurement>|
+    if report::value_of(ms, "killed") == Some(0m) { Pass } else { Fail(ms) })
+
+pub fn stop_row(name: String, s: Stop, c: Criterion) -> Row =
+  { ..row(name ++ " stops", c, stop_measurements(s)), detail: Str(stop_text(s)) }
+
 pub type Served<a> = { value: a, stop: Stop }
 
 // `body` over a server, which is stopped whatever `body` answers.
@@ -344,49 +367,69 @@ pub fn all_of<a>(results: List<Result<a, String>>) -> Result<List<a>, String> =
       Ok(xs) -> match r { Err(why) -> Err(why), Ok(x) -> Ok(push(xs, x)) },
     })
 
-// Every request answered with `status` and nothing failed: a partial answer is a different
-// measurement, not a slower server.
-pub fn complete(s: Sample, requests: Int, status: Int) -> Verdict =
-  if len(s.failures) > 0 {
-    Fail(
-      int_to_string(len(s.failures)) ++ " exchange(s) failed; the first: "
-        ++ (match list_at(s.failures, 0) { Some(why) -> why, None -> "" }),
-    )
-  } else if s.answered != requests {
-    Fail(
-      int_to_string(s.answered) ++ " of " ++ int_to_string(requests) ++ " requests were answered",
-    )
-  } else {
-    match filter(s.statuses, |one: { status: Int, count: Int }| one.status != status) {
-      [] -> Pass,
-      [other, ..] ->
-        Fail(int_to_string(other.count) ++ " answered " ++ int_to_string(other.status)),
-    }
-  }
+pub fn asked(l: Load) -> Int = l.connections * l.per_conn
 
-// The numbers a served row is read off.
-pub fn figures_of(s: Sample) -> List<Figure> =
+fn right(status: Int) -> String = "answered_" ++ int_to_string(status)
+
+fn answered_with(s: Sample, status: Int) -> Int =
+  fold(s.statuses, 0, |n: Int, one: { status: Int, count: Int }|
+    if one.status == status { n + one.count } else { n })
+
+// Every request answered with `status` and no exchange failed: a partial answer is a different
+// measurement, not a slower server.
+pub fn complete(status: Int) -> Criterion =
+  holding(
+    "every request answered " ++ int_to_string(status) ++ ", none failed",
+    ["asked", "answered", right(status), "failed"],
+    |vs: List<Decimal>|
+      match vs {
+        [wanted, answered, rightly, failed] ->
+          answered == wanted && rightly == wanted && failed == 0m,
+        _ -> false,
+      },
+  )
+
+// An empty sample has no percentile, and its row leaves it out rather than reading a zero.
+fn percentile_of(name: String, xs: List<Int>, p: Int) -> List<Measurement> =
+  match stats::percentile(xs, p) { Some(v) -> [number(name, v, "µs")], None -> [] }
+
+// The numbers a served row is read off: what was asked and how it was answered, the rate, the
+// latencies, and over TLS the handshakes the client timed apart from the requests.
+pub fn measurements_of(l: Load, s: Sample, status: Int) -> List<Measurement> =
   cats([
     [
-      figure("requests", s.answered),
-      figure("connections", s.connections),
-      figure("per_second", stats::per_second(s.answered, s.wall_us)),
-      figure("p50_us", stats::percentile_or_zero(s.latencies, 50)),
-      figure("p95_us", stats::percentile_or_zero(s.latencies, 95)),
-      figure("p99_us", stats::percentile_or_zero(s.latencies, 99)),
-      figure("max_us", stats::percentile_or_zero(s.latencies, 100)),
-      figure("connect_p50_us", stats::percentile_or_zero(s.connects, 50)),
+      number("asked", asked(l), "requests"),
+      number("answered", s.answered, "requests"),
+      number(right(status), answered_with(s, status), "requests"),
+      number("failed", len(s.failures), "exchanges"),
+      number("connections", s.connections, "connections"),
+      number("per_second", stats::per_second(s.answered, s.wall_us), "requests/s"),
     ],
-    if len(s.handshakes) == 0 { [] } else {
-      [
-        figure("handshakes", len(s.handshakes)),
-        figure("handshake_p50_us", stats::percentile_or_zero(s.handshakes, 50)),
-        figure("handshake_p99_us", stats::percentile_or_zero(s.handshakes, 99)),
-      ]
+    percentile_of("p50", s.latencies, 50),
+    percentile_of("p95", s.latencies, 95),
+    percentile_of("p99", s.latencies, 99),
+    percentile_of("max", s.latencies, 100),
+    percentile_of("connect_p50", s.connects, 50),
+    match l.trust {
+      None -> [],
+      Some(_) ->
+        cats([
+          [number("handshakes", len(s.handshakes), "handshakes")],
+          percentile_of("handshake_p50", s.handshakes, 50),
+          percentile_of("handshake_p99", s.handshakes, 99),
+        ]),
     },
   ])
 
-// --- Certificates, the floor and the programs that time themselves ----------------------------
+// What the first exchange that failed was told, when one did.
+pub fn detail_of(s: Sample) -> Json =
+  match list_at(s.failures, 0) { Some(why) -> Str(why), None -> Null }
+
+// A served point's row: every request of the load answered 200.
+pub fn answered_row(name: String, l: Load, s: Sample) -> Row =
+  { ..row(name, complete(200), measurements_of(l, s, 200)), detail: detail_of(s) }
+
+// --- Certificates, bindings and the programs that time themselves -----------------------------
 
 pub type Credential = { name: String, certificate: String, key: String }
 
@@ -602,26 +645,55 @@ test "the load client's line carries every setting, and only a trusted certifica
   assert_eq(list_at(tls, len(tls) - 1), Some("scratch/serve/tls/desk.pem"))
 }
 
-test "a report is a sample, and a partial or wrong answer is refused rather than averaged" {
+fn verdict_of(r: Row) -> report::Verdict =
+  match report::judge([r]) { [j] -> j.verdict, _ -> panic("one row is judged as one") }
+
+test "a report is a sample, and a partial or wrong answer fails with its counts" {
   let text = "{\"requests\":3,\"answered\":3,\"connections\":1,\"per_conn\":3,\"wall_micros\":300,\"latencies\":[30,10,20],\"connects\":[5],\"handshakes\":[],\"statuses\":[{\"count\":3,\"status\":200}],\"failures\":[]}";
+  let l = { port: 1, routes: ["/items"], connections: 1, concurrency: 1, per_conn: 3, trust: None };
   match json::parse_string(text) {
     Err(_) -> panic("the report is JSON"),
     Ok(j) -> match sample_of(j) {
       Err(why) -> panic(why),
       Ok(s) -> {
-        assert_eq(complete(s, 3, 200), Pass);
-        assert_eq(complete(s, 4, 200), Fail("3 of 4 requests were answered"));
-        assert_eq(complete(s, 3, 404), Fail("3 answered 200"));
-        assert(
-          complete({ ..s, failures: ["/items: the server closed the connection"] }, 3, 200) != Pass,
+        assert_eq(verdict_of(answered_row("p", l, s)), Pass);
+        assert_eq(
+          verdict_of(answered_row("p", { ..l, per_conn: 4 }, s)),
+          Fail([
+            number("asked", 4, "requests"),
+            number("answered", 3, "requests"),
+            number("answered_200", 3, "requests"),
+            number("failed", 0, "exchanges"),
+          ]),
         );
-        assert_eq(stats::per_second(s.answered, s.wall_us), 10000);
-        assert(
-          fold(figures_of(s), false, |seen: Bool, f: Figure| seen || f == figure("p50_us", 20)),
+        assert(verdict_of(row("p", complete(404), measurements_of(l, s, 404))) != Pass);
+        let broken = { ..s, failures: ["/items: the server closed the connection"] };
+        assert(verdict_of(answered_row("p", l, broken)) != Pass);
+        assert_eq(
+          answered_row("p", l, broken).detail,
+          Str("/items: the server closed the connection"),
+        );
+        let taken = measurements_of(l, s, 200);
+        assert_eq(report::value_of(taken, "per_second"), Some(10000m));
+        assert_eq(report::value_of(taken, "p50"), Some(20m));
+        assert_eq(report::value_of(taken, "handshakes"), None);
+        assert_eq(
+          report::value_of(measurements_of({ ..l, trust: Some("desk.pem") }, s, 200), "handshakes"),
+          Some(0m),
         )
       },
     },
   }
+}
+
+test "a server of the language's own must drain, and a floor only must not be killed" {
+  let judged = |s: Stop, c: Criterion| verdict_of(stop_row("it", s, c));
+  assert_eq(judged(Stopped(Exited(0)), drained()), Pass);
+  assert(judged(Stopped(Signalled(15)), drained()) != Pass);
+  assert_eq(judged(Killed, drained()), Fail([number("killed", 1, "")]));
+  assert_eq(judged(Stopped(Signalled(15)), ended()), Pass);
+  assert(judged(Killed, ended()) != Pass);
+  assert_eq(stop_row("the floor,", Killed, ended()).name, "the floor, stops")
 }
 
 test "a program's report is the one line it printed past the run's own" {

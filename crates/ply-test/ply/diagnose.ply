@@ -12,9 +12,9 @@
 // the test's own closure is where suspicion starts, not where it ends.
 
 import bisect (Auto, Bisected, DoesNotCheck, a_failure, a_pass, Host, Minimal, NoHybrids, Partial,
-               Sole, Bisection, Budget, MissingBody, Mode, Never, NoChanges, NeverPassed,
-               NotAttempted, NotInTheGraph, NotRequested, Skipped, Trial, Verdict, bisect, culprits,
-               default_budget, mode_budget, not_attempted, precheck, unresolved_trial)
+               Sole, Bisection, Budget, MissingBody, Mode, Never, NoChanges, NeverPassed, Nondet,
+               NotAttempted, NotInTheGraph, NotRequested, Panicked, Skipped, Trial, Verdict, bisect,
+               culprits, default_budget, mode_budget, not_attempted, precheck, unresolved_trial)
 import delta (Added, Change, ChangeKind, Delta, Derived, Edited, added, change, change_is_candidate,
               derived, edited, is_candidate, kind_word, no_edges, with_components)
 import slice (CausalSlice, Enter, TraceAuto, TraceNever, Tracing, did_run, depth_of, failed, finish,
@@ -161,17 +161,17 @@ pub fn needs_a_hybrid(delta: Delta) -> Bool = {
 fn no_hybrid(_delta: Delta, _flipped: List<Int>) -> Trial = unresolved_trial(MissingBody)
 
 /// One failure becomes its attribution. `delta` is the classified diff, absent when there was no
-/// baseline to compare against; `hybrid` is absent when this build cannot mix two eras; `classified`
-/// says how many changed definitions could not be told apart from a hash that merely moved, and
-/// `test_classified` whether the test's own hash could.
+/// baseline to compare against; `hybrid` builds and runs a mixture, and `absent` is why none can be
+/// built, when none can; `classified` says how many changed definitions could not be told apart from
+/// a hash that merely moved, and `test_classified` whether the test's own hash could.
 pub fn diagnose<a | e>(
   evidence: Evidence,
   options: Options,
   delta: Option<Delta>,
   classified: Int,
   test_classified: Bool,
-  hybrid: Option<(Delta, List<Int>) -> Trial / e>,
-  absent: Skipped,
+  hybrid: (Delta, List<Int>) -> Trial / e,
+  absent: Option<Skipped>,
 ) -> Attribution / e = {
   let start = from_suspects(evidence.suspects);
   let gate = precheck({
@@ -187,9 +187,9 @@ pub fn diagnose<a | e>(
       None -> not_attempted(NeverPassed),
       Some(d) -> {
         let budget = mode_budget(options.bisect, options.budget);
-        match hybrid {
-          Some(mix) -> searched(bisect(d, mix, budget), classified, test_classified),
-          None -> if needs_a_hybrid(d) { not_attempted(absent) }
+        match absent {
+          None -> searched(bisect(d, hybrid, budget), classified, test_classified),
+          Some(why) -> if needs_a_hybrid(d) { not_attempted(why) }
           else { searched(bisect(d, no_hybrid, budget), classified, test_classified) },
         }
       },
@@ -413,23 +413,62 @@ test "the gate decides before any hybrid is built" {
   let one = with_components(None, [edited("a", "h1", "h2", true)], no_edges(), []);
   let options = { bisect: Never, trace: TraceNever, budget: default_budget() };
   // `--bisect=never` is not attempted, with the reason a caller can look up.
-  let a = diagnose(a_gate(false, false, false, true), options, Some(one), 0, true, None, NoHybrids);
+  let a = diagnose(
+    a_gate(false, false, false, true),
+    options,
+    Some(one),
+    0,
+    true,
+    no_hybrid,
+    Some(NoHybrids),
+  );
   assert_eq(a.bisection.verdict, NotAttempted(NotRequested));
   assert_eq(a.bisection.reason, "bisection was not requested for this run");
   // With no baseline there is no earlier definition set to compare against, whatever else is true.
   let asking = { ..options, bisect: Auto };
-  let a = diagnose(a_gate(false, false, false, false), asking, Some(one), 0, true, None, NoHybrids);
+  let a = diagnose(
+    a_gate(false, false, false, false),
+    asking,
+    Some(one),
+    0,
+    true,
+    no_hybrid,
+    Some(NoHybrids),
+  );
   assert_eq(a.bisection.verdict, NotAttempted(NeverPassed));
   // A host was reached: re-running the test would repeat what it did outside the program.
-  let a = diagnose(a_gate(false, false, true, true), asking, Some(one), 0, true, None, NoHybrids);
-  assert_eq(a.bisection.verdict, NotAttempted(Host))
+  let a = diagnose(
+    a_gate(false, false, true, true),
+    asking,
+    Some(one),
+    0,
+    true,
+    no_hybrid,
+    Some(NoHybrids),
+  );
+  assert_eq(a.bisection.verdict, NotAttempted(Host));
+  // The one gate, in its one order: a defect in Ply, then a host, then `nondet`.
+  let a = diagnose(a_gate(true, true, true, true), asking, Some(one), 0, true, no_hybrid, None);
+  assert_eq(a.bisection.verdict, NotAttempted(Panicked));
+  let a = diagnose(a_gate(true, false, true, true), asking, Some(one), 0, true, no_hybrid, None);
+  assert_eq(a.bisection.verdict, NotAttempted(Host));
+  let a = diagnose(a_gate(true, false, false, true), asking, Some(one), 0, true, no_hybrid, None);
+  assert_eq(a.bisection.verdict, NotAttempted(Nondet))
 }
 
 test "one cluster with no test edit is decided by counting, even with no hybrid to build" {
   // Nothing can mix two eras, but nothing needs to: one cluster and an unedited test is the answer.
   let one = with_components(None, [edited("a", "h1", "h2", true)], no_edges(), []);
   let options = { bisect: Auto, trace: TraceNever, budget: default_budget() };
-  let a = diagnose(a_gate(false, false, false, true), options, Some(one), 0, true, None, NoHybrids);
+  let a = diagnose(
+    a_gate(false, false, false, true),
+    options,
+    Some(one),
+    0,
+    true,
+    no_hybrid,
+    Some(NoHybrids),
+  );
   assert_eq(a.bisection.verdict, Sole);
   assert_eq(a.bisection.confidence, Minimal);
   assert_eq(a.bisection.search.evaluated, 0);
@@ -441,7 +480,15 @@ test "one cluster with no test edit is decided by counting, even with no hybrid 
     no_edges(),
     [],
   );
-  let a = diagnose(a_gate(false, false, false, true), options, Some(two), 0, true, None, NoHybrids);
+  let a = diagnose(
+    a_gate(false, false, false, true),
+    options,
+    Some(two),
+    0,
+    true,
+    no_hybrid,
+    Some(NoHybrids),
+  );
   assert_eq(a.bisection.verdict, NotAttempted(NoHybrids))
 }
 
@@ -455,15 +502,7 @@ test "the reason says what could not be classified, and when a test edit was not
   let options = { bisect: Auto, trace: TraceNever, budget: default_budget() };
   let culprit = [1];
   let mix = |_d: Delta, flipped: List<Int>| scripted(culprit, [], flipped);
-  let a = diagnose(
-    a_gate(false, false, false, true),
-    options,
-    Some(two),
-    2,
-    true,
-    Some(mix),
-    NoHybrids,
-  );
+  let a = diagnose(a_gate(false, false, false, true), options, Some(two), 2, true, mix, None);
   assert_eq(
     a.bisection.reason,
     "narrowed 2 changed definitions to b in 4 runs (0 answered from the cache); 2 of the changed definitions could not be told apart from a hash that merely moved, so the search considered them all",
@@ -472,15 +511,7 @@ test "the reason says what could not be classified, and when a test edit was not
   // Every mixture failing is `not_in_the_graph`, and an unclassified test hash means an edit to the
   // test has not been ruled out.
   let all = |_d: Delta, flipped: List<Int>| scripted([], [], flipped);
-  let a = diagnose(
-    a_gate(false, false, false, true),
-    options,
-    Some(two),
-    0,
-    false,
-    Some(all),
-    NoHybrids,
-  );
+  let a = diagnose(a_gate(false, false, false, true), options, Some(two), 0, false, all, None);
   assert_eq(a.bisection.verdict, NotInTheGraph);
   assert(
     string_contains(
@@ -504,8 +535,8 @@ test "a diagnosis ranks the suspects it was handed and keeps the order the slice
     Some(one),
     0,
     true,
-    None,
-    NoHybrids,
+    no_hybrid,
+    Some(NoHybrids),
   );
   // `a` is the sole culprit, so it is first; `b` is an unknown, ranked behind it.
   assert_eq(describe(a.suspects), ["a:?:edited", "b:?:-"])

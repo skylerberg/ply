@@ -3,10 +3,11 @@
 
 use crate::load::Loaded;
 use ply_eval::Value;
+use ply_eval::decode::{self, At};
 use ply_span::{Diagnostic, SourceId, Span, codes};
 use std::collections::HashMap;
 
-const ENTRY: &str = "costs.costs_dump";
+const ENTRY: &str = "costs.costs";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -118,13 +119,8 @@ fn report(loaded: &Loaded) -> Result<Report, Diagnostic> {
         ],
     )
     .map_err(|e| failed(&format!("{e:#}")))?;
-    let Value::Str(dump) = &answer else {
-        return Err(failed(&format!(
-            "`{ENTRY}` answered a {} rather than a string",
-            answer.type_name()
-        )));
-    };
-    read(dump, &sources).map_err(|e| failed(&e))
+    let what = format!("`{ENTRY}`'s answer");
+    read(At::new(&what, &answer), &sources).map_err(|e| failed(&e.to_string()))
 }
 
 fn failed(why: &str) -> Diagnostic {
@@ -139,85 +135,51 @@ fn failed(why: &str) -> Diagnostic {
     .note("this is Ply's fault: the compiler's own `costs.ply` is what failed here")
 }
 
-fn read(dump: &str, sources: &HashMap<String, SourceId>) -> Result<Report, String> {
-    let (head, mut rest) = dump
-        .split_once('\n')
-        .ok_or("an empty answer: the program did not resolve in the port")?;
-    if !head.starts_with("rounds ") {
-        return Err(format!(
-            "an answer that opens with {head:?}, not `rounds <n>`"
-        ));
+/// A `costs.Report`; its offsets are into the module each definition names.
+fn read(answer: At<'_>, sources: &HashMap<String, SourceId>) -> Result<Report, decode::Error> {
+    if !answer.field("ok")?.bool()? {
+        return Err(answer.error("the program did not resolve in the port"));
     }
-    let mut defs: Vec<Definition> = Vec::new();
-    let mut source = None;
-    while !rest.is_empty() {
-        let (header, after) = rest
-            .split_once('\n')
-            .ok_or("an unterminated frame header")?;
-        let fields: Vec<&str> = header.split(' ').collect();
-        rest = match fields.as_slice() {
-            ["def", _kind, start, end, module, name, label] => {
-                let (module, after) = take(after, module)?;
-                let (name, after) = take(after, name)?;
-                let (_label, after) = take(after, label)?;
-                let id = *sources
-                    .get(module)
-                    .ok_or_else(|| format!("a definition in `{module}`, which was not asked"))?;
-                source = Some(id);
-                let promise = match (*start, *end) {
-                    ("-", "-") => None,
-                    _ => Some(Span::new(id, number(start)?, number(end)?)),
-                };
-                defs.push(Definition {
-                    name: name.to_string(),
-                    promise,
-                    sites: Vec::new(),
-                });
-                after
-            }
-            ["site", start, end, verdict, param, reason, fix] => {
-                let (reason, after) = take(after, reason)?;
-                let (fix, after) = take(after, fix)?;
-                let (Some(id), Some(def)) = (source, defs.last_mut()) else {
-                    return Err("a site before any definition".to_string());
-                };
-                def.sites.push(Site {
-                    span: Span::new(id, number(start)?, number(end)?),
-                    verdict: match *verdict {
+    let span = |id: SourceId, at: At<'_>| -> Result<Span, decode::Error> {
+        Ok(Span::new(
+            id,
+            at.field("start")?.number()?,
+            at.field("end")?.number()?,
+        ))
+    };
+    let defs = answer.field("defs")?.items(|def| {
+        let module = def.field("module_name")?;
+        let id = *sources
+            .get(module.utf8()?)
+            .ok_or_else(|| module.error("a definition in a module that was not asked"))?;
+        Ok(Definition {
+            name: def.field("name")?.utf8()?.to_string(),
+            promise: match def.field("reuse")?.option()? {
+                Some(reuse) => Some(span(id, reuse)?),
+                None => None,
+            },
+            sites: def.field("sites")?.items(|site| {
+                let verdict = site.field("verdict")?;
+                let fix = site.field("fix")?.utf8()?;
+                let param = site.field("param")?;
+                Ok(Site {
+                    span: span(id, site)?,
+                    verdict: match verdict.utf8()? {
                         "reuses" => Verdict::Reuses,
                         "copies" => Verdict::Copies,
                         "unknown" => Verdict::Unknown,
-                        other => {
-                            return Err(format!("a verdict this reader does not know: {other:?}"));
-                        }
+                        other => return Err(verdict.error(format!("`{other}` is no verdict"))),
                     },
-                    reason: reason.to_string(),
+                    reason: site.field("reason")?.utf8()?.to_string(),
                     fix: (!fix.is_empty()).then(|| fix.to_string()),
-                    param: match *param {
-                        "-" => None,
-                        k => Some(k.parse().map_err(|_| format!("a parameter {k:?}"))?),
+                    param: if param.int()? < 0 {
+                        None
+                    } else {
+                        Some(param.number()?)
                     },
-                });
-                after
-            }
-            _ => {
-                return Err(format!(
-                    "a frame header this reader does not know: {header:?}"
-                ));
-            }
-        };
-    }
+                })
+            })?,
+        })
+    })?;
     Ok(Report { defs })
-}
-
-fn take<'a>(text: &'a str, n: &str) -> Result<(&'a str, &'a str), String> {
-    let n: usize = n.parse().map_err(|_| format!("a length {n:?}"))?;
-    match (text.get(..n), text.get(n..)) {
-        (Some(taken), Some(rest)) => Ok((taken, rest)),
-        _ => Err(format!("a text of {n} bytes past the end of the answer")),
-    }
-}
-
-fn number(text: &str) -> Result<u32, String> {
-    text.parse().map_err(|_| format!("an offset {text:?}"))
 }
