@@ -201,16 +201,18 @@ fn a_constant_the_seam_refuses_keeps_no_continuation_for_the_next_entry() {
         .expect("the test parks and resumes a continuation of its own");
 }
 
-/// A declared field may name `Task<Int>`, so `spawned`'s task reaches its answer past the checker.
-const HELD: &str = r#"
-type Held = Held(Task<Int>)
-
-fn spawned() -> Held = simulate { Held(task.spawn(|| 1)) }
+/// A closure's type does not mention the task it captures, so `spawned`'s task reaches its answer
+/// past the checker.
+const CAPTURED: &str = r#"
+fn spawned() -> () -> Int / {task.join} = simulate {
+  let t = task.spawn(|| 1);
+  || task.join(t)
+}
 "#;
 
 #[test]
 fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
-    let compiled = Compiled::new(HELD);
+    let compiled = Compiled::new(CAPTURED);
     let (mut machine, tier) = compiled.machine_and_tier();
 
     let d = machine
@@ -223,7 +225,6 @@ fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
         "{}",
         d.message
     );
-    assert!(d.message.contains("Held`'s argument 1"), "{}", d.message);
     assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
 }
 

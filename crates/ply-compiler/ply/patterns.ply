@@ -6,7 +6,7 @@ import spine (push_front, positional, Span, Ident, QName, Ctx, P, R, Ate, Acc, P
               eat, tok_bytes, tok_at, expect, expect_close, expect_ident, expect_field_name,
               keyword_pun_refusal, deeper, shallower, qname, comma_list, settle, failed, t_lparen,
               t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket, t_comma, t_colon, t_dotdot,
-              t_minus, t_underscore, k_true, k_false, num, rec, nlist, opt, payload, word,
+              t_minus, t_pipe, t_underscore, k_true, k_false, num, rec, nlist, opt, payload, word,
               dump_list, dump_opt, dump_ident, dump_qname, dump_diags, start)
 import lexer (Tok, Token, TIdent, TInt, TFixed, TWide, TFloat, TDec, TStr, TBytes, TKw, TPunct,
               TEof, Width, width_named, width_normalize)
@@ -53,6 +53,8 @@ pub type Pattern =
   | PCtor({ span: Span, name: QName, args: List<Pattern> })
   | PRecord({ span: Span, rest: Bool, fields: List<{ name: Ident, pat: Pattern }> })
   | PList({ span: Span, rest: Option<Pattern>, items: List<Pattern> })
+  // `a | b`: two or more alternatives, each binding the same names at the same types.
+  | POr({ span: Span, alts: List<Pattern> })
   // The placeholder `settle` asks for; no parse produces it.
   | PBad({ span: Span })
 
@@ -64,6 +66,7 @@ pub fn pat_span(x: Pattern) -> Span =
     PCtor(v) -> v.span,
     PRecord(v) -> v.span,
     PList(v) -> v.span,
+    POr(v) -> v.span,
     PBad(v) -> v.span,
   }
 
@@ -75,10 +78,77 @@ fn set_pat_span(x: Pattern, s: Span) -> Pattern =
     PCtor(v) -> PCtor({ span: s, name: v.name, args: v.args }),
     PRecord(v) -> PRecord({ span: s, rest: v.rest, fields: v.fields }),
     PList(v) -> PList({ span: s, rest: v.rest, items: v.items }),
+    POr(v) -> POr({ span: s, alts: v.alts }),
     PBad(v) -> PBad({ span: s }),
   }
 
 pub fn no_pattern() -> Pattern = PBad({ span: dummy_span() })
+
+pub fn has_or(x: Pattern) -> Bool =
+  match x {
+    POr(_) -> true,
+    PCtor(v) -> fold(v.args, false, |b: Bool, a: Pattern| b || has_or(a)),
+    PRecord(v) ->
+      fold(v.fields, false, |b: Bool, f: { name: Ident, pat: Pattern }| b || has_or(f.pat)),
+    PList(v) ->
+      fold(v.items, false, |b: Bool, a: Pattern| b || has_or(a))
+        || (match v.rest { Some(r) -> has_or(r), None -> false }),
+    PWild(_) -> false,
+    PVar(_) -> false,
+    PLit(_) -> false,
+    PBad(_) -> false,
+  }
+
+// The patterns without a choice in them that `x` is, in the order a match tries them: a nested
+// choice is distributed outwards, the leftmost alternative varying slowest.
+pub fn alternatives_of(x: Pattern) -> List<Pattern> =
+  match x {
+    POr(v) ->
+      fold(v.alts, [], |acc: List<Pattern>, a: Pattern| append_pats(acc, alternatives_of(a))),
+    PCtor(v) ->
+      map(product(map(v.args, alternatives_of)), |args: List<Pattern>|
+        PCtor({ span: v.span, name: v.name, args: args })),
+    PRecord(v) ->
+      map(
+        product(map(v.fields, |f: { name: Ident, pat: Pattern }| alternatives_of(f.pat))),
+        |ps: List<Pattern>|
+          PRecord({
+            span: v.span,
+            rest: v.rest,
+            fields: map(range(0, len(ps)), |i: Int| {
+              let f = match list_at(v.fields, i) {
+                Some(f) -> f,
+                None -> { name: no_ident(), pat: no_pattern() },
+              };
+              { name: f.name, pat: match list_at(ps, i) { Some(q) -> q, None -> f.pat } }
+            }),
+          }),
+      ),
+    PList(v) -> {
+      let rests = match v.rest {
+        Some(r) -> map(alternatives_of(r), |q: Pattern| Some(q)),
+        None -> [None],
+      };
+      fold(product(map(v.items, alternatives_of)), [], |acc: List<Pattern>, items: List<Pattern>|
+        append_pats(
+          acc,
+          map(rests, |r: Option<Pattern>| PList({ span: v.span, rest: r, items: items })),
+        ))
+    },
+    _ -> [x],
+  }
+
+// Every choice of one element from each list, the first list varying slowest.
+fn product(xss: List<List<Pattern>>) -> List<List<Pattern>> =
+  fold(xss, [[]], |acc: List<List<Pattern>>, xs: List<Pattern>|
+    fold(acc, [], |out: List<List<Pattern>>, prefix: List<Pattern>|
+      append_lists(out, map(xs, |x: Pattern| push(prefix, x)))))
+
+fn append_pats(a: List<Pattern>, b: List<Pattern>) -> List<Pattern> =
+  fold(b, a, |acc: List<Pattern>, x: Pattern| push(acc, x))
+
+fn append_lists(a: List<List<Pattern>>, b: List<List<Pattern>>) -> List<List<Pattern>> =
+  fold(b, a, |acc: List<List<Pattern>>, x: List<Pattern>| push(acc, x))
 
 fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(m) -> false }
 
@@ -86,9 +156,32 @@ fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(m) -> false }
 
 pub fn pattern(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   let d = deeper(c, p)?;
-  match pattern_body(c, d) {
+  match alternatives(c, d) {
     Err(q) -> Err(shallower(q)),
     Ok(r) -> Ok({ p: shallower(r.p), node: r.node }),
+  }
+}
+
+// `|` binds loosest, so every alternative is a pattern without one; parentheses nest another.
+fn alternatives(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
+  let first = pattern_body(c, p)?;
+  if !at(c, first.p, t_pipe()) { Ok(first) } else {
+    let more = iterate(
+      { p: first.p, out: [first.node] },
+      c.ntok - first.p.pos + 1,
+      |s: Acc<Pattern>|
+        if !at(c, s.p, t_pipe()) { Stop(Ok(s)) } else {
+          match pattern_body(c, advance(c, s.p).p) {
+            Err(q) -> Stop(Err(q)),
+            Ok(r) -> Continue({ p: r.p, out: push(s.out, r.node) }),
+          }
+        },
+    )?;
+    let last = match list_at(more.out, len(more.out) - 1) {
+      Some(x) -> pat_span(x),
+      None -> pat_span(first.node),
+    };
+    Ok({ p: more.p, node: POr({ span: span_to(pat_span(first.node), last), alts: more.out }) })
   }
 }
 
@@ -342,6 +435,7 @@ pub fn dump_pattern(x: Pattern) -> Bytes =
         dump_list(v.items, dump_pattern),
         dump_opt(v.rest, dump_pattern),
       ]),
+    POr(v) -> bytes_concat(rec(v.span, b"por"), dump_list(v.alts, dump_pattern)),
     PBad(v) -> rec(v.span, b"pbad"),
   }
 
@@ -428,6 +522,67 @@ test "record patterns, the shorthand, and the rest marker" {
   );
   assert_eq(dump_pattern_of(b"{..}"), "0:4:prec;?1;#0;#0;");
   assert_eq(dump_pattern_of(b"{x, ..}"), "0:7:prec;?1;#1;1:2:ident;@78;1:2:pvar;1:2:ident;@78;#0;")
+}
+
+test "alternatives are one pattern, and `|` binds looser than a constructor's arguments" {
+  assert_eq(
+    dump_pattern_of(b"A | B"),
+    "0:5:por;#2;0:1:pctr;0:1:qname;?0;0:1:ident;@41;#0;4:5:pctr;4:5:qname;?0;4:5:ident;@42;#0;#0;",
+  );
+  assert_eq(
+    dump_pattern_of(b"Some(1 | 2)"),
+    "0:11:pctr;0:4:qname;?0;0:4:ident;@536f6d65;#1;5:10:por;#2;5:6:plit;%int;@31;9:10:plit;%int;@32;#0;",
+  );
+  assert_eq(
+    dump_pattern_of(b"(x, 0) | (0, x)"),
+    "0:15:por;#2;0:6:prec;?0;#2;1:2:ident;@5f30;1:2:pvar;1:2:ident;@78;4:5:ident;@5f31;4:5:plit;%int;@30;9:15:prec;?0;#2;10:11:ident;@5f30;10:11:plit;%int;@30;13:14:ident;@5f31;13:14:pvar;13:14:ident;@78;#0;",
+  )
+}
+
+test "a parenthesised alternative nests rather than flattening" {
+  assert_eq(
+    dump_pattern_of(b"1 | (2 | 3)"),
+    "0:11:por;#2;0:1:plit;%int;@31;4:11:por;#2;5:6:plit;%int;@32;9:10:plit;%int;@33;#0;",
+  )
+}
+
+// Names and structure only, for the expansion tests below.
+fn shape(x: Pattern) -> Bytes =
+  match x {
+    PWild(_) -> b"_",
+    PVar(v) -> v.name.name,
+    PLit(_) -> b"#",
+    PCtor(v) -> if len(v.args) == 0 { v.name.name.name }
+    else { bytes_concat_all([v.name.name.name, b"(", join_shapes(v.args), b")"]) },
+    PRecord(v) ->
+      bytes_concat_all([
+        b"(",
+        join_shapes(map(v.fields, |f: { name: Ident, pat: Pattern }| f.pat)),
+        b")",
+      ]),
+    PList(v) -> bytes_concat_all([b"[", join_shapes(v.items), b"]"]),
+    POr(v) -> bytes_concat_all([b"{", join_shapes(v.alts), b"}"]),
+    PBad(_) -> b"!",
+  }
+
+fn join_shapes(xs: List<Pattern>) -> Bytes =
+  fold(xs, b"", |acc: Bytes, x: Pattern|
+    if bytes_len(acc) == 0 { shape(x) } else { bytes_concat_all([acc, b", ", shape(x)]) })
+
+fn expanded(src: Bytes) -> List<Bytes> = {
+  let s = start(src);
+  map(alternatives_of(settle(pattern(s.c, s.p), no_pattern()).node), shape)
+}
+
+test "a nested choice is distributed outwards, the leftmost alternative varying slowest" {
+  assert_eq(expanded(b"(A | B, C | D)"), [b"(A, C)", b"(A, D)", b"(B, C)", b"(B, D)"]);
+  assert_eq(expanded(b"Some(1 | 2) | None"), [b"Some(#)", b"Some(#)", b"None"]);
+  assert_eq(expanded(b"[x, A | B]"), [b"[x, A]", b"[x, B]"]);
+  assert_eq(expanded(b"x"), [b"x"])
+}
+
+test "an alternative missing after `|` is one diagnostic" {
+  assert_eq(dump_pattern_of(b"A |"), "0:0:pbad;#1;!E0001:3:3:1:0;=3:3:1;")
 }
 
 test "an unclosed list pattern labels its opening bracket" {
