@@ -235,9 +235,9 @@ pub type Coverage = {
 }
 
 // One obligation's result, as everything below needs it: what it is about, how strongly it was
-// discharged, whether the machine established it, and whether it was tried at all. `tier` is present
-// exactly when something held, so a refuted claim has none.
-pub type ClaimRow = { owner: String, kind: Kind, tier: Option<Tier>, holds: Bool, attempted: Bool }
+// discharged, whether the machine established it, and whether a discharge reached a verdict at all.
+// `tier` is present exactly when something held, so a refuted claim has none.
+pub type ClaimRow = { owner: String, kind: Kind, tier: Option<Tier>, holds: Bool, discharged: Bool }
 
 /// The definitions each discharge covers. A clause covers its owner; a law covers everything it
 /// names, which is why a law is worth writing.
@@ -325,8 +325,8 @@ pub fn unspecified_changes(c: Changes) -> Int = len(c.changed) - specified_chang
 
 /// Which definitions moved, whether their claims moved with them, and what became of those claims.
 /// `current` is each definition's hash and spec as they stand now, `baselines` what was accepted, and
-/// `results` the run's own rows: `holds` is whether the machine established the claim, `attempted`
-/// whether it was discharged at all.
+/// `results` the run's own rows: `holds` is whether the machine established the claim, `discharged`
+/// whether it reached a verdict at all.
 pub fn review(
   defs: List<String>,
   laws: Laws,
@@ -371,7 +371,7 @@ pub fn review(
               broken: checked.broken
                 + len(filter(entry.obligations, |i: Int| !at_or(results, i).holds)),
               undischarged: checked.undischarged
-                + len(filter(entry.obligations, |i: Int| !at_or(results, i).attempted)),
+                + len(filter(entry.obligations, |i: Int| !at_or(results, i).discharged)),
             }
           } else { checked }
         },
@@ -424,8 +424,8 @@ fn at_or<a>(xs: List<a>, i: Int) -> a =
 // pin every branch: what the cache answered, which tier wins, which definitions moved, and which
 // claims went with them.
 
-fn a_row(owner: String, kind: Kind, tier: Option<Tier>, holds: Bool, attempted: Bool) -> ClaimRow =
-  { owner: owner, kind: kind, tier: tier, holds: holds, attempted: attempted }
+fn a_row(owner: String, kind: Kind, tier: Option<Tier>, holds: Bool, discharged: Bool) -> ClaimRow =
+  { owner: owner, kind: kind, tier: tier, holds: holds, discharged: discharged }
 
 fn a_clause(owner: String, tier: Option<Tier>) -> ClaimRow =
   a_row(owner, Ensures(0), tier, tier != None, tier != None)
@@ -459,9 +459,15 @@ pub type Counter = {
 }
 
 // What re-running one case answered. `Kept` is a point the guard admitted and the body held,
-// `Refuted` one the guard admitted and the body did not, and `Rejected` one the guard drew the
-// line on: exactly what one turn of a search over cases sees.
-pub type Point = | Kept(List<Binding>) | Falsified(List<Binding>) | Rejected | Undrawn(Gap)
+// `Falsified` one the guard admitted and the body did not, and `Rejected` one the guard drew the
+// line on: exactly what one turn of a search over cases sees. `Faulted` is Ply failing on it, which
+// says nothing about the claim.
+pub type Point =
+  | Kept(List<Binding>)
+  | Falsified(List<Binding>)
+  | Rejected
+  | Undrawn(Gap)
+  | Faulted(Fault)
 
 pub type Outcome =
   | Held({ tier: Tier, evidence: Evidence })
@@ -470,6 +476,8 @@ pub type Outcome =
   // opinion about a label.
   | Vacuous({ guard: { module: Int, start: Int, end: Int }, why: Vacuity })
   | Unattempted(Gap)
+  // Ply failed rather than the program: neither a verdict on the claim nor a gap in it.
+  | Defect(Fault)
 // --- What a discharge has to say for itself ---------------------------------
 
 fn field(fields: Map<String, Json>, key: String) -> Json =
@@ -569,7 +577,8 @@ pub fn evidence_summary(tier: Tier, e: Evidence) -> String =
 // A count of them wears its word. This is a package, so it carries the one it needs rather than
 // reaching into the CLI's report.
 fn plural(n: Int, word: String) -> String =
-  if n == 1 { word } else if string_ends_with(word, "y")
+  if n == 1 { word }
+  else if string_ends_with(word, "y")
       && !ends_in_vowel(string_slice(word, 0, string_len(word) - 1)) {
     string_slice(word, 0, string_len(word) - 1) ++ "ies"
   } else { word ++ "s" }
@@ -1071,6 +1080,24 @@ pub fn gap_summary(g: Gap) -> String =
     NotDrawn -> "its points are not drawn one at a time",
   }
 
+// A gap's kind, as a document names it for a reader that counts gaps rather than reading them.
+pub fn gap_word(g: Gap) -> String =
+  match g {
+    UnhandledEffect(_) -> "unhandled_effect",
+    Ungeneratable(_) -> "ungeneratable",
+    Raised(_) -> "raised",
+    GuardNotSampled(_) -> "guard_not_sampled",
+    ReachesHost(_) -> "reaches_host",
+    NotDrawn -> "not_drawn",
+  }
+
+// Ply's own failure while discharging a claim, and the point it was judging, if one was.
+pub type Fault = { code: String, message: String, notes: List<String>, bindings: List<Binding> }
+
+// What Ply's failure reads as, in the words `ply test` gives a defect: the program is not to blame.
+pub fn fault_summary(f: Fault) -> String =
+  "Ply failed rather than the program, so this is a defect in Ply: " ++ f.message
+
 pub fn vacuity_summary(v: Vacuity) -> String =
   match v {
     Unsatisfiable -> "the guard admits no value",
@@ -1085,6 +1112,44 @@ test "a gap and a vacuity read as one line each" {
   );
   assert_eq(vacuity_summary(Unsatisfiable), "the guard admits no value");
   assert_eq(vacuity_summary(NoCaseKept(8)), "the guard kept none of 8 cases")
+}
+
+test "the program's raise and Ply's failure each read one way, and only Ply's names Ply" {
+  let raised = gap_summary(Raised({ message: "division by zero", bindings: [] }));
+  assert_eq(raised, "raised: division by zero");
+  let declined: Fault = {
+    code: "E0505",
+    message: "the compiled tier declined to enter `m.law`",
+    notes: [],
+    bindings: [],
+  };
+  assert_eq(
+    fault_summary(declined),
+    "Ply failed rather than the program, so this is a defect in Ply: the compiled tier declined to enter `m.law`",
+  );
+  assert(!string_contains(raised, "Ply"))
+}
+
+test "every kind of gap has a word of its own" {
+  let every = [
+    UnhandledEffect(None),
+    Ungeneratable({ param: "f", ty: "(Int) -> Int" }),
+    Raised({ message: "division by zero", bindings: [] }),
+    GuardNotSampled({ generated: 200, witness: [] }),
+    ReachesHost("{db.read[users]}"),
+    NotDrawn,
+  ];
+  let words = map(every, gap_word);
+  assert_eq(words, [
+    "unhandled_effect",
+    "ungeneratable",
+    "raised",
+    "guard_not_sampled",
+    "reaches_host",
+    "not_drawn",
+  ]);
+  // Two gaps of one kind with different particulars are one word.
+  assert_eq(gap_word(UnhandledEffect(Some("{db.read[rows]}"))), gap_word(UnhandledEffect(None)))
 }
 
 // What a definition leaves alone, from its checked footprint.

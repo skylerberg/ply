@@ -1,0 +1,185 @@
+// A run's front end, reused. What a load answers is a function of the files its walk read, the
+// toolchain that reads them and the one flag resolved against the answer, so those hash to one
+// key, and a run that finds an answer filed under its key takes it rather than running the front
+// end. The machine files an answer only once the load it was handed held, `reuse fn` promises and
+// all, so an entry vouches for those too. Nothing else a run decides is keyed: the grants, the
+// binding and the entry are its own, and are decided again every time.
+
+import compiler.hash (hex)
+import diagnostic (Place)
+import machine (Walked)
+import program (Placed, placed_of)
+import sources (File, DepPackage, Project)
+import std.hash (blake3)
+
+// What reads a walk: the `ply` program and the modules it ships, the emitter among them, as the
+// launcher gates them, and the binary's version.
+pub type Toolchain = { stamp: String, version: String }
+
+// What the key is a key of: one of another shape names another entry.
+fn domain() -> String = "ply run front 1"
+
+// One field, its length first, so no two keys run their fields together into the same bytes.
+fn field(b: Bytes) -> Bytes =
+  bytes_concat_all([bytes_of_string(int_to_string(bytes_len(b))), b":", b])
+
+fn named(s: String) -> Bytes = field(bytes_of_string(s))
+
+fn maybe(b: Option<Bytes>) -> Bytes =
+  match b { None -> b"-", Some(x) -> bytes_concat(b"+", field(x)) }
+
+fn counted(n: Int) -> Bytes = named(int_to_string(n))
+
+// A module is its name and its text. Where it was read is not in the key: that is only what a
+// report calls it, and a run takes its places from its own walk.
+fn module_field(f: File) -> Bytes = bytes_concat(named(f.module), blake3(f.text))
+
+fn modules_field(files: List<File>) -> Bytes =
+  bytes_concat(counted(len(files)), bytes_concat_all(map(files, module_field)))
+
+// A dependency is the key the front end judges it by, its manifest and its modules.
+fn package_field(p: DepPackage) -> Bytes =
+  bytes_concat_all([named(p.root), maybe(p.manifest), modules_field(p.files)])
+
+fn manifest_of(project: Project) -> Option<Bytes> =
+  match project.manifest { Some(f) -> Some(f.text), None -> None }
+
+fn schema_of(schema: Option<String>) -> Option<Bytes> =
+  match schema { Some(s) -> Some(bytes_of_string(s)), None -> None }
+
+// Everything the front end and the promise check read, in the order the walk read it: the root
+// the package judgments are keyed by, the manifest, the modules, each dependency, and the
+// `--config-schema` a run resolves against the answer before the machine is handed it.
+pub fn key_of(tools: Toolchain, project: Project, schema: Option<String>) -> String =
+  string_of_bytes(
+    hex(
+      blake3(
+        bytes_concat_all([
+          named(domain()),
+          named(tools.stamp),
+          named(tools.version),
+          named(project.root_key),
+          maybe(manifest_of(project)),
+          modules_field(project.files),
+          counted(len(project.packages)),
+          bytes_concat_all(map(project.packages, package_field)),
+          maybe(schema_of(schema)),
+        ]),
+      ),
+    ),
+  )
+
+// The walk as `machine.reuse` takes it: its key, and its places as a front end places them.
+pub fn walked(tools: Toolchain, project: Project, schema: Option<String>) -> Walked = {
+  let placed: Placed = placed_of(project);
+  { key: key_of(tools, project, schema), modules: placed.modules, manifests: placed.manifests }
+}
+
+// `b3:` and the key's first twelve hex characters, as a report prints a digest.
+pub fn short(key: String) -> String = "b3:" ++ string_slice(key, 0, 12)
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_file(path: String, module: String, body: Bytes) -> File =
+  { path: path, module: module, text: body, at: { label: "cwd", path: path } }
+
+fn a_dep() -> DepPackage =
+  {
+    root: "/w/lib",
+    dir: "/w/lib",
+    manifest: Some(b"fn package() -> Manifest = lib()\n"),
+    files: [a_file("/w/lib/deep.ply", "deep", b"pub fn deep() -> Int = 7\n")],
+  }
+
+fn a_project() -> Project =
+  {
+    files: [
+      a_file("main.ply", "main", b"import lib.deep\nfn main() -> Int = deep::deep()\n"),
+      a_file("util.ply", "util", b"pub fn one() -> Int = 1\n"),
+    ],
+    sources: [],
+    diags: [],
+    manifest: Some(a_file("ply.pkg", "", b"fn package() -> Manifest = app()\n")),
+    packages: [a_dep()],
+    root_key: "/w/app",
+  }
+
+fn tools() -> Toolchain = { stamp: "b3:0123456789ab", version: "0.16.0" }
+
+fn key(p: Project) -> String = key_of(tools(), p, None)
+
+fn paths_of(places: List<Place>) -> List<String> = map(places, |p: Place| p.path)
+
+test "a walk hashes to one key of sixty-four hex characters, and the same walk to the same key" {
+  assert_eq(key(a_project()), key(a_project()));
+  assert_eq(string_len(key(a_project())), 64);
+  assert_eq(short(key(a_project())), "b3:" ++ string_slice(key(a_project()), 0, 12))
+}
+
+test "an edit to a module, a dependency or a manifest is a different key" {
+  let base = key(a_project());
+  let edited = map(a_project().files, |f: File|
+    if f.module == "util" { { ..f, text: b"pub fn one() -> Int = 2\n" } } else { f });
+  assert(key({ ..a_project(), files: edited }) != base);
+  let deeper = {
+    ..a_dep(),
+    files: [a_file("/w/lib/deep.ply", "deep", b"pub fn deep() -> Int = 8\n")],
+  };
+  assert(key({ ..a_project(), packages: [deeper] }) != base);
+  assert(key({ ..a_project(), manifest: None }) != base);
+  assert(key({ ..a_project(), packages: [{ ..a_dep(), manifest: Some(b"other") }] }) != base);
+  assert(key({ ..a_project(), packages: [] }) != base)
+}
+
+test "a module renamed, or a root the package judgments are keyed by, is a different key" {
+  let base = key(a_project());
+  let renamed = map(a_project().files, |f: File|
+    if f.module == "util" { { ..f, module: "helpers" } } else { f });
+  assert(key({ ..a_project(), files: renamed }) != base);
+  assert(key({ ..a_project(), root_key: "/elsewhere/app" }) != base);
+  assert(key({ ..a_project(), packages: [{ ..a_dep(), root: "/w/other" }] }) != base)
+}
+
+test "another toolchain, another version or another schema is a different key" {
+  let base = key(a_project());
+  assert(key_of({ ..tools(), stamp: "b3:ba9876543210" }, a_project(), None) != base);
+  assert(key_of({ ..tools(), version: "0.17.0" }, a_project(), None) != base);
+  let spec = key_of(tools(), a_project(), Some("main.spec"));
+  assert(spec != base);
+  assert(spec != key_of(tools(), a_project(), Some("main.other")))
+}
+
+test "bytes moved from one file to the next, or a module moved into a dependency, are a different key" {
+  let two = [
+    a_file("a.ply", "a", b"fn a() -> Int = 1\n"),
+    a_file("b.ply", "b", b"fn b() -> Int = 2\n"),
+  ];
+  let shifted = [
+    a_file("a.ply", "a", b"fn a() -> Int = 1\nfn b"),
+    a_file("b.ply", "b", b"() -> Int = 2\n"),
+  ];
+  assert(key({ ..a_project(), files: two }) != key({ ..a_project(), files: shifted }));
+  let lifted = {
+    ..a_project(),
+    files: [a_file("main.ply", "main", b"import lib.deep\nfn main() -> Int = deep::deep()\n")],
+    packages: [
+      {
+        ..a_dep(),
+        files: push(a_dep().files, a_file("/w/lib/util.ply", "util", b"pub fn one() -> Int = 1\n")),
+      },
+    ],
+  };
+  assert(key(lifted) != key(a_project()))
+}
+
+test "where a file was read is no part of the key" {
+  let elsewhere = map(a_project().files, |f: File| { ..f, path: "src/" ++ f.path });
+  assert_eq(key({ ..a_project(), files: elsewhere }), key(a_project()))
+}
+
+test "a walk hands the machine its modules, the root's first, and its manifests apart" {
+  let w = walked(tools(), a_project(), None);
+  assert_eq(w.key, key(a_project()));
+  assert_eq(paths_of(w.modules), ["main.ply", "util.ply", "/w/lib/deep.ply"]);
+  assert_eq(paths_of(w.manifests), ["ply.pkg", "/w/lib/ply.pkg"])
+}

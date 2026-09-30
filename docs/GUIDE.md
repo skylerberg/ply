@@ -889,8 +889,8 @@ rather than raised.
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
 | `PLY_C_CACHE=DIR` | compiled unit cache (default under the temp directory) |
-| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them (default under the temp directory) |
-| `PLY_C_CACHE_MAX=BYTES` | cap on that cache, oldest entries swept first; `0` is no cap |
+| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them, and the front-end answers `ply run` files (§16) (default under the temp directory) |
+| `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_DUMP=NAME` | print one body's emitted C, or `*` for the unit's largest bodies |
@@ -953,7 +953,7 @@ holds for **every** interleaving and is reported `exhaustive`.
 | `--sim-budget N` | interleavings per seed (`dpor` only) |
 | `--sim-steps N` | steps per interleaving before `E0414` |
 | `--seed 7`, `--seed 7:3.0.2` | replay one interleaving; implies `--sim once` |
-| `--measure-reduction` | also run unpruned and report the cost |
+| `--measure-reduction` | also run the search twice more, unpruned (`naive`) and blind to the order spawns and joins impose (`blind`), and report each count; a failure only they reach fails the test |
 
 Results are cached per search plan; a search that spends its budget passes but
 is not cached. A failure prints the racing steps, their tasks and positions, and
@@ -995,6 +995,7 @@ law "a credit and a matching debit leave an account exactly as it was"
 | `property` | randomized cases passed; failures shrink |
 | `example` | concrete cases passed |
 | `unattempted` (`W0604`) | undecided; never green, never cached |
+| `defect` | Ply failed rather than the program: nothing is claimed, never cached, exit 1 |
 
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
@@ -1009,7 +1010,14 @@ view and `len` known to lie below `i64::MAX`.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
-values. A claim's type variables are lettered by where they first appear among
+values. A proposition that raises is a gap in the claim; one the compiled tier
+declines, or any other failure that is Ply's own, is a `defect` reported under
+Ply's code (`E0505`), as `ply test` reports one. Under `--json` a gap carries
+its sentence as `gap` and its kind as `gap_kind` (`unhandled_effect`,
+`ungeneratable`, `raised`, `guard_not_sampled`, `reaches_host`, `not_drawn`), a
+defect carries `defect` — its `code`, `message`, the `bindings` Ply failed at,
+and a `summary` — and `summary` counts defects as `defect`. A claim's type
+variables are lettered by where they first appear among
 its binders (`forall (x: a, y: List<b>)`); a sample draws each as `Int`
 (`a := Int`), and a proof leaves each an uninterpreted sort
 (`uninterpreted a, b`). Flags: `--prove-cases N` (below 25 kept cases only `example`),
@@ -1299,9 +1307,11 @@ The resource label is a table (`db.query[items]` is `db.read[items]`).
 Transaction control is on the singleton resource, so transactions conflict.
 `transaction` handles `rollback`; a `rollback` performed in its body still
 reaches the caller's row through `e`, so a handler around a transaction names
-it too. SQL errors are values; `is_retryable(e)`
-covers serialization failures. `MemDb` is an in-memory twin (`open`, `step`,
-`begin_step`, `commit_step`, `abort_step`). 
+it too. SQL errors are values: a `DbError`'s `code` is the SQLSTATE,
+`constraint` the constraint a violation names, and `detail` the server's message
+and detail. `is_retryable(e)` is true for a serialization failure (`40001`) and
+a deadlock (`40P01`). `MemDb` is an in-memory twin (`open`, `step`,
+`begin_step`, `commit_step`, `abort_step`).
 The driver that runs in Ply reads a statement before it sends it. A statement
 that writes, performed as `db.query`, is refused because the endpoints that
 perform it would be scheduled as if they only read, and text the reader cannot
@@ -1326,6 +1336,29 @@ the language's, and the host is left with `net`. The effect is nominal, so a
 program that wants a server handles it: `with_server` is how, and
 `{db.read[*], db.write[*] | e}` in its signature is what lets one handler answer
 every table at once.
+
+A statement outside a transaction takes an idle connection, or opens one while
+fewer than `size` are open, and gives it back once the server has answered; with
+none to take it is `53300`. A `begin` takes a connection for its transaction, a
+`begin` inside it is a savepoint on that connection, and the `commit` or `abort`
+that closes the transaction gives the connection back whatever the server
+answered. A `commit` the server turned into a rollback, because a statement in
+the transaction had failed, is `25P02`, as it is in the twin. Tasks in
+transactions at once each hold their own connection. A handler cannot see which
+task performs an operation, so `serve` takes an operation to belong to the one
+open transaction whose connection is not waiting on the server, and to no
+transaction when every one is: a task holding a transaction open must wait on
+nothing but its own statements. One that waits on anything else — `task.yield`,
+`task.join`, `clock.sleep`, another host operation — leaves its transaction
+between statements while other tasks run, so an operation from a task with no
+transaction is taken for its own, and one performed while two transactions are
+between statements is raised.
+
+A connection that fails is class `08`: `08001` it could not be opened, `08006`
+it broke, `08P01` a reply could not be read, `08003` the transaction's
+connection is gone and the transaction with it, and `08007` a `commit` whose
+outcome is unknown. A server that asks for a password when none was given is
+`28000`.
 
 The connection string is `postgres://user[:password]@host[:port]/database`,
 and its query carries what every connection the pool opens starts with, told
@@ -1391,6 +1424,7 @@ pub type Heard = Said(String) | Quiet | Closed
 
 pub nondet effect process {
   read  args[p]()             -> List<String>
+  read  bound[e]()            -> Bool
   write out[p](text: String)  -> Unit
   write err[p](text: String)  -> Unit
   write line[p]()             -> Option<String>
@@ -1413,9 +1447,10 @@ consumed and two readers of one input race for it), and `exit` ends the program
 there: nothing after it runs, no value is
 printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). These
 are bound only by `ply run --host`; `ply test` withholds them, even with
-`--host` (`E0424`). The operations whose label is an executable — `spawn`,
-`start` and those on a started child — are bound by `ply test --host` too, for
-the labels `--exec` names. Under `ply run --json` the lines `out` writes go to
+`--host` (`E0424`). The operations whose label is an executable — `bound`,
+`spawn`, `start` and those on a started child — are bound by `ply test --host`
+too: a label `--exec` does not name is unbound (`E0456`), and `bound` answers
+`false` for it. Under `ply run --json` the lines `out` writes go to
 stderr, so stdout still carries the one object. Handle it over a `Captured`
 value: `captured(args)`, `args_step`, `out_step`, `err_step`, `line_step` and `exit_step` keep each line,
 hand out `with_input`'s scripted input lines, and the first exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
@@ -1427,6 +1462,9 @@ but the executable: `--exec cc=/usr/bin/cc` binds one program to `cc`, and
 executable bound is `E0456`, and an `--exec` path that is missing, is not a file
 or has no execute bit is `E0457` before anything runs. Nothing in the call names
 a program, so the run decides what a footprint's `process.spawn[cc]` may do.
+`bound` answers whether the run bound a program to its label, so a program that
+can do without one asks `process.bound[cc]()` rather than ending at `E0456`; the
+table is settled before anything runs, so the answer holds for the whole run.
 
 `args` is the argument vector after the program; `dir` is the working
 directory, and `""` is the run's own. `env` is the *whole* environment: a spawn
@@ -1444,6 +1482,8 @@ hands out planned `Finished` values in order and records each `Launch`; a spawn
 with no reply planned answers `Exited(127)`, as a shell does for a command it
 could not run. Build replies with `exited(code, out, err)` and
 `signalled(signal, out, err)`, and read one back with `exit_code`.
+`runs_bound_step` answers `bound`: `true` once a reply is planned, unless the
+test sets the twin's `bound`, and no spawn changes it.
 
 `start` launches a child beside the program, by the same label, `dir` and `env`
 rules, and answers its handle — an `Int`, as a socket's is — or `Err` with why
@@ -1486,9 +1526,10 @@ Handle the children over a `Children` value: `children(planned)` hands each
 `output_line` hears in order, `Closed` once that runs out — and a start with
 none planned answers `Err`. `start_step`, `wait_step`, `signal_step`,
 `input_step` and `output_line_step` each answer an `Answered` of the twin and
-what the host would have said, `end_input_step` answers the twin, and each
-`Child` records its launch, the bytes written to it, whether its input is open
-and the signals it was sent. A `Kill` ends a scripted child, so the next `wait` hands it back, and
+what the host would have said, `end_input_step` answers the twin, `bound_step`
+answers `bound` as `runs_bound_step` does, `true` once a script is planned, and
+each `Child` records its launch, the bytes written to it, whether its input is
+open and the signals it was sent. A `Kill` ends a scripted child, so the next `wait` hands it back, and
 a spent or unknown handle panics, as the host refuses one.
 
 ### 13.10 `std.time`
@@ -1787,7 +1828,11 @@ clear-text password, and SCRAM-SHA-256; md5 is refused with a message naming it.
 bound as text, and both answer the columns, the rows and the command tag; NULL is
 `None` and every column is `Some` bytes. A statement the server refuses is
 `Rejected(session, server)`, which carries the connection back because it is
-still usable — the SQLSTATE is what a program branches on. `finish` sends
+still usable; one the server hangs up after, as it does after a `FATAL` error, is
+`Refused(server)`. A `Server` is the refusal's `severity`, its SQLSTATE `code` —
+what a program branches on — its `message` and `detail`, and the `constraint` a
+violation names. A session's `status` is where its transaction stood at the last
+`ReadyForQuery`: `Idle`, `InTransaction` or `FailedTransaction`. `finish` sends
 `Terminate` and closes.
 
 The SCRAM steps are exposed because they are pure: `scram_first_bare` writes the
@@ -2256,8 +2301,9 @@ always runs and is never cached. An operation performed inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
-test run binds `process.spawn`, `process.start` and the operations on a started
-child for the labels `--exec` names. All flags below require `--host`.
+test run binds `process.bound`, `process.spawn`, `process.start` and the
+operations on a started child, which reach only the programs `--exec` names. All
+flags below require `--host`.
 
 `ply hosts` lists every bindable operation (`effect.op[resource]`: one row per
 operation and label some row of the program names, where a written mode atom
@@ -2414,7 +2460,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, and how many definitions the front-end cache seeded and how many were checked; with `--types`, effect sets and provenance) |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, host, simulation |
-| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
+| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
@@ -2484,6 +2530,27 @@ time. `ply build`, `ply hosts`, `ply test
 `machine.load` of a program runs the whole front end. A cache that will not read
 is a warning and a cold check, never a failure; the run that files over one
 filed by a compiler whose shipped modules differed says so once, as `W0605`.
+
+`ply run` over sources goes further: once a load holds, the front end's answer
+is filed under a key of everything it and the `reuse fn` promise check (`E0127`)
+read — the name and bytes of every module the walk read, the root's manifest,
+each dependency's key, manifest and modules, the root's absolute path, the `ply`
+program and the modules it ships as the launcher gates them (so `PLY_C_EMITTER`
+too), the binary's version, and `--config-schema`. A later run whose walk hashes
+the same takes that answer and runs neither the front end nor the promise check,
+which the filed load passed; it binds, grants (`--allow`, `--exec`, `--fs`) and
+picks its entry anew, and reports exactly what a run that built the answer
+reports. Any edit to a module, a dependency or a manifest, another schema or
+another `ply` is a new key, and the front end runs again; `ply.lock` is not
+read by a run and is not in the key. A single `.ply` file keys that one module.
+The answers live under the stage root (`PLY_C_STAGE`, §8.6) in `run-fronts/`,
+one file per key, each written beside itself and renamed into place, so two runs
+of one package never read half of one; an entry that does not read is rebuilt
+and written over. They are swept with the stages, least recently used first, down to
+`PLY_C_CACHE_MAX`, never one used within the hour, and deleting them is always
+safe. `ply run --explain` says `reused` or `built`, the key, and what reading,
+the front end, filing into `.ply-cache` and the machine's load each took, on
+stderr before the entry runs, or as `front_end` in the `--json` document.
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
@@ -2648,7 +2715,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `W0605` | standard library changed since the cache was written |
 | `W0607` | supplied configuration key the schema does not declare |
 | `W0608` | drain deadline expired with requests in flight |
-| `W0609` | spans still open when an entry point ended |
+| `W0609` | spans still open when their task or the entry point ended |
 | `W0610` | reference cycle, never freed |
 | `W0611` | definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps it quiet |
 | `W0612` | run abandoned at its wall clock; nothing recorded |

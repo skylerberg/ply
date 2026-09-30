@@ -51,8 +51,7 @@ pub fn run_on_tier(
     let texts = module_texts(&loaded.check, &loaded.sources);
     let unit =
         ply_codegen::Unit::over_front(&loaded.front, texts).expect("this host has a C compiler");
-    let executor = ply_test::InterpExecutor::new(&loaded.front)
-        .with_backend(unit)
+    let executor = ply_test::InterpExecutor::new(&loaded.front, unit)
         .with_search(ply_test::Search::of(selection))
         .with_hosts(hosting);
     ply_test::run_with(selection, &loaded.check, &loaded.hashes, store, &executor)

@@ -161,43 +161,34 @@ fn every_numeric_candidate_is_strictly_smaller() {
     }
 }
 
+/// The walk is `proof.shrink`'s, and it tries candidates in order: a float's first is the floor,
+/// and the floor offers none.
 #[test]
-fn a_float_shrinks_all_the_way_to_zero() {
+fn a_floats_first_candidate_is_its_floor() {
     let world = world();
-    let mut current = Value::Float(-1234.5);
-    let mut steps = 0;
-    while let Some(next) = candidates(&current, &Sort::float(), &world)
-        .into_iter()
-        .next()
-    {
-        current = next;
-        steps += 1;
-        assert!(steps < 200, "the walk did not terminate");
+    for f in [-1234.5, 0.1, 1e300, f64::NAN, f64::NEG_INFINITY] {
+        let first = candidates(&Value::Float(f), &Sort::float(), &world)
+            .into_iter()
+            .next();
+        assert!(
+            matches!(first, Some(Value::Float(z)) if z == 0.0 && z.is_sign_positive()),
+            "{f} offered {first:?} first"
+        );
     }
-    assert!(matches!(current, Value::Float(f) if f == 0.0 && f.is_sign_positive()));
+    assert!(candidates(&Value::Float(0.0), &Sort::float(), &world).is_empty());
 }
 
 #[test]
-fn a_decimal_sheds_its_trailing_zeros_before_its_digits() {
+fn a_decimal_offers_its_floor_and_then_its_scale_shed() {
     let world = world();
     let padded = Value::Decimal(Decimal::new(1_500_000, 6));
     let offered = candidates(&padded, &Sort::decimal(), &world);
+    assert_eq!(offered.first(), Some(&Value::Decimal(Decimal::ZERO)));
     assert!(
         offered
             .iter()
             .any(|c| matches!(c, Value::Decimal(d) if d.scale() == 1 && *d == Decimal::new(15, 1))),
         "normalizing the scale is a candidate: {offered:?}"
     );
-
-    let mut current = padded;
-    let mut steps = 0;
-    while let Some(next) = candidates(&current, &Sort::decimal(), &world)
-        .into_iter()
-        .next()
-    {
-        current = next;
-        steps += 1;
-        assert!(steps < 200, "the walk did not terminate");
-    }
-    assert_eq!(current, Value::Decimal(Decimal::ZERO));
+    assert!(candidates(&Value::Decimal(Decimal::ZERO), &Sort::decimal(), &world).is_empty());
 }

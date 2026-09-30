@@ -2,8 +2,8 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use crate::counting::charge;
-use ply_eval::arena::{Arena, Reclaim, RegionKind};
-use ply_eval::{Span, Value};
+use ply_eval::Value;
+use ply_eval::arena::{Arena, Owner, Reclaim, RegionKind};
 use std::sync::Arc;
 
 fn counted<R>(f: impl FnOnce() -> R) -> (usize, R) {
@@ -28,9 +28,9 @@ fn a_regions_close_is_a_truncation() {
     for kind in [RegionKind::Unique, RegionKind::Shared] {
         let mut arena = Arena::new();
         let (arc, value) = payload(1);
-        let r = arena.open(kind, Span::DUMMY);
-        let slot = arena.alloc(value).expect("inside a region");
-        arena.alloc(Value::Int(2));
+        let r = arena.open(Owner::ENTRY, kind);
+        let slot = arena.alloc(Owner::ENTRY, value).expect("inside a region");
+        arena.alloc(Owner::ENTRY, Value::Int(2));
 
         let outcome = arena.close(r);
 
@@ -49,9 +49,9 @@ fn a_regions_close_is_a_truncation() {
 fn a_close_costs_the_allocator_nothing() {
     let mut arena = Arena::new();
     let warm = |arena: &mut Arena| {
-        let r = arena.open(RegionKind::Unique, Span::DUMMY);
+        let r = arena.open(Owner::ENTRY, RegionKind::Unique);
         for i in 0..1_000 {
-            arena.alloc(Value::Int(i));
+            arena.alloc(Owner::ENTRY, Value::Int(i));
         }
         arena.close(r)
     };
@@ -67,8 +67,8 @@ fn a_close_costs_the_allocator_nothing() {
     assert_eq!(allocations, 0);
 
     // The same, under an enclosing region that keeps the chunks from going back.
-    let root = arena.open(RegionKind::Shared, Span::DUMMY);
-    arena.alloc(Value::Int(0));
+    let root = arena.open(Owner::ENTRY, RegionKind::Shared);
+    arena.alloc(Owner::ENTRY, Value::Int(0));
     let (allocations, ()) = counted(|| {
         for _ in 0..100 {
             assert_eq!(warm(&mut arena), Reclaim::Freed(1_000));

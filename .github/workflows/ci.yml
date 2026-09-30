@@ -36,6 +36,7 @@ jobs:
     outputs:
       partitions: ${{ steps.tables.outputs.partitions }}
       solo: ${{ steps.tables.outputs.solo }}
+      corpus: ${{ steps.tables.outputs.corpus }}
       shards: ${{ steps.cut.outputs.shards }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,6 +95,7 @@ jobs:
         run: |
           echo "partitions=$(.github/ci-shards.sh partitions)" >> "$GITHUB_OUTPUT"
           echo "solo=$(.github/ci-shards.sh solo-matrix)" >> "$GITHUB_OUTPUT"
+          echo "corpus=$(.github/ci-shards.sh corpus-matrix)" >> "$GITHUB_OUTPUT"
 
   clippy:
     name: cargo fmt --all --check and cargo clippy --workspace --all-targets
@@ -167,14 +169,6 @@ jobs:
       - name: cargo test --workspace --no-run
         if: steps.reuse.outputs.reused != 'true'
         run: cargo test --locked --workspace --no-run
-      # No test target of its own package builds the corpus executor, so nothing else would; the
-      # archive takes it by name (`.config/nextest.toml`).
-      - name: The corpus executor
-        if: steps.reuse.outputs.reused != 'true'
-        run: |
-          set -euo pipefail
-          cargo build --locked -p ply-corpus --bin ply-corpus
-          strip --strip-debug target/debug/ply-corpus
       # nextest does not run doctests.
       - name: cargo test --doc
         if: steps.reuse.outputs.reused != 'true'
@@ -354,11 +348,9 @@ jobs:
 
   # `build-ply`'s self-test is the run's first `ply`, so the emitter's own unit is emitted and
   # compiled there, under the compiler every suite job compiles it with, and saved under this
-  # run's emitter key. That leaves the corpus program's unit, which only a run of the program by the
-  # archive's `ply` builds, and this is the job with the archive: it restores the emission, adds the
-  # corpus program to it, and saves the set under the tree's key for a later run whose sources have
-  # not moved. Only main's entries reach a later run, and the shards start before this finishes,
-  # so a pull request skips it.
+  # run's emitter key. This job, which holds the archive, restores that emission and saves it under
+  # the tree's key for a later run whose sources have not moved. Only main's entries reach a later
+  # run, and the shards start before this finishes, so a pull request skips it.
   stage:
     name: the emitter's stage
     if: github.event_name == 'push'
@@ -379,9 +371,9 @@ jobs:
 
   test:
     name: test ${{ matrix.shard }}/${{ matrix.of }}
-    # The stage is a cache, not an input: a shard restores the emitter's own key from `build-ply`
-    # and warms the corpus program's itself, so it does not wait the emitter's whole stage out. On a
-    # pull request, where `refresh` does not run, this is the run's critical path.
+    # The stage is a cache, not an input: a shard restores the emitter's own key from `build-ply`,
+    # so it does not wait the emitter's whole stage out. On a pull request, where `refresh` does not
+    # run, this is the run's critical path.
     needs: [plan, build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -415,6 +407,17 @@ jobs:
           set -euo pipefail
           exclude=$(.github/ci-shards.sh exclude-filter)
           [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
+          # The corpus's runs this partition takes go beside nextest rather than after it: a run is
+          # one mostly single-threaded process, so nextest gives up one of the runner's four threads.
+          threads=()
+          runs=$(.github/ci-shards.sh corpus-for-partition "$SHARD")
+          if [ -n "$runs" ]; then
+            .github/ci-corpus.sh partition "$SHARD" "/tmp/corpus-timings-$SHARD.tsv" > /tmp/corpus.log 2>&1 &
+            corpus=$!
+            threads=(--test-threads 3)
+          else
+            : > "/tmp/corpus-timings-$SHARD.tsv"
+          fi
           config=/tmp/ply-shards/shard-$SHARD.toml
           if [ "$SHARDS" = true ]; then
             [ -f "$config" ] || { echo "the plan cut the shards and $config did not come back" >&2; exit 1; }
@@ -428,8 +431,15 @@ jobs:
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast "${cut[@]}" \
-            -E "not ($exclude)" 2>&1 | tee /tmp/partition.log
+            --no-fail-fast "${cut[@]}" "${threads[@]}" \
+            -E "not ($exclude)" 2>&1 | tee /tmp/partition.log || nextest=$?
+          # The corpus's log is printed whatever nextest did, so a red partition still shows both.
+          corpus_status=0
+          if [ -n "${corpus:-}" ]; then
+            wait "$corpus" || corpus_status=$?
+            cat /tmp/corpus.log
+          fi
+          [ "${nextest:-0}" -eq 0 ] || exit "$nextest"
           ran=$(awk '
             { gsub(/\033\[[0-9;]*m/, "") }
             /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
@@ -439,6 +449,7 @@ jobs:
           [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
           echo "profile=$profile" >> "$GITHUB_OUTPUT"
           echo "ran=$ran" >> "$GITHUB_OUTPUT"
+          [ "$corpus_status" -eq 0 ] || { echo "a corpus run this partition took failed" >&2; exit 1; }
 
       # What the next run cuts its shards from.
       - name: The durations this shard measured
@@ -455,6 +466,8 @@ jobs:
             exit 1
           }
           echo "$lines durations"
+          # Each corpus run this partition took, as one `corpus <run> <ms>` row the cut weighs.
+          cat "/tmp/corpus-timings-$SHARD.tsv" >> "/tmp/timings-$SHARD.tsv"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: timings-${{ matrix.shard }}
@@ -519,8 +532,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
-        with:
-          corpus-program: ${{ matrix.corpus }}
 
       - name: cargo nextest run
         env:
@@ -560,8 +571,6 @@ jobs:
         with:
           persist-credentials: true
       - uses: ./.github/actions/suite
-        with:
-          corpus-program: "false"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ply
@@ -601,8 +610,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
-        with:
-          corpus-program: "false"
 
       - name: cargo nextest run
         run: |
@@ -657,8 +664,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
-        with:
-          corpus-program: "false"
 
       - name: cargo nextest run
         run: |
@@ -670,6 +675,57 @@ jobs:
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --no-fail-fast --success-output immediate -E "$filter"
 
+  # The corpus's checks that start desks under load, a runner each (`ci-shards.sh corpus-matrix`): they
+  # spawn this run's `ply` over desks and floors with the grants `benches/corpus.sh` gives the program.
+  # Postgres beside them holds the desk's schema, and the database checks are handed its URL as
+  # `CORPUS_DB`. The corpus's other runs go to the partitions.
+  corpus:
+    name: test corpus ${{ matrix.id }}
+    needs: [plan, build, build-ply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.corpus) }}
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: desk
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/suite
+      - name: psql, and the libpq the floor links
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client libpq-dev
+      - name: The desk's schema
+        run: psql -v ON_ERROR_STOP=1 -q -h 127.0.0.1 -U postgres -d desk -f examples/desk.sql
+      # Built as `benches/corpus.sh` builds them; the checks ask `process.bound` for each.
+      - name: The floors the served tables are compared with
+        run: |
+          set -euo pipefail
+          cc -O2 -o target/http-floor benches/http-floor/floor.c -lpthread
+          cc -O2 -o target/pg-floor benches/pg-floor/pg.c -I"$(pg_config --includedir)" -L"$(pg_config --libdir)" -lpq
+      # A check may take minutes and make any number of calls; a quarter of an hour abandons one.
+      - name: ply test
+        env:
+          ID: ${{ matrix.id }}
+        run: |
+          .github/ci-corpus.sh run "$ID" \
+            --exec "http_floor=$PWD/target/http-floor" --exec "pg_floor=$PWD/target/pg-floor" \
+            --set CORPUS_DB=postgres://postgres@127.0.0.1:5432/desk
+
   # The one required check. What a run parks in the cache for its own jobs -- the archive every
   # partition unpacks, the emitter's stage, the shard cut -- is keyed by the run id, so no later run
   # can read it, and left behind it evicts the object cache that does outlive a run. A green run
@@ -678,7 +734,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [plan, clippy, build, build-ply, stage, test, solo, gates, test-hosts, refresh]
+    needs: [plan, clippy, build, build-ply, stage, test, solo, gates, test-hosts, corpus, refresh]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

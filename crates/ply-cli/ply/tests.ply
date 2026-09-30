@@ -384,14 +384,19 @@ pub type Backend = {
   codegen_nanos: Option<Int>,
 }
 
-pub type Naive = { explored: Int, bounded: Bool, rendered: String }
+// What a search run beside the pruned one explored; `bounded` when a spent budget or a failure
+// stopped it first.
+pub type Cost = { explored: Int, bounded: Bool, rendered: String }
 
 // What one test's search did. Absent, never zeroed, on a test that reached no `simulate` region.
 pub type Explored = {
   explored: Int,
   exhaustive: Bool,
   exhausted: Bool,
-  naive: Option<Naive>,
+  // `--measure-reduction` only: the same search blind to the order spawns and joins impose, and the
+  // same search unpruned.
+  blind: Option<Cost>,
+  naive: Option<Cost>,
   // Tenths, so one division answers both the line and the document.
   reduction_tenths: Option<Int>,
   steps: Int,
@@ -679,10 +684,12 @@ fn keyed(reason: String) -> String = joined(string_split(reason, " "), "_")
 
 fn why(reason: String) -> String =
   if reason == "new" { "this hash has never gone green, so nothing is known about it" }
-  else if reason == "nondet" { "`test/nondet` always runs and is never cached" } else if reason
-      == "previous failure" { "the cache holds a failure, and a failure is never trusted" } else if reason
-      == "cached" { "this exact hash already passed; re-running cannot reveal anything new" }
-  else { "no hash was produced, so the cache cannot answer for it" }
+  else if reason == "nondet" { "`test/nondet` always runs and is never cached" }
+  else if reason == "previous failure" {
+    "the cache holds a failure, and a failure is never trusted"
+  } else if reason == "cached" {
+    "this exact hash already passed; re-running cannot reveal anything new"
+  } else { "no hash was produced, so the cache cannot answer for it" }
 
 // `region`, `shared` or `host`: a socket lives outside every region, so a host-backed test is
 // neither isolated nor cached.
@@ -1020,7 +1027,7 @@ fn result_line(s: Style, p: Program, o: Outcome, width: Int) -> String =
     ++ "ms"
 
 // A bounded naive count makes the ratio a lower bound.
-fn reduction_part(e: Explored, naive: Naive) -> List<String> =
+fn reduction_part(e: Explored, naive: Cost) -> List<String> =
   match e.reduction_tenths {
     None -> [],
     Some(tenths) ->
@@ -1032,9 +1039,10 @@ fn search_parts(e: Explored) -> List<String> = {
   let head = [count_of(e.explored, "interleaving")];
   let thorough = if e.exhaustive { push(head, "exhaustive") } else { head };
   let spent = if e.exhausted { push(thorough, "budget spent — not cached") } else { thorough };
+  let blind = match e.blind { None -> spent, Some(b) -> push(spent, "blind " ++ b.rendered) };
   match e.naive {
-    None -> spent,
-    Some(naive) -> appended(push(spent, "naive " ++ naive.rendered), reduction_part(e, naive)),
+    None -> blind,
+    Some(naive) -> appended(push(blind, "naive " ++ naive.rendered), reduction_part(e, naive)),
   }
 }
 
@@ -1140,7 +1148,8 @@ fn described(x: Suspect) -> String =
 
 fn suspect_lines(s: Style, f: Fault) -> List<String> = {
   let rest = map(filter(f.suspects, |x: Suspect| !x.culprit), described);
-  if len(rest) > 0 { ["  " ++ yellow(s, "suspects:") ++ " " ++ joined(rest, ", ")] } else if f.unchanged {
+  if len(rest) > 0 { ["  " ++ yellow(s, "suspects:") ++ " " ++ joined(rest, ", ")] }
+  else if f.unchanged {
     ["  " ++ dim(s, "suspects: none — nothing in this test's closure changed")]
   } else { [] }
 }
@@ -1285,14 +1294,14 @@ fn group_json(d: Decided, i: Int) -> Json = {
   ])
 }
 
-fn naive_json(v: Option<Naive>) -> Json =
+fn cost_json(v: Option<Cost>) -> Json =
   match v {
     None -> Null,
-    Some(n) ->
+    Some(c) ->
       object([
-        { key: "explored", value: num(n.explored) },
-        { key: "bounded", value: Bool(n.bounded) },
-        { key: "rendered", value: Str(n.rendered) },
+        { key: "explored", value: num(c.explored) },
+        { key: "bounded", value: Bool(c.bounded) },
+        { key: "rendered", value: Str(c.rendered) },
       ]),
   }
 
@@ -1301,7 +1310,8 @@ fn search_json(e: Explored) -> Json =
     { key: "explored", value: num(e.explored) },
     { key: "exhaustive", value: Bool(e.exhaustive) },
     { key: "exhausted", value: Bool(e.exhausted) },
-    { key: "naive", value: naive_json(e.naive) },
+    { key: "blind", value: cost_json(e.blind) },
+    { key: "naive", value: cost_json(e.naive) },
     {
       key: "reduction",
       value: match e.reduction_tenths { Some(t) -> Number(decimal(fixed(t, 1))), None -> Null },
@@ -2414,11 +2424,12 @@ test "the repro is a seed and the command that replays it" {
   ])
 }
 
-test "a search says what it explored and what an unpruned one would have cost" {
+test "a search says what it explored and what a blind and an unpruned one would have cost" {
   let e: Explored = {
     explored: 12,
     exhaustive: true,
     exhausted: false,
+    blind: Some({ explored: 30, bounded: false, rendered: "30" }),
     naive: Some({ explored: 120, bounded: false, rendered: "120" }),
     reduction_tenths: Some(100),
     steps: 8,
@@ -2427,8 +2438,16 @@ test "a search says what it explored and what an unpruned one would have cost" {
   };
   assert_eq(
     joined(search_parts(e), " · "),
-    "12 interleavings · exhaustive · naive 120 · 10× reduction",
-  )
+    "12 interleavings · exhaustive · blind 30 · naive 120 · 10× reduction",
+  );
+  let doc = to_string(search_json(e));
+  assert(string_contains(doc, "\"blind\":{\"bounded\":false,\"explored\":30,\"rendered\":\"30\"}"));
+  assert(
+    string_contains(doc, "\"naive\":{\"bounded\":false,\"explored\":120,\"rendered\":\"120\"}"),
+  );
+  let unmeasured = { ..e, blind: None, naive: None, reduction_tenths: None };
+  assert_eq(joined(search_parts(unmeasured), " · "), "12 interleavings · exhaustive");
+  assert(string_contains(to_string(search_json(unmeasured)), "\"blind\":null"))
 }
 
 test "the simulation line counts the searches and says a spent budget out loud" {
@@ -2587,6 +2606,7 @@ test "a bounded naive count makes the ratio a lower bound" {
     explored: 12,
     exhaustive: false,
     exhausted: false,
+    blind: Some({ explored: 40, bounded: false, rendered: "40" }),
     naive: Some({ explored: 4096, bounded: true, rendered: ">= 4096" }),
     reduction_tenths: Some(3413),
     steps: 8,
@@ -2595,7 +2615,7 @@ test "a bounded naive count makes the ratio a lower bound" {
   };
   assert_eq(
     joined(search_parts(e), " · "),
-    "12 interleavings · naive >= 4096 · >= 341× reduction",
+    "12 interleavings · blind 40 · naive >= 4096 · >= 341× reduction",
   )
 }
 

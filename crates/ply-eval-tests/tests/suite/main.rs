@@ -3,6 +3,7 @@
 mod fixture;
 
 mod armed;
+mod call_memo;
 mod constant_memo;
 mod determinism_audit;
 mod hoist_staleness_audit;
@@ -16,8 +17,10 @@ mod reference_cycles;
 mod region_boundary_audit;
 mod region_isolation_audit;
 mod region_meaning_adversarial;
+mod region_stacks_audit;
 mod secrets;
 mod simulated_handlers;
+mod spawn_handlers;
 mod unit;
 mod use_after_free_audit;
 mod value_semantics_audit;

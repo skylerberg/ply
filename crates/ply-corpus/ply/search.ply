@@ -1,0 +1,712 @@
+// `sim` — what the concurrency simulator's search costs over a corpus's simulated tests, read off the
+// product's own reports: every table is `ply test --json --no-cache` under the search the line names.
+// The reduction is each test's footprint-guided search beside an unpruned one, and the
+// synchronization the same search beside one blind to the order spawns and joins impose, both from
+// one `--measure-reduction` run; race power is the interleavings each strategy runs to the first
+// failure, one root a trial through `--sim-roots`; throughput is seeds a second under `--sim random`.
+
+import report
+import report (Row, Criterion, Measurement, Pass, Fail, Inconclusive, Holds, holding, number, exact,
+               row, untaken)
+import spine
+import stats
+import std.json (Json, Str, Number, Null, Object, object, array)
+import std.json
+import std.list
+import std.fs (fs)
+import std.process (process)
+import std.config (config)
+
+pub type Args = {
+  // A `.ply` file, or a directory a previous `gen` wrote.
+  corpus: String,
+  // Roots per strategy in the race-finding table; zero drops it.
+  trials: Int,
+  // Interleavings a search may run per root, pruned or not.
+  budget: Int,
+  // Scheduling steps one interleaving may take.
+  steps: Int,
+  // Seeds the throughput table times; zero drops it.
+  rate_seeds: Int,
+  reduction: Bool,
+}
+
+fn cats<a>(xss: List<List<a>>) -> List<a> =
+  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
+
+fn flag(b: Bool) -> Int = if b { 1 } else { 0 }
+
+// --- What a run reports --------------------------------------------------------------------
+
+// One simulated test's search in one run, as the report carries it.
+pub type Searched = {
+  explored: Int,
+  exhaustive: Bool,
+  // The search spent its budget, so `explored` is a lower bound.
+  exhausted: Bool,
+  // The unpruned search run beside it: what it explored, and whether its budget or a failure
+  // stopped it.
+  naive: Option<{ explored: Int, bounded: Bool }>,
+  // The same search blind to the order spawns and joins impose, run beside it.
+  blind: Option<{ explored: Int, bounded: Bool }>,
+  steps: Int,
+  // An interleaving failed, and the search stopped there.
+  failed: Bool,
+  us: Int,
+}
+
+// Every test that reads a seed, and the search the run reported for it; a test the run reported no
+// search for is `None`.
+pub type Ran = List<{ key: String, search: Option<Searched> }>
+
+// A search the product ran beside the pruned one, under `key`; `null` when it ran none.
+fn beside(s: Map<String, Json>, key: String) -> Option<{ explored: Int, bounded: Bool }> =
+  match spine::field(s, key) {
+    Ok(c) ->
+      Some({ explored: spine::int_field(c, "explored"), bounded: spine::bool_field(c, "bounded") }),
+    Err(_) -> None,
+  }
+
+fn searched_of(r: Map<String, Json>) -> Option<Searched> =
+  match spine::field(r, "simulation") {
+    Err(_) -> None,
+    Ok(s) ->
+      Some({
+        explored: spine::int_field(s, "explored"),
+        exhaustive: spine::bool_field(s, "exhaustive"),
+        exhausted: spine::bool_field(s, "exhausted"),
+        naive: beside(s, "naive"),
+        blind: beside(s, "blind"),
+        steps: spine::int_field(s, "steps"),
+        failed: match map_get(s, "failing_seed") { Some(Str(_)) -> true, _ -> false },
+        us: spine::us_of_ms(spine::decimal_field(r, "duration_ms")),
+      }),
+  }
+
+pub fn ran_of(j: Json) -> Result<Ran, String> =
+  match j {
+    Object(m) -> match spine::field(m, "selection") {
+      Err(e) -> Err(e),
+      Ok(selection) -> {
+        let results = spine::objects(spine::array_field(m, "results"));
+        Ok(
+          map(
+            filter(
+              spine::objects(spine::array_field(selection, "tests")),
+              |t: Map<String, Json>| spine::bool_field(t, "seeded"),
+            ),
+            |t: Map<String, Json>| {
+              let index = spine::int_field(t, "index");
+              {
+                key: spine::str_field(t, "key"),
+                search: match filter(results, |r: Map<String, Json>|
+                    spine::int_field(r, "index") == index) {
+                  [r, ..] -> searched_of(r),
+                  [] -> None,
+                },
+              }
+            },
+          ),
+        )
+      },
+    },
+    _ -> Err("the test report is not an object"),
+  }
+
+// The flags one run's search is asked for with, as `ply test` takes them.
+pub fn dpor_flags(a: Args, root: Int) -> List<String> =
+  [
+    "--sim",
+    "dpor",
+    "--sim-roots",
+    int_to_string(root) ++ ".." ++ int_to_string(root + 1),
+    "--sim-budget",
+    int_to_string(a.budget),
+    "--sim-steps",
+    int_to_string(a.steps),
+  ]
+
+// Seeds `from` up to `from + count`, one interleaving each.
+pub fn random_flags(a: Args, from: Int, count: Int) -> List<String> =
+  [
+    "--sim",
+    "random",
+    "--sim-roots",
+    int_to_string(from) ++ ".." ++ int_to_string(from + count),
+    "--sim-steps",
+    int_to_string(a.steps),
+  ]
+
+// Every test of the corpus under one search, nothing read from a cache and nothing bisected: a
+// failure here is what the search is measured by.
+fn ran(
+  a: Args,
+  search: List<String>,
+) -> Result<Ran, String> / {process.spawn[ply], config.get[env]} =
+  match spine::document(
+      spine::ply(
+        cats([
+          ["test", a.corpus, "--json", "--no-cache", "--bisect", "never", "--color", "never"],
+          search,
+        ]),
+        ".",
+      ),
+    ) {
+    Err(why) -> Err(why),
+    Ok(j) -> match spine::refusal(j) {
+      Some(why) -> Err("`" ++ a.corpus ++ "` does not compile: " ++ why),
+      None -> match ran_of(j) {
+        Err(why) -> Err(why),
+        Ok(r) -> if len(r) == 0 {
+          Err(
+            "no test under `" ++ a.corpus
+              ++ "` reads a simulation seed, so there is no search to measure",
+          )
+        } else { Ok(r) },
+      },
+    },
+  }
+
+// --- The reduction ----------------------------------------------------------------------------
+
+// Pruning is sound only if it never costs more than enumerating every order does, and never skips
+// an interleaving that fails.
+pub fn pruning() -> Criterion =
+  Holds(
+    "the pruned search runs no more interleavings than enumerating every order, and skips no failure",
+    |ms: List<Measurement>|
+      match ((
+          report::value_of(ms, "pruned"),
+          report::value_of(ms, "naive"),
+          report::value_of(ms, "skipped"),
+        )) {
+        (Some(pruned), Some(naive), Some(skipped)) -> if pruned <= naive && skipped == 0m { Pass }
+        else { Fail(report::named(ms, ["pruned", "naive", "skipped"])) },
+        (Some(_), None, _) ->
+          Inconclusive(
+            "no unpruned search ran beside it: the pruned search stopped at a failure of its own",
+          ),
+        _ -> Inconclusive("the search was not measured"),
+      },
+  )
+
+// A test's pruned search and, when it ran, the unpruned one beside it. The product runs the unpruned
+// search only when the pruned one passed, so a failure with one beside it is one pruning skipped.
+pub fn reduction_row(key: String, s: Searched) -> Row =
+  row(
+    "reduction " ++ key,
+    pruning(),
+    cats([
+      [
+        number("pruned", s.explored, "interleavings"),
+        number("pruned_bounded", flag(s.exhausted), ""),
+        number("exhaustive", flag(s.exhaustive), ""),
+      ],
+      match s.naive {
+        None -> [],
+        Some(n) ->
+          [
+            number("naive", n.explored, "interleavings"),
+            number("naive_bounded", flag(n.bounded), ""),
+            number("skipped", flag(s.failed), ""),
+            exact(
+              "reduction",
+              decimal_div(
+                decimal_of_int(n.explored),
+                decimal_of_int(max(s.explored, 1)),
+                1,
+                HalfEven,
+              ),
+              "×",
+            ),
+          ],
+      },
+      [number("steps", s.steps, "steps"), report::ms_of_us("ms", s.us)],
+    ]),
+  )
+
+// --- The synchronization ----------------------------------------------------------------------
+
+// What the clocks earn: they only spare the search reorderings a spawn or a join already rules out,
+// so a search that reads them should run no more interleavings than one that cannot.
+pub fn synchronized() -> Criterion =
+  Holds(
+    "the pruned search runs no more interleavings than one that cannot see the synchronization",
+    |ms: List<Measurement>|
+      match ((report::value_of(ms, "pruned"), report::value_of(ms, "unsynchronized"))) {
+        (Some(pruned), Some(unsynchronized)) -> if cut_short(ms) {
+          Inconclusive("a search stopped short of its frontier, so its count is only a lower bound")
+        } else if pruned <= unsynchronized { Pass }
+        else { Fail(report::named(ms, ["pruned", "unsynchronized"])) },
+        (Some(_), None) ->
+          Inconclusive(
+            "no clock-blind search ran beside it: the pruned search stopped at a failure of its own",
+          ),
+        _ -> Inconclusive("the search was not measured"),
+      },
+  )
+
+// A spent budget or a failure stopped either search short of its frontier, leaving its count a lower
+// bound.
+fn cut_short(ms: List<Measurement>) -> Bool =
+  report::value_of(ms, "pruned_bounded") == Some(1m)
+    || report::value_of(ms, "unsynchronized_bounded") == Some(1m)
+
+// A test's pruned search and, when it ran, the same search with every step's clock withheld.
+pub fn synchronization_row(key: String, s: Searched) -> Row =
+  row(
+    "synchronization " ++ key,
+    synchronized(),
+    cats([
+      [
+        number("pruned", s.explored, "interleavings"),
+        number("pruned_bounded", flag(s.exhausted), ""),
+      ],
+      match s.blind {
+        None -> [],
+        Some(b) ->
+          [
+            number("unsynchronized", b.explored, "interleavings"),
+            number("unsynchronized_bounded", flag(b.bounded), ""),
+          ],
+      },
+    ]),
+  )
+
+// Both tables are read off one run, which searches each test three ways.
+fn reduction_rows(a: Args) -> Result<List<Row>, String> / {process.spawn[ply], config.get[env]} =
+  match ran(a, push(dpor_flags(a, 0), "--measure-reduction")) {
+    Err(why) -> Err(why),
+    Ok(r) ->
+      Ok(
+        cats([
+          measured(r, "reduction ", pruning(), reduction_row),
+          measured(r, "synchronization ", synchronized(), synchronization_row),
+        ]),
+      ),
+  }
+
+// A row per test the run reported, and an untaken one for a test it reported no search for.
+fn measured(r: Ran, table: String, c: Criterion, row_of: (String, Searched) -> Row) -> List<Row> =
+  map(r, |t: { key: String, search: Option<Searched> }|
+    match t.search {
+      Some(s) -> row_of(t.key, s),
+      None -> untaken(table ++ t.key, c, "the run reported no search for it"),
+    })
+
+// --- Race power -------------------------------------------------------------------------------
+
+// One trial of one strategy: the root it started from, and the interleavings it ran to the first
+// failure, when it reached one.
+pub type Trial = { root: Int, interleavings: Option<Int> }
+
+pub type Summary = { median: Option<Decimal>, worst: Option<Int>, misses: Int }
+
+pub fn summarized(trials: List<Trial>) -> Summary = {
+  let found = list::sort(
+    fold(trials, [], |acc: List<Int>, t: Trial|
+      match t.interleavings { Some(n) -> push(acc, n), None -> acc }),
+  );
+  let n = len(found);
+  let at = |i: Int| match list_at(found, i) { Some(x) -> x, None -> 0 };
+  {
+    median: if n == 0 { None } else if n % 2 == 0 {
+      Some(decimal_div(decimal_of_int(at(n / 2 - 1) + at(n / 2)), 2m, 1, HalfEven))
+    } else { Some(decimal_of_int(at(n / 2))) },
+    worst: if n == 0 { None } else { Some(at(n - 1)) },
+    misses: len(trials) - n,
+  }
+}
+
+// The search has race-finding power when it reaches the failure from every root, and in no more
+// interleavings at the median than sampling seeds takes.
+pub fn raced() -> Criterion =
+  Holds(
+    "the search reaches the failure from every root, in no more interleavings at the median than sampling seeds takes",
+    |ms: List<Measurement>|
+      match ((
+          report::value_of(ms, "trials"),
+          report::value_of(ms, "dpor_misses"),
+          report::value_of(ms, "sampled_misses"),
+        )) {
+        (Some(trials), Some(dpor_misses), Some(sampled_misses)) -> if dpor_misses == trials
+            && sampled_misses == trials {
+          Inconclusive(
+            "no search and no sample reached a failure, so there is no race to find within the budget",
+          )
+        } else if dpor_misses > 0m { Fail(report::named(ms, ["dpor_misses", "trials"])) }
+        else if sampled_misses == trials { Pass } else {
+          match ((report::value_of(ms, "dpor_median"), report::value_of(ms, "sampled_median"))) {
+            (Some(d), Some(s)) -> if d <= s { Pass }
+            else { Fail(report::named(ms, ["dpor_median", "sampled_median"])) },
+            _ -> Inconclusive("a median was not measured"),
+          }
+        },
+        _ -> Inconclusive("the trials were not counted"),
+      },
+  )
+
+fn summary_measurements(prefix: String, s: Summary) -> List<Measurement> =
+  cats([
+    match s.median { Some(m) -> [exact(prefix ++ "_median", m, "interleavings")], None -> [] },
+    match s.worst { Some(w) -> [number(prefix ++ "_worst", w, "interleavings")], None -> [] },
+    [number(prefix ++ "_misses", s.misses, "trials")],
+  ])
+
+fn trials_json(ts: List<Trial>) -> Json =
+  array(
+    map(ts, |t: Trial|
+      object([
+        { key: "root", value: Number(decimal_of_int(t.root)) },
+        {
+          key: "interleavings",
+          value: match t.interleavings { Some(n) -> Number(decimal_of_int(n)), None -> Null },
+        },
+      ])),
+  )
+
+pub fn race_row(key: String, dpor: List<Trial>, sampled: List<Trial>) -> Row = {
+  let d = summarized(dpor);
+  let s = summarized(sampled);
+  let ratio = match ((d.median, s.median)) {
+    (Some(dm), Some(sm)) -> if dm > 0m && d.misses == 0 && s.misses == 0 {
+      [exact("median_ratio", decimal_div(sm, dm, 1, HalfEven), "×")]
+    } else { [] },
+    _ -> [],
+  };
+  {
+    ..row("race " ++ key, raced(), cats([[number("trials", len(dpor), "trials")], summary_measurements("dpor", d), summary_measurements("sampled", s), ratio])),
+    detail: object([
+      { key: "dpor", value: trials_json(dpor) },
+      { key: "sampled", value: trials_json(sampled) },
+    ]),
+  }
+}
+
+// A run's trial of each test, from `root`: the interleavings to its failure when it failed.
+fn trials_in(r: Ran, root: Int) -> Map<String, Option<Trial>> =
+  fold(
+    r,
+    map_new(),
+    |m: Map<String, Option<Trial>>, t: { key: String, search: Option<Searched> }|
+      map_insert(m, t.key, match t.search {
+        Some(s) ->
+          Some({ root: root, interleavings: if s.failed { Some(s.explored) } else { None } }),
+        None -> None,
+      }),
+  )
+
+// Every run of a strategy, one root each, stopping at the first that could not be taken.
+fn runs_of(
+  a: Args,
+  roots: List<Int>,
+  flags: (Int) -> List<String>,
+) -> Result<List<Map<String, Option<Trial>>>, String> / {process.spawn[ply], config.get[env]} =
+  fold(roots, Ok([]), |acc: Result<List<Map<String, Option<Trial>>>, String>, root: Int|
+    match acc {
+      Err(why) -> Err(why),
+      Ok(done) -> match ran(a, flags(root)) {
+        Err(why) -> Err(why),
+        Ok(r) -> Ok(push(done, trials_in(r, root))),
+      },
+    })
+
+// One test's trials over every run, or why one run has none for it.
+fn trials_of(key: String, runs: List<Map<String, Option<Trial>>>) -> Result<List<Trial>, String> =
+  fold(runs, Ok([]), |acc: Result<List<Trial>, String>, run: Map<String, Option<Trial>>|
+    match acc {
+      Err(why) -> Err(why),
+      Ok(done) -> match map_get(run, key) {
+        Some(Some(t)) -> Ok(push(done, t)),
+        _ -> Err("a run reported no search for it"),
+      },
+    })
+
+// The search's trial `t` starts from root `t`; the sample's draws seeds from the trials times one
+// past `t`, so no two trials' seeds meet and none is a search's root.
+pub fn sampled_from(trials: Int, t: Int) -> Int = trials * (t + 1)
+
+fn race_rows(a: Args) -> Result<List<Row>, String> / {process.spawn[ply], config.get[env]} =
+  match runs_of(a, range(0, a.trials), |root: Int| dpor_flags(a, root)) {
+    Err(why) -> Err(why),
+    Ok(dpor) -> match runs_of(a, range(0, a.trials), |t: Int|
+        random_flags(a, sampled_from(a.trials, t), a.budget)) {
+      Err(why) -> Err(why),
+      Ok(sampled) -> {
+        let keys = match list_at(dpor, 0) { Some(first) -> map_keys(first), None -> [] };
+        Ok(
+          map(keys, |key: String|
+            match ((trials_of(key, dpor), trials_of(key, sampled))) {
+              (Ok(d), Ok(s)) -> race_row(key, d, s),
+              (Err(why), _) -> untaken("race " ++ key, raced(), why),
+              (_, Err(why)) -> untaken("race " ++ key, raced(), why),
+            }),
+        )
+      },
+    },
+  }
+
+// --- Throughput -------------------------------------------------------------------------------
+
+pub fn every_seed() -> Criterion =
+  holding(
+    "every seed asked for ran, unless one failed first",
+    ["asked", "seeds", "stopped"],
+    |vs: List<Decimal>|
+      match vs {
+        [asked, seeds, stopped] -> seeds == asked || (stopped == 1m && seeds <= asked),
+        _ -> false,
+      },
+  )
+
+pub fn rate_row(key: String, asked: Int, definitions: Option<Int>, s: Searched) -> Row =
+  row(
+    "rate " ++ key,
+    every_seed(),
+    cats([
+      [
+        number("asked", asked, "seeds"),
+        number("seeds", s.explored, "seeds"),
+        number("stopped", flag(s.failed), ""),
+        report::ms_of_us("ms", s.us),
+        number("per_second", stats::per_second(s.explored, s.us), "seeds/s"),
+        number("steps", s.steps, "steps"),
+      ],
+      match definitions { Some(n) -> [number("definitions", n, "definitions")], None -> [] },
+    ]),
+  )
+
+// How big the corpus is, as the front end counts it.
+fn definitions_in(corpus: String) -> Option<Int> / {process.spawn[ply], config.get[env]} =
+  match spine::document(spine::ply(["check", corpus, "--json", "--color", "never"], ".")) {
+    Ok(Object(m)) -> Some(len(spine::array_field(m, "definitions"))),
+    _ -> None,
+  }
+
+fn rate_rows(a: Args) -> Result<List<Row>, String> / {process.spawn[ply], config.get[env]} =
+  match ran(a, random_flags(a, 0, a.rate_seeds)) {
+    Err(why) -> Err(why),
+    Ok(r) -> {
+      let definitions = definitions_in(a.corpus);
+      Ok(
+        map(r, |t: { key: String, search: Option<Searched> }|
+          match t.search {
+            Some(s) -> rate_row(t.key, a.rate_seeds, definitions, s),
+            None -> untaken("rate " ++ t.key, every_seed(), "the run reported no search for it"),
+          }),
+      )
+    },
+  }
+
+// --- The report ---------------------------------------------------------------------------------
+
+fn taken_if(
+  wanted: Bool,
+  rows: () -> Result<List<Row>, String> / {process.spawn[ply], config.get[env]},
+) -> Result<List<Row>, String> / {process.spawn[ply], config.get[env]} =
+  if wanted { rows() } else { Ok([]) }
+
+// Each table asked for, in order; a run that could not be taken stops the subcommand, since every
+// table is read off the same corpus.
+pub fn run(
+  a: Args,
+) -> Result<report::Report, String> / {process.spawn[ply], config.get[env], fs.read[repo]} = {
+  let reduced = taken_if(a.reduction, || reduction_rows(a))?;
+  let raced_rows = taken_if(a.trials > 0, || race_rows(a))?;
+  let rated = taken_if(a.rate_seeds > 0, || rate_rows(a))?;
+  report::made(
+    "sim",
+    "sim — the search over the simulated tests of " ++ a.corpus,
+    cats([reduced, raced_rows, rated]),
+    [
+      { key: "root", value: Str(a.corpus) },
+      { key: "budget", value: Number(decimal_of_int(a.budget)) },
+      { key: "steps", value: Number(decimal_of_int(a.steps)) },
+      { key: "trials", value: Number(decimal_of_int(a.trials)) },
+      { key: "rate_seeds", value: Number(decimal_of_int(a.rate_seeds)) },
+    ],
+  )
+}
+
+// --- Tests ---------------------------------------------------------------------------------------
+
+fn verdict_of(r: Row) -> report::Verdict =
+  match report::judge([r]) { [j] -> j.verdict, _ -> panic("one row is judged as one") }
+
+fn a_search() -> Searched =
+  {
+    explored: 12,
+    exhaustive: true,
+    exhausted: false,
+    naive: Some({ explored: 120, bounded: false }),
+    blind: Some({ explored: 30, bounded: false }),
+    steps: 480,
+    failed: false,
+    us: 3000,
+  }
+
+fn args() -> Args =
+  { corpus: "c", trials: 4, budget: 4096, steps: 100000, rate_seeds: 64, reduction: true }
+
+test "a summary carries its misses, and an even count's median is between its middle two" {
+  let trials = [
+    { root: 0, interleavings: Some(4) },
+    { root: 1, interleavings: None },
+    { root: 2, interleavings: Some(2) },
+  ];
+  assert_eq(summarized(trials), { median: Some(3.0m), worst: Some(4), misses: 1 });
+  assert_eq(summarized([{ root: 0, interleavings: Some(5) }]).median, Some(5m));
+  assert_eq(summarized([{ root: 0, interleavings: None }]), {
+    median: None,
+    worst: None,
+    misses: 1,
+  })
+}
+
+test "the pruned search passes against the unpruned one, and fails when it ran more or skipped one" {
+  assert_eq(verdict_of(reduction_row("m.t", a_search())), Pass);
+  let dearer = { ..a_search(), explored: 121 };
+  assert(verdict_of(reduction_row("m.t", dearer)) != Pass);
+  let skipped = { ..a_search(), failed: true, naive: Some({ explored: 40, bounded: true }) };
+  assert_eq(
+    verdict_of(reduction_row("m.t", skipped)),
+    Fail([
+      number("pruned", 12, "interleavings"),
+      number("naive", 40, "interleavings"),
+      number("skipped", 1, ""),
+    ]),
+  );
+  let stopped = { ..a_search(), failed: true, naive: None, blind: None };
+  assert(match verdict_of(reduction_row("m.t", stopped)) {
+    Inconclusive(why) -> string_contains(why, "stopped at a failure"),
+    _ -> false,
+  });
+  match reduction_row("m.t", a_search()).taken {
+    Ok(ms) -> assert_eq(report::value_of(ms, "reduction"), Some(10.0m)),
+    Err(why) -> panic(why),
+  }
+}
+
+test "the pruned search passes against the clock-blind one, fails when it ran more, and a bound decides nothing" {
+  assert_eq(verdict_of(synchronization_row("m.t", a_search())), Pass);
+  assert_eq(verdict_of(synchronization_row("m.t", { ..a_search(), explored: 30 })), Pass);
+  assert_eq(
+    verdict_of(synchronization_row("m.t", { ..a_search(), explored: 31 })),
+    Fail([number("pruned", 31, "interleavings"), number("unsynchronized", 30, "interleavings")]),
+  );
+  let lower_bound = |s: Searched|
+    match verdict_of(synchronization_row("m.t", s)) {
+      Inconclusive(why) -> string_contains(why, "lower bound"),
+      _ -> false,
+    };
+  assert(lower_bound({ ..a_search(), explored: 256, exhausted: true, exhaustive: false }));
+  assert(lower_bound({ ..a_search(), blind: Some({ explored: 4096, bounded: true }) }));
+  assert(lower_bound({ ..a_search(), explored: 31, blind: Some({ explored: 30, bounded: true }) }));
+  let stopped = { ..a_search(), failed: true, naive: None, blind: None };
+  assert(match verdict_of(synchronization_row("m.t", stopped)) {
+    Inconclusive(why) -> string_contains(why, "stopped at a failure"),
+    _ -> false,
+  })
+}
+
+test "a test with no race reports its misses and no ratio, and is no verdict on the search" {
+  let missed = map(range(0, 2), |r: Int| { root: r, interleavings: None });
+  let r = race_row("m.t", missed, missed);
+  match r.taken {
+    Ok(ms) -> {
+      assert_eq(report::value_of(ms, "dpor_misses"), Some(2m));
+      assert_eq(report::value_of(ms, "dpor_median"), None);
+      assert_eq(report::value_of(ms, "median_ratio"), None)
+    },
+    Err(why) -> panic(why),
+  };
+  assert(match verdict_of(r) {
+    Inconclusive(why) -> string_contains(why, "no race to find"),
+    _ -> false,
+  })
+}
+
+test "the search passes when it finds the failure from every root no later than sampling does" {
+  let found = |ns: List<Int>|
+    map(range(0, len(ns)), |i: Int| { root: i, interleavings: list_at(ns, i) });
+  let quick = found([2, 3]);
+  assert_eq(verdict_of(race_row("m.t", quick, found([9, 30]))), Pass);
+  assert_eq(
+    verdict_of(race_row("m.t", quick, map(range(0, 2), |r: Int| { root: r, interleavings: None }))),
+    Pass,
+  );
+  assert(verdict_of(race_row("m.t", found([40, 50]), quick)) != Pass);
+  let missing = [{ root: 0, interleavings: Some(2) }, { root: 1, interleavings: None }];
+  assert_eq(
+    verdict_of(race_row("m.t", missing, quick)),
+    Fail([number("dpor_misses", 1, "trials"), number("trials", 2, "trials")]),
+  );
+  match race_row("m.t", quick, found([9, 30])).taken {
+    Ok(ms) -> assert_eq(report::value_of(ms, "median_ratio"), Some(7.8m)),
+    Err(why) -> panic(why),
+  }
+}
+
+test "a rate counts the seeds it ran, and a sample that stopped at a failure ran fewer" {
+  let s = { ..a_search(), explored: 64, naive: None, us: 500000 };
+  let r = rate_row("m.t", 64, Some(80), s);
+  assert_eq(verdict_of(r), Pass);
+  match r.taken {
+    Ok(ms) -> {
+      assert_eq(report::value_of(ms, "per_second"), Some(128m));
+      assert_eq(report::value_of(ms, "definitions"), Some(80m))
+    },
+    Err(why) -> panic(why),
+  };
+  assert_eq(verdict_of(rate_row("m.t", 64, None, { ..s, explored: 9, failed: true })), Pass);
+  assert(verdict_of(rate_row("m.t", 64, None, { ..s, explored: 9 })) != Pass)
+}
+
+test "each trial searches one root, and no sample draws a seed another trial or a search does" {
+  assert_eq(dpor_flags(args(), 3), [
+    "--sim",
+    "dpor",
+    "--sim-roots",
+    "3..4",
+    "--sim-budget",
+    "4096",
+    "--sim-steps",
+    "100000",
+  ]);
+  assert_eq(random_flags(args(), sampled_from(4, 1), 4096), [
+    "--sim",
+    "random",
+    "--sim-roots",
+    "8..4104",
+    "--sim-steps",
+    "100000",
+  ]);
+  assert_eq(map(range(0, 4), |t: Int| sampled_from(4, t)), [4, 8, 12, 16])
+}
+
+test "a run's searches are read off its report, one for every test that reads a seed" {
+  let text = "{\"selection\":{\"tests\":[{\"index\":0,\"key\":\"m.plain\",\"seeded\":false},{\"index\":1,\"key\":\"m.raced\",\"seeded\":true},{\"index\":2,\"key\":\"m.quiet\",\"seeded\":true}]},\"results\":[{\"index\":0,\"duration_ms\":1.0,\"simulation\":null},{\"index\":1,\"duration_ms\":2.5,\"simulation\":{\"explored\":7,\"exhaustive\":false,\"exhausted\":false,\"blind\":{\"explored\":9,\"bounded\":false,\"rendered\":\"9\"},\"naive\":{\"explored\":70,\"bounded\":true,\"rendered\":\">= 70\"},\"reduction\":10.0,\"steps\":90,\"virtual_time_ns\":0,\"failing_seed\":\"4:0.1\"}},{\"index\":2,\"duration_ms\":0.5,\"simulation\":null}]}";
+  match json::parse_string(text) {
+    Err(_) -> panic("the report is JSON"),
+    Ok(j) -> match ran_of(j) {
+      Err(why) -> panic(why),
+      Ok(r) ->
+        assert_eq(r, [
+          {
+            key: "m.raced",
+            search: Some({
+              explored: 7,
+              exhaustive: false,
+              exhausted: false,
+              naive: Some({ explored: 70, bounded: true }),
+              blind: Some({ explored: 9, bounded: false }),
+              steps: 90,
+              failed: true,
+              us: 2500,
+            }),
+          },
+          { key: "m.quiet", search: None },
+        ]),
+    },
+  }
+}

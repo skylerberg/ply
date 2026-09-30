@@ -5,7 +5,7 @@ mod children;
 
 pub(crate) use children::{Children, Io, Output, Signal};
 
-use crate::pool::{Bell, Done, Exit, PROCESS_FIRST_TOKEN, Pool};
+use crate::pool::{Bell, Done, Exit, Inbox, PROCESS_FIRST_TOKEN, Pool};
 use children::{Child, Launch, Refusal, Unusable};
 use ply_eval::host::HostRegistry;
 use ply_eval::{
@@ -203,7 +203,7 @@ pub struct ProcessHost {
     /// Shared with the drains that forward an inheriting child's lines to a captured sink.
     sink: Arc<Sink>,
     exit: Mutex<Option<i32>>,
-    /// The programs `--exec NAME=PATH` bound; a label outside this is `E0456`.
+    /// The programs `--exec NAME=PATH` bound, which `bound` reads; a label outside them is `E0456`.
     executables: Executables,
     /// Where a spawn waits, so a driver that starts a compiler does not stop the machine.
     pool: Pool,
@@ -251,6 +251,14 @@ impl ProcessHost {
 
     pub fn owns(&self, pending: &Pending) -> bool {
         self.pool.owns(pending)
+    }
+
+    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
+        self.pool.watch(pending, inbox)
+    }
+
+    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        self.pool.collect(inbox)
     }
 
     pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
@@ -349,6 +357,7 @@ pub fn register(registry: &mut HostRegistry, host: Option<&Arc<ProcessHost>>) {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     Args,
+    Bound,
     Out,
     Err,
     Line,
@@ -363,8 +372,9 @@ pub enum Op {
 }
 
 impl Op {
-    pub const ALL: [Op; 12] = [
+    pub const ALL: [Op; 13] = [
         Op::Args,
+        Op::Bound,
         Op::Out,
         Op::Err,
         Op::Line,
@@ -381,6 +391,7 @@ impl Op {
     pub fn name(self) -> &'static str {
         match self {
             Op::Args => "args",
+            Op::Bound => "bound",
             Op::Out => "out",
             Op::Err => "err",
             Op::Line => "line",
@@ -398,6 +409,7 @@ impl Op {
     pub fn what(self) -> &'static str {
         match self {
             Op::Args => "`process.args`",
+            Op::Bound => "`process.bound`",
             Op::Out => "`process.out`",
             Op::Err => "`process.err`",
             Op::Line => "`process.line`",
@@ -415,6 +427,7 @@ impl Op {
     pub fn path(self) -> &'static str {
         match self {
             Op::Args => "ply_host::process::args",
+            Op::Bound => "ply_host::process::bound",
             Op::Out => "ply_host::process::out",
             Op::Err => "ply_host::process::err",
             Op::Line => "ply_host::process::line",
@@ -431,7 +444,7 @@ impl Op {
 
     pub fn arity(self) -> usize {
         match self {
-            Op::Args | Op::Line => 0,
+            Op::Args | Op::Bound | Op::Line => 0,
             Op::Out | Op::Err | Op::Exit | Op::EndInput => 1,
             Op::Wait | Op::Signal | Op::Input | Op::OutputLine => 2,
             Op::Spawn => 3,
@@ -442,7 +455,8 @@ impl Op {
     /// Labelled by the program `--exec` bound rather than by the run's own process.
     pub fn names_an_executable(self) -> bool {
         match self {
-            Op::Spawn
+            Op::Bound
+            | Op::Spawn
             | Op::Start
             | Op::Wait
             | Op::Signal
@@ -457,9 +471,14 @@ impl Op {
     pub fn waits(self) -> bool {
         match self {
             Op::Spawn | Op::Line | Op::Wait | Op::Input | Op::OutputLine => true,
-            Op::Args | Op::Out | Op::Err | Op::Exit | Op::Start | Op::Signal | Op::EndInput => {
-                false
-            }
+            Op::Args
+            | Op::Bound
+            | Op::Out
+            | Op::Err
+            | Op::Exit
+            | Op::Start
+            | Op::Signal
+            | Op::EndInput => false,
         }
     }
 
@@ -469,10 +488,10 @@ impl Op {
             op: Symbol::new(self.name()),
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
-            // The arguments never change; everything else writes, starts, signals, reaps or
-            // consumes.
+            // The arguments and the executables never change; everything else writes, starts,
+            // signals, reaps or consumes.
             linearity: match self {
-                Op::Args => Linearity::Repeatable,
+                Op::Args | Op::Bound => Linearity::Repeatable,
                 Op::Out
                 | Op::Err
                 | Op::Line
@@ -521,6 +540,9 @@ impl HostHandler for Operation {
                 let args = host.argv.iter().map(|arg| Value::Str(arg.as_str().into()));
                 Ok(HostAnswer::Value(Value::list(args.collect())))
             }
+            Op::Bound => Ok(HostAnswer::Value(Value::Bool(
+                host.executables.get(&req.atom.resource).is_some(),
+            ))),
             Op::Out | Op::Err => {
                 let text = req.args[0].as_str(span, "the text to write")?;
                 let stream = match self.op {
@@ -856,6 +878,9 @@ pub fn unbound(op: Op, at: &Resource, span: Span) -> Diagnostic {
     )
     .primary(span, format!("`{label}` names no program"))
     .note(format!("bind one beside the run: `--exec {label}=<program>`"))
+    .note(format!(
+        "a program that can do without it asks `process.bound[{label}]()` before it starts one"
+    ))
     .note("the label is the capability: a child process is outside what the effect system can promise, so which program a label may start is named where the run is configured, never in the program")
 }
 

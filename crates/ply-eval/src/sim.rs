@@ -98,8 +98,9 @@ impl fmt::Display for Seed {
     }
 }
 
+/// Never reused within a region, and wide enough that a server spawning without pause never wraps.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct TaskId(pub u32);
+pub struct TaskId(pub u64);
 
 impl fmt::Display for TaskId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -322,12 +323,13 @@ pub enum Access {
         id: Slot,
         mode: Mode,
     },
-    /// A `with_cell` took the next slot from the arena's bump pointer.
+    /// A `with_cell` took the lowest free slot of the store every stack shares.
     Alloc,
 }
 
 impl Access {
-    /// Cells conflict when one writes the same slot; allocations always, as they share one counter.
+    /// Cells conflict when one writes the same slot; allocations always, as the order they run in
+    /// decides which slot each takes.
     pub fn conflicts_with(&self, other: &Access) -> bool {
         match (self, other) {
             (Access::Atom(a), Access::Atom(b)) => a.conflicts_with(b),
@@ -412,14 +414,15 @@ pub struct Race {
     pub at: u32,
 }
 
-/// What an unpruned search would have explored.
+/// What a search run beside the pruned one explored; `bounded` when a spent budget or a failure
+/// stopped it short of its frontier, so the count is a lower bound.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Naive {
+pub struct Cost {
     pub explored: u32,
     pub bounded: bool,
 }
 
-impl fmt::Display for Naive {
+impl fmt::Display for Cost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.bounded {
             write!(f, ">= {}", self.explored)
@@ -436,8 +439,10 @@ pub struct Exploration {
     pub exhaustive: bool,
     /// The budget was spent.
     pub exhausted: bool,
-    /// `--measure-reduction` only.
-    pub naive: Option<Naive>,
+    /// `--measure-reduction` only: the same search with every pair of steps dependent.
+    pub naive: Option<Cost>,
+    /// `--measure-reduction` only: the same search with every step's vector clock withheld.
+    pub blind: Option<Cost>,
     pub steps: u64,
     /// Nanoseconds of virtual time the last interleaving consumed.
     pub virtual_time: i64,

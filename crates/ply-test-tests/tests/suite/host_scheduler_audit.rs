@@ -44,8 +44,7 @@ fn run_report(
     hosting: Hosting<'_>,
 ) -> RunReport {
     let unit = compiled.tier();
-    let executor = InterpExecutor::new(&compiled.port)
-        .with_backend(unit)
+    let executor = InterpExecutor::new(&compiled.port, unit)
         .with_search(search)
         .with_hosts(hosting);
     ply_test::run_with(

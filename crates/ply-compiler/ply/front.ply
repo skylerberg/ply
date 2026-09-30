@@ -22,7 +22,8 @@ import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index,
              digest, unused, Pin, Rehash, Rehashed, rehash_index)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, update_shapes, expanded_mods,
-              check_front_with, is_prelude_effect, builtin_schemes, builtin_docs, find_doc)
+              check_front_with, is_prelude_effect, builtin_schemes, builtin_docs, find_doc,
+              published_pure)
 import diag (Parsed, parse_all, parse_at, outside_every_module, placed)
 import pkg (Pkgs, Closure, Package, Pinned, closure, empty, pins_of)
 import resolve (Pkg, resolve_packaged, no_pkgs)
@@ -555,7 +556,7 @@ fn key_published(d: DefInfo) -> Bytes = {
       { p: out.p, texts: push(acc.texts, out.s) }
     },
   );
-  let pure = if len(d.footprint) == 0 && len(d.constraints) == 0 { b"true" } else { b"false" };
+  let pure = if published_pure(d) { b"true" } else { b"false" };
   bytes_concat_all([
     b"(",
     joined(printed.texts, b", "),
@@ -703,8 +704,9 @@ fn root_keys(mods: List<Mod>, c: Front, h: HashOutput) -> List<KeyRow> = {
 // --- The emitter's roots -----------------------------------------------------
 
 // One root the emitter offers: a definition, a spec clause, a test or a law part, with the arity
-// its body is emitted at and whether every parameter and the answer is `Int` or `Bool`.
-type EmitRoot = { root: Bytes, arity: Int, scalar: Bool, width: Bool, at: At }
+// its body is emitted at and whether every parameter and the answer is `Int` or `Bool`. `pure` is
+// a definition's published purity, which lets a memo answer for it; any other root runs each time.
+type EmitRoot = { root: Bytes, arity: Int, scalar: Bool, width: Bool, pure: Bool, at: At }
 
 // The span of a root the tables do not place: a test or law whose check output has no row.
 fn no_at() -> At = { module: no_module(), start: 0, end: 0 }
@@ -729,28 +731,6 @@ fn emit_ctors_of(mods: List<Mod>, c: Front) -> List<EmitCtor> = {
   let rest = fold(mods, [], |acc: List<CtorInfo>, m: Mod|
     append(acc, filter(c.ctors, |k: CtorInfo| k.module == m.name)));
   map(append(prelude, rest), |k: CtorInfo| { name: k.name, arity: k.arity })
-}
-
-// The roots that are pure and take no parameters, which the emitted unit memoizes.
-fn emit_constants(mods: List<Mod>, c: Front) -> List<Bytes> = {
-  let defs = map_of_entries(map(c.defs, |d: DefInfo| { key: d.name, value: d }));
-  fold(mods, [], |acc: List<Bytes>, m: Mod|
-    fold(m.module.items, acc, |a: List<Bytes>, it: Item|
-      match it {
-        IFn(d) -> {
-          let name = qualify(m.name, d.name.name);
-          match map_get(defs, name) {
-            None -> a,
-            Some(def) -> {
-              let sig = emit_signature(def.scheme.ty);
-              if len(sig.params) + len(def.scheme.label_vars) == 0 && len(def.footprint) == 0
-                  && len(def.constraints) == 0 { push(a, name) }
-              else { a }
-            },
-          }
-        },
-        _ -> a,
-      }))
 }
 
 // A fixed width, which a value crossing the compiled seam cannot carry: it is held there as
@@ -805,6 +785,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                   arity: len(sig.params) + len(def.scheme.label_vars),
                   scalar: scalar_params && emit_is_scalar(sig.ret),
                   width: mentions_width(def.scheme.ty),
+                  pure: published_pure(def),
                   at: span_at(def.at.module, def.at.span),
                 };
                 let clauses = fold(
@@ -819,6 +800,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                             arity: len(sig.params),
                             scalar: scalar_params,
                             width: false,
+                            pure: false,
                             at: span_at(def.at.module, def.at.span),
                           }),
                           requires: b.requires + 1,
@@ -832,6 +814,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                             arity: len(sig.params) + 1,
                             scalar: scalar_params && emit_is_scalar(sig.ret),
                             width: false,
+                            pure: false,
                             at: span_at(def.at.module, def.at.span),
                           }),
                           requires: b.requires,
@@ -850,6 +833,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
               arity: 0,
               scalar: false,
               width: false,
+              pure: false,
               at: match map_get(tests, qualify(m.name, d.name)) {
                 Some(t) -> span_at(t.at.module, t.at.span),
                 None -> no_at(),
@@ -872,6 +856,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                   arity: len(binders),
                   scalar: scalar,
                   width: false,
+                  pure: false,
                   at: match law { Some(l) -> span_at(l.at.module, l.at.span), None -> no_at() },
                 }),
             );
@@ -938,7 +923,6 @@ fn tables(
     keys: root_keys(mods, c, h),
     emit_roots: emit_roots(mods, c),
     emit_ctors: emit_ctors_of(mods, c),
-    emit_constants: emit_constants(mods, c),
     ordinals: map(mods, ordinal_row),
     bodies: h.bodies,
     test_bodies: h.test_bodies,
@@ -1550,7 +1534,6 @@ pub fn dump_of(a: Analysis) -> Dump =
         keys: [],
         emit_roots: [],
         emit_ctors: [],
-        emit_constants: [],
         ordinals: [],
         bodies: [],
         test_bodies: [],
@@ -2141,7 +2124,6 @@ pub type Dump = {
   keys: List<KeyRow>,
   emit_roots: List<EmitRoot>,
   emit_ctors: List<EmitCtor>,
-  emit_constants: List<Bytes>,
   ordinals: List<OrdinalRow>,
   bodies: List<BodyRow>,
   test_bodies: List<Bytes>,
@@ -2192,6 +2174,20 @@ test "the emitter's root keys cover every root and no two share one" {
       assert_eq(len(distinct), len(keys));
     },
   }
+}
+
+test "a root is pure only as a definition with no row and no constraint" {
+  let src = b"effect log { write emit(Bytes) -> Unit }\nfn origin() -> Int = 0\nfn hello() -> Unit / { log.write } = log.emit(b\"hi\")\nfn same<a>(x: a, y: a) -> Bool where derivable(eq, a) = x == y\nfn positive(n: Int) -> Int requires n > 0 = n\ntest \"t\" { assert_eq(origin(), 0) }\nlaw \"l\" forall (n: Int) { same(n, n) }";
+  let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
+  assert_eq(map(d.emit_roots, |r: EmitRoot| { root: r.root, pure: r.pure }), [
+    { root: b"m.origin", pure: true },
+    { root: b"m.hello", pure: false },
+    { root: b"m.same", pure: false },
+    { root: b"m.positive", pure: true },
+    { root: b"m.test#0", pure: false },
+    { root: b"m.positive#requires#0", pure: false },
+    { root: b"m.law#0.body", pure: false },
+  ])
 }
 
 test "a program's answer holds its warnings, its order, its packages and its modules" {

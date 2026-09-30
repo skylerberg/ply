@@ -1,14 +1,13 @@
 //! Discharging obligations, and the evidence they are filed and read back under.
 
-use ply_eval::DefHash;
+use ply_eval::{DefHash, Diagnostic, codes};
 use ply_prove::{
-    CaseReport, Certificate, Discharge, Evidence, Obligation, ProvePlan, ProveReport, Rule,
+    CaseReport, Certificate, Discharge, Evidence, Fault, Obligation, ProvePlan, ProveReport, Rule,
 };
 use ply_store::{
     CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule, Store,
 };
 use rayon::prelude::*;
-use std::collections::BTreeMap;
 use std::time::Instant;
 
 pub fn to_cached(evidence: &Evidence) -> CachedObligation {
@@ -124,38 +123,21 @@ fn from_cached_rule(rule: &CachedRule) -> Rule {
 }
 
 /// What a program decided about the obligations it asked about: which it reports on, which of those
-/// the cache could not answer for, and the key each answered one's evidence is read back from.
+/// the cache could not answer for, and the key each answered one's evidence is read back from. How
+/// each is discharged is the obligation's own strategy.
 #[derive(Clone, Debug, Default)]
 pub struct Choice {
     /// Which obligations the run reports on, by collection index, ascending.
     pub claims: Vec<usize>,
-    /// The finite domains the program decided, by collection index, for the claims it wants walked
-    /// rather than sampled. A claim without one is sampled, which is the program's decision too.
-    pub domains: Vec<(usize, Domain)>,
     /// Positions in `claims` the cache could not answer for, in order.
     pub to_discharge: Vec<usize>,
     /// Positions in `claims` the cache answered for, and the key each one's evidence is under.
     pub read: Vec<(usize, DefHash)>,
 }
 
-/// A finite domain, as the program measured it: each binder's shape, in binder order, and what the
-/// domain is called in an artifact. The runtime materialises a point from these and walks them
-/// itself; whether there are points to walk, and how many, is not its decision.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Domain {
-    pub shapes: Vec<ply_prove::domain::Shape>,
-    pub name: String,
-}
-
 pub trait Discharger: Sync {
-    /// `domain` is the program's own measurement of the obligation's binders, or `None` when it
-    /// decided to sample instead.
-    fn discharge(
-        &self,
-        obligation: &Obligation,
-        plan: &ProvePlan,
-        domain: Option<&Domain>,
-    ) -> Discharge;
+    /// Carries out the strategy the obligation holds.
+    fn discharge(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge;
 }
 
 /// A program's decision, carried out up to what the cache answered, so a discharger is built only
@@ -167,10 +149,6 @@ pub struct Asked {
     to_discharge: Vec<usize>,
     plan: ProvePlan,
     started: Instant,
-    /// What the program measured, keyed by the obligation's position in `obligations` — the same
-    /// index `to_discharge` holds. The discharge of a claim the program measured walks the points it
-    /// measured; a claim it did not is sampled.
-    domains: BTreeMap<usize, Domain>,
 }
 
 impl Asked {
@@ -196,7 +174,6 @@ impl Asked {
             to_discharge: choice.to_discharge.clone(),
             plan: plan.clone().normalized(),
             started,
-            domains: choice.domains.iter().cloned().collect(),
         }
     }
 
@@ -212,18 +189,12 @@ impl Asked {
             to_discharge,
             plan,
             started,
-            domains,
         } = self;
 
         let fresh: Vec<(usize, Discharge)> = to_discharge
             .par_iter()
             .filter(|&&index| index < obligations.len())
-            .map(|&index| {
-                (
-                    index,
-                    discharger.discharge(&obligations[index], &plan, domains.get(&index)),
-                )
-            })
+            .map(|&index| (index, discharger.discharge(&obligations[index], &plan)))
             .collect();
 
         let mut discharges: Vec<Option<Discharge>> = cached
@@ -234,24 +205,39 @@ impl Asked {
             discharges[index] = Some(discharge);
         }
 
-        // Every index either came from the cache or was discharged, so no `None` survives.
         let paired: Vec<(Obligation, Discharge)> = obligations
             .into_iter()
             .zip(discharges)
             .map(|(obligation, discharge)| {
-                let discharge = discharge.unwrap_or_else(|| {
-                    Discharge::Unattempted(ply_prove::Gap::UnhandledEffect(
-                        obligation.footprint.clone(),
-                    ))
-                });
+                let discharge = discharge.unwrap_or_else(|| unanswered(&obligation));
                 (obligation, discharge)
             })
             .collect();
 
         ProveReport {
             obligations: paired,
-            plan,
             duration: started.elapsed(),
         }
     }
+}
+
+/// A claim neither read back nor discharged: the program and the store disagree, which is Ply's.
+fn unanswered(obligation: &Obligation) -> Discharge {
+    Discharge::Faulted(Fault {
+        bindings: Vec::new(),
+        diagnostic: Box::new(
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!(
+                    "no evidence was read back or made for `{}`",
+                    obligation.owner
+                ),
+            )
+            .primary(obligation.span, "nothing was discharged for this claim")
+            .note(
+                "the program chose what the cache answered from the store this run reads; this is \
+                 Ply's fault",
+            ),
+        ),
+    })
 }

@@ -1,5 +1,6 @@
 // `world` — the program as the prover reads it: every declared type, every definition's signature,
-// and the obligations the program owes, built from the compiler's own answer.
+// the obligations the program owes and how each one is discharged, and the definitions and laws a
+// run answers for, built from the compiler's own answer.
 //
 // A type variable is numbered by where it first appears in the item it belongs to: a definition's
 // signature, a type's parameters, or one claim's binders taken together. Every binder of a claim is
@@ -11,15 +12,16 @@ import compiler.front (Whole, Analysed, Refused, analyse)
 import compiler.infer (CtorInfo, DefInfo, LawBinder, LawInfo, SpecInfo)
 import compiler.items (Item, IFn, SEnsures, SRequires)
 import compiler.exprs (Param)
-import compiler.hash (hex)
+import compiler.hash (HashOutput, hex)
 import compiler.resolve (Diag, Mod, diag1, qualify)
 import compiler.spine (Span)
 import compiler.tycore (Atom, Field, Printer, Type, TyCon, TyFn, TyRecord, TyVar, at, contains_int,
-                        field_get, print_resource, print_ty, printer_naming, printer_new,
-                        reserve_atoms, row_is_pure, row_text, tuple_arity, ty_letter)
+                        field_get, print_resource, print_row, print_ty, printer_naming, printer_new,
+                        reserve_atoms, row_is_pure, tuple_arity, ty_letter)
 import compiler.types (MWrite)
-import domain (Con, Decl, Fn, Record, Ty, Var, Variant)
-import obligation (Ensures, Frame, Kind, Law, Pure, Writes)
+import domain (Cases, Con, Decl, Domain, Fn, Record, Scalar, Shape, Ty, Var, Variant, finite,
+               name_of)
+import obligation (Def, Ensures, Frame, Kind, Law, Pure, Writes, Written)
 
 // A definition as a callee: its signature, and whether its published row is empty. The static
 // prover unfolds a call and shares one term between equal calls only when that row is.
@@ -27,6 +29,24 @@ pub type Signature = { name: String, ty: Ty, pure: Bool }
 
 // One binder of one claim: its name, its type, and that type as the compiler prints it.
 pub type Binder = { name: String, ty: Ty, text: String }
+
+// How the runtime discharges an obligation. Which search a claim goes to is decided here, once, and
+// the runtime carries it out.
+pub type Strategy =
+  // A law over a `simulate` region: its interleavings are searched at each of its points.
+  | Interleave(Points)
+  // A `law/host`: its body reaches the world, so it runs against the host a run binds.
+  | Hosted
+  // The static prover first, and what follows when that does not settle the claim.
+  | Static(Unsettled)
+
+// What follows a static attempt that settled nothing. Checking an `ensures` calls its owner, so an
+// owner that performs names its row: nothing supplies the handlers it needs.
+pub type Unsettled = | Unhandled(String) | Run(Points)
+
+// Every point of a domain small enough to walk, which is a proof when each one holds, with what an
+// artifact calls the domain; or a sample.
+pub type Points = | Every(Domain, String) | Drawn
 
 // A claim the program makes, and what discharging it needs to know.
 pub type Obligation = {
@@ -36,9 +56,13 @@ pub type Obligation = {
   owner: String,
   kind: Kind,
   at: { module: Int, start: Int, end: Int },
-  // A clause's are its owner's parameters, named as its signature writes them, then `result`; a
-  // law's are its `forall` binders.
+  // What a point of the claim's domain assigns: a clause's owner's parameters, named as its
+  // signature writes them, or a law's `forall` binders.
   binders: List<Binder>,
+  // A clause's `result`: its owner's answer, printed with the parameters and never drawn.
+  result: Option<Binder>,
+  // The name each type variable of the binders and the result prints as, by its number.
+  variables: List<String>,
   // A clause beside a `requires`, or a law with a `where`.
   guarded: Bool,
   // `law/host`: the body reaches the world.
@@ -48,16 +72,20 @@ pub type Obligation = {
   footprint: Option<String>,
   // What the owner leaves alone: an `ensures` promises everything outside what its row writes.
   frame: Frame,
+  strategy: Strategy,
 }
 
 pub type World = { decls: List<Decl>, signatures: List<Signature>, obligations: List<Obligation> }
 
-// The world, and the trouble that cost it an obligation.
-pub type Built = { world: World, warnings: List<Diag> }
+// The world; every definition and every hashed law of the modules a run answers for, in the
+// checker's order, which is what its coverage and its review count; and the trouble that cost it an
+// obligation.
+pub type Built = { world: World, defs: List<Def>, laws: List<Written>, warnings: List<Diag> }
 
 // Every declared type and signature, and the obligations of the modules `owned` answers for: every
 // definition's `ensures` clauses in the checker's order, then every law.
 pub fn world_of(w: Whole, owned: (Bytes) -> Bool) -> Built = {
+  let decls = decls_of(w.checked.ctors);
   let written = written_params(w.mods);
   let keys = fold(
     w.hashes.specs,
@@ -65,32 +93,102 @@ pub fn world_of(w: Whole, owned: (Bytes) -> Bool) -> Built = {
     |acc: Map<Bytes, List<Bytes>>, s: { name: Bytes, hashes: List<Bytes> }|
       map_insert(acc, s.name, s.hashes),
   );
-  let clauses = fold(
-    filter(w.checked.defs, |d: DefInfo| owned(d.module)),
-    { obligations: [], warnings: [] },
-    |acc: Owed, d: DefInfo| clauses_of(acc, d, written, keys),
-  );
-  let owed = fold(
-    filter(w.checked.laws, |l: LawInfo| owned(l.module)),
-    clauses,
-    |acc: Owed, l: LawInfo| law_of(acc, l, w.hashes.laws),
-  );
+  let defs = filter(w.checked.defs, |d: DefInfo| owned(d.module));
+  let laws = filter(w.checked.laws, |l: LawInfo| owned(l.module));
+  let clauses = fold(defs, { obligations: [], warnings: [] }, |acc: Owed, d: DefInfo|
+    clauses_of(acc, d, written, keys, decls));
+  let owed = fold(laws, clauses, |acc: Owed, l: LawInfo| law_of(acc, l, w.hashes.laws, decls));
   {
     world: {
-      decls: decls_of(w.checked.ctors),
+      decls: decls,
       signatures: map(w.checked.defs, signature_of),
       obligations: owed.obligations,
     },
+    defs: defined(defs, w.hashes),
+    laws: sentences_of(laws, w.hashes),
     warnings: owed.warnings,
   }
 }
 
-// The binders a point of a claim's domain assigns: a clause's `result` is its owner's answer, and
-// not something drawn.
-pub fn generated(o: Obligation) -> List<Binder> =
-  match o.kind {
-    Ensures(_) -> map(range(0, len(o.binders) - 1), |i: Int| at(o.binders, i)),
-    Law(_) -> o.binders,
+// --- What a run answers for ----------------------------------------------------------
+
+// Each definition with its hash, when the front end produced one, and its own clauses' sentences.
+fn defined(ds: List<DefInfo>, h: HashOutput) -> List<Def> = {
+  let hashed = fold(h.defs, map_new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
+    map_insert(acc, x.name, x.hash));
+  let clauses = fold(
+    h.spec_texts,
+    map_new(),
+    |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
+      map_insert(acc, x.name, x.hashes),
+  );
+  map(ds, |d: DefInfo|
+    {
+      name: text(d.name),
+      hash: match map_get(hashed, d.name) { Some(x) -> Some(text(hex(x))), None -> None },
+      specs: match map_get(clauses, d.name) { Some(xs) -> map(xs, hashed_text), None -> [] },
+    })
+}
+
+fn hashed_text(b: Bytes) -> String = text(hex(b))
+
+// Each law the front end hashed, as its sentence, which is its own hash when it has no other, and
+// every name it mentions.
+fn sentences_of(ls: List<LawInfo>, h: HashOutput) -> List<Written> = {
+  let mentioned = fold(
+    h.deps,
+    map_new(),
+    |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }|
+      map_insert(acc, x.name, x.names),
+  );
+  fold(ls, [], |acc: List<Written>, l: LawInfo|
+    match list_at(h.laws, l.index) {
+      None -> acc,
+      Some(hash) ->
+        push(acc, {
+          key: text(l.key),
+          text: hashed_text(match list_at(h.law_texts, l.index) { Some(t) -> t, None -> hash }),
+          mentions: map(match map_get(mentioned, l.key) { Some(ns) -> ns, None -> [] }, text),
+        }),
+    })
+}
+
+// --- How an obligation is discharged -------------------------------------------------
+
+// The binders' points: every one of them when their domain is finite and small enough to walk,
+// named as the binders print, or a sample.
+fn points_of(binders: List<Binder>, decls: List<Decl>) -> Points =
+  match finite(map(binders, |b: Binder| b.ty), decls) {
+    Some(domain) -> Every(domain, name_of(map(binders, |b: Binder| b.text))),
+    None -> Drawn,
+  }
+
+// An `ensures` is attempted statically whatever its owner performs, since a proof never calls the
+// owner; only a run over its points does.
+fn clause_strategy(performs: Option<String>, binders: List<Binder>, decls: List<Decl>) -> Strategy =
+  match performs {
+    Some(row) -> Static(Unhandled(row)),
+    None -> Static(Run(points_of(binders, decls))),
+  }
+
+// Whether a counterexample is walked down from the draw it came from. Only a point drawn one at a
+// time has a draw to walk from: an enumerated point is one a fixed order met, and an interleaving
+// search's are schedules.
+pub fn walks(s: Strategy) -> Bool =
+  match s { Static(Run(Drawn)) -> true, Hosted -> true, _ -> false }
+
+// A law's own row is a read of a `simulate` region unless the law is a `law/host`.
+fn law_strategy(
+  host: Bool,
+  footprint: Option<String>,
+  binders: List<Binder>,
+  decls: List<Decl>,
+) -> Strategy =
+  if host { Hosted } else {
+    match footprint {
+      Some(_) -> Interleave(points_of(binders, decls)),
+      None -> Static(Run(points_of(binders, decls))),
+    }
   }
 
 // --- Types ---------------------------------------------------------------------------
@@ -139,9 +237,12 @@ fn numbered(vars: List<Int>) -> Printer =
 
 type Named = { name: Bytes, ty: Type }
 
+// One claim's binders, and the name each of their variables prints as, by its number.
+type Printed = { binders: List<Binder>, variables: List<String> }
+
 // One claim's binders, numbered together and printed by one printer: two binders share a letter
 // exactly when they share a variable.
-fn binders_of(named: List<Named>) -> List<Binder> = {
+fn binders_of(named: List<Named>) -> Printed = {
   let vars = fold(named, [], |acc: List<Int>, b: Named| met(b.ty, acc));
   let printed = fold(
     named,
@@ -151,7 +252,7 @@ fn binders_of(named: List<Named>) -> List<Binder> = {
       { p: o.p, out: push(acc.out, { name: text(b.name), ty: ty_of(b.ty, vars), text: text(o.s) }) }
     },
   );
-  printed.out
+  { binders: printed.out, variables: map(range(0, len(vars)), |i: Int| text(ty_letter(i))) }
 }
 
 fn signature_of(d: DefInfo) -> Signature =
@@ -248,8 +349,11 @@ fn frame_of(footprint: List<Atom>) -> Frame = {
   }
 }
 
+// A row as a report prints it, its labels named apart from the resources it names.
 fn footprint_text(atoms: List<Atom>) -> Option<String> =
-  if len(atoms) == 0 { None } else { Some(text(row_text({ atoms: atoms, tail: None }))) }
+  if len(atoms) == 0 { None } else {
+    Some(text(print_row(reserve_atoms(printer_new(), atoms), { atoms: atoms, tail: None }).s))
+  }
 
 // A claim with no key was never hashed, so nothing may be filed or read under one for it.
 fn unhashed(name: Bytes, module: Int, s: Span) -> Diag = {
@@ -273,6 +377,7 @@ fn clauses_of(
   d: DefInfo,
   written: Map<Bytes, List<Bytes>>,
   keys: Map<Bytes, List<Bytes>>,
+  decls: List<Decl>,
 ) -> Owed = {
   let ensures = filter(d.spec, is_ensures);
   if len(ensures) == 0 { acc } else {
@@ -283,9 +388,12 @@ fn clauses_of(
     let names = match map_get(written, d.name) { Some(ns) -> ns, None -> [] };
     let params = map(range(0, min(len(names), len(shape.params))), |i: Int|
       { name: at(names, i), ty: at(shape.params, i) });
-    let binders = binders_of(push(params, { name: b"result", ty: shape.ret }));
+    let printed = binders_of(push(params, { name: b"result", ty: shape.ret }));
+    let binders = map(range(0, len(params)), |i: Int| at(printed.binders, i));
+    let result = list_at(printed.binders, len(params));
     let guarded = fold(d.spec, false, |g: Bool, s: SpecInfo| g || s.kind == SRequires);
     let frame = frame_of(d.footprint);
+    let strategy = clause_strategy(footprint_text(d.footprint), binders, decls);
     let hashed = match map_get(keys, d.name) { Some(hs) -> hs, None -> [] };
     fold(range(0, len(ensures)), acc, |out: Owed, ordinal: Int| {
       let clause = at(ensures, ordinal);
@@ -300,10 +408,13 @@ fn clauses_of(
               kind: Ensures(ordinal),
               at: at_of(d.at.module, clause.span),
               binders: binders,
+              result: result,
+              variables: printed.variables,
               guarded: guarded,
               host: false,
               footprint: footprint_text(clause.footprint),
               frame: frame,
+              strategy: strategy,
             }),
           },
       }
@@ -313,10 +424,12 @@ fn clauses_of(
 
 // A law's own row is empty, or a read of a simulation no program can write, so it leaves
 // everything alone.
-fn law_of(acc: Owed, l: LawInfo, hashes: List<Bytes>) -> Owed =
+fn law_of(acc: Owed, l: LawInfo, hashes: List<Bytes>, decls: List<Decl>) -> Owed =
   match list_at(hashes, l.index) {
     None -> { ..acc, warnings: push(acc.warnings, unhashed(l.key, l.at.module, l.at.span)) },
-    Some(key) ->
+    Some(key) -> {
+      let printed = binders_of(map(l.binders, |b: LawBinder| { name: b.name, ty: b.ty }));
+      let footprint = footprint_text(l.footprint);
       {
         ..acc,
         obligations: push(acc.obligations, {
@@ -324,13 +437,17 @@ fn law_of(acc: Owed, l: LawInfo, hashes: List<Bytes>) -> Owed =
           owner: text(l.key),
           kind: Law(Some(text(l.name))),
           at: at_of(l.at.module, l.at.span),
-          binders: binders_of(map(l.binders, |b: LawBinder| { name: b.name, ty: b.ty })),
+          binders: printed.binders,
+          result: None,
+          variables: printed.variables,
           guarded: l.has_guard,
           host: l.host,
-          footprint: footprint_text(l.footprint),
+          footprint: footprint,
           frame: Pure,
+          strategy: law_strategy(l.host, footprint, printed.binders, decls),
         }),
-      },
+      }
+    },
   }
 
 // --- Tests ---------------------------------------------------------------------------
@@ -361,6 +478,9 @@ fn signature_named(ss: List<Signature>, name: String) -> Signature =
 
 fn owned_by(os: List<Obligation>, owner: String) -> List<Obligation> =
   filter(os, |o: Obligation| o.owner == owner)
+
+fn strategies(os: List<Obligation>, owner: String) -> List<Strategy> =
+  map(owned_by(os, owner), |o: Obligation| o.strategy)
 
 test "a declared type is its constructors in declaration order, written over its parameters" {
   let w = built_of(
@@ -396,7 +516,7 @@ test "a signature numbers its variables by first appearance, and says whether it
   assert_eq(say.ty, Fn([Con("Bytes", [])], Con("Unit", []), false))
 }
 
-test "a clause's binders are its owner's parameters as written, then result, printed as one" {
+test "a clause's binders are its owner's parameters as written, and its result is printed with them" {
   let built = built_of(
     b"fn pick<a, b>(first: a, second: b) -> a requires len([second]) == 1 ensures len([result]) == 1 ensures len([first]) == 1 = first\n",
   );
@@ -404,12 +524,13 @@ test "a clause's binders are its owner's parameters as written, then result, pri
   let os = owned_by(built.world.obligations, "m.pick");
   assert_eq(map(os, |o: Obligation| o.kind), [Ensures(0), Ensures(1)]);
   let o = at(os, 0);
+  // A point assigns the parameters; `result` is the owner's answer at them.
   assert_eq(o.binders, [
     { name: "first", ty: Var(0), text: "a" },
     { name: "second", ty: Var(1), text: "b" },
-    { name: "result", ty: Var(0), text: "a" },
   ]);
-  assert_eq(map(generated(o), |b: Binder| b.name), ["first", "second"]);
+  assert_eq(o.result, Some({ name: "result", ty: Var(0), text: "a" }));
+  assert_eq(o.variables, ["a", "b"]);
   assert(o.guarded);
   assert_eq(o.frame, Pure);
   assert_eq(o.footprint, None);
@@ -434,8 +555,22 @@ test "every binder of one law shares one numbering, so two variables never read 
     Fn([Var(0)], Con("List", [Var(1)]), true),
   ]);
   assert_eq(map(o.binders, |b: Binder| b.text), ["a", "b", "(a) -> List<b>"]);
-  assert_eq(generated(o), o.binders);
+  assert_eq(o.variables, ["a", "b"]);
+  assert_eq(o.result, None);
   assert(!o.guarded)
+}
+
+// A report names a sampled variable, and one a proof left uninterpreted, by these names.
+test "a claim's variables are named as its binders print them, skipping a row's letters" {
+  let os = owned_by(
+    built_of(
+      b"law \"five\" forall (v: p, w: q, x: r, y: s, z: u) { len([v]) + len([w]) + len([x]) + len([y]) + len([z]) == 5 }\n",
+    ).world.obligations,
+    "m.five",
+  );
+  let o = at(os, 0);
+  assert_eq(o.variables, ["a", "b", "c", "d", "g"]);
+  assert_eq(map(o.binders, |b: Binder| b.text), o.variables)
 }
 
 test "an ensures is framed by what its owner writes, and a read changes nothing" {
@@ -453,7 +588,32 @@ test "a law that reaches the host carries its row as a report prints it" {
     ).world.obligations,
     "m.answers",
   );
-  assert_eq(map(os, |o: Obligation| (o.host, o.footprint)), [(true, Some("{m.db.read[users]}"))])
+  assert_eq(map(os, |o: Obligation| (o.host, o.footprint)), [(true, Some("{m.db.read[users]}"))]);
+  // Its domain is finite and small, and still nothing but the host answers for it.
+  assert_eq(map(os, |o: Obligation| o.strategy), [Hosted])
+}
+
+fn contains_name(names: List<String>, name: String) -> Bool =
+  fold(names, false, |found: Bool, n: String| found || n == name)
+
+fn hex_len(o: Option<String>) -> Int = match o { Some(t) -> string_len(t), None -> 0 }
+
+test "a run answers for its own definitions and hashed laws, each keyed as its baseline is" {
+  let w = whole_of(
+    b"fn f(x: Int) -> Int ensures result == x = x\nfn g() -> Int = 1\nlaw \"f is g\" forall (x: Int) { f(x) == x + g() - 1 }\n",
+  );
+  let built = world_of(w, every);
+  assert_eq(map(built.defs, |d: Def| d.name), ["m.f", "m.g"]);
+  assert_eq(map(built.defs, |d: Def| hex_len(d.hash)), [64, 64]);
+  // A definition's spec is its own clauses' sentences, and a law's is its own sentence.
+  assert_eq(map(built.defs, |d: Def| map(d.specs, string_len)), [[64], []]);
+  assert_eq(map(built.laws, |l: Written| (l.key, string_len(l.text))), [("m.f is g", 64)]);
+  let mentions = at(built.laws, 0).mentions;
+  assert(contains_name(mentions, "m.f") && contains_name(mentions, "m.g"));
+  // Scoped as the obligations are: a module the run does not own answers for nothing.
+  let other = world_of(w, |m: Bytes| m != b"m");
+  assert_eq(other.defs, []);
+  assert_eq(other.laws, [])
 }
 
 test "the claims of a module the run does not own are left out, and its types are not" {
@@ -463,4 +623,65 @@ test "the claims of a module the run does not own are left out, and its types ar
   );
   assert_eq(built.world.obligations, []);
   assert_eq(len(decl_named(built.world.decls, "m.Coin").variants), 2)
+}
+
+// --- Strategies ------------------------------------------------------------------------
+
+fn coin() -> Shape =
+  Cases(2, [{ name: "m.Heads", size: 1, fields: [] }, { name: "m.Tails", size: 1, fields: [] }])
+
+test "a claim that performs nothing is attempted statically, then walked or sampled" {
+  let os = built_of(
+    b"type Coin = | Heads | Tails\nfn turn(c: Coin, twice: Bool) -> Coin ensures result == c || result != c = if twice { c } else { match c { Heads -> Tails, Tails -> Heads } }\nfn double(n: Int) -> Int ensures result == n + n = n + n\nlaw \"coins\" forall (c: Coin, b: Bool) { c == c || b }\nlaw \"ints\" forall (n: Int) { n == n }\nlaw \"ground\" { 1 == 1 }\n",
+  ).world.obligations;
+  let walked = Static(
+    Run(Every({ shapes: [coin(), Scalar("Bool", 2)], points: 4 }, "m.Coin × Bool")),
+  );
+  // A clause's domain is its owner's parameters: the answer is computed at each point, not drawn.
+  assert_eq(strategies(os, "m.turn"), [walked]);
+  assert_eq(strategies(os, "m.coins"), [walked]);
+  assert_eq(strategies(os, "m.double"), [Static(Run(Drawn))]);
+  assert_eq(strategies(os, "m.ints"), [Static(Run(Drawn))]);
+  // A ground claim has exactly one point, and walking it is evaluating it.
+  assert_eq(strategies(os, "m.ground"), [Static(Run(Every({ shapes: [], points: 1 }, "unit")))])
+}
+
+test "an ensures whose owner performs is a gap once the static prover has not settled it" {
+  let os = built_of(
+    b"effect store {\n  read get() -> Int\n  write put(n: Int) -> Unit\n}\nfn peek() -> Int / {store.read} ensures true = store.get()\nfn poke(n: Int) -> Unit / {store.read, store.write} ensures true = store.put(n)\n",
+  ).world.obligations;
+  // A read needs a handler as much as a write does, though it leaves everything alone.
+  assert_eq(strategies(os, "m.peek"), [Static(Unhandled("{m.store.read}"))]);
+  assert_eq(strategies(os, "m.poke"), [Static(Unhandled("{m.store.read, m.store.write}"))])
+}
+
+// A law whose body reaches a `simulate` region, over `binders`, handing the first writer `first`.
+fn simulated(binders: Bytes, first: Bytes) -> Bytes =
+  bytes_concat_all([
+    b"effect chan {\n  write put[q](v: Int) -> Unit\n}\nfn worker(v: Int) -> Unit / {chan.write[q]} = chan.put[q](v)\nlaw \"two writers\" ",
+    binders,
+    b" {\n  with_cell[q]([]) { q -> {\n    handle {\n      simulate {\n        let a = task.spawn(|| worker(",
+    first,
+    b"));\n        let b = task.spawn(|| worker(2));\n        task.join(a);\n        task.join(b);\n        len(cell_get(q)) == 2\n      }\n    } with {\n      chan.put[q](v) -> cell_set(q, push(cell_get(q), v)),\n    }\n  } }\n}\n",
+  ])
+
+fn searched(binders: Bytes, first: Bytes) -> List<Strategy> =
+  strategies(built_of(simulated(binders, first)).world.obligations, "m.two writers")
+
+test "a law over a simulate region searches its interleavings, at every point it can walk" {
+  assert_eq(searched(b"forall (flip: Bool)", b"if flip { 1 } else { 3 }"), [
+    Interleave(Every({ shapes: [Scalar("Bool", 2)], points: 2 }, "Bool")),
+  ]);
+  assert_eq(searched(b"forall (n: Int)", b"n"), [Interleave(Drawn)]);
+  assert_eq(searched(b"", b"1"), [Interleave(Every({ shapes: [], points: 1 }, "unit"))])
+}
+
+test "only a counterexample drawn one point at a time is walked down" {
+  let every = Every({ shapes: [Scalar("Bool", 2)], points: 2 }, "Bool");
+  assert(walks(Static(Run(Drawn))));
+  assert(walks(Hosted));
+  assert(!walks(Static(Run(every))));
+  assert(!walks(Static(Unhandled("{m.store.read}"))));
+  assert(!walks(Interleave(Drawn)));
+  assert(!walks(Interleave(every)))
 }

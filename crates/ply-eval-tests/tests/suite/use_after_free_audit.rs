@@ -1,5 +1,5 @@
 use crate::fixture::Compiled;
-use ply_eval::arena::{Arena, Reclaim, RegionKind, Slot, Stats};
+use ply_eval::arena::{Arena, Owner, Reclaim, RegionKind, Slot, Stats};
 use ply_eval::{Diagnostic, Span, Value, codes};
 
 #[track_caller]
@@ -162,8 +162,10 @@ pub fn guarded() -> Int =
 fn what_a_close_reclaims_is_decided_by_the_extent_and_never_by_the_kind() {
     for kind in [RegionKind::Unique, RegionKind::Shared] {
         let mut arena = Arena::new();
-        let region = arena.open(kind, Span::DUMMY);
-        let cell = arena.alloc(Value::Int(1)).expect("the region is open");
+        let region = arena.open(Owner::ENTRY, kind);
+        let cell = arena
+            .alloc(Owner::ENTRY, Value::Int(1))
+            .expect("the region is open");
 
         assert_eq!(
             arena.close(region),
@@ -174,15 +176,18 @@ fn what_a_close_reclaims_is_decided_by_the_extent_and_never_by_the_kind() {
     }
 }
 
-/// Only the generation catches a stale read, so wrapping is the one way a wrong value returns.
+/// Only the generation catches a stale read, so between renewals wrapping is the one way a wrong
+/// value returns.
 #[test]
 fn a_positions_generation_only_rises_and_never_hands_back_an_identity() {
     const ROUNDS: u32 = 2_000;
     let mut arena = Arena::new();
     let mut seen: Vec<Slot> = Vec::new();
     for round in 0..ROUNDS {
-        let region = arena.open(RegionKind::Unique, Span::DUMMY);
-        let slot = arena.alloc(Value::Int(round as i64)).expect("just opened");
+        let region = arena.open(Owner::ENTRY, RegionKind::Unique);
+        let slot = arena
+            .alloc(Owner::ENTRY, Value::Int(round as i64))
+            .expect("just opened");
         assert_eq!(
             slot.index(),
             0,

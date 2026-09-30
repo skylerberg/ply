@@ -424,13 +424,12 @@ fn congruence_over_an_uninterpreted_function_decides_both_directions() {
 fn a_polymorphic_proof_records_its_sorts() {
     let f = fixture(CONGRUENCE);
     let proved = proof(&f, "congruence is polymorphic");
-    // Named as the claim's binders print them: `g: (a) -> b, u: a, v: a`.
-    assert_eq!(
-        proved.sorts,
-        vec![Symbol::new("a"), Symbol::new("b")],
-        "{:?}",
-        proved.sorts
-    );
+    // `g: (a) -> b, u: a, v: a`, by number: naming them is the world's.
+    assert_eq!(proved.sorts, vec![0, 1], "{:?}", proved.sorts);
+    let certificate = proved
+        .certify(true, &[Symbol::new("a"), Symbol::new("b")])
+        .expect("a witnessed guard is certified");
+    assert_eq!(certificate.sorts, [Symbol::new("a"), Symbol::new("b")]);
 }
 
 #[test]
@@ -681,7 +680,11 @@ fn two_calls_to_an_effectful_definition_are_not_one_term() {
 fn returns_zero(fixture: &Fixture, owner: &str) -> Decision {
     let ctx = fixture.context();
     let def = fixture.def(owner);
-    let binders = vec![Binder::new("result", Sort::int())];
+    let binders = vec![Binder {
+        name: Symbol::new("result"),
+        sort: Sort::int(),
+        text: "Int".to_string(),
+    }];
     decide(
         &ctx,
         &Goal {
@@ -879,13 +882,15 @@ fn a_certificate_needs_the_guard_to_admit_a_value() {
     let f = fixture(GUARDED);
     let guarded = proof(&f, "a guard nothing establishes");
     assert!(!guarded.guard_satisfiable);
-    assert!(guarded.certify(false).is_none());
-    let certificate = guarded.certify(true).expect("a kept case establishes it");
+    assert!(guarded.certify(false, &[]).is_none());
+    let certificate = guarded
+        .certify(true, &[])
+        .expect("a kept case establishes it");
     assert!(certificate.guard_satisfiable);
 
     let unguarded = proof(&f, "an unguarded claim");
     assert!(unguarded.guard_satisfiable);
-    assert!(unguarded.certify(false).is_some());
+    assert!(unguarded.certify(false, &[]).is_some());
 }
 
 const UNINHABITED: &str = r#"
@@ -899,7 +904,7 @@ fn an_uninhabited_domain_does_not_establish_satisfiability() {
     let f = fixture(UNINHABITED);
     let proved = proof(&f, "anything about nothing");
     assert!(!proved.guard_satisfiable);
-    assert!(proved.certify(false).is_none());
+    assert!(proved.certify(false, &[]).is_none());
 }
 
 const LISTS: &str = r#"

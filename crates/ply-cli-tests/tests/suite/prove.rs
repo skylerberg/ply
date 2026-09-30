@@ -571,12 +571,93 @@ fn bounded(x: Int) -> Int
     };
     assert_eq!(by_label("m.inc")["outcome"], "unattempted");
     assert_eq!(by_label("m.inc")["tier"], Value::Null);
+    assert!(
+        by_label("m.inc")["gap"]
+            .as_str()
+            .is_some_and(|gap| gap.contains("overflow")),
+        "`x + 1 > x` has no answer at `i64::MAX`, so no tier covers every input: {v}"
+    );
     assert_eq!(by_label("m.bounded")["tier"], "proved");
     assert_eq!(
         v["coverage"]["uncovered"].as_array().unwrap(),
         &vec![Value::from("m.inc")],
         "a definition whose only claim is a gap is one a reviewer still has to read"
     );
+}
+
+/// The seam carries no fixed width, so the tier declines `low_bit`; `inc` raises on its own.
+#[test]
+fn a_proposition_the_tier_declines_is_a_defect_in_ply_and_not_a_gap() {
+    const SOURCE: &str = "\
+fn low_bit(b: U8) -> Int
+  ensures result < 2
+= int_of_u8(b & 1u8)
+
+fn inc(x: Int) -> Int
+  ensures result > x
+= x + 1
+";
+    let dir = project(SOURCE);
+    let out = ply(dir.path())
+        .args(["prove", "--no-cache", "--json"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    let by_label = |needle: &str| -> Value {
+        v["obligations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["label"].as_str().unwrap_or_default().contains(needle))
+            .cloned()
+            .unwrap_or_else(|| panic!("no obligation for `{needle}`: {v}"))
+    };
+    let declined = by_label("m.low_bit");
+    assert_eq!(
+        declined["outcome"], "defect",
+        "the control must be an entry the tier declines: {declined}"
+    );
+    assert!(declined["tier"].is_null(), "{declined}");
+    assert!(
+        declined["gap"].is_null() && declined["gap_kind"].is_null(),
+        "Ply's failure is no gap in the claim: {declined}"
+    );
+    assert_eq!(declined["defect"]["code"], "E0505", "{declined}");
+    assert!(
+        declined["defect"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("declined")),
+        "{declined}"
+    );
+    assert!(
+        declined["defect"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("this is a defect in Ply")),
+        "{declined}"
+    );
+    let raised = by_label("m.inc");
+    assert_eq!(raised["outcome"], "unattempted", "{raised}");
+    assert_eq!(raised["gap_kind"], "raised", "{raised}");
+    assert_eq!(v["summary"]["defect"], 1, "{v}");
+    assert_eq!(v["summary"]["unattempted"], 1, "{v}");
+    let codes: Vec<&str> = v["diagnostics"]
+        .as_array()
+        .expect("a diagnostic array")
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert_eq!(
+        codes.iter().filter(|code| **code == "W0604").count(),
+        1,
+        "only the program's gap is W0604: {codes:?}"
+    );
+    assert!(codes.contains(&"E0505"), "{codes:?}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a defect fails the run, as one fails `ply test`: {v}"
+    );
+    assert_eq!(v["ok"], false, "{v}");
 }
 
 #[test]
@@ -712,6 +793,33 @@ law \"shift agrees with base\" forall (x: Int) where x > 0 && x < 1000
     }
 }
 
+/// A finite domain is walked in a fixed order, so the point that fails is the one reported: there
+/// is no draw to walk down from, and one regenerated in its place would be a point that holds.
+#[test]
+fn an_enumerated_refutation_is_reported_at_the_point_that_fails() {
+    let source = "\
+type Day = Mon | Tue | Wed | Thu | Fri | Sat | Sun
+
+fn rank(d: Day) -> Int =
+  match d { Mon -> 1, Tue -> 2, Wed -> 3, Thu -> 4, Fri -> 5, Sat -> 6, Sun -> 7 }
+
+law \"every day is early\" forall (d: Day) { rank(d) / 1 < 7 }
+";
+    let dir = project(source);
+    let v = json_of(
+        &ply(dir.path())
+            .args(["prove", "--no-cache", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let o = &v["obligations"][0];
+    assert_eq!(o["outcome"], "refuted", "{o}");
+    let counterexample = &o["counterexample"];
+    assert_eq!(counterexample["bindings"][0]["value"], "m.Sun", "{o}");
+    assert_eq!(counterexample["original"][0]["value"], "m.Sun", "{o}");
+    assert_eq!(counterexample["shrinks"], 0, "{o}");
+}
+
 /// A counterexample is not finished when it is found: the walk that makes it small is the
 /// program's, driven one question at a time through the shrink operations, and what a report shows
 /// is what the walk settled on. This is the end-to-end claim for that — the fixture
@@ -757,5 +865,11 @@ law \"the bound holds\"
     assert!(
         settled < started,
         "the walk settled on {settled}, no smaller than the {started} it started from: {text}"
+    );
+    // The draw is `i64::MAX`, whose size is past what an `Int` holds: read as one, the walk still
+    // halves its way down to where the claim starts to fail.
+    assert_eq!(
+        settled, 100,
+        "the walk stopped short of the boundary: {text}"
     );
 }

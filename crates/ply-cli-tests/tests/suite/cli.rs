@@ -2325,6 +2325,93 @@ fn the_search_plan_is_published_so_two_runs_can_be_compared() {
     assert_eq!(sim["budget"], 1);
 }
 
+/// The parent reads what each task wrote only after joining it: the join orders each read after its
+/// write, and only the steps' clocks tell the search so.
+const JOINED: &str = "\
+effect tally {
+  write bump[r](by: Int) -> Unit
+}
+
+fn fill_left() -> Int / {tally.bump[left], task.yield} = {
+  tally.bump[left](1);
+  task.yield();
+  tally.bump[left](2);
+  3
+}
+
+fn fill_right() -> Int / {tally.bump[right], task.yield} = {
+  tally.bump[right](4);
+  task.yield();
+  tally.bump[right](5);
+  9
+}
+
+test \"what the joined tasks wrote is read after the joins\" {
+  with_cell[left](0) { l ->
+    with_cell[right](0) { r ->
+      handle {
+        simulate {
+          let a = task.spawn(|| fill_left());
+          let b = task.spawn(|| fill_right());
+          assert_eq(task.join(a) + task.join(b), 12);
+          assert_eq(cell_get(l), 3);
+          assert_eq(cell_get(r), 9)
+        }
+      } with {
+        tally.bump[left](n) -> cell_set(l, cell_get(l) + n),
+        tally.bump[right](n) -> cell_set(r, cell_get(r) + n),
+      }
+    }
+  }
+}
+";
+
+#[test]
+fn a_measured_reduction_reports_a_clock_blind_search_that_ran_no_fewer_than_the_pruned_one() {
+    let dir = project(JOINED);
+    let v = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--no-cache", "--measure-reduction"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(v["summary"]["passed"], 1, "{v}");
+    let search = &v["results"][0]["simulation"];
+    let pruned = search["explored"].as_u64().expect("a pruned count");
+    assert_eq!(search["blind"]["bounded"], false, "{v}");
+    let blind = search["blind"]["explored"]
+        .as_u64()
+        .expect("a clock-blind count");
+    assert!(
+        blind >= pruned,
+        "{blind} interleavings without the clocks against {pruned} with them: {v}"
+    );
+    assert!(search["naive"]["explored"].is_u64(), "{v}");
+
+    let text = stdout_of(
+        &ply(dir.path())
+            .args(["test", "--no-cache", "--measure-reduction"])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        text.contains(&format!(" · blind {blind} · naive ")),
+        "{text}"
+    );
+
+    let unmeasured = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--no-cache"])
+            .output()
+            .unwrap(),
+    );
+    let search = &unmeasured["results"][0]["simulation"];
+    assert!(
+        search["blind"].is_null() && search["naive"].is_null(),
+        "{unmeasured}"
+    );
+}
+
 /// A `random` search files a pass under each root it ran as well as under the whole plan, so a
 /// narrower plan whose every root already passed on its own is answered without searching again.
 const ONE_SPAWN: &str = "\
@@ -2439,13 +2526,59 @@ fn a_test_run_binds_what_exec_names_and_withholds_the_rest_of_process() {
     assert_eq!(status("writes a line"), "failed", "{v}");
     assert_eq!(v["failures"][0]["diagnostic"]["code"], "E0424", "{v}");
 
-    // Without `--exec`, the spawn is withheld too, and the refusal says what binds it.
+    // Without `--exec`, the label is unbound, and the refusal says how to bind it.
     let bare = ply(dir.path())
         .args(["test", "--host", "--filter", "spawns"])
         .output()
         .unwrap();
     let text = stdout_of(&bare);
-    assert!(text.contains("`--exec`"), "{text}");
+    assert!(text.contains("no executable is bound to it"), "{text}");
+    assert!(text.contains("--exec echo="), "{text}");
+}
+
+/// A test asks which labels its run bound, and an unbound one is answered rather than withheld.
+const BOUND: &str = "\
+import std.process (process)
+
+fn echo_bound() -> Bool / {process.bound[echo]} = process.bound[echo]()
+
+fn cc_bound() -> Bool / {process.bound[cc]} = process.bound[cc]()
+
+test/nondet \"echo is bound\" { assert(echo_bound()) }
+
+test/nondet \"cc is not bound\" { assert(!cc_bound()) }
+";
+
+#[test]
+fn a_test_asks_which_labels_its_run_bound() {
+    let dir = project(BOUND);
+    let status = |v: &Value, label: &str| -> Value {
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == label)
+            .map(|r| r["status"].clone())
+            .unwrap_or(Value::Null)
+    };
+    let granted = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--host", "--exec", "echo=/bin/echo"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(status(&granted, "echo is bound"), "passed", "{granted}");
+    assert_eq!(status(&granted, "cc is not bound"), "passed", "{granted}");
+
+    let bare = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--host", "--no-cache"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(status(&bare, "echo is bound"), "failed", "{bare}");
+    assert_eq!(status(&bare, "cc is not bound"), "passed", "{bare}");
+    assert_ne!(bare["failures"][0]["diagnostic"]["code"], "E0424", "{bare}");
 }
 
 #[test]

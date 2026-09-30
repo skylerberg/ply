@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::cont::SimId;
 use crate::sched::{Stamp, StepRecord, happens_before};
-use crate::sim::{Exploration, Naive, Plan, Race, RaceSite, Seed, SimMode, StepFootprint, TaskId};
+use crate::sim::{Cost, Exploration, Plan, Race, RaceSite, Seed, SimMode, StepFootprint, TaskId};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Step {
@@ -128,35 +128,63 @@ pub fn explore_under(plan: &Plan, dependence: Dependence, driver: &mut dyn Simul
     }
 }
 
-/// [`explore`], then again with every pair dependent, to fill [`Exploration::naive`].
+/// A driver whose recordings carry no vector clocks, so the search cannot tell which dependent
+/// steps a spawn or a join already ordered.
+pub struct Blind<'a>(pub &'a mut dyn Simulation);
+
+impl Simulation for Blind<'_> {
+    fn run(&mut self, seed: &Seed) -> Interleaving {
+        let mut run = self.0.run(seed);
+        for step in &mut run.steps {
+            step.stamp.clear();
+        }
+        run
+    }
+}
+
+/// [`explore`], then the same search over a [`Blind`] driver and again with every pair dependent, to
+/// fill [`Exploration::blind`] and [`Exploration::naive`].
 pub fn measure_reduction(plan: &Plan, driver: &mut dyn Simulation) -> Explored {
     let mut explored = explore(plan, driver);
     if plan.mode != SimMode::Dpor || explored.exploration.failure.is_some() {
-        // Nothing was pruned, or both searches stopped at a failure rather than at their frontier.
+        // Nothing was pruned, or the searches would stop at a failure rather than at their frontier.
         return explored;
     }
-    let naive_plan = Plan {
+    let measuring = Plan {
         budget: plan.budget.max(NAIVE_BUDGET),
         ..plan.clone()
-    }
-    .normalized();
-    let naive = search(&naive_plan, Dependence::All, driver);
-    explored.exploration.naive = Some(Naive {
-        explored: naive.exploration.explored,
-        bounded: naive.exploration.exhausted || naive.exploration.failure.is_some(),
-    });
-    if let Some(seed) = naive.exploration.failure {
-        explored.exploration.failure = Some(seed);
+    };
+    let blind = explore(&measuring, &mut Blind(driver));
+    let naive = explore_under(&measuring, Dependence::All, driver);
+    explored.exploration.blind = Some(cost_of(&blind));
+    explored.exploration.naive = Some(cost_of(&naive));
+    // Each prunes less than the pruned search, so a failure only it reaches is one pruning skipped.
+    let skipped = [
+        (
+            blind,
+            "this interleaving was reached only with every step's vector clock withheld, so the \
+             pruned search skipped it: a step's recorded clock claims it observed a step it did not",
+        ),
+        (
+            naive,
+            "this interleaving was reached only with the dependence relation forced to true, so \
+             the pruned search skipped it: a step's recorded footprint is missing an access it made",
+        ),
+    ];
+    if let Some((failed, why)) = skipped.into_iter().find(|(measured, _)| !measured.passed()) {
+        explored.exploration.failure = failed.exploration.failure;
+        explored.exploration.race = failed.exploration.race;
         explored.exploration.exhaustive = false;
-        explored.diagnostic = naive.diagnostic.map(|d| {
-            d.note(
-                "this interleaving was reached only with the dependence relation forced to true, \
-                 so the pruned search skipped it: a step's recorded footprint is missing an \
-                 access it made",
-            )
-        });
+        explored.diagnostic = failed.diagnostic.map(|d| d.note(why));
     }
     explored
+}
+
+fn cost_of(measured: &Explored) -> Cost {
+    Cost {
+        explored: measured.exploration.explored,
+        bounded: measured.exploration.exhausted || !measured.passed(),
+    }
 }
 
 fn sample(plan: &Plan, driver: &mut dyn Simulation) -> Explored {

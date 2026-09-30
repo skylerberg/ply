@@ -32,7 +32,7 @@ of it next.
 | `crates/ply-cli` | the `ply` program, as Ply source in `ply/` and the artifact it builds (`bootstrap/`); not a cargo crate |
 | `crates/ply-registry` | the package registry `ply publish` and `ply resolve` talk to, as Ply source in `ply/`; not a cargo crate |
 | `crates/ply-launcher` | the `ply` binary: enters the program the artifact holds |
-| `crates/ply-corpus` | synthetic projects and the benchmark harnesses |
+| `crates/ply-corpus` | the benchmark corpus as a Ply program (`ply/`), the checks that run it end to end (`checks/`) and the programs it measures (`fixtures/`); not a cargo crate |
 | `crates/<crate>-tests` | that crate's tests |
 | `examples/`, `tests/lang/`, `tests/fixtures/` | Ply programs the suite runs |
 | `benches/` | benchmark scripts and their recorded output |
@@ -54,6 +54,9 @@ CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
 cut from the durations its last run measured.
 Tests that need a runner of their own are `SOLO` in `.github/ci-shards.sh`; run one
 with `cargo nextest run --workspace -E "$(.github/ci-shards.sh solo-filter <id>)"`.
+The corpus's tests are the Ply package `crates/ply-corpus/checks`, run by `.github/ci-corpus.sh`:
+each shard runs its share of them beside its nextest run, and the `corpus` job runs `serving` and
+`database` against a postgres. `.github/ci-corpus.sh run <id>` runs one with the grants CI passes.
 The postgres tests in `ply-host-tests` skip unless `PLY_PG_URL` and `PLY_TEST_DB`
 name a server.
 
