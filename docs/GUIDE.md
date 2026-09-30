@@ -2262,7 +2262,8 @@ leaves it unchanged; a failure raised by a run of it carries no line number. A
 body or closure that fails verification is `E0443`, as is a build whose closure
 holds two identical declarations it cannot tell apart (two effects, or two
 members of one recursive group); an artifact from another version is `E0444`.
-`--config-schema` ships that function too.
+`--config-schema` ships that function too, resolved as a run resolves it: a name
+that is not a nullary pure function returning a `ConfigSpec` is `E0440`.
 
 ## 16. The `ply` command
 

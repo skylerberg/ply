@@ -200,8 +200,8 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_span::Diagnostic> {
     }
     let binding = registry.bind(&front.check).expect("the prover ops bind");
     machine.set_host_binding(Arc::new(binding));
-    let loaded = ply_machine::load::load(project.path()).expect("the program under test loads");
-    let (_, obligations) = crate::fixture::world_of(&loaded);
+    let (_, _, obligations) =
+        crate::fixture::proving(project.path()).expect("the program under test loads");
     machine.call(
         "proof.obligation.main",
         vec![
@@ -270,11 +270,10 @@ fn the_fixture_declares_the_payload_where_the_machine_names_it() {
     let mut checked = 0;
     for (home, ty) in ply_machine::claims::MARSHALLED {
         let declared: Vec<&str> = front
-            .check
-            .ctors
+            .types
             .values()
-            .filter(|c| c.type_name.as_str().rsplit('.').next() == Some(*ty))
-            .map(|c| c.module.as_str())
+            .filter(|t| t.simple_name.as_str() == *ty)
+            .map(|t| t.module.as_str())
             .collect();
         if declared.is_empty() {
             continue;

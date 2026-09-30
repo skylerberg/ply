@@ -3,7 +3,6 @@
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::CheckOutput;
-use ply_ty::ty::Type;
 use serde_json::{Value as Json, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +14,8 @@ pub struct ConfigOptions {
     pub set: Vec<String>,
     /// A `KEY=VALUE` file, one pair per line, no quoting. Repeatable; a later file wins.
     pub files: Vec<PathBuf>,
-    /// `<module>.<fn>`: a nullary pure function returning a `ConfigSpec`, checked at start-up.
+    /// `<module>.<fn>`: a nullary pure function returning a `ConfigSpec`, resolved by the program
+    /// that configures the machine, or by the build that shipped it in an artifact.
     pub schema: Option<String>,
 }
 
@@ -24,9 +24,6 @@ impl ConfigOptions {
     pub fn read(&self, host: bool) -> Result<Option<Sources>, Vec<Diagnostic>> {
         if !host {
             return Ok(None);
-        }
-        if let Some(name) = &self.schema {
-            schema::check_shape(name).map_err(|d| vec![d])?;
         }
         Sources::read(&self.set, &self.files).map(Some)
     }
@@ -158,90 +155,24 @@ impl Configuration {
     }
 }
 
-/// Resolving `--config-schema <module>.<fn>` against the program and reading its value.
+/// Reading the `--config-schema` function's value. Which definition the flag names, and whether it
+/// is a nullary pure function returning a `ConfigSpec`, is decided before the machine is
+/// configured: by the CLI over the program it loaded, or by the build that shipped it in an
+/// artifact.
 pub mod schema {
     use super::*;
 
-    /// Matched on the name's tail so a project aliasing `std.config` still resolves.
-    const SPEC_TYPE: &str = "ConfigSpec";
-
     const KEYS: &str = "keys";
 
-    /// `<module>.<fn>`, before any program is in hand.
-    pub fn check_shape(name: &str) -> Result<(), Diagnostic> {
-        let segments: Vec<&str> = name.split('.').collect();
-        let well_formed = segments.len() >= 2
-            && segments.iter().all(|s| {
-                !s.is_empty()
-                    && s.chars()
-                        .next()
-                        .is_some_and(|c| c.is_alphabetic() || c == '_')
-                    && s.chars().all(|c| c.is_alphanumeric() || c == '_')
-            });
-        if well_formed {
-            return Ok(());
-        }
-        Err(Diagnostic::error(
-            codes::CONFIG_UNAVAILABLE,
-            format!("`--config-schema {name}` is not a `<module>.<fn>` name"),
-        )
-        .primary(Span::DUMMY, "this argument is the run's configuration")
-        .note("write the program-wide name of the function, as `ply hash` prints it"))
-    }
-
-    /// The definition `--config-schema` names, checked to be one a schema can be materialised from.
-    pub fn resolve<'a>(check: &'a CheckOutput, name: &str) -> Result<&'a Symbol, Diagnostic> {
-        let Some((symbol, def)) = check.defs.iter().find(|(key, _)| key.as_str() == name) else {
-            return Err(unknown(check, name));
-        };
-        let Type::Fn { params, ret, .. } = &def.scheme.ty else {
-            return Err(not_a_spec_fn(
-                name,
-                "it is not a function, and a schema is materialised by calling one",
-            ));
-        };
-        if !params.is_empty() {
-            return Err(not_a_spec_fn(
-                name,
-                &format!(
-                    "it takes {} argument{}, and the run has nothing to pass",
-                    params.len(),
-                    if params.len() == 1 { "" } else { "s" }
-                ),
-            ));
-        }
-        if !returns_spec(ret) {
-            return Err(not_a_spec_fn(
-                name,
-                &format!("it returns `{ret}` rather than a `ConfigSpec`"),
-            ));
-        }
-        if !def.footprint.is_empty() {
-            return Err(not_a_spec_fn(
-                name,
-                &format!(
-                    "its row is `{}`, and the schema is read before anything is bound, so it \
-                     must be pure",
-                    def.footprint
-                ),
-            ));
-        }
-        Ok(symbol)
-    }
-
-    /// Resolve, evaluate and decode; a name that resolves but will not evaluate is still a
-    /// refusal.
+    /// Evaluate and decode; a definition that will not evaluate is still a refusal.
     pub fn materialise(
         check: &CheckOutput,
         name: &str,
         constant: &dyn Fn(&str) -> Result<ply_eval::Value, Diagnostic>,
     ) -> Result<Spec, Diagnostic> {
-        resolve(check, name)?;
-        let def = check
-            .defs
-            .values()
-            .find(|d| d.name.as_str() == name)
-            .ok_or_else(|| unknown(check, name))?;
+        let Some(def) = check.defs.get(&Symbol::new(name)) else {
+            return Err(absent(name));
+        };
         let value = constant(name).map_err(|failure| {
             Diagnostic::error(
                 codes::CONFIG_UNAVAILABLE,
@@ -319,25 +250,6 @@ pub mod schema {
         })
     }
 
-    /// Structural, because inference expands the `ConfigSpec` record alias away.
-    fn returns_spec(ret: &Type) -> bool {
-        match ret {
-            Type::Con(name, args) if args.is_empty() => name
-                .as_str()
-                .rsplit('.')
-                .next()
-                .is_some_and(|tail| tail == SPEC_TYPE),
-            Type::Record(fields) => {
-                fields.len() == 1
-                    && matches!(
-                        fields.get(&Symbol::new(KEYS)),
-                        Some(Type::Con(name, args)) if name.as_str() == "List" && args.len() == 1
-                    )
-            }
-            _ => false,
-        }
-    }
-
     fn malformed(name: &str, why: &str) -> Diagnostic {
         Diagnostic::error(
             codes::CONFIG_UNAVAILABLE,
@@ -348,41 +260,14 @@ pub mod schema {
         .note("build it with `std.config`'s `spec`, `required`, `optional` and `with_default`")
     }
 
-    fn not_a_spec_fn(name: &str, why: &str) -> Diagnostic {
+    /// The CLI resolves a program's own before it configures a machine, so what this refuses is an
+    /// artifact's run, and an artifact carries the function only when its build shipped it.
+    fn absent(name: &str) -> Diagnostic {
         Diagnostic::error(
-            codes::CONFIG_UNAVAILABLE,
-            format!("`--config-schema {name}` does not name a configuration schema: {why}"),
-        )
-        .primary(Span::DUMMY, "this argument is the run's configuration")
-        .note("it must be a nullary pure function returning `std.config.ConfigSpec` — a record `{keys: List<Key>}`")
-    }
-
-    fn unknown(check: &CheckOutput, name: &str) -> Diagnostic {
-        let mut candidates: Vec<&str> = check
-            .defs
-            .iter()
-            .filter(|(_, def)| match &def.scheme.ty {
-                Type::Fn { params, ret, .. } => {
-                    params.is_empty() && returns_spec(ret) && def.footprint.is_empty()
-                }
-                _ => false,
-            })
-            .map(|(key, _)| key.as_str())
-            .collect();
-        candidates.sort_unstable();
-
-        let mut diagnostic = Diagnostic::error(
             codes::CONFIG_UNAVAILABLE,
             format!("`--config-schema {name}` names no definition in this program"),
         )
-        .primary(Span::DUMMY, "this argument is the run's configuration");
-        diagnostic = if candidates.is_empty() {
-            diagnostic
-                .note("this program declares no nullary function returning a `ConfigSpec`")
-                .note("drop `--config-schema`: without it a missing key is a `None` at the call site, later and per key and still the program's to handle")
-        } else {
-            diagnostic.note(format!("this program has: {}", candidates.join(", ")))
-        };
-        diagnostic
+        .primary(Span::DUMMY, "this argument is the run's configuration")
+        .note("an artifact carries a schema only when `ply build --config-schema` shipped it")
     }
 }
