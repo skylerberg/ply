@@ -51,7 +51,7 @@ SOLO=(
   "corpus-session-audit:ply-cli-tests:suite:incremental_audit::a_long_session_over_the_example_corpus_agrees_at_every_step"
   # The corpus's own socket bench, which nothing in a shard reaches: it binds a real listener, and
   # the CLI's reservations do not cover another crate's, so it gets a runner of its own.
-  "corpus-socket-bench:ply-corpus-tests:suite:unit::w3::the_socket_bench_serves_the_read_mix"
+  "corpus-socket-bench:ply-corpus-tests:suite:served::the_socket_bench_serves_the_desk_and_its_floor"
 )
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.

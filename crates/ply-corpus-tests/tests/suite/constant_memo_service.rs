@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ply_corpus::{w3, w6_run};
+use ply_corpus::w6_run::{self, Loaded, request};
 use std::path::{Path, PathBuf};
 
 fn repo() -> PathBuf {
@@ -12,45 +12,35 @@ fn repo() -> PathBuf {
 
 fn script() -> Vec<(&'static str, Vec<u8>)> {
     vec![
-        ("/health", w3::request("GET", "/health", None, false, 0, 0)),
-        ("/ready", w3::request("GET", "/ready", None, false, 0, 0)),
-        ("/items", w3::request("GET", "/items", None, false, 0, 0)),
+        ("/health", request("GET", "/health", None, false, 0, 0)),
+        ("/ready", request("GET", "/ready", None, false, 0, 0)),
+        ("/items", request("GET", "/items", None, false, 0, 0)),
         (
             "/items/featured",
-            w3::request("GET", "/items/featured", None, false, 0, 0),
+            request("GET", "/items/featured", None, false, 0, 0),
         ),
         (
             "/items/bolt",
-            w3::request("GET", "/items/bolt", None, false, 0, 0),
+            request("GET", "/items/bolt", None, false, 0, 0),
         ),
-        ("/orders", w3::request("GET", "/orders", None, false, 0, 0)),
-        (
-            "/orders/1",
-            w3::request("GET", "/orders/1", None, false, 0, 0),
-        ),
+        ("/orders", request("GET", "/orders", None, false, 0, 0)),
+        ("/orders/1", request("GET", "/orders/1", None, false, 0, 0)),
         (
             "/docs/orders/placing",
-            w3::request("GET", "/docs/orders/placing", None, false, 0, 0),
+            request("GET", "/docs/orders/placing", None, false, 0, 0),
         ),
-        (
-            "/nowhere",
-            w3::request("GET", "/nowhere", None, false, 0, 0),
-        ),
-        (
-            "/orders put",
-            w3::request("PUT", "/orders", None, false, 0, 0),
-        ),
-        ("* options", w3::request("OPTIONS", "*", None, false, 0, 0)),
+        ("/nowhere", request("GET", "/nowhere", None, false, 0, 0)),
+        ("/orders put", request("PUT", "/orders", None, false, 0, 0)),
+        ("* options", request("OPTIONS", "*", None, false, 0, 0)),
     ]
 }
 
-fn variants() -> Result<(w3::Loaded, w3::Loaded)> {
-    let service = w3::Service::open(&repo())?;
-    let source = service.source(w3::Variant::Sequential, w3::Transport::Http)?;
+fn variants() -> Result<(Loaded, Loaded)> {
+    let source = w6_run::desk_source(&repo())?;
     // The ladder's own rewrite, so this control and the one `w6-ladder` prices against are one program.
     let control = w6_run::without_constants(&source);
     assert_ne!(source, control, "the rewrite found nothing to disable");
-    Ok((w3::Loaded::parse(&source)?, w3::Loaded::parse(&control)?))
+    Ok((Loaded::parse(&source)?, Loaded::parse(&control)?))
 }
 
 #[test]

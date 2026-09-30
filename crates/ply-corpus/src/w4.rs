@@ -7,14 +7,12 @@ use ply_span::{Diagnostic, Span, Symbol};
 use ply_ty::CheckOutput;
 use ply_ty::ModuleName;
 use ply_ty::ty::Footprint;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use crate::serve::{Server, reserve_port};
-use crate::w3;
 
 /// The `ops` and `pool` sections' programs.
 const BENCH: &str = include_str!("../ply/w4.ply");
@@ -642,9 +640,9 @@ pub fn exhaustion(url: &str, pool: usize, concurrency: u32, acquire_ms: u64) -> 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Store {
-    /// `main` calls `run`, and the `db` atoms reach postgres.
+    /// `DESK_STORE=postgres`: the `db` atoms reach postgres.
     Postgres,
-    /// `main` calls `run_memory`, and they reach the twin.
+    /// `DESK_STORE=memory`: they reach the twin.
     Twin,
 }
 
@@ -657,21 +655,43 @@ impl Store {
     }
 }
 
-/// The corpus's own program for one store, copied into a project `ply run --host` can be pointed
-/// at. There is nothing to rewrite: each store's entry point is written down.
-pub fn project(dir: &Path, repo: &Path, store: Store, variant: w3::Variant) -> Result<()> {
-    let mode = match store {
-        Store::Postgres => "postgres",
-        Store::Twin => "memory",
-    };
-    let name = format!("desk-{}-{mode}.ply", variant.label());
-    let source = std::fs::read_to_string(repo.join("crates/ply-corpus/fixtures").join(name))?;
-    std::fs::write(dir.join("desk.ply"), source)?;
+/// Which accept loop a served desk runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Variant {
+    /// One connection at a time.
+    Sequential,
+    /// A task per connection on the production scheduler.
+    TaskPerConn,
+}
+
+impl Variant {
+    pub fn label(self) -> &'static str {
+        match self {
+            Variant::Sequential => "sequential",
+            Variant::TaskPerConn => "task-per-conn",
+        }
+    }
+
+    /// What `DESK_ACCEPT` calls it.
+    fn setting(self) -> &'static str {
+        match self {
+            Variant::Sequential => "sequential",
+            Variant::TaskPerConn => "task-per-connection",
+        }
+    }
+}
+
+/// `examples/desk.ply`, copied into a project `ply run --host` can be pointed at; which store and
+/// accept loop it serves are settings `served_args` carries.
+pub fn project(dir: &Path, repo: &Path) -> Result<()> {
+    std::fs::copy(repo.join("examples/desk.ply"), dir.join("desk.ply"))
+        .context("copying `examples/desk.ply`")?;
     Ok(())
 }
 
 /// The command line a served desk runs on: which config schema, its own settings, and where its
-/// database is when it has one.
+/// database is when it has one, which is also what chooses postgres over the twin.
 ///
 /// One function rather than four, so a flag the CLI does not declare is one edit from being caught:
 /// `a_served_run_takes_the_flags_the_sections_pass` drives the real CLI with this.
@@ -680,6 +700,7 @@ pub fn served_args(
     connections: u32,
     api_key: &str,
     database: Option<&str>,
+    variant: Variant,
 ) -> Vec<String> {
     let mut args = vec![
         "--config-schema".to_string(),
@@ -691,6 +712,17 @@ pub fn served_args(
         // A fixture value: `desk.config` declares the key `required`, so a run needs one.
         "--set".to_string(),
         format!("DESK_API_KEY={api_key}"),
+        "--set".to_string(),
+        format!(
+            "DESK_STORE={}",
+            if database.is_some() {
+                "postgres"
+            } else {
+                "memory"
+            }
+        ),
+        "--set".to_string(),
+        format!("DESK_ACCEPT={}", variant.setting()),
     ];
     if let Some(url) = database {
         args.push("--set".to_string());
@@ -708,7 +740,7 @@ pub fn crud(
     concurrencies: &[u32],
     per_conn: u32,
     requests_per_point: u32,
-) -> Result<Vec<w3::LoadPoint>> {
+) -> Result<Vec<LoadPoint>> {
     let routes: [(&'static str, &'static str); 3] = [
         ("health (no db)", "/health"),
         ("items (1 select)", "/items"),
@@ -717,24 +749,25 @@ pub fn crud(
     let mut out = Vec::new();
     for &store in stores {
         for &concurrency in concurrencies {
-            let conns_per_thread = w3::share(concurrency, per_conn, requests_per_point);
+            let conns_per_thread = share(concurrency, per_conn, requests_per_point);
             let budget = concurrency * conns_per_thread * routes.len() as u32 + 1;
             let dir = tempfile::tempdir().context("a temp dir for the served project")?;
             let port = reserve_port()?;
-            project(dir.path(), repo, store, w3::Variant::Sequential)?;
+            project(dir.path(), repo)?;
             let mut args = served_args(
                 port,
                 budget,
                 "bench-key",
                 (store == Store::Postgres).then_some(url),
+                Variant::Sequential,
             );
             args.extend(["--trace".to_string(), "off".to_string()]);
             let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
             let mut server = Server::start(ply, dir.path(), &borrowed)?;
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            w3::wait_until_serving(&mut server, addr)?;
+            wait_until_serving(&mut server, addr)?;
             for (name, path) in routes {
-                out.push(w3::load_point(
+                out.push(load_point(
                     &mut server,
                     addr,
                     store.label(),
@@ -751,13 +784,386 @@ pub fn crud(
     Ok(out)
 }
 
+// --- A served desk and the Ply load client, for `crud` and `w5`'s served sections ------------
+
+/// A port nothing is listening on.
+pub fn reserve_port() -> Result<u16> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("reserving an ephemeral port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// `ply run --host`, killed however the harness leaves.
+pub struct Server {
+    child: Option<Child>,
+    /// The binary this was started with, which is also the one a load client runs.
+    ply: PathBuf,
+}
+
+impl Server {
+    /// `extra` is appended to the fixed arguments.
+    pub fn start(ply: &Path, dir: &Path, extra: &[&str]) -> Result<Server> {
+        Server::start_with(ply, dir, extra, Stdio::piped())
+    }
+
+    /// The same, with somewhere else for the trace sink to write.
+    pub fn start_with(ply: &Path, dir: &Path, extra: &[&str], stderr: Stdio) -> Result<Server> {
+        let child = Command::new(ply)
+            .args(["run", "--host", "--color", "never"])
+            .args(extra)
+            .current_dir(dir)
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .with_context(|| format!("starting `{} run --host`", ply.display()))?;
+        Ok(Server {
+            child: Some(child),
+            ply: ply.to_path_buf(),
+        })
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
+    /// Block until the process exits, answering its status and everything it wrote.
+    pub fn wait(mut self, within: Duration) -> Result<(std::process::ExitStatus, String)> {
+        let deadline = Instant::now() + within;
+        loop {
+            let child = self.child.as_mut().expect("the server has not been reaped");
+            match child.try_wait()? {
+                Some(status) => return Ok((status, self.take())),
+                None if Instant::now() >= deadline => {
+                    bail!("the server was still running {within:?} after the signal")
+                }
+                None => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+    }
+
+    pub fn exited(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        let child = self.child.as_mut().expect("the server has not been reaped");
+        Ok(child.try_wait()?)
+    }
+
+    /// The output if the server has died; never blocks on a live process's pipe.
+    fn output_if_exited(&mut self) -> String {
+        match self.exited() {
+            Ok(Some(status)) => format!("the server exited {status}:\n{}", self.take()),
+            Ok(None) => "the server was still running".to_string(),
+            Err(e) => format!("the server could not be waited on: {e}"),
+        }
+    }
+
+    /// The server was given its fixed connection count, so it must exit on its own.
+    pub fn finish(mut self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let child = self.child.as_mut().expect("the server has not been reaped");
+            match child.try_wait()? {
+                Some(status) if status.success() => return Ok(()),
+                Some(status) => bail!("the server exited {status}:\n{}", self.take()),
+                None if Instant::now() >= deadline => {
+                    bail!("the server was still running a minute after every connection")
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    fn take(&mut self) -> String {
+        let Some(child) = self.child.take() else {
+            return String::new();
+        };
+        match child.wait_with_output() {
+            Ok(out) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => format!("(the server's output could not be read: {e})"),
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The load client's own source, so the file the harness runs and the file the corpus checks are
+/// one file.
+const LOAD_CLIENT: &str = include_str!("../fixtures/load.ply");
+
+/// What one run of the load client found, as the program wrote it down.
+#[derive(Clone, Debug, Deserialize)]
+struct Report {
+    answered: u32,
+    wall_micros: i64,
+    latencies: Vec<i64>,
+    statuses: Vec<Status>,
+    failures: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct Status {
+    status: u16,
+    count: u32,
+}
+
+/// The load client: the program on disk and a root its report is written under.
+struct LoadClient {
+    ply: PathBuf,
+    dir: tempfile::TempDir,
+    root: tempfile::TempDir,
+}
+
+impl LoadClient {
+    fn new(ply: &Path) -> Result<LoadClient> {
+        let dir = tempfile::tempdir().context("a temp dir for the load client")?;
+        std::fs::write(dir.path().join("load.ply"), LOAD_CLIENT)
+            .context("writing the load client")?;
+        let root = tempfile::tempdir().context("a temp dir for the load client's report")?;
+        Ok(LoadClient {
+            ply: ply.to_path_buf(),
+            dir,
+            root,
+        })
+    }
+
+    /// One run: `connections` connections carrying `per_conn` requests each over `paths`, over TLS
+    /// when `trust` names the certificate to accept.
+    fn measure(
+        &self,
+        addr: std::net::SocketAddr,
+        paths: &str,
+        connections: u32,
+        per_conn: u32,
+        trust: Option<&Path>,
+    ) -> Result<Report> {
+        let report = "load.json";
+        // A stale report would be read as this run's.
+        let _ = std::fs::remove_file(self.root.path().join(report));
+        let mut command = Command::new(&self.ply);
+        command
+            .args(["run", "--host", "--color", "never"])
+            .arg("--fs")
+            .arg(format!("report={}", self.root.path().display()))
+            // The name `certgen` issues a certificate for, which is what TLS verifies.
+            .args(["--set", "LOAD_HOST=localhost"])
+            .args(["--set", &format!("LOAD_PORT={}", addr.port())])
+            .args(["--set", &format!("LOAD_ROUTES={paths}")])
+            .args(["--set", &format!("LOAD_CONNECTIONS={connections}")])
+            .args(["--set", &format!("LOAD_PER_CONN={per_conn}")])
+            .args(["--set", &format!("LOAD_TLS={}", trust.is_some())])
+            .args(["--set", &format!("LOAD_REPORT={report}")])
+            .current_dir(self.dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(certificate) = trust {
+            command.arg("--trust").arg(certificate);
+        }
+        let out = command.output().with_context(|| {
+            format!(
+                "running `{} run --host` as a load client",
+                self.ply.display()
+            )
+        })?;
+        if !out.status.success() {
+            bail!(
+                "the load client exited {} at {connections}x{per_conn} on {paths}:\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let path = self.root.path().join(report);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("the load client wrote no report to `{}`", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("reading `{}`", path.display()))
+    }
+}
+
+/// Connections per client for a point, so each carries about `requests_per_point` requests.
+pub fn share(concurrency: u32, per_conn: u32, requests_per_point: u32) -> u32 {
+    let wanted = requests_per_point.div_ceil(concurrency * per_conn).max(1);
+    wanted.min((1000 / concurrency).max(1))
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LoadPoint {
+    pub variant: &'static str,
+    pub transport: &'static str,
+    pub label: String,
+    pub concurrency: u32,
+    pub per_conn: u32,
+    pub connections: u32,
+    pub requests: u32,
+    pub seconds: f64,
+    pub per_second: f64,
+    pub p50_micros: f64,
+    pub p95_micros: f64,
+    pub p99_micros: f64,
+    pub max_micros: f64,
+}
+
+/// Nearest-rank.
+fn percentile(of: &[i64], p: f64) -> f64 {
+    if of.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = of.to_vec();
+    sorted.sort_unstable();
+    let rank = ((p * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1] as f64
+}
+
+/// A partial answer is a different measurement, not a slower server.
+fn require(report: &Report, requests: u32) -> Result<()> {
+    if !report.failures.is_empty() || report.answered != requests {
+        bail!(
+            "{} of {requests} requests were answered ({} failures); first: {}",
+            report.answered,
+            report.failures.len(),
+            report
+                .failures
+                .first()
+                .map(String::as_str)
+                .unwrap_or("none recorded")
+        );
+    }
+    let bad: Vec<String> = report
+        .statuses
+        .iter()
+        .filter(|s| s.status != 200)
+        .map(|s| format!("{}x {}", s.count, s.status))
+        .collect();
+    if !bad.is_empty() {
+        bail!("the server answered {}", bad.join(", "));
+    }
+    Ok(())
+}
+
+/// Block until the server answers a real request, so timing does not race its typecheck.
+pub fn wait_until_serving(server: &mut Server, addr: std::net::SocketAddr) -> Result<()> {
+    wait_until_serving_over(server, addr, None)
+}
+
+/// The same over whichever transport the server was started with; `trust` is a certificate a TLS
+/// client accepts beside the built-in roots, which is what makes it speak TLS at all.
+pub fn wait_until_serving_over(
+    server: &mut Server,
+    addr: std::net::SocketAddr,
+    trust: Option<&Path>,
+) -> Result<()> {
+    let client = LoadClient::new(&server.ply)?;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Some(status) = server.exited()? {
+            bail!(
+                "the server exited {status} before listening:\n{}",
+                server.take()
+            );
+        }
+        if let Ok(report) = client.measure(addr, "/health", 1, 1, trust)
+            && report.answered == 1
+            && report.failures.is_empty()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("nothing answering on {addr} after three minutes");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// One measured point against a server the caller started.
+#[allow(clippy::too_many_arguments)]
+pub fn load_point(
+    server: &mut Server,
+    addr: std::net::SocketAddr,
+    variant: &'static str,
+    label: &'static str,
+    path: &str,
+    concurrency: u32,
+    per_conn: u32,
+    conns_per_thread: u32,
+) -> Result<LoadPoint> {
+    load_point_over(
+        server,
+        addr,
+        None,
+        variant,
+        label,
+        path,
+        concurrency,
+        per_conn,
+        conns_per_thread,
+    )
+}
+
+/// The same over whichever transport the server was started with.
+#[allow(clippy::too_many_arguments)]
+pub fn load_point_over(
+    server: &mut Server,
+    addr: std::net::SocketAddr,
+    trust: Option<&Path>,
+    variant: &'static str,
+    label: &'static str,
+    path: &str,
+    concurrency: u32,
+    per_conn: u32,
+    conns_per_thread: u32,
+) -> Result<LoadPoint> {
+    let connections = concurrency * conns_per_thread;
+    let requests = connections * per_conn;
+    let client = LoadClient::new(&server.ply)?;
+    let measured = client.measure(addr, path, connections, per_conn, trust);
+    let report = measured.with_context(|| {
+        format!(
+            "{label} at concurrency {concurrency}\n{}",
+            server.output_if_exited()
+        )
+    })?;
+    require(&report, requests).with_context(|| {
+        format!(
+            "{label} at concurrency {concurrency}\n{}",
+            server.output_if_exited()
+        )
+    })?;
+    let seconds = report.wall_micros as f64 / 1e6;
+    Ok(LoadPoint {
+        variant,
+        transport: if trust.is_some() { "https" } else { "http" },
+        label: label.to_string(),
+        concurrency,
+        per_conn,
+        connections,
+        requests,
+        seconds,
+        per_second: if seconds > 0.0 {
+            requests as f64 / seconds
+        } else {
+            0.0
+        },
+        p50_micros: percentile(&report.latencies, 0.50),
+        p95_micros: percentile(&report.latencies, 0.95),
+        p99_micros: percentile(&report.latencies, 0.99),
+        max_micros: percentile(&report.latencies, 1.0),
+    })
+}
+
 #[derive(Default, Serialize)]
 pub struct Measurements {
     pub ops: Vec<OpPoint>,
     pub sizes: Vec<SizePoint>,
     pub pool: Vec<PoolPoint>,
     pub exhaustion: Vec<Exhaustion>,
-    pub crud: Vec<w3::LoadPoint>,
+    pub crud: Vec<LoadPoint>,
 }
 
 pub fn render(m: &Measurements) -> String {
