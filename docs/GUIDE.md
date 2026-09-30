@@ -283,6 +283,10 @@ NAME` says how a package got here: the path from the root package to it through
 the packages that declare it, then the version and digest it resolved to. `Git`
 and `Registry` sources arrive with resolution.
 
+A command acts on the root package, the one whose tree it was given: a
+dependency's `main` is no entry point, and `ply test` runs the root package's
+tests and never a dependency's, which are that package's own to run.
+
 ## 4. Types
 
 Types are inferred by Hindley–Milner unification with row polymorphism. Written
@@ -822,11 +826,13 @@ an abandoned test is not a success, since it decided nothing about that test.
 
 A failing deterministic test that has passed before is bisected over the
 definitions that changed to name a culprit. `--bisect auto|always|never`
-(default `auto`), `--bisect-budget N` (evaluations, default 64), and
-`--trace auto|always|never` (record which definitions a failure entered) control
-this. `--json` prints one object with each failure's diagnostic, values,
-footprint, suspects, culprit and replay command. `--watch` re-runs on every
-`.ply` change, keeping caches in memory.
+(default `auto`) and `--bisect-budget N` (evaluations, default 64) control
+this. `--json` prints one object with each failure's diagnostic, declared
+footprint, suspects, culprit and replay command (`schema_version` 6); the
+suspects are ranked culprits first, then an edited definition before one whose
+hash only moved. Each result counts the operations its test performed,
+handled ones included, as `performs`. `--watch` re-runs on every `.ply` change,
+keeping caches in memory.
 
 ### 8.5 Coverage and mutants
 
@@ -917,7 +923,8 @@ holds for **every** interleaving and is reported `exhaustive`.
 | `--sim dpor` | footprint-guided partial-order reduction (default) |
 | `--sim random` | one interleaving per seed |
 | `--sim once` | exactly one interleaving |
-| `--seeds N` | seeds per test (default 1 under `dpor`, 64 under `random`) |
+| `--seeds N` | seeds per test, from 0 (default 1 under `dpor`, 64 under `random`) |
+| `--sim-roots FROM..TO` | the seeds from `FROM` up to but not including `TO` instead: `5..6` is seed 5 alone |
 | `--sim-budget N` | interleavings per seed (`dpor` only) |
 | `--sim-steps N` | steps per interleaving before `E0414` |
 | `--seed 7`, `--seed 7:3.0.2` | replay one interleaving; implies `--sim once` |
@@ -981,7 +988,12 @@ values. Flags: `--prove-cases N` (below 25 kept cases only `example`),
 `--prove-roots N`, `--prove-budget N` (spent reports `property`),
 `--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
 1000000000; an evaluation past it leaves the obligation `unattempted`, and the
-number keys the cached result, so more budget is a stronger claim).
+number keys the cached result, so more budget is a stronger claim). `--reach`
+asks the static tier alone about every obligation the run reports on, cached or
+not, and under `--json` each then carries `reach`: what it decided (`proved`,
+`guard_unsatisfiable`, `open` or `budget_spent`), the steps it spent, and each
+place it left the decidable fragment as `{kind, about}` — `null` for a law over
+interleavings, which the static tier never sees.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
@@ -1354,11 +1366,13 @@ line, `line` reads one line of the program's standard input without its line
 ending and answers `None` at end of input (a `write`, because each line is
 consumed and two readers of one input race for it), and `exit` ends the program
 there: nothing after it runs, no value is
-printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). It is
-bound only by `ply run --host`; `ply test` withholds it, even with `--host`
-(`E0424`). Under `ply run --json` the lines `out` writes go to stderr, so stdout
-still carries the one object. Handle it over a `Captured` value: `captured(args)`,
-`args_step`, `out_step`, `err_step`, `line_step` and `exit_step` keep each line,
+printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). These
+are bound only by `ply run --host`; `ply test` withholds them, even with
+`--host` (`E0424`). The operations whose label is an executable — `spawn`,
+`start` and those on a started child — are bound by `ply test --host` too, for
+the labels `--exec` names. Under `ply run --json` the lines `out` writes go to
+stderr, so stdout still carries the one object. Handle it over a `Captured`
+value: `captured(args)`, `args_step`, `out_step`, `err_step`, `line_step` and `exit_step` keep each line,
 hand out `with_input`'s scripted input lines, and the first exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
 ends the handled body as the host would.
 
@@ -2193,8 +2207,9 @@ handler that would serve it. With `--host`, a test that reaches a bound handler
 always runs and is never cached. An operation performed inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal` and `std.process` are bound only
-by `ply run --host`; `ply test --host` withholds them (`E0424`). All flags
-below require `--host`.
+by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
+test run binds `process.spawn`, `process.start` and the operations on a started
+child for the labels `--exec` names. All flags below require `--host`.
 
 `ply hosts` lists every bindable operation (`effect.op[resource]`: one row per
 operation and label some row of the program names, where a written mode atom
@@ -2209,8 +2224,8 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
-| `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run` only); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `cache` (`store`), `bootstrap` (`archive`), `hosts` (`tcb`) or `edit` (`ply run` only); `E0459` otherwise |
+| `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `cache` (`store`), `bootstrap` (`archive`), `hosts` (`tcb`) or `edit` (`ply run`, `ply test`); `E0459` otherwise |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -2276,10 +2291,10 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance) |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--profile`, `--std`, host, simulation |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, and how many definitions the front-end cache seeded and how many were checked; with `--types`, effect sets and provenance) |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
-| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, host, trace, prove, simulation |
+| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
@@ -2335,10 +2350,16 @@ names the ones it means, so `machine` — which drives another machine — is
 granted on purpose and not by accident.
 The first run after `ply` or the program itself changes compiles the program's unit,
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
-run loads the compiled object and the front end it filed beside it. The ones
-that load a program run the whole front end every time: the front-end cache
-under `.ply-cache` is written by `ply test`, `ply prove` and `ply review`, read
-back by them and by `ply cache`, and by nothing else.
+run loads the compiled object and the front end it filed beside it. A command
+that loads a program reads the front-end cache under `.ply-cache` before it
+analyses and files what it answered after: a definition whose hash has not moved
+since it was filed is taken from its filed rows, so a run checks what an edit
+moved and what reaches it, and a definition generic over an effect row every
+time. `ply build`, `ply hosts`, `ply test
+--no-cache` and `--no-incremental` neither read nor file it, and a program's own
+`machine.load` of a program runs the whole front end. A cache that will not read
+is a warning and a cold check, never a failure; the run that files over one
+filed by a compiler whose shipped modules differed says so once, as `W0605`.
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
