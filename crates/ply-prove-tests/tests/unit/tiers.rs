@@ -1,13 +1,11 @@
 use ply_eval::{Exploration, Plan, Seed, SimMode};
 use ply_prove::{
-    CaseReport, Certificate, Counterexample, Discharge, Evidence, Frame, Gap, MIN_PROPERTY_CASES,
-    Obligation, ObligationKind, ProvePlan, ProveReport, Rule, Tier, Vacuity, VacuityKind, frame_of,
+    CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, MIN_PROPERTY_CASES,
+    Obligation, ObligationKind, ProvePlan, ProveReport, Rule, Tier, Vacuity, VacuityKind,
     interleaving_proves,
 };
 use ply_span::Span;
 use ply_ty::DefHash;
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, Resource};
 use std::time::Duration;
 
 fn cases(kept: u32) -> Evidence {
@@ -68,7 +66,7 @@ fn nothing_but_a_hold_has_a_tier_or_is_cached() {
             guard: Span::DUMMY,
             kind: VacuityKind::ProvedUnsatisfiable,
         }),
-        Discharge::Unattempted(Gap::UnhandledEffect(Footprint::empty())),
+        Discharge::Unattempted(Gap::UnhandledEffect(None)),
     ];
     for outcome in outcomes {
         assert_eq!(outcome.tier(), None);
@@ -83,25 +81,6 @@ fn only_a_proof_is_plan_independent() {
     assert!(Discharge::Held(Evidence::Proof(certificate())).is_plan_independent());
     assert!(!Discharge::Held(cases(200)).is_plan_independent());
     assert!(!Discharge::Held(cases(3)).is_plan_independent());
-}
-
-#[test]
-fn a_frame_names_the_writes_and_nothing_else() {
-    assert_eq!(frame_of(&Footprint::empty()), Frame::Pure);
-
-    let read = EffectAtom::new("db", Resource::Named("users".into()), Mode::Read);
-    assert_eq!(
-        frame_of(&Footprint::from_atoms([read.clone()])),
-        Frame::Pure,
-        "a read changes nothing, so it does not narrow a frame"
-    );
-
-    let write = EffectAtom::new("db", Resource::Named("orders".into()), Mode::Write);
-    let Frame::Writes(writes) = frame_of(&Footprint::from_atoms([read, write])) else {
-        panic!("a write must produce a frame");
-    };
-    assert_eq!(writes.len(), 1);
-    assert!(writes.contains(&("db".into(), Resource::Named("orders".into()))));
 }
 
 fn exploration(exhaustive: bool, exhausted: bool) -> Exploration {
@@ -160,23 +139,17 @@ fn a_report_fails_on_a_refutation_or_a_vacuity_and_not_on_a_gap() {
         owner: "m.f".into(),
         kind: ObligationKind::Ensures { index: 0 },
         span: Span::DUMMY,
-        frame: Frame::Pure,
         binders: Vec::new(),
         guarded: false,
         host: false,
-        footprint: Footprint::empty(),
+        footprint: None,
     };
     let report = |discharge| ProveReport {
         obligations: vec![(obligation.clone(), discharge)],
         plan: ProvePlan::default(),
         duration: Duration::ZERO,
     };
-    assert!(
-        !report(Discharge::Unattempted(Gap::UnhandledEffect(
-            Footprint::empty()
-        )))
-        .failed()
-    );
+    assert!(!report(Discharge::Unattempted(Gap::UnhandledEffect(None))).failed());
     assert!(
         report(Discharge::Vacuous(Vacuity {
             guard: Span::DUMMY,
