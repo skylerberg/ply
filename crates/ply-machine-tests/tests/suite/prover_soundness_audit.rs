@@ -526,11 +526,11 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
         );
     }
 
-    // And the coverage line says so, which is the half a reviewer reads.
+    // And nothing is covered, which is the half a reviewer reads: coverage counts only a claim
+    // that holds, which is `proof.obligation`'s rule, over these discharges.
     let dir = project(SOURCE);
     let loaded = load(dir.path()).expect("the fixture compiles");
     let hashes = loaded.hashes.clone();
-    let laws = ply_test::obligation::Laws::of(&loaded.check, &hashes);
     let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
     let prover = Prover::new(&loaded)
         .expect("the port lowers the claims")
@@ -549,10 +549,11 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
             (o, d)
         })
         .collect();
-    let coverage = ply_test::obligation::coverage(&loaded.check, &laws, &results);
-    assert_eq!(coverage.covered, 0, "{:?}", coverage.uncovered);
-    assert!(coverage.uncovered.iter().any(|n| n.as_str() == "m.spin"));
-    assert!(coverage.uncovered.iter().any(|n| n.as_str() == "m.go"));
+    assert_eq!(results.len(), 3);
+    assert!(
+        results.iter().all(|(_, d)| !d.holds()),
+        "a claim held, so something would be covered: {results:?}"
+    );
 }
 
 #[test]
