@@ -434,7 +434,7 @@ impl<'a> Worker<'a> {
         self.machine.set_regions(self.region.open().0);
     }
 
-    /// Returns the test's own slots to the bump pointer and carries its fixture writes here.
+    /// Returns the test's own slots to the store and carries its fixture writes here.
     fn close_region(&mut self) {
         if self.region.is_empty() {
             return;

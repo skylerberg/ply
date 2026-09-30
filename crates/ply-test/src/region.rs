@@ -30,8 +30,8 @@ impl GroupRegion {
         self.fixture.is_empty()
     }
 
-    /// A region stack seeded from the fixture and sealed at the mark, and the handle reaching it.
-    #[must_use = "opening a region builds a stack; dropping it discards the seed"]
+    /// A cell arena seeded from the fixture and sealed at the mark, and the handle reaching it.
+    #[must_use = "opening a region builds a cell arena; dropping it discards the seed"]
     pub fn open(&self) -> (TaskRegions, Value) {
         self.fixture.open()
     }
