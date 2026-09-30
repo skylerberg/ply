@@ -2,10 +2,7 @@
 //! transitional executor's subcommands, each run from the plan the program writes.
 
 pub mod discharge;
-pub mod pg;
 pub mod simulate;
-pub mod w4;
-pub mod w5;
 pub mod w6;
 pub mod w6_run;
 
