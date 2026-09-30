@@ -1000,8 +1000,9 @@ impl Heap {
     pub fn to_word(&mut self, layouts: &Layouts, v: &Value) -> Word {
         match v {
             Value::Int(n) => self.boxed_int(*n),
-            // Below 64 bits a width is held as the `Int` it stands for; at 64 it is the runtime's own.
-            Value::Fixed(f) if f.ty.bits() < 64 => imm(f.value() as i64),
+            // Below 64 bits a width is held as the `Int` it stands for, which its sign-extended
+            // bits cut to 64 are; at 64 bits and past it is the runtime's own.
+            Value::Fixed(f) if f.ty.bits() < 64 => imm(f.bits() as i64),
             Value::Bool(b) => bool(*b),
             Value::Unit => unit(),
             Value::Str(s) if u32::try_from(s.len()).is_ok() => self.str(s),

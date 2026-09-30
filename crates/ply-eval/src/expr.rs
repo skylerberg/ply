@@ -8,7 +8,7 @@ pub enum Lit {
     /// A suffixed literal such as `255u8`; `bits` is normalized by [`IntTy::normalize`].
     Fixed {
         ty: IntTy,
-        bits: u64,
+        bits: u128,
     },
     Bool(bool),
     Str(String),
