@@ -194,7 +194,7 @@ enum Go {
         reply: Sender<drive::Measured>,
     },
     Reload {
-        front: crate::driver::HandedFront,
+        front: Box<crate::driver::HandedFront>,
         reply: Sender<Result<drive::FoundData, drive::Refused>>,
     },
 }
@@ -207,7 +207,7 @@ impl HostHandler for Site {
             ("configure", [options]) => self.configure(&label, options, span)?,
             ("load", [root, front]) => self.load(&label, root, front, span)?,
             ("reload", [front]) => {
-                let front = crate::driver::handed_front_of(front, span)?;
+                let front = Box::new(crate::driver::handed_front_of(front, span)?);
                 let answer: Result<drive::FoundData, drive::Refused> =
                     self.ask(&label, span, |reply| Go::Reload { reply, front })?;
                 match answer {

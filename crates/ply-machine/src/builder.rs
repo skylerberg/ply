@@ -1,15 +1,15 @@
-//! What `ply build` loads, builds, hashes and writes, as the program in `crates/ply-cli/ply`
-//! performs it.
+//! What `ply build` builds, hashes and writes, as the program in `crates/ply-cli/ply` performs it,
+//! over the front end that program ran and handed over.
 //!
-//! The front end and the emitter stay here: a front end or a compiled unit is not a value a
-//! program can hold. Which entry is built, what the
-//! container carries, where it lands and what the report says are the program's, in
-//! `crates/ply-cli/ply/build.ply`.
+//! The emitter stays here: a compiled unit is not a value a program can hold. Which entry is
+//! built, what the container carries, where it lands and what the report says are the program's,
+//! in `crates/ply-cli/ply/build.ply`.
 
 use crate::artifact::{self, Built};
 
+use crate::driver::{HandedFront, handed_front_of, load_over_front};
 use crate::hosts::Lent;
-use crate::load::{LoadError, Loaded, load};
+use crate::load::{LoadError, Loaded};
 use crate::payload::{count, diags_value, option, places_value, record};
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
@@ -47,7 +47,7 @@ pub struct BuildOptions {
 }
 
 /// The ops and the one handler serving them. Nothing is read before the program asks: `loaded`
-/// loads the path it is handed, `previous` the artifact it names.
+/// reads the front end it is handed, `previous` the artifact it names.
 pub fn lent() -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         program: Mutex::new(None),
@@ -85,9 +85,10 @@ impl HostHandler for Site {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
-            ("loaded", [path]) => {
+            ("loaded", [path, front]) => {
                 let path = PathBuf::from(path.as_str(span, "the program's root")?);
-                let loaded = self.load_once(path);
+                let front = handed_front_of(front, span)?;
+                let loaded = self.load_once(&path, &front);
                 self.loaded(loaded)
             }
             ("made", [entry, startup, reaches]) => self.made(
@@ -201,11 +202,12 @@ impl Site {
     /// The load runs at most once, on the op that asks for it.
     fn load_once(
         &self,
-        path: PathBuf,
+        path: &Path,
+        front: &HandedFront,
     ) -> std::sync::MutexGuard<'_, Option<Result<Loaded, LoadError>>> {
         let mut program = self.program.lock().unwrap_or_else(|e| e.into_inner());
         if program.is_none() {
-            *program = Some(load(&path));
+            *program = Some(load_over_front(path, front));
         }
         program
     }
