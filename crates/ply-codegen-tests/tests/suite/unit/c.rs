@@ -25,11 +25,11 @@ fn every_declared_helper_has_an_address() {
 #[test]
 fn an_entry_entered_with_the_wrong_arity_is_refused_rather_than_read_past() {
     ply_codegen::c::producer::ensure_default();
-    let err = ply_codegen::c::producer::call("emit.emit_roots", &[])
-        .expect_err("`emit.emit_roots` takes seven arguments");
+    let err = ply_codegen::c::producer::call("emit.emit_roots_answer", &[])
+        .expect_err("`emit.emit_roots_answer` takes seven arguments");
     let text = err.to_string();
     assert!(
-        text.contains("`emit.emit_roots` takes 7 arguments and was entered with 0"),
+        text.contains("`emit.emit_roots_answer` takes 7 arguments and was entered with 0"),
         "the refusal names the entry and both counts: {text}"
     );
 }

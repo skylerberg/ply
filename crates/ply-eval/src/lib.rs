@@ -10,6 +10,7 @@ pub mod builtins;
 pub mod codec;
 pub mod compiled;
 pub mod cont;
+pub mod decode;
 pub mod escape;
 pub mod explore;
 pub mod expr;

@@ -1012,12 +1012,12 @@ impl Store {
         }
     }
 
-    pub fn claims_part(&self, key: ContentHash) -> Option<String> {
+    pub fn claims_part(&self, key: ContentHash) -> Option<Vec<u8>> {
         self.claims.part(key)
     }
 
     /// Replaces every part on disk at the next flush, unless these are the parts already there.
-    pub fn put_claims_parts(&mut self, parts: std::collections::BTreeMap<ContentHash, String>) {
+    pub fn put_claims_parts(&mut self, parts: std::collections::BTreeMap<ContentHash, Vec<u8>>) {
         self.claims.put(parts);
     }
 
