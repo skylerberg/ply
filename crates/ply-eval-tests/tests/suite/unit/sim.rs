@@ -298,7 +298,7 @@ fn run(root: u64, script: &[(&str, &str, Vec<Value>)]) -> (Vec<Answer>, i64, u64
         .enumerate()
         .map(|(i, (effect, op, args))| {
             handlers
-                .dispatch(sig(effect, op), TaskId(i as u32), args, span())
+                .dispatch(sig(effect, op), TaskId(i as u64), args, span())
                 .expect("a well-typed request")
         })
         .collect();

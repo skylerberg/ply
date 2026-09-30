@@ -1,6 +1,6 @@
 //! The filesystem, as operations confined to roots the run names.
 
-use crate::pool::{Bell, Done, FS_FIRST_TOKEN, Pool};
+use crate::pool::{Bell, Done, FS_FIRST_TOKEN, Inbox, Pool};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
@@ -274,6 +274,14 @@ impl FsHost {
 
     pub fn owns(&self, pending: &Pending) -> bool {
         self.pool.owns(pending)
+    }
+
+    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
+        self.pool.watch(pending, inbox)
+    }
+
+    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        self.pool.collect(inbox)
     }
 
     pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {

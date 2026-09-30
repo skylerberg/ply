@@ -48,7 +48,10 @@ impl Clock for CountedClock {
 struct NoRuntime;
 
 impl HostRuntime for NoRuntime {
-    fn poll(&self, _: &Pending) -> Result<Option<Value>, Diagnostic> {
+    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+        unreachable!("`trace` never answers `Pending`")
+    }
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
         unreachable!("`trace` never answers `Pending`")
     }
     fn park(&self) -> Result<(), Diagnostic> {

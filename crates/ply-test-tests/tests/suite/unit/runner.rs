@@ -1084,7 +1084,7 @@ fn a_failure_carries_the_seed_and_the_race_that_explain_it() {
     let mut store = root.store();
     let (program, seeded) = seeded_program();
     let seed = Seed::at(0, vec![1, 0, 3]);
-    let site = |task: u32| RaceSite {
+    let site = |task: u64| RaceSite {
         task: ply_eval::TaskId(task),
         definition: Some(Symbol::new("apply_debit")),
         access: "db.write[accounts]".into(),

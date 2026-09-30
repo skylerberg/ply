@@ -237,6 +237,11 @@ impl<V: Clone + Default> Arena<V> {
         self.depth
     }
 
+    /// The owners a nesting is kept for, which is one past the highest that has opened a region.
+    pub fn owners(&self) -> usize {
+        self.owners.len()
+    }
+
     pub fn open(&mut self, owner: Owner, kind: RegionKind) -> RegionId {
         if owner.0 >= self.owners.len() {
             self.owners.resize(owner.0 + 1, Nesting::EMPTY);

@@ -438,8 +438,12 @@ pub fn err_host_in_simulation(span: Span, operation: &str, region: Span) -> Diag
 pub struct Unbound;
 
 impl HostRuntime for Unbound {
-    fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        Err(err_unbound_runtime(&format!("poll `{pending}`")))
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        Err(err_unbound_runtime(&format!("watch `{pending}`")))
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
