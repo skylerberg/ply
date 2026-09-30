@@ -416,11 +416,14 @@ fn a_handle_in_a_trace_field_is_the_host_boundary_and_nothing_further() {
     .expect_err("a field carrying a handle is refused");
     assert!(d.message.contains("item 0"), "{}", d.message);
 
-    // A sink writes text: a handle renders opaquely and is never dereferenced.
+    // A handle is copied out as its slot and never dereferenced.
     let (_a, c) = live_cell();
-    let rendered = c.render();
-    assert!(rendered.starts_with("<cell "), "{rendered}");
-    assert!(!rendered.contains("41"), "the slot's contents are not read");
+    let copied = ply_eval::Plain::of(&c);
+    assert!(matches!(copied, ply_eval::Plain::Cell { .. }), "{copied:?}");
+    assert!(
+        !format!("{copied:?}").contains("41"),
+        "the slot's contents are not read"
+    );
 }
 
 /// `boxed` is nullary with an empty row, so it is a constant: the memo keeps what its cell held.

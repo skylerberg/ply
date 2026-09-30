@@ -155,12 +155,9 @@ fn what_the_handlers_answer_has_the_declared_type() {
             })
             .collect();
         match handlers.dispatch(sig, TaskId(0), &args, span()) {
-            Ok(Answer::Value(v)) => assert_eq!(
-                type_of(&v),
-                Some(ret.as_str()),
-                "`{sig}` answered {}",
-                v.render()
-            ),
+            Ok(Answer::Value(v)) => {
+                assert_eq!(type_of(&v), Some(ret.as_str()), "`{sig}` answered {v:?}")
+            }
             // A woken sleeper is resumed with `clock.sleep`'s declared return.
             Ok(Answer::Sleeping { .. }) => {
                 assert_eq!(ret, "Unit");

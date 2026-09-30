@@ -1,4 +1,5 @@
 use crate::fixture::Compiled;
+use ply_eval::Value;
 
 const SOURCE: &str = r#"
 effect db {
@@ -115,18 +116,12 @@ fn same_named_definitions_in_two_modules_do_not_collide() {
     let mut machine = compiled.machine();
     let at = ply_eval::Span::DUMMY;
     assert_eq!(
-        machine
-            .call("alpha.wrapped", Vec::new(), at)
-            .unwrap()
-            .render(),
-        "1"
+        machine.call("alpha.wrapped", Vec::new(), at).unwrap(),
+        Value::Int(1)
     );
     assert_eq!(
-        machine
-            .call("beta.wrapped", Vec::new(), at)
-            .unwrap()
-            .render(),
-        "2"
+        machine.call("beta.wrapped", Vec::new(), at).unwrap(),
+        Value::Int(2)
     );
 }
 
@@ -148,18 +143,15 @@ fn constructors_from_two_modules_are_distinct_values() {
     let mut machine = compiled.machine();
     let at = ply_eval::Span::DUMMY;
     assert_eq!(
-        machine
-            .call("beta.theirs", Vec::new(), at)
-            .unwrap()
-            .render(),
-        "1"
+        machine.call("beta.theirs", Vec::new(), at).unwrap(),
+        Value::Int(1)
     );
     assert_eq!(
-        machine.call("beta.mine", Vec::new(), at).unwrap().render(),
-        "2"
+        machine.call("beta.mine", Vec::new(), at).unwrap(),
+        Value::Int(2)
     );
     assert_eq!(
-        machine.call("alpha.make", Vec::new(), at).unwrap().render(),
-        "alpha.Wrapped(1)"
+        machine.call("alpha.make", Vec::new(), at).unwrap(),
+        Value::ctor("alpha.Wrapped", vec![Value::Int(1)])
     );
 }

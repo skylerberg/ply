@@ -612,7 +612,7 @@ fn launched(
             .as_str(Span::DUMMY, "a reason")
             .expect("a String")
             .to_string()),
-        other => panic!("not a `Result`: {}", other.render()),
+        other => panic!("not a `Result`: {other:?}"),
     }
 }
 
@@ -631,7 +631,7 @@ fn wait(host: &Arc<ProcessHost>, child: i64, timeout_ms: i64) -> Result<Option<V
     .map(|answer| match &answer {
         Value::Ctor { name, args } if name.as_str() == "Some" => Some(args[0].clone()),
         Value::Ctor { name, .. } if name.as_str() == "None" => None,
-        other => panic!("not an `Option`: {}", other.render()),
+        other => panic!("not an `Option`: {other:?}"),
     })
 }
 
@@ -670,7 +670,7 @@ fn heard(host: &Arc<ProcessHost>, child: i64, timeout_ms: i64) -> Heard {
         ),
         Value::Ctor { name, .. } if name.as_str() == "std.process.Quiet" => Heard::Quiet,
         Value::Ctor { name, .. } if name.as_str() == "std.process.Closed" => Heard::Closed,
-        other => panic!("not a `Heard`: {}", other.render()),
+        other => panic!("not a `Heard`: {other:?}"),
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::fixture::Compiled;
 use ply_eval::explore::{Explored, Interleaving, Step};
-use ply_eval::{Diagnostic, Machine, Plan, Provider, Seed, SimMode, codes, explore};
+use ply_eval::{Diagnostic, Machine, Plain, Plan, Provider, Seed, SimMode, codes, explore, slot};
 use std::rc::Rc;
 
 /// Everything one interleaving is allowed to be a function of, rendered.
@@ -105,8 +105,9 @@ fn assert_lost_update(explored: &Explored, total: i64, what: &str) {
         );
     };
     assert_eq!(d.code, codes::ASSERTION_FAILED, "{what}: {d:?}");
-    let lost = format!("assertion failed: expected {total}, found ");
+    let lost = format!("assertion failed: expected {}, found ", slot(0));
     assert!(d.message.starts_with(&lost), "{what}: {}", d.message);
+    assert_eq!(d.values.first(), Some(&Plain::Int(total)), "{what}: {d:?}");
 }
 
 fn dpor(budget: u32) -> Plan {

@@ -285,7 +285,7 @@ fn transcript(answers: &[Answer]) -> Vec<String> {
     answers
         .iter()
         .map(|answer| match answer {
-            Answer::Value(v) => v.render(),
+            Answer::Value(v) => format!("{v:?}"),
             Answer::Sleeping { deadline } => format!("sleeping until {deadline}"),
         })
         .collect()
@@ -528,9 +528,8 @@ fn the_table_names_each_operation_once_and_answers_all_of_them() {
             Answer::Sleeping { .. } => assert_eq!(sig.ret, SimTy::Unit),
             Answer::Value(v) => assert!(
                 sig.ret.holds(&v),
-                "`{sig}` promises {} and answered {}",
+                "`{sig}` promises {} and answered {v:?}",
                 sig.ret.as_str(),
-                v.render()
             ),
         }
     }
