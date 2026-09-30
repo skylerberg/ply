@@ -1784,11 +1784,11 @@ fn ret_of(here: List<Def>, name: Bytes) -> { k: Option<Kind>, ty: Ty } =
   fold(here, { k: None, ty: TyOpen }, |acc: { k: Option<Kind>, ty: Ty }, d: Def|
     if d.name == name { { k: d.ret, ty: d.ret_ty } } else { acc })
 
-// A nullary pure definition (here or imported) returning a word is answered from the constant table.
-fn constant_of(em: Em, name: Bytes) -> Option<{ full: Bytes, ty: Ty }> =
+// A nullary pure definition (here or imported) is read from the constant table, whatever its kind: a call reruns its body at every read.
+fn constant_of(em: Em, name: Bytes) -> Option<{ full: Bytes, ret: { k: Option<Kind>, ty: Ty } }> =
   if fold(em.here, false, |acc: Bool, h: Def| acc || h.name == name) {
-    if is_pure(em.here, name) && ret_of(em.here, name).k == Some(KBoxed) {
-      Some({ full: qualify(em.module, name), ty: ret_of(em.here, name).ty })
+    if is_pure(em.here, name) {
+      Some({ full: qualify(em.module, name), ret: ret_of(em.here, name) })
     } else { None }
   } else {
     let callee = match qualified(name) { Some(q) -> q.name, None -> name };
@@ -1797,11 +1797,8 @@ fn constant_of(em: Em, name: Bytes) -> Option<{ full: Bytes, ty: Ty }> =
         None -> from_import(em.imports, name),
       } {
       None -> None,
-      Some(imp) -> if is_pure(imp.defs, callee) && ret_of(imp.defs, callee).k == Some(KBoxed) {
-        Some({
-          full: bytes_concat_all([imp.module, b".", callee]),
-          ty: ret_of(imp.defs, callee).ty,
-        })
+      Some(imp) -> if is_pure(imp.defs, callee) {
+        Some({ full: bytes_concat_all([imp.module, b".", callee]), ret: ret_of(imp.defs, callee) })
       } else { None },
     }
   }
@@ -4302,19 +4299,19 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
             },
           }
         } else {
-          // A pure nullary definition answering a word is read from the runtime's constant table, not called.
+          // A pure nullary definition is read from the runtime's constant table, not called.
           if len(a.args) == 0 && constant_of(em, fv.name) != None {
             match constant_of(em, fv.name) {
               None -> None,
               Some(k) -> {
-                let noted = note_call(em, k.full);
+                let noted = note_call(site(em, c.span), k.full);
                 let l = lambda_of(noted, entry_of(k.full));
                 let held = bind(
                   l.em,
                   KBoxed,
                   bytes_concat_all([b"rt_constant_p(ctx, @@l", num(l.i), b"@@)"]),
                 );
-                Some({ em: check(held.em), v: { k: KBoxed, c: held.v.c, ty: k.ty } })
+                Some(opened_to(check(held.em), held.v, k.ret))
               },
             }
           } else if !fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) {
@@ -7080,8 +7077,9 @@ test "a self call in tail position restarts the body instead of nesting" {
 }
 
 test "a self call that takes no arguments restarts the body as well" {
+  // `spin` declares a row: a pure nullary definition is a constant, which the table answers.
   let src = bytes_concat_all([
-    b"fn spin() -> Int = spin()\n",
+    b"fn spin() -> Int / {clock.read} = spin()\n",
     b"fn poll() -> Int = { let n = clock.now(); if n <= 0 { 0 } else { poll() } }\n",
     b"fn ladder() -> Int = 1 + ladder()\n",
   ]);
