@@ -311,12 +311,12 @@ pub trait Executor: Sync {
     }
 }
 
-/// The search each test runs, and whether to measure what an unpruned one would have cost.
+/// The search each test runs, and whether to measure what a less pruned one would have cost.
 #[derive(Clone, Debug, Default)]
 pub struct Search {
     pub plan: Plan,
     pub narrowed: BTreeMap<usize, Plan>,
-    /// Re-run the search with dependence forced to `true`, to measure the reduction.
+    /// Re-run the search with every vector clock withheld and with dependence forced to `true`.
     pub measure_reduction: bool,
 }
 
