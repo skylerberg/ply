@@ -5,7 +5,6 @@ use crate::{
     DefHash, Diagnostic, Footprint, HashOutput, Mode, Severity, SourceId, Span, Symbol, codes,
 };
 use indexmap::IndexMap;
-use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
@@ -99,8 +98,18 @@ pub struct EmitterRoot {
     /// Whether the root's scheme mentions a fixed-width type, which the compiled seam cannot
     /// carry.
     pub width: bool,
+    /// Whether the compiler published the root pure: nothing else lets a memo answer for it. A
+    /// test, a clause or a law part never is.
+    pub pure: bool,
     /// The root's definition span, which a failure is reported against.
     pub span: Span,
+}
+
+impl EmitterRoot {
+    /// A pure root of no arguments: the unit gives it a memo slot.
+    pub fn constant(&self) -> bool {
+        self.pure && self.arity == 0
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -128,8 +137,6 @@ pub struct Front {
     pub emitter_roots: Vec<EmitterRoot>,
     /// The emitter's constructors, in the order the emitted C names tags by.
     pub emitter_ctors: Vec<(Symbol, usize)>,
-    /// The roots that are pure and take no parameters, which the emitted unit memoizes.
-    pub emitter_constants: BTreeSet<Symbol>,
     /// The hasher's item order: every hashed name, test and law, as its rows come.
     pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
