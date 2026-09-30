@@ -2439,13 +2439,59 @@ fn a_test_run_binds_what_exec_names_and_withholds_the_rest_of_process() {
     assert_eq!(status("writes a line"), "failed", "{v}");
     assert_eq!(v["failures"][0]["diagnostic"]["code"], "E0424", "{v}");
 
-    // Without `--exec`, the spawn is withheld too, and the refusal says what binds it.
+    // Without `--exec`, the label is unbound, and the refusal says how to bind it.
     let bare = ply(dir.path())
         .args(["test", "--host", "--filter", "spawns"])
         .output()
         .unwrap();
     let text = stdout_of(&bare);
-    assert!(text.contains("`--exec`"), "{text}");
+    assert!(text.contains("E0456"), "{text}");
+    assert!(text.contains("--exec echo="), "{text}");
+}
+
+/// A test asks which labels its run bound, and an unbound one is answered rather than withheld.
+const BOUND: &str = "\
+import std.process (process)
+
+fn echo_bound() -> Bool / {process.bound[echo]} = process.bound[echo]()
+
+fn cc_bound() -> Bool / {process.bound[cc]} = process.bound[cc]()
+
+test/nondet \"echo is bound\" { assert(echo_bound()) }
+
+test/nondet \"cc is not bound\" { assert(!cc_bound()) }
+";
+
+#[test]
+fn a_test_asks_which_labels_its_run_bound() {
+    let dir = project(BOUND);
+    let status = |v: &Value, label: &str| -> Value {
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == label)
+            .map(|r| r["status"].clone())
+            .unwrap_or(Value::Null)
+    };
+    let granted = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--host", "--exec", "echo=/bin/echo"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(status(&granted, "echo is bound"), "passed", "{granted}");
+    assert_eq!(status(&granted, "cc is not bound"), "passed", "{granted}");
+
+    let bare = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--host", "--no-cache"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(status(&bare, "echo is bound"), "failed", "{bare}");
+    assert_eq!(status(&bare, "cc is not bound"), "passed", "{bare}");
+    assert_ne!(bare["failures"][0]["diagnostic"]["code"], "E0424", "{bare}");
 }
 
 #[test]

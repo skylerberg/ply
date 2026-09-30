@@ -1070,8 +1070,9 @@ fn bind(
             Ok(resolved) => resolved,
             Err(diagnostics) => return refuse(diagnostics),
         };
-    // A test is not a process: of `process` it binds only `spawn`, and only for what `--exec` names.
-    let process = if args.host && !args.exec.is_empty() {
+    // A test is not a process: of `process` it binds only what names a program, and only the
+    // programs `--exec` names, so under `--host` an unnamed label is unbound rather than withheld.
+    let process = if args.host {
         match ply_host::process::Executables::load(&args.exec, Span::DUMMY) {
             Ok(executables) => Some(ply_host::process::ProcessHost::spawning(executables)),
             Err(diagnostic) => return refuse(vec![diagnostic]),
