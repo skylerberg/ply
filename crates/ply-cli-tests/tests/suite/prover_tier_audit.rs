@@ -373,7 +373,7 @@ fn a_gap_is_reported_as_one_and_carries_no_tier() {
     assert!(
         share["gap"]
             .as_str()
-            .is_some_and(|gap| gap.starts_with("raised: ")),
+            .is_some_and(|gap| gap.starts_with("raised: ") && gap.contains("division by zero")),
         "{share}"
     );
     assert!(tier(recorded).is_none() && tier(share).is_none());
@@ -460,6 +460,12 @@ law \"a raising index does not\"
         outcome(raising),
         "unattempted",
         "the control must raise, or the arm above is compared with nothing: {raising}"
+    );
+    assert!(
+        raising["gap"]
+            .as_str()
+            .is_some_and(|gap| gap.starts_with("raised: `bytes_at` index")),
+        "the control raises at its index: {raising}"
     );
     assert!(tier(raising).is_none(), "{raising}");
 }

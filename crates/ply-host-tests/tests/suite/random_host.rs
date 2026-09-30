@@ -40,8 +40,8 @@ fn call(entry: &str) -> Result<Value, ply_eval::Diagnostic> {
         .bind(&front.check)
         .expect("the declaration and the registration agree");
 
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(ply_eval::Provider::attach(unit));
+    let mut machine = Machine::new(&front, ply_eval::Provider::attach(unit))
+        .expect("the unit was compiled from this program");
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(host.runtime());
     let declared = front
