@@ -1,7 +1,7 @@
 //! `net` over loopback TCP, plaintext or TLS.
 
 use super::{Handles, Net, Op, not_a_listener, not_a_stream, unknown_handle};
-use crate::pool::{Done, NET_FIRST_TOKEN, Pool};
+use crate::pool::{Bell, Done, NET_FIRST_TOKEN, Pool};
 use crate::tls::{self, Credentials, Handshakes};
 use ply_eval::{HostAnswer, HostRuntime, Pending, Value};
 use ply_span::{Diagnostic, Span};
@@ -140,6 +140,14 @@ impl TcpHost {
         self.pool.outstanding()
     }
 
+    pub fn ready(&self) -> bool {
+        self.pool.ready()
+    }
+
+    pub fn ring(&self, bell: &Arc<Bell>) {
+        self.pool.ring(bell);
+    }
+
     pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
         self.pool.park_until(bound)
     }
@@ -174,6 +182,7 @@ impl Net for TcpHost {
             Op::Recv => "ply_host::tcp::recv",
             Op::Send => "ply_host::tcp::send",
             Op::Close => "ply_host::tcp::close",
+            Op::LocalPort => "ply_host::tcp::local_port",
         }
     }
 
@@ -383,6 +392,21 @@ impl Net for TcpHost {
             Some(Sock::Listener(..) | Sock::Finished) => Ok(HostAnswer::Value(Value::Unit)),
             None => Err(unknown_handle(socket, span)),
         }
+    }
+
+    fn local_port(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
+        self.sockets.handles.check(socket, at, span)?;
+        let address = match lock(&self.sockets.open).get(&socket) {
+            Some(Sock::Listener(l, _)) => l.local_addr().ok(),
+            Some(Sock::Stream(s)) => s.local_addr().ok(),
+            Some(Sock::Tls(s)) => s.local_addr().ok(),
+            Some(Sock::Finished) => None,
+            None => return Err(unknown_handle(socket, span)),
+        };
+        Ok(HostAnswer::Value(match address {
+            Some(address) => Value::ctor("Some", vec![Value::Int(i64::from(address.port()))]),
+            None => Value::ctor("None", Vec::new()),
+        }))
     }
 }
 

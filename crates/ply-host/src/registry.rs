@@ -1,5 +1,6 @@
 //! The trusted computing base, as one list.
 
+use crate::pool::Bell;
 use crate::signal::{self, Accepting, Shutdown};
 use crate::{certgen, config, fs, process, random, sched, tcp, time, trace};
 use ply_eval::Value;
@@ -7,10 +8,6 @@ use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownRepo
 use ply_span::{Diagnostic, Span, codes};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
-
-/// How long a park waits on the socket pool while the database also holds a token.
-const ALTERNATE: Duration = Duration::from_micros(250);
 
 pub struct Host {
     net: Arc<tcp::TcpHost>,
@@ -25,6 +22,8 @@ pub struct Host {
     process: Option<Arc<process::ProcessHost>>,
     /// The two readings `std.time` answers, counting from when this host was built.
     time: Arc<time::TimeHost>,
+    /// Rung by every pool above, so a park can wait on all of them at once.
+    bell: Arc<Bell>,
 }
 
 impl Default for Host {
@@ -39,20 +38,28 @@ impl Host {
     }
 
     pub fn with_credentials(credentials: crate::tls::Credentials) -> Host {
+        let bell = Arc::new(Bell::default());
+        let net = tcp::TcpHost::with_credentials(credentials);
+        net.ring(&bell);
+        let fs = fs::FsHost::new(fs::Roots::new());
+        fs.ring(&bell);
         Host {
-            net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
+            net: Arc::new(net),
             config: Arc::new(config::Snapshot::unopened()),
             trace: Arc::new(trace::Trace::default()),
             shutdown: None,
-            fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
+            fs: Arc::new(fs),
             process: None,
             time: Arc::new(time::TimeHost::new()),
+            bell,
         }
     }
 
     pub fn rooted(self, roots: fs::Roots) -> Host {
+        let fs = fs::FsHost::new(roots);
+        fs.ring(&self.bell);
         Host {
-            fs: Arc::new(fs::FsHost::new(roots)),
+            fs: Arc::new(fs),
             ..self
         }
     }
@@ -62,6 +69,10 @@ impl Host {
     }
 
     pub fn with_process(self, process: process::ProcessHost) -> Host {
+        process.ring(&self.bell);
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.attach_children(process.children());
+        }
         Host {
             process: Some(Arc::new(process)),
             ..self
@@ -122,6 +133,7 @@ impl Host {
             process: self.process.clone(),
             trace: Arc::clone(&self.trace),
             shutdown: self.shutdown.clone(),
+            bell: Arc::clone(&self.bell),
         })
     }
 
@@ -135,6 +147,9 @@ impl Host {
 
     pub fn stopping_on(self, shutdown: Arc<Shutdown>) -> Host {
         shutdown.attach_net(Arc::clone(&self.net) as Arc<dyn signal::Accepting>);
+        if let Some(process) = &self.process {
+            shutdown.attach_children(process.children());
+        }
         Host {
             shutdown: Some(shutdown),
             ..self
@@ -171,6 +186,7 @@ struct Facilities {
     process: Option<Arc<process::ProcessHost>>,
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
+    bell: Arc<Bell>,
 }
 
 impl HostRuntime for Facilities {
@@ -209,31 +225,27 @@ impl HostRuntime for Facilities {
             }
             return Ok(());
         }
-        // Separate condition variables cannot be waited on together, so a park blocks on one only
-        // when no other facility has work.
-        let filesystem_waiting = self.fs.outstanding() > 0;
-        let spawn_waiting = self
-            .process
-            .as_ref()
-            .is_some_and(|process| process.outstanding() > 0);
-        if self.net.outstanding() > 0 {
-            if filesystem_waiting || spawn_waiting {
-                return self.net.park_until(ALTERNATE);
+        let net = self.net.outstanding() > 0;
+        let fs = self.fs.outstanding() > 0;
+        let process = self.process.as_ref().filter(|p| p.outstanding() > 0);
+        match (net, fs, process) {
+            (false, false, None) => Err(err_nothing_outstanding()),
+            (true, false, None) => self.net.park(),
+            (false, true, None) => self.fs.park(),
+            (false, false, Some(process)) => process.park(),
+            // Several pools' condition variables cannot be waited on together, so the bell each
+            // of them rings is waited on instead.
+            _ => {
+                let seen = self.bell.rung();
+                let ready = self.net.ready()
+                    || self.fs.ready()
+                    || self.process.as_ref().is_some_and(|p| p.ready());
+                if !ready {
+                    self.bell.wait_past(seen);
+                }
+                Ok(())
             }
-            return self.net.park();
         }
-        if filesystem_waiting {
-            if spawn_waiting {
-                return self.fs.park_until(ALTERNATE);
-            }
-            return self.fs.park();
-        }
-        if let Some(process) = &self.process
-            && spawn_waiting
-        {
-            return process.park();
-        }
-        Err(err_nothing_outstanding())
     }
 
     fn stopping(&self) -> bool {
@@ -251,10 +263,13 @@ impl HostRuntime for Facilities {
         ))
     }
 
-    /// The process-level teardown, in a pinned order.
-    /// The run's own teardown: the drain deadline governs scheduling and the socket pool, so
-    /// nothing here waits on it.
+    /// The run's own teardown, in a pinned order: the drain deadline governs scheduling and the
+    /// socket pool, so nothing here waits on it.
     fn shutdown(&self, _drain_ms: u64) -> ShutdownReport {
+        // However the run ended, it leaves no child running.
+        if let Some(process) = &self.process {
+            process.end_children();
+        }
         let mut report = ShutdownReport {
             spans_abandoned: self.trace.open_spans(),
             ..ShutdownReport::default()
