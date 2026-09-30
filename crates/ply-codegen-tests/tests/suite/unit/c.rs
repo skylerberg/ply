@@ -391,31 +391,41 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
 
 #[test]
 fn a_record_with_a_counted_field_survives_being_rebuilt() {
+    let p = |depth: i64, diags: &[i64]| {
+        ply_eval::Value::Record(std::sync::Arc::new(ply_eval::Fields::from_unsorted(vec![
+            (ply_eval::Symbol::new("pos"), ply_eval::Value::Int(0)),
+            (ply_eval::Symbol::new("depth"), ply_eval::Value::Int(depth)),
+            (
+                ply_eval::Symbol::new("diags"),
+                ply_eval::Value::list(diags.iter().map(|&d| ply_eval::Value::Int(d)).collect()),
+            ),
+        ])))
+    };
     for (which, body, want) in [
         (
             "plain",
             "pub fn probe(n: Int) -> P = {pos: 0, depth: n, diags: [n]}",
-            "{depth: 4, diags: [4], pos: 0}",
+            p(4, &[4]),
         ),
         (
             "rebuilt",
             "pub fn probe(n: Int) -> P = with_depth({pos: 0, depth: n, diags: [n]}, 9)",
-            "{depth: 9, diags: [4], pos: 0}",
+            p(9, &[4]),
         ),
         (
             "pushed",
             "pub fn probe(n: Int) -> P = noted({pos: 0, depth: n, diags: [n]}, 7)",
-            "{depth: 4, diags: [4, 7], pos: 0}",
+            p(4, &[4, 7]),
         ),
         (
             "let-bound",
             "pub fn probe(n: Int) -> P = { let p = {pos: 0, depth: n, diags: [n]}; with_depth(p, p.depth + 1) }",
-            "{depth: 5, diags: [4], pos: 0}",
+            p(5, &[4]),
         ),
         (
             "wrapped",
             "pub fn probe(n: Int) -> Option<P> = Some({pos: 0, depth: n, diags: [n]})",
-            "Some({depth: 4, diags: [4], pos: 0})",
+            ply_eval::Value::ctor("Some", vec![p(4, &[4])]),
         ),
     ] {
         let source = format!(
@@ -442,7 +452,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{which}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
-        assert_eq!(got.render(), want, "`{which}`");
+        assert_eq!(got, want, "`{which}`");
     }
 }
 

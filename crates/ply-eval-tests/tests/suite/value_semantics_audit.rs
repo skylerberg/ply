@@ -3,8 +3,8 @@
 
 use crate::fixture::Compiled;
 use ply_eval::{
-    ARGUMENT_VECTOR_CLASSES, Decimal, Diagnostic, SECRET_REDACTED, Span, Value, first_difference,
-    values_equal,
+    ARGUMENT_VECTOR_CLASSES, Decimal, Diagnostic, Plain, Span, Value, assertion_failure,
+    first_difference, values_equal,
 };
 use std::sync::Arc;
 
@@ -105,7 +105,7 @@ fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments()
     }
 }
 
-/// `first_difference` builds text that `ply-store` caches in a failing outcome.
+/// A failing assertion's diagnostic is what `ply-store` caches in a failing outcome.
 #[test]
 fn the_assertion_differ_never_descends_into_a_credential() {
     let hidden = "hunter2";
@@ -150,20 +150,23 @@ fn the_assertion_differ_never_descends_into_a_credential() {
     ];
 
     for (label, actual, expected) in pairs {
+        let failed = assertion_failure(&actual, &expected, Span::DUMMY);
         for text in [
-            actual.render(),
-            expected.render(),
+            format!("{failed:?}"),
             format!("{:?}", first_difference(&actual, &expected)),
             format!("{:?}", first_difference(&expected, &actual)),
         ] {
             assert!(
                 !text.contains(hidden) && !text.contains(other),
-                "{label}: a payload reached a rendered string: {text}"
+                "{label}: a payload reached what a failure keeps: {text}"
             );
         }
         assert!(
-            actual.render().contains(SECRET_REDACTED),
-            "{label}: the redaction marker is missing, so something else rendered instead"
+            failed
+                .values
+                .iter()
+                .any(|v| format!("{v:?}").contains("Secret")),
+            "{label}: the credential is missing from the carried values, so something else stood in"
         );
     }
 }
@@ -257,11 +260,11 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
         "the language's `==` stopped treating `1.5m` and `1.50m` as one value"
     );
     assert_eq!(short.cmp(&long), std::cmp::Ordering::Equal);
-    assert_eq!(short.render(), "1.5");
+    assert_eq!(format!("{short:?}"), "Decimal(1.5)");
     assert_eq!(
-        long.render(),
-        "1.50",
-        "two values that are one `Map` key render as two different strings"
+        format!("{long:?}"),
+        "Decimal(1.50)",
+        "two values that are one `Map` key keep two different scales"
     );
 
     // One key, canonical, whichever spelling was written last.
@@ -277,10 +280,13 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
         values_equal(&short_then_long, &long_then_short, Span::DUMMY).expect("two maps compare"),
         "the two maps are not even equal, which is a larger defect than the one this pins"
     );
-    assert_eq!(short_then_long.render(), "{1.5: 2}");
     assert_eq!(
-        long_then_short.render(),
-        "{1.5: 2}",
+        format!("{short_then_long:?}"),
+        "Map([(Decimal(1.5), Int(2))])"
+    );
+    assert_eq!(
+        format!("{long_then_short:?}"),
+        "Map([(Decimal(1.5), Int(2))])",
         "two `==`-equal maps render as two different strings, so `map_keys`, `map_entries`, \
          `map_fold` and every derived encoding over them are functions of insertion history"
     );
@@ -405,11 +411,13 @@ fn canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it() {
     };
 
     assert_eq!(
-        fields
-            .get(&ply_eval::Symbol::new("d"))
-            .expect("the decimal field")
-            .render(),
-        "1.5",
+        format!(
+            "{:?}",
+            fields
+                .get(&ply_eval::Symbol::new("d"))
+                .expect("the decimal field")
+        ),
+        "Decimal(1.5)",
         "the key was not canonicalized, so this test is not exercising the rebuild"
     );
     match fields.get(&ply_eval::Symbol::new("p")) {
@@ -419,14 +427,13 @@ fn canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it() {
         ),
         other => panic!("the credential stopped being a `Secret`: {other:?}"),
     }
+    let copied = format!("{:?}", Plain::of(&m));
     assert!(
-        m.render().contains(SECRET_REDACTED),
-        "a canonicalized key holding a credential renders it: {}",
-        m.render()
+        copied.contains("Secret"),
+        "a canonicalized key lost its credential: {copied}"
     );
     assert!(
-        !m.render().contains("hunter2"),
-        "a canonicalized key printed a credential: {}",
-        m.render()
+        !copied.contains("hunter2"),
+        "a canonicalized key copied a credential out: {copied}"
     );
 }

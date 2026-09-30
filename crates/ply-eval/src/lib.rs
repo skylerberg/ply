@@ -34,6 +34,7 @@ pub use list::List;
 pub mod evaluator;
 pub mod map;
 pub mod memo;
+mod plain;
 mod pool;
 mod program;
 pub mod rc;
@@ -72,6 +73,7 @@ pub use explore::{
 pub use footprint::{EffectAtom, Footprint, Mode, Resource, atom_texts, label_var_name};
 pub use hash::{DefHash, HashOutput};
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
+pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use program::{
     CheckOutput, DefInfo, DefWritten, EffectInfo, EffectSet, EmitterRoot, Front, Hashed, LawInfo,
     Literal, ModuleInfo, ModuleName, OpInfo, Ordinal, Pinned, SpecInfo, SpecKind, TestInfo,
@@ -86,11 +88,11 @@ pub use sim::{
     Wake,
 };
 pub use span::{
-    Diagnostic, Edit, Fix, Label, Severity, SourceFile, SourceId, SourceMap, Span, Symbol,
-    intern_code,
+    Diagnostic, Edit, Fix, Label, Severity, SourceFile, SourceId, SourceMap, Span, Sparse, Symbol,
+    intern_code, slot,
 };
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Fields, Fixed, FixedOp, Map, SECRET_REDACTED, Synth, Value,
-    constant_time_eq, first_difference, values_equal,
+    Closure, ClosureKind, Decimal, Difference, Fields, Fixed, FixedOp, Map, Step as PathStep,
+    Synth, Value, constant_time_eq, first_difference, values_equal,
 };

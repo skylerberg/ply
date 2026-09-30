@@ -17,7 +17,7 @@
 import args (Flags, from_argv, style_of)
 import config_schema
 import compiler.resolve (Diag, Label)
-import diagnostic (Place, Spot, spot_of, all_to_json, all_to_text)
+import diagnostic (Place, Raised, Spot, shown, spot_of, all_to_json, all_to_text)
 import entry (Main, Module, entry_point, no_module)
 import env (env)
 import program (Timed, front_of, timed_over, usable)
@@ -30,6 +30,7 @@ import std.fs (fs)
 import std.time (time)
 import report (Answer, ind, ok_code, compile_error, count_of, refused, warning_lines)
 import std.json (Json, Null, Str, Bool, Number, Array, Member, Object, object, to_string)
+import std.value (Value, VInt, VUnit, render)
 import std.process (process, Captured, captured, out_step, err_step)
 import style (Style, dim, plain, red)
 
@@ -177,7 +178,7 @@ fn drained(d: Diag) -> Bool = d.code == b"W0608"
 // An abandoned run raised nothing: the clock stopped it where it stood.
 fn abandoned(d: Diag) -> Bool = d.code == b"W0612"
 
-fn expired_of(e: Ended) -> Bool = match e.raised { Some(d) -> drained(d), None -> false }
+fn expired_of(e: Ended) -> Bool = match e.raised { Some(r) -> drained(r.diag), None -> false }
 
 // Handshakes completed and refused, which a run only knows once it is over.
 fn handshake_lines(s: Style, e: Ended) -> List<String> =
@@ -346,7 +347,7 @@ fn document(
         { key: "binding", value: Str(if b.hermetic { "hermetic" } else { "host" }) },
         { key: "counters", value: counters_json(e.counters) },
         { key: "hosts", value: e.hosts },
-        { key: "value", value: text_or_null(e.value) },
+        { key: "value", value: match e.value { Some(v) -> Str(render(v)), None -> Null } },
         { key: "configuration", value: e.configuration },
         { key: "shutdown", value: shutdown_json(e) },
         { key: "diagnostics", value: all_to_json(diags, places_of(t)) },
@@ -371,7 +372,7 @@ fn exited(s: Style, t: Target, en: String, b: Bound, e: Ended, code: Int) -> Ans
 fn answered(s: Style, t: Target, en: String, b: Bound, e: Ended) -> Answer =
   {
     json: document(t, en, b, e, true, ok_code(), noted(t, b, e)),
-    lines: also(handshake_lines(s, e), [ind() ++ (match e.value { Some(v) -> v, None -> "" })]),
+    lines: also(handshake_lines(s, e), [ind() ++ (match e.value { Some(v) -> render(v), None -> "" })]),
     errs: also(all_to_text(s, e.cycles, places_of(t)), stop_lines(s, e)),
     code: ok_code(),
   }
@@ -397,7 +398,7 @@ fn ended(s: Style, t: Target, en: String, b: Bound, e: Ended) -> Answer =
     Some(code) -> exited(s, t, en, b, e, code),
     None -> match e.raised {
       None -> answered(s, t, en, b, e),
-      Some(d) -> raised(s, t, en, b, e, d),
+      Some(r) -> raised(s, t, en, b, e, shown(r)),
     },
   }
 
@@ -706,7 +707,7 @@ fn no_teardown() -> Teardown =
     problems: [],
   }
 
-fn answered_with(value: String) -> Ended =
+fn answered_with(value: Value) -> Ended =
   {
     exit: None,
     value: Some(value),
@@ -720,6 +721,8 @@ fn answered_with(value: String) -> Ended =
     hosts: Null,
     configuration: Null,
   }
+
+fn unvalued(d: Diag) -> Raised = { diag: d, values: [] }
 
 fn a_diag(code: Bytes, message: Bytes, labels: List<Label>) -> Diag =
   {
@@ -768,7 +771,7 @@ fn bare() -> Flags = from_argv("run", [])
 fn as_json() -> Flags = from_argv("run", ["--json"])
 
 test "a value the entry answered with is one indented line and exit 0" {
-  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), answered_with("42"));
+  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), answered_with(VInt(42)));
   assert_eq(ran.answer.code, 0);
   assert_eq(ran.answer.lines, ["   42"]);
   assert_eq(ran.answer.errs, []);
@@ -778,7 +781,7 @@ test "a value the entry answered with is one indented line and exit 0" {
 
 test "the object keys off `command` and `exit_code`, and names the entry and its module" {
   let text = to_string(
-    ran_over(as_json(), Ok(a_program()), Ok(hermetic()), answered_with("42")).answer.json,
+    ran_over(as_json(), Ok(a_program()), Ok(hermetic()), answered_with(VInt(42))).answer.json,
   );
   assert(string_contains(text, "\"command\":\"run\""));
   assert(string_contains(text, "\"exit_code\":0"));
@@ -793,7 +796,7 @@ test "the object keys off `command` and `exit_code`, and names the entry and its
 // What a run may reach is disclosed while the entry is still ahead of it, so it goes out on the
 // stream as the program runs rather than in the answer collected after it.
 test "a bound run discloses what it may reach before the entry is entered" {
-  let ran = ran_over(bare(), Ok(a_program()), Ok(a_binding()), answered_with("42"));
+  let ran = ran_over(bare(), Ok(a_program()), Ok(a_binding()), answered_with(VInt(42)));
   assert_eq(ran.out, [
     "   binding host · 7 operations · b3:aabbccddeeff",
     "   config      2 keys · 1 secret",
@@ -806,25 +809,25 @@ test "a bound run discloses what it may reach before the entry is entered" {
 }
 
 test "`--json` promises stdout to the one object, so nothing else is written at all" {
-  let ran = ran_over(as_json(), Ok(a_program()), Ok(a_binding()), answered_with("42"));
+  let ran = ran_over(as_json(), Ok(a_program()), Ok(a_binding()), answered_with(VInt(42)));
   assert_eq(ran.out, []);
   assert_eq(ran.err, []);
   assert(string_contains(to_string(ran.answer.json), "\"binding\":\"host\""))
 }
 
 test "a hermetic run discloses nothing, because there is nothing it could reach" {
-  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), answered_with("()"));
+  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), answered_with(VUnit));
   assert_eq(ran.out, []);
   assert_eq(ran.err, [])
 }
 
 test "a raise is exit 1, and says where it was raised for a reader with the file open" {
   let raise = {
-    ..answered_with("42"),
+    ..answered_with(VInt(42)),
     value: None,
-    raised: Some(
+    raised: Some(unvalued(
       a_diag(b"E0501", b"nope", [{ module: 0, start: 19, end: 21, primary: true, text: b"here" }]),
-    ),
+    )),
   };
   let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), raise);
   assert_eq(ran.answer.code, 1);
@@ -833,11 +836,21 @@ test "a raise is exit 1, and says where it was raised for a reader with the file
   assert_eq(nth(ran.answer.errs, len(ran.answer.errs) - 1), "   raised at m.ply:1:20")
 }
 
+test "a raise shows the values it carries, rendered where its text names them" {
+  let raise = {
+    ..answered_with(VInt(42)),
+    value: None,
+    raised: Some({ diag: a_diag(b"E0501", b"expected \x010\x02", []), values: [VInt(3)] }),
+  };
+  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), raise);
+  assert_eq(nth(ran.answer.errs, 0), "Error[E0501]: expected 3")
+}
+
 test "an expired drain is exit 3, and is not attributed to a line of the program" {
   let expired = {
-    ..answered_with("()"),
+    ..answered_with(VUnit),
     value: None,
-    raised: Some(a_diag(b"W0608", b"the drain deadline expired", [])),
+    raised: Some(unvalued(a_diag(b"W0608", b"the drain deadline expired", []))),
   };
   let ran = ran_over(bare(), Ok(a_program()), Ok(a_binding()), expired);
   assert_eq(ran.answer.code, 3);
@@ -845,7 +858,7 @@ test "an expired drain is exit 3, and is not attributed to a line of the program
 }
 
 test "a program that chose its own exit code is answered with that code and no value" {
-  let chose = { ..answered_with("()"), exit: Some(7), value: None };
+  let chose = { ..answered_with(VUnit), exit: Some(7), value: None };
   let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), chose);
   assert_eq(ran.answer.code, 7);
   assert_eq(ran.answer.lines, []);
@@ -857,7 +870,7 @@ test "a program that chose its own exit code is answered with that code and no v
 
 test "a stopped run says what was in flight, how long the drain took, and what it rolled back" {
   let stopped = {
-    ..answered_with("()"),
+    ..answered_with(VUnit),
     stopping: Some({
       signal: Some("SIGTERM"),
       listeners: 1,
@@ -885,10 +898,10 @@ test "a stopped run says what was in flight, how long the drain took, and what i
 }
 
 test "an artifact says which file it ran, its digest, and what it carries" {
-  let ran = ran_over(bare(), Ok(an_artifact()), Ok(hermetic()), answered_with("42"));
+  let ran = ran_over(bare(), Ok(an_artifact()), Ok(hermetic()), answered_with(VInt(42)));
   assert_eq(ran.out, ["   program b3:1f2e3d4c5b6a · 3 definitions · compiled unit embedded"]);
   let text = to_string(
-    ran_over(as_json(), Ok(an_artifact()), Ok(hermetic()), answered_with("42")).answer.json,
+    ran_over(as_json(), Ok(an_artifact()), Ok(hermetic()), answered_with(VInt(42))).answer.json,
   );
   assert(string_contains(text, "\"artifact\":\"m.plyx\""));
   assert(string_contains(text, "\"digest\":\"b3:1f2e3d4c5b6a\""));
@@ -906,7 +919,7 @@ test "an artifact whose unit this runtime cannot enter says so and still runs" {
     unit: false,
     warnings: [{ ..aside, severity: b"warning" }],
   });
-  let ran = ran_over(bare(), Ok(stale), Ok(hermetic()), answered_with("42"));
+  let ran = ran_over(bare(), Ok(stale), Ok(hermetic()), answered_with(VInt(42)));
   assert_eq(
     nth(ran.out, 0),
     "   warning: the artifact's compiled unit was built for another runtime",
@@ -921,7 +934,7 @@ test "a program that does not load is the load's own refusal with the tally unde
     places: [],
     artifact: None,
   };
-  let ran = ran_over(bare(), Err(why), Err(nothing()), answered_with(""));
+  let ran = ran_over(bare(), Err(why), Err(nothing()), answered_with(VUnit));
   assert_eq(ran.answer.code, 2);
   assert_eq(ran.answer.lines, []);
   assert_eq(ran.answer.errs, [
@@ -937,11 +950,11 @@ test "a file that is not an artifact is refused about the file and tallies nothi
     artifact: Some("junk.plyx"),
   };
   let text = to_string(
-    ran_over(as_json(), Err(why), Err(nothing()), answered_with("")).answer.json,
+    ran_over(as_json(), Err(why), Err(nothing()), answered_with(VUnit)).answer.json,
   );
   assert(string_contains(text, "\"artifact\":\"junk.plyx\""));
   assert(string_contains(text, "\"E0443\""));
-  let ran = ran_over(bare(), Err(why), Err(nothing()), answered_with(""));
+  let ran = ran_over(bare(), Err(why), Err(nothing()), answered_with(VUnit));
   assert_eq(ran.answer.code, 2);
   assert_eq(ran.answer.errs, ["Error[E0443]: not a program at all"])
 }
@@ -954,7 +967,7 @@ test "a program with no `main` is refused over its own files before anything is 
     mains: [],
     modules: [{ name: "m", path: "m.ply", at: { module: 0, start: 18, end: 18 } }],
   });
-  let ran = ran_over(as_json(), Ok(empty), Err(nothing()), answered_with(""));
+  let ran = ran_over(as_json(), Ok(empty), Err(nothing()), answered_with(VUnit));
   assert_eq(ran.answer.code, 2);
   let text = to_string(ran.answer.json);
   assert(string_contains(text, "\"root\":\"/p\""));
@@ -967,7 +980,7 @@ test "a binding that does not match the program is a start-up failure naming no 
     places: [],
     artifact: None,
   };
-  let ran = ran_over(bare(), Ok(a_program()), Err(why), answered_with(""));
+  let ran = ran_over(bare(), Ok(a_program()), Err(why), answered_with(VUnit));
   assert_eq(ran.answer.code, 2);
   assert_eq(ran.answer.errs, [
     "Error[E0412]: a nondet effect in a det test",
@@ -975,7 +988,7 @@ test "a binding that does not match the program is a start-up failure naming no 
   ]);
   assert(
     string_contains(
-      to_string(ran_over(as_json(), Ok(a_program()), Err(why), answered_with("")).answer.json),
+      to_string(ran_over(as_json(), Ok(a_program()), Err(why), answered_with(VUnit)).answer.json),
       "\"binding\":\"host\"",
     ),
   )
@@ -983,7 +996,7 @@ test "a binding that does not match the program is a start-up failure naming no 
 
 test "what the machine reused is a count and a ratio, and no ratio at all over nothing" {
   let reused = {
-    ..answered_with("42"),
+    ..answered_with(VInt(42)),
     counters: { updates: 4, updates_in_place: 3, in_place: decimal_of_string("0.75"), cycles: 0 },
   };
   let text = to_string(ran_over(as_json(), Ok(a_program()), Ok(hermetic()), reused).answer.json);
@@ -991,7 +1004,7 @@ test "what the machine reused is a count and a ratio, and no ratio at all over n
   assert(string_contains(text, "\"updates_in_place\":3"));
   assert(string_contains(text, "\"in_place\":0.75"));
   let over_nothing = to_string(
-    ran_over(as_json(), Ok(a_program()), Ok(hermetic()), answered_with("42")).answer.json,
+    ran_over(as_json(), Ok(a_program()), Ok(hermetic()), answered_with(VInt(42))).answer.json,
   );
   assert(string_contains(over_nothing, "\"in_place\":null"))
 }
@@ -1012,14 +1025,14 @@ fn a_build() -> Loading =
 fn explaining() -> Flags = from_argv("run", ["--explain"])
 
 fn loaded(flags: Flags, l: Loading) -> Ran =
-  ran_loaded(flags, Ok(a_program()), Ok(a_binding()), answered_with("42"), Some(l))
+  ran_loaded(flags, Ok(a_program()), Ok(a_binding()), answered_with(VInt(42)), Some(l))
 
 test "a run over a reused front end answers exactly as one over a front end it ran" {
   assert_eq(loaded(bare(), a_reuse()), loaded(bare(), a_build()));
   assert_eq(loaded(as_json(), a_reuse()), loaded(as_json(), a_build()));
   assert_eq(
     loaded(bare(), a_reuse()),
-    ran_over(bare(), Ok(a_program()), Ok(a_binding()), answered_with("42")),
+    ran_over(bare(), Ok(a_program()), Ok(a_binding()), answered_with(VInt(42))),
   )
 }
 
@@ -1053,7 +1066,7 @@ test "a load the machine refused says nothing about where its time went" {
     places: [],
     artifact: None,
   };
-  let ran = ran_loaded(explaining(), Err(why), Err(nothing()), answered_with(""), Some(a_build()));
+  let ran = ran_loaded(explaining(), Err(why), Err(nothing()), answered_with(VUnit), Some(a_build()));
   assert_eq(ran.err, []);
   assert_eq(ran.answer.code, 2)
 }

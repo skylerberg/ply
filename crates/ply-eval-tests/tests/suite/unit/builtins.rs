@@ -40,12 +40,16 @@ fn bytes(b: &[u8]) -> Value {
     Value::bytes(b)
 }
 
-fn found(b: Builtin, args: Vec<Value>) -> String {
-    done(b, args).unwrap().render()
+fn found(b: Builtin, args: Vec<Value>) -> Value {
+    done(b, args).unwrap()
 }
 
-fn some(i: i64) -> String {
-    format!("Some({i})")
+fn some(i: i64) -> Value {
+    Value::ctor("Some", vec![Value::Int(i)])
+}
+
+fn none() -> Value {
+    Value::ctor("None", Vec::new())
 }
 
 /// `Some(i)` as `i` and `None` as `-1`, the shape the folds it is compared against answer in.
@@ -87,18 +91,18 @@ fn index_of_covers_empty_absent_at_the_start_at_the_end_and_overlapping() {
     );
     assert_eq!(
         found(Builtin::BytesIndexOf, vec![bytes(b""), bytes(b"a")]),
-        "None"
+        none()
     );
     assert_eq!(
         found(Builtin::BytesIndexOf, vec![hay.clone(), bytes(b"z")]),
-        "None"
+        none()
     );
     assert_eq!(
         found(
             Builtin::BytesIndexOf,
             vec![hay.clone(), bytes(b"aaabaaabx")]
         ),
-        "None",
+        none(),
         "a needle longer than the haystack cannot occur"
     );
     assert_eq!(
@@ -165,7 +169,7 @@ fn index_of_from_answers_an_absolute_index_and_admits_the_end() {
             Builtin::BytesIndexOfFrom,
             vec![hay.clone(), bytes(b" "), Value::Int(14)]
         ),
-        "None"
+        none()
     );
 }
 
@@ -209,7 +213,7 @@ fn index_of_byte_takes_a_byte_and_refuses_anything_else() {
             Builtin::BytesIndexOfByte,
             vec![bytes(b"abc"), Value::Int(255)]
         ),
-        "None"
+        none()
     );
     for out_of_range in [-1, 256] {
         let d = done(
@@ -247,12 +251,10 @@ fn index_of_agrees_with_a_naive_search_over_ten_thousand_pairs() {
         };
 
         assert_eq!(
-            done(Builtin::BytesIndexOf, vec![bytes(&hay), bytes(&needle)])
-                .unwrap()
-                .render(),
+            done(Builtin::BytesIndexOf, vec![bytes(&hay), bytes(&needle)]).unwrap(),
             match naive(&hay, &needle, 0) {
                 Some(i) => some(i as i64),
-                None => "None".to_string(),
+                None => none(),
             },
             "case {case}: {hay:?} / {needle:?}"
         );
@@ -261,11 +263,10 @@ fn index_of_agrees_with_a_naive_search_over_ten_thousand_pairs() {
                 Builtin::BytesIndexOfFrom,
                 vec![bytes(&hay), bytes(&needle), Value::Int(from as i64)]
             )
-            .unwrap()
-            .render(),
+            .unwrap(),
             match naive(&hay, &needle, from) {
                 Some(i) => some(i as i64),
-                None => "None".to_string(),
+                None => none(),
             },
             "case {case}: {hay:?} / {needle:?} from {from}"
         );
@@ -289,28 +290,24 @@ fn starts_with_and_ends_with_agree_with_the_empty_and_whole_cases() {
     ] {
         for hit in hits {
             assert_eq!(
-                done(builtin, vec![b.clone(), bytes(hit)]).unwrap().render(),
-                "true",
+                done(builtin, vec![b.clone(), bytes(hit)]).unwrap(),
+                Value::Bool(true),
                 "{} {hit:?}",
                 builtin.name()
             );
         }
         for miss in misses {
             assert_eq!(
-                done(builtin, vec![b.clone(), bytes(miss)])
-                    .unwrap()
-                    .render(),
-                "false",
+                done(builtin, vec![b.clone(), bytes(miss)]).unwrap(),
+                Value::Bool(false),
                 "{} {miss:?}",
                 builtin.name()
             );
         }
     }
     assert_eq!(
-        done(Builtin::BytesStartsWith, vec![bytes(b""), bytes(b"")])
-            .unwrap()
-            .render(),
-        "true"
+        done(Builtin::BytesStartsWith, vec![bytes(b""), bytes(b"")]).unwrap(),
+        Value::Bool(true)
     );
 }
 
@@ -318,20 +315,26 @@ fn starts_with_and_ends_with_agree_with_the_empty_and_whole_cases() {
 fn split_keeps_the_empty_pieces_a_join_needs_to_round_trip() {
     let split = |hay: &[u8], sep: &[u8]| done(Builtin::BytesSplit, vec![bytes(hay), bytes(sep)]);
     assert_eq!(
-        split(b"a,b,c", b",").unwrap().render(),
-        "[b\"a\", b\"b\", b\"c\"]"
+        split(b"a,b,c", b",").unwrap(),
+        Value::list(vec![bytes(b"a"), bytes(b"b"), bytes(b"c")])
     );
-    assert_eq!(split(b"", b",").unwrap().render(), "[b\"\"]");
-    assert_eq!(split(b",", b",").unwrap().render(), "[b\"\", b\"\"]");
-    assert_eq!(split(b"abc", b",").unwrap().render(), "[b\"abc\"]");
+    assert_eq!(split(b"", b",").unwrap(), Value::list(vec![bytes(b"")]));
     assert_eq!(
-        split(b"a\r\n\r\nb", b"\r\n").unwrap().render(),
-        "[b\"a\", b\"\", b\"b\"]"
+        split(b",", b",").unwrap(),
+        Value::list(vec![bytes(b""), bytes(b"")])
+    );
+    assert_eq!(
+        split(b"abc", b",").unwrap(),
+        Value::list(vec![bytes(b"abc")])
+    );
+    assert_eq!(
+        split(b"a\r\n\r\nb", b"\r\n").unwrap(),
+        Value::list(vec![bytes(b"a"), bytes(b""), bytes(b"b")])
     );
     // Non-overlapping, left to right: the second `aa` starts after the first one's last byte.
     assert_eq!(
-        split(b"aaaa", b"aa").unwrap().render(),
-        "[b\"\", b\"\", b\"\"]"
+        split(b"aaaa", b"aa").unwrap(),
+        Value::list(vec![bytes(b""), bytes(b""), bytes(b"")])
     );
 }
 
@@ -551,8 +554,7 @@ fn position_finds_the_first_byte_its_predicate_accepts() {
             vec![hay.clone(), Value::Int(0), f()],
             is_upper
         )
-        .unwrap()
-        .render(),
+        .unwrap(),
         some(3)
     );
     assert_eq!(
@@ -561,9 +563,8 @@ fn position_finds_the_first_byte_its_predicate_accepts() {
             vec![hay.clone(), Value::Int(4), f()],
             is_upper
         )
-        .unwrap()
-        .render(),
-        "None"
+        .unwrap(),
+        none()
     );
     assert_eq!(
         drive(
@@ -571,9 +572,8 @@ fn position_finds_the_first_byte_its_predicate_accepts() {
             vec![bytes(b""), Value::Int(0), f()],
             |_| panic!("an empty buffer calls no predicate")
         )
-        .unwrap()
-        .render(),
-        "None"
+        .unwrap(),
+        none()
     );
 }
 
@@ -589,7 +589,7 @@ fn position_calls_its_predicate_once_for_a_match_at_the_start_of_a_megabyte() {
         },
     )
     .unwrap();
-    assert_eq!(out.render(), some(0));
+    assert_eq!(out, some(0));
     assert_eq!(calls, 1);
 }
 
@@ -626,11 +626,11 @@ fn one_suspension_point_inside_position_can_be_resumed_twice() {
         }
     };
     assert_eq!(
-        finish(advance(frame.clone(), Value::Bool(true)).unwrap(), false).render(),
+        finish(advance(frame.clone(), Value::Bool(true)).unwrap(), false),
         some(0)
     );
     assert_eq!(
-        finish(advance(frame, Value::Bool(false)).unwrap(), true).render(),
+        finish(advance(frame, Value::Bool(false)).unwrap(), true),
         some(1)
     );
 }
@@ -724,10 +724,8 @@ fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() 
         "`é` is two bytes, so the byte index is one past the character index"
     );
     assert_eq!(
-        done(Builtin::StringFind, vec![Value::str(text), Value::str("=")])
-            .unwrap()
-            .render(),
-        "5"
+        done(Builtin::StringFind, vec![Value::str(text), Value::str("=")]).unwrap(),
+        Value::Int(5)
     );
 
     // A byte search may cut a character, and `string_of_bytes` refuses the piece.
@@ -737,10 +735,8 @@ fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() 
     )
     .unwrap();
     assert_eq!(
-        done(Builtin::BytesIsUtf8, vec![cut.clone()])
-            .unwrap()
-            .render(),
-        "false"
+        done(Builtin::BytesIsUtf8, vec![cut.clone()]).unwrap(),
+        Value::Bool(false)
     );
     assert_eq!(
         done(Builtin::StringOfBytes, vec![cut]).unwrap_err().code,
@@ -775,7 +771,7 @@ fn map_visits_every_element_in_order() {
     })
     .unwrap();
     assert_eq!(seen, [1, 2, 3]);
-    assert_eq!(out.render(), "[10, 20, 30]");
+    assert_eq!(out, ints(&[10, 20, 30]));
 }
 
 #[test]
@@ -784,12 +780,12 @@ fn an_empty_list_never_calls_the_callback() {
         panic!("map called its function on an empty list")
     })
     .unwrap();
-    assert_eq!(out.render(), "[]");
+    assert_eq!(out, ints(&[]));
     let out = drive(Builtin::Fold, vec![ints(&[]), Value::Int(7), f()], |_| {
         panic!("fold called its function on an empty list")
     })
     .unwrap();
-    assert_eq!(out.render(), "7");
+    assert_eq!(out, Value::Int(7));
 }
 
 #[test]
@@ -799,7 +795,7 @@ fn filter_keeps_the_element_its_predicate_accepted() {
         Value::Bool(n % 2 == 0)
     })
     .unwrap();
-    assert_eq!(out.render(), "[2, 4]");
+    assert_eq!(out, ints(&[2, 4]));
 }
 
 #[test]
@@ -814,7 +810,7 @@ fn fold_threads_the_accumulator_leftwards() {
         },
     )
     .unwrap();
-    assert_eq!(out.render(), "123");
+    assert_eq!(out, Value::Int(123));
 }
 
 #[test]
@@ -840,8 +836,8 @@ fn one_suspension_point_inside_map_can_be_resumed_twice() {
 
     let a = finish(advance(frame.clone(), Value::Int(7)).unwrap(), 0);
     let b = finish(advance(frame, Value::Int(9)).unwrap(), 1);
-    assert_eq!(a.render(), "[7, 0, 0]");
-    assert_eq!(b.render(), "[9, 1, 1]");
+    assert_eq!(a, ints(&[7, 0, 0]));
+    assert_eq!(b, ints(&[9, 1, 1]));
 }
 
 #[test]
@@ -864,7 +860,7 @@ fn an_iterate_threads_its_seed_and_answers_what_stop_carries() {
         stop_at(7),
     )
     .unwrap();
-    assert_eq!(out.render(), "\"done at 7\"");
+    assert_eq!(out, Value::str("done at 7"));
 
     // Stopping on the very first step costs one round, not none: the step has to run to say so.
     let out = drive(
@@ -873,7 +869,7 @@ fn an_iterate_threads_its_seed_and_answers_what_stop_carries() {
         stop_at(0),
     )
     .unwrap();
-    assert_eq!(out.render(), "\"done at 9\"");
+    assert_eq!(out, Value::str("done at 9"));
 }
 
 /// Each resumption has to continue its own copy of the countdown.
@@ -923,10 +919,10 @@ fn one_suspension_point_inside_iterate_can_be_resumed_twice() {
         3,
     )
     .unwrap();
-    assert_eq!(a.render(), "3");
+    assert_eq!(a, Value::Int(3));
     assert_eq!(
-        b.render(),
-        "3",
+        b,
+        Value::Int(3),
         "the second resumption inherited a spent budget"
     );
 
@@ -1042,7 +1038,7 @@ fn cell_builtins_read_and_write_the_arena_they_are_given() {
     let Step::Done(v) = got else {
         panic!("cell_get does not suspend");
     };
-    assert_eq!(v.render(), "2");
+    assert_eq!(v, Value::Int(2));
 }
 
 /// The stale slot and the live one share an index and differ only in generation.
@@ -1273,10 +1269,10 @@ fn map_update_applies_the_function_to_a_present_key_and_leaves_an_absent_one_alo
         |args| Value::Int(args[0].as_int(Span::DUMMY, "test").unwrap() + 41),
     )
     .unwrap();
-    assert_eq!(out.render(), "{\"k\": 42}");
+    assert_eq!(out, Value::map([(Value::str("k"), Value::Int(42))]));
     let untouched = drive(Builtin::MapUpdate, vec![m, Value::str("z"), f()], |_| {
         panic!("`map_update` called its function on an absent key")
     })
     .unwrap();
-    assert_eq!(untouched.render(), "{\"k\": 1}");
+    assert_eq!(untouched, Value::map([(Value::str("k"), Value::Int(1))]));
 }
