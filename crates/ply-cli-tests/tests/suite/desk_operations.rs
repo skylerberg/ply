@@ -280,7 +280,7 @@ fn hosts_prints_where_records_go_which_channels_exist_and_what_a_signal_does() {
     run.says("sink       ply_host::trace::json → stderr · level info");
     // `http` for the request span, `orders` and `items` for the two tables.
     run.says("channels   http items orders");
-    run.says("spans      per-task stack · closed at end_entry_point");
+    run.says("spans      per-task stack · closed at end_task or end_entry_point");
 
     run.says("shutdown");
     run.says("signals    INT TERM · lead 0ms · drain 30000ms · second signal exits 130/143");

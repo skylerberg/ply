@@ -51,6 +51,8 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
             "std.signal.signal.stopping[..]",
             "std.signal.signal.deadline_ms[..]",
             "std.process.process.args[..]",
+            // `--exec` is resolved once, before anything runs.
+            "std.process.process.bound[..]",
         ]
     );
 }
@@ -66,7 +68,7 @@ fn a_registry_and_a_runtime_come_from_one_host() {
     };
     assert_eq!(
         runtime
-            .poll(&stray)
+            .watch(&stray)
             .expect_err("a token nothing minted is refused")
             .code,
         codes::INTERNAL_ERROR

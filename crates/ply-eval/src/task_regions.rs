@@ -1,18 +1,17 @@
-//! The region stack a task allocates in, and the fixture it starts from.
+//! The cell arena an entry runs over: the fixture's region and the entry's, on the entry's own
+//! stack, and every region the entry's stacks open over them.
 
-use crate::Span;
-use crate::arena::{Arena, Reclaim, RegionId, RegionKind, Slot};
+use crate::arena::{Arena, Owner, RegionId, RegionKind, Slot};
 use crate::value::Value;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
-/// Regions every stack holds from the moment it exists: the fixture's and the entry point's.
+/// Regions the entry's own stack holds from the moment it exists: the fixture's and the entry's.
 const FLOOR: usize = 2;
 
 pub struct TaskRegions<V = Value> {
     arena: Arena<V>,
-    root: RegionId,
     entry: RegionId,
     /// Shared with the [`Fixture`] it came from, so opening one copies no values.
     base: Rc<Vec<V>>,
@@ -34,19 +33,18 @@ impl<V: Clone + Default> TaskRegions<V> {
     fn from_values(base: Rc<Vec<V>>) -> TaskRegions<V> {
         let mut arena = Arena::new();
         // Both shared: a continuation captured across either may resume after its lexical close.
-        let root = arena.open(RegionKind::Shared, Span::DUMMY);
+        arena.open(Owner::ENTRY, RegionKind::Shared);
         let base_slots = base
             .iter()
             .map(|value| {
                 arena
-                    .alloc(value.clone())
+                    .alloc(Owner::ENTRY, value.clone())
                     .expect("the root region is open, so an allocation cannot fail")
             })
             .collect();
-        let entry = arena.open(RegionKind::Shared, Span::DUMMY);
+        let entry = arena.open(Owner::ENTRY, RegionKind::Shared);
         TaskRegions {
             arena,
-            root,
             entry,
             base,
             base_slots,
@@ -68,50 +66,42 @@ impl<V: Clone + Default> TaskRegions<V> {
     }
 
     pub fn reset(&mut self) {
+        self.close_program_regions();
         self.arena.close(self.entry);
         for (slot, value) in self.base_slots.iter().zip(self.base.iter()) {
             let restored = self.arena.set(*slot, value.clone());
-            debug_assert!(restored, "the fixture's slots sit below every truncation");
+            debug_assert!(restored, "the fixture's slots sit below every close");
         }
-        self.entry = self.arena.open(RegionKind::Shared, Span::DUMMY);
-        self.arena.clear_journal();
+        self.entry = self.arena.open(Owner::ENTRY, RegionKind::Shared);
     }
 
     pub fn base_len(&self) -> usize {
         self.base.len()
     }
 
-    /// The region the fixture lives in, which outlives every entry point.
-    pub fn root(&self) -> RegionId {
-        self.root
-    }
-
-    pub fn open_region(&mut self, kind: RegionKind, span: Span) -> RegionId {
-        self.arena.open(kind, span)
-    }
-
-    pub fn close_region(&mut self, region: RegionId) -> Reclaim {
-        self.arena.close(region)
-    }
-
+    /// Closes every region every stack opened, down to the fixture's and the entry's.
     pub fn close_program_regions(&mut self) {
-        while self.arena.depth() > FLOOR {
-            self.arena.close_current();
-        }
+        self.arena.close_all_but(Owner::ENTRY, FLOOR);
     }
 
-    /// Closes every region opened since the stack stood `depth` deep, for control that jumped
-    /// back past their closes.
-    pub fn close_regions_above(&mut self, depth: usize) {
-        while self.arena.depth() > depth.max(FLOOR) {
-            self.arena.close_current();
-        }
+    /// [`Arena::renew`] down to the fixture's region and the entry's, so refused while either
+    /// holds a cell.
+    pub fn renew(&mut self) -> bool {
+        self.arena.renew(Owner::ENTRY, FLOOR)
     }
 
+    /// Closes every region `owner` opened since it stood `depth` deep, for control that jumped
+    /// back past their closes or a stack that will not run again.
+    pub fn close_regions_above(&mut self, owner: Owner, depth: usize) {
+        let floor = if owner == Owner::ENTRY { FLOOR } else { 0 };
+        self.arena.close_above(owner, depth.max(floor));
+    }
+
+    /// A cell on the entry's own stack, in its innermost region.
     pub fn alloc_cell(&mut self, value: V) -> Slot {
         self.arena
-            .alloc(value)
-            .expect("a task's entry region is open for the whole of a run")
+            .alloc(Owner::ENTRY, value)
+            .expect("the entry region is open for the whole of a run")
     }
 }
 
@@ -137,7 +127,7 @@ impl<V: Clone + Default + fmt::Debug> fmt::Debug for TaskRegions<V> {
     }
 }
 
-/// A seeded region stack and the value a test reaches it through.
+/// A seeded cell arena and the value a test reaches it through.
 #[derive(Clone, Debug)]
 pub struct Fixture {
     values: Rc<Vec<Value>>,
@@ -172,7 +162,7 @@ impl Fixture {
     }
 
     /// Sealed, so an entry point resets to the seed and not to nothing.
-    #[must_use = "opening a fixture builds a region stack; dropping it discards the seed"]
+    #[must_use = "opening a fixture builds a cell arena; dropping it discards the seed"]
     pub fn open(&self) -> (TaskRegions, Value) {
         (
             TaskRegions::from_values(Rc::clone(&self.values)),

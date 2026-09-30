@@ -7,15 +7,16 @@ import claims
 import config_schema
 import program (Front, Timed, front_of, is_shipped, no_front, timed_load, timed_uncached)
 import proof.shrink (Ask, Descent, Offer, Offered, Reply, Take, Taken, Tries, Would, descend)
-import proof.obligation (Binding, Frame, Gap, Held, Outcome, Pure, Raised, ReachesHost, Refuted,
-                         Sampled, Unattempted, frame_summary)
+import proof.obligation (Binding, Defect, Frame, Gap, Held, NoCaseKept, Outcome, Pure, Raised,
+                         ReachesHost, Refuted, Sampled, Unattempted, Unsatisfiable, Vacuous,
+                         frame_summary)
 import proof.world (Built, World, world_of)
-import claims (Claimed, Collected, Measured, Settled, measured, Options, prover, Claim, Choice,
-               Collection, Discharged, Refusal, Row, Verdicts, Broken, Trouble, Unbound, a_claim,
-               a_counter, a_place, a_plan, also, at_tier, claimed_part, code_of, collected_part,
-               collection_of, coverage_json, coverage_lines, decided, diagnostics_of, held_of,
-               joined, no_world, nth, num, obligation_json, once_each, own_claims, plan_json,
-               proved, quantifier, refusal, refuted_of, rendered, row_head, rows_of, seconds,
+import claims (Claimed, Collected, Settled, Options, prover, Claim, Choice, Collection, Discharged,
+               Refusal, Row, Verdicts, Broken, Trouble, Unbound, a_claim, a_counter, a_fault, a_loc,
+               a_place, a_plan, also, at_tier, claimed_part, code_of, collected_part, collection_of,
+               coverage_json, coverage_lines, decided, defect_of, diagnostics_of, held_of, joined,
+               no_world, nth, num, obligation_json, once_each, own_claims, plan_json, proved,
+               quantifier, refusal, refuted_of, rendered, row_head, rows_of, seconds,
                unattempted_of, under, vacuous_of)
 import proof.obligation (Coverage, Ensures, Example, Fresh, FromProof, Kind, Law, Property, Proved,
                          Tier, reason_word)
@@ -55,8 +56,11 @@ fn summary_line(s: Style, rows: List<Row>, ms: Decimal) -> String = {
   let gaps = unattempted_of(rows);
   let counted = if gaps > 0 { head ++ " · " ++ int_to_string(gaps) ++ " unattempted" }
   else { head };
-  counted ++ "   " ++ dim(s, "(" ++ seconds(ms) ++ "s)")
+  let faulted = if defect_of(rows) > 0 { counted ++ " · " ++ defects_word(rows) } else { counted };
+  faulted ++ "   " ++ dim(s, "(" ++ seconds(ms) ++ "s)")
 }
+
+fn defects_word(rows: List<Row>) -> String = count_of(defect_of(rows), "defect") ++ " in Ply"
 
 // A refutation is a fact about the program, so it is written out in full: the point it fails at,
 // what that point was shrunk from, and the frame the claim is made under.
@@ -82,6 +86,9 @@ fn detail_lines(s: Style, r: Row) -> List<String> =
       else { [under() ++ dim(s, "shrunk to " ++ rendered(raise.bindings))] },
       _ -> [],
     },
+    // Where Ply failed, which is what a report of the defect needs to reproduce it.
+    Defect(f) -> if len(f.bindings) == 0 { [] }
+    else { [under() ++ dim(s, "at " ++ rendered(f.bindings))] },
     _ -> [],
   }
 
@@ -117,13 +124,13 @@ fn tally_line(s: Style, rows: List<Row>, ms: Decimal) -> String = {
   let refuted = refuted_of(rows);
   let vacuous = vacuous_of(rows);
   let clock = " (" ++ seconds(ms) ++ "s)";
-  if refuted == 0 && vacuous == 0 { ind() ++ green(s, held) ++ clock } else {
-    let parts = also(
-      if refuted > 0 { [int_to_string(refuted) ++ " refuted"] } else { [] },
-      if vacuous > 0 { [int_to_string(vacuous) ++ " vacuous"] } else { [] },
-    );
-    ind() ++ red(s, joined(parts, ", ")) ++ ", " ++ held ++ clock
-  }
+  let claimed = also(
+    if refuted > 0 { [int_to_string(refuted) ++ " refuted"] } else { [] },
+    if vacuous > 0 { [int_to_string(vacuous) ++ " vacuous"] } else { [] },
+  );
+  let parts = if defect_of(rows) > 0 { push(claimed, defects_word(rows)) } else { claimed };
+  if len(parts) == 0 { ind() ++ green(s, held) ++ clock }
+  else { ind() ++ red(s, joined(parts, ", ")) ++ ", " ++ held ++ clock }
 }
 
 fn filtered_lines(s: Style, filtered_out: Int) -> List<String> =
@@ -167,6 +174,7 @@ fn summary_json(rows: List<Row>) -> Json =
     { key: "refuted", value: num(refuted_of(rows)) },
     { key: "vacuous", value: num(vacuous_of(rows)) },
     { key: "unattempted", value: num(unattempted_of(rows)) },
+    { key: "defect", value: num(defect_of(rows)) },
   ])
 
 fn document(
@@ -257,8 +265,9 @@ fn reached(
     }
   }
 
-/// Every counterexample walked down before it is read: a refutation keeps the draw it failed at and
-/// gains the tuple the walk settled on, and a raise keeps its gap and gains its own.
+/// Every counterexample walked down before it is read, when its claim's points were drawn: a
+/// refutation keeps the draw it failed at and gains the tuple the walk settled on, and a raise keeps
+/// its gap and gains its own.
 fn walked(
   claims: List<Claim>,
   wanted: List<Int>,
@@ -276,7 +285,13 @@ fn sifted_at(
 ) -> Outcome / {prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} =
   match list_at(v.outcomes, i) {
     None -> panic("the runtime answered fewer obligations than were asked"),
-    Some(o) -> sifted(at(wanted, i, 0 - 1), o, budget),
+    Some(o) -> {
+      let claim = at(wanted, i, 0 - 1);
+      match list_at(claims, claim) {
+        Some(c) -> if c.walks { sifted(claim, o, budget) } else { o },
+        None -> o,
+      }
+    },
   }
 
 fn sifted(
@@ -307,9 +322,8 @@ fn sifted(
     _ -> o,
   }
 
-/// One counterexample walked down, when the runtime has one to walk. `None` is a claim with nothing
-/// to shrink — a race, an enumerated point, a claim that held — and it is the runtime's answer, not
-/// a guess this side makes.
+/// One counterexample walked down, when the runtime holds the draw it came from. `None` is an
+/// outcome that holds none, such as a claim that held.
 fn descended(
   claim: Int,
   budget: Int,
@@ -391,7 +405,6 @@ fn a_collection(cs: List<Claim>) -> Collection =
     places: [a_place()],
     warnings: [],
     claims: cs,
-    decls: [],
     defs: map(cs, |c: Claim| { name: c.owner, hash: Some(c.key), specs: [] }),
     laws: [],
     plan: a_plan(),
@@ -402,7 +415,7 @@ fn got_of(c: Result<Collection, Refusal>) -> Result<Collected, Refusal> =
   match c { Ok(x) -> Ok(collected_part(x)), Err(why) -> Err(why) }
 
 fn mine_of(c: Result<Collection, Refusal>) -> Claimed =
-  match c { Ok(x) -> claimed_part(x), Err(_) -> { claims: [], decls: [], warnings: [] } }
+  match c { Ok(x) -> claimed_part(x), Err(_) -> { claims: [], defs: [], laws: [], warnings: [] } }
 
 fn verdicts(outcomes: List<Outcome>) -> Discharged =
   { outcomes: outcomes, duration_ms: decimal_of_int(0), warnings: [] }
@@ -488,6 +501,75 @@ test "a refuted claim is exit 1, and says where it fails and what it was shrunk 
   assert_eq(nth(answer.lines, len(answer.lines) - 1), "   1 refuted, 0 held (0.00s)")
 }
 
+// A runtime that holds a draw for every claim, and whose every walk settles on the empty list.
+fn walked_over(c: Collection, v: Discharged) -> Answer =
+  handle {
+    prove_over(
+      style_of(bare()),
+      bare(),
+      claims::no_options(),
+      no_front(),
+      no_world(),
+      claimed_part(c),
+    )
+  } with {
+    prover.configure[claims](options, front, world) -> (),
+    prover.collected[claims]() -> Ok(collected_part(c)),
+    prover.outcomes[claims](keys) -> map(keys, |_k: String| None),
+    prover.reaches[claims](asked) -> Ok(map(asked, |_i: Int| None)),
+    prover.shrink[claims](claim) -> Ok(Some(1)),
+    prover.offers[claims](i) -> Ok(None),
+    prover.would[claims](i, position) -> Ok(false),
+    prover.accept[claims](i, position) -> Ok(()),
+    prover.settled[claims]() ->
+      Ok(
+        Some({
+          bindings: [{ name: "xs", ty: "List<Int>", rendered: "[]" }],
+          original: [{ name: "xs", ty: "List<Int>", rendered: "[7, 9]" }],
+        }),
+      ),
+    prover.discharged[claims](choice) -> Ok(v),
+    prover.record[claims](entries) -> [],
+  }
+
+// The line after the one naming `needle`, which is where a refutation's point is written.
+fn under_line(lines: List<String>, needle: String) -> String = {
+  let found = fold(range(0, len(lines)), 0 - 1, |at: Int, i: Int|
+    if at >= 0 { at } else if string_contains(nth(lines, i), needle) { i } else { at });
+  nth(lines, found + 1)
+}
+
+// An enumerated point is the one a fixed order met, and an interleaving search's are schedules:
+// there is no draw to walk either down from.
+test "only a claim whose points were drawn has its counterexample walked" {
+  let drawn = { ..a_claim("m.drawn", Law(Some("drawn"))), walks: true };
+  let enumerated = { ..a_claim("m.enumerated", Law(Some("enumerated"))), walks: false };
+  let answer = walked_over(
+    a_collection([drawn, enumerated]),
+    verdicts([Refuted(a_counter()), Refuted(a_counter())]),
+  );
+  assert(string_contains(under_line(answer.lines, "law \"drawn\""), "→  xs = []"));
+  assert(string_contains(under_line(answer.lines, "law \"enumerated\""), "→  xs = [0, 0]"))
+}
+
+// A guard that admits nothing makes its claim say nothing, which is a failure as a refutation is.
+test "a vacuous claim is exit 1, however the guard was found to admit nothing" {
+  let unsatisfiable = proved_over(
+    bare(),
+    Ok(a_collection(one_claim())),
+    Ok(verdicts([Vacuous({ guard: a_loc(), why: Unsatisfiable })])),
+  );
+  assert_eq(unsatisfiable.code, 1);
+  assert_eq(nth(unsatisfiable.lines, len(unsatisfiable.lines) - 1), "   1 vacuous, 0 held (0.00s)");
+  let unkept = proved_over(
+    bare(),
+    Ok(a_collection(one_claim())),
+    Ok(verdicts([Vacuous({ guard: a_loc(), why: NoCaseKept(200) })])),
+  );
+  assert_eq(unkept.code, 1);
+  assert(string_contains(to_string(unkept.json), "\"ok\":false"))
+}
+
 // A gap is not a failure: nothing was established, and nothing was refuted either.
 test "an obligation nothing could attempt is counted, reported and still exit 0" {
   let answer = proved_over(
@@ -503,7 +585,39 @@ test "an obligation nothing could attempt is counted, reported and still exit 0"
       nth(answer.lines, 4),
       "reaches the host ({db.read[u]}); run `ply prove --host`",
     ),
-  )
+  );
+  let text = to_string(answer.json);
+  assert(string_contains(text, "\"gap_kind\":\"reaches_host\""));
+  assert(string_contains(text, "W0604"))
+}
+
+test "a claim Ply failed on is a defect in Ply and exit 1, never the program's gap" {
+  let answer = proved_over(
+    bare(),
+    Ok(a_collection(one_claim())),
+    Ok(verdicts([Defect(a_fault())])),
+  );
+  assert_eq(answer.code, 1);
+  assert_eq(
+    nth(answer.lines, 2),
+    "   1 obligation · 0 proved · 0 property · 0 example · 1 defect in Ply   (0.00s)",
+  );
+  assert(
+    string_contains(
+      nth(answer.lines, 4),
+      "Ply failed rather than the program, so this is a defect in Ply: the compiled tier declined to enter `m.law`",
+    ),
+  );
+  assert_eq(nth(answer.lines, 5), "       at b = true");
+  assert_eq(nth(answer.lines, len(answer.lines) - 1), "   1 defect in Ply, 0 held (0.00s)");
+  let text = to_string(answer.json);
+  assert(string_contains(text, "\"outcome\":\"defect\""));
+  assert(string_contains(text, "\"defect\":1"));
+  assert(string_contains(text, "\"unattempted\":0"));
+  assert(string_contains(text, "\"code\":\"E0505\""));
+  assert(string_contains(text, "\"ok\":false"));
+  assert(!string_contains(text, "W0604"));
+  assert(!string_contains(text, "\"gap\""))
 }
 
 test "`--filter` decides what is discharged at all, and says how much it left out" {

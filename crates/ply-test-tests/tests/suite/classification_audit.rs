@@ -46,7 +46,9 @@ struct Answering {
 impl Executor for Answering {
     type Worker = ();
 
-    fn worker(&self) {}
+    fn worker(&self) -> Result<(), Diagnostic> {
+        Ok(())
+    }
 
     fn execute(&self, _worker: &mut (), _index: usize) -> Result<(), Diagnostic> {
         if self.unwind {

@@ -207,10 +207,21 @@ pub const CONFIG_UNDECLARED: &str = "W0607";
 pub const DRAIN_INCOMPLETE: &str = "W0608";
 /// A value was made to reach itself; cycles are not collected, so it leaks.
 pub const REFERENCE_CYCLE: &str = "W0610";
-/// Spans still open when an entry point ended, closed by teardown.
+/// Spans still open when their task or the entry point ended, reported when the entry point ends.
 pub const SPAN_ABANDONED: &str = "W0609";
 /// A definition no `pub` item, `main`, test or law reaches.
 pub const UNUSED_DEFINITION: &str = "W0611";
 /// A run the harness stopped at its wall clock: a fact about the machine, not about the
 /// program, so nothing it did is recorded.
 pub const RUN_ABANDONED: &str = "W0612";
+
+/// Whether a failure under `code` is Ply's own rather than the program's.
+pub fn is_defect(code: &str) -> bool {
+    [
+        INTERNAL_ERROR,
+        HOST_FOOTPRINT_ESCAPE,
+        SECRET_TO_HOST,
+        SIMULATION_DIVERGENCE,
+    ]
+    .contains(&code)
+}

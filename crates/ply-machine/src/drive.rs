@@ -135,6 +135,9 @@ impl Target {
             sources: err.sources,
             artifact: None,
         })?;
+        if front.is_some_and(|f| f.promises == crate::driver::Promises::Held) {
+            return Ok(Target::Project(Box::new(loaded)));
+        }
         match crate::costs::broken_promises(&loaded) {
             Some(err) => Err(Refused {
                 diagnostics: err.diagnostics,
@@ -612,8 +615,7 @@ fn evaluate(
     declared: Option<&ply_eval::Footprint>,
     compiled: std::rc::Rc<dyn ply_eval::Compiled>,
 ) -> Result<PlyValue, Diagnostic> {
-    let mut machine = ply_eval::Machine::new(front);
-    machine.set_compiled(compiled);
+    let mut machine = ply_eval::Machine::new(front, compiled)?;
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);

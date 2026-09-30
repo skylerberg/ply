@@ -1,6 +1,7 @@
 use crate::arena::Slot;
 use crate::builtins::Builtin;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
+use crate::sched::TaskHandle;
 use crate::sim::TaskId;
 use crate::{Diagnostic, IntTy, Span, Symbol, codes, render_float};
 use rpds::RedBlackTreeMap;
@@ -155,7 +156,8 @@ pub enum Value {
     Closure(Arc<Closure>),
     /// An index and generation, so a cell of a closed region reads `None` instead of aliasing.
     Cell(Slot),
-    Task(TaskId),
+    /// Compared by its task's id; its count is what tells a production region the task can retire.
+    Task(TaskHandle),
     /// A credential; a distinct variant rather than a `Ctor`, so no pattern match can unwrap it.
     Secret(Arc<Value>),
 }
@@ -396,7 +398,7 @@ impl Value {
 
     pub fn as_task(&self, span: Span, what: &str) -> Result<TaskId, Diagnostic> {
         match self {
-            Value::Task(id) => Ok(*id),
+            Value::Task(handle) => Ok(handle.id()),
             other => Err(type_error(span, what, "Task", other)),
         }
     }
@@ -521,8 +523,8 @@ impl Value {
             Value::Cell(slot) => {
                 let _ = write!(out, "<cell {slot}>");
             }
-            Value::Task(id) => {
-                let _ = write!(out, "<task {id}>");
+            Value::Task(handle) => {
+                let _ = write!(out, "<task {}>", handle.id());
             }
             // No recursion into the payload, so the redaction holds at any depth.
             Value::Secret(_) => out.push_str(SECRET_REDACTED),
@@ -748,7 +750,7 @@ impl Ord for Value {
                 grow(|| n1.cmp(n2).then_with(|| a1.iter().cmp(a2.iter())))
             }
             (Value::Cell(x), Value::Cell(y)) => x.cmp(y),
-            (Value::Task(x), Value::Task(y)) => x.cmp(y),
+            (Value::Task(x), Value::Task(y)) => x.id().cmp(&y.id()),
             // Unreachable from a well-typed program: a `Secret` has no order.
             (Value::Secret(x), Value::Secret(y)) => grow(|| x.cmp(y)),
             (Value::Closure(_), Value::Closure(_)) => Ordering::Equal,
@@ -938,7 +940,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             });
         }
         (Value::Cell(x), Value::Cell(y)) => x == y,
-        (Value::Task(x), Value::Task(y)) => x == y,
+        (Value::Task(x), Value::Task(y)) => x.id() == y.id(),
         (Value::Secret(x), Value::Secret(y)) => {
             return descend(span, depth, || match (&**x, &**y) {
                 (Value::Str(p), Value::Str(q)) => Ok(constant_time_eq(p.as_bytes(), q.as_bytes())),

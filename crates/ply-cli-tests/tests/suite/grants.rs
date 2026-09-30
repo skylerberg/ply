@@ -8,7 +8,8 @@ use tempfile::TempDir;
 const OUTER: &str = "\
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m]() -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -28,6 +29,7 @@ type Front = {
 type Options = Unit
 type Ended = Unit
 type Target = Unit
+type Walked = Unit
 type Bound = Unit
 type Refusal = Unit
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
@@ -36,7 +38,7 @@ type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
 fn main() -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  match machine.load[m](\"inner\", None) {
+  match machine.load[m](\"inner\", None, None) {
     Ok(_) -> match machine.bound[m](\"inner.main\") {
       Ok(_) -> {
         let doubled = machine.call[m](\"inner.double\", [VInt(21)]);
@@ -115,7 +117,10 @@ fn without_the_grant_the_machine_is_not_bound() {
         "a program drove a machine with no grant"
     );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("E0424") || err.contains("machine"), "{err}");
+    assert!(
+        (err.contains("E0303") || err.contains("E0424")) && err.contains("`m.machine.load[m]`"),
+        "the ungranted operation is what refused: {err}"
+    );
 }
 
 /// A program that declares the prover and reaches one of its operations behind a branch never taken:
@@ -135,7 +140,7 @@ nondet effect prover {
   read would[claims](i: Int, position: Int) -> Result<Bool, Unit>
   write accept[claims](i: Int, position: Int) -> Result<Unit, Unit>
   read settled[claims]() -> Result<Option<Unit>, Unit>
-  read baselines[claims]() -> List<Unit>
+  read baselines[claims](names: List<String>) -> List<Unit>
   write accepted[claims](records: List<Unit>) -> Unit
 }
 

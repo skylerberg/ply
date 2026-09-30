@@ -74,8 +74,8 @@ fn harness(loaded: &'static Loaded) -> Harness {
     let unit: &'static Unit =
         Unit::over_front(&loaded.front, loaded.texts.clone()).expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
-    let mut machine = Machine::new(&loaded.front);
-    machine.set_compiled(bodies.clone());
+    let machine = Machine::new(&loaded.front, bodies.clone())
+        .expect("the unit was compiled from this program");
     Harness {
         unit,
         bodies,
@@ -387,8 +387,12 @@ fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     let declined = inside.expect_err("a reentrant entry is declined, not served");
     assert_eq!(
         declined.code,
-        ply_eval::codes::RUNTIME_ERROR,
-        "the decline arrived as something other than a runtime error: {declined}"
+        ply_eval::codes::INTERNAL_ERROR,
+        "a decline is Ply's own defect, never the program's runtime error: {declined}"
+    );
+    assert_eq!(
+        declined.message,
+        "the compiled tier declined to enter `pure.step`"
     );
 
     let after = h.run("pure.step", &[Value::Int(5)]);

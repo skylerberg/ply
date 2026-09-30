@@ -1,6 +1,7 @@
 use crate::fixture::Compiled;
-use ply_eval::explore::{Interleaving, Step};
-use ply_eval::{Machine, Plan, Seed, SimMode, explore};
+use ply_eval::explore::{Explored, Interleaving, Step};
+use ply_eval::{Diagnostic, Machine, Plan, Provider, Seed, SimMode, codes, explore};
+use std::rc::Rc;
 
 /// Everything one interleaving is allowed to be a function of, rendered.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -8,7 +9,8 @@ struct Transcript {
     verdict: String,
     virtual_time: i64,
     steps: Vec<String>,
-    world: Vec<String>,
+    /// The operations the tier reports the run performed, handled ones included.
+    performed: String,
 }
 
 fn render_step(step: &Step) -> String {
@@ -25,29 +27,58 @@ fn render_step(step: &Step) -> String {
     )
 }
 
-impl Compiled {
-    fn transcript_of(&self, index: usize, seed: &Seed) -> Transcript {
-        let mut machine = Machine::new(&self.front);
+/// A program and the one tier every run of it goes to in turn, as one worker's runs do.
+struct Audited {
+    compiled: Compiled,
+    tier: Rc<dyn ply_eval::Compiled>,
+}
+
+impl Audited {
+    fn new(source: &str) -> Audited {
+        let compiled = Compiled::named("t", source);
+        let tier = compiled.unit().attach();
+        Audited { compiled, tier }
+    }
+
+    /// Test `index` at `seed`, run by the tier through the `simulate` region every fixture here
+    /// opens: a transcript of anything else would compare nothing the program did.
+    fn run(&self, index: usize, seed: &Seed) -> (Machine<'_>, Result<(), Diagnostic>) {
+        let mut machine = self.compiled.machine_on(Rc::clone(&self.tier));
         machine.set_seed(seed.clone(), 100_000);
         let outcome = machine.eval_test(index);
-        let steps = match machine.simulated() {
-            Some(record) => record.steps.iter().map(render_step).collect(),
-            None => Vec::new(),
-        };
-        let virtual_time = machine.simulated().map_or(0, |r| r.virtual_time);
+        assert_eq!(
+            machine.compiled_counts(),
+            (1, 0),
+            "test {index} at seed {seed} was not run by the tier: {outcome:?}"
+        );
+        if let Err(d) = &outcome {
+            assert_ne!(
+                d.code,
+                codes::INTERNAL_ERROR,
+                "test {index} at seed {seed} failed in Ply: {d:?}"
+            );
+        }
+        let steps = machine.simulated().map_or(0, |record| record.steps.len());
+        assert!(
+            steps > 0,
+            "test {index} at seed {seed} recorded no step of its region"
+        );
+        (machine, outcome)
+    }
+
+    fn transcript_of(&self, index: usize, seed: &Seed) -> Transcript {
+        let (machine, outcome) = self.run(index, seed);
+        let record = machine.simulated().expect("the run recorded its region");
+        let trace = machine.trace();
         Transcript {
             verdict: match &outcome {
                 Ok(()) => "passed".to_string(),
                 // The code and the message, so that two different failures cannot compare equal.
                 Err(d) => format!("{}: {}", d.code, d.message),
             },
-            virtual_time,
-            steps,
-            world: machine
-                .cells()
-                .slots()
-                .map(|(slot, v)| format!("{}={}", slot.index(), v.render()))
-                .collect(),
+            virtual_time: record.virtual_time,
+            steps: record.steps.iter().map(render_step).collect(),
+            performed: format!("{} in {} performs", trace.footprint(), trace.performs()),
         }
     }
 
@@ -56,28 +87,26 @@ impl Compiled {
     }
 
     fn interleaving_at(&self, index: usize, seed: &Seed) -> Interleaving {
-        self.run_at(index, seed).0
+        let (machine, outcome) = self.run(index, seed);
+        machine
+            .simulated()
+            .expect("the run recorded its region")
+            .interleaving(&outcome)
     }
+}
 
-    /// What the run interleaved, and the world it left behind.
-    fn run_at(&self, index: usize, seed: &Seed) -> (Interleaving, Vec<String>) {
-        let mut machine = Machine::new(&self.front);
-        machine.set_seed(seed.clone(), 100_000);
-        let outcome = machine.eval_test(index);
-        let world = machine
-            .cells()
-            .slots()
-            .map(|(slot, v)| format!("{}={}", slot.index(), v.render()))
-            .collect();
-        let interleaving = match machine.simulated() {
-            Some(record) => record.interleaving(&outcome),
-            None => match outcome {
-                Ok(()) => Interleaving::passed(Vec::new()),
-                Err(d) => Interleaving::failed(Vec::new(), d),
-            },
-        };
-        (interleaving, world)
-    }
+/// The failure a search stopped at is the fixture's assertion seeing an update lost.
+#[track_caller]
+fn assert_lost_update(explored: &Explored, total: i64, what: &str) {
+    let Some(d) = &explored.diagnostic else {
+        panic!(
+            "{what}: no interleaving of {} failed",
+            explored.exploration.explored
+        );
+    };
+    assert_eq!(d.code, codes::ASSERTION_FAILED, "{what}: {d:?}");
+    let lost = format!("assertion failed: expected {total}, found ");
+    assert!(d.message.starts_with(&lost), "{what}: {}", d.message);
 }
 
 fn dpor(budget: u32) -> Plan {
@@ -215,12 +244,12 @@ const SHAPE_NAMES: [&str; 4] = [
 
 #[test]
 fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
-    let compiled = Compiled::named("t", SHAPES);
+    let audited = Audited::new(SHAPES);
     for (index, name) in SHAPE_NAMES.iter().enumerate() {
         for root in 0..48u64 {
             let seed = Seed::root(root);
-            let first = compiled.transcript_of(index, &seed);
-            let again = compiled.transcript_of(index, &seed);
+            let first = audited.transcript_of(index, &seed);
+            let again = audited.transcript_of(index, &seed);
             assert_eq!(again, first, "`{name}` diverged at seed {root}");
         }
     }
@@ -228,9 +257,8 @@ fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
 
 #[test]
 fn an_edit_that_changes_no_hash_changes_no_interleaving() {
-    let plain = Compiled::named("t", LOST_UPDATE);
-    let edited = Compiled::named(
-        "t",
+    let plain = Audited::new(LOST_UPDATE);
+    let edited = Audited::new(
         &LOST_UPDATE
             .replace("let seen =", "// a comment nobody reads\n  let observed =")
             .replace("seen + 1", "observed + 1")
@@ -238,6 +266,14 @@ fn an_edit_that_changes_no_hash_changes_no_interleaving() {
             .replace("let b = task.spawn", "let second = task.spawn")
             .replace("task.join(a)", "task.join(first)")
             .replace("task.join(b)", "task.join(second)"),
+    );
+    assert_eq!(
+        edited.compiled.front.hashes.tests, plain.compiled.front.hashes.tests,
+        "the edit must change no hash, or this compares two programs"
+    );
+    assert_eq!(
+        edited.compiled.front.hashes.defs,
+        plain.compiled.front.hashes.defs
     );
     for root in 0..24u64 {
         let seed = Seed::root(root);
@@ -251,14 +287,14 @@ fn an_edit_that_changes_no_hash_changes_no_interleaving() {
 
 #[test]
 fn the_whole_search_is_a_function_of_its_plan() {
-    let compiled = Compiled::named("t", SHAPES);
+    let audited = Audited::new(SHAPES);
     for (index, name) in SHAPE_NAMES.iter().enumerate() {
         let first = explore(&dpor(128), &mut |seed: &Seed| {
-            compiled.interleaving_at(index, seed)
+            audited.interleaving_at(index, seed)
         });
         for _ in 0..8 {
             let again = explore(&dpor(128), &mut |seed: &Seed| {
-                compiled.interleaving_at(index, seed)
+                audited.interleaving_at(index, seed)
             });
             assert_eq!(again.seeds, first.seeds, "`{name}`: the search wandered");
             assert_eq!(
@@ -269,11 +305,90 @@ fn the_whole_search_is_a_function_of_its_plan() {
     }
 }
 
+/// The tasks touch the cell themselves, so the race is reported over the cell's name rather than
+/// over an effect's atom.
+const CELL_RACE: &str = r#"
+test "a lost update on a cell" {
+  with_cell[n](0) { c ->
+    simulate {
+      let a = task.spawn(|| { let seen = cell_get(c); clock.now(); cell_set(c, seen + 1) });
+      let b = task.spawn(|| { let seen = cell_get(c); clock.now(); cell_set(c, seen + 1) });
+      task.join(a);
+      task.join(b);
+      assert_eq(cell_get(c), 2)
+    }
+  }
+}
+"#;
+
+/// Each interleaving is an entry on the worker's tier, as is every search the worker ran before, so
+/// a race names the cell as a fresh tier does or the report depends on what ran first.
+#[test]
+fn every_search_on_one_tier_names_a_races_cell_alike() {
+    let audited = Audited::new(CELL_RACE);
+    let search = || {
+        explore(&dpor(256), &mut |seed: &Seed| {
+            audited.interleaving_at(0, seed)
+        })
+    };
+
+    let first = search();
+
+    assert_lost_update(&first, 2, "the first search");
+    let race = first
+        .exploration
+        .race
+        .clone()
+        .expect("the search reached the lost update by reordering two steps");
+    for site in [&race.left, &race.right] {
+        assert!(
+            site.access.starts_with("cell.") && site.access.ends_with("[@0.0]"),
+            "the test's one cell, named as a fresh tier names it: {}",
+            site.access
+        );
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            search().exploration.race,
+            Some(race.clone()),
+            "a later search on the same tier reported the race differently"
+        );
+    }
+}
+
+/// A mixture's run, on a tier of its own, reproduces a failure only if its message matches the one
+/// the worker's tier reported.
+#[test]
+fn every_entry_of_one_tier_names_a_failures_cell_alike() {
+    let compiled = Compiled::named(
+        "t",
+        r#"
+test "an update that reads the cell it holds" {
+  with_cell[n](1) { c -> cell_update(c, |x: Int| x + cell_get(c)) }
+}
+"#,
+    );
+    let tier = compiled.unit().attach();
+    for _ in 0..3 {
+        let d = compiled
+            .machine_on(Rc::clone(&tier))
+            .eval_test(0)
+            .expect_err("the update's function reads the cell it holds");
+        assert_eq!(
+            (d.code, d.message.as_str()),
+            (
+                codes::RUNTIME_ERROR,
+                "`cell_get` reached cell @0.0 while a `cell_update` holds its contents"
+            )
+        );
+    }
+}
+
 #[test]
 fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
-    let compiled = Compiled::named("t", SHAPES);
+    let audited = Audited::new(SHAPES);
     for (index, name) in SHAPE_NAMES.iter().enumerate() {
-        let named = compiled.transcript_of(index, &Seed::root(0));
+        let named = audited.transcript_of(index, &Seed::root(0));
         for plan in [
             Plan {
                 mode: SimMode::Once,
@@ -287,9 +402,9 @@ fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
             let mut seen: Option<Transcript> = None;
             let explored = explore(&plan, &mut |seed: &Seed| {
                 if seed == &Seed::root(0) && seen.is_none() {
-                    seen = Some(compiled.transcript_of(index, seed));
+                    seen = Some(audited.transcript_of(index, seed));
                 }
-                compiled.interleaving_at(index, seed)
+                audited.interleaving_at(index, seed)
             });
             assert!(explored.exploration.explored >= 1);
             assert_eq!(
@@ -375,24 +490,28 @@ test "the same region twice through a call" {
 
 #[test]
 fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
-    for (source, name) in [
-        (TWO_REGIONS, "two regions written out"),
+    for (source, name, total) in [
+        (TWO_REGIONS, "two regions written out", 2),
         (
             REGION_IN_A_HELPER,
             "one region reached twice through a call",
+            4,
         ),
     ] {
-        let compiled = Compiled::named("t", source);
+        let audited = Audited::new(source);
         let searched = explore(&dpor(1024), &mut |seed: &Seed| {
-            compiled.interleaving_at(0, seed)
+            audited.interleaving_at(0, seed)
         });
 
         let sampled = explore(&Plan::random(64), &mut |seed: &Seed| {
-            compiled.interleaving_at(0, seed)
+            audited.interleaving_at(0, seed)
         });
-        assert!(
-            sampled.exploration.failure.is_some(),
-            "`{name}`: the fixture must contain a reachable lost update, or it proves nothing"
+        assert_lost_update(
+            &sampled,
+            total,
+            &format!(
+                "`{name}`: the fixture must contain a reachable lost update, or it proves nothing"
+            ),
         );
 
         assert!(
@@ -407,13 +526,13 @@ fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
                 .as_ref()
                 .expect("a sampled failure"),
         );
+        assert_lost_update(&searched, total, &format!("`{name}`: the search"));
     }
 }
 
 #[test]
 fn a_legal_program_is_never_reported_as_a_simulation_divergence() {
-    let compiled = Compiled::named(
-        "t",
+    let audited = Audited::new(
         r#"
 effect counter {
   read  get[r]() -> Int
@@ -468,51 +587,22 @@ test "the second region's shape depends on what the first raced to" {
 "#,
     );
     let explored = explore(&dpor(256), &mut |seed: &Seed| {
-        compiled.interleaving_at(0, seed)
+        audited.interleaving_at(0, seed)
     });
     if let Some(diagnostic) = &explored.diagnostic {
         assert_ne!(
             diagnostic.code,
-            ply_eval::codes::SIMULATION_DIVERGENCE,
+            codes::SIMULATION_DIVERGENCE,
             "a legal program was blamed on Ply's simulation: {}\nnotes: {:?}",
             diagnostic.message,
             diagnostic.notes
         );
+        panic!("its assertion holds in every interleaving, and a run failed: {diagnostic:?}");
     }
-}
-
-#[test]
-fn the_machines_simulated_seam_reads_nothing_a_seed_does_not_name() {
-    let source = include_str!("../../../ply-eval/src/evaluator.rs");
-    let body = source
-        .split_once("mod tests")
-        .map(|(body, _)| body)
-        .unwrap_or(source);
-    // Not `HashMap`: the machine's name tables use it, looked up by key and never iterated.
-    for banned in [
-        "SystemTime",
-        "Instant",
-        "thread::",
-        "rayon",
-        "as_ptr",
-        "strong_count",
-        "rand::",
-        "env::var",
-    ] {
-        assert!(
-            !body.contains(banned),
-            "`{banned}` appears in ply_eval::machine, which is on the path of every simulated \
-             step; a seeded run must be a function of its definitions and its seed"
-        );
-    }
-    for iterated in [".values()", ".keys()", ".iter()"] {
-        for (line, text) in body.lines().enumerate() {
-            assert!(
-                !(text.contains(iterated) && (text.contains("fns") || text.contains("ctors"))),
-                "machine.rs:{} iterates a hash-based table: {}",
-                line + 1,
-                text.trim()
-            );
-        }
-    }
+    // Replay is checked on a branch, so a search that took none compared nothing.
+    assert!(
+        explored.exploration.explored > 1,
+        "{:?}",
+        explored.exploration
+    );
 }

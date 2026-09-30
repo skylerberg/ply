@@ -392,15 +392,15 @@ where
     selection.groups.retain(|g| !g.is_empty());
     let expected = selection.to_run.len();
     let outcome: Result<RunReport, _> = catch_unwind(AssertUnwindSafe(|| {
-        let executor = ply_test::InterpExecutor::new(&front)
+        let executor = ply_test::InterpExecutor::new(&front, provider)
             .with_search(ply_test::Search::of(&selection))
-            .with_hosts(hosting(hosts, runtime))
-            .with_backend(provider);
+            .with_hosts(hosting(hosts, runtime));
         ply_test::run_with(&selection, &front.check, &front.hashes, store, &executor)
     }));
     match outcome {
         Err(_) => Verdict::Unresolved("the run panicked"),
-        Ok(report) if report.failed > 0 => Verdict::Killed,
+        Ok(report) if report.failures.iter().any(|f| !f.defect) => Verdict::Killed,
+        Ok(report) if report.failed > 0 => Verdict::Unresolved("Ply failed running the tests"),
         Ok(report) if report.passed == expected => Verdict::Survived,
         Ok(_) => Verdict::Unresolved("not every test answered"),
     }

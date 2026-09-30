@@ -4,13 +4,10 @@ use ply_eval::{
     Access, DefHash, Diagnostic, Domain, Interleaving, Mode, Plan, Seed, SimId, SimMode,
     Simulation, Span, StepFootprint, Stream, Symbol, TaskId, codes, explore,
 };
-use ply_prove::concurrency::{
-    BodyRun, LawSearch, Searched, ValueDomain, audit_interleaving_proof, discharge, refutation,
-    replay_command,
-};
+use ply_prove::concurrency::{BodyRun, LawSearch, Searched, ValueDomain, discharge};
 use ply_prove::{
-    Binder, Binding, Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, Rule, Sort,
-    Tier, Vacuity, VacuityKind, interleaving_proves,
+    Binder, Binding, Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, Points,
+    Rule, Sort, Strategy, Tier, Vacuity, VacuityKind, interleaving_proves,
 };
 
 fn body_was_false(span: Span) -> Diagnostic {
@@ -27,7 +24,8 @@ struct Model {
     claims: fn(i64) -> bool,
     /// Points whose runs reach no `simulate` region.
     unobserved: bool,
-    raises: bool,
+    /// The code every run fails with before it reaches a region.
+    raises: Option<&'static str>,
     traces: Vec<Vec<u16>>,
 }
 
@@ -37,7 +35,7 @@ impl Model {
             tasks,
             claims,
             unobserved: false,
-            raises: false,
+            raises: None,
             traces: Vec::new(),
         }
     }
@@ -53,7 +51,7 @@ impl Model {
         loop {
             let enabled: Vec<TaskId> = (0..self.tasks)
                 .filter(|&t| pc[t] < 2)
-                .map(|t| TaskId(t as u32))
+                .map(|t| TaskId(t as u64))
                 .collect();
             if enabled.is_empty() {
                 break;
@@ -100,12 +98,9 @@ impl Model {
 
 impl LawSearch for Model {
     fn run(&mut self, _point: u64, seed: &Seed) -> BodyRun {
-        if self.raises {
+        if let Some(code) = self.raises {
             return BodyRun::model(
-                Interleaving::failed(
-                    Vec::new(),
-                    Diagnostic::error(codes::RUNTIME_ERROR, "divided by zero"),
-                ),
+                Interleaving::failed(Vec::new(), Diagnostic::error(code, "divided by zero")),
                 false,
                 true,
             );
@@ -133,12 +128,55 @@ fn law(binders: usize) -> Obligation {
         kind: ObligationKind::Law,
         span: Span::DUMMY,
         binders: (0..binders)
-            .map(|i| Binder::new(&format!("n{i}"), Sort::int()))
+            .map(|i| Binder {
+                name: Symbol::new(format!("n{i}")),
+                sort: Sort::int(),
+                text: "Int".to_string(),
+            })
             .collect(),
-        guarded: false,
-        host: false,
+        result: None,
+        variables: Vec::new(),
         footprint: Some("{sim.read}".to_string()),
+        strategy: Strategy::Interleave(Points::Drawn),
     }
+}
+
+/// A ground law's one point, as `proof.world` measures it.
+fn ground() -> ValueDomain {
+    ValueDomain::Enumerated {
+        domain: Symbol::new("unit"),
+        points: 1,
+        kept: 1,
+    }
+}
+
+fn tier(discharge: &Discharge) -> Option<Tier> {
+    match discharge {
+        Discharge::Held(evidence) => Some(evidence.tier()),
+        _ => None,
+    }
+}
+
+/// What makes an interleaving proof one: an admitted guard, a search that ran, every value domain
+/// covered as well, and a claim about one program rather than a polymorphic one.
+#[track_caller]
+fn audited(obligation: &Obligation, certificate: &Certificate) {
+    let interleavings = certificate.rules.iter().find_map(|rule| match rule {
+        Rule::ExhaustiveInterleaving { interleavings } => Some(*interleavings),
+        _ => None,
+    });
+    assert!(interleavings.is_some_and(|n| n > 0), "{certificate:?}");
+    assert!(certificate.guard_satisfiable);
+    assert!(certificate.sorts.is_empty());
+    assert_eq!(
+        certificate
+            .rules
+            .iter()
+            .any(|rule| matches!(rule, Rule::ExhaustiveEnumeration { .. })),
+        !obligation.binders.is_empty(),
+        "a law with binders names the enumeration of its values, and a ground one does not: \
+         {certificate:?}"
+    );
 }
 
 fn dpor(budget: u32) -> Plan {
@@ -159,9 +197,9 @@ fn certificate(searched: &Searched) -> &Certificate {
 fn a_law_that_holds_under_every_interleaving_is_proved() {
     let obligation = law(0);
     let mut model = Model::new(2, |counter| counter <= 2);
-    let searched = discharge(&obligation, &dpor(64), &ValueDomain::ground(), &mut model);
+    let searched = discharge(&obligation, &dpor(64), &ground(), &mut model);
 
-    assert_eq!(searched.discharge.tier(), Some(Tier::Proved));
+    assert_eq!(tier(&searched.discharge), Some(Tier::Proved));
     assert!(searched.exhaustive);
     assert!(!searched.exhausted);
     assert!(searched.observed);
@@ -175,9 +213,7 @@ fn a_law_that_holds_under_every_interleaving_is_proved() {
         }],
         "a ground law's certificate names the interleaving search and nothing else"
     );
-    assert!(certificate.guard_satisfiable);
-    assert!(certificate.sorts.is_empty());
-    assert_eq!(audit_interleaving_proof(&obligation, certificate), Ok(()));
+    audited(&obligation, certificate);
 }
 
 #[test]
@@ -185,12 +221,12 @@ fn a_law_that_holds_only_sometimes_is_refuted_with_a_seed() {
     let obligation = law(0);
     // Reaches 1 when both reads precede both writes.
     let mut model = Model::new(2, |counter| counter == 2);
-    let searched = discharge(&obligation, &dpor(64), &ValueDomain::ground(), &mut model);
+    let searched = discharge(&obligation, &dpor(64), &ground(), &mut model);
 
     let Discharge::Refuted(counterexample) = &searched.discharge else {
         panic!("expected a refutation, got {:?}", searched.discharge);
     };
-    assert_eq!(searched.discharge.tier(), None);
+    assert_eq!(tier(&searched.discharge), None);
     let seed = counterexample
         .sim_seed
         .as_ref()
@@ -213,9 +249,9 @@ fn a_law_that_holds_only_sometimes_is_refuted_with_a_seed() {
 fn a_search_that_spends_its_budget_is_property_and_says_how_many() {
     let obligation = law(0);
     let mut model = Model::new(3, |counter| counter <= 3);
-    let searched = discharge(&obligation, &dpor(30), &ValueDomain::ground(), &mut model);
+    let searched = discharge(&obligation, &dpor(30), &ground(), &mut model);
 
-    assert_eq!(searched.discharge.tier(), Some(Tier::Property));
+    assert_eq!(tier(&searched.discharge), Some(Tier::Property));
     assert!(searched.exhausted);
     assert!(!searched.exhaustive);
     let Discharge::Held(Evidence::Cases(report)) = &searched.discharge else {
@@ -223,14 +259,13 @@ fn a_search_that_spends_its_budget_is_property_and_says_how_many() {
     };
     assert_eq!(report.kept, 30, "the count is the interleavings it ran");
     assert_eq!(report.kept, searched.evaluations);
-    assert!(searched.line().unwrap().contains("budget spent"));
 }
 
 #[test]
 fn a_reported_failure_replays_exactly() {
     let obligation = law(0);
     let mut search = Model::new(2, |counter| counter == 2);
-    let found = discharge(&obligation, &dpor(64), &ValueDomain::ground(), &mut search);
+    let found = discharge(&obligation, &dpor(64), &ground(), &mut search);
     let Discharge::Refuted(counterexample) = &found.discharge else {
         panic!("expected a refutation");
     };
@@ -241,7 +276,7 @@ fn a_reported_failure_replays_exactly() {
     let again = discharge(
         &obligation,
         &Plan::once(seed.clone()),
-        &ValueDomain::ground(),
+        &ground(),
         &mut replay,
     );
     let Discharge::Refuted(replayed) = &again.discharge else {
@@ -258,7 +293,7 @@ fn a_reported_failure_replays_exactly() {
     );
     // `once` observes no flip, so it invents no race.
     assert!(replayed.race.is_none());
-    assert_eq!(again.discharge.tier(), None);
+    assert_eq!(tier(&again.discharge), None);
 }
 
 #[test]
@@ -278,7 +313,7 @@ fn an_exhaustive_search_over_sampled_values_is_never_proved() {
     );
     assert!(searched.exhaustive, "every point's frontier emptied");
     assert_eq!(
-        searched.discharge.tier(),
+        tier(&searched.discharge),
         Some(Tier::Property),
         "exhaustive over schedules says nothing about the values that were sampled"
     );
@@ -309,32 +344,8 @@ fn an_enumerated_value_domain_proves_and_names_its_enumeration() {
             .iter()
             .any(|r| matches!(r, Rule::ExhaustiveInterleaving { .. }))
     );
-    assert_eq!(audit_interleaving_proof(&obligation, certificate), Ok(()));
+    audited(&obligation, certificate);
     assert_eq!(searched.points, 2);
-}
-
-#[test]
-fn the_audit_rejects_an_interleaving_proof_that_covered_no_value_domain() {
-    let forged = Certificate {
-        rules: vec![Rule::ExhaustiveInterleaving { interleavings: 12 }],
-        steps: 12,
-        guard_satisfiable: true,
-        sorts: Vec::new(),
-    };
-    assert!(audit_interleaving_proof(&law(1), &forged).is_err());
-    assert_eq!(audit_interleaving_proof(&law(0), &forged), Ok(()));
-
-    let empty = Certificate {
-        rules: vec![Rule::ExhaustiveInterleaving { interleavings: 0 }],
-        ..forged.clone()
-    };
-    assert!(audit_interleaving_proof(&law(0), &empty).is_err());
-
-    let unguarded = Certificate {
-        guard_satisfiable: false,
-        ..forged
-    };
-    assert!(audit_interleaving_proof(&law(0), &unguarded).is_err());
 }
 
 #[test]
@@ -358,15 +369,14 @@ fn a_search_that_reached_no_region_is_exhaustive_over_nothing() {
     );
     assert!(interleaving_proves(&plan, &explored.exploration, true));
 
-    let searched = discharge(&law(0), &plan, &ValueDomain::ground(), &mut nothing);
+    let searched = discharge(&law(0), &plan, &ground(), &mut nothing);
     assert!(!searched.observed);
     assert_eq!(searched.interleavings, 0);
     assert_ne!(
-        searched.discharge.tier(),
+        tier(&searched.discharge),
         Some(Tier::Proved),
         "a search that scheduled nothing proves nothing"
     );
-    assert!(searched.line().unwrap().contains("no `simulate` region"));
 }
 
 #[test]
@@ -374,17 +384,17 @@ fn a_sampled_plan_never_proves() {
     for plan in [Plan::random(4), Plan::once(Seed::root(7))] {
         assert_ne!(plan.mode, SimMode::Dpor);
         let mut model = Model::new(2, |counter| counter <= 2);
-        let searched = discharge(&law(0), &plan, &ValueDomain::ground(), &mut model);
-        assert_ne!(searched.discharge.tier(), Some(Tier::Proved));
-        assert!(searched.discharge.holds());
+        let searched = discharge(&law(0), &plan, &ground(), &mut model);
+        assert_ne!(tier(&searched.discharge), Some(Tier::Proved));
+        assert!(matches!(searched.discharge, Discharge::Held(_)));
     }
 }
 
 #[test]
 fn a_body_that_raises_is_a_gap_and_not_a_refutation() {
     let mut model = Model::new(2, |_| true);
-    model.raises = true;
-    let searched = discharge(&law(1), &dpor(64), &ValueDomain::ground(), &mut model);
+    model.raises = Some(codes::RUNTIME_ERROR);
+    let searched = discharge(&law(1), &dpor(64), &ground(), &mut model);
     let Discharge::Unattempted(Gap::Raised {
         bindings,
         diagnostic,
@@ -395,6 +405,21 @@ fn a_body_that_raises_is_a_gap_and_not_a_refutation() {
     };
     assert_eq!(diagnostic.code, codes::RUNTIME_ERROR);
     assert_eq!(bindings.len(), 1);
+}
+
+/// A body the tier declined, or a schedule that diverged, is Ply's failure and not the program's gap.
+#[test]
+fn a_body_ply_failed_to_run_is_its_failure_and_not_a_gap() {
+    for code in [codes::INTERNAL_ERROR, codes::SIMULATION_DIVERGENCE] {
+        let mut model = Model::new(2, |_| true);
+        model.raises = Some(code);
+        let searched = discharge(&law(1), &dpor(64), &ground(), &mut model);
+        let Discharge::Faulted(fault) = &searched.discharge else {
+            panic!("{code} was reported as {:?}", searched.discharge);
+        };
+        assert_eq!(fault.diagnostic.code, code);
+        assert_eq!(fault.bindings.len(), 1, "the point Ply failed at");
+    }
 }
 
 #[test]
@@ -417,7 +442,7 @@ fn a_domain_the_guard_emptied_is_vacuous_and_not_proved() {
             ..
         })
     ));
-    assert_eq!(enumerated.discharge.tier(), None);
+    assert_eq!(tier(&enumerated.discharge), None);
 
     let sampled = discharge(
         &law(1),
@@ -476,14 +501,14 @@ fn one_unexhausted_point_costs_the_whole_law_its_proof() {
     );
     assert!(searched.exhausted);
     assert!(!searched.exhaustive);
-    assert_ne!(searched.discharge.tier(), Some(Tier::Proved));
+    assert_ne!(tier(&searched.discharge), Some(Tier::Proved));
 }
 
 #[test]
 fn two_runs_over_one_law_agree() {
     let run = || {
         let mut model = Model::new(3, |counter| counter == 3);
-        let searched = discharge(&law(0), &dpor(64), &ValueDomain::ground(), &mut model);
+        let searched = discharge(&law(0), &dpor(64), &ground(), &mut model);
         let seed = match &searched.discharge {
             Discharge::Refuted(c) => c.sim_seed.clone(),
             other => panic!("expected a refutation, got {other:?}"),
@@ -494,15 +519,7 @@ fn two_runs_over_one_law_agree() {
 }
 
 #[test]
-fn the_replay_command_is_the_command() {
-    assert_eq!(
-        replay_command(&Seed::at(0, vec![1, 0, 3]), "transfers conserve value"),
-        "ply prove --seed 0:1.0.3 --filter \"transfers conserve value\""
-    );
-}
-
-#[test]
-fn a_refutation_reports_the_seed_the_race_and_the_replay() {
+fn a_refutation_over_sampled_values_carries_its_seed_its_race_and_its_point() {
     let obligation = law(1);
     let mut model = Model::new(2, |counter| counter == 2);
     let searched = discharge(
@@ -519,24 +536,15 @@ fn a_refutation_reports_the_seed_the_race_and_the_replay() {
     let Discharge::Refuted(counterexample) = &searched.discharge else {
         panic!("expected a refutation");
     };
-    let rendered = refutation(
-        "transfers conserve value",
-        counterexample,
-        body_was_false(Span::DUMMY),
+    assert!(counterexample.sim_seed.is_some());
+    assert!(counterexample.race.is_some());
+    assert_eq!(counterexample.case, 0);
+    assert_eq!(
+        counterexample
+            .bindings
+            .iter()
+            .map(|b| (b.name.as_str(), b.rendered.as_str()))
+            .collect::<Vec<_>>(),
+        [("n", "0")]
     );
-    let notes = rendered.notes.join("\n");
-    assert!(notes.contains("seed: "));
-    assert!(notes.contains("race: "));
-    assert!(notes.contains("replay: ply prove --seed "));
-    assert!(notes.contains("n = 0"));
-}
-
-#[test]
-fn only_a_law_carrying_sim_read_is_routed_to_a_search() {
-    assert!(law(0).is_concurrency_law());
-    let pure = Obligation {
-        footprint: None,
-        ..law(0)
-    };
-    assert!(!pure.is_concurrency_law());
 }

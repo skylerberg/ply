@@ -217,6 +217,10 @@ fn a_failure_in_an_artifact_carries_no_line_number() {
         from_source["diagnostics"][0]["labels"][0]["start"]["line"],
         1
     );
+    assert_eq!(
+        from_source["diagnostics"][0]["message"], "division by zero",
+        "the program's own failure, not the seam's: {from_source}"
+    );
     let failed = json_of(
         &ply(dir.path())
             .args(["run", "m.plyx", "--json"])
@@ -925,6 +929,12 @@ fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
         codes::CONFIG_UNAVAILABLE,
         "{bare_run}"
     );
+    assert!(
+        bare_run["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("names no definition in this program")),
+        "the schema is absent from the artifact, rather than entered and declined: {bare_run}"
+    );
 
     // Named at build time, the schema ships, and the artifact refuses to start on the missing key as the source does.
     let build = String::from_utf8(
@@ -1123,4 +1133,47 @@ fn an_entered_program_starts_what_its_caller_bound_to_the_label() {
     let entered = artifact::enter(&artifact, &opened, Vec::new(), binds);
     let code = entered.expect("the program runs");
     assert_eq!(code, 7, "the child's own code is what came back");
+}
+
+/// Exits 7 when its caller bound a program to `cc` and 9 when it did not, and starts nothing.
+const ASKS_FOR_CC: &str = r#"
+import std.process (process)
+
+fn main() -> Unit / {process.bound[cc], process.exit[proc]} =
+  process.exit[proc](if process.bound[cc]() { 7 } else { 9 })
+"#;
+
+#[test]
+fn an_artifact_asks_whether_its_caller_bound_the_label_it_would_start() {
+    let dir = project(ASKS_FOR_CC);
+    let artifact = artifact_of(dir.path());
+    let opened = artifact::open(&artifact, Path::new("asks.plyx")).expect("it opens");
+    let unbound = artifact::enter(&artifact, &opened, Vec::new(), Binds::default());
+    assert_eq!(unbound.expect("the program runs"), 9);
+    let mut executables = Executables::new();
+    executables
+        .bind("cc", Path::new("/bin/sh"), Span::DUMMY)
+        .expect("a shell is a program");
+    let binds = Binds {
+        executables,
+        ..Binds::default()
+    };
+    let bound = artifact::enter(&artifact, &opened, Vec::new(), binds);
+    assert_eq!(bound.expect("the program runs"), 7);
+
+    // `ply run` over the same artifact answers from its own `--exec`.
+    write_artifact(&dir.path().join("m.plyx"), &artifact);
+    for (exec, code) in [(&["--exec", "cc=/bin/sh"][..], 7), (&[][..], 9)] {
+        let out = ply(dir.path())
+            .args(["run", "m.plyx", "--host"])
+            .args(exec)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "run with {exec:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

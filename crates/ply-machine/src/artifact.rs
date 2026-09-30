@@ -1268,8 +1268,7 @@ fn evaluate(
     declared: Option<&ply_eval::Footprint>,
     tier: &'static dyn ply_eval::Provider,
 ) -> Result<ply_eval::Value, Diagnostic> {
-    let mut machine = ply_eval::Machine::new(&opened.front);
-    machine.set_compiled(tier.attach());
+    let mut machine = ply_eval::Machine::new(&opened.front, tier.attach())?;
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);

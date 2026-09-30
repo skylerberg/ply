@@ -1,6 +1,10 @@
+use ply_eval::Value;
 use ply_eval::arena::*;
-use ply_eval::{Span, Value};
 use std::sync::Arc;
+
+/// Two control stacks.
+const A: Owner = Owner(0);
+const B: Owner = Owner(1);
 
 /// Behind an `Arc`, so `strong_count` shows whether the arena freed it.
 fn payload(n: i64) -> (Arc<Vec<Value>>, Value) {
@@ -24,9 +28,9 @@ fn int_of(arena: &Arena, slot: Slot) -> i64 {
 #[test]
 fn allocation_is_a_bump_and_close_gives_the_slots_back() {
     let mut arena: Arena = Arena::new();
-    let r = arena.open(RegionKind::Unique, Span::DUMMY);
+    let r = arena.open(A, RegionKind::Unique);
     for i in 0..64 {
-        arena.alloc(Value::Int(i));
+        arena.alloc(A, Value::Int(i));
     }
     assert_eq!(arena.live(), 64);
     assert_eq!(arena.extent(r), Some(64));
@@ -34,7 +38,7 @@ fn allocation_is_a_bump_and_close_gives_the_slots_back() {
     arena.close(r);
 
     assert_eq!(arena.live(), 0);
-    assert_eq!(arena.depth(), 0);
+    assert_eq!(arena.depth(A), 0);
     assert_eq!(arena.extent(r), None);
 }
 
@@ -42,8 +46,8 @@ fn allocation_is_a_bump_and_close_gives_the_slots_back() {
 fn closing_a_region_drops_the_values_it_held() {
     let mut arena: Arena = Arena::new();
     let (arc, value) = payload(1);
-    let r = arena.open(RegionKind::Unique, Span::DUMMY);
-    arena.alloc(value);
+    let r = arena.open(A, RegionKind::Unique);
+    arena.alloc(A, value);
     assert_eq!(
         Arc::strong_count(&arc),
         2,
@@ -59,18 +63,18 @@ fn closing_a_region_drops_the_values_it_held() {
 fn a_second_region_of_the_same_size_allocates_nothing() {
     let mut arena: Arena = Arena::new();
     for _ in 0..4 {
-        let r = arena.open(RegionKind::Unique, Span::DUMMY);
+        let r = arena.open(A, RegionKind::Unique);
         for i in 0..1_000 {
-            arena.alloc(Value::Int(i));
+            arena.alloc(A, Value::Int(i));
         }
         arena.close(r);
     }
     let after_warm = arena.stats().chunks_allocated;
 
     for _ in 0..1_000 {
-        let r = arena.open(RegionKind::Unique, Span::DUMMY);
+        let r = arena.open(A, RegionKind::Unique);
         for i in 0..1_000 {
-            arena.alloc(Value::Int(i));
+            arena.alloc(A, Value::Int(i));
         }
         arena.close(r);
     }
@@ -86,12 +90,12 @@ fn a_second_region_of_the_same_size_allocates_nothing() {
 #[test]
 fn a_slot_from_a_closed_region_reads_nothing_rather_than_the_value_after_it() {
     let mut arena: Arena = Arena::new();
-    let first = arena.open(RegionKind::Unique, Span::DUMMY);
-    let stale = arena.alloc(Value::Int(1)).expect("inside a region");
+    let first = arena.open(A, RegionKind::Unique);
+    let stale = arena.alloc(A, Value::Int(1)).expect("inside a region");
     arena.close(first);
 
-    let second = arena.open(RegionKind::Unique, Span::DUMMY);
-    let fresh = arena.alloc(Value::Int(2)).expect("inside a region");
+    let second = arena.open(A, RegionKind::Unique);
+    let fresh = arena.alloc(A, Value::Int(2)).expect("inside a region");
 
     assert_eq!(
         stale.index(),
@@ -107,18 +111,18 @@ fn a_slot_from_a_closed_region_reads_nothing_rather_than_the_value_after_it() {
 #[test]
 fn allocating_outside_every_region_is_refused() {
     let mut arena: Arena = Arena::new();
-    assert!(arena.alloc(Value::Int(1)).is_none());
+    assert!(arena.alloc(A, Value::Int(1)).is_none());
     assert_eq!(arena.stats().allocations, 0);
 }
 
 #[test]
 fn an_inner_region_reads_and_writes_an_outer_regions_values() {
     let mut arena: Arena = Arena::new();
-    let outer = arena.open(RegionKind::Unique, Span::DUMMY);
-    let a = arena.alloc(Value::Int(1)).expect("inside a region");
+    let outer = arena.open(A, RegionKind::Unique);
+    let a = arena.alloc(A, Value::Int(1)).expect("inside a region");
 
-    let inner = arena.open(RegionKind::Unique, Span::DUMMY);
-    let b = arena.alloc(Value::Int(2)).expect("inside a region");
+    let inner = arena.open(A, RegionKind::Unique);
+    let b = arena.alloc(A, Value::Int(2)).expect("inside a region");
     assert_eq!(int_of(&arena, a), 1);
     assert!(arena.set(a, Value::Int(10)));
 
@@ -133,16 +137,16 @@ fn an_inner_region_reads_and_writes_an_outer_regions_values() {
 #[test]
 fn closing_an_outer_region_closes_the_inner_regions_still_open_inside_it() {
     let mut arena: Arena = Arena::new();
-    let outer = arena.open(RegionKind::Unique, Span::DUMMY);
-    arena.alloc(Value::Int(1));
-    let mid = arena.open(RegionKind::Shared, Span::DUMMY);
-    arena.alloc(Value::Int(2));
-    let inner = arena.open(RegionKind::Unique, Span::DUMMY);
-    let deep = arena.alloc(Value::Int(3)).expect("inside a region");
+    let outer = arena.open(A, RegionKind::Unique);
+    arena.alloc(A, Value::Int(1));
+    let mid = arena.open(A, RegionKind::Shared);
+    arena.alloc(A, Value::Int(2));
+    let inner = arena.open(A, RegionKind::Unique);
+    let deep = arena.alloc(A, Value::Int(3)).expect("inside a region");
 
     arena.close(outer);
 
-    assert_eq!(arena.depth(), 0);
+    assert_eq!(arena.depth(A), 0);
     assert_eq!(arena.live(), 0);
     assert!(arena.get(deep).is_none());
     assert_eq!(arena.kind(mid), None);
@@ -152,16 +156,16 @@ fn closing_an_outer_region_closes_the_inner_regions_still_open_inside_it() {
 #[test]
 fn closing_a_region_twice_is_not_a_second_free() {
     let mut arena: Arena = Arena::new();
-    let outer = arena.open(RegionKind::Unique, Span::DUMMY);
-    let kept = arena.alloc(Value::Int(7)).expect("inside a region");
-    let inner = arena.open(RegionKind::Unique, Span::DUMMY);
-    arena.alloc(Value::Int(8));
+    let outer = arena.open(A, RegionKind::Unique);
+    let kept = arena.alloc(A, Value::Int(7)).expect("inside a region");
+    let inner = arena.open(A, RegionKind::Unique);
+    arena.alloc(A, Value::Int(8));
 
     arena.close(inner);
     arena.close(inner);
 
     assert_eq!(int_of(&arena, kept), 7);
-    assert_eq!(arena.depth(), 1);
+    assert_eq!(arena.depth(A), 1);
     arena.close(outer);
 }
 
@@ -171,11 +175,11 @@ fn nesting_deeper_than_one_chunk_keeps_every_level_addressable() {
     let mut regions = Vec::new();
     let mut slots = Vec::new();
     for level in 0..32 {
-        regions.push(arena.open(RegionKind::Unique, Span::DUMMY));
+        regions.push(arena.open(A, RegionKind::Unique));
         for i in 0..40 {
             slots.push((
                 arena
-                    .alloc(Value::Int(level * 100 + i))
+                    .alloc(A, Value::Int(level * 100 + i))
                     .expect("inside a region"),
                 level * 100 + i,
             ));
@@ -199,10 +203,10 @@ fn a_slots_generation_counts_frees_and_is_a_wrapping_u32() {
     let mut arena: Arena = Arena::new();
     let mut seen = Vec::new();
     for _ in 0..8 {
-        let r = arena.open(RegionKind::Unique, Span::DUMMY);
+        let r = arena.open(A, RegionKind::Unique);
         seen.push(
             arena
-                .alloc(Value::Int(0))
+                .alloc(A, Value::Int(0))
                 .expect("inside a region")
                 .generation(),
         );
@@ -219,9 +223,9 @@ fn a_slots_generation_counts_frees_and_is_a_wrapping_u32() {
 #[test]
 fn slots_iterate_in_ascending_index_order() {
     let mut arena: Arena = Arena::new();
-    let r = arena.open(RegionKind::Unique, Span::DUMMY);
+    let r = arena.open(A, RegionKind::Unique);
     for i in 0..600 {
-        arena.alloc(Value::Int(i));
+        arena.alloc(A, Value::Int(i));
     }
     let seen: Vec<u32> = arena.slots().map(|(slot, _)| slot.index()).collect();
     assert_eq!(seen, (0..600).collect::<Vec<u32>>());
@@ -234,4 +238,488 @@ fn the_default_kind_is_shared() {
     assert_eq!(RegionKind::parse("unique"), Some(RegionKind::Unique));
     assert_eq!(RegionKind::parse("shared"), Some(RegionKind::Shared));
     assert_eq!(RegionKind::parse("Unique"), None);
+}
+
+#[test]
+fn closing_the_older_of_two_stacks_regions_leaves_the_other_stacks_cells() {
+    let mut arena: Arena = Arena::new();
+    let older = arena.open(A, RegionKind::Shared);
+    let a = arena.alloc(A, Value::Int(1)).expect("inside a region");
+    let younger = arena.open(B, RegionKind::Shared);
+    let b = arena.alloc(B, Value::Int(2)).expect("inside a region");
+    let a_again = arena.alloc(A, Value::Int(3)).expect("inside a region");
+
+    assert_eq!(arena.close(older), Reclaim::Freed(2));
+
+    assert_eq!(int_of(&arena, b), 2, "the other stack's cell survives");
+    assert!(arena.get(a).is_none() && arena.get(a_again).is_none());
+    assert!(!arena.set(a, Value::Int(9)));
+    assert_eq!(arena.kind(younger), Some(RegionKind::Shared));
+    assert_eq!((arena.depth(A), arena.depth(B)), (0, 1));
+    assert_eq!((arena.total_depth(), arena.live()), (1, 1));
+    let live: Vec<Slot> = arena.slots().map(|(slot, _)| slot).collect();
+    assert_eq!(live, vec![b]);
+
+    // The positions go back lowest first, at a generation no stale slot carries.
+    let reopened = arena.open(A, RegionKind::Shared);
+    let first = arena.alloc(A, Value::Int(4)).expect("inside a region");
+    let second = arena.alloc(A, Value::Int(5)).expect("inside a region");
+    assert_eq!((first.index(), first.generation()), (0, 1));
+    assert_eq!((second.index(), second.generation()), (2, 1));
+    assert!(arena.get(a).is_none() && arena.get(a_again).is_none());
+    assert_eq!(arena.close(younger), Reclaim::Freed(1));
+    assert_eq!(arena.close(reopened), Reclaim::Freed(2));
+    assert_eq!((arena.total_depth(), arena.live()), (0, 0));
+}
+
+#[test]
+fn a_nested_close_stays_within_its_owner() {
+    let mut arena: Arena = Arena::new();
+    let a_outer = arena.open(A, RegionKind::Unique);
+    arena.alloc(A, Value::Int(1));
+    let b_outer = arena.open(B, RegionKind::Unique);
+    let kept = arena.alloc(B, Value::Int(2)).expect("inside a region");
+    let a_inner = arena.open(A, RegionKind::Unique);
+    arena.alloc(A, Value::Int(3));
+    let b_inner = arena.open(B, RegionKind::Shared);
+    let also_kept = arena.alloc(B, Value::Int(4)).expect("inside a region");
+    assert_eq!(arena.extent(a_outer), Some(2));
+
+    assert_eq!(arena.close(a_outer), Reclaim::Freed(2));
+
+    assert_eq!(
+        arena.kind(a_inner),
+        None,
+        "the inner region of the same stack closed"
+    );
+    assert_eq!(arena.kind(b_outer), Some(RegionKind::Unique));
+    assert_eq!(arena.kind(b_inner), Some(RegionKind::Shared));
+    assert_eq!(arena.extent(b_outer), Some(2));
+    assert_eq!(int_of(&arena, kept), 2);
+    assert_eq!(int_of(&arena, also_kept), 4);
+    assert_eq!(arena.close(a_outer), Reclaim::NotOpen);
+
+    // The other stack's new cell goes into its own innermost region.
+    let late = arena.alloc(B, Value::Int(5)).expect("inside a region");
+    assert_eq!(arena.close(b_inner), Reclaim::Freed(2));
+    assert!(arena.get(late).is_none());
+    assert_eq!(int_of(&arena, kept), 2);
+    assert!(
+        arena.alloc(A, Value::Int(6)).is_none(),
+        "the first stack holds no region"
+    );
+    assert_eq!(arena.close(b_outer), Reclaim::Freed(1));
+    assert_eq!(arena.live(), 0);
+}
+
+#[test]
+fn closing_above_a_depth_closes_one_owners_regions() {
+    let mut arena: Arena = Arena::new();
+    arena.open(A, RegionKind::Shared);
+    let base = arena.alloc(A, Value::Int(1)).expect("inside a region");
+    arena.open(B, RegionKind::Shared);
+    let theirs = arena.alloc(B, Value::Int(2)).expect("inside a region");
+    arena.open(A, RegionKind::Unique);
+    let mid = arena.alloc(A, Value::Int(3)).expect("inside a region");
+    arena.open(B, RegionKind::Unique);
+    let deeper = arena.alloc(B, Value::Int(4)).expect("inside a region");
+    arena.open(A, RegionKind::Unique);
+    let top = arena.alloc(A, Value::Int(5)).expect("inside a region");
+
+    arena.close_above(A, 1);
+
+    assert_eq!(
+        (arena.depth(A), arena.depth(B), arena.total_depth()),
+        (1, 2, 3)
+    );
+    assert_eq!(int_of(&arena, base), 1);
+    assert!(arena.get(mid).is_none() && arena.get(top).is_none());
+    assert_eq!(int_of(&arena, theirs), 2);
+    assert_eq!(int_of(&arena, deeper), 4);
+
+    arena.close_above(B, 0);
+
+    assert_eq!((arena.depth(A), arena.depth(B)), (1, 0));
+    assert_eq!(int_of(&arena, base), 1);
+    assert_eq!(arena.live(), 1);
+
+    arena.close_all_but(A, 0);
+    assert_eq!((arena.total_depth(), arena.live()), (0, 0));
+}
+
+/// One stack's nested opens and closes hand out the positions and generations a bump pointer
+/// would, so the slots tests and diagnostics name do not depend on how the store frees.
+#[test]
+fn one_stack_gets_the_indices_and_generations_a_bump_pointer_gives() {
+    let mut arena: Arena = Arena::new();
+    let mut seen = Vec::new();
+    let mut take = |arena: &mut Arena, n: usize| {
+        for _ in 0..n {
+            let slot = arena.alloc(A, Value::Unit).expect("inside a region");
+            seen.push((slot.index(), slot.generation()));
+        }
+    };
+    let outer = arena.open(A, RegionKind::Shared);
+    take(&mut arena, 2);
+    let inner = arena.open(A, RegionKind::Unique);
+    take(&mut arena, 2);
+    arena.close(inner);
+    take(&mut arena, 1);
+    arena.open(A, RegionKind::Unique);
+    take(&mut arena, 2);
+    arena.close(outer);
+    let last = arena.open(A, RegionKind::Shared);
+    take(&mut arena, 6);
+    arena.close(last);
+
+    assert_eq!(
+        seen,
+        vec![
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (2, 1),
+            (3, 1),
+            (4, 0),
+            (0, 1),
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 1),
+            (5, 0),
+        ]
+    );
+    assert_eq!(arena.live(), 0);
+}
+
+#[test]
+fn a_pinned_regions_close_keeps_its_slots_and_leaves_the_nesting() {
+    let mut arena: Arena = Arena::new();
+    let outer = arena.open(A, RegionKind::Shared);
+    let kept = arena.open(A, RegionKind::Shared);
+    let cell = arena.alloc(A, Value::Int(5)).expect("inside a region");
+    let pin = arena.pin(kept).expect("an open region takes a pin");
+
+    assert_eq!(arena.close(kept), Reclaim::Freed(0));
+
+    assert_eq!(int_of(&arena, cell), 5, "the close kept the pinned cell");
+    assert!(arena.set(cell, Value::Int(6)));
+    assert_eq!(
+        (arena.depth(A), arena.total_depth(), arena.live()),
+        (1, 1, 1)
+    );
+    assert_eq!(arena.nesting(A).collect::<Vec<_>>(), vec![outer]);
+    assert_eq!(
+        arena.kind(kept),
+        Some(RegionKind::Shared),
+        "the id still names it"
+    );
+    assert_eq!(arena.extent(kept), None, "no stack holds it open");
+    assert_eq!(arena.close(kept), Reclaim::NotOpen);
+    assert!(
+        arena.pin(kept).is_none(),
+        "a closed region takes no new pin"
+    );
+    let next = arena.alloc(A, Value::Int(7)).expect("inside a region");
+    assert_eq!(
+        arena.extent(outer),
+        Some(1),
+        "the next cell went to the region below"
+    );
+
+    assert_eq!(arena.close(outer), Reclaim::Freed(1));
+    assert!(arena.get(next).is_none());
+    assert_eq!(int_of(&arena, cell), 6);
+    assert_eq!(arena.unpin(pin), 1);
+    assert_eq!((arena.total_depth(), arena.live()), (0, 0));
+}
+
+#[test]
+fn reopening_a_parked_region_restores_its_nesting_and_its_depth() {
+    let mut arena: Arena = Arena::new();
+    let outer = arena.open(A, RegionKind::Shared);
+    let kept = arena.open(A, RegionKind::Shared);
+    let cell = arena.alloc(A, Value::Int(5)).expect("inside a region");
+    let pin = arena.pin(kept).expect("an open region takes a pin");
+    arena.close(kept);
+
+    assert!(arena.reopen(&pin, A));
+
+    assert_eq!((arena.depth(A), arena.total_depth()), (2, 2));
+    assert_eq!(arena.nesting(A).collect::<Vec<_>>(), vec![kept, outer]);
+    assert_eq!(arena.extent(kept), Some(1));
+    assert_eq!(int_of(&arena, cell), 5);
+    assert!(!arena.reopen(&pin, A), "an open region is not reopened");
+    arena.alloc(A, Value::Int(6)).expect("inside a region");
+    assert_eq!(
+        arena.extent(kept),
+        Some(2),
+        "the next cell went to the reopened region"
+    );
+
+    assert_eq!(
+        arena.close(outer),
+        Reclaim::Freed(0),
+        "the close below reached the reopened region, which the pin parks again"
+    );
+    assert_eq!((arena.total_depth(), arena.live()), (0, 2));
+    assert_eq!(arena.unpin(pin), 2);
+    assert_eq!(arena.live(), 0);
+}
+
+#[test]
+fn the_last_unpin_frees_a_parked_regions_slots() {
+    let mut arena: Arena = Arena::new();
+    let (arc, value) = payload(1);
+    let r = arena.open(A, RegionKind::Shared);
+    let cell = arena.alloc(A, value).expect("inside a region");
+    let pin = arena.pin(r).expect("an open region takes a pin");
+    arena.close(r);
+    assert_eq!(Arc::strong_count(&arc), 2, "the parked region holds it");
+
+    assert_eq!(arena.unpin(pin), 1);
+
+    assert_eq!(Arc::strong_count(&arc), 1, "the last unpin dropped it");
+    assert!(arena.get(cell).is_none());
+    assert_eq!(arena.kind(r), None);
+    assert_eq!(arena.live(), 0);
+}
+
+#[test]
+fn a_stale_id_of_a_region_freed_after_its_unpin_never_matches() {
+    let mut arena: Arena = Arena::new();
+    let stale = arena.open(A, RegionKind::Shared);
+    let old = arena.alloc(A, Value::Int(1)).expect("inside a region");
+    let pin = arena.pin(stale).expect("an open region takes a pin");
+    arena.close(stale);
+    arena.unpin(pin);
+
+    let fresh = arena.open(A, RegionKind::Shared);
+    let new = arena.alloc(A, Value::Int(2)).expect("inside a region");
+
+    assert_eq!(
+        (fresh.to_bits() as u32, new.index()),
+        (stale.to_bits() as u32, old.index()),
+        "the scope and the slot were reused, which is why the generations matter"
+    );
+    assert_ne!(fresh, stale);
+    assert_eq!(arena.kind(stale), None);
+    assert!(arena.pin(stale).is_none());
+    assert_eq!(arena.close(stale), Reclaim::NotOpen);
+    assert!(arena.get(old).is_none());
+    assert_eq!(int_of(&arena, new), 2);
+    assert_eq!(arena.close(fresh), Reclaim::Freed(1));
+}
+
+#[test]
+fn a_region_pinned_twice_survives_the_first_unpin() {
+    let mut arena: Arena = Arena::new();
+    let r = arena.open(A, RegionKind::Shared);
+    let cell = arena.alloc(A, Value::Int(3)).expect("inside a region");
+    let first = arena.pin(r).expect("an open region takes a pin");
+    let second = arena.pin(r).expect("and another");
+    arena.close(r);
+
+    assert_eq!(arena.unpin(first), 0);
+
+    assert_eq!(int_of(&arena, cell), 3, "the second pin still holds it");
+    assert_eq!(arena.live(), 1);
+    assert!(arena.reopen(&second, A));
+    assert_eq!(arena.close(r), Reclaim::Freed(0));
+    assert_eq!(arena.unpin(second), 1);
+    assert_eq!(arena.live(), 0);
+}
+
+#[test]
+fn a_region_unpinned_while_open_is_freed_by_its_own_close() {
+    let mut arena: Arena = Arena::new();
+    let r = arena.open(A, RegionKind::Shared);
+    let cell = arena.alloc(A, Value::Int(1)).expect("inside a region");
+    let pin = arena.pin(r).expect("an open region takes a pin");
+
+    assert_eq!(arena.unpin(pin), 0, "its cells wait for its close");
+    assert_eq!(int_of(&arena, cell), 1);
+    assert_eq!(arena.close(r), Reclaim::Freed(1));
+    assert_eq!(arena.live(), 0);
+}
+
+/// Only what a pin holds outlives a close: the regions its owner opened after the pinned one go
+/// back as a close reaches them.
+#[test]
+fn a_close_parks_the_pinned_region_and_frees_the_ones_opened_after_it() {
+    let mut arena: Arena = Arena::new();
+    let kept = arena.open(A, RegionKind::Shared);
+    let held = arena.alloc(A, Value::Int(1)).expect("inside a region");
+    let pin = arena.pin(kept).expect("an open region takes a pin");
+    let later = arena.open(A, RegionKind::Shared);
+    let gone = arena.alloc(A, Value::Int(2)).expect("inside a region");
+
+    assert_eq!(arena.close(kept), Reclaim::Freed(1));
+
+    assert!(arena.get(gone).is_none());
+    assert_eq!(arena.kind(later), None);
+    assert_eq!(int_of(&arena, held), 1);
+    assert_eq!((arena.depth(A), arena.live()), (0, 1));
+    assert_eq!(arena.unpin(pin), 1);
+    assert_eq!(arena.live(), 0);
+}
+
+/// The regions the entry's own stack keeps between entries: the fixture's and the entry's.
+const FLOOR: usize = 2;
+
+fn floored() -> Arena {
+    let mut arena: Arena = Arena::new();
+    for _ in 0..FLOOR {
+        arena.open(A, RegionKind::Shared);
+    }
+    arena
+}
+
+/// Two stacks' regions, the older closed first so the store frees out of order and reuses an
+/// index within the entry; answers the slots handed out, in order.
+fn an_entry(arena: &mut Arena) -> Vec<Slot> {
+    let mut slots = Vec::new();
+    let older = arena.open(A, RegionKind::Unique);
+    let younger = arena.open(B, RegionKind::Shared);
+    for i in 0..3 {
+        slots.extend(arena.alloc(A, Value::Int(i)));
+        slots.extend(arena.alloc(B, Value::Int(i)));
+    }
+    arena.close(older);
+    slots.extend(arena.alloc(B, Value::Int(9)));
+    arena.close(younger);
+    slots
+}
+
+#[test]
+fn a_renewed_store_hands_out_the_slots_a_new_one_does() {
+    let fresh = an_entry(&mut floored());
+    assert_eq!(fresh.first(), Some(&Slot::new(0, 0)));
+
+    let mut arena = floored();
+    for _ in 0..3 {
+        an_entry(&mut arena);
+    }
+    assert_ne!(
+        an_entry(&mut arena),
+        fresh,
+        "without a renewal an entry's slots count the lives earlier entries gave their indices"
+    );
+
+    for _ in 0..3 {
+        assert!(arena.renew(A, FLOOR));
+        assert_eq!(an_entry(&mut arena), fresh);
+    }
+}
+
+/// A renewal walks only the indices used since the last one, so those a wide entry used are
+/// renewed by the renewal after it and stay so through narrower entries.
+#[test]
+fn a_wide_entrys_indices_stay_renewed_through_narrower_entries() {
+    let entry = |arena: &mut Arena, cells: usize| -> Vec<Slot> {
+        let r = arena.open(A, RegionKind::Unique);
+        let slots: Vec<Slot> = (0..cells)
+            .map(|i| {
+                arena
+                    .alloc(A, Value::Int(i as i64))
+                    .expect("inside a region")
+            })
+            .collect();
+        arena.close(r);
+        assert!(arena.renew(A, FLOOR));
+        slots
+    };
+    let wide = CHUNK * 2 + 1;
+    let mut arena = floored();
+    entry(&mut arena, wide);
+    for _ in 0..4 {
+        entry(&mut arena, 3);
+    }
+
+    let slots = entry(&mut arena, wide);
+
+    let named: Vec<(u32, u32)> = slots.iter().map(|s| (s.index(), s.generation())).collect();
+    assert_eq!(named, (0..wide as u32).map(|i| (i, 0)).collect::<Vec<_>>());
+}
+
+/// Whatever is open above the floor or pinned may still hold a slot from before, which a renewed
+/// store would resolve again.
+#[test]
+fn a_renewal_is_refused_while_a_region_above_the_floor_is_open_or_pinned() {
+    let mut arena = floored();
+    let floor: Vec<RegionId> = arena.nesting(A).collect();
+    an_entry(&mut arena);
+
+    let above = arena.open(A, RegionKind::Unique);
+    assert!(!arena.renew(A, FLOOR), "a region open above the floor");
+    let unrenewed = arena.alloc(A, Value::Unit).expect("inside a region");
+    assert_eq!(unrenewed.index(), 0);
+    assert_ne!(unrenewed.generation(), 0, "the refusal changed nothing");
+    arena.close(above);
+
+    let other = arena.open(B, RegionKind::Shared);
+    assert!(!arena.renew(A, FLOOR), "a region open on another stack");
+    arena.close(other);
+
+    let pin = arena.pin(floor[1]).expect("the floor is open");
+    assert!(!arena.renew(A, FLOOR), "a pin on the floor");
+    arena.unpin(pin);
+
+    let parked = arena.open(B, RegionKind::Shared);
+    let pin = arena.pin(parked).expect("an open region takes a pin");
+    arena.close(parked);
+    assert_eq!((arena.total_depth(), arena.live()), (FLOOR, 0));
+    assert!(
+        !arena.renew(A, FLOOR),
+        "a region its pin parked, though it holds no cell"
+    );
+    arena.unpin(pin);
+
+    assert!(arena.renew(A, FLOOR));
+    let kept = arena.alloc(A, Value::Int(7)).expect("the floor is open");
+    assert_eq!(kept, Slot::new(0, 0));
+    assert!(!arena.renew(A, FLOOR), "a cell live in the floor");
+    assert_eq!(int_of(&arena, kept), 7);
+}
+
+/// A `cell_update` whose function never returned leaves its slot taken; the renewed store hands
+/// that name to a new cell, which nothing is updating.
+#[test]
+fn a_renewal_forgets_an_update_its_entry_never_finished() {
+    let mut arena = floored();
+    let r = arena.open(A, RegionKind::Unique);
+    let held = arena.alloc(A, Value::Int(1)).expect("inside a region");
+    arena.take(held).expect("the cell is live");
+    arena.close(r);
+
+    assert!(arena.renew(A, FLOOR));
+
+    arena.open(A, RegionKind::Unique);
+    let fresh = arena.alloc(A, Value::Int(2)).expect("inside a region");
+    assert_eq!(fresh, held);
+    assert!(!arena.is_taken(fresh));
+    assert_eq!(int_of(&arena, fresh), 2);
+}
+
+/// A held pin reaches a parked region, which a fresh one cannot name: the holds taken through it
+/// add to the region's count, and the region goes only with the last of them.
+#[test]
+fn a_parked_region_pinned_twice_more_goes_with_the_last_of_its_pins() {
+    let mut arena: Arena = Arena::new();
+    let r = arena.open(A, RegionKind::Shared);
+    let cell = arena.alloc(A, Value::Int(4)).expect("inside a region");
+    let first = arena.pin(r).expect("an open region takes a pin");
+    arena.close(r);
+
+    let second = arena.repin(&first);
+    let third = arena.repin(&first);
+
+    assert_eq!(arena.unpin(first), 0, "two holds taken while parked remain");
+    assert_eq!(arena.unpin(second), 0);
+    assert_eq!(int_of(&arena, cell), 4);
+    assert_eq!(arena.kind(r), Some(RegionKind::Shared));
+    assert_eq!(arena.unpin(third), 1, "the last hold freed it");
+    assert!(arena.get(cell).is_none());
+    assert_eq!(arena.live(), 0);
 }

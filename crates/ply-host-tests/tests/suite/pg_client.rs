@@ -3,7 +3,7 @@
 //! `SimNet` hands the client the bytes a server would have sent and records what it sent back,
 //! so the framing, the handshake and both query cycles are decided without a socket.
 
-use ply_eval::{Machine, Span, Value};
+use ply_eval::{Machine, Span, Symbol, Value};
 use ply_host::tcp::{Net, SimNet};
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use std::sync::Arc;
 const CLIENT: &str = r#"
 import std.net (net)
 import std.pg (connect, simple_query, extended_query, finish, default_client, Answer, ClientError, client_error_text, server_text, Rejected)
-import std.db (db, serve, server_of, stmt, Rows, Count, Failed)
+import std.db (db, serve, server_of, stmt, transaction, is_retryable, Rows, Count, Failed, Serializable, ReadWrite)
 
 // The driver over the same script: what a connection string asks of every connection it opens.
 pub fn told(url: String) -> Result<String, String>
@@ -50,6 +50,25 @@ pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String
         finish[link](reply.session, default_client());
         Ok(first_text(reply.answer))
       },
+    },
+  }
+
+// A transaction the server refuses to commit, run again while the refusal says to.
+pub fn retried(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match server_of(url) {
+    Err(why) -> Err(why),
+    Ok(cfg) -> Ok(serve(cfg, 1, "test-nonce", || attempts(3, ""))),
+  }
+
+fn attempts(left: Int, seen: String) -> String =
+  match transaction(Serializable, ReadWrite, ||
+      db.execute[items](stmt("insert into items (id) values (1)"), [])) {
+    Ok(_) -> seen ++ "committed",
+    Err(rolled) -> match rolled.error {
+      Some(e) -> if is_retryable(e) && left > 1 { attempts(left - 1, seen ++ e.code ++ " then ") }
+      else { seen ++ e.code ++ ": " ++ e.detail },
+      None -> seen ++ rolled.reason,
     },
   }
 
@@ -146,19 +165,15 @@ fn run(entry: &str, args: Vec<Value>, script: Vec<Vec<u8>>) -> Result<Ran, Strin
         .bind(&front.check)
         .expect("the declaration and the registration agree");
 
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(ply_eval::Provider::attach(unit));
+    let mut machine = Machine::new(&front, ply_eval::Provider::attach(unit))
+        .expect("the unit was compiled from this program");
     machine.set_host_binding(Arc::new(binding));
-    let simple = entry.rsplit('.').next().expect("an entry has a name");
-    if let Some(declared) = front
+    let declared = front
         .check
         .defs
-        .values()
-        .find(|d| d.simple_name.as_str() == simple)
-        .map(|d| d.footprint.clone())
-    {
-        machine.set_declared_footprint(declared);
-    }
+        .get(&Symbol::new(entry))
+        .expect("the entry is a definition of the program");
+    machine.set_declared_footprint(declared.footprint.clone());
     let answered = machine
         .call(entry, args, Span::DUMMY)
         .unwrap_or_else(|e| panic!("the call answers: {e}"));
@@ -175,21 +190,17 @@ fn run_over_tcp(entry: &str, args: Vec<Value>) -> Result<Ran, String> {
         .bind(&front.check)
         .expect("the declaration and the registration agree");
 
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(ply_eval::Provider::attach(unit));
+    let mut machine = Machine::new(&front, ply_eval::Provider::attach(unit))
+        .expect("the unit was compiled from this program");
     machine.set_host_binding(Arc::new(binding));
     // The real socket answers `Pending`, so the machine needs something to wait on.
     machine.set_host_runtime(host.runtime());
-    let simple = entry.rsplit('.').next().expect("an entry has a name");
-    if let Some(declared) = front
+    let declared = front
         .check
         .defs
-        .values()
-        .find(|d| d.simple_name.as_str() == simple)
-        .map(|d| d.footprint.clone())
-    {
-        machine.set_declared_footprint(declared);
-    }
+        .get(&Symbol::new(entry))
+        .expect("the entry is a definition of the program");
+    machine.set_declared_footprint(declared.footprint.clone());
     let answered = machine
         .call(entry, args, Span::DUMMY)
         .unwrap_or_else(|e| panic!("the call answers: {e}"));
@@ -284,6 +295,23 @@ fn refused(code: &str, text: &str) -> Vec<u8> {
     body.push(0);
     let mut out = message(b'E', &body);
     out.extend(message(b'Z', b"I"));
+    out
+}
+
+/// A command's tag, and the readiness that says where the transaction stands.
+fn completed(tag: &str, status: u8) -> Vec<u8> {
+    let mut out = message(b'C', &named(tag));
+    out.extend(message(b'Z', &[status]));
+    out
+}
+
+/// An insert through the extended cycle, inside a transaction.
+fn inserted() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(message(b'1', b""));
+    out.extend(message(b'2', b""));
+    out.extend(message(b'n', b""));
+    out.extend(completed("INSERT 0 1", b'T'));
     out
 }
 
@@ -397,6 +425,43 @@ fn a_refusal_comes_back_with_its_sqlstate_and_leaves_the_connection_usable() {
     let text = sent_text(&outcome.sent);
     assert!(text.contains("select nope"), "{text}");
     assert!(text.contains("select 1"), "{text}");
+}
+
+/// A serialization failure the server answers a `COMMIT` with comes back from `std.db` as its
+/// SQLSTATE, so `is_retryable` sees it, and the retry begins a transaction of its own on the
+/// connection the refusal left talking.
+#[test]
+fn a_serialization_failure_comes_back_as_40001_and_the_transaction_is_retried() {
+    let outcome = run(
+        "m.retried",
+        vec![Value::str("postgres://ply@127.0.0.1:5432/ply")],
+        vec![
+            greeting(),
+            completed("BEGIN", b'T'),
+            inserted(),
+            refused(
+                "40001",
+                "could not serialize access due to read/write dependencies among transactions",
+            ),
+            completed("BEGIN", b'T'),
+            inserted(),
+            completed("COMMIT", b'I'),
+        ],
+    )
+    .expect("the server refused nothing the program did not handle");
+    assert_eq!(outcome.text, "40001 then committed");
+
+    let text = sent_text(&outcome.sent);
+    assert_eq!(
+        text.matches("begin isolation level serializable read write")
+            .count(),
+        2,
+        "the retry did not begin a transaction of its own: {text:?}"
+    );
+    assert!(
+        !text.contains("savepoint"),
+        "the retry was taken for a transaction nested in the refused one: {text:?}"
+    );
 }
 
 /// `std.db` tells the server a connection string's timeouts and name in the start-up message, so a

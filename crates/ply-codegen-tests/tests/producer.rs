@@ -737,6 +737,32 @@ fn across(seed: Int) -> Int =
     };
     cell_get(c)
   } }
+
+fn threaded(seed: Int) -> Int =
+  handle {
+    with_cell[inner](seed) { c -> {
+      let b = amb.flip[coin]();
+      cell_set(c, cell_get(c) + (if b { 1 } else { 2 }));
+      cell_get(c)
+    } }
+  } with {
+    amb.flip[coin]() resume k -> k(true) + k(false),
+    return x -> x
+  }
+
+fn later(seed: Int) -> Int =
+  handle {
+    with_cell[inner](seed) { c -> {
+      let b = amb.flip[coin]();
+      with_cell[step](if b { 1 } else { 2 }) { d -> {
+        cell_set(c, cell_get(c) + cell_get(d));
+        cell_get(c)
+      } }
+    } }
+  } with {
+    amb.flip[coin]() resume k -> k(true) + k(false),
+    return x -> x
+  }
 "#;
 
 #[test]
@@ -752,6 +778,7 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
     // `across` captures under a task whose region has ended by the second resumption, so the tier refuses it.
+    // `threaded` and `later` resume into a cell opened before the stop: the second run reads what the first wrote.
     let cases: Vec<(&str, Vec<Value>, Result<Value, &str>)> = vec![
         ("m.both", vec![Value::Int(3)], Ok(Value::Int(303))),
         ("m.thrice", vec![Value::Int(7)], Ok(Value::Int(42))),
@@ -763,6 +790,8 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
         ("m.shared", vec![Value::Int(0)], Ok(Value::Int(30002))),
         ("m.siblings", vec![Value::Int(1)], Ok(Value::Int(33))),
         ("m.across", vec![Value::Int(0)], Err("E0413")),
+        ("m.threaded", vec![Value::Int(5)], Ok(Value::Int(14))),
+        ("m.later", vec![Value::Int(5)], Ok(Value::Int(14))),
     ];
     for (name, args, want) in cases {
         let entry = native
@@ -770,6 +799,7 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
         ctx.begin(10_000);
+        let start = ctx.cell_extent();
         let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
         let words: Vec<i64> = args
             .iter()
@@ -800,6 +830,11 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
             }
         }
         ctx.end();
+        assert_eq!(
+            ctx.cell_extent(),
+            start,
+            "`{name}{args:?}` left regions or cells behind once it ended"
+        );
     }
 }
 
@@ -834,12 +869,24 @@ impl ply_eval::HostHandler for Slow {
     }
 }
 
-/// A reactor that resolves every pending answer to three times its token on the next poll.
-struct Reactor;
+/// A reactor that resolves every pending answer to three times its token when next asked.
+#[derive(Default)]
+struct Reactor {
+    watched: std::cell::RefCell<Vec<u64>>,
+}
 
 impl ply_eval::HostRuntime for Reactor {
-    fn poll(&self, pending: &ply_eval::Pending) -> Result<Option<Value>, ply_eval::Diagnostic> {
-        Ok(Some(Value::Int(pending.token as i64 * 3)))
+    fn watch(&self, pending: &ply_eval::Pending) -> Result<(), ply_eval::Diagnostic> {
+        self.watched.borrow_mut().push(pending.token);
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, ply_eval::Diagnostic>)> {
+        self.watched
+            .take()
+            .into_iter()
+            .map(|token| (token, Ok(Value::Int(token as i64 * 3))))
+            .collect()
     }
 
     fn park(&self) -> Result<(), ply_eval::Diagnostic> {
@@ -925,7 +972,7 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
-        ctx.set_host(binding, Some(std::rc::Rc::new(Reactor)));
+        ctx.set_host(binding, Some(std::rc::Rc::new(Reactor::default())));
         ctx.begin(10_000);
         let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
         let words: Vec<i64> = args

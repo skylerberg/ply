@@ -20,6 +20,12 @@
 #                                nextest JUnit report
 #   ci-shards.sh solo-matrix     the JSON matrix of tests that run alone
 #   ci-shards.sh solo-filter ID  the nextest filterset selecting one solo test
+#   ci-shards.sh corpus-matrix   the JSON matrix of the corpus runs that get a
+#                                runner of their own
+#   ci-shards.sh corpus-for-partition K
+#                                the corpus runs partition K takes after its
+#                                nextest run
+#   ci-shards.sh corpus-line ID  the package one run tests and its filter
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the other
 #                                jobs: the solo tests, the shutdown suite and
 #                                the postgres packages
@@ -48,13 +54,18 @@ SOLO=(
   # length on top of the shard's share.
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
   "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
-  # The corpus's own served benches, which nothing in a shard reaches: each binds real listeners, and
-  # the CLI's reservations do not cover another crate's, so each gets a runner of its own.
-  "corpus-socket-bench:ply-corpus-tests:suite:served::the_socket_bench_serves_the_desk_and_its_floor"
-  "corpus-database-bench:ply-corpus-tests:suite:served::the_database_bench_takes_what_needs_no_database_and_names_what_does"
-  "corpus-lifecycle-bench:ply-corpus-tests:suite:served::the_lifecycle_bench_drains_and_deploys_and_names_what_needs_a_database"
-  "corpus-ladder:ply-corpus-tests:suite:served::the_ladder_serves_the_desk_and_holds_the_shipped_allocation_figure"
 )
+
+# The corpus's Ply tests, one run an entry: the program's own, then each module of the checks package
+# that declares a test, selected by its name. Every check spawns `ply`, so a run takes its checks one
+# after another. The runs that start desks under load get a runner each; the rest go to the
+# partitions, round robin in entry order, after each partition's nextest run.
+CORPUS_PROGRAM=crates/ply-corpus/ply
+CORPUS_CHECKS=crates/ply-corpus/checks
+CORPUS_ALONE=(serving database)
+# Placed a test at a time rather than a module at a time: a whole module on one partition would
+# outlast the partition's nextest shard.
+CORPUS_BY_TEST=(audit generated toolchain)
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.
 # `test-hosts` runs them in one job. The set was named for postgres when the driver lived in the
@@ -163,6 +174,85 @@ cmd_solo_filter() {
     fi
   done < <(cmd_solo)
   echo "no solo test named '$1'" >&2
+  return 1
+}
+
+# One entry id a line: `program`, then every checks module that declares a test.
+# One entry id a line: `program`, then every checks module that declares a test, as `module` or, for
+# a module placed a test at a time, `module:N` for its Nth test.
+corpus_entries() {
+  local file module count i
+  printf 'program\n'
+  for file in "$root/$CORPUS_CHECKS"/*.ply; do
+    grep -qE '^test(/[a-z]+)? "' "$file" || continue
+    module=$(basename "$file" .ply)
+    if corpus_by_test "$module"; then
+      count=$(corpus_test_names "$file" | grep -c .)
+      for ((i = 1; i <= count; i++)); do printf '%s:%d\n' "$module" "$i"; done
+    else
+      printf '%s\n' "$module"
+    fi
+  done
+}
+
+corpus_by_test() {
+  local id
+  for id in "${CORPUS_BY_TEST[@]}"; do [[ $id == "$1" ]] && return 0; done
+  return 1
+}
+
+# The names of a checks module's tests, in the order it declares them.
+corpus_test_names() {
+  sed -nE 's/^test(\/[a-z]+)? "([^"]*)".*/\2/p' "$1"
+}
+
+corpus_alone() {
+  local id
+  for id in "${CORPUS_ALONE[@]}"; do [[ $id == "$1" ]] && return 0; done
+  return 1
+}
+
+cmd_corpus_matrix() {
+  local id first=1
+  printf '{"include":['
+  for id in "${CORPUS_ALONE[@]}"; do
+    ((first)) || printf ','
+    first=0
+    printf '{"id":"%s"}' "$id"
+  done
+  printf ']}\n'
+}
+
+# Every entry that does not run alone, the first to partition 1, the next to 2, and so on round.
+cmd_corpus_for_partition() {
+  local id n=0
+  while read -r id; do
+    corpus_alone "$id" && continue
+    (((n % PARTITIONS) + 1 == $1)) && printf '%s\n' "$id"
+    n=$((n + 1))
+  done < <(corpus_entries)
+}
+
+# `path filter`: the program's entry takes every test of its package, a checks module's its own, and
+# `module:N` its Nth test by the qualified name `ply test --filter` matches.
+cmd_corpus_line() {
+  local entry module n name entries
+  # Read whole before the loop can return, so the lister never writes into a closed pipe.
+  entries=$(corpus_entries)
+  while read -r entry; do
+    [[ $entry == "$1" ]] || continue
+    if [[ $entry == program ]]; then
+      printf '%s\n' "$CORPUS_PROGRAM"
+    elif [[ $entry == *:* ]]; then
+      module=${entry%%:*} n=${entry##*:}
+      name=$(corpus_test_names "$root/$CORPUS_CHECKS/$module.ply" | sed -n "${n}p")
+      printf '%s %s.%s\n' "$CORPUS_CHECKS" "$module" "$name"
+    else
+      printf '%s %s.\n' "$CORPUS_CHECKS" "$entry"
+    fi
+    return 0
+  done <<< "$entries"
+  echo "no corpus entry named '$1'" >&2
   return 1
 }
 
@@ -540,15 +630,12 @@ cmd_give_back() {
 }
 
 cmd_solo_matrix() {
-  local id package target test corpus first=1
+  local id package target test first=1
   printf '{"include":['
   while read -r id package target test; do
     ((first)) || printf ','
     first=0
-    # Whether the job builds the corpus program: its tests run it, and a test that built it itself
-    # would spend its own deadline on the build.
-    if [[ $package == ply-corpus-tests ]]; then corpus=true; else corpus=false; fi
-    printf '{"id":"%s","corpus":"%s"}' "$id" "$corpus"
+    printf '{"id":"%s"}' "$id"
   done < <(cmd_solo)
   printf ']}\n'
 }
@@ -874,6 +961,69 @@ cmd_verify() {
     done
   fi
 
+  # --- the corpus's Ply tests -------------------------------------------------
+  local corpus_job
+  for dir in "$CORPUS_PROGRAM" "$CORPUS_CHECKS"; do
+    if [[ ! -f "$root/$dir/ply.pkg" ]]; then
+      echo "FAIL: $dir holds no ply.pkg, and a corpus run tests it as a package" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ -f "$root/$CORPUS_CHECKS/program.ply" ]]; then
+    echo "FAIL: $CORPUS_CHECKS/program.ply would be run under the id of the program's own tests" >&2
+    failures=$((failures + 1))
+  fi
+  if [[ $(corpus_entries | grep -c .) -lt 2 ]]; then
+    echo "FAIL: no module of $CORPUS_CHECKS declares a test, so the corpus's checks run nowhere" >&2
+    failures=$((failures + 1))
+  fi
+  local entries
+  entries=$(corpus_entries)
+  for id in "${CORPUS_ALONE[@]}"; do
+    if ! grep -qx "$id" <<< "$entries"; then
+      echo "FAIL: '$id' runs alone and no module of $CORPUS_CHECKS by that name declares a test" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  # A test placed by name is picked out by a substring of its qualified name, so no name in its module
+  # may hold another.
+  local module names
+  for module in "${CORPUS_BY_TEST[@]}"; do
+    names=$(corpus_test_names "$root/$CORPUS_CHECKS/$module.ply")
+    while IFS= read -r name; do
+      [[ -n $name ]] || continue
+      if [[ $(grep -cF -- "$name" <<< "$names") -gt 1 ]]; then
+        echo "FAIL: '$module.$name' is part of another test's name in $CORPUS_CHECKS/$module.ply, so its filter picks both" >&2
+        failures=$((failures + 1))
+      fi
+    done <<< "$names"
+  done
+  # Every entry that does not run alone is some partition's, so the round robin stays total.
+  local placed k
+  placed=$(for ((k = 1; k <= PARTITIONS; k++)); do cmd_corpus_for_partition "$k"; done | sort)
+  if [[ $placed != "$(grep -vxF -f <(printf '%s\n' "${CORPUS_ALONE[@]}") <<< "$entries" | sort)" ]]; then
+    echo "FAIL: the partitions' corpus runs are not every entry that does not run alone" >&2
+    failures=$((failures + 1))
+  fi
+  if ! grep -q 'ci-corpus\.sh' "$workflow"; then
+    echo "FAIL: no job in $workflow runs ci-corpus.sh, so the partitions' corpus runs run nowhere" >&2
+    failures=$((failures + 1))
+  fi
+  # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
+  for corpus_command in corpus-matrix corpus-for-partition; do
+    corpus_job=$(awk -v c="ci-shards\\.sh $corpus_command" '
+      /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
+      $0 ~ c { print job; exit }
+    ' "$workflow")
+    if [[ -z $corpus_job ]]; then
+      echo "FAIL: no job in $workflow runs \`ci-shards.sh $corpus_command\`, so its corpus runs run nowhere" >&2
+      failures=$((failures + 1))
+    elif [[ " ${needs//[][,]/ } " != *" $corpus_job "* ]]; then
+      echo "FAIL: job '$corpus_job' runs corpus tests, and is not in the \`ci\` job's needs list" >&2
+      failures=$((failures + 1))
+    fi
+  done
+
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
   cmd_cache_payloads || failures=$((failures + 1))
@@ -898,7 +1048,7 @@ cmd_verify() {
   fi
   local cut="by test count, with nothing measured"
   [[ -s $TIMINGS ]] && cut="from $(grep -c . "$TIMINGS") measured durations"
-  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $PARTITIONS partitions cut $cut"
+  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs; $PARTITIONS partitions cut $cut"
 }
 
 case "${1:-}" in
@@ -909,6 +1059,9 @@ case "${1:-}" in
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
   solo-matrix) cmd_solo_matrix ;;
   solo-filter) cmd_solo_filter "${2:?a solo id}" ;;
+  corpus-matrix) cmd_corpus_matrix ;;
+  corpus-for-partition) cmd_corpus_for_partition "${2:?a partition}" ;;
+  corpus-line) cmd_corpus_line "${2:?a corpus entry}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
   host-filter) cmd_host_filter ;;
@@ -916,7 +1069,7 @@ case "${1:-}" in
   tree-check-filter) cmd_tree_check_filter ;;
   give-back) cmd_give_back "${2:?a run id}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|corpus-matrix|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
     exit 2
     ;;
 esac

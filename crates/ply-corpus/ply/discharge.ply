@@ -1,0 +1,342 @@
+// `prove` — what the spec tier buys a project: where its obligations land, and why some fell short.
+// Every number is `ply prove --json --reach --no-cache`'s own: the tier each obligation was discharged
+// at, and what the static tier alone answered for each, asked apart from the discharge.
+
+import report
+import report (Row, Criterion, holding, number, exact, row)
+import spine
+import std.json (Json, Str, Number, Object, object, array)
+import std.json
+import std.list
+import std.fs (fs)
+import std.process (process)
+import std.config (config)
+
+pub type Args = { projects: List<String>, cases: Int, prove_budget: Int }
+
+// One obligation, as the report carries it.
+pub type Obligation = {
+  tier: Option<String>,
+  // A proof whose certificate names a rule that ran the program rather than argued about it.
+  executed: Bool,
+  // The kind of gap that left it unattempted, as the report names it.
+  gap: Option<String>,
+  // What the static tier alone decided and every construct it stopped at, or `None` for an
+  // obligation it is never asked about.
+  reach: Option<{ decision: String, blockers: List<String> }>,
+}
+
+// One project's obligations as `ply prove` discharged them, with the counts its report gives.
+pub type Discharged = {
+  project: String,
+  definitions: Int,
+  specified: Int,
+  covered: Int,
+  proved: Int,
+  property: Int,
+  example: Int,
+  refuted: Int,
+  vacuous: Int,
+  unattempted: Int,
+  // Obligations Ply failed on, which are Ply's defects and never the project's gaps.
+  defect: Int,
+  ms: Decimal,
+  obligations: List<Obligation>,
+}
+
+// --- Reading the report ---------------------------------------------------------------------
+
+// The rules the prover certifies by running the program rather than by an argument about it.
+fn execution_rules() -> List<String> =
+  ["ground_evaluation", "exhaustive_enumeration", "exhaustive_interleaving"]
+
+// A rule the prover named with fields carries them under its own tag, and one that needs none is
+// the tag alone.
+fn rule_tag(r: Json) -> String =
+  match r {
+    Str(tag) -> tag,
+    Object(m) -> match map_keys(m) { [tag, ..] -> tag, [] -> "" },
+    _ -> "",
+  }
+
+fn ran_the_program(certificate: Map<String, Json>) -> Bool =
+  fold(spine::array_field(certificate, "rules"), false, |ran: Bool, r: Json|
+    ran || list::contains(execution_rules(), rule_tag(r)))
+
+fn obligation_of(o: Map<String, Json>) -> Obligation =
+  {
+    tier: match map_get(o, "tier") { Some(Str(t)) -> Some(t), _ -> None },
+    executed: match spine::field(o, "certificate") { Ok(c) -> ran_the_program(c), Err(_) -> false },
+    gap: match map_get(o, "gap_kind") { Some(Str(g)) -> Some(g), _ -> None },
+    reach: match spine::field(o, "reach") {
+      Err(_) -> None,
+      Ok(r) ->
+        Some({
+          decision: spine::str_field(r, "decision"),
+          blockers: map(
+            spine::objects(spine::array_field(r, "blockers")),
+            |b: Map<String, Json>| spine::str_field(b, "kind"),
+          ),
+        }),
+    },
+  }
+
+pub fn discharged_of(project: String, j: Json) -> Result<Discharged, String> =
+  match j {
+    Object(m) -> match spine::field(m, "summary") {
+      Err(e) -> Err(e),
+      Ok(summary) -> match spine::field(m, "coverage") {
+        Err(e) -> Err(e),
+        Ok(coverage) ->
+          Ok({
+            project: project,
+            definitions: spine::int_field(coverage, "definitions"),
+            specified: spine::int_field(m, "specified"),
+            covered: spine::int_field(coverage, "covered"),
+            proved: spine::int_field(summary, "proved"),
+            property: spine::int_field(summary, "property"),
+            example: spine::int_field(summary, "example"),
+            refuted: spine::int_field(summary, "refuted"),
+            vacuous: spine::int_field(summary, "vacuous"),
+            unattempted: spine::int_field(summary, "unattempted"),
+            defect: spine::int_field(summary, "defect"),
+            ms: spine::decimal_field(m, "duration_ms"),
+            obligations: map(spine::objects(spine::array_field(m, "obligations")), obligation_of),
+          }),
+      },
+    },
+    _ -> Err("the prove report is not an object"),
+  }
+
+// --- Counting -----------------------------------------------------------------------------------
+
+fn counted(os: List<Obligation>, want: (Obligation) -> Bool) -> Int = len(filter(os, want))
+
+fn proved(o: Obligation) -> Bool = o.tier == Some("proved")
+
+fn decision_of(o: Obligation) -> String = match o.reach { Some(r) -> r.decision, None -> "" }
+
+// Proved by an argument, with nothing run: what the static tier alone ought to decide too.
+fn argued(o: Obligation) -> Bool = proved(o) && !o.executed
+
+// How many there are of each, most common first and then by name.
+pub fn histogram(xs: List<String>) -> List<{ name: String, count: Int }> =
+  list::sort_by(
+    map_fold(
+      fold(xs, map_new(), |m: Map<String, Int>, x: String|
+        map_insert(m, x, match map_get(m, x) { Some(n) -> n + 1, None -> 1 })),
+      [],
+      |acc: List<{ name: String, count: Int }>, name: String, count: Int|
+        push(acc, { name: name, count: count }),
+    ),
+    |a: { name: String, count: Int }, b: { name: String, count: Int }|
+      a.count > b.count || (a.count == b.count && compare(a.name, b.name) != Greater),
+  )
+
+fn histogram_json(h: List<{ name: String, count: Int }>, what: String) -> Json =
+  array(
+    map(h, |e: { name: String, count: Int }|
+      object([
+        { key: what, value: Str(e.name) },
+        { key: "obligations", value: Number(decimal_of_int(e.count)) },
+      ])),
+  )
+
+// Why an obligation was not attempted at all, by kind.
+pub fn gaps(d: Discharged) -> List<{ name: String, count: Int }> =
+  histogram(
+    fold(d.obligations, [], |acc: List<String>, o: Obligation|
+      match o.gap { Some(g) -> push(acc, g), None -> acc }),
+  )
+
+// Where an obligation the static tier did not decide left its fragment, each construct once an
+// obligation.
+pub fn blockers(d: Discharged) -> List<{ name: String, count: Int }> =
+  histogram(
+    fold(d.obligations, [], |acc: List<String>, o: Obligation|
+      match o.reach {
+        Some(r) -> if r.decision == "open" || r.decision == "budget_spent" {
+          fold(list::unique(r.blockers), acc, |inner: List<String>, b: String| push(inner, b))
+        } else { acc },
+        None -> acc,
+      }),
+  )
+
+// --- The rows ------------------------------------------------------------------------------------
+
+// A refuted or vacuous obligation does not hold, and one Ply failed on is Ply's defect; a gap is not.
+pub fn held() -> Criterion =
+  holding(
+    "no obligation is refuted or vacuous, and Ply failed on none",
+    ["refuted", "vacuous", "defect"],
+    |vs: List<Decimal>|
+      match vs {
+        [refuted, vacuous, defect] -> refuted == 0m && vacuous == 0m && defect == 0m,
+        _ -> false,
+      },
+  )
+
+// The discharge and the static tier asked alone take one decision over one budget, so a proof that
+// ran nothing is one the static tier decides.
+pub fn decided() -> Criterion =
+  holding(
+    "every proof made without running the program is one the static tier alone decides",
+    ["undecided_proofs"],
+    |vs: List<Decimal>| vs == [0m],
+  )
+
+pub fn tier_row(d: Discharged) -> Row = {
+  let obligations = len(d.obligations);
+  {
+    ..row(d.project, held(), [number("definitions", d.definitions, "definitions"), number("specified", d.specified, "definitions"), number("covered", d.covered, "definitions"), number("obligations", obligations, "obligations"), number("proved", d.proved, "obligations"), number("proved_by_execution", counted(d.obligations, |o: Obligation| proved(o) && o.executed), "obligations"), number("property", d.property, "obligations"), number("example", d.example, "obligations"), number("refuted", d.refuted, "obligations"), number("vacuous", d.vacuous, "obligations"), number("unattempted", d.unattempted, "obligations"), number("defect", d.defect, "obligations"), exact("ms", d.ms, "ms"), exact("per_obligation", decimal_div(d.ms, decimal_of_int(max(obligations, 1)), 3, HalfEven), "ms")]),
+    detail: object([{ key: "gaps", value: histogram_json(gaps(d), "gap") }]),
+  }
+}
+
+pub fn reach_row(d: Discharged) -> Row = {
+  let os = d.obligations;
+  let at = |decision: String| counted(os, |o: Obligation| decision_of(o) == decision);
+  {
+    ..row(d.project ++ " reach", decided(), [number("attempted", counted(os, |o: Obligation| o.reach != None), "obligations"), number("decided", at("proved"), "obligations"), number("open", at("open"), "obligations"), number("budget_spent", at("budget_spent"), "obligations"), number("guard_unsatisfiable", at("guard_unsatisfiable"), "obligations"), number("static_proofs", counted(os, argued), "obligations"), number("undecided_proofs", counted(os, |o: Obligation| argued(o) && decision_of(o) != "proved"), "obligations")]),
+    detail: object([{ key: "blockers", value: histogram_json(blockers(d), "blocker") }]),
+  }
+}
+
+// --- Running it ------------------------------------------------------------------------------
+
+pub fn prove_args(a: Args, project: String) -> List<String> =
+  [
+    "prove",
+    project,
+    "--json",
+    "--reach",
+    "--no-cache",
+    "--prove-cases",
+    int_to_string(a.cases),
+    "--prove-budget",
+    int_to_string(a.prove_budget),
+    "--color",
+    "never",
+  ]
+
+fn discharged(
+  a: Args,
+  project: String,
+) -> Result<Discharged, String> / {process.spawn[ply], config.get[env]} =
+  match spine::document(spine::ply(prove_args(a, project), ".")) {
+    Err(why) -> Err("`" ++ project ++ "`: " ++ why),
+    Ok(j) -> match spine::refusal(j) {
+      Some(why) -> Err("`" ++ project ++ "` did not load: " ++ why),
+      None -> discharged_of(project, j),
+    },
+  }
+
+// Every project in order, two rows each; a project that did not load stops the subcommand.
+pub fn run(
+  a: Args,
+) -> Result<report::Report, String> / {process.spawn[ply], config.get[env], fs.read[repo]} =
+  match fold(a.projects, Ok([]), |acc: Result<List<Row>, String>, project: String|
+      match acc {
+        Err(why) -> Err(why),
+        Ok(rows) -> match discharged(a, project) {
+          Err(why) -> Err(why),
+          Ok(d) -> Ok(push(push(rows, tier_row(d)), reach_row(d))),
+        },
+      }) {
+    Err(why) -> Err(why),
+    Ok(rows) ->
+      report::made(
+        "prove",
+        "prove — where each project's obligations land, at " ++ int_to_string(a.cases)
+          ++ " cases and a budget of "
+          ++ int_to_string(a.prove_budget),
+        rows,
+        [
+          { key: "cases", value: Number(decimal_of_int(a.cases)) },
+          { key: "prove_budget", value: Number(decimal_of_int(a.prove_budget)) },
+        ],
+      ),
+  }
+
+// --- Tests ---------------------------------------------------------------------------------------
+
+fn a_report() -> Json =
+  match json::parse_string(
+      "{\"command\":\"prove\",\"ok\":true,\"exit_code\":0,\"specified\":3,\"coverage\":{\"definitions\":5,\"covered\":2},\"duration_ms\":12.5,\"summary\":{\"obligations\":5,\"proved\":3,\"property\":1,\"example\":0,\"refuted\":0,\"vacuous\":0,\"unattempted\":1,\"defect\":0},\"obligations\":[{\"tier\":\"proved\",\"certificate\":{\"rules\":[\"linear_arithmetic\",{\"unfold\":{\"def\":\"m.f\",\"depth\":1}}]},\"reach\":{\"decision\":\"proved\",\"steps\":4,\"blockers\":[]}},{\"tier\":\"proved\",\"certificate\":{\"rules\":[\"ground_evaluation\"]},\"reach\":{\"decision\":\"open\",\"steps\":2,\"blockers\":[{\"kind\":\"recursive_call\",\"about\":\"m.g\"},{\"kind\":\"recursive_call\",\"about\":\"m.h\"}]}},{\"tier\":\"proved\",\"certificate\":{\"rules\":[{\"exhaustive_enumeration\":{\"domain\":\"Bool\",\"points\":2}}]},\"reach\":null},{\"tier\":\"property\",\"reach\":{\"decision\":\"budget_spent\",\"steps\":10000,\"blockers\":[{\"kind\":\"division\",\"about\":null}]}},{\"tier\":null,\"outcome\":\"unattempted\",\"gap\":\"raised: division by zero\",\"gap_kind\":\"raised\",\"reach\":{\"decision\":\"open\",\"steps\":1,\"blockers\":[{\"kind\":\"division\",\"about\":null}]}}]}",
+    ) {
+    Ok(j) -> j,
+    Err(e) -> panic(e.message),
+  }
+
+fn a_discharge() -> Discharged =
+  match discharged_of("laws.ply", a_report()) { Ok(d) -> d, Err(why) -> panic(why) }
+
+fn verdict_of(r: Row) -> report::Verdict =
+  match report::judge([r]) { [j] -> j.verdict, _ -> panic("one row is judged as one") }
+
+fn value(r: Row, name: String) -> Option<Decimal> =
+  match r.taken { Ok(ms) -> report::value_of(ms, name), Err(_) -> None }
+
+test "a project's tiers are the report's, and a proof that ran the program is told apart" {
+  let d = a_discharge();
+  let tiers = tier_row(d);
+  assert_eq(verdict_of(tiers), report::Pass);
+  assert_eq(
+    map(["obligations", "proved", "proved_by_execution", "covered", "unattempted"], |n: String|
+      value(tiers, n)),
+    [Some(5m), Some(3m), Some(2m), Some(2m), Some(1m)],
+  );
+  assert_eq(value(tiers, "per_obligation"), Some(2.5m));
+  assert_eq(value(tiers, "defect"), Some(0m));
+  assert(verdict_of(tier_row({ ..d, refuted: 1 })) != report::Pass);
+  assert(verdict_of(tier_row({ ..d, vacuous: 1 })) != report::Pass);
+  // Ply failing on an obligation is Ply's defect, which no gap histogram hides.
+  assert(verdict_of(tier_row({ ..d, defect: 1 })) != report::Pass);
+  assert_eq(json::to_string(tiers.detail), "{\"gaps\":[{\"gap\":\"raised\",\"obligations\":1}]}")
+}
+
+test "what the static tier decided is counted over what it was asked, and why it stopped" {
+  let reach = reach_row(a_discharge());
+  assert_eq(verdict_of(reach), report::Pass);
+  assert_eq(
+    map(["attempted", "decided", "open", "budget_spent", "static_proofs"], |n: String|
+      value(reach, n)),
+    [Some(4m), Some(1m), Some(2m), Some(1m), Some(1m)],
+  );
+  assert_eq(
+    json::to_string(reach.detail),
+    "{\"blockers\":[{\"blocker\":\"division\",\"obligations\":2},{\"blocker\":\"recursive_call\",\"obligations\":1}]}",
+  )
+}
+
+test "a proof that ran nothing and that the static tier did not decide fails the reach row" {
+  let d = a_discharge();
+  let undecided = {
+    ..d,
+    obligations: push(d.obligations, {
+      tier: Some("proved"),
+      executed: false,
+      gap: None,
+      reach: Some({ decision: "open", blockers: [] }),
+    }),
+  };
+  assert_eq(
+    verdict_of(reach_row(undecided)),
+    report::Fail([number("undecided_proofs", 1, "obligations")]),
+  )
+}
+
+test "a histogram is most common first, then by name" {
+  assert_eq(histogram(["b", "a", "c", "a", "b"]), [
+    { name: "a", count: 2 },
+    { name: "b", count: 2 },
+    { name: "c", count: 1 },
+  ])
+}
+
+test "every project is proved uncached, with the static tier asked about each obligation" {
+  let line = prove_args({ projects: ["laws.ply"], cases: 20, prove_budget: 500 }, "laws.ply");
+  assert_eq(list_at(line, 1), Some("laws.ply"));
+  assert(list::contains(line, "--reach") && list::contains(line, "--no-cache"));
+  assert_eq(list_at(line, 6), Some("20"))
+}

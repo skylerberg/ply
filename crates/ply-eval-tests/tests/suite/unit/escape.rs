@@ -1,4 +1,4 @@
-use ply_eval::arena::{Arena, RegionKind};
+use ply_eval::arena::{Arena, Owner, RegionKind};
 use ply_eval::escape::*;
 use ply_eval::{ClosureKind, Span, Symbol, Value, codes};
 use std::collections::BTreeMap;
@@ -7,8 +7,12 @@ use std::sync::Arc;
 /// A real slot, because a [`Slot`](ply_eval::arena::Slot) carries a generation only the allocator assigns.
 fn cell() -> Value {
     let mut arena = Arena::new();
-    arena.open(RegionKind::Shared, Span::DUMMY);
-    Value::Cell(arena.alloc(Value::Int(0)).expect("the region is open"))
+    arena.open(Owner::ENTRY, RegionKind::Shared);
+    Value::Cell(
+        arena
+            .alloc(Owner::ENTRY, Value::Int(0))
+            .expect("the region is open"),
+    )
 }
 
 #[test]
@@ -84,9 +88,11 @@ fn a_secret_is_not_a_place_to_hide_a_handle_and_its_shape_stays_redacted() {
 #[test]
 fn a_task_and_a_continuation_are_handles_too() {
     assert_eq!(
-        carries(&Value::Task(ply_eval::sim::TaskId(0)))
-            .expect("a task is a handle")
-            .handle,
+        carries(&Value::Task(ply_eval::TaskHandle::unowned(
+            ply_eval::sim::TaskId(0)
+        )))
+        .expect("a task is a handle")
+        .handle,
         Handle::Task
     );
 }

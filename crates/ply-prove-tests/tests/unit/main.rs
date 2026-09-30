@@ -1,5 +1,6 @@
 mod checked;
 mod concurrency;
+mod differential;
 mod domain;
 mod numerics;
 mod property;

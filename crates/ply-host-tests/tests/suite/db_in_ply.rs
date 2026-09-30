@@ -5,7 +5,7 @@
 //! sees only `net`. A program serves itself: `with_server` reads the connection string, so nothing
 //! about the effect comes from the host.
 
-use ply_eval::{Machine, Span, Value};
+use ply_eval::{Machine, Span, Symbol, Value};
 use std::sync::Arc;
 
 /// A program that handles its own `db` from a connection string.
@@ -13,8 +13,8 @@ const PROGRAM: &str = r#"
 import std.net (net)
 import std.random (entropy)
 import std.db
-import std.db (db, with_server, stmt, transaction, PInt, PText, CInt, CText, Answer, Rows, Count,
-               Failed, ReadCommitted, ReadWrite, Row)
+import std.db (db, with_server, stmt, transaction, is_retryable, PInt, PText, CInt, CText, Answer,
+               Rows, Count, Failed, ReadCommitted, ReadWrite, Serializable, Row, Rollback)
 
 pub fn run(url: String) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
@@ -140,12 +140,93 @@ pub fn overrun(url: String) -> Result<String, String>
       stmt("select count(*) as n from pg_class a, pg_class b, pg_class c, pg_class d"),
       [],
     ) {
-      Failed(e) -> Ok(e.detail),
+      Failed(e) -> Ok(e.code ++ ": " ++ e.detail),
       _ -> Err("the statement finished inside its timeout"),
     }
   }) {
     Err(why) -> Err(why),
     Ok(answered) -> answered,
+  }
+
+fn bump(id: Int, by: Int) -> Answer / {db.execute[ledger]} =
+  db.execute[ledger](stmt("update ledger set n = n + $2 where id = $1"), [PInt(id), PInt(by)])
+
+fn ended(out: Result<Unit, Rollback>) -> String =
+  match out { Ok(_) -> "committed", Err(rolled) -> rolled.reason }
+
+// Two tasks in transactions at once on one pool, over one row: each holds a connection of its own,
+// so the one that rolls back undoes only its own write, whichever takes the row first.
+pub fn two_at_once(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join} =
+  with_server(url, 2, || {
+    let kept = task.spawn(|| ended(transaction(ReadCommitted, ReadWrite, || {
+      bump(1, 1);
+      ()
+    })));
+    let undone = task.spawn(|| ended(transaction(ReadCommitted, ReadWrite, || {
+      bump(1, 10);
+      db.rollback("undone")
+    })));
+    task.join(kept) ++ " " ++ task.join(undone)
+  })
+
+// Two serializable transactions writing one row: the one that writes second is refused with 40001,
+// and run again from its `begin` it goes through. The other runs on a pool of its own, inside the
+// first attempt.
+pub fn serialized(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
+  with_server(url, 1, || contended(url, 3, ""))
+
+fn contended(url: String, left: Int, seen: String) -> String =
+  match transaction(Serializable, ReadWrite, || {
+      db.query[ledger](stmt("select n from ledger where id = $1"), [PInt(1)]);
+      if seen == "" {
+        with_server(url, 1, || transaction(Serializable, ReadWrite, || bump(1, 10)));
+        ()
+      };
+      match bump(1, 1) {
+        Failed(e) -> db.rollback(if is_retryable(e) { "retry " ++ e.code } else { e.code }),
+        _ -> (),
+      }
+    }) {
+    Ok(_) -> seen ++ "committed",
+    Err(rolled) -> if string_starts_with(rolled.reason, "retry ") && left > 1 {
+      contended(url, left - 1, seen ++ string_slice(rolled.reason, 6, string_len(rolled.reason)) ++ " then ")
+    } else { seen ++ rolled.reason },
+  }
+
+// Two tasks, each on a pool of its own, taking two rows in opposite orders: the server breaks the
+// deadlock by refusing one with 40P01, and the other commits once that one has rolled back.
+pub fn deadlocked(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join} = {
+  let a = task.spawn(|| crossing(url, 1, 2));
+  let b = task.spawn(|| crossing(url, 2, 1));
+  Ok(task.join(a) ++ " " ++ task.join(b))
+}
+
+fn crossing(url: String, first: Int, second: Int) -> String =
+  match with_server(url, 1, || ended(transaction(ReadCommitted, ReadWrite, || {
+      bump(first, 1);
+      both_written(400);
+      match bump(second, 1) { Failed(e) -> db.rollback(e.code), _ -> () }
+    }))) {
+    Err(why) -> why,
+    Ok(text) -> text,
+  }
+
+// Until both transactions have written, when each holds a transaction id of its own.
+fn both_written(left: Int) -> Unit =
+  if left <= 0 { () } else {
+    match db.query[pg_locks](
+        stmt("select count(*) as n from pg_locks where locktype = 'transactionid' and granted"),
+        [],
+      ) {
+      Rows([row, ..]) -> match map_get(row, "n") {
+        Some(CInt(n)) -> if n >= 2 { () } else { both_written(left - 1) },
+        _ -> both_written(left - 1),
+      },
+      _ -> both_written(left - 1),
+    }
   }
 "#;
 
@@ -168,20 +249,16 @@ fn call_outcome(entry: &str, url: &str) -> Result<Value, ply_eval::Diagnostic> {
         .bind(&front.check)
         .expect("the declaration and the registration agree");
 
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(ply_eval::Provider::attach(unit));
+    let mut machine = Machine::new(&front, ply_eval::Provider::attach(unit))
+        .expect("the unit was compiled from this program");
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(host.runtime());
-    let simple = entry.rsplit('.').next().expect("an entry has a name");
-    if let Some(declared) = front
+    let declared = front
         .check
         .defs
-        .values()
-        .find(|d| d.simple_name.as_str() == simple)
-        .map(|d| d.footprint.clone())
-    {
-        machine.set_declared_footprint(declared);
-    }
+        .get(&Symbol::new(entry))
+        .expect("the entry is a definition of the program");
+    machine.set_declared_footprint(declared.footprint.clone());
     machine.call(entry, vec![Value::str(url)], Span::DUMMY)
 }
 
@@ -300,9 +377,71 @@ fn a_connection_strings_timeouts_bound_every_statement_on_the_server() {
     }
     match call("m.overrun", &bounded) {
         Ok(why) => assert!(
-            why.contains("57014"),
-            "the statement ended for another reason: {why}"
+            why.starts_with("57014: ") && why.contains("statement timeout"),
+            "the statement ended for another reason, or its SQLSTATE was not its code: {why}"
         ),
         Err(why) => panic!("the timeout did not bound the statement: {why}"),
     }
+}
+
+/// A table of counters, one row per id, each starting at zero.
+fn ledger(cluster: &crate::support::cluster::Cluster, ids: &[i32]) {
+    cluster.psql(
+        "ply",
+        "create table ledger (id int4 primary key, n int4 not null)",
+    );
+    for id in ids {
+        cluster.psql("ply", &format!("insert into ledger values ({id}, 0)"));
+    }
+}
+
+#[test]
+fn two_tasks_in_transactions_at_once_each_hold_a_connection_of_their_own() {
+    let Some((cluster, url)) = cluster() else {
+        return;
+    };
+    ledger(&cluster, &[1]);
+    match call("m.two_at_once", &url) {
+        Ok(text) => assert_eq!(text, "committed undone"),
+        Err(why) => panic!("the pool could not hold two transactions: {why}"),
+    }
+    assert_eq!(
+        cluster.psql("ply", "select n from ledger where id = 1"),
+        "1",
+        "the rolled-back write landed, or the committed one did not"
+    );
+}
+
+#[test]
+fn a_serialization_failure_is_40001_and_the_retried_transaction_commits() {
+    let Some((cluster, url)) = cluster() else {
+        return;
+    };
+    ledger(&cluster, &[1]);
+    match call("m.serialized", &url) {
+        Ok(text) => assert_eq!(text, "40001 then committed"),
+        Err(why) => panic!("the serialization failure was not retried: {why}"),
+    }
+    assert_eq!(
+        cluster.psql("ply", "select n from ledger where id = 1"),
+        "11",
+        "the other transaction's write and the retried one's are not both there"
+    );
+}
+
+#[test]
+fn a_deadlock_is_40p01_and_the_transaction_left_standing_commits() {
+    let Some((cluster, url)) = cluster() else {
+        return;
+    };
+    ledger(&cluster, &[1, 2]);
+    let text = call("m.deadlocked", &url).unwrap_or_else(|why| panic!("{why}"));
+    let mut ends: Vec<&str> = text.split(' ').collect();
+    ends.sort_unstable();
+    assert_eq!(ends, ["40P01", "committed"], "{text}");
+    assert_eq!(
+        cluster.psql("ply", "select sum(n) from ledger"),
+        "2",
+        "the survivor's two writes are not all that landed"
+    );
 }

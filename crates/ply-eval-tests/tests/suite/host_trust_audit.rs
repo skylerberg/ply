@@ -4,7 +4,8 @@ use ply_eval::host::{
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{
-    Diagnostic, EffectAtom, Footprint, Machine, Mode, Resource, Symbol, TaskId, Value, codes,
+    Diagnostic, EffectAtom, Footprint, Machine, Mode, Resource, Symbol, TaskHandle, TaskId, Value,
+    codes,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -248,11 +249,23 @@ fn a_blocking_handler_is_still_entered_on_the_machines_thread() {
     }
 
     /// Resolves whatever it is handed, as an already-finished dispatched job would.
-    struct Resolves;
+    #[derive(Default)]
+    struct Resolves {
+        watched: std::cell::RefCell<Vec<u64>>,
+    }
 
     impl HostRuntime for Resolves {
-        fn poll(&self, _: &ply_eval::host::Pending) -> Result<Option<Value>, Diagnostic> {
-            Ok(Some(Value::Int(1)))
+        fn watch(&self, pending: &ply_eval::host::Pending) -> Result<(), Diagnostic> {
+            self.watched.borrow_mut().push(pending.token);
+            Ok(())
+        }
+
+        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+            self.watched
+                .take()
+                .into_iter()
+                .map(|token| (token, Ok(Value::Int(1))))
+                .collect()
         }
 
         fn park(&self) -> Result<(), Diagnostic> {
@@ -278,7 +291,7 @@ test/nondet "blocking, honestly" { assert_eq(net.send[socket](1), 1) }
     declared.blocking = true;
     let handler = Arc::new(Reports(AtomicU64::new(0)));
     let mut machine = compiled.bound(vec![(declared, handler.clone())]);
-    machine.set_host_runtime(std::rc::Rc::new(Resolves));
+    machine.set_host_runtime(std::rc::Rc::new(Resolves::default()));
     machine.eval_test(0).expect("green");
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -327,7 +340,9 @@ fn a_fabricated_task_handle_from_a_host_answer_is_refused() {
 
     impl HostHandler for Fake {
         fn call(&self, _: &dyn HostRuntime, _: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-            Ok(HostAnswer::Value(Value::Task(TaskId(9999))))
+            Ok(HostAnswer::Value(Value::Task(TaskHandle::unowned(TaskId(
+                9999,
+            )))))
         }
     }
 
@@ -700,8 +715,12 @@ fn a_token_nothing_resolves_is_diagnosed_inside_a_production_region() {
     struct NeverResolves;
 
     impl HostRuntime for NeverResolves {
-        fn poll(&self, _: &ply_eval::host::Pending) -> Result<Option<Value>, Diagnostic> {
-            Ok(None)
+        fn watch(&self, _: &ply_eval::host::Pending) -> Result<(), Diagnostic> {
+            Ok(())
+        }
+
+        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+            Vec::new()
         }
 
         fn park(&self) -> Result<(), Diagnostic> {
@@ -747,5 +766,9 @@ test/nondet "waits on a token nothing resolves" {
         codes::INTERNAL_ERROR,
         "a run that cannot progress must say so: {}",
         d.message
+    );
+    assert!(
+        d.message.contains("returned from `park`"),
+        "the scheduler must be what refused, not the seam: {d:?}"
     );
 }

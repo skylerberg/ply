@@ -2,6 +2,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use crate::fixture::Compiled;
+use ply_eval::arena::Owner;
 use ply_eval::escape::Boundary;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -13,8 +14,10 @@ use std::sync::Arc;
 /// A cell over a still-open region's slot, so what is under test is the boundary and not staleness.
 fn live_cell() -> (Arena, Value) {
     let mut arena = Arena::new();
-    arena.open(RegionKind::Shared, Span::DUMMY);
-    let slot = arena.alloc(Value::Int(41)).expect("the region is open");
+    arena.open(Owner::ENTRY, RegionKind::Shared);
+    let slot = arena
+        .alloc(Owner::ENTRY, Value::Int(41))
+        .expect("the region is open");
     (arena, Value::Cell(slot))
 }
 
@@ -67,11 +70,11 @@ test "the parked continuation still reads its region's cell" {
 }
 "#;
 
-/// A constant whose value is a slot in *this run's* arena.
+/// A constant whose body reads a cell of the region it opens.
 const CONSTANT_OVER_A_CELL: &str = r#"
 fn boxed() -> Int = with_cell[log](41) { c -> cell_get(c) }
 
-test "the constant reads this run's cell" {
+test "the constant answers what its cell held" {
   assert_eq(boxed(), 41)
 }
 "#;
@@ -108,6 +111,21 @@ fn boxed() -> Boxed = with_cell[log](41) { c -> Wrap(|| cell_get(c)) }
     );
 }
 
+/// The body reads a cell of the region enclosing its `handle`, and is resumed only once that region
+/// has closed: the region's cell outlives its close for as long as the body can run.
+#[test]
+fn the_parked_continuation_runs_on_the_tier_and_reads_its_regions_cell() {
+    let compiled = Compiled::new(PARKED);
+    let (mut machine, tier) = compiled.machine_and_tier();
+    let test = compiled.index_of("the parked continuation still reads its region's cell");
+
+    machine
+        .eval_test(test)
+        .expect("the resumed body reads 41 from the closed region's cell");
+
+    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+}
+
 #[test]
 fn a_cell_from_another_arena_is_refused_at_the_entry_point() {
     let compiled = Compiled::new(PARKED);
@@ -140,7 +158,7 @@ fn an_entry_point_reset_leaves_an_earlier_runs_slot_resolvable() {
     let mut regions = TaskRegions::new();
     let slot = regions
         .arena_mut()
-        .alloc(Value::Int(1))
+        .alloc(Owner::ENTRY, Value::Int(1))
         .expect("the root region is open");
     regions.seal();
 
@@ -187,6 +205,14 @@ fn a_handler_may_not_answer_with_the_boundarys_own_code() {
         d.code,
         codes::RUNTIME_ERROR,
         "the classification is taken back from the handler"
+    );
+    assert_eq!(d.message, "a handler claiming the machine's own verdict");
+    assert!(
+        d.notes
+            .iter()
+            .any(|n| n.contains(codes::REGION_ESCAPE_AT_BOUNDARY)),
+        "the code the handler claimed is not reported: {:?}",
+        d.notes
     );
 }
 
@@ -238,28 +264,32 @@ fn a_handle_in_a_trace_field_is_the_host_boundary_and_nothing_further() {
     assert!(!rendered.contains("41"), "the slot's contents are not read");
 }
 
-/// `boxed` is nullary with an empty row, so the memo's rule makes it a constant.
+/// `boxed` is nullary with an empty row, so it is a constant: the memo keeps what its cell held.
 #[test]
-fn a_constant_whose_value_reaches_a_region_is_not_remembered_across_runs() {
+fn a_constant_whose_body_opens_a_region_answers_every_run() {
     let compiled = Compiled::new(CONSTANT_OVER_A_CELL);
     let mut machine = compiled.machine();
 
     for run in 0..3 {
         machine
             .eval_test(0)
-            .unwrap_or_else(|d| panic!("run {run} must read this run's own cell: {d:#?}"));
+            .unwrap_or_else(|d| panic!("run {run} must answer what the cell held: {d:#?}"));
     }
 }
 
 #[test]
 fn a_stale_slot_reports_rather_than_reading_what_replaced_it() {
     let mut arena = Arena::new();
-    let first = arena.open(RegionKind::Unique, Span::DUMMY);
-    let stale = arena.alloc(Value::Int(41)).expect("inside a region");
+    let first = arena.open(Owner::ENTRY, RegionKind::Unique);
+    let stale = arena
+        .alloc(Owner::ENTRY, Value::Int(41))
+        .expect("inside a region");
     arena.close(first);
 
-    let second = arena.open(RegionKind::Unique, Span::DUMMY);
-    let fresh = arena.alloc(Value::Int(99)).expect("inside a region");
+    let second = arena.open(Owner::ENTRY, RegionKind::Unique);
+    let fresh = arena
+        .alloc(Owner::ENTRY, Value::Int(99))
+        .expect("inside a region");
 
     assert_eq!(
         stale.index(),

@@ -3,9 +3,10 @@ use ply_eval::{
     Value,
 };
 use ply_prove::property::{
-    EDGE_CASES, EDGE_INTS, GenStream, Judge, Ungeneratable, draw_cases, generatable, generate,
+    EDGE_CASES, EDGE_INTS, GenStream, Judge, Outcome, Ungeneratable, generatable, generate,
     run_property,
 };
+use ply_prove::shrink::Target;
 use ply_prove::world::{Decl, World};
 use ply_prove::{
     Binder, DEFAULT_SHRINK_BUDGET, Discharge, Evidence, GEN_DEPTH, Gap, MIN_PROPERTY_CASES,
@@ -47,8 +48,39 @@ pub(crate) fn key(byte: u8) -> DefHash {
     DefHash([byte; 32])
 }
 
-pub(crate) fn binder(name: &str, sort: Sort) -> Binder {
-    Binder::new(name, sort)
+/// `text` is the type as the compiler prints it, which is what a report names it by.
+fn binder(name: &str, sort: Sort, text: &str) -> Binder {
+    Binder {
+        name: Symbol::new(name),
+        sort,
+        text: text.to_string(),
+    }
+}
+
+fn tier(discharge: &Discharge) -> Option<Tier> {
+    match discharge {
+        Discharge::Held(evidence) => Some(evidence.tier()),
+        _ => None,
+    }
+}
+
+/// Every binder drawn at every case of one root, as one run of the property search draws them.
+fn cases_of(
+    binders: &[Binder],
+    world: &World,
+    key: DefHash,
+    root: u64,
+    cases: u32,
+) -> Vec<Vec<Value>> {
+    let mut stream = GenStream::new(root, key);
+    (0..cases)
+        .map(|case| {
+            binders
+                .iter()
+                .map(|b| generate(&b.sort, world, &mut stream, case).expect("must generate"))
+                .collect()
+        })
+        .collect()
 }
 
 fn con(name: &str) -> Sort {
@@ -194,7 +226,7 @@ fn every_ply_type_generates() {
     ];
     for (sort, shaped) in cases {
         for value in draw(&sort, &world, 40) {
-            assert!(shaped(&value), "{sort} generated {}", value.render());
+            assert!(shaped(&value), "{sort:?} generated {}", value.render());
         }
     }
 }
@@ -271,11 +303,11 @@ fn a_recursive_type_terminates_and_stays_within_the_depth_bound() {
         }
         assert!(
             deepest > 1,
-            "{ty} never nested, so the depth bound is untested"
+            "{ty:?} never nested, so the depth bound is untested"
         );
         assert!(
             deepest <= GEN_DEPTH as usize + 2,
-            "{ty} nested {deepest} deep, past the bound"
+            "{ty:?} nested {deepest} deep, past the bound"
         );
     }
 }
@@ -325,12 +357,12 @@ fn the_types_a_binder_may_not_have_are_named() {
 fn a_root_replays_exactly() {
     let world = adts();
     let binders = vec![
-        binder("n", Sort::int()),
-        binder("xs", Sort::list(Sort::string())),
-        binder("t", con("Tree")),
+        binder("n", Sort::int(), "Int"),
+        binder("xs", Sort::list(Sort::string()), "List<String>"),
+        binder("t", con("Tree"), "Tree"),
     ];
-    let once = draw_cases(&binders, &world, key(9), 41, 50).expect("must generate");
-    let again = draw_cases(&binders, &world, key(9), 41, 50).expect("must generate");
+    let once = cases_of(&binders, &world, key(9), 41, 50);
+    let again = cases_of(&binders, &world, key(9), 41, 50);
     assert_eq!(rendered(&once), rendered(&again));
     assert!(!rendered(&once).is_empty());
 }
@@ -338,9 +370,9 @@ fn a_root_replays_exactly() {
 #[test]
 fn another_root_draws_another_run() {
     let world = World::default();
-    let binders = vec![binder("n", Sort::int())];
-    let a = draw_cases(&binders, &world, key(9), 41, 60).expect("must generate");
-    let b = draw_cases(&binders, &world, key(9), 42, 60).expect("must generate");
+    let binders = vec![binder("n", Sort::int(), "Int")];
+    let a = cases_of(&binders, &world, key(9), 41, 60);
+    let b = cases_of(&binders, &world, key(9), 42, 60);
     assert_ne!(rendered(&a), rendered(&b));
 }
 
@@ -348,27 +380,22 @@ fn another_root_draws_another_run() {
 #[test]
 fn the_obligation_keys_the_stream() {
     let world = World::default();
-    let binders = vec![binder("n", Sort::int())];
-    let a = draw_cases(&binders, &world, key(1), 0, 60).expect("must generate");
-    let b = draw_cases(&binders, &world, key(2), 0, 60).expect("must generate");
+    let binders = vec![binder("n", Sort::int(), "Int")];
+    let a = cases_of(&binders, &world, key(1), 0, 60);
+    let b = cases_of(&binders, &world, key(2), 0, 60);
     assert_ne!(rendered(&a), rendered(&b));
 }
 
+/// Two streams over one root and one obligation draw alike, and moving either moves the draws.
 #[test]
 fn a_draw_is_a_function_of_root_key_and_counter_only() {
-    let mut stream = GenStream::new(7, key(3));
-    for counter in 0..16 {
-        assert_eq!(stream.next_u64(), GenStream::draw(7, &key(3), counter));
-    }
-    assert_eq!(stream.drawn(), 16);
-    assert_ne!(
-        GenStream::draw(7, &key(3), 0),
-        GenStream::draw(8, &key(3), 0)
-    );
-    assert_ne!(
-        GenStream::draw(7, &key(3), 0),
-        GenStream::draw(7, &key(4), 0)
-    );
+    let drawn = |root: u64, obligation: u8| {
+        let mut stream = GenStream::new(root, key(obligation));
+        (0..16).map(|_| stream.next_u64()).collect::<Vec<_>>()
+    };
+    assert_eq!(drawn(7, 3), drawn(7, 3));
+    assert_ne!(drawn(7, 3)[0], drawn(8, 3)[0]);
+    assert_ne!(drawn(7, 3)[0], drawn(7, 4)[0]);
 }
 
 pub(crate) fn rendered(cases: &[Vec<Value>]) -> Vec<Vec<String>> {
@@ -447,10 +474,27 @@ where
     G: FnMut(&[Value]) -> Result<bool, Diagnostic>,
     B: FnMut(&[Value]) -> Result<bool, Diagnostic>,
 {
+    named(binders, &[], world, cases, guard, body)
+}
+
+/// A run over binders whose type variables `variables` names by number.
+fn named<G, B>(
+    binders: &[Binder],
+    variables: &[Symbol],
+    world: &World,
+    cases: u32,
+    guard: G,
+    body: B,
+) -> Discharge
+where
+    G: FnMut(&[Value]) -> Result<bool, Diagnostic>,
+    B: FnMut(&[Value]) -> Result<bool, Diagnostic>,
+{
     let mut judge = Fn2::new(guard, body);
     run_property(
         key(5),
         binders,
+        variables,
         world,
         &plan(cases),
         Span::DUMMY,
@@ -461,9 +505,9 @@ where
 #[test]
 fn a_guard_that_admits_nothing_is_reported_rather_than_passed() {
     let world = World::default();
-    let binders = vec![binder("n", Sort::int())];
+    let binders = vec![binder("n", Sort::int(), "Int")];
     let discharge = run(&binders, &world, 200, |_| Ok(false), |_| Ok(true));
-    assert_eq!(discharge.tier(), None, "a vacuity has no tier to report");
+    assert_eq!(tier(&discharge), None, "a vacuity has no tier to report");
     match discharge {
         Discharge::Vacuous(v) => {
             assert_eq!(v.kind, VacuityKind::NoCaseKept { generated: 200 });
@@ -475,7 +519,7 @@ fn a_guard_that_admits_nothing_is_reported_rather_than_passed() {
 #[test]
 fn a_tight_guard_reports_example_and_a_loose_one_property() {
     let world = World::default();
-    let binders = vec![binder("n", Sort::int())];
+    let binders = vec![binder("n", Sort::int(), "Int")];
 
     let tight = run(
         &binders,
@@ -492,7 +536,7 @@ fn a_tight_guard_reports_example_and_a_loose_one_property() {
         "{report:?}"
     );
     assert_eq!(report.rejected, report.generated - report.kept);
-    assert_eq!(tight.tier(), Some(Tier::Example));
+    assert_eq!(tier(&tight), Some(Tier::Example));
 
     let loose = run(&binders, &world, 200, |_| Ok(true), |_| Ok(true));
     let Discharge::Held(Evidence::Cases(report)) = &loose else {
@@ -500,15 +544,23 @@ fn a_tight_guard_reports_example_and_a_loose_one_property() {
     };
     assert_eq!(report.kept, 200);
     assert_eq!(report.rejected, 0);
-    assert_eq!(loose.tier(), Some(Tier::Property));
+    assert_eq!(tier(&loose), Some(Tier::Property));
 }
 
 #[test]
 fn the_guard_decides_before_the_body_is_ever_evaluated() {
     let world = World::default();
-    let binders = vec![binder("n", Sort::int())];
+    let binders = vec![binder("n", Sort::int(), "Int")];
     let mut judge = Fn2::new(|v: &[Value]| Ok(ints(v)[0] > 0), |_: &[Value]| Ok(true));
-    run_property(key(5), &binders, &world, &plan(50), Span::DUMMY, &mut judge);
+    run_property(
+        key(5),
+        &binders,
+        &[],
+        &world,
+        &plan(50),
+        Span::DUMMY,
+        &mut judge,
+    );
     for pair in judge.asked.windows(2) {
         if pair[1].0 == "body" {
             assert_eq!(pair[0].0, "guard");
@@ -530,7 +582,7 @@ fn rendered_one(values: &[Value]) -> Vec<String> {
 #[test]
 fn a_refutation_names_its_root_its_case_and_what_it_started_from() {
     let world = World::default();
-    let binders = vec![binder("n", Sort::int())];
+    let binders = vec![binder("n", Sort::int(), "Int")];
     let discharge = run(
         &binders,
         &world,
@@ -574,7 +626,7 @@ fn a_binder_the_generator_cannot_inhabit_is_a_gap_rather_than_a_verdict() {
 #[test]
 fn a_raising_case_is_a_gap_with_a_shrunk_input() {
     let world = World::default();
-    let binders = vec![binder("n", Sort::int())];
+    let binders = vec![binder("n", Sort::int(), "Int")];
     let boom = |v: &[Value]| {
         if ints(v)[0].unsigned_abs() > 100 {
             Err(Diagnostic::error(
@@ -606,19 +658,61 @@ fn a_raising_case_is_a_gap_with_a_shrunk_input() {
     }
 }
 
+/// Ply failing on the guard or the body is its own failure, neither a gap nor a verdict.
+#[test]
+fn a_case_ply_fails_on_is_its_failure_and_never_the_programs_gap() {
+    let world = World::default();
+    let binders = vec![binder("n", Sort::int(), "Int")];
+    let declined = |_: &[Value]| -> Result<bool, Diagnostic> {
+        Err(Diagnostic::error(
+            ply_eval::codes::INTERNAL_ERROR,
+            "the compiled tier declined to enter `m.law`",
+        ))
+    };
+    for discharge in [
+        run(&binders, &world, 200, declined, |_| Ok(true)),
+        run(&binders, &world, 200, |_| Ok(true), declined),
+    ] {
+        match discharge {
+            Discharge::Faulted(fault) => {
+                assert_eq!(fault.diagnostic.code, ply_eval::codes::INTERNAL_ERROR);
+                assert_eq!(fault.bindings.len(), 1, "the point it failed at: {fault:?}");
+            }
+            other => panic!("Ply's failure was reported as {other:?}"),
+        }
+    }
+}
+
+/// A walk keeps a candidate that still raises or refutes, and Ply failing on it does neither.
+#[test]
+fn a_candidate_ply_fails_on_matches_no_walk() {
+    let failed = Outcome::stopped(Diagnostic::error(
+        ply_eval::codes::INTERNAL_ERROR,
+        "declined",
+    ));
+    assert!(matches!(failed, Outcome::Faulted(_)), "{failed:?}");
+    assert!(!failed.matches(Target::Raises) && !failed.matches(Target::Falsifies));
+    let raised = Outcome::stopped(Diagnostic::error(
+        ply_eval::codes::RUNTIME_ERROR,
+        "division by zero",
+    ));
+    assert!(raised.matches(Target::Raises), "{raised:?}");
+}
+
 #[test]
 fn a_polymorphic_binder_is_monomorphised_and_recorded() {
     let world = World::default();
     let binders = vec![
-        binder("x", Sort::Var(0)),
-        binder("xs", Sort::list(Sort::Var(0))),
-        binder("y", Sort::Var(1)),
+        binder("x", Sort::Var(0), "a"),
+        binder("xs", Sort::list(Sort::Var(0)), "List<a>"),
+        binder("y", Sort::Var(1), "b"),
     ];
-    let discharge = run(&binders, &world, 40, |_| Ok(true), |_| Ok(true));
+    let variables = [Symbol::new("a"), Symbol::new("b")];
+    let discharge = named(&binders, &variables, &world, 40, |_| Ok(true), |_| Ok(true));
     let Discharge::Held(Evidence::Cases(report)) = discharge else {
         panic!("expected a hold");
     };
-    // Each variable once, under the letter its binders print it with.
+    // Each variable once, in the order the binders meet them, under the name the claim gives it.
     assert_eq!(
         report.instantiations,
         vec![
@@ -632,8 +726,8 @@ fn a_polymorphic_binder_is_monomorphised_and_recorded() {
 fn two_runs_over_one_refutation_agree_byte_for_byte() {
     let world = adts();
     let binders = vec![
-        binder("xs", Sort::list(Sort::int())),
-        binder("t", con("Tree")),
+        binder("xs", Sort::list(Sort::int()), "List<Int>"),
+        binder("t", con("Tree"), "Tree"),
     ];
     let falsify = |v: &[Value]| {
         let Value::List(items) = &v[0] else {
@@ -661,14 +755,22 @@ fn two_runs_over_one_refutation_agree_byte_for_byte() {
 #[test]
 fn every_root_in_the_plan_is_drawn_and_reported() {
     let world = World::default();
-    let binders = vec![binder("n", Sort::int())];
+    let binders = vec![binder("n", Sort::int(), "Int")];
     let mut judge = Fn2::new(|_: &[Value]| Ok(true), |_: &[Value]| Ok(true));
     let plan = ProvePlan {
         cases: 30,
         roots: vec![3, 1, 1],
         ..plan(30)
     };
-    let discharge = run_property(key(5), &binders, &world, &plan, Span::DUMMY, &mut judge);
+    let discharge = run_property(
+        key(5),
+        &binders,
+        &[],
+        &world,
+        &plan,
+        Span::DUMMY,
+        &mut judge,
+    );
     let Discharge::Held(Evidence::Cases(report)) = discharge else {
         panic!("expected a hold");
     };

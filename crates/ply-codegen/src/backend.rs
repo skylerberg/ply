@@ -13,12 +13,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The widest arity this boundary carries without allocating an argument array.
 const MAX_ARITY: usize = 16;
 
-/// One admitted definition: where its code is, and how many arguments it takes.
+/// One admitted definition: where its code is, how many arguments it takes, and what may answer
+/// an entry instead of running it.
 struct Admitted {
     entry: Entry,
     arity: usize,
-    /// The memo index of a pure nullary root.
-    constant: Option<usize>,
+    memo: Memo,
+}
+
+/// Decided once, from the purity the compiler published: an impure root has no memo to consult.
+#[derive(Clone, Copy)]
+enum Memo {
+    Never,
+    /// A pure root of no arguments, and its memo slot.
+    Constant(usize),
+    /// A pure root, whose entries over memo words alone are remembered.
+    Calls,
 }
 
 /// Why an offered call was not taken.
@@ -282,15 +292,16 @@ impl Bodies {
             if unit.source.mentions_width(name.as_str()) {
                 continue;
             }
-            let constant = code.constant_index(name.as_str());
-            admitted.insert(
-                name.clone(),
-                Admitted {
-                    entry,
-                    arity,
-                    constant,
-                },
-            );
+            // An embedded unit's slots were chosen when it was built; this program's purity decides.
+            let memo = match (
+                unit.source.pure(name.as_str()),
+                code.constant_index(name.as_str()),
+            ) {
+                (false, _) => Memo::Never,
+                (true, Some(slot)) => Memo::Constant(slot),
+                (true, None) => Memo::Calls,
+            };
+            admitted.insert(name.clone(), Admitted { entry, arity, memo });
         }
         let ctx = RefCell::new(code.context());
         Ok(Bodies {
@@ -352,7 +363,7 @@ impl Bodies {
         };
 
         let tables = Rc::clone(&ctx.tables);
-        if let Some(index) = admitted.constant
+        if let Memo::Constant(index) = admitted.memo
             && let Some(kept) = tables.memoized(index)
             && let Some(value) = tables.memo_value(kept)
         {
@@ -366,7 +377,7 @@ impl Bodies {
         let mut handles = [0i64; MAX_ARITY];
         let before = ctx.heap.allocated();
         // A call whose arguments are all memoized words is itself memoized.
-        let mut all_memo = !args.is_empty();
+        let mut all_memo = matches!(admitted.memo, Memo::Calls) && !args.is_empty();
         for (slot, value) in handles.iter_mut().zip(args) {
             *slot = match tables.memo_word(value) {
                 Some(w) => w,
@@ -426,6 +437,7 @@ impl Bodies {
                 None => Run::Declined,
             };
         }
+        crate::detached::release_all(&mut ctx);
         if !ctx.cells_balanced() {
             ctx.end();
             drop(ctx);
@@ -434,9 +446,11 @@ impl Bodies {
         // Memoize the word and its converted value, so later entries skip both run and conversion.
         let mut walked = crate::heap::Walked::default();
         let value = crate::heap::Heap::to_value_counted(&tables.layouts, out, &mut walked);
-        let kept = match admitted.constant {
-            Some(index) if crate::heap::world_independent(out) => Some(tables.memoize(index, out)),
-            None if all_memo && crate::heap::world_independent(out) => {
+        let kept = match admitted.memo {
+            Memo::Constant(index) if crate::heap::world_independent(out) => {
+                Some(tables.memoize(index, out))
+            }
+            Memo::Calls if all_memo && crate::heap::world_independent(out) => {
                 tables.memoize_call(name, words, out)
             }
             _ => None,

@@ -2,7 +2,6 @@
 
 use ply_eval::Symbol;
 use ply_eval::decode::{At, Error};
-use std::fmt;
 
 /// A type as the prover reads one. A variable is numbered by where it first appears in the item it
 /// belongs to, so one law's `Var(0)` and one signature's are unrelated.
@@ -18,21 +17,6 @@ pub enum Sort {
     },
     /// Ascending by field name, each name once.
     Record(Vec<(Symbol, Sort)>),
-}
-
-/// As `tycore.ty_letter` names the variables a printer meets, so a sort reads as its binders do.
-const VAR_LETTERS: &[u8] = b"abcdghijklmnopqrsuvwxyz";
-
-/// The name the `index`th variable of an item is printed under: `a`, `b`, …, then a round (`a1`).
-pub fn var_name(index: u32) -> String {
-    let n = VAR_LETTERS.len();
-    let i = index as usize;
-    let letter = char::from(VAR_LETTERS[i % n]);
-    if i < n {
-        letter.to_string()
-    } else {
-        format!("{letter}{}", i / n)
-    }
 }
 
 impl Sort {
@@ -185,50 +169,4 @@ impl Sort {
             }
         })
     }
-}
-
-impl fmt::Display for Sort {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Sort::Var(v) => f.write_str(&var_name(*v)),
-            Sort::Con(name, args) if args.is_empty() => write!(f, "{name}"),
-            Sort::Con(name, args) => write!(f, "{name}<{}>", joined(args)),
-            Sort::Fn { params, ret, pure } => {
-                write!(f, "({}) -> {ret}", joined(params))?;
-                if !pure {
-                    f.write_str(" / {..}")?;
-                }
-                Ok(())
-            }
-            Sort::Record(fields) => {
-                let tuple = (0..fields.len()).all(|i| {
-                    fields
-                        .iter()
-                        .any(|(n, _)| n.as_str() == format!("_{i}").as_str())
-                });
-                if tuple && !fields.is_empty() {
-                    let items: Vec<String> = (0..fields.len())
-                        .filter_map(|i| {
-                            let name = Symbol::new(format!("_{i}"));
-                            fields
-                                .iter()
-                                .find(|(n, _)| *n == name)
-                                .map(|(_, s)| s.to_string())
-                        })
-                        .collect();
-                    return write!(f, "({})", items.join(", "));
-                }
-                let items: Vec<String> = fields.iter().map(|(n, s)| format!("{n}: {s}")).collect();
-                write!(f, "{{{}}}", items.join(", "))
-            }
-        }
-    }
-}
-
-fn joined(sorts: &[Sort]) -> String {
-    sorts
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
 }

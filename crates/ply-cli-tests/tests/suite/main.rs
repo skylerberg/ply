@@ -2,10 +2,11 @@
 //! its own.
 //!
 //! What belongs here: a test of `ply` as shipped — the binary as a process, the artifact and the
-//! module sources `ply build` commits and the launcher lays out, and the standard library and the
-//! examples as `ply` presents them. A test whose subject is a workspace library's own API belongs
-//! to that library's `-tests` package, which is where `ply-machine-tests` keeps the machine's
-//! modules, the prover's soundness audit and the two front-end conformance suites.
+//! module sources `ply build` commits and the launcher lays out, the standard library and the
+//! examples as `ply` presents them, and the prover's audits, read from the report it writes. A test
+//! whose subject is a workspace library's own API belongs to that library's `-tests` package, which
+//! is where `ply-machine-tests` keeps the machine's modules and the two front-end conformance
+//! suites.
 //!
 //! Every command a test runs here comes from [`harness`], which is also the only place the `ply`
 //! binary is named, so no test can quietly inherit the machine's environment or forget a flag.
@@ -46,10 +47,13 @@ mod numerics;
 mod packages;
 mod process_cli;
 mod prove;
+mod prover_soundness_audit;
+mod prover_tier_audit;
 mod refcount_counters;
 mod registry;
 mod regressions;
 mod replace;
+mod reuse;
 mod routing_audit;
 mod shutdown;
 mod stdlib;

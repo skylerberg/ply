@@ -8,10 +8,10 @@
 mod claims;
 mod fixture;
 mod prover_runs;
-mod prover_soundness_audit;
 mod replay;
+mod reused;
 mod selector_reads;
-mod tiers;
+mod strategy;
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{Front, Machine, Provider, SourceId, Span, Value};
@@ -23,7 +23,8 @@ use std::sync::Arc;
 const OUTER: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -43,6 +44,7 @@ type At = { module: Int, start: Int, end: Int }
 type Main = { name: String, module: String, path: String, at: At }
 type Module = { name: String, path: String, at: At }
 type Place = { path: String, text: Bytes }
+type Walked = { key: String, modules: List<Place>, manifests: List<Place> }
 type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
 type Fix = { title: Bytes, edits: List<Edit> }
 type Edit = { module: Int, start: Int, end: Int, text: Bytes }
@@ -130,7 +132,7 @@ type Ended = {
 }
 
 fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
-  match machine.load[m](root, Some(front)) {
+  match machine.load[m](root, Some(front), None) {
     Ok(_t) -> {
       match machine.bound[m]("inner.main") {
         Ok(_b) -> {
@@ -178,8 +180,8 @@ fn entered_with(inner: &str, host: bool) -> Value {
     let texts: HashMap<String, String> =
         [("m".to_string(), OUTER.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     ply_machine::register_with(
         &mut registry,
@@ -274,10 +276,21 @@ fn main() -> Int = panic("the inner program's own bug")
     // A raise is a diagnostic value; the outer program does not read inside it.
     assert!(option_int(field(&answer, "exit")).is_none());
     assert_eq!(option_text(field(&answer, "value")), None);
-    let raised = field(&answer, "raised");
+    let raised = match field(&answer, "raised") {
+        Value::Ctor { name, args } if name.as_str() == "Some" => &args[0],
+        other => panic!("the raise is reported, not unwound: {other:?}"),
+    };
+    let text = |name: &str| {
+        let bytes = field(raised, name)
+            .as_bytes(Span::DUMMY, name)
+            .expect("a diagnostic's fields are bytes");
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    assert_eq!(text("code"), ply_eval::codes::RUNTIME_ERROR);
     assert!(
-        matches!(raised, Value::Ctor { name, .. } if name.as_str() == "Some"),
-        "the raise is reported, not unwound"
+        text("message").contains("the inner program's own bug"),
+        "the inner program's panic is what was raised: {}",
+        text("message")
     );
 }
 
@@ -288,8 +301,8 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
     let texts: HashMap<String, String> =
         [("m".to_string(), OUTER.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     ply_machine::register(&mut registry);
     let binding = registry.bind(&front.check).expect("the machine ops bind");
@@ -313,7 +326,8 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
 const OUTER_TWICE: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -333,6 +347,7 @@ type At = { module: Int, start: Int, end: Int }
 type Main = { name: String, module: String, path: String, at: At }
 type Module = { name: String, path: String, at: At }
 type Place = { path: String, text: Bytes }
+type Walked = { key: String, modules: List<Place>, manifests: List<Place> }
 type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
 type Diag = {
   code: Bytes,
@@ -392,7 +407,7 @@ fn once() -> Option<String> / {machine.bound[m], machine.enter[m]} = {
 }
 
 fn main(root: String, front: Front) -> Option<String> / {machine.load[m], machine.bound[m], machine.enter[m]} = {
-  let _loaded = machine.load[m](root, Some(front));
+  let _loaded = machine.load[m](root, Some(front), None);
   once()
 }
 
@@ -421,8 +436,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     let binding = Arc::new(registry.bind(&front.check).expect("the machine ops bind"));
 
     let call = |entry: &str, args: Vec<Value>| {
-        let mut machine = Machine::new(&front);
-        machine.set_compiled(unit.attach());
+        let mut machine =
+            Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
         machine.set_host_binding(Arc::clone(&binding));
         machine
             .call(entry, args, Span::DUMMY)
@@ -456,7 +471,8 @@ fn a_configured_machine_binds_what_the_options_say() {
     let outer = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -510,6 +526,7 @@ type At = { module: Int, start: Int, end: Int }
 type Main = { name: String, module: String, path: String, at: At }
 type Module = { name: String, path: String, at: At }
 type Place = { path: String, text: Bytes }
+type Walked = { key: String, modules: List<Place>, manifests: List<Place> }
 type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
 type Diag = {
   code: Bytes,
@@ -592,7 +609,7 @@ fn opts(host: Bool) -> Options =
 
 fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
   machine.configure[m](opts(true));
-  match machine.load[m](root, Some(front)) {
+  match machine.load[m](root, Some(front), None) {
     Err(_) -> false,
     Ok(_t) -> {
       let bound = machine.bound[m]("inner.main");
@@ -616,8 +633,8 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
     let texts: HashMap<String, String> =
         [("m".to_string(), outer.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     ply_machine::register(&mut registry);
     let binding = registry.bind(&front.check).expect("the machine ops bind");
@@ -643,7 +660,8 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
 const OUTER_CALL: &str = r#"
 nondet effect machine {
   write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
@@ -656,6 +674,7 @@ type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Options = Unit
 type Target = Unit
+type Walked = Unit
 type Bound = Unit
 type Front = {
   dump: Bytes,
@@ -672,7 +691,7 @@ type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value
 type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
 fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  match machine.load[m](root, Some(front)) {
+  match machine.load[m](root, Some(front), None) {
     Ok(_) -> match machine.bound[m]("inner.main") {
       Ok(_) -> {
         let doubled = machine.call[m]("inner.double", [VInt(21)]);
@@ -717,8 +736,8 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
         .into_iter()
         .collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach());
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     ply_machine::register_with_for(
         &mut registry,

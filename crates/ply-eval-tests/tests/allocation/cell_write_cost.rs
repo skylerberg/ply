@@ -1,5 +1,5 @@
 use crate::counting::charge;
-use ply_eval::arena::Slot;
+use ply_eval::arena::{Owner, Slot};
 use ply_eval::{Fixture, TaskRegions, Value};
 use rpds::RedBlackTreeMap;
 
@@ -125,7 +125,7 @@ fn resetting_to_the_fixture_returns_every_slot_and_allocates_nothing() {
     assert_eq!((allocs, bytes), (0, 0));
     assert_eq!(regions.live(), 0);
     assert_eq!(
-        regions.depth(),
+        regions.depth(Owner::ENTRY),
         2,
         "the fixture's region and a fresh entry region"
     );

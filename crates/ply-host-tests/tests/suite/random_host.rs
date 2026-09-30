@@ -4,7 +4,7 @@
 //! needs a value a server cannot predict — a SASL nonce, a key — reads this instead, and the host
 //! is what draws it.
 
-use ply_eval::{Machine, Span, Value};
+use ply_eval::{Machine, Span, Symbol, Value};
 use std::sync::Arc;
 
 const PROGRAM: &str = r#"
@@ -40,20 +40,16 @@ fn call(entry: &str) -> Result<Value, ply_eval::Diagnostic> {
         .bind(&front.check)
         .expect("the declaration and the registration agree");
 
-    let mut machine = Machine::new(&front);
-    machine.set_compiled(ply_eval::Provider::attach(unit));
+    let mut machine = Machine::new(&front, ply_eval::Provider::attach(unit))
+        .expect("the unit was compiled from this program");
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(host.runtime());
-    let simple = entry.rsplit('.').next().expect("an entry has a name");
-    if let Some(declared) = front
+    let declared = front
         .check
         .defs
-        .values()
-        .find(|d| d.simple_name.as_str() == simple)
-        .map(|d| d.footprint.clone())
-    {
-        machine.set_declared_footprint(declared);
-    }
+        .get(&Symbol::new(entry))
+        .expect("the entry is a definition of the program");
+    machine.set_declared_footprint(declared.footprint.clone());
     machine.call(entry, Vec::new(), Span::DUMMY)
 }
 

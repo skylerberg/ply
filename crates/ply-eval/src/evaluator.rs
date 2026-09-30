@@ -8,10 +8,9 @@ use crate::sim::{DEFAULT_STEPS, Seed};
 use crate::trace::Trace;
 use crate::value::Value;
 use crate::{
-    Arena, Diagnostic, EffectAtom, Footprint, Front, ModuleName, Span, Symbol, TaskRegions, codes,
-    region,
+    Arena, DefHash, Diagnostic, EffectAtom, Footprint, Front, ModuleName, Span, Symbol,
+    TaskRegions, codes, region,
 };
-use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -30,10 +29,10 @@ pub struct Machine<'a> {
     binding: Arc<HostBinding>,
     /// What answers a [`crate::host::HostAnswer::Pending`].
     runtime: Option<Rc<dyn HostRuntime>>,
-    compiled: Option<Rc<dyn Compiled>>,
-    compiled_entries: Cell<u64>,
-    compiled_declines: Cell<u64>,
-    compiled_refusals: Cell<u64>,
+    /// The only evaluator: every entry point and test runs here.
+    compiled: Rc<dyn Compiled>,
+    compiled_entries: u64,
+    compiled_declines: u64,
     record: Option<region::Record>,
     host_use: HostUse,
     host_ops: u64,
@@ -43,8 +42,12 @@ pub struct Machine<'a> {
 }
 
 impl<'a> Machine<'a> {
-    pub fn new(front: &'a Front) -> Machine<'a> {
-        Machine {
+    /// Refuses a tier built from another program, whose bodies would answer for that one.
+    pub fn new(front: &'a Front, compiled: Rc<dyn Compiled>) -> Result<Machine<'a>, Diagnostic> {
+        if !compiled.describes(front.hashes_digest) {
+            return Err(err_foreign_tier(front.hashes_digest));
+        }
+        let machine = Machine {
             id: MachineId::next(),
             front,
             regions: TaskRegions::new(),
@@ -54,17 +57,19 @@ impl<'a> Machine<'a> {
             sim_steps: DEFAULT_STEPS,
             binding: Arc::new(HostBinding::hermetic()),
             runtime: None,
-            compiled: None,
-            compiled_entries: Cell::new(0),
-            compiled_declines: Cell::new(0),
-            compiled_refusals: Cell::new(0),
+            compiled,
+            compiled_entries: 0,
+            compiled_declines: 0,
             record: None,
             host_use: HostUse::default(),
             host_ops: 0,
             declared: None,
             re_executed: false,
             teardown: Vec::new(),
-        }
+        };
+        // A tier may be shared by several machines, so it takes this one's hermetic defaults.
+        machine.share_host();
+        Ok(machine)
     }
 
     pub fn with_max_calls(mut self, max: usize) -> Machine<'a> {
@@ -78,11 +83,10 @@ impl<'a> Machine<'a> {
     }
 
     fn share_host(&self) {
-        if let Some(backend) = &self.compiled {
-            backend.set_host(Arc::clone(&self.binding), self.runtime.clone());
-            backend.set_declared(self.declared.clone());
-            backend.set_re_executed(self.re_executed);
-        }
+        self.compiled
+            .set_host(Arc::clone(&self.binding), self.runtime.clone());
+        self.compiled.set_declared(self.declared.clone());
+        self.compiled.set_re_executed(self.re_executed);
     }
 
     pub fn set_host_runtime(&mut self, runtime: Rc<dyn HostRuntime>) {
@@ -138,15 +142,9 @@ impl<'a> Machine<'a> {
         &self.regions
     }
 
-    pub fn set_compiled(&mut self, compiled: Rc<dyn Compiled>) {
-        if compiled.describes(self.front.hashes_digest) {
-            self.compiled = Some(compiled);
-            self.share_host();
-        }
-    }
-
+    /// Entries the tier ran, and entries it declined, over this machine's life.
     pub fn compiled_counts(&self) -> (u64, u64) {
-        (self.compiled_entries.get(), self.compiled_declines.get())
+        (self.compiled_entries, self.compiled_declines)
     }
 
     /// Every subsequent entry point resets to this stack's fixture rather than to an empty one.
@@ -192,30 +190,22 @@ impl<'a> Machine<'a> {
         span: Span,
     ) -> Result<(), Diagnostic> {
         let root = module.qualify(&Symbol::new(format!("test#{ordinal}")));
-        let Some(backend) = self.compiled.clone() else {
-            return Err(err_not_compiled(&root, span));
-        };
-        backend.set_seed(self.seed.clone(), self.sim_steps);
-        let entered = backend.enter_test(&root, self.max_calls);
+        self.compiled.set_seed(self.seed.clone(), self.sim_steps);
+        let entered = self.compiled.enter_test(&root, self.max_calls);
         self.record_compiled_atoms();
-        self.record = backend.simulated();
+        self.record = self.compiled.simulated();
         let out = match entered {
             Entered::Answered(Value::Unit) => {
-                self.compiled_entries.set(self.compiled_entries.get() + 1);
+                self.compiled_entries += 1;
                 Ok(())
             }
-            Entered::Answered(_) => {
-                self.compiled_refusals.set(self.compiled_refusals.get() + 1);
-                self.compiled_declines.set(self.compiled_declines.get() + 1);
+            Entered::Answered(_) | Entered::Declined => {
+                self.compiled_declines += 1;
                 Err(err_not_compiled(&root, span))
             }
             Entered::Raised(raised) => {
-                self.compiled_entries.set(self.compiled_entries.get() + 1);
+                self.compiled_entries += 1;
                 Err(raised)
-            }
-            Entered::Declined => {
-                self.compiled_declines.set(self.compiled_declines.get() + 1);
-                Err(err_not_compiled(&root, span))
             }
         };
         self.end_entry_point();
@@ -240,24 +230,24 @@ impl<'a> Machine<'a> {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Diagnostic> {
-        let Some(backend) = self.compiled.clone() else {
-            return Err(err_not_compiled(sym, span));
-        };
-        backend.set_seed(self.seed.clone(), self.sim_steps);
-        let entered = backend.enter_whole(sym, &args, self.max_calls);
+        self.compiled.set_seed(self.seed.clone(), self.sim_steps);
+        let entered = self.compiled.enter_whole(sym, &args, self.max_calls);
         self.record_compiled_atoms();
-        self.record = backend.simulated();
+        self.record = self.compiled.simulated();
         self.end_entry_point();
         match entered {
             Entered::Answered(value) => {
-                self.compiled_entries.set(self.compiled_entries.get() + 1);
+                self.compiled_entries += 1;
                 Ok(value)
             }
             Entered::Raised(raised) => {
-                self.compiled_entries.set(self.compiled_entries.get() + 1);
+                self.compiled_entries += 1;
                 Err(raised)
             }
-            Entered::Declined => Err(err_not_compiled(sym, span)),
+            Entered::Declined => {
+                self.compiled_declines += 1;
+                Err(err_not_compiled(sym, span))
+            }
         }
     }
 
@@ -269,17 +259,14 @@ impl<'a> Machine<'a> {
     }
 
     fn record_compiled_atoms(&mut self) {
-        let Some(backend) = self.compiled.as_ref() else {
-            return;
-        };
-        for atom in backend.take_performed() {
+        for atom in self.compiled.take_performed() {
             self.trace.record(atom);
         }
-        let (used, ops) = backend.take_host_use();
+        let (used, ops) = self.compiled.take_host_use();
         self.host_use.atoms = self.host_use.atoms.union(&used.atoms);
         self.host_use.operations += used.operations;
         self.host_ops = self.host_ops.saturating_add(ops);
-        self.teardown.extend(backend.take_teardown());
+        self.teardown.extend(self.compiled.take_teardown());
     }
 
     /// Hands the host runtime every exit path from an entry point.
@@ -299,15 +286,28 @@ impl<'a> Machine<'a> {
 
 pub fn err_not_compiled(name: &Symbol, span: Span) -> Diagnostic {
     Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("the compiled tier holds no body for `{name}`"),
+        codes::INTERNAL_ERROR,
+        format!("the compiled tier declined to enter `{name}`"),
     )
     .primary(span, "the compiled tier declined this")
     .note(
         "a body the emitter cannot compile is `E0448` where the program is built, so this is the \
-         seam rather than the body: no backend attached, a signature the boundary does not carry, \
-         the wrong number of arguments, or an entry reached while another was running",
+         seam rather than the body: a unit that failed to build, a signature the boundary does \
+         not carry, the wrong number of arguments, or an entry reached while another was running",
     )
+    .note("this is Ply's fault, not the program's")
+}
+
+#[cold]
+#[inline(never)]
+fn err_foreign_tier(program: DefHash) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("a machine for program {program} was handed a compiled tier built from another"),
+    )
+    .primary(Span::DUMMY, "nothing was run")
+    .note("a unit's bodies answer for the program it was compiled from, never for another")
+    .note("this is Ply's fault, not the program's")
 }
 
 pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
@@ -438,8 +438,12 @@ pub fn err_host_in_simulation(span: Span, operation: &str, region: Span) -> Diag
 pub struct Unbound;
 
 impl HostRuntime for Unbound {
-    fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        Err(err_unbound_runtime(&format!("poll `{pending}`")))
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        Err(err_unbound_runtime(&format!("watch `{pending}`")))
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
