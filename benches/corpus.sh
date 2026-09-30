@@ -3,7 +3,7 @@
 # builds from `crates/ply-corpus/ply`, with the grants it needs, and the arguments passed through.
 # Paths on the line are relative to the working directory, which is the program's `work` root;
 # `real` reads the toolchain's trees under it, so it runs from the repository's root, and so do
-# `serve`, `w3`, `w4` and `w5`, whose `--repo` defaults to it.
+# `serve`, `w3`, `w4`, `w5` and `w6-ladder`, whose `--repo` defaults to it.
 #
 #   benches/corpus.sh gen --out corpora/m20 --modules 20
 #   benches/corpus.sh bench corpora/m20 --json
@@ -11,6 +11,7 @@
 #   benches/corpus.sh serve --sections layers,scans,load
 #   benches/corpus.sh w4 --db postgres://me@localhost/bench
 #   benches/corpus.sh w5 --sections drain,deploy
+#   benches/corpus.sh w6-ladder --db postgres://postgres@127.0.0.1/desk --out benches
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
