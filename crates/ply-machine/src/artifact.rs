@@ -922,7 +922,7 @@ fn front_failed(why: String) -> Vec<Diagnostic> {
 struct Answered {
     front: Front,
     modules: Vec<String>,
-    dump: String,
+    dump: ply_eval::Value,
 }
 
 /// Shipped modules live in this binary, pinned by the header's `ply_std::digest()`; the port
@@ -948,7 +948,7 @@ fn ask_the_port(
 /// indexes land where it wrote them, and the dump read back against those very ids.
 fn place_and_read(
     modules: &[String],
-    dump: &str,
+    dump: &ply_eval::Value,
     ids: &mut Vec<ply_span::SourceId>,
     sources: &mut SourceMap,
 ) -> Result<Front, Vec<Diagnostic>> {
@@ -959,7 +959,7 @@ fn place_and_read(
         })?;
         ids.push(sources.add(crate::shelf::pseudo_path(&name), text));
     }
-    let front = ply_ty::read_front(dump, ids.as_slice())
+    let front = ply_codegen::c::dump::read(dump, ids.as_slice())
         .map_err(|e| front_failed(format!("the front end's answer does not read: {e}")))?;
     let errors: Vec<Diagnostic> = front
         .diagnostics
@@ -987,6 +987,8 @@ pub fn front_cache(artifact: &Artifact) -> PathBuf {
         ..artifact.clone()
     };
     let mut hasher = blake3::Hasher::new();
+    // What the entry is written as is part of its key.
+    hasher.update(b"front.FrontAnswer as ply_eval::codec\0");
     hasher.update(&closure.digest());
     hasher.update(ply_store::FRONTEND_VERSION.as_bytes());
     hasher.update(&[0]);
@@ -997,34 +999,32 @@ pub fn front_cache(artifact: &Artifact) -> PathBuf {
         .join(format!("front.{}", &hasher.finalize().to_hex()[..16]))
 }
 
-/// The pulled module names, then the dump: the two halves a `Front` is rebuilt from in process.
-fn file_front(at: &Path, modules: &[String], dump: &str) {
+/// The pulled module names and the dump, as `front.answer_pulling_std_with` answers them: the two
+/// halves a `Front` is rebuilt from in process.
+fn file_front(at: &Path, modules: &[String], dump: &ply_eval::Value) {
     let Some(parent) = at.parent() else { return };
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let mut bytes = format!("{}\n", modules.len()).into_bytes();
-    for module in modules {
-        bytes.extend_from_slice(module.as_bytes());
-        bytes.push(b'\n');
-    }
-    bytes.extend_from_slice(dump.as_bytes());
+    let answer = crate::payload::record(vec![
+        (
+            "pulled",
+            ply_eval::Value::list(
+                modules
+                    .iter()
+                    .map(|m| ply_eval::Value::bytes(m.as_bytes()))
+                    .collect(),
+            ),
+        ),
+        ("dump", dump.clone()),
+    ]);
+    let Ok(bytes) = ply_eval::codec::encode(&answer) else {
+        return;
+    };
     let tmp = parent.join(format!("front.{}.tmp", std::process::id()));
     if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, at).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-}
-
-fn split_front(text: &str) -> Option<(Vec<String>, &str)> {
-    let (count, mut rest) = text.split_once('\n')?;
-    let count: usize = count.parse().ok()?;
-    let mut modules = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (name, tail) = rest.split_once('\n')?;
-        modules.push(name.to_string());
-        rest = tail;
-    }
-    Some((modules, rest))
 }
 
 /// The `Front` an earlier run answered for this very artifact. A hit skips the check below that
@@ -1035,8 +1035,13 @@ fn cached_front(
     ids: &mut Vec<ply_span::SourceId>,
     sources: &mut SourceMap,
 ) -> Option<Front> {
-    let text = std::fs::read_to_string(at).ok()?;
-    let (modules, dump) = split_front(&text)?;
+    let answer = ply_eval::codec::decode(&std::fs::read(at).ok()?).ok()?;
+    let filed = ply_eval::decode::At::new("a filed front end", &answer);
+    let modules = filed
+        .field("pulled")
+        .and_then(|m| m.items(|name| Ok(name.utf8()?.to_string())))
+        .ok()?;
+    let dump = filed.field("dump").ok()?.value();
     let kept_ids = ids.clone();
     let kept_sources = sources.clone();
     match place_and_read(&modules, dump, ids, sources) {
