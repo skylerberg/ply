@@ -27,15 +27,6 @@ pub enum ValueDomain {
 }
 
 impl ValueDomain {
-    /// One point: the empty tuple.
-    pub fn ground() -> ValueDomain {
-        ValueDomain::Enumerated {
-            domain: "unit".into(),
-            points: 1,
-            kept: 1,
-        }
-    }
-
     pub fn covers_every_value(&self) -> bool {
         matches!(self, ValueDomain::Enumerated { .. })
     }
@@ -78,14 +69,6 @@ pub struct BodyRun {
 }
 
 impl BodyRun {
-    pub fn observed(&self) -> bool {
-        self.observed
-    }
-
-    pub fn raised(&self) -> bool {
-        self.raised
-    }
-
     pub fn interleaving(&self) -> &Interleaving {
         &self.interleaving
     }
@@ -161,40 +144,6 @@ pub struct Searched {
     pub exhausted: bool,
     pub observed: bool,
     pub points: u64,
-}
-
-impl Searched {
-    pub fn line(&self) -> Option<String> {
-        if self.evaluations == 0 {
-            return None;
-        }
-        if !self.observed {
-            return Some(format!(
-                "{} evaluation{} · no `simulate` region reached",
-                self.evaluations,
-                plural(self.evaluations)
-            ));
-        }
-        let mut line = format!(
-            "{} interleaving{}",
-            self.interleavings,
-            plural(self.interleavings)
-        );
-        if self.points > 1 {
-            line.push_str(&format!(" over {} points", self.points));
-        }
-        if self.exhaustive {
-            line.push_str(" · exhaustive");
-        }
-        if self.exhausted {
-            line.push_str(" · budget spent");
-        }
-        Some(line)
-    }
-}
-
-fn plural(n: u32) -> &'static str {
-    if n == 1 { "" } else { "s" }
 }
 
 pub fn discharge(
@@ -337,7 +286,7 @@ impl Totals {
             points,
             ..
         } = domain
-            && !obligation.generated().is_empty()
+            && !obligation.binders.is_empty()
         {
             rules.push(Rule::ExhaustiveEnumeration {
                 domain: name.clone(),
@@ -412,87 +361,4 @@ impl ply_eval::Simulation for Driver<'_> {
         }
         run.interleaving
     }
-}
-
-pub fn replay_command(seed: &Seed, law: &str) -> String {
-    format!("ply prove --seed {seed} --filter \"{law}\"")
-}
-
-pub fn refutation(law: &str, counterexample: &Counterexample, found: Diagnostic) -> Diagnostic {
-    let Some(seed) = &counterexample.sim_seed else {
-        return found;
-    };
-    let mut diagnostic = found.note(format!("seed: {seed}"));
-    if let Some(race) = &counterexample.race {
-        diagnostic = diagnostic
-            .note(format!("race: {}", race_site(&race.left)))
-            .note(format!("      {}", race_site(&race.right)));
-    }
-    if !counterexample.bindings.is_empty() {
-        let bindings: Vec<String> = counterexample
-            .bindings
-            .iter()
-            .map(|b| format!("{} = {}", b.name, b.rendered))
-            .collect();
-        diagnostic = diagnostic.note(format!("at {}", bindings.join(", ")));
-        diagnostic = diagnostic.note(
-            "the seed replays the interleaving; the bindings are redrawn from the same prove plan, \
-             so replay under the flags this run used",
-        );
-    }
-    diagnostic.note(format!("replay: {}", replay_command(seed, law)))
-}
-
-fn race_site(site: &ply_eval::RaceSite) -> String {
-    let definition = site
-        .definition
-        .as_ref()
-        .map(|d| d.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    format!("{}  {definition}   {}", site.task, site.access)
-}
-
-pub fn audit_interleaving_proof(
-    obligation: &Obligation,
-    certificate: &Certificate,
-) -> Result<(), String> {
-    let interleavings = certificate.rules.iter().find_map(|rule| match rule {
-        Rule::ExhaustiveInterleaving { interleavings } => Some(*interleavings),
-        _ => None,
-    });
-    let Some(interleavings) = interleavings else {
-        return Ok(());
-    };
-    if !certificate.guard_satisfiable {
-        return Err(format!(
-            "`{}` is proved over a guard nothing was shown to satisfy",
-            obligation.owner
-        ));
-    }
-    if interleavings == 0 {
-        return Err(format!(
-            "`{}` is proved by an exhaustive search that ran no interleaving",
-            obligation.owner
-        ));
-    }
-    if !obligation.binders.is_empty()
-        && !certificate
-            .rules
-            .iter()
-            .any(|rule| matches!(rule, Rule::ExhaustiveEnumeration { .. }))
-    {
-        return Err(format!(
-            "`{}` has {} binder(s) and is proved by an exhaustive interleaving search that \
-             covered no value domain",
-            obligation.owner,
-            obligation.binders.len()
-        ));
-    }
-    if !certificate.sorts.is_empty() {
-        return Err(format!(
-            "`{}` is a proof about one program, so it has no uninterpreted sorts",
-            obligation.owner
-        ));
-    }
-    Ok(())
 }

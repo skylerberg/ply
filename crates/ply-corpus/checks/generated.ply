@@ -1,0 +1,550 @@
+// Corpora the generator writes, judged by the product itself, and the subcommands that run over one:
+// `bench`, `measure`, `sim` and `prove`. A failure among a corpus's own tests is the reference
+// evaluator disagreeing with the runtime.
+
+import support
+import support (scratch, cats, joined, shown, refused, reported, named, starting, value, passes,
+                why_inconclusive, measured, context)
+import corpus.bench
+import corpus.cmd
+import corpus.discharge
+import corpus.gen
+import corpus.measure
+import corpus.report
+import corpus.report (Report, Judged, WithinRatio)
+import corpus.search
+import corpus.spine
+import corpus.spine (under)
+import std.fs (fs)
+import std.json
+import std.json (Json, Object, Str, Null)
+import std.list
+
+// --- Generated corpora -----------------------------------------------------------------------
+
+fn shape(
+  seed: String,
+  modules: String,
+  defs: String,
+  tests: String,
+  depth: String,
+) -> List<String> =
+  [
+    "--seed",
+    seed,
+    "--modules",
+    modules,
+    "--defs-per-module",
+    defs,
+    "--tests",
+    tests,
+    "--depth",
+    depth,
+  ]
+
+// A corpus `gen` writes into a scratch directory of its own, from the flags a line shapes it with.
+fn generated(name: String, shaped: List<String>) -> String = {
+  let dir = scratch(name);
+  match cmd::asked(cats([["gen", "--out", dir, "--no-verify"], shaped])) {
+    cmd::Gen(g) -> match gen::run(g.out, g.spec, g.no_verify) {
+      Ok(_) -> dir,
+      Err(why) -> panic("`gen " ++ joined(shaped, " ") ++ "` failed: " ++ why),
+    },
+    other -> refused(other),
+  }
+}
+
+fn section(m: Map<String, Json>, key: String) -> Map<String, Json> =
+  match spine::field(m, key) { Ok(s) -> s, Err(why) -> panic(why) }
+
+type Verified = { tests: Int, passed: Int, failed: Int, groups: Int, seeded: Int }
+
+// Every test of a corpus run by the product, nothing read from a cache.
+fn verified(dir: String) -> Verified =
+  match spine::document(
+      spine::ply(["test", ".", "--json", "--no-cache", "--color", "never"], dir),
+    ) {
+    Err(why) -> panic("`ply test` over `" ++ dir ++ "` wrote no report: " ++ why),
+    Ok(j) -> match spine::refusal(j) {
+      Some(why) -> panic("`" ++ dir ++ "` does not compile: " ++ why),
+      None -> match j {
+        Object(m) -> {
+          let selection = section(m, "selection");
+          let summary = section(m, "summary");
+          let failed = spine::int_field(summary, "failed");
+          assert(
+            failed == 0,
+            Some(
+              "`" ++ dir
+                ++ "`'s generated tests failed, so the reference evaluator disagrees with the runtime: "
+                ++ (match map_get(m, "failures") { Some(f) -> json::to_string(f), None -> "" }),
+            ),
+          );
+          {
+            tests: spine::int_field(selection, "total"),
+            passed: spine::int_field(summary, "passed"),
+            failed: failed,
+            groups: len(spine::array_field(selection, "groups")),
+            seeded: len(
+              filter(
+                spine::objects(spine::array_field(selection, "tests")),
+                |t: Map<String, Json>| spine::bool_field(t, "seeded"),
+              ),
+            ),
+          }
+        },
+        _ -> panic("`ply test` over `" ++ dir ++ "` wrote a report that is not an object"),
+      },
+    },
+  }
+
+fn count(n: Int) -> String = int_to_string(n)
+
+test/nondet "a generated corpus compiles and every one of its tests passes" {
+  let dir = scratch("verified");
+  match cmd::asked(cats([["gen", "--out", dir], shape("12", "8", "12", "40", "3")])) {
+    cmd::Gen(g) -> match gen::run(g.out, g.spec, g.no_verify) {
+      Ok(made) -> assert(made.verified, Some("`gen` wrote the corpus and did not verify it")),
+      Err(why) -> panic("`gen` failed: " ++ why),
+    },
+    other -> refused(other),
+  };
+  let v = verified(dir);
+  assert(v.passed == v.tests, Some(count(v.passed) ++ " of " ++ count(v.tests) ++ " tests passed"));
+  assert(v.tests >= 40, Some("only " ++ count(v.tests) ++ " tests reached the runner"))
+}
+
+test/nondet "several seeds all produce corpora that compile and pass" {
+  let _ = map(["1", "2", "3", "99"], |seed: String|
+    verified(generated("seed-" ++ seed, shape(seed, "5", "8", "16", "2"))));
+  ()
+}
+
+test/nondet "a corpus with no effects still compiles, and its tests never conflict" {
+  let v = verified(
+    generated("no-effects", cats([shape("7", "4", "6", "8", "2"), ["--effect-fraction", "0"]])),
+  );
+  assert(v.groups == 1, Some(count(v.groups) ++ " groups, and pure tests never conflict"))
+}
+
+test/nondet "a corpus that is all effects still compiles" {
+  let _ = verified(
+    generated("all-effects", cats([shape("8", "4", "6", "12", "2"), ["--effect-fraction", "1"]])),
+  );
+  ()
+}
+
+test/nondet "a single-module corpus is still a corpus" {
+  let _ = verified(generated("one-module", shape("9", "1", "10", "6", "1")));
+  ()
+}
+
+// `tests` `simulate` tests of three tasks, two steps each, at a conflict density, over a small corpus.
+fn concurrent(name: String, density: String, tests: String) -> String =
+  generated(
+    name,
+    cats([
+      shape("31", "4", "6", "8", "2"),
+      [
+        "--concurrent-tests",
+        tests,
+        "--tasks-per-test",
+        "3",
+        "--steps-per-task",
+        "2",
+        "--conflict-density",
+        density,
+      ],
+    ]),
+  )
+
+test/nondet "a concurrent corpus compiles and passes at every density" {
+  let _ = map(["0", "0.5", "1"], |density: String| {
+    let v = verified(concurrent("concurrent-" ++ density, density, "4"));
+    assert(
+      v.passed == v.tests && v.seeded == 4,
+      Some(
+        "at density " ++ density ++ ", " ++ count(v.passed) ++ " of " ++ count(v.tests)
+          ++ " tests passed and "
+          ++ count(v.seeded)
+          ++ " read a seed, and each of the four `simulate` tests must",
+      ),
+    )
+  });
+  ()
+}
+
+// `sim.read` names an input no test can write, so it serializes nothing.
+test/nondet "concurrent tests do not change how the suite is scheduled" {
+  let plain = verified(concurrent("unsimulated", "0.5", "0"));
+  let simulated = verified(concurrent("simulated", "0.5", "4"));
+  assert_eq(plain.seeded, 0);
+  assert_eq(simulated.tests, plain.tests + 4);
+  assert(
+    simulated.groups == plain.groups,
+    Some(
+      "four simulated tests moved the group count from " ++ count(plain.groups) ++ " to "
+        ++ count(simulated.groups),
+    ),
+  )
+}
+
+// A corpus whose definitions carry an obligation at `fraction`, with `specimens` specimens a module.
+fn specified(name: String, fraction: String, specimens: String) -> String =
+  generated(
+    name,
+    cats([
+      shape("17", "5", "8", "16", "2"),
+      ["--spec-fraction", fraction, "--specimens-per-module", specimens],
+    ]),
+  )
+
+test/nondet "a specified corpus compiles and every test still passes" {
+  let _ = map([("0", "3"), ("0.5", "3"), ("1", "0"), ("1", "4")], |density: (String, String)| {
+    let (fraction, specimens) = density;
+    let v = verified(specified("specified-" ++ fraction ++ "-" ++ specimens, fraction, specimens));
+    assert(
+      v.passed == v.tests,
+      Some(
+        "at " ++ fraction ++ " with " ++ specimens ++ " specimens, " ++ count(v.passed) ++ " of "
+          ++ count(v.tests)
+          ++ " tests passed",
+      ),
+    )
+  });
+  ()
+}
+
+// A specified corpus at `fraction` with no specimens, as `ply <command> . --json` reports it.
+fn specified_report(name: String, fraction: String, command: String) -> Map<String, Json> = {
+  let dir = specified(name, fraction, "0");
+  match spine::report_json(spine::ply([command, ".", "--json", "--color", "never"], dir)) {
+    Ok(Object(m)) -> m,
+    Ok(_) ->
+      panic("`ply " ++ command ++ "` over `" ++ dir ++ "` wrote a report that is not an object"),
+    Err(why) -> panic("`ply " ++ command ++ "` over `" ++ dir ++ "` failed: " ++ why),
+  }
+}
+
+fn member_of(m: Map<String, Json>, key: String) -> Json =
+  match map_get(m, key) { Some(v) -> v, None -> Null }
+
+// Each definition's `key`, by its name.
+fn by_name(report: Map<String, Json>, key: String) -> Map<String, Json> =
+  fold(
+    spine::objects(spine::array_field(report, "definitions")),
+    map_new(),
+    |acc: Map<String, Json>, d: Map<String, Json>|
+      map_insert(acc, spine::str_field(d, "name"), member_of(d, key)),
+  )
+
+// Each test's `keys`, in the order the report lists the tests.
+fn of_tests(report: Map<String, Json>, keys: List<String>) -> List<List<Json>> =
+  map(spine::objects(spine::array_field(report, "tests")), |t: Map<String, Json>|
+    map(keys, |k: String| member_of(t, k)))
+
+// Every definition `bare` names, with what `dense` gives it.
+fn kept(bare: Map<String, Json>, dense: Map<String, Json>, what: String) -> Unit =
+  map_fold(bare, (), |u: Unit, name: String, v: Json|
+    assert(
+      map_get(dense, name) == Some(v),
+      Some(
+        "`" ++ name ++ "`'s " ++ what ++ " moved when a clause was attached to it: "
+          ++ json::to_string(v)
+          ++ " became "
+          ++ (match map_get(dense, name) { Some(w) -> json::to_string(w), None -> "nothing" }),
+      ),
+    ))
+
+test/nondet "raising the spec density changes no definition hash and no test hash" {
+  let bare = specified_report("hashed-bare", "0", "hash");
+  let dense = specified_report("hashed-dense", "1", "hash");
+  let bare_defs = by_name(bare, "hash");
+  assert_eq(map_len(by_name(dense, "hash")), map_len(bare_defs));
+  kept(bare_defs, by_name(dense, "hash"), "hash");
+  assert_eq(of_tests(dense, ["hash"]), of_tests(bare, ["hash"]))
+}
+
+test/nondet "attaching a spec changes no definition's footprint and no test's" {
+  let bare = specified_report("checked-bare", "0", "check");
+  let dense = specified_report("checked-dense", "1", "check");
+  kept(by_name(bare, "footprint"), by_name(dense, "footprint"), "footprint");
+  assert_eq(of_tests(dense, ["footprint", "nondet"]), of_tests(bare, ["footprint", "nondet"]))
+}
+
+fn manifest_of(dir: String) -> Map<String, Json> =
+  match fs.read_file[work](under(dir, "corpus.json")) {
+    None -> panic("`" ++ dir ++ "` holds no corpus.json"),
+    Some(bytes) -> match json::parse(bytes) {
+      Ok(Object(m)) -> m,
+      _ -> panic("`" ++ dir ++ "`'s corpus.json is not a JSON object"),
+    },
+  }
+
+test/nondet "the manifest reports the obligations the corpus actually carries" {
+  let m = manifest_of(specified("manifested", "0.5", "3"));
+  let specs = section(m, "specs");
+  let n = |key: String| spine::int_field(specs, key);
+  let shown_specs = json::to_string(Object(specs));
+  assert(n("specimens") == 3 * 5 && n("laws") == 3 * 5, Some(shown_specs));
+  assert(n("obligations") == n("decided") + n("sampled") + n("gaps"), Some(shown_specs));
+  assert(
+    n("specified_definitions") + n("unspecified_definitions")
+      == spine::int_field(m, "definitions") + n("specimens"),
+    Some(shown_specs),
+  );
+  assert(n("decided") > 0 && n("sampled") > 0 && n("gaps") > 0, Some(shown_specs))
+}
+
+// --- bench and measure ---------------------------------------------------------------------
+
+fn benched(name: String) -> String = generated(name, shape("4", "5", "6", "10", "2"))
+
+// Every `.ply` file under `dir` with its text, in path order.
+fn sources(dir: String) -> List<{ path: String, text: Bytes }> =
+  map(list::sort(bench::ply_files(dir)), |p: String|
+    { path: p, text: match fs.read_file[work](p) { Some(t) -> t, None -> b"" } })
+
+fn bench_report(dir: String) -> Report =
+  match cmd::asked(["bench", dir, "--repeats", "1"]) {
+    cmd::Bench(b) -> reported("bench " ++ dir, bench::run(b.corpus, b.repeats)),
+    other -> refused(other),
+  }
+
+test/nondet "the bench's verdicts hold on a generated corpus, and its scenarios leave the corpus as they found it" {
+  let dir = benched("bench");
+  let before = sources(dir);
+  let r = bench_report(dir);
+  let _ = map(["cold", "warm", "rename", "edit-leaf", "edit-hub", "pipeline"], |name: String|
+    passes(named(r, name)));
+  assert(report::all_passed(r.rows), Some(shown(r)));
+  assert(
+    match context(r, "corpus") { Object(c) -> spine::str_field(c, "root") == dir, _ -> false },
+    Some("the report names the corpus it benched: " ++ shown(r)),
+  );
+  assert(
+    string_starts_with(r.provenance.corpus, "b3:")
+      && string_starts_with(r.provenance.runtime, "ply "),
+    Some("the report is pinned to the corpus and the runtime that measured it: " ++ shown(r)),
+  );
+  assert(value(named(r, "pipeline"), "files") > 0m, Some(shown(r)));
+  assert_eq(value(named(r, "warm"), "selected"), 0m);
+  assert_eq(value(named(r, "rename"), "selected"), 0m);
+  let leaf = value(named(r, "edit-leaf"), "selected");
+  let hub = value(named(r, "edit-hub"), "selected");
+  assert(
+    hub > leaf,
+    Some(
+      "editing a hub selects more than editing a leaf: " ++ decimal_to_string(leaf) ++ " against "
+        ++ decimal_to_string(hub),
+    ),
+  );
+  assert(sources(dir) == before, Some("the scenarios left the corpus mutated"))
+}
+
+test/nondet "a stale edit site is an error rather than a silent no-op" {
+  let dir = benched("stale");
+  let m = manifest_of(dir);
+  let leaf = match map_get(m, "leaf_edit") {
+    Some(Object(e)) -> e,
+    _ -> panic("the manifest carries no leaf edit"),
+  };
+  let stale = map_insert(
+    m,
+    "leaf_edit",
+    Object(map_insert(leaf, "find", Str("fn definitely_not_here() -> Int = 0\n"))),
+  );
+  assert(
+    fs.write_file[work](under(dir, "corpus.json"), bytes_of_string(json::to_string(Object(stale)))),
+    Some("the manifest could not be rewritten"),
+  );
+  match cmd::asked(["bench", dir, "--repeats", "1"]) {
+    cmd::Bench(b) -> match bench::run(b.corpus, b.repeats) {
+      Ok(r) -> panic("a stale edit site ran to the end: " ++ shown(r)),
+      Err(why) ->
+        assert(
+          string_contains(why, "occurs 0 times"),
+          Some("the stale site must say so, not slip by: " ++ why),
+        ),
+    },
+    other -> refused(other),
+  }
+}
+
+fn climbing(vs: List<Decimal>) -> Bool =
+  fold(range(1, len(vs)), true, |up: Bool, i: Int|
+    up
+      && (match ((list_at(vs, i - 1), list_at(vs, i))) {
+        (Some(before), Some(after)) -> before < after,
+        _ -> false,
+      }))
+
+// The resumption fixture is one computation resumed 0, 1, 2 and 4 times, so its steps have to climb;
+// the rest are the product's own reports over the corpus the fixtures are written beside.
+test/nondet "measure prices a corpus by the product's reports, and a call and a resumption in process" {
+  let dir = benched("measure");
+  let r = match cmd::asked(["measure", dir, "--repeats", "2"]) {
+    cmd::Measure(m) ->
+      reported("measure " ++ dir, measure::run(m.corpus, m.repeats, m.only_throughput)),
+    other -> refused(other),
+  };
+  let resumptions = named(r, "resumptions");
+  passes(resumptions);
+  let steps = map(["r0_steps", "r1_steps", "r2_steps", "r4_steps"], |name: String|
+    value(resumptions, name));
+  assert(
+    climbing(steps),
+    Some("more resumptions must do more work: " ++ report::judged_text(resumptions)),
+  );
+  let points = match resumptions.row.detail {
+    Object(d) -> spine::objects(spine::array_field(d, "points")),
+    _ -> [],
+  };
+  assert_eq(map(points, |p: Map<String, Json>| spine::int_field(p, "n")), [0, 1, 2, 4]);
+  assert(
+    fold(range(1, len(points)), true, |ok: Bool, i: Int|
+      ok
+        && (match list_at(points, i) {
+          Some(p) -> spine::int_field(p, "marginal_steps") > 0,
+          None -> false,
+        })),
+    Some("a resumption that costs nothing did not happen: " ++ report::judged_text(resumptions)),
+  );
+  let call = named(r, "call");
+  passes(call);
+  assert(
+    value(resumptions, "front") > 0m && value(call, "front") > 0m,
+    Some("no front end was timed before the machine held a fixture: " ++ shown(r)),
+  );
+  let store = named(r, "store");
+  passes(store);
+  assert(value(store, "open") >= 0m, Some(report::judged_text(store)));
+  let first = named(r, "first-pass");
+  passes(first);
+  assert(
+    value(first, "workers") == 1m && value(first, "tests") >= 10m && value(first, "execute") > 0m,
+    Some(report::judged_text(first)),
+  );
+  let steady = named(r, "steady-pass");
+  assert(why_inconclusive(steady) == None, Some(report::judged_text(steady)));
+  assert(
+    match steady.row.criterion { WithinRatio(_, of, _) -> of == "first-pass", _ -> false },
+    Some("the steady pass is timed against the first: " ++ report::judged_text(steady)),
+  );
+  let scheduling = named(r, "scheduling");
+  passes(scheduling);
+  assert_eq(
+    value(scheduling, "isolated") + value(scheduling, "shared"),
+    value(scheduling, "tests"),
+  );
+  let shared_groups = value(scheduling, "shared_groups");
+  assert_eq(value(scheduling, "groups"), if shared_groups > 1m { shared_groups } else { 1m });
+  let left = filter(
+    match fs.list_dir[work](dir) { Some(names) -> names, None -> [] },
+    |name: String| string_starts_with(name, "fixture-"),
+  );
+  assert(len(left) == 0, Some("fixtures left behind in " ++ dir ++ ": " ++ joined(left, ", ")))
+}
+
+// --- sim --------------------------------------------------------------------------------------
+
+// One `simulate` test of `tasks` tasks at a conflict density, over a two-module corpus.
+fn simulated_corpus(name: String, density: String, tasks: String) -> String =
+  generated(
+    name,
+    cats([
+      shape("17", "2", "4", "2", "1"),
+      [
+        "--concurrent-tests",
+        "1",
+        "--tasks-per-test",
+        tasks,
+        "--steps-per-task",
+        "2",
+        "--conflict-density",
+        density,
+      ],
+    ]),
+  )
+
+fn simulated(argv: List<String>) -> Report =
+  match cmd::asked(argv) {
+    cmd::Sim(s) -> reported(joined(argv, " "), search::run(s.args)),
+    other -> refused(other),
+  }
+
+// The rows of a table, of which there is at least one.
+fn table(r: Report, prefix: String) -> List<Judged> =
+  match starting(r, prefix) {
+    [] -> panic("no simulated test has a `" ++ prefix ++ "` row: " ++ shown(r)),
+    rows -> rows,
+  }
+
+test/nondet "the pruned search runs no more interleavings than enumerating every order" {
+  let dir = simulated_corpus("pruned", "0", "2");
+  let r = simulated(["sim", dir, "--trials", "0", "--rate-seeds", "0", "--budget", "512"]);
+  let _ = map(table(r, "reduction "), |j: Judged| {
+    passes(j);
+    assert(value(j, "reduction") >= 1m, Some(report::judged_text(j)))
+  });
+  ()
+}
+
+test/nondet "a test with no race to find reports its misses and no ratio" {
+  let dir = simulated_corpus("unraced", "1", "2");
+  let r = simulated([
+    "sim",
+    dir,
+    "--trials",
+    "2",
+    "--budget",
+    "16",
+    "--rate-seeds",
+    "0",
+    "--no-reduction",
+  ]);
+  let _ = map(table(r, "race "), |j: Judged| {
+    assert(
+      value(j, "dpor_misses") == value(j, "trials")
+        && report::value_of(measured(j), "dpor_median") == None
+        && report::value_of(measured(j), "median_ratio") == None,
+      Some(report::judged_text(j)),
+    );
+    assert(
+      match why_inconclusive(j) {
+        Some(why) -> string_contains(why, "no race to find"),
+        None -> false,
+      },
+      Some(report::judged_text(j)),
+    )
+  });
+  ()
+}
+
+test/nondet "a rate counts the seeds each simulated test ran" {
+  let dir = simulated_corpus("rated", "0.5", "2");
+  let r = simulated(["sim", dir, "--trials", "0", "--rate-seeds", "8", "--no-reduction"]);
+  let _ = map(table(r, "rate "), |j: Judged| {
+    passes(j);
+    assert(value(j, "seeds") == 8m && value(j, "per_second") > 0m, Some(report::judged_text(j)))
+  });
+  ()
+}
+
+// --- prove ------------------------------------------------------------------------------------
+
+// A generated corpus's specs are built to hold: none is refuted, and each proof that ran nothing is
+// one the static tier alone decides.
+test/nondet "prove's tiers and the static tier's reach hold over a specified corpus" {
+  let dir = specified("proved", "0.5", "3");
+  let r = match cmd::asked(["prove", dir]) {
+    cmd::Prove(p) -> reported("prove " ++ dir, discharge::run(p.args)),
+    other -> refused(other),
+  };
+  let tiers = named(r, dir);
+  passes(tiers);
+  assert(value(tiers, "obligations") > 0m && value(tiers, "proved") > 0m, Some(shown(r)));
+  let reach = named(r, dir ++ " reach");
+  passes(reach);
+  assert(value(reach, "attempted") > 0m, Some(report::judged_text(reach)))
+}

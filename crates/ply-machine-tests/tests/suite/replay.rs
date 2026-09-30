@@ -25,7 +25,7 @@ nondet effect prover {
   write record[claims](entries: List<{ at: Int, key: String }>) -> List<Unit>
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
   read reaches[claims](claims: List<Int>) -> Result<List<Unit>, Refusal>
-  read baselines[claims]() -> List<Baseline>
+  read baselines[claims](names: List<String>) -> List<Baseline>
   write accepted[claims](records: List<Baseline>) -> Accepted
 }
 
@@ -43,19 +43,25 @@ type Decl = { name: String, params: Int, variants: List<Variant> }
 type Signature = { name: String, ty: Shape, pure: Bool }
 type Kind = | Ensures(Int) | Law(Option<String>)
 type Frame = | Pure | Writes(List<String>)
+type Points = | Every({ shapes: List<Unit>, points: Int }, String) | Drawn
+type Unsettled = | Unhandled(String) | Run(Points)
+type Strategy = | Interleave(Points) | Hosted | Static(Unsettled)
+type Bound = { name: String, ty: Shape, text: String }
 type Claimed = {
   key: String,
   owner: String,
   kind: Kind,
   at: { module: Int, start: Int, end: Int },
-  binders: List<{ name: String, ty: Shape, text: String }>,
+  binders: List<Bound>,
+  result: Option<Bound>,
+  variables: List<String>,
   guarded: Bool,
   host: Bool,
-  footprint: String,
+  footprint: Option<String>,
   frame: Frame,
+  strategy: Strategy,
 }
 type World = { decls: List<Decl>, signatures: List<Signature>, obligations: List<Claimed> }
-type Measured = { claim: Int, sizes: List<Int>, name: String }
 type Tls = Unit
 type Named = Unit
 type Db = { url: Option<String>, pool: Option<Int>, acquire_ms: Option<Int>, statement_ms: Option<Int>, idle_txn_ms: Option<Int>, connect_ms: Option<Int>, statement_cache: Option<Int>, schema: Option<String> }
@@ -175,6 +181,9 @@ law "doubling is tripling"
   }
 "#;
 
+/// That law as `proof.world` would hand it over.
+const THE_LAW: (&str, &[&str]) = ("m.doubling is tripling", &["n"]);
+
 fn front_of(source: &str) -> Front {
     let named = vec![("proof.obligation".to_string(), source.to_string())];
     let ids = vec![SourceId(0)];
@@ -198,15 +207,13 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_eval::Diagnostic> {
     }
     let binding = registry.bind(&front.check).expect("the prover ops bind");
     machine.set_host_binding(Arc::new(binding));
-    let (_, _, obligations) =
-        crate::fixture::proving(project.path()).expect("the program under test loads");
     machine.call(
         "proof.obligation.main",
         vec![
             Value::str(project.path().display().to_string()),
             Value::Int(index),
             crate::fixture::handed(project.path()),
-            crate::fixture::world_value(&obligations),
+            crate::fixture::int_laws(&[THE_LAW]),
         ],
         Span::DUMMY,
     )

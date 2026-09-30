@@ -1,6 +1,7 @@
-//! Decoding a point of a domain the program measured. Which types are finite, and how large, is
-//! `proof.domain`'s decision and its tests'; these pin that the runtime builds exactly the values the
-//! program counted, once each, in the program's order.
+//! Decoding a point of a domain the program measured. Which types are finite, how large, and
+//! whether a domain is walked at all are `proof.domain`'s and `proof.world`'s decisions and their
+//! tests'; these pin that the runtime builds exactly the values the program counted, once each, in
+//! the program's order.
 
 use ply_eval::{Fixed, IntTy, Symbol, Value};
 use ply_prove::domain::{Case, Finite, Shape};
@@ -28,9 +29,18 @@ fn ctor(name: &str, args: Vec<Value>) -> Value {
     Value::ctor(name, args)
 }
 
+/// A domain as the program hands one over: its shapes, and the count it decided they hold.
+fn walked(shapes: Vec<Shape>, points: u64) -> Finite {
+    Finite {
+        shapes,
+        points,
+        name: Symbol::new("a domain"),
+    }
+}
+
 #[test]
 fn a_point_is_every_binder_decoded_the_last_varying_fastest() {
-    let finite = Finite::of_shapes(vec![scalar("Bool", 2), kinds()]).expect("six points");
+    let finite = walked(vec![scalar("Bool", 2), kinds()], 6);
     assert_eq!(finite.points, 6);
     assert_eq!(
         finite.point(0),
@@ -66,7 +76,7 @@ fn a_case_takes_its_share_of_its_type_and_decodes_its_fields() {
             },
         ],
     };
-    let finite = Finite::of_shapes(vec![wrap]).expect("seven points");
+    let finite = walked(vec![wrap], 7);
     assert_eq!(finite.point(0), Some(vec![ctor("Nothing", vec![])]));
     assert_eq!(
         finite.point(1),
@@ -95,7 +105,7 @@ fn a_record_and_a_fixed_width_are_built_from_their_shapes() {
             (Symbol::new("n"), scalar("U8", 256)),
         ],
     };
-    let finite = Finite::of_shapes(vec![record]).expect("a record's points");
+    let finite = walked(vec![record], 512);
     let fixed = |n: i128| Value::Fixed(Fixed::of(IntTy::U8, n).expect("a byte"));
     let built = |flag: bool, n: i128| {
         Value::Record(std::sync::Arc::new(
@@ -112,13 +122,8 @@ fn a_record_and_a_fixed_width_are_built_from_their_shapes() {
 }
 
 #[test]
-fn a_domain_of_no_points_is_no_domain_and_a_ground_claim_has_one() {
-    let empty = Shape::Cases {
-        size: 0,
-        cases: Vec::new(),
-    };
-    assert!(Finite::of_shapes(vec![scalar("Bool", 2), empty]).is_none());
-    let ground = Finite::of_shapes(Vec::new()).expect("one point");
-    assert_eq!(ground.points, 1);
+fn a_ground_claims_one_point_is_the_empty_tuple() {
+    let ground = walked(Vec::new(), 1);
     assert_eq!(ground.point(0), Some(Vec::new()));
+    assert_eq!(ground.point(1), None);
 }

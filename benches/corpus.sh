@@ -17,8 +17,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin="${CARGO_TARGET_DIR:-$root/target}/release"
 
-cargo build --release --quiet --manifest-path "$root/Cargo.toml" \
-  -p ply-launcher --bin ply -p ply-corpus --bin ply-corpus
+cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p ply-launcher --bin ply
 
 # The program starts only what is bound here, so the floors its tables are compared with are built
 # here too; it asks `process.bound` for each. The libpq tool is built only where `pg_config` says
@@ -27,7 +26,7 @@ floor="$root/benches/http-floor/floor.c"
 if [ "$floor" -nt "$bin/http-floor" ]; then
   cc -O2 -o "$bin/http-floor" "$floor" -lpthread
 fi
-execs=(--exec "ply=$bin/ply" --exec "executor=$bin/ply-corpus" --exec "http_floor=$bin/http-floor")
+execs=(--exec "ply=$bin/ply" --exec "http_floor=$bin/http-floor")
 
 pg="$root/benches/pg-floor/pg.c"
 if command -v pg_config >/dev/null; then

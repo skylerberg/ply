@@ -1,8 +1,9 @@
-//! The program as the prover reads it — its declared types, its definitions' signatures and the
-//! obligations it owes — as `proof.world` builds it.
+//! The program as the prover reads it — its declared types, its definitions' signatures, the
+//! obligations it owes and how each is discharged — as `proof.world` builds it.
 
+use crate::domain::Finite;
 use crate::sort::Sort;
-use crate::{Binder, Obligation, ObligationKind};
+use crate::{Binder, Obligation, ObligationKind, Points, Strategy, Unsettled};
 use ply_eval::decode::{At, Error};
 use ply_eval::{DefHash, IntTy, SECRET, SourceId, Span, Symbol, TASK_TYPE};
 use std::collections::{BTreeMap, BTreeSet};
@@ -288,6 +289,25 @@ fn obligation(at: At<'_>) -> Result<Obligation, Error> {
     let text = key.str()?;
     let kind = at.field("kind")?.ctor()?;
     let place = at.field("at")?;
+    let variables: Vec<Symbol> = at
+        .field("variables")?
+        .items(|v| Ok(Symbol::new(v.str()?)))?;
+    let named = {
+        let count = variables.len();
+        move |b: At<'_>| binder(b, count)
+    };
+    let binders = at.field("binders")?.items(named)?;
+    let how = at.field("strategy")?;
+    let strategy = strategy(how)?;
+    if let Some(finite) = walked(&strategy)
+        && finite.shapes.len() != binders.len()
+    {
+        return Err(how.error(format!(
+            "a domain over {} binder(s), for a claim of {}",
+            finite.shapes.len(),
+            binders.len()
+        )));
+    }
     Ok(Obligation {
         key: DefHash::from_hex(text)
             .ok_or_else(|| key.error(format!("`{text}` is not a hash in hex")))?,
@@ -304,18 +324,72 @@ fn obligation(at: At<'_>) -> Result<Obligation, Error> {
             place.field("start")?.number()?,
             place.field("end")?.number()?,
         ),
-        binders: at.field("binders")?.items(|b| {
-            Ok(Binder {
-                name: Symbol::new(b.field("name")?.str()?),
-                sort: Sort::decode(b.field("ty")?)?,
-                text: b.field("text")?.str()?.to_string(),
-            })
-        })?,
-        guarded: at.field("guarded")?.bool()?,
-        host: at.field("host")?.bool()?,
+        binders,
+        result: match at.field("result")?.option()? {
+            Some(result) => Some(named(result)?),
+            None => None,
+        },
         footprint: match at.field("footprint")?.option()? {
             Some(row) => Some(row.str()?.to_string()),
             None => None,
         },
+        strategy,
+        variables,
     })
+}
+
+/// The domain a strategy walks, when it walks one: its shapes are one per binder.
+fn walked(strategy: &Strategy) -> Option<&Finite> {
+    match strategy {
+        Strategy::Interleave(Points::Every(finite))
+        | Strategy::Static(Unsettled::Run(Points::Every(finite))) => Some(finite),
+        _ => None,
+    }
+}
+
+/// One binder, whose every variable the claim names: the name is what a report calls it.
+fn binder(at: At<'_>, variables: usize) -> Result<Binder, Error> {
+    let ty = at.field("ty")?;
+    let sort = Sort::decode(ty)?;
+    let mut vars = Vec::new();
+    sort.vars(&mut vars);
+    if let Some(v) = vars.iter().find(|v| **v as usize >= variables) {
+        return Err(ty.error(format!("variable {v} of a claim that names {variables}")));
+    }
+    Ok(Binder {
+        name: Symbol::new(at.field("name")?.str()?),
+        sort,
+        text: at.field("text")?.str()?.to_string(),
+    })
+}
+
+/// A `proof.world.Strategy`.
+fn strategy(at: At<'_>) -> Result<Strategy, Error> {
+    let strategy = at.ctor()?;
+    Ok(match strategy.name() {
+        "Interleave" => Strategy::Interleave(points(strategy.arg(0)?)?),
+        "Hosted" => Strategy::Hosted,
+        "Static" => {
+            let then = strategy.arg(0)?.ctor()?;
+            Strategy::Static(match then.name() {
+                "Unhandled" => Unsettled::Unhandled(then.arg(0)?.str()?.to_string()),
+                "Run" => Unsettled::Run(points(then.arg(0)?)?),
+                _ => return Err(then.unknown()),
+            })
+        }
+        _ => return Err(strategy.unknown()),
+    })
+}
+
+/// A `proof.world.Points`.
+fn points(at: At<'_>) -> Result<Points, Error> {
+    let points = at.ctor()?;
+    match points.name() {
+        "Every" => Ok(Points::Every(Finite::decode(
+            points.arg(0)?,
+            points.arg(1)?,
+        )?)),
+        "Drawn" => Ok(Points::Drawn),
+        _ => Err(points.unknown()),
+    }
 }
