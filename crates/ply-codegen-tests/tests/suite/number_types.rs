@@ -1,4 +1,4 @@
-use crate::fragment::{call, unit};
+use crate::fragment::{call, raised, unit};
 use ply_eval::Value;
 
 /// Signatures are `Int` because a fixed width may not cross the seam; the widths live inside the bodies, as in `std.hash`.
@@ -244,4 +244,216 @@ fn a_signature_naming_a_width_is_declined_rather_than_answered() {
         call(unit, "m.narrows#requires#0", &[Value::Int(7)]),
         Some(Value::Bool(true))
     );
+}
+
+/// Operands whose `+`, `-` and `*` leave the width, each with what the wrapping builtin of the
+/// same operation answers for them.
+struct Operands {
+    ty: &'static str,
+    add: (i64, i64, i64),
+    sub: (i64, i64, i64),
+    mul: (i64, i64, i64),
+}
+
+const OPERANDS: [Operands; 4] = [
+    Operands {
+        ty: "U8",
+        add: (200, 100, 44),
+        sub: (100, 200, 156),
+        mul: (200, 100, 32),
+    },
+    Operands {
+        ty: "I8",
+        add: (100, 100, -56),
+        sub: (-100, 100, 56),
+        mul: (100, 100, 16),
+    },
+    Operands {
+        ty: "U32",
+        add: (4_000_000_000, 1_000_000_000, 705_032_704),
+        sub: (1, 2, 4_294_967_295),
+        mul: (100_000, 100_000, 1_410_065_408),
+    },
+    Operands {
+        ty: "I32",
+        add: (2_000_000_000, 2_000_000_000, -294_967_296),
+        sub: (-2_000_000_000, 2_000_000_000, 294_967_296),
+        mul: (100_000, 100_000, 1_410_065_408),
+    },
+];
+
+/// Where compiled code holds a value as an untyped word: a list, tuple, record or constructor
+/// pattern's binders, a function value's answer bound by `let`, a closure's captures, a generic's
+/// answer and a map's value.
+const SHAPES: [&str; 8] = [
+    "list", "tuple", "field", "ctor", "answer", "capture", "generic", "map",
+];
+
+/// `<shape>_<width>(x, y, op)` reads `x` and `y` at the width through the shape and applies `op`:
+/// `+`, `-`, `*`, then `wrap_add`, `wrap_sub`, `wrap_mul`, back to `Int` in the same body so no
+/// narrowing on the way out can hide a wrong answer.
+fn binders() -> String {
+    let mut source = String::from(
+        "fn nth<t>(xs: List<t>, i: Int, d: t) -> t = match list_at(xs, i) { Some(v) -> v, None -> d }\n",
+    );
+    for o in &OPERANDS {
+        let (ty, t) = (o.ty, o.ty.to_lowercase());
+        let ops = |k: &str| {
+            format!(
+                "if {k} == 0 {{ int_of_{t}(a + b) }} else if {k} == 1 {{ int_of_{t}(a - b) }} \
+                 else if {k} == 2 {{ int_of_{t}(a * b) }} \
+                 else if {k} == 3 {{ int_of_{t}(wrap_add(a, b)) }} \
+                 else if {k} == 4 {{ int_of_{t}(wrap_sub(a, b)) }} \
+                 else {{ int_of_{t}(wrap_mul(a, b)) }}"
+            )
+        };
+        let (op, k) = (ops("op"), ops("k"));
+        source.push_str(&format!(
+            "
+type Pair{ty} = | Pair{ty}({ty}, {ty})
+fn listed_{t}(xs: List<{ty}>, op: Int) -> Int = match xs {{ [a, b, ..] -> {op}, _ -> 0 }}
+fn list_{t}(x: Int, y: Int, op: Int) -> Int = listed_{t}([{t}_of_int(x), {t}_of_int(y)], op)
+fn tupled_{t}(p: ({ty}, {ty}), op: Int) -> Int = match p {{ (a, b) -> {op} }}
+fn tuple_{t}(x: Int, y: Int, op: Int) -> Int = tupled_{t}(({t}_of_int(x), {t}_of_int(y)), op)
+fn fielded_{t}(r: {{ left: {ty}, right: {ty} }}, op: Int) -> Int = match r {{ {{ left: a, right: b }} -> {op} }}
+fn field_{t}(x: Int, y: Int, op: Int) -> Int = fielded_{t}({{ left: {t}_of_int(x), right: {t}_of_int(y) }}, op)
+fn constructed_{t}(p: Pair{ty}, op: Int) -> Int = match p {{ Pair{ty}(a, b) -> {op} }}
+fn ctor_{t}(x: Int, y: Int, op: Int) -> Int = constructed_{t}(Pair{ty}({t}_of_int(x), {t}_of_int(y)), op)
+fn answered_{t}(f: (Int) -> {ty}, x: Int, y: Int, op: Int) -> Int = {{ let a = f(x); let b = f(y); {op} }}
+fn answer_{t}(x: Int, y: Int, op: Int) -> Int = answered_{t}(|n: Int| {t}_of_int(n), x, y, op)
+fn captured_{t}(a: {ty}, b: {ty}, op: Int) -> Int = {{ let f = |k: Int| {k}; f(op) }}
+fn capture_{t}(x: Int, y: Int, op: Int) -> Int = captured_{t}({t}_of_int(x), {t}_of_int(y), op)
+fn chosen_{t}(xs: List<{ty}>, op: Int) -> Int = {{ let a = nth(xs, 0, {t}_of_int(0)); let b = nth(xs, 1, {t}_of_int(0)); {op} }}
+fn generic_{t}(x: Int, y: Int, op: Int) -> Int = chosen_{t}([{t}_of_int(x), {t}_of_int(y)], op)
+fn valued_{t}(m: Map<Int, {ty}>, op: Int) -> Int = match map_get(m, 0) {{ Some(a) -> match map_get(m, 1) {{ Some(b) -> {op}, None -> 0 }}, None -> 0 }}
+fn map_{t}(x: Int, y: Int, op: Int) -> Int = valued_{t}(map_insert(map_insert(map_new(), 0, {t}_of_int(x)), 1, {t}_of_int(y)), op)
+"
+        ));
+    }
+    source
+}
+
+/// However a width reached an operator, the operator is the width's: `+ - *` raise past it and the
+/// wrapping builtins wrap at it.
+#[test]
+fn a_width_is_read_at_its_type_through_every_binder() {
+    let source = binders();
+    let (_, unit) = unit(&source);
+    for o in &OPERANDS {
+        let t = o.ty.to_lowercase();
+        for shape in SHAPES {
+            let name = format!("m.{shape}_{t}");
+            for (op, (x, y, wrapped), what) in [
+                (0, o.add, "addition"),
+                (1, o.sub, "subtraction"),
+                (2, o.mul, "multiplication"),
+            ] {
+                let args = [Value::Int(x), Value::Int(y), Value::Int(op)];
+                let raise = raised(unit, &name, &args);
+                assert!(
+                    raise.message.contains(&format!("overflow in {what}")),
+                    "`{name}{args:?}` raised {raise:?}"
+                );
+                let wrap = [Value::Int(x), Value::Int(y), Value::Int(op + 3)];
+                assert_eq!(
+                    call(unit, &name, &wrap),
+                    Some(Value::Int(wrapped)),
+                    "`{name}{wrap:?}`"
+                );
+            }
+        }
+    }
+}
+
+/// The comparisons, shifts, bit operators, negation and division over bound widths; the 64-bit
+/// widths, which are the runtime's own words; and width builtins passed as values.
+const WORDS: &str = r#"
+fn lt_i8(x: Int, y: Int) -> Bool = match [i8_of_int(x), i8_of_int(y)] { [a, b] -> a < b, _ -> false }
+fn ge_u32(x: Int, y: Int) -> Bool = match [u32_of_int(x), u32_of_int(y)] { [a, b] -> a >= b, _ -> false }
+fn shl_u8(x: Int, n: Int) -> Int = match [u8_of_int(x)] { [a] -> int_of_u8(a << n), _ -> 0 }
+fn ushr_i8(x: Int, n: Int) -> Int = match [i8_of_int(x)] { [a] -> int_of_i8(a >>> n), _ -> 0 }
+fn not_u8(x: Int) -> Int = match [u8_of_int(x)] { [a] -> int_of_u8(~a), _ -> 0 }
+fn neg_i8(x: Int) -> Int = match [i8_of_int(x)] { [a] -> int_of_i8(-a), _ -> 0 }
+fn div_i8(x: Int, y: Int) -> Int = match [i8_of_int(x), i8_of_int(y)] { [a, b] -> int_of_i8(a / b), _ -> 0 }
+fn rotr_u8(x: Int, n: Int) -> Int = match [u8_of_int(x)] { [a] -> int_of_u8(rotr(a, n)), _ -> 0 }
+fn shl_u64(x: Int, n: Int) -> Int = match [u64_of_int(x)] { [a] -> int_of_u64(a << n), _ -> 0 }
+fn ushr_i64(x: Int, n: Int) -> Int = match [i64_of_int(x)] { [a] -> int_of_i64(a >>> n), _ -> 0 }
+fn not_i64(x: Int) -> Int = match [i64_of_int(x)] { [a] -> int_of_i64(~a), _ -> 0 }
+fn shifted(w: U64, n: Int) -> U64 = w << n
+fn shl_u64_param(x: Int, n: Int) -> Int = int_of_u64(shifted(u64_of_int(x), n))
+fn folded_u8(x: Int, y: Int) -> Int = int_of_u8(fold([u8_of_int(x), u8_of_int(y)], 0u8, wrap_add))
+fn narrowed(x: Int) -> Int = fold(map(map([x], u8_of_int), int_of_u8), 0, |acc: Int, v: Int| acc + v)
+fn folded_int(x: Int, y: Int) -> Int = fold([x, y], 0, wrap_add)
+"#;
+
+#[test]
+fn every_operator_reads_a_bound_width_at_its_type() {
+    let (_, unit) = unit(WORDS);
+    let int = |n: i64| Some(Value::Int(n));
+    let answers: &[(&str, Vec<Value>, Option<Value>)] = &[
+        (
+            "m.lt_i8",
+            vec![Value::Int(-1), Value::Int(1)],
+            Some(Value::Bool(true)),
+        ),
+        (
+            "m.ge_u32",
+            vec![Value::Int(4_294_967_295), Value::Int(1)],
+            Some(Value::Bool(true)),
+        ),
+        ("m.shl_u8", vec![Value::Int(200), Value::Int(1)], int(144)),
+        ("m.ushr_i8", vec![Value::Int(-2), Value::Int(1)], int(127)),
+        ("m.not_u8", vec![Value::Int(200)], int(55)),
+        ("m.neg_i8", vec![Value::Int(-127)], int(127)),
+        ("m.div_i8", vec![Value::Int(-128), Value::Int(2)], int(-64)),
+        ("m.rotr_u8", vec![Value::Int(1), Value::Int(1)], int(128)),
+        ("m.shl_u64", vec![Value::Int(3), Value::Int(1)], int(6)),
+        ("m.ushr_i64", vec![Value::Int(-1), Value::Int(60)], int(15)),
+        ("m.not_i64", vec![Value::Int(5)], int(-6)),
+        (
+            "m.shl_u64_param",
+            vec![Value::Int(1), Value::Int(4)],
+            int(16),
+        ),
+        (
+            "m.folded_u8",
+            vec![Value::Int(200), Value::Int(100)],
+            int(44),
+        ),
+        ("m.narrowed", vec![Value::Int(200)], int(200)),
+        (
+            "m.folded_int",
+            vec![Value::Int(i64::MAX), Value::Int(1)],
+            int(i64::MIN),
+        ),
+    ];
+    for (name, args, want) in answers {
+        assert_eq!(&call(unit, name, args), want, "`{name}{args:?}`");
+    }
+    let raises: &[(&str, Vec<Value>, &str)] = &[
+        (
+            "m.shl_u8",
+            vec![Value::Int(1), Value::Int(8)],
+            "shift count out of range",
+        ),
+        (
+            "m.shl_u64",
+            vec![Value::Int(1), Value::Int(64)],
+            "shift count out of range",
+        ),
+        ("m.neg_i8", vec![Value::Int(-128)], "overflow in negation"),
+        (
+            "m.div_i8",
+            vec![Value::Int(-128), Value::Int(-1)],
+            "overflow in division",
+        ),
+        ("m.narrowed", vec![Value::Int(256)], "was given 256"),
+    ];
+    for (name, args, what) in raises {
+        let raise = raised(unit, name, args);
+        assert!(
+            raise.message.contains(what),
+            "`{name}{args:?}` raised {raise:?}"
+        );
+    }
 }
