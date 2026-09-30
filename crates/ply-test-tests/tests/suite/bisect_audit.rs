@@ -1,9 +1,8 @@
 use crate::fixture::Compiled;
-use ply_span::Symbol;
+use ply_eval::{DefHash, Symbol};
 use ply_test::bisect::{
     Baseline, ChangeSet, Classify, DefKey, Regression, Rehashed, Row, change_set,
 };
-use ply_ty::DefHash;
 use std::collections::BTreeMap;
 
 fn sym(s: &str) -> Symbol {

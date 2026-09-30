@@ -3,9 +3,7 @@
 //! answers inputs only.
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{Machine, Provider};
-use ply_span::{SourceId, Span};
-use ply_ty::Front;
+use ply_eval::{Front, Machine, Provider, SourceId, Span};
 use std::collections::HashMap;
 
 /// A program that configures the tester over the directory it is handed, loads it, and reports

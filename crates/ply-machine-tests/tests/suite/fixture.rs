@@ -44,7 +44,7 @@ pub fn handed(path: &Path) -> ply_eval::Value {
     let mut files: Vec<(String, String, String)> = Vec::new();
     for path in paths {
         let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
-        let module = ply_ty::ModuleName::from_relative_path(&relative)
+        let module = ply_eval::ModuleName::from_relative_path(&relative)
             .expect("a fixture's file is a module");
         let text = std::fs::read_to_string(&path).expect("the fixture is read");
         files.push((path.display().to_string(), module.to_string(), text));
@@ -61,7 +61,7 @@ pub fn handed(path: &Path) -> ply_eval::Value {
     let pulled = producer::front_pulling_std_with(&own, ply_machine::shelf::sources(), &packages)
         .expect("the front end runs");
     for name in &pulled.modules {
-        let module = ply_ty::ModuleName::from_dotted(name);
+        let module = ply_eval::ModuleName::from_dotted(name);
         if let Some(text) = ply_machine::shelf::source(&module) {
             files.push((
                 ply_machine::shelf::pseudo_path(&module)
@@ -174,14 +174,14 @@ pub fn measured(
             .collect(),
     );
     let answer = package.enter("finite", vec![binders, decls]);
-    let domain = option_of(&answer, "a domain", ply_span::Span::DUMMY)
+    let domain = option_of(&answer, "a domain", ply_eval::Span::DUMMY)
         .expect("`finite` answers an option")?;
-    let shapes = field_of(domain, "shapes", ply_span::Span::DUMMY)
+    let shapes = field_of(domain, "shapes", ply_eval::Span::DUMMY)
         .expect("a domain has shapes")
-        .as_list(ply_span::Span::DUMMY, "the shapes")
+        .as_list(ply_eval::Span::DUMMY, "the shapes")
         .expect("a list")
         .iter()
-        .map(|shape| ply_machine::claims::shape_of(shape, ply_span::Span::DUMMY).expect("a shape"))
+        .map(|shape| ply_machine::claims::shape_of(shape, ply_eval::Span::DUMMY).expect("a shape"))
         .collect();
     let texts = Value::list(
         obligation
@@ -192,7 +192,7 @@ pub fn measured(
     );
     let name = package
         .enter("name_of", vec![texts])
-        .as_str(ply_span::Span::DUMMY, "a domain's name")
+        .as_str(ply_eval::Span::DUMMY, "a domain's name")
         .expect("`name_of` answers text")
         .to_string();
     Some(ply_test::obligation::Domain { shapes, name })
@@ -202,7 +202,7 @@ pub fn measured(
 pub fn bound() -> u64 {
     let bound = measuring()
         .enter("bound", Vec::new())
-        .as_int(ply_span::Span::DUMMY, "the bound")
+        .as_int(ply_eval::Span::DUMMY, "the bound")
         .expect("`bound` answers a number");
     u64::try_from(bound).expect("a bound is a count")
 }
@@ -220,7 +220,7 @@ impl Measuring {
             static BODIES: std::cell::OnceCell<std::rc::Rc<dyn ply_eval::Compiled>> =
                 const { std::cell::OnceCell::new() };
         }
-        let qualified = ply_span::Symbol::new(format!("{}.{name}", self.module));
+        let qualified = ply_eval::Symbol::new(format!("{}.{name}", self.module));
         BODIES.with(|bodies| {
             let compiled = bodies.get_or_init(|| ply_eval::Provider::attach(self.unit));
             match compiled.enter_whole(&qualified, &args, ply_eval::DEFAULT_MAX_CALLS) {
@@ -275,14 +275,14 @@ pub fn proving(
 > {
     let handed = handed(path);
     let front =
-        ply_machine::driver::handed_front_of(&handed, ply_span::Span::DUMMY).map_err(|d| {
+        ply_machine::driver::handed_front_of(&handed, ply_eval::Span::DUMMY).map_err(|d| {
             ply_machine::load::LoadError {
-                sources: ply_span::SourceMap::new(),
+                sources: ply_eval::SourceMap::new(),
                 diagnostics: vec![d],
             }
         })?;
     let loaded = ply_machine::driver::load_over_front(path, &front)?;
-    let dump = ply_machine::payload::field_of(&handed, "dump", ply_span::Span::DUMMY)
+    let dump = ply_machine::payload::field_of(&handed, "dump", ply_eval::Span::DUMMY)
         .expect("the front end's answer is handed over");
     let (world, obligations) = world_of(
         ply_eval::decode::At::new("the front end's answer", dump),
@@ -297,10 +297,9 @@ fn world_of(
     loaded: &ply_machine::load::Loaded,
 ) -> Result<(ply_prove::World, Vec<ply_prove::Obligation>), ply_eval::decode::Error> {
     use ply_eval::decode::At;
+    use ply_eval::{SpecKind, Symbol};
     use ply_prove::world::{Decl, Signature, Variant};
     use ply_prove::{Obligation, ObligationKind, World};
-    use ply_span::Symbol;
-    use ply_ty::SpecKind;
 
     let mut decls: Vec<Decl> = Vec::new();
     for ctor in answer.field("ctors")?.list()? {
@@ -352,7 +351,7 @@ fn world_of(
     }
 
     let row =
-        |footprint: &ply_ty::Footprint| (!footprint.is_empty()).then(|| footprint.to_string());
+        |footprint: &ply_eval::Footprint| (!footprint.is_empty()).then(|| footprint.to_string());
     let mut obligations = Vec::new();
     for (name, info) in &loaded.check.defs {
         if !info.spec.iter().any(|s| s.kind == SpecKind::Ensures) {
@@ -576,7 +575,7 @@ fn sort_of(
         "TyCon" => {
             let con = c.arg(0)?;
             Sort::Con(
-                ply_span::Symbol::new(con.field("name")?.utf8()?),
+                ply_eval::Symbol::new(con.field("name")?.utf8()?),
                 con.field("args")?.items(|a| sort_of(a, vars))?,
             )
         }
@@ -594,7 +593,7 @@ fn sort_of(
         "TyRecord" => Sort::record(
             fields(c.arg(0)?)?
                 .into_iter()
-                .map(|(name, field)| Ok((ply_span::Symbol::new(name), sort_of(field, vars)?)))
+                .map(|(name, field)| Ok((ply_eval::Symbol::new(name), sort_of(field, vars)?)))
                 .collect::<Result<Vec<_>, ply_eval::decode::Error>>()?,
         ),
         _ => return Err(c.unknown()),
@@ -627,7 +626,7 @@ fn params_of(scheme: ply_eval::decode::At<'_>) -> Result<Vec<i64>, ply_eval::dec
 
 /// One claim's binders, numbered together, each printed with its variables' letters.
 fn binders_of(
-    named: &[(ply_span::Symbol, ply_eval::decode::At<'_>)],
+    named: &[(ply_eval::Symbol, ply_eval::decode::At<'_>)],
 ) -> Result<Vec<ply_prove::Binder>, ply_eval::decode::Error> {
     let mut vars = Vec::new();
     for (_, ty) in named {

@@ -3,10 +3,9 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Machine, TaskId, Value};
-use ply_span::{Diagnostic, Symbol, codes};
-use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, Resource};
+use ply_eval::{
+    Diagnostic, EffectAtom, Footprint, Machine, Mode, Resource, Symbol, TaskId, Value, codes,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

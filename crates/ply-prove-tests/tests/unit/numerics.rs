@@ -1,10 +1,9 @@
 //! Drawing and shrinking `Float` and `Decimal`.
 
-use ply_eval::{Decimal, Value};
+use ply_eval::{Decimal, DefHash, Value};
 use ply_prove::property::{EDGE_CASES, GenStream, generatable, generate};
 use ply_prove::shrink::{candidates, minimal, size};
 use ply_prove::{Sort, World};
-use ply_ty::DefHash;
 
 fn world() -> World {
     World::default()

@@ -1,9 +1,7 @@
 use crate::hosts::{Hosts, hosting};
 use crate::load::Loaded;
-use ply_eval::HostRuntime;
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
+use ply_eval::{DefInfo, Diagnostic, HashOutput, HostRuntime, SourceId, Span, Symbol, codes};
 use ply_test::RunReport;
-use ply_ty::{DefInfo, HashOutput};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -257,7 +255,7 @@ pub fn mutants(loaded: &Loaded, def: &DefInfo) -> Vec<Mutant> {
 
 /// The program with one span replaced, as the front end reads it.
 fn spliced(loaded: &Loaded, mutant: &Mutant) -> (Vec<(String, String)>, Vec<SourceId>) {
-    let mut modules: Vec<&ply_ty::ModuleInfo> = loaded.check.modules.values().collect();
+    let mut modules: Vec<&ply_eval::ModuleInfo> = loaded.check.modules.values().collect();
     modules.sort_by_key(|m| m.source.0);
     let sources: Vec<(String, String)> = modules
         .iter()

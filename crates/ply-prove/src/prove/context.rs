@@ -3,7 +3,7 @@
 use super::claims::{Claims, Code, Definition};
 use crate::sort::Sort;
 use crate::world::{Ctor, Decl, Signature, World};
-use ply_span::Symbol;
+use ply_eval::Symbol;
 use std::collections::{BTreeSet, HashMap};
 
 pub struct Context<'a> {

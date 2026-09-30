@@ -12,7 +12,7 @@ const UNARMED_CODES: &[(&str, &str)] = &[];
 const UNARMED_VARIANTS: &[(&str, &str)] = &[(
     "Severity::Note",
     "Two consumers and no producer: `Diagnostic`'s Display in \
-         crates/ply-span/src/lib.rs heads a diagnostic \"Note\", and \
+         crates/ply-eval/src/span.rs heads a diagnostic \"Note\", and \
          crates/ply-machine/src/payload.rs hands the program a \"note\". \
          Nothing builds one. Severity also derives Deserialize, so a Note could \
          in principle arrive from a stored diagnostic rather than from a \
@@ -53,7 +53,7 @@ struct Indirection {
 const COVERED_ENUM_ROOTS: &[&str] = &["crates/ply-test/src", "crates/ply-prove/src"];
 
 /// Individually covered enums outside `COVERED_ENUM_ROOTS`, as `(file, name)`.
-const COVERED_ENUMS: &[(&str, &str)] = &[("crates/ply-span/src/lib.rs", "Severity")];
+const COVERED_ENUMS: &[(&str, &str)] = &[("crates/ply-eval/src/span.rs", "Severity")];
 
 /// Blanks comments and string, raw-string and char literals, preserving offsets and newlines.
 fn blank_literals_and_comments(src: &[u8]) -> Vec<u8> {
@@ -509,7 +509,7 @@ fn workspace_root() -> PathBuf {
         .join("..")
         .join("..")
         .canonicalize()
-        .expect("the workspace root is two directories above crates/ply-span")
+        .expect("the workspace root is two directories above crates/ply-eval-tests")
 }
 
 /// Package names from `[workspace] members`, read out of the root manifest as text.
@@ -822,24 +822,17 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-/// `NAME -> ("E0435", line)` for every `pub const` in `ply_span::codes`.
+/// `ply_eval::codes`, a module that is the whole of its file.
+const CODES: &str = "crates/ply-eval/src/codes.rs";
+
+/// `NAME -> ("E0435", line)` for every `pub const` in `ply_eval::codes`.
 fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
-    let raw = std::fs::read(root.join("crates/ply-span/src/lib.rs")).expect("ply-span's lib.rs");
+    let raw = std::fs::read(root.join(CODES)).expect("ply-eval's codes.rs");
     let blanked = blank_literals_and_comments(&raw);
-    let at = find_all(&blanked, b"pub mod codes")
-        .into_iter()
-        .next()
-        .expect("ply-span declares `pub mod codes`");
-    let open = blanked[at..]
-        .iter()
-        .position(|b| *b == b'{')
-        .expect("the codes module has a body")
-        + at;
-    let close = delim_close(&blanked, open);
+    let close = blanked.len();
 
     let mut out = BTreeMap::new();
-    for start in find_all(&blanked[open..close], b"pub const") {
-        let start = open + start;
+    for start in find_all(&blanked, b"pub const") {
         let name_at = skip_ws(&blanked, start + b"pub const".len(), close);
         let (name, name_end) = ident_at(&blanked, name_at);
         // `skip_ws` over `blanked` would skip the blanked literal and land on the `;`.
@@ -1206,7 +1199,7 @@ fn tree() -> &'static Tree {
 fn how_to_fix(what: &str, list: &str) -> String {
     format!(
         "\n\nEither construct it — {what} — or, if it is reserved on purpose, add a row to \
-         `{list}` in crates/ply-span-tests/tests/armed.rs with a reason. \
+         `{list}` in crates/ply-eval-tests/tests/suite/armed.rs with a reason. \
          An entry there is not absolution: it is what makes \"reserved on purpose\" and \
          \"we forgot\" stop looking identical. Do NOT loosen the rule to make an entry \
          disappear; that inverts the point of this gate."
@@ -1230,7 +1223,7 @@ fn every_registered_code_is_constructed_in_production() {
     );
     assert!(
         declared.len() > 50,
-        "parsed {} codes out of ply_span::codes — the parser is broken",
+        "parsed {} codes out of ply_eval::codes — the parser is broken",
         declared.len()
     );
     assert!(
@@ -1253,10 +1246,7 @@ fn every_registered_code_is_constructed_in_production() {
             dead.len()
         );
         for (name, (number, line)) in &dead {
-            let _ = writeln!(
-                message,
-                "  {number} {name}    declared at crates/ply-span/src/lib.rs:{line}"
-            );
+            let _ = writeln!(message, "  {number} {name}    declared at {CODES}:{line}");
         }
         message.push_str(
             "\nA code is ARMED iff a production Rust source calls Diagnostic::error(codes::NAME, ..) \
@@ -1373,7 +1363,7 @@ fn every_diagnostic_constructor_call_names_its_code_literally() {
          wrapper is invisible to every_registered_code_is_constructed_in_production, which \
          would then report it dead — or, if the wrapper were quietly allowlisted by file, hide \
          a real death. Add the wrapper to CODE_INDIRECTION in \
-         crates/ply-span-tests/tests/armed.rs with a reason, or pass codes::NAME literally.",
+         crates/ply-eval-tests/tests/suite/armed.rs with a reason, or pass codes::NAME literally.",
         unlisted.len(),
         unlisted.join("\n")
     );
@@ -1412,7 +1402,7 @@ fn every_code_declared_or_raised_has_one_row_in_the_registry() {
         .collect();
     assert!(
         shared.is_empty(),
-        "constants in ply_span::codes share a number, which nothing reading a code can tell \
+        "constants in ply_eval::codes share a number, which nothing reading a code can tell \
          apart: {shared:?}"
     );
 
@@ -1438,7 +1428,7 @@ fn every_code_declared_or_raised_has_one_row_in_the_registry() {
     let missing: Vec<&&str> = wanted.iter().filter(|c| !rows.contains_key(**c)).collect();
     assert!(
         missing.is_empty(),
-        "{} code(s) declared in ply_span::codes or raised from a `.ply` source have no row in \
+        "{} code(s) declared in ply_eval::codes or raised from a `.ply` source have no row in \
          `meanings()` in {REGISTRY}, so `ply explain` cannot say what they mean: {missing:?}\n\n\
          Add a row m(\"E0000\", \"what it means\") — adding a row moves no existing number.",
         missing.len()
@@ -1481,7 +1471,7 @@ fn the_registry_has_no_row_for_a_code_nothing_declares_or_raises() {
         .collect();
     assert!(
         stale.is_empty(),
-        "the registry explains {} code(s) that nothing declares in ply_span::codes or raises from \
+        "the registry explains {} code(s) that nothing declares in ply_eval::codes or raises from \
          a `.ply` source: {stale:?}\n\nDelete the row, or raise the code where the condition it \
          names is detected.",
         stale.len()
@@ -1508,7 +1498,7 @@ fn no_allowlist_entry_has_outlived_its_reason() {
         );
         if !declared.contains_key(*name) {
             stale.push(format!(
-                "  UNARMED_CODES has `{name}`, which ply_span::codes no longer declares — \
+                "  UNARMED_CODES has `{name}`, which ply_eval::codes no longer declares — \
                  delete the row"
             ));
         } else if armed.contains(*name) {
@@ -1834,7 +1824,7 @@ fn a_variant_list_is_read_off_an_enum_body() {
 fn a_codes_path_is_recognised_however_it_is_qualified() {
     assert_eq!(code_from_path("codes::X"), Some("X"));
     assert_eq!(code_from_path("crate::codes::X"), Some("X"));
-    assert_eq!(code_from_path("ply_span::codes::X"), Some("X"));
+    assert_eq!(code_from_path("ply_eval::codes::X"), Some("X"));
     assert_eq!(code_from_path("code"), None);
     assert_eq!(code_from_path("self.code"), None);
     assert_eq!(code_from_path("other::X"), None);

@@ -1,5 +1,4 @@
-use ply_eval::Value;
-use ply_span::{Span, codes};
+use ply_eval::{Span, Value, codes};
 
 /// A small stack, where unbounded host recursion aborts the whole test binary.
 fn on_a_small_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {

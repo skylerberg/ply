@@ -1,7 +1,8 @@
 use ply_codegen::c::{dump, producer};
-use ply_eval::{Fields, Value};
-use ply_span::{Edit, Fix, Severity, SourceId, Span, Symbol, codes};
-use ply_ty::{EffectAtom, Footprint, Hashed, Literal, Mode, Ordinal, Resource, Visibility};
+use ply_eval::{
+    Edit, EffectAtom, Fields, Fix, Footprint, Hashed, Literal, Mode, Ordinal, Resource, Severity,
+    SourceId, Span, Symbol, Value, Visibility, codes,
+};
 use std::sync::Arc;
 
 fn record(fields: Vec<(&str, Value)>) -> Value {
