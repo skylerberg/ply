@@ -175,7 +175,7 @@ fn emit_all(
     phases.emit = started.elapsed();
     let constants: Vec<String> = taken
         .iter()
-        .filter(|n| loaded.front.emitter_constants.contains(&Symbol::new(n)))
+        .filter(|n| loaded.constant(n))
         .cloned()
         .collect();
     // An uncalled pure nullary root still needs a code-table row for its memo slot.
