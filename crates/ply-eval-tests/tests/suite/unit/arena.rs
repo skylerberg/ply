@@ -565,6 +565,143 @@ fn a_close_parks_the_pinned_region_and_frees_the_ones_opened_after_it() {
     assert_eq!(arena.live(), 0);
 }
 
+/// The regions the entry's own stack keeps between entries: the fixture's and the entry's.
+const FLOOR: usize = 2;
+
+fn floored() -> Arena {
+    let mut arena: Arena = Arena::new();
+    for _ in 0..FLOOR {
+        arena.open(A, RegionKind::Shared);
+    }
+    arena
+}
+
+/// Two stacks' regions, the older closed first so the store frees out of order and reuses an
+/// index within the entry; answers the slots handed out, in order.
+fn an_entry(arena: &mut Arena) -> Vec<Slot> {
+    let mut slots = Vec::new();
+    let older = arena.open(A, RegionKind::Unique);
+    let younger = arena.open(B, RegionKind::Shared);
+    for i in 0..3 {
+        slots.extend(arena.alloc(A, Value::Int(i)));
+        slots.extend(arena.alloc(B, Value::Int(i)));
+    }
+    arena.close(older);
+    slots.extend(arena.alloc(B, Value::Int(9)));
+    arena.close(younger);
+    slots
+}
+
+#[test]
+fn a_renewed_store_hands_out_the_slots_a_new_one_does() {
+    let fresh = an_entry(&mut floored());
+    assert_eq!(fresh.first(), Some(&Slot::new(0, 0)));
+
+    let mut arena = floored();
+    for _ in 0..3 {
+        an_entry(&mut arena);
+    }
+    assert_ne!(
+        an_entry(&mut arena),
+        fresh,
+        "without a renewal an entry's slots count the lives earlier entries gave their indices"
+    );
+
+    for _ in 0..3 {
+        assert!(arena.renew(A, FLOOR));
+        assert_eq!(an_entry(&mut arena), fresh);
+    }
+}
+
+/// A renewal walks only the indices used since the last one, so those a wide entry used are
+/// renewed by the renewal after it and stay so through narrower entries.
+#[test]
+fn a_wide_entrys_indices_stay_renewed_through_narrower_entries() {
+    let entry = |arena: &mut Arena, cells: usize| -> Vec<Slot> {
+        let r = arena.open(A, RegionKind::Unique);
+        let slots: Vec<Slot> = (0..cells)
+            .map(|i| {
+                arena
+                    .alloc(A, Value::Int(i as i64))
+                    .expect("inside a region")
+            })
+            .collect();
+        arena.close(r);
+        assert!(arena.renew(A, FLOOR));
+        slots
+    };
+    let wide = CHUNK * 2 + 1;
+    let mut arena = floored();
+    entry(&mut arena, wide);
+    for _ in 0..4 {
+        entry(&mut arena, 3);
+    }
+
+    let slots = entry(&mut arena, wide);
+
+    let named: Vec<(u32, u32)> = slots.iter().map(|s| (s.index(), s.generation())).collect();
+    assert_eq!(named, (0..wide as u32).map(|i| (i, 0)).collect::<Vec<_>>());
+}
+
+/// Whatever is open above the floor or pinned may still hold a slot from before, which a renewed
+/// store would resolve again.
+#[test]
+fn a_renewal_is_refused_while_a_region_above_the_floor_is_open_or_pinned() {
+    let mut arena = floored();
+    let floor: Vec<RegionId> = arena.nesting(A).collect();
+    an_entry(&mut arena);
+
+    let above = arena.open(A, RegionKind::Unique);
+    assert!(!arena.renew(A, FLOOR), "a region open above the floor");
+    let unrenewed = arena.alloc(A, Value::Unit).expect("inside a region");
+    assert_eq!(unrenewed.index(), 0);
+    assert_ne!(unrenewed.generation(), 0, "the refusal changed nothing");
+    arena.close(above);
+
+    let other = arena.open(B, RegionKind::Shared);
+    assert!(!arena.renew(A, FLOOR), "a region open on another stack");
+    arena.close(other);
+
+    let pin = arena.pin(floor[1]).expect("the floor is open");
+    assert!(!arena.renew(A, FLOOR), "a pin on the floor");
+    arena.unpin(pin);
+
+    let parked = arena.open(B, RegionKind::Shared);
+    let pin = arena.pin(parked).expect("an open region takes a pin");
+    arena.close(parked);
+    assert_eq!((arena.total_depth(), arena.live()), (FLOOR, 0));
+    assert!(
+        !arena.renew(A, FLOOR),
+        "a region its pin parked, though it holds no cell"
+    );
+    arena.unpin(pin);
+
+    assert!(arena.renew(A, FLOOR));
+    let kept = arena.alloc(A, Value::Int(7)).expect("the floor is open");
+    assert_eq!(kept, Slot::new(0, 0));
+    assert!(!arena.renew(A, FLOOR), "a cell live in the floor");
+    assert_eq!(int_of(&arena, kept), 7);
+}
+
+/// A `cell_update` whose function never returned leaves its slot taken; the renewed store hands
+/// that name to a new cell, which nothing is updating.
+#[test]
+fn a_renewal_forgets_an_update_its_entry_never_finished() {
+    let mut arena = floored();
+    let r = arena.open(A, RegionKind::Unique);
+    let held = arena.alloc(A, Value::Int(1)).expect("inside a region");
+    arena.take(held).expect("the cell is live");
+    arena.close(r);
+
+    assert!(arena.renew(A, FLOOR));
+
+    arena.open(A, RegionKind::Unique);
+    let fresh = arena.alloc(A, Value::Int(2)).expect("inside a region");
+    assert_eq!(fresh, held);
+    assert!(!arena.is_taken(fresh));
+    assert_eq!(int_of(&arena, fresh), 2);
+}
+
 /// A held pin reaches a parked region, which a fresh one cannot name: the holds taken through it
 /// add to the region's count, and the region goes only with the last of them.
 #[test]

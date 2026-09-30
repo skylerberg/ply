@@ -24,7 +24,8 @@ struct Model {
     claims: fn(i64) -> bool,
     /// Points whose runs reach no `simulate` region.
     unobserved: bool,
-    raises: bool,
+    /// The code every run fails with before it reaches a region.
+    raises: Option<&'static str>,
     traces: Vec<Vec<u16>>,
 }
 
@@ -34,7 +35,7 @@ impl Model {
             tasks,
             claims,
             unobserved: false,
-            raises: false,
+            raises: None,
             traces: Vec::new(),
         }
     }
@@ -97,12 +98,9 @@ impl Model {
 
 impl LawSearch for Model {
     fn run(&mut self, _point: u64, seed: &Seed) -> BodyRun {
-        if self.raises {
+        if let Some(code) = self.raises {
             return BodyRun::model(
-                Interleaving::failed(
-                    Vec::new(),
-                    Diagnostic::error(codes::RUNTIME_ERROR, "divided by zero"),
-                ),
+                Interleaving::failed(Vec::new(), Diagnostic::error(code, "divided by zero")),
                 false,
                 true,
             );
@@ -395,7 +393,7 @@ fn a_sampled_plan_never_proves() {
 #[test]
 fn a_body_that_raises_is_a_gap_and_not_a_refutation() {
     let mut model = Model::new(2, |_| true);
-    model.raises = true;
+    model.raises = Some(codes::RUNTIME_ERROR);
     let searched = discharge(&law(1), &dpor(64), &ground(), &mut model);
     let Discharge::Unattempted(Gap::Raised {
         bindings,
@@ -407,6 +405,21 @@ fn a_body_that_raises_is_a_gap_and_not_a_refutation() {
     };
     assert_eq!(diagnostic.code, codes::RUNTIME_ERROR);
     assert_eq!(bindings.len(), 1);
+}
+
+/// A body the tier declined, or a schedule that diverged, is Ply's failure and not the program's gap.
+#[test]
+fn a_body_ply_failed_to_run_is_its_failure_and_not_a_gap() {
+    for code in [codes::INTERNAL_ERROR, codes::SIMULATION_DIVERGENCE] {
+        let mut model = Model::new(2, |_| true);
+        model.raises = Some(code);
+        let searched = discharge(&law(1), &dpor(64), &ground(), &mut model);
+        let Discharge::Faulted(fault) = &searched.discharge else {
+            panic!("{code} was reported as {:?}", searched.discharge);
+        };
+        assert_eq!(fault.diagnostic.code, code);
+        assert_eq!(fault.bindings.len(), 1, "the point Ply failed at");
+    }
 }
 
 #[test]

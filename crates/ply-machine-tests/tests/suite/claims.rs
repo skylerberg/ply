@@ -10,21 +10,34 @@ fn cli_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ply-cli/ply")
 }
 
-/// Every row has to name a module that declares the type.
+/// Every row has to name a module that declares the type, and every case it builds.
 ///
 /// The tag this side builds is `<module>.<constructor>` and the program matches it against the name
-/// its own spine gives the constructor, so a type that moved module and left its row behind is a
-/// value no arm matches. `replay`'s `the_fixture_declares_the_payload_where_the_machine_names_it`
-/// is the same claim about the fixture rather than about the program.
+/// its own spine gives the constructor, so a type that moved module and left its row behind, or a
+/// case spelled otherwise than the program declares it, is a value no arm matches. `replay`'s
+/// `the_fixture_declares_the_payload_where_the_machine_names_it` is the same claim about the fixture
+/// rather than about the program.
 #[test]
 fn every_marshalled_type_is_declared_where_this_side_says() {
     let loaded = ply_machine::load::load(&cli_root()).expect("the CLI tree loads");
-    for (home, ty) in MARSHALLED {
+    for (home, ty, cases) in MARSHALLED {
         assert!(
             declares(&loaded, home, ty),
             "`{ty}` is not declared in `{home}`, so a tag built from it names nothing the \
              program matches"
         );
+        for case in *cases {
+            let tag = format!("{home}.{case}");
+            assert!(
+                loaded
+                    .front
+                    .emitter_ctors
+                    .iter()
+                    .any(|(name, _)| name.as_str() == tag),
+                "`{home}` declares no case `{case}`, so the claims family builds a value no arm \
+                 matches"
+            );
+        }
     }
 }
 

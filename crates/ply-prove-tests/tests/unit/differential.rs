@@ -178,6 +178,12 @@ fn contradictions(a: &Audited) -> (Vec<String>, Vec<String>) {
                 diagnostic.message,
                 rendered(&bindings)
             )),
+            // A sample Ply could not finish checks nothing, so it cannot stand as agreement.
+            Discharge::Faulted(fault) => contradicted.push(format!(
+                "`{label}` is proved and Ply failed sampling it: `{}` at {}",
+                fault.diagnostic.message,
+                rendered(&fault.bindings)
+            )),
             _ => {}
         }
     }

@@ -570,6 +570,12 @@ impl Ctx {
         }
         self.detached.clear();
         self.entry = ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // No cell outlives its entry, so each entry can name its cells as a fresh tier would.
+        let renewed = self.cells.renew();
+        debug_assert!(
+            renewed,
+            "an entry began with a region above the floor open or pinned, or a cell live"
+        );
         // After the recovery above, which gives back what that entry held.
         self.cells_baseline = self.cell_extent();
         heap::enter(&mut self.heap);

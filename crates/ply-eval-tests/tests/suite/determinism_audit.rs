@@ -27,35 +27,23 @@ fn render_step(step: &Step) -> String {
     )
 }
 
-/// A program, the unit compiled from it, and the one tier every search's interleavings run on in
-/// turn, as one worker's do.
+/// A program and the one tier every run of it goes to in turn, as one worker's runs do.
 struct Audited {
     compiled: Compiled,
-    unit: &'static ply_codegen::Unit,
-    searched: Rc<dyn ply_eval::Compiled>,
+    tier: Rc<dyn ply_eval::Compiled>,
 }
 
 impl Audited {
     fn new(source: &str) -> Audited {
         let compiled = Compiled::named("t", source);
-        let unit = compiled.unit();
-        let searched = unit.attach();
-        Audited {
-            compiled,
-            unit,
-            searched,
-        }
+        let tier = compiled.unit().attach();
+        Audited { compiled, tier }
     }
 
     /// Test `index` at `seed`, run by the tier through the `simulate` region every fixture here
     /// opens: a transcript of anything else would compare nothing the program did.
-    fn run(
-        &self,
-        tier: Rc<dyn ply_eval::Compiled>,
-        index: usize,
-        seed: &Seed,
-    ) -> (Machine<'_>, Result<(), Diagnostic>) {
-        let mut machine = self.compiled.machine_on(tier);
+    fn run(&self, index: usize, seed: &Seed) -> (Machine<'_>, Result<(), Diagnostic>) {
+        let mut machine = self.compiled.machine_on(Rc::clone(&self.tier));
         machine.set_seed(seed.clone(), 100_000);
         let outcome = machine.eval_test(index);
         assert_eq!(
@@ -78,10 +66,8 @@ impl Audited {
         (machine, outcome)
     }
 
-    /// On a tier of its own: a cell's slot counts its earlier lives on the tier that allocated it,
-    /// so a reused tier names the same cell differently.
     fn transcript_of(&self, index: usize, seed: &Seed) -> Transcript {
-        let (machine, outcome) = self.run(self.unit.attach(), index, seed);
+        let (machine, outcome) = self.run(index, seed);
         let record = machine.simulated().expect("the run recorded its region");
         let trace = machine.trace();
         Transcript {
@@ -101,7 +87,7 @@ impl Audited {
     }
 
     fn interleaving_at(&self, index: usize, seed: &Seed) -> Interleaving {
-        let (machine, outcome) = self.run(Rc::clone(&self.searched), index, seed);
+        let (machine, outcome) = self.run(index, seed);
         machine
             .simulated()
             .expect("the run recorded its region")
@@ -316,6 +302,85 @@ fn the_whole_search_is_a_function_of_its_plan() {
                 "`{name}`: the search reported a different exploration"
             );
         }
+    }
+}
+
+/// The tasks touch the cell themselves, so the race is reported over the cell's name rather than
+/// over an effect's atom.
+const CELL_RACE: &str = r#"
+test "a lost update on a cell" {
+  with_cell[n](0) { c ->
+    simulate {
+      let a = task.spawn(|| { let seen = cell_get(c); clock.now(); cell_set(c, seen + 1) });
+      let b = task.spawn(|| { let seen = cell_get(c); clock.now(); cell_set(c, seen + 1) });
+      task.join(a);
+      task.join(b);
+      assert_eq(cell_get(c), 2)
+    }
+  }
+}
+"#;
+
+/// Each interleaving is an entry on the worker's tier, as is every search the worker ran before, so
+/// a race names the cell as a fresh tier does or the report depends on what ran first.
+#[test]
+fn every_search_on_one_tier_names_a_races_cell_alike() {
+    let audited = Audited::new(CELL_RACE);
+    let search = || {
+        explore(&dpor(256), &mut |seed: &Seed| {
+            audited.interleaving_at(0, seed)
+        })
+    };
+
+    let first = search();
+
+    assert_lost_update(&first, 2, "the first search");
+    let race = first
+        .exploration
+        .race
+        .clone()
+        .expect("the search reached the lost update by reordering two steps");
+    for site in [&race.left, &race.right] {
+        assert!(
+            site.access.starts_with("cell.") && site.access.ends_with("[@0.0]"),
+            "the test's one cell, named as a fresh tier names it: {}",
+            site.access
+        );
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            search().exploration.race,
+            Some(race.clone()),
+            "a later search on the same tier reported the race differently"
+        );
+    }
+}
+
+/// A mixture's run, on a tier of its own, reproduces a failure only if its message matches the one
+/// the worker's tier reported.
+#[test]
+fn every_entry_of_one_tier_names_a_failures_cell_alike() {
+    let compiled = Compiled::named(
+        "t",
+        r#"
+test "an update that reads the cell it holds" {
+  with_cell[n](1) { c -> cell_update(c, |x: Int| x + cell_get(c)) }
+}
+"#,
+    );
+    let tier = compiled.unit().attach();
+    for _ in 0..3 {
+        let d = compiled
+            .machine_on(Rc::clone(&tier))
+            .eval_test(0)
+            .expect_err("the update's function reads the cell it holds");
+        assert_eq!(
+            (d.code, d.message.as_str()),
+            (
+                codes::RUNTIME_ERROR,
+                "`cell_get` reached cell @0.0 while a `cell_update` holds its contents"
+            )
+        );
     }
 }
 

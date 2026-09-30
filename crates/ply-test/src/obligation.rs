@@ -1,8 +1,8 @@
 //! Discharging obligations, and the evidence they are filed and read back under.
 
-use ply_eval::DefHash;
+use ply_eval::{DefHash, Diagnostic, codes};
 use ply_prove::{
-    CaseReport, Certificate, Discharge, Evidence, Obligation, ProvePlan, ProveReport, Rule,
+    CaseReport, Certificate, Discharge, Evidence, Fault, Obligation, ProvePlan, ProveReport, Rule,
 };
 use ply_store::{
     CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule, Store,
@@ -205,16 +205,11 @@ impl Asked {
             discharges[index] = Some(discharge);
         }
 
-        // Every index either came from the cache or was discharged, so no `None` survives.
         let paired: Vec<(Obligation, Discharge)> = obligations
             .into_iter()
             .zip(discharges)
             .map(|(obligation, discharge)| {
-                let discharge = discharge.unwrap_or_else(|| {
-                    Discharge::Unattempted(ply_prove::Gap::UnhandledEffect(
-                        obligation.footprint.clone(),
-                    ))
-                });
+                let discharge = discharge.unwrap_or_else(|| unanswered(&obligation));
                 (obligation, discharge)
             })
             .collect();
@@ -224,4 +219,25 @@ impl Asked {
             duration: started.elapsed(),
         }
     }
+}
+
+/// A claim neither read back nor discharged: the program and the store disagree, which is Ply's.
+fn unanswered(obligation: &Obligation) -> Discharge {
+    Discharge::Faulted(Fault {
+        bindings: Vec::new(),
+        diagnostic: Box::new(
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!(
+                    "no evidence was read back or made for `{}`",
+                    obligation.owner
+                ),
+            )
+            .primary(obligation.span, "nothing was discharged for this claim")
+            .note(
+                "the program chose what the cache answered from the store this run reads; this is \
+                 Ply's fault",
+            ),
+        ),
+    })
 }

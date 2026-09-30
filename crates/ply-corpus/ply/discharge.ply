@@ -5,8 +5,6 @@
 import report
 import report (Row, Criterion, holding, number, exact, row)
 import spine
-import proof.obligation (Gap, GuardNotSampled, NotDrawn, Raised, ReachesHost, Ungeneratable,
-                         UnhandledEffect, gap_summary)
 import std.json (Json, Str, Number, Object, object, array)
 import std.json
 import std.list
@@ -21,6 +19,7 @@ pub type Obligation = {
   tier: Option<String>,
   // A proof whose certificate names a rule that ran the program rather than argued about it.
   executed: Bool,
+  // The kind of gap that left it unattempted, as the report names it.
   gap: Option<String>,
   // What the static tier alone decided and every construct it stopped at, or `None` for an
   // obligation it is never asked about.
@@ -39,6 +38,8 @@ pub type Discharged = {
   refuted: Int,
   vacuous: Int,
   unattempted: Int,
+  // Obligations Ply failed on, which are Ply's defects and never the project's gaps.
+  defect: Int,
   ms: Decimal,
   obligations: List<Obligation>,
 }
@@ -66,7 +67,7 @@ fn obligation_of(o: Map<String, Json>) -> Obligation =
   {
     tier: match map_get(o, "tier") { Some(Str(t)) -> Some(t), _ -> None },
     executed: match spine::field(o, "certificate") { Ok(c) -> ran_the_program(c), Err(_) -> false },
-    gap: match map_get(o, "gap") { Some(Str(g)) -> Some(g), _ -> None },
+    gap: match map_get(o, "gap_kind") { Some(Str(g)) -> Some(g), _ -> None },
     reach: match spine::field(o, "reach") {
       Err(_) -> None,
       Ok(r) ->
@@ -98,6 +99,7 @@ pub fn discharged_of(project: String, j: Json) -> Result<Discharged, String> =
             refuted: spine::int_field(summary, "refuted"),
             vacuous: spine::int_field(summary, "vacuous"),
             unattempted: spine::int_field(summary, "unattempted"),
+            defect: spine::int_field(summary, "defect"),
             ms: spine::decimal_field(m, "duration_ms"),
             obligations: map(spine::objects(spine::array_field(m, "obligations")), obligation_of),
           }),
@@ -105,19 +107,6 @@ pub fn discharged_of(project: String, j: Json) -> Result<Discharged, String> =
     },
     _ -> Err("the prove report is not an object"),
   }
-
-// A gap's kind, read back from the words `gap_summary` wrote for it, which is all the report
-// carries: two gaps of one kind with different particulars count as one.
-pub fn gap_kind(summary: String) -> String =
-  if summary == gap_summary(UnhandledEffect(None))
-      || (string_starts_with(summary, "performs ") && string_ends_with(summary, ": no handler")) {
-    "unhandled effect"
-  } else if string_starts_with(summary, "no value of `") { "ungeneratable parameter" }
-  else if string_starts_with(summary, "raised: ") { "evaluation raised" }
-  else if string_starts_with(summary, "the guard kept none of ") { "guard not sampled" }
-  else if string_starts_with(summary, "reaches the host (") { "reaches the host" }
-  else if summary == gap_summary(NotDrawn) { "not drawn one point at a time" }
-  else { summary }
 
 // --- Counting -----------------------------------------------------------------------------------
 
@@ -157,7 +146,7 @@ fn histogram_json(h: List<{ name: String, count: Int }>, what: String) -> Json =
 pub fn gaps(d: Discharged) -> List<{ name: String, count: Int }> =
   histogram(
     fold(d.obligations, [], |acc: List<String>, o: Obligation|
-      match o.gap { Some(g) -> push(acc, gap_kind(g)), None -> acc }),
+      match o.gap { Some(g) -> push(acc, g), None -> acc }),
   )
 
 // Where an obligation the static tier did not decide left its fragment, each construct once an
@@ -175,10 +164,17 @@ pub fn blockers(d: Discharged) -> List<{ name: String, count: Int }> =
 
 // --- The rows ------------------------------------------------------------------------------------
 
-// A refuted or vacuous obligation is a claim that does not hold; a gap is not one.
+// A refuted or vacuous obligation does not hold, and one Ply failed on is Ply's defect; a gap is not.
 pub fn held() -> Criterion =
-  holding("no obligation is refuted or vacuous", ["refuted", "vacuous"], |vs: List<Decimal>|
-    match vs { [refuted, vacuous] -> refuted == 0m && vacuous == 0m, _ -> false })
+  holding(
+    "no obligation is refuted or vacuous, and Ply failed on none",
+    ["refuted", "vacuous", "defect"],
+    |vs: List<Decimal>|
+      match vs {
+        [refuted, vacuous, defect] -> refuted == 0m && vacuous == 0m && defect == 0m,
+        _ -> false,
+      },
+  )
 
 // The discharge and the static tier asked alone take one decision over one budget, so a proof that
 // ran nothing is one the static tier decides.
@@ -192,7 +188,7 @@ pub fn decided() -> Criterion =
 pub fn tier_row(d: Discharged) -> Row = {
   let obligations = len(d.obligations);
   {
-    ..row(d.project, held(), [number("definitions", d.definitions, "definitions"), number("specified", d.specified, "definitions"), number("covered", d.covered, "definitions"), number("obligations", obligations, "obligations"), number("proved", d.proved, "obligations"), number("proved_by_execution", counted(d.obligations, |o: Obligation| proved(o) && o.executed), "obligations"), number("property", d.property, "obligations"), number("example", d.example, "obligations"), number("refuted", d.refuted, "obligations"), number("vacuous", d.vacuous, "obligations"), number("unattempted", d.unattempted, "obligations"), exact("ms", d.ms, "ms"), exact("per_obligation", decimal_div(d.ms, decimal_of_int(max(obligations, 1)), 3, HalfEven), "ms")]),
+    ..row(d.project, held(), [number("definitions", d.definitions, "definitions"), number("specified", d.specified, "definitions"), number("covered", d.covered, "definitions"), number("obligations", obligations, "obligations"), number("proved", d.proved, "obligations"), number("proved_by_execution", counted(d.obligations, |o: Obligation| proved(o) && o.executed), "obligations"), number("property", d.property, "obligations"), number("example", d.example, "obligations"), number("refuted", d.refuted, "obligations"), number("vacuous", d.vacuous, "obligations"), number("unattempted", d.unattempted, "obligations"), number("defect", d.defect, "obligations"), exact("ms", d.ms, "ms"), exact("per_obligation", decimal_div(d.ms, decimal_of_int(max(obligations, 1)), 3, HalfEven), "ms")]),
     detail: object([{ key: "gaps", value: histogram_json(gaps(d), "gap") }]),
   }
 }
@@ -264,33 +260,9 @@ pub fn run(
 
 // --- Tests ---------------------------------------------------------------------------------------
 
-// The kind each gap is, as the typed gap says it; a gap the prover adds is a match this refuses.
-fn kind_of(g: Gap) -> String =
-  match g {
-    UnhandledEffect(_) -> "unhandled effect",
-    Ungeneratable(_) -> "ungeneratable parameter",
-    Raised(_) -> "evaluation raised",
-    GuardNotSampled(_) -> "guard not sampled",
-    ReachesHost(_) -> "reaches the host",
-    NotDrawn -> "not drawn one point at a time",
-  }
-
-test "every kind of gap is read back from the words the prover wrote for it" {
-  let every = [
-    UnhandledEffect(None),
-    UnhandledEffect(Some("{db.read[users]}")),
-    Ungeneratable({ param: "f", ty: "(Int) -> Int" }),
-    Raised({ message: "division by zero", bindings: [] }),
-    GuardNotSampled({ generated: 200, witness: [] }),
-    ReachesHost("{db.read[users]}"),
-    NotDrawn,
-  ];
-  assert_eq(map(every, |g: Gap| gap_kind(gap_summary(g))), map(every, kind_of))
-}
-
 fn a_report() -> Json =
   match json::parse_string(
-      "{\"command\":\"prove\",\"ok\":true,\"exit_code\":0,\"specified\":3,\"coverage\":{\"definitions\":5,\"covered\":2},\"duration_ms\":12.5,\"summary\":{\"obligations\":5,\"proved\":3,\"property\":1,\"example\":0,\"refuted\":0,\"vacuous\":0,\"unattempted\":1},\"obligations\":[{\"tier\":\"proved\",\"certificate\":{\"rules\":[\"linear_arithmetic\",{\"unfold\":{\"def\":\"m.f\",\"depth\":1}}]},\"reach\":{\"decision\":\"proved\",\"steps\":4,\"blockers\":[]}},{\"tier\":\"proved\",\"certificate\":{\"rules\":[\"ground_evaluation\"]},\"reach\":{\"decision\":\"open\",\"steps\":2,\"blockers\":[{\"kind\":\"recursive_call\",\"about\":\"m.g\"},{\"kind\":\"recursive_call\",\"about\":\"m.h\"}]}},{\"tier\":\"proved\",\"certificate\":{\"rules\":[{\"exhaustive_enumeration\":{\"domain\":\"Bool\",\"points\":2}}]},\"reach\":null},{\"tier\":\"property\",\"reach\":{\"decision\":\"budget_spent\",\"steps\":10000,\"blockers\":[{\"kind\":\"division\",\"about\":null}]}},{\"tier\":null,\"outcome\":\"unattempted\",\"gap\":\"raised: division by zero\",\"reach\":{\"decision\":\"open\",\"steps\":1,\"blockers\":[{\"kind\":\"division\",\"about\":null}]}}]}",
+      "{\"command\":\"prove\",\"ok\":true,\"exit_code\":0,\"specified\":3,\"coverage\":{\"definitions\":5,\"covered\":2},\"duration_ms\":12.5,\"summary\":{\"obligations\":5,\"proved\":3,\"property\":1,\"example\":0,\"refuted\":0,\"vacuous\":0,\"unattempted\":1,\"defect\":0},\"obligations\":[{\"tier\":\"proved\",\"certificate\":{\"rules\":[\"linear_arithmetic\",{\"unfold\":{\"def\":\"m.f\",\"depth\":1}}]},\"reach\":{\"decision\":\"proved\",\"steps\":4,\"blockers\":[]}},{\"tier\":\"proved\",\"certificate\":{\"rules\":[\"ground_evaluation\"]},\"reach\":{\"decision\":\"open\",\"steps\":2,\"blockers\":[{\"kind\":\"recursive_call\",\"about\":\"m.g\"},{\"kind\":\"recursive_call\",\"about\":\"m.h\"}]}},{\"tier\":\"proved\",\"certificate\":{\"rules\":[{\"exhaustive_enumeration\":{\"domain\":\"Bool\",\"points\":2}}]},\"reach\":null},{\"tier\":\"property\",\"reach\":{\"decision\":\"budget_spent\",\"steps\":10000,\"blockers\":[{\"kind\":\"division\",\"about\":null}]}},{\"tier\":null,\"outcome\":\"unattempted\",\"gap\":\"raised: division by zero\",\"gap_kind\":\"raised\",\"reach\":{\"decision\":\"open\",\"steps\":1,\"blockers\":[{\"kind\":\"division\",\"about\":null}]}}]}",
     ) {
     Ok(j) -> j,
     Err(e) -> panic(e.message),
@@ -315,12 +287,12 @@ test "a project's tiers are the report's, and a proof that ran the program is to
     [Some(5m), Some(3m), Some(2m), Some(2m), Some(1m)],
   );
   assert_eq(value(tiers, "per_obligation"), Some(2.5m));
+  assert_eq(value(tiers, "defect"), Some(0m));
   assert(verdict_of(tier_row({ ..d, refuted: 1 })) != report::Pass);
   assert(verdict_of(tier_row({ ..d, vacuous: 1 })) != report::Pass);
-  assert_eq(
-    json::to_string(tiers.detail),
-    "{\"gaps\":[{\"gap\":\"evaluation raised\",\"obligations\":1}]}",
-  )
+  // Ply failing on an obligation is Ply's defect, which no gap histogram hides.
+  assert(verdict_of(tier_row({ ..d, defect: 1 })) != report::Pass);
+  assert_eq(json::to_string(tiers.detail), "{\"gaps\":[{\"gap\":\"raised\",\"obligations\":1}]}")
 }
 
 test "what the static tier decided is counted over what it was asked, and why it stopped" {
