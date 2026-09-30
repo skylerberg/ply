@@ -165,6 +165,46 @@ fn a_real_answer_reads_to_the_program_it_describes() {
     assert_eq!(unused.labels[0].span.source, SourceId(0));
 }
 
+const PURITY: &str = "effect log { write emit(Bytes) -> Unit }\n\
+fn origin() -> Int = 0\n\
+fn hello() -> Unit / { log.write } = log.emit(b\"hi\")\n\
+fn same<a>(x: a, y: a) -> Bool where derivable(eq, a) = x == y\n\
+fn positive(n: Int) -> Int requires n > 0 = n\n\
+test \"origin\" { assert_eq(origin(), 0) }\n\
+law \"same\" forall (n: Int) { same(n, n) }\n";
+
+/// A definition with a row or a constraint is impure, a test, a clause or a law part is never
+/// pure, and only a pure root of no arguments is a constant.
+#[test]
+fn each_root_reads_the_purity_the_compiler_published() {
+    let front =
+        dump::read(&answer(&[("m", PURITY)]), &[SourceId(0)]).unwrap_or_else(|e| panic!("{e}"));
+    let read: Vec<(&str, bool)> = front
+        .emitter_roots
+        .iter()
+        .map(|r| (r.root.as_str(), r.pure))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("m.origin", true),
+            ("m.hello", false),
+            ("m.same", false),
+            ("m.positive", true),
+            ("m.test#0", false),
+            ("m.positive#requires#0", false),
+            ("m.law#0.body", false),
+        ]
+    );
+    let constants: Vec<&str> = front
+        .emitter_roots
+        .iter()
+        .filter(|r| r.constant())
+        .map(|r| r.root.as_str())
+        .collect();
+    assert_eq!(constants, ["m.origin"]);
+}
+
 fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
     let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
@@ -436,7 +476,6 @@ fn holding(footprint: Value) -> Value {
         "keys",
         "emit_roots",
         "emit_ctors",
-        "emit_constants",
         "ordinals",
         "bodies",
         "test_bodies",
