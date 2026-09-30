@@ -1,9 +1,23 @@
-//! What a run's searches are written under, and what it reports about them.
+//! Which tests are searched, what a search's green verdict may be written under, and what the run
+//! reports about its searches.
 
 use ply_eval::explore::Interleaving;
 use ply_eval::{Exploration, Machine, Seed};
 use ply_span::Diagnostic;
-use ply_ty::DefHash;
+use ply_ty::{DefHash, EffectAtom, Footprint};
+
+/// The effect whose atom a `simulate` region leaves in a footprint: the seed it reads.
+const SIM_EFFECT: &str = "sim";
+
+/// Something in its closure entered a `simulate` region, so it runs once per interleaving.
+pub fn is_seeded(f: &Footprint) -> bool {
+    f.atoms().any(is_seed)
+}
+
+/// An atom that reads the seed a search hands the test.
+pub fn is_seed(a: &EffectAtom) -> bool {
+    a.effect.as_str() == SIM_EFFECT
+}
 
 pub fn seed_run(machine: &mut Machine<'_>, seed: &Seed, steps: u32) {
     machine.set_seed(seed.clone(), steps);
@@ -71,35 +85,4 @@ pub struct SimSummary {
     /// Searches that spent their budget.
     pub exhausted: usize,
     pub failed: usize,
-}
-
-impl SimSummary {
-    pub fn any(&self) -> bool {
-        self.simulated > 0
-    }
-
-    /// `simulated: 3 of 47 · 61 interleavings · 3 exhaustive`.
-    pub fn line(&self) -> Option<String> {
-        if !self.any() {
-            return None;
-        }
-        let mut line = format!(
-            "simulated: {} of {} · {} interleaving{}",
-            self.simulated,
-            self.total,
-            self.interleavings,
-            if self.interleavings == 1 { "" } else { "s" }
-        );
-        if self.exhaustive > 0 {
-            line.push_str(&format!(" · {} exhaustive", self.exhaustive));
-        }
-        if self.exhausted > 0 {
-            line.push_str(&format!(" · {} budget spent, not cached", self.exhausted));
-        }
-        Some(line)
-    }
-}
-
-pub fn replay_command(seed: &Seed, test_name: &str) -> String {
-    format!("ply test --seed {seed} --filter \"{test_name}\"")
 }

@@ -1,7 +1,6 @@
-// The front end's answer for the driver: the errors, or else the warnings and every table it reads, as values and in `diag.ply`'s framing.
+// The front end's answer for the driver: the errors, or else the warnings and every table it reads, as values.
 
-import spine (Span, Ident, QName, PDiag, dummy_span, num, pdiag, plabel, field, framed)
-import lexer (byte_of)
+import spine (Span, Ident, QName, PDiag, dummy_span, num, pdiag, plabel)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, VariantDef, SpecClause,
               SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef, Binder)
 import types (Mode, MRead, MWrite, MBad, AtomExpr)
@@ -14,7 +13,8 @@ import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecor
              CLet, CLetPat, CDo, CPat, CPatField, PxCtor, PxRecord, PxList, lower_fn, dump)
 import tycore (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
                atoms_text, atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new,
-               print_ty, Field, at, append, take, contains_bytes, contains_int)
+               print_ty, Field, at, append, take, contains_bytes, contains_int, canonical_atoms,
+               canonical_scheme, canonical_type)
 import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEffect,
                 resolve_modules, qualify, lookup, find, is_bare, diag1, backticked,
                 import_module_name, path_span)
@@ -22,17 +22,13 @@ import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index,
              digest, unused, Pin, Rehash, Rehashed, rehash_index)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, update_shapes, expanded_mods,
-              check_front_with, deriver_text, is_prelude_effect, builtin_schemes, builtin_docs,
-              find_doc)
-import diag (Parsed, parse_all, parse_at, outside_every_module, frame, flag, placed)
+              check_front_with, is_prelude_effect, builtin_schemes, builtin_docs, find_doc)
+import diag (Parsed, parse_all, parse_at, outside_every_module, placed)
 import pkg (Pkgs, Closure, Package, Pinned, closure, empty, pins_of)
 import resolve (Pkg, resolve_packaged, no_pkgs)
 import std.hash (blake3)
 import std.pkg (Manifest)
 import fmt (item_range, replace_item)
-
-fn cat(parts: List<List<Bytes>>) -> List<Bytes> =
-  fold(parts, [], |acc: List<Bytes>, p: List<Bytes>| append(acc, p))
 
 fn joined(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
@@ -291,11 +287,9 @@ pub fn effect_sets_of(
       _ -> acc,
     })
 
-fn set_text(v: SetView) -> Bytes =
-  bytes_concat_all([v.name, b" ", joined(v.includes, b","), b" ", atoms_text(v.atoms, b",")])
-
-// --- The rows the dump holds ------------------------------------------------
-// A test or a law is framed under its index: its key may hold a space or a newline.
+// --- The rows the answer holds -----------------------------------------------
+// Each type, scheme and footprint numbered as its text names its variables, so two answers about
+// one program are equal values however the checker numbered them.
 
 // Program-wide names of everything a module declares, in source order.
 pub fn module_items(m: Mod) -> List<Bytes> =
@@ -335,9 +329,9 @@ fn def_row(d: DefInfo, w: Written) -> DefRow =
     simple_name: d.simple_name,
     public: w.public,
     reuse: w.reuse,
-    scheme: d.scheme,
-    footprint: d.footprint,
-    performed: d.performed,
+    scheme: canonical_scheme(d.scheme),
+    footprint: canonical_atoms(d.footprint),
+    performed: canonical_atoms(d.performed),
     constraints: d.constraints,
     internally_effectful: d.internally_effectful,
     row_aliases: d.row_aliases,
@@ -346,7 +340,7 @@ fn def_row(d: DefInfo, w: Written) -> DefRow =
       {
         kind: kind_text(s.kind),
         index: s.index,
-        footprint: s.footprint,
+        footprint: canonical_atoms(s.footprint),
         at: span_at(d.at.module, s.span),
       }),
     at: loc_at(d.at),
@@ -360,7 +354,7 @@ fn test_row(t: TestInfo, name_at: Loc) -> TestRow =
     module: t.module,
     index: t.index,
     nondet: t.nondet,
-    footprint: t.footprint,
+    footprint: canonical_atoms(t.footprint),
     at: loc_at(t.at),
     name_at: loc_at(name_at),
   }
@@ -372,10 +366,10 @@ fn law_row(l: LawInfo, lits: List<Bytes>) -> LawRow =
     module: l.module,
     index: l.index,
     binders: map(l.binders, |b: LawBinder|
-      { name: b.name, at: span_at(l.at.module, b.span), ty: b.ty }),
+      { name: b.name, at: span_at(l.at.module, b.span), ty: canonical_type(b.ty) }),
     has_guard: l.has_guard,
     host: l.host,
-    footprint: l.footprint,
+    footprint: canonical_atoms(l.footprint),
     at: loc_at(l.at),
     literals: lits,
   }
@@ -385,9 +379,9 @@ fn op_row(module: Int, o: OpInfo) -> OpRow =
     name: o.name,
     mode: mode_text(o.mode),
     resource_param: o.resource_param,
-    params: o.params,
-    ret: o.ret,
-    scheme: o.scheme,
+    params: map(o.params, canonical_type),
+    ret: canonical_type(o.ret),
+    scheme: match o.scheme { Some(sc) -> Some(canonical_scheme(sc)), None -> None },
     at: span_at(module, o.at.span),
   }
 
@@ -410,13 +404,13 @@ fn ctor_row(k: CtorInfo) -> CtorRow =
     type_name: k.type_name,
     index: k.index,
     arity: k.arity,
-    fields: k.fields,
-    scheme: k.scheme,
+    fields: map(k.fields, canonical_type),
+    scheme: canonical_scheme(k.scheme),
     at: loc_at(k.at),
   }
 
 // --- The hashes ---------------------------------------------------------------
-// A name declared twice (a `fn` and an `effect` alike) is one frame, as the maps merged it.
+// A name declared twice (a `fn` and an `effect` alike) is one row, as the maps merged it.
 
 fn by_name_one(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<Bytes, Bytes> =
   fold(xs, map_new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
@@ -895,14 +889,6 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
   append(append(walked.fns, walked.tests), walked.specs)
 }
 
-fn emit_root_frame(r: EmitRoot) -> Bytes =
-  framed(b"emitroot", r.root, [
-    field(b"arity", num(r.arity)),
-    field(b"scalar", flag(r.scalar)),
-    field(b"width", flag(r.width)),
-    field(b"span", at_text(r.at)),
-  ])
-
 fn ordinal_row(m: Mod) -> OrdinalRow =
   {
     module: m.name,
@@ -935,7 +921,7 @@ fn tables(
   let names = test_name_spans(mods);
   let lits = law_literals(mods);
   {
-    diags: map(warnings, framed_diag),
+    diags: map(warnings, answered_diag),
     order: map(r.order, |i: Int| at(mods, i).name),
     packages: packages,
     pins: pins,
@@ -1542,12 +1528,12 @@ fn analyse_closure(
   }
 }
 
-// Every table the answer holds, as the rows `dump_text` frames.
+// Every table the answer holds, as rows.
 pub fn dump_of(a: Analysis) -> Dump =
   match a {
     Refused(ds) ->
       {
-        diags: map(ds, framed_diag),
+        diags: map(ds, answered_diag),
         order: [],
         packages: [],
         pins: [],
@@ -1572,16 +1558,6 @@ pub fn dump_of(a: Analysis) -> Dump =
     Analysed(w) ->
       tables(w.warnings, w.mods, w.r, w.checked, w.index, w.hashes, w.packages, w.pins, w.mod_pkg),
   }
-
-pub fn front_dump(sources: List<Source>) -> String = front_dump_with(sources, [], [])
-
-// The front end handed the rows the last answer published: what this program hashes the same is
-// taken from them, and only what moved is walked.
-pub fn front_dump_with(
-  sources: List<Source>,
-  defs: List<KnownDefRow>,
-  tests: List<KnownTestRow>,
-) -> String = string_of_bytes(dump_text(dump_of(analyse_with(parse_all(sources), defs, tests))))
 
 // A builtin as the checker binds it, and the names its parameters are documented under.
 pub type BuiltinRow = { name: Bytes, scheme: Scheme, params: List<Bytes> }
@@ -1996,28 +1972,14 @@ pub fn analyse_pulling_std_with(
   }
 }
 
-// `front_dump` over `user` and the modules of `shipped` it imports, led by a `pulled` frame naming those in order.
-pub fn front_pulling_std(user: List<Source>, shipped: List<Source>) -> String =
-  front_pulling_std_with(user, shipped, [], [])
-
-pub fn front_pulling_std_with(
-  user: List<Source>,
-  shipped: List<Source>,
-  defs: List<KnownDefRow>,
-  tests: List<KnownTestRow>,
-  pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
-) -> String = {
-  let a: FrontAnswer = answer_pulling_std_with(user, shipped, defs, tests, pkgs);
-  let head = framed(b"pulled", b"_", map(a.pulled, |n: Bytes| field(b"module", n)));
-  string_of_bytes(bytes_concat(head, dump_text(a.dump)))
-}
-
 // The front end's answer as values: the shipped modules pulled in, in the order a label's module
 // index counts them after the program's own, and the rows. A refused program's rows are its
 // diagnostics alone.
 pub type FrontAnswer = { pulled: List<Bytes>, dump: Dump }
 
-// `front_pulling_std_with`'s answer before it is framed.
+// `analyse_pulling_std_with`'s answer as the rows it holds: what the driver reads. The rows handed
+// in are the last answer's: what this program hashes the same is taken from them, and only what
+// moved is walked.
 pub fn answer_pulling_std_with(
   user: List<Source>,
   shipped: List<Source>,
@@ -2029,10 +1991,10 @@ pub fn answer_pulling_std_with(
   { pulled: x.pulled, dump: dump_of(x.out) }
 }
 
-// --- The rows a dump is made of -----------------------------------------------
-// Types and rows are held as the checker's values; only the writer prints them.
+// --- The rows an answer is made of ----------------------------------------------
+// Types and rows are held as the checker's values.
 
-// A span as a frame writes it: a module index, `no_module` outside every module, and the offsets.
+// A span: a module index, `no_module` outside every module, and the offsets.
 pub type At = { module: Int, start: Int, end: Int }
 
 pub type ModuleRow = {
@@ -2143,7 +2105,7 @@ pub type HashRow = {
   closure: List<Bytes>,
 }
 
-// A test's or a law's hash frame, under the index of the item it is about; `text` is a law's
+// A test's or a law's hash row, under the index of the item it is about; `text` is a law's
 // sentence hash and is empty for a test.
 pub type ItemHashRow = {
   index: Int,
@@ -2160,7 +2122,7 @@ pub type OrdinalRow = { module: Bytes, items: List<Bytes> }
 
 pub type BodyRow = { name: Bytes, body: Bytes }
 
-// Every frame of a dump, each table in the order it is written.
+// Every table of the front end's answer.
 pub type Dump = {
   diags: List<Diag>,
   order: List<Bytes>,
@@ -2188,11 +2150,8 @@ pub type Dump = {
 pub fn has_error(ds: List<Diag>) -> Bool =
   fold(ds, false, |acc: Bool, d: Diag| acc || d.severity == b"error")
 
-// --- Writing ------------------------------------------------------------------
-
-// A diagnostic as a frame carries it: the frame holds no dedup key, and the note count is the
-// notes. What a reader can answer, so what a `Dump` holds.
-pub fn framed_diag(d: Diag) -> Diag =
+// A diagnostic as the answer carries it: no dedup key, and the note count is the notes.
+pub fn answered_diag(d: Diag) -> Diag =
   {
     code: d.code,
     notes: len(d.notes_text),
@@ -2204,235 +2163,6 @@ pub fn framed_diag(d: Diag) -> Diag =
     fixes: d.fixes,
   }
 
-fn at_text(a: At) -> Bytes = bytes_concat_all([num(a.module), b" ", num(a.start), b" ", num(a.end)])
-
-fn module_frame(m: ModuleRow) -> Bytes =
-  framed(
-    b"module",
-    m.name,
-    cat([
-      [field(b"index", num(m.index))],
-      map(m.items, |x: Bytes| field(b"item", x)),
-      map(m.imports, |x: Bytes| field(b"import", x)),
-      map(m.sets, |v: SetView| field(b"effect_set", set_text(v))),
-    ]),
-  )
-
-fn footprint_text(atoms: List<Atom>) -> Bytes = atoms_text(atoms, b",")
-
-fn constraint_text(c: DefConstraint) -> Bytes =
-  bytes_concat_all([deriver_text(c.deriver), b" ", num(c.param)])
-
-fn def_frame(d: DefRow) -> Bytes =
-  framed(
-    b"def",
-    d.name,
-    cat([
-      [
-        field(b"module", d.module),
-        field(b"simple_name", d.simple_name),
-        field(b"public", flag(d.public)),
-        field(b"reuse", flag(d.reuse)),
-        field(b"scheme", scheme_text(d.scheme)),
-        field(b"footprint", footprint_text(d.footprint)),
-        field(b"performed", footprint_text(d.performed)),
-      ],
-      map(d.constraints, |c: DefConstraint| field(b"constraint", constraint_text(c))),
-      [field(b"internally_effectful", flag(d.internally_effectful))],
-      map(d.row_aliases, |a: Bytes| field(b"row_alias", a)),
-      map(d.params, |p: ParamRow| field(b"param", bytes_concat_all([p.name, b" ", at_text(p.at)]))),
-      map(d.spec, |s: SpecRow|
-        field(
-          b"spec",
-          bytes_concat_all([
-            s.kind,
-            b" ",
-            num(s.index),
-            b" ",
-            footprint_text(s.footprint),
-            b"\n",
-            at_text(s.at),
-          ]),
-        )),
-      [field(b"span", at_text(d.at))],
-      map(d.literals, |x: Bytes| field(b"literal", x)),
-    ]),
-  )
-
-fn type_frame(t: TypeRow) -> Bytes =
-  framed(b"type", t.name, [
-    field(b"module", t.module),
-    field(b"simple_name", t.simple_name),
-    field(b"public", flag(t.public)),
-    field(b"arity", num(t.arity)),
-    field(b"span", at_text(t.at)),
-  ])
-
-fn test_frame(t: TestRow) -> Bytes =
-  framed(b"test", num(t.index), [
-    field(b"key", t.key),
-    field(b"name", t.name),
-    field(b"module", t.module),
-    field(b"index", num(t.index)),
-    field(b"nondet", flag(t.nondet)),
-    field(b"footprint", footprint_text(t.footprint)),
-    field(b"span", at_text(t.at)),
-    field(b"name_span", at_text(t.name_at)),
-  ])
-
-fn law_frame(l: LawRow) -> Bytes =
-  framed(
-    b"law",
-    num(l.index),
-    cat([
-      [
-        field(b"key", l.key),
-        field(b"name", l.name),
-        field(b"module", l.module),
-        field(b"index", num(l.index)),
-      ],
-      map(l.binders, |b: BinderRow|
-        field(b"binder", bytes_concat_all([b.name, b" ", at_text(b.at), b"\n", type_text(b.ty)]))),
-      [
-        field(b"has_guard", flag(l.has_guard)),
-        field(b"host", flag(l.host)),
-        field(b"footprint", footprint_text(l.footprint)),
-        field(b"span", at_text(l.at)),
-      ],
-      map(l.literals, |x: Bytes| field(b"literal", x)),
-    ]),
-  )
-
-fn op_text(o: OpRow) -> Bytes =
-  bytes_concat_all([
-    o.name,
-    b" ",
-    o.mode,
-    b" ",
-    flag(o.resource_param),
-    b" ",
-    num(len(o.params)),
-    b" ",
-    flag(match o.scheme { Some(_) -> true, None -> false }),
-    b" ",
-    at_text(o.at),
-    b"\n",
-    bytes_concat_all(map(o.params, |p: Type| bytes_concat(type_text(p), b"\n"))),
-    type_text(o.ret),
-    b"\n",
-    match o.scheme { Some(sc) -> bytes_concat(scheme_text(sc), b"\n"), None -> b"" },
-  ])
-
-fn effect_frame(e: EffectRow) -> Bytes =
-  framed(
-    b"effect",
-    e.name,
-    cat([
-      [
-        field(b"module", e.module),
-        field(b"simple_name", e.simple_name),
-        field(b"public", flag(e.public)),
-        field(b"nondet", flag(e.nondet)),
-      ],
-      map(e.ops, |o: OpRow| field(b"op", op_text(o))),
-      [field(b"span", at_text(e.at))],
-    ]),
-  )
-
-fn ctor_frame(k: CtorRow) -> Bytes =
-  framed(
-    b"ctor",
-    k.name,
-    cat([
-      [
-        field(b"module", k.module),
-        field(b"simple_name", k.simple_name),
-        field(b"type_name", k.type_name),
-        field(b"index", num(k.index)),
-        field(b"arity", num(k.arity)),
-      ],
-      map(k.fields, |t: Type| field(b"field", type_text(t))),
-      [field(b"scheme", scheme_text(k.scheme)), field(b"span", at_text(k.at))],
-    ]),
-  )
-
-fn hex_field(key: Bytes, h: Option<Bytes>) -> List<Bytes> =
-  match h { Some(x) -> [field(key, x)], None -> [] }
-
-fn reach_fields(deps: List<Bytes>, closure: List<Bytes>) -> List<Bytes> =
-  append(map(deps, |n: Bytes| field(b"dep", n)), map(closure, |n: Bytes| field(b"closure", n)))
-
-fn hash_frame(f: HashFrame) -> Bytes =
-  match f {
-    HDef(r) ->
-      framed(
-        b"hash",
-        r.name,
-        cat([
-          hex_field(b"def", r.def),
-          hex_field(b"own", r.own),
-          hex_field(b"decl", r.decl),
-          map(r.specs, |h: Bytes| field(b"spec", h)),
-          map(r.spec_texts, |h: Bytes| field(b"spec_text", h)),
-          reach_fields(r.deps, r.closure),
-        ]),
-      ),
-    HTest(r) ->
-      framed(
-        b"testhash",
-        num(r.index),
-        cat([[field(b"key", r.key), field(b"hash", r.hash)], reach_fields(r.deps, r.closure)]),
-      ),
-    HLaw(r) ->
-      framed(
-        b"lawhash",
-        num(r.index),
-        cat([
-          [field(b"key", r.key), field(b"hash", r.hash), field(b"text", r.text)],
-          reach_fields(r.deps, r.closure),
-        ]),
-      ),
-  }
-
-fn ordinal_frame(o: OrdinalRow) -> Bytes =
-  framed(b"ordinal", o.module, map(o.items, |x: Bytes| field(b"item", x)))
-
-fn table_frames(d: Dump) -> List<Bytes> =
-  cat([
-    [framed(b"order", b"_", map(d.order, |m: Bytes| field(b"module", m)))],
-    map(d.packages, |p: Pkg|
-      framed(b"pkg", p.prefix, map(p.deps, |dep: Bytes| field(b"dep", dep)))),
-    map(d.pins, |p: Pinned|
-      framed(b"pin", p.name, [field(b"version", p.version), field(b"digest", p.digest)])),
-    [framed(b"modpkg", b"_", map(d.mod_pkg, |i: Int| field(b"pkg", num(i))))],
-    map(d.modules, module_frame),
-    map(d.defs, def_frame),
-    map(d.types, type_frame),
-    map(d.tests, test_frame),
-    map(d.laws, law_frame),
-    map(d.effects, effect_frame),
-    map(d.ctors, ctor_frame),
-    map(d.hashes, hash_frame),
-    [framed(b"hashesdigest", b"_", [hex(d.hashes_digest)])],
-    map(d.keys, |k: KeyRow| framed(b"key", k.root, [k.key])),
-    map(d.emit_roots, emit_root_frame),
-    map(d.emit_ctors, |k: EmitCtor| framed(b"emitctor", k.name, [field(b"arity", num(k.arity))])),
-    map(d.emit_constants, |r: Bytes| framed(b"emitconst", r, [])),
-    map(d.ordinals, ordinal_frame),
-    map(d.bodies, |b: BodyRow| framed(b"body", b.name, [hex(b.body)])),
-    map(range(0, len(d.test_bodies)), |i: Int|
-      framed(b"testbody", num(i), [hex(at(d.test_bodies, i))])),
-  ])
-
-// The diagnostics lead; an error is the whole answer, so no table follows one.
-pub fn dump_frames(d: Dump) -> List<Bytes> = {
-  let ds = map(range(0, len(d.diags)), |i: Int| frame(i, at(d.diags, i)));
-  if has_error(d.diags) { ds } else { append(ds, table_frames(d)) }
-}
-
-// One concatenation over the finished frames; appending per frame is quadratic.
-pub fn dump_text(d: Dump) -> Bytes = bytes_concat_all(dump_frames(d))
-
 // --- Tests ------------------------------------------------------------------
 
 fn program() -> List<Source> =
@@ -2442,16 +2172,6 @@ fn program() -> List<Source> =
       src: b"effect log { write emit(Bytes) -> Unit }\ntype Shape = | Dot | Line(Int)\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\ntest \"says\" { say(b\"x\") }",
     },
   ]
-
-fn holds(dump: String, frame_text: Bytes) -> Bool =
-  match bytes_index_of(bytes_of_string(dump), frame_text) { Some(_) -> true, None -> false }
-
-// The index just past `head` in the dump.
-fn past(d: Bytes, head: Bytes) -> Int =
-  match bytes_index_of(d, head) {
-    Some(i) -> i + bytes_len(head),
-    None -> panic("the dump holds the frame"),
-  }
 
 test "the emitter's root keys cover every root and no two share one" {
   let src = b"fn pos(x: Int) -> Bool = x > 0\nfn f(x: Int) -> Int requires pos(x) ensures x >= 0 = x\ntest \"t\" { assert_eq(f(1), 1) }\nlaw \"l\" forall (x: Int) { f(x) == x }";
@@ -2474,20 +2194,36 @@ test "the emitter's root keys cover every root and no two share one" {
   }
 }
 
-test "a diagnostic ends the dump where diag_dump would" {
-  assert_eq(
-    front_dump([{ name: b"m", src: b"fn f() -> Int = \"x\"" }]),
-    "diag 0 121\ncode 5\nE0201severity 5\nerrormessage 33\ntype mismatch: function body typelabel 40\n0 16 19 1\nexpected `Int`, found `String`",
-  )
-}
-
-test "the warnings come first, then the order and the module frame" {
-  assert(
-    bytes_starts_with(
-      bytes_of_string(front_dump(program())),
-      b"diag 0 98\ncode 5\nW0611severity 7\nwarningmessage 28\ntype `m.Shape` is never usedlabel 20\n0 46 51 1\nnever usedorder _ 10\nmodule 1\nmpkg  0\npkg std 0\npkg compiler 9\ndep 3\nstdmodpkg _ 7\npkg 1\n0module m 72\nindex 1\n0item 5\nm.logitem 7\nm.Shapeitem 5\nm.Dotitem 6\nm.Lineitem 5\nm.saydef m.say ",
-    ),
-  )
+test "a program's answer holds its warnings, its order, its packages and its modules" {
+  let d = dump_of(analyse(parse_all(program())));
+  assert_eq(d.diags, [
+    {
+      code: b"W0611",
+      notes: 0,
+      labels: [{ module: 0, start: 46, end: 51, primary: true, text: b"never used" }],
+      text: b"",
+      message: b"type `m.Shape` is never used",
+      notes_text: [],
+      severity: b"warning",
+      fixes: [],
+    },
+  ]);
+  assert_eq(d.order, [b"m"]);
+  assert_eq(d.packages, [
+    { prefix: b"", deps: [] },
+    { prefix: b"std", deps: [] },
+    { prefix: b"compiler", deps: [b"std"] },
+  ]);
+  assert_eq(d.mod_pkg, [0]);
+  assert_eq(d.modules, [
+    {
+      name: b"m",
+      index: 0,
+      items: [b"m.log", b"m.Shape", b"m.Dot", b"m.Line", b"m.say"],
+      imports: [],
+      sets: [],
+    },
+  ])
 }
 
 fn reachable() -> List<Source> =
@@ -2499,93 +2235,145 @@ fn reachable() -> List<Source> =
   ]
 
 test "only a definition no root reaches is warned, each once" {
-  let out = front_dump(reachable());
-  assert(holds(out, b"message 25\nfn `m.dead` is never used"));
-  assert(holds(out, b"message 27\nfn `m.deader` is never used"));
-  assert(holds(out, b"message 29\ntype `m.Unused` is never used"));
-  assert(!holds(out, b"diag 3 "));
-  assert(holds(out, b"order _ "))
+  let d = dump_of(analyse(parse_all(reachable())));
+  let said = map(d.diags, |x: Diag| x.message);
+  assert(contains_bytes(said, b"fn `m.dead` is never used"));
+  assert(contains_bytes(said, b"fn `m.deader` is never used"));
+  assert(contains_bytes(said, b"type `m.Unused` is never used"));
+  assert_eq(len(said), 3);
+  assert(len(d.order) > 0)
 }
 
-test "a definition frames its scheme, footprint and span" {
-  assert(
-    holds(
-      front_dump(program()),
-      b"def m.say 190\nmodule 1\nmsimple_name 3\nsaypublic 1\n0reuse 1\n0scheme 31\n(Bytes) -> Unit / {m.log.write}footprint 11\nm.log.writeperformed 10\nm.log.emitinternally_effectful 1\n1param 9\nb 0 79 87span 8\n0 72 126",
-    ),
-  )
+test "a definition's row holds its scheme, footprint, parameters and span" {
+  let say = def_named(dump_of(analyse(parse_all(program()))), b"m.say");
+  assert_eq(say.module, b"m");
+  assert_eq(say.simple_name, b"say");
+  assert(!say.public && !say.reuse);
+  assert_eq(scheme_text(say.scheme), b"(Bytes) -> Unit / {m.log.write}");
+  assert_eq(atoms_text(say.footprint, b","), b"m.log.write");
+  assert_eq(atoms_text(say.performed, b","), b"m.log.emit");
+  assert(say.internally_effectful);
+  assert_eq(say.params, [{ name: b"b", at: { module: 0, start: 79, end: 87 } }]);
+  assert_eq(say.at, { module: 0, start: 72, end: 126 })
 }
 
-test "a test is framed by its index and carries its key" {
-  assert(
-    holds(
-      front_dump(program()),
-      b"test 0 113\nkey 6\nm.saysname 4\nsaysmodule 1\nmindex 1\n0nondet 1\n0footprint 11\nm.log.writespan 9\n0 127 152name_span 9\n0 132 138",
-    ),
-  )
+test "a test's row is placed by its index and carries its key" {
+  assert_eq(dump_of(analyse(parse_all(program()))).tests, [
+    {
+      key: b"m.says",
+      name: b"says",
+      module: b"m",
+      index: 0,
+      nondet: false,
+      footprint: [{ effect: b"m.log", resource: RSingleton, mode: MWrite, op: None }],
+      at: { module: 0, start: 127, end: 152 },
+      name_at: { module: 0, start: 132, end: 138 },
+    },
+  ])
 }
 
-test "an effect frames each operation on its own lines" {
-  assert(
-    holds(
-      front_dump(program()),
-      b"effect m.log 102\nmodule 1\nmsimple_name 3\nlogpublic 1\n0nondet 1\n0op 36\nemit write 0 1 0 0 13 38\nBytes\nUnit\nspan 6\n0 0 40",
-    ),
-  )
+fn effect_named(d: Dump, name: Bytes) -> EffectRow =
+  match fold(d.effects, None, |acc: Option<EffectRow>, e: EffectRow|
+      if e.name == name { Some(e) } else { acc }) {
+    Some(e) -> e,
+    None -> panic("the answer holds the effect"),
+  }
+
+test "an effect's row holds each operation with its mode, its types and its span" {
+  let log = effect_named(dump_of(analyse(parse_all(program()))), b"m.log");
+  assert_eq(log.module, b"m");
+  assert_eq(log.simple_name, b"log");
+  assert(!log.public && !log.nondet);
+  assert_eq(log.ops, [
+    {
+      name: b"emit",
+      mode: b"write",
+      resource_param: false,
+      params: [con_named(b"Bytes")],
+      ret: con_named(b"Unit"),
+      scheme: None,
+      at: { module: 0, start: 13, end: 38 },
+    },
+  ]);
+  assert_eq(log.at, { module: 0, start: 0, end: 40 })
 }
 
 test "a prelude effect is placed outside every module and its operations carry a scheme" {
-  assert(
-    holds(
-      front_dump(program()),
-      b"effect sim 119\nmodule 0\nsimple_name 3\nsimpublic 1\n1nondet 1\n0op 45\nseed read 0 0 1 4294967295 0 0\nInt\n() -> Int\nspan 14\n4294967295 0 0",
-    ),
-  )
+  let sim = effect_named(dump_of(analyse(parse_all(program()))), b"sim");
+  assert_eq(sim.module, b"");
+  assert(sim.public);
+  assert_eq(sim.at, { module: no_module(), start: 0, end: 0 });
+  assert_eq(map(sim.ops, |o: OpRow| o.name), [b"seed"]);
+  let seed = at(sim.ops, 0);
+  assert_eq(seed.mode, b"read");
+  assert_eq(seed.params, []);
+  assert_eq(seed.ret, con_named(b"Int"));
+  assert_eq(match seed.scheme { Some(sc) -> scheme_text(sc), None -> b"" }, b"() -> Int");
+  assert_eq(seed.at, { module: no_module(), start: 0, end: 0 })
 }
 
-test "a constructor frames its fields and its scheme" {
-  assert(
-    holds(
-      front_dump(program()),
-      b"ctor m.Line 116\nmodule 1\nmsimple_name 4\nLinetype_name 7\nm.Shapeindex 1\n1arity 1\n1field 3\nIntscheme 16\n(Int) -> m.Shapespan 7\n0 62 71",
-    ),
-  )
+test "a constructor's row holds its fields and its scheme" {
+  let line = filter(dump_of(analyse(parse_all(program()))).ctors, |k: CtorRow| k.name == b"m.Line");
+  assert_eq(line, [
+    {
+      name: b"m.Line",
+      module: b"m",
+      simple_name: b"Line",
+      type_name: b"m.Shape",
+      index: 1,
+      arity: 1,
+      fields: [con_named(b"Int")],
+      scheme: {
+        ty_vars: [],
+        row_vars: [],
+        label_vars: [],
+        ty: TyFn({
+          params: [con_named(b"Int")],
+          ret: con_named(b"m.Shape"),
+          effects: { atoms: [], tail: None },
+        }),
+      },
+      at: { module: 0, start: 62, end: 71 },
+    },
+  ])
 }
 
-test "a hash record carries the definition's hash, its own form and its reach, and the body hashes to it" {
-  let d = bytes_of_string(front_dump(program()));
-  let def_at = past(d, b"hash m.say 183\ndef 64\n");
-  let def_hash = bytes_slice(d, def_at, def_at + 64);
-  assert_eq(bytes_slice(d, def_at + 64, def_at + 71), b"own 64\n");
-  assert_eq(
-    bytes_slice(d, def_at + 135, def_at + 135 + 52),
-    b"dep 5\nm.logclosure 5\nm.logclosure 5\nm.saytesthash 0 ",
-  );
+fn def_hash_named(d: Dump, name: Bytes) -> HashRow =
+  match fold(d.hashes, None, |acc: Option<HashRow>, h: HashFrame|
+      match h { HDef(r) -> if r.name == name { Some(r) } else { acc }, _ -> acc }) {
+    Some(r) -> r,
+    None -> panic("the answer hashes the definition"),
+  }
+
+fn body_named(d: Dump, name: Bytes) -> Bytes =
+  match fold(d.bodies, None, |acc: Option<Bytes>, b: BodyRow|
+      if b.name == name { Some(b.body) } else { acc }) {
+    Some(b) -> b,
+    None -> panic("the answer holds the body"),
+  }
+
+test "a hash row carries the definition's hash, its own form and its reach, and the body hashes to it" {
+  let d = dump_of(analyse(parse_all(program())));
+  let say = def_hash_named(d, b"m.say");
+  assert(say.own != None);
+  assert_eq(say.deps, [b"m.log"]);
+  assert_eq(say.closure, [b"m.log", b"m.say"]);
+  // The test's row follows the definition it reaches.
+  let order = map(d.hashes, |h: HashFrame|
+    match h { HDef(r) -> r.name, HTest(r) -> r.key, HLaw(r) -> r.key });
+  let placed = fold(range(0, len(order)), 0 - 1, |acc: Int, j: Int|
+    if at(order, j) == b"m.say" { j } else { acc });
+  assert_eq(list_at(order, placed + 1), Some(b"m.says"));
   // A solo body is the kind byte and then exactly the bytes the definition's hash is taken over.
-  let body_at = past(d, b"body m.say ");
-  let body_end = match bytes_index_of_from(d, b"testbody 0 ", body_at) {
-    Some(i) -> i,
-    None -> panic("the test body follows"),
-  };
-  let line_end = match bytes_index_of_from(d, b"\n", body_at) {
-    Some(i) -> i,
-    None -> panic("a frame head ends its line"),
-  };
-  let body = unhex(bytes_slice(d, line_end + 1, body_end));
+  let body = body_named(d, b"m.say");
   assert_eq(bytes_at(body, 0), 0);
-  assert_eq(hex(blake3(bytes_slice(body, 1, bytes_len(body)))), def_hash)
-}
-
-fn unhex(h: Bytes) -> Bytes = {
-  let digit = |c: Int| if c >= 97 { c - 87 } else { c - 48 };
-  bytes_concat_all(
-    map(range(0, bytes_len(h) / 2), |i: Int|
-      byte_of(digit(bytes_at(h, 2 * i)) * 16 + digit(bytes_at(h, 2 * i + 1)))),
-  )
+  assert_eq(Some(hex(blake3(bytes_slice(body, 1, bytes_len(body))))), say.def)
 }
 
 test "the ordinals list every fn, test and law in source order" {
-  assert(holds(front_dump(program()), b"ordinal m 34\nitem 8\nfn m.sayitem 11\ntest m.says"))
+  assert_eq(dump_of(analyse(parse_all(program()))).ordinals, [
+    { module: b"m", items: [b"fn m.say", b"test m.says"] },
+  ])
 }
 
 fn specified() -> List<Source> =
@@ -2596,21 +2384,27 @@ fn specified() -> List<Source> =
     },
   ]
 
-test "a definition frames its row aliases and each clause with its kind, index and span" {
-  let out = front_dump(specified());
-  assert(holds(out, b"internally_effectful 1\n1row_alias 2\nIoparam 9\nb 0 76 84span 8\n0 69 114"));
-  assert(
-    holds(
-      out,
-      b"def m.inc 224\nmodule 1\nmsimple_name 3\nincpublic 1\n0reuse 1\n0scheme 12\n(Int) -> Intfootprint 0\nperformed 0\ninternally_effectful 1\n0param 11\nx 0 122 128spec 21\nrequires 0 \n0 137 151spec 20\nensures 1 \n0 152 170span 9\n0 115 178literal 5\nint 0",
-    ),
-  );
-  assert(
-    holds(
-      out,
-      b"ordinal m 71\nitem 8\nfn m.sayitem 25\nfn m.inc requires,ensuresitem 15\nlaw m.inc grows",
-    ),
-  )
+test "a definition's row holds its row aliases and each clause with its kind, index and span" {
+  let d = dump_of(analyse(parse_all(specified())));
+  let say = def_named(d, b"m.say");
+  assert(say.internally_effectful);
+  assert_eq(say.row_aliases, [b"Io"]);
+  assert_eq(say.params, [{ name: b"b", at: { module: 0, start: 76, end: 84 } }]);
+  assert_eq(say.at, { module: 0, start: 69, end: 114 });
+  let inc = def_named(d, b"m.inc");
+  assert_eq(scheme_text(inc.scheme), b"(Int) -> Int");
+  assert_eq(inc.footprint, []);
+  assert(!inc.internally_effectful);
+  assert_eq(inc.params, [{ name: b"x", at: { module: 0, start: 122, end: 128 } }]);
+  assert_eq(inc.spec, [
+    { kind: b"requires", index: 0, footprint: [], at: { module: 0, start: 137, end: 151 } },
+    { kind: b"ensures", index: 1, footprint: [], at: { module: 0, start: 152, end: 170 } },
+  ]);
+  assert_eq(inc.at, { module: 0, start: 115, end: 178 });
+  assert_eq(inc.literals, [b"int 0"]);
+  assert_eq(d.ordinals, [
+    { module: b"m", items: [b"fn m.say", b"fn m.inc requires,ensures", b"law m.inc grows"] },
+  ])
 }
 
 // One program with both definitions' rows written as `row`, and the set they may name declared.
@@ -2656,43 +2450,68 @@ fn written() -> List<Source> =
     },
   ]
 
-test "a definition frames its visibility, its reuse marker and its parameters as written" {
-  let out = front_dump(written());
-  assert(holds(out, b"simple_name 4\nkeeppublic 1\n1reuse 1\n1scheme "));
-  assert(holds(out, b"internally_effectful 1\n0param 12\nxs 0 104 117span"))
+test "a definition's row holds its visibility, its reuse marker and its parameters as written" {
+  let keep = def_named(dump_of(analyse(parse_all(written()))), b"m.keep");
+  assert(keep.public && keep.reuse);
+  assert(!keep.internally_effectful);
+  assert_eq(keep.params, [{ name: b"xs", at: { module: 0, start: 104, end: 117 } }])
 }
 
-test "a type frames its arity and its visibility" {
-  assert(holds(front_dump(written()), b"module 1\nmsimple_name 4\nPairpublic 1\n1arity 1\n2span "))
-}
-
-test "a guard's literals are framed in the search's order, a negation folded" {
-  assert(holds(front_dump(written()), b"literal 5\nint 7literal 6\nint -3literal 5\nint 3"))
-}
-
-test "a law frames its binders with their spans and types, and its hashes carry the sentence" {
-  let out = front_dump(specified());
-  assert(
-    holds(
-      out,
-      b"law 0 142\nkey 11\nm.inc growsname 9\ninc growsmodule 1\nmindex 1\n0binder 15\nx 0 203 209\nInthas_guard 1\n1host 1\n0footprint 0\nspan 9\n0 179 237literal 5\nint 0",
-    ),
-  );
-  // An `effect set` with no includes, hence the two spaces.
-  assert(holds(out, b"effect_set 15\nIo  m.log.write"));
-  let d = bytes_of_string(out);
-  let hash_at = past(d, b"lawhash 0 210\nkey 11\nm.inc growshash 64\n");
-  assert_eq(bytes_slice(d, hash_at + 64, hash_at + 72), b"text 64\n");
+test "a type's row holds its arity and its visibility" {
   assert_eq(
-    bytes_slice(d, hash_at + 136, hash_at + 136 + 48),
-    b"dep 5\nm.incclosure 5\nm.incclosure 11\nm.inc grows",
-  );
+    map(dump_of(analyse(parse_all(written()))).types, |t: TypeRow|
+      { name: t.name, module: t.module, public: t.public, arity: t.arity }),
+    [{ name: b"m.Pair", module: b"m", public: true, arity: 2 }],
+  )
+}
+
+test "a guard's literals are in the search's order, a negation folded" {
+  assert_eq(map(dump_of(analyse(parse_all(written()))).laws, |l: LawRow| l.literals), [
+    [b"int 7", b"int -3", b"int 3"],
+  ])
+}
+
+test "a law's row holds its binders with their spans and types, and its hashes carry the sentence" {
+  let d = dump_of(analyse(parse_all(specified())));
+  assert_eq(d.laws, [
+    {
+      key: b"m.inc grows",
+      name: b"inc grows",
+      module: b"m",
+      index: 0,
+      binders: [{ name: b"x", at: { module: 0, start: 203, end: 209 }, ty: con_named(b"Int") }],
+      has_guard: true,
+      host: false,
+      footprint: [],
+      at: { module: 0, start: 179, end: 237 },
+      literals: [b"int 0"],
+    },
+  ]);
+  // An `effect set` with no includes.
+  assert_eq(map(d.modules, |m: ModuleRow| m.sets), [
+    [
+      {
+        name: b"Io",
+        includes: [],
+        atoms: [{ effect: b"m.log", resource: RSingleton, mode: MWrite, op: None }],
+      },
+    ],
+  ]);
+  let law = match fold(d.hashes, None, |acc: Option<ItemHashRow>, h: HashFrame|
+      match h { HLaw(r) -> Some(r), _ -> acc }) {
+    Some(r) -> r,
+    None -> panic("the law is hashed"),
+  };
+  assert_eq(law.key, b"m.inc grows");
+  assert_eq(bytes_len(law.hash), 64);
+  assert_eq(bytes_len(law.text), 64);
+  assert_eq(law.deps, [b"m.inc"]);
+  assert_eq(law.closure, [b"m.inc", b"m.inc grows"]);
   // Two clauses: two obligation keys and two sentence keys, in source order.
-  let spec_at = past(d, b"hash m.inc 455\ndef 64\n");
-  assert_eq(bytes_slice(d, spec_at + 64, spec_at + 71), b"own 64\n");
-  assert_eq(bytes_slice(d, spec_at + 135, spec_at + 143), b"spec 64\n");
-  assert_eq(bytes_slice(d, spec_at + 207, spec_at + 215), b"spec 64\n");
-  assert_eq(bytes_slice(d, spec_at + 279, spec_at + 292), b"spec_text 64\n")
+  let inc = def_hash_named(d, b"m.inc");
+  assert(inc.own != None);
+  assert_eq(len(inc.specs), 2);
+  assert_eq(len(inc.spec_texts), 2)
 }
 
 fn claimed() -> List<Source> =
@@ -2771,23 +2590,40 @@ fn shelf() -> List<Source> =
   ]
 
 test "the shipped modules a program imports follow it a round at a time, each round in byte order" {
-  let out = front_pulling_std(
+  let a = answer_pulling_std_with(
     [{ name: b"m", src: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }],
     shelf(),
+    [],
+    [],
   );
-  assert(
-    bytes_starts_with(
-      bytes_of_string(out),
-      b"pulled _ 42\nmodule 5\nstd.amodule 5\nstd.bmodule 5\nstd.corder _ ",
-    ),
-  )
+  assert_eq(a.pulled, [b"std.a", b"std.b", b"std.c"]);
+  assert_eq(a.dump.diags, []);
+  assert(len(a.dump.order) > 0)
 }
 
 test "an import of a module that does not ship is reported at the import, listing the ones that do" {
-  assert_eq(
-    front_pulling_std([{ name: b"m", src: b"import std.e\npub fn f() -> Int = 1" }], shelf()),
-    "pulled _ 0\ndiag 0 245\ncode 5\nE0106severity 5\nerrormessage 48\nno module named `std.e` ships with this compilerlabel 18\n0 7 12 1\nnot foundnote 52\nthe stdlib holds: `std.a`, `std.b`, `std.c`, `std.d`note 63\n`ply std` lists them with the digest this binary was built from",
-  )
+  let a = answer_pulling_std_with(
+    [{ name: b"m", src: b"import std.e\npub fn f() -> Int = 1" }],
+    shelf(),
+    [],
+    [],
+  );
+  assert_eq(a.pulled, []);
+  assert_eq(a.dump.diags, [
+    {
+      code: b"E0106",
+      notes: 2,
+      labels: [{ module: 0, start: 7, end: 12, primary: true, text: b"not found" }],
+      text: b"",
+      message: b"no module named `std.e` ships with this compiler",
+      notes_text: [
+        b"the stdlib holds: `std.a`, `std.b`, `std.c`, `std.d`",
+        b"`ply std` lists them with the digest this binary was built from",
+      ],
+      severity: b"error",
+      fixes: [],
+    },
+  ])
 }
 
 fn compiler_shelf() -> List<Source> =
@@ -2797,40 +2633,55 @@ fn compiler_shelf() -> List<Source> =
   ]
 
 test "a compiler module the shelf carries is pulled in under the shelf's root" {
-  let out = front_pulling_std(
+  let a = answer_pulling_std_with(
     [{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
     compiler_shelf(),
+    [],
+    [],
   );
-  assert(
-    bytes_starts_with(
-      bytes_of_string(out),
-      b"pulled _ 40\nmodule 10\ncompiler.amodule 10\ncompiler.border _ ",
-    ),
-  );
-  assert(holds(out, b"def compiler.a.first "))
+  assert_eq(a.pulled, [b"compiler.a", b"compiler.b"]);
+  assert_eq(a.dump.diags, []);
+  assert_eq(len(filter(a.dump.defs, |r: DefRow| r.name == b"compiler.a.first")), 1)
 }
 
+fn messages(d: Dump) -> List<Bytes> = map(d.diags, |x: Diag| x.message)
+
 test "a shelved module importing outside the shelf is the compiler's own defect" {
-  let out = front_pulling_std(
+  let a = answer_pulling_std_with(
     [{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
     [{ name: b"compiler.a", src: b"import std.e (e)\npub fn first() -> Int = e()" }],
+    [],
+    [],
   );
   assert(
-    holds(out, b"the shipped module `compiler.a` imports `std.e`, which this build does not ship"),
+    contains_bytes(
+      messages(a.dump),
+      b"the shipped module `compiler.a` imports `std.e`, which this build does not ship",
+    ),
   )
 }
 
 test "a shipped module importing outside the shipped ones is placed in that module, which the answer names" {
-  let out = front_pulling_std([{ name: b"m", src: b"import std.x\npub fn f() -> Int = 1" }], [
-    { name: b"std.x", src: b"import m\npub fn x() -> Int = 1" },
-  ]);
-  assert(bytes_starts_with(bytes_of_string(out), b"pulled _ 14\nmodule 5\nstd.xdiag 0 "));
-  assert(
-    holds(
-      out,
-      b"message 70\nthe shipped module `std.x` imports `m`, which this build does not shiplabel 65\n1 7 8 1\na stdlib module may import only modules that ship with it",
-    ),
-  )
+  let a = answer_pulling_std_with(
+    [{ name: b"m", src: b"import std.x\npub fn f() -> Int = 1" }],
+    [{ name: b"std.x", src: b"import m\npub fn x() -> Int = 1" }],
+    [],
+    [],
+  );
+  assert_eq(a.pulled, [b"std.x"]);
+  let said = filter(a.dump.diags, |d: Diag|
+    d.message == b"the shipped module `std.x` imports `m`, which this build does not ship");
+  assert_eq(map(said, |d: Diag| d.labels), [
+    [
+      {
+        module: 1,
+        start: 7,
+        end: 8,
+        primary: true,
+        text: b"a stdlib module may import only modules that ship with it",
+      },
+    ],
+  ])
 }
 
 fn answered() -> List<Source> =
@@ -2851,13 +2702,9 @@ fn def_named(d: Dump, name: Bytes) -> DefRow =
 
 fn con_named(name: Bytes) -> Type = TyCon({ name: name, args: [] })
 
-test "the answer's rows frame to the text entry's answer, each type and row held as the checker's value" {
+test "the answer's rows hold each type and row as the checker's value" {
   let a = answer_pulling_std_with(answered(), shelf(), [], []);
   assert_eq(a.pulled, [b"std.b"]);
-  assert_eq(
-    bytes_of_string(front_pulling_std_with(answered(), shelf(), [], [])),
-    bytes_concat(framed(b"pulled", b"_", [field(b"module", b"std.b")]), dump_text(a.dump)),
-  );
   let same = def_named(a.dump, b"base.same");
   assert_eq(same.scheme, {
     ty_vars: [],
@@ -2887,20 +2734,29 @@ test "the answer's rows frame to the text entry's answer, each type and row held
   )
 }
 
-test "a refused program's answer is its diagnostics, with no rows" {
+test "a refused program's answer is its diagnostics, placed where it went wrong, with no rows" {
   let bad = [{ name: b"m", src: b"fn f() -> Int = \"x\"" }];
   let a = answer_pulling_std_with(bad, [], [], []);
   assert_eq(a.pulled, []);
-  assert_eq(map(a.dump.diags, |d: Diag| d.code), [b"E0201"]);
+  assert_eq(a.dump.diags, [
+    {
+      code: b"E0201",
+      notes: 0,
+      labels: [
+        { module: 0, start: 16, end: 19, primary: true, text: b"expected `Int`, found `String`" },
+      ],
+      text: b"",
+      message: b"type mismatch: function body type",
+      notes_text: [],
+      severity: b"error",
+      fixes: [],
+    },
+  ]);
   assert_eq(a.dump.order, []);
   assert_eq(a.dump.modules, []);
   assert_eq(a.dump.defs, []);
   assert_eq(a.dump.tests, []);
-  assert_eq(a.dump.hashes, []);
-  assert_eq(
-    bytes_of_string(front_pulling_std_with(bad, [], [], [])),
-    bytes_concat(framed(b"pulled", b"_", []), dump_text(a.dump)),
-  )
+  assert_eq(a.dump.hashes, [])
 }
 
 fn whole_of(sources: List<Source>) -> Whole =
@@ -2921,8 +2777,29 @@ fn effectful() -> List<Source> =
     },
   ]
 
-// The text an analysis publishes: a seeded row and a walked one print alike, but may number their variables apart.
-fn published(a: Analysis) -> Bytes = dump_text(dump_of(a))
+// The rows an analysis publishes, which number their variables as their texts name them: a seeded
+// row and a walked one are then alike, however the checker numbered each.
+fn published(a: Analysis) -> Dump = dump_of(a)
+
+// The same definition, with a module of generics checked ahead of it in one of the two programs:
+// the checker numbers its variables apart in the two, and the rows do not.
+test "two programs alike but for what the checker numbered first publish equal rows" {
+  let pick = b"pub fn pick<p, q>(x: p, y: q, f: (p) -> q) -> List<q> = [f(x), y]";
+  let alone = [{ name: b"m", src: pick }];
+  let behind = [
+    { name: b"a", src: b"pub fn first<c, d, e>(x: c, y: d, z: e) -> c = x" },
+    { name: b"m", src: pick },
+  ];
+  let raw = |sources: List<Source>|
+    fold(whole_of(sources).checked.defs, None, |acc: Option<Scheme>, d: DefInfo|
+      if d.name == b"m.pick" { Some(d.scheme) } else { acc });
+  assert(raw(alone) != raw(behind));
+  let one = def_named(published(analyse(parse_all(alone))), b"m.pick");
+  let two = def_named(published(analyse(parse_all(behind))), b"m.pick");
+  assert_eq(one.scheme, two.scheme);
+  assert_eq(one.footprint, two.footprint);
+  assert_eq(one.scheme.ty_vars, [0, 1])
+}
 
 test "a definition whose hash has not moved is published from its rows, not from its body" {
   let rows = rows_of(whole_of(effectful()));

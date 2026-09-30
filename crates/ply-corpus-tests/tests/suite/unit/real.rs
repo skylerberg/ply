@@ -1,5 +1,5 @@
-//! The real-code row, end to end: the checkout's compiler and CLI, front-ended by the product
-//! itself, with the digest each member is pinned by beside the verdicts.
+//! The real-code row, end to end: the checkout's compiler and CLI, each front-ended by the product
+//! itself in a test of its own, with the digest it is pinned by beside its verdict.
 
 use crate::support::{corpus, document, measured, outcome, repo, row};
 use std::path::Path;
@@ -43,9 +43,11 @@ fn pin_of(trees: &[&str]) -> String {
     format!("b3:{}", h.finalize().to_hex())
 }
 
-#[test]
-fn the_toolchain_trees_frontend_clean_at_their_pins() {
-    let out = corpus(&repo(), &["real", "--no-tests", "--json"]);
+fn front_ended(member: &str) -> serde_json::Value {
+    let out = corpus(
+        &repo(),
+        &["real", "--member", member, "--no-tests", "--json"],
+    );
     assert!(
         out.status.success(),
         "the real-code row refused:\n{}",
@@ -54,52 +56,67 @@ fn the_toolchain_trees_frontend_clean_at_their_pins() {
     let report = document(&out);
     assert_eq!(report["ok"].as_bool(), Some(true), "{report:#}");
     let members = report["members"].as_array().expect("members is an array");
-    assert_eq!(members.len(), 2);
+    assert_eq!(
+        members.len(),
+        1,
+        "only the member asked for is pinned: {report:#}"
+    );
+    assert_eq!(members[0]["name"].as_str(), Some(member), "{report:#}");
     let rows = report["rows"].as_array().expect("rows is an array");
     assert_eq!(
         rows.len(),
-        2,
-        "one check row for each member, the tests skipped: {report:#}"
+        1,
+        "one check row, the tests skipped: {report:#}"
     );
+    let checked = row(&report, &format!("{member} check"));
+    assert_eq!(outcome(checked), "pass", "{checked:#}");
+    assert_eq!(checked["detail"], members[0]["digest"], "{checked:#}");
+    report
+}
 
-    let compiler = &members[0];
-    assert_eq!(compiler["name"].as_str(), Some("compiler"));
+#[test]
+fn the_compiler_frontends_clean_at_its_pin() {
+    let report = front_ended("compiler");
+    let compiler = &report["members"][0];
     assert_eq!(
         compiler["digest"].as_str(),
         Some(pin_of(&["crates/ply-compiler/ply"]).as_str()),
         "{compiler:#}"
     );
     let checked = row(&report, "compiler check");
-    assert_eq!(outcome(checked), "pass", "{checked:#}");
-    assert_eq!(checked["detail"], compiler["digest"], "{checked:#}");
     assert!(
         measured(checked, "definitions") > 1000.0,
         "the compiler is the real one: {checked:#}"
     );
+}
 
+#[test]
+fn the_cli_frontends_clean_at_its_pin() {
+    let report = front_ended("cli");
+    let cli = &report["members"][0];
     // The CLI reads the packages its manifest names by path, so its pin covers them too.
-    let cli = &members[1];
-    assert_eq!(cli["name"].as_str(), Some("cli"));
-    assert_eq!(
-        cli["trees"],
-        serde_json::json!([
-            "crates/ply-cli/ply",
-            "crates/ply-test/ply",
-            "crates/ply-prove/ply"
-        ]),
-        "{cli:#}"
-    );
+    let trees = [
+        "crates/ply-cli/ply",
+        "crates/ply-test/ply",
+        "crates/ply-prove/ply",
+    ];
+    assert_eq!(cli["trees"], serde_json::json!(trees), "{cli:#}");
     assert_eq!(
         cli["digest"].as_str(),
-        Some(
-            pin_of(&[
-                "crates/ply-cli/ply",
-                "crates/ply-test/ply",
-                "crates/ply-prove/ply"
-            ])
-            .as_str()
-        ),
+        Some(pin_of(&trees).as_str()),
         "{cli:#}"
     );
-    assert_eq!(outcome(row(&report, "cli check")), "pass", "{report:#}");
+}
+
+/// The tests above take a member each, so they are the whole row only while their members are
+/// every member `real` takes: a name it does not take is refused with the ones it does.
+#[test]
+fn the_members_tested_here_are_every_member_real_takes() {
+    let out = corpus(&repo(), &["real", "--member", "none"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("[possible values: compiler, cli]"),
+        "{stderr}"
+    );
 }
