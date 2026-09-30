@@ -3,20 +3,23 @@
 
 use super::tables::{Defined, Tables};
 use ply_eval::{Symbol, Value};
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::PathBuf;
 
 fn dir() -> PathBuf {
     super::load::cache_dir().join("emit")
 }
 
-/// What a body's C is a function of: its root's key (`Source::keys`), the constructor table, the
-/// helper table and the running binary, so rebuilding `ply` invalidates the cache.
+/// The sources of the runtime the emitter runs on, as `build.rs` digests them. Not the binary: a
+/// change anywhere else in `ply`, or the other build profile, emits the same bodies.
+const RUNTIME: &str = env!("PLY_RUNTIME_DIGEST");
+
+/// What a body's C is a function of: its root's key (`Source::keys`), which names the emitter, the
+/// constructor table, the helper table and the runtime.
 pub fn key(def_hash: &str, ctors: &str) -> String {
     let mut h = blake3::Hasher::new();
     for part in [
         "ply-c-emit-7",
-        exe_identity(),
+        RUNTIME,
         &super::exports::helpers_digest(),
         ctors,
         def_hash,
@@ -25,35 +28,6 @@ pub fn key(def_hash: &str, ctors: &str) -> String {
         h.update(&[0]);
     }
     h.finalize().to_hex().to_string()
-}
-
-/// The running binary's identity: its contents, so a build that writes the same bytes keeps the
-/// cache it filled last time. Digested once, since `key` is asked per body.
-fn exe_identity() -> &'static str {
-    static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| file_digest(&exe))
-            // A binary that cannot be read vouches for nothing, so it shares with no other.
-            .unwrap_or_else(unidentified)
-    })
-    .as_str()
-}
-
-/// The digest of a file's bytes; `None` when it cannot be read.
-pub fn file_digest(path: &Path) -> Option<String> {
-    let mut h = blake3::Hasher::new();
-    h.update_reader(std::fs::File::open(path).ok()?).ok()?;
-    Some(h.finalize().to_hex().to_string())
-}
-
-fn unidentified() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("unidentified {} {now}", std::process::id())
 }
 
 /// The digest of the constructor table, whose positions a body writes as numbers.

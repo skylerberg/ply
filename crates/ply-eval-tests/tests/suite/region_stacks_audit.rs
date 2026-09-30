@@ -300,15 +300,7 @@ fn a_body_its_clause_abandons_holds_no_region_once_the_entry_returns() {
 /// The arena's extent as a bare entry of `name(n)` begins, once it returns, and once it has ended:
 /// between the last two, what a capture pins is still held.
 fn extents(name: &str, n: i64, want: i64) -> [(usize, usize); 3] {
-    let compiled = Compiled::new(PROGRAMS);
-    ply_codegen::c::producer::ensure_default();
-    let front: &'static ply_eval::Front = Box::leak(Box::new(compiled.front.clone()));
-    let source: &'static ply_codegen::Source = Box::leak(Box::new(
-        ply_codegen::Source::from_front(front).with_texts(compiled.texts.clone()),
-    ));
-    let names = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, _) = ply_codegen::c::build(source, &refs).expect("the unit builds");
+    let native = Compiled::new(PROGRAMS).native();
     let entry = native
         .entry(name)
         .unwrap_or_else(|| panic!("`{name}` compiled"));
