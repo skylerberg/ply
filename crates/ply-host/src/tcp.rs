@@ -25,72 +25,21 @@ pub const EFFECT: &str = "std.net.net";
 /// The most bytes one `recv` allocates for, whatever `max` asks.
 pub const MAX_RECV: usize = 1 << 20;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Op {
-    Listen,
-    ListenTls,
-    Connect,
-    ConnectTls,
-    Handshake,
-    Accept,
-    Recv,
-    Send,
-    Close,
-    LocalPort,
+operations! {
+    what "net";
+    Listen = "listen" / 1,
+    ListenTls = "listen_tls" / 2,
+    Connect = "connect" / 3,
+    ConnectTls = "connect_tls" / 3,
+    Handshake = "handshake" / 1,
+    Accept = "accept" / 1,
+    Recv = "recv" / 3,
+    Send = "send" / 3,
+    Close = "close" / 1,
+    LocalPort = "local_port" / 1,
 }
 
 impl Op {
-    pub const ALL: [Op; 10] = [
-        Op::Listen,
-        Op::ListenTls,
-        Op::Connect,
-        Op::ConnectTls,
-        Op::Handshake,
-        Op::Accept,
-        Op::Recv,
-        Op::Send,
-        Op::Close,
-        Op::LocalPort,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Op::Listen => "listen",
-            Op::ListenTls => "listen_tls",
-            Op::Connect => "connect",
-            Op::ConnectTls => "connect_tls",
-            Op::Handshake => "handshake",
-            Op::Accept => "accept",
-            Op::Recv => "recv",
-            Op::Send => "send",
-            Op::Close => "close",
-            Op::LocalPort => "local_port",
-        }
-    }
-
-    pub fn what(self) -> &'static str {
-        match self {
-            Op::Listen => "`net.listen`",
-            Op::ListenTls => "`net.listen_tls`",
-            Op::Connect => "`net.connect`",
-            Op::ConnectTls => "`net.connect_tls`",
-            Op::Handshake => "`net.handshake`",
-            Op::Accept => "`net.accept`",
-            Op::Recv => "`net.recv`",
-            Op::Send => "`net.send`",
-            Op::Close => "`net.close`",
-            Op::LocalPort => "`net.local_port`",
-        }
-    }
-
-    fn arity(self) -> usize {
-        match self {
-            Op::Listen | Op::Accept | Op::Close | Op::Handshake | Op::LocalPort => 1,
-            Op::ListenTls => 2,
-            Op::Connect | Op::ConnectTls | Op::Recv | Op::Send => 3,
-        }
-    }
-
     fn waits(self) -> bool {
         matches!(
             self,
