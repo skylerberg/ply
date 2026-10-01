@@ -3,18 +3,23 @@
 //! tests a run owes, how they are coloured and where a pass belongs are `suite`'s to decide, and its
 //! own tests pin them; these state the choice and check what the runtime did with it.
 
-use crate::fixture::{handed, plan_key, root_key};
+use crate::fixture::{Seeds, handed, root_key, run_at, seeds_key};
 use ply_eval::host::{HostRuntime, MachineId, Pending};
 use ply_eval::{
-    CheckOutput, Cost, DefHash, Diagnostic, EffectAtom, Exploration, Footprint, HashOutput, Mode,
-    Plan, Race, RaceSite, Resource, Seed, SourceId, Symbol, Value, codes,
+    CheckOutput, DefHash, Diagnostic, EffectAtom, Footprint, HashOutput, Mode, Resource, Seed,
+    SourceId, Symbol, Value, codes,
 };
 use ply_store::{Outcome, Store};
-use ply_test::{Executor, Hosting, InterpExecutor, Reason, Search, Selection, Status, run_with};
+use ply_test::{
+    Cost, Executed, Hosting, InterpExecutor, Race, RaceSite, Reason, RunReport, Searched,
+    Selection, Status,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 struct TempRoot(PathBuf);
 
@@ -74,24 +79,32 @@ impl Program {
 
     /// Every test, as a cold cache has it.
     fn every(&self) -> Selection {
-        crate::fixture::every(&self.check, &self.hashes, &Plan::default())
+        crate::fixture::every(&self.check, &self.hashes)
     }
 
     /// `runs` alone and every other test cached: what a program hands over once the store holds a
     /// pass for the rest.
     fn choose(&self, runs: &[usize]) -> Selection {
-        crate::fixture::choose(&self.check, &self.hashes, runs, &Plan::default())
+        crate::fixture::choose(&self.check, &self.hashes, runs)
     }
 
-    /// Runs on the compiled C tier; `Unit::over_front` leaks a `&'static Unit`. Every failure is
-    /// the fixture's own: one of Ply's would leave what a test says about failures about nothing.
-    fn run(&self, selection: &Selection, store: &mut Store) -> ply_test::RunReport {
-        let unit = ply_codegen::Unit::over_front(&self.port, self.texts())
-            .expect("this host has a C compiler");
-        let executor = InterpExecutor::new(&self.port, unit)
-            .with_hosts(Hosting::hermetic())
-            .with_search(Search::of(selection));
-        let report = run_with(selection, &self.check, &self.hashes, store, &executor);
+    /// `Unit::over_front` leaks a `&'static Unit`.
+    fn unit(&self) -> &'static ply_codegen::Unit {
+        ply_codegen::Unit::over_front(&self.port, self.texts()).expect("this host has a C compiler")
+    }
+
+    /// Runs on the compiled C tier. Every failure is the fixture's own: one of Ply's would leave
+    /// what a test says about failures about nothing.
+    fn run(&self, selection: &Selection, store: &mut Store) -> RunReport {
+        let report = run_at(
+            selection,
+            &self.port,
+            self.unit(),
+            Hosting::hermetic(),
+            store,
+            &Seeds::default(),
+            1,
+        );
         for failure in &report.failures {
             assert!(
                 !failure.defect,
@@ -114,6 +127,48 @@ impl Program {
     /// what to run is made from.
     fn filed(&self, store: &Store, name: &str) -> bool {
         passed(store, self.hashes.tests[self.index_of(name)])
+    }
+
+    /// What a run that reported each of `ran` came to, nothing actually running.
+    fn concluded(&self, selection: &Selection, store: &mut Store, ran: Vec<Executed>) -> RunReport {
+        ply_test::concluded(
+            selection,
+            &self.check,
+            &self.hashes,
+            store,
+            ran,
+            Duration::ZERO,
+        )
+    }
+
+    /// Each selected test reported as passing -- a seeded one with the search `searches` names for
+    /// it, from that many roots -- but `failing`, which failed.
+    fn reported(
+        &self,
+        selection: &Selection,
+        store: &mut Store,
+        searches: &[(usize, Searched, usize)],
+        failing: &[usize],
+    ) -> RunReport {
+        let ran = selection
+            .to_run
+            .iter()
+            .map(|&index| {
+                let search = searches.iter().find(|(i, _, _)| *i == index);
+                Executed {
+                    failure: failing.contains(&index).then(|| {
+                        Diagnostic::error(
+                            ply_eval::codes::ASSERTION_FAILED,
+                            "balance went negative",
+                        )
+                    }),
+                    searched: search.map(|(_, s, _)| s.clone()),
+                    seeds: search.map_or(0, |(_, _, n)| *n),
+                    ..Executed::refused(index, Diagnostic::error("", "overwritten"))
+                }
+            })
+            .collect();
+        self.concluded(selection, store, ran)
     }
 }
 
@@ -542,8 +597,6 @@ fn literal(to_run: Vec<usize>, groups: Vec<Vec<usize>>, reason: Reason) -> Selec
         to_run,
         groups,
         reasons: vec![reason; 3],
-        plan: Plan::default(),
-        narrowed: BTreeMap::new(),
         filed: BTreeMap::new(),
         out_of_scope: BTreeSet::new(),
     }
@@ -557,19 +610,6 @@ fn an_empty_selection_runs_nothing() {
     let report = program.run(&literal(Vec::new(), Vec::new(), Reason::Cached), &mut store);
     assert_eq!((report.passed, report.failed, report.cached), (0, 0, 0));
     assert!(report.warnings.is_empty());
-}
-
-#[test]
-fn a_selected_test_left_out_of_every_group_is_still_run() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(ARITHMETIC);
-    let report = program.run(
-        &literal(vec![0, 1, 2], vec![vec![0]], Reason::New),
-        &mut store,
-    );
-    assert_eq!(report.passed, 3, "no selected test may be silently skipped");
-    assert_eq!(report.warnings.len(), 1);
 }
 
 #[test]
@@ -725,34 +765,31 @@ test "runs once per interleaving" {
 }
 "#;
 
-/// A test is entered on the worker's own machine, and a searched one on a machine per
-/// interleaving; what either ended with is the run's to report.
+/// A test is entered once, and a seeded one once per interleaving; what either entry ended with is
+/// the run's to report.
 #[test]
 fn what_a_test_ended_with_is_in_the_report_whether_it_ran_once_or_was_searched() {
     let program = Program::compile(ENDINGS);
-    let unit = ply_codegen::Unit::over_front(&program.port, program.texts())
-        .expect("this host has a C compiler");
-    let runtime = || -> Rc<dyn HostRuntime> { Rc::new(Warns) };
-    for (name, searched) in [("runs once", false), ("runs once per interleaving", true)] {
+    let runtime: ply_eval::RuntimeFactory = Arc::new(|| Rc::new(Warns) as Rc<dyn HostRuntime>);
+    for (name, seeded) in [("runs once", false), ("runs once per interleaving", true)] {
+        let index = program.index_of(name);
+        assert_eq!(
+            ply_test::is_seeded(&program.check.tests[index].footprint),
+            seeded,
+            "{name} is searched: {seeded}"
+        );
         let root = TempRoot::new();
         let mut store = root.store();
-        let selection = program.choose(&[program.index_of(name)]);
-        let executor = InterpExecutor::new(&program.port, unit)
-            .with_hosts(Hosting::hermetic().with_runtime(&runtime))
-            .with_search(Search::of(&selection));
-        let report = run_with(
-            &selection,
-            &program.check,
-            &program.hashes,
+        let report = run_at(
+            &program.choose(&[index]),
+            &program.port,
+            program.unit(),
+            Hosting::hermetic().with_runtime(Arc::clone(&runtime)),
             &mut store,
-            &executor,
+            &Seeds::default(),
+            1,
         );
         assert_eq!(report.failed, 0, "{name}: {:#?}", report.failures);
-        assert_eq!(
-            report.results[0].simulation.is_some(),
-            searched,
-            "{name} was searched: {searched}"
-        );
         assert!(
             report
                 .warnings
@@ -764,23 +801,23 @@ fn what_a_test_ended_with_is_in_the_report_whether_it_ran_once_or_was_searched()
     }
 }
 
-struct PanickingExecutor {
-    panic_on: usize,
-}
-
-impl Executor for PanickingExecutor {
-    type Worker = ();
-
-    fn worker(&self) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-
-    fn execute(&self, _worker: &mut (), index: usize) -> Result<(), Diagnostic> {
-        if index == self.panic_on {
-            panic!("deliberate panic in test {index}");
-        }
-        Ok(())
-    }
+/// Every selected test run on this thread, but `doomed`, whose run unwinds.
+fn unwinding(program: &Program, selection: &Selection, doomed: usize) -> Vec<Executed> {
+    let executor = InterpExecutor::new(&program.port, program.unit());
+    selection
+        .groups
+        .iter()
+        .flatten()
+        .map(|&index| {
+            if index == doomed {
+                ply_test::contained(&program.check, index, || {
+                    panic!("deliberate panic in test {index}")
+                })
+            } else {
+                ply_test::executed(&executor, &program.check, index)
+            }
+        })
+        .collect()
 }
 
 #[test]
@@ -791,14 +828,8 @@ fn a_panicking_test_is_contained_and_reported_as_a_failure() {
     let selection = program.every();
     let doomed = program.index_of("mul is right");
 
-    let executor = PanickingExecutor { panic_on: doomed };
-    let report = run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
+    let ran = unwinding(&program, &selection, doomed);
+    let report = program.concluded(&selection, &mut store, ran);
 
     assert_eq!(report.passed, 2, "the other tests must still have run");
     assert_eq!(report.failed, 1);
@@ -837,21 +868,14 @@ fn a_panicking_test_is_contained_and_reported_as_a_failure() {
 }
 
 #[test]
-fn a_panic_does_not_stop_the_groups_that_follow() {
+fn a_panic_leaves_the_thread_it_unwound_able_to_run_the_next_test() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
 
-    // One group per test forces the sequential path, so the unwound worker runs the next test.
     let selection = literal(vec![0, 1, 2], vec![vec![0], vec![1], vec![2]], Reason::New);
-    let executor = PanickingExecutor { panic_on: 0 };
-    let report = run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
+    let ran = unwinding(&program, &selection, 0);
+    let report = program.concluded(&selection, &mut store, ran);
 
     assert_eq!((report.passed, report.failed), (2, 1));
     assert!(
@@ -867,44 +891,28 @@ fn a_panic_does_not_stop_the_groups_that_follow() {
     );
 }
 
-/// An executor whose test reports that Ply broke one of its own invariants, without unwinding.
-struct InternalErrorExecutor {
-    fail_on: usize,
-}
-
-impl Executor for InternalErrorExecutor {
-    type Worker = ();
-
-    fn worker(&self) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-
-    fn execute(&self, _worker: &mut (), index: usize) -> Result<(), Diagnostic> {
-        if index == self.fail_on {
-            return Err(Diagnostic::error(
-                ply_eval::codes::INTERNAL_ERROR,
-                "internal error: a frame that is not a builtin step reached `advance`",
-            ));
-        }
-        Ok(())
-    }
-}
-
 #[test]
 fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
     let doomed = program.index_of("mul is right");
+    let selection = program.every();
 
-    let executor = InternalErrorExecutor { fail_on: doomed };
-    let report = run_with(
-        &program.every(),
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
+    let ran = selection
+        .to_run
+        .iter()
+        .map(|&index| Executed {
+            failure: (index == doomed).then(|| {
+                Diagnostic::error(
+                    ply_eval::codes::INTERNAL_ERROR,
+                    "internal error: a frame that is not a builtin step reached `advance`",
+                )
+            }),
+            ..Executed::refused(index, Diagnostic::error("", "overwritten"))
+        })
+        .collect();
+    let report = program.concluded(&selection, &mut store, ran);
 
     let result = report
         .results
@@ -915,38 +923,27 @@ fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
     assert!(report.failures[0].defect);
 }
 
-/// An executor with nothing to run a test on, as a unit built from another program leaves one.
-struct RefusingExecutor;
-
-impl Executor for RefusingExecutor {
-    type Worker = ();
-
-    fn worker(&self) -> Result<(), Diagnostic> {
-        Err(Diagnostic::error(
-            ply_eval::codes::INTERNAL_ERROR,
-            "the worker's tier was built from another program",
-        ))
-    }
-
-    fn execute(&self, _worker: &mut (), index: usize) -> Result<(), Diagnostic> {
-        panic!("test {index} ran on a worker that was refused")
-    }
-}
-
 #[test]
-fn a_worker_that_cannot_be_built_fails_every_test_as_a_defect_and_caches_none() {
+fn a_test_nothing_could_run_is_a_defect_and_caches_nothing() {
     let root = TempRoot::new();
     let mut store = root.store();
     let program = Program::compile(ARITHMETIC);
     let selection = program.every();
 
-    let report = run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &RefusingExecutor,
-    );
+    let ran = selection
+        .to_run
+        .iter()
+        .map(|&index| {
+            Executed::refused(
+                index,
+                Diagnostic::error(
+                    ply_eval::codes::INTERNAL_ERROR,
+                    "the unit was built from another program",
+                ),
+            )
+        })
+        .collect();
+    let report = program.concluded(&selection, &mut store, ran);
 
     assert_eq!(report.passed, 0);
     assert_eq!(report.failed, selection.to_run.len());
@@ -955,7 +952,7 @@ fn a_worker_that_cannot_be_built_fails_every_test_as_a_defect_and_caches_none() 
         let diagnostic = result.failure.as_ref().expect("a refusal is the failure");
         assert_eq!(
             diagnostic.message,
-            "the worker's tier was built from another program"
+            "the unit was built from another program"
         );
     }
     assert!(report.failures.iter().all(|f| f.defect));
@@ -964,93 +961,28 @@ fn a_worker_that_cannot_be_built_fails_every_test_as_a_defect_and_caches_none() 
     }
 }
 
-/// Reports a search without running one.
-struct SimExecutor {
-    explorations: BTreeMap<usize, Exploration>,
-    failing: BTreeSet<usize>,
-    /// What the last `execute` was asked to search, per test.
-    plans: std::sync::Mutex<BTreeMap<usize, Plan>>,
-    search: Search,
-}
-
-impl SimExecutor {
-    fn new(selection: &Selection) -> SimExecutor {
-        SimExecutor {
-            explorations: BTreeMap::new(),
-            failing: BTreeSet::new(),
-            plans: std::sync::Mutex::new(BTreeMap::new()),
-            search: Search::of(selection),
-        }
-    }
-
-    fn exploring(mut self, index: usize, exploration: Exploration) -> SimExecutor {
-        self.explorations.insert(index, exploration);
-        self
-    }
-
-    fn failing(mut self, index: usize) -> SimExecutor {
-        self.failing.insert(index);
-        self
-    }
-
-    fn searched(&self, index: usize) -> Option<Plan> {
-        self.plans
-            .lock()
-            .expect("not poisoned")
-            .get(&index)
-            .cloned()
-    }
-}
-
-impl Executor for SimExecutor {
-    type Worker = Option<Exploration>;
-
-    fn worker(&self) -> Result<Option<Exploration>, Diagnostic> {
-        Ok(None)
-    }
-
-    fn execute(&self, worker: &mut Option<Exploration>, index: usize) -> Result<(), Diagnostic> {
-        self.plans
-            .lock()
-            .expect("not poisoned")
-            .insert(index, self.search.plan_for(index).clone());
-        *worker = self.explorations.get(&index).cloned();
-        if self.failing.contains(&index) {
-            return Err(Diagnostic::error(
-                ply_eval::codes::ASSERTION_FAILED,
-                "balance went negative",
-            ));
-        }
-        Ok(())
-    }
-
-    fn exploration(&self, worker: &Option<Exploration>) -> Option<Exploration> {
-        worker.clone()
-    }
-}
-
-fn exhaustive(explored: u32) -> Exploration {
-    Exploration {
+fn exhaustive(explored: u32) -> Searched {
+    Searched {
         explored,
         exhaustive: true,
         steps: u64::from(explored) * 4,
-        ..Exploration::default()
+        ..Searched::default()
     }
 }
 
-fn spent(explored: u32) -> Exploration {
-    Exploration {
+fn spent(explored: u32) -> Searched {
+    Searched {
         explored,
         exhausted: true,
-        ..Exploration::default()
+        ..Searched::default()
     }
 }
 
-fn failed_at(seed: Seed, explored: u32) -> Exploration {
-    Exploration {
+fn failed_at(seed: Seed, explored: u32) -> Searched {
+    Searched {
         explored,
         failure: Some(seed),
-        ..Exploration::default()
+        ..Searched::default()
     }
 }
 
@@ -1070,10 +1002,9 @@ fn seeded_program() -> (Program, usize) {
     (program, index)
 }
 
-/// Every test runs under `plan`, a seeded one's pass filed under the plan's key and, when the plan
-/// is answered root by root, each root's too; the rest under their own hashes.
-fn seeded_choice(program: &Program, seeded: &[usize], plan: &Plan, per_root: bool) -> Selection {
-    let plan = plan.clone().normalized();
+/// Every test runs, a seeded one's pass filed under the key of the search over `seeds` and, when the
+/// search is answered root by root, each root's too; the rest under their own hashes.
+fn seeded_choice(program: &Program, seeded: &[usize], seeds: &Seeds, per_root: bool) -> Selection {
     let runs: Vec<usize> = (0..program.check.tests.len()).collect();
     let filed = runs
         .iter()
@@ -1082,77 +1013,50 @@ fn seeded_choice(program: &Program, seeded: &[usize], plan: &Plan, per_root: boo
             let keys = if !seeded.contains(&i) {
                 vec![hash]
             } else if per_root {
-                plan.roots
+                seeds
+                    .roots
                     .iter()
                     .map(|&r| root_key(hash, r))
-                    .chain([plan_key(hash, &plan)])
+                    .chain([seeds_key(hash, seeds)])
                     .collect()
             } else {
-                vec![plan_key(hash, &plan)]
+                vec![seeds_key(hash, seeds)]
             };
             (i, keys)
         })
         .collect();
-    handed(&program.check, &plan, &runs, BTreeMap::new(), filed)
+    handed(&program.check, &runs, filed)
 }
 
 #[test]
-fn a_narrowed_choice_searches_only_the_roots_it_owes_and_files_the_widened_plan() {
+fn a_narrowed_search_files_every_key_it_was_handed_for_the_widened_plan() {
     let root = TempRoot::new();
     let mut store = root.store();
     let (program, seeded) = seeded_program();
     let hash = program.hashes.tests[seeded];
 
-    let four = Plan::random(4);
+    let four = Seeds::roots(0..4);
     let selection = seeded_choice(&program, &[seeded], &four, true);
-    let executor = SimExecutor::new(&selection).exploring(seeded, exhaustive(4));
-    run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
-    assert_eq!(
-        executor.searched(seeded).map(|p| p.roots),
-        Some(vec![0, 1, 2, 3])
-    );
+    program.reported(&selection, &mut store, &[(seeded, exhaustive(4), 4)], &[]);
     for r in 0..4 {
         assert!(passed(&store, root_key(hash, r)), "root {r}'s own key");
     }
 
-    // The first four roots each hold a pass of their own, so widening to eight owes the rest.
-    let eight = Plan::random(8);
-    let owed: Vec<u64> = vec![4, 5, 6, 7];
-    let keys: Vec<DefHash> = owed
-        .iter()
-        .map(|&r| root_key(hash, r))
-        .chain([plan_key(hash, &eight)])
+    // The first four roots each hold a pass of their own, so widening to eight owes the rest, and
+    // the program searches only those.
+    let eight = Seeds::roots(0..8);
+    let keys: Vec<DefHash> = (4..8)
+        .map(|r| root_key(hash, r))
+        .chain([seeds_key(hash, &eight)])
         .collect();
-    let widened = handed(
-        &program.check,
-        &eight,
-        &[seeded],
-        BTreeMap::from([(seeded, owed.clone())]),
-        BTreeMap::from([(seeded, keys)]),
-    );
-    assert_eq!(widened.plan_for(seeded).roots, owed);
-
-    let executor = SimExecutor::new(&widened).exploring(seeded, exhaustive(4));
-    run_with(
-        &widened,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
+    let widened = handed(&program.check, &[seeded], BTreeMap::from([(seeded, keys)]));
+    let report = program.reported(&widened, &mut store, &[(seeded, exhaustive(4), 4)], &[]);
     assert_eq!(
-        executor.searched(seeded).map(|p| p.roots),
-        Some(owed),
-        "the run must search only what it owes"
+        report.simulation.seeds, 4,
+        "the seeds the search started from"
     );
     assert!(
-        passed(&store, plan_key(hash, &eight)),
+        passed(&store, seeds_key(hash, &eight)),
         "the widened plan's key is filed even though only half its roots ran"
     );
 }
@@ -1162,17 +1066,10 @@ fn an_exhausted_search_reports_green_and_writes_nothing() {
     let root = TempRoot::new();
     let mut store = root.store();
     let (program, seeded) = seeded_program();
-    let plan = Plan::default();
+    let seeds = Seeds::default();
 
-    let selection = seeded_choice(&program, &[seeded], &plan, false);
-    let executor = SimExecutor::new(&selection).exploring(seeded, spent(256));
-    let report = run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
+    let selection = seeded_choice(&program, &[seeded], &seeds, false);
+    let report = program.reported(&selection, &mut store, &[(seeded, spent(256), 1)], &[]);
 
     assert_eq!(report.failed, 0);
     assert_eq!(report.passed, 3);
@@ -1187,7 +1084,7 @@ fn an_exhausted_search_reports_green_and_writes_nothing() {
 
     let hash = program.hashes.tests[seeded];
     assert!(store.get(hash).is_none());
-    assert!(store.get(plan_key(hash, &plan)).is_none());
+    assert!(store.get(seeds_key(hash, &seeds)).is_none());
     assert_eq!(report.simulation.exhausted, 1);
 }
 
@@ -1196,26 +1093,22 @@ fn a_simulated_failure_is_never_cached_under_any_key() {
     let root = TempRoot::new();
     let mut store = root.store();
     let (program, seeded) = seeded_program();
-    let plan = Plan::random(2);
+    let seeds = Seeds::roots(0..2);
     let seed = Seed::at(0, vec![1, 0, 3]);
 
-    let selection = seeded_choice(&program, &[seeded], &plan, true);
-    let executor = SimExecutor::new(&selection)
-        .exploring(seeded, failed_at(seed.clone(), 47))
-        .failing(seeded);
-    let report = run_with(
+    let selection = seeded_choice(&program, &[seeded], &seeds, true);
+    let report = program.reported(
         &selection,
-        &program.check,
-        &program.hashes,
         &mut store,
-        &executor,
+        &[(seeded, failed_at(seed, 47), 2)],
+        &[seeded],
     );
 
     assert_eq!(report.failed, 1);
     let hash = program.hashes.tests[seeded];
     assert!(store.get(hash).is_none());
-    assert!(store.get(plan_key(hash, &plan)).is_none());
-    for root in &plan.roots {
+    assert!(store.get(seeds_key(hash, &seeds)).is_none());
+    for root in &seeds.roots {
         assert!(store.get(root_key(hash, *root)).is_none());
     }
 }
@@ -1227,33 +1120,22 @@ fn a_failure_carries_the_seed_and_the_race_that_explain_it() {
     let (program, seeded) = seeded_program();
     let seed = Seed::at(0, vec![1, 0, 3]);
     let site = |task: u64| RaceSite {
-        task: ply_eval::TaskId(task),
+        task,
         definition: Some(Symbol::new("apply_debit")),
         access: "db.write[accounts]".into(),
         span: ply_eval::Span::DUMMY,
     };
 
-    let selection = seeded_choice(&program, &[seeded], &Plan::default(), false);
-    let executor = SimExecutor::new(&selection)
-        .exploring(
-            seeded,
-            Exploration {
-                race: Some(Race {
-                    left: site(1),
-                    right: site(2),
-                    at: 3,
-                }),
-                ..failed_at(seed.clone(), 47)
-            },
-        )
-        .failing(seeded);
-    let report = run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
+    let selection = seeded_choice(&program, &[seeded], &Seeds::default(), false);
+    let raced = Searched {
+        race: Some(Race {
+            left: site(1),
+            right: site(2),
+            at: 3,
+        }),
+        ..failed_at(seed.clone(), 47)
+    };
+    let report = program.reported(&selection, &mut store, &[(seeded, raced, 1)], &[seeded]);
 
     let failure = &report.failures[0];
     assert_eq!(failure.seed, Some(seed));
@@ -1285,22 +1167,15 @@ fn a_seeded_test_with_no_observed_search_warns_and_is_not_cached() {
     let root = TempRoot::new();
     let mut store = root.store();
     let (program, seeded) = seeded_program();
-    let plan = Plan::default();
+    let seeds = Seeds::default();
 
-    let selection = seeded_choice(&program, &[seeded], &plan, false);
-    let executor = SimExecutor::new(&selection);
-    let report = run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
+    let selection = seeded_choice(&program, &[seeded], &seeds, false);
+    let report = program.reported(&selection, &mut store, &[], &[]);
 
     assert_eq!(report.failed, 0);
     assert!(
         store
-            .get(plan_key(program.hashes.tests[seeded], &plan))
+            .get(seeds_key(program.hashes.tests[seeded], &seeds))
             .is_none()
     );
     assert_eq!(
@@ -1322,18 +1197,14 @@ fn the_summary_counts_the_seeds_the_interleavings_and_the_exhaustive_searches() 
     let mut program = Program::compile(ARITHMETIC);
     let one = make_seeded(&mut program, "mul is right");
     let two = make_seeded(&mut program, "twice is right");
-    let plan = Plan::random(4);
+    let seeds = Seeds::roots(0..4);
 
-    let selection = seeded_choice(&program, &[one, two], &plan, true);
-    let executor = SimExecutor::new(&selection)
-        .exploring(one, exhaustive(12))
-        .exploring(two, spent(256));
-    let report = run_with(
+    let selection = seeded_choice(&program, &[one, two], &seeds, true);
+    let report = program.reported(
         &selection,
-        &program.check,
-        &program.hashes,
         &mut store,
-        &executor,
+        &[(one, exhaustive(12), 4), (two, spent(256), 4)],
+        &[],
     );
 
     let summary = report.simulation;
@@ -1373,7 +1244,7 @@ fn a_measured_reduction_is_carried_on_the_result_and_a_spent_naive_budget_is_a_l
     let mut store = root.store();
     let (program, seeded) = seeded_program();
 
-    let selection = seeded_choice(&program, &[seeded], &Plan::default(), false);
+    let selection = seeded_choice(&program, &[seeded], &Seeds::default(), false);
     let blind = Cost {
         explored: 30,
         bounded: false,
@@ -1382,21 +1253,12 @@ fn a_measured_reduction_is_carried_on_the_result_and_a_spent_naive_budget_is_a_l
         explored: 720,
         bounded: false,
     };
-    let executor = SimExecutor::new(&selection).exploring(
-        seeded,
-        Exploration {
-            blind: Some(blind),
-            naive: Some(naive),
-            ..exhaustive(12)
-        },
-    );
-    let report = run_with(
-        &selection,
-        &program.check,
-        &program.hashes,
-        &mut store,
-        &executor,
-    );
+    let measured = Searched {
+        blind: Some(blind),
+        naive: Some(naive),
+        ..exhaustive(12)
+    };
+    let report = program.reported(&selection, &mut store, &[(seeded, measured, 1)], &[]);
 
     let result = report
         .results

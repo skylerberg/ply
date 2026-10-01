@@ -1,35 +1,29 @@
 //! What `ply prove` and `ply review` load, discharge, review and accept, as the program in
 //! `crates/ply-cli/ply` performs it.
 //!
-//! The store and the prover stay here: discharging a claim enters compiled bodies, and an entry does
-//! not nest on the thread the `ply` program itself runs on. The obligations, the types they are
-//! written over and the search each one goes to are the program's (`proof.world`), handed over with
-//! the front end; which claims are asked for, the keys their evidence is read and filed under, what
-//! the review, the coverage and the baseline come to, every line and key of both reports and the
-//! code each run exits with are the program's too, in `crates/ply-cli/ply/claims.ply`, `prove.ply`
-//! and `review.ply`.
+//! The store and the prover's entries stay here: discharging a claim enters compiled bodies. The
+//! obligations, the types they are written over and the search each one goes to are the program's
+//! (`proof.world`), handed over with the front end; which claims are asked for, the keys their
+//! evidence is read and filed under, the evidence itself (`proof.evidence`, which the store holds as
+//! text it never reads), what the review, the coverage and the baseline come to, every line and key
+//! of both reports and the code each run exits with are the program's too, in
+//! `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
 
 use crate::config::Configuration;
-use crate::engine::Point;
+use crate::engine::{Fault, Judgement, Mode, Obligation};
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
-use crate::payload::{count, ctor, diags_value, option, places_value, record, strings};
-use crate::support::{build_pool, enter_constant, prover_backend};
+use crate::payload::{count, ctor, diags_value, places_value, record, strings};
+use crate::support::{enter_constant, prover_backend};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes};
-use ply_prove::property::{GenStream, generate};
-use ply_prove::shrink::Target;
-use ply_prove::{
-    Binder, Discharge, Evidence, Fault, Gap, Obligation, ProvePlan, ProveReport, Tier, Vacuity,
-    VacuityKind, World,
-};
 use ply_store::ReviewRecord;
 use ply_store::Store;
-use ply_test::obligation::{self, from_cached, to_cached};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 /// The effect `crates/ply-cli/ply/claims.ply` declares. It is lent to the two entries that read
 /// obligations and nowhere else.
@@ -45,41 +39,11 @@ const EFFECT: &str = "prover";
 /// refuses one this table does not list, and `every_marshalled_type_is_declared_where_this_side_says`
 /// holds every row to the program, because a tag that names no declaration is a placeless `no arm
 /// of this match matched` the moment the program matches the value.
-pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
-    ("proof.obligation", "Evidence", &["Proof", "Sampled"]),
-    (
-        "proof.obligation",
-        "Outcome",
-        &["Held", "Refuted", "Vacuous", "Unattempted", "Defect"],
-    ),
-    (
-        "proof.obligation",
-        "Point",
-        &["Kept", "Falsified", "Rejected", "Undrawn", "Faulted"],
-    ),
-    (
-        "proof.obligation",
-        "Gap",
-        &[
-            "UnhandledEffect",
-            "Ungeneratable",
-            "Raised",
-            "GuardNotSampled",
-            "ReachesHost",
-            "NotDrawn",
-        ],
-    ),
-    (
-        "proof.obligation",
-        "Tier",
-        &["Proved", "Property", "Example"],
-    ),
-    (
-        "proof.obligation",
-        "Vacuity",
-        &["Unsatisfiable", "NoCaseKept"],
-    ),
-];
+pub const MARSHALLED: &[(&str, &str, &[&str])] = &[(
+    "proof.obligation",
+    "Judged",
+    &["JHeld", "JFailed", "JRejected", "JRaised", "JFaulted"],
+)];
 
 /// One case of a type this side marshals, under the name the program declares it by.
 fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
@@ -94,19 +58,14 @@ fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     ctor(home, name, args)
 }
 
-const OPERATIONS: [(&str, &str); 14] = [
+const OPERATIONS: [(&str, &str); 9] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
-    ("outcomes", "ply_machine::claims::outcomes"),
-    ("discharged", "ply_machine::claims::discharged"),
+    ("prepared", "ply_machine::claims::prepared"),
+    ("cached", "ply_machine::claims::cached"),
+    ("judged", "ply_machine::claims::judged"),
+    ("interleaved", "ply_machine::claims::interleaved"),
     ("record", "ply_machine::claims::record"),
-    ("replay", "ply_machine::claims::replay"),
-    ("reaches", "ply_machine::claims::reaches"),
-    ("shrink", "ply_machine::claims::shrink"),
-    ("offers", "ply_machine::claims::offers"),
-    ("would", "ply_machine::claims::would"),
-    ("accept", "ply_machine::claims::accept"),
-    ("settled", "ply_machine::claims::settled"),
     ("baselines", "ply_machine::claims::baselines"),
     ("accepted", "ply_machine::claims::accepted"),
 ];
@@ -121,12 +80,9 @@ pub struct Job {
     /// The front end the CLI ran. A run without one is refused rather than loading again: `ply
     /// prove` and `ply review` start one and hand its answer over.
     pub front: Option<crate::driver::HandedFront>,
-    /// The program as the prover reads it, and the obligations it owes, as the program built them.
-    pub world: World,
+    /// The obligations the program owes, as it built them.
     pub obligations: Vec<Obligation>,
     pub use_cache: bool,
-    pub jobs: Option<u32>,
-    pub plan: ProvePlan,
     /// `None` for a command that binds nothing at all, which is every `ply review`.
     pub binding: Option<Binding>,
 }
@@ -147,6 +103,7 @@ pub fn lent(module: &str) -> Vec<Lent> {
         job: Mutex::new(None),
         machine: Mutex::new(None),
         claims: Mutex::new(0),
+        judging: RwLock::new(None),
         module: module.to_string(),
     });
     OPERATIONS
@@ -179,6 +136,8 @@ struct Site {
     /// How many claims the collection held, so a re-run can refuse an index that names none
     /// before reaching the thread.
     claims: Mutex<usize>,
+    /// The prover, once a discharge has built it: claims are judged on whichever threads ask.
+    judging: RwLock<Option<Arc<Judging>>>,
     /// Where the lent program declares `prover`, and so the `Refusal` it matches.
     module: String,
 }
@@ -190,8 +149,8 @@ impl HostHandler for Site {
             ("configure", [options, front, world]) => {
                 let mut job = job_of(options, span)?;
                 job.front = Some(crate::driver::handed_front_of(front, span)?);
-                (job.world, job.obligations) =
-                    World::decode(ply_eval::decode::At::new("the world", world))
+                job.obligations =
+                    crate::engine::obligations_of(ply_eval::decode::At::new("the world", world))
                         .map_err(|e| unread_world(&e, span))?;
                 // A configuration begins a run, whatever the last one was left doing: its machine
                 // is dropped, which joins its thread, and its claims are no longer this run's.
@@ -202,37 +161,20 @@ impl HostHandler for Site {
                 PlyValue::Unit
             }
             ("collected", _) => self.collected()?,
-            ("discharged", [choice]) => self.discharged(choice_of(choice, span)?)?,
-            ("record", [entries]) => self.record(filed_of(entries, span)?)?,
-            ("outcomes", [keys]) => {
-                let list = keys.as_list(span, "the keys to look up")?;
-                let mut named = Vec::with_capacity(list.len());
-                for item in list {
-                    named.push(item.as_str(span, "a key")?.to_string());
-                }
-                self.outcomes(&named)?
+            ("prepared", [step_budget]) => {
+                self.prepared(step_budget.as_int(span, "the calls an evaluation may make")?)?
             }
-            ("shrink", [claim]) => self.shrink(
+            ("cached", [keys]) => self.cached(&texts_of(keys, "the keys to read", span)?)?,
+            ("judged", [batches]) => self.judged(batches_of(batches, span)?)?,
+            ("interleaved", [claim, point, seed, steps]) => self.interleaved(
                 usize::try_from(claim.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
+                points_of(&PlyValue::list(vec![point.clone()]), span)?
+                    .pop()
+                    .unwrap_or_default(),
+                crate::recording::seed_of(seed, span)?,
+                u32::try_from(steps.as_int(span, "the scheduling steps")?).unwrap_or(u32::MAX),
             )?,
-            ("offers", [i]) => self.offers(
-                usize::try_from(i.as_int(span, "the value's place")?).unwrap_or(usize::MAX),
-            )?,
-            ("would", [i, position]) => self.would(
-                usize::try_from(i.as_int(span, "the value's place")?).unwrap_or(usize::MAX),
-                position.as_int(span, "the candidate's place")?,
-            )?,
-            ("accept", [i, position]) => self.take(
-                usize::try_from(i.as_int(span, "the value's place")?).unwrap_or(usize::MAX),
-                position.as_int(span, "the candidate's place")?,
-            )?,
-            ("settled", _) => self.settled()?,
-            ("replay", [index, root, case]) => self.replay(
-                usize::try_from(index.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
-                u64::try_from(root.as_int(span, "the generator's root")?).unwrap_or(0),
-                u32::try_from(case.as_int(span, "the case to draw")?).unwrap_or(u32::MAX),
-            )?,
-            ("reaches", [claims]) => self.reaches(indices(claims, span)?)?,
+            ("record", [entries]) => self.record(filed_of(entries, span)?)?,
             ("baselines", [names]) => self.baselines(names_of(names, span)?)?,
             ("accepted", [records]) => self.accepted(records_of(records, span)?)?,
             (other, _) => return Err(unasked(other, span)),
@@ -241,26 +183,97 @@ impl HostHandler for Site {
     }
 }
 
-/// The decision, as the program sent it.
-fn choice_of(value: &PlyValue, span: Span) -> Result<obligation::Choice, Diagnostic> {
-    use crate::payload::field_of;
-    Ok(obligation::Choice {
-        claims: indices(field_of(value, "claims", span)?, span)?,
-        to_discharge: indices(field_of(value, "runs", span)?, span)?,
-        read: filed_of(field_of(value, "read", span)?, span)?,
-    })
-}
-
-/// Positions in the run's claims, each with the key the program named for it.
-fn filed_of(value: &PlyValue, span: Span) -> Result<Vec<(usize, DefHash)>, Diagnostic> {
-    use crate::payload::field_of;
+/// A list of text the program sent.
+fn texts_of(value: &PlyValue, what: &str, span: Span) -> Result<Vec<String>, Diagnostic> {
     let mut out = Vec::new();
-    for entry in value.as_list(span, "the keys evidence is filed under")? {
-        let at = field_of(entry, "at", span)?.as_int(span, "a claim's place in the run")?;
-        let key = key_of(field_of(entry, "key", span)?.as_str(span, "a key")?, span)?;
-        out.push((usize::try_from(at).unwrap_or(usize::MAX), key));
+    for item in value.as_list(span, what)? {
+        out.push(item.as_str(span, what)?.to_string());
     }
     Ok(out)
+}
+
+/// One batch of points the program sent: whose claim, the points as plain values, and how they are
+/// judged.
+pub struct Batch {
+    claim: usize,
+    points: Vec<Vec<ply_eval::Plain>>,
+    mode: Mode,
+}
+
+/// The `proof.property.Batch`es the program sent.
+fn batches_of(value: &PlyValue, span: Span) -> Result<Vec<Batch>, Diagnostic> {
+    use crate::payload::field_of;
+    let mut out = Vec::new();
+    for batch in value.as_list(span, "the batches to judge")? {
+        let claim = field_of(batch, "claim", span)?.as_int(span, "a claim's place")?;
+        let (mode, _) = case_of(field_of(batch, "mode", span)?, "a mode", span)?;
+        out.push(Batch {
+            claim: usize::try_from(claim).unwrap_or(usize::MAX),
+            points: points_of(field_of(batch, "points", span)?, span)?,
+            mode: match mode {
+                "MWhole" => Mode::Whole,
+                "MWitness" => Mode::Witness,
+                "MDomain" => Mode::Domain,
+                other => return Err(malformed(&format!("`{other}` is no mode"), span)),
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// Tuples of `std.value.Value`s, as the plain values they name.
+fn points_of(value: &PlyValue, span: Span) -> Result<Vec<Vec<ply_eval::Plain>>, Diagnostic> {
+    let mut out = Vec::new();
+    for point in value.as_list(span, "the points")? {
+        let mut values = Vec::new();
+        for v in point.as_list(span, "a point")? {
+            values.push(crate::payload::value_plain(v, span)?);
+        }
+        out.push(values);
+    }
+    Ok(out)
+}
+
+/// The evidence the program decided to file, each under the key it chose, as the text
+/// `proof.evidence` wrote: the store holds it and never reads it.
+fn filed_of(value: &PlyValue, span: Span) -> Result<Vec<(DefHash, serde_json::Value)>, Diagnostic> {
+    use crate::payload::field_of;
+    let mut out = Vec::new();
+    for entry in value.as_list(span, "the evidence to file")? {
+        let key = key_of(field_of(entry, "key", span)?.as_str(span, "a key")?, span)?;
+        let text = field_of(entry, "evidence", span)?.as_str(span, "evidence")?;
+        let evidence = serde_json::from_str(text)
+            .map_err(|e| malformed(&format!("the evidence to file is no JSON: {e}"), span))?;
+        out.push((key, evidence));
+    }
+    Ok(out)
+}
+
+/// A constructor's simple name and its arguments.
+fn case_of<'v>(
+    value: &'v PlyValue,
+    what: &str,
+    span: Span,
+) -> Result<(&'v str, &'v [PlyValue]), Diagnostic> {
+    match value {
+        PlyValue::Ctor { name, args } => Ok((
+            name.as_str()
+                .rsplit_once('.')
+                .map_or(name.as_str(), |(_, simple)| simple),
+            args,
+        )),
+        _ => Err(malformed(&format!("{what} is no constructor"), span)),
+    }
+}
+
+/// A value the program's types promise a shape for, without it: Ply disagreeing with itself.
+fn malformed(why: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the program's decision is malformed: {why}"),
+    )
+    .primary(span, "this is what the program sent")
+    .note("`proof.decide` and this reader are one program's two halves; this is Ply's fault")
 }
 
 /// The baselines the program decided to record, each keyed by the definition's name.
@@ -294,173 +307,12 @@ fn key_of(hex: &str, span: Span) -> Result<DefHash, Diagnostic> {
     })
 }
 
-/// The tuple a counterexample's draw gives, regenerated: the values a walk needs are the ones the
-/// generator produced, and a draw is reproducible from where it was made.
-fn drawn(obligation: &Obligation, root: u64, case: u32, world: &World) -> Option<Vec<Value>> {
-    let mut stream = GenStream::new(root, obligation.key);
-    obligation
-        .binders
-        .iter()
-        .map(|binder| generate(&binder.sort, world, &mut stream, case).ok())
-        .collect()
-}
-
-/// The counterexample a claim's discharge left, regenerated from the draw it reports: a refutation's
-/// or a raise's. Which claims are walked at all is the program's decision, since only a point drawn
-/// one at a time has a draw to regenerate; an outcome with no counterexample has nothing here.
-fn walkable(
-    claim: usize,
-    obligations: &[Obligation],
-    report: &Option<ProveReport>,
-    world: &World,
-) -> Option<Shrinking> {
-    let obligation = obligations.get(claim)?;
-    let report = report.as_ref()?;
-    let discharge = report
-        .obligations
-        .iter()
-        .find(|(o, _)| o.key == obligation.key)
-        .map(|(_, discharge)| discharge)?;
-    let (values, original, target) = match discharge {
-        Discharge::Refuted(cx) => (
-            drawn(obligation, cx.root, cx.case, world)?,
-            cx.original.clone(),
-            Target::Falsifies,
-        ),
-        Discharge::Unattempted(Gap::Raised {
-            root,
-            case,
-            bindings,
-            ..
-        }) => (
-            drawn(obligation, *root, *case, world)?,
-            bindings.clone(),
-            Target::Raises,
-        ),
-        _ => return None,
-    };
-    Some(Shrinking {
-        claim,
-        values,
-        binders: obligation.binders.clone(),
-        target,
-        original,
-    })
-}
-
-/// The value at `i` as it stands, with its candidates and each one's size.
-fn offer(s: &Shrinking, i: usize, world: &World) -> Option<Offer> {
-    let value = s.values.get(i)?;
-    let binder = s.binders.get(i)?;
-    let here = ply_prove::shrink::size(value, world);
-    let candidates = ply_prove::shrink::candidates(value, &binder.sort, world)
-        .iter()
-        .enumerate()
-        .map(|(position, candidate)| (position as u64, ply_prove::shrink::size(candidate, world)))
-        .collect();
-    Some(Offer { here, candidates })
-}
-
-/// The tuple with the candidate at `position` of the value at `i` taken.
-fn candidate_at(s: &Shrinking, i: usize, position: i64, world: &World) -> Option<Vec<Value>> {
-    let value = s.values.get(i)?;
-    let binder = s.binders.get(i)?;
-    let candidates = ply_prove::shrink::candidates(value, &binder.sort, world);
-    let picked = usize::try_from(position)
-        .ok()
-        .and_then(|position| candidates.get(position))
-        .cloned()?;
-    let mut values = s.values.clone();
-    values[i] = picked;
-    Some(values)
-}
-
-/// The counterexample as it now stands: the walk's accepted values, and the ones it started from.
-fn settled_of(s: &Shrinking) -> Settled {
-    Settled {
-        bindings: s
-            .binders
-            .iter()
-            .zip(&s.values)
-            .map(|(binder, value)| {
-                (
-                    binder.name.as_str().to_string(),
-                    binder.text.clone(),
-                    ply_eval::Plain::shown(value),
-                )
-            })
-            .collect(),
-        original: s
-            .original
-            .iter()
-            .map(|binding| {
-                (
-                    binding.name.as_str().to_string(),
-                    binding.ty.clone(),
-                    binding.value.clone(),
-                )
-            })
-            .collect(),
-    }
-}
-
-/// A counterexample's bindings, as `proof.obligation.Binding`s.
-fn texts_of_bindings(bindings: &[(String, String, ply_eval::Plain)]) -> PlyValue {
-    PlyValue::list(
-        bindings
-            .iter()
-            .map(|(name, ty, value)| {
-                record(vec![
-                    ("name", PlyValue::str(name)),
-                    ("ty", PlyValue::str(ty)),
-                    ("value", crate::payload::plain_value(value)),
-                ])
-            })
-            .collect(),
-    )
-}
-
-/// What a program needs to walk one value: how big it is, and its candidates with theirs, as
-/// `(position, size)` — the position being what the program hands back to try one.
-struct Offer {
-    here: u64,
-    candidates: Vec<(u64, u64)>,
-}
-
-/// The counterexample as it now stands: `(name, type, value)`.
-struct Settled {
-    bindings: Vec<(String, String, ply_eval::Plain)>,
-    original: Vec<(String, String, ply_eval::Plain)>,
-}
-
-/// One counterexample being walked down. The values live here because a program cannot hold a value
-/// of a type it never named: it decides which candidate to take, and this is where taking it lands.
-struct Shrinking {
-    claim: usize,
-    values: Vec<Value>,
-    /// Parallel to `values`: what each is a value of, and how a report prints that.
-    binders: Vec<Binder>,
-    target: Target,
-    original: Vec<ply_prove::Binding>,
-}
-
 /// Definitions by program-wide name, as the program handed them over.
 fn names_of(value: &PlyValue, span: Span) -> Result<Vec<Symbol>, Diagnostic> {
     value
         .as_list(span, "the definitions to read baselines for")?
         .iter()
         .map(|item| Ok(Symbol::new(item.as_str(span, "a definition's name")?)))
-        .collect()
-}
-
-fn indices(value: &PlyValue, span: Span) -> Result<Vec<usize>, Diagnostic> {
-    value
-        .as_list(span, "the claims to discharge")?
-        .iter()
-        .map(|item| {
-            item.as_int(span, "a claim's place in the collection")
-                .map(|index| usize::try_from(index).unwrap_or(usize::MAX))
-        })
         .collect()
 }
 
@@ -492,161 +344,91 @@ impl Site {
         }
     }
 
-    /// Start walking this claim's counterexample down, and answer how many values it has, or nothing
-    /// for an outcome that is no counterexample.
-    fn shrink(&self, claim: usize) -> Result<PlyValue, Diagnostic> {
+    /// Binds the hosts and builds the prover a discharge runs against, once, each evaluation of a
+    /// claim bounded by `step_budget` calls, and answers what opening the hosts had to say.
+    fn prepared(&self, step_budget: i64) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("shrink"))?;
-        machine.ask(Go::Shrink(claim))?;
+        let machine = held.as_ref().ok_or_else(|| unstarted("prepared"))?;
+        machine.ask(Go::Prepare(step_budget))?;
         match machine.step()? {
-            Step::Shrink(answer) => {
-                Ok(self.answered((*answer).map(|width| crate::payload::option(width.map(count)))))
-            }
-            _ => Err(out_of_step("shrink")),
+            Step::Prepared(answer) => Ok(self.answered((*answer).map(|ready| {
+                *self.judging.write().unwrap_or_else(|e| e.into_inner()) = Some(ready.judging);
+                diags_value(&ready.warnings)
+            }))),
+            _ => Err(out_of_step("prepared")),
         }
     }
 
-    /// The value at `i` as it stands, with its candidates.
-    fn offers(&self, i: usize) -> Result<PlyValue, Diagnostic> {
+    /// The text the store holds under each key.
+    fn cached(&self, keys: &[String]) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("offers"))?;
-        machine.ask(Go::Offers(i))?;
-        let Step::Offers(answer) = machine.step()? else {
-            return Err(out_of_step("offers"));
-        };
-        let value = (*answer).map(|offer| {
-            crate::payload::option(offer.map(|offer| {
-                let candidates = offer
-                    .candidates
-                    .iter()
-                    .map(|(position, size)| {
-                        record(vec![
-                            ("position", PlyValue::Int(*position as i64)),
-                            ("size", size_value(*size)),
-                        ])
-                    })
-                    .collect();
-                record(vec![
-                    ("here", size_value(offer.here)),
-                    ("candidates", PlyValue::list(candidates)),
-                ])
-            }))
-        });
-        Ok(self.answered(value))
-    }
-
-    fn would(&self, i: usize, position: i64) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("would"))?;
-        machine.ask(Go::Would { i, position })?;
+        let machine = held.as_ref().ok_or_else(|| unstarted("cached"))?;
+        machine.ask(Go::Cached(keys.to_vec()))?;
         match machine.step()? {
-            Step::Would(answer) => Ok(self.answered((*answer).map(PlyValue::Bool))),
-            _ => Err(out_of_step("would")),
-        }
-    }
-
-    fn take(&self, i: usize, position: i64) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("accept"))?;
-        machine.ask(Go::Take { i, position })?;
-        match machine.step()? {
-            Step::Took(answer) => Ok(self.answered((*answer).map(|_| PlyValue::Unit))),
-            _ => Err(out_of_step("accept")),
-        }
-    }
-
-    /// The counterexample as it now stands, with the walk's choices taken into account.
-    fn settled(&self) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("settled"))?;
-        machine.ask(Go::Settled)?;
-        let Step::Settled(answer) = machine.step()? else {
-            return Err(out_of_step("settled"));
-        };
-        let value = (*answer).map(|settled| {
-            crate::payload::option(settled.map(|settled| {
-                record(vec![
-                    ("bindings", texts_of_bindings(&settled.bindings)),
-                    ("original", texts_of_bindings(&settled.original)),
-                ])
-            }))
-        });
-        Ok(self.answered(value))
-    }
-
-    /// The store's answer under each key, as a report prints one: `passed`, `failed`, or nothing.
-    fn outcomes(&self, keys: &[String]) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("outcomes"))?;
-        machine.ask(Go::Outcomes(keys.to_vec()))?;
-        match machine.step()? {
-            Step::Outcomes(answers) => Ok(PlyValue::list(
-                answers
-                    .iter()
-                    .map(|answer| crate::payload::option(answer.as_deref().map(PlyValue::str)))
+            Step::Cached(read) => Ok(PlyValue::list(
+                read.iter()
+                    .map(|text| crate::payload::option(text.as_deref().map(PlyValue::str)))
                     .collect(),
             )),
-            _ => Err(out_of_step("outcomes")),
+            _ => Err(out_of_step("cached")),
         }
     }
 
-    fn discharged(&self, choice: obligation::Choice) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("discharged"))?;
-        machine.ask(Go::Discharge(choice))?;
-        match machine.step()? {
-            Step::Discharged(answer) => Ok(self.answered((*answer).map(|v| verdicts_value(&v)))),
-            _ => Err(out_of_step("discharged")),
-        }
+    /// The prover a discharge built. It reaches no machine: the program judges from many threads
+    /// at once.
+    fn judging(&self, op: &str) -> Result<Arc<Judging>, Diagnostic> {
+        self.judging
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|judging| judging.open.load(Ordering::Acquire))
+            .cloned()
+            .ok_or_else(|| out_of_step(op))
     }
 
-    /// Files the evidence of the discharges just made under the keys the program chose.
-    fn record(&self, entries: Vec<(usize, DefHash)>) -> Result<PlyValue, Diagnostic> {
+    /// Each batch's points judged in turn, on this thread.
+    fn judged(&self, batches: Vec<Batch>) -> Result<PlyValue, Diagnostic> {
+        let claims = *self.claims.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(batch) = batches.iter().find(|b| b.claim >= claims) {
+            return Err(no_such_claim(batch.claim, claims));
+        }
+        let judging = self.judging("judged")?;
+        Ok(PlyValue::list(
+            batches
+                .iter()
+                .map(|batch| {
+                    PlyValue::list(judging.judged(batch).iter().map(judged_value).collect())
+                })
+                .collect(),
+        ))
+    }
+
+    /// A law over interleavings, run at one of its points under one seed, on this thread.
+    fn interleaved(
+        &self,
+        claim: usize,
+        point: Vec<ply_eval::Plain>,
+        seed: ply_eval::Seed,
+        steps: u32,
+    ) -> Result<PlyValue, Diagnostic> {
+        let claims = *self.claims.lock().unwrap_or_else(|e| e.into_inner());
+        if claim >= claims {
+            return Err(no_such_claim(claim, claims));
+        }
+        let judging = self.judging("interleaved")?;
+        Ok(interleaved_value(
+            &judging.interleaved(claim, point, &seed, steps),
+        ))
+    }
+
+    /// Files the evidence the program chose, each under the key it chose.
+    fn record(&self, entries: Vec<(DefHash, serde_json::Value)>) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("record"))?;
         machine.ask(Go::Record(entries))?;
         match machine.step()? {
             Step::Recorded(warnings) => Ok(diags_value(&warnings)),
             _ => Err(out_of_step("record")),
-        }
-    }
-
-    fn replay(&self, index: usize, root: u64, case: u32) -> Result<PlyValue, Diagnostic> {
-        let held = self.claims.lock().unwrap_or_else(|e| e.into_inner());
-        if index >= *held {
-            return Err(no_such_claim(index, *held));
-        }
-        drop(held);
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("replay"))?;
-        machine.ask(Go::Replay { index, root, case })?;
-        match machine.step()? {
-            Step::Replayed(answer) => Ok(self.answered((*answer).map(|point| point_value(&point)))),
-            _ => Err(out_of_step("replay")),
-        }
-    }
-
-    /// What the static tier alone answers for each claim, cached or not: `None` for one it never
-    /// sees, such as a law over interleavings.
-    fn reaches(&self, wanted: Vec<usize>) -> Result<PlyValue, Diagnostic> {
-        let held = self.claims.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&index) = wanted.iter().find(|&&index| index >= *held) {
-            return Err(no_such_claim(index, *held));
-        }
-        drop(held);
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("reaches"))?;
-        machine.ask(Go::Reaches(wanted))?;
-        match machine.step()? {
-            Step::Reached(answer) => Ok(self.answered((*answer).map(|reached| {
-                PlyValue::list(
-                    reached
-                        .iter()
-                        .map(|reach| option(reach.as_ref().map(reach_value)))
-                        .collect(),
-                )
-            }))),
-            _ => Err(out_of_step("reaches")),
         }
     }
 
@@ -696,41 +478,14 @@ impl Site {
 
 /// What the program asks the machine for next.
 enum Go {
-    /// Start walking this claim's counterexample down. The answer is how many values it has, or
-    /// nothing for an outcome that is no counterexample.
-    Shrink(usize),
-    /// The value at `i` as it now stands: its size and its candidates with theirs.
-    Offers(usize),
-    /// Whether replacing the value at `i` with that candidate still leaves the counterexample a
-    /// counterexample.
-    Would {
-        i: usize,
-        position: i64,
-    },
-    /// Take that candidate: the program decided it was smaller and still held.
-    Take {
-        i: usize,
-        position: i64,
-    },
-    /// The counterexample as it now stands.
-    Settled,
+    /// Bind the hosts and build the prover a discharge runs against, with the calls each
+    /// evaluation of a claim may make.
+    Prepare(i64),
     /// What the store holds under these keys. The program computes them — a plan key is part of
     /// the obligation's own encoding — so no row could carry the answers.
-    Outcomes(Vec<String>),
-    Discharge(obligation::Choice),
-    /// File the evidence of the discharges just made, each at a position in the run, under the key
-    /// the program chose for it.
-    Record(Vec<(usize, DefHash)>),
-    /// One point of one obligation's guard: its place in the collection, the generator's root,
-    /// and which case to draw.
-    Replay {
-        index: usize,
-        root: u64,
-        case: u32,
-    },
-    /// What the static tier alone answers for each of these claims, by its place in the
-    /// collection, whether or not anything discharged it this run.
-    Reaches(Vec<usize>),
+    Cached(Vec<String>),
+    /// File this evidence, each under the key the program chose for it.
+    Record(Vec<(DefHash, serde_json::Value)>),
     /// The baseline a reader accepted for each of these definitions.
     Baselines(Vec<Symbol>),
     Accept(Vec<(Symbol, ReviewRecord)>),
@@ -738,24 +493,15 @@ enum Go {
 
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
-    Shrink(Box<Result<Option<usize>, Refused>>),
-    Offers(Box<Result<Option<Offer>, Refused>>),
-    Would(Box<Result<bool, Refused>>),
-    Took(Box<Result<(), Refused>>),
-    Settled(Box<Result<Option<Settled>, Refused>>),
-    /// The store's answer under each key asked about: `passed`, `failed`, or nothing.
-    Outcomes(Vec<Option<String>>),
-    Discharged(Box<Result<Verdicts, Refused>>),
+    Prepared(Box<Result<Ready, Refused>>),
+    Cached(Vec<Option<String>>),
     Recorded(Vec<Diagnostic>),
-    Replayed(Box<Result<Point, Refused>>),
-    Reached(Box<Result<Vec<Option<crate::engine::Reach>>, Refused>>),
     Baselines(Vec<(String, ReviewRecord)>),
     Accepted(Box<Accepted>),
 }
 
-/// The thread the load, the store and the prover live on. The `ply` program performing these
-/// operations is itself inside an entry, and a compiled body entered while another entry holds the
-/// same thread is declined rather than run — which would report every obligation as a gap.
+/// The thread the load and the store live on, and the prover is built on. Claims are judged on the
+/// threads the program asks from, against the [`Judging`] this thread publishes.
 struct Machine {
     go: Option<mpsc::Sender<Go>>,
     steps: mpsc::Receiver<Step>,
@@ -838,160 +584,45 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
         sources: loaded.sources.clone(),
         warnings: std::mem::take(&mut warnings),
         obligations: obligations.len(),
-        plan: job.plan.clone(),
+        host: job.binding.as_ref().is_some_and(|b| b.host),
     }))));
 
-    let mut report: Option<ProveReport> = None;
-    // The counterexample being walked down, if a program is walking one: the values live here
-    // because a program cannot hold a value of a type it never named.
-    let mut shrinking: Option<Shrinking> = None;
-    // Built by the first step that runs an obligation, and kept: a discharge of many claims and a
-    // re-run of one case are the same prover over the same hosts.
+    // Built by the first step that runs an obligation, and kept: every batch a discharge judges
+    // is judged by the same prover over the same hosts.
     let mut prepared: Option<Result<Prepared, Refused>> = None;
     loop {
         match asked.recv() {
-            Ok(Go::Outcomes(keys)) => {
-                // What the *obligation* cache holds under each key, as a word: the program applies
-                // the rule (a proof only under the bare key, a sample only under its plan's), and
-                // only the runtime can decode an entry.
-                let answers: Vec<Option<String>> = keys
+            Ok(Go::Prepare(step_budget)) => {
+                if prepared.is_none() {
+                    prepared = Some(prepare(&job, &loaded, step_budget));
+                }
+                let answer = match prepared.as_ref() {
+                    Some(Ok(ready)) => Ok(Ready {
+                        warnings: ready.warnings.clone(),
+                        judging: Arc::clone(&ready.judging),
+                    }),
+                    Some(Err(refused)) => Err(refused.clone()),
+                    None => return,
+                };
+                let _ = told.send(Step::Prepared(Box::new(answer)));
+            }
+            Ok(Go::Cached(keys)) => {
+                let read = keys
                     .iter()
                     .map(|key| {
-                        let entry = ply_eval::DefHash::from_hex(key)
-                            .and_then(|hash| store.obligation(hash))?;
-                        Some(match from_cached(&entry) {
-                            Ok(Evidence::Proof(_)) => "proof".to_string(),
-                            Ok(Evidence::Cases(_)) => "sample".to_string(),
-                            Err(_) => "other".to_string(),
-                        })
+                        let entry =
+                            DefHash::from_hex(key).and_then(|hash| store.obligation(hash))?;
+                        Some(entry.to_string())
                     })
                     .collect();
-                let _ = told.send(Step::Outcomes(answers));
-            }
-            Ok(Go::Shrink(claim)) => {
-                if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &mut store));
-                }
-                let start = match prepared.as_ref() {
-                    Some(Ok(ready)) => walkable(claim, obligations, &report, ready.prover.world()),
-                    Some(Err(refused)) => {
-                        let _ = told.send(Step::Shrink(Box::new(Err(refused.clone()))));
-                        return;
-                    }
-                    None => return,
-                };
-                let width = start.as_ref().map(|s| s.values.len());
-                shrinking = start;
-                let _ = told.send(Step::Shrink(Box::new(Ok(width))));
-            }
-            Ok(Go::Offers(i)) => {
-                let answer = match (&shrinking, prepared.as_ref()) {
-                    (Some(s), Some(Ok(ready))) => offer(s, i, ready.prover.world()),
-                    _ => None,
-                };
-                let _ = told.send(Step::Offers(Box::new(Ok(answer))));
-            }
-            Ok(Go::Would { i, position }) => {
-                let answer = match (&shrinking, prepared.as_ref()) {
-                    (Some(s), Some(Ok(ready))) => {
-                        candidate_at(s, i, position, ready.prover.world()).is_some_and(|values| {
-                            ready
-                                .prover
-                                .judge_at(&obligations[s.claim], &job.plan, &values)
-                                .matches(s.target)
-                        })
-                    }
-                    _ => false,
-                };
-                let _ = told.send(Step::Would(Box::new(Ok(answer))));
-            }
-            Ok(Go::Take { i, position }) => {
-                let picked = match (&shrinking, prepared.as_ref()) {
-                    (Some(s), Some(Ok(ready))) => {
-                        candidate_at(s, i, position, ready.prover.world())
-                            .map(|values| values[i].clone())
-                    }
-                    _ => None,
-                };
-                if let (Some(value), Some(s)) = (picked, shrinking.as_mut())
-                    && i < s.values.len()
-                {
-                    s.values[i] = value;
-                }
-                let _ = told.send(Step::Took(Box::new(Ok(()))));
-            }
-            Ok(Go::Settled) => {
-                let answer = shrinking.as_ref().map(settled_of);
-                let _ = told.send(Step::Settled(Box::new(Ok(answer))));
-            }
-            Ok(Go::Discharge(wanted)) => {
-                if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &mut store));
-                }
-                let ready = match prepared.as_ref() {
-                    Some(Ok(ready)) => ready,
-                    Some(Err(refused)) => {
-                        let _ = told.send(Step::Discharged(Box::new(Err(refused.clone()))));
-                        return;
-                    }
-                    None => return,
-                };
-                let asked_for: Vec<Obligation> = wanted
-                    .claims
-                    .iter()
-                    .filter_map(|&index| obligations.get(index).cloned())
-                    .collect();
-                let (proved, mut warnings) = discharge(&job, asked_for, &wanted, ready, &store);
-                warnings.extend(flushed(&mut store));
-                let verdicts = verdicts_of(&proved, warnings);
-                report = Some(proved);
-                let _ = told.send(Step::Discharged(Box::new(Ok(verdicts))));
+                let _ = told.send(Step::Cached(read));
             }
             Ok(Go::Record(entries)) => {
-                let mut warnings = Vec::new();
-                for (at, key) in entries {
-                    match report.as_ref().and_then(|r| r.obligations.get(at)) {
-                        Some((_, Discharge::Held(evidence))) => {
-                            store.put_obligation(key, to_cached(evidence))
-                        }
-                        _ => warnings.push(unfiled(at)),
-                    }
+                for (key, evidence) in entries {
+                    store.put_obligation(key, evidence);
                 }
-                warnings.extend(flushed(&mut store));
+                let warnings = flushed(&mut store);
                 let _ = told.send(Step::Recorded(warnings));
-            }
-            Ok(Go::Replay { index, root, case }) => {
-                if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &mut store));
-                }
-                let answer = match prepared.as_ref() {
-                    Some(Ok(ready)) => {
-                        Ok(ready
-                            .prover
-                            .point_at(&obligations[index], root, case, &job.plan))
-                    }
-                    Some(Err(refused)) => Err(refused.clone()),
-                    None => return,
-                };
-                let _ = told.send(Step::Replayed(Box::new(answer)));
-            }
-            Ok(Go::Reaches(wanted)) => {
-                if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &mut store));
-                }
-                let answer = match prepared.as_ref() {
-                    Some(Ok(ready)) => Ok(wanted
-                        .iter()
-                        .map(|&index| {
-                            obligations
-                                .get(index)
-                                .and_then(|obligation| ready.prover.reach(obligation, &job.plan))
-                        })
-                        .collect()),
-                    Some(Err(refused)) => Err(refused.clone()),
-                    None => return,
-                };
-                let _ = told.send(Step::Reached(Box::new(answer)));
             }
             Ok(Go::Baselines(names)) => {
                 let baselines = names
@@ -1064,19 +695,80 @@ fn flushed(store: &mut Store) -> Vec<Diagnostic> {
 
 /// The prover and the hosts a run discharges and re-runs points with, built when the first step
 /// that needs them asks: a discharge of many claims and a re-run of one case are the same engine.
-struct Prepared<'a> {
+struct Prepared {
     /// Kept alive for the prover's lifetime, which is the run's.
     _hosts: Option<Hosts>,
-    prover: crate::engine::Prover<'a>,
+    judging: Arc<Judging>,
     /// What opening the hosts had to say, reported by the discharge that reads them.
     warnings: Vec<Diagnostic>,
 }
 
-fn prepare<'a>(
-    job: &'a Job,
-    loaded: &'a Loaded,
-    store: &mut Store,
-) -> Result<Prepared<'a>, Refused> {
+impl Drop for Prepared {
+    /// Before the hosts go: nothing is judged against a stopped host.
+    fn drop(&mut self) {
+        self.judging.open.store(false, Ordering::Release);
+    }
+}
+
+/// What preparing answers: what opening the hosts had to say, and the prover it built.
+struct Ready {
+    warnings: Vec<Diagnostic>,
+    judging: Arc<Judging>,
+}
+
+/// What judging a claim needs, owned, so every thread the program judges from can read it.
+struct Judging {
+    prover: crate::engine::Prover,
+    obligations: Vec<Obligation>,
+    /// The calls each evaluation of a claim may make; it decides what an evaluation reports.
+    step_budget: i64,
+    open: AtomicBool,
+}
+
+impl Judging {
+    fn judged(&self, batch: &Batch) -> Vec<Judgement> {
+        match (self.obligations.get(batch.claim), values_of(&batch.points)) {
+            (Some(obligation), Ok(values)) => {
+                self.prover
+                    .judged(obligation, self.step_budget, &values, batch.mode)
+            }
+            (None, _) => vec![Judgement::Faulted(no_such_claim(
+                batch.claim,
+                self.obligations.len(),
+            ))],
+            (_, Err(fault)) => vec![Judgement::Faulted(*fault.diagnostic)],
+        }
+    }
+
+    fn interleaved(
+        &self,
+        claim: usize,
+        point: Vec<ply_eval::Plain>,
+        seed: &ply_eval::Seed,
+        steps: u32,
+    ) -> crate::engine::Interleaved {
+        let faulted = |diagnostic: Diagnostic| crate::engine::Interleaved {
+            interleaving: ply_eval::Interleaving::passed(Vec::new()),
+            verdict: Some(Judgement::Faulted(diagnostic)),
+            observed: false,
+        };
+        let Some(obligation) = self.obligations.get(claim) else {
+            return faulted(no_such_claim(claim, self.obligations.len()));
+        };
+        match values_of(&[point]) {
+            Ok(mut values) => self.prover.interleaved(
+                obligation,
+                self.step_budget,
+                &values.pop().unwrap_or_default(),
+                seed,
+                steps,
+            ),
+            Err(fault) => faulted(*fault.diagnostic),
+        }
+    }
+}
+
+fn prepare(job: &Job, loaded: &Loaded, step_budget: i64) -> Result<Prepared, Refused> {
     let unbound = |diagnostics: Vec<Diagnostic>| Refused {
         why: Why::Unbound,
         diagnostics,
@@ -1110,47 +802,42 @@ fn prepare<'a>(
         .filter(|_| job.binding.as_ref().is_some_and(|b| b.host))
         .map(|hosts| crate::engine::Hosting {
             binding: hosts.binding(),
-            runtime: hosts.runtime_factory().map(|f| {
-                Arc::new(f)
-                    as Arc<dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync + Send>
-            }),
+            runtime: hosts.runtime_factory(),
         });
-    let prover =
-        crate::engine::prover(loaded, &job.world, hosting, backend, store).map_err(|err| {
-            Refused {
-                why: Why::Broken,
-                diagnostics: err.diagnostics,
-                sources: err.sources,
-            }
-        })?;
     Ok(Prepared {
         _hosts: hosts,
-        prover,
+        judging: Arc::new(Judging {
+            prover: crate::engine::prover(loaded, hosting, backend),
+            obligations: job.obligations.clone(),
+            step_budget,
+            open: AtomicBool::new(true),
+        }),
         warnings,
     })
 }
 
-/// The program's decision carried out: the evidence it named read back, and the rest discharged.
-fn discharge(
-    job: &Job,
-    asked_for: Vec<Obligation>,
-    choice: &obligation::Choice,
-    prepared: &Prepared<'_>,
-    store: &Store,
-) -> (ProveReport, Vec<Diagnostic>) {
-    let mut warnings = prepared.warnings.clone();
-    let asked = obligation::Asked::chosen(asked_for, choice, store, &job.plan);
-    let (pool, _workers) = build_pool(job.jobs, &mut warnings);
-    let discharge = || asked.discharge(&prepared.prover);
-    let mut report = match &pool {
-        Some(pool) => pool.install(discharge),
-        None => discharge(),
-    };
-    warnings.append(&mut report.warnings);
-    (report, warnings)
+/// The values plain values name, on the thread that judges them.
+fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<Value>>, Fault> {
+    points
+        .iter()
+        .map(|point| {
+            point
+                .iter()
+                .map(|plain| plain.clone().into_value())
+                .collect::<Result<Vec<Value>, _>>()
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|why| Fault {
+            bindings: Vec::new(),
+            diagnostic: Box::new(
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("a point the program drew is no runtime value: {why}"),
+                )
+                .note("the program draws only values of its claims' types; this is Ply's fault"),
+            ),
+        })
 }
-
-// --- What crosses back ----------------------------------------------------------
 
 #[derive(Clone)]
 enum Why {
@@ -1166,54 +853,20 @@ struct Refused {
     sources: SourceMap,
 }
 
-/// Where a claim is written, as a label points at it.
-struct At {
-    module: u32,
-    start: u32,
-    end: u32,
-}
-
-impl At {
-    fn of(span: Span) -> At {
-        At {
-            module: span.source.0,
-            start: span.start,
-            end: span.end,
-        }
-    }
-}
-
 /// What loading the run came to. The obligations, and the definitions and laws a run answers for,
 /// are the program's; this counts the obligations, so a re-run can refuse an index that names none.
 struct Collection {
     sources: SourceMap,
     warnings: Vec<Diagnostic>,
     obligations: usize,
-    plan: ProvePlan,
-}
-
-struct Verdicts {
-    outcomes: Vec<Discharge>,
-    duration: std::time::Duration,
-    warnings: Vec<Diagnostic>,
+    /// Whether a `law/host` has a host bound to run against.
+    host: bool,
 }
 
 struct Accepted {
     definitions: usize,
     stored: bool,
     warnings: Vec<Diagnostic>,
-}
-
-fn verdicts_of(report: &ProveReport, warnings: Vec<Diagnostic>) -> Verdicts {
-    Verdicts {
-        outcomes: report
-            .obligations
-            .iter()
-            .map(|(_, discharge)| discharge.clone())
-            .collect(),
-        duration: report.duration,
-        warnings,
-    }
 }
 
 // --- The values the program reads -------------------------------------------------
@@ -1234,41 +887,6 @@ fn refusal_value(refused: &Refused, module: &str) -> PlyValue {
     )
 }
 
-fn at_value(at: &At) -> PlyValue {
-    record(vec![
-        ("module", PlyValue::Int(i64::from(at.module))),
-        ("start", PlyValue::Int(i64::from(at.start))),
-        ("end", PlyValue::Int(i64::from(at.end))),
-    ])
-}
-
-fn roots_value(roots: &[u64]) -> PlyValue {
-    PlyValue::list(roots.iter().map(|&root| tally(root)).collect())
-}
-
-fn plan_value(plan: &ProvePlan) -> PlyValue {
-    record(vec![
-        ("cases", tally(u64::from(plan.cases))),
-        ("roots", roots_value(&plan.roots)),
-        ("prove_budget", tally(u64::from(plan.prove_budget))),
-        ("shrink_budget", tally(u64::from(plan.shrink_budget))),
-        ("step_budget", PlyValue::Int(plan.step_budget)),
-        (
-            "sim",
-            record(vec![
-                ("mode", PlyValue::str(plan.sim.mode.as_str())),
-                ("roots", roots_value(&plan.sim.roots)),
-                ("budget", tally(u64::from(plan.sim.budget))),
-                ("steps", tally(u64::from(plan.sim.steps))),
-                (
-                    "path",
-                    PlyValue::list(plan.sim.path.iter().map(|&c| tally(u64::from(c))).collect()),
-                ),
-            ]),
-        ),
-    ])
-}
-
 fn hashes_value(hashes: &[DefHash]) -> PlyValue {
     PlyValue::list(hashes.iter().map(|h| PlyValue::str(h.to_hex())).collect())
 }
@@ -1277,137 +895,7 @@ fn collection_value(collection: Collection) -> PlyValue {
     record(vec![
         ("places", places_value(&collection.sources)),
         ("warnings", diags_value(&collection.warnings)),
-        ("plan", plan_value(&collection.plan)),
-    ])
-}
-
-fn tier_value(tier: Tier) -> PlyValue {
-    let named = match tier {
-        Tier::Proved => "Proved",
-        Tier::Property => "Property",
-        Tier::Example => "Example",
-    };
-    case("Tier", named, Vec::new())
-}
-
-fn bindings_value(bindings: &[ply_prove::Binding]) -> PlyValue {
-    PlyValue::list(
-        bindings
-            .iter()
-            .map(|b| {
-                record(vec![
-                    ("name", PlyValue::str(b.name.as_str())),
-                    ("ty", PlyValue::str(&b.ty)),
-                    ("value", crate::payload::plain_value(&b.value)),
-                ])
-            })
-            .collect(),
-    )
-}
-
-/// The prover's own account of a proof, placed under `rules` as it wrote it: the program adds keys
-/// around this document rather than deriving a second spelling of it.
-fn rules_value(rules: &[ply_prove::Rule]) -> PlyValue {
-    crate::payload::json(&serde_json::to_value(rules).unwrap_or(serde_json::Value::Null))
-}
-
-fn evidence_value(evidence: &Evidence) -> PlyValue {
-    match evidence {
-        Evidence::Proof(c) => case(
-            "Evidence",
-            "Proof",
-            vec![record(vec![
-                ("rules", rules_value(&c.rules)),
-                ("steps", tally(u64::from(c.steps))),
-                ("guard_satisfiable", PlyValue::Bool(c.guard_satisfiable)),
-                (
-                    "sorts",
-                    strings(c.sorts.iter().map(ply_eval::Symbol::as_str)),
-                ),
-            ])],
-        ),
-        Evidence::Cases(c) => case(
-            "Evidence",
-            "Sampled",
-            vec![record(vec![
-                ("generated", tally(u64::from(c.generated))),
-                ("kept", tally(u64::from(c.kept))),
-                ("rejected", tally(u64::from(c.rejected))),
-                ("roots", roots_value(&c.roots)),
-                (
-                    "instantiations",
-                    PlyValue::list(
-                        c.instantiations
-                            .iter()
-                            .map(|(var, ty)| {
-                                record(vec![
-                                    ("var", PlyValue::str(var.as_str())),
-                                    ("ty", PlyValue::str(ty)),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-            ])],
-        ),
-    }
-}
-
-fn gap_value(gap: &Gap) -> PlyValue {
-    match gap {
-        Gap::UnhandledEffect(row) => case(
-            "Gap",
-            "UnhandledEffect",
-            vec![option(row.as_deref().map(PlyValue::str))],
-        ),
-        Gap::Ungeneratable { param, ty } => case(
-            "Gap",
-            "Ungeneratable",
-            vec![record(vec![
-                ("param", PlyValue::str(param.as_str())),
-                ("ty", PlyValue::str(ty)),
-            ])],
-        ),
-        Gap::Raised {
-            bindings,
-            diagnostic,
-            ..
-        } => case(
-            "Gap",
-            "Raised",
-            vec![record(vec![
-                ("message", PlyValue::str(&diagnostic.message)),
-                ("values", shown_values(diagnostic)),
-                ("bindings", bindings_value(bindings)),
-            ])],
-        ),
-        Gap::GuardNotSampled { generated, witness } => case(
-            "Gap",
-            "GuardNotSampled",
-            vec![record(vec![
-                ("generated", tally(u64::from(*generated))),
-                ("witness", bindings_value(witness)),
-            ])],
-        ),
-        Gap::ReachesHost(row) => case(
-            "Gap",
-            "ReachesHost",
-            vec![PlyValue::str(row.as_deref().unwrap_or("{}"))],
-        ),
-        Gap::NotDrawn => case("Gap", "NotDrawn", Vec::new()),
-    }
-}
-
-fn fault_value(fault: &Fault) -> PlyValue {
-    record(vec![
-        ("code", PlyValue::str(fault.diagnostic.code)),
-        ("message", PlyValue::str(&fault.diagnostic.message)),
-        (
-            "notes",
-            strings(fault.diagnostic.notes.iter().map(String::as_str)),
-        ),
-        ("values", shown_values(&fault.diagnostic)),
-        ("bindings", bindings_value(&fault.bindings)),
+        ("host", PlyValue::Bool(collection.host)),
     ])
 }
 
@@ -1422,97 +910,48 @@ fn shown_values(diagnostic: &Diagnostic) -> PlyValue {
     )
 }
 
-/// One point as `claims.ply` reads it: the same constructors the whole-run outcomes use, minus
-/// the tier, because a case that held says nothing about how the obligation as a whole was shown.
-fn point_value(point: &Point) -> PlyValue {
-    match point {
-        Point::Kept(bindings) => case("Point", "Kept", vec![bindings_value(bindings)]),
-        Point::Falsified(bindings) => case("Point", "Falsified", vec![bindings_value(bindings)]),
-        Point::Rejected => case("Point", "Rejected", Vec::new()),
-        Point::Undrawn(gap) => case("Point", "Undrawn", vec![gap_value(gap)]),
-        Point::Faulted(fault) => case("Point", "Faulted", vec![fault_value(fault)]),
-    }
-}
-
-fn vacuity_value(vacuity: &Vacuity) -> PlyValue {
-    record(vec![
-        ("guard", at_value(&At::of(vacuity.guard))),
-        (
-            "why",
-            match vacuity.kind {
-                VacuityKind::ProvedUnsatisfiable => case("Vacuity", "Unsatisfiable", Vec::new()),
-                VacuityKind::NoCaseKept { generated } => {
-                    case("Vacuity", "NoCaseKept", vec![tally(u64::from(generated))])
-                }
-            },
-        ),
-    ])
-}
-
-fn outcome_value(discharge: &Discharge) -> PlyValue {
-    match discharge {
-        Discharge::Held(evidence) => case(
-            "Outcome",
-            "Held",
-            vec![record(vec![
-                ("tier", tier_value(evidence.tier())),
-                ("evidence", evidence_value(evidence)),
-            ])],
-        ),
-        Discharge::Refuted(cx) => case(
-            "Outcome",
-            "Refuted",
-            vec![record(vec![
-                ("bindings", bindings_value(&cx.bindings)),
-                ("original", bindings_value(&cx.original)),
-                ("shrinks", tally(u64::from(cx.shrinks))),
-                ("root", tally(cx.root)),
-                ("case", tally(u64::from(cx.case))),
-                (
-                    "seed",
-                    option(cx.sim_seed.as_ref().map(|s| PlyValue::str(s.to_string()))),
-                ),
-            ])],
-        ),
-        Discharge::Vacuous(vacuity) => case("Outcome", "Vacuous", vec![vacuity_value(vacuity)]),
-        Discharge::Unattempted(gap) => case("Outcome", "Unattempted", vec![gap_value(gap)]),
-        Discharge::Faulted(fault) => case("Outcome", "Defect", vec![fault_value(fault)]),
-    }
-}
-
-fn verdicts_value(verdicts: &Verdicts) -> PlyValue {
+/// One judgement as `proof.property` reads it.
+/// A `proof.property.Interleaved` reply's payload: the recording as `sim.recording` spells it.
+fn interleaved_value(run: &crate::engine::Interleaved) -> PlyValue {
     record(vec![
         (
-            "outcomes",
-            PlyValue::list(verdicts.outcomes.iter().map(outcome_value).collect()),
-        ),
-        ("duration_ms", millis(verdicts.duration)),
-        ("warnings", diags_value(&verdicts.warnings)),
-    ])
-}
-
-/// What the static tier alone answered for one obligation, as the product carries it.
-fn reach_value(reach: &crate::engine::Reach) -> PlyValue {
-    record(vec![
-        ("decision", PlyValue::str(reach.decision.as_str())),
-        ("steps", tally(u64::from(reach.decision.steps()))),
-        (
-            "blockers",
-            PlyValue::list(
-                reach
-                    .blockers
-                    .iter()
-                    .map(|blocker| {
-                        let (kind, about) = blocker.parts();
-                        record(vec![
-                            ("kind", PlyValue::str(kind)),
-                            ("about", option(about.map(PlyValue::str))),
-                        ])
-                    })
-                    .collect(),
+            "interleaving",
+            crate::recording::interleaving_value(
+                &run.interleaving,
+                run.verdict.as_ref().map(judged_value),
             ),
         ),
+        ("observed", PlyValue::Bool(run.observed)),
     ])
+}
+
+fn judged_value(judgement: &Judgement) -> PlyValue {
+    match judgement {
+        Judgement::Held => case("Judged", "JHeld", Vec::new()),
+        Judgement::Failed => case("Judged", "JFailed", Vec::new()),
+        Judgement::Rejected => case("Judged", "JRejected", Vec::new()),
+        Judgement::Raised(diagnostic) => case(
+            "Judged",
+            "JRaised",
+            vec![record(vec![
+                ("message", PlyValue::str(&diagnostic.message)),
+                ("values", shown_values(diagnostic)),
+            ])],
+        ),
+        Judgement::Faulted(diagnostic) => case(
+            "Judged",
+            "JFaulted",
+            vec![record(vec![
+                ("code", PlyValue::str(diagnostic.code)),
+                ("message", PlyValue::str(&diagnostic.message)),
+                (
+                    "notes",
+                    strings(diagnostic.notes.iter().map(String::as_str)),
+                ),
+                ("values", shown_values(diagnostic)),
+            ])],
+        ),
+    }
 }
 
 /// A baseline as the program reads one: the definition's hash and its spec, keyed by its name.
@@ -1537,24 +976,6 @@ fn accepted_value(accepted: &Accepted) -> PlyValue {
     ])
 }
 
-fn tally(n: u64) -> PlyValue {
-    PlyValue::Int(n as i64)
-}
-
-/// A size past what an `Int` holds is the largest one: the walk only takes a strictly smaller
-/// candidate, and a size that wrapped would read as smaller than every other.
-fn size_value(size: u64) -> PlyValue {
-    PlyValue::Int(i64::try_from(size).unwrap_or(i64::MAX))
-}
-
-/// Milliseconds to three places, which is what both reports publish as `duration_ms`.
-fn millis(d: std::time::Duration) -> PlyValue {
-    let ms = (d.as_secs_f64() * 1_000_000.0).round() / 1000.0;
-    ply_eval::Decimal::from_f64_retain(ms)
-        .map(PlyValue::Decimal)
-        .unwrap_or(PlyValue::Decimal(ply_eval::Decimal::ZERO))
-}
-
 // --- Small things -------------------------------------------------------------
 
 #[cold]
@@ -1564,16 +985,6 @@ fn unopened(root: &std::path::Path, e: &impl std::fmt::Display) -> Diagnostic {
         format!("could not open the cache under `{}`: {e:#}", root.display()),
     )
     .note("check the directory's permissions")
-}
-
-#[cold]
-fn unfiled(at: usize) -> Diagnostic {
-    Diagnostic::warning(
-        codes::INTERNAL_ERROR,
-        format!("the program asked to file claim {at}'s evidence, and it holds none"),
-    )
-    .note("nothing was filed for it, so the next run discharges it again")
-    .note("the program and the thread it drives are written together; this is Ply's fault")
 }
 
 #[cold]
@@ -1660,23 +1071,13 @@ fn unread_world(why: &ply_eval::decode::Error, span: Span) -> Diagnostic {
 
 /// The job record as the program builds it from the parsed line, read field by field.
 fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
-    use crate::payload::{field_of, opt_int_at, opt_str_at, str_list_at};
+    use crate::payload::{field_of, opt_str_at, str_list_at};
     let bool_at = |name: &str| field_of(v, name, span)?.as_bool(span, name);
     let str_at = |name: &str| {
         field_of(v, name, span)?
             .as_str(span, name)
             .map(str::to_string)
     };
-    let sim = field_of(v, "sim", span)?;
-    let prove = field_of(v, "prove", span)?;
-    let prove_opts = crate::simulation::ProveOptions {
-        prove_cases: opt_int_at(prove, "cases", span)?.map(|n| n as u32),
-        prove_roots: opt_int_at(prove, "roots", span)?.map(|n| n as u32),
-        prove_budget: opt_int_at(prove, "budget", span)?.map(|n| n as u32),
-        shrink_budget: opt_int_at(prove, "shrink_budget", span)?.map(|n| n as u32),
-        prove_steps: opt_int_at(prove, "steps", span)?,
-    };
-    let sim_opts = crate::simulation::sim_options_of(sim, span)?;
     let host = bool_at("host")?;
     let binding = if host {
         let tls_list = field_of(v, "tls", span)?;
@@ -1742,11 +1143,8 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
     Ok(Job {
         path: PathBuf::from(str_at("path")?),
         front: None,
-        world: World::default(),
         obligations: Vec::new(),
         use_cache: !bool_at("no_cache")?,
-        jobs: opt_int_at(v, "jobs", span)?.map(|n| n as u32),
-        plan: crate::simulation::prove_plan(&prove_opts, &sim_opts),
         binding,
     })
 }

@@ -1210,8 +1210,7 @@ pub fn enter(artifact: &Artifact, opened: &Opened, argv: Vec<String>, binds: Bin
         .get(&opened.entry)
         .map(|d| d.span)
         .unwrap_or(Span::DUMMY);
-    let plan = crate::simulation::run_plan(None);
-    let ended = evaluate(opened, span, &plan, &hosts, declared.as_ref(), tier);
+    let ended = evaluate(opened, span, &hosts, declared.as_ref(), tier);
     let _ = crate::drive::teardown(&hosts, None, crate::drive::TEARDOWN_FLOOR_MS);
     let requested = hosts.requested_exit();
     ended.map(|answer| match requested {
@@ -1265,7 +1264,6 @@ pub(crate) fn tier(
 fn evaluate(
     opened: &Opened,
     span: Span,
-    plan: &ply_eval::Plan,
     hosts: &crate::hosts::Hosts,
     declared: Option<&ply_eval::Footprint>,
     tier: &'static dyn ply_eval::Provider,
@@ -1275,13 +1273,17 @@ fn evaluate(
         Err(refused) => return Ended::refused(refused),
     };
     machine.set_host_binding(hosts.binding());
-    if let Some(runtime) = hosts.runtime() {
+    if let Some(runtime) = hosts.runtime_factory() {
         machine.set_host_runtime(runtime);
     }
     if let Some(declared) = declared {
         machine.set_declared_footprint(declared.clone());
     }
-    ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
+    ply_test::sim::seed_run(
+        &mut machine,
+        &ply_eval::Seed::default(),
+        ply_eval::sim::DEFAULT_STEPS,
+    );
     machine.call(opened.entry.as_str(), Vec::new(), span)
 }
 

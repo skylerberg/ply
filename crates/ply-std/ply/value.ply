@@ -193,6 +193,127 @@ fn fixed_text(ty: String, bits: U128) -> String = {
   else { u128_to_string(pattern) }
 }
 
+// --- Order ------------------------------------------------------------------
+
+// The order the runtime keeps values in, which is a map's key order: by kind first, then within
+// one kind as `compare` orders its payloads.
+pub fn order(a: Value, b: Value) -> Ordering = {
+  let ranks = compare(rank(a), rank(b));
+  if ranks != Equal { ranks } else {
+    match ((a, b)) {
+      (VBool(x), VBool(y)) -> compare(x, y),
+      (VInt(x), VInt(y)) -> compare(x, y),
+      (VFloat(x), VFloat(y)) -> compare(total_key(x), total_key(y)),
+      (VDecimal(x), VDecimal(y)) -> compare(x, y),
+      (VFixed(tx, x), VFixed(ty, y)) -> {
+        let widths = compare(width_rank(tx), width_rank(ty));
+        if widths != Equal { widths } else { compare(signed_key(tx, x), signed_key(ty, y)) }
+      },
+      (VStr(x), VStr(y)) -> compare(x, y),
+      (VBytes(x), VBytes(y)) -> compare(x, y),
+      (VList(xs), VList(ys)) -> ordered(xs, ys, order),
+      (VMap(xs), VMap(ys)) ->
+        ordered(xs, ys, |p: Entry, q: Entry| {
+          let keys = order(p.key, q.key);
+          if keys != Equal { keys } else { order(p.value, q.value) }
+        }),
+      (VRecord(xs), VRecord(ys)) ->
+        ordered(xs, ys, |p: Field, q: Field| {
+          let names = compare(p.name, q.name);
+          if names != Equal { names } else { order(p.value, q.value) }
+        }),
+      (VCtor(nx, xs), VCtor(ny, ys)) -> {
+        let names = compare(nx, ny);
+        if names != Equal { names } else { ordered(xs, ys, order) }
+      },
+      (VCell(x), VCell(y)) -> compare(x, y),
+      (VTask(x), VTask(y)) -> compare(x, y),
+      _ -> Equal,
+    }
+  }
+}
+
+fn rank(v: Value) -> Int =
+  match v {
+    VUnit -> 0,
+    VBool(_) -> 1,
+    VInt(_) -> 2,
+    VFloat(_) -> 3,
+    VDecimal(_) -> 4,
+    VStr(_) -> 5,
+    VBytes(_) -> 6,
+    VList(_) -> 7,
+    VMap(_) -> 8,
+    VRecord(_) -> 9,
+    VCtor(_, _) -> 10,
+    VFn(_) -> 11,
+    VCell(_) -> 12,
+    VTask(_) -> 13,
+    VSecret -> 14,
+    VFixed(_, _) -> 15,
+    VElided(_) -> 16,
+  }
+
+// IEEE 754's total order as a signed integer: a negative float's magnitude bits are flipped.
+fn total_key(f: Float) -> Int = {
+  let b = bits_of_float(f);
+  if b < 0 { b ^ 0x7FFF_FFFF_FFFF_FFFF } else { b }
+}
+
+// The widths in the runtime's declaration order.
+fn width_rank(ty: String) -> Int =
+  match list_index(["U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "U128", "I128"], ty) {
+    Some(i) -> i,
+    None -> 10,
+  }
+
+fn list_index(xs: List<String>, x: String) -> Option<Int> =
+  fold(range(0, len(xs)), None, |found: Option<Int>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> if list_at(xs, i) == Some(x) { Some(i) } else { None },
+    })
+
+// A signed pattern with its width's sign bit flipped orders as an unsigned one.
+fn signed_key(ty: String, bits: U128) -> U128 = {
+  let width = width_of(ty);
+  let pattern = bits & mask(width);
+  if string_starts_with(ty, "I") { pattern ^ 1u128 << width - 1 } else { pattern }
+}
+
+fn ordered<a>(xs: List<a>, ys: List<a>, by: (a, a) -> Ordering) -> Ordering = {
+  let common = fold(range(0, min(len(xs), len(ys))), Equal, |acc: Ordering, i: Int|
+    if acc != Equal { acc } else {
+      match ((list_at(xs, i), list_at(ys, i))) { (Some(x), Some(y)) -> by(x, y), _ -> Equal }
+    });
+  if common != Equal { common } else { compare(len(xs), len(ys)) }
+}
+
+// A map of these entries in key order; a later entry for a key replaces an earlier one, as
+// inserting them one at a time would.
+pub fn map_of(entries: List<Entry>) -> Value =
+  VMap(fold(entries, [], |acc: List<Entry>, e: Entry| inserted(acc, e)))
+
+fn inserted(sorted: List<Entry>, e: Entry) -> List<Entry> = {
+  let at = fold(range(0, len(sorted)), len(sorted), |found: Int, i: Int|
+    if found < len(sorted) { found } else {
+      match list_at(sorted, i) {
+        Some(s) -> if order(e.key, s.key) != Greater { i } else { found },
+        None -> found,
+      }
+    });
+  if at == len(sorted) { push(sorted, e) } else {
+    let same = match list_at(sorted, at) { Some(s) -> order(e.key, s.key) == Equal, None -> false };
+    fold(range(0, len(sorted)), [], |out: List<Entry>, i: Int|
+      match list_at(sorted, i) {
+        Some(s) -> if i != at { push(out, s) }
+        else if same { push(out, e) }
+        else { push(push(out, e), s) },
+        None -> out,
+      })
+  }
+}
+
 // --- Text -------------------------------------------------------------------
 
 fn escaped(s: String) -> String =
@@ -327,4 +448,31 @@ test "a function shows as what it is" {
   assert_eq(render(VSecret), "Secret(****)");
   assert_eq(render(VCell({ index: 3, generation: 1 })), "<cell @3.1>");
   assert_eq(render(VTask(7)), "<task @7>")
+}
+
+test "values order by kind first, then as their payloads compare" {
+  assert_eq(order(VInt(5), VStr("a")), Less);
+  assert_eq(order(VStr("b"), VStr("ab")), Greater);
+  assert_eq(order(VList([VInt(1)]), VList([VInt(1), VInt(0)])), Less);
+  assert_eq(order(VCtor("m.A", [VInt(9)]), VCtor("m.B", [])), Less);
+  // A signed width orders by value, so `-1i8` is below `0i8`; an unsigned one by pattern.
+  assert_eq(order(VFixed("I8", 255u128), VFixed("I8", 0u128)), Less);
+  assert_eq(order(VFixed("U8", 255u128), VFixed("U8", 0u128)), Greater);
+  assert_eq(order(VFloat(0.0 - 1.0), VFloat(0.5)), Less)
+}
+
+test "a map is in key order, and a later entry for a key replaces an earlier one" {
+  assert_eq(
+    map_of([
+      { key: VInt(3), value: VStr("c") },
+      { key: VInt(1), value: VStr("a") },
+      { key: VInt(3), value: VStr("z") },
+      { key: VInt(2), value: VStr("b") },
+    ]),
+    VMap([
+      { key: VInt(1), value: VStr("a") },
+      { key: VInt(2), value: VStr("b") },
+      { key: VInt(3), value: VStr("z") },
+    ]),
+  )
 }

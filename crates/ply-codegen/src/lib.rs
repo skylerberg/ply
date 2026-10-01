@@ -12,6 +12,7 @@ pub mod heap;
 pub mod host;
 pub mod list;
 pub mod map;
+mod parallel;
 pub mod rt;
 pub mod simulate;
 pub mod source;

@@ -1,64 +1,144 @@
-//! Which prover a run drives.
+//! The runtime's half of a discharge: a claim's propositions entered at the points the program
+//! drew, and a law over interleavings searched at the points its guard kept. What a claim's points
+//! are, and what their judgements come to, is the program's.
 
-use crate::load::{LoadError, Loaded};
-use ply_eval::host::{HostBinding, HostRuntime};
+use crate::load::Loaded;
+use ply_eval::decode::{At, Error as DecodeError};
+use ply_eval::host::HostBinding;
 use ply_eval::{
-    CheckOutput, DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Literal, Machine, Seed,
-    Span, SpecKind, Symbol, Value, codes,
+    DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, SourceId, Span, Symbol,
+    Value, codes,
 };
-use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
-use ply_prove::domain::Finite;
-use ply_prove::property::{
-    self, GenStream, Judge, Outcome, bindings, judge_case, run_property, ungeneratable,
-};
-use ply_prove::prove::claims::{Clause, Code, Definition, Law};
-use ply_prove::prove::{self, Blocker, Claims, Decision, Goal, Limits, Proof};
-use ply_prove::{
-    Binder, Binding, Certificate, Counterexample, Discharge, Evidence, Fault, Gap, Obligation,
-    ObligationKind, Points, ProvePlan, Rule, Sort, Strategy, Unsettled, Vacuity, VacuityKind,
-    World,
-};
-use ply_store::Store;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-/// The discharger this build drives over the program's `world`, its claims kept in `store`. One
-/// built once serves a whole run's discharges and re-runs alike.
-pub fn prover<'a>(
-    loaded: &'a Loaded,
-    world: &'a World,
-    hosting: Option<Hosting>,
-    backend: &'static dyn ply_eval::Provider,
-    store: &mut Store,
-) -> Result<Prover<'a>, LoadError> {
-    let prover = Prover::over(loaded, world, backend, Some(store))?;
-    Ok(match hosting {
-        Some(hosting) => prover.with_hosting(hosting),
-        None => prover,
+/// One claim the program owes, as far as the runtime enters it: whose it is, where it is written,
+/// what a point assigns, the guards it is judged after, and which machine its propositions run on.
+/// Everything else about it is `proof.world`'s.
+#[derive(Clone, Debug)]
+pub struct Obligation {
+    /// `<module>.<def>` for a clause, `<module>.<label>` for a law.
+    pub owner: Symbol,
+    pub kind: ObligationKind,
+    pub span: Span,
+    /// What a point assigns: the owner's parameters for a clause, the `forall` binders for a law.
+    pub binders: Vec<Binder>,
+    /// A clause's `result`, which is the owner's answer and never drawn.
+    pub result: Option<Binder>,
+    /// Each guard's place: an owner's `requires` clauses, or a law's `where`.
+    pub guards: Vec<Span>,
+    pub strategy: Strategy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObligationKind {
+    /// Its place among the owner's `ensures` clauses.
+    Ensures {
+        index: usize,
+    },
+    Law,
+}
+
+/// One binder of a claim: what a report calls it, and its type as the compiler prints it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Binder {
+    pub name: Symbol,
+    pub text: String,
+}
+
+/// Which machine a claim's propositions run on, as `proof.world` decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strategy {
+    /// A law over a `simulate` region: its interleavings are searched at each of its points.
+    Interleave,
+    /// A `law/host`, run against the host the run binds.
+    Hosted,
+    /// The static prover first, then the claim's points.
+    Static,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Binding {
+    pub name: Symbol,
+    /// The binder's type as the compiler prints it.
+    pub ty: String,
+    pub value: ply_eval::Plain,
+}
+
+/// Ply's own failure while judging a claim, as [`ply_eval::codes::is_defect`] tells it apart.
+#[derive(Clone, Debug)]
+pub struct Fault {
+    /// The point being judged when Ply failed, or none when it failed before a point was drawn.
+    pub bindings: Vec<Binding>,
+    pub diagnostic: Box<Diagnostic>,
+}
+
+/// The obligations a `proof.world.World` owes, in the order the program listed them, which is the
+/// order it names them by.
+pub fn obligations_of(world: At<'_>) -> Result<Vec<Obligation>, DecodeError> {
+    world.field("obligations")?.items(obligation_of)
+}
+
+fn obligation_of(at: At<'_>) -> Result<Obligation, DecodeError> {
+    let kind = at.field("kind")?.ctor()?;
+    let binder = |b: At<'_>| -> Result<Binder, DecodeError> {
+        Ok(Binder {
+            name: Symbol::new(b.field("name")?.str()?),
+            text: b.field("text")?.str()?.to_string(),
+        })
+    };
+    let span = |s: At<'_>| -> Result<Span, DecodeError> {
+        Ok(Span::new(
+            SourceId(s.field("module")?.number()?),
+            s.field("start")?.number()?,
+            s.field("end")?.number()?,
+        ))
+    };
+    let strategy = at.field("strategy")?.ctor()?;
+    Ok(Obligation {
+        owner: Symbol::new(at.field("owner")?.str()?),
+        kind: match kind.name() {
+            "Ensures" => ObligationKind::Ensures {
+                index: kind.arg(0)?.number()?,
+            },
+            "Law" => ObligationKind::Law,
+            _ => return Err(kind.unknown()),
+        },
+        span: span(at.field("at")?)?,
+        binders: at.field("binders")?.items(binder)?,
+        result: match at.field("result")?.option()? {
+            Some(result) => Some(binder(result)?),
+            None => None,
+        },
+        guards: at.field("guards")?.items(span)?,
+        strategy: match strategy.name() {
+            "Interleave" => Strategy::Interleave,
+            "Hosted" => Strategy::Hosted,
+            "Static" => Strategy::Static,
+            _ => return Err(strategy.unknown()),
+        },
     })
 }
 
-fn claims_of(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, LoadError> {
-    crate::driver::claims(loaded, store).map_err(|why| {
-        loaded.refused(
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("the front end could not lower this program's claims: {why}"),
-            )
-            .primary(Span::DUMMY, "nothing was proved, so nothing is claimed")
-            .note("this is Ply's fault: the compiler's own front end is what failed here"),
-        )
-    })
+/// The prover this build drives over the program. One built once serves a whole run.
+pub fn prover(
+    loaded: &Loaded,
+    hosting: Option<Hosting>,
+    backend: &'static dyn ply_eval::Provider,
+) -> Prover {
+    let prover = Prover::new(loaded, backend);
+    match hosting {
+        Some(hosting) => prover.with_hosting(hosting),
+        None => prover,
+    }
 }
 
 /// Where an obligation's claim is written, found once per run.
 enum Claim<'s> {
     Ensures {
         owner: &'s DefInfo,
-        def: &'s Definition,
-        clause: &'s Clause,
         /// Its place among the owner's `ensures` clauses, which names its root.
         index: usize,
     },
@@ -66,50 +146,19 @@ enum Claim<'s> {
         info: &'s LawInfo,
         /// Its place among the module's laws, which names its roots.
         ordinal: usize,
-        law: &'s Law,
     },
 }
 
-impl<'s> Claim<'s> {
-    /// The propositions that narrow the domain: an owner's `requires` clauses, or a law's `where`.
-    fn guards(&self) -> Vec<&'s Clause> {
-        match self {
-            Claim::Ensures { def, .. } => def
-                .spec
-                .iter()
-                .filter(|(kind, _)| *kind == SpecKind::Requires)
-                .map(|(_, clause)| clause)
-                .collect(),
-            Claim::Law { law, .. } => law.guard.iter().collect(),
-        }
-    }
-
-    fn body(&self) -> &'s Code {
-        match self {
-            Claim::Ensures { clause, .. } => &clause.code,
-            Claim::Law { law, .. } => &law.body,
-        }
-    }
-
-    /// Where a vacuity points.
-    fn guard_span(&self, fallback: Span) -> Span {
-        self.guards().first().map_or(fallback, |g| g.span)
-    }
-}
-
-pub struct Prover<'a> {
-    check: &'a CheckOutput,
-    front: &'a Front,
-    world: &'a World,
-    /// Built once; `machine()` runs per obligation.
-    ctx: prove::Context<'a>,
-    laws: HashMap<Symbol, (usize, &'a LawInfo)>,
+/// It owns what it judges, so a run can judge on whichever threads the program asks from.
+pub struct Prover {
+    front: Arc<Front>,
+    /// Each law's place among its module's laws, which names its roots, and its place in the
+    /// program's.
+    laws: HashMap<Symbol, (usize, usize)>,
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
     backend: &'static dyn ply_eval::Provider,
-    /// What the entries its machines made ended with, until a discharge's report takes it.
-    teardown: Arc<Mutex<Vec<Diagnostic>>>,
 }
 
 /// The binding and the reactor a `law/host` runs against. The factory is owned rather than
@@ -117,46 +166,28 @@ pub struct Prover<'a> {
 /// keep one prover across many steps.
 pub struct Hosting {
     pub binding: Arc<HostBinding>,
-    pub runtime: Option<Arc<dyn Fn() -> Rc<dyn HostRuntime> + Sync + Send>>,
+    pub runtime: Option<ply_eval::RuntimeFactory>,
 }
 
-impl<'a> Prover<'a> {
+impl Prover {
     /// `backend` is the unit built from `loaded`, laws' and clauses' roots included.
-    pub fn new(
-        loaded: &'a Loaded,
-        world: &'a World,
-        backend: &'static dyn ply_eval::Provider,
-    ) -> Result<Prover<'a>, LoadError> {
-        Prover::over(loaded, world, backend, None)
-    }
-
-    fn over(
-        loaded: &'a Loaded,
-        world: &'a World,
-        backend: &'static dyn ply_eval::Provider,
-        store: Option<&mut Store>,
-    ) -> Result<Prover<'a>, LoadError> {
-        let check = &loaded.check;
+    pub fn new(loaded: &Loaded, backend: &'static dyn ply_eval::Provider) -> Prover {
         let mut laws = HashMap::new();
         let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
-        for law in &check.laws {
+        for (at, law) in loaded.front.check.laws.iter().enumerate() {
             let ordinal = ordinals.entry(law.module.as_symbol()).or_default();
-            laws.insert(law.key.clone(), (*ordinal, law));
+            laws.insert(law.key.clone(), (*ordinal, at));
             *ordinal += 1;
         }
-        Ok(Prover {
-            check,
-            front: &loaded.front,
-            world,
-            ctx: prove::Context::new(claims_of(loaded, store)?, world),
+        Prover {
+            front: Arc::clone(&loaded.front),
             laws,
             hosting: None,
             backend,
-            teardown: Arc::default(),
-        })
+        }
     }
 
-    /// The unit, attached once per thread: obligations are discharged on pool threads.
+    /// The unit, attached once per thread: claims are judged on whichever threads the program asks from.
     fn compiled(&self) -> Rc<dyn ply_eval::Compiled> {
         thread_local! {
             static ATTACHED: RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
@@ -185,10 +216,11 @@ impl<'a> Prover<'a> {
         }
     }
 
-    /// Each guard's compiled root, in [`Claim::guards`] order, which `source.rs` numbers alike.
-    fn guard_roots(&self, claim: &Claim<'_>) -> Vec<Symbol> {
+    /// Each guard's compiled root, in [`Obligation::guards`] order, which `source.rs` numbers
+    /// alike.
+    fn guard_roots(&self, obligation: &Obligation, claim: &Claim<'_>) -> Vec<Symbol> {
         match claim {
-            Claim::Ensures { owner, .. } => (0..claim.guards().len())
+            Claim::Ensures { owner, .. } => (0..obligation.guards.len())
                 .map(|k| {
                     owner.module.qualify(&ply_codegen::clause_root_name(
                         &owner.simple_name,
@@ -197,8 +229,8 @@ impl<'a> Prover<'a> {
                     ))
                 })
                 .collect(),
-            Claim::Law { info, ordinal, .. } => claim
-                .guards()
+            Claim::Law { info, ordinal } => obligation
+                .guards
                 .iter()
                 .map(|_| {
                     info.module
@@ -209,43 +241,29 @@ impl<'a> Prover<'a> {
     }
 
     /// Bind the host, so that a `law/host` is attempted rather than reported as a gap.
-    pub fn with_hosting(mut self, hosting: Hosting) -> Prover<'a> {
+    pub fn with_hosting(mut self, hosting: Hosting) -> Prover {
         self.hosting = Some(hosting);
         self
     }
 
     fn claim(&self, obligation: &Obligation) -> Option<Claim<'_>> {
-        let claims = self.ctx.claims();
         match obligation.kind {
-            ObligationKind::Ensures { index } => {
-                let def = claims.defs.get(&obligation.owner)?;
-                let (_, clause) = def
-                    .spec
-                    .iter()
-                    .filter(|(kind, _)| *kind == SpecKind::Ensures)
-                    .nth(index)?;
-                Some(Claim::Ensures {
-                    owner: self.check.defs.get(&obligation.owner)?,
-                    def,
-                    clause,
-                    index,
-                })
-            }
+            ObligationKind::Ensures { index } => Some(Claim::Ensures {
+                owner: self.front.check.defs.get(&obligation.owner)?,
+                index,
+            }),
             ObligationKind::Law => {
-                let &(ordinal, info) = self.laws.get(&obligation.owner)?;
-                Some(Claim::Law {
-                    info,
-                    ordinal,
-                    law: claims.laws.get(&obligation.owner)?,
-                })
+                let &(ordinal, at) = self.laws.get(&obligation.owner)?;
+                let info = self.front.check.laws.get(at)?;
+                Some(Claim::Law { info, ordinal })
             }
         }
     }
 
     /// What an owner is called through to produce `result`: the tier its propositions are entered
     /// on, attached afresh.
-    fn machine(&self) -> Result<Machine<'a>, Fault> {
-        Machine::new(self.front, self.backend.attach())
+    fn machine(&self) -> Result<Machine<'_>, Fault> {
+        Machine::new(&self.front, self.backend.attach())
             .map(|machine| machine.with_max_calls(DEFAULT_MAX_CALLS))
             .map_err(|refused| Fault {
                 bindings: Vec::new(),
@@ -254,121 +272,58 @@ impl<'a> Prover<'a> {
     }
 
     /// The machine a `law/host`'s body runs on: the run's binding and a reactor for this thread.
-    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'a>, Fault> {
+    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'_>, Fault> {
         let mut machine = self.machine()?;
         machine.set_host_binding(Arc::clone(&hosting.binding));
         if let Some(factory) = &hosting.runtime {
-            machine.set_host_runtime(factory());
+            machine.set_host_runtime(Arc::clone(factory));
         }
         Ok(machine)
     }
-
-    fn decide(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        plan: &ProvePlan,
-    ) -> (Decision, Vec<Blocker>) {
-        let guards: Vec<&Code> = claim.guards().into_iter().map(|g| &g.code).collect();
-        let result = match claim {
-            Claim::Ensures { def, .. } => obligation.result.as_ref().map(|_| &def.body),
-            Claim::Law { .. } => None,
-        };
-        let binders = obligation.all_binders();
-        let goal = Goal {
-            binders: &binders,
-            guards: &guards,
-            result,
-            body: claim.body(),
-        };
-        let limits = Limits {
-            steps: plan.prove_budget,
-            ..Limits::default()
-        };
-        prove::decide_and_diagnose(&self.ctx, &goal, &limits)
-    }
-
-    fn attempt_static(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        plan: &ProvePlan,
-    ) -> Static {
-        match self.decide(obligation, claim, plan).0 {
-            Decision::GuardUnsatisfiable { .. } => Static::Vacuous,
-            Decision::Proved(proof) => match proof.certify(false, &obligation.variables) {
-                Some(certificate) => Static::Proved(certificate),
-                None => Static::NeedsWitness(proof),
-            },
-            Decision::Unknown { .. } => Static::Inconclusive,
-        }
-    }
-
-    /// What the static tier alone answered, and where the obligation left the fragment on the way:
-    /// nothing for a claim whose strategy never asks it.
-    pub fn reach(&self, obligation: &Obligation, plan: &ProvePlan) -> Option<Reach> {
-        if let Strategy::Interleave(_) = obligation.strategy {
-            return None;
-        }
-        let claim = self.claim(obligation)?;
-        let (decision, blockers) = self.decide(obligation, &claim, plan);
-        Some(Reach { decision, blockers })
-    }
 }
 
-/// What the static tier answered, and the fragment boundaries it crossed.
-pub struct Reach {
-    pub decision: Decision,
-    pub blockers: Vec<Blocker>,
-}
-
-/// One point of one obligation's guard, as `claims.ply` reads it: what a search over cases is
-/// made of, one case at a time. `Undrawn` is the obligation's own gap — the points are not drawn,
-/// or not drawn one at a time — rather than anything about this draw.
+/// What one point of a claim came to.
 #[derive(Debug)]
-pub enum Point {
-    Kept(Vec<Binding>),
-    /// The guard admitted the point and the body does not hold there: this point falsifies the
-    /// claim, which is what a shrinker starts from.
-    Falsified(Vec<Binding>),
+pub enum Judgement {
+    Held,
+    Failed,
     Rejected,
-    /// No point was drawn, and the gap says why.
-    Undrawn(Gap),
-    /// Ply failed rather than the program, before the point was drawn or while judging it.
-    Faulted(Fault),
+    /// The program raised.
+    Raised(Diagnostic),
+    /// Ply failed rather than the program, so the point says nothing about the claim.
+    Faulted(Diagnostic),
 }
 
-/// Why an obligation stops before any point decides it: a gap in the claim, or Ply's failure.
-enum Stop {
-    Gap(Gap),
-    Fault(Fault),
-}
-
-impl From<Gap> for Stop {
-    fn from(gap: Gap) -> Stop {
-        Stop::Gap(gap)
-    }
-}
-
-impl From<Fault> for Stop {
-    fn from(fault: Fault) -> Stop {
-        Stop::Fault(fault)
-    }
-}
-
-impl Stop {
-    fn discharge(self) -> Discharge {
-        match self {
-            Stop::Gap(gap) => Discharge::Unattempted(gap),
-            Stop::Fault(fault) => Discharge::Faulted(fault),
+impl Judgement {
+    pub(crate) fn stopped(diagnostic: Diagnostic) -> Judgement {
+        if codes::is_defect(diagnostic.code) {
+            Judgement::Faulted(diagnostic)
+        } else {
+            Judgement::Raised(diagnostic)
         }
     }
+}
 
-    fn point(self) -> Point {
-        match self {
-            Stop::Gap(gap) => Point::Undrawn(gap),
-            Stop::Fault(fault) => Point::Faulted(fault),
-        }
+/// How a batch's points are judged, and which judgement ends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The whole claim, until a point settles it.
+    Whole,
+    /// The guard alone, until it admits a point.
+    Witness,
+    /// The guard alone at every point, until it raises.
+    Domain,
+}
+
+impl Mode {
+    fn ends(self, judgement: &Judgement) -> bool {
+        matches!(
+            (self, judgement),
+            (_, Judgement::Faulted(_))
+                | (Mode::Whole, Judgement::Failed | Judgement::Raised(_))
+                | (Mode::Witness, Judgement::Held)
+                | (Mode::Domain, Judgement::Raised(_))
+        )
     }
 }
 
@@ -394,596 +349,160 @@ fn unclaimed(obligation: &Obligation) -> Fault {
     }
 }
 
-/// What the static tier had to say, before anything ran.
-enum Static {
-    Proved(Certificate),
-    /// A decided body over a domain the prover could not show inhabited.
-    NeedsWitness(Proof),
-    Vacuous,
-    Inconclusive,
+/// A `law/host` judged with no host bound: the program asked for what the run never opened.
+#[cold]
+fn unhosted(obligation: &Obligation) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!(
+            "`{}` reaches the host, and this run binds none",
+            obligation.owner
+        ),
+    )
+    .primary(
+        obligation.span,
+        "a `law/host` is judged against the host a run binds",
+    )
+    .note("the program judges a `law/host` only under `--host`; this is Ply's fault")
 }
 
-impl ply_test::obligation::Discharger for Prover<'_> {
-    fn discharge(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
-        self.discharge_with(obligation, plan)
-    }
-
-    fn teardown(&self) -> Vec<Diagnostic> {
-        std::mem::take(&mut *self.teardown.lock().unwrap_or_else(|e| e.into_inner()))
-    }
-}
-
-impl<'a> Prover<'a> {
-    /// The program as the prover reads it.
-    pub fn world(&self) -> &World {
-        self.world
-    }
-
-    /// Judge one tuple the way a discharge would: the same guard, the same body, the same case
-    /// machinery. Which tuples to ask about is the program's, so the walk that makes a
-    /// counterexample small drives this rather than running here.
-    pub fn judge_at(&self, obligation: &Obligation, plan: &ProvePlan, values: &[Value]) -> Outcome {
+impl Prover {
+    /// One claim's points, judged in order until one ends the batch.
+    pub fn judged(
+        &self,
+        obligation: &Obligation,
+        step_budget: i64,
+        points: &[Vec<Value>],
+        mode: Mode,
+    ) -> Vec<Judgement> {
         let Some(claim) = self.claim(obligation) else {
-            return Outcome::Faulted(*unclaimed(obligation).diagnostic);
+            return vec![Judgement::Faulted(*unclaimed(obligation).diagnostic)];
         };
-        match self.cases(obligation, &claim, plan) {
-            Ok(mut cases) => judge_case(&mut cases, values),
-            Err(Stop::Fault(fault)) => Outcome::Faulted(*fault.diagnostic),
-            Err(Stop::Gap(_)) => Outcome::Rejected,
-        }
-    }
-
-    /// One obligation, discharged the way its strategy says, at the strongest tier this build can
-    /// demonstrate.
-    pub fn discharge_with(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
-        let Some(claim) = self.claim(obligation) else {
-            return Discharge::Faulted(unclaimed(obligation));
-        };
-        match &obligation.strategy {
-            Strategy::Interleave(points) => {
-                self.search_interleavings(obligation, &claim, plan, points)
-            }
-            Strategy::Hosted => self.discharge_host(obligation, &claim, plan),
-            Strategy::Static(unsettled) => {
-                self.discharge_static(obligation, &claim, plan, unsettled)
-            }
-        }
-    }
-
-    /// The static prover first; what it did not settle is a gap, or a run over the claim's points.
-    fn discharge_static(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        plan: &ProvePlan,
-        unsettled: &Unsettled,
-    ) -> Discharge {
-        let witness = match self.attempt_static(obligation, claim, plan) {
-            Static::Proved(certificate) => return Discharge::Held(Evidence::Proof(certificate)),
-            Static::Vacuous => {
-                return Discharge::Vacuous(Vacuity {
-                    guard: claim.guard_span(obligation.span),
-                    kind: VacuityKind::ProvedUnsatisfiable,
-                });
-            }
-            Static::NeedsWitness(proof) => Some(proof),
-            Static::Inconclusive => None,
-        };
-        let points = match unsettled {
-            Unsettled::Unhandled(row) => {
-                return Discharge::Unattempted(Gap::UnhandledEffect(Some(row.clone())));
-            }
-            Unsettled::Run(points) => points,
-        };
-        let mut cases = match self.cases(obligation, claim, plan) {
+        let mut cases = match self.cases(obligation, &claim, step_budget) {
             Ok(cases) => cases,
-            Err(stop) => return stop.discharge(),
+            Err(fault) => return vec![Judgement::Faulted(*fault.diagnostic)],
         };
-        match points {
-            Points::Every(finite) => self.enumerate(obligation, claim, finite, &mut cases, witness),
-            Points::Drawn => self.sample(obligation, claim, plan, &mut cases, witness),
+        if let Strategy::Hosted = obligation.strategy {
+            let Some(hosting) = &self.hosting else {
+                return vec![Judgement::Faulted(unhosted(obligation))];
+            };
+            cases.machine = match self.host_machine(hosting) {
+                Ok(machine) => machine,
+                Err(fault) => return vec![Judgement::Faulted(*fault.diagnostic)],
+            };
         }
-    }
-
-    /// The property search, with the static argument certified once a kept case witnesses its
-    /// domain.
-    fn sample(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        plan: &ProvePlan,
-        cases: &mut Cases<'a>,
-        witness: Option<Proof>,
-    ) -> Discharge {
-        let discharge = run_property(
-            obligation.key,
-            &obligation.binders,
-            &obligation.variables,
-            self.world,
-            plan,
-            claim.guard_span(obligation.span),
-            cases,
-        );
-        match discharge {
-            // Keeping no sample means the generator missed the guard, not that it admits nothing.
-            Discharge::Vacuous(Vacuity {
-                kind: VacuityKind::NoCaseKept { generated },
-                ..
-            }) => match self.witness(obligation, claim, cases) {
-                Ok(Some(values)) => {
-                    match witness.and_then(|proof| proof.certify(true, &obligation.variables)) {
-                        Some(certificate) => Discharge::Held(Evidence::Proof(certificate)),
-                        None => Discharge::Unattempted(Gap::GuardNotSampled {
-                            generated,
-                            witness: bindings(&obligation.binders, &values),
-                        }),
-                    }
-                }
-                Ok(None) => discharge,
-                Err(fault) => Discharge::Faulted(fault),
-            },
-            other => upgrade(other, witness, &obligation.variables),
-        }
-    }
-
-    /// One point of one obligation's guard, at a root and case the caller chose, or the gap that
-    /// stops the obligation being run a point at a time at all. This is what a search over cases
-    /// is made of, one case at a time: a caller that wants to shrink a refutation, or cover a
-    /// finite domain, drives the draws rather than asking for the whole search.
-    pub fn point_at(
-        &self,
-        obligation: &Obligation,
-        root: u64,
-        case: u32,
-        plan: &ProvePlan,
-    ) -> Point {
-        let Some(claim) = self.claim(obligation) else {
-            return Point::Faulted(unclaimed(obligation));
-        };
-        if let Strategy::Interleave(_) = obligation.strategy {
-            return Point::Undrawn(Gap::NotDrawn);
-        }
-        let mut cases = match self.cases(obligation, &claim, plan) {
-            Ok(cases) => cases,
-            Err(stop) => return stop.point(),
-        };
-        match &obligation.strategy {
-            Strategy::Hosted => {
-                let Some(hosting) = &self.hosting else {
-                    return Point::Undrawn(Gap::ReachesHost(obligation.footprint.clone()));
-                };
-                cases.machine = match self.host_machine(hosting) {
-                    Ok(machine) => machine,
-                    Err(fault) => return Point::Faulted(fault),
-                };
-            }
-            Strategy::Static(Unsettled::Unhandled(row)) => {
-                return Point::Undrawn(Gap::UnhandledEffect(Some(row.clone())));
-            }
-            Strategy::Static(Unsettled::Run(_)) | Strategy::Interleave(_) => {}
-        }
-
-        // The draw is the generator's, from a stream the caller seeds: the same point a whole
-        // run would have reached at this root and case.
-        let mut stream = GenStream::new(root, obligation.key);
-        let mut values = Vec::with_capacity(obligation.binders.len());
-        for binder in &obligation.binders {
-            match property::generate(&binder.sort, self.world, &mut stream, case) {
-                Ok(value) => values.push(value),
-                Err(_) => return Point::Undrawn(ungeneratable(binder)),
-            }
-        }
-        let bindings = bindings(&obligation.binders, &values);
-        match judge_case(&mut cases, &values) {
-            Outcome::Held => Point::Kept(bindings),
-            Outcome::Failed => Point::Falsified(bindings),
-            Outcome::Rejected => Point::Rejected,
-            // A raise at one point is the obligation's own gap, in the same words a whole run
-            // reports it in: nothing was refuted and nothing was established.
-            // A point drawn for a replay has no root or case to go back to: it was named, not
-            // drawn, so there is nothing a walk could regenerate.
-            Outcome::Raised(diagnostic) => Point::Undrawn(Gap::Raised {
-                bindings,
-                diagnostic: Box::new(diagnostic),
-                root: 0,
-                case: 0,
-            }),
-            Outcome::Faulted(diagnostic) => Point::Faulted(Fault {
-                bindings,
-                diagnostic: Box::new(diagnostic),
-            }),
-        }
-    }
-
-    /// A `law/host`, discharged by running it.
-    fn discharge_host(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        plan: &ProvePlan,
-    ) -> Discharge {
-        let Some(hosting) = &self.hosting else {
-            return Discharge::Unattempted(Gap::ReachesHost(obligation.footprint.clone()));
-        };
-        let mut cases = match self.cases(obligation, claim, plan) {
-            Ok(cases) => cases,
-            Err(stop) => return stop.discharge(),
-        };
-        cases.machine = match self.host_machine(hosting) {
-            Ok(machine) => machine,
-            Err(fault) => return Discharge::Faulted(fault),
-        };
-        run_property(
-            obligation.key,
-            &obligation.binders,
-            &obligation.variables,
-            self.world,
-            plan,
-            claim.guard_span(obligation.span),
-            &mut cases,
-        )
-    }
-
-    /// Binder values the guard admits, tried at points named by the guard's own literals.
-    fn witness(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        cases: &mut Cases<'a>,
-    ) -> Result<Option<Vec<Value>>, Fault> {
-        let literals = self.literals(claim);
-        let mut stream = GenStream::new(0, obligation.key);
-        let mut columns: Vec<Vec<Value>> = Vec::with_capacity(cases.binders.len());
-        let mut points = 1usize;
-        for binder in &cases.binders {
-            let column = match self.candidates(&binder.sort, &literals) {
-                Some(column) => column,
-                // A shape the guard's literals cannot name: a list, record, ADT or function.
-                None => match property::generate(&binder.sort, self.world, &mut stream, 0) {
-                    Ok(value) => vec![value],
-                    Err(_) => return Ok(None),
+        let mut out = Vec::with_capacity(points.len());
+        for values in points {
+            let judgement = match mode {
+                Mode::Whole => cases.judge(values),
+                Mode::Witness | Mode::Domain => match cases.guard(values) {
+                    Ok(true) => Judgement::Held,
+                    Ok(false) => Judgement::Rejected,
+                    Err(diagnostic) => Judgement::stopped(diagnostic),
                 },
             };
-            points = match points.checked_mul(column.len()) {
-                Some(points) if points <= WITNESS_POINTS => points,
-                _ => return Ok(None),
-            };
-            columns.push(column);
-        }
-
-        for index in 0..points {
-            let mut values = Vec::with_capacity(columns.len());
-            let mut rest = index;
-            for column in &columns {
-                values.push(column[rest % column.len()].clone());
-                rest /= column.len();
-            }
-            match cases.guard(&values) {
-                Ok(true) => return Ok(Some(values)),
-                Ok(false) => {}
-                Err(diagnostic) if codes::is_defect(diagnostic.code) => {
-                    return Err(Fault {
-                        bindings: bindings(&cases.binders, &values),
-                        diagnostic: Box::new(diagnostic),
-                    });
-                }
-                // A point the guard raises at is not admitted; the property tier reports the raise.
-                Err(_) => {}
+            let ends = mode.ends(&judgement);
+            out.push(judgement);
+            if ends {
+                break;
             }
         }
-        Ok(None)
+        out
     }
 
-    fn literals(&self, claim: &Claim<'_>) -> Literals {
-        let written = match claim {
-            Claim::Ensures { owner, .. } => self
-                .front
-                .defs_written
-                .get(&owner.name)
-                .map(|w| w.requires_literals.as_slice()),
-            Claim::Law { info, .. } => self.front.law_literals.get(info.index).map(Vec::as_slice),
+    /// A law whose body reaches a `simulate` region, run once at `values` under `seed`: the
+    /// interleaving it took, how it ended, and whether it entered a region at all.
+    pub fn interleaved(
+        &self,
+        obligation: &Obligation,
+        step_budget: i64,
+        values: &[Value],
+        seed: &Seed,
+        steps: u32,
+    ) -> Interleaved {
+        let Some(claim) = self.claim(obligation) else {
+            return Interleaved::faulted(*unclaimed(obligation).diagnostic);
         };
-        Literals::of(written.unwrap_or_default())
-    }
-
-    /// The values one binder is tried at, smallest and most literal first.
-    fn candidates(&self, sort: &Sort, literals: &Literals) -> Option<Vec<Value>> {
-        let Sort::Con(name, args) = sort else {
-            return None;
+        let cases = match self.cases(obligation, &claim, step_budget) {
+            Ok(cases) => cases,
+            Err(fault) => return Interleaved::faulted(*fault.diagnostic),
         };
-        if !args.is_empty() {
-            return None;
+        let compiled = self.compiled();
+        compiled.set_seed(seed.clone(), steps);
+        let entered = ply_codegen::rt::with_step_budget(step_budget, || {
+            compiled.enter_whole(&cases.body_root, values, DEFAULT_MAX_CALLS)
+        });
+        let (value, record) = match entered {
+            ply_eval::Entered::Answered(value) => (Ok(value), compiled.simulated()),
+            ply_eval::Entered::Raised(raised) => (Err(raised), compiled.simulated()),
+            ply_eval::Entered::Declined => (
+                Err(ply_eval::err_not_compiled(
+                    &cases.body_root,
+                    obligation.span,
+                )),
+                None,
+            ),
+        };
+        let judged = match value {
+            Ok(Value::Bool(true)) => None,
+            Ok(Value::Bool(false)) => Some(Judgement::Failed),
+            Ok(other) => Some(Judgement::Faulted(body_was_not_boolean(
+                &other,
+                obligation.span,
+            ))),
+            Err(diagnostic) => Some(Judgement::stopped(diagnostic)),
+        };
+        let outcome = match &judged {
+            None => Ok(()),
+            Some(_) => Err(Diagnostic::error(
+                codes::OBLIGATION_REFUTED,
+                "the law failed",
+            )),
+        };
+        Interleaved {
+            interleaving: record.as_ref().map_or_else(
+                || ply_eval::Interleaving::passed(Vec::new()),
+                |r| r.interleaving(&outcome),
+            ),
+            verdict: judged,
+            observed: record.is_some(),
         }
-        let mut out: Vec<Value> = match name.as_str() {
-            "Bool" => vec![Value::Bool(false), Value::Bool(true)],
-            "Unit" => vec![Value::Unit],
-            "String" => {
-                let mut out = vec![Value::str(String::new())];
-                out.extend(literals.strings.iter().map(|s| Value::str(s.clone())));
-                out
-            }
-            "Bytes" => {
-                let mut out = vec![Value::bytes([])];
-                out.extend(literals.bytes.iter().map(Value::bytes));
-                out
-            }
-            "Int" => {
-                // Each literal and its neighbours: `x > 1000000` is satisfied by `1000001`.
-                let mut out = vec![0i64, 1, -1];
-                for &k in &literals.ints {
-                    for candidate in [k, k.saturating_add(1), k.saturating_sub(1)] {
-                        if !out.contains(&candidate) {
-                            out.push(candidate);
-                        }
-                    }
-                }
-                out.into_iter().map(Value::Int).collect()
-            }
-            _ => return None,
-        };
-        out.truncate(WITNESS_PER_BINDER);
-        Some(out)
     }
 
     fn cases(
         &self,
         obligation: &Obligation,
         claim: &Claim<'_>,
-        plan: &ProvePlan,
-    ) -> Result<Cases<'a>, Stop> {
+        step_budget: i64,
+    ) -> Result<Cases<'_>, Fault> {
         let call = match claim {
             Claim::Ensures { .. } => Some(obligation.owner.clone()),
             Claim::Law { .. } => None,
         };
-        let result = obligation.result.as_ref().map(|b| b.name.clone());
-        if let Some(binder) = obligation
-            .binders
-            .iter()
-            .find(|b| property::generatable(&b.sort, self.world).is_err())
-        {
-            return Err(ungeneratable(binder).into());
-        }
         Ok(Cases {
             machine: self.machine()?,
             compiled: self.compiled(),
-            guard_roots: self.guard_roots(claim),
+            guard_roots: self.guard_roots(obligation, claim),
             body_root: self.body_root(claim),
-            binders: obligation.binders.clone(),
             span: obligation.span,
             call,
-            result,
-            step_budget: plan.step_budget,
-            teardown: Arc::clone(&self.teardown),
-        })
-    }
-
-    fn enumerate(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        finite: &Finite,
-        cases: &mut Cases<'a>,
-        witness: Option<Proof>,
-    ) -> Discharge {
-        let mut kept = 0u64;
-        for point in 0..finite.points {
-            // A domain that cannot produce its own point has not been covered.
-            let Some(values) = finite.point(point) else {
-                return Discharge::Unattempted(ungeneratable(&obligation.binders[0]));
-            };
-            match judge_case(cases, &values) {
-                Outcome::Rejected => {}
-                Outcome::Held => kept += 1,
-                Outcome::Failed => {
-                    // No shrinking: the enumeration order is fixed.
-                    let bindings = bindings(&obligation.binders, &values);
-                    return Discharge::Refuted(Counterexample {
-                        original: bindings.clone(),
-                        bindings,
-                        shrinks: 0,
-                        root: 0,
-                        case: u32::try_from(point).unwrap_or(u32::MAX),
-                        race: None,
-                        sim_seed: None,
-                    });
-                }
-                Outcome::Raised(diagnostic) => {
-                    return Discharge::Unattempted(Gap::Raised {
-                        bindings: bindings(&obligation.binders, &values),
-                        diagnostic: Box::new(diagnostic),
-                        // The domain's order is the walk's: the index is the case.
-                        root: 0,
-                        case: u32::try_from(point).unwrap_or(u32::MAX),
-                    });
-                }
-                Outcome::Faulted(diagnostic) => {
-                    return Discharge::Faulted(Fault {
-                        bindings: bindings(&obligation.binders, &values),
-                        diagnostic: Box::new(diagnostic),
-                    });
-                }
-            }
-        }
-
-        if kept == 0 {
-            // A finite domain enumerated with nothing kept decides the guard unsatisfiable.
-            return Discharge::Vacuous(Vacuity {
-                guard: claim.guard_span(obligation.span),
-                kind: VacuityKind::ProvedUnsatisfiable,
-            });
-        }
-
-        // A kept point witnesses the domain, so the static argument can now be certified.
-        if let Some(proof) = witness
-            && let Some(certificate) = proof.certify(true, &obligation.variables)
-        {
-            return Discharge::Held(Evidence::Proof(certificate));
-        }
-
-        let rule = if obligation.binders.is_empty() {
-            Rule::GroundEvaluation
-        } else {
-            Rule::ExhaustiveEnumeration {
-                domain: finite.name.clone(),
-                points: finite.points,
-            }
-        };
-        Discharge::Held(Evidence::Proof(Certificate {
-            rules: vec![rule],
-            steps: u32::try_from(finite.points).unwrap_or(u32::MAX),
-            guard_satisfiable: true,
-            sorts: Vec::new(),
-        }))
-    }
-
-    /// A law whose body reaches a `simulate` region, discharged by searching interleavings.
-    fn search_interleavings(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        plan: &ProvePlan,
-        points: &Points,
-    ) -> Discharge {
-        let mut cases = match self.cases(obligation, claim, plan) {
-            Ok(cases) => cases,
-            Err(stop) => return stop.discharge(),
-        };
-
-        let (points, domain) = match self.law_domain(obligation, &mut cases, plan, points) {
-            Ok(kept) => kept,
-            Err(stop) => return stop.discharge(),
-        };
-
-        let mut search = Search {
-            compiled: self.compiled(),
-            body_root: cases.body_root.clone(),
-            binders: obligation.binders.clone(),
-            points,
-            steps: plan.sim.steps,
-            step_budget: plan.step_budget,
-            span: obligation.span,
-        };
-        concurrency::discharge(obligation, &plan.sim, &domain, &mut search).discharge
-    }
-
-    /// The points a concurrency law is searched at, and what claim covering them supports.
-    fn law_domain(
-        &self,
-        obligation: &Obligation,
-        cases: &mut Cases<'a>,
-        plan: &ProvePlan,
-        points: &Points,
-    ) -> Result<(Vec<Vec<Value>>, ValueDomain), Stop> {
-        let binders = &obligation.binders;
-        let mut kept: Vec<Vec<Value>> = Vec::new();
-
-        if let Points::Every(finite) = points {
-            for point in 0..finite.points {
-                let Some(values) = finite.point(point) else {
-                    continue;
-                };
-                if self.admits(cases, &values)? {
-                    kept.push(values);
-                }
-            }
-            let domain = ValueDomain::Enumerated {
-                domain: finite.name.clone(),
-                points: finite.points,
-                kept: kept.len() as u64,
-            };
-            return Ok((kept, domain));
-        }
-
-        let plan = plan.clone().normalized();
-        let mut generated = 0u32;
-        for &root in &plan.roots {
-            let mut stream = GenStream::new(root, obligation.key);
-            for case in 0..plan.cases {
-                let mut values = Vec::with_capacity(binders.len());
-                for binder in binders {
-                    match property::generate(&binder.sort, self.world, &mut stream, case) {
-                        Ok(value) => values.push(value),
-                        Err(_) => return Err(ungeneratable(binder).into()),
-                    }
-                }
-                generated = generated.saturating_add(1);
-                if self.admits(cases, &values)? {
-                    kept.push(values);
-                }
-            }
-        }
-        let domain = ValueDomain::Sampled {
-            generated,
-            kept: u32::try_from(kept.len()).unwrap_or(u32::MAX),
-            rejected: generated.saturating_sub(u32::try_from(kept.len()).unwrap_or(u32::MAX)),
-            instantiations: property::instantiations(binders, &obligation.variables),
-        };
-        Ok((kept, domain))
-    }
-
-    fn admits(&self, cases: &mut Cases<'a>, values: &[Value]) -> Result<bool, Stop> {
-        cases.guard(values).map_err(|diagnostic| {
-            let bindings = bindings(&cases.binders, values);
-            if codes::is_defect(diagnostic.code) {
-                return Stop::Fault(Fault {
-                    bindings,
-                    diagnostic: Box::new(diagnostic),
-                });
-            }
-            Stop::Gap(Gap::Raised {
-                bindings,
-                diagnostic: Box::new(diagnostic),
-                // A guard that raised while values were handed in: nothing here knows the draw.
-                root: 0,
-                case: 0,
-            })
+            result: obligation.result.as_ref().map(|b| b.name.clone()),
+            step_budget,
         })
     }
 }
 
-/// The most guard evaluations one witness search spends.
-const WITNESS_POINTS: usize = 4096;
-
-/// The most candidate values one binder contributes.
-const WITNESS_PER_BINDER: usize = 12;
-
-/// The literals a guard is written in terms of, which is where its domain is.
-#[derive(Default)]
-struct Literals {
-    ints: Vec<i64>,
-    strings: Vec<String>,
-    bytes: Vec<Vec<u8>>,
-}
-
-impl Literals {
-    fn of(written: &[Literal]) -> Literals {
-        let mut out = Literals::default();
-        for literal in written {
-            match literal {
-                Literal::Int(k) => out.ints.push(*k),
-                Literal::Str(s) => out.strings.push(s.clone()),
-                Literal::Bytes(b) => out.bytes.push(b.clone()),
-            }
-        }
-        out
-    }
-}
-
-/// Certifies a static argument the prover could not vouch for, once a run kept a case.
-fn upgrade(discharge: Discharge, witness: Option<Proof>, variables: &[Symbol]) -> Discharge {
-    let Some(proof) = witness else {
-        return discharge;
-    };
-    let Discharge::Held(Evidence::Cases(report)) = &discharge else {
-        return discharge;
-    };
-    if report.kept == 0 {
-        return discharge;
-    }
-    match proof.certify(true, variables) {
-        Some(certificate) => Discharge::Held(Evidence::Proof(certificate)),
-        None => discharge,
-    }
+/// Each binder beside the value it was given, as a report prints them.
+pub fn bindings(binders: &[Binder], values: &[Value]) -> Vec<Binding> {
+    binders
+        .iter()
+        .zip(values)
+        .map(|(binder, value)| Binding {
+            name: binder.name.clone(),
+            ty: binder.text.clone(),
+            value: ply_eval::Plain::shown(value),
+        })
+        .collect()
 }
 
 /// How a tuple of binder values is judged: guard first, always.
@@ -992,14 +511,11 @@ struct Cases<'a> {
     compiled: Rc<dyn ply_eval::Compiled>,
     guard_roots: Vec<Symbol>,
     body_root: Symbol,
-    binders: Vec<Binder>,
     span: Span,
     /// The definition an `ensures` is attached to, called to produce `result`.
     call: Option<Symbol>,
     result: Option<Symbol>,
     step_budget: i64,
-    /// The prover's, which a discharge's report reads.
-    teardown: Arc<Mutex<Vec<Diagnostic>>>,
 }
 
 impl Cases<'_> {
@@ -1029,7 +545,20 @@ impl Cases<'_> {
     }
 }
 
-impl Judge for Cases<'_> {
+impl Cases<'_> {
+    /// Guard first, always.
+    fn judge(&mut self, values: &[Value]) -> Judgement {
+        match self.guard(values) {
+            Err(d) => Judgement::stopped(d),
+            Ok(false) => Judgement::Rejected,
+            Ok(true) => match self.body(values) {
+                Err(d) => Judgement::stopped(d),
+                Ok(true) => Judgement::Held,
+                Ok(false) => Judgement::Failed,
+            },
+        }
+    }
+
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         for root in &self.guard_roots {
             let value = self.on_tier(root, values)?;
@@ -1044,14 +573,10 @@ impl Judge for Cases<'_> {
         // A law's binders, or an owner's parameters then `result`: the order `source.rs` expects.
         let mut args = values.to_vec();
         if let (Some(name), Some(_)) = (&self.call, &self.result) {
-            let (returned, mut warnings) = self
+            let (returned, _) = self
                 .machine
                 .call(name.as_str(), values.to_vec(), self.span)
                 .into_parts();
-            self.teardown
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .append(&mut warnings);
             args.push(returned?);
         }
         let value = self.on_tier(&self.body_root, &args)?;
@@ -1059,43 +584,31 @@ impl Judge for Cases<'_> {
     }
 }
 
-/// One law body, run at a point of its value domain under a seed the interleaving search chooses.
-struct Search {
-    compiled: Rc<dyn ply_eval::Compiled>,
-    body_root: Symbol,
-    binders: Vec<Binder>,
-    /// The points the guard kept, in order.
-    points: Vec<Vec<Value>>,
-    /// A `simulate` region's own budget: scheduling steps, not calls.
-    steps: u32,
-    /// Calls one evaluation of the body may make.
-    step_budget: i64,
-    span: Span,
+/// One run of a law over interleavings: the schedule it took, how its body ended, and whether it
+/// entered a `simulate` region, without which there was no schedule to take.
+pub struct Interleaved {
+    pub interleaving: ply_eval::Interleaving,
+    /// `None` when the body held.
+    pub verdict: Option<Judgement>,
+    pub observed: bool,
 }
 
-impl LawSearch for Search {
-    fn run(&mut self, point: u64, seed: &Seed) -> BodyRun {
-        let values = self.points.get(point as usize).cloned().unwrap_or_default();
-        let compiled = &self.compiled;
-        compiled.set_seed(seed.clone(), self.steps);
-        let entered = ply_codegen::rt::with_step_budget(self.step_budget, || {
-            compiled.enter_whole(&self.body_root, &values, DEFAULT_MAX_CALLS)
-        });
-        let (value, record) = match entered {
-            ply_eval::Entered::Answered(value) => (Ok(value), compiled.simulated()),
-            ply_eval::Entered::Raised(raised) => (Err(raised), compiled.simulated()),
-            ply_eval::Entered::Declined => (
-                Err(ply_eval::err_not_compiled(&self.body_root, self.span)),
-                None,
-            ),
-        };
-        concurrency::body_run(record.as_ref(), value, self.span)
-    }
-
-    fn bindings(&self, point: u64) -> Vec<Binding> {
-        match self.points.get(point as usize) {
-            Some(values) => bindings(&self.binders, values),
-            None => Vec::new(),
+impl Interleaved {
+    fn faulted(diagnostic: Diagnostic) -> Interleaved {
+        Interleaved {
+            interleaving: ply_eval::Interleaving::passed(Vec::new()),
+            verdict: Some(Judgement::Faulted(diagnostic)),
+            observed: false,
         }
     }
+}
+
+fn body_was_not_boolean(value: &Value, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("a law body came to `{}` rather than to a Boolean", ply_eval::slot(0)),
+    )
+    .showing(vec![ply_eval::Plain::shown(value)])
+    .primary(span, "a law is a proposition, so its body is `Bool`")
+    .note("the type checker rejects a non-`Bool` law body with E0201, so reaching this is a defect in Ply")
 }

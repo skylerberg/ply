@@ -17,14 +17,22 @@ use ply_eval::{
     BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Resource, Span, Step,
     Symbol, Value, codes, values_equal,
 };
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// A lock nothing poisons: a panic while one is held is already the end of the run.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A compiled function: `extern "C" fn(ctx, args) -> handle`.
 pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 
+/// A unit's tables, which every thread running the unit reads: what a `parallel` branch may change
+/// is behind an atomic or a lock.
 pub struct Tables {
     /// The constant pool as values.
     pub consts: Vec<Value>,
@@ -37,21 +45,21 @@ pub struct Tables {
     pub builtins: Vec<Builtin>,
     /// Every compiled function's finalized address by index, for building native closures.
     pub functions: Vec<usize>,
-    /// Each pure nullary function's memoized answer by index, as an immortal word.
-    pub memo: RefCell<Vec<Option<Word>>>,
+    /// Each pure nullary function's memoized answer by index, as an immortal word; `0` is none.
+    pub memo: Box<[AtomicI64]>,
     /// Owns the constant pool's and the memo's objects for as long as the unit lives.
-    pub immortals: RefCell<Heap>,
-    /// The 256 one-byte values, each made immortal when first asked for.
-    pub bytes: RefCell<[Word; 256]>,
+    pub immortals: Mutex<Heap>,
+    /// The 256 one-byte values, each made immortal when first asked for; `0` is not yet.
+    pub bytes: [AtomicI64; 256],
     /// Per constructor index, a nullary one's immortal singleton, or `0`.
     pub nullaries: Vec<Word>,
     pub empty_list: Word,
     pub empty_map: Word,
     /// Memo words and their converted values, both ways, so a tree crosses the seam unrebuilt.
-    pub memo_values: RefCell<HashMap<Word, Value>>,
-    pub memo_words: RefCell<HashMap<Identity, Word>>,
+    pub memo_values: Mutex<HashMap<Word, Value>>,
+    pub memo_words: Mutex<HashMap<Identity, Word>>,
     /// Answers of roots called with only memo words, up to [`CALL_MEMO_LIMIT`].
-    pub calls: RefCell<HashMap<(Symbol, Vec<Word>), Word>>,
+    pub calls: Mutex<HashMap<(Symbol, Vec<Word>), Word>>,
     /// Every root, sorted by `id`: what a body's stored site names.
     pub roots: Vec<Root>,
 }
@@ -96,40 +104,41 @@ fn identity(v: &Value) -> Option<Identity> {
 impl Tables {
     /// The memo's word for the pure nullary function at `index`, if it has one.
     pub fn memoized(&self, index: usize) -> Option<Word> {
-        self.memo.borrow().get(index).copied().flatten()
+        let w = self.memo.get(index)?.load(Acquire);
+        (w != 0).then_some(w)
     }
 
-    /// Remembers `w` as pure nullary function `index`'s answer, copied into the immortal heap.
+    /// Remembers `w` as pure nullary function `index`'s answer, copied into the immortal heap. Two
+    /// threads memoizing at once keep one copy each and answer the same value.
     pub fn memoize(&self, index: usize, w: Word) -> Word {
-        let kept = self.immortals.borrow_mut().adopt(w);
-        let mut memo = self.memo.borrow_mut();
-        if memo.len() <= index {
-            memo.resize(index + 1, None);
+        let kept = lock(&self.immortals).adopt(w);
+        if let Some(slot) = self.memo.get(index) {
+            slot.store(kept, Release);
         }
-        memo[index] = Some(kept);
         kept
     }
 
     /// The value a memo word was converted to before, if it was.
     pub fn memo_value(&self, w: Word) -> Option<Value> {
-        self.memo_values.borrow().get(&w).cloned()
+        lock(&self.memo_values).get(&w).cloned()
     }
 
     /// The memo word a value came from; `memo_values` holds the allocations, so ids are not reused.
     pub fn memo_word(&self, v: &Value) -> Option<Word> {
         let id = identity(v)?;
-        self.memo_words.borrow().get(&id).copied()
+        lock(&self.memo_words).get(&id).copied()
     }
 
     /// Keeps `v` for memo word `w` and maps its direct parts to their words, since a body that
     /// takes a memo value apart hands those parts back in.
     pub fn remember(&self, w: Word, v: &Value) {
         // Replacing the value would free allocations its recorded identities still name.
-        if self.memo_values.borrow().contains_key(&w) {
+        let mut values = lock(&self.memo_values);
+        if values.contains_key(&w) {
             return;
         }
-        self.memo_values.borrow_mut().insert(w, v.clone());
-        let mut words = self.memo_words.borrow_mut();
+        values.insert(w, v.clone());
+        let mut words = lock(&self.memo_words);
         if let Some(id) = identity(v) {
             words.insert(id, w);
         }
@@ -165,30 +174,37 @@ impl Tables {
 
     /// The remembered answer of `root` over exactly these memo words, if it has one.
     pub fn memo_call(&self, root: &Symbol, words: &[Word]) -> Option<Value> {
-        let kept = *self.calls.borrow().get(&(root.clone(), words.to_vec()))?;
+        let kept = *lock(&self.calls).get(&(root.clone(), words.to_vec()))?;
         self.memo_value(kept)
     }
 
     /// Remembers `out` for `root` over these memo words; `None` once the bound is reached.
     pub fn memoize_call(&self, root: &Symbol, words: &[Word], out: Word) -> Option<Word> {
-        let mut calls = self.calls.borrow_mut();
+        let mut calls = lock(&self.calls);
         if calls.len() >= CALL_MEMO_LIMIT {
             return None;
         }
-        let kept = self.immortals.borrow_mut().adopt(out);
+        let kept = lock(&self.immortals).adopt(out);
         calls.insert((root.clone(), words.to_vec()), kept);
         Some(kept)
     }
 
     /// The immortal `Bytes` holding just `b`.
     pub fn byte(&self, b: u8) -> Word {
-        let cached = self.bytes.borrow()[b as usize];
+        let slot = &self.bytes[b as usize];
+        let cached = slot.load(Acquire);
         if cached != 0 {
             return cached;
         }
-        let w = self.immortals.borrow_mut().bytes(&[b]);
+        let mut immortals = lock(&self.immortals);
+        // Another thread may have made it while this one waited.
+        let cached = slot.load(Acquire);
+        if cached != 0 {
+            return cached;
+        }
+        let w = immortals.bytes(&[b]);
         heap::mark_immortal(w);
-        self.bytes.borrow_mut()[b as usize] = w;
+        slot.store(w, Release);
         w
     }
 
@@ -449,7 +465,7 @@ pub struct Ctx {
     pub heap: Heap,
     /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
     last_entry: usize,
-    pub tables: Rc<Tables>,
+    pub tables: Arc<Tables>,
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
     pub builtin_calls: u64,
@@ -474,6 +490,8 @@ pub struct Ctx {
     /// arguments read; `None` for one entered without its program's answer.
     pub(crate) program: Option<&'static ply_eval::Front>,
     pub(crate) runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
+    /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of.
+    pub(crate) runtime_factory: Option<ply_eval::RuntimeFactory>,
     pub(crate) declared: Option<ply_eval::Footprint>,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_eval::host::HostUse,
@@ -494,10 +512,12 @@ pub struct Ctx {
     pub(crate) unwind: Option<(usize, usize, Word)>,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
     resumed: Option<Word>,
+    /// The heap and poison site of the entry this one began inside, put back when it ends.
+    outer: (*mut Heap, *const i64),
 }
 
 impl Ctx {
-    pub fn new(tables: Rc<Tables>) -> Ctx {
+    pub fn new(tables: Arc<Tables>) -> Ctx {
         let cells = ply_eval::TaskRegions::new();
         let baseline = (cells.total_depth(), cells.live());
         Ctx {
@@ -532,6 +552,7 @@ impl Ctx {
             binding: Arc::new(ply_eval::HostBinding::hermetic()),
             program: None,
             runtime: None,
+            runtime_factory: None,
             declared: None,
             re_executed: false,
             host_use: ply_eval::host::HostUse::default(),
@@ -546,7 +567,94 @@ impl Ctx {
             entered_sims: 0,
             unwind: None,
             resumed: None,
+            outer: (std::ptr::null_mut(), std::ptr::null()),
         }
+    }
+
+    /// A context for one branch of a `parallel` block this entry reached: its unit, host, seed and
+    /// what is left of its bounds, and nothing of its own, so it can run on another thread.
+    pub(crate) fn branch(&self) -> Ctx {
+        let mut b = Ctx::new(Arc::clone(&self.tables));
+        b.heap = Heap::branch();
+        b.fuel = self.fuel;
+        // Zero is no bound, so a budget spent to the last call stays a bound of one.
+        b.step_budget = if self.step_budget > 0 {
+            (self.step_budget - self.ticks).max(1)
+        } else {
+            0
+        };
+        b.deadline = self.deadline;
+        b.time_budget_ms = self.time_budget_ms;
+        b.arm_tick();
+        b.entry = self.entry;
+        b.binding = Arc::clone(&self.binding);
+        b.runtime_factory = self.runtime_factory.clone();
+        b.program = self.program;
+        b.declared = self.declared.clone();
+        b.re_executed = self.re_executed;
+        b.id = self.id;
+        b.seed = self.seed.clone();
+        b.sim_steps = self.sim_steps;
+        b.cells_baseline = b.cell_extent();
+        b
+    }
+
+    /// Takes back what a finished branch did, in the order the branches are written: its memory,
+    /// its calls, and what it performed.
+    pub(crate) fn absorb(&mut self, mut branch: Ctx) {
+        crate::detached::release_all(&mut branch);
+        branch.cells.close_program_regions();
+        self.heap.adopt_heap(std::mem::take(&mut branch.heap));
+        self.ticks = self.ticks.saturating_add(branch.ticks);
+        self.grown += branch.grown;
+        self.builtin_calls += branch.builtin_calls;
+        self.performed.append(&mut branch.performed);
+        self.host_use.atoms = self.host_use.atoms.union(&branch.host_use.atoms);
+        self.host_use.operations += branch.host_use.operations;
+        self.host_ops = self.host_ops.saturating_add(branch.host_ops);
+        if branch.last_linear.is_some() {
+            self.last_linear = branch.last_linear.take();
+        }
+        self.teardown.append(&mut branch.teardown);
+    }
+
+    /// Whether a `parallel` block's branches may run on other threads: nothing they perform can then
+    /// reach a handler this entry holds, a region's scheduler or this thread's host runtime, all of
+    /// which live on this thread.
+    pub(crate) fn runs_branches_at_once(&self) -> bool {
+        // A reactor this thread holds and no factory could make again belongs to this thread alone.
+        if !self.sims.is_empty() || (self.runtime.is_some() && self.runtime_factory.is_none()) {
+            return false;
+        }
+        let mut stack = Some(self.current);
+        while let Some(s) = stack {
+            if !self.stacks[s].list.is_empty() {
+                return false;
+            }
+            stack = self.stacks[s].parent;
+        }
+        true
+    }
+
+    /// The calls left before this entry's budget is spent, or `None` when nothing bounds it.
+    pub(crate) fn steps_left(&self) -> Option<i64> {
+        (self.step_budget > 0).then(|| self.step_budget - self.ticks)
+    }
+
+    /// Fails this entry as one of its `parallel` branches failed.
+    pub(crate) fn fail_from_branch(&mut self, code: i64, diagnostic: Option<Diagnostic>) {
+        if self.failed == 0 {
+            self.failed = code;
+        }
+        if self.diagnostic.is_none() {
+            self.diagnostic = diagnostic;
+        }
+    }
+
+    /// Fails this entry as running out of its step budget does.
+    pub(crate) fn fail_out_of_steps(&mut self) {
+        self.ticks = self.step_budget.saturating_add(1);
+        self.tick();
     }
 
     /// Between calls, and only between calls.
@@ -592,8 +700,11 @@ impl Ctx {
         );
         // After the recovery above, which gives back what that entry held.
         self.cells_baseline = self.cell_extent();
-        heap::enter(&mut self.heap);
-        heap::poison::enter(&raw const self.site_root);
+        // Another unit's entry may be running further up this thread: it gets its own back at `end`.
+        self.outer = (
+            heap::swap_current(&mut self.heap),
+            heap::poison::swap(&raw const self.site_root),
+        );
     }
 
     /// When compiled code must call back next: the call one past the budget, the end of this
@@ -650,8 +761,9 @@ impl Ctx {
             self.cells_balanced(),
             "closing the entry's regions left slots the arena did not reclaim"
         );
-        heap::poison::leave();
-        heap::leave();
+        heap::poison::swap(self.outer.1);
+        heap::swap_current(self.outer.0);
+        self.outer = (std::ptr::null_mut(), std::ptr::null());
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(
@@ -734,9 +846,21 @@ impl Ctx {
         &mut self,
         binding: Arc<ply_eval::HostBinding>,
         runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
+        factory: Option<ply_eval::RuntimeFactory>,
     ) {
         self.binding = binding;
         self.runtime = runtime;
+        self.runtime_factory = factory;
+    }
+
+    /// The reactor this context waits on, made on first need on a `parallel` branch's thread.
+    pub(crate) fn host_runtime(&mut self) -> Option<Rc<dyn ply_eval::HostRuntime>> {
+        if self.runtime.is_none()
+            && let Some(factory) = &self.runtime_factory
+        {
+            self.runtime = Some(factory());
+        }
+        self.runtime.clone()
     }
 
     pub(crate) fn frames(&mut self) -> &mut Vec<HandlerFrame> {
@@ -862,7 +986,7 @@ impl Ctx {
     }
 
     pub(crate) fn word(&mut self, v: &Value) -> Word {
-        let tables = Rc::clone(&self.tables);
+        let tables = Arc::clone(&self.tables);
         self.heap.to_word(&tables.layouts, v)
     }
 
@@ -1203,7 +1327,7 @@ pub fn time_budget_ms() -> u64 {
 pub(crate) const STACK_MARGIN: usize = 512 * 1024;
 
 /// The floor for this thread, asked of the platform once per thread (it can be a `/proc` read).
-fn stack_floor() -> usize {
+pub(crate) fn stack_floor() -> usize {
     thread_local! {
         static FLOOR: usize = stack_floor_of_this_thread();
     }
@@ -1898,7 +2022,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::MapNew, []) => Some(ctx.tables.empty_map),
         (Builtin::MapInsert, [m, k, v]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
-            let tables = Rc::clone(&ctx.tables);
+            let tables = Arc::clone(&ctx.tables);
             Some(ctx.heap.map_insert(&tables.layouts, *m, *k, *v))
         }
         (Builtin::MapGet, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
@@ -1925,7 +2049,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(heap::bool(found))
         }
         (Builtin::MapRemove, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
-            let tables = Rc::clone(&ctx.tables);
+            let tables = Arc::clone(&ctx.tables);
             let out = ctx.heap.map_remove(&tables.layouts, *m, *k);
             heap::dec(*k);
             Some(out)
@@ -1969,7 +2093,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(out)
         }
         (Builtin::MapOfEntries, [xs]) if heap::kind(*xs) == KIND_LIST => {
-            let tables = Rc::clone(&ctx.tables);
+            let tables = Arc::clone(&ctx.tables);
             let entries = list::to_vec(obj(*xs));
             let n = entries.len();
             let (key, value) = (Symbol::new("key"), Symbol::new("value"));
@@ -2004,7 +2128,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::MapMerge, [a, bm])
             if heap::kind(*a) == KIND_MAP && heap::kind(*bm) == KIND_MAP =>
         {
-            let tables = Rc::clone(&ctx.tables);
+            let tables = Arc::clone(&ctx.tables);
             let o = obj(*bm);
             let mut m = *a;
             for (k, v) in map::to_vec(o) {
@@ -2442,11 +2566,26 @@ pub unsafe extern "C" fn rt_ctor_value(ctx: *mut Ctx, index: i64) -> i64 {
     })))
 }
 
+/// One more holder of a shared object, for compiled code, which has no atomics of its own.
+pub unsafe extern "C" fn rt_inc_shared(_ctx: *mut Ctx, w: i64) {
+    heap::inc_shared(w);
+}
+
+/// One holder fewer of a shared object.
+pub unsafe extern "C" fn rt_dec_shared(_ctx: *mut Ctx, w: i64) {
+    heap::dec_shared(w);
+}
+
+/// `parallel { .. }`: the `n` nullary closures at `slots`, each answer written over its closure.
+pub unsafe extern "C" fn rt_parallel(ctx: *mut Ctx, slots: i64, n: i64) {
+    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize) }
+}
+
 /// The value of the pure nullary function at `index`, memoized when world-independent.
 pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
-    let tables = Rc::clone(&unsafe { &*ctx }.tables);
-    if let Some(Some(w)) = tables.memo.borrow().get(index as usize) {
-        return *w;
+    let tables = Arc::clone(&unsafe { &*ctx }.tables);
+    if let Some(w) = tables.memoized(index as usize) {
+        return w;
     }
     // SAFETY: as in `call_value`; a nullary function never reads the null argument pointer.
     let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(tables.functions[index as usize]) };
@@ -2957,7 +3096,7 @@ pub unsafe extern "C" fn rt_record_update(
     }
     // Unwritten fields come from the base by offset, or by name when the lowering guessed a base
     // of another shape.
-    let tables = Rc::clone(&ctx.tables);
+    let tables = Arc::clone(&ctx.tables);
     let width = tables.layouts.shape_width(shape);
     let flat = flat_over(written) & unsafe { (*o).flags };
     let out = ctx.heap.alloc(KIND_RECORD, flat, width as u32, shape);
@@ -3250,7 +3389,7 @@ pub unsafe extern "C" fn rt_map_insert(ctx: *mut Ctx, m: i64, k: i64, v: i64) ->
     let ctx = unsafe { &mut *ctx };
     if heap::kind(m) == KIND_MAP && heap::native_key(k) {
         ctx.builtin_calls += 1;
-        let tables = Rc::clone(&ctx.tables);
+        let tables = Arc::clone(&ctx.tables);
         return ctx.heap.map_insert(&tables.layouts, m, k, v);
     }
     direct(ctx, Builtin::MapInsert, &[m, k, v])

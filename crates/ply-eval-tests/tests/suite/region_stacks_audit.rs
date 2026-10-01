@@ -253,7 +253,7 @@ fn answers(name: &str, more: i64, seeds: std::ops::Range<u64>) {
     let (mut machine, tier) = compiled.machine_and_tier();
     for root in seeds {
         let n = root as i64;
-        machine.set_seed(Seed::root(root), DEFAULT_STEPS);
+        machine.set_seed(Seed::at(root, Vec::new()), DEFAULT_STEPS);
         match machine
             .call(name, vec![Value::Int(n)], Span::DUMMY)
             .into_parts()

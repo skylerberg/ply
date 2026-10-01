@@ -107,6 +107,9 @@ pub const LABEL_GROUP_BINDERS: &str = "E0307";
 /// A call inside a recursive group that would instantiate the group's row, or the callee's own
 /// type parameter, at something else: polymorphic recursion.
 pub const POLYMORPHIC_RECURSION: &str = "E0308";
+/// `parallel` branches that may not run at once: rows that conflict, or a branch that opens a
+/// `simulate` region.
+pub const PARALLEL_CONFLICT: &str = "E0309";
 pub const NONDET_IN_DET_TEST: &str = "E0412";
 /// A `Task` in a `simulate` region's result, or a `join` after its region ended.
 pub const TASK_ESCAPES_SCOPE: &str = "E0413";

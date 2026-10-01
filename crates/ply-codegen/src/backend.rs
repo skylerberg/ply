@@ -415,7 +415,7 @@ impl Bodies {
             return self.decline(|d| d.reentered += 1);
         };
 
-        let tables = Rc::clone(&ctx.tables);
+        let tables = std::sync::Arc::clone(&ctx.tables);
         if let Memo::Constant(index) = admitted.memo
             && let Some(kept) = tables.memoized(index)
             && let Some(value) = tables.memo_value(kept)
@@ -617,9 +617,10 @@ impl ply_eval::Compiled for Bodies {
         &self,
         binding: std::sync::Arc<ply_eval::HostBinding>,
         runtime: Option<std::rc::Rc<dyn ply_eval::HostRuntime>>,
+        factory: Option<ply_eval::RuntimeFactory>,
     ) {
         if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
-            ctx.set_host(binding, runtime);
+            ctx.set_host(binding, runtime, factory);
         }
     }
 

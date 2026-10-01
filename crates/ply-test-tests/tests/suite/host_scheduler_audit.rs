@@ -1,11 +1,11 @@
-use crate::fixture::Compiled;
+use crate::fixture::{Compiled, Seeds};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Diagnostic, Plan, Symbol, Value, codes};
+use ply_eval::{Diagnostic, Symbol, Value, codes};
 use ply_store::Store;
-use ply_test::{Hosting, InterpExecutor, RunReport, Search, Selection};
+use ply_test::{Hosting, RunReport, Selection};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,20 +40,10 @@ fn run_report(
     compiled: &Compiled,
     store: &mut Store,
     selection: &Selection,
-    search: Search,
-    hosting: Hosting<'_>,
+    seeds: Seeds,
+    hosting: Hosting,
 ) -> RunReport {
-    let unit = compiled.tier();
-    let executor = InterpExecutor::new(&compiled.port, unit)
-        .with_search(search)
-        .with_hosts(hosting);
-    ply_test::run_with(
-        selection,
-        &compiled.check,
-        &compiled.hashes,
-        store,
-        &executor,
-    )
+    compiled.run(selection, hosting, store, &seeds)
 }
 
 #[derive(Default)]
@@ -130,12 +120,11 @@ fn run_hosted(source: &str, tasks: bool) -> Ran {
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = compiled.every();
-    let search = Search::of(&selection);
     let report = run_report(
         &compiled,
         &mut store,
         &selection,
-        search,
+        Seeds::default(),
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
     Ran {
@@ -377,17 +366,17 @@ fn under_simulation_once_the_same_send_runs_exactly_once_and_is_not_cached() {
         .unwrap_or_else(|d| panic!("the registry binds: {d:#?}"));
     let root = TempRoot::new();
     let mut store = root.store();
-    let plan = Plan::once(ply_eval::Seed::default());
-    let selection = crate::fixture::every(&compiled.check, &compiled.hashes, &plan);
+    let seeds = Seeds::once(ply_eval::Seed::default());
+    let selection = compiled.every();
     assert!(
-        !plan.re_executes(),
+        !seeds.re_executed,
         "the fixture only bites if this plan really runs the test once"
     );
     let report = run_report(
         &compiled,
         &mut store,
         &selection,
-        Search::of(&selection),
+        seeds,
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
     assert!(
@@ -422,7 +411,7 @@ fn a_hermetic_refusal_says_that_host_would_not_repair_a_searched_test() {
         &compiled,
         &mut store,
         &selection,
-        Search::of(&selection),
+        Seeds::default(),
         // The shape `ply test` uses: the registry is carried, nothing is bound.
         Hosting::hermetic().with_binding(Arc::new(HostBinding::hermetic_with(registry(
             counter.clone(),
@@ -450,13 +439,16 @@ fn measure_reduction_re_executes_a_once_plan_and_is_refused() {
         .unwrap_or_else(|d| panic!("the registry binds: {d:#?}"));
     let root = TempRoot::new();
     let mut store = root.store();
-    let plan = Plan::once(ply_eval::Seed::default());
-    let selection = crate::fixture::every(&compiled.check, &compiled.hashes, &plan);
+    let selection = compiled.every();
+    // A measured reduction runs the search beside two less pruned ones, so even one seed re-runs.
     let report = run_report(
         &compiled,
         &mut store,
         &selection,
-        Search::of(&selection).measuring(true),
+        Seeds {
+            re_executed: true,
+            ..Seeds::once(ply_eval::Seed::default())
+        },
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
     let d = &report.failures[0].diagnostic;
@@ -492,12 +484,11 @@ test "a det test over a deterministic host handler" {
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = compiled.every();
-    let search = Search::of(&selection);
     let report = run_report(
         &compiled,
         &mut store,
         &selection,
-        search,
+        Seeds::default(),
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
     assert_eq!(counter.calls(), 1, "the run itself reached the socket once");
@@ -550,12 +541,11 @@ test/nondet "spawns without a binding" {
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = compiled.every();
-    let search = Search::of(&selection);
     let report = run_report(
         &compiled,
         &mut store,
         &selection,
-        search,
+        Seeds::default(),
         Hosting::hermetic().with_binding(Arc::new(HostBinding::hermetic_with(registry(
             counter.clone(),
             true,

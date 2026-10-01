@@ -102,21 +102,6 @@ fn list(value: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// The decision a claim's reach names; a law the static tier sees always has one.
-fn decision_of(reach: &Value) -> String {
-    let Value::Ctor { name, args } = reach else {
-        panic!("a reach is an `Option`: {reach:?}");
-    };
-    assert_eq!(
-        name.as_str(),
-        "Some",
-        "the static tier saw nothing of a law"
-    );
-    field_of(&args[0], "decision", Span::DUMMY)
-        .and_then(|d| d.as_str(Span::DUMMY, "a decision").map(str::to_string))
-        .expect("a reach names its decision")
-}
-
 /// Whether a run's collection places `source`: a project's own module is among the files it read.
 fn places(collection: &Value, source: &str) -> bool {
     let places = field_of(collection, "places", Span::DUMMY).expect("a collection's places");
@@ -179,25 +164,33 @@ fn a_second_configuration_is_a_second_run_over_its_own_project() {
                 "the second run collected the first project"
             );
         }
-        let all = Value::list((0..laws).map(|i| Value::Int(i as i64)).collect());
-        let choice = record(vec![
-            ("claims", all.clone()),
-            ("runs", all),
-            ("read", Value::list(Vec::new())),
-        ]);
-        let verdicts = ok(ask(&lent, "discharged", vec![choice]));
-        let outcomes = field_of(&verdicts, "outcomes", Span::DUMMY).expect("the outcomes");
-        assert_eq!(list(outcomes).len(), laws);
-        // The static tier is asked about each claim on its own, after anything discharged it.
-        let asked = Value::list((0..laws).map(|i| Value::Int(i as i64)).collect());
-        let reached = ok(ask(&lent, "reaches", vec![asked]));
-        let decisions: Vec<String> = list(&reached).iter().map(decision_of).collect();
-        assert_eq!(decisions.len(), laws, "{decisions:?}");
-        assert!(
-            decisions.iter().all(
-                |d| ["proved", "guard_unsatisfiable", "open", "budget_spent"].contains(&d.as_str())
-            ),
-            "{decisions:?}"
+        let warnings = ok(ask(
+            &lent,
+            "prepared",
+            vec![Value::Int(ply_eval::DEFAULT_STEP_BUDGET)],
+        ));
+        assert!(list(&warnings).is_empty(), "{warnings:?}");
+        // Each law judged where every binder is zero, which each of them holds at.
+        let batches = owed
+            .iter()
+            .enumerate()
+            .map(|(claim, (_, binders))| {
+                let zeros = binders
+                    .iter()
+                    .map(|_| Value::ctor("std.value.VInt", vec![Value::Int(0)]))
+                    .collect();
+                record(vec![
+                    ("claim", Value::Int(claim as i64)),
+                    ("points", Value::list(vec![Value::list(zeros)])),
+                    ("mode", Value::ctor("proof.property.MWhole", Vec::new())),
+                ])
+            })
+            .collect();
+        let judged = ask(&lent, "judged", vec![Value::list(batches)]);
+        let held = Value::ctor("proof.obligation.JHeld", Vec::new());
+        assert_eq!(
+            list(&judged).iter().map(list).collect::<Vec<_>>(),
+            vec![vec![held]; laws]
         );
     }
 }

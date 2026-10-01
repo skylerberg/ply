@@ -13,7 +13,8 @@ use crate::source::Source;
 use anyhow::{Result, bail};
 use ply_eval::{Span, Symbol};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ pub struct Native {
     lib: Library,
     entries: HashMap<String, (Entry, usize)>,
     constants: HashMap<String, usize>,
-    tables: Rc<Tables>,
+    tables: Arc<Tables>,
 }
 
 impl Native {
@@ -40,7 +41,7 @@ impl Native {
         self.constants.get(name).copied()
     }
 
-    pub fn tables(&self) -> &Rc<Tables> {
+    pub fn tables(&self) -> &Arc<Tables> {
         &self.tables
     }
 
@@ -537,13 +538,14 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         bail!("two roots of this unit share a site id");
     }
     let mut tables = tables_of(unit, &ctors);
+    tables.memo = functions.iter().map(|_| AtomicI64::new(0)).collect();
     tables.functions = functions;
     tables.roots = roots;
     Ok(Native {
         lib,
         entries,
         constants,
-        tables: Rc::new(tables),
+        tables: Arc::new(tables),
     })
 }
 
@@ -846,8 +848,8 @@ fn tables_of(mut unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
         builtins: unit.builtins,
         functions: Vec::new(),
         memo: Default::default(),
-        immortals: std::cell::RefCell::new(immortals),
-        bytes: std::cell::RefCell::new([0; 256]),
+        immortals: std::sync::Mutex::new(immortals),
+        bytes: std::array::from_fn(|_| AtomicI64::new(0)),
         nullaries,
         empty_list,
         empty_map,

@@ -8,8 +8,9 @@ import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate, EBad,
-              Stmt, SLet, SLetElse, SExpr, Param, MatchArm, HandleClause, ReturnClause, RecField)
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
+              EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, MatchArm, HandleClause,
+              ReturnClause, RecField)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, DJson, DEq, DOrd, SpecKind, SRequires, SEnsures, SpecClause,
@@ -601,6 +602,7 @@ fn t_e_perform() -> Int = 62
 fn t_e_handle() -> Int = 63
 fn t_e_with_cell() -> Int = 64
 fn t_e_simulate() -> Int = 65
+fn t_e_parallel() -> Int = 100
 fn t_e_record_update() -> Int = 67
 fn t_s_let() -> Int = 70
 fn t_s_expr() -> Int = 71
@@ -1177,6 +1179,9 @@ fn expr(z: Nz, e: Expr) -> Nz =
       { ..inner, values: head.values }
     },
     ESimulate(s) -> expr(tag(z, t_e_simulate()), s.body),
+    EParallel(v) ->
+      fold(v.branches, u32v(tag(z, t_e_parallel()), len(v.branches)), |acc: Nz, x: Expr|
+        expr(acc, x)),
     EBad(_) -> panic("a placeholder reached the hasher"),
   }
 
@@ -1385,6 +1390,7 @@ pub fn is_pure(e: Expr) -> Bool =
     EHandle(_) -> false,
     EWithCell(_) -> false,
     ESimulate(_) -> false,
+    EParallel(v) -> fold(v.branches, true, |acc: Bool, x: Expr| acc && is_pure(x)),
     ETry(_) -> false,
     EBad(_) -> false,
     ELit(_) -> true,
@@ -1466,6 +1472,7 @@ fn mentions(e: Expr, names: List<Bytes>) -> Bool =
     EWithCell(c) ->
       contains_bytes(names, c.binder.name) || mentions(c.init, names) || mentions(c.body, names),
     ESimulate(s) -> mentions(s.body, names),
+    EParallel(v) -> fold(v.branches, false, |acc: Bool, x: Expr| acc || mentions(x, names)),
   }
 
 fn pattern_mentions(p: Pattern, names: List<Bytes>) -> Bool =
@@ -2213,6 +2220,7 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
     },
     EWithCell(c) -> lambda_rets(c.body, lambda_rets(c.init, out)),
     ESimulate(s) -> lambda_rets(s.body, out),
+    EParallel(v) -> fold(v.branches, out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
   }
 
 fn is_pub(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
@@ -3241,6 +3249,10 @@ fn p_expr(x: Pr, d: Dc, depth: Int) -> Got = {
   } else if t.v == t_e_simulate() {
     let body = p_block(x, e, depth);
     { d: body.d, t: bytes_concat(b"simulate ", body.t) }
+  } else if t.v == t_e_parallel() {
+    let n = rd_count(e);
+    let branches = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
+    { d: branches.d, t: bytes_concat_all([b"parallel { ", joined(branches.ts, b", "), b" }"]) }
   } else {
     panic(string_of_bytes(bytes_concat(b"a tag that does not begin an expression: ", num(t.v))))
   }
@@ -4024,6 +4036,20 @@ test "printed bodies hash back to what they were stored under, under their own n
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
   let shipped = printed_of(out, [b"left.util"]);
   assert_eq(map(shipped, |m: { module: Bytes, text: Bytes }| m.module), [b"app", b"right.util"])
+}
+
+test "a parallel block prints back as written and hashes back to what it was stored under" {
+  let out = hash_index(
+    indexed([
+      { name: b"app", src: b"pub fn both(n: Int) -> (Int, Bool) = parallel { n + 1, n > 0 }" },
+    ]),
+  );
+  let ms = printed_of(out, []);
+  assert(holds_text(at(ms, 0).text, b"parallel { "));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
 test "a reference is printed under a name the module holding it exports" {

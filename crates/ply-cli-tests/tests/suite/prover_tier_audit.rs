@@ -5,6 +5,9 @@ use crate::harness::{json_of, ply, project, repo};
 use serde_json::Value;
 use std::path::Path;
 
+/// `proof.goal`'s `default_unfold_depth`: no certificate inlines deeper.
+const UNFOLD_DEPTH: u64 = 3;
+
 /// What `ply prove` answers for `path` under the repository, or for the project at `dir` when there
 /// is no path, discharged afresh, with `flags` besides.
 fn proved_at(dir: &Path, path: Option<&str>, flags: &[&str]) -> Value {
@@ -113,7 +116,7 @@ fn the_certificate_audit() {
                 assert!(
                     unfolded["depth"]
                         .as_u64()
-                        .is_some_and(|d| d <= u64::from(ply_prove::UNFOLD_DEPTH)),
+                        .is_some_and(|d| d <= UNFOLD_DEPTH),
                     "{owner} unfolded past the bound: {unfolded}"
                 );
             }

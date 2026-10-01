@@ -10,9 +10,9 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               EffectSetDef, ImportDecl, ImportKind, INames, Binder, OpDef, EffectDef, TestDef,
               LawDef, parse, dump_module)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate, EBad,
-              Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause, ReturnClause,
-              RecField, expr_span)
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
+              EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
+              ReturnClause, RecField, expr_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit)
 
 // --- Shared ---------------------------------------------------------------------
@@ -52,6 +52,7 @@ pub fn is_pure(e: Expr) -> Bool =
     EHandle(_) -> false,
     EWithCell(_) -> false,
     ESimulate(_) -> false,
+    EParallel(v) -> fold(v.branches, true, |acc: Bool, x: Expr| acc && is_pure(x)),
     ETry(_) -> false,
     ELit(_) -> true,
     EVar(_) -> true,
@@ -692,6 +693,10 @@ fn walk_expr(s: Sets, e: Expr) -> { s: Sets, e: Expr } =
       let o = walk_expr(s, x.body);
       { s: o.s, e: ESimulate({ span: x.span, body: o.e }) }
     },
+    EParallel(x) -> {
+      let o = walk_exprs(s, x.branches);
+      { s: o.s, e: EParallel({ span: x.span, branches: o.xs }) }
+    },
     _ -> { s: s, e: e },
   }
 
@@ -995,6 +1000,7 @@ fn ru_expr(sh: Map<Bytes, List<Bytes>>, e: Expr) -> Expr =
         body: ru_expr(sh, c.body),
       }),
     ESimulate(x) -> ESimulate({ span: x.span, body: ru_expr(sh, x.body) }),
+    EParallel(x) -> EParallel({ span: x.span, branches: ru_exprs(sh, x.branches) }),
     _ -> e,
   }
 
@@ -1366,7 +1372,8 @@ fn scan(cx: TryCx, e: Expr) -> Scanned =
           },
       }
     },
-    // A nested block is not entered; a lambda, handler, cell, region or `simulate` is a barrier to `?`.
+    // A nested block is not entered; a lambda, handler, cell, region, `simulate` or `parallel` is a
+    // barrier to `?`.
     _ -> { cx: cx, s: purity(is_pure(e)), e: e },
   }
 
@@ -1906,6 +1913,10 @@ fn sweep_inner(cx: TryCx, e: Expr, scope: Option<Bytes>, barrier: Option<Bytes>)
       let o = sweep(cx, x.body, scope, under(barrier, b"a `simulate` body"));
       { cx: o.cx, e: ESimulate({ span: x.span, body: o.e }) }
     },
+    EParallel(x) -> {
+      let o = sweep_all(cx, x.branches, scope, under(barrier, b"a `parallel` branch"));
+      { cx: o.cx, e: EParallel({ span: x.span, branches: o.xs }) }
+    },
     _ -> { cx: cx, e: e },
   }
 
@@ -2033,8 +2044,12 @@ pub fn expand_try(m: Module, diags: List<PDiag>) -> { module: Module, diags: Lis
 
 // --- Running the rewrites --------------------------------------------------------------------
 
-fn has_update(m: Module) -> Bool =
-  any_expr(m, |e: Expr| match e { ERecordUpdate(_) -> true, _ -> false })
+fn has_update(m: Module) -> Bool = any_expr(m, is_update)
+
+fn is_update(e: Expr) -> Bool = match e { ERecordUpdate(_) -> true, _ -> false }
+
+// Whether a definition writes a record update anywhere: its body, a clause, or a default.
+pub fn fn_has_update(d: FnDef) -> Bool = any_expr({ imports: [], items: [IFn(d)] }, is_update)
 fn has_try(m: Module) -> Bool = any_expr(m, |e: Expr| match e { ETry(_) -> true, _ -> false })
 
 fn any_expr(m: Module, p: (Expr) -> Bool) -> Bool =
@@ -2090,6 +2105,7 @@ fn any_in(e: Expr, p: (Expr) -> Bool) -> Bool =
           || (match h.ret { None -> false, Some(rc) -> any_in(rc.body, p) }),
       EWithCell(c) -> any_in(c.init, p) || any_in(c.body, p),
       ESimulate(x) -> any_in(x.body, p),
+      EParallel(x) -> fold(x.branches, false, |b: Bool, y: Expr| b || any_in(y, p)),
       _ -> false,
     })
 

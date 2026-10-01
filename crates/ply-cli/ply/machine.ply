@@ -11,6 +11,8 @@ import diagnostic (Place, Raised)
 import entry (Main, Module)
 import std.json (Json)
 import std.value (Value)
+import sim.plan
+import sim.plan (Seed)
 
 // What the Rust side loads, binds, enters and tears down, in that order and each once. The
 // binding lives on the thread the entry runs on, which is why binding and entering are two
@@ -82,7 +84,8 @@ pub type Options = {
   drain_lead_ms: Int,
   steps: Int,
   timeout: Int,
-  seed: Option<String>,
+  // The one interleaving a run's `simulate` regions take.
+  seed: Option<Seed>,
   profile: String,
   argv: List<String>,
 }
@@ -111,6 +114,32 @@ pub fn default_options() -> Options =
   }
 
 // --- Tests ------------------------------------------------------------------
+
+test "work is dealt into lanes round-robin and comes back in its own order" {
+  let xs = range(0, 7);
+  assert_eq(dealt(xs, None), map(xs, |x: Int| [x]));
+  assert_eq(dealt(xs, Some(3)), [[0, 3, 6], [1, 4], [2, 5]]);
+  assert_eq(dealt(xs, Some(1)), [xs]);
+  assert_eq(dealt(xs, Some(0)), [xs]);
+  assert_eq(dealt(range(0, 2), Some(8)), [[0], [1]]);
+  assert_eq(dealt([], Some(4)), []);
+  assert_eq(undealt(dealt(xs, Some(3))), xs);
+  assert_eq(undealt(dealt(xs, None)), xs);
+  assert_eq(
+    undealt(map(dealt(xs, Some(2)), |lane: List<Int>| map(lane, |x: Int| x * 10))),
+    map(xs, |x: Int| x * 10),
+  )
+}
+
+test "the flags name the search a run keys its seeded tests on" {
+  let p = sim_plan_of(no_sim_options());
+  assert_eq(p, plan::default_plan());
+  let seeded = sim_plan_of({ ..no_sim_options(), seed: Some("7:1.0") });
+  assert_eq(seeded.mode, plan::Once);
+  assert_eq(seeded.roots, [7u64]);
+  assert_eq(seeded.path, [1, 0]);
+  assert_eq(sim_plan_of({ ..no_sim_options(), mode: "random" }).budget, 1)
+}
 
 test "the defaults are one record" {
   assert_eq(default_options().profile, "development");
@@ -228,6 +257,37 @@ pub fn sim_options_from(p: Parsed) -> SimOpts =
     measure_reduction: has(p, "measure-reduction"),
   }
 
+// What the flags ask a search to run, as `sim.plan` normalizes a plan.
+pub fn sim_plan_of(sim: SimOpts) -> plan::Plan =
+  plan::asked_plan({
+    seed: match sim.seed { Some(text) -> plan::parse_seed(text), None -> None },
+    mode: match plan::parse_mode(sim.mode) { Some(m) -> m, None -> plan::Dpor },
+    roots: sim.roots,
+    budget: sim.budget,
+    steps: sim.steps,
+  })
+
+// Work dealt into lanes run at once: one lane per item, or `n` lanes dealt round-robin when `--jobs`
+// names `n`, so lane `k` holds items `k`, `k + n`, ...
+pub fn dealt<a>(xs: List<a>, lanes: Option<Int>) -> List<List<a>> = {
+  let n = match lanes { Some(k) -> max(1, min(k, len(xs))), None -> len(xs) };
+  map(range(0, min(n, len(xs))), |k: Int|
+    fold(range(0, len(xs)), [], |lane: List<a>, i: Int|
+      if i % n != k { lane }
+      else { match list_at(xs, i) { Some(x) -> push(lane, x), None -> lane } }))
+}
+
+// What each lane answered, back in the order `dealt` took the items in.
+pub fn undealt<b>(lanes: List<List<b>>) -> List<b> = {
+  let n = len(lanes);
+  let total = fold(lanes, 0, |acc: Int, lane: List<b>| acc + len(lane));
+  fold(range(0, total), [], |out: List<b>, i: Int|
+    match list_at(lanes, i % n) {
+      Some(lane) -> match list_at(lane, i / n) { Some(x) -> push(out, x), None -> out },
+      None -> out,
+    })
+}
+
 // What a run searches when no flag says otherwise.
 pub fn no_sim_options() -> SimOpts =
   { seed: None, mode: "dpor", roots: None, budget: None, steps: None, measure_reduction: false }
@@ -292,7 +352,7 @@ pub fn options_from(p: Parsed) -> Options =
     drain_lead_ms: int_of(p, "drain-lead-ms", default_options().drain_lead_ms),
     steps: int_of(p, "steps", default_options().steps),
     timeout: int_of(p, "timeout", default_options().timeout),
-    seed: opt_text(p, "seed"),
+    seed: match opt_text(p, "seed") { Some(text) -> plan::parse_seed(text), None -> None },
     profile: match value(p, "profile") { Some(pr) -> pr, None -> default_options().profile },
     argv: p.argv,
   }

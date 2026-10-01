@@ -1,11 +1,8 @@
 //! The helpers the machines share: backend selection, the compiled tier over a load, schema
-//! materialisation, the worker pool, and `plural`.
+//! materialisation, and `plural`.
 
 use ply_eval::{Diagnostic, SourceMap, Span, codes};
 use std::collections::BTreeSet;
-
-/// The worker pool's frames recurse per node on the native stack.
-const WORKER_STACK: usize = 256 << 20;
 
 fn unbuilt(error: impl std::fmt::Display) -> Diagnostic {
     Diagnostic::error(
@@ -38,23 +35,6 @@ pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
     };
     ply_codegen::select_profile(profile);
     Ok(())
-}
-
-/// Runs `selection` on the compiled tier built from `loaded`'s module source texts.
-pub fn run_on_tier(
-    loaded: &crate::load::Loaded,
-    selection: &ply_test::Selection,
-    hosting: ply_test::Hosting<'_>,
-    store: &mut ply_store::Store,
-) -> ply_test::RunReport {
-    ply_codegen::c::producer::ensure_default();
-    let texts = module_texts(&loaded.check, &loaded.sources);
-    let unit =
-        ply_codegen::Unit::over_front(&loaded.front, texts).expect("this host has a C compiler");
-    let executor = ply_test::InterpExecutor::new(&loaded.front, unit)
-        .with_search(ply_test::Search::of(selection))
-        .with_hosts(hosting);
-    ply_test::run_with(selection, &loaded.check, &loaded.hashes, store, &executor)
 }
 
 pub fn module_texts(
@@ -130,31 +110,4 @@ pub fn once_each(warnings: Vec<Diagnostic>) -> Vec<Diagnostic> {
         .into_iter()
         .filter(|d| seen.insert((d.code, d.message.clone())))
         .collect()
-}
-
-pub fn build_pool(
-    jobs: Option<u32>,
-    warnings: &mut Vec<Diagnostic>,
-) -> (Option<rayon::ThreadPool>, usize) {
-    let requested = jobs.unwrap_or(0) as usize;
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(requested)
-        .stack_size(WORKER_STACK)
-        .build()
-    {
-        Ok(pool) => {
-            let workers = pool.current_num_threads();
-            (Some(pool), workers)
-        }
-        Err(e) => {
-            warnings.push(
-                Diagnostic::warning(
-                    ply_eval::codes::RUNTIME_ERROR,
-                    format!("could not start {requested} worker threads: {e}"),
-                )
-                .note("the run continued on the default thread pool"),
-            );
-            (None, rayon::current_num_threads())
-        }
-    }
 }

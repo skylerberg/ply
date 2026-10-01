@@ -1,0 +1,276 @@
+// `plan` — what a search is asked to run: the seeds a schedule is drawn from, and how many.
+
+// A schedule: the root its stream is drawn from, and the choices taken before the stream decides.
+pub type Seed = { root: U64, path: List<Int> }
+
+pub fn root_seed(root: U64) -> Seed = { root: root, path: [] }
+
+pub fn is_root(s: Seed) -> Bool = len(s.path) == 0
+
+// The interleaving that agrees with `s` up to scheduling point `at` and takes `choice` there.
+pub fn branch(s: Seed, at: Int, choice: Int) -> Seed =
+  {
+    root: s.root,
+    path: push(
+      map(range(0, at), |i: Int| match list_at(s.path, i) { Some(c) -> c, None -> 0 }),
+      choice,
+    ),
+  }
+
+// `7`, or `7:3.0.2` past the root.
+pub fn seed_text(s: Seed) -> String =
+  fold(range(0, len(s.path)), u64_text(s.root), |acc: String, i: Int|
+    match list_at(s.path, i) {
+      Some(c) -> acc ++ (if i == 0 { ":" } else { "." }) ++ int_to_string(c),
+      None -> acc,
+    })
+
+// What `seed_text` writes, and a root or choice written `0x` and hexadecimal.
+pub fn parse_seed(text: String) -> Option<Seed> =
+  match string_split(text, ":") {
+    [root] -> match parse_u64(root) { Some(r) -> Some(root_seed(r)), None -> None },
+    // `7:` is not `7`: an empty path is a typo, not a root.
+    [root, rest] -> if rest == "" { None } else {
+      match parse_u64(root) {
+        None -> None,
+        Some(r) ->
+          fold(
+            string_split(rest, "."),
+            Some({ root: r, path: [] }),
+            |acc: Option<Seed>, part: String|
+              match acc {
+                None -> None,
+                Some(s) -> match parse_u64(part) {
+                  Some(c) -> if c <= 65535u64 { Some({ ..s, path: push(s.path, int_of_u64(c)) }) }
+                  else { None },
+                  None -> None,
+                },
+              },
+          ),
+      }
+    },
+    _ -> None,
+  }
+
+// Unambiguous bytes for a key: the root, the path's length, then each choice, all little-endian.
+pub fn seed_bytes(s: Seed) -> Bytes =
+  bytes_concat_all([
+    u64_le(s.root),
+    le(len(s.path), 4),
+    bytes_concat_all(map(s.path, |c: Int| le(c, 2))),
+  ])
+
+fn le(n: Int, width: Int) -> Bytes =
+  bytes_concat_all(map(range(0, width), |i: Int| byte_of_int(n >> 8 * i & 255)))
+
+fn u64_le(n: U64) -> Bytes =
+  bytes_concat_all(map(range(0, 8), |i: Int| byte_of_int(int_of_u64(n >> 8 * i & 255u64))))
+
+// Decimal, from the high half and the low: an `Int` holds neither a whole `U64` nor its text.
+pub fn u64_text(n: U64) -> String = {
+  let high = int_of_u64(n >> 32);
+  let low = int_of_u64(n & 4294967295u64);
+  if high == 0 { int_to_string(low) }
+  else { u128_to_string(u128_of_int(high) * 4294967296u128 + u128_of_int(low)) }
+}
+
+// Decimal, or `0x` and hexadecimal.
+fn parse_u64(s: String) -> Option<U64> =
+  if string_starts_with(s, "0x") || string_starts_with(s, "0X") {
+    let digits = string_slice(s, 2, string_len(s));
+    if digits == "" || string_len(digits) > 16 { None } else { digits_value(digits, 16) }
+  } else if s == "" { None }
+  else { digits_value(s, 10) }
+
+fn digits_value(s: String, radix: Int) -> Option<U64> =
+  fold(code_points_of(s), Some(0u64), |acc: Option<U64>, c: Int|
+    match acc {
+      None -> None,
+      Some(n) -> match digit(c, radix) {
+        None -> None,
+        Some(d) -> match checked_mul(n, u64_of_int(radix)) {
+          None -> None,
+          Some(m) -> checked_add(m, u64_of_int(d)),
+        },
+      },
+    })
+
+fn code_points_of(s: String) -> List<Int> =
+  map(range(0, bytes_len(bytes_of_string(s))), |i: Int| bytes_at(bytes_of_string(s), i))
+
+fn digit(c: Int, radix: Int) -> Option<Int> = {
+  let d = if c >= 48 && c <= 57 { c - 48 }
+  else if c >= 97 && c <= 102 { c - 87 }
+  else if c >= 65 && c <= 70 { c - 55 }
+  else { 99 };
+  if d < radix { Some(d) } else { None }
+}
+
+// --- Plans ------------------------------------------------------------------------
+
+// One interleaving, the one the seed names; one per root; or a search over the schedules that
+// could change an answer.
+pub type Mode = | Once | Random | Dpor
+
+pub fn mode_word(m: Mode) -> String = match m { Once -> "once", Random -> "random", Dpor -> "dpor" }
+
+pub fn parse_mode(s: String) -> Option<Mode> =
+  if s == "once" { Some(Once) }
+  else if s == "random" { Some(Random) }
+  else if s == "dpor" { Some(Dpor) }
+  else { None }
+
+// Whether a root's exploration is independent claims, one per seed.
+pub fn caches_per_seed(m: Mode) -> Bool = m == Random
+
+// `roots` ascending and once each after `normalized`; `budget` interleavings per root, `steps`
+// scheduling steps per interleaving, and `path` the fixed choices under `Once`.
+pub type Plan = { mode: Mode, roots: List<U64>, budget: Int, steps: Int, path: List<Int> }
+
+pub fn default_budget() -> Int = 256
+
+pub fn default_steps() -> Int = 100000
+
+pub fn default_random_roots() -> Int = 64
+
+pub fn default_plan() -> Plan =
+  { mode: Dpor, roots: [0u64], budget: default_budget(), steps: default_steps(), path: [] }
+
+pub fn once(seed: Seed) -> Plan =
+  { mode: Once, roots: [seed.root], budget: 1, steps: default_steps(), path: seed.path }
+
+pub fn random(roots: Int) -> Plan =
+  {
+    mode: Random,
+    roots: map(range(0, roots), |r: Int| u64_of_int(r)),
+    budget: 1,
+    steps: default_steps(),
+    path: [],
+  }
+
+// Ascending roots once each, at least one; a budget and steps of at least one; no path outside `Once`.
+pub fn normalized(p: Plan) -> Plan = {
+  let sorted = fold(p.roots, [], |acc: List<U64>, r: U64| inserted(acc, r));
+  {
+    mode: p.mode,
+    roots: if len(sorted) == 0 { [0u64] } else { sorted },
+    budget: max(p.budget, 1),
+    steps: max(p.steps, 1),
+    path: if p.mode == Once { p.path } else { [] },
+  }
+}
+
+fn inserted(xs: List<U64>, r: U64) -> List<U64> = {
+  let below = filter(xs, |x: U64| x < r);
+  if len(below) < len(xs) && list_at(xs, len(below)) == Some(r) { xs }
+  else { fold(filter(xs, |x: U64| x > r), push(below, r), |acc: List<U64>, x: U64| push(acc, x)) }
+}
+
+pub fn seeds(p: Plan) -> List<Seed> = map(p.roots, |r: U64| { root: r, path: p.path })
+
+// Whether a plan runs a test more than once.
+pub fn re_executes(p: Plan) -> Bool = {
+  let n = normalized(p);
+  let per_root = match n.mode { Dpor -> n.budget, _ -> 1 };
+  len(n.roots) * per_root > 1
+}
+
+// What a run's simulation flags ask for. A seed names one interleaving; otherwise the mode searches
+// `roots`, or as many from 0 as the mode runs by default.
+pub type Asked = {
+  seed: Option<Seed>,
+  mode: Mode,
+  roots: Option<{ from: Int, to: Int }>,
+  budget: Option<Int>,
+  steps: Option<Int>,
+}
+
+pub fn asked_plan(a: Asked) -> Plan = {
+  let steps = match a.steps { Some(n) -> n, None -> default_steps() };
+  match a.seed {
+    Some(seed) -> normalized({ ..once(seed), steps: steps }),
+    None -> {
+      let roots = match a.roots {
+        Some(r) -> range(r.from, r.to),
+        None -> range(0, match a.mode { Random -> default_random_roots(), _ -> 1 }),
+      };
+      normalized({
+        mode: a.mode,
+        roots: map(roots, |r: Int| u64_of_int(r)),
+        budget: match a.mode {
+          Dpor -> match a.budget { Some(b) -> b, None -> default_budget() },
+          _ -> 1,
+        },
+        steps: steps,
+        path: [],
+      })
+    },
+  }
+}
+
+test "the flags name a plan: a seed one interleaving, a mode its default roots" {
+  let none = { seed: None, mode: Dpor, roots: None, budget: None, steps: None };
+  assert_eq(asked_plan(none), default_plan());
+  assert_eq(asked_plan({ ..none, mode: Random }).roots, map(range(0, 64), |r: Int| u64_of_int(r)));
+  assert_eq(asked_plan({ ..none, mode: Random, budget: Some(9) }).budget, 1);
+  assert_eq(
+    asked_plan({ ..none, roots: Some({ from: 2, to: 4 }), budget: Some(9), steps: Some(10) }),
+    { mode: Dpor, roots: [2u64, 3u64], budget: 9, steps: 10, path: [] },
+  );
+  assert_eq(asked_plan({ ..none, seed: Some({ root: 7u64, path: [1] }) }), {
+    mode: Once,
+    roots: [7u64],
+    budget: 1,
+    steps: default_steps(),
+    path: [1],
+  })
+}
+
+test "every flag that widens the search names another plan, so it reaches a seeded test's key" {
+  let none = { seed: None, mode: Dpor, roots: None, budget: None, steps: None };
+  let plans = [
+    asked_plan(none),
+    asked_plan({ ..none, roots: Some({ from: 0, to: 2 }) }),
+    asked_plan({ ..none, roots: Some({ from: 1, to: 2 }) }),
+    asked_plan({ ..none, budget: Some(1) }),
+    asked_plan({ ..none, steps: Some(1) }),
+    asked_plan({ ..none, mode: Random }),
+    asked_plan({ ..none, seed: Some(root_seed(0u64)) }),
+  ];
+  fold(range(0, len(plans)), (), |_u: Unit, i: Int|
+    fold(range(0, len(plans)), (), |_v: Unit, j: Int|
+      if i < j { assert(list_at(plans, i) != list_at(plans, j)) } else { () }));
+  // A replay keeps the step bound, the one search flag `--seed` leaves alone.
+  assert_eq(asked_plan({ ..none, seed: Some(root_seed(7u64)), steps: Some(64) }).steps, 64)
+}
+
+test "a seed is written as its root and its path, and reads back" {
+  let s = { root: 7u64, path: [3, 0, 2] };
+  assert_eq(seed_text(s), "7:3.0.2");
+  assert_eq(parse_seed("7:3.0.2"), Some(s));
+  assert_eq(parse_seed("0x10"), Some(root_seed(16u64)));
+  assert_eq(parse_seed("18446744073709551615"), Some(root_seed(18446744073709551615u64)));
+  assert_eq(seed_text(root_seed(18446744073709551615u64)), "18446744073709551615");
+  assert_eq(parse_seed("7:"), None);
+  assert_eq(parse_seed("7:65536"), None);
+  assert_eq(parse_seed(""), None);
+  assert_eq(branch(s, 1, 4), { root: 7u64, path: [3, 4] });
+  assert_eq(branch(root_seed(1u64), 2, 1), { root: 1u64, path: [0, 0, 1] })
+}
+
+test "a seed's bytes name the root, the path's length and each choice" {
+  assert_eq(
+    seed_bytes({ root: 1u64, path: [2] }),
+    b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00",
+  );
+  assert(seed_bytes({ root: 1u64, path: [] }) != seed_bytes({ root: 1u64, path: [0] }))
+}
+
+test "a normalized plan runs each root once, in order, and keeps a path only to replay one seed" {
+  let p = normalized({ mode: Dpor, roots: [3u64, 1u64, 3u64], budget: 0, steps: 0, path: [1] });
+  assert_eq(p, { mode: Dpor, roots: [1u64, 3u64], budget: 1, steps: 1, path: [] });
+  assert_eq(normalized({ ..p, roots: [] }).roots, [0u64]);
+  assert(re_executes(default_plan()));
+  assert(!re_executes(once(root_seed(5u64))));
+  assert(re_executes(random(2)))
+}

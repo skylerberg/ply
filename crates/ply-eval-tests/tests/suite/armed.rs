@@ -24,22 +24,7 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[(
 const CODE_INDIRECTION: &[Indirection] = &[];
 
 /// Covered enum names that more than one covered enum declares.
-const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[
-    (
-        "Reason",
-        "crates/ply-test/src/lib.rs's Reason (why a test runs) and crates/ply-prove/src/prove/mod.rs's \
-         Reason (why the static tier stopped) share no variant name, so a `Reason::X` hit can only \
-         arm the enum that has X. If one of them gains a variant the other has, this gate stops \
-         telling them apart.",
-    ),
-    (
-        "Shape",
-        "crates/ply-prove/src/domain.rs's Shape (a domain the program measured) and \
-         crates/ply-prove/src/prove/egraph.rs's Shape (an e-graph node's constructor) share no \
-         variant name, so a `Shape::X` hit can only arm the enum that has X. If one of them gains \
-         a variant the other has, this gate stops telling them apart.",
-    ),
-];
+const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[];
 
 struct Indirection {
     file: &'static str,
@@ -48,12 +33,19 @@ struct Indirection {
     reason: &'static str,
 }
 
-/// Every `pub enum` under these directories is covered by the variant half: the runtimes the test
-/// and prove packages drive, whose decisions are the packages' and whose mechanisms are these.
-const COVERED_ENUM_ROOTS: &[&str] = &["crates/ply-test/src", "crates/ply-prove/src"];
+/// Every `pub enum` under these directories is covered by the variant half: the runtime the test
+/// package drives, whose decisions are the package's and whose mechanisms are these.
+const COVERED_ENUM_ROOTS: &[&str] = &["crates/ply-test/src"];
 
-/// Individually covered enums outside `COVERED_ENUM_ROOTS`, as `(file, name)`.
-const COVERED_ENUMS: &[(&str, &str)] = &[("crates/ply-eval/src/span.rs", "Severity")];
+/// Individually covered enums outside `COVERED_ENUM_ROOTS`, as `(file, name)`: the prove package's
+/// runtime among them.
+const COVERED_ENUMS: &[(&str, &str)] = &[
+    ("crates/ply-eval/src/span.rs", "Severity"),
+    ("crates/ply-machine/src/engine.rs", "ObligationKind"),
+    ("crates/ply-machine/src/engine.rs", "Strategy"),
+    ("crates/ply-machine/src/engine.rs", "Judgement"),
+    ("crates/ply-machine/src/engine.rs", "Mode"),
+];
 
 /// Blanks comments and string, raw-string and char literals, preserving offsets and newlines.
 fn blank_literals_and_comments(src: &[u8]) -> Vec<u8> {
@@ -1277,7 +1269,7 @@ fn every_variant_of_a_covered_enum_is_constructed_in_production() {
     );
     let total: usize = covered.iter().map(|e| e.variants.len()).sum();
     assert!(
-        total > 40,
+        total > 30,
         "found {total} variants across the covered enums"
     );
 

@@ -643,6 +643,38 @@ it and the function's result and everything evaluated before it is pure:
   position; after an impure argument (`g(h(x), k(x)?)`); or in a nested block.
   Bind the value first.
 
+### 5.9 `parallel`
+
+```ply
+fn both(xs: List<Int>) -> (Int, Int) =
+  parallel { fold(xs, 0, |a: Int, x: Int| a + x), len(filter(xs, |x: Int| x > 0)) }
+```
+
+`parallel { a, b, .. }` answers the tuple `(a, b, ..)` and means exactly that:
+the branches evaluated left to right. The runtime runs them at once, on threads
+of its own, wherever that cannot change the answer: the checker admits a block
+only when no two branches' rows conflict (§6.2), cells of a region opened
+outside the block included, so a branch reads nothing another writes. It takes
+two or more branches, and `parallel` is a name wherever no `{` follows it.
+
+* The block's row is the union of its branches'; it is as deterministic as they
+  are, so a deterministic test may hold one, and its result may be cached.
+* The leftmost failing branch is the block's failure, whichever failed first.
+  A branch to its right may already have performed its effects.
+* The branches spend one step budget between them (`E0503`, §8.4), as they would
+  in turn.
+* A block whose branches could reach a `handle` around it or a `simulate` region
+  (§9) runs them in turn, which answers the same. So does one whose branches
+  hold a cell, a task or a continuation. Under `--host` each branch waits on a
+  reactor of its own.
+* `E0309`: two branches perform operations of one effect on one resource, one
+  of them a `write`; or a branch's row is open (it calls a function value whose
+  row is a variable) while another performs anything; or a branch opens a
+  `simulate` region or performs a `task` operation, since a task belongs to the
+  scheduler of the thread that spawned it. `E0118`: a `?` inside a branch.
+
+`std.parallel` (§13.36) splits a list across nested blocks.
+
 ## 6. Effects and handlers
 
 ### 6.1 Declaring an effect
@@ -709,7 +741,9 @@ label and talk upstream under another, over one serve loop and one writer
 (§13.1, §13.2).
 
 Two atoms **conflict** iff they name the same resource of the same effect and
-one is a `write`.
+one is a `write`. A label parameter or `[*]` may be any label, so it conflicts
+with every label of its effect. `parallel` (§5.9) and the test scheduler (§8.4)
+both decide by this.
 
 ### 6.3 Performing
 
@@ -886,9 +920,11 @@ effect, or write `test/nondet "label" { ... }`, which is never cached.
 
 ### 8.4 Scheduling and failures
 
-Tests whose footprints do not conflict run concurrently; a test whose effects
-are all discharged in a region conflicts with nothing. `--jobs N`/`-j` sets
-workers (default one per core).
+Tests whose footprints do not conflict run concurrently, under `parallel`
+blocks (§5.9) on one thread per core; a test whose effects are all discharged in
+a region conflicts with nothing. `--jobs N`/`-j` deals them into `N` lanes, each
+lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
+claims' points the same way.
 
 `--steps N` is the calls each test may make (default 1000000000; `0` is no
 bound); a test past it fails with `E0503`, which is a program error like any
@@ -997,6 +1033,9 @@ effect sim           { read  seed() -> Int }
   `simulate`. `E0425`: a host operation inside the region, refused before the
   handler runs and whether or not it is bound; the region answers `task`,
   `clock`, `random` and `sim.seed` itself.
+* A `parallel` block (§5.9) inside a region runs its branches in turn, so the
+  scheduler sees nothing of it. A branch may not open a region (`E0309`): a
+  region's schedule is drawn from its entry's seed in the order regions open.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -1202,6 +1241,7 @@ Strings are indexed by character, bytes by byte.
 | `bytes_slice(b: Bytes, start: Int, end: Int) -> Bytes` | |
 | `bytes_concat(a: Bytes, b: Bytes) -> Bytes` | `a ++ b` |
 | `bytes_concat_all(bs: List<Bytes>) -> Bytes` | one allocation |
+| `bytes_blake3(b: Bytes) -> Bytes` | the 32-byte BLAKE3 digest |
 | `byte_of_int(n: Int) -> Bytes` | raises outside `0..=255` |
 | `bytes_of_string(s: String) -> Bytes` | |
 | `string_of_bytes(b: Bytes) -> String` | raises on invalid UTF-8 |
@@ -1768,10 +1808,10 @@ pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int) -> Bytes
 bytes, which is the salted password SCRAM asks for and the only length anything
 here needs.
 
-All of it is written in Ply, and the vectors the SHA-256 standard and RFC 4231
-publish are the tests. It is slow — a compression round walks a list of words
-rather than living in scalars — so use it for small inputs: a key, a proof, a
-nonce, not a file.
+`blake3` is the `bytes_blake3` builtin. The SHA-256 family is written in Ply, and
+the vectors the SHA-256 standard and RFC 4231 publish are the tests. It is slow —
+a compression round walks a list of words rather than living in scalars — so use
+it for small inputs: a key, a proof, a nonce, not a file.
 
 ### 13.14 `std.bytes`
 
@@ -2438,6 +2478,8 @@ pub type Fun =
   | FTable({ arity: Int, entries: List<Entry>, default: Value })
 pub fn render(v: Value) -> String
 pub fn filled(text: String, values: List<Value>) -> String
+pub fn order(a: Value, b: Value) -> Ordering
+pub fn map_of(entries: List<Entry>) -> Value
 pub fn shown_items() -> Int
 pub fn shown_depth() -> Int
 ```
@@ -2450,7 +2492,26 @@ and a credential shows as `Secret(****)`. A fixed width holds the bit pattern it
 reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
 a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
 and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each
-value a runtime diagnostic's text names in its place.
+value a runtime diagnostic's text names in its place. `order` is the order the
+runtime keeps values in (by kind, then by payload), which is a map's key order,
+and `map_of` builds a `VMap` in that order, a later entry for a key replacing an
+earlier one.
+
+### 13.36 `std.parallel`
+
+```ply
+pub fn grain() -> Int
+pub fn par_map<a, b>(xs: List<a>, f: (a) -> b) -> List<b>
+pub fn par_fold<a, b>(xs: List<a>, zero: b, step: (b, a) -> b, merge: (b, b) -> b) -> b
+```
+
+A list is cut in halves, each pair under a `parallel` block (§5.9), until a
+piece holds `grain()` items; the pieces are the same on every run, however many
+threads there are. `par_map` answers what `map` answers. `par_fold` folds each
+piece from `zero` with `step` and merges the pieces' answers left to right: it
+is `fold(xs, zero, step)` when `merge` is associative, `zero` is its identity
+and `step(b, x)` is `merge(b, step(zero, x))`, as for a sum or a list. `f`,
+`step` and `merge` are pure.
 
 ## 14. The host boundary
 
@@ -2826,6 +2887,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
 | `E0307` | mutually recursive definitions binding different label or row parameters |
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
+| `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
@@ -2887,7 +2949,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   variables; no exceptions; no typeclasses, implicits or method syntax; no
   modules-as-values or first-class effects; no `unsafe` or FFI.
 * Specs cannot name mutable state. Cycles are not collected, and a task never
-  moves between OS threads.
+  moves between OS threads; only a `parallel` block's branches run on threads
+  of the runtime's own.
 * No file handles — `fs` reads a range and appends by path, with nothing open
   between calls — and no recursive walk or permissions; no cancellation or
   backpressure; no migrations or live schema check; HTTP/1.1 only; no

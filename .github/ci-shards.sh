@@ -70,6 +70,7 @@ CORPUS_BY_TEST=(audit generated toolchain)
 # the log, where a Rust test wrapping the run would report one failure for all of them.
 PACKAGE_SUITES=(
   "prove:crates/ply-prove/ply"
+  "sim:crates/ply-sim/ply"
   "suite:crates/ply-test/ply"
 )
 

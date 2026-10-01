@@ -8,5 +8,4 @@ mod load;
 mod migrate;
 mod payload;
 mod policy;
-mod simulation;
 mod warm;

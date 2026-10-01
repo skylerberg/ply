@@ -1,0 +1,202 @@
+// `goal` — what the static prover is asked, what it may spend, and the steps `decide` and
+// `induct` share: the range of every `Int` atom, conjunction, and one refutation on a budget.
+
+import compiler.code (Code)
+import context (Context, inhabited, reaches_float)
+import domain (Ty)
+import rules (RuleLog, Rule)
+import solve (Solver, Answer, Closed, refute)
+import sort (bool_ty, is_con, vars)
+import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFixed, TUnit, TSym, TOpaque, TLin,
+             TApp, TCtor, TNil, TCons, TRecord, TField, TNot, TAnd, TOr, TCmp, TEq, TIf, TMatch,
+             Mono, Arm, TestLit, Ge, Le, size, node, sort_of, int_lit, cmp, and, op_add, op_sub,
+             op_mul, op_div, op_rem, op_concat, op_bit_and, op_bit_or, op_bit_xor, op_bit_not,
+             op_shl, op_shr, op_ushr)
+
+pub type Binder = { name: String, ty: Ty }
+
+// Binder `i` is slot `i` of every clause's window. For an `ensures`: the owner's parameters then
+// `result`, the guards are the `requires` beside it, and `result` is the definition's body; for a
+// law: its `forall` binders and its `where`.
+pub type Goal = {
+  binders: List<Binder>,
+  guards: List<Option<Code>>,
+  result: Option<Option<Code>>,
+  body: Option<Code>,
+}
+
+// `steps` is charged per obligation.
+pub type Limits = { steps: Int, unfold_depth: Int, split_depth: Int }
+
+pub fn default_prove_budget() -> Int = 10000
+
+pub fn default_unfold_depth() -> Int = 3
+
+pub fn default_limits() -> Limits =
+  { steps: default_prove_budget(), unfold_depth: default_unfold_depth(), split_depth: 48 }
+
+pub type Reason = | Open | BudgetSpent
+
+// `rules` in application order; `sorts` the type variables left as uninterpreted sorts, ascending;
+// `guard_satisfiable` when there is no guard, or a valid one over an inhabited domain.
+pub type Proof = { rules: List<Rule>, steps: Int, sorts: List<Int>, guard_satisfiable: Bool }
+
+pub type Assertion = { term: Int, polarity: Bool }
+
+// A refutation's store and log after it ran, what it came to, and the budget it left.
+pub type Ran = { ts: Terms, rules: RuleLog, answer: Answer, left: Int }
+
+pub fn run(
+  ts: Terms,
+  cx: Context,
+  rules: RuleLog,
+  budget: Int,
+  limits: Limits,
+  assertions: List<Assertion>,
+) -> Ran = {
+  let r = refute(
+    { ts: ts, rules: rules, budget: budget, split_depth: limits.split_depth, cx: cx },
+    assertions,
+  );
+  { ts: r.sv.ts, rules: r.sv.rules, answer: r.answer, left: r.sv.budget }
+}
+
+pub fn conjunction(ts: Terms, guards: List<Int>) -> { ts: Terms, id: Option<Int> } =
+  fold(guards, { ts: ts, id: None }, |acc: { ts: Terms, id: Option<Int> }, g: Int|
+    match acc.id {
+      None -> { ts: acc.ts, id: Some(g) },
+      Some(previous) -> {
+        let m = and(acc.ts, previous, g);
+        { ts: m.ts, id: Some(m.id) }
+      },
+    })
+
+pub fn domain_inhabited(cx: Context, binders: List<Binder>) -> Bool =
+  fold(binders, true, |ok: Bool, b: Binder| ok && inhabited(cx, b.ty))
+
+// The binders' variables, by number, ascending.
+pub fn uninterpreted_sorts(binders: List<Binder>) -> List<Int> = {
+  let found = fold(binders, [], |acc: List<Int>, b: Binder| vars(b.ty, acc));
+  fold(found, [], |acc: List<Int>, v: Int| {
+    let before = filter(acc, |x: Int| x < v);
+    let after = filter(acc, |x: Int| x > v);
+    fold(after, push(before, v), |a: List<Int>, x: Int| push(a, x))
+  })
+}
+
+pub fn float_in(cx: Context, ts: Terms) -> Bool =
+  fold(range(0, size(ts)), false, |f: Bool, t: Int|
+    f || (match sort_of(ts, t) { Some(s) -> reaches_float(cx, s), None -> false }))
+
+// `MIN ≤ t ≤ MAX` for every term that denotes a Ply `Int` whenever it is defined: every `Int` atom,
+// except the ones in `skip`, a call whose value is in question.
+pub fn int_ranges(
+  ts: Terms,
+  computed: Option<Int>,
+  skip: Map<Int, Bool>,
+) -> { ts: Terms, out: List<Assertion> } = {
+  let derived = derived_from(ts, computed);
+  let atoms = filter(range(0, size(ts)), |t: Int|
+    list_at(derived, t) != Some(true) && !map_contains(skip, t)
+      && (match node(ts, t) {
+        TSym(_) -> true,
+        TField(_) -> true,
+        TApp(a) -> match node(ts, a.head) { TOpaque(name) -> !is_operator_symbol(name), _ -> true },
+        _ -> false,
+      })
+      && (match sort_of(ts, t) { Some(s) -> is_con(s, "Int"), None -> false }));
+  ranges_of(ts, atoms)
+}
+
+// `Int` atoms lie in the 64 bits; a `len` in `[0, MAX)`, since no list has that many elements.
+pub fn ranges_of(ts: Terms, candidates: List<Int>) -> { ts: Terms, out: List<Assertion> } = {
+  let atoms = filter(candidates, |a: Int|
+    match sort_of(ts, a) { Some(s) -> is_con(s, "Int"), None -> false });
+  let min = int_lit(ts, 0 - 9223372036854775807 - 1);
+  let max = int_lit(min.ts, 9223372036854775807);
+  let zero = int_lit(max.ts, 0);
+  let below_max = int_lit(zero.ts, 9223372036854775806);
+  fold(atoms, { ts: below_max.ts, out: [] }, |acc: { ts: Terms, out: List<Assertion> }, a: Int| {
+    let length = is_length(acc.ts, a);
+    let low = cmp(acc.ts, Ge, a, if length { zero.id } else { min.id });
+    let high = cmp(low.ts, Le, a, if length { below_max.id } else { max.id });
+    {
+      ts: high.ts,
+      out: push(push(acc.out, { term: low.id, polarity: true }), { term: high.id, polarity: true }),
+    }
+  })
+}
+
+fn is_length(ts: Terms, t: Int) -> Bool =
+  match node(ts, t) {
+    TApp(a) -> match node(ts, a.head) { TOpaque(name) -> name == "len", _ -> false },
+    _ -> false,
+  }
+
+// Terms containing `root`, in one pass: the store makes children before their parents.
+pub fn derived_from(ts: Terms, root: Option<Int>) -> List<Bool> =
+  match root {
+    None -> map(range(0, size(ts)), |_: Int| false),
+    Some(r) ->
+      fold(
+        range(0, size(ts)),
+        map(range(0, size(ts)), |t: Int| t == r),
+        |out: List<Bool>, t: Int|
+          if list_at(out, t) == Some(true) { out }
+          else if fold(children(node(ts, t)), false, |f: Bool, c: Int|
+              f || list_at(out, c) == Some(true)) { list_set(out, t, true) }
+          else { out },
+      ),
+  }
+
+pub fn children(n: Node) -> List<Int> =
+  match n {
+    TLin(p) -> map(p.monomials, |m: Mono| m.term),
+    TApp(a) -> fold(a.args, [a.head], |acc: List<Int>, x: Int| push(acc, x)),
+    TCtor(c) -> c.args,
+    TCons(c) -> [c.head, c.tail],
+    TRecord(fields) -> map(fields, |f: { name: String, value: Int }| f.value),
+    TField(f) -> [f.base],
+    TNot(a) -> [a],
+    TAnd(a, b) -> [a, b],
+    TOr(a, b) -> [a, b],
+    TCmp(c) -> [c.lhs, c.rhs],
+    TEq(e) -> [e.lhs, e.rhs],
+    TIf(i) -> [i.cond, i.then_branch, i.else_branch],
+    TMatch(m) ->
+      fold(m.arms, [m.scrutinee], |acc: List<Int>, arm: Arm| {
+        let with_body = push(fold(arm.binds, acc, |a: List<Int>, x: Int| push(a, x)), arm.body);
+        match arm.test { TestLit(literal) -> push(with_body, literal), _ -> with_body }
+      }),
+    _ -> [],
+  }
+
+// The heads `int_ranges` declines to call atoms: a shift has a value only at some counts.
+fn is_operator_symbol(name: String) -> Bool =
+  fold(
+    [
+      op_add(),
+      op_sub(),
+      op_mul(),
+      op_div(),
+      op_rem(),
+      op_concat(),
+      op_bit_and(),
+      op_bit_or(),
+      op_bit_xor(),
+      op_bit_not(),
+      op_shl(),
+      op_shr(),
+      op_ushr(),
+    ],
+    false,
+    |f: Bool, op: String| f || op == name,
+  )
+
+pub fn set_of(xs: List<Int>) -> Map<Int, Bool> =
+  fold(xs, map_new(), |m: Map<Int, Bool>, x: Int| map_insert(m, x, true))
+
+pub fn with_true(ids: List<Int>) -> List<Assertion> = map(ids, |t: Int| { term: t, polarity: true })
+
+pub fn appended<a>(xs: List<a>, ys: List<a>) -> List<a> =
+  fold(ys, xs, |acc: List<a>, y: a| push(acc, y))

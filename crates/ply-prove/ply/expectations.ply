@@ -1,0 +1,1201 @@
+// `expectations` — what the static prover decides: every rule gets a true instance that is proved and
+// a false instance that is not.
+
+import compiler.code (Code)
+import compiler.diag (parse_all)
+import compiler.front (Whole, Analysed, Refused, ClaimClause, analyse, claims)
+import compiler.items (SEnsures, SRequires)
+import context (Context, Claims, Law, Def, claims_of, context, unfoldable)
+import decide (Decision, Proved, GuardUnsatisfiable, Unknown, Diagnosed, Static, Certified,
+               Unwitnessed, GuardRefuted, Undecided, static_of, decide, decide_and_diagnose)
+import domain (Ty, Fn)
+import goal (Goal, Binder, Limits, Proof, BudgetSpent, appended, default_limits,
+             default_unfold_depth)
+import lower (Blocker, BitOperator, FloatTerm, DecimalArithmetic)
+import rules (Rule, LinearArithmetic, Propositional, Congruence, Injectivity, CaseSplit, Unfold,
+              induction_rule)
+import sort (canonical, int_ty)
+import world
+import world (Built, Obligation, Signature, world_of)
+
+type Fixture = { cx: Context, built: Built, claims: Claims }
+
+fn every(m: Bytes) -> Bool = true
+
+fn fixture(src: String) -> Fixture = {
+  let sources = [{ name: b"m", src: bytes_of_string(src) }];
+  match analyse(parse_all(sources)) {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(w) -> {
+      let built = world_of(w, every);
+      let cs = claims_of(claims(sources));
+      { cx: context(cs, built.world), built: built, claims: cs }
+    },
+  }
+}
+
+fn owner(label: String) -> String = "m." ++ label
+
+fn source(lines: List<String>) -> String =
+  fold(lines, "", |acc: String, l: String| acc ++ l ++ "\n")
+
+fn law_goal(f: Fixture, label: String) -> Goal =
+  match map_get(f.claims.laws, owner(label)) {
+    None -> panic("no law labelled " ++ label),
+    Some(l) ->
+      {
+        binders: law_binders(f, label),
+        guards: match l.guard { Some(g) -> [g.code], None -> [] },
+        result: None,
+        body: l.body,
+      },
+  }
+
+fn law_binders(f: Fixture, label: String) -> List<Binder> =
+  match fold(f.built.world.obligations, None, |acc: Option<Obligation>, o: Obligation|
+      match acc { Some(_) -> acc, None -> if o.owner == owner(label) { Some(o) } else { None } }) {
+    Some(o) -> map(o.binders, |b: world::Binder| { name: b.name, ty: canonical(b.ty) }),
+    // A law with no binders owes no obligation row of its own.
+    None -> [],
+  }
+
+fn attempt(f: Fixture, label: String) -> Decision =
+  decide(f.cx, law_goal(f, label), default_limits())
+
+fn attempt_with(f: Fixture, label: String, limits: Limits) -> Decision =
+  decide(f.cx, law_goal(f, label), limits)
+
+fn diagnosed(f: Fixture, label: String) -> Diagnosed =
+  decide_and_diagnose(f.cx, law_goal(f, label), default_limits())
+
+fn proof(f: Fixture, label: String) -> Proof =
+  match diagnosed(f, label) {
+    { decision: Proved(p), blockers: _ } -> p,
+    _ -> panic("`" ++ label ++ "` was expected to be proved"),
+  }
+
+fn not_proved(f: Fixture, label: String) -> Bool =
+  match attempt(f, label) { Proved(_) -> false, _ -> true }
+
+fn is_proved(f: Fixture, label: String) -> Bool =
+  match attempt(f, label) { Proved(_) -> true, _ -> false }
+
+fn vacuous(d: Decision) -> Bool = match d { GuardUnsatisfiable(_) -> true, _ -> false }
+
+fn uses(p: Proof, r: Rule) -> Bool = fold(p.rules, false, |f: Bool, x: Rule| f || x == r)
+
+test "linear arithmetic decides both directions" {
+  let f = fixture(arithmetic());
+  assert(uses(proof(f, "bounded positives sum past one"), LinearArithmetic));
+  assert(not_proved(f, "bounded positives sum past two"));
+  assert(is_proved(f, "bounded doubling is adding"));
+  assert(is_proved(f, "bounded subtraction inverts"));
+  assert(is_proved(f, "ordering is transitive"));
+  assert(not_proved(f, "ordering skips two"))
+}
+
+test "an int is bounded by its own width" {
+  assert(is_proved(fixture(arithmetic()), "an int is not below the smallest"))
+}
+
+test "arithmetic that can leave Int is not proved" {
+  let f = fixture(arithmetic());
+  let pairs = [
+    { unbounded: "a successor is larger", bounded: "a bounded successor is larger" },
+    { unbounded: "positives sum past one", bounded: "bounded positives sum past one" },
+    { unbounded: "doubling is adding", bounded: "bounded doubling is adding" },
+    { unbounded: "subtraction inverts", bounded: "bounded subtraction inverts" },
+  ];
+  assert(
+    fold(pairs, true, |ok: Bool, p: { unbounded: String, bounded: String }|
+      ok && not_proved(f, p.unbounded) && is_proved(f, p.bounded)),
+  )
+}
+
+test "a quotient is a value only where its divisor is not zero" {
+  let f = fixture(arithmetic());
+  assert(not_proved(f, "a symbolic quotient is a function"));
+  assert(is_proved(f, "a nonzero quotient is a function"));
+  // `0` never has an answer, and `-1` has one everywhere except `Int`'s least value.
+  assert(not_proved(f, "remainder by zero is a function"));
+  assert(not_proved(f, "dividing by minus one is a function"));
+  assert(is_proved(f, "dividing a bounded value by minus one"))
+}
+
+test "strict inequalities are tightened to the integers" {
+  let f = fixture(arithmetic());
+  assert(is_proved(f, "a strict bound is a tight bound"));
+  assert(not_proved(f, "a strict bound is tighter still"));
+  assert(is_proved(f, "ordering skips one"))
+}
+
+test "multiplication by a symbolic is not arithmetic" {
+  assert(not_proved(fixture(arithmetic()), "multiplication commutes"))
+}
+
+test "division is uninterpreted in both directions" {
+  let f = fixture(arithmetic());
+  assert(not_proved(f, "halves are wholes"));
+  assert(not_proved(f, "dividing by one"));
+  // Uninterpreted is not unknown: congruence still applies to it.
+  assert(is_proved(f, "division is a function"));
+  assert(is_proved(f, "remainder is a function"))
+}
+
+test "an unsatisfiable guard is vacuous and never proved" {
+  assert(vacuous(attempt(fixture(arithmetic()), "an integer between")))
+}
+
+test "a satisfiable guard is never vacuous however narrow" {
+  let f = fixture(arithmetic());
+  assert(!vacuous(attempt(f, "a domain of one point")));
+  assert(!vacuous(attempt(f, "a domain of one wrong point")));
+  assert(is_proved(f, "a domain of one point"));
+  assert(not_proved(f, "a domain of one wrong point"))
+}
+
+test "two operators that overflowed are not one term" {
+  let f = fixture(boundaries());
+  assert(not_proved(f, "an overflowing sum is an overflowing product"));
+  assert(not_proved(f, "an overflowing difference is an overflowing product"));
+  // `MAX + MAX` raises, so congruence's reflexivity is about a value never computed.
+  assert(not_proved(f, "an overflowing sum is itself"))
+}
+
+test "arithmetic is proved only where the result is an Int" {
+  let f = fixture(boundaries());
+  assert(not_proved(f, "adding one grows"));
+  assert(not_proved(f, "a round trip past the boundary"));
+  assert(is_proved(f, "a bounded round trip"))
+}
+
+fn arithmetic() -> String =
+  source([
+    "law \"a successor is larger\" forall (x: Int) { x + 1 > x }",
+    "law \"a bounded successor is larger\" forall (x: Int) where x < 100 { x + 1 > x }",
+    "law \"a successor is smaller\" forall (x: Int) { x + 1 > x + 2 }",
+    "law \"positives sum past one\" forall (x: Int, y: Int) where x > 0 && y > 0 { x + y > 1 }",
+    "law \"bounded positives sum past one\" forall (x: Int, y: Int)",
+    "  where x > 0 && y > 0 && x < 1000 && y < 1000 { x + y > 1 }",
+    "law \"positives sum past two\" forall (x: Int, y: Int) where x > 0 && y > 0 { x + y > 2 }",
+    "law \"bounded positives sum past two\" forall (x: Int, y: Int)",
+    "  where x > 0 && y > 0 && x < 1000 && y < 1000 { x + y > 2 }",
+    "law \"doubling is adding\" forall (x: Int) { 2 * x == x + x }",
+    "law \"bounded doubling is adding\" forall (x: Int) where x > -1000 && x < 1000",
+    "  { 2 * x == x + x }",
+    "law \"multiplication commutes\" forall (x: Int, y: Int) { x * y == y * x }",
+    "law \"subtraction inverts\" forall (x: Int, y: Int) { x + y - y == x }",
+    "law \"bounded subtraction inverts\" forall (x: Int, y: Int)",
+    "  where x > -1000 && x < 1000 && y > -1000 && y < 1000 { x + y - y == x }",
+    "law \"ordering is transitive\" forall (x: Int, y: Int, z: Int) where x < y && y < z { x < z }",
+    "law \"ordering skips one\" forall (x: Int, y: Int, z: Int) where x < y && y < z { x < z - 1 }",
+    "law \"ordering skips two\" forall (x: Int, y: Int, z: Int) where x < y && y < z { x < z - 2 }",
+    "law \"a strict bound is a tight bound\" forall (x: Int, y: Int) where x < y { x + 1 <= y }",
+    "law \"a strict bound is tighter still\" forall (x: Int, y: Int) where x < y { x + 2 <= y }",
+    "law \"an integer between\" forall (x: Int) where x > 0 && x < 1 { x == 100 }",
+    "law \"a domain of one point\" forall (x: Int) where x > 0 && x < 2 { x == 1 }",
+    "law \"a domain of one wrong point\" forall (x: Int) where x > 0 && x < 2 { x == 2 }",
+    "law \"halves are wholes\" forall (x: Int) { x / 2 * 2 == x }",
+    "law \"dividing by one\" forall (x: Int) { x / 1 == x }",
+    "law \"division is a function\" forall (x: Int) { x / 2 == x / 2 }",
+    "law \"remainder is a function\" forall (x: Int, y: Int) where x == y { x % 3 == y % 3 }",
+    "law \"a symbolic quotient is a function\" forall (x: Int, y: Int) { x / y == x / y }",
+    "law \"a nonzero quotient is a function\" forall (x: Int, y: Int) where y > 0",
+    "  { x / y == x / y }",
+    "law \"an int is not below the smallest\" forall (x: Int)",
+    "  { x >= -9223372036854775807 - 1 }",
+    "law \"dividing by minus one is a function\" forall (x: Int) { x / -1 == x / -1 }",
+    "law \"dividing a bounded value by minus one\" forall (x: Int) where x > -100",
+    "  { x / -1 == x / -1 }",
+    "law \"remainder by zero is a function\" forall (x: Int) { x % 0 == x % 0 }",
+  ])
+
+fn boundaries() -> String =
+  source([
+    "law \"adding one grows\" forall (x: Int) { x + 1 > x }",
+    "law \"the largest int\" { 9223372036854775807 + 1 > 9223372036854775807 }",
+    "law \"a round trip past the boundary\" forall (x: Int)",
+    "  { x + 9223372036854775807 - 9223372036854775807 == x }",
+    "law \"a bounded round trip\" forall (x: Int) where x > -1000 && x < 1000",
+    "  { x + 1000 - 1000 == x }",
+    "law \"scaling past the boundary\" forall (x: Int)",
+    "  { x * 9223372036854775807 * 9223372036854775807 * 9223372036854775807 * 3 ==",
+    "    x * 9223372036854775807 * 9223372036854775807 * 9223372036854775807 * 3 }",
+    "law \"the smallest int is smallest\" forall (x: Int) { x >= -9223372036854775807 }",
+    "law \"an overflowing sum is an overflowing product\"",
+    "  { 9223372036854775807 + 9223372036854775807 ==",
+    "    9223372036854775807 * 9223372036854775807 }",
+    "law \"an overflowing difference is an overflowing product\"",
+    "  { -9223372036854775807 - 9223372036854775807 ==",
+    "    -9223372036854775807 * 9223372036854775807 }",
+    "law \"an overflowing sum is itself\" forall (x: Int)",
+    "  where x == 9223372036854775807 + 9223372036854775807",
+    "  { x == 9223372036854775807 + 9223372036854775807 }",
+  ])
+
+fn propositional() -> String =
+  source([
+    "law \"excluded middle\" forall (b: Bool) { b || !b }",
+    "law \"a bare disjunction\" forall (b: Bool, c: Bool) { b || c }",
+    "law \"disjunction commutes\" forall (b: Bool, c: Bool) where b || c { c || b }",
+    "law \"de morgan\" forall (b: Bool, c: Bool) { !(b && c) == (!b || !c) }",
+    "law \"de morgan mangled\" forall (b: Bool, c: Bool) { !(b && c) == (!b && !c) }",
+    "law \"a conditional picks a branch\" forall (b: Bool, x: Int)",
+    "  { if b { x } else { x } == x }",
+    "law \"a conditional is not constant\" forall (b: Bool, x: Int, y: Int)",
+    "  { if b { x } else { y } == x }",
+  ])
+
+fn congruence() -> String =
+  source([
+    "law \"a function is a function\" forall (f: (Int) -> Int, x: Int) { f(x) == f(x) }",
+    "law \"equal arguments agree\" forall (f: (Int) -> Int, x: Int, y: Int) where x == y",
+    "  { f(x) == f(y) }",
+    "law \"any two arguments agree\" forall (f: (Int) -> Int, x: Int, y: Int)",
+    "  { f(x) == f(y) }",
+    "law \"congruence is polymorphic\" forall (g: (a) -> b, u: a, v: a) where u == v",
+    "  { g(u) == g(v) }",
+    "law \"a record is its fields\" forall (n: Int) { { balance: n }.balance == n }",
+    "law \"records with equal fields are equal\" forall (n: Int, m: Int) where n == m",
+    "  { { balance: n } == { balance: m } }",
+    "law \"records with any fields are equal\" forall (n: Int, m: Int)",
+    "  { { balance: n } == { balance: m } }",
+    "",
+    "fn moved(account: { name: String, balance: Int }, amount: Int)",
+    "  -> { name: String, balance: Int }",
+    "= { name: account.name, balance: account.balance + amount }",
+    "",
+    "law \"a record rebuilt from its own fields is the record\"",
+    "  forall (a: { name: String, balance: Int }) {",
+    "    { name: a.name, balance: a.balance } == a",
+    "  }",
+    "law \"moving an account and moving it back is the account\"",
+    "  forall (a: { name: String, balance: Int }, n: Int)",
+    "  where n > -1000 && n < 1000 && a.balance > -1000 && a.balance < 1000 {",
+    "    moved(moved(a, n), 0 - n) == a",
+    "  }",
+    "law \"moving an unbounded account and back is the account\"",
+    "  forall (a: { name: String, balance: Int }, n: Int) {",
+    "    moved(moved(a, n), 0 - n) == a",
+    "  }",
+    "law \"moving an account leaves it where it was\"",
+    "  forall (a: { name: String, balance: Int }, n: Int) {",
+    "    moved(a, n) == a",
+    "  }",
+    "law \"one matching field is enough\"",
+    "  forall (a: { name: String, balance: Int }, b: { name: String, balance: Int })",
+    "  where a.name == b.name {",
+    "    a == b",
+    "  }",
+  ])
+
+fn shapes() -> String =
+  source([
+    "type Shape = Circle(Int) | Square(Int)",
+    "",
+    "law \"constructors are injective\" forall (a: Int, b: Int) where Circle(a) == Circle(b)",
+    "  { a == b }",
+    "law \"injective by one\" forall (a: Int, b: Int) where Circle(a) == Circle(b)",
+    "  { a == b + 1 }",
+    "law \"constructors are distinct\" forall (a: Int, b: Int) where Circle(a) == Square(b)",
+    "  { a == b + 1 }",
+    "law \"a rebuilt value is the same\" forall (a: Int) { Circle(a) == Circle(a) }",
+    "law \"two constructors are not\" forall (a: Int) { Circle(a) == Square(a) }",
+  ])
+
+fn rainbow() -> String =
+  source([
+    "type Colour = Red | Orange | Yellow | Green | Blue | Indigo | Violet | Black",
+    "",
+    "fn rank(c: Colour) -> Int = match c {",
+    "  Red -> 0,",
+    "  Orange -> 1,",
+    "  Yellow -> 2,",
+    "  Green -> 3,",
+    "  Blue -> 4,",
+    "  Indigo -> 5,",
+    "  Violet -> 6,",
+    "  Black -> 7,",
+    "}",
+    "",
+    "law \"every rank is in range\" forall (c: Colour) { rank(c) >= 0 && rank(c) <= 7 }",
+    "law \"every rank is small\" forall (c: Colour) { rank(c) <= 6 }",
+    "law \"no rank is seven\" forall (c: Colour) { rank(c) != 7 }",
+  ])
+
+fn chain() -> String =
+  source([
+    "fn one(x: Int) -> Int = x + 1",
+    "fn two(x: Int) -> Int = one(x) + 1",
+    "fn three(x: Int) -> Int = two(x) + 1",
+    "fn four(x: Int) -> Int = three(x) + 1",
+    "",
+    "fn countdown(n: Int) -> Int = if n <= 0 { 0 } else { countdown(n - 1) + 1 }",
+    "fn doubled(n: Int) -> Int = if n <= 0 { 0 } else { doubled(n - 1) + 2 }",
+    "fn forever(n: Int) -> Int = forever(n)",
+    "fn twice_down(n: Int) -> Int = if n <= 0 { 0 } else { twice_down(n - 2) + 2 }",
+    "fn topped(n: Int) -> Int = if n <= 0 { 9223372036854775807 } else { topped(n - 1) + 1 }",
+    "fn ping(n: Int) -> Int = if n <= 0 { 0 } else { pong(n - 1) + 1 }",
+    "fn pong(n: Int) -> Int = if n <= 0 { 0 } else { ping(n - 1) + 1 }",
+    "",
+    "law \"three unfoldings suffice\" forall (x: Int) where x > 0 && x < 1000",
+    "  { three(x) == x + 3 }",
+    "law \"four unfoldings do not\" forall (x: Int) where x > 0 && x < 1000",
+    "  { four(x) == x + 4 }",
+    "law \"a recursive call is a function\" forall (n: Int) { countdown(n) == countdown(n) }",
+    "law \"a recursive definition steps\" forall (n: Int) where n > 0",
+    "  { countdown(n) == countdown(n - 1) + 1 }",
+    "law \"counting down counts\" forall (n: Int) where n >= 0 { countdown(n) == n }",
+    "law \"doubling by recursion\" forall (n: Int) where n >= 0 && n < 1000000 { doubled(n) == 2 * n }",
+    "law \"counting down is not the identity\" forall (n: Int) { countdown(n) == n }",
+    "law \"counting down is never negative\" forall (n: Int) { countdown(n) >= 0 }",
+    "law \"a step off the top overflows\" forall (n: Int) where n >= 0 { topped(n + 1) == topped(n) + 1 }",
+    "law \"a definition that never returns is not a function\" forall (n: Int) { forever(n) == forever(n) }",
+    "law \"stepping by two counts\" forall (n: Int) where n >= 0 { twice_down(n) == n }",
+    "law \"a mutual recursion is not unrolled\" forall (n: Int) where n >= 0 { ping(n) == n }",
+  ])
+
+fn spines() -> String =
+  source([
+    "fn count<a>(xs: List<a>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + count(rest) }",
+    "fn total(xs: List<Int>) -> Int = match xs { [] -> 0, [x, ..rest] -> x + total(rest) }",
+    "fn spin(xs: List<Int>) -> Int = match xs { [] -> 0, [_, ..rest] -> spin(xs) }",
+    "fn count_from<a>(xs: List<a>, k: Int) -> Int = match xs { [] -> k, [_, ..rest] -> count_from(rest, k + 1) }",
+    "",
+    "law \"counting counts\" forall (xs: List<Int>) { count(xs) == len(xs) }",
+    "law \"a total is a total\" forall (xs: List<Int>) { total(xs) == total(xs) }",
+    "law \"a total of ints is non-negative\" forall (xs: List<Int>) { total(xs) >= 0 }",
+    "law \"a definition that keeps its list is not a function\" forall (xs: List<Int>) { spin(xs) == spin(xs) }",
+    "law \"counting from an accumulator counts\" forall (xs: List<Int>, k: Int) where k >= 0 && k < 1000 { count_from(xs, k) == len(xs) + k }",
+    "law \"a list pattern takes the head of a literal\" forall (x: Int) { match [x, 2] { [a, ..] -> a == x, [] -> false } }",
+    "law \"a list pattern does not confuse the tail\" forall (x: Int) { match [1, x] { [_, b] -> b == 1, _ -> false } }",
+    "law \"a pushed literal ends in what was pushed\" forall (x: Int) { match push([1], x) { [_, b] -> b == x, _ -> false } }",
+  ])
+
+fn effectful() -> String =
+  source([
+    "effect log { write note(n: Int) -> Unit }",
+    "effect counter { write next() -> Int }",
+    "",
+    "fn shout(n: Int) -> Int { log.note(n); n }",
+    "fn bump() -> Int = counter.next()",
+    "fn difference() -> Int ensures result == 0 = bump() - bump()",
+    "fn once() -> Int ensures result == 0 = { let n = counter.next(); n - n }",
+  ])
+
+fn matching() -> String =
+  source([
+    "fn flip(b: Bool) -> Bool = match b { true -> false, false -> true }",
+    "fn absolute(x: Int) -> Int = if x < 0 { 0 - x } else { x }",
+    "",
+    "type Pair = Pair(Int, Int)",
+    "fn left(p: Pair) -> Int = match p { Pair(a, _) -> a }",
+    "fn swap(p: Pair) -> Pair = match p { Pair(a, b) -> Pair(b, a) }",
+    "",
+    "law \"flipping twice is identity\" forall (b: Bool) { flip(flip(b)) == b }",
+    "law \"flipping once is identity\" forall (b: Bool) { flip(b) == b }",
+    "law \"absolute is non negative\" forall (x: Int) { absolute(x) >= 0 }",
+    "law \"a bounded absolute is non negative\" forall (x: Int) where x > -1000",
+    "  { absolute(x) >= 0 }",
+    "law \"absolute is positive\" forall (x: Int) { absolute(x) > 0 }",
+    "law \"swapping twice is identity\" forall (p: Pair) { swap(swap(p)) == p }",
+    "law \"swapping once is identity\" forall (p: Pair) { swap(p) == p }",
+    "law \"left of a swap\" forall (p: Pair) { left(swap(swap(p))) == left(p) }",
+  ])
+
+fn ledger() -> String =
+  source([
+    "type Account = Account(Int, Int)",
+    "",
+    "fn identifier(a: Account) -> Int = match a { Account(i, _) -> i }",
+    "fn balance(a: Account) -> Int = match a { Account(_, b) -> b }",
+    "",
+    "fn withdraw(acct: Account, amount: Int) -> Account",
+    "  requires amount > 0",
+    "  ensures balance(result) == balance(acct) - amount",
+    "  ensures identifier(result) == identifier(acct)",
+    "  ensures balance(result) == balance(acct) + amount",
+    "  = Account(identifier(acct), balance(acct) - amount)",
+  ])
+
+fn hard() -> String =
+  source([
+    "type Bit = Zero | One",
+    "fn value(b: Bit) -> Int = match b { Zero -> 0, One -> 1 }",
+    "",
+    "law \"four bits are bounded\" forall (a: Bit, b: Bit, c: Bit, d: Bit)",
+    "  { value(a) + value(b) + value(c) + value(d) <= 4 }",
+    "",
+    "law \"five bits are bounded\" forall (a: Bit, b: Bit, c: Bit, d: Bit, e: Bit)",
+    "  { value(a) + value(b) + value(c) + value(d) + value(e) <= 5 }",
+  ])
+
+fn guarded() -> String =
+  source([
+    "law \"a guard nothing establishes\" forall (x: Int, y: Int) where x < y { x != y }",
+    "law \"an unguarded claim\" forall (x: Int) { x == x }",
+  ])
+
+fn uninhabited() -> String =
+  source([
+    "type Bottom = Wrap(Bottom)",
+    "",
+    "law \"anything about nothing\" forall (b: Bottom) { b == b }",
+  ])
+
+fn lists() -> String =
+  source([
+    "law \"list literals are injective\" forall (a: Int, b: Int) where [a] == [b] { a == b }",
+    "law \"list literals are injective by one\" forall (a: Int, b: Int) where [a] == [b]",
+    "  { a == b + 1 }",
+    "law \"lists of different lengths differ\" forall (a: Int, b: Int) where [a] == [b, b]",
+    "  { a == b + 1 }",
+  ])
+
+fn opaque() -> String =
+  source([
+    "type Tree = Leaf | Node(Tree, Tree)",
+    "",
+    "fn depth_one(t: Tree) -> Int = match t {",
+    "  Node(Leaf, _) -> 1,",
+    "  _ -> 0,",
+    "}",
+    "",
+    "law \"a nested pattern is not decided\" forall (t: Tree) { depth_one(t) >= 0 }",
+    "law \"a nested pattern is still a function\" forall (t: Tree) { depth_one(t) == depth_one(t) }",
+  ])
+
+fn corpus() -> String =
+  source([
+    "type Shade = Pale | Mid | Deep",
+    "",
+    "fn weight(s: Shade) -> Int = match s { Pale -> 1, Mid -> 2, Deep -> 3 }",
+    "fn twice(x: Int) -> Int = x + x",
+    "fn quadruple(x: Int) -> Int = twice(x) + twice(x)",
+    "",
+    "law \"identity of addition\" forall (x: Int) { x + 0 == x }",
+    "law \"addition commutes\" forall (x: Int, y: Int) { x + y == y + x }",
+    "law \"bounded addition commutes\" forall (x: Int, y: Int)",
+    "  where x > -1000 && x < 1000 && y > -1000 && y < 1000 { x + y == y + x }",
+    "law \"addition associates\" forall (x: Int, y: Int, z: Int)",
+    "  { (x + y) + z == x + (y + z) }",
+    "law \"bounded addition associates\" forall (x: Int, y: Int, z: Int)",
+    "  where x > -1000 && x < 1000 && y > -1000 && y < 1000 && z > -1000 && z < 1000",
+    "  { (x + y) + z == x + (y + z) }",
+    "law \"self subtraction is zero\" forall (x: Int) { x - x == 0 }",
+    "law \"negation is subtraction\" forall (x: Int) { 0 - x == -x }",
+    "law \"bounded negation is subtraction\" forall (x: Int) where x > -1000 && x < 1000",
+    "  { 0 - x == -x }",
+    "law \"doubling scales\" forall (x: Int) { twice(x) == 2 * x }",
+    "law \"bounded doubling scales\" forall (x: Int) where x > -1000 && x < 1000",
+    "  { twice(x) == 2 * x }",
+    "law \"quadrupling scales\" forall (x: Int) { quadruple(x) == 4 * x }",
+    "law \"bounded quadrupling scales\" forall (x: Int) where x > -1000 && x < 1000",
+    "  { quadruple(x) == 4 * x }",
+    "law \"a positive is at least one\" forall (x: Int) where x > 0 { x >= 1 }",
+    "law \"at least one is positive\" forall (x: Int) where x >= 1 { x > 0 }",
+    "law \"antisymmetry\" forall (x: Int, y: Int) where x <= y && y <= x { x == y }",
+    "law \"strictness is asymmetric\" forall (x: Int, y: Int) where x < y { y > x }",
+    "law \"multiplication commutes\" forall (x: Int, y: Int) { x * y == y * x }",
+    "law \"a square is not negative\" forall (x: Int) { x * x >= 0 }",
+    "law \"de morgan for conjunction\" forall (b: Bool, c: Bool)",
+    "  { !(b && c) == (!b || !c) }",
+    "law \"de morgan for disjunction\" forall (b: Bool, c: Bool)",
+    "  { !(b || c) == (!b && !c) }",
+    "law \"double negation\" forall (b: Bool) { !!b == b }",
+    "law \"a disjunct is implied\" forall (b: Bool, c: Bool) where b { b || c }",
+    "law \"a branch is one of two\" forall (b: Bool, x: Int, y: Int)",
+    "  { if b { x } else { y } == x || if b { x } else { y } == y }",
+    "law \"a function is a function\" forall (f: (Int) -> Int, x: Int) { f(x) == f(x) }",
+    "law \"equal arguments agree\" forall (f: (Int) -> Int, x: Int, y: Int) where x == y",
+    "  { f(x) == f(y) }",
+    "law \"a field is what was put in it\" forall (x: Int) { { amount: x }.amount == x }",
+    "law \"every weight is positive\" forall (s: Shade) { weight(s) >= 1 }",
+    "law \"no weight is four\" forall (s: Shade) { weight(s) != 4 }",
+    "",
+    "law \"successor is identity\" forall (x: Int) { x + 1 == x }",
+    "law \"everything is ordered one way\" forall (x: Int, y: Int) { x > y }",
+    "law \"a positive is at least two\" forall (x: Int) where x > 0 { x > 1 }",
+    "law \"doubling is squaring\" forall (x: Int) { twice(x) == x * x }",
+    "law \"quadrupling is tripling\" forall (x: Int) { quadruple(x) == 3 * x }",
+    "law \"de morgan mangled\" forall (b: Bool, c: Bool) { !(b && c) == (!b && !c) }",
+    "law \"a disjunction always holds\" forall (b: Bool, c: Bool) { b || c }",
+    "law \"a branch is always the first\" forall (b: Bool, x: Int, y: Int)",
+    "  { if b { x } else { y } == x }",
+    "law \"any two arguments agree\" forall (f: (Int) -> Int, x: Int, y: Int)",
+    "  { f(x) == f(y) }",
+    "law \"a field is one more\" forall (x: Int) { { amount: x }.amount == x + 1 }",
+    "law \"every weight is one\" forall (s: Shade) { weight(s) == 1 }",
+    "law \"weights stop at two\" forall (s: Shade) { weight(s) <= 2 }",
+    "law \"ordering skips two\" forall (x: Int, y: Int, z: Int) where x < y && y < z",
+    "  { x < z - 2 }",
+    "law \"halving round trips\" forall (x: Int) { x / 2 * 2 == x }",
+    "",
+    "law \"between zero and one\" forall (x: Int) where x > 0 && x < 1 { x == x }",
+    "law \"its own successor\" forall (x: Int) where x == x + 1 { x != x }",
+    "law \"its own bounded successor\" forall (x: Int) where x < 100 && x == x + 1",
+    "  { x != x }",
+    "law \"true and false at once\" forall (b: Bool) where b && !b { !b }",
+    "law \"one is two\" forall (x: Int) where 1 == 2 { x != x }",
+    "law \"two weights at once\" forall (s: Shade) where weight(s) == 1 && weight(s) == 3",
+    "  { s == s }",
+    "",
+    "// The numeric types, whose whole content in this audit is that a type arriving",
+    "// is not evidence. Every `Float` entry below is `Refutable` — false at `NaN`,",
+    "// including the reflexivity of `==` — so the audit asserts `Unknown` for each,",
+    "// which is the structural refusal doing its job rather than a rule somebody",
+    "// remembered to apply.",
+    "law \"a float equals itself\" forall (x: Float) { x == x }",
+    "law \"a float sum commutes\" forall (x: Float, y: Float) { x + y == y + x }",
+    "law \"a float is at least itself\" forall (x: Float) { x >= x }",
+    "law \"a decimal equals itself\" forall (x: Decimal) { x == x }",
+    "law \"two decimal scales are one value\" forall (x: Int) { 1.5m == 1.50m }",
+    "law \"two decimals are two values\" forall (x: Int) { 1.5m != 1.6m }",
+    "law \"a decimal zero is additive\" forall (x: Decimal) { x + 0m == x }",
+  ])
+
+fn clause_binders(f: Fixture, name: String) -> List<Binder> =
+  match fold(f.built.world.signatures, None, |acc: Option<Signature>, s: Signature|
+      match acc { Some(_) -> acc, None -> if s.name == owner(name) { Some(s) } else { None } }) {
+    Some(s) -> match canonical(s.ty) {
+      Fn(params, ret, _) ->
+        map(range(0, len(params) + 1), |i: Int|
+          {
+            name: "_" ++ int_to_string(i),
+            ty: match list_at(params, i) { Some(p) -> p, None -> ret },
+          }),
+      _ -> panic("`" ++ name ++ "` is not a function"),
+    },
+    None -> panic("no signature for " ++ name),
+  }
+
+fn def_of(f: Fixture, name: String) -> Def =
+  match map_get(f.claims.defs, owner(name)) {
+    Some(d) -> d,
+    None -> panic("no definition " ++ name),
+  }
+
+fn clauses(d: Def, ensures: Bool) -> List<Option<Code>> =
+  map(
+    filter(d.spec, |c: ClaimClause| match c.kind { SEnsures -> ensures, SRequires -> !ensures }),
+    |c: ClaimClause| c.clause.code,
+  )
+
+fn nth<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("no such clause") }
+
+fn returns_zero(f: Fixture, name: String) -> Decision = {
+  let d = def_of(f, name);
+  decide(
+    f.cx,
+    {
+      binders: [{ name: "result", ty: int_ty() }],
+      guards: [],
+      result: Some(d.body),
+      body: nth(clauses(d, true), 0),
+    },
+    default_limits(),
+  )
+}
+
+fn ensures_goal(index: Int) -> Decision = {
+  let f = fixture(ledger());
+  let d = def_of(f, "withdraw");
+  decide(
+    f.cx,
+    {
+      binders: clause_binders(f, "withdraw"),
+      guards: clauses(d, false),
+      result: Some(d.body),
+      body: nth(clauses(d, true), index),
+    },
+    default_limits(),
+  )
+}
+
+fn spends_its_budget(f: Fixture, label: String, limits: Limits) -> Bool =
+  match attempt_with(f, label, limits) { Unknown(u) -> u.reason == BudgetSpent, _ -> false }
+
+fn inducted_on(p: Proof, binder: String, def: String) -> Bool = uses(p, induction_rule(binder, def))
+
+fn deepest_unfold(p: Proof) -> Int =
+  fold(p.rules, 0, |acc: Int, r: Rule|
+    match r { Unfold(u) -> if u.depth > acc { u.depth } else { acc }, _ -> acc })
+
+test "a constant outside Int is opaque rather than wrapped" {
+  let f = fixture(boundaries());
+  assert(not_proved(f, "the largest int"));
+  assert(not_proved(f, "the smallest int is smallest"))
+}
+
+// The product it stands for is one no `Int` holds, so congruence over it decides nothing.
+test "a coefficient that overflows stays a term" {
+  assert(not_proved(fixture(boundaries()), "scaling past the boundary"))
+}
+
+test "propositional structure decides both directions" {
+  let f = fixture(propositional());
+  assert(uses(proof(f, "excluded middle"), Propositional));
+  assert(not_proved(f, "a bare disjunction"));
+  assert(is_proved(f, "disjunction commutes"));
+  assert(is_proved(f, "de morgan"));
+  assert(not_proved(f, "de morgan mangled"));
+  assert(is_proved(f, "a conditional picks a branch"));
+  assert(not_proved(f, "a conditional is not constant"))
+}
+
+test "congruence over an uninterpreted function decides both directions" {
+  let f = fixture(congruence());
+  assert(uses(proof(f, "a function is a function"), Congruence));
+  assert(is_proved(f, "equal arguments agree"));
+  assert(not_proved(f, "any two arguments agree"))
+}
+
+test "a polymorphic proof records its sorts" {
+  let p = proof(fixture(congruence()), "congruence is polymorphic");
+  // `g: (a) -> b, u: a, v: a`, by number: naming them is the world's.
+  assert_eq(p.sorts, [0, 1]);
+  match static_of(Proved(p), ["a", "b"]) {
+    Certified(c) -> assert_eq(c.sorts, ["a", "b"]),
+    Unwitnessed(c) -> assert_eq(c.sorts, ["a", "b"]),
+    _ -> panic("a proof settles the claim"),
+  }
+}
+
+test "records project and compare structurally" {
+  let f = fixture(congruence());
+  assert(is_proved(f, "a record is its fields"));
+  assert(is_proved(f, "records with equal fields are equal"));
+  assert(not_proved(f, "records with any fields are equal"))
+}
+
+test "a record equals one rebuilt from all of its fields and no fewer" {
+  let f = fixture(congruence());
+  assert(uses(proof(f, "a record rebuilt from its own fields is the record"), Congruence));
+  assert(is_proved(f, "moving an account and moving it back is the account"));
+  assert(not_proved(f, "moving an account leaves it where it was"));
+  assert(not_proved(f, "one matching field is enough"));
+  // Unguarded, the balance can leave `Int`.
+  assert(not_proved(f, "moving an unbounded account and back is the account"))
+}
+
+test "constructor injectivity decides both directions" {
+  let f = fixture(shapes());
+  assert(uses(proof(f, "constructors are injective"), Injectivity));
+  assert(not_proved(f, "injective by one"));
+  assert(is_proved(f, "a rebuilt value is the same"));
+  assert(not_proved(f, "two constructors are not"))
+}
+
+test "distinct constructors make a guard vacuous" {
+  assert(vacuous(attempt(fixture(shapes()), "constructors are distinct")))
+}
+
+test "a case split over many constructors decides both directions" {
+  let f = fixture(rainbow());
+  assert(uses(proof(f, "every rank is in range"), CaseSplit({ ty: "m.Colour", arms: 8 })));
+  assert(not_proved(f, "every rank is small"));
+  assert(not_proved(f, "no rank is seven"))
+}
+
+test "a non-recursive definition unfolds to the stated depth" {
+  let f = fixture(chain());
+  assert(deepest_unfold(proof(f, "three unfoldings suffice")) <= default_unfold_depth());
+  assert(not_proved(f, "four unfoldings do not"))
+}
+
+test "a recursive definition is unfolded only by induction" {
+  let f = fixture(chain());
+  assert(unfoldable(f.cx, "m.countdown") == None);
+  assert(unfoldable(f.cx, "m.three") != None);
+  assert(inducted_on(proof(f, "counting down counts"), "n", "m.countdown"));
+  assert(inducted_on(proof(f, "doubling by recursion"), "n", "m.doubled"));
+  // The base case is where a claim false below zero fails.
+  assert(not_proved(f, "counting down is not the identity"));
+  // The unrolled body adds one to a value only the hypothesis could bound, and these hypotheses
+  // do not bound it, so its overflow stays undecided.
+  assert(not_proved(f, "a recursive call is a function"));
+  assert(not_proved(f, "a recursive definition steps"));
+  assert(not_proved(f, "counting down is never negative"));
+  // At zero the step lands on the top of `Int`.
+  assert(not_proved(f, "a step off the top overflows"))
+}
+
+test "a recursive definition over a list is proved by induction on its spine" {
+  let f = fixture(spines());
+  assert(inducted_on(proof(f, "counting counts"), "xs", "m.count"));
+  // The unrolled step adds one to a value only the hypothesis could bound, and it does not.
+  assert(not_proved(f, "a total is a total"));
+  assert(not_proved(f, "a total of ints is non-negative"));
+  // The self call keeps the whole list, so no measure decreases.
+  assert(not_proved(f, "a definition that keeps its list is not a function"));
+  // The step needs the claim at `k + 1`, and the hypothesis is at `k`.
+  assert(not_proved(f, "counting from an accumulator counts"))
+}
+
+test "list patterns over literal spines are decided without induction" {
+  let f = fixture(spines());
+  assert(is_proved(f, "a list pattern takes the head of a literal"));
+  assert(is_proved(f, "a pushed literal ends in what was pushed"));
+  assert(not_proved(f, "a list pattern does not confuse the tail"))
+}
+
+test "induction needs a decreasing self call and a step of one" {
+  let f = fixture(chain());
+  assert(not_proved(f, "a definition that never returns is not a function"));
+  assert(not_proved(f, "a mutual recursion is not unrolled"));
+  // The recursion steps by two, and the hypothesis is one step down.
+  assert(not_proved(f, "stepping by two counts"))
+}
+
+test "two calls to an effectful definition are not one term" {
+  let f = fixture(effectful());
+  assert(match returns_zero(f, "difference") { Proved(_) -> false, _ -> true });
+  // One performance bound to a local is evaluated once, so both uses of `n` are one value.
+  assert(match returns_zero(f, "once") { Proved(_) -> true, _ -> false })
+}
+
+test "an effectful definition is never unfolded" {
+  assert(unfoldable(fixture(effectful()).cx, "m.shout") == None)
+}
+
+test "a literal match decides both directions" {
+  let f = fixture(matching());
+  assert(is_proved(f, "flipping twice is identity"));
+  assert(not_proved(f, "flipping once is identity"))
+}
+
+// `0 - x` is only evaluated where `x < 0`, so the `else` arm's definedness costs nothing.
+test "an if decides both directions" {
+  let f = fixture(matching());
+  assert(is_proved(f, "a bounded absolute is non negative"));
+  assert(not_proved(f, "absolute is non negative"));
+  assert(not_proved(f, "absolute is positive"))
+}
+
+test "a constructor match decides both directions" {
+  let f = fixture(matching());
+  assert(is_proved(f, "swapping twice is identity"));
+  assert(not_proved(f, "swapping once is identity"));
+  assert(is_proved(f, "left of a swap"))
+}
+
+test "a postcondition over a definition decides both directions" {
+  assert(match ensures_goal(0) { Proved(_) -> true, _ -> false });
+  assert(match ensures_goal(1) { Proved(_) -> true, _ -> false });
+  assert(match ensures_goal(2) { Proved(_) -> false, _ -> true })
+}
+
+test "a postcondition without the definition is unknown" {
+  let f = fixture(ledger());
+  let d = def_of(f, "withdraw");
+  let decision = decide(
+    f.cx,
+    {
+      binders: clause_binders(f, "withdraw"),
+      guards: [],
+      result: None,
+      body: nth(clauses(d, true), 0),
+    },
+    default_limits(),
+  );
+  assert(match decision { Proved(_) -> false, _ -> true })
+}
+
+test "a spent budget is unknown and never proved" {
+  let f = fixture(hard());
+  assert(spends_its_budget(f, "four bits are bounded", { ..default_limits(), steps: 20 }));
+  // Decides at the default budget, so the assertion above is about the budget alone.
+  assert(is_proved(f, "four bits are bounded"))
+}
+
+test "an obligation larger than the default budget is unknown" {
+  let f = fixture(hard());
+  assert(spends_its_budget(f, "five bits are bounded", default_limits()));
+  assert(match attempt_with(f, "five bits are bounded", { ..default_limits(), steps: 100000 }) {
+    Proved(_) -> true,
+    _ -> false,
+  })
+}
+
+test "a decision is a function of the obligation" {
+  let f = fixture(rainbow());
+  assert_eq(attempt(f, "every rank is in range"), attempt(f, "every rank is in range"))
+}
+
+test "a certificate needs the guard to admit a value" {
+  let f = fixture(guarded());
+  let g = proof(f, "a guard nothing establishes");
+  assert(!g.guard_satisfiable);
+  // A kept case is what establishes it.
+  assert(match static_of(Proved(g), []) { Unwitnessed(_) -> true, _ -> false });
+  let u = proof(f, "an unguarded claim");
+  assert(u.guard_satisfiable);
+  assert(match static_of(Proved(u), []) { Certified(_) -> true, _ -> false })
+}
+
+test "an uninhabited domain does not establish satisfiability" {
+  let p = proof(fixture(uninhabited()), "anything about nothing");
+  assert(!p.guard_satisfiable);
+  assert(match static_of(Proved(p), []) { Unwitnessed(_) -> true, _ -> false })
+}
+
+test "list literals are injective and length distinct" {
+  let f = fixture(lists());
+  assert(is_proved(f, "list literals are injective"));
+  assert(not_proved(f, "list literals are injective by one"));
+  assert(vacuous(attempt(f, "lists of different lengths differ")))
+}
+
+test "a nested pattern leaves the match uninterpreted" {
+  let f = fixture(opaque());
+  assert(not_proved(f, "a nested pattern is not decided"));
+  assert(is_proved(f, "a nested pattern is still a function"))
+}
+
+// What is actually true of a law, established by hand rather than by the component under test.
+type Truth =
+  // Holds of every input its guard admits, and the guard admits one.
+  | Valid
+  // Holds wherever it evaluates, and raises at some input its guard admits.
+  | Partial
+  | Refutable
+  | Vacuous
+
+fn audit() -> List<{ label: String, truth: Truth }> = {
+  let valid = [
+    "identity of addition",
+    "bounded addition commutes",
+    "bounded addition associates",
+    "self subtraction is zero",
+    "bounded negation is subtraction",
+    "bounded doubling scales",
+    "bounded quadrupling scales",
+    "a positive is at least one",
+    "at least one is positive",
+    "antisymmetry",
+    "strictness is asymmetric",
+    "multiplication commutes",
+    "a square is not negative",
+    "de morgan for conjunction",
+    "de morgan for disjunction",
+    "double negation",
+    "a disjunct is implied",
+    "a branch is one of two",
+    "a function is a function",
+    "equal arguments agree",
+    "a field is what was put in it",
+    "every weight is positive",
+    "no weight is four",
+    "a decimal equals itself",
+    "two decimal scales are one value",
+    "two decimals are two values",
+    // Valid, and still not proved: there is no theory of `Decimal` arithmetic.
+    "a decimal zero is additive",
+  ];
+  let partial = [
+    "addition commutes",
+    "addition associates",
+    "negation is subtraction",
+    "doubling scales",
+    "quadrupling scales",
+    // The guard raises at `Int`'s greatest value, so its domain is undecided rather than empty.
+    "its own successor",
+  ];
+  let refutable = [
+    "successor is identity",
+    "everything is ordered one way",
+    "a positive is at least two",
+    "doubling is squaring",
+    "quadrupling is tripling",
+    "de morgan mangled",
+    "a disjunction always holds",
+    "a branch is always the first",
+    "any two arguments agree",
+    "a field is one more",
+    "every weight is one",
+    "weights stop at two",
+    "ordering skips two",
+    "halving round trips",
+    "a float equals itself",
+    "a float sum commutes",
+    "a float is at least itself",
+  ];
+  let vacuous_ones = [
+    "between zero and one",
+    "its own bounded successor",
+    "true and false at once",
+    "one is two",
+    "two weights at once",
+  ];
+  let tagged = |labels: List<String>, t: Truth| map(labels, |l: String| { label: l, truth: t });
+  appended(
+    appended(
+      appended(tagged(valid, Valid), tagged(partial, Partial)),
+      tagged(refutable, Refutable),
+    ),
+    tagged(vacuous_ones, Vacuous),
+  )
+}
+
+test "nothing false is ever proved and nothing real is ever vacuous" {
+  let f = fixture(corpus());
+  let wrong = filter(audit(), |e: { label: String, truth: Truth }| {
+    let d = attempt(f, e.label);
+    match e.truth {
+      Valid -> vacuous(d),
+      Partial -> match d { Unknown(_) -> false, _ -> true },
+      Refutable -> match d { Unknown(_) -> false, _ -> true },
+      Vacuous -> match d { Proved(_) -> true, _ -> false },
+    }
+  });
+  assert_eq(map(wrong, |e: { label: String, truth: Truth }| e.label), [])
+}
+
+// An audit whose every entry came back `Unknown` would pass while proving nothing.
+test "the audit corpus exercises the fragment" {
+  let f = fixture(corpus());
+  let undecided = filter(audit(), |e: { label: String, truth: Truth }|
+    e.truth == Valid && (match attempt(f, e.label) { Proved(_) -> false, _ -> true }));
+  assert_eq(map(undecided, |e: { label: String, truth: Truth }| e.label), [
+    "multiplication commutes",
+    "a square is not negative",
+    "a decimal zero is additive",
+  ]);
+  let missed = filter(audit(), |e: { label: String, truth: Truth }|
+    e.truth == Vacuous && !vacuous(attempt(f, e.label)));
+  assert_eq(map(missed, |e: { label: String, truth: Truth }| e.label), [])
+}
+
+fn bits() -> String =
+  source([
+    "law \"a mask is a function\" forall (x: Int, y: Int) { x & y == x & y }",
+    "law \"a complement is a function\" forall (x: Int) { ~x == ~x }",
+    "law \"a masked value is a value\" forall (x: Int, y: Int) where x & y > 0 { x & y > 0 }",
+    "",
+    "law \"a mask is its left operand\" forall (x: Int, y: Int) { x & y == x }",
+    "law \"a mask is no larger than what it masks\" forall (x: Int, y: Int) { x & y <= x }",
+    "law \"a left shift is a doubling\" forall (x: Int) where x > 0 { x << 1 > x }",
+    "law \"a complement is a bounded negation\" forall (x: Int) where x > 0 && x < 100",
+    "  { ~x == 0 - x }",
+    "",
+    "law \"and is or\" forall (x: Int, y: Int) { x & y == x | y }",
+    "law \"xor is and\" forall (x: Int, y: Int) { x ^ y == x & y }",
+    "law \"the right shifts agree\" forall (x: Int, n: Int) where n >= 0 && n <= 63",
+    "  { x >> n == x >>> n }",
+    "",
+    "law \"a shift is a function\" forall (x: Int, n: Int) { x << n == x << n }",
+    "law \"a bounded shift is a function\" forall (x: Int, n: Int) where n >= 0 && n <= 63",
+    "  { x << n == x << n }",
+    "law \"a shift by the last bit is a function\" forall (x: Int) { x >>> 63 == x >>> 63 }",
+    "law \"a shift past the last bit is a function\" forall (x: Int) { x >>> 64 == x >>> 64 }",
+    "law \"a shift by a negative is a function\" forall (x: Int) { x >> -1 == x >> -1 }",
+    "",
+    "law \"masking commutes\" forall (x: Int, y: Int) { x & y == y & x }",
+    "law \"a complement is an involution\" forall (x: Int) { ~(~x) == x }",
+  ])
+
+fn floats() -> String =
+  source([
+    "law \"a float equals itself\" forall (x: Float) { x == x }",
+    "law \"a float sum commutes\" forall (x: Float, y: Float) { x + y == y + x }",
+    "law \"a float is at least itself\" forall (x: Float) { x >= x }",
+    "law \"a float zero is additive\" forall (x: Float) { x + 0.0 == x }",
+    "law \"one point five is one point five\" forall (n: Int) { 1.5 == 1.5 }",
+    "law \"a float in a list\" forall (xs: List<Float>) { len(xs) >= 0 }",
+    "law \"a float in a record\" forall (r: {rate: Float}) { r == r }",
+    "fn half() -> Float = 0.5",
+    "law \"a float from a call\" forall (n: Int) { half() == half() }",
+  ])
+
+fn decimals() -> String =
+  source([
+    "fn scaled(d: Decimal) -> Decimal = d",
+    "fn wrap(d: Decimal) -> { amount: Decimal } = { amount: d }",
+    "",
+    "law \"a decimal equals itself\" forall (x: Decimal) { x == x }",
+    "law \"congruence over a decimal\" forall (x: Decimal) { scaled(x) == scaled(x) }",
+    "law \"a decimal inside a record\" forall (x: Decimal) { wrap(x) == wrap(x) }",
+    "law \"a decimal literal is itself\" forall (n: Int) { 1.5m == 1.5m }",
+    "law \"two scales are one value\" forall (n: Int) { 1.5m == 1.50m }",
+    "law \"two values are two values\" forall (n: Int) { 1.5m == 1.6m }",
+    "",
+    "law \"a decimal zero is additive\" forall (x: Decimal) { x + 0m == x }",
+    "law \"a decimal sum commutes\" forall (x: Decimal, y: Decimal) { x + y == y + x }",
+    "law \"a decimal is at least itself\" forall (x: Decimal) { x >= x }",
+  ])
+
+fn beside_a_float() -> String =
+  source(["law \"an int is itself, beside a float\" forall (x: Int, unused: Float) { x == x }"])
+
+fn an_int_is_itself() -> String = source(["law \"an int is itself\" forall (x: Int) { x == x }"])
+
+fn int_zero() -> String =
+  source(["law \"an int zero is additive\" forall (x: Int) where x > 0 && x < 100 { x + 0 == x }"])
+
+fn decimal_zero() -> String =
+  source(["law \"a decimal zero is additive\" forall (x: Decimal) { x + 0m == x }"])
+
+fn prelude_adts() -> String =
+  source([
+    "fn or_else(o: Option<Int>, d: Int) -> Int = match o { None -> d, Some(v) -> v }",
+    "fn direction(o: Ordering) -> Int = match o { Less -> -1, Equal -> 0, Greater -> 1 }",
+    "law \"or_else is a function\" forall (o: Option<Int>, d: Int)",
+    "  { or_else(o, d) == or_else(o, d) }",
+    "law \"a direction is one of three\" forall (o: Ordering)",
+    "  { direction(o) == -1 || direction(o) == 0 || direction(o) == 1 }",
+  ])
+
+fn destructured() -> String =
+  source([
+    "fn rates() -> { a: Float, b: Float } = { a: 1.0, b: 2.0 }",
+    "fn ints() -> { a: Int, b: Int } = { a: 1, b: 2 }",
+    "",
+    "law \"a destructured float sum commutes\" forall (n: Int) {",
+    "  let { a: x, b: y } = rates();",
+    "  x + y == y + x",
+    "}",
+    "law \"a destructured int sum commutes\" forall (n: Int) {",
+    "  let { a: x, b: y } = ints();",
+    "  x + y == y + x",
+    "}",
+    "law \"a matched float sum commutes\" forall (n: Int) {",
+    "  match rates() { { a: x, b: y } -> x + y == y + x }",
+    "}",
+  ])
+
+fn blocked_by(f: Fixture, label: String, b: Blocker) -> Bool =
+  fold(diagnosed(f, label).blockers, false, |found: Bool, x: Blocker| found || x == b)
+
+test "no bit operator folds into the arithmetic" {
+  let f = fixture(bits());
+  assert(
+    fold(
+      [
+        "a mask is its left operand",
+        "a mask is no larger than what it masks",
+        "a left shift is a doubling",
+        "a complement is a bounded negation",
+      ],
+      true,
+      |ok: Bool, l: String| ok && not_proved(f, l),
+    ),
+  )
+}
+
+test "the bit operators are seven functions and not one" {
+  let f = fixture(bits());
+  assert(not_proved(f, "and is or"));
+  assert(not_proved(f, "xor is and"));
+  assert(not_proved(f, "the right shifts agree"))
+}
+
+test "a bit operator is a function of its operands" {
+  let f = fixture(bits());
+  assert(is_proved(f, "a mask is a function"));
+  assert(is_proved(f, "a complement is a function"));
+  assert(is_proved(f, "a masked value is a value"))
+}
+
+test "a shift is a value only where its count is a bit position" {
+  let f = fixture(bits());
+  assert(not_proved(f, "a shift is a function"));
+  assert(is_proved(f, "a bounded shift is a function"));
+  assert(is_proved(f, "a shift by the last bit is a function"));
+  assert(not_proved(f, "a shift past the last bit is a function"));
+  assert(not_proved(f, "a shift by a negative is a function"))
+}
+
+test "a true law about the bit pattern is property and not proved" {
+  let f = fixture(bits());
+  assert(
+    fold(["masking commutes", "a complement is an involution"], true, |ok: Bool, l: String|
+      ok && (match diagnosed(f, l).decision { Proved(_) -> false, _ -> true })
+        && blocked_by(f, l, BitOperator)),
+  )
+}
+
+test "no law mentioning a float is ever proved" {
+  let f = fixture(floats());
+  assert(
+    fold(
+      [
+        "a float equals itself",
+        "a float sum commutes",
+        "a float is at least itself",
+        "a float zero is additive",
+        "one point five is one point five",
+        "a float in a list",
+        "a float in a record",
+        "a float from a call",
+      ],
+      true,
+      |ok: Bool, l: String| ok && not_proved(f, l),
+    ),
+  )
+}
+
+test "a refused float obligation says that is why" {
+  let f = fixture(floats());
+  assert(match diagnosed(f, "a float equals itself").decision { Unknown(_) -> true, _ -> false });
+  assert(blocked_by(f, "a float equals itself", FloatTerm))
+}
+
+test "a float binder alone is enough to refuse" {
+  assert(not_proved(fixture(beside_a_float()), "an int is itself, beside a float"))
+}
+
+test "the same claim without a float is still proved" {
+  assert(is_proved(fixture(an_int_is_itself()), "an int is itself"))
+}
+
+// `==` on `Decimal` is an equivalence relation, so reflexivity and congruence are sound over it.
+test "a decimal is provable as an uninterpreted term" {
+  let f = fixture(decimals());
+  assert(is_proved(f, "a decimal equals itself"));
+  assert(is_proved(f, "congruence over a decimal"));
+  assert(is_proved(f, "a decimal inside a record"));
+  assert(is_proved(f, "a decimal literal is itself"))
+}
+
+test "two decimal literals of one value are one term" {
+  let f = fixture(decimals());
+  assert(is_proved(f, "two scales are one value"));
+  // Distinct values must stay distinct: the normalization merged nothing else.
+  assert(not_proved(f, "two values are two values"))
+}
+
+test "decimal arithmetic and ordering are property rather than proved" {
+  let f = fixture(decimals());
+  assert(not_proved(f, "a decimal zero is additive"));
+  assert(not_proved(f, "a decimal sum commutes"));
+  assert(not_proved(f, "a decimal is at least itself"))
+}
+
+test "a decimal never reports the float blocker" {
+  let f = fixture(decimals());
+  assert(!blocked_by(f, "a decimal zero is additive", FloatTerm));
+  assert(!blocked_by(f, "a decimal equals itself", FloatTerm));
+  assert(blocked_by(f, "a decimal zero is additive", DecimalArithmetic))
+}
+
+test "the arithmetic fragment did not grow" {
+  assert(is_proved(fixture(int_zero()), "an int zero is additive"));
+  assert(not_proved(fixture(decimal_zero()), "a decimal zero is additive"))
+}
+
+// Prelude sum types have no declaring file, yet the fragment must see their constructor lists.
+test "a prelude sum type is a case analysis like any other" {
+  let f = fixture(prelude_adts());
+  assert(is_proved(f, "or_else is a function"));
+  assert(is_proved(f, "a direction is one of three"))
+}
+
+// The one way a `Float` can enter the graph carrying no sort of its own.
+test "a float pulled out of a destructuring is still refused" {
+  let f = fixture(destructured());
+  assert(not_proved(f, "a destructured float sum commutes"));
+  assert(not_proved(f, "a matched float sum commutes"));
+  // The `Int` control: outside the fragment for its own reason, never as a `Float` problem.
+  assert(!blocked_by(f, "a destructured int sum commutes", FloatTerm))
+}

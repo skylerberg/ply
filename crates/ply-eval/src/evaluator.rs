@@ -27,8 +27,10 @@ pub struct Machine<'a> {
     sim_steps: u32,
     /// The handler of last resort.
     binding: Arc<HostBinding>,
-    /// What answers a [`crate::host::HostAnswer::Pending`].
+    /// What answers a [`crate::host::HostAnswer::Pending`], made on this machine's thread, and what
+    /// made it, for the threads a `parallel` block runs branches on.
     runtime: Option<Rc<dyn HostRuntime>>,
+    factory: Option<crate::host::RuntimeFactory>,
     /// The only evaluator: every entry point and test runs here.
     compiled: Rc<dyn Compiled>,
     compiled_entries: u64,
@@ -90,6 +92,7 @@ impl<'a> Machine<'a> {
             sim_steps: DEFAULT_STEPS,
             binding: Arc::new(HostBinding::hermetic()),
             runtime: None,
+            factory: None,
             compiled,
             compiled_entries: 0,
             compiled_declines: 0,
@@ -115,14 +118,18 @@ impl<'a> Machine<'a> {
     }
 
     fn share_host(&self) {
-        self.compiled
-            .set_host(Arc::clone(&self.binding), self.runtime.clone());
+        self.compiled.set_host(
+            Arc::clone(&self.binding),
+            self.runtime.clone(),
+            self.factory.clone(),
+        );
         self.compiled.set_declared(self.declared.clone());
         self.compiled.set_re_executed(self.re_executed);
     }
 
-    pub fn set_host_runtime(&mut self, runtime: Rc<dyn HostRuntime>) {
-        self.runtime = Some(runtime);
+    pub fn set_host_runtime(&mut self, factory: crate::host::RuntimeFactory) {
+        self.runtime = Some(factory());
+        self.factory = Some(factory);
         self.share_host();
     }
 

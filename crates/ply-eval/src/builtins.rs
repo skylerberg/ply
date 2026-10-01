@@ -66,6 +66,7 @@ pub enum Builtin {
     BytesSlice,
     BytesConcat,
     BytesConcatAll,
+    BytesBlake3,
     BytesOfString,
     BytesIsUtf8,
     BytesIndexOf,
@@ -182,6 +183,7 @@ impl Builtin {
             "bytes_slice" => Builtin::BytesSlice,
             "bytes_concat" => Builtin::BytesConcat,
             "bytes_concat_all" => Builtin::BytesConcatAll,
+            "bytes_blake3" => Builtin::BytesBlake3,
             "bytes_of_string" => Builtin::BytesOfString,
             "bytes_is_utf8" => Builtin::BytesIsUtf8,
             "bytes_index_of" => Builtin::BytesIndexOf,
@@ -298,6 +300,7 @@ impl Builtin {
             Builtin::BytesSlice => "bytes_slice",
             Builtin::BytesConcat => "bytes_concat",
             Builtin::BytesConcatAll => "bytes_concat_all",
+            Builtin::BytesBlake3 => "bytes_blake3",
             Builtin::BytesOfString => "bytes_of_string",
             Builtin::BytesIsUtf8 => "bytes_is_utf8",
             Builtin::BytesIndexOf => "bytes_index_of",
@@ -385,6 +388,7 @@ impl Builtin {
             | Builtin::BytesOfString
             | Builtin::BytesIsUtf8
             | Builtin::BytesConcatAll
+            | Builtin::BytesBlake3
             | Builtin::StringOfBytes
             | Builtin::StringOfBytesLossy
             | Builtin::StringLen
@@ -571,6 +575,7 @@ impl Builtin {
             Builtin::BytesSlice,
             Builtin::BytesConcat,
             Builtin::BytesConcatAll,
+            Builtin::BytesBlake3,
             Builtin::BytesOfString,
             Builtin::BytesIsUtf8,
             Builtin::BytesIndexOf,
@@ -1031,6 +1036,11 @@ fn call_with(
             out.extend_from_slice(a);
             out.extend_from_slice(b);
             Ok(Step::Done(Value::bytes(out)))
+        }
+
+        Builtin::BytesBlake3 => {
+            let b = args[0].as_bytes(span, "`bytes_blake3`")?;
+            Ok(Step::Done(Value::bytes(blake3::hash(b).as_bytes())))
         }
 
         Builtin::BytesConcatAll => {

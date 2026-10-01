@@ -1,4 +1,3 @@
-use crate::obligations::CachedObligation;
 use crate::reviews::ReviewRecord;
 use crate::{Outcome, PROVER_VERSION, PassRecord, RUNTIME_VERSION};
 use anyhow::Context;
@@ -40,7 +39,7 @@ const STALE_TEMP_AGE: Duration = Duration::from_secs(60);
 pub(crate) type Entries = BTreeMap<DefHash, Outcome>;
 pub(crate) type Definitions = BTreeSet<DefHash>;
 pub(crate) type Passes = BTreeMap<Symbol, PassRecord>;
-pub(crate) type Obligations = BTreeMap<DefHash, CachedObligation>;
+pub(crate) type Obligations = BTreeMap<DefHash, serde_json::Value>;
 pub(crate) type Reviews = BTreeMap<Symbol, ReviewRecord>;
 
 #[derive(Default)]
@@ -472,7 +471,6 @@ pub fn sweep_temps(dir: &Path, max_age: Option<Duration>) {
             OBLIGATIONS_STEM,
             REVIEWS_STEM,
             crate::frontend::FRONTEND_STEM,
-            crate::answer::CLAIMS_STEM,
         ]
         .iter()
         .any(|stem| name.starts_with(&format!("{stem}.")));
