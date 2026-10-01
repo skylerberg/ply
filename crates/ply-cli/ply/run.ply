@@ -196,9 +196,7 @@ fn stopped_line(s: Style, g: Stopping, w: Teardown) -> String =
         ++ int_to_string(g.listeners)
         ++ " listener(s) closed · "
         ++ int_to_string(g.connections)
-        ++ " connection(s) in flight · "
-        ++ int_to_string(g.scopes)
-        ++ " transaction(s) open",
+        ++ " connection(s) in flight",
     )
 
 fn drain_line(s: Style, g: Stopping, expired: Bool) -> String =
@@ -209,22 +207,8 @@ fn drain_line(s: Style, g: Stopping, expired: Bool) -> String =
         ++ "ms since the signal",
     )
 
-fn teardown_lines(s: Style, w: Teardown) -> List<String> =
-  also(
-    [
-      ind()
-        ++ dim(
-          s,
-          "teardown    " ++ int_to_string(w.transactions_rolled_back)
-            ++ " transaction(s) rolled back, none committed · "
-            ++ int_to_string(w.connections_closed)
-            ++ " connection(s) closed rather than returned · "
-            ++ int_to_string(w.spans_abandoned)
-            ++ " span(s) abandoned · sink flushed",
-        ),
-    ],
-    map(w.problems, |p: String| ind() ++ dim(s, "warning[W0608]: " ++ p)),
-  )
+fn teardown_line(s: Style, w: Teardown) -> String =
+  ind() ++ dim(s, "teardown    " ++ int_to_string(w.spans_left_open) ++ " span(s) left open · sink flushed")
 
 fn trace_lines(s: Style, e: Ended) -> List<String> =
   match e.trace {
@@ -249,10 +233,11 @@ fn stop_lines(s: Style, e: Ended) -> List<String> =
     None -> [],
     Some(g) ->
       also(
-        also(
-          [stopped_line(s, g, e.teardown), drain_line(s, g, expired_of(e))],
-          teardown_lines(s, e.teardown),
-        ),
+        [
+          stopped_line(s, g, e.teardown),
+          drain_line(s, g, expired_of(e)),
+          teardown_line(s, e.teardown),
+        ],
         trace_lines(s, e),
       ),
   }
@@ -316,10 +301,7 @@ fn shutdown_json(e: Ended) -> Json =
     { key: "signal", value: match e.stopping { Some(g) -> text_or_null(g.signal), None -> Null } },
     { key: "drain_ms", value: num(e.teardown.drain_ms) },
     { key: "drain_lead_ms", value: num(e.teardown.lead_ms) },
-    { key: "transactions_rolled_back", value: num(e.teardown.transactions_rolled_back) },
-    { key: "connections_closed", value: num(e.teardown.connections_closed) },
-    { key: "spans_abandoned", value: num(e.teardown.spans_abandoned) },
-    { key: "problems", value: texts(e.teardown.problems) },
+    { key: "spans_left_open", value: num(e.teardown.spans_left_open) },
   ])
 
 fn document(
@@ -709,15 +691,7 @@ fn a_binding() -> Bound =
 
 fn no_counters() -> Counters = { updates: 0, updates_in_place: 0, in_place: None, cycles: 0 }
 
-fn no_teardown() -> Teardown =
-  {
-    lead_ms: 0,
-    drain_ms: 30000,
-    transactions_rolled_back: 0,
-    connections_closed: 0,
-    spans_abandoned: 0,
-    problems: [],
-  }
+fn no_teardown() -> Teardown = { lead_ms: 0, drain_ms: 30000, spans_left_open: 0 }
 
 fn answered_with(value: Value) -> Ended =
   {
@@ -885,33 +859,30 @@ test "a program that chose its own exit code is answered with that code and no v
   assert(string_contains(text, "\"value\":null"))
 }
 
-test "a stopped run says what was in flight, how long the drain took, and what it rolled back" {
+test "a stopped run says what was in flight, how long the drain took, and what it left open" {
   let stopped = {
     ..answered_with(VUnit),
-    stopping: Some({
-      signal: Some("SIGTERM"),
-      listeners: 1,
-      connections: 2,
-      scopes: 1,
-      elapsed_ms: 40,
-    }),
-    teardown: {
-      ..no_teardown(),
-      transactions_rolled_back: 1,
-      connections_closed: 2,
-      spans_abandoned: 3,
-      problems: ["a sink would not flush"],
-    },
-    trace: Some({ events: 9, spans: 4, abandoned: 1, flushed: true }),
+    stopping: Some({ signal: Some("SIGTERM"), listeners: 1, connections: 2, elapsed_ms: 40 }),
+    teardown: { ..no_teardown(), spans_left_open: 1 },
+    trace: Some({ events: 9, spans: 4, abandoned: 2, flushed: true }),
   };
   let ran = ran_over(bare(), Ok(a_program()), Ok(a_binding()), stopped);
   assert_eq(ran.answer.errs, [
-    "   stopping    signal SIGTERM · lead 0ms · drain 30000ms · 1 listener(s) closed · 2 connection(s) in flight · 1 transaction(s) open",
+    "   stopping    signal SIGTERM · lead 0ms · drain 30000ms · 1 listener(s) closed · 2 connection(s) in flight",
     "   drained       40ms since the signal",
-    "   teardown    1 transaction(s) rolled back, none committed · 2 connection(s) closed rather than returned · 3 span(s) abandoned · sink flushed",
-    "   warning[W0608]: a sink would not flush",
-    "   trace       9 event(s) · 4 span(s) · 1 abandoned · flushed",
+    "   teardown    1 span(s) left open · sink flushed",
+    "   trace       9 event(s) · 4 span(s) · 2 abandoned · flushed",
   ])
+}
+
+test "the shutdown block counts the spans left open, as the warning that named them did" {
+  let finished = {
+    ..answered_with(VInt(3)),
+    warnings: [left_open()],
+    teardown: { ..no_teardown(), spans_left_open: 2 },
+  };
+  let text = to_string(ran_over(as_json(), Ok(a_program()), Ok(hermetic()), finished).answer.json);
+  assert(string_contains(text, "\"spans_left_open\":2"))
 }
 
 // What the runtime warns of when an entry ends with `reserving` open inside `order`.

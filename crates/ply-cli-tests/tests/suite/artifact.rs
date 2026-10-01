@@ -877,7 +877,7 @@ fn main() -> Int = ready()
         built["shutdown"]["drain_ms"],
         source["shutdown"]["drain_ms"]
     );
-    assert_eq!(built["shutdown"]["transactions_rolled_back"], 0);
+    assert_eq!(built["shutdown"]["spans_left_open"], 0);
 
     // Without `--host` it is still `E0424`, naming the twin: the flag is the only way out.
     let hermetic = ply(dir.path())

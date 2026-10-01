@@ -85,10 +85,6 @@ pub trait Accepting: Send + Sync {
     fn accepts_in_flight(&self) -> usize;
 }
 
-pub trait Transactions: Send + Sync {
-    fn open_scopes(&self) -> usize;
-}
-
 #[derive(Default)]
 struct State {
     signal: Option<Signal>,
@@ -97,7 +93,6 @@ struct State {
     listeners_closed: usize,
     /// Connections open when phase 2 finished; the banner reports these as in flight.
     in_flight_at_stop: usize,
-    scopes_at_stop: usize,
 }
 
 pub struct Shutdown {
@@ -112,7 +107,6 @@ pub struct Shutdown {
     woke: Condvar,
     signals: Vec<Signal>,
     net: Mutex<Option<Arc<dyn Accepting>>>,
-    db: Mutex<Option<Arc<dyn Transactions>>>,
     /// Weak, so the children still go when their host does.
     children: Mutex<Option<Weak<Children>>>,
 }
@@ -128,7 +122,6 @@ impl Shutdown {
             woke: Condvar::new(),
             signals: signals_of_this_platform(),
             net: Mutex::new(None),
-            db: Mutex::new(None),
             children: Mutex::new(None),
         })
     }
@@ -212,14 +205,10 @@ impl Shutdown {
         lock(&self.state).signal
     }
 
-    /// What phase 2 found: listeners closed, connections open, scopes open.
-    pub fn at_stop(&self) -> (usize, usize, usize) {
+    /// What phase 2 found: listeners closed, and connections open.
+    pub fn at_stop(&self) -> (usize, usize) {
         let state = lock(&self.state);
-        (
-            state.listeners_closed,
-            state.in_flight_at_stop,
-            state.scopes_at_stop,
-        )
+        (state.listeners_closed, state.in_flight_at_stop)
     }
 
     /// Sleep for at most `bound`, or until the stop moves to its next phase.
@@ -271,7 +260,6 @@ impl Shutdown {
             self.stopped_accepting.store(true, Ordering::Release);
             state.listeners_closed = closed;
             state.in_flight_at_stop = net.as_ref().map_or(0, |n| n.connections_in_flight());
-            state.scopes_at_stop = lock(&self.db).as_ref().map_or(0, |db| db.open_scopes());
             // The drain starts when accept stops, so a lead never shortens the drain.
             state.deadline = Some(Instant::now() + self.bounds.drain);
             net
@@ -374,11 +362,9 @@ fn exit_now(shutdown: &Arc<Shutdown>, which: Signal) -> ! {
     let connections = lock(&shutdown.net)
         .as_ref()
         .map_or(0, |net| net.connections_in_flight());
-    let scopes = lock(&shutdown.db).as_ref().map_or(0, |db| db.open_scopes());
     eprintln!(
-        "   abandoned   {connections} connection{} in flight · {scopes} transaction{} open · nothing was committed",
+        "   abandoned   {connections} connection{} in flight",
         if connections == 1 { "" } else { "s" },
-        if scopes == 1 { "" } else { "s" },
     );
     shutdown.end_children();
     std::process::exit(which.exit_code());

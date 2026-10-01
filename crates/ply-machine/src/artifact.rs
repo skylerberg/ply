@@ -1211,7 +1211,7 @@ pub fn enter(artifact: &Artifact, opened: &Opened, argv: Vec<String>, binds: Bin
         .map(|d| d.span)
         .unwrap_or(Span::DUMMY);
     let ended = evaluate(opened, span, &hosts, declared.as_ref(), tier);
-    let _ = crate::drive::teardown(&hosts, None, crate::drive::TEARDOWN_FLOOR_MS);
+    let _ = crate::drive::teardown(&hosts);
     let requested = hosts.requested_exit();
     ended.map(|answer| match requested {
         Some(code) => Ok(code),

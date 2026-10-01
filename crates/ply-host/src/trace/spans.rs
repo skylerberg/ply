@@ -73,6 +73,8 @@ pub struct Spans {
     retired: BTreeMap<MachineId, Abandoned>,
     opened: u64,
     abandoned: u64,
+    /// What every ended entry point's warning counted.
+    left_open: u64,
 }
 
 impl Default for Spans {
@@ -89,6 +91,7 @@ impl Spans {
             retired: BTreeMap::new(),
             opened: 0,
             abandoned: 0,
+            left_open: 0,
         }
     }
 
@@ -96,8 +99,15 @@ impl Spans {
         self.opened
     }
 
+    /// Every span closed `Abandoned`, those an outer `exit` closed through included.
     pub fn abandoned(&self) -> u64 {
         self.abandoned
+    }
+
+    /// The spans the ended entry points' warnings counted: those left open when their task or
+    /// entry point ended.
+    pub fn left_open(&self) -> u64 {
+        self.left_open
     }
 
     pub fn depth(&self, owner: Owner) -> usize {
@@ -197,7 +207,9 @@ impl Spans {
             abandoned.note(&closing.open);
         }
         let retired = self.retired.remove(&machine).unwrap_or_default();
-        (closings, abandoned.then(retired))
+        let abandoned = abandoned.then(retired);
+        self.left_open += abandoned.count;
+        (closings, abandoned)
     }
 
     /// Removes a retired task's spans, innermost first, noting them for its entry point's warning.
