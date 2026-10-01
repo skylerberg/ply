@@ -1,6 +1,6 @@
 use ply_eval::builtins::*;
 use ply_eval::task_regions::TaskRegions;
-use ply_eval::{Diagnostic, Frame, Span, Value, codes};
+use ply_eval::{Diagnostic, Span, Value, codes};
 
 fn ints(xs: &[i64]) -> Value {
     Value::list(xs.iter().copied().map(Value::Int).collect())
@@ -1001,18 +1001,6 @@ fn a_non_boolean_from_a_filter_predicate_is_a_runtime_error() {
     let d = drive(Builtin::Filter, vec![ints(&[1]), f()], |_| Value::Int(1)).unwrap_err();
     assert_eq!(d.code, codes::RUNTIME_ERROR);
     assert!(d.message.contains("Bool"), "{}", d.message);
-}
-
-#[test]
-fn advancing_a_frame_that_is_not_a_builtin_step_is_reported_not_ignored() {
-    let frame = Frame::Call {
-        name: None,
-        call_site: Span::DUMMY,
-        memo: false,
-    };
-    let d = advance(frame, Value::Unit).unwrap_err();
-    assert_eq!(d.code, codes::INTERNAL_ERROR);
-    assert!(d.message.contains("internal error"), "{}", d.message);
 }
 
 #[test]

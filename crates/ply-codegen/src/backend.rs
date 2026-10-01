@@ -11,7 +11,6 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The widest arity this boundary carries without allocating an argument array.
@@ -121,11 +120,7 @@ impl Unit {
         let started = std::time::Instant::now();
         // The pre-flight decides the compiled set and leaves the unit every worker reads back.
         let (compiled, refusals) = closure(source, &candidates)?;
-        let members: BTreeSet<Symbol> = compiled
-            .iter()
-            .filter(|name| registers(source, name))
-            .map(Symbol::new)
-            .collect();
+        let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
         let analysis_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let unit = Unit {
             identity,
@@ -150,11 +145,7 @@ impl Unit {
         let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
         let source: &'static Source = Box::leak(Box::new(Source::from_front(front)));
         let compiled = exports.names();
-        let members: BTreeSet<Symbol> = compiled
-            .iter()
-            .filter(|name| registers(source, name))
-            .map(Symbol::new)
-            .collect();
+        let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
         let unit = Unit {
             identity,
             source,
@@ -651,18 +642,6 @@ impl ply_eval::Compiled for Bodies {
             .map(|mut ctx| std::mem::take(&mut ctx.teardown))
             .unwrap_or_default()
     }
-}
-
-/// Which compiled bodies the machine may enter: all, or only scalar signatures under
-/// `PLY_CODEGEN_REGISTER=narrow` (read once per process).
-fn registers(source: &Source, name: &str) -> bool {
-    !narrow_registry() || source.scalar_signature(name)
-}
-
-pub fn narrow_registry() -> bool {
-    static NARROW: OnceLock<bool> = OnceLock::new();
-    *NARROW
-        .get_or_init(|| std::env::var("PLY_CODEGEN_REGISTER").is_ok_and(|v| v.trim() == "narrow"))
 }
 
 /// The largest subset of `candidates` the emitter compiles as one unit, and what it dropped.

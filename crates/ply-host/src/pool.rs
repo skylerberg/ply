@@ -49,6 +49,10 @@ pub enum Done {
     MaybeStrings(Option<Vec<String>>),
     /// `None` at end of input, which is what reading a line past the last one answers.
     MaybeString(Option<String>),
+    /// A walk's entries, each a path and the kind constructor it names; `None` for no directory.
+    MaybeEntries(Option<Vec<(String, &'static str)>>),
+    /// A path's nine permission bits, as `std.fs.Mode` holds them.
+    MaybeMode(Option<u32>),
     /// A constructor with no fields, by the program-wide name the declaring module gives it.
     Ctor(&'static str),
     Finished(Exit),
@@ -344,6 +348,15 @@ fn take(state: &mut State, token: u64) -> Taken {
             })))
         }
         Done::MaybeString(text) => Ok(option(text.map(Value::str))),
+        Done::MaybeEntries(entries) => Ok(option(entries.map(|entries| {
+            Value::list(
+                entries
+                    .into_iter()
+                    .map(|(path, kind)| entry(path, kind))
+                    .collect(),
+            )
+        }))),
+        Done::MaybeMode(bits) => Ok(option(bits.map(mode))),
         Done::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
         Done::Finished(exit) => Ok(finished(exit)),
         Done::MaybeFinished(exit) => Ok(option(exit.map(finished))),
@@ -369,6 +382,39 @@ fn finished(exit: Exit) -> Value {
         (Symbol::new("out"), Value::bytes(exit.out)),
     ]);
     Value::Record(Arc::new(fields.into_iter().collect()))
+}
+
+/// The record `std.fs.Entry` names.
+fn entry(path: String, kind: &'static str) -> Value {
+    record([
+        ("kind", Value::ctor(kind, Vec::new())),
+        ("path", Value::str(path)),
+    ])
+}
+
+/// The record `std.fs.Mode` names, each `std.fs.Access` one triple of its bits.
+fn mode(bits: u32) -> Value {
+    let access = |triple: u32| {
+        record([
+            ("execute", Value::Bool(triple & 1 != 0)),
+            ("read", Value::Bool(triple & 4 != 0)),
+            ("write", Value::Bool(triple & 2 != 0)),
+        ])
+    };
+    record([
+        ("group", access(bits >> 3 & 7)),
+        ("other", access(bits & 7)),
+        ("owner", access(bits >> 6 & 7)),
+    ])
+}
+
+fn record<const N: usize>(fields: [(&str, Value); N]) -> Value {
+    Value::Record(Arc::new(
+        fields
+            .into_iter()
+            .map(|(name, value)| (Symbol::new(name), value))
+            .collect(),
+    ))
 }
 
 fn heard_value(heard: Heard) -> Value {
