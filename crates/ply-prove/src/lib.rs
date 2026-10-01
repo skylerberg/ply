@@ -4,7 +4,6 @@
 // `Value` shares non-`Send` payloads through `Arc` by design.
 #![allow(clippy::arc_with_non_send_sync)]
 
-pub mod concurrency;
 pub mod sort;
 pub mod world;
 

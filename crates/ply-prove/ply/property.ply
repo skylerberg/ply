@@ -15,10 +15,14 @@ import obligation (Outcome, Held, Refuted, Vacuous, Unattempted, Defect, Gap, Un
                    Certificate, Cases, Instantiation, Binding, Tier, Proved, Property, Example,
                    Vacuity, Unsatisfiable, NoCaseKept, Counter, Fault, Judged, JHeld, JFailed,
                    JRejected, JRaised, JFaulted, NotDrawn, Law, Pure)
-import rules (Rule, GroundEvaluation, ExhaustiveEnumeration)
+import rules (Rule, GroundEvaluation, ExhaustiveEnumeration, ExhaustiveInterleaving)
 import shrink (Target, Falsifies, Raises, descend)
 import world (Obligation, World, Binder, Strategy, Interleave, Hosted, Static, Unhandled, Run,
               Every, Drawn, Points, unsettled, walks)
+import sim.plan
+import sim.plan (Seed, Dpor, seed_text)
+import sim.recording (Interleaving, Step, Passed, Failed, ACell)
+import sim.search (Exact, Why, Ran, Unscheduled, Diverged, explore_keeping)
 
 // One claim the run discharges: its place in the collection, the claim, and what the static prover
 // settled for it.
@@ -37,16 +41,22 @@ pub type Searched =
   | SSampled({ generated: Int, kept: Int, rejected: Int, instantiations: List<Instantiation> })
 
 // What a discharge asks the runtime, and what it answers: one conversation, because a function's
-// row is one row and a discharge needs both answers.
-pub type Ask = | AskJudged(List<Batch>) | AskSearched(Int, List<List<Value>>, Searched)
+// row is one row and a discharge needs both answers. A law over interleavings is run at one of its
+// points under one seed, within so many scheduling steps.
+pub type Ask = | AskJudged(List<Batch>) | AskInterleaved(Int, List<Value>, Seed, Int)
 
-pub type Reply = | Judgements(List<List<Judged>>) | SearchedOut(Outcome)
+pub type Reply = | Judgements(List<List<Judged>>) | Interleaved(LawRun)
+
+// One run of a law: `observed` when it entered a `simulate` region, without which there was no
+// schedule to vary.
+pub type LawRun = { interleaving: Interleaving<Judged>, observed: Bool }
 
 fn judge_with<| e>(ask: (Ask) -> Reply / e, batches: List<Batch>) -> List<List<Judged>> / e =
   match ask(AskJudged(batches)) { Judgements(js) -> js, _ -> [] }
 
-// What a run draws: the cases each root gives, the roots, and the re-runs a walk may cost.
-pub type Plan = { cases: Int, roots: List<Int>, shrink_budget: Int }
+// What a run draws: the cases each root gives, the roots, the re-runs a walk may cost, and the
+// interleavings a law over a `simulate` region is searched at.
+pub type Plan = { cases: Int, roots: List<Int>, shrink_budget: Int, sim: plan::Plan }
 
 // Fewer kept cases than this is concrete evidence with no coverage claim.
 pub fn min_property_cases() -> Int = 25
@@ -566,10 +576,7 @@ fn finished<| e>(
       shrunk(a, f.outcome, f.values, f.target, ts, plan, ask)
     } else { f.outcome },
     Unkept(u) -> witnessed(a, u.generated, u.witness, u.vacuous, ts, ask),
-    Kept(k) -> match ask(AskSearched(a.claim, k.points, k.searched)) {
-      SearchedOut(o) -> o,
-      _ -> Unattempted(UnhandledEffect(None)),
-    },
+    Kept(k) -> law_searched(a, k.points, k.searched, plan, ask),
   }
 
 fn first_judged(answers: List<List<Judged>>) -> Option<Judged> =
@@ -602,6 +609,218 @@ fn shrunk<| e>(
     other -> other,
   }
 }
+
+// --- A law over interleavings -----------------------------------------------------
+
+// What a law's searches came to across the points they ran at.
+type Totals = {
+  interleavings: Int,
+  evaluations: Int,
+  exhaustive: Bool,
+  exhausted: Bool,
+  observed: Bool,
+}
+
+// What one point's search keeps across its runs: how many entered a region, and whether all did.
+type Watch = { entered: Int, observed: Bool }
+
+// Each kept point searched in turn; the first failure is the law's.
+fn law_searched<| e>(
+  a: Asked,
+  points: List<List<Value>>,
+  searched: Searched,
+  p: Plan,
+  ask: (Ask) -> Reply / e,
+) -> Outcome / e = {
+  let sim = plan::normalized(p.sim);
+  let start = {
+    totals: {
+      interleavings: 0,
+      evaluations: 0,
+      exhaustive: true,
+      exhausted: false,
+      observed: true,
+    },
+    ended: None,
+  };
+  let walked = fold(
+    range(0, len(points)),
+    start,
+    |acc: { totals: Totals, ended: Option<Outcome> }, i: Int|
+      match ((acc.ended, list_at(points, i))) {
+        (None, Some(values)) -> {
+          let kept = explore_keeping(
+            sim,
+            Exact,
+            { entered: 0, observed: true },
+            |w: Watch, seed: Seed|
+              match ask(AskInterleaved(a.claim, values, seed, sim.steps)) {
+                Interleaved(r) ->
+                  {
+                    run: r.interleaving,
+                    state: {
+                      entered: if r.observed { w.entered + 1 } else { w.entered },
+                      observed: w.observed && r.observed,
+                    },
+                  },
+                Judgements(_) -> { run: unanswered(), state: w },
+              },
+          );
+          let e = kept.explored.exploration;
+          let totals = {
+            interleavings: acc.totals.interleavings + kept.state.entered,
+            evaluations: acc.totals.evaluations + e.explored,
+            exhaustive: acc.totals.exhaustive && e.exhaustive,
+            exhausted: acc.totals.exhausted || e.exhausted,
+            observed: acc.totals.observed && kept.state.observed,
+          };
+          match ((e.failure, kept.explored.failure)) {
+            (Some(seed), Some(fl)) ->
+              {
+                totals: totals,
+                ended: Some(law_failed(a.obligation, values, i, seed, fl.why, fl.notes)),
+              },
+            _ -> { totals: totals, ended: None },
+          }
+        },
+        _ -> acc,
+      },
+  );
+  match walked.ended { Some(o) -> o, None -> law_held(a.obligation, searched, sim, walked.totals) }
+}
+
+fn unanswered() -> Interleaving<Judged> =
+  {
+    steps: [],
+    verdict: Failed(
+      JFaulted({
+        code: "E0505",
+        message: "the runtime answered an interleaving with judgements",
+        notes: [],
+        values: [],
+      }),
+    ),
+    virtual_time: 0,
+  }
+
+// A body that came to `false` is a refutation, a raise is the program's gap, and a fault or a search
+// Ply cannot trust is Ply's defect. A race's counterexample is an interleaving: there is no draw to
+// shrink back to, so it is reported as it ran.
+fn law_failed(
+  o: Obligation,
+  values: List<Value>,
+  point: Int,
+  seed: Seed,
+  why: Why<Judged>,
+  notes: List<String>,
+) -> Outcome = {
+  let bs = bindings(o, values);
+  let again = "reproduce with `--sim once --seed " ++ seed_text(seed)
+    ++ "`, and report it with the test's source";
+  match why {
+    Ran(JFailed) ->
+      Refuted({
+        bindings: bs,
+        original: bs,
+        shrinks: 0,
+        root: root_int(seed.root),
+        case: point,
+        seed: Some(seed_text(seed)),
+      }),
+    Ran(JRaised(r)) -> Unattempted(Raised({ message: r.message, values: r.values, bindings: bs })),
+    Ran(JFaulted(f)) ->
+      Defect({
+        code: f.code,
+        message: f.message,
+        notes: appended(f.notes, notes),
+        values: f.values,
+        bindings: bs,
+      }),
+    Ran(_) ->
+      Defect({
+        code: "E0505",
+        message: "an interleaving search failed a run that held",
+        notes: notes,
+        values: [],
+        bindings: bs,
+      }),
+    Unscheduled(u) ->
+      Defect({
+        code: "E0505",
+        message: "the scheduler recorded a step that does not describe a schedule",
+        notes: appended([u.what, again], notes),
+        values: [],
+        bindings: bs,
+      }),
+    Diverged(d) ->
+      Defect({
+        code: "E0415",
+        message: "replaying seed " ++ seed_text(seed) ++ " did not reproduce the recorded schedule",
+        notes: appended(
+          [
+            d.what,
+            "a simulated run must be a pure function of its definition set and its seed; this is a defect in Ply rather than in the program under test",
+            again,
+          ],
+          notes,
+        ),
+        values: [],
+        bindings: bs,
+      }),
+  }
+}
+
+fn appended<a>(xs: List<a>, ys: List<a>) -> List<a> =
+  fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
+
+// A root past what an `Int` holds is reported as the least one, which no plan writes.
+fn root_int(r: U64) -> Int =
+  if r > 9223372036854775807u64 { 0 - 9223372036854775807 - 1 } else { int_of_u64(r) }
+
+// No point kept is a vacuity; every interleaving at every value is a proof; anything less samples
+// schedules, so it counts interleavings rather than values.
+fn law_held(o: Obligation, searched: Searched, sim: plan::Plan, t: Totals) -> Outcome =
+  match searched {
+    SEnumerated(d) -> if d.kept == 0 { Vacuous({ guard: guard_span(o), why: Unsatisfiable }) }
+    else if proves(sim, t) {
+      let enumerated = if len(o.binders) > 0 {
+        [ExhaustiveEnumeration({ domain: d.domain, points: d.points })]
+      } else { [] };
+      Held({
+        tier: Proved,
+        evidence: Proof({
+          rules: push(enumerated, ExhaustiveInterleaving(t.interleavings)),
+          steps: t.interleavings,
+          guard_satisfiable: true,
+          sorts: [],
+        }),
+      })
+    } else { sampled_schedules(sim, t, d.points - d.kept, []) },
+    SSampled(x) -> if x.kept == 0 {
+      Vacuous({ guard: guard_span(o), why: NoCaseKept(x.generated) })
+    } else { sampled_schedules(sim, t, x.rejected, x.instantiations) },
+  }
+
+// A search that entered no region emptied a frontier it never filled, so it proves nothing.
+fn proves(sim: plan::Plan, t: Totals) -> Bool =
+  sim.mode == Dpor && t.exhaustive && !t.exhausted && t.observed && t.interleavings > 0
+
+fn sampled_schedules(
+  sim: plan::Plan,
+  t: Totals,
+  rejected: Int,
+  instantiations: List<Instantiation>,
+) -> Outcome =
+  Held({
+    tier: if t.evaluations >= min_property_cases() { Property } else { Example },
+    evidence: Sampled({
+      generated: t.evaluations,
+      kept: t.evaluations,
+      rejected: rejected,
+      roots: map(sim.roots, root_int),
+      instantiations: instantiations,
+    }),
+  })
 
 // --- A witness of the guard -----------------------------------------------------
 
@@ -787,7 +1006,8 @@ fn sampled_claim(binders: List<Binder>) -> Obligation = claim_of(binders, Static
 
 fn no_world() -> World = { decls: [], signatures: [], obligations: [] }
 
-fn a_plan(cases: Int) -> Plan = { cases: cases, roots: [0], shrink_budget: 1000 }
+fn a_plan(cases: Int) -> Plan =
+  { cases: cases, roots: [0], shrink_budget: 1000, sim: plan::default_plan() }
 
 // A runtime that judges each point by `rule`, given how it is asked, and searches nothing.
 fn judging(rule: (Mode, List<Value>) -> Judged) -> (Ask) -> Reply =
@@ -795,7 +1015,11 @@ fn judging(rule: (Mode, List<Value>) -> Judged) -> (Ask) -> Reply =
     match a {
       AskJudged(bs) ->
         Judgements(map(bs, |b: Batch| map(b.points, |p: List<Value>| rule(b.mode, p)))),
-      AskSearched(_, _, _) -> SearchedOut(Unattempted(NotDrawn)),
+      AskInterleaved(_, _, _, _) ->
+        Interleaved({
+          interleaving: { steps: [], verdict: Passed, virtual_time: 0 },
+          observed: false,
+        }),
     }
 
 fn never_asked() -> (Ask) -> Reply = |a: Ask| panic("a settled claim asks the runtime nothing")
@@ -1004,14 +1228,77 @@ test "a law over interleavings is searched at the points its guard kept" {
             map(b.points, |p: List<Value>| if p == [VBool(true)] { JHeld } else { JRejected })
           }),
         ),
-      AskSearched(claim, points, searched) -> {
-        assert_eq((claim, points), (0, [[VBool(true)]]));
-        assert_eq(searched, SEnumerated({ domain: "Bool", points: 2, kept: 1 }));
-        SearchedOut(Unattempted(NotDrawn))
+      AskInterleaved(claim, point, seed, steps) -> {
+        assert_eq((claim, point, steps), (0, [VBool(true)], plan::default_steps()));
+        Interleaved({
+          interleaving: { steps: [one_step()], verdict: Passed, virtual_time: 0 },
+          observed: true,
+        })
       },
     };
-  assert_eq(run_one(o, Undecided, a_plan(10), ask), Unattempted(NotDrawn))
+  // One task, so one schedule, at the one value the guard kept: every interleaving of every value.
+  assert_eq(
+    run_one(o, Undecided, a_plan(10), ask),
+    Held({
+      tier: Proved,
+      evidence: Proof({
+        rules: [ExhaustiveEnumeration({ domain: "Bool", points: 2 }), ExhaustiveInterleaving(1)],
+        steps: 1,
+        guard_satisfiable: true,
+        sorts: [],
+      }),
+    }),
+  );
+  // A body that came to `false` under a seed is refuted at that seed, as it ran.
+  let refuting = |a: Ask|
+    match a {
+      AskJudged(bs) -> Judgements(map(bs, |b: Batch| map(b.points, |p: List<Value>| JHeld))),
+      AskInterleaved(_, point, _, _) ->
+        Interleaved({
+          interleaving: {
+            steps: [one_step()],
+            verdict: if point == [VBool(false)] { Failed(JFailed) } else { Passed },
+            virtual_time: 0,
+          },
+          observed: true,
+        }),
+    };
+  assert_eq(
+    run_one(o, Undecided, a_plan(10), refuting),
+    Refuted({
+      bindings: [{ name: "a", ty: "Bool", value: VBool(false) }],
+      original: [{ name: "a", ty: "Bool", value: VBool(false) }],
+      shrinks: 0,
+      root: 0,
+      case: 0,
+      seed: Some("0"),
+    }),
+  );
+  // A search whose runs never entered a region proves nothing however many it ran.
+  assert_eq(
+    match run_one(
+        o,
+        Undecided,
+        a_plan(10),
+        judging(|m: Mode, p: List<Value>| if p == [VBool(true)] { JHeld } else { JRejected }),
+      ) {
+      Held(h) -> h.tier,
+      _ -> Proved,
+    },
+    Example,
+  )
 }
+
+fn one_step() -> Step =
+  {
+    region: 0,
+    task: 0,
+    enabled: [0],
+    choice: 0,
+    accesses: [],
+    site: { definition: None, span: { module: 0, start: 0, end: 0 } },
+    stamp: [1],
+  }
 
 test "a run judges every claim's first points in one batch" {
   let x = sampled_claim([int_binder("x")]);
@@ -1028,7 +1315,7 @@ test "a run judges every claim's first points in one batch" {
         ]);
         Judgements(map(bs, |batch: Batch| map(batch.points, |p: List<Value>| JHeld)))
       },
-      AskSearched(_, _, _) -> panic("nothing to search"),
+      AskInterleaved(_, _, _, _) -> panic("nothing to search"),
     };
   let outcomes = discharged(
     [
@@ -1049,4 +1336,231 @@ test "every variable of the binders is drawn as an Int, in the order it first ap
     variables: ["a", "b"],
   };
   assert_eq(instantiations(o), [{ var: "b", ty: "Int" }, { var: "a", ty: "Int" }])
+}
+
+// `tasks` tasks each reading a shared counter and writing it back: the lost update. A choice past
+// the seed's path takes the first enabled task. No clocks, so every dependent pair is a candidate.
+fn counter_run(tasks: Int, holds: (Int) -> Bool, seed: Seed) -> Interleaving<Judged> = {
+  let start = {
+    pc: map(range(0, tasks), |_t: Int| 0),
+    reg: map(range(0, tasks), |_t: Int| 0),
+    counter: 0,
+    steps: [],
+  };
+  let end = iterate(
+    start,
+    4 * tasks + 2,
+    |st: { pc: List<Int>, reg: List<Int>, counter: Int, steps: List<Step> }| {
+      let enabled = filter(range(0, tasks), |t: Int|
+        match list_at(st.pc, t) { Some(p) -> p < 2, None -> false });
+      if len(enabled) == 0 { Stop(st) } else {
+        let choice = match list_at(seed.path, len(st.steps)) {
+          Some(c) -> min(c, len(enabled) - 1),
+          None -> 0,
+        };
+        let t = match list_at(enabled, choice) { Some(x) -> x, None -> 0 };
+        let pc = match list_at(st.pc, t) { Some(p) -> p, None -> 0 };
+        let reading = pc == 0;
+        let reg = if reading { list_set(st.reg, t, st.counter) } else { st.reg };
+        let counter = if reading { st.counter }
+        else { match list_at(st.reg, t) { Some(r) -> r + 1, None -> 0 } };
+        Continue({
+          pc: list_set(st.pc, t, pc + 1),
+          reg: reg,
+          counter: counter,
+          steps: push(st.steps, {
+            region: 0,
+            task: t,
+            enabled: enabled,
+            choice: choice,
+            accesses: [ACell({ index: 0, generation: 0, write: !reading })],
+            site: { definition: Some("transfer"), span: { module: 0, start: 0, end: 0 } },
+            stamp: [],
+          }),
+        })
+      }
+    },
+  );
+  {
+    steps: end.steps,
+    verdict: if holds(end.counter) { Passed } else { Failed(JFailed) },
+    virtual_time: 0,
+  }
+}
+
+// A runtime whose guard keeps every point and whose law body is `run` at each seed.
+fn law_runtime(run: (Seed) -> Interleaving<Judged>, observed: Bool) -> (Ask) -> Reply =
+  |a: Ask|
+    match a {
+      AskJudged(bs) -> Judgements(map(bs, |b: Batch| map(b.points, |p: List<Value>| JHeld))),
+      AskInterleaved(_, _, seed, _) -> Interleaved({ interleaving: run(seed), observed: observed }),
+    }
+
+fn ground_law() -> Obligation =
+  match finite([], []) {
+    Some(d) -> claim_of([], Interleave(Every(d, "Unit"))),
+    None -> panic("a ground domain"),
+  }
+
+fn bool_law() -> Obligation =
+  match finite([Con("Bool", [])], []) {
+    Some(d) -> claim_of([bool_binder("b")], Interleave(Every(d, "Bool"))),
+    None -> panic("finite"),
+  }
+
+fn sampled_law() -> Obligation = claim_of([int_binder("n")], Interleave(Drawn))
+
+fn dpor_plan(budget: Int) -> Plan = { ..a_plan(4), sim: { ..plan::default_plan(), budget: budget } }
+
+fn tier_of(o: Outcome) -> Option<Tier> = match o { Held(h) -> Some(h.tier), _ -> None }
+
+test "a law that holds under every interleaving is proved, and its certificate names the search" {
+  match run_one(
+      ground_law(),
+      Undecided,
+      dpor_plan(64),
+      law_runtime(|s: Seed| counter_run(2, |c: Int| c <= 2, s), true),
+    ) {
+    Held(h) -> match h.evidence {
+      Proof(c) -> {
+        assert_eq(h.tier, Proved);
+        assert(c.steps > 1);
+        assert_eq(c.rules, [ExhaustiveInterleaving(c.steps)])
+      },
+      _ -> panic("not a proof"),
+    },
+    _ -> panic("not held"),
+  };
+  // A finite value domain is named beside the search.
+  match run_one(
+      bool_law(),
+      Undecided,
+      dpor_plan(64),
+      law_runtime(|s: Seed| counter_run(2, |c: Int| c <= 2, s), true),
+    ) {
+    Held(h) -> match h.evidence {
+      Proof(c) ->
+        assert_eq(list_at(c.rules, 0), Some(ExhaustiveEnumeration({ domain: "Bool", points: 2 }))),
+      _ -> panic("not a proof"),
+    },
+    _ -> panic("not held"),
+  }
+}
+
+test "a law that holds only sometimes is refuted at the interleaving that broke it, which replays" {
+  let breaks = |s: Seed| counter_run(2, |c: Int| c == 2, s);
+  match run_one(ground_law(), Undecided, dpor_plan(64), law_runtime(breaks, true)) {
+    Refuted(cx) -> match cx.seed {
+      Some(text) -> {
+        assert(string_contains(text, ":"));
+        // The seed it names fails again, alone.
+        match plan::parse_seed(text) {
+          Some(seed) ->
+            assert_eq(
+              tier_of(
+                run_one(
+                  ground_law(),
+                  Undecided,
+                  { ..a_plan(4), sim: plan::once(seed) },
+                  law_runtime(breaks, true),
+                ),
+              ),
+              None,
+            ),
+          None -> panic("an unreadable seed"),
+        }
+      },
+      None -> panic("no seed"),
+    },
+    _ -> panic("not refuted"),
+  };
+  // Two runs over one law agree.
+  assert_eq(
+    run_one(ground_law(), Undecided, dpor_plan(64), law_runtime(breaks, true)),
+    run_one(ground_law(), Undecided, dpor_plan(64), law_runtime(breaks, true)),
+  )
+}
+
+test "a search that spends its budget, samples its values or runs a sampled plan proves nothing" {
+  let holds = law_runtime(|s: Seed| counter_run(3, |c: Int| c <= 3, s), true);
+  match run_one(ground_law(), Undecided, dpor_plan(30), holds) {
+    Held(h) -> match h.evidence {
+      Sampled(c) -> assert_eq((h.tier, c.kept, c.generated), (Property, 30, 30)),
+      _ -> panic("not sampled"),
+    },
+    _ -> panic("not held"),
+  };
+  assert(
+    tier_of(
+        run_one(
+          sampled_law(),
+          Undecided,
+          dpor_plan(64),
+          law_runtime(|s: Seed| counter_run(2, |c: Int| c <= 2, s), true),
+        ),
+      )
+      != Some(Proved),
+  );
+  let random = { ..a_plan(4), sim: plan::random(4) };
+  assert(
+    tier_of(
+        run_one(
+          ground_law(),
+          Undecided,
+          random,
+          law_runtime(|s: Seed| counter_run(2, |c: Int| c <= 2, s), true),
+        ),
+      )
+      != Some(Proved),
+  )
+}
+
+test "a search that reached no region schedules nothing and proves nothing" {
+  let nowhere = law_runtime(|s: Seed| { steps: [], verdict: Passed, virtual_time: 0 }, false);
+  assert(tier_of(run_one(ground_law(), Undecided, dpor_plan(64), nowhere)) != Some(Proved))
+}
+
+test "a body that raises is a gap, and one Ply failed to run is its defect" {
+  let raising = law_runtime(
+    |s: Seed|
+      {
+        steps: [],
+        verdict: Failed(JRaised({ message: "divided by zero", values: [] })),
+        virtual_time: 0,
+      },
+    false,
+  );
+  match run_one(bool_law(), Undecided, dpor_plan(64), raising) {
+    Unattempted(Raised(r)) -> assert_eq((r.message, len(r.bindings)), ("divided by zero", 1)),
+    _ -> panic("not a raise"),
+  };
+  let faulting = law_runtime(
+    |s: Seed|
+      {
+        steps: [],
+        verdict: Failed(JFaulted({ code: "E0415", message: "diverged", notes: [], values: [] })),
+        virtual_time: 0,
+      },
+    false,
+  );
+  match run_one(bool_law(), Undecided, dpor_plan(64), faulting) {
+    Defect(f) -> assert_eq((f.code, len(f.bindings)), ("E0415", 1)),
+    _ -> panic("not a defect"),
+  }
+}
+
+test "a domain the guard emptied is vacuous, and not proved" {
+  let rejecting = |a: Ask|
+    match a {
+      AskJudged(bs) -> Judgements(map(bs, |b: Batch| map(b.points, |p: List<Value>| JRejected))),
+      AskInterleaved(_, _, _, _) -> panic("nothing kept, so nothing to search"),
+    };
+  match run_one(bool_law(), Undecided, dpor_plan(64), rejecting) {
+    Vacuous(v) -> assert_eq(v.why, Unsatisfiable),
+    _ -> panic("not vacuous"),
+  };
+  match run_one(sampled_law(), Undecided, dpor_plan(64), rejecting) {
+    Vacuous(v) -> assert_eq(v.why, NoCaseKept(4)),
+    _ -> panic("not vacuous"),
+  }
 }
