@@ -8,7 +8,7 @@ pub mod region;
 pub mod sim;
 
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
-use ply_eval::host::{HostBinding, HostRuntime};
+use ply_eval::host::HostBinding;
 use ply_eval::{
     Arena, CheckOutput, DefHash, Diagnostic, Exploration, HashOutput, Machine, Plan, Race, Seed,
     Symbol, TaskRegions, Value, codes,
@@ -342,27 +342,24 @@ impl Search {
 }
 
 #[derive(Default)]
-pub struct Hosting<'a> {
+pub struct Hosting {
     binding: Option<Arc<HostBinding>>,
     /// A factory: a runtime handle belongs to one thread, and the runner has a machine per worker.
-    runtime: Option<&'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync)>,
+    runtime: Option<ply_eval::RuntimeFactory>,
 }
 
-impl<'a> Hosting<'a> {
-    pub fn hermetic() -> Hosting<'a> {
+impl Hosting {
+    pub fn hermetic() -> Hosting {
         Hosting::default()
     }
 
-    pub fn with_binding(mut self, binding: Arc<HostBinding>) -> Hosting<'a> {
+    pub fn with_binding(mut self, binding: Arc<HostBinding>) -> Hosting {
         self.binding = Some(binding);
         self
     }
 
     /// What a [`ply_eval::host::HostAnswer::Pending`] is polled on.
-    pub fn with_runtime(
-        mut self,
-        runtime: &'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync),
-    ) -> Hosting<'a> {
+    pub fn with_runtime(mut self, runtime: ply_eval::RuntimeFactory) -> Hosting {
         self.runtime = Some(runtime);
         self
     }
@@ -371,7 +368,7 @@ impl<'a> Hosting<'a> {
 pub struct InterpExecutor<'a> {
     front: &'a ply_eval::Front,
     fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
-    hosts: Hosting<'a>,
+    hosts: Hosting,
     /// The unit every worker attaches the tier its machines run on from.
     provider: &'static dyn ply_eval::Provider,
     search: Search,
@@ -467,7 +464,7 @@ impl<'a> InterpExecutor<'a> {
         self
     }
 
-    pub fn with_hosts(mut self, hosts: Hosting<'a>) -> Self {
+    pub fn with_hosts(mut self, hosts: Hosting) -> Self {
         self.hosts = hosts;
         self
     }
@@ -490,8 +487,8 @@ impl<'a> InterpExecutor<'a> {
         if let Some(binding) = &self.hosts.binding {
             machine.set_host_binding(Arc::clone(binding));
         }
-        if let Some(runtime) = self.hosts.runtime {
-            machine.set_host_runtime(runtime());
+        if let Some(runtime) = &self.hosts.runtime {
+            machine.set_host_runtime(Arc::clone(runtime));
         }
         Ok(Box::new(machine))
     }

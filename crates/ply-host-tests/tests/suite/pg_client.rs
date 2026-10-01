@@ -183,7 +183,7 @@ fn run(entry: &str, args: Vec<Value>, script: Vec<Vec<u8>>) -> Result<Ran, Strin
 /// The same entries, but over the real network: a cluster is the only peer that can say whether
 /// the client's SCRAM is a SCRAM a server accepts.
 fn run_over_tcp(entry: &str, args: Vec<Value>) -> Result<Ran, String> {
-    let host = ply_host::Host::new();
+    let host = std::sync::Arc::new(ply_host::Host::new());
     let (front, unit) = tiered(CLIENT);
     let binding = host
         .registry()
@@ -194,7 +194,10 @@ fn run_over_tcp(entry: &str, args: Vec<Value>) -> Result<Ran, String> {
         .expect("the unit was compiled from this program");
     machine.set_host_binding(Arc::new(binding));
     // The real socket answers `Pending`, so the machine needs something to wait on.
-    machine.set_host_runtime(host.runtime());
+    machine.set_host_runtime({
+        let host = std::sync::Arc::clone(&host);
+        std::sync::Arc::new(move || host.runtime())
+    });
     let declared = front
         .check
         .defs

@@ -42,7 +42,13 @@ pub trait Compiled {
         None
     }
 
-    fn set_host(&self, _binding: Arc<HostBinding>, _runtime: Option<Rc<dyn HostRuntime>>) {}
+    fn set_host(
+        &self,
+        _binding: Arc<HostBinding>,
+        _runtime: Option<Rc<dyn HostRuntime>>,
+        _factory: Option<crate::host::RuntimeFactory>,
+    ) {
+    }
 
     fn set_declared(&self, _declared: Option<Footprint>) {}
 

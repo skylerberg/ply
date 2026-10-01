@@ -85,7 +85,7 @@ fn a_production_region_keeps_its_tables_to_the_tasks_still_live() {
     };
     let entry = native.entry("m.churn").expect("`churn` compiles");
     let mut ctx = native.context();
-    ctx.set_host(Arc::new(tasks_bound(front)), None);
+    ctx.set_host(Arc::new(tasks_bound(front)), None, None);
     ctx.begin(100_000);
     let rounds = 200;
     let answer = unsafe { entry(&mut ctx, [imm(rounds)].as_ptr()) };
@@ -164,7 +164,7 @@ fn a_production_region_that_drops_its_task_handles_gives_their_bridges_back() {
     };
     let entry = native.entry("m.fired").expect("`fired` compiles");
     let mut ctx = native.context();
-    ctx.set_host(Arc::new(tasks_bound(front)), None);
+    ctx.set_host(Arc::new(tasks_bound(front)), None, None);
     ctx.begin(100_000);
     let rounds = 10_000;
     let answer = unsafe { entry(&mut ctx, [imm(rounds)].as_ptr()) };

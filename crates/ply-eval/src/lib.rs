@@ -59,7 +59,8 @@ pub use cont::{Frame, Next, Prompt, Segment, SimId, Stack};
 pub use escape::{Boundary, Escapee, Handle};
 pub use host::{
     Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
-    HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, ShutdownReport,
+    HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory,
+    ShutdownReport,
 };
 pub use task_regions::{Fixture, TaskRegions};
 // `explore::Step` is not re-exported: `Step` at the root is the builtin's.

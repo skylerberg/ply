@@ -3,7 +3,7 @@
 //! are, and what their judgements come to, is the program's.
 
 use crate::load::Loaded;
-use ply_eval::host::{HostBinding, HostRuntime};
+use ply_eval::host::HostBinding;
 use ply_eval::{
     CheckOutput, DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, Span,
     Symbol, Value, codes,
@@ -56,7 +56,7 @@ pub struct Prover<'a> {
 /// keep one prover across many steps.
 pub struct Hosting {
     pub binding: Arc<HostBinding>,
-    pub runtime: Option<Arc<dyn Fn() -> Rc<dyn HostRuntime> + Sync + Send>>,
+    pub runtime: Option<ply_eval::RuntimeFactory>,
 }
 
 impl<'a> Prover<'a> {
@@ -167,7 +167,7 @@ impl<'a> Prover<'a> {
         let mut machine = self.machine()?;
         machine.set_host_binding(Arc::clone(&hosting.binding));
         if let Some(factory) = &hosting.runtime {
-            machine.set_host_runtime(factory());
+            machine.set_host_runtime(Arc::clone(factory));
         }
         Ok(machine)
     }

@@ -41,7 +41,7 @@ fn run_report(
     store: &mut Store,
     selection: &Selection,
     search: Search,
-    hosting: Hosting<'_>,
+    hosting: Hosting,
 ) -> RunReport {
     let unit = compiled.tier();
     let executor = InterpExecutor::new(&compiled.port, unit)

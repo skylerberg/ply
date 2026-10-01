@@ -625,7 +625,7 @@ fn evaluate(
 ) -> Result<PlyValue, Diagnostic> {
     let mut machine = ply_eval::Machine::new(front, compiled)?;
     machine.set_host_binding(hosts.binding());
-    if let Some(runtime) = hosts.runtime() {
+    if let Some(runtime) = hosts.runtime_factory() {
         machine.set_host_runtime(runtime);
     }
     if let Some(declared) = declared {

@@ -44,7 +44,7 @@ pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
 pub fn run_on_tier(
     loaded: &crate::load::Loaded,
     selection: &ply_test::Selection,
-    hosting: ply_test::Hosting<'_>,
+    hosting: ply_test::Hosting,
     store: &mut ply_store::Store,
 ) -> ply_test::RunReport {
     ply_codegen::c::producer::ensure_default();
