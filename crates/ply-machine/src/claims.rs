@@ -13,7 +13,7 @@ use crate::config::Configuration;
 use crate::engine::{Judgement, Mode};
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
-use crate::payload::{count, ctor, diags_value, option, places_value, record, strings};
+use crate::payload::{count, ctor, diags_value, places_value, record, strings};
 use crate::support::{build_pool, enter_constant, prover_backend};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
@@ -47,8 +47,6 @@ pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
         "Judged",
         &["JHeld", "JFailed", "JRejected", "JRaised", "JFaulted"],
     ),
-    ("sim.recording", "Access", &["AAtom", "ACell", "AAlloc"]),
-    ("sim.recording", "Verdict", &["Passed", "Failed"]),
     (
         "proof.rules",
         "Rule",
@@ -193,7 +191,7 @@ impl HostHandler for Site {
                 points_of(&PlyValue::list(vec![point.clone()]), span)?
                     .pop()
                     .unwrap_or_default(),
-                seed_of(seed, span)?,
+                crate::recording::seed_of(seed, span)?,
                 u32::try_from(steps.as_int(span, "the scheduling steps")?).unwrap_or(u32::MAX),
             )?,
             ("record", [entries]) => self.record(filed_of(entries, span)?)?,
@@ -268,27 +266,6 @@ fn instantiations_of(value: &PlyValue, span: Span) -> Result<Vec<(Symbol, String
             ))
         })
         .collect()
-}
-
-/// A `sim.plan.Seed`: its root and the choices before the stream decides.
-fn seed_of(value: &PlyValue, span: Span) -> Result<ply_eval::Seed, Diagnostic> {
-    use crate::payload::field_of;
-    let root = match field_of(value, "root", span)? {
-        PlyValue::Fixed(f) => f.bits() as u64,
-        _ => return Err(malformed("a seed's root is no `U64`", span)),
-    };
-    let mut path = Vec::new();
-    for choice in field_of(value, "path", span)?.as_list(span, "a seed's path")? {
-        path.push(
-            u16::try_from(choice.as_int(span, "a choice")?).map_err(|_| {
-                malformed(
-                    "a seed's choice is past what a scheduling point offers",
-                    span,
-                )
-            })?,
-        );
-    }
-    Ok(ply_eval::Seed::at(root, path))
 }
 
 /// A `proof.obligation.Evidence`.
@@ -1031,23 +1008,6 @@ struct Refused {
     sources: SourceMap,
 }
 
-/// Where a claim is written, as a label points at it.
-struct At {
-    module: u32,
-    start: u32,
-    end: u32,
-}
-
-impl At {
-    fn of(span: Span) -> At {
-        At {
-            module: span.source.0,
-            start: span.start,
-            end: span.end,
-        }
-    }
-}
-
 /// What loading the run came to. The obligations, and the definitions and laws a run answers for,
 /// are the program's; this counts the obligations, so a re-run can refuse an index that names none.
 struct Collection {
@@ -1081,14 +1041,6 @@ fn refusal_value(refused: &Refused, module: &str) -> PlyValue {
             ("places", places_value(&refused.sources)),
         ])],
     )
-}
-
-fn at_value(at: &At) -> PlyValue {
-    record(vec![
-        ("module", PlyValue::Int(i64::from(at.module))),
-        ("start", PlyValue::Int(i64::from(at.start))),
-        ("end", PlyValue::Int(i64::from(at.end))),
-    ])
 }
 
 fn roots_value(roots: &[u64]) -> PlyValue {
@@ -1242,95 +1194,16 @@ fn shown_values(diagnostic: &Diagnostic) -> PlyValue {
 /// One judgement as `proof.property` reads it.
 /// A `proof.property.Interleaved` reply's payload: the recording as `sim.recording` spells it.
 fn interleaved_value(run: &crate::engine::Interleaved) -> PlyValue {
-    let interleaving = &run.interleaving;
     record(vec![
         (
             "interleaving",
-            record(vec![
-                (
-                    "steps",
-                    PlyValue::list(interleaving.steps.iter().map(step_value).collect()),
-                ),
-                (
-                    "verdict",
-                    match &run.verdict {
-                        None => case("Verdict", "Passed", Vec::new()),
-                        Some(judged) => case("Verdict", "Failed", vec![judged_value(judged)]),
-                    },
-                ),
-                ("virtual_time", PlyValue::Int(interleaving.virtual_time)),
-            ]),
+            crate::recording::interleaving_value(
+                &run.interleaving,
+                run.verdict.as_ref().map(judged_value),
+            ),
         ),
         ("observed", PlyValue::Bool(run.observed)),
     ])
-}
-
-fn step_value(step: &ply_eval::explore::Step) -> PlyValue {
-    let int = |n: u64| PlyValue::Int(i64::try_from(n).unwrap_or(i64::MAX));
-    record(vec![
-        ("region", int(u64::from(step.region.0))),
-        ("task", int(step.task.0)),
-        (
-            "enabled",
-            PlyValue::list(step.enabled.iter().map(|t| int(t.0)).collect()),
-        ),
-        ("choice", PlyValue::Int(i64::from(step.choice))),
-        (
-            "accesses",
-            PlyValue::list(step.accesses.accesses().map(access_value).collect()),
-        ),
-        (
-            "site",
-            record(vec![
-                (
-                    "definition",
-                    option(step.definition.as_ref().map(|d| PlyValue::str(d.as_str()))),
-                ),
-                ("span", at_value(&At::of(step.span))),
-            ]),
-        ),
-        (
-            "stamp",
-            PlyValue::list(step.stamp.iter().map(|&n| int(u64::from(n))).collect()),
-        ),
-    ])
-}
-
-fn access_value(access: &ply_eval::sim::Access) -> PlyValue {
-    use ply_eval::sim::Access;
-    match access {
-        Access::Atom(atom) => case(
-            "Access",
-            "AAtom",
-            vec![record(vec![
-                ("effect", PlyValue::str(atom.effect.as_str())),
-                (
-                    "resource",
-                    option(match &atom.resource {
-                        ply_eval::Resource::Named(name) => Some(PlyValue::str(name.as_str())),
-                        ply_eval::Resource::Var(n) => Some(PlyValue::str(format!("${n}"))),
-                        ply_eval::Resource::Every => Some(PlyValue::str("*")),
-                        ply_eval::Resource::Singleton => None,
-                    }),
-                ),
-                ("write", PlyValue::Bool(atom.mode == ply_eval::Mode::Write)),
-                (
-                    "op",
-                    option(atom.op.as_ref().map(|op| PlyValue::str(op.as_str()))),
-                ),
-            ])],
-        ),
-        Access::Cell { id, mode } => case(
-            "Access",
-            "ACell",
-            vec![record(vec![
-                ("index", PlyValue::Int(i64::from(id.index()))),
-                ("generation", PlyValue::Int(i64::from(id.generation()))),
-                ("write", PlyValue::Bool(*mode == ply_eval::Mode::Write)),
-            ])],
-        ),
-        Access::Alloc => case("Access", "AAlloc", Vec::new()),
-    }
 }
 
 fn judged_value(judgement: &Judgement) -> PlyValue {

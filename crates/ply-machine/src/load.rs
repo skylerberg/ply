@@ -36,7 +36,7 @@ pub struct Loaded {
     pub files: Vec<Found>,
     pub sources: SourceMap,
     /// Handed to `ply_codegen::Unit::over_front` so one invocation runs one front end.
-    pub front: Front,
+    pub front: std::sync::Arc<Front>,
     /// [`Front::check`].
     pub check: CheckOutput,
     /// [`Front::hashes`].

@@ -27,6 +27,7 @@ pub mod mutate;
 pub mod options;
 pub mod payload;
 pub mod policy;
+pub mod recording;
 pub mod reused;
 pub mod shelf;
 pub mod simulation;

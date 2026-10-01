@@ -40,23 +40,6 @@ pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-/// Runs `selection` on the compiled tier built from `loaded`'s module source texts.
-pub fn run_on_tier(
-    loaded: &crate::load::Loaded,
-    selection: &ply_test::Selection,
-    hosting: ply_test::Hosting,
-    store: &mut ply_store::Store,
-) -> ply_test::RunReport {
-    ply_codegen::c::producer::ensure_default();
-    let texts = module_texts(&loaded.check, &loaded.sources);
-    let unit =
-        ply_codegen::Unit::over_front(&loaded.front, texts).expect("this host has a C compiler");
-    let executor = ply_test::InterpExecutor::new(&loaded.front, unit)
-        .with_search(ply_test::Search::of(selection))
-        .with_hosts(hosting);
-    ply_test::run_with(selection, &loaded.check, &loaded.hashes, store, &executor)
-}
-
 pub fn module_texts(
     check: &ply_eval::CheckOutput,
     sources: &SourceMap,
