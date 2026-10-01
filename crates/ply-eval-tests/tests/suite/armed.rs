@@ -1605,6 +1605,45 @@ fn ambiguous_enum_names_are_declared() {
     );
 }
 
+/// A library whose `[lib]` says `test = false` is never built as a test, so a `#[cfg(test)]` item
+/// in its source compiles under clippy and never runs.
+#[test]
+fn no_library_that_never_runs_its_unit_tests_holds_one() {
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a readable source directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = workspace_root();
+    let mut offenders = Vec::new();
+    for member in workspace_members(&root) {
+        let dir = root.join("crates").join(&member);
+        let manifest =
+            std::fs::read_to_string(dir.join("Cargo.toml")).expect("a member has a manifest");
+        if !manifest.lines().any(|line| line.trim() == "test = false") {
+            continue;
+        }
+        let mut files = Vec::new();
+        rust_files(&dir.join("src"), &mut files);
+        for path in files {
+            let raw = std::fs::read(&path).expect("a readable source file");
+            if contains(&blank_literals_and_comments(&raw), b"#[cfg(test)]") {
+                offenders.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these libraries never run their unit tests, so a test here is never run: {offenders:?}\n\n\
+         Move it to the library's `-tests` package."
+    );
+}
+
 fn mask_of(src: &str) -> Vec<bool> {
     let text = blank_cfg_test_blocks(&blank_literals_and_comments(src.as_bytes()));
     let mut masked = vec![false; text.len()];

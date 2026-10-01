@@ -457,8 +457,7 @@ impl Drive {
         ply_eval::rc::reset();
         let started = Instant::now();
         // The `ply` program performing this is inside a scope that zeroed the thread-local
-        // budgets, and the lookup prefers a thread-local to the process value, so the entry's own
-        // bounds are set here, on the thread it runs on, and nowhere else.
+        // budgets, so the entry's own bounds are set here, on the thread it runs on.
         let ended = ply_codegen::rt::with_step_budget(options.steps, || {
             ply_codegen::rt::with_time_budget(options.timeout, || {
                 evaluate(
@@ -626,10 +625,8 @@ fn evaluate(
         .map(|answer| answer.map_err(|d| place_the_unplaced(d, call.name)))
 }
 
-/// A raise with no place says what failed and not what was running, which is
-/// the most confusing shape a runtime error has — it cost a session thirty
-/// tool calls to trace one to a stale compiled stage. Name the entry point.
-fn place_the_unplaced(mut d: Diagnostic, entry: &str) -> Diagnostic {
+/// A raise with no place says what failed and not what was running, so it names the entry point.
+pub fn place_the_unplaced(mut d: Diagnostic, entry: &str) -> Diagnostic {
     let placed = d.labels.iter().any(|l| l.span != Span::DUMMY);
     if !placed {
         d = d.note(format!(
@@ -1182,32 +1179,4 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
         },
         profile: str_at("profile")?,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::place_the_unplaced;
-    use ply_eval::{Diagnostic, Span, codes};
-
-    #[test]
-    fn a_raise_with_no_place_names_the_entry_point_it_came_from() {
-        let bare = Diagnostic::error(codes::RUNTIME_ERROR, "`len` expects a List or String");
-        let placed = place_the_unplaced(bare, "ply.main");
-        assert!(
-            placed
-                .notes
-                .iter()
-                .any(|n| n.contains("no place in the source") && n.contains("ply.main")),
-            "{:?}",
-            placed.notes
-        );
-    }
-
-    #[test]
-    fn a_raise_that_has_a_place_is_left_alone() {
-        let with_place = Diagnostic::error(codes::RUNTIME_ERROR, "boom")
-            .primary(Span::new(ply_eval::SourceId(0), 1, 2), "here");
-        let same = place_the_unplaced(with_place, "ply.main");
-        assert!(same.notes.is_empty(), "{:?}", same.notes);
-    }
 }

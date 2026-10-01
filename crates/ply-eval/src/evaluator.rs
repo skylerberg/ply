@@ -8,8 +8,7 @@ use crate::sim::{DEFAULT_STEPS, Seed};
 use crate::trace::Trace;
 use crate::value::Value;
 use crate::{
-    Arena, DefHash, Diagnostic, EffectAtom, Footprint, Front, ModuleName, Span, Symbol,
-    TaskRegions, codes, region,
+    DefHash, Diagnostic, EffectAtom, Footprint, Front, ModuleName, Span, Symbol, codes, region,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,7 +18,6 @@ pub struct Machine<'a> {
     id: MachineId,
     /// Its tests are [`Machine::eval_test`]'s indices; its hashes name the unit it may enter.
     front: &'a Front,
-    regions: TaskRegions,
     trace: Trace,
     max_calls: usize,
     /// Seed and per-interleaving step budget for the next entry point's `simulate` regions.
@@ -85,7 +83,6 @@ impl<'a> Machine<'a> {
         let machine = Machine {
             id: MachineId::next(),
             front,
-            regions: TaskRegions::new(),
             trace: Trace::new(),
             max_calls: DEFAULT_MAX_CALLS,
             seed: Seed::default(),
@@ -133,10 +130,6 @@ impl<'a> Machine<'a> {
         self.share_host();
     }
 
-    pub fn host_binding(&self) -> &HostBinding {
-        &self.binding
-    }
-
     pub fn host_ops(&self) -> u64 {
         self.host_ops
     }
@@ -169,34 +162,13 @@ impl<'a> Machine<'a> {
         &self.trace
     }
 
-    pub fn cells(&self) -> &Arena {
-        self.regions.arena()
-    }
-
-    pub fn cells_mut(&mut self) -> &mut Arena {
-        self.regions.arena_mut()
-    }
-
-    pub fn regions(&self) -> &TaskRegions {
-        &self.regions
-    }
-
     /// Entries the tier ran, and entries it declined, over this machine's life.
     pub fn compiled_counts(&self) -> (u64, u64) {
         (self.compiled_entries, self.compiled_declines)
     }
 
-    /// Every subsequent entry point resets to this stack's fixture rather than to an empty one.
-    pub fn set_regions(&mut self, regions: TaskRegions) {
-        self.regions = regions;
-    }
-
     pub fn test_count(&self) -> usize {
         self.front.check.tests.len()
-    }
-
-    pub fn test_name(&self, index: usize) -> Option<&'a str> {
-        self.front.check.tests.get(index).map(|t| t.name.as_str())
     }
 
     /// `index` into the front's tests: load order, then source order.

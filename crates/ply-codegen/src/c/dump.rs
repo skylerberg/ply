@@ -6,10 +6,10 @@
 
 use ply_eval::decode::{At, Error};
 use ply_eval::{
-    Carry, DefHash, DefInfo, DefWritten, Diagnostic, Edit, EffectAtom, EffectInfo, EffectSet,
-    EmitterRoot, Fix, Footprint, Front, HashOutput, Hashed, INT_TYPES, Label, LawInfo, Literal,
-    Mode, ModuleInfo, ModuleName, OpInfo, Ordinal, Pinned, Resource, Severity, SourceId, Span,
-    SpecInfo, SpecKind, Symbol, TestInfo, TypeDecl, Value, Visibility, WrittenParam, intern_code,
+    Carry, DefHash, DefInfo, DefWritten, Diagnostic, Edit, EffectAtom, EffectInfo, EmitterRoot,
+    Fix, Footprint, Front, HashOutput, INT_TYPES, Label, LawInfo, Mode, ModuleInfo, ModuleName,
+    OpInfo, Ordinal, Pinned, Resource, Severity, SourceId, Span, SpecKind, Symbol, TestInfo,
+    TypeDecl, Value, Visibility, WrittenParam, intern_code,
 };
 use std::collections::BTreeMap;
 
@@ -33,7 +33,6 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
         return Ok(front);
     }
 
-    front.order = symbols(d.field("order")?)?;
     front.packages = d.field("packages")?.items(|p| {
         Ok((
             p.field("prefix")?.utf8()?.to_string(),
@@ -50,16 +49,6 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
     front.mod_pkg = d.field("mod_pkg")?.items(|i| i.number())?;
     for m in d.field("modules")?.list()? {
         let name = m.field("name")?.utf8()?;
-        let sets = m.field("sets")?.items(|s| {
-            Ok(EffectSet {
-                name: Symbol::new(s.field("name")?.utf8()?),
-                includes: symbols(s.field("includes")?)?,
-                atoms: footprint(s.field("atoms")?)?,
-            })
-        })?;
-        if !sets.is_empty() {
-            front.effect_sets.insert(Symbol::new(name), sets);
-        }
         let index = m.field("index")?;
         let source = *sources.get(index.number::<usize>()?).ok_or_else(|| {
             index.error(format!(
@@ -89,14 +78,10 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
         front.types.insert(decl.name.clone(), decl);
     }
     for (i, t) in d.field("tests")?.list()?.enumerate() {
-        let (test, name_span) = r.test(t, i)?;
-        front.check.tests.push(test);
-        front.test_name_spans.push(name_span);
+        front.check.tests.push(r.test(t, i)?);
     }
     for (i, l) in d.field("laws")?.list()?.enumerate() {
-        let (law, literals) = r.law(l, i)?;
-        front.check.laws.push(law);
-        front.law_literals.push(literals);
+        front.check.laws.push(r.law(l, i)?);
     }
     for e in d.field("effects")?.list()? {
         let (effect, vis) = r.effect(e)?;
@@ -115,7 +100,6 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
         Ok(EmitterRoot {
             root: Symbol::new(e.field("root")?.utf8()?),
             arity: e.field("arity")?.number()?,
-            scalar: e.field("scalar")?.bool()?,
             pure: e.field("pure")?.bool()?,
             span: r.span(e.field("at")?)?,
             params: carries(e.field("params")?)?,
@@ -162,17 +146,12 @@ fn hashes(rows: At<'_>, front: &mut Front) -> Result<(), Error> {
     let tests = front.check.tests.len();
     let laws = front.check.laws.len();
     let mut test_hashes: Vec<Option<DefHash>> = vec![None; tests];
-    let mut law_hashes: Vec<Option<(DefHash, DefHash)>> = vec![None; laws];
+    let mut laws_hashed = vec![false; laws];
     for row in rows.list()? {
         let c = row.ctor()?;
         let h = c.arg(0)?;
         match c.name() {
-            "HDef" => {
-                def_hash(h, &mut front.hashes)?;
-                front
-                    .hash_order
-                    .push(Hashed::Def(Symbol::new(h.field("name")?.utf8()?)));
-            }
+            "HDef" => def_hash(h, &mut front.hashes)?,
             "HTest" => {
                 let i = item(h, tests, "test")?;
                 let key = front.check.tests[i].key.clone();
@@ -180,17 +159,14 @@ fn hashes(rows: At<'_>, front: &mut Front) -> Result<(), Error> {
                 if test_hashes[i].replace(hash).is_some() {
                     return Err(h.error(format!("test {i} is hashed twice")));
                 }
-                front.hash_order.push(Hashed::Test(i));
             }
             "HLaw" => {
                 let i = item(h, laws, "law")?;
                 let key = front.check.laws[i].key.clone();
-                let hash = item_hash(h, &key, &mut front.hashes)?;
-                let text = hash_of(h.field("text")?)?;
-                if law_hashes[i].replace((hash, text)).is_some() {
+                item_hash(h, &key, &mut front.hashes)?;
+                if std::mem::replace(&mut laws_hashed[i], true) {
                     return Err(h.error(format!("law {i} is hashed twice")));
                 }
-                front.hash_order.push(Hashed::Law(i));
             }
             _ => return Err(c.unknown()),
         }
@@ -199,10 +175,8 @@ fn hashes(rows: At<'_>, front: &mut Front) -> Result<(), Error> {
         let hash = hash.ok_or_else(|| rows.error(format!("test {i} has no hash row")))?;
         front.hashes.tests.push(hash);
     }
-    for (i, hashes) in law_hashes.into_iter().enumerate() {
-        let (hash, text) = hashes.ok_or_else(|| rows.error(format!("law {i} has no hash row")))?;
-        front.hashes.laws.push(hash);
-        front.hashes.law_texts.push(text);
+    if let Some(i) = laws_hashed.iter().position(|hashed| !hashed) {
+        return Err(rows.error(format!("law {i} has no hash row")));
     }
     Ok(())
 }
@@ -216,19 +190,8 @@ fn def_hash(h: At<'_>, out: &mut HashOutput) -> Result<(), Error> {
     if let Some(x) = h.field("def")?.option()? {
         out.defs.insert(name.clone(), hash_of(x)?);
     }
-    if let Some(x) = h.field("own")?.option()? {
-        out.own.insert(name.clone(), hash_of(x)?);
-    }
     if let Some(x) = h.field("decl")?.option()? {
         out.decls.insert(name.clone(), hash_of(x)?);
-    }
-    let specs = h.field("specs")?.items(hash_of)?;
-    if !specs.is_empty() {
-        out.specs.insert(name.clone(), specs);
-    }
-    let spec_texts = h.field("spec_texts")?.items(hash_of)?;
-    if !spec_texts.is_empty() {
-        out.spec_texts.insert(name.clone(), spec_texts);
     }
     out.deps.insert(name.clone(), symbols(h.field("deps")?)?);
     out.closure
@@ -286,44 +249,6 @@ fn visibility(public: bool) -> Visibility {
     } else {
         Visibility::Private
     }
-}
-
-fn spec_kind(x: At<'_>) -> Result<SpecKind, Error> {
-    match x.utf8()? {
-        "requires" => Ok(SpecKind::Requires),
-        "ensures" => Ok(SpecKind::Ensures),
-        other => Err(x.error(format!("`{other}` is not `requires` or `ensures`"))),
-    }
-}
-
-/// `<int|str|bytes> <value>`: a literal a guard mentions, a bytes one as hex.
-fn literal(x: At<'_>) -> Result<Literal, Error> {
-    let text = x.utf8()?;
-    let Some((kind, value)) = text.split_once(' ') else {
-        return Err(x.error(format!("`{text}` is not `<int|str|bytes> <value>`")));
-    };
-    match kind {
-        "int" => value
-            .parse()
-            .map(Literal::Int)
-            .map_err(|_| x.error(format!("`{value}` is not an integer"))),
-        "str" => Ok(Literal::Str(value.to_string())),
-        "bytes" => unhex(value)
-            .map(Literal::Bytes)
-            .ok_or_else(|| x.error(format!("`{value}` is not hex"))),
-        other => Err(x.error(format!("`{other}` is not `int`, `str` or `bytes`"))),
-    }
-}
-
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    let digit = |b: u8| (b as char).to_digit(16);
-    text.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Some(((digit(pair[0])? << 4) | digit(pair[1])?) as u8))
-        .collect()
 }
 
 /// `fn <name>[ <kind>,<kind>]`, `test <name>` or `law <name>`: one keyable item of a module.
@@ -421,16 +346,6 @@ impl Reader<'_> {
             simple_name: Symbol::new(d.field("simple_name")?.utf8()?),
             footprint: footprint(d.field("footprint")?)?,
             performed: footprint(d.field("performed")?)?,
-            row_aliases: symbols(d.field("row_aliases")?)?,
-            spec: d.field("spec")?.items(|s| {
-                Ok(SpecInfo {
-                    kind: spec_kind(s.field("kind")?)?,
-                    index: s.field("index")?.number()?,
-                    footprint: footprint(s.field("footprint")?)?,
-                    span: self.span(s.field("at")?)?,
-                })
-            })?,
-            internally_effectful: d.field("internally_effectful")?.bool()?,
             span: self.span(d.field("at")?)?,
         };
         let written = DefWritten {
@@ -442,7 +357,6 @@ impl Reader<'_> {
                     span: self.span(p.field("at")?)?,
                 })
             })?,
-            requires_literals: d.field("literals")?.items(literal)?,
         };
         Ok((info, written))
     }
@@ -468,8 +382,8 @@ impl Reader<'_> {
         Ok(i)
     }
 
-    fn test(&self, t: At<'_>, at: usize) -> Result<(TestInfo, Span), Error> {
-        let test = TestInfo {
+    fn test(&self, t: At<'_>, at: usize) -> Result<TestInfo, Error> {
+        Ok(TestInfo {
             name: t.field("name")?.utf8()?.to_string(),
             module: ModuleName::from_dotted(t.field("module")?.utf8()?),
             key: Symbol::new(t.field("key")?.utf8()?),
@@ -477,22 +391,19 @@ impl Reader<'_> {
             nondet: t.field("nondet")?.bool()?,
             footprint: footprint(t.field("footprint")?)?,
             span: self.span(t.field("at")?)?,
-        };
-        Ok((test, self.span(t.field("name_at")?)?))
+        })
     }
 
-    fn law(&self, l: At<'_>, at: usize) -> Result<(LawInfo, Vec<Literal>), Error> {
-        let law = LawInfo {
+    fn law(&self, l: At<'_>, at: usize) -> Result<LawInfo, Error> {
+        Ok(LawInfo {
             name: l.field("name")?.utf8()?.to_string(),
             module: ModuleName::from_dotted(l.field("module")?.utf8()?),
             key: Symbol::new(l.field("key")?.utf8()?),
             index: self.placed(l, at)?,
-            has_guard: l.field("has_guard")?.bool()?,
             host: l.field("host")?.bool()?,
             footprint: footprint(l.field("footprint")?)?,
             span: self.span(l.field("at")?)?,
-        };
-        Ok((law, l.field("literals")?.items(literal)?))
+        })
     }
 
     fn effect(&self, e: At<'_>) -> Result<(EffectInfo, Visibility), Error> {
@@ -631,19 +542,11 @@ fn resolve_op_modes(front: &mut Front) {
     for def in front.check.defs.values_mut() {
         def.footprint.resolve_modes(&mode_of);
         def.performed.resolve_modes(&mode_of);
-        for spec in &mut def.spec {
-            spec.footprint.resolve_modes(&mode_of);
-        }
     }
     for test in &mut front.check.tests {
         test.footprint.resolve_modes(&mode_of);
     }
     for law in &mut front.check.laws {
         law.footprint.resolve_modes(&mode_of);
-    }
-    for sets in front.effect_sets.values_mut() {
-        for set in sets {
-            set.atoms.resolve_modes(&mode_of);
-        }
     }
 }

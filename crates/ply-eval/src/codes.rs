@@ -1,115 +1,34 @@
 //! Stable diagnostic codes.
 
-pub const UNEXPECTED_TOKEN: &str = "E0001";
-pub const UNTERMINATED_STRING: &str = "E0002";
 pub const UNKNOWN_NAME: &str = "E0101";
-pub const UNKNOWN_TYPE: &str = "E0102";
-pub const UNKNOWN_EFFECT: &str = "E0103";
 pub const UNKNOWN_OPERATION: &str = "E0104";
 pub const DUPLICATE_DEFINITION: &str = "E0105";
 pub const UNKNOWN_MODULE: &str = "E0106";
-pub const PRIVATE_NAME: &str = "E0107";
-pub const AMBIGUOUS_IMPORT: &str = "E0108";
 pub const MODULE_CYCLE: &str = "E0109";
 pub const DUPLICATE_IMPORT: &str = "E0110";
 pub const INVALID_MODULE_PATH: &str = "E0111";
 pub const AMBIGUOUS_ENTRY_POINT: &str = "E0112";
-/// A row, or an `effect set` body, naming a set the module does not declare.
-pub const UNKNOWN_EFFECT_SET: &str = "E0114";
-pub const EFFECT_SET_CYCLE: &str = "E0115";
-/// The base of a record update `{..b, f: e}` is not a record, or its type is not known there.
-pub const RECORD_UPDATE_SHAPE: &str = "E0116";
-pub const RECORD_UPDATE_FIELD: &str = "E0117";
-/// A `?` whose enclosing function's return type is not readable as `Result` or `Option`.
-pub const TRY_SCOPE: &str = "E0118";
-/// A `?` whose early exit would change what runs or discard something written.
-pub const TRY_POSITION: &str = "E0119";
-/// A parameter default on a lambda, an effect operation or a handler clause.
-pub const DEFAULT_NOT_ALLOWED: &str = "E0120";
-/// A parameter default that is not a pure, closed expression.
-pub const DEFAULT_NOT_PURE: &str = "E0121";
-/// A default on a `pub fn` that mentions a name the callee's module does not export.
-pub const DEFAULT_PRIVATE_NAME: &str = "E0122";
-/// A named argument naming no parameter, one named twice, or one filled positionally.
-pub const UNKNOWN_ARGUMENT_NAME: &str = "E0123";
-/// A positional argument after a named one.
-pub const ARGUMENT_ORDER: &str = "E0124";
-/// A parameter filled neither positionally nor by name, carrying no default.
-pub const MISSING_ARGUMENT: &str = "E0125";
-/// A top-level `fn` that leaves a parameter or return type to inference.
-pub const MISSING_SIGNATURE: &str = "E0126";
 /// A `reuse fn` with an append the cost checker cannot show reuses its list.
 pub const REUSE_BROKEN: &str = "E0127";
-/// A `ply replace` whose result would not check, or would move a definition it did not name.
-pub const REPLACEMENT_REFUSED: &str = "E0128";
-/// A `ply.pkg` that is not exactly one `fn package` returning std.pkg's `Manifest`.
-pub const MANIFEST_SHAPE: &str = "E0129";
-/// A manifest body that runs rather than being a literal, a constructor, a record or a list.
-pub const MANIFEST_NOT_LITERAL: &str = "E0130";
-/// A manifest literal that does not decode, or whose fields fail validation.
-pub const MANIFEST_FIELD: &str = "E0131";
-/// An import reaching a package the importing module's manifest does not declare.
-pub const DEPENDENCY_NOT_DECLARED: &str = "E0132";
 /// Two packages granting one module prefix, or a package's files claiming another's.
 pub const PREFIX_COLLISION: &str = "E0133";
-/// `ply.pkg` files depending on one another in a cycle.
-pub const DEPENDENCY_CYCLE: &str = "E0134";
 /// A dependency whose path is missing, that holds no `ply.pkg`, or that was never fetched.
 pub const DEPENDENCY_UNUSABLE: &str = "E0135";
-/// A dependency below the version floor the manifest importing it asks for.
-pub const DEPENDENCY_VERSION: &str = "E0136";
-/// One package reached at two places, where a closure pins one version.
-pub const DEPENDENCY_DIAMOND: &str = "E0137";
-/// A dependency whose sources are not what `ply.lock` pinned.
-pub const LOCK_MISMATCH: &str = "E0138";
-/// A `ply.lock` that does not decode or is from another format.
-pub const LOCK_UNREADABLE: &str = "E0139";
 /// A git dependency that could not be fetched.
 pub const DEPENDENCY_FETCH: &str = "E0140";
-/// A registry that could not be asked: `PLY_REGISTRY` unset or malformed, or no answer.
-pub const REGISTRY_UNASKED: &str = "E0141";
-/// A registry archive whose bytes are not the ones the lock pins or the index lists.
-pub const REGISTRY_ARCHIVE: &str = "E0142";
-/// A registry dependency no published, unyanked version satisfies.
-pub const REGISTRY_UNSATISFIED: &str = "E0143";
-/// A publish or a yank the registry refused.
-pub const REGISTRY_REFUSED: &str = "E0144";
-/// A package or a version no registry takes: a program, a non-registry dependency, a bad name.
-pub const REGISTRY_UNTAKEABLE: &str = "E0145";
 pub const TYPE_MISMATCH: &str = "E0201";
 pub const ARITY_MISMATCH: &str = "E0202";
 pub const OCCURS_CHECK: &str = "E0203";
-pub const NOT_A_FUNCTION: &str = "E0204";
 pub const NON_EXHAUSTIVE_MATCH: &str = "E0205";
 /// No derivation for the requested deriver; reported at the field that blocks it.
 pub const NOT_DERIVABLE: &str = "E0206";
-pub const UNKNOWN_DERIVER: &str = "E0207";
-/// A `derive` in a module other than the one declaring its target type.
-pub const ORPHAN_DERIVE: &str = "E0208";
 /// `/` applied to `Decimal`.
 pub const DECIMAL_DIVISION: &str = "E0209";
-/// An operand whose type nothing determines: an arithmetic or ordered-comparison numeric,
-/// or the `String`-or-`Bytes` a `++` joins.
-pub const NUMERIC_UNDETERMINED: &str = "E0210";
-/// An integer literal outside the fixed-width type its context gave it.
-pub const LITERAL_OUT_OF_RANGE: &str = "E0211";
-pub const UNBOUND_ROW_VAR: &str = "E0301";
 pub const EFFECT_NOT_PERMITTED: &str = "E0302";
 pub const UNHANDLED_EFFECT: &str = "E0303";
 pub const RESOURCE_REQUIRED: &str = "E0304";
 /// A `handle` whose body performs an operation, on an atom it handles, that no clause answers.
 pub const HANDLER_CLAUSE_MISSING: &str = "E0305";
-/// A call leaving a label parameter unfilled by written label or argument row, or passing a
-/// label-generic definition as a value.
-pub const LABEL_INSTANTIATION: &str = "E0306";
-/// Members of one recursive group binding different numbers of label or row parameters.
-pub const LABEL_GROUP_BINDERS: &str = "E0307";
-/// A call inside a recursive group that would instantiate the group's row, or the callee's own
-/// type parameter, at something else: polymorphic recursion.
-pub const POLYMORPHIC_RECURSION: &str = "E0308";
-/// `parallel` branches that may not run at once: rows that conflict, or a branch that opens a
-/// `simulate` region.
-pub const PARALLEL_CONFLICT: &str = "E0309";
 pub const NONDET_IN_DET_TEST: &str = "E0412";
 /// A `Task` in a `simulate` region's result, or a `join` after its region ended.
 pub const TASK_ESCAPES_SCOPE: &str = "E0413";
@@ -124,8 +43,6 @@ pub const EFFECT_IN_SPEC: &str = "E0417";
 /// A `forall` binder type with no generator, an effectful function type, or a row variable.
 pub const UNQUANTIFIABLE_TYPE: &str = "E0418";
 pub const OBLIGATION_REFUTED: &str = "E0419";
-/// The guard admitted no values, so the obligation says nothing.
-pub const VACUOUS_OBLIGATION: &str = "E0420";
 /// A host registration names an effect, operation or resource the program does not declare.
 pub const HOST_OPERATION_UNKNOWN: &str = "E0421";
 /// Two host registrations claim one atom.
@@ -146,11 +63,6 @@ pub const HOST_BLOCKING_ANSWER: &str = "E0428";
 pub const TLS_CREDENTIAL_UNKNOWN: &str = "E0429";
 /// A `--tls` credential that does not load, or whose key does not match its certificate.
 pub const TLS_CREDENTIAL_INVALID: &str = "E0430";
-/// Postgres is bound but the database is unnamed, unparseable, unsupported or unreachable.
-/// The server refused to prepare a statement, or its columns do not fit the row codec.
-/// A statement touches a table outside its entry point's declared footprint.
-/// A database operation by a task that does not own the open transaction scope.
-/// The live schema has a trigger, rule or cascade touching tables no statement names.
 /// A `Secret` passed to a host operation whose registration does not accept one.
 pub const SECRET_TO_HOST: &str = "E0439";
 /// A `--config` file or `--set` that cannot be read or is not `KEY=VALUE`.
@@ -199,19 +111,16 @@ pub const INTERNAL_ERROR: &str = "E0505";
 pub const CACHE_UNREADABLE: &str = "W0601";
 pub const CACHE_CORRUPT: &str = "W0602";
 pub const CACHE_VERSION_CHANGED: &str = "W0603";
-/// An obligation no tier could decide.
-pub const OBLIGATION_NOT_DISCHARGED: &str = "W0604";
 /// The stdlib shipped with this compiler differs from the one the cache was written under.
 pub const STDLIB_CHANGED: &str = "W0605";
-/// A host runtime could not hand every resource back when an entry point ended.
 /// An explicitly supplied configuration key the run's schema does not declare.
 pub const CONFIG_UNDECLARED: &str = "W0607";
 /// The drain deadline expired with connections still in flight.
 pub const DRAIN_INCOMPLETE: &str = "W0608";
-/// A value was made to reach itself; cycles are not collected, so it leaks.
-pub const REFERENCE_CYCLE: &str = "W0610";
 /// Spans still open when their task or the entry point ended, reported when the entry point ends.
 pub const SPAN_ABANDONED: &str = "W0609";
+/// A value was made to reach itself; cycles are not collected, so it leaks.
+pub const REFERENCE_CYCLE: &str = "W0610";
 /// A definition no `pub` item, `main`, test or law reaches.
 pub const UNUSED_DEFINITION: &str = "W0611";
 /// A run the harness stopped at its wall clock: a fact about the machine, not about the
