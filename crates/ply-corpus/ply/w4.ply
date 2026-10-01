@@ -25,6 +25,8 @@ import std.process
 import std.process (process, Finished)
 import std.router (int_of_text)
 import std.time (time)
+import std.list
+import std.string
 
 pub type Args = {
   repo: String,
@@ -44,15 +46,6 @@ pub type Args = {
 }
 
 pub fn sections() -> List<String> = ["ops", "sizes", "pool", "exhaustion", "crud"]
-
-fn has(xs: List<String>, x: String) -> Bool =
-  fold(xs, false, |seen: Bool, y: String| seen || y == x)
-
-fn cats<a>(xss: List<List<a>>) -> List<a> =
-  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
-
-fn joined(parts: List<String>, sep: String) -> String =
-  fold(parts, "", |acc: String, p: String| if acc == "" { p } else { acc ++ sep ++ p })
 
 fn tasks_text(n: Int) -> String = if n == 1 { "1 task" } else { int_to_string(n) ++ " tasks" }
 
@@ -96,9 +89,6 @@ pub fn point_settings(section: String, p: Point) -> List<List<String>> =
 // otherwise failed, and each repeat's microseconds.
 pub type Took = { asked: Int, answered: Int, refused: Int, failed: Int, runs_us: List<Int> }
 
-fn int_of(j: Json) -> Int =
-  match j { Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }, _ -> 0 }
-
 pub fn took_of(j: Json) -> Result<Took, String> =
   match j {
     Object(m) ->
@@ -107,7 +97,7 @@ pub fn took_of(j: Json) -> Result<Took, String> =
         answered: spine::int_field(m, "answered"),
         refused: spine::int_field(m, "refused"),
         failed: spine::int_field(m, "failed"),
-        runs_us: map(spine::array_field(m, "runs_us"), int_of),
+        runs_us: spine::ints_field(m, "runs_us"),
       }),
     _ -> Err("the program's report is not an object"),
   }
@@ -116,17 +106,11 @@ pub fn took_of(j: Json) -> Result<Took, String> =
 // report could not be read.
 pub type Ran = | Timed(Took) | Raised(String) | Unread(String)
 
-fn first_line(text: String) -> String =
-  match filter(string_split(text, "\n"), |line: String| string_trim(line) != "") {
-    [line, ..] -> string_trim(line),
-    [] -> "it said nothing",
-  }
-
 // The diagnostic a run ended with, past any warning written before it.
 fn raised_line(text: String) -> String =
   match filter(string_split(text, "\n"), |line: String| string_contains(line, "error[")) {
     [line, ..] -> string_trim(line),
-    [] -> first_line(text),
+    [] -> spine::first_line(text),
   }
 
 pub fn ran_of(f: Finished) -> Ran =
@@ -150,7 +134,7 @@ fn over_database(
     kit::ran(
       k,
       "statements.ply",
-      cats([
+      list::flatten([
         point_settings("postgres", p),
         [kit::set("BENCH_DATABASE", url), kit::set("BENCH_POOL", int_to_string(pool))],
       ]),
@@ -209,7 +193,7 @@ fn per_statement(us: Int, statements: Int) -> Decimal =
 
 // The counts a row is judged by, and its fastest repeat as microseconds a statement and a rate.
 pub fn took_measurements(t: Took, per_repeat: Int) -> List<Measurement> =
-  cats([
+  list::flatten([
     [
       number("raised", 0, ""),
       number("asked", t.asked, "statements"),
@@ -235,7 +219,7 @@ pub fn point_row(
   beside: List<Measurement>,
 ) -> Row =
   match r {
-    Timed(t) -> row(name, c, cats([took_measurements(t, per_repeat), beside])),
+    Timed(t) -> row(name, c, list::flatten([took_measurements(t, per_repeat), beside])),
     Raised(why) -> { ..row(name, c, [number("raised", 1, "")]), detail: Str(why) },
     Unread(why) -> untaken(name, c, why),
   }
@@ -263,7 +247,7 @@ fn tool(args: List<String>) -> Result<String, String> / {process.spawn[pg_floor]
   if spine::exit_zero(f) { Ok(string_of_bytes_lossy(f.out)) } else {
     Err(
       "the libpq tool's `" ++ (match args { [mode, ..] -> mode, [] -> "" }) ++ "` failed: "
-        ++ first_line(string_of_bytes_lossy(f.err)),
+        ++ spine::first_line(string_of_bytes_lossy(f.err)),
     )
   }
 }
@@ -334,10 +318,10 @@ fn prepared(
         Ok(Object(m)) -> match tool([
             "sql",
             url,
-            joined(cats([texts_of(m, "drop"), texts_of(m, "create")]), "; "),
+            string::join(list::flatten([texts_of(m, "drop"), texts_of(m, "create")]), "; "),
           ]) {
           Err(why) -> Unprepared(why),
-          Ok(_) -> Ready({ url: url, fill: joined(texts_of(m, "fill"), "; ") }),
+          Ok(_) -> Ready({ url: url, fill: string::join(texts_of(m, "fill"), "; ") }),
         },
         Ok(_) -> Unprepared("the schema report is not an object"),
       }
@@ -437,9 +421,9 @@ fn ops_rows(
   a: Args,
   p: Prepared,
 ) -> List<Row> / {process.spawn[ply], process.spawn[pg_floor], config.get[env]} =
-  cats(
+  list::flatten(
     map(workloads(), |w: Workload|
-      cats(
+      list::flatten(
         map(range(0, len(a.concurrency)), |i: Int|
           match list_at(a.concurrency, i) {
             Some(tasks) -> ops_point(k, a, p, w, tasks, i == 0),
@@ -451,7 +435,7 @@ fn ops_rows(
 // --- sizes: one ordered select against the rows it sorts ---------------------------------------
 
 fn sizes_rows(k: Kit, a: Args, p: Prepared) -> List<Row> / {process.spawn[ply], config.get[env]} =
-  cats(
+  list::flatten(
     map(a.rows, |n: Int| {
       let point = { workload: Select, tasks: 1, per: a.operations, rows: n, repeats: a.repeats };
       let name = |rung: String| "sizes, " ++ int_to_string(n) ++ " rows, " ++ rung;
@@ -477,7 +461,7 @@ fn sizes_rows(k: Kit, a: Args, p: Prepared) -> List<Row> / {process.spawn[ply], 
 fn pool_tasks() -> Int = 8
 
 fn pool_rows(k: Kit, a: Args, p: Prepared) -> List<Row> / {process.spawn[ply], config.get[env]} =
-  cats(
+  list::flatten(
     map([Select, Transaction], |w: Workload|
       map(a.pool_sizes, |size: Int| {
         let per = per_task(a.operations, pool_tasks());
@@ -537,8 +521,6 @@ fn exhaustion_rows(k: Kit, p: Prepared) -> List<Row> / {process.spawn[ply], conf
 
 pub fn crud_routes() -> List<String> = ["/health", "/items", "/orders/1"]
 
-fn clients_text(c: Int) -> String = if c == 1 { "1 client" } else { int_to_string(c) ++ " clients" }
-
 fn crud_load(a: Args, port: Int, route: String, clients: Int) -> kit::Load =
   {
     port: port,
@@ -558,7 +540,7 @@ fn loaded(
   s: Server,
 ) -> Result<List<Pointed>, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work]} =
   kit::all_of(
-    cats(
+    list::flatten(
       map(crud_routes(), |route: String|
         map(a.load_concurrency, |c: Int| {
           let l = crud_load(a, s.port, route, c);
@@ -566,7 +548,7 @@ fn loaded(
             Err(why) -> Err(why),
             Ok(sample) ->
               Ok({
-                name: "crud, " ++ store ++ ", GET " ++ route ++ ", " ++ clients_text(c),
+                name: "crud, " ++ store ++ ", GET " ++ route ++ ", " ++ kit::clients_text(c),
                 load: l,
                 sample: sample,
               }),
@@ -576,10 +558,10 @@ fn loaded(
   )
 
 fn crud_names(a: Args, store: String) -> List<String> =
-  cats(
+  list::flatten(
     map(crud_routes(), |route: String|
       map(a.load_concurrency, |c: Int|
-        "crud, " ++ store ++ ", GET " ++ route ++ ", " ++ clients_text(c))),
+        "crud, " ++ store ++ ", GET " ++ route ++ ", " ++ kit::clients_text(c))),
   )
 
 fn stop_name(store: String) -> String = "the desk over the " ++ store ++ ","
@@ -621,7 +603,7 @@ fn crud_rows(
   k: Kit,
   a: Args,
 ) -> List<Row> / {process.start[ply], process.output_line[ply], process.wait[ply], process.signal[ply], process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work], net.connect[probe], net.close[probe], time.elapsed_ms, time.sleep_ms} =
-  cats(
+  list::flatten(
     map(crud_desks(a), |one: { store: String, desk: served::Desk }|
       if one.store == "postgres" && a.db == None {
         push(
@@ -647,18 +629,19 @@ pub fn run(
   match kit::prepare(k) {
     Err(why) -> Err(why),
     Ok(_) -> {
-      let tabled = has(a.sections, "ops") || has(a.sections, "sizes") || has(a.sections, "pool")
-        || has(a.sections, "exhaustion");
+      let tabled = list::contains(a.sections, "ops") || list::contains(a.sections, "sizes")
+        || list::contains(a.sections, "pool")
+        || list::contains(a.sections, "exhaustion");
       let p = if tabled { prepared(k, a.db) } else { NoDatabase };
-      let rows = cats([
-        if has(a.sections, "crud") {
+      let rows = list::flatten([
+        if list::contains(a.sections, "crud") {
           [served::lines_row("the desk lines `crud` runs", served::checked(lines(k, a)))]
         } else { [] },
-        if has(a.sections, "ops") { ops_rows(k, a, p) } else { [] },
-        if has(a.sections, "sizes") { sizes_rows(k, a, p) } else { [] },
-        if has(a.sections, "pool") { pool_rows(k, a, p) } else { [] },
-        if has(a.sections, "exhaustion") { exhaustion_rows(k, p) } else { [] },
-        if has(a.sections, "crud") { crud_rows(k, a) } else { [] },
+        if list::contains(a.sections, "ops") { ops_rows(k, a, p) } else { [] },
+        if list::contains(a.sections, "sizes") { sizes_rows(k, a, p) } else { [] },
+        if list::contains(a.sections, "pool") { pool_rows(k, a, p) } else { [] },
+        if list::contains(a.sections, "exhaustion") { exhaustion_rows(k, p) } else { [] },
+        if list::contains(a.sections, "crud") { crud_rows(k, a) } else { [] },
       ]);
       report::made("w4", "w4 — a statement through the effect boundary, beside libpq", rows, [
         { key: "sections", value: array(map(a.sections, |s: String| Str(s))) },
@@ -675,24 +658,28 @@ pub fn run(
 fn took(asked: Int, answered: Int, refused: Int, failed: Int) -> Took =
   { asked: asked, answered: answered, refused: refused, failed: failed, runs_us: [900, 400] }
 
-fn verdict_of(r: Row) -> report::Verdict =
-  match report::judge([r]) { [j] -> j.verdict, _ -> panic("one row is judged as one") }
-
 test "a point is judged by its counts, and a run that raised fails on that alone" {
   assert_eq(
-    verdict_of(point_row("p", every_answered(), 200, Timed(took(400, 400, 0, 0)), [])),
+    report::judged_alone(point_row("p", every_answered(), 200, Timed(took(400, 400, 0, 0)), [])),
     Pass,
   );
   assert(
-    verdict_of(point_row("p", every_answered(), 200, Timed(took(400, 399, 1, 0)), [])) != Pass,
+    report::judged_alone(point_row("p", every_answered(), 200, Timed(took(400, 399, 1, 0)), []))
+      != Pass,
   );
-  assert_eq(verdict_of(point_row("p", nothing_lost(), 200, Timed(took(400, 399, 1, 0)), [])), Pass);
-  assert(verdict_of(point_row("p", nothing_lost(), 200, Timed(took(400, 399, 0, 1)), [])) != Pass);
+  assert_eq(
+    report::judged_alone(point_row("p", nothing_lost(), 200, Timed(took(400, 399, 1, 0)), [])),
+    Pass,
+  );
+  assert(
+    report::judged_alone(point_row("p", nothing_lost(), 200, Timed(took(400, 399, 0, 1)), []))
+      != Pass,
+  );
   let raised = point_row("p", nothing_lost(), 200, Raised("error[E0502]: the pool panicked"), []);
-  assert_eq(verdict_of(raised), Fail([number("raised", 1, "")]));
+  assert_eq(report::judged_alone(raised), Fail([number("raised", 1, "")]));
   assert_eq(raised.detail, Str("error[E0502]: the pool panicked"));
   assert_eq(
-    verdict_of(point_row("p", every_answered(), 200, Unread("no report"), [])),
+    report::judged_alone(point_row("p", every_answered(), 200, Unread("no report"), [])),
     Inconclusive("no report"),
   )
 }
@@ -728,14 +715,14 @@ test "the program's report is read into what it took, and its failure is what it
 }
 
 test "a point is the program's settings, and every write starts past the fill's keys" {
-  let settings = cats(
+  let settings = list::flatten(
     point_settings("postgres", { workload: SelectBy, tasks: 4, per: 100, rows: 64, repeats: 3 }),
   );
   assert(
     fold(
       ["BENCH_WORKLOAD=select $1", "BENCH_TASKS=4", "BENCH_PER=100", "BENCH_BASE=1000000"],
       true,
-      |ok: Bool, want: String| ok && has(settings, want),
+      |ok: Bool, want: String| ok && list::contains(settings, want),
     ),
   );
   assert(base() > keys());

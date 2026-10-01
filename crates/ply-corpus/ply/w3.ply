@@ -18,6 +18,7 @@ import std.json (Json, Object, Number, Str, array)
 import std.net (net)
 import std.process (process)
 import std.time (time)
+import std.list
 
 pub type Args = {
   repo: String,
@@ -36,14 +37,6 @@ pub type Args = {
 }
 
 pub fn sections() -> List<String> = ["mix", "routes", "keep-alive", "tls", "shape"]
-
-fn has(xs: List<String>, x: String) -> Bool =
-  fold(xs, false, |seen: Bool, y: String| seen || y == x)
-
-fn cats<a>(xss: List<List<a>>) -> List<a> =
-  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
-
-fn clients_text(c: Int) -> String = if c == 1 { "1 client" } else { int_to_string(c) ++ " clients" }
 
 fn per_conn_text(p: Int) -> String =
   if p == 1 { "1 request a connection" } else { int_to_string(p) ++ " requests a connection" }
@@ -88,7 +81,7 @@ fn points(
 // --- The rows --------------------------------------------------------------------------
 
 pub fn mix_rows(ps: List<Point>) -> List<Row> =
-  map(ps, |p: Point| answered("the read mix, " ++ clients_text(p.load.concurrency), p))
+  map(ps, |p: Point| answered("the read mix, " ++ kit::clients_text(p.load.concurrency), p))
 
 pub fn route_rows(ps: List<Point>) -> List<Row> =
   map(ps, |p: Point| answered("GET " ++ (match p.load.routes { [r, ..] -> r, _ -> "" }), p))
@@ -104,7 +97,7 @@ pub fn keep_alive_rows(ps: List<Point>) -> List<Row> =
       "reuse",
       holding(
         "every point sustains at least the rate of one request a connection",
-        cats([
+        list::flatten([
           [per_second_at(1)],
           map(filter(ps, |p: Point| p.load.per_conn != 1), |p: Point|
             per_second_at(p.load.per_conn)),
@@ -136,7 +129,7 @@ fn handshaken() -> Criterion =
 pub fn tls_rows(transport: String, ps: List<Point>) -> List<Row> =
   map(ps, |p: Point| {
     let name = transport ++ ", " ++ per_conn_text(p.load.per_conn) ++ ", "
-      ++ clients_text(p.load.concurrency);
+      ++ kit::clients_text(p.load.concurrency);
     match p.load.trust {
       None -> answered(name, p),
       Some(_) ->
@@ -148,9 +141,6 @@ pub fn tls_rows(transport: String, ps: List<Point>) -> List<Row> =
   })
 
 pub type Shaped = { axis: String, fields: Int, bytes: Int, nanos: Int }
-
-fn int_of(j: Json) -> Int =
-  match j { Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }, _ -> 0 }
 
 pub fn shaped_of(j: Json) -> Result<List<Shaped>, String> =
   match j {
@@ -164,7 +154,7 @@ pub fn shaped_of(j: Json) -> Result<List<Shaped>, String> =
                 axis: match map_get(p, "axis") { Some(Str(s)) -> s, _ -> "" },
                 fields: spine::int_field(p, "fields"),
                 bytes: spine::int_field(p, "bytes"),
-                nanos: match stats::best(map(spine::array_field(p, "runs_us"), int_of)) {
+                nanos: match stats::best(spine::ints_field(p, "runs_us")) {
                   Some(us) -> stats::nanos_each(us, calls),
                   None -> 0,
                 },
@@ -209,7 +199,7 @@ fn tls_clients(a: Args) -> List<Int> =
   if a.ladder_concurrency <= 1 { [1] } else { [1, a.ladder_concurrency] }
 
 fn tls_loads(a: Args, port: Int, trust: Option<String>) -> List<kit::Load> =
-  cats(
+  list::flatten(
     map(tls_clients(a), |c: Int|
       map(tls_ladder(), |per: Int| load(port, ["/items"], c, per, a.ladder_requests, trust))),
   )
@@ -220,7 +210,7 @@ fn plain_points(
   a: Args,
   s: Server,
 ) -> Result<Plain, String> / {process.spawn[ply], config.get[env], fs.read_file[work], fs.remove[work]} = {
-  let mix = if has(a.sections, "mix") {
+  let mix = if list::contains(a.sections, "mix") {
     points(
       k,
       a.repeats,
@@ -228,7 +218,7 @@ fn plain_points(
         load(s.port, served::read_mix(), c, a.per_conn, a.requests_per_point, None)),
     )
   } else { Ok([]) };
-  let routes = if has(a.sections, "routes") {
+  let routes = if list::contains(a.sections, "routes") {
     points(
       k,
       a.repeats,
@@ -236,7 +226,7 @@ fn plain_points(
         load(s.port, [r], 1, a.per_conn, a.requests_per_point, None)),
     )
   } else { Ok([]) };
-  let keep = if has(a.sections, "keep-alive") {
+  let keep = if list::contains(a.sections, "keep-alive") {
     points(
       k,
       a.repeats,
@@ -244,8 +234,9 @@ fn plain_points(
         load(s.port, served::read_mix(), a.ladder_concurrency, per, a.ladder_requests, None)),
     )
   } else { Ok([]) };
-  let tls = if has(a.sections, "tls") { points(k, a.repeats, tls_loads(a, s.port, None)) }
-  else { Ok([]) };
+  let tls = if list::contains(a.sections, "tls") {
+    points(k, a.repeats, tls_loads(a, s.port, None))
+  } else { Ok([]) };
   match kit::all_of([mix, routes, keep, tls]) {
     Err(why) -> Err(why),
     Ok(parts) -> match parts {
@@ -265,7 +256,7 @@ fn served_rows(
       plain_points(k, a, s)) {
     Err(why) -> Err(why),
     Ok(plain) -> {
-      let secured = if has(a.sections, "tls") {
+      let secured = if list::contains(a.sections, "tls") {
         match kit::credential(k, "desk") {
           Err(why) -> Err(why),
           Ok(c) -> match kit::serving[ply](
@@ -288,7 +279,7 @@ fn served_rows(
         Ok(t) -> {
           let p = plain.value;
           Ok(
-            cats([
+            list::flatten([
               mix_rows(p.mix),
               route_rows(p.routes),
               if len(p.keep_alive) == 0 { [] } else { keep_alive_rows(p.keep_alive) },
@@ -311,11 +302,11 @@ pub fn run(
   match kit::prepare(k) {
     Err(why) -> Err(why),
     Ok(_) -> {
-      let loaded = if has(a.sections, "mix") || has(a.sections, "routes")
-          || has(a.sections, "keep-alive")
-          || has(a.sections, "tls") { served_rows(k, a) }
+      let loaded = if list::contains(a.sections, "mix") || list::contains(a.sections, "routes")
+          || list::contains(a.sections, "keep-alive")
+          || list::contains(a.sections, "tls") { served_rows(k, a) }
       else { Ok([]) };
-      let shape = if has(a.sections, "shape") {
+      let shape = if list::contains(a.sections, "shape") {
         match kit::timed(k, "shape.ply", a.iterations, a.repeats) {
           Err(why) -> Err(why),
           Ok(j) -> match shaped_of(j) { Err(why) -> Err(why), Ok(ss) -> Ok(shape_rows(ss)) },
@@ -327,7 +318,7 @@ pub fn run(
           report::made(
             "w3",
             "w3 — routing, framing, keep-alive and TLS on the request path",
-            cats(parts),
+            list::flatten(parts),
             [
               { key: "sections", value: array(map(a.sections, |s: String| Str(s))) },
               { key: "accept", value: Str(a.accept) },

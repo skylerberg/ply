@@ -25,6 +25,8 @@ import std.process
 import std.process (process, Finished, Ended, Exited, Signalled)
 import std.router (int_of_text)
 import std.time (time)
+import std.list
+import std.string
 
 pub type Kit = { repo: String, scratch: String }
 
@@ -39,9 +41,6 @@ fn tls_dir(k: Kit) -> String = under(k.scratch, "tls")
 pub fn prepare(k: Kit) -> Result<Unit, String> / {fs.create_dir[work]} =
   if fs.create_dir[work](client_dir(k)) && fs.create_dir[work](tls_dir(k)) { Ok(()) }
   else { Err("the scratch directory `" ++ k.scratch ++ "` could not be made") }
-
-fn cats<a>(xss: List<List<a>>) -> List<a> =
-  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |inner: List<a>, x: a| push(inner, x)))
 
 pub fn set(key: String, value: String) -> List<String> = ["--set", key ++ "=" ++ value]
 
@@ -275,11 +274,12 @@ pub type Sample = {
   failures: List<String>,
 }
 
-fn joined(parts: List<String>) -> String =
-  fold(parts, "", |acc: String, p: String| if acc == "" { p } else { acc ++ "," ++ p })
+// How many clients a row ran with, as a row's name says it.
+pub fn clients_text(c: Int) -> String =
+  if c == 1 { "1 client" } else { int_to_string(c) ++ " clients" }
 
 pub fn load_args(k: Kit, l: Load) -> List<String> =
-  cats([
+  list::flatten([
     [
       "run",
       fixture(k, "load.ply"),
@@ -292,7 +292,7 @@ pub fn load_args(k: Kit, l: Load) -> List<String> =
     // The name a certificate is issued for, which is what TLS verifies; plaintext reaches it too.
     set("LOAD_HOST", "localhost"),
     set("LOAD_PORT", int_to_string(l.port)),
-    set("LOAD_ROUTES", joined(l.routes)),
+    set("LOAD_ROUTES", string::join(l.routes, ",")),
     set("LOAD_CONNECTIONS", int_to_string(l.connections)),
     set("LOAD_CONCURRENCY", int_to_string(l.concurrency)),
     set("LOAD_PER_CONN", int_to_string(l.per_conn)),
@@ -300,10 +300,6 @@ pub fn load_args(k: Kit, l: Load) -> List<String> =
     set("LOAD_REPORT", "load.json"),
     match l.trust { Some(certificate) -> ["--trust", certificate], None -> [] },
   ])
-
-fn ints(m: Map<String, Json>, key: String) -> List<Int> =
-  map(spine::array_field(m, key), |j: Json|
-    match j { Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }, _ -> 0 })
 
 fn texts(m: Map<String, Json>, key: String) -> List<String> =
   map(spine::array_field(m, key), |j: Json| match j { Str(s) -> s, _ -> "" })
@@ -316,9 +312,9 @@ pub fn sample_of(j: Json) -> Result<Sample, String> =
         answered: spine::int_field(m, "answered"),
         connections: spine::int_field(m, "connections"),
         wall_us: spine::int_field(m, "wall_micros"),
-        latencies: ints(m, "latencies"),
-        connects: ints(m, "connects"),
-        handshakes: ints(m, "handshakes"),
+        latencies: spine::ints_field(m, "latencies"),
+        connects: spine::ints_field(m, "connects"),
+        handshakes: spine::ints_field(m, "handshakes"),
         statuses: map(spine::array_field(m, "statuses"), |s: Json|
           match s {
             Object(one) ->
@@ -401,7 +397,7 @@ fn percentile_of(name: String, xs: List<Int>, p: Int) -> List<Measurement> =
 // The numbers a served row is read off: what was asked and how it was answered, the rate, the
 // latencies, and over TLS the handshakes the client timed apart from the requests.
 pub fn measurements_of(l: Load, s: Sample, status: Int) -> List<Measurement> =
-  cats([
+  list::flatten([
     [
       number("asked", asked(l), "requests"),
       number("answered", s.answered, "requests"),
@@ -418,7 +414,7 @@ pub fn measurements_of(l: Load, s: Sample, status: Int) -> List<Measurement> =
     match l.trust {
       None -> [],
       Some(_) ->
-        cats([
+        list::flatten([
           [number("handshakes", len(s.handshakes), "handshakes")],
           percentile_of("handshake_p50", s.handshakes, 50),
           percentile_of("handshake_p99", s.handshakes, 99),
@@ -474,7 +470,7 @@ pub fn printed(f: Finished, what: String) -> Result<Json, String> =
 
 // A program under `fixtures/` run once over the host with `settings`, each a `set` pair.
 pub fn fixture_args(k: Kit, name: String, settings: List<List<String>>) -> List<String> =
-  cats([["run", fixture(k, name), "--host", "--color", "never"], cats(settings)])
+  list::flatten([["run", fixture(k, name), "--host", "--color", "never"], list::flatten(settings)])
 
 pub fn ran(
   k: Kit,
@@ -676,9 +672,6 @@ test "the load client's line carries every setting, and only a trusted certifica
   assert_eq(list_at(tls, len(tls) - 1), Some("scratch/serve/tls/desk.pem"))
 }
 
-fn verdict_of(r: Row) -> report::Verdict =
-  match report::judge([r]) { [j] -> j.verdict, _ -> panic("one row is judged as one") }
-
 test "a report is a sample, and a partial or wrong answer fails with its counts" {
   let text = "{\"requests\":3,\"answered\":3,\"connections\":1,\"per_conn\":3,\"wall_micros\":300,\"latencies\":[30,10,20],\"connects\":[5],\"handshakes\":[],\"statuses\":[{\"count\":3,\"status\":200}],\"failures\":[]}";
   let l = { port: 1, routes: ["/items"], connections: 1, concurrency: 1, per_conn: 3, trust: None };
@@ -687,9 +680,9 @@ test "a report is a sample, and a partial or wrong answer fails with its counts"
     Ok(j) -> match sample_of(j) {
       Err(why) -> panic(why),
       Ok(s) -> {
-        assert_eq(verdict_of(answered_row("p", l, s)), Pass);
+        assert_eq(report::judged_alone(answered_row("p", l, s)), Pass);
         assert_eq(
-          verdict_of(answered_row("p", { ..l, per_conn: 4 }, s)),
+          report::judged_alone(answered_row("p", { ..l, per_conn: 4 }, s)),
           Fail([
             number("asked", 4, "requests"),
             number("answered", 3, "requests"),
@@ -697,9 +690,9 @@ test "a report is a sample, and a partial or wrong answer fails with its counts"
             number("failed", 0, "exchanges"),
           ]),
         );
-        assert(verdict_of(row("p", complete(404), measurements_of(l, s, 404))) != Pass);
+        assert(report::judged_alone(row("p", complete(404), measurements_of(l, s, 404))) != Pass);
         let broken = { ..s, failures: ["/items: the server closed the connection"] };
-        assert(verdict_of(answered_row("p", l, broken)) != Pass);
+        assert(report::judged_alone(answered_row("p", l, broken)) != Pass);
         assert_eq(
           answered_row("p", l, broken).detail,
           Str("/items: the server closed the connection"),
@@ -718,7 +711,7 @@ test "a report is a sample, and a partial or wrong answer fails with its counts"
 }
 
 test "a server of the language's own must drain, and a floor only must not be killed" {
-  let judged = |s: Stop, c: Criterion| verdict_of(stop_row("it", s, c));
+  let judged = |s: Stop, c: Criterion| report::judged_alone(stop_row("it", s, c));
   assert_eq(judged(Stopped(Exited(0)), drained()), Pass);
   assert(judged(Stopped(Signalled(15)), drained()) != Pass);
   assert_eq(judged(Killed, drained()), Fail([number("killed", 1, "")]));
