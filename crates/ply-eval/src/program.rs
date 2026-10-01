@@ -2,7 +2,8 @@
 //! `ply_codegen::c::dump` reads them. Its types are the front end's alone.
 
 use crate::{
-    DefHash, Diagnostic, Footprint, HashOutput, Mode, Severity, SourceId, Span, Symbol, codes,
+    Carry, CtorCarries, DefHash, Diagnostic, Footprint, HashOutput, Mode, Severity, SourceId, Span,
+    Symbol, codes,
 };
 use indexmap::IndexMap;
 use std::fmt;
@@ -95,14 +96,16 @@ pub struct EmitterRoot {
     pub root: Symbol,
     pub arity: usize,
     pub scalar: bool,
-    /// Whether the root's scheme mentions a fixed-width type, which the compiled seam cannot
-    /// carry.
-    pub width: bool,
     /// Whether the compiler published the root pure: nothing else lets a memo answer for it. A
     /// test, a clause or a law part never is.
     pub pure: bool,
     /// The root's definition span, which a failure is reported against.
     pub span: Span,
+    /// How its parameters read, over the type variables they share with its answer; a label
+    /// parameter has none.
+    pub params: Vec<Carry>,
+    /// How its answer reads back out of compiled code.
+    pub answer: Carry,
 }
 
 impl EmitterRoot {
@@ -137,6 +140,8 @@ pub struct Front {
     pub emitter_roots: Vec<EmitterRoot>,
     /// The emitter's constructors, in the order the emitted C names tags by.
     pub emitter_ctors: Vec<(Symbol, usize)>,
+    /// How each constructor's fields read back out of compiled code.
+    pub ctor_carries: CtorCarries,
     /// The hasher's item order: every hashed name, test and law, as its rows come.
     pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
@@ -173,6 +178,8 @@ pub struct OpInfo {
     pub mode: Mode,
     pub resource_param: bool,
     pub span: Span,
+    /// How each argument a host handler is given reads out of compiled code.
+    pub params: Vec<Carry>,
 }
 
 /// `name` is program-wide (`store.db`) and equals the `effect` of every

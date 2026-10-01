@@ -1,7 +1,7 @@
 use ply_codegen::c::{dump, producer};
 use ply_eval::{
-    Edit, EffectAtom, Fields, Fix, Footprint, Hashed, Literal, Mode, Ordinal, Resource, Severity,
-    SourceId, Span, Symbol, Value, Visibility, codes,
+    Carry, Edit, EffectAtom, Fields, Fix, Footprint, Hashed, IntTy, Literal, Mode, Ordinal,
+    Resource, Severity, SourceId, Span, Symbol, Value, Visibility, codes,
 };
 use std::sync::Arc;
 
@@ -212,33 +212,100 @@ law \"low\" forall (b: U8) where int_of_u8(b) > 0 { low_bit(b) < 2 }\n\
 law \"grows\" forall (x: Int) where x > 0 { inc(x) > x }\n";
 
 /// A clause carries its owner's parameters, and `result` too for an `ensures`, and a law part its
-/// binders: each mentions a width exactly where those types do.
+/// binders: each reads a width exactly where those types hold one.
 #[test]
-fn each_root_reads_the_width_the_compiler_published() {
+fn each_root_reads_the_carries_the_compiler_published() {
     let front =
         dump::read(&answer(&[("m", WIDTHS)]), &[SourceId(0)]).unwrap_or_else(|e| panic!("{e}"));
-    let read: Vec<(&str, bool)> = front
+    let u8 = || Carry::Width(IntTy::U8);
+    let read: Vec<(&str, Vec<Carry>, Carry)> = front
         .emitter_roots
         .iter()
-        .map(|r| (r.root.as_str(), r.width))
+        .map(|r| (r.root.as_str(), r.params.clone(), r.answer.clone()))
         .collect();
     assert_eq!(
         read,
         [
-            ("m.low_bit", true),
-            ("m.narrow", true),
-            ("m.inc", false),
-            ("m.low_bit#requires#0", true),
-            ("m.low_bit#ensures#0", true),
-            ("m.narrow#requires#0", false),
-            ("m.narrow#ensures#0", true),
-            ("m.inc#requires#0", false),
-            ("m.inc#ensures#0", false),
-            ("m.law#0.guard", true),
-            ("m.law#0.body", true),
-            ("m.law#1.guard", false),
-            ("m.law#1.body", false),
+            ("m.low_bit", vec![u8()], Carry::Plain),
+            ("m.narrow", vec![Carry::Plain], u8()),
+            ("m.inc", vec![Carry::Plain], Carry::Plain),
+            ("m.low_bit#requires#0", vec![u8()], Carry::Plain),
+            (
+                "m.low_bit#ensures#0",
+                vec![u8(), Carry::Plain],
+                Carry::Plain
+            ),
+            ("m.narrow#requires#0", vec![Carry::Plain], Carry::Plain),
+            ("m.narrow#ensures#0", vec![Carry::Plain, u8()], Carry::Plain),
+            ("m.inc#requires#0", vec![Carry::Plain], Carry::Plain),
+            (
+                "m.inc#ensures#0",
+                vec![Carry::Plain, Carry::Plain],
+                Carry::Plain
+            ),
+            ("m.law#0.guard", vec![u8()], Carry::Plain),
+            ("m.law#0.body", vec![u8()], Carry::Plain),
+            ("m.law#1.guard", vec![Carry::Plain], Carry::Plain),
+            ("m.law#1.body", vec![Carry::Plain], Carry::Plain),
         ]
+    );
+}
+
+const NOMINAL: &str = "effect probe { write put(xs: List<U8>, n: Int) -> Unit }\n\
+type Byte = | Byte(U8)\n\
+type Pair<a, b> = | Pair(b, a)\n\
+fn pick<a>(xs: List<a>, r: { v: I16, n: Int }) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n\
+fn apply<a>(f: (Int) -> a, x: Int) -> a = f(x)\n\
+fn sent(xs: List<U8>) -> Unit / { probe.write } = probe.put(xs, 1)\n";
+
+/// A constructor's fields read over its type's parameters, a root's type variables by number, and
+/// an operation's arguments as its declaration types them.
+#[test]
+fn constructors_variables_and_operations_read_their_published_carries() {
+    let front =
+        dump::read(&answer(&[("m", NOMINAL)]), &[SourceId(0)]).unwrap_or_else(|e| panic!("{e}"));
+    let named = |name: &str| Symbol::new(name);
+    assert_eq!(
+        front.ctor_carries[&named("m.Byte")],
+        [Carry::Width(IntTy::U8)]
+    );
+    assert_eq!(
+        front.ctor_carries[&named("m.Pair")],
+        [Carry::Var(1), Carry::Var(0)]
+    );
+    assert_eq!(front.ctor_carries[&named("Some")], [Carry::Var(0)]);
+    let root = |name: &str| {
+        front
+            .emitter_roots
+            .iter()
+            .find(|r| r.root.as_str() == name)
+            .unwrap_or_else(|| panic!("no root `{name}`"))
+    };
+    let pick = root("m.pick");
+    assert_eq!(
+        pick.params,
+        [
+            Carry::List(Box::new(Carry::Var(0))),
+            Carry::Record(vec![
+                (named("n"), Carry::Plain),
+                (named("v"), Carry::Width(IntTy::I16)),
+            ]),
+        ]
+    );
+    assert_eq!(pick.answer, Carry::Sum(vec![Carry::Var(0)]));
+    let apply = root("m.apply");
+    assert_eq!(
+        apply.params,
+        [
+            Carry::Fn(vec![Carry::Plain], Box::new(Carry::Var(0))),
+            Carry::Plain
+        ]
+    );
+    assert_eq!(apply.answer, Carry::Var(0));
+    let put = &front.check.effects[&named("m.probe")].ops[&named("put")];
+    assert_eq!(
+        put.params,
+        [Carry::List(Box::new(Carry::Width(IntTy::U8))), Carry::Plain]
     );
 }
 
