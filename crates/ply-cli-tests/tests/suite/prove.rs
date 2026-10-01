@@ -585,13 +585,13 @@ fn bounded(x: Int) -> Int
     );
 }
 
-/// The seam carries no fixed width, so the tier declines `low_bit`; `inc` raises on its own.
+/// A closure cannot cross out of the tier, so it declines `adder`'s answer; `inc` raises on its own.
 #[test]
 fn a_proposition_the_tier_declines_is_a_defect_in_ply_and_not_a_gap() {
     const SOURCE: &str = "\
-fn low_bit(b: U8) -> Int
-  ensures result < 2
-= int_of_u8(b & 1u8)
+fn adder(n: Int) -> (Int) -> Int
+  ensures result(1) == n + 1
+= |x: Int| x + n
 
 fn inc(x: Int) -> Int
   ensures result > x
@@ -612,7 +612,7 @@ fn inc(x: Int) -> Int
             .cloned()
             .unwrap_or_else(|| panic!("no obligation for `{needle}`: {v}"))
     };
-    let declined = by_label("m.low_bit");
+    let declined = by_label("m.adder");
     assert_eq!(
         declined["outcome"], "defect",
         "the control must be an entry the tier declines: {declined}"
@@ -660,9 +660,11 @@ fn inc(x: Int) -> Int
     assert_eq!(v["ok"], false, "{v}");
 }
 
-/// A proposition over a fixed width is declined at the seam rather than judged over misread bytes.
+/// A claim over a fixed width is judged over the values it names: the seam reads each width as
+/// its type says, so a law over `U8` is refuted at the byte that breaks it and proved over the
+/// 256 that hold, and a clause no byte satisfies is vacuous rather than misread.
 #[test]
-fn a_claim_over_a_fixed_width_is_declined_at_the_seam_rather_than_misread() {
+fn a_claim_over_a_fixed_width_is_judged_over_the_values_it_names() {
     const SOURCE: &str = "\
 fn narrow(n: Int) -> U8
   requires n >= 0 && n < 256
@@ -674,7 +676,13 @@ fn low_bit(b: U8) -> Int
   ensures result < 2
 = int_of_u8(b & 1u8)
 
+type Byte = | Byte(U8)
+
 law \"no byte is seven\" forall (b: U8) { int_of_u8(b) != 7 }
+
+law \"every byte fits\" forall (b: U8) { int_of_u8(b) < 256 }
+
+law \"no Byte is seven\" forall (b: Byte) { match b { Byte(x) -> int_of_u8(x) != 7 } }
 ";
     let dir = project(SOURCE);
     let out = ply(dir.path())
@@ -682,27 +690,44 @@ law \"no byte is seven\" forall (b: U8) { int_of_u8(b) != 7 }
         .output()
         .unwrap();
     let v = json_of(&out);
-    for (needle, declined) in [
-        ("m.narrow", "m.narrow"),
-        ("m.low_bit", "m.low_bit#requires#0"),
-        ("no byte is seven", "m.law#0.body"),
-    ] {
-        let o = v["obligations"]
+    let by_label = |needle: &str| -> Value {
+        v["obligations"]
             .as_array()
             .unwrap()
             .iter()
             .find(|o| o["label"].as_str().unwrap_or_default().contains(needle))
             .cloned()
-            .unwrap_or_else(|| panic!("no obligation for `{needle}`: {v}"));
-        assert_eq!(o["outcome"], "defect", "{o}");
-        assert!(
-            o["defect"]["message"]
-                .as_str()
-                .is_some_and(|m| m.contains(&format!("declined to enter `{declined}`"))),
-            "{o}"
-        );
+            .unwrap_or_else(|| panic!("no obligation for `{needle}`: {v}"))
+    };
+    for (needle, value) in [("no byte is seven", "7"), ("no Byte is seven", "m.Byte(7)")] {
+        let o = by_label(needle);
+        assert_eq!(o["outcome"], "refuted", "{o}");
+        let binding = &o["counterexample"]["bindings"][0];
+        assert_eq!(binding["name"], "b", "{o}");
+        assert_eq!(binding["value"], value, "{o}");
+        assert_eq!(o["counterexample"]["shrinks"], 0, "{o}");
     }
-    assert_eq!(v["summary"]["defect"], 3, "{v}");
+    assert_eq!(
+        by_label("no byte is seven")["counterexample"]["bindings"][0]["type"],
+        "U8"
+    );
+    let fits = by_label("every byte fits");
+    assert_eq!(fits["outcome"], "proved", "{fits}");
+    let enumerated: Vec<&Value> = fits["certificate"]["rules"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|rule| rule.get("exhaustive_enumeration"))
+        .collect();
+    assert!(
+        enumerated.len() == 1 && enumerated[0]["points"] == 256,
+        "every byte was checked: {fits}"
+    );
+    assert_eq!(by_label("m.low_bit")["outcome"], "vacuous");
+    assert_ne!(by_label("m.narrow")["outcome"], "defect");
+    assert_eq!(v["summary"]["defect"], 0, "{v}");
+    assert_eq!(v["summary"]["refuted"], 2, "{v}");
     assert_eq!(out.status.code(), Some(1), "{v}");
 }
 

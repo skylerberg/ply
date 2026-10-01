@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
-use crate::harness::{Reservation, connect_when_ready, process, write};
+use crate::harness::{Reservation, connect_when_ready, process, repo, write};
+use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Child, Stdio};
@@ -74,7 +75,6 @@ fn ready(answer: &str, nonce: &str) -> bool {
 /// Killed on drop, including during a panic, so a failing test does not leak a server.
 struct Server {
     child: Child,
-    nonce: String,
     reserved: Reservation,
     _dir: tempfile::TempDir,
 }
@@ -95,8 +95,19 @@ impl Server {
     fn start_with(source: &str, flags: &[&str]) -> Server {
         let mut refused = Vec::new();
         for _ in 0..PORT_ATTEMPTS {
-            let mut server = Server::spawn(source, flags, Reservation::take());
-            match server.wait_until_listening() {
+            let reserved = Reservation::take();
+            let nonce = nonce();
+            let dir = tempfile::tempdir().expect("a temp dir");
+            write(
+                dir.path(),
+                "main.ply",
+                &source
+                    .replace("HEAD", HEAD)
+                    .replace("PORT", &reserved.port().to_string())
+                    .replace("NONCE", &nonce),
+            );
+            let mut server = Server::launch(dir, flags, reserved);
+            match server.wait_until_listening(&nonce) {
                 Ok(()) => return server,
                 Err(why) => refused.push(why),
             }
@@ -107,17 +118,37 @@ impl Server {
         );
     }
 
-    fn spawn(source: &str, flags: &[&str], reserved: Reservation) -> Server {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let nonce = nonce();
-        write(
-            dir.path(),
-            "main.ply",
-            &source
-                .replace("HEAD", HEAD)
-                .replace("PORT", &reserved.port().to_string())
-                .replace("NONCE", &nonce),
+    /// `tests/fixtures/<name>.ply` as committed, told its port by the setting `port_key`. It cannot
+    /// echo a token, so the reservation keeps the port this test's alone, and the connection that
+    /// found it listening is handed back as the test's own.
+    fn fixture(name: &str, port_key: &str, flags: &[&str]) -> (Server, TcpStream) {
+        let file = format!("{name}.ply");
+        let mut refused = Vec::new();
+        for _ in 0..PORT_ATTEMPTS {
+            let reserved = Reservation::take();
+            let setting = format!("{port_key}={}", reserved.port());
+            let dir = tempfile::tempdir().expect("a temp dir");
+            std::fs::copy(
+                repo().join("tests/fixtures").join(&file),
+                dir.path().join(&file),
+            )
+            .expect("the fixture is copied");
+            let mut server = Server::launch(dir, &[flags, &["--set", &setting]].concat(), reserved);
+            let Server {
+                child, reserved, ..
+            } = &mut server;
+            match connect_when_ready(reserved, child, Duration::from_secs(60), |_| true) {
+                Ok(held) => return (server, held),
+                Err(why) => refused.push(why),
+            }
+        }
+        panic!(
+            "`ply run --host` never listened, on {PORT_ATTEMPTS} ports:\n\n{}",
+            refused.join("\n\n")
         );
+    }
+
+    fn launch(dir: tempfile::TempDir, flags: &[&str], reserved: Reservation) -> Server {
         let child = process(dir.path())
             .arg("run")
             .arg("--host")
@@ -128,7 +159,6 @@ impl Server {
             .expect("`ply run` starts");
         Server {
             child,
-            nonce,
             reserved,
             _dir: dir,
         }
@@ -136,13 +166,12 @@ impl Server {
 
     /// The probe is a whole request and response, and the answer has to carry this test's token:
     /// a bare connect, or a `200 OK`, can belong to another test's server on the same port.
-    fn wait_until_listening(&mut self) -> Result<(), String> {
-        let nonce = self.nonce.clone();
+    fn wait_until_listening(&mut self, nonce: &str) -> Result<(), String> {
         connect_when_ready(
             &mut self.reserved,
             &mut self.child,
             Duration::from_secs(60),
-            |stream| ready(&request(stream), &nonce),
+            |stream| ready(&request(stream), nonce),
         )
         .map(|_| ())
     }
@@ -172,7 +201,13 @@ impl Server {
     }
 
     /// The exit code and everything the run wrote, where `W0608` and the shutdown banner land.
-    fn finish(mut self) -> (i32, String) {
+    fn finish(self) -> (i32, String) {
+        let (code, out, err) = self.wait();
+        (code, format!("{out}{err}"))
+    }
+
+    /// The exit code, and what the run wrote to stdout and to stderr apart.
+    fn wait(mut self) -> (i32, String, String) {
         let until = Instant::now() + Duration::from_secs(60);
         loop {
             match self.child.try_wait().expect("the child is ours") {
@@ -196,7 +231,7 @@ impl Server {
             let _ = stderr.read_to_string(&mut err);
         }
         // `None` means a signal killed the process, and a killed run did not drain.
-        (status.code().unwrap_or(-1), format!("{out}{err}"))
+        (status.code().unwrap_or(-1), out, err)
     }
 }
 
@@ -335,6 +370,64 @@ fn a_drain_that_expires_reports_w0608_and_exits_three() {
         output.contains("drain-ms"),
         "`W0608` has to say what to do about it\n\n{output}"
     );
+}
+
+/// `tests/fixtures/drain_incomplete.ply`: a head announcing a body that never comes keeps its
+/// request reading for up to the program's `body_timeout_ms`, and a 300ms drain cannot wait that out.
+#[test]
+fn the_drain_fixture_abandons_a_request_still_reading_its_body() {
+    let (server, mut held) = Server::fixture(
+        "drain_incomplete",
+        "DRAIN_PORT",
+        &["--json", "--drain-ms", "300"],
+    );
+    held.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n")
+        .expect("the head is written");
+    std::thread::sleep(Duration::from_millis(200));
+    server.signal("TERM");
+
+    let mut answer = Vec::new();
+    let _ = held.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = held.read_to_end(&mut answer);
+    assert!(
+        answer.is_empty(),
+        "a request live at the deadline is closed with no response; this client read {:?}",
+        String::from_utf8_lossy(&answer)
+    );
+
+    let (code, out, err) = server.wait();
+    let report: Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("`--json` writes one document on stdout: {e}\n{out}{err}"));
+    assert_eq!(code, 3, "{report}");
+    assert_eq!(report["exit_code"], 3, "{report}");
+    assert_eq!(report["shutdown"]["signal"], "TERM", "{report}");
+    assert_eq!(report["shutdown"]["drain_ms"], 300, "{report}");
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a diagnostics array: {report}"));
+    assert!(
+        diagnostics.iter().all(|d| d["severity"] != "error"),
+        "the expired drain is the run's only failure: {report}"
+    );
+    let drained = diagnostics
+        .iter()
+        .find(|d| d["code"] == "W0608")
+        .unwrap_or_else(|| panic!("the run exited 3 and never said why: {report}"));
+    assert_eq!(drained["severity"], "warning", "{drained}");
+    assert_eq!(
+        drained["message"], "the drain deadline expired",
+        "{drained}"
+    );
+    let notes: Vec<&str> = drained["notes"]
+        .as_array()
+        .map(|notes| notes.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for note in [
+        "1 connection(s) abandoned with no response written",
+        "raise `--drain-ms` above the program's own body_timeout_ms + write_timeout_ms",
+    ] {
+        assert!(notes.contains(&note), "`W0608` lacks `{note}`: {drained}");
+    }
 }
 
 #[test]
