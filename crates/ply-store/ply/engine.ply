@@ -1,12 +1,11 @@
 // The engine: frames appended to one data file and found through one index of sorted sections,
 // rewritten whole. It knows a table by its number and a key as 32 bytes, never what a payload means.
 
-import std.fs (fs, MemFs, mem_empty, mem_read, mem_read_at, mem_list, mem_kind, mem_resolved,
-               mem_exists, mem_size, mem_modified, mem_write, mem_append, mem_create_dir,
-               mem_remove, mem_rename, mem_sync, mem_lock, mem_unlock)
+import std.fs (fs, mem_empty)
 import std.random (entropy)
 import std.time (time)
 import std.bytes (u32_le, u64_le)
+import twin (on_twin)
 
 // --- Layout -----------------------------------------------------------------
 
@@ -57,18 +56,30 @@ pub type Store = {
   sections: List<Section>,
   puts: Map<Bytes, Bytes>,
   drops: Map<Bytes, Bool>,
-  warnings: List<String>,
+  warnings: List<Warning>,
 }
+
+// What a warning reports: the store could not be read or written, held something that did not
+// verify, or was written in another format or for other stored types.
+pub type Trouble = | Unreadable | Corrupt | OtherVersion
+
+pub type Warning = { trouble: Trouble, message: String }
 
 pub type Found = | Hit(Bytes) | Miss | Bad(String)
 
 type Disk = { nonce: Bytes, data_len: Int, index: Bytes, sections: List<Section> }
 
-type Loaded = | Valid(Disk) | Cold | Damaged(String)
+type Problem = { trouble: Trouble, why: String }
+
+type Loaded = | Valid(Disk) | Cold | Unusable(Problem)
+
+fn corrupt(why: String) -> Problem = { trouble: Corrupt, why: why }
+
+fn foreign(why: String) -> Problem = { trouble: OtherVersion, why: why }
 
 fn empty_disk() -> Disk = { nonce: b"", data_len: 0, index: b"", sections: [] }
 
-fn with_disk(dir: String, schema: Bytes, d: Disk, warnings: List<String>) -> Store =
+fn with_disk(dir: String, schema: Bytes, d: Disk, warnings: List<Warning>) -> Store =
   {
     dir: dir,
     schema: schema,
@@ -82,12 +93,23 @@ fn with_disk(dir: String, schema: Bytes, d: Disk, warnings: List<String>) -> Sto
   }
 
 // One warning per distinct reason, however often a run meets it.
-pub fn warn(s: Store, why: String) -> Store =
-  if fold(s.warnings, false, |seen: Bool, w: String| seen || w == why) { s }
-  else { { ..s, warnings: push(s.warnings, why) } }
+pub fn warn(s: Store, trouble: Trouble, message: String) -> Store =
+  { ..s, warnings: noted(s.warnings, { trouble: trouble, message: message }) }
 
-fn unreadable(why: String) -> String =
-  "the store is unreadable (" ++ why ++ "); this run starts empty"
+fn noted(ws: List<Warning>, w: Warning) -> List<Warning> =
+  if fold(ws, false, |seen: Bool, x: Warning| seen || x == w) { ws } else { push(ws, w) }
+
+pub fn messages(ws: List<Warning>) -> List<String> = map(ws, |w: Warning| w.message)
+
+fn starts_empty(p: Problem) -> Warning =
+  {
+    trouble: p.trouble,
+    message: match p.trouble {
+      OtherVersion ->
+        "the store was written by another version (" ++ p.why ++ "); this run starts empty",
+      _ -> "the store is unreadable (" ++ p.why ++ "); this run starts empty",
+    },
+  }
 
 // `schema` names every stored type's encoding; a store written under another is read as empty.
 pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r]} = {
@@ -95,7 +117,7 @@ pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r]} = {
   match load[r](dir, digest) {
     Valid(d) -> with_disk(dir, digest, d, []),
     Cold -> with_disk(dir, digest, empty_disk(), []),
-    Damaged(why) -> with_disk(dir, digest, empty_disk(), [unreadable(why)]),
+    Unusable(p) -> with_disk(dir, digest, empty_disk(), [starts_empty(p)]),
   }
 }
 
@@ -103,29 +125,30 @@ fn load<[r]>(dir: String, schema: Bytes) -> Loaded / {fs.read[r]} =
   match fs.read_file[r](path(dir, index_name())) {
     None -> Cold,
     Some(idx) -> match parse_index(idx, schema) {
-      Err(why) -> Damaged(why),
-      Ok(d) -> match data_problem[r](dir, d, schema) {
-        None -> Valid(d),
-        Some(why) -> Damaged(why),
-      },
+      Err(p) -> Unusable(p),
+      Ok(d) -> match data_problem[r](dir, d, schema) { None -> Valid(d), Some(p) -> Unusable(p) },
     },
   }
 
-fn parse_index(b: Bytes, schema: Bytes) -> Result<Disk, String> =
+fn parse_index(b: Bytes, schema: Bytes) -> Result<Disk, Problem> =
   if bytes_len(b) < index_header() || bytes_slice(b, 0, 8) != index_magic() {
-    Err("the index is not a store index")
+    Err(corrupt("the index is not a store index"))
   } else if u32_at(b, 8) != format() {
     Err(
-      "the index is in format " ++ int_to_string(u32_at(b, 8)) ++ ", not "
-        ++ int_to_string(format()),
+      foreign(
+        "the index is in format " ++ int_to_string(u32_at(b, 8)) ++ ", not "
+          ++ int_to_string(format()),
+      ),
     )
-  } else if bytes_slice(b, 36, 68) != schema { Err("the index was written for other stored types") }
-  else if bytes_blake3(bytes_slice(b, index_header(), bytes_len(b))) != bytes_slice(b, 68, 100) {
-    Err("the index does not match its checksum")
-  } else if u64_at(b, 28) < data_header() { Err("the index vouches for no data file") } else {
+  } else if bytes_slice(b, 36, 68) != schema {
+    Err(foreign("the index was written for other stored types"))
+  } else if bytes_blake3(bytes_slice(b, index_header(), bytes_len(b))) != bytes_slice(b, 68, 100) {
+    Err(corrupt("the index does not match its checksum"))
+  } else if u64_at(b, 28) < data_header() { Err(corrupt("the index vouches for no data file")) }
+  else {
     let count = u32_at(b, 100);
     let records = index_header() + count * table_width();
-    if records > bytes_len(b) { Err("the index's tables run past its end") } else {
+    if records > bytes_len(b) { Err(corrupt("the index's tables run past its end")) } else {
       match sections_from(b, 0, count, records, 0 - 1, []) {
         Err(why) -> Err(why),
         Ok(secs) ->
@@ -141,31 +164,32 @@ fn sections_from(
   records: Int,
   last: Int,
   acc: List<Section>,
-) -> Result<List<Section>, String> =
+) -> Result<List<Section>, Problem> =
   if i == count { Ok(acc) } else {
     let at = index_header() + i * table_width();
     let sec = { table: u32_at(b, at), count: u32_at(b, at + 4), start: u64_at(b, at + 8) };
-    if sec.table <= last { Err("the index's tables are out of order") }
+    if sec.table <= last { Err(corrupt("the index's tables are out of order")) }
     else if sec.start < records || sec.start + sec.count * record_width() > bytes_len(b) {
-      Err("a table lies outside the index")
+      Err(corrupt("a table lies outside the index"))
     } else { sections_from(b, i + 1, count, records, sec.table, push(acc, sec)) }
   }
 
-fn data_problem<[r]>(dir: String, d: Disk, schema: Bytes) -> Option<String> / {fs.read[r]} = {
+fn data_problem<[r]>(dir: String, d: Disk, schema: Bytes) -> Option<Problem> / {fs.read[r]} = {
   let file = path(dir, data_name());
   match fs.read_at[r](file, 0, data_header()) {
-    None -> Some("the data file is missing"),
+    None -> Some(corrupt("the data file is missing")),
     Some(h) -> if bytes_len(h) < data_header() || bytes_slice(h, 0, 8) != data_magic() {
-      Some("the data file is not a store's")
+      Some(corrupt("the data file is not a store's"))
     } else if bytes_slice(h, 12, 28) != d.nonce {
-      Some("the data file is not the one the index was written with")
+      Some(corrupt("the data file is not the one the index was written with"))
     } else if u32_at(h, 8) != format() || bytes_slice(h, 28, 60) != schema {
-      Some("the data file was written for other stored types")
+      Some(foreign("the data file was written for other stored types"))
     } else {
       match fs.file_size[r](file) {
-        Some(n) -> if n < d.data_len { Some("the data file is shorter than the index vouches for") }
-        else { None },
-        None -> Some("the data file is missing"),
+        Some(n) -> if n < d.data_len {
+          Some(corrupt("the data file is shorter than the index vouches for"))
+        } else { None },
+        None -> Some(corrupt("the data file is missing")),
       }
     },
   }
@@ -304,7 +328,8 @@ pub fn drop(s: Store, table: Int, key: Bytes) -> Store = {
 
 pub fn pending(s: Store) -> Int = map_len(s.puts) + map_len(s.drops)
 
-fn not_kept(s: Store, why: String) -> Store = warn(s, why ++ "; this run's entries were not kept")
+fn not_kept(s: Store, why: String) -> Store =
+  warn(s, Unreadable, why ++ "; this run's entries were not kept")
 
 fn fresh_nonce() -> Bytes / {entropy.next, time.now_ms} =
   bytes_slice(bytes_blake3(u64_le(entropy.next()) ++ u64_le(time.now_ms())), 0, 16)
@@ -322,7 +347,7 @@ pub fn flush<[r]>(s: Store) -> Store / {fs.read[r], fs.write[r], entropy.next, t
     sweep[r](s.dir);
     let written = locked_flush[r](s);
     if fs.unlock[r](path(s.dir, lock_name())) { written }
-    else { warn(written, "the store's lock could not be released") }
+    else { warn(written, Unreadable, "the store's lock could not be released") }
   }
 
 // Every temp file is stale under the lock: only its holder writes one.
@@ -336,20 +361,20 @@ fn sweep<[r]>(dir: String) -> Unit / {fs.read[r], fs.write[r]} =
         } else { () }),
   }
 
-type Base = { disk: Option<Disk>, warnings: List<String> }
+type Base = { disk: Option<Disk>, warnings: List<Warning> }
 
 // The store on disk now, which another run may have written since this one opened it.
 fn base<[r]>(s: Store) -> Base / {fs.read[r], fs.write[r], entropy.next, time.now_ms} =
   match load[r](s.dir, s.schema) {
     Valid(d) -> { disk: Some(d), warnings: s.warnings },
     Cold -> started[r](s.dir, s.schema, s.warnings),
-    Damaged(why) -> started[r](s.dir, s.schema, push(s.warnings, unreadable(why))),
+    Unusable(p) -> started[r](s.dir, s.schema, noted(s.warnings, starts_empty(p))),
   }
 
 fn started<[r]>(
   dir: String,
   schema: Bytes,
-  warnings: List<String>,
+  warnings: List<Warning>,
 ) -> Base / {fs.write[r], entropy.next, time.now_ms} = {
   let nonce = fresh_nonce();
   let file = path(dir, data_name());
@@ -413,9 +438,9 @@ fn published<[r]>(s: Store, index: Bytes) -> Store / {fs.write[r]} = {
       Ok(d) -> {
         let fresh = with_disk(s.dir, s.schema, d, s.warnings);
         if s.dir == "" || fs.sync[r](s.dir) { fresh }
-        else { warn(fresh, "the store's directory could not be synced") }
+        else { warn(fresh, Unreadable, "the store's directory could not be synced") }
       },
-      Err(why) -> not_kept(s, "the index this run wrote does not read back (" ++ why ++ ")"),
+      Err(why) -> not_kept(s, "the index this run wrote does not read back (" ++ why.why ++ ")"),
     }
   } else { not_kept(s, "the store's index could not be written") }
 }
@@ -521,19 +546,19 @@ type Copied = { frames: List<Bytes>, size: Int, tables: List<Table>, dropped: In
 pub fn compact<[r]>(s0: Store) -> Store / {fs.read[r], fs.write[r], entropy.next, time.now_ms} = {
   let s = flush[r](s0);
   if pending(s) > 0 { s } else if !fs.lock[r](path(s.dir, lock_name())) {
-    warn(s, "another run holds the store's lock; it was not compacted")
+    warn(s, Unreadable, "another run holds the store's lock; it was not compacted")
   } else {
     sweep[r](s.dir);
     let done = locked_compact[r](s);
     if fs.unlock[r](path(s.dir, lock_name())) { done }
-    else { warn(done, "the store's lock could not be released") }
+    else { warn(done, Unreadable, "the store's lock could not be released") }
   }
 }
 
 fn locked_compact<[r]>(s: Store) -> Store / {fs.read[r], fs.write[r], entropy.next, time.now_ms} =
   match load[r](s.dir, s.schema) {
     Cold -> s,
-    Damaged(why) -> warn(s, unreadable(why)),
+    Unusable(p) -> { ..s, warnings: noted(s.warnings, starts_empty(p)) },
     Valid(d) -> {
       let copied = fold(
         d.sections,
@@ -546,16 +571,17 @@ fn locked_compact<[r]>(s: Store) -> Store / {fs.read[r], fs.write[r], entropy.ne
       let dtmp = path(s.dir, data_name() ++ temp_suffix());
       let itmp = path(s.dir, index_name() ++ temp_suffix());
       let s1 = if copied.dropped == 0 { s }
-      else { warn(s, "compaction dropped entries that did not verify") };
+      else { warn(s, Corrupt, "compaction dropped entries that did not verify") };
       if fs.write_file[r](dtmp, data) && fs.sync[r](dtmp) && fs.write_file[r](itmp, index)
           && fs.sync[r](itmp)
           && fs.rename[r](dtmp, path(s.dir, data_name()))
           && fs.rename[r](itmp, path(s.dir, index_name())) {
         match parse_index(index, s.schema) {
           Ok(nd) -> with_disk(s.dir, s.schema, nd, s1.warnings),
-          Err(why) -> warn(s1, "the index compaction wrote does not read back (" ++ why ++ ")"),
+          Err(p) ->
+            warn(s1, Corrupt, "the index compaction wrote does not read back (" ++ p.why ++ ")"),
         }
-      } else { warn(s1, "the store could not be compacted") }
+      } else { warn(s1, Unreadable, "the store could not be compacted") }
     },
   }
 
@@ -590,72 +616,6 @@ fn copy_table<[r]>(dir: String, d: Disk, sec: Section, acc0: Copied) -> Copied /
 
 // --- Tests ------------------------------------------------------------------
 
-type Twin<a> = { value: a, tree: MemFs }
-
-// Runs `go` over an in-memory tree as the label `mem`, with a counting entropy and a fixed clock.
-fn on_twin<a>(
-  tree: MemFs,
-  go: () -> a / {fs.read[mem], fs.write[mem], entropy.next, time.now_ms},
-) -> Twin<a> =
-  with_cell[disk](tree) { t ->
-    with_cell[draws](0) { n -> {
-      let value = handle {
-        go()
-      } with {
-        fs.read_file[mem](p) -> mem_read(cell_get(t), p),
-        fs.read_at[mem](p, o, l) -> mem_read_at(cell_get(t), p, o, l),
-        fs.list_dir[mem](p) -> mem_list(cell_get(t), p),
-        fs.kind[mem](p) -> mem_kind(cell_get(t), p),
-        fs.resolved[mem](p) -> mem_resolved(cell_get(t), p),
-        fs.exists[mem](p) -> mem_exists(cell_get(t), p),
-        fs.file_size[mem](p) -> mem_size(cell_get(t), p),
-        fs.modified_ms[mem](p) -> mem_modified(cell_get(t), p),
-        fs.write_file[mem](p, b) -> {
-          let w = mem_write(cell_get(t), p, b);
-          cell_set(t, w.fs);
-          w.ok
-        },
-        fs.append[mem](p, b) -> {
-          let w = mem_append(cell_get(t), p, b);
-          cell_set(t, w.fs);
-          w.at
-        },
-        fs.create_dir[mem](p) -> {
-          let w = mem_create_dir(cell_get(t), p);
-          cell_set(t, w.fs);
-          w.ok
-        },
-        fs.remove[mem](p) -> {
-          let w = mem_remove(cell_get(t), p);
-          cell_set(t, w.fs);
-          w.ok
-        },
-        fs.rename[mem](a, b) -> {
-          let w = mem_rename(cell_get(t), a, b);
-          cell_set(t, w.fs);
-          w.ok
-        },
-        fs.sync[mem](p) -> mem_sync(cell_get(t), p),
-        fs.lock[mem](p) -> {
-          let w = mem_lock(cell_get(t), p);
-          cell_set(t, w.fs);
-          w.ok
-        },
-        fs.unlock[mem](p) -> {
-          let w = mem_unlock(cell_get(t), p);
-          cell_set(t, w.fs);
-          w.ok
-        },
-        entropy.next() -> {
-          cell_set(n, cell_get(n) + 1);
-          cell_get(n)
-        },
-        time.now_ms() -> 1000,
-      };
-      { value: value, tree: cell_get(t) }
-    } }
-  }
-
 fn k(name: String) -> Bytes = bytes_blake3(bytes_of_string(name))
 
 fn schema_a() -> Bytes = b"schema a"
@@ -663,9 +623,9 @@ fn schema_a() -> Bytes = b"schema a"
 fn hit(f: Found) -> Bytes =
   match f { Hit(b) -> b, Miss -> b"<miss>", Bad(why) -> bytes_of_string(why) }
 
-fn all(xs: List<List<String>>) -> List<String> =
-  fold(xs, [], |acc: List<String>, x: List<String>|
-    fold(x, acc, |a: List<String>, w: String| push(a, w)))
+fn all(xs: List<List<Warning>>) -> List<String> =
+  fold(xs, [], |acc: List<String>, x: List<Warning>|
+    fold(x, acc, |a: List<String>, w: Warning| push(a, w.message)))
 
 fn missed(f: Found) -> Bool = match f { Miss -> true, _ -> false }
 
@@ -685,7 +645,7 @@ test "what a store puts it reads at once, and again after a flush and a reopen" 
     assert(missed(get[mem](s3, 1, k("c"))));
     assert_eq(len(keys(s3, 1)), 2);
     assert_eq(map(stats(s3).entries, |e: { table: Int, count: Int }| e.count), [2, 1]);
-    s3.warnings
+    messages(s3.warnings)
   });
   assert_eq(run.value, [])
 }
@@ -701,7 +661,7 @@ test "a drop and a replacement hold across a flush" {
     assert(missed(get[mem](s3, 1, k("a"))));
     assert_eq(hit(get[mem](s3, 1, k("b"))), b"three");
     assert_eq(keys(s3, 1), [k("b")]);
-    s3.warnings
+    messages(s3.warnings)
   });
   assert_eq(run.value, [])
 }
@@ -762,8 +722,8 @@ test "a store written under another schema, or missing its data file, opens empt
     all([other.warnings, gone.warnings])
   });
   assert_eq(run.value, [
-    unreadable("the index was written for other stored types"),
-    unreadable("the data file is missing"),
+    "the store was written by another version (the index was written for other stored types); this run starts empty",
+    "the store is unreadable (the data file is missing); this run starts empty",
   ])
 }
 
@@ -774,7 +734,7 @@ test "a run that cannot take the lock writes nothing and says so" {
     let s = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), b"x"));
     assert_eq(pending(s), 1);
     assert(missed(get[mem](open[mem]("cache", schema_a()), 1, k("a"))));
-    s.warnings
+    messages(s.warnings)
   });
   assert_eq(run.value, ["another run holds the store's lock; this run's entries were not kept"])
 }
@@ -818,5 +778,23 @@ test "an index that does not match its checksum opens empty and is replaced by t
     assert_eq(hit(get[mem](s4, 1, k("b"))), b"y");
     all([s2.warnings, s4.warnings])
   });
-  assert_eq(run.value, [unreadable("the index does not match its checksum")])
+  assert_eq(run.value, [
+    "the store is unreadable (the index does not match its checksum); this run starts empty",
+  ])
+}
+
+fn at_least(ws: List<Warning>) -> Warning =
+  match list_at(ws, 0) { Some(w) -> w, None -> { trouble: Corrupt, message: "none" } }
+
+test "a warning says whether the store was another version's, damaged, or out of reach" {
+  let run = on_twin(mem_empty(), || {
+    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, k("a"), b"x"));
+    let other = open[mem]("cache", b"schema b");
+    assert(fs.remove[mem]("cache/store.dat"));
+    let gone = open[mem]("cache", schema_a());
+    assert(fs.lock[mem]("cache/store.lock"));
+    let held = flush[mem](put(gone, 1, k("b"), b"y"));
+    map(push(held.warnings, at_least(other.warnings)), |w: Warning| w.trouble)
+  });
+  assert_eq(run.value, [Corrupt, Unreadable, OtherVersion])
 }
