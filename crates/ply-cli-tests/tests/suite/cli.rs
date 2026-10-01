@@ -712,7 +712,7 @@ fn a_filter_matching_nothing_says_so_rather_than_claiming_success_quietly() {
     let text = stdout_of(&out);
     assert!(text.contains("selected 0 of 0"), "got:\n{text}");
     assert!(
-        text.contains("no test key contains that substring"),
+        text.contains("no test key contains a `--filter` substring"),
         "got:\n{text}"
     );
 }

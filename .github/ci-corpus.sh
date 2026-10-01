@@ -33,7 +33,7 @@ run_one() {
   else
     "$ply" test "$path" ${filter:+--filter "$filter"} "${grants[@]}" "$@" > "$out" || status=$?
   fi
-  jq -r '.results[]? | "\(.status)\t\(.name)"' "$out" 2>/dev/null
+  jq -r '.results[]? | "\(.status)\t\(.key // .name)"' "$out" 2>/dev/null
   selected=$(jq -s 'map(.results // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
   if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
     [ "$selected" -gt 0 ] || echo "corpus run $id selected no test (filter: ${filter:-none})" >&2
@@ -45,7 +45,7 @@ run_one() {
 }
 
 # The checks runs IDs, in one `ply test`: each run's milliseconds are the summed durations of the
-# tests its filter selected, and a run whose filter selected none fails.
+# tests whose `<module>.<label>` key its filter holds, and a run whose filter selected none fails.
 run_checks() {
   local timings=$1 id line path filter status=0 out bad=0 n ms i
   local -a filters=() ids=() args=()
@@ -59,10 +59,10 @@ run_checks() {
   done
   out=$(mktemp)
   "$ply" test "$path" "${args[@]}" "${grants[@]}" > "$out" || status=$?
-  jq -r '.results[]? | "\(.status)\t\(.name)"' "$out" 2>/dev/null
+  jq -r '.results[]? | "\(.status)\t\(.key // .name)"' "$out" 2>/dev/null
   for i in "${!ids[@]}"; do
-    n=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.name | contains($f))] | length' "$out" 2>/dev/null || echo 0)
-    ms=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.name | contains($f)) | .duration_us] | add // 0 | . / 1000 | floor' "$out" 2>/dev/null || echo 0)
+    n=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.key | contains($f))] | length' "$out" 2>/dev/null || echo 0)
+    ms=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.key | contains($f)) | .duration_ms] | add // 0 | floor' "$out" 2>/dev/null || echo 0)
     if [ "$n" -eq 0 ]; then
       echo "corpus run ${ids[$i]} selected no test (filter: ${filters[$i]})" >&2
       bad=1

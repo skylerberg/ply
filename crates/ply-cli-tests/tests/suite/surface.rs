@@ -63,7 +63,7 @@ fn test_runs_every_test_any_of_its_filters_matches() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| r["name"].as_str().unwrap())
+        .map(|r| r["key"].as_str().unwrap())
         .collect();
     ran.sort_unstable();
     assert_eq!(ran, ["m.alone is three", "m.two is two"], "{v}");
