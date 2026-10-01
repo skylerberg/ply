@@ -4,14 +4,16 @@
 
 import args (Flags, from_argv, style_of)
 import claims
+import proof.rules (Congruence)
 import program (Timed, front_of, is_shipped, no_front, timed_load, timed_uncached)
 import proof.world (Built, World, world_of)
-import claims (Broken, Options, prover, Accepted, Claim, Claimed, Collected, Collection, Discharged,
+import claims (Broken, Options, prover, Accepted, Claim, Claimed, Collected, Collection, Discharged, Refusal,
                Row, Verdicts, a_claim, a_counter, a_fault, a_place, also, claim_rows, claimed_part,
                code_of, collected_part, collection_of, coverage_json, coverage_lines, decided,
                detail_of, diagnostics_of, failure, label_of, laws_in, mark_of, no_statics, no_world,
                nth, num, obligation_json, a_plan, once_each, outcome_word, own_claims, pad_right,
-               plan_json, proved, refusal, rows_of, Statics, statics_of)
+               plan_json, proved, refusal, rows_of, Statics, statics_of, discharge_runs)
+import proof.decide (Static)
 import proof.obligation (Change, Changed, Changes, Coverage, Def, Defect, Ensures, Fresh, Gap,
                          Moved, Never, Outcome, Record, Refuted, Tier, Unattempted, Unchanged,
                          UnhandledEffect, record_map, records, review)
@@ -273,14 +275,15 @@ fn all_of(cs: List<Claim>) -> List<Int> = range(0, len(cs))
 
 // A review reports on everything the collection holds: what moved since the baseline a reader
 // accepted, and what became of the claims that went with it.
-fn changed_answer(
+fn changed_answer<| e>(
   s: Style,
   c: Collection,
   use_cache: Bool,
   statics: Statics,
-) -> Answer / {prover.discharged[claims], prover.record[claims], prover.baselines[claims], prover.outcomes[claims]} = {
+  discharge: (Collection, List<Int>, List<Static>) -> Result<Discharged, Refusal> / e,
+) -> Answer / {prover.record[claims], prover.baselines[claims], prover.outcomes[claims], prover.cached[claims] | e} = {
   let wanted = all_of(c.claims);
-  match decided(c, wanted, use_cache, statics, false) {
+  match decided(c, wanted, use_cache, statics, false, |runs: List<Int>, settled: List<Static>| discharge(c, runs, settled)) {
     Err(why) -> refusal(s, "review", why),
     Ok(v) -> {
       let laws = laws_in(c);
@@ -299,7 +302,7 @@ fn changed_answer(
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.baselines[claims], prover.accepted[claims], prover.outcomes[claims], store.known[cache], store.file[cache]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.record[claims], prover.baselines[claims], prover.accepted[claims], prover.outcomes[claims], prover.cached[claims], prover.prepared[claims], prover.judged[claims], prover.searched[claims], store.known[cache], store.file[cache]} = {
   let s: Style = style_of(flags);
   let t: Timed = if options.no_incremental { timed_uncached(flags.paths) }
   else { timed_load(flags.paths) };
@@ -319,6 +322,7 @@ pub fn run(
         built.world,
         own_claims(w, built),
         statics_of(w, built.world),
+        discharge_runs,
       )
     },
   }
@@ -326,7 +330,7 @@ pub fn run(
 
 // The review itself, over the front end `run` loaded, the claims it built from it, and the static
 // prover over them.
-fn review_over(
+fn review_over<| e>(
   s: Style,
   flags: Flags,
   options: Options,
@@ -334,7 +338,8 @@ fn review_over(
   world: World,
   mine: Claimed,
   statics: Statics,
-) -> Answer / {prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.baselines[claims], prover.accepted[claims], prover.outcomes[claims]} = {
+  discharge: (Collection, List<Int>, List<Static>) -> Result<Discharged, Refusal> / e,
+) -> Answer / {prover.configure[claims], prover.collected[claims], prover.record[claims], prover.baselines[claims], prover.accepted[claims], prover.outcomes[claims], prover.cached[claims] | e} = {
   prover.configure[claims](options, front, world);
   match prover.collected[claims]() {
     Err(why) -> refusal(s, "review", why),
@@ -343,7 +348,7 @@ fn review_over(
       let c = collection_of(got, mine);
       if flags.action == "accept" {
         accepted_answer(s, c, prover.accepted[claims](records(c.defs, laws_in(c))))
-      } else { changed_answer(s, c, !options.no_cache, statics) }
+      } else { changed_answer(s, c, !options.no_cache, statics, discharge) }
     },
   }
 }
@@ -359,6 +364,8 @@ fn a_collection(cs: List<Claim>) -> Collection =
     defs: map(cs, |c: Claim| { name: c.owner, hash: Some(c.key), specs: [] }),
     laws: [],
     plan: a_plan(),
+    host: false,
+    world: no_world(),
   }
 
 fn covering(definitions: Int) -> Coverage =
@@ -416,12 +423,14 @@ fn ran_over(
       no_world(),
       claimed_part(c),
       no_statics(None),
+      |_c: Collection, runs: List<Int>, _settled: List<Static>|
+        Ok({ ..d, outcomes: fold(runs, [], |out: List<Outcome>, i: Int| match list_at(d.outcomes, i) { Some(o) -> push(out, o), None -> out }) }),
     )
   } with {
     prover.configure[claims](options, front, world) -> (),
     prover.collected[claims]() -> Ok(collected_part(c)),
     prover.outcomes[claims](keys) -> map(keys, |_k: String| None),
-    prover.discharged[claims](choice) -> Ok(d),
+    prover.cached[claims](keys) -> map(keys, |_k: String| None),
     prover.record[claims](entries) -> [],
     prover.baselines[claims](names) -> held,
     prover.accepted[claims](records) -> { ..a, definitions: len(records) },
@@ -582,7 +591,7 @@ test "the object names what moved, what it covers and the sentence to act on" {
   let answer = reviewed_over(
     from_argv("review", ["--json"]),
     a_collection(one_claim()),
-    verdicts([proved(Array([]), 1)], 3),
+    verdicts([proved([], 1)], 3),
     ch,
     nothing_accepted(),
   );

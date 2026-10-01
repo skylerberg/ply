@@ -13,16 +13,19 @@ import harness
 import report
 import report (Row, Criterion, holding, number, row, untaken)
 import spine (under)
-import proof.obligation (Binding, Falsified, Fault, Faulted, Held, Kept, NotDrawn, Outcome, Point,
-                         Proved, Raised, Rejected, Undrawn, fault_summary)
-import proof.world (Built, world_of)
+import proof.obligation (Binding, Fault, Held, Outcome, Proved, Judged, JFailed, JHeld, JRaised,
+                         JRejected, JFaulted, fault_summary)
+import proof.decide (Static)
+import proof.gen (Types)
+import proof.property (MWhole, bindings, redrawn, types_of_world)
+import proof.world (Built, Obligation, world_of)
 import std.json (Json, Str, Number, object, array)
 import std.json
 import std.fs (fs)
 import std.process (process)
 import std.config (config)
 import std.time (time)
-import std.value (VInt, filled, render)
+import std.value (Value, VInt, filled, render)
 
 // The fewest proofs an audit may draw from and still be a gate.
 fn least_audited() -> Int = 100
@@ -82,14 +85,13 @@ fn rendered(bs: List<Binding>) -> String =
   fold(bs, "", |acc: String, b: Binding|
     (if acc == "" { "" } else { acc ++ ", " }) ++ b.name ++ " = " ++ render(b.value))
 
-// How one draw contradicts a proof, or `None` when it does not: a refutation, a raise and Ply failing
-// on it are all defects, and a draw the guard rejects or the generator could not make says nothing.
-pub fn contradiction(point: Point) -> Option<String> =
-  match point {
-    Falsified(bs) -> Some("refutes it at " ++ rendered(bs)),
-    Undrawn(Raised(r)) ->
-      Some("raises `" ++ filled(r.message, r.values) ++ "` at " ++ rendered(r.bindings)),
-    Faulted(f) -> Some(fault_summary(f) ++ at_point(f.bindings)),
+// How one judgement contradicts a proof, or `None` when it does not: a refutation, a raise and Ply
+// failing on it are all defects, and a point the guard rejects says nothing.
+pub fn contradiction(j: Judged, bs: List<Binding>) -> Option<String> =
+  match j {
+    JFailed -> Some("refutes it at " ++ rendered(bs)),
+    JRaised(r) -> Some("raises `" ++ filled(r.message, r.values) ++ "` at " ++ rendered(bs)),
+    JFaulted(f) -> Some(fault_summary({ code: f.code, message: f.message, notes: f.notes, values: f.values, bindings: bs }) ++ at_point(bs)),
     _ -> None,
   }
 
@@ -99,31 +101,42 @@ fn at_point(bs: List<Binding>) -> String = if len(bs) == 0 { "" } else { ", at "
 // What re-drawing one proof came to: the draws made, and the first that contradicted it.
 type Drawn = { draws: Int, how: Option<String> }
 
-// Every case from every root, until one contradicts the proof.
-fn drawn(
+// Every case from every root, each drawn afresh, judged until one contradicts the proof. A point the
+// generator cannot make says nothing, and is still a draw.
+fn redrawn_proof(
   index: Int,
-  root: Int,
-  case: Int,
+  o: Obligation,
+  ts: Types,
   cases: Int,
   roots: Int,
-  draws: Int,
-) -> Result<Drawn, String> / {prover.replay[claims]} =
-  if root >= roots { Ok({ draws: draws, how: None }) }
-  else if case >= cases { drawn(index, root + 1, 0, cases, roots, draws) } else {
-    match prover.replay[claims](index, root, case) {
-      Err(_) -> Err("the prover would not replay claim " ++ int_to_string(index)),
-      Ok(point) -> match contradiction(point) {
-        Some(how) ->
-          Ok({
-            draws: draws + 1,
-            how: Some(
-              how ++ " (root " ++ int_to_string(root) ++ ", case " ++ int_to_string(case) ++ ")",
-            ),
-          }),
-        None -> drawn(index, root, case + 1, cases, roots, draws + 1),
+) -> Drawn / {prover.judged[claims]} = {
+  let all = fold(range(0, roots), [], |acc: List<{ root: Int, case: Int }>, root: Int|
+    fold(range(0, cases), acc, |a: List<{ root: Int, case: Int }>, case: Int| push(a, { root: root, case: case })));
+  let made = fold(range(0, len(all)), { points: [], at: [] }, |acc: { points: List<List<Value>>, at: List<Int> }, k: Int|
+    match list_at(all, k) {
+      None -> acc,
+      Some(p) -> match redrawn(o, ts, p.root, p.case) {
+        Ok(values) -> { points: push(acc.points, values), at: push(acc.at, k) },
+        Err(_) -> acc,
       },
-    }
-  }
+    });
+  let js = match list_at(prover.judged[claims]([{ claim: index, points: made.points, mode: MWhole }]), 0) { Some(x) -> x, None -> [] };
+  let found = fold(range(0, len(js)), None, |acc: Option<{ k: Int, how: String }>, i: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> match (list_at(js, i), list_at(made.points, i), list_at(made.at, i)) {
+        (Some(j), Some(values), Some(k)) -> match contradiction(j, bindings(o, values)) {
+          Some(how) -> match list_at(all, k) {
+            Some(p) -> Some({ k: k, how: how ++ " (root " ++ int_to_string(p.root) ++ ", case " ++ int_to_string(p.case) ++ ")" }),
+            None -> None,
+          },
+          None -> None,
+        },
+        _ -> None,
+      },
+    });
+  match found { Some(f) -> { draws: f.k + 1, how: Some(f.how) }, None -> { draws: len(all), how: None } }
+}
 
 fn proved(outcome: Outcome) -> Bool = match outcome { Held(h) -> h.tier == Proved, _ -> false }
 
@@ -133,7 +146,7 @@ pub fn audited(
   dir: String,
   cases: Int,
   roots: Int,
-) -> Result<Audit, String> / {fs.read[work], fs.read[repo], time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.outcomes[claims], prover.discharged[claims], prover.record[claims], prover.replay[claims], prover.accepted[claims]} =
+) -> Result<Audit, String> / {fs.read[work], fs.read[repo], time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.outcomes[claims], prover.cached[claims], prover.prepared[claims], prover.judged[claims], prover.searched[claims], prover.record[claims], prover.accepted[claims], time.elapsed_ms} =
   match harness::project(dir) {
     Err(why) -> Err(why),
     Ok(sources) -> match harness::fronted(sources) {
@@ -147,20 +160,23 @@ pub fn audited(
           Ok(got) -> {
             let c = claims::collection_of(got, claims::own_claims(f.whole, built));
             let all = range(0, len(c.claims));
-            match claims::decided(c, all, false, claims::statics_of(f.whole, built.world), false) {
+            let discharge = |runs: List<Int>, settled: List<Static>| claims::discharge_runs(c, runs, settled);
+            match claims::decided(c, all, false, claims::statics_of(f.whole, built.world), false, discharge) {
               Err(_) -> Err("the prover would not discharge the obligations of `" ++ dir ++ "`"),
               Ok(v) -> {
                 let proofs = filter(all, |i: Int|
                   match list_at(v.outcomes, i) { Some(o) -> proved(o), None -> false });
+                let ts = types_of_world(built.world);
                 let redrawn = fold(
                   proofs,
                   Ok({ draws: 0, defects: [] }),
                   |acc: Result<{ draws: Int, defects: List<Defect> }, String>, i: Int|
                     match acc {
                       Err(e) -> Err(e),
-                      Ok(so_far) -> match drawn(i, 0, 0, cases, roots, 0) {
-                        Err(e) -> Err(e),
-                        Ok(d) ->
+                      Ok(so_far) -> match list_at(built.world.obligations, i) {
+                        None -> Err("the world holds no obligation " ++ int_to_string(i)),
+                        Some(o) -> {
+                          let d = redrawn_proof(i, o, ts, cases, roots);
                           Ok({
                             draws: so_far.draws + d.draws,
                             defects: match d.how {
@@ -174,7 +190,8 @@ pub fn audited(
                                   how: how,
                                 }),
                             },
-                          }),
+                          })
+                        },
                       },
                     },
                 );
@@ -249,7 +266,7 @@ fn title_of(a: Args) -> String =
 // stops the audit.
 pub fn run(
   a: Args,
-) -> Result<report::Report, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, process.spawn[ply], config.get[env], prover.configure[claims], prover.collected[claims], prover.outcomes[claims], prover.discharged[claims], prover.record[claims], prover.replay[claims], prover.accepted[claims]} =
+) -> Result<report::Report, String> / {fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, process.spawn[ply], config.get[env], prover.configure[claims], prover.collected[claims], prover.outcomes[claims], prover.cached[claims], prover.prepared[claims], prover.judged[claims], prover.searched[claims], prover.record[claims], prover.accepted[claims], time.elapsed_ms} =
   match taken(a.seeds, a.seed) {
     Err(why) -> Err(why),
     Ok(chosen) -> match fold(
@@ -296,27 +313,19 @@ fn verdicts(rows: List<Row>) -> List<report::Verdict> =
 
 test "a draw contradicts a proof by refuting it, raising under it or Ply failing on it, and no other way" {
   let b: Binding = { name: "n", ty: "Int", value: VInt(3) };
-  assert_eq(contradiction(Falsified([b])), Some("refutes it at n = 3"));
+  assert_eq(contradiction(JFailed, [b]), Some("refutes it at n = 3"));
   assert_eq(
-    contradiction(Undrawn(Raised({ message: "division by zero", values: [], bindings: [b] }))),
+    contradiction(JRaised({ message: "division by zero", values: [] }), [b]),
     Some("raises `division by zero` at n = 3"),
   );
-  let declined: Fault = {
-    code: "E0505",
-    message: "the compiled tier declined to enter `m.law`",
-    notes: [],
-    values: [],
-    bindings: [b],
-  };
   assert_eq(
-    contradiction(Faulted(declined)),
+    contradiction(JFaulted({ code: "E0505", message: "the compiled tier declined to enter `m.law`", notes: [], values: [] }), [b]),
     Some(
       "Ply failed rather than the program, so this is a defect in Ply: the compiled tier declined to enter `m.law`, at n = 3",
     ),
   );
-  assert_eq(contradiction(Kept([b])), None);
-  assert_eq(contradiction(Rejected), None);
-  assert_eq(contradiction(Undrawn(NotDrawn)), None)
+  assert_eq(contradiction(JHeld, [b]), None);
+  assert_eq(contradiction(JRejected, [b]), None)
 }
 
 test "a seed's row fails on one disagreement, and on a corpus short of its share of proofs" {

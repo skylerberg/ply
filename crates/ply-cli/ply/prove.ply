@@ -4,14 +4,17 @@
 
 import args (Flags, from_argv, style_of)
 import claims
+import proof.rules (Congruence)
 import config_schema
 import program (Timed, front_of, is_shipped, no_front, timed_load, timed_uncached)
-import proof.shrink (Ask, Descent, Offer, Offered, Reply, Take, Taken, Tries, Would, descend)
-import proof.obligation (Binding, Defect, Frame, Gap, Held, NoCaseKept, Outcome, Pure, Raised,
-                         ReachesHost, Refuted, Sampled, Unattempted, Unsatisfiable, Vacuous,
+import proof.obligation (Binding, Defect, Evidence, Frame, Gap, Held, NoCaseKept, Outcome, Pure,
+                         Raised, ReachesHost, Refuted, Sampled, Unattempted, Unsatisfiable, Vacuous,
                          frame_summary)
+import proof.decide (Static)
+import proof.keys (prove_key)
+import std.bytes (bytes_of_hex, hex_of)
 import proof.world (Built, World, world_of)
-import claims (Claimed, Collected, Settled, Options, prover, Claim, Choice, Collection, Discharged,
+import claims (Claimed, Collected, Options, prover, Claim, Collection, Discharged, discharge_runs,
                Refusal, Row, Verdicts, Broken, Trouble, Unbound, a_claim, a_counter, a_fault, a_loc,
                a_place, a_plan, also, at_tier, claimed_part, code_of, collected_part, collection_of,
                coverage_json, coverage_lines, decided, defect_of, diagnostics_of, held_of, joined,
@@ -232,122 +235,25 @@ fn answered(
 
 // `--reach` asks the static tier about every claim the run reports on, whether the cache or a
 // discharge answered it, so a cached run reports what a fresh one does.
-fn asked(
+fn asked<| e>(
   s: Style,
   flags: Flags,
   c: Collection,
   use_cache: Bool,
   statics: Statics,
-) -> Answer / {prover.discharged[claims], prover.record[claims], prover.outcomes[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} = {
+  discharge: (Collection, List<Int>, List<Static>) -> Result<Discharged, Refusal> / e,
+) -> Answer / {prover.record[claims], prover.outcomes[claims], prover.cached[claims] | e} = {
   let wanted = wanted_of(c.claims, flags);
-  match decided(c, wanted, use_cache, statics, flags.reach) {
+  match decided(c, wanted, use_cache, statics, flags.reach, |runs: List<Int>, settled: List<Static>| discharge(c, runs, settled)) {
     Err(why) -> refusal(s, "prove", why),
-    Ok(v) -> {
-      // A counterexample is not finished when it is found: the walk that makes it small is this
-      // side's, and it runs before anything is read.
-      let v = { ..v, outcomes: walked(c.claims, wanted, v, c.plan.shrink_budget) };
-      answered(s, flags, c, rows_of(c.claims, wanted, v), v, len(c.claims) - len(wanted))
-    },
+    Ok(v) -> answered(s, flags, c, rows_of(c.claims, wanted, v), v, len(c.claims) - len(wanted)),
   }
 }
-
-/// Every counterexample walked down before it is read, when its claim's points were drawn: a
-/// refutation keeps the draw it failed at and gains the tuple the walk settled on, and a raise keeps
-/// its gap and gains its own.
-fn walked(
-  claims: List<Claim>,
-  wanted: List<Int>,
-  v: Verdicts,
-  budget: Int,
-) -> List<Outcome> / {prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} =
-  map(range(0, len(v.outcomes)), |i: Int| sifted_at(claims, wanted, v, i, budget))
-
-fn sifted_at(
-  claims: List<Claim>,
-  wanted: List<Int>,
-  v: Verdicts,
-  i: Int,
-  budget: Int,
-) -> Outcome / {prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} =
-  match list_at(v.outcomes, i) {
-    None -> panic("the runtime answered fewer obligations than were asked"),
-    Some(o) -> {
-      let claim = at(wanted, i, 0 - 1);
-      match list_at(claims, claim) {
-        Some(c) -> if c.walks { sifted(claim, o, budget) } else { o },
-        None -> o,
-      }
-    },
-  }
-
-fn sifted(
-  claim: Int,
-  o: Outcome,
-  budget: Int,
-) -> Outcome / {prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} =
-  match o {
-    Refuted(cx) -> match descended(claim, budget) {
-      None -> o,
-      Some(settled) ->
-        Refuted({
-          ..cx,
-          bindings: settled.bindings,
-          original: settled.original,
-          shrinks: settled.steps,
-        }),
-    },
-    Unattempted(gap) -> match gap {
-      // A raise is a counterexample too: it is the input a body gave up on, and the same walk makes
-      // it readable. A gap with nothing to walk keeps its own words.
-      Raised(raise) -> match descended(claim, budget) {
-        None -> o,
-        Some(settled) -> Unattempted(Raised({ ..raise, bindings: settled.bindings })),
-      },
-      _ -> o,
-    },
-    _ -> o,
-  }
-
-/// One counterexample walked down, when the runtime holds the draw it came from. `None` is an
-/// outcome that holds none, such as a claim that held.
-fn descended(
-  claim: Int,
-  budget: Int,
-) -> Option<{ bindings: List<Binding>, original: List<Binding>, steps: Int }> / {prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} =
-  match prover.shrink[claims](claim) {
-    Err(_) -> None,
-    Ok(None) -> None,
-    Ok(Some(width)) -> {
-      let out = descend(width, |q: Ask| converse(q), budget);
-      match prover.settled[claims]() {
-        Err(_) -> None,
-        Ok(None) -> None,
-        Ok(Some(settled)) ->
-          Some({ bindings: settled.bindings, original: settled.original, steps: out.steps }),
-      }
-    },
-  }
-
-/// One turn of the conversation the walk has with the runtime: what the value at `i` is now, whether
-/// a candidate still holds, and taking it. Every operation is asked from here, because a function has
-/// one row and the walk cannot take four callbacks that perform different ones.
-fn converse(
-  q: Ask,
-) -> Reply / {prover.offers[claims], prover.would[claims], prover.accept[claims]} =
-  match q {
-    Offer(i) -> Offered(match prover.offers[claims](i) { Ok(offer) -> offer, Err(_) -> None }),
-    Would(i, position) ->
-      Tries(match prover.would[claims](i, position) { Ok(yes) -> yes, Err(_) -> false }),
-    Take(i, position) -> match prover.accept[claims](i, position) { _ -> Taken(()) },
-  }
-
-// The n-th answer, or the spare when the runtime answered fewer than asked.
-fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) -> x, None -> spare }
 
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.outcomes[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims], store.known[cache], store.file[cache]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, prover.configure[claims], prover.collected[claims], prover.record[claims], prover.outcomes[claims], prover.cached[claims], prover.prepared[claims], prover.judged[claims], prover.searched[claims], store.known[cache], store.file[cache]} = {
   let s: Style = style_of(flags);
   let t: Timed = if options.no_incremental { timed_uncached(flags.paths) }
   else { timed_load(flags.paths) };
@@ -369,15 +275,16 @@ pub fn run(
           built.world,
           own_claims(w, built),
           statics_of(w, built.world),
+          discharge_runs,
         )
       },
     },
   }
 }
 
-// The run itself, over the front end `run` loaded, the claims it built from it, and the static
-// prover over them.
-fn prove_over(
+// The run itself, over the front end `run` loaded, the claims it built from it, the static prover
+// over them, and what discharges what is left.
+fn prove_over<| e>(
   s: Style,
   flags: Flags,
   options: Options,
@@ -385,11 +292,12 @@ fn prove_over(
   world: World,
   mine: Claimed,
   statics: Statics,
-) -> Answer / {prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.record[claims], prover.outcomes[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} = {
+  discharge: (Collection, List<Int>, List<Static>) -> Result<Discharged, Refusal> / e,
+) -> Answer / {prover.configure[claims], prover.collected[claims], prover.record[claims], prover.outcomes[claims], prover.cached[claims] | e} = {
   prover.configure[claims](options, front, world);
   match prover.collected[claims]() {
     Err(why) -> refusal(s, "prove", why),
-    Ok(got) -> asked(s, flags, collection_of(got, mine), !options.no_cache, statics),
+    Ok(got) -> asked(s, flags, collection_of(got, mine), !options.no_cache, statics, discharge),
   }
 }
 
@@ -404,6 +312,8 @@ fn a_collection(cs: List<Claim>) -> Collection =
     defs: map(cs, |c: Claim| { name: c.owner, hash: Some(c.key), specs: [] }),
     laws: [],
     plan: a_plan(),
+    host: false,
+    world: no_world(),
   }
 
 // What the runtime answers a fixture's collection with, and what the fixture built of it.
@@ -411,7 +321,7 @@ fn got_of(c: Result<Collection, Refusal>) -> Result<Collected, Refusal> =
   match c { Ok(x) -> Ok(collected_part(x)), Err(why) -> Err(why) }
 
 fn mine_of(c: Result<Collection, Refusal>) -> Claimed =
-  match c { Ok(x) -> claimed_part(x), Err(_) -> { claims: [], defs: [], laws: [], warnings: [] } }
+  match c { Ok(x) -> claimed_part(x), Err(_) -> { claims: [], defs: [], laws: [], warnings: [], world: no_world() } }
 
 fn verdicts(outcomes: List<Outcome>) -> Discharged =
   { outcomes: outcomes, duration_ms: decimal_of_int(0), warnings: [] }
@@ -447,18 +357,13 @@ fn reached_over(
       no_world(),
       mine_of(c),
       no_statics(reach),
+      |_c: Collection, runs: List<Int>, _settled: List<Static>| ran(v, runs),
     )
   } with {
     prover.configure[claims](options, front, world) -> (),
     prover.collected[claims]() -> got_of(c),
     prover.outcomes[claims](keys) -> held,
-    // A fixture's claims have no runtime-held values, so there is nothing to walk.
-    prover.shrink[claims](claim) -> Ok(None),
-    prover.offers[claims](i) -> Ok(None),
-    prover.would[claims](i, position) -> Ok(false),
-    prover.accept[claims](i, position) -> Ok(()),
-    prover.settled[claims]() -> Ok(None),
-    prover.discharged[claims](choice) -> v,
+    prover.cached[claims](keys) -> map(keys, |k: String| filed_under(c, v, k)),
     prover.record[claims](entries) -> [],
   }
 
@@ -466,7 +371,7 @@ fn bare() -> Flags = from_argv("prove", [])
 
 fn one_claim() -> List<Claim> = [a_claim("m.one", Ensures(0))]
 
-fn one_proved() -> List<Outcome> = [proved(Array([Str("congruence")]), 2)]
+fn one_proved() -> List<Outcome> = [proved([Congruence], 2)]
 
 test "the coverage line leads, the tally closes, and a run where every claim holds is exit 0" {
   let answer = proved_over(bare(), Ok(a_collection(one_claim())), Ok(verdicts(one_proved())));
@@ -505,55 +410,31 @@ test "a refuted claim is exit 1, and says where it fails and what it was shrunk 
 }
 
 // A runtime that holds a draw for every claim, and whose every walk settles on the empty list.
-fn walked_over(c: Collection, v: Discharged) -> Answer =
-  handle {
-    prove_over(
-      style_of(bare()),
-      bare(),
-      claims::no_options(),
-      no_front(),
-      no_world(),
-      claimed_part(c),
-      no_statics(None),
-    )
-  } with {
-    prover.configure[claims](options, front, world) -> (),
-    prover.collected[claims]() -> Ok(collected_part(c)),
-    prover.outcomes[claims](keys) -> map(keys, |_k: String| None),
-    prover.shrink[claims](claim) -> Ok(Some(1)),
-    prover.offers[claims](i) -> Ok(None),
-    prover.would[claims](i, position) -> Ok(false),
-    prover.accept[claims](i, position) -> Ok(()),
-    prover.settled[claims]() ->
-      Ok(
-        Some({
-          bindings: [{ name: "xs", ty: "List<Int>", value: VList([]) }],
-          original: [{ name: "xs", ty: "List<Int>", value: VList([VInt(7), VInt(9)]) }],
-        }),
-      ),
-    prover.discharged[claims](choice) -> Ok(v),
-    prover.record[claims](entries) -> [],
+// A fixture's discharge: the outcomes it was handed for the claims at these collection indices.
+fn ran(v: Result<Discharged, Refusal>, runs: List<Int>) -> Result<Discharged, Refusal> =
+  match v {
+    Err(why) -> Err(why),
+    Ok(d) -> Ok({ ..d, outcomes: fold(runs, [], |out: List<Outcome>, i: Int| match list_at(d.outcomes, i) { Some(o) -> push(out, o), None -> out }) }),
   }
 
-// The line after the one naming `needle`, which is where a refutation's point is written.
-fn under_line(lines: List<String>, needle: String) -> String = {
-  let found = fold(range(0, len(lines)), 0 - 1, |at: Int, i: Int|
-    if at >= 0 { at } else if string_contains(nth(lines, i), needle) { i } else { at });
-  nth(lines, found + 1)
-}
-
-// An enumerated point is the one a fixed order met, and an interleaving search's are schedules:
-// there is no draw to walk either down from.
-test "only a claim whose points were drawn has its counterexample walked" {
-  let drawn = { ..a_claim("m.drawn", Law(Some("drawn"))), walks: true };
-  let enumerated = { ..a_claim("m.enumerated", Law(Some("enumerated"))), walks: false };
-  let answer = walked_over(
-    a_collection([drawn, enumerated]),
-    verdicts([Refuted(a_counter()), Refuted(a_counter())]),
-  );
-  assert(string_contains(under_line(answer.lines, "law \"drawn\""), "→  xs = []"));
-  assert(string_contains(under_line(answer.lines, "law \"enumerated\""), "→  xs = [0, 0]"))
-}
+// What a fixture's cache holds under a key: the evidence the fixture's outcome for the claim the key
+// names holds, under its bare key or its plan's.
+fn filed_under(c: Result<Collection, Refusal>, v: Result<Discharged, Refusal>, key: String) -> Option<Evidence> =
+  match (c, v) {
+    (Ok(x), Ok(d)) -> {
+      let digest = claims::plan_digest_of(x.plan);
+      fold(range(0, len(x.claims)), None, |found: Option<Evidence>, i: Int|
+        match found {
+          Some(_) -> found,
+          None -> match (list_at(x.claims, i), list_at(d.outcomes, i)) {
+            (Some(claim), Some(Held(h))) ->
+              if claim.key == key || hex_of(prove_key(bytes_of_hex(claim.key), digest)) == key { Some(h.evidence) } else { None },
+            _ -> None,
+          },
+        })
+    },
+    _ -> None,
+  }
 
 // A guard that admits nothing makes its claim say nothing, which is a failure as a refutation is.
 test "a vacuous claim is exit 1, however the guard was found to admit nothing" {

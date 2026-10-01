@@ -8,10 +8,10 @@
 // a report prints and in the sort the runtime reasons with.
 
 import compiler.diag (parse_all)
-import compiler.front (Whole, Analysed, Refused, analyse)
+import compiler.front (Whole, Analysed, Refused, analyse, literals_of)
 import compiler.infer (CtorInfo, DefInfo, LawBinder, LawInfo, SpecInfo)
 import compiler.items (Item, IFn, ILaw, SEnsures, SRequires, SpecClause)
-import compiler.exprs (Param, expr_span)
+import compiler.exprs (Expr, Param, expr_span)
 import compiler.hash (HashOutput, hex)
 import compiler.resolve (Diag, Mod, diag1, qualify)
 import compiler.spine (Span)
@@ -65,6 +65,9 @@ pub type Obligation = {
   variables: List<String>,
   // Where each guard is written: the owner's `requires` clauses in order, or a law's `where`.
   guards: List<{ module: Int, start: Int, end: Int }>,
+  // The literals the guards are written with, as `<int|str|bytes> <value>`: where a witness of the
+  // guard is looked for first.
+  literals: List<Bytes>,
   // `law/host`: the body reaches the world.
   host: Bool,
   // The claim's own row as a report prints it, when it performs anything: `{sim.read}` for a law
@@ -177,6 +180,9 @@ fn clause_strategy(performs: Option<String>, binders: List<Binder>, decls: List<
 // Whether a counterexample is walked down from the draw it came from. Only a point drawn one at a
 // time has a draw to walk from: an enumerated point is one a fixed order met, and an interleaving
 // search's are schedules.
+// What follows the static prover, for a claim that starts at it.
+pub fn unsettled(s: Strategy) -> Option<Unsettled> = match s { Static(u) -> Some(u), _ -> None }
+
 pub fn walks(s: Strategy) -> Bool =
   match s { Static(Run(Drawn)) -> true, Hosted -> true, _ -> false }
 
@@ -330,27 +336,26 @@ fn written_params(mods: List<Mod>) -> Map<Bytes, List<Bytes>> =
       }))
 
 // Each definition's `requires` expressions, in order, by program-wide name.
-fn requires_of(mods: List<Mod>) -> Map<Bytes, List<Span>> =
-  fold(mods, map_new(), |acc: Map<Bytes, List<Span>>, m: Mod|
-    fold(m.module.items, acc, |a: Map<Bytes, List<Span>>, it: Item|
+fn requires_of(mods: List<Mod>) -> Map<Bytes, List<Expr>> =
+  fold(mods, map_new(), |acc: Map<Bytes, List<Expr>>, m: Mod|
+    fold(m.module.items, acc, |a: Map<Bytes, List<Expr>>, it: Item|
       match it {
         IFn(d) ->
           map_insert(
             a,
             qualify(m.name, d.name.name),
-            map(filter(d.spec, |c: SpecClause| c.kind == SRequires), |c: SpecClause|
-              expr_span(c.expr)),
+            map(filter(d.spec, |c: SpecClause| c.kind == SRequires), |c: SpecClause| c.expr),
           ),
         _ -> a,
       }))
 
 // Each law's `where`, by program-wide name.
-fn law_guards(mods: List<Mod>) -> Map<Bytes, Span> =
-  fold(mods, map_new(), |acc: Map<Bytes, Span>, m: Mod|
-    fold(m.module.items, acc, |a: Map<Bytes, Span>, it: Item|
+fn law_guards(mods: List<Mod>) -> Map<Bytes, Expr> =
+  fold(mods, map_new(), |acc: Map<Bytes, Expr>, m: Mod|
+    fold(m.module.items, acc, |a: Map<Bytes, Expr>, it: Item|
       match it {
         ILaw(d) -> match d.guard {
-          Some(g) -> map_insert(a, qualify(m.name, d.name), expr_span(g)),
+          Some(g) -> map_insert(a, qualify(m.name, d.name), g),
           None -> a,
         },
         _ -> a,
@@ -406,7 +411,7 @@ fn clauses_of(
   acc: Owed,
   d: DefInfo,
   written: Map<Bytes, List<Bytes>>,
-  requires: Map<Bytes, List<Span>>,
+  requires: Map<Bytes, List<Expr>>,
   keys: Map<Bytes, List<Bytes>>,
   decls: List<Decl>,
 ) -> Owed = {
@@ -422,8 +427,9 @@ fn clauses_of(
     let printed = binders_of(push(params, { name: b"result", ty: shape.ret }));
     let binders = map(range(0, len(params)), |i: Int| at(printed.binders, i));
     let result = list_at(printed.binders, len(params));
-    let guards = map(match map_get(requires, d.name) { Some(ss) -> ss, None -> [] }, |g: Span|
-      at_of(d.at.module, g));
+    let propositions = match map_get(requires, d.name) { Some(es) -> es, None -> [] };
+    let guards = map(propositions, |g: Expr| at_of(d.at.module, expr_span(g)));
+    let literals = literals_of(propositions);
     let frame = frame_of(d.footprint);
     let strategy = clause_strategy(footprint_text(d.footprint), binders, decls);
     let hashed = match map_get(keys, d.name) { Some(hs) -> hs, None -> [] };
@@ -443,6 +449,7 @@ fn clauses_of(
               result: result,
               variables: printed.variables,
               guards: guards,
+              literals: literals,
               host: false,
               footprint: footprint_text(clause.footprint),
               frame: frame,
@@ -460,7 +467,7 @@ fn law_of(
   acc: Owed,
   l: LawInfo,
   hashes: List<Bytes>,
-  wheres: Map<Bytes, Span>,
+  wheres: Map<Bytes, Expr>,
   decls: List<Decl>,
 ) -> Owed =
   match list_at(hashes, l.index) {
@@ -478,7 +485,8 @@ fn law_of(
           binders: printed.binders,
           result: None,
           variables: printed.variables,
-          guards: match map_get(wheres, l.key) { Some(g) -> [at_of(l.at.module, g)], None -> [] },
+          guards: match map_get(wheres, l.key) { Some(g) -> [at_of(l.at.module, expr_span(g))], None -> [] },
+          literals: match map_get(wheres, l.key) { Some(g) -> literals_of([g]), None -> [] },
           host: l.host,
           footprint: footprint,
           frame: Pure,
