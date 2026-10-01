@@ -1700,33 +1700,59 @@ deadline inside `simulate { .. }` wants `clock`.
 
 ```ply
 pub type Kind = | File | Dir | Symlink | Missing
+pub type Entry = { path: String, kind: Kind }
+pub type Mode = { owner: Access, group: Access, other: Access }
+pub type Access = { read: Bool, write: Bool, execute: Bool }
 
 pub nondet effect fs {
   read  read_file[r](path: String) -> Option<Bytes>
   read  read_at[r](path: String, offset: Int, len: Int) -> Option<Bytes>
   read  list_dir[r](path: String) -> Option<List<String>>
+  read  walk[r](path: String) -> Option<List<Entry>>
   read  kind[r](path: String) -> Kind
   read  resolved[r](path: String) -> Kind
   read  exists[r](path: String) -> Bool
   read  file_size[r](path: String) -> Option<Int>
   read  modified_ms[r](path: String) -> Option<Int>
+  read  mode[r](path: String) -> Option<Mode>
+  read  read_link[r](path: String) -> Option<String>
+  read  canonical[r](path: String) -> Option<String>
   write write_file[r](path: String, body: Bytes) -> Bool
   write append[r](path: String, body: Bytes) -> Option<Int>
+  write copy[r](from: String, to: String) -> Bool
   write create_dir[r](path: String) -> Bool
+  write temp_dir[r](dir: String, prefix: String) -> Option<String>
   write remove[r](path: String) -> Bool
+  write remove_tree[r](path: String) -> Bool
   write rename[r](from: String, to: String) -> Bool
+  write symlink[r](path: String, target: String) -> Bool
+  write set_mode[r](path: String, mode: Mode) -> Bool
+  write set_modified[r](path: String, ms: Int) -> Bool
   write sync[r](path: String) -> Bool
   write lock[r](path: String) -> Bool
   write unlock[r](path: String) -> Bool
 }
+pub fn mode_text(m: Mode) -> String
+pub fn mode_of_text(text: String) -> Option<Mode>
 ```
 
 The label is a root bound with `--fs NAME=PATH`. Unbound label: `E0451`; a path
 escaping its root (`..`, absolute, or a symlink outside): `E0452`. Different
-roots do not conflict. `list_dir` is one level, `rename` stays in one root.
-`kind` says what a path names in one call and does not follow a symlink, so a
-walk can pass one over; `Missing` is also what this run cannot read. Every other
-operation follows one.
+roots do not conflict. `list_dir` is one level, and `rename` and `copy` stay in
+one root. `kind` says what a path names in one call and does not follow a
+symlink: it answers `Symlink` for one, so a walk that must not leave the root
+can refuse it, and `Missing` is also what this run cannot read. `resolved`
+follows, and answers what the path names at the end — `File`, `Dir` or
+`Missing`, never `Symlink`. `exists`, `remove`, `remove_tree`, `rename`,
+`symlink` and `read_link` act on a link itself, as `kind` does; every other
+operation follows one. Following cannot leave the root either way, because a
+path resolving outside it is refused before any operation runs.
+
+`walk` answers every entry under a directory, not the directory itself: depth
+first, each directory's names in byte order, each path from the root as the call
+named the directory. A symlink is an entry of kind `Symlink` and is never
+followed, so a walk neither leaves its root nor loops. `None` means the path is
+not a directory.
 
 `append` and `read_at` are what make a file a log rather than a value. `append`
 costs the size of what is new rather than the size of the file, creates the file
@@ -1739,12 +1765,6 @@ time.
 
 `read_at` answers **what is there**, which may be less than was asked for: a
 range that runs past the end is short, and one that starts at or past the end is
-`kind` does not follow a symlink: it answers `Symlink` for one, so a walk that
-must not leave the root can refuse it. `resolved` follows, and answers what the
-path names at the end — `File`, `Dir` or `Missing`, never `Symlink`. Following
-cannot leave the root either way, because a path resolving outside it is refused
-before any operation runs.
-
 empty. That is deliberate, and the one place `std.fs` parts company with
 `bytes_slice`, which never clamps a range: a value's length is known and fixed,
 while a file's is neither, so a reader holding an offset it recorded earlier
@@ -1756,8 +1776,35 @@ arithmetic that went wrong and raises `E0502`. Two reads of one range may differ
 the effect is `nondet` and a file can change under it.
 
 `E0453` bounds one call, not a file: `read_file` refuses a file whose whole
-contents would be the answer, and `read_at` refuses a `len`, each above 64 MiB.
-A larger file is read a range at a time.
+contents would be the answer, `read_at` a `len`, and `walk` a tree whose paths
+would be the answer, each above 64 MiB. A larger file is read a range at a time,
+and a larger tree a directory at a time with `list_dir`.
+
+`create_dir` makes every missing ancestor, and is `true` for a directory already
+there. `copy` writes a file's bytes and permission bits over whatever file the
+destination held, and never copies a directory. `remove` takes one file, one
+symlink or one empty directory; `remove_tree` takes a directory with everything
+under it, a symlink in it removed rather than followed. Neither removes the root
+itself. `temp_dir` makes a new directory under `dir` whose name starts with
+`prefix`, and answers its path from the root as `dir` was named: no two calls,
+from this run or another, answer one directory, and a `prefix` holding `/` is
+`None`. Nothing removes it but `remove_tree`.
+
+`canonical` answers the absolute host path a path names, every symlink resolved,
+and `None` when nothing is there. It is the one operation that answers a host
+path rather than a root's, and what a program hands a process it starts (§13.9),
+whose working directory and arguments are host paths. `mode` and `set_mode` read
+and write the nine permission bits — read, write and execute for the owner, the
+group and everyone else — and `set_mode` keeps the set-id and sticky bits a path
+had. `mode_text` spells a mode as `ls -l` does, `rwxr-xr-x`, and `mode_of_text`
+reads that spelling back, `None` for any other. `set_modified` stamps a path's
+modification time, in milliseconds since the Unix epoch; a negative one is
+`E0502`.
+
+`symlink(path, target)` makes `path` a link to `target`, which is kept as
+written and read from the link's own directory. A target that is absolute or
+climbs out of the root is `E0452`, so no link `std.fs` makes leads out of its
+root. `read_link` answers the target a link holds, and `None` for anything else.
 
 `sync` makes what was written durable, and is what a paired cache needs to be
 honest rather than lucky. A write reaches the page cache, not the disk, and
@@ -1779,14 +1826,26 @@ removes nothing — for a lock it does not hold, so one run cannot break another
 A run that dies holding a lock leaves the file behind, and the stale age is what
 recovers it.
 
-The twin is `MemFs` (`mem_empty`, `mem_of`, `mem_read`, `mem_write`, `mem_list`,
-`mem_kind`, `mem_exists`, `mem_size`, `mem_create_dir`, `mem_remove`,
-`mem_rename`, `mem_modified`, `mem_read_at`, `mem_append`, `mem_sync`,
-`mem_lock`, `mem_unlock`); it holds no symlinks, so `mem_kind` never answers
-`Symlink`, it has no wall clock, so no lock in it goes stale, and it was never on
-a disk, so `mem_sync` only says whether the path names something. `mem_append`
-answers an `Appended` of the tree and the offset. A test imports both `std.fs`
-and `std.fs (fs)` to name the module and the effect.
+The twin is `MemFs`, with a `mem_` function for every operation (`mem_read`,
+`mem_read_at`, `mem_list`, `mem_walk`, `mem_kind`, `mem_resolved`, `mem_exists`,
+`mem_size`, `mem_modified`, `mem_mode`, `mem_read_link`, `mem_canonical`,
+`mem_write`, `mem_append`, `mem_copy`, `mem_create_dir`, `mem_temp_dir`,
+`mem_remove`, `mem_remove_tree`, `mem_rename`, `mem_symlink`, `mem_set_mode`,
+`mem_set_modified`, `mem_sync`, `mem_lock`, `mem_unlock`) and `mem_empty` and
+`mem_of` to start one. It follows a symlink where the host does, a chain of more
+than forty being a loop that names nothing. It holds its owner to a path's
+owner bits, a fresh file being `rw-r--r--` and a fresh directory `rwxr-xr-x`, so
+a test can make a file unreadable. It has no wall clock, so no lock in it goes
+stale and `mem_temp_dir` names a directory from its prefix and the tree's own
+counter; it was never on a disk, so `mem_sync` only says whether the path names
+something and `mem_canonical` is handed the absolute path the tree stands for.
+A write answers a `Written` of the tree and whether it happened, `mem_append` an
+`Appended` of the tree and the offset, and `mem_temp_dir` a `Made` of the tree
+and the path. `on_mem(tree, go)` runs `go` with every operation on the label its
+row names answered by the twin, and answers an `Over` of the value and the tree
+it left: what a test hands code written to perform any operation of a root,
+since it answers whatever operations `std.fs` gains. A test imports both
+`std.fs` and `std.fs (fs)` to name the module and the effect.
 
 ### 13.12 `std.path`
 
@@ -3014,9 +3073,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   moves between OS threads; only a `parallel` block's branches run on threads
   of the runtime's own.
 * No file handles — `fs` reads a range and appends by path, with nothing open
-  between calls — and no recursive walk or permissions; no cancellation or
-  backpressure; no migrations or live schema check; HTTP/1.1 only; no
-  authentication framework.
+  between calls; no cancellation or backpressure; no migrations or live schema
+  check; HTTP/1.1 only; no authentication framework.
 
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no
 `handle` names is found only when it reaches the host boundary at run time
