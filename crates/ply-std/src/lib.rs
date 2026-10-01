@@ -76,6 +76,8 @@ pub const URL: &str = include_str!("../ply/url.ply");
 
 pub const UUID: &str = include_str!("../ply/uuid.ply");
 
+pub const VALUE: &str = include_str!("../ply/value.ply");
+
 /// The trusted list, kept sorted and unique.
 pub const MODULES: &[(&str, &str)] = &[
     ("std.base64", BASE64),
@@ -112,6 +114,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.trace", TRACE),
     ("std.url", URL),
     ("std.uuid", UUID),
+    ("std.value", VALUE),
 ];
 
 pub fn source(name: &str) -> Option<&'static str> {

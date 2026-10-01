@@ -330,7 +330,7 @@ fn descend<'v>(
     found
 }
 
-/// What a value is, in a line: a container by its shape, anything else by its text, cut short.
+/// What a value is, in a line, by its shape: only the CLI renders a value.
 fn sketch(v: &Value) -> String {
     match v {
         Value::Record(fields) => format!(
@@ -340,14 +340,9 @@ fn sketch(v: &Value) -> String {
         Value::Ctor { name, args } => format!("`{name}` holding {} argument(s)", args.len()),
         Value::List(items) => format!("a list of {}", items.len()),
         Value::Map(m) => format!("a map of {}", m.size()),
-        other => {
-            let text = other.render();
-            let text = match text.char_indices().nth(60) {
-                Some((cut, _)) => format!("{}…", &text[..cut]),
-                None => text,
-            };
-            format!("{} {text}", other.type_name())
-        }
+        Value::Str(text) => format!("a `String` of {} characters", text.chars().count()),
+        Value::Bytes(b) => format!("a `Bytes` of {} bytes", b.len()),
+        other => format!("a `{}`", other.type_name()),
     }
 }
 

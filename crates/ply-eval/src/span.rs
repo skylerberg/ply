@@ -1,5 +1,6 @@
 //! Spans, sources and diagnostics; `crates/ply-cli/ply/diagnostic.ply` renders them.
 
+use crate::Plain;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -206,7 +207,80 @@ pub struct Diagnostic {
     pub message: String,
     pub labels: Vec<Label>,
     pub notes: Vec<String>,
-    pub fixes: Vec<Fix>,
+    pub fixes: Sparse<Fix>,
+    /// What the text names by [`slot`], rendered only by the CLI.
+    #[serde(default, skip_serializing_if = "Sparse::is_empty")]
+    pub values: Sparse<Plain>,
+}
+
+/// A list most diagnostics leave empty, held as one pointer: every runtime `Result` carries a
+/// `Diagnostic`, so its size is paid on every call.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+#[allow(clippy::box_collection)]
+pub struct Sparse<T>(Option<Box<Vec<T>>>);
+
+impl<T> Sparse<T> {
+    pub fn new() -> Sparse<T> {
+        Sparse(None)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn push(&mut self, item: T) {
+        self.0.get_or_insert_with(Box::default).push(item);
+    }
+}
+
+impl<T> Default for Sparse<T> {
+    fn default() -> Sparse<T> {
+        Sparse::new()
+    }
+}
+
+impl<T> From<Vec<T>> for Sparse<T> {
+    fn from(items: Vec<T>) -> Sparse<T> {
+        Sparse((!items.is_empty()).then(|| Box::new(items)))
+    }
+}
+
+impl<T> FromIterator<T> for Sparse<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(items: I) -> Sparse<T> {
+        items.into_iter().collect::<Vec<T>>().into()
+    }
+}
+
+impl<T> std::ops::Deref for Sparse<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Sparse<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T> IntoIterator for Sparse<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.map(|items| *items).unwrap_or_default().into_iter()
+    }
+}
+
+/// Where a diagnostic's message, label or note stands its `values[i]`.
+pub fn slot(i: usize) -> String {
+    format!("\u{1}{i}\u{2}")
 }
 
 impl Diagnostic {
@@ -217,7 +291,8 @@ impl Diagnostic {
             message: message.into(),
             labels: Vec::new(),
             notes: Vec::new(),
-            fixes: Vec::new(),
+            fixes: Sparse::new(),
+            values: Sparse::new(),
         }
     }
 
@@ -259,6 +334,35 @@ impl Diagnostic {
         self
     }
 
+    /// Carries `values`, which the text names by [`slot`].
+    pub fn showing(mut self, values: Vec<Plain>) -> Self {
+        self.values = values.into();
+        self
+    }
+
+    /// `text` with each slot said as what its value is, for a reader with no renderer.
+    pub fn described(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find('\u{1}') {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('\u{2}') else {
+                out.push_str(&rest[open..]);
+                return out;
+            };
+            let said = after[..close]
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| self.values.get(i))
+                .map_or("a value", Plain::describe);
+            out.push_str(said);
+            rest = &after[close + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
     pub fn primary_span(&self) -> Option<Span> {
         self.labels
             .iter()
@@ -295,9 +399,14 @@ impl fmt::Display for Diagnostic {
             Severity::Warning => "Warning",
             Severity::Note => "Note",
         };
-        write!(f, "{titled}[{}]: {}", self.code, self.message)?;
+        write!(
+            f,
+            "{titled}[{}]: {}",
+            self.code,
+            self.described(&self.message)
+        )?;
         for note in &self.notes {
-            write!(f, "\n  = {note}")?;
+            write!(f, "\n  = {}", self.described(note))?;
         }
         for fix in &self.fixes {
             write!(f, "\n  = fix: {}", fix.title)?;

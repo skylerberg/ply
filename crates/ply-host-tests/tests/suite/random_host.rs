@@ -60,7 +60,7 @@ fn answered(entry: &str) -> Value {
 fn text(value: &Value) -> String {
     match value {
         Value::Str(s) => s.to_string(),
-        other => panic!("answered {other}, not text"),
+        other => panic!("answered {other:?}, not text"),
     }
 }
 

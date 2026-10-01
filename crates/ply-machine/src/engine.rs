@@ -1010,10 +1010,11 @@ impl Cases<'_> {
             Value::Bool(b) => Ok(b),
             other => Err(Diagnostic::error(
                 codes::INTERNAL_ERROR,
-                format!("a spec expression came to `{other}` rather than to a Boolean"),
+                format!("a spec expression came to `{}` rather than to a Boolean", ply_eval::slot(0)),
             )
             .primary(self.span, "a spec states a proposition, so its type is `Bool`")
-            .note("the type checker rejects a non-`Bool` clause with E0201, so reaching this is a defect in Ply")),
+            .note("the type checker rejects a non-`Bool` clause with E0201, so reaching this is a defect in Ply")
+            .showing(vec![ply_eval::Plain::shown(&other)])),
         }
     }
 }

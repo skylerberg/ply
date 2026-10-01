@@ -831,11 +831,18 @@ cell the task is handed: open it inside the region,
 nobody joined after the region's `}`, and a `task.join` inside the region does
 not license it, because no type records the join.
 
+A task, in turn, may be kept only in a cell younger than the `simulate` region
+that spawned it. A `simulate` region may not write a cell of a region opened
+around it while that cell can hold a `Task`, whether it writes the cell itself
+or calls a function whose row writes it: keep the task in a cell opened inside
+the region, or join it there and store what it answers.
+
 * `E0201`: the cell escapes its `with_cell[r]` region.
 * `E0446`: a value branded by the region outlives it (stored in an older
   binding, handed to an operation, or handed to a `task.spawn` whose scheduler
-  is older than the region), or a declared type's field or an operation's
-  signature mentions a `Cell` or a `Task` (§4.6).
+  is older than the region), a task is stored in a cell older than its
+  `simulate` region, or a declared type's field or an operation's signature
+  mentions a `Cell` or a `Task` (§4.6).
 * `E0449`: a region handle (a cell, a task, or the continuation a clause's
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
@@ -966,10 +973,15 @@ effect sim           { read  seed() -> Int }
   wall clock.
 * A task performs against the handlers around its `task.spawn`; a clause that
   binds `resume` is unreachable from a task (`E0502`).
-* `E0413`: a `Task` escapes. `E0414`: no progress, or a spent step budget.
-  `E0416`: nested `simulate`. `E0425`: a host operation inside the region,
-  refused before the handler runs and whether or not it is bound; the region
-  answers `task`, `clock`, `random` and `sim.seed` itself.
+* `E0413`: a `Task` escapes in the region's answer: directly, inside a value,
+  or inside a closure that captured it. A closure's type shows a captured task
+  only as the `task.join` in its row, or the `sim.read` of a `simulate` it opens
+  to join one, so a function whose row carries either may not leave the region.
+  `E0446`: a task is stored in a cell older than the region (§7). `E0414`: no
+  progress, or a spent step budget. `E0416`: nested `simulate`. `E0425`: a host
+  operation inside the region, refused before the handler runs and whether or
+  not it is bound; the region answers `task`, `clock`, `random` and `sim.seed`
+  itself.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -2390,6 +2402,36 @@ nothing here raises. `is_sign_negative` holds for `-0.0` and a negative NaN too.
 `trunc` goes toward zero and keeps the sign, leaving a NaN or an infinity as it
 is. `pow2(k)` is `2^k` exactly, through the subnormals down to `2^-1074`, zero
 below that and an infinity above `2^1023`.
+
+### 13.35 `std.value`
+
+```ply
+pub type Value =
+  | VUnit | VBool(Bool) | VInt(Int) | VFloat(Float) | VDecimal(Decimal)
+  | VFixed(String, U128) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
+  | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
+  | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
+pub type Field = { name: String, value: Value }
+pub type Entry = { key: Value, value: Value }
+pub type Fun =
+  | FNamed(String) | FAnonymous | FConst({ arity: Int, value: Value })
+  | FProject({ arity: Int, index: Int })
+  | FTable({ arity: Int, entries: List<Entry>, default: Value })
+pub fn render(v: Value) -> String
+pub fn filled(text: String, values: List<Value>) -> String
+pub fn shown_items() -> Int
+pub fn shown_depth() -> Int
+```
+
+A value of any type as data: what `machine.call` takes and answers, what a
+runtime diagnostic carries, and what a counterexample binds. `render` is the one
+way a value is shown, in the language's own spelling. A list or map past
+`shown_items` items counts the rest, nesting past `shown_depth` shows as `…`,
+and a credential shows as `Secret(****)`. A fixed width holds the bit pattern it
+reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
+a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
+and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each
+value a runtime diagnostic's text names in its place.
 
 ## 14. The host boundary
 
