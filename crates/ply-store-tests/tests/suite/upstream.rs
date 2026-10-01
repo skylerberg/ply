@@ -1,7 +1,5 @@
 use ply_eval::DefHash;
-use ply_store::{
-    Outcome, Store, Upstream,
-};
+use ply_store::{Outcome, Store, Upstream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 

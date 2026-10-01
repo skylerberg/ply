@@ -3,11 +3,11 @@
 //! are, and what their judgements come to, is the program's.
 
 use crate::load::Loaded;
-use ply_eval::host::HostBinding;
 use ply_eval::decode::{At, Error as DecodeError};
+use ply_eval::host::HostBinding;
 use ply_eval::{
-    DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, SourceId, Span, Symbol, Value,
-    codes,
+    DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, SourceId, Span, Symbol,
+    Value, codes,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -35,7 +35,9 @@ pub struct Obligation {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObligationKind {
     /// Its place among the owner's `ensures` clauses.
-    Ensures { index: usize },
+    Ensures {
+        index: usize,
+    },
     Law,
 }
 
