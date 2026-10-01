@@ -313,10 +313,8 @@ impl<'a> Machine<'a> {
     /// ending warned of.
     fn end_entry_point(&mut self) -> Vec<Diagnostic> {
         let mut warnings = self.compiled.take_teardown();
-        if let Some(runtime) = self.runtime.clone()
-            && let Err(diagnostic) = runtime.end_entry_point(self.id)
-        {
-            warnings.push(diagnostic);
+        if let Some(runtime) = self.runtime.clone() {
+            warnings.extend(runtime.end_entry_point(self.id));
         }
         warnings
     }

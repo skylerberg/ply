@@ -456,10 +456,9 @@ impl Bodies {
         if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
             out = unsafe { crate::simulate::finish_root(&mut *ctx as *mut crate::rt::Ctx, out) };
         }
-        if let Some(rt) = ctx.runtime.clone()
-            && let Err(d) = rt.end_entry_point(ctx.id)
-        {
-            ctx.teardown.push(d);
+        if let Some(rt) = ctx.runtime.clone() {
+            let warned = rt.end_entry_point(ctx.id);
+            ctx.teardown.extend(warned);
         }
         *self.last.borrow_mut() = LastEntry {
             steps: u64::try_from(ctx.ticks).unwrap_or(0),

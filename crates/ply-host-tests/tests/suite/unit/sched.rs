@@ -671,9 +671,10 @@ fn a_retired_tasks_open_span_is_closed_abandoned_at_retirement() {
         (Kind::Exit, "request", Outcome::Abandoned)
     );
     let records = sink.records().len();
-    let warning = rt
-        .end_entry_point(machine)
-        .expect_err("the retired task's span is still `W0609`");
+    let warnings = rt.end_entry_point(machine);
+    let [warning] = warnings.as_slice() else {
+        panic!("the retired task's span is still `W0609`: {warnings:?}");
+    };
     assert_eq!(warning.code, codes::SPAN_ABANDONED);
     assert!(
         warning.message.contains("`request` on `http`"),
@@ -684,5 +685,10 @@ fn a_retired_tasks_open_span_is_closed_abandoned_at_retirement() {
         sink.records().len(),
         records,
         "the span was written at retirement, not again at the end"
+    );
+    assert_eq!(
+        rt.shutdown().spans_left_open,
+        1,
+        "the run's report counts the span the warning named"
     );
 }

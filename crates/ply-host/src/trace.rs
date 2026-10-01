@@ -177,6 +177,11 @@ impl Trace {
         lock(&self.spans).total_open()
     }
 
+    /// What every `W0609` this trace raised counted, so a report of the run cannot disagree.
+    pub fn left_open(&self) -> u64 {
+        lock(&self.spans).left_open()
+    }
+
     /// Closes this machine's open spans `Abandoned` and warns of them with its retired tasks'.
     pub fn end_entry_point(&self, machine: MachineId) -> Option<Diagnostic> {
         let (closings, abandoned) = lock(&self.spans).end_entry_point(machine);

@@ -264,6 +264,10 @@ fn a_run_warns_of_the_spans_its_entry_left_open_and_exits_zero() {
     assert_eq!(warned.len(), 1, "{document}");
     assert_eq!(warned[0]["severity"], "warning", "{document}");
     assert_eq!(warned[0]["message"], warning, "{document}");
+    assert_eq!(
+        document["shutdown"]["spans_left_open"], 2,
+        "the report counts the spans the warning names: {document}"
+    );
 }
 
 fn tested(dir: &Path, flags: &[&str]) -> Value {
