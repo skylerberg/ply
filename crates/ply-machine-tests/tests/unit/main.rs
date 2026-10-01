@@ -9,4 +9,3 @@ mod load;
 mod migrate;
 mod payload;
 mod policy;
-mod warm;

@@ -4,7 +4,7 @@
 //! beside itself and renamed into place, so a reader finds a whole entry or none; an entry that
 //! does not read is no entry, and the run that finds it so runs the front end and files over it.
 
-use crate::driver::{FrontFile, HandedFront, Promises};
+use crate::driver::{FrontFile, HandedFront};
 use crate::payload::record;
 use ply_codegen::c::{bundle, sweep};
 use ply_eval::decode::{At, Error};
@@ -67,7 +67,6 @@ pub fn front(
         front: started.elapsed(),
         write_back: Duration::ZERO,
         cached: false,
-        promises: Promises::Held,
     };
     Some((front, path))
 }

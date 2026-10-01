@@ -279,15 +279,6 @@ pub fn handshakes_json(counts: &tls::HandshakeCounts) -> Value {
     })
 }
 
-/// What the test runner is told it may reach.
-pub fn hosting(hosts: &Hosts, runtime: &Option<ply_eval::RuntimeFactory>) -> ply_test::Hosting {
-    let hosting = ply_test::Hosting::hermetic().with_binding(hosts.binding());
-    match runtime {
-        Some(factory) => hosting.with_runtime(Arc::clone(factory)),
-        None => hosting,
-    }
-}
-
 /// The roots the run bound: what each `fs` label in a row actually names.
 pub struct Filesystem {
     /// By name, ascending. Empty is reported, since an `fs` operation with no root is `E0451`.
