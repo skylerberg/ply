@@ -5,11 +5,10 @@ use crate::list;
 use crate::map;
 use ply_eval::{Carry, Closure, ClosureKind, CtorCarries, Fields, Fixed, Symbol, Value};
 use std::alloc::{Layout, alloc, dealloc};
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 pub type Word = i64;
 
@@ -37,6 +36,18 @@ pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
 pub const IMMORTAL: u32 = u32::MAX;
+
+/// Set on the count of an object another thread may hold. The count changes atomically, the object
+/// is never unique, so nothing reuses it in place, and its block is not recycled when it dies: which
+/// heap's free list it belongs on is not something the thread that drops it knows.
+pub const SHARED: u32 = 1 << 31;
+
+/// An object's count, read and changed as an atomic: another thread may hold a shared object.
+#[inline]
+fn count(o: *mut Obj) -> &'static std::sync::atomic::AtomicU32 {
+    // SAFETY: `rc` is an aligned `u32` at the start of every object, which lives as long as its heap.
+    unsafe { std::sync::atomic::AtomicU32::from_ptr(&raw mut (*o).rc) }
+}
 
 pub const HEADER: usize = 16;
 
@@ -223,6 +234,11 @@ pub mod poison {
         SITE.with(|s| s.set(site));
     }
 
+    /// Points poison reports at `site` until the matching swap back, answering what it replaced.
+    pub fn swap(site: *const i64) -> *const i64 {
+        SITE.with(|s| s.replace(site))
+    }
+
     pub fn leave() {
         SITE.with(|s| s.set(std::ptr::null()));
     }
@@ -302,8 +318,8 @@ pub unsafe fn str_of<'a>(o: *mut Obj) -> &'a str {
 /// Record shapes: a shape is its sorted field names, and a field's offset its position in them.
 #[derive(Default)]
 pub struct Shapes {
-    ids: HashMap<Rc<[Symbol]>, u32>,
-    names: Vec<Rc<[Symbol]>>,
+    ids: HashMap<Arc<[Symbol]>, u32>,
+    names: Vec<Arc<[Symbol]>>,
 }
 
 impl Shapes {
@@ -313,16 +329,17 @@ impl Shapes {
             return *id;
         }
         let id = self.names.len() as u32;
-        let rc: Rc<[Symbol]> = Rc::from(fields);
+        let rc: Arc<[Symbol]> = Arc::from(fields);
         self.ids.insert(rc.clone(), id);
         self.names.push(rc);
         id
     }
 }
 
-/// Record shapes and constructors by index, shared by the compiler and the running entry.
+/// Record shapes and constructors by index, shared by the compiler and the running entry, and by
+/// the threads a `parallel` block's branches run on, any of which may intern a shape.
 pub struct Layouts {
-    shapes: RefCell<Shapes>,
+    shapes: std::sync::RwLock<Shapes>,
     pub ctors: Vec<(Symbol, usize)>,
     ctor_ids: HashMap<Symbol, u32>,
     /// The prelude constructors the runtime builds itself, resolved once.
@@ -369,7 +386,7 @@ impl Layouts {
         }
         let entry_shape = interned.intern(Layouts::entry_fields());
         Layouts {
-            shapes: RefCell::new(interned),
+            shapes: std::sync::RwLock::new(interned),
             ctors,
             ctor_ids,
             some,
@@ -397,6 +414,7 @@ impl Layouts {
         let rows: Box<[u16]> = self
             .shapes
             .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
             .names
             .iter()
             .flat_map(|shape| {
@@ -419,27 +437,36 @@ impl Layouts {
     }
 
     /// The id of the shape with exactly these fields, in any order.
-    pub fn shape(&self, fields: Vec<Symbol>) -> u32 {
-        self.shapes.borrow_mut().intern(fields)
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Shapes> {
+        self.shapes.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn shape(&self, mut fields: Vec<Symbol>) -> u32 {
+        fields.sort();
+        if let Some(id) = self.read().ids.get(fields.as_slice()) {
+            return *id;
+        }
+        self.shapes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .intern(fields)
     }
 
     pub fn shape_count(&self) -> usize {
-        self.shapes.borrow().names.len()
+        self.read().names.len()
     }
 
-    pub fn shape_names(&self, shape: u32) -> Rc<[Symbol]> {
-        self.shapes.borrow().names[shape as usize].clone()
+    pub fn shape_names(&self, shape: u32) -> Arc<[Symbol]> {
+        self.read().names[shape as usize].clone()
     }
 
     /// How many fields a shape has.
     pub fn shape_width(&self, shape: u32) -> usize {
-        self.shapes.borrow().names[shape as usize].len()
+        self.read().names[shape as usize].len()
     }
 
     pub fn offset(&self, shape: u32, name: &Symbol) -> Option<usize> {
-        self.shapes.borrow().names[shape as usize]
-            .binary_search(name)
-            .ok()
+        self.read().names[shape as usize].binary_search(name).ok()
     }
 }
 
@@ -457,6 +484,8 @@ pub struct Heap {
     /// The bridges whose `Value` the end drops, each block's `layout` its index here.
     bridges: Vec<*mut Obj>,
     persistent: bool,
+    /// The bytes the first chunk takes, which each next one doubles.
+    first: usize,
     /// Objects allocated since the last reset, and the same by kind.
     count: usize,
     by_kind: [usize; 16],
@@ -489,6 +518,11 @@ pub fn enter(heap: *mut Heap) {
 
 pub fn leave() {
     CURRENT.with(|c| c.set(std::ptr::null_mut()));
+}
+
+/// The heap an entry running nested on this thread takes over until it swaps the old one back.
+pub fn swap_current(heap: *mut Heap) -> *mut Heap {
+    CURRENT.with(|c| c.replace(heap))
 }
 
 /// The payload bytes an object was allocated with, from its header; `usize::MAX` if unsized.
@@ -551,6 +585,7 @@ impl Default for Heap {
 }
 
 const FIRST_CHUNK: usize = 1 << 20;
+const BRANCH_CHUNK: usize = 16 << 10;
 const LARGEST_CHUNK: usize = 64 << 20;
 
 /// The byte offset of the bump pointer and of the chunk's end within a [`Heap`].
@@ -567,6 +602,7 @@ impl Heap {
             chunk: 0,
             bridges: Vec::new(),
             persistent: false,
+            first: FIRST_CHUNK,
             count: 0,
             by_kind: [0; 16],
             by_layout: HashMap::new(),
@@ -590,6 +626,53 @@ impl Heap {
             lists.resize_with(class + 1, Vec::new);
         }
         &mut lists[class]
+    }
+
+    /// A `parallel` branch's heap, which its block adopts: it starts small, since a branch is
+    /// often a few allocations and every chunk it takes outlives it.
+    pub fn branch() -> Heap {
+        let mut h = Heap::new();
+        h.first = BRANCH_CHUNK;
+        h
+    }
+
+    /// Takes over a finished branch's memory: its objects are this entry's from here on. Its used
+    /// chunks go before the one bumping, which keeps the chunks after it the empty ones.
+    pub fn adopt_heap(&mut self, mut other: Heap) {
+        let used = if other.chunks.is_empty() { 0 } else { other.chunk + 1 };
+        if used > 0 && self.cur.is_null() {
+            self.grow(0);
+        }
+        let spare_chunks = other.chunks.split_off(used);
+        let spare_starts = other.starts.split_off(used);
+        let at = self.chunk;
+        self.chunk += used;
+        self.chunks.splice(at..at, other.chunks.drain(..));
+        self.starts.splice(at..at, other.starts.drain(..));
+        self.chunks.extend(spare_chunks);
+        self.starts.extend(spare_starts);
+        for o in other.bridges.drain(..) {
+            unsafe { (*o).layout = self.bridges.len() as u32 };
+            self.bridges.push(o);
+        }
+        for (class, list) in other.free.drain(..).enumerate() {
+            if self.free.len() <= class {
+                self.free.resize_with(class + 1, Vec::new);
+            }
+            self.free[class].extend(list);
+        }
+        for (class, list) in other.large.drain(..).enumerate() {
+            if self.large.len() <= class {
+                self.large.resize_with(class + 1, Vec::new);
+            }
+            self.large[class].extend(list);
+        }
+        self.delayed.extend(other.delayed.drain(..));
+        self.count += other.count;
+        for (mine, theirs) in self.by_kind.iter_mut().zip(other.by_kind) {
+            *mine += theirs;
+        }
+        self.recycled += other.recycled;
     }
 
     /// A heap whose entries never end: what outlives every entry lives here.
@@ -706,7 +789,7 @@ impl Heap {
             }
         }
         let last = self.chunks.last().map_or(0, |c| c.1);
-        let cap = need.max(FIRST_CHUNK).max((last * 2).min(LARGEST_CHUNK));
+        let cap = need.max(self.first).max((last * 2).min(LARGEST_CHUNK));
         let p = unsafe { alloc(Layout::from_size_align(cap, 16).expect("a chunk layout")) };
         assert!(!p.is_null(), "the heap is out of memory");
         self.chunks.push((p, cap));
@@ -1229,11 +1312,12 @@ pub fn inc(w: Word) {
         return;
     }
     let o = obj(w);
-    unsafe {
-        if (*o).rc != IMMORTAL {
-            debug_assert!((*o).kind != KIND_DEAD, "a dead object was shared");
-            (*o).rc += 1;
-        }
+    let rc = count(o).load(Relaxed);
+    if rc < SHARED {
+        debug_assert!(unsafe { (*o).kind } != KIND_DEAD, "a dead object was shared");
+        unsafe { (*o).rc = rc + 1 };
+    } else if rc != IMMORTAL {
+        inc_shared(w);
     }
 }
 
@@ -1244,18 +1328,104 @@ pub fn dec(w: Word) {
         return;
     }
     let o = obj(w);
-    unsafe {
-        if (*o).rc == IMMORTAL {
-            return;
-        }
-        debug_assert!((*o).kind != KIND_DEAD, "a dead object was released again");
-        if (*o).rc > 1 {
-            (*o).rc -= 1;
-            return;
-        }
+    let rc = count(o).load(Relaxed);
+    if rc == IMMORTAL {
+        return;
+    }
+    if rc >= SHARED {
+        dec_shared(w);
+        return;
+    }
+    debug_assert!(unsafe { (*o).kind } != KIND_DEAD, "a dead object was released again");
+    if rc > 1 {
+        unsafe { (*o).rc = rc - 1 };
+        return;
     }
     let heap = CURRENT.with(|c| c.get());
     unsafe { release(o, heap) }
+}
+
+/// [`inc`] of an object [`share`] marked.
+pub fn inc_shared(w: Word) {
+    count(obj(w)).fetch_add(1, Relaxed);
+}
+
+/// [`dec`] of an object [`share`] marked: the holder that takes the count to none dismantles it.
+pub fn dec_shared(w: Word) {
+    let o = obj(w);
+    if count(o).fetch_sub(1, Release) == SHARED | 1 {
+        std::sync::atomic::fence(Acquire);
+        let heap = CURRENT.with(|c| c.get());
+        unsafe { release(o, heap) }
+    }
+}
+
+/// Marks everything under `words` shared, or nothing when something under them names what only
+/// this thread's context holds: a cell, a task or a continuation.
+pub fn share(words: &[Word]) -> bool {
+    let mut marked: Vec<*mut Obj> = Vec::new();
+    let mut pending: Vec<Word> = words.to_vec();
+    while let Some(w) = pending.pop() {
+        if is_imm(w) || w == 0 {
+            continue;
+        }
+        let o = obj(w);
+        let rc = count(o).load(Relaxed);
+        // Immortal, or shared already, and so judged when it was marked.
+        if rc >= SHARED {
+            continue;
+        }
+        let stays = unsafe {
+            match (*o).kind {
+                KIND_BRIDGE => crosses_threads(bridged(o)),
+                KIND_CLOSURE => {
+                    !crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize)
+                }
+                _ => true,
+            }
+        };
+        if !stays {
+            for o in marked {
+                unsafe { (*o).rc &= !SHARED };
+            }
+            return false;
+        }
+        unsafe { (*o).rc = rc | SHARED };
+        marked.push(o);
+        for (first, last) in unsafe { child_ranges(o) } {
+            for i in first..last {
+                pending.push(unsafe { word_at(o, i) });
+            }
+        }
+    }
+    true
+}
+
+/// Whether a bridged value may be held by another thread: a cell is a slot of this entry's arena,
+/// and a task a handle into this thread's scheduler.
+fn crosses_threads(v: &Value) -> bool {
+    match v {
+        Value::Cell(_) | Value::Task(_) => false,
+        Value::Secret(inner) => crosses_threads(inner),
+        Value::Closure(c) => match &c.kind {
+            ClosureKind::Native { captured, .. } => captured.iter().all(crosses_threads),
+            _ => true,
+        },
+        Value::List(items) => items.iter().all(crosses_threads),
+        Value::Map(entries) => entries
+            .iter()
+            .all(|(k, v)| crosses_threads(k) && crosses_threads(v)),
+        Value::Record(fields) => fields.values().all(crosses_threads),
+        Value::Ctor { args, .. } => args.iter().all(crosses_threads),
+        Value::Int(_)
+        | Value::Fixed(_)
+        | Value::Bool(_)
+        | Value::Float(_)
+        | Value::Decimal(_)
+        | Value::Str(_)
+        | Value::Bytes(_)
+        | Value::Unit => true,
+    }
 }
 
 /// `o`, held once, released with its children, into `heap`'s free lists when it has them.
@@ -1277,7 +1447,7 @@ pub fn reset(w: Word) -> Word {
     }
     let o = obj(w);
     unsafe {
-        if (*o).kind != KIND_RECORD || (*o).rc != 1 {
+        if (*o).kind != KIND_RECORD || count(o).load(Relaxed) != 1 {
             dec(w);
             return 0;
         }
@@ -1312,12 +1482,10 @@ fn cmp_bytes(x: &[u8], y: &[u8]) -> Ordering {
 /// How deep dismantling recurses on the stack before deferring to a heap list.
 const DISMANTLE_DEPTH: usize = 32;
 
-/// `o`, held once, dies: its children are released and its header marked dead.
-unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, heap: *mut Heap) {
+/// The payload words of `o` that hold counted children.
+unsafe fn child_ranges(o: *mut Obj) -> [(usize, usize); 2] {
     unsafe {
-        debug_assert!((*o).rc == 1 && (*o).kind != KIND_DEAD);
-        (*o).rc = 0;
-        let ranges: [(usize, usize); 2] = match (*o).kind {
+        match (*o).kind {
             KIND_RECORD | KIND_CTOR if (*o).flags & FLAT != 0 => [(0, 0), (0, 0)],
             KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => [(0, (*o).len as usize), (0, 0)],
             KIND_MLEAF => [(0, 2 * (*o).len as usize), (0, 0)],
@@ -1331,32 +1499,57 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, hea
                 (map::KEYS, map::KEYS + (*o).len as usize),
             ],
             KIND_CLOSURE => [(CLOSURE_CAPTURES, (*o).len as usize), (0, 0)],
-            KIND_BRIDGE => {
-                std::ptr::drop_in_place(bridge_slot(o));
-                [(0, 0), (0, 0)]
-            }
             _ => [(0, 0), (0, 0)],
-        };
-        for i in ranges.iter().flat_map(|(first, last)| *first..*last) {
+        }
+    }
+}
+
+/// `o`, held once, dies: its children are released and its header marked dead.
+unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, heap: *mut Heap) {
+    unsafe {
+        // A shared object reaches here with its count's own bits spent.
+        let shared = (*o).rc == SHARED;
+        debug_assert!((shared || (*o).rc == 1) && (*o).kind != KIND_DEAD);
+        (*o).rc = 0;
+        if (*o).kind == KIND_BRIDGE {
+            std::ptr::drop_in_place(bridge_slot(o));
+        }
+        for i in child_ranges(o).iter().flat_map(|(first, last)| *first..*last) {
             let c = word_at(o, i);
             if is_imm(c) || c == 0 {
                 continue;
             }
             let co = obj(c);
-            if (*co).rc == IMMORTAL {
+            let rc = count(co).load(Relaxed);
+            if rc == IMMORTAL {
                 continue;
             }
             debug_assert!((*co).kind != KIND_DEAD, "a dead object was released again");
-            if (*co).rc > 1 {
-                (*co).rc -= 1;
-            } else if depth < DISMANTLE_DEPTH {
+            let last = if rc >= SHARED {
+                let was = count(co).fetch_sub(1, Release) == SHARED | 1;
+                if was {
+                    std::sync::atomic::fence(Acquire);
+                }
+                was
+            } else if rc > 1 {
+                (*co).rc = rc - 1;
+                false
+            } else {
+                true
+            };
+            if !last {
+                continue;
+            }
+            if depth < DISMANTLE_DEPTH {
                 dismantle(co, depth + 1, deferred, heap);
             } else {
                 deferred.push(co);
             }
         }
         // The class is read off the header before it is marked dead.
-        recycle(o, heap);
+        if !shared {
+            recycle(o, heap);
+        }
         (*o).kind = KIND_DEAD;
     }
 }
@@ -1507,7 +1700,7 @@ pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
 /// Whether one holder alone has `w`: what lets an update write in place.
 #[inline]
 pub fn is_unique(w: Word) -> bool {
-    !is_imm(w) && unsafe { (*obj(w)).rc == 1 }
+    !is_imm(w) && count(obj(w)).load(Relaxed) == 1
 }
 
 #[inline]

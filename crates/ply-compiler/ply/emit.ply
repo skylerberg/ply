@@ -4,7 +4,7 @@
 import spine (num, Ident, Span, dummy_span, span_key, PDiag)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp,
              NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField,
-             NPerform, NLabel, NCell, NLambda, NSim, NHandle, CStmt, CLet, CLetPat, CDo, pat_slots,
+             NPerform, NLabel, NCell, NLambda, NSim, NPar, NHandle, CStmt, CLet, CLetPat, CDo, pat_slots,
              CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, lower_fn, qname_text)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias,
               parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
@@ -1682,6 +1682,7 @@ fn slots_read(c: Code) -> List<Int> =
     // A capture read inside a lambda is a read of the object it copies; the lambda's own parameter is not a read here.
     NLambda(l) -> through_caps(slots_read(l.body), l.caps),
     NSim(x) -> concat(map(x.caps, |c2: Cap| c2.src), slots_read(x.body)),
+    NPar(pr) -> all_read(pr.branches),
     NHandle(h) ->
       concat(
         slots_read(h.body),
@@ -4896,6 +4897,37 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         },
       }
     },
+    // `parallel { .. }`: the branches' closures go to the runtime, which runs them at once where it may
+    // and in order where it must, and writes each one's answer over its closure.
+    NPar(pr) -> match items(em, pr.branches, params, 0, []) {
+      None -> None,
+      Some(w) -> {
+        let n = len(w.names);
+        let arr = fresh(w.em);
+        let held = line(
+          arr.em,
+          bytes_concat_all([b"Word ", arr.name, b"[] = {", bytes_join(w.names, b", "), b"};"]),
+        );
+        let ran = check(
+          line(
+            site(held, c.span),
+            bytes_concat_all([b"rt_parallel_p(ctx, (Word)(intptr_t)", arr.name, b", ", num(n), b");"]),
+          ),
+        );
+        let names = map(range(0, n), |i: Int| bytes_concat(b"_", num(i)));
+        let words = map(range(0, n), |i: Int| bytes_concat_all([arr.name, b"[", num(i), b"]"]));
+        let sorted = sorted_names(names);
+        Some(
+          build_record(
+            ran,
+            sorted,
+            map(range(0, n), |at: Int| word_at_rank(names, words, at)),
+            map(sorted, |_x: Bytes| KBoxed),
+            None,
+          ),
+        )
+      },
+    },
     _ -> Some(refused(em, b"an effect construct or another node this port does not emit")),
   }
 
@@ -8041,6 +8073,7 @@ fn has_handle(c: Code) -> Bool = {
     NCell(c2) -> within([c2.init, c2.body]),
     NLambda(l) -> has_handle(l.body),
     NSim(x) -> has_handle(x.body),
+    NPar(pr) -> within(pr.branches),
     _ -> false,
   }
 }
@@ -8393,6 +8426,7 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> = {
     NCell(c2) -> here(walk_handles(c2.init, effects), c2.body),
     NLambda(l) -> walk_handles(l.body, effects),
     NSim(x) -> concat_names(scheduled_ops(), walk_handles(x.body, effects)),
+    NPar(pr) -> fold(pr.branches, [], here),
     _ -> [],
   }
 }

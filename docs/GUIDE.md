@@ -2823,6 +2823,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
 | `E0307` | mutually recursive definitions binding different label or row parameters |
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
+| `E0309` | two branches of a `parallel` block may touch one resource where either writes |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
