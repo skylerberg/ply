@@ -75,21 +75,29 @@ pub type Declared<'a> = &'a dyn Fn(&str) -> String;
 /// Every effect where the `ply` binary's own program declares it.
 fn own(effect: &str) -> String {
     match effect {
-        "prover" => "claims".to_string(),
-        other => other.to_string(),
+        "prover" => "claims",
+        "tester" => "tests",
+        "store" => "cache",
+        "archive" => "bootstrap",
+        "tcb" => "hosts",
+        "edit" => "replace",
+        other => other,
     }
+    .to_string()
 }
 
 /// The operations one family lends.
 pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
     Some(match family {
-        "machine" => crate::registrations_with(crate::drive::RunOptions::default()),
+        "machine" => {
+            crate::registrations_in(&declared("machine"), crate::drive::RunOptions::default())
+        }
         "tester" => crate::tester::Session::new(&TestOptions::default()).lent(),
         "claims" => crate::claims::lent(&declared("prover")),
         "builder" => crate::builder::lent(),
-        "cache" => crate::cache::lent(),
+        "cache" => crate::cache::lent(&declared("store")),
         "bootstrap" => crate::bootstrap::lent(),
-        "hosts" => crate::hosts::lent(),
+        "hosts" => crate::hosts::lent(&declared("tcb")),
         "edit" => crate::edit::lent(),
         _ => return None,
     })

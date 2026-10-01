@@ -41,27 +41,26 @@ test "a cell that reaches itself through a variant" {
     );
 }
 
+/// The guard compiled code runs before `cell_set` stores a value.
 #[test]
 fn the_detector_still_finds_the_shape_it_guards_against() {
-    use ply_eval::{Span, TaskRegions};
+    use ply_codegen::heap::{self, Heap};
+    use ply_eval::{Span, TaskRegions, Value};
 
     let mut regions = TaskRegions::new();
-    let id = regions.alloc_cell(ply_eval::Value::Unit);
-    let held = ply_eval::Value::list(vec![ply_eval::Value::Cell(id)]);
+    let id = regions.alloc_cell(Value::Unit);
+    let mut words = Heap::new();
+    let cell = words.bridge(Value::Cell(id));
+    let held = words.list_from(&[cell]);
+    assert!(
+        heap::reaches_cell(held, id),
+        "the guard stopped recognizing the one shape it exists for"
+    );
 
     ply_eval::rc::reset();
     let before = ply_eval::rc::stats().cycles;
-    let _ = ply_eval::builtins::call(
-        ply_eval::Builtin::CellSet,
-        vec![ply_eval::Value::Cell(id), held],
-        &mut regions,
-        Span::DUMMY,
-    );
-    assert_eq!(
-        ply_eval::rc::stats().cycles,
-        before + 1,
-        "the guard stopped recognizing the one shape it exists for"
-    );
+    ply_eval::rc::note_cell_cycle(id, Span::DUMMY);
+    assert_eq!(ply_eval::rc::stats().cycles, before + 1);
     let reported = ply_eval::rc::take_cycles();
     assert_eq!(reported.len(), 1);
     assert_eq!(reported[0].code, codes::REFERENCE_CYCLE);

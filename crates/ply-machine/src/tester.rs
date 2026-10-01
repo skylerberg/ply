@@ -248,8 +248,7 @@ impl HostHandler for Site {
                     .first()
                     .ok_or_else(|| unasked("configure", req.span))?;
                 let options = test_options_of(options, req.span)?;
-                // A configuration begins a run, whatever the last one left: its machine, opened
-                // over the last options, is dropped, which joins its thread.
+                // A configuration begins a run: the last run's machine is dropped, joining its thread.
                 let previous = self.held().take();
                 drop(previous);
                 *self.running.write().unwrap_or_else(|e| e.into_inner()) = None;

@@ -56,7 +56,6 @@ pub fn module_texts(
 pub fn prover_backend(
     loaded: &crate::load::Loaded,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
-    ply_codegen::c::producer::ensure_default();
     build_backend_over(&loaded.front, module_texts(&loaded.check, &loaded.sources))
 }
 

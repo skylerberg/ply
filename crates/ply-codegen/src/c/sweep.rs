@@ -85,10 +85,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
         for e in read.flatten() {
             let path = e.path();
             // A half-written entry belongs to a running process about to rename it.
-            if path
-                .extension()
-                .is_some_and(|x| x == "tmp" || x == "rtmp" || x == "utmp" || x == "otmp")
-            {
+            if path.extension().is_some_and(|x| x == "tmp") {
                 continue;
             }
             let Ok(meta) = e.metadata() else { continue };
