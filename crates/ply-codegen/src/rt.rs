@@ -1076,10 +1076,6 @@ pub unsafe extern "C" fn rt_box_int(ctx: *mut Ctx, v: i64) -> i64 {
     ctx.heap.boxed_int(v)
 }
 
-pub unsafe extern "C" fn rt_box_bool(_ctx: *mut Ctx, v: i64) -> i64 {
-    heap::bool(v != 0)
-}
-
 pub unsafe extern "C" fn rt_unbox_int(ctx: *mut Ctx, w: i64) -> i64 {
     match heap::as_int(w) {
         Some(i) => i,
@@ -1264,20 +1260,12 @@ pub unsafe extern "C" fn rt_tick(ctx: *mut Ctx) {
 /// Calls between two callbacks while an entry is still within its bounds.
 const TICK_CHUNK: i64 = 4096;
 
-/// The calls one entry may make; 0 is no bound. A command sets the process's, and a caller that
-/// wants one evaluation bounded differently sets its thread's.
-static STEP_BUDGET: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(ply_eval::DEFAULT_STEP_BUDGET);
-
 thread_local! {
+    /// The calls one entry may make; 0 is no bound.
     static THREAD_STEP_BUDGET: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
-pub fn set_step_budget(steps: i64) {
-    STEP_BUDGET.store(steps.max(0), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Runs `f` with entries on this thread bounded by `steps` rather than by the process's budget.
+/// Runs `f` with entries on this thread bounded by `steps` rather than by the default budget.
 pub fn with_step_budget<R>(steps: i64, f: impl FnOnce() -> R) -> R {
     let before = THREAD_STEP_BUDGET.with(|t| t.replace(Some(steps.max(0))));
     let out = f();
@@ -1288,7 +1276,7 @@ pub fn with_step_budget<R>(steps: i64, f: impl FnOnce() -> R) -> R {
 pub fn step_budget() -> i64 {
     THREAD_STEP_BUDGET
         .with(|t| t.get())
-        .unwrap_or_else(|| STEP_BUDGET.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(ply_eval::DEFAULT_STEP_BUDGET)
 }
 
 /// Runs `f` with entries on this thread bounded by neither budget: the compiler's own work is
@@ -1297,19 +1285,13 @@ pub fn unbounded<R>(f: impl FnOnce() -> R) -> R {
     with_step_budget(0, || with_time_budget(0, f))
 }
 
-/// The wall clock an entry may take, in milliseconds; 0 is none. It abandons a run rather than
-/// judging it, so only a harness that will say so sets one.
-static TIME_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 thread_local! {
+    /// The wall clock an entry may take, in milliseconds; 0 is none. It abandons a run rather than
+    /// judging it, so only a harness that will say so sets one.
     static THREAD_TIME_BUDGET_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-pub fn set_time_budget(ms: u64) {
-    TIME_BUDGET_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Runs `f` with entries on this thread bounded by `ms` rather than the process's budget.
+/// Runs `f` with entries on this thread bounded by `ms` rather than by none.
 pub fn with_time_budget<R>(ms: u64, f: impl FnOnce() -> R) -> R {
     let before = THREAD_TIME_BUDGET_MS.with(|t| t.replace(Some(ms)));
     let out = f();
@@ -1318,9 +1300,7 @@ pub fn with_time_budget<R>(ms: u64, f: impl FnOnce() -> R) -> R {
 }
 
 pub fn time_budget_ms() -> u64 {
-    THREAD_TIME_BUDGET_MS
-        .with(|t| t.get())
-        .unwrap_or_else(|| TIME_BUDGET_MS.load(std::sync::atomic::Ordering::Relaxed))
+    THREAD_TIME_BUDGET_MS.with(|t| t.get()).unwrap_or(0)
 }
 
 /// Room below the floor for the runtime's frames and the deepest compiled frame itself.
@@ -2969,48 +2949,6 @@ pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
     ctx.fail(d);
 }
 
-/// A range longer than [`RANGE_LIMIT`], raised where a fused loop would have walked it.
-pub unsafe extern "C" fn rt_bad_range(ctx: *mut Ctx, lo: i64, hi: i64) {
-    let ctx = unsafe { &mut *ctx };
-    let d = error(format!(
-        "`range` of {} elements exceeds the limit of {RANGE_LIMIT}",
-        hi.saturating_sub(lo)
-    ));
-    ctx.fail(d);
-}
-
-/// The most elements the interpreter's `range` builds, which a fused loop holds to as well.
-pub const RANGE_LIMIT: i64 = 10_000_000;
-
-/// Element `i` of a list a fused loop checked, held once more. Reads the list.
-pub unsafe extern "C" fn rt_list_get(_ctx: *mut Ctx, list: i64, i: i64) -> i64 {
-    let w = list::get(obj(list), i as usize);
-    heap::inc(w);
-    w
-}
-
-/// `xs` with `x` appended, for a fused `map` or `filter` building its answer. Takes both.
-pub unsafe extern "C" fn rt_list_push(ctx: *mut Ctx, xs: i64, x: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    ctx.heap.list_push(xs, x)
-}
-
-/// A fused loop was handed something other than a list.
-pub unsafe extern "C" fn rt_not_a_list(ctx: *mut Ctx, which: i64, value: i64) {
-    let ctx = unsafe { &mut *ctx };
-    let what = match which {
-        0 => "fold",
-        1 => "map",
-        _ => "filter",
-    };
-    let d = error(format!(
-        "`{what}` needs a List, and this is {}",
-        ctx.type_name(value)
-    ));
-    heap::dec(value);
-    ctx.fail(d);
-}
-
 /// A shift count outside the word; `which` indexes [`ply_eval::INT_TYPES`], or is `-1` for `Int`.
 pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64, which: i64) {
     let ctx = unsafe { &mut *ctx };
@@ -3057,94 +2995,6 @@ pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, 
         unsafe { set_word(o, i, *w) };
     }
     o as Word
-}
-
-/// A record update writing `n` fields at `offsets` in `shape`: in place when the base is unique
-/// and has that shape, else into a fresh copy. Takes the base and the written fields.
-pub unsafe extern "C" fn rt_record_update(
-    ctx: *mut Ctx,
-    shape: i64,
-    base: i64,
-    args: *const i64,
-    offsets: *const i64,
-    n: i64,
-) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let written = args_of(args, n);
-    let offsets = args_of(offsets, n);
-    if heap::kind(base) != KIND_RECORD {
-        let d = error(format!(
-            "a record update needs a record, and this is {}",
-            ctx.type_name(base)
-        ));
-        return ctx.fail(d);
-    }
-    let o = obj(base);
-    let shape = shape as u32;
-    let in_place = unsafe { (*o).layout } == shape && is_unique(base);
-    let width = ctx.tables.layouts.shape_width(shape);
-    ply_eval::rc::note_update_of(in_place, if in_place { 0 } else { width }, ctx.site());
-    if in_place {
-        for (w, at) in written.iter().zip(offsets) {
-            unsafe {
-                heap::dec(word_at(o, *at as usize));
-                set_word(o, *at as usize, *w);
-            }
-        }
-        unsafe { (*o).flags &= flat_over(written) | !heap::FLAT };
-        return base;
-    }
-    // Unwritten fields come from the base by offset, or by name when the lowering guessed a base
-    // of another shape.
-    let tables = Arc::clone(&ctx.tables);
-    let width = tables.layouts.shape_width(shape);
-    let flat = flat_over(written) & unsafe { (*o).flags };
-    let out = ctx.heap.alloc(KIND_RECORD, flat, width as u32, shape);
-    // Which offsets were written: a bitmask up to 128 fields, a list past that.
-    let mut mask = 0u128;
-    let mut wide = Vec::new();
-    if width > 128 {
-        wide = vec![false; width];
-    }
-    for (w, at) in written.iter().zip(offsets) {
-        let at = *at as usize;
-        unsafe { set_word(out, at, *w) };
-        if width > 128 {
-            wide[at] = true;
-        } else {
-            mask |= 1 << at;
-        }
-    }
-    let filled = |i: usize| {
-        if width > 128 {
-            wide[i]
-        } else {
-            mask >> i & 1 == 1
-        }
-    };
-    if written.len() < width {
-        let base_shape = unsafe { (*o).layout };
-        if base_shape == shape {
-            for i in (0..width).filter(|i| !filled(*i)) {
-                let w = unsafe { word_at(o, i) };
-                heap::inc(w);
-                unsafe { set_word(out, i, w) };
-            }
-        } else {
-            let names = tables.layouts.shape_names(shape);
-            for i in (0..width).filter(|i| !filled(*i)) {
-                let Some(at) = tables.layouts.offset(base_shape, &names[i]) else {
-                    let d = error(format!("this record has no field `{}`", names[i]));
-                    return ctx.fail(d);
-                };
-                let w = unsafe { word_at(o, at) };
-                heap::inc(w);
-                unsafe { set_word(out, i, w) };
-            }
-        }
-    }
-    heap::dec(base);
-    out as Word
 }
 
 /// One field of a record by name. `own`: 0 reads the base and holds the field once more; 2 moves

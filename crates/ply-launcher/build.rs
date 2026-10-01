@@ -26,11 +26,7 @@ fn main() {
     for (name, text) in modules(&root) {
         out.push_str(&format!("    ({name:?}, include_str!({text:?})),\n"));
     }
-    out.push_str(
-        "];\n\n/// The CLI package's manifest.\n\
-         pub const PROGRAM_MANIFEST: &str = include_str!(",
-    );
-    out.push_str(&format!("{:?});\n", manifest(&root).display().to_string()));
+    out.push_str("];\n");
 
     out.push_str(
         "\n/// Every package this binary ships — the CLI and everything it depends on by path, the\n\

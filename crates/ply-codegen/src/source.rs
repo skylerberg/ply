@@ -36,8 +36,6 @@ struct Tables {
     ctors: Vec<(Symbol, usize)>,
     roots: Vec<String>,
     arities: HashMap<String, usize>,
-    /// Roots whose parameters and answer are all `Int` or `Bool`.
-    scalars: HashSet<String>,
     /// Each root's place in [`Front::emitter_roots`].
     rows: HashMap<String, usize>,
     /// Roots the compiler published pure.
@@ -62,12 +60,6 @@ impl Tables {
                 .emitter_roots
                 .iter()
                 .map(|r| (r.root.to_string(), r.arity))
-                .collect(),
-            scalars: front
-                .emitter_roots
-                .iter()
-                .filter(|r| r.scalar)
-                .map(|r| r.root.to_string())
                 .collect(),
             rows: front
                 .emitter_roots
@@ -206,11 +198,6 @@ impl Source {
     pub fn row(&self, name: &str) -> Option<&'static EmitterRoot> {
         let front: &'static Front = self.front;
         self.tables.rows.get(name).map(|&i| &front.emitter_roots[i])
-    }
-
-    /// Whether every parameter and the answer are `Int` or `Bool`.
-    pub fn scalar_signature(&self, name: &str) -> bool {
-        self.tables.scalars.contains(name)
     }
 
     /// Whether the compiler published the root pure.

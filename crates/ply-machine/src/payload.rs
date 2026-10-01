@@ -17,14 +17,6 @@ pub fn record(fields: Vec<(&str, PlyValue)>) -> PlyValue {
     ))
 }
 
-/// A record whose field names are already symbols, in no particular order.
-///
-/// `Value::Record` holds an `Arc`, and its fields are not `Send`; every construction site says so.
-#[allow(clippy::arc_with_non_send_sync)]
-pub fn record_unsorted(fields: Vec<(Symbol, PlyValue)>) -> PlyValue {
-    PlyValue::Record(Arc::new(ply_eval::Fields::from_unsorted(fields)))
-}
-
 /// A constructor of a type the program declares, by its program-wide name.
 pub fn ctor(module: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     PlyValue::ctor(Symbol::new(format!("{module}.{name}")), args)

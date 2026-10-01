@@ -1,7 +1,7 @@
 use ply_codegen::c::{dump, producer};
 use ply_eval::{
-    Carry, Edit, EffectAtom, Fields, Fix, Footprint, Hashed, IntTy, Literal, Mode, Ordinal,
-    Resource, Severity, SourceId, Span, Symbol, Value, Visibility, codes,
+    Carry, Edit, EffectAtom, Fields, Fix, Footprint, IntTy, Mode, Ordinal, Resource, Severity,
+    SourceId, Span, Symbol, Value, Visibility, codes,
 };
 use std::sync::Arc;
 
@@ -96,12 +96,9 @@ fn a_real_answer_reads_to_the_program_it_describes() {
     let test = &front.check.tests[0];
     assert_eq!(test.key, named("m.says"));
     assert_eq!(test.footprint, log_write);
-    assert_eq!(front.test_name_spans[0].source, SourceId(0));
 
     let law = &front.check.laws[0];
     assert_eq!(law.key, named("m.picks the first"));
-    assert!(law.has_guard);
-    assert_eq!(front.law_literals, vec![vec![Literal::Int(2)]]);
 
     let log = &front.check.effects[&named("m.log")];
     let emit = &log.ops[&named("emit")];
@@ -118,9 +115,12 @@ fn a_real_answer_reads_to_the_program_it_describes() {
         assert!(front.hashes.defs.contains_key(&named(def)), "{def}");
     }
     assert_eq!(front.hashes.tests.len(), 1);
-    assert_eq!(front.hashes.laws.len(), 1);
-    assert!(front.hash_order.contains(&Hashed::Test(0)));
-    assert!(front.hash_order.contains(&Hashed::Law(0)));
+    assert!(
+        front
+            .hashes
+            .closure
+            .contains_key(&named("m.picks the first"))
+    );
     assert_eq!(front.test_bodies.len(), 1);
 
     assert_eq!(
@@ -347,7 +347,7 @@ fn an_answer_over_the_examples_and_the_compiler_reads_whole() {
         "the corpus does not check: {:?}",
         once.diagnostics
     );
-    assert!(!once.check.defs.is_empty() && !once.hash_order.is_empty());
+    assert!(!once.check.defs.is_empty() && !once.hashes.defs.is_empty());
     assert_eq!(once.check.tests.len(), once.hashes.tests.len());
     let again = dump::read(&pulled.dump, &ids).unwrap_or_else(|e| panic!("{e}"));
     assert!(
@@ -362,12 +362,9 @@ fn a_malformed_answer_names_the_path_to_what_is_wrong() {
     let ids = [SourceId(0)];
     dump::read(&good, &ids).unwrap_or_else(|e| panic!("{e}"));
 
-    let def = with(&first(field(&good, "defs")), "row_aliases", Value::Int(7));
+    let def = with(&first(field(&good, "defs")), "params", Value::Int(7));
     let err = dump::read(&with(&good, "defs", Value::list(vec![def])), &ids).unwrap_err();
-    assert_eq!(
-        err.path, "the front end's answer.defs[0].row_aliases",
-        "{err}"
-    );
+    assert_eq!(err.path, "the front end's answer.defs[0].params", "{err}");
     assert!(err.message.contains("expected a list"), "{err}");
 
     let short = with(&good, "hashes_digest", Value::bytes([0u8; 31]));
@@ -473,7 +470,7 @@ fn an_error_is_the_whole_answer_with_its_labels_notes_and_fixes() {
     let sources = [SourceId(9), SourceId(4)];
     let front = dump::read(&refused, &sources).unwrap_or_else(|e| panic!("{e}"));
     assert!(front.has_error());
-    assert!(front.check.defs.is_empty() && front.order.is_empty());
+    assert!(front.check.defs.is_empty() && front.packages.is_empty());
 
     let [failed, warned] = &front.diagnostics[..] else {
         panic!("two diagnostics: {:?}", front.diagnostics);
@@ -558,16 +555,11 @@ fn holding(footprint: Value) -> Value {
         ("reuse", Value::Bool(false)),
         ("footprint", footprint.clone()),
         ("performed", footprint),
-        ("internally_effectful", Value::Bool(false)),
-        ("row_aliases", empty()),
         ("params", empty()),
-        ("spec", empty()),
         ("at", nowhere()),
-        ("literals", empty()),
     ]);
     let mut tables: Vec<(&str, Value)> = [
         "diags",
-        "order",
         "packages",
         "pins",
         "mod_pkg",
