@@ -148,6 +148,7 @@ nondet effect prover {
   read prepared[claims](step_budget: Int) -> Result<List<Unit>, Unit>
   read judged[claims](batches: List<Unit>) -> List<List<Unit>>
   read interleaved[claims](claim: Int, point: List<Unit>, seed: Unit, steps: Int) -> Unit
+  read ended[claims]() -> List<Unit>
   write record[claims](entries: List<Unit>) -> List<Unit>
   read baselines[claims](names: List<String>) -> List<Unit>
   write accepted[claims](records: List<Unit>) -> Unit
