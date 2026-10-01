@@ -3,16 +3,23 @@
 # grants `benches/corpus.sh` gives the program. A run fails when a test fails, when the run refuses,
 # and when its filter selects no test, so a renamed test never stops being run quietly.
 #
-#   ci-corpus.sh partition K TIMINGS   every run partition K takes, one after another; each run's
-#                                      milliseconds are appended to TIMINGS as `corpus <run> <ms>`,
-#                                      and with the program's own tests go those of the programs
-#                                      under `fixtures/` it runs, each of which must pass a test
+#   ci-corpus.sh partition K TIMINGS [CUT]
+#       every run partition K takes (`ci-shards.sh corpus-for-partition K [CUT]`), each lane one
+#       process beside the others. A lane's checks go in one `ply test` with a `--filter` each, so
+#       the checks package's closure is loaded once a lane rather than once a run. Each run's
+#       milliseconds are appended to TIMINGS as `corpus <run> <ms>`: a check's are its tests' own,
+#       out of the report. With the program's own tests go those of the programs under `fixtures/`
+#       it runs, each of which must pass a test.
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ply="$root/target/debug/ply"
 shards="$root/.github/ci-shards.sh"
+
+# What a checks run is given after `ply test PATH`.
+grants=(--host --timeout 900000 --steps 0 --json
+  --exec "ply=$ply" --allow machine --allow claims --fs work=. --fs "repo=$root")
 
 run_one() {
   local id=$1 line path filter status=0 selected out
@@ -24,9 +31,7 @@ run_one() {
     # A package's own suite runs as `ply test` runs it: the corpus's grants are for the corpus.
     "$ply" test "$path" --json "$@" > "$out" || status=$?
   else
-    "$ply" test "$path" ${filter:+--filter "$filter"} --host --timeout 900000 --steps 0 --json \
-      --exec "ply=$ply" --allow machine --allow claims --fs work=. --fs "repo=$root" "$@" \
-      > "$out" || status=$?
+    "$ply" test "$path" ${filter:+--filter "$filter"} "${grants[@]}" "$@" > "$out" || status=$?
   fi
   jq -r '.results[]? | "\(.status)\t\(.name)"' "$out" 2>/dev/null
   selected=$(jq -s 'map(.results // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
@@ -39,17 +44,80 @@ run_one() {
   rm -f "$out"
 }
 
+# The checks runs IDs, in one `ply test`: each run's milliseconds are the summed durations of the
+# tests its filter selected, and a run whose filter selected none fails.
+run_checks() {
+  local timings=$1 id line path filter status=0 out bad=0 n ms i
+  local -a filters=() ids=() args=()
+  shift
+  for id in "$@"; do
+    line=$("$shards" corpus-line "$id") || return 2
+    read -r path filter <<< "$line"
+    ids+=("$id")
+    filters+=("$filter")
+    args+=(--filter "$filter")
+  done
+  out=$(mktemp)
+  "$ply" test "$path" "${args[@]}" "${grants[@]}" > "$out" || status=$?
+  jq -r '.results[]? | "\(.status)\t\(.name)"' "$out" 2>/dev/null
+  for i in "${!ids[@]}"; do
+    n=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.name | contains($f))] | length' "$out" 2>/dev/null || echo 0)
+    ms=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.name | contains($f)) | .duration_us] | add // 0 | . / 1000 | floor' "$out" 2>/dev/null || echo 0)
+    if [ "$n" -eq 0 ]; then
+      echo "corpus run ${ids[$i]} selected no test (filter: ${filters[$i]})" >&2
+      bad=1
+    fi
+    printf 'corpus\t%s\t%s\n' "${ids[$i]}" "$ms" >> "$timings"
+  done
+  if [ "$status" -ne 0 ] || [ "$bad" -ne 0 ]; then
+    cat "$out"
+    rm -f "$out"
+    return 1
+  fi
+  rm -f "$out"
+}
+
 fixtures() {
-  local fixture failed=0
+  local fixture failed=0 out
+  out=$(mktemp)
   for fixture in "$root"/crates/ply-corpus/fixtures/*.ply; do
-    if ! "$ply" test "$fixture" --no-cache --json > /tmp/fixture.json; then
-      cat /tmp/fixture.json
+    if ! "$ply" test "$fixture" --no-cache --json > "$out"; then
+      cat "$out"
       failed=1
-    elif ! jq -e '.summary.passed > 0' /tmp/fixture.json > /dev/null; then
+    elif ! jq -e '.summary.passed > 0' "$out" > /dev/null; then
       echo "$fixture tested nothing" >&2
       failed=1
     fi
   done
+  rm -f "$out"
+  return "$failed"
+}
+
+# One lane's runs, one after another: the program's own and each package's suite in a `ply test` of
+# their own, and every checks run in one.
+lane() {
+  local timings=$1 id started failed=0
+  local -a checks=()
+  shift
+  : > "$timings"
+  for id in "$@"; do
+    case "$id" in
+      program | package-*)
+        echo "::group::corpus $id"
+        started=$(date +%s%3N)
+        run_one "$id" || failed=1
+        if [ "$id" = program ]; then fixtures || failed=1; fi
+        printf 'corpus\t%s\t%s\n' "$id" "$(($(date +%s%3N) - started))" >> "$timings"
+        echo "::endgroup::"
+        ;;
+      *) checks+=("$id") ;;
+    esac
+  done
+  if [ "${#checks[@]}" -gt 0 ]; then
+    echo "::group::corpus checks ${checks[*]}"
+    run_checks "$timings" "${checks[@]}" || failed=1
+    echo "::endgroup::"
+  fi
   return "$failed"
 }
 
@@ -57,24 +125,31 @@ case "${1:-}" in
   partition)
     shard=${2:?a partition}
     timings=${3:?a file for the durations}
-    runs=$("$shards" corpus-for-partition "$shard") || exit 2
-    failed=0
+    runs=$("$shards" corpus-for-partition "$shard" "${4:-}") || exit 2
     : > "$timings"
-    for id in $runs; do
-      echo "::group::corpus $id"
-      started=$(date +%s%3N)
-      run_one "$id" || failed=1
-      if [ "$id" = program ]; then fixtures || failed=1; fi
-      printf 'corpus\t%s\t%s\n' "$id" "$(($(date +%s%3N) - started))" >> "$timings"
-      echo "::endgroup::"
+    work=$(mktemp -d)
+    lanes=$(cut -d' ' -f1 <<< "$runs" | sort -un)
+    pids=()
+    for l in $lanes; do
+      read -ra ids <<< "$(awk -v l="$l" '$1 == l { printf "%s ", $2 }' <<< "$runs")"
+      lane "$work/lane-$l.tsv" "${ids[@]}" > "$work/lane-$l.log" 2>&1 &
+      pids+=("$!")
     done
+    failed=0
+    for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+    for l in $lanes; do
+      echo "=== corpus lane $l"
+      cat "$work/lane-$l.log"
+      cat "$work/lane-$l.tsv" >> "$timings"
+    done
+    rm -rf "$work"
     exit "$failed"
     ;;
   run)
     run_one "${2:?a corpus entry}" "${@:3}"
     ;;
   *)
-    echo "usage: ci-corpus.sh partition K TIMINGS | run ID [ARG...]" >&2
+    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | run ID [ARG...]" >&2
     exit 2
     ;;
 esac

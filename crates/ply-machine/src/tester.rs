@@ -114,7 +114,8 @@ pub struct TestOptions {
     pub json: bool,
     pub explain: bool,
     pub no_cache: bool,
-    pub filter: Option<String>,
+    /// `--filter`'s substrings: a test any of them matches runs, and none runs everything.
+    pub filters: Vec<String>,
     pub jobs: Option<u32>,
     pub steps: i64,
     pub timeout: u64,
@@ -863,7 +864,7 @@ fn iterate(
     }
 
     let hashes = loaded.hashes.clone();
-    let plan = Plan::new(&loaded, args.filter.as_deref(), args.std);
+    let plan = Plan::new(&loaded, &args.filters, args.std);
 
     if let Some(err) = crate::costs::broken_promises(&loaded) {
         return refuse(err.diagnostics, err.sources);
@@ -1861,14 +1862,16 @@ pub struct Plan {
 impl Plan {
     /// A run tests the package being loaded: a dependency's tests are its own to run, and a shipped
     /// module's are in scope only under `--std`, which `std_tests` is.
-    pub fn new(loaded: &Loaded, filter: Option<&str>, std_tests: bool) -> Plan {
+    pub fn new(loaded: &Loaded, filters: &[String], std_tests: bool) -> Plan {
         let check = &loaded.check;
         let root = loaded.root_package();
         let in_scope = |t: &ply_eval::TestInfo| {
             root.contains(&t.module) || (std_tests && crate::shelf::is_shipped(&t.module))
         };
         // Against `<module>.<label>`, so `--filter store.` narrows to a module.
-        let matches = |t: &ply_eval::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
+        let matches = |t: &ply_eval::TestInfo| {
+            filters.is_empty() || filters.iter().any(|n| t.key.as_str().contains(n.as_str()))
+        };
 
         let scoped = check.tests.iter().filter(|t| in_scope(t)).count();
         let out_of_scope: BTreeSet<usize> = check
@@ -2951,7 +2954,7 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
         json: bool_at("json")?,
         explain: bool_at("explain")?,
         no_cache: bool_at("no_cache")?,
-        filter: opt_str_at(v, "filter", span)?,
+        filters: str_list_at(v, "filters", span)?,
         jobs: opt_int_at(v, "jobs", span)?.map(|n| n as u32),
         steps: int_at("steps")?,
         timeout: int_at("timeout")? as u64,
@@ -3005,7 +3008,7 @@ impl Default for TestOptions {
             json: false,
             explain: false,
             no_cache: false,
-            filter: None,
+            filters: Vec::new(),
             jobs: None,
             steps: ply_eval::DEFAULT_STEP_BUDGET,
             timeout: 60_000,
