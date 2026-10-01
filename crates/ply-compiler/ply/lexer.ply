@@ -36,6 +36,8 @@ pub type Tok =
   | TFloat(Bytes)
   | TDec(Bytes, Int)
   | TStr(Bytes)
+  // A line string's lines, joined: a value like a `TStr`'s, which only an expression may be.
+  | TLines(Bytes)
   | TBytes(Bytes)
   | TKw(Bytes)
   | TPunct(Bytes)
@@ -148,7 +150,9 @@ fn token_at(src: Bytes, s: Scan, start: Int) -> Scan = {
   if is_digit(c) { number(src, s, start) }
   else if c == 98 && at(src, start + 1) == 34 { bytes_body(src, s, start, start + 2, b"") }
   else if is_ident_start(c) { ident(src, s, start) }
-  else if c == 34 { string_lit(src, s, start, start + 1, b"") } else if c >= 128 {
+  else if c == 34 { string_lit(src, s, start, start + 1, b"") }
+  else if c == 92 && at(src, start + 1) == 92 { line_string(src, s, start, start, []) }
+  else if c >= 128 {
     // With no Unicode table, any non-ASCII character outside a literal is refused as `X0001`.
     err(
       seek(s, start + utf8_len(c)),
@@ -699,6 +703,51 @@ fn string_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Sc
   }
 }
 
+// --- Line strings -----------------------------------------------------------
+
+// A `\r` before a line's `\n` ends the line rather than being content.
+fn line_string(src: Bytes, s: Scan, open: Int, line: Int, done: List<Bytes>) -> Scan = {
+  let from = line + 2;
+  let eol = scan_until(src, from, b"\n");
+  let fin = if eol > from && at(src, eol - 1) == 13 { eol - 1 } else { eol };
+  let blank = scan_back(src, from, fin);
+  let checked = if blank == fin { s } else {
+    err(
+      s,
+      blank,
+      fin,
+      unexpected(),
+      b"a line of a line string ends in whitespace",
+      b"whitespace at the end of a line is invisible, so it is not content; end the line before it, or write the line as a `\"...\"` string with the spaces in it",
+    )
+  };
+  let lines = push(done, bytes_slice(src, from, fin));
+  let next = continued_at(src, eol);
+  if next < 0 { emit(checked, open, fin, TLines(joined_lines(lines))) }
+  else { line_string(src, checked, open, next, lines) }
+}
+
+fn scan_back(src: Bytes, from: Int, fin: Int) -> Int =
+  iterate(fin, fin - from + 1, |i: Int|
+    if i > from && (at(src, i - 1) == 32 || at(src, i - 1) == 9) { Continue(i - 1) }
+    else { Stop(i) })
+
+// The `\\` continuing a line string on the line after `eol`, or -1.
+fn continued_at(src: Bytes, eol: Int) -> Int =
+  if at(src, eol) != 10 { -1 } else {
+    let k = scan(src, eol + 1, b" \t");
+    if at(src, k) == 92 && at(src, k + 1) == 92 { k } else { -1 }
+  }
+
+fn joined_lines(lines: List<Bytes>) -> Bytes =
+  bytes_concat_all(
+    fold(range(0, len(lines)), [], |acc: List<Bytes>, i: Int|
+      match list_at(lines, i) {
+        Some(l) -> if i == 0 { push(acc, l) } else { push(push(acc, b"\n"), l) },
+        None -> acc,
+      }),
+  )
+
 // --- Byte-string literals ---------------------------------------------------
 
 // A byte above `~` is refused rather than encoded, so the literal cannot depend on the file's encoding.
@@ -883,6 +932,7 @@ fn body(t: Tok) -> Bytes =
     TFloat(txt) -> bytes_concat(b"f:", txt),
     TDec(m, sc) -> bytes_concat_all([b"d:", m, b":", num(sc)]),
     TStr(b) -> bytes_concat(b"s:", hex(b)),
+    TLines(b) -> bytes_concat(b"l:", hex(b)),
     TBytes(b) -> bytes_concat(b"b:", hex(b)),
     TKw(b) -> bytes_concat(b"k:", b),
     TPunct(b) -> bytes_concat(b"p:", b),
@@ -941,6 +991,30 @@ test "an unterminated string reports from its opening quote" {
     "0:3:k:let;4:5:i:s;6:7:p:eq;8:13:s:6f6f7073;14:17:k:let;18:19:i:t;20:21:p:eq;22:23:n:1;23:23:e;8:13:!:E0002;",
   )
 }
+
+test "a line string runs from its backslashes to the end of the line, verbatim" {
+  // `a"\n` and two backslashes, as written: nothing in a line string is an escape.
+  assert_eq(dump(b"\\\\a\"\\n\\\\\nx"), "0:8:l:61225c6e5c5c;9:10:i:x;10:10:e;")
+}
+
+test "the lines of a line string join with a newline, and the last one ends the value" {
+  assert_eq(dump(b"\\\\one\n  \\\\two\n\t\\\\\n1"), "0:17:l:6f6e650a74776f0a;18:19:n:1;19:19:e;")
+}
+
+test "a line string ends at the first line that does not continue it" {
+  assert_eq(dump(b"\\\\one\n\n\\\\two"), "0:5:l:6f6e65;7:12:l:74776f;12:12:e;");
+  assert_eq(dump(b"\\\\one\n// two\n\\\\three"), "0:5:l:6f6e65;13:20:l:7468726565;20:20:e;")
+}
+
+test "a carriage return before a newline ends a line rather than being content" {
+  assert_eq(dump(b"\\\\a\r\n\\\\b\r\n"), "0:8:l:610a62;10:10:e;")
+}
+
+test "a line of a line string that ends in whitespace is refused where the whitespace starts" {
+  assert_eq(dump(b"\\\\a  \n\\\\b"), "0:9:l:6120200a62;9:9:e;3:5:!:E0001;")
+}
+
+test "one backslash is no token" { assert_eq(dump(b"\\a"), "1:2:i:a;2:2:e;0:1:!:E0001;") }
 
 test "a byte literal takes the string escapes plus hex" {
   assert_eq(dump(b"b\"GET \\r\\n\\x00\\xff\\\"\\\\\""), "0:23:b:474554200d0a00ff225c;23:23:e;")
