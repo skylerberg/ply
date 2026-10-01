@@ -66,9 +66,11 @@ CORPUS_ALONE=(serving database)
 # Placed a test at a time rather than a module at a time: a whole module on one partition would
 # outlast the partition's nextest shard.
 CORPUS_BY_TEST=(audit generated toolchain)
-# Corpus processes a partition runs side by side, each a lane of the cut: its checks go in one
-# `ply test`, which loads the checks package's closure once. Nextest takes the runner's other threads.
-CORPUS_LANES=2
+# Corpus processes a partition runs beside nextest, each a lane of the cut: its checks go in one
+# `ply test`, which loads the checks package's closure once. A lane is mostly that front end, 50-160 s
+# on a busy runner against a few seconds to a minute of checks, so one a partition: a second doubles
+# the front ends and takes a thread from nextest, which is the longer side.
+CORPUS_LANES=1
 # Packages whose own suites run as corpus entries too, as `id:path`: each failing test is named in
 # the log, where a Rust test wrapping the run would report one failure for all of them.
 PACKAGE_SUITES=(
