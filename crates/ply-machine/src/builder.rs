@@ -36,14 +36,6 @@ const OPERATIONS: [(&str, &str); 6] = [
 /// the program's own entry is live; the stack is a front end's, not a report's.
 const BUILD_STACK: usize = 256 << 20;
 
-/// What `ply build` is configured with, as plain data: the shell's parsed flags convert into
-/// this.
-#[derive(Clone, Debug, Default)]
-pub struct BuildOptions {
-    pub path: std::path::PathBuf,
-    pub diff: Option<std::path::PathBuf>,
-}
-
 /// The ops and the one handler serving them. Nothing is read before the program asks: `loaded`
 /// reads the front end it is handed, `previous` the artifact it names.
 pub fn lent() -> Vec<Lent> {

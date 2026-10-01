@@ -584,10 +584,6 @@ const FIRST_CHUNK: usize = 1 << 20;
 const BRANCH_CHUNK: usize = 16 << 10;
 const LARGEST_CHUNK: usize = 64 << 20;
 
-/// The byte offset of the bump pointer and of the chunk's end within a [`Heap`].
-pub const HEAP_CUR: usize = 0;
-pub const HEAP_END: usize = 8;
-
 impl Heap {
     pub fn new() -> Heap {
         Heap {

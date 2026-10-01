@@ -15,18 +15,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// One claim the program owes, as far as the runtime enters it: whose it is, where it is written,
-/// what a point assigns, the guards it is judged after, and which machine its propositions run on.
-/// Everything else about it is `proof.world`'s.
+/// the guards it is judged after, and which machine its propositions run on. Everything else about
+/// it is `proof.world`'s.
 #[derive(Clone, Debug)]
 pub struct Obligation {
     /// `<module>.<def>` for a clause, `<module>.<label>` for a law.
     pub owner: Symbol,
     pub kind: ObligationKind,
     pub span: Span,
-    /// What a point assigns: the owner's parameters for a clause, the `forall` binders for a law.
-    pub binders: Vec<Binder>,
-    /// A clause's `result`, which is the owner's answer and never drawn.
-    pub result: Option<Binder>,
+    /// Whether the clause binds `result`, the owner's answer, which a point never draws.
+    pub result: bool,
     /// Each guard's place: an owner's `requires` clauses, or a law's `where`.
     pub guards: Vec<Span>,
     pub strategy: Strategy,
@@ -41,13 +39,6 @@ pub enum ObligationKind {
     Law,
 }
 
-/// One binder of a claim: what a report calls it, and its type as the compiler prints it.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Binder {
-    pub name: Symbol,
-    pub text: String,
-}
-
 /// Which machine a claim's propositions run on, as `proof.world` decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strategy {
@@ -59,22 +50,6 @@ pub enum Strategy {
     Static,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub struct Binding {
-    pub name: Symbol,
-    /// The binder's type as the compiler prints it.
-    pub ty: String,
-    pub value: ply_eval::Plain,
-}
-
-/// Ply's own failure while judging a claim, as [`ply_eval::codes::is_defect`] tells it apart.
-#[derive(Clone, Debug)]
-pub struct Fault {
-    /// The point being judged when Ply failed, or none when it failed before a point was drawn.
-    pub bindings: Vec<Binding>,
-    pub diagnostic: Box<Diagnostic>,
-}
-
 /// The obligations a `proof.world.World` owes, in the order the program listed them, which is the
 /// order it names them by.
 pub fn obligations_of(world: At<'_>) -> Result<Vec<Obligation>, DecodeError> {
@@ -83,12 +58,6 @@ pub fn obligations_of(world: At<'_>) -> Result<Vec<Obligation>, DecodeError> {
 
 fn obligation_of(at: At<'_>) -> Result<Obligation, DecodeError> {
     let kind = at.field("kind")?.ctor()?;
-    let binder = |b: At<'_>| -> Result<Binder, DecodeError> {
-        Ok(Binder {
-            name: Symbol::new(b.field("name")?.str()?),
-            text: b.field("text")?.str()?.to_string(),
-        })
-    };
     let span = |s: At<'_>| -> Result<Span, DecodeError> {
         Ok(Span::new(
             SourceId(s.field("module")?.number()?),
@@ -107,11 +76,7 @@ fn obligation_of(at: At<'_>) -> Result<Obligation, DecodeError> {
             _ => return Err(kind.unknown()),
         },
         span: span(at.field("at")?)?,
-        binders: at.field("binders")?.items(binder)?,
-        result: match at.field("result")?.option()? {
-            Some(result) => Some(binder(result)?),
-            None => None,
-        },
+        result: at.field("result")?.option()?.is_some(),
         guards: at.field("guards")?.items(span)?,
         strategy: match strategy.name() {
             "Interleave" => Strategy::Interleave,
@@ -442,8 +407,8 @@ impl Prover {
             .claim(obligation)
             .ok_or_else(|| unclaimed(obligation))?;
         let call = match claim {
-            Claim::Ensures { .. } => Some(obligation.owner.clone()),
-            Claim::Law { .. } => None,
+            Claim::Ensures { .. } if obligation.result => Some(obligation.owner.clone()),
+            Claim::Ensures { .. } | Claim::Law { .. } => None,
         };
         Ok(Cases {
             machine: self.machine(obligation)?,
@@ -451,7 +416,6 @@ impl Prover {
             body_root: self.body_root(&claim),
             span: obligation.span,
             call,
-            result: obligation.result.as_ref().map(|b| b.name.clone()),
             step_budget,
             warnings: Vec::new(),
         })
@@ -464,28 +428,14 @@ pub struct Judgements {
     pub warnings: Vec<Diagnostic>,
 }
 
-/// Each binder beside the value it was given, as a report prints them.
-pub fn bindings(binders: &[Binder], values: &[Value]) -> Vec<Binding> {
-    binders
-        .iter()
-        .zip(values)
-        .map(|(binder, value)| Binding {
-            name: binder.name.clone(),
-            ty: binder.text.clone(),
-            value: ply_eval::Plain::shown(value),
-        })
-        .collect()
-}
-
 /// How a tuple of binder values is judged: guard first, always.
 struct Cases<'a> {
     machine: Machine<'a>,
     guard_roots: Vec<Symbol>,
     body_root: Symbol,
     span: Span,
-    /// The definition an `ensures` is attached to, called to produce `result`.
+    /// The definition an `ensures` that binds `result` is attached to, called to produce it.
     call: Option<Symbol>,
-    result: Option<Symbol>,
     step_budget: i64,
     /// What every entry so far ended with.
     warnings: Vec<Diagnostic>,
@@ -546,7 +496,7 @@ impl Cases<'_> {
     fn body(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         // A law's binders, or an owner's parameters then `result`: the order `source.rs` expects.
         let mut args = values.to_vec();
-        if let (Some(name), Some(_)) = (self.call.clone(), &self.result) {
+        if let Some(name) = self.call.clone() {
             args.push(self.enter(&name, values.to_vec())?);
         }
         let root = self.body_root.clone();

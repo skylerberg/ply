@@ -1,5 +1,5 @@
 use crate::fixture::Compiled;
-use ply_eval::arena::{Arena, Owner, Reclaim, RegionKind, Slot, Stats};
+use ply_eval::arena::{Arena, Owner, Reclaim, RegionKind, Slot};
 use ply_eval::{Diagnostic, Span, Value, codes};
 
 #[track_caller]
@@ -10,19 +10,10 @@ fn refused(src: &str) -> Vec<Diagnostic> {
     }
 }
 
-impl Compiled {
-    /// The machine's answer and the arena it left behind.
-    #[track_caller]
-    fn run_call(&self, name: &str) -> (Result<Value, Diagnostic>, Stats) {
-        let mut machine = self.machine();
-        let (answer, _) = machine.call(name, Vec::new(), Span::DUMMY).into_parts();
-        (answer, machine.cells().stats())
-    }
-}
-
 #[track_caller]
-fn answers(compiled: &Compiled, name: &str, want: i64) -> Stats {
-    let (answer, stats) = compiled.run_call(name);
+fn answers(compiled: &Compiled, name: &str, want: i64) {
+    let mut machine = compiled.machine();
+    let (answer, _) = machine.call(name, Vec::new(), Span::DUMMY).into_parts();
     match answer {
         Ok(Value::Int(got)) => assert_eq!(
             got, want,
@@ -32,7 +23,6 @@ fn answers(compiled: &Compiled, name: &str, want: i64) -> Stats {
         Ok(other) => panic!("`{name}` answered {other:?}"),
         Err(d) => panic!("`{name}` failed: {d:#?}"),
     }
-    stats
 }
 
 fn codes_of(diags: &[Diagnostic]) -> Vec<&str> {
