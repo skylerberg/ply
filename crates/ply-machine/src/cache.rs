@@ -46,9 +46,6 @@ use std::sync::Arc;
 /// performs the four reports, and every load performs `known` and `file`.
 const EFFECT: &str = "store";
 
-/// The module the payload's constructors are declared in, as a program-wide name.
-const PAYLOAD: &str = "cache";
-
 /// One registration per operation: the operation the program performs names what was done.
 const OPERATIONS: [(&str, &str); 6] = [
     ("statistics", "ply_machine::cache::statistics"),
@@ -61,9 +58,12 @@ const OPERATIONS: [(&str, &str); 6] = [
 
 /// The ops and the one handler serving them: the action runs where the program asks for it, with
 /// the path it names. A handler is handed `&self`, and a store that compacts, clears or files is
-/// worked with `&mut`.
-pub fn lent() -> Vec<Lent> {
-    let done: Arc<dyn HostHandler> = Arc::new(Did);
+/// worked with `&mut`. `module` is where the program lent them declares `store`, which is where the
+/// payload's constructors are declared too.
+pub fn lent(module: &str) -> Vec<Lent> {
+    let done: Arc<dyn HostHandler> = Arc::new(Did {
+        module: module.to_string(),
+    });
     OPERATIONS
         .into_iter()
         .map(|(op, path)| (registration(op, path), Arc::clone(&done)))
@@ -86,7 +86,9 @@ fn registration(op: &str, path: &'static str) -> HostOp {
 }
 
 /// The one handler: the action runs where the program asks for it.
-struct Did;
+struct Did {
+    module: String,
+}
 
 impl HostHandler for Did {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
@@ -110,7 +112,7 @@ impl HostHandler for Did {
                     path: path(p)?,
                     json: false,
                 }),
-                matches_value,
+                |m| matches_value(m, &self.module),
             ),
             ("compacted", [p]) => answered(
                 &compacted(&CacheScope {
@@ -844,26 +846,26 @@ fn test_entry(test: &FoundTest, store: &Store, unread: &mut Option<String>) -> E
     }
 }
 
-fn matches_value(m: &Matches) -> PlyValue {
+fn matches_value(m: &Matches, module: &str) -> PlyValue {
     record(vec![
         ("directory", PlyValue::str(&m.directory)),
         ("warnings", diags_value(&m.warnings)),
         (
             "entries",
-            PlyValue::list(m.entries.iter().map(entry_value).collect()),
+            PlyValue::list(m.entries.iter().map(|e| entry_value(e, module)).collect()),
         ),
     ])
 }
 
-fn entry_value(e: &Entry) -> PlyValue {
+fn entry_value(e: &Entry, module: &str) -> PlyValue {
     record(vec![
         ("name", PlyValue::str(&e.name)),
-        ("kind", kind_value(&e.kind)),
+        ("kind", kind_value(&e.kind, module)),
         ("hash", PlyValue::str(&e.hash)),
         ("file", PlyValue::str(&e.file)),
         ("location", option(e.location.as_deref().map(PlyValue::str))),
         ("stale", PlyValue::Bool(e.stale)),
-        ("filed", filed_value(&e.filed)),
+        ("filed", filed_value(&e.filed, module)),
         (
             "body",
             option(e.body.map(|(encoding, bytes)| {
@@ -873,32 +875,35 @@ fn entry_value(e: &Entry) -> PlyValue {
                 ])
             })),
         ),
-        ("outcome", option(e.outcome.as_ref().map(outcome_value))),
+        (
+            "outcome",
+            option(e.outcome.as_ref().map(|o| outcome_value(o, module))),
+        ),
     ])
 }
 
-fn kind_value(kind: &Kind) -> PlyValue {
+fn kind_value(kind: &Kind, module: &str) -> PlyValue {
     match kind {
-        Kind::Def(DefKind::Fn) => ctor(PAYLOAD, "AFn", Vec::new()),
-        Kind::Def(DefKind::Type) => ctor(PAYLOAD, "AType", Vec::new()),
-        Kind::Def(DefKind::Effect) => ctor(PAYLOAD, "AnEffect", Vec::new()),
-        Kind::Test(nondet) => ctor(PAYLOAD, "ATest", vec![PlyValue::Bool(*nondet)]),
+        Kind::Def(DefKind::Fn) => ctor(module, "AFn", Vec::new()),
+        Kind::Def(DefKind::Type) => ctor(module, "AType", Vec::new()),
+        Kind::Def(DefKind::Effect) => ctor(module, "AnEffect", Vec::new()),
+        Kind::Test(nondet) => ctor(module, "ATest", vec![PlyValue::Bool(*nondet)]),
     }
 }
 
-fn filed_value(filed: &Filed) -> PlyValue {
+fn filed_value(filed: &Filed, module: &str) -> PlyValue {
     match filed {
-        Filed::Definition(value) => ctor(PAYLOAD, "FiledDefinition", vec![value.clone()]),
-        Filed::Declaration(value) => ctor(PAYLOAD, "FiledDeclaration", vec![value.clone()]),
-        Filed::Test(value) => ctor(PAYLOAD, "FiledTestRow", vec![value.clone()]),
-        Filed::Unfiled => ctor(PAYLOAD, "Unfiled", Vec::new()),
+        Filed::Definition(value) => ctor(module, "FiledDefinition", vec![value.clone()]),
+        Filed::Declaration(value) => ctor(module, "FiledDeclaration", vec![value.clone()]),
+        Filed::Test(value) => ctor(module, "FiledTestRow", vec![value.clone()]),
+        Filed::Unfiled => ctor(module, "Unfiled", Vec::new()),
     }
 }
 
-fn outcome_value(outcome: &Outcome) -> PlyValue {
+fn outcome_value(outcome: &Outcome, module: &str) -> PlyValue {
     match outcome {
-        Outcome::Pass => ctor(PAYLOAD, "Passed", Vec::new()),
-        Outcome::Fail { message, .. } => ctor(PAYLOAD, "Failed", vec![PlyValue::str(message)]),
+        Outcome::Pass => ctor(module, "Passed", Vec::new()),
+        Outcome::Fail { message, .. } => ctor(module, "Failed", vec![PlyValue::str(message)]),
     }
 }
 
@@ -925,7 +930,7 @@ fn locate(store: &Store, path: &Path, span: FileSpan) -> (Option<String>, bool) 
 // --- Small things -------------------------------------------------------------
 
 /// `Ok(v)` or `Err(Refusal)`, as the program reads the operation's answer.
-fn answered<T>(answer: &Result<T, Refused>, value: fn(&T) -> PlyValue) -> PlyValue {
+fn answered<T>(answer: &Result<T, Refused>, value: impl Fn(&T) -> PlyValue) -> PlyValue {
     match answer {
         Ok(done) => PlyValue::ctor("Ok", vec![value(done)]),
         Err(why) => PlyValue::ctor("Err", vec![refusal_value(why)]),
