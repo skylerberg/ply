@@ -72,18 +72,7 @@ pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
             "ExhaustiveInterleaving",
         ],
     ),
-    (
-        "proof.obligation",
-        "Gap",
-        &[
-            "UnhandledEffect",
-            "Ungeneratable",
-            "Raised",
-            "GuardNotSampled",
-            "ReachesHost",
-            "NotDrawn",
-        ],
-    ),
+    ("proof.obligation", "Gap", &["Raised"]),
     (
         "proof.obligation",
         "Tier",
@@ -1274,48 +1263,20 @@ fn evidence_value(evidence: &Evidence) -> PlyValue {
 }
 
 fn gap_value(gap: &Gap) -> PlyValue {
-    match gap {
-        Gap::UnhandledEffect(row) => case(
-            "Gap",
-            "UnhandledEffect",
-            vec![option(row.as_deref().map(PlyValue::str))],
-        ),
-        Gap::Ungeneratable { param, ty } => case(
-            "Gap",
-            "Ungeneratable",
-            vec![record(vec![
-                ("param", PlyValue::str(param.as_str())),
-                ("ty", PlyValue::str(ty)),
-            ])],
-        ),
-        Gap::Raised {
-            bindings,
-            diagnostic,
-            ..
-        } => case(
-            "Gap",
-            "Raised",
-            vec![record(vec![
-                ("message", PlyValue::str(&diagnostic.message)),
-                ("values", shown_values(diagnostic)),
-                ("bindings", bindings_value(bindings)),
-            ])],
-        ),
-        Gap::GuardNotSampled { generated, witness } => case(
-            "Gap",
-            "GuardNotSampled",
-            vec![record(vec![
-                ("generated", tally(u64::from(*generated))),
-                ("witness", bindings_value(witness)),
-            ])],
-        ),
-        Gap::ReachesHost(row) => case(
-            "Gap",
-            "ReachesHost",
-            vec![PlyValue::str(row.as_deref().unwrap_or("{}"))],
-        ),
-        Gap::NotDrawn => case("Gap", "NotDrawn", Vec::new()),
-    }
+    let Gap::Raised {
+        bindings,
+        diagnostic,
+        ..
+    } = gap;
+    case(
+        "Gap",
+        "Raised",
+        vec![record(vec![
+            ("message", PlyValue::str(&diagnostic.message)),
+            ("values", shown_values(diagnostic)),
+            ("bindings", bindings_value(bindings)),
+        ])],
+    )
 }
 
 fn fault_value(fault: &Fault) -> PlyValue {

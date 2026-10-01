@@ -147,16 +147,9 @@ pub struct Vacuity {
     pub kind: VacuityKind,
 }
 
+/// What an interleaving search could not establish; every other gap is the program's to find.
 #[derive(Clone, Debug)]
 pub enum Gap {
-    /// Checking an `ensures` calls the definition, whose row needs an unsupplied handler: the row as
-    /// a report prints it, or `None` when it names nothing to hold a handler for.
-    UnhandledEffect(Option<String>),
-    Ungeneratable {
-        param: Symbol,
-        /// As the compiler prints it.
-        ty: String,
-    },
     /// The program's own raise; a diagnostic that is Ply's failure is a [`Discharge::Faulted`].
     Raised {
         bindings: Vec<Binding>,
@@ -166,16 +159,6 @@ pub enum Gap {
         root: u64,
         case: u32,
     },
-    /// The guard kept no case of a full budget, yet admits `witness`.
-    GuardNotSampled {
-        generated: u32,
-        witness: Vec<Binding>,
-    },
-    /// A `law/host` under a hermetic run, with its row as a report prints it.
-    ReachesHost(Option<String>),
-    /// The obligation's points are not drawn one at a time, so there is no case to re-run: a
-    /// concurrency law's points are interleavings that the search chooses.
-    NotDrawn,
 }
 
 /// Ply's own failure while discharging a claim, as [`ply_eval::codes::is_defect`] tells it apart.
