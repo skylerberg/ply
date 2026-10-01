@@ -28,8 +28,8 @@ from_parent() {
   count=$(printf '%s' "$moved" | jq '.files | length')
   [ "$count" -gt 0 ] && [ "$count" -lt 300 ] || return 1
   moved=$(printf '%s' "$moved" | jq -r '.files[].filename')
-  # Paths that cannot reach the build. Not ci.yml (it defines the build) nor benches/ (it holds a
-  # workspace member).
+  # Paths that cannot reach the build. Not ci.yml (it defines the build) nor benches/ (tests read
+  # its kernel and the figures it holds).
   if printf '%s\n' "$moved" | grep -qvE '\.md$|^docs/|^\.github/([a-z-]+\.sh$|actions/suite/|workflows/(bless|profile|run)\.yml$)'; then
     return 1
   fi

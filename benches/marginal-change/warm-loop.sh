@@ -2,7 +2,7 @@
 # What one edit costs *inside a warm process*, across project sizes and across the one property
 # that turns out to decide it: whether the project has tests that must run on every invocation.
 #
-#   ./benches/marginal-change/warm-loop.sh            # writes observation-warm.txt
+#   ./benches/marginal-change/warm-loop.sh            # prints the table
 #
 # Refuses a stale binary (exit 2) and waits for the load gate, refusing if it never comes (exit 3).
 set -euo pipefail
@@ -72,18 +72,14 @@ PY
   rm -f "$out"
 }
 
-obs="$here/observation-warm.txt"
-{
-  echo "==> load before: $(uptime)"
-  echo
-  echo "One edit inside a warm process. Each row is the front end an iteration paid, over"
-  echo "$edits edits, best to worst."
-  echo
-  echo "deterministic tests only — nothing runs unless the edit reached it:"
-  for m in 10 40 160; do one "$work/det_$m" "$(( m * 25 )) definitions"; done
-  echo
-  echo "the generator's default fraction of nondeterministic tests, which run every time:"
-  for m in 10 40 160; do one "$work/nondet_$m" "$(( m * 25 )) definitions"; done
-  echo
-  echo "==> load after: $(uptime)"
-} | tee "$obs"
+echo
+echo "One edit inside a warm process. Each row is the front end an iteration paid, over"
+echo "$edits edits, best to worst."
+echo
+echo "deterministic tests only — nothing runs unless the edit reached it:"
+for m in 10 40 160; do one "$work/det_$m" "$(( m * 25 )) definitions"; done
+echo
+echo "the generator's default fraction of nondeterministic tests, which run every time:"
+for m in 10 40 160; do one "$work/nondet_$m" "$(( m * 25 )) definitions"; done
+echo
+echo "==> load after: $(uptime)"
