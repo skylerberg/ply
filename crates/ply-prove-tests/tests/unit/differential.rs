@@ -76,7 +76,7 @@ impl OnTier {
     fn truth(&self, root: &Symbol, values: &[Value]) -> Result<bool, Diagnostic> {
         match self.tier.enter_whole(root, values, DEFAULT_MAX_CALLS) {
             Entered::Answered(Value::Bool(b)) => Ok(b),
-            Entered::Answered(other) => panic!("`{root}` came to `{other}`"),
+            Entered::Answered(other) => panic!("`{root}` came to `{other:?}`"),
             Entered::Raised(d) => Err(d),
             Entered::Declined => panic!("the tier declined `{root}`"),
         }
@@ -152,7 +152,7 @@ fn contradictions(a: &Audited) -> (Vec<String>, Vec<String>) {
         let rendered = |bindings: &[ply_prove::Binding]| {
             bindings
                 .iter()
-                .map(|b| format!("{} = {}", b.name, b.rendered))
+                .map(|b| format!("{} = {:?}", b.name, b.value))
                 .collect::<Vec<_>>()
                 .join(", ")
         };

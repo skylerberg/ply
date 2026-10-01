@@ -1,0 +1,330 @@
+// std.value — a value of any type as data, and `render`, the one way a value is shown.
+
+// What `machine.call` crosses, what a runtime diagnostic carries, and what the prover draws.
+pub type Value =
+  | VUnit
+  | VBool(Bool)
+  | VInt(Int)
+  | VFloat(Float)
+  | VDecimal(Decimal)
+  // The width's name and the pattern it reads, with nothing above the width: `-1i8` is `0xFFu128`.
+  | VFixed(String, U128)
+  | VStr(String)
+  | VBytes(Bytes)
+  | VList(List<Value>)
+  // Sorted by name, as a record's fields are.
+  | VRecord(List<Field>)
+  | VCtor(String, List<Value>)
+  // In key order.
+  | VMap(List<Entry>)
+  | VFn(Fun)
+  | VCell({ index: Int, generation: Int })
+  | VTask(Int)
+  // A credential, whose payload never leaves the runtime.
+  | VSecret
+  // What a diagnostic's snapshot left out: that many more items of a list or map, or with 0,
+  // everything nested deeper.
+  | VElided(Int)
+
+pub type Field = { name: String, value: Value }
+
+pub type Entry = { key: Value, value: Value }
+
+// A function as data. Only a generated one (constant, projection, table) can be called.
+pub type Fun =
+  | FNamed(String)
+  | FAnonymous
+  | FConst({ arity: Int, value: Value })
+  | FProject({ arity: Int, index: Int })
+  // The first entry whose key equals the first argument, else `default`.
+  | FTable({ arity: Int, entries: List<Entry>, default: Value })
+
+// A list or a map shows this many items before the rest is counted.
+pub fn shown_items() -> Int = 32
+
+// Nesting past this shows as `…`.
+pub fn shown_depth() -> Int = 16
+
+pub fn render(v: Value) -> String = rendered(v, 0)
+
+fn rendered(v: Value, depth: Int) -> String =
+  if depth > shown_depth() { "…" } else {
+    match v {
+      VUnit -> "()",
+      VBool(b) -> if b { "true" } else { "false" },
+      VInt(n) -> int_to_string(n),
+      VFloat(f) -> float_to_string(f),
+      VDecimal(d) -> decimal_to_string(d),
+      VFixed(ty, bits) -> fixed_text(ty, bits),
+      VStr(s) -> "\"" ++ escaped(s) ++ "\"",
+      VBytes(b) -> bytes_text(b),
+      VList(items) -> "[" ++ items_text(map(items, |x: Value| rendered(x, depth + 1))) ++ "]",
+      VRecord(fields) -> record_text(fields, depth),
+      VCtor(name, args) -> if len(args) == 0 { name }
+      else { name ++ "(" ++ joined(map(args, |x: Value| rendered(x, depth + 1)), ", ") ++ ")" },
+      VMap(entries) -> "{" ++ items_text(map(entries, |e: Entry| entry_text(e, depth))) ++ "}",
+      VFn(f) -> "<fn" ++ fun_text(f) ++ ">",
+      VCell(c) -> "<cell @" ++ int_to_string(c.index) ++ "." ++ int_to_string(c.generation) ++ ">",
+      VTask(id) -> "<task @" ++ int_to_string(id) ++ ">",
+      VSecret -> "Secret(****)",
+      VElided(n) -> elided(n),
+    }
+  }
+
+fn elided(n: Int) -> String = if n == 0 { "…" } else { "… " ++ int_to_string(n) ++ " more" }
+
+fn entry_text(e: Entry, depth: Int) -> String =
+  match e.key {
+    VElided(n) -> elided(n),
+    k -> rendered(k, depth + 1) ++ ": " ++ rendered(e.value, depth + 1),
+  }
+
+// Past `shown_items`, the rest is counted; a snapshot already cut short says so itself.
+fn items_text(parts: List<String>) -> String =
+  if len(parts) <= shown_items() { joined(parts, ", ") }
+  else { joined(push(take(parts, shown_items()), elided(len(parts) - shown_items())), ", ") }
+
+fn take(xs: List<String>, n: Int) -> List<String> =
+  map(range(0, n), |i: Int| match list_at(xs, i) { Some(x) -> x, None -> "" })
+
+fn joined(parts: List<String>, sep: String) -> String =
+  fold(range(0, len(parts)), "", |acc: String, i: Int|
+    match list_at(parts, i) { Some(p) -> if i == 0 { p } else { acc ++ sep ++ p }, None -> acc })
+
+// A tuple is the record `{_0: a, _1: b}` and shows as one.
+fn record_text(fields: List<Field>, depth: Int) -> String =
+  if is_tuple(fields) {
+    "(" ++ joined(map(range(0, len(fields)), |i: Int| tuple_item(fields, i, depth)), ", ") ++ ")"
+  } else {
+    "{" ++ joined(map(fields, |f: Field| f.name ++ ": " ++ rendered(f.value, depth + 1)), ", ")
+      ++ "}"
+  }
+
+fn is_tuple(fields: List<Field>) -> Bool =
+  len(fields) >= 2
+    && fold(range(0, len(fields)), true, |acc: Bool, i: Int|
+      acc && field_named(fields, "_" ++ int_to_string(i)) != None)
+
+fn field_named(fields: List<Field>, name: String) -> Option<Value> =
+  fold(fields, None, |acc: Option<Value>, f: Field|
+    if f.name == name { Some(f.value) } else { acc })
+
+fn tuple_item(fields: List<Field>, i: Int, depth: Int) -> String =
+  match field_named(fields, "_" ++ int_to_string(i)) {
+    Some(v) -> rendered(v, depth + 1),
+    None -> "",
+  }
+
+// A generated function shows as the lambda it behaves as.
+fn fun_text(f: Fun) -> String =
+  match f {
+    FNamed(name) -> " " ++ name,
+    FAnonymous -> "",
+    FConst(c) ->
+      " |" ++ joined(map(range(0, c.arity), |_: Int| "_"), ", ") ++ "| " ++ render(c.value),
+    FProject(p) -> " |" ++ params(p.arity) ++ "| x" ++ int_to_string(p.index),
+    FTable(t) -> " |" ++ params(t.arity) ++ "| " ++ table_text(t.entries, t.default),
+  }
+
+fn params(arity: Int) -> String =
+  joined(map(range(0, arity), |i: Int| "x" ++ int_to_string(i)), ", ")
+
+fn table_text(entries: List<Entry>, default: Value) -> String =
+  fold(range(0, len(entries)), render(default), |acc: String, j: Int|
+    match list_at(entries, len(entries) - 1 - j) {
+      Some(e) ->
+        "if x0 == " ++ render(e.key) ++ " { " ++ render(e.value) ++ " } else { " ++ acc ++ " }",
+      None -> acc,
+    })
+
+// --- Slots ------------------------------------------------------------------
+
+// A runtime diagnostic's text stands `values[i]` in as `\x01`, `i` in decimal, `\x02`.
+fn opener() -> String = string_of_bytes(b"\x01")
+
+fn closer() -> String = string_of_bytes(b"\x02")
+
+// `text` with each slot replaced by its value, rendered.
+pub fn filled(text: String, values: List<Value>) -> String =
+  match string_split(text, opener()) {
+    [head, ..pieces] ->
+      fold(pieces, head, |acc: String, piece: String| acc ++ slot_piece(piece, values)),
+    [] -> text,
+  }
+
+// A slot naming no value is kept as it came.
+fn slot_piece(piece: String, values: List<Value>) -> String =
+  match string_split(piece, closer()) {
+    [index, ..rest] -> match slot_value(index, values) {
+      Some(v) -> render(v) ++ joined(rest, closer()),
+      None -> opener() ++ piece,
+    },
+    [] -> opener() ++ piece,
+  }
+
+fn slot_value(index: String, values: List<Value>) -> Option<Value> = {
+  let digits = bytes_of_string(index);
+  if bytes_len(digits) == 0 || bytes_len(digits) > 9
+      || !fold(range(0, bytes_len(digits)), true, |ok: Bool, i: Int|
+        ok && bytes_at(digits, i) >= 48 && bytes_at(digits, i) <= 57) { None } else {
+    list_at(
+      values,
+      fold(range(0, bytes_len(digits)), 0, |n: Int, i: Int| n * 10 + bytes_at(digits, i) - 48),
+    )
+  }
+}
+
+// --- Fixed widths -----------------------------------------------------------
+
+fn width_of(ty: String) -> Int =
+  if ty == "U8" || ty == "I8" { 8 }
+  else if ty == "U16" || ty == "I16" { 16 }
+  else if ty == "U32" || ty == "I32" { 32 }
+  else if ty == "U64" || ty == "I64" { 64 }
+  else { 128 }
+
+fn mask(width: Int) -> U128 = if width == 128 { ~0u128 } else { wrap_sub(1u128 << width, 1u128) }
+
+fn fixed_text(ty: String, bits: U128) -> String = {
+  let width = width_of(ty);
+  let pattern = bits & mask(width);
+  let negative = string_starts_with(ty, "I") && pattern >> width - 1 == 1u128;
+  if negative { "-" ++ u128_to_string(wrap_sub(0u128, pattern) & mask(width)) }
+  else { u128_to_string(pattern) }
+}
+
+// --- Text -------------------------------------------------------------------
+
+fn escaped(s: String) -> String =
+  string_of_bytes(
+    escape_each(bytes_of_string(s), |c: Int|
+      if c == 10 { Some(b"\\n") }
+      else if c == 9 { Some(b"\\t") }
+      else if c == 13 { Some(b"\\r") }
+      else if c == 0 { Some(b"\\0") }
+      else if c == 92 { Some(b"\\\\") }
+      else if c == 34 { Some(b"\\\"") }
+      else { None }),
+  )
+
+// Only ASCII is replaced, so UTF-8 stays whole.
+fn escape_each(b: Bytes, swap: (Int) -> Option<Bytes>) -> Bytes =
+  bytes_concat_all(
+    map(range(0, bytes_len(b)), |i: Int|
+      match swap(bytes_at(b, i)) { Some(r) -> r, None -> bytes_slice(b, i, i + 1) }),
+  )
+
+fn bytes_text(b: Bytes) -> String = {
+  let n = bytes_len(b);
+  let head = if n > shown_items() { bytes_slice(b, 0, shown_items()) } else { b };
+  let body = escape_each(head, |c: Int|
+    if c == 10 { Some(b"\\n") }
+    else if c == 9 { Some(b"\\t") }
+    else if c == 13 { Some(b"\\r") }
+    else if c == 92 { Some(b"\\\\") }
+    else if c == 34 { Some(b"\\\"") }
+    else if c >= 32 && c <= 126 { None }
+    else { Some(bytes_concat(b"\\x", hex2(c))) });
+  let more = if n > shown_items() { " " ++ elided(n - shown_items()) } else { "" };
+  "b\"" ++ string_of_bytes(body) ++ "\"" ++ more
+}
+
+fn hex2(c: Int) -> Bytes = bytes_concat(hex_digit(c / 16), hex_digit(c % 16))
+
+fn hex_digit(d: Int) -> Bytes = bytes_slice(b"0123456789abcdef", d, d + 1)
+
+// --- Tests ------------------------------------------------------------------
+
+test "scalars show as their literals do, without a width suffix" {
+  assert_eq(render(VInt(-3)), "-3");
+  assert_eq(render(VBool(true)), "true");
+  assert_eq(render(VUnit), "()");
+  assert_eq(render(VFloat(1.5)), "1.5");
+  assert_eq(render(VDecimal(1.50m)), "1.50");
+  assert_eq(render(VFixed("U8", 255u128)), "255");
+  assert_eq(render(VFixed("I8", 255u128)), "-1");
+  assert_eq(
+    render(VFixed("I128", 170141183460469231731687303715884105728u128)),
+    "-170141183460469231731687303715884105728",
+  );
+  assert_eq(
+    render(VFixed("U128", 340282366920938463463374607431768211455u128)),
+    "340282366920938463463374607431768211455",
+  )
+}
+
+test "text is quoted and escaped, and bytes past the first 32 are counted" {
+  assert_eq(render(VStr("a\"b\n")), "\"a\\\"b\\n\"");
+  assert_eq(render(VStr("é")), "\"é\"");
+  assert_eq(render(VBytes(b"GET \x00\xff")), "b\"GET \\x00\\xff\"");
+  assert_eq(
+    render(VBytes(bytes_concat_all(map(range(0, 40), |_: Int| b"a")))),
+    "b\"" ++ string_of_bytes(bytes_concat_all(map(range(0, 32), |_: Int| b"a"))) ++ "\" … 8 more",
+  )
+}
+
+test "containers nest, a tuple shows as one, and a list past 32 items is counted" {
+  assert_eq(render(VList([VInt(1), VInt(2)])), "[1, 2]");
+  assert_eq(
+    render(VRecord([{ name: "a", value: VInt(1) }, { name: "b", value: VStr("x") }])),
+    "{a: 1, b: \"x\"}",
+  );
+  assert_eq(
+    render(VRecord([{ name: "_0", value: VInt(1) }, { name: "_1", value: VBool(false) }])),
+    "(1, false)",
+  );
+  assert_eq(render(VCtor("Some", [VInt(3)])), "Some(3)");
+  assert_eq(render(VCtor("None", [])), "None");
+  assert_eq(render(VMap([{ key: VStr("k"), value: VInt(1) }])), "{\"k\": 1}");
+  assert_eq(
+    render(VList(map(range(0, 34), |i: Int| VInt(i)))),
+    "[" ++ joined(map(range(0, 32), |i: Int| int_to_string(i)), ", ") ++ ", … 2 more]",
+  )
+}
+
+test "a snapshot cut short shows where it was cut" {
+  assert_eq(render(VList([VInt(1), VElided(5)])), "[1, … 5 more]");
+  assert_eq(
+    render(VMap([{ key: VInt(1), value: VInt(2) }, { key: VElided(3), value: VElided(3) }])),
+    "{1: 2, … 3 more}",
+  );
+  assert_eq(render(VCtor("Some", [VElided(0)])), "Some(…)")
+}
+
+test "nesting past the shown depth is elided" {
+  let deep = fold(range(0, 20), VInt(0), |acc: Value, _: Int| VList([acc]));
+  assert(string_contains(render(deep), "[…]"));
+  assert(!string_contains(render(deep), "0"))
+}
+
+test "a slot is filled with its value, and a slot naming none is kept" {
+  let slot = |i: Int| opener() ++ int_to_string(i) ++ closer();
+  assert_eq(
+    filled("expected " ++ slot(0) ++ ", found " ++ slot(1), [VInt(1), VStr("a")]),
+    "expected 1, found \"a\"",
+  );
+  assert_eq(filled("no slots", []), "no slots");
+  assert_eq(filled("at " ++ slot(3), [VInt(1)]), "at " ++ slot(3))
+}
+
+test "a function shows as what it is" {
+  assert_eq(render(VFn(FNamed("m.double"))), "<fn m.double>");
+  assert_eq(render(VFn(FAnonymous)), "<fn>");
+  assert_eq(render(VFn(FConst({ arity: 2, value: VInt(3) }))), "<fn |_, _| 3>");
+  assert_eq(render(VFn(FProject({ arity: 2, index: 1 }))), "<fn |x0, x1| x1>");
+  assert_eq(
+    render(
+      VFn(
+        FTable({
+          arity: 1,
+          entries: [{ key: VInt(1), value: VBool(true) }],
+          default: VBool(false),
+        }),
+      ),
+    ),
+    "<fn |x0| if x0 == 1 { true } else { false }>",
+  );
+  assert_eq(render(VSecret), "Secret(****)");
+  assert_eq(render(VCell({ index: 3, generation: 1 })), "<cell @3.1>");
+  assert_eq(render(VTask(7)), "<task @7>")
+}

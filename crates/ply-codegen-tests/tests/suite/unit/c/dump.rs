@@ -17,7 +17,7 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
 /// `value` with one field put in place of what it held.
 fn with(value: &Value, name: &str, field: Value) -> Value {
     let Value::Record(fields) = value else {
-        panic!("not a record: {}", value.render());
+        panic!("not a record: {value:?}");
     };
     let mut out: Vec<(Symbol, Value)> =
         fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -31,7 +31,7 @@ fn with(value: &Value, name: &str, field: Value) -> Value {
 
 fn field<'v>(value: &'v Value, name: &str) -> &'v Value {
     let Value::Record(fields) = value else {
-        panic!("not a record: {}", value.render());
+        panic!("not a record: {value:?}");
     };
     fields
         .named(name)
@@ -40,7 +40,7 @@ fn field<'v>(value: &'v Value, name: &str) -> &'v Value {
 
 fn first(list: &Value) -> Value {
     let Value::List(items) = list else {
-        panic!("not a list: {}", list.render());
+        panic!("not a list: {list:?}");
     };
     items.iter().next().expect("a first item").clone()
 }
@@ -494,7 +494,7 @@ fn an_error_is_the_whole_answer_with_its_labels_notes_and_fixes() {
         ]
     );
     assert_eq!(
-        failed.fixes,
+        failed.fixes.to_vec(),
         vec![Fix {
             title: "add the annotation".to_string(),
             edits: vec![
