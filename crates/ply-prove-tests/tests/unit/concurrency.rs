@@ -6,8 +6,8 @@ use ply_eval::{
 };
 use ply_prove::concurrency::{BodyRun, LawSearch, Searched, ValueDomain, discharge};
 use ply_prove::{
-    Binder, Binding, Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, Points,
-    Rule, Sort, Strategy, Tier, Vacuity, VacuityKind, interleaving_proves,
+    Binder, Binding, Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, Rule, Sort,
+    Strategy, Tier, Vacuity, VacuityKind, interleaving_proves,
 };
 
 fn body_was_false(span: Span) -> Diagnostic {
@@ -137,7 +137,7 @@ fn law(binders: usize) -> Obligation {
         result: None,
         variables: Vec::new(),
         footprint: Some("{sim.read}".to_string()),
-        strategy: Strategy::Interleave(Points::Drawn),
+        strategy: Strategy::Interleave,
         guards: Vec::new(),
     }
 }

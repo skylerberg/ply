@@ -5,16 +5,12 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod concurrency;
-pub mod domain;
-pub mod property;
-pub mod shrink;
 pub mod sort;
 pub mod world;
 
 pub use sort::Sort;
 pub use world::World;
 
-use domain::Finite;
 use ply_eval::{DefHash, Diagnostic, Plan, Race, Seed, Span, Symbol};
 use serde::Serialize;
 use std::fmt;
@@ -22,9 +18,6 @@ use std::time::Duration;
 
 /// Kept cases below which a run has concrete evidence and no coverage claim.
 pub const MIN_PROPERTY_CASES: u32 = 25;
-
-/// Past this depth only non-recursive constructors are drawn, so generation terminates.
-pub const GEN_DEPTH: u32 = 4;
 
 pub const DEFAULT_CASES: u32 = 200;
 pub const DEFAULT_PROVE_BUDGET: u32 = 10_000;
@@ -154,16 +147,9 @@ pub struct Vacuity {
     pub kind: VacuityKind,
 }
 
+/// What an interleaving search could not establish; every other gap is the program's to find.
 #[derive(Clone, Debug)]
 pub enum Gap {
-    /// Checking an `ensures` calls the definition, whose row needs an unsupplied handler: the row as
-    /// a report prints it, or `None` when it names nothing to hold a handler for.
-    UnhandledEffect(Option<String>),
-    Ungeneratable {
-        param: Symbol,
-        /// As the compiler prints it.
-        ty: String,
-    },
     /// The program's own raise; a diagnostic that is Ply's failure is a [`Discharge::Faulted`].
     Raised {
         bindings: Vec<Binding>,
@@ -173,16 +159,6 @@ pub enum Gap {
         root: u64,
         case: u32,
     },
-    /// The guard kept no case of a full budget, yet admits `witness`.
-    GuardNotSampled {
-        generated: u32,
-        witness: Vec<Binding>,
-    },
-    /// A `law/host` under a hermetic run, with its row as a report prints it.
-    ReachesHost(Option<String>),
-    /// The obligation's points are not drawn one at a time, so there is no case to re-run: a
-    /// concurrency law's points are interleavings that the search chooses.
-    NotDrawn,
 }
 
 /// Ply's own failure while discharging a claim, as [`ply_eval::codes::is_defect`] tells it apart.
@@ -221,30 +197,16 @@ pub struct Binder {
     pub text: String,
 }
 
-/// How `proof.world` decided an obligation is discharged. The engine follows it.
-#[derive(Clone, Debug)]
+/// Which search `proof.world` decided an obligation goes to, as far as the runtime is concerned:
+/// which machine its propositions run on, and whether its points are interleavings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strategy {
     /// A law over a `simulate` region: its interleavings are searched at each of its points.
-    Interleave(Points),
+    Interleave,
     /// A `law/host`, run against the host the run binds.
     Hosted,
-    /// The static prover first, and what follows when that does not settle the claim.
-    Static(Unsettled),
-}
-
-#[derive(Clone, Debug)]
-pub enum Unsettled {
-    /// Checking the clause calls an owner that performs this row, and nothing supplies handlers.
-    Unhandled(String),
-    Run(Points),
-}
-
-/// The points a search runs a claim at.
-#[derive(Clone, Debug)]
-pub enum Points {
-    /// Every point of a domain the program measured, which is a proof when each holds.
-    Every(Finite),
-    Drawn,
+    /// The static prover first, then the claim's points.
+    Static,
 }
 
 /// A claim the program owes, as `proof.world` built it.
@@ -275,16 +237,6 @@ impl Obligation {
     pub fn guard_span(&self) -> Span {
         self.guards.first().copied().unwrap_or(self.span)
     }
-}
-
-/// What the program's static prover answered for an obligation before anything ran.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Static {
-    Proved(Certificate),
-    /// A decided body over a domain the prover could not show inhabited: a kept case certifies it.
-    NeedsWitness(Certificate),
-    Vacuous,
-    Inconclusive,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
