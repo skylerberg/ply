@@ -6,28 +6,6 @@
 //! compiler's own values, which this keeps and hands back without reading; what each subcommand
 //! *says* is the program's, in `crates/ply-cli/ply/cache.ply`.
 
-/// The cache subcommand, as plain data the machine reads; the shell's parsed flags convert into
-/// this.
-#[derive(Clone, Debug)]
-pub enum CacheAction {
-    Clear(CacheScope),
-    Stats(CacheScope),
-    Compact(CacheScope),
-    Inspect(InspectOptions),
-}
-
-#[derive(Clone, Debug)]
-pub struct CacheScope {
-    pub path: std::path::PathBuf,
-    pub json: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct InspectOptions {
-    pub query: String,
-    pub path: std::path::PathBuf,
-    pub json: bool,
-}
 use crate::hosts::Lent;
 use crate::payload::{count, ctor, diags_value, field_of, option, record};
 use ply_eval::host::{
@@ -97,37 +75,13 @@ impl HostHandler for Did {
             Ok(PathBuf::from(value.as_str(span, "the project's path")?))
         };
         let value = match (req.op.op.as_str(), req.args) {
-            ("statistics", [p]) => answered(
-                &statistics(&CacheScope {
-                    path: path(p)?,
-                    json: false,
-                }),
-                statistics_value,
-            ),
+            ("statistics", [p]) => answered(&statistics(&path(p)?), statistics_value),
             ("matches", [query, p]) => answered(
-                &matches(&InspectOptions {
-                    query: query
-                        .as_str(span, "the definition asked about")?
-                        .to_string(),
-                    path: path(p)?,
-                    json: false,
-                }),
+                &matches(query.as_str(span, "the definition asked about")?, &path(p)?),
                 |m| matches_value(m, &self.module),
             ),
-            ("compacted", [p]) => answered(
-                &compacted(&CacheScope {
-                    path: path(p)?,
-                    json: false,
-                }),
-                compacted_value,
-            ),
-            ("cleared", [p]) => answered(
-                &cleared(&CacheScope {
-                    path: path(p)?,
-                    json: false,
-                }),
-                cleared_value,
-            ),
+            ("compacted", [p]) => answered(&compacted(&path(p)?), compacted_value),
+            ("cleared", [p]) => answered(&cleared(&path(p)?), cleared_value),
             ("known", [p, sources]) => known(&path(p)?, &sources_of(sources, span)?),
             ("file", [p, sources, filing, whole]) => diags_value(&file(
                 &path(p)?,
@@ -548,12 +502,12 @@ struct Stats {
     counts: CacheStats,
 }
 
-fn statistics(scope: &CacheScope) -> Result<Stats, Refused> {
+fn statistics(path: &Path) -> Result<Stats, Refused> {
     let Opened {
         store,
         open_us,
         warnings,
-    } = open(&scope.path)?;
+    } = open(path)?;
     Ok(Stats {
         directory: shown(store.dir()),
         warnings,
@@ -603,12 +557,12 @@ struct Compacted {
     results: usize,
 }
 
-fn compacted(scope: &CacheScope) -> Result<Compacted, Refused> {
+fn compacted(path: &Path) -> Result<Compacted, Refused> {
     let Opened {
         mut store,
         mut warnings,
         ..
-    } = open(&scope.path)?;
+    } = open(path)?;
 
     // Compaction drops what surviving files do not name, so a partial walk would delete silently.
     let keep = match crate::load::ply_files(store.root()) {
@@ -696,12 +650,12 @@ struct Cleared {
     cleared: usize,
 }
 
-fn cleared(scope: &CacheScope) -> Result<Cleared, Refused> {
+fn cleared(path: &Path) -> Result<Cleared, Refused> {
     let Opened {
         mut store,
         warnings,
         ..
-    } = open(&scope.path)?;
+    } = open(path)?;
     let before = store.len();
 
     if let Err(e) = store.clear() {
@@ -768,13 +722,13 @@ enum Filed {
     Unfiled,
 }
 
-fn matches(args: &InspectOptions) -> Result<Matches, Refused> {
+fn matches(query: &str, path: &Path) -> Result<Matches, Refused> {
     let Opened {
         mut store,
         mut warnings,
         ..
-    } = open(&args.path)?;
-    let found = store.lookup(&args.query);
+    } = open(path)?;
+    let found = store.lookup(query);
     let mut unread = None;
     let entries = found
         .iter()

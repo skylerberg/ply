@@ -23,11 +23,7 @@ pub mod host;
 pub mod intty;
 pub mod limit;
 pub mod list;
-pub use expr::{BinOp, Lit, UnOp, render_float};
-/// The built-in type names the runtime recognizes: a credential, and the handle `task.spawn`
-/// answers with. The checker declares them; only their names reach here.
-pub const SECRET: &str = "Secret";
-pub const TASK_TYPE: &str = "Task";
+pub use expr::{BinOp, render_float};
 
 pub use intty::{INT_TYPES, IntTy};
 pub use list::List;
@@ -35,7 +31,6 @@ pub mod evaluator;
 pub mod map;
 pub mod memo;
 mod plain;
-mod pool;
 mod program;
 pub mod rc;
 pub mod region;
@@ -54,7 +49,7 @@ pub use backend::{Compilation, Counters, Offers, Provider};
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use carry::{Carry, CtorCarries};
 pub use compiled::{Compiled, Entered};
-pub use cont::{Frame, Next, Prompt, Segment, SimId, Stack};
+pub use cont::{Frame, SimId};
 pub use escape::{Boundary, Escapee, Handle};
 pub use evaluator::{
     Ended, Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,
@@ -73,9 +68,9 @@ pub use hash::{DefHash, HashOutput};
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use program::{
-    CheckOutput, DefInfo, DefWritten, EffectInfo, EffectSet, EmitterRoot, Front, Hashed, LawInfo,
-    Literal, ModuleInfo, ModuleName, OpInfo, Ordinal, Pinned, SpecInfo, SpecKind, TestInfo,
-    TypeDecl, Visibility, WrittenParam, is_ident, is_ident_continue, is_ident_start,
+    CheckOutput, DefInfo, DefWritten, EffectInfo, EmitterRoot, Front, LawInfo, ModuleInfo,
+    ModuleName, OpInfo, Ordinal, Pinned, SpecKind, TestInfo, TypeDecl, Visibility, WrittenParam,
+    is_ident, is_ident_continue, is_ident_start,
 };
 pub use rc::Stats as RcStats;
 pub use region::{Interleaving, Verdict};

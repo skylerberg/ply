@@ -21,13 +21,12 @@ const EFFECT: &str = "archive";
 /// One registration for the one operation: the emission, which has already run.
 const OPERATIONS: [(&str, &str); 1] = [("emitted", "ply_machine::bootstrap::emitted")];
 
-/// What `ply bootstrap` is configured with, as plain data: the shell's parsed flags convert.
-#[derive(Clone, Debug)]
-pub struct BootstrapOptions {
-    pub path: std::path::PathBuf,
-    pub out: std::path::PathBuf,
-    pub verify: bool,
-    pub profile: String,
+/// What `ply bootstrap` is asked to emit, from the record the program parsed.
+struct BootstrapOptions {
+    path: PathBuf,
+    out: PathBuf,
+    verify: bool,
+    profile: String,
 }
 
 /// The emission runs here, before the program is entered: a handler is handed `&self`, and the
@@ -243,10 +242,8 @@ fn unregistered(op: &str, span: Span) -> Diagnostic {
     .note("this is a defect in Ply's host dispatch rather than in the program")
 }
 
-// The options record the program parsed: the path, the output directory, `--verify`, `--profile`.
 fn options_of(v: &PlyValue, span: Span) -> Result<BootstrapOptions, Diagnostic> {
-    use crate::payload::{field_of, str_list_at};
-    let _ = str_list_at;
+    use crate::payload::field_of;
     Ok(BootstrapOptions {
         path: PathBuf::from(field_of(v, "path", span)?.as_str(span, "the program's root")?),
         out: PathBuf::from(field_of(v, "out", span)?.as_str(span, "the archive's directory")?),

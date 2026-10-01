@@ -2,15 +2,15 @@
 //! content-addressed store already holds.
 
 use crate::load::Loaded;
+use crate::payload::record;
 use ply_eval::decode::{self, At};
 use ply_eval::{
-    DefHash, DefInfo, Diagnostic, Ended, Fields, Front, HashOutput, ModuleName, Severity,
-    SourceMap, Span, Symbol, Value, codes,
+    DefHash, DefInfo, Diagnostic, Ended, Front, HashOutput, ModuleName, Severity, SourceMap, Span,
+    Symbol, Value, codes,
 };
 use ply_store::body::StoredBody;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 pub const EXTENSION: &str = "plyx";
 
@@ -302,17 +302,6 @@ fn refused(path: &Path, refusal: At<'_>) -> Result<Diagnostic, decode::Error> {
     })
 }
 
-// `Value::Record` holds an `Arc`, and `Fields` is not `Send`; every construction site says so.
-#[allow(clippy::arc_with_non_send_sync)]
-fn record(fields: Vec<(&str, Value)>) -> Value {
-    Value::Record(Arc::new(Fields::from_unsorted(
-        fields
-            .into_iter()
-            .map(|(name, value)| (Symbol::new(name), value))
-            .collect(),
-    )))
-}
-
 fn answer(entry: &str, args: &[Value]) -> Result<Value, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
     ply_codegen::c::producer::call(entry, args).map_err(|e| container_failed(format!("{e:#}")))
@@ -436,21 +425,7 @@ pub fn build(
 
     out.closure = closure_texts(&out, front)?;
     // Reopened as a target opens it, so an artifact that builds is one that opens.
-    let opened = match reopen(&out) {
-        Ok(opened) => opened,
-        Err(diags) => {
-            if let Ok(dir) = std::env::var("PLY_DUMP_CLOSURE") {
-                let dir = std::path::PathBuf::from(dir);
-                std::fs::create_dir_all(&dir).unwrap();
-                for (file, text) in &out.closure {
-                    let at = dir.join(file);
-                    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
-                    std::fs::write(&at, text).unwrap();
-                }
-            }
-            return Err(vec![unreopened(&diags)]);
-        }
-    };
+    let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
     let emission = embedded_unit(&opened, &opened.entry, &names).map_err(|d| vec![d])?;
     out.unit = emission.unit;
@@ -1005,7 +980,7 @@ fn file_front(at: &Path, modules: &[String], dump: &ply_eval::Value) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let answer = crate::payload::record(vec![
+    let answer = record(vec![
         (
             "pulled",
             ply_eval::Value::list(

@@ -1,28 +1,4 @@
-//! Operators and literals, shared by the evaluator, the prover and the code generator.
-
-use crate::IntTy;
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Lit {
-    Int(i64),
-    /// A suffixed literal such as `255u8`; `bits` is normalized by [`IntTy::normalize`].
-    Fixed {
-        ty: IntTy,
-        bits: u128,
-    },
-    Bool(bool),
-    Str(String),
-    /// `b"GET "`.
-    Bytes(Vec<u8>),
-    /// IEEE-754 binary64.
-    Float(f64),
-    /// Sign and magnitude in `mantissa`, digits after the point in `scale`.
-    Decimal {
-        mantissa: i128,
-        scale: u32,
-    },
-    Unit,
-}
+//! The binary operators compiled code hands the runtime, and how a `Float` is written.
 
 /// The shortest text that reads back as this `f64`, always distinguishable from an integer.
 pub fn render_float(f: f64) -> String {
@@ -98,12 +74,4 @@ impl BinOp {
             BinOp::Ushr => ">>>",
         }
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum UnOp {
-    Neg,
-    Not,
-    /// Prefix `~` on an `Int`; `!` stays `Bool`-only.
-    BitNot,
 }

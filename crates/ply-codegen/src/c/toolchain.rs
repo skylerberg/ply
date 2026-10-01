@@ -3,8 +3,8 @@
 //! A warm run reads its unit back out of a cache. An *edit* recompiles it, and `cc -O2` over a
 //! large unit is the slow part of that. So there are two things to compile for, and one compiler
 //! cannot be both: `development`, the default, is `tcc` if installed, else `cc -O0`; `release` is
-//! `cc -O2`. A measurement wants `release` and has to say so -- `--profile release`, or
-//! `PLY_C_PROFILE=release`, which is what `benches/value-model/run.sh` passes.
+//! `cc -O2`. A measurement wants `release` and has to say so: `--profile release`, or
+//! `PLY_C_PROFILE=release`.
 
 /// What this run is compiling for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
