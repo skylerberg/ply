@@ -2,7 +2,7 @@
 
 use crate::cont::SimId;
 use crate::host::{HostBinding, HostRuntime, MachineId, Pending};
-use crate::region::Trail;
+use crate::region::{StepSite, Trail};
 use crate::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use crate::value::Value;
 use crate::{Diagnostic, Span, codes};
@@ -149,6 +149,8 @@ pub struct StepRecord {
     pub at: i64,
     /// What the step touched, excluding the scheduler's own bookkeeping.
     pub accesses: StepFootprint,
+    /// Where it first touched something in `accesses`, else where it gave control back.
+    pub site: Option<StepSite>,
     pub stamp: Stamp,
 }
 
@@ -324,6 +326,7 @@ impl<K, B> Scheduler<K, B> {
             choice: choice as u16,
             at: clock.now(),
             accesses: StepFootprint::new(),
+            site: None,
             stamp: self.task_mut(task)?.stamp.clone(),
         });
         self.current = Some(task);
