@@ -84,7 +84,7 @@ fn pass_over<| e>(
 fn try_alts<| e>(
   values: List<Value>,
   i: Int,
-  here: U64,
+  here: U128,
   alts: List<Value>,
   ts: Types,
   holds: (List<Value>) -> Bool / e,
@@ -106,20 +106,22 @@ fn try_alts<| e>(
 
 // --- Size ---------------------------------------------------------------------
 
-fn top() -> U64 = ~0u64
+// Exact, because a measure that saturates calls every candidate no smaller and stalls the walk:
+// every leaf stays below 2^121, so a sum saturates only past a hundred of the largest.
+fn top() -> U128 = ~0u128
 
-fn plus(a: U64, b: U64) -> U64 = match checked_add(a, b) { Some(c) -> c, None -> top() }
+fn plus(a: U128, b: U128) -> U128 = match checked_add(a, b) { Some(c) -> c, None -> top() }
 
-fn times(a: U64, b: U64) -> U64 = match checked_mul(a, b) { Some(c) -> c, None -> top() }
+fn wide(n: Int) -> U128 = u128_of_int(n)
 
 fn least_int() -> Int = 0 - 9223372036854775807 - 1
 
 // `-5` is larger than `5`, which is what makes negating a negative a shrink.
-fn int_size(n: Int) -> U64 = {
-  let magnitude = if n >= 0 { u64_of_int(n) }
-  else if n == least_int() { 9223372036854775808u64 }
-  else { u64_of_int(0 - n) };
-  plus(times(magnitude, 2u64), if n < 0 { 1u64 } else { 0u64 })
+fn int_size(n: Int) -> U128 = {
+  let magnitude = if n >= 0 { wide(n) }
+  else if n == least_int() { 9223372036854775808u128 }
+  else { wide(0 - n) };
+  magnitude * 2u128 + (if n < 0 { 1u128 } else { 0u128 })
 }
 
 fn width_of(ty: String) -> Int =
@@ -152,39 +154,34 @@ fn pattern_of(ty: String, v: Signed) -> U128 = {
   else { v.magnitude }
 }
 
-// `int_size` over a width's value: twice the magnitude, one more when negative, at the ceiling past
-// sixty-four bits.
-fn fixed_size(ty: String, bits: U128) -> U64 = {
+// `int_size` over a width's value. Past 2^118 the magnitude counts in steps of 2^10, which keeps the
+// leaf below 2^121 and still makes each halving smaller.
+fn fixed_size(ty: String, bits: U128) -> U128 = {
   let v = signed_of(ty, bits);
-  if v.magnitude > 9223372036854775807u128 { top() } else {
-    plus(times(u64_of_int(int_of_u128(v.magnitude)), 2u64), if v.negative { 1u64 } else { 0u64 })
-  }
+  let knee = 1u128 << 118;
+  let counted = if v.magnitude < knee { v.magnitude } else { knee + (v.magnitude - knee >> 10) };
+  counted * 2u128 + (if v.negative { 1u128 } else { 0u128 })
 }
 
-fn float_size(f: Float) -> U64 =
-  if is_nan(f) { top() }
-  else if is_infinite(f) { top() - 1u64 } else {
+// Above every finite float, whose measure is below 2^64.
+fn float_size(f: Float) -> U128 =
+  if is_nan(f) { 1u128 << 65 }
+  else if is_infinite(f) { (1u128 << 65) - 1u128 } else {
     // Measured over the bits: a saturating cast would make every large float one size and stall.
-    let magnitude = u64_of_int(bits_of_float(f) & 0x7FFF_FFFF_FFFF_FFFF);
-    plus(times(magnitude, 2u64), if is_sign_negative(f) { 1u64 } else { 0u64 })
+    let magnitude = wide(bits_of_float(f) & 0x7FFF_FFFF_FFFF_FFFF);
+    magnitude * 2u128 + (if is_sign_negative(f) { 1u128 } else { 0u128 })
   }
 
-fn decimal_size(d: Decimal) -> U64 = {
-  let m = decimal::trunc(decimal::abs(d));
-  let magnitude = if m <= 9223372036854775807m { u64_of_int(int_or_zero(m)) }
-  else if m <= 18446744073709551615m {
-    plus(u64_of_int(int_or_zero(m - 9223372036854775808m)), 9223372036854775808u64)
-  } else { 288230376151711743u64 };
-  plus(
-    plus(
-      plus(times(magnitude, 64u64), if decimal::fract(d) == 0m { 0u64 } else { 32u64 }),
-      u64_of_int(scale(d)),
-    ),
-    if decimal::is_negative(d) { 1u64 } else { 0u64 },
-  )
+fn decimal_size(d: Decimal) -> U128 = {
+  let whole = decimal::trunc(decimal::abs(d));
+  let magnitude = match u128_of_string(decimal_to_string(normalize(whole))) {
+    Some(m) -> m,
+    None -> 0u128,
+  };
+  let fraction = if decimal::fract(d) == 0m { 0u128 } else { 32u128 };
+  let sign = if decimal::is_negative(d) { 1u128 } else { 0u128 };
+  magnitude * 64u128 + fraction + wide(scale(d)) + sign
 }
-
-fn int_or_zero(d: Decimal) -> Int = match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }
 
 // Each declared constructor's place among its type's variants.
 fn ctor_index(ts: Types, name: String) -> Int =
@@ -199,46 +196,43 @@ fn ctor_index(ts: Types, name: String) -> Int =
         })
     })
 
-fn sum<a>(xs: List<a>, f: (a) -> U64) -> U64 = fold(xs, 0u64, |acc: U64, x: a| plus(acc, f(x)))
+fn sum<a>(xs: List<a>, f: (a) -> U128) -> U128 = fold(xs, 0u128, |acc: U128, x: a| plus(acc, f(x)))
 
-// A saturating structural measure, and the reason the walk ends.
-pub fn size(v: Value, ts: Types) -> U64 =
+// A structural measure, and the reason the walk ends.
+pub fn size(v: Value, ts: Types) -> U128 =
   match v {
     VInt(n) -> int_size(n),
     VFixed(ty, bits) -> fixed_size(ty, bits),
-    VBool(b) -> if b { 1u64 } else { 0u64 },
-    VUnit -> 0u64,
+    VBool(b) -> if b { 1u128 } else { 0u128 },
+    VUnit -> 0u128,
     VFloat(f) -> float_size(f),
     VDecimal(d) -> decimal_size(d),
-    VStr(s) -> sum(code_points(s), |c: Int| u64_of_int(1 + c)),
-    VBytes(b) -> sum(range(0, bytes_len(b)), |i: Int| u64_of_int(1 + bytes_at(b, i))),
-    VList(items) -> plus(u64_of_int(len(items)), sum(items, |x: Value| size(x, ts))),
+    VStr(s) -> sum(code_points(s), |c: Int| wide(1 + c)),
+    VBytes(b) -> sum(range(0, bytes_len(b)), |i: Int| wide(1 + bytes_at(b, i))),
+    VList(items) -> plus(wide(len(items)), sum(items, |x: Value| size(x, ts))),
     // Keys count too, so replacing a key with a smaller one is a strict shrink.
     VMap(entries) ->
-      plus(
-        u64_of_int(len(entries)),
-        sum(entries, |e: Entry| plus(size(e.key, ts), size(e.value, ts))),
-      ),
+      plus(wide(len(entries)), sum(entries, |e: Entry| plus(size(e.key, ts), size(e.value, ts)))),
     VRecord(fields) -> sum(fields, |f: Field| size(f.value, ts)),
     VCtor(name, args) ->
       plus(
-        plus(1u64, plus(u64_of_int(max(ctor_index(ts, name), 0)), u64_of_int(len(args)))),
+        plus(1u128, plus(wide(max(ctor_index(ts, name), 0)), wide(len(args)))),
         sum(args, |x: Value| size(x, ts)),
       ),
     VFn(fun) -> match fun {
-      FConst(c) -> plus(2u64, size(c.value, ts)),
-      FProject(_) -> 1u64,
+      FConst(c) -> plus(2u128, size(c.value, ts)),
+      FProject(_) -> 1u128,
       FTable(t) ->
         plus(
-          4u64,
+          4u128,
           plus(
             sum(t.entries, |e: Entry| plus(size(e.key, ts), size(e.value, ts))),
             size(t.default, ts),
           ),
         ),
-      _ -> 1u64,
+      _ -> 1u128,
     },
-    _ -> 0u64,
+    _ -> 0u128,
   }
 
 // --- The floor ----------------------------------------------------------------
@@ -504,8 +498,8 @@ fn decimal_candidates(d: Decimal) -> List<Decimal> =
       98,
       |s: { out: List<Decimal>, half: Decimal, left: Int }|
         if s.left == 0 { Stop(s.out) } else {
-          // Rounding to the widest scale rounds nothing: this is the exact quotient, at the scale it has.
-          let next = decimal_div(s.half, 2m, 28, Down);
+          // The exact half, rounded to even only where it has more digits than a decimal holds.
+          let next = decimal_div(s.half, 2m, 28, HalfEven);
           if next != 0m && scale(next) <= scale(d) {
             Continue({ out: push(s.out, next), half: next, left: s.left - 1 })
           } else { Stop(s.out) }
@@ -516,13 +510,20 @@ fn decimal_candidates(d: Decimal) -> List<Decimal> =
     deduped(filter(flipped, |c: Decimal| decimal_size(c) < here))
   }
 
+// Empty, then each half, then each byte dropped, then each byte lowered: a length the claim bounds
+// is reached one byte at a time. Below three bytes the halves are the drops.
 fn bytes_candidates(b: Bytes) -> List<Value> =
   if bytes_len(b) == 0 { [] } else {
-    let mid = bytes_len(b) / 2;
-    let start = if bytes_len(b) >= 2 {
-      [VBytes(b""), VBytes(bytes_slice(b, 0, mid)), VBytes(bytes_slice(b, mid, bytes_len(b)))]
+    let n = bytes_len(b);
+    let mid = n / 2;
+    let start = if n >= 2 {
+      [VBytes(b""), VBytes(bytes_slice(b, 0, mid)), VBytes(bytes_slice(b, mid, n))]
     } else { [VBytes(b"")] };
-    fold(range(0, bytes_len(b)), start, |out: List<Value>, i: Int| {
+    let dropped = if n < 3 { start } else {
+      fold(range(0, n), start, |out: List<Value>, i: Int|
+        push(out, VBytes(bytes_concat(bytes_slice(b, 0, i), bytes_slice(b, i + 1, n)))))
+    };
+    fold(range(0, n), dropped, |out: List<Value>, i: Int| {
       let byte = bytes_at(b, i);
       fold([0, byte / 2], out, |acc: List<Value>, lowered: Int|
         if lowered == byte { acc } else {
@@ -540,6 +541,7 @@ fn bytes_candidates(b: Bytes) -> List<Value> =
     })
   }
 
+// As `bytes_candidates`, a character at a time, lowered toward `a`.
 fn string_candidates(s: String) -> List<Value> = {
   let chars = code_points(s);
   if len(chars) == 0 { [] } else {
@@ -552,7 +554,11 @@ fn string_candidates(s: String) -> List<Value> = {
         VStr(text(map(range(mid, len(chars)), |i: Int| at_int(chars, i)))),
       ]
     } else { [VStr("")] };
-    fold(range(0, len(chars)), start, |out: List<Value>, i: Int| {
+    let dropped = if len(chars) < 3 { start } else {
+      fold(range(0, len(chars)), start, |out: List<Value>, i: Int|
+        push(out, VStr(text(without(chars, i)))))
+    };
+    fold(range(0, len(chars)), dropped, |out: List<Value>, i: Int| {
       let code = at_int(chars, i);
       if code <= 97 { out } else {
         fold([97, 97 + (code - 97) / 2], out, |acc: List<Value>, lowered: Int|
@@ -789,7 +795,10 @@ fn shaped_types() -> Types =
 
 test "a negative outweighs its own magnitude, and an empty collection a populated one" {
   assert(size(VInt(0 - 5), no_types()) > size(VInt(5), no_types()));
-  assert_eq(size(VInt(0 - 9223372036854775807 - 1), no_types()), top());
+  assert(
+    size(VInt(0 - 9223372036854775807 - 1), no_types())
+      > size(VInt(9223372036854775807), no_types()),
+  );
   assert(size(VList([]), no_types()) < size(VList([VInt(0)]), no_types()));
   assert(size(VMap([]), no_types()) < size(VMap([{ key: VInt(0), value: VInt(0) }]), no_types()))
 }
@@ -826,4 +835,68 @@ test "a value its type does not describe offers nothing" {
   assert_eq(candidates(VBool(true), Con("Bool", []), no_types()), [VBool(false)]);
   assert_eq(candidates(VUnit, Con("Unit", []), no_types()), []);
   assert_eq(candidates(VCtor("m.Gone", [VInt(3)]), Con("m.Gone", []), no_types()), [])
+}
+
+test "bytes and text drop one element at a time, so a bounded length is reached exactly" {
+  let bounded = |vs: List<Value>|
+    match vs {
+      [VBytes(b)] -> bytes_len(b) >= 3,
+      [VStr(s)] -> len(code_points(s)) >= 3,
+      _ -> false,
+    };
+  assert_eq(
+    descend([VBytes(b"T\x9cF\xf1")], [Con("Bytes", [])], no_types(), bounded, 500).values,
+    [VBytes(b"\x00\x00\x00")],
+  );
+  assert_eq(descend([VStr("dede")], [Con("String", [])], no_types(), bounded, 500).values, [
+    VStr("aaa"),
+  ]);
+  assert_eq(first_n(bytes_candidates(b"abc"), 6), [
+    VBytes(b""),
+    VBytes(b"a"),
+    VBytes(b"bc"),
+    VBytes(b"bc"),
+    VBytes(b"ac"),
+    VBytes(b"ab"),
+  ])
+}
+
+test "a record of the largest integers still shrinks: the measure never saturates" {
+  let point = Record([
+    { name: "label", ty: Con("String", []) },
+    { name: "x", ty: int_ty() },
+    { name: "y", ty: int_ty() },
+  ]);
+  let far = |vs: List<Value>|
+    match vs {
+      [VRecord(fs)] ->
+        fold(fs, false, |hit: Bool, f: Field|
+          hit || (f.name == "x" && (match f.value { VInt(n) -> n >= 100, _ -> false }))),
+      _ -> false,
+    };
+  let largest = VRecord([
+    { name: "label", value: VStr("m") },
+    { name: "x", value: VInt(9223372036854775807) },
+    { name: "y", value: VInt(9223372036854775807) },
+  ]);
+  assert_eq(descend([largest], [point], no_types(), far, 500).values, [
+    VRecord([
+      { name: "label", value: VStr("") },
+      { name: "x", value: VInt(100) },
+      { name: "y", value: VInt(0) },
+    ]),
+  ]);
+  let wide = |m: U128| size(VFixed("U128", m), no_types());
+  assert(wide(~0u128) > wide(~0u128 >> 1));
+  assert(wide(~0u128) < 1u128 << 121)
+}
+
+test "a decimal halves exactly at its own scale, and to even past the digits a decimal holds" {
+  let halves = |d: Decimal| filter(decimal_candidates(d), |c: Decimal| c != 0m);
+  assert_eq(
+    list_at(halves(79228162514264337593543950335m), 0),
+    Some(39614081257132168796771975168m),
+  );
+  assert_eq(halves(12m), [6m, 3m]);
+  assert_eq(halves(5m), [])
 }
