@@ -100,6 +100,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `1.5`, `1e9`, `2.5e-3` | `Float` | IEEE-754 binary64. |
 | `1.50m`, `0m` | `Decimal` | Exact base 10; up to 28 fractional digits, 96-bit mantissa; keeps its written scale. |
 | `"text"` | `String` | UTF-8; no line breaks. |
+| `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
 | `true`, `false` / `()` | `Bool` / `Unit` | |
 
@@ -110,6 +111,23 @@ written as a literal; use `i8_of_int(-128)`.
 
 String escapes are `\n` `\t` `\r` `\0` `\\` `\"` (no `\u`). Byte strings add
 `\xNN` and refuse source characters above `U+007F`.
+
+A line string is a run of lines that each start with `\\`, led only by blanks.
+Everything after the `\\` to the end of its line is text, verbatim: nothing is
+an escape, so quotes, backslashes and `\\` itself are written as they read. The
+lines join with `\n` and the last one ends the value, so a value ending in a
+newline ends with a line holding only `\\`:
+
+```ply
+fn program() -> String =
+  \\fn main() -> Int = 42
+  \\
+```
+
+A line ending in a space or a tab is `E0001`, since that whitespace cannot be
+seen; a `\r` before a line's newline is not text. A line string is an
+expression, never a pattern or a label. Nothing can follow it on its last line,
+so what comes after it goes on the next one.
 
 ### 2.4 Operators
 
@@ -2777,8 +2795,10 @@ stderr before the entry runs, or as `front_end` in the `--json` document.
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
-file it cannot read or write back is an error too, exiting 2, so `--check`
-never passes over a file it did not read. A directory whose name starts with
+line string starts a line of its own, each of its lines at the first's indent,
+and as the last item of a list it takes no trailing comma. A file it cannot read
+or write back is an error too, exiting 2, so `--check` never passes over a file
+it did not read. A directory whose name starts with
 `.`, and one named `target`, are not walked; a symlink found while walking is
 passed over, and one named on the command line is an error rather than a file to
 rewrite.
