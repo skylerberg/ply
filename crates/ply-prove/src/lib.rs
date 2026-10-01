@@ -321,6 +321,8 @@ impl ProvePlan {
 pub struct ProveReport {
     pub obligations: Vec<(Obligation, Discharge)>,
     pub duration: Duration,
+    /// What the entries the discharges made ended with, such as spans they left open.
+    pub warnings: Vec<Diagnostic>,
 }
 
 pub fn interleaving_proves(

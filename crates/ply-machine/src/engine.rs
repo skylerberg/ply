@@ -22,7 +22,7 @@ use ply_store::Store;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The discharger this build drives over the program's `world`, its claims kept in `store`. One
 /// built once serves a whole run's discharges and re-runs alike.
@@ -108,6 +108,8 @@ pub struct Prover<'a> {
     hosting: Option<Hosting>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
     backend: &'static dyn ply_eval::Provider,
+    /// What the entries its machines made ended with, until a discharge's report takes it.
+    teardown: Arc<Mutex<Vec<Diagnostic>>>,
 }
 
 /// The binding and the reactor a `law/host` runs against. The factory is owned rather than
@@ -150,6 +152,7 @@ impl<'a> Prover<'a> {
             laws,
             hosting: None,
             backend,
+            teardown: Arc::default(),
         })
     }
 
@@ -403,6 +406,10 @@ enum Static {
 impl ply_test::obligation::Discharger for Prover<'_> {
     fn discharge(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
         self.discharge_with(obligation, plan)
+    }
+
+    fn teardown(&self) -> Vec<Diagnostic> {
+        std::mem::take(&mut *self.teardown.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -746,6 +753,7 @@ impl<'a> Prover<'a> {
             call,
             result,
             step_budget: plan.step_budget,
+            teardown: Arc::clone(&self.teardown),
         })
     }
 
@@ -990,6 +998,8 @@ struct Cases<'a> {
     call: Option<Symbol>,
     result: Option<Symbol>,
     step_budget: i64,
+    /// The prover's, which a discharge's report reads.
+    teardown: Arc<Mutex<Vec<Diagnostic>>>,
 }
 
 impl Cases<'_> {
@@ -1034,10 +1044,15 @@ impl Judge for Cases<'_> {
         // A law's binders, or an owner's parameters then `result`: the order `source.rs` expects.
         let mut args = values.to_vec();
         if let (Some(name), Some(_)) = (&self.call, &self.result) {
-            let returned = self
+            let (returned, mut warnings) = self
                 .machine
-                .call(name.as_str(), values.to_vec(), self.span)?;
-            args.push(returned);
+                .call(name.as_str(), values.to_vec(), self.span)
+                .into_parts();
+            self.teardown
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append(&mut warnings);
+            args.push(returned?);
         }
         let value = self.on_tier(&self.body_root, &args)?;
         self.boolean(value)

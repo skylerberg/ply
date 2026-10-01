@@ -1142,10 +1142,11 @@ fn discharge(
     let asked = obligation::Asked::chosen(asked_for, choice, store, &job.plan);
     let (pool, _workers) = build_pool(job.jobs, &mut warnings);
     let discharge = || asked.discharge(&prepared.prover);
-    let report = match &pool {
+    let mut report = match &pool {
         Some(pool) => pool.install(discharge),
         None => discharge(),
     };
+    warnings.append(&mut report.warnings);
     (report, warnings)
 }
 

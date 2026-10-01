@@ -3,14 +3,18 @@
 //! discharged each way, whatever the claim itself would have been decided to be.
 
 use crate::fixture::{loaded, project};
-use ply_eval::{DefHash, Span, Symbol, Value, codes};
-use ply_machine::engine::{Point, Prover};
+use ply_eval::host::{HostBinding, HostRuntime, MachineId, Pending};
+use ply_eval::{DefHash, Diagnostic, Span, Symbol, Value, codes};
+use ply_machine::engine::{Hosting, Point, Prover};
 use ply_prove::domain::{Finite, Shape};
 use ply_prove::property::Outcome;
 use ply_prove::{
     Binder, Discharge, Evidence, Gap, Obligation, ObligationKind, Points, ProvePlan, Rule, Sort,
     Strategy, Unsettled, World,
 };
+use ply_test::obligation::Discharger;
+use std::rc::Rc;
+use std::sync::Arc;
 
 const SOURCE: &str = r#"
 law "halving a choice" forall (b: Bool) { (if b { 4 } else { 6 }) / 2 > 1 }
@@ -331,4 +335,80 @@ fn a_law_that_holds_has_no_point_that_falsifies_it() {
         }
         assert!(kept > 0, "no draw was admitted: the search saw nothing");
     });
+}
+
+/// Discharging the `ensures` calls `same` for its `result`.
+const OWNED: &str = "\
+fn same(n: Int) -> Int
+  ensures result == n
+= n
+";
+
+/// A runtime that warns as every entry point it is told of ends, as one does of spans left open.
+struct Warns;
+
+impl HostRuntime for Warns {
+    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+        Ok(Value::Unit)
+    }
+
+    fn end_entry_point(&self, _: MachineId) -> Result<(), Diagnostic> {
+        Err(Diagnostic::warning(
+            codes::SPAN_ABANDONED,
+            "a span was still open when the entry point ended",
+        ))
+    }
+}
+
+/// Handed the host, the claim calls its owner on the host's machine; what each of those entries
+/// ended with is the discharge's to report, and a read takes it.
+#[test]
+fn what_the_owners_entries_ended_with_is_the_discharges_to_report() {
+    let dir = project(OWNED);
+    let loaded = loaded(dir.path());
+    let world = World::default();
+    let backend =
+        ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier");
+    let runtime = || -> Rc<dyn HostRuntime> { Rc::new(Warns) };
+    let prover = Prover::new(&loaded, &world, backend)
+        .expect("the port lowers the claims")
+        .with_hosting(Hosting {
+            binding: Arc::new(HostBinding::hermetic()),
+            runtime: Some(Arc::new(runtime)),
+        });
+    let owned = Obligation {
+        key: DefHash([9; 32]),
+        owner: Symbol::new("m.same"),
+        kind: ObligationKind::Ensures { index: 0 },
+        span: Span::DUMMY,
+        binders: vec![binder("n", Sort::int(), "Int")],
+        result: Some(binder("result", Sort::int(), "Int")),
+        variables: Vec::new(),
+        footprint: None,
+        strategy: Strategy::Hosted,
+    };
+    let discharge = prover.discharge_with(&owned, &ProvePlan::default());
+    assert!(
+        matches!(discharge, Discharge::Held(_)),
+        "every case calls the owner and holds: {discharge:?}"
+    );
+    let warned = prover.teardown();
+    assert!(!warned.is_empty(), "the owner's entries ended with nothing");
+    assert!(
+        warned.iter().all(|w| w.code == codes::SPAN_ABANDONED),
+        "{warned:?}"
+    );
+    assert!(prover.teardown().is_empty(), "a read takes what it reads");
 }

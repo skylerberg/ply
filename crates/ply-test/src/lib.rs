@@ -387,6 +387,8 @@ pub struct Worker<'a> {
     tier: Rc<dyn ply_eval::Compiled>,
     backend_use: Option<BackendUse>,
     performs: u64,
+    /// What this worker's entries ended with since [`Executor::teardown`] last read it.
+    teardown: Vec<Diagnostic>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -411,6 +413,7 @@ impl<'a> Worker<'a> {
             tier,
             backend_use: None,
             performs: 0,
+            teardown: Vec::new(),
         }
     }
 
@@ -524,6 +527,7 @@ impl<'a> InterpExecutor<'a> {
         Option<ply_eval::host::HostUse>,
         Option<BackendUse>,
         u64,
+        Vec<Diagnostic>,
     ) {
         let plan = self.search.plan_for(index);
         // A search re-runs the whole test, so any host operation runs once per interleaving.
@@ -534,6 +538,7 @@ impl<'a> InterpExecutor<'a> {
         // Every interleaving's, summed.
         let mut used: Option<BackendUse> = None;
         let mut performs = 0u64;
+        let mut teardown: Vec<Diagnostic> = Vec::new();
         let region = &worker.region;
         let tier = &worker.tier;
         let mut interleaving = |seed: &Seed| {
@@ -550,7 +555,8 @@ impl<'a> InterpExecutor<'a> {
             self.arm_footprint_check(machine.as_mut(), index);
             machine.set_re_executed(re_executed);
             sim::seed_run(machine.as_mut(), seed, plan.steps);
-            let outcome = machine.eval_test(index);
+            let (outcome, warnings) = machine.eval_test(index).into_parts();
+            teardown.extend(warnings);
             performs = performs.saturating_add(machine.trace().performs());
             if let Some(reached) = machine.host_use() {
                 let into = host.get_or_insert_with(Default::default);
@@ -588,6 +594,7 @@ impl<'a> InterpExecutor<'a> {
             host,
             used,
             performs,
+            teardown,
         )
     }
 }
@@ -622,8 +629,7 @@ impl<'a> Executor for InterpExecutor<'a> {
 
     fn teardown(&self, worker: &mut Worker<'a>) -> Vec<Diagnostic> {
         let mut out = ply_eval::rc::take_cycles();
-        let m = &mut worker.machine;
-        out.extend(m.take_teardown_warnings());
+        out.append(&mut worker.teardown);
         out
     }
 
@@ -634,12 +640,14 @@ impl<'a> Executor for InterpExecutor<'a> {
         let (e0, d0) = worker.machine.compiled_counts();
         worker.backend_use = None;
         if self.searches(index) {
-            let (outcome, exploration, host, searched, performs) = self.search(worker, index);
+            let (outcome, exploration, host, searched, performs, mut teardown) =
+                self.search(worker, index);
             worker.exploration = exploration;
             worker.host = host;
             // The worker's counters never moved; the search reports its own.
             worker.backend_use = searched;
             worker.performs = performs;
+            worker.teardown.append(&mut teardown);
             return outcome;
         }
         worker.open_region();
@@ -661,7 +669,9 @@ impl<'a> InterpExecutor<'a> {
     fn execute_directly(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
         let m = &mut worker.machine;
         self.arm_footprint_check(m.as_mut(), index);
-        m.eval_test(index)
+        let (outcome, mut warnings) = m.eval_test(index).into_parts();
+        worker.teardown.append(&mut warnings);
+        outcome
     }
 }
 

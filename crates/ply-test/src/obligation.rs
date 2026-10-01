@@ -138,6 +138,9 @@ pub struct Choice {
 pub trait Discharger: Sync {
     /// Carries out the strategy the obligation holds.
     fn discharge(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge;
+
+    /// What the entries the discharges made ended with; forgotten once read.
+    fn teardown(&self) -> Vec<Diagnostic>;
 }
 
 /// A program's decision, carried out up to what the cache answered, so a discharger is built only
@@ -217,6 +220,7 @@ impl Asked {
         ProveReport {
             obligations: paired,
             duration: started.elapsed(),
+            warnings: discharger.teardown(),
         }
     }
 }

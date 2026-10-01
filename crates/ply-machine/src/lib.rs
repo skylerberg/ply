@@ -169,7 +169,7 @@ enum Go {
     Call {
         name: String,
         args: Vec<ply_eval::Plain>,
-        reply: Sender<Result<ply_eval::Plain, Diagnostic>>,
+        reply: Sender<ply_eval::Ended<ply_eval::Plain>>,
     },
     Accounting {
         reply: Sender<drive::Measured>,
@@ -226,12 +226,9 @@ impl HostHandler for Site {
                     .iter()
                     .map(|a| crate::payload::value_plain(a, span))
                     .collect::<Result<_, _>>()?;
-                let answer: Result<ply_eval::Plain, Diagnostic> =
+                let called: ply_eval::Ended<ply_eval::Plain> =
                     self.ask(&label, span, |reply| Go::Call { name, args, reply })?;
-                match answer {
-                    Ok(plain) => ok(crate::payload::plain_value(&plain)),
-                    Err(d) => err(crate::payload::raised_value(&d)),
-                }
+                drive::called_value(called)
             }
             ("accounting", []) => {
                 let measured: drive::Measured =

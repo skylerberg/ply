@@ -11,14 +11,14 @@ use std::sync::Arc;
 impl Compiled {
     #[track_caller]
     fn must_pass(&self, name: &str) {
-        if let Err(d) = self.machine().eval_test(self.index_of(name)) {
+        if let Err(d) = self.machine().eval_test(self.index_of(name)).into_parts().0 {
             panic!("{name:?} was expected to pass:\n{d:#?}");
         }
     }
 
     #[track_caller]
     fn answer_of(&self, name: &str, args: Vec<Value>) -> Result<Value, Diagnostic> {
-        self.machine().call(name, args, Span::DUMMY)
+        self.machine().call(name, args, Span::DUMMY).into_parts().0
     }
 }
 

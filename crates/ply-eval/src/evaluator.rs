@@ -38,7 +38,40 @@ pub struct Machine<'a> {
     host_ops: u64,
     declared: Option<Footprint>,
     re_executed: bool,
-    teardown: Vec<Diagnostic>,
+}
+
+/// How one entry ended: its answer, and what the host runtime warned of as it ended, such as the
+/// spans it left open. The answer is not had without the warnings in hand.
+#[must_use = "an entry's warnings are its driver's to report"]
+#[derive(Debug)]
+pub struct Ended<T> {
+    answer: Result<T, Diagnostic>,
+    warnings: Vec<Diagnostic>,
+}
+
+impl<T> Ended<T> {
+    /// Refused before anything was entered, so nothing ended and nothing warns.
+    pub fn refused(diagnostic: Diagnostic) -> Ended<T> {
+        Ended {
+            answer: Err(diagnostic),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// The answer made into another, the warnings kept with it.
+    pub fn map<U>(
+        self,
+        f: impl FnOnce(Result<T, Diagnostic>) -> Result<U, Diagnostic>,
+    ) -> Ended<U> {
+        Ended {
+            answer: f(self.answer),
+            warnings: self.warnings,
+        }
+    }
+
+    pub fn into_parts(self) -> (Result<T, Diagnostic>, Vec<Diagnostic>) {
+        (self.answer, self.warnings)
+    }
 }
 
 impl<'a> Machine<'a> {
@@ -65,7 +98,6 @@ impl<'a> Machine<'a> {
             host_ops: 0,
             declared: None,
             re_executed: false,
-            teardown: Vec::new(),
         };
         // A tier may be shared by several machines, so it takes this one's hermetic defaults.
         machine.share_host();
@@ -161,18 +193,20 @@ impl<'a> Machine<'a> {
     }
 
     /// `index` into the front's tests: load order, then source order.
-    pub fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic> {
+    pub fn eval_test(&mut self, index: usize) -> Ended<()> {
         let front = self.front;
         let tests = &front.check.tests;
         let Some(test) = tests.get(index) else {
-            return Err(Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!(
-                    "no test at index {index}; the program defines {}",
-                    tests.len()
-                ),
-            )
-            .primary(Span::DUMMY, "requested test does not exist"));
+            return Ended::refused(
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!(
+                        "no test at index {index}; the program defines {}",
+                        tests.len()
+                    ),
+                )
+                .primary(Span::DUMMY, "requested test does not exist"),
+            );
         };
         let ordinal = tests[..index]
             .iter()
@@ -184,18 +218,13 @@ impl<'a> Machine<'a> {
 
     /// The compiled front end is the authority: unit passes, a raise fails, and a missing body or
     /// any other answer is Ply's defect.
-    fn tier_test(
-        &mut self,
-        module: &ModuleName,
-        ordinal: usize,
-        span: Span,
-    ) -> Result<(), Diagnostic> {
+    fn tier_test(&mut self, module: &ModuleName, ordinal: usize, span: Span) -> Ended<()> {
         let root = module.qualify(&Symbol::new(format!("test#{ordinal}")));
         self.compiled.set_seed(self.seed.clone(), self.sim_steps);
         let entered = self.compiled.enter_test(&root, self.max_calls);
         self.record_compiled_atoms();
         self.record = self.compiled.simulated();
-        let out = match entered {
+        let answer = match entered {
             Entered::Answered(Value::Unit) => {
                 self.compiled_entries += 1;
                 Ok(())
@@ -213,34 +242,33 @@ impl<'a> Machine<'a> {
                 Err(raised)
             }
         };
-        self.end_entry_point();
-        out
+        Ended {
+            answer,
+            warnings: self.end_entry_point(),
+        }
     }
 
     /// `name` is the program-wide name — `app.main`, not `main`.
-    pub fn call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
+    pub fn call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Ended<Value> {
         let sym = Symbol::new(name);
         // Before the run resets, so a refusal leaves the previous run's arena alone.
         let boundary = crate::escape::Boundary::EntryPoint { name };
         for arg in &args {
-            crate::escape::check(&boundary, arg, span)?;
+            if let Err(refused) = crate::escape::check(&boundary, arg, span) {
+                return Ended::refused(refused);
+            }
         }
         self.begin_entry();
         self.tier_call(&sym, args, span)
     }
 
-    fn tier_call(
-        &mut self,
-        sym: &Symbol,
-        args: Vec<Value>,
-        span: Span,
-    ) -> Result<Value, Diagnostic> {
+    fn tier_call(&mut self, sym: &Symbol, args: Vec<Value>, span: Span) -> Ended<Value> {
         self.compiled.set_seed(self.seed.clone(), self.sim_steps);
         let entered = self.compiled.enter_whole(sym, &args, self.max_calls);
         self.record_compiled_atoms();
         self.record = self.compiled.simulated();
-        self.end_entry_point();
-        match entered {
+        let warnings = self.end_entry_point();
+        let answer = match entered {
             Entered::Answered(value) => {
                 self.compiled_entries += 1;
                 Ok(value)
@@ -253,7 +281,8 @@ impl<'a> Machine<'a> {
                 self.compiled_declines += 1;
                 Err(err_not_compiled(sym, span))
             }
-        }
+        };
+        Ended { answer, warnings }
     }
 
     fn begin_entry(&mut self) {
@@ -271,21 +300,18 @@ impl<'a> Machine<'a> {
         self.host_use.atoms = self.host_use.atoms.union(&used.atoms);
         self.host_use.operations += used.operations;
         self.host_ops = self.host_ops.saturating_add(ops);
-        self.teardown.extend(self.compiled.take_teardown());
     }
 
-    /// Hands the host runtime every exit path from an entry point.
-    fn end_entry_point(&mut self) {
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        if let Err(diagnostic) = runtime.end_entry_point(self.id) {
-            self.teardown.push(diagnostic);
+    /// Hands the host runtime every exit path from an entry point, and answers what the entry's
+    /// ending warned of.
+    fn end_entry_point(&mut self) -> Vec<Diagnostic> {
+        let mut warnings = self.compiled.take_teardown();
+        if let Some(runtime) = self.runtime.clone()
+            && let Err(diagnostic) = runtime.end_entry_point(self.id)
+        {
+            warnings.push(diagnostic);
         }
-    }
-
-    pub fn take_teardown_warnings(&mut self) -> Vec<Diagnostic> {
-        std::mem::take(&mut self.teardown)
+        warnings
     }
 }
 

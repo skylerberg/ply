@@ -73,6 +73,8 @@ impl Compiled {
             .expect("the unit was compiled from this program");
         let failure = machine
             .eval_test(index)
+            .into_parts()
+            .0
             .expect_err("the fixture must fail as written");
         assert_ne!(
             failure.code,

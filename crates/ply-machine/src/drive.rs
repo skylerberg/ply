@@ -12,7 +12,8 @@ use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
 use crate::support::{enter_constant, prover_backend, select_profile};
 use ply_eval::{
-    CheckOutput, Diagnostic, Front, ModuleName, SourceMap, Span, Symbol, Value as PlyValue, codes,
+    CheckOutput, Diagnostic, Ended, Front, ModuleName, SourceMap, Span, Symbol, Value as PlyValue,
+    codes,
 };
 use ply_host::process::{Executables, ProcessHost, Sink, Stream};
 use ply_host::signal::{self, Shutdown};
@@ -376,12 +377,9 @@ impl Drive {
     }
 
     /// Enter one definition with arguments, the way `call` asks: the value back, or what it
-    /// raised. The binding stays up, so a load may be called any number of times.
-    pub fn call(
-        &mut self,
-        name: &str,
-        args: Vec<ply_eval::Plain>,
-    ) -> Result<ply_eval::Plain, Diagnostic> {
+    /// raised, and what the entry ended with. The binding stays up, so a load may be called any
+    /// number of times.
+    pub fn call(&mut self, name: &str, args: Vec<ply_eval::Plain>) -> Ended<ply_eval::Plain> {
         let options = &self.options;
         let target = &self.target;
         let span = target
@@ -391,12 +389,12 @@ impl Drive {
             .map(|d| d.span)
             .unwrap_or(Span::DUMMY);
         let Some((_, bound)) = self.bound.as_ref() else {
-            return Err(Diagnostic::error(
+            return Ended::refused(Diagnostic::error(
                 codes::INTERNAL_ERROR,
                 "`machine.call` before `machine.bound`: nothing is bound to call into".to_string(),
             ));
         };
-        let args: Vec<PlyValue> = args
+        let args: Vec<PlyValue> = match args
             .into_iter()
             .map(|a| {
                 a.into_value().map_err(|why| {
@@ -407,12 +405,16 @@ impl Drive {
                     .primary(span, "an argument crosses as data")
                 })
             })
-            .collect::<Result<_, _>>()?;
+            .collect()
+        {
+            Ok(args) => args,
+            Err(refused) => return Ended::refused(refused),
+        };
         let plan = crate::simulation::run_plan(options.seed.as_ref());
         let compiled = bound.compiled();
         ply_eval::rc::reset();
         let started = Instant::now();
-        let outcome = ply_codegen::rt::with_step_budget(options.steps, || {
+        let ended = ply_codegen::rt::with_step_budget(options.steps, || {
             ply_codegen::rt::with_time_budget(options.timeout, || {
                 evaluate(
                     target.front(),
@@ -427,7 +429,7 @@ impl Drive {
         });
         // A call that raised still did the work its accounting counts.
         note_measurement(&mut self.accounting, &compiled, started);
-        Ok(ply_eval::Plain::of(&outcome?))
+        ended.map(|answer| answer.map(|value| ply_eval::Plain::of(&value)))
     }
 
     /// What the calls since the last read measured, and the read resets it.
@@ -456,7 +458,7 @@ impl Drive {
         // The `ply` program performing this is inside a scope that zeroed the thread-local
         // budgets, and the lookup prefers a thread-local to the process value, so the entry's own
         // bounds are set here, on the thread it runs on, and nowhere else.
-        let answer = ply_codegen::rt::with_step_budget(options.steps, || {
+        let ended = ply_codegen::rt::with_step_budget(options.steps, || {
             ply_codegen::rt::with_time_budget(options.timeout, || {
                 evaluate(
                     target.front(),
@@ -473,6 +475,7 @@ impl Drive {
             })
         });
         note_measurement(&mut self.accounting, &compiled, started);
+        let (answer, warnings) = ended.into_parts();
         let counters = ply_eval::rc::stats();
         // A cycle among escaped values is never collected, so only this run can report it.
         let cycles = ply_eval::rc::take_cycles();
@@ -498,6 +501,7 @@ impl Drive {
             raised: None,
             counters,
             cycles,
+            warnings,
             stopping,
             teardown: Teardown {
                 lead_ms: options.shutdown.drain_lead_ms,
@@ -622,8 +626,11 @@ fn evaluate(
     hosts: &Hosts,
     declared: Option<&ply_eval::Footprint>,
     compiled: std::rc::Rc<dyn ply_eval::Compiled>,
-) -> Result<PlyValue, Diagnostic> {
-    let mut machine = ply_eval::Machine::new(front, compiled)?;
+) -> Ended<PlyValue> {
+    let mut machine = match ply_eval::Machine::new(front, compiled) {
+        Ok(machine) => machine,
+        Err(refused) => return Ended::refused(refused),
+    };
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);
@@ -635,7 +642,7 @@ fn evaluate(
     ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
     machine
         .call(call.name, call.args, span)
-        .map_err(|d| place_the_unplaced(d, call.name))
+        .map(|answer| answer.map_err(|d| place_the_unplaced(d, call.name)))
 }
 
 /// A raise with no place says what failed and not what was running, which is
@@ -895,6 +902,8 @@ pub struct Outcome {
     raised: Option<Diagnostic>,
     counters: ply_eval::rc::Stats,
     cycles: Vec<Diagnostic>,
+    /// What the entry ended with, such as the spans it left open.
+    warnings: Vec<Diagnostic>,
     stopping: Option<Stopped>,
     teardown: Teardown,
     trace: Option<ply_host::trace::Counts>,
@@ -918,6 +927,7 @@ impl Outcome {
             ),
             counters: ply_eval::rc::Stats::default(),
             cycles: Vec::new(),
+            warnings: Vec::new(),
             stopping: None,
             teardown: Teardown {
                 lead_ms: 0,
@@ -983,6 +993,7 @@ pub fn outcome_value(o: &Outcome) -> PlyValue {
         ),
         ("counters", counters_value(&o.counters)),
         ("cycles", diags_value(&o.cycles)),
+        ("warnings", diags_value(&o.warnings)),
         (
             "stopping",
             option(o.stopping.as_ref().map(|s| {
@@ -1013,6 +1024,21 @@ pub fn outcome_value(o: &Outcome) -> PlyValue {
         ),
         ("hosts", json(&o.hosts)),
         ("configuration", json(&o.configuration)),
+    ])
+}
+
+/// What a `call` answers with: the value or what it raised, and what the entry ended with.
+pub fn called_value(called: Ended<ply_eval::Plain>) -> PlyValue {
+    let (answer, warnings) = called.into_parts();
+    record(vec![
+        (
+            "answer",
+            match answer {
+                Ok(plain) => PlyValue::ctor("Ok", vec![crate::payload::plain_value(&plain)]),
+                Err(d) => PlyValue::ctor("Err", vec![crate::payload::raised_value(&d)]),
+            },
+        ),
+        ("warnings", diags_value(&warnings)),
     ])
 }
 
