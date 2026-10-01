@@ -55,7 +55,7 @@ type Claimed = {
   binders: List<Bound>,
   result: Option<Bound>,
   variables: List<String>,
-  guarded: Bool,
+  guards: List<{ module: Int, start: Int, end: Int }>,
   host: Bool,
   footprint: Option<String>,
   frame: Frame,

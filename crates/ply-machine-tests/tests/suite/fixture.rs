@@ -176,7 +176,7 @@ pub fn int_laws(laws: &[(&str, &[&str])]) -> ply_eval::Value {
             ),
             ("result", option(None)),
             ("variables", Value::list(Vec::new())),
-            ("guarded", Value::Bool(false)),
+            ("guards", Value::list(Vec::new())),
             ("host", Value::Bool(false)),
             ("footprint", option(None)),
             ("frame", ctor("proof.obligation", "Pure", Vec::new())),
