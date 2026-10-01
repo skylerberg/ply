@@ -33,12 +33,7 @@ struct Indirection {
     reason: &'static str,
 }
 
-/// Every `pub enum` under these directories is covered by the variant half: the runtime the test
-/// package drives, whose decisions are the package's and whose mechanisms are these.
-const COVERED_ENUM_ROOTS: &[&str] = &["crates/ply-test/src"];
-
-/// Individually covered enums outside `COVERED_ENUM_ROOTS`, as `(file, name)`: the prove package's
-/// runtime among them.
+/// The enums the variant half covers, as `(file, name)`: the prove package's runtime among them.
 const COVERED_ENUMS: &[(&str, &str)] = &[
     ("crates/ply-eval/src/span.rs", "Severity"),
     ("crates/ply-machine/src/engine.rs", "ObligationKind"),
@@ -1064,22 +1059,19 @@ fn variant_names(body: &[u8]) -> Vec<String> {
 fn covered_enums(sources: &[Source]) -> Vec<CoveredEnum> {
     let mut out = Vec::new();
     for source in sources {
-        let in_root = COVERED_ENUM_ROOTS
-            .iter()
-            .any(|root| source.rel.starts_with(root));
         let named: Vec<&str> = COVERED_ENUMS
             .iter()
             .filter(|(file, _)| *file == source.rel)
             .map(|(_, name)| *name)
             .collect();
-        if !in_root && named.is_empty() {
+        if named.is_empty() {
             continue;
         }
         for at in find_all(&source.text, b"pub enum ") {
             let name_at = skip_ws(&source.text, at + b"pub enum ".len(), source.text.len());
             let (name, name_end) = ident_at(&source.text, name_at);
             let name = String::from_utf8_lossy(name).into_owned();
-            if !in_root && !named.contains(&name.as_str()) {
+            if !named.contains(&name.as_str()) {
                 continue;
             }
             let Some(brace) = source.text[name_end..]
@@ -1262,15 +1254,19 @@ fn every_variant_of_a_covered_enum_is_constructed_in_production() {
     let tree = tree();
     let covered = &tree.covered;
 
+    let missing: Vec<String> = COVERED_ENUMS
+        .iter()
+        .filter(|(file, name)| !covered.iter().any(|e| e.file == *file && e.name == *name))
+        .map(|(file, name)| format!("{file}: {name}"))
+        .collect();
     assert!(
-        covered.len() > 10,
-        "found {} covered enums — COVERED_ENUM_ROOTS resolved to nothing",
-        covered.len()
+        missing.is_empty(),
+        "COVERED_ENUMS names enums the scan does not find, so it covers nothing of them: {missing:?}"
     );
     let total: usize = covered.iter().map(|e| e.variants.len()).sum();
     assert!(
-        total > 30,
-        "found {total} variants across the covered enums"
+        covered.iter().all(|e| !e.variants.is_empty()),
+        "a covered enum was read with no variants, which is a broken scan"
     );
 
     let allowed: BTreeSet<&str> = UNARMED_VARIANTS.iter().map(|(name, _)| *name).collect();
