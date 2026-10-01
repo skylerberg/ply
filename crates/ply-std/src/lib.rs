@@ -12,6 +12,8 @@ pub const BASE64: &str = include_str!("../ply/base64.ply");
 
 pub const BIGINT: &str = include_str!("../ply/bigint.ply");
 
+pub const BIN: &str = include_str!("../ply/bin.ply");
+
 pub const BYTES: &str = include_str!("../ply/bytes.ply");
 
 pub const CERTGEN: &str = include_str!("../ply/certgen.ply");
@@ -84,6 +86,7 @@ pub const VALUE: &str = include_str!("../ply/value.ply");
 pub const MODULES: &[(&str, &str)] = &[
     ("std.base64", BASE64),
     ("std.bigint", BIGINT),
+    ("std.bin", BIN),
     ("std.bytes", BYTES),
     ("std.certgen", CERTGEN),
     ("std.config", CONFIG),

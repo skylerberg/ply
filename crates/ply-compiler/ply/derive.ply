@@ -10,8 +10,9 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
               ReturnClause, RecField)
 import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TDAlias, TDSum,
-              VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, ImportDecl, ImportKind, IModule,
-              IAlias, INames, Vis, VPub, VPriv, Derived, Constraint, SpecClause, parse)
+              VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, deriver_text, deriver_tag,
+              ImportDecl, ImportKind, IModule, IAlias, INames, Vis, VPub, VPriv, Derived,
+              Constraint, SpecClause, parse)
 import rewrite (expand)
 import resolve (Diag, Source, diag1, diag2, is_bare, dump_diags)
 
@@ -34,6 +35,8 @@ pub fn con_shape(d: Deriver, name: Bytes) -> ConShape =
   else if name == b"List" || name == b"Option" || name == b"Map" || name == b"Result"
       || name == b"Ordering"
       || name == b"Rounding" { Structural }
+  else if same_deriver(d, DBin) && is_fixed_width(name) { Leaf }
+  else if same_deriver(d, DBin) && name == b"Iter" { Structural }
   else if name == b"Cell" || name == b"Task" { Refused(WHandle) }
   else if name == b"Secret" { match d { DEq -> Leaf, _ -> Refused(WSecret) } }
   else { Nominal }
@@ -41,17 +44,22 @@ pub fn con_shape(d: Deriver, name: Bytes) -> ConShape =
 // Whether a type constructor's JSON encoding can be the document `null`.
 pub fn null_encoded_name(name: Bytes) -> Bool = name == b"Unit" || name == b"Option"
 
-pub fn deriver_text(d: Deriver) -> Bytes =
-  match d { DJson -> b"json", DEq -> b"eq", DOrd -> b"ord" }
-
-pub fn deriver_tag(d: Deriver) -> Int = match d { DJson -> 0, DEq -> 1, DOrd -> 2 }
+fn is_fixed_width(name: Bytes) -> Bool =
+  name == b"U8" || name == b"U16" || name == b"U32" || name == b"U64" || name == b"U128"
+    || name == b"I8"
+    || name == b"I16"
+    || name == b"I32"
+    || name == b"I64"
+    || name == b"I128"
 
 pub fn same_deriver(a: Deriver, b: Deriver) -> Bool = deriver_tag(a) == deriver_tag(b)
 
 // The module whose definitions a generated body calls, if any.
-fn runtime_module(d: Deriver) -> Option<Bytes> = match d { DJson -> Some(b"std.json"), _ -> None }
+fn runtime_module(d: Deriver) -> Option<Bytes> =
+  match d { DJson -> Some(b"std.json"), DBin -> Some(b"std.bin"), _ -> None }
 
-fn runtime_path(d: Deriver) -> List<Bytes> = match d { DJson -> [b"std", b"json"], _ -> [] }
+fn runtime_path(d: Deriver) -> List<Bytes> =
+  match d { DJson -> [b"std", b"json"], DBin -> [b"std", b"bin"], _ -> [] }
 
 fn is_upper_b(c: Int) -> Bool = c >= 65 && c <= 90
 fn is_lower_b(c: Int) -> Bool = c >= 97 && c <= 122
@@ -109,6 +117,7 @@ fn function_refusal(d: Deriver) -> Bytes =
     DJson -> b"a function has no JSON encoding",
     DEq -> b"functions cannot be compared for equality",
     DOrd -> b"functions cannot be ordered",
+    DBin -> b"a function has no binary encoding",
   }
 
 pub fn refusal_reason(w: Why, d: Deriver, simple: Bytes) -> Bytes =
@@ -124,6 +133,7 @@ pub fn secret_reason(d: Deriver) -> Bytes =
     DJson -> b"a derived codec would write the credential into the document",
     DOrd -> b"a credential has no order",
     DEq -> b"a credential has no structural equality to derive",
+    DBin -> b"a derived codec would write the credential into the bytes",
   }
 
 pub fn refusal_note(w: Why, d: Deriver) -> Option<Bytes> =
@@ -223,15 +233,21 @@ fn check_te(d: Deriver, te: TypeExpr) -> Option<Blocker> =
 
 type Alias = { name: Bytes, body: TypeExpr }
 
-// `b` prefixes every generated binder, chosen so none can shadow a dictionary parameter.
-type Emitter = { d: Deriver, rt: Bytes, b: Bytes, aliases: List<Alias> }
+// `b` prefixes every generated binder, chosen so none can shadow a dictionary parameter; `path` is the module's.
+type Emitter = { d: Deriver, rt: Bytes, b: Bytes, aliases: List<Alias>, path: Bytes }
 
-fn emitter(d: Deriver, rt: Bytes, params: List<Ident>, aliases: List<Alias>) -> Emitter = {
+fn emitter(
+  d: Deriver,
+  rt: Bytes,
+  params: List<Ident>,
+  aliases: List<Alias>,
+  path: Bytes,
+) -> Emitter = {
   let b = iterate(b"d", len(params) + 2, |x: Bytes|
     if fold(params, false, |acc: Bool, p: Ident| acc || bytes_starts_with(p.name, x)) {
       Continue(bytes_concat(x, b"_"))
     } else { Stop(x) });
-  { d: d, rt: rt, b: b, aliases: aliases }
+  { d: d, rt: rt, b: b, aliases: aliases, path: path }
 }
 
 fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
@@ -273,10 +289,11 @@ fn emit_item(e: Emitter, def: TypeDef) -> Bytes = {
   ])
 }
 
-// `JsonCodec<a>` is nominal and ships with `std.json`; `EqDict` and `OrdDict` are structural.
+// `JsonCodec<a>` and `BinCodec<a>` ship with their runtime modules; `EqDict` and `OrdDict` are structural.
 fn dict_type(e: Emitter, arg: Bytes) -> Bytes =
   match e.d {
     DJson -> bytes_concat_all([e.rt, b"JsonCodec<", arg, b">"]),
+    DBin -> bytes_concat_all([e.rt, b"BinCodec<", arg, b">"]),
     DEq -> bytes_concat_all([b"{eq: (", arg, b", ", arg, b") -> Bool}"]),
     DOrd -> bytes_concat_all([b"{compare: (", arg, b", ", arg, b") -> Ordering}"]),
   }
@@ -316,27 +333,42 @@ fn dictionary(e: Emitter, def: TypeDef, target: Bytes) -> Bytes =
         b"b)}",
       ]),
     DJson -> match def.body {
-      TDAlias(body) -> json_codec(e, body, target),
+      TDAlias(body) -> codec(e, body, target),
       TDSum(variants) -> json_sum(e, variants, target),
+    },
+    DBin -> match def.body {
+      TDAlias(body) -> codec(e, body, target),
+      TDSum(variants) -> bin_sum(e, def, variants, target),
     },
   }
 
-// An expression of type `JsonCodec<te>`.
-fn json_codec(e: Emitter, te: TypeExpr, annotation: Bytes) -> Bytes =
+// An expression of the codec type of `te`: `JsonCodec<te>` or `BinCodec<te>`.
+fn codec(e: Emitter, te: TypeExpr, annotation: Bytes) -> Bytes =
   match te {
     TVar(p) -> p.name,
-    TUnit(_) -> bytes_concat(e.rt, b"unit_json()"),
+    TUnit(_) -> bytes_concat_all([e.rt, b"unit_", deriver_text(e.d), b"()"]),
     TBad(_) -> b"()",
     TFn(_) -> b"()",
-    TRecord(r) -> json_record(e, r.fields, annotation),
+    TRecord(r) -> match e.d {
+      DBin -> bin_record(e, r.fields, annotation),
+      _ -> json_record(e, r.fields, annotation),
+    },
     TCon(c) -> {
       let simple = c.name.name.name;
-      let codecs = map(c.args, |a: TypeExpr| json_codec(e, a, render_type(a)));
+      let codecs = map(c.args, |a: TypeExpr| codec(e, a, render_type(a)));
       // A JSON object's keys are strings, so a `Map<String, v>` has an object form.
-      if simple == b"Map" && len(c.args) == 2 && is_string(e, at(c.args, 0)) {
+      if same_deriver(e.d, DJson) && simple == b"Map" && len(c.args) == 2
+          && is_string(e, at(c.args, 0)) {
         bytes_concat_all([e.rt, b"string_map_json(", at(codecs, 1), b")"])
       } else {
-        let call = bytes_concat_all([snake_case(simple), b"_json(", join(codecs, b", "), b")"]);
+        let call = bytes_concat_all([
+          snake_case(simple),
+          b"_",
+          deriver_text(e.d),
+          b"(",
+          join(codecs, b", "),
+          b")",
+        ]);
         // A named type is composed through by name, never inlined.
         match con_shape(e.d, simple) {
           Nominal -> match c.name.module {
@@ -375,7 +407,7 @@ fn json_record(
       b"{key: \"",
       f.name.name,
       b"\", value: (",
-      json_codec(e, f.ty, render_type(f.ty)),
+      codec(e, f.ty, render_type(f.ty)),
       b".encode)(",
       e.b,
       b"v.",
@@ -409,7 +441,7 @@ fn json_record(
         b"j, \"",
         f.name.name,
         b"\", ",
-        json_codec(e, f.ty, render_type(f.ty)),
+        codec(e, f.ty, render_type(f.ty)),
         b") {Err(",
         e.b,
         b"e) -> Err(",
@@ -445,7 +477,7 @@ fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes = {
     let values = map(range(0, len(v.fields)), |i: Int|
       bytes_concat_all([
         b"(",
-        json_codec(e, at(v.fields, i), render_type(at(v.fields, i))),
+        codec(e, at(v.fields, i), render_type(at(v.fields, i))),
         b".encode)(",
         e.b,
         num(i),
@@ -501,7 +533,7 @@ fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes = {
             b"t, ",
             num(i),
             b"), ",
-            json_codec(e, at(v.fields, i), render_type(at(v.fields, i))),
+            codec(e, at(v.fields, i), render_type(at(v.fields, i))),
             b".decode) {Err(",
             e.b,
             b"e) -> Err(",
@@ -548,6 +580,192 @@ fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes = {
     b"}",
   ]);
   bytes_concat_all([b"{encode: ", encode, b", decode: ", decode, b"}"])
+}
+
+// A scalar is written and read by `std.bin`'s own functions rather than through a codec.
+fn bin_scalar(te: TypeExpr) -> Option<Bytes> =
+  match te {
+    TUnit(_) -> Some(b"unit"),
+    TCon(c) -> match con_shape(DBin, c.name.name.name) {
+      Leaf -> Some(snake_case(c.name.name.name)),
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn bin_put(e: Emitter, te: TypeExpr, w: Bytes, x: Bytes) -> Bytes =
+  match bin_scalar(te) {
+    Some(s) -> bytes_concat_all([e.rt, b"put_", s, b"(", w, b", ", x, b")"]),
+    None -> bytes_concat_all([b"(", codec(e, te, render_type(te)), b".put)(", w, b", ", x, b")"]),
+  }
+
+fn bin_take(e: Emitter, te: TypeExpr, from: Bytes) -> Bytes =
+  match bin_scalar(te) {
+    Some(s) -> bytes_concat_all([e.rt, b"take_", s, b"(", e.b, b"d, ", from, b")"]),
+    None ->
+      bytes_concat_all([b"(", codec(e, te, render_type(te)), b".take)(", e.b, b"d, ", from, b")"]),
+  }
+
+// Each of `tys` read where the last ended, the first at `start`, then `built` over their values.
+fn bin_takes(e: Emitter, tys: List<TypeExpr>, start: Bytes, built: Bytes) -> Bytes = {
+  let n = len(tys);
+  let end_of = |i: Int| if i < 0 { start } else { bytes_concat_all([e.b, num(i), b".at"]) };
+  fold(
+    range(0, n),
+    bytes_concat_all([b"Ok({value: ", built, b", at: ", end_of(n - 1), b"})"]),
+    |acc: Bytes, k: Int| {
+      let i = n - 1 - k;
+      bytes_concat_all([
+        b"match ",
+        bin_take(e, at(tys, i), end_of(i - 1)),
+        b" {Err(",
+        e.b,
+        b"e) -> Err(",
+        e.b,
+        b"e), Ok(",
+        e.b,
+        num(i),
+        b") -> ",
+        acc,
+        b"}",
+      ])
+    },
+  )
+}
+
+fn values_of(e: Emitter, n: Int) -> List<Bytes> =
+  map(range(0, n), |i: Int| bytes_concat_all([e.b, num(i), b".value"]))
+
+fn shapes_of(e: Emitter, tys: List<TypeExpr>) -> Bytes =
+  join(map(tys, |t: TypeExpr| bytes_concat(codec(e, t, render_type(t)), b".shape")), b", ")
+
+fn bin_record(e: Emitter, fields: List<{ name: Ident, ty: TypeExpr }>, annotation: Bytes) -> Bytes = {
+  let put = fold(fields, bytes_concat(e.b, b"w"), |acc: Bytes, f: { name: Ident, ty: TypeExpr }|
+    bin_put(e, f.ty, acc, bytes_concat_all([e.b, b"v.", f.name.name])));
+  let values = values_of(e, len(fields));
+  let built = map(range(0, len(fields)), |i: Int|
+    bytes_concat_all([at(fields, i).name.name, b": ", at(values, i)]));
+  let shapes = map(fields, |f: { name: Ident, ty: TypeExpr }|
+    bytes_concat_all([
+      b"{name: \"",
+      f.name.name,
+      b"\", shape: ",
+      codec(e, f.ty, render_type(f.ty)),
+      b".shape}",
+    ]));
+  bytes_concat_all([
+    b"{put: |",
+    e.b,
+    b"w: Bytes, ",
+    e.b,
+    b"v: ",
+    annotation,
+    b"| ",
+    put,
+    b", take: |",
+    e.b,
+    b"d: Bytes, ",
+    e.b,
+    b"n: Int| ",
+    bin_takes(
+      e,
+      map(fields, |f: { name: Ident, ty: TypeExpr }| f.ty),
+      bytes_concat(e.b, b"n"),
+      bytes_concat_all([b"{", join(built, b", "), b"}"]),
+    ),
+    b", shape: |",
+    e.b,
+    b"s: ",
+    e.rt,
+    b"Shapes| ",
+    e.rt,
+    b"record_shape(",
+    e.b,
+    b"s, [",
+    join(shapes, b", "),
+    b"])}",
+  ])
+}
+
+// A variant is its index among the declared constructors, then its fields in order.
+fn bin_sum(e: Emitter, def: TypeDef, variants: List<VariantDef>, target: Bytes) -> Bytes = {
+  let count = len(variants);
+  let arms = map(range(0, count), |vi: Int| {
+    let v = at(variants, vi);
+    let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(e.b, num(i)));
+    let pat = if len(binders) == 0 { v.name.name }
+    else { bytes_concat_all([v.name.name, b"(", join(binders, b", "), b")"]) };
+    let tagged = bytes_concat_all([e.rt, b"put_tag(", e.b, b"w, ", num(vi), b")"]);
+    let body = fold(range(0, len(v.fields)), tagged, |acc: Bytes, i: Int|
+      bin_put(e, at(v.fields, i), acc, at(binders, i)));
+    bytes_concat_all([pat, b" -> ", body])
+  });
+  let cases = map(range(0, count), |vi: Int| {
+    let v = at(variants, vi);
+    let args = if len(v.fields) == 0 { b"" }
+    else { bytes_concat_all([b"(", join(values_of(e, len(v.fields)), b", "), b")"]) };
+    bytes_concat_all([
+      if vi == count - 1 { b"_" } else { num(vi) },
+      b" -> ",
+      bin_takes(e, v.fields, bytes_concat(e.b, b"t.at"), bytes_concat(v.name.name, args)),
+    ])
+  });
+  let shapes = map(variants, |v: VariantDef|
+    bytes_concat_all([b"{name: \"", v.name.name, b"\", fields: [", shapes_of(e, v.fields), b"]}"]));
+  let params = join(map(def.params, |p: Ident| bytes_concat(p.name, b".shape")), b", ");
+  bytes_concat_all([
+    b"{put: |",
+    e.b,
+    b"w: Bytes, ",
+    e.b,
+    b"v: ",
+    target,
+    b"| match ",
+    e.b,
+    b"v {",
+    join(arms, b", "),
+    b"}, take: |",
+    e.b,
+    b"d: Bytes, ",
+    e.b,
+    b"n: Int| match ",
+    e.rt,
+    b"take_tag(",
+    e.b,
+    b"d, ",
+    e.b,
+    b"n, ",
+    num(count),
+    b") {Err(",
+    e.b,
+    b"e) -> Err(",
+    e.b,
+    b"e), Ok(",
+    e.b,
+    b"t) -> match ",
+    e.b,
+    b"t.value {",
+    join(cases, b", "),
+    b"}}, shape: |",
+    e.b,
+    b"s: ",
+    e.rt,
+    b"Shapes| ",
+    e.rt,
+    b"sum_shape(",
+    e.b,
+    b"s, \"",
+    e.path,
+    b".",
+    def.name.name,
+    b"\", \"",
+    def.name.name,
+    b"\", [",
+    params,
+    b"], [",
+    join(shapes, b", "),
+    b"])}",
+  ])
 }
 
 fn qname_text(q: QName) -> Bytes =
@@ -852,6 +1070,7 @@ type Claimed = { name: Bytes, def: DeriveDef }
 type Generated = { source: Bytes, def: FnDef, derived: Derived }
 type Ex = {
   m: Int,
+  path: Bytes,
   module: Module,
   types: List<TypeDef>,
   aliases: List<Alias>,
@@ -901,7 +1120,7 @@ fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool =
       acc && lower_byte(bytes_at(a, i)) == lower_byte(bytes_at(b, i)))
 
 // Each table keeps the first of a name on its own, so an alias may follow a same-named sum type.
-fn new_expander(m: Int, module: Module) -> Ex = {
+fn new_expander(m: Int, path: Bytes, module: Module) -> Ex = {
   let walked = fold(
     module.items,
     { types: [], aliases: [] },
@@ -926,6 +1145,7 @@ fn new_expander(m: Int, module: Module) -> Ex = {
   );
   {
     m: m,
+    path: path,
     module: module,
     types: walked.types,
     aliases: walked.aliases,
@@ -956,7 +1176,7 @@ fn one(ex: Ex, def: DeriveDef) -> Ex =
               None -> ex1,
               Some(prefix) -> {
                 let source = emit_item(
-                  emitter(def.deriver, prefix, target.params, ex1.aliases),
+                  emitter(def.deriver, prefix, target.params, ex1.aliases, ex1.path),
                   target,
                 );
                 match parse_generated(source, def.span) {
@@ -1188,13 +1408,13 @@ fn internal(ex: Ex, def: DeriveDef, source: Bytes) -> Ex =
     ),
   )
 
-// Appends the generated definitions and any import a runtime module needed.
-pub fn expand_derives(m: Int, module: Module) -> Expansion =
+// Appends the generated definitions and any import a runtime module needed; `path` names the module.
+pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion =
   if !fold(module.items, false, |b: Bool, it: Item|
       b || (match it { IDerive(_) -> true, _ -> false })) {
     { module: module, derived: [], diags: [] }
   } else {
-    let ex = run_expander(new_expander(m, module));
+    let ex = run_expander(new_expander(m, path, module));
     let added = fold(ex.runtimes, [], |acc: List<ImportDecl>, r: Runtime|
       match r.added { Some(i) -> push(acc, i), None -> acc });
     {
@@ -1208,8 +1428,8 @@ pub fn expand_derives(m: Int, module: Module) -> Expansion =
   }
 
 // The source each of this module's derivations generates, in `derive` order.
-pub fn preview(module: Module) -> List<Bytes> =
-  map(run_expander(new_expander(0, module)).generated, |g: Generated| g.source)
+pub fn preview(path: Bytes, module: Module) -> List<Bytes> =
+  map(run_expander(new_expander(0, path, module)).generated, |g: Generated| g.source)
 
 // Each module expanded on its own: its generated sources length-prefixed, then its diagnostics.
 pub fn derive_dump(sources: List<Source>) -> String = {
@@ -1217,8 +1437,8 @@ pub fn derive_dump(sources: List<Source>) -> String = {
     let s = at(sources, i);
     let r = parse(s.src);
     let x = expand(r.node, r.p.uses_sets, r.p.diags);
-    let generated = preview(x.module);
-    let d: Expansion = expand_derives(i, x.module);
+    let generated = preview(s.name, x.module);
+    let d: Expansion = expand_derives(i, s.name, x.module);
     bytes_concat_all([
       acc,
       b"M;",
@@ -1247,7 +1467,7 @@ test "snake_case follows the rule, acronyms included" {
 
 test "the generated form is pinned to the reference's golden output" {
   let src = b"import std.json\ntype Order = {id: Int, lines: List<Line>}\ntype Line = {sku: String}\ntype Status = Placed | Shipped(Int)\nderive json for Order\nderive eq for Line\nderive ord for Line\nderive json for Status";
-  let out = preview(parse(src).node);
+  let out = preview(b"t", parse(src).node);
   assert_eq(len(out), 4);
   assert_eq(
     at(out, 0),
@@ -1267,14 +1487,28 @@ test "the generated form is pinned to the reference's golden output" {
   )
 }
 
+test "the bin form writes scalars straight, composes the rest, and keys a sum by its module" {
+  let src = b"import std.bin\ntype Line = {sku: String, qty: U32, tags: List<String>}\ntype Tree<a> = Leaf | Node(Tree<a>, a)\nderive bin for Line\nderive bin for Tree";
+  let out = preview(b"shop", parse(src).node);
+  assert_eq(len(out), 2);
+  assert_eq(
+    at(out, 0),
+    b"fn line_bin() -> bin::BinCodec<Line> = {put: |dw: Bytes, dv: Line| (bin::list_bin(bin::string_bin()).put)(bin::put_u32(bin::put_string(dw, dv.sku), dv.qty), dv.tags), take: |dd: Bytes, dn: Int| match bin::take_string(dd, dn) {Err(de) -> Err(de), Ok(d0) -> match bin::take_u32(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> match (bin::list_bin(bin::string_bin()).take)(dd, d1.at) {Err(de) -> Err(de), Ok(d2) -> Ok({value: {sku: d0.value, qty: d1.value, tags: d2.value}, at: d2.at})}}}, shape: |ds: bin::Shapes| bin::record_shape(ds, [{name: \"sku\", shape: bin::string_bin().shape}, {name: \"qty\", shape: bin::u32_bin().shape}, {name: \"tags\", shape: bin::list_bin(bin::string_bin()).shape}])}",
+  );
+  assert_eq(
+    at(out, 1),
+    b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = {put: |dw: Bytes, dv: Tree<a>| match dv {Leaf -> bin::put_tag(dw, 0), Node(d0, d1) -> (a.put)((tree_bin(a).put)(bin::put_tag(dw, 1), d0), d1)}, take: |dd: Bytes, dn: Int| match bin::take_tag(dd, dn, 2) {Err(de) -> Err(de), Ok(dt) -> match dt.value {0 -> Ok({value: Leaf, at: dt.at}), _ -> match (tree_bin(a).take)(dd, dt.at) {Err(de) -> Err(de), Ok(d0) -> match (a.take)(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> Ok({value: Node(d0.value, d1.value), at: d1.at})}}}}, shape: |ds: bin::Shapes| bin::sum_shape(ds, \"shop.Tree\", \"Tree\", [a.shape], [{name: \"Leaf\", fields: []}, {name: \"Node\", fields: [tree_bin(a).shape, a.shape]}])}",
+  )
+}
+
 test "a selective import of std.json still writes a module binder, stepping around a taken name" {
   let src = b"import other.json\nimport std.json (JsonCodec, Json, object, field, int_json)\ntype Order = {id: Int}\nderive json for Order";
-  let x = expand_derives(0, parse(src).node);
+  let x = expand_derives(0, b"t", parse(src).node);
   assert_eq(len(x.diags), 0);
   assert_eq(len(x.module.imports), 3);
   assert(
     bytes_starts_with(
-      at(preview(parse(src).node), 0),
+      at(preview(b"t", parse(src).node), 0),
       b"fn order_json() -> json_::JsonCodec<Order>",
     ),
   )
@@ -1282,7 +1516,7 @@ test "a selective import of std.json still writes a module binder, stepping arou
 
 test "every span in a generated definition is the derive item's" {
   let src = b"import std.json\ntype Order = {id: Int}\nderive json for Order";
-  let x = expand_derives(0, parse(src).node);
+  let x = expand_derives(0, b"t", parse(src).node);
   assert_eq(len(x.derived), 1);
   let d = at(x.derived, 0);
   assert_eq(d.span, { start: 39, end: 60 });
@@ -1296,18 +1530,24 @@ test "every span in a generated definition is the derive item's" {
 }
 
 test "an orphan, a collision, a missing runtime and a refused field each report as the reference does" {
-  let orphan_ = expand_derives(0, parse(b"import std.json\nderive json for Order").node);
+  let orphan_ = expand_derives(0, b"t", parse(b"import std.json\nderive json for Order").node);
   assert_eq(map(orphan_.diags, |d: Diag| d.code), [b"E0208"]);
   let twice = expand_derives(
     0,
+    b"t",
     parse(b"type Order = {id: Int}\nderive eq for Order\nderive eq for Order").node,
   );
   assert_eq(map(twice.diags, |d: Diag| d.code), [b"E0105"]);
   assert_eq(len(at(twice.diags, 0).labels), 2);
-  let missing = expand_derives(0, parse(b"type Order = {id: Int}\nderive json for Order").node);
+  let missing = expand_derives(
+    0,
+    b"t",
+    parse(b"type Order = {id: Int}\nderive json for Order").node,
+  );
   assert_eq(map(missing.diags, |d: Diag| d.code), [b"E0206"]);
   let refused = expand_derives(
     0,
+    b"t",
     parse(
       b"import std.json\ntype Order = {id: Int, on_complete: (Int) -> Unit}\nderive json for Order",
     ).node,
