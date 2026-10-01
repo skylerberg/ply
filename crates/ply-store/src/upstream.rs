@@ -2,7 +2,6 @@
 //! passes and discharged obligations keyed by content and by version. There is no lock: a key
 //! names its bytes, so a racing write is idempotent, and a reader sees a whole file or none.
 
-use crate::obligations::CachedObligation;
 use ply_eval::DefHash;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -76,7 +75,7 @@ impl Upstream {
         self.publish(&Self::place(&self.results(), hash), &[])
     }
 
-    pub fn obligation(&self, hash: DefHash) -> Option<CachedObligation> {
+    pub fn obligation(&self, hash: DefHash) -> Option<serde_json::Value> {
         let bytes = std::fs::read(Self::place(&self.obligations(), hash)).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
@@ -84,7 +83,7 @@ impl Upstream {
     pub fn publish_obligation(
         &self,
         hash: DefHash,
-        entry: &CachedObligation,
+        entry: &serde_json::Value,
     ) -> std::io::Result<()> {
         let bytes = serde_json::to_vec(entry).map_err(std::io::Error::other)?;
         self.publish(&Self::place(&self.obligations(), hash), &bytes)

@@ -164,7 +164,11 @@ fn a_second_configuration_is_a_second_run_over_its_own_project() {
                 "the second run collected the first project"
             );
         }
-        let warnings = ok(ask(&lent, "prepared", Vec::new()));
+        let warnings = ok(ask(
+            &lent,
+            "prepared",
+            vec![Value::Int(ply_eval::DEFAULT_STEP_BUDGET)],
+        ));
         assert!(list(&warnings).is_empty(), "{warnings:?}");
         // Each law judged where every binder is zero, which each of them holds at.
         let batches = owed

@@ -893,8 +893,7 @@ law \"every day is early\" forall (d: Day) { rank(d) / 1 < 7 }
 
 /// A counterexample is not finished when it is found: the walk that makes it small is the
 /// program's, driven one question at a time through the shrink operations, and what a report shows
-/// is what the walk settled on. This is the end-to-end claim for that — the fixture
-/// `ply-prove-tests`' walk tests used, read where a person reads it.
+/// is what the walk settled on. This is the end-to-end claim for that, read where a person reads it.
 #[test]
 fn a_counterexample_is_shrunk_by_the_program_that_reads_it() {
     // `n < 100` fails only at 100 and above, and the draw that finds it is as large as the type

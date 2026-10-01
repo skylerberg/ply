@@ -143,9 +143,8 @@ const PROVING: &str = "\
 nondet effect prover {
   write configure[claims](options: Unit, front: Unit, world: Unit) -> Unit
   read collected[claims]() -> Result<Unit, Unit>
-  read outcomes[claims](keys: List<String>) -> List<Option<String>>
-  read prepared[claims]() -> Result<List<Unit>, Unit>
-  read cached[claims](keys: List<String>) -> List<Option<Unit>>
+  read cached[claims](keys: List<String>) -> List<Option<String>>
+  read prepared[claims](step_budget: Int) -> Result<List<Unit>, Unit>
   read judged[claims](batches: List<Unit>) -> List<List<Unit>>
   read interleaved[claims](claim: Int, point: List<Unit>, seed: Unit, steps: Int) -> Unit
   write record[claims](entries: List<Unit>) -> List<Unit>

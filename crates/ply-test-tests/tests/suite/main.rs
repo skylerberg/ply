@@ -10,5 +10,4 @@ mod host_selection_audit;
 mod host_trust_audit;
 mod hybrid;
 mod isolation_audit;
-mod obligations;
 mod unit;
