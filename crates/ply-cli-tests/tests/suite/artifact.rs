@@ -1114,7 +1114,8 @@ fn spawning() -> (TempDir, Artifact, artifact::Opened) {
 #[test]
 fn an_entered_program_cannot_spawn_a_label_nothing_bound() {
     let (_dir, artifact, opened) = spawning();
-    let entered = artifact::enter(&artifact, &opened, Vec::new(), Binds::default());
+    let (entered, _) =
+        artifact::enter(&artifact, &opened, Vec::new(), Binds::default()).into_parts();
     let refused = entered.expect_err("`cc` is bound to nothing");
     assert_eq!(refused.code, codes::PROCESS_EXEC_UNBOUND);
 }
@@ -1130,9 +1131,39 @@ fn an_entered_program_starts_what_its_caller_bound_to_the_label() {
         executables,
         ..Binds::default()
     };
-    let entered = artifact::enter(&artifact, &opened, Vec::new(), binds);
+    let (entered, _) = artifact::enter(&artifact, &opened, Vec::new(), binds).into_parts();
     let code = entered.expect("the program runs");
     assert_eq!(code, 7, "the child's own code is what came back");
+}
+
+/// Opens a span and answers without closing it.
+const LEAVES_A_SPAN: &str = r#"
+import std.trace
+import std.trace (trace)
+
+fn main() -> Int / {trace.write[orders]} = {
+  let order = trace.enter[orders]("order", map_new());
+  3
+}
+"#;
+
+/// What the launcher reports for the program it entered: the code is the program's, and the span
+/// its entry left open comes back beside it.
+#[test]
+fn an_entered_program_hands_back_the_span_it_left_open_beside_its_code() {
+    let dir = project(LEAVES_A_SPAN);
+    let artifact = artifact_of(dir.path());
+    let opened = artifact::open(&artifact, Path::new("leaves.plyx")).expect("it opens");
+    let (code, warnings) =
+        artifact::enter(&artifact, &opened, Vec::new(), Binds::default()).into_parts();
+    assert_eq!(code.expect("the program runs"), artifact::EXIT_OK);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].code, codes::SPAN_ABANDONED, "{warnings:?}");
+    assert!(
+        warnings[0].message.contains("`order` on `orders`"),
+        "{}",
+        warnings[0].message
+    );
 }
 
 /// Exits 7 when its caller bound a program to `cc` and 9 when it did not, and starts nothing.
@@ -1148,7 +1179,8 @@ fn an_artifact_asks_whether_its_caller_bound_the_label_it_would_start() {
     let dir = project(ASKS_FOR_CC);
     let artifact = artifact_of(dir.path());
     let opened = artifact::open(&artifact, Path::new("asks.plyx")).expect("it opens");
-    let unbound = artifact::enter(&artifact, &opened, Vec::new(), Binds::default());
+    let (unbound, _) =
+        artifact::enter(&artifact, &opened, Vec::new(), Binds::default()).into_parts();
     assert_eq!(unbound.expect("the program runs"), 9);
     let mut executables = Executables::new();
     executables
@@ -1158,7 +1190,7 @@ fn an_artifact_asks_whether_its_caller_bound_the_label_it_would_start() {
         executables,
         ..Binds::default()
     };
-    let bound = artifact::enter(&artifact, &opened, Vec::new(), binds);
+    let (bound, _) = artifact::enter(&artifact, &opened, Vec::new(), binds).into_parts();
     assert_eq!(bound.expect("the program runs"), 7);
 
     // `ply run` over the same artifact answers from its own `--exec`.

@@ -176,6 +176,8 @@ fn run(entry: &str, args: Vec<Value>, script: Vec<Vec<u8>>) -> Result<Ran, Strin
     machine.set_declared_footprint(declared.footprint.clone());
     let answered = machine
         .call(entry, args, Span::DUMMY)
+        .into_parts()
+        .0
         .unwrap_or_else(|e| panic!("the call answers: {e}"));
     ran(answered, Some(net))
 }
@@ -203,6 +205,8 @@ fn run_over_tcp(entry: &str, args: Vec<Value>) -> Result<Ran, String> {
     machine.set_declared_footprint(declared.footprint.clone());
     let answered = machine
         .call(entry, args, Span::DUMMY)
+        .into_parts()
+        .0
         .unwrap_or_else(|e| panic!("the call answers: {e}"));
     ran(answered, None)
 }

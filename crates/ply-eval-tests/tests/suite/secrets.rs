@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 fn run(source: &str) -> Result<(), Diagnostic> {
     let compiled = Compiled::named("t", source);
     let mut machine = compiled.machine_on_tier();
-    machine.eval_test(0)
+    machine.eval_test(0).into_parts().0
 }
 
 #[track_caller]
@@ -289,7 +289,7 @@ fn a_secret_reaching_a_handler_that_does_not_declare_one_is_e0439() {
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), false)));
 
-    let d = machine.eval_test(0).expect_err("E0439");
+    let d = machine.eval_test(0).into_parts().0.expect_err("E0439");
     assert_eq!(d.code, codes::SECRET_TO_HOST);
     assert!(d.message.contains("net.send[socket]"), "{}", d.message);
     assert!(d.message.contains("argument 1"), "{}", d.message);
@@ -313,7 +313,7 @@ fn a_secret_nested_in_an_argument_is_found() {
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), false)));
 
-    let d = machine.eval_test(0).expect_err("E0439");
+    let d = machine.eval_test(0).into_parts().0.expect_err("E0439");
     assert_eq!(d.code, codes::SECRET_TO_HOST);
     assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
 }
@@ -325,7 +325,11 @@ fn an_operation_that_declares_secrets_receives_one() {
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), true)));
 
-    machine.eval_test(0).expect("the handler answers");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the handler answers");
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
     // Even there, the value still refuses to be copied out.
     assert_eq!(handler.seen.lock().unwrap().as_slice(), [Plain::Secret]);
@@ -338,7 +342,11 @@ fn an_argument_with_no_secret_reaches_the_handler_as_before() {
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), false)));
 
-    machine.eval_test(0).expect("the handler answers");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the handler answers");
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
 }
 

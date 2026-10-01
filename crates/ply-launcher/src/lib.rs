@@ -5,7 +5,7 @@
 //! big-stack thread, the artifact open, the `cwd` and `shelf` roots, the process and environment
 //! bindings, and the exit code.
 
-use ply_eval::{Diagnostic, codes};
+use ply_eval::{Diagnostic, Ended, codes};
 use ply_machine::artifact::{self, Binds};
 use std::path::{Path, PathBuf};
 
@@ -78,25 +78,35 @@ fn land_in(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Enter the program on the command's own big-stack thread; the answer is the exit code it asked
-/// for. `binds` lends whatever the caller's command configured on top of the launcher's own.
+/// for, with what the entry ended with. `binds` lends whatever the caller's command configured on
+/// top of the launcher's own.
 pub fn run(
     program: &Program,
     root: &Path,
     argv: Vec<String>,
     mut binds: Binds,
     count: Option<crate::count::Asked>,
-) -> Result<i32, Diagnostic> {
-    let shelf = shelf(program)?;
+) -> Ended<i32> {
+    let shelf = match shelf(program) {
+        Ok(shelf) => shelf,
+        Err(refused) => return Ended::refused(refused),
+    };
     let path = PathBuf::from(&program.artifact_name);
-    let (artifact, _) = artifact::decode(&program.artifact, &path)?;
-    let opened = artifact::open(&artifact, &path).map_err(|diagnostics| {
-        diagnostics.into_iter().next().unwrap_or_else(|| {
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                "the program did not open, and nothing said why",
-            )
-        })
-    })?;
+    let artifact = match artifact::decode(&program.artifact, &path) {
+        Ok((artifact, _)) => artifact,
+        Err(refused) => return Ended::refused(refused),
+    };
+    let opened = match artifact::open(&artifact, &path) {
+        Ok(opened) => opened,
+        Err(diagnostics) => {
+            return Ended::refused(diagnostics.into_iter().next().unwrap_or_else(|| {
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    "the program did not open, and nothing said why",
+                )
+            }));
+        }
+    };
     let mut roots = vec![
         ply_host::fs::RootSpec {
             name: "cwd".to_string(),
@@ -156,11 +166,13 @@ pub fn run(
             Ok(answer) => answer,
             Err(panic) => std::panic::resume_unwind(panic),
         },
-        Err(e) => Err(Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!("the program could not be started on a thread of its own: {e}"),
-        )
-        .primary(ply_eval::Span::DUMMY, "this is Ply's fault")),
+        Err(e) => Ended::refused(
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the program could not be started on a thread of its own: {e}"),
+            )
+            .primary(ply_eval::Span::DUMMY, "this is Ply's fault"),
+        ),
     }
 }
 

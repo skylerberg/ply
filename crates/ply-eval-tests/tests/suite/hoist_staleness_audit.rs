@@ -7,6 +7,8 @@ impl Compiled {
         let mut machine = self.machine();
         machine
             .call(name, Vec::new(), Span::DUMMY)
+            .into_parts()
+            .0
             .unwrap_or_else(|d| panic!("[{}] {}", d.code, d.message))
     }
 }

@@ -1,4 +1,4 @@
-use ply_eval::{DefHash, Span, Symbol, codes};
+use ply_eval::{DefHash, Diagnostic, Span, Symbol, codes};
 use ply_prove::{
     Binder, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation,
     ObligationKind, Points, ProvePlan, Rule, Sort, Strategy, Tier, Unsettled, Vacuity, VacuityKind,
@@ -144,6 +144,30 @@ impl Discharger for Scripted {
             _ => unattempted(),
         }
     }
+
+    fn teardown(&self) -> Vec<Diagnostic> {
+        Vec::new()
+    }
+}
+
+/// A prover whose every discharge enters an owner that leaves a span open.
+#[derive(Default)]
+struct Ending {
+    ended: Mutex<Vec<Diagnostic>>,
+}
+
+impl Discharger for Ending {
+    fn discharge(&self, obligation: &Obligation, _plan: &ProvePlan) -> Discharge {
+        self.ended.lock().unwrap().push(Diagnostic::warning(
+            codes::SPAN_ABANDONED,
+            format!("`{}` left a span open", obligation.owner),
+        ));
+        proved()
+    }
+
+    fn teardown(&self) -> Vec<Diagnostic> {
+        std::mem::take(&mut *self.ended.lock().unwrap())
+    }
 }
 
 /// The program's decision, carried out: every answered obligation's evidence is read back from the
@@ -153,7 +177,7 @@ fn carried_out(
     store: &Store,
     read: Vec<(usize, DefHash)>,
     to_discharge: Vec<usize>,
-    discharger: &Scripted,
+    discharger: &dyn Discharger,
 ) -> ply_prove::ProveReport {
     let choice = Choice {
         claims: (0..obligations.len()).collect(),
@@ -188,6 +212,27 @@ fn evidence_is_read_back_from_the_key_the_program_named_and_only_the_rest_is_dis
     );
     let tiers: Vec<Option<Tier>> = report.obligations.iter().map(|(_, d)| tier(d)).collect();
     assert_eq!(tiers, vec![Some(Tier::Property), Some(Tier::Proved)]);
+}
+
+#[test]
+fn what_the_discharges_entries_ended_with_is_in_the_report_and_read_once() {
+    let dir = TempRoot::new();
+    let store = dir.store();
+    let ending = Ending::default();
+    let report = carried_out(
+        vec![ensures(1, "m.f", 0), ensures(2, "m.g", 0)],
+        &store,
+        Vec::new(),
+        vec![0, 1],
+        &ending,
+    );
+    let mut warned: Vec<&str> = report.warnings.iter().map(|w| w.message.as_str()).collect();
+    warned.sort_unstable();
+    assert_eq!(warned, ["`m.f` left a span open", "`m.g` left a span open"]);
+    assert!(
+        ending.teardown().is_empty(),
+        "the report took what the entries ended with"
+    );
 }
 
 #[test]

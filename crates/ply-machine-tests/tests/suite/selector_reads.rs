@@ -144,6 +144,8 @@ fn a_selector_reads_the_keys_the_hashes_and_the_plan_before_anything_runs() {
             ],
             Span::DUMMY,
         )
+        .into_parts()
+        .0
         .expect("the outer main ran");
     assert_eq!(
         answer,

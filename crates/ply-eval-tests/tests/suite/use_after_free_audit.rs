@@ -15,7 +15,7 @@ impl Compiled {
     #[track_caller]
     fn run_call(&self, name: &str) -> (Result<Value, Diagnostic>, Stats) {
         let mut machine = self.machine();
-        let answer = machine.call(name, Vec::new(), Span::DUMMY);
+        let (answer, _) = machine.call(name, Vec::new(), Span::DUMMY).into_parts();
         (answer, machine.cells().stats())
     }
 }

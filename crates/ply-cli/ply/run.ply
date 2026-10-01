@@ -28,7 +28,7 @@ import sources
 import sources (load_resolved)
 import std.fs (fs)
 import std.time (time)
-import report (Answer, ind, ok_code, compile_error, count_of, refused, warning_lines)
+import report (Answer, ind, ok_code, compile_error, count_of, refused, warned_lines, warning_lines)
 import std.json (Json, Null, Str, Bool, Number, Array, Member, Object, object, to_string)
 import std.value (Value, VInt, VUnit, render)
 import std.process (process, Captured, captured, out_step, err_step)
@@ -358,14 +358,18 @@ fn document(
 // --- The answer -------------------------------------------------------------
 
 // Everything the run has to say about itself that is not the entry's own answer.
-fn noted(t: Target, b: Bound, e: Ended) -> List<Diag> = also(also(told_of(t), b.warnings), e.cycles)
+fn noted(t: Target, b: Bound, e: Ended) -> List<Diag> =
+  also(also(also(told_of(t), b.warnings), e.cycles), e.warnings)
 
 // The program chose its code and returned no value, so none is printed.
 fn exited(s: Style, t: Target, en: String, b: Bound, e: Ended, code: Int) -> Answer =
   {
     json: document(t, en, b, e, code == ok_code(), code, noted(t, b, e)),
     lines: handshake_lines(s, e),
-    errs: also(all_to_text(s, e.cycles, places_of(t)), stop_lines(s, e)),
+    errs: also(
+      also(all_to_text(s, e.cycles, places_of(t)), stop_lines(s, e)),
+      warned_lines(s, e.warnings),
+    ),
     code: code,
   }
 
@@ -375,7 +379,10 @@ fn answered(s: Style, t: Target, en: String, b: Bound, e: Ended) -> Answer =
     lines: also(handshake_lines(s, e), [
       ind() ++ (match e.value { Some(v) -> render(v), None -> "" }),
     ]),
-    errs: also(all_to_text(s, e.cycles, places_of(t)), stop_lines(s, e)),
+    errs: also(
+      also(all_to_text(s, e.cycles, places_of(t)), stop_lines(s, e)),
+      warned_lines(s, e.warnings),
+    ),
     code: ok_code(),
   }
 
@@ -386,10 +393,13 @@ fn raised(s: Style, t: Target, en: String, b: Bound, e: Ended, d: Diag) -> Answe
     lines: [],
     errs: also(
       also(
-        also(all_to_text(s, e.cycles, places_of(t)), stop_lines(s, e)),
-        all_to_text(s, [d], places_of(t)),
+        also(
+          also(all_to_text(s, e.cycles, places_of(t)), stop_lines(s, e)),
+          all_to_text(s, [d], places_of(t)),
+        ),
+        raised_at(s, t, d),
       ),
-      raised_at(s, t, d),
+      warned_lines(s, e.warnings),
     ),
     code: code,
   }
@@ -716,6 +726,7 @@ fn answered_with(value: Value) -> Ended =
     raised: None,
     counters: no_counters(),
     cycles: [],
+    warnings: [],
     stopping: None,
     teardown: no_teardown(),
     trace: None,
@@ -901,6 +912,54 @@ test "a stopped run says what was in flight, how long the drain took, and what i
     "   warning[W0608]: a sink would not flush",
     "   trace       9 event(s) · 4 span(s) · 1 abandoned · flushed",
   ])
+}
+
+// What the runtime warns of when an entry ends with `reserving` open inside `order`.
+fn left_open() -> Diag =
+  {
+    ..a_diag(b"W0609", b"2 spans were still open when their task or the entry point ended: `reserving` on `orders`, `order` on `orders`", []),
+    notes: 1,
+    notes_text: [b"each was closed `Abandoned` and written"],
+    severity: b"warning",
+  }
+
+fn warned_of_spans() -> List<String> =
+  [
+    "",
+    "   warning: 2 spans were still open when their task or the entry point ended: `reserving` on `orders`, `order` on `orders`",
+    "     = each was closed `Abandoned` and written",
+  ]
+
+test "spans an entry left open are warned of on stderr under its answer, and its exit 0 stands" {
+  let finished = { ..answered_with(VInt(3)), warnings: [left_open()] };
+  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), finished);
+  assert_eq(ran.answer.code, 0);
+  assert_eq(ran.answer.lines, ["   3"]);
+  assert_eq(ran.answer.errs, warned_of_spans());
+  let text = to_string(ran_over(as_json(), Ok(a_program()), Ok(hermetic()), finished).answer.json);
+  assert(string_contains(text, "\"code\":\"W0609\""));
+  assert(string_contains(text, "\"exit_code\":0"))
+}
+
+test "a raise that left spans open is said first, and the spans after where it was raised" {
+  let finished = {
+    ..answered_with(VUnit),
+    value: None,
+    raised: Some(
+      unvalued(
+        a_diag(b"E0502", b"boom", [
+          { module: 0, start: 19, end: 21, primary: true, text: b"here" },
+        ]),
+      ),
+    ),
+    warnings: [left_open()],
+  };
+  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), finished);
+  assert_eq(ran.answer.code, 1);
+  let errs = ran.answer.errs;
+  assert_eq(nth(errs, 0), "Error[E0502]: boom");
+  assert_eq(nth(errs, len(errs) - 4), "   raised at m.ply:1:20");
+  assert_eq(map(range(len(errs) - 3, len(errs)), |i: Int| nth(errs, i)), warned_of_spans())
 }
 
 test "an artifact says which file it ran, its digest, and what it carries" {

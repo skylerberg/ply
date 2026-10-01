@@ -1453,6 +1453,9 @@ pub nondet effect trace {
 The label is a channel; every perform is written at its call site. Tests collect
 records with `Sink` and `event_step`, `enter_step`, `exit_step`, `count_step`,
 `gauge_step`, `time_step`, `drain`, `named`, `on_channel`, `counter_total`.
+A span still open when its task retires or its entry point ends is closed
+`Abandoned`, innermost first, and written; the run warns of it (`W0609`), which
+changes no exit code.
 
 ### 13.8 `std.signal`
 

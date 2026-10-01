@@ -254,7 +254,11 @@ fn answers(name: &str, more: i64, seeds: std::ops::Range<u64>) {
     for root in seeds {
         let n = root as i64;
         machine.set_seed(Seed::root(root), DEFAULT_STEPS);
-        match machine.call(name, vec![Value::Int(n)], Span::DUMMY) {
+        match machine
+            .call(name, vec![Value::Int(n)], Span::DUMMY)
+            .into_parts()
+            .0
+        {
             Ok(Value::Int(got)) => assert_eq!(got, n + more, "`{name}` at seed {root}"),
             other => panic!("`{name}` at seed {root}: {other:?}"),
         }

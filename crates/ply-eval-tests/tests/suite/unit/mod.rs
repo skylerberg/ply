@@ -9,6 +9,7 @@ mod compiled;
 mod cont;
 mod decode;
 mod escape;
+mod evaluator;
 mod explore;
 mod footprint;
 mod hash;

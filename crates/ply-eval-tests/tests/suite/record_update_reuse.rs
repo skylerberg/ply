@@ -5,7 +5,7 @@ fn passes(source: &str, test: &str) -> rc::Stats {
     let compiled = Compiled::new(source);
     let index = compiled.index_of(test);
     let before = rc::stats();
-    if let Err(d) = compiled.machine().eval_test(index) {
+    if let Err(d) = compiled.machine().eval_test(index).into_parts().0 {
         panic!("{test:?} must pass: {d:#?}");
     }
     let after = rc::stats();
