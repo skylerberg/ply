@@ -110,19 +110,31 @@ fn width_of(ty: String) -> Int =
   else if ty == "U64" || ty == "I64" { 64 }
   else { 128 }
 
-// A width's value clamped into an `Int`, as the integer it is measured as.
-fn fixed_int(ty: String, bits: U128) -> Int = {
+fn mask_of(w: Int) -> U128 = if w == 128 { ~0u128 } else { (1u128 << w) - 1u128 }
+
+// A width's value as its sign and magnitude, which a `U64` or a 128-bit width can take past what an
+// `Int` holds.
+type Signed = { negative: Bool, magnitude: U128 }
+
+fn signed_of(ty: String, bits: U128) -> Signed = {
   let w = width_of(ty);
-  let pattern = if w == 128 { bits } else { bits & (1u128 << w) - 1u128 };
-  let negative = string_starts_with(ty, "I") && pattern >> w - 1 == 1u128;
-  if negative {
-    // `2^w - pattern` is the magnitude.
-    let magnitude = if w == 128 { wrap_sub(0u128, pattern) } else { (1u128 << w) - pattern };
-    if magnitude > 9223372036854775808u128 { least_int() }
-    else if magnitude == 9223372036854775808u128 { least_int() }
-    else { 0 - int_of_u128(magnitude) }
-  } else if pattern > 9223372036854775807u128 { 9223372036854775807 }
-  else { int_of_u128(pattern) }
+  let pattern = bits & mask_of(w);
+  if string_starts_with(ty, "I") && pattern >> w - 1 == 1u128 {
+    { negative: true, magnitude: if w == 128 { wrap_sub(0u128, pattern) } else { (1u128 << w) - pattern } }
+  } else { { negative: false, magnitude: pattern } }
+}
+
+fn pattern_of(ty: String, v: Signed) -> U128 = {
+  let w = width_of(ty);
+  if v.negative && v.magnitude != 0u128 { wrap_sub(0u128, v.magnitude) & mask_of(w) } else { v.magnitude }
+}
+
+// `int_size` over a width's value: twice the magnitude, one more when negative, at the ceiling past
+// sixty-four bits.
+fn fixed_size(ty: String, bits: U128) -> U64 = {
+  let v = signed_of(ty, bits);
+  if v.magnitude > 9223372036854775807u128 { top() }
+  else { plus(times(u64_of_int(int_of_u128(v.magnitude)), 2u64), if v.negative { 1u64 } else { 0u64 }) }
 }
 
 fn float_size(f: Float) -> U64 =
@@ -161,7 +173,7 @@ fn sum<a>(xs: List<a>, f: (a) -> U64) -> U64 = fold(xs, 0u64, |acc: U64, x: a| p
 pub fn size(v: Value, ts: Types) -> U64 =
   match v {
     VInt(n) -> int_size(n),
-    VFixed(ty, bits) -> int_size(fixed_int(ty, bits)),
+    VFixed(ty, bits) -> fixed_size(ty, bits),
     VBool(b) -> if b { 1u64 } else { 0u64 },
     VUnit -> 0u64,
     VFloat(f) -> float_size(f),
@@ -260,6 +272,7 @@ fn candidates_at(v: Value, t: Ty, ts: Types, depth: Int) -> List<Value> =
   if depth >= hard_depth() { [] } else {
     match v {
       VInt(n) -> map(int_candidates(n), |c: Int| VInt(c)),
+      VFixed(ty, bits) -> map(fixed_candidates(ty, bits), |c: U128| VFixed(ty, c)),
       VFloat(f) -> map(float_candidates(f), |c: Float| VFloat(c)),
       VDecimal(d) -> map(decimal_candidates(d), |c: Decimal| VDecimal(c)),
       VBool(b) -> if b { [VBool(false)] } else { [] },
@@ -323,6 +336,23 @@ fn int_candidates(n: Int) -> List<Int> =
     let flipped = if n < 0 { match checked_neg(n) { Some(p) -> push(stepped, p), None -> stepped } } else { stepped };
     deduped(filter(flipped, |c: Int| c != n))
   }
+
+// `int_candidates` in the width's own arithmetic, so each candidate is a value of the type: toward
+// zero by halves, then by one, then by its sign where the width has the magnitude.
+fn fixed_candidates(ty: String, bits: U128) -> List<U128> = {
+  let v = signed_of(ty, bits);
+  if v.magnitude == 0u128 { [] } else {
+    let w = width_of(ty);
+    let halves = iterate({ out: [0u128], half: v.magnitude / 2u128 }, 130, |st: { out: List<U128>, half: U128 }|
+      if st.half == 0u128 { Stop(st.out) }
+      else { Continue({ out: push(st.out, pattern_of(ty, { negative: v.negative, magnitude: st.half })), half: st.half / 2u128 }) });
+    let stepped = push(halves, pattern_of(ty, { negative: v.negative, magnitude: v.magnitude - 1u128 }));
+    // `-min` is no value of a signed width: the least one offers no magnitude.
+    let flipped = if v.negative && v.magnitude <= (1u128 << w - 1) - 1u128 { push(stepped, v.magnitude) } else { stepped };
+    let pattern = pattern_of(ty, v);
+    deduped(filter(flipped, |c: U128| c != pattern))
+  }
+}
 
 fn float_candidates(f: Float) -> List<Float> =
   if f == 0.0 && !is_sign_negative(f) { [] }
@@ -497,4 +527,25 @@ test "a budget of re-runs is what stops the walk" {
 test "a list shrinks by halves and by dropping an item before its items shrink" {
   let cs = candidates(VList(ints([4, 2])), Con("List", [int_ty()]), no_types());
   assert_eq(cs, [VList([]), VList(ints([4])), VList(ints([2])), VList(ints([2])), VList(ints([4])), VList(ints([0, 2])), VList(ints([2, 2])), VList(ints([1, 2])), VList(ints([3, 2])), VList(ints([4, 0])), VList(ints([4, 1]))])
+}
+
+fn fixed(ty: String, n: Int) -> Value =
+  VFixed(ty, if n >= 0 { u128_of_int(n) } else { pattern_of(ty, { negative: true, magnitude: u128_of_int(0 - n) }) })
+
+test "a width shrinks toward zero and stays a value of its type" {
+  let offered = |v: Value, t: String| candidates(v, Con(t, []), no_types());
+  assert_eq(offered(fixed("U8", 9), "U8"), map([0, 4, 2, 1, 8], |n: Int| fixed("U8", n)));
+  // `128` is no `I8`, so the least byte offers no magnitude.
+  assert_eq(
+    offered(fixed("I8", 0 - 128), "I8"),
+    map([0, 0 - 64, 0 - 32, 0 - 16, 0 - 8, 0 - 4, 0 - 2, 0 - 1, 0 - 127], |n: Int| fixed("I8", n)),
+  );
+  assert_eq(offered(fixed("U32", 0), "U32"), []);
+  // Past what an `Int` holds, the measure still orders the walk toward zero.
+  let full = VFixed("U64", 18446744073709551615u128);
+  let halves = offered(full, "U64");
+  assert_eq(list_at(halves, 0), Some(fixed("U64", 0)));
+  assert_eq(list_at(halves, 1), Some(VFixed("U64", 9223372036854775807u128)));
+  assert(size(full, no_types()) > size(VFixed("U64", 9223372036854775807u128), no_types()));
+  assert(size(fixed("I8", 0 - 5), no_types()) > size(fixed("I8", 5), no_types()))
 }

@@ -25,7 +25,12 @@ pub struct Step {
 }
 
 impl Step {
-    pub fn from_record(record: &StepRecord, definition: Option<Symbol>, span: Span) -> Step {
+    /// `fallback` places a step that placed nothing itself.
+    pub fn from_record(record: &StepRecord, fallback: Span) -> Step {
+        let (definition, span) = match &record.site {
+            Some(site) => (site.definition.clone(), site.span),
+            None => (None, fallback),
+        };
         Step {
             region: record.region,
             task: record.task,

@@ -16,7 +16,10 @@ fn cell() -> Value {
 }
 
 fn task() -> Value {
-    Value::Task(ply_eval::TaskHandle::unowned(ply_eval::sim::TaskId(0)))
+    Value::Task(ply_eval::TaskHandle::unowned(
+        ply_eval::SimId(0),
+        ply_eval::sim::TaskId(0),
+    ))
 }
 
 fn closure(kind: ClosureKind) -> Value {

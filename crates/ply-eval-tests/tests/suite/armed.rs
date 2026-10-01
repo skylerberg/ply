@@ -24,22 +24,7 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[(
 const CODE_INDIRECTION: &[Indirection] = &[];
 
 /// Covered enum names that more than one covered enum declares.
-const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[
-    (
-        "Reason",
-        "crates/ply-test/src/lib.rs's Reason (why a test runs) and crates/ply-prove/src/prove/mod.rs's \
-         Reason (why the static tier stopped) share no variant name, so a `Reason::X` hit can only \
-         arm the enum that has X. If one of them gains a variant the other has, this gate stops \
-         telling them apart.",
-    ),
-    (
-        "Shape",
-        "crates/ply-prove/src/domain.rs's Shape (a domain the program measured) and \
-         crates/ply-prove/src/prove/egraph.rs's Shape (an e-graph node's constructor) share no \
-         variant name, so a `Shape::X` hit can only arm the enum that has X. If one of them gains \
-         a variant the other has, this gate stops telling them apart.",
-    ),
-];
+const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[];
 
 struct Indirection {
     file: &'static str,

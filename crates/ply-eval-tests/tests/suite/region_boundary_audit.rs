@@ -201,18 +201,21 @@ fn a_constant_the_seam_refuses_keeps_no_continuation_for_the_next_entry() {
         .expect("the test parks and resumes a continuation of its own");
 }
 
-/// A closure's type does not mention the task it captures, so `spawned`'s task reaches its answer
-/// past the checker.
-const CAPTURED: &str = r#"
-fn spawned() -> () -> Int / {task.join} = simulate {
-  let t = task.spawn(|| 1);
-  || task.join(t)
-}
+/// A callback's row is its caller's to choose, so the `simulate` region that hands it a task cannot
+/// see the task stored in an older cell, and `spawned`'s task reaches its answer past the checker.
+const HANDED: &str = r#"
+fn simulated<| e>(on: (Task<Int>) -> Unit / e) -> Unit / {sim.read | e} =
+  simulate { on(task.spawn(|| 1)) }
+
+fn spawned() -> Option<Task<Int>> = with_cell[slot](None) { kept -> {
+  simulated(|t: Task<Int>| cell_set(kept, Some(t)));
+  cell_get(kept)
+} }
 "#;
 
 #[test]
 fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
-    let compiled = Compiled::new(CAPTURED);
+    let compiled = Compiled::new(HANDED);
     let (mut machine, tier) = compiled.machine_and_tier();
 
     let d = machine
@@ -225,6 +228,35 @@ fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
         "{}",
         d.message
     );
+    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+}
+
+/// A type parameter hides the task `spawned` let out from the next region, which numbers a task of
+/// its own `@1` as well: joined there by id alone, the handle would answer that task's `2`.
+const REJOINED: &str = r#"
+fn joined<a>(x: a, wait: (a) -> Int / {task.join}) -> Int / {sim.read} =
+  simulate {
+    let mine = task.spawn(|| 2);
+    wait(x) + task.join(mine)
+  }
+
+pub fn rejoined() -> Int = match spawned() {
+  Some(t) -> joined(t, |h: Task<Int>| task.join(h)),
+  None -> 0,
+}
+"#;
+
+#[test]
+fn a_task_carried_into_another_region_fails_its_join_rather_than_answering_a_stranger() {
+    let compiled = Compiled::new(&format!("{HANDED}{REJOINED}"));
+    let (mut machine, tier) = compiled.machine_and_tier();
+
+    let d = machine
+        .call("m.rejoined", vec![], Span::DUMMY)
+        .expect_err("the handle names a task of the first region");
+
+    assert_eq!(d.code, codes::TASK_ESCAPES_SCOPE, "{d:#?}");
+    assert!(d.message.contains("another region"), "{}", d.message);
     assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
 }
 
