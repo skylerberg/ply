@@ -1,2 +1,0 @@
-mod tiers;
-mod world;

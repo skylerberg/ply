@@ -3,16 +3,124 @@
 //! are, and what their judgements come to, is the program's.
 
 use crate::load::Loaded;
+use ply_eval::decode::{At, Error as DecodeError};
 use ply_eval::host::HostBinding;
 use ply_eval::{
-    DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, Span, Symbol, Value,
-    codes,
+    DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, SourceId, Span, Symbol,
+    Value, codes,
 };
-use ply_prove::{Binder, Binding, Fault, Obligation, ObligationKind, ProvePlan, Strategy};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+
+/// One claim the program owes, as far as the runtime enters it: whose it is, where it is written,
+/// what a point assigns, the guards it is judged after, and which machine its propositions run on.
+/// Everything else about it is `proof.world`'s.
+#[derive(Clone, Debug)]
+pub struct Obligation {
+    /// `<module>.<def>` for a clause, `<module>.<label>` for a law.
+    pub owner: Symbol,
+    pub kind: ObligationKind,
+    pub span: Span,
+    /// What a point assigns: the owner's parameters for a clause, the `forall` binders for a law.
+    pub binders: Vec<Binder>,
+    /// A clause's `result`, which is the owner's answer and never drawn.
+    pub result: Option<Binder>,
+    /// Each guard's place: an owner's `requires` clauses, or a law's `where`.
+    pub guards: Vec<Span>,
+    pub strategy: Strategy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObligationKind {
+    /// Its place among the owner's `ensures` clauses.
+    Ensures {
+        index: usize,
+    },
+    Law,
+}
+
+/// One binder of a claim: what a report calls it, and its type as the compiler prints it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Binder {
+    pub name: Symbol,
+    pub text: String,
+}
+
+/// Which machine a claim's propositions run on, as `proof.world` decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strategy {
+    /// A law over a `simulate` region: its interleavings are searched at each of its points.
+    Interleave,
+    /// A `law/host`, run against the host the run binds.
+    Hosted,
+    /// The static prover first, then the claim's points.
+    Static,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Binding {
+    pub name: Symbol,
+    /// The binder's type as the compiler prints it.
+    pub ty: String,
+    pub value: ply_eval::Plain,
+}
+
+/// Ply's own failure while judging a claim, as [`ply_eval::codes::is_defect`] tells it apart.
+#[derive(Clone, Debug)]
+pub struct Fault {
+    /// The point being judged when Ply failed, or none when it failed before a point was drawn.
+    pub bindings: Vec<Binding>,
+    pub diagnostic: Box<Diagnostic>,
+}
+
+/// The obligations a `proof.world.World` owes, in the order the program listed them, which is the
+/// order it names them by.
+pub fn obligations_of(world: At<'_>) -> Result<Vec<Obligation>, DecodeError> {
+    world.field("obligations")?.items(obligation_of)
+}
+
+fn obligation_of(at: At<'_>) -> Result<Obligation, DecodeError> {
+    let kind = at.field("kind")?.ctor()?;
+    let binder = |b: At<'_>| -> Result<Binder, DecodeError> {
+        Ok(Binder {
+            name: Symbol::new(b.field("name")?.str()?),
+            text: b.field("text")?.str()?.to_string(),
+        })
+    };
+    let span = |s: At<'_>| -> Result<Span, DecodeError> {
+        Ok(Span::new(
+            SourceId(s.field("module")?.number()?),
+            s.field("start")?.number()?,
+            s.field("end")?.number()?,
+        ))
+    };
+    let strategy = at.field("strategy")?.ctor()?;
+    Ok(Obligation {
+        owner: Symbol::new(at.field("owner")?.str()?),
+        kind: match kind.name() {
+            "Ensures" => ObligationKind::Ensures {
+                index: kind.arg(0)?.number()?,
+            },
+            "Law" => ObligationKind::Law,
+            _ => return Err(kind.unknown()),
+        },
+        span: span(at.field("at")?)?,
+        binders: at.field("binders")?.items(binder)?,
+        result: match at.field("result")?.option()? {
+            Some(result) => Some(binder(result)?),
+            None => None,
+        },
+        guards: at.field("guards")?.items(span)?,
+        strategy: match strategy.name() {
+            "Interleave" => Strategy::Interleave,
+            "Hosted" => Strategy::Hosted,
+            "Static" => Strategy::Static,
+            _ => return Err(strategy.unknown()),
+        },
+    })
+}
 
 /// The prover this build drives over the program. One built once serves a whole run.
 pub fn prover(
@@ -263,14 +371,14 @@ impl Prover {
     pub fn judged(
         &self,
         obligation: &Obligation,
-        plan: &ProvePlan,
+        step_budget: i64,
         points: &[Vec<Value>],
         mode: Mode,
     ) -> Vec<Judgement> {
         let Some(claim) = self.claim(obligation) else {
             return vec![Judgement::Faulted(*unclaimed(obligation).diagnostic)];
         };
-        let mut cases = match self.cases(obligation, &claim, plan) {
+        let mut cases = match self.cases(obligation, &claim, step_budget) {
             Ok(cases) => cases,
             Err(fault) => return vec![Judgement::Faulted(*fault.diagnostic)],
         };
@@ -307,7 +415,7 @@ impl Prover {
     pub fn interleaved(
         &self,
         obligation: &Obligation,
-        plan: &ProvePlan,
+        step_budget: i64,
         values: &[Value],
         seed: &Seed,
         steps: u32,
@@ -315,13 +423,13 @@ impl Prover {
         let Some(claim) = self.claim(obligation) else {
             return Interleaved::faulted(*unclaimed(obligation).diagnostic);
         };
-        let cases = match self.cases(obligation, &claim, plan) {
+        let cases = match self.cases(obligation, &claim, step_budget) {
             Ok(cases) => cases,
             Err(fault) => return Interleaved::faulted(*fault.diagnostic),
         };
         let compiled = self.compiled();
         compiled.set_seed(seed.clone(), steps);
-        let entered = ply_codegen::rt::with_step_budget(plan.step_budget, || {
+        let entered = ply_codegen::rt::with_step_budget(step_budget, || {
             compiled.enter_whole(&cases.body_root, values, DEFAULT_MAX_CALLS)
         });
         let (value, record) = match entered {
@@ -365,7 +473,7 @@ impl Prover {
         &self,
         obligation: &Obligation,
         claim: &Claim<'_>,
-        plan: &ProvePlan,
+        step_budget: i64,
     ) -> Result<Cases<'_>, Fault> {
         let call = match claim {
             Claim::Ensures { .. } => Some(obligation.owner.clone()),
@@ -379,7 +487,7 @@ impl Prover {
             span: obligation.span,
             call,
             result: obligation.result.as_ref().map(|b| b.name.clone()),
-            step_budget: plan.step_budget,
+            step_budget,
         })
     }
 }

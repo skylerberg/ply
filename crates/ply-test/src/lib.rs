@@ -4,7 +4,6 @@
 
 pub mod bisect;
 pub mod hybrid;
-pub mod obligation;
 pub mod sim;
 
 use ply_eval::host::{HostBinding, HostUse};
