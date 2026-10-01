@@ -71,6 +71,7 @@ CORPUS_BY_TEST=(audit generated toolchain)
 PACKAGE_SUITES=(
   "prove:crates/ply-prove/ply"
   "sim:crates/ply-sim/ply"
+  "store:crates/ply-store/ply"
   "suite:crates/ply-test/ply"
 )
 

@@ -657,3 +657,157 @@ fn the_refusals_that_keep_a_codec_total_all_fire() {
         assert!(run.text.contains(code), "{source}\n{}", run.text);
     }
 }
+
+const BIN_CORPUS: &str = r#"import std.bin
+
+pub type Colour = Red | Green | Blue
+pub type Tree = Leaf | Node(Tree, Tree)
+
+pub type Leafy = {
+  name: String,
+  raw: Bytes,
+  weight: Decimal,
+  count: Int,
+  flag: Bool,
+  nothing: Unit,
+  small: U8,
+  wide: I64,
+  tags: List<String>,
+  maybe: Option<Option<Int>>,
+}
+
+pub type Deep = {
+  by_name: Map<String, Colour>,
+  by_num: Map<Int, List<Colour>>,
+  leaf: Leafy,
+  inner: List<Leafy>,
+  results: List<Result<Int, String>>,
+  tree: Tree,
+  pair: (Int, Option<Unit>),
+}
+
+derive bin for Colour
+derive bin for Tree
+derive bin for Leafy
+derive bin for Deep
+
+pub fn round(d: Deep) -> Bool = bin::decode(bin::encode(d, deep_bin()), deep_bin()) == Ok(d)
+
+law "a derived codec round-trips through the bytes"
+  forall (d: Deep) { round(d) }
+"#;
+
+#[test]
+fn every_shape_the_bin_deriver_accepts_round_trips_over_generated_values() {
+    let dir = one(BIN_CORPUS);
+    laws_hold(dir.path());
+}
+
+#[test]
+fn bin_reads_back_what_json_cannot_and_refuses_what_it_did_not_write() {
+    passes(
+        r#"import std.bin
+
+pub type Reading = { ratio: Float, at: U64, big: I128, tag: Ordering }
+derive bin for Reading
+
+pub type Tree = Leaf | Node(Tree, Int)
+derive bin for Tree
+
+fn deep(n: Int, t: Tree) -> Tree = if n <= 0 { t } else { deep(n - 1, Node(t, n)) }
+
+test "a NaN keeps its bits and the wide widths keep their range" {
+  let nan = float_of_bits(9221120237041090561);
+  let least = match i128_of_string("-170141183460469231731687303715884105728") { Some(n) -> n, None -> 0i128 };
+  let r = {ratio: nan, at: 18446744073709551615u64, big: least, tag: Greater};
+  match bin::decode(bin::encode(r, reading_bin()), reading_bin()) {
+    Ok(s) -> {
+      assert_eq(bits_of_float(s.ratio), bits_of_float(nan));
+      assert_eq(s.at, r.at);
+      assert_eq(s.big, r.big);
+      assert_eq(s.tag, Greater)
+    },
+    Err(e) -> assert_eq(bin::error_to_string(e), "it should have decoded"),
+  }
+}
+
+test "a deep recursive value round-trips" {
+  let t = deep(500, Leaf);
+  assert_eq(bin::decode(bin::encode(t, tree_bin()), tree_bin()), Ok(t))
+}
+
+test "a constructor index past the type's is refused, not guessed" {
+  match bin::decode(b"\x02", tree_bin()) {
+    Ok(t) -> assert(false),
+    Err(e) -> assert_eq(bin::error_to_string(e), "constructor 2 of a type with 2 (at byte 0)"),
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn a_shape_moves_with_the_type_and_only_with_it() {
+    let dir = project_files(&[
+        (
+            "n.ply",
+            "import std.bin\npub type S = A(Int) | B(String)\nderive bin for S\npub type R = {x: Int}\nderive bin for R\n",
+        ),
+        (
+            "o.ply",
+            "import std.bin\npub type S = B(String) | A(Int)\nderive bin for S\n",
+        ),
+        (
+            "m.ply",
+            r#"import std.bin
+import n
+import o
+
+pub type S = A(Int) | B(String)
+derive bin for S
+pub type R = {x: Int}
+derive bin for R
+pub type Renamed = {y: Int}
+derive bin for Renamed
+pub type Box<a> = {item: a}
+derive bin for Box
+
+test "one structure under one name has one shape, in any module" {
+  assert_eq(bin::shape_digest(s_bin()), bin::shape_digest(n::s_bin()));
+  assert_eq(bin::shape_digest(r_bin()), bin::shape_digest(n::r_bin()))
+}
+
+test "an order, a field name or a type argument changes it" {
+  assert(bin::shape_digest(s_bin()) != bin::shape_digest(o::s_bin()));
+  assert(bin::shape_digest(r_bin()) != bin::shape_digest(renamed_bin()));
+  assert(bin::shape_digest(box_bin(bin::int_bin())) != bin::shape_digest(box_bin(bin::string_bin())))
+}
+"#,
+        ),
+    ]);
+    let run = Run::of(dir.path(), &["test"]);
+    assert_eq!(run.code, 0, "{}", run.text);
+}
+
+#[test]
+fn a_bin_derivation_needs_its_module_and_refuses_a_credential() {
+    for (source, says) in [
+        (
+            "pub type R = {x: Int}\nderive bin for R\n",
+            "this module does not import `std.bin`",
+        ),
+        (
+            "import std.bin\npub type R = {token: Secret}\nderive bin for R\n",
+            "a derived codec would write the credential into the bytes",
+        ),
+    ] {
+        let dir = one(source);
+        let run = Run::of(dir.path(), &["check"]);
+        assert_ne!(run.code, 0, "{}", run.text);
+        assert!(
+            run.text.contains("E0206") && run.text.contains(says),
+            "{says}\n{}",
+            run.text
+        );
+    }
+}

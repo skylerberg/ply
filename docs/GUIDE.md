@@ -100,6 +100,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `1.5`, `1e9`, `2.5e-3` | `Float` | IEEE-754 binary64. |
 | `1.50m`, `0m` | `Decimal` | Exact base 10; up to 28 fractional digits, 96-bit mantissa; keeps its written scale. |
 | `"text"` | `String` | UTF-8; no line breaks. |
+| `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
 | `true`, `false` / `()` | `Bool` / `Unit` | |
 
@@ -110,6 +111,23 @@ written as a literal; use `i8_of_int(-128)`.
 
 String escapes are `\n` `\t` `\r` `\0` `\\` `\"` (no `\u`). Byte strings add
 `\xNN` and refuse source characters above `U+007F`.
+
+A line string is a run of lines that each start with `\\`, led only by blanks.
+Everything after the `\\` to the end of its line is text, verbatim: nothing is
+an escape, so quotes, backslashes and `\\` itself are written as they read. The
+lines join with `\n` and the last one ends the value, so a value ending in a
+newline ends with a line holding only `\\`:
+
+```ply
+fn program() -> String =
+  \\fn main() -> Int = 42
+  \\
+```
+
+A line ending in a space or a tab is `E0001`, since that whitespace cannot be
+seen; a `\r` before a line's newline is not text. A line string is an
+expression, never a pattern or a label. Nothing can follow it on its last line,
+so what comes after it goes on the next one.
 
 ### 2.4 Operators
 
@@ -1152,6 +1170,7 @@ derive json for Line
 | `json` | `<snake_case(T)>_json` | `std.json.JsonCodec<T>` |
 | `eq` | `<snake_case(T)>_eq` | `{eq: (T, T) -> Bool}` |
 | `ord` | `<snake_case(T)>_ord` | `{compare: (T, T) -> Ordering}` |
+| `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
 
 There are no other derivers (`E0207`). A name collision (`HTTPRequest` and
 `HttpRequest` both give `http_request`) is `E0105`. A `derive` must be in the
@@ -1172,8 +1191,10 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
 plain values: `json::decode_bytes(body, order_json())`.
 
 `E0206` names the field that blocks a derivation: function types, `Cell` and
-`Task` (all derivers); `Float` (`ord`); `Secret` (`json`, `ord`); `Option<Unit>`
-and `Option<Option<a>>` (`json`).
+`Task` (all derivers); `Float` (`ord`); `Secret` (`json`, `ord`, `bin`);
+`Option<Unit>` and `Option<Option<a>>` (`json`). `json` and `bin` need their
+module imported (`import std.json`, `import std.bin`), or the `derive` is
+`E0206`.
 
 ## 12. Builtins
 
@@ -2571,6 +2592,44 @@ is `fold(xs, zero, step)` when `merge` is associative, `zero` is its identity
 and `step(b, x)` is `merge(b, step(zero, x))`, as for a sum or a list. `f`,
 `step` and `merge` are pure.
 
+### 13.37 `std.bin`
+
+```ply
+pub type BinCodec<a> = {
+  put: (Bytes, a) -> Bytes,
+  take: (Bytes, Int) -> Result<Taken<a>, BinError>,
+  shape: Shape,
+}
+pub type Taken<a> = { value: a, at: Int }
+pub type BinError = { at: Int, message: String }
+pub fn encode<a>(x: a, codec: BinCodec<a>) -> Bytes
+pub fn decode<a>(data: Bytes, codec: BinCodec<a>) -> Result<a, BinError>
+pub fn shape_digest<a>(codec: BinCodec<a>) -> Bytes
+```
+
+A compact encoding for bytes both ends read with the same type, which is what
+`derive bin` targets. Nothing names a field: a record is its fields in declared
+order and a variant is its constructor's index, then its fields. `Int`, counts,
+lengths and the 16- to 128-bit widths are varints (signed ones zigzagged);
+`U8`/`I8` are one byte, `Float` its eight IEEE bytes (a `NaN` keeps its
+payload), `Decimal` its text, and `Unit` one zero byte, so every value takes at
+least a byte. `put` appends a value to the bytes it is given and `take` reads one
+at an offset. `decode` refuses bytes that end inside the value, bytes left over,
+and anything no value writes: a constructor index past the type's, a count past
+the bytes left, a map's keys out of order, an overlong varint, text that is not
+UTF-8.
+
+`shape_digest` is 32 bytes that change whenever a field, a constructor, a name
+or an order changes anywhere the type reaches, so a store can key what it wrote
+by it. A recursive type finishes: a reference back into a sum being digested is
+named rather than entered.
+
+Codecs: `unit_bin`, `bool_bin`, `int_bin`, `float_bin`, `decimal_bin`,
+`string_bin`, `bytes_bin`, `u8_bin` … `u128_bin`, `i8_bin` … `i128_bin`,
+`ordering_bin`, `rounding_bin`, and combinators `list_bin`, `option_bin`,
+`result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*` and `take_*` are
+public too.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
@@ -2833,8 +2892,10 @@ stderr before the entry runs, or as `front_end` in the `--json` document.
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
-file it cannot read or write back is an error too, exiting 2, so `--check`
-never passes over a file it did not read. A directory whose name starts with
+line string starts a line of its own, each of its lines at the first's indent,
+and as the last item of a list it takes no trailing comma. A file it cannot read
+or write back is an error too, exiting 2, so `--check` never passes over a file
+it did not read. A directory whose name starts with
 `.`, and one named `target`, are not walked; a symlink found while walking is
 passed over, and one named on the command line is an error rather than a file to
 rewrite.
