@@ -645,10 +645,8 @@ const EFFECT: &str = "tcb";
 
 const PREVIEW: &str = "ply_machine::hosts::preview";
 
-/// The module the payload's constructors are declared in, as a program-wide name.
-const PAYLOAD: &str = "hosts";
-
-pub fn lent() -> Vec<Lent> {
+/// `module` is where the program lent it declares `tcb`, which is where `Stage` is declared too.
+pub fn lent(module: &str) -> Vec<Lent> {
     let op = HostOp {
         effect: Symbol::new(EFFECT),
         op: Symbol::new("preview"),
@@ -660,10 +658,17 @@ pub fn lent() -> Vec<Lent> {
         secrets: false,
         path: PREVIEW,
     };
-    vec![(op, Arc::new(Facility))]
+    vec![(
+        op,
+        Arc::new(Facility {
+            module: module.to_string(),
+        }),
+    )]
 }
 
-struct Facility;
+struct Facility {
+    module: String,
+}
 
 impl HostHandler for Facility {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
@@ -673,7 +678,7 @@ impl HostHandler for Facility {
                 let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
                 let options = crate::drive::run_options_of(options, span)?;
                 let front = crate::driver::handed_front_of(front, span)?;
-                Assembled::of(&path, &options, &front).preview()
+                Assembled::of(&path, &options, &front).preview(&self.module)
             }
             (other, _) => return Err(unregistered(other, span)),
         };
@@ -748,10 +753,13 @@ impl Assembled {
         }
     }
 
-    fn preview(&self) -> PlyValue {
+    fn preview(&self, module: &str) -> PlyValue {
         let d = &self.disclosures;
         record(vec![
-            ("stage", PlyValue::ctor(payload(self.stage), Vec::new())),
+            (
+                "stage",
+                PlyValue::ctor(Symbol::new(format!("{module}.{}", self.stage)), Vec::new()),
+            ),
             ("root", PlyValue::str(&self.root)),
             ("handlers", count(self.listing.handlers)),
             (
@@ -840,10 +848,6 @@ fn bind(args: &crate::drive::RunOptions, loaded: &crate::load::Loaded) -> Result
 }
 
 // --- The payload -------------------------------------------------------------
-
-fn payload(ctor: &str) -> Symbol {
-    Symbol::new(format!("{PAYLOAD}.{ctor}"))
-}
 
 fn row_value(row: &HostRow) -> PlyValue {
     record(vec![

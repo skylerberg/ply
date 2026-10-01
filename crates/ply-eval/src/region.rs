@@ -1,10 +1,13 @@
 //! The trail every region of one entry point writes into.
 
-use crate::cont::SimId;
 use crate::sched::{Stamp, StepRecord};
 use crate::sim::{Access, Domain, Seed, StepFootprint, Stream, TaskId};
 
 use crate::{Diagnostic, Span, Symbol};
+
+/// A `simulate` region: its ordinal among the regions one entry point has entered.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct SimId(pub u32);
 
 /// A place in the program, and the definition it lies in.
 #[derive(Clone, PartialEq, Eq, Debug)]

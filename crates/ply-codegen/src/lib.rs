@@ -1,4 +1,5 @@
-//! The compiled tier behind `ply test`: the machine's lowered `Code` emitted as C.
+//! Compiled code, the only evaluator: a program's emitted C built and loaded as a unit, and the
+//! runtime that C calls into.
 
 // `Value` holds `Arc`s but is not `Send`; raw-pointer helpers share the contract in `heap.rs`.
 #![allow(clippy::arc_with_non_send_sync)]

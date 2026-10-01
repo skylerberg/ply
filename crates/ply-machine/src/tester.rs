@@ -168,7 +168,15 @@ impl HostHandler for Site {
         let span = req.span;
         let value = match req.op.op.as_str() {
             "configure" => {
-                *lock(&self.options) = test_options_of(arg(req, 0)?, span)?;
+                let options = test_options_of(arg(req, 0)?, span)?;
+                // A run begins whatever the last one left; the store is kept only for its project.
+                let mut held = lock(&self.options);
+                if crate::load::project_root(&held.path) != crate::load::project_root(&options.path)
+                {
+                    *lock(&self.cache) = None;
+                }
+                *held = options;
+                *self.run.write().unwrap_or_else(|e| e.into_inner()) = Run::default();
                 PlyValue::Unit
             }
             "unit" => self.unit(

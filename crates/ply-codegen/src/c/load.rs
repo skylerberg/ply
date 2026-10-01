@@ -60,9 +60,9 @@ impl Drop for Library {
 // holds the `Bodies` it belongs to.
 unsafe impl Send for Library {}
 
-/// The C compiler this tier shells out to. `cc` rather than a pinned name, for the reason ADR 0037
-/// gives for preferring C over LLVM in the first place: the dependency should be the one every
-/// machine already has. Which one, and on what flag, is the profile's answer -- see `toolchain.rs`.
+/// The C compiler this tier shells out to. `cc` rather than a pinned name: the dependency should be
+/// the one every machine already has. Which one, and on what flag, is the profile's answer -- see
+/// `toolchain.rs`.
 fn compiler() -> String {
     super::toolchain::Profile::current().compiler()
 }
@@ -218,9 +218,9 @@ pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
 /// Compile `source` into a shared object and load it, with the time its objects took to compile,
 /// apart from the link and the load; zero when the image was already in the cache.
 ///
-/// One image per unit: `benches/c-floor/` found one link a constant rather than an exponent, and
-/// the per-definition image it refused. The objects that link into it are one per bucket, each
-/// keyed by its C and kept under `obj/`, so an edit that reached one bucket compiles one bucket.
+/// One image per unit, because one link costs a constant where an image per definition grows with
+/// the program. The objects that link into it are one per bucket, each keyed by its C and kept
+/// under `obj/`, so an edit that reached one bucket compiles one bucket.
 pub(super) fn compile_and_load_timed(source: &str, stem: &str) -> Result<(Library, Duration)> {
     // The other place the cache is written, and the one that writes the large files. A run that
     // only loads a bootstrap bundle never reaches `build`, and would otherwise add an object per
@@ -414,7 +414,7 @@ fn land(built: &Path, target: &Path) -> PathBuf {
     if std::fs::rename(built, target).is_ok() {
         return target.to_path_buf();
     }
-    let tmp = target.with_extension(format!("{}.otmp", std::process::id()));
+    let tmp = ply_eval::files::temp_beside(target);
     if std::fs::copy(built, &tmp).is_ok() && std::fs::rename(&tmp, target).is_ok() {
         let _ = std::fs::remove_file(built);
         return target.to_path_buf();

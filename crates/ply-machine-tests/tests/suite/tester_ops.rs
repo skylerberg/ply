@@ -7,7 +7,8 @@ use ply_eval::host::HostRegistry;
 use ply_eval::{Machine, Provider, Span, Value};
 use std::sync::Arc;
 
-const OUTER: &str = r#"
+/// The family as a program declares it, and the helpers both programs report with.
+const DECLARED: &str = r#"
 import std.json (Json)
 import std.value (Value)
 
@@ -131,7 +132,10 @@ fn flags(xs: List<Bool>) -> String =
 fn held(xs: List<Option<PassRecord>>) -> String =
   fold(xs, "", |acc: String, x: Option<PassRecord>|
     acc ++ (if acc == "" { "" } else { "," }) ++ (match x { Some(r) -> r.test, None -> "none" }))
+"#;
 
+/// One run over a project: its tests, the binding, and the store written and read back.
+const ONE_RUN: &str = r#"
 fn main(root: String, front: Front) -> String / {
   tester.configure[r], tester.unit[r], tester.bound[r], tester.hosted[r], tester.ended[r],
   tester.executed[r], tester.opened[r], tester.outcomes[r], tester.seen[r], tester.baselines[r],
@@ -174,6 +178,30 @@ fn main(root: String, front: Front) -> String / {
 }
 "#;
 
+/// Two runs over two projects, neither ended: each one's unit, its first test, and what its store
+/// held before it filed a pass.
+const TWO_RUNS: &str = r#"
+fn first_of(root: String, front: Front) -> String / {
+  tester.configure[r], tester.unit[r], tester.executed[r], tester.outcomes[r], tester.filed[r],
+} = {
+  tester.configure[r](options(root));
+  let known = said(tester.outcomes[r]([key("a")]));
+  match tester.unit[r](front, true, false) {
+    Err(_) -> "no unit",
+    Ok(u) -> {
+      let ran = tester.executed[r](u, 0).status;
+      let filed = tester.filed[r]({ passes: [key("a")], records: [], seen: [] });
+      int_to_string(u) ++ " " ++ ran ++ " " ++ known ++ " "
+        ++ (match filed.unflushed { Some(_) -> "unflushed", None -> "flushed" })
+    },
+  }
+}
+
+fn main(root: String, front: Front, other: String, other_front: Front) -> String / {
+  tester.configure[r], tester.unit[r], tester.executed[r], tester.outcomes[r], tester.filed[r],
+} = first_of(root, front) ++ " | " ++ first_of(other, other_front)
+"#;
+
 const PROJECT: &str = r#"
 effect disk {
   read peek[r](key: Int) -> Int
@@ -195,18 +223,19 @@ test "peeks" {
 }
 "#;
 
-#[test]
-fn a_program_runs_its_tests_through_the_family_and_files_what_it_decided() {
-    let project = crate::fixture::project(PROJECT);
+/// A machine over `DECLARED` and `main`, bound to the tester operations the program declares.
+fn driving(main: &str) -> Machine<'static> {
     ply_codegen::c::producer::ensure_default();
-    let answered =
-        ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), OUTER.to_string())])
-            .expect("the driving program checks");
+    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
+        "m".to_string(),
+        format!("{DECLARED}{main}"),
+    )])
+    .expect("the driving program checks");
     let unit =
         ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
             .expect("this host has a C toolchain");
-    let front = answered.front;
-    let mut machine = Machine::new(&front, unit.attach()).expect("the unit is this program's");
+    let front: &'static ply_eval::Front = Box::leak(Box::new(answered.front));
+    let mut machine = Machine::new(front, unit.attach()).expect("the unit is this program's");
     let mut registry = HostRegistry::new();
     // Only what this program declares: a family's operation the program does not declare is a
     // registration the binding refuses.
@@ -217,18 +246,28 @@ fn a_program_runs_its_tests_through_the_family_and_files_what_it_decided() {
     }
     let binding = registry.bind(&front.check).expect("the tester ops bind");
     machine.set_host_binding(Arc::new(binding));
-    let answer = machine
-        .call(
-            "m.main",
-            vec![
-                Value::str(project.path().display().to_string()),
-                crate::fixture::handed(project.path()),
-            ],
-            Span::DUMMY,
-        )
+    machine
+}
+
+fn root_and_front(project: &tempfile::TempDir) -> [Value; 2] {
+    [
+        Value::str(project.path().display().to_string()),
+        crate::fixture::handed(project.path()),
+    ]
+}
+
+fn answer_of(machine: &mut Machine<'_>, args: Vec<Value>) -> Value {
+    machine
+        .call("m.main", args, Span::DUMMY)
         .into_parts()
         .0
-        .expect("the driving program ran");
+        .expect("the driving program ran")
+}
+
+#[test]
+fn a_program_runs_its_tests_through_the_family_and_files_what_it_decided() {
+    let project = crate::fixture::project(PROJECT);
+    let answer = answer_of(&mut driving(ONE_RUN), root_and_front(&project).to_vec());
     // The runtime runs exactly what it is asked and says how each ended; a handled operation is
     // performed all the same, and a test's count starts over with it. What was filed reads back
     // under the keys the program named, and nothing else does.
@@ -237,4 +276,20 @@ fn a_program_runs_its_tests_through_the_family_and_files_what_it_decided() {
         "a".repeat(64)
     );
     assert_eq!(answer, Value::str(expected), "the program saw: {answer:?}");
+}
+
+/// A configuration begins a run whether or not the last one ended: the last run's units and binding
+/// go, and so does its store when the project is another.
+#[test]
+fn a_configuration_begins_a_run_over_the_project_it_names() {
+    let first = crate::fixture::project("test \"holds\" { assert(true) }\n");
+    let second = crate::fixture::project("test \"breaks\" { assert(false) }\n");
+    let mut args = root_and_front(&first).to_vec();
+    args.extend(root_and_front(&second));
+    let answer = answer_of(&mut driving(TWO_RUNS), args);
+    assert_eq!(
+        answer,
+        Value::str("0 passed none flushed | 0 failed none flushed"),
+        "the program saw: {answer:?}"
+    );
 }

@@ -13,24 +13,19 @@
 
 use super::{Native, Refused};
 use anyhow::{Context, Result};
+use ply_eval::files::write_atomically;
 use std::io::{Read, Write};
 use std::path::Path;
 
 const UNIT: &str = "unit.c.gz";
 const SOURCES: &str = "SOURCES.digest";
 
-/// Writes the bundle, replacing what was there; each file lands by a rename, so a reader never
-/// sees half of one.
+/// Writes the bundle, replacing what was there.
 pub fn write(dir: &Path, text: &str, sources_digest: &str) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
-    let land = |name: &str, bytes: Vec<u8>| -> Result<()> {
-        let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, dir.join(name))?;
-        Ok(())
-    };
-    land(UNIT, pack(text)?)?;
-    land(SOURCES, format!("{sources_digest}\n").into_bytes())
+    write_atomically(&dir.join(UNIT), &pack(text)?)?;
+    write_atomically(&dir.join(SOURCES), format!("{sources_digest}\n").as_bytes())?;
+    Ok(())
 }
 
 /// A bundle: its C and the digest of the sources it came from. Whether it serves this runtime is

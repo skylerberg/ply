@@ -392,36 +392,14 @@ pub fn register(registry: &mut HostRegistry, shutdown: Option<&Arc<Shutdown>>) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Op {
-    Stopping,
-    DeadlineMs,
+operations! {
+    what "signal";
+    path "signal";
+    Stopping = "stopping",
+    DeadlineMs = "deadline_ms",
 }
 
 impl Op {
-    pub const ALL: [Op; 2] = [Op::Stopping, Op::DeadlineMs];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Op::Stopping => "stopping",
-            Op::DeadlineMs => "deadline_ms",
-        }
-    }
-
-    pub fn what(self) -> &'static str {
-        match self {
-            Op::Stopping => "`signal.stopping`",
-            Op::DeadlineMs => "`signal.deadline_ms`",
-        }
-    }
-
-    pub fn path(self) -> &'static str {
-        match self {
-            Op::Stopping => "ply_host::signal::stopping",
-            Op::DeadlineMs => "ply_host::signal::deadline_ms",
-        }
-    }
-
     pub fn declaration(self) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),

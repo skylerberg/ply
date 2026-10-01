@@ -65,8 +65,8 @@ fn an_object_is_as_removable_as_a_body() {
 fn a_temporary_is_never_swept() {
     let dir = tempfile::tempdir().unwrap();
     let names = [
-        "emit/a.1234.tmp",
-        "obj/c.1234.otmp",
+        "emit/a.body.1234.0.tmp",
+        "obj/c.o.1234.1.tmp",
         "emit/b.body",
         "obj/d.o",
     ];
@@ -74,7 +74,10 @@ fn a_temporary_is_never_swept() {
     sweep(dir.path(), 0);
     assert_eq!(
         present(dir.path(), &names),
-        vec!["emit/a.1234.tmp".to_string(), "obj/c.1234.otmp".to_string()]
+        vec![
+            "emit/a.body.1234.0.tmp".to_string(),
+            "obj/c.o.1234.1.tmp".to_string()
+        ]
     );
 }
 

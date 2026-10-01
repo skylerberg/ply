@@ -5,9 +5,14 @@ use ply_machine::policy;
 /// Where the `ply` binary's own program declares each family's effect.
 fn own(effect: &str) -> String {
     match effect {
-        "prover" => "claims".to_string(),
-        other => other.to_string(),
+        "prover" => "claims",
+        "store" => "cache",
+        "archive" => "bootstrap",
+        "tcb" => "hosts",
+        "edit" => "replace",
+        other => other,
     }
+    .to_string()
 }
 
 #[test]
@@ -82,10 +87,10 @@ fn a_family_that_does_not_exist_is_refused_by_name() {
 
 #[test]
 fn a_familys_values_are_named_by_the_module_the_program_declares_it_in() {
-    // The machine and claims families build values of types their program declares; lending one
-    // to a consumer that imports the CLI's module is the same operations, named as it names them.
+    // These families build values of types their program declares; lending one to a consumer that
+    // imports the CLI's modules is the same operations, named as it names them.
     let consumer = |effect: &str| format!("cli.{}", own(effect));
-    for family in ["machine", "claims"] {
+    for family in ["machine", "claims", "cache", "hosts"] {
         let as_cli = policy::lent(family, &own).expect("the family is there");
         let as_consumer = policy::lent(family, &consumer).expect("the family is there");
         assert_eq!(
@@ -93,5 +98,20 @@ fn a_familys_values_are_named_by_the_module_the_program_declares_it_in() {
             as_consumer.len(),
             "the same operations, named differently"
         );
+    }
+    let found = ply_machine::drive::FoundData::Project {
+        root: String::new(),
+        files: Vec::new(),
+        places: Vec::new(),
+        mains: Vec::new(),
+        modules: Vec::new(),
+    };
+    for module in ["machine", "cli.machine"] {
+        match &ply_machine::drive::found_value(&found, module) {
+            ply_eval::Value::Ctor { name, .. } => {
+                assert_eq!(name.as_str(), format!("{module}.Project"))
+            }
+            other => panic!("a load answers a `Target`, not {}", other.type_name()),
+        }
     }
 }

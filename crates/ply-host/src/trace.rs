@@ -43,55 +43,17 @@ impl Level {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Op {
-    Event,
-    Enter,
-    Exit,
-    Count,
-    Gauge,
-    Time,
+operations! {
+    what "trace";
+    Event = "event" / 3,
+    Enter = "enter" / 2,
+    Exit = "exit" / 2,
+    Count = "count" / 3,
+    Gauge = "gauge" / 3,
+    Time = "time" / 3,
 }
 
 impl Op {
-    pub const ALL: [Op; 6] = [
-        Op::Event,
-        Op::Enter,
-        Op::Exit,
-        Op::Count,
-        Op::Gauge,
-        Op::Time,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Op::Event => "event",
-            Op::Enter => "enter",
-            Op::Exit => "exit",
-            Op::Count => "count",
-            Op::Gauge => "gauge",
-            Op::Time => "time",
-        }
-    }
-
-    pub fn what(self) -> &'static str {
-        match self {
-            Op::Event => "`trace.event`",
-            Op::Enter => "`trace.enter`",
-            Op::Exit => "`trace.exit`",
-            Op::Count => "`trace.count`",
-            Op::Gauge => "`trace.gauge`",
-            Op::Time => "`trace.time`",
-        }
-    }
-
-    pub fn arity(self) -> usize {
-        match self {
-            Op::Enter | Op::Exit => 2,
-            Op::Event | Op::Count | Op::Gauge | Op::Time => 3,
-        }
-    }
-
     fn kind(self) -> Kind {
         match self {
             Op::Event => Kind::Event,

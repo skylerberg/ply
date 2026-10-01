@@ -29,144 +29,39 @@ const LOCK_POLL: Duration = Duration::from_millis(2);
 /// Far longer than a read-merge-write takes, so only a lock left by a killed process is broken.
 pub const LOCK_STALE_AGE: Duration = Duration::from_secs(30);
 
-/// In the order `std.fs` declares them.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Op {
-    ReadFile,
-    ReadAt,
-    ListDir,
-    Kind,
-    Resolved,
-    Exists,
-    FileSize,
-    ModifiedMs,
-    WriteFile,
-    Append,
-    CreateDir,
-    Remove,
-    Rename,
-    Sync,
-    Lock,
-    Unlock,
-    Copy,
-    RemoveTree,
-    TempDir,
-    Canonical,
-    Mode,
-    SetMode,
-    Symlink,
-    ReadLink,
-    Walk,
-    SetModified,
+// In the order `std.fs` declares them.
+operations! {
+    what "fs";
+    path "fs";
+    ReadFile = "read_file" / 1,
+    ReadAt = "read_at" / 3,
+    ListDir = "list_dir" / 1,
+    Kind = "kind" / 1,
+    Resolved = "resolved" / 1,
+    Exists = "exists" / 1,
+    FileSize = "file_size" / 1,
+    ModifiedMs = "modified_ms" / 1,
+    WriteFile = "write_file" / 2,
+    Append = "append" / 2,
+    CreateDir = "create_dir" / 1,
+    Remove = "remove" / 1,
+    Rename = "rename" / 2,
+    Sync = "sync" / 1,
+    Lock = "lock" / 1,
+    Unlock = "unlock" / 1,
+    Copy = "copy" / 2,
+    RemoveTree = "remove_tree" / 1,
+    TempDir = "temp_dir" / 2,
+    Canonical = "canonical" / 1,
+    Mode = "mode" / 1,
+    SetMode = "set_mode" / 2,
+    Symlink = "symlink" / 2,
+    ReadLink = "read_link" / 1,
+    Walk = "walk" / 1,
+    SetModified = "set_modified" / 2,
 }
 
 impl Op {
-    pub const ALL: [Op; 26] = [
-        Op::ReadFile,
-        Op::ReadAt,
-        Op::ListDir,
-        Op::Kind,
-        Op::Resolved,
-        Op::Exists,
-        Op::FileSize,
-        Op::ModifiedMs,
-        Op::WriteFile,
-        Op::Append,
-        Op::CreateDir,
-        Op::Remove,
-        Op::Rename,
-        Op::Sync,
-        Op::Lock,
-        Op::Unlock,
-        Op::Copy,
-        Op::RemoveTree,
-        Op::TempDir,
-        Op::Canonical,
-        Op::Mode,
-        Op::SetMode,
-        Op::Symlink,
-        Op::ReadLink,
-        Op::Walk,
-        Op::SetModified,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Op::ReadFile => "read_file",
-            Op::ReadAt => "read_at",
-            Op::ListDir => "list_dir",
-            Op::Kind => "kind",
-            Op::Resolved => "resolved",
-            Op::Exists => "exists",
-            Op::FileSize => "file_size",
-            Op::ModifiedMs => "modified_ms",
-            Op::WriteFile => "write_file",
-            Op::Append => "append",
-            Op::CreateDir => "create_dir",
-            Op::Remove => "remove",
-            Op::Rename => "rename",
-            Op::Sync => "sync",
-            Op::Lock => "lock",
-            Op::Unlock => "unlock",
-            Op::Copy => "copy",
-            Op::RemoveTree => "remove_tree",
-            Op::TempDir => "temp_dir",
-            Op::Canonical => "canonical",
-            Op::Mode => "mode",
-            Op::SetMode => "set_mode",
-            Op::Symlink => "symlink",
-            Op::ReadLink => "read_link",
-            Op::Walk => "walk",
-            Op::SetModified => "set_modified",
-        }
-    }
-
-    pub fn what(self) -> &'static str {
-        match self {
-            Op::ReadFile => "`fs.read_file`",
-            Op::ReadAt => "`fs.read_at`",
-            Op::ListDir => "`fs.list_dir`",
-            Op::Kind => "`fs.kind`",
-            Op::Resolved => "`fs.resolved`",
-            Op::Exists => "`fs.exists`",
-            Op::FileSize => "`fs.file_size`",
-            Op::ModifiedMs => "`fs.modified_ms`",
-            Op::WriteFile => "`fs.write_file`",
-            Op::Append => "`fs.append`",
-            Op::CreateDir => "`fs.create_dir`",
-            Op::Remove => "`fs.remove`",
-            Op::Rename => "`fs.rename`",
-            Op::Sync => "`fs.sync`",
-            Op::Lock => "`fs.lock`",
-            Op::Unlock => "`fs.unlock`",
-            Op::Copy => "`fs.copy`",
-            Op::RemoveTree => "`fs.remove_tree`",
-            Op::TempDir => "`fs.temp_dir`",
-            Op::Canonical => "`fs.canonical`",
-            Op::Mode => "`fs.mode`",
-            Op::SetMode => "`fs.set_mode`",
-            Op::Symlink => "`fs.symlink`",
-            Op::ReadLink => "`fs.read_link`",
-            Op::Walk => "`fs.walk`",
-            Op::SetModified => "`fs.set_modified`",
-        }
-    }
-
-    fn arity(self) -> usize {
-        match self {
-            Op::ReadAt => 3,
-            Op::WriteFile
-            | Op::Append
-            | Op::Rename
-            | Op::Copy
-            | Op::TempDir
-            | Op::SetMode
-            | Op::Symlink
-            | Op::SetModified => 2,
-            _ => 1,
-        }
-    }
-
     /// The thread name a job runs under.
     fn label(self) -> &'static str {
         match self {
@@ -199,7 +94,7 @@ impl Op {
         }
     }
 
-    pub fn declaration(self, path: &'static str) -> HostOp {
+    pub fn declaration(self) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
@@ -209,7 +104,7 @@ impl Op {
             blocking: true,
             // No expression turns a `Secret` into a path `String` or a body `Bytes`.
             secrets: false,
-            path,
+            path: self.path(),
         }
     }
 }
@@ -369,37 +264,6 @@ impl FsHost {
     pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
         self.pool.block_on(pending)
     }
-
-    fn path(op: Op) -> &'static str {
-        match op {
-            Op::ReadFile => "ply_host::fs::read_file",
-            Op::ReadAt => "ply_host::fs::read_at",
-            Op::ListDir => "ply_host::fs::list_dir",
-            Op::Kind => "ply_host::fs::kind",
-            Op::Resolved => "ply_host::fs::resolved",
-            Op::Exists => "ply_host::fs::exists",
-            Op::FileSize => "ply_host::fs::file_size",
-            Op::ModifiedMs => "ply_host::fs::modified_ms",
-            Op::WriteFile => "ply_host::fs::write_file",
-            Op::Append => "ply_host::fs::append",
-            Op::CreateDir => "ply_host::fs::create_dir",
-            Op::Remove => "ply_host::fs::remove",
-            Op::Rename => "ply_host::fs::rename",
-            Op::Sync => "ply_host::fs::sync",
-            Op::Lock => "ply_host::fs::lock",
-            Op::Unlock => "ply_host::fs::unlock",
-            Op::Copy => "ply_host::fs::copy",
-            Op::RemoveTree => "ply_host::fs::remove_tree",
-            Op::TempDir => "ply_host::fs::temp_dir",
-            Op::Canonical => "ply_host::fs::canonical",
-            Op::Mode => "ply_host::fs::mode",
-            Op::SetMode => "ply_host::fs::set_mode",
-            Op::Symlink => "ply_host::fs::symlink",
-            Op::ReadLink => "ply_host::fs::read_link",
-            Op::Walk => "ply_host::fs::walk",
-            Op::SetModified => "ply_host::fs::set_modified",
-        }
-    }
 }
 
 pub fn registrations(fs: &Arc<FsHost>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
@@ -410,7 +274,7 @@ pub fn registrations(fs: &Arc<FsHost>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
                 op: *op,
                 fs: Arc::clone(fs),
             });
-            (op.declaration(FsHost::path(*op)), handler)
+            (op.declaration(), handler)
         })
         .collect()
 }
