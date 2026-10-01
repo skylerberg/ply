@@ -243,6 +243,37 @@ fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
     assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
 }
 
+/// A type parameter hides the task `spawned` let out from the next region, which numbers a task of
+/// its own `@1` as well: joined there by id alone, the handle would answer that task's `2`.
+const REJOINED: &str = r#"
+fn joined<a>(x: a, wait: (a) -> Int / {task.join}) -> Int / {sim.read} =
+  simulate {
+    let mine = task.spawn(|| 2);
+    wait(x) + task.join(mine)
+  }
+
+pub fn rejoined() -> Int = match spawned() {
+  Some(t) -> joined(t, |h: Task<Int>| task.join(h)),
+  None -> 0,
+}
+"#;
+
+#[test]
+fn a_task_carried_into_another_region_fails_its_join_rather_than_answering_a_stranger() {
+    let compiled = Compiled::new(&format!("{HANDED}{REJOINED}"));
+    let (mut machine, tier) = compiled.machine_and_tier();
+
+    let d = machine
+        .call("m.rejoined", vec![], Span::DUMMY)
+        .into_parts()
+        .0
+        .expect_err("the handle names a task of the first region");
+
+    assert_eq!(d.code, codes::TASK_ESCAPES_SCOPE, "{d:#?}");
+    assert!(d.message.contains("another region"), "{}", d.message);
+    assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
+}
+
 #[test]
 fn the_constant_memo_keeps_no_answer_that_holds_a_continuation() {
     let native = Compiled::new(PARKED).native();

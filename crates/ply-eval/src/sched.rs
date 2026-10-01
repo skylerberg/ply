@@ -2,7 +2,7 @@
 
 use crate::cont::SimId;
 use crate::host::{HostBinding, HostRuntime, MachineId, Pending};
-use crate::region::Trail;
+use crate::region::{StepSite, Trail};
 use crate::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use crate::value::Value;
 use crate::{Diagnostic, Span, codes};
@@ -52,11 +52,13 @@ impl HostPolicy {
     }
 }
 
-/// A `Task` value: its task's id, counted so a production region can retire the task once unheld.
+/// A `Task` value: its region and its id, counted so a production region can retire it once unheld.
 #[derive(Clone)]
 pub struct TaskHandle(Rc<Held>);
 
 struct Held {
+    /// Every region numbers its own tasks, so an id alone names a task only in its own region.
+    region: SimId,
     id: TaskId,
     /// A production region's [`Released`]; dangling for every other handle, which nothing counts.
     released: Weak<Released>,
@@ -66,12 +68,17 @@ struct Held {
 type Released = Cell<Vec<TaskId>>;
 
 impl TaskHandle {
-    /// A handle no region counts, as one built outside every region is.
-    pub fn unowned(id: TaskId) -> TaskHandle {
+    /// A handle to `id` of `region` that no region counts toward retiring the task.
+    pub fn unowned(region: SimId, id: TaskId) -> TaskHandle {
         TaskHandle(Rc::new(Held {
+            region,
             id,
             released: Weak::new(),
         }))
+    }
+
+    pub fn region(&self) -> SimId {
+        self.0.region
     }
 
     pub fn id(&self) -> TaskId {
@@ -149,6 +156,8 @@ pub struct StepRecord {
     pub at: i64,
     /// What the step touched, excluding the scheduler's own bookkeeping.
     pub accesses: StepFootprint,
+    /// Where it first touched something in `accesses`, else where it gave control back.
+    pub site: Option<StepSite>,
     pub stamp: Stamp,
 }
 
@@ -324,6 +333,7 @@ impl<K, B> Scheduler<K, B> {
             choice: choice as u16,
             at: clock.now(),
             accesses: StepFootprint::new(),
+            site: None,
             stamp: self.task_mut(task)?.stamp.clone(),
         });
         self.current = Some(task);
@@ -519,7 +529,11 @@ impl<K, B> Scheduler<K, B> {
             Policy::Host => Rc::downgrade(&self.released),
             Policy::Seeded => Weak::new(),
         };
-        TaskHandle(Rc::new(Held { id, released }))
+        TaskHandle(Rc::new(Held {
+            region: self.region,
+            id,
+            released,
+        }))
     }
 
     /// At the region's end, the bodies of the tasks it never started, for the caller to release.
@@ -572,8 +586,12 @@ impl<K, B> Scheduler<K, B> {
         Ok(())
     }
 
-    pub fn join(&mut self, k: K, target: TaskId, span: Span) -> Result<(), Diagnostic> {
+    pub fn join(&mut self, k: K, target: &TaskHandle, span: Span) -> Result<(), Diagnostic> {
         let task = self.running()?;
+        if target.region() != self.region {
+            return Err(err_foreign_task(span, target.id()));
+        }
+        let target = target.id();
         let done = match self.tasks.get(&target).map(|t| &t.state) {
             None => return Err(err_unknown_task(span, target)),
             Some(TaskState::Done(value)) => Some(value.clone()),
@@ -940,6 +958,21 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 pub const FRUITLESS_PARKS: u32 = 1024;
+
+#[cold]
+#[inline(never)]
+fn err_foreign_task(span: Span, task: TaskId) -> Diagnostic {
+    Diagnostic::error(
+        codes::TASK_ESCAPES_SCOPE,
+        format!("`{task}` is a task of another region"),
+    )
+    .primary(
+        span,
+        "this handle was spawned by another region's scheduler",
+    )
+    .note("every region numbers its own tasks, so here the handle's id names another task, or none")
+    .note("join the task inside the region that spawned it")
+}
 
 #[cold]
 #[inline(never)]
