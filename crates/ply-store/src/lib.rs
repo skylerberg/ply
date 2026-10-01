@@ -35,7 +35,7 @@ pub const RUNTIME_VERSION: &str = "0.16.0";
 /// Bumping this discards every filed row and interface, source fingerprint and front-end answer.
 /// A slot holds a `front.Filing` the checker accepted, so a change to that shape or to what the
 /// checker accepts is a bump here.
-pub const FRONTEND_VERSION: &str = "0.32.0";
+pub const FRONTEND_VERSION: &str = "0.33.0";
 
 /// Bumping this re-attempts every obligation and re-runs no test.
 pub const PROVER_VERSION: &str = "0.8.0";

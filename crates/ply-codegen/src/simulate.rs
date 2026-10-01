@@ -7,7 +7,7 @@ use crate::rt::{
 };
 use crate::stack::{Stack, switch};
 use ply_eval::host::Pending;
-use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, Turn};
+use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, TaskHandle, Turn};
 use ply_eval::sim::{Access, Answer, Handlers, OpSignature, TaskId, signature};
 use ply_eval::{Diagnostic, SimId, Span, Symbol, Unbound, Value, codes};
 use std::collections::BTreeMap;
@@ -49,7 +49,7 @@ struct TaskStack {
 enum Request {
     /// The body, and the stack the spawn was performed on.
     Spawn(Word, usize),
-    Join(TaskId),
+    Join(TaskHandle),
     Yield,
     Seeded(&'static OpSignature, Vec<Value>),
     Park(Pending),
@@ -336,7 +336,7 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             );
             sim.sched.suspend(k, Value::Task(handle))
         }
-        Request::Join(target) => sim.sched.join(k, target, site),
+        Request::Join(target) => sim.sched.join(k, &target, site),
         Request::Yield => sim.sched.suspend(k, Value::Unit),
         Request::Park(pending) => match &runtime {
             Some(rt) => sim.sched.park_on_host(k, pending, site, rt.as_ref()),
@@ -459,7 +459,7 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
             let handle = c.value(args[0]);
             heap::dec(args[0]);
             match handle.as_task(c.site(), "`task.join`") {
-                Ok(target) => Request::Join(target),
+                Ok(target) => Request::Join(target.clone()),
                 Err(d) => return c.fail(d),
             }
         }
