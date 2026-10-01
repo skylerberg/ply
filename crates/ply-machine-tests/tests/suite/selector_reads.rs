@@ -97,13 +97,13 @@ fn main(root: String, front: Front) -> Bool / {
 }
 "#;
 
-/// Two runs, each configured over a tree and a filter of its own: the first test each one's load
+/// Two runs, each configured over a tree and filters of its own: the first test each one's load
 /// holds, and how many tests its filter hid.
 const TWO_RUNS: &str = r#"
-fn first_test(root: String, front: Front, filter: Option<String>) -> String / {
+fn first_test(root: String, front: Front, filters: List<String>) -> String / {
   tester.configure[r], tester.loaded[r], tester.keys[r],
 } = {
-  tester.configure[r]({ ..options(root), filter: filter });
+  tester.configure[r]({ ..options(root), filters: filters });
   match tester.loaded[r](front) {
     Err(_) -> "refused",
     Ok(p) -> match list_at(tester.keys[r](), 0) {
@@ -115,7 +115,7 @@ fn first_test(root: String, front: Front, filter: Option<String>) -> String / {
 
 fn main(root: String, front: Front, other: String, other_front: Front) -> List<String> / {
   tester.configure[r], tester.loaded[r], tester.keys[r],
-} = [first_test(root, front, None), first_test(other, other_front, Some("nothing"))]
+} = [first_test(root, front, []), first_test(other, other_front, ["nothing"])]
 "#;
 
 fn front_of(source: &str) -> Front {
