@@ -3,7 +3,6 @@
 //! a summary a reviewer can read.
 
 use crate::hosts::Lent;
-use crate::tester::TestOptions;
 use ply_eval::{CheckOutput, Diagnostic, Span, codes};
 
 /// One family of capabilities, and what lending it lets a program do.
@@ -76,7 +75,6 @@ pub type Declared<'a> = &'a dyn Fn(&str) -> String;
 fn own(effect: &str) -> String {
     match effect {
         "prover" => "claims",
-        "tester" => "tests",
         "store" => "cache",
         "archive" => "bootstrap",
         "tcb" => "hosts",
@@ -92,7 +90,7 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
         "machine" => {
             crate::registrations_in(&declared("machine"), crate::drive::RunOptions::default())
         }
-        "tester" => crate::tester::Session::new(&TestOptions::default()).lent(),
+        "tester" => crate::tester::Session::new().lent(),
         "claims" => crate::claims::lent(&declared("prover")),
         "builder" => crate::builder::lent(),
         "cache" => crate::cache::lent(&declared("store")),

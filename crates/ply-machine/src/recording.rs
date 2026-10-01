@@ -70,19 +70,6 @@ pub fn span_value(span: Span) -> PlyValue {
     ])
 }
 
-/// What a recording's `{ module, start, end }` names.
-pub fn span_of(value: &PlyValue, span: Span) -> Result<Span, Diagnostic> {
-    let part = |name: &str| -> Result<u32, Diagnostic> {
-        u32::try_from(field_of(value, name, span)?.as_int(span, name)?)
-            .map_err(|_| malformed("a span is out of range", span))
-    };
-    Ok(Span::new(
-        ply_eval::SourceId(part("module")?),
-        part("start")?,
-        part("end")?,
-    ))
-}
-
 fn step_value(step: &ply_eval::region::Step) -> PlyValue {
     let int = |n: u64| PlyValue::Int(i64::try_from(n).unwrap_or(i64::MAX));
     record(vec![

@@ -11,7 +11,8 @@ mod judged_effect;
 mod judging;
 mod prover_runs;
 mod reused;
-mod selector_reads;
+mod tester_ops;
+mod testrun;
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{Front, Machine, Provider, Span, Value};

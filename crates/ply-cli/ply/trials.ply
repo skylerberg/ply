@@ -1,0 +1,651 @@
+// A failure's bisection, as the program carries it out: the facts its change set is classified
+// from, the bodies of the era its test last passed in beside this run's, and each mixture the
+// search asks for, printed and checked by the compiler and run hermetically at the interleaving the
+// failure took. Which mixture to try, and what the answers mean, is `suite.diagnose`'s.
+
+import cache (Front, SourceFile)
+import compiler.front (Analysed, DefInterface, FiledDef, Refused, Whole, analyse_pulling_std_with,
+                       body_key, dump_of, filing, rehash)
+import compiler.hash (Pin, Printed, Rehashed, Unprintable, print_bodies)
+import compiler.infer (DefInfo, TestInfo)
+import compiler.resolve (Source)
+import diagnostic (Raised)
+import entry (At)
+import program (Program, outside, sourced)
+import sim.plan (Seed)
+import sim.recording (Passed, Failed)
+import std.bytes (bytes_of_hex, hex_of)
+import suite.bisect (DifferentFailure, DoesNotCheck, MissingBody, NoBodies, NoHybrids, Skipped,
+                     Trial, a_failure, a_pass, from_cache, unresolved_trial)
+import suite.bisect
+import suite.conclude (PassRecord, Named)
+import suite.delta (Decl, DefKey, Facts, Row, Value, decl_key, value_key)
+import suite.facts (Baseline, Now, Node, Rehash, facts)
+import suite.mixture (Mixture, choose, hashes_of, mixture_of, printed_names)
+import tester (tester)
+
+// The interleaving a mixture runs is the failure's, at the bound a replay of one takes.
+fn trial_steps() -> Int = 100000
+
+// What a failure's cause is decided from, when its test passed before: the facts, why no mixture
+// can be tried when none can, and where each name the facts mention is.
+pub type Evident = {
+  facts: Facts,
+  absent: Option<Skipped>,
+  at: List<{ name: String, at: Option<At> }>,
+}
+
+// What trying a mixture of one failure takes.
+pub type Bench = {
+  mixture: Mixture,
+  // Every body either era could take, by hash: this run's own, then the store's.
+  bodies: Map<String, Bytes>,
+  test_body: Bytes,
+  // What makes another failure the same failure.
+  code: Bytes,
+  message: Bytes,
+  seed: Seed,
+}
+
+// One failure's facts, and the bench a mixture of it is tried on when one can be.
+pub type Diagnosed = { evident: Evident, bench: Option<Bench> }
+
+// The program as diagnosis reads it, computed once per run however many tests failed.
+pub type Tree = {
+  whole: Whole,
+  sources: List<Source>,
+  defs: Map<String, String>,
+  decls: Map<String, String>,
+  closure: Map<String, List<String>>,
+  deps: Map<String, List<String>>,
+  // Each definition's interface as this run's front end would file it.
+  interfaces: Map<String, FiledDef>,
+  // This run's bodies by hash, and each test's by its hash.
+  bodies: Map<String, Bytes>,
+  test_bodies: Map<String, Bytes>,
+  places: Map<String, At>,
+}
+
+fn text(b: Bytes) -> String = string_of_bytes_lossy(b)
+
+fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<String, String> =
+  fold(xs, map_new(), |acc: Map<String, String>, x: { name: Bytes, hash: Bytes }|
+    map_insert(acc, text(x.name), hex_of(x.hash)))
+
+// A name's one body answers for each hash the name has; a name with a body in each namespace has
+// each filed under the hash it verifies as.
+fn bodies_of(w: Whole) -> Map<String, Bytes> = {
+  let defs = by_name(w.hashes.defs);
+  let decls = by_name(w.hashes.decls);
+  let counted = fold(
+    w.hashes.bodies,
+    map_new(),
+    |acc: Map<String, Int>, b: { name: Bytes, body: Bytes }|
+      map_insert(acc, text(b.name), match map_get(acc, text(b.name)) {
+        Some(n) -> n + 1,
+        None -> 1,
+      }),
+  );
+  fold(w.hashes.bodies, map_new(), |acc: Map<String, Bytes>, b: { name: Bytes, body: Bytes }| {
+    let alone = map_get(counted, text(b.name)) == Some(1);
+    let hashes = fold(
+      [map_get(defs, text(b.name)), map_get(decls, text(b.name))],
+      [],
+      |hs: List<String>, h: Option<String>| match h { Some(x) -> push(hs, x), None -> hs },
+    );
+    fold(hashes, acc, |into: Map<String, Bytes>, h: String|
+      if alone || body_key(b.body) == Some(bytes_of_hex(h)) { map_insert(into, h, b.body) }
+      else { into })
+  })
+}
+
+fn at_of(l: { module: Int, span: { start: Int, end: Int } }) -> Option<At> =
+  if l.module == outside() { None }
+  else { Some({ module: l.module, start: l.span.start, end: l.span.end }) }
+
+// Everything diagnosis reads of this run's program.
+pub fn program_of(p: Program, w: Whole) -> Tree = tree_of(sourced(p, w), w)
+
+// The same over the modules as the front end took them.
+pub fn tree_of(sources: List<Source>, w: Whole) -> Tree = {
+  let filed = filing(w);
+  {
+    whole: w,
+    sources: sources,
+    defs: by_name(w.hashes.defs),
+    decls: by_name(w.hashes.decls),
+    closure: fold(
+      w.hashes.closure,
+      map_new(),
+      |acc: Map<String, List<String>>, c: { name: Bytes, names: Map<Bytes, Bool> }|
+        map_insert(acc, text(c.name), map(map_keys(c.names), text)),
+    ),
+    deps: fold(
+      w.hashes.deps,
+      map_new(),
+      |acc: Map<String, List<String>>, d: { name: Bytes, names: List<Bytes> }|
+        map_insert(acc, text(d.name), map(d.names, text)),
+    ),
+    interfaces: fold(filed.defs, map_new(), |acc: Map<String, FiledDef>, f: FiledDef|
+      map_insert(acc, text(f.name), f)),
+    bodies: bodies_of(w),
+    test_bodies: fold(w.hashes.test_bodies, map_new(), |acc: Map<String, Bytes>, b: Bytes|
+      match body_key(b) { Some(k) -> map_insert(acc, hex_of(k), b), None -> acc }),
+    places: fold(w.checked.defs, map_new(), |acc: Map<String, At>, d: DefInfo|
+      match at_of(d.at) { Some(a) -> map_insert(acc, text(d.name), a), None -> acc }),
+  }
+}
+
+fn named_map(xs: List<Named>) -> Map<String, String> =
+  fold(xs, map_new(), |acc: Map<String, String>, n: Named| map_insert(acc, n.name, n.hash))
+
+// Today's bodies re-hashed with every reference to a baseline name written as its baseline hash.
+fn rehashed(pr: Tree, b: Baseline) -> Rehash = {
+  let pins = appended(
+    map_fold(b.closure, [], |acc: List<Pin>, name: String, h: String|
+      push(acc, { name: bytes_of_string(name), decl: false, hash: bytes_of_hex(h) })),
+    map_fold(b.decls, [], |acc: List<Pin>, name: String, h: String|
+      push(acc, { name: bytes_of_string(name), decl: true, hash: bytes_of_hex(h) })),
+  );
+  let w = pr.whole;
+  let r: Rehashed = rehash(pr.sources, pins, w.packages, w.mod_pkg, len(w.packages));
+  {
+    nodes: map(
+      r.nodes,
+      |n: { name: Bytes, decl: Bool, fresh: Bytes, table: Bytes, component: Int }|
+        {
+          key: if n.decl { decl_key(text(n.name)) } else { value_key(text(n.name)) },
+          fresh: hex_of(n.fresh),
+          table: hex_of(n.table),
+          component: n.component,
+        },
+    ),
+    tests: fold(r.tests, map_new(), |acc: Map<String, String>, t: { key: Bytes, hash: Bytes }|
+      map_insert(acc, text(t.key), hex_of(t.hash))),
+  }
+}
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+// Whether a function's published interface, its scheme and its footprint, is the same in both
+// eras: exactly when a mixture swapping it alone still checks. A declaration never is, and an
+// interface the store never filed is no answer.
+fn stable_of(pr: Tree, key: DefKey, before: String) -> Option<Bool> / {tester.interfaces[corpus]} =
+  match key.ns {
+    Decl -> Some(false),
+    Value -> match map_get(pr.interfaces, key.name) {
+      None -> None,
+      Some(now) -> match tester.interfaces[corpus]([{ hash: before, name: key.name }]) {
+        [Some(was)] -> Some(same_interface(was, now.interface)),
+        _ -> None,
+      },
+    },
+  }
+
+fn same_interface(a: DefInterface, b: DefInterface) -> Bool =
+  a.scheme == b.scheme && a.row.footprint == b.row.footprint
+
+// The bodies a mixture could take that this run does not hold, from the store; one that is not the
+// body its hash names is no body at all.
+fn stored(
+  have: Map<String, Bytes>,
+  wanted: List<String>,
+) -> Map<String, Bytes> / {tester.bodies[corpus]} = {
+  let missing = filter(wanted, |h: String| !map_contains(have, h));
+  if len(missing) == 0 { have } else {
+    let found = tester.bodies[corpus](missing);
+    fold(range(0, len(missing)), have, |acc: Map<String, Bytes>, i: Int|
+      match ((list_at(missing, i), list_at(found, i))) {
+        (Some(h), Some(Some(b))) -> if body_key(b) == Some(bytes_of_hex(h)) {
+          map_insert(acc, h, b)
+        } else { acc },
+        _ -> acc,
+      })
+  }
+}
+
+// One failure's facts and bench, from the pass its test last had. `seed` is the interleaving it
+// failed at, when it was searched.
+pub fn diagnosed(
+  pr: Tree,
+  key: String,
+  test_hash: Option<String>,
+  record: PassRecord,
+  failure: Raised,
+  seed: Seed,
+) -> Diagnosed / {tester.interfaces[corpus], tester.bodies[corpus]} = {
+  let b: Baseline = {
+    test: record.test,
+    closure: named_map(record.closure),
+    decls: named_map(record.decls),
+  };
+  let names = match map_get(pr.closure, key) { Some(xs) -> xs, None -> [] };
+  let now: Now = { test: test_hash, closure: names, defs: pr.defs, decls: pr.decls, deps: pr.deps };
+  let f = facts(key, b, now, Some(rehashed(pr, b)), |k: DefKey, was: String| stable_of(pr, k, was));
+  let m = mixture_of(b.closure, b.decls, names, pr.defs, pr.decls);
+  let held = stored(pr.bodies, hashes_of(m));
+  let complete = fold(hashes_of(m), true, |ok: Bool, h: String| ok && map_contains(held, h));
+  let test_body = match test_hash { Some(h) -> map_get(pr.test_bodies, h), None -> None };
+  let mentioned = fold(
+    f.rows,
+    map_insert(map_new(), key, true),
+    |acc: Map<String, Bool>, r: Row| map_insert(acc, r.name, true),
+  );
+  let evident = {
+    facts: f,
+    absent: if !complete { Some(NoBodies) }
+    else if test_body == None { Some(NoHybrids) }
+    else { None },
+    at: map(map_keys(mentioned), |name: String| { name: name, at: map_get(pr.places, name) }),
+  };
+  {
+    evident: evident,
+    bench: match test_body {
+      Some(body) -> if !complete { None } else {
+        Some({
+          mixture: m,
+          bodies: held,
+          test_body: body,
+          code: failure.diag.code,
+          message: failure.diag.message,
+          seed: seed,
+        })
+      },
+      None -> None,
+    },
+  }
+}
+
+// What one mixture came to, and the key its pass is filed under when it passed.
+pub type Tried = { trial: Trial, proved: Option<String> }
+
+fn unresolved(why: bisect::Unresolved) -> Tried = { trial: unresolved_trial(why), proved: None }
+
+// The test of a printed mixture, which `print_bodies` names.
+fn mixture_test() -> Bytes = b"ply_tests.t0"
+
+// The mixture that takes `flipped` from now and the rest from the baseline. A key already holding a
+// pass answers without anything being built.
+pub fn trial(
+  b: Bench,
+  flipped: List<DefKey>,
+  filed: Option<String>,
+) -> Tried / {tester.outcomes[corpus], tester.unit[corpus], tester.interleaved[corpus]} = {
+  let cached = match filed {
+    Some(k) -> tester.outcomes[corpus]([k]) == [Some("passed")],
+    None -> false,
+  };
+  if cached { { trial: from_cache(a_pass()), proved: None } } else {
+    match choose(b.mixture, flipped) {
+      Err(why) -> unresolved(why),
+      Ok(chosen) -> {
+        let bodies = fold(chosen.hashes, Some([]), |acc: Option<List<Bytes>>, h: String|
+          match ((acc, map_get(b.bodies, h))) {
+            (Some(xs), Some(body)) -> Some(push(xs, body)),
+            _ -> None,
+          });
+        match bodies {
+          None -> unresolved(MissingBody),
+          Some(xs) -> match printed_names(xs) {
+            None -> unresolved(MissingBody),
+            Some(names) -> match print_bodies(
+                xs,
+                names,
+                [b.test_body],
+                map(chosen.relink, |r: { from: String, to: String }|
+                  { from: bytes_of_hex(r.from), to: bytes_of_hex(r.to) }),
+                [],
+              ) {
+              Unprintable(_) -> unresolved(MissingBody),
+              Printed(modules) -> ran(b, modules, filed),
+            },
+          },
+        }
+      },
+    }
+  }
+}
+
+fn ran(
+  b: Bench,
+  modules: List<{ module: Bytes, text: Bytes }>,
+  filed: Option<String>,
+) -> Tried / {tester.unit[corpus], tester.interleaved[corpus]} = {
+  let sources = map(modules, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text });
+  match analyse_pulling_std_with(sources, [], [], []).out {
+    Refused(_) -> unresolved(DoesNotCheck),
+    Analysed(w) -> {
+      let at = fold(w.checked.tests, None, |found: Option<Int>, t: TestInfo|
+        match found {
+          Some(_) -> found,
+          None -> if t.key == mixture_test() { Some(t.index) } else { None },
+        });
+      match at {
+        None -> unresolved(DoesNotCheck),
+        Some(index) -> {
+          let front: Front = {
+            dump: dump_of(Analysed(w)),
+            files: map(modules, |m: { module: Bytes, text: Bytes }|
+              { path: text(m.module), name: text(m.module), text: m.text }),
+            read_ms: 0,
+            front_ms: 0,
+            file_ms: 0,
+            cached: false,
+          };
+          // Hermetic always: a search asks for up to its budget of these.
+          match tester.unit[corpus](front, true, false) {
+            Err(_) -> unresolved(DifferentFailure),
+            Ok(unit) -> match tester.interleaved[corpus](
+                unit,
+                index,
+                b.seed,
+                trial_steps(),
+                false,
+              ).run.verdict {
+              Passed -> { trial: a_pass(), proved: filed },
+              Failed(fell) -> if fell.failure.diag.code == b.code
+                  && fell.failure.diag.message == b.message { { trial: a_failure(), proved: None } }
+              else { unresolved(DifferentFailure) },
+            },
+          }
+        },
+      }
+    },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn chain() -> String =
+  "fn leaf(n: Int) -> Int = n + 1\nfn mid(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n"
+
+fn era(src: String) -> Tree = {
+  let sources = [{ name: b"", src: bytes_of_string(src) }];
+  match analyse_pulling_std_with(sources, [], [], []).out {
+    Analysed(w) -> tree_of(sources, w),
+    Refused(_) -> panic("the fixture checks"),
+  }
+}
+
+fn hash_of_test(t: Tree, key: String) -> Option<String> =
+  fold(range(0, len(t.whole.checked.tests)), None, |found: Option<String>, i: Int|
+    match ((found, list_at(t.whole.checked.tests, i), list_at(t.whole.hashes.tests, i))) {
+      (None, Some(info), Some(h)) -> if text(info.key) == key { Some(hex_of(h)) } else { None },
+      _ -> found,
+    })
+
+// What a pass of `key` in `t` filed: its hash and its closure's.
+fn passed_in(t: Tree, key: String) -> PassRecord = {
+  let names = match map_get(t.closure, key) { Some(xs) -> xs, None -> [] };
+  let pick = |m: Map<String, String>|
+    fold(names, [], |acc: List<Named>, n: String|
+      match map_get(m, n) { Some(h) -> push(acc, { name: n, hash: h }), None -> acc });
+  {
+    test: match hash_of_test(t, key) { Some(h) -> h, None -> "" },
+    closure: pick(t.defs),
+    decls: pick(t.decls),
+  }
+}
+
+fn a_raised(code: Bytes, message: Bytes) -> Raised =
+  {
+    diag: {
+      code: code,
+      notes: 0,
+      labels: [],
+      text: b"",
+      message: message,
+      notes_text: [],
+      severity: b"error",
+      fixes: [],
+    },
+    values: [],
+  }
+
+// The failure in `after` of a test that passed in `before`, diagnosed over a store that holds what
+// `before` filed: its interfaces and its bodies.
+fn diagnosed_over(before: Tree, after: Tree, key: String) -> Diagnosed =
+  handle {
+    diagnosed(
+      after,
+      key,
+      hash_of_test(after, key),
+      passed_in(before, key),
+      a_raised(b"E0501", b"assertion failed"),
+      { root: 0u64, path: [] },
+    )
+  } with {
+    tester.interfaces[corpus](asked) ->
+      map(asked, |a: { hash: String, name: String }|
+        match map_get(before.interfaces, a.name) { Some(f) -> Some(f.interface), None -> None }),
+    tester.bodies[corpus](hashes) -> map(hashes, |h: String| map_get(before.bodies, h)),
+  }
+
+fn row_of(d: Diagnosed, name: String) -> Row =
+  match filter(d.evident.facts.rows, |r: Row| r.name == name) {
+    [r, ..] -> r,
+    [] -> panic("a row for every name either closure holds"),
+  }
+
+fn edited_row(r: Row) -> Bool = r.before != r.after && r.rehashed != None && r.rehashed != r.before
+
+fn derived_row(r: Row) -> Bool = r.before != r.after && r.rehashed == r.before
+
+fn leaf_edited() -> String =
+  "fn leaf(n: Int) -> Int = n + 2\nfn mid(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n"
+
+test "an edit to a leaf leaves what references it rehashing to its baseline" {
+  let d = diagnosed_over(era(chain()), era(leaf_edited()), "chain");
+  assert(edited_row(row_of(d, "leaf")));
+  assert(derived_row(row_of(d, "mid")));
+  assert(derived_row(row_of(d, "top")));
+  assert_eq(row_of(d, "leaf").referrers, ["mid"]);
+  assert_eq(row_of(d, "mid").referrers, ["top"]);
+  // Interfaces are compared only for a body that moved on its own.
+  assert_eq(row_of(d, "leaf").stable, Some(true));
+  assert_eq(row_of(d, "mid").stable, None);
+  // The closure moved under the test, and its body did not.
+  assert_eq(d.evident.facts.own.rehashed, Some(d.evident.facts.own.before));
+  assert_eq(d.evident.absent, None)
+}
+
+test "a renamed definition keeps its hash in the program" {
+  let renamed = "fn first(n: Int) -> Int = n + 1\nfn mid(n: Int) -> Int = first(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n";
+  let d = diagnosed_over(era(chain()), era(renamed), "chain");
+  let gone = row_of(d, "leaf");
+  assert_eq(gone.after, None);
+  assert(gone.kept);
+  let arrived = row_of(d, "first");
+  assert_eq(arrived.before, None);
+  assert_eq(arrived.after, gone.before);
+  assert_eq(row_of(d, "mid").before, row_of(d, "mid").after)
+}
+
+test "an edit to the test body rehashes away from its baseline" {
+  let edited = "fn leaf(n: Int) -> Int = n + 1\nfn mid(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(2), 4) }\n";
+  let d = diagnosed_over(era(chain()), era(edited), "chain");
+  let own = d.evident.facts.own;
+  assert(own.after != Some(own.before));
+  assert(own.rehashed != None && own.rehashed != Some(own.before));
+  assert(fold(d.evident.facts.rows, true, |ok: Bool, r: Row| ok && r.before == r.after))
+}
+
+test "editing one member of a component moves the whole component and names it" {
+  let parity = "fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\ntest \"parity holds\" { assert(even(4)) }\n";
+  let edited = "fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) && true }\ntest \"parity holds\" { assert(even(4)) }\n";
+  let d = diagnosed_over(era(parity), era(edited), "parity holds");
+  assert(edited_row(row_of(d, "odd")));
+  assert(edited_row(row_of(d, "even")));
+  assert_eq(row_of(d, "even").component, [value_key("even"), value_key("odd")]);
+  assert_eq(row_of(d, "odd").component, [value_key("even"), value_key("odd")])
+}
+
+test "an added definition is named with what mentions it" {
+  let added = "fn leaf(n: Int) -> Int = n + 1\nfn bump(n: Int) -> Int = n\nfn mid(n: Int) -> Int = bump(leaf(n)) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n";
+  let d = diagnosed_over(era(chain()), era(added), "chain");
+  assert_eq(row_of(d, "bump").before, None);
+  assert(row_of(d, "bump").after != None);
+  assert_eq(row_of(d, "bump").referrers, ["mid"]);
+  assert(edited_row(row_of(d, "mid")))
+}
+
+test "a store that cannot produce the baseline's bodies is why no mixture can be tried" {
+  let d = handle {
+    diagnosed(
+      era(leaf_edited()),
+      "chain",
+      hash_of_test(era(leaf_edited()), "chain"),
+      passed_in(era(chain()), "chain"),
+      a_raised(b"E0501", b"assertion failed"),
+      { root: 0u64, path: [] },
+    )
+  } with {
+    tester.interfaces[corpus](asked) -> map(asked, |a: { hash: String, name: String }| None),
+    tester.bodies[corpus](hashes) -> map(hashes, |h: String| None),
+  };
+  assert_eq(d.evident.absent, Some(NoBodies));
+  assert_eq(d.bench, None)
+}
+
+// A mixture is printed from bodies alone, checked like any program, and run without the binding.
+fn tried(b: Bench, flipped: List<DefKey>, failing: Bool) -> Tried =
+  handle {
+    trial(b, flipped, Some("k"))
+  } with {
+    tester.outcomes[corpus](keys) -> map(keys, |k: String| None),
+    tester.unit[corpus](front, build, hosted) -> if hosted {
+      panic("a mixture reached the binding")
+    } else if len(front.files) == 0 { Err([]) }
+    else { Ok(7) },
+    tester.interleaved[corpus](unit, index, seed, steps, again) ->
+      {
+        run: {
+          steps: [],
+          verdict: if failing {
+            Failed({ status: "failed", failure: a_raised(b"E0501", b"assertion failed") })
+          } else { Passed },
+          virtual_time: 0,
+        },
+        observed: false,
+        usage: { duration_us: 0, host: false, entries: 0, declines: 0, performs: 0, teardown: [] },
+      },
+  }
+
+test "a mixture of the two eras prints and checks, and its answer is the trial's" {
+  let d = diagnosed_over(era(chain()), era(leaf_edited()), "chain");
+  match d.bench {
+    None -> panic("every body is on hand, so a mixture can be built"),
+    Some(b) -> {
+      let green = tried(b, [value_key("leaf")], false);
+      assert_eq(green.trial, a_pass());
+      // A green mixture is filed under the key it was handed, and never under the failing test's.
+      assert_eq(green.proved, Some("k"));
+      let red = tried(b, [value_key("leaf")], true);
+      assert_eq(red.trial, a_failure());
+      assert_eq(red.proved, None)
+    },
+  }
+}
+
+test "a mixture whose key already holds a pass is answered without being built" {
+  let d = diagnosed_over(era(chain()), era(leaf_edited()), "chain");
+  match d.bench {
+    None -> panic("a mixture can be built"),
+    Some(b) -> {
+      let t = handle {
+        trial(b, [value_key("leaf")], Some("k"))
+      } with {
+        tester.outcomes[corpus](keys) -> map(keys, |k: String| Some("passed")),
+        tester.unit[corpus](front, build, hosted) -> panic("a cached mixture was built"),
+        tester.interleaved[corpus](unit, index, seed, steps, again) ->
+          panic("a cached mixture was run"),
+      };
+      assert_eq(t.trial, from_cache(a_pass()));
+      assert_eq(t.proved, None)
+    },
+  }
+}
+
+fn decl_row_of(d: Diagnosed, name: String) -> Row =
+  match filter(d.evident.facts.rows, |r: Row| r.name == name && r.ns == Decl) {
+    [r, ..] -> r,
+    [] -> panic("a row for the declaration"),
+  }
+
+fn value_row_of(d: Diagnosed, name: String) -> Row =
+  match filter(d.evident.facts.rows, |r: Row| r.name == name && r.ns == Value) {
+    [r, ..] -> r,
+    [] -> panic("a row for the definition"),
+  }
+
+fn untouched_row(r: Row) -> Bool = r.before != None && r.before == r.after
+
+fn padded3(i: Int) -> String =
+  if i < 10 { "00" ++ int_to_string(i) } else { "0" ++ int_to_string(i) }
+
+// A chain of definitions, each calling the one below it, so an edit at the leaf reaches every
+// caller through the hashes and only the leaf is a candidate.
+fn deep(depth: Int, leaf: String) -> String =
+  fold(range(1, depth), "fn f000(n: Int) -> Int = " ++ leaf ++ "\n", |acc: String, i: Int|
+      acc ++ "fn f" ++ padded3(i) ++ "(n: Int) -> Int = f" ++ padded3(i - 1) ++ "(n) + 1\n")
+    ++ "test \"deep\" { assert_eq(f"
+    ++ padded3(depth - 1)
+    ++ "(1), "
+    ++ int_to_string(depth)
+    ++ ") }\n"
+
+test "a deep chain yields one edit and every caller above it derived" {
+  let d = diagnosed_over(era(deep(64, "n + 1")), era(deep(64, "n + 2")), "deep");
+  assert_eq(len(d.evident.facts.rows), 64);
+  assert(edited_row(row_of(d, "f000")));
+  assert_eq(len(filter(d.evident.facts.rows, derived_row)), 63)
+}
+
+fn handled() -> String =
+  "effect db {\n  read get[users](key: Int) -> Int\n}\nfn lookup(k: Int) -> Int / {db.get[users]} = db.get[users](k)\nfn twice(k: Int) -> Int / {db.get[users]} = lookup(k) + lookup(k)\nfn seeded(k: Int) -> Int = handle { twice(k) } with { db.get[users](n) -> n * 10 }\ntest \"handled\" { assert_eq(seeded(2), 40) }\n"
+
+test "editing a handler names the definition that carries it, and not the performers" {
+  let after = string_concat(
+    string_slice(handled(), 0, string_find(handled(), "n * 10")),
+    "n * 11"
+      ++ string_slice(handled(), string_find(handled(), "n * 10") + 6, string_len(handled())),
+  );
+  let d = diagnosed_over(era(handled()), era(after), "handled");
+  assert(edited_row(row_of(d, "seeded")));
+  assert(untouched_row(row_of(d, "lookup")));
+  assert(untouched_row(row_of(d, "twice")))
+}
+
+test "editing an effect declaration makes the declaration the edit and its users derived" {
+  let at = string_find(handled(), "}\nfn lookup");
+  let after = string_slice(handled(), 0, at) ++ "  read peek[users](key: Int) -> Int\n"
+    ++ string_slice(handled(), at, string_len(handled()));
+  let d = diagnosed_over(era(handled()), era(after), "handled");
+  assert(edited_row(decl_row_of(d, "db")));
+  // A declaration's interface is never the same on both sides, so it is never independent.
+  assert_eq(decl_row_of(d, "db").stable, Some(false));
+  assert(derived_row(row_of(d, "lookup")));
+  assert(derived_row(row_of(d, "twice")));
+  assert(derived_row(row_of(d, "seeded")))
+}
+
+test "a rename beside an edit leaves the renamed definition re-normalizing to its baseline" {
+  let after = "fn leaf(n: Int) -> Int = n + 2\nfn middle(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = middle(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n";
+  let d = diagnosed_over(era(chain()), era(after), "chain");
+  assert(edited_row(row_of(d, "leaf")));
+  let mid = row_of(d, "mid");
+  assert_eq(mid.after, None);
+  assert(mid.renamed);
+  assert_eq(row_of(d, "middle").before, None);
+  assert_eq(row_of(d, "middle").rehashed, mid.before);
+  assert(derived_row(row_of(d, "top")))
+}
+
+test "a name shared by a function and a type still names the one that moved" {
+  let collide = "type Amount = Cents(Int) | Dollars(Int)\nfn Amount(n: Int) -> Int = n + 1\nfn use_it(a: Amount) -> Int = match a { Cents(c) -> c, Dollars(d) -> d * 100 }\ntest \"t\" { assert_eq(use_it(Cents(5)), 5) }\n";
+  let swapped = "type Amount = Dollars(Int) | Cents(Int)\nfn Amount(n: Int) -> Int = n + 1\nfn use_it(a: Amount) -> Int = match a { Cents(c) -> c, Dollars(d) -> d * 100 }\ntest \"t\" { assert_eq(use_it(Cents(5)), 5) }\n";
+  let d = diagnosed_over(era(collide), era(swapped), "t");
+  assert(edited_row(decl_row_of(d, "Amount")));
+  assert(derived_row(value_row_of(d, "use_it")))
+}
