@@ -20,17 +20,6 @@ pub enum Ordinal {
     Law(Symbol),
 }
 
-/// One entry of the hasher's item order: what one of its hash rows is about.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Hashed {
-    /// A `fn`, `type` or `effect`, by program-wide name; one entry for a name in two namespaces.
-    Def(Symbol),
-    /// A test, by its position in `CheckOutput::tests`.
-    Test(usize),
-    /// A law, by its position in `CheckOutput::laws`.
-    Law(usize),
-}
-
 /// A parameter as the source wrote it, which a spec clause's binders are named and placed by.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WrittenParam {
@@ -46,7 +35,6 @@ pub struct DefWritten {
     pub reuse: bool,
     /// In source order.
     pub params: Vec<WrittenParam>,
-    pub requires_literals: Vec<Literal>,
 }
 
 /// A `type`; no table of [`CheckOutput`] holds its arity, visibility or span.
@@ -59,25 +47,6 @@ pub struct TypeDecl {
     /// Type parameter count; their names never escape.
     pub arity: usize,
     pub span: Span,
-}
-
-/// One `effect set` of a module.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct EffectSet {
-    /// The simple name, which is what a row writes.
-    pub name: Symbol,
-    /// The sets this one includes, by simple name, in source order.
-    pub includes: Vec<Symbol>,
-    /// The expansion as program-wide atoms; an atom naming an unresolved effect is dropped.
-    pub atoms: Footprint,
-}
-
-/// A literal a guard mentions, which is where the witness search looks for a domain.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Literal {
-    Int(i64),
-    Str(String),
-    Bytes(Vec<u8>),
 }
 
 /// One dependency as `ply.lock` pins it: what it calls itself, the version it declares, and the
@@ -95,7 +64,6 @@ pub struct Pinned {
 pub struct EmitterRoot {
     pub root: Symbol,
     pub arity: usize,
-    pub scalar: bool,
     /// Whether the compiler published the root pure: nothing else lets a memo answer for it. A
     /// test, a clause or a law part never is.
     pub pure: bool,
@@ -118,8 +86,6 @@ impl EmitterRoot {
 #[derive(Clone, Debug, Default)]
 pub struct Front {
     pub diagnostics: Vec<Diagnostic>,
-    /// Dependency-first module order, by module name.
-    pub order: Vec<Symbol>,
     /// The closure's packages as `(prefix, declared dep prefixes)`; empty for a project
     /// without packages.
     pub packages: Vec<(String, Vec<String>)>,
@@ -135,15 +101,12 @@ pub struct Front {
     pub hashes_digest: DefHash,
     /// The emitter's root cache keys, by root name, as the compiler computed them.
     pub keys: IndexMap<Symbol, String>,
-    /// Every root the emitter offers, with the arity its body is emitted at and whether its
-    /// parameters and answer are all `Int` or `Bool`.
+    /// Every root the emitter offers, with the arity its body is emitted at.
     pub emitter_roots: Vec<EmitterRoot>,
     /// The emitter's constructors, in the order the emitted C names tags by.
     pub emitter_ctors: Vec<(Symbol, usize)>,
     /// How each constructor's fields read back out of compiled code.
     pub ctor_carries: CtorCarries,
-    /// The hasher's item order: every hashed name, test and law, as its rows come.
-    pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
     pub ordinals: Vec<(Symbol, Vec<Ordinal>)>,
     /// Every `fn`'s, `type`'s and `effect`'s stored body, in the hasher's item order.
@@ -156,12 +119,6 @@ pub struct Front {
     pub types: IndexMap<Symbol, TypeDecl>,
     /// Whether each `effect` was written `pub`; a prelude effect has no entry and is public.
     pub effects_written: IndexMap<Symbol, Visibility>,
-    /// Parallel to `CheckOutput::tests`: the span of each test's label.
-    pub test_name_spans: Vec<Span>,
-    /// Parallel to `CheckOutput::laws`: the literals each law's guard mentions, in walk order.
-    pub law_literals: Vec<Vec<Literal>>,
-    /// Every module's `effect set`s in source order; a module that declares none has no entry.
-    pub effect_sets: IndexMap<Symbol, Vec<EffectSet>>,
 }
 
 impl Front {
@@ -194,17 +151,6 @@ pub struct EffectInfo {
     pub span: Span,
 }
 
-/// A `requires` or `ensures` clause that type-checked.
-#[derive(Clone, Debug)]
-pub struct SpecInfo {
-    pub kind: SpecKind,
-    /// Position among the owner's clauses, in source order.
-    pub index: usize,
-    /// Always empty: a spec expression must not change what it observes.
-    pub footprint: Footprint,
-    pub span: Span,
-}
-
 /// A standalone `law`.
 #[derive(Clone, Debug)]
 pub struct LawInfo {
@@ -215,7 +161,6 @@ pub struct LawInfo {
     pub key: Symbol,
     /// Position in [`CheckOutput::laws`].
     pub index: usize,
-    pub has_guard: bool,
     /// `law/host`: the body may carry any row.
     pub host: bool,
     /// `{}`, `{sim.read}` for a concurrency law, or any row when [`host`](LawInfo::host) is set.
@@ -234,12 +179,6 @@ pub struct DefInfo {
     pub footprint: Footprint,
     /// The row inference computed for the body.
     pub performed: Footprint,
-    /// The `effect set`s this definition's row was written with, in source order, by simple name.
-    pub row_aliases: Vec<Symbol>,
-    /// `requires` / `ensures`, in source order.
-    pub spec: Vec<SpecInfo>,
-    /// Whether running this can execute a `perform` that [`DefInfo::footprint`] does not show.
-    pub internally_effectful: bool,
     pub span: Span,
 }
 

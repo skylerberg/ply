@@ -19,15 +19,6 @@ pub const DIGEST: &str = "ply.digest";
 /// because the keys below are the repository's own paths.
 pub const ROOT: &str = "crates/ply-cli/ply";
 
-/// Every package this binary ships — the CLI and everything it depends on by path — as
-/// `(repository path, module, text)`.
-pub fn closure() -> Vec<(String, String, String)> {
-    PROGRAM_PACKAGES
-        .iter()
-        .map(|(dir, name, text)| ((*dir).to_string(), (*name).to_string(), (*text).to_string()))
-        .collect()
-}
-
 /// The whole closure as the port takes it: `(path, text)`, which `digest_of` sorts. A package's own
 /// modules and its manifest are keyed by the path they have in the repository, so nothing about the
 /// program is a function of where this binary happens to be.
