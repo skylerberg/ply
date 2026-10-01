@@ -320,8 +320,30 @@ fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
              {before:?} to {after:?}"
         )
     });
+    // An edit, which the next report has to be about rather than the program the watch began with.
+    let before = after;
+    let stamped = std::time::Instant::now();
+    loop {
+        std::fs::write(&path, RED).unwrap();
+        if std::fs::metadata(&path).unwrap().modified().unwrap() != before {
+            break;
+        }
+        assert!(
+            stamped.elapsed() < window,
+            "an edit never moved the modification time off {before:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let edited = rx
+        .recv_timeout(window)
+        .unwrap_or_else(|err| panic!("`--watch` did not report the edit: {err}"));
     let _ = child.kill();
     let _ = child.wait();
+    assert_eq!(
+        edited["ok"],
+        Value::Bool(false),
+        "the report after an edit tested the program the watch began with: {edited}"
+    );
     let reports = [first, second];
     for (i, report) in reports.iter().enumerate() {
         assert_eq!(report["ok"], Value::Bool(true), "iteration {i}: {report}");
