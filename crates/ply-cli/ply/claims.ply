@@ -8,6 +8,9 @@
 import cmdline (Parsed, has, parse_nat, value, values_of)
 import proof.shrink (Offer, Reply)
 import proof.world (Built, Obligation, World, walks)
+import proof.decide (Diagnosed, Static, Undecided, decision_word, steps_of)
+import proof.lower (Blocker, blocker_parts)
+import proof.statics (Prover, claims_for, diagnosed, modules_of, prover_of, settled, settled_by)
 import machine
 import cache (Front)
 import compiler.front (Whole)
@@ -85,10 +88,6 @@ pub nondet effect prover {
   // cases is made of, one case at a time. The index is the claim's place in the collection, as
   // `discharged` reads its wants, and the root is the seed a counterexample reports.
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
-  // What the static tier alone answers for each of these claims, by its place in the collection,
-  // whether or not anything discharged it this run: `None` for one it never sees, such as a law over
-  // interleavings. A measurement a run asks for, not a step of a discharge.
-  read reaches[claims](claims: List<Int>) -> Result<List<Option<Reach>>, Refusal>
   // A counterexample is not finished when it is found: the walk that makes it small is this side's,
   // and it drives it one question at a time. The runtime keeps the values — a program cannot hold a
   // value of a type it never named — and regenerates them from the draw it reports.
@@ -167,10 +166,15 @@ pub type Claim = {
 }
 
 // What the program decided about a run of obligations: which ones it reports on, by collection
-// index, which of those the cache could not answer for, in that order, and the key each answered
-// one's evidence is read back from, by its place in the run. How each is discharged is its
-// obligation's own strategy.
-pub type Choice = { claims: List<Int>, runs: List<Int>, read: List<{ at: Int, key: String }> }
+// index, which of those the cache could not answer for, in that order, the key each answered one's
+// evidence is read back from, by its place in the run, and what the static prover settled for each
+// one to discharge. How the rest of each is discharged is its obligation's own strategy.
+pub type Choice = {
+  claims: List<Int>,
+  runs: List<Int>,
+  read: List<{ at: Int, key: String }>,
+  statics: List<Static>,
+}
 
 pub type Sim = { mode: String, roots: List<Int>, budget: Int, steps: Int, path: List<Int> }
 
@@ -229,7 +233,7 @@ pub fn own_claims(w: Whole, built: Built) -> Claimed = {
         host: o.host,
         owner: o.owner,
         kind: o.kind,
-        guarded: o.guarded,
+        guarded: len(o.guards) > 0,
         frame: o.frame,
         at: o.at,
         unperformed: match o.kind {
@@ -257,6 +261,89 @@ pub type Reach = {
   steps: Int,
   blockers: List<{ kind: String, about: Option<String> }>,
 }
+
+// What the static prover answers a run, by collection index: what it settles for each claim to
+// discharge, parallel to `runs`, and under `reach`, what it alone answers for each claim reported
+// on, parallel to `wanted`, whatever else answered it. `budget` is the plan's.
+pub type StaticAnswers = { settled: List<Static>, reaches: Option<List<Option<Reach>>> }
+
+pub type Statics = { answer: (List<Int>, List<Int>, Bool, Int) -> StaticAnswers }
+
+// The static prover over `world`'s obligations, lowering the claims of `w` only for what a run asks:
+// a run the cache answered in full lowers nothing.
+pub fn statics_of(w: Whole, world: World) -> Statics =
+  {
+    answer: |wanted: List<Int>, runs: List<Int>, reach: Bool, budget: Int| {
+      let obligation = |i: Int| list_at(world.obligations, i);
+      let asked = filter_some(map(if reach { wanted } else { runs }, obligation));
+      if len(asked) == 0 {
+        {
+          settled: map(runs, |_i: Int| Undecided),
+          reaches: if reach { Some(map(wanted, |_i: Int| None)) } else { None },
+        }
+      } else {
+        let p: Prover = prover_of(claims_for(w, modules_of(w, asked)), world, budget);
+        if !reach {
+          {
+            settled: map(runs, |i: Int|
+              match obligation(i) { Some(o) -> settled(p, o), None -> Undecided }),
+            reaches: None,
+          }
+        } else {
+          let found = map(wanted, |i: Int|
+            match obligation(i) { Some(o) -> Some({ o: o, d: diagnosed(p, o) }), None -> None });
+          let by_index = fold(
+            range(0, len(wanted)),
+            map_new(),
+            |acc: Map<Int, Option<Diagnosed>>, k: Int|
+              match list_at(found, k) {
+                Some(Some(f)) ->
+                  map_insert(acc, match list_at(wanted, k) { Some(i) -> i, None -> -1 }, f.d),
+                _ -> acc,
+              },
+          );
+          {
+            settled: map(runs, |i: Int|
+              match obligation(i) {
+                Some(o) -> settled_by(o, match map_get(by_index, i) { Some(d) -> d, None -> None }),
+                None -> Undecided,
+              }),
+            reaches: Some(
+              map(found, |f: Option<{ o: Obligation, d: Option<Diagnosed> }>|
+                match f {
+                  Some(x) -> match x.d { Some(d) -> Some(reach_of(d)), None -> None },
+                  None -> None,
+                }),
+            ),
+          }
+        }
+      }
+    },
+  }
+
+// A run that asks the static prover nothing, as a report's tests hand one: every claim is left to
+// its strategy, and under `reach` each is answered `reach`.
+pub fn no_statics(reach: Option<Reach>) -> Statics =
+  {
+    answer: |wanted: List<Int>, runs: List<Int>, asked: Bool, budget: Int|
+      {
+        settled: map(runs, |_i: Int| Undecided),
+        reaches: if asked { Some(map(wanted, |_i: Int| reach)) } else { None },
+      },
+  }
+
+fn reach_of(d: Diagnosed) -> Reach =
+  {
+    decision: decision_word(d.decision),
+    steps: steps_of(d.decision),
+    blockers: map(d.blockers, |b: Blocker| {
+      let parts = blocker_parts(b);
+      { kind: parts.kind, about: parts.detail }
+    }),
+  }
+
+fn filter_some<a>(xs: List<Option<a>>) -> List<a> =
+  fold(xs, [], |acc: List<a>, x: Option<a>| match x { Some(v) -> push(acc, v), None -> acc })
 
 // A run of obligations as a report reads it: what became of each claim it asked for, where each
 // answer came from, and the accounting over them.
@@ -501,6 +588,8 @@ pub fn decided(
   c: Collection,
   wanted: List<Int>,
   use_cache: Bool,
+  statics: Statics,
+  reach: Bool,
 ) -> Result<Verdicts, Refusal> / {prover.outcomes[claims], prover.discharged[claims], prover.record[claims]} = {
   let digest = plan_digest_of(c.plan);
   let asked = map(wanted, |i: Int| blank_claim(c.claims, i));
@@ -512,6 +601,13 @@ pub fn decided(
   });
   let hosted = map(asked, |claim: Claim| claim.host);
   let selection = select(hosted, answers, use_cache);
+  // `runs` are places in the run; the static prover reads collection indices.
+  let static_answers = (statics.answer)(
+    wanted,
+    map(selection.to_discharge, |at: Int| match list_at(wanted, at) { Some(i) -> i, None -> -1 }),
+    reach,
+    c.plan.prove_budget,
+  );
   let choice = {
     claims: wanted,
     runs: selection.to_discharge,
@@ -520,6 +616,7 @@ pub fn decided(
         Some(Some(key)) -> push(acc, { at: at, key: key }),
         _ -> acc,
       }),
+    statics: static_answers.settled,
   };
   match prover.discharged[claims](choice) {
     Err(why) -> Err(why),
@@ -536,7 +633,7 @@ pub fn decided(
       let names = map(c.defs, |x: Def| x.name);
       Ok({
         outcomes: d.outcomes,
-        reaches: None,
+        reaches: static_answers.reaches,
         reasons: selection.reasons,
         coverage: coverage(names, laws, claim_rows(c, wanted, d.outcomes)),
         cached: hits(selection),

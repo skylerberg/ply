@@ -335,6 +335,13 @@ fn obligation(at: At<'_>) -> Result<Obligation, Error> {
         },
         strategy,
         variables,
+        guards: at.field("guards")?.items(|g| {
+            Ok(Span::new(
+                SourceId(g.field("module")?.number()?),
+                g.field("start")?.number()?,
+                g.field("end")?.number()?,
+            ))
+        })?,
     })
 }
 

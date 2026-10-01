@@ -1697,7 +1697,10 @@ pub fn native_key(w: Word) -> bool {
     unsafe {
         match (*o).kind {
             KIND_UNIT | KIND_BOOL | KIND_INT | KIND_STR | KIND_BYTES => true,
-            KIND_BRIDGE => matches!(bridged(o), Value::Str(_) | Value::Bytes(_)),
+            KIND_BRIDGE => matches!(
+                bridged(o),
+                Value::Str(_) | Value::Bytes(_) | Value::Fixed(_)
+            ),
             KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => {
                 (0..(*o).len as usize).all(|i| native_key(word_at(o, i)))
             }

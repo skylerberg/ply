@@ -56,6 +56,7 @@ fn ensures(key: u8, owner: &str, index: usize) -> Obligation {
         variables: Vec::new(),
         footprint: None,
         strategy: Strategy::Static(Unsettled::Run(Points::Drawn)),
+        guards: Vec::new(),
     }
 }
 
@@ -135,7 +136,12 @@ impl Scripted {
 }
 
 impl Discharger for Scripted {
-    fn discharge(&self, obligation: &Obligation, _plan: &ProvePlan) -> Discharge {
+    fn discharge(
+        &self,
+        obligation: &Obligation,
+        _plan: &ProvePlan,
+        _settled: &ply_prove::Static,
+    ) -> Discharge {
         self.asked.lock().unwrap().push(obligation.key);
         match self.answers.get(&obligation.key) {
             Some(Discharge::Held(e)) => Discharge::Held(e.clone()),
@@ -157,6 +163,7 @@ fn carried_out(
 ) -> ply_prove::ProveReport {
     let choice = Choice {
         claims: (0..obligations.len()).collect(),
+        statics: vec![ply_prove::Static::Inconclusive; to_discharge.len()],
         to_discharge,
         read,
     };

@@ -1,0 +1,328 @@
+// `arith` — linear integer arithmetic, by Fourier–Motzkin elimination with integer tightening.
+
+// `Σ coeffs[v]·v + konst ≤ 0`.
+pub type Row = { coeffs: Map<Int, I128>, konst: I128 }
+
+pub type Feasibility = | Infeasible | Undecided
+
+// What an elimination came to, and the budget it left.
+pub type Settled = { answer: Feasibility, budget: Int }
+
+// Past this many rows an elimination answers `Undecided`.
+fn max_rows() -> Int = 512
+
+pub fn leq(rows: List<Row>, coeffs: Map<Int, I128>, konst: I128) -> List<Row> =
+  push(rows, { coeffs: coeffs, konst: konst })
+
+// Both directions; a direction whose negation leaves `I128` is dropped, which only weakens it.
+pub fn eq_rows(rows: List<Row>, coeffs: Map<Int, I128>, konst: I128) -> List<Row> = {
+  let negated = fold(
+    map_entries(coeffs),
+    Some(map_new()),
+    |acc: Option<Map<Int, I128>>, e: { key: Int, value: I128 }|
+      match acc {
+        None -> None,
+        Some(m) -> match checked_neg(e.value) {
+          Some(c) -> Some(map_insert(m, e.key, c)),
+          None -> None,
+        },
+      },
+  );
+  let first = match negated {
+    Some(m) -> match checked_neg(konst) { Some(k) -> leq(rows, m, k), None -> rows },
+    None -> rows,
+  };
+  leq(first, coeffs, konst)
+}
+
+fn charged(budget: Int) -> Option<Int> = if budget >= 1 { Some(budget - 1) } else { None }
+
+pub fn feasibility(rows: List<Row>, budget: Int) -> Settled = {
+  let tightened = map(rows, tighten);
+  if any_contradiction(tightened) { { answer: Infeasible, budget: budget } }
+  else { eliminate(tightened, budget) }
+}
+
+fn eliminate(rows: List<Row>, budget: Int) -> Settled =
+  match next_variable(rows) {
+    None ->
+      { answer: if any_contradiction(rows) { Infeasible } else { Undecided }, budget: budget },
+    Some(v) -> match charged(budget) {
+      None -> { answer: Undecided, budget: 0 },
+      Some(left) -> {
+        let positive = filter(rows, |r: Row|
+          match map_get(r.coeffs, v) { Some(c) -> c > 0i128, None -> false });
+        let negative = filter(rows, |r: Row|
+          match map_get(r.coeffs, v) { Some(c) -> c < 0i128, None -> false });
+        let kept = filter(rows, |r: Row| !map_contains(r.coeffs, v));
+        if len(positive) * len(negative) + len(kept) > max_rows() {
+          { answer: Undecided, budget: left }
+        } else { combined_all(positive, negative, v, kept, left) }
+      },
+    },
+  }
+
+// Every positive row against every negative one, charging one step each.
+fn combined_all(
+  positive: List<Row>,
+  negative: List<Row>,
+  v: Int,
+  kept: List<Row>,
+  budget: Int,
+) -> Settled = {
+  let pairs = fold(positive, [], |acc: List<{ p: Row, n: Row }>, p: Row|
+    fold(negative, acc, |a: List<{ p: Row, n: Row }>, n: Row| push(a, { p: p, n: n })));
+  let walked = fold(
+    pairs,
+    { rows: kept, budget: budget, stop: None },
+    |st: { rows: List<Row>, budget: Int, stop: Option<Feasibility> }, pair: { p: Row, n: Row }|
+      match st.stop {
+        Some(_) -> st,
+        None -> match charged(st.budget) {
+          None -> { rows: st.rows, budget: 0, stop: Some(Undecided) },
+          Some(left) -> match combine(pair.p, pair.n, v) {
+            // An overflowing combination is dropped, which only weakens the system.
+            None -> { rows: st.rows, budget: left, stop: None },
+            Some(c) -> {
+              let row = tighten(c);
+              if is_contradiction(row) { { rows: st.rows, budget: left, stop: Some(Infeasible) } }
+              else if map_len(row.coeffs) == 0 { { rows: st.rows, budget: left, stop: None } }
+              else { { rows: push(st.rows, row), budget: left, stop: None } }
+            },
+          },
+        },
+      },
+  );
+  match walked.stop {
+    Some(answer) -> { answer: answer, budget: walked.budget },
+    None -> eliminate(walked.rows, walked.budget),
+  }
+}
+
+// Fewest rows produced, lowest variable on a tie, so the search is deterministic.
+fn next_variable(rows: List<Row>) -> Option<Int> = {
+  let counts = fold(rows, map_new(), |acc: Map<Int, { p: Int, n: Int }>, r: Row|
+    fold(
+      map_entries(r.coeffs),
+      acc,
+      |m: Map<Int, { p: Int, n: Int }>, e: { key: Int, value: I128 }| {
+        let held = match map_get(m, e.key) { Some(c) -> c, None -> { p: 0, n: 0 } };
+        map_insert(m, e.key, if e.value > 0i128 { { p: held.p + 1, n: held.n } }
+        else { { p: held.p, n: held.n + 1 } })
+      },
+    ));
+  let best = fold(
+    map_entries(counts),
+    None,
+    |acc: Option<{ v: Int, cost: Int }>, e: { key: Int, value: { p: Int, n: Int } }| {
+      let cost = e.value.p * e.value.n;
+      match acc {
+        Some(b) -> if cost < b.cost { Some({ v: e.key, cost: cost }) } else { acc },
+        None -> Some({ v: e.key, cost: cost }),
+      }
+    },
+  );
+  match best { Some(b) -> Some(b.v), None -> None }
+}
+
+// `a·x + P ≤ 0` and `-b·x + N ≤ 0` with `a, b > 0` give `b·P + a·N ≤ 0`.
+fn combine(positive: Row, negative: Row, v: Int) -> Option<Row> =
+  match map_get(positive.coeffs, v) {
+    None -> None,
+    Some(a) -> match map_get(negative.coeffs, v) {
+      None -> None,
+      Some(nb) -> match checked_neg(nb) {
+        None -> None,
+        Some(b) -> {
+          let from_p = fold(
+            map_entries(positive.coeffs),
+            Some(map_new()),
+            |acc: Option<Map<Int, I128>>, e: { key: Int, value: I128 }|
+              match acc {
+                None -> None,
+                Some(m) -> if e.key == v { Some(m) } else {
+                  match checked_mul(e.value, b) {
+                    Some(c) -> Some(map_insert(m, e.key, c)),
+                    None -> None,
+                  }
+                },
+              },
+          );
+          let both = fold(
+            map_entries(negative.coeffs),
+            from_p,
+            |acc: Option<Map<Int, I128>>, e: { key: Int, value: I128 }|
+              match acc {
+                None -> None,
+                Some(m) -> if e.key == v { Some(m) } else {
+                  match checked_mul(e.value, a) {
+                    None -> None,
+                    Some(scaled) -> match checked_add(
+                        match map_get(m, e.key) { Some(c) -> c, None -> 0i128 },
+                        scaled,
+                      ) {
+                      Some(c) -> Some(map_insert(m, e.key, c)),
+                      None -> None,
+                    },
+                  }
+                },
+              },
+          );
+          match both {
+            None -> None,
+            Some(m) -> match checked_mul(positive.konst, b) {
+              None -> None,
+              Some(kp) -> match checked_mul(negative.konst, a) {
+                None -> None,
+                Some(kn) -> match checked_add(kp, kn) {
+                  Some(k) -> Some({ coeffs: nonzero(m), konst: k }),
+                  None -> None,
+                },
+              },
+            },
+          }
+        },
+      },
+    },
+  }
+
+fn nonzero(m: Map<Int, I128>) -> Map<Int, I128> =
+  fold(map_entries(m), map_new(), |acc: Map<Int, I128>, e: { key: Int, value: I128 }|
+    if e.value == 0i128 { acc } else { map_insert(acc, e.key, e.value) })
+
+// Divided by the coefficients' gcd, the constant rounded up; valid over the integers.
+fn tighten(row: Row) -> Row = {
+  let coeffs = nonzero(row.coeffs);
+  let g = fold(map_values(coeffs), 0i128, |acc: I128, c: I128| gcd(acc, magnitude(c)));
+  if g <= 1i128 { { coeffs: coeffs, konst: row.konst } } else {
+    {
+      coeffs: fold(
+        map_entries(coeffs),
+        map_new(),
+        |acc: Map<Int, I128>, e: { key: Int, value: I128 }| map_insert(acc, e.key, e.value / g),
+      ),
+      konst: ceil_div(row.konst, g),
+    }
+  }
+}
+
+// `I128`'s least value has no magnitude it holds; its gcd with anything is taken as itself.
+fn magnitude(c: I128) -> I128 =
+  if c < 0i128 { match checked_neg(c) { Some(m) -> m, None -> c } } else { c }
+
+fn is_contradiction(row: Row) -> Bool = map_len(row.coeffs) == 0 && row.konst > 0i128
+
+fn any_contradiction(rows: List<Row>) -> Bool =
+  fold(rows, false, |found: Bool, r: Row| found || is_contradiction(r))
+
+fn gcd(a: I128, b: I128) -> I128 = if b == 0i128 { magnitude(a) } else { gcd(b, a % b) }
+
+// `b` is positive.
+pub fn ceil_div(a: I128, b: I128) -> I128 = if a % b > 0i128 { a / b + 1i128 } else { a / b }
+
+fn row(pairs: List<{ v: Int, c: I128 }>, konst: I128) -> Row =
+  {
+    coeffs: fold(pairs, map_new(), |m: Map<Int, I128>, p: { v: Int, c: I128 }|
+      map_insert(m, p.v, p.c)),
+    konst: konst,
+  }
+
+test "x > 0 and x < 1 have no integer between them" {
+  // 1 - x ≤ 0 and x - 0 ≤ 0 after tightening `x < 1` to `x - 1 + 1 ≤ 0`.
+  let rows = [row([{ v: 0, c: -1i128 }], 1i128), row([{ v: 0, c: 1i128 }], 0i128)];
+  assert_eq(feasibility(rows, 100).answer, Infeasible)
+}
+
+test "a domain of one integer is not infeasible" {
+  let rows = [row([{ v: 0, c: -1i128 }], 1i128), row([{ v: 0, c: 1i128 }], -1i128)];
+  assert_eq(feasibility(rows, 100).answer, Undecided)
+}
+
+test "tightening rounds the constant up over the integers" {
+  // 2x + 1 ≤ 0 is x + 1 ≤ 0 over the integers; against x ≥ 0 it is infeasible.
+  let rows = [row([{ v: 0, c: 2i128 }], 1i128), row([{ v: 0, c: -1i128 }], 0i128)];
+  assert_eq(feasibility(rows, 100).answer, Infeasible);
+  assert_eq(ceil_div(-7i128, 2i128), -3i128);
+  assert_eq(ceil_div(7i128, 2i128), 4i128)
+}
+
+test "an exhausted budget is undecided and spends to zero" {
+  let rows = [
+    row([{ v: 0, c: 1i128 }, { v: 1, c: -1i128 }], 0i128),
+    row([{ v: 1, c: 1i128 }, { v: 0, c: -1i128 }], 1i128),
+  ];
+  assert_eq(feasibility(rows, 0), { answer: Undecided, budget: 0 })
+}
+
+fn decided(rows: List<Row>) -> Feasibility = feasibility(rows, 10000).answer
+
+test "a variable below and above a bound is infeasible" {
+  // x <= -1 and x >= 1.
+  assert_eq(
+    decided([row([{ v: 0, c: 1i128 }], 1i128), row([{ v: 0, c: -1i128 }], 1i128)]),
+    Infeasible,
+  )
+}
+
+test "a satisfiable system is not infeasible" {
+  // x >= 1 and x <= 10.
+  assert_eq(
+    decided([row([{ v: 0, c: -1i128 }], 1i128), row([{ v: 0, c: 1i128 }], -10i128)]),
+    Undecided,
+  )
+}
+
+// Feasible over the rationals, infeasible over the integers.
+test "an equation no integer satisfies is infeasible" {
+  assert_eq(decided(eq_rows([], row([{ v: 0, c: 2i128 }], 0i128).coeffs, -1i128)), Infeasible)
+}
+
+test "a transitive chain closes" {
+  // x < y, y < z, z < x.
+  assert_eq(
+    decided(
+      map([{ a: 0, b: 1 }, { a: 1, b: 2 }, { a: 2, b: 0 }], |p: { a: Int, b: Int }|
+        row([{ v: p.a, c: 1i128 }, { v: p.b, c: -1i128 }], 1i128)),
+    ),
+    Infeasible,
+  )
+}
+
+test "a chain that is merely tight stays satisfiable" {
+  assert_eq(
+    decided(
+      map([{ a: 0, b: 1 }, { a: 1, b: 2 }], |p: { a: Int, b: Int }|
+        row([{ v: p.a, c: 1i128 }, { v: p.b, c: -1i128 }], 1i128)),
+    ),
+    Undecided,
+  )
+}
+
+test "an overflowing combination is undecided" {
+  let half = 170141183460469231731687303715884105727i128 / 2i128;
+  let third = 170141183460469231731687303715884105727i128 / 3i128;
+  assert_eq(
+    decided([
+      row([{ v: 0, c: half }, { v: 1, c: 1i128 }], 0i128),
+      row([{ v: 0, c: -half }, { v: 2, c: 1i128 }], 1i128),
+      row([{ v: 1, c: third }], third),
+    ]),
+    Undecided,
+  )
+}
+
+test "a spent budget is undecided and never infeasible" {
+  let chain = push(
+    map(range(0, 8), |v: Int| row([{ v: v, c: 1i128 }, { v: v + 1, c: -1i128 }], 1i128)),
+    row([{ v: 8, c: 1i128 }, { v: 0, c: -1i128 }], 1i128),
+  );
+  assert_eq(feasibility(chain, 1).answer, Undecided)
+}
+
+test "ceil_div rounds toward positive infinity" {
+  assert_eq(ceil_div(3i128, 2i128), 2i128);
+  assert_eq(ceil_div(4i128, 2i128), 2i128);
+  assert_eq(ceil_div(-3i128, 2i128), -1i128);
+  assert_eq(ceil_div(-4i128, 2i128), -2i128);
+  assert_eq(ceil_div(0i128, 5i128), 0i128)
+}
