@@ -144,14 +144,11 @@ nondet effect prover {
   write configure[claims](options: Unit, front: Unit, world: Unit) -> Unit
   read collected[claims]() -> Result<Unit, Unit>
   read outcomes[claims](keys: List<String>) -> List<Option<String>>
-  read discharged[claims](choice: Unit) -> Result<Unit, Unit>
+  read prepared[claims]() -> Result<List<Unit>, Unit>
+  read cached[claims](keys: List<String>) -> List<Option<Unit>>
+  read judged[claims](batches: List<Unit>) -> List<List<Unit>>
+  read searched[claims](claim: Int, points: List<List<Unit>>, domain: Unit) -> Unit
   write record[claims](entries: List<Unit>) -> List<Unit>
-  read replay[claims](index: Int, root: Int, case: Int) -> Result<Unit, Unit>
-  read shrink[claims](claim: Int) -> Result<Option<Int>, Unit>
-  read offers[claims](i: Int) -> Result<Option<Unit>, Unit>
-  read would[claims](i: Int, position: Int) -> Result<Bool, Unit>
-  write accept[claims](i: Int, position: Int) -> Result<Unit, Unit>
-  read settled[claims]() -> Result<Option<Unit>, Unit>
   read baselines[claims](names: List<String>) -> List<Unit>
   write accepted[claims](records: List<Unit>) -> Unit
 }

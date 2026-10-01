@@ -1202,6 +1202,7 @@ Strings are indexed by character, bytes by byte.
 | `bytes_slice(b: Bytes, start: Int, end: Int) -> Bytes` | |
 | `bytes_concat(a: Bytes, b: Bytes) -> Bytes` | `a ++ b` |
 | `bytes_concat_all(bs: List<Bytes>) -> Bytes` | one allocation |
+| `bytes_blake3(b: Bytes) -> Bytes` | the 32-byte BLAKE3 digest |
 | `byte_of_int(n: Int) -> Bytes` | raises outside `0..=255` |
 | `bytes_of_string(s: String) -> Bytes` | |
 | `string_of_bytes(b: Bytes) -> String` | raises on invalid UTF-8 |
@@ -2435,6 +2436,8 @@ pub type Fun =
   | FTable({ arity: Int, entries: List<Entry>, default: Value })
 pub fn render(v: Value) -> String
 pub fn filled(text: String, values: List<Value>) -> String
+pub fn order(a: Value, b: Value) -> Ordering
+pub fn map_of(entries: List<Entry>) -> Value
 pub fn shown_items() -> Int
 pub fn shown_depth() -> Int
 ```
@@ -2447,7 +2450,10 @@ and a credential shows as `Secret(****)`. A fixed width holds the bit pattern it
 reads, with nothing above the width, so `-1i8` is `VFixed("I8", 255u128)`. Only
 a generated function (`FConst`, `FProject`, `FTable`) crosses back into a run,
 and `VElided` marks what a diagnostic's snapshot cut short. `filled` puts each
-value a runtime diagnostic's text names in its place.
+value a runtime diagnostic's text names in its place. `order` is the order the
+runtime keeps values in (by kind, then by payload), which is a map's key order,
+and `map_of` builds a `VMap` in that order, a later entry for a key replacing an
+earlier one.
 
 ## 14. The host boundary
 

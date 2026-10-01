@@ -1,36 +1,31 @@
-//! `prover.replay` through the effect: a program configures a run, collects, and re-runs one
-//! case of one obligation's guard at a root it chooses, reading what the draw said. The fixture is
-//! the module the payload's constructors are named after, so it declares them where the package
-//! does: `the_fixture_declares_the_payload_where_the_machine_names_it` is what says so.
+//! `prover.judged` through the effect: a program configures a run, collects, prepares, and judges
+//! points of one obligation it chose itself, reading what each came to. The fixture is the module
+//! the payload's constructors are named after, so it declares them where the package does:
+//! `the_fixture_declares_the_payload_where_the_machine_names_it` is what says so.
 
 use crate::fixture::project;
 use ply_eval::host::HostRegistry;
 use ply_eval::{Front, Machine, Provider, Span, Value};
 use std::sync::Arc;
 
-/// The re-run program. Every operation of the effect is declared, as the run that binds it
-/// requires, and `Point` is the shape `claims.ply` reads.
-const REPLAY: &str = r#"
-import std.value (Value, render)
+/// The judging program. Every operation of the effect is declared, as the run that binds it
+/// requires, and `Batch` and `Judged` are the shapes `claims.ply` sends and reads.
+const JUDGING: &str = r#"
+import std.value (Value, VInt, render)
 
 nondet effect prover {
   write configure[claims](options: Options, front: Front, world: World) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
-  read shrink[claims](claim: Int) -> Result<Option<Int>, Refusal>
-  read offers[claims](i: Int) -> Result<Option<Offer>, Refusal>
-  read would[claims](i: Int, position: Int) -> Result<Bool, Refusal>
-  write accept[claims](i: Int, position: Int) -> Result<Unit, Refusal>
-  read settled[claims]() -> Result<Option<Settled>, Refusal>
   read outcomes[claims](keys: List<String>) -> List<Option<String>>
-  read discharged[claims](choice: Choice) -> Result<Verdicts, Refusal>
-  write record[claims](entries: List<{ at: Int, key: String }>) -> List<Unit>
-  read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
+  read prepared[claims]() -> Result<List<Diag>, Refusal>
+  read cached[claims](keys: List<String>) -> List<Option<Evidence>>
+  read judged[claims](batches: List<Batch>) -> List<List<Judged>>
+  read searched[claims](claim: Int, points: List<List<Value>>, domain: Searched) -> Outcome
+  write record[claims](entries: List<{ key: String, evidence: Evidence }>) -> List<Diag>
   read baselines[claims](names: List<String>) -> List<Baseline>
   write accepted[claims](records: List<Baseline>) -> Accepted
 }
 
-type Offer = { here: Int, candidates: List<{ position: Int, size: Int }> }
-type Settled = { bindings: List<Binding>, original: List<Binding> }
 // The world's vocabulary is a shape this fixture only carries: it never reads one, so it names
 // each type itself rather than borrowing the name of the package's.
 type Shape =
@@ -56,6 +51,7 @@ type Claimed = {
   result: Option<Bound>,
   variables: List<String>,
   guards: List<{ module: Int, start: Int, end: Int }>,
+  literals: List<Bytes>,
   host: Bool,
   footprint: Option<String>,
   frame: Frame,
@@ -87,11 +83,12 @@ type Options = {
 }
 type Refusal = Unit
 type Collection = Unit
-type Choice = Unit
-type Verdicts = Unit
+type Diag = Unit
+type Evidence = Unit
+type Searched = Unit
+type Outcome = Unit
 type Baseline = Unit
 type Accepted = Unit
-type Binding = { name: String, ty: String, value: Value }
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
@@ -100,48 +97,37 @@ type Front = {
   file_ms: Int,
   cached: Bool,
 }
-type Gap = Unit
-type Fault = Unit
-type Point =
-  | Kept(List<Binding>)
-  | Falsified(List<Binding>)
-  | Rejected
-  | Undrawn(Gap)
-  | Faulted(Fault)
+type Mode = | MWhole | MWitness | MDomain
+type Batch = { claim: Int, points: List<List<Value>>, mode: Mode }
+type Judged =
+  | JHeld
+  | JFailed
+  | JRejected
+  | JRaised({ message: String, values: List<Value> })
+  | JFaulted({ code: String, message: String, notes: List<String>, values: List<Value> })
 
-type Answer = { falsified: Int, kept: Int, rejected: Int, first: String }
+type Answer = { failed: Int, held: Int, rejected: Int, first: String }
 
-/// Cases scanned from one root: enough to find the draw that falsifies.
+/// The points judged: `n` from zero, one batch each, so a failing point ends only its own batch.
 fn cases() -> Int = 64
 
-fn nothing() -> Answer = { falsified: 0, kept: 0, rejected: 0, first: "" }
-
-fn drawn(bs: List<Binding>) -> String =
-  fold(bs, "", |acc: String, b: Binding|
-    if acc == "" { render(b.value) } else { acc ++ ", " ++ render(b.value) })
-
-fn scan(index: Int, case: Int, seen: Answer) -> Answer / {prover.replay[claims]} =
-  if case >= cases() { seen } else {
-    match prover.replay[claims](index, 0, case) {
-      Err(_) -> seen,
-      Ok(point) -> match point {
-        Kept(_) -> scan(index, case + 1, { ..seen, kept: seen.kept + 1 }),
-        Falsified(bs) ->
-          if seen.falsified == 0 {
-            scan(index, case + 1, {
-              ..seen,
-              falsified: seen.falsified + 1,
-              first: drawn(bs),
-            })
-          } else { scan(index, case + 1, { ..seen, falsified: seen.falsified + 1 }) },
-        Rejected -> scan(index, case + 1, { ..seen, rejected: seen.rejected + 1 }),
-        Undrawn(_) -> scan(index, case + 1, seen),
-        Faulted(_) -> scan(index, case + 1, seen),
+fn judged_at(index: Int) -> Answer / {prover.judged[claims]} = {
+  let points = map(range(0, cases()), |n: Int| [VInt(n)]);
+  let answers = prover.judged[claims](map(points, |p: List<Value>| { claim: index, points: [p], mode: MWhole }));
+  fold(range(0, len(answers)), { failed: 0, held: 0, rejected: 0, first: "" }, |seen: Answer, i: Int|
+    match (list_at(answers, i), list_at(points, i)) {
+      (Some([JHeld]), _) -> { ..seen, held: seen.held + 1 },
+      (Some([JFailed]), Some(p)) -> {
+        ..seen,
+        failed: seen.failed + 1,
+        first: if seen.first == "" { fold(p, "", |acc: String, v: Value| acc ++ render(v)) } else { seen.first },
       },
-    }
-  }
+      (Some([JRejected]), _) -> { ..seen, rejected: seen.rejected + 1 },
+      _ -> seen,
+    })
+}
 
-fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prover.configure[claims], prover.collected[claims], prover.replay[claims]} = {
+fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prover.configure[claims], prover.collected[claims], prover.prepared[claims], prover.judged[claims]} = {
   prover.configure[claims]({
     path: root,
     no_incremental: false,
@@ -174,9 +160,9 @@ fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prove
       measure_reduction: false,
     },
   }, front, world);
-  match prover.collected[claims]() {
-    Err(_) -> { falsified: 0 - 1, kept: 0, rejected: 0, first: "" },
-    Ok(_) -> scan(index, 0, nothing()),
+  match (prover.collected[claims](), prover.prepared[claims]()) {
+    (Ok(_), Ok(_)) -> judged_at(index),
+    _ -> { failed: 0 - 1, held: 0, rejected: 0, first: "" },
   }
 }
 "#;
@@ -198,7 +184,7 @@ fn front_of(source: &str) -> Front {
         "proof.obligation".to_string(),
         source.to_string(),
     )])
-    .expect("the re-run program checks")
+    .expect("the judging program checks")
     .front
 }
 
@@ -209,7 +195,7 @@ fn built(source: &str) -> (Front, &'static ply_codegen::Unit) {
         "proof.obligation".to_string(),
         source.to_string(),
     )])
-    .expect("the re-run program checks");
+    .expect("the judging program checks");
     let unit =
         ply_codegen::Unit::over_front(&answered.front, answered.modules.into_iter().collect())
             .expect("this host has a C toolchain");
@@ -219,7 +205,7 @@ fn built(source: &str) -> (Front, &'static ply_codegen::Unit) {
 /// The fixture's answer, from one entered call.
 fn one_run(source: &str, index: i64) -> Result<Value, ply_eval::Diagnostic> {
     let project = project(source);
-    let (front, unit) = built(REPLAY);
+    let (front, unit) = built(JUDGING);
     let mut machine =
         Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
@@ -259,24 +245,24 @@ fn int(answer: &Value, name: &str) -> i64 {
 }
 
 #[test]
-fn a_replayed_case_comes_back_as_the_value_that_falsifies_the_claim() {
+fn a_judged_point_comes_back_as_the_value_that_falsifies_the_claim() {
     let answer = one_run(A_FALSE_LAW, 0).expect("the run finished");
     assert!(
-        int(&answer, "falsified") > 0,
-        "no draw falsified a law that does not hold: {answer:?}"
+        int(&answer, "failed") > 0 && int(&answer, "held") > 0,
+        "a law that holds only at zero was judged as {answer:?}"
     );
     let first = field(&answer, "first");
     let drawn = match &first {
         Value::Str(text) => text.to_string(),
         other => panic!("the first falsifying point is a string, not {other:?}"),
     };
-    // Independently of the prover: the value the point drew really does break the law.
+    // Independently of the prover: the point really does break the law.
     let n: i64 = drawn.parse().unwrap_or_else(|e| {
-        panic!("the point drew `{drawn}`, which is not an integer: {e}");
+        panic!("the point was `{drawn}`, which is not an integer: {e}");
     });
     assert!(
         n + n != n * 3,
-        "the replayed point drew `{n}`, at which the law holds"
+        "the point `{n}` was judged failed, and the law holds there"
     );
 }
 
@@ -292,7 +278,7 @@ fn a_claim_index_the_collection_does_not_hold_is_refused_rather_than_answered() 
 
 #[test]
 fn the_fixture_declares_the_payload_where_the_machine_names_it() {
-    let front = front_of(REPLAY);
+    let front = front_of(JUDGING);
     let mut checked = 0;
     for (home, ty, _) in ply_machine::claims::MARSHALLED {
         let declared: Vec<&str> = front
