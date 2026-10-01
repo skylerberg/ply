@@ -690,7 +690,7 @@ pub enum FoundData {
 }
 
 /// [`FoundData`] as the value the program reads it as. Called on the calling thread.
-pub fn found_value(found: &FoundData) -> PlyValue {
+pub fn found_value(found: &FoundData, module: &str) -> PlyValue {
     match found {
         FoundData::Project {
             root,
@@ -699,7 +699,7 @@ pub fn found_value(found: &FoundData) -> PlyValue {
             mains,
             modules,
         } => crate::payload::ctor(
-            "machine",
+            module,
             "Project",
             vec![record(vec![
                 ("root", PlyValue::str(root)),
@@ -717,7 +717,7 @@ pub fn found_value(found: &FoundData) -> PlyValue {
             unit,
             warnings,
         } => crate::payload::ctor(
-            "machine",
+            module,
             "Deployed",
             vec![record(vec![
                 ("path", PlyValue::str(path)),
