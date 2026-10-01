@@ -8,5 +8,6 @@ mod detached;
 mod heap;
 mod list;
 mod map;
+mod parallel;
 mod simulate;
 mod stack;

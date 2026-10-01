@@ -639,7 +639,11 @@ impl Heap {
     /// Takes over a finished branch's memory: its objects are this entry's from here on. Its used
     /// chunks go before the one bumping, which keeps the chunks after it the empty ones.
     pub fn adopt_heap(&mut self, mut other: Heap) {
-        let used = if other.chunks.is_empty() { 0 } else { other.chunk + 1 };
+        let used = if other.chunks.is_empty() {
+            0
+        } else {
+            other.chunk + 1
+        };
         if used > 0 && self.cur.is_null() {
             self.grow(0);
         }
@@ -1314,7 +1318,10 @@ pub fn inc(w: Word) {
     let o = obj(w);
     let rc = count(o).load(Relaxed);
     if rc < SHARED {
-        debug_assert!(unsafe { (*o).kind } != KIND_DEAD, "a dead object was shared");
+        debug_assert!(
+            unsafe { (*o).kind } != KIND_DEAD,
+            "a dead object was shared"
+        );
         unsafe { (*o).rc = rc + 1 };
     } else if rc != IMMORTAL {
         inc_shared(w);
@@ -1336,7 +1343,10 @@ pub fn dec(w: Word) {
         dec_shared(w);
         return;
     }
-    debug_assert!(unsafe { (*o).kind } != KIND_DEAD, "a dead object was released again");
+    debug_assert!(
+        unsafe { (*o).kind } != KIND_DEAD,
+        "a dead object was released again"
+    );
     if rc > 1 {
         unsafe { (*o).rc = rc - 1 };
         return;
@@ -1514,7 +1524,10 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, hea
         if (*o).kind == KIND_BRIDGE {
             std::ptr::drop_in_place(bridge_slot(o));
         }
-        for i in child_ranges(o).iter().flat_map(|(first, last)| *first..*last) {
+        for i in child_ranges(o)
+            .iter()
+            .flat_map(|(first, last)| *first..*last)
+        {
             let c = word_at(o, i);
             if is_imm(c) || c == 0 {
                 continue;
