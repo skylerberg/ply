@@ -88,7 +88,7 @@ fn capped(index: usize) -> Obligation {
     }
 }
 
-fn with_prover<R>(f: impl FnOnce(&Prover<'_>) -> R) -> R {
+fn with_prover<R>(f: impl FnOnce(&Prover) -> R) -> R {
     let dir = project(SOURCE);
     let loaded = loaded(dir.path());
     let backend =
@@ -269,7 +269,7 @@ fn a_run_that_reaches_no_region_is_unobserved_and_keeps_its_verdict() {
             &law,
             &ProvePlan::default(),
             &[Value::Bool(true)],
-            &Seed::root(0),
+            &Seed::at(0, Vec::new()),
             64,
         )
     });
@@ -286,7 +286,7 @@ fn a_run_that_reaches_no_region_is_unobserved_and_keeps_its_verdict() {
             &dividing,
             &ProvePlan::default(),
             &[Value::Bool(false)],
-            &Seed::root(0),
+            &Seed::at(0, Vec::new()),
             64,
         )
     });
@@ -308,7 +308,7 @@ fn a_run_under_a_seed_records_the_schedule_it_took() {
             &law,
             &ProvePlan::default(),
             &[Value::Bool(true)],
-            &Seed::root(3),
+            &Seed::at(3, Vec::new()),
             64,
         )
     });
@@ -324,7 +324,7 @@ fn a_run_under_a_seed_records_the_schedule_it_took() {
             &law,
             &ProvePlan::default(),
             &[Value::Bool(true)],
-            &Seed::root(3),
+            &Seed::at(3, Vec::new()),
             64,
         )
     });

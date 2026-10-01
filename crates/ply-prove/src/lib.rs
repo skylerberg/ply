@@ -10,10 +10,9 @@ pub mod world;
 pub use sort::Sort;
 pub use world::World;
 
-use ply_eval::{DefHash, Diagnostic, Plan, Race, Seed, Span, Symbol};
+use ply_eval::{DefHash, Diagnostic, Span, Symbol};
 use serde::Serialize;
 use std::fmt;
-use std::time::Duration;
 
 /// Kept cases below which a run has concrete evidence and no coverage claim.
 pub const MIN_PROPERTY_CASES: u32 = 25;
@@ -123,59 +122,12 @@ pub struct Binding {
     pub value: ply_eval::Plain,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub struct Counterexample {
-    pub bindings: Vec<Binding>,
-    pub original: Vec<Binding>,
-    pub shrinks: u32,
-    pub root: u64,
-    pub case: u32,
-    pub race: Option<Race>,
-    pub sim_seed: Option<Seed>,
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum VacuityKind {
-    ProvedUnsatisfiable,
-    NoCaseKept { generated: u32 },
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Vacuity {
-    pub guard: Span,
-    pub kind: VacuityKind,
-}
-
-/// What an interleaving search could not establish; every other gap is the program's to find.
-#[derive(Clone, Debug)]
-pub enum Gap {
-    /// The program's own raise; a diagnostic that is Ply's failure is a [`Discharge::Faulted`].
-    Raised {
-        bindings: Vec<Binding>,
-        diagnostic: Box<Diagnostic>,
-        /// The draw the values came from, so a program that shrinks this counterexample can
-        /// regenerate them: a value of a type the program never named is not something it can hold.
-        root: u64,
-        case: u32,
-    },
-}
-
 /// Ply's own failure while discharging a claim, as [`ply_eval::codes::is_defect`] tells it apart.
 #[derive(Clone, Debug)]
 pub struct Fault {
     /// The point being judged when Ply failed, or none when it failed before a point was drawn.
     pub bindings: Vec<Binding>,
     pub diagnostic: Box<Diagnostic>,
-}
-
-#[derive(Clone, Debug)]
-pub enum Discharge {
-    Held(Evidence),
-    Refuted(Counterexample),
-    Vacuous(Vacuity),
-    Unattempted(Gap),
-    /// Neither a verdict on the claim nor a gap in it: Ply failed rather than the program.
-    Faulted(Fault),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -250,7 +202,6 @@ pub struct ProvePlan {
     /// Calls per evaluation of a claim; 0 is no bound. It decides what an evaluation reports, so
     /// it keys the result: a proof means the same thing on every machine.
     pub step_budget: i64,
-    pub sim: Plan,
 }
 
 impl Default for ProvePlan {
@@ -261,7 +212,6 @@ impl Default for ProvePlan {
             prove_budget: DEFAULT_PROVE_BUDGET,
             shrink_budget: DEFAULT_SHRINK_BUDGET,
             step_budget: ply_eval::DEFAULT_STEP_BUDGET,
-            sim: Plan::default(),
         }
     }
 }
@@ -271,26 +221,6 @@ impl ProvePlan {
     pub fn normalized(mut self) -> ProvePlan {
         self.roots.sort_unstable();
         self.roots.dedup();
-        self.sim = self.sim.normalized();
         self
     }
-}
-
-/// What a run discharged: each obligation it was asked about beside what became of it.
-#[derive(Clone, Debug)]
-pub struct ProveReport {
-    pub obligations: Vec<(Obligation, Discharge)>,
-    pub duration: Duration,
-}
-
-pub fn interleaving_proves(
-    plan: &Plan,
-    exploration: &ply_eval::Exploration,
-    domain_enumerated: bool,
-) -> bool {
-    plan.mode == ply_eval::SimMode::Dpor
-        && exploration.exhaustive
-        && !exploration.exhausted
-        && exploration.failure.is_none()
-        && domain_enumerated
 }

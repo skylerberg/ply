@@ -1,11 +1,11 @@
-use crate::fixture::Compiled;
+use crate::fixture::{Compiled, Seeds};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{Diagnostic, Resource, SourceId, Symbol, Value};
 use ply_store::Store;
-use ply_test::{Hosting, InterpExecutor, Record, RunReport, Search};
+use ply_test::{Hosting, Record, RunReport};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,17 +93,7 @@ fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
     };
-    let unit = compiled.tier();
-    let executor = InterpExecutor::new(&compiled.port, unit)
-        .with_search(Search::default())
-        .with_hosts(hosting);
-    ply_test::run_with(
-        &selection,
-        &compiled.check,
-        &compiled.hashes,
-        store,
-        &executor,
-    )
+    compiled.run(&selection, hosting, store, &Seeds::default())
 }
 
 /// Two tests, one resource, both declared `read`, and a handler that writes.

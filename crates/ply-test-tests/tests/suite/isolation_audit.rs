@@ -2,12 +2,11 @@
 //! colour, and the runtime running a class the program coloured without its tests observing each
 //! other. How atoms become classes is the program's, and its tests pin it.
 
-use crate::fixture::Compiled;
-use ply_eval::{Footprint, SourceId, TaskRegions, Value};
+use crate::fixture::{Compiled, Seeds, run_at};
+use ply_eval::{Footprint, SourceId};
 use ply_store::Store;
-use ply_test::{GroupRegion, Selection};
+use ply_test::{Hosting, Selection};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct TempRoot(PathBuf);
@@ -235,16 +234,14 @@ fn a_class_of_isolated_tests_running_at_once_never_observe_each_other() {
     for round in 0..3 {
         let root = TempRoot::new();
         let mut store = root.store();
-        let selection = compiled.every();
-        let executor = ply_test::InterpExecutor::new(&compiled.port, unit)
-            .with_search(ply_test::Search::of(&selection))
-            .with_hosts(ply_test::Hosting::hermetic());
-        let report = ply_test::run_with(
-            &selection,
-            &compiled.check,
-            &compiled.hashes,
+        let report = run_at(
+            &compiled.every(),
+            &compiled.port,
+            unit,
+            Hosting::hermetic(),
             &mut store,
-            &executor,
+            &Seeds::default(),
+            8,
         );
         assert_eq!(
             (report.passed, report.failed),
@@ -254,152 +251,6 @@ fn a_class_of_isolated_tests_running_at_once_never_observe_each_other() {
         );
         assert!(report.results.iter().all(|r| r.group == 0));
     }
-}
-
-#[test]
-fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {
-    const TESTS: usize = 12;
-    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let selection = compiled.every();
-
-    let executor = FixtureProbe::default();
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .expect("a one-worker pool");
-    let report = pool.install(|| {
-        ply_test::run_with(
-            &selection,
-            &compiled.check,
-            &compiled.hashes,
-            &mut store,
-            &executor,
-        )
-    });
-    assert_eq!((report.passed, report.failed), (TESTS, 0));
-
-    assert_eq!(
-        executor.built.load(Ordering::Relaxed),
-        1,
-        "one group and one worker is one fixture build"
-    );
-
-    let mut seen = executor.seen.into_inner().expect("no worker panicked");
-    seen.sort_by_key(|o| o.index);
-    for (n, o) in seen.iter().enumerate() {
-        assert_eq!(o.mark, 1, "the region's mark moved: {o:?}");
-        assert_eq!(o.fixture_len, 1, "the region grew by a test's own cells");
-        let expected = if n == 0 { -1 } else { seen[n - 1].index as i64 };
-        assert_eq!(
-            o.observed_at_open, expected,
-            "test {} did not open on the previous test's write",
-            o.index
-        );
-    }
-}
-
-#[derive(Debug)]
-struct Observation {
-    index: usize,
-    observed_at_open: i64,
-    mark: usize,
-    fixture_len: usize,
-}
-
-/// Reads the fixture, writes it, and allocates its own cell: everything a real test does to a region.
-#[derive(Default)]
-struct FixtureProbe {
-    built: AtomicUsize,
-    seen: Mutex<Vec<Observation>>,
-}
-
-impl ply_test::Executor for FixtureProbe {
-    type Worker = GroupRegion;
-
-    fn worker(&self) -> Result<GroupRegion, ply_eval::Diagnostic> {
-        self.built.fetch_add(1, Ordering::Relaxed);
-        Ok(GroupRegion::build(|regions: &mut TaskRegions| {
-            Value::Cell(regions.alloc_cell(Value::Int(-1)))
-        }))
-    }
-
-    fn execute(&self, region: &mut GroupRegion, index: usize) -> Result<(), ply_eval::Diagnostic> {
-        let (mut stack, handle) = region.open();
-        let seed = match handle {
-            Value::Cell(slot) => slot,
-            other => panic!("expected the fixture's handle, found {other:?}"),
-        };
-        let observed_at_open = match stack.get(seed) {
-            Some(Value::Int(i)) => *i,
-            other => panic!("the fixture cell is gone: {other:?}"),
-        };
-        for i in 0..4 {
-            stack.alloc_cell(Value::Int(i));
-        }
-        assert!(stack.set(seed, Value::Int(index as i64)));
-        assert!(region.close(&stack), "the stack came from this region");
-        self.seen
-            .lock()
-            .expect("no worker panicked")
-            .push(Observation {
-                index,
-                observed_at_open,
-                mark: region.mark(),
-                fixture_len: region.fixture().len(),
-            });
-        Ok(())
-    }
-}
-
-#[test]
-fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
-    const TESTS: usize = 24;
-    const JOBS: usize = 8;
-    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let selection = compiled.every();
-
-    let executor = FixtureProbe::default();
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(JOBS)
-        .build()
-        .expect("an eight-worker pool");
-    let report = pool.install(|| {
-        ply_test::run_with(
-            &selection,
-            &compiled.check,
-            &compiled.hashes,
-            &mut store,
-            &executor,
-        )
-    });
-    assert_eq!((report.passed, report.failed), (TESTS, 0));
-
-    let builds = executor.built.load(Ordering::Relaxed);
-    assert!(
-        (1..=JOBS).contains(&builds),
-        "a group is served by at most one region per worker: {builds} builds at {JOBS} jobs"
-    );
-
-    let seen = executor.seen.into_inner().expect("no worker panicked");
-    assert_eq!(seen.len(), TESTS);
-    for o in &seen {
-        assert_eq!(o.mark, 1, "the region's mark moved: {o:?}");
-        assert_eq!(o.fixture_len, 1, "the region grew by a test's own cells");
-        assert!(
-            o.observed_at_open == -1 || (0..TESTS as i64).contains(&o.observed_at_open),
-            "a test opened on a value no test and no seed ever wrote: {o:?}"
-        );
-    }
-    assert_eq!(
-        seen.iter().filter(|o| o.observed_at_open == -1).count(),
-        builds,
-        "exactly one test per worker opens on the seed, and the rest open on a \
-         previous test's write to that worker's own region"
-    );
 }
 
 #[test]
@@ -431,22 +282,15 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
             groups: classes.clone(),
             ..compiled.every()
         };
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs)
-            .build()
-            .expect("the worker pool");
-        let executor = ply_test::InterpExecutor::new(&compiled.port, unit)
-            .with_search(ply_test::Search::of(&selection))
-            .with_hosts(ply_test::Hosting::hermetic());
-        let report = pool.install(|| {
-            ply_test::run_with(
-                &selection,
-                &compiled.check,
-                &compiled.hashes,
-                &mut store,
-                &executor,
-            )
-        });
+        let report = run_at(
+            &selection,
+            &compiled.port,
+            unit,
+            Hosting::hermetic(),
+            &mut store,
+            &Seeds::default(),
+            jobs,
+        );
         let mut verdicts: Vec<(usize, ply_test::Status, usize)> = report
             .results
             .iter()

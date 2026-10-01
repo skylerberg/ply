@@ -1,11 +1,8 @@
 //! The helpers the machines share: backend selection, the compiled tier over a load, schema
-//! materialisation, the worker pool, and `plural`.
+//! materialisation, and `plural`.
 
 use ply_eval::{Diagnostic, SourceMap, Span, codes};
 use std::collections::BTreeSet;
-
-/// The worker pool's frames recurse per node on the native stack.
-const WORKER_STACK: usize = 256 << 20;
 
 fn unbuilt(error: impl std::fmt::Display) -> Diagnostic {
     Diagnostic::error(
@@ -113,31 +110,4 @@ pub fn once_each(warnings: Vec<Diagnostic>) -> Vec<Diagnostic> {
         .into_iter()
         .filter(|d| seen.insert((d.code, d.message.clone())))
         .collect()
-}
-
-pub fn build_pool(
-    jobs: Option<u32>,
-    warnings: &mut Vec<Diagnostic>,
-) -> (Option<rayon::ThreadPool>, usize) {
-    let requested = jobs.unwrap_or(0) as usize;
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(requested)
-        .stack_size(WORKER_STACK)
-        .build()
-    {
-        Ok(pool) => {
-            let workers = pool.current_num_threads();
-            (Some(pool), workers)
-        }
-        Err(e) => {
-            warnings.push(
-                Diagnostic::warning(
-                    ply_eval::codes::RUNTIME_ERROR,
-                    format!("could not start {requested} worker threads: {e}"),
-                )
-                .note("the run continued on the default thread pool"),
-            );
-            (None, rayon::current_num_threads())
-        }
-    }
 }

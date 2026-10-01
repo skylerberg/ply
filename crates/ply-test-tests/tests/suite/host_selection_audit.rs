@@ -1,11 +1,11 @@
-use crate::fixture::Compiled;
+use crate::fixture::{Compiled, Seeds};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{Diagnostic, Resource, Symbol, Value};
 use ply_store::{Outcome, Store};
-use ply_test::{Hosting, InterpExecutor, Search};
+use ply_test::Hosting;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,17 +93,7 @@ fn run(
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
     };
-    let unit = compiled.tier();
-    let executor = InterpExecutor::new(&compiled.port, unit)
-        .with_search(Search::default())
-        .with_hosts(hosting);
-    ply_test::run_with(
-        &compiled.every(),
-        &compiled.check,
-        &compiled.hashes,
-        store,
-        &executor,
-    )
+    compiled.run(&compiled.every(), hosting, store, &Seeds::default())
 }
 
 /// Whether the store holds a pass under the test's own key, whatever key a program handed over.

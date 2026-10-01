@@ -1,6 +1,6 @@
-//! Deterministic simulation: seeds, plans, the dependence relation, and seeded `clock`/`random`.
+//! Deterministic simulation: seeds, the steps a run records, and seeded `clock`/`random`.
 
-use crate::{Diagnostic, EffectAtom, Mode, Span, Symbol, codes};
+use crate::{Diagnostic, EffectAtom, Mode, Span, codes};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -15,75 +15,13 @@ pub struct Seed {
 }
 
 impl Seed {
-    pub fn root(root: u64) -> Seed {
-        Seed {
-            root,
-            path: Vec::new(),
-        }
-    }
-
     pub fn at(root: u64, path: Vec<u16>) -> Seed {
         Seed { root, path }
-    }
-
-    pub fn is_root(&self) -> bool {
-        self.path.is_empty()
-    }
-
-    /// `"7"` or `"7:3.0.2"`.
-    pub fn parse(s: &str) -> Option<Seed> {
-        let (root, rest) = match s.split_once(':') {
-            Some((root, rest)) => (root, Some(rest)),
-            None => (s, None),
-        };
-        let root = parse_u64(root)?;
-        let path = match rest {
-            None => Vec::new(),
-            // `7:` is not `7`: an empty path segment is a typo, not a root.
-            Some("") => return None,
-            Some(rest) => rest
-                .split('.')
-                .map(|part| parse_u64(part).and_then(|n| u16::try_from(n).ok()))
-                .collect::<Option<Vec<u16>>>()?,
-        };
-        Some(Seed { root, path })
-    }
-
-    /// Unambiguous bytes for a cache key; the path is length-prefixed.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(12 + 2 * self.path.len());
-        out.extend_from_slice(&self.root.to_le_bytes());
-        out.extend_from_slice(&(self.path.len() as u32).to_le_bytes());
-        for choice in &self.path {
-            out.extend_from_slice(&choice.to_le_bytes());
-        }
-        out
-    }
-
-    /// The interleaving that agrees with this one up to scheduling point `at` and takes `choice`.
-    pub fn branch(&self, at: usize, choice: u16) -> Seed {
-        let mut path: Vec<u16> = self.path.iter().copied().take(at).collect();
-        path.resize(at, 0);
-        path.push(choice);
-        Seed {
-            root: self.root,
-            path,
-        }
     }
 
     /// `None` when the stream decides.
     pub fn choice(&self, i: usize) -> Option<u16> {
         self.path.get(i).copied()
-    }
-}
-
-/// Decimal, or `0x`-prefixed hexadecimal.
-fn parse_u64(s: &str) -> Option<u64> {
-    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(hex) if !hex.is_empty() => u64::from_str_radix(hex, 16).ok(),
-        Some(_) => None,
-        None if s.is_empty() => None,
-        None => s.parse().ok(),
     }
 }
 
@@ -195,126 +133,8 @@ impl Stream {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum SimMode {
-    /// One interleaving, the one the seed names.
-    Once,
-    /// One interleaving per root.
-    Random,
-    /// Backtrack-set search.
-    #[default]
-    Dpor,
-}
-
-impl SimMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SimMode::Once => "once",
-            SimMode::Random => "random",
-            SimMode::Dpor => "dpor",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<SimMode> {
-        match s {
-            "once" => Some(SimMode::Once),
-            "random" => Some(SimMode::Random),
-            "dpor" => Some(SimMode::Dpor),
-            _ => None,
-        }
-    }
-
-    /// Whether a root's exploration decomposes into independent per-seed claims.
-    pub fn caches_per_seed(self) -> bool {
-        matches!(self, SimMode::Random)
-    }
-}
-
-/// The default interleavings explored per root under [`SimMode::Dpor`].
-pub const DEFAULT_BUDGET: u32 = 256;
-
 /// Default scheduling steps per interleaving before the region is [`crate::codes::DEADLOCK`].
 pub const DEFAULT_STEPS: u32 = 100_000;
-
-pub const DEFAULT_RANDOM_ROOTS: u32 = 64;
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Plan {
-    pub mode: SimMode,
-    /// Ascending and deduplicated by [`Plan::normalized`].
-    pub roots: Vec<u64>,
-    /// Interleavings per root.
-    pub budget: u32,
-    /// Scheduling steps per interleaving.
-    pub steps: u32,
-    /// The fixed path under [`SimMode::Once`], so `--seed 7:3.0.2` names one interleaving.
-    pub path: Vec<u16>,
-}
-
-impl Default for Plan {
-    fn default() -> Plan {
-        Plan {
-            mode: SimMode::Dpor,
-            roots: vec![0],
-            budget: DEFAULT_BUDGET,
-            steps: DEFAULT_STEPS,
-            path: Vec::new(),
-        }
-    }
-}
-
-impl Plan {
-    pub fn once(seed: Seed) -> Plan {
-        Plan {
-            mode: SimMode::Once,
-            roots: vec![seed.root],
-            budget: 1,
-            steps: DEFAULT_STEPS,
-            path: seed.path,
-        }
-    }
-
-    pub fn random(roots: u32) -> Plan {
-        Plan {
-            mode: SimMode::Random,
-            roots: (0..u64::from(roots)).collect(),
-            budget: 1,
-            steps: DEFAULT_STEPS,
-            path: Vec::new(),
-        }
-    }
-
-    /// Ascending, deduplicated roots, and no path outside [`SimMode::Once`].
-    pub fn normalized(mut self) -> Plan {
-        self.roots.sort_unstable();
-        self.roots.dedup();
-        if self.roots.is_empty() {
-            self.roots.push(0);
-        }
-        self.budget = self.budget.max(1);
-        self.steps = self.steps.max(1);
-        if self.mode != SimMode::Once {
-            self.path.clear();
-        }
-        self
-    }
-
-    pub fn seeds(&self) -> Vec<Seed> {
-        self.roots
-            .iter()
-            .map(|&root| Seed::at(root, self.path.clone()))
-            .collect()
-    }
-
-    pub fn re_executes(&self) -> bool {
-        let plan = self.clone().normalized();
-        let per_root = match plan.mode {
-            SimMode::Once | SimMode::Random => 1,
-            SimMode::Dpor => u64::from(plan.budget),
-        };
-        plan.roots.len() as u64 * per_root > 1
-    }
-}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Access {
@@ -395,70 +215,6 @@ impl StepFootprint {
             .iter()
             .filter(|a| other.0.iter().any(|b| a.conflicts_with(b)))
             .collect()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct RaceSite {
-    pub task: TaskId,
-    pub definition: Option<Symbol>,
-    pub access: String,
-    pub span: Span,
-}
-
-/// Two steps whose reordering at scheduling point `at` turned a pass into a failure.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Race {
-    pub left: RaceSite,
-    pub right: RaceSite,
-    pub at: u32,
-}
-
-/// What a search run beside the pruned one explored; `bounded` when a spent budget or a failure
-/// stopped it short of its frontier, so the count is a lower bound.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Cost {
-    pub explored: u32,
-    pub bounded: bool,
-}
-
-impl fmt::Display for Cost {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.bounded {
-            write!(f, ">= {}", self.explored)
-        } else {
-            write!(f, "{}", self.explored)
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct Exploration {
-    pub explored: u32,
-    /// Every interleaving ran, up to an outcome-preserving equivalence.
-    pub exhaustive: bool,
-    /// The budget was spent.
-    pub exhausted: bool,
-    /// `--measure-reduction` only: the same search with every pair of steps dependent.
-    pub naive: Option<Cost>,
-    /// `--measure-reduction` only: the same search with every step's vector clock withheld.
-    pub blind: Option<Cost>,
-    pub steps: u64,
-    /// Nanoseconds of virtual time the last interleaving consumed.
-    pub virtual_time: i64,
-    pub failure: Option<Seed>,
-    pub race: Option<Race>,
-}
-
-impl Exploration {
-    /// How many times more an unpruned search would have run.
-    pub fn reduction(&self) -> Option<f64> {
-        let naive = self.naive?;
-        (self.explored > 0).then(|| f64::from(naive.explored) / f64::from(self.explored))
-    }
-
-    pub fn is_cacheable(&self) -> bool {
-        self.failure.is_none() && !self.exhausted
     }
 }
 

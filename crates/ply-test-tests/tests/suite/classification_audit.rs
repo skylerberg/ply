@@ -1,7 +1,7 @@
 use crate::fixture::Compiled;
 use ply_eval::{Diagnostic, Severity, SourceId, Span, codes};
 use ply_store::Store;
-use ply_test::{Executor, RunReport, Status, run_with};
+use ply_test::{Executed, RunReport, Status};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -37,40 +37,41 @@ fn double(x: Int) -> Int = x * 2
 test "double doubles" { assert_eq(double(4), 8) }
 "#;
 
-/// Answers with a chosen code, so the classifier is measured against the code, not a program.
+/// A run that ended with a chosen diagnostic, so the classifier is measured against the code, not a
+/// program; `unwind` when Ply unwound rather than the program failing.
 struct Answering {
     diagnostic: Option<Diagnostic>,
     unwind: bool,
 }
 
-impl Executor for Answering {
-    type Worker = ();
-
-    fn worker(&self) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-
-    fn execute(&self, _worker: &mut (), _index: usize) -> Result<(), Diagnostic> {
-        if self.unwind {
-            panic!("the evaluator lost its footing");
-        }
-        match &self.diagnostic {
-            Some(d) => Err(d.clone()),
-            None => Ok(()),
-        }
-    }
-}
-
-fn report_for(executor: &Answering) -> RunReport {
+fn report_for(answer: &Answering) -> RunReport {
     let root = TempRoot::new();
     let mut store = root.store();
+    concluded(answer, &mut store)
+}
+
+fn concluded(answer: &Answering, store: &mut Store) -> RunReport {
     let compiled = Compiled::anonymous(CORPUS);
-    run_with(
+    let failure = match (&answer.diagnostic, answer.unwind) {
+        (Some(d), _) => Some(d.clone()),
+        (None, true) => Some(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "test `double doubles` panicked: the evaluator lost its footing",
+        )),
+        (None, false) => None,
+    };
+    let ran = vec![Executed {
+        failure,
+        panicked: answer.unwind,
+        ..Executed::refused(0, Diagnostic::error(codes::INTERNAL_ERROR, "overwritten"))
+    }];
+    ply_test::concluded(
         &compiled.every(),
         &compiled.check,
         &compiled.hashes,
-        &mut store,
-        executor,
+        store,
+        ran,
+        std::time::Duration::ZERO,
     )
 }
 
@@ -112,17 +113,14 @@ fn an_internal_error_and_an_unwind_are_both_defects() {
     assert_eq!(status, Status::Panicked);
 
     let report = report_for(&Answering {
-        diagnostic: None,
+        diagnostic: Some(Diagnostic::error(codes::RUNTIME_ERROR, "a program's code")),
         unwind: true,
     });
-    assert!(report.failures[0].defect, "an unwind is a defect");
-    assert_eq!(report.results[0].status, Status::Panicked);
-    assert_eq!(
-        report.failures[0].diagnostic.code,
-        codes::INTERNAL_ERROR,
-        "an unwind is rendered as the internal-error code so a JSON consumer \
-         reading only the code agrees with `defect`"
+    assert!(
+        report.failures[0].defect,
+        "an unwind is a defect whatever code it carries"
     );
+    assert_eq!(report.results[0].status, Status::Panicked);
 }
 
 #[test]
@@ -142,12 +140,7 @@ fn a_non_error_severity_is_still_a_failure() {
 fn an_abandoned_run_is_no_verdict_and_is_recorded_nowhere() {
     let root = TempRoot::new();
     let mut store = root.store();
-    let compiled = Compiled::anonymous(CORPUS);
-    let report = run_with(
-        &compiled.every(),
-        &compiled.check,
-        &compiled.hashes,
-        &mut store,
+    let report = concluded(
         &Answering {
             diagnostic: Some(Diagnostic::warning(
                 codes::RUN_ABANDONED,
@@ -155,6 +148,7 @@ fn an_abandoned_run_is_no_verdict_and_is_recorded_nowhere() {
             )),
             unwind: false,
         },
+        &mut store,
     );
     assert_eq!(report.abandoned, 1);
     assert_eq!(report.failed, 0);
