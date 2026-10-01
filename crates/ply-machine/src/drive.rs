@@ -480,18 +480,13 @@ impl Drive {
         // A cycle among escaped values is never collected, so only this run can report it.
         let cycles = ply_eval::rc::take_cycles();
         // On the machine's own thread, never from a signal handler.
-        let report = teardown(
-            &bound.hosts,
-            bound.shutdown.as_ref(),
-            options.shutdown.drain_ms,
-        );
+        let report = teardown(&bound.hosts);
         let stopping = bound.shutdown.filter(|s| s.stopping()).map(|s| {
-            let (listeners, connections, scopes) = s.at_stop();
+            let (listeners, connections) = s.at_stop();
             Stopped {
                 signal: s.signal().map(|sig| sig.name().to_string()),
                 listeners,
                 connections,
-                scopes,
                 elapsed_ms: s.elapsed().unwrap_or_default().as_millis() as u64,
             }
         });
@@ -506,10 +501,7 @@ impl Drive {
             teardown: Teardown {
                 lead_ms: options.shutdown.drain_lead_ms,
                 drain_ms: options.shutdown.drain_ms,
-                transactions_rolled_back: report.as_ref().map_or(0, |r| r.transactions_rolled_back),
-                connections_closed: report.as_ref().map_or(0, |r| r.connections_closed.len()),
-                spans_abandoned: report.as_ref().map_or(0, |r| r.spans_abandoned),
-                problems: report.map_or_else(Vec::new, |r| r.problems),
+                spans_left_open: report.map_or(0, |r| r.spans_left_open),
             },
             trace: bound.hosts.trace_counts(),
             handshakes: if bound.hosts.is_hermetic() {
@@ -537,23 +529,11 @@ impl Drive {
     }
 }
 
-/// Rolls back every open transaction, closes spans `Abandoned`, flushes the sink, closes the pool.
-pub fn teardown(
-    hosts: &Hosts,
-    shutdown: Option<&Arc<Shutdown>>,
-    drain_ms: u64,
-) -> Option<ply_eval::ShutdownReport> {
-    let budget = match shutdown.filter(|s| s.stopping()) {
-        Some(stopping) => {
-            let left = stopping.deadline_ms().max(0) as u64;
-            left.max(TEARDOWN_FLOOR_MS)
-        }
-        None => drain_ms,
-    };
-    hosts.runtime().map(|rt| rt.shutdown(budget))
+/// Ends the children still running and flushes the sink; each entry closed its own spans as it
+/// ended.
+pub fn teardown(hosts: &Hosts) -> Option<ply_eval::ShutdownReport> {
+    hosts.runtime().map(|rt| rt.shutdown())
 }
-
-pub const TEARDOWN_FLOOR_MS: u64 = 1_000;
 
 /// `--json` promises stdout to the one object, so the program's own lines go to stderr instead.
 /// Loaded up front so an `--exec` that cannot be started is `E0457` before anything runs.
@@ -883,17 +863,13 @@ pub struct Stopped {
     signal: Option<String>,
     listeners: usize,
     connections: usize,
-    scopes: usize,
     elapsed_ms: u64,
 }
 
 pub struct Teardown {
     lead_ms: u64,
     drain_ms: u64,
-    transactions_rolled_back: usize,
-    connections_closed: usize,
-    spans_abandoned: usize,
-    problems: Vec<String>,
+    spans_left_open: usize,
 }
 
 pub struct Outcome {
@@ -932,10 +908,7 @@ impl Outcome {
             teardown: Teardown {
                 lead_ms: 0,
                 drain_ms: 0,
-                transactions_rolled_back: 0,
-                connections_closed: 0,
-                spans_abandoned: 0,
-                problems: Vec::new(),
+                spans_left_open: 0,
             },
             trace: None,
             handshakes: Vec::new(),
@@ -1001,7 +974,6 @@ pub fn outcome_value(o: &Outcome) -> PlyValue {
                     ("signal", option(s.signal.as_deref().map(PlyValue::str))),
                     ("listeners", count(s.listeners)),
                     ("connections", count(s.connections)),
-                    ("scopes", count(s.scopes)),
                     ("elapsed_ms", tally(s.elapsed_ms)),
                 ])
             })),
@@ -1072,13 +1044,7 @@ fn teardown_value(w: &Teardown) -> PlyValue {
     record(vec![
         ("lead_ms", tally(w.lead_ms)),
         ("drain_ms", tally(w.drain_ms)),
-        (
-            "transactions_rolled_back",
-            count(w.transactions_rolled_back),
-        ),
-        ("connections_closed", count(w.connections_closed)),
-        ("spans_abandoned", count(w.spans_abandoned)),
-        ("problems", strings(w.problems.iter().map(String::as_str))),
+        ("spans_left_open", count(w.spans_left_open)),
     ])
 }
 

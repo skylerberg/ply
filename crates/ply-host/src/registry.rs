@@ -283,19 +283,16 @@ impl HostRuntime for Facilities {
 
     /// The run's own teardown, in a pinned order: the drain deadline governs scheduling and the
     /// socket pool, so nothing here waits on it.
-    fn shutdown(&self, _drain_ms: u64) -> ShutdownReport {
+    fn shutdown(&self) -> ShutdownReport {
         // However the run ended, it leaves no child running.
         if let Some(process) = &self.process {
             process.end_children();
         }
-        let mut report = ShutdownReport {
-            spans_abandoned: self.trace.open_spans(),
-            ..ShutdownReport::default()
-        };
         // The sink flushes before the run's own state is gone.
         self.trace.flush();
-        report.records_flushed = Some(self.trace.counts().events as usize);
-        report
+        ShutdownReport {
+            spans_left_open: usize::try_from(self.trace.left_open()).unwrap_or(usize::MAX),
+        }
     }
 
     /// Drive until this token resolves, or until the drain deadline says the run is out of time.
@@ -339,12 +336,9 @@ impl HostRuntime for Facilities {
         }
     }
 
-    /// Closes the spans this entry point left open.
-    fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic> {
-        match self.trace.end_entry_point(machine) {
-            None => Ok(()),
-            Some(spans) => Err(spans),
-        }
+    /// Closes the spans this entry point left open, and warns of them.
+    fn end_entry_point(&self, machine: MachineId) -> Vec<Diagnostic> {
+        self.trace.end_entry_point(machine).into_iter().collect()
     }
 
     /// Closes the spans the retired task left open.

@@ -1120,7 +1120,7 @@ fn the_runs_teardown_ends_the_children_it_leaves() {
         .with_process(ProcessHost::new(Vec::new(), Sink::captured()).executing(executables));
     let host = facilities.process().expect("a process host").clone();
     let (_, pid) = sleeper(&host);
-    let _ = facilities.runtime().shutdown(0);
+    let _ = facilities.runtime().shutdown();
     assert!(!alive(&pid), "the child {pid} outlived the run's teardown");
 }
 

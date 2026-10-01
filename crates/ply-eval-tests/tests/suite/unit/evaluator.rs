@@ -67,9 +67,9 @@ impl HostRuntime for Warns {
         Ok(Value::Unit)
     }
 
-    fn end_entry_point(&self, _: MachineId) -> Result<(), Diagnostic> {
+    fn end_entry_point(&self, _: MachineId) -> Vec<Diagnostic> {
         self.ended.fetch_add(1, Ordering::Relaxed);
-        Err(warning("the runtime's"))
+        vec![warning("the runtime's")]
     }
 }
 
