@@ -83,7 +83,7 @@ pub fn span_of(value: &PlyValue, span: Span) -> Result<Span, Diagnostic> {
     ))
 }
 
-fn step_value(step: &ply_eval::explore::Step) -> PlyValue {
+fn step_value(step: &ply_eval::region::Step) -> PlyValue {
     let int = |n: u64| PlyValue::Int(i64::try_from(n).unwrap_or(i64::MAX));
     record(vec![
         ("region", int(u64::from(step.region.0))),

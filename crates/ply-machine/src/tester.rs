@@ -1,12 +1,13 @@
 //! What `ply test` loads, binds and runs, as the program in `crates/ply-cli/ply/tests.ply`
 //! performs it.
 //!
-//! The front end, the store, the compiled backend, the host binding, the worker pool, the per-test
-//! unwind catching and the building of a mixture stay here: a front end is not a value a program can
-//! hold, a Rust unwind is not a Ply value, and the store's on-disk format has one reader. Which tests
-//! run, the keys each result is read and filed under, the classes they share, why a failure happened
-//! and everything said about it are the program's: this side answers what it knows and does what it
-//! is told.
+//! The front end, the store, the compiled backend, the host binding, running one test or one
+//! interleaving of it, the per-test unwind catching and the building of a mixture stay here: a front
+//! end is not a value a program can hold, a Rust unwind is not a Ply value, and the store's on-disk
+//! format has one reader. Which tests run, in which classes and lanes, which interleavings a seeded
+//! test is searched at, the keys each result is read and filed under, why a failure happened and
+//! everything said about it are the program's: this side answers what it knows and does what it is
+//! told.
 
 use crate::hosts::{self, Hosts, Lent, hosting};
 use crate::load::{Loaded, project_root};
@@ -544,9 +545,7 @@ impl Site {
         machine.ask(Go::Mutant(id))?;
         match machine.step()? {
             Step::Mutant(Ok(unit)) => Ok(PlyValue::ctor("Ok", vec![count(unit)])),
-            Step::Mutant(Err(verdict)) => {
-                Ok(PlyValue::ctor("Err", vec![unbuilt_value(&verdict)]))
-            }
+            Step::Mutant(Err(verdict)) => Ok(PlyValue::ctor("Err", vec![unbuilt_value(&verdict)])),
             _ => Err(out_of_step("mutant")),
         }
     }
@@ -1273,12 +1272,8 @@ fn after_run(
                 verdicts,
                 budget_spent,
             } => {
-                let report = mutation_report(
-                    std::mem::take(&mut queue),
-                    verdicts,
-                    budget_spent,
-                    loaded,
-                );
+                let report =
+                    mutation_report(std::mem::take(&mut queue), verdicts, budget_spent, loaded);
                 let _ = told.send(Step::Mutation(Box::new(mutants_view(&report, loaded))));
             }
             go => {
@@ -1348,16 +1343,7 @@ struct Unit {
 #[derive(Default)]
 struct Slot {
     once: Option<ply_test::Executed>,
-    /// Each failing interleaving's diagnostic, by the id the program holds it by.
-    failures: Vec<Diagnostic>,
-    /// Some interleaving never entered a `simulate` region, so it had no schedule to vary.
-    unobserved: bool,
-    panicked: bool,
-    duration: Duration,
-    host: Option<ply_eval::host::HostUse>,
-    backend: ply_test::BackendUse,
-    performs: u64,
-    teardown: Vec<Diagnostic>,
+    interleavings: ply_test::Interleavings,
 }
 
 impl Running {
@@ -1379,7 +1365,9 @@ impl Running {
                     units.len()
                 ),
             )
-            .note("units are the loaded program and each mutant `mutant` built; this is Ply's fault")
+            .note(
+                "units are the loaded program and each mutant `mutant` built; this is Ply's fault",
+            )
         })
     }
 
@@ -1441,29 +1429,14 @@ impl Running {
             }
             None => ply_test::Interleaved::refused(nothing_built()),
         };
-        let failed = match &run.interleaving.verdict {
-            ply_eval::Verdict::Failed(diagnostic) => Some(diagnostic.clone()),
-            ply_eval::Verdict::Passed => None,
-        };
         let fell = self.slot(unit, test, |slot| {
-            slot.unobserved |= !run.observed;
-            slot.panicked |= run.panicked;
-            slot.duration += run.duration;
-            if let Some(reached) = &run.host {
-                let into = slot.host.get_or_insert_with(Default::default);
-                into.atoms = into.atoms.union(&reached.atoms);
-                into.operations = into.operations.saturating_add(reached.operations);
-            }
-            slot.backend.entries = slot.backend.entries.saturating_add(run.backend.entries);
-            slot.backend.declines = slot.backend.declines.saturating_add(run.backend.declines);
-            slot.performs = slot.performs.saturating_add(run.performs);
-            slot.teardown.extend(run.teardown.iter().cloned());
-            failed.map(|diagnostic| {
-                let status = status_word(Some(&diagnostic), run.panicked);
-                slot.failures.push(diagnostic);
+            slot.interleavings.add(&run).map(|id| {
                 record(vec![
-                    ("id", count(slot.failures.len() - 1)),
-                    ("status", PlyValue::str(status)),
+                    ("id", count(id)),
+                    (
+                        "status",
+                        PlyValue::str(status_word(slot.interleavings.held().get(id), run.panicked)),
+                    ),
                 ])
             })
         });
@@ -1484,7 +1457,7 @@ impl Running {
             .map(|&test| {
                 let mut slot = slots.remove(&(0, test)).unwrap_or_default();
                 match (settled.remove(&test), slot.once.take()) {
-                    (Some(search), _) => search.executed(slot),
+                    (Some(search), _) => search.executed(slot.interleavings),
                     (None, Some(once)) => once,
                     (None, None) => ply_test::Executed::refused(test, never_ran(test)),
                 }
@@ -1536,26 +1509,18 @@ enum Why {
 }
 
 impl Settled {
-    fn executed(self, slot: Slot) -> ply_test::Executed {
-        ply_test::Executed {
-            index: self.test,
-            duration: slot.duration,
-            failure: self.failure.map(|stopped| stopped.diagnostic(&slot.failures)),
-            panicked: slot.panicked,
-            searched: (!slot.unobserved).then_some(self.searched),
-            seeds: self.seeds,
-            host: slot.host,
-            teardown: slot.teardown,
-            backend: Some(slot.backend),
-            performs: slot.performs,
-        }
+    fn executed(self, runs: ply_test::Interleavings) -> ply_test::Executed {
+        let failure = self.failure.map(|stopped| stopped.diagnostic(runs.held()));
+        runs.settled(self.test, self.searched, failure, self.seeds)
     }
 }
 
 impl Stopped {
     fn diagnostic(self, held: &[Diagnostic]) -> Diagnostic {
         let reproduce = |seed: &ply_eval::Seed| {
-            format!("reproduce with `--sim once --seed {seed}`, and report it with the test's source")
+            format!(
+                "reproduce with `--sim once --seed {seed}`, and report it with the test's source"
+            )
         };
         let stopped = match self.why {
             Why::Ran(id) => held.get(id).cloned().unwrap_or_else(|| {
@@ -1680,7 +1645,11 @@ fn stopped_of(v: &PlyValue, span: Span) -> Result<Stopped, Diagnostic> {
                 .to_string(),
         ))
     };
-    let why = match name.as_str().rsplit_once('.').map_or(name.as_str(), |(_, n)| n) {
+    let why = match name
+        .as_str()
+        .rsplit_once('.')
+        .map_or(name.as_str(), |(_, n)| n)
+    {
         "Ran" => Why::Ran(
             usize::try_from(field_of(payload, "id", span)?.as_int(span, "a failure's id")?)
                 .unwrap_or(usize::MAX),
@@ -2068,7 +2037,7 @@ fn unbuilt_backend(provider: Option<&'static dyn ply_eval::Provider>) -> Option<
         Diagnostic::error(
             codes::INTERNAL_ERROR,
             format!(
-                "{unbuilt} worker(s) could not build the `{}` backend, and every call they were \
+                "{unbuilt} thread(s) could not build the `{}` backend, and every call they were \
                  offered was declined",
                 provider.map_or("", ply_eval::Provider::name)
             ),
@@ -2761,30 +2730,30 @@ fn fault_value(f: &FaultView) -> PlyValue {
 }
 
 fn mutants_value(m: &MutantsView) -> PlyValue {
-record(vec![
-    ("killed", count(m.killed)),
-    ("survived", count(m.survived)),
-    ("skipped", count(m.skipped)),
-    ("budget_spent", PlyValue::Bool(m.budget_spent)),
-    ("unreached", texts(&m.unreached)),
-    (
-        "survivors",
-        PlyValue::list(
-            m.survivors
-                .iter()
-                .map(|(definition, from, to, span)| {
-                    record(vec![
-                        ("definition", PlyValue::str(definition)),
-                        ("from", PlyValue::str(from)),
-                        ("to", PlyValue::str(to)),
-                        ("at", option(placed(*span))),
-                    ])
-                })
-                .collect(),
+    record(vec![
+        ("killed", count(m.killed)),
+        ("survived", count(m.survived)),
+        ("skipped", count(m.skipped)),
+        ("budget_spent", PlyValue::Bool(m.budget_spent)),
+        ("unreached", texts(&m.unreached)),
+        (
+            "survivors",
+            PlyValue::list(
+                m.survivors
+                    .iter()
+                    .map(|(definition, from, to, span)| {
+                        record(vec![
+                            ("definition", PlyValue::str(definition)),
+                            ("from", PlyValue::str(from)),
+                            ("to", PlyValue::str(to)),
+                            ("at", option(placed(*span))),
+                        ])
+                    })
+                    .collect(),
+            ),
         ),
-    ),
-    ("json", json(&m.json)),
-])
+        ("json", json(&m.json)),
+    ])
 }
 
 fn ran_value(over: &Over) -> PlyValue {

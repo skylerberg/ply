@@ -3,48 +3,13 @@ use ply_eval::sim::*;
 use ply_eval::{EffectAtom, Mode, Span, Symbol, Value, codes};
 
 #[test]
-fn a_seed_round_trips_through_its_text_form() {
-    for text in ["0", "7", "18446744073709551615", "7:3", "0:1.0.2"] {
-        let seed = Seed::parse(text).expect("parses");
-        assert_eq!(seed.to_string(), text, "{text} did not round-trip");
-    }
-}
-
-#[test]
-fn hexadecimal_roots_parse_and_print_as_decimal() {
-    assert_eq!(Seed::parse("0xff"), Some(Seed::root(255)));
-    assert_eq!(Seed::parse("0xFF:1"), Some(Seed::at(255, vec![1])));
-}
-
-/// A seed that parses loosely replays something other than what failed.
-#[test]
-fn everything_else_is_rejected() {
-    for text in [
-        "", "-1", "7:", ":3", "7:a", "7.3", "0x", "1_000", " 7", "7 ",
-    ] {
-        assert_eq!(Seed::parse(text), None, "`{text}` should not parse");
-    }
-}
-
-#[test]
-fn canonical_bytes_distinguish_a_path_from_a_longer_root() {
-    // No length-prefix ambiguity can make one seed's path look like another's root.
-    assert_ne!(Seed::root(7).to_bytes(), Seed::at(7, vec![1]).to_bytes());
-    assert_ne!(
-        Seed::at(7, vec![1, 0]).to_bytes(),
-        Seed::at(7, vec![1]).to_bytes()
+fn a_seed_prints_its_root_and_then_its_path() {
+    assert_eq!(Seed::at(7, Vec::new()).to_string(), "7");
+    assert_eq!(Seed::at(0, vec![1, 0, 2]).to_string(), "0:1.0.2");
+    assert_eq!(
+        Seed::at(u64::MAX, vec![3]).to_string(),
+        "18446744073709551615:3"
     );
-}
-
-#[test]
-fn branching_keeps_the_prefix_and_forgets_the_suffix() {
-    let seed = Seed::at(3, vec![1, 2, 3, 4]);
-    assert_eq!(seed.branch(2, 9), Seed::at(3, vec![1, 2, 9]));
-    assert_eq!(seed.branch(0, 5), Seed::at(3, vec![5]));
-    // A search may reach a scheduling point the prefix never named, so branching past it pads.
-    let branched = seed.branch(6, 1);
-    assert_eq!(branched.choice(6), Some(1));
-    assert_eq!(branched.path.len(), 7);
 }
 
 #[test]
@@ -172,105 +137,6 @@ fn the_empty_step_commutes_with_everything() {
     let w = StepFootprint::from_accesses([Access::Atom(atom("db", Some("u"), Mode::Write))]);
     assert!(!empty.conflicts_with(&w));
     assert!(!w.conflicts_with(&empty));
-}
-
-#[test]
-fn a_normalized_plan_forgets_the_order_roots_were_written_in() {
-    let a = Plan {
-        roots: vec![3, 1, 1, 2],
-        ..Plan::default()
-    };
-    let b = Plan {
-        roots: vec![1, 2, 3],
-        ..Plan::default()
-    };
-    assert_eq!(a.normalized(), b.normalized());
-}
-
-#[test]
-fn normalization_drops_a_path_outside_once() {
-    let plan = Plan {
-        mode: SimMode::Dpor,
-        path: vec![1, 2],
-        ..Plan::default()
-    }
-    .normalized();
-    assert!(plan.path.is_empty());
-    assert_eq!(Plan::once(Seed::at(4, vec![1])).normalized().path, vec![1]);
-}
-
-#[test]
-fn a_once_plan_names_exactly_the_seed_it_replays() {
-    let seed = Seed::at(9, vec![0, 3]);
-    assert_eq!(Plan::once(seed.clone()).seeds(), vec![seed]);
-}
-
-#[test]
-fn an_exhausted_search_is_not_cacheable() {
-    let exhausted = Exploration {
-        explored: 256,
-        exhausted: true,
-        ..Exploration::default()
-    };
-    assert!(!exhausted.is_cacheable());
-
-    let complete = Exploration {
-        explored: 12,
-        exhaustive: true,
-        ..Exploration::default()
-    };
-    assert!(complete.is_cacheable());
-
-    let failed = Exploration {
-        explored: 4,
-        exhaustive: true,
-        failure: Some(Seed::root(0)),
-        ..Exploration::default()
-    };
-    assert!(!failed.is_cacheable());
-}
-
-#[test]
-fn a_bounded_count_renders_as_a_lower_bound() {
-    assert_eq!(
-        Cost {
-            explored: 4096,
-            bounded: true
-        }
-        .to_string(),
-        ">= 4096"
-    );
-    assert_eq!(
-        Cost {
-            explored: 720,
-            bounded: false
-        }
-        .to_string(),
-        "720"
-    );
-}
-
-#[test]
-fn reduction_is_none_until_the_naive_search_is_measured() {
-    let mut e = Exploration {
-        explored: 12,
-        ..Exploration::default()
-    };
-    assert_eq!(e.reduction(), None);
-    e.blind = Some(Cost {
-        explored: 30,
-        bounded: false,
-    });
-    assert_eq!(
-        e.reduction(),
-        None,
-        "the reduction is against the naive search alone"
-    );
-    e.naive = Some(Cost {
-        explored: 720,
-        bounded: false,
-    });
-    assert_eq!(e.reduction(), Some(60.0));
 }
 
 fn span() -> Span {

@@ -237,3 +237,257 @@ fn a_seed_actually_decides_which_interleaving_runs() {
         "24 seeds gave one verdict on a racy test, so the seed decides nothing: {verdicts:?}"
     );
 }
+
+/// The tasks touch the cell themselves, so a race is reported over the cell's name rather than over
+/// an effect's atom.
+const CELL_RACE: &str = r#"
+test "a lost update on a cell" {
+  with_cell[n](0) { c ->
+    simulate {
+      let a = task.spawn(|| { let seen = cell_get(c); clock.now(); cell_set(c, seen + 1) });
+      let b = task.spawn(|| { let seen = cell_get(c); clock.now(); cell_set(c, seen + 1) });
+      task.join(a);
+      task.join(b);
+      assert_eq(cell_get(c), 2)
+    }
+  }
+}
+"#;
+
+/// Each interleaving is an entry on the tier the test runs on, as is every search before it on that
+/// thread, so a race names the cell as a fresh tier does or the report depends on what ran first.
+#[test]
+fn every_search_on_one_thread_names_a_races_cell_alike() {
+    let source: String = (0..3)
+        .map(|i| {
+            CELL_RACE.replace(
+                "a lost update on a cell",
+                &format!("a lost update on cell {i}"),
+            )
+        })
+        .collect();
+    let dir = project(&source);
+    let run = artifact(dir.path(), &["--jobs", "1"]);
+    let races: Vec<&Value> = run["failures"]
+        .as_array()
+        .expect("failures is an array")
+        .iter()
+        .map(|f| &f["race"])
+        .collect();
+    assert_eq!(races.len(), 3, "each copy reaches the lost update: {run}");
+    for race in &races {
+        for side in ["left", "right"] {
+            let access = race[side]["access"].as_str().unwrap_or_default();
+            assert!(
+                access.starts_with("cell.") && access.ends_with("[@0.0]"),
+                "the test's one cell, named as a fresh tier names it: {race}"
+            );
+        }
+        // Each copy has spans and a name of its own; what it names of the cell is the same.
+        let named = |r: &Value| {
+            (
+                r["at"].clone(),
+                [&r["left"], &r["right"]].map(|s| (s["task"].clone(), s["access"].clone())),
+            )
+        };
+        assert_eq!(
+            named(race),
+            named(races[0]),
+            "a later search on the thread named the race differently"
+        );
+    }
+}
+
+const TWO_REGIONS: &str = r#"
+effect counter {
+  read  get[r]() -> Int
+  write put[r](v: Int) -> Unit
+}
+
+fn bump() -> Unit / {counter.read[n], counter.write[n], clock.read} = {
+  let seen = counter.get[n]();
+  clock.now();
+  counter.put[n](seen + 1)
+}
+
+test "a race in the first region and a quiet second one" {
+  with_cell[n](0) { c ->
+    handle {
+      {
+        simulate {
+          let a = task.spawn(|| bump());
+          let b = task.spawn(|| bump());
+          task.join(a);
+          task.join(b)
+        };
+        simulate {
+          clock.now();
+          ()
+        };
+        assert_eq(counter.get[n](), 2)
+      }
+    } with {
+      counter.get[n]() -> cell_get(c),
+      counter.put[n](v) -> cell_set(c, v),
+    }
+  }
+}
+"#;
+
+const REGION_IN_A_HELPER: &str = r#"
+effect counter {
+  read  get[r]() -> Int
+  write put[r](v: Int) -> Unit
+}
+
+fn bump() -> Unit / {counter.read[n], counter.write[n], clock.read} = {
+  let seen = counter.get[n]();
+  clock.now();
+  counter.put[n](seen + 1)
+}
+
+fn race() -> Unit / {counter.read[n], counter.write[n], sim.read} = simulate {
+  let a = task.spawn(|| bump());
+  let b = task.spawn(|| bump());
+  task.join(a);
+  task.join(b)
+}
+
+test "the same region twice through a call" {
+  with_cell[n](0) { c ->
+    handle {
+      {
+        race();
+        race();
+        assert_eq(counter.get[n](), 4)
+      }
+    } with {
+      counter.get[n]() -> cell_get(c),
+      counter.put[n](v) -> cell_set(c, v),
+    }
+  }
+}
+"#;
+
+/// The fixture's assertion seeing an update lost: a failed test whose diagnostic says so.
+#[track_caller]
+fn assert_lost_update(run: &Value, total: i64, what: &str) {
+    let failure = run["failures"]
+        .as_array()
+        .and_then(|fs| fs.first())
+        .unwrap_or_else(|| panic!("{what}: no interleaving failed: {run}"));
+    assert_eq!(failure["diagnostic"]["code"], "E0501", "{what}: {failure}");
+    let message = failure["diagnostic"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    let lost = format!("assertion failed: expected {total}, found ");
+    assert!(
+        message.starts_with(&lost) && message != format!("{lost}{total}"),
+        "{what}: {message}"
+    );
+    assert!(
+        failure["seed"].is_string(),
+        "{what}: a lost update names its seed: {failure}"
+    );
+}
+
+#[test]
+fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
+    for (source, name, total) in [
+        (TWO_REGIONS, "two regions written out", 2),
+        (
+            REGION_IN_A_HELPER,
+            "one region reached twice through a call",
+            4,
+        ),
+    ] {
+        let dir = project(source);
+        let sampled = artifact(dir.path(), &["--sim", "random", "--seeds", "64"]);
+        assert_lost_update(
+            &sampled,
+            total,
+            &format!(
+                "`{name}`: the fixture must contain a reachable lost update, or it proves nothing"
+            ),
+        );
+        let searched = artifact(dir.path(), &["--sim-budget", "1024"]);
+        assert_lost_update(&searched, total, &format!("`{name}`: the search"));
+    }
+}
+
+/// The second region's shape depends on what the first raced to, so replaying a branch rebuilds a
+/// region whose enabled sets differ from the recording's only if the replay strayed.
+const SHAPE_FOLLOWS_A_RACE: &str = r#"
+effect counter {
+  read  get[r]() -> Int
+  write put[r](v: Int) -> Unit
+  write note[r](v: Int) -> Unit
+}
+
+fn bump() -> Unit / {counter.get[n], counter.put[n], clock.now} = {
+  let seen = counter.get[n]();
+  clock.now();
+  counter.put[n](seen + 1)
+}
+
+fn noise() -> Unit / {counter.get[n], counter.note[m], clock.now} = {
+  let seen = counter.get[n]();
+  clock.now();
+  counter.note[m](seen)
+}
+
+test "the second region's shape depends on what the first raced to" {
+  with_cell[n](0) { c -> {
+  with_cell[m](0) { d ->
+    handle {
+      {
+        simulate {
+          let a = task.spawn(|| bump());
+          let b = task.spawn(|| bump());
+          task.join(a);
+          task.join(b)
+        };
+        simulate {
+          if counter.get[n]() == 2 {
+            let a = task.spawn(|| noise());
+            let b = task.spawn(|| noise());
+            task.join(a);
+            task.join(b)
+          } else {
+            let a = task.spawn(|| noise());
+            task.join(a)
+          }
+        };
+        assert(cell_get(d) >= 0)
+      }
+    } with {
+      counter.get[n]() -> cell_get(c),
+      counter.put[n](v) -> cell_set(c, v),
+      counter.note[m](v) -> cell_set(d, v),
+    }
+  }
+  } }
+}
+"#;
+
+#[test]
+fn a_legal_program_is_never_reported_as_a_simulation_divergence() {
+    let dir = project(SHAPE_FOLLOWS_A_RACE);
+    let run = artifact(dir.path(), &[]);
+    if let Some(failure) = run["failures"]
+        .as_array()
+        .expect("failures is an array")
+        .first()
+    {
+        assert_ne!(
+            failure["diagnostic"]["code"], "E0415",
+            "a legal program was blamed on Ply's simulation: {failure}"
+        );
+        panic!("its assertion holds in every interleaving, and a run failed: {failure}");
+    }
+    // Replay is checked on a branch, so a search that took none compared nothing.
+    let explored = run["results"][0]["simulation"]["explored"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(explored > 1, "{run}");
+}

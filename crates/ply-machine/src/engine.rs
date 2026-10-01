@@ -5,8 +5,8 @@
 use crate::load::Loaded;
 use ply_eval::host::HostBinding;
 use ply_eval::{
-    CheckOutput, DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, Span,
-    Symbol, Value, codes,
+    DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, Span, Symbol, Value,
+    codes,
 };
 use ply_prove::{Binder, Binding, Fault, Obligation, ObligationKind, ProvePlan, Strategy};
 use std::cell::RefCell;
@@ -15,11 +15,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// The prover this build drives over the program. One built once serves a whole run.
-pub fn prover<'a>(
-    loaded: &'a Loaded,
+pub fn prover(
+    loaded: &Loaded,
     hosting: Option<Hosting>,
     backend: &'static dyn ply_eval::Provider,
-) -> Prover<'a> {
+) -> Prover {
     let prover = Prover::new(loaded, backend);
     match hosting {
         Some(hosting) => prover.with_hosting(hosting),
@@ -41,10 +41,12 @@ enum Claim<'s> {
     },
 }
 
-pub struct Prover<'a> {
-    check: &'a CheckOutput,
-    front: &'a Front,
-    laws: HashMap<Symbol, (usize, &'a LawInfo)>,
+/// It owns what it judges, so a run can judge on whichever threads the program asks from.
+pub struct Prover {
+    front: Arc<Front>,
+    /// Each law's place among its module's laws, which names its roots, and its place in the
+    /// program's.
+    laws: HashMap<Symbol, (usize, usize)>,
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
@@ -59,27 +61,25 @@ pub struct Hosting {
     pub runtime: Option<ply_eval::RuntimeFactory>,
 }
 
-impl<'a> Prover<'a> {
+impl Prover {
     /// `backend` is the unit built from `loaded`, laws' and clauses' roots included.
-    pub fn new(loaded: &'a Loaded, backend: &'static dyn ply_eval::Provider) -> Prover<'a> {
-        let check = &loaded.check;
+    pub fn new(loaded: &Loaded, backend: &'static dyn ply_eval::Provider) -> Prover {
         let mut laws = HashMap::new();
         let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
-        for law in &check.laws {
+        for (at, law) in loaded.front.check.laws.iter().enumerate() {
             let ordinal = ordinals.entry(law.module.as_symbol()).or_default();
-            laws.insert(law.key.clone(), (*ordinal, law));
+            laws.insert(law.key.clone(), (*ordinal, at));
             *ordinal += 1;
         }
         Prover {
-            check,
-            front: &loaded.front,
+            front: Arc::clone(&loaded.front),
             laws,
             hosting: None,
             backend,
         }
     }
 
-    /// The unit, attached once per thread: obligations are discharged on pool threads.
+    /// The unit, attached once per thread: claims are judged on whichever threads the program asks from.
     fn compiled(&self) -> Rc<dyn ply_eval::Compiled> {
         thread_local! {
             static ATTACHED: RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
@@ -133,7 +133,7 @@ impl<'a> Prover<'a> {
     }
 
     /// Bind the host, so that a `law/host` is attempted rather than reported as a gap.
-    pub fn with_hosting(mut self, hosting: Hosting) -> Prover<'a> {
+    pub fn with_hosting(mut self, hosting: Hosting) -> Prover {
         self.hosting = Some(hosting);
         self
     }
@@ -141,11 +141,12 @@ impl<'a> Prover<'a> {
     fn claim(&self, obligation: &Obligation) -> Option<Claim<'_>> {
         match obligation.kind {
             ObligationKind::Ensures { index } => Some(Claim::Ensures {
-                owner: self.check.defs.get(&obligation.owner)?,
+                owner: self.front.check.defs.get(&obligation.owner)?,
                 index,
             }),
             ObligationKind::Law => {
-                let &(ordinal, info) = self.laws.get(&obligation.owner)?;
+                let &(ordinal, at) = self.laws.get(&obligation.owner)?;
+                let info = self.front.check.laws.get(at)?;
                 Some(Claim::Law { info, ordinal })
             }
         }
@@ -153,8 +154,8 @@ impl<'a> Prover<'a> {
 
     /// What an owner is called through to produce `result`: the tier its propositions are entered
     /// on, attached afresh.
-    fn machine(&self) -> Result<Machine<'a>, Fault> {
-        Machine::new(self.front, self.backend.attach())
+    fn machine(&self) -> Result<Machine<'_>, Fault> {
+        Machine::new(&self.front, self.backend.attach())
             .map(|machine| machine.with_max_calls(DEFAULT_MAX_CALLS))
             .map_err(|refused| Fault {
                 bindings: Vec::new(),
@@ -163,7 +164,7 @@ impl<'a> Prover<'a> {
     }
 
     /// The machine a `law/host`'s body runs on: the run's binding and a reactor for this thread.
-    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'a>, Fault> {
+    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'_>, Fault> {
         let mut machine = self.machine()?;
         machine.set_host_binding(Arc::clone(&hosting.binding));
         if let Some(factory) = &hosting.runtime {
@@ -257,7 +258,7 @@ fn unhosted(obligation: &Obligation) -> Diagnostic {
     .note("the program judges a `law/host` only under `--host`; this is Ply's fault")
 }
 
-impl<'a> Prover<'a> {
+impl Prover {
     /// One claim's points, judged in order until one ends the batch.
     pub fn judged(
         &self,
@@ -365,7 +366,7 @@ impl<'a> Prover<'a> {
         obligation: &Obligation,
         claim: &Claim<'_>,
         plan: &ProvePlan,
-    ) -> Result<Cases<'a>, Fault> {
+    ) -> Result<Cases<'_>, Fault> {
         let call = match claim {
             Claim::Ensures { .. } => Some(obligation.owner.clone()),
             Claim::Law { .. } => None,

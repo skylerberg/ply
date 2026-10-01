@@ -920,9 +920,11 @@ effect, or write `test/nondet "label" { ... }`, which is never cached.
 
 ### 8.4 Scheduling and failures
 
-Tests whose footprints do not conflict run concurrently; a test whose effects
-are all discharged in a region conflicts with nothing. `--jobs N`/`-j` sets
-workers (default one per core).
+Tests whose footprints do not conflict run concurrently, under `parallel`
+blocks (§5.9) on one thread per core; a test whose effects are all discharged in
+a region conflicts with nothing. `--jobs N`/`-j` deals them into `N` lanes, each
+lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
+claims' points the same way.
 
 `--steps N` is the calls each test may make (default 1000000000; `0` is no
 bound); a test past it fails with `E0503`, which is a program error like any

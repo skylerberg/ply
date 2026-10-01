@@ -83,7 +83,6 @@ pub struct Choice {
     pub filed: BTreeMap<usize, Vec<DefHash>>,
 }
 
-
 #[derive(Clone)]
 pub struct Selection {
     pub total: usize,
@@ -308,7 +307,6 @@ impl RunReport {
     }
 }
 
-
 #[derive(Default, Clone)]
 pub struct Hosting {
     binding: Option<Arc<HostBinding>>,
@@ -458,26 +456,34 @@ fn entered<'a>(
 
 /// One test run once on this thread, as a test with no `simulate` region in its closure runs.
 pub fn executed(executor: &InterpExecutor<'_>, check: &CheckOutput, index: usize) -> Executed {
+    contained(check, index, || {
+        let started = Instant::now();
+        match entered(executor, index, None) {
+            Ok(e) => Executed {
+                index,
+                duration: started.elapsed(),
+                failure: e.outcome.err(),
+                panicked: false,
+                searched: None,
+                seeds: 0,
+                host: e.host,
+                teardown: e.teardown,
+                backend: Some(e.backend),
+                performs: e.performs,
+            },
+            Err(refused) => Executed::refused(index, refused),
+        }
+    })
+}
+
+/// `run` on this thread, an unwind out of it reported as Ply's defect at the test's source.
+pub fn contained(check: &CheckOutput, index: usize, run: impl FnOnce() -> Executed) -> Executed {
     let started = Instant::now();
-    let result = catch_unwind(AssertUnwindSafe(|| entered(executor, index, None)));
-    let duration = started.elapsed();
-    match result {
-        Ok(Ok(e)) => Executed {
-            index,
-            duration,
-            failure: e.outcome.err(),
-            panicked: false,
-            searched: None,
-            seeds: 0,
-            host: e.host,
-            teardown: e.teardown,
-            backend: Some(e.backend),
-            performs: e.performs,
-        },
-        Ok(Err(refused)) => Executed::refused(index, refused),
+    match catch_unwind(AssertUnwindSafe(run)) {
+        Ok(executed) => executed,
         Err(payload) => Executed {
             panicked: true,
-            duration,
+            duration: started.elapsed(),
             ..Executed::refused(index, panic_diagnostic(payload, check, index))
         },
     }
@@ -533,6 +539,74 @@ pub fn interleaved(
         },
         Ok(Err(refused)) => failed(refused, false),
         Err(payload) => failed(panic_diagnostic(payload, check, index), true),
+    }
+}
+
+/// What a seeded test's interleavings came to as each one ran: what they reached and cost between
+/// them, and each failing one's diagnostic, held by the order it failed in.
+#[derive(Default)]
+pub struct Interleavings {
+    failures: Vec<Diagnostic>,
+    /// Some interleaving never entered a `simulate` region, so it had no schedule to vary.
+    unobserved: bool,
+    panicked: bool,
+    duration: Duration,
+    host: Option<HostUse>,
+    backend: BackendUse,
+    performs: u64,
+    teardown: Vec<Diagnostic>,
+}
+
+impl Interleavings {
+    /// Folds one more in, answering the id a failing one's diagnostic is held under.
+    pub fn add(&mut self, run: &Interleaved) -> Option<usize> {
+        self.unobserved |= !run.observed;
+        self.panicked |= run.panicked;
+        self.duration += run.duration;
+        if let Some(reached) = &run.host {
+            let into = self.host.get_or_insert_with(Default::default);
+            into.atoms = into.atoms.union(&reached.atoms);
+            into.operations = into.operations.saturating_add(reached.operations);
+        }
+        self.backend.entries = self.backend.entries.saturating_add(run.backend.entries);
+        self.backend.declines = self.backend.declines.saturating_add(run.backend.declines);
+        self.performs = self.performs.saturating_add(run.performs);
+        self.teardown.extend(run.teardown.iter().cloned());
+        match &run.interleaving.verdict {
+            ply_eval::Verdict::Failed(diagnostic) => {
+                self.failures.push(diagnostic.clone());
+                Some(self.failures.len() - 1)
+            }
+            ply_eval::Verdict::Passed => None,
+        }
+    }
+
+    /// Each failing interleaving's diagnostic, by its id.
+    pub fn held(&self) -> &[Diagnostic] {
+        &self.failures
+    }
+
+    /// The test's result once the search that ran these settled on `searched`, stopping at
+    /// `failure` if it stopped at one, from `seeds` roots. An unobserved search is no search.
+    pub fn settled(
+        self,
+        index: usize,
+        searched: Searched,
+        failure: Option<Diagnostic>,
+        seeds: usize,
+    ) -> Executed {
+        Executed {
+            index,
+            duration: self.duration,
+            failure,
+            panicked: self.panicked,
+            searched: (!self.unobserved).then_some(searched),
+            seeds,
+            host: self.host,
+            teardown: self.teardown,
+            backend: Some(self.backend),
+            performs: self.performs,
+        }
     }
 }
 
@@ -661,7 +735,6 @@ pub fn diagnose_failures(
     Hybrids { fresh, per_failure }
 }
 
-
 /// What the program's run came to, in test order, filed under the keys it named: what a run prints,
 /// written into the store as the report is assembled. `duration` is the run's wall clock.
 pub fn concluded(
@@ -695,7 +768,10 @@ pub fn concluded(
             warnings.push(
                 Diagnostic::warning(
                     codes::INTERNAL_ERROR,
-                    format!("a run named test {index}, but the module defines {}", check.tests.len()),
+                    format!(
+                        "a run named test {index}, but the module defines {}",
+                        check.tests.len()
+                    ),
                 )
                 .note("the choice was made against another program; the stale index was skipped"),
             );
@@ -770,7 +846,10 @@ pub fn concluded(
             index,
             name: test.name.clone(),
             hash,
-            group: group_of.get(&index).copied().unwrap_or(selection.groups.len()),
+            group: group_of
+                .get(&index)
+                .copied()
+                .unwrap_or(selection.groups.len()),
             duration: executed.duration,
             status,
             failure: executed.failure,
@@ -943,4 +1022,3 @@ fn observe_definitions(
             .map(|(_, hash)| *hash),
     );
 }
-

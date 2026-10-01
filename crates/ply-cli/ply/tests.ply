@@ -1732,7 +1732,7 @@ fn tests_over(
     Ok(p) -> {
       // Which tests run is the program's to say, and so is every key the store is asked about or a
       // pass is filed under: the runtime answers what the store holds and does what it is told.
-      let searching = plan_of(options.sim);
+      let searching = machine::sim_plan_of(options.sim);
       let search = search_of(searching);
       let decisions = decide(cases_of(tester.keys[corpus](), search));
       // Which tests may share a worker is the program's to say, from the atoms each row carries;
@@ -1759,11 +1759,16 @@ fn tests_over(
           let asked = {
             plan: searching,
             measuring: options.sim.measure_reduction,
-            lanes: match options.jobs { Some(n) -> if n > 0 { Some(n) } else { None }, None -> None },
+            lanes: match options.jobs {
+              Some(n) -> if n > 0 { Some(n) } else { None },
+              None -> None,
+            },
           };
           let narrowing = narrowed(decisions, search.roots);
           let searched = flat_map(classes, |class: List<Int>|
-            settled_of(ran_class(map(class, |i: Int| job_of(p, 0, i, narrowing, searching)), asked)));
+            settled_of(
+              ran_class(map(class, |i: Int| job_of(p, 0, i, narrowing, searching)), asked),
+            ));
           let r = mutated(p, tester.concluded[corpus](searched), options, asked);
           // The run is over, so the runtime can be asked about mixtures of what it found; every
           // failure's cause is decided here, before anything renders one.
@@ -1777,16 +1782,6 @@ fn tests_over(
 }
 
 // --- The run ----------------------------------------------------------------
-
-// What the flags ask a run to search, as `sim.plan` normalizes a plan.
-fn plan_of(sim: machine::SimOpts) -> plan::Plan =
-  plan::asked_plan({
-    seed: match sim.seed { Some(text) -> plan::parse_seed(text), None -> None },
-    mode: match plan::parse_mode(sim.mode) { Some(m) -> m, None -> plan::Dpor },
-    roots: sim.roots,
-    budget: sim.budget,
-    steps: sim.steps,
-  })
 
 // The search a seeded test's key is computed against, as the selector reads one.
 fn search_of(p: plan::Plan) -> Search =
@@ -1859,49 +1854,59 @@ fn settled_of(done: List<Done>) -> List<Settled> =
     match d.settled { Some(st) -> push(acc, st), None -> acc })
 
 // One class's tests at once: each in a lane of its own, or dealt across the lanes `--jobs` names,
-// a lane's tests in turn.
-fn ran_class(jobs: List<Job>, asked: Asked) -> List<Done> / {tester.executed[corpus], tester.interleaved[corpus]} = {
-  let lanes = match asked.lanes {
-    None -> map(jobs, |j: Job| [j]),
-    Some(n) -> map(range(0, min(n, len(jobs))), |k: Int|
-      fold(range(0, len(jobs)), [], |lane: List<Job>, i: Int|
-        if i % n != k { lane } else {
-          match list_at(jobs, i) { Some(j) -> push(lane, j), None -> lane }
-        })),
-  };
-  ran_lanes(lanes, asked.measuring, 0, len(lanes))
+// a lane's tests in turn, answered in the class's order.
+fn ran_class(
+  jobs: List<Job>,
+  asked: Asked,
+) -> List<Done> / {tester.executed[corpus], tester.interleaved[corpus]} = {
+  let lanes = machine::dealt(jobs, asked.lanes);
+  machine::undealt(ran_lanes(lanes, asked.measuring, 0, len(lanes)))
 }
 
-// Halves under a `parallel` block until one lane is left, so lanes run at once and the answer is
-// the lanes' in order.
-fn ran_lanes(lanes: List<List<Job>>, measuring: Bool, lo: Int, hi: Int) -> List<Done> / {tester.executed[corpus], tester.interleaved[corpus]} =
-  if hi - lo <= 0 { [] }
-  else if hi - lo == 1 {
+// Halves under a `parallel` block until one lane is left, so lanes run at once; each lane answers
+// with its tests' in turn.
+fn ran_lanes(
+  lanes: List<List<Job>>,
+  measuring: Bool,
+  lo: Int,
+  hi: Int,
+) -> List<List<Done>> / {tester.executed[corpus], tester.interleaved[corpus]} =
+  if hi - lo <= 0 { [] } else if hi - lo == 1 {
     match list_at(lanes, lo) {
-      Some(lane) -> fold(lane, [], |out: List<Done>, j: Job| push(out, ran_job(j, measuring))),
+      Some(lane) -> [fold(lane, [], |out: List<Done>, j: Job| push(out, ran_job(j, measuring)))],
       None -> [],
     }
   } else {
     let mid = lo + (hi - lo) / 2;
-    let halves = parallel { ran_lanes(lanes, measuring, lo, mid), ran_lanes(lanes, measuring, mid, hi) };
+    let halves = parallel {
+      ran_lanes(lanes, measuring, lo, mid),
+      ran_lanes(lanes, measuring, mid, hi),
+    };
     appended(halves._0, halves._1)
   }
 
 // A test once, or a seeded one searched an interleaving at a time.
-fn ran_job(j: Job, measuring: Bool) -> Done / {tester.executed[corpus], tester.interleaved[corpus]} =
+fn ran_job(
+  j: Job,
+  measuring: Bool,
+) -> Done / {tester.executed[corpus], tester.interleaved[corpus]} =
   match j.search {
     None -> { test: j.test, status: tester.executed[corpus](j.unit, j.test), settled: None },
     Some(p) -> {
       // A search re-runs the whole test, so any host operation runs once per interleaving.
       let again = plan::re_executes(p) || measuring;
       let run = |seed: Seed| tester.interleaved[corpus](j.unit, j.test, seed, p.steps, again);
-      let explored = if measuring { search::measure_reduction(p, run) } else { search::explore(p, run) };
+      let explored = if measuring { search::measure_reduction(p, run) }
+      else { search::explore(p, run) };
       {
         test: j.test,
         status: match explored.failure {
           None -> "passed",
           // A recording that names no schedule, or a replay that took another, is Ply's fault.
-          Some(fl) -> match search::ran_failure(fl) { Some(fell) -> fell.status, None -> "panicked" },
+          Some(fl) -> match search::ran_failure(fl) {
+            Some(fell) -> fell.status,
+            None -> "panicked",
+          },
         },
         settled: Some({
           test: j.test,
@@ -1930,7 +1935,9 @@ fn mutated(
           judged_mutant(p, m, every, asked));
         {
           ..r,
-          mutants: Some(tester.mutation[corpus](judged, len(queue.mutants) > options.mutate_budget)),
+          mutants: Some(
+            tester.mutation[corpus](judged, len(queue.mutants) > options.mutate_budget),
+          ),
         }
       }
     },
@@ -1953,15 +1960,19 @@ fn judged_mutant(
       );
       let statuses = flat_map(classes, |class: List<Int>|
         map(
-          ran_class(map(class, |i: Int| job_of(p, unit, i, [], asked.plan)), { ..asked, measuring: false }),
+          ran_class(map(class, |i: Int| job_of(p, unit, i, [], asked.plan)), {
+            ..asked,
+            measuring: false,
+          }),
           |d: Done| d.status,
         ));
       let expected = fold(classes, 0, |n: Int, class: List<Int>| n + len(class));
       let judged = |verdict: String, why: String| { id: m.id, verdict: verdict, why: why };
       if said(statuses, "failed") { judged("killed", "") }
       else if said(statuses, "panicked") { judged("unresolved", "Ply failed running the tests") }
-      else if len(filter(statuses, |w: String| w == "passed")) == expected { judged("survived", "") }
-      else { judged("unresolved", "not every test answered") }
+      else if len(filter(statuses, |w: String| w == "passed")) == expected {
+        judged("survived", "")
+      } else { judged("unresolved", "not every test answered") }
     },
   }
 
@@ -2888,4 +2899,30 @@ test "a binding that does not match the program is a start-up failure naming no 
     "Error[E0412]: a nondet effect in a det test",
     "   no host handler was bound (1 error)",
   ])
+}
+
+test "a seeded test searches the roots it still owes, and any other runs once" {
+  let p = a_program([a_case(0, "plain"), { ..a_case(1, "seeded"), seeded: true }]);
+  let searching = plan::random(4);
+  assert_eq(job_of(p, 0, 0, [], searching), { unit: 0, test: 0, search: None });
+  assert_eq(job_of(p, 0, 1, [], searching).search, Some(searching));
+  assert_eq(job_of(p, 2, 1, [{ index: 1, roots: [2, 3] }], searching), {
+    unit: 2,
+    test: 1,
+    search: Some({ ..searching, roots: [2u64, 3u64] }),
+  })
+}
+
+test "the search a seeded test is keyed on is the plan the flags name, and the document says it" {
+  let p = machine::sim_plan_of({
+    ..machine::no_sim_options(),
+    mode: "random",
+    roots: Some({ from: 0, to: 3 }),
+  });
+  assert_eq(search_of(p), { mode: "random", roots: [0, 1, 2], budget: 1, steps: 100000, path: [] });
+  let seeded = { ..machine::no_sim_options(), seed: Some("0x10:2") };
+  let doc = to_string(with_sim(object([]), sim_json(machine::sim_plan_of(seeded), seeded)));
+  assert(string_contains(doc, "\"seed\":\"16:2\""));
+  assert(string_contains(doc, "\"mode\":\"once\""));
+  assert(string_contains(doc, "\"roots\":[16]"))
 }
