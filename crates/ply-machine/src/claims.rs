@@ -1,16 +1,16 @@
 //! What `ply prove` and `ply review` load, discharge, review and accept, as the program in
 //! `crates/ply-cli/ply` performs it.
 //!
-//! The store and the prover stay here: discharging a claim enters compiled bodies, and an entry does
-//! not nest on the thread the `ply` program itself runs on. The obligations, the types they are
-//! written over and the search each one goes to are the program's (`proof.world`), handed over with
-//! the front end; which claims are asked for, the keys their evidence is read and filed under, what
-//! the review, the coverage and the baseline come to, every line and key of both reports and the
-//! code each run exits with are the program's too, in `crates/ply-cli/ply/claims.ply`, `prove.ply`
-//! and `review.ply`.
+//! The store and the prover's entries stay here: discharging a claim enters compiled bodies. The
+//! obligations, the types they are written over and the search each one goes to are the program's
+//! (`proof.world`), handed over with the front end; which claims are asked for, the keys their
+//! evidence is read and filed under, the evidence itself (`proof.evidence`, which the store holds as
+//! text it never reads), what the review, the coverage and the baseline come to, every line and key
+//! of both reports and the code each run exits with are the program's too, in
+//! `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
 
 use crate::config::Configuration;
-use crate::engine::{Judgement, Mode};
+use crate::engine::{Fault, Judgement, Mode, Obligation};
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, ctor, diags_value, places_value, record, strings};
@@ -19,7 +19,6 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes};
-use crate::engine::{Fault, Obligation};
 use ply_store::ReviewRecord;
 use ply_store::Store;
 use std::path::PathBuf;
@@ -40,13 +39,11 @@ const EFFECT: &str = "prover";
 /// refuses one this table does not list, and `every_marshalled_type_is_declared_where_this_side_says`
 /// holds every row to the program, because a tag that names no declaration is a placeless `no arm
 /// of this match matched` the moment the program matches the value.
-pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
-    (
-        "proof.obligation",
-        "Judged",
-        &["JHeld", "JFailed", "JRejected", "JRaised", "JFaulted"],
-    ),
-];
+pub const MARSHALLED: &[(&str, &str, &[&str])] = &[(
+    "proof.obligation",
+    "Judged",
+    &["JHeld", "JFailed", "JRejected", "JRaised", "JFaulted"],
+)];
 
 /// One case of a type this side marshals, under the name the program declares it by.
 fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
@@ -61,10 +58,9 @@ fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     ctor(home, name, args)
 }
 
-const OPERATIONS: [(&str, &str); 10] = [
+const OPERATIONS: [(&str, &str); 9] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
-    ("outcomes", "ply_machine::claims::outcomes"),
     ("prepared", "ply_machine::claims::prepared"),
     ("cached", "ply_machine::claims::cached"),
     ("judged", "ply_machine::claims::judged"),
@@ -614,7 +610,8 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                 let read = keys
                     .iter()
                     .map(|key| {
-                        let entry = DefHash::from_hex(key).and_then(|hash| store.obligation(hash))?;
+                        let entry =
+                            DefHash::from_hex(key).and_then(|hash| store.obligation(hash))?;
                         Some(entry.to_string())
                     })
                     .collect();
@@ -731,9 +728,10 @@ struct Judging {
 impl Judging {
     fn judged(&self, batch: &Batch) -> Vec<Judgement> {
         match (self.obligations.get(batch.claim), values_of(&batch.points)) {
-            (Some(obligation), Ok(values)) => self
-                .prover
-                .judged(obligation, self.step_budget, &values, batch.mode),
+            (Some(obligation), Ok(values)) => {
+                self.prover
+                    .judged(obligation, self.step_budget, &values, batch.mode)
+            }
             (None, _) => vec![Judgement::Faulted(no_such_claim(
                 batch.claim,
                 self.obligations.len(),
@@ -900,7 +898,6 @@ fn collection_value(collection: Collection) -> PlyValue {
         ("host", PlyValue::Bool(collection.host)),
     ])
 }
-
 
 /// The values a diagnostic's text names, which `std.value.filled` puts in place.
 fn shown_values(diagnostic: &Diagnostic) -> PlyValue {

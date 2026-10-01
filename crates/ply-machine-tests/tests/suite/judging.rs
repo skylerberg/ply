@@ -53,21 +53,11 @@ fn claim(owner: &str, kind: ObligationKind, binders: Vec<Binder>, guards: usize)
 }
 
 fn over_a_bool(owner: &str) -> Obligation {
-    claim(
-        owner,
-        ObligationKind::Law,
-        vec![binder("b", "Bool")],
-        0,
-    )
+    claim(owner, ObligationKind::Law, vec![binder("b", "Bool")], 0)
 }
 
 fn over_an_int(owner: &str, guards: usize) -> Obligation {
-    claim(
-        owner,
-        ObligationKind::Law,
-        vec![binder("n", "Int")],
-        guards,
-    )
+    claim(owner, ObligationKind::Law, vec![binder("n", "Int")], guards)
 }
 
 /// `capped`'s `ensures` clause `index`, under its one `requires`.
@@ -205,10 +195,7 @@ fn an_entry_the_tier_declines_is_plys_failure() {
     let mismatched = claim(
         "m.halving a choice",
         ObligationKind::Law,
-        vec![
-            binder("b", "Bool"),
-            binder("spare", "Bool"),
-        ],
+        vec![binder("b", "Bool"), binder("spare", "Bool")],
         0,
     );
     let judgements = judged(
