@@ -17,15 +17,16 @@ fn the_cli_tree_is_a_package() {
         vec![
             (
                 "cli".to_string(),
-                vec!["suite".to_string(), "proof".to_string()]
+                vec!["suite".to_string(), "sim".to_string(), "proof".to_string()]
             ),
             ("suite".to_string(), Vec::new()),
-            ("proof".to_string(), Vec::new()),
+            ("sim".to_string(), Vec::new()),
+            ("proof".to_string(), vec!["sim".to_string()]),
             ("std".to_string(), Vec::new()),
             ("compiler".to_string(), vec!["std".to_string()]),
         ],
-        "the CLI tree's ply.pkg names it the `cli` package, closed over the suite, the prove package \
-         and the two built-ins"
+        "the CLI tree's ply.pkg names it the `cli` package, closed over the suite, the search, the \
+         prove package and the two built-ins"
     );
 }
 
@@ -42,10 +43,11 @@ fn the_corpus_tree_is_a_package_over_the_cli() {
             ),
             (
                 "cli".to_string(),
-                vec!["suite".to_string(), "proof".to_string()]
+                vec!["suite".to_string(), "sim".to_string(), "proof".to_string()]
             ),
             ("suite".to_string(), Vec::new()),
-            ("proof".to_string(), Vec::new()),
+            ("proof".to_string(), vec!["sim".to_string()]),
+            ("sim".to_string(), Vec::new()),
             ("std".to_string(), Vec::new()),
             ("compiler".to_string(), vec!["std".to_string()]),
         ],
