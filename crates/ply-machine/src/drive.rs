@@ -136,7 +136,8 @@ impl Target {
             sources: err.sources,
             artifact: None,
         })?;
-        if front.is_some_and(|f| f.promises == crate::driver::Promises::Held) {
+        // The program that ran a front end it hands over checked its `reuse fn` promises with it.
+        if front.is_some() {
             return Ok(Target::Project(Box::new(loaded)));
         }
         match crate::costs::broken_promises(&loaded) {
@@ -618,7 +619,7 @@ fn evaluate(
         machine.set_declared_footprint(declared.clone());
     }
     // Exploration is a test-time activity; a run takes the one interleaving its seed names.
-    ply_test::sim::seed_run(&mut machine, seed, ply_eval::sim::DEFAULT_STEPS);
+    machine.set_seed(seed.clone(), ply_eval::sim::DEFAULT_STEPS);
     machine
         .call(call.name, call.args, span)
         .map(|answer| answer.map_err(|d| place_the_unplaced(d, call.name)))

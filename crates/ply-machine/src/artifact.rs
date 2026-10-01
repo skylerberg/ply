@@ -1254,11 +1254,7 @@ fn evaluate(
     if let Some(declared) = declared {
         machine.set_declared_footprint(declared.clone());
     }
-    ply_test::sim::seed_run(
-        &mut machine,
-        &ply_eval::Seed::default(),
-        ply_eval::sim::DEFAULT_STEPS,
-    );
+    machine.set_seed(ply_eval::Seed::default(), ply_eval::sim::DEFAULT_STEPS);
     machine.call(opened.entry.as_str(), Vec::new(), span)
 }
 

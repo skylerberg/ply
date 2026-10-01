@@ -5,27 +5,12 @@ use ply_eval::{
     CheckOutput, DefInfo, Diagnostic, Front, HashOutput, ModuleInfo, ModuleName, SourceId,
     SourceMap, Span, Symbol, TestInfo, codes,
 };
-use ply_store::ContentHash;
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
 
-/// Modification time and length: hashing every file on every poll is the cost this avoids.
-pub type Stamp = (Option<SystemTime>, u64);
-
-/// The stamp a path carries now; one no real file has when it cannot be stat'd.
-pub fn stamp_of(path: &Path) -> Stamp {
-    std::fs::metadata(path)
-        .map(|m| (m.modified().ok(), m.len()))
-        .unwrap_or((None, u64::MAX))
-}
-
-/// A file as this load found it: stamped before the read, then the bytes the read got — never a
-/// later look at the disk, which would fold a save made meanwhile into this load's baseline.
+/// A file this load read.
 #[derive(Clone, Debug)]
 pub struct Found {
     pub path: PathBuf,
-    pub stamp: Stamp,
-    pub content: ContentHash,
 }
 
 #[derive(Debug)]
