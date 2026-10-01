@@ -1,8 +1,8 @@
 //! The host boundary from the compiled tier: an unhandled `perform` reaches the context's binding
 //! through the machine's checks, in the machine's order.
 
-use crate::heap::{self, Word};
-use crate::rt::{Ctx, values_taken};
+use crate::heap::{self, Heap, Walked, Word};
+use crate::rt::Ctx;
 use ply_eval::handler::err_unhandled;
 use ply_eval::host::{
     HostAnswer, HostRequest, attribute, err_blocking_answered_inline, err_hermetic,
@@ -10,7 +10,7 @@ use ply_eval::host::{
 };
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{
-    Diagnostic, Span, Symbol, Unbound, carries_secret, check_host_answer, codes,
+    Diagnostic, Span, Symbol, Unbound, Value, carries_secret, check_host_answer, codes,
     err_footprint_escape, err_host_in_simulation, err_no_runtime, err_secret_to_host,
     err_unenumerated_atom,
 };
@@ -54,6 +54,41 @@ pub(crate) fn err_continuation_resumed(
         .note("the rule is conservative: it refuses when any at-most-once host operation happened after the capture, including in another task")
 }
 
+/// The arguments `effect.op` takes, each read as the operation's declaration types it and taken
+/// as [`crate::rt::values_taken`] takes them; `None` when one does not read.
+fn arguments(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]) -> Option<Vec<Value>> {
+    let declared = c.program.and_then(|program| {
+        let params = &program.check.effects.get(effect)?.ops.get(op)?.params;
+        Some((params.as_slice(), &program.ctor_carries))
+    });
+    let tables = std::rc::Rc::clone(&c.tables);
+    let mut walked = Walked::default();
+    let mut out = Vec::with_capacity(args.len());
+    for (i, w) in args.iter().enumerate() {
+        out.push(
+            match declared.and_then(|(params, ctors)| Some((params.get(i)?, ctors))) {
+                Some((carry, ctors)) => Heap::read(&tables.layouts, *w, carry, ctors, &mut walked),
+                None => Heap::to_value_counted(&tables.layouts, *w, &mut walked),
+            },
+        );
+        heap::dec(*w);
+    }
+    (!walked.unread).then_some(out)
+}
+
+#[cold]
+#[inline(never)]
+fn err_unread_argument(span: Span, operation: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!(
+            "an argument of `{operation}` holds a word its declared type does not say how to read"
+        ),
+    )
+    .primary(span, "performed here")
+    .note("this is Ply's fault, not the program's")
+}
+
 pub unsafe fn perform(
     ctx: *mut Ctx,
     effect: &Symbol,
@@ -63,8 +98,10 @@ pub unsafe fn perform(
 ) -> Word {
     let c = unsafe { &mut *ctx };
     let span = c.site();
-    let values = values_taken(c, args);
     let operation = operation_label(effect, op, resource);
+    let Some(values) = arguments(c, effect, op, args) else {
+        return c.fail(err_unread_argument(span, &operation));
+    };
     let binding = Arc::clone(&c.binding);
     let would = binding.would_serve(effect, op, resource);
     let resolved = binding.resolve(effect, op, resource);

@@ -153,6 +153,12 @@ fn the_shift_and_overflow_raises_are_the_same_on_both_engines() {
 }
 
 #[test]
+fn a_width_raises_at_its_type_through_every_binder_on_both_engines() {
+    check("widths_raise", false);
+    check("widths_raise", true);
+}
+
+#[test]
 fn the_byte_builtins_raises_are_the_same_on_both_engines() {
     check("bytes_raise", false);
     check("bytes_raise", true);

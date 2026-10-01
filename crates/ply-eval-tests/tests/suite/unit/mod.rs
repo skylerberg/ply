@@ -4,6 +4,7 @@
 mod arena;
 mod argv;
 mod builtins;
+mod carry;
 mod codec;
 mod compiled;
 mod cont;

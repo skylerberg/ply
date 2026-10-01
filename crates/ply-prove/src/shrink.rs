@@ -3,7 +3,7 @@
 use crate::property::{HARD_GEN_DEPTH, Ungeneratable, const_fn, fn_size};
 use crate::sort::Sort;
 use crate::world::World;
-use ply_eval::{Decimal, Fixed, IntTy, List, SECRET, Symbol, TASK_TYPE, Value};
+use ply_eval::{Decimal, Fixed, FixedOp, IntTy, List, SECRET, Symbol, TASK_TYPE, Value};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::BTreeMap;
@@ -23,11 +23,7 @@ pub fn size(value: &Value, world: &World) -> u64 {
     while let Some(v) = pending.pop() {
         let here = match v {
             Value::Int(n) => int_size(*n),
-            Value::Fixed(f) => int_size(
-                f.to_i128()
-                    .unwrap_or(i128::MAX)
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
-            ),
+            Value::Fixed(f) => fixed_size(*f),
             Value::Bool(b) => u64::from(*b),
             Value::Unit => 0,
             Value::Float(f) => float_size(*f),
@@ -97,6 +93,18 @@ fn int_size(n: i64) -> u64 {
     n.unsigned_abs()
         .saturating_mul(2)
         .saturating_add(u64::from(n < 0))
+}
+
+/// [`int_size`] over a width's value, which a `U64` or a 128-bit width can take past what an
+/// `Int` holds. Only a `U128` past `i128::MAX` has no `i128`, and those are at the ceiling anyway.
+fn fixed_size(f: Fixed) -> u64 {
+    f.to_i128().map_or(u64::MAX, |v| {
+        let size = v
+            .unsigned_abs()
+            .saturating_mul(2)
+            .saturating_add(u128::from(v < 0));
+        u64::try_from(size).unwrap_or(u64::MAX)
+    })
 }
 
 /// The smallest value of a type: the shrinker's floor.
@@ -180,6 +188,7 @@ fn candidates_at(value: &Value, sort: &Sort, world: &World, depth: u32) -> Vec<V
     }
     match (value, sort) {
         (Value::Int(n), _) => int_candidates(*n),
+        (Value::Fixed(f), _) => fixed_candidates(*f),
         (Value::Float(f), _) => float_candidates(*f),
         (Value::Decimal(d), _) => decimal_candidates(*d),
         (Value::Bool(true), _) => vec![Value::Bool(false)],
@@ -250,6 +259,28 @@ fn int_candidates(n: i64) -> Vec<Value> {
     out.retain(|c| *c != n);
     out.dedup();
     out.into_iter().map(Value::Int).collect()
+}
+
+/// [`int_candidates`] in the width's own arithmetic, so each candidate is a value of the type.
+fn fixed_candidates(f: Fixed) -> Vec<Value> {
+    if f.is_zero() {
+        return Vec::new();
+    }
+    let at = |v: i128| Fixed::of(f.ty, v).expect("0, 1 and 2 are values of every width");
+    let negative = f.value_cmp(at(0)).is_lt();
+    let mut out = vec![at(0)];
+    let mut half = f.checked(at(2), FixedOp::Div);
+    while let Some(h) = half.filter(|h| !h.is_zero()) {
+        out.push(h);
+        half = h.checked(at(2), FixedOp::Div);
+    }
+    out.extend(f.checked(at(1), if negative { FixedOp::Add } else { FixedOp::Sub }));
+    if negative {
+        out.extend(f.checked_neg());
+    }
+    out.retain(|c| *c != f);
+    out.dedup();
+    out.into_iter().map(Value::Fixed).collect()
 }
 
 fn float_candidates(f: f64) -> Vec<Value> {
