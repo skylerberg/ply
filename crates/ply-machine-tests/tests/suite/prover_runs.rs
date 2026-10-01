@@ -164,19 +164,29 @@ fn a_second_configuration_is_a_second_run_over_its_own_project() {
                 "the second run collected the first project"
             );
         }
-        let all = Value::list((0..laws).map(|i| Value::Int(i as i64)).collect());
-        // Nothing settled statically: each law is left to its strategy.
-        let undecided = (0..laws)
-            .map(|_| Value::ctor("proof.decide.Undecided", Vec::new()))
+        let warnings = ok(ask(&lent, "prepared", Vec::new()));
+        assert!(list(&warnings).is_empty(), "{warnings:?}");
+        // Each law judged where every binder is zero, which each of them holds at.
+        let batches = owed
+            .iter()
+            .enumerate()
+            .map(|(claim, (_, binders))| {
+                let zeros = binders
+                    .iter()
+                    .map(|_| Value::ctor("std.value.VInt", vec![Value::Int(0)]))
+                    .collect();
+                record(vec![
+                    ("claim", Value::Int(claim as i64)),
+                    ("points", Value::list(vec![Value::list(zeros)])),
+                    ("mode", Value::ctor("proof.property.MWhole", Vec::new())),
+                ])
+            })
             .collect();
-        let choice = record(vec![
-            ("claims", all.clone()),
-            ("runs", all),
-            ("read", Value::list(Vec::new())),
-            ("statics", Value::list(undecided)),
-        ]);
-        let verdicts = ok(ask(&lent, "discharged", vec![choice]));
-        let outcomes = field_of(&verdicts, "outcomes", Span::DUMMY).expect("the outcomes");
-        assert_eq!(list(outcomes).len(), laws);
+        let judged = ask(&lent, "judged", vec![Value::list(batches)]);
+        let held = Value::ctor("proof.obligation.JHeld", Vec::new());
+        assert_eq!(
+            list(&judged).iter().map(list).collect::<Vec<_>>(),
+            vec![vec![held]; laws]
+        );
     }
 }

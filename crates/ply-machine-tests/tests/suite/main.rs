@@ -7,11 +7,11 @@
 
 mod claims;
 mod fixture;
+mod judged_effect;
+mod judging;
 mod prover_runs;
-mod replay;
 mod reused;
 mod selector_reads;
-mod strategy;
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{Front, Machine, Provider, Span, Value};
