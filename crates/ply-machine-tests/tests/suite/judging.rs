@@ -3,12 +3,9 @@
 //! judgements come to, is `proof.property`'s, pinned by its own tests.
 
 use crate::fixture::{loaded, project};
-use ply_eval::{DefHash, Plain, Span, Symbol, Value, codes};
+use ply_eval::{DefHash, Seed, Span, Symbol, Value, codes};
 use ply_machine::engine::{Judgement, Mode, Prover};
-use ply_prove::concurrency::ValueDomain;
-use ply_prove::{
-    Binder, Discharge, Evidence, Gap, Obligation, ObligationKind, ProvePlan, Sort, Strategy,
-};
+use ply_prove::{Binder, Obligation, ObligationKind, ProvePlan, Sort, Strategy};
 
 const SOURCE: &str = r#"
 law "halving a choice" forall (b: Bool) { (if b { 4 } else { 6 }) / 2 > 1 }
@@ -22,6 +19,13 @@ law "past a hundred" forall (n: Int) where n > 100 { n > 0 }
 law "a guarded quotient" forall (n: Int) where 12 / n > 0 { true }
 
 law "a quotient past zero" forall (n: Int) where n != 0 { 12 / n != 99 }
+
+law "a region joins what it spawned" forall (b: Bool) {
+  simulate {
+    let t = task.spawn(|| if b { 1 } else { 2 });
+    task.join(t) > 0
+  }
+}
 
 fn capped(n: Int) -> Int
   requires n < 1000
@@ -84,7 +88,7 @@ fn capped(index: usize) -> Obligation {
     }
 }
 
-fn with_prover<R>(f: impl FnOnce(&Prover<'_>) -> R) -> R {
+fn with_prover<R>(f: impl FnOnce(&Prover) -> R) -> R {
     let dir = project(SOURCE);
     let loaded = loaded(dir.path());
     let backend =
@@ -253,54 +257,76 @@ fn a_hosted_claim_judged_with_no_host_bound_is_plys_failure() {
     );
 }
 
-/// The claim reaches no `simulate` region, so each point is one evaluation, and nothing it
-/// scheduled is a proof.
+/// A law that reaches no `simulate` region has no schedule: the run says so, and its body's verdict.
 #[test]
-fn a_law_over_interleavings_is_searched_at_each_point_it_is_handed() {
-    let searched = Obligation {
+fn a_run_that_reaches_no_region_is_unobserved_and_keeps_its_verdict() {
+    let law = Obligation {
         strategy: Strategy::Interleave,
         ..over_a_bool("m.halving a choice")
     };
-    let domain = ValueDomain::Enumerated {
-        domain: Symbol::new("Bool"),
-        points: 2,
-        kept: 2,
-    };
-    let discharge = with_prover(|prover| {
-        prover.searched(
-            &searched,
+    let run = with_prover(|prover| {
+        prover.interleaved(
+            &law,
             &ProvePlan::default(),
-            bools(&[true, false]),
-            domain,
+            &[Value::Bool(true)],
+            &Seed::at(0, Vec::new()),
+            64,
         )
     });
-    let Discharge::Held(Evidence::Cases(report)) = &discharge else {
-        panic!("a search that scheduled nothing proves nothing: {discharge:?}");
-    };
-    assert_eq!((report.generated, report.kept, report.rejected), (2, 2, 0));
-}
+    assert!(!run.observed);
+    assert!(run.interleaving.steps.is_empty());
+    assert!(run.verdict.is_none(), "{:?}", run.verdict);
 
-#[test]
-fn a_raise_in_an_interleaving_search_is_a_gap_at_its_point() {
-    let searched = Obligation {
+    let dividing = Obligation {
         strategy: Strategy::Interleave,
         ..over_a_bool("m.dividing by a choice")
     };
-    let domain = ValueDomain::Enumerated {
-        domain: Symbol::new("Bool"),
-        points: 2,
-        kept: 2,
-    };
-    let discharge = with_prover(|prover| {
-        prover.searched(
-            &searched,
+    let run = with_prover(|prover| {
+        prover.interleaved(
+            &dividing,
             &ProvePlan::default(),
-            bools(&[true, false]),
-            domain,
+            &[Value::Bool(false)],
+            &Seed::at(0, Vec::new()),
+            64,
         )
     });
-    let Discharge::Unattempted(Gap::Raised { bindings, .. }) = &discharge else {
-        panic!("the program's raise was reported as {discharge:?}");
+    assert_eq!(
+        shown(&[run.verdict.expect("the body raised")]),
+        [format!("raised {}", codes::RUNTIME_ERROR)]
+    );
+}
+
+/// A law over a region runs one schedule per call: the seed's, recorded step by step.
+#[test]
+fn a_run_under_a_seed_records_the_schedule_it_took() {
+    let law = Obligation {
+        strategy: Strategy::Interleave,
+        ..over_a_bool("m.a region joins what it spawned")
     };
-    assert_eq!(bindings[0].value, Plain::Bool(false), "{bindings:?}");
+    let run = with_prover(|prover| {
+        prover.interleaved(
+            &law,
+            &ProvePlan::default(),
+            &[Value::Bool(true)],
+            &Seed::at(3, Vec::new()),
+            64,
+        )
+    });
+    assert!(run.observed);
+    assert!(run.verdict.is_none(), "{:?}", run.verdict);
+    assert!(!run.interleaving.steps.is_empty());
+    for step in &run.interleaving.steps {
+        assert_eq!(step.enabled.get(usize::from(step.choice)), Some(&step.task));
+    }
+    // The same seed takes the same schedule.
+    let again = with_prover(|prover| {
+        prover.interleaved(
+            &law,
+            &ProvePlan::default(),
+            &[Value::Bool(true)],
+            &Seed::at(3, Vec::new()),
+            64,
+        )
+    });
+    assert_eq!(again.interleaving.steps, run.interleaving.steps);
 }

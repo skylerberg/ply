@@ -1,11 +1,12 @@
 //! A task performs against the handlers around its `task.spawn` as they stood at the spawn,
-//! whatever its spawner does before the task first runs. No access tells those orders apart, so
-//! the pruned search runs one of them; these run under the unpruned one `--measure-reduction` adds.
+//! whatever its spawner does before the task first runs. No access tells those orders apart, so a
+//! pruned search runs one of them; these run every order.
 
 use crate::fixture::Compiled;
-use ply_eval::explore::Step;
+use ply_eval::region::Step;
 use ply_eval::sched::ROOT;
-use ply_eval::{Plan, Seed, TaskId, measure_reduction};
+use ply_eval::sim::DEFAULT_STEPS;
+use ply_eval::{Seed, TaskId};
 
 const TESTS: &str = r#"
 effect ask {
@@ -52,26 +53,38 @@ test "the region unwinds before the task starts" { assert(abandoned(7) == 7) }
 
 const SPAWNED: TaskId = TaskId(1);
 
-/// The steps of every run of the test under the unpruned search, each of which passed.
+/// The steps of every order the test's region can run in, each of which passed: every other choice
+/// at every scheduling point past the ones a run was told to take is another order.
 #[track_caller]
 fn every_order(name: &str) -> Vec<Vec<Step>> {
     let compiled = Compiled::new(TESTS);
     let index = compiled.index_of(name);
     let mut machine = compiled.machine();
-    let plan = Plan::default();
     let mut runs = Vec::new();
-    let explored = measure_reduction(&plan, &mut |seed: &Seed| {
-        machine.set_seed(seed.clone(), plan.steps);
+    let mut pending: Vec<Vec<u16>> = vec![Vec::new()];
+    while let Some(path) = pending.pop() {
+        machine.set_seed(Seed::at(0, path.clone()), DEFAULT_STEPS);
         let outcome = machine.eval_test(index);
         let record = machine
             .simulated()
             .unwrap_or_else(|| panic!("`{name}` ran no region: {outcome:?}"));
-        runs.push(record.steps.clone());
-        record.interleaving(&outcome)
-    });
-    assert!(explored.passed(), "`{name}`: {:#?}", explored.diagnostic);
-    let naive = explored.exploration.naive.expect("the unpruned search ran");
-    assert!(!naive.bounded, "`{name}`: the unpruned search ran {naive}");
+        assert!(outcome.is_ok(), "`{name}` at {path:?}: {outcome:?}");
+        let steps = record.steps.clone();
+        for (at, step) in steps.iter().enumerate().skip(path.len()) {
+            for choice in 0..step.enabled.len() as u16 {
+                if choice != step.choice {
+                    let mut branch: Vec<u16> = steps[..at].iter().map(|s| s.choice).collect();
+                    branch.push(choice);
+                    pending.push(branch);
+                }
+            }
+        }
+        runs.push(steps);
+        assert!(
+            runs.len() <= 4096,
+            "`{name}` has more orders than a fixture should"
+        );
+    }
     runs
 }
 

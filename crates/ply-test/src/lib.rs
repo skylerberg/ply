@@ -1,17 +1,15 @@
-//! Running the tests the program chose, in the classes it chose, and filing each result under the
-//! keys it handed over.
+//! Running a test once, or one interleaving of it, on whichever thread asks, and filing what a run
+//! of the tests the program chose came to under the keys it handed over. Which tests run, in which
+//! classes, at once or not, and which interleavings a seeded test is searched at, is the program's.
 
 pub mod bisect;
 pub mod hybrid;
 pub mod obligation;
-pub mod region;
 pub mod sim;
 
-use ply_eval::explore::{Interleaving, explore, measure_reduction};
-use ply_eval::host::{HostBinding, HostRuntime};
+use ply_eval::host::{HostBinding, HostUse};
 use ply_eval::{
-    Arena, CheckOutput, DefHash, Diagnostic, Exploration, HashOutput, Machine, Plan, Race, Seed,
-    Symbol, TaskRegions, Value, codes,
+    CheckOutput, DefHash, Diagnostic, HashOutput, Interleaving, Machine, Seed, Span, Symbol, codes,
 };
 use ply_store::{Outcome, PassRecord, Store};
 use std::any::Any;
@@ -20,7 +18,6 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub use bisect::{
@@ -28,7 +25,6 @@ pub use bisect::{
     Trial, TrialOutcome, Unresolved, change_set,
 };
 pub use hybrid::{BodyHybrid, Mixture, Signature};
-pub use region::GroupRegion;
 pub use sim::{Record, SimSummary, is_seeded, record_under};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,8 +68,8 @@ impl Reason {
 }
 
 /// What a run decided, sent by the program that decided it. The runtime applies its own `--filter`
-/// and `--std` to it, executes exactly what is left of `runs`, schedules by `groups`, and writes a
-/// pass under the keys `filed` names for it.
+/// and `--std` to it, reports on exactly what is left of `runs` by `groups`, and writes a pass under
+/// the keys `filed` names for it.
 #[derive(Clone, Debug, Default)]
 pub struct Choice {
     /// Test indices to execute, ascending.
@@ -81,13 +77,8 @@ pub struct Choice {
     /// The reason for every test the keys row named, indexed by test index. The program decides for
     /// all of them, whether or not this run's filter will report on one.
     pub reasons: Vec<Reason>,
-    /// The roots a seeded test still owes, when the cache already answered some of the plan's.
-    pub narrowed: BTreeMap<usize, Vec<u64>>,
     /// Concurrency classes over `runs`, as the program coloured them.
     pub groups: Vec<Vec<usize>>,
-    /// Concurrency classes over every test the run reports on, for a pass that re-runs any of them
-    /// whatever the cache held: a mutant runs the tests that reach it. Empty unless one is asked for.
-    pub every: Vec<Vec<usize>>,
     /// Every key each running test's pass is written under. A test with none is never written.
     pub filed: BTreeMap<usize, Vec<DefHash>>,
 }
@@ -101,10 +92,6 @@ pub struct Selection {
     pub groups: Vec<Vec<usize>>,
     /// Indexed by test index, length `total`.
     pub reasons: Vec<Reason>,
-    /// The search this selection was made against; a seeded test's result is published under it.
-    pub plan: Plan,
-    /// What a seeded test still owes, when the cache already covers part of the plan.
-    pub narrowed: BTreeMap<usize, Plan>,
     /// Every key each running test's pass is written under.
     pub filed: BTreeMap<usize, Vec<DefHash>>,
     /// Test indices this run was never asked to decide: a test outside the root package, or a
@@ -115,26 +102,11 @@ pub struct Selection {
 impl Selection {
     /// The runtime's view of what the program decided. The evidence a cached test is reported with is
     /// always a pass — a stored failure is never `Cached` — so nothing here has to read the store.
-    pub fn chosen(choice: &Choice, check: &CheckOutput, plan: &Plan) -> Selection {
-        let plan = plan.clone().normalized();
+    pub fn chosen(choice: &Choice, check: &CheckOutput) -> Selection {
         let total = check.tests.len();
         let cached: Vec<(usize, Outcome)> = (0..total)
             .filter(|i| choice.reasons.get(*i) == Some(&Reason::Cached))
             .map(|i| (i, Outcome::Pass))
-            .collect();
-        let narrowed: BTreeMap<usize, Plan> = choice
-            .narrowed
-            .iter()
-            .map(|(&index, roots)| {
-                (
-                    index,
-                    Plan {
-                        roots: roots.clone(),
-                        ..plan.clone()
-                    }
-                    .normalized(),
-                )
-            })
             .collect();
         Selection {
             total,
@@ -142,16 +114,14 @@ impl Selection {
             to_run: choice.runs.clone(),
             groups: choice.groups.clone(),
             reasons: choice.reasons.clone(),
-            plan,
-            narrowed,
             filed: choice.filed.clone(),
             out_of_scope: BTreeSet::new(),
         }
     }
 
     /// The same selection over the tests a filter keeps. `--filter` cannot change which tests
-    /// conflict, so a class only loses members; a cached result or a narrowed plan for a test the
-    /// run does not report on goes with it.
+    /// conflict, so a class only loses members; a cached result for a test the run does not report
+    /// on goes with it.
     pub fn keep(&self, visible: &[usize]) -> Selection {
         let keeps = |i: &usize| visible.binary_search(i).is_ok();
         let mut out = self.clone();
@@ -164,18 +134,12 @@ impl Selection {
             .map(|class| class.iter().copied().filter(keeps).collect::<Vec<usize>>())
             .filter(|class| !class.is_empty())
             .collect();
-        out.narrowed.retain(|index, _| keeps(index));
         out.filed.retain(|index, _| keeps(index));
         out
     }
 
     pub fn reason(&self, index: usize) -> Option<Reason> {
         self.reasons.get(index).copied()
-    }
-
-    /// The run's plan, unless the cache already answered for some of this test's roots.
-    pub fn plan_for(&self, index: usize) -> &Plan {
-        self.narrowed.get(&index).unwrap_or(&self.plan)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -193,10 +157,73 @@ impl fmt::Debug for Selection {
             .field("to_run", &self.to_run)
             .field("groups", &self.groups)
             .field("reasons", &self.reasons)
-            .field("plan", &self.plan)
-            .field("narrowed", &self.narrowed)
             .field("filed", &self.filed)
             .finish()
+    }
+}
+
+/// What a search run beside the pruned one explored; `bounded` when a spent budget or a failure
+/// stopped it short of its frontier, so the count is a lower bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cost {
+    pub explored: u32,
+    pub bounded: bool,
+}
+
+impl fmt::Display for Cost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.bounded {
+            write!(f, ">= {}", self.explored)
+        } else {
+            write!(f, "{}", self.explored)
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RaceSite {
+    pub task: u64,
+    pub definition: Option<Symbol>,
+    pub access: String,
+    pub span: Span,
+}
+
+/// Two steps whose reordering at scheduling point `at` turned a pass into a failure.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Race {
+    pub left: RaceSite,
+    pub right: RaceSite,
+    pub at: u32,
+}
+
+/// What a seeded test's search ran, as the program that searched it reports it.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Searched {
+    pub explored: u32,
+    /// Every interleaving ran, up to reordering steps that do not conflict.
+    pub exhaustive: bool,
+    /// The budget was spent.
+    pub exhausted: bool,
+    /// `--measure-reduction` only: the same search with every pair of steps dependent.
+    pub naive: Option<Cost>,
+    /// `--measure-reduction` only: the same search with every step's vector clock withheld.
+    pub blind: Option<Cost>,
+    pub steps: u64,
+    /// Nanoseconds of virtual time the last interleaving consumed.
+    pub virtual_time: i64,
+    pub failure: Option<Seed>,
+    pub race: Option<Race>,
+}
+
+impl Searched {
+    /// How many times more an unpruned search would have run.
+    pub fn reduction(&self) -> Option<f64> {
+        let naive = self.naive?;
+        (self.explored > 0).then(|| f64::from(naive.explored) / f64::from(self.explored))
+    }
+
+    pub fn is_cacheable(&self) -> bool {
+        self.failure.is_none() && !self.exhausted
     }
 }
 
@@ -220,7 +247,7 @@ pub struct TestResult {
     pub duration: Duration,
     pub status: Status,
     pub failure: Option<Diagnostic>,
-    pub simulation: Option<Exploration>,
+    pub simulation: Option<Searched>,
     /// Absent when nothing was written: a spent budget or an unobserved search proved nothing.
     pub recorded: Option<Record>,
     pub backend: Option<BackendUse>,
@@ -280,113 +307,35 @@ impl RunReport {
     }
 }
 
-pub trait Executor: Sync {
-    type Worker;
-
-    /// Refused when nothing can run a test here: each test that worker would have run fails with
-    /// the refusal.
-    fn worker(&self) -> Result<Self::Worker, Diagnostic>;
-
-    fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic>;
-
-    /// What the search the last [`Executor::execute`] performed did.
-    fn exploration(&self, _worker: &Self::Worker) -> Option<Exploration> {
-        None
-    }
-
-    fn host_use(&self, _worker: &Self::Worker) -> Option<ply_eval::host::HostUse> {
-        None
-    }
-
-    fn backend_use(&self, _worker: &Self::Worker) -> Option<BackendUse> {
-        None
-    }
-
-    /// The operations the last [`Executor::execute`] performed.
-    fn performs(&self, _worker: &Self::Worker) -> u64 {
-        0
-    }
-
-    /// What the host runtime reported while closing the entry point; forgotten once read.
-    fn teardown(&self, _worker: &mut Self::Worker) -> Vec<Diagnostic> {
-        Vec::new()
-    }
-}
-
-/// The search each test runs, and whether to measure what a less pruned one would have cost.
-#[derive(Clone, Debug, Default)]
-pub struct Search {
-    pub plan: Plan,
-    pub narrowed: BTreeMap<usize, Plan>,
-    /// Re-run the search with every vector clock withheld and with dependence forced to `true`.
-    pub measure_reduction: bool,
-}
-
-impl Search {
-    pub fn of(selection: &Selection) -> Search {
-        Search {
-            plan: selection.plan.clone(),
-            narrowed: selection.narrowed.clone(),
-            measure_reduction: false,
-        }
-    }
-
-    pub fn measuring(mut self, measure: bool) -> Search {
-        self.measure_reduction = measure;
-        self
-    }
-
-    pub fn plan_for(&self, index: usize) -> &Plan {
-        self.narrowed.get(&index).unwrap_or(&self.plan)
-    }
-}
-
-#[derive(Default)]
-pub struct Hosting<'a> {
+#[derive(Default, Clone)]
+pub struct Hosting {
     binding: Option<Arc<HostBinding>>,
-    /// A factory: a runtime handle belongs to one thread, and the runner has a machine per worker.
-    runtime: Option<&'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync)>,
+    /// A factory: a runtime handle belongs to one thread, and a test runs on whichever asks.
+    runtime: Option<ply_eval::RuntimeFactory>,
 }
 
-impl<'a> Hosting<'a> {
-    pub fn hermetic() -> Hosting<'a> {
+impl Hosting {
+    pub fn hermetic() -> Hosting {
         Hosting::default()
     }
 
-    pub fn with_binding(mut self, binding: Arc<HostBinding>) -> Hosting<'a> {
+    pub fn with_binding(mut self, binding: Arc<HostBinding>) -> Hosting {
         self.binding = Some(binding);
         self
     }
 
     /// What a [`ply_eval::host::HostAnswer::Pending`] is polled on.
-    pub fn with_runtime(
-        mut self,
-        runtime: &'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync),
-    ) -> Hosting<'a> {
+    pub fn with_runtime(mut self, runtime: ply_eval::RuntimeFactory) -> Hosting {
         self.runtime = Some(runtime);
         self
     }
 }
 
+/// What a test runs on: the program, the unit built from it, and the host it may reach.
 pub struct InterpExecutor<'a> {
     front: &'a ply_eval::Front,
-    fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
-    hosts: Hosting<'a>,
-    /// The unit every worker attaches the tier its machines run on from.
+    hosts: Hosting,
     provider: &'static dyn ply_eval::Provider,
-    search: Search,
-}
-
-pub struct Worker<'a> {
-    pub machine: Box<Machine<'a>>,
-    exploration: Option<Exploration>,
-    host: Option<ply_eval::host::HostUse>,
-    /// The region this worker's tests run in, built once and mutated in place.
-    region: GroupRegion,
-    /// Attached once and installed on every machine the worker builds, per-interleaving ones too.
-    tier: Rc<dyn ply_eval::Compiled>,
-    backend_use: Option<BackendUse>,
-    performs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -397,56 +346,6 @@ pub struct BackendUse {
     pub declines: u64,
 }
 
-impl<'a> Worker<'a> {
-    fn in_region(
-        machine: Box<Machine<'a>>,
-        tier: Rc<dyn ply_eval::Compiled>,
-        region: GroupRegion,
-    ) -> Worker<'a> {
-        Worker {
-            machine,
-            exploration: None,
-            host: None,
-            region,
-            tier,
-            backend_use: None,
-            performs: 0,
-        }
-    }
-
-    /// The fixture, plus every write the tests run so far made to it.
-    pub fn region(&self) -> &GroupRegion {
-        &self.region
-    }
-
-    fn open_region(&mut self) {
-        if self.region.is_empty() {
-            return;
-        }
-        self.machine.set_regions(self.region.open().0);
-    }
-
-    /// Returns the test's own slots to the store and carries its fixture writes here.
-    fn close_region(&mut self) {
-        if self.region.is_empty() {
-            return;
-        }
-        let m = &self.machine;
-        self.region.close(m.cells());
-    }
-
-    /// The cells of the machine whose verdict is reported.
-    pub fn cells_mut(&mut self) -> &mut Arena {
-        let m = &mut self.machine;
-        m.cells_mut()
-    }
-
-    pub fn cells(&self) -> &Arena {
-        let m = &self.machine;
-        m.cells()
-    }
-}
-
 impl<'a> InterpExecutor<'a> {
     /// Every test runs on a tier attached from `provider`, the unit built from `front`.
     pub fn new(
@@ -455,45 +354,43 @@ impl<'a> InterpExecutor<'a> {
     ) -> InterpExecutor<'a> {
         InterpExecutor {
             front,
-            fixture: None,
             hosts: Hosting::hermetic(),
             provider,
-            search: Search::default(),
         }
     }
 
-    pub fn with_fixture(mut self, fixture: &'a (dyn Fn(&mut TaskRegions) -> Value + Sync)) -> Self {
-        self.fixture = Some(fixture);
-        self
-    }
-
-    pub fn with_hosts(mut self, hosts: Hosting<'a>) -> Self {
+    pub fn with_hosts(mut self, hosts: Hosting) -> Self {
         self.hosts = hosts;
         self
     }
 
-    pub fn with_search(mut self, search: Search) -> Self {
-        self.search = search;
-        self
-    }
-
-    /// The region this worker's group runs in, built on the worker's own thread.
-    fn build_region(&self) -> GroupRegion {
-        match self.fixture {
-            Some(build) => GroupRegion::build(build),
-            None => GroupRegion::empty(),
+    /// The tier this thread runs the unit on, attached once per thread: a test is a fresh machine
+    /// over it, never a fresh attachment.
+    fn tier(&self) -> Rc<dyn ply_eval::Compiled> {
+        thread_local! {
+            static ATTACHED: std::cell::RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
+        let key = std::ptr::from_ref(self.provider).cast::<()>() as usize;
+        ATTACHED.with(|attached| {
+            if let Some((_, tier)) = attached.borrow().iter().find(|(k, _)| *k == key) {
+                return Rc::clone(tier);
+            }
+            let tier = self.provider.attach();
+            attached.borrow_mut().push((key, Rc::clone(&tier)));
+            tier
+        })
     }
 
-    fn machine(&self, tier: Rc<dyn ply_eval::Compiled>) -> Result<Box<Machine<'a>>, Diagnostic> {
-        let mut machine = Machine::new(self.front, tier)?;
+    fn machine(&self) -> Result<Machine<'a>, Diagnostic> {
+        let mut machine = Machine::new(self.front, self.tier())?;
         if let Some(binding) = &self.hosts.binding {
             machine.set_host_binding(Arc::clone(binding));
         }
-        if let Some(runtime) = self.hosts.runtime {
-            machine.set_host_runtime(runtime());
+        if let Some(runtime) = &self.hosts.runtime {
+            machine.set_host_runtime(Arc::clone(runtime));
         }
-        Ok(Box::new(machine))
+        Ok(machine)
     }
 
     /// States this entry point's footprint claim, so a host answer outside it is `E0427`.
@@ -502,166 +399,248 @@ impl<'a> InterpExecutor<'a> {
             machine.set_declared_footprint(test.footprint.clone());
         }
     }
-
-    /// Whether this test's outcome depends on a seed, and so is searched rather than run.
-    fn searches(&self, index: usize) -> bool {
-        self.front
-            .check
-            .tests
-            .get(index)
-            .is_some_and(|t| is_seeded(&t.footprint))
-    }
-
-    /// The whole test, once per interleaving, each opening the group's region as the test found it.
-    #[allow(clippy::type_complexity)]
-    fn search(
-        &self,
-        worker: &Worker<'a>,
-        index: usize,
-    ) -> (
-        Result<(), Diagnostic>,
-        Option<Exploration>,
-        Option<ply_eval::host::HostUse>,
-        Option<BackendUse>,
-        u64,
-    ) {
-        let plan = self.search.plan_for(index);
-        // A search re-runs the whole test, so any host operation runs once per interleaving.
-        let re_executed = plan.re_executes() || self.search.measure_reduction;
-        let mut observed = true;
-        // Every interleaving's, unioned.
-        let mut host: Option<ply_eval::host::HostUse> = None;
-        // Every interleaving's, summed.
-        let mut used: Option<BackendUse> = None;
-        let mut performs = 0u64;
-        let region = &worker.region;
-        let tier = &worker.tier;
-        let mut interleaving = |seed: &Seed| {
-            let mut machine = match self.machine(Rc::clone(tier)) {
-                Ok(machine) => machine,
-                Err(refused) => {
-                    observed = false;
-                    return Interleaving::failed(Vec::new(), refused);
-                }
-            };
-            if !region.is_empty() {
-                machine.set_regions(region.open().0);
-            }
-            self.arm_footprint_check(machine.as_mut(), index);
-            machine.set_re_executed(re_executed);
-            sim::seed_run(machine.as_mut(), seed, plan.steps);
-            let outcome = machine.eval_test(index);
-            performs = performs.saturating_add(machine.trace().performs());
-            if let Some(reached) = machine.host_use() {
-                let into = host.get_or_insert_with(Default::default);
-                into.atoms = into.atoms.union(&reached.atoms);
-                into.operations = into.operations.saturating_add(reached.operations);
-            }
-            let (entries, declines) = machine.compiled_counts();
-            let into = used.get_or_insert_with(Default::default);
-            into.entries = into.entries.saturating_add(entries);
-            into.declines = into.declines.saturating_add(declines);
-            match sim::interleaving_of(machine.as_ref(), &outcome) {
-                Some(interleaving) => interleaving,
-                None => {
-                    observed = false;
-                    match outcome {
-                        Ok(()) => Interleaving::passed(Vec::new()),
-                        Err(diagnostic) => Interleaving::failed(Vec::new(), diagnostic),
-                    }
-                }
-            }
-        };
-
-        let explored = if self.search.measure_reduction {
-            measure_reduction(plan, &mut interleaving)
-        } else {
-            explore(plan, &mut interleaving)
-        };
-        let outcome = match explored.diagnostic {
-            Some(diagnostic) => Err(diagnostic),
-            None => Ok(()),
-        };
-        (
-            outcome,
-            observed.then_some(explored.exploration),
-            host,
-            used,
-            performs,
-        )
-    }
 }
 
-impl<'a> Executor for InterpExecutor<'a> {
-    type Worker = Worker<'a>;
+/// What running one test, or settling one search, came to.
+#[derive(Clone, Debug)]
+pub struct Executed {
+    pub index: usize,
+    pub duration: Duration,
+    pub failure: Option<Diagnostic>,
+    /// Ply unwound rather than the program failing.
+    pub panicked: bool,
+    pub searched: Option<Searched>,
+    /// The roots a seeded test's search started from.
+    pub seeds: usize,
+    /// What this test reached across the boundary, which decides whether its pass may be written.
+    pub host: Option<HostUse>,
+    pub teardown: Vec<Diagnostic>,
+    pub backend: Option<BackendUse>,
+    pub performs: u64,
+}
 
-    fn worker(&self) -> Result<Worker<'a>, Diagnostic> {
-        let tier = self.provider.attach();
-        let machine = self.machine(Rc::clone(&tier))?;
-        let mut worker = Worker::in_region(machine, tier, self.build_region());
-        // So the worker holds the group's region from creation, not only from its first test.
-        worker.open_region();
-        Ok(worker)
+/// What one machine's entry came to, before it is anyone's report.
+struct Entered {
+    outcome: Result<(), Diagnostic>,
+    interleaving: Option<Interleaving>,
+    performs: u64,
+    host: Option<HostUse>,
+    backend: BackendUse,
+    teardown: Vec<Diagnostic>,
+}
+
+fn entered<'a>(
+    executor: &InterpExecutor<'a>,
+    index: usize,
+    seeded: Option<(&Seed, u32, bool)>,
+) -> Result<Entered, Diagnostic> {
+    let mut machine = executor.machine()?;
+    executor.arm_footprint_check(&mut machine, index);
+    if let Some((seed, steps, re_executed)) = seeded {
+        machine.set_re_executed(re_executed);
+        sim::seed_run(&mut machine, seed, steps);
     }
+    let outcome = machine.eval_test(index);
+    let (entries, declines) = machine.compiled_counts();
+    let mut teardown = ply_eval::rc::take_cycles();
+    teardown.extend(machine.take_teardown_warnings());
+    Ok(Entered {
+        interleaving: seeded.and_then(|_| sim::interleaving_of(&machine, &outcome)),
+        outcome,
+        performs: machine.trace().performs(),
+        host: machine.host_use().cloned(),
+        backend: BackendUse { entries, declines },
+        teardown,
+    })
+}
 
-    fn exploration(&self, worker: &Worker<'a>) -> Option<Exploration> {
-        worker.exploration.clone()
-    }
-
-    fn host_use(&self, worker: &Worker<'a>) -> Option<ply_eval::host::HostUse> {
-        worker.host.clone()
-    }
-
-    fn backend_use(&self, worker: &Worker<'a>) -> Option<BackendUse> {
-        worker.backend_use
-    }
-
-    fn performs(&self, worker: &Worker<'a>) -> u64 {
-        worker.performs
-    }
-
-    fn teardown(&self, worker: &mut Worker<'a>) -> Vec<Diagnostic> {
-        let mut out = ply_eval::rc::take_cycles();
-        let m = &mut worker.machine;
-        out.extend(m.take_teardown_warnings());
-        out
-    }
-
-    fn execute(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
-        worker.exploration = None;
-        worker.host = None;
-        // Cumulative over the machine's life, so this test's own is the difference.
-        let (e0, d0) = worker.machine.compiled_counts();
-        worker.backend_use = None;
-        if self.searches(index) {
-            let (outcome, exploration, host, searched, performs) = self.search(worker, index);
-            worker.exploration = exploration;
-            worker.host = host;
-            // The worker's counters never moved; the search reports its own.
-            worker.backend_use = searched;
-            worker.performs = performs;
-            return outcome;
+/// One test run once on this thread, as a test with no `simulate` region in its closure runs.
+pub fn executed(executor: &InterpExecutor<'_>, check: &CheckOutput, index: usize) -> Executed {
+    contained(check, index, || {
+        let started = Instant::now();
+        match entered(executor, index, None) {
+            Ok(e) => Executed {
+                index,
+                duration: started.elapsed(),
+                failure: e.outcome.err(),
+                panicked: false,
+                searched: None,
+                seeds: 0,
+                host: e.host,
+                teardown: e.teardown,
+                backend: Some(e.backend),
+                performs: e.performs,
+            },
+            Err(refused) => Executed::refused(index, refused),
         }
-        worker.open_region();
-        let outcome = self.execute_directly(worker, index);
-        worker.performs = worker.machine.trace().performs();
-        let (e1, d1) = worker.machine.compiled_counts();
-        worker.backend_use = Some(BackendUse {
-            entries: e1.saturating_sub(e0),
-            declines: d1.saturating_sub(d0),
-        });
-        worker.host = worker.machine.host_use().cloned();
-        // A failing test still closes its region so the next test does not inherit it.
-        worker.close_region();
-        outcome
+    })
+}
+
+/// `run` on this thread, an unwind out of it reported as Ply's defect at the test's source.
+pub fn contained(check: &CheckOutput, index: usize, run: impl FnOnce() -> Executed) -> Executed {
+    let started = Instant::now();
+    match catch_unwind(AssertUnwindSafe(run)) {
+        Ok(executed) => executed,
+        Err(payload) => Executed {
+            panicked: true,
+            duration: started.elapsed(),
+            ..Executed::refused(index, panic_diagnostic(payload, check, index))
+        },
     }
 }
 
-impl<'a> InterpExecutor<'a> {
-    fn execute_directly(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
-        let m = &mut worker.machine;
-        self.arm_footprint_check(m.as_mut(), index);
-        m.eval_test(index)
+/// One interleaving of a seeded test, the one `seed` names, on this thread.
+pub struct Interleaved {
+    pub interleaving: Interleaving,
+    /// The test entered a `simulate` region, and so had a schedule to vary.
+    pub observed: bool,
+    pub panicked: bool,
+    pub duration: Duration,
+    pub host: Option<HostUse>,
+    pub backend: BackendUse,
+    pub performs: u64,
+    pub teardown: Vec<Diagnostic>,
+}
+
+pub fn interleaved(
+    executor: &InterpExecutor<'_>,
+    check: &CheckOutput,
+    index: usize,
+    seed: &Seed,
+    steps: u32,
+    re_executed: bool,
+) -> Interleaved {
+    let started = Instant::now();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        entered(executor, index, Some((seed, steps, re_executed)))
+    }));
+    let duration = started.elapsed();
+    let failed = |diagnostic: Diagnostic, panicked: bool| Interleaved {
+        panicked,
+        duration,
+        ..Interleaved::refused(diagnostic)
+    };
+    match result {
+        Ok(Ok(e)) => Interleaved {
+            observed: e.interleaving.is_some(),
+            interleaving: match e.interleaving {
+                Some(interleaving) => interleaving,
+                None => match e.outcome {
+                    Ok(()) => Interleaving::passed(Vec::new()),
+                    Err(diagnostic) => Interleaving::failed(Vec::new(), diagnostic),
+                },
+            },
+            panicked: false,
+            duration,
+            host: e.host,
+            backend: e.backend,
+            performs: e.performs,
+            teardown: e.teardown,
+        },
+        Ok(Err(refused)) => failed(refused, false),
+        Err(payload) => failed(panic_diagnostic(payload, check, index), true),
+    }
+}
+
+/// What a seeded test's interleavings came to as each one ran: what they reached and cost between
+/// them, and each failing one's diagnostic, held by the order it failed in.
+#[derive(Default)]
+pub struct Interleavings {
+    failures: Vec<Diagnostic>,
+    /// Some interleaving never entered a `simulate` region, so it had no schedule to vary.
+    unobserved: bool,
+    panicked: bool,
+    duration: Duration,
+    host: Option<HostUse>,
+    backend: BackendUse,
+    performs: u64,
+    teardown: Vec<Diagnostic>,
+}
+
+impl Interleavings {
+    /// Folds one more in, answering the id a failing one's diagnostic is held under.
+    pub fn add(&mut self, run: &Interleaved) -> Option<usize> {
+        self.unobserved |= !run.observed;
+        self.panicked |= run.panicked;
+        self.duration += run.duration;
+        if let Some(reached) = &run.host {
+            let into = self.host.get_or_insert_with(Default::default);
+            into.atoms = into.atoms.union(&reached.atoms);
+            into.operations = into.operations.saturating_add(reached.operations);
+        }
+        self.backend.entries = self.backend.entries.saturating_add(run.backend.entries);
+        self.backend.declines = self.backend.declines.saturating_add(run.backend.declines);
+        self.performs = self.performs.saturating_add(run.performs);
+        self.teardown.extend(run.teardown.iter().cloned());
+        match &run.interleaving.verdict {
+            ply_eval::Verdict::Failed(diagnostic) => {
+                self.failures.push(diagnostic.clone());
+                Some(self.failures.len() - 1)
+            }
+            ply_eval::Verdict::Passed => None,
+        }
+    }
+
+    /// Each failing interleaving's diagnostic, by its id.
+    pub fn held(&self) -> &[Diagnostic] {
+        &self.failures
+    }
+
+    /// The test's result once the search that ran these settled on `searched`, stopping at
+    /// `failure` if it stopped at one, from `seeds` roots. An unobserved search is no search.
+    pub fn settled(
+        self,
+        index: usize,
+        searched: Searched,
+        failure: Option<Diagnostic>,
+        seeds: usize,
+    ) -> Executed {
+        Executed {
+            index,
+            duration: self.duration,
+            failure,
+            panicked: self.panicked,
+            searched: (!self.unobserved).then_some(searched),
+            seeds,
+            host: self.host,
+            teardown: self.teardown,
+            backend: Some(self.backend),
+            performs: self.performs,
+        }
+    }
+}
+
+impl Interleaved {
+    /// An interleaving nothing could run: only the refusal is known.
+    pub fn refused(refusal: Diagnostic) -> Interleaved {
+        Interleaved {
+            interleaving: Interleaving::failed(Vec::new(), refusal),
+            observed: false,
+            panicked: false,
+            duration: Duration::ZERO,
+            host: None,
+            backend: BackendUse::default(),
+            performs: 0,
+            teardown: Vec::new(),
+        }
+    }
+}
+
+impl Executed {
+    /// A test nothing could run: only the refusal is known.
+    pub fn refused(index: usize, refusal: Diagnostic) -> Executed {
+        Executed {
+            index,
+            duration: Duration::ZERO,
+            failure: Some(refusal),
+            panicked: false,
+            searched: None,
+            seeds: 0,
+            host: None,
+            teardown: Vec::new(),
+            backend: None,
+            performs: 0,
+        }
     }
 }
 
@@ -756,17 +735,26 @@ pub fn diagnose_failures(
     Hybrids { fresh, per_failure }
 }
 
-pub fn run_with<E: Executor>(
+/// What the program's run came to, in test order, filed under the keys it named: what a run prints,
+/// written into the store as the report is assembled. `duration` is the run's wall clock.
+pub fn concluded(
     selection: &Selection,
     check: &CheckOutput,
     hashes: &HashOutput,
     store: &mut Store,
-    executor: &E,
+    mut ran: Vec<Executed>,
+    duration: Duration,
 ) -> RunReport {
-    let started = Instant::now();
     let mut warnings = Vec::new();
-
     let changed = changed_definitions(hashes, store);
+    ran.sort_by_key(|e| e.index);
+    let seeds: BTreeMap<usize, usize> = ran.iter().map(|e| (e.index, e.seeds)).collect();
+    let group_of: BTreeMap<usize, usize> = selection
+        .groups
+        .iter()
+        .enumerate()
+        .flat_map(|(g, class)| class.iter().map(move |&i| (i, g)))
+        .collect();
 
     let mut results: Vec<TestResult> = Vec::new();
     let mut failures = Vec::new();
@@ -774,109 +762,102 @@ pub fn run_with<E: Executor>(
     let mut failed = 0usize;
     let mut abandoned = 0usize;
 
-    for (group_index, group) in schedule_of(selection, &mut warnings).iter().enumerate() {
-        let mut live = Vec::with_capacity(group.len());
-        for &index in group {
-            if index < check.tests.len() {
-                live.push(index);
-            } else {
-                warnings.push(
-                    Diagnostic::warning(
-                        codes::INTERNAL_ERROR,
-                        format!(
-                            "selection names test {index}, but the module defines {}",
-                            check.tests.len()
-                        ),
-                    )
-                    .note(
-                        "the choice was made against another program; the stale index was skipped",
+    for executed in ran {
+        let index = executed.index;
+        let Some(test) = check.tests.get(index) else {
+            warnings.push(
+                Diagnostic::warning(
+                    codes::INTERNAL_ERROR,
+                    format!(
+                        "a run named test {index}, but the module defines {}",
+                        check.tests.len()
                     ),
-                );
-            }
-        }
+                )
+                .note("the choice was made against another program; the stale index was skipped"),
+            );
+            continue;
+        };
+        warnings.extend(executed.teardown);
+        let hash = test_hash(hashes, index);
+        let seeded = is_seeded(&test.footprint);
+        let host_backed = executed.host.is_some();
+        let abandoned_run = executed.failure.as_ref().is_some_and(is_abandoned);
+        let defect = executed
+            .failure
+            .as_ref()
+            .is_some_and(|d| executed.panicked || codes::is_defect(d.code));
+        let status = match (&executed.failure, defect) {
+            (None, _) => Status::Passed,
+            (Some(_), _) if abandoned_run => Status::Abandoned,
+            (Some(_), false) => Status::Failed,
+            (Some(_), true) => Status::Panicked,
+        };
+        let searched = executed.searched;
+        let mut recorded = None;
 
-        for executed in execute_group(executor, &live, check) {
-            let index = executed.index;
-            warnings.extend(executed.teardown);
-            let test = &check.tests[index];
-            let hash = test_hash(hashes, index);
-            let seeded = is_seeded(&test.footprint);
-            let host_backed = executed.host.is_some();
-            let abandoned_run = executed.failure.as_ref().is_some_and(is_abandoned);
-            let defect = executed
-                .failure
-                .as_ref()
-                .is_some_and(|d| executed.panicked || codes::is_defect(d.code));
-            let status = match (&executed.failure, defect) {
-                (None, _) => Status::Passed,
-                (Some(_), _) if abandoned_run => Status::Abandoned,
-                (Some(_), false) => Status::Failed,
-                (Some(_), true) => Status::Panicked,
-            };
-            let exploration = executed.exploration;
-            let mut recorded = None;
-
-            if abandoned_run {
-                // The clock is a fact about this machine: no verdict, no suspects, nothing stored.
-                abandoned += 1;
-            } else if let Some(diagnostic) = &executed.failure {
-                failed += 1;
-                failures.push(Failure {
-                    name: test.name.clone(),
-                    key: test.key.clone(),
-                    diagnostic: diagnostic.clone(),
-                    defect,
-                    host: host_backed,
-                    suspects: suspects_for(hashes, &test.key, &changed),
-                    seed: exploration.as_ref().and_then(|e| e.failure.clone()),
-                    race: exploration.as_ref().and_then(|e| e.race.clone()),
-                });
-            } else if executed.host.is_some() {
-                // This run reached a socket: its green verdict is about that moment only.
-                passed += 1;
-                recorded = Some(Record::Host);
-            } else {
-                passed += 1;
-                if let Some(filed) = selection.filed.get(&index) {
-                    let record = record_under(filed, seeded, exploration.as_ref());
-                    if record == Record::Unobserved {
-                        warnings.push(unobserved_search(&test.key));
-                    }
-                    for key in record.keys() {
-                        store.put(*key, Outcome::Pass);
-                    }
-                    // Only the evaluator writes the name-keyed baseline.
-                    if record.is_written()
-                        && let Some(hash) = hash
-                    {
-                        let (closure, decls) = closure_hashes(hashes, &test.key);
-                        store.put_pass_record(
-                            test.key.clone(),
-                            PassRecord {
-                                test_hash: hash,
-                                closure,
-                                decls,
-                            },
-                        );
-                    }
-                    recorded = Some(record);
-                }
-            }
-
-            results.push(TestResult {
-                index,
+        if abandoned_run {
+            // The clock is a fact about this machine: no verdict, no suspects, nothing stored.
+            abandoned += 1;
+        } else if let Some(diagnostic) = &executed.failure {
+            failed += 1;
+            failures.push(Failure {
                 name: test.name.clone(),
-                hash,
-                group: group_index,
-                duration: executed.duration,
-                status,
-                failure: executed.failure,
-                simulation: exploration,
-                recorded,
-                backend: executed.backend,
-                performs: executed.performs,
+                key: test.key.clone(),
+                diagnostic: diagnostic.clone(),
+                defect,
+                host: host_backed,
+                suspects: suspects_for(hashes, &test.key, &changed),
+                seed: searched.as_ref().and_then(|e| e.failure.clone()),
+                race: searched.as_ref().and_then(|e| e.race.clone()),
             });
+        } else if executed.host.is_some() {
+            // This run reached a socket: its green verdict is about that moment only.
+            passed += 1;
+            recorded = Some(Record::Host);
+        } else {
+            passed += 1;
+            if let Some(filed) = selection.filed.get(&index) {
+                let record = record_under(filed, seeded, searched.as_ref());
+                if record == Record::Unobserved {
+                    warnings.push(unobserved_search(&test.key));
+                }
+                for key in record.keys() {
+                    store.put(*key, Outcome::Pass);
+                }
+                // Only the evaluator writes the name-keyed baseline.
+                if record.is_written()
+                    && let Some(hash) = hash
+                {
+                    let (closure, decls) = closure_hashes(hashes, &test.key);
+                    store.put_pass_record(
+                        test.key.clone(),
+                        PassRecord {
+                            test_hash: hash,
+                            closure,
+                            decls,
+                        },
+                    );
+                }
+                recorded = Some(record);
+            }
         }
+
+        results.push(TestResult {
+            index,
+            name: test.name.clone(),
+            hash,
+            group: group_of
+                .get(&index)
+                .copied()
+                .unwrap_or(selection.groups.len()),
+            duration: executed.duration,
+            status,
+            failure: executed.failure,
+            simulation: searched,
+            recorded,
+            backend: executed.backend,
+            performs: executed.performs,
+        });
     }
 
     observe_definitions(store, hashes, check, selection, &results);
@@ -891,7 +872,7 @@ pub fn run_with<E: Executor>(
         );
     }
 
-    let simulation = summarize_simulation(selection, &results);
+    let simulation = summarize_simulation(&results, &seeds);
 
     RunReport {
         passed,
@@ -899,28 +880,28 @@ pub fn run_with<E: Executor>(
         abandoned,
         cached: selection.cached.len(),
         failures,
-        duration: started.elapsed(),
+        duration,
         results,
         warnings,
         simulation,
     }
 }
 
-fn summarize_simulation(selection: &Selection, results: &[TestResult]) -> SimSummary {
+fn summarize_simulation(results: &[TestResult], seeds: &BTreeMap<usize, usize>) -> SimSummary {
     let mut summary = SimSummary {
         total: results.len(),
         ..SimSummary::default()
     };
     for result in results {
-        let Some(exploration) = &result.simulation else {
+        let Some(searched) = &result.simulation else {
             continue;
         };
         summary.simulated += 1;
-        summary.seeds += selection.plan_for(result.index).roots.len();
-        summary.interleavings += u64::from(exploration.explored);
-        summary.exhaustive += usize::from(exploration.exhaustive);
-        summary.exhausted += usize::from(exploration.exhausted);
-        summary.failed += usize::from(exploration.failure.is_some());
+        summary.seeds += seeds.get(&result.index).copied().unwrap_or(0);
+        summary.interleavings += u64::from(searched.explored);
+        summary.exhaustive += usize::from(searched.exhaustive);
+        summary.exhausted += usize::from(searched.exhausted);
+        summary.failed += usize::from(searched.failure.is_some());
     }
     summary
 }
@@ -933,133 +914,6 @@ fn unobserved_search(key: &Symbol) -> Diagnostic {
     )
     .note("the test passed and its result was not cached, so it re-runs next time")
     .note("this is a defect in Ply rather than in the test; please report it")
-}
-
-/// A selected test no group claims would be silently skipped, which a runner must never do.
-fn schedule_of(selection: &Selection, warnings: &mut Vec<Diagnostic>) -> Vec<Vec<usize>> {
-    let scheduled: BTreeSet<usize> = selection.groups.iter().flatten().copied().collect();
-    let orphans: Vec<usize> = selection
-        .to_run
-        .iter()
-        .copied()
-        .filter(|i| !scheduled.contains(i))
-        .collect();
-    if orphans.is_empty() {
-        return selection.groups.clone();
-    }
-    warnings.push(
-        Diagnostic::warning(
-            codes::INTERNAL_ERROR,
-            format!(
-                "{} selected tests were in no concurrency group",
-                orphans.len()
-            ),
-        )
-        .note("they were run one at a time: the choice named them to run and gave them no class"),
-    );
-    let mut groups = selection.groups.clone();
-    groups.extend(orphans.into_iter().map(|i| vec![i]));
-    groups
-}
-
-struct Executed {
-    index: usize,
-    duration: Duration,
-    failure: Option<Diagnostic>,
-    panicked: bool,
-    exploration: Option<Exploration>,
-    /// What this test reached across the boundary, which decides whether its pass may be written.
-    host: Option<ply_eval::host::HostUse>,
-    teardown: Vec<Diagnostic>,
-    backend: Option<BackendUse>,
-    performs: u64,
-}
-
-impl Executed {
-    /// A test no worker could be built for: nothing ran, so nothing but the refusal is known.
-    fn refused(index: usize, refusal: Diagnostic) -> Executed {
-        Executed {
-            index,
-            duration: Duration::ZERO,
-            failure: Some(refusal),
-            panicked: false,
-            exploration: None,
-            host: None,
-            teardown: Vec::new(),
-            backend: None,
-            performs: 0,
-        }
-    }
-}
-
-/// One worker per pool thread, built lazily so a small group builds no idle interpreters.
-fn execute_group<E: Executor>(
-    executor: &E,
-    indices: &[usize],
-    check: &CheckOutput,
-) -> Vec<Executed> {
-    if indices.is_empty() {
-        return Vec::new();
-    }
-
-    let next = AtomicUsize::new(0);
-    let per_thread = rayon::broadcast(|_| {
-        let mut worker: Option<E::Worker> = None;
-        let mut out: Vec<Executed> = Vec::new();
-        loop {
-            let Some(&index) = indices.get(next.fetch_add(1, Ordering::Relaxed)) else {
-                return out;
-            };
-            let built = match worker.take() {
-                Some(built) => built,
-                None => match executor.worker() {
-                    Ok(built) => built,
-                    Err(refused) => {
-                        out.push(Executed::refused(index, refused));
-                        continue;
-                    }
-                },
-            };
-            let w = worker.insert(built);
-            let started = Instant::now();
-            let result = catch_unwind(AssertUnwindSafe(|| executor.execute(w, index)));
-            let duration = started.elapsed();
-
-            let (failure, panicked) = match result {
-                Ok(Ok(())) => (None, false),
-                Ok(Err(d)) => (Some(d), false),
-                Err(payload) => {
-                    // Unwinding leaves its invariants unknown; the next test gets a fresh worker.
-                    worker = None;
-                    (Some(panic_diagnostic(payload, check, index)), true)
-                }
-            };
-            // After the unwind check: a worker with unknown invariants has nothing to report.
-            let exploration = worker.as_ref().and_then(|w| executor.exploration(w));
-            let host = worker.as_ref().and_then(|w| executor.host_use(w));
-            let backend = worker.as_ref().and_then(|w| executor.backend_use(w));
-            let performs = worker.as_ref().map_or(0, |w| executor.performs(w));
-            let teardown = worker
-                .as_mut()
-                .map(|w| executor.teardown(w))
-                .unwrap_or_default();
-            out.push(Executed {
-                index,
-                duration,
-                failure,
-                panicked,
-                exploration,
-                host,
-                teardown,
-                backend,
-                performs,
-            });
-        }
-    });
-
-    let mut out: Vec<Executed> = per_thread.into_iter().flatten().collect();
-    out.sort_by_key(|e| e.index);
-    out
 }
 
 /// The wall clock stopped this run: it is about the machine, so it is no verdict on the test.

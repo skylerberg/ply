@@ -20,7 +20,7 @@ nondet effect prover {
   read prepared[claims]() -> Result<List<Diag>, Refusal>
   read cached[claims](keys: List<String>) -> List<Option<Evidence>>
   read judged[claims](batches: List<Batch>) -> List<List<Judged>>
-  read searched[claims](claim: Int, points: List<List<Value>>, domain: Searched) -> Outcome
+  read interleaved[claims](claim: Int, point: List<Value>, seed: Seed, steps: Int) -> LawRun
   write record[claims](entries: List<{ key: String, evidence: Evidence }>) -> List<Diag>
   read baselines[claims](names: List<String>) -> List<Baseline>
   write accepted[claims](records: List<Baseline>) -> Accepted
@@ -85,8 +85,8 @@ type Refusal = Unit
 type Collection = Unit
 type Diag = Unit
 type Evidence = Unit
-type Searched = Unit
-type Outcome = Unit
+type Seed = Unit
+type LawRun = Unit
 type Baseline = Unit
 type Accepted = Unit
 type Front = {

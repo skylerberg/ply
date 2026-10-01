@@ -408,7 +408,7 @@ impl Drive {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let plan = crate::simulation::run_plan(options.seed.as_ref());
+        let seed = options.seed.clone().unwrap_or_default();
         let compiled = bound.compiled();
         ply_eval::rc::reset();
         let started = Instant::now();
@@ -418,7 +418,7 @@ impl Drive {
                     target.front(),
                     Call { name, args },
                     span,
-                    &plan,
+                    &seed,
                     &bound.hosts,
                     bound.declared.as_ref(),
                     compiled.clone(),
@@ -448,7 +448,7 @@ impl Drive {
             .get(&Symbol::new(&entry))
             .map(|d| d.span)
             .unwrap_or(Span::DUMMY);
-        let plan = crate::simulation::run_plan(options.seed.as_ref());
+        let seed = options.seed.clone().unwrap_or_default();
         let compiled = bound.compiled();
         // The counters are per thread, and this is the thread the entry runs on.
         ply_eval::rc::reset();
@@ -465,7 +465,7 @@ impl Drive {
                         args: Vec::new(),
                     },
                     span,
-                    &plan,
+                    &seed,
                     &bound.hosts,
                     bound.declared.as_ref(),
                     compiled.clone(),
@@ -618,21 +618,21 @@ fn evaluate(
     front: &Front,
     call: Call<'_>,
     span: Span,
-    plan: &ply_eval::Plan,
+    seed: &ply_eval::Seed,
     hosts: &Hosts,
     declared: Option<&ply_eval::Footprint>,
     compiled: std::rc::Rc<dyn ply_eval::Compiled>,
 ) -> Result<PlyValue, Diagnostic> {
     let mut machine = ply_eval::Machine::new(front, compiled)?;
     machine.set_host_binding(hosts.binding());
-    if let Some(runtime) = hosts.runtime() {
+    if let Some(runtime) = hosts.runtime_factory() {
         machine.set_host_runtime(runtime);
     }
     if let Some(declared) = declared {
         machine.set_declared_footprint(declared.clone());
     }
     // Exploration is a test-time activity; a run takes the one interleaving its seed names.
-    ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
+    ply_test::sim::seed_run(&mut machine, seed, ply_eval::sim::DEFAULT_STEPS);
     machine
         .call(call.name, call.args, span)
         .map_err(|d| place_the_unplaced(d, call.name))
@@ -1078,16 +1078,6 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
     let bool_at = |name: &str| get(name).and_then(|v| v.as_bool(span, name));
     let int_at = |name: &str| get(name).and_then(|v| v.as_int(span, name));
     let str_at = |name: &str| get(name).and_then(|v| v.as_str(span, name).map(str::to_string));
-    let opt_str = |name: &str| -> Result<Option<String>, Diagnostic> {
-        match get(name)? {
-            PlyValue::Ctor { name, args } if name.as_str() == "Some" => Ok(args
-                .first()
-                .map(|v| v.as_str(span, "a value").map(str::to_string))
-                .transpose()?),
-            PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
-            other => Err(crate::payload::shape(other, span)),
-        }
-    };
     let str_list = |name: &str| -> Result<Vec<String>, Diagnostic> {
         get(name)?
             .as_list(span, name)?
@@ -1124,14 +1114,8 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
         }
         Ok(out)
     };
-    let seed = match opt_str("seed")? {
-        Some(text) => Some(ply_eval::Seed::parse(&text).ok_or_else(|| {
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("`{text}` was handed to the machine as a seed but does not parse"),
-            )
-            .primary(span, "the program validates seeds; this is Ply's fault")
-        })?),
+    let seed = match crate::payload::option_of(get("seed")?, "a seed", span)? {
+        Some(seed) => Some(crate::recording::seed_of(seed, span)?),
         None => None,
     };
     let tls = cred_list("tls")?;

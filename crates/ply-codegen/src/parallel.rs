@@ -88,6 +88,8 @@ impl Handed {
         let site_was = heap::poison::swap(&raw const c.site_root);
         branch.answer = call_value(ctx, branch.closure, &[]);
         heap::dec(branch.closure);
+        // A reactor belongs to the thread that made it, and this branch is over.
+        c.runtime = None;
         heap::poison::swap(site_was);
         heap::swap_current(heap_was);
     }

@@ -407,7 +407,7 @@ impl Driver {
             sources: self.sources,
             check: published_order(&front),
             hashes: front.hashes.clone(),
-            front,
+            front: std::sync::Arc::new(front),
             frontend: FrontEnd {
                 incremental: self.incremental,
                 phases: self.phases,

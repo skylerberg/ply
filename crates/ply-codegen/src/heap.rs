@@ -230,10 +230,6 @@ pub mod poison {
         static SITE: std::cell::Cell<*const i64> = const { std::cell::Cell::new(std::ptr::null()) };
     }
 
-    pub fn enter(site: *const i64) {
-        SITE.with(|s| s.set(site));
-    }
-
     /// Points poison reports at `site` until the matching swap back, answering what it replaced.
     pub fn swap(site: *const i64) -> *const i64 {
         SITE.with(|s| s.replace(site))

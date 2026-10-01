@@ -6,8 +6,10 @@
 // line and key of both reports, and the code each run exits with are decided here.
 
 import cmdline (Parsed, has, parse_nat, value, values_of)
-import proof.property (Ask, AskJudged, AskSearched, Asked, Batch, Judgements, Searched, SearchedOut,
-                       discharged, min_property_cases)
+import proof.property (Ask, AskJudged, AskInterleaved, Asked, Batch, Judgements, Interleaved,
+                       LawRun, discharged, min_property_cases)
+import sim.plan
+import sim.plan (Seed)
 import proof.world (Built, Obligation, World, walks)
 import proof.decide (Diagnosed, Static, Undecided, decision_word, steps_of)
 import proof.lower (Blocker, blocker_parts)
@@ -93,8 +95,8 @@ pub nondet effect prover {
   // the collection: a whole claim stops at the first point that settles it, a guard alone at the
   // first point it admits.
   read judged[claims](batches: List<Batch>) -> List<List<Judged>>
-  // A law over interleavings, searched at the points its guard kept.
-  read searched[claims](claim: Int, points: List<List<Value>>, domain: Searched) -> Outcome
+  // A law over interleavings, run once at one of its points under one seed, within so many steps.
+  read interleaved[claims](claim: Int, point: List<Value>, seed: Seed, steps: Int) -> LawRun
   // Files each discharge's evidence under the key this program chose for it, and answers what
   // storing it had to say.
   write record[claims](entries: List<{ key: String, evidence: Evidence }>) -> List<Diag>
@@ -160,22 +162,29 @@ pub type Claim = {
   walks: Bool,
 }
 
-pub type Sim = { mode: String, roots: List<Int>, budget: Int, steps: Int, path: List<Int> }
-
-// What an obligation weaker than a proof was discharged against, and cached under.
+// What an obligation weaker than a proof was discharged against, and cached under: the runtime's
+// bounds on drawing and judging, and the search a law over interleavings runs.
 pub type Plan = {
   cases: Int,
   roots: List<Int>,
   prove_budget: Int,
   shrink_budget: Int,
   step_budget: Int,
-  sim: Sim,
+  sim: plan::Plan,
+}
+
+pub type Bounds = {
+  cases: Int,
+  roots: List<Int>,
+  prove_budget: Int,
+  shrink_budget: Int,
+  step_budget: Int,
 }
 
 // What the runtime loaded for a run: the places its spans point into, what loading it had to say,
-// and the plan the run discharges under.
+// and the bounds the run discharges under.
 // `host` is whether a `law/host` has a host bound to run against.
-pub type Collected = { places: List<Place>, warnings: List<Diag>, plan: Plan, host: Bool }
+pub type Collected = { places: List<Place>, warnings: List<Diag>, plan: Bounds, host: Bool }
 
 // What this side built of its own claims: one per obligation of the world, in its order; the
 // definitions and laws the run answers for; and the trouble that cost it an obligation.
@@ -198,18 +207,29 @@ pub type Collection = {
   plan: Plan,
   host: Bool,
   world: World,
+  // How many lanes judge batches at once: one per batch when `--jobs` names none.
+  lanes: Option<Int>,
 }
 
-pub fn collection_of(got: Collected, mine: Claimed) -> Collection =
+// The run's options name the search a law over interleavings runs, and how many lanes judge.
+pub fn collection_of(got: Collected, mine: Claimed, options: Options) -> Collection =
   {
     places: got.places,
     warnings: also(got.warnings, mine.warnings),
     claims: mine.claims,
     defs: mine.defs,
     laws: mine.laws,
-    plan: got.plan,
+    plan: {
+      cases: got.plan.cases,
+      roots: got.plan.roots,
+      prove_budget: got.plan.prove_budget,
+      shrink_budget: got.plan.shrink_budget,
+      step_budget: got.plan.step_budget,
+      sim: machine::sim_plan_of(options.sim),
+    },
     host: got.host,
     world: mine.world,
+    lanes: match options.jobs { Some(n) -> if n > 0 { Some(n) } else { None }, None -> None },
   }
 
 // Every obligation of the world as a claim a report reads, with what its owner's row declares and its
@@ -536,8 +556,8 @@ pub fn plan_digest_of(p: Plan) -> Bytes =
     p.step_budget,
     p.roots,
     digest_of({
-      mode: p.sim.mode,
-      roots: p.sim.roots,
+      mode: plan::mode_word(p.sim.mode),
+      roots: map(p.sim.roots, |r: U64| int_of_u64(r)),
       budget: p.sim.budget,
       steps: p.sim.steps,
       path: p.sim.path,
@@ -699,7 +719,7 @@ pub fn discharge_runs(
   c: Collection,
   runs: List<Int>,
   settled: List<Static>,
-) -> Result<Discharged, Refusal> / {prover.prepared[claims], prover.judged[claims], prover.searched[claims], time.elapsed_ms} =
+) -> Result<Discharged, Refusal> / {prover.prepared[claims], prover.judged[claims], prover.interleaved[claims], time.elapsed_ms} =
   if len(runs) == 0 { Ok({ outcomes: [], duration_ms: decimal_of_int(0), warnings: [] }) } else {
     match prover.prepared[claims]() {
       Err(why) -> Err(why),
@@ -716,13 +736,18 @@ pub fn discharge_runs(
         let outcomes = discharged(
           asked,
           c.world,
-          { cases: c.plan.cases, roots: c.plan.roots, shrink_budget: c.plan.shrink_budget },
+          {
+            cases: c.plan.cases,
+            roots: c.plan.roots,
+            shrink_budget: c.plan.shrink_budget,
+            sim: c.plan.sim,
+          },
           c.host,
           |q: Ask|
             match q {
-              AskJudged(batches) -> Judgements(prover.judged[claims](batches)),
-              AskSearched(claim, points, domain) ->
-                SearchedOut(prover.searched[claims](claim, points, domain)),
+              AskJudged(batches) -> Judgements(judged_in_lanes(batches, c.lanes)),
+              AskInterleaved(claim, point, seed, steps) ->
+                Interleaved(prover.interleaved[claims](claim, point, seed, steps)),
             },
         );
         Ok({
@@ -732,6 +757,31 @@ pub fn discharge_runs(
         })
       },
     }
+  }
+
+// Each batch is one claim's points judged in turn, and batches are independent: each in a lane of
+// its own, or dealt across the lanes `--jobs` names, answered in the batches' order.
+fn judged_in_lanes(
+  batches: List<Batch>,
+  lanes: Option<Int>,
+) -> List<List<Judged>> / {prover.judged[claims]} = {
+  let dealt = machine::dealt(batches, lanes);
+  machine::undealt(judged_lanes(dealt, 0, len(dealt)))
+}
+
+// Halves under a `parallel` block until one lane is left, whose batches are judged in one call.
+fn judged_lanes(
+  lanes: List<List<Batch>>,
+  lo: Int,
+  hi: Int,
+) -> List<List<List<Judged>>> / {prover.judged[claims]} =
+  if hi - lo <= 0 { [] } else if hi - lo == 1 {
+    match list_at(lanes, lo) { Some(lane) -> [prover.judged[claims](lane)], None -> [] }
+  } else {
+    let mid = lo + (hi - lo) / 2;
+    let halves = parallel { judged_lanes(lanes, lo, mid), judged_lanes(lanes, mid, hi) };
+    fold(halves._1, halves._0, |out: List<List<List<Judged>>>, lane: List<List<Judged>>|
+      push(out, lane))
   }
 
 // The n-th answer, or none when the runtime answered fewer than were asked.
@@ -946,10 +996,10 @@ pub fn coverage_json(cov: Coverage) -> Json =
     },
   ])
 
-fn sim_json(s: Sim) -> Json =
+fn sim_json(s: plan::Plan) -> Json =
   object([
-    { key: "mode", value: Str(s.mode) },
-    { key: "roots", value: Array(map(s.roots, |r: Int| num(r))) },
+    { key: "mode", value: Str(plan::mode_word(s.mode)) },
+    { key: "roots", value: Array(map(s.roots, |r: U64| num(int_of_u64(r)))) },
     { key: "budget", value: num(s.budget) },
     { key: "steps", value: num(s.steps) },
   ])
@@ -1099,7 +1149,7 @@ pub fn a_plan() -> Plan =
     prove_budget: 10000,
     shrink_budget: 500,
     step_budget: 1000000000,
-    sim: { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [] },
+    sim: plan::default_plan(),
   }
 
 pub fn proved(rules: List<Rule>, steps: Int) -> Outcome =
@@ -1301,6 +1351,7 @@ fn a_collection_of(cs: List<Claim>) -> Collection =
     plan: a_plan(),
     host: false,
     world: no_world(),
+    lanes: None,
   }
 
 test "a claim that holds raises nothing at all" {
@@ -1363,7 +1414,18 @@ pub fn no_options() -> Options =
 // A collection with nothing of this side's in it yet, from what the runtime loaded: what a fixture
 // hands a run that is told what the runtime answered.
 pub fn collected_part(c: Collection) -> Collected =
-  { places: c.places, warnings: c.warnings, plan: c.plan, host: c.host }
+  {
+    places: c.places,
+    warnings: c.warnings,
+    plan: {
+      cases: c.plan.cases,
+      roots: c.plan.roots,
+      prove_budget: c.plan.prove_budget,
+      shrink_budget: c.plan.shrink_budget,
+      step_budget: c.plan.step_budget,
+    },
+    host: c.host,
+  }
 
 pub fn claimed_part(c: Collection) -> Claimed =
   { claims: c.claims, defs: c.defs, laws: c.laws, warnings: [], world: c.world }

@@ -3,26 +3,23 @@
 //! are, and what their judgements come to, is the program's.
 
 use crate::load::Loaded;
-use ply_eval::host::{HostBinding, HostRuntime};
+use ply_eval::host::HostBinding;
 use ply_eval::{
-    CheckOutput, DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, Span,
-    Symbol, Value, codes,
+    DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, Span, Symbol, Value,
+    codes,
 };
-use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
-use ply_prove::{
-    Binder, Binding, Discharge, Fault, Obligation, ObligationKind, ProvePlan, Strategy,
-};
+use ply_prove::{Binder, Binding, Fault, Obligation, ObligationKind, ProvePlan, Strategy};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 /// The prover this build drives over the program. One built once serves a whole run.
-pub fn prover<'a>(
-    loaded: &'a Loaded,
+pub fn prover(
+    loaded: &Loaded,
     hosting: Option<Hosting>,
     backend: &'static dyn ply_eval::Provider,
-) -> Prover<'a> {
+) -> Prover {
     let prover = Prover::new(loaded, backend);
     match hosting {
         Some(hosting) => prover.with_hosting(hosting),
@@ -44,10 +41,12 @@ enum Claim<'s> {
     },
 }
 
-pub struct Prover<'a> {
-    check: &'a CheckOutput,
-    front: &'a Front,
-    laws: HashMap<Symbol, (usize, &'a LawInfo)>,
+/// It owns what it judges, so a run can judge on whichever threads the program asks from.
+pub struct Prover {
+    front: Arc<Front>,
+    /// Each law's place among its module's laws, which names its roots, and its place in the
+    /// program's.
+    laws: HashMap<Symbol, (usize, usize)>,
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
@@ -59,30 +58,28 @@ pub struct Prover<'a> {
 /// keep one prover across many steps.
 pub struct Hosting {
     pub binding: Arc<HostBinding>,
-    pub runtime: Option<Arc<dyn Fn() -> Rc<dyn HostRuntime> + Sync + Send>>,
+    pub runtime: Option<ply_eval::RuntimeFactory>,
 }
 
-impl<'a> Prover<'a> {
+impl Prover {
     /// `backend` is the unit built from `loaded`, laws' and clauses' roots included.
-    pub fn new(loaded: &'a Loaded, backend: &'static dyn ply_eval::Provider) -> Prover<'a> {
-        let check = &loaded.check;
+    pub fn new(loaded: &Loaded, backend: &'static dyn ply_eval::Provider) -> Prover {
         let mut laws = HashMap::new();
         let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
-        for law in &check.laws {
+        for (at, law) in loaded.front.check.laws.iter().enumerate() {
             let ordinal = ordinals.entry(law.module.as_symbol()).or_default();
-            laws.insert(law.key.clone(), (*ordinal, law));
+            laws.insert(law.key.clone(), (*ordinal, at));
             *ordinal += 1;
         }
         Prover {
-            check,
-            front: &loaded.front,
+            front: Arc::clone(&loaded.front),
             laws,
             hosting: None,
             backend,
         }
     }
 
-    /// The unit, attached once per thread: obligations are discharged on pool threads.
+    /// The unit, attached once per thread: claims are judged on whichever threads the program asks from.
     fn compiled(&self) -> Rc<dyn ply_eval::Compiled> {
         thread_local! {
             static ATTACHED: RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
@@ -136,7 +133,7 @@ impl<'a> Prover<'a> {
     }
 
     /// Bind the host, so that a `law/host` is attempted rather than reported as a gap.
-    pub fn with_hosting(mut self, hosting: Hosting) -> Prover<'a> {
+    pub fn with_hosting(mut self, hosting: Hosting) -> Prover {
         self.hosting = Some(hosting);
         self
     }
@@ -144,11 +141,12 @@ impl<'a> Prover<'a> {
     fn claim(&self, obligation: &Obligation) -> Option<Claim<'_>> {
         match obligation.kind {
             ObligationKind::Ensures { index } => Some(Claim::Ensures {
-                owner: self.check.defs.get(&obligation.owner)?,
+                owner: self.front.check.defs.get(&obligation.owner)?,
                 index,
             }),
             ObligationKind::Law => {
-                let &(ordinal, info) = self.laws.get(&obligation.owner)?;
+                let &(ordinal, at) = self.laws.get(&obligation.owner)?;
+                let info = self.front.check.laws.get(at)?;
                 Some(Claim::Law { info, ordinal })
             }
         }
@@ -156,8 +154,8 @@ impl<'a> Prover<'a> {
 
     /// What an owner is called through to produce `result`: the tier its propositions are entered
     /// on, attached afresh.
-    fn machine(&self) -> Result<Machine<'a>, Fault> {
-        Machine::new(self.front, self.backend.attach())
+    fn machine(&self) -> Result<Machine<'_>, Fault> {
+        Machine::new(&self.front, self.backend.attach())
             .map(|machine| machine.with_max_calls(DEFAULT_MAX_CALLS))
             .map_err(|refused| Fault {
                 bindings: Vec::new(),
@@ -166,11 +164,11 @@ impl<'a> Prover<'a> {
     }
 
     /// The machine a `law/host`'s body runs on: the run's binding and a reactor for this thread.
-    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'a>, Fault> {
+    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'_>, Fault> {
         let mut machine = self.machine()?;
         machine.set_host_binding(Arc::clone(&hosting.binding));
         if let Some(factory) = &hosting.runtime {
-            machine.set_host_runtime(factory());
+            machine.set_host_runtime(Arc::clone(factory));
         }
         Ok(machine)
     }
@@ -189,7 +187,7 @@ pub enum Judgement {
 }
 
 impl Judgement {
-    fn stopped(diagnostic: Diagnostic) -> Judgement {
+    pub(crate) fn stopped(diagnostic: Diagnostic) -> Judgement {
         if codes::is_defect(diagnostic.code) {
             Judgement::Faulted(diagnostic)
         } else {
@@ -260,7 +258,7 @@ fn unhosted(obligation: &Obligation) -> Diagnostic {
     .note("the program judges a `law/host` only under `--host`; this is Ply's fault")
 }
 
-impl<'a> Prover<'a> {
+impl Prover {
     /// One claim's points, judged in order until one ends the batch.
     pub fn judged(
         &self,
@@ -304,32 +302,63 @@ impl<'a> Prover<'a> {
         out
     }
 
-    /// A law whose body reaches a `simulate` region, searched over interleavings at the points its
-    /// guard kept.
-    pub fn searched(
+    /// A law whose body reaches a `simulate` region, run once at `values` under `seed`: the
+    /// interleaving it took, how it ended, and whether it entered a region at all.
+    pub fn interleaved(
         &self,
         obligation: &Obligation,
         plan: &ProvePlan,
-        points: Vec<Vec<Value>>,
-        domain: ValueDomain,
-    ) -> Discharge {
+        values: &[Value],
+        seed: &Seed,
+        steps: u32,
+    ) -> Interleaved {
         let Some(claim) = self.claim(obligation) else {
-            return Discharge::Faulted(unclaimed(obligation));
+            return Interleaved::faulted(*unclaimed(obligation).diagnostic);
         };
         let cases = match self.cases(obligation, &claim, plan) {
             Ok(cases) => cases,
-            Err(fault) => return Discharge::Faulted(fault),
+            Err(fault) => return Interleaved::faulted(*fault.diagnostic),
         };
-        let mut search = Search {
-            compiled: self.compiled(),
-            body_root: cases.body_root.clone(),
-            binders: obligation.binders.clone(),
-            points,
-            steps: plan.sim.steps,
-            step_budget: plan.step_budget,
-            span: obligation.span,
+        let compiled = self.compiled();
+        compiled.set_seed(seed.clone(), steps);
+        let entered = ply_codegen::rt::with_step_budget(plan.step_budget, || {
+            compiled.enter_whole(&cases.body_root, values, DEFAULT_MAX_CALLS)
+        });
+        let (value, record) = match entered {
+            ply_eval::Entered::Answered(value) => (Ok(value), compiled.simulated()),
+            ply_eval::Entered::Raised(raised) => (Err(raised), compiled.simulated()),
+            ply_eval::Entered::Declined => (
+                Err(ply_eval::err_not_compiled(
+                    &cases.body_root,
+                    obligation.span,
+                )),
+                None,
+            ),
         };
-        concurrency::discharge(obligation, &plan.sim, &domain, &mut search).discharge
+        let judged = match value {
+            Ok(Value::Bool(true)) => None,
+            Ok(Value::Bool(false)) => Some(Judgement::Failed),
+            Ok(other) => Some(Judgement::Faulted(body_was_not_boolean(
+                &other,
+                obligation.span,
+            ))),
+            Err(diagnostic) => Some(Judgement::stopped(diagnostic)),
+        };
+        let outcome = match &judged {
+            None => Ok(()),
+            Some(_) => Err(Diagnostic::error(
+                codes::OBLIGATION_REFUTED,
+                "the law failed",
+            )),
+        };
+        Interleaved {
+            interleaving: record.as_ref().map_or_else(
+                || ply_eval::Interleaving::passed(Vec::new()),
+                |r| r.interleaving(&outcome),
+            ),
+            verdict: judged,
+            observed: record.is_some(),
+        }
     }
 
     fn cases(
@@ -337,7 +366,7 @@ impl<'a> Prover<'a> {
         obligation: &Obligation,
         claim: &Claim<'_>,
         plan: &ProvePlan,
-    ) -> Result<Cases<'a>, Fault> {
+    ) -> Result<Cases<'_>, Fault> {
         let call = match claim {
             Claim::Ensures { .. } => Some(obligation.owner.clone()),
             Claim::Law { .. } => None,
@@ -446,43 +475,31 @@ impl Cases<'_> {
     }
 }
 
-/// One law body, run at a point of its value domain under a seed the interleaving search chooses.
-struct Search {
-    compiled: Rc<dyn ply_eval::Compiled>,
-    body_root: Symbol,
-    binders: Vec<Binder>,
-    /// The points the guard kept, in order.
-    points: Vec<Vec<Value>>,
-    /// A `simulate` region's own budget: scheduling steps, not calls.
-    steps: u32,
-    /// Calls one evaluation of the body may make.
-    step_budget: i64,
-    span: Span,
+/// One run of a law over interleavings: the schedule it took, how its body ended, and whether it
+/// entered a `simulate` region, without which there was no schedule to take.
+pub struct Interleaved {
+    pub interleaving: ply_eval::Interleaving,
+    /// `None` when the body held.
+    pub verdict: Option<Judgement>,
+    pub observed: bool,
 }
 
-impl LawSearch for Search {
-    fn run(&mut self, point: u64, seed: &Seed) -> BodyRun {
-        let values = self.points.get(point as usize).cloned().unwrap_or_default();
-        let compiled = &self.compiled;
-        compiled.set_seed(seed.clone(), self.steps);
-        let entered = ply_codegen::rt::with_step_budget(self.step_budget, || {
-            compiled.enter_whole(&self.body_root, &values, DEFAULT_MAX_CALLS)
-        });
-        let (value, record) = match entered {
-            ply_eval::Entered::Answered(value) => (Ok(value), compiled.simulated()),
-            ply_eval::Entered::Raised(raised) => (Err(raised), compiled.simulated()),
-            ply_eval::Entered::Declined => (
-                Err(ply_eval::err_not_compiled(&self.body_root, self.span)),
-                None,
-            ),
-        };
-        concurrency::body_run(record.as_ref(), value, self.span)
-    }
-
-    fn bindings(&self, point: u64) -> Vec<Binding> {
-        match self.points.get(point as usize) {
-            Some(values) => bindings(&self.binders, values),
-            None => Vec::new(),
+impl Interleaved {
+    fn faulted(diagnostic: Diagnostic) -> Interleaved {
+        Interleaved {
+            interleaving: ply_eval::Interleaving::passed(Vec::new()),
+            verdict: Some(Judgement::Faulted(diagnostic)),
+            observed: false,
         }
     }
+}
+
+fn body_was_not_boolean(value: &Value, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("a law body came to `{}` rather than to a Boolean", ply_eval::slot(0)),
+    )
+    .showing(vec![ply_eval::Plain::shown(value)])
+    .primary(span, "a law is a proposition, so its body is `Bool`")
+    .note("the type checker rejects a non-`Bool` law body with E0201, so reaching this is a defect in Ply")
 }

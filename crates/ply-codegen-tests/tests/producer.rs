@@ -373,7 +373,7 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
-        ctx.set_host(binding, None);
+        ctx.set_host(binding, None, None);
         ctx.begin(10_000);
         let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
         let words: Vec<i64> = args
@@ -972,7 +972,7 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
-        ctx.set_host(binding, Some(std::rc::Rc::new(Reactor::default())));
+        ctx.set_host(binding, Some(std::rc::Rc::new(Reactor::default())), None);
         ctx.begin(10_000);
         let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
         let words: Vec<i64> = args

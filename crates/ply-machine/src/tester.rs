@@ -1,12 +1,13 @@
 //! What `ply test` loads, binds and runs, as the program in `crates/ply-cli/ply/tests.ply`
 //! performs it.
 //!
-//! The front end, the store, the compiled backend, the host binding, the worker pool, the per-test
-//! unwind catching and the building of a mixture stay here: a front end is not a value a program can
-//! hold, a Rust unwind is not a Ply value, and the store's on-disk format has one reader. Which tests
-//! run, the keys each result is read and filed under, the classes they share, why a failure happened
-//! and everything said about it are the program's: this side answers what it knows and does what it
-//! is told.
+//! The front end, the store, the compiled backend, the host binding, running one test or one
+//! interleaving of it, the per-test unwind catching and the building of a mixture stay here: a front
+//! end is not a value a program can hold, a Rust unwind is not a Ply value, and the store's on-disk
+//! format has one reader. Which tests run, in which classes and lanes, which interleavings a seeded
+//! test is searched at, the keys each result is read and filed under, why a failure happened and
+//! everything said about it are the program's: this side answers what it knows and does what it is
+//! told.
 
 use crate::hosts::{self, Hosts, Lent, hosting};
 use crate::load::{Loaded, project_root};
@@ -14,22 +15,22 @@ use crate::options::When;
 use crate::payload::{
     count, diags_value, json, option, places_value, raised_value, record, strings,
 };
-use crate::support::{
-    build_backend_over, build_pool, enter_constant, module_texts, once_each, select_profile,
-};
+use crate::support::{build_backend_over, enter_constant, module_texts, once_each, select_profile};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{
-    CheckOutput, Cost, Diagnostic, Footprint, HashOutput, Mode, SourceMap, Span, Symbol,
+    CheckOutput, Diagnostic, Footprint, HashOutput, Mode, SourceMap, Span, Symbol,
     Value as PlyValue, codes,
 };
 use ply_store::Store;
-use ply_test::{Record, RunReport, Selection, Status, TestResult};
+use ply_test::{Cost, Record, RunReport, Selection, Status, TestResult};
 use serde_json::{Value, json as jsonlit};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::time::{Duration, Instant};
 
 /// The effect `crates/ply-cli/ply/tests.ply` declares. It is lent to that one entry and nowhere
 /// else: no other command runs a corpus.
@@ -69,16 +70,24 @@ fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     crate::payload::ctor(home, name, args)
 }
 
-const OPERATIONS: [(&str, &str); 13] = [
+const OPERATIONS: [(&str, &str); 18] = [
     ("configure", "ply_machine::tester::configure"),
     ("loaded", "ply_machine::test::loaded"),
     ("bound", "ply_machine::test::bound"),
-    ("ran", "ply_machine::test::ran"),
     ("stamped", "ply_machine::test::stamped"),
     // What a selector computes a selection from, before anything runs.
     ("keys", "ply_machine::tester::keys"),
     ("hashed", "ply_machine::tester::hashed"),
-    ("searched", "ply_machine::tester::searched"),
+    // The run the program schedules: a test once, or one interleaving of it, on whichever thread
+    // asks, and what they came to.
+    ("started", "ply_machine::tester::started"),
+    ("executed", "ply_machine::tester::executed"),
+    ("interleaved", "ply_machine::tester::interleaved"),
+    ("concluded", "ply_machine::tester::concluded"),
+    // A mutation the program judges a mutant at a time, after a green run.
+    ("mutated", "ply_machine::tester::mutated"),
+    ("mutant", "ply_machine::tester::mutant"),
+    ("mutation", "ply_machine::tester::mutation"),
     ("trial", "ply_machine::tester::trial"),
     ("record", "ply_machine::tester::record"),
     ("chosen", "ply_machine::tester::chosen"),
@@ -125,7 +134,6 @@ pub struct TestOptions {
     pub allow: Vec<String>,
     pub config: crate::config::ConfigOptions,
     pub std: bool,
-    pub simulation: crate::simulation::SimOptions,
 }
 
 pub struct Session(Arc<Site>);
@@ -135,6 +143,7 @@ impl Session {
         Session(Arc::new(Site {
             args: Mutex::new(args.clone()),
             machine: Mutex::new(None),
+            running: RwLock::new(None),
         }))
     }
 
@@ -160,24 +169,10 @@ fn choice_of(v: &PlyValue, span: Span) -> Result<ply_test::Choice, Diagnostic> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut narrowed = std::collections::BTreeMap::new();
-    for entry in field_of(v, "narrowed", span)?.as_list(span, "the narrowed plans")? {
-        let index = field_of(entry, "index", span)?.as_int(span, "a test index")? as usize;
-        let roots = ints_of(field_of(entry, "roots", span)?, span, "the roots owed")?
-            .into_iter()
-            .map(|r| r as u64)
-            .collect();
-        narrowed.insert(index, roots);
+    let mut groups = Vec::new();
+    for class in field_of(v, "groups", span)?.as_list(span, "the classes")? {
+        groups.push(ints_of(class, span, "a class")?);
     }
-    let classes = |name: &str| -> Result<Vec<Vec<usize>>, Diagnostic> {
-        let mut out = Vec::new();
-        for class in field_of(v, name, span)?.as_list(span, "the classes")? {
-            out.push(ints_of(class, span, "a class")?);
-        }
-        Ok(out)
-    };
-    let groups = classes("groups")?;
-    let every = classes("every")?;
     let mut filed = std::collections::BTreeMap::new();
     for entry in field_of(v, "filed", span)?.as_list(span, "where each pass is filed")? {
         let index = field_of(entry, "index", span)?.as_int(span, "a test index")? as usize;
@@ -190,9 +185,7 @@ fn choice_of(v: &PlyValue, span: Span) -> Result<ply_test::Choice, Diagnostic> {
     Ok(ply_test::Choice {
         runs,
         reasons,
-        narrowed,
         groups,
-        every,
         filed,
     })
 }
@@ -245,6 +238,8 @@ struct Site {
     args: Mutex<TestOptions>,
     /// Started by the first operation and joined by the last.
     machine: Mutex<Option<Machine>>,
+    /// The run in progress, which every thread the program runs a test on reads.
+    running: RwLock<Option<Arc<Running>>>,
 }
 
 impl HostHandler for Site {
@@ -266,11 +261,43 @@ impl HostHandler for Site {
             }
             "loaded" => self.loaded()?,
             "bound" => self.bound()?,
-            "ran" => self.ran()?,
             "stamped" => self.stamped(),
             "keys" => self.knowledge(Ask::Keys)?,
             "hashed" => self.knowledge(Ask::Hashed)?,
-            "searched" => self.knowledge(Ask::Searched)?,
+            "started" => self.started()?,
+            "executed" => {
+                let unit = index_arg(req, 0, "a unit")?;
+                let test = index_arg(req, 1, "a test index")?;
+                self.run("executed")?.executed(unit, test)?
+            }
+            "interleaved" => {
+                let unit = index_arg(req, 0, "a unit")?;
+                let test = index_arg(req, 1, "a test index")?;
+                let seed = crate::recording::seed_of(arg(req, 2)?, span)?;
+                let steps = arg(req, 3)?.as_int(span, "a step bound")?;
+                let re_executed = arg(req, 4)?.as_bool(span, "whether the test re-runs")?;
+                self.run("interleaved")?.interleaved(
+                    unit,
+                    test,
+                    &seed,
+                    u32::try_from(steps.max(1)).unwrap_or(u32::MAX),
+                    re_executed,
+                )?
+            }
+            "concluded" => {
+                let mut searched = Vec::new();
+                for entry in arg(req, 0)?.as_list(span, "the settled searches")? {
+                    searched.push(settled_of(entry, span)?);
+                }
+                self.concluded(searched)?
+            }
+            "mutated" => self.mutated()?,
+            "mutant" => self.mutant(index_arg(req, 0, "a mutant's id")?)?,
+            "mutation" => {
+                let verdicts = verdicts_of(arg(req, 0)?, span)?;
+                let budget_spent = arg(req, 1)?.as_bool(span, "whether the budget was spent")?;
+                self.mutation(verdicts, budget_spent)?
+            }
             "trial" => {
                 use crate::payload::field_of;
                 let failure = req
@@ -348,6 +375,7 @@ impl Site {
     }
 
     fn loaded(&self) -> Result<PlyValue, Diagnostic> {
+        *self.running.write().unwrap_or_else(|e| e.into_inner()) = None;
         let mut held = self.held();
         if held.is_none() {
             *held = Some(Machine::start(
@@ -406,7 +434,6 @@ impl Site {
         machine.ask(match &asked {
             Ask::Keys => Go::Keys,
             Ask::Hashed => Go::Hashed,
-            Ask::Searched => Go::Searched,
             Ask::Footprint(tests) => Go::Footprint(tests.clone()),
             Ask::Outcomes(keys) => Go::Outcomes(keys.clone()),
         })?;
@@ -465,16 +492,91 @@ impl Site {
         }
     }
 
-    fn ran(&self) -> Result<PlyValue, Diagnostic> {
+    /// Publishes the run, so the threads the program runs tests on can reach it.
+    fn started(&self) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("ran"))?;
-        machine.ask(Go::Run)?;
-        let step = machine.step()?;
-        match step {
-            Step::Ran(over) => Ok(ran_value(&over)),
-            _ => Err(out_of_step("ran")),
+        let machine = held.as_ref().ok_or_else(|| unstarted("started"))?;
+        machine.ask(Go::Start)?;
+        match machine.step()? {
+            Step::Started(running) => {
+                *self.running.write().unwrap_or_else(|e| e.into_inner()) = Some(running);
+                Ok(PlyValue::Unit)
+            }
+            _ => Err(out_of_step("started")),
         }
     }
+
+    /// The run in progress. It reaches no machine: a test runs on the thread that asks, and many
+    /// ask at once.
+    fn run(&self, op: &str) -> Result<Arc<Running>, Diagnostic> {
+        self.running
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|running| running.is_open())
+            .cloned()
+            .ok_or_else(|| out_of_step(op))
+    }
+
+    fn concluded(&self, searched: Vec<Settled>) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("concluded"))?;
+        machine.ask(Go::Conclude(searched))?;
+        match machine.step()? {
+            Step::Ran(over) => Ok(ran_value(&over)),
+            _ => Err(out_of_step("concluded")),
+        }
+    }
+
+    fn mutated(&self) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("mutated"))?;
+        machine.ask(Go::Mutated)?;
+        match machine.step()? {
+            Step::Mutated(queued) => Ok(queued_value(&queued)),
+            _ => Err(out_of_step("mutated")),
+        }
+    }
+
+    /// The unit a mutant's tests run in, or the verdict a mutant that does not build already is.
+    fn mutant(&self, id: usize) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("mutant"))?;
+        machine.ask(Go::Mutant(id))?;
+        match machine.step()? {
+            Step::Mutant(Ok(unit)) => Ok(PlyValue::ctor("Ok", vec![count(unit)])),
+            Step::Mutant(Err(verdict)) => Ok(PlyValue::ctor("Err", vec![unbuilt_value(&verdict)])),
+            _ => Err(out_of_step("mutant")),
+        }
+    }
+
+    fn mutation(
+        &self,
+        verdicts: Vec<(usize, crate::mutate::Verdict)>,
+        budget_spent: bool,
+    ) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("mutation"))?;
+        machine.ask(Go::Mutation {
+            verdicts,
+            budget_spent,
+        })?;
+        match machine.step()? {
+            Step::Mutation(view) => Ok(mutants_value(&view)),
+            _ => Err(out_of_step("mutation")),
+        }
+    }
+}
+
+fn arg<'a>(req: &'a HostRequest<'_>, at: usize) -> Result<&'a PlyValue, Diagnostic> {
+    req.args
+        .get(at)
+        .ok_or_else(|| unasked(req.op.op.as_str(), req.span))
+}
+
+fn index_arg(req: &HostRequest<'_>, at: usize, what: &str) -> Result<usize, Diagnostic> {
+    let n = arg(req, at)?.as_int(req.span, what)?;
+    usize::try_from(n).map_err(|_| crate::payload::missing(what, req.span))
 }
 
 /// One file's stamp, whole: the modification time to the nanosecond and the length. Two walks that
@@ -503,10 +605,12 @@ enum Go {
     /// What the program decided to run. Sent before the binding, because whether a unit has to be
     /// built at all is a function of it: a fully cached run builds none.
     Chosen(ply_test::Choice),
-    Run,
+    /// The run begins: from here every test the program runs, runs on the thread that asks.
+    Start,
+    /// The run is over, and these are the searches the program settled its seeded tests with.
+    Conclude(Vec<Settled>),
     Keys,
     Hashed,
-    Searched,
     /// The store's answer under each key the caller names: the narrowing asks about keys the
     /// *program* computes, so no row could have carried them.
     Outcomes(Vec<String>),
@@ -525,16 +629,31 @@ enum Go {
     Record {
         reply: mpsc::Sender<Vec<Diagnostic>>,
     },
+    /// The mutants of the run's targets that some test reaches, cheapest first.
+    Mutated,
+    /// One queued mutant, built into a unit a test can run in.
+    Mutant(usize),
+    /// What the program judged each mutant it ran, and whether its budget stopped it short.
+    Mutation {
+        verdicts: Vec<(usize, crate::mutate::Verdict)>,
+        budget_spent: bool,
+    },
 }
 
 enum Step {
     Loaded(Box<Result<Found, Refused>>),
     Bound(Box<Option<Refused>>),
+    Started(Arc<Running>),
     Ran(Box<Over>),
+    Mutated(Box<Queued>),
+    Mutant(Result<usize, crate::mutate::Verdict>),
+    Mutation(Box<MutantsView>),
     Knowledge {
         asked: Ask,
         value: Box<KnowledgeValue>,
     },
+    /// No iteration is running to answer what was asked.
+    Idle,
 }
 
 /// Which part of what a selector reads to compute a selection.
@@ -542,7 +661,6 @@ enum Step {
 enum Ask {
     Keys,
     Hashed,
-    Searched,
     Footprint(Vec<usize>),
     Outcomes(Vec<String>),
 }
@@ -552,7 +670,6 @@ impl Ask {
         match self {
             Ask::Keys => "keys",
             Ask::Hashed => "hashed",
-            Ask::Searched => "searched",
             Ask::Footprint(_) => "footprint",
             Ask::Outcomes(_) => "outcomes",
         }
@@ -563,16 +680,22 @@ impl Ask {
 enum KnowledgeValue {
     Keys(Vec<KeyRow>),
     Hashed(Vec<HashedRow>),
-    Searched(SearchedRow),
     Footprint(String),
     Outcomes(Vec<Option<String>>),
 }
 
+/// The mutants a mutation judges, each beside the tests that reach it, and why there are none when
+/// the query no longer names a definition.
+struct Queued {
+    mutants: Vec<(usize, Vec<usize>)>,
+    refused: Vec<Diagnostic>,
+}
+
 /// The thread this process's machine lives on. The `ply` program performing these operations is
-/// itself inside an entry; two entries do not nest on one thread, and a bisection and a mutation
-/// each evaluate a program of their own. The load, the store, the binding, the pool and the
-/// diagnosis all happen here, and only what a report is written from crosses back — which is also
-/// what lets the front end outlive an iteration: it never leaves this thread.
+/// itself inside an entry; the load, the store, the binding and the diagnosis happen here, and only
+/// what a report is written from crosses back — which is also what lets the front end outlive an
+/// iteration. The tests themselves run on whichever threads the program runs them on, against the
+/// [`Running`] this thread publishes.
 struct Machine {
     go: Option<mpsc::Sender<Go>>,
     steps: mpsc::Receiver<Step>,
@@ -623,42 +746,65 @@ fn serve(args: &TestOptions, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<G
     let mut warm = crate::warm::Warm::default();
     // What the last run kept, so a program can try mixtures of it long after the run finished.
     let mut hybrids: Option<ply_test::Hybrids> = None;
-    while let Ok(signal) = asked.recv() {
-        // A trial is not an iteration: it asks about the run that just ended.
-        if let Go::Trial {
-            failure,
-            keys,
-            filed,
-            reply,
-        } = signal
-        {
-            let answer = match &mut cache {
-                Ok(cache) => trial(&mut cache.store, hybrids.as_ref(), failure, &keys, filed),
-                Err(diagnostic) => Err(diagnostic.clone()),
-            };
-            let _ = reply.send(answer);
-            continue;
-        }
-        if let Go::Record { reply } = signal {
-            let _ = reply.send(match &mut cache {
-                Ok(cache) => recorded(&mut cache.store),
-                // The store never opened, and the load already said so.
-                Err(_) => Vec::new(),
-            });
-            continue;
-        }
-        match &mut cache {
-            Ok(cache) => iterate(args, cache, &mut warm, told, asked, &mut hybrids),
-            Err(diagnostic) => {
-                let _ = told.send(Step::Loaded(Box::new(Err(Refused {
-                    diagnostics: vec![diagnostic.clone()],
-                    sources: SourceMap::new(),
-                }))));
+    // What an iteration received and did not answer, which is the first thing asked after it.
+    let mut pending: Option<Go> = None;
+    while let Some(signal) = pending.take().or_else(|| asked.recv().ok()) {
+        let signal = match answer_after(signal, cache.as_mut().map_err(|e| &*e), hybrids.as_ref()) {
+            Ok(()) => continue,
+            Err(signal) => signal,
+        };
+        match signal {
+            Go::Load => match &mut cache {
+                Ok(cache) => {
+                    // A trial asks about the run that finished last, and a new one is starting.
+                    hybrids = None;
+                    pending = iterate(args, cache, &mut warm, told, asked, &mut hybrids);
+                }
+                Err(diagnostic) => {
+                    let _ = told.send(Step::Loaded(Box::new(Err(Refused {
+                        diagnostics: vec![diagnostic.clone()],
+                        sources: SourceMap::new(),
+                    }))));
+                }
+            },
+            // Stated ahead of a binding that never came.
+            Go::Chosen(_) => {}
+            _ => {
+                let _ = told.send(Step::Idle);
             }
         }
     }
 }
 
+/// Answers a trial or a record, which ask about the run that finished last, and hands anything
+/// else back.
+fn answer_after(
+    go: Go,
+    cache: Result<&mut Cache, &Diagnostic>,
+    hybrids: Option<&ply_test::Hybrids>,
+) -> Result<(), Go> {
+    match go {
+        Go::Trial {
+            failure,
+            keys,
+            filed,
+            reply,
+        } => {
+            let _ = reply.send(match cache {
+                Ok(cache) => trial(&mut cache.store, hybrids, failure, &keys, filed),
+                Err(diagnostic) => Err(diagnostic.clone()),
+            });
+        }
+        Go::Record { reply } => {
+            // A store that never opened, the load already reported.
+            let _ = reply.send(cache.map(|c| recorded(&mut c.store)).unwrap_or_default());
+        }
+        other => return Err(other),
+    }
+    Ok(())
+}
+
+/// One report's iteration, and whatever it was asked that it did not answer.
 fn iterate(
     args: &TestOptions,
     cache: &mut Cache,
@@ -666,12 +812,19 @@ fn iterate(
     told: &mpsc::Sender<Step>,
     asked: &mpsc::Receiver<Go>,
     hybrids: &mut Option<ply_test::Hybrids>,
-) {
+) -> Option<Go> {
     let mut warnings = std::mem::take(&mut cache.warnings);
     let opened = cache.store.take_warnings();
     warnings.extend(crate::migrate::notice(&cache.store, &opened));
     warnings.extend(opened);
 
+    let refuse = |diagnostics: Vec<Diagnostic>, sources: SourceMap| {
+        let _ = told.send(Step::Loaded(Box::new(Err(Refused {
+            diagnostics,
+            sources,
+        }))));
+        None
+    };
     // The front end is a function of the sources, so an unmoved tree reuses it whole.
     let (held, reuse) = warm.take(&project_root(&args.path));
     let loaded = match held {
@@ -696,13 +849,7 @@ fn iterate(
             }
             loaded
         }
-        Err(err) => {
-            let _ = told.send(Step::Loaded(Box::new(Err(Refused {
-                diagnostics: err.diagnostics,
-                sources: err.sources,
-            }))));
-            return;
-        }
+        Err(err) => return refuse(err.diagnostics, err.sources),
     };
     warnings.extend(cache.store.take_warnings());
     warnings.extend(loaded.frontend.warnings.iter().cloned());
@@ -712,53 +859,45 @@ fn iterate(
     if let Some(query) = &args.mutate
         && let Err(diagnostic) = crate::mutate::targets(&loaded, query)
     {
-        let _ = told.send(Step::Loaded(Box::new(Err(Refused {
-            diagnostics: vec![diagnostic],
-            sources: loaded.sources.clone(),
-        }))));
-        return;
+        return refuse(vec![diagnostic], loaded.sources.clone());
     }
 
-    // Part of a simulated test's cache key, so decided before selection.
-    let search = crate::simulation::plan(&args.simulation);
     let hashes = loaded.hashes.clone();
     let plan = Plan::new(&loaded, args.filter.as_deref(), args.std);
 
     if let Some(err) = crate::costs::broken_promises(&loaded) {
-        let _ = told.send(Step::Loaded(Box::new(Err(Refused {
-            diagnostics: err.diagnostics,
-            sources: err.sources,
-        }))));
-        return;
+        return refuse(err.diagnostics, err.sources);
     }
 
     let _ = told.send(Step::Loaded(Box::new(Ok(found(
-        args, &loaded, &hashes, &plan, &search, warnings,
+        args, &loaded, &hashes, &plan, warnings,
     )))));
     // What a selector reads, before anything runs. It states its decision on the same channel, so
     // the machine has it by the time the binding decides whether a unit is worth building.
     let mut chosen = None;
-    let knowledge = Knowledge::of(&loaded, &hashes, &search);
-    if !serve_reads(asked, told, &knowledge, &cache.store, &mut chosen) {
-        return;
+    let knowledge = Knowledge::of(&loaded, &hashes);
+    match serve_reads(asked, told, &knowledge, &cache.store, &mut chosen) {
+        Some(Go::Bind) => {}
+        other => return other,
     }
-    if bind(
+    let (written, pending) = bind(
         args,
         cache,
         warm,
         &loaded,
         &hashes,
         plan,
-        &search,
         told,
         asked,
         &knowledge,
         &mut chosen,
         hybrids,
-    ) {
+    );
+    if written {
         // Only over a report that was written: an iteration that returned early leaves nothing held.
         warm.keep(loaded);
     }
+    pending
 }
 
 /// What a selector reads: computed once per iteration, before anything runs. Plain data, so it
@@ -766,7 +905,6 @@ fn iterate(
 struct Knowledge {
     keys: Vec<KeyRow>,
     hashed: Vec<HashedRow>,
-    searched: SearchedRow,
     /// Every test's footprint, in test order: a group's rendering is the union of the ones it names.
     footprints: Vec<Footprint>,
 }
@@ -787,18 +925,6 @@ fn outcomes_of(store: &ply_store::Store, keys: &[String]) -> Vec<Option<String>>
                 })
         })
         .collect()
-}
-
-impl Knowledge {
-    /// The union of the named tests' footprints, printed. An index no test holds contributes
-    /// nothing, so a program that asked about one finds out by the absence rather than a refusal.
-    fn footprint_of(&self, tests: &[usize]) -> String {
-        tests
-            .iter()
-            .filter_map(|&i| self.footprints.get(i))
-            .fold(Footprint::empty(), |acc, f| acc.union(f))
-            .to_string()
-    }
 }
 
 /// One test the loaded tree declares: its own hash, and whether the search is part of its key.
@@ -824,56 +950,8 @@ struct HashedRow {
     test: bool,
 }
 
-/// The search a seeded test's key is computed against: one shape wherever the program reads a
-/// plan, since a record crosses by its fields and a missing one is a read of the wrong one.
-#[derive(Clone)]
-struct SearchedRow {
-    mode: String,
-    roots: Vec<u64>,
-    /// Numbers, not their printed forms: the program's own `Plan` type says `Int`, and a record
-    /// crosses as a *dynamic* value, so nothing checks the two against each other.
-    budget: u32,
-    steps: u32,
-    /// The choices `--seed` fixes, which name one interleaving under `once`.
-    path: Vec<u16>,
-}
-
-impl SearchedRow {
-    fn of(search: &ply_eval::Plan) -> SearchedRow {
-        SearchedRow {
-            mode: search.mode.as_str().to_string(),
-            roots: search.roots.clone(),
-            budget: search.budget,
-            steps: search.steps,
-            path: search.path.clone(),
-        }
-    }
-}
-
-fn searched_value(row: &SearchedRow) -> PlyValue {
-    record(vec![
-        (
-            "roots",
-            PlyValue::list(row.roots.iter().map(|&r| PlyValue::Int(r as i64)).collect()),
-        ),
-        ("mode", PlyValue::str(&row.mode)),
-        ("seeds", count(row.roots.len())),
-        ("budget", count(row.budget as usize)),
-        ("steps", count(row.steps as usize)),
-        (
-            "path",
-            PlyValue::list(
-                row.path
-                    .iter()
-                    .map(|&c| PlyValue::Int(i64::from(c)))
-                    .collect(),
-            ),
-        ),
-    ])
-}
-
 impl Knowledge {
-    fn of(loaded: &Loaded, hashes: &HashOutput, search: &ply_eval::Plan) -> Knowledge {
+    fn of(loaded: &Loaded, hashes: &HashOutput) -> Knowledge {
         let keys = loaded
             .check
             .tests
@@ -921,101 +999,75 @@ impl Knowledge {
                 .iter()
                 .map(|t| t.footprint.clone())
                 .collect(),
-            searched: SearchedRow::of(search),
         }
+    }
+
+    /// The union of the named tests' footprints, printed. An index no test holds contributes
+    /// nothing, so a program that asked about one finds out by the absence rather than a refusal.
+    fn footprint_of(&self, tests: &[usize]) -> String {
+        tests
+            .iter()
+            .filter_map(|&i| self.footprints.get(i))
+            .fold(Footprint::empty(), |acc, f| acc.union(f))
+            .to_string()
     }
 }
 
-/// Serves reads until `Bind` arrives. `false` when the iteration is over instead.
+/// Answers what a selector reads until something else arrives, which it hands back; `None` once
+/// the program is gone. Keeps the decision the program sent, if it sent one.
 fn serve_reads(
     asked: &mpsc::Receiver<Go>,
     told: &mpsc::Sender<Step>,
     knowledge: &Knowledge,
     store: &ply_store::Store,
     chosen: &mut Option<ply_test::Choice>,
-) -> bool {
-    serve_reads_loop(asked, told, knowledge, store, chosen, Sig::Bind)
-}
-
-/// The same, for the reads a selector makes between the binding and the run.
-fn serve_reads_until_run(
-    asked: &mpsc::Receiver<Go>,
-    told: &mpsc::Sender<Step>,
-    knowledge: &Knowledge,
-    store: &ply_store::Store,
-    chosen: &mut Option<ply_test::Choice>,
-) -> bool {
-    serve_reads_loop(asked, told, knowledge, store, chosen, Sig::Run)
-}
-
-/// Which of `Bind`/`Run` ends the wait.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sig {
-    Bind,
-    Run,
-}
-
-/// Answers reads until the signal arrives. Keeps the decision the program sent, if it sent one.
-fn serve_reads_loop(
-    asked: &mpsc::Receiver<Go>,
-    told: &mpsc::Sender<Step>,
-    knowledge: &Knowledge,
-    store: &ply_store::Store,
-    chosen: &mut Option<ply_test::Choice>,
-    until: Sig,
-) -> bool {
+) -> Option<Go> {
     loop {
-        let got = asked.recv();
-        // The ask travels back with the answer: a step's answer is only its own if the questions
-        // match, and two of these questions carry the caller's arguments.
-        let (asked, value) = match got {
-            Ok(Go::Bind) => return until == Sig::Bind,
-            Ok(Go::Run) => return until == Sig::Run,
-            Ok(Go::Chosen(choice)) => {
-                *chosen = Some(choice);
-                continue;
+        match asked.recv().ok()? {
+            Go::Chosen(choice) => *chosen = Some(choice),
+            go => {
+                if let Err(other) = answer_read(go, told, knowledge, store) {
+                    return Some(other);
+                }
             }
-            Ok(Go::Keys) => (Ask::Keys, KnowledgeValue::Keys(knowledge.keys.clone())),
-            Ok(Go::Hashed) => (
-                Ask::Hashed,
-                KnowledgeValue::Hashed(knowledge.hashed.clone()),
-            ),
-            Ok(Go::Searched) => (
-                Ask::Searched,
-                KnowledgeValue::Searched(knowledge.searched.clone()),
-            ),
-            Ok(Go::Footprint(tests)) => (
-                Ask::Footprint(tests.clone()),
-                KnowledgeValue::Footprint(knowledge.footprint_of(&tests)),
-            ),
-            Ok(Go::Outcomes(keys)) => (
-                Ask::Outcomes(keys.clone()),
-                KnowledgeValue::Outcomes(outcomes_of(store, &keys)),
-            ),
-            // A trial asks about the run that has *finished*; one arriving here is asking too
-            // early, and the honest answer is that there is nothing to try yet.
-            Ok(Go::Trial { reply, .. }) => {
-                let _ = reply.send(Err(Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    "a mixture was asked for before the run it is a mixture of",
-                )));
-                continue;
-            }
-            // Nothing has been tried yet, so nothing is waiting to be written.
-            Ok(Go::Record { reply }) => {
-                let _ = reply.send(Vec::new());
-                continue;
-            }
-            Ok(Go::Load) | Err(_) => return false,
-        };
-        let _ = told.send(Step::Knowledge {
-            asked,
-            value: Box::new(value),
-        });
+        }
     }
 }
 
-/// Whether a report was written, which is what decides if this front end is worth holding.
+/// Answers `go` when it is a read, and hands it back otherwise. The ask travels back with the
+/// answer: a step's answer is only its own if the questions match, and two of them carry the
+/// caller's arguments.
+fn answer_read(
+    go: Go,
+    told: &mpsc::Sender<Step>,
+    knowledge: &Knowledge,
+    store: &ply_store::Store,
+) -> Result<(), Go> {
+    let (asked, value) = match go {
+        Go::Keys => (Ask::Keys, KnowledgeValue::Keys(knowledge.keys.clone())),
+        Go::Hashed => (
+            Ask::Hashed,
+            KnowledgeValue::Hashed(knowledge.hashed.clone()),
+        ),
+        Go::Footprint(tests) => (
+            Ask::Footprint(tests.clone()),
+            KnowledgeValue::Footprint(knowledge.footprint_of(&tests)),
+        ),
+        Go::Outcomes(keys) => (
+            Ask::Outcomes(keys.clone()),
+            KnowledgeValue::Outcomes(outcomes_of(store, &keys)),
+        ),
+        other => return Err(other),
+    };
+    let _ = told.send(Step::Knowledge {
+        asked,
+        value: Box::new(value),
+    });
+    Ok(())
+}
+
+/// Whether a report was written, which is what decides if this front end is worth holding, and
+/// whatever was asked that this did not answer.
 #[allow(clippy::too_many_arguments)]
 fn bind(
     args: &TestOptions,
@@ -1024,24 +1076,23 @@ fn bind(
     loaded: &Loaded,
     hashes: &HashOutput,
     plan: Plan,
-    search: &ply_eval::Plan,
     told: &mpsc::Sender<Step>,
     asked: &mpsc::Receiver<Go>,
     knowledge: &Knowledge,
     chosen: &mut Option<ply_test::Choice>,
     hybrids: &mut Option<ply_test::Hybrids>,
-) -> bool {
+) -> (bool, Option<Go>) {
     let refuse = |diagnostics: Vec<Diagnostic>| {
         let _ = told.send(Step::Bound(Box::new(Some(Refused {
             diagnostics,
             sources: loaded.sources.clone(),
         }))));
-        false
+        (false, None)
     };
     if let Err(diagnostic) = select_profile(&args.profile) {
         return refuse(vec![diagnostic]);
     };
-    // One per run, shared by the workers; a run that decided to execute nothing builds no unit
+    // One per run, shared by every test; a run that decided to execute nothing builds no unit
     // unless a schema was named.
     let nothing_to_run = chosen.as_ref().map(|c| c.runs.is_empty()).unwrap_or(true);
     let schema_named = args.config.schema.is_some();
@@ -1104,114 +1155,647 @@ fn bind(
     };
     let _ = told.send(Step::Bound(Box::new(None)));
     // A selector may still ask what the tree holds between the binding and the run.
-    if !serve_reads_until_run(asked, told, knowledge, &cache.store, chosen) {
-        return false;
+    match serve_reads(asked, told, knowledge, &cache.store, chosen) {
+        Some(Go::Start) => {}
+        other => return (false, other),
     }
     let choice = chosen.clone().unwrap_or_default();
-    let selection = decided(&choice, &plan, &loaded.check, search);
-    let (over, mixtures) = execute(
+    let selection = decided(&choice, &plan, &loaded.check);
+    let provider = unit.filter(|_| !nothing_to_run);
+    let running = Arc::new(Running {
+        units: RwLock::new(vec![Unit {
+            front: Arc::clone(&loaded.front),
+            provider,
+        }]),
+        hosting: hosting(&hosts, &hosts.runtime_factory()),
+        steps: args.steps,
+        timeout: args.timeout,
+        slots: Mutex::new(BTreeMap::new()),
+        open: AtomicBool::new(true),
+    });
+    let started = Instant::now();
+    let _ = told.send(Step::Started(Arc::clone(&running)));
+    let searched = match serve_reads(asked, told, knowledge, &cache.store, chosen) {
+        Some(Go::Conclude(searched)) => searched,
+        other => {
+            running.close();
+            return (false, other);
+        }
+    };
+    let ran = running.ran(&selection.to_run, searched);
+    let (over, mixtures) = concluded(
         args,
         cache,
         loaded,
         hashes,
         &plan,
-        &choice,
         &selection,
-        search,
         &hosts,
-        unit.filter(|_| !nothing_to_run),
+        provider,
+        ran,
+        started.elapsed(),
         config_warnings,
     );
     // Kept for whatever the report asks next: a trial is about the run that just finished.
     *hybrids = Some(mixtures);
     let _ = told.send(Step::Ran(Box::new(over)));
-    true
+    let pending = after_run(
+        args,
+        cache,
+        loaded,
+        hashes,
+        told,
+        asked,
+        knowledge,
+        hybrids.as_ref(),
+        &running,
+    );
+    // The binding goes with this frame, and no test runs against a stopped host.
+    running.close();
+    (true, pending)
 }
 
+/// Answers what the program asks once the run is reported -- the mutation it judges, the mixtures
+/// it tries and the record of them -- until something else arrives, which it hands back.
 #[allow(clippy::too_many_arguments)]
-fn execute(
+fn after_run(
+    args: &TestOptions,
+    cache: &mut Cache,
+    loaded: &Loaded,
+    hashes: &HashOutput,
+    told: &mpsc::Sender<Step>,
+    asked: &mpsc::Receiver<Go>,
+    knowledge: &Knowledge,
+    hybrids: Option<&ply_test::Hybrids>,
+    running: &Running,
+) -> Option<Go> {
+    let mut queue = crate::mutate::Queue::default();
+    loop {
+        let go = match answer_after(asked.recv().ok()?, Ok(&mut *cache), hybrids) {
+            Ok(()) => continue,
+            Err(go) => go,
+        };
+        match go {
+            Go::Mutated => {
+                let refused = match args
+                    .mutate
+                    .as_deref()
+                    .map(|query| crate::mutate::targets(loaded, query))
+                {
+                    Some(Ok(targets)) => {
+                        queue = crate::mutate::queued(loaded, hashes, &targets);
+                        Vec::new()
+                    }
+                    // The query was resolved before the run, so this is a target that moved under it.
+                    Some(Err(diagnostic)) => vec![diagnostic],
+                    None => Vec::new(),
+                };
+                let mutants = queue
+                    .mutants
+                    .iter()
+                    .enumerate()
+                    .map(|(id, (tests, _))| (id, tests.clone()))
+                    .collect();
+                let _ = told.send(Step::Mutated(Box::new(Queued { mutants, refused })));
+            }
+            Go::Mutant(id) => {
+                let built = match queue.mutants.get(id) {
+                    Some((_, mutant)) => crate::mutate::built(loaded, mutant)
+                        .map(|(front, provider)| running.add(front, provider)),
+                    None => Err(crate::mutate::Verdict::Unresolved(format!(
+                        "no mutant {id} was queued"
+                    ))),
+                };
+                let _ = told.send(Step::Mutant(built));
+            }
+            Go::Mutation {
+                verdicts,
+                budget_spent,
+            } => {
+                let report =
+                    mutation_report(std::mem::take(&mut queue), verdicts, budget_spent, loaded);
+                let _ = told.send(Step::Mutation(Box::new(mutants_view(&report, loaded))));
+            }
+            go => {
+                if let Err(other) = answer_read(go, told, knowledge, &cache.store) {
+                    return Some(other);
+                }
+            }
+        }
+    }
+}
+
+/// The mutation as the program judged it: each verdict beside its mutant and the tests that reach
+/// it, and every mutant the budget never reached left out.
+fn mutation_report(
+    queue: crate::mutate::Queue,
+    verdicts: Vec<(usize, crate::mutate::Verdict)>,
+    budget_spent: bool,
+    loaded: &Loaded,
+) -> crate::mutate::Report {
+    let generated = queue.mutants.len();
+    let mut mutants: Vec<Option<(Vec<usize>, crate::mutate::Mutant)>> =
+        queue.mutants.into_iter().map(Some).collect();
+    let judged = verdicts
+        .into_iter()
+        .filter_map(|(id, verdict)| {
+            let (tests, mutant) = mutants.get_mut(id)?.take()?;
+            Some(crate::mutate::Judged {
+                mutant,
+                verdict,
+                tests: tests
+                    .iter()
+                    .filter_map(|&i| loaded.check.tests.get(i).map(|t| t.key.clone()))
+                    .collect(),
+            })
+        })
+        .collect();
+    crate::mutate::Report {
+        definitions: queue.definitions,
+        generated,
+        judged,
+        unreached: queue.unreached,
+        budget_spent,
+    }
+}
+
+// --- The run, on whichever thread asks ------------------------------------------
+
+/// One run, as every thread the program runs a test on reads it: the programs a test can run in --
+/// the loaded one, then each mutant built since -- the host they reach, and what each test came to.
+struct Running {
+    units: RwLock<Vec<Unit>>,
+    hosting: ply_test::Hosting,
+    steps: i64,
+    timeout: u64,
+    slots: Mutex<BTreeMap<(usize, usize), Slot>>,
+    open: AtomicBool,
+}
+
+#[derive(Clone)]
+struct Unit {
+    front: Arc<ply_eval::Front>,
+    /// `None` when the run decided to execute nothing and so built nothing to run a test on.
+    provider: Option<&'static dyn ply_eval::Provider>,
+}
+
+/// What one test came to, over every call the program made for it.
+#[derive(Default)]
+struct Slot {
+    once: Option<ply_test::Executed>,
+    interleavings: ply_test::Interleavings,
+}
+
+impl Running {
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        self.open.store(false, Ordering::Release);
+    }
+
+    fn unit(&self, unit: usize) -> Result<Unit, Diagnostic> {
+        let units = self.units.read().unwrap_or_else(|e| e.into_inner());
+        units.get(unit).cloned().ok_or_else(|| {
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!(
+                    "the program ran a test in unit {unit}, and the run holds {}",
+                    units.len()
+                ),
+            )
+            .note(
+                "units are the loaded program and each mutant `mutant` built; this is Ply's fault",
+            )
+        })
+    }
+
+    fn add(&self, front: Arc<ply_eval::Front>, provider: &'static dyn ply_eval::Provider) -> usize {
+        let mut units = self.units.write().unwrap_or_else(|e| e.into_inner());
+        units.push(Unit {
+            front,
+            provider: Some(provider),
+        });
+        units.len() - 1
+    }
+
+    fn slot<R>(&self, unit: usize, test: usize, f: impl FnOnce(&mut Slot) -> R) -> R {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        f(slots.entry((unit, test)).or_default())
+    }
+
+    /// The program's thread is entered with no budget of its own; a test is bounded by the run's.
+    fn budgeted<R>(&self, f: impl FnOnce() -> R) -> R {
+        ply_codegen::rt::with_step_budget(self.steps, || {
+            ply_codegen::rt::with_time_budget(self.timeout, f)
+        })
+    }
+
+    /// One test run once on this thread, and how it ended.
+    fn executed(&self, unit: usize, test: usize) -> Result<PlyValue, Diagnostic> {
+        let Unit { front, provider } = self.unit(unit)?;
+        let once = match provider {
+            Some(provider) => {
+                let executor = ply_test::InterpExecutor::new(&front, provider)
+                    .with_hosts(self.hosting.clone());
+                self.budgeted(|| ply_test::executed(&executor, &front.check, test))
+            }
+            None => ply_test::Executed::refused(test, nothing_built()),
+        };
+        let status = status_word(once.failure.as_ref(), once.panicked);
+        self.slot(unit, test, |slot| slot.once = Some(once));
+        Ok(PlyValue::str(status))
+    }
+
+    /// One interleaving of a seeded test on this thread, recorded; a failure crosses as the id the
+    /// run holds its diagnostic by, and how a report classes it.
+    fn interleaved(
+        &self,
+        unit: usize,
+        test: usize,
+        seed: &ply_eval::Seed,
+        steps: u32,
+        re_executed: bool,
+    ) -> Result<PlyValue, Diagnostic> {
+        let Unit { front, provider } = self.unit(unit)?;
+        let run = match provider {
+            Some(provider) => {
+                let executor = ply_test::InterpExecutor::new(&front, provider)
+                    .with_hosts(self.hosting.clone());
+                self.budgeted(|| {
+                    ply_test::interleaved(&executor, &front.check, test, seed, steps, re_executed)
+                })
+            }
+            None => ply_test::Interleaved::refused(nothing_built()),
+        };
+        let fell = self.slot(unit, test, |slot| {
+            slot.interleavings.add(&run).map(|id| {
+                record(vec![
+                    ("id", count(id)),
+                    (
+                        "status",
+                        PlyValue::str(status_word(slot.interleavings.held().get(id), run.panicked)),
+                    ),
+                ])
+            })
+        });
+        Ok(crate::recording::interleaving_value(
+            &run.interleaving,
+            fell,
+        ))
+    }
+
+    /// What each test the program was told to run came to: one run once as it ran, a seeded one as
+    /// the program's search settled it, and one the program never ran as Ply's fault.
+    fn ran(&self, to_run: &[usize], searched: Vec<Settled>) -> Vec<ply_test::Executed> {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut settled: BTreeMap<usize, Settled> =
+            searched.into_iter().map(|s| (s.test, s)).collect();
+        to_run
+            .iter()
+            .map(|&test| {
+                let mut slot = slots.remove(&(0, test)).unwrap_or_default();
+                match (settled.remove(&test), slot.once.take()) {
+                    (Some(search), _) => search.executed(slot.interleavings),
+                    (None, Some(once)) => once,
+                    (None, None) => ply_test::Executed::refused(test, never_ran(test)),
+                }
+            })
+            .collect()
+    }
+}
+
+/// How a report classes a run that ended with `failure`.
+fn status_word(failure: Option<&Diagnostic>, panicked: bool) -> &'static str {
+    match failure {
+        None => "passed",
+        Some(d) if d.code == codes::RUN_ABANDONED => "abandoned",
+        Some(d) if panicked || codes::is_defect(d.code) => "panicked",
+        Some(_) => "failed",
+    }
+}
+
+/// A seeded test's search, as the program settled it: what it ran, why it stopped at a failure,
+/// and how many roots it started from.
+struct Settled {
+    test: usize,
+    searched: ply_test::Searched,
+    failure: Option<Stopped>,
+    seeds: usize,
+}
+
+/// Why a search stopped at a seed, and what a less pruned search had to say about reaching it.
+struct Stopped {
+    why: Why,
+    notes: Vec<String>,
+}
+
+enum Why {
+    /// The run failed, with the diagnostic this run holds under the id.
+    Ran(usize),
+    /// The recording names no schedule.
+    Unscheduled {
+        seed: ply_eval::Seed,
+        span: Span,
+        what: String,
+    },
+    /// A replay did not take the schedule the seed names.
+    Diverged {
+        seed: ply_eval::Seed,
+        span: Span,
+        what: String,
+    },
+}
+
+impl Settled {
+    fn executed(self, runs: ply_test::Interleavings) -> ply_test::Executed {
+        let failure = self.failure.map(|stopped| stopped.diagnostic(runs.held()));
+        runs.settled(self.test, self.searched, failure, self.seeds)
+    }
+}
+
+impl Stopped {
+    fn diagnostic(self, held: &[Diagnostic]) -> Diagnostic {
+        let reproduce = |seed: &ply_eval::Seed| {
+            format!(
+                "reproduce with `--sim once --seed {seed}`, and report it with the test's source"
+            )
+        };
+        let stopped = match self.why {
+            Why::Ran(id) => held.get(id).cloned().unwrap_or_else(|| {
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!(
+                        "the search stopped at failure {id}, and the run holds {}",
+                        held.len()
+                    ),
+                )
+                .note("`sim.search` and the runtime are one run's two halves; this is Ply's fault")
+            }),
+            Why::Unscheduled { seed, span, what } => Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                "the scheduler recorded a step that does not describe a schedule",
+            )
+            .primary(span, "this step")
+            .note(what)
+            .note(reproduce(&seed)),
+            Why::Diverged { seed, span, what } => Diagnostic::error(
+                codes::SIMULATION_DIVERGENCE,
+                format!("replaying seed {seed} did not reproduce the recorded schedule"),
+            )
+            .primary(span, "this scheduling point")
+            .note(what)
+            .note(
+                "a simulated run must be a pure function of its definition set and its seed; this \
+                 is a defect in Ply rather than in the program under test",
+            )
+            .note(reproduce(&seed)),
+        };
+        self.notes.into_iter().fold(stopped, Diagnostic::note)
+    }
+}
+
+/// A `tests.Settled`: the test, the `sim.search.Exploration` its search came to, why it stopped,
+/// and how many roots it started from.
+fn settled_of(v: &PlyValue, span: Span) -> Result<Settled, Diagnostic> {
+    use crate::payload::{field_of, option_of};
+    let int = |v: &PlyValue, name: &str| field_of(v, name, span)?.as_int(span, name);
+    let nat = |v: &PlyValue, name: &str| -> Result<u64, Diagnostic> {
+        u64::try_from(int(v, name)?).map_err(|_| crate::payload::missing(name, span))
+    };
+    let flag = |v: &PlyValue, name: &str| field_of(v, name, span)?.as_bool(span, name);
+    let e = field_of(v, "exploration", span)?;
+    let cost = |name: &str| -> Result<Option<ply_test::Cost>, Diagnostic> {
+        option_of(field_of(e, name, span)?, name, span)?
+            .map(|c| {
+                Ok(ply_test::Cost {
+                    explored: u32::try_from(nat(c, "explored")?).unwrap_or(u32::MAX),
+                    bounded: flag(c, "bounded")?,
+                })
+            })
+            .transpose()
+    };
+    let searched = ply_test::Searched {
+        explored: u32::try_from(nat(e, "explored")?).unwrap_or(u32::MAX),
+        exhaustive: flag(e, "exhaustive")?,
+        exhausted: flag(e, "exhausted")?,
+        naive: cost("naive")?,
+        blind: cost("blind")?,
+        steps: nat(e, "steps")?,
+        virtual_time: int(e, "virtual_time")?,
+        failure: option_of(field_of(e, "failure", span)?, "a failing seed", span)?
+            .map(|seed| crate::recording::seed_of(seed, span))
+            .transpose()?,
+        race: option_of(field_of(e, "race", span)?, "a race", span)?
+            .map(|race| race_of(race, span))
+            .transpose()?,
+    };
+    let failure = option_of(field_of(v, "failure", span)?, "a search's failure", span)?
+        .map(|failure| stopped_of(failure, span))
+        .transpose()?;
+    Ok(Settled {
+        test: usize::try_from(nat(v, "test")?).unwrap_or(usize::MAX),
+        searched,
+        failure,
+        seeds: usize::try_from(nat(v, "seeds")?).unwrap_or(usize::MAX),
+    })
+}
+
+/// A `sim.search.Race`.
+fn race_of(v: &PlyValue, span: Span) -> Result<ply_test::Race, Diagnostic> {
+    use crate::payload::{field_of, option_of};
+    let site = |v: &PlyValue| -> Result<ply_test::RaceSite, Diagnostic> {
+        Ok(ply_test::RaceSite {
+            task: u64::try_from(field_of(v, "task", span)?.as_int(span, "a task")?)
+                .unwrap_or(u64::MAX),
+            definition: option_of(field_of(v, "definition", span)?, "a definition", span)?
+                .map(|d| d.as_str(span, "a definition").map(Symbol::new))
+                .transpose()?,
+            access: field_of(v, "access", span)?
+                .as_str(span, "an access")?
+                .to_string(),
+            span: crate::recording::span_of(field_of(v, "span", span)?, span)?,
+        })
+    };
+    Ok(ply_test::Race {
+        left: site(field_of(v, "left", span)?)?,
+        right: site(field_of(v, "right", span)?)?,
+        at: u32::try_from(field_of(v, "at", span)?.as_int(span, "a scheduling point")?)
+            .unwrap_or(u32::MAX),
+    })
+}
+
+/// A `sim.search.Failure<tests.Fell>`.
+fn stopped_of(v: &PlyValue, span: Span) -> Result<Stopped, Diagnostic> {
+    use crate::payload::field_of;
+    let why = field_of(v, "why", span)?;
+    let PlyValue::Ctor { name, args } = why else {
+        return Err(crate::payload::shape(why, span));
+    };
+    let payload = args
+        .first()
+        .ok_or_else(|| crate::payload::shape(why, span))?;
+    let at = |payload: &PlyValue| -> Result<(ply_eval::Seed, Span, String), Diagnostic> {
+        Ok((
+            crate::recording::seed_of(field_of(payload, "seed", span)?, span)?,
+            crate::recording::span_of(field_of(payload, "span", span)?, span)?,
+            field_of(payload, "what", span)?
+                .as_str(span, "what a recording got wrong")?
+                .to_string(),
+        ))
+    };
+    let why = match name
+        .as_str()
+        .rsplit_once('.')
+        .map_or(name.as_str(), |(_, n)| n)
+    {
+        "Ran" => Why::Ran(
+            usize::try_from(field_of(payload, "id", span)?.as_int(span, "a failure's id")?)
+                .unwrap_or(usize::MAX),
+        ),
+        "Unscheduled" => {
+            let (seed, span, what) = at(payload)?;
+            Why::Unscheduled { seed, span, what }
+        }
+        "Diverged" => {
+            let (seed, span, what) = at(payload)?;
+            Why::Diverged { seed, span, what }
+        }
+        _ => return Err(crate::payload::shape(why, span)),
+    };
+    let mut notes = Vec::new();
+    for note in field_of(v, "notes", span)?.as_list(span, "a failure's notes")? {
+        notes.push(note.as_str(span, "a note")?.to_string());
+    }
+    Ok(Stopped { why, notes })
+}
+
+/// What the program judged each mutant: `killed`, `survived`, or `skipped` or `unresolved` and why.
+fn verdicts_of(
+    v: &PlyValue,
+    span: Span,
+) -> Result<Vec<(usize, crate::mutate::Verdict)>, Diagnostic> {
+    use crate::mutate::Verdict;
+    use crate::payload::field_of;
+    let mut out = Vec::new();
+    for entry in v.as_list(span, "the verdicts")? {
+        let id = field_of(entry, "id", span)?.as_int(span, "a mutant's id")?;
+        let why = field_of(entry, "why", span)?
+            .as_str(span, "a verdict's reason")?
+            .to_string();
+        let verdict = match field_of(entry, "verdict", span)?.as_str(span, "a verdict")? {
+            "killed" => Verdict::Killed,
+            "survived" => Verdict::Survived,
+            "skipped" => Verdict::Skipped(why),
+            "unresolved" => Verdict::Unresolved(why),
+            other => {
+                return Err(Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("`{other}` is not a verdict a mutant can have"),
+                )
+                .primary(span, "the program handed this verdict over"));
+            }
+        };
+        out.push((usize::try_from(id).unwrap_or(usize::MAX), verdict));
+    }
+    Ok(out)
+}
+
+/// A mutant `mutant` could not build, as the program reads the verdict it already is.
+fn unbuilt_value(verdict: &crate::mutate::Verdict) -> PlyValue {
+    use crate::mutate::Verdict;
+    let (word, why) = match verdict {
+        Verdict::Killed => ("killed", ""),
+        Verdict::Survived => ("survived", ""),
+        Verdict::Skipped(why) => ("skipped", why.as_str()),
+        Verdict::Unresolved(why) => ("unresolved", why.as_str()),
+    };
+    record(vec![
+        ("verdict", PlyValue::str(word)),
+        ("why", PlyValue::str(why)),
+    ])
+}
+
+fn queued_value(queued: &Queued) -> PlyValue {
+    record(vec![
+        (
+            "mutants",
+            PlyValue::list(
+                queued
+                    .mutants
+                    .iter()
+                    .map(|(id, tests)| {
+                        record(vec![
+                            ("id", count(*id)),
+                            (
+                                "tests",
+                                PlyValue::list(tests.iter().map(|&i| count(i)).collect()),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("refused", diags_value(&queued.refused)),
+    ])
+}
+
+#[cold]
+fn nothing_built() -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "a test was run in a run that decided to execute nothing, so no unit was built to run it on",
+    )
+    .note("this is Ply's fault: the choice named no test to run and the program ran one anyway")
+}
+
+#[cold]
+fn never_ran(test: usize) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("test {test} was chosen to run, and the program never ran it"),
+    )
+    .note("a runner must never skip a test it chose; this is Ply's fault")
+}
+
+/// How many tests run at once: the lanes `--jobs` names, or one per core.
+fn workers(jobs: Option<u32>) -> usize {
+    match jobs {
+        Some(n) if n > 0 => n as usize,
+        _ => std::thread::available_parallelism().map_or(1, |n| n.get()),
+    }
+}
+
+/// What the run came to, filed under the keys the program named, and what a failure's cause is
+/// decided from.
+#[allow(clippy::too_many_arguments)]
+fn concluded(
     args: &TestOptions,
     cache: &mut Cache,
     loaded: &Loaded,
     hashes: &HashOutput,
     plan: &Plan,
-    choice: &ply_test::Choice,
     selection: &Selection,
-    search: &ply_eval::Plan,
     hosts: &Hosts,
     provider: Option<&'static dyn ply_eval::Provider>,
+    ran: Vec<ply_test::Executed>,
+    duration: Duration,
     mut warnings: Vec<Diagnostic>,
 ) -> (Over, ply_test::Hybrids) {
-    let (pool, workers) = build_pool(args.jobs, &mut warnings);
-    let simulation = ply_test::Search::of(selection).measuring(args.simulation.measure_reduction);
-    // A factory: a reactor belongs to its thread, and each worker builds its own machine.
-    let runtime = hosts.runtime_factory();
-    // A pooled test is measured on a worker thread of rayon's, which holds no thread-local budget
-    // and reads the process's, so the process's is what bounds a run. The diagnosis and the
-    // mutation below are measured on this thread, which sits inside the scope the `ply` program
-    // was entered under -- one that zeroed the thread-local budgets -- and the lookup prefers a
-    // thread-local to the process value, so those two need the scope as well as the setters.
-    ply_codegen::rt::set_step_budget(args.steps);
-    ply_codegen::rt::set_time_budget(args.timeout);
-    let mut hybrids = ply_test::Hybrids {
-        fresh: ply_store::body::of_front(&loaded.front),
-        per_failure: Vec::new(),
-    };
-    let (report, mutants) = ply_codegen::rt::with_step_budget(args.steps, || {
-        ply_codegen::rt::with_time_budget(args.timeout, || {
-            let mut run = || match provider {
-                Some(provider) => {
-                    let executor = ply_test::InterpExecutor::new(&loaded.front, provider)
-                        .with_search(simulation.clone())
-                        .with_hosts(hosting(hosts, &runtime));
-                    ply_test::run_with(
-                        selection,
-                        &loaded.check,
-                        hashes,
-                        &mut cache.store,
-                        &executor,
-                    )
-                }
-                None => ply_test::run_with(
-                    selection,
-                    &loaded.check,
-                    hashes,
-                    &mut cache.store,
-                    &NothingToRun,
-                ),
-            };
-            let report = match &pool {
-                Some(pool) => pool.install(run),
-                None => run(),
-            };
-            // After the run, since a pass recorded now is a valid baseline for another's failure.
-            // What changed and what a mixture would need are handed over; the program that reads
-            // the report decides everything about the cause.
-            hybrids =
-                ply_test::diagnose_failures(&report, &loaded.texts(), &loaded.front, &cache.store);
-            let escapes = hosts_escapes(&report, &loaded.check, hosts);
-            let ok = report.is_success() && escapes.is_empty();
-            // Only over a green program: a survivor of a red one says nothing.
-            let mutants = match (&args.mutate, ok) {
-                (Some(query), true) => match crate::mutate::targets(loaded, query) {
-                    Ok(targets) => Some(Ok(crate::mutate::run(
-                        loaded,
-                        hashes,
-                        &targets,
-                        args.mutate_budget,
-                        search,
-                        choice,
-                        plan,
-                        hosts,
-                        &runtime,
-                    ))),
-                    Err(diagnostic) => Some(Err(diagnostic)),
-                },
-                _ => None,
-            };
-            (report, mutants)
-        })
-    });
+    let report = ply_test::concluded(
+        selection,
+        &loaded.check,
+        hashes,
+        &mut cache.store,
+        ran,
+        duration,
+    );
+    // After the run, since a pass recorded now is a valid baseline for another's failure. What
+    // changed and what a mixture would need are handed over; the program that reads the report
+    // decides everything about the cause.
+    let hybrids =
+        ply_test::diagnose_failures(&report, &loaded.texts(), &loaded.front, &cache.store);
     warnings.extend(report.warnings.iter().cloned());
     // Pass records are read lazily, so an unreadable baseline only surfaces here.
     warnings.extend(cache.store.take_warnings());
@@ -1220,15 +1804,6 @@ fn execute(
     if let Some(unbuilt) = unbuilt_backend(provider) {
         escapes.push(unbuilt);
     }
-    let mutants = match mutants {
-        Some(Ok(report)) => Some(mutants_view(&report, loaded)),
-        // The query was resolved before the run, so this is a target that moved under it.
-        Some(Err(diagnostic)) => {
-            escapes.push(diagnostic);
-            None
-        }
-        None => None,
-    };
     let over = Over {
         hermetic: hosts.is_hermetic(),
         label: hosts.label().to_string(),
@@ -1242,7 +1817,7 @@ fn execute(
             .copied()
             .filter(|&index| reaches(hosts, &loaded.check, index))
             .collect(),
-        workers,
+        workers: workers(args.jobs),
         backend: Some(backend_view(provider, &report)),
         failures: report
             .failures
@@ -1263,7 +1838,6 @@ fn execute(
         simulation: report.simulation,
         escapes,
         warnings: once_each(warnings),
-        mutants,
         coverage: args
             .coverage
             .then(|| crate::mutate::coverage_json(loaded, hashes)),
@@ -1319,32 +1893,18 @@ impl Plan {
     }
 }
 
-/// The runtime's view of what the program decided, under this run's own filter: the tests it keeps,
-/// the classes filtered to them, and the roots each still owes. `--filter` cannot change which
-/// tests conflict, so a class only loses members.
-pub(crate) fn decided(
-    choice: &ply_test::Choice,
-    plan: &Plan,
-    check: &CheckOutput,
-    search: &ply_eval::Plan,
-) -> Selection {
+/// The runtime's view of what the program decided, under this run's own filter: the tests it keeps
+/// and the classes filtered to them. `--filter` cannot change which tests conflict, so a class only
+/// loses members.
+pub(crate) fn decided(choice: &ply_test::Choice, plan: &Plan, check: &CheckOutput) -> Selection {
     let keeps = |i: &usize| plan.visible.binary_search(i).is_ok();
-    let classes = |classes: &[Vec<usize>]| -> Vec<Vec<usize>> {
-        classes
+    let filtered = ply_test::Choice {
+        runs: choice.runs.iter().copied().filter(keeps).collect(),
+        groups: choice
+            .groups
             .iter()
             .map(|class| class.iter().copied().filter(keeps).collect::<Vec<usize>>())
             .filter(|class| !class.is_empty())
-            .collect()
-    };
-    let filtered = ply_test::Choice {
-        runs: choice.runs.iter().copied().filter(keeps).collect(),
-        groups: classes(&choice.groups),
-        every: classes(&choice.every),
-        narrowed: choice
-            .narrowed
-            .iter()
-            .filter(|(index, _)| keeps(index))
-            .map(|(index, roots)| (*index, roots.clone()))
             .collect(),
         filed: choice
             .filed
@@ -1354,7 +1914,7 @@ pub(crate) fn decided(
             .collect(),
         reasons: choice.reasons.clone(),
     };
-    let mut selection = Selection::chosen(&filtered, check, search);
+    let mut selection = Selection::chosen(&filtered, check);
     selection.out_of_scope = plan.out_of_scope.clone();
     selection
 }
@@ -1467,31 +2027,6 @@ pub fn hosts_escapes(report: &RunReport, check: &CheckOutput, hosts: &Hosts) -> 
         .collect()
 }
 
-/// What a run that decided to execute nothing hands the runner: it built no unit, so no test can
-/// be given a machine.
-struct NothingToRun;
-
-impl ply_test::Executor for NothingToRun {
-    type Worker = std::convert::Infallible;
-
-    fn worker(&self) -> Result<std::convert::Infallible, Diagnostic> {
-        Err(Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            "a test was scheduled in a run that decided to execute nothing, so no unit was built \
-             to run it on",
-        )
-        .note("this is Ply's fault: the choice named no test to run and scheduled one anyway"))
-    }
-
-    fn execute(
-        &self,
-        worker: &mut std::convert::Infallible,
-        _index: usize,
-    ) -> Result<(), Diagnostic> {
-        match *worker {}
-    }
-}
-
 /// An unbuilt backend declines every call, which would make a green run vacuous.
 fn unbuilt_backend(provider: Option<&'static dyn ply_eval::Provider>) -> Option<Diagnostic> {
     let unbuilt = provider.map_or(0, ply_eval::Provider::unbuilt);
@@ -1502,7 +2037,7 @@ fn unbuilt_backend(provider: Option<&'static dyn ply_eval::Provider>) -> Option<
         Diagnostic::error(
             codes::INTERNAL_ERROR,
             format!(
-                "{unbuilt} worker(s) could not build the `{}` backend, and every call they were \
+                "{unbuilt} thread(s) could not build the `{}` backend, and every call they were \
                  offered was declined",
                 provider.map_or("", ply_eval::Provider::name)
             ),
@@ -1557,7 +2092,6 @@ struct Found {
     declared: usize,
     cases: Vec<CaseView>,
     filtered_out: usize,
-    plan: SearchedRow,
     warnings: Vec<Diagnostic>,
     options: Value,
 }
@@ -1578,7 +2112,6 @@ struct Over {
     simulation: ply_test::SimSummary,
     escapes: Vec<Diagnostic>,
     warnings: Vec<Diagnostic>,
-    mutants: Option<MutantsView>,
     coverage: Option<Value>,
 }
 
@@ -1697,7 +2230,6 @@ fn found(
     loaded: &Loaded,
     hashes: &HashOutput,
     plan: &Plan,
-    search: &ply_eval::Plan,
     warnings: Vec<Diagnostic>,
 ) -> Found {
     let check = &loaded.check;
@@ -1742,21 +2274,10 @@ fn found(
             })
             .collect(),
         filtered_out: plan.filtered_out,
-        plan: SearchedRow::of(search),
         warnings,
         options: jsonlit!({
             "bisect": args.bisect.as_str(),
             "bisect_budget": args.bisect_budget,
-            // The whole plan: every field is in a seeded test's cache key.
-            "sim": {
-                "mode": search.mode.as_str(),
-                "seed": args.simulation.seed.as_ref().map(|s| s.to_string()),
-                "seeds": search.roots.len(),
-                "roots": search.roots,
-                "budget": u64::from(search.budget),
-                "steps": u64::from(search.steps),
-                "measure_reduction": args.simulation.measure_reduction,
-            },
         }),
     }
 }
@@ -1901,9 +2422,9 @@ fn fault(
     }
 }
 
-fn site_view(site: &ply_eval::RaceSite) -> SiteView {
+fn site_view(site: &ply_test::RaceSite) -> SiteView {
     SiteView {
-        task: site.task.to_string(),
+        task: format!("@{}", site.task),
         definition: site.definition.as_ref().map(|d| d.to_string()),
         access: site.access.to_string(),
         span: site.span,
@@ -2057,7 +2578,6 @@ fn found_value(found: Found) -> PlyValue {
             PlyValue::list(found.cases.iter().map(case_value).collect()),
         ),
         ("filtered_out", count(found.filtered_out)),
-        ("plan", searched_value(&found.plan)),
         ("warnings", diags_value(&found.warnings)),
         ("options", json(&found.options)),
     ])
@@ -2099,7 +2619,6 @@ fn knowledge_value(value: &KnowledgeValue) -> PlyValue {
                 .map(|answer| option(answer.as_deref().map(PlyValue::str)))
                 .collect(),
         ),
-        KnowledgeValue::Searched(row) => searched_value(row),
     }
 }
 
@@ -2210,6 +2729,33 @@ fn fault_value(f: &FaultView) -> PlyValue {
     ])
 }
 
+fn mutants_value(m: &MutantsView) -> PlyValue {
+    record(vec![
+        ("killed", count(m.killed)),
+        ("survived", count(m.survived)),
+        ("skipped", count(m.skipped)),
+        ("budget_spent", PlyValue::Bool(m.budget_spent)),
+        ("unreached", texts(&m.unreached)),
+        (
+            "survivors",
+            PlyValue::list(
+                m.survivors
+                    .iter()
+                    .map(|(definition, from, to, span)| {
+                        record(vec![
+                            ("definition", PlyValue::str(definition)),
+                            ("from", PlyValue::str(from)),
+                            ("to", PlyValue::str(to)),
+                            ("at", option(placed(*span))),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("json", json(&m.json)),
+    ])
+}
+
 fn ran_value(over: &Over) -> PlyValue {
     record(vec![
         ("hermetic", PlyValue::Bool(over.hermetic)),
@@ -2272,35 +2818,8 @@ fn ran_value(over: &Over) -> PlyValue {
         ),
         ("escapes", diags_value(&over.escapes)),
         ("warnings", diags_value(&over.warnings)),
-        (
-            "mutants",
-            option(over.mutants.as_ref().map(|m| {
-                record(vec![
-                    ("killed", count(m.killed)),
-                    ("survived", count(m.survived)),
-                    ("skipped", count(m.skipped)),
-                    ("budget_spent", PlyValue::Bool(m.budget_spent)),
-                    ("unreached", texts(&m.unreached)),
-                    (
-                        "survivors",
-                        PlyValue::list(
-                            m.survivors
-                                .iter()
-                                .map(|(definition, from, to, span)| {
-                                    record(vec![
-                                        ("definition", PlyValue::str(definition)),
-                                        ("from", PlyValue::str(from)),
-                                        ("to", PlyValue::str(to)),
-                                        ("at", option(placed(*span))),
-                                    ])
-                                })
-                                .collect(),
-                        ),
-                    ),
-                    ("json", json(&m.json)),
-                ])
-            })),
-        ),
+        // The program judges a mutation after the run, and sets this from what it judged.
+        ("mutants", option(None)),
         (
             "coverage",
             option(over.coverage.as_ref().map(|document| {
@@ -2425,7 +2944,6 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
         }
         Ok(out)
     };
-    let sim = field_of(v, "sim", span)?;
     let config = field_of(v, "config", span)?;
     Ok(TestOptions {
         front: None,
@@ -2476,7 +2994,6 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
             schema: opt_str_at(config, "schema", span)?,
         },
         std: bool_at("std")?,
-        simulation: crate::simulation::sim_options_of(sim, span)?,
     })
 }
 
@@ -2506,7 +3023,6 @@ impl Default for TestOptions {
             allow: Vec::new(),
             config: crate::config::ConfigOptions::default(),
             std: false,
-            simulation: crate::simulation::SimOptions::default(),
         }
     }
 }
