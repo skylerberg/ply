@@ -2,8 +2,7 @@
 
 use ply_eval::decode::At;
 use ply_eval::{SourceId, Span, Symbol, Value};
-use ply_prove::domain::Shape;
-use ply_prove::{Obligation, ObligationKind, Points, Sort, Strategy, Unsettled, World};
+use ply_prove::{Obligation, ObligationKind, Sort, Strategy, World};
 use std::sync::Arc;
 
 #[allow(clippy::arc_with_non_send_sync)]
@@ -294,47 +293,33 @@ fn flipped(how: Value) -> Value {
     obligation(KEY, vec![binder("b", con("Bool"), "Bool")], None, &[], how)
 }
 
+/// Which search a claim goes to is all the runtime reads of its strategy: what follows the constructor
+/// is the program's.
 #[test]
 fn every_strategy_reads_as_the_search_it_names() {
     let over = |how: Value| read(flipped(how)).strategy;
     let every = strategy("Every", vec![bool_domain(), Value::str("Bool")]);
-    let Strategy::Interleave(Points::Every(finite)) =
-        over(strategy("Interleave", vec![every.clone()]))
-    else {
-        panic!("an interleaving search over every point");
-    };
-    assert_eq!(finite.name.as_str(), "Bool");
-    assert_eq!(finite.points, 2);
     assert_eq!(
-        finite.shapes,
-        [Shape::Scalar {
-            name: "Bool".to_string(),
-            size: 2
-        }]
+        over(strategy("Interleave", vec![every.clone()])),
+        Strategy::Interleave
     );
-    assert!(matches!(
+    assert_eq!(
         over(strategy("Interleave", vec![strategy("Drawn", Vec::new())])),
-        Strategy::Interleave(Points::Drawn)
-    ));
-    assert!(matches!(
-        over(strategy("Hosted", Vec::new())),
-        Strategy::Hosted
-    ));
-    let Strategy::Static(Unsettled::Unhandled(row)) = over(strategy(
-        "Static",
-        vec![strategy("Unhandled", vec![Value::str("{m.store.read}")])],
-    )) else {
-        panic!("a static attempt, then the gap");
-    };
-    assert_eq!(row, "{m.store.read}");
-    assert!(matches!(
+        Strategy::Interleave
+    );
+    assert_eq!(over(strategy("Hosted", Vec::new())), Strategy::Hosted);
+    assert_eq!(
+        over(strategy(
+            "Static",
+            vec![strategy("Unhandled", vec![Value::str("{m.store.read}")])],
+        )),
+        Strategy::Static
+    );
+    assert_eq!(
         over(strategy("Static", vec![strategy("Run", vec![every])])),
-        Strategy::Static(Unsettled::Run(Points::Every(_)))
-    ));
-    assert!(matches!(
-        over(sampled()),
-        Strategy::Static(Unsettled::Run(Points::Drawn))
-    ));
+        Strategy::Static
+    );
+    assert_eq!(over(sampled()), Strategy::Static);
 }
 
 #[test]
@@ -353,64 +338,6 @@ fn a_strategy_the_reader_does_not_know_is_refused() {
     let why = refusal_of(&value);
     assert_eq!(why.path, "the world.obligations[0].strategy");
     assert!(why.message.contains("`Guess`"), "{why}");
-}
-
-/// A count the shapes do not multiply out to would walk a point twice or miss one.
-#[test]
-fn a_domain_its_shapes_do_not_count_is_refused() {
-    let counted = |points: i64| {
-        let domain = record(vec![
-            (
-                "shapes",
-                Value::list(vec![ty("Scalar", vec![Value::str("Bool"), Value::Int(2)])]),
-            ),
-            ("points", Value::Int(points)),
-        ]);
-        let every = strategy("Every", vec![domain, Value::str("Bool")]);
-        world(
-            vec![],
-            vec![],
-            vec![flipped(strategy(
-                "Static",
-                vec![strategy("Run", vec![every])],
-            ))],
-        )
-    };
-    let why = refusal_of(&counted(3));
-    assert!(
-        why.message
-            .contains("3 points, which the binders' shapes do not multiply out to"),
-        "{why}"
-    );
-    assert!(refusal_of(&counted(0)).message.contains("no points"));
-    assert!(World::decode(At::new("the world", &counted(2))).is_ok());
-}
-
-/// A point decodes one value per shape, and the body is entered with one per binder.
-#[test]
-fn a_domain_of_another_arity_than_its_claim_is_refused() {
-    let every = strategy("Every", vec![bool_domain(), Value::str("Bool")]);
-    let value = world(
-        vec![],
-        vec![],
-        vec![obligation(
-            KEY,
-            vec![
-                binder("b", con("Bool"), "Bool"),
-                binder("c", con("Bool"), "Bool"),
-            ],
-            None,
-            &[],
-            strategy("Interleave", vec![every]),
-        )],
-    );
-    let why = refusal_of(&value);
-    assert_eq!(why.path, "the world.obligations[0].strategy");
-    assert!(
-        why.message
-            .contains("a domain over 1 binder(s), for a claim of 2"),
-        "{why}"
-    );
 }
 
 #[test]
@@ -492,8 +419,5 @@ fn a_world_reads_its_types_its_signatures_and_its_obligations() {
     assert_eq!(o.binders.len(), 2);
     assert_eq!(o.result.as_ref().map(|b| b.name.as_str()), Some("result"));
     assert_eq!(o.variables, [Symbol::new("a"), Symbol::new("b")]);
-    assert!(matches!(
-        o.strategy,
-        Strategy::Static(Unsettled::Run(Points::Drawn))
-    ));
+    assert_eq!(o.strategy, Strategy::Static);
 }

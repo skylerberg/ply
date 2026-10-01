@@ -1,13 +1,8 @@
-use ply_eval::{DefHash, Span, Symbol, codes};
-use ply_prove::{
-    Binder, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation,
-    ObligationKind, Points, ProvePlan, Rule, Sort, Strategy, Tier, Unsettled, Vacuity, VacuityKind,
-};
+use ply_eval::DefHash;
+use ply_prove::{CaseReport, Certificate, Evidence, Rule, Tier};
 use ply_store::{CachedCases, CachedEvidence, CachedObligation, Store};
-use ply_test::obligation::{self, Choice, Discharger, from_cached, to_cached};
-use std::collections::BTreeMap;
+use ply_test::obligation::{from_cached, to_cached};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct TempRoot(PathBuf);
@@ -37,36 +32,6 @@ fn hash(byte: u8) -> DefHash {
     DefHash([byte; 32])
 }
 
-fn ensures(key: u8, owner: &str, index: usize) -> Obligation {
-    Obligation {
-        key: hash(key),
-        owner: Symbol::new(owner),
-        kind: ObligationKind::Ensures { index },
-        span: Span::DUMMY,
-        binders: vec![Binder {
-            name: Symbol::new("x"),
-            sort: Sort::int(),
-            text: "Int".to_string(),
-        }],
-        result: Some(Binder {
-            name: Symbol::new("result"),
-            sort: Sort::int(),
-            text: "Int".to_string(),
-        }),
-        variables: Vec::new(),
-        footprint: None,
-        strategy: Strategy::Static(Unsettled::Run(Points::Drawn)),
-        guards: Vec::new(),
-    }
-}
-
-fn tier(discharge: &Discharge) -> Option<Tier> {
-    match discharge {
-        Discharge::Held(evidence) => Some(evidence.tier()),
-        _ => None,
-    }
-}
-
 fn certificate() -> Certificate {
     Certificate {
         rules: vec![Rule::LinearArithmetic],
@@ -74,10 +39,6 @@ fn certificate() -> Certificate {
         guard_satisfiable: true,
         sorts: Vec::new(),
     }
-}
-
-fn proved() -> Discharge {
-    Discharge::Held(Evidence::Proof(certificate()))
 }
 
 fn cases(kept: u32) -> CaseReport {
@@ -88,113 +49,6 @@ fn cases(kept: u32) -> CaseReport {
         roots: vec![0],
         instantiations: Vec::new(),
     }
-}
-
-fn refuted() -> Discharge {
-    Discharge::Refuted(Counterexample {
-        bindings: Vec::new(),
-        original: Vec::new(),
-        shrinks: 0,
-        root: 0,
-        case: 0,
-        race: None,
-        sim_seed: None,
-    })
-}
-
-fn vacuous() -> Discharge {
-    Discharge::Vacuous(Vacuity {
-        guard: Span::DUMMY,
-        kind: VacuityKind::NoCaseKept { generated: 200 },
-    })
-}
-
-fn unattempted() -> Discharge {
-    Discharge::Unattempted(Gap::UnhandledEffect(None))
-}
-
-/// A prover with scripted answers that records every obligation it was asked about.
-struct Scripted {
-    answers: BTreeMap<DefHash, Discharge>,
-    asked: Mutex<Vec<DefHash>>,
-}
-
-impl Scripted {
-    fn new(answers: impl IntoIterator<Item = (DefHash, Discharge)>) -> Scripted {
-        Scripted {
-            answers: answers.into_iter().collect(),
-            asked: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Sorted: a discharge runs over a `par_iter`, so arrival order is the pool's.
-    fn asked(&self) -> Vec<DefHash> {
-        let mut asked = self.asked.lock().unwrap().clone();
-        asked.sort();
-        asked
-    }
-}
-
-impl Discharger for Scripted {
-    fn discharge(
-        &self,
-        obligation: &Obligation,
-        _plan: &ProvePlan,
-        _settled: &ply_prove::Static,
-    ) -> Discharge {
-        self.asked.lock().unwrap().push(obligation.key);
-        match self.answers.get(&obligation.key) {
-            Some(Discharge::Held(e)) => Discharge::Held(e.clone()),
-            Some(Discharge::Refuted(_)) => refuted(),
-            Some(Discharge::Vacuous(_)) => vacuous(),
-            _ => unattempted(),
-        }
-    }
-}
-
-/// The program's decision, carried out: every answered obligation's evidence is read back from the
-/// key the program named, and only the rest are discharged.
-fn carried_out(
-    obligations: Vec<Obligation>,
-    store: &Store,
-    read: Vec<(usize, DefHash)>,
-    to_discharge: Vec<usize>,
-    discharger: &Scripted,
-) -> ply_prove::ProveReport {
-    let choice = Choice {
-        claims: (0..obligations.len()).collect(),
-        statics: vec![ply_prove::Static::Inconclusive; to_discharge.len()],
-        to_discharge,
-        read,
-    };
-    obligation::Asked::chosen(obligations, &choice, store, &ProvePlan::default())
-        .discharge(discharger)
-}
-
-#[test]
-fn evidence_is_read_back_from_the_key_the_program_named_and_only_the_rest_is_discharged() {
-    let dir = TempRoot::new();
-    let mut store = dir.store();
-    // A sample, filed under a key of the program's choosing: nothing here encodes one.
-    store.put_obligation(hash(40), to_cached(&Evidence::Cases(cases(200))));
-    store.flush().unwrap();
-
-    let store = dir.store();
-    let scripted = Scripted::new([(hash(2), proved())]);
-    let report = carried_out(
-        vec![ensures(1, "m.f", 0), ensures(2, "m.g", 0)],
-        &store,
-        vec![(0, hash(40))],
-        vec![1],
-        &scripted,
-    );
-    assert_eq!(
-        scripted.asked(),
-        vec![hash(2)],
-        "an answered obligation is not attempted"
-    );
-    let tiers: Vec<Option<Tier>> = report.obligations.iter().map(|(_, d)| tier(d)).collect();
-    assert_eq!(tiers, vec![Some(Tier::Property), Some(Tier::Proved)]);
 }
 
 #[test]
@@ -244,76 +98,4 @@ fn a_proof_that_did_not_establish_its_guard_cannot_be_read() {
         c.guard_satisfiable = false;
     }
     assert!(from_cached(&entry).is_err());
-}
-
-#[test]
-fn only_what_was_asked_about_is_discharged_and_every_outcome_comes_back() {
-    let dir = TempRoot::new();
-    let store = dir.store();
-    let scripted = Scripted::new([
-        (hash(1), refuted()),
-        (hash(2), vacuous()),
-        (hash(3), unattempted()),
-    ]);
-    let report = carried_out(
-        vec![
-            ensures(1, "m.f", 0),
-            ensures(2, "m.g", 0),
-            ensures(3, "m.h", 0),
-        ],
-        &store,
-        Vec::new(),
-        vec![0, 1, 2],
-        &scripted,
-    );
-    assert_eq!(scripted.asked(), vec![hash(1), hash(2), hash(3)]);
-    // Each in the place it was asked about: what a run of them comes to is the program's to say.
-    let came_back: Vec<(&str, &str)> = report
-        .obligations
-        .iter()
-        .map(|(o, d)| {
-            let outcome = match d {
-                Discharge::Refuted(_) => "refuted",
-                Discharge::Vacuous(_) => "vacuous",
-                Discharge::Unattempted(_) => "unattempted",
-                Discharge::Held(_) => "held",
-                Discharge::Faulted(_) => "defect",
-            };
-            (o.owner.as_str(), outcome)
-        })
-        .collect();
-    assert_eq!(
-        came_back,
-        [
-            ("m.f", "refuted"),
-            ("m.g", "vacuous"),
-            ("m.h", "unattempted")
-        ]
-    );
-}
-
-/// A claim said to be cached whose evidence does not read back was lost by Ply, not left a gap.
-#[test]
-fn a_claim_neither_read_back_nor_discharged_is_plys_failure() {
-    let dir = TempRoot::new();
-    let store = dir.store();
-    let scripted = Scripted::new([]);
-    let report = carried_out(
-        vec![ensures(1, "m.f", 0)],
-        &store,
-        vec![(0, hash(40))],
-        Vec::new(),
-        &scripted,
-    );
-    assert!(
-        scripted.asked().is_empty(),
-        "a claim the cache answered is not discharged"
-    );
-    match &report.obligations[..] {
-        [(_, Discharge::Faulted(fault))] => {
-            assert_eq!(fault.diagnostic.code, codes::INTERNAL_ERROR);
-            assert!(fault.bindings.is_empty(), "no point was judged: {fault:?}");
-        }
-        other => panic!("a lost claim is Ply's failure, not {other:?}"),
-    }
 }
