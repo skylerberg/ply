@@ -1,0 +1,277 @@
+//! Every program under `tests/fixtures` has a test here named for it, which `ply check`s it before
+//! anything runs it for what it is for: one that exists to be refused is refused with exactly the
+//! errors listed beside its name, and every other one checks clean. A fixture a change to the
+//! language breaks fails as itself, rather than as the outcome some other test is waiting for.
+
+use crate::harness::{copy_sources, json_of, ply, repo, scratch};
+use serde_json::Value;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+fn fixture_root() -> PathBuf {
+    repo().join("tests/fixtures")
+}
+
+/// The fixture `name`, a file or a directory, as a project of its own, so nothing a run writes
+/// lands in the tree.
+fn copied(name: &str) -> TempDir {
+    let project = scratch();
+    let file = format!("{name}.ply");
+    let from = fixture_root().join(&file);
+    if from.is_file() {
+        std::fs::copy(&from, project.path().join(&file)).expect("the fixture is copied");
+    } else {
+        copy_sources(&fixture_root().join(name), project.path());
+    }
+    project
+}
+
+fn listing(errors: &[&Value]) -> String {
+    errors
+        .iter()
+        .map(|d| {
+            let at = d["labels"]
+                .as_array()
+                .and_then(|labels| labels.iter().find(|l| l["primary"] == true))
+                .map(|l| {
+                    format!(
+                        " at {}:{}",
+                        l["file"].as_str().unwrap_or("?"),
+                        l["start"]["line"]
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "  {} {}{at}\n",
+                d["code"].as_str().unwrap_or("?"),
+                d["message"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+#[track_caller]
+fn checks_as_listed(name: &str, refused: &[&str]) {
+    let project = copied(name);
+    let answer = json_of(
+        &ply(project.path())
+            .args(["check", "--json"])
+            .output()
+            .expect("`ply check` runs"),
+    );
+    let errors: Vec<&Value> = answer["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`ply check` answered no diagnostics array: {answer}"))
+        .iter()
+        .filter(|d| d["severity"] == "error")
+        .collect();
+    let mut found: Vec<&str> = errors
+        .iter()
+        .map(|d| d["code"].as_str().unwrap_or_default())
+        .collect();
+    found.sort_unstable();
+    let mut listed = refused.to_vec();
+    listed.sort_unstable();
+    if listed.is_empty() {
+        assert!(
+            found.is_empty(),
+            "`tests/fixtures/{name}` does not compile, so nothing that runs it reaches what it is \
+             for:\n{}",
+            listing(&errors)
+        );
+    } else {
+        assert_eq!(
+            found,
+            listed,
+            "`tests/fixtures/{name}` exists to be refused with exactly the errors listed for it:\n{}",
+            listing(&errors)
+        );
+    }
+}
+
+/// A test per fixture, named for it, with the errors `ply check` refuses it with: none for a
+/// program that is run for what it does.
+macro_rules! fixtures {
+    ($($name:ident: [$($code:literal),*],)*) => {
+        const LISTED: &[&str] = &[$(stringify!($name)),*];
+        $(
+            #[test]
+            fn $name() {
+                checks_as_listed(stringify!($name), &[$($code),*]);
+            }
+        )*
+    };
+}
+
+fixtures! {
+    ambiguous_import: ["E0108"],
+    arity_mismatch: ["E0202"],
+    artifact_invalid: [],
+    artifact_version: [],
+    assertion_failed: [],
+    bank_race: [],
+    concurrency_law_binder: [],
+    config_invalid: [],
+    config_missing: [],
+    config_unavailable: [],
+    config_undeclared: [],
+    deadlock: [],
+    decimal_division: ["E0209", "E0209"],
+    drain_incomplete: [],
+    duplicate_definition: ["E0105"],
+    duplicate_import: ["E0110"],
+    effect_in_spec: ["E0417", "E0417", "E0417"],
+    effect_not_permitted: ["E0302"],
+    effect_set_cycle: ["E0115"],
+    invalid_module_path: ["E0111"],
+    lang: [],
+    module_cycle: ["E0109"],
+    multi_shot_clause: [],
+    nested_simulation: ["E0416", "E0416"],
+    non_exhaustive_match: ["E0205"],
+    nondet_fail: ["E0412"],
+    nondet_in_det_test: ["E0412"],
+    not_a_function: ["E0204"],
+    not_derivable: ["E0206"],
+    not_derivable_map_key: ["E0206", "E0206"],
+    obligation_not_discharged: [],
+    occurs_check: ["E0203"],
+    orphan_derive: ["E0208"],
+    private_name: ["E0107"],
+    record_update_field: ["E0117"],
+    record_update_shape: ["E0116", "E0116"],
+    refuted_law: [],
+    reserved_module_name: ["E0133"],
+    resource_required: ["E0304"],
+    runtime_error: [],
+    secret_containment: ["E0101", "E0101", "E0201", "E0201", "E0201", "E0205", "E0418"],
+    secret_not_derivable: ["E0206", "E0206"],
+    self_handled_effect: [],
+    span_abandoned: [],
+    span_unbalanced: [],
+    task_escapes_scope: ["E0413"],
+    tls_credential_invalid: [],
+    tls_credential_unknown: [],
+    try_position: ["E0119"],
+    try_scope: ["E0118"],
+    type_mismatch: ["E0201"],
+    unbound_row_var: ["E0301"],
+    unexpected_token: ["E0001"],
+    unhandled_effect: [],
+    unknown_deriver: ["E0207", "E0207"],
+    unknown_effect: ["E0103"],
+    unknown_effect_set: ["E0114", "E0114"],
+    unknown_module: ["E0106"],
+    unknown_name: ["E0101"],
+    unknown_operation: ["E0104"],
+    unknown_type: ["E0102"],
+    unquantifiable_type: ["E0418", "E0418", "E0418"],
+    unscheduled_task: ["E0412", "E0412"],
+    unterminated_string: ["E0002"],
+    vacuous_law: [],
+}
+
+/// A fixture with no test here is one a change can break with nothing failing.
+#[test]
+fn every_fixture_is_listed() {
+    let on_disk: BTreeSet<String> = std::fs::read_dir(fixture_root())
+        .expect("tests/fixtures is readable")
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?.to_string();
+            // `ply` leaves a `.ply-cache` beside a program checked where it lies.
+            if name.starts_with('.') {
+                None
+            } else if path.is_dir() {
+                Some(name)
+            } else {
+                name.strip_suffix(".ply").map(str::to_string)
+            }
+        })
+        .collect();
+    let listed: BTreeSet<String> = LISTED.iter().map(|name| name.to_string()).collect();
+    let unlisted: Vec<&String> = on_disk.difference(&listed).collect();
+    let gone: Vec<&String> = listed.difference(&on_disk).collect();
+    assert!(
+        unlisted.is_empty(),
+        "these fixtures have no test: list each in `fixtures!` with the errors `ply check` refuses \
+         it with, or none: {unlisted:?}"
+    );
+    assert!(
+        gone.is_empty(),
+        "`fixtures!` lists these, and `tests/fixtures` holds no such program: {gone:?}"
+    );
+}
+
+fn tested(dir: &Path, flags: &[&str]) -> Value {
+    json_of(
+        &ply(dir)
+            .args(["test", "--json", "--no-cache"])
+            .args(flags)
+            .output()
+            .expect("`ply test` runs"),
+    )
+}
+
+#[track_caller]
+fn only_failure(report: &Value) -> &Value {
+    match report["failures"].as_array().map(Vec::as_slice) {
+        Some([failure]) => failure,
+        _ => panic!("expected exactly one failing test: {report}"),
+    }
+}
+
+/// Run end to end, `bank_race.ply`'s two transfers pass; the search moves one's balance check ahead
+/// of the other's debit, so both pass a check only one should. The failure names the two sides of
+/// that reordering, and the seed it prints replays it.
+#[test]
+fn the_search_finds_the_bank_race_and_its_seed_replays_it() {
+    let project = copied("bank_race");
+    let searched = tested(project.path(), &[]);
+    assert_eq!(searched["exit_code"], 1, "{searched}");
+    let failure = only_failure(&searched);
+    assert_eq!(
+        failure["key"], "bank_race.no account is ever overdrawn",
+        "{failure}"
+    );
+    assert_eq!(failure["diagnostic"]["code"], "E0501", "{failure}");
+    assert_eq!(
+        failure["diagnostic"]["message"], "assertion failed: expected 0, found 1",
+        "alice is overdrawn: {failure}"
+    );
+
+    let race = &failure["race"];
+    let sides = [&race["left"], &race["right"]];
+    let tasks: BTreeSet<&str> = sides.iter().filter_map(|s| s["task"].as_str()).collect();
+    let accesses: BTreeSet<&str> = sides.iter().filter_map(|s| s["access"].as_str()).collect();
+    assert_eq!(
+        tasks,
+        BTreeSet::from(["@1", "@2"]),
+        "the race is between the two transfers: {race}"
+    );
+    assert_eq!(
+        accesses,
+        BTreeSet::from([
+            "bank_race.bank.read[accounts]",
+            "bank_race.bank.write[accounts]"
+        ]),
+        "one transfer's balance check is reordered against the other's debit: {race}"
+    );
+
+    let seed = failure["seed"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a failure the search found carries its seed: {failure}"));
+    let test = "no account is ever overdrawn";
+    assert_eq!(
+        failure["replay"],
+        format!("ply test --seed {seed} --filter \"{test}\""),
+        "{failure}"
+    );
+    let replayed = tested(project.path(), &["--seed", seed, "--filter", test]);
+    assert_eq!(
+        only_failure(&replayed)["diagnostic"]["message"],
+        failure["diagnostic"]["message"],
+        "the seed the failure printed does not replay it: {replayed}"
+    );
+}
