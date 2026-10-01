@@ -2,8 +2,7 @@
 
 use ply_eval::decode::At;
 use ply_eval::{SourceId, Span, Symbol, Value};
-use ply_prove::domain::Shape;
-use ply_prove::{Obligation, ObligationKind, Points, Sort, Strategy, Unsettled, World};
+use ply_prove::{Obligation, ObligationKind, Sort, Strategy, World};
 use std::sync::Arc;
 
 #[allow(clippy::arc_with_non_send_sync)]
@@ -294,47 +293,33 @@ fn flipped(how: Value) -> Value {
     obligation(KEY, vec![binder("b", con("Bool"), "Bool")], None, &[], how)
 }
 
+/// Which search a claim goes to is all the runtime reads of its strategy: what follows the constructor
+/// is the program's.
 #[test]
 fn every_strategy_reads_as_the_search_it_names() {
     let over = |how: Value| read(flipped(how)).strategy;
     let every = strategy("Every", vec![bool_domain(), Value::str("Bool")]);
-    let Strategy::Interleave(Points::Every(finite)) =
-        over(strategy("Interleave", vec![every.clone()]))
-    else {
-        panic!("an interleaving search over every point");
-    };
-    assert_eq!(finite.name.as_str(), "Bool");
-    assert_eq!(finite.points, 2);
     assert_eq!(
-        finite.shapes,
-        [Shape::Scalar {
-            name: "Bool".to_string(),
-            size: 2
-        }]
+        over(strategy("Interleave", vec![every.clone()])),
+        Strategy::Interleave
     );
-    assert!(matches!(
+    assert_eq!(
         over(strategy("Interleave", vec![strategy("Drawn", Vec::new())])),
-        Strategy::Interleave(Points::Drawn)
-    ));
-    assert!(matches!(
-        over(strategy("Hosted", Vec::new())),
-        Strategy::Hosted
-    ));
-    let Strategy::Static(Unsettled::Unhandled(row)) = over(strategy(
-        "Static",
-        vec![strategy("Unhandled", vec![Value::str("{m.store.read}")])],
-    )) else {
-        panic!("a static attempt, then the gap");
-    };
-    assert_eq!(row, "{m.store.read}");
-    assert!(matches!(
+        Strategy::Interleave
+    );
+    assert_eq!(over(strategy("Hosted", Vec::new())), Strategy::Hosted);
+    assert_eq!(
+        over(strategy(
+            "Static",
+            vec![strategy("Unhandled", vec![Value::str("{m.store.read}")])],
+        )),
+        Strategy::Static
+    );
+    assert_eq!(
         over(strategy("Static", vec![strategy("Run", vec![every])])),
-        Strategy::Static(Unsettled::Run(Points::Every(_)))
-    ));
-    assert!(matches!(
-        over(sampled()),
-        Strategy::Static(Unsettled::Run(Points::Drawn))
-    ));
+        Strategy::Static
+    );
+    assert_eq!(over(sampled()), Strategy::Static);
 }
 
 #[test]
@@ -492,8 +477,5 @@ fn a_world_reads_its_types_its_signatures_and_its_obligations() {
     assert_eq!(o.binders.len(), 2);
     assert_eq!(o.result.as_ref().map(|b| b.name.as_str()), Some("result"));
     assert_eq!(o.variables, [Symbol::new("a"), Symbol::new("b")]);
-    assert!(matches!(
-        o.strategy,
-        Strategy::Static(Unsettled::Run(Points::Drawn))
-    ));
+    assert_eq!(o.strategy, Strategy::Static);
 }

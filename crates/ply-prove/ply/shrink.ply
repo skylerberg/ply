@@ -1,158 +1,500 @@
-// `shrink` — counterexample minimisation as pure logic over a re-run the caller owns.
+// `shrink` — making a counterexample small enough to read.
 //
-// The runtime owns what a value *is*: which candidates a value has, how big each of them is, and
-// what happens when one replaces it. What is decided here is the walk. Greedy descent: the first
-// candidate smaller than the value it replaces is accepted, and the whole walk starts again, so the
-// result is minimal in the sense that no single value can be made smaller without losing the
-// property. The number of re-runs is the budget a caller set, counted, not timed.
-//
-// This is why a counterexample is a *witness* rather than a dump: a value that is small enough to
-// read is the difference between a report someone acts on and one they scroll past.
+// Greedy descent: at each value of the tuple in turn, the first candidate smaller than the value it
+// replaces that still has the property is taken, and the walk starts again from the first value. The
+// result is minimal in that no single value can be made smaller without losing the property. The
+// number of re-runs is the budget, counted rather than timed, and the size measure is what makes the
+// walk end.
 
-// What the walk came to: how many candidates were kept, and how many were tried.
-pub type Descent = { steps: Int, evaluations: Int }
+import std.decimal (normalize, scale)
+import std.decimal
+import std.float (is_finite, is_nan, is_infinite, is_sign_negative, trunc)
+import std.float
+import std.string (code_points, of_code_points)
+import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VStr, VBytes, VList, VRecord,
+                  VCtor, VMap, VFn, VCell, VTask, VSecret, VElided, Field, Entry, FNamed, FAnonymous,
+                  FConst, FProject, FTable, map_of)
+import domain (Ty, Var, Fn, Record, Con)
+import gen (Types, Typed, Ungeneratable, UCell, UTask, USecret, UEffectful, UUninhabited, UTooDeep,
+            by_name, fields_of, generatable, hard_depth)
 
-// One candidate at one value, as the runtime offers it: the position to hand back, and how big the
-// candidate is. The size is the runtime's measure, because only it knows what a value contains.
-pub type Alt = { position: Int, size: Int }
+// The property the original input had, which every accepted candidate must keep.
+pub type Target = | Falsifies | Raises
 
-// What the walk asks the runtime, and what it answers. One conversation rather than a callback per
-// operation, because a row is one row: a function cannot take several closures that each perform
-// different operations, and the walk needs to read a value, try a candidate and take one.
-pub type Ask = | Offer(Int) | Would(Int, Int) | Take(Int, Int)
+// What the walk came to: the tuple it settled on, how many candidates were kept, and how many were
+// tried.
+pub type Descent = { values: List<Value>, steps: Int, evaluations: Int }
 
-pub type Reply = | Offered(Option<Offer>) | Tries(Bool) | Taken(Unit)
-
-// One value of a counterexample: how big it is now, and its candidates with theirs.
-pub type Offer = { here: Int, candidates: List<Alt> }
-
-// The walk. `width` is how many values the counterexample has, and `ask` is the conversation with
-// whichever side holds them.
-//
-// The values are the runtime's: a counterexample is a tuple of values of types this program never
-// named. What is decided here is the order and the stopping rule — greedy descent, where the first
-// candidate smaller than the value it replaces is taken and the walk starts again — and the budget,
-// counted in re-runs rather than seconds.
-pub fn descend<a | e>(width: Int, ask: (Ask) -> Reply / e, budget: Int) -> Descent / e =
-  walk(width, ask, budget, 0, 0)
-
-// One pass from `i` on: the first candidate that is smaller *and* still holds is taken, and the
-// caller starts again from the first value. `stopped` is the budget running out mid-pass, which ends
-// the whole walk rather than the pass — the caller asked for that many re-runs and no more.
-fn pass_over<a | e>(
-  width: Int,
-  ask: (Ask) -> Reply / e,
+// The walk. `holds` re-runs the claim at a tuple and says whether it still has the property; the
+// budget is how many re-runs it may cost.
+pub fn descend<| e>(
+  values: List<Value>,
+  tys: List<Ty>,
+  ts: Types,
+  holds: (List<Value>) -> Bool / e,
   budget: Int,
+) -> Descent / e = walk({ values: values, steps: 0, evaluations: 0 }, tys, ts, holds, budget)
+
+type Pass = { values: List<Value>, hit: Bool, stopped: Bool, evaluations: Int }
+
+fn walk<| e>(d: Descent, tys: List<Ty>, ts: Types, holds: (List<Value>) -> Bool / e, budget: Int) -> Descent / e = {
+  let pass = pass_over(d.values, 0, tys, ts, holds, budget, d.evaluations);
+  // A budget spent mid-pass stops the walk where it is rather than claiming minimality.
+  if pass.stopped || !pass.hit { { values: pass.values, steps: d.steps, evaluations: pass.evaluations } }
+  else { walk({ values: pass.values, steps: d.steps + 1, evaluations: pass.evaluations }, tys, ts, holds, budget) }
+}
+
+fn pass_over<| e>(
+  values: List<Value>,
   i: Int,
+  tys: List<Ty>,
+  ts: Types,
+  holds: (List<Value>) -> Bool / e,
+  budget: Int,
   evaluations: Int,
-) -> { hit: Bool, stopped: Bool, evaluations: Int } / e =
-  if i >= width { { hit: false, stopped: false, evaluations: evaluations } } else {
-    match ask(Offer(i)) {
-      Offered(None) -> { hit: false, stopped: false, evaluations: evaluations },
-      Offered(Some(offer)) -> {
-        let tried = try_alts(offer, i, ask, budget, evaluations);
-        if tried.stopped { { hit: false, stopped: true, evaluations: tried.evaluations } }
-        else if tried.hit { { hit: true, stopped: false, evaluations: tried.evaluations } }
-        else { pass_over(width, ask, budget, i + 1, tried.evaluations) }
+) -> Pass / e =
+  match (list_at(values, i), list_at(tys, i)) {
+    (Some(v), Some(t)) -> {
+      let here = size(v, ts);
+      let tried = try_alts(values, i, here, candidates(v, t, ts), ts, holds, budget, evaluations);
+      if tried.stopped || tried.hit { tried }
+      else { pass_over(values, i + 1, tys, ts, holds, budget, tried.evaluations) }
+    },
+    _ -> { values: values, hit: false, stopped: false, evaluations: evaluations },
+  }
+
+// The candidates at one value, in order. One no smaller than the value is skipped without being
+// counted — nothing was re-run for it — and the budget is checked only for one that would be.
+fn try_alts<| e>(
+  values: List<Value>,
+  i: Int,
+  here: U64,
+  alts: List<Value>,
+  ts: Types,
+  holds: (List<Value>) -> Bool / e,
+  budget: Int,
+  evaluations: Int,
+) -> Pass / e =
+  match alts {
+    [] -> { values: values, hit: false, stopped: false, evaluations: evaluations },
+    [alt, ..rest] -> if size(alt, ts) >= here {
+      try_alts(values, i, here, rest, ts, holds, budget, evaluations)
+    } else if evaluations >= budget { { values: values, hit: false, stopped: true, evaluations: evaluations } }
+    else {
+      let tried = list_set(values, i, alt);
+      if holds(tried) { { values: tried, hit: true, stopped: false, evaluations: evaluations + 1 } }
+      else { try_alts(values, i, here, rest, ts, holds, budget, evaluations + 1) }
+    },
+  }
+
+// --- Size ---------------------------------------------------------------------
+
+fn top() -> U64 = ~0u64
+
+fn plus(a: U64, b: U64) -> U64 = match checked_add(a, b) { Some(c) -> c, None -> top() }
+
+fn times(a: U64, b: U64) -> U64 = match checked_mul(a, b) { Some(c) -> c, None -> top() }
+
+fn least_int() -> Int = 0 - 9223372036854775807 - 1
+
+// `-5` is larger than `5`, which is what makes negating a negative a shrink.
+fn int_size(n: Int) -> U64 = {
+  let magnitude = if n >= 0 { u64_of_int(n) } else if n == least_int() { 9223372036854775808u64 } else { u64_of_int(0 - n) };
+  plus(times(magnitude, 2u64), if n < 0 { 1u64 } else { 0u64 })
+}
+
+fn width_of(ty: String) -> Int =
+  if ty == "U8" || ty == "I8" { 8 }
+  else if ty == "U16" || ty == "I16" { 16 }
+  else if ty == "U32" || ty == "I32" { 32 }
+  else if ty == "U64" || ty == "I64" { 64 }
+  else { 128 }
+
+// A width's value clamped into an `Int`, as the integer it is measured as.
+fn fixed_int(ty: String, bits: U128) -> Int = {
+  let w = width_of(ty);
+  let pattern = if w == 128 { bits } else { bits & (1u128 << w) - 1u128 };
+  let negative = string_starts_with(ty, "I") && pattern >> w - 1 == 1u128;
+  if negative {
+    // `2^w - pattern` is the magnitude.
+    let magnitude = if w == 128 { wrap_sub(0u128, pattern) } else { (1u128 << w) - pattern };
+    if magnitude > 9223372036854775808u128 { least_int() }
+    else if magnitude == 9223372036854775808u128 { least_int() }
+    else { 0 - int_of_u128(magnitude) }
+  } else if pattern > 9223372036854775807u128 { 9223372036854775807 }
+  else { int_of_u128(pattern) }
+}
+
+fn float_size(f: Float) -> U64 =
+  if is_nan(f) { top() }
+  else if is_infinite(f) { top() - 1u64 }
+  else {
+    // Measured over the bits: a saturating cast would make every large float one size and stall.
+    let magnitude = u64_of_int(bits_of_float(f) & 0x7FFF_FFFF_FFFF_FFFF);
+    plus(times(magnitude, 2u64), if is_sign_negative(f) { 1u64 } else { 0u64 })
+  }
+
+fn decimal_size(d: Decimal) -> U64 = {
+  let m = decimal::trunc(decimal::abs(d));
+  let magnitude =
+    if m <= 9223372036854775807m { u64_of_int(int_or_zero(m)) }
+    else if m <= 18446744073709551615m { plus(u64_of_int(int_or_zero(m - 9223372036854775808m)), 9223372036854775808u64) }
+    else { 288230376151711743u64 };
+  plus(
+    plus(plus(times(magnitude, 64u64), if decimal::fract(d) == 0m { 0u64 } else { 32u64 }), u64_of_int(scale(d))),
+    if decimal::is_negative(d) { 1u64 } else { 0u64 },
+  )
+}
+
+fn int_or_zero(d: Decimal) -> Int = match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 }
+
+// Each declared constructor's place among its type's variants.
+fn ctor_index(ts: Types, name: String) -> Int =
+  map_fold(ts, 0 - 1, |found: Int, _t: String, typed: Typed|
+    if found >= 0 { found }
+    else { fold(range(0, len(typed.decl.variants)), 0 - 1, |at: Int, i: Int|
+      if at >= 0 { at } else { match list_at(typed.decl.variants, i) { Some(v) -> if v.name == name { i } else { at }, None -> at } }) })
+
+fn sum<a>(xs: List<a>, f: (a) -> U64) -> U64 = fold(xs, 0u64, |acc: U64, x: a| plus(acc, f(x)))
+
+// A saturating structural measure, and the reason the walk ends.
+pub fn size(v: Value, ts: Types) -> U64 =
+  match v {
+    VInt(n) -> int_size(n),
+    VFixed(ty, bits) -> int_size(fixed_int(ty, bits)),
+    VBool(b) -> if b { 1u64 } else { 0u64 },
+    VUnit -> 0u64,
+    VFloat(f) -> float_size(f),
+    VDecimal(d) -> decimal_size(d),
+    VStr(s) -> sum(code_points(s), |c: Int| u64_of_int(1 + c)),
+    VBytes(b) -> sum(range(0, bytes_len(b)), |i: Int| u64_of_int(1 + bytes_at(b, i))),
+    VList(items) -> plus(u64_of_int(len(items)), sum(items, |x: Value| size(x, ts))),
+    // Keys count too, so replacing a key with a smaller one is a strict shrink.
+    VMap(entries) -> plus(u64_of_int(len(entries)), sum(entries, |e: Entry| plus(size(e.key, ts), size(e.value, ts)))),
+    VRecord(fields) -> sum(fields, |f: Field| size(f.value, ts)),
+    VCtor(name, args) -> plus(
+      plus(1u64, plus(u64_of_int(max(ctor_index(ts, name), 0)), u64_of_int(len(args)))),
+      sum(args, |x: Value| size(x, ts)),
+    ),
+    VFn(fun) -> match fun {
+      FConst(c) -> plus(2u64, size(c.value, ts)),
+      FProject(_) -> 1u64,
+      FTable(t) -> plus(4u64, plus(sum(t.entries, |e: Entry| plus(size(e.key, ts), size(e.value, ts))), size(t.default, ts))),
+      _ -> 1u64,
+    },
+    _ -> 0u64,
+  }
+
+// --- The floor ----------------------------------------------------------------
+
+// The smallest value of a type: where the walk bottoms out.
+pub fn minimal(t: Ty, ts: Types) -> Result<Value, Ungeneratable> = minimal_at(t, ts, 0)
+
+fn minimal_at(t: Ty, ts: Types, depth: Int) -> Result<Value, Ungeneratable> =
+  if depth >= hard_depth() { Err(UTooDeep) } else {
+    match t {
+      Var(_) -> Ok(VInt(0)),
+      Record(fields) -> match all_minimal(map(by_name(fields), |f: { name: String, ty: Ty }| f.ty), ts, depth + 1) {
+        Err(e) -> Err(e),
+        Ok(vs) -> Ok(VRecord(map(range(0, len(vs)), |i: Int|
+          { name: match list_at(by_name(fields), i) { Some(f) -> f.name, None -> "" }, value: match list_at(vs, i) { Some(v) -> v, None -> VUnit } }))),
       },
-      // A conversation that answers the wrong thing is the runtime's bug, not a smaller candidate.
-      _ -> { hit: false, stopped: true, evaluations: evaluations },
+      Fn(params, ret, pure) -> if !pure { Err(UEffectful) } else {
+        match minimal_at(ret, ts, depth + 1) { Err(e) -> Err(e), Ok(v) -> Ok(VFn(FConst({ arity: len(params), value: v }))) }
+      },
+      Con(name, args) ->
+        if name == "Int" { Ok(VInt(0)) }
+        else if string_starts_with(name, "U") && width_name(name) || string_starts_with(name, "I") && width_name(name) { Ok(VFixed(name, 0u128)) }
+        // `0.0`, not `-0.0`: the two are different values and the positive one is the floor.
+        else if name == "Float" { Ok(VFloat(0.0)) }
+        else if name == "Decimal" { Ok(VDecimal(0m)) }
+        else if name == "Bool" { Ok(VBool(false)) }
+        else if name == "String" { Ok(VStr("")) }
+        else if name == "Bytes" { Ok(VBytes(b"")) }
+        else if name == "Unit" { Ok(VUnit) }
+        else if name == "List" { Ok(VList([])) }
+        else if name == "Map" { Ok(VMap([])) }
+        else if name == "Cell" { Err(UCell) }
+        else if name == "Task" { Err(UTask) }
+        else if name == "Secret" { Err(USecret) }
+        else {
+          match shallowest(ts, name, args) {
+            None -> Err(UUninhabited(name)),
+            Some(v) -> match all_minimal(v.fields, ts, depth + 1) { Err(e) -> Err(e), Ok(vs) -> Ok(VCtor(v.name, vs)) },
+          }
+        },
     }
   }
 
-// The candidates at one value, in order. A candidate no smaller than the value is skipped without
-// being counted — nothing was re-run for it — and the budget is checked only for one that would be.
-fn try_alts<a | e>(
-  offer: Offer,
-  i: Int,
-  ask: (Ask) -> Reply / e,
-  budget: Int,
-  evaluations: Int,
-) -> { hit: Bool, stopped: Bool, evaluations: Int } / e =
-  match offer.candidates {
-    [] -> { hit: false, stopped: false, evaluations: evaluations },
-    [alt, ..rest] -> if alt.size >= offer.here {
-      try_alts({ ..offer, candidates: rest }, i, ask, budget, evaluations)
-    } else if evaluations >= budget { { hit: false, stopped: true, evaluations: evaluations } }
-    else {
-      match ask(Would(i, alt.position)) {
-        Tries(true) -> {
-          ask(Take(i, alt.position));
-          { hit: true, stopped: false, evaluations: evaluations + 1 }
+fn width_name(name: String) -> Bool =
+  fold(["U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "U128", "I128"], false, |f: Bool, w: String| f || w == name)
+
+fn all_minimal(tys: List<Ty>, ts: Types, depth: Int) -> Result<List<Value>, Ungeneratable> =
+  fold(tys, Ok([]), |acc: Result<List<Value>, Ungeneratable>, t: Ty|
+    match acc { Err(_) -> acc, Ok(vs) -> match minimal_at(t, ts, depth) { Err(e) -> Err(e), Ok(v) -> Ok(push(vs, v)) } })
+
+// The usable variant needing the fewest nested applications, the earlier declared on a tie.
+fn shallowest(ts: Types, name: String, args: List<Ty>) -> Option<{ name: String, fields: List<Ty> }> =
+  match map_get(ts, name) {
+    None -> None,
+    Some(typed) -> {
+      let best = fold(range(0, len(typed.decl.variants)), None, |acc: Option<{ depth: Int, name: String, fields: List<Ty> }>, i: Int|
+        match (list_at(typed.decl.variants, i), list_at(typed.depths, i)) {
+          (Some(v), Some(Some(d))) -> {
+            let fields = fields_of(v.fields, args);
+            if !fold(fields, true, |ok: Bool, f: Ty| ok && generatable(f, ts) == Ok(())) { acc }
+            else { match acc { Some(b) -> if d < b.depth { Some({ depth: d, name: v.name, fields: fields }) } else { acc }, None -> Some({ depth: d, name: v.name, fields: fields }) } }
+          },
+          _ -> acc,
+        });
+      match best { Some(b) -> Some({ name: b.name, fields: b.fields }), None -> None }
+    },
+  }
+
+// --- Candidates ---------------------------------------------------------------
+
+// Candidates for one value of type `t`, in the order two runs must agree on.
+pub fn candidates(v: Value, t: Ty, ts: Types) -> List<Value> = candidates_at(v, t, ts, 0)
+
+fn candidates_at(v: Value, t: Ty, ts: Types, depth: Int) -> List<Value> =
+  if depth >= hard_depth() { [] } else {
+    match v {
+      VInt(n) -> map(int_candidates(n), |c: Int| VInt(c)),
+      VFloat(f) -> map(float_candidates(f), |c: Float| VFloat(c)),
+      VDecimal(d) -> map(decimal_candidates(d), |c: Decimal| VDecimal(c)),
+      VBool(b) -> if b { [VBool(false)] } else { [] },
+      VStr(s) -> string_candidates(s),
+      VBytes(b) -> bytes_candidates(b),
+      VList(items) -> list_candidates(items, list_elem(t), ts, depth),
+      VMap(entries) -> {
+        let kv = map_types(t);
+        map_candidates(entries, kv.key, kv.value, ts, depth)
+      },
+      VRecord(fields) -> match t {
+        Record(field_tys) -> fold(range(0, len(fields)), [], |out: List<Value>, i: Int|
+          match list_at(fields, i) {
+            None -> out,
+            Some(f) -> match field_ty(field_tys, f.name) {
+              None -> out,
+              Some(ft) -> fold(candidates_at(f.value, ft, ts, depth + 1), out, |acc: List<Value>, c: Value|
+                push(acc, VRecord(list_set(fields, i, { name: f.name, value: c })))),
+            },
+          }),
+        _ -> [],
+      },
+      VCtor(name, args) -> match t {
+        Con(ty_name, ty_args) -> ctor_candidates(name, args, ty_name, ty_args, t, ts, depth),
+        _ -> [],
+      },
+      // The constant function is the floor, so the size test ends the walk on the next pass.
+      VFn(_) -> match t {
+        Fn(params, ret, _) -> match minimal(ret, ts) { Ok(m) -> [VFn(FConst({ arity: len(params), value: m }))], Err(_) -> [] },
+        _ -> [],
+      },
+      _ -> [],
+    }
+  }
+
+fn int_ty() -> Ty = Con("Int", [])
+
+fn list_elem(t: Ty) -> Ty =
+  match t { Con(name, args) -> if name == "List" { match list_at(args, 0) { Some(a) -> a, None -> int_ty() } } else { int_ty() }, _ -> int_ty() }
+
+fn map_types(t: Ty) -> { key: Ty, value: Ty } =
+  match t {
+    Con(name, args) -> if name == "Map" && len(args) == 2 {
+      { key: match list_at(args, 0) { Some(a) -> a, None -> int_ty() }, value: match list_at(args, 1) { Some(a) -> a, None -> int_ty() } }
+    } else { { key: int_ty(), value: int_ty() } },
+    _ -> { key: int_ty(), value: int_ty() },
+  }
+
+fn field_ty(fields: List<{ name: String, ty: Ty }>, name: String) -> Option<Ty> =
+  fold(fields, None, |found: Option<Ty>, f: { name: String, ty: Ty }| match found { Some(_) -> found, None -> if f.name == name { Some(f.ty) } else { None } })
+
+// Consecutive repeats removed, as `Vec::dedup` does.
+fn deduped<a>(xs: List<a>) -> List<a> =
+  fold(xs, [], |acc: List<a>, x: a| match list_at(acc, len(acc) - 1) { Some(last) -> if last == x { acc } else { push(acc, x) }, None -> push(acc, x) })
+
+fn int_candidates(n: Int) -> List<Int> =
+  if n == 0 { [] } else {
+    let halves = iterate({ out: [0], half: n / 2 }, 64, |s: { out: List<Int>, half: Int }|
+      if s.half == 0 { Stop(s.out) } else { Continue({ out: push(s.out, s.half), half: s.half / 2 }) });
+    let stepped = match checked_sub(n, if n > 0 { 1 } else { 0 - 1 }) { Some(step) -> push(halves, step), None -> halves };
+    let flipped = if n < 0 { match checked_neg(n) { Some(p) -> push(stepped, p), None -> stepped } } else { stepped };
+    deduped(filter(flipped, |c: Int| c != n))
+  }
+
+fn float_candidates(f: Float) -> List<Float> =
+  if f == 0.0 && !is_sign_negative(f) { [] }
+  else if !is_finite(f) { [0.0] }
+  else {
+    let truncated = trunc(f);
+    let start = if truncated != f { [0.0, truncated] } else { [0.0] };
+    let halves = iterate({ out: start, half: f / 2.0, left: 64 }, 66, |s: { out: List<Float>, half: Float, left: Int }|
+      if s.left == 0 || s.half == 0.0 || !is_finite(s.half) { Stop(s.out) }
+      else { Continue({ out: push(s.out, s.half), half: s.half / 2.0, left: s.left - 1 }) });
+    let flipped = if is_sign_negative(f) { push(halves, 0.0 - f) } else { halves };
+    // `!=`, not an order: `-0.0 == 0.0`, and keeping it would cycle the walk.
+    filter(flipped, |c: Float| c != f)
+  }
+
+fn decimal_candidates(d: Decimal) -> List<Decimal> =
+  if d == 0m && scale(d) == 0 { [] } else {
+    let normalized = normalize(d);
+    let start = if scale(normalized) != scale(d) { [0m, normalized] } else { [0m] };
+    let rounded = fold(range(0, scale(d)), start, |out: List<Decimal>, places: Int| push(out, decimal_round(d, places, Down)));
+    let halves = iterate({ out: rounded, half: d, left: 96 }, 98, |s: { out: List<Decimal>, half: Decimal, left: Int }|
+      if s.left == 0 { Stop(s.out) } else {
+        // Rounding to the widest scale rounds nothing: this is the exact quotient, at the scale it has.
+        let next = decimal_div(s.half, 2m, 28, Down);
+        if next != 0m && scale(next) <= scale(d) { Continue({ out: push(s.out, next), half: next, left: s.left - 1 }) }
+        else { Stop(s.out) }
+      });
+    let flipped = if decimal::is_negative(d) { push(halves, 0m - d) } else { halves };
+    let here = decimal_size(d);
+    deduped(filter(flipped, |c: Decimal| decimal_size(c) < here))
+  }
+
+fn bytes_candidates(b: Bytes) -> List<Value> =
+  if bytes_len(b) == 0 { [] } else {
+    let mid = bytes_len(b) / 2;
+    let start = if bytes_len(b) >= 2 { [VBytes(b""), VBytes(bytes_slice(b, 0, mid)), VBytes(bytes_slice(b, mid, bytes_len(b)))] } else { [VBytes(b"")] };
+    fold(range(0, bytes_len(b)), start, |out: List<Value>, i: Int| {
+      let byte = bytes_at(b, i);
+      fold([0, byte / 2], out, |acc: List<Value>, lowered: Int|
+        if lowered == byte { acc }
+        else { push(acc, VBytes(bytes_concat_all([bytes_slice(b, 0, i), byte_of_int(lowered), bytes_slice(b, i + 1, bytes_len(b))]))) })
+    })
+  }
+
+fn string_candidates(s: String) -> List<Value> = {
+  let chars = code_points(s);
+  if len(chars) == 0 { [] } else {
+    let text = |cs: List<Int>| match of_code_points(cs) { Some(t) -> t, None -> "" };
+    let mid = len(chars) / 2;
+    let start = if len(chars) >= 2 {
+      [VStr(""), VStr(text(map(range(0, mid), |i: Int| at_int(chars, i)))), VStr(text(map(range(mid, len(chars)), |i: Int| at_int(chars, i))))]
+    } else { [VStr("")] };
+    fold(range(0, len(chars)), start, |out: List<Value>, i: Int| {
+      let code = at_int(chars, i);
+      if code <= 97 { out } else {
+        fold([97, 97 + (code - 97) / 2], out, |acc: List<Value>, lowered: Int|
+          if lowered == code { acc }
+          else { match of_code_points(list_set(chars, i, lowered)) { Some(t) -> push(acc, VStr(t)), None -> acc } })
+      }
+    })
+  }
+}
+
+fn at_int(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(x) -> x, None -> 0 }
+
+fn without<a>(xs: List<a>, at: Int) -> List<a> =
+  fold(range(0, len(xs)), [], |out: List<a>, i: Int| if i == at { out } else { match list_at(xs, i) { Some(x) -> push(out, x), None -> out } })
+
+fn slice<a>(xs: List<a>, from: Int, to: Int) -> List<a> =
+  fold(range(from, to), [], |out: List<a>, i: Int| match list_at(xs, i) { Some(x) -> push(out, x), None -> out })
+
+fn list_candidates(items: List<Value>, elem: Ty, ts: Types, depth: Int) -> List<Value> =
+  if len(items) == 0 { [] } else {
+    let mid = len(items) / 2;
+    let start = if len(items) >= 2 { [VList([]), VList(slice(items, 0, mid)), VList(slice(items, mid, len(items)))] } else { [VList([])] };
+    let removed = fold(range(0, len(items)), start, |out: List<Value>, i: Int| push(out, VList(without(items, i))));
+    fold(range(0, len(items)), removed, |out: List<Value>, i: Int|
+      match list_at(items, i) {
+        None -> out,
+        Some(item) -> fold(candidates_at(item, elem, ts, depth + 1), out, |acc: List<Value>, c: Value| push(acc, VList(list_set(items, i, c)))),
+      })
+  }
+
+fn map_candidates(entries: List<Entry>, key: Ty, val: Ty, ts: Types, depth: Int) -> List<Value> =
+  if len(entries) == 0 { [] } else {
+    let removed = fold(range(0, len(entries)), [VMap([])], |out: List<Value>, i: Int| push(out, map_of(without(entries, i))));
+    let values = fold(range(0, len(entries)), removed, |out: List<Value>, i: Int|
+      match list_at(entries, i) {
+        None -> out,
+        Some(e) -> fold(candidates_at(e.value, val, ts, depth + 1), out, |acc: List<Value>, c: Value|
+          push(acc, map_of(list_set(entries, i, { key: e.key, value: c })))),
+      });
+    fold(range(0, len(entries)), values, |out: List<Value>, i: Int|
+      match list_at(entries, i) {
+        None -> out,
+        Some(e) -> fold(candidates_at(e.key, key, ts, depth + 1), out, |acc: List<Value>, c: Value|
+          push(acc, map_of(list_set(entries, i, { key: c, value: e.value })))),
+      })
+  }
+
+fn ctor_candidates(name: String, args: List<Value>, ty_name: String, ty_args: List<Ty>, t: Ty, ts: Types, depth: Int) -> List<Value> =
+  match map_get(ts, ty_name) {
+    None -> [],
+    Some(typed) -> {
+      let at = fold(range(0, len(typed.decl.variants)), 0 - 1, |found: Int, i: Int|
+        if found >= 0 { found } else { match list_at(typed.decl.variants, i) { Some(v) -> if v.name == name { i } else { found }, None -> found } });
+      match list_at(typed.decl.variants, at) {
+        None -> [],
+        Some(variant) -> {
+          let fields = fields_of(variant.fields, ty_args);
+          if len(fields) != len(args) { [] } else {
+            // A field of the value's own type is a smaller value of it.
+            let own = fold(range(0, len(fields)), [], |out: List<Value>, i: Int|
+              match (list_at(fields, i), list_at(args, i)) { (Some(f), Some(a)) -> if f == t { push(out, a) } else { out }, _ -> out });
+            // An earlier variant, built from this one's fields where their types match and the floor
+            // elsewhere.
+            let lower = fold(range(0, at), own, |out: List<Value>, j: Int|
+              match list_at(typed.decl.variants, j) {
+                None -> out,
+                Some(v) -> {
+                  let wanted = fields_of(v.fields, ty_args);
+                  let filled = fold(wanted, Some({ used: map(fields, |_f: Ty| false), values: [] }),
+                    |acc: Option<{ used: List<Bool>, values: List<Value> }>, want: Ty|
+                      match acc {
+                        None -> None,
+                        Some(st) -> {
+                          let found = fold(range(0, len(fields)), 0 - 1, |hit: Int, k: Int|
+                            if hit >= 0 { hit } else { match (list_at(fields, k), list_at(st.used, k)) { (Some(have), Some(false)) -> if have == want { k } else { hit }, _ -> hit } });
+                          if found >= 0 {
+                            match list_at(args, found) { Some(a) -> Some({ used: list_set(st.used, found, true), values: push(st.values, a) }), None -> None }
+                          } else { match minimal(want, ts) { Ok(m) -> Some({ used: st.used, values: push(st.values, m) }), Err(_) -> None } }
+                        },
+                      });
+                  match filled { Some(st) -> push(out, VCtor(v.name, st.values)), None -> out }
+                },
+              });
+            fold(range(0, len(fields)), lower, |out: List<Value>, i: Int|
+              match (list_at(fields, i), list_at(args, i)) {
+                (Some(f), Some(a)) -> fold(candidates_at(a, f, ts, depth + 1), out, |acc: List<Value>, c: Value| push(acc, VCtor(name, list_set(args, i, c)))),
+                _ -> out,
+              })
+          }
         },
-        _ -> try_alts({ ..offer, candidates: rest }, i, ask, budget, evaluations + 1),
       }
     },
   }
 
-fn walk<a | e>(
-  width: Int,
-  ask: (Ask) -> Reply / e,
-  budget: Int,
-  steps: Int,
-  evaluations: Int,
-) -> Descent / e = {
-  let pass = pass_over(width, ask, budget, 0, evaluations);
-  if pass.stopped {
-    // The budget ran out mid-pass: the walk stops where it is rather than claiming minimality.
-    { steps: steps, evaluations: pass.evaluations }
-  } else if pass.hit { walk(width, ask, budget, steps + 1, pass.evaluations) }
-  else { { steps: steps, evaluations: pass.evaluations } }
+// --- Tests --------------------------------------------------------------------
+
+fn no_types() -> Types = map_new()
+
+fn ints(xs: List<Int>) -> List<Value> = map(xs, |x: Int| VInt(x))
+
+test "an integer shrinks toward zero by halves, then by one, then by its sign" {
+  assert_eq(int_candidates(10), [0, 5, 2, 1, 9]);
+  assert_eq(int_candidates(0 - 6), [0, 0 - 3, 0 - 1, 0 - 5, 6]);
+  assert_eq(int_candidates(0), [])
 }
 
-// A scripted conversation with a counterexample of one value. The runtime holds the values and
-// updates them when a candidate is taken; here the answer is fixed, because what these tests are
-// about is what the walk *asks* and in what order, not what a value becomes.
-fn asked(size: Int, offers: List<Alt>, held: Bool) -> (Ask) -> Reply =
-  |q: Ask|
-    match q {
-      Offer(_i) -> Offered(Some({ here: size, candidates: offers })),
-      Would(_i, _position) -> Tries(held),
-      Take(_i, _position) -> Taken(()),
-    }
-
-test "greedy descent takes the first smaller candidate, not the smallest" {
-  // One re-run allowed, so the walk stops after its first acceptance — and the count is how many
-  // candidates it had to try to find one. Three would mean it looked past the first.
-  let out = descend(
-    1,
-    asked(9, [{ position: 5, size: 5 }, { position: 3, size: 3 }, { position: 2, size: 2 }], true),
-    1,
-  );
-  assert_eq(out.steps, 1);
-  assert_eq(out.evaluations, 1)
-}
-
-test "a candidate that loses the property is not taken, and the next one is tried" {
-  let out = descend(1, asked(9, [{ position: 3, size: 3 }, { position: 7, size: 7 }], false), 64);
-  assert_eq(out.steps, 0);
-  assert_eq(out.evaluations, 2)
+test "greedy descent takes the first smaller candidate that still holds, and starts again" {
+  let d = descend(ints([10]), [int_ty()], no_types(), |vs: List<Value>| match vs { [VInt(n)] -> n >= 3, _ -> false }, 64);
+  assert_eq(d.values, ints([3]));
+  assert(d.steps > 0)
 }
 
 test "a budget of re-runs is what stops the walk" {
-  let out = descend(
-    1,
-    asked(9, [{ position: 5, size: 5 }, { position: 3, size: 3 }, { position: 2, size: 2 }], true),
-    2,
-  );
-  // Two re-runs, and the third — which would still be within the walk's reach — is what the budget
-  // refuses.
-  assert_eq(out.steps, 2);
-  assert_eq(out.evaluations, 2)
+  let d = descend(ints([1000]), [int_ty()], no_types(), |_vs: List<Value>| true, 1);
+  assert_eq(d.evaluations, 1);
+  assert_eq(d.values, ints([0]))
 }
 
-test "a candidate no smaller than the value is never tried" {
-  let out = descend(
-    1,
-    asked(9, [{ position: 10, size: 10 }, { position: 11, size: 11 }], true),
-    64,
-  );
-  // Nothing was re-run, so nothing was spent: the budget is counted, not timed.
-  assert_eq(out.evaluations, 0)
-}
-
-test "a width of no values is a walk with nothing to do" {
-  let out = descend(0, asked(0, [], true), 8);
-  assert_eq(out.steps, 0);
-  assert_eq(out.evaluations, 0)
+test "a list shrinks by halves and by dropping an item before its items shrink" {
+  let cs = candidates(VList(ints([4, 2])), Con("List", [int_ty()]), no_types());
+  assert_eq(cs, [VList([]), VList(ints([4])), VList(ints([2])), VList(ints([2])), VList(ints([4])), VList(ints([0, 2])), VList(ints([2, 2])), VList(ints([1, 2])), VList(ints([3, 2])), VList(ints([4, 0])), VList(ints([4, 1]))])
 }
