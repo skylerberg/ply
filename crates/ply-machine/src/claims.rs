@@ -19,10 +19,9 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes};
-use ply_prove::{Certificate, Evidence, Fault, Obligation, ProvePlan, Rule, World};
+use crate::engine::{Fault, Obligation};
 use ply_store::ReviewRecord;
 use ply_store::Store;
-use ply_test::obligation::{from_cached, to_cached};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
@@ -42,27 +41,10 @@ const EFFECT: &str = "prover";
 /// holds every row to the program, because a tag that names no declaration is a placeless `no arm
 /// of this match matched` the moment the program matches the value.
 pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
-    ("proof.obligation", "Evidence", &["Proof", "Sampled"]),
     (
         "proof.obligation",
         "Judged",
         &["JHeld", "JFailed", "JRejected", "JRaised", "JFaulted"],
-    ),
-    (
-        "proof.rules",
-        "Rule",
-        &[
-            "GroundEvaluation",
-            "ExhaustiveEnumeration",
-            "LinearArithmetic",
-            "Propositional",
-            "CaseSplit",
-            "Congruence",
-            "Injectivity",
-            "Unfold",
-            "Induction",
-            "ExhaustiveInterleaving",
-        ],
     ),
 ];
 
@@ -102,11 +84,9 @@ pub struct Job {
     /// The front end the CLI ran. A run without one is refused rather than loading again: `ply
     /// prove` and `ply review` start one and hand its answer over.
     pub front: Option<crate::driver::HandedFront>,
-    /// The program as the prover reads it, and the obligations it owes, as the program built them.
-    pub world: World,
+    /// The obligations the program owes, as it built them.
     pub obligations: Vec<Obligation>,
     pub use_cache: bool,
-    pub plan: ProvePlan,
     /// `None` for a command that binds nothing at all, which is every `ply review`.
     pub binding: Option<Binding>,
 }
@@ -173,8 +153,8 @@ impl HostHandler for Site {
             ("configure", [options, front, world]) => {
                 let mut job = job_of(options, span)?;
                 job.front = Some(crate::driver::handed_front_of(front, span)?);
-                (job.world, job.obligations) =
-                    World::decode(ply_eval::decode::At::new("the world", world))
+                job.obligations =
+                    crate::engine::obligations_of(ply_eval::decode::At::new("the world", world))
                         .map_err(|e| unread_world(&e, span))?;
                 // A configuration begins a run, whatever the last one was left doing: its machine
                 // is dropped, which joins its thread, and its claims are no longer this run's.
@@ -185,8 +165,9 @@ impl HostHandler for Site {
                 PlyValue::Unit
             }
             ("collected", _) => self.collected()?,
-            ("outcomes", [keys]) => self.outcomes(&texts_of(keys, "the keys to look up", span)?)?,
-            ("prepared", _) => self.prepared()?,
+            ("prepared", [step_budget]) => {
+                self.prepared(step_budget.as_int(span, "the calls an evaluation may make")?)?
+            }
             ("cached", [keys]) => self.cached(&texts_of(keys, "the keys to read", span)?)?,
             ("judged", [batches]) => self.judged(batches_of(batches, span)?)?,
             ("interleaved", [claim, point, seed, steps]) => self.interleaved(
@@ -257,114 +238,19 @@ fn points_of(value: &PlyValue, span: Span) -> Result<Vec<Vec<ply_eval::Plain>>, 
     Ok(out)
 }
 
-fn instantiations_of(value: &PlyValue, span: Span) -> Result<Vec<(Symbol, String)>, Diagnostic> {
-    use crate::payload::field_of;
-    value
-        .as_list(span, "instantiations")?
-        .iter()
-        .map(|i| {
-            Ok((
-                Symbol::new(field_of(i, "var", span)?.as_str(span, "a variable")?),
-                field_of(i, "ty", span)?.as_str(span, "a type")?.to_string(),
-            ))
-        })
-        .collect()
-}
-
-/// A `proof.obligation.Evidence`.
-fn evidence_of(value: &PlyValue, span: Span) -> Result<Evidence, Diagnostic> {
-    use crate::payload::field_of;
-    let (name, args) = case_of(value, "evidence", span)?;
-    let fields = args
-        .first()
-        .ok_or_else(|| malformed("evidence is missing its fields", span))?;
-    Ok(match name {
-        "Proof" => Evidence::Proof(certificate_of(fields, span)?),
-        "Sampled" => Evidence::Cases(ply_prove::CaseReport {
-            generated: narrow(field_of(fields, "generated", span)?, "generated", span)?,
-            kept: narrow(field_of(fields, "kept", span)?, "kept", span)?,
-            rejected: narrow(field_of(fields, "rejected", span)?, "rejected", span)?,
-            roots: field_of(fields, "roots", span)?
-                .as_list(span, "roots")?
-                .iter()
-                .map(|r| narrow(r, "a root", span))
-                .collect::<Result<_, _>>()?,
-            instantiations: instantiations_of(field_of(fields, "instantiations", span)?, span)?,
-        }),
-        other => return Err(malformed(&format!("`{other}` is no evidence"), span)),
-    })
-}
-
-/// The evidence the program decided to file, each under the key it chose.
-fn filed_of(value: &PlyValue, span: Span) -> Result<Vec<(DefHash, Evidence)>, Diagnostic> {
+/// The evidence the program decided to file, each under the key it chose, as the text
+/// `proof.evidence` wrote: the store holds it and never reads it.
+fn filed_of(value: &PlyValue, span: Span) -> Result<Vec<(DefHash, serde_json::Value)>, Diagnostic> {
     use crate::payload::field_of;
     let mut out = Vec::new();
     for entry in value.as_list(span, "the evidence to file")? {
         let key = key_of(field_of(entry, "key", span)?.as_str(span, "a key")?, span)?;
-        out.push((key, evidence_of(field_of(entry, "evidence", span)?, span)?));
+        let text = field_of(entry, "evidence", span)?.as_str(span, "evidence")?;
+        let evidence = serde_json::from_str(text)
+            .map_err(|e| malformed(&format!("the evidence to file is no JSON: {e}"), span))?;
+        out.push((key, evidence));
     }
     Ok(out)
-}
-
-/// A `proof.obligation.Certificate`.
-fn certificate_of(value: &PlyValue, span: Span) -> Result<Certificate, Diagnostic> {
-    use crate::payload::field_of;
-    Ok(Certificate {
-        rules: field_of(value, "rules", span)?
-            .as_list(span, "a proof's rules")?
-            .iter()
-            .map(|rule| rule_of(rule, span))
-            .collect::<Result<_, _>>()?,
-        steps: narrow(field_of(value, "steps", span)?, "a proof's steps", span)?,
-        guard_satisfiable: field_of(value, "guard_satisfiable", span)?
-            .as_bool(span, "whether the guard is satisfiable")?,
-        sorts: field_of(value, "sorts", span)?
-            .as_list(span, "a proof's sorts")?
-            .iter()
-            .map(|sort| Ok(Symbol::new(sort.as_str(span, "a sort's name")?)))
-            .collect::<Result<_, Diagnostic>>()?,
-    })
-}
-
-/// A `proof.rules.Rule`.
-fn rule_of(value: &PlyValue, span: Span) -> Result<Rule, Diagnostic> {
-    use crate::payload::field_of;
-    let (name, args) = case_of(value, "a rule", span)?;
-    let fields = || {
-        args.first()
-            .ok_or_else(|| malformed(&format!("`{name}` is missing its fields"), span))
-    };
-    let field = |key: &str| field_of(fields()?, key, span);
-    let text = |key: &str| -> Result<Symbol, Diagnostic> {
-        Ok(Symbol::new(field(key)?.as_str(span, key)?))
-    };
-    Ok(match name {
-        "GroundEvaluation" => Rule::GroundEvaluation,
-        "ExhaustiveEnumeration" => Rule::ExhaustiveEnumeration {
-            domain: text("domain")?,
-            points: narrow(field("points")?, "points", span)?,
-        },
-        "LinearArithmetic" => Rule::LinearArithmetic,
-        "Propositional" => Rule::Propositional,
-        "CaseSplit" => Rule::CaseSplit {
-            ty: text("ty")?,
-            arms: narrow(field("arms")?, "arms", span)?,
-        },
-        "Congruence" => Rule::Congruence,
-        "Injectivity" => Rule::Injectivity,
-        "Unfold" => Rule::Unfold {
-            def: text("def")?,
-            depth: narrow(field("depth")?, "depth", span)?,
-        },
-        "Induction" => Rule::Induction {
-            binder: text("binder")?,
-            def: text("def")?,
-        },
-        "ExhaustiveInterleaving" => Rule::ExhaustiveInterleaving {
-            interleavings: narrow(fields()?, "interleavings", span)?,
-        },
-        other => return Err(malformed(&format!("`{other}` is no rule"), span)),
-    })
 }
 
 /// A constructor's simple name and its arguments.
@@ -382,12 +268,6 @@ fn case_of<'v>(
         )),
         _ => Err(malformed(&format!("{what} is no constructor"), span)),
     }
-}
-
-/// A count the program sent, in the width the runtime holds it at.
-fn narrow<T: TryFrom<i64>>(value: &PlyValue, what: &str, span: Span) -> Result<T, Diagnostic> {
-    T::try_from(value.as_int(span, what)?)
-        .map_err(|_| malformed(&format!("{what} is out of range"), span))
 }
 
 /// A value the program's types promise a shape for, without it: Ply disagreeing with itself.
@@ -468,28 +348,12 @@ impl Site {
         }
     }
 
-    /// The store's answer under each key, as a report prints one: `passed`, `failed`, or nothing.
-    fn outcomes(&self, keys: &[String]) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("outcomes"))?;
-        machine.ask(Go::Outcomes(keys.to_vec()))?;
-        match machine.step()? {
-            Step::Outcomes(answers) => Ok(PlyValue::list(
-                answers
-                    .iter()
-                    .map(|answer| crate::payload::option(answer.as_deref().map(PlyValue::str)))
-                    .collect(),
-            )),
-            _ => Err(out_of_step("outcomes")),
-        }
-    }
-
-    /// Binds the hosts and builds the prover a discharge runs against, once, and answers what
-    /// opening the hosts had to say.
-    fn prepared(&self) -> Result<PlyValue, Diagnostic> {
+    /// Binds the hosts and builds the prover a discharge runs against, once, each evaluation of a
+    /// claim bounded by `step_budget` calls, and answers what opening the hosts had to say.
+    fn prepared(&self, step_budget: i64) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("prepared"))?;
-        machine.ask(Go::Prepare)?;
+        machine.ask(Go::Prepare(step_budget))?;
         match machine.step()? {
             Step::Prepared(answer) => Ok(self.answered((*answer).map(|ready| {
                 *self.judging.write().unwrap_or_else(|e| e.into_inner()) = Some(ready.judging);
@@ -499,7 +363,7 @@ impl Site {
         }
     }
 
-    /// The evidence the store holds under each key, where it can be read.
+    /// The text the store holds under each key.
     fn cached(&self, keys: &[String]) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("cached"))?;
@@ -507,7 +371,7 @@ impl Site {
         match machine.step()? {
             Step::Cached(read) => Ok(PlyValue::list(
                 read.iter()
-                    .map(|evidence| crate::payload::option(evidence.as_ref().map(evidence_value)))
+                    .map(|text| crate::payload::option(text.as_deref().map(PlyValue::str)))
                     .collect(),
             )),
             _ => Err(out_of_step("cached")),
@@ -562,7 +426,7 @@ impl Site {
     }
 
     /// Files the evidence the program chose, each under the key it chose.
-    fn record(&self, entries: Vec<(DefHash, Evidence)>) -> Result<PlyValue, Diagnostic> {
+    fn record(&self, entries: Vec<(DefHash, serde_json::Value)>) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("record"))?;
         machine.ask(Go::Record(entries))?;
@@ -618,15 +482,14 @@ impl Site {
 
 /// What the program asks the machine for next.
 enum Go {
+    /// Bind the hosts and build the prover a discharge runs against, with the calls each
+    /// evaluation of a claim may make.
+    Prepare(i64),
     /// What the store holds under these keys. The program computes them — a plan key is part of
     /// the obligation's own encoding — so no row could carry the answers.
-    Outcomes(Vec<String>),
-    /// Bind the hosts and build the prover a discharge runs against.
-    Prepare,
-    /// The evidence filed under these keys.
     Cached(Vec<String>),
     /// File this evidence, each under the key the program chose for it.
-    Record(Vec<(DefHash, Evidence)>),
+    Record(Vec<(DefHash, serde_json::Value)>),
     /// The baseline a reader accepted for each of these definitions.
     Baselines(Vec<Symbol>),
     Accept(Vec<(Symbol, ReviewRecord)>),
@@ -634,10 +497,8 @@ enum Go {
 
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
-    /// The store's answer under each key asked about: `passed`, `failed`, or nothing.
-    Outcomes(Vec<Option<String>>),
     Prepared(Box<Result<Ready, Refused>>),
-    Cached(Vec<Option<Evidence>>),
+    Cached(Vec<Option<String>>),
     Recorded(Vec<Diagnostic>),
     Baselines(Vec<(String, ReviewRecord)>),
     Accepted(Box<Accepted>),
@@ -727,7 +588,6 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
         sources: loaded.sources.clone(),
         warnings: std::mem::take(&mut warnings),
         obligations: obligations.len(),
-        plan: job.plan.clone(),
         host: job.binding.as_ref().is_some_and(|b| b.host),
     }))));
 
@@ -736,25 +596,9 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     let mut prepared: Option<Result<Prepared, Refused>> = None;
     loop {
         match asked.recv() {
-            Ok(Go::Outcomes(keys)) => {
-                // What the *obligation* cache holds under each key, as a word: the program applies
-                // the rule (a proof only under the bare key, a sample only under its plan's), and
-                // only the runtime can decode an entry.
-                let answers: Vec<Option<String>> = keys
-                    .iter()
-                    .map(|key| {
-                        Some(match read_evidence(&store, key)? {
-                            Ok(Evidence::Proof(_)) => "proof".to_string(),
-                            Ok(Evidence::Cases(_)) => "sample".to_string(),
-                            Err(_) => "other".to_string(),
-                        })
-                    })
-                    .collect();
-                let _ = told.send(Step::Outcomes(answers));
-            }
-            Ok(Go::Prepare) => {
+            Ok(Go::Prepare(step_budget)) => {
                 if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded));
+                    prepared = Some(prepare(&job, &loaded, step_budget));
                 }
                 let answer = match prepared.as_ref() {
                     Some(Ok(ready)) => Ok(Ready {
@@ -769,13 +613,16 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
             Ok(Go::Cached(keys)) => {
                 let read = keys
                     .iter()
-                    .map(|key| read_evidence(&store, key).and_then(Result::ok))
+                    .map(|key| {
+                        let entry = DefHash::from_hex(key).and_then(|hash| store.obligation(hash))?;
+                        Some(entry.to_string())
+                    })
                     .collect();
                 let _ = told.send(Step::Cached(read));
             }
             Ok(Go::Record(entries)) => {
                 for (key, evidence) in entries {
-                    store.put_obligation(key, to_cached(&evidence));
+                    store.put_obligation(key, evidence);
                 }
                 let warnings = flushed(&mut store);
                 let _ = told.send(Step::Recorded(warnings));
@@ -876,7 +723,8 @@ struct Ready {
 struct Judging {
     prover: crate::engine::Prover,
     obligations: Vec<Obligation>,
-    plan: ProvePlan,
+    /// The calls each evaluation of a claim may make; it decides what an evaluation reports.
+    step_budget: i64,
     open: AtomicBool,
 }
 
@@ -885,7 +733,7 @@ impl Judging {
         match (self.obligations.get(batch.claim), values_of(&batch.points)) {
             (Some(obligation), Ok(values)) => self
                 .prover
-                .judged(obligation, &self.plan, &values, batch.mode),
+                .judged(obligation, self.step_budget, &values, batch.mode),
             (None, _) => vec![Judgement::Faulted(no_such_claim(
                 batch.claim,
                 self.obligations.len(),
@@ -912,7 +760,7 @@ impl Judging {
         match values_of(&[point]) {
             Ok(mut values) => self.prover.interleaved(
                 obligation,
-                &self.plan,
+                self.step_budget,
                 &values.pop().unwrap_or_default(),
                 seed,
                 steps,
@@ -922,7 +770,7 @@ impl Judging {
     }
 }
 
-fn prepare(job: &Job, loaded: &Loaded) -> Result<Prepared, Refused> {
+fn prepare(job: &Job, loaded: &Loaded, step_budget: i64) -> Result<Prepared, Refused> {
     let unbound = |diagnostics: Vec<Diagnostic>| Refused {
         why: Why::Unbound,
         diagnostics,
@@ -963,18 +811,11 @@ fn prepare(job: &Job, loaded: &Loaded) -> Result<Prepared, Refused> {
         judging: Arc::new(Judging {
             prover: crate::engine::prover(loaded, hosting, backend),
             obligations: job.obligations.clone(),
-            plan: job.plan.clone(),
+            step_budget,
             open: AtomicBool::new(true),
         }),
         warnings,
     })
-}
-
-/// The evidence filed under a key, read back: `None` for nothing there, an error for something this
-/// side cannot read.
-fn read_evidence(store: &Store, key: &str) -> Option<Result<Evidence, String>> {
-    let entry = DefHash::from_hex(key).and_then(|hash| store.obligation(hash))?;
-    Some(from_cached(&entry))
 }
 
 /// The values plain values name, on the thread that judges them.
@@ -1020,7 +861,6 @@ struct Collection {
     sources: SourceMap,
     warnings: Vec<Diagnostic>,
     obligations: usize,
-    plan: ProvePlan,
     /// Whether a `law/host` has a host bound to run against.
     host: bool,
 }
@@ -1049,20 +889,6 @@ fn refusal_value(refused: &Refused, module: &str) -> PlyValue {
     )
 }
 
-fn roots_value(roots: &[u64]) -> PlyValue {
-    PlyValue::list(roots.iter().map(|&root| tally(root)).collect())
-}
-
-fn plan_value(plan: &ProvePlan) -> PlyValue {
-    record(vec![
-        ("cases", tally(u64::from(plan.cases))),
-        ("roots", roots_value(&plan.roots)),
-        ("prove_budget", tally(u64::from(plan.prove_budget))),
-        ("shrink_budget", tally(u64::from(plan.shrink_budget))),
-        ("step_budget", PlyValue::Int(plan.step_budget)),
-    ])
-}
-
 fn hashes_value(hashes: &[DefHash]) -> PlyValue {
     PlyValue::list(hashes.iter().map(|h| PlyValue::str(h.to_hex())).collect())
 }
@@ -1071,107 +897,10 @@ fn collection_value(collection: Collection) -> PlyValue {
     record(vec![
         ("places", places_value(&collection.sources)),
         ("warnings", diags_value(&collection.warnings)),
-        ("plan", plan_value(&collection.plan)),
         ("host", PlyValue::Bool(collection.host)),
     ])
 }
 
-/// The prover's own account of a proof, placed under `rules` as it wrote it: the program adds keys
-/// around this document rather than deriving a second spelling of it.
-fn rules_value(rules: &[Rule]) -> PlyValue {
-    PlyValue::list(rules.iter().map(rule_value).collect())
-}
-
-/// A rule as `proof.rules` declares it.
-fn rule_value(rule: &Rule) -> PlyValue {
-    let fields = |fs: Vec<(&str, PlyValue)>| vec![record(fs)];
-    match rule {
-        Rule::GroundEvaluation => case("Rule", "GroundEvaluation", Vec::new()),
-        Rule::ExhaustiveEnumeration { domain, points } => case(
-            "Rule",
-            "ExhaustiveEnumeration",
-            fields(vec![
-                ("domain", PlyValue::str(domain.as_str())),
-                ("points", tally(*points)),
-            ]),
-        ),
-        Rule::LinearArithmetic => case("Rule", "LinearArithmetic", Vec::new()),
-        Rule::Propositional => case("Rule", "Propositional", Vec::new()),
-        Rule::CaseSplit { ty, arms } => case(
-            "Rule",
-            "CaseSplit",
-            fields(vec![
-                ("ty", PlyValue::str(ty.as_str())),
-                ("arms", tally(u64::from(*arms))),
-            ]),
-        ),
-        Rule::Congruence => case("Rule", "Congruence", Vec::new()),
-        Rule::Injectivity => case("Rule", "Injectivity", Vec::new()),
-        Rule::Unfold { def, depth } => case(
-            "Rule",
-            "Unfold",
-            fields(vec![
-                ("def", PlyValue::str(def.as_str())),
-                ("depth", tally(u64::from(*depth))),
-            ]),
-        ),
-        Rule::Induction { binder, def } => case(
-            "Rule",
-            "Induction",
-            fields(vec![
-                ("binder", PlyValue::str(binder.as_str())),
-                ("def", PlyValue::str(def.as_str())),
-            ]),
-        ),
-        Rule::ExhaustiveInterleaving { interleavings } => case(
-            "Rule",
-            "ExhaustiveInterleaving",
-            vec![tally(u64::from(*interleavings))],
-        ),
-    }
-}
-
-fn evidence_value(evidence: &Evidence) -> PlyValue {
-    match evidence {
-        Evidence::Proof(c) => case(
-            "Evidence",
-            "Proof",
-            vec![record(vec![
-                ("rules", rules_value(&c.rules)),
-                ("steps", tally(u64::from(c.steps))),
-                ("guard_satisfiable", PlyValue::Bool(c.guard_satisfiable)),
-                (
-                    "sorts",
-                    strings(c.sorts.iter().map(ply_eval::Symbol::as_str)),
-                ),
-            ])],
-        ),
-        Evidence::Cases(c) => case(
-            "Evidence",
-            "Sampled",
-            vec![record(vec![
-                ("generated", tally(u64::from(c.generated))),
-                ("kept", tally(u64::from(c.kept))),
-                ("rejected", tally(u64::from(c.rejected))),
-                ("roots", roots_value(&c.roots)),
-                (
-                    "instantiations",
-                    PlyValue::list(
-                        c.instantiations
-                            .iter()
-                            .map(|(var, ty)| {
-                                record(vec![
-                                    ("var", PlyValue::str(var.as_str())),
-                                    ("ty", PlyValue::str(ty)),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-            ])],
-        ),
-    }
-}
 
 /// The values a diagnostic's text names, which `std.value.filled` puts in place.
 fn shown_values(diagnostic: &Diagnostic) -> PlyValue {
@@ -1248,10 +977,6 @@ fn accepted_value(accepted: &Accepted) -> PlyValue {
         ("stored", PlyValue::Bool(accepted.stored)),
         ("warnings", diags_value(&accepted.warnings)),
     ])
-}
-
-fn tally(n: u64) -> PlyValue {
-    PlyValue::Int(n as i64)
 }
 
 // --- Small things -------------------------------------------------------------
@@ -1349,20 +1074,12 @@ fn unread_world(why: &ply_eval::decode::Error, span: Span) -> Diagnostic {
 
 /// The job record as the program builds it from the parsed line, read field by field.
 fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
-    use crate::payload::{field_of, opt_int_at, opt_str_at, str_list_at};
+    use crate::payload::{field_of, opt_str_at, str_list_at};
     let bool_at = |name: &str| field_of(v, name, span)?.as_bool(span, name);
     let str_at = |name: &str| {
         field_of(v, name, span)?
             .as_str(span, name)
             .map(str::to_string)
-    };
-    let prove = field_of(v, "prove", span)?;
-    let prove_opts = crate::simulation::ProveOptions {
-        prove_cases: opt_int_at(prove, "cases", span)?.map(|n| n as u32),
-        prove_roots: opt_int_at(prove, "roots", span)?.map(|n| n as u32),
-        prove_budget: opt_int_at(prove, "budget", span)?.map(|n| n as u32),
-        shrink_budget: opt_int_at(prove, "shrink_budget", span)?.map(|n| n as u32),
-        prove_steps: opt_int_at(prove, "steps", span)?,
     };
     let host = bool_at("host")?;
     let binding = if host {
@@ -1429,10 +1146,8 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
     Ok(Job {
         path: PathBuf::from(str_at("path")?),
         front: None,
-        world: World::default(),
         obligations: Vec::new(),
         use_cache: !bool_at("no_cache")?,
-        plan: crate::simulation::prove_plan(&prove_opts),
         binding,
     })
 }
