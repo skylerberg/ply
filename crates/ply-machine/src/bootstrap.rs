@@ -30,9 +30,7 @@ struct BootstrapOptions {
 }
 
 pub fn lent() -> Vec<Lent> {
-    let archive: Arc<dyn HostHandler> = Arc::new(Archive {
-        done: std::sync::Mutex::new(None),
-    });
+    let archive: Arc<dyn HostHandler> = Arc::new(Archive);
     OPERATIONS
         .into_iter()
         .map(|(op, path)| (registration(op, path), Arc::clone(&archive)))
@@ -86,26 +84,15 @@ impl Refused {
     }
 }
 
-struct Archive {
-    /// The emission, once the program has asked for it.
-    done: std::sync::Mutex<Option<Result<Emitted, Refused>>>,
-}
+struct Archive;
 
 impl Archive {
-    /// The emission runs when the program performs `emitted`, and once only.
-    fn emitted(
-        &self,
-        options: &PlyValue,
-        span: Span,
-    ) -> Result<Result<Emitted, Refused>, Diagnostic> {
-        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
-        if done.is_none() {
-            *done = Some(match options_of(options, span) {
-                Ok(o) => emit(&o),
-                Err(diagnostic) => Err(Refused::bare(diagnostic)),
-            });
+    /// The emission runs when the program performs `emitted`, over the options it names.
+    fn emitted(&self, options: &PlyValue, span: Span) -> Result<Emitted, Refused> {
+        match options_of(options, span) {
+            Ok(o) => emit(&o),
+            Err(diagnostic) => Err(Refused::bare(diagnostic)),
         }
-        Ok(done.as_ref().unwrap().clone())
     }
 }
 
@@ -113,7 +100,7 @@ impl HostHandler for Archive {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let value = match req.op.op.as_str() {
             "emitted" => {
-                match self.emitted(req.args.first().unwrap_or(&PlyValue::Unit), req.span)? {
+                match self.emitted(req.args.first().unwrap_or(&PlyValue::Unit), req.span) {
                     Ok(emitted) => PlyValue::ctor("Ok", vec![emitted_value(&emitted)]),
                     Err(why) => PlyValue::ctor("Err", vec![refusal_value(&why)]),
                 }
