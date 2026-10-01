@@ -1174,6 +1174,7 @@ Strings are indexed by character, bytes by byte.
 | `bytes_slice(b: Bytes, start: Int, end: Int) -> Bytes` | |
 | `bytes_concat(a: Bytes, b: Bytes) -> Bytes` | `a ++ b` |
 | `bytes_concat_all(bs: List<Bytes>) -> Bytes` | one allocation |
+| `bytes_blake3(b: Bytes) -> Bytes` | the 32-byte BLAKE3 digest |
 | `byte_of_int(n: Int) -> Bytes` | raises outside `0..=255` |
 | `bytes_of_string(s: String) -> Bytes` | |
 | `string_of_bytes(b: Bytes) -> String` | raises on invalid UTF-8 |
