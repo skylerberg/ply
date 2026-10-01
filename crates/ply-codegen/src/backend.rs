@@ -415,7 +415,7 @@ impl Bodies {
             return self.decline(|d| d.reentered += 1);
         };
 
-        let tables = Rc::clone(&ctx.tables);
+        let tables = std::sync::Arc::clone(&ctx.tables);
         if let Memo::Constant(index) = admitted.memo
             && let Some(kept) = tables.memoized(index)
             && let Some(value) = tables.memo_value(kept)

@@ -643,6 +643,36 @@ it and the function's result and everything evaluated before it is pure:
   position; after an impure argument (`g(h(x), k(x)?)`); or in a nested block.
   Bind the value first.
 
+### 5.9 `parallel`
+
+```ply
+fn both(xs: List<Int>) -> (Int, Int) =
+  parallel { fold(xs, 0, |a: Int, x: Int| a + x), len(filter(xs, |x: Int| x > 0)) }
+```
+
+`parallel { a, b, .. }` answers the tuple `(a, b, ..)` and means exactly that:
+the branches evaluated left to right. The runtime runs them at once, on threads
+of its own, wherever that cannot change the answer: the checker admits a block
+only when no two branches' rows conflict (§6.2), cells of a region opened
+outside the block included, so a branch reads nothing another writes. It takes
+two or more branches, and `parallel` is a name wherever no `{` follows it.
+
+* The block's row is the union of its branches'; it is as deterministic as they
+  are, so a deterministic test may hold one, and its result may be cached.
+* The leftmost failing branch is the block's failure, whichever failed first.
+  A branch to its right may already have performed its effects.
+* The branches spend one step budget between them (`E0503`, §8.4), as they would
+  in turn.
+* A block whose branches could reach a `handle` around it, a `simulate` region
+  (§9), or the production host runtime runs them in turn, which answers the
+  same. So does one whose branches hold a cell, a task or a continuation.
+* `E0309`: two branches perform operations of one effect on one resource, one
+  of them a `write`; or a branch's row is open (it calls a function value whose
+  row is a variable) while another performs anything; or a branch opens a
+  `simulate` region. `E0118`: a `?` inside a branch.
+
+`std.parallel` (§13.36) splits a list across nested blocks.
+
 ## 6. Effects and handlers
 
 ### 6.1 Declaring an effect
@@ -709,7 +739,9 @@ label and talk upstream under another, over one serve loop and one writer
 (§13.1, §13.2).
 
 Two atoms **conflict** iff they name the same resource of the same effect and
-one is a `write`.
+one is a `write`. A label parameter or `[*]` may be any label, so it conflicts
+with every label of its effect. `parallel` (§5.9) and the test scheduler (§8.4)
+both decide by this.
 
 ### 6.3 Performing
 
@@ -997,6 +1029,9 @@ effect sim           { read  seed() -> Int }
   `simulate`. `E0425`: a host operation inside the region, refused before the
   handler runs and whether or not it is bound; the region answers `task`,
   `clock`, `random` and `sim.seed` itself.
+* A `parallel` block (§5.9) inside a region runs its branches in turn, so the
+  scheduler sees nothing of it. A branch may not open a region (`E0309`): a
+  region's schedule is drawn from its entry's seed in the order regions open.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -2455,6 +2490,22 @@ runtime keeps values in (by kind, then by payload), which is a map's key order,
 and `map_of` builds a `VMap` in that order, a later entry for a key replacing an
 earlier one.
 
+### 13.36 `std.parallel`
+
+```ply
+pub fn grain() -> Int
+pub fn par_map<a, b>(xs: List<a>, f: (a) -> b) -> List<b>
+pub fn par_fold<a, b>(xs: List<a>, zero: b, step: (b, a) -> b, merge: (b, b) -> b) -> b
+```
+
+A list is cut in halves, each pair under a `parallel` block (§5.9), until a
+piece holds `grain()` items; the pieces are the same on every run, however many
+threads there are. `par_map` answers what `map` answers. `par_fold` folds each
+piece from `zero` with `step` and merges the pieces' answers left to right: it
+is `fold(xs, zero, step)` when `merge` is associative, `zero` is its identity
+and `step(b, x)` is `merge(b, step(zero, x))`, as for a sum or a list. `f`,
+`step` and `merge` are pure.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
@@ -2829,6 +2880,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
 | `E0307` | mutually recursive definitions binding different label or row parameters |
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
+| `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |
@@ -2890,7 +2942,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   variables; no exceptions; no typeclasses, implicits or method syntax; no
   modules-as-values or first-class effects; no `unsafe` or FFI.
 * Specs cannot name mutable state. Cycles are not collected, and a task never
-  moves between OS threads.
+  moves between OS threads; only a `parallel` block's branches run on threads
+  of the runtime's own.
 * No file handles — `fs` reads a range and appends by path, with nothing open
   between calls — and no recursive walk or permissions; no cancellation or
   backpressure; no migrations or live schema check; HTTP/1.1 only; no

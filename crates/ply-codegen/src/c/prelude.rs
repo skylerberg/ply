@@ -97,13 +97,6 @@ static inline Word ply_reset_flat(Word w) {
   return w;
 }
 
-static inline void ply_inc(Word w) {
-  if (!ply_is_imm(w) && w != 0) {
-    PlyObj *o = ply_obj(w);
-    if (o->rc != UINT32_MAX) o->rc += 1;
-  }
-}
-
 /* The word a field holds, at a statically known offset. */
 static inline Word ply_field_at(Word base, int at) { return ply_words(base)[at]; }
 static inline void ply_set_field(Word base, int at, Word v) { ply_words(base)[at] = v; }
@@ -194,6 +187,9 @@ helpers![
     // only while this table still starts with the one it was emitted against.
     ("rt_grow", 2, true),
     ("rt_bitnot", 1, true),
+    ("rt_inc_shared", 1, false),
+    ("rt_dec_shared", 1, false),
+    ("rt_parallel", 2, false),
 ];
 
 /// The line that opens the runtime's definitions: everything from it on is the unit's tail, the
@@ -225,12 +221,23 @@ pub fn runtime_header() -> String {
     // Singletons are heap addresses: bound at load, not baked in, or cached objects break.
     out.push_str("extern Word ply_true, ply_false, ply_unit;\n");
     // Trap: `rt_dec` frees unconditionally (it is `release_last`); only call it once `rc == 1`.
+    // A count with its top bit set is shared (`heap::SHARED`): tcc has no atomics, so the runtime
+    // changes it.
     out.push_str(
-        "\nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
+        "\nstatic inline void ply_inc(Word w) {\n\
          \x20 if (ply_is_imm(w) || w == 0) return;\n\
          \x20 PlyObj *o = ply_obj(w);\n\
-         \x20 if (o->rc == UINT32_MAX) return;\n\
-         \x20 if (o->rc > 1) { o->rc -= 1; return; }\n\
+         \x20 uint32_t rc = o->rc;\n\
+         \x20 if (rc < UINT32_C(0x80000000)) o->rc = rc + 1;\n\
+         \x20 else if (rc != UINT32_MAX) rt_inc_shared_p(0, w);\n\
+         }\n\
+         \nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
+         \x20 if (ply_is_imm(w) || w == 0) return;\n\
+         \x20 PlyObj *o = ply_obj(w);\n\
+         \x20 uint32_t rc = o->rc;\n\
+         \x20 if (rc == UINT32_MAX) return;\n\
+         \x20 if (rc >= UINT32_C(0x80000000)) { rt_dec_shared_p(ctx, w); return; }\n\
+         \x20 if (rc > 1) { o->rc = rc - 1; return; }\n\
          \x20 rt_dec_p(ctx, w);\n\
          }\n",
     );
