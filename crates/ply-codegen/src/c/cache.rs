@@ -2,6 +2,7 @@
 //! (`@@c3@@`), so a cached body is a function of the body alone.
 
 use super::tables::{Defined, Tables};
+use ply_eval::files::write_atomically;
 use ply_eval::{Symbol, Value};
 use std::path::PathBuf;
 
@@ -68,10 +69,7 @@ pub fn write_refusal(key: &str, reason: &str) {
     if std::fs::create_dir_all(&d).is_err() {
         return;
     }
-    let tmp = d.join(format!("{key}.{}.rtmp", std::process::id()));
-    if std::fs::write(&tmp, reason).is_ok() {
-        let _ = std::fs::rename(&tmp, d.join(format!("{key}.refused")));
-    }
+    let _ = write_atomically(&d.join(format!("{key}.refused")), reason.as_bytes());
 }
 
 /// The body kept under `key`, if one is.
@@ -86,11 +84,7 @@ pub fn write(key: &str, text: &str, tables: &Tables) {
         return;
     }
     let encoded = encode(text, tables);
-    // Renamed into place, so a reader never sees half a body.
-    let tmp = d.join(format!("{key}.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, encoded).is_ok() {
-        let _ = std::fs::rename(&tmp, d.join(format!("{key}.body")));
-    }
+    let _ = write_atomically(&d.join(format!("{key}.body")), encoded.as_bytes());
 }
 
 pub fn encode(text: &str, t: &Tables) -> String {
@@ -338,8 +332,8 @@ pub fn write_unit(key: &str, object: &str) {
     if std::fs::create_dir_all(&d).is_err() {
         return;
     }
-    let tmp = d.join(format!("{key}.{}.utmp", std::process::id()));
-    if std::fs::write(&tmp, format!("{object}\n")).is_ok() {
-        let _ = std::fs::rename(&tmp, d.join(format!("{key}.unit")));
-    }
+    let _ = write_atomically(
+        &d.join(format!("{key}.unit")),
+        format!("{object}\n").as_bytes(),
+    );
 }
