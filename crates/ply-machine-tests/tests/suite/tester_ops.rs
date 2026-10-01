@@ -208,8 +208,12 @@ fn a_program_runs_its_tests_through_the_family_and_files_what_it_decided() {
     let front = answered.front;
     let mut machine = Machine::new(&front, unit.attach()).expect("the unit is this program's");
     let mut registry = HostRegistry::new();
+    // Only what this program declares: a family's operation the program does not declare is a
+    // registration the binding refuses.
     for (op, handler) in ply_machine::tester::Session::new().lent() {
-        registry.register(op, handler);
+        if !["interleaved", "bodies", "interfaces"].contains(&op.op.as_str()) {
+            registry.register(op, handler);
+        }
     }
     let binding = registry.bind(&front.check).expect("the tester ops bind");
     machine.set_host_binding(Arc::new(binding));
