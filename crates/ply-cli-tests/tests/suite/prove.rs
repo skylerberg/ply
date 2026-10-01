@@ -789,6 +789,97 @@ law \"an ordinary claim\" forall (k: Int) { k == k }
     assert!(hosted["tier"].is_null(), "{hosted}");
 }
 
+/// Under `--host` a `law/host`'s body reaches the host it names: here the trace, whose span the
+/// body leaves open at every point it is judged at, which the report warns of once.
+#[test]
+fn a_law_host_reaches_the_host_under_host_and_its_warnings_are_reported() {
+    const SOURCE: &str = "\
+import std.trace
+import std.trace (trace)
+
+law/host \"a span left open is warned of\" forall (n: Int) where n > 0 {
+  let _ = trace.enter[orders](\"checking\", map_new());
+  n > 0
+}
+";
+    let warning =
+        "1 span was still open when its task or the entry point ended: `checking` on `orders`";
+    let dir = project(SOURCE);
+    let out = ply(dir.path())
+        .args(["prove", "--host", "--no-cache", "--json"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    let law = &v["obligations"][0];
+    assert!(
+        law["outcome"] == "property" || law["outcome"] == "example",
+        "the law held at the points it was judged at: {v}"
+    );
+    assert_eq!(v["summary"]["unattempted"], 0, "{v}");
+    assert_eq!(v["summary"]["defect"], 0, "{v}");
+    let warned: Vec<&Value> = v["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the report carries warnings: {v}"))
+        .iter()
+        .filter(|w| w["code"] == "W0609")
+        .collect();
+    assert_eq!(warned.len(), 1, "warned once, however many points: {v}");
+    assert_eq!(warned[0]["message"], warning, "{v}");
+
+    let out = ply(dir.path())
+        .args(["prove", "--host", "--no-cache"])
+        .output()
+        .unwrap();
+    let text = stdout_of(&out);
+    assert_eq!(
+        text.matches(warning).count(),
+        1,
+        "the report says it once: {text}"
+    );
+}
+
+/// Shrinking a `law/host`'s counterexample re-enters its body, and what those entries end with is
+/// reported with the rest. Each span is named for its point, so the point the walk settled on names
+/// one only the walk's own entries opened.
+#[test]
+fn what_a_law_hosts_shrinking_entries_end_with_is_reported() {
+    const SOURCE: &str = "\
+import std.trace
+import std.trace (trace)
+
+law/host \"below ten\" forall (n: Int) where n > 0 {
+  let _ = trace.enter[orders](int_to_string(n), map_new());
+  n < 10
+}
+";
+    let dir = project(SOURCE);
+    let v = json_of(
+        &ply(dir.path())
+            .args(["prove", "--host", "--no-cache", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let counterexample = &v["obligations"][0]["counterexample"];
+    assert!(
+        counterexample["shrinks"].as_u64().is_some_and(|n| n > 0),
+        "the walk took steps: {v}"
+    );
+    let settled = counterexample["bindings"][0]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the walk settled on a point: {v}"));
+    let named = format!("`{settled}` on `orders`");
+    let warned = v["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|w| {
+            w["code"] == "W0609" && w["message"].as_str().is_some_and(|m| m.contains(&named))
+        })
+    });
+    assert!(
+        warned,
+        "the span the settled point's entry left open was not warned of: {v}"
+    );
+}
+
 /// A cached proof survives every plan widening, so only a key over the whole transitive closure keeps it current.
 #[test]
 fn editing_what_a_proof_rests_on_re_opens_it() {
