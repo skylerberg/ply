@@ -64,17 +64,12 @@ pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
 }
 
 fn lay_out(dir: &Path, sources: &[(String, String)]) -> std::io::Result<()> {
+    use ply_eval::files::write_atomically;
     std::fs::create_dir_all(dir)?;
     for (name, text) in sources {
-        land_in(dir, &format!("{name}.ply"), text.as_bytes())?;
+        write_atomically(&dir.join(format!("{name}.ply")), text.as_bytes())?;
     }
-    land_in(dir, SHELF_MARKER, b"ok")
-}
-
-fn land_in(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, dir.join(name))
+    write_atomically(&dir.join(SHELF_MARKER), b"ok")
 }
 
 /// Enter the program on the command's own big-stack thread; the answer is the exit code it asked

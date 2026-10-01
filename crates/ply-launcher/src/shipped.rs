@@ -164,15 +164,10 @@ fn refused_entry(built: &crate::artifact::Built) -> Diagnostic {
     diagnostic.note(crate::artifact::refusal_list(&built.refused))
 }
 
-/// By a rename, so a reader never sees half of one.
 fn land(at: &Path, bytes: &[u8]) {
     let Some(parent) = at.parent() else { return };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let tmp = parent.join(format!("{ARTIFACT}.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, at).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if std::fs::create_dir_all(parent).is_ok() {
+        let _ = ply_eval::files::write_atomically(at, bytes);
     }
 }
 
