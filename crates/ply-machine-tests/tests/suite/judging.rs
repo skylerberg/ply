@@ -3,9 +3,8 @@
 //! judgements come to, is `proof.property`'s, pinned by its own tests.
 
 use crate::fixture::{loaded, project};
-use ply_eval::{DefHash, Seed, Span, Symbol, Value, codes};
-use ply_machine::engine::{Judgement, Mode, Prover};
-use ply_prove::{Binder, Obligation, ObligationKind, ProvePlan, Sort, Strategy};
+use ply_eval::{Seed, Span, Symbol, Value, codes};
+use ply_machine::engine::{Binder, Judgement, Mode, Obligation, ObligationKind, Prover, Strategy};
 
 const SOURCE: &str = r#"
 law "halving a choice" forall (b: Bool) { (if b { 4 } else { 6 }) / 2 > 1 }
@@ -34,24 +33,20 @@ fn capped(n: Int) -> Int
 = if n > 10 { 10 } else { n }
 "#;
 
-fn binder(name: &str, sort: Sort, text: &str) -> Binder {
+fn binder(name: &str, text: &str) -> Binder {
     Binder {
         name: Symbol::new(name),
-        sort,
         text: text.to_string(),
     }
 }
 
 fn claim(owner: &str, kind: ObligationKind, binders: Vec<Binder>, guards: usize) -> Obligation {
     Obligation {
-        key: DefHash([7; 32]),
         owner: Symbol::new(owner),
         kind,
         span: Span::DUMMY,
         binders,
         result: None,
-        variables: Vec::new(),
-        footprint: Some("{m.db.read[users]}".to_string()),
         strategy: Strategy::Static,
         guards: vec![Span::DUMMY; guards],
     }
@@ -61,7 +56,7 @@ fn over_a_bool(owner: &str) -> Obligation {
     claim(
         owner,
         ObligationKind::Law,
-        vec![binder("b", Sort::bool(), "Bool")],
+        vec![binder("b", "Bool")],
         0,
     )
 }
@@ -70,7 +65,7 @@ fn over_an_int(owner: &str, guards: usize) -> Obligation {
     claim(
         owner,
         ObligationKind::Law,
-        vec![binder("n", Sort::int(), "Int")],
+        vec![binder("n", "Int")],
         guards,
     )
 }
@@ -78,11 +73,11 @@ fn over_an_int(owner: &str, guards: usize) -> Obligation {
 /// `capped`'s `ensures` clause `index`, under its one `requires`.
 fn capped(index: usize) -> Obligation {
     Obligation {
-        result: Some(binder("result", Sort::int(), "Int")),
+        result: Some(binder("result", "Int")),
         ..claim(
             "m.capped",
             ObligationKind::Ensures { index },
-            vec![binder("n", Sort::int(), "Int")],
+            vec![binder("n", "Int")],
             1,
         )
     }
@@ -105,7 +100,7 @@ fn ints(ns: &[i64]) -> Vec<Vec<Value>> {
 }
 
 fn judged(obligation: &Obligation, points: &[Vec<Value>], mode: Mode) -> Vec<Judgement> {
-    with_prover(|prover| prover.judged(obligation, &ProvePlan::default(), points, mode))
+    with_prover(|prover| prover.judged(obligation, ply_eval::DEFAULT_STEP_BUDGET, points, mode))
 }
 
 /// Each judgement's name, with the code a stopped one carries.
@@ -211,8 +206,8 @@ fn an_entry_the_tier_declines_is_plys_failure() {
         "m.halving a choice",
         ObligationKind::Law,
         vec![
-            binder("b", Sort::bool(), "Bool"),
-            binder("spare", Sort::bool(), "Bool"),
+            binder("b", "Bool"),
+            binder("spare", "Bool"),
         ],
         0,
     );
@@ -267,7 +262,7 @@ fn a_run_that_reaches_no_region_is_unobserved_and_keeps_its_verdict() {
     let run = with_prover(|prover| {
         prover.interleaved(
             &law,
-            &ProvePlan::default(),
+            ply_eval::DEFAULT_STEP_BUDGET,
             &[Value::Bool(true)],
             &Seed::at(0, Vec::new()),
             64,
@@ -284,7 +279,7 @@ fn a_run_that_reaches_no_region_is_unobserved_and_keeps_its_verdict() {
     let run = with_prover(|prover| {
         prover.interleaved(
             &dividing,
-            &ProvePlan::default(),
+            ply_eval::DEFAULT_STEP_BUDGET,
             &[Value::Bool(false)],
             &Seed::at(0, Vec::new()),
             64,
@@ -306,7 +301,7 @@ fn a_run_under_a_seed_records_the_schedule_it_took() {
     let run = with_prover(|prover| {
         prover.interleaved(
             &law,
-            &ProvePlan::default(),
+            ply_eval::DEFAULT_STEP_BUDGET,
             &[Value::Bool(true)],
             &Seed::at(3, Vec::new()),
             64,
@@ -322,7 +317,7 @@ fn a_run_under_a_seed_records_the_schedule_it_took() {
     let again = with_prover(|prover| {
         prover.interleaved(
             &law,
-            &ProvePlan::default(),
+            ply_eval::DEFAULT_STEP_BUDGET,
             &[Value::Bool(true)],
             &Seed::at(3, Vec::new()),
             64,

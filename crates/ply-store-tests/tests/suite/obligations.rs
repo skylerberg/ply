@@ -1,10 +1,8 @@
 //! The obligation and review files, neither of which is read at [`Store::open`].
 
 use ply_eval::{DefHash, Symbol};
-use ply_store::{
-    CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule, PROVER_VERSION,
-    ReviewRecord, Store,
-};
+use ply_store::{PROVER_VERSION, ReviewRecord, Store};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -37,35 +35,32 @@ fn key(byte: u8) -> DefHash {
     DefHash([byte; 32])
 }
 
-fn proof() -> CachedObligation {
-    CachedObligation {
-        tier: "proved".to_string(),
-        evidence: CachedEvidence::Proof(CachedCertificate {
-            rules: vec![
-                CachedRule::LinearArithmetic,
-                CachedRule::Unfold {
-                    def: Symbol::new("ledger.fee"),
-                    depth: 2,
-                },
-            ],
-            steps: 41,
-            guard_satisfiable: true,
-            sorts: vec![Symbol::new("a")],
-        }),
-    }
+/// Evidence as the prove package writes it; the store holds it without reading it.
+fn proof() -> Value {
+    json!({
+        "tier": "proved",
+        "evidence": {
+            "evidence": "proof",
+            "rules": ["linear_arithmetic", {"unfold": {"def": "ledger.fee", "depth": 2}}],
+            "steps": 41,
+            "guard_satisfiable": true,
+            "sorts": ["a"],
+        },
+    })
 }
 
-fn sample(kept: u32) -> CachedObligation {
-    CachedObligation {
-        tier: if kept >= 25 { "property" } else { "example" }.to_string(),
-        evidence: CachedEvidence::Cases(CachedCases {
-            generated: 200,
-            kept,
-            rejected: 200 - kept,
-            roots: vec![0],
-            instantiations: Vec::new(),
-        }),
-    }
+fn sample(kept: u32) -> Value {
+    json!({
+        "tier": if kept >= 25 { "property" } else { "example" },
+        "evidence": {
+            "evidence": "cases",
+            "generated": 200,
+            "kept": kept,
+            "rejected": 200 - kept,
+            "roots": [0],
+            "instantiations": [],
+        },
+    })
 }
 
 fn obligations_path(root: &Path) -> std::path::PathBuf {
@@ -104,9 +99,9 @@ fn the_recorded_tier_survives_the_round_trip() {
         store.flush().unwrap();
     }
     let store = Store::open(dir.path()).unwrap();
-    assert_eq!(store.obligation(key(1)).unwrap().tier, "proved");
-    assert_eq!(store.obligation(key(2)).unwrap().tier, "property");
-    assert_eq!(store.obligation(key(3)).unwrap().tier, "example");
+    assert_eq!(store.obligation(key(1)).unwrap()["tier"], "proved");
+    assert_eq!(store.obligation(key(2)).unwrap()["tier"], "property");
+    assert_eq!(store.obligation(key(3)).unwrap()["tier"], "example");
 }
 
 #[test]

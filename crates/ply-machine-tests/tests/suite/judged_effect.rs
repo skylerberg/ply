@@ -16,12 +16,11 @@ import std.value (Value, VInt, render)
 nondet effect prover {
   write configure[claims](options: Options, front: Front, world: World) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
-  read outcomes[claims](keys: List<String>) -> List<Option<String>>
-  read prepared[claims]() -> Result<List<Diag>, Refusal>
-  read cached[claims](keys: List<String>) -> List<Option<Evidence>>
+  read prepared[claims](step_budget: Int) -> Result<List<Diag>, Refusal>
+  read cached[claims](keys: List<String>) -> List<Option<String>>
   read judged[claims](batches: List<Batch>) -> List<List<Judged>>
   read interleaved[claims](claim: Int, point: List<Value>, seed: Seed, steps: Int) -> LawRun
-  write record[claims](entries: List<{ key: String, evidence: Evidence }>) -> List<Diag>
+  write record[claims](entries: List<{ key: String, evidence: String }>) -> List<Diag>
   read baselines[claims](names: List<String>) -> List<Baseline>
   write accepted[claims](records: List<Baseline>) -> Accepted
 }
@@ -160,7 +159,7 @@ fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prove
       measure_reduction: false,
     },
   }, front, world);
-  match (prover.collected[claims](), prover.prepared[claims]()) {
+  match (prover.collected[claims](), prover.prepared[claims](1000000000)) {
     (Ok(_), Ok(_)) -> judged_at(index),
     _ -> { failed: 0 - 1, held: 0, rejected: 0, first: "" },
   }

@@ -1,6 +1,6 @@
-use ply_eval::{DefHash, Symbol};
+use ply_eval::DefHash;
 use ply_store::{
-    CachedCertificate, CachedEvidence, CachedObligation, CachedRule, Outcome, Store, Upstream,
+    Outcome, Store, Upstream,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,16 +33,17 @@ fn key(byte: u8) -> DefHash {
     DefHash([byte; 32])
 }
 
-fn proof() -> CachedObligation {
-    CachedObligation {
-        tier: "proved".to_string(),
-        evidence: CachedEvidence::Proof(CachedCertificate {
-            rules: vec![CachedRule::LinearArithmetic],
-            steps: 3,
-            guard_satisfiable: true,
-            sorts: vec![Symbol::new("a")],
-        }),
-    }
+fn proof() -> serde_json::Value {
+    serde_json::json!({
+        "tier": "proved",
+        "evidence": {
+            "evidence": "proof",
+            "rules": ["linear_arithmetic"],
+            "steps": 3,
+            "guard_satisfiable": true,
+            "sorts": ["a"],
+        },
+    })
 }
 
 fn failure() -> Outcome {

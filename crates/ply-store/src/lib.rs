@@ -8,7 +8,6 @@ pub mod diag;
 pub mod disk;
 pub mod frontend;
 mod idx;
-pub mod obligations;
 pub mod reviews;
 pub mod schema;
 pub mod upstream;
@@ -21,9 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub use frontend::{DefEntry, DefKind, FileSpan, Member, Slot, SourceFingerprint, TestEntry};
-pub use obligations::{
-    CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule,
-};
 pub use reviews::ReviewRecord;
 pub use schema::fingerprint as schema_fingerprint;
 pub use upstream::Upstream;
@@ -298,7 +294,9 @@ pub struct Store {
     entries: disk::Entries,
     definitions: disk::Definitions,
     passes: Passes,
-    obligations: Lazy<DefHash, CachedObligation>,
+    /// Each discharged obligation's evidence, as the prove package wrote it: the store never reads
+    /// it.
+    obligations: Lazy<DefHash, serde_json::Value>,
     reviews: Lazy<Symbol, ReviewRecord>,
     dirty: bool,
     frontend_path: PathBuf,
@@ -722,7 +720,7 @@ impl Store {
     }
 
     /// The local entry, or else the upstream's.
-    pub fn obligation(&self, key: DefHash) -> Option<CachedObligation> {
+    pub fn obligation(&self, key: DefHash) -> Option<serde_json::Value> {
         if let Some(entry) = self.obligations.get(&key) {
             return Some(entry.clone());
         }
@@ -730,7 +728,7 @@ impl Store {
     }
 
     /// Only a `Held` discharge may be written, and only under its tier's key.
-    pub fn put_obligation(&mut self, key: DefHash, entry: CachedObligation) {
+    pub fn put_obligation(&mut self, key: DefHash, entry: serde_json::Value) {
         self.obligations.put(key, entry);
     }
 
@@ -780,7 +778,7 @@ impl Store {
         self.write_passes()?;
         self.write_results()?;
         let dir = self.dir.clone();
-        let fresh_obligations: Vec<(DefHash, CachedObligation)> = self
+        let fresh_obligations: Vec<(DefHash, serde_json::Value)> = self
             .obligations
             .added
             .iter()
@@ -803,7 +801,7 @@ impl Store {
     }
 
     /// After the local write, so an unreachable upstream never costs a run its own record.
-    fn publish(&mut self, obligations: &[(DefHash, CachedObligation)]) {
+    fn publish(&mut self, obligations: &[(DefHash, serde_json::Value)]) {
         let Some(upstream) = self.upstream.clone() else {
             return;
         };

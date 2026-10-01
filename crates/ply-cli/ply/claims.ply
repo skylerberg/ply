@@ -7,7 +7,8 @@
 
 import cmdline (Parsed, has, parse_nat, value, values_of)
 import proof.property (Ask, AskJudged, AskInterleaved, Asked, Batch, Judgements, Interleaved,
-                       LawRun, discharged, min_property_cases)
+                       LawRun, discharged)
+import proof.evidence (evidence_of, evidence_text, evidence_tier)
 import sim.plan
 import sim.plan (Seed)
 import proof.world (Built, Obligation, World, walks)
@@ -83,14 +84,12 @@ pub nondet effect prover {
   // `discharged` names by position.
   write configure[claims](options: Options, front: Front, world: World) -> Unit
   read collected[claims]() -> Result<Collected, Refusal>
-  // What the obligation cache holds under each key the program names, spelled out: a proof, a
-  // sample, or something the runtime cannot read. Every key is the program's: this is the only side
-  // that encodes one.
-  read outcomes[claims](keys: List<String>) -> List<Option<String>>
-  // Binds what a discharge runs against, once, and answers what opening the hosts had to say.
-  read prepared[claims]() -> Result<List<Diag>, Refusal>
-  // The evidence filed under each key, where something this side can read is.
-  read cached[claims](keys: List<String>) -> List<Option<Evidence>>
+  // The text filed under each key the program names, which only `proof.evidence` reads. Every key
+  // is the program's: this is the only side that encodes one.
+  read cached[claims](keys: List<String>) -> List<Option<String>>
+  // Binds what a discharge runs against, once, with the calls each evaluation of a claim may make,
+  // and answers what opening the hosts had to say.
+  read prepared[claims](step_budget: Int) -> Result<List<Diag>, Refusal>
   // Each batch's points judged in order, many batches at once, each one claim's by its place in
   // the collection: a whole claim stops at the first point that settles it, a guard alone at the
   // first point it admits.
@@ -99,7 +98,7 @@ pub nondet effect prover {
   read interleaved[claims](claim: Int, point: List<Value>, seed: Seed, steps: Int) -> LawRun
   // Files each discharge's evidence under the key this program chose for it, and answers what
   // storing it had to say.
-  write record[claims](entries: List<{ key: String, evidence: Evidence }>) -> List<Diag>
+  write record[claims](entries: List<{ key: String, evidence: String }>) -> List<Diag>
   // The baseline a reader accepted for each of these definitions, where there is one.
   read baselines[claims](names: List<String>) -> List<{ name: String, record: Record }>
   write accepted[claims](records: List<{ name: String, record: Record }>) -> Accepted
@@ -162,8 +161,9 @@ pub type Claim = {
   walks: Bool,
 }
 
-// What an obligation weaker than a proof was discharged against, and cached under: the runtime's
-// bounds on drawing and judging, and the search a law over interleavings runs.
+// What an obligation weaker than a proof was discharged against, and cached under: the cases drawn
+// per root and the roots, the budgets of the static prover and of shrinking, the calls each
+// evaluation of a claim may make, and the search a law over interleavings runs.
 pub type Plan = {
   cases: Int,
   roots: List<Int>,
@@ -173,18 +173,9 @@ pub type Plan = {
   sim: plan::Plan,
 }
 
-pub type Bounds = {
-  cases: Int,
-  roots: List<Int>,
-  prove_budget: Int,
-  shrink_budget: Int,
-  step_budget: Int,
-}
-
-// What the runtime loaded for a run: the places its spans point into, what loading it had to say,
-// and the bounds the run discharges under.
-// `host` is whether a `law/host` has a host bound to run against.
-pub type Collected = { places: List<Place>, warnings: List<Diag>, plan: Bounds, host: Bool }
+// What the runtime loaded for a run: the places its spans point into and what loading it had to
+// say. `host` is whether a `law/host` has a host bound to run against.
+pub type Collected = { places: List<Place>, warnings: List<Diag>, host: Bool }
 
 // What this side built of its own claims: one per obligation of the world, in its order; the
 // definitions and laws the run answers for; and the trouble that cost it an obligation.
@@ -211,6 +202,19 @@ pub type Collection = {
   lanes: Option<Int>,
 }
 
+// What the flags ask a run to discharge under, each bound its default when a flag names none.
+pub fn plan_of(options: Options) -> Plan =
+  {
+    cases: or_else(options.prove.cases, 200),
+    roots: range(0, or_else(options.prove.roots, 1)),
+    prove_budget: or_else(options.prove.budget, 10000),
+    shrink_budget: or_else(options.prove.shrink_budget, 500),
+    step_budget: or_else(options.prove.steps, 1000000000),
+    sim: machine::sim_plan_of(options.sim),
+  }
+
+fn or_else(v: Option<Int>, spare: Int) -> Int = match v { Some(n) -> n, None -> spare }
+
 // The run's options name the search a law over interleavings runs, and how many lanes judge.
 pub fn collection_of(got: Collected, mine: Claimed, options: Options) -> Collection =
   {
@@ -219,14 +223,7 @@ pub fn collection_of(got: Collected, mine: Claimed, options: Options) -> Collect
     claims: mine.claims,
     defs: mine.defs,
     laws: mine.laws,
-    plan: {
-      cases: got.plan.cases,
-      roots: got.plan.roots,
-      prove_budget: got.plan.prove_budget,
-      shrink_budget: got.plan.shrink_budget,
-      step_budget: got.plan.step_budget,
-      sim: machine::sim_plan_of(options.sim),
-    },
+    plan: plan_of(options),
     host: got.host,
     world: mine.world,
     lanes: match options.jobs { Some(n) -> if n > 0 { Some(n) } else { None }, None -> None },
@@ -604,14 +601,18 @@ pub fn decided<| e>(
   statics: Statics,
   reach: Bool,
   discharge: (List<Int>, List<Static>) -> Result<Discharged, Refusal> / e,
-) -> Result<Verdicts, Refusal> / {prover.outcomes[claims], prover.cached[claims], prover.record[claims] | e} = {
+) -> Result<Verdicts, Refusal> / {prover.cached[claims], prover.record[claims] | e} = {
   let digest = plan_digest_of(c.plan);
   let asked = map(wanted, |i: Int| blank_claim(c.claims, i));
   let keys = map(asked, |claim: Claim|
     { bare: claim.key, planned: hex_of(prove_key(bytes_of_hex(claim.key), digest)) });
-  let answers = map(keys, |k: { bare: String, planned: String }| {
-    let held = prover.outcomes[claims]([k.bare, k.planned]);
-    verdict_of(k.bare, k.planned, held_at(held, 0), held_at(held, 1))
+  // What each claim's two keys hold, read once: the verdict is decided from it, and a cached
+  // claim's evidence is read back from it.
+  let held = map(keys, |k: { bare: String, planned: String }| prover.cached[claims]([k.bare, k.planned]));
+  let answers = map(range(0, len(keys)), |i: Int| {
+    let k = blank_keys(keys, i);
+    let h = match list_at(held, i) { Some(texts) -> texts, None -> [] };
+    verdict_of(k.bare, k.planned, filed_kind(held_at(h, 0)), filed_kind(held_at(h, 1)))
   });
   let hosted = map(asked, |claim: Claim| claim.host);
   let selection = select(hosted, answers, use_cache);
@@ -619,9 +620,18 @@ pub fn decided<| e>(
   let runs = map(selection.to_discharge, |at: Int|
     match list_at(wanted, at) { Some(i) -> i, None -> -1 });
   let static_answers = (statics.answer)(wanted, runs, reach, c.plan.prove_budget);
-  let read_keys = fold(selection.from, [], |acc: List<String>, from: Option<String>|
-    match from { Some(k) -> push(acc, k), None -> acc });
-  let read = if len(read_keys) == 0 { [] } else { prover.cached[claims](read_keys) };
+  let read = fold(range(0, len(selection.from)), [], |acc: List<Option<Evidence>>, at: Int|
+    match list_at(selection.from, at) {
+      Some(Some(key)) -> {
+        let h = match list_at(held, at) { Some(texts) -> texts, None -> [] };
+        let text = if key == blank_keys(keys, at).bare { held_at(h, 0) } else { held_at(h, 1) };
+        push(acc, match text {
+          Some(t) -> match evidence_of(t) { Ok(e) -> Some(e), Err(_) -> None },
+          None -> None,
+        })
+      },
+      _ -> acc,
+    });
   match discharge(runs, static_answers.settled) {
     Err(why) -> Err(why),
     Ok(d) -> {
@@ -632,9 +642,9 @@ pub fn decided<| e>(
           fold(
             filed,
             [],
-            |acc: List<{ key: String, evidence: Evidence }>, f: { at: Int, key: String }|
+            |acc: List<{ key: String, evidence: String }>, f: { at: Int, key: String }|
               match list_at(outcomes, f.at) {
-                Some(Held(h)) -> push(acc, { key: f.key, evidence: h.evidence }),
+                Some(Held(h)) -> push(acc, { key: f.key, evidence: evidence_text(h.evidence) }),
                 _ -> acc,
               },
           ),
@@ -659,6 +669,21 @@ pub fn decided<| e>(
     },
   }
 }
+
+fn blank_keys(keys: List<{ bare: String, planned: String }>, i: Int) -> { bare: String, planned: String } =
+  match list_at(keys, i) { Some(k) -> k, None -> { bare: "", planned: "" } }
+
+// What a key holds as the cache's verdict reads it: a proof, a sample, or something no discharge
+// files.
+fn filed_kind(text: Option<String>) -> Option<String> =
+  match text {
+    None -> None,
+    Some(t) -> Some(match evidence_of(t) {
+      Ok(Proof(_)) -> "proof",
+      Ok(Sampled(_)) -> "sample",
+      Err(_) -> "other",
+    }),
+  }
 
 // Each claim's outcome, by its place in the run: the evidence read back for a claim the cache
 // answered, in the order the keys were asked, and the discharge's for the rest, in its order.
@@ -695,12 +720,6 @@ fn answered(
       },
   ).out
 
-fn evidence_tier(e: Evidence) -> Tier =
-  match e {
-    Proof(_) -> Proved,
-    Sampled(c) -> if c.kept >= min_property_cases() { Property } else { Example },
-  }
-
 // A claim neither read back nor discharged: the program and the store disagree, which is Ply's.
 fn unanswered(c: Claim) -> Outcome =
   Defect({
@@ -721,7 +740,7 @@ pub fn discharge_runs(
   settled: List<Static>,
 ) -> Result<Discharged, Refusal> / {prover.prepared[claims], prover.judged[claims], prover.interleaved[claims], time.elapsed_ms} =
   if len(runs) == 0 { Ok({ outcomes: [], duration_ms: decimal_of_int(0), warnings: [] }) } else {
-    match prover.prepared[claims]() {
+    match prover.prepared[claims](c.plan.step_budget) {
       Err(why) -> Err(why),
       Ok(warnings) -> {
         let started = time.elapsed_ms();
@@ -1414,18 +1433,7 @@ pub fn no_options() -> Options =
 // A collection with nothing of this side's in it yet, from what the runtime loaded: what a fixture
 // hands a run that is told what the runtime answered.
 pub fn collected_part(c: Collection) -> Collected =
-  {
-    places: c.places,
-    warnings: c.warnings,
-    plan: {
-      cases: c.plan.cases,
-      roots: c.plan.roots,
-      prove_budget: c.plan.prove_budget,
-      shrink_budget: c.plan.shrink_budget,
-      step_budget: c.plan.step_budget,
-    },
-    host: c.host,
-  }
+  { places: c.places, warnings: c.warnings, host: c.host }
 
 pub fn claimed_part(c: Collection) -> Claimed =
   { claims: c.claims, defs: c.defs, laws: c.laws, warnings: [], world: c.world }

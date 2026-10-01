@@ -30,7 +30,6 @@ pub mod policy;
 pub mod recording;
 pub mod reused;
 pub mod shelf;
-pub mod simulation;
 pub mod support;
 pub mod tester;
 pub mod trace;

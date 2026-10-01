@@ -24,8 +24,9 @@ of it next.
 | `crates/ply-codegen` | the compiled tier: emits C, builds it and loads it |
 | `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its bootstrap bundle (`bootstrap/`) |
 | `crates/ply-store` | the result and front-end caches under `.ply-cache` |
-| `crates/ply-test` | test selection, scheduling and running |
-| `crates/ply-prove` | specification obligations and their discharge |
+| `crates/ply-test` | running a test or one interleaving of it, and filing results (Rust); what a run decides, as the `suite` package (`ply/`) |
+| `crates/ply-prove` | specification obligations and their discharge, as the `prove` package in `ply/`; not a cargo crate |
+| `crates/ply-sim` | the interleaving search, as the `sim` package in `ply/`; not a cargo crate |
 | `crates/ply-host` | the Rust handlers effects resolve to (db, fs, tcp, tls, ...) |
 | `crates/ply-machine` | the nested-entry capability: a program loading and entering another program |
 | `crates/ply-std` | the standard library, as Ply source in `ply/` |
