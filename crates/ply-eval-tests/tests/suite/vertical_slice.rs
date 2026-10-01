@@ -35,7 +35,11 @@ fn a_handled_effect_evaluates_through_the_checked_module() {
     let compiled = single();
     let mut machine = compiled.machine();
     assert_eq!(machine.test_count(), 2);
-    machine.eval_test(0).expect("the handled test should pass");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the handled test should pass");
 }
 
 /// Effect, perform and handler sit in three modules that each spell the effect differently.
@@ -69,6 +73,8 @@ fn a_handler_discharges_an_effect_declared_in_another_module() {
     compiled
         .machine()
         .eval_test(0)
+        .into_parts()
+        .0
         .expect("the cross-module handler should discharge `store.db`");
 }
 
@@ -98,6 +104,8 @@ fn a_handler_clause_body_resolves_where_the_handler_was_written() {
     compiled
         .machine()
         .eval_test(0)
+        .into_parts()
+        .0
         .expect("the clause body must resolve `fixture` in `app`, not in `store`");
 }
 
@@ -116,11 +124,19 @@ fn same_named_definitions_in_two_modules_do_not_collide() {
     let mut machine = compiled.machine();
     let at = ply_eval::Span::DUMMY;
     assert_eq!(
-        machine.call("alpha.wrapped", Vec::new(), at).unwrap(),
+        machine
+            .call("alpha.wrapped", Vec::new(), at)
+            .into_parts()
+            .0
+            .unwrap(),
         Value::Int(1)
     );
     assert_eq!(
-        machine.call("beta.wrapped", Vec::new(), at).unwrap(),
+        machine
+            .call("beta.wrapped", Vec::new(), at)
+            .into_parts()
+            .0
+            .unwrap(),
         Value::Int(2)
     );
 }
@@ -143,15 +159,27 @@ fn constructors_from_two_modules_are_distinct_values() {
     let mut machine = compiled.machine();
     let at = ply_eval::Span::DUMMY;
     assert_eq!(
-        machine.call("beta.theirs", Vec::new(), at).unwrap(),
+        machine
+            .call("beta.theirs", Vec::new(), at)
+            .into_parts()
+            .0
+            .unwrap(),
         Value::Int(1)
     );
     assert_eq!(
-        machine.call("beta.mine", Vec::new(), at).unwrap(),
+        machine
+            .call("beta.mine", Vec::new(), at)
+            .into_parts()
+            .0
+            .unwrap(),
         Value::Int(2)
     );
     assert_eq!(
-        machine.call("alpha.make", Vec::new(), at).unwrap(),
+        machine
+            .call("alpha.make", Vec::new(), at)
+            .into_parts()
+            .0
+            .unwrap(),
         Value::ctor("alpha.Wrapped", vec![Value::Int(1)])
     );
 }

@@ -53,7 +53,7 @@ fn call(entry: &str) -> Result<Value, ply_eval::Diagnostic> {
         .get(&Symbol::new(entry))
         .expect("the entry is a definition of the program");
     machine.set_declared_footprint(declared.footprint.clone());
-    machine.call(entry, Vec::new(), Span::DUMMY)
+    machine.call(entry, Vec::new(), Span::DUMMY).into_parts().0
 }
 
 fn answered(entry: &str) -> Value {

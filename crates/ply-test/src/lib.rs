@@ -439,10 +439,10 @@ fn entered<'a>(
         machine.set_re_executed(re_executed);
         sim::seed_run(&mut machine, seed, steps);
     }
-    let outcome = machine.eval_test(index);
+    let (outcome, warnings) = machine.eval_test(index).into_parts();
     let (entries, declines) = machine.compiled_counts();
     let mut teardown = ply_eval::rc::take_cycles();
-    teardown.extend(machine.take_teardown_warnings());
+    teardown.extend(warnings);
     Ok(Entered {
         interleaving: seeded.and_then(|_| sim::interleaving_of(&machine, &outcome)),
         outcome,

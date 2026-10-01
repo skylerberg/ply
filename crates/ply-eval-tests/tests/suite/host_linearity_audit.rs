@@ -130,7 +130,7 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
             std::rc::Rc::new(Ready::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
         }));
     }
-    let outcome = machine.eval_test(0);
+    let (outcome, _) = machine.eval_test(0).into_parts();
     Run {
         outcome,
         sends: counter.calls(),
@@ -243,6 +243,8 @@ test/nondet "three resumptions, nothing bound" {
     machine.set_host_binding(Arc::new(HostBinding::hermetic_with(registry)));
     machine
         .eval_test(0)
+        .into_parts()
+        .0
         .expect("a compiled-in registry is not a bound one");
     assert_eq!(machine.host_ops(), 0);
     assert_eq!(counter.calls(), 0);

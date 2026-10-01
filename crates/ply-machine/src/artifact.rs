@@ -4,8 +4,8 @@
 use crate::load::Loaded;
 use ply_eval::decode::{self, At};
 use ply_eval::{
-    DefHash, DefInfo, Diagnostic, Fields, Front, HashOutput, ModuleName, Severity, SourceMap, Span,
-    Symbol, Value, codes,
+    DefHash, DefInfo, Diagnostic, Ended, Fields, Front, HashOutput, ModuleName, Severity,
+    SourceMap, Span, Symbol, Value, codes,
 };
 use ply_store::body::StoredBody;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1149,18 +1149,14 @@ pub struct Binds {
     pub trust: Vec<PathBuf>,
 }
 
-/// One entry into an opened artifact, with no line of its own on either stream: the program's
-/// output is the whole of what a caller sees. The answer is the code `process.exit` asked for,
-/// else `0` for a value returned and the diagnostic for a raise.
 /// The code an entry answers with when it asked for none.
 pub const EXIT_OK: i32 = 0;
 
-pub fn enter(
-    artifact: &Artifact,
-    opened: &Opened,
-    argv: Vec<String>,
-    binds: Binds,
-) -> Result<i32, Diagnostic> {
+/// One entry into an opened artifact, with no line of its own on either stream: the program's
+/// output is the whole of what a caller sees. The answer is the code `process.exit` asked for,
+/// else `0` for a value returned and the diagnostic for a raise; what the entry ended with is the
+/// caller's to report.
+pub fn enter(artifact: &Artifact, opened: &Opened, argv: Vec<String>, binds: Binds) -> Ended<i32> {
     let Binds {
         roots,
         executables,
@@ -1179,7 +1175,10 @@ pub fn enter(
         .defs
         .get(&opened.entry)
         .map(|d| d.footprint.clone());
-    let tier = tier(opened, unit)?;
+    let tier = match tier(opened, unit) {
+        Ok(tier) => tier,
+        Err(refused) => return Ended::refused(refused),
+    };
     let process = ply_host::process::ProcessHost::new(
         argv,
         ply_host::process::Sink::Real {
@@ -1187,7 +1186,7 @@ pub fn enter(
         },
     )
     .executing(executables);
-    let hosts = crate::hosts::Hosts::open_stopping(
+    let hosts = match crate::hosts::Hosts::open_stopping(
         &opened.front.check,
         true,
         &crate::options::TlsOptions {
@@ -1200,8 +1199,10 @@ pub fn enter(
         None,
         Some(process),
         lent,
-    )
-    .map_err(|diagnostics| bind_failed(&diagnostics))?;
+    ) {
+        Ok(hosts) => hosts,
+        Err(diagnostics) => return Ended::refused(bind_failed(&diagnostics)),
+    };
     let span = opened
         .front
         .check
@@ -1209,12 +1210,13 @@ pub fn enter(
         .get(&opened.entry)
         .map(|d| d.span)
         .unwrap_or(Span::DUMMY);
-    let answer = evaluate(opened, span, &hosts, declared.as_ref(), tier);
+    let ended = evaluate(opened, span, &hosts, declared.as_ref(), tier);
     let _ = crate::drive::teardown(&hosts, None, crate::drive::TEARDOWN_FLOOR_MS);
-    match hosts.requested_exit() {
+    let requested = hosts.requested_exit();
+    ended.map(|answer| match requested {
         Some(code) => Ok(code),
         None => answer.map(|_| EXIT_OK),
-    }
+    })
 }
 
 fn bind_failed(diagnostics: &[Diagnostic]) -> Diagnostic {
@@ -1265,8 +1267,11 @@ fn evaluate(
     hosts: &crate::hosts::Hosts,
     declared: Option<&ply_eval::Footprint>,
     tier: &'static dyn ply_eval::Provider,
-) -> Result<ply_eval::Value, Diagnostic> {
-    let mut machine = ply_eval::Machine::new(&opened.front, tier.attach())?;
+) -> Ended<ply_eval::Value> {
+    let mut machine = match ply_eval::Machine::new(&opened.front, tier.attach()) {
+        Ok(machine) => machine,
+        Err(refused) => return Ended::refused(refused),
+    };
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime_factory() {
         machine.set_host_runtime(runtime);

@@ -262,7 +262,10 @@ fn call_outcome(entry: &str, url: &str) -> Result<Value, ply_eval::Diagnostic> {
         .get(&Symbol::new(entry))
         .expect("the entry is a definition of the program");
     machine.set_declared_footprint(declared.footprint.clone());
-    machine.call(entry, vec![Value::str(url)], Span::DUMMY)
+    machine
+        .call(entry, vec![Value::str(url)], Span::DUMMY)
+        .into_parts()
+        .0
 }
 
 /// What the entry answered, as `Ok`'s text or `Err`'s.

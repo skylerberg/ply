@@ -10,6 +10,7 @@ mod compiled;
 mod cont;
 mod decode;
 mod escape;
+mod evaluator;
 mod footprint;
 mod hash;
 mod host;

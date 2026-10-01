@@ -45,7 +45,7 @@ impl Audited {
     fn run(&self, index: usize, seed: &Seed) -> (Machine<'_>, Result<(), Diagnostic>) {
         let mut machine = self.compiled.machine_on(Rc::clone(&self.tier));
         machine.set_seed(seed.clone(), 100_000);
-        let outcome = machine.eval_test(index);
+        let (outcome, _) = machine.eval_test(index).into_parts();
         assert_eq!(
             machine.compiled_counts(),
             (1, 0),
@@ -273,6 +273,8 @@ test "an update that reads the cell it holds" {
         let d = compiled
             .machine_on(Rc::clone(&tier))
             .eval_test(0)
+            .into_parts()
+            .0
             .expect_err("the update's function reads the cell it holds");
         assert_eq!(
             (d.code, d.message.as_str()),

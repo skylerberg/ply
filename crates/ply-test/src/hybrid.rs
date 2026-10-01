@@ -256,7 +256,9 @@ impl BodyHybrid<'_> {
                 ply_codegen::Unit::over_front(&front, texts).expect("this host has a C compiler");
             let mut machine = ply_eval::Machine::new(&front, unit.attach())?;
             seed_run(&mut machine, &seed, ply_eval::sim::DEFAULT_STEPS);
-            machine.eval_test(index)
+            // No host runtime is bound, so the entry ends with nothing to warn of.
+            let (outcome, _) = machine.eval_test(index).into_parts();
+            outcome
         }));
         match outcome {
             Ok(Ok(())) => {

@@ -213,16 +213,19 @@ fn one_run(source: &str, index: i64) -> Result<Value, ply_eval::Diagnostic> {
     }
     let binding = registry.bind(&front.check).expect("the prover ops bind");
     machine.set_host_binding(Arc::new(binding));
-    machine.call(
-        "proof.obligation.main",
-        vec![
-            Value::str(project.path().display().to_string()),
-            Value::Int(index),
-            crate::fixture::handed(project.path()),
-            crate::fixture::int_laws(&[THE_LAW]),
-        ],
-        Span::DUMMY,
-    )
+    machine
+        .call(
+            "proof.obligation.main",
+            vec![
+                Value::str(project.path().display().to_string()),
+                Value::Int(index),
+                crate::fixture::handed(project.path()),
+                crate::fixture::int_laws(&[THE_LAW]),
+            ],
+            Span::DUMMY,
+        )
+        .into_parts()
+        .0
 }
 
 fn field(answer: &Value, name: &str) -> Value {
