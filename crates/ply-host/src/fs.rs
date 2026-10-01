@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Must match the effect `std.fs` declares.
 pub const EFFECT: &str = "fs";
@@ -47,10 +48,20 @@ pub enum Op {
     Sync,
     Lock,
     Unlock,
+    Copy,
+    RemoveTree,
+    TempDir,
+    Canonical,
+    Mode,
+    SetMode,
+    Symlink,
+    ReadLink,
+    Walk,
+    SetModified,
 }
 
 impl Op {
-    pub const ALL: [Op; 16] = [
+    pub const ALL: [Op; 26] = [
         Op::ReadFile,
         Op::ReadAt,
         Op::ListDir,
@@ -67,6 +78,16 @@ impl Op {
         Op::Sync,
         Op::Lock,
         Op::Unlock,
+        Op::Copy,
+        Op::RemoveTree,
+        Op::TempDir,
+        Op::Canonical,
+        Op::Mode,
+        Op::SetMode,
+        Op::Symlink,
+        Op::ReadLink,
+        Op::Walk,
+        Op::SetModified,
     ];
 
     pub fn name(self) -> &'static str {
@@ -87,6 +108,16 @@ impl Op {
             Op::Sync => "sync",
             Op::Lock => "lock",
             Op::Unlock => "unlock",
+            Op::Copy => "copy",
+            Op::RemoveTree => "remove_tree",
+            Op::TempDir => "temp_dir",
+            Op::Canonical => "canonical",
+            Op::Mode => "mode",
+            Op::SetMode => "set_mode",
+            Op::Symlink => "symlink",
+            Op::ReadLink => "read_link",
+            Op::Walk => "walk",
+            Op::SetModified => "set_modified",
         }
     }
 
@@ -108,13 +139,30 @@ impl Op {
             Op::Sync => "`fs.sync`",
             Op::Lock => "`fs.lock`",
             Op::Unlock => "`fs.unlock`",
+            Op::Copy => "`fs.copy`",
+            Op::RemoveTree => "`fs.remove_tree`",
+            Op::TempDir => "`fs.temp_dir`",
+            Op::Canonical => "`fs.canonical`",
+            Op::Mode => "`fs.mode`",
+            Op::SetMode => "`fs.set_mode`",
+            Op::Symlink => "`fs.symlink`",
+            Op::ReadLink => "`fs.read_link`",
+            Op::Walk => "`fs.walk`",
+            Op::SetModified => "`fs.set_modified`",
         }
     }
 
     fn arity(self) -> usize {
         match self {
             Op::ReadAt => 3,
-            Op::WriteFile | Op::Append | Op::Rename => 2,
+            Op::WriteFile
+            | Op::Append
+            | Op::Rename
+            | Op::Copy
+            | Op::TempDir
+            | Op::SetMode
+            | Op::Symlink
+            | Op::SetModified => 2,
             _ => 1,
         }
     }
@@ -138,6 +186,16 @@ impl Op {
             Op::Sync => "fs-sync",
             Op::Lock => "fs-lock",
             Op::Unlock => "fs-unlock",
+            Op::Copy => "fs-copy",
+            Op::RemoveTree => "fs-remove-tree",
+            Op::TempDir => "fs-temp-dir",
+            Op::Canonical => "fs-canonical",
+            Op::Mode => "fs-mode",
+            Op::SetMode => "fs-set-mode",
+            Op::Symlink => "fs-symlink",
+            Op::ReadLink => "fs-read-link",
+            Op::Walk => "fs-walk",
+            Op::SetModified => "fs-set-modified",
         }
     }
 
@@ -330,6 +388,16 @@ impl FsHost {
             Op::Sync => "ply_host::fs::sync",
             Op::Lock => "ply_host::fs::lock",
             Op::Unlock => "ply_host::fs::unlock",
+            Op::Copy => "ply_host::fs::copy",
+            Op::RemoveTree => "ply_host::fs::remove_tree",
+            Op::TempDir => "ply_host::fs::temp_dir",
+            Op::Canonical => "ply_host::fs::canonical",
+            Op::Mode => "ply_host::fs::mode",
+            Op::SetMode => "ply_host::fs::set_mode",
+            Op::Symlink => "ply_host::fs::symlink",
+            Op::ReadLink => "ply_host::fs::read_link",
+            Op::Walk => "ply_host::fs::walk",
+            Op::SetModified => "ply_host::fs::set_modified",
         }
     }
 }
@@ -376,7 +444,17 @@ impl HostHandler for Operation {
             Op::WriteFile | Op::Append => {
                 Second::Body(Arc::clone(req.args[1].as_bytes(span, "a body")?))
             }
-            Op::Rename => Second::Path(req.args[1].as_str(span, "a path")?.to_string()),
+            Op::Rename | Op::Copy => Second::Path(req.args[1].as_str(span, "a path")?.to_string()),
+            Op::Symlink => Second::Target(req.args[1].as_str(span, "a link's target")?.to_string()),
+            Op::TempDir => Second::Name(req.args[1].as_str(span, "a name's prefix")?.to_string()),
+            Op::SetMode => Second::Mode(mode_bits(&req.args[1], span)?),
+            Op::SetModified => {
+                let ms = req.args[1].as_int(span, "milliseconds since the epoch")?;
+                if ms < 0 {
+                    return Err(before_epoch(ms, span));
+                }
+                Second::Millis(ms)
+            }
             Op::ReadAt => {
                 let offset = req.args[1].as_int(span, "an offset")?;
                 let len = req.args[2].as_int(span, "a length")?;
@@ -408,6 +486,10 @@ enum Second {
     None,
     Body(Arc<[u8]>),
     Path(String),
+    Target(String),
+    Name(String),
+    Mode(u32),
+    Millis(i64),
     Range { offset: i64, len: i64 },
 }
 
@@ -506,6 +588,266 @@ fn run(
         Op::Sync => Done::Bool(sync_path(&target)),
         Op::Lock => Done::Bool(take_lock(&target, held)),
         Op::Unlock => Done::Bool(drop_lock(&target, held)),
+        Op::Copy => match second {
+            Second::Path(to) => match confine(root, &to, span) {
+                Err(refusal) => Done::Refused(refusal),
+                Ok(destination) => Done::Bool(copy_file(&target, &destination)),
+            },
+            _ => Done::Failed("a copy with no destination reached the pool".into()),
+        },
+        Op::RemoveTree => Done::Bool(names_below_root(path) && remove_tree(&target)),
+        Op::TempDir => match second {
+            Second::Name(prefix) => Done::MaybeString(temp_dir(path, &target, &prefix)),
+            _ => Done::Failed("a temporary directory with no prefix reached the pool".into()),
+        },
+        Op::Canonical => Done::MaybeString(
+            std::fs::canonicalize(&target)
+                .ok()
+                .and_then(|real| real.to_str().map(str::to_string)),
+        ),
+        Op::Mode => Done::MaybeMode(mode_of(&target)),
+        Op::SetMode => match second {
+            Second::Mode(bits) => Done::Bool(set_mode(&target, bits)),
+            _ => Done::Failed("a mode change with no mode reached the pool".into()),
+        },
+        Op::Symlink => match second {
+            Second::Target(to) => match link_stays(root, path, &to, span) {
+                Err(refusal) => Done::Refused(refusal),
+                Ok(()) => Done::Bool(std::os::unix::fs::symlink(&to, &target).is_ok()),
+            },
+            _ => Done::Failed("a link with no target reached the pool".into()),
+        },
+        Op::ReadLink => Done::MaybeString(
+            std::fs::read_link(&target)
+                .ok()
+                .and_then(|to| to.to_str().map(str::to_string)),
+        ),
+        Op::Walk => match walk(path, &target) {
+            Ok(entries) => Done::MaybeEntries(entries),
+            Err(bytes) => Done::Refused(walk_too_large(bytes, path, span)),
+        },
+        Op::SetModified => match second {
+            Second::Millis(ms) => Done::Bool(set_modified(&target, ms)),
+            _ => Done::Failed("a stamp with no time reached the pool".into()),
+        },
+    }
+}
+
+/// A file's bytes and permission bits, over whatever the destination held; never a directory.
+fn copy_file(from: &Path, to: &Path) -> bool {
+    std::fs::metadata(from).is_ok_and(|m| m.is_file()) && std::fs::copy(from, to).is_ok()
+}
+
+/// A path naming the root itself names nothing under it, so no operation removes the root.
+fn names_below_root(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|c| matches!(c, Component::Normal(_)))
+}
+
+/// A symlink is removed as itself; a directory with everything under it, its links unfollowed.
+fn remove_tree(target: &Path) -> bool {
+    match std::fs::symlink_metadata(target) {
+        Err(_) => false,
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(target).is_ok(),
+        Ok(_) => std::fs::remove_file(target).is_ok(),
+    }
+}
+
+/// The path as the root names it: `.` and empty segments dropped, so `./a/` and `a` agree.
+fn under_root(path: &str) -> String {
+    Path::new(path)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn joined(dir: &str, name: &str) -> String {
+    let dir = under_root(dir);
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// `create_dir` rather than `create_dir_all`: a name another run made first is a collision to
+/// retry, never a directory to share.
+fn temp_dir(dir: &str, target: &Path, prefix: &str) -> Option<String> {
+    if prefix.contains('/') || prefix.contains('\0') || !target.is_dir() {
+        return None;
+    }
+    for _ in 0..64 {
+        let name = format!("{prefix}{}", unique_suffix());
+        match std::fs::create_dir(target.join(&name)) {
+            Ok(()) => return Some(joined(dir, &name)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn unique_suffix() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u32(std::process::id());
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    format!("{:012x}", hasher.finish() & 0xffff_ffff_ffff)
+}
+
+fn mode_of(target: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(target)
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o777)
+}
+
+/// The nine permission bits; the set-id and sticky bits the file had are kept.
+fn set_mode(target: &Path, bits: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(target) else {
+        return false;
+    };
+    let kept = meta.permissions().mode() & !0o777;
+    std::fs::set_permissions(
+        target,
+        std::fs::Permissions::from_mode(kept | (bits & 0o777)),
+    )
+    .is_ok()
+}
+
+/// Read from the link's own directory, a target must stay under the root: one that names another
+/// root or climbs out of this one would hand whoever follows the link a path outside it.
+fn link_stays(root: &Path, link: &str, target: &str, span: Span) -> Result<(), Diagnostic> {
+    let to = Path::new(target);
+    if to.is_absolute() {
+        return Err(escapes(
+            root,
+            target,
+            "a link's target names its own root",
+            span,
+        ));
+    }
+    let mut depth = Path::new(link)
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count()
+        .saturating_sub(1);
+    for component in to.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir if depth == 0 => {
+                return Err(escapes(
+                    root,
+                    target,
+                    "read from the link's directory, `..` leaves the root",
+                    span,
+                ));
+            }
+            Component::ParentDir => depth -= 1,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub const KIND_FILE: &str = "std.fs.File";
+pub const KIND_DIR: &str = "std.fs.Dir";
+pub const KIND_SYMLINK: &str = "std.fs.Symlink";
+
+/// Every entry under `dir`, depth first and each directory's names in byte order, a symlink listed
+/// and never followed. `Err` carries the bytes of paths gathered once they pass what one answer
+/// holds.
+fn walk(dir: &str, target: &Path) -> Result<Option<Vec<(String, &'static str)>>, u64> {
+    if !std::fs::metadata(target).is_ok_and(|m| m.is_dir()) {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    let mut bytes = 0;
+    walk_into(&under_root(dir), target, &mut out, &mut bytes)?;
+    Ok(Some(out))
+}
+
+fn walk_into(
+    prefix: &str,
+    at: &Path,
+    out: &mut Vec<(String, &'static str)>,
+    bytes: &mut u64,
+) -> Result<(), u64> {
+    let Ok(entries) = std::fs::read_dir(at) else {
+        return Ok(());
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for name in names {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        *bytes += path.len() as u64;
+        if *bytes > MAX_READ_BYTES {
+            return Err(*bytes);
+        }
+        let full = at.join(&name);
+        let kind = match std::fs::symlink_metadata(&full) {
+            Ok(meta) if meta.is_symlink() => KIND_SYMLINK,
+            Ok(meta) if meta.is_dir() => KIND_DIR,
+            Ok(meta) if meta.is_file() => KIND_FILE,
+            _ => continue,
+        };
+        out.push((path.clone(), kind));
+        if kind == KIND_DIR {
+            walk_into(&path, &full, out, bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// A directory is opened as a file to stamp it, which `futimens` allows its owner.
+fn set_modified(target: &Path, ms: i64) -> bool {
+    File::open(target)
+        .and_then(|file| file.set_modified(UNIX_EPOCH + Duration::from_millis(ms as u64)))
+        .is_ok()
+}
+
+/// A `std.fs.Mode` as its nine permission bits: the owner's, the group's and everyone else's.
+fn mode_bits(mode: &Value, span: Span) -> Result<u32, Diagnostic> {
+    let access = |who: &str| -> Option<u32> {
+        let Value::Record(fields) = mode else {
+            return None;
+        };
+        let Some(Value::Record(access)) = fields.named(who) else {
+            return None;
+        };
+        let bit = |name: &str, value: u32| match access.named(name) {
+            Some(Value::Bool(true)) => Some(value),
+            Some(Value::Bool(false)) => Some(0),
+            _ => None,
+        };
+        Some(bit("read", 4)? | bit("write", 2)? | bit("execute", 1)?)
+    };
+    match (access("owner"), access("group"), access("other")) {
+        (Some(owner), Some(group), Some(other)) => Ok(owner << 6 | group << 3 | other),
+        _ => Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "`fs.set_mode` was handed something that is not a `std.fs.Mode`".to_string(),
+        )
+        .primary(span, "a well-typed call hands a mode")),
     }
 }
 
@@ -674,6 +1016,31 @@ fn too_large(bytes: u64, path: &str, span: Span) -> Diagnostic {
         "a read answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
     ))
     .note("read it a range at a time with `fs.read_at(path, offset, len)`, which is also what keeps the cost of reading a large file proportional to the part that is wanted")
+}
+
+#[cold]
+fn walk_too_large(bytes: u64, path: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::FS_FILE_TOO_LARGE,
+        format!("a walk of `{path}` would answer more than {bytes} bytes of paths"),
+    )
+    .primary(span, "this is more than one walk answers")
+    .note(format!(
+        "a walk answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
+    ))
+    .note("walk the tree a directory at a time with `fs.list_dir`")
+}
+
+#[cold]
+fn before_epoch(ms: i64, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`fs.set_modified` was given {ms} milliseconds"),
+    )
+    .primary(
+        span,
+        "a modification time is milliseconds since the Unix epoch, never before it",
+    )
 }
 
 #[cold]
