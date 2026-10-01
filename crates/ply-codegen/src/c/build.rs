@@ -8,7 +8,7 @@ use super::tables::{Defined, Positions, Unit, bucket_mark, bucket_of, root_id};
 use super::{HELPERS, PRELUDE, helper_addresses, runtime_header, runtime_object};
 use crate::heap::{Heap, Word, mark_immortal};
 use crate::rt::Entry;
-use crate::rt::{Ctx, Tables};
+use crate::rt::{Ctx, Root, Tables};
 use crate::source::Source;
 use anyhow::{Result, bail};
 use ply_eval::{Span, Symbol};
@@ -522,17 +522,18 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
             ),
         );
     }
-    let mut roots: Vec<(u64, Span)> = taken
+    let mut roots: Vec<Root> = taken
         .iter()
-        .map(|t| {
-            let span = source
+        .map(|t| Root {
+            id: root_id(&t.name),
+            name: Symbol::new(&t.name),
+            span: source
                 .and_then(|s| s.span_of(&t.name))
-                .unwrap_or(Span::DUMMY);
-            (root_id(&t.name), span)
+                .unwrap_or(Span::DUMMY),
         })
         .collect();
-    roots.sort_by_key(|(id, _)| *id);
-    if roots.windows(2).any(|w| w[0].0 == w[1].0) {
+    roots.sort_by_key(|r| r.id);
+    if roots.windows(2).any(|w| w[0].id == w[1].id) {
         bail!("two roots of this unit share a site id");
     }
     let mut tables = tables_of(unit, &ctors);

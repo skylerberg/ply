@@ -1,6 +1,6 @@
 //! Deterministic simulation: seeds, plans, the dependence relation, and seeded `clock`/`random`.
 
-use crate::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, codes};
+use crate::{Diagnostic, EffectAtom, Mode, Span, Symbol, codes};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -488,20 +488,8 @@ impl SimTy {
 pub struct OpSignature {
     pub effect: &'static str,
     pub op: &'static str,
-    pub mode: Mode,
     pub params: &'static [SimTy],
     pub ret: SimTy,
-}
-
-impl OpSignature {
-    pub fn atom(&self) -> EffectAtom {
-        EffectAtom::new(self.effect, Resource::Singleton, self.mode)
-    }
-
-    /// What this operation adds to the access set of the step it ends.
-    pub fn step_access(&self) -> Option<Access> {
-        (self.effect == "random").then(|| Access::Atom(self.atom()))
-    }
 }
 
 impl fmt::Display for OpSignature {
@@ -514,28 +502,24 @@ pub const SEEDED_OPS: &[OpSignature] = &[
     OpSignature {
         effect: "clock",
         op: "now",
-        mode: Mode::Read,
         params: &[],
         ret: SimTy::Int,
     },
     OpSignature {
         effect: "clock",
         op: "sleep",
-        mode: Mode::Write,
         params: &[SimTy::Int],
         ret: SimTy::Unit,
     },
     OpSignature {
         effect: "random",
         op: "next",
-        mode: Mode::Write,
         params: &[],
         ret: SimTy::Int,
     },
     OpSignature {
         effect: "random",
         op: "below",
-        mode: Mode::Write,
         params: &[SimTy::Int],
         ret: SimTy::Int,
     },

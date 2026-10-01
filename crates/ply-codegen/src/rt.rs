@@ -11,6 +11,8 @@ use crate::map;
 use crate::stack::{Stack, switch};
 use ply_eval::arena::{Owner, RegionId, Slot};
 use ply_eval::builtins::{cell_in_update, no_such_cell};
+use ply_eval::region::StepSite;
+use ply_eval::sim::Access;
 use ply_eval::{
     BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Resource, Span, Step,
     Symbol, Value, codes, values_equal,
@@ -50,9 +52,17 @@ pub struct Tables {
     pub memo_words: RefCell<HashMap<Identity, Word>>,
     /// Answers of roots called with only memo words, up to [`CALL_MEMO_LIMIT`].
     pub calls: RefCell<HashMap<(Symbol, Vec<Word>), Word>>,
-    /// Each root's definition span in the text the unit runs over, by `root_id` of its name and
-    /// sorted by it: a site is an offset from its start. Never cached: definitions move.
-    pub roots: Vec<(u64, Span)>,
+    /// Every root, sorted by `id`: what a body's stored site names.
+    pub roots: Vec<Root>,
+}
+
+/// A root a body's sites name by `id`, the `root_id` of `name`.
+pub struct Root {
+    pub id: u64,
+    pub name: Symbol,
+    /// Its definition's span in the text the unit runs over: a site is an offset from its start.
+    /// Never cached: definitions move.
+    pub span: Span,
 }
 
 /// How many calls of roots over memo words a unit remembers.
@@ -778,24 +788,43 @@ impl Ctx {
 
     /// The span the body last stored, or `Span::DUMMY` before any has.
     pub fn site(&self) -> Span {
-        let Some(root) = u64::try_from(self.site_root)
-            .ok()
-            .and_then(|r| {
-                let roots = &self.tables.roots;
-                let at = roots.binary_search_by_key(&r, |(id, _)| *id).ok()?;
-                Some(&roots[at].1)
-            })
-            .filter(|r| !r.is_dummy())
-        else {
+        self.stored_in(self.stored_root())
+    }
+
+    /// [`Ctx::site`] and the definition the body that stored it belongs to.
+    pub(crate) fn step_site(&self) -> StepSite {
+        let root = self.stored_root();
+        StepSite {
+            definition: root.map(|r| r.name.clone()),
+            span: self.stored_in(root),
+        }
+    }
+
+    /// Puts `access` into the running step, made where the body last stored a site.
+    pub(crate) fn record_access(&mut self, access: Access) {
+        let at = self.step_site();
+        self.trail.record_access(access, at);
+    }
+
+    fn stored_root(&self) -> Option<&Root> {
+        let id = u64::try_from(self.site_root).ok()?;
+        let roots = &self.tables.roots;
+        let at = roots.binary_search_by_key(&id, |r| r.id).ok()?;
+        Some(&roots[at])
+    }
+
+    /// The stored offsets as a span in `root`'s definition.
+    fn stored_in(&self, root: Option<&Root>) -> Span {
+        let Some(defined) = root.map(|r| r.span).filter(|s| !s.is_dummy()) else {
             return Span::DUMMY;
         };
         let at = |offset: i64| {
-            i64::from(root.start)
+            i64::from(defined.start)
                 .checked_add(offset)
                 .and_then(|o| u32::try_from(o).ok())
         };
         match (at(self.site_start), at(self.site_end)) {
-            (Some(start), Some(end)) => Span::new(root.source, start, end),
+            (Some(start), Some(end)) => Span::new(defined.source, start, end),
             _ => Span::DUMMY,
         }
     }
@@ -887,7 +916,7 @@ pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
 pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if !ctx.sims.is_empty() {
-        ctx.trail.record_access(ply_eval::sim::Access::Alloc);
+        ctx.record_access(Access::Alloc);
     }
     let owner = ctx.owner();
     let slot = ctx
@@ -1350,7 +1379,7 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
     if !ctx.sims.is_empty()
         && let Some(access) = crate::simulate::cell_access(ctx, b, args)
     {
-        ctx.trail.record_access(access);
+        ctx.record_access(access);
     }
     if let Some(w) = native_builtin(ctx, b, args) {
         return w;
@@ -2180,11 +2209,9 @@ pub unsafe extern "C" fn rt_perform(
         if mode != 0 { Mode::Write } else { Mode::Read },
         op.clone(),
     );
-    // A step's footprint is what it conflicts on, which is the mode; the scheduled operation's
-    // own access (`OpSignature::step_access`) is that same mode atom.
+    // A step conflicts on the mode, and a scheduled draw's access is recorded here alone.
     if !c.sims.is_empty() {
-        c.trail
-            .record_access(ply_eval::sim::Access::Atom(atom.mode_atom()));
+        c.record_access(Access::Atom(atom.mode_atom()));
     }
     c.performed.push(atom);
     let mut found = None;

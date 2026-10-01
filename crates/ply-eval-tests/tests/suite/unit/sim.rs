@@ -494,20 +494,6 @@ fn a_draw_uses_the_rand_stream_and_the_whole_range_of_an_int() {
     assert!(negatives > 0, "`random.next` answers the whole of `Int`");
 }
 
-/// Keeping `random.write` stops the search from calling two draws commutative.
-#[test]
-fn only_a_draw_is_an_access_of_the_step_it_ends() {
-    for sig in SEEDED_OPS {
-        let access = sig.step_access();
-        match sig.effect {
-            "clock" => assert!(access.is_none(), "`{sig}` is scheduler bookkeeping"),
-            _ => assert_eq!(access, Some(Access::Atom(sig.atom()))),
-        }
-    }
-    let draw = StepFootprint::from_accesses(sig("random", "next").step_access());
-    assert!(draw.conflicts_with(&draw));
-}
-
 #[test]
 fn the_table_names_each_operation_once_and_answers_all_of_them() {
     let mut seen: Vec<(&str, &str)> = Vec::new();
