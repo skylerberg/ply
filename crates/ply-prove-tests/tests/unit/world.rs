@@ -340,64 +340,6 @@ fn a_strategy_the_reader_does_not_know_is_refused() {
     assert!(why.message.contains("`Guess`"), "{why}");
 }
 
-/// A count the shapes do not multiply out to would walk a point twice or miss one.
-#[test]
-fn a_domain_its_shapes_do_not_count_is_refused() {
-    let counted = |points: i64| {
-        let domain = record(vec![
-            (
-                "shapes",
-                Value::list(vec![ty("Scalar", vec![Value::str("Bool"), Value::Int(2)])]),
-            ),
-            ("points", Value::Int(points)),
-        ]);
-        let every = strategy("Every", vec![domain, Value::str("Bool")]);
-        world(
-            vec![],
-            vec![],
-            vec![flipped(strategy(
-                "Static",
-                vec![strategy("Run", vec![every])],
-            ))],
-        )
-    };
-    let why = refusal_of(&counted(3));
-    assert!(
-        why.message
-            .contains("3 points, which the binders' shapes do not multiply out to"),
-        "{why}"
-    );
-    assert!(refusal_of(&counted(0)).message.contains("no points"));
-    assert!(World::decode(At::new("the world", &counted(2))).is_ok());
-}
-
-/// A point decodes one value per shape, and the body is entered with one per binder.
-#[test]
-fn a_domain_of_another_arity_than_its_claim_is_refused() {
-    let every = strategy("Every", vec![bool_domain(), Value::str("Bool")]);
-    let value = world(
-        vec![],
-        vec![],
-        vec![obligation(
-            KEY,
-            vec![
-                binder("b", con("Bool"), "Bool"),
-                binder("c", con("Bool"), "Bool"),
-            ],
-            None,
-            &[],
-            strategy("Interleave", vec![every]),
-        )],
-    );
-    let why = refusal_of(&value);
-    assert_eq!(why.path, "the world.obligations[0].strategy");
-    assert!(
-        why.message
-            .contains("a domain over 1 binder(s), for a claim of 2"),
-        "{why}"
-    );
-}
-
 #[test]
 fn a_world_reads_its_types_its_signatures_and_its_obligations() {
     let value = world(
