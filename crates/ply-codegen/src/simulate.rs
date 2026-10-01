@@ -305,13 +305,13 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
         unsafe { switch(&mut *from, sp) };
 
         let c = unsafe { &mut *ctx };
-        let site = c.site();
+        let yielded = c.step_site();
         let sim = c.sims.last_mut().expect("a region is running");
         sim.running = None;
         c.current = sim.stack;
         c.stack_floor = sim.floor_below;
         if sim.sched.records_steps() {
-            c.trail.end_step(site);
+            c.trail.end_step(yielded);
         }
     }
 }
@@ -343,12 +343,7 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             None => sim.sched.park_on_host(k, pending, site, &Unbound),
         },
         Request::Seeded(sig, args) => match sim.handlers.dispatch(sig, task, &args, site) {
-            Ok(Answer::Value(value)) => {
-                if let Some(access) = sig.step_access() {
-                    c.trail.record_access(access);
-                }
-                sim.sched.suspend(k, value)
-            }
+            Ok(Answer::Value(value)) => sim.sched.suspend(k, value),
             Ok(Answer::Sleeping { deadline }) => sim.sched.sleep_until(k, deadline, site),
             Err(d) => Err(d),
         },

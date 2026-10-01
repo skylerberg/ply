@@ -118,15 +118,15 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
             scalar: e.field("scalar")?.bool()?,
             pure: e.field("pure")?.bool()?,
             span: r.span(e.field("at")?)?,
-            params: published(e, "params", carries)?.unwrap_or_default(),
-            answer: published(e, "answer", carry)?.unwrap_or(Carry::Open),
+            params: carries(e.field("params")?)?,
+            answer: carry(e.field("answer")?)?,
         })
     })?;
     for k in d.field("emit_ctors")?.list()? {
         let name = Symbol::new(k.field("name")?.utf8()?);
-        if let Some(fields) = published(k, "fields", carries)? {
-            front.ctor_carries.insert(name.clone(), fields);
-        }
+        front
+            .ctor_carries
+            .insert(name.clone(), carries(k.field("fields")?)?);
         front
             .emitter_ctors
             .push((name, k.field("arity")?.number()?));
@@ -525,25 +525,12 @@ impl Reader<'_> {
             },
             resource_param: o.field("resource_param")?.bool()?,
             span: self.span(o.field("at")?)?,
-            params: published(o, "carries", carries)?.unwrap_or_default(),
+            params: carries(o.field("carries")?)?,
         })
     }
 }
 
 // --- Carries -------------------------------------------------------------------------------
-
-/// A row's carries. The committed bundle that stages a pull request's compiler may predate them,
-/// and nothing is entered over its answer, so absent reads as `None`.
-fn published<T>(
-    row: At<'_>,
-    field: &str,
-    read: impl FnOnce(At<'_>) -> Result<T, Error>,
-) -> Result<Option<T>, Error> {
-    match row.field(field) {
-        Ok(x) => read(x).map(Some),
-        Err(_) => Ok(None),
-    }
-}
 
 fn carries(list: At<'_>) -> Result<Vec<Carry>, Error> {
     list.items(carry)

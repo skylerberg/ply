@@ -1,11 +1,13 @@
 use ply_eval::arena::Slot;
 use ply_eval::cont::SimId;
 use ply_eval::host::{HostRuntime, MachineId, Pending};
-use ply_eval::region::Trail;
+use ply_eval::region::{StepSite, Trail};
 use ply_eval::sched::*;
 use ply_eval::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use ply_eval::sim::{Answer, Handlers, signature};
-use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskHandle, Value, codes};
+use ply_eval::{
+    Diagnostic, EffectAtom, Mode, Resource, SourceId, Span, Symbol, TaskHandle, Value, codes,
+};
 
 type Sched = Scheduler<usize, Value>;
 type Choice = Turn<usize, Value>;
@@ -634,6 +636,14 @@ fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> Access {
     ))
 }
 
+/// The site `at` bytes into source 0, in the definition `definition`.
+fn site(definition: &str, at: u32) -> StepSite {
+    StepSite {
+        definition: Some(Symbol::new(definition)),
+        span: Span::new(SourceId(0), at, at + 1),
+    }
+}
+
 #[test]
 fn the_schedulers_own_bookkeeping_is_not_an_access_but_a_draw_is() {
     let (mut sched, mut clock, mut trail) = solo(0);
@@ -643,18 +653,78 @@ fn the_schedulers_own_bookkeeping_is_not_an_access_but_a_draw_is() {
     else {
         panic!("expected the root's step");
     };
-    trail.record_access(atom("task", None, Mode::Write));
-    trail.record_access(atom("clock", None, Mode::Read));
-    trail.record_access(atom("clock", None, Mode::Write));
+    trail.record_access(atom("task", None, Mode::Write), site("m.f", 0));
+    trail.record_access(atom("clock", None, Mode::Read), site("m.f", 1));
+    trail.record_access(atom("clock", None, Mode::Write), site("m.f", 2));
     assert_eq!(trail.steps()[0].accesses.len(), 0);
+    assert_eq!(trail.steps()[0].site, None, "bookkeeping places no step");
 
-    trail.record_access(atom("random", None, Mode::Write));
-    trail.record_access(atom("db", Some("orders"), Mode::Write));
-    trail.record_access(Access::Cell {
-        id: Slot::new(3, 0),
-        mode: Mode::Write,
-    });
+    trail.record_access(atom("random", None, Mode::Write), site("m.f", 3));
+    trail.record_access(atom("db", Some("orders"), Mode::Write), site("m.f", 4));
+    trail.record_access(
+        Access::Cell {
+            id: Slot::new(3, 0),
+            mode: Mode::Write,
+        },
+        site("m.f", 5),
+    );
     assert_eq!(trail.steps()[0].accesses.len(), 3);
+}
+
+/// A race names where each of its steps first touched something a task can share, and the
+/// definition that did it, whatever the step went on to touch and wherever it gave control back.
+#[test]
+fn a_step_is_placed_at_its_first_shared_access() {
+    let (mut sched, mut clock, mut trail) = solo(0);
+    let Turn::Run { .. } = sched
+        .next(&mut clock, &mut trail)
+        .expect("the root is enabled")
+    else {
+        panic!("expected the root's step");
+    };
+    trail.record_access(atom("clock", None, Mode::Read), site("m.tick", 1));
+    trail.record_access(
+        atom("bank", Some("accounts"), Mode::Read),
+        site("m.transfer", 10),
+    );
+    trail.record_access(
+        Access::Cell {
+            id: Slot::new(1, 0),
+            mode: Mode::Read,
+        },
+        site("m.test#0", 20),
+    );
+    trail.end_step(site("m.transfer", 30));
+    sched.suspend(suspended(), Value::Unit).expect("running");
+
+    let Turn::Run { .. } = sched.next(&mut clock, &mut trail).expect("still enabled") else {
+        panic!("expected a second step");
+    };
+    trail.end_step(site("m.idle", 40));
+    sched.suspend(suspended(), Value::Unit).expect("running");
+
+    let Turn::Run { .. } = sched.next(&mut clock, &mut trail).expect("still enabled") else {
+        panic!("expected a third step");
+    };
+    trail.record_access(Access::Alloc, site("m.open", 50));
+
+    let placed: Vec<(Option<String>, Span)> = trail
+        .record()
+        .steps
+        .iter()
+        .map(|step| (step.definition.as_ref().map(|d| d.to_string()), step.span))
+        .collect();
+    let named = |s: StepSite| (s.definition.map(|d| d.to_string()), s.span);
+    assert_eq!(
+        placed,
+        [
+            named(site("m.transfer", 10)),
+            // Nothing shared: where it gave control back.
+            named(site("m.idle", 40)),
+            // The run failed in it, after its first access.
+            named(site("m.open", 50)),
+        ]
+    );
 }
 
 #[test]
@@ -666,18 +736,24 @@ fn two_steps_touching_one_cell_are_dependent() {
     else {
         panic!("expected the root's step");
     };
-    trail.record_access(Access::Cell {
-        id: Slot::new(1, 0),
-        mode: Mode::Write,
-    });
+    trail.record_access(
+        Access::Cell {
+            id: Slot::new(1, 0),
+            mode: Mode::Write,
+        },
+        site("m.f", 0),
+    );
     sched.suspend(suspended(), Value::Unit).expect("running");
     let Turn::Run { .. } = sched.next(&mut clock, &mut trail).expect("still enabled") else {
         panic!("expected a second step");
     };
-    trail.record_access(Access::Cell {
-        id: Slot::new(1, 0),
-        mode: Mode::Read,
-    });
+    trail.record_access(
+        Access::Cell {
+            id: Slot::new(1, 0),
+            mode: Mode::Read,
+        },
+        site("m.g", 0),
+    );
     let steps = trail.steps();
     assert!(steps[0].accesses.conflicts_with(&steps[1].accesses));
     assert!(!steps[0].accesses.conflicts_with(&StepFootprint::new()));
