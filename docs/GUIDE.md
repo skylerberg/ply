@@ -1085,7 +1085,9 @@ law "a credit and a matching debit leave an account exactly as it was"
   be quantified), an optional `where` guard and a block body.
 * Specs, guards and law bodies must be pure (`E0417`), except that a law body
   may be a `simulate` region. `law/host "..." { }` allows any effect but is
-  never `proved` or cached, and is `W0604` under a hermetic run.
+  never `proved` or cached, and is `W0604` under a hermetic run. Under `--host`
+  its guard and body run against the host the run binds, and what their entries
+  end with, such as a span left open (`W0609`), is reported once.
 * Specs do not change a definition's hash. An `ensures` implies every resource
   outside the footprint is unchanged; there is no `old()`.
 * `Int` arithmetic is checked, so bound the domain with guards as above.

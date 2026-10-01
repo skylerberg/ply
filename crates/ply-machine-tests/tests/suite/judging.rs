@@ -3,8 +3,17 @@
 //! judgements come to, is `proof.property`'s, pinned by its own tests.
 
 use crate::fixture::{loaded, project};
-use ply_eval::{Seed, Span, Symbol, Value, codes};
-use ply_machine::engine::{Binder, Judgement, Mode, Obligation, ObligationKind, Prover, Strategy};
+use ply_eval::host::{
+    Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
+    HostRuntime, Linearity, MachineId, Pending,
+};
+use ply_eval::{Diagnostic, Seed, Span, Symbol, Value, codes};
+use ply_machine::engine::{
+    Binder, Hosting, Judgement, Mode, Obligation, ObligationKind, Prover, Strategy,
+};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const SOURCE: &str = r#"
 law "halving a choice" forall (b: Bool) { (if b { 4 } else { 6 }) / 2 > 1 }
@@ -90,7 +99,11 @@ fn ints(ns: &[i64]) -> Vec<Vec<Value>> {
 }
 
 fn judged(obligation: &Obligation, points: &[Vec<Value>], mode: Mode) -> Vec<Judgement> {
-    with_prover(|prover| prover.judged(obligation, ply_eval::DEFAULT_STEP_BUDGET, points, mode))
+    with_prover(|prover| {
+        prover
+            .judged(obligation, ply_eval::DEFAULT_STEP_BUDGET, points, mode)
+            .each
+    })
 }
 
 /// Each judgement's name, with the code a stopped one carries.
@@ -223,6 +236,108 @@ fn a_claim_the_program_does_not_state_is_plys_failure() {
     assert_eq!(
         shown(&judgements),
         [format!("faulted {}", codes::INTERNAL_ERROR)]
+    );
+}
+
+const HOSTED: &str = r#"
+nondet effect counter {
+  read bump[c]() -> Int
+}
+
+law/host "the counter answers" forall (n: Int) where n > 0 { counter.bump[hits]() > 0 }
+"#;
+
+/// Answers every `bump` with `1`, counting them.
+struct Counter(AtomicU64);
+
+impl HostHandler for Counter {
+    fn call(&self, _: &dyn HostRuntime, _: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(HostAnswer::Value(Value::Int(1)))
+    }
+}
+
+/// A runtime that warns as every entry point it is told of ends, as one does of spans left open.
+struct Warns;
+
+impl HostRuntime for Warns {
+    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+        Ok(Value::Unit)
+    }
+
+    fn end_entry_point(&self, _: MachineId) -> Vec<Diagnostic> {
+        vec![Diagnostic::warning(
+            codes::SPAN_ABANDONED,
+            "a span was still open when the entry point ended",
+        )]
+    }
+}
+
+/// A `law/host` is judged against the host the run binds, its guard and body alike, and what each
+/// of its entries ended with comes back with the judgements.
+#[test]
+fn a_hosted_claim_reaches_the_host_and_hands_back_what_its_entries_ended_with() {
+    let dir = project(HOSTED);
+    let loaded = loaded(dir.path());
+    let counter = Arc::new(Counter(AtomicU64::new(0)));
+    let mut registry = HostRegistry::new();
+    registry.register(
+        HostOp {
+            effect: Symbol::new("counter"),
+            op: Symbol::new("bump"),
+            resource: HostResource::Any,
+            determinism: Determinism::Nondeterministic,
+            linearity: Linearity::Repeatable,
+            blocking: false,
+            secrets: false,
+            path: "judging::Counter",
+        },
+        counter.clone(),
+    );
+    let binding = registry.bind(&loaded.check).expect("the counter binds");
+    let backend =
+        ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier");
+    let prover = Prover::new(&loaded, backend).with_hosting(Hosting {
+        binding: Arc::new(binding),
+        runtime: Some(Arc::new(|| Rc::new(Warns) as Rc<dyn HostRuntime>)),
+    });
+    let hosted = Obligation {
+        strategy: Strategy::Hosted,
+        ..over_an_int("m.the counter answers", 1)
+    };
+
+    let judged = prover.judged(
+        &hosted,
+        ply_eval::DEFAULT_STEP_BUDGET,
+        &ints(&[1, 0, 2]),
+        Mode::Whole,
+    );
+    assert_eq!(shown(&judged.each), ["held", "rejected", "held"]);
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        2,
+        "each body the guard admitted reached the host once"
+    );
+    assert!(
+        !judged.warnings.is_empty()
+            && judged
+                .warnings
+                .iter()
+                .all(|w| w.code == codes::SPAN_ABANDONED),
+        "what the entries ended with never came back: {:?}",
+        judged.warnings
     );
 }
 

@@ -10,7 +10,7 @@
 //! `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
 
 use crate::config::Configuration;
-use crate::engine::{Fault, Judgement, Mode, Obligation};
+use crate::engine::{Fault, Interleaved, Judgement, Mode, Obligation};
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, ctor, diags_value, places_value, record, strings};
@@ -58,13 +58,14 @@ fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     ctor(home, name, args)
 }
 
-const OPERATIONS: [(&str, &str); 9] = [
+const OPERATIONS: [(&str, &str); 10] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
     ("prepared", "ply_machine::claims::prepared"),
     ("cached", "ply_machine::claims::cached"),
     ("judged", "ply_machine::claims::judged"),
     ("interleaved", "ply_machine::claims::interleaved"),
+    ("ended", "ply_machine::claims::ended"),
     ("record", "ply_machine::claims::record"),
     ("baselines", "ply_machine::claims::baselines"),
     ("accepted", "ply_machine::claims::accepted"),
@@ -174,6 +175,7 @@ impl HostHandler for Site {
                 crate::recording::seed_of(seed, span)?,
                 u32::try_from(steps.as_int(span, "the scheduling steps")?).unwrap_or(u32::MAX),
             )?,
+            ("ended", []) => diags_value(&self.judging("ended")?.take_ended()),
             ("record", [entries]) => self.record(filed_of(entries, span)?)?,
             ("baselines", [names]) => self.baselines(names_of(names, span)?)?,
             ("accepted", [records]) => self.accepted(records_of(records, span)?)?,
@@ -723,21 +725,27 @@ struct Judging {
     /// The calls each evaluation of a claim may make; it decides what an evaluation reports.
     step_budget: i64,
     open: AtomicBool,
+    /// What every entry judging made ended with, from any thread, until `ended` takes it.
+    ended: Mutex<Vec<Diagnostic>>,
 }
 
 impl Judging {
     fn judged(&self, batch: &Batch) -> Vec<Judgement> {
-        match (self.obligations.get(batch.claim), values_of(&batch.points)) {
+        let judgements = match (self.obligations.get(batch.claim), values_of(&batch.points)) {
             (Some(obligation), Ok(values)) => {
                 self.prover
                     .judged(obligation, self.step_budget, &values, batch.mode)
             }
-            (None, _) => vec![Judgement::Faulted(no_such_claim(
-                batch.claim,
-                self.obligations.len(),
-            ))],
-            (_, Err(fault)) => vec![Judgement::Faulted(*fault.diagnostic)],
-        }
+            (None, _) => {
+                return vec![Judgement::Faulted(no_such_claim(
+                    batch.claim,
+                    self.obligations.len(),
+                ))];
+            }
+            (_, Err(fault)) => return vec![Judgement::Faulted(*fault.diagnostic)],
+        };
+        self.keep(judgements.warnings);
+        judgements.each
     }
 
     fn interleaved(
@@ -747,15 +755,10 @@ impl Judging {
         seed: &ply_eval::Seed,
         steps: u32,
     ) -> crate::engine::Interleaved {
-        let faulted = |diagnostic: Diagnostic| crate::engine::Interleaved {
-            interleaving: ply_eval::Interleaving::passed(Vec::new()),
-            verdict: Some(Judgement::Faulted(diagnostic)),
-            observed: false,
-        };
         let Some(obligation) = self.obligations.get(claim) else {
-            return faulted(no_such_claim(claim, self.obligations.len()));
+            return Interleaved::faulted(no_such_claim(claim, self.obligations.len()));
         };
-        match values_of(&[point]) {
+        let mut run = match values_of(&[point]) {
             Ok(mut values) => self.prover.interleaved(
                 obligation,
                 self.step_budget,
@@ -763,8 +766,26 @@ impl Judging {
                 seed,
                 steps,
             ),
-            Err(fault) => faulted(*fault.diagnostic),
+            Err(fault) => return Interleaved::faulted(*fault.diagnostic),
+        };
+        self.keep(std::mem::take(&mut run.warnings));
+        run
+    }
+
+    fn keep(&self, warnings: Vec<Diagnostic>) {
+        if !warnings.is_empty() {
+            self.ended
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(warnings);
         }
+    }
+
+    /// Each warning once: every point a claim is judged at ends an entry, and says the same.
+    fn take_ended(&self) -> Vec<Diagnostic> {
+        crate::support::once_each(std::mem::take(
+            &mut *self.ended.lock().unwrap_or_else(|e| e.into_inner()),
+        ))
     }
 }
 
@@ -811,6 +832,7 @@ fn prepare(job: &Job, loaded: &Loaded, step_budget: i64) -> Result<Prepared, Ref
             obligations: job.obligations.clone(),
             step_budget,
             open: AtomicBool::new(true),
+            ended: Mutex::new(Vec::new()),
         }),
         warnings,
     })
