@@ -67,7 +67,17 @@ const STACK: usize = 256 << 20;
 
 /// The ops and the one handler serving them, configured as the run being lent is configured.
 pub fn registrations_with(options: drive::RunOptions) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
+    registrations_in(EFFECT, options)
+}
+
+/// The machine for a program that declares `machine` in `module`, which is where `Target` is
+/// declared too: what a load answers crosses under that module's name.
+pub fn registrations_in(
+    module: &str,
+    options: drive::RunOptions,
+) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
+        module: module.to_string(),
         options,
         labels: Mutex::new(HashMap::new()),
         configured: Mutex::new(HashMap::new()),
@@ -127,6 +137,7 @@ fn refused_value(refused: &drive::Refused) -> Value {
 // --- The handler ------------------------------------------------------------------
 
 struct Site {
+    module: String,
     options: drive::RunOptions,
     labels: Mutex<HashMap<String, Labelled>>,
     /// What a label was configured with before it loaded, if it was.
@@ -193,7 +204,7 @@ impl HostHandler for Site {
                 let answer: Result<drive::FoundData, drive::Refused> =
                     self.ask(&label, span, |reply| Go::Reload { reply, front })?;
                 match answer {
-                    Ok(found) => ok(drive::found_value(&found)),
+                    Ok(found) => ok(drive::found_value(&found, &self.module)),
                     Err(refused) => refused_value(&refused),
                 }
             }
@@ -314,7 +325,7 @@ impl Site {
             );
         }
         Ok(match found {
-            Ok(found) => ok(drive::found_value(&found)),
+            Ok(found) => ok(drive::found_value(&found, &self.module)),
             Err(refused) => refused_value(&refused),
         })
     }
@@ -366,7 +377,10 @@ impl Site {
                 // A load that opens consumes its label's configuration.
                 self.taken(label);
                 ply_codegen::c::sweep::used(&entry);
-                Ok(payload::option(Some(drive::found_value(&found))))
+                Ok(payload::option(Some(drive::found_value(
+                    &found,
+                    &self.module,
+                ))))
             }
             Err(_) => Ok(payload::option(None)),
         }
