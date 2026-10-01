@@ -56,9 +56,10 @@ pub(crate) const HARD_GEN_DEPTH: u32 = 64;
 /// What every type variable is drawn as, as a report names the type.
 const VARIABLE_DRAWN_AS: &str = "Int";
 
-const GEN_DOMAIN: &[u8] = b"ply.gen.stream.1";
+/// `std.random`'s keyed stream, whose key is the obligation's.
+const GEN_DOMAIN: &[u8] = b"ply.sim.stream.1";
 
-/// Counter-mode BLAKE3, keyed by the root and the obligation.
+/// Counter-mode BLAKE3, keyed by the root and the obligation, as `std.random.rand_keyed` is.
 #[derive(Clone, Debug)]
 pub struct GenStream {
     root: u64,
@@ -86,6 +87,8 @@ impl GenStream {
         let mut hasher = blake3::Hasher::new();
         hasher.update(GEN_DOMAIN);
         hasher.update(&root.to_le_bytes());
+        hasher.update(&[2]);
+        hasher.update(&(key.0.len() as u32).to_le_bytes());
         hasher.update(&key.0);
         hasher.update(&counter.to_le_bytes());
         let bytes = hasher.finalize();
