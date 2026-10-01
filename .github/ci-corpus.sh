@@ -11,11 +11,21 @@
 #       out of the report. With the program's own tests go those of the programs under `fixtures/`
 #       it runs, each of which must pass a test.
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
+#   ci-corpus.sh mark                  the moment `keep` gathers from
+#   ci-corpus.sh keep DIR              the C `ply` emitted and compiled since `mark`, into DIR for a
+#                                      later run: a body is keyed by its definition, the emitter and
+#                                      the runtime's sources, so another tree reuses what still
+#                                      applies. The packages' stores stay out: they hold test results,
+#                                      which a runtime a later run builds could not vouch for.
+#   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ply="$root/target/debug/ply"
 shards="$root/.github/ci-shards.sh"
+# The caches `ply` reads, where the workflow restores them.
+caches=/tmp
+mark=$caches/ply-c-corpus.mark
 
 # What a checks run is given after `ply test PATH`.
 grants=(--host --timeout 900000 --steps 0 --json
@@ -148,8 +158,25 @@ case "${1:-}" in
   run)
     run_one "${2:?a corpus entry}" "${@:3}"
     ;;
+  mark)
+    touch "$mark"
+    ;;
+  keep)
+    dir=${2:?a directory}
+    [ -f "$mark" ] || { echo "nothing is marked: run 'ci-corpus.sh mark' before the runs" >&2; exit 2; }
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    (cd "$caches" && find ply-c-cache ply-c-stage -type f -newer "$mark" -print0 2>/dev/null |
+      tar --null -T - -cf -) | tar -xf - -C "$dir" || exit 1
+    du -sh "$dir"
+    ;;
+  restore)
+    dir=${2:?a directory}
+    [ -d "$dir" ] || exit 0
+    tar -C "$dir" -cf - . | tar -C "$caches" --skip-old-files -xf -
+    ;;
   *)
-    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | run ID [ARG...]" >&2
+    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | run ID [ARG...] | mark | keep DIR | restore DIR" >&2
     exit 2
     ;;
 esac
