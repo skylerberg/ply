@@ -1842,8 +1842,11 @@ counter; it was never on a disk, so `mem_sync` only says whether the path names
 something and `mem_canonical` is handed the absolute path the tree stands for.
 A write answers a `Written` of the tree and whether it happened, `mem_append` an
 `Appended` of the tree and the offset, and `mem_temp_dir` a `Made` of the tree
-and the path. A test imports both `std.fs` and `std.fs (fs)` to name the module
-and the effect.
+and the path. `on_mem(tree, go)` runs `go` with every operation on the label its
+row names answered by the twin, and answers an `Over` of the value and the tree
+it left: what a test hands code written to perform any operation of a root,
+since it answers whatever operations `std.fs` gains. A test imports both
+`std.fs` and `std.fs (fs)` to name the module and the effect.
 
 ### 13.12 `std.path`
 
