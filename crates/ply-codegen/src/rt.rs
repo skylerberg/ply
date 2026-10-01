@@ -470,6 +470,9 @@ pub struct Ctx {
     pub(crate) entry: u64,
     /// The host boundary: what a `perform` nothing on the stack answers reaches.
     pub(crate) binding: Arc<ply_eval::HostBinding>,
+    /// The program this context's entries run, whose declarations say how a host operation's
+    /// arguments read; `None` for one entered without its program's answer.
+    pub(crate) program: Option<&'static ply_eval::Front>,
     pub(crate) runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
     pub(crate) declared: Option<ply_eval::Footprint>,
     pub(crate) re_executed: bool,
@@ -527,6 +530,7 @@ impl Ctx {
             starting_detached: None,
             entry: 0,
             binding: Arc::new(ply_eval::HostBinding::hermetic()),
+            program: None,
             runtime: None,
             declared: None,
             re_executed: false,
@@ -996,7 +1000,8 @@ const BINOPS: [BinOp; 18] = [
     BinOp::Ushr,
 ];
 
-/// The machine's own negation of a value whose type the emitter cannot see. Takes it.
+/// The machine's own negation of a `Float`, a `Decimal` or a width past 32 bits, which compiled
+/// code holds as the runtime's own words. Takes it.
 pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let vals = values_taken(c, &[a]);
@@ -1032,7 +1037,8 @@ pub unsafe extern "C" fn rt_bitnot(ctx: *mut Ctx, a: i64) -> i64 {
     c.word(&answer)
 }
 
-/// The machine's own operator over two values whose type the emitter does not fix. Takes both.
+/// The machine's own operator over two words of a `Float`, a `Decimal` or a width past 32 bits.
+/// Takes both.
 pub unsafe extern "C" fn rt_binary(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let Some(op) = usize::try_from(op)
@@ -1308,12 +1314,15 @@ pub unsafe extern "C" fn rt_let_no_match(ctx: *mut Ctx) {
     ctx.fail(d);
 }
 
+/// `what` is `emit.ply`'s `overflow_code`.
 pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
     let name = match what {
         0 => "addition",
         1 => "subtraction",
-        _ => "negation",
+        2 => "negation",
+        3 => "multiplication",
+        _ => "division",
     };
     let d = error(format!("integer overflow in {name}"));
     ctx.fail(d);
