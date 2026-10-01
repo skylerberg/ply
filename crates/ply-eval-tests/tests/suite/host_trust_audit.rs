@@ -291,7 +291,9 @@ test/nondet "blocking, honestly" { assert_eq(net.send[socket](1), 1) }
     declared.blocking = true;
     let handler = Arc::new(Reports(AtomicU64::new(0)));
     let mut machine = compiled.bound(vec![(declared, handler.clone())]);
-    machine.set_host_runtime(std::rc::Rc::new(Resolves::default()));
+    machine.set_host_runtime(std::sync::Arc::new(|| {
+        std::rc::Rc::new(Resolves::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
+    }));
     machine.eval_test(0).expect("green");
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -761,7 +763,9 @@ test/nondet "waits on a token nothing resolves" {
     entries.push((any("net", "accept"), Arc::new(Waits)));
 
     let mut machine = compiled.bound(entries);
-    machine.set_host_runtime(std::rc::Rc::new(NeverResolves));
+    machine.set_host_runtime(std::sync::Arc::new(|| {
+        std::rc::Rc::new(NeverResolves) as std::rc::Rc<dyn ply_eval::HostRuntime>
+    }));
     let d = diagnostic(machine.eval_test(0));
     assert_eq!(
         d.code,

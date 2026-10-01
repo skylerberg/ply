@@ -1,11 +1,10 @@
 use crate::hosts::{Hosts, hosting};
 use crate::load::Loaded;
-use ply_eval::{DefInfo, Diagnostic, HashOutput, HostRuntime, SourceId, Span, Symbol, codes};
+use ply_eval::{DefInfo, Diagnostic, HashOutput, SourceId, Span, Symbol, codes};
 use ply_test::RunReport;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::rc::Rc;
 
 pub struct Mutant {
     pub definition: Symbol,
@@ -277,7 +276,7 @@ fn spliced(loaded: &Loaded, mutant: &Mutant) -> (Vec<(String, String)>, Vec<Sour
 /// Judges every mutant of every target, cheapest first, up to the budget; the honest program
 /// is assumed green, since a survivor means nothing otherwise.
 #[allow(clippy::too_many_arguments)]
-pub fn run<F>(
+pub fn run(
     loaded: &Loaded,
     hashes: &HashOutput,
     targets: &[&DefInfo],
@@ -286,11 +285,8 @@ pub fn run<F>(
     choice: &ply_test::Choice,
     plan: &crate::tester::Plan,
     hosts: &Hosts,
-    runtime: &Option<F>,
-) -> Report
-where
-    F: Fn() -> Rc<dyn HostRuntime> + Sync,
-{
+    runtime: &Option<ply_eval::RuntimeFactory>,
+) -> Report {
     let mut report = Report {
         definitions: targets.len(),
         ..Report::default()
@@ -342,7 +338,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn judge<F>(
+fn judge(
     loaded: &Loaded,
     mutant: &Mutant,
     reached: &[usize],
@@ -350,12 +346,9 @@ fn judge<F>(
     choice: &ply_test::Choice,
     plan: &crate::tester::Plan,
     hosts: &Hosts,
-    runtime: &Option<F>,
+    runtime: &Option<ply_eval::RuntimeFactory>,
     store: &mut ply_store::Store,
-) -> Verdict
-where
-    F: Fn() -> Rc<dyn HostRuntime> + Sync,
-{
+) -> Verdict {
     let (sources, ids) = spliced(loaded, mutant);
     let Ok(front) = ply_codegen::c::producer::checked_front(&sources, &ids) else {
         return Verdict::Skipped("does not check");

@@ -966,10 +966,7 @@ fn prepare<'a>(job: &'a Job, loaded: &'a Loaded) -> Result<Prepared<'a>, Refused
         .filter(|_| job.binding.as_ref().is_some_and(|b| b.host))
         .map(|hosts| crate::engine::Hosting {
             binding: hosts.binding(),
-            runtime: hosts.runtime_factory().map(|f| {
-                Arc::new(f)
-                    as Arc<dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync + Send>
-            }),
+            runtime: hosts.runtime_factory(),
         });
     Ok(Prepared {
         _hosts: hosts,

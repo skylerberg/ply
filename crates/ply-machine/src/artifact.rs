@@ -1270,7 +1270,7 @@ fn evaluate(
 ) -> Result<ply_eval::Value, Diagnostic> {
     let mut machine = ply_eval::Machine::new(&opened.front, tier.attach())?;
     machine.set_host_binding(hosts.binding());
-    if let Some(runtime) = hosts.runtime() {
+    if let Some(runtime) = hosts.runtime_factory() {
         machine.set_host_runtime(runtime);
     }
     if let Some(declared) = declared {

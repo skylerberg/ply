@@ -7159,63 +7159,56 @@ fn check_parallels(cx: Cx) -> Cx =
   fold(cx.parallels, { ..cx, parallels: [] }, |c: Cx, site: ParallelSite| {
     let rows = map(site.branches, |b: { span: Span, row: Row }|
       { span: b.span, row: resolve_r(c, b.row) });
-    let n = len(rows);
-    let seed = seed_atom();
-    let simulating = fold(rows, None, |acc: Option<Branch>, b: Branch|
-      match acc {
-        Some(_) -> acc,
-        None -> if atoms_contains(b.row.atoms, seed) { Some(b) } else { None },
-      });
-    let found = fold(range(0, n), None, |acc: Option<Clash>, j: Int|
-      fold(range(0, j), acc, |inner: Option<Clash>, i: Int|
-        match inner { Some(_) -> inner, None -> clash(at(rows, i), at(rows, j)) }));
-    match simulating {
-      Some(b) ->
-        err_labels(
-          c,
-          b"E0309",
-          b"a `parallel` branch may not open a `simulate` region",
-          [
-            lab(
-              site.module,
-              b.span,
-              true,
-              bytes_concat(b"this branch performs ", tick(atom_text(seed))),
-            ),
-          ],
-          [
-            b"a region's schedule is drawn from its entry's seed, in the order its regions open, which branches running at once do not have",
-          ],
-        ),
-      None -> match found {
-        None -> c,
-        Some(k) ->
-          err_labels(
-            c,
-            b"E0309",
-            b"two branches of this `parallel` block may touch one resource",
-            [
-              lab(
-                site.module,
-                k.later.span,
-                true,
-                bytes_concat(b"this branch performs ", k.later_does),
-              ),
-              lab(
-                site.module,
-                k.earlier.span,
-                false,
-                bytes_concat(b"and this one performs ", k.earlier_does),
-              ),
+    match refusal(rows) {
+      None -> c,
+      Some(r) -> err_labels(c, b"E0309", r.message, map(r.labels, |l: { span: Span, primary: Bool, text: Bytes }| lab(site.module, l.span, l.primary, l.text)), r.notes),
+    }
+  })
+
+type Refusal = { message: Bytes, labels: List<{ span: Span, primary: Bool, text: Bytes }>, notes: List<Bytes> }
+
+// What keeps a block's branches from running at once: a region's schedule, a task's scheduler, or
+// a resource two of them touch.
+fn refusal(rows: List<Branch>) -> Option<Refusal> = {
+  let seed = seed_atom();
+  let performing = |pick: (Atom) -> Bool| fold(rows, None, |acc: Option<{ branch: Branch, atom: Atom }>, b: Branch|
+    match acc {
+      Some(_) -> acc,
+      None -> match filter(b.row.atoms, pick) { [a, ..] -> Some({ branch: b, atom: a }), [] -> None },
+    });
+  let one = |p: { branch: Branch, atom: Atom }, message: Bytes, why: Bytes|
+    Some({
+      message: message,
+      labels: [{ span: p.branch.span, primary: true, text: bytes_concat(b"this branch performs ", tick(atom_text(p.atom))) }],
+      notes: [why],
+    });
+  match performing(|a: Atom| a == seed) {
+    Some(p) -> one(p, b"a `parallel` branch may not open a `simulate` region", b"a region's schedule is drawn from its entry's seed, in the order its regions open, which branches running at once do not have"),
+    None -> match performing(|a: Atom| a.effect == b"task") {
+      Some(p) -> one(p, b"a `parallel` branch may not spawn, join or yield a task", b"a task is scheduled by the thread that spawned it, and a branch may run on another; spawn the tasks outside the block"),
+      None -> {
+        let n = len(rows);
+        let found = fold(range(0, n), None, |acc: Option<Clash>, j: Int|
+          fold(range(0, j), acc, |inner: Option<Clash>, i: Int|
+            match inner { Some(_) -> inner, None -> clash(at(rows, i), at(rows, j)) }));
+        match found {
+          None -> None,
+          Some(k) -> Some({
+            message: b"two branches of this `parallel` block may touch one resource",
+            labels: [
+              { span: k.later.span, primary: true, text: bytes_concat(b"this branch performs ", k.later_does) },
+              { span: k.earlier.span, primary: false, text: bytes_concat(b"and this one performs ", k.earlier_does) },
             ],
-            [
+            notes: [
               b"branches run at once, so two of them may not perform operations of one effect on one resource where either is a `write`",
               b"bind the branches with `let` in the order they must run, or move what they share out of the block",
             ],
-          ),
+          }),
+        }
       },
-    }
-  })
+    },
+  }
+}
 
 type Branch = { span: Span, row: Row }
 
@@ -9797,8 +9790,7 @@ test "a branch whose row is open may perform anything, so it shares with no bran
   )
 }
 
-test "a branch may not open a `simulate` region, whose schedule is its entry's" {
-  assert_eq(check_codes(b"fn f() -> (Int, Int) / {sim.read} = parallel { simulate { 1 }, 2 }"), [
-    b"E0309",
-  ])
+test "a branch may not open a `simulate` region, whose schedule is its entry's, nor spawn a task" {
+  assert_eq(check_codes(b"fn f() -> (Int, Int) / {sim.read} = parallel { simulate { 1 }, 2 }"), [b"E0309"]);
+  assert_eq(check_codes(b"fn f() -> (Int, Int) / {task.write} = parallel { task.join(task.spawn(|| 1)), 2 }"), [b"E0309"])
 }

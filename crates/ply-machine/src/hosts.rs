@@ -191,11 +191,11 @@ impl Hosts {
     }
 
     /// The same thing, as something a worker thread can call for itself.
-    pub fn runtime_factory(&self) -> Option<impl Fn() -> Rc<dyn HostRuntime> + Sync + use<>> {
-        self.host
-            .as_ref()
-            .map(Arc::clone)
-            .map(|host| move || host.runtime())
+    pub fn runtime_factory(&self) -> Option<ply_eval::RuntimeFactory> {
+        self.host.as_ref().map(Arc::clone).map(|host| {
+            let factory: ply_eval::RuntimeFactory = Arc::new(move || host.runtime());
+            factory
+        })
     }
 
     pub fn binding(&self) -> Arc<HostBinding> {
@@ -280,13 +280,10 @@ pub fn handshakes_json(counts: &tls::HandshakeCounts) -> Value {
 }
 
 /// What the test runner is told it may reach.
-pub fn hosting<'a, F>(hosts: &Hosts, runtime: &'a Option<F>) -> ply_test::Hosting<'a>
-where
-    F: Fn() -> Rc<dyn HostRuntime> + Sync,
-{
+pub fn hosting(hosts: &Hosts, runtime: &Option<ply_eval::RuntimeFactory>) -> ply_test::Hosting {
     let hosting = ply_test::Hosting::hermetic().with_binding(hosts.binding());
     match runtime {
-        Some(factory) => hosting.with_runtime(factory),
+        Some(factory) => hosting.with_runtime(Arc::clone(factory)),
         None => hosting,
     }
 }

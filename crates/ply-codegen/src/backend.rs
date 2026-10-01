@@ -617,9 +617,10 @@ impl ply_eval::Compiled for Bodies {
         &self,
         binding: std::sync::Arc<ply_eval::HostBinding>,
         runtime: Option<std::rc::Rc<dyn ply_eval::HostRuntime>>,
+        factory: Option<ply_eval::RuntimeFactory>,
     ) {
         if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
-            ctx.set_host(binding, runtime);
+            ctx.set_host(binding, runtime, factory);
         }
     }
 

@@ -169,7 +169,7 @@ pub unsafe fn perform(
     if let Err(d) = ply_eval::escape::check_arguments(&operation, declaration.path, &values, span) {
         return c.fail(d);
     }
-    let runtime = c.runtime.clone();
+    let runtime = c.host_runtime();
     let answered = {
         let request = HostRequest {
             atom: atom.clone(),
