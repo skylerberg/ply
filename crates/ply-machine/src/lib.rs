@@ -23,7 +23,6 @@ pub mod engine;
 pub mod hosts;
 pub mod load;
 pub mod migrate;
-pub mod mutate;
 pub mod options;
 pub mod payload;
 pub mod policy;
@@ -32,9 +31,9 @@ pub mod reused;
 pub mod shelf;
 pub mod support;
 pub mod tester;
+pub mod testrun;
 pub mod trace;
 pub mod vcs;
-pub mod warm;
 
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,

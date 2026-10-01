@@ -1,0 +1,270 @@
+// `facts` — what is known about each definition in a failing test's closure, in the era it last
+// passed and now: the rows `delta.classified` makes a change set of.
+
+import std.list (sort_by)
+import delta (DefKey, Facts, Own, Row, Value, Decl, decl_key, key_before, value_key)
+
+/// The definition set a test was last seen to pass at.
+pub type Baseline = {
+  test: String,
+  /// Program-wide name to hash, for every function in the closure then.
+  closure: Map<String, String>,
+  /// The same for the `type` and `effect` declarations.
+  decls: Map<String, String>,
+}
+
+/// The program now: the failing test's hash and closure, every hash by name, and what each name
+/// mentions.
+pub type Now = {
+  test: Option<String>,
+  closure: List<String>,
+  defs: Map<String, String>,
+  decls: Map<String, String>,
+  deps: Map<String, List<String>>,
+}
+
+/// Today's bodies hashed with each reference to a baseline name written as its baseline hash: each
+/// one's fresh hash, the hash the current table re-normalizes it to, and its recursive component,
+/// `-1` when it is in none; and each test's.
+pub type Node = { key: DefKey, fresh: String, table: String, component: Int }
+
+pub type Rehash = { nodes: List<Node>, tests: Map<String, String> }
+
+fn era_hash(defs: Map<String, String>, decls: Map<String, String>, key: DefKey) -> Option<String> =
+  match key.ns { Value -> map_get(defs, key.name), Decl -> map_get(decls, key.name) }
+
+fn key_text(k: DefKey) -> String = match k.ns { Value -> "v " ++ k.name, Decl -> "d " ++ k.name }
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+fn keyed(acc: Map<String, DefKey>, k: DefKey) -> Map<String, DefKey> =
+  map_insert(acc, key_text(k), k)
+
+/// Every definition either era's closure holds, ascending.
+fn keys_of(b: Baseline, now: Now) -> List<DefKey> = {
+  let then = fold(
+    appended(map(map_keys(b.closure), value_key), map(map_keys(b.decls), decl_key)),
+    map_new(),
+    keyed,
+  );
+  let all = fold(now.closure, then, |acc: Map<String, DefKey>, name: String| {
+    let with_value = if map_contains(now.defs, name) { keyed(acc, value_key(name)) } else { acc };
+    if map_contains(now.decls, name) { keyed(with_value, decl_key(name)) } else { with_value }
+  });
+  sort_by(map_values(all), key_before)
+}
+
+/// The names among `names` that mention each one, ascending.
+fn referrers_of(
+  deps: Map<String, List<String>>,
+  names: Map<String, Bool>,
+) -> Map<String, List<String>> = {
+  let found = map_fold(
+    deps,
+    map_new(),
+    |acc: Map<String, Map<String, Bool>>, from: String, to: List<String>|
+      if !map_contains(names, from) { acc } else {
+        fold(to, acc, |into: Map<String, Map<String, Bool>>, name: String|
+          if !map_contains(names, name) { into } else {
+            let held = match map_get(into, name) { Some(xs) -> xs, None -> map_new() };
+            map_insert(into, name, map_insert(held, from, true))
+          })
+      },
+  );
+  map_fold(
+    found,
+    map_new(),
+    |acc: Map<String, List<String>>, name: String, from: Map<String, Bool>|
+      map_insert(acc, name, map_keys(from)),
+  )
+}
+
+/// The rehash, indexed: each node by its key, and each component's members, ascending.
+type Indexed = { nodes: Map<String, Node>, components: Map<Int, List<DefKey>> }
+
+fn indexed(r: Option<Rehash>) -> Indexed =
+  match r {
+    None -> { nodes: map_new(), components: map_new() },
+    Some(rehash) -> {
+      let members = fold(rehash.nodes, map_new(), |acc: Map<Int, List<DefKey>>, n: Node|
+        if n.component < 0 { acc } else {
+          map_insert(
+            acc,
+            n.component,
+            push(match map_get(acc, n.component) { Some(xs) -> xs, None -> [] }, n.key),
+          )
+        });
+      {
+        nodes: fold(rehash.nodes, map_new(), |acc: Map<String, Node>, n: Node|
+          map_insert(acc, key_text(n.key), n)),
+        components: map_fold(
+          members,
+          map_new(),
+          |acc: Map<Int, List<DefKey>>, c: Int, keys: List<DefKey>|
+            map_insert(acc, c, sort_by(keys, key_before)),
+        ),
+      }
+    },
+  }
+
+/// The members of `key`'s recursive component, itself among them, when it is in one.
+fn component_of(ix: Indexed, key: DefKey) -> List<DefKey> =
+  match map_get(ix.nodes, key_text(key)) {
+    None -> [],
+    Some(n) -> match map_get(ix.components, n.component) { Some(keys) -> keys, None -> [] },
+  }
+
+/// The facts one failure's change set is classified from. `stable` is asked, of a body that moved
+/// on its own, whether its published interface is the same in both eras; it is never asked when
+/// nothing could re-hash the program, since then nothing is classified.
+pub fn facts<| e>(
+  key: String,
+  b: Baseline,
+  now: Now,
+  rehash: Option<Rehash>,
+  stable: (DefKey, String) -> Option<Bool> / e,
+) -> Facts / e = {
+  let keys = keys_of(b, now);
+  let ix = indexed(rehash);
+  let names = fold(keys, map_new(), |acc: Map<String, Bool>, k: DefKey|
+    map_insert(acc, k.name, true));
+  let referrers = referrers_of(now.deps, names);
+  let present = fold(
+    appended(map_values(now.defs), map_values(now.decls)),
+    map_new(),
+    |acc: Map<String, Bool>, h: String| map_insert(acc, h, true),
+  );
+  let image = match rehash {
+    None -> map_new(),
+    Some(r) ->
+      fold(r.nodes, map_new(), |acc: Map<String, Bool>, n: Node| map_insert(acc, n.table, true)),
+  };
+  let rows = map(keys, |k: DefKey| {
+    let before = era_hash(b.closure, b.decls, k);
+    let after = era_hash(now.defs, now.decls, k);
+    let rehashed = match map_get(ix.nodes, key_text(k)) { Some(n) -> Some(n.fresh), None -> None };
+    {
+      name: k.name,
+      ns: k.ns,
+      before: before,
+      after: after,
+      rehashed: rehashed,
+      // Comparing interfaces reads the baseline's out of the store, so it is asked only of a body
+      // that moved on its own.
+      stable: match ((before, after, rehash)) {
+        (Some(was), Some(is), Some(_)) -> if was != is && rehashed != Some(was) { stable(k, was) }
+        else { None },
+        _ -> None,
+      },
+      kept: match before { Some(was) -> map_contains(present, was), None -> false },
+      renamed: match before { Some(was) -> map_contains(image, was), None -> false },
+      component: component_of(ix, k),
+      referrers: match map_get(referrers, k.name) { Some(from) -> from, None -> [] },
+    }
+  });
+  {
+    own: {
+      name: key,
+      before: b.test,
+      after: now.test,
+      rehashed: match rehash { Some(r) -> map_get(r.tests, key), None -> None },
+    },
+    rows: rows,
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn named(pairs: List<{ key: String, value: String }>) -> Map<String, String> = map_of_entries(pairs)
+
+fn a_baseline() -> Baseline =
+  {
+    test: "t1",
+    closure: named([{ key: "m.leaf", value: "l1" }, { key: "m.top", value: "p1" }]),
+    decls: map_new(),
+  }
+
+fn a_now() -> Now =
+  {
+    test: Some("t2"),
+    closure: ["m.leaf", "m.top"],
+    defs: named([{ key: "m.leaf", value: "l2" }, { key: "m.top", value: "p2" }]),
+    decls: map_new(),
+    deps: map_of_entries([{ key: "m.top", value: ["m.leaf"] }, { key: "m.t", value: ["m.top"] }]),
+  }
+
+fn a_rehash() -> Rehash =
+  {
+    nodes: [
+      { key: value_key("m.leaf"), fresh: "l2", table: "l2", component: 0 - 1 },
+      { key: value_key("m.top"), fresh: "p1", table: "p2", component: 0 - 1 },
+    ],
+    tests: map_insert(map_new(), "m.t", "t1"),
+  }
+
+fn row_named(f: Facts, name: String) -> Row =
+  match filter(f.rows, |r: Row| r.name == name) {
+    [r, ..] -> r,
+    [] -> panic("a row for every name in either closure"),
+  }
+
+test "an edit to a leaf leaves what references it rehashing to its baseline" {
+  let f = facts("m.t", a_baseline(), a_now(), Some(a_rehash()), |k: DefKey, was: String|
+    Some(true));
+  let leaf = row_named(f, "m.leaf");
+  assert_eq(leaf.rehashed, Some("l2"));
+  assert_eq(leaf.stable, Some(true));
+  let top = row_named(f, "m.top");
+  assert_eq(top.rehashed, Some("p1"));
+  // A body that only moved because something under it did is never asked about its interface.
+  assert_eq(top.stable, None);
+  assert_eq(leaf.referrers, ["m.top"]);
+  assert_eq(f.own.rehashed, Some("t1"))
+}
+
+test "a classifier with no evidence answers nothing" {
+  let f = facts("m.t", a_baseline(), a_now(), None, |k: DefKey, was: String| panic("not asked"));
+  assert_eq(map(f.rows, |r: Row| r.rehashed), [None, None]);
+  assert_eq(map(f.rows, |r: Row| r.stable), [None, None]);
+  assert_eq(f.own.rehashed, None)
+}
+
+test "a definition only one era holds is a row with the other era's hash missing" {
+  let now = {
+    ..a_now(),
+    closure: ["m.top", "m.added"],
+    defs: map_insert(a_now().defs, "m.added", "a2"),
+  };
+  let f = facts("m.t", a_baseline(), now, None, |k: DefKey, was: String| None);
+  assert_eq(map(f.rows, |r: Row| r.name), ["m.added", "m.leaf", "m.top"]);
+  assert_eq(row_named(f, "m.added").before, None);
+  assert_eq(row_named(f, "m.added").after, Some("a2"))
+}
+
+test "a baseline hash still in the program is kept, and one the program re-normalizes to is renamed" {
+  let now = {
+    ..a_now(),
+    defs: named([
+      { key: "m.leaf", value: "l2" },
+      { key: "m.top", value: "p2" },
+      { key: "m.other", value: "l1" },
+    ]),
+  };
+  let f = facts("m.t", a_baseline(), now, Some(a_rehash()), |k: DefKey, was: String| None);
+  assert(row_named(f, "m.leaf").kept);
+  assert(!row_named(f, "m.top").kept);
+  assert(!row_named(f, "m.top").renamed)
+}
+
+test "the members of a recursive component are named on each of its rows" {
+  let r = {
+    ..a_rehash(),
+    nodes: [
+      { key: value_key("m.leaf"), fresh: "l2", table: "l2", component: 3 },
+      { key: value_key("m.top"), fresh: "p1", table: "p2", component: 3 },
+    ],
+  };
+  let f = facts("m.t", a_baseline(), a_now(), Some(r), |k: DefKey, was: String| None);
+  assert_eq(row_named(f, "m.leaf").component, [value_key("m.leaf"), value_key("m.top")])
+}

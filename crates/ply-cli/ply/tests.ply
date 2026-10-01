@@ -1,28 +1,47 @@
-// `ply test` — which tests this run had to execute, what each of them did, and what the run
-// exits with. The load, the store, the compiled backend, the host binding, the worker pool, the
-// per-test unwind catching and the building of a mixture are the Rust side's: a front end is not a
-// value a program can hold, a Rust unwind is not a Ply value, and the store's on-disk format has one
-// reader. Which tests run, the keys each result is read and filed under, the classes they share and
-// why a failure happened are decided here, from what the runtime answers, along with everything
-// said about all of it, in both forms, and the code it exits with.
+// `ply test` — which tests this run executes, what each of them did, what the run proves, and what
+// it exits with. The runtime holds what a program cannot — compiled units, the host binding, a
+// test's run and the result cache's format — behind `tester`. Which tests run, the classes they
+// share, the keys each result is read and filed under, what the run concludes, why a failure
+// happened, the mutants and mixtures tried, and everything said about all of it are decided here,
+// in both forms, along with the code the run exits with.
 
 import args (Flags, from_argv, style_of)
+import appends (broken_promises)
 import builder (builder)
 import cache (store, Front)
-import std.fs (fs)
+import std.fs (fs, File, mem_kind, mem_list, mem_modified, mem_of, mem_size)
+import std.list (sort_by)
+import std.path (parent)
 import std.time (time)
 import cmdline
 import cmdline (Parsed, Run, has, parse, value, values_of)
 import config_schema
 import surface
 import machine
-import compiler.resolve (Diag, Label)
-import diagnostic (Place, Raised, Spot, shown, spot_of, all_to_json, all_to_text)
+import compiler.diag (parse_all)
+import compiler.front (Analysed, Refused, Whole, analyse)
+import compiler.infer (DefInfo, TestInfo)
+import compiler.resolve (Diag, Label, Source)
+import compiler.tycore
+import compiler.tycore (RAny, RNamed, RSingleton, RVar)
+import compiler.types
+import compiler.types (MRead, MWrite)
+import diagnostic (Place, Raised, Spot, diag_of, noted, place_json, placeless, shown, spot_of,
+                   all_to_json, all_to_text)
 import entry (At, no_module)
-import program (Timed, front_of, is_shelved, modules_of, timed_load, timed_uncached)
+import mutants (Coverage, Judged, Mutants, Mutation, Queue, Survivor, built, coverage, mutants,
+                queued, targets)
+import paths
+import program (Timed, front_of, is_shelved, is_shipped, modules_of, outside, timed_over,
+                timed_uncached_over, unmoved)
 import report (Answer, ind, ok_code, compile_error, count_of, plural, refused, warned_lines)
+import sources (load_resolved, shelf)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string)
 import style (Style, plain, bold, dim, green, red, yellow)
+import tester (tester, Executed, Fell, Filed, Hosted, Options, Use, use_both, use_none)
+import trials (Bench, Evident, Tried, diagnosed, trial)
+import trials
+import walk
 // What a test's footprint makes it — shared, isolated or host — and the classes the tests that run
 // share are the suite's, from the atoms each row carries and the tests the binding reaches.
 import suite.schedule (Atom, Counts, contends_only_over_regions, counts, group_by_conflict,
@@ -30,9 +49,13 @@ import suite.schedule (Atom, Counts, contends_only_over_regions, counts, group_b
 // The keys a mixture's result is filed under are the suite's, like every other test result's.
 import suite.keys (mixture_key)
 // What decides a cause: the change set, the search over it, and the verdict it reaches.
-import suite.bisect (Auto, Bisection, Budget, Mode, NoBodies, NotAttempted, NotRequested,
-                     SearchStats, Skipped, Trial, a_failure, a_pass, confidence_word, is_conclusive,
-                     mode_parse, skipped_word, verdict_skipped, verdict_word)
+import suite.bisect (Auto, Bisection, Budget, MissingBody, Mode, NoBodies, NotAttempted,
+                     NotRequested, SearchStats, Skipped, Trial, a_failure, a_pass, confidence_word,
+                     is_conclusive, mode_parse, mode_word, skipped_word, unresolved_trial,
+                     verdict_skipped, verdict_word)
+// What a run establishes: each test's status, where each pass is filed, and what is suspected.
+import suite.conclude (Concluded, Hashes, StaleIndex, UnobservedSearch, written)
+import suite.conclude
 import suite.delta (Delta, DefKey, Edited, Facts, Value, classified, flipped_keys, kind_word,
                     ns_word)
 import suite.diagnose (Attribution, Evidence, Suspect, diagnose)
@@ -45,134 +68,10 @@ import sim.plan
 import sim.plan (Seed)
 import sim.recording (Interleaving)
 import sim.search
-import sim.search (Exploration, Failure)
-
-// What the Rust side loads, binds and runs, in that order and each once per report. A run that
-// refuses at either of the first two ran nothing, which is why binding and running are two
-// operations rather than one. `stamped` is the tree as a walk finds it now, which is how a
-// watching run decides there is another report to write; the walk is the host's and the deciding
-// is not. It answers `None` when a directory would not be read, which a watcher must not read as
-// a tree that has not moved.
-// The front end this run is against, as the machine reads it: the compiler's answer, every source
-// it names in the order their ids run, the package roots the store files a dependency's sources
-// under, and what this side's own load cost. `ply test` walks the tree and runs the compiler in
-// order to report on both, so it hands the answer over rather than letting the machine repeat it.
-// What the test run is configured with: the report flags, the machine's budgets and bounds, and
-// the host it may bind — the program parses the line and hands the record over.
-pub type Options = {
-  path: String,
-  json: Bool,
-  explain: Bool,
-  no_cache: Bool,
-  filter: Option<String>,
-  jobs: Option<Int>,
-  steps: Int,
-  timeout: Int,
-  bisect: String,
-  bisect_budget: Int,
-  coverage: Bool,
-  mutate: Option<String>,
-  mutate_budget: Int,
-  profile: String,
-  watch: Bool,
-  std: Bool,
-  host: Bool,
-  tls: List<machine::TlsCred>,
-  trust: List<String>,
-  fs: List<machine::Named>,
-  // The programs a test's `process.spawn` may start, and the families the tests are lent.
-  exec: List<machine::Named>,
-  allow: List<String>,
-  config: machine::ConfigOpts,
-  sim: machine::SimOpts,
-}
+import sim.search (Exact, Exploration, Failure, Diverged, Unscheduled)
 
 // One atom of a test's footprint, as a scheduler compares them and as the printer spells it.
 pub type Printed = { atom: Atom, text: String }
-
-pub nondet effect tester {
-  write configure[corpus](options: Options, front: Front) -> Unit
-  read loaded[r]() -> Result<Program, Refusal>
-  read bound[r]() -> Result<Unit, Refusal>
-  read stamped[r]() -> Option<List<String>>
-  // What a selector computes a selection from, before anything runs: each test's own hash and the
-  // definitions' hashes.
-  read keys[r]() -> List<Row>
-  read hashed[r]() -> List<Hashed>
-  // The printed union of a set of tests' footprints. The program colours the graph; rendering a
-  // colour is the compiler's, since only its printer can keep a label variable off a name.
-  read footprint[r](tests: List<Int>) -> String
-  // What the store holds under each of these keys. Every key is the program's: this is the only
-  // side that encodes one.
-  read outcomes[r](keys: List<String>) -> List<Option<String>>
-  // What the program decided to run: which tests, the classes they share, the reason for every
-  // test, and the keys each pass is filed under. Stated before the binding, because whether a unit
-  // has to be built at all is a function of it.
-  write chosen[r](choice: Choice) -> Unit
-  // The run begins. A test runs in a unit, on whichever thread asks: unit 0 is the loaded program,
-  // and each mutant `mutant` builds is another.
-  write started[r]() -> Unit
-  // One test run once, and how it ended: `passed`, `failed`, `panicked` or `abandoned`.
-  read executed[r](unit: Int, index: Int) -> String
-  // One interleaving of a seeded test, the one `seed` names, as the runtime recorded it.
-  read interleaved[r](unit: Int, index: Int, seed: Seed, steps: Int, re_executed: Bool) -> Interleaving<Fell>
-  // What the run came to, filed under the keys the program named, given how its searches settled
-  // each seeded test.
-  write concluded[r](searched: List<Settled>) -> Ran
-  // The mutants of the `--mutate` targets that some test reaches, cheapest first.
-  read mutated[r]() -> Queue
-  // The unit a mutant's tests run in, or the verdict a mutant that does not build already is.
-  write mutant[r](id: Int) -> Result<Int, Judgement>
-  // What the program judged each mutant it ran, and whether its budget stopped it short.
-  write mutation[r](judged: List<Judged>, budget_spent: Bool) -> Mutants
-  // One mixture of one failure: a set of definitions to take from the post-edit side, and the key
-  // its pass is filed under, which a pass already there answers without building anything.
-  read trial[r](failure: Int, keys: List<{ name: String, ns: String }>, filed: Option<String>) -> Trial
-  // Writes what the mixtures proved since the run, whose own write came before them, and answers
-  // what storing it had to say.
-  write record[r]() -> List<Diag>
-}
-
-// One run's decision, as the runtime reads it back.
-pub type Choice = {
-  // Test indices to execute, ascending.
-  runs: List<Int>,
-  // The reason for every test the keys row named, indexed by test index.
-  reasons: List<String>,
-  // Concurrency classes over `runs`.
-  groups: List<List<Int>>,
-  // Every key each running test's pass is filed under.
-  filed: List<{ index: Int, keys: List<String> }>,
-}
-
-// A failed run whose diagnostic the runtime holds, by its id, and how a report classes it.
-pub type Fell = { id: Int, status: String }
-
-// How the program's search settled one seeded test: what it explored, why it stopped at a failure,
-// and how many roots it started from.
-pub type Settled = {
-  test: Int,
-  exploration: Exploration,
-  failure: Option<Failure<Fell>>,
-  seeds: Int,
-}
-
-// Each mutant beside the tests that reach it, and why there are none when the query no longer names
-// a definition.
-pub type Queue = { mutants: List<Queued>, refused: List<Diag> }
-
-pub type Queued = { id: Int, tests: List<Int> }
-
-// A mutant's verdict: `killed`, `survived`, `skipped` or `unresolved`, and why when it is either of
-// the last two.
-pub type Judgement = { verdict: String, why: String }
-
-pub type Judged = { id: Int, verdict: String, why: String }
-
-// One definition or test the loaded tree declares, and its hash.
-pub type Hashed = { name: String, hash: String, test: Bool }
-
-// --- What the Rust side answers with ----------------------------------------
 
 // The options record, built from the parsed line.
 pub fn options_from(p: Parsed, root: String) -> Options = {
@@ -290,9 +189,17 @@ fn owed_of(d: Decided, index: Int) -> Int =
     hits -> at(hits, 0, { index: index, owed: 0 }).owed,
   }
 
-// One class's rendering is the printer's, so it is asked for rather than assembled.
-fn with_footprint(acc: List<Group>, class: List<Int>) -> List<Group> / {tester.footprint[corpus]} =
-  push(acc, { tests: class, footprint: tester.footprint[corpus](class) })
+// A class's footprint is the union of its tests', printed as one footprint is.
+fn group_of_class(w: Whole, class: List<Int>) -> Group =
+  {
+    tests: class,
+    footprint: footprint_text(
+      canonical(
+        fold(class, [], |acc: List<tycore::Atom>, i: Int|
+          match test_at(w, i) { Some(t) -> appended(acc, t.footprint), None -> acc }),
+      ),
+    ),
+  }
 
 // The footprint's atoms, unprinted.
 fn atoms_of(c: Case) -> List<Atom> = map(c.atoms, |x: Printed| x.atom)
@@ -332,7 +239,7 @@ fn decided_of(
   groups: List<Group>,
   classes: List<List<Int>>,
 ) -> Decided = {
-  let runs = to_run(decisions);
+  let runs = filter(to_run(decisions), |i: Int| case_of(p, i) != None);
   {
     search: search,
     sim: sim,
@@ -472,15 +379,6 @@ pub type Site = { task: String, definition: Option<String>, access: String, at: 
 // one.
 pub type Race = { left: Site, right: Site, step: Int }
 
-// What a failure's cause is decided from, when the test passed before: the facts its change set is
-// classified from, why no mixture can be tried when none can, and where each name the facts mention
-// is.
-pub type Evident = {
-  facts: Facts,
-  absent: Option<Skipped>,
-  at: List<{ name: String, at: Option<At> }>,
-}
-
 // One failure as the runtime reports it: what happened, and the facts its cause is decided from.
 pub type Failed = {
   key: String,
@@ -527,20 +425,6 @@ pub type Fault = {
   status: Option<String>,
   declared: Option<List<String>>,
 }
-
-pub type Mutant = { definition: String, from: String, to: String, at: Option<At> }
-
-pub type Mutants = {
-  killed: Int,
-  survived: Int,
-  skipped: Int,
-  budget_spent: Bool,
-  unreached: List<String>,
-  survivors: List<Mutant>,
-  json: Json,
-}
-
-pub type Coverage = { definitions: Int, unreached: List<String>, json: Json }
 
 pub type Summary = { passed: Int, failed: Int, abandoned: Int, cached: Int, duration_us: Int }
 
@@ -610,6 +494,9 @@ fn strings(xs: List<String>) -> Json = Array(map(xs, |x: String| Str(x)))
 fn opt_strings(v: Option<List<String>>) -> Json = match v { Some(xs) -> strings(xs), None -> Null }
 
 fn covers(xs: List<Int>, wanted: Int) -> Bool = len(filter(xs, |x: Int| x == wanted)) > 0
+
+fn set_of(xs: List<Int>) -> Map<Int, Bool> =
+  fold(xs, map_new(), |acc: Map<Int, Bool>, x: Int| map_insert(acc, x, true))
 
 fn said(lines: List<String>, wanted: String) -> Bool =
   len(filter(lines, |l: String| l == wanted)) > 0
@@ -682,25 +569,6 @@ fn primary_of(d: Diag) -> Option<Label> =
     match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } })
 
 fn label_at(l: Label) -> At = { module: l.module, start: l.start, end: l.end }
-
-// Line and column rather than byte offsets, for editors.
-fn place_json(places: List<Place>, a: At) -> Json =
-  if a.module == no_module() { Null } else {
-    match list_at(places, a.module) {
-      None -> Null,
-      Some(place) -> {
-        let from: Spot = spot_of(place.text, a.start);
-        let to: Spot = spot_of(place.text, a.end);
-        object([
-          { key: "file", value: Str(place.path) },
-          { key: "line", value: num(from.line) },
-          { key: "column", value: num(from.col) },
-          { key: "end_line", value: num(to.line) },
-          { key: "end_column", value: num(to.col) },
-        ])
-      },
-    }
-  }
 
 fn location_json(places: List<Place>, d: Diag) -> Json =
   match primary_of(d) { None -> Null, Some(l) -> place_json(places, label_at(l)) }
@@ -1253,7 +1121,7 @@ fn coverage_lines(s: Style, r: Ran) -> List<String> =
       ),
   }
 
-fn survivor_line(s: Style, places: List<Place>, m: Mutant) -> String = {
+fn survivor_line(s: Style, places: List<Place>, m: Survivor) -> String = {
   let spot = match m.at {
     None -> "",
     Some(a) -> match located(places, a) { Some(text) -> text, None -> "" },
@@ -1276,7 +1144,7 @@ fn mutant_lines(s: Style, p: Program, r: Ran) -> List<String> =
           [ind() ++ bold(s, "mutants") ++ " " ++ bold(s, tally)],
           unreached_lines(s, m.unreached),
         ),
-        map(m.survivors, |x: Mutant| survivor_line(s, p.places, x)),
+        map(m.survivors, |x: Survivor| survivor_line(s, p.places, x)),
       )
     },
   }
@@ -1698,87 +1566,451 @@ fn unbound(s: Style, refusal: Refusal) -> Answer = {
   }
 }
 
+// --- The load ---------------------------------------------------------------
+
+// One report, and the load a watching run's next report may reuse.
+pub type Iteration = { answer: Answer, held: Option<Timed> }
+
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.started[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.concluded[corpus], tester.mutated[corpus], tester.mutant[corpus], tester.mutation[corpus], tester.trial[corpus], tester.record[corpus], store.known[cache], store.file[cache]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, store.known[cache], store.file[cache], tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.opened[corpus], tester.outcomes[corpus], tester.seen[corpus], tester.baselines[corpus], tester.bodies[corpus], tester.interfaces[corpus], tester.filed[corpus]} =
+  iterated(flags, options, None).answer
+
+// A save that changed no file's text is the last report's load again, with nothing re-derived.
+fn loaded(
+  flags: Flags,
+  options: Options,
+  held: Option<Timed>,
+) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, store.known[cache], store.file[cache]} = {
+  let started = time.elapsed_ms();
+  let project = load_resolved(flags.paths);
+  let reused = match held {
+    Some(t) -> if unmoved(project, t.program) { Some(t) } else { None },
+    None -> None,
+  };
+  match reused {
+    Some(t) -> { ..t, read_ms: 0, front_ms: 0, file_ms: 0 },
+    None -> if options.no_cache { timed_uncached_over(flags.paths, project, started) }
+    else { timed_over(flags.paths, project, started) },
+  }
+}
+
+// One report over the tree as it is now; `held` is the load the last one ran against.
+pub fn iterated(
+  flags: Flags,
+  options: Options,
+  held: Option<Timed>,
+) -> Iteration / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, store.known[cache], store.file[cache], tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.opened[corpus], tester.outcomes[corpus], tester.seen[corpus], tester.baselines[corpus], tester.bodies[corpus], tester.interfaces[corpus], tester.filed[corpus]} = {
   let s: Style = style_of(flags);
-  let t: Timed = if options.no_cache { timed_uncached(flags.paths) }
-  else { timed_load(flags.paths) };
+  let t: Timed = loaded(flags, options, held);
   match t.program.whole {
     // Every diagnostic, as `check` refuses: an error is the whole answer, so the shelved-module
     // filter a successful load applies to warnings is not applied here.
-    None -> refused(s, "test", t.program.diags, t.program.places),
+    None -> { answer: refused(s, "test", t.program.diags, t.program.places), held: None },
     Some(w) -> match config_schema::refusal(w, options.config.schema) {
-      Some(d) -> unbound(s, { diags: [d], places: t.program.places }),
-      None -> tests_over(flags, s, options, front_of(t, w)),
+      Some(d) -> { answer: unbound(s, { diags: [d], places: t.program.places }), held: None },
+      None -> { answer: tests_over(flags, s, options, t, w), held: Some(t) },
     },
   }
 }
 
-// The run itself, over the front end `run` loaded.
+// How the tree stamps now, one line per `.ply` file the paths name, or `None` when the walk could
+// not read what it was given: a walk that failed has seen nothing, and a watcher told the tree is
+// empty stops noticing saves to it.
+pub fn stamped(
+  rs: List<paths::Resolved>,
+) -> Option<List<String>> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs]} = {
+  let found = walk::sweep(rs);
+  if len(found.errors) > 0 { None } else {
+    Some(
+      map_fold(found.files, [], |acc: List<String>, shown: String, at: paths::Rooted|
+        push(
+          acc,
+          shown ++ " " ++ stamp_part(paths::modified_ms(at)) ++ " "
+            ++ stamp_part(paths::file_size(at)),
+        )),
+    )
+  }
+}
+
+fn stamp_part(n: Option<Int>) -> String = match n { Some(x) -> int_to_string(x), None -> "-" }
+
+// The root a report names: the directory a path names, or the one holding the file it names.
+fn root_of(rs: List<paths::Resolved>) -> String / {fs.kind[cwd], fs.kind[abs]} =
+  match list_at(rs, 0) {
+    None -> ".",
+    Some(r) -> match paths::kind(paths::rooted(r)) {
+      File -> {
+        let dir = parent(r.machine);
+        if dir == "" { "." } else { dir }
+      },
+      _ -> r.machine,
+    },
+  }
+
+// --- What the loaded tree tells a selector ------------------------------------
+
+fn text(b: Bytes) -> String = string_of_bytes_lossy(b)
+
+fn test_at(w: Whole, i: Int) -> Option<TestInfo> = list_at(w.checked.tests, i)
+
+fn hash_at(w: Whole, i: Int) -> Option<String> =
+  match list_at(w.hashes.tests, i) { Some(h) -> Some(hex_of(h)), None -> None }
+
+// Something in its closure entered a `simulate` region, so it reads a seed and is searched.
+fn seeded_of(atoms: List<tycore::Atom>) -> Bool =
+  fold(atoms, false, |found: Bool, a: tycore::Atom| found || a.effect == b"sim")
+
+// One test the tree declares, as the selector keys it.
+fn rows_of(w: Whole) -> List<Row> =
+  fold(range(0, len(w.checked.tests)), [], |acc: List<Row>, i: Int|
+    match test_at(w, i) {
+      None -> acc,
+      Some(t) ->
+        push(acc, {
+          index: i,
+          label: text(t.name),
+          name: text(t.key),
+          module: text(t.module),
+          hash: hash_at(w, i),
+          seeded: seeded_of(t.footprint),
+          nondet: t.nondet,
+        }),
+    })
+
+// The order the runtime holds a footprint's atoms in: by effect, then resource, a named one first
+// and every label last, then mode and operation.
+fn resource_rank(r: tycore::Resource) -> Int =
+  match r { RNamed(_) -> 0, RVar(_) -> 1, RSingleton -> 2, RAny -> 3 }
+
+fn mode_rank(m: types::Mode) -> Int = match m { MRead -> 0, MWrite -> 1, _ -> 2 }
+
+fn atom_before(a: tycore::Atom, b: tycore::Atom) -> Bool =
+  if a.effect != b.effect { compare(a.effect, b.effect) == Less }
+  else if resource_rank(a.resource) != resource_rank(b.resource) {
+    resource_rank(a.resource) < resource_rank(b.resource)
+  } else if a.resource != b.resource {
+    match ((a.resource, b.resource)) {
+      (RNamed(x), RNamed(y)) -> compare(x, y) == Less,
+      (RVar(x), RVar(y)) -> x < y,
+      _ -> false,
+    }
+  } else if mode_rank(a.mode) != mode_rank(b.mode) { mode_rank(a.mode) < mode_rank(b.mode) } else {
+    match ((a.op, b.op)) {
+      (None, Some(_)) -> true,
+      (Some(x), Some(y)) -> compare(x, y) == Less,
+      _ -> false,
+    }
+  }
+
+// The atoms ascending, each once.
+fn canonical(atoms: List<tycore::Atom>) -> List<tycore::Atom> = {
+  let sorted = sort_by(atoms, atom_before);
+  fold(sorted, [], |acc: List<tycore::Atom>, a: tycore::Atom|
+    match list_at(acc, len(acc) - 1) {
+      Some(last) -> if last == a { acc } else { push(acc, a) },
+      None -> push(acc, a),
+    })
+}
+
+// Each atom's text, a label variable named against the rest, so `[l]` means one thing among them.
+fn atom_texts(atoms: List<tycore::Atom>) -> List<String> =
+  map(tycore::print_atom_list(tycore::printer_new(), atoms).ss, text)
+
+fn footprint_text(atoms: List<tycore::Atom>) -> String =
+  "{" ++ joined(atom_texts(atoms), ", ") ++ "}"
+
+fn mode_writes(m: types::Mode) -> Bool = match m { MWrite -> true, _ -> false }
+
+fn case_view(w: Whole, i: Int, t: TestInfo) -> Case = {
+  let atoms = canonical(t.footprint);
+  let texts = atom_texts(atoms);
+  {
+    index: i,
+    key: text(t.key),
+    name: text(t.name),
+    module: text(t.module),
+    nondet: t.nondet,
+    hash: hash_at(w, i),
+    footprint: footprint_text(atoms),
+    atoms: map(range(0, len(atoms)), |j: Int|
+      match list_at(atoms, j) {
+        Some(a) ->
+          {
+            atom: {
+              effect: text(a.effect),
+              resource: text(tycore::resource_text(a.resource)),
+              writes: mode_writes(a.mode),
+            },
+            text: at(texts, j, ""),
+          },
+        None -> { atom: { effect: "", resource: "", writes: false }, text: "" },
+      }),
+    seeded: seeded_of(t.footprint),
+  }
+}
+
+// Which tests a run reports on: the package being loaded — a dependency's tests are its own to run,
+// and a shipped module's are in scope only under `--std` — narrowed by `--filter` to the keys that
+// contain it.
+type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
+
+fn root_modules(w: Whole) -> Map<String, Bool> =
+  fold(range(0, len(w.mods)), map_new(), |acc: Map<String, Bool>, i: Int|
+    match ((list_at(w.mods, i), list_at(w.mod_pkg, i))) {
+      (Some(m), Some(pkg)) -> if pkg == 0 { map_insert(acc, text(m.name), true) } else { acc },
+      _ -> acc,
+    })
+
+fn scope_of(w: Whole, options: Options) -> Scope = {
+  let packaged = len(w.packages) > 0;
+  let root = root_modules(w);
+  let in_scope = |t: TestInfo|
+    (if packaged { map_contains(root, text(t.module)) } else { !is_shipped(text(t.module)) })
+      || (options.std && is_shipped(text(t.module)));
+  let matches = |t: TestInfo|
+    match options.filter { Some(f) -> string_contains(text(t.key), f), None -> true };
+  fold(
+    range(0, len(w.checked.tests)),
+    { visible: [], out: [], filtered_out: 0 },
+    |acc: Scope, i: Int|
+      match test_at(w, i) {
+        None -> acc,
+        Some(t) -> if !in_scope(t) { { ..acc, out: push(acc.out, i) } }
+        else if matches(t) { { ..acc, visible: push(acc.visible, i) } }
+        else { { ..acc, filtered_out: acc.filtered_out + 1 } },
+      },
+  )
+}
+
+// A diagnostic raised inside a module that ships with `ply` is its maintainers', not this
+// program's.
+fn in_shipped(w: Whole, d: Diag) -> Bool =
+  match primary_of(d) {
+    None -> false,
+    Some(l) -> match list_at(w.mods, l.module) {
+      Some(m) -> is_shipped(text(m.name)),
+      None -> false,
+    },
+  }
+
+// What the report says about the load, the tests in scope, and the options it ran under.
+fn program_of(
+  options: Options,
+  t: Timed,
+  w: Whole,
+  root: String,
+  scope: Scope,
+  opened: List<Diag>,
+) -> Program =
+  {
+    root: root,
+    files: map(t.program.places, |pl: Place| pl.path),
+    places: t.program.places,
+    modules: map(modules_of(t.program, w), |m: { name: String, path: String }|
+      { name: m.name, file: m.path }),
+    incremental: t.cached,
+    phases: {
+      read_us: t.read_ms * 1000,
+      front_us: t.front_ms * 1000,
+      write_back_us: t.file_ms * 1000,
+    },
+    declared: len(w.checked.tests),
+    cases: fold(scope.visible, [], |acc: List<Case>, i: Int|
+      match test_at(w, i) {
+        Some(test_info) -> push(acc, case_view(w, i, test_info)),
+        None -> acc,
+      }),
+    filtered_out: scope.filtered_out,
+    warnings: appended(opened, filter(t.program.diags, |d: Diag| !in_shipped(w, d))),
+    options: object([
+      {
+        key: "bisect",
+        value: Str(mode_word(match mode_parse(options.bisect) { Some(m) -> m, None -> Auto })),
+      },
+      { key: "bisect_budget", value: num(options.bisect_budget) },
+    ]),
+  }
+
+// --- The run ----------------------------------------------------------------
+
+// A query naming nothing is wrong whatever the run does, and a `reuse fn` whose promise the cost
+// checker cannot show stops it as under `ply check`; both refuse before anything runs.
 fn tests_over(
   flags: Flags,
   s: Style,
   options: Options,
-  front: Front,
-) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.started[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.concluded[corpus], tester.mutated[corpus], tester.mutant[corpus], tester.mutation[corpus], tester.trial[corpus], tester.record[corpus]} = {
-  tester.configure[corpus](options, front);
-  match tester.loaded[corpus]() {
-    Err(refusal) -> refused(s, "test", refusal.diags, refusal.places),
-    Ok(p) -> {
-      // Which tests run is the program's to say, and so is every key the store is asked about or a
-      // pass is filed under: the runtime answers what the store holds and does what it is told.
-      let searching = machine::sim_plan_of(options.sim);
-      let search = search_of(searching);
-      let decisions = decide(cases_of(tester.keys[corpus](), search));
-      // Which tests may share a worker is the program's to say, from the atoms each row carries;
-      // only the rendering of a class is the printer's.
-      let classes = classes_of(p, to_run(decisions));
-      let decided = decided_of(
-        p,
-        decisions,
-        search,
-        sim_json(searching, options.sim),
-        fold(classes, [], with_footprint),
-        classes,
-      );
-      tester.chosen[corpus]({
-        runs: decided.runs,
-        reasons: map(decided.reasons, |e: { index: Int, reason: Reason }| word(e.reason)),
-        groups: classes,
-        filed: filed(decisions, search),
-      });
-      match tester.bound[corpus]() {
-        Err(refusal) -> unbound(s, refusal),
-        Ok(_) -> {
-          tester.started[corpus]();
-          let asked = {
-            plan: searching,
-            measuring: options.sim.measure_reduction,
-            lanes: match options.jobs {
-              Some(n) -> if n > 0 { Some(n) } else { None },
-              None -> None,
-            },
-          };
-          let narrowing = narrowed(decisions, search.roots);
-          let searched = flat_map(classes, |class: List<Int>|
-            settled_of(
-              ran_class(map(class, |i: Int| job_of(p, 0, i, narrowing, searching)), asked),
-            ));
-          let r = mutated(p, tester.concluded[corpus](searched), options, asked);
-          // The run is over, so the runtime can be asked about mixtures of what it found; every
-          // failure's cause is decided here, before anything renders one.
-          let faults = decided_faults(r, diagnosing(options));
-          let stored = tester.record[corpus]();
-          answered(s, flags, p, { ..r, warnings: appended(r.warnings, stored) }, faults, decided)
-        },
-      }
+  t: Timed,
+  w: Whole,
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.opened[corpus], tester.outcomes[corpus], tester.seen[corpus], tester.baselines[corpus], tester.bodies[corpus], tester.interfaces[corpus], tester.filed[corpus]} = {
+  let aimed: Result<Option<List<DefInfo>>, Diag> = match options.mutate {
+    Some(query) -> match targets(w, query) { Ok(defs) -> Ok(Some(defs)), Err(d) -> Err(d) },
+    None -> Ok(None),
+  };
+  match aimed {
+    Err(d) -> refused(s, "test", [d], t.program.places),
+    Ok(targeted) -> {
+      let broken = broken_promises(t.program, w);
+      if len(broken) > 0 { refused(s, "test", broken, t.program.places) }
+      else { selected(flags, s, options, t, w, targeted) }
     },
   }
 }
 
-// --- The run ----------------------------------------------------------------
+fn selected(
+  flags: Flags,
+  s: Style,
+  options: Options,
+  t: Timed,
+  w: Whole,
+  targeted: Option<List<DefInfo>>,
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.opened[corpus], tester.outcomes[corpus], tester.seen[corpus], tester.baselines[corpus], tester.bodies[corpus], tester.interfaces[corpus], tester.filed[corpus]} = {
+  tester.configure[corpus](options);
+  let opened = if options.no_cache { [] } else { tester.opened[corpus]() };
+  let scope = scope_of(w, options);
+  let p = program_of(options, t, w, root_of(flags.paths), scope, opened);
+  // Which tests run is the program's to say, and so is every key the store is asked about or a
+  // pass is filed under: the runtime answers what the store holds and does what it is told.
+  let searching = machine::sim_plan_of(options.sim);
+  let search = search_of(searching);
+  let decisions = decide(cases_of(rows_of(w), search, options.no_cache));
+  // Which tests may share a worker is the program's to say, from the atoms each row carries.
+  let visible = set_of(scope.visible);
+  let classes = classes_of(p, filter(to_run(decisions), |i: Int| map_contains(visible, i)));
+  let decided = decided_of(
+    p,
+    decisions,
+    search,
+    sim_json(searching, options.sim),
+    map(classes, |class: List<Int>| group_of_class(w, class)),
+    classes,
+  );
+  // A run that executes nothing builds no unit, unless a schema has constants to enter.
+  let build = len(decided.runs) > 0 || options.config.schema != None;
+  match tester.unit[corpus](front_of(t, w), build, true) {
+    Err(diags) -> {
+      tester.ended[corpus]();
+      unbound(s, { diags: diags, places: p.places })
+    },
+    Ok(_) -> match tester.bound[corpus]() {
+      Err(diags) -> {
+        tester.ended[corpus]();
+        unbound(s, { diags: diags, places: p.places })
+      },
+      Ok(configured) -> {
+        let answer = concluded_run(
+          flags,
+          s,
+          options,
+          p,
+          t,
+          w,
+          scope,
+          decisions,
+          decided,
+          searching,
+          configured,
+          targeted,
+        );
+        tester.ended[corpus]();
+        answer
+      },
+    },
+  }
+}
+
+// The run itself, what it establishes, filed, and what it is asked after: a mutation of a green
+// run, and the cause of every failure.
+fn concluded_run(
+  flags: Flags,
+  s: Style,
+  options: Options,
+  p: Program,
+  t: Timed,
+  w: Whole,
+  scope: Scope,
+  decisions: List<Decision>,
+  decided: Decided,
+  searching: plan::Plan,
+  configured: List<Diag>,
+  targeted: Option<List<DefInfo>>,
+) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.unit[corpus], tester.hosted[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.opened[corpus], tester.outcomes[corpus], tester.seen[corpus], tester.baselines[corpus], tester.bodies[corpus], tester.interfaces[corpus], tester.filed[corpus]} = {
+  let asked = {
+    plan: searching,
+    measuring: options.sim.measure_reduction,
+    lanes: match options.jobs { Some(n) -> if n > 0 { Some(n) } else { None }, None -> None },
+  };
+  let narrowing = narrowed(decisions, decided.search.roots);
+  let started = time.elapsed_us();
+  let done = flat_map(decided.classes, |g: Group|
+    ran_class(map(g.tests, |i: Int| job_of(p, 0, i, narrowing, searching)), asked));
+  let elapsed = time.elapsed_us() - started;
+  let hosted = tester.hosted[corpus]();
+  let h = hashes_of(w);
+  let running = set_of(decided.runs);
+  let by_test = fold(done, map_new(), |acc: Map<Int, Done>, d: Done| map_insert(acc, d.test, d));
+  let c: Concluded<Raised> = conclude::concluded(
+    conclude_tests(w),
+    h,
+    {
+      groups: map(decided.classes, |g: Group| g.tests),
+      filed: fold(
+        filed(decisions, decided.search),
+        map_new(),
+        |acc: Map<Int, List<String>>, e: { index: Int, keys: List<String> }|
+          if map_contains(running, e.index) { map_insert(acc, e.index, e.keys) } else { acc },
+      ),
+      reasons: fold(decisions, map_new(), |acc: Map<Int, Reason>, d: Decision|
+        map_insert(acc, d.case.index, d.reason)),
+      out_of_scope: scope.out,
+    },
+    if options.no_cache { map_new() } else { seen_of(h) },
+    map(done, conclusion_of),
+  );
+  let stored = if options.no_cache { [] } else {
+    filing_said(
+      tester.filed[corpus](c.filing),
+      "could not write the test cache: ",
+      "the run itself is valid; every test will simply be re-run next time",
+    )
+  };
+  let r = mutated(
+    t,
+    w,
+    p,
+    ran_of(options, p, w, decided, hosted, c, by_test, elapsed, appended(configured, stored)),
+    options,
+    asked,
+    targeted,
+  );
+  // After the run is filed, since a pass recorded now is a valid baseline for another's failure.
+  let found = diagnosed_all(options, t, w, c, by_test, r.failures);
+  let cause = decided_faults({ ..r, failures: found.failures }, found.benches, diagnosing(options));
+  let proved = if options.no_cache || len(cause.proved) == 0 { [] } else {
+    filing_said(
+      tester.filed[corpus]({ passes: cause.proved, records: [], seen: [] }),
+      "could not write what the bisection's mixtures proved: ",
+      "every verdict stands; the next bisection runs those mixtures again",
+    )
+  };
+  let lazily = if options.no_cache { [] } else { tester.opened[corpus]() };
+  answered(
+    s,
+    flags,
+    p,
+    { ..r, failures: found.failures, warnings: appended(appended(r.warnings, proved), lazily) },
+    cause.faults,
+    decided,
+  )
+}
+
+// What writing to the store had to say, its own failure first.
+fn filing_said(f: Filed, unflushed: String, note: String) -> List<Diag> =
+  match f.unflushed {
+    None -> f.warnings,
+    Some(why) -> appended([diag_of("warning", "W0601", unflushed ++ why, [], [note])], f.warnings),
+  }
 
 // The search a seeded test's key is computed against, as the selector reads one.
 fn search_of(p: plan::Plan) -> Search =
@@ -1821,8 +2053,15 @@ type Asked = { plan: plan::Plan, measuring: Bool, lanes: Option<Int> }
 // One test to run in one unit, and the plan it searches when it is seeded.
 type Job = { unit: Int, test: Int, search: Option<plan::Plan> }
 
-// How one test ended, and how its search settled when it searched.
-type Done = { test: Int, status: String, settled: Option<Settled> }
+// How one test ended, what running it cost, and what its search explored, when it searched and every
+// interleaving of it entered a region.
+type Done = {
+  test: Int,
+  status: String,
+  failure: Option<Raised>,
+  usage: Use,
+  searched: Option<{ exploration: Exploration, seeds: Int }>,
+}
 
 // A seeded test searches the roots it still owes; any other runs once.
 fn job_of(
@@ -1845,10 +2084,6 @@ fn job_of(
       None -> None,
     },
   }
-
-fn settled_of(done: List<Done>) -> List<Settled> =
-  fold(done, [], |acc: List<Settled>, d: Done|
-    match d.settled { Some(st) -> push(acc, st), None -> acc })
 
 // One class's tests at once: each in a lane of its own, or dealt across the lanes `--jobs` names,
 // a lane's tests in turn, answered in the class's order.
@@ -1882,19 +2117,37 @@ fn ran_lanes(
     appended(halves._0, halves._1)
   }
 
+// What a search's runs come to between them: what they cost, and whether one of them never
+// entered a region, which makes the whole search no search.
+type Swept = { usage: Use, unobserved: Bool }
+
 // A test once, or a seeded one searched an interleaving at a time.
 fn ran_job(
   j: Job,
   measuring: Bool,
 ) -> Done / {tester.executed[corpus], tester.interleaved[corpus]} =
   match j.search {
-    None -> { test: j.test, status: tester.executed[corpus](j.unit, j.test), settled: None },
+    None -> {
+      let e: Executed = tester.executed[corpus](j.unit, j.test);
+      { test: j.test, status: e.status, failure: e.failure, usage: e.usage, searched: None }
+    },
     Some(p) -> {
       // A search re-runs the whole test, so any host operation runs once per interleaving.
       let again = plan::re_executes(p) || measuring;
-      let run = |seed: Seed| tester.interleaved[corpus](j.unit, j.test, seed, p.steps, again);
-      let explored = if measuring { search::measure_reduction(p, run) }
-      else { search::explore(p, run) };
+      let run = |st: Swept, seed: Seed| {
+        let one = tester.interleaved[corpus](j.unit, j.test, seed, p.steps, again);
+        {
+          run: one.run,
+          state: {
+            usage: use_both(st.usage, one.usage),
+            unobserved: st.unobserved || !one.observed,
+          },
+        }
+      };
+      let begun: Swept = { usage: use_none(), unobserved: false };
+      let kept = if measuring { search::measure_keeping(p, begun, run) }
+      else { search::explore_keeping(p, Exact, begun, run) };
+      let explored = kept.explored;
       {
         test: j.test,
         status: match explored.failure {
@@ -1905,37 +2158,369 @@ fn ran_job(
             None -> "panicked",
           },
         },
-        settled: Some({
-          test: j.test,
-          exploration: explored.exploration,
-          failure: explored.failure,
-          seeds: len(plan::normalized(p).roots),
-        }),
+        failure: match explored.failure { Some(fl) -> Some(stopped(fl)), None -> None },
+        usage: kept.state.usage,
+        searched: if kept.state.unobserved { None }
+        else { Some({ exploration: explored.exploration, seeds: len(plan::normalized(p).roots) }) },
       }
     },
   }
 
+fn reproduce(seed: Seed) -> String =
+  "reproduce with `--sim once --seed " ++ plan::seed_text(seed)
+    ++ "`, and report it with the test's source"
+
+fn spanned(span: { module: Int, start: Int, end: Int }, said: String) -> Label =
+  {
+    module: span.module,
+    start: span.start,
+    end: span.end,
+    primary: true,
+    text: bytes_of_string(said),
+  }
+
+// Why a search stopped at a seed, as the diagnostic a report prints: the run's own failure, or the
+// defect a recording that names no schedule, or a replay that took another, is.
+fn stopped(fl: Failure<Fell>) -> Raised =
+  match search::ran_failure(fl) {
+    Some(fell) -> { ..fell.failure, diag: noted(fell.failure.diag, fl.notes) },
+    None -> {
+      let d = match fl.why {
+        Diverged(x) ->
+          diag_of(
+            "error",
+            "E0415",
+            "replaying seed " ++ plan::seed_text(x.seed)
+              ++ " did not reproduce the recorded schedule",
+            [spanned(x.span, "this scheduling point")],
+            [
+              x.what,
+              "a simulated run must be a pure function of its definition set and its seed; this is a defect in Ply rather than in the program under test",
+              reproduce(x.seed),
+            ],
+          ),
+        Unscheduled(x) ->
+          diag_of(
+            "error",
+            "E0505",
+            "the scheduler recorded a step that does not describe a schedule",
+            [spanned(x.span, "this step")],
+            [x.what, reproduce(x.seed)],
+          ),
+        _ -> diag_of("error", "E0505", "a search stopped at a failure it does not hold", [], []),
+      };
+      { diag: noted(d, fl.notes), values: [] }
+    },
+  }
+
+// --- What the run establishes ------------------------------------------------
+
+fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<String, String> =
+  fold(xs, map_new(), |acc: Map<String, String>, x: { name: Bytes, hash: Bytes }|
+    map_insert(acc, text(x.name), hex_of(x.hash)))
+
+fn hashes_of(w: Whole) -> Hashes =
+  {
+    defs: by_name(w.hashes.defs),
+    decls: by_name(w.hashes.decls),
+    closure: fold(
+      w.hashes.closure,
+      map_new(),
+      |acc: Map<String, List<String>>, c: { name: Bytes, names: Map<Bytes, Bool> }|
+        map_insert(acc, text(c.name), map(map_keys(c.names), text)),
+    ),
+  }
+
+fn conclude_tests(w: Whole) -> List<conclude::Test> =
+  fold(range(0, len(w.checked.tests)), [], |acc: List<conclude::Test>, i: Int|
+    match test_at(w, i) {
+      Some(t) ->
+        push(acc, {
+          index: i,
+          key: text(t.key),
+          seeded: seeded_of(t.footprint),
+          hash: hash_at(w, i),
+        }),
+      None -> acc,
+    })
+
+// Whether the store had seen each definition before this run, which a failure is suspected against.
+fn seen_of(h: Hashes) -> Map<String, Bool> / {tester.seen[corpus]} = {
+  let hashes = map_values(h.defs);
+  let answers = tester.seen[corpus](hashes);
+  fold(range(0, len(hashes)), map_new(), |acc: Map<String, Bool>, i: Int|
+    match ((list_at(hashes, i), list_at(answers, i))) {
+      (Some(hash), Some(known)) -> map_insert(acc, hash, known),
+      _ -> acc,
+    })
+}
+
+fn conclusion_of(d: Done) -> conclude::Ran<Raised> =
+  {
+    index: d.test,
+    status: d.status,
+    failure: d.failure,
+    host: d.usage.host,
+    searched: match d.searched {
+      Some(x) ->
+        Some({
+          explored: x.exploration.explored,
+          exhaustive: x.exploration.exhaustive,
+          exhausted: x.exploration.exhausted,
+          failed: x.exploration.failure != None,
+        }),
+      None -> None,
+    },
+    seeds: match d.searched { Some(x) -> x.seeds, None -> 0 },
+  }
+
+fn done_at(done: Map<Int, Done>, index: Int) -> Option<Done> = map_get(done, index)
+
+fn cost_of(c: Option<search::Cost>) -> Option<Cost> =
+  match c {
+    None -> None,
+    Some(x) ->
+      Some({
+        explored: x.explored,
+        bounded: x.bounded,
+        rendered: (if x.bounded { ">= " } else { "" }) ++ int_to_string(x.explored),
+      }),
+  }
+
+// How many times more an unpruned search would have run, in tenths, rounded half up.
+fn tenths_of(e: Exploration) -> Option<Int> =
+  match e.naive {
+    None -> None,
+    Some(naive) -> if e.explored > 0 { Some((naive.explored * 20 + e.explored) / (2 * e.explored)) }
+    else { None },
+  }
+
+fn explored_of(e: Exploration) -> Explored =
+  {
+    explored: e.explored,
+    exhaustive: e.exhaustive,
+    exhausted: e.exhausted,
+    blind: cost_of(e.blind),
+    naive: cost_of(e.naive),
+    reduction_tenths: tenths_of(e),
+    steps: e.steps,
+    virtual_time_ns: e.virtual_time,
+    failing_seed: match e.failure { Some(seed) -> Some(plan::seed_text(seed)), None -> None },
+  }
+
+fn exploration_of(done: Map<Int, Done>, index: Int) -> Option<Exploration> =
+  match done_at(done, index) {
+    Some(d) -> match d.searched { Some(x) -> Some(x.exploration), None -> None },
+    None -> None,
+  }
+
+fn site_of(x: search::RaceSite) -> Site =
+  {
+    task: "@" ++ int_to_string(x.task),
+    definition: x.definition,
+    access: x.access,
+    at: if x.span.module == outside() { None } else { Some(x.span) },
+  }
+
+fn outcome_of(w: Whole, done: Map<Int, Done>, o: conclude::Outcome<Raised>) -> Outcome = {
+  let d = done_at(done, o.index);
+  {
+    index: o.index,
+    name: match test_at(w, o.index) { Some(t) -> text(t.name), None -> "" },
+    hash: hash_at(w, o.index),
+    duration_us: match d { Some(x) -> x.usage.duration_us, None -> 0 },
+    status: o.status,
+    diagnostic: o.failure,
+    search: match exploration_of(done, o.index) { Some(e) -> Some(explored_of(e)), None -> None },
+    cached: match o.recorded { Some(rec) -> Some(written(rec)), None -> None },
+    performs: match d { Some(x) -> x.usage.performs, None -> 0 },
+  }
+}
+
+fn failed_of(w: Whole, h: Hashes, done: Map<Int, Done>, f: conclude::Failed<Raised>) -> Failed = {
+  let t = test_at(w, f.index);
+  let e = exploration_of(done, f.index);
+  {
+    key: f.key,
+    name: match t { Some(x) -> text(x.name), None -> f.key },
+    diagnostic: f.failure,
+    defect: f.defect,
+    host: f.host,
+    search: None,
+    suspects: map(f.suspects, |name: String|
+      {
+        name: name,
+        hash: match map_get(h.defs, name) { Some(x) -> Some(x), None -> map_get(h.decls, name) },
+      }),
+    unchanged: len(f.suspects) == 0,
+    seed: match e {
+      Some(x) -> match x.failure { Some(seed) -> Some(plan::seed_text(seed)), None -> None },
+      None -> None,
+    },
+    race: match e {
+      Some(x) -> match x.race {
+        Some(race) -> Some({ left: site_of(race.left), right: site_of(race.right), step: race.at }),
+        None -> None,
+      },
+      None -> None,
+    },
+    module: match t { Some(x) -> Some(text(x.module)), None -> None },
+    test_hash: hash_at(w, f.index),
+    nondet: match t { Some(x) -> Some(x.nondet), None -> None },
+    status: match done_at(done, f.index) { Some(d) -> Some(d.status), None -> None },
+    declared: match t { Some(x) -> Some(atom_texts(canonical(x.footprint))), None -> None },
+  }
+}
+
+// A pass a later hermetic run would believe, filed for a test the binding can reach, and a backend
+// that silently declined every call: each is a run that is green over a seam nothing reached.
+fn escapes_of(hosted: Hosted, w: Whole, c: Concluded<Raised>) -> List<Diag> = {
+  let reached = set_of(hosted.reaches);
+  let filed_host = if hosted.hermetic { [] } else {
+    fold(c.outcomes, [], |acc: List<Diag>, o: conclude::Outcome<Raised>| {
+      let wrote = match o.recorded { Some(rec) -> written(rec), None -> false };
+      if !wrote || !map_contains(reached, o.index) { acc } else {
+        push(
+          acc,
+          diag_of(
+            "error",
+            "E0505",
+            "`" ++ (match test_at(w, o.index) { Some(t) -> text(t.name), None -> "" })
+              ++ "` can reach the host binding, and its pass was written to the result cache",
+            [],
+            [
+              "a run that reached the host proves nothing about the next one, so it is never cached",
+              "run `ply cache clear`: an entry written here would be believed by a later hermetic run",
+              "this is Ply's fault — the runner and the binding disagree about what this test can do",
+            ],
+          ),
+        )
+      }
+    })
+  };
+  let b = hosted.backend;
+  if b.unbuilt == 0 { filed_host } else {
+    push(
+      filed_host,
+      diag_of(
+        "error",
+        "E0505",
+        int_to_string(b.unbuilt) ++ " thread(s) could not build the `" ++ b.name
+          ++ "` backend, and every call they were offered was declined",
+        [],
+        [
+          "the backend was built once before the run started, so this cannot be a host that has no code generator",
+          "this is Ply's fault — a run that installs a backend and silently does not have one is green over a seam nothing reached",
+        ],
+      ),
+    )
+  }
+}
+
+fn notice_of(n: conclude::Notice) -> Diag =
+  match n {
+    StaleIndex(x) ->
+      diag_of(
+        "warning",
+        "E0505",
+        "a run named test " ++ int_to_string(x.index) ++ ", but the module defines "
+          ++ int_to_string(x.declared),
+        [],
+        ["the choice was made against another program; the stale index was skipped"],
+      ),
+    UnobservedSearch(key) ->
+      diag_of(
+        "warning",
+        "E0505",
+        "`" ++ key ++ "` reads a simulation seed, but the run reported no search",
+        [],
+        [
+          "the test passed and its result was not cached, so it re-runs next time",
+          "this is a defect in Ply rather than in the test; please report it",
+        ],
+      ),
+  }
+
+fn ran_of(
+  options: Options,
+  p: Program,
+  w: Whole,
+  decided: Decided,
+  hosted: Hosted,
+  c: Concluded<Raised>,
+  done: Map<Int, Done>,
+  elapsed: Int,
+  said: List<Diag>,
+) -> Ran = {
+  let h = hashes_of(w);
+  let ordered = fold(c.outcomes, [], |acc: List<Done>, o: conclude::Outcome<Raised>|
+    match done_at(done, o.index) { Some(d) -> push(acc, d), None -> acc });
+  let teardown = fold(ordered, [], |acc: List<Diag>, d: Done| appended(acc, d.usage.teardown));
+  let b = hosted.backend;
+  {
+    hermetic: hosted.hermetic,
+    label: hosted.label,
+    operations: hosted.operations,
+    digest: hosted.digest,
+    handshakes: hosted.handshakes,
+    hosts: hosted.hosts,
+    reaches: filter(hosted.reaches, |i: Int| case_of(p, i) != None),
+    workers: match options.jobs {
+      Some(n) -> if n > 0 { n } else { hosted.cores },
+      None -> hosted.cores,
+    },
+    backend: Some({
+      name: b.name,
+      fragment: b.fragment,
+      offered: b.offered,
+      entered: map_fold(done, 0, |n: Int, i: Int, d: Done| n + d.usage.entries),
+      declined: map_fold(done, 0, |n: Int, i: Int, d: Done| n + d.usage.declines),
+      converted_in: b.converted_in,
+      converted_out: b.converted_out,
+      units: b.units,
+      analysis_nanos: b.analysis_nanos,
+      codegen_nanos: b.codegen_nanos,
+    }),
+    results: map(c.outcomes, |o: conclude::Outcome<Raised>| outcome_of(w, done, o)),
+    failures: map(c.failures, |f: conclude::Failed<Raised>| failed_of(w, h, done, f)),
+    summary: {
+      passed: c.passed,
+      failed: c.failed,
+      abandoned: c.abandoned,
+      cached: cached_count(p, decided),
+      duration_us: elapsed,
+    },
+    simulation: c.simulation,
+    escapes: escapes_of(hosted, w, c),
+    warnings: appended(appended(teardown, map(c.notices, notice_of)), said),
+    mutants: None,
+    coverage: if options.coverage { Some(coverage(w)) } else { None },
+  }
+}
+
 // A green run's mutants, judged up to the budget; a red run's survivors would say nothing.
 fn mutated(
+  t: Timed,
+  w: Whole,
   p: Program,
   r: Ran,
   options: Options,
   asked: Asked,
-) -> Ran / {tester.mutated[corpus], tester.mutant[corpus], tester.mutation[corpus], tester.executed[corpus], tester.interleaved[corpus]} =
-  match options.mutate {
+  targeted: Option<List<DefInfo>>,
+) -> Ran / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], tester.unit[corpus], tester.executed[corpus], tester.interleaved[corpus]} =
+  match targeted {
     None -> r,
-    Some(_) -> if !green_run(r) { r } else {
-      let queue = tester.mutated[corpus]();
-      if len(queue.refused) > 0 { { ..r, escapes: appended(r.escapes, queue.refused) } } else {
-        let every = every_of(p, options);
-        let judged = map(take_first(queue.mutants, options.mutate_budget), |m: Queued|
-          judged_mutant(p, m, every, asked));
-        {
-          ..r,
-          mutants: Some(
-            tester.mutation[corpus](judged, len(queue.mutants) > options.mutate_budget),
-          ),
-        }
+    Some(defs) -> if !green_run(r) { r } else {
+      let queue = queued(t.program.places, w, defs);
+      let shelved = shelf();
+      let every = every_of(p, options);
+      let judged = map(range(0, min(options.mutate_budget, len(queue.mutants))), |id: Int|
+        judged_mutant(t, w, p, shelved, queue, id, every, asked));
+      {
+        ..r,
+        mutants: Some(
+          mutants(t.program.places, w, queue, judged, len(queue.mutants) > options.mutate_budget),
+        ),
       }
     },
   }
@@ -1943,47 +2528,57 @@ fn mutated(
 // The tests that reach a mutant, in the classes every test the run reports on was coloured into: a
 // subset of a class shares nothing either. Every seed of the plan is owed, and nothing is filed.
 fn judged_mutant(
+  t: Timed,
+  w: Whole,
   p: Program,
-  m: Queued,
+  shelved: List<Source>,
+  queue: Queue,
+  id: Int,
   every: List<List<Int>>,
   asked: Asked,
-) -> Judged / {tester.mutant[corpus], tester.executed[corpus], tester.interleaved[corpus]} =
-  match tester.mutant[corpus](m.id) {
-    Err(j) -> { id: m.id, verdict: j.verdict, why: j.why },
-    Ok(unit) -> {
-      let classes = filter(
-        map(every, |class: List<Int>| filter(class, |i: Int| contains_int(m.tests, i))),
-        |class: List<Int>| len(class) > 0,
-      );
-      let statuses = flat_map(classes, |class: List<Int>|
-        map(
-          ran_class(map(class, |i: Int| job_of(p, unit, i, [], asked.plan)), {
-            ..asked,
-            measuring: false,
-          }),
-          |d: Done| d.status,
-        ));
-      let expected = fold(classes, 0, |n: Int, class: List<Int>| n + len(class));
-      let judged = |verdict: String, why: String| { id: m.id, verdict: verdict, why: why };
-      if said(statuses, "failed") { judged("killed", "") }
-      else if said(statuses, "panicked") { judged("unresolved", "Ply failed running the tests") }
-      else if len(filter(statuses, |w: String| w == "passed")) == expected {
-        judged("survived", "")
-      } else { judged("unresolved", "not every test answered") }
+) -> Judged / {tester.unit[corpus], tester.executed[corpus], tester.interleaved[corpus]} =
+  match list_at(queue.mutants, id) {
+    None ->
+      { id: id, verdict: "unresolved", why: "no mutant " ++ int_to_string(id) ++ " was queued" },
+    Some(m) -> match built(t.program, w, shelved, m.mutation) {
+      Err(j) -> { ..j, id: id },
+      Ok(unit) -> {
+        let classes = filter(
+          map(every, |class: List<Int>| filter(class, |i: Int| contains_int(m.tests, i))),
+          |class: List<Int>| len(class) > 0,
+        );
+        let statuses = flat_map(classes, |class: List<Int>|
+          map(
+            ran_class(map(class, |i: Int| job_of(p, unit, i, [], asked.plan)), {
+              ..asked,
+              measuring: false,
+            }),
+            |d: Done| d.status,
+          ));
+        let expected = fold(classes, 0, |n: Int, class: List<Int>| n + len(class));
+        let judged = |verdict: String, why: String| { id: id, verdict: verdict, why: why };
+        if said(statuses, "failed") { judged("killed", "") }
+        else if said(statuses, "panicked") { judged("unresolved", "Ply failed running the tests") }
+        else if len(filter(statuses, |s: String| s == "passed")) == expected {
+          judged("survived", "")
+        } else { judged("unresolved", "not every test answered") }
+      },
     },
   }
 
-fn take_first<a>(xs: List<a>, n: Int) -> List<a> =
-  fold(range(0, min(n, len(xs))), [], |out: List<a>, i: Int|
-    match list_at(xs, i) { Some(x) -> push(out, x), None -> out })
-
 /// What the store holds for each test, asked under the keys this program computes: the key its
 /// result is filed under, and — for a seeded test whose plan is answered root by root — each
-/// root's own.
-fn cases_of(rows: List<Row>, search: Search) -> List<select::Case> / {tester.outcomes[corpus]} = {
+/// root's own. A run that bypasses the cache asks nothing and finds nothing.
+fn cases_of(
+  rows: List<Row>,
+  search: Search,
+  bypassed: Bool,
+) -> List<select::Case> / {tester.outcomes[corpus]} = {
+  let ask = |keys: List<String>|
+    if bypassed { map(keys, |k: String| None) } else { tester.outcomes[corpus](keys) };
   let digest = digest_of(search);
   let keys = map(rows, |r: Row| key_of(r, digest));
-  let answers = tester.outcomes[corpus](
+  let answers = ask(
     fold(keys, [], |acc: List<String>, k: Option<String>|
       match k { Some(key) -> push(acc, key), None -> acc }),
   );
@@ -2001,7 +2596,7 @@ fn cases_of(rows: List<Row>, search: Search) -> List<select::Case> / {tester.out
     let r: Row = at(rows, i, no_row());
     let owed = match r.hash {
       Some(h) -> if answers_per_root(r, search) {
-        Some(owed_roots(search.roots, tester.outcomes[corpus](seed_keys(h, search.roots, []))))
+        Some(owed_roots(search.roots, ask(seed_keys(h, search.roots, []))))
       } else { None },
       None -> None,
     };
@@ -2017,10 +2612,77 @@ fn no_row() -> Row =
 
 // --- What decided each cause -------------------------------------------------
 
-/// Every failure's cause, decided before anything renders one.
-fn decided_faults(r: Ran, asked: Diagnosing) -> List<Fault> / {tester.trial[corpus]} =
-  flat_map(range(0, len(r.failures)), |i: Int|
-    match list_at(r.failures, i) { None -> [], Some(f) -> [fault_of(f, i, asked)] })
+// Each failure's facts, read once the run is filed, and the bench its mixtures are tried on. A test
+// that never passed, or a run that bypassed the cache, has no baseline and so no facts.
+fn diagnosed_all(
+  options: Options,
+  t: Timed,
+  w: Whole,
+  c: Concluded<Raised>,
+  done: Map<Int, Done>,
+  failures: List<Failed>,
+) -> { failures: List<Failed>, benches: List<Option<Bench>> } / {tester.baselines[corpus], tester.interfaces[corpus], tester.bodies[corpus]} =
+  if options.no_cache || len(failures) == 0 {
+    { failures: failures, benches: map(failures, |f: Failed| None) }
+  } else {
+    let records = tester.baselines[corpus](map(failures, |f: Failed| f.key));
+    if fold(records, true, |none: Bool, r: Option<conclude::PassRecord>| none && r == None) {
+      { failures: failures, benches: map(failures, |f: Failed| None) }
+    } else {
+      let tree = trials::program_of(t.program, w);
+      fold(
+        range(0, len(failures)),
+        { failures: [], benches: [] },
+        |acc: { failures: List<Failed>, benches: List<Option<Bench>> }, i: Int|
+          match ((list_at(failures, i), list_at(records, i), list_at(c.failures, i))) {
+            (Some(f), Some(Some(record)), Some(cf)) -> {
+              let seed = match exploration_of(done, cf.index) {
+                Some(e) -> match e.failure { Some(s) -> s, None -> { root: 0u64, path: [] } },
+                None -> { root: 0u64, path: [] },
+              };
+              let d = diagnosed(tree, f.key, f.test_hash, record, f.diagnostic, seed);
+              {
+                failures: push(acc.failures, { ..f, search: Some(d.evident) }),
+                benches: push(acc.benches, d.bench),
+              }
+            },
+            (Some(f), _, _) ->
+              { failures: push(acc.failures, f), benches: push(acc.benches, None) },
+            _ -> acc,
+          },
+      )
+    }
+  }
+
+// Every failure's cause, decided before anything renders one, and the keys of the mixtures that
+// went green, which the store keeps.
+fn decided_faults(
+  r: Ran,
+  benches: List<Option<Bench>>,
+  asked: Diagnosing,
+) -> { faults: List<Fault>, proved: List<String> } / {tester.outcomes[corpus], tester.unit[corpus], tester.interleaved[corpus]} =
+  with_cell[proofs]([]) { held -> {
+    let faults = flat_map(range(0, len(r.failures)), |i: Int|
+      match list_at(r.failures, i) {
+        None -> [],
+        Some(f) ->
+          [
+            fault_of(f, asked, |keys: List<DefKey>, filed: Option<String>|
+              match list_at(benches, i) {
+                Some(Some(b)) -> {
+                  let tried: Tried = trial(b, keys, filed);
+                  match tried.proved {
+                    Some(k) -> cell_set(held, push(cell_get(held), k)),
+                    None -> (),
+                  };
+                  tried.trial
+                },
+                _ -> unresolved_trial(MissingBody),
+              }),
+          ],
+      });
+    { faults: faults, proved: cell_get(held) }
+  } }
 
 // What this run's flags ask of a cause: the search mode and the trial budget.
 type Diagnosing = { bisect: Mode, budget: Budget }
@@ -2032,9 +2694,13 @@ fn diagnosing(options: Options) -> Diagnosing =
   }
 
 /// One failure's cause. The gate, the change set, the search over it and the ranking of the
-/// suspects are `suite.diagnose`'s, over the facts the runtime handed over and a closure that asks
-/// it for one mixture at a time.
-fn fault_of(f: Failed, index: Int, asked: Diagnosing) -> Fault / {tester.trial[corpus]} = {
+/// suspects are `suite.diagnose`'s, over the facts the run read and `tried`, which builds and runs
+/// one mixture at a time.
+fn fault_of<| e>(
+  f: Failed,
+  asked: Diagnosing,
+  tried: (List<DefKey>, Option<String>) -> Trial / e,
+) -> Fault / e = {
   let diff = match f.search { Some(e) -> Some(classified(e.facts)), None -> None };
   let evidence: Evidence = {
     nondet: match f.nondet { Some(x) -> x, None -> false },
@@ -2051,11 +2717,7 @@ fn fault_of(f: Failed, index: Int, asked: Diagnosing) -> Fault / {tester.trial[c
     match diff { Some(d) -> !d.test_unclassified, None -> true },
     |d: Delta, flipped: List<Int>| {
       let keys = flipped_keys(d, flipped);
-      tester.trial[corpus](
-        index,
-        map(keys, |k: DefKey| { name: k.name, ns: ns_word(k.ns) }),
-        mixture_filed(f, keys),
-      )
+      tried(keys, mixture_filed(f, keys))
     },
     match f.search { Some(e) -> e.absent, None -> None },
   );
@@ -2358,17 +3020,16 @@ fn a_failed(defect: Bool, host: Bool, absent: Option<Skipped>) -> Failed =
     declared: None,
   }
 
-// The verdict on one failure, from a runtime whose mixtures fail exactly when they take `m.b`.
+// The verdict on one failure, from mixtures that fail exactly when they take `m.b`.
 fn caused(f: Failed) -> Bisect =
-  handle {
-    fault_of(f, 0, { bisect: Auto, budget: { max_trials: Some(64) } }).bisect
-  } with {
-    tester.trial[corpus](failure, keys, filed) -> taking_b_fails(keys),
-  }
+  fault_of(
+    f,
+    { bisect: Auto, budget: { max_trials: Some(64) } },
+    |keys: List<DefKey>, filed: Option<String>| taking_b_fails(keys),
+  ).bisect
 
-fn taking_b_fails(keys: List<{ name: String, ns: String }>) -> Trial =
-  if len(filter(keys, |k: { name: String, ns: String }| k.name == "m.b")) > 0 { a_failure() }
-  else { a_pass() }
+fn taking_b_fails(keys: List<DefKey>) -> Trial =
+  if len(filter(keys, |k: DefKey| k.name == "m.b")) > 0 { a_failure() } else { a_pass() }
 
 test "a green run is exit 0, and the head says what was selected of what" {
   let p = a_program([a_case(0, "one"), a_case(1, "two")]);
@@ -2922,4 +3583,206 @@ test "the search a seeded test is keyed on is the plan the flags name, and the d
   assert(string_contains(doc, "\"seed\":\"16:2\""));
   assert(string_contains(doc, "\"mode\":\"once\""));
   assert(string_contains(doc, "\"roots\":[16]"))
+}
+
+// --- Footprints over real programs --------------------------------------------
+
+fn analysed_as(name: String, src: String) -> Whole =
+  match analyse(parse_all([{ name: bytes_of_string(name), src: bytes_of_string(src) }])) {
+    Analysed(w) -> w,
+    Refused(_) -> panic("the fixture checks"),
+  }
+
+fn compiled(src: String) -> Whole = analysed_as("", src)
+
+fn cases_of_whole(w: Whole) -> List<Case> =
+  fold(range(0, len(w.checked.tests)), [], |acc: List<Case>, i: Int|
+    match test_at(w, i) { Some(t) -> push(acc, case_view(w, i, t)), None -> acc })
+
+// The classes every test of a program is coloured into, as a run that executes them all colours them.
+fn coloured(w: Whole) -> List<List<Int>> = {
+  let cases = cases_of_whole(w);
+  classes_of(a_program(cases), map(cases, |c: Case| c.index))
+}
+
+fn texts_of_case(w: Whole, i: Int) -> List<String> =
+  match list_at(cases_of_whole(w), i) { Some(c) -> map(c.atoms, |x: Printed| x.text), None -> [] }
+
+fn a_store() -> String =
+  "effect store {\n  read  all[r]() -> Int\n  write save[r](n: Int) -> Unit\n}\n"
+
+fn precise() -> String =
+  a_store()
+    ++ "fn list_items() -> Int / {store.read[items]} = store.all[items]()\nfn place_order() -> Int / {store.write[orders]} { store.save[orders](1); 2 }\ntest \"items\" { assert_eq(list_items(), 0) }\ntest \"orders\" { assert_eq(place_order(), 2) }\n"
+
+fn aliased() -> String =
+  a_store()
+    ++ "effect set Desk = {store.read[items], store.write[orders]}\nfn list_items() -> Int / {Desk} = store.all[items]()\nfn place_order() -> Int / {Desk} { store.save[orders](1); 2 }\ntest \"items\" { assert_eq(list_items(), 0) }\ntest \"orders\" { assert_eq(place_order(), 2) }\n"
+
+test "precise rows leave two endpoints nothing to contend over, and one broad set serialises them" {
+  assert_eq(coloured(compiled(precise())), [[0, 1]]);
+  assert_eq(coloured(compiled(aliased())), [[0], [1]])
+}
+
+test "the atoms that serialise them are the set's expansion, and an alias only ever widens" {
+  let broad = texts_of_case(compiled(aliased()), 0);
+  let narrow = texts_of_case(compiled(precise()), 0);
+  assert(len(filter(broad, |t: String| string_ends_with(t, "store.write[orders]"))) > 0);
+  assert(len(filter(broad, |t: String| string_contains(t, "Desk"))) == 0);
+  assert(len(filter(narrow, |t: String| string_ends_with(t, "store.write[orders]"))) == 0);
+  assert(fold(narrow, true, |ok: Bool, t: String| ok && said(broad, t)))
+}
+
+fn cell_test(label: String, i: Int) -> String =
+  "test \"contender " ++ label ++ " " ++ int_to_string(i) ++ "\" { let seen = with_cell[" ++ label
+    ++ "]("
+    ++ int_to_string(i)
+    ++ ") { c -> { cell_set(c, cell_get(c) * 7); cell_get(c) } }; assert_eq(touches_"
+    ++ label
+    ++ "(seen), "
+    ++ int_to_string(i * 7)
+    ++ ") }\n"
+
+fn toucher(label: String) -> String =
+  "fn touches_" ++ label ++ "(n: Int) -> Int / {cell.read[" ++ label ++ "], cell.write[" ++ label
+    ++ "]} = n\n"
+
+test "tests naming one region label all conflict, and tests on distinct labels never do" {
+  let one = fold(range(0, 3), toucher("table"), |acc: String, i: Int| acc ++ cell_test("table", i));
+  assert_eq(coloured(compiled(one)), [[0], [1], [2]]);
+  let apart = fold(range(0, 3), "", |acc: String, i: Int| {
+    let label = "table" ++ int_to_string(i);
+    acc ++ toucher(label) ++ cell_test(label, i)
+  });
+  assert_eq(coloured(compiled(apart)), [[0, 1, 2]])
+}
+
+test "an effect whose name merely resembles a region's names a real resource" {
+  let w = compiled(
+    "effect cells {\n  write put[rows](v: Int) -> Unit\n}\ntest \"one\" { cells.put[rows](1) }\ntest \"two\" { cells.put[rows](2) }\n",
+  );
+  assert_eq(texts_of_case(w, 0), ["cells.put[rows]"]);
+  assert_eq(coloured(w), [[0], [1]])
+}
+
+test "a region label beside a real write does not launder the write" {
+  let w = compiled(
+    "effect db {\n  read  get[users]() -> Int\n  write put[users](v: Int) -> Unit\n}\nfn touches(n: Int) -> Int / {cell.read[table]} = n\ntest \"cell only\" { let seen = with_cell[table](1) { c -> cell_get(c) }; assert_eq(touches(seen), 1) }\ntest \"cell and a real write\" { let seen = with_cell[table](1) { c -> cell_get(c) }; db.put[users](touches(seen)) }\ntest \"a real read\" { assert_eq(db.get[users](), 0) }\n",
+  );
+  assert_eq(texts_of_case(w, 1), ["cell.read[table]", "db.put[users]"]);
+  // Two readers of one region label share a worker; a writer and a reader of `users` do not.
+  assert_eq(coloured(w), [[0, 1], [2]])
+}
+
+test "a test whose regions discharge their cells contends over nothing" {
+  let w = compiled(
+    "test \"users cell\" { with_cell[users](1) { c -> assert_eq(cell_get(c), 1) } }\ntest \"orders cell\" { with_cell[orders](2) { c -> assert_eq(cell_get(c), 2) } }\ntest \"pure\" { assert_eq(1, 1) }\n",
+  );
+  assert_eq(map(cases_of_whole(w), |c: Case| c.footprint), ["{}", "{}", "{}"]);
+  assert_eq(coloured(w), [[0, 1, 2]])
+}
+
+test "a program cannot declare either effect the scheduler reads a name of" {
+  let refused = |name: String|
+    match analyse(
+        parse_all([
+          {
+            name: b"",
+            src: bytes_of_string(
+              "effect " ++ name ++ " {\n  write put[users](v: Int) -> Unit\n}\ntest \"claim\" { "
+                ++ name
+                ++ ".put[users](1) }\n",
+            ),
+          },
+        ]),
+      ) {
+      Analysed(_) -> false,
+      Refused(_) -> true,
+    };
+  assert(refused("cell"));
+  assert(refused("sim"))
+}
+
+test "a test that reads a seed is searched, and one that does not runs once" {
+  let w = compiled(
+    "test \"once\" { assert_eq(1, 1) }\ntest \"searched\" { let n = simulate { task.join(task.spawn(|| 1)) }; assert_eq(n, 1) }\n",
+  );
+  assert_eq(map(cases_of_whole(w), |c: Case| c.seeded), [false, true]);
+  assert_eq(map(rows_of(w), |r: Row| r.seeded), [false, true])
+}
+
+test "a run reports on the tests `--filter` keeps, and counts the ones it hid" {
+  let w = analysed_as(
+    "m",
+    "test \"alpha\" { assert_eq(1, 1) }\ntest \"beta\" { assert_eq(2, 2) }\n",
+  );
+  let options = options_from(parsed(["test", "--filter", "alpha"]), "/p");
+  let scope = scope_of(w, options);
+  assert_eq(scope.visible, [0]);
+  assert_eq(scope.filtered_out, 1);
+  assert_eq(scope.out, []);
+  assert_eq(scope_of(w, options_from(parsed(["test"]), "/p")).visible, [0, 1])
+}
+
+// --- What a search's cost reads as --------------------------------------------
+
+test "a bounded count renders as a lower bound, and a reduction needs the naive search" {
+  assert_eq(
+    cost_of(Some({ explored: 4096, bounded: true })),
+    Some({ explored: 4096, bounded: true, rendered: ">= 4096" }),
+  );
+  assert_eq(cost_of(None), None);
+  let e: Exploration = {
+    explored: 12,
+    exhaustive: true,
+    exhausted: false,
+    naive: None,
+    blind: None,
+    steps: 8,
+    virtual_time: 0,
+    failure: None,
+    race: None,
+  };
+  assert_eq(tenths_of(e), None);
+  assert_eq(tenths_of({ ..e, naive: Some({ explored: 120, bounded: false }) }), Some(100));
+  // Rounded half up to a tenth: 40 / 12 is 3.33.
+  assert_eq(tenths_of({ ..e, naive: Some({ explored: 40, bounded: false }) }), Some(33));
+  assert_eq(tenths_of({ ..e, explored: 0, naive: Some({ explored: 40, bounded: false }) }), None);
+  assert_eq(
+    explored_of({ ..e, failure: Some({ root: 7u64, path: [1, 0] }) }).failing_seed,
+    Some("7:1.0"),
+  )
+}
+
+// --- What a watching run stamps -----------------------------------------------
+
+test "a tree stamps one line per `.ply` file, and a walk that fails stamps nothing" {
+  let tree = mem_of([
+    { path: "m.ply", body: b"fn m() -> Int = 1" },
+    { path: "notes.txt", body: b"x" },
+    { path: "sub/deep.ply", body: b"fn d() -> Int = 2" },
+  ]);
+  let walked = |rs: List<paths::Resolved>|
+    handle {
+      stamped(rs)
+    } with {
+      fs.kind[cwd](p) -> mem_kind(tree, p),
+      fs.kind[abs](p) -> panic("nothing here leaves the working directory"),
+      fs.list_dir[cwd](p) -> mem_list(tree, p),
+      fs.list_dir[abs](p) -> panic("nothing here leaves the working directory"),
+      fs.modified_ms[cwd](p) -> mem_modified(tree, p),
+      fs.modified_ms[abs](p) -> panic("nothing here leaves the working directory"),
+      fs.file_size[cwd](p) -> mem_size(tree, p),
+      fs.file_size[abs](p) -> panic("nothing here leaves the working directory"),
+    };
+  match walked([paths::here()]) {
+    Some(lines) -> {
+      assert_eq(len(lines), 2);
+      assert(string_starts_with(at(lines, 0, ""), "m.ply "));
+      assert(string_ends_with(at(lines, 0, ""), " 17"));
+      assert(string_starts_with(at(lines, 1, ""), "sub/deep.ply "))
+    },
+    None -> panic("a readable tree stamps"),
+  };
+  assert_eq(walked([paths::at_cwd("gone")]), None)
 }

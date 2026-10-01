@@ -24,11 +24,11 @@ of it next.
 | `crates/ply-codegen` | the compiled tier: emits C, builds it and loads it |
 | `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its bootstrap bundle (`bootstrap/`) |
 | `crates/ply-store` | the result and front-end caches under `.ply-cache` |
-| `crates/ply-test` | running a test or one interleaving of it, and filing results (Rust); what a run decides, as the `suite` package (`ply/`) |
+| `crates/ply-test` | what a test run decides, as the `suite` package in `ply/`; not a cargo crate |
 | `crates/ply-prove` | specification obligations and their discharge, as the `prove` package in `ply/`; not a cargo crate |
 | `crates/ply-sim` | the interleaving search, as the `sim` package in `ply/`; not a cargo crate |
 | `crates/ply-host` | the Rust handlers effects resolve to (db, fs, tcp, tls, ...) |
-| `crates/ply-machine` | the nested-entry capability: a program loading and entering another program |
+| `crates/ply-machine` | the nested-entry capability: a program loading and entering another program; and the runtime `ply test` and `ply prove` drive |
 | `crates/ply-std` | the standard library, as Ply source in `ply/` |
 | `crates/ply-cli` | the `ply` program, as Ply source in `ply/` and the artifact it builds (`bootstrap/`); not a cargo crate |
 | `crates/ply-registry` | the package registry `ply publish` and `ply resolve` talk to, as Ply source in `ply/`; not a cargo crate |
