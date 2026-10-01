@@ -3,12 +3,10 @@
 //! it here, from nothing.
 
 use crate::load::{
-    Discovered, Found, LoadError, Loaded, Stamp, anchor, discover, project_root, stamp_of,
-    unreadable,
+    Discovered, Found, LoadError, Loaded, anchor, discover, project_root, unreadable,
 };
 use ply_codegen::c::producer;
 use ply_eval::{Diagnostic, Front, ModuleName, SourceId, SourceMap, Span, codes};
-use ply_store::ContentHash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -100,16 +98,12 @@ pub fn load_over_front(path: &Path, handed: &HandedFront) -> Result<Loaded, Load
     for file in &handed.files {
         let path = PathBuf::from(&file.path);
         let module = ModuleName::from_dotted(&file.name);
-        let content = ContentHash::of(file.text.as_bytes());
         let source = sources.add(&path, file.text.clone());
-        let stamp = crate::load::stamp_of(&path);
         states.push(FileState {
             path,
             module: module.clone(),
             source,
             text: Arc::from(file.text.as_str()),
-            content,
-            stamp,
             shipped: crate::shelf::source(&module).is_some(),
         });
     }
@@ -142,9 +136,6 @@ struct FileState {
     module: ModuleName,
     source: SourceId,
     text: Arc<str>,
-    content: ContentHash,
-    /// What the file stamped before this load read it, which a watcher compares against.
-    stamp: Stamp,
     /// Embedded in the binary rather than discovered on disk.
     shipped: bool,
 }
@@ -284,15 +275,8 @@ impl Driver {
 
         timed(&mut phases.read, || {
             for file in &discovered {
-                // Before the read: a save that lands between the two then moves the stamp away
-                // from what this load recorded, so the next one looks rather than trusts it.
-                let stamp = stamp_of(&file.path);
                 match std::fs::read_to_string(&file.path) {
-                    Ok(text) => {
-                        let content = ContentHash::of(text.as_bytes());
-                        let id = sources.add(&file.path, text);
-                        read.push((id, content, stamp));
-                    }
+                    Ok(text) => read.push(sources.add(&file.path, text)),
                     Err(e) => diagnostics.push(unreadable(&file.path, &e)),
                 }
             }
@@ -306,7 +290,7 @@ impl Driver {
 
         // Checked with the text on hand, so an unusable path is reported against the file.
         let mut files = Vec::with_capacity(discovered.len());
-        for (file, &(source, content, stamp)) in discovered.iter().zip(&read) {
+        for (file, &source) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
                 Ok(module) => files.push(FileState {
                     path: file.path.clone(),
@@ -316,8 +300,6 @@ impl Driver {
                         .get(source)
                         .map(|f| f.text.clone())
                         .unwrap_or_else(|| "".into()),
-                    content,
-                    stamp,
                     shipped: false,
                 }),
                 Err(diagnostic) => diagnostics.push(anchor(diagnostic, &sources, source)),
@@ -384,8 +366,6 @@ impl Driver {
             .iter()
             .map(|f| Found {
                 path: f.path.clone(),
-                stamp: f.stamp,
-                content: f.content,
             })
             .collect();
         // Whether the whole-program promise check has anything to check.
@@ -455,12 +435,10 @@ impl Driver {
             for (path, name, text) in &package.files {
                 let source = self.sources.add(path, text.to_string());
                 self.files.push(FileState {
-                    stamp: stamp_of(path),
                     path: path.clone(),
                     module: ModuleName::from_dotted(name),
                     source,
                     text: text.clone(),
-                    content: ContentHash::of(text.as_bytes()),
                     shipped: false,
                 });
             }
@@ -471,12 +449,10 @@ impl Driver {
         if let Some((path, text)) = &self.manifest {
             let source = self.sources.add(path, text.to_string());
             self.files.push(FileState {
-                stamp: stamp_of(path),
                 path: path.clone(),
                 module: ModuleName::from_dotted("pkg"),
                 source,
                 text: text.clone(),
-                content: ContentHash::of(text.as_bytes()),
                 shipped: false,
             });
         }
@@ -487,12 +463,10 @@ impl Driver {
             let path = PathBuf::from(&package.root).join("ply.pkg");
             let source = self.sources.add(&path, text.to_string());
             self.files.push(FileState {
-                stamp: stamp_of(&path),
                 path,
                 module: ModuleName::from_dotted("pkg"),
                 source,
                 text: Arc::from(text.as_str()),
-                content: ContentHash::of(text.as_bytes()),
                 shipped: false,
             });
         }
@@ -511,7 +485,6 @@ impl Driver {
                 continue;
             };
             let path = crate::shelf::pseudo_path(&module);
-            let content = ContentHash::of(text.as_bytes());
             let source = self.sources.add(&path, text);
             let text = self
                 .sources
@@ -519,12 +492,10 @@ impl Driver {
                 .map(|f| f.text.clone())
                 .unwrap_or_else(|| "".into());
             self.files.push(FileState {
-                stamp: stamp_of(&path),
                 path,
                 module,
                 source,
                 text,
-                content,
                 shipped: true,
             });
         }
