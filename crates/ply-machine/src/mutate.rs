@@ -1,10 +1,7 @@
-use crate::hosts::{Hosts, hosting};
 use crate::load::Loaded;
 use ply_eval::{DefInfo, Diagnostic, HashOutput, SourceId, Span, Symbol, codes};
-use ply_test::RunReport;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 pub struct Mutant {
     pub definition: Symbol,
@@ -17,9 +14,9 @@ pub enum Verdict {
     Killed,
     Survived,
     /// The mutant is not a program, or no test reaches the definition.
-    Skipped(&'static str),
+    Skipped(String),
     /// The tests neither all passed nor any failed for the mutant's sake.
-    Unresolved(&'static str),
+    Unresolved(String),
 }
 
 pub struct Judged {
@@ -273,130 +270,51 @@ fn spliced(loaded: &Loaded, mutant: &Mutant) -> (Vec<(String, String)>, Vec<Sour
     (sources, ids)
 }
 
-/// Judges every mutant of every target, cheapest first, up to the budget; the honest program
-/// is assumed green, since a survivor means nothing otherwise.
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    loaded: &Loaded,
-    hashes: &HashOutput,
-    targets: &[&DefInfo],
-    budget: usize,
-    search: &ply_eval::sim::Plan,
-    choice: &ply_test::Choice,
-    plan: &crate::tester::Plan,
-    hosts: &Hosts,
-    runtime: &Option<ply_eval::RuntimeFactory>,
-) -> Report {
-    let mut report = Report {
+/// Every mutant of every target that some test reaches, cheapest first: the fewer tests reach a
+/// mutant, the less judging it costs. The program judges them, up to its budget.
+pub fn queued(loaded: &Loaded, hashes: &HashOutput, targets: &[&DefInfo]) -> Queue {
+    let mut queue = Queue {
         definitions: targets.len(),
-        ..Report::default()
+        ..Queue::default()
     };
-    let mut queue: Vec<(Vec<usize>, Mutant)> = Vec::new();
     for def in targets {
         let reached = reaching(loaded, hashes, &def.name);
         if reached.is_empty() {
-            report.unreached.push(def.name.clone());
+            queue.unreached.push(def.name.clone());
             continue;
         }
         for mutant in mutants(loaded, def) {
-            queue.push((reached.clone(), mutant));
+            queue.mutants.push((reached.clone(), mutant));
         }
     }
-    report.generated = queue.len();
-    queue.sort_by_key(|(reached, _)| reached.len());
-    let scratch = crate::tester::Cache::scratch();
-    let Ok(mut scratch) = scratch else {
-        return report;
-    };
-    for (n, (reached, mutant)) in queue.into_iter().enumerate() {
-        if n >= budget {
-            report.budget_spent = true;
-            break;
-        }
-        let tests: Vec<Symbol> = reached
-            .iter()
-            .map(|&i| loaded.check.tests[i].key.clone())
-            .collect();
-        let verdict = judge(
-            loaded,
-            &mutant,
-            &reached,
-            search,
-            choice,
-            plan,
-            hosts,
-            runtime,
-            &mut scratch.store,
-        );
-        report.judged.push(Judged {
-            mutant,
-            verdict,
-            tests,
-        });
-    }
-    report
+    queue.mutants.sort_by_key(|(reached, _)| reached.len());
+    queue
 }
 
-#[allow(clippy::too_many_arguments)]
-fn judge(
+#[derive(Default)]
+pub struct Queue {
+    pub definitions: usize,
+    pub unreached: Vec<Symbol>,
+    /// Each mutant beside the tests that reach its definition.
+    pub mutants: Vec<(Vec<usize>, Mutant)>,
+}
+
+/// The program with `mutant` spliced in, checked and compiled; why not when it cannot be.
+pub fn built(
     loaded: &Loaded,
     mutant: &Mutant,
-    reached: &[usize],
-    search: &ply_eval::sim::Plan,
-    choice: &ply_test::Choice,
-    plan: &crate::tester::Plan,
-    hosts: &Hosts,
-    runtime: &Option<ply_eval::RuntimeFactory>,
-    store: &mut ply_store::Store,
-) -> Verdict {
+) -> Result<(Arc<ply_eval::Front>, &'static dyn ply_eval::Provider), Verdict> {
     let (sources, ids) = spliced(loaded, mutant);
     let Ok(front) = ply_codegen::c::producer::checked_front(&sources, &ids) else {
-        return Verdict::Skipped("does not check");
+        return Err(Verdict::Skipped("does not check".to_string()));
     };
     let texts: std::collections::HashMap<String, String> = sources.iter().cloned().collect();
     let Ok(provider) = ply_codegen::Unit::over_front(&front, texts) else {
-        return Verdict::Unresolved("the C backend could not be built");
+        return Err(Verdict::Unresolved(
+            "the C backend could not be built".to_string(),
+        ));
     };
-    // The mutant's selection is the program's decision over tests whose hashes this store has never
-    // seen, so a test the program found in the cache is new here and every test that reaches the
-    // mutant runs, in the classes the program coloured over every test the run reports on: a subset
-    // of a class shares nothing either. Nothing it proves is filed, since the keys the program named
-    // are the unmutated tests'. The reasons stay the program's, with `cached` read as `new`.
-    let mut fresh = choice.clone();
-    fresh.runs = plan.visible.clone();
-    fresh.groups = choice.every.clone();
-    fresh.narrowed.clear();
-    fresh.filed.clear();
-    fresh.reasons = fresh
-        .reasons
-        .iter()
-        .map(|reason| match reason {
-            ply_test::Reason::Cached => ply_test::Reason::New,
-            other => *other,
-        })
-        .collect();
-    let mut selection = crate::tester::decided(&fresh, plan, &front.check, search);
-    let wanted: BTreeSet<usize> = reached.iter().copied().collect();
-    selection.to_run.retain(|i| wanted.contains(i));
-    selection
-        .groups
-        .iter_mut()
-        .for_each(|g| g.retain(|i| wanted.contains(i)));
-    selection.groups.retain(|g| !g.is_empty());
-    let expected = selection.to_run.len();
-    let outcome: Result<RunReport, _> = catch_unwind(AssertUnwindSafe(|| {
-        let executor = ply_test::InterpExecutor::new(&front, provider)
-            .with_search(ply_test::Search::of(&selection))
-            .with_hosts(hosting(hosts, runtime));
-        ply_test::run_with(&selection, &front.check, &front.hashes, store, &executor)
-    }));
-    match outcome {
-        Err(_) => Verdict::Unresolved("the run panicked"),
-        Ok(report) if report.failures.iter().any(|f| !f.defect) => Verdict::Killed,
-        Ok(report) if report.failed > 0 => Verdict::Unresolved("Ply failed running the tests"),
-        Ok(report) if report.passed == expected => Verdict::Survived,
-        Ok(_) => Verdict::Unresolved("not every test answered"),
-    }
+    Ok((Arc::new(front), provider))
 }
 
 pub fn to_json(report: &Report, loaded: &Loaded) -> Value {
@@ -413,7 +331,7 @@ pub fn to_json(report: &Report, loaded: &Loaded) -> Value {
                     "location": crate::tester::location_json(&loaded.sources, j.mutant.span),
                     "tests": j.tests.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
                     "why": match &j.verdict {
-                        Verdict::Skipped(why) | Verdict::Unresolved(why) => Value::String((*why).to_string()),
+                        Verdict::Skipped(why) | Verdict::Unresolved(why) => Value::String(why.clone()),
                         _ => Value::Null,
                     },
                 })

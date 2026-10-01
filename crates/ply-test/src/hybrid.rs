@@ -2,7 +2,7 @@
 
 use crate::bisect::{DefKey, Trial, Unresolved};
 use crate::sim::seed_run;
-use ply_eval::{DefHash, Diagnostic, HashOutput, Plan, Provider, Seed, SourceId, Symbol};
+use ply_eval::{DefHash, Diagnostic, HashOutput, Provider, Seed, SourceId, Symbol};
 use ply_store::body::{BodySet, StoredBody};
 use ply_store::{Outcome, Store};
 use std::collections::{BTreeMap, BTreeSet};
@@ -109,7 +109,7 @@ pub struct BodyHybrid<'a> {
     /// The keys of mixtures that went green.
     proved: Vec<DefHash>,
     /// Pinned to the interleaving the failure happened in.
-    plan: Plan,
+    seed: Seed,
 }
 
 impl<'a> BodyHybrid<'a> {
@@ -127,12 +127,12 @@ impl<'a> BodyHybrid<'a> {
             test,
             signature,
             proved: Vec::new(),
-            plan: Plan::once(Seed::default()),
+            seed: Seed::default(),
         }
     }
 
     pub fn at_seed(mut self, seed: &Seed) -> BodyHybrid<'a> {
-        self.plan = Plan::once(seed.clone());
+        self.seed = seed.clone();
         self
     }
 
@@ -247,7 +247,7 @@ impl BodyHybrid<'_> {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
 
-        let plan = self.plan.clone();
+        let seed = self.seed.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             // Hermetic always: a search asks this up to `Budget::max_trials` times.
             let texts: std::collections::HashMap<String, String> =
@@ -255,7 +255,7 @@ impl BodyHybrid<'_> {
             let unit =
                 ply_codegen::Unit::over_front(&front, texts).expect("this host has a C compiler");
             let mut machine = ply_eval::Machine::new(&front, unit.attach())?;
-            seed_run(&mut machine, &plan.seeds()[0], plan.steps);
+            seed_run(&mut machine, &seed, ply_eval::sim::DEFAULT_STEPS);
             machine.eval_test(index)
         }));
         match outcome {

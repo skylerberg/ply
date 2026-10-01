@@ -2,7 +2,7 @@
 //! reports about its searches.
 
 use ply_eval::explore::Interleaving;
-use ply_eval::{DefHash, Diagnostic, EffectAtom, Exploration, Footprint, Machine, Seed};
+use ply_eval::{DefHash, Diagnostic, EffectAtom, Footprint, Machine, Seed};
 
 /// The effect whose atom a `simulate` region leaves in a footprint: the seed it reads.
 const SIM_EFFECT: &str = "sim";
@@ -59,7 +59,7 @@ impl Record {
 
 /// Whether a green verdict may be written under the keys the program filed it under: a search that
 /// spent its budget, or one that was never observed, proved nothing.
-pub fn record_under(filed: &[DefHash], seeded: bool, exploration: Option<&Exploration>) -> Record {
+pub fn record_under(filed: &[DefHash], seeded: bool, exploration: Option<&crate::Searched>) -> Record {
     if seeded && exploration.is_none() {
         return Record::Unobserved;
     }
