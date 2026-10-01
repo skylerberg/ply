@@ -260,23 +260,17 @@ impl Prover {
         }
     }
 
-    /// What an owner is called through to produce `result`: the tier its propositions are entered
-    /// on, attached afresh.
-    fn machine(&self) -> Result<Machine<'_>, Fault> {
-        Machine::new(&self.front, self.backend.attach())
-            .map(|machine| machine.with_max_calls(DEFAULT_MAX_CALLS))
-            .map_err(|refused| Fault {
-                bindings: Vec::new(),
-                diagnostic: Box::new(refused),
-            })
-    }
-
-    /// The machine a `law/host`'s body runs on: the run's binding and a reactor for this thread.
-    fn host_machine(&self, hosting: &Hosting) -> Result<Machine<'_>, Fault> {
-        let mut machine = self.machine()?;
-        machine.set_host_binding(Arc::clone(&hosting.binding));
-        if let Some(factory) = &hosting.runtime {
-            machine.set_host_runtime(Arc::clone(factory));
+    /// What every entry a claim makes goes through, its owner's call included: this thread's tier,
+    /// bound to the run's host and a reactor for this thread when the claim is a `law/host`.
+    fn machine(&self, obligation: &Obligation) -> Result<Machine<'_>, Diagnostic> {
+        let mut machine =
+            Machine::new(&self.front, self.compiled())?.with_max_calls(DEFAULT_MAX_CALLS);
+        if let Strategy::Hosted = obligation.strategy {
+            let hosting = self.hosting.as_ref().ok_or_else(|| unhosted(obligation))?;
+            machine.set_host_binding(Arc::clone(&hosting.binding));
+            if let Some(factory) = &hosting.runtime {
+                machine.set_host_runtime(Arc::clone(factory));
+            }
         }
         Ok(machine)
     }
@@ -329,24 +323,16 @@ impl Mode {
 
 /// The world named an obligation no claim of the front end's states: Ply disagreeing with itself.
 #[cold]
-fn unclaimed(obligation: &Obligation) -> Fault {
-    Fault {
-        bindings: Vec::new(),
-        diagnostic: Box::new(
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("the prover holds no claim for `{}`", obligation.owner),
-            )
-            .primary(
-                obligation.span,
-                "this obligation was named, and no claim states it",
-            )
-            .note(
-                "`proof.world` and the front end's claims are read from one program; this is \
-                 Ply's fault",
-            ),
-        ),
-    }
+fn unclaimed(obligation: &Obligation) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the prover holds no claim for `{}`", obligation.owner),
+    )
+    .primary(
+        obligation.span,
+        "this obligation was named, and no claim states it",
+    )
+    .note("`proof.world` and the front end's claims are read from one program; this is Ply's fault")
 }
 
 /// A `law/host` judged with no host bound: the program asked for what the run never opened.
@@ -367,31 +353,25 @@ fn unhosted(obligation: &Obligation) -> Diagnostic {
 }
 
 impl Prover {
-    /// One claim's points, judged in order until one ends the batch.
+    /// One claim's points, judged in order until one ends the batch, and what the entries that
+    /// judged them ended with.
     pub fn judged(
         &self,
         obligation: &Obligation,
         step_budget: i64,
         points: &[Vec<Value>],
         mode: Mode,
-    ) -> Vec<Judgement> {
-        let Some(claim) = self.claim(obligation) else {
-            return vec![Judgement::Faulted(*unclaimed(obligation).diagnostic)];
-        };
-        let mut cases = match self.cases(obligation, &claim, step_budget) {
+    ) -> Judgements {
+        let mut cases = match self.cases(obligation, step_budget) {
             Ok(cases) => cases,
-            Err(fault) => return vec![Judgement::Faulted(*fault.diagnostic)],
+            Err(diagnostic) => {
+                return Judgements {
+                    each: vec![Judgement::Faulted(diagnostic)],
+                    warnings: Vec::new(),
+                };
+            }
         };
-        if let Strategy::Hosted = obligation.strategy {
-            let Some(hosting) = &self.hosting else {
-                return vec![Judgement::Faulted(unhosted(obligation))];
-            };
-            cases.machine = match self.host_machine(hosting) {
-                Ok(machine) => machine,
-                Err(fault) => return vec![Judgement::Faulted(*fault.diagnostic)],
-            };
-        }
-        let mut out = Vec::with_capacity(points.len());
+        let mut each = Vec::with_capacity(points.len());
         for values in points {
             let judgement = match mode {
                 Mode::Whole => cases.judge(values),
@@ -402,12 +382,15 @@ impl Prover {
                 },
             };
             let ends = mode.ends(&judgement);
-            out.push(judgement);
+            each.push(judgement);
             if ends {
                 break;
             }
         }
-        out
+        Judgements {
+            each,
+            warnings: cases.warnings,
+        }
     }
 
     /// A law whose body reaches a `simulate` region, run once at `values` under `seed`: the
@@ -420,30 +403,13 @@ impl Prover {
         seed: &Seed,
         steps: u32,
     ) -> Interleaved {
-        let Some(claim) = self.claim(obligation) else {
-            return Interleaved::faulted(*unclaimed(obligation).diagnostic);
-        };
-        let cases = match self.cases(obligation, &claim, step_budget) {
+        let mut cases = match self.cases(obligation, step_budget) {
             Ok(cases) => cases,
-            Err(fault) => return Interleaved::faulted(*fault.diagnostic),
+            Err(diagnostic) => return Interleaved::faulted(diagnostic),
         };
-        let compiled = self.compiled();
-        compiled.set_seed(seed.clone(), steps);
-        let entered = ply_codegen::rt::with_step_budget(step_budget, || {
-            compiled.enter_whole(&cases.body_root, values, DEFAULT_MAX_CALLS)
-        });
-        let (value, record) = match entered {
-            ply_eval::Entered::Answered(value) => (Ok(value), compiled.simulated()),
-            ply_eval::Entered::Raised(raised) => (Err(raised), compiled.simulated()),
-            ply_eval::Entered::Declined => (
-                Err(ply_eval::err_not_compiled(
-                    &cases.body_root,
-                    obligation.span,
-                )),
-                None,
-            ),
-        };
-        let judged = match value {
+        cases.machine.set_seed(seed.clone(), steps);
+        let body_root = cases.body_root.clone();
+        let judged = match cases.enter(&body_root, values.to_vec()) {
             Ok(Value::Bool(true)) => None,
             Ok(Value::Bool(false)) => Some(Judgement::Failed),
             Ok(other) => Some(Judgement::Faulted(body_was_not_boolean(
@@ -459,37 +425,43 @@ impl Prover {
                 "the law failed",
             )),
         };
+        let record = cases.machine.simulated();
         Interleaved {
-            interleaving: record.as_ref().map_or_else(
+            interleaving: record.map_or_else(
                 || ply_eval::Interleaving::passed(Vec::new()),
                 |r| r.interleaving(&outcome),
             ),
             verdict: judged,
             observed: record.is_some(),
+            warnings: cases.warnings,
         }
     }
 
-    fn cases(
-        &self,
-        obligation: &Obligation,
-        claim: &Claim<'_>,
-        step_budget: i64,
-    ) -> Result<Cases<'_>, Fault> {
+    fn cases(&self, obligation: &Obligation, step_budget: i64) -> Result<Cases<'_>, Diagnostic> {
+        let claim = self
+            .claim(obligation)
+            .ok_or_else(|| unclaimed(obligation))?;
         let call = match claim {
             Claim::Ensures { .. } => Some(obligation.owner.clone()),
             Claim::Law { .. } => None,
         };
         Ok(Cases {
-            machine: self.machine()?,
-            compiled: self.compiled(),
-            guard_roots: self.guard_roots(obligation, claim),
-            body_root: self.body_root(claim),
+            machine: self.machine(obligation)?,
+            guard_roots: self.guard_roots(obligation, &claim),
+            body_root: self.body_root(&claim),
             span: obligation.span,
             call,
             result: obligation.result.as_ref().map(|b| b.name.clone()),
             step_budget,
+            warnings: Vec::new(),
         })
     }
+}
+
+/// What a batch of points came to, and what the entries that judged them ended with.
+pub struct Judgements {
+    pub each: Vec<Judgement>,
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Each binder beside the value it was given, as a report prints them.
@@ -508,7 +480,6 @@ pub fn bindings(binders: &[Binder], values: &[Value]) -> Vec<Binding> {
 /// How a tuple of binder values is judged: guard first, always.
 struct Cases<'a> {
     machine: Machine<'a>,
-    compiled: Rc<dyn ply_eval::Compiled>,
     guard_roots: Vec<Symbol>,
     body_root: Symbol,
     span: Span,
@@ -516,19 +487,21 @@ struct Cases<'a> {
     call: Option<Symbol>,
     result: Option<Symbol>,
     step_budget: i64,
+    /// What every entry so far ended with.
+    warnings: Vec<Diagnostic>,
 }
 
 impl Cases<'_> {
-    /// The proposition entered on the tier, the only evaluator a proposition has.
-    fn on_tier(&self, root: &Symbol, args: &[Value]) -> Result<Value, Diagnostic> {
-        let entered = ply_codegen::rt::with_step_budget(self.step_budget, || {
-            self.compiled.enter_whole(root, args, DEFAULT_MAX_CALLS)
-        });
-        match entered {
-            ply_eval::Entered::Answered(value) => Ok(value),
-            ply_eval::Entered::Raised(d) => Err(d),
-            ply_eval::Entered::Declined => Err(ply_eval::err_not_compiled(root, self.span)),
-        }
+    /// One entry through the claim's machine, within the claim's budget, keeping what it ended
+    /// with.
+    fn enter(&mut self, root: &Symbol, args: Vec<Value>) -> Result<Value, Diagnostic> {
+        let (machine, span) = (&mut self.machine, self.span);
+        let (answer, warnings) = ply_codegen::rt::with_step_budget(self.step_budget, || {
+            machine.call(root.as_str(), args, span)
+        })
+        .into_parts();
+        self.warnings.extend(warnings);
+        answer
     }
 
     fn boolean(&self, value: Value) -> Result<bool, Diagnostic> {
@@ -560,8 +533,9 @@ impl Cases<'_> {
     }
 
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
-        for root in &self.guard_roots {
-            let value = self.on_tier(root, values)?;
+        for at in 0..self.guard_roots.len() {
+            let root = self.guard_roots[at].clone();
+            let value = self.enter(&root, values.to_vec())?;
             if !self.boolean(value)? {
                 return Ok(false);
             }
@@ -572,14 +546,11 @@ impl Cases<'_> {
     fn body(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         // A law's binders, or an owner's parameters then `result`: the order `source.rs` expects.
         let mut args = values.to_vec();
-        if let (Some(name), Some(_)) = (&self.call, &self.result) {
-            let (returned, _) = self
-                .machine
-                .call(name.as_str(), values.to_vec(), self.span)
-                .into_parts();
-            args.push(returned?);
+        if let (Some(name), Some(_)) = (self.call.clone(), &self.result) {
+            args.push(self.enter(&name, values.to_vec())?);
         }
-        let value = self.on_tier(&self.body_root, &args)?;
+        let root = self.body_root.clone();
+        let value = self.enter(&root, args)?;
         self.boolean(value)
     }
 }
@@ -591,14 +562,17 @@ pub struct Interleaved {
     /// `None` when the body held.
     pub verdict: Option<Judgement>,
     pub observed: bool,
+    /// What the run's entry ended with.
+    pub warnings: Vec<Diagnostic>,
 }
 
 impl Interleaved {
-    fn faulted(diagnostic: Diagnostic) -> Interleaved {
+    pub fn faulted(diagnostic: Diagnostic) -> Interleaved {
         Interleaved {
             interleaving: ply_eval::Interleaving::passed(Vec::new()),
             verdict: Some(Judgement::Faulted(diagnostic)),
             observed: false,
+            warnings: Vec::new(),
         }
     }
 }
