@@ -6,12 +6,11 @@ use ply_eval::host::HostRegistry;
 use ply_eval::{Front, Machine, Provider, SourceId, Span};
 use std::collections::HashMap;
 
-/// A program that configures the tester over the directory it is handed, loads it, and reports
-/// what the tree holds: one test and its hash.
-const OUTER: &str = r#"
+/// The tester as a program declares it, and the options it configures a run with.
+const DECLARED: &str = r#"
 nondet effect tester {
-  write configure[r](options: Options, front: Front) -> Unit
-  read loaded[r]() -> Result<Program, Refusal>
+  write configure[r](options: Options) -> Unit
+  read loaded[r](front: Front) -> Result<Program, Refusal>
   read bound[r]() -> Result<Unit, Refusal>
   read trial[r](failure: Int, keys: List<{ name: String, ns: String }>, filed: Option<String>) -> Trial
   read stamped[r]() -> Option<List<String>>
@@ -19,7 +18,7 @@ nondet effect tester {
   read hashed[r]() -> List<Hashed>
 }
 
-type Program = Unit
+type Program = { filtered_out: Int }
 type Refusal = Unit
 type Key = {
   index: Int, label: String, name: String, module: String,
@@ -68,12 +67,16 @@ fn options(root: String) -> Options =
     config: { set: [], files: [], schema: None },
     sim: { seed: None, mode: "exhaustive", roots: None, budget: None, steps: None, measure_reduction: false },
   }
+"#;
 
+/// Configures the tester over the directory it is handed, loads it, and reports what the tree
+/// holds: one test and its hash.
+const KEYS_AND_HASHES: &str = r#"
 fn main(root: String, front: Front) -> Bool / {
   tester.configure[r], tester.loaded[r], tester.keys[r], tester.hashed[r],
 } = {
-  tester.configure[r](options(root), front);
-  match tester.loaded[r]() {
+  tester.configure[r](options(root));
+  match tester.loaded[r](front) {
     Err(_) -> false,
     Ok(_) -> {
       let keys = tester.keys[r]();
@@ -94,6 +97,27 @@ fn main(root: String, front: Front) -> Bool / {
 }
 "#;
 
+/// Two runs, each configured over a tree and a filter of its own: the first test each one's load
+/// holds, and how many tests its filter hid.
+const TWO_RUNS: &str = r#"
+fn first_test(root: String, front: Front, filter: Option<String>) -> String / {
+  tester.configure[r], tester.loaded[r], tester.keys[r],
+} = {
+  tester.configure[r]({ ..options(root), filter: filter });
+  match tester.loaded[r](front) {
+    Err(_) -> "refused",
+    Ok(p) -> match list_at(tester.keys[r](), 0) {
+      Some(k) -> k.name ++ " " ++ int_to_string(p.filtered_out),
+      None -> "none",
+    },
+  }
+}
+
+fn main(root: String, front: Front, other: String, other_front: Front) -> List<String> / {
+  tester.configure[r], tester.loaded[r], tester.keys[r],
+} = [first_test(root, front, None), first_test(other, other_front, Some("nothing"))]
+"#;
+
 fn front_of(source: &str) -> Front {
     let named = vec![("m".to_string(), source.to_string())];
     let ids = vec![SourceId(0)];
@@ -101,21 +125,13 @@ fn front_of(source: &str) -> Front {
     ply_codegen::c::producer::checked_front(&named, &ids).expect("the program checks")
 }
 
-#[test]
-fn a_selector_reads_the_keys_and_the_hashes_before_anything_runs() {
-    // One project with one test, which is what the program's checks are written against.
-    let dir = tempfile::tempdir().expect("a temp dir");
-    std::fs::write(
-        dir.path().join("p.ply"),
-        "fn double(x: Int) -> Int = x * 2\n\ntest \"doubles\" { assert_eq(double(2), 4) }\n",
-    )
-    .unwrap();
-
-    let front = front_of(OUTER);
-    let texts: HashMap<String, String> =
-        [("m".to_string(), OUTER.to_string())].into_iter().collect();
-    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
-    let mut machine = Machine::new(&front, Provider::attach(unit))
+/// A machine over `DECLARED` and `main`, bound to the tester operations it performs.
+fn driving(main: &str) -> Machine<'static> {
+    let source = format!("{DECLARED}{main}");
+    let front: &'static Front = Box::leak(Box::new(front_of(&source)));
+    let texts: HashMap<String, String> = [("m".to_string(), source)].into_iter().collect();
+    let unit = ply_codegen::Unit::over_front(front, texts).expect("this host has a C toolchain");
+    let mut machine = Machine::new(front, Provider::attach(unit))
         .expect("the unit was compiled from this program");
 
     let mut registry = HostRegistry::new();
@@ -129,16 +145,33 @@ fn a_selector_reads_the_keys_and_the_hashes_before_anything_runs() {
     }
     let binding = registry.bind(&front.check).expect("the tester ops bind");
     machine.set_host_binding(std::sync::Arc::new(binding));
+    machine
+}
 
+/// A project of one module, `name.ply`, holding `text`.
+fn tree(name: &str, text: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(dir.path().join(format!("{name}.ply")), text).unwrap();
+    dir
+}
+
+fn root_and_front(dir: &tempfile::TempDir) -> [ply_eval::Value; 2] {
+    [
+        ply_eval::Value::str(dir.path().display().to_string()),
+        crate::fixture::handed(dir.path()),
+    ]
+}
+
+#[test]
+fn a_selector_reads_the_keys_and_the_hashes_before_anything_runs() {
+    // One project with one test, which is what the program's checks are written against.
+    let dir = tree(
+        "p",
+        "fn double(x: Int) -> Int = x * 2\n\ntest \"doubles\" { assert_eq(double(2), 4) }\n",
+    );
+    let mut machine = driving(KEYS_AND_HASHES);
     let answer = machine
-        .call(
-            "m.main",
-            vec![
-                ply_eval::Value::str(dir.path().display().to_string()),
-                crate::fixture::handed(dir.path()),
-            ],
-            Span::DUMMY,
-        )
+        .call("m.main", root_and_front(&dir).to_vec(), Span::DUMMY)
         .into_parts()
         .0
         .expect("the outer main ran");
@@ -146,5 +179,35 @@ fn a_selector_reads_the_keys_and_the_hashes_before_anything_runs() {
         answer,
         ply_eval::Value::Bool(true),
         "the answers read: {answer:?}"
+    );
+}
+
+/// A run is its configuration's: a second one loads the tree it is handed under its own options,
+/// not under the first's.
+#[test]
+fn a_configuration_begins_a_run_over_the_tree_it_names() {
+    let first = tree(
+        "p",
+        "fn double(x: Int) -> Int = x * 2\n\ntest \"doubles\" { assert_eq(double(2), 4) }\n",
+    );
+    let second = tree(
+        "q",
+        "fn triple(x: Int) -> Int = x * 3\n\ntest \"triples\" { assert_eq(triple(2), 6) }\n",
+    );
+    let mut machine = driving(TWO_RUNS);
+    let mut args = root_and_front(&first).to_vec();
+    args.extend(root_and_front(&second));
+    let answer = machine
+        .call("m.main", args, Span::DUMMY)
+        .into_parts()
+        .0
+        .expect("the outer main ran");
+    assert_eq!(
+        answer,
+        ply_eval::Value::list(vec![
+            ply_eval::Value::str("p.doubles 0"),
+            ply_eval::Value::str("q.triples 1"),
+        ]),
+        "each run's load answered: {answer:?}"
     );
 }

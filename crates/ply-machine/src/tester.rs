@@ -101,16 +101,12 @@ const OPERATIONS: [(&str, &str); 18] = [
 /// kilobytes. Reserved, not committed.
 const RUN_STACK: usize = 256 << 20;
 
-/// One process's machine. The load, the store and the binding are opened on a thread of their own
-/// and live as long as this does, so a `--watch` iteration over an unmoved tree re-derives nothing.
 /// What `ply test` is configured with, as plain data: the shell's parsed flags convert into
-/// this.
+/// this. The machine a configuration starts lives until the next one, so a `--watch` iteration
+/// over an unmoved tree re-derives nothing.
 #[derive(Clone, Debug)]
 pub struct TestOptions {
     pub path: std::path::PathBuf,
-    /// The front end the CLI ran. A run without one is refused rather than loading again: `ply
-    /// test` is the only caller that starts one, and it always hands its answer over.
-    pub front: Option<crate::driver::HandedFront>,
     pub json: bool,
     pub explain: bool,
     pub no_cache: bool,
@@ -236,7 +232,7 @@ fn registration(op: &str, path: &'static str) -> HostOp {
 
 struct Site {
     args: Mutex<TestOptions>,
-    /// Started by the first operation and joined by the last.
+    /// Started by a run's first load and joined when the next run is configured.
     machine: Mutex<Option<Machine>>,
     /// The run in progress, which every thread the program runs a test on reads.
     running: RwLock<Option<Arc<Running>>>,
@@ -251,15 +247,22 @@ impl HostHandler for Site {
                     .args
                     .first()
                     .ok_or_else(|| unasked("configure", req.span))?;
-                let mut options = test_options_of(options, req.span)?;
-                options.front = match req.args.get(1) {
-                    Some(front) => Some(crate::driver::handed_front_of(front, req.span)?),
-                    None => None,
-                };
+                let options = test_options_of(options, req.span)?;
+                // A configuration begins a run, whatever the last one left: its machine, opened
+                // over the last options, is dropped, which joins its thread.
+                let previous = self.held().take();
+                drop(previous);
+                *self.running.write().unwrap_or_else(|e| e.into_inner()) = None;
                 *self.args.lock().unwrap_or_else(|e| e.into_inner()) = options;
                 ply_eval::Value::Unit
             }
-            "loaded" => self.loaded()?,
+            "loaded" => {
+                let front = req
+                    .args
+                    .first()
+                    .ok_or_else(|| unasked("loaded", req.span))?;
+                self.loaded(crate::driver::handed_front_of(front, req.span)?)?
+            }
             "bound" => self.bound()?,
             "stamped" => self.stamped(),
             "keys" => self.knowledge(Ask::Keys)?,
@@ -374,7 +377,9 @@ impl Site {
         self.machine.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn loaded(&self) -> Result<PlyValue, Diagnostic> {
+    /// One report's load, over the front end the CLI ran for it: a watching run hands one per
+    /// report, and the machine its configuration started serves them all.
+    fn loaded(&self, front: crate::driver::HandedFront) -> Result<PlyValue, Diagnostic> {
         *self.running.write().unwrap_or_else(|e| e.into_inner()) = None;
         let mut held = self.held();
         if held.is_none() {
@@ -383,7 +388,7 @@ impl Site {
             )?);
         }
         let machine = held.as_ref().ok_or_else(|| unstarted("loaded"))?;
-        machine.ask(Go::Load)?;
+        machine.ask(Go::Load(Box::new(front)))?;
         match machine.step()? {
             Step::Loaded(found) => Ok(answered((*found).map(found_value))),
             _ => Err(out_of_step("loaded")),
@@ -600,7 +605,8 @@ fn answered(answer: Result<PlyValue, Refused>) -> PlyValue {
 // --- The thread the corpus runs on --------------------------------------------
 
 enum Go {
-    Load,
+    /// A report begins, over the front end the CLI ran for it.
+    Load(Box<crate::driver::HandedFront>),
     Bind,
     /// What the program decided to run. Sent before the binding, because whether a unit has to be
     /// built at all is a function of it: a fully cached run builds none.
@@ -691,7 +697,7 @@ struct Queued {
     refused: Vec<Diagnostic>,
 }
 
-/// The thread this process's machine lives on. The `ply` program performing these operations is
+/// The thread a run's machine lives on. The `ply` program performing these operations is
 /// itself inside an entry; the load, the store, the binding and the diagnosis happen here, and only
 /// what a report is written from crosses back — which is also what lets the front end outlive an
 /// iteration. The tests themselves run on whichever threads the program runs them on, against the
@@ -740,7 +746,7 @@ impl Drop for Machine {
     }
 }
 
-/// One store and one warm front end for the whole process, however many reports are asked of it.
+/// One store and one warm front end for the run, however many reports are asked of it.
 fn serve(args: &TestOptions, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     let mut cache = Cache::open(&project_root(&args.path), args.no_cache);
     let mut warm = crate::warm::Warm::default();
@@ -754,11 +760,11 @@ fn serve(args: &TestOptions, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<G
             Err(signal) => signal,
         };
         match signal {
-            Go::Load => match &mut cache {
+            Go::Load(front) => match &mut cache {
                 Ok(cache) => {
                     // A trial asks about the run that finished last, and a new one is starting.
                     hybrids = None;
-                    pending = iterate(args, cache, &mut warm, told, asked, &mut hybrids);
+                    pending = iterate(args, &front, cache, &mut warm, told, asked, &mut hybrids);
                 }
                 Err(diagnostic) => {
                     let _ = told.send(Step::Loaded(Box::new(Err(Refused {
@@ -807,6 +813,7 @@ fn answer_after(
 /// One report's iteration, and whatever it was asked that it did not answer.
 fn iterate(
     args: &TestOptions,
+    front: &crate::driver::HandedFront,
     cache: &mut Cache,
     warm: &mut crate::warm::Warm,
     told: &mpsc::Sender<Step>,
@@ -829,17 +836,7 @@ fn iterate(
     let (held, reuse) = warm.take(&project_root(&args.path));
     let loaded = match held {
         Some(loaded) => Ok(loaded),
-        None => match &args.front {
-            Some(front) => crate::driver::load_over_front(&args.path, front),
-            None => Err(crate::load::LoadError {
-                sources: ply_eval::SourceMap::new(),
-                diagnostics: vec![Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    "`ply test` handed no front end over, and this side runs none",
-                )
-                .note("the CLI walks the tree and runs the compiler; a run without its answer has                        nothing to test")],
-            }),
-        },
+        None => crate::driver::load_over_front(&args.path, front),
     };
     let loaded = match loaded {
         Ok(mut loaded) => {
@@ -2946,7 +2943,6 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
     };
     let config = field_of(v, "config", span)?;
     Ok(TestOptions {
-        front: None,
         path: std::path::PathBuf::from(str_at("path")?),
         json: bool_at("json")?,
         explain: bool_at("explain")?,
@@ -3001,7 +2997,6 @@ impl Default for TestOptions {
     fn default() -> TestOptions {
         TestOptions {
             path: std::path::PathBuf::from("."),
-            front: None,
             json: false,
             explain: false,
             no_cache: false,
