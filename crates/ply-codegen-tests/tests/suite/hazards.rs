@@ -88,6 +88,8 @@ impl Harness {
         let unit = self.unit;
         self.machine
             .call(name, args.to_vec(), Span::DUMMY)
+            .into_parts()
+            .0
             .unwrap_or_else(|d| {
                 panic!(
                     "`{name}` raised: {}; the port's refusal: {:?}",
@@ -105,7 +107,9 @@ impl Harness {
         args: Vec<Value>,
     ) -> Result<Value, ply_eval::Diagnostic> {
         let machine = &mut self.machine;
-        ply_codegen::rt::with_step_budget(budget, || machine.call(name, args, Span::DUMMY))
+        ply_codegen::rt::with_step_budget(budget, || {
+            machine.call(name, args, Span::DUMMY).into_parts().0
+        })
     }
 
     /// The machine's own diagnostic, which a compiled failure has to arrive as.
@@ -113,6 +117,8 @@ impl Harness {
         let raised = self
             .machine
             .call(name, args.to_vec(), Span::DUMMY)
+            .into_parts()
+            .0
             .expect_err(name);
         assert_eq!(
             raised.code,
@@ -302,7 +308,7 @@ fn a_failed_entry_does_not_poison_the_one_after_it() {
         ("pure.mix", vec![Value::Int(i64::MAX), Value::Int(1)]),
         ("pure.share", vec![Value::Int(1), Value::Int(0)]),
     ] {
-        let _ = h.machine.call(name, args, Span::DUMMY);
+        let _ = h.machine.call(name, args, Span::DUMMY).into_parts().0;
         assert_eq!(h.run("pure.seeded", &[]), Value::Int(80));
         assert_eq!(h.run("pure.step", &[Value::Int(5)]), Value::Int(16));
     }
@@ -372,6 +378,8 @@ fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     let inside = bodies.while_entered(|| {
         h.machine
             .call("pure.step", vec![Value::Int(5)], Span::DUMMY)
+            .into_parts()
+            .0
     });
     assert_eq!(
         h.entered(),

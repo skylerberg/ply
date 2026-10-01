@@ -204,6 +204,68 @@ fn every_fixture_is_listed() {
     );
 }
 
+/// Run as its header says, `span_abandoned.ply` answers its value with two spans still open; the
+/// run closes them `Abandoned`, warns of both innermost first, and still exits 0, since a warning
+/// is no failure.
+#[test]
+fn a_run_warns_of_the_spans_its_entry_left_open_and_exits_zero() {
+    let project = copied("span_abandoned");
+    let run = ["run", "--host", "--trace", "json"];
+    let warning = "2 spans were still open when their task or the entry point ended: `reserving` on \
+                   `orders`, `order` on `orders`";
+
+    let out = ply(project.path())
+        .args(run)
+        .arg("span_abandoned.ply")
+        .output()
+        .expect("`ply run` runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .last()
+            .map(str::trim),
+        Some("3"),
+        "the entry's value is the answer: {stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.trim() == format!("warning: {warning}")),
+        "the run says nothing of the spans it closed: {stderr}"
+    );
+    let abandoned: Vec<Value> = stderr
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["outcome"] == "abandoned")
+        .collect();
+    let closed: Vec<&str> = abandoned
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert_eq!(closed, ["reserving", "order"], "{stderr}");
+
+    let document = json_of(
+        &ply(project.path())
+            .args(run)
+            .args(["--json", "span_abandoned.ply"])
+            .output()
+            .expect("`ply run --json` runs"),
+    );
+    assert_eq!(document["exit_code"], 0, "{document}");
+    let warned: Vec<&Value> = document["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the document carries diagnostics: {document}"))
+        .iter()
+        .filter(|d| d["code"] == "W0609")
+        .collect();
+    assert_eq!(warned.len(), 1, "{document}");
+    assert_eq!(warned[0]["severity"], "warning", "{document}");
+    assert_eq!(warned[0]["message"], warning, "{document}");
+}
+
 fn tested(dir: &Path, flags: &[&str]) -> Value {
     json_of(
         &ply(dir)

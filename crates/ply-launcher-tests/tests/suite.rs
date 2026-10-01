@@ -54,6 +54,8 @@ fn ask() -> ply_eval::Value {
     machine.set_host_binding(Arc::new(binding));
     machine
         .call("m.main", Vec::new(), Span::DUMMY)
+        .into_parts()
+        .0
         .expect("the entry ran")
 }
 

@@ -4,8 +4,8 @@ use ply_eval::host::{
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{
-    Diagnostic, EffectAtom, Footprint, Machine, Mode, Resource, SimId, Symbol, TaskHandle, TaskId,
-    Value, codes,
+    Diagnostic, EffectAtom, Ended, Footprint, Machine, Mode, Resource, SimId, Symbol, TaskHandle,
+    TaskId, Value, codes,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,8 +45,11 @@ fn atom(effect: &str, resource: &str, mode: Mode) -> EffectAtom {
 }
 
 #[track_caller]
-fn diagnostic(outcome: Result<(), Diagnostic>) -> Diagnostic {
-    outcome.expect_err("the program was expected to fail")
+fn diagnostic(outcome: Ended<()>) -> Diagnostic {
+    outcome
+        .into_parts()
+        .0
+        .expect_err("the program was expected to fail")
 }
 
 /// Registered against a read, but mutates its own state on every call and answers the new value.
@@ -81,7 +84,11 @@ fn documents_a_read_declared_handler_that_writes_is_recorded_as_a_read() {
     let mut machine = compiled.bound(vec![(any("db", "get"), handler.clone())]);
     machine.set_declared_footprint(Footprint::from_atoms([atom("t.db", "users", Mode::Read)]));
 
-    machine.eval_test(0).expect("the run is green");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the run is green");
 
     let used = machine.host_use().expect("the run reached the host");
     assert_eq!(
@@ -111,9 +118,15 @@ fn documents_a_lying_handler_couples_two_entry_points_that_share_nothing() {
     let handler = Arc::new(Mutates::default());
     let mut machine = compiled.bound(vec![(any("db", "get"), handler.clone())]);
 
-    machine.eval_test(0).expect("the first test is green");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the first test is green");
     machine
         .eval_test(1)
+        .into_parts()
+        .0
         .expect("the second test is green *because* it saw the first one's write");
 
     assert_eq!(handler.writes.load(Ordering::SeqCst), 2);
@@ -185,9 +198,11 @@ test/nondet "writes orders" { assert_eq(writers(), 2) }
         "the declared footprints do not conflict, so these two may run concurrently"
     );
 
-    machine.eval_test(0).expect("green");
+    machine.eval_test(0).into_parts().0.expect("green");
     machine
         .eval_test(1)
+        .into_parts()
+        .0
         .expect("green, and only because it saw the other resource's handler move");
     assert_eq!(cell.load(Ordering::SeqCst), 2);
 }
@@ -226,7 +241,7 @@ test/nondet "blocking, allegedly" { assert_eq(net.send[socket](1), 1) }
 
     // Declared honestly, the same handler passes: the check is the declaration against the answer.
     let mut machine = compiled.bound(vec![(any("net", "send"), Arc::new(Inline))]);
-    machine.eval_test(0).expect("green");
+    machine.eval_test(0).into_parts().0.expect("green");
 }
 
 /// E0428 checks the answer only: every handler's `call` still runs on the machine's thread.
@@ -294,7 +309,7 @@ test/nondet "blocking, honestly" { assert_eq(net.send[socket](1), 1) }
     machine.set_host_runtime(std::sync::Arc::new(|| {
         std::rc::Rc::new(Resolves::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
     }));
-    machine.eval_test(0).expect("green");
+    machine.eval_test(0).into_parts().0.expect("green");
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&std::thread::current().id(), &mut hasher);
@@ -577,7 +592,11 @@ fn documents_a_declared_footprint_outlives_the_entry_point_that_stated_it() {
     let mut machine = compiled.bound(vec![(any("db", "get"), handler.clone())]);
 
     machine.set_declared_footprint(Footprint::from_atoms([atom("t.db", "users", Mode::Read)]));
-    machine.eval_test(0).expect("green under its own claim");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("green under its own claim");
     // A second entry point, whose row nobody restated, is still judged by the first one's claim.
     machine.set_declared_footprint(Footprint::empty());
     assert_eq!(

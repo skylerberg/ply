@@ -573,10 +573,11 @@ impl Cases<'_> {
         // A law's binders, or an owner's parameters then `result`: the order `source.rs` expects.
         let mut args = values.to_vec();
         if let (Some(name), Some(_)) = (&self.call, &self.result) {
-            let returned = self
+            let (returned, _) = self
                 .machine
-                .call(name.as_str(), values.to_vec(), self.span)?;
-            args.push(returned);
+                .call(name.as_str(), values.to_vec(), self.span)
+                .into_parts();
+            args.push(returned?);
         }
         let value = self.on_tier(&self.body_root, &args)?;
         self.boolean(value)

@@ -4,9 +4,10 @@
 //! own tests pin them; these state the choice and check what the runtime did with it.
 
 use crate::fixture::{Seeds, handed, root_key, run_at, seeds_key};
+use ply_eval::host::{HostRuntime, MachineId, Pending};
 use ply_eval::{
     CheckOutput, DefHash, Diagnostic, EffectAtom, Footprint, HashOutput, Mode, Resource, Seed,
-    SourceId, Symbol,
+    SourceId, Symbol, Value, codes,
 };
 use ply_store::{Outcome, Store};
 use ply_test::{
@@ -15,6 +16,8 @@ use ply_test::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -720,6 +723,82 @@ fn a_result_counts_the_operations_its_own_test_performed() {
         0,
         "a worker's count starts over with each test"
     );
+}
+
+/// A runtime that warns as every entry point it is told of ends, as one does of spans left open.
+struct Warns;
+
+impl HostRuntime for Warns {
+    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+        Ok(Value::Unit)
+    }
+
+    fn end_entry_point(&self, _: MachineId) -> Result<(), Diagnostic> {
+        Err(Diagnostic::warning(
+            codes::SPAN_ABANDONED,
+            "a span was still open when the entry point ended",
+        ))
+    }
+}
+
+const ENDINGS: &str = r#"
+test "runs once" { assert_eq(1, 1) }
+
+test "runs once per interleaving" {
+  let n = simulate {
+    let a = task.spawn(|| 1);
+    task.join(a)
+  };
+  assert_eq(n, 1)
+}
+"#;
+
+/// A test is entered once, and a seeded one once per interleaving; what either entry ended with is
+/// the run's to report.
+#[test]
+fn what_a_test_ended_with_is_in_the_report_whether_it_ran_once_or_was_searched() {
+    let program = Program::compile(ENDINGS);
+    let runtime: ply_eval::RuntimeFactory = Arc::new(|| Rc::new(Warns) as Rc<dyn HostRuntime>);
+    for (name, seeded) in [("runs once", false), ("runs once per interleaving", true)] {
+        let index = program.index_of(name);
+        assert_eq!(
+            ply_test::is_seeded(&program.check.tests[index].footprint),
+            seeded,
+            "{name} is searched: {seeded}"
+        );
+        let root = TempRoot::new();
+        let mut store = root.store();
+        let report = run_at(
+            &program.choose(&[index]),
+            &program.port,
+            program.unit(),
+            Hosting::hermetic().with_runtime(Arc::clone(&runtime)),
+            &mut store,
+            &Seeds::default(),
+            1,
+        );
+        assert_eq!(report.failed, 0, "{name}: {:#?}", report.failures);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.code == codes::SPAN_ABANDONED),
+            "{name}: what the test ended with never reached the report: {:#?}",
+            report.warnings
+        );
+    }
 }
 
 /// Every selected test run on this thread, but `doomed`, whose run unwinds.

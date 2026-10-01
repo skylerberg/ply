@@ -37,7 +37,11 @@ fn main() {
         trust: ply_launcher::trust(),
         ..ply_machine::artifact::Binds::default()
     };
-    let code = match ply_launcher::run(&program, &root, argv, binds, count) {
+    let (answer, warnings) = ply_launcher::run(&program, &root, argv, binds, count).into_parts();
+    for warning in warnings {
+        eprintln!("{warning}");
+    }
+    let code = match answer {
         Ok(code) => code,
         Err(diagnostic) => {
             eprintln!("{diagnostic}");

@@ -14,7 +14,7 @@ nondet effect machine {
   read reload[m]() -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
-  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
@@ -49,6 +49,7 @@ type Diag = {
   fixes: List<Fix>,
 }
 type Raised = { diag: Diag, values: List<Value> }
+type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 
 fn main() -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
   match machine.load[m](\"inner\", None, None) {
@@ -57,7 +58,7 @@ fn main() -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.
         let doubled = machine.call[m](\"inner.double\", [VInt(21)]);
         let spent = machine.accounting[m]();
         machine.drop[m]();
-        match doubled {
+        match doubled.answer {
           Ok(v) -> match v { VInt(i) -> i + spent.steps, _ -> 0 - 2 },
           Err(_) -> 0 - 1,
         }

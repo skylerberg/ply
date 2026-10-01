@@ -29,13 +29,14 @@ nondet effect machine {
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
-  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Raised = { diag: Diag, values: List<Value> }
+type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 
 type Options = { host: Bool, trace: TraceOpts }
 type TraceOpts = { sink: String, level: String }
@@ -123,6 +124,7 @@ type Ended = {
   raised: Option<Raised>,
   counters: Counters,
   cycles: List<Diag>,
+  warnings: List<Diag>,
   stopping: Option<Stopping>,
   teardown: Teardown,
   trace: Option<Trace>,
@@ -180,18 +182,24 @@ fn project(inner: &str) -> tempfile::TempDir {
 }
 
 fn entered_with(inner: &str, host: bool) -> Value {
-    let project = project(inner);
-    let (front, unit) = built(OUTER);
-    let mut machine =
-        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
-    let mut registry = HostRegistry::new();
-    ply_machine::register_with(
-        &mut registry,
+    driven(
+        OUTER,
+        inner,
         ply_machine::drive::RunOptions {
             host,
             ..Default::default()
         },
-    );
+    )
+}
+
+/// `outer`'s answer over a root holding `inner`, its machine ops configured as `options` says.
+fn driven(outer: &str, inner: &str, options: ply_machine::drive::RunOptions) -> Value {
+    let project = project(inner);
+    let (front, unit) = built(outer);
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
+    let mut registry = HostRegistry::new();
+    ply_machine::register_with(&mut registry, options);
     let binding = registry.bind(&front.check).expect("the machine ops bind");
     machine.set_host_binding(Arc::new(binding));
     machine
@@ -203,6 +211,8 @@ fn entered_with(inner: &str, host: bool) -> Value {
             ],
             Span::DUMMY,
         )
+        .into_parts()
+        .0
         .expect("the outer main ran")
 }
 
@@ -299,6 +309,128 @@ fn main() -> Int = panic("the inner program's own bug")
     );
 }
 
+/// The outer program: bind `inner.main` and call it, answering how the call ended.
+const OUTER_CALLS_MAIN: &str = r#"
+import std.value (Value, VInt)
+
+nondet effect machine {
+  write configure[m](options: Options) -> Unit
+  read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read reuse[m](root: String, walked: Walked) -> Option<Target>
+  read reload[m](front: Front) -> Result<Target, Refusal>
+  read bound[m](entry: String) -> Result<Bound, Refusal>
+  write enter[m]() -> Ended
+  read call[m](name: String, args: List<Value>) -> Called
+  read accounting[m]() -> Accounting
+  write drop[m]() -> Unit
+}
+
+type Accounting = { steps: Int, micros: Int, counters: Counters }
+type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
+type Options = Unit
+type Target = Unit
+type Walked = Unit
+type Bound = Unit
+type Front = {
+  dump: Bytes,
+  files: List<{ path: String, name: String, text: Bytes }>,
+  read_ms: Int,
+  front_ms: Int,
+  file_ms: Int,
+  cached: Bool,
+}
+type Refusal = Unit
+type Ended = Unit
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+type Fix = { title: Bytes, edits: List<Edit> }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+type Raised = { diag: Diag, values: List<Value> }
+type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
+
+fn main(root: String, front: Front) -> Called / {machine.load[m], machine.bound[m], machine.call[m], machine.drop[m]} = {
+  let _loaded = machine.load[m](root, Some(front), None);
+  let _bound = machine.bound[m]("inner.main");
+  let called = machine.call[m]("inner.main", []);
+  machine.drop[m]();
+  called
+}
+"#;
+
+const LEAVES_A_SPAN: &str = r#"
+import std.trace
+import std.trace (trace)
+
+fn main() -> Int / {trace.write[orders]} = {
+  let order = trace.enter[orders]("order", map_new());
+  3
+}
+"#;
+
+/// Bound to the host, whose trace facility closes what an entry leaves open, with a sink that
+/// writes nothing.
+fn hosted_quietly() -> ply_machine::drive::RunOptions {
+    ply_machine::drive::RunOptions {
+        host: true,
+        trace: ply_machine::trace::TraceOptions::silent(),
+        ..Default::default()
+    }
+}
+
+/// The code and message of each diagnostic in a list the machine answered.
+fn diags(list: &Value) -> Vec<(String, String)> {
+    let Value::List(items) = list else {
+        panic!("diagnostics are a list, not {}", list.type_name());
+    };
+    let text = |d: &Value, name: &str| {
+        let bytes = field(d, name)
+            .as_bytes(Span::DUMMY, name)
+            .expect("a diagnostic's fields are bytes");
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    items
+        .iter()
+        .map(|d| (text(d, "code"), text(d, "message")))
+        .collect()
+}
+
+#[track_caller]
+fn warns_of_the_open_span(warnings: &Value) {
+    let warned = diags(warnings);
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0].0, ply_eval::codes::SPAN_ABANDONED, "{warned:?}");
+    assert!(warned[0].1.contains("`order` on `orders`"), "{warned:?}");
+}
+
+/// What `ply run` reads once the entry is over.
+#[test]
+fn an_entry_that_left_a_span_open_ends_with_w0609_beside_its_value() {
+    let answer = driven(OUTER, LEAVES_A_SPAN, hosted_quietly());
+    assert_eq!(option_value(field(&answer, "value")), Some(&vint(3)));
+    warns_of_the_open_span(field(&answer, "warnings"));
+}
+
+#[test]
+fn a_call_that_left_a_span_open_answers_w0609_beside_its_value() {
+    let answer = driven(OUTER_CALLS_MAIN, LEAVES_A_SPAN, hosted_quietly());
+    match field(&answer, "answer") {
+        Value::Ctor { name, args } if name.as_str() == "Ok" => {
+            assert_eq!(args.first(), Some(&vint(3)));
+        }
+        other => panic!("the call answered its value, not {other:?}"),
+    }
+    warns_of_the_open_span(field(&answer, "warnings"));
+}
+
 #[test]
 fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
     // The outer program panics with the refusal's first message; the outer machine raises it.
@@ -319,6 +451,8 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
             ],
             Span::DUMMY,
         )
+        .into_parts()
+        .0
         .expect_err("the outer main raises the refusal's message");
     assert!(raised.message.contains("unknown_name"), "{raised}");
 }
@@ -335,7 +469,7 @@ nondet effect machine {
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
-  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
@@ -343,6 +477,7 @@ nondet effect machine {
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Raised = { diag: Diag, values: List<Value> }
+type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 
 type Options = { host: Bool, trace: TraceOpts }
 type TraceOpts = { sink: String, level: String }
@@ -441,6 +576,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
         machine.set_host_binding(Arc::clone(&binding));
         machine
             .call(entry, args, Span::DUMMY)
+            .into_parts()
+            .0
             .expect("the entry ran")
     };
 
@@ -478,7 +615,7 @@ nondet effect machine {
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
-  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
@@ -486,6 +623,7 @@ nondet effect machine {
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Raised = { diag: Diag, values: List<Value> }
+type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 
 type TlsCred = { name: String, cert: String, key: String }
 type Named = { name: String, path: String }
@@ -646,6 +784,8 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
             ],
             Span::DUMMY,
         )
+        .into_parts()
+        .0
         .expect("the outer main ran");
     assert_eq!(answer, Value::Bool(true), "the configured host bound");
 }
@@ -665,7 +805,7 @@ nondet effect machine {
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
-  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
@@ -700,6 +840,7 @@ type Diag = {
   fixes: List<Fix>,
 }
 type Raised = { diag: Diag, values: List<Value> }
+type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
 fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
@@ -712,9 +853,9 @@ fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[
         let raised = machine.call[m]("inner.boom", []);
         let after_raised = machine.accounting[m]();
         machine.drop[m]();
-        match doubled {
+        match doubled.answer {
           Ok(v) -> match v {
-            VInt(i) -> match raised {
+            VInt(i) -> match raised.answer {
               Err(r) -> if bytes_index_of(r.diag.message, b"oh no") != None {
                 { value: i, steps: first.steps, reset: again.steps, raised_steps: after_raised.steps }
               } else { { value: 0 - 4, steps: 0, reset: 0, raised_steps: 0 } },
@@ -765,6 +906,8 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
             ],
             Span::DUMMY,
         )
+        .into_parts()
+        .0
         .expect("the outer main ran");
     let Value::Record(fields) = &answer else {
         panic!("the outer program answers a record, not {answer:?}");
@@ -809,7 +952,7 @@ nondet effect machine {
   read reload[m](front: Front) -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
-  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
@@ -844,12 +987,13 @@ type Diag = {
   fixes: List<Fix>,
 }
 type Raised = { diag: Diag, values: List<Value> }
+type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 type Spent = { answers: List<Int>, ran: Int, remembered: Int, both: Int, declined: Int }
 
 fn spent() -> Int / {machine.accounting[m]} = (machine.accounting[m]()).steps
 
-fn answered(r: Result<Value, Raised>) -> Int =
-  match r { Ok(v) -> match v { VInt(i) -> i, _ -> 0 - 2 }, Err(_) -> 0 - 1 }
+fn answered(c: Called) -> Int =
+  match c.answer { Ok(v) -> match v { VInt(i) -> i, _ -> 0 - 2 }, Err(_) -> 0 - 1 }
 
 fn main(root: String, front: Front) -> Spent / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
   let _loaded = machine.load[m](root, Some(front), None);
@@ -905,6 +1049,8 @@ fn a_memo_answer_and_a_decline_add_no_steps_to_the_accounting() {
             ],
             Span::DUMMY,
         )
+        .into_parts()
+        .0
         .expect("the outer main ran");
     let int = |value: &Value| {
         value

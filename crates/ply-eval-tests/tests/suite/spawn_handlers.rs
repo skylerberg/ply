@@ -64,7 +64,7 @@ fn every_order(name: &str) -> Vec<Vec<Step>> {
     let mut pending: Vec<Vec<u16>> = vec![Vec::new()];
     while let Some(path) = pending.pop() {
         machine.set_seed(Seed::at(0, path.clone()), DEFAULT_STEPS);
-        let outcome = machine.eval_test(index);
+        let (outcome, _) = machine.eval_test(index).into_parts();
         let record = machine
             .simulated()
             .unwrap_or_else(|| panic!("`{name}` ran no region: {outcome:?}"));

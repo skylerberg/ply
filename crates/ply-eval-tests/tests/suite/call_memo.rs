@@ -38,6 +38,8 @@ impl HostHandler for Counter {
 fn call(machine: &mut ply_eval::Machine<'_>, name: &str, args: Vec<Value>) -> Value {
     machine
         .call(name, args, Span::DUMMY)
+        .into_parts()
+        .0
         .unwrap_or_else(|d| panic!("`{name}` raised: {d:#?}"))
 }
 

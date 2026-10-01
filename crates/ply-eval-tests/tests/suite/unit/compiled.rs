@@ -47,7 +47,7 @@ fn first_test_under(
     entered: impl Fn() -> Entered + 'static,
 ) -> (Result<(), Diagnostic>, (u64, u64)) {
     let mut machine = machine_under(c, entered);
-    let outcome = machine.eval_test(0);
+    let (outcome, _) = machine.eval_test(0).into_parts();
     (outcome, machine.compiled_counts())
 }
 
@@ -122,6 +122,8 @@ fn an_entry_point_the_tier_declined_is_plys_defect_and_counted_as_declined() {
     let mut machine = machine_under(&c, || panic!("no test is entered here"));
     let d = machine
         .call("double", vec![Value::Int(21)], Span::DUMMY)
+        .into_parts()
+        .0
         .expect_err("a declined entry answers nothing");
     assert_eq!(d.code, codes::INTERNAL_ERROR, "{d:?}");
     assert!(

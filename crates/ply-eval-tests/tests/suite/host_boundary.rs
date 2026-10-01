@@ -3,7 +3,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, Pending,
 };
-use ply_eval::{Diagnostic, EffectAtom, Footprint, Mode, Resource, Symbol, Value, codes};
+use ply_eval::{Diagnostic, EffectAtom, Ended, Footprint, Mode, Resource, Symbol, Value, codes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -114,8 +114,11 @@ fn atom(effect: &str, resource: &str, mode: Mode) -> EffectAtom {
 }
 
 #[track_caller]
-fn diagnostic(outcome: Result<(), Diagnostic>) -> Diagnostic {
-    outcome.expect_err("the program was expected to fail")
+fn diagnostic(outcome: Ended<()>) -> Diagnostic {
+    outcome
+        .into_parts()
+        .0
+        .expect_err("the program was expected to fail")
 }
 
 const SEND: &str = r#"
@@ -201,7 +204,11 @@ fn a_bound_run_reaches_the_handler_and_records_what_it_reached() {
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.eval_test(0).expect("the bound run passes");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the bound run passes");
 
     assert_eq!(counter.calls(), 1);
     assert_eq!(machine.host_ops(), 1);
@@ -239,7 +246,11 @@ test/nondet "the double answers" {
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.eval_test(0).expect("the double answers it");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the double answers it");
 
     assert_eq!(counter.calls(), 0, "the host was never reached");
     assert_eq!(machine.host_ops(), 0);
@@ -333,6 +344,8 @@ test/nondet "captured after the send" {
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
+        .into_parts()
+        .0
         .expect("nothing irreversible happened after the capture");
     assert_eq!(counter.calls(), 1);
 }
@@ -354,7 +367,11 @@ test "three resumptions" {
     );
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(HostBinding::hermetic()));
-    machine.eval_test(0).expect("multi-shot is unaffected");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("multi-shot is unaffected");
     assert_eq!(machine.host_ops(), 0);
 }
 
@@ -531,7 +548,11 @@ test/nondet "the region's own handlers answer" {
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.eval_test(0).expect("the seeded handlers answer");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the seeded handlers answer");
     assert_eq!(counter.calls(), 0, "a bound handler was reached");
     assert!(
         machine.simulated().is_some(),
@@ -571,7 +592,11 @@ test/nondet "the region's own scheduler answers" {
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.eval_test(0).expect("the seeded scheduler answers");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the seeded scheduler answers");
     assert_eq!(
         counter.calls(),
         0,
@@ -625,6 +650,8 @@ fn an_answer_inside_the_declared_footprint_is_allowed() {
     )]));
     machine
         .eval_test(0)
+        .into_parts()
+        .0
         .expect("the mode atom covers the operation");
 }
 
@@ -652,7 +679,11 @@ fn a_declared_operation_atom_admits_that_operation_alone() {
 
     let mut machine = bound();
     machine.set_declared_footprint(named("send"));
-    machine.eval_test(0).expect("the operation is declared");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the operation is declared");
 
     let mut machine = bound();
     machine.set_declared_footprint(named("recv"));
@@ -708,7 +739,11 @@ test/nondet "waits" {
     machine.set_host_runtime(std::sync::Arc::new(|| {
         std::rc::Rc::new(Resolved7::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
     }));
-    machine.eval_test(0).expect("the token resolves");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the token resolves");
     assert_eq!(machine.host_ops(), 1);
 }
 
@@ -779,7 +814,11 @@ test/nondet "two tasks and a join" {
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.eval_test(0).expect("the production scheduler runs");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the production scheduler runs");
     assert_eq!(
         counter.calls(),
         0,
@@ -929,7 +968,11 @@ test/nondet "the sibling runs while one task waits" {
     machine.set_host_runtime(std::sync::Arc::new(|| {
         std::rc::Rc::new(Later::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
     }));
-    machine.eval_test(0).expect("both tasks finish");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("both tasks finish");
     assert_eq!(
         machine.host_use().expect("reached the host").operations,
         1,
@@ -1027,6 +1070,8 @@ test/nondet "each task reads its cell after the other's region closed" {
     }));
     machine
         .eval_test(0)
+        .into_parts()
+        .0
         .expect("both tasks read their own cells");
     assert_eq!(tier.declines().touched_cells, 0, "{:?}", tier.declines());
 }
@@ -1061,6 +1106,8 @@ test/nondet "the task first runs after the handle around its spawn ended" {
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
+        .into_parts()
+        .0
         .expect("the task answers from the handle that ended before it first ran");
     assert_eq!(
         probe.calls(),
@@ -1101,6 +1148,8 @@ test/nondet "every join answers its own task" {
     );
     machine
         .eval_test(0)
+        .into_parts()
+        .0
         .expect("each join answers its own task");
 }
 
@@ -1121,6 +1170,8 @@ test/nondet "every join of a kept task answers" {
     );
     machine
         .eval_test(0)
+        .into_parts()
+        .0
         .expect("each kept task answers both joins");
 }
 
@@ -1143,7 +1194,11 @@ test/nondet "the relayed task stays joinable" {
 }
 "#,
     );
-    machine.eval_test(0).expect("the relayed task answers");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("the relayed task answers");
 }
 
 #[test]
@@ -1170,5 +1225,9 @@ test/nondet "one operation, no tasks" {
     machine.set_host_runtime(std::sync::Arc::new(|| {
         std::rc::Rc::new(Resolved7::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
     }));
-    machine.eval_test(0).expect("block_on answers");
+    machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect("block_on answers");
 }

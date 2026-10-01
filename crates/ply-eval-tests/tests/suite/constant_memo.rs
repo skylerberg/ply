@@ -44,7 +44,10 @@ pub fn reads_literal(n: Int, sum: Int) -> Int =
 
 fn probe(c: &Compiled, name: &str) -> Result<Value, Diagnostic> {
     let mut machine = c.machine().with_max_calls(BUDGET);
-    machine.call(name, vec![Value::Int(400)], Span::DUMMY)
+    machine
+        .call(name, vec![Value::Int(400)], Span::DUMMY)
+        .into_parts()
+        .0
 }
 
 /// The budget's own refusal: a second `deep` under `nest` was evaluated rather than remembered.
@@ -64,6 +67,8 @@ fn counted(c: &Compiled, name: &str, args: Vec<Value>) -> (Value, u64) {
     let mut machine = machine.with_max_calls(BUDGET);
     let value = machine
         .call(name, args, Span::DUMMY)
+        .into_parts()
+        .0
         .unwrap_or_else(|d| panic!("`{name}` raised: {d:#?}"));
     (value, tier.steps())
 }
@@ -106,6 +111,8 @@ fn a_constant_the_memo_answers_counts_no_steps() {
     let mut constant = || {
         let value = machine
             .call("m.constant", vec![], Span::DUMMY)
+            .into_parts()
+            .0
             .unwrap_or_else(|d| panic!("`m.constant` raised: {d:#?}"));
         (value, tier.steps())
     };
@@ -123,6 +130,8 @@ fn a_constant_the_memo_answers_counts_no_steps() {
 fn ran(machine: &mut Machine<'_>, tier: &ply_codegen::Bodies) -> u64 {
     machine
         .call("m.parameterized", vec![Value::Int(0)], Span::DUMMY)
+        .into_parts()
+        .0
         .unwrap_or_else(|d| panic!("`m.parameterized` raised: {d:#?}"));
     let steps = tier.steps();
     assert!(steps > 0, "`m.parameterized` ran no body");
@@ -140,6 +149,8 @@ fn a_declined_entry_counts_no_steps() {
         let before = ran(&mut machine, &tier);
         machine
             .call(name, args, Span::DUMMY)
+            .into_parts()
+            .0
             .expect_err("the seam declines the offer");
         assert_eq!(
             tier.steps(),
@@ -148,8 +159,13 @@ fn a_declined_entry_counts_no_steps() {
         );
     }
     let before = ran(&mut machine, &tier);
-    tier.while_entered(|| machine.call("m.parameterized", vec![Value::Int(0)], Span::DUMMY))
-        .expect_err("an entry that arrives while another runs is declined");
+    tier.while_entered(|| {
+        machine
+            .call("m.parameterized", vec![Value::Int(0)], Span::DUMMY)
+            .into_parts()
+            .0
+    })
+    .expect_err("an entry that arrives while another runs is declined");
     assert_eq!(
         tier.steps(),
         0,
@@ -180,6 +196,8 @@ pub fn raced() -> Int / {sim.read} = simulate {
 fn called(machine: &mut Machine<'_>, name: &str) -> Value {
     machine
         .call(name, vec![], Span::DUMMY)
+        .into_parts()
+        .0
         .unwrap_or_else(|d| panic!("`{name}` raised: {d:#?}"))
 }
 

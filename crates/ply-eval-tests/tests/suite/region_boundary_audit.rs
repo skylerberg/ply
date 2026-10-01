@@ -127,6 +127,8 @@ fn the_parked_continuation_runs_on_the_tier_and_reads_its_regions_cell() {
 
     machine
         .eval_test(test)
+        .into_parts()
+        .0
         .expect("the resumed body reads 41 from the closed region's cell");
 
     assert_eq!(tier.declines().total(), 0, "{:?}", tier.declines());
@@ -145,6 +147,8 @@ fn two_entries_on_one_tier_each_resume_the_continuation_they_parked() {
     ] {
         machine
             .eval_test(compiled.index_of(name))
+            .into_parts()
+            .0
             .unwrap_or_else(|d| panic!("{name}: {d:#?}"));
     }
 
@@ -160,6 +164,8 @@ fn a_continuation_in_an_entrys_answer_is_the_programs_error_and_no_decline() {
 
     let d = machine
         .call("m.parked", vec![], Span::DUMMY)
+        .into_parts()
+        .0
         .expect_err("a continuation does not leave the entry that captured it");
 
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{d:#?}");
@@ -191,6 +197,8 @@ fn a_constant_the_seam_refuses_keeps_no_continuation_for_the_next_entry() {
     for entry in 0..2 {
         let d = machine
             .call("m.parked", vec![], Span::DUMMY)
+            .into_parts()
+            .0
             .expect_err("a continuation does not cross out of the tier");
         assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "entry {entry}");
     }
@@ -198,6 +206,8 @@ fn a_constant_the_seam_refuses_keeps_no_continuation_for_the_next_entry() {
 
     machine
         .eval_test(compiled.index_of("the parked continuation still reads its region's cell"))
+        .into_parts()
+        .0
         .expect("the test parks and resumes a continuation of its own");
 }
 
@@ -220,6 +230,8 @@ fn a_task_in_an_entrys_answer_is_refused_as_a_continuation_is() {
 
     let d = machine
         .call("m.spawned", vec![], Span::DUMMY)
+        .into_parts()
+        .0
         .expect_err("a task does not leave the region that spawned it");
 
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{d:#?}");
@@ -253,6 +265,8 @@ fn a_task_carried_into_another_region_fails_its_join_rather_than_answering_a_str
 
     let d = machine
         .call("m.rejoined", vec![], Span::DUMMY)
+        .into_parts()
+        .0
         .expect_err("the handle names a task of the first region");
 
     assert_eq!(d.code, codes::TASK_ESCAPES_SCOPE, "{d:#?}");
@@ -297,6 +311,8 @@ fn a_cell_from_another_arena_is_refused_at_the_entry_point() {
     let d = compiled
         .machine()
         .call("m.identity", vec![cell], Span::DUMMY)
+        .into_parts()
+        .0
         .expect_err("a cell may not enter a run");
 
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY);
@@ -320,6 +336,8 @@ fn a_continuation_from_another_entry_is_refused_at_the_entry_point() {
     let d = compiled
         .machine()
         .call("m.resume_it", vec![saved], Span::DUMMY)
+        .into_parts()
+        .0
         .expect_err("a continuation may not enter a run");
 
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{}", d.message);
@@ -338,6 +356,8 @@ fn data_still_crosses_the_entry_point() {
         compiled
             .machine()
             .call("m.identity", vec![Value::Int(7)], Span::DUMMY)
+            .into_parts()
+            .0
             .expect("an `Int` is data"),
         Value::Int(7)
     );
@@ -391,7 +411,11 @@ fn a_handler_may_not_answer_with_the_boundarys_own_code() {
     let mut machine = compiled.machine();
     machine.set_host_binding(Arc::new(binding));
 
-    let d = machine.eval_test(0).expect_err("the handler refused");
+    let d = machine
+        .eval_test(0)
+        .into_parts()
+        .0
+        .expect_err("the handler refused");
     assert_eq!(
         d.code,
         codes::RUNTIME_ERROR,
@@ -467,6 +491,8 @@ fn a_constant_whose_body_opens_a_region_answers_every_run() {
     for run in 0..3 {
         machine
             .eval_test(0)
+            .into_parts()
+            .0
             .unwrap_or_else(|d| panic!("run {run} must answer what the cell held: {d:#?}"));
     }
 }
