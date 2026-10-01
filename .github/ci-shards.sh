@@ -100,6 +100,7 @@ TREE_CHECKS=(
   "ply-eval-tests:suite:armed::the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
   "ply-eval-tests:suite:armed::no_allowlist_entry_has_outlived_its_reason"
   "ply-eval-tests:suite:armed::ambiguous_enum_names_are_declared"
+  "ply-cli-tests:suite:fixtures::every_fixture_is_listed"
   "ply-cli-tests:suite:fmt::the_maintained_sources_are_committed_formatted"
   "ply-cli-tests:suite:tree::every_test_file_is_declared_and_every_declaration_has_a_file"
   "ply-cli-tests:suite:tree::the_harness_is_the_only_place_the_ply_binary_is_named"
