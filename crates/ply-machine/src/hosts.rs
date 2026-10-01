@@ -645,120 +645,35 @@ const EFFECT: &str = "tcb";
 
 const PREVIEW: &str = "ply_machine::hosts::preview";
 
-const OPEN: &str = "ply_machine::hosts::open";
-
 /// The module the payload's constructors are declared in, as a program-wide name.
 const PAYLOAD: &str = "hosts";
 
-/// Assembled before the program is entered: a load and a backend are the compiler's work, and
-/// the compiler is not something to re-enter from inside a running program.
-/// What `ply hosts` is configured with, as plain data: the program's parse converts into this.
-#[derive(Clone, Debug)]
-pub struct HostsOptions {
-    pub path: std::path::PathBuf,
-    /// The front end the CLI ran, handed over with the asking.
-    pub front: Option<crate::driver::HandedFront>,
-    pub host: bool,
-    pub json: bool,
-    pub digest: bool,
-    pub tls: crate::options::TlsOptions,
-    pub fs: Vec<ply_host::fs::RootSpec>,
-    pub config: crate::config::ConfigOptions,
-    pub trace: crate::trace::TraceOptions,
-    pub shutdown: crate::options::ShutdownOptions,
-}
-
-/// The ops and the one handler serving them: nothing is assembled before the program asks, and
-/// its path and options come with the asking.
-impl HostsOptions {
-    /// The preview is hermetic: nothing is bound.
-    pub fn hermetic(path: std::path::PathBuf) -> HostsOptions {
-        HostsOptions::of(path, crate::drive::RunOptions::default())
-    }
-
-    pub fn of(path: std::path::PathBuf, o: crate::drive::RunOptions) -> HostsOptions {
-        HostsOptions {
-            path,
-            front: o.front,
-            host: o.host,
-            json: false,
-            digest: false,
-            tls: o.tls,
-            fs: o.fs,
-            config: o.config,
-            trace: o.trace,
-            shutdown: o.shutdown,
-        }
-    }
-}
-
 pub fn lent() -> Vec<Lent> {
-    let facility: Arc<dyn HostHandler> = Arc::new(Facility {
-        assembled: std::sync::Mutex::new(None),
-    });
-    vec![
-        (registration("preview", PREVIEW), Arc::clone(&facility)),
-        (registration("open", OPEN), facility),
-    ]
-}
-
-fn registration(op: &str, path: &'static str) -> HostOp {
-    HostOp {
+    let op = HostOp {
         effect: Symbol::new(EFFECT),
-        op: Symbol::new(op),
+        op: Symbol::new("preview"),
         resource: HostResource::Any,
         // The flags, the tree and the process environment are not functions of program state.
         determinism: Determinism::Nondeterministic,
-        // One binding serves the whole command, so a second perform reads the same one.
         linearity: Linearity::Repeatable,
         blocking: false,
         secrets: false,
-        path,
-    }
+        path: PREVIEW,
+    };
+    vec![(op, Arc::new(Facility))]
 }
 
-struct Facility {
-    assembled: std::sync::Mutex<Option<Assembled>>,
-}
-
-impl Facility {
-    fn assembled(&self, options: HostsOptions) -> std::sync::MutexGuard<'_, Option<Assembled>> {
-        let mut held = self.assembled.lock().unwrap_or_else(|e| e.into_inner());
-        if held.is_none() {
-            *held = Some(Assembled::of(&options));
-        }
-        held
-    }
-}
+struct Facility;
 
 impl HostHandler for Facility {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
             ("preview", [path, options, front]) => {
-                let mut o = crate::drive::run_options_of(options, span)?;
-                o.front = Some(crate::driver::handed_front_of(front, span)?);
-                let options = HostsOptions::of(
-                    std::path::PathBuf::from(path.as_str(span, "the project's path")?),
-                    o,
-                );
-                self.assembled(options)
-                    .as_ref()
-                    .expect("assembled")
-                    .preview()
-            }
-            ("open", [path, options, front]) => {
-                let mut o = crate::drive::run_options_of(options, span)?;
-                o.front = Some(crate::driver::handed_front_of(front, span)?);
-                o.host = true;
-                let options = HostsOptions::of(
-                    std::path::PathBuf::from(path.as_str(span, "the project's path")?),
-                    o,
-                );
-                self.assembled(options)
-                    .as_ref()
-                    .expect("assembled")
-                    .binding()
+                let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
+                let options = crate::drive::run_options_of(options, span)?;
+                let front = crate::driver::handed_front_of(front, span)?;
+                Assembled::of(&path, &options, &front).preview()
             }
             (other, _) => return Err(unregistered(other, span)),
         };
@@ -766,7 +681,7 @@ impl HostHandler for Facility {
     }
 }
 
-/// The binding this invocation's flags define, resolved once and then only read.
+/// The binding this invocation's flags define.
 struct Assembled {
     /// The `Stage` constructor the program matches on, by simple name.
     stage: &'static str,
@@ -781,27 +696,12 @@ struct Assembled {
 }
 
 impl Assembled {
-    fn of(args: &crate::hosts::HostsOptions) -> Assembled {
-        // The front end is the CLI's: it ran the compiler over this tree and handed the answer with
-        // the asking, so nothing here reads a path twice. A preview without one is a caller that did
-        // not ask `tcb`, which is a defect rather than a refusal to report.
-        let Some(front) = &args.front else {
-            return Assembled::refused(
-                "NotLoaded",
-                String::new(),
-                vec![
-                    Diagnostic::error(
-                        ply_eval::codes::INTERNAL_ERROR,
-                        "the CLI handed no front end over, and this side runs none",
-                    )
-                    .note(
-                        "the CLI walks the tree and runs the compiler before it asks for a binding",
-                    ),
-                ],
-                SourceMap::new(),
-            );
-        };
-        let loaded = match crate::driver::load_over_front(&args.path, front) {
+    fn of(
+        path: &std::path::Path,
+        options: &crate::drive::RunOptions,
+        front: &crate::driver::HandedFront,
+    ) -> Assembled {
+        let loaded = match crate::driver::load_over_front(path, front) {
             Ok(loaded) => loaded,
             Err(err) => {
                 return Assembled::refused(
@@ -813,7 +713,7 @@ impl Assembled {
             }
         };
         let root = loaded.root.display().to_string();
-        match bind(args, &loaded) {
+        match bind(options, &loaded) {
             Ok(bound) => Assembled {
                 stage: "Bound",
                 root,
@@ -859,6 +759,7 @@ impl Assembled {
                 PlyValue::list(self.listing.rows.iter().map(row_value).collect()),
             ),
             ("digest", PlyValue::str(&self.digest)),
+            ("hermetic", PlyValue::Bool(self.hermetic)),
             (
                 "transport",
                 option(d.transport.as_ref().map(transport_value)),
@@ -880,16 +781,6 @@ impl Assembled {
             ("places", places_value(&self.sources)),
         ])
     }
-
-    fn binding(&self) -> PlyValue {
-        record(vec![
-            (
-                "label",
-                PlyValue::str(if self.hermetic { "hermetic" } else { "host" }),
-            ),
-            ("hermetic", PlyValue::Bool(self.hermetic)),
-        ])
-    }
 }
 
 /// What the host flags open, over a program that loaded.
@@ -903,7 +794,7 @@ struct Bound {
 /// The stage that refused, and why.
 type Refusal = (&'static str, Vec<Diagnostic>);
 
-fn bind(args: &crate::hosts::HostsOptions, loaded: &crate::load::Loaded) -> Result<Bound, Refusal> {
+fn bind(args: &crate::drive::RunOptions, loaded: &crate::load::Loaded) -> Result<Bound, Refusal> {
     // Whether or not `--host` was passed: a digest that moved with a flag would pin nothing.
     let trace = args.trace.open();
     let stopping = ply_host::signal::Shutdown::new(args.shutdown.bounds());

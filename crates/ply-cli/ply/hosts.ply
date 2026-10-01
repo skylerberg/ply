@@ -20,7 +20,6 @@ import style (Style, plain, red)
 // The trusted computing base, as the Rust side assembles it under the host flags.
 pub nondet effect tcb {
   read preview[r](root: String, options: machine::Options, front: Front) -> Preview
-  write open[r](root: String, options: machine::Options, front: Front) -> Binding
 }
 
 // --- What the Rust side answers with ----------------------------------------
@@ -103,6 +102,8 @@ pub type Preview = {
   handlers: Int,
   rows: List<Row>,
   digest: String,
+  // Whether the run binds nothing, which is so unless `--host` was passed.
+  hermetic: Bool,
   transport: Option<Transport>,
   filesystem: Option<Filesystem>,
   configuration: Option<Configuration>,
@@ -111,8 +112,6 @@ pub type Preview = {
   diags: List<Diag>,
   places: List<Place>,
 }
-
-pub type Binding = { label: String, hermetic: Bool }
 
 // --- Small things -----------------------------------------------------------
 
@@ -436,14 +435,14 @@ fn shutdown_json(t: Stopping) -> Json =
     { key: "drain_ms", value: num(t.drain_ms) },
   ])
 
-fn report_json(p: Preview, b: Binding) -> Json = {
+fn report_json(p: Preview) -> Json = {
   let head: List<Member> = [
     { key: "command", value: Str("hosts") },
     { key: "schema_version", value: num(schema_version()) },
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: num(ok_code()) },
     { key: "root", value: Str(p.root) },
-    { key: "binding", value: Str(b.label) },
+    { key: "binding", value: Str(if p.hermetic { "hermetic" } else { "host" }) },
     { key: "handlers", value: num(p.handlers) },
     { key: "operations", value: num(len(p.rows)) },
     { key: "digest", value: Str(p.digest) },
@@ -503,22 +502,22 @@ fn indented(lines: List<String>) -> List<String> =
   map(lines, |l: String| if l == "" { "" } else { ind() ++ l })
 
 // The listing opens on a blank line, as every other report does.
-fn text_lines(p: Preview, b: Binding) -> List<String> = {
-  let body = if b.hermetic { hermetic_lines(p) } else { listing_lines(p) };
+fn text_lines(p: Preview) -> List<String> = {
+  let body = if p.hermetic { hermetic_lines(p) } else { listing_lines(p) };
   appended([""], indented(body))
 }
 
 // `--digest` is the one line a CI check pins: not the listing, and not the warnings under it.
-fn answered(s: Style, flags: Flags, p: Preview, b: Binding) -> Answer = {
-  let lines = if flags.digest { [p.digest] } else { text_lines(p, b) };
+fn answered(s: Style, flags: Flags, p: Preview) -> Answer = {
+  let lines = if flags.digest { [p.digest] } else { text_lines(p) };
   let errs = if flags.digest { [] } else { all_to_text(s, p.diags, p.places) };
-  { json: report_json(p, b), lines: lines, errs: errs, code: ok_code() }
+  { json: report_json(p), lines: lines, errs: errs, code: ok_code() }
 }
 
 pub fn run(
   flags: Flags,
   options: machine::Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tcb.preview[host], tcb.open[host]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tcb.preview[host]} = {
   let s: Style = style_of(flags);
   let t: Timed = timed_uncached(flags.paths);
   match t.program.whole {
@@ -536,13 +535,13 @@ fn binding_over(
   flags: Flags,
   options: machine::Options,
   front: Front,
-) -> Answer / {tcb.preview[host], tcb.open[host]} = {
+) -> Answer / {tcb.preview[host]} = {
   let p: Preview = tcb.preview[host](root_of(flags), options, front);
   match p.stage {
     NotLoaded -> refused(s, "hosts", p.diags, p.places),
     NotResolved -> unresolved(s, p),
     NotBound -> unbound(s, p.diags, p.places),
-    Bound -> answered(s, flags, p, tcb.open[host](root_of(flags), options, front)),
+    Bound -> answered(s, flags, p),
   }
 }
 
@@ -569,6 +568,7 @@ fn nothing() -> Preview =
     handlers: 0,
     rows: [],
     digest: "b3:000000000000",
+    hermetic: false,
     transport: None,
     filesystem: None,
     configuration: None,
@@ -590,10 +590,6 @@ fn listed() -> Preview =
     ],
     digest: "b3:1f2e3d4c5b6a",
   }
-
-fn hermetic() -> Binding = { label: "hermetic", hermetic: true }
-
-fn bound() -> Binding = { label: "host", hermetic: false }
 
 fn flags_of(json: Bool, digest: Bool) -> Flags = { ..no_flags(), json: json, digest: digest }
 
@@ -754,17 +750,16 @@ test "the configuration block counts its sources and never prints a secret's val
   assert(!string_contains(joined(lines, "\n"), "hunter2"))
 }
 
-// The run's own answer, over a binding the test hands it in place of the Rust side.
-fn answered_over(p: Preview, b: Binding, flags: Flags) -> Answer =
+// The run's own answer, over a preview the test hands it in place of the Rust side.
+fn answered_over(p: Preview, flags: Flags) -> Answer =
   handle {
     binding_over(plain(), flags, machine::default_options(), no_front())
   } with {
     tcb.preview[host](root, options, front) -> p,
-    tcb.open[host](root, options, front) -> b,
   }
 
 test "the listing opens on a blank line and every other line is indented" {
-  let answer = answered_over(listed(), bound(), flags_of(false, false));
+  let answer = answered_over(listed(), flags_of(false, false));
   assert_eq(answer.code, 0);
   assert_eq(at(answer.lines, 0, "?"), "");
   assert_eq(
@@ -776,20 +771,20 @@ test "the listing opens on a blank line and every other line is indented" {
 }
 
 test "`--digest` writes the one line a CI check pins and nothing else" {
-  let answer = answered_over(listed(), bound(), flags_of(false, true));
+  let answer = answered_over(listed(), flags_of(false, true));
   assert_eq(answer.lines, ["b3:1f2e3d4c5b6a"]);
   assert_eq(answer.errs, []);
   assert_eq(answer.code, 0)
 }
 
 test "a hermetic run lists nothing and says what would bind" {
-  let answer = answered_over(listed(), hermetic(), flags_of(false, false));
+  let answer = answered_over({ ..listed(), hermetic: true }, flags_of(false, false));
   assert_eq(at(answer.lines, 1, ""), ind() ++ "hermetic — no host handler is bound");
   assert_eq(len(answer.lines), 4)
 }
 
 test "the object keys off `command` and `exit_code`, and carries the rows and the binding" {
-  let text = to_string(answered_over(listed(), bound(), flags_of(true, false)).json);
+  let text = to_string(answered_over(listed(), flags_of(true, false)).json);
   assert(string_contains(text, "\"command\":\"hosts\""));
   assert(string_contains(text, "\"exit_code\":0"));
   assert(string_contains(text, "\"binding\":\"host\""));
@@ -811,7 +806,7 @@ test "a binding that could not be opened is exit 2 with the tally under it" {
     fixes: [],
   };
   let refused: Preview = { ..nothing(), stage: NotBound, diags: [refusal] };
-  let answer = answered_over(refused, bound(), flags_of(false, false));
+  let answer = answered_over(refused, flags_of(false, false));
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, []);
   assert_eq(answer.errs, [
@@ -832,7 +827,7 @@ test "a registration that does not resolve is exit 2 with no tally" {
     fixes: [],
   };
   let refused: Preview = { ..nothing(), stage: NotResolved, diags: [refusal] };
-  let answer = answered_over(refused, bound(), flags_of(false, false));
+  let answer = answered_over(refused, flags_of(false, false));
   assert_eq(answer.code, 2);
   assert_eq(answer.errs, ["Error[W0604]: `db.get[users]` has no handler"])
 }
@@ -849,7 +844,7 @@ test "a program that does not load is the load's own refusal" {
     fixes: [],
   };
   let unloadable: Preview = { ..nothing(), stage: NotLoaded, diags: [broken] };
-  let answer = answered_over(unloadable, bound(), flags_of(false, false));
+  let answer = answered_over(unloadable, flags_of(false, false));
   assert_eq(answer.code, 2);
   assert_eq(answer.errs, ["Error[E0201]: type mismatch", ind() ++ "compilation failed (1 error)"])
 }
