@@ -414,7 +414,7 @@ fn land(built: &Path, target: &Path) -> PathBuf {
     if std::fs::rename(built, target).is_ok() {
         return target.to_path_buf();
     }
-    let tmp = target.with_extension(format!("{}.otmp", std::process::id()));
+    let tmp = ply_eval::files::temp_beside(target);
     if std::fs::copy(built, &tmp).is_ok() && std::fs::rename(&tmp, target).is_ok() {
         let _ = std::fs::remove_file(built);
         return target.to_path_buf();

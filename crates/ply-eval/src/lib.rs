@@ -15,6 +15,7 @@ pub mod compiled;
 pub mod decode;
 pub mod escape;
 pub mod expr;
+pub mod files;
 mod footprint;
 pub mod handler;
 mod hash;
