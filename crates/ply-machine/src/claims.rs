@@ -10,7 +10,7 @@
 //! `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
 
 use crate::config::Configuration;
-use crate::engine::{Fault, Interleaved, Judgement, Mode, Obligation};
+use crate::engine::{Interleaved, Judgement, Mode, Obligation};
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, ctor, diags_value, places_value, record, strings};
@@ -84,13 +84,13 @@ pub struct Job {
     /// The obligations the program owes, as it built them.
     pub obligations: Vec<Obligation>,
     pub use_cache: bool,
-    /// `None` for a command that binds nothing at all, which is every `ply review`.
+    /// What `--host` binds, which a `law/host` is discharged against; `None` without it, which
+    /// is every `ply review`.
     pub binding: Option<Binding>,
 }
 
-/// What a `law/host` is discharged against, and what a hermetic run refuses to reach.
+/// What a `law/host` is discharged against.
 pub struct Binding {
-    pub host: bool,
     pub tls: crate::options::TlsOptions,
     pub fs: Vec<ply_host::fs::RootSpec>,
     pub config: crate::config::ConfigOptions,
@@ -586,7 +586,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
         sources: loaded.sources.clone(),
         warnings: std::mem::take(&mut warnings),
         obligations: obligations.len(),
-        host: job.binding.as_ref().is_some_and(|b| b.host),
+        host: job.binding.is_some(),
     }))));
 
     // Built by the first step that runs an obligation, and kept: every batch a discharge judges
@@ -742,7 +742,7 @@ impl Judging {
                     self.obligations.len(),
                 ))];
             }
-            (_, Err(fault)) => return vec![Judgement::Faulted(*fault.diagnostic)],
+            (_, Err(fault)) => return vec![Judgement::Faulted(fault)],
         };
         self.keep(judgements.warnings);
         judgements.each
@@ -766,7 +766,7 @@ impl Judging {
                 seed,
                 steps,
             ),
-            Err(fault) => return Interleaved::faulted(*fault.diagnostic),
+            Err(fault) => return Interleaved::faulted(fault),
         };
         self.keep(std::mem::take(&mut run.warnings));
         run
@@ -802,13 +802,13 @@ fn prepare(job: &Job, loaded: &Loaded, step_budget: i64) -> Result<Prepared, Ref
         None => None,
         Some(binding) => {
             let (configuration, opened) =
-                Configuration::open(&loaded.check, binding.host, &binding.config, &constant)
+                Configuration::open(&loaded.check, true, &binding.config, &constant)
                     .map_err(&unbound)?;
             warnings.extend(opened);
             Some(
                 Hosts::open(
                     &loaded.check,
-                    binding.host,
+                    true,
                     &binding.tls,
                     &binding.fs,
                     configuration,
@@ -818,13 +818,10 @@ fn prepare(job: &Job, loaded: &Loaded, step_budget: i64) -> Result<Prepared, Ref
             )
         }
     };
-    let hosting = hosts
-        .as_ref()
-        .filter(|_| job.binding.as_ref().is_some_and(|b| b.host))
-        .map(|hosts| crate::engine::Hosting {
-            binding: hosts.binding(),
-            runtime: hosts.runtime_factory(),
-        });
+    let hosting = hosts.as_ref().map(|hosts| crate::engine::Hosting {
+        binding: hosts.binding(),
+        runtime: hosts.runtime_factory(),
+    });
     Ok(Prepared {
         _hosts: hosts,
         judging: Arc::new(Judging {
@@ -839,7 +836,7 @@ fn prepare(job: &Job, loaded: &Loaded, step_budget: i64) -> Result<Prepared, Ref
 }
 
 /// The values plain values name, on the thread that judges them.
-fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<Value>>, Fault> {
+fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<Value>>, Diagnostic> {
     points
         .iter()
         .map(|point| {
@@ -849,15 +846,12 @@ fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<Value>>, Fault> 
                 .collect::<Result<Vec<Value>, _>>()
         })
         .collect::<Result<_, _>>()
-        .map_err(|why| Fault {
-            bindings: Vec::new(),
-            diagnostic: Box::new(
-                Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    format!("a point the program drew is no runtime value: {why}"),
-                )
-                .note("the program draws only values of its claims' types; this is Ply's fault"),
-            ),
+        .map_err(|why| {
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("a point the program drew is no runtime value: {why}"),
+            )
+            .note("the program draws only values of its claims' types; this is Ply's fault")
         })
 }
 
@@ -1100,8 +1094,7 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
             .as_str(span, name)
             .map(str::to_string)
     };
-    let host = bool_at("host")?;
-    let binding = if host {
+    let binding = if bool_at("host")? {
         let tls_list = field_of(v, "tls", span)?;
         let mut tls = Vec::new();
         for item in tls_list.as_list(span, "tls")?.iter() {
@@ -1128,7 +1121,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
         let config = field_of(v, "config", span)?;
         let trace = field_of(v, "trace", span)?;
         Some(Binding {
-            host,
             tls: crate::options::TlsOptions {
                 tls,
                 trust: str_list_at(v, "trust", span)?
