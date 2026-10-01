@@ -1,7 +1,7 @@
 //! The program a unit compiles out of: the front end's answer over it, and each module's text.
 //! Every table here is read from a [`Front`].
 
-use ply_eval::{Front, SourceId, SourceMap, Span, Symbol};
+use ply_eval::{EmitterRoot, Front, SourceId, SourceMap, Span, Symbol};
 use std::collections::{HashMap, HashSet};
 use std::sync::{PoisonError, RwLock};
 
@@ -38,8 +38,8 @@ struct Tables {
     arities: HashMap<String, usize>,
     /// Roots whose parameters and answer are all `Int` or `Bool`.
     scalars: HashSet<String>,
-    /// Roots whose scheme mentions a fixed-width type, which the compiled seam cannot carry.
-    widths: HashSet<String>,
+    /// Each root's place in [`Front::emitter_roots`].
+    rows: HashMap<String, usize>,
     /// Roots the compiler published pure.
     pures: HashSet<String>,
     /// Pure roots of no arguments, which a unit gives memo slots.
@@ -69,11 +69,11 @@ impl Tables {
                 .filter(|r| r.scalar)
                 .map(|r| r.root.to_string())
                 .collect(),
-            widths: front
+            rows: front
                 .emitter_roots
                 .iter()
-                .filter(|r| r.width)
-                .map(|r| r.root.to_string())
+                .enumerate()
+                .map(|(i, r)| (r.root.to_string(), i))
                 .collect(),
             pures: front
                 .emitter_roots
@@ -202,9 +202,10 @@ impl Source {
         self.tables.arities.get(name).copied()
     }
 
-    /// Whether the root's scheme mentions a fixed-width type.
-    pub fn mentions_width(&self, name: &str) -> bool {
-        self.tables.widths.contains(name)
+    /// The row the compiler published for `name`, which says how its values read.
+    pub fn row(&self, name: &str) -> Option<&'static EmitterRoot> {
+        let front: &'static Front = self.front;
+        self.tables.rows.get(name).map(|&i| &front.emitter_roots[i])
     }
 
     /// Whether every parameter and the answer are `Int` or `Bool`.

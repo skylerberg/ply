@@ -4,8 +4,8 @@ use ply_eval::host::{
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{
-    Diagnostic, EffectAtom, Footprint, Machine, Mode, Resource, Symbol, TaskHandle, TaskId, Value,
-    codes,
+    Diagnostic, EffectAtom, Footprint, Machine, Mode, Resource, SimId, Symbol, TaskHandle, TaskId,
+    Value, codes,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -341,9 +341,10 @@ fn a_fabricated_task_handle_from_a_host_answer_is_refused() {
 
     impl HostHandler for Fake {
         fn call(&self, _: &dyn HostRuntime, _: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-            Ok(HostAnswer::Value(Value::Task(TaskHandle::unowned(TaskId(
-                9999,
-            )))))
+            Ok(HostAnswer::Value(Value::Task(TaskHandle::unowned(
+                SimId(0),
+                TaskId(9999),
+            ))))
         }
     }
 

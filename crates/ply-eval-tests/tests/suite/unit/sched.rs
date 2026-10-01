@@ -1,11 +1,13 @@
 use ply_eval::arena::Slot;
 use ply_eval::cont::SimId;
 use ply_eval::host::{HostRuntime, MachineId, Pending};
-use ply_eval::region::Trail;
+use ply_eval::region::{StepSite, Trail};
 use ply_eval::sched::*;
 use ply_eval::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use ply_eval::sim::{Answer, Handlers, signature};
-use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskHandle, Value, codes};
+use ply_eval::{
+    Diagnostic, EffectAtom, Mode, Resource, SourceId, Span, Symbol, TaskHandle, Value, codes,
+};
 
 type Sched = Scheduler<usize, Value>;
 type Choice = Turn<usize, Value>;
@@ -143,7 +145,11 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                             }
                             sched.suspend(suspended(), Value::Int(id.0 as i64))?;
                         }
-                        Act::Join(id) => sched.join(suspended(), TaskId(id), Span::DUMMY)?,
+                        Act::Join(id) => sched.join(
+                            suspended(),
+                            &TaskHandle::unowned(SimId(0), TaskId(id)),
+                            Span::DUMMY,
+                        )?,
                         Act::Sleep(nanos) => {
                             let answer = handlers.dispatch(
                                 signature("clock", "sleep").expect("declared"),
@@ -549,10 +555,57 @@ fn joining_a_task_this_region_never_created_is_a_scope_error() {
         panic!("expected the root's step");
     };
     let err = sched
-        .join(suspended(), TaskId(7), Span::DUMMY)
+        .join(
+            suspended(),
+            &TaskHandle::unowned(SimId(0), TaskId(7)),
+            Span::DUMMY,
+        )
         .expect_err("no such task");
     assert_eq!(err.code, codes::TASK_ESCAPES_SCOPE);
     assert!(err.message.contains("@7"));
+}
+
+/// Both regions number a task `@1`, so a join by id alone would answer the other region's task.
+#[test]
+fn joining_another_regions_task_fails_rather_than_answering_this_regions_namesake() {
+    let (mut first, mut clock, mut trail) = solo(0);
+    let Turn::Run { .. } = first
+        .next(&mut clock, &mut trail)
+        .expect("the root is enabled")
+    else {
+        panic!("expected the first region's root");
+    };
+    let stranger = first.spawn(Value::Int(1), Span::DUMMY);
+
+    let mut second: Sched = Scheduler::new(SimId(1), Span::DUMMY);
+    let (mut clock, mut trail) = (Clock::new(), Trail::new(Seed::root(0)));
+    let Turn::Run { .. } = second
+        .next(&mut clock, &mut trail)
+        .expect("the root is enabled")
+    else {
+        panic!("expected the second region's root");
+    };
+    let namesake = second.spawn(Value::Int(2), Span::DUMMY);
+    assert_eq!(
+        namesake.id(),
+        stranger.id(),
+        "each region numbers from `@1`"
+    );
+
+    let err = second
+        .join(suspended(), &stranger, Span::DUMMY)
+        .expect_err("the handle names a task of the first region");
+    assert_eq!(err.code, codes::TASK_ESCAPES_SCOPE);
+    assert!(err.message.contains("another region"), "{}", err.message);
+    assert_ne!(
+        Value::Task(stranger),
+        Value::Task(namesake.clone()),
+        "two regions' tasks are not one value"
+    );
+
+    second
+        .join(suspended(), &namesake, Span::DUMMY)
+        .expect("its own task is still joinable");
 }
 
 #[test]
@@ -583,6 +636,14 @@ fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> Access {
     ))
 }
 
+/// The site `at` bytes into source 0, in the definition `definition`.
+fn site(definition: &str, at: u32) -> StepSite {
+    StepSite {
+        definition: Some(Symbol::new(definition)),
+        span: Span::new(SourceId(0), at, at + 1),
+    }
+}
+
 #[test]
 fn the_schedulers_own_bookkeeping_is_not_an_access_but_a_draw_is() {
     let (mut sched, mut clock, mut trail) = solo(0);
@@ -592,18 +653,78 @@ fn the_schedulers_own_bookkeeping_is_not_an_access_but_a_draw_is() {
     else {
         panic!("expected the root's step");
     };
-    trail.record_access(atom("task", None, Mode::Write));
-    trail.record_access(atom("clock", None, Mode::Read));
-    trail.record_access(atom("clock", None, Mode::Write));
+    trail.record_access(atom("task", None, Mode::Write), site("m.f", 0));
+    trail.record_access(atom("clock", None, Mode::Read), site("m.f", 1));
+    trail.record_access(atom("clock", None, Mode::Write), site("m.f", 2));
     assert_eq!(trail.steps()[0].accesses.len(), 0);
+    assert_eq!(trail.steps()[0].site, None, "bookkeeping places no step");
 
-    trail.record_access(atom("random", None, Mode::Write));
-    trail.record_access(atom("db", Some("orders"), Mode::Write));
-    trail.record_access(Access::Cell {
-        id: Slot::new(3, 0),
-        mode: Mode::Write,
-    });
+    trail.record_access(atom("random", None, Mode::Write), site("m.f", 3));
+    trail.record_access(atom("db", Some("orders"), Mode::Write), site("m.f", 4));
+    trail.record_access(
+        Access::Cell {
+            id: Slot::new(3, 0),
+            mode: Mode::Write,
+        },
+        site("m.f", 5),
+    );
     assert_eq!(trail.steps()[0].accesses.len(), 3);
+}
+
+/// A race names where each of its steps first touched something a task can share, and the
+/// definition that did it, whatever the step went on to touch and wherever it gave control back.
+#[test]
+fn a_step_is_placed_at_its_first_shared_access() {
+    let (mut sched, mut clock, mut trail) = solo(0);
+    let Turn::Run { .. } = sched
+        .next(&mut clock, &mut trail)
+        .expect("the root is enabled")
+    else {
+        panic!("expected the root's step");
+    };
+    trail.record_access(atom("clock", None, Mode::Read), site("m.tick", 1));
+    trail.record_access(
+        atom("bank", Some("accounts"), Mode::Read),
+        site("m.transfer", 10),
+    );
+    trail.record_access(
+        Access::Cell {
+            id: Slot::new(1, 0),
+            mode: Mode::Read,
+        },
+        site("m.test#0", 20),
+    );
+    trail.end_step(site("m.transfer", 30));
+    sched.suspend(suspended(), Value::Unit).expect("running");
+
+    let Turn::Run { .. } = sched.next(&mut clock, &mut trail).expect("still enabled") else {
+        panic!("expected a second step");
+    };
+    trail.end_step(site("m.idle", 40));
+    sched.suspend(suspended(), Value::Unit).expect("running");
+
+    let Turn::Run { .. } = sched.next(&mut clock, &mut trail).expect("still enabled") else {
+        panic!("expected a third step");
+    };
+    trail.record_access(Access::Alloc, site("m.open", 50));
+
+    let placed: Vec<(Option<String>, Span)> = trail
+        .record()
+        .steps
+        .iter()
+        .map(|step| (step.definition.as_ref().map(|d| d.to_string()), step.span))
+        .collect();
+    let named = |s: StepSite| (s.definition.map(|d| d.to_string()), s.span);
+    assert_eq!(
+        placed,
+        [
+            named(site("m.transfer", 10)),
+            // Nothing shared: where it gave control back.
+            named(site("m.idle", 40)),
+            // The run failed in it, after its first access.
+            named(site("m.open", 50)),
+        ]
+    );
 }
 
 #[test]
@@ -615,18 +736,24 @@ fn two_steps_touching_one_cell_are_dependent() {
     else {
         panic!("expected the root's step");
     };
-    trail.record_access(Access::Cell {
-        id: Slot::new(1, 0),
-        mode: Mode::Write,
-    });
+    trail.record_access(
+        Access::Cell {
+            id: Slot::new(1, 0),
+            mode: Mode::Write,
+        },
+        site("m.f", 0),
+    );
     sched.suspend(suspended(), Value::Unit).expect("running");
     let Turn::Run { .. } = sched.next(&mut clock, &mut trail).expect("still enabled") else {
         panic!("expected a second step");
     };
-    trail.record_access(Access::Cell {
-        id: Slot::new(1, 0),
-        mode: Mode::Read,
-    });
+    trail.record_access(
+        Access::Cell {
+            id: Slot::new(1, 0),
+            mode: Mode::Read,
+        },
+        site("m.g", 0),
+    );
     let steps = trail.steps();
     assert!(steps[0].accesses.conflicts_with(&steps[1].accesses));
     assert!(!steps[0].accesses.conflicts_with(&StepFootprint::new()));
@@ -959,17 +1086,21 @@ impl HostRuntime for Stopping {
 
 /// Two tasks each waiting on the other, with no host wait and no virtual clock.
 fn deadlock(sched: &mut Sched) {
-    let other = sched.spawn(Value::Unit, Span::DUMMY).id();
+    let other = sched.spawn(Value::Unit, Span::DUMMY);
     sched
-        .join(suspended(), other, Span::DUMMY)
+        .join(suspended(), &other, Span::DUMMY)
         .expect("the root is running");
     let Turn::Run { task, .. } = sched.next_host(&Idle).expect("the spawned task is enabled")
     else {
         panic!("expected the spawned task's first step");
     };
-    assert_eq!(task, other);
+    assert_eq!(task, other.id());
     sched
-        .join(suspended(), ROOT, Span::DUMMY)
+        .join(
+            suspended(),
+            &TaskHandle::unowned(SimId(0), ROOT),
+            Span::DUMMY,
+        )
         .expect("the spawned task is running");
 }
 
@@ -1086,7 +1217,7 @@ fn a_production_region_keeps_only_the_tasks_that_can_still_run_or_be_joined() {
             .expect("the root is running");
         until_root(&mut sched, &Idle);
         sched
-            .join(suspended(), target, Span::DUMMY)
+            .join(suspended(), &joined, Span::DUMMY)
             .expect("a task whose handle is held is kept");
         drop(joined);
         let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
@@ -1144,7 +1275,7 @@ fn a_kept_handle_keeps_its_finished_task_joinable_and_every_join_answers() {
     for handle in &kept {
         for join in 0..2 {
             sched
-                .join(suspended(), handle.id(), Span::DUMMY)
+                .join(suspended(), handle, Span::DUMMY)
                 .expect("the task is kept");
             let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
                 panic!("the root resumes from its join");
