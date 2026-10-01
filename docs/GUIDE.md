@@ -1801,10 +1801,10 @@ pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int) -> Bytes
 bytes, which is the salted password SCRAM asks for and the only length anything
 here needs.
 
-All of it is written in Ply, and the vectors the SHA-256 standard and RFC 4231
-publish are the tests. It is slow — a compression round walks a list of words
-rather than living in scalars — so use it for small inputs: a key, a proof, a
-nonce, not a file.
+`blake3` is the `bytes_blake3` builtin. The SHA-256 family is written in Ply, and
+the vectors the SHA-256 standard and RFC 4231 publish are the tests. It is slow —
+a compression round walks a list of words rather than living in scalars — so use
+it for small inputs: a key, a proof, a nonce, not a file.
 
 ### 13.14 `std.bytes`
 
