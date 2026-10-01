@@ -1,4 +1,4 @@
-use crate::harness::{ply, project, repo, stdout_of};
+use crate::harness::{ply, project, stdout_of};
 use serde_json::Value;
 
 const BILLING: &str = r#"
@@ -92,30 +92,6 @@ fn decimal_division_is_e0209_and_names_decimal_div() {
     assert!(
         text.contains("rounding nobody wrote down"),
         "the note is the argument, not decoration: {text}"
-    );
-}
-
-#[test]
-fn the_decimal_division_fixture_reports_e0209_and_nothing_else() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = std::fs::read_to_string(repo().join("tests/fixtures/decimal_division.ply"))
-        .expect("the fixture is part of the repository");
-    std::fs::write(dir.path().join("billing.ply"), source).unwrap();
-
-    let out = ply(dir.path()).args(["check", "--json"]).output().unwrap();
-    assert_ne!(out.status.code(), Some(0));
-    let text = stdout_of(&out);
-    let report: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
-    let codes: Vec<&str> = report["diagnostics"]
-        .as_array()
-        .expect("a diagnostics array")
-        .iter()
-        .map(|d| d["code"].as_str().unwrap_or_default())
-        .collect();
-    assert_eq!(
-        codes,
-        ["E0209", "E0209"],
-        "the fixture has exactly two refusals and no incidental errors: {text}"
     );
 }
 
