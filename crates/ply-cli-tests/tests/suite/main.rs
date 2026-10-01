@@ -29,6 +29,7 @@ mod effect_set_selection;
 mod effect_sets;
 mod explain;
 mod failure_classification_audit;
+mod fixtures;
 mod fmt;
 mod grants;
 mod harness;
