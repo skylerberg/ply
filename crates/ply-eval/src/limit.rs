@@ -18,24 +18,6 @@ pub fn grow<R>(f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, f)
 }
 
-pub(crate) fn err_iterate_budget(span: Span, budget: i64) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("`iterate` took its budget of {budget} steps without stopping"),
-    )
-    .primary(span, "this loop never answered `Stop`")
-    .note("raise the budget if the loop is right, or check the step that should have stopped")
-}
-
-pub(crate) fn err_iterate_budget_not_a_count(span: Span, budget: i64) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("`iterate` was given a budget of {budget}"),
-    )
-    .primary(span, "a budget is the most steps the loop may take")
-    .note("it must be at least 1")
-}
-
 pub(crate) fn err_value_depth(span: Span, max: usize) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,

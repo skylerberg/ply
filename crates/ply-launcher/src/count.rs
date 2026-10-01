@@ -274,9 +274,9 @@ impl Asked {
 }
 
 /// How many allocations one walked site stands for when the run did not ask for exact sites. The
-/// walk is the whole cost of a site census — about 19µs an allocation, measured — so sampling by
-/// this keeps a served window in the same order as a plain count while leaving the biggest sites
-/// clear: the row's allocations are its sampled ones times this.
+/// walk is the whole cost of a site census, so sampling by this keeps a served window in the same
+/// order as a plain count while leaving the biggest sites clear: the row's allocations are its
+/// sampled ones times this.
 pub const SAMPLED: u32 = 64;
 
 /// `--count-allocs=PATH` (totals), `--count-alloc-sites=PATH` (totals and where, one allocation in

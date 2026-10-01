@@ -137,14 +137,12 @@ fn the_comparison_is_over_the_whole_of_both_operands() {
 /// The runtime backstop under `derivable(ord, ·)`.
 #[test]
 fn compare_values_refuses_a_secret_at_run_time() {
-    let mut regions = ply_eval::TaskRegions::new();
     let d = ply_eval::builtins::call(
         ply_eval::Builtin::CompareValues,
         vec![
             Value::secret(Value::str("a")),
             Value::secret(Value::str("b")),
         ],
-        &mut regions,
         ply_eval::Span::DUMMY,
     )
     .expect_err("a credential has no order");
@@ -158,7 +156,6 @@ fn compare_values_refuses_a_secret_at_run_time() {
 
 #[test]
 fn a_secret_key_is_refused_by_every_map_operation_that_takes_one() {
-    let mut regions = ply_eval::TaskRegions::new();
     let key = Value::secret(Value::str("a"));
     for (builtin, args) in [
         (
@@ -178,7 +175,7 @@ fn a_secret_key_is_refused_by_every_map_operation_that_takes_one() {
             vec![Value::empty_map(), key.clone()],
         ),
     ] {
-        let d = ply_eval::builtins::call(builtin, args, &mut regions, ply_eval::Span::DUMMY)
+        let d = ply_eval::builtins::call(builtin, args, ply_eval::Span::DUMMY)
             .err()
             .unwrap_or_else(|| panic!("{} accepted a Secret key", builtin.name()));
         assert_eq!(d.code, codes::RUNTIME_ERROR, "{}", builtin.name());
@@ -413,14 +410,12 @@ test "confuse" {
 /// At the builtin, independent of whether any source program can still reach it.
 #[test]
 fn map_of_entries_refuses_a_secret_key() {
-    let mut regions = ply_eval::TaskRegions::new();
     let refused = ply_eval::builtins::call(
         ply_eval::Builtin::MapOfEntries,
         vec![Value::list(vec![
             entry(Value::secret(Value::str("hunter2")), Value::Int(1)),
             entry(Value::secret(Value::str("hunter1")), Value::Int(0)),
         ])],
-        &mut regions,
         ply_eval::Span::DUMMY,
     );
     let d = refused.expect_err("`map_of_entries` refuses a `Secret` key");
@@ -434,13 +429,11 @@ fn map_of_entries_refuses_a_secret_key() {
 
 #[test]
 fn map_merge_refuses_a_secret_key() {
-    let mut regions = ply_eval::TaskRegions::new();
     // No map builtin builds this right-hand side, so it is assembled directly.
     let right = Value::map([(Value::secret(Value::str("hunter2")), Value::Int(1))]);
     let refused = ply_eval::builtins::call(
         ply_eval::Builtin::MapMerge,
         vec![Value::empty_map(), right],
-        &mut regions,
         ply_eval::Span::DUMMY,
     );
     let d = refused.expect_err("`map_merge` refuses a `Secret` key");
@@ -485,8 +478,7 @@ fn every_map_operation_that_orders_a_key_refuses_a_secret() {
         ),
     ];
     for (builtin, args) in cases {
-        let mut regions = ply_eval::TaskRegions::new();
-        let refused = ply_eval::builtins::call(builtin, args, &mut regions, ply_eval::Span::DUMMY);
+        let refused = ply_eval::builtins::call(builtin, args, ply_eval::Span::DUMMY);
         let d = refused
             .err()
             .unwrap_or_else(|| panic!("{builtin:?} accepted a `Secret` key"));
@@ -497,6 +489,11 @@ fn every_map_operation_that_orders_a_key_refuses_a_secret() {
             d.message
         );
     }
+    // No `Secret` is a native key, so `map_update` always reaches its key through `take`.
+    let d = ply_eval::map::take(Value::empty_map(), &secret, ply_eval::Span::DUMMY)
+        .expect_err("`map_update` refuses a `Secret` key");
+    assert_eq!(d.code, codes::RUNTIME_ERROR, "{d:#?}");
+    assert!(d.message.contains("cannot order a `Secret`"), "{d:#?}");
 }
 
 /// A `{key, value}` record, as `map_of_entries` reads one.

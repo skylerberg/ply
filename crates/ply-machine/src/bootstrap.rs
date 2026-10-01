@@ -18,7 +18,7 @@ use std::sync::Arc;
 /// nowhere else.
 const EFFECT: &str = "archive";
 
-/// One registration for the one operation: the emission, which has already run.
+/// One registration for the one operation: the emission.
 const OPERATIONS: [(&str, &str); 1] = [("emitted", "ply_machine::bootstrap::emitted")];
 
 /// What `ply bootstrap` is asked to emit, from the record the program parsed.
@@ -29,8 +29,6 @@ struct BootstrapOptions {
     profile: String,
 }
 
-/// The emission runs here, when the program asks for it: the front end and the emitter are the
-/// compiler's own work.
 pub fn lent() -> Vec<Lent> {
     let archive: Arc<dyn HostHandler> = Arc::new(Archive);
     OPERATIONS
@@ -47,7 +45,7 @@ fn registration(op: &str, path: &'static str) -> HostOp {
         // A tree and the files beside it are not functions of program state.
         determinism: Determinism::Nondeterministic,
         linearity: Linearity::AtMostOnce,
-        // The work is done before the program is entered, so the handler answers, not dispatches.
+        // The handler emits here rather than dispatching: one entry, no other task to stall.
         blocking: false,
         secrets: false,
         path,
