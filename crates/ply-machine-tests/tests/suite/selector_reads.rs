@@ -50,7 +50,7 @@ type Front = {
   cached: Bool,
 }
 type Options = {
-  path: String, json: Bool, explain: Bool, no_cache: Bool, filter: Option<String>, jobs: Option<Int>,
+  path: String, json: Bool, explain: Bool, no_cache: Bool, filters: List<String>, jobs: Option<Int>,
   steps: Int, timeout: Int, bisect: String, bisect_budget: Int, coverage: Bool, mutate: Option<String>,
   mutate_budget: Int, profile: String, watch: Bool, std: Bool, host: Bool,
   tls: List<TlsCred>, trust: List<String>, fs: List<Named>, exec: List<Named>, allow: List<String>,
@@ -59,7 +59,7 @@ type Options = {
 
 fn options(root: String) -> Options =
   {
-    path: root, json: false, explain: false, no_cache: false, filter: None, jobs: None,
+    path: root, json: false, explain: false, no_cache: false, filters: [], jobs: None,
     steps: 1000000000, timeout: 60000, bisect: "auto", bisect_budget: 500, coverage: false,
     mutate: None, mutate_budget: 32, profile: "development", watch: false,
     std: false, host: false, tls: [], trust: [], fs: [], exec: [], allow: [],

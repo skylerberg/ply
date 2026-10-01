@@ -313,20 +313,20 @@ jobs:
         run: .github/binary-is-current.sh --self-test
       - name: The binary is built from this tree
         run: .github/binary-is-current.sh target/release/ply
-      # On the merge with main, not only the branch: two changes that each re-pinned their own tree
-      # leave main's lock stale, and main's refresh is the first build that verifies it.
-      - name: Every lockfile pins this tree
-        run: |
-          set -euo pipefail
-          locks=$(git ls-files '*ply.lock')
-          for lock in $locks; do target/release/ply resolve "$(dirname "$lock")" >/dev/null; done
-          git diff --exit-code -- $locks || { echo "a ply.lock does not pin these sources: run 'ply resolve' on it" >&2; exit 1; }
-
-      # What that first `ply` emitted, for the rest of the run: the shards and `stage` restore it
-      # rather than repeat the emission. Nothing was emitted when the restore above hit the tree's
-      # own key, and `stage` finds that key itself.
+      # What that first `ply` emitted, for the rest of the run: the suite jobs restore it rather
+      # than repeat the emission. On main it is saved under the tree's own key, which a later run
+      # restores, so main's next pull requests find it as soon as this job ends; a pull request's
+      # entries reach no other run, so it saves under the run's. Nothing was emitted when the
+      # restore above hit the tree's own key, and the suite jobs find that key themselves.
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.stage-cache.outputs.cache-hit != 'true'
+        if: steps.stage-cache.outputs.cache-hit != 'true' && github.event_name == 'push'
+        with:
+          path: |
+            /tmp/ply-c-cache
+            /tmp/ply-c-stage
+          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push'
         with:
           path: |
             /tmp/ply-c-cache
@@ -351,29 +351,6 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  # `build-ply`'s self-test is the run's first `ply`, so the emitter's own unit is emitted and
-  # compiled there, under the compiler every suite job compiles it with, and saved under this
-  # run's emitter key. This job, which holds the archive, restores that emission and saves it under
-  # the tree's key for a later run whose sources have not moved. Only main's entries reach a later
-  # run, and the shards start before this finishes, so a pull request skips it.
-  stage:
-    name: the emitter's stage
-    if: github.event_name == 'push'
-    needs: [build, build-ply]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/suite
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            /tmp/ply-c-cache
-            /tmp/ply-c-stage
-          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
-
   test:
     name: test ${{ matrix.shard }}/${{ matrix.of }}
     # The stage is a cache, not an input: a shard restores the emitter's own key from `build-ply`,
@@ -396,6 +373,15 @@ jobs:
           key: test-shards-${{ github.run_id }}
           fail-on-cache-miss: true
       - uses: ./.github/actions/suite
+      # The C main's corpus runs compiled (`ci-corpus.sh keep`): without it a lane's first `ply test`
+      # emits the checks package's whole closure, the compiler's included, before its first check.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/ply-c-corpus
+          key: ply-c-corpus-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
+          restore-keys: ply-c-corpus-
+      - name: The corpus's compiled C, merged under the stage
+        run: .github/ci-corpus.sh restore /tmp/ply-c-corpus
 
       # A shard's profile names the tests it runs, except the catch-all's, which is the negation of
       # every other shard: a test the durations do not name runs there, and only there.
@@ -412,14 +398,18 @@ jobs:
           set -euo pipefail
           exclude=$(.github/ci-shards.sh exclude-filter)
           [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
-          # The corpus's runs this partition takes go beside nextest rather than after it: a run is
-          # one mostly single-threaded process, so nextest gives up one of the runner's four threads.
+          # The corpus's runs this partition takes go beside nextest rather than after it, a lane to a
+          # process. A lane is about one busy thread, since its checks wait on the `ply` they spawn;
+          # nextest takes the threads the lanes leave, and one more so neither side idles at the end.
           threads=()
-          runs=$(.github/ci-shards.sh corpus-for-partition "$SHARD")
+          plan=()
+          if [ "$SHARDS" = true ]; then plan=(/tmp/ply-shards); fi
+          runs=$(.github/ci-shards.sh corpus-for-partition "$SHARD" "${plan[@]}")
           if [ -n "$runs" ]; then
-            .github/ci-corpus.sh partition "$SHARD" "/tmp/corpus-timings-$SHARD.tsv" > /tmp/corpus.log 2>&1 &
+            .github/ci-corpus.sh partition "$SHARD" "/tmp/corpus-timings-$SHARD.tsv" "${plan[@]}" > /tmp/corpus.log 2>&1 &
             corpus=$!
-            threads=(--test-threads 3)
+            lanes=$(cut -d' ' -f1 <<< "$runs" | sort -u | wc -l)
+            threads=(--test-threads "$(($(nproc) - lanes + 1))")
           else
             : > "/tmp/corpus-timings-$SHARD.tsv"
           fi
@@ -656,6 +646,17 @@ jobs:
           }
           echo "shutdown: $w5 test(s) ran"
 
+      # On the merge with main, not only the branch: two changes that each re-pinned their own tree
+      # leave main's lock stale, and main's refresh is the first build that verifies it. Here, beside
+      # the partitions, rather than in `build-ply`, whose end every partition waits on.
+      - name: Every lockfile pins this tree
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          locks=$(git ls-files '*ply.lock')
+          for lock in $locks; do target/debug/ply resolve "$(dirname "$lock")" >/dev/null; done
+          git diff --exit-code -- $locks || { echo "a ply.lock does not pin these sources: run 'ply resolve' on it" >&2; exit 1; }
+
   test-hosts:
     name: test the host packages
     needs: [build, build-ply]
@@ -711,6 +712,19 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
+      # The C main's corpus runs compiled (`ci-corpus.sh keep`): without it a lane's first `ply test`
+      # emits the checks package's whole closure, the compiler's included, before its first check.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/ply-c-corpus
+          key: ply-c-corpus-${{ matrix.id }}-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
+          restore-keys: |
+            ply-c-corpus-${{ matrix.id }}-
+            ply-c-corpus-
+      - name: The corpus's compiled C, merged under the stage
+        run: .github/ci-corpus.sh restore /tmp/ply-c-corpus
+      - name: The moment this job's compiling starts
+        run: .github/ci-corpus.sh mark
       - name: psql, and the libpq the floor links
         run: |
           sudo apt-get update -qq
@@ -731,6 +745,15 @@ jobs:
           .github/ci-corpus.sh run "$ID" \
             --exec "http_floor=$PWD/target/http-floor" --exec "pg_floor=$PWD/target/pg-floor" \
             --set CORPUS_DB=postgres://postgres@127.0.0.1:5432/desk
+      # From main, what this run compiled, for every later run's corpus lanes.
+      - name: What this run compiled
+        if: github.event_name == 'push'
+        run: .github/ci-corpus.sh keep /tmp/ply-c-corpus
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push'
+        with:
+          path: /tmp/ply-c-corpus
+          key: ply-c-corpus-${{ matrix.id }}-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
 
   # The one check that says a run is green. What a run parks in the cache for its own jobs -- the archive every
   # partition unpacks, the emitter's stage, the shard cut -- is keyed by the run id, so no later run
@@ -740,7 +763,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [plan, clippy, build, build-ply, stage, test, solo, gates, test-hosts, corpus, refresh]
+    needs: [plan, clippy, build, build-ply, test, solo, gates, test-hosts, corpus, refresh]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -754,12 +777,12 @@ jobs:
           set -euo pipefail
           echo '${{ toJSON(needs) }}' > /tmp/needs.json
           cat /tmp/needs.json
-          # `stage` and `refresh` run on main only.
+          # `refresh` runs on main only.
           not_ok=$(jq -r --arg event "$EVENT" '
             to_entries[]
             | select(.value.result != "success")
             | select(($event == "pull_request" and .value.result == "skipped"
-                and (.key == "stage" or .key == "refresh")) | not)
+                and .key == "refresh") | not)
             | "\(.key) = \(.value.result)"
           ' /tmp/needs.json)
           if [ -n "$not_ok" ]; then

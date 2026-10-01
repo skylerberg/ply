@@ -22,9 +22,9 @@
 #   ci-shards.sh solo-filter ID  the nextest filterset selecting one solo test
 #   ci-shards.sh corpus-matrix   the JSON matrix of the corpus runs that get a
 #                                runner of their own
-#   ci-shards.sh corpus-for-partition K
-#                                the corpus runs partition K takes after its
-#                                nextest run
+#   ci-shards.sh corpus-for-partition K [DIR]
+#                                `lane entry` per corpus run partition K takes,
+#                                from the cut in DIR, or round robin without one
 #   ci-shards.sh corpus-line ID  the package one run tests and its filter
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the other
 #                                jobs: the solo tests, the shutdown suite and
@@ -66,6 +66,9 @@ CORPUS_ALONE=(serving database)
 # Placed a test at a time rather than a module at a time: a whole module on one partition would
 # outlast the partition's nextest shard.
 CORPUS_BY_TEST=(audit generated toolchain)
+# Corpus processes a partition runs side by side, each a lane of the cut: its checks go in one
+# `ply test`, which loads the checks package's closure once. Nextest takes the runner's other threads.
+CORPUS_LANES=2
 # Packages whose own suites run as corpus entries too, as `id:path`: each failing test is named in
 # the log, where a Rust test wrapping the run would report one failure for all of them.
 PACKAGE_SUITES=(
@@ -240,14 +243,27 @@ cmd_corpus_matrix() {
   printf ']}\n'
 }
 
-# Every entry that does not run alone, the first to partition 1, the next to 2, and so on round.
-cmd_corpus_for_partition() {
-  local id n=0
+# Every entry that does not run alone.
+corpus_placed() {
+  local id
   while read -r id; do
-    corpus_alone "$id" && continue
-    (((n % PARTITIONS) + 1 == $1)) && printf '%s\n' "$id"
-    n=$((n + 1))
+    corpus_alone "$id" || printf '%s\n' "$id"
   done < <(corpus_entries)
+}
+
+# `lane entry` per corpus run partition K takes: the plan's cut when DIR holds one, which it does for
+# every partition once durations were measured; else round robin, a partition's lanes in turn.
+cmd_corpus_for_partition() {
+  local k=$1 dir=${2:-} id n=0
+  if [[ -n $dir ]]; then
+    [[ -f $dir/corpus-$k.txt ]] || { echo "the plan's cut in $dir holds no corpus-$k.txt" >&2; return 1; }
+    cat "$dir/corpus-$k.txt"
+    return 0
+  fi
+  while read -r id; do
+    (((n % PARTITIONS) + 1 == k)) && printf '%d %s\n' $(((n / PARTITIONS) % CORPUS_LANES + 1)) "$id"
+    n=$((n + 1))
+  done < <(corpus_placed)
 }
 
 # `path filter`: the program's entry takes every test of its package, a checks module's its own, and
@@ -405,13 +421,16 @@ living_durations() {
     echo "FAIL: cargo metadata named no test binary in $root" >&2
     return 1
   }
-  dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" '
+  # A corpus row is the entry's own, and lives while the entry does.
+  dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" -v placed="$(corpus_placed | tr '\n' ' ')" '
+    BEGIN { n = split(placed, ids, " "); for (i = 1; i <= n; i++) corpus[ids[i]] = 1; n = 0 }
     NR == FNR { live[$0] = 1; next }
+    $1 == "corpus" { if ($2 in corpus) print > out; else n++; next }
     $1 in live { print > out; next }
     { n++ }
     END { printf "%d", n }
   ' - "$1")
-  [[ $dropped -eq 0 ]] || echo "$dropped measured row(s) name binaries the tree no longer builds; left to the catch-all" >&2
+  [[ $dropped -eq 0 ]] || echo "$dropped measured row(s) name binaries or corpus runs the tree no longer has; left to the catch-all" >&2
 }
 
 # One `shard-<i>.toml` per partition: the tests it runs as its profile's `default-filter`, and the
@@ -434,7 +453,14 @@ shard_configs() {
     rm -rf "$tmp"
     return 3
   fi
-  timings=$tmp/living
+  awk -F"$TAB" -v corpus="$tmp/corpus" '$1 == "corpus" { print > corpus; next } { print }' \
+    "$tmp/living" > "$tmp/nextest"
+  if [[ ! -s $tmp/nextest ]]; then
+    echo "no measured durations name a test nextest runs" >&2
+    rm -rf "$tmp"
+    return 3
+  fi
+  timings=$tmp/nextest
   assign "$timings" > "$tmp/assigned"
   catchall=$(awk -F"$TAB" '$1 == "catchall" { print $2 }' "$tmp/assigned")
   if awk -F"$TAB" '$1 == "load" && $4 == 0 { bare = 1 } END { exit !bare }' "$tmp/assigned"; then
@@ -474,7 +500,47 @@ shard_configs() {
         ($2 == catchall ? ", and every test with no measured duration" : "")
     }
   ' "$tmp/assigned"
+  touch "$tmp/corpus"
+  corpus_cut "$dir" "$tmp/corpus"
   rm -rf "$tmp"
+}
+
+# The corpus runs the partitions take, longest first onto the least loaded of every partition's
+# lanes, as `corpus-<k>.txt` of `lane entry` lines; the lanes are taken partition by partition, so
+# the first runs placed land on different runners. A run nothing measured counts as the median of
+# those that were, and is placed after them.
+corpus_cut() {
+  local dir=$1 rows=$2 k
+  for ((k = 1; k <= PARTITIONS; k++)); do : > "$dir/corpus-$k.txt"; done
+  corpus_placed | awk -v rows="$rows" -v dir="$dir" -v p="$PARTITIONS" -v l="$CORPUS_LANES" '
+    BEGIN {
+      FS = "\t"
+      while ((getline line < rows) > 0) { split(line, f, "\t"); ms[f[2]] = f[3] + 0 }
+      FS = " "
+    }
+    { ids[++n] = $1 }
+    END {
+      for (i = 1; i <= n; i++) if (ids[i] in ms) { m++; order[m] = ids[i] }
+      # Longest first, ties in entry order.
+      for (i = 2; i <= m; i++) {
+        x = order[i]
+        for (j = i - 1; j >= 1 && ms[order[j]] < ms[x]; j--) order[j + 1] = order[j]
+        order[j + 1] = x
+      }
+      median = m ? ms[order[int((m + 1) / 2)]] : 60000
+      for (i = 1; i <= n; i++) if (!(ids[i] in ms)) { order[++m] = ids[i]; ms[ids[i]] = median }
+      lanes = p * l
+      for (i = 1; i <= m; i++) {
+        best = 1
+        for (j = 2; j <= lanes; j++) if (load[j] < load[best]) best = j
+        load[best] += ms[order[i]]
+        held[best]++
+        printf "%d %s\n", int((best - 1) / p) + 1, order[i] >> (dir "/corpus-" ((best - 1) % p + 1) ".txt")
+      }
+      for (j = 1; j <= lanes; j++)
+        printf "corpus %d.%d: %d runs, %.1fs\n", (j - 1) % p + 1, int((j - 1) / p) + 1, held[j], load[j] / 1000
+    }
+  '
 }
 
 cmd_shard_configs() { shard_configs "${1:?a directory to write the configs to}" "$TIMINGS"; }
@@ -750,6 +816,13 @@ check_shards() {
       bad=1
     fi
   fi
+  for ((i = 1; i <= PARTITIONS; i++)); do
+    cmd_corpus_for_partition "$i" "$dir"
+  done | cut -d' ' -f2 | LC_ALL=C sort > "$tmp/corpus-cut"
+  if ! cmp -s "$tmp/corpus-cut" <(corpus_placed | LC_ALL=C sort); then
+    echo "FAIL: the $what cut's corpus runs are not every run a partition takes, each once" >&2
+    bad=1
+  fi
   rm -rf "$tmp"
   return "$bad"
 }
@@ -1019,7 +1092,7 @@ cmd_verify() {
   done
   # Every entry that does not run alone is some partition's, so the round robin stays total.
   local placed k
-  placed=$(for ((k = 1; k <= PARTITIONS; k++)); do cmd_corpus_for_partition "$k"; done | sort)
+  placed=$(for ((k = 1; k <= PARTITIONS; k++)); do cmd_corpus_for_partition "$k"; done | cut -d' ' -f2 | sort)
   if [[ $placed != "$(grep -vxF -f <(printf '%s\n' "${CORPUS_ALONE[@]}") <<< "$entries" | sort)" ]]; then
     echo "FAIL: the partitions' corpus runs are not every entry that does not run alone" >&2
     failures=$((failures + 1))
@@ -1079,7 +1152,7 @@ case "${1:-}" in
   solo-matrix) cmd_solo_matrix ;;
   solo-filter) cmd_solo_filter "${2:?a solo id}" ;;
   corpus-matrix) cmd_corpus_matrix ;;
-  corpus-for-partition) cmd_corpus_for_partition "${2:?a partition}" ;;
+  corpus-for-partition) cmd_corpus_for_partition "${2:?a partition}" "${3:-}" ;;
   corpus-line) cmd_corpus_line "${2:?a corpus entry}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
@@ -1088,7 +1161,7 @@ case "${1:-}" in
   tree-check-filter) cmd_tree_check_filter ;;
   give-back) cmd_give_back "${2:?a run id}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|corpus-matrix|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|corpus-matrix|corpus-for-partition K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
     exit 2
     ;;
 esac
