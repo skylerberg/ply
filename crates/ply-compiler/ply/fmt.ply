@@ -70,8 +70,16 @@ type Pr = { src: Bytes, comments: List<Comment> }
 
 // `ci` is the next comment not yet placed; `pending` holds the ones the current line will end
 // with; `prev_end` is where the last placed node or comment ended, for the blank-line rule.
-// `parts` is last: it is the list that grows.
-type St = { ci: Int, col: Int, prev_end: Int, pending: List<Bytes>, parts: List<Bytes> }
+// `closed` is the indent the next text breaks to after a line string, whose line runs to its end,
+// and -1 otherwise. `parts` is last: it is the list that grows.
+type St = {
+  ci: Int,
+  col: Int,
+  prev_end: Int,
+  pending: List<Bytes>,
+  closed: Int,
+  parts: List<Bytes>,
+}
 
 fn width() -> Int = 100
 
@@ -109,12 +117,15 @@ fn trim_last(parts: List<Bytes>) -> List<Bytes> = {
 }
 
 fn emit(st: St, b: Bytes) -> St =
-  {
-    ci: st.ci,
-    prev_end: st.prev_end,
-    pending: st.pending,
-    col: st.col + bytes_len(b),
-    parts: push(st.parts, b),
+  if st.closed >= 0 && bytes_len(trim(b)) > 0 { emit(nl(st, st.closed, false), trim(b)) } else {
+    {
+      ci: st.ci,
+      prev_end: st.prev_end,
+      pending: st.pending,
+      col: st.col + bytes_len(b),
+      closed: st.closed,
+      parts: push(st.parts, b),
+    }
   }
 
 fn set_prev(st: St, e: Int) -> St = { ..st, prev_end: e }
@@ -141,6 +152,7 @@ fn nl(st: St, indent: Int, blank: Bool) -> St = {
       prev_end: st.prev_end,
       pending: [],
       col: indent,
+      closed: -1,
       parts: list_set(st.parts, n - 1, spaces(indent)),
     }
   } else {
@@ -151,10 +163,20 @@ fn nl(st: St, indent: Int, blank: Bool) -> St = {
       prev_end: st.prev_end,
       pending: [],
       col: indent,
+      closed: -1,
       parts: push(trailed, bytes_concat(lead, spaces(indent))),
     }
   }
 }
+
+// Nothing printed on the current line yet but its indent.
+fn line_empty(st: St) -> Bool =
+  match list_at(st.parts, len(st.parts) - 1) {
+    None -> true,
+    Some(last) ->
+      fold(range(0, bytes_len(last)), true, |all: Bool, i: Int|
+        all && (bytes_at(last, i) == 10 || is_blank(bytes_at(last, i)))),
+  }
 
 fn finish(st: St) -> Bytes = {
   let trailed = with_trailing(st.parts, st.pending, 0);
@@ -211,6 +233,7 @@ fn trail(p: Pr, st: St, end: Int) -> St =
           ci: st.ci,
           col: st.col,
           prev_end: st.prev_end,
+          closed: st.closed,
           parts: st.parts,
           pending: push(st.pending, comment_text(p, c)),
         },
@@ -231,6 +254,7 @@ fn absorb(p: Pr, st: St, end: Int) -> St =
             ci: st.ci,
             col: st.col,
             prev_end: st.prev_end,
+            closed: st.closed,
             parts: st.parts,
             pending: push(st.pending, comment_text(p, c)),
           },
@@ -401,6 +425,31 @@ fn unparen_text(t: Bytes) -> Bytes = {
 
 fn strip_blanks(t: Bytes) -> Bytes =
   bytes_concat_all(bytes_split(bytes_concat_all(bytes_split(t, b" ")), b"\t"))
+
+// A literal written as a line string: the AST holds only its value, so the source says which.
+fn is_lines(p: Pr, e: Expr) -> Bool =
+  match e {
+    ELit(v) -> {
+      let t = unparen(p, v.span);
+      bytes_len(t) >= 2 && bytes_at(t, 0) == 92 && bytes_at(t, 1) == 92
+    },
+    _ -> false,
+  }
+
+// One line per line of the value, every one at the first's indent, and nothing after the last on
+// its line: what follows breaks to `indent`.
+fn line_string(st: St, value: Bytes, indent: Int, cont: Int) -> St = {
+  let empty = line_empty(st);
+  let col = if empty { st.col } else { cont };
+  let lines = bytes_split(value, b"\n");
+  let printed = fold(
+    range(0, len(lines)),
+    if empty { st } else { nl(st, cont, false) },
+    |s: St, i: Int|
+      emit(if i == 0 { s } else { nl(s, col, false) }, bytes_concat(b"\\\\", at(lines, i))),
+  );
+  { ..printed, closed: indent }
+}
 
 fn lit_text(p: Pr, s: Span, l: Lit) -> Bytes =
   match l {
@@ -681,7 +730,7 @@ fn flat_clauses(p: Pr, clauses: List<HandleClause>, ret: Option<ReturnClause>) -
 
 fn flat_expr(p: Pr, e: Expr) -> Option<Bytes> =
   match e {
-    ELit(v) -> Some(lit_text(p, v.span, v.lit)),
+    ELit(v) -> if is_lines(p, e) { None } else { Some(lit_text(p, v.span, v.lit)) },
     EVar(v) -> Some(qname_text(v.name)),
     EBinary(v) ->
       cat([
@@ -826,7 +875,11 @@ fn chain_operand(p: Pr, st: St, e: Expr, parens: Bool, cont: Int, after: Int) ->
 
 fn broken(p: Pr, st: St, e: Expr, indent: Int, cont: Int, after: Int) -> St =
   match e {
-    ELit(v) -> emit(st, lit_text(p, v.span, v.lit)),
+    ELit(v) -> match v.lit {
+      LStr(value) -> if is_lines(p, e) { line_string(st, value, indent, cont) }
+      else { emit(st, lit_text(p, v.span, v.lit)) },
+      _ -> emit(st, lit_text(p, v.span, v.lit)),
+    },
     EVar(v) -> emit(st, qname_text(v.name)),
     EBinary(v) -> chain(p, st, v.lhs, v.op, v.rhs, cont, after),
     EUnary(v) ->
@@ -989,13 +1042,15 @@ fn call(
     Some(text) -> emit(expr(p, emit(st, text), at(args, n - 1), indent, after + 1), b")"),
     None -> {
       let s1 = emit(st, b"(");
-      let s2 = fold(args, s1, |s: St, a: Expr| element(p, s, a, indent + 2));
-      let s3 = fold(named, s2, |s: St, a: NamedArg| {
+      let s2 = fold(range(0, n), s1, |s: St, i: Int|
+        element(p, s, at(args, i), indent + 2, i == n - 1 && len(named) == 0));
+      let s3 = fold(range(0, len(named)), s2, |s: St, i: Int| {
+        let a = at(named, i);
         let o = emit(
           open_line(p, s, a.span.start, indent + 2, false),
           bytes_concat(a.name.name, b": "),
         );
-        let v = emit(expr(p, o, a.value, indent + 2, 1), b",");
+        let v = separated(p, expr(p, o, a.value, indent + 2, 1), a.value, i == len(named) - 1);
         trail(p, set_prev(v, a.span.end), a.span.end)
       });
       close(p, s3, sp.end, indent, b")")
@@ -1003,11 +1058,15 @@ fn call(
   }
 }
 
-fn element(p: Pr, st: St, e: Expr, indent: Int) -> St = {
+fn element(p: Pr, st: St, e: Expr, indent: Int, last: Bool) -> St = {
   let sp = expr_span(e);
-  let s = emit(expr(p, open_line(p, st, sp.start, indent, false), e, indent, 1), b",");
+  let s = separated(p, expr(p, open_line(p, st, sp.start, indent, false), e, indent, 1), e, last);
   trail(p, set_prev(s, sp.end), sp.end)
 }
+
+// A list's separator, except after a last line string, where it would need a line to itself.
+fn separated(p: Pr, st: St, e: Expr, last: Bool) -> St =
+  if last && is_lines(p, e) { st } else { emit(st, b",") }
 
 fn elements(
   p: Pr,
@@ -1019,7 +1078,8 @@ fn elements(
   indent: Int,
 ) -> St = {
   let s1 = set_prev(trail(p, emit(st, open), sp.start + 1), sp.start + 1);
-  let s2 = fold(items, s1, |s: St, e: Expr| element(p, s, e, indent + 2));
+  let s2 = fold(range(0, len(items)), s1, |s: St, i: Int|
+    element(p, s, at(items, i), indent + 2, i == len(items) - 1));
   close(p, s2, sp.end, indent, closer)
 }
 
@@ -1037,11 +1097,14 @@ fn record(p: Pr, st: St, base: Option<Expr>, fields: List<RecField>, sp: Span, i
     },
     None -> s1,
   };
-  let s3 = fold(fields, s2, |s: St, f: RecField| {
+  let s3 = fold(range(0, len(fields)), s2, |s: St, i: Int| {
+    let f = at(fields, i);
     let vsp = expr_span(f.value);
     let o = open_line(p, s, f.name.span.start, indent + 2, false);
-    let v = if punned(f) { emit(o, bytes_concat(f.name.name, b",")) }
-    else { emit(expr(p, emit(o, bytes_concat(f.name.name, b": ")), f.value, indent + 2, 1), b",") };
+    let v = if punned(f) { emit(o, bytes_concat(f.name.name, b",")) } else {
+      let named = emit(o, bytes_concat(f.name.name, b": "));
+      separated(p, expr(p, named, f.value, indent + 2, 1), f.value, i == len(fields) - 1)
+    };
     trail(p, set_prev(v, vsp.end), vsp.end)
   });
   close(p, s3, sp.end, indent, b"}")
@@ -1106,14 +1169,15 @@ fn if_chain(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St =
 
 fn match_expr(p: Pr, st: St, scrut: Expr, arms: List<MatchArm>, sp: Span, indent: Int) -> St = {
   let s1 = emit(scrutinee(p, emit(st, b"match "), scrut, indent + 2, 2), b" {");
-  let s2 = fold(arms, s1, |s: St, a: MatchArm| arm(p, s, a, indent + 2));
+  let s2 = fold(range(0, len(arms)), s1, |s: St, i: Int|
+    arm(p, s, at(arms, i), indent + 2, i == len(arms) - 1));
   close(p, s2, sp.end, indent, b"}")
 }
 
-fn arm(p: Pr, st: St, a: MatchArm, indent: Int) -> St = {
+fn arm(p: Pr, st: St, a: MatchArm, indent: Int, last: Bool) -> St = {
   let s1 = emit(open_line(p, st, a.span.start, indent, false), pattern_text(p, a.pat));
   let s2 = match a.guard { Some(g) -> expr(p, emit(s1, b" if "), g, indent + 2, 3), None -> s1 };
-  let s4 = emit(arm_body(p, emit(s2, b" ->"), a.body, indent), b",");
+  let s4 = separated(p, arm_body(p, emit(s2, b" ->"), a.body, indent), a.body, last);
   trail(p, set_prev(s4, a.span.end), a.span.end)
 }
 
@@ -1143,12 +1207,14 @@ fn handle_expr(
     _ -> expr(p, s1, body, indent + 2, 7),
   };
   let s3 = emit(s2, b" with {");
-  let s4 = fold(clauses, s3, |s: St, c: HandleClause| {
+  let s4 = fold(range(0, len(clauses)), s3, |s: St, i: Int| {
+    let c = at(clauses, i);
     let o = emit(
       open_line(p, s, c.span.start, indent + 2, false),
       bytes_concat(clause_head(c), b" ->"),
     );
-    let bd = emit(arm_body(p, o, c.body, indent + 2), b",");
+    let last = i == len(clauses) - 1 && (match ret { Some(_) -> false, None -> true });
+    let bd = separated(p, arm_body(p, o, c.body, indent + 2), c.body, last);
     trail(p, set_prev(bd, c.span.end), c.span.end)
   });
   let s5 = match ret {
@@ -1157,7 +1223,7 @@ fn handle_expr(
         open_line(p, s4, r.span.start, indent + 2, false),
         bytes_concat_all([b"return ", r.binder.name, b" ->"]),
       );
-      let bd = emit(arm_body(p, o, r.body, indent + 2), b",");
+      let bd = separated(p, arm_body(p, o, r.body, indent + 2), r.body, true);
       trail(p, set_prev(bd, r.span.end), r.span.end)
     },
     None -> s4,
@@ -1193,7 +1259,7 @@ fn cell_expr(
 // --- Items ------------------------------------------------------------------
 
 fn module(p: Pr, m: Module) -> Bytes = {
-  let st0 = { ci: 0, col: 0, prev_end: 0, pending: [], parts: [] };
+  let st0 = { ci: 0, col: 0, prev_end: 0, pending: [], closed: -1, parts: [] };
   let s1 = fold(m.imports, st0, |s: St, d: ImportDecl| import_decl(p, s, d));
   let s2 = fold(m.items, s1, |s: St, it: Item| item(p, s, it));
   finish(flush_comments(p, s2, bytes_len(p.src) + 1, 0, true))
@@ -2031,6 +2097,32 @@ test "the branch that ends a chain leaves room on its line for what follows the 
       b"  x\n",
       b"}\n",
     ]),
+  )
+}
+
+test "a line string starts a line of its own, and what follows it starts the next" {
+  lays_out(
+    b"fn f() -> String = { let s = \\\\one\n      \\\\two\n; s }\n",
+    b"fn f() -> String = {\n  let s =\n    \\\\one\n    \\\\two\n  ;\n  s\n}\n",
+  );
+  lays_out(
+    b"fn f() -> String = \\\\say \"hi\" \\\\here\n\nfn g() -> String = \"a\\nb\"\n",
+    b"fn f() -> String =\n  \\\\say \"hi\" \\\\here\n\nfn g() -> String = \"a\\nb\"\n",
+  )
+}
+
+test "a line string that ends a list, a call or a record takes no comma, and one before an item does" {
+  lays_out(
+    b"fn f() -> Unit = assert_eq(g(), \\\\a\n  \\\\b\n)\n",
+    b"fn f() -> Unit =\n  assert_eq(\n    g(),\n    \\\\a\n    \\\\b\n  )\n",
+  );
+  lays_out(
+    b"fn f() -> { path: String, text: String } = { path: \"m.ply\", text: \\\\one\n}\n",
+    b"fn f() -> { path: String, text: String } =\n  {\n    path: \"m.ply\",\n    text:\n      \\\\one\n  }\n",
+  );
+  lays_out(
+    b"fn f() -> List<String> = [\\\\a\n, \\\\b\n]\n",
+    b"fn f() -> List<String> =\n  [\n    \\\\a\n    ,\n    \\\\b\n  ]\n",
   )
 }
 
