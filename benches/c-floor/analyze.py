@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""PRE-REGISTERED.md's statistic and decision rule over a raw file, and nothing else.
+"""The statistic and decision rule over the raw file run.sh writes, and nothing else.
 
-    ./analyze.py observation-2.txt
+    ./analyze.py raw.txt
 """
 import re
 import sys

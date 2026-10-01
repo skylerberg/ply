@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # What a C toolchain charges per changed definition and per reached definition,
-# on units shaped like emitted Ply code: PRE-REGISTERED.md's protocol and nothing
-# else. Writes benches/c-floor/raw.txt.
+# on units shaped like emitted Ply code. Writes benches/c-floor/raw.txt, which
+# analyze.py reads.
 #
 #   ./benches/c-floor/run.sh
 #
