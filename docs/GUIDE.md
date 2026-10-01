@@ -1017,8 +1017,9 @@ holds for **every** interleaving and is reported `exhaustive`.
 | `--measure-reduction` | also run the search twice more, unpruned (`naive`) and blind to the order spawns and joins impose (`blind`), and report each count; a failure only they reach fails the test |
 
 Results are cached per search plan; a search that spends its budget passes but
-is not cached. A failure prints the racing steps, their tasks and positions, and
-a replay command such as
+is not cached. A failure prints the racing steps — each one's task, and the
+definition and position where it first touched shared state — and a replay
+command such as
 `ply test --seed 0:0.1.0.2 --filter "no account is ever overdrawn"`.
 
 ## 10. Specifications, laws and proof
