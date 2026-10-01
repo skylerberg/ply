@@ -1,0 +1,140 @@
+// What `ply test` asks of the runtime: a unit per program its tests run in, the host binding over
+// the first, one test or one interleaving of one on whichever thread asks, and the reads and writes
+// of the result cache. A compiled unit, a binding and a Rust unwind are not values a program can
+// hold, and the cache's format has one reader; everything a run decides is `tests.ply`'s.
+
+import cache (Front)
+import compiler.front (DefInterface)
+import compiler.resolve (Diag)
+import diagnostic (Raised)
+import machine
+import sim.plan (Seed)
+import sim.recording (Interleaving)
+import std.json (Json)
+import suite.conclude (Filing, PassRecord)
+
+// What a run is configured with: the report flags, the machine's budgets and bounds, and the host
+// it may bind. The runtime reads the budgets, the profile and the binding's flags from it.
+pub type Options = {
+  path: String,
+  json: Bool,
+  explain: Bool,
+  no_cache: Bool,
+  filter: Option<String>,
+  jobs: Option<Int>,
+  steps: Int,
+  timeout: Int,
+  bisect: String,
+  bisect_budget: Int,
+  coverage: Bool,
+  mutate: Option<String>,
+  mutate_budget: Int,
+  profile: String,
+  watch: Bool,
+  std: Bool,
+  host: Bool,
+  tls: List<machine::TlsCred>,
+  trust: List<String>,
+  fs: List<machine::Named>,
+  // The programs a test's `process.spawn` may start, and the families the tests are lent.
+  exec: List<machine::Named>,
+  allow: List<String>,
+  config: machine::ConfigOpts,
+  sim: machine::SimOpts,
+}
+
+pub nondet effect tester {
+  write configure[r](options: Options) -> Unit
+  // A program tests run in, from a front end the program ran: the loaded program first, then each
+  // mutant and mixture. A unit built for a run that executes nothing compiles nothing, and one that
+  // is not `hosted` reaches no binding.
+  write unit[r](front: Front, build: Bool, hosted: Bool) -> Result<Int, List<Diag>>
+  // The host binding over the first unit, answering what the configuration warned of.
+  write bound[r]() -> Result<List<Diag>, List<Diag>>
+  // What the binding and the first unit's backend came to, once the run is over.
+  read hosted[r]() -> Hosted
+  // The run is over: the binding stops and the units go, and the compiled program stays for the
+  // next run over the same definitions.
+  write ended[r]() -> Unit
+  read executed[r](unit: Int, index: Int) -> Executed
+  // One interleaving of a seeded test, the one `seed` names.
+  read interleaved[r](unit: Int, index: Int, seed: Seed, steps: Int, re_executed: Bool) -> Interleaved
+  // The result cache: what opening it degraded past, each key's outcome, whether each definition
+  // was ever seen, each test's last pass, stored bodies, and filed interfaces.
+  read opened[r]() -> List<Diag>
+  read outcomes[r](keys: List<String>) -> List<Option<String>>
+  read seen[r](hashes: List<String>) -> List<Bool>
+  read baselines[r](keys: List<String>) -> List<Option<PassRecord>>
+  read bodies[r](hashes: List<String>) -> List<Option<Bytes>>
+  read interfaces[r](asked: List<{ hash: String, name: String }>) -> List<Option<DefInterface>>
+  write filed[r](filing: Filing) -> Filed
+}
+
+// What running a test, or one interleaving of it, cost and reached, whatever it decided. `host` is
+// whether it reached a host handler, which makes a green verdict about that moment only.
+pub type Use = {
+  duration_us: Int,
+  host: Bool,
+  // Bodies run natively, and calls the backend was offered and declined.
+  entries: Int,
+  declines: Int,
+  // The operations it performed, handled ones included.
+  performs: Int,
+  // Cycles teardown collected, and the entry's own warnings.
+  teardown: List<Diag>,
+}
+
+// How one run of a test ended: `passed`, `failed`, `panicked` or `abandoned`.
+pub type Executed = { status: String, failure: Option<Raised>, usage: Use }
+
+// A failing interleaving's failure, and how a report classes it.
+pub type Fell = { status: String, failure: Raised }
+
+// `observed` is whether the test entered a `simulate` region, and so had a schedule to vary.
+pub type Interleaved = { run: Interleaving<Fell>, observed: Bool, usage: Use }
+
+// What the first unit's backend did, apart from the entries each test counted. `unbuilt` counts the
+// threads that could not build it and so declined every call.
+pub type Compiled = {
+  name: String,
+  fragment: Int,
+  offered: Int,
+  converted_in: Int,
+  converted_out: Int,
+  // Absent unless the provider compiled something: analysis is paid once, code generation per worker.
+  units: Option<Int>,
+  analysis_nanos: Option<Int>,
+  codegen_nanos: Option<Int>,
+  unbuilt: Int,
+}
+
+// The binding a run had, and the tests of the first unit it reaches.
+pub type Hosted = {
+  hermetic: Bool,
+  // `hermetic` or `host`.
+  label: String,
+  operations: Int,
+  digest: String,
+  handshakes: List<String>,
+  hosts: Json,
+  reaches: List<Int>,
+  cores: Int,
+  backend: Compiled,
+}
+
+// Why writing to the store failed, when it did, and what the store had to say.
+pub type Filed = { unflushed: Option<String>, warnings: List<Diag> }
+
+pub fn use_none() -> Use =
+  { duration_us: 0, host: false, entries: 0, declines: 0, performs: 0, teardown: [] }
+
+// Two runs' costs, as one test that ran both.
+pub fn use_both(a: Use, b: Use) -> Use =
+  {
+    duration_us: a.duration_us + b.duration_us,
+    host: a.host || b.host,
+    entries: a.entries + b.entries,
+    declines: a.declines + b.declines,
+    performs: a.performs + b.performs,
+    teardown: fold(b.teardown, a.teardown, |acc: List<Diag>, d: Diag| push(acc, d)),
+  }

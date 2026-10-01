@@ -1,0 +1,474 @@
+// `--coverage` and `--mutate`: which tests reach each definition, from the hash closure alone, and
+// each definition changed one operator or literal at a time. A site is a token of the compiler's
+// own lexer, and a mutant is the text the load read with that token replaced, checked again over
+// the load's own packages and seeded with its rows, so only what the change reaches is walked.
+
+import cache (Front)
+import compiler.front (Analysed, Refused, Rows, Whole, analyse_pulling_std_with, rows_of)
+import compiler.infer (DefInfo, TestInfo)
+import compiler.lexer (Token, TInt, TKw, TPunct, lex)
+import compiler.pkg (Pkgs, Supplied)
+import compiler.resolve (Diag, Source)
+import diagnostic (Place, diag_of, place_json, placeless)
+import entry (At)
+import program (Program, front_of, is_shipped, outside, published)
+import std.json (Json, Null, Str, Bool, Number, Array, object)
+import tester (tester)
+
+// One change to one definition's text: the token at `at` replaced by `to`.
+pub type Mutation = { definition: String, at: At, from: String, to: String }
+
+// Each mutant beside the tests that reach its definition, cheapest first; and the definitions no
+// test reaches, which have no mutant worth judging.
+pub type Queue = {
+  definitions: Int,
+  unreached: List<String>,
+  mutants: List<{ tests: List<Int>, mutation: Mutation }>,
+}
+
+// A mutant's verdict: `killed`, `survived`, `skipped` or `unresolved`, and why when it is either of
+// the last two.
+pub type Judged = { id: Int, verdict: String, why: String }
+
+pub type Survivor = { definition: String, from: String, to: String, at: Option<At> }
+
+pub type Mutants = {
+  killed: Int,
+  survived: Int,
+  skipped: Int,
+  budget_spent: Bool,
+  unreached: List<String>,
+  survivors: List<Survivor>,
+  json: Json,
+}
+
+pub type Coverage = { definitions: Int, unreached: List<String>, json: Json }
+
+fn text(b: Bytes) -> String = string_of_bytes_lossy(b)
+
+fn joined(parts: List<String>, sep: String) -> String =
+  fold(range(0, len(parts)), "", |acc: String, i: Int|
+    match list_at(parts, i) { Some(p) -> if i == 0 { p } else { acc ++ sep ++ p }, None -> acc })
+
+// Every definition of this project, as the load published them: what `--mutate *` and
+// `--coverage` are over.
+fn project_defs(w: Whole) -> List<DefInfo> =
+  filter(published(w), |d: DefInfo| !is_shipped(text(d.module)))
+
+// The definitions `--mutate DEF` names: every project definition for `*`, else one by its
+// program-wide or unique simple name.
+pub fn targets(w: Whole, query: String) -> Result<List<DefInfo>, Diag> = {
+  let project = project_defs(w);
+  let exact = filter(project, |d: DefInfo| text(d.name) == query);
+  let simple = filter(project, |d: DefInfo| text(d.simple_name) == query);
+  if query == "*" { Ok(project) }
+  else if len(exact) > 0 { Ok(exact) }
+  else if len(simple) == 1 { Ok(simple) } else if len(simple) == 0 {
+    Err(
+      diag_of(
+        "error",
+        "E0101",
+        "no definition is named `" ++ query ++ "`",
+        [placeless("not a definition of this project")],
+        [
+          "`--mutate` takes a program-wide name, a simple name unique in the project, or nothing for every definition",
+        ],
+      ),
+    )
+  } else {
+    Err(
+      diag_of(
+        "error",
+        "E0101",
+        "`" ++ query ++ "` names " ++ int_to_string(len(simple)) ++ " definitions",
+        [placeless("say which")],
+        ["one of: " ++ joined(map(simple, |d: DefInfo| text(d.name)), ", ")],
+      ),
+    )
+  }
+}
+
+// Each test's closure, by the test's program-wide name.
+fn closures(w: Whole) -> Map<Bytes, Map<Bytes, Bool>> =
+  fold(
+    w.hashes.closure,
+    map_new(),
+    |acc: Map<Bytes, Map<Bytes, Bool>>, c: { name: Bytes, names: Map<Bytes, Bool> }|
+      map_insert(acc, c.name, c.names),
+  )
+
+// The tests whose closure holds the definition, in test order.
+fn reaching(w: Whole, closed: Map<Bytes, Map<Bytes, Bool>>, name: Bytes) -> List<TestInfo> =
+  filter(w.checked.tests, |t: TestInfo|
+    match map_get(closed, t.key) { Some(names) -> map_contains(names, name), None -> false })
+
+// --- Sites ------------------------------------------------------------------
+
+fn token_at(toks: List<Token>, i: Int) -> Option<Token> =
+  if i < 0 { None } else { list_at(toks, i) }
+
+fn is_punct(t: Option<Token>, p: Bytes) -> Bool =
+  match t { Some(x) -> x.tok == TPunct(p), None -> false }
+
+// `<<` and `>>` are two tokens touching, which a comparison never is.
+fn touching(toks: List<Token>, i: Int, p: Bytes) -> Bool =
+  match token_at(toks, i) {
+    None -> false,
+    Some(t) -> {
+      let before = token_at(toks, i - 1);
+      let after = token_at(toks, i + 1);
+      (is_punct(before, p) && (match before { Some(b) -> b.end == t.start, None -> false }))
+        || (is_punct(after, p) && (match after { Some(a) -> a.start == t.end, None -> false }))
+    },
+  }
+
+fn swapped(toks: List<Token>, i: Int, p: Bytes) -> Option<String> =
+  if p == b"plus" { Some("-") }
+  else if p == b"minus" { Some("+") }
+  else if p == b"le" { Some("<") }
+  else if p == b"ge" { Some(">") }
+  else if p == b"lt" { if touching(toks, i, b"lt") { None } else { Some("<=") } }
+  else if p == b"gt" { if touching(toks, i, b"gt") { None } else { Some(">=") } }
+  else if p == b"eqeq" { Some("!=") }
+  else if p == b"bangeq" { Some("==") }
+  else if p == b"bang" { Some("") }
+  else if p == b"ampamp" { Some("||") }
+  else if p == b"pipepipe" { Some("&&") }
+  else { None }
+
+fn is_digit_or_underscore(c: Int) -> Bool = (c >= 48 && c <= 57) || c == 95
+
+fn is_word(c: Int) -> Bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+
+// A decimal literal with nothing fused to it: not hex, not suffixed, and not the start of a range.
+fn plain_decimal(src: Bytes, t: Token) -> Bool = {
+  let digits = fold(range(t.start, t.end), true, |ok: Bool, i: Int|
+    ok && is_digit_or_underscore(bytes_at(src, i)));
+  let after = if t.end < bytes_len(src) { bytes_at(src, t.end) } else { 0 };
+  digits && !is_word(after) && after != 46
+}
+
+// One change per operator or literal of `src`, outside strings and comments, in source order. A
+// site the grammar gives another meaning, a `<` opening a type argument, makes a mutant that does
+// not check, which the run skips.
+pub fn sites(src: Bytes) -> List<{ start: Int, end: Int, to: String }> = {
+  let toks = lex(src).toks;
+  fold(range(0, len(toks)), [], |acc: List<{ start: Int, end: Int, to: String }>, i: Int|
+    match token_at(toks, i) {
+      None -> acc,
+      Some(t) -> {
+        let site = |to: String| push(acc, { start: t.start, end: t.end, to: to });
+        match t.tok {
+          TPunct(p) -> match swapped(toks, i, p) { Some(to) -> site(to), None -> acc },
+          TKw(k) -> if k == b"true" { site("false") }
+          else if k == b"false" { site("true") }
+          else { acc },
+          TInt(n) -> if !plain_decimal(src, t) { acc }
+          else { match checked_add(n, 1) { Some(m) -> site(int_to_string(m)), None -> acc } },
+          _ -> acc,
+        }
+      },
+    })
+}
+
+// Every mutation of `d`, in source order.
+pub fn mutations(places: List<Place>, d: DefInfo) -> List<Mutation> =
+  match list_at(places, d.at.module) {
+    None -> [],
+    Some(place) -> {
+      let start = d.at.span.start;
+      let src = bytes_slice(place.text, start, d.at.span.end);
+      map(sites(src), |s: { start: Int, end: Int, to: String }|
+        {
+          definition: text(d.name),
+          at: { module: d.at.module, start: start + s.start, end: start + s.end },
+          from: text(bytes_slice(src, s.start, s.end)),
+          to: s.to,
+        })
+    },
+  }
+
+// Every mutation of every target some test reaches, cheapest first: the fewer tests reach a
+// mutant, the less judging it costs, and mutants a run reaches equally stay in source order.
+pub fn queued(places: List<Place>, w: Whole, targets: List<DefInfo>) -> Queue = {
+  let closed = closures(w);
+  let start: { unreached: List<String>, by_cost: Map<Int, List<{ tests: List<Int>, mutation: Mutation }>> } = {
+    unreached: [],
+    by_cost: map_new(),
+  };
+  let sorted = fold(
+    targets,
+    start,
+    |acc: { unreached: List<String>, by_cost: Map<Int, List<{ tests: List<Int>, mutation: Mutation }>> }, d: DefInfo| {
+      let tests = map(reaching(w, closed, d.name), |t: TestInfo| t.index);
+      if len(tests) == 0 { { ..acc, unreached: push(acc.unreached, text(d.name)) } } else {
+        let held = match map_get(acc.by_cost, len(tests)) { Some(xs) -> xs, None -> [] };
+        {
+          ..acc,
+          by_cost: map_insert(
+            acc.by_cost,
+            len(tests),
+            fold(
+              mutations(places, d),
+              held,
+              |into: List<{ tests: List<Int>, mutation: Mutation }>, m: Mutation|
+                push(into, { tests: tests, mutation: m }),
+            ),
+          ),
+        }
+      }
+    },
+  );
+  {
+    definitions: len(targets),
+    unreached: sorted.unreached,
+    mutants: fold(
+      map_values(sorted.by_cost),
+      [],
+      |acc: List<{ tests: List<Int>, mutation: Mutation }>, xs: List<{ tests: List<Int>, mutation: Mutation }>|
+        fold(
+          xs,
+          acc,
+          |out: List<{ tests: List<Int>, mutation: Mutation }>, x: { tests: List<Int>, mutation: Mutation }|
+            push(out, x),
+        ),
+    ),
+  }
+}
+
+// --- One mutant -------------------------------------------------------------
+
+fn spliced_text(original: Bytes, m: Mutation) -> Bytes =
+  bytes_concat_all([
+    bytes_slice(original, 0, m.at.start),
+    bytes_of_string(m.to),
+    bytes_slice(original, m.at.end, bytes_len(original)),
+  ])
+
+fn spliced_places(places: List<Place>, m: Mutation) -> List<Place> =
+  map(range(0, len(places)), |i: Int|
+    match list_at(places, i) {
+      None -> { path: "", text: b"" },
+      Some(place) -> if i == m.at.module { { ..place, text: spliced_text(place.text, m) } }
+      else { place },
+    })
+
+// A dependency's modules come after the root's, package by package, as the load placed them.
+fn spliced_pkgs(pkgs: Pkgs, own: Int, places: List<Place>) -> Pkgs = {
+  let done = fold(
+    pkgs.supplied,
+    { at: own, out: [] },
+    |acc: { at: Int, out: List<Supplied> }, s: Supplied| {
+      let modules = map(range(0, len(s.modules)), |j: Int|
+        match ((list_at(s.modules, j), list_at(places, acc.at + j))) {
+          (Some(src), Some(place)) -> { name: src.name, src: place.text },
+          (Some(src), None) -> src,
+          _ -> { name: b"", src: b"" },
+        });
+      { at: acc.at + len(s.modules), out: push(acc.out, { ..s, modules: modules }) }
+    },
+  );
+  { ..pkgs, supplied: done.out }
+}
+
+// The unit a mutant's tests run in, or the verdict a mutant that is not a program already is.
+pub fn built(
+  p: Program,
+  w: Whole,
+  shelved: List<Source>,
+  m: Mutation,
+) -> Result<Int, Judged> / {tester.unit[corpus]} = {
+  let places = spliced_places(p.places, m);
+  let own = map(range(0, len(p.files)), |i: Int|
+    match ((list_at(p.files, i), list_at(places, i))) {
+      (Some(f), Some(place)) -> { name: bytes_of_string(f.module), src: place.text },
+      _ -> { name: b"", src: b"" },
+    });
+  let rows: Rows = rows_of(w);
+  let out = analyse_pulling_std_with(
+    own,
+    shelved,
+    rows.defs,
+    rows.tests,
+    spliced_pkgs(p.pkgs, len(p.files), places),
+  ).out;
+  match out {
+    Refused(_) -> Err({ id: 0, verdict: "skipped", why: "does not check" }),
+    Analysed(mutant) -> {
+      let front: Front = front_of(
+        {
+          program: { ..p, places: places, diags: mutant.warnings, whole: Some(mutant) },
+          read_ms: 0,
+          front_ms: 0,
+          file_ms: 0,
+          cached: false,
+        },
+        mutant,
+      );
+      match tester.unit[corpus](front, true, true) {
+        Ok(unit) -> Ok(unit),
+        Err(_) -> Err({ id: 0, verdict: "unresolved", why: "the C backend could not be built" }),
+      }
+    },
+  }
+}
+
+// --- What a mutation and the coverage come to ---------------------------------
+
+fn placed(a: At) -> Option<At> = if a.module == outside() { None } else { Some(a) }
+
+fn mutation_json(
+  places: List<Place>,
+  m: Mutation,
+  tests: List<String>,
+  why: Option<String>,
+) -> Json =
+  object([
+    { key: "definition", value: Str(m.definition) },
+    { key: "from", value: Str(m.from) },
+    { key: "to", value: Str(m.to) },
+    { key: "location", value: place_json(places, m.at) },
+    { key: "tests", value: Array(map(tests, |t: String| Str(t))) },
+    { key: "why", value: match why { Some(w) -> Str(w), None -> Null } },
+  ])
+
+fn num(n: Int) -> Json = Number(decimal_of_int(n))
+
+// The mutation as the program judged it: each verdict beside its mutant and the tests that reach
+// it, and every mutant the budget never reached left out.
+pub fn mutants(
+  places: List<Place>,
+  w: Whole,
+  q: Queue,
+  judged: List<Judged>,
+  budget_spent: Bool,
+) -> Mutants = {
+  let keys = fold(w.checked.tests, map_new(), |acc: Map<Int, String>, t: TestInfo|
+    map_insert(acc, t.index, text(t.key)));
+  let rows = fold(
+    judged,
+    [],
+    |acc: List<{ judged: Judged, mutation: Mutation, tests: List<String> }>, j: Judged|
+      match list_at(q.mutants, j.id) {
+        None -> acc,
+        Some(x) ->
+          push(acc, {
+            judged: j,
+            mutation: x.mutation,
+            tests: fold(x.tests, [], |ts: List<String>, i: Int|
+              match map_get(keys, i) { Some(k) -> push(ts, k), None -> ts }),
+          }),
+      },
+  );
+  let said = |verdict: String|
+    filter(rows, |r: { judged: Judged, mutation: Mutation, tests: List<String> }|
+      r.judged.verdict == verdict);
+  let killed = len(said("killed"));
+  let survived = len(said("survived"));
+  let skipped = len(said("skipped"));
+  let unresolved = len(said("unresolved"));
+  let entry = |r: { judged: Judged, mutation: Mutation, tests: List<String> }|
+    mutation_json(
+      places,
+      r.mutation,
+      r.tests,
+      if r.judged.verdict == "skipped" || r.judged.verdict == "unresolved" { Some(r.judged.why) }
+      else { None },
+    );
+  {
+    killed: killed,
+    survived: survived,
+    skipped: skipped + unresolved,
+    budget_spent: budget_spent,
+    unreached: q.unreached,
+    survivors: map(
+      said("survived"),
+      |r: { judged: Judged, mutation: Mutation, tests: List<String> }|
+        {
+          definition: r.mutation.definition,
+          from: r.mutation.from,
+          to: r.mutation.to,
+          at: placed(r.mutation.at),
+        },
+    ),
+    json: object([
+      { key: "definitions", value: num(q.definitions) },
+      { key: "generated", value: num(len(q.mutants)) },
+      { key: "run", value: num(len(rows)) },
+      { key: "killed", value: num(killed) },
+      { key: "survived", value: num(survived) },
+      { key: "skipped", value: num(skipped) },
+      { key: "unresolved", value: num(unresolved) },
+      { key: "budget_spent", value: Bool(budget_spent) },
+      { key: "unreached", value: Array(map(q.unreached, |n: String| Str(n))) },
+      { key: "survivors", value: Array(map(said("survived"), entry)) },
+      {
+        key: "skips",
+        value: Array(
+          map(
+            filter(rows, |r: { judged: Judged, mutation: Mutation, tests: List<String> }|
+              r.judged.verdict == "skipped" || r.judged.verdict == "unresolved"),
+            entry,
+          ),
+        ),
+      },
+    ]),
+  }
+}
+
+// Which tests reach each project definition, from the hash closure alone.
+pub fn coverage(w: Whole) -> Coverage = {
+  let closed = closures(w);
+  let defs = map(project_defs(w), |d: DefInfo|
+    {
+      name: text(d.name),
+      reached_by: map(reaching(w, closed, d.name), |t: TestInfo| text(t.key)),
+    });
+  let unreached = map(
+    filter(defs, |d: { name: String, reached_by: List<String> }| len(d.reached_by) == 0),
+    |d: { name: String, reached_by: List<String> }| d.name,
+  );
+  {
+    definitions: len(defs),
+    unreached: unreached,
+    json: object([
+      {
+        key: "definitions",
+        value: Array(
+          map(defs, |d: { name: String, reached_by: List<String> }|
+            object([
+              { key: "name", value: Str(d.name) },
+              { key: "reached_by", value: Array(map(d.reached_by, |t: String| Str(t))) },
+            ])),
+        ),
+      },
+      { key: "unreached", value: Array(map(unreached, |n: String| Str(n))) },
+    ]),
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn changes(src: String) -> List<String> =
+  map(sites(bytes_of_string(src)), |s: { start: Int, end: Int, to: String }|
+    string_of_bytes_lossy(bytes_slice(bytes_of_string(src), s.start, s.end)) ++ "->" ++ s.to)
+
+test "each operator and literal is one site, and an arrow, a concatenation and a string are none" {
+  assert_eq(changes("fn f(a: Int) -> Int = a + 1 - 2"), ["+->-", "1->2", "-->+", "2->3"]);
+  assert_eq(changes("fn f(s: String) -> String = s ++ \"a + b\""), []);
+  assert_eq(changes("fn f(a: Int, b: Int) -> Bool = a <= b && !(a == b) || true"), [
+    "<=-><",
+    "&&->||",
+    "!->",
+    "==->!=",
+    "||->&&",
+    "true->false",
+  ])
+}
+
+test "a shift, a hex or suffixed literal and a range bound are not sites" {
+  assert_eq(changes("fn f(a: Int) -> Int = a >>> 32"), ["32->33"]);
+  assert_eq(changes("fn f() -> Int = 0xFF + 3u8"), ["+->-"]);
+  assert_eq(changes("fn f() -> List<Int> = range(1..5)"), ["<-><=", ">->>=", "5->6"]);
+  assert_eq(changes("fn f(m: Map<Int, List<Int>>) -> Int = 1 // 2 + 3"), ["<-><=", "<-><=", "1->2"])
+}

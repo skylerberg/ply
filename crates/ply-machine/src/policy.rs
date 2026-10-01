@@ -3,7 +3,6 @@
 //! a summary a reviewer can read.
 
 use crate::hosts::Lent;
-use crate::tester::TestOptions;
 use ply_eval::{CheckOutput, Diagnostic, Span, codes};
 
 /// One family of capabilities, and what lending it lets a program do.
@@ -84,7 +83,7 @@ fn own(effect: &str) -> String {
 pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
     Some(match family {
         "machine" => crate::registrations_with(crate::drive::RunOptions::default()),
-        "tester" => crate::tester::Session::new(&TestOptions::default()).lent(),
+        "tester" => crate::tester::Session::new().lent(),
         "claims" => crate::claims::lent(&declared("prover")),
         "builder" => crate::builder::lent(),
         "cache" => crate::cache::lent(),

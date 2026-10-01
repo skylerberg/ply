@@ -4,7 +4,7 @@
 
 use crate::fixture::{handed, project};
 use ply_eval::Span;
-use ply_machine::driver::{HandedFront, Promises, handed_front_of};
+use ply_machine::driver::{HandedFront, handed_front_of};
 use ply_machine::reused::{self, Walked};
 use std::path::{Path, PathBuf};
 
@@ -55,8 +55,6 @@ fn a_filed_front_reads_back_over_the_walk_that_asks_for_it() {
     let (back, at) = reused::front(&key, walk(dir.path(), "elsewhere/m.ply"), Vec::new())
         .expect("the entry reads back");
     assert_eq!(at, entry(&key));
-    assert_eq!(back.promises, Promises::Held);
-    assert_eq!(front.promises, Promises::Unchecked);
     assert_eq!(back.files.len(), front.files.len());
     let first = &back.files[0];
     assert_eq!(

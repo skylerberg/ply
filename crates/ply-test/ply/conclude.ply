@@ -1,0 +1,527 @@
+// `conclude` — what a run came to: each test's status, the keys a green verdict is filed under or
+// why it is filed under none, what each failure is suspected of, and which definitions the store
+// may record as seen. The runtime ran the tests; what their results establish is decided here.
+
+import std.list (sort)
+import select (Cached, Reason)
+
+/// A search a seeded test ran, as concluding reads it.
+pub type Searched = { explored: Int, exhaustive: Bool, exhausted: Bool, failed: Bool }
+
+/// One test the run executed, generic over how a failure is said.
+pub type Ran<d> = {
+  index: Int,
+  /// `passed`, `failed`, `panicked` or `abandoned`.
+  status: String,
+  failure: Option<d>,
+  /// The run reached a host handler, so its verdict is about that moment only.
+  host: Bool,
+  /// `None` for a test that ran once, and for a search no interleaving of which was observed.
+  searched: Option<Searched>,
+  /// The roots its search started from.
+  seeds: Int,
+}
+
+/// One test the program declares.
+pub type Test = { index: Int, key: String, seeded: Bool, hash: Option<String> }
+
+/// The program's hashes by name, and each test's closure by its key.
+pub type Hashes = {
+  defs: Map<String, String>,
+  decls: Map<String, String>,
+  closure: Map<String, List<String>>,
+}
+
+/// What the run was told: the classes it ran, the keys each running test's pass is filed under, the
+/// reason for every test, and the tests it was never asked to decide.
+pub type Chosen = {
+  groups: List<List<Int>>,
+  filed: Map<Int, List<String>>,
+  reasons: Map<Int, Reason>,
+  out_of_scope: List<Int>,
+}
+
+/// Where a green verdict is written, or why it is not.
+pub type Record =
+  // Under each of these keys, in order.
+  | Under(List<String>)
+  // The search spent its budget, or stopped at a failure.
+  | Exhausted
+  // The footprint reads a seed and no search was observed.
+  | Unobserved
+  // The run reached a host handler.
+  | Host
+
+pub fn written(r: Record) -> Bool = match r { Under(_) -> true, _ -> false }
+
+/// A spent budget or an unobserved search proved nothing, seeded or not: a handler can hide the seed
+/// a region reads, and the region still searched.
+pub fn record_under(filed: List<String>, seeded: Bool, searched: Option<Searched>) -> Record =
+  match searched {
+    None -> if seeded { Unobserved } else { Under(filed) },
+    Some(s) -> if s.failed || s.exhausted { Exhausted } else { Under(filed) },
+  }
+
+pub type Outcome<d> = {
+  index: Int,
+  status: String,
+  failure: Option<d>,
+  searched: Option<Searched>,
+  /// The class it ran in; one past the last for a test no class names.
+  group: Int,
+  /// `None` when no pass was filed for it at all.
+  recorded: Option<Record>,
+}
+
+pub type Failed<d> = {
+  index: Int,
+  key: String,
+  failure: d,
+  /// Ply's fault rather than the program's: nothing in the definition graph to attribute.
+  defect: Bool,
+  /// The failing run reached a host handler, so re-running it acts on the world again.
+  host: Bool,
+  /// Definitions in the test's closure the store had never seen, ascending, the test aside.
+  suspects: List<String>,
+}
+
+pub type Named = { name: String, hash: String }
+
+/// The definition set a test passed at: its hash, and the hash of every function and declaration
+/// in its closure, by name, since names are how two eras of a program are lined up.
+pub type PassRecord = { test: String, closure: List<Named>, decls: List<Named> }
+
+/// What the store is told: passes by key, pass records by test, and the definitions it may record
+/// as seen.
+pub type Filing = {
+  passes: List<String>,
+  records: List<{ key: String, record: PassRecord }>,
+  seen: List<String>,
+}
+
+pub fn nothing_filed() -> Filing = { passes: [], records: [], seen: [] }
+
+/// Something about the run itself rather than about any test.
+pub type Notice =
+  // The program ran a test index the program does not declare.
+  | StaleIndex({ index: Int, declared: Int })
+  // A test reading a seed passed with no search observed, named by its key.
+  | UnobservedSearch(String)
+
+pub type Simulated = {
+  simulated: Int,
+  /// Every test the run executed, simulated or not.
+  total: Int,
+  seeds: Int,
+  interleavings: Int,
+  /// Searches that emptied their frontier, and searches that spent their budget.
+  exhaustive: Int,
+  exhausted: Int,
+  failed: Int,
+}
+
+pub type Concluded<d> = {
+  /// Every test that ran, in index order.
+  outcomes: List<Outcome<d>>,
+  failures: List<Failed<d>>,
+  passed: Int,
+  failed: Int,
+  /// The wall clock stopped these: no verdict, so the run is no success either.
+  abandoned: Int,
+  notices: List<Notice>,
+  filing: Filing,
+  simulation: Simulated,
+}
+
+type Tally<d> = {
+  outcomes: List<Outcome<d>>,
+  failures: List<Failed<d>>,
+  passed: Int,
+  failed: Int,
+  abandoned: Int,
+  notices: List<Notice>,
+  passes: List<String>,
+  records: List<{ key: String, record: PassRecord }>,
+}
+
+fn by_index<a>(xs: List<{ index: Int, item: a }>) -> Map<Int, a> =
+  fold(xs, map_new(), |acc: Map<Int, a>, x: { index: Int, item: a }|
+    map_insert(acc, x.index, x.item))
+
+fn sorted_ran<d>(ran: List<Ran<d>>) -> List<Ran<d>> = {
+  let held = by_index(map(ran, |r: Ran<d>| { index: r.index, item: r }));
+  map_values(held)
+}
+
+fn names_in(m: Map<String, String>, names: List<String>) -> List<Named> =
+  fold(names, [], |acc: List<Named>, name: String|
+    match map_get(m, name) { Some(h) -> push(acc, { name: name, hash: h }), None -> acc })
+
+fn closure_of(h: Hashes, key: String) -> List<String> =
+  match map_get(h.closure, key) { Some(names) -> sort(names), None -> [] }
+
+/// The record a passing test is filed with: its own hash and its closure's.
+pub fn pass_record(h: Hashes, key: String, own: String) -> PassRecord = {
+  let names = closure_of(h, key);
+  { test: own, closure: names_in(h.defs, names), decls: names_in(h.decls, names) }
+}
+
+/// Definitions whose current hash the store had never seen.
+fn changed(h: Hashes, seen: Map<String, Bool>) -> Map<String, Bool> =
+  map_fold(h.defs, map_new(), |acc: Map<String, Bool>, name: String, hash: String|
+    match map_get(seen, hash) {
+      Some(known) -> if known { acc } else { map_insert(acc, name, true) },
+      None -> map_insert(acc, name, true),
+    })
+
+fn suspects_of(h: Hashes, key: String, changed: Map<String, Bool>) -> List<String> =
+  filter(closure_of(h, key), |name: String| name != key && map_contains(changed, name))
+
+fn group_of(groups: List<List<Int>>) -> Map<Int, Int> =
+  fold(range(0, len(groups)), map_new(), |acc: Map<Int, Int>, g: Int|
+    match list_at(groups, g) {
+      Some(class) -> fold(class, acc, |into: Map<Int, Int>, i: Int| map_insert(into, i, g)),
+      None -> acc,
+    })
+
+fn one<d>(
+  t: Tally<d>,
+  r: Ran<d>,
+  declared: Test,
+  h: Hashes,
+  chosen: Chosen,
+  changed: Map<String, Bool>,
+  groups: Map<Int, Int>,
+) -> Tally<d> = {
+  let outcome = |recorded: Option<Record>|
+    {
+      index: r.index,
+      status: r.status,
+      failure: r.failure,
+      searched: r.searched,
+      group: match map_get(groups, r.index) { Some(g) -> g, None -> len(chosen.groups) },
+      recorded: recorded,
+    };
+  if r.status == "abandoned" {
+    // The clock is a fact about this machine: no verdict, no suspects, nothing stored.
+    { ..t, outcomes: push(t.outcomes, outcome(None)), abandoned: t.abandoned + 1 }
+  } else {
+    match r.failure {
+      Some(failure) ->
+        {
+          ..t,
+          outcomes: push(t.outcomes, outcome(None)),
+          failed: t.failed + 1,
+          failures: push(t.failures, {
+            index: r.index,
+            key: declared.key,
+            failure: failure,
+            defect: r.status == "panicked",
+            host: r.host,
+            suspects: suspects_of(h, declared.key, changed),
+          }),
+        },
+      None -> if r.host {
+        { ..t, outcomes: push(t.outcomes, outcome(Some(Host))), passed: t.passed + 1 }
+      } else {
+        match map_get(chosen.filed, r.index) {
+          None -> { ..t, outcomes: push(t.outcomes, outcome(None)), passed: t.passed + 1 },
+          Some(keys) -> {
+            let record = record_under(keys, declared.seeded, r.searched);
+            let noticed = match record {
+              Unobserved -> push(t.notices, UnobservedSearch(declared.key)),
+              _ -> t.notices,
+            };
+            let passes = match record {
+              Under(under) -> fold(under, t.passes, |acc: List<String>, k: String| push(acc, k)),
+              _ -> t.passes,
+            };
+            let records = match declared.hash {
+              Some(hash) -> if written(record) {
+                push(t.records, { key: declared.key, record: pass_record(h, declared.key, hash) })
+              } else { t.records },
+              None -> t.records,
+            };
+            {
+              ..t,
+              outcomes: push(t.outcomes, outcome(Some(record))),
+              passed: t.passed + 1,
+              notices: noticed,
+              passes: passes,
+              records: records,
+            }
+          },
+        }
+      },
+    }
+  }
+}
+
+/// Every definition but those a failed, or never decided, test reached: a red test does not vouch
+/// for what it exercised, and a skipped one vouches for nothing.
+fn vouched_for<d>(
+  tests: List<Test>,
+  h: Hashes,
+  chosen: Chosen,
+  outcomes: List<Outcome<d>>,
+) -> List<String> = {
+  let proven = fold(outcomes, map_new(), |acc: Map<Int, Bool>, o: Outcome<d>|
+    if o.status == "passed" { map_insert(acc, o.index, true) } else { acc });
+  let out = fold(chosen.out_of_scope, map_new(), |acc: Map<Int, Bool>, i: Int|
+    map_insert(acc, i, true));
+  let implicated = fold(tests, map_new(), |acc: Map<String, Bool>, t: Test| {
+    let green = match map_get(chosen.reasons, t.index) { Some(Cached) -> true, _ -> false };
+    if map_contains(out, t.index) || green || map_contains(proven, t.index) { acc } else {
+      fold(closure_of(h, t.key), acc, |into: Map<String, Bool>, n: String|
+        map_insert(into, n, true))
+    }
+  });
+  map_fold(h.defs, [], |acc: List<String>, name: String, hash: String|
+    if map_contains(implicated, name) { acc } else { push(acc, hash) })
+}
+
+fn simulated<d>(outcomes: List<Outcome<d>>, ran: List<Ran<d>>) -> Simulated = {
+  let seeds = by_index(map(ran, |r: Ran<d>| { index: r.index, item: r.seeds }));
+  fold(
+    outcomes,
+    {
+      simulated: 0,
+      total: len(outcomes),
+      seeds: 0,
+      interleavings: 0,
+      exhaustive: 0,
+      exhausted: 0,
+      failed: 0,
+    },
+    |acc: Simulated, o: Outcome<d>|
+      match o.searched {
+        None -> acc,
+        Some(s) ->
+          {
+            ..acc,
+            simulated: acc.simulated + 1,
+            seeds: acc.seeds + (match map_get(seeds, o.index) { Some(n) -> n, None -> 0 }),
+            interleavings: acc.interleavings + s.explored,
+            exhaustive: acc.exhaustive + (if s.exhaustive { 1 } else { 0 }),
+            exhausted: acc.exhausted + (if s.exhausted { 1 } else { 0 }),
+            failed: acc.failed + (if s.failed { 1 } else { 0 }),
+          },
+      },
+  )
+}
+
+/// What the run came to, in test order. `seen` is whether the store had seen each definition's
+/// hash before this run, which is what a failure's suspects are judged against.
+pub fn concluded<d>(
+  tests: List<Test>,
+  h: Hashes,
+  chosen: Chosen,
+  seen: Map<String, Bool>,
+  ran: List<Ran<d>>,
+) -> Concluded<d> = {
+  let declared = by_index(map(tests, |t: Test| { index: t.index, item: t }));
+  let suspicious = changed(h, seen);
+  let groups = group_of(chosen.groups);
+  let ordered = sorted_ran(ran);
+  let t: Tally<d> = fold(
+    ordered,
+    {
+      outcomes: [],
+      failures: [],
+      passed: 0,
+      failed: 0,
+      abandoned: 0,
+      notices: [],
+      passes: [],
+      records: [],
+    },
+    |acc: Tally<d>, r: Ran<d>|
+      match map_get(declared, r.index) {
+        None ->
+          {
+            ..acc,
+            notices: push(acc.notices, StaleIndex({ index: r.index, declared: len(tests) })),
+          },
+        Some(declared_test) -> one(acc, r, declared_test, h, chosen, suspicious, groups),
+      },
+  );
+  {
+    outcomes: t.outcomes,
+    failures: t.failures,
+    passed: t.passed,
+    failed: t.failed,
+    abandoned: t.abandoned,
+    notices: t.notices,
+    filing: {
+      passes: t.passes,
+      records: t.records,
+      seen: vouched_for(tests, h, chosen, t.outcomes),
+    },
+    simulation: simulated(t.outcomes, ordered),
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_test(index: Int, name: String) -> Test =
+  { index: index, key: "m." ++ name, seeded: false, hash: Some("t" ++ int_to_string(index)) }
+
+fn a_program() -> Hashes =
+  {
+    defs: map_of_entries([
+      { key: "m.add", value: "h_add" },
+      { key: "m.mul", value: "h_mul" },
+      { key: "m.twice", value: "h_twice" },
+    ]),
+    decls: map_new(),
+    closure: map_of_entries([
+      { key: "m.adds", value: ["m.add"] },
+      { key: "m.doubles", value: ["m.twice", "m.mul"] },
+    ]),
+  }
+
+fn every(tests: List<Test>) -> Chosen =
+  {
+    groups: [map(tests, |t: Test| t.index)],
+    filed: fold(tests, map_new(), |acc: Map<Int, List<String>>, t: Test|
+      match t.hash { Some(h) -> map_insert(acc, t.index, [h]), None -> acc }),
+    reasons: map_new(),
+    out_of_scope: [],
+  }
+
+fn passing(index: Int) -> Ran<String> =
+  { index: index, status: "passed", failure: None, host: false, searched: None, seeds: 0 }
+
+fn failing(index: Int) -> Ran<String> =
+  { ..passing(index), status: "failed", failure: Some("assertion failed") }
+
+fn both() -> List<Test> = [a_test(0, "adds"), a_test(1, "doubles")]
+
+test "a pass is filed under its keys with its closure, and a failure under none" {
+  let c = concluded(both(), a_program(), every(both()), map_new(), [passing(0), failing(1)]);
+  assert_eq(c.passed, 1);
+  assert_eq(c.failed, 1);
+  assert_eq(c.filing.passes, ["t0"]);
+  assert_eq(c.filing.records, [
+    {
+      key: "m.adds",
+      record: { test: "t0", closure: [{ name: "m.add", hash: "h_add" }], decls: [] },
+    },
+  ]);
+  assert_eq(map(c.outcomes, |o: Outcome<String>| o.recorded), [Some(Under(["t0"])), None])
+}
+
+test "a red test does not vouch for the definitions it exercised" {
+  let c = concluded(both(), a_program(), every(both()), map_new(), [passing(0), failing(1)]);
+  assert_eq(c.filing.seen, ["h_add"])
+}
+
+test "a test the run skipped vouches for nothing, and a cached one still does" {
+  let chosen = { ..every(both()), reasons: map_insert(map_new(), 1, Cached) };
+  let c = concluded(both(), a_program(), chosen, map_new(), [passing(0)]);
+  assert_eq(c.filing.seen, ["h_add", "h_mul", "h_twice"]);
+  let skipped = concluded(both(), a_program(), every(both()), map_new(), [passing(0)]);
+  assert_eq(skipped.filing.seen, ["h_add"])
+}
+
+test "a failure suspects exactly the definitions in its closure the store never saw" {
+  let seen = map_insert(map_new(), "h_mul", true);
+  let c = concluded(both(), a_program(), every(both()), seen, [failing(1)]);
+  assert_eq(map(c.failures, |f: Failed<String>| f.suspects), [["m.twice"]])
+}
+
+test "a host-backed pass, an abandoned run and a defect are each recorded for what they are" {
+  let hosted = { ..passing(0), host: true };
+  let stopped = { ..failing(1), status: "abandoned" };
+  let c = concluded(both(), a_program(), every(both()), map_new(), [hosted, stopped]);
+  assert_eq(map(c.outcomes, |o: Outcome<String>| o.recorded), [Some(Host), None]);
+  assert_eq(c.abandoned, 1);
+  assert_eq(c.failed, 0);
+  assert_eq(c.filing.passes, []);
+  let defect = concluded(both(), a_program(), every(both()), map_new(), [
+    { ..failing(1), status: "panicked" },
+  ]);
+  assert_eq(map(defect.failures, |f: Failed<String>| f.defect), [true])
+}
+
+test "a spent or unobserved search writes nothing, and the unobserved one is noticed" {
+  let seeded = [{ ..a_test(0, "adds"), seeded: true }, a_test(1, "doubles")];
+  let spent = {
+    ..passing(1),
+    searched: Some({ explored: 4, exhaustive: false, exhausted: true, failed: false }),
+  };
+  let c = concluded(seeded, a_program(), every(seeded), map_new(), [passing(0), spent]);
+  assert_eq(map(c.outcomes, |o: Outcome<String>| o.recorded), [Some(Unobserved), Some(Exhausted)]);
+  assert_eq(c.filing.passes, []);
+  assert_eq(c.notices, [UnobservedSearch("m.adds")]);
+  assert_eq(c.simulation.exhausted, 1);
+  assert_eq(c.simulation.interleavings, 4)
+}
+
+test "a test index the program does not declare is noticed rather than reported" {
+  let c = concluded(both(), a_program(), every(both()), map_new(), [passing(7)]);
+  assert_eq(c.notices, [StaleIndex({ index: 7, declared: 2 })]);
+  assert_eq(c.outcomes, [])
+}
+
+test "results come back in test order, each with the class it ran in" {
+  let chosen = { ..every(both()), groups: [[1], [0]] };
+  let c = concluded(both(), a_program(), chosen, map_new(), [passing(1), passing(0)]);
+  assert_eq(map(c.outcomes, |o: Outcome<String>| o.index), [0, 1]);
+  assert_eq(map(c.outcomes, |o: Outcome<String>| o.group), [1, 0])
+}
+
+fn searched(explored: Int, exhausted: Bool, failed: Bool) -> Searched =
+  { explored: explored, exhaustive: !exhausted && !failed, exhausted: exhausted, failed: failed }
+
+test "a pass is written under exactly the keys it was filed under, a seeded one's roots too" {
+  let seeded = [{ ..a_test(0, "adds"), seeded: true }];
+  let chosen = { ..every(seeded), filed: map_insert(map_new(), 0, ["plan", "root 0", "root 1"]) };
+  let c = concluded(seeded, a_program(), chosen, map_new(), [
+    { ..passing(0), searched: Some(searched(3, false, false)), seeds: 2 },
+  ]);
+  assert_eq(c.filing.passes, ["plan", "root 0", "root 1"]);
+  assert_eq(c.simulation.seeds, 2);
+  assert_eq(c.simulation.exhaustive, 1)
+}
+
+test "a search stopped at a failure is filed under no key, and counted as failed" {
+  let seeded = [{ ..a_test(0, "adds"), seeded: true }];
+  let c = concluded(seeded, a_program(), every(seeded), map_new(), [
+    { ..failing(0), searched: Some(searched(5, false, true)), seeds: 1 },
+  ]);
+  assert_eq(c.filing.passes, []);
+  assert_eq(c.filing.records, []);
+  assert_eq(c.simulation.failed, 1);
+  assert_eq(c.simulation.interleavings, 5)
+}
+
+test "a spent budget stops an unseeded test's pass being written as well" {
+  let c = concluded(both(), a_program(), every(both()), map_new(), [
+    { ..passing(0), searched: Some(searched(9, true, false)) },
+  ]);
+  assert_eq(map(c.outcomes, |o: Outcome<String>| o.recorded), [Some(Exhausted)]);
+  assert_eq(c.filing.passes, [])
+}
+
+test "a test with no keys filed for it passes and is written under nothing" {
+  let chosen = { ..every(both()), filed: map_new() };
+  let c = concluded(both(), a_program(), chosen, map_new(), [passing(0)]);
+  assert_eq(c.passed, 1);
+  assert_eq(map(c.outcomes, |o: Outcome<String>| o.recorded), [None]);
+  assert_eq(c.filing.passes, [])
+}
+
+test "a test outside the run's scope never implicates what it reaches" {
+  let chosen = { ..every(both()), out_of_scope: [1] };
+  let c = concluded(both(), a_program(), chosen, map_new(), [passing(0)]);
+  assert_eq(c.filing.seen, ["h_add", "h_mul", "h_twice"])
+}
+
+test "only a pass with a hash is filed with a pass record" {
+  let unhashed = [{ ..a_test(0, "adds"), hash: None }];
+  let chosen = { ..every(unhashed), filed: map_insert(map_new(), 0, ["k"]) };
+  let c = concluded(unhashed, a_program(), chosen, map_new(), [passing(0)]);
+  assert_eq(c.filing.passes, ["k"]);
+  assert_eq(c.filing.records, [])
+}

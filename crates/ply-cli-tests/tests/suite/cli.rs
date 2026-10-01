@@ -2219,6 +2219,120 @@ fn a_bisected_failure_leaves_the_next_runs_suspects_unchanged() {
     );
 }
 
+const FIVE: &str = "\
+fn a(n: Int) -> Int = n + 1
+fn b(n: Int) -> Int = n + 2
+fn c(n: Int) -> Int = n + 3
+fn d(n: Int) -> Int = n + 4
+fn e(n: Int) -> Int = n + 5
+fn all(n: Int) -> Int = a(n) + b(n) + c(n) + d(n) + e(n)
+
+test \"sums\" { assert_eq(all(0), 15) }
+";
+
+/// Four edits that only move a sum's terms and one that changes it: the mixtures tell them apart, and
+/// each one that went green is filed under its own key, so the next bisection reads it back.
+#[test]
+fn only_the_culprit_among_five_edits_is_named_and_the_next_run_reads_its_mixtures_back() {
+    let dir = project(FIVE);
+    ply(dir.path()).arg("test").assert().success();
+    std::fs::write(
+        dir.path().join("m.ply"),
+        FIVE.replace("= n + 1", "= 1 + n")
+            .replace("= n + 2", "= 2 + n")
+            .replace("= n + 3", "= n + 9")
+            .replace("= n + 4", "= 4 + n")
+            .replace("= n + 5", "= 5 + n"),
+    )
+    .unwrap();
+
+    let first = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
+    let culprit = &first["failures"][0]["culprit"];
+    assert_eq!(culprit["verdict"], "bisected", "{culprit}");
+    assert_eq!(culprit["definitions"], serde_json::json!(["m.c"]));
+    assert_eq!(culprit["search"]["cached"], 0, "{culprit}");
+
+    let second = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
+    let again = &second["failures"][0]["culprit"];
+    assert_eq!(again["definitions"], serde_json::json!(["m.c"]));
+    assert!(
+        again["search"]["cached"].as_u64().unwrap() > 0,
+        "no mixture the first bisection proved was read back: {again}"
+    );
+}
+
+const TOGETHER: &str = "\
+fn flag() -> Bool = true
+fn left() -> Int = 3 + 4
+fn right() -> Int = 7
+fn pick() -> Int = if flag() { left() } else { right() }
+
+test \"pick\" { assert_eq(pick(), 7) }
+";
+
+/// Neither edit alone is a cause, so a search may not assume one is.
+#[test]
+fn two_edits_that_only_fail_together_are_both_named() {
+    let dir = project(TOGETHER);
+    ply(dir.path()).arg("test").assert().success();
+    std::fs::write(
+        dir.path().join("m.ply"),
+        TOGETHER
+            .replace("fn flag() -> Bool = true", "fn flag() -> Bool = false")
+            .replace("fn right() -> Int = 7", "fn right() -> Int = 8"),
+    )
+    .unwrap();
+
+    let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
+    let culprit = &v["failures"][0]["culprit"];
+    assert_eq!(culprit["verdict"], "bisected", "{culprit}");
+    assert_eq!(
+        culprit["definitions"],
+        serde_json::json!(["m.flag", "m.right"])
+    );
+}
+
+const EDITED_TEST: &str = "\
+fn scale(n: Int) -> Int = n * 2
+fn other(n: Int) -> Int = n + 1
+
+test \"doubles\" { assert_eq(scale(2) + other(0), 5) }
+";
+
+/// Every mixture carries the test's own text, so no trial can clear it: the test is the cause, and the
+/// definition that moved beside it is innocent.
+#[test]
+fn an_edited_test_beside_an_edited_definition_names_the_test() {
+    let dir = project(EDITED_TEST);
+    ply(dir.path()).arg("test").assert().success();
+    std::fs::write(
+        dir.path().join("m.ply"),
+        EDITED_TEST
+            .replace("+ other(0), 5", "+ other(0), 9")
+            .replace(
+                "fn other(n: Int) -> Int = n + 1",
+                "fn other(n: Int) -> Int = 1 + n",
+            ),
+    )
+    .unwrap();
+
+    let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
+    let failure = &v["failures"][0];
+    assert_eq!(failure["culprit"]["verdict"], "test_changed", "{failure}");
+    assert_eq!(
+        failure["culprit"]["definitions"],
+        serde_json::json!(["m.doubles"])
+    );
+    assert!(
+        failure["suspects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "m.other" && s["culprit"] == false),
+        "{failure}"
+    );
+}
+
 const PARITY: &str = "\
 fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
 

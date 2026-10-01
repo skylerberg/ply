@@ -68,28 +68,3 @@ fn the_refusal_is_declared_beside_the_effect_it_is_named_by() {
         prover.module
     );
 }
-
-/// Every case the tester builds has to be one the program declares, of the type and in the module
-/// the tester says: a case name that names nothing is a placeless `no arm of this match matched`
-/// the moment the program matches the value.
-#[test]
-fn every_case_the_tester_builds_is_declared_where_it_says() {
-    let loaded = ply_machine::load::load(&cli_root()).expect("the CLI tree loads");
-    for (home, ty, cases) in ply_machine::tester::MARSHALLED {
-        assert!(
-            declares(&loaded, home, ty),
-            "`{home}` does not declare `{ty}`, so the tester builds a value no arm matches"
-        );
-        for case in *cases {
-            let tag = format!("{home}.{case}");
-            assert!(
-                loaded
-                    .front
-                    .emitter_ctors
-                    .iter()
-                    .any(|(name, _)| name.as_str() == tag),
-                "`{home}` declares no case `{case}`, so the tester builds a value no arm matches"
-            );
-        }
-    }
-}
