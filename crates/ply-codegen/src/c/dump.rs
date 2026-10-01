@@ -1,14 +1,15 @@
 //! The front end's answer, a `front.Dump` as `crates/ply-compiler/ply/front.ply` builds it, read
-//! into a [`Front`]. No type is read: the runtime reasons about none. A footprint is read from the
-//! checker's own atoms, its label variables numbered where they first appear, so an answer reads to
-//! one structure however the checker happened to number them.
+//! into a [`Front`]. No type is read: the runtime reasons about none, and a value's words read back
+//! as the carries the compiler published. A footprint is read from the checker's own atoms, its
+//! label variables numbered where they first appear, so an answer reads to one structure however
+//! the checker happened to number them.
 
 use ply_eval::decode::{At, Error};
 use ply_eval::{
-    DefHash, DefInfo, DefWritten, Diagnostic, Edit, EffectAtom, EffectInfo, EffectSet, EmitterRoot,
-    Fix, Footprint, Front, HashOutput, Hashed, Label, LawInfo, Literal, Mode, ModuleInfo,
-    ModuleName, OpInfo, Ordinal, Pinned, Resource, Severity, SourceId, Span, SpecInfo, SpecKind,
-    Symbol, TestInfo, TypeDecl, Value, Visibility, WrittenParam, intern_code,
+    Carry, DefHash, DefInfo, DefWritten, Diagnostic, Edit, EffectAtom, EffectInfo, EffectSet,
+    EmitterRoot, Fix, Footprint, Front, HashOutput, Hashed, INT_TYPES, Label, LawInfo, Literal,
+    Mode, ModuleInfo, ModuleName, OpInfo, Ordinal, Pinned, Resource, Severity, SourceId, Span,
+    SpecInfo, SpecKind, Symbol, TestInfo, TypeDecl, Value, Visibility, WrittenParam, intern_code,
 };
 use std::collections::BTreeMap;
 
@@ -115,17 +116,21 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
             root: Symbol::new(e.field("root")?.utf8()?),
             arity: e.field("arity")?.number()?,
             scalar: e.field("scalar")?.bool()?,
-            width: e.field("width")?.bool()?,
             pure: e.field("pure")?.bool()?,
             span: r.span(e.field("at")?)?,
+            params: published(e, "params", carries)?.unwrap_or_default(),
+            answer: published(e, "answer", carry)?.unwrap_or(Carry::Open),
         })
     })?;
-    front.emitter_ctors = d.field("emit_ctors")?.items(|k| {
-        Ok((
-            Symbol::new(k.field("name")?.utf8()?),
-            k.field("arity")?.number()?,
-        ))
-    })?;
+    for k in d.field("emit_ctors")?.list()? {
+        let name = Symbol::new(k.field("name")?.utf8()?);
+        if let Some(fields) = published(k, "fields", carries)? {
+            front.ctor_carries.insert(name.clone(), fields);
+        }
+        front
+            .emitter_ctors
+            .push((name, k.field("arity")?.number()?));
+    }
     front.ordinals = d.field("ordinals")?.items(|o| {
         Ok((
             Symbol::new(o.field("module")?.utf8()?),
@@ -520,8 +525,55 @@ impl Reader<'_> {
             },
             resource_param: o.field("resource_param")?.bool()?,
             span: self.span(o.field("at")?)?,
+            params: published(o, "carries", carries)?.unwrap_or_default(),
         })
     }
+}
+
+// --- Carries -------------------------------------------------------------------------------
+
+/// A row's carries. The committed bundle that stages a pull request's compiler may predate them,
+/// and nothing is entered over its answer, so absent reads as `None`.
+fn published<T>(
+    row: At<'_>,
+    field: &str,
+    read: impl FnOnce(At<'_>) -> Result<T, Error>,
+) -> Result<Option<T>, Error> {
+    match row.field(field) {
+        Ok(x) => read(x).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+fn carries(list: At<'_>) -> Result<Vec<Carry>, Error> {
+    list.items(carry)
+}
+
+/// A `front.Carry`.
+fn carry(c: At<'_>) -> Result<Carry, Error> {
+    let k = c.ctor()?;
+    Ok(match k.name() {
+        "CPlain" => Carry::Plain,
+        "CWidth" => {
+            let n = k.arg(0)?;
+            let ty = INT_TYPES
+                .get(n.number::<usize>()?)
+                .ok_or_else(|| n.error("a width the runtime does not number"))?;
+            Carry::Width(*ty)
+        }
+        "CList" => Carry::List(Box::new(carry(k.arg(0)?)?)),
+        "CMap" => Carry::Map(Box::new(carry(k.arg(0)?)?), Box::new(carry(k.arg(1)?)?)),
+        "CRecord" => Carry::Record(k.arg(0)?.items(|f| {
+            Ok((
+                Symbol::new(f.field("name")?.utf8()?),
+                carry(f.field("carry")?)?,
+            ))
+        })?),
+        "CSum" => Carry::Sum(carries(k.arg(0)?)?),
+        "CFn" => Carry::Fn(carries(k.arg(0)?)?, Box::new(carry(k.arg(1)?)?)),
+        "CVar" => Carry::Var(k.arg(0)?.number()?),
+        _ => return Err(k.unknown()),
+    })
 }
 
 // --- Footprints ----------------------------------------------------------------------------
