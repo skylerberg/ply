@@ -313,15 +313,6 @@ jobs:
         run: .github/binary-is-current.sh --self-test
       - name: The binary is built from this tree
         run: .github/binary-is-current.sh target/release/ply
-      # On the merge with main, not only the branch: two changes that each re-pinned their own tree
-      # leave main's lock stale, and main's refresh is the first build that verifies it.
-      - name: Every lockfile pins this tree
-        run: |
-          set -euo pipefail
-          locks=$(git ls-files '*ply.lock')
-          for lock in $locks; do target/release/ply resolve "$(dirname "$lock")" >/dev/null; done
-          git diff --exit-code -- $locks || { echo "a ply.lock does not pin these sources: run 'ply resolve' on it" >&2; exit 1; }
-
       # What that first `ply` emitted, for the rest of the run: the shards and `stage` restore it
       # rather than repeat the emission. Nothing was emitted when the restore above hit the tree's
       # own key, and `stage` finds that key itself.
@@ -412,14 +403,18 @@ jobs:
           set -euo pipefail
           exclude=$(.github/ci-shards.sh exclude-filter)
           [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
-          # The corpus's runs this partition takes go beside nextest rather than after it: a run is
-          # one mostly single-threaded process, so nextest gives up one of the runner's four threads.
+          # The corpus's runs this partition takes go beside nextest rather than after it, a lane to a
+          # process. A lane is about one busy thread, since its checks wait on the `ply` they spawn;
+          # nextest takes the threads the lanes leave, and one more so neither side idles at the end.
           threads=()
-          runs=$(.github/ci-shards.sh corpus-for-partition "$SHARD")
+          plan=()
+          if [ "$SHARDS" = true ]; then plan=(/tmp/ply-shards); fi
+          runs=$(.github/ci-shards.sh corpus-for-partition "$SHARD" "${plan[@]}")
           if [ -n "$runs" ]; then
-            .github/ci-corpus.sh partition "$SHARD" "/tmp/corpus-timings-$SHARD.tsv" > /tmp/corpus.log 2>&1 &
+            .github/ci-corpus.sh partition "$SHARD" "/tmp/corpus-timings-$SHARD.tsv" "${plan[@]}" > /tmp/corpus.log 2>&1 &
             corpus=$!
-            threads=(--test-threads 3)
+            lanes=$(cut -d' ' -f1 <<< "$runs" | sort -u | wc -l)
+            threads=(--test-threads "$(($(nproc) - lanes + 1))")
           else
             : > "/tmp/corpus-timings-$SHARD.tsv"
           fi
@@ -655,6 +650,17 @@ jobs:
             exit 1
           }
           echo "shutdown: $w5 test(s) ran"
+
+      # On the merge with main, not only the branch: two changes that each re-pinned their own tree
+      # leave main's lock stale, and main's refresh is the first build that verifies it. Here, beside
+      # the partitions, rather than in `build-ply`, whose end every partition waits on.
+      - name: Every lockfile pins this tree
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          locks=$(git ls-files '*ply.lock')
+          for lock in $locks; do target/debug/ply resolve "$(dirname "$lock")" >/dev/null; done
+          git diff --exit-code -- $locks || { echo "a ply.lock does not pin these sources: run 'ply resolve' on it" >&2; exit 1; }
 
   test-hosts:
     name: test the host packages

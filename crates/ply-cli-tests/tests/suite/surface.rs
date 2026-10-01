@@ -42,6 +42,35 @@ fn defs_lists_every_definition_with_its_place_hash_signature_and_references() {
 }
 
 #[test]
+fn test_runs_every_test_any_of_its_filters_matches() {
+    let dir = project(&format!(
+        "{SOURCE}test \"one is one\" {{ assert_eq(one(), 1) }}\n"
+    ));
+    let out = ply(dir.path())
+        .args([
+            "test",
+            "--json",
+            "--no-cache",
+            "--filter",
+            "two",
+            "--filter",
+            "alone",
+        ])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    let mut ran: Vec<&str> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    ran.sort_unstable();
+    assert_eq!(ran, ["m.alone is three", "m.two is two"], "{v}");
+    assert_eq!(v["filters"], serde_json::json!(["two", "alone"]));
+}
+
+#[test]
 fn callers_names_what_mentions_a_definition_and_what_reaches_it() {
     let dir = project(SOURCE);
     let out = ply(dir.path())
