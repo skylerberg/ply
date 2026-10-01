@@ -19,36 +19,14 @@ pub const EFFECT: &str = "std.config.config";
 
 pub const REDACTED: &str = "****";
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Op {
-    Get,
-    Secret,
+operations! {
+    what "config";
+    path "config";
+    Get = "get",
+    Secret = "secret",
 }
 
 impl Op {
-    pub const ALL: [Op; 2] = [Op::Get, Op::Secret];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Op::Get => "get",
-            Op::Secret => "secret",
-        }
-    }
-
-    pub fn what(self) -> &'static str {
-        match self {
-            Op::Get => "`config.get`",
-            Op::Secret => "`config.secret`",
-        }
-    }
-
-    pub fn path(self) -> &'static str {
-        match self {
-            Op::Get => "ply_host::config::get",
-            Op::Secret => "ply_host::config::secret",
-        }
-    }
-
     pub fn declaration(self) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),

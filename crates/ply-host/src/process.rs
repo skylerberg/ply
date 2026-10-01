@@ -354,104 +354,25 @@ pub fn register(registry: &mut HostRegistry, host: Option<&Arc<ProcessHost>>) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Op {
-    Args,
-    Bound,
-    Out,
-    Err,
-    Line,
-    Exit,
-    Spawn,
-    Start,
-    Wait,
-    Signal,
-    Input,
-    EndInput,
-    OutputLine,
+operations! {
+    what "process";
+    path "process";
+    Args = "args" / 0,
+    Bound = "bound" / 0,
+    Out = "out" / 1,
+    Err = "err" / 1,
+    Line = "line" / 0,
+    Exit = "exit" / 1,
+    Spawn = "spawn" / 3,
+    Start = "start" / 4,
+    Wait = "wait" / 2,
+    Signal = "signal" / 2,
+    Input = "input" / 2,
+    EndInput = "end_input" / 1,
+    OutputLine = "output_line" / 2,
 }
 
 impl Op {
-    pub const ALL: [Op; 13] = [
-        Op::Args,
-        Op::Bound,
-        Op::Out,
-        Op::Err,
-        Op::Line,
-        Op::Exit,
-        Op::Spawn,
-        Op::Start,
-        Op::Wait,
-        Op::Signal,
-        Op::Input,
-        Op::EndInput,
-        Op::OutputLine,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Op::Args => "args",
-            Op::Bound => "bound",
-            Op::Out => "out",
-            Op::Err => "err",
-            Op::Line => "line",
-            Op::Exit => "exit",
-            Op::Spawn => "spawn",
-            Op::Start => "start",
-            Op::Wait => "wait",
-            Op::Signal => "signal",
-            Op::Input => "input",
-            Op::EndInput => "end_input",
-            Op::OutputLine => "output_line",
-        }
-    }
-
-    pub fn what(self) -> &'static str {
-        match self {
-            Op::Args => "`process.args`",
-            Op::Bound => "`process.bound`",
-            Op::Out => "`process.out`",
-            Op::Err => "`process.err`",
-            Op::Line => "`process.line`",
-            Op::Exit => "`process.exit`",
-            Op::Spawn => "`process.spawn`",
-            Op::Start => "`process.start`",
-            Op::Wait => "`process.wait`",
-            Op::Signal => "`process.signal`",
-            Op::Input => "`process.input`",
-            Op::EndInput => "`process.end_input`",
-            Op::OutputLine => "`process.output_line`",
-        }
-    }
-
-    pub fn path(self) -> &'static str {
-        match self {
-            Op::Args => "ply_host::process::args",
-            Op::Bound => "ply_host::process::bound",
-            Op::Out => "ply_host::process::out",
-            Op::Err => "ply_host::process::err",
-            Op::Line => "ply_host::process::line",
-            Op::Exit => "ply_host::process::exit",
-            Op::Spawn => "ply_host::process::spawn",
-            Op::Start => "ply_host::process::start",
-            Op::Wait => "ply_host::process::wait",
-            Op::Signal => "ply_host::process::signal",
-            Op::Input => "ply_host::process::input",
-            Op::EndInput => "ply_host::process::end_input",
-            Op::OutputLine => "ply_host::process::output_line",
-        }
-    }
-
-    pub fn arity(self) -> usize {
-        match self {
-            Op::Args | Op::Bound | Op::Line => 0,
-            Op::Out | Op::Err | Op::Exit | Op::EndInput => 1,
-            Op::Wait | Op::Signal | Op::Input | Op::OutputLine => 2,
-            Op::Spawn => 3,
-            Op::Start => 4,
-        }
-    }
-
     /// Labelled by the program `--exec` bound rather than by the run's own process.
     pub fn names_an_executable(self) -> bool {
         match self {

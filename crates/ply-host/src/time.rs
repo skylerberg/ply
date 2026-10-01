@@ -16,52 +16,16 @@ pub const MODULE: &str = "std.time";
 
 pub const EFFECT: &str = "std.time.time";
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Op {
-    NowMs,
-    ElapsedMs,
-    ElapsedUs,
-    SleepMs,
+operations! {
+    what "time";
+    path "time";
+    NowMs = "now_ms" / 0,
+    ElapsedMs = "elapsed_ms" / 0,
+    ElapsedUs = "elapsed_us" / 0,
+    SleepMs = "sleep_ms" / 1,
 }
 
 impl Op {
-    pub const ALL: [Op; 4] = [Op::NowMs, Op::ElapsedMs, Op::ElapsedUs, Op::SleepMs];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Op::NowMs => "now_ms",
-            Op::ElapsedMs => "elapsed_ms",
-            Op::ElapsedUs => "elapsed_us",
-            Op::SleepMs => "sleep_ms",
-        }
-    }
-
-    pub fn what(self) -> &'static str {
-        match self {
-            Op::NowMs => "`time.now_ms`",
-            Op::ElapsedMs => "`time.elapsed_ms`",
-            Op::ElapsedUs => "`time.elapsed_us`",
-            Op::SleepMs => "`time.sleep_ms`",
-        }
-    }
-
-    pub fn path(self) -> &'static str {
-        match self {
-            Op::NowMs => "ply_host::time::now_ms",
-            Op::ElapsedMs => "ply_host::time::elapsed_ms",
-            Op::ElapsedUs => "ply_host::time::elapsed_us",
-            Op::SleepMs => "ply_host::time::sleep_ms",
-        }
-    }
-
-    /// What the declaration in `std.time` gives the operation, which inference has already checked.
-    pub fn arity(self) -> usize {
-        match self {
-            Op::NowMs | Op::ElapsedMs | Op::ElapsedUs => 0,
-            Op::SleepMs => 1,
-        }
-    }
-
     pub fn declaration(self) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),

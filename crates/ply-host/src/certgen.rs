@@ -12,40 +12,13 @@ use std::sync::Arc;
 
 pub const EFFECT: &str = "certgen";
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Op {
-    Issue,
+operations! {
+    what "certgen";
+    path "certgen";
+    Issue = "issue" / 0,
 }
 
 impl Op {
-    pub const ALL: [Op; 1] = [Op::Issue];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Op::Issue => "issue",
-        }
-    }
-
-    pub fn what(self) -> &'static str {
-        match self {
-            Op::Issue => "`certgen.issue`",
-        }
-    }
-
-    pub fn path(self) -> &'static str {
-        match self {
-            Op::Issue => "ply_host::certgen::issue",
-        }
-    }
-
-    /// What the declaration in `std.certgen` gives the operation, which inference has already
-    /// checked.
-    pub fn arity(self) -> usize {
-        match self {
-            Op::Issue => 0,
-        }
-    }
-
     pub fn declaration(self) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),
