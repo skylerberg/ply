@@ -1,29 +1,26 @@
-//! `tester.keys`, `tester.hashed` and `tester.searched`: what a selector reads before anything
-//! runs. The selection and every key it is made with are the program's to compute, so the host
-//! answers inputs only.
+//! `tester.keys` and `tester.hashed`: what a selector reads before anything runs. The selection,
+//! the search a seeded test is keyed on and every key it is made with are the program's to compute,
+//! so the host answers inputs only.
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{Front, Machine, Provider, SourceId, Span};
 use std::collections::HashMap;
 
 /// A program that configures the tester over the directory it is handed, loads it, and reports
-/// what the tree holds: one test and its hash, and the plan.
+/// what the tree holds: one test and its hash.
 const OUTER: &str = r#"
 nondet effect tester {
   write configure[r](options: Options, front: Front) -> Unit
   read loaded[r]() -> Result<Program, Refusal>
   read bound[r]() -> Result<Unit, Refusal>
-  read ran[r]() -> Ran
   read trial[r](failure: Int, keys: List<{ name: String, ns: String }>, filed: Option<String>) -> Trial
   read stamped[r]() -> Option<List<String>>
   read keys[r]() -> List<Key>
   read hashed[r]() -> List<Hashed>
-  read searched[r]() -> Plan
 }
 
 type Program = Unit
 type Refusal = Unit
-type Ran = Unit
 type Key = {
   index: Int, label: String, name: String, module: String,
   hash: Option<String>, seeded: Bool, nondet: Bool,
@@ -32,7 +29,6 @@ type Hashed = { name: String, hash: String, test: Bool }
 type Trial = { outcome: TrialOutcome, cached: Bool }
 type TrialOutcome = | Fails | Passes | Unresolved(Unresolved)
 type Unresolved = | DoesNotCheck | DifferentFailure | MissingBody | BudgetSpent
-type Plan = { mode: String, seeds: Int, budget: String, steps: String }
 type Named = { name: String, path: String }
 type TlsCred = { name: String, cert: String, key: String }
 type DbOpts = {
@@ -74,7 +70,7 @@ fn options(root: String) -> Options =
   }
 
 fn main(root: String, front: Front) -> Bool / {
-  tester.configure[r], tester.loaded[r], tester.keys[r], tester.hashed[r], tester.searched[r],
+  tester.configure[r], tester.loaded[r], tester.keys[r], tester.hashed[r],
 } = {
   tester.configure[r](options(root), front);
   match tester.loaded[r]() {
@@ -82,7 +78,6 @@ fn main(root: String, front: Front) -> Bool / {
     Ok(_) -> {
       let keys = tester.keys[r]();
       let hashed = tester.hashed[r]();
-      let plan = tester.searched[r]();
       // The project has one test: it is named program-wide and hashed, and it reads no seed, so
       // its own hash is what its result is keyed on.
       let one = match list_at(keys, 0) {
@@ -93,7 +88,7 @@ fn main(root: String, front: Front) -> Bool / {
         None -> false,
       };
       let named = fold(hashed, false, |acc: Bool, h: Hashed| acc || (h.test && h.name == "p.doubles"));
-      one && named && plan.mode != "" && plan.seeds >= 1
+      one && named
     },
   }
 }
@@ -107,7 +102,7 @@ fn front_of(source: &str) -> Front {
 }
 
 #[test]
-fn a_selector_reads_the_keys_the_hashes_and_the_plan_before_anything_runs() {
+fn a_selector_reads_the_keys_and_the_hashes_before_anything_runs() {
     // One project with one test, which is what the program's checks are written against.
     let dir = tempfile::tempdir().expect("a temp dir");
     std::fs::write(
@@ -128,7 +123,7 @@ fn a_selector_reads_the_keys_the_hashes_and_the_plan_before_anything_runs() {
     for (op, handler) in
         ply_machine::policy::lent("tester", &|e: &str| e.to_string()).expect("the family")
     {
-        if ["configure", "loaded", "keys", "hashed", "searched"].contains(&op.op.as_str()) {
+        if ["configure", "loaded", "keys", "hashed"].contains(&op.op.as_str()) {
             registry.register(op, handler);
         }
     }

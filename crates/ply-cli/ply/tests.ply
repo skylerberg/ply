@@ -41,6 +41,11 @@ import suite.select (Cached, Decision, New, Nondet, PreviousFailure, Reason, Row
                      answers_per_root, decide, digest_of, filed, key_of, narrowed, owed_roots,
                      seed_keys, to_run, word)
 import std.bytes (bytes_of_hex, hex_of)
+import sim.plan
+import sim.plan (Seed)
+import sim.recording (Interleaving)
+import sim.search
+import sim.search (Exploration, Failure)
 
 // What the Rust side loads, binds and runs, in that order and each once per report. A run that
 // refuses at either of the first two ran nothing, which is why binding and running are two
@@ -89,23 +94,37 @@ pub nondet effect tester {
   write configure[corpus](options: Options, front: Front) -> Unit
   read loaded[r]() -> Result<Program, Refusal>
   read bound[r]() -> Result<Unit, Refusal>
-  read ran[r]() -> Ran
   read stamped[r]() -> Option<List<String>>
-  // What a selector computes a selection from, before anything runs: each test's own hash, the
-  // definitions' hashes, and the search a seeded test is keyed on.
+  // What a selector computes a selection from, before anything runs: each test's own hash and the
+  // definitions' hashes.
   read keys[r]() -> List<Row>
   read hashed[r]() -> List<Hashed>
-  read searched[r]() -> Plan
   // The printed union of a set of tests' footprints. The program colours the graph; rendering a
   // colour is the compiler's, since only its printer can keep a label variable off a name.
   read footprint[r](tests: List<Int>) -> String
   // What the store holds under each of these keys. Every key is the program's: this is the only
   // side that encodes one.
   read outcomes[r](keys: List<String>) -> List<Option<String>>
-  // What the program decided to run: which tests, the roots each still owes, the classes they
-  // share, the reason for every test, and the keys each pass is filed under. Stated before the
-  // binding, because whether a unit has to be built at all is a function of it.
+  // What the program decided to run: which tests, the classes they share, the reason for every
+  // test, and the keys each pass is filed under. Stated before the binding, because whether a unit
+  // has to be built at all is a function of it.
   write chosen[r](choice: Choice) -> Unit
+  // The run begins. A test runs in a unit, on whichever thread asks: unit 0 is the loaded program,
+  // and each mutant `mutant` builds is another.
+  write started[r]() -> Unit
+  // One test run once, and how it ended: `passed`, `failed`, `panicked` or `abandoned`.
+  read executed[r](unit: Int, index: Int) -> String
+  // One interleaving of a seeded test, the one `seed` names, as the runtime recorded it.
+  read interleaved[r](unit: Int, index: Int, seed: Seed, steps: Int, re_executed: Bool) -> Interleaving<Fell>
+  // What the run came to, filed under the keys the program named, given how its searches settled
+  // each seeded test.
+  write concluded[r](searched: List<Settled>) -> Ran
+  // The mutants of the `--mutate` targets that some test reaches, cheapest first.
+  read mutated[r]() -> Queue
+  // The unit a mutant's tests run in, or the verdict a mutant that does not build already is.
+  write mutant[r](id: Int) -> Result<Int, Judgement>
+  // What the program judged each mutant it ran, and whether its budget stopped it short.
+  write mutation[r](judged: List<Judged>, budget_spent: Bool) -> Mutants
   // One mixture of one failure: a set of definitions to take from the post-edit side, and the key
   // its pass is filed under, which a pass already there answers without building anything.
   read trial[r](failure: Int, keys: List<{ name: String, ns: String }>, filed: Option<String>) -> Trial
@@ -120,16 +139,35 @@ pub type Choice = {
   runs: List<Int>,
   // The reason for every test the keys row named, indexed by test index.
   reasons: List<String>,
-  // The roots a seeded test still owes.
-  narrowed: List<{ index: Int, roots: List<Int> }>,
   // Concurrency classes over `runs`.
   groups: List<List<Int>>,
-  // Concurrency classes over every test the run reports on, for a pass that re-runs any of them
-  // whatever the cache held: a mutant runs the tests that reach it.
-  every: List<List<Int>>,
   // Every key each running test's pass is filed under.
   filed: List<{ index: Int, keys: List<String> }>,
 }
+
+// A failed run whose diagnostic the runtime holds, by its id, and how a report classes it.
+pub type Fell = { id: Int, status: String }
+
+// How the program's search settled one seeded test: what it explored, why it stopped at a failure,
+// and how many roots it started from.
+pub type Settled = {
+  test: Int,
+  exploration: Exploration,
+  failure: Option<Failure<Fell>>,
+  seeds: Int,
+}
+
+// Each mutant beside the tests that reach it, and why there are none when the query no longer names
+// a definition.
+pub type Queue = { mutants: List<Queued>, refused: List<Diag> }
+
+pub type Queued = { id: Int, tests: List<Int> }
+
+// A mutant's verdict: `killed`, `survived`, `skipped` or `unresolved`, and why when it is either of
+// the last two.
+pub type Judgement = { verdict: String, why: String }
+
+pub type Judged = { id: Int, verdict: String, why: String }
 
 // One definition or test the loaded tree declares, and its hash.
 pub type Hashed = { name: String, hash: String, test: Bool }
@@ -185,18 +223,6 @@ pub type Refusal = { diags: List<Diag>, places: List<Place> }
 // printed from the same integer, so a line and its document cannot disagree by a rounding.
 pub type Phases = { read_us: Int, front_us: Int, write_back_us: Int }
 
-// The search every seeded test is keyed on. Each field is in that test's cache key.
-// `budget` and `steps` are the bounds as the search prints them, which is all a report does with
-// them; the document carries the machine's own numbers under `options`.
-pub type Plan = {
-  mode: String,
-  roots: List<Int>,
-  seeds: Int,
-  budget: Int,
-  steps: Int,
-  path: List<Int>,
-}
-
 pub type ModuleView = { name: String, file: String }
 
 // One test still in scope, and what the store said about it. `test` is a reserved word, so a
@@ -220,6 +246,9 @@ pub type Case = {
 // which tests run, the classes they share, and the summary over them. The report reads all of it
 // from here rather than from the runtime, which no longer decides any of it.
 pub type Decided = {
+  // The search every seeded test is keyed on, and the options document's account of it.
+  search: Search,
+  sim: Json,
   reasons: List<{ index: Int, reason: Reason }>,
   owed: List<{ index: Int, owed: Int }>,
   runs: List<Int>,
@@ -299,11 +328,14 @@ fn decided_of(
   p: Program,
   decisions: List<Decision>,
   search: Search,
+  sim: Json,
   groups: List<Group>,
   classes: List<List<Int>>,
 ) -> Decided = {
   let runs = to_run(decisions);
   {
+    search: search,
+    sim: sim,
     reasons: map(decisions, |x: Decision| { index: x.case.index, reason: x.reason }),
     owed: fold(decisions, [], |acc: List<{ index: Int, owed: Int }>, x: Decision|
       if !x.case.seeded { acc } else {
@@ -363,7 +395,6 @@ pub type Program = {
   // The tests still in scope, in ascending index order.
   cases: List<Case>,
   filtered_out: Int,
-  plan: Plan,
   warnings: List<Diag>,
   // What the machine was configured with, placed under the key this report gives it.
   options: Json,
@@ -882,13 +913,13 @@ fn why_lines(s: Style, p: Program, d: Decided) -> List<String> = {
 }
 
 fn owed_line(s: Style, p: Program, c: Case, d: Decided) -> List<String> =
-  if owed_of(d, c.index) == len(p.plan.roots) { [] } else {
+  if owed_of(d, c.index) == len(d.search.roots) { [] } else {
     [
       ind() ++ "  "
         ++ dim(
           s,
           display_of(p, c) ++ ": " ++ int_to_string(owed_of(d, c.index)) ++ " of "
-            ++ count_of(len(p.plan.roots), "seed")
+            ++ count_of(len(d.search.roots), "seed")
             ++ " still owed; the rest already passed on their own",
         ),
     ]
@@ -904,10 +935,10 @@ fn search_lines(s: Style, p: Program, d: Decided) -> List<String> = {
       ind() ++ "  "
         ++ dim(
           s,
-          p.plan.mode ++ " · " ++ count_of(p.plan.seeds, "seed") ++ " · budget "
-            ++ int_to_string(p.plan.budget)
+          d.search.mode ++ " · " ++ count_of(len(d.search.roots), "seed") ++ " · budget "
+            ++ int_to_string(d.search.budget)
             ++ " · steps "
-            ++ int_to_string(p.plan.steps),
+            ++ int_to_string(d.search.steps),
         ),
       ind() ++ "  "
         ++ dim(
@@ -1562,7 +1593,7 @@ fn document(
         { key: "binding", value: Str(r.label) },
         { key: "hosts", value: r.hosts },
         { key: "workers", value: num(r.workers) },
-        { key: "options", value: p.options },
+        { key: "options", value: with_sim(p.options, d.sim) },
         { key: "simulation", value: simulated_json(r.simulation) },
         { key: "backend", value: backend_json(r) },
         { key: "selection", value: selection_json(p, r, d) },
@@ -1670,7 +1701,7 @@ fn unbound(s: Style, refusal: Refusal) -> Answer = {
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.searched[corpus], tester.trial[corpus], tester.record[corpus], store.known[cache], store.file[cache]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.started[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.concluded[corpus], tester.mutated[corpus], tester.mutant[corpus], tester.mutation[corpus], tester.trial[corpus], tester.record[corpus], store.known[cache], store.file[cache]} = {
   let s: Style = style_of(flags);
   let t: Timed = if options.no_cache { timed_uncached(flags.paths) }
   else { timed_load(flags.paths) };
@@ -1691,33 +1722,53 @@ fn tests_over(
   s: Style,
   options: Options,
   front: Front,
-) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.searched[corpus], tester.trial[corpus], tester.record[corpus]} = {
+) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.started[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.concluded[corpus], tester.mutated[corpus], tester.mutant[corpus], tester.mutation[corpus], tester.trial[corpus], tester.record[corpus]} = {
   tester.configure[corpus](options, front);
   match tester.loaded[corpus]() {
     Err(refusal) -> refused(s, "test", refusal.diags, refusal.places),
     Ok(p) -> {
       // Which tests run is the program's to say, and so is every key the store is asked about or a
       // pass is filed under: the runtime answers what the store holds and does what it is told.
-      let search = search_of(tester.searched[corpus]());
+      let searching = machine::sim_plan_of(options.sim);
+      let search = search_of(searching);
       let decisions = decide(cases_of(tester.keys[corpus](), search));
       // Which tests may share a worker is the program's to say, from the atoms each row carries;
       // only the rendering of a class is the printer's.
       let classes = classes_of(p, to_run(decisions));
-      let decided = decided_of(p, decisions, search, fold(classes, [], with_footprint), classes);
+      let decided = decided_of(
+        p,
+        decisions,
+        search,
+        sim_json(searching, options.sim),
+        fold(classes, [], with_footprint),
+        classes,
+      );
       tester.chosen[corpus]({
         runs: decided.runs,
         reasons: map(decided.reasons, |e: { index: Int, reason: Reason }| word(e.reason)),
-        narrowed: narrowed(decisions, search.roots),
         groups: classes,
-        every: every_of(p, options),
         filed: filed(decisions, search),
       });
       match tester.bound[corpus]() {
         Err(refusal) -> unbound(s, refusal),
         Ok(_) -> {
+          tester.started[corpus]();
+          let asked = {
+            plan: searching,
+            measuring: options.sim.measure_reduction,
+            lanes: match options.jobs {
+              Some(n) -> if n > 0 { Some(n) } else { None },
+              None -> None,
+            },
+          };
+          let narrowing = narrowed(decisions, search.roots);
+          let searched = flat_map(classes, |class: List<Int>|
+            settled_of(
+              ran_class(map(class, |i: Int| job_of(p, 0, i, narrowing, searching)), asked),
+            ));
+          let r = mutated(p, tester.concluded[corpus](searched), options, asked);
           // The run is over, so the runtime can be asked about mixtures of what it found; every
           // failure's cause is decided here, before anything renders one.
-          let r = tester.ran[corpus]();
           let faults = decided_faults(r, diagnosing(options));
           let stored = tester.record[corpus]();
           answered(s, flags, p, { ..r, warnings: appended(r.warnings, stored) }, faults, decided)
@@ -1727,8 +1778,204 @@ fn tests_over(
   }
 }
 
-fn search_of(plan: Plan) -> Search =
-  { mode: plan.mode, roots: plan.roots, budget: plan.budget, steps: plan.steps, path: plan.path }
+// --- The run ----------------------------------------------------------------
+
+// The search a seeded test's key is computed against, as the selector reads one.
+fn search_of(p: plan::Plan) -> Search =
+  {
+    mode: plan::mode_word(p.mode),
+    roots: map(p.roots, |r: U64| int_of_u64(r)),
+    budget: p.budget,
+    steps: p.steps,
+    path: p.path,
+  }
+
+// The whole plan, as the document's options carry it: every field is in a seeded test's key.
+fn sim_json(p: plan::Plan, sim: machine::SimOpts) -> Json =
+  object([
+    { key: "budget", value: num(p.budget) },
+    { key: "measure_reduction", value: Bool(sim.measure_reduction) },
+    { key: "mode", value: Str(plan::mode_word(p.mode)) },
+    { key: "roots", value: Array(map(p.roots, |r: U64| Number(decimal(plan::u64_text(r))))) },
+    {
+      key: "seed",
+      value: match sim.seed {
+        Some(text) -> match plan::parse_seed(text) {
+          Some(seed) -> Str(plan::seed_text(seed)),
+          None -> Null,
+        },
+        None -> Null,
+      },
+    },
+    { key: "seeds", value: num(len(p.roots)) },
+    { key: "steps", value: num(p.steps) },
+  ])
+
+fn with_sim(options: Json, sim: Json) -> Json =
+  match options { Object(members) -> Object(map_insert(members, "sim", sim)), other -> other }
+
+// What the run's searches are asked: the plan a seeded test searches, whether to measure what the
+// pruning saved, and how many lanes run tests at once — one per test when `--jobs` names none.
+type Asked = { plan: plan::Plan, measuring: Bool, lanes: Option<Int> }
+
+// One test to run in one unit, and the plan it searches when it is seeded.
+type Job = { unit: Int, test: Int, search: Option<plan::Plan> }
+
+// How one test ended, and how its search settled when it searched.
+type Done = { test: Int, status: String, settled: Option<Settled> }
+
+// A seeded test searches the roots it still owes; any other runs once.
+fn job_of(
+  p: Program,
+  unit: Int,
+  index: Int,
+  narrowing: List<{ index: Int, roots: List<Int> }>,
+  searching: plan::Plan,
+) -> Job =
+  {
+    unit: unit,
+    test: index,
+    search: match case_of(p, index) {
+      Some(c) -> if !c.seeded { None } else {
+        match filter(narrowing, |n: { index: Int, roots: List<Int> }| n.index == index) {
+          [owed, ..] -> Some({ ..searching, roots: map(owed.roots, |r: Int| u64_of_int(r)) }),
+          [] -> Some(searching),
+        }
+      },
+      None -> None,
+    },
+  }
+
+fn settled_of(done: List<Done>) -> List<Settled> =
+  fold(done, [], |acc: List<Settled>, d: Done|
+    match d.settled { Some(st) -> push(acc, st), None -> acc })
+
+// One class's tests at once: each in a lane of its own, or dealt across the lanes `--jobs` names,
+// a lane's tests in turn, answered in the class's order.
+fn ran_class(
+  jobs: List<Job>,
+  asked: Asked,
+) -> List<Done> / {tester.executed[corpus], tester.interleaved[corpus]} = {
+  let lanes = machine::dealt(jobs, asked.lanes);
+  machine::undealt(ran_lanes(lanes, asked.measuring, 0, len(lanes)))
+}
+
+// Halves under a `parallel` block until one lane is left, so lanes run at once; each lane answers
+// with its tests' in turn.
+fn ran_lanes(
+  lanes: List<List<Job>>,
+  measuring: Bool,
+  lo: Int,
+  hi: Int,
+) -> List<List<Done>> / {tester.executed[corpus], tester.interleaved[corpus]} =
+  if hi - lo <= 0 { [] } else if hi - lo == 1 {
+    match list_at(lanes, lo) {
+      Some(lane) -> [fold(lane, [], |out: List<Done>, j: Job| push(out, ran_job(j, measuring)))],
+      None -> [],
+    }
+  } else {
+    let mid = lo + (hi - lo) / 2;
+    let halves = parallel {
+      ran_lanes(lanes, measuring, lo, mid),
+      ran_lanes(lanes, measuring, mid, hi),
+    };
+    appended(halves._0, halves._1)
+  }
+
+// A test once, or a seeded one searched an interleaving at a time.
+fn ran_job(
+  j: Job,
+  measuring: Bool,
+) -> Done / {tester.executed[corpus], tester.interleaved[corpus]} =
+  match j.search {
+    None -> { test: j.test, status: tester.executed[corpus](j.unit, j.test), settled: None },
+    Some(p) -> {
+      // A search re-runs the whole test, so any host operation runs once per interleaving.
+      let again = plan::re_executes(p) || measuring;
+      let run = |seed: Seed| tester.interleaved[corpus](j.unit, j.test, seed, p.steps, again);
+      let explored = if measuring { search::measure_reduction(p, run) }
+      else { search::explore(p, run) };
+      {
+        test: j.test,
+        status: match explored.failure {
+          None -> "passed",
+          // A recording that names no schedule, or a replay that took another, is Ply's fault.
+          Some(fl) -> match search::ran_failure(fl) {
+            Some(fell) -> fell.status,
+            None -> "panicked",
+          },
+        },
+        settled: Some({
+          test: j.test,
+          exploration: explored.exploration,
+          failure: explored.failure,
+          seeds: len(plan::normalized(p).roots),
+        }),
+      }
+    },
+  }
+
+// A green run's mutants, judged up to the budget; a red run's survivors would say nothing.
+fn mutated(
+  p: Program,
+  r: Ran,
+  options: Options,
+  asked: Asked,
+) -> Ran / {tester.mutated[corpus], tester.mutant[corpus], tester.mutation[corpus], tester.executed[corpus], tester.interleaved[corpus]} =
+  match options.mutate {
+    None -> r,
+    Some(_) -> if !green_run(r) { r } else {
+      let queue = tester.mutated[corpus]();
+      if len(queue.refused) > 0 { { ..r, escapes: appended(r.escapes, queue.refused) } } else {
+        let every = every_of(p, options);
+        let judged = map(take_first(queue.mutants, options.mutate_budget), |m: Queued|
+          judged_mutant(p, m, every, asked));
+        {
+          ..r,
+          mutants: Some(
+            tester.mutation[corpus](judged, len(queue.mutants) > options.mutate_budget),
+          ),
+        }
+      }
+    },
+  }
+
+// The tests that reach a mutant, in the classes every test the run reports on was coloured into: a
+// subset of a class shares nothing either. Every seed of the plan is owed, and nothing is filed.
+fn judged_mutant(
+  p: Program,
+  m: Queued,
+  every: List<List<Int>>,
+  asked: Asked,
+) -> Judged / {tester.mutant[corpus], tester.executed[corpus], tester.interleaved[corpus]} =
+  match tester.mutant[corpus](m.id) {
+    Err(j) -> { id: m.id, verdict: j.verdict, why: j.why },
+    Ok(unit) -> {
+      let classes = filter(
+        map(every, |class: List<Int>| filter(class, |i: Int| contains_int(m.tests, i))),
+        |class: List<Int>| len(class) > 0,
+      );
+      let statuses = flat_map(classes, |class: List<Int>|
+        map(
+          ran_class(map(class, |i: Int| job_of(p, unit, i, [], asked.plan)), {
+            ..asked,
+            measuring: false,
+          }),
+          |d: Done| d.status,
+        ));
+      let expected = fold(classes, 0, |n: Int, class: List<Int>| n + len(class));
+      let judged = |verdict: String, why: String| { id: m.id, verdict: verdict, why: why };
+      if said(statuses, "failed") { judged("killed", "") }
+      else if said(statuses, "panicked") { judged("unresolved", "Ply failed running the tests") }
+      else if len(filter(statuses, |w: String| w == "passed")) == expected {
+        judged("survived", "")
+      } else { judged("unresolved", "not every test answered") }
+    },
+  }
+
+fn take_first<a>(xs: List<a>, n: Int) -> List<a> =
+  fold(range(0, min(n, len(xs))), [], |out: List<a>, i: Int|
+    match list_at(xs, i) { Some(x) -> push(out, x), None -> out })
 
 /// What the store holds for each test, asked under the keys this program computes: the key its
 /// result is filed under, and — for a seeded test whose plan is answered root by root — each
@@ -1947,6 +2194,7 @@ fn a_decided(p: Program, keys: List<select::Case>) -> Decided = {
     p,
     decisions,
     a_search(),
+    Null,
     map(classes, |class: List<Int>| { tests: class, footprint: "{}" }),
     classes,
   )
@@ -1963,7 +2211,6 @@ fn a_program(cases: List<Case>) -> Program =
     declared: len(cases),
     cases: cases,
     filtered_out: 0,
-    plan: { mode: "one", roots: [0], seeds: 1, budget: 64, steps: 1000, path: [] },
     warnings: [],
     options: Null,
   }
@@ -2649,4 +2896,30 @@ test "a binding that does not match the program is a start-up failure naming no 
     "Error[E0412]: a nondet effect in a det test",
     "   no host handler was bound (1 error)",
   ])
+}
+
+test "a seeded test searches the roots it still owes, and any other runs once" {
+  let p = a_program([a_case(0, "plain"), { ..a_case(1, "seeded"), seeded: true }]);
+  let searching = plan::random(4);
+  assert_eq(job_of(p, 0, 0, [], searching), { unit: 0, test: 0, search: None });
+  assert_eq(job_of(p, 0, 1, [], searching).search, Some(searching));
+  assert_eq(job_of(p, 2, 1, [{ index: 1, roots: [2, 3] }], searching), {
+    unit: 2,
+    test: 1,
+    search: Some({ ..searching, roots: [2u64, 3u64] }),
+  })
+}
+
+test "the search a seeded test is keyed on is the plan the flags name, and the document says it" {
+  let p = machine::sim_plan_of({
+    ..machine::no_sim_options(),
+    mode: "random",
+    roots: Some({ from: 0, to: 3 }),
+  });
+  assert_eq(search_of(p), { mode: "random", roots: [0, 1, 2], budget: 1, steps: 100000, path: [] });
+  let seeded = { ..machine::no_sim_options(), seed: Some("0x10:2") };
+  let doc = to_string(with_sim(object([]), sim_json(machine::sim_plan_of(seeded), seeded)));
+  assert(string_contains(doc, "\"seed\":\"16:2\""));
+  assert(string_contains(doc, "\"mode\":\"once\""));
+  assert(string_contains(doc, "\"roots\":[16]"))
 }

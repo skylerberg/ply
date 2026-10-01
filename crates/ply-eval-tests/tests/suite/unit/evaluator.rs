@@ -2,8 +2,10 @@ use crate::fixture::port_front;
 use ply_eval::compiled::{Compiled, Entered};
 use ply_eval::host::{HostRuntime, MachineId, Pending};
 use ply_eval::{DefHash, Diagnostic, Front, Machine, Span, Symbol, Value, codes};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const PROGRAM: &str = "fn main() -> Int = 3\n\ntest \"main answers\" { assert_eq(main(), 3) }\n";
 
@@ -43,10 +45,9 @@ impl Compiled for Leaves {
     }
 }
 
-/// A runtime that warns as every entry point it is told of ends.
-#[derive(Default)]
+/// A runtime that warns as every entry point it is told of ends, counting them where a test reads.
 struct Warns {
-    ended: Cell<u32>,
+    ended: Arc<AtomicU32>,
 }
 
 impl HostRuntime for Warns {
@@ -67,7 +68,7 @@ impl HostRuntime for Warns {
     }
 
     fn end_entry_point(&self, _: MachineId) -> Result<(), Diagnostic> {
-        self.ended.set(self.ended.get() + 1);
+        self.ended.fetch_add(1, Ordering::Relaxed);
         Err(warning("the runtime's"))
     }
 }
@@ -91,16 +92,25 @@ fn both() -> Vec<&'static str> {
     ]
 }
 
-fn machine_over(front: &Front, answer: impl Fn() -> Entered + 'static) -> (Machine<'_>, Rc<Warns>) {
+/// The machine, and how many entry points its runtime has been told ended.
+fn machine_over(
+    front: &Front,
+    answer: impl Fn() -> Entered + 'static,
+) -> (Machine<'_>, Arc<AtomicU32>) {
     let tier = Rc::new(Leaves {
         program: front.hashes_digest,
         answer: Box::new(answer),
         left: RefCell::new(Vec::new()),
     });
     let mut machine = Machine::new(front, tier).expect("the tier describes the program");
-    let runtime = Rc::new(Warns::default());
-    machine.set_host_runtime(runtime.clone());
-    (machine, runtime)
+    let ended = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&ended);
+    machine.set_host_runtime(Arc::new(move || {
+        Rc::new(Warns {
+            ended: Arc::clone(&counted),
+        }) as Rc<dyn HostRuntime>
+    }));
+    (machine, ended)
 }
 
 #[test]
@@ -119,13 +129,13 @@ fn a_test_hands_back_what_its_body_and_its_entry_point_warned_of_as_it_ended() {
 #[test]
 fn each_call_hands_back_its_own_warnings_and_none_of_the_entry_before_it() {
     let front = port_front(&[("", PROGRAM)]);
-    let (mut machine, runtime) = machine_over(&front, || Entered::Answered(Value::Int(3)));
+    let (mut machine, ended) = machine_over(&front, || Entered::Answered(Value::Int(3)));
     for entry in 1..=2 {
         let (answer, warnings) = machine.call("main", Vec::new(), Span::DUMMY).into_parts();
         assert_eq!(answer.ok(), Some(Value::Int(3)), "entry {entry}");
         assert_eq!(messages(&warnings), both(), "entry {entry}");
     }
-    assert_eq!(runtime.ended.get(), 2);
+    assert_eq!(ended.load(Ordering::Relaxed), 2);
 }
 
 /// A body that raises never reaches the `trace.exit` it was heading for, which is when its spans
@@ -147,8 +157,7 @@ fn a_raise_hands_back_its_warnings_beside_the_diagnostic() {
 #[test]
 fn an_entry_refused_before_it_ran_ended_nothing_and_warns_of_nothing() {
     let front = port_front(&[("", PROGRAM)]);
-    let (mut machine, runtime) =
-        machine_over(&front, || panic!("a refused entry reached the tier"));
+    let (mut machine, ended) = machine_over(&front, || panic!("a refused entry reached the tier"));
     let (answer, warnings) = machine.eval_test(7).into_parts();
     assert_eq!(
         answer.expect_err("there is no eighth test").code,
@@ -156,7 +165,7 @@ fn an_entry_refused_before_it_ran_ended_nothing_and_warns_of_nothing() {
     );
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(
-        runtime.ended.get(),
+        ended.load(Ordering::Relaxed),
         0,
         "no entry point began, so none ended"
     );

@@ -1,7 +1,6 @@
 //! The `.ply-cache` directory: results keyed by `(RUNTIME_VERSION, DefHash)`, and the front end
-//! keyed by `(FRONTEND_VERSION, path | DefHash)`, beside the parts of the last claims it lowered.
+//! keyed by `(FRONTEND_VERSION, path | DefHash)`.
 
-mod answer;
 mod binary;
 pub mod body;
 pub mod codec;
@@ -9,7 +8,6 @@ pub mod diag;
 pub mod disk;
 pub mod frontend;
 mod idx;
-pub mod obligations;
 pub mod reviews;
 pub mod schema;
 pub mod upstream;
@@ -22,9 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub use frontend::{DefEntry, DefKind, FileSpan, Member, Slot, SourceFingerprint, TestEntry};
-pub use obligations::{
-    CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule,
-};
 pub use reviews::ReviewRecord;
 pub use schema::fingerprint as schema_fingerprint;
 pub use upstream::Upstream;
@@ -299,13 +294,14 @@ pub struct Store {
     entries: disk::Entries,
     definitions: disk::Definitions,
     passes: Passes,
-    obligations: Lazy<DefHash, CachedObligation>,
+    /// Each discharged obligation's evidence, as the prove package wrote it: the store never reads
+    /// it.
+    obligations: Lazy<DefHash, serde_json::Value>,
     reviews: Lazy<Symbol, ReviewRecord>,
     dirty: bool,
     frontend_path: PathBuf,
     frontend_data_path: PathBuf,
     frontend: frontend::Frontend,
-    claims: answer::Answer,
     warnings: Vec<Diagnostic>,
     stdlib: Stdlib,
     upstream: Option<Upstream>,
@@ -607,7 +603,7 @@ fn names_match(name: &Symbol, query: &str) -> bool {
 }
 
 /// Obsolete front-end cache files, removed whenever the front end is written.
-const RETIRED_FRONTEND_FILES: [&str; 2] = ["frontend.json", "frontend.answer"];
+const RETIRED_FRONTEND_FILES: [&str; 3] = ["frontend.json", "frontend.answer", "claims.answer"];
 
 impl Store {
     pub fn open(root: &Path) -> anyhow::Result<Store> {
@@ -622,11 +618,6 @@ impl Store {
         let frontend_path = dir.join(frontend::FRONTEND_FILE);
         let frontend_data_path = dir.join(frontend::FRONTEND_DATA_FILE);
         let stdlib_path = dir.join(disk::STDLIB_FILE);
-        let claims = answer::Answer::new(
-            dir.join(answer::CLAIMS_FILE),
-            answer::CLAIMS_STEM,
-            "lowered claims",
-        );
         let (frontend, frontend_warnings) =
             frontend::Frontend::open(&frontend_path, &frontend_data_path);
         let mut store = Store {
@@ -654,7 +645,6 @@ impl Store {
             frontend_path,
             frontend_data_path,
             frontend,
-            claims,
             warnings: frontend_warnings,
             upstream: None,
             shared_passes: std::collections::BTreeSet::new(),
@@ -730,7 +720,7 @@ impl Store {
     }
 
     /// The local entry, or else the upstream's.
-    pub fn obligation(&self, key: DefHash) -> Option<CachedObligation> {
+    pub fn obligation(&self, key: DefHash) -> Option<serde_json::Value> {
         if let Some(entry) = self.obligations.get(&key) {
             return Some(entry.clone());
         }
@@ -738,7 +728,7 @@ impl Store {
     }
 
     /// Only a `Held` discharge may be written, and only under its tier's key.
-    pub fn put_obligation(&mut self, key: DefHash, entry: CachedObligation) {
+    pub fn put_obligation(&mut self, key: DefHash, entry: serde_json::Value) {
         self.obligations.put(key, entry);
     }
 
@@ -766,7 +756,6 @@ impl Store {
             && !self.reviews.dirty
             && !self.frontend.is_dirty()
             && self.stdlib.pending.is_none()
-            && !self.claims.is_pending()
         {
             return Ok(());
         }
@@ -789,7 +778,7 @@ impl Store {
         self.write_passes()?;
         self.write_results()?;
         let dir = self.dir.clone();
-        let fresh_obligations: Vec<(DefHash, CachedObligation)> = self
+        let fresh_obligations: Vec<(DefHash, serde_json::Value)> = self
             .obligations
             .added
             .iter()
@@ -808,12 +797,11 @@ impl Store {
             disk::save_stdlib(&self.dir, &self.stdlib.path, &digest)?;
             self.stdlib.stored = OnceLock::from(Some(digest));
         }
-        self.claims.flush(&self.dir)?;
         Ok(())
     }
 
     /// After the local write, so an unreachable upstream never costs a run its own record.
-    fn publish(&mut self, obligations: &[(DefHash, CachedObligation)]) {
+    fn publish(&mut self, obligations: &[(DefHash, serde_json::Value)]) {
         let Some(upstream) = self.upstream.clone() else {
             return;
         };
@@ -915,7 +903,6 @@ impl Store {
         remove(&self.obligations.path, "obligation cache")?;
         remove(&self.frontend_path, "front-end cache")?;
         remove(&self.frontend_data_path, "front-end cache")?;
-        self.claims.clear()?;
         self.forget_retired();
         disk::sweep_temps(&self.dir, None);
         Ok(())
@@ -1010,15 +997,6 @@ impl Store {
         for name in RETIRED_FRONTEND_FILES {
             let _ = std::fs::remove_file(self.dir.join(name));
         }
-    }
-
-    pub fn claims_part(&self, key: ContentHash) -> Option<Vec<u8>> {
-        self.claims.part(key)
-    }
-
-    /// Replaces every part on disk at the next flush, unless these are the parts already there.
-    pub fn put_claims_parts(&mut self, parts: std::collections::BTreeMap<ContentHash, Vec<u8>>) {
-        self.claims.put(parts);
     }
 
     pub fn frontend_path(&self) -> &Path {
@@ -1234,7 +1212,7 @@ impl Store {
     }
 
     pub fn frontend_is_empty(&self) -> bool {
-        self.frontend.is_empty() && self.claims.is_empty()
+        self.frontend.is_empty()
     }
 
     pub fn frontend_is_dirty(&self) -> bool {

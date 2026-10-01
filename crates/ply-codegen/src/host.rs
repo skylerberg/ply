@@ -61,7 +61,7 @@ fn arguments(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]) -> Option
         let params = &program.check.effects.get(effect)?.ops.get(op)?.params;
         Some((params.as_slice(), &program.ctor_carries))
     });
-    let tables = std::rc::Rc::clone(&c.tables);
+    let tables = std::sync::Arc::clone(&c.tables);
     let mut walked = Walked::default();
     let mut out = Vec::with_capacity(args.len());
     for (i, w) in args.iter().enumerate() {
@@ -169,7 +169,7 @@ pub unsafe fn perform(
     if let Err(d) = ply_eval::escape::check_arguments(&operation, declaration.path, &values, span) {
         return c.fail(d);
     }
-    let runtime = c.runtime.clone();
+    let runtime = c.host_runtime();
     let answered = {
         let request = HostRequest {
             atom: atom.clone(),

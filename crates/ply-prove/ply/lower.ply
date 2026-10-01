@@ -1,0 +1,1242 @@
+// `lower` — a claim's lowered code as prover terms, with what must hold for it to have a value.
+
+import compiler.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
+                      NPerform, NLabel, NCell, NLambda, NSim, NPar, NHandle, NField, NUpd, CStmt,
+                      CLet, CLetPat, CDo, CField, CArm, Cap, CPat, PxWild, PxVar, PxLit, PxCtor,
+                      PxRecord, PxList, CPatField)
+import compiler.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
+import context (Context, Ctor, Def, ctor, arity, ctor_sort, signature, is_pure, is_recursive,
+                unfoldable, self_recursive, reaches_float)
+import domain (Ty, Var, Fn, Record, Con)
+import rules (RuleLog, unfolded)
+import sort (bool_ty, bytes_ty, float_ty, int_ty, string_ty, decimal_ty, is_con, list_elem, list_ty,
+             option_ty, record_of, substituted, field_ty)
+import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFixed, TUnit, TSym, TOpaque, TLin,
+             TApp, TCtor, TNil, TCons, TRecord, TField, TNot, TAnd, TOr, TCmp, TEq, TIf, TMatch,
+             CmpOp, Lt, Le, Gt, Ge, Arm, ArmTest, Always, TestCtor, TestLit, TestList, Undecidable,
+             true_id, false_id, new_terms, size, node, sort_of, force_int, mk, int_lit, boolean,
+             string, decimal, fixed, unit, nil, cons, sym, opaque, add, sub, neg, mul, field, not,
+             and, or, cmp, eq, app, op_add, op_sub, op_mul, op_div, op_rem, op_concat, op_bit_and,
+             op_bit_or, op_bit_xor, op_bit_not, op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge)
+
+// Past this many terms no definition is unfolded further.
+pub fn max_terms() -> Int = 20000
+
+// Prelude functions that cannot raise or diverge, so a call needs no definedness requirement.
+pub fn total_builtins() -> List<String> =
+  [
+    "len",
+    "push",
+    "list_at",
+    "int_to_string",
+    "min",
+    "max",
+    "string_concat",
+    "bytes_len",
+    "bytes_concat",
+    "bytes_of_string",
+    "bytes_is_utf8",
+    "bytes_index_of",
+    "bytes_starts_with",
+    "bytes_ends_with",
+    "string_of_bytes_lossy",
+    "string_len",
+    "string_trim",
+    "string_lower",
+    "string_upper",
+    "string_starts_with",
+    "string_ends_with",
+    "string_contains",
+    "map_new",
+    "map_insert",
+    "map_get",
+    "map_contains",
+    "map_remove",
+    "map_len",
+    "map_keys",
+    "map_values",
+    "map_entries",
+    "map_of_entries",
+    "map_merge",
+    "decimal_of_int",
+    "decimal_to_string",
+    "decimal_of_string",
+    "float_of_decimal",
+    "decimal_of_float",
+    "int_of_decimal",
+    "bits_of_float",
+    "float_of_bits",
+    // Total but still uninterpreted.
+    "wrap_add",
+    "wrap_sub",
+    "wrap_mul",
+    "rotr32",
+    "checked_add",
+    "checked_sub",
+    "checked_mul",
+    "checked_neg",
+    "i128_of_int",
+    "u128_to_string",
+    "i128_to_string",
+    "u128_of_string",
+    "i128_of_string",
+  ]
+
+pub fn is_total_builtin(name: String) -> Bool =
+  fold(total_builtins(), false, |f: Bool, b: String| f || b == name)
+
+// Where lowering left the decidable fragment.
+pub type Blocker =
+  | RecursiveCall(String)
+  // A call whose row is not known to be empty, so occurrences cannot share a term.
+  | EffectfulCall(String)
+  | UnfoldLimit(String)
+  // A builtin, or a name from outside the program.
+  | OpaqueCall(String)
+  | Division
+  | NonlinearMultiplication
+  | CoefficientRange
+  | Lambda
+  | Concat
+  | BitOperator
+  | FloatTerm
+  | DecimalArithmetic
+  // `perform`, `handle`, `with_cell` or `simulate`.
+  | Region
+  | UndecidableMatchArm
+  | DestructuringLet
+  // Why induction declined: which definition or case, in words.
+  | Induction(String)
+
+// The kind a report prints, and the definition or reason it names, if any.
+pub fn blocker_parts(b: Blocker) -> { kind: String, detail: Option<String> } =
+  match b {
+    RecursiveCall(d) -> { kind: "recursive_call", detail: Some(d) },
+    EffectfulCall(d) -> { kind: "effectful_call", detail: Some(d) },
+    UnfoldLimit(d) -> { kind: "unfold_limit", detail: Some(d) },
+    OpaqueCall(d) -> { kind: "opaque_call", detail: Some(d) },
+    Division -> { kind: "division", detail: None },
+    NonlinearMultiplication -> { kind: "nonlinear_multiplication", detail: None },
+    CoefficientRange -> { kind: "coefficient_range", detail: None },
+    Lambda -> { kind: "lambda", detail: None },
+    Concat -> { kind: "concat", detail: None },
+    BitOperator -> { kind: "bit_operator", detail: None },
+    FloatTerm -> { kind: "float_term", detail: None },
+    DecimalArithmetic -> { kind: "decimal_arithmetic", detail: None },
+    Region -> { kind: "region", detail: None },
+    UndecidableMatchArm -> { kind: "undecidable_match_arm", detail: None },
+    DestructuringLet -> { kind: "destructuring_let", detail: None },
+    Induction(why) -> { kind: "induction", detail: Some(why) },
+  }
+
+// A self call whose argument in `slot` must be non-negative and below `bound`, the parameter it was
+// entered with: what makes a recursive definition terminate.
+pub type Measure = { def: String, slot: Int, bound: Int }
+
+pub type Lowering = {
+  ts: Terms,
+  rules: RuleLog,
+  unfold_limit: Int,
+  depth: Int,
+  window: List<Option<Int>>,
+  blockers: List<Blocker>,
+  // What must hold for the lowered expressions not to raise or diverge.
+  requirements: List<Int>,
+  // Conditions assumed on the way to the expression being lowered.
+  path: List<Int>,
+  float: Bool,
+  // Recursive definitions shown to terminate, so a call of one is a value.
+  total: Map<String, Bool>,
+  // Recursive definitions inlined to the depth, each unrolling recorded as an equation.
+  unrolled: Map<String, Bool>,
+  measure: Option<Measure>,
+  // What each self call under the measure owes: the argument decreases and stays non-negative.
+  measures: List<Int>,
+  // `f(x̄) == body(x̄)` for each unrolling of a recursive definition, and the `f(x̄)` of each.
+  equations: List<Int>,
+  defined: List<Int>,
+  // Calls of a total definition left as terms.
+  calls: List<Int>,
+  // Each rest binder of a list pattern, with the list it is the tail of.
+  smaller: List<{ tail: Int, from: Int }>,
+}
+
+// A lowering after a step, and the term the step produced.
+pub type L = { lw: Lowering, id: Int }
+
+pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering =
+  {
+    ts: new_terms(),
+    rules: rules,
+    unfold_limit: unfold_limit,
+    depth: 0,
+    window: [],
+    blockers: [],
+    requirements: [],
+    path: [],
+    float: false,
+    total: map_new(),
+    unrolled: map_new(),
+    measure: None,
+    measures: [],
+    equations: [],
+    defined: [],
+    calls: [],
+    smaller: [],
+  }
+
+fn text(b: Bytes) -> String = string_of_bytes_lossy(b)
+
+fn holds(set: Map<String, Bool>, name: String) -> Bool = map_contains(set, name)
+
+// Lifts a term-store step into the lowering.
+fn on(lw: Lowering, made: Made) -> L = { lw: { ..lw, ts: made.ts }, id: made.id }
+
+fn with_ts(lw: Lowering, ts: Terms) -> Lowering = { ..lw, ts: ts }
+
+fn blocked(lw: Lowering, b: Blocker) -> Lowering = { ..lw, blockers: push(lw.blockers, b) }
+
+// No proof survives a `Float` in the obligation.
+fn floated(lw: Lowering) -> Lowering =
+  if lw.float { lw } else { { ..blocked(lw, FloatTerm), float: true } }
+
+pub fn assume(lw: Lowering, cond: Int) -> Lowering = { ..lw, path: push(lw.path, cond) }
+
+// Forgets the conditions assumed so far, before lowering a hypothesis instance.
+pub fn drop_assumptions(lw: Lowering) -> Lowering = { ..lw, path: [] }
+
+fn popped(lw: Lowering) -> Lowering = { ..lw, path: take(lw.path, len(lw.path) - 1) }
+
+fn take<a>(xs: List<a>, n: Int) -> List<a> =
+  fold(range(0, n), [], |acc: List<a>, i: Int|
+    match list_at(xs, i) { Some(x) -> push(acc, x), None -> acc })
+
+fn drop_front<a>(xs: List<a>, n: Int) -> List<a> =
+  fold(range(n, len(xs)), [], |acc: List<a>, i: Int|
+    match list_at(xs, i) { Some(x) -> push(acc, x), None -> acc })
+
+// `p₁ ∧ … ∧ pₙ ⟹ cond` under the current path.
+pub fn under_path(lw: Lowering, cond: Int) -> L =
+  fold(range(0, len(lw.path)), { lw: lw, id: cond }, |acc: L, k: Int| {
+    let i = len(lw.path) - 1 - k;
+    match list_at(lw.path, i) {
+      Some(p) -> {
+        let negated = not(acc.lw.ts, p);
+        on(acc.lw, or(negated.ts, negated.id, acc.id))
+      },
+      None -> acc,
+    }
+  })
+
+fn require(lw: Lowering, cond: Int) -> Lowering =
+  if cond == true_id() { lw } else {
+    let out = under_path(lw, cond);
+    { ..out.lw, requirements: push(out.lw.requirements, out.id) }
+  }
+
+fn undefined(lw: Lowering) -> Lowering = require(lw, false_id())
+
+fn require_int_range(lw: Lowering, t: Int) -> Lowering =
+  match node(lw.ts, t) {
+    TLin(_) -> {
+      let min = int_lit(lw.ts, 0 - 9223372036854775807 - 1);
+      let max = int_lit(min.ts, 9223372036854775807);
+      let low = cmp(max.ts, Ge, t, min.id);
+      let high = cmp(low.ts, Le, t, max.id);
+      let both = and(high.ts, low.id, high.id);
+      require(with_ts(lw, both.ts), both.id)
+    },
+    _ -> lw,
+  }
+
+// Zero divisors raise, and `Int`'s least value divided by `-1` overflows.
+fn require_divisible(lw: Lowering, lhs: Int, rhs: Int) -> Lowering =
+  match node(lw.ts, rhs) {
+    TInt(k) -> if k == 0 { undefined(lw) } else if k == 0 - 1 {
+      let min = int_lit(lw.ts, 0 - 9223372036854775807 - 1);
+      let is_min = eq(min.ts, lhs, min.id);
+      let not_min = not(is_min.ts, is_min.id);
+      require(with_ts(lw, not_min.ts), not_min.id)
+    } else { lw },
+    _ -> {
+      let zero = int_lit(lw.ts, 0);
+      let is_zero = eq(zero.ts, rhs, zero.id);
+      let nonzero = not(is_zero.ts, is_zero.id);
+      let lw2 = require(with_ts(lw, nonzero.ts), nonzero.id);
+      let min = int_lit(lw2.ts, 0 - 9223372036854775807 - 1);
+      let minus_one = int_lit(min.ts, 0 - 1);
+      let lhs_min = eq(minus_one.ts, lhs, min.id);
+      let rhs_minus_one = eq(lhs_min.ts, rhs, minus_one.id);
+      let overflows = and(rhs_minus_one.ts, lhs_min.id, rhs_minus_one.id);
+      let safe = not(overflows.ts, overflows.id);
+      require(with_ts(lw2, safe.ts), safe.id)
+    },
+  }
+
+// A shift raises unless its count is a bit position; nothing else makes it raise.
+fn require_shift_count(lw: Lowering, count: Int) -> Lowering = {
+  let zero = int_lit(lw.ts, 0);
+  let width = int_lit(zero.ts, 63);
+  let low = cmp(width.ts, Ge, count, zero.id);
+  let high = cmp(low.ts, Le, count, width.id);
+  let both = and(high.ts, low.id, high.id);
+  require(with_ts(lw, both.ts), both.id)
+}
+
+pub fn bind_symbolic(lw: Lowering, t: Ty, cx: Context) -> L = {
+  let lw2 = if reaches_float(cx, t) { floated(lw) } else { lw };
+  on(lw2, sym(lw2.ts, Some(t)))
+}
+
+pub fn lower_root(lw: Lowering, cx: Context, c: Option<Code>, binders: List<Int>) -> L = {
+  let outer = lw.window;
+  let r = lower_opt({ ..lw, window: map(binders, |t: Int| Some(t)) }, cx, c);
+  { lw: { ..r.lw, window: outer }, id: r.id }
+}
+
+// A body or clause the lowering did not take reads as unreached.
+fn lower_opt(lw: Lowering, cx: Context, c: Option<Code>) -> L =
+  match c {
+    Some(code) -> lower(lw, cx, code),
+    None -> on(blocked(lw, UndecidableMatchArm), sym(lw.ts, None)),
+  }
+
+fn opaque_sym(lw: Lowering, b: Blocker) -> L = {
+  let lw2 = blocked(lw, b);
+  on(lw2, sym(lw2.ts, None))
+}
+
+pub fn lower(lw: Lowering, cx: Context, c: Code) -> L =
+  match c.node {
+    NLit(l) -> literal(lw, l),
+    NVar(v) -> match v.slot { Some(s) -> local(lw, s), None -> global(lw, cx, text(v.name)) },
+    NBinary(b) -> binary_code(lw, cx, b.op, b.lhs, b.rhs),
+    NUnary(u) -> unary(lw, cx, u.op, u.operand),
+    NLambda(_) -> opaque_sym(lw, Lambda),
+    NApp(a) -> application(lw, cx, a.func, a.args),
+    NIf(i) -> {
+      let cond = lower(lw, cx, i.cond);
+      let then_branch = lower(assume(cond.lw, cond.id), cx, i.then_branch);
+      let otherwise = not(then_branch.lw.ts, cond.id);
+      let else_branch = lower(
+        assume(popped(with_ts(then_branch.lw, otherwise.ts)), otherwise.id),
+        cx,
+        i.else_branch,
+      );
+      let lw2 = popped(else_branch.lw);
+      let sort = match sort_of(lw2.ts, then_branch.id) {
+        Some(s) -> Some(s),
+        None -> sort_of(lw2.ts, else_branch.id),
+      };
+      on(
+        lw2,
+        mk(
+          lw2.ts,
+          TIf({ cond: cond.id, then_branch: then_branch.id, else_branch: else_branch.id }),
+          sort,
+        ),
+      )
+    },
+    NMatch(m) -> match_expr(lw, cx, m.scrutinee, m.arms),
+    NBlock(b) -> block(lw, cx, b.stmts, b.tail),
+    NRecord(r) ->
+      record(lw, cx, map(r.fields, |f: CField| { name: text(f.name), value: Some(f.value) }), None),
+    // Each branch applied where it stands: the block means the tuple of its branches' answers.
+    NPar(pr) ->
+      record(
+        lw,
+        cx,
+        map(range(0, len(pr.branches)), |i: Int|
+          {
+            name: "_" ++ int_to_string(i),
+            value: match list_at(pr.branches, i) {
+              Some(b) -> Some({ own: b.own, span: b.span, node: NApp({ func: b, args: [] }) }),
+              None -> None,
+            },
+          }),
+        None,
+      ),
+    // The fields a record update copies read the base; the ones it sets follow them.
+    NUpd(u) ->
+      record(
+        lw,
+        cx,
+        fold(
+          u.sets,
+          map(u.copies, |n: Bytes| { name: text(n), value: None }),
+          |acc: List<{ name: String, value: Option<Code> }>, f: CField|
+            push(acc, { name: text(f.name), value: Some(f.value) }),
+        ),
+        Some(u.base),
+      ),
+    NField(f) -> {
+      let base = lower(lw, cx, f.base);
+      on(base.lw, field(base.lw.ts, base.id, text(f.field)))
+    },
+    NList(l) -> {
+      let items = fold(
+        l.items,
+        { lw: lw, ids: [] },
+        |acc: { lw: Lowering, ids: List<Int> }, x: Code| {
+          let r = lower(acc.lw, cx, x);
+          { lw: r.lw, ids: push(acc.ids, r.id) }
+        },
+      );
+      let sort = match list_at(items.ids, 0) {
+        Some(t) -> match sort_of(items.lw.ts, t) { Some(s) -> Some(list_ty(s)), None -> None },
+        None -> None,
+      };
+      let empty = nil(items.lw.ts, sort);
+      let built = fold(range(0, len(items.ids)), empty, |acc: Made, k: Int|
+        match list_at(items.ids, len(items.ids) - 1 - k) {
+          Some(item) -> cons(acc.ts, item, acc.id, sort),
+          None -> acc,
+        });
+      on(items.lw, built)
+    },
+    NPerform(_) -> opaque_sym(lw, Region),
+    NCell(_) -> opaque_sym(lw, Region),
+    NSim(_) -> opaque_sym(lw, Region),
+    NHandle(_) -> opaque_sym(lw, Region),
+    // A label argument is the field-table entry of a resource: opaque, like a perform.
+    NLabel(_) -> opaque_sym(lw, Region),
+  }
+
+// A record literal, or an update: each copied field read off `base`, then each set one.
+fn record(
+  lw: Lowering,
+  cx: Context,
+  fields: List<{ name: String, value: Option<Code> }>,
+  base: Option<Code>,
+) -> L = {
+  let lowered = fold(
+    fields,
+    { lw: lw, out: [] },
+    |acc: { lw: Lowering, out: List<{ name: String, value: Int }> }, f: { name: String, value: Option<Code> }|
+      match f.value {
+        Some(v) -> {
+          let r = lower(acc.lw, cx, v);
+          { lw: r.lw, out: push(acc.out, { name: f.name, value: r.id }) }
+        },
+        None -> match base {
+          Some(b) -> {
+            let r = lower(acc.lw, cx, b);
+            let read = field(r.lw.ts, r.id, f.name);
+            { lw: with_ts(r.lw, read.ts), out: push(acc.out, { name: f.name, value: read.id }) }
+          },
+          None -> acc,
+        },
+      },
+  );
+  let sorted = sorted_fields(lowered.out);
+  let sort = record_sort(lowered.lw.ts, sorted);
+  on(lowered.lw, mk(lowered.lw.ts, TRecord(sorted), sort))
+}
+
+// Stable, by name.
+fn sorted_fields(fields: List<{ name: String, value: Int }>) -> List<{ name: String, value: Int }> =
+  fold(fields, [], |acc: List<{ name: String, value: Int }>, f: { name: String, value: Int }| {
+    let before = filter(acc, |g: { name: String, value: Int }| compare(g.name, f.name) != Greater);
+    let after = filter(acc, |g: { name: String, value: Int }| compare(g.name, f.name) == Greater);
+    fold(
+      after,
+      push(before, f),
+      |a: List<{ name: String, value: Int }>, g: { name: String, value: Int }| push(a, g),
+    )
+  })
+
+fn record_sort(ts: Terms, fields: List<{ name: String, value: Int }>) -> Option<Ty> =
+  match fold(
+      fields,
+      Some([]),
+      |acc: Option<List<{ name: String, ty: Ty }>>, f: { name: String, value: Int }|
+        match acc {
+          None -> None,
+          Some(xs) -> match sort_of(ts, f.value) {
+            Some(s) -> Some(push(xs, { name: f.name, ty: s })),
+            None -> None,
+          },
+        },
+    ) {
+    Some(xs) -> Some(record_of(xs)),
+    None -> None,
+  }
+
+fn unary(lw: Lowering, cx: Context, op: Bytes, operand: Code) -> L = {
+  let t = lower(lw, cx, operand);
+  if op == b"not" { on(t.lw, not(t.lw.ts, t.id)) }
+  // Not folded to `-x - 1`, which raises at `Int`'s least value where `~` does not.
+  else if op == b"bitnot" {
+    let lw2 = blocked(with_ts(t.lw, force_int(t.lw.ts, t.id)), BitOperator);
+    let head = opaque(lw2.ts, op_bit_not(), None);
+    let term = app(head.ts, head.id, [t.id], Some(int_ty()));
+    { lw: with_ts(lw2, force_int(term.ts, term.id)), id: term.id }
+  } else {
+    let lw2 = with_ts(t.lw, force_int(t.lw.ts, t.id));
+    match neg(lw2.ts, t.id) {
+      Some(out) -> { lw: require_int_range(with_ts(lw2, out.ts), out.id), id: out.id },
+      None -> {
+        let lw3 = undefined(blocked(lw2, CoefficientRange));
+        on(lw3, sym(lw3.ts, Some(int_ty())))
+      },
+    }
+  }
+}
+
+fn literal(lw: Lowering, l: Lit) -> L =
+  match l {
+    LInt(k) -> on(lw, int_lit(lw.ts, k)),
+    LBool(b) -> on(lw, boolean(lw.ts, b)),
+    LStr(s) -> on(lw, string(lw.ts, text(s))),
+    // Not `TStr`: `b"ab"` and `"ab"` must not be congruent.
+    LBytes(_) -> on(lw, sym(lw.ts, Some(bytes_ty()))),
+    // No shared node: congruence needs a reflexive `==`, which `Float` lacks.
+    LFloat(_) -> {
+      let lw2 = floated(lw);
+      on(lw2, sym(lw2.ts, Some(float_ty())))
+    },
+    LDec(raw) -> on(lw, decimal(lw.ts, decimal_of_raw(text(raw)))),
+    LFixed(width, bits) -> on(lw, fixed(lw.ts, string_upper(text(width)), 0, bits)),
+    LWide(width, high, low) -> on(lw, fixed(lw.ts, string_upper(text(width)), high, low)),
+    LUnit -> on(lw, unit(lw.ts)),
+    LBad -> on(lw, unit(lw.ts)),
+  }
+
+// `1.50m` is `1.50`; a pattern's `-` is part of its source, and negates it.
+fn decimal_of_raw(raw: String) -> Decimal = {
+  let b = bytes_of_string(raw);
+  let digits = |from: Int, to: Int|
+    bytes_concat_all(
+      map(range(from, to), |i: Int| {
+        let c = bytes_at(b, i);
+        if c >= 48 && c <= 57 { bytes_slice(b, i, i + 1) } else { b"" }
+      }),
+    );
+  let dot = match bytes_index_of(b, b".") { Some(i) -> i, None -> bytes_len(b) };
+  let whole = digits(0, dot);
+  let fraction = digits(dot, bytes_len(b));
+  let sign = if bytes_starts_with(b, b"-") { b"-" } else { b"" };
+  let spelled = bytes_concat_all([
+    sign,
+    if bytes_len(whole) == 0 { b"0" } else { whole },
+    if bytes_len(fraction) == 0 { b"" } else { b"." },
+    fraction,
+  ]);
+  match decimal_of_string(string_of_bytes(spelled)) { Some(d) -> d, None -> decimal_of_int(0) }
+}
+
+fn local(lw: Lowering, slot: Int) -> L =
+  match list_at(lw.window, slot) {
+    Some(Some(t)) -> { lw: lw, id: t },
+    _ -> on(lw, sym(lw.ts, None)),
+  }
+
+fn bind(lw: Lowering, slot: Int, t: Int) -> Lowering = {
+  let grown = if len(lw.window) <= slot {
+    fold(range(len(lw.window), slot + 1), lw.window, |w: List<Option<Int>>, _: Int| push(w, None))
+  } else { lw.window };
+  { ..lw, window: list_set(grown, slot, Some(t)) }
+}
+
+fn global(lw: Lowering, cx: Context, name: String) -> L =
+  match ctor(cx, name) {
+    Some(c) -> if arity(c) == 0 {
+      on(lw, mk(lw.ts, TCtor({ name: name, args: [] }), Some(ctor_sort(c))))
+    } else { on(lw, mk(lw.ts, TOpaque(name), Some(ctor_sort(c)))) },
+    None -> match signature(cx, name) {
+      Some(s) -> on(lw, mk(lw.ts, TOpaque(name), Some(s.ty))),
+      None -> if is_total_builtin(name) { on(lw, opaque(lw.ts, name, None)) }
+      else { on(lw, sym(lw.ts, None)) },
+    },
+  }
+
+type Numeric = | FloatOperand | DecimalOperand
+
+fn operand_type(ts: Terms, lhs: Int, rhs: Int) -> Option<Numeric> =
+  fold([lhs, rhs], None, |acc: Option<Numeric>, side: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> match sort_of(ts, side) {
+        Some(t) -> if is_con(t, "Float") { Some(FloatOperand) }
+        else if is_con(t, "Decimal") { Some(DecimalOperand) }
+        else { None },
+        None -> None,
+      },
+    })
+
+// Short-circuit: the right operand owes its requirements only under the left's answer.
+fn binary_code(lw: Lowering, cx: Context, op: Bytes, lhs: Code, rhs: Code) -> L =
+  if op == b"and" || op == b"or" {
+    let l = lower(lw, cx, lhs);
+    let reached = if op == b"and" { { lw: l.lw, id: l.id } } else { on(l.lw, not(l.lw.ts, l.id)) };
+    let r = lower(assume(reached.lw, reached.id), cx, rhs);
+    binary(popped(r.lw), op, l.id, r.id)
+  } else {
+    let l = lower(lw, cx, lhs);
+    let r = lower(l.lw, cx, rhs);
+    binary(r.lw, op, l.id, r.id)
+  }
+
+fn is_arith_op(op: Bytes) -> Bool =
+  op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
+
+fn is_cmp_op(op: Bytes) -> Bool = op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
+
+fn cmp_of(op: Bytes) -> CmpOp =
+  if op == b"lt" { Lt } else if op == b"le" { Le } else if op == b"gt" { Gt } else { Ge }
+
+fn arith_symbol(op: Bytes) -> String =
+  if op == b"add" { op_add() }
+  else if op == b"sub" { op_sub() }
+  else if op == b"mul" { op_mul() }
+  else if op == b"div" { op_div() }
+  else if op == b"rem" { op_rem() }
+  else if op == b"lt" { op_lt() }
+  else if op == b"le" { op_le() }
+  else if op == b"gt" { op_gt() }
+  else { op_ge() }
+
+fn non_int_operator(lw: Lowering, op: Bytes, lhs: Int, rhs: Int, numeric: Numeric) -> L = {
+  let comparison = is_cmp_op(op);
+  let lw2 = match numeric {
+    FloatOperand -> floated(lw),
+    DecimalOperand -> {
+      let b = blocked(lw, DecimalArithmetic);
+      if comparison { b } else { undefined(b) }
+    },
+  };
+  let sort = if comparison { bool_ty() }
+  else { match numeric { FloatOperand -> float_ty(), DecimalOperand -> decimal_ty() } };
+  let head = opaque(lw2.ts, arith_symbol(op), None);
+  on(lw2, app(head.ts, head.id, [lhs, rhs], Some(sort)))
+}
+
+fn forced(lw: Lowering, a: Int, b: Int) -> Lowering = with_ts(lw, force_int(force_int(lw.ts, a), b))
+
+fn binary(lw: Lowering, op: Bytes, lhs: Int, rhs: Int) -> L =
+  match if is_arith_op(op) || is_cmp_op(op) { operand_type(lw.ts, lhs, rhs) } else { None } {
+    Some(numeric) -> non_int_operator(lw, op, lhs, rhs, numeric),
+    None -> if is_arith_op(op) {
+      let lw2 = forced(lw, lhs, rhs);
+      let folded = if op == b"add" { add(lw2.ts, lhs, rhs) }
+      else if op == b"sub" { sub(lw2.ts, lhs, rhs) }
+      else if op == b"mul" { mul(lw2.ts, lhs, rhs) }
+      // Uninterpreted even by a literal, so `x / 2 * 2 == x` can never be proved.
+      else { None };
+      match folded {
+        Some(t) -> { lw: require_int_range(with_ts(lw2, t.ts), t.id), id: t.id },
+        None -> {
+          let literal_factor = (match node(lw2.ts, lhs) { TInt(_) -> true, _ -> false })
+            || (match node(lw2.ts, rhs) { TInt(_) -> true, _ -> false });
+          let divided = op == b"div" || op == b"rem";
+          let lw3 = blocked(lw2, if divided { Division }
+          else if op == b"mul" && !literal_factor { NonlinearMultiplication }
+          else { CoefficientRange });
+          // Uninterpreted as values, but their definedness is decidable; everything else left `Int`.
+          let lw4 = if divided { require_divisible(lw3, lhs, rhs) } else { undefined(lw3) };
+          let head = opaque(lw4.ts, arith_symbol(op), None);
+          let term = app(head.ts, head.id, [lhs, rhs], Some(int_ty()));
+          { lw: with_ts(lw4, force_int(term.ts, term.id)), id: term.id }
+        },
+      }
+    } else if is_cmp_op(op) {
+      let lw2 = forced(lw, lhs, rhs);
+      on(lw2, cmp(lw2.ts, cmp_of(op), lhs, rhs))
+    } else if op == b"and" { on(lw, and(lw.ts, lhs, rhs)) }
+    else if op == b"or" { on(lw, or(lw.ts, lhs, rhs)) }
+    // `==` on functions is a type error, so it needs no requirement here.
+    else if op == b"eq" { on(lw, eq(lw.ts, lhs, rhs)) } else if op == b"ne" {
+      let e = eq(lw.ts, lhs, rhs);
+      on(lw, not(e.ts, e.id))
+    } else if op == b"concat" {
+      let lw2 = blocked(lw, Concat);
+      let head = opaque(lw2.ts, op_concat(), None);
+      // Both sides share one sort, so either side that has one gives the answer's.
+      let sort = match sort_of(head.ts, lhs) {
+        Some(s) -> s,
+        None -> match sort_of(head.ts, rhs) { Some(s) -> s, None -> string_ty() },
+      };
+      on(lw2, app(head.ts, head.id, [lhs, rhs], Some(sort)))
+    } else {
+      // Uninterpreted. Folding `x << 1` into `2·x` is wrong: the evaluator refutes `x << 1 > x`
+      // at `x = 2^62`.
+      let lw2 = blocked(forced(lw, lhs, rhs), BitOperator);
+      let shift = op == b"shl" || op == b"shr" || op == b"ushr";
+      let lw3 = if shift { require_shift_count(lw2, rhs) } else { lw2 };
+      let symbol = if op == b"bitand" { op_bit_and() }
+      else if op == b"bitor" { op_bit_or() }
+      else if op == b"bitxor" { op_bit_xor() }
+      else if op == b"shl" { op_shl() }
+      else if op == b"shr" { op_shr() }
+      else { op_ushr() };
+      let head = opaque(lw3.ts, symbol, None);
+      let term = app(head.ts, head.id, [lhs, rhs], Some(int_ty()));
+      { lw: with_ts(lw3, force_int(term.ts, term.id)), id: term.id }
+    },
+  }
+
+type Callee = | Local | Named(String) | Unresolved(String) | Other
+
+// Decided from the code, not the head's term: a local and a same-named definition lower alike.
+fn callee(cx: Context, func: Code) -> Callee =
+  match func.node {
+    NVar(v) -> match v.slot {
+      Some(_) -> Local,
+      None -> {
+        let name = text(v.name);
+        if ctor(cx, name) != None || signature(cx, name) != None { Named(name) }
+        // Written `module::name`, and the resolver bound nothing.
+        else if string_contains(name, "::") { Other }
+        else { Unresolved(name) }
+      },
+    },
+    _ -> Other,
+  }
+
+fn lowered_args(lw: Lowering, cx: Context, args: List<Code>) -> { lw: Lowering, ids: List<Int> } =
+  fold(args, { lw: lw, ids: [] }, |acc: { lw: Lowering, ids: List<Int> }, a: Code| {
+    let r = lower(acc.lw, cx, a);
+    { lw: r.lw, ids: push(acc.ids, r.id) }
+  })
+
+fn application(lw: Lowering, cx: Context, func: Code, args: List<Code>) -> L = {
+  let lowered = lowered_args(lw, cx, args);
+  match func.node {
+    NLambda(l) -> if l.params == len(lowered.ids) {
+      apply_lambda(lowered.lw, cx, lowered.ids, l.caps, l.body)
+    } else { call(lowered.lw, cx, func, lowered.ids) },
+    _ -> call(lowered.lw, cx, func, lowered.ids),
+  }
+}
+
+fn apply_lambda(lw: Lowering, cx: Context, args: List<Int>, caps: List<Cap>, body: Code) -> L = {
+  let captured = fold(
+    caps,
+    { lw: lw, window: map(args, |t: Int| Some(t)) },
+    |acc: { lw: Lowering, window: List<Option<Int>> }, cap: Cap| {
+      let r = local(acc.lw, cap.src);
+      let grown = if len(acc.window) <= cap.dst {
+        fold(range(len(acc.window), cap.dst + 1), acc.window, |w: List<Option<Int>>, _: Int|
+          push(w, None))
+      } else { acc.window };
+      { lw: r.lw, window: list_set(grown, cap.dst, Some(r.id)) }
+    },
+  );
+  let outer = captured.lw.window;
+  let r = lower({ ..captured.lw, window: captured.window }, cx, body);
+  { lw: { ..r.lw, window: outer }, id: r.id }
+}
+
+fn call(lw: Lowering, cx: Context, func: Code, args: List<Int>) -> L = {
+  let who = callee(cx, func);
+  let head = lower(lw, cx, func);
+  let head_sort = match sort_of(head.lw.ts, head.id) {
+    Some(Fn(_, ret, _)) -> Some(ret),
+    _ -> None,
+  };
+  // A total builtin is a function of its arguments, so two calls over one argument are one term.
+  let total_builtin = match who { Unresolved(name) -> is_total_builtin(name), _ -> false };
+  let sort = match who {
+    Unresolved(name) -> if total_builtin { builtin_sort(name, args, head.lw.ts) }
+    else { head_sort },
+    _ -> head_sort,
+  };
+  let pure0 = total_builtin || head_is_pure(head.lw.ts, head.id);
+  let opened = match node(head.lw.ts, head.id) {
+    TOpaque(name) -> if total_builtin { Keep(pure0, head.lw) } else {
+      match ctor(cx, name) {
+        Some(c) -> if arity(c) == len(args) {
+          Done(
+            on(
+              head.lw,
+              mk(
+                head.lw.ts,
+                TCtor({ name: name, args: args }),
+                ctor_result_sort(c, args, head.lw.ts),
+              ),
+            ),
+          )
+        } else { Keep(pure0, head.lw) },
+        None -> match try_unfold(head.lw, cx, name, head.id, sort, args) {
+          Some(r) -> Done(r),
+          None -> Keep(pure0 && is_pure(cx, name), note_unfold_refusal(head.lw, cx, name)),
+        },
+      }
+    },
+    _ -> Keep(pure0, head.lw),
+  };
+  match opened {
+    Done(r) -> r,
+    Keep(pure, lw2) -> {
+      let dec = decreasing_call(lw2, who, args);
+      let lw3 = if !dec.owed && !callee_is_total(dec.lw, cx, who, head.id) { undefined(dec.lw) }
+      else { dec.lw };
+      match match who { Unresolved(name) -> list_builtin(lw3, name, head.id, args), _ -> None } {
+        Some(r) -> r,
+        None -> if !pure {
+          // A call not known to be a function of its arguments gets a fresh symbol per occurrence.
+          on(lw3, sym(lw3.ts, sort))
+        } else {
+          let made = on(lw3, app(lw3.ts, head.id, args, sort));
+          let total_named = match who { Named(name) -> holds(lw3.total, name), _ -> false };
+          if total_named { { lw: { ..made.lw, calls: push(made.lw.calls, made.id) }, id: made.id } }
+          else { made }
+        },
+      }
+    },
+  }
+}
+
+type Opened = | Done(L) | Keep(Bool, Lowering)
+
+// `len` and `push` over a list whose spine is in view, structurally; where the spine ends in a
+// symbol the call stays, over that symbol.
+fn list_builtin(lw: Lowering, name: String, head: Int, args: List<Int>) -> Option<L> =
+  match args {
+    [xs] -> if name == "len" { list_len(lw, head, xs) } else { None },
+    [xs, x] -> if name == "push" { list_push(lw, head, xs, x) } else { None },
+    _ -> None,
+  }
+
+fn spine(ts: Terms, xs: Int) -> { heads: List<Int>, end: Int } =
+  iterate({ heads: [], end: xs }, size(ts) + 1, |s: { heads: List<Int>, end: Int }|
+    match node(ts, s.end) {
+      TCons(c) -> Continue({ heads: push(s.heads, c.head), end: c.tail }),
+      _ -> Stop(s),
+    })
+
+fn list_len(lw: Lowering, head: Int, xs: Int) -> Option<L> = {
+  let s = spine(lw.ts, xs);
+  match node(lw.ts, s.end) {
+    TNil -> Some(on(lw, int_lit(lw.ts, len(s.heads)))),
+    _ -> if len(s.heads) == 0 { None } else {
+      let rest = app(lw.ts, head, [s.end], Some(int_ty()));
+      let k = int_lit(rest.ts, len(s.heads));
+      match add(k.ts, k.id, rest.id) {
+        Some(sum) -> Some({ lw: require_int_range(with_ts(lw, sum.ts), sum.id), id: sum.id }),
+        None -> None,
+      }
+    },
+  }
+}
+
+fn list_push(lw: Lowering, head: Int, xs: Int, x: Int) -> Option<L> = {
+  let sort = sort_of(lw.ts, xs);
+  let s = spine(lw.ts, xs);
+  let at_nil = match node(lw.ts, s.end) { TNil -> true, _ -> false };
+  if !at_nil && len(s.heads) == 0 { None } else {
+    let last = if at_nil {
+      let empty = nil(lw.ts, sort);
+      cons(empty.ts, x, empty.id, sort)
+    } else { app(lw.ts, head, [s.end, x], sort) };
+    let built = fold(range(0, len(s.heads)), last, |acc: Made, k: Int|
+      match list_at(s.heads, len(s.heads) - 1 - k) {
+        Some(h) -> cons(acc.ts, h, acc.id, sort),
+        None -> acc,
+      });
+    Some(on(lw, built))
+  }
+}
+
+fn callee_is_total(lw: Lowering, cx: Context, who: Callee, head: Int) -> Bool =
+  match who {
+    Local -> match sort_of(lw.ts, head) { Some(Fn(_, _, pure)) -> pure, _ -> false },
+    // A definition whose body was not inlined is not known to be total.
+    Named(name) -> ctor(cx, name) != None || holds(lw.total, name),
+    Unresolved(name) -> is_total_builtin(name),
+    Other -> false,
+  }
+
+fn head_is_pure(ts: Terms, head: Int) -> Bool =
+  match sort_of(ts, head) { Some(Fn(_, _, pure)) -> pure, _ -> false }
+
+// Why `try_unfold` declined; kept in its decision order.
+fn note_unfold_refusal(lw: Lowering, cx: Context, name: String) -> Lowering =
+  blocked(lw, if lw.depth >= lw.unfold_limit || size(lw.ts) >= max_terms() { UnfoldLimit(name) }
+  else if is_recursive(cx, name) { RecursiveCall(name) }
+  else if !is_pure(cx, name) { EffectfulCall(name) }
+  else { OpaqueCall(name) })
+
+// Whether `t` is a tail of `root`, through the list patterns that took it apart.
+pub fn smaller_than(lw: Lowering, t: Int, root: Int) -> Bool =
+  fold(
+      range(0, len(lw.smaller) + 1),
+      { at: t, found: None },
+      |st: { at: Int, found: Option<Bool> }, _: Int|
+        match st.found {
+          Some(_) -> st,
+          None -> match fold(lw.smaller, None, |acc: Option<Int>, s: { tail: Int, from: Int }|
+              match acc {
+                Some(_) -> acc,
+                None -> if s.tail == st.at { Some(s.from) } else { None },
+              }) {
+            None -> { at: st.at, found: Some(false) },
+            Some(from) -> if from == root { { at: from, found: Some(true) } }
+            else { { at: from, found: None } },
+          },
+        },
+    ).found
+    == Some(true)
+
+// The self call of the definition under a termination check owes the measure: its argument in the
+// measured slot is non-negative and below the parameter the body was entered with.
+fn decreasing_call(lw: Lowering, who: Callee, args: List<Int>) -> { lw: Lowering, owed: Bool } =
+  match lw.measure {
+    None -> { lw: lw, owed: false },
+    Some(m) -> if match who { Named(name) -> name != m.def, _ -> true } { { lw: lw, owed: false } }
+    else {
+      match list_at(args, m.slot) {
+        None -> { lw: lw, owed: false },
+        Some(arg) -> if match sort_of(lw.ts, m.bound) {
+            Some(s) -> list_elem(s) != None,
+            None -> false,
+          } {
+          let owed = if smaller_than(lw, arg, m.bound) { true_id() } else { false_id() };
+          { lw: { ..lw, measures: push(lw.measures, owed) }, owed: true }
+        } else {
+          let zero = int_lit(lw.ts, 0);
+          let low = cmp(zero.ts, Ge, arg, zero.id);
+          let high = cmp(low.ts, Lt, arg, m.bound);
+          let both = and(high.ts, low.id, high.id);
+          let under = under_path(with_ts(lw, both.ts), both.id);
+          { lw: { ..under.lw, measures: push(under.lw.measures, under.id) }, owed: true }
+        },
+      }
+    },
+  }
+
+fn try_unfold(
+  lw: Lowering,
+  cx: Context,
+  name: String,
+  head: Int,
+  sort: Option<Ty>,
+  args: List<Int>,
+) -> Option<L> =
+  if lw.depth >= lw.unfold_limit || size(lw.ts) >= max_terms() { None } else {
+    let unrolling = holds(lw.unrolled, name);
+    // One step of a recursive definition: the hypothesis speaks about the call that remains.
+    if unrolling && lw.depth >= 1 { None } else {
+      match match unfoldable(cx, name) {
+          Some(d) -> Some(d),
+          None -> if unrolling { self_recursive(cx, name) } else { None },
+        } {
+        None -> None,
+        Some(def) -> if def.params != len(args) { None } else {
+          let lw2 = { ..lw, rules: unfolded(lw.rules, name, lw.depth + 1), depth: lw.depth + 1 };
+          let outer = lw2.window;
+          let r = lower_opt({ ..lw2, window: map(args, |t: Int| Some(t)) }, cx, def.body);
+          let back = { ..r.lw, window: outer, depth: r.lw.depth - 1 };
+          if unrolling {
+            let c = app(back.ts, head, args, sort);
+            let equation = eq(c.ts, c.id, r.id);
+            Some({
+              lw: {
+                ..with_ts(back, equation.ts),
+                equations: push(back.equations, equation.id),
+                defined: push(back.defined, c.id),
+              },
+              id: r.id,
+            })
+          } else { Some({ lw: back, id: r.id }) }
+        },
+      }
+    }
+  }
+
+fn block(lw: Lowering, cx: Context, stmts: List<CStmt>, tail: Option<Code>) -> L = {
+  let after = fold(stmts, lw, |acc: Lowering, st: CStmt|
+    match st {
+      CLet(l) -> {
+        let r = lower(acc, cx, l.value);
+        bind(r.lw, l.slot, r.id)
+      },
+      CLetPat(l) -> match l.pat {
+        PxWild -> acc,
+        PxVar(v) -> match v.slot {
+          Some(s) -> {
+            let r = lower(acc, cx, l.value);
+            bind(r.lw, s, r.id)
+          },
+          None -> acc,
+        },
+        pat -> {
+          let r = lower(acc, cx, l.value);
+          let sort = sort_of(r.lw.ts, r.id);
+          bind_opaque(blocked(r.lw, DestructuringLet), cx, pat, sort)
+        },
+      },
+      // A statement run for its effect adds nothing a claim's value is made of.
+      CDo(_) -> acc,
+    });
+  match tail { Some(t) -> lower(after, cx, t), None -> on(after, unit(after.ts)) }
+}
+
+fn bind_opaque(lw: Lowering, cx: Context, pat: CPat, sort: Option<Ty>) -> Lowering = {
+  let lw2 = match sort {
+    Some(s) -> if reaches_float(cx, s) { floated(lw) } else { lw },
+    None -> lw,
+  };
+  fold(pattern_slots(pat), lw2, |acc: Lowering, slot: Int| {
+    let t = sym(acc.ts, None);
+    bind(with_ts(acc, t.ts), slot, t.id)
+  })
+}
+
+// Each slot a pattern binds, in the order the Rust walk's stack visits them.
+fn pattern_slots(p: CPat) -> List<Int> =
+  iterate({ stack: [p], out: [] }, 1000000, |s: { stack: List<CPat>, out: List<Int> }|
+    match list_at(s.stack, len(s.stack) - 1) {
+      None -> Stop(s),
+      Some(top) -> {
+        let rest = take(s.stack, len(s.stack) - 1);
+        Continue(match top {
+          PxVar(v) ->
+            { stack: rest, out: match v.slot { Some(slot) -> push(s.out, slot), None -> s.out } },
+          PxCtor(c) ->
+            { stack: fold(c.args, rest, |acc: List<CPat>, a: CPat| push(acc, a)), out: s.out },
+          PxRecord(r) ->
+            {
+              stack: fold(r.fields, rest, |acc: List<CPat>, f: CPatField| push(acc, f.pat)),
+              out: s.out,
+            },
+          PxList(l) -> {
+            let items = fold(l.items, rest, |acc: List<CPat>, a: CPat| push(acc, a));
+            { stack: match l.rest { Some(r) -> push(items, r), None -> items }, out: s.out }
+          },
+          _ -> { stack: rest, out: s.out },
+        })
+      },
+    }).out
+
+fn match_expr(lw: Lowering, cx: Context, scrutinee: Code, arms: List<CArm>) -> L = {
+  let s = lower(lw, cx, scrutinee);
+  let s_sort = sort_of(s.lw.ts, s.id);
+  let walked = fold(
+    arms,
+    { lw: s.lw, arms: [], sort: None },
+    |acc: { lw: Lowering, arms: List<Arm>, sort: Option<Ty> }, a: CArm| {
+      // What a guard admits is not modelled, so a guarded arm is never known to be taken.
+      let shaped = match a.guard {
+        Some(_) -> None,
+        None -> arm_shape(acc.lw, cx, a.pat, s.id, s_sort),
+      };
+      let tested = match shaped {
+        Some(sh) -> sh,
+        None ->
+          {
+            lw: bind_opaque(blocked(acc.lw, UndecidableMatchArm), cx, a.pat, s_sort),
+            test: Undecidable,
+            binds: [],
+          },
+      };
+      let guarded = match a.guard { Some(g) -> lower(tested.lw, cx, g).lw, None -> tested.lw };
+      // What a list arm's body owes is owed only where the arm runs: at `[]`, or off it.
+      let taken = match tested.test {
+        TestList(t) -> {
+          let empty = nil(guarded.ts, s_sort);
+          let at_nil = eq(empty.ts, s.id, empty.id);
+          if t.fixed == 0 && !t.rest { Some(on(guarded, at_nil)) }
+          else { Some(on(guarded, not(at_nil.ts, at_nil.id))) }
+        },
+        _ -> None,
+      };
+      let entered = match taken { Some(c) -> assume(c.lw, c.id), None -> guarded };
+      let body = lower(entered, cx, a.body);
+      let left = match taken { Some(_) -> popped(body.lw), None -> body.lw };
+      let sort = match acc.sort { Some(x) -> Some(x), None -> sort_of(left.ts, body.id) };
+      {
+        lw: left,
+        arms: push(acc.arms, { test: tested.test, binds: tested.binds, body: body.id }),
+        sort: sort,
+      }
+    },
+  );
+  on(walked.lw, mk(walked.lw.ts, TMatch({ scrutinee: s.id, arms: walked.arms }), walked.sort))
+}
+
+fn is_simple(p: CPat) -> Bool = match p { PxWild -> true, PxVar(_) -> true, _ -> false }
+
+fn arm_shape(
+  lw: Lowering,
+  cx: Context,
+  pat: CPat,
+  scrutinee: Int,
+  s_sort: Option<Ty>,
+) -> Option<{ lw: Lowering, test: ArmTest, binds: List<Int> }> =
+  match pat {
+    PxWild -> Some({ lw: lw, test: Always, binds: [] }),
+    PxVar(v) ->
+      Some({
+        lw: match v.slot { Some(slot) -> bind(lw, slot, scrutinee), None -> lw },
+        test: Always,
+        binds: [],
+      }),
+    PxLit(l) -> {
+      let t = literal(lw, l);
+      Some({ lw: t.lw, test: TestLit(t.id), binds: [] })
+    },
+    PxCtor(c) -> match ctor(cx, text(c.name)) {
+      None -> None,
+      Some(k) -> if arity(k) != len(c.args)
+          || !fold(c.args, true, |ok: Bool, a: CPat| ok && is_simple(a)) { None } else {
+        let sorts = field_sorts(k, s_sort);
+        let bound = fold(
+          range(0, len(c.args)),
+          { lw: lw, binds: [] },
+          |acc: { lw: Lowering, binds: List<Int> }, i: Int| {
+            let f = sym(acc.lw.ts, match list_at(sorts, i) { Some(s) -> s, None -> None });
+            let lw2 = with_ts(acc.lw, f.ts);
+            let lw3 = match list_at(c.args, i) {
+              Some(PxVar(v)) -> match v.slot { Some(slot) -> bind(lw2, slot, f.id), None -> lw2 },
+              _ -> lw2,
+            };
+            { lw: lw3, binds: push(acc.binds, f.id) }
+          },
+        );
+        Some({ lw: bound.lw, test: TestCtor(text(c.name)), binds: bound.binds })
+      },
+    },
+    PxList(l) -> {
+      let simple = fold(l.items, true, |ok: Bool, a: CPat| ok && is_simple(a))
+        && (match l.rest { Some(r) -> is_simple(r), None -> true });
+      if !simple { None } else {
+        let elem = match s_sort { Some(s) -> list_elem(s), None -> None };
+        // A spine in view binds its own heads and tail, so a call over the tail is the same term
+        // wherever the tail is named; a symbol gets fresh fields.
+        let heads = fold(
+          l.items,
+          { lw: lw, at: Some(scrutinee), binds: [] },
+          |acc: { lw: Lowering, at: Option<Int>, binds: List<Int> }, item: CPat| {
+            let stepped = match acc.at {
+              Some(t) -> match node(acc.lw.ts, t) {
+                TCons(c) -> { lw: acc.lw, at: Some(c.tail), field: c.head },
+                _ -> {
+                  let f = sym(acc.lw.ts, elem);
+                  { lw: with_ts(acc.lw, f.ts), at: None, field: f.id }
+                },
+              },
+              None -> {
+                let f = sym(acc.lw.ts, elem);
+                { lw: with_ts(acc.lw, f.ts), at: None, field: f.id }
+              },
+            };
+            let lw2 = match item {
+              PxVar(v) -> match v.slot {
+                Some(slot) -> bind(stepped.lw, slot, stepped.field),
+                None -> stepped.lw,
+              },
+              _ -> stepped.lw,
+            };
+            { lw: lw2, at: stepped.at, binds: push(acc.binds, stepped.field) }
+          },
+        );
+        let finished = match l.rest {
+          None -> { lw: heads.lw, binds: heads.binds },
+          Some(r) -> {
+            let tail = match heads.at {
+              Some(t) -> { lw: heads.lw, id: t },
+              None -> on(heads.lw, sym(heads.lw.ts, s_sort)),
+            };
+            let lw2 = if tail.id != scrutinee {
+              { ..tail.lw, smaller: push(tail.lw.smaller, { tail: tail.id, from: scrutinee }) }
+            } else { tail.lw };
+            let lw3 = match r {
+              PxVar(v) -> match v.slot { Some(slot) -> bind(lw2, slot, tail.id), None -> lw2 },
+              _ -> lw2,
+            };
+            { lw: lw3, binds: push(heads.binds, tail.id) }
+          },
+        };
+        Some({
+          lw: finished.lw,
+          test: TestList({ fixed: len(l.items), rest: l.rest != None }),
+          binds: finished.binds,
+        })
+      }
+    },
+    PxRecord(_) -> None,
+  }
+
+// What a total builtin answers, read off its arguments' sorts where the answer depends on them.
+fn builtin_sort(name: String, args: List<Int>, ts: Terms) -> Option<Ty> = {
+  let first = match list_at(args, 0) { Some(a) -> sort_of(ts, a), None -> None };
+  if name == "len" || name == "min" || name == "max" || name == "bytes_len"
+      || name == "string_len" { Some(int_ty()) }
+  else if name == "int_to_string" { Some(string_ty()) }
+  else if name == "push" { first } else if name == "list_at" {
+    match first {
+      Some(s) -> match list_elem(s) { Some(e) -> Some(option_ty(e)), None -> None },
+      None -> None,
+    }
+  } else { None }
+}
+
+// A constructor's fields, instantiated against the scrutinee's sort when it is known.
+pub fn field_sorts(c: Ctor, sort: Option<Ty>) -> List<Option<Ty>> = {
+  let args = match sort {
+    Some(Con(name, xs)) -> if name == c.decl.name && len(xs) == c.decl.params { xs } else { [] },
+    _ -> [],
+  };
+  map(c.variant.fields, |f: Ty| Some(substituted(f, args)))
+}
+
+fn ctor_result_sort(c: Ctor, args: List<Int>, ts: Terms) -> Option<Ty> = {
+  let subst = fold(range(0, len(c.variant.fields)), map_new(), |acc: Map<Int, Ty>, i: Int|
+    match list_at(c.variant.fields, i) {
+      Some(f) -> match list_at(args, i) {
+        Some(a) -> match sort_of(ts, a) { Some(actual) -> match_sort(f, actual, acc), None -> acc },
+        None -> acc,
+      },
+      None -> acc,
+    });
+  Some(
+    Con(
+      c.decl.name,
+      map(range(0, c.decl.params), |p: Int|
+        match map_get(subst, p) { Some(s) -> s, None -> Var(p) }),
+    ),
+  )
+}
+
+// One-way matching of `pattern` against `actual`; silently declines where they disagree.
+fn match_sort(pattern: Ty, actual: Ty, subst: Map<Int, Ty>) -> Map<Int, Ty> =
+  match pattern {
+    Var(v) -> if map_contains(subst, v) { subst } else { map_insert(subst, v, actual) },
+    Con(a, xs) -> match actual {
+      Con(b, ys) -> if a == b && len(xs) == len(ys) {
+        fold(range(0, len(xs)), subst, |acc: Map<Int, Ty>, i: Int|
+          match list_at(xs, i) {
+            Some(x) -> match list_at(ys, i) { Some(y) -> match_sort(x, y, acc), None -> acc },
+            None -> acc,
+          })
+      } else { subst },
+      _ -> subst,
+    },
+    Fn(ps, r, _) -> match actual {
+      Fn(qs, s, _) -> if len(ps) == len(qs) {
+        match_sort(
+          r,
+          s,
+          fold(range(0, len(ps)), subst, |acc: Map<Int, Ty>, i: Int|
+            match list_at(ps, i) {
+              Some(p) -> match list_at(qs, i) { Some(q) -> match_sort(p, q, acc), None -> acc },
+              None -> acc,
+            }),
+        )
+      } else { subst },
+      _ -> subst,
+    },
+    Record(xs) -> match actual {
+      Record(_) ->
+        fold(xs, subst, |acc: Map<Int, Ty>, x: { name: String, ty: Ty }|
+          match field_ty(actual, x.name) { Some(y) -> match_sort(x.ty, y, acc), None -> acc }),
+      _ -> subst,
+    },
+  }
+
+// The requirements recorded since `mark`.
+pub fn requirements_since(lw: Lowering, mark: Int) -> List<Int> = drop_front(lw.requirements, mark)
+
+pub fn requirements_between(lw: Lowering, from: Int, to: Int) -> List<Int> =
+  take(drop_front(lw.requirements, from), to - from)

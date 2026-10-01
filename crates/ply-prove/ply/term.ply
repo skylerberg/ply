@@ -1,0 +1,418 @@
+// `term` — the prover's term language: one hash-consed DAG per obligation.
+
+import domain (Ty, Con, Record)
+import sort (bool_ty, decimal_ty, field_ty, int_ty, is_con, string_ty, unit_ty)
+
+// The names the prover gives operators it does not interpret. One each for the shifts: `-1 >> 1`
+// and `-1 >>> 1` differ, and a shared name would equate them.
+pub fn op_add() -> String = "(+)"
+pub fn op_sub() -> String = "(-)"
+pub fn op_mul() -> String = "(*)"
+pub fn op_div() -> String = "(/)"
+pub fn op_rem() -> String = "(%)"
+pub fn op_concat() -> String = "(++)"
+pub fn op_bit_and() -> String = "(&)"
+pub fn op_bit_or() -> String = "(|)"
+pub fn op_bit_xor() -> String = "(^)"
+pub fn op_bit_not() -> String = "(~)"
+pub fn op_shl() -> String = "(<<)"
+pub fn op_shr() -> String = "(>>)"
+pub fn op_ushr() -> String = "(>>>)"
+pub fn op_lt() -> String = "(<)"
+pub fn op_le() -> String = "(<=)"
+pub fn op_gt() -> String = "(>)"
+pub fn op_ge() -> String = "(>=)"
+
+pub type CmpOp = | Lt | Le | Gt | Ge
+
+pub type Mono = { term: Int, coeff: I128 }
+
+// `Σ coeff · term + konst`, ascending by term, with no zero coefficient and no nested `TLin`.
+pub type Poly = { monomials: List<Mono>, konst: I128 }
+
+pub type ArmTest =
+  | Always
+  | TestCtor(String)
+  | TestLit(Int)
+  // `fixed` heads, then a rest or the end of the list.
+  | TestList({ fixed: Int, rest: Bool })
+  // A nested constructor or record pattern.
+  | Undecidable
+
+// `binds` has one term per constructor field, in field order.
+pub type Arm = { test: ArmTest, binds: List<Int>, body: Int }
+
+pub type Node =
+  | TInt(Int)
+  | TBool(Bool)
+  | TStr(String)
+  // Compared by value, so `1.5m` and `1.50m` are one node.
+  | TDecimal(Decimal)
+  // Distinct from `TInt`: `5` and `5u32` must not be congruent. The width, then its bits as the
+  // literal carries them; arithmetic over it stays opaque.
+  | TFixed(String, Int, Int)
+  | TUnit
+  // A `forall` binder, `result`, a constructor field a case split exposed, or an opaque stand-in.
+  | TSym(Int)
+  // A top-level definition named as a value, or an uninterpreted operator.
+  | TOpaque(String)
+  | TLin(Poly)
+  | TApp({ head: Int, args: List<Int> })
+  | TCtor({ name: String, args: List<Int> })
+  | TNil
+  | TCons({ head: Int, tail: Int })
+  // Ascending by field name.
+  | TRecord(List<{ name: String, value: Int }>)
+  | TField({ base: Int, field: String })
+  | TNot(Int)
+  | TAnd(Int, Int)
+  | TOr(Int, Int)
+  // Over `Int` only.
+  | TCmp({ op: CmpOp, lhs: Int, rhs: Int })
+  | TEq({ lhs: Int, rhs: Int })
+  | TIf({ cond: Int, then_branch: Int, else_branch: Int })
+  | TMatch({ scrutinee: Int, arms: List<Arm> })
+
+// `ints` marks what the type system already proved an `Int`.
+// `ctors`, `lists` and `records` are the terms of each of those heads, ascending, so a search for
+// one in a class reads only those.
+pub type Terms = {
+  nodes: List<Node>,
+  sorts: List<Option<Ty>>,
+  ints: List<Bool>,
+  index: Map<Node, Int>,
+  next_sym: Int,
+  ctors: List<Int>,
+  lists: List<Int>,
+  records: List<Int>,
+}
+
+// A term store after a change, and the term the change was about.
+pub type Made = { ts: Terms, id: Int }
+
+pub fn true_id() -> Int = 0
+
+pub fn false_id() -> Int = 1
+
+// `true` and `false` first, so their ids are fixed.
+pub fn new_terms() -> Terms = {
+  let empty: Terms = {
+    nodes: [],
+    sorts: [],
+    ints: [],
+    index: map_new(),
+    next_sym: 0,
+    ctors: [],
+    lists: [],
+    records: [],
+  };
+  mk(mk(empty, TBool(true), Some(bool_ty())).ts, TBool(false), Some(bool_ty())).ts
+}
+
+pub fn size(ts: Terms) -> Int = len(ts.nodes)
+
+pub fn node(ts: Terms, t: Int) -> Node =
+  match list_at(ts.nodes, t) { Some(n) -> n, None -> panic("a term the store never made") }
+
+pub fn sort_of(ts: Terms, t: Int) -> Option<Ty> =
+  match list_at(ts.sorts, t) { Some(s) -> s, None -> None }
+
+pub fn is_int(ts: Terms, t: Int) -> Bool = match list_at(ts.ints, t) { Some(b) -> b, None -> false }
+
+pub fn force_int(ts: Terms, t: Int) -> Terms = { ..ts, ints: list_set(ts.ints, t, true) }
+
+pub fn mk(ts: Terms, n: Node, sort: Option<Ty>) -> Made =
+  match map_get(ts.index, n) {
+    Some(existing) -> {
+      let ts2 = match sort_of(ts, existing) {
+        None -> { ..ts, sorts: list_set(ts.sorts, existing, sort) },
+        Some(_) -> ts,
+      };
+      { ts: ts2, id: existing }
+    },
+    None -> {
+      let id = len(ts.nodes);
+      let int = (match sort { Some(s) -> is_con(s, "Int"), None -> false })
+        || (match n { TInt(_) -> true, TLin(_) -> true, _ -> false });
+      {
+        ts: {
+          nodes: push(ts.nodes, n),
+          sorts: push(ts.sorts, sort),
+          ints: push(ts.ints, int),
+          index: map_insert(ts.index, n, id),
+          next_sym: ts.next_sym,
+          ctors: match n { TCtor(_) -> push(ts.ctors, id), _ -> ts.ctors },
+          lists: match n {
+            TNil -> push(ts.lists, id),
+            TCons(_) -> push(ts.lists, id),
+            _ -> ts.lists,
+          },
+          records: match n { TRecord(_) -> push(ts.records, id), _ -> ts.records },
+        },
+        id: id,
+      }
+    },
+  }
+
+pub fn int_lit(ts: Terms, k: Int) -> Made = mk(ts, TInt(k), Some(int_ty()))
+
+pub fn boolean(ts: Terms, b: Bool) -> Made = mk(ts, TBool(b), Some(bool_ty()))
+
+pub fn string(ts: Terms, s: String) -> Made = mk(ts, TStr(s), Some(string_ty()))
+
+pub fn decimal(ts: Terms, d: Decimal) -> Made = mk(ts, TDecimal(d), Some(decimal_ty()))
+
+pub fn fixed(ts: Terms, width: String, high: Int, low: Int) -> Made =
+  mk(ts, TFixed(width, high, low), Some(Con(width, [])))
+
+pub fn unit(ts: Terms) -> Made = mk(ts, TUnit, Some(unit_ty()))
+
+pub fn nil(ts: Terms, sort: Option<Ty>) -> Made = mk(ts, TNil, sort)
+
+pub fn cons(ts: Terms, head: Int, tail: Int, sort: Option<Ty>) -> Made =
+  mk(ts, TCons({ head: head, tail: tail }), sort)
+
+pub fn sym(ts: Terms, sort: Option<Ty>) -> Made = {
+  let made = mk(ts, TSym(ts.next_sym), sort);
+  { ts: { ..made.ts, next_sym: ts.next_sym + 1 }, id: made.id }
+}
+
+pub fn opaque(ts: Terms, name: String, sort: Option<Ty>) -> Made = mk(ts, TOpaque(name), sort)
+
+// --- Linear terms -----------------------------------------------------------
+
+pub fn constant(k: I128) -> Poly = { monomials: [], konst: k }
+
+pub fn poly_of(ts: Terms, t: Int) -> Poly =
+  match node(ts, t) {
+    TInt(k) -> constant(i128_of_int(k)),
+    TLin(p) -> p,
+    _ -> { monomials: [{ term: t, coeff: 1i128 }], konst: 0i128 },
+  }
+
+pub fn scaled(p: Poly, factor: I128) -> Option<Poly> =
+  match checked_mul(p.konst, factor) {
+    None -> None,
+    Some(k) -> match fold(p.monomials, Some([]), |acc: Option<List<Mono>>, m: Mono|
+        match acc {
+          None -> None,
+          Some(ms) -> match checked_mul(m.coeff, factor) {
+            None -> None,
+            Some(c) -> if c == 0i128 { Some(ms) }
+            else { Some(push(ms, { term: m.term, coeff: c })) },
+          },
+        }) {
+      None -> None,
+      Some(ms) -> Some({ monomials: ms, konst: k }),
+    },
+  }
+
+// A merge of two ascending lists, summing where they share a term and dropping a sum of zero.
+pub fn plus(a: Poly, b: Poly) -> Option<Poly> =
+  match checked_add(a.konst, b.konst) {
+    None -> None,
+    Some(k) -> match merged(a.monomials, b.monomials, 0, 0, []) {
+      None -> None,
+      Some(ms) -> Some({ monomials: ms, konst: k }),
+    },
+  }
+
+fn merged(xs: List<Mono>, ys: List<Mono>, i: Int, j: Int, out: List<Mono>) -> Option<List<Mono>> =
+  match list_at(xs, i) {
+    None ->
+      Some(
+        fold(range(j, len(ys)), out, |acc: List<Mono>, k: Int|
+          match list_at(ys, k) { Some(m) -> push(acc, m), None -> acc }),
+      ),
+    Some(x) -> match list_at(ys, j) {
+      None ->
+        Some(
+          fold(range(i, len(xs)), out, |acc: List<Mono>, k: Int|
+            match list_at(xs, k) { Some(m) -> push(acc, m), None -> acc }),
+        ),
+      Some(y) -> if x.term == y.term {
+        match checked_add(x.coeff, y.coeff) {
+          None -> None,
+          Some(c) ->
+            merged(xs, ys, i + 1, j + 1, if c == 0i128 { out }
+            else { push(out, { term: x.term, coeff: c }) }),
+        }
+      } else if x.term < y.term { merged(xs, ys, i + 1, j, push(out, x)) }
+      else { merged(xs, ys, i, j + 1, push(out, y)) },
+    },
+  }
+
+// A constant outside `Int` is no Ply value, so it has no term.
+pub fn intern_poly(ts: Terms, p: Poly) -> Option<Made> =
+  match p.monomials {
+    [] -> match checked_int(p.konst) { Some(k) -> Some(int_lit(ts, k)), None -> None },
+    [m] -> if m.coeff == 1i128 && p.konst == 0i128 { Some({ ts: ts, id: m.term }) }
+    else { Some(lin(ts, p)) },
+    _ -> Some(lin(ts, p)),
+  }
+
+fn lin(ts: Terms, p: Poly) -> Made = {
+  let made = mk(ts, TLin(p), Some(int_ty()));
+  { ts: force_int(made.ts, made.id), id: made.id }
+}
+
+fn checked_int(k: I128) -> Option<Int> =
+  if k < i128_of_int(0 - 9223372036854775807 - 1) || k > i128_of_int(9223372036854775807) { None }
+  else { Some(int_of_i128(k)) }
+
+pub fn add(ts: Terms, a: Int, b: Int) -> Option<Made> =
+  match plus(poly_of(ts, a), poly_of(ts, b)) { None -> None, Some(p) -> intern_poly(ts, p) }
+
+pub fn sub(ts: Terms, a: Int, b: Int) -> Option<Made> =
+  match scaled(poly_of(ts, b), -1i128) {
+    None -> None,
+    Some(negated) -> match plus(poly_of(ts, a), negated) {
+      None -> None,
+      Some(p) -> intern_poly(ts, p),
+    },
+  }
+
+pub fn neg(ts: Terms, a: Int) -> Option<Made> =
+  match scaled(poly_of(ts, a), -1i128) { None -> None, Some(p) -> intern_poly(ts, p) }
+
+// In the fragment only when a factor is an integer literal.
+pub fn mul(ts: Terms, a: Int, b: Int) -> Option<Made> =
+  match node(ts, a) {
+    TInt(k) -> times(ts, poly_of(ts, b), k),
+    _ -> match node(ts, b) { TInt(k) -> times(ts, poly_of(ts, a), k), _ -> None },
+  }
+
+fn times(ts: Terms, p: Poly, k: Int) -> Option<Made> =
+  match scaled(p, i128_of_int(k)) { None -> None, Some(q) -> intern_poly(ts, q) }
+
+// --- Structure --------------------------------------------------------------
+
+// Reduces over a record literal; the same reduction up to equality is a solver rule.
+pub fn field(ts: Terms, base: Int, name: String) -> Made =
+  match node(ts, base) {
+    TRecord(fields) -> match fold(
+        fields,
+        None,
+        |acc: Option<Int>, f: { name: String, value: Int }|
+          match acc { Some(_) -> acc, None -> if f.name == name { Some(f.value) } else { None } },
+      ) {
+      Some(v) -> { ts: ts, id: v },
+      None -> projected(ts, base, name),
+    },
+    _ -> projected(ts, base, name),
+  }
+
+fn projected(ts: Terms, base: Int, name: String) -> Made =
+  mk(ts, TField({ base: base, field: name }), match sort_of(ts, base) {
+    Some(s) -> field_ty(s, name),
+    None -> None,
+  })
+
+pub fn not(ts: Terms, a: Int) -> Made =
+  match node(ts, a) {
+    TBool(b) -> boolean(ts, !b),
+    TNot(inner) -> { ts: ts, id: inner },
+    _ -> mk(ts, TNot(a), Some(bool_ty())),
+  }
+
+pub fn and(ts: Terms, a: Int, b: Int) -> Made = mk(ts, TAnd(a, b), Some(bool_ty()))
+
+pub fn or(ts: Terms, a: Int, b: Int) -> Made = mk(ts, TOr(a, b), Some(bool_ty()))
+
+pub fn cmp(ts: Terms, op: CmpOp, lhs: Int, rhs: Int) -> Made =
+  mk(ts, TCmp({ op: op, lhs: lhs, rhs: rhs }), Some(bool_ty()))
+
+pub fn eq(ts: Terms, lhs: Int, rhs: Int) -> Made = {
+  let low = if lhs <= rhs { lhs } else { rhs };
+  let high = if lhs <= rhs { rhs } else { lhs };
+  mk(project_fields(ts, low, high), TEq({ lhs: low, rhs: high }), Some(bool_ty()))
+}
+
+// Both sides' fields, interned, so the solver's extensionality rule has projections to compare.
+fn project_fields(ts: Terms, a: Int, b: Int) -> Terms =
+  match sort_of(ts, a) {
+    Some(Record(left)) -> match sort_of(ts, b) {
+      Some(Record(right)) -> if map(left, |f: { name: String, ty: Ty }| f.name)
+          != map(right, |f: { name: String, ty: Ty }| f.name) { ts } else {
+        fold(left, ts, |acc: Terms, f: { name: String, ty: Ty }| {
+          let x = field(acc, a, f.name);
+          let y = field(x.ts, b, f.name);
+          if x.id != y.id { project_fields(y.ts, x.id, y.id) } else { y.ts }
+        })
+      },
+      _ -> ts,
+    },
+    _ -> ts,
+  }
+
+pub fn app(ts: Terms, head: Int, args: List<Int>, sort: Option<Ty>) -> Made =
+  mk(ts, TApp({ head: head, args: args }), sort)
+
+test "equal nodes are one term, and true and false come first" {
+  let ts = new_terms();
+  assert_eq(node(ts, true_id()), TBool(true));
+  assert_eq(node(ts, false_id()), TBool(false));
+  let a = int_lit(ts, 3);
+  let b = int_lit(a.ts, 3);
+  assert_eq(a.id, b.id);
+  assert_eq(size(b.ts), 3)
+}
+
+test "a linear term folds its constants and cancels to a literal" {
+  let x = sym(new_terms(), Some(int_ty()));
+  let one = int_lit(x.ts, 1);
+  let up = match add(one.ts, x.id, one.id) { Some(m) -> m, None -> panic("in range") };
+  let back = match sub(up.ts, up.id, one.id) { Some(m) -> m, None -> panic("in range") };
+  assert_eq(back.id, x.id);
+  let two = int_lit(back.ts, 2);
+  let twice = match mul(two.ts, x.id, two.id) { Some(m) -> m, None -> panic("in range") };
+  assert_eq(poly_of(twice.ts, twice.id), {
+    monomials: [{ term: x.id, coeff: 2i128 }],
+    konst: 0i128,
+  })
+}
+
+test "a constant outside Int has no term" {
+  let ts = new_terms();
+  let big = int_lit(ts, 9223372036854775807);
+  let one = int_lit(big.ts, 1);
+  assert_eq(add(one.ts, big.id, one.id), None)
+}
+
+test "a linear combination is canonical" {
+  let x = sym(new_terms(), Some(int_ty()));
+  let zero = int_lit(x.ts, 0);
+  let plus_zero = match add(zero.ts, x.id, zero.id) { Some(m) -> m, None -> panic("in range") };
+  assert_eq(plus_zero.id, x.id);
+  let one = int_lit(plus_zero.ts, 1);
+  let a = match add(one.ts, x.id, one.id) { Some(m) -> m, None -> panic("in range") };
+  let b = match add(a.ts, one.id, x.id) { Some(m) -> m, None -> panic("in range") };
+  assert_eq(a.id, b.id)
+}
+
+test "a coefficient that overflows produces no term" {
+  let x = sym(new_terms(), Some(int_ty()));
+  let big = int_lit(x.ts, 9223372036854775807);
+  let scaled = match mul(big.ts, x.id, big.id) { Some(m) -> m, None -> panic("in range") };
+  let again = match mul(scaled.ts, scaled.id, big.id) { Some(m) -> m, None -> panic("in range") };
+  // The largest `Int` cubed leaves `I128`.
+  assert_eq(mul(again.ts, again.id, big.id), None)
+}
+
+test "multiplication of two symbolics is not arithmetic" {
+  let x = sym(new_terms(), Some(int_ty()));
+  let y = sym(x.ts, Some(int_ty()));
+  assert_eq(mul(y.ts, x.id, y.id), None)
+}
+
+test "projection reduces over a record literal" {
+  let v = int_lit(new_terms(), 7);
+  let record = mk(v.ts, TRecord([{ name: "balance", value: v.id }]), None);
+  assert_eq(field(record.ts, record.id, "balance").id, v.id)
+}
+
+test "every fresh symbol is a distinct term" {
+  let a = sym(new_terms(), None);
+  let b = sym(a.ts, None);
+  assert(a.id != b.id)
+}

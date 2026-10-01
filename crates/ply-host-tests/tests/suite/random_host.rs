@@ -33,7 +33,7 @@ fn tiered(service: &str) -> (ply_eval::Front, &'static ply_codegen::Unit) {
 }
 
 fn call(entry: &str) -> Result<Value, ply_eval::Diagnostic> {
-    let host = ply_host::Host::new();
+    let host = std::sync::Arc::new(ply_host::Host::new());
     let (front, unit) = tiered(PROGRAM);
     let binding = host
         .registry()
@@ -43,7 +43,10 @@ fn call(entry: &str) -> Result<Value, ply_eval::Diagnostic> {
     let mut machine = Machine::new(&front, ply_eval::Provider::attach(unit))
         .expect("the unit was compiled from this program");
     machine.set_host_binding(Arc::new(binding));
-    machine.set_host_runtime(host.runtime());
+    machine.set_host_runtime({
+        let host = std::sync::Arc::clone(&host);
+        std::sync::Arc::new(move || host.runtime())
+    });
     let declared = front
         .check
         .defs

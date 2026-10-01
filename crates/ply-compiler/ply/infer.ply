@@ -8,9 +8,9 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               Constraint, Deriver, DJson, DEq, DOrd, SpecKind, SRequires, SEnsures, SpecClause,
               Derived, DeriveDef, parse)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate, EBad,
-              Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause, ReturnClause,
-              RecField, expr_span)
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
+              EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
+              ReturnClause, RecField, expr_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, pat_span, has_or)
 import tycore (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -18,16 +18,16 @@ import tycore (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar,
                OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
                atoms_union, atoms_contains, atoms_difference, resource_covers, row_empty, row_open,
                row_closed, row_singleton, row_is_pure, row_union, row_without, row_without_covered,
-               con, con1, t_int, t_bool, t_string, t_bytes, t_float, t_decimal, t_unit, t_list,
-               t_option, t_map, t_iter, t_secret, t_fn, mono, fields_sorted, field_get,
-               mentions_secret, at, set_at, take, drop, append, contains_int, contains_bytes,
-               ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var, fresh_ty,
-               fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row, is_rigid_ty,
-               is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row, occurs_ty,
-               solve_continuation_row, free_vars, unify, unify_row, env_new, env_push, env_pop,
-               env_bind, env_bind_global, env_remove_global, env_lookup, env_depth_of, env_locals,
-               instantiate_with, instantiate, rename_scheme, generalize, region_prefix, region_of,
-               label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
+               atom_conflicts, con, con1, t_int, t_bool, t_string, t_bytes, t_float, t_decimal,
+               t_unit, t_list, t_option, t_map, t_iter, t_secret, t_fn, mono, fields_sorted,
+               field_get, mentions_secret, at, set_at, take, drop, append, contains_int,
+               contains_bytes, ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var,
+               fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row,
+               is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row,
+               occurs_ty, solve_continuation_row, free_vars, unify, unify_row, env_new, env_push,
+               env_pop, env_bind, env_bind_global, env_remove_global, env_lookup, env_depth_of,
+               env_locals, instantiate_with, instantiate, rename_scheme, generalize, region_prefix,
+               region_of, label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
                scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
                print_row)
 import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Edit,
@@ -204,6 +204,8 @@ type Simulation = {
   reads: List<CellAccess>,
   entering: List<{ name: Bytes, span: Span, ty: Type }>,
 }
+// A `parallel` block's branches and what each performs, judged once the module is solved.
+type ParallelSite = { module: Int, span: Span, branches: List<{ span: Span, row: Row }> }
 // `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
 type RigidParam = { name: Bytes, v: Int }
 type MapKeySite = {
@@ -291,6 +293,7 @@ type Cx = {
   open_regions: List<OpenRegion>,
   regions: List<RegionSite>,
   simulations: List<Simulation>,
+  parallels: List<ParallelSite>,
   map_keys: List<MapKeySite>,
   constrained_uses: List<ConstraintSite>,
   spec_kind: Option<SpecKind>,
@@ -703,6 +706,7 @@ pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc
     { name: b"bytes_u32_le", sc: mono_fn([t_bytes(), t_int()], con(b"U32")) },
     { name: b"bytes_slice", sc: mono_fn([t_bytes(), t_int(), t_int()], t_bytes()) },
     { name: b"bytes_concat", sc: mono_fn([t_bytes(), t_bytes()], t_bytes()) },
+    { name: b"bytes_blake3", sc: mono_fn([t_bytes()], t_bytes()) },
     { name: b"bytes_concat_all", sc: mono_fn([t_list(t_bytes())], t_bytes()) },
     { name: b"bytes_of_string", sc: mono_fn([t_string()], t_bytes()) },
     { name: b"bytes_is_utf8", sc: mono_fn([t_bytes()], t_bool()) },
@@ -862,6 +866,7 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
     bdoc(b"bytes_u32_le", [b"b", b"i"], b"four bytes at `i`, little-endian"),
     bdoc(b"bytes_slice", [b"b", b"start", b"end"], b"raises out of range"),
     bdoc(b"bytes_concat", [b"a", b"b"], b"`a ++ b`"),
+    bdoc(b"bytes_blake3", [b"b"], b"the 32-byte BLAKE3 digest of `b`"),
     bdoc(b"bytes_concat_all", [b"bs"], b"one allocation"),
     bdoc(b"bytes_of_string", [b"s"], b"UTF-8"),
     bdoc(b"bytes_is_utf8", [b"b"], b""),
@@ -2701,7 +2706,33 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
     EHandle(h) -> infer_handle(cx, h.span, h.body, h.clauses, h.ret),
     EWithCell(c) -> infer_with_cell(cx, c.span, c.resource, c.init, c.binder, c.body),
     ESimulate(s) -> infer_simulate(cx, s.span, s.body),
+    EParallel(v) -> infer_parallel(cx, v.span, v.branches),
   }
+
+// The branches' answers as a tuple, which is what evaluating them left to right answers.
+fn infer_parallel(cx: Cx, span: Span, branches: List<Expr>) -> Inferred = {
+  let out = fold(
+    range(0, len(branches)),
+    { cx: cx, fs: [], row: row_empty(), rows: [] },
+    |acc: { cx: Cx, fs: List<Field>, row: Row, rows: List<{ span: Span, row: Row }> }, i: Int| {
+      let b = at(branches, i);
+      let o: Inferred = infer(acc.cx, b);
+      let j: WithRow = join(o.cx, span, acc.row, o.row);
+      {
+        cx: j.cx,
+        fs: push(acc.fs, { name: bytes_concat(b"_", num(i)), ty: o.ty }),
+        row: j.r,
+        rows: push(acc.rows, { span: expr_span(b), row: o.row }),
+      }
+    },
+  );
+  let site = { module: out.cx.module, span: span, branches: out.rows };
+  {
+    cx: { ..out.cx, parallels: push(out.cx.parallels, site) },
+    ty: TyRecord(fields_sorted(out.fs)),
+    row: out.row,
+  }
+}
 
 // `{..b, f: e}` answers the base's own record type with the written fields replaced, and publishes the
 // base's field list for the lowering. A base whose type the substitution does not hold yet waits for
@@ -5104,6 +5135,7 @@ fn collect_refs(e: Expr, out: Refs) -> Refs =
     },
     EWithCell(c) -> collect_refs(c.body, collect_refs(c.init, out)),
     ESimulate(s) -> collect_refs(s.body, out),
+    EParallel(v) -> fold(v.branches, out, |acc: Refs, x: Expr| collect_refs(x, acc)),
   }
 
 // Tarjan's components; the goldens fix the order they come out in.
@@ -7121,6 +7153,144 @@ fn is_dummy(s: Span) -> Bool = s.start == 0 && s.end == 0
 fn encloses(outer: Span, inner: Span) -> Bool =
   !is_dummy(outer) && !is_dummy(inner) && outer.start <= inner.start && inner.end <= outer.end
 
+// Branches run at once, so no two may touch one resource where either writes. A label parameter or
+// `[*]` may be any label, and a row variable any row.
+fn check_parallels(cx: Cx) -> Cx =
+  fold(cx.parallels, { ..cx, parallels: [] }, |c: Cx, site: ParallelSite| {
+    let rows = map(site.branches, |b: { span: Span, row: Row }|
+      { span: b.span, row: resolve_r(c, b.row) });
+    match refusal(rows) {
+      None -> c,
+      Some(r) ->
+        err_labels(
+          c,
+          b"E0309",
+          r.message,
+          map(r.labels, |l: { span: Span, primary: Bool, text: Bytes }|
+            lab(site.module, l.span, l.primary, l.text)),
+          r.notes,
+        ),
+    }
+  })
+
+type Refusal = {
+  message: Bytes,
+  labels: List<{ span: Span, primary: Bool, text: Bytes }>,
+  notes: List<Bytes>,
+}
+
+// What keeps a block's branches from running at once: a region's schedule, a task's scheduler, or
+// a resource two of them touch.
+fn refusal(rows: List<Branch>) -> Option<Refusal> = {
+  let seed = seed_atom();
+  let performing = |pick: (Atom) -> Bool|
+    fold(rows, None, |acc: Option<{ branch: Branch, atom: Atom }>, b: Branch|
+      match acc {
+        Some(_) -> acc,
+        None -> match filter(b.row.atoms, pick) {
+          [a, ..] -> Some({ branch: b, atom: a }),
+          [] -> None,
+        },
+      });
+  let one = |p: { branch: Branch, atom: Atom }, message: Bytes, why: Bytes|
+    Some({
+      message: message,
+      labels: [
+        {
+          span: p.branch.span,
+          primary: true,
+          text: bytes_concat(b"this branch performs ", tick(atom_text(p.atom))),
+        },
+      ],
+      notes: [why],
+    });
+  match performing(|a: Atom| a == seed) {
+    Some(p) ->
+      one(
+        p,
+        b"a `parallel` branch may not open a `simulate` region",
+        b"a region's schedule is drawn from its entry's seed, in the order its regions open, which branches running at once do not have",
+      ),
+    None -> match performing(|a: Atom| a.effect == b"task") {
+      Some(p) ->
+        one(
+          p,
+          b"a `parallel` branch may not spawn, join or yield a task",
+          b"a task is scheduled by the thread that spawned it, and a branch may run on another; spawn the tasks outside the block",
+        ),
+      None -> {
+        let n = len(rows);
+        let found = fold(range(0, n), None, |acc: Option<Clash>, j: Int|
+          fold(range(0, j), acc, |inner: Option<Clash>, i: Int|
+            match inner { Some(_) -> inner, None -> clash(at(rows, i), at(rows, j)) }));
+        match found {
+          None -> None,
+          Some(k) ->
+            Some({
+              message: b"two branches of this `parallel` block may touch one resource",
+              labels: [
+                {
+                  span: k.later.span,
+                  primary: true,
+                  text: bytes_concat(b"this branch performs ", k.later_does),
+                },
+                {
+                  span: k.earlier.span,
+                  primary: false,
+                  text: bytes_concat(b"and this one performs ", k.earlier_does),
+                },
+              ],
+              notes: [
+                b"branches run at once, so two of them may not perform operations of one effect on one resource where either is a `write`",
+                b"bind the branches with `let` in the order they must run, or move what they share out of the block",
+              ],
+            }),
+        }
+      },
+    },
+  }
+}
+
+type Branch = { span: Span, row: Row }
+
+type Clash = { earlier: Branch, earlier_does: Bytes, later: Branch, later_does: Bytes }
+
+fn may_alias(a: Resource, b: Resource) -> Bool =
+  a == b || (match a { RVar(_) -> true, RAny -> true, _ -> false })
+    || (match b { RVar(_) -> true, RAny -> true, _ -> false })
+
+fn clash(x: Branch, y: Branch) -> Option<Clash> = {
+  let atoms = fold(x.row.atoms, None, |acc: Option<Clash>, a: Atom|
+    fold(y.row.atoms, acc, |inner: Option<Clash>, b: Atom|
+      match inner {
+        Some(_) -> inner,
+        None -> if atom_conflicts({ ..a, resource: b.resource }, b)
+            && may_alias(a.resource, b.resource) {
+          Some({
+            earlier: x,
+            earlier_does: tick(atom_text(a)),
+            later: y,
+            later_does: tick(atom_text(b)),
+          })
+        } else { None },
+      }));
+  match atoms {
+    Some(_) -> atoms,
+    None -> {
+      let open = |r: Row| r.tail != None;
+      let busy = |r: Row| len(r.atoms) > 0 || r.tail != None;
+      if (open(x.row) && busy(y.row)) || (open(y.row) && busy(x.row)) {
+        Some({
+          earlier: x,
+          earlier_does: tick(row_text(x.row)),
+          later: y,
+          later_does: tick(row_text(y.row)),
+        })
+      } else { None }
+    },
+  }
+}
+
 fn check_simulations(cx: Cx) -> Cx = {
   let seed = seed_atom();
   let sites = cx.simulations;
@@ -7804,6 +7974,7 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
     open_regions: [],
     regions: [],
     simulations: [],
+    parallels: [],
     map_keys: [],
     constrained_uses: [],
     spec_kind: None,
@@ -7898,6 +8069,13 @@ fn operand_name(t: Type) -> Bytes =
 // The record-update shapes of a checked program, for a caller that lowers bodies but emits no C.
 pub fn update_shapes(r: Resolved, mods: List<Mod>) -> Option<List<UpdateShape>> = {
   let out = check_program(r, mods);
+  if any_error(out.cx.diags) { None } else { Some(out.cx.update_shapes) }
+}
+
+// The same, with the definitions `known` holds rows for published from them rather than walked: only
+// a walked body's updates are shaped.
+pub fn update_shapes_with(r: Resolved, mods: List<Mod>, known: Known) -> Option<List<UpdateShape>> = {
+  let out = check_program_with(r, mods, known);
   if any_error(out.cx.diags) { None } else { Some(out.cx.update_shapes) }
 }
 
@@ -7999,8 +8177,8 @@ pub fn check_program_with(r: Resolved, mods: List<Mod>, known: Known) -> Checked
   let constrained: Cx = check_constraints(
     check_map_keys(check_comparisons(check_label_apps(settled))),
   );
-  let solved: Cx = check_regions(
-    check_simulations(attribute_generated(check_derives(constrained))),
+  let solved: Cx = check_parallels(
+    check_regions(check_simulations(attribute_generated(check_derives(constrained)))),
   );
   let marked: Cx = mark_internal_effects(solved);
   { cx: marked, ok: !any_error(marked.diags) }
@@ -9584,5 +9762,83 @@ test "record patterns are exhausted field by field" {
   assert_eq(
     not_covered(bytes_concat(t, b"fn f(p: { t: T, n: Int }) -> Int = match p { {t: A, n} -> n }")),
     [b"not covered: `{t: B, ..}`"],
+  )
+}
+
+test "a `parallel` block is the tuple of its branches, and branches may share what none of them writes" {
+  assert_eq(check_codes(b"fn f(n: Int) -> (Int, Bool) = parallel { n + 1, n > 0 }"), []);
+  assert_eq(check_codes(b"fn f(n: Int) -> (Int, Int, Int) = parallel { n, n, n }"), []);
+  assert_eq(check_codes(b"fn f(n: Int) -> (Bool, Int) = parallel { n + 1, n > 0 }"), [b"E0201"]);
+  assert_eq(
+    check_codes(
+      net_src(b"fn f() -> (Int, Int) / {net.read[c]} = parallel { net.peek[c](), net.peek[c]() }"),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      net_src(
+        b"fn f() -> (Unit, Int) / {net.write[c], net.read[d]} = parallel { net.close[c](), net.peek[d]() }",
+      ),
+    ),
+    [],
+  )
+}
+
+test "two branches that touch one resource where either writes are refused" {
+  let diags = check_diags(
+    net_src(
+      b"fn f() -> (Unit, Int) / {net.write[c], net.read[c]} = parallel { net.close[c](), net.peek[c]() }",
+    ),
+  );
+  assert_eq(map(diags, |dg: Diag| dg.code), [b"E0309"]);
+  assert(
+    fold(diags, false, |b: Bool, dg: Diag|
+      b
+        || fold(dg.labels, false, |c: Bool, l: Label|
+          c || bytes_index_of(l.text, b"net.close[c]") != None)),
+  );
+  // A label parameter may be any label.
+  assert_eq(
+    check_codes(
+      net_src(
+        b"fn f<[l]>() -> (Unit, Int) / {net.write[l], net.read[c]} = parallel { net.close[l](), net.peek[c]() }",
+      ),
+    ),
+    [b"E0309"],
+  );
+  // A cell of a region opened outside the block is one resource the branches share.
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int = with_cell[w](0) { c -> { let p = parallel { cell_set(c, 1), cell_get(c) }; p._1 } }",
+    ),
+    [b"E0309"],
+  );
+  assert_eq(
+    check_codes(
+      b"fn f() -> (Int, Int) = parallel { with_cell[w](0) { c -> cell_get(c) }, with_cell[w](1) { c -> { cell_set(c, 2); cell_get(c) } } }",
+    ),
+    [],
+  )
+}
+
+test "a branch whose row is open may perform anything, so it shares with no branch that performs" {
+  assert_eq(check_codes(b"fn f<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }"), [
+  ]);
+  assert_eq(
+    check_codes(b"fn f<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), g() }"),
+    [b"E0309"],
+  )
+}
+
+test "a branch may not open a `simulate` region, whose schedule is its entry's, nor spawn a task" {
+  assert_eq(check_codes(b"fn f() -> (Int, Int) / {sim.read} = parallel { simulate { 1 }, 2 }"), [
+    b"E0309",
+  ]);
+  assert_eq(
+    check_codes(
+      b"fn f() -> (Int, Int) / {task.write} = parallel { task.join(task.spawn(|| 1)), 2 }",
+    ),
+    [b"E0309"],
   )
 }

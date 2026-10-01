@@ -16,6 +16,9 @@ A feature earns its place by one of these. Saving keystrokes does not count.
   never just a slower run.
 - **One implementation, O(change) everywhere.** Nothing is redone that an edit did not reach,
   including in the compiler's own loop. New code is Ply; Rust is ported as work reaches it.
+- **Parallelism is the language's.** A row says what a computation touches, which is what shows
+  that running two at once cannot change an answer. `parallel { .. }` is how a program, the
+  compiler and the CLI included, uses more than one core; no handler keeps a pool of its own.
 
 ## Open
 

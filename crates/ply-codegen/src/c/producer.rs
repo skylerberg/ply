@@ -650,8 +650,6 @@ pub struct Census {
     pub entries: usize,
     /// Modules handed to the front end, summed over its entries.
     pub modules: usize,
-    /// Modules handed to [`claims`], summed over its entries.
-    pub claimed: usize,
     pub allocated: usize,
     pub recycled: usize,
     /// The most chunk bytes any one entry held at its end.
@@ -665,7 +663,6 @@ thread_local! {
         RefCell::new(Census {
             entries: 0,
             modules: 0,
-            claimed: 0,
             allocated: 0,
             recycled: 0,
             chunk_bytes: 0,
@@ -716,8 +713,6 @@ fn read_front(dump: &Value, ids: &[SourceId]) -> Result<Front> {
     super::dump::read(dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))
 }
 
-const CLAIMS: &str = "front.claims";
-
 /// The package tables a caller passes to a resolving entry, as values: what [`Front`]
 /// publishes, or empty lists for a program without packages.
 pub fn package_tables(
@@ -752,19 +747,6 @@ pub fn package_tables(
             Value::Int(packages.len() as i64),
         )
     }
-}
-
-/// Every body, clause and law of a program [`front`] already checked, lowered, resolving the
-/// way the front end did: `packages` and `mod_pkg` are what it published, or empty for a
-/// program without packages. The answer is a `List<front.Claim>`, as the prover reads it.
-pub fn claims(
-    sources: &[(String, String)],
-    packages: &[(String, Vec<String>)],
-    mod_pkg: &[usize],
-) -> Result<Value> {
-    tally(|census| census.claimed += sources.len());
-    let (pkgs, mods, shelf) = package_tables(packages, mod_pkg);
-    call(CLAIMS, &[source_list(sources), pkgs, mods, shelf])
 }
 
 fn source_list(sources: &[(String, String)]) -> Value {

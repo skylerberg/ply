@@ -1,0 +1,256 @@
+// `evidence` — what a discharge established, as the store files it. The store holds the text and
+// never reads it: an entry is believed only when every field is one a discharge writes and the tier
+// it was filed under is the one its evidence earns.
+
+import std.json (Array, Bool, DecodeError, Json, JsonCodec, Number, Str, bool_json, decode_error,
+                 error_to_string, expected, field, get, int_json, json_json, list_json, object,
+                 parse_string, string_json, to_string)
+import obligation (Cases, Certificate, Evidence, Example, Instantiation, Proof, Property, Proved,
+                   Sampled, Tier, tier_word)
+import rules (Rule, CaseSplit, Congruence, ExhaustiveEnumeration, ExhaustiveInterleaving,
+              GroundEvaluation, Induction, Injectivity, LinearArithmetic, Propositional, Unfold,
+              rule_json)
+import property (min_property_cases)
+
+// How strong the evidence is: a certificate proves, and enough kept cases are a property.
+pub fn evidence_tier(e: Evidence) -> Tier =
+  match e {
+    Proof(_) -> Proved,
+    Sampled(c) -> if c.kept >= min_property_cases() { Property } else { Example },
+  }
+
+pub fn evidence_text(e: Evidence) -> String = to_string(evidence_json(e))
+
+// What a store entry says, when it is evidence a discharge could have filed.
+pub fn evidence_of(text: String) -> Result<Evidence, String> =
+  match parse_string(text) {
+    Err(e) -> Err(error_to_string(e)),
+    Ok(j) -> match decoded(j) { Err(e) -> Err(error_to_string(e)), Ok(checked) -> checked },
+  }
+
+fn num(n: Int) -> Json = Number(decimal_of_int(n))
+
+fn evidence_json(e: Evidence) -> Json =
+  object([
+    { key: "tier", value: Str(tier_word(evidence_tier(e))) },
+    {
+      key: "evidence",
+      value: match e {
+        Proof(c) ->
+          object([
+            { key: "evidence", value: Str("proof") },
+            { key: "rules", value: Array(map(c.rules, rule_json)) },
+            { key: "steps", value: num(c.steps) },
+            { key: "guard_satisfiable", value: Bool(c.guard_satisfiable) },
+            { key: "sorts", value: Array(map(c.sorts, |s: String| Str(s))) },
+          ]),
+        Sampled(c) ->
+          object([
+            { key: "evidence", value: Str("cases") },
+            { key: "generated", value: num(c.generated) },
+            { key: "kept", value: num(c.kept) },
+            { key: "rejected", value: num(c.rejected) },
+            { key: "roots", value: Array(map(c.roots, num)) },
+            {
+              key: "instantiations",
+              value: Array(
+                map(c.instantiations, |x: Instantiation| Array([Str(x.var), Str(x.ty)])),
+              ),
+            },
+          ]),
+      },
+    },
+  ])
+
+// The evidence, and whether it may be believed: a parse that succeeds can still hold a tier its
+// evidence does not earn, or a proof that never established its guard.
+fn decoded(j: Json) -> Result<Result<Evidence, String>, DecodeError> = {
+  let tier = field(j, "tier", string_json())?;
+  let body = field(j, "evidence", json_json())?;
+  let kind = field(body, "evidence", string_json())?;
+  let e = evidence_body(body, kind)?;
+  Ok(believed(tier, e))
+}
+
+fn believed(tier: String, e: Evidence) -> Result<Evidence, String> =
+  if tier != tier_word(evidence_tier(e)) {
+    Err(
+      "an entry labelled `" ++ tier ++ "` whose evidence is `" ++ tier_word(evidence_tier(e))
+        ++ "`",
+    )
+  } else {
+    match e {
+      Proof(c) -> if c.guard_satisfiable { Ok(e) }
+      else { Err("a proof that did not establish its guard") },
+      Sampled(_) -> Ok(e),
+    }
+  }
+
+fn evidence_body(body: Json, kind: String) -> Result<Evidence, DecodeError> =
+  if kind == "proof" { proof_of(body) }
+  else if kind == "cases" { cases_of(body) }
+  else { Err(decode_error("`" ++ kind ++ "` is not a kind of evidence")) }
+
+fn proof_of(body: Json) -> Result<Evidence, DecodeError> = {
+  let rules = field(body, "rules", list_json(rule_codec()))?;
+  let steps = field(body, "steps", int_json())?;
+  let guard = field(body, "guard_satisfiable", bool_json())?;
+  let sorts = field(body, "sorts", list_json(string_json()))?;
+  Ok(Proof({ rules: rules, steps: steps, guard_satisfiable: guard, sorts: sorts }))
+}
+
+fn cases_of(body: Json) -> Result<Evidence, DecodeError> = {
+  let generated = field(body, "generated", int_json())?;
+  let kept = field(body, "kept", int_json())?;
+  let rejected = field(body, "rejected", int_json())?;
+  let roots = field(body, "roots", list_json(int_json()))?;
+  let instantiations = field(body, "instantiations", list_json(instantiation_codec()))?;
+  Ok(
+    Sampled({
+      generated: generated,
+      kept: kept,
+      rejected: rejected,
+      roots: roots,
+      instantiations: instantiations,
+    }),
+  )
+}
+
+fn instantiation_codec() -> JsonCodec<Instantiation> =
+  {
+    encode: |x: Instantiation| Array([Str(x.var), Str(x.ty)]),
+    decode: |j: Json|
+      match j {
+        Array([Str(var), Str(ty)]) -> Ok({ var: var, ty: ty }),
+        _ -> Err(expected("a variable and its type", j)),
+      },
+  }
+
+fn rule_codec() -> JsonCodec<Rule> = { encode: rule_json, decode: rule_of }
+
+// A rule with no fields is its name, any other an object holding its fields under its name.
+fn rule_of(j: Json) -> Result<Rule, DecodeError> =
+  match j {
+    Str(name) -> bare_rule(name, j),
+    _ -> match get(j, "exhaustive_enumeration") {
+      Some(f) -> enumeration_of(f),
+      None -> match get(j, "case_split") {
+        Some(f) -> case_split_of(f),
+        None -> match get(j, "unfold") {
+          Some(f) -> unfold_of(f),
+          None -> match get(j, "induction") {
+            Some(f) -> induction_of(f),
+            None -> match get(j, "exhaustive_interleaving") {
+              Some(f) -> interleaving_of(f),
+              None -> Err(expected("a rule", j)),
+            },
+          },
+        },
+      },
+    },
+  }
+
+fn bare_rule(name: String, j: Json) -> Result<Rule, DecodeError> =
+  if name == "ground_evaluation" { Ok(GroundEvaluation) }
+  else if name == "linear_arithmetic" { Ok(LinearArithmetic) }
+  else if name == "propositional" { Ok(Propositional) }
+  else if name == "congruence" { Ok(Congruence) }
+  else if name == "injectivity" { Ok(Injectivity) }
+  else { Err(expected("a rule", j)) }
+
+fn enumeration_of(f: Json) -> Result<Rule, DecodeError> = {
+  let domain = field(f, "domain", string_json())?;
+  let points = field(f, "points", int_json())?;
+  Ok(ExhaustiveEnumeration({ domain: domain, points: points }))
+}
+
+fn case_split_of(f: Json) -> Result<Rule, DecodeError> = {
+  let ty = field(f, "ty", string_json())?;
+  let arms = field(f, "arms", int_json())?;
+  Ok(CaseSplit({ ty: ty, arms: arms }))
+}
+
+fn unfold_of(f: Json) -> Result<Rule, DecodeError> = {
+  let def = field(f, "def", string_json())?;
+  let depth = field(f, "depth", int_json())?;
+  Ok(Unfold({ def: def, depth: depth }))
+}
+
+fn induction_of(f: Json) -> Result<Rule, DecodeError> = {
+  let binder = field(f, "binder", string_json())?;
+  let def = field(f, "def", string_json())?;
+  Ok(Induction({ binder: binder, def: def }))
+}
+
+fn interleaving_of(f: Json) -> Result<Rule, DecodeError> = {
+  let n = field(f, "interleavings", int_json())?;
+  Ok(ExhaustiveInterleaving(n))
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_certificate() -> Certificate =
+  {
+    rules: [
+      GroundEvaluation,
+      ExhaustiveEnumeration({ domain: "Bool", points: 2 }),
+      CaseSplit({ ty: "m.Shape", arms: 3 }),
+      Unfold({ def: "m.f", depth: 2 }),
+      Induction({ binder: "n", def: "m.f" }),
+      ExhaustiveInterleaving(12),
+      LinearArithmetic,
+      Propositional,
+      Congruence,
+      Injectivity,
+    ],
+    steps: 41,
+    guard_satisfiable: true,
+    sorts: ["a"],
+  }
+
+fn a_sample(kept: Int) -> Cases =
+  {
+    generated: 200,
+    kept: kept,
+    rejected: 200 - kept,
+    roots: [0, 3],
+    instantiations: [{ var: "a", ty: "Int" }],
+  }
+
+test "evidence reads back as it was filed, every rule included" {
+  let proof = Proof(a_certificate());
+  assert_eq(evidence_of(evidence_text(proof)), Ok(proof));
+  let sample = Sampled(a_sample(30));
+  assert_eq(evidence_of(evidence_text(sample)), Ok(sample))
+}
+
+test "only a certificate is proved, and the kept count alone separates property from example" {
+  assert_eq(evidence_tier(Proof(a_certificate())), Proved);
+  assert_eq(evidence_tier(Sampled(a_sample(min_property_cases()))), Property);
+  assert_eq(evidence_tier(Sampled(a_sample(min_property_cases() - 1))), Example);
+  assert_eq(evidence_tier(Sampled(a_sample(0))), Example)
+}
+
+test "an entry is believed only with the tier its evidence earns and a guard a proof established" {
+  let relabelled = "{\"evidence\":{\"evidence\":\"cases\",\"generated\":3,\"instantiations\":[],\"kept\":3,\"rejected\":0,\"roots\":[0]},\"tier\":\"proved\"}";
+  assert_eq(evidence_of(relabelled), Err("an entry labelled `proved` whose evidence is `example`"));
+  let vacuous = evidence_text(Proof({ ..a_certificate(), guard_satisfiable: false }));
+  assert_eq(evidence_of(vacuous), Err("a proof that did not establish its guard"));
+  assert(evidence_of("{\"tier\":\"proved\"}") != Ok(Proof(a_certificate())));
+  assert(evidence_of("not json") != Ok(Proof(a_certificate())))
+}
+
+test "the text is the shape the store has always held" {
+  let filed = "{\"evidence\":{\"evidence\":\"proof\",\"guard_satisfiable\":true,\"rules\":[\"ground_evaluation\",{\"unfold\":{\"def\":\"m.f\",\"depth\":1}}],\"sorts\":[],\"steps\":4},\"tier\":\"proved\"}";
+  assert_eq(
+    evidence_of(filed),
+    Ok(
+      Proof({
+        rules: [GroundEvaluation, Unfold({ def: "m.f", depth: 1 })],
+        steps: 4,
+        guard_satisfiable: true,
+        sorts: [],
+      }),
+    ),
+  )
+}

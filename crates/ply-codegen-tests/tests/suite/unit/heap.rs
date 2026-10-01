@@ -650,3 +650,75 @@ fn a_word_is_an_object_only_at_a_live_start() {
     heap.end();
     assert!(!heap.is_object(w), "nothing survives the entry");
 }
+
+/// What another thread may hold is marked once, all of it, and is never unique after.
+#[test]
+fn sharing_marks_everything_under_the_words_and_counts_it_apart() {
+    let mut h = Heap::new();
+    enter(&mut h);
+    let l = layouts();
+    let inner = h.to_word(&l, &Value::list(vec![Value::str("a"), Value::Int(2)]));
+    let outer = h.to_word(&l, &Value::ctor("Some", vec![Value::Int(0)]));
+    unsafe { set_word(obj(outer), 0, inner) };
+    assert!(share(&[outer]));
+    for w in [outer, inner] {
+        assert!(unsafe { (*obj(w)).rc } >= SHARED);
+        assert!(!is_unique(w));
+    }
+    inc(outer);
+    dec(outer);
+    assert_eq!(kind(outer), KIND_CTOR);
+    // The last holder dismantles it, and the block is no free list's: no thread knows whose it is.
+    dec(outer);
+    assert_eq!(kind(outer), KIND_DEAD);
+    assert_eq!(kind(inner), KIND_DEAD);
+    let next = h.to_word(&l, &Value::ctor("Some", vec![Value::Int(1)]));
+    assert_ne!(next, outer);
+    leave();
+    h.end();
+}
+
+/// A cell is a slot of one entry's arena: nothing under words that reach one is marked.
+#[test]
+fn sharing_what_reaches_a_cell_marks_nothing() {
+    let mut h = Heap::new();
+    let l = layouts();
+    let cell = h.bridge(Value::Cell(ply_eval::arena::Slot::new(0, 0)));
+    let plain = h.to_word(&l, &Value::list(vec![Value::Int(1)]));
+    let holder = h.to_word(&l, &Value::ctor("Some", vec![Value::Int(0)]));
+    unsafe { set_word(obj(holder), 0, cell) };
+    assert!(!share(&[plain, holder]));
+    for w in [plain, holder, cell] {
+        assert!(
+            unsafe { (*obj(w)).rc } < SHARED,
+            "a refused share left a mark"
+        );
+    }
+    h.end();
+}
+
+/// A branch's objects are its block's once the block adopts its heap, and the block keeps bumping
+/// where it was.
+#[test]
+fn an_adopted_heap_keeps_its_objects_and_its_bridges() {
+    let l = layouts();
+    let mut parent = Heap::new();
+    let before = parent.to_word(&l, &Value::str("before"));
+    let mut branch = Heap::branch();
+    let made = branch.to_word(&l, &Value::list(vec![Value::Int(7), Value::str("x")]));
+    let float = branch.bridge(Value::Float(2.5));
+    parent.adopt_heap(branch);
+    let after = parent.to_word(&l, &Value::str("after"));
+    assert_eq!(
+        Heap::to_value(&l, made),
+        Value::list(vec![Value::Int(7), Value::str("x")])
+    );
+    assert_eq!(Heap::to_value(&l, float), Value::Float(2.5));
+    assert_eq!(Heap::to_value(&l, before), Value::str("before"));
+    assert_eq!(Heap::to_value(&l, after), Value::str("after"));
+    assert!(parent.is_object(made) && parent.is_object(after));
+    enter(&mut parent);
+    dec(float);
+    leave();
+    parent.end();
+}

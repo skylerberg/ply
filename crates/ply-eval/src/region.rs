@@ -1,8 +1,8 @@
 //! The trail every region of one entry point writes into.
 
-use crate::explore::{Interleaving, Step, Verdict};
-use crate::sched::StepRecord;
-use crate::sim::{Access, Domain, Seed, Stream};
+use crate::cont::SimId;
+use crate::sched::{Stamp, StepRecord};
+use crate::sim::{Access, Domain, Seed, StepFootprint, Stream, TaskId};
 
 use crate::{Diagnostic, Span, Symbol};
 
@@ -11,6 +11,75 @@ use crate::{Diagnostic, Span, Symbol};
 pub struct StepSite {
     pub definition: Option<Symbol>,
     pub span: Span,
+}
+
+/// One scheduling point of a recorded interleaving.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Step {
+    pub region: SimId,
+    pub task: TaskId,
+    /// Every task the scheduler could have resumed at this point, in its canonical order.
+    pub enabled: Vec<TaskId>,
+    /// The index into `enabled` that was taken; `enabled[choice] == task`.
+    pub choice: u16,
+    /// Every cell and `random.write` touched, but not the terminating `task.*`/`clock.*` atom.
+    pub accesses: StepFootprint,
+    pub definition: Option<Symbol>,
+    pub span: Span,
+    /// The acting task's vector clock: which earlier steps this one had observed.
+    pub stamp: Stamp,
+}
+
+impl Step {
+    /// `fallback` places a step that placed nothing itself.
+    pub fn from_record(record: &StepRecord, fallback: Span) -> Step {
+        let (definition, span) = match &record.site {
+            Some(site) => (site.definition.clone(), site.span),
+            None => (None, fallback),
+        };
+        Step {
+            region: record.region,
+            task: record.task,
+            enabled: record.enabled.clone(),
+            choice: record.choice,
+            accesses: record.accesses.clone(),
+            definition,
+            span,
+            stamp: record.stamp.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Verdict {
+    Passed,
+    Failed(Diagnostic),
+}
+
+#[derive(Clone, Debug)]
+pub struct Interleaving {
+    pub steps: Vec<Step>,
+    pub verdict: Verdict,
+    /// Nanoseconds of virtual time the run consumed.
+    pub virtual_time: i64,
+}
+
+impl Interleaving {
+    pub fn passed(steps: Vec<Step>) -> Interleaving {
+        Interleaving {
+            steps,
+            verdict: Verdict::Passed,
+            virtual_time: 0,
+        }
+    }
+
+    pub fn failed(steps: Vec<Step>, diagnostic: Diagnostic) -> Interleaving {
+        Interleaving {
+            steps,
+            verdict: Verdict::Failed(diagnostic),
+            virtual_time: 0,
+        }
+    }
 }
 
 pub struct Trail {

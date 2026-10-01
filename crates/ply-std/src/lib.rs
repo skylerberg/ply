@@ -46,6 +46,8 @@ pub const NET: &str = include_str!("../ply/net.ply");
 
 pub const OPTION: &str = include_str!("../ply/option.ply");
 
+pub const PARALLEL: &str = include_str!("../ply/parallel.ply");
+
 pub const PARSE: &str = include_str!("../ply/parse.ply");
 
 pub const PATH: &str = include_str!("../ply/path.ply");
@@ -99,6 +101,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.msgpack", MSGPACK),
     ("std.net", NET),
     ("std.option", OPTION),
+    ("std.parallel", PARALLEL),
     ("std.parse", PARSE),
     ("std.path", PATH),
     ("std.pg", PG),

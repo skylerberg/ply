@@ -207,6 +207,9 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
             "rt_list_set" => rt::rt_list_set as *const (),
             "rt_list_lookup" => rt::rt_list_lookup as *const (),
             "rt_map_lookup" => rt::rt_map_lookup as *const (),
+            "rt_inc_shared" => rt::rt_inc_shared as *const (),
+            "rt_dec_shared" => rt::rt_dec_shared as *const (),
+            "rt_parallel" => rt::rt_parallel as *const (),
             other => unreachable!("no address for the helper `{other}`"),
         };
         out.push(p as *mut std::ffi::c_void);

@@ -15,7 +15,6 @@ pub mod compiled;
 pub mod cont;
 pub mod decode;
 pub mod escape;
-pub mod explore;
 pub mod expr;
 mod footprint;
 pub mod handler;
@@ -57,21 +56,18 @@ pub use carry::{Carry, CtorCarries};
 pub use compiled::{Compiled, Entered};
 pub use cont::{Frame, Next, Prompt, Segment, SimId, Stack};
 pub use escape::{Boundary, Escapee, Handle};
-pub use host::{
-    Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
-    HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, ShutdownReport,
-};
-pub use task_regions::{Fixture, TaskRegions};
-// `explore::Step` is not re-exported: `Step` at the root is the builtin's.
 pub use evaluator::{
     Ended, Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,
     err_host_in_simulation, err_nested_simulation, err_no_runtime, err_not_compiled,
     err_secret_to_host, err_unenumerated_atom,
 };
-pub use explore::{
-    Dependence, Explored, Interleaving, Simulation, Verdict, explore, explore_under,
-    measure_reduction,
+pub use host::{
+    Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
+    HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory,
+    ShutdownReport,
 };
+pub use task_regions::{Fixture, TaskRegions};
+// `region::Step` is not re-exported: `Step` at the root is the builtin's.
 pub use footprint::{EffectAtom, Footprint, Mode, Resource, atom_texts, label_var_name};
 pub use hash::{DefHash, HashOutput};
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
@@ -82,12 +78,12 @@ pub use program::{
     TypeDecl, Visibility, WrittenParam, is_ident, is_ident_continue, is_ident_start,
 };
 pub use rc::Stats as RcStats;
+pub use region::{Interleaving, Verdict};
 pub use sched::TaskHandle;
 pub use semantics::strict_binary;
 pub use sim::{
-    Access, Answer, Clock, Cost, Domain, Exploration, Handlers, OpSignature, Plan, Race, RaceSite,
-    Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed, SimMode, SimTy, Sleep, StepFootprint, Stream, TaskId,
-    Wake,
+    Access, Answer, Clock, Domain, Handlers, OpSignature, Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed,
+    SimTy, Sleep, StepFootprint, Stream, TaskId, Wake,
 };
 pub use span::{
     Diagnostic, Edit, Fix, Label, Severity, SourceFile, SourceId, SourceMap, Span, Sparse, Symbol,
