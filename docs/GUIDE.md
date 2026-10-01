@@ -1152,6 +1152,7 @@ derive json for Line
 | `json` | `<snake_case(T)>_json` | `std.json.JsonCodec<T>` |
 | `eq` | `<snake_case(T)>_eq` | `{eq: (T, T) -> Bool}` |
 | `ord` | `<snake_case(T)>_ord` | `{compare: (T, T) -> Ordering}` |
+| `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
 
 There are no other derivers (`E0207`). A name collision (`HTTPRequest` and
 `HttpRequest` both give `http_request`) is `E0105`. A `derive` must be in the
@@ -1172,8 +1173,10 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
 plain values: `json::decode_bytes(body, order_json())`.
 
 `E0206` names the field that blocks a derivation: function types, `Cell` and
-`Task` (all derivers); `Float` (`ord`); `Secret` (`json`, `ord`); `Option<Unit>`
-and `Option<Option<a>>` (`json`).
+`Task` (all derivers); `Float` (`ord`); `Secret` (`json`, `ord`, `bin`);
+`Option<Unit>` and `Option<Option<a>>` (`json`). `json` and `bin` need their
+module imported (`import std.json`, `import std.bin`), or the `derive` is
+`E0206`.
 
 ## 12. Builtins
 
@@ -2514,6 +2517,44 @@ piece from `zero` with `step` and merges the pieces' answers left to right: it
 is `fold(xs, zero, step)` when `merge` is associative, `zero` is its identity
 and `step(b, x)` is `merge(b, step(zero, x))`, as for a sum or a list. `f`,
 `step` and `merge` are pure.
+
+### 13.37 `std.bin`
+
+```ply
+pub type BinCodec<a> = {
+  put: (Bytes, a) -> Bytes,
+  take: (Bytes, Int) -> Result<Taken<a>, BinError>,
+  shape: Shape,
+}
+pub type Taken<a> = { value: a, at: Int }
+pub type BinError = { at: Int, message: String }
+pub fn encode<a>(x: a, codec: BinCodec<a>) -> Bytes
+pub fn decode<a>(data: Bytes, codec: BinCodec<a>) -> Result<a, BinError>
+pub fn shape_digest<a>(codec: BinCodec<a>) -> Bytes
+```
+
+A compact encoding for bytes both ends read with the same type, which is what
+`derive bin` targets. Nothing names a field: a record is its fields in declared
+order and a variant is its constructor's index, then its fields. `Int`, counts,
+lengths and the 16- to 128-bit widths are varints (signed ones zigzagged);
+`U8`/`I8` are one byte, `Float` its eight IEEE bytes (a `NaN` keeps its
+payload), `Decimal` its text, and `Unit` one zero byte, so every value takes at
+least a byte. `put` appends a value to the bytes it is given and `take` reads one
+at an offset. `decode` refuses bytes that end inside the value, bytes left over,
+and anything no value writes: a constructor index past the type's, a count past
+the bytes left, a map's keys out of order, an overlong varint, text that is not
+UTF-8.
+
+`shape_digest` is 32 bytes that change whenever a field, a constructor, a name
+or an order changes anywhere the type reaches, so a store can key what it wrote
+by it. A recursive type finishes: a reference back into a sum being digested is
+named rather than entered.
+
+Codecs: `unit_bin`, `bool_bin`, `int_bin`, `float_bin`, `decimal_bin`,
+`string_bin`, `bytes_bin`, `u8_bin` … `u128_bin`, `i8_bin` … `i128_bin`,
+`ordering_bin`, `rounding_bin`, and combinators `list_bin`, `option_bin`,
+`result_bin`, `iter_bin`, `map_bin`. Each scalar's `put_*` and `take_*` are
+public too.
 
 ## 14. The host boundary
 
