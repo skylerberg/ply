@@ -264,7 +264,7 @@ fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
                             return Err(sched.fail(
                                 Diagnostic::error(codes::RUNTIME_ERROR, "the task failed")
                                     .primary(Span::DUMMY, "here"),
-                                &ply_eval::Seed::root(0),
+                                &ply_eval::Seed::at(0, Vec::new()),
                             ));
                         }
                     }
@@ -543,7 +543,7 @@ fn a_failed_production_region_answers_with_its_failure_forever() {
     };
     sched.fail(
         Diagnostic::error(codes::RUNTIME_ERROR, "boom"),
-        &ply_eval::Seed::root(0),
+        &ply_eval::Seed::at(0, Vec::new()),
     );
     for _ in 0..4 {
         let err = refused(sched.next_host(&*rt), "the region is over");

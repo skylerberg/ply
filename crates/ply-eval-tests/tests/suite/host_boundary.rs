@@ -454,7 +454,9 @@ test/nondet "a socket under a seed" {
 
         let mut machine = compiled.machine_on_tier();
         machine.set_host_binding(Arc::new(binding));
-        machine.set_host_runtime(std::rc::Rc::new(Resolved7::default()));
+        machine.set_host_runtime(std::sync::Arc::new(|| {
+            std::rc::Rc::new(Resolved7::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
+        }));
         let d = diagnostic(machine.eval_test(0));
         assert_eq!(
             d.code,
@@ -703,7 +705,9 @@ test/nondet "waits" {
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.set_host_runtime(std::rc::Rc::new(Resolved7::default()));
+    machine.set_host_runtime(std::sync::Arc::new(|| {
+        std::rc::Rc::new(Resolved7::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
+    }));
     machine.eval_test(0).expect("the token resolves");
     assert_eq!(machine.host_ops(), 1);
 }
@@ -922,7 +926,9 @@ test/nondet "the sibling runs while one task waits" {
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.set_host_runtime(std::rc::Rc::new(Later::default()));
+    machine.set_host_runtime(std::sync::Arc::new(|| {
+        std::rc::Rc::new(Later::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
+    }));
     machine.eval_test(0).expect("both tasks finish");
     assert_eq!(
         machine.host_use().expect("reached the host").operations,
@@ -1016,7 +1022,9 @@ test/nondet "each task reads its cell after the other's region closed" {
 
     let (mut machine, tier) = compiled.machine_and_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.set_host_runtime(std::rc::Rc::new(AfterPark::default()));
+    machine.set_host_runtime(std::sync::Arc::new(|| {
+        std::rc::Rc::new(AfterPark::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
+    }));
     machine
         .eval_test(0)
         .expect("both tasks read their own cells");
@@ -1159,6 +1167,8 @@ test/nondet "one operation, no tasks" {
     let binding = registry.bind(&compiled.front.check).expect("binds");
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
-    machine.set_host_runtime(std::rc::Rc::new(Resolved7::default()));
+    machine.set_host_runtime(std::sync::Arc::new(|| {
+        std::rc::Rc::new(Resolved7::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
+    }));
     machine.eval_test(0).expect("block_on answers");
 }

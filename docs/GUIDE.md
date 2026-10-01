@@ -663,13 +663,15 @@ two or more branches, and `parallel` is a name wherever no `{` follows it.
   A branch to its right may already have performed its effects.
 * The branches spend one step budget between them (`E0503`, §8.4), as they would
   in turn.
-* A block whose branches could reach a `handle` around it, a `simulate` region
-  (§9), or the production host runtime runs them in turn, which answers the
-  same. So does one whose branches hold a cell, a task or a continuation.
+* A block whose branches could reach a `handle` around it or a `simulate` region
+  (§9) runs them in turn, which answers the same. So does one whose branches
+  hold a cell, a task or a continuation. Under `--host` each branch waits on a
+  reactor of its own.
 * `E0309`: two branches perform operations of one effect on one resource, one
   of them a `write`; or a branch's row is open (it calls a function value whose
   row is a variable) while another performs anything; or a branch opens a
-  `simulate` region. `E0118`: a `?` inside a branch.
+  `simulate` region or performs a `task` operation, since a task belongs to the
+  scheduler of the thread that spawned it. `E0118`: a `?` inside a branch.
 
 `std.parallel` (§13.36) splits a list across nested blocks.
 
@@ -918,9 +920,11 @@ effect, or write `test/nondet "label" { ... }`, which is never cached.
 
 ### 8.4 Scheduling and failures
 
-Tests whose footprints do not conflict run concurrently; a test whose effects
-are all discharged in a region conflicts with nothing. `--jobs N`/`-j` sets
-workers (default one per core).
+Tests whose footprints do not conflict run concurrently, under `parallel`
+blocks (§5.9) on one thread per core; a test whose effects are all discharged in
+a region conflicts with nothing. `--jobs N`/`-j` deals them into `N` lanes, each
+lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
+claims' points the same way.
 
 `--steps N` is the calls each test may make (default 1000000000; `0` is no
 bound); a test past it fails with `E0503`, which is a program error like any
@@ -2880,7 +2884,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
 | `E0307` | mutually recursive definitions binding different label or row parameters |
 | `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
-| `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region |
+| `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region, or enters another |
 | `E0414` | deadlock, or spent step budget |

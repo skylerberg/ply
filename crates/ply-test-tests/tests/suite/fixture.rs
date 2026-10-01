@@ -1,7 +1,10 @@
-use ply_eval::{CheckOutput, DefHash, Diagnostic, HashOutput, ModuleName, Plan, SourceId};
+use ply_eval::{CheckOutput, DefHash, Diagnostic, HashOutput, ModuleName, Seed, SourceId};
 use ply_store::Store;
-use ply_test::{Choice, Reason, Selection};
+use ply_test::{Choice, Executed, Hosting, InterpExecutor, Reason, RunReport, Selection};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Files a program's definitions as the CLI does before its tests run: each one's row and scheme,
 /// as the compiler prints them, under its hash and name, and the file's fingerprint naming the
@@ -160,20 +163,163 @@ impl Compiled {
             .expect("this host has a C compiler")
     }
 
-    /// Every test, run as one class under the default plan.
+    /// Every test, run as one class.
     pub fn every(&self) -> Selection {
-        every(&self.check, &self.hashes, &Plan::default())
+        every(&self.check, &self.hashes)
+    }
+
+    /// `selection` run on this program's own unit, a seeded test once per seed of `seeds`.
+    pub fn run(
+        &self,
+        selection: &Selection,
+        hosting: Hosting,
+        store: &mut Store,
+        seeds: &Seeds,
+    ) -> RunReport {
+        run_at(selection, &self.port, self.tier(), hosting, store, seeds, 1)
     }
 }
 
-/// A stand-in for the key a program files a seeded test's result under. The runtime reads and
-/// writes under whatever it is handed, so a runner test needs only a key that moves with the plan;
-/// the encoding a program uses is `suite.keys`'s, and its tests pin it.
-pub fn plan_key(test: DefHash, plan: &Plan) -> DefHash {
-    stand_in(&format!("{test:?} {:?}", plan.clone().normalized()))
+/// The interleavings a fixture runs a seeded test at -- one per root, each taking `path` first --
+/// the steps each may take, and whether the test is run more than once. Which interleavings a
+/// search runs is the program's; a fixture names the ones a test needs.
+#[derive(Clone, Debug)]
+pub struct Seeds {
+    pub roots: Vec<u64>,
+    pub path: Vec<u16>,
+    pub steps: u32,
+    pub re_executed: bool,
 }
 
-/// The same for one root of a plan answered root by root.
+impl Default for Seeds {
+    /// As a search from root 0 runs it: the test may run again.
+    fn default() -> Seeds {
+        Seeds {
+            roots: vec![0],
+            path: Vec::new(),
+            steps: 100_000,
+            re_executed: true,
+        }
+    }
+}
+
+impl Seeds {
+    /// Exactly the interleaving `seed` names, run once.
+    pub fn once(seed: Seed) -> Seeds {
+        Seeds {
+            roots: vec![seed.root],
+            path: seed.path,
+            re_executed: false,
+            ..Seeds::default()
+        }
+    }
+
+    /// One interleaving per root.
+    pub fn roots(roots: impl IntoIterator<Item = u64>) -> Seeds {
+        let roots: Vec<u64> = roots.into_iter().collect();
+        Seeds {
+            re_executed: roots.len() > 1,
+            roots,
+            ..Seeds::default()
+        }
+    }
+}
+
+/// What a runner makes of `selection`: each class in turn, its tests across `jobs` threads, each
+/// run on the thread that takes it -- a seeded one once per seed of `seeds` -- and the run concluded
+/// under the keys the selection names.
+pub fn run_at(
+    selection: &Selection,
+    front: &ply_eval::Front,
+    unit: &'static dyn ply_eval::Provider,
+    hosting: Hosting,
+    store: &mut Store,
+    seeds: &Seeds,
+    jobs: usize,
+) -> RunReport {
+    let executor = InterpExecutor::new(front, unit).with_hosts(hosting);
+    let check = &front.check;
+    let started = Instant::now();
+    let mut ran = Vec::new();
+    for class in &selection.groups {
+        let next = AtomicUsize::new(0);
+        let out = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..jobs.clamp(1, class.len().max(1)) {
+                std::thread::Builder::new()
+                    .stack_size(64 << 20)
+                    .spawn_scoped(scope, || {
+                        while let Some(&index) = class.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let seeded = check
+                                .tests
+                                .get(index)
+                                .is_some_and(|t| ply_test::is_seeded(&t.footprint));
+                            let done = if seeded {
+                                searched(&executor, check, index, seeds)
+                            } else {
+                                ply_test::executed(&executor, check, index)
+                            };
+                            out.lock().expect("no test thread panicked").push(done);
+                        }
+                    })
+                    .expect("a test thread starts");
+            }
+        });
+        ran.extend(out.into_inner().expect("no test thread panicked"));
+    }
+    ply_test::concluded(
+        selection,
+        check,
+        &front.hashes,
+        store,
+        ran,
+        started.elapsed(),
+    )
+}
+
+/// A seeded test run once per seed of `seeds`, in order, until one fails.
+pub fn searched(
+    executor: &InterpExecutor<'_>,
+    check: &CheckOutput,
+    index: usize,
+    seeds: &Seeds,
+) -> Executed {
+    let mut runs = ply_test::Interleavings::default();
+    let mut searched = ply_test::Searched::default();
+    let mut failure = None;
+    for &root in &seeds.roots {
+        let seed = Seed::at(root, seeds.path.clone());
+        let run = ply_test::interleaved(
+            executor,
+            check,
+            index,
+            &seed,
+            seeds.steps,
+            seeds.re_executed,
+        );
+        searched.explored += 1;
+        searched.steps += run.interleaving.steps.len() as u64;
+        searched.virtual_time = run.interleaving.virtual_time;
+        if let Some(id) = runs.add(&run) {
+            failure = runs.held().get(id).cloned();
+            searched.failure = Some(seed);
+            break;
+        }
+    }
+    runs.settled(index, searched, failure, seeds.roots.len())
+}
+
+/// A stand-in for the key a program files a seeded test's result under. The runtime reads and
+/// writes under whatever it is handed, so a runner test needs only a key that moves with the seeds;
+/// the encoding a program uses is `suite.keys`'s, and its tests pin it.
+pub fn seeds_key(test: DefHash, seeds: &Seeds) -> DefHash {
+    stand_in(&format!(
+        "{test:?} {:?} {:?} {}",
+        seeds.roots, seeds.path, seeds.steps
+    ))
+}
+
+/// The same for one root of a search answered root by root.
 pub fn root_key(test: DefHash, root: u64) -> DefHash {
     stand_in(&format!("{test:?} root {root}"))
 }
@@ -188,9 +334,7 @@ fn stand_in(text: &str) -> DefHash {
 /// runner test hands the runtime the answer it needs.
 pub fn handed(
     check: &CheckOutput,
-    plan: &Plan,
     runs: &[usize],
-    narrowed: BTreeMap<usize, Vec<u64>>,
     filed: BTreeMap<usize, Vec<DefHash>>,
 ) -> Selection {
     let reasons = (0..check.tests.len())
@@ -210,25 +354,23 @@ pub fn handed(
     let choice = Choice {
         runs: runs.to_vec(),
         reasons,
-        narrowed,
         groups,
-        every: Vec::new(),
         filed,
     };
-    Selection::chosen(&choice, check, plan)
+    Selection::chosen(&choice, check)
 }
 
 /// `runs` alone, each filed under its test's own hash.
-pub fn choose(check: &CheckOutput, hashes: &HashOutput, runs: &[usize], plan: &Plan) -> Selection {
+pub fn choose(check: &CheckOutput, hashes: &HashOutput, runs: &[usize]) -> Selection {
     let filed = runs
         .iter()
         .filter_map(|&i| Some((i, vec![*hashes.tests.get(i)?])))
         .collect();
-    handed(check, plan, runs, BTreeMap::new(), filed)
+    handed(check, runs, filed)
 }
 
 /// Every test, as a cold cache has it.
-pub fn every(check: &CheckOutput, hashes: &HashOutput, plan: &Plan) -> Selection {
+pub fn every(check: &CheckOutput, hashes: &HashOutput) -> Selection {
     let all: Vec<usize> = (0..check.tests.len()).collect();
-    choose(check, hashes, &all, plan)
+    choose(check, hashes, &all)
 }

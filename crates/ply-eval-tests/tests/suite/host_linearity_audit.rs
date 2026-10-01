@@ -126,7 +126,9 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     if runtime {
-        machine.set_host_runtime(std::rc::Rc::new(Ready::default()));
+        machine.set_host_runtime(std::sync::Arc::new(|| {
+            std::rc::Rc::new(Ready::default()) as std::rc::Rc<dyn ply_eval::HostRuntime>
+        }));
     }
     let outcome = machine.eval_test(0);
     Run {

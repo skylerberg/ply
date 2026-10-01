@@ -490,6 +490,8 @@ pub struct Ctx {
     /// arguments read; `None` for one entered without its program's answer.
     pub(crate) program: Option<&'static ply_eval::Front>,
     pub(crate) runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
+    /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of.
+    pub(crate) runtime_factory: Option<ply_eval::RuntimeFactory>,
     pub(crate) declared: Option<ply_eval::Footprint>,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_eval::host::HostUse,
@@ -510,6 +512,8 @@ pub struct Ctx {
     pub(crate) unwind: Option<(usize, usize, Word)>,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
     resumed: Option<Word>,
+    /// The heap and poison site of the entry this one began inside, put back when it ends.
+    outer: (*mut Heap, *const i64),
 }
 
 impl Ctx {
@@ -548,6 +552,7 @@ impl Ctx {
             binding: Arc::new(ply_eval::HostBinding::hermetic()),
             program: None,
             runtime: None,
+            runtime_factory: None,
             declared: None,
             re_executed: false,
             host_use: ply_eval::host::HostUse::default(),
@@ -562,6 +567,7 @@ impl Ctx {
             entered_sims: 0,
             unwind: None,
             resumed: None,
+            outer: (std::ptr::null_mut(), std::ptr::null()),
         }
     }
 
@@ -582,6 +588,7 @@ impl Ctx {
         b.arm_tick();
         b.entry = self.entry;
         b.binding = Arc::clone(&self.binding);
+        b.runtime_factory = self.runtime_factory.clone();
         b.program = self.program;
         b.declared = self.declared.clone();
         b.re_executed = self.re_executed;
@@ -615,7 +622,8 @@ impl Ctx {
     /// reach a handler this entry holds, a region's scheduler or this thread's host runtime, all of
     /// which live on this thread.
     pub(crate) fn runs_branches_at_once(&self) -> bool {
-        if !self.sims.is_empty() || self.runtime.is_some() {
+        // A reactor this thread holds and no factory could make again belongs to this thread alone.
+        if !self.sims.is_empty() || (self.runtime.is_some() && self.runtime_factory.is_none()) {
             return false;
         }
         let mut stack = Some(self.current);
@@ -692,8 +700,11 @@ impl Ctx {
         );
         // After the recovery above, which gives back what that entry held.
         self.cells_baseline = self.cell_extent();
-        heap::enter(&mut self.heap);
-        heap::poison::enter(&raw const self.site_root);
+        // Another unit's entry may be running further up this thread: it gets its own back at `end`.
+        self.outer = (
+            heap::swap_current(&mut self.heap),
+            heap::poison::swap(&raw const self.site_root),
+        );
     }
 
     /// When compiled code must call back next: the call one past the budget, the end of this
@@ -750,8 +761,9 @@ impl Ctx {
             self.cells_balanced(),
             "closing the entry's regions left slots the arena did not reclaim"
         );
-        heap::poison::leave();
-        heap::leave();
+        heap::poison::swap(self.outer.1);
+        heap::swap_current(self.outer.0);
+        self.outer = (std::ptr::null_mut(), std::ptr::null());
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(
@@ -834,9 +846,21 @@ impl Ctx {
         &mut self,
         binding: Arc<ply_eval::HostBinding>,
         runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
+        factory: Option<ply_eval::RuntimeFactory>,
     ) {
         self.binding = binding;
         self.runtime = runtime;
+        self.runtime_factory = factory;
+    }
+
+    /// The reactor this context waits on, made on first need on a `parallel` branch's thread.
+    pub(crate) fn host_runtime(&mut self) -> Option<Rc<dyn ply_eval::HostRuntime>> {
+        if self.runtime.is_none()
+            && let Some(factory) = &self.runtime_factory
+        {
+            self.runtime = Some(factory());
+        }
+        self.runtime.clone()
     }
 
     pub(crate) fn frames(&mut self) -> &mut Vec<HandlerFrame> {

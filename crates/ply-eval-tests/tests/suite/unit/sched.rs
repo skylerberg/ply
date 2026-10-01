@@ -38,7 +38,7 @@ fn solo(root: u64) -> (Sched, Clock, Trail) {
     (
         Scheduler::new(SimId(0), Span::DUMMY),
         Clock::new(),
-        Trail::new(Seed::root(root)),
+        Trail::new(Seed::at(root, Vec::new())),
     )
 }
 
@@ -197,7 +197,7 @@ fn two_workers() -> Program {
 #[test]
 fn a_region_with_no_tasks_delivers_its_bodys_value() {
     let program = vec![vec![Act::Mark("only")]];
-    let run = run(&program, Seed::root(1)).expect("no reason to block");
+    let run = run(&program, Seed::at(1, Vec::new())).expect("no reason to block");
     assert_eq!(run.marks, vec![(0, "only")]);
     assert_eq!(run.choices, vec![0], "the body's own step is a step");
 }
@@ -205,9 +205,9 @@ fn a_region_with_no_tasks_delivers_its_bodys_value() {
 #[test]
 fn one_seed_produces_one_interleaving_however_often_it_is_run() {
     let program = two_workers();
-    let first = run(&program, Seed::root(7)).expect("completes");
+    let first = run(&program, Seed::at(7, Vec::new())).expect("completes");
     for _ in 0..64 {
-        let again = run(&program, Seed::root(7)).expect("completes");
+        let again = run(&program, Seed::at(7, Vec::new())).expect("completes");
         assert_eq!(again.marks, first.marks);
         assert_eq!(again.choices, first.choices);
         assert_eq!(again.steps, first.steps);
@@ -219,7 +219,7 @@ fn different_seeds_produce_different_interleavings() {
     let program = two_workers();
     let mut seen: Vec<Vec<(u64, &'static str)>> = Vec::new();
     for root in 0..32 {
-        let run = run(&program, Seed::root(root)).expect("completes");
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
         if !seen.contains(&run.marks) {
             seen.push(run.marks);
         }
@@ -234,7 +234,7 @@ fn different_seeds_produce_different_interleavings() {
 fn every_interleaving_runs_every_task_in_its_own_order() {
     let program = two_workers();
     for root in 0..64 {
-        let run = run(&program, Seed::root(root)).expect("completes");
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
         let of = |task: u64| -> Vec<&'static str> {
             run.marks
                 .iter()
@@ -252,7 +252,7 @@ fn every_interleaving_runs_every_task_in_its_own_order() {
 #[test]
 fn the_realized_choice_sequence_replays_the_run_it_came_from() {
     let program = two_workers();
-    let free = run(&program, Seed::root(11)).expect("completes");
+    let free = run(&program, Seed::at(11, Vec::new())).expect("completes");
     let pinned = run(&program, Seed::at(11, free.choices.clone())).expect("completes");
     assert_eq!(pinned.marks, free.marks);
     assert_eq!(pinned.choices, free.choices);
@@ -261,7 +261,7 @@ fn the_realized_choice_sequence_replays_the_run_it_came_from() {
 #[test]
 fn a_path_prefix_pins_only_the_steps_it_names() {
     let program = two_workers();
-    let free = run(&program, Seed::root(3)).expect("completes");
+    let free = run(&program, Seed::at(3, Vec::new())).expect("completes");
     let prefix: Vec<u16> = free.choices.iter().copied().take(3).collect();
     let branched = run(&program, Seed::at(3, prefix.clone())).expect("completes");
     assert_eq!(&branched.choices[..3], &prefix[..]);
@@ -291,7 +291,7 @@ fn a_task_may_spawn_tasks_of_its_own() {
         vec![Act::Mark("grandchild b")],
     ];
     for root in 0..16 {
-        let run = run(&program, Seed::root(root)).expect("completes");
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
         let marks: Vec<&'static str> = run.marks.iter().map(|(_, m)| *m).collect();
         assert!(marks.contains(&"grandchild a"), "seed {root}");
         assert!(marks.contains(&"grandchild b"), "seed {root}");
@@ -317,7 +317,7 @@ fn a_task_nobody_joins_still_runs_to_completion() {
         vec![Act::Yield, Act::Mark("worker done")],
     ];
     for root in 0..16 {
-        let run = run(&program, Seed::root(root)).expect("completes");
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
         assert!(
             run.marks.contains(&(1, "worker done")),
             "seed {root} abandoned an unjoined task"
@@ -339,7 +339,7 @@ fn a_join_orders_the_child_before_the_parent_and_siblings_against_nobody() {
         vec![Act::Yield, Act::Mark("b")],
     ];
     for root in 0..8 {
-        let run = run(&program, Seed::root(root)).expect("completes");
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
         let last = |task: u64| {
             run.stamps
                 .iter()
@@ -374,7 +374,7 @@ fn joining_a_task_that_already_finished_does_not_block() {
         vec![Act::Mark("worker")],
     ];
     for root in 0..8 {
-        let run = run(&program, Seed::root(root)).expect("completes");
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
         assert!(run.marks.contains(&(0, "joined twice")), "seed {root}");
     }
 }
@@ -383,7 +383,7 @@ fn joining_a_task_that_already_finished_does_not_block() {
 fn a_join_cycle_is_a_deadlock_naming_both_tasks() {
     let program: Program = vec![vec![Act::Spawn(1), Act::Join(1)], vec![Act::Join(0)]];
     for root in 0..8 {
-        let err = run(&program, Seed::root(root)).expect_err("nothing can run");
+        let err = run(&program, Seed::at(root, Vec::new())).expect_err("nothing can run");
         assert_eq!(err.code, codes::DEADLOCK);
         assert!(
             err.message.contains("2 tasks are blocked"),
@@ -406,7 +406,7 @@ fn a_join_cycle_is_a_deadlock_naming_both_tasks() {
 #[test]
 fn a_task_that_joins_itself_deadlocks_rather_than_hanging() {
     let program: Program = vec![vec![Act::Join(0)]];
-    let err = run(&program, Seed::root(0)).expect_err("nothing can run");
+    let err = run(&program, Seed::at(0, Vec::new())).expect_err("nothing can run");
     assert_eq!(err.code, codes::DEADLOCK);
     assert!(err.message.contains("1 task is blocked"), "{}", err.message);
     assert!(
@@ -422,7 +422,7 @@ fn a_region_that_never_stops_spends_its_step_budget() {
     let mut forever = vec![Act::Yield; 64];
     forever.push(Act::Mark("unreachable"));
     let program: Program = vec![forever];
-    let err = run_with(&program, Seed::root(0), 16).expect_err("the budget is spent");
+    let err = run_with(&program, Seed::at(0, Vec::new()), 16).expect_err("the budget is spent");
     assert_eq!(err.code, codes::DEADLOCK);
     assert!(
         err.message.contains("16 scheduling steps"),
@@ -439,7 +439,7 @@ fn a_task_failing_stops_the_region_and_names_the_task() {
         vec![Act::Mark("a"), Act::Fail],
         vec![Act::Mark("b"), Act::Yield, Act::Mark("b2")],
     ];
-    let err = run(&program, Seed::root(4)).expect_err("a task failed");
+    let err = run(&program, Seed::at(4, Vec::new())).expect_err("a task failed");
     assert_eq!(err.code, codes::RUNTIME_ERROR);
     assert!(
         err.notes.iter().any(|n| n.contains("@1")),
@@ -460,7 +460,7 @@ fn a_failed_region_answers_with_its_failure_forever() {
     };
     let failure = sched.fail(
         Diagnostic::error(codes::RUNTIME_ERROR, "boom"),
-        &Seed::root(0),
+        &Seed::at(0, Vec::new()),
     );
     assert_eq!(failure.code, codes::RUNTIME_ERROR);
     for _ in 0..4 {
@@ -483,7 +483,7 @@ fn virtual_time_does_not_advance_while_any_task_can_run() {
         ],
     ];
     for root in 0..16 {
-        let run = run(&program, Seed::root(root)).expect("completes");
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
         let woke = run
             .marks
             .iter()
@@ -511,7 +511,7 @@ fn tasks_sleeping_to_one_deadline_wake_together_and_their_order_is_explored() {
     ];
     let mut orders: Vec<Vec<u64>> = Vec::new();
     for root in 0..32 {
-        let run = run(&program, Seed::root(root)).expect("completes");
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
         assert_eq!(run.clock, 50, "seed {root}");
         let order: Vec<u64> = run
             .marks
@@ -533,7 +533,7 @@ fn tasks_sleeping_to_one_deadline_wake_together_and_their_order_is_explored() {
 #[test]
 fn a_sleep_of_no_duration_is_a_yield_and_moves_no_clock() {
     let program: Program = vec![vec![Act::Sleep(0), Act::Sleep(-5), Act::Mark("through")]];
-    let run = run(&program, Seed::root(0)).expect("completes");
+    let run = run(&program, Seed::at(0, Vec::new())).expect("completes");
     assert_eq!(run.clock, 0);
     assert_eq!(run.marks, vec![(0, "through")]);
 }
@@ -541,7 +541,7 @@ fn a_sleep_of_no_duration_is_a_yield_and_moves_no_clock() {
 #[test]
 fn consecutive_sleeps_accumulate_virtual_time() {
     let program: Program = vec![vec![Act::Sleep(30), Act::Sleep(12), Act::Mark("done")]];
-    let run = run(&program, Seed::root(0)).expect("completes");
+    let run = run(&program, Seed::at(0, Vec::new())).expect("completes");
     assert_eq!(run.clock, 42);
 }
 
@@ -578,7 +578,7 @@ fn joining_another_regions_task_fails_rather_than_answering_this_regions_namesak
     let stranger = first.spawn(Value::Int(1), Span::DUMMY);
 
     let mut second: Sched = Scheduler::new(SimId(1), Span::DUMMY);
-    let (mut clock, mut trail) = (Clock::new(), Trail::new(Seed::root(0)));
+    let (mut clock, mut trail) = (Clock::new(), Trail::new(Seed::at(0, Vec::new())));
     let Turn::Run { .. } = second
         .next(&mut clock, &mut trail)
         .expect("the root is enabled")
@@ -611,7 +611,7 @@ fn joining_another_regions_task_fails_rather_than_answering_this_regions_namesak
 #[test]
 fn every_step_records_the_set_its_choice_indexed() {
     let program = two_workers();
-    let run = run(&program, Seed::root(13)).expect("completes");
+    let run = run(&program, Seed::at(13, Vec::new())).expect("completes");
     assert_eq!(run.choices.len(), run.steps.len());
     for (i, (task, enabled, choice)) in run.steps.iter().enumerate() {
         let mut ascending = enabled.clone();
@@ -774,8 +774,8 @@ fn drawing_random_numbers_does_not_disturb_the_schedule() {
         })
         .collect();
     for root in 0..16 {
-        let a = run(&plain, Seed::root(root)).expect("completes");
-        let b = run(&drawing, Seed::root(root)).expect("completes");
+        let a = run(&plain, Seed::at(root, Vec::new())).expect("completes");
+        let b = run(&drawing, Seed::at(root, Vec::new())).expect("completes");
         assert_eq!(a.choices, b.choices, "seed {root}");
         assert_eq!(a.marks, b.marks, "seed {root}");
     }
@@ -1033,7 +1033,7 @@ fn a_lazily_opened_region_roots_on_the_control_that_opened_it() {
 
 #[test]
 fn a_production_region_records_nothing_in_the_trail() {
-    let trail = Trail::new(Seed::root(9));
+    let trail = Trail::new(Seed::at(9, Vec::new()));
     let mut sched = production();
     assert!(!sched.records_steps());
     for _ in 0..4 {

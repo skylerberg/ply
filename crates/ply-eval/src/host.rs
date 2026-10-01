@@ -153,6 +153,10 @@ pub trait HostHandler: Send + Sync {
     fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic>;
 }
 
+/// Makes a reactor for the thread that calls it: one belongs to its thread, and a machine, a test
+/// worker or a `parallel` branch each drive their own.
+pub type RuntimeFactory = std::sync::Arc<dyn Fn() -> std::rc::Rc<dyn HostRuntime> + Send + Sync>;
+
 pub trait HostRuntime {
     /// Hands `pending` back through `resolved` once it resolves; refuses a token it did not mint.
     fn watch(&self, pending: &Pending) -> Result<(), Diagnostic>;

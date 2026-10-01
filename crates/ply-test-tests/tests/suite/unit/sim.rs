@@ -1,15 +1,16 @@
-use ply_eval::{Cost, DefHash, EffectAtom, Exploration, Footprint, Mode, Resource, Symbol};
+use ply_eval::{DefHash, EffectAtom, Footprint, Mode, Resource, Symbol};
 use ply_test::sim::{Record, is_seeded, record_under};
+use ply_test::{Cost, Searched};
 
 fn hash(byte: u8) -> DefHash {
     DefHash([byte; 32])
 }
 
-fn passing(explored: u32) -> Exploration {
-    Exploration {
+fn passing(explored: u32) -> Searched {
+    Searched {
         explored,
         exhaustive: true,
-        ..Exploration::default()
+        ..Searched::default()
     }
 }
 
@@ -28,10 +29,10 @@ fn a_pass_is_written_under_exactly_the_keys_it_was_filed_under() {
 
 #[test]
 fn a_spent_budget_writes_nothing_under_either_mode() {
-    let spent = Exploration {
+    let spent = Searched {
         explored: 256,
         exhausted: true,
-        ..Exploration::default()
+        ..Searched::default()
     };
     let record = record_under(&[hash(1), hash(2)], true, Some(&spent));
     assert_eq!(record, Record::Exhausted);
@@ -41,10 +42,10 @@ fn a_spent_budget_writes_nothing_under_either_mode() {
 /// A handler for `sim.seed()` drops `sim.read` from the row, but the region inside still searched.
 #[test]
 fn a_spent_budget_stops_an_unseeded_test_caching_too() {
-    let spent = Exploration {
+    let spent = Searched {
         explored: 256,
         exhausted: true,
-        ..Exploration::default()
+        ..Searched::default()
     };
     assert_eq!(
         record_under(&[hash(1)], false, Some(&spent)),
@@ -73,7 +74,7 @@ fn a_test_is_searched_exactly_when_its_footprint_reads_a_seed() {
 
 #[test]
 fn a_measured_reduction_does_not_change_what_is_written() {
-    let measured = Exploration {
+    let measured = Searched {
         blind: Some(Cost {
             explored: 30,
             bounded: false,
@@ -88,4 +89,38 @@ fn a_measured_reduction_does_not_change_what_is_written() {
         record_under(&[hash(1)], true, Some(&measured)).keys(),
         [hash(1)]
     );
+}
+
+#[test]
+fn a_bounded_count_renders_as_a_lower_bound() {
+    let bounded = Cost {
+        explored: 4096,
+        bounded: true,
+    };
+    assert_eq!(bounded.to_string(), ">= 4096");
+    let exact = Cost {
+        explored: 720,
+        bounded: false,
+    };
+    assert_eq!(exact.to_string(), "720");
+}
+
+#[test]
+fn reduction_is_none_until_the_naive_search_is_measured() {
+    let mut e = passing(12);
+    assert_eq!(e.reduction(), None);
+    e.blind = Some(Cost {
+        explored: 30,
+        bounded: false,
+    });
+    assert_eq!(
+        e.reduction(),
+        None,
+        "the reduction is against the naive search alone"
+    );
+    e.naive = Some(Cost {
+        explored: 720,
+        bounded: false,
+    });
+    assert_eq!(e.reduction(), Some(60.0));
 }
