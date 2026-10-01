@@ -1,7 +1,7 @@
 //! The deterministic scheduler.
 
-use crate::cont::SimId;
 use crate::host::{HostBinding, HostRuntime, MachineId, Pending};
+use crate::region::SimId;
 use crate::region::{StepSite, Trail};
 use crate::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use crate::value::Value;

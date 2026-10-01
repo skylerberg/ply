@@ -1,7 +1,6 @@
 //! The prelude, in one definition per builtin.
 
-use crate::arena::{Arena, Slot};
-use crate::cont::Frame;
+use crate::arena::Slot;
 use crate::semantics::arity_error;
 use crate::value::{
     Decimal, Fixed, FixedOp, List, Value, first_difference, type_error, values_equal,
@@ -9,7 +8,6 @@ use crate::value::{
 use crate::{Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, map, slot};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
-use std::fmt;
 
 /// A list this long is a runaway `range`, not an intent.
 const MAX_RANGE_LEN: i64 = 10_000_000;
@@ -649,28 +647,7 @@ impl Builtin {
     }
 }
 
-pub enum Step {
-    Done(Value),
-    /// Apply `callee` to `args`, then hand the answer to [`advance`] along with `frame`.
-    Apply {
-        callee: Value,
-        args: Vec<Value>,
-        frame: Frame,
-    },
-}
-
-impl fmt::Debug for Step {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Step::Done(v) => write!(f, "Done({v:?})"),
-            Step::Apply { callee, args, .. } => {
-                write!(f, "Apply({callee:?} to {} arguments)", args.len())
-            }
-        }
-    }
-}
-
-fn push(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
+fn push(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     let x = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
     let Value::List(list) = &mut xs else {
@@ -678,11 +655,11 @@ fn push(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     };
     let copied = list.push(x);
     crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
-    Ok(Step::Done(xs))
+    Ok(xs)
 }
 
 /// `list_set`, taking the list out of its arguments so the last holder writes in place.
-fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
+fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     let v = args.pop().expect("arity checked");
     let index = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
@@ -695,28 +672,19 @@ fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     };
     let copied = list.set(at, v);
     crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
-    Ok(Step::Done(xs))
+    Ok(xs)
 }
 
-/// `cells` is the live arena, not a snapshot: `cell_get` must see a handler's earlier writes.
-pub fn call(
-    b: Builtin,
-    mut args: Vec<Value>,
-    cells: &mut Arena,
-    span: Span,
-) -> Result<Step, Diagnostic> {
-    let out = call_with(b, &mut args, cells, span);
+/// A builtin over values. One that calls back into the program, or reads a cell, is the compiled
+/// tier's to answer, since only it can enter a closure or reach a cell.
+pub fn call(b: Builtin, mut args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
+    let out = call_with(b, &mut args, span);
     args.clear();
     crate::argv::give(args);
     out
 }
 
-fn call_with(
-    b: Builtin,
-    args: &mut Vec<Value>,
-    cells: &mut Arena,
-    span: Span,
-) -> Result<Step, Diagnostic> {
+fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     let (min, max) = b.arity();
     if args.len() < min || args.len() > max {
         let expected = if min == max { min } else { max };
@@ -731,22 +699,22 @@ fn call_with(
     match b {
         Builtin::Assert => {
             if args[0].as_bool(span, "`assert`")? {
-                return Ok(Step::Done(Value::Unit));
+                return Ok(Value::Unit);
             }
             Err(assert_failure(&args[1], span))
         }
 
         Builtin::AssertEq => {
             if values_equal(&args[0], &args[1], span)? {
-                Ok(Step::Done(Value::Unit))
+                Ok(Value::Unit)
             } else {
                 Err(assertion_failure(&args[0], &args[1], span))
             }
         }
 
         Builtin::Len => match &args[0] {
-            Value::List(xs) => Ok(Step::Done(Value::Int(xs.len() as i64))),
-            Value::Str(s) => Ok(Step::Done(Value::Int(s.chars().count() as i64))),
+            Value::List(xs) => Ok(Value::Int(xs.len() as i64)),
+            Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
             other => Err(type_error(span, "`len`", "a List or String", other)),
         },
 
@@ -755,39 +723,27 @@ fn call_with(
         Builtin::ListAt => {
             let xs = args[0].as_list(span, "`list_at`")?;
             let i = args[1].as_int(span, "`list_at`")?;
-            Ok(Step::Done(option(at(xs, i).cloned())))
+            Ok(option(at(xs, i).cloned()))
         }
 
         Builtin::ListSet => list_set(args, span),
 
-        Builtin::Map => {
-            let items = args[0].as_list(span, "`map`")?.clone();
-            Ok(next_map(args[1].clone(), items, 0, Vec::new(), span))
-        }
-
-        Builtin::Filter => {
-            let items = args[0].as_list(span, "`filter`")?.clone();
-            Ok(next_filter(args[1].clone(), items, 0, Vec::new(), span))
-        }
-
-        Builtin::Fold => {
-            let items = args[0].as_list(span, "`fold`")?.clone();
-            Ok(next_fold(args[2].clone(), items, 0, args[1].clone(), span))
-        }
-
-        Builtin::Iterate => {
-            let budget = args[1].as_int(span, "`iterate`")?;
-            if budget < 1 {
-                return Err(crate::limit::err_iterate_budget_not_a_count(span, budget));
-            }
-            next_iterate(args[2].clone(), args[0].clone(), budget, budget, span)
-        }
+        Builtin::Map
+        | Builtin::Filter
+        | Builtin::Fold
+        | Builtin::Iterate
+        | Builtin::BytesPosition
+        | Builtin::MapUpdate
+        | Builtin::MapFold
+        | Builtin::CellGet
+        | Builtin::CellSet
+        | Builtin::CellUpdate => Err(answered_by_the_tier(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
             let hi = args[1].as_int(span, "`range`")?;
             if hi <= lo {
-                return Ok(Step::Done(Value::list(Vec::new())));
+                return Ok(Value::list(Vec::new()));
             }
             let len = hi.saturating_sub(lo);
             if len > MAX_RANGE_LEN {
@@ -797,25 +753,25 @@ fn call_with(
                 )
                 .primary(span, "this range is too large to materialize"));
             }
-            Ok(Step::Done(Value::list((lo..hi).map(Value::Int).collect())))
+            Ok(Value::list((lo..hi).map(Value::Int).collect()))
         }
 
         Builtin::Min | Builtin::Max => {
             let x = args[0].as_int(span, &format!("`{}`", b.name()))?;
             let y = args[1].as_int(span, &format!("`{}`", b.name()))?;
-            Ok(Step::Done(Value::Int(if b == Builtin::Min {
+            Ok(Value::Int(if b == Builtin::Min {
                 x.min(y)
             } else {
                 x.max(y)
-            })))
+            }))
         }
 
         Builtin::Rotr32 => {
             let x = args[0].as_int(span, "`rotr32`")?;
             let n = args[1].as_int(span, "`rotr32`")?;
-            Ok(Step::Done(Value::Int(i64::from(
+            Ok(Value::Int(i64::from(
                 (x as u32).rotate_right((n & 31) as u32),
-            ))))
+            )))
         }
 
         Builtin::Rotr => {
@@ -829,12 +785,12 @@ fn call_with(
                 } else {
                     (raw >> k) | (raw << (w - k))
                 };
-                return Ok(Step::Done(Value::Fixed(Fixed::new(f.ty, bits))));
+                return Ok(Value::Fixed(Fixed::new(f.ty, bits)));
             }
             let x = args[0].as_int(span, "`rotr`")?;
-            Ok(Step::Done(Value::Int(
-                (x as u64).rotate_right(n.rem_euclid(64) as u32) as i64,
-            )))
+            Ok(Value::Int(
+                (x as u64).rotate_right(n.rem_euclid(64) as u32) as i64
+            ))
         }
 
         Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul => {
@@ -847,15 +803,15 @@ fn call_with(
                     Builtin::WrapSub => x.wrapping(*y, |a, c| a.wrapping_sub(c)),
                     _ => x.wrapping(*y, |a, c| a.wrapping_mul(c)),
                 };
-                return Ok(Step::Done(Value::Fixed(v)));
+                return Ok(Value::Fixed(v));
             }
             let x = args[0].as_int(span, &format!("`{what}`"))?;
             let y = args[1].as_int(span, &format!("`{what}`"))?;
-            Ok(Step::Done(Value::Int(match b {
+            Ok(Value::Int(match b {
                 Builtin::WrapAdd => x.wrapping_add(y),
                 Builtin::WrapSub => x.wrapping_sub(y),
                 _ => x.wrapping_mul(y),
-            })))
+            }))
         }
 
         // Out of range raises rather than truncating; a program masks first to mean truncation.
@@ -872,7 +828,7 @@ fn call_with(
             let t = b.converts_into().expect("every `_of_int` names its type");
             let n = args[0].as_int(span, &format!("`{}`", t.of_int_name()))?;
             match Fixed::of(t, i128::from(n)) {
-                Some(v) => Ok(Step::Done(Value::Fixed(v))),
+                Some(v) => Ok(Value::Fixed(v)),
                 None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
                     format!("`{}` was given {n}", t.of_int_name()),
@@ -898,7 +854,7 @@ fn call_with(
             let t = b.converts_from().expect("every `int_of_` names its type");
             let f = args[0].as_fixed(span, &format!("`{}`", t.to_int_name()))?;
             match f.to_i128().and_then(|v| i64::try_from(v).ok()) {
-                Some(n) => Ok(Step::Done(Value::Int(n))),
+                Some(n) => Ok(Value::Int(n)),
                 None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
                     format!("`{}` was given {}", t.to_int_name(), slot(0)),
@@ -913,7 +869,7 @@ fn call_with(
 
         Builtin::U128ToString | Builtin::I128ToString => {
             let f = args[0].as_fixed(span, &format!("`{}`", b.name()))?;
-            Ok(Step::Done(Value::str(f.to_decimal())))
+            Ok(Value::str(f.to_decimal()))
         }
 
         Builtin::U128OfString | Builtin::I128OfString => {
@@ -923,7 +879,7 @@ fn call_with(
             } else {
                 IntTy::I128
             };
-            Ok(Step::Done(option(fixed_of_text(t, text).map(Value::Fixed))))
+            Ok(option(fixed_of_text(t, text).map(Value::Fixed)))
         }
 
         Builtin::CheckedAdd | Builtin::CheckedSub | Builtin::CheckedMul => {
@@ -947,7 +903,7 @@ fn call_with(
                     .map(Value::Int)
                 }
             };
-            Ok(Step::Done(option(answer)))
+            Ok(option(answer))
         }
 
         Builtin::CheckedNeg => {
@@ -958,14 +914,14 @@ fn call_with(
                     .checked_neg()
                     .map(Value::Int),
             };
-            Ok(Step::Done(option(answer)))
+            Ok(option(answer))
         }
 
         // Raises rather than masking: a silent `& 0xFF` would write a byte nobody chose.
         Builtin::ByteOfInt => {
             let n = args[0].as_int(span, "`byte_of_int`")?;
             match u8::try_from(n) {
-                Ok(byte) => Ok(Step::Done(Value::bytes([byte]))),
+                Ok(byte) => Ok(Value::bytes([byte])),
                 Err(_) => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
                     format!("`byte_of_int` was given {n}"),
@@ -975,32 +931,32 @@ fn call_with(
             }
         }
 
-        Builtin::IntToString => Ok(Step::Done(Value::str(
+        Builtin::IntToString => Ok(Value::str(
             args[0].as_int(span, "`int_to_string`")?.to_string(),
-        ))),
+        )),
 
         // The language's own float spelling, the one a diagnostic prints: shortest round-trip,
         // and `Infinity`/`NaN` rather than the `inf`/`NaN` Rust would write.
-        Builtin::FloatToString => Ok(Step::Done(Value::str(crate::render_float(
+        Builtin::FloatToString => Ok(Value::str(crate::render_float(
             args[0].as_float(span, "`float_to_string`")?,
-        )))),
+        ))),
 
         Builtin::StringConcat => {
             let a = args[0].as_str(span, "`string_concat`")?;
             let b = args[1].as_str(span, "`string_concat`")?;
-            Ok(Step::Done(Value::str(format!("{a}{b}"))))
+            Ok(Value::str(format!("{a}{b}")))
         }
 
         Builtin::BytesLen => {
             let b = args[0].as_bytes(span, "`bytes_len`")?;
-            Ok(Step::Done(Value::Int(b.len() as i64)))
+            Ok(Value::Int(b.len() as i64))
         }
 
         Builtin::BytesAt => {
             let b = args[0].as_bytes(span, "`bytes_at`")?;
             let i = args[1].as_int(span, "`bytes_at`")?;
             match usize::try_from(i).ok().and_then(|i| b.get(i)) {
-                Some(byte) => Ok(Step::Done(Value::Int(i64::from(*byte)))),
+                Some(byte) => Ok(Value::Int(i64::from(*byte))),
                 None => Err(out_of_range(span, "bytes_at", i, b.len(), "bytes")),
             }
         }
@@ -1013,10 +969,10 @@ fn call_with(
                 .and_then(|i| b.get(i..i + 4))
                 .and_then(|s| <[u8; 4]>::try_from(s).ok());
             match four {
-                Some(w) => Ok(Step::Done(Value::Fixed(Fixed::new(
+                Some(w) => Ok(Value::Fixed(Fixed::new(
                     IntTy::U32,
                     u128::from(u32::from_le_bytes(w)),
-                )))),
+                ))),
                 // Reported at the last index it would read: that is the one past the end.
                 None => Err(out_of_range(span, "bytes_u32_le", i + 3, b.len(), "bytes")),
             }
@@ -1026,7 +982,7 @@ fn call_with(
             let b = args[0].as_bytes(span, "`bytes_slice`")?;
             let (start, end) =
                 range_args(&args[1], &args[2], b.len(), span, "bytes_slice", "bytes")?;
-            Ok(Step::Done(Value::bytes(&b[start..end])))
+            Ok(Value::bytes(&b[start..end]))
         }
 
         Builtin::BytesConcat => {
@@ -1035,12 +991,12 @@ fn call_with(
             let mut out = Vec::with_capacity(a.len() + b.len());
             out.extend_from_slice(a);
             out.extend_from_slice(b);
-            Ok(Step::Done(Value::bytes(out)))
+            Ok(Value::bytes(out))
         }
 
         Builtin::BytesBlake3 => {
             let b = args[0].as_bytes(span, "`bytes_blake3`")?;
-            Ok(Step::Done(Value::bytes(blake3::hash(b).as_bytes())))
+            Ok(Value::bytes(blake3::hash(b).as_bytes()))
         }
 
         Builtin::BytesConcatAll => {
@@ -1053,48 +1009,48 @@ fn call_with(
             for piece in pieces.iter() {
                 out.extend_from_slice(piece.as_bytes(span, "`bytes_concat_all`")?);
             }
-            Ok(Step::Done(Value::bytes(out)))
+            Ok(Value::bytes(out))
         }
 
         Builtin::BytesOfString => {
             let s = args[0].as_str(span, "`bytes_of_string`")?;
-            Ok(Step::Done(Value::bytes(s.as_bytes())))
+            Ok(Value::bytes(s.as_bytes()))
         }
 
         Builtin::BytesIsUtf8 => {
             let b = args[0].as_bytes(span, "`bytes_is_utf8`")?;
-            Ok(Step::Done(Value::Bool(std::str::from_utf8(b).is_ok())))
+            Ok(Value::Bool(std::str::from_utf8(b).is_ok()))
         }
 
         Builtin::BytesIndexOf => {
             let hay = args[0].as_bytes(span, "`bytes_index_of`")?;
             let needle = args[1].as_bytes(span, "`bytes_index_of`")?;
-            Ok(Step::Done(position(find(hay, needle, 0))))
+            Ok(position(find(hay, needle, 0)))
         }
 
         Builtin::BytesIndexOfFrom => {
             let hay = args[0].as_bytes(span, "`bytes_index_of_from`")?;
             let needle = args[1].as_bytes(span, "`bytes_index_of_from`")?;
             let from = start_at(&args[2], hay.len(), span, "bytes_index_of_from")?;
-            Ok(Step::Done(position(find(hay, needle, from))))
+            Ok(position(find(hay, needle, from)))
         }
 
         Builtin::BytesIndexOfByte => {
             let hay = args[0].as_bytes(span, "`bytes_index_of_byte`")?;
             let byte = one_byte(&args[1], span, "bytes_index_of_byte")?;
-            Ok(Step::Done(position(memchr::memchr(byte, hay))))
+            Ok(position(memchr::memchr(byte, hay)))
         }
 
         Builtin::BytesStartsWith => {
             let b = args[0].as_bytes(span, "`bytes_starts_with`")?;
             let prefix = args[1].as_bytes(span, "`bytes_starts_with`")?;
-            Ok(Step::Done(Value::Bool(b.starts_with(prefix))))
+            Ok(Value::Bool(b.starts_with(prefix)))
         }
 
         Builtin::BytesEndsWith => {
             let b = args[0].as_bytes(span, "`bytes_ends_with`")?;
             let suffix = args[1].as_bytes(span, "`bytes_ends_with`")?;
-            Ok(Step::Done(Value::Bool(b.ends_with(suffix))))
+            Ok(Value::Bool(b.ends_with(suffix)))
         }
 
         Builtin::BytesSplit => {
@@ -1115,41 +1071,35 @@ fn call_with(
                 at = found + sep.len();
             }
             out.push(Value::bytes(&b[at..]));
-            Ok(Step::Done(Value::list(out)))
+            Ok(Value::list(out))
         }
 
         Builtin::BytesScan => {
             let b = args[0].as_bytes(span, "`bytes_scan`")?;
-            Ok(Step::Done(Value::Int(scan(args, b, span, false)?)))
+            Ok(Value::Int(scan(args, b, span, false)?))
         }
 
         Builtin::BytesScanUntil => {
             let b = args[0].as_bytes(span, "`bytes_scan_until`")?;
-            Ok(Step::Done(Value::Int(scan(args, b, span, true)?)))
-        }
-
-        Builtin::BytesPosition => {
-            let b = args[0].as_bytes(span, "`bytes_position`")?.clone();
-            let from = start_at(&args[1], b.len(), span, "bytes_position")?;
-            Ok(next_position(args[2].clone(), b, from, span))
+            Ok(Value::Int(scan(args, b, span, true)?))
         }
 
         Builtin::StringOfBytes => {
             let b = args[0].as_bytes(span, "`string_of_bytes`")?;
             match std::str::from_utf8(b) {
-                Ok(s) => Ok(Step::Done(Value::str(s))),
+                Ok(s) => Ok(Value::str(s)),
                 Err(e) => Err(not_utf8(span, b, &e)),
             }
         }
 
         Builtin::StringOfBytesLossy => {
             let b = args[0].as_bytes(span, "`string_of_bytes_lossy`")?;
-            Ok(Step::Done(Value::str(String::from_utf8_lossy(b))))
+            Ok(Value::str(String::from_utf8_lossy(b)))
         }
 
-        Builtin::StringLen => Ok(Step::Done(Value::Int(
+        Builtin::StringLen => Ok(Value::Int(
             args[0].as_str(span, "`string_len`")?.chars().count() as i64,
-        ))),
+        )),
 
         Builtin::StringSlice => {
             let s = args[0].as_str(span, "`string_slice`")?;
@@ -1164,7 +1114,7 @@ fn call_with(
             )?;
             let from = char_offset(s, start);
             let to = char_offset(s, end);
-            Ok(Step::Done(Value::str(&s[from..to])))
+            Ok(Value::str(&s[from..to]))
         }
 
         Builtin::StringSplit => {
@@ -1178,47 +1128,43 @@ fn call_with(
                 .primary(span, "an empty separator matches everywhere and nowhere")
                 .note("pass the text that actually separates the parts, as in \"\\r\\n\""));
             }
-            Ok(Step::Done(Value::list(
-                s.split(sep).map(Value::str).collect(),
-            )))
+            Ok(Value::list(s.split(sep).map(Value::str).collect()))
         }
 
         // These three read `std`'s Unicode tables, so their answers move if those tables do.
-        Builtin::StringTrim => Ok(Step::Done(Value::str(
-            args[0].as_str(span, "`string_trim`")?.trim(),
-        ))),
+        Builtin::StringTrim => Ok(Value::str(args[0].as_str(span, "`string_trim`")?.trim())),
 
-        Builtin::StringLower => Ok(Step::Done(Value::str(
+        Builtin::StringLower => Ok(Value::str(
             args[0].as_str(span, "`string_lower`")?.to_lowercase(),
-        ))),
+        )),
 
-        Builtin::StringUpper => Ok(Step::Done(Value::str(
+        Builtin::StringUpper => Ok(Value::str(
             args[0].as_str(span, "`string_upper`")?.to_uppercase(),
-        ))),
+        )),
 
         Builtin::StringStartsWith => {
             let s = args[0].as_str(span, "`string_starts_with`")?;
             let prefix = args[1].as_str(span, "`string_starts_with`")?;
-            Ok(Step::Done(Value::Bool(s.starts_with(prefix))))
+            Ok(Value::Bool(s.starts_with(prefix)))
         }
 
         Builtin::StringEndsWith => {
             let s = args[0].as_str(span, "`string_ends_with`")?;
             let suffix = args[1].as_str(span, "`string_ends_with`")?;
-            Ok(Step::Done(Value::Bool(s.ends_with(suffix))))
+            Ok(Value::Bool(s.ends_with(suffix)))
         }
 
         Builtin::StringContains => {
             let s = args[0].as_str(span, "`string_contains`")?;
             let needle = args[1].as_str(span, "`string_contains`")?;
-            Ok(Step::Done(Value::Bool(s.contains(needle))))
+            Ok(Value::Bool(s.contains(needle)))
         }
 
         Builtin::StringFind => {
             let s = args[0].as_str(span, "`string_find`")?;
             let needle = args[1].as_str(span, "`string_find`")?;
             match s.find(needle) {
-                Some(at) => Ok(Step::Done(Value::Int(s[..at].chars().count() as i64))),
+                Some(at) => Ok(Value::Int(s[..at].chars().count() as i64)),
                 None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
                     format!("`string_find` did not find {} in {}", slot(0), slot(1)),
@@ -1236,99 +1182,34 @@ fn call_with(
         Builtin::Compare | Builtin::CompareValues => {
             crate::value::secret_has_no_order(&args[0], b.name(), span)?;
             crate::value::secret_has_no_order(&args[1], b.name(), span)?;
-            Ok(Step::Done(Value::ctor(
+            Ok(Value::ctor(
                 match args[0].cmp(&args[1]) {
                     std::cmp::Ordering::Less => "Less",
                     std::cmp::Ordering::Equal => "Equal",
                     std::cmp::Ordering::Greater => "Greater",
                 },
                 Vec::new(),
-            )))
-        }
-
-        // Every map builtin reaches keys through `map::key`, the one gate before `Value::cmp`.
-        Builtin::MapNew => Ok(Step::Done(map::new())),
-        Builtin::MapInsert => {
-            let (k, v) = (args.remove(1), args.remove(1));
-            Ok(Step::Done(map::insert(args.remove(0), k, v, span)?))
-        }
-        Builtin::MapGet => Ok(Step::Done(map::get(&args[0], &args[1], span)?)),
-        Builtin::MapContains => Ok(Step::Done(map::contains(&args[0], &args[1], span)?)),
-        Builtin::MapRemove => {
-            let k = args.remove(1);
-            Ok(Step::Done(map::remove(args.remove(0), &k, span)?))
-        }
-        Builtin::MapUpdate => {
-            let f = args.remove(2);
-            let key = args.remove(1);
-            let (map, taken) = map::take(args.remove(0), &key, span)?;
-            Ok(match taken {
-                Some(value) => Step::Apply {
-                    callee: f,
-                    args: crate::argv::of([value]),
-                    frame: Frame::MapUpdateStep { map, key, span },
-                },
-                None => Step::Done(map),
-            })
-        }
-        Builtin::MapLen => Ok(Step::Done(map::len(&args[0], span)?)),
-        Builtin::MapKeys => Ok(Step::Done(map::keys(&args[0], span)?)),
-        Builtin::MapValues => Ok(Step::Done(map::values(&args[0], span)?)),
-        Builtin::MapEntries => Ok(Step::Done(map::entries(&args[0], span)?)),
-        Builtin::MapOfEntries => Ok(Step::Done(map::of_entries(&args[0], span)?)),
-        Builtin::MapMerge => Ok(Step::Done(map::merge(&args[0], &args[1], span)?)),
-
-        Builtin::MapFold => {
-            let entries = map::fold_entries(&args[0], span)?;
-            Ok(map::next_fold(
-                args[2].clone(),
-                entries,
-                0,
-                args[1].clone(),
-                span,
             ))
         }
 
-        Builtin::CellGet => {
-            let slot = args[0].as_cell(span, "`cell_get`")?;
-            if cells.is_taken(slot) {
-                return Err(cell_in_update(span, slot, "cell_get"));
-            }
-            match cells.get(slot) {
-                Some(v) => Ok(Step::Done(v.clone())),
-                None => Err(no_such_cell(span, slot)),
-            }
+        // Every map builtin reaches keys through `map::key`, the one gate before `Value::cmp`.
+        Builtin::MapNew => Ok(map::new()),
+        Builtin::MapInsert => {
+            let (k, v) = (args.remove(1), args.remove(1));
+            Ok(map::insert(args.remove(0), k, v, span)?)
         }
-
-        Builtin::CellSet => {
-            let slot = args[0].as_cell(span, "`cell_set`")?;
-            if cells.is_taken(slot) {
-                return Err(cell_in_update(span, slot, "cell_set"));
-            }
-            // Reported rather than refused: refusing would change what a legal program means.
-            crate::rc::cell_cycle(slot, &args[1], span);
-            if cells.set(slot, args.remove(1)) {
-                Ok(Step::Done(Value::Unit))
-            } else {
-                Err(no_such_cell(span, slot))
-            }
+        Builtin::MapGet => Ok(map::get(&args[0], &args[1], span)?),
+        Builtin::MapContains => Ok(map::contains(&args[0], &args[1], span)?),
+        Builtin::MapRemove => {
+            let k = args.remove(1);
+            Ok(map::remove(args.remove(0), &k, span)?)
         }
-
-        // Contents leave the arena for the call; `Frame::CellUpdateStep` puts the answer back.
-        Builtin::CellUpdate => {
-            let slot = args[0].as_cell(span, "`cell_update`")?;
-            if cells.is_taken(slot) {
-                return Err(cell_in_update(span, slot, "cell_update"));
-            }
-            let Some(current) = cells.take(slot) else {
-                return Err(no_such_cell(span, slot));
-            };
-            Ok(Step::Apply {
-                callee: args[1].clone(),
-                args: crate::argv::of([current]),
-                frame: Frame::CellUpdateStep { slot, span },
-            })
-        }
+        Builtin::MapLen => Ok(map::len(&args[0], span)?),
+        Builtin::MapKeys => Ok(map::keys(&args[0], span)?),
+        Builtin::MapValues => Ok(map::values(&args[0], span)?),
+        Builtin::MapEntries => Ok(map::entries(&args[0], span)?),
+        Builtin::MapOfEntries => Ok(map::of_entries(&args[0], span)?),
+        Builtin::MapMerge => Ok(map::merge(&args[0], &args[1], span)?),
 
         Builtin::DecimalDiv => {
             let a = args[0].as_decimal(span, "`decimal_div`")?;
@@ -1341,72 +1222,68 @@ fn call_with(
             let quotient = a
                 .checked_div(b)
                 .ok_or_else(|| decimal_overflow(span, "division"))?;
-            Ok(Step::Done(Value::Decimal(
-                quotient.round_dp_with_strategy(scale, mode),
-            )))
+            Ok(Value::Decimal(quotient.round_dp_with_strategy(scale, mode)))
         }
 
         Builtin::DecimalRound => {
             let d = args[0].as_decimal(span, "`decimal_round`")?;
             let scale = decimal_scale(&args[1], span, "decimal_round")?;
             let mode = rounding(&args[2], span, "decimal_round")?;
-            Ok(Step::Done(Value::Decimal(
-                d.round_dp_with_strategy(scale, mode),
-            )))
+            Ok(Value::Decimal(d.round_dp_with_strategy(scale, mode)))
         }
 
-        Builtin::DecimalOfInt => Ok(Step::Done(Value::Decimal(Decimal::from(
+        Builtin::DecimalOfInt => Ok(Value::Decimal(Decimal::from(
             args[0].as_int(span, "`decimal_of_int`")?,
-        )))),
+        ))),
 
         Builtin::IntOfDecimal => {
             let d = args[0].as_decimal(span, "`int_of_decimal`")?;
             let mode = rounding(&args[1], span, "int_of_decimal")?;
-            Ok(Step::Done(option(
+            Ok(option(
                 d.round_dp_with_strategy(0, mode).to_i64().map(Value::Int),
-            )))
+            ))
         }
 
         Builtin::FloatOfDecimal => {
             let d = args[0].as_decimal(span, "`float_of_decimal`")?;
-            Ok(Step::Done(Value::Float(float_of_decimal(d))))
+            Ok(Value::Float(float_of_decimal(d)))
         }
 
         Builtin::DecimalOfFloat => {
             let f = args[0].as_float(span, "`decimal_of_float`")?;
-            Ok(Step::Done(option(decimal_of_float(f).map(Value::Decimal))))
+            Ok(option(decimal_of_float(f).map(Value::Decimal)))
         }
 
         Builtin::DecimalOfString => {
             let s = args[0].as_str(span, "`decimal_of_string`")?;
-            Ok(Step::Done(option(parse_decimal(s).map(Value::Decimal))))
+            Ok(option(parse_decimal(s).map(Value::Decimal)))
         }
 
         Builtin::FloatOfString => {
             let s = args[0].as_str(span, "`float_of_string`")?;
-            Ok(Step::Done(option(parse_float(s).map(Value::Float))))
+            Ok(option(parse_float(s).map(Value::Float)))
         }
 
         // Keeps the scale (`1.50m` renders `1.50`), so it round-trips `decimal_of_string`.
         Builtin::DecimalToString => {
             let d = args[0].as_decimal(span, "`decimal_to_string`")?;
-            Ok(Step::Done(Value::str(d.to_string())))
+            Ok(Value::str(d.to_string()))
         }
 
         Builtin::BitsOfFloat => {
             let f = args[0].as_float(span, "`bits_of_float`")?;
-            Ok(Step::Done(Value::Int(f.to_bits() as i64)))
+            Ok(Value::Int(f.to_bits() as i64))
         }
 
         Builtin::FloatOfBits => {
             let n = args[0].as_int(span, "`float_of_bits`")?;
-            Ok(Step::Done(Value::Float(f64::from_bits(n as u64))))
+            Ok(Value::Float(f64::from_bits(n as u64)))
         }
 
         Builtin::Observe => {
             // The identity; its work is the emitter's, which makes the call opaque so the C
             // compiler cannot drop a pure computation whose value is only observed.
-            Ok(Step::Done(args[0].clone()))
+            Ok(args[0].clone())
         }
 
         Builtin::Panic => {
@@ -1423,7 +1300,7 @@ fn call_with(
 
         Builtin::SecretOfString => {
             args[0].as_str(span, "`secret_of_string`")?;
-            Ok(Step::Done(Value::secret(args[0].clone())))
+            Ok(Value::secret(args[0].clone()))
         }
 
         // Constant time but not rate limited: preventing a guessing loop is the program's job.
@@ -1433,22 +1310,22 @@ fn call_with(
             };
             let candidate = args[1].as_str(span, "`secret_verify`")?;
             let held = held.as_str(span, "`secret_verify`")?;
-            Ok(Step::Done(Value::Bool(crate::value::constant_time_eq(
+            Ok(Value::Bool(crate::value::constant_time_eq(
                 held.as_bytes(),
                 candidate.as_bytes(),
-            ))))
+            )))
         }
 
         Builtin::SecretIsEmpty => {
             let Value::Secret(held) = &args[0] else {
                 return Err(type_error(span, "`secret_is_empty`", "Secret", &args[0]));
             };
-            Ok(Step::Done(Value::Bool(match &**held {
+            Ok(Value::Bool(match &**held {
                 Value::Str(s) => s.is_empty(),
                 Value::Bytes(b) => b.is_empty(),
                 // Only strings are constructible; `false` reports a credential as present.
                 _ => false,
-            })))
+            }))
         }
     }
 }
@@ -1572,191 +1449,6 @@ fn parse_float(text: &str) -> Option<f64> {
     text.replace('_', "").parse().ok()
 }
 
-pub fn advance(frame: Frame, answer: Value) -> Result<Step, Diagnostic> {
-    Ok(match frame {
-        Frame::MapStep {
-            f,
-            items,
-            next,
-            mut done,
-            span,
-        } => {
-            done.push(answer);
-            next_map(f, items, next, done, span)
-        }
-
-        Frame::FilterStep {
-            f,
-            items,
-            next,
-            mut done,
-            span,
-        } => {
-            if answer.as_bool(span, "the predicate given to `filter`")?
-                && let Some(kept) = next.checked_sub(1).and_then(|i| items.get(i))
-            {
-                done.push(kept.clone());
-            }
-            next_filter(f, items, next, done, span)
-        }
-
-        Frame::FoldStep {
-            f,
-            items,
-            next,
-            span,
-        } => next_fold(f, items, next, answer, span),
-
-        Frame::MapFoldStep {
-            f,
-            entries,
-            next,
-            span,
-        } => map::next_fold(f, entries, next, answer, span),
-
-        Frame::IterateStep {
-            f,
-            budget,
-            left,
-            span,
-        } => match iterate_answer(&answer, span)? {
-            Continued(seed) => return next_iterate(f, seed, budget, left, span),
-            Stopped(r) => Step::Done(r),
-        },
-
-        Frame::MapUpdateStep { map, key, span } => Step::Done(map::insert(map, key, answer, span)?),
-
-        Frame::BytesPositionStep {
-            f,
-            bytes,
-            next,
-            span,
-        } => {
-            if answer.as_bool(span, "the predicate given to `bytes_position`")? {
-                // `next` is one past the byte the predicate was asked about.
-                Step::Done(position(Some(next - 1)))
-            } else {
-                next_position(f, bytes, next, span)
-            }
-        }
-
-        _ => return Err(not_a_builtin_step()),
-    })
-}
-
-fn next_map(f: Value, items: List, next: usize, done: Vec<Value>, span: Span) -> Step {
-    let Some(x) = items.get(next).cloned() else {
-        return Step::Done(Value::list(done));
-    };
-    Step::Apply {
-        callee: f.clone(),
-        args: crate::argv::of([x]),
-        frame: Frame::MapStep {
-            f,
-            items,
-            next: next + 1,
-            done,
-            span,
-        },
-    }
-}
-
-fn next_filter(f: Value, items: List, next: usize, done: Vec<Value>, span: Span) -> Step {
-    let Some(x) = items.get(next).cloned() else {
-        return Step::Done(Value::list(done));
-    };
-    Step::Apply {
-        callee: f.clone(),
-        args: crate::argv::of([x]),
-        frame: Frame::FilterStep {
-            f,
-            items,
-            next: next + 1,
-            done,
-            span,
-        },
-    }
-}
-
-fn next_fold(f: Value, items: List, next: usize, acc: Value, span: Span) -> Step {
-    let Some(x) = items.get(next).cloned() else {
-        return Step::Done(acc);
-    };
-    Step::Apply {
-        callee: f.clone(),
-        args: crate::argv::of([acc, x]),
-        frame: Frame::FoldStep {
-            f,
-            items,
-            next: next + 1,
-            span,
-        },
-    }
-}
-
-fn next_iterate(
-    f: Value,
-    seed: Value,
-    budget: i64,
-    left: i64,
-    span: Span,
-) -> Result<Step, Diagnostic> {
-    if left <= 0 {
-        return Err(crate::limit::err_iterate_budget(span, budget));
-    }
-    Ok(Step::Apply {
-        callee: f.clone(),
-        args: crate::argv::of([seed]),
-        frame: Frame::IterateStep {
-            f,
-            budget,
-            left: left - 1,
-            span,
-        },
-    })
-}
-
-enum IterAnswer {
-    Continued(Value),
-    Stopped(Value),
-}
-use IterAnswer::{Continued, Stopped};
-
-/// Anything but `Continue` or `Stop` is a type error rather than a silent stop.
-fn iterate_answer(answer: &Value, span: Span) -> Result<IterAnswer, Diagnostic> {
-    if let Value::Ctor { name, args } = answer
-        && args.len() == 1
-    {
-        match name.as_str() {
-            "Continue" => return Ok(Continued(args[0].clone())),
-            "Stop" => return Ok(Stopped(args[0].clone())),
-            _ => {}
-        }
-    }
-    Err(type_error(
-        span,
-        "the function given to `iterate`",
-        "Continue or Stop",
-        answer,
-    ))
-}
-
-fn next_position(f: Value, bytes: std::sync::Arc<[u8]>, next: usize, span: Span) -> Step {
-    let Some(byte) = bytes.get(next).copied() else {
-        return Step::Done(position(None));
-    };
-    Step::Apply {
-        callee: f.clone(),
-        args: crate::argv::of([Value::Int(i64::from(byte))]),
-        frame: Frame::BytesPositionStep {
-            f,
-            bytes,
-            next: next + 1,
-            span,
-        },
-    }
-}
-
 fn position(at: Option<usize>) -> Value {
     match at {
         Some(i) => Value::ctor("Some", vec![Value::Int(i as i64)]),
@@ -1853,15 +1545,19 @@ fn start_at(v: &Value, len: usize, span: Span, what: &str) -> Result<usize, Diag
     let from = int_arg(v, span, what)?;
     match usize::try_from(from) {
         Ok(from) if from <= len => Ok(from),
-        _ => Err(Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!("`{what}` start {from} is outside a value of {len} bytes"),
-        )
-        .primary(span, "this position does not exist")
-        .note(format!(
-            "a start must satisfy `0 <= from <= {len}`; it is never clamped"
-        ))),
+        _ => Err(start_outside(from, len, span, what)),
     }
+}
+
+pub fn start_outside(from: i64, len: usize, span: Span, what: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{what}` start {from} is outside a value of {len} bytes"),
+    )
+    .primary(span, "this position does not exist")
+    .note(format!(
+        "a start must satisfy `0 <= from <= {len}`; it is never clamped"
+    ))
 }
 
 /// A scan's byte budget, which bounds the work hostile input can cause.
@@ -2028,12 +1724,16 @@ pub fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     .note("please report this: a cell value escaped the region that allocated it")
 }
 
-/// Only the higher-order builtins suspend, so only their frames reach here.
+/// The compiled tier answers every builtin that calls back into the program or reads a cell.
 #[cold]
-fn not_a_builtin_step() -> Diagnostic {
+fn answered_by_the_tier(b: Builtin, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        "internal error: a frame that is not a builtin step reached `advance`",
+        format!(
+            "`{}` reached the value builtins, and only compiled code can answer it",
+            b.name()
+        ),
     )
-    .primary(Span::DUMMY, "please report this")
+    .primary(span, "it calls back into the program or reads a cell")
+    .note("this is Ply's fault: the compiled tier answers this builtin over its own words")
 }
