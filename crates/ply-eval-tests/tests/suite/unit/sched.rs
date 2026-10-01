@@ -143,7 +143,11 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                             }
                             sched.suspend(suspended(), Value::Int(id.0 as i64))?;
                         }
-                        Act::Join(id) => sched.join(suspended(), TaskId(id), Span::DUMMY)?,
+                        Act::Join(id) => sched.join(
+                            suspended(),
+                            &TaskHandle::unowned(SimId(0), TaskId(id)),
+                            Span::DUMMY,
+                        )?,
                         Act::Sleep(nanos) => {
                             let answer = handlers.dispatch(
                                 signature("clock", "sleep").expect("declared"),
@@ -549,10 +553,57 @@ fn joining_a_task_this_region_never_created_is_a_scope_error() {
         panic!("expected the root's step");
     };
     let err = sched
-        .join(suspended(), TaskId(7), Span::DUMMY)
+        .join(
+            suspended(),
+            &TaskHandle::unowned(SimId(0), TaskId(7)),
+            Span::DUMMY,
+        )
         .expect_err("no such task");
     assert_eq!(err.code, codes::TASK_ESCAPES_SCOPE);
     assert!(err.message.contains("@7"));
+}
+
+/// Both regions number a task `@1`, so a join by id alone would answer the other region's task.
+#[test]
+fn joining_another_regions_task_fails_rather_than_answering_this_regions_namesake() {
+    let (mut first, mut clock, mut trail) = solo(0);
+    let Turn::Run { .. } = first
+        .next(&mut clock, &mut trail)
+        .expect("the root is enabled")
+    else {
+        panic!("expected the first region's root");
+    };
+    let stranger = first.spawn(Value::Int(1), Span::DUMMY);
+
+    let mut second: Sched = Scheduler::new(SimId(1), Span::DUMMY);
+    let (mut clock, mut trail) = (Clock::new(), Trail::new(Seed::root(0)));
+    let Turn::Run { .. } = second
+        .next(&mut clock, &mut trail)
+        .expect("the root is enabled")
+    else {
+        panic!("expected the second region's root");
+    };
+    let namesake = second.spawn(Value::Int(2), Span::DUMMY);
+    assert_eq!(
+        namesake.id(),
+        stranger.id(),
+        "each region numbers from `@1`"
+    );
+
+    let err = second
+        .join(suspended(), &stranger, Span::DUMMY)
+        .expect_err("the handle names a task of the first region");
+    assert_eq!(err.code, codes::TASK_ESCAPES_SCOPE);
+    assert!(err.message.contains("another region"), "{}", err.message);
+    assert_ne!(
+        Value::Task(stranger),
+        Value::Task(namesake.clone()),
+        "two regions' tasks are not one value"
+    );
+
+    second
+        .join(suspended(), &namesake, Span::DUMMY)
+        .expect("its own task is still joinable");
 }
 
 #[test]
@@ -959,17 +1010,21 @@ impl HostRuntime for Stopping {
 
 /// Two tasks each waiting on the other, with no host wait and no virtual clock.
 fn deadlock(sched: &mut Sched) {
-    let other = sched.spawn(Value::Unit, Span::DUMMY).id();
+    let other = sched.spawn(Value::Unit, Span::DUMMY);
     sched
-        .join(suspended(), other, Span::DUMMY)
+        .join(suspended(), &other, Span::DUMMY)
         .expect("the root is running");
     let Turn::Run { task, .. } = sched.next_host(&Idle).expect("the spawned task is enabled")
     else {
         panic!("expected the spawned task's first step");
     };
-    assert_eq!(task, other);
+    assert_eq!(task, other.id());
     sched
-        .join(suspended(), ROOT, Span::DUMMY)
+        .join(
+            suspended(),
+            &TaskHandle::unowned(SimId(0), ROOT),
+            Span::DUMMY,
+        )
         .expect("the spawned task is running");
 }
 
@@ -1086,7 +1141,7 @@ fn a_production_region_keeps_only_the_tasks_that_can_still_run_or_be_joined() {
             .expect("the root is running");
         until_root(&mut sched, &Idle);
         sched
-            .join(suspended(), target, Span::DUMMY)
+            .join(suspended(), &joined, Span::DUMMY)
             .expect("a task whose handle is held is kept");
         drop(joined);
         let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
@@ -1144,7 +1199,7 @@ fn a_kept_handle_keeps_its_finished_task_joinable_and_every_join_answers() {
     for handle in &kept {
         for join in 0..2 {
             sched
-                .join(suspended(), handle.id(), Span::DUMMY)
+                .join(suspended(), handle, Span::DUMMY)
                 .expect("the task is kept");
             let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
                 panic!("the root resumes from its join");
