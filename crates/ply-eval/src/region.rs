@@ -6,6 +6,8 @@ use crate::sim::{Access, Domain, Seed, Stream};
 
 use crate::{Diagnostic, Span, Symbol};
 
+/// A place in the program, and the definition it lies in.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StepSite {
     pub definition: Option<Symbol>,
     pub span: Span,
@@ -17,13 +19,9 @@ pub struct Trail {
     /// The choices actually made, which extend past the seed's path.
     choices: Vec<u16>,
     steps: Vec<StepRecord>,
-    /// Parallel to `steps`, appended as each step ends.
-    sites: Vec<StepSite>,
-    /// Where the running step *first* touched something a task can share.
-    pending: Option<StepSite>,
     drawn: u64,
     virtual_time: i64,
-    /// The live region's span, for a step whose site never closed because the run failed in it.
+    /// The live region's span, for a step the run failed in before it placed itself.
     fallback: Span,
     entered: bool,
 }
@@ -36,8 +34,6 @@ impl Trail {
             sched: Stream::new(root, Domain::Sched),
             choices: Vec::new(),
             steps: Vec::new(),
-            sites: Vec::new(),
-            pending: None,
             drawn: 0,
             virtual_time: 0,
             fallback: Span::DUMMY,
@@ -95,21 +91,22 @@ impl Trail {
         &self.choices
     }
 
-    pub fn record_access(&mut self, access: Access) {
+    /// `at` is where the access is made: a step is placed at its first.
+    pub fn record_access(&mut self, access: Access, at: StepSite) {
         if crate::sched::is_scheduler_bookkeeping(&access) {
             return;
         }
         if let Some(step) = self.steps.last_mut() {
             step.accesses.insert(access);
+            step.site.get_or_insert(at);
         }
     }
 
-    pub fn end_step(&mut self, fallback: Span) {
-        let site = self.pending.take().unwrap_or(StepSite {
-            definition: None,
-            span: fallback,
-        });
-        self.sites.push(site);
+    /// A step that touched nothing a task can share is placed where it gave control back.
+    pub fn end_step(&mut self, yielded: StepSite) {
+        if let Some(step) = self.steps.last_mut() {
+            step.site.get_or_insert(yielded);
+        }
     }
 
     pub fn record(&self) -> Record {
@@ -117,14 +114,7 @@ impl Trail {
             steps: self
                 .steps
                 .iter()
-                .enumerate()
-                .map(|(i, step)| {
-                    let (definition, span) = match self.sites.get(i) {
-                        Some(site) => (site.definition.clone(), site.span),
-                        None => (None, self.fallback),
-                    };
-                    Step::from_record(step, definition, span)
-                })
+                .map(|step| Step::from_record(step, self.fallback))
                 .collect(),
             virtual_time: self.virtual_time,
         }

@@ -284,9 +284,21 @@ fn only_failure(report: &Value) -> &Value {
     }
 }
 
+/// The byte range of `text` in the fixture `name`, which writes it once.
+fn written_in(name: &str, text: &str) -> (u64, u64) {
+    let source = std::fs::read_to_string(fixture_root().join(format!("{name}.ply")))
+        .expect("the fixture is readable");
+    let found: Vec<usize> = source.match_indices(text).map(|(at, _)| at).collect();
+    let [at] = found[..] else {
+        panic!("`{name}` writes `{text}` {} times, not once", found.len());
+    };
+    (at as u64, (at + text.len()) as u64)
+}
+
 /// Run end to end, `bank_race.ply`'s two transfers pass; the search moves one's balance check ahead
 /// of the other's debit, so both pass a check only one should. The failure names the two sides of
-/// that reordering, and the seed it prints replays it.
+/// that reordering, each at the perform in `transfer` that made its access, and the seed it prints
+/// replays it.
 #[test]
 fn the_search_finds_the_bank_race_and_its_seed_replays_it() {
     let project = copied("bank_race");
@@ -320,6 +332,31 @@ fn the_search_finds_the_bank_race_and_its_seed_replays_it() {
         ]),
         "one transfer's balance check is reordered against the other's debit: {race}"
     );
+    for (access, perform) in [
+        (
+            "bank_race.bank.read[accounts]",
+            "bank.balance[accounts](from)",
+        ),
+        (
+            "bank_race.bank.write[accounts]",
+            "bank.credit[accounts](from, -amount)",
+        ),
+    ] {
+        let side = sides
+            .iter()
+            .find(|s| s["access"] == access)
+            .unwrap_or_else(|| panic!("no side of the race is `{access}`: {race}"));
+        assert_eq!(
+            side["definition"], "bank_race.transfer",
+            "`{access}` is named in the definition that performed it: {race}"
+        );
+        let (start, end) = written_in("bank_race", perform);
+        assert_eq!(
+            (side["span"]["start"].as_u64(), side["span"]["end"].as_u64()),
+            (Some(start), Some(end)),
+            "`{access}` is placed at `{perform}`, where its step first touched the accounts: {race}"
+        );
+    }
 
     let seed = failure["seed"]
         .as_str()

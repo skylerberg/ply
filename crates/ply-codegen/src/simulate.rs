@@ -7,7 +7,7 @@ use crate::rt::{
 };
 use crate::stack::{Stack, switch};
 use ply_eval::host::Pending;
-use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, Turn};
+use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, TaskHandle, Turn};
 use ply_eval::sim::{Access, Answer, Handlers, OpSignature, TaskId, signature};
 use ply_eval::{Diagnostic, SimId, Span, Symbol, Unbound, Value, codes};
 use std::collections::BTreeMap;
@@ -49,7 +49,7 @@ struct TaskStack {
 enum Request {
     /// The body, and the stack the spawn was performed on.
     Spawn(Word, usize),
-    Join(TaskId),
+    Join(TaskHandle),
     Yield,
     Seeded(&'static OpSignature, Vec<Value>),
     Park(Pending),
@@ -305,13 +305,13 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
         unsafe { switch(&mut *from, sp) };
 
         let c = unsafe { &mut *ctx };
-        let site = c.site();
+        let yielded = c.step_site();
         let sim = c.sims.last_mut().expect("a region is running");
         sim.running = None;
         c.current = sim.stack;
         c.stack_floor = sim.floor_below;
         if sim.sched.records_steps() {
-            c.trail.end_step(site);
+            c.trail.end_step(yielded);
         }
     }
 }
@@ -336,19 +336,14 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             );
             sim.sched.suspend(k, Value::Task(handle))
         }
-        Request::Join(target) => sim.sched.join(k, target, site),
+        Request::Join(target) => sim.sched.join(k, &target, site),
         Request::Yield => sim.sched.suspend(k, Value::Unit),
         Request::Park(pending) => match &runtime {
             Some(rt) => sim.sched.park_on_host(k, pending, site, rt.as_ref()),
             None => sim.sched.park_on_host(k, pending, site, &Unbound),
         },
         Request::Seeded(sig, args) => match sim.handlers.dispatch(sig, task, &args, site) {
-            Ok(Answer::Value(value)) => {
-                if let Some(access) = sig.step_access() {
-                    c.trail.record_access(access);
-                }
-                sim.sched.suspend(k, value)
-            }
+            Ok(Answer::Value(value)) => sim.sched.suspend(k, value),
             Ok(Answer::Sleeping { deadline }) => sim.sched.sleep_until(k, deadline, site),
             Err(d) => Err(d),
         },
@@ -459,7 +454,7 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
             let handle = c.value(args[0]);
             heap::dec(args[0]);
             match handle.as_task(c.site(), "`task.join`") {
-                Ok(target) => Request::Join(target),
+                Ok(target) => Request::Join(target.clone()),
                 Err(d) => return c.fail(d),
             }
         }
