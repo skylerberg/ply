@@ -114,13 +114,6 @@ pub fn take_cycles() -> Vec<Diagnostic> {
         .unwrap_or_default()
 }
 
-pub(crate) fn cell_cycle(slot: Slot, value: &Value, span: Span) -> Option<Diagnostic> {
-    if !value_reaches_cell(value, slot) {
-        return None;
-    }
-    note_cell_cycle(slot, span)
-}
-
 /// Whether `v` reaches cell `slot`, within the walk's budget.
 pub fn value_reaches_cell(v: &Value, slot: Slot) -> bool {
     let mut budget = CYCLE_WALK_BUDGET;
@@ -128,7 +121,7 @@ pub fn value_reaches_cell(v: &Value, slot: Slot) -> bool {
 }
 
 /// Counts a found cell cycle and warns once per site.
-pub fn note_cell_cycle(slot: Slot, span: Span) -> Option<Diagnostic> {
+pub fn note_cell_cycle(slot: Slot, span: Span) {
     bump(|s| s.cycles += 1);
     let seen = SEEN
         .try_with(|c| {
@@ -140,6 +133,9 @@ pub fn note_cell_cycle(slot: Slot, span: Span) -> Option<Diagnostic> {
             known
         })
         .unwrap_or(false);
+    if seen {
+        return;
+    }
     let d = Diagnostic::warning(
         codes::REFERENCE_CYCLE,
         format!("cell {slot} is being made to contain itself"),
@@ -147,10 +143,7 @@ pub fn note_cell_cycle(slot: Slot, span: Span) -> Option<Diagnostic> {
     .primary(span, "this value reaches the cell it is stored in")
     .note("reference counting does not collect cycles, so this cell and everything it reaches stay allocated for the rest of the run")
     .note("break the cycle by storing the part that does not name the cell, or by clearing the cell before the run ends");
-    if !seen {
-        let _ = CYCLES.try_with(|c| c.borrow_mut().push(d.clone()));
-    }
-    Some(d)
+    let _ = CYCLES.try_with(|c| c.borrow_mut().push(d));
 }
 
 const CYCLE_WALK_BUDGET: u32 = 256;
