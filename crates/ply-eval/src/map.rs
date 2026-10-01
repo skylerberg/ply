@@ -1,9 +1,7 @@
 //! The `Map` builtins.
 
-use crate::cont::Frame;
 use crate::value::{Fields, Map, Value};
 use crate::{Diagnostic, Span, Symbol, codes};
-use std::rc::Rc;
 use std::sync::Arc;
 
 /// Entries are `{key, value}` records because Ply has no tuples.
@@ -50,6 +48,22 @@ pub(crate) fn insert(mut m: Value, k: Value, v: Value, span: Span) -> Result<Val
     Ok(m)
 }
 
+/// Removes `k`'s entry for `map_update`, so a map held once lends its function the value held once.
+pub fn take(mut m: Value, k: &Value, span: Span) -> Result<(Value, Option<Value>), Diagnostic> {
+    key(k, "map_update", span)?;
+    let taken = match &mut m {
+        Value::Map(out) => {
+            let taken = out.get(k).cloned();
+            if taken.is_some() {
+                out.remove_mut(k);
+            }
+            taken
+        }
+        other => return Err(crate::value::type_error(span, "`map_update`", "Map", other)),
+    };
+    Ok((m, taken))
+}
+
 pub(crate) fn get(m: &Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
     key(k, "map_get", span)?;
     Ok(match m.as_map(span, "`map_get`")?.get(k) {
@@ -75,26 +89,6 @@ pub(crate) fn remove(mut m: Value, k: &Value, span: Span) -> Result<Value, Diagn
         other => return Err(crate::value::type_error(span, "`map_remove`", "Map", other)),
     }
     Ok(m)
-}
-
-/// Removes the entry for `map_update` so the updating function can see the value uniquely owned.
-pub(crate) fn take(
-    mut m: Value,
-    k: &Value,
-    span: Span,
-) -> Result<(Value, Option<Value>), Diagnostic> {
-    key(k, "map_update", span)?;
-    let taken = match &mut m {
-        Value::Map(out) => match out.get(k).cloned() {
-            Some(v) => {
-                out.remove_mut(k);
-                Some(v)
-            }
-            None => None,
-        },
-        other => return Err(crate::value::type_error(span, "`map_update`", "Map", other)),
-    };
-    Ok((m, taken))
 }
 
 pub(crate) fn len(m: &Value, span: Span) -> Result<Value, Diagnostic> {
@@ -159,36 +153,4 @@ pub(crate) fn merge(a: &Value, b: &Value, span: Span) -> Result<Value, Diagnosti
         put(&mut out, k.clone(), v.clone(), "map_merge", span)?;
     }
     Ok(Value::Map(out))
-}
-
-/// A snapshot of the entries `map_fold` visits, in ascending key order.
-pub type Entries = Rc<Vec<(Value, Value)>>;
-
-pub(crate) fn fold_entries(m: &Value, span: Span) -> Result<Entries, Diagnostic> {
-    let m = m.as_map(span, "`map_fold`")?;
-    Ok(Rc::new(
-        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-    ))
-}
-
-pub(crate) fn next_fold(
-    f: Value,
-    entries: Entries,
-    next: usize,
-    acc: Value,
-    span: Span,
-) -> crate::builtins::Step {
-    let Some((k, v)) = entries.get(next).cloned() else {
-        return crate::builtins::Step::Done(acc);
-    };
-    crate::builtins::Step::Apply {
-        callee: f.clone(),
-        args: crate::argv::of([acc, k, v]),
-        frame: Frame::MapFoldStep {
-            f,
-            entries,
-            next: next + 1,
-            span,
-        },
-    }
 }
