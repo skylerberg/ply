@@ -21,15 +21,16 @@ import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEff
 import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index, hash_index, hex,
              digest, unused, Pin, Rehash, Rehashed, rehash_index)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
-              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, update_shapes, expanded_mods,
-              check_front_with, is_prelude_effect, builtin_schemes, builtin_docs, find_doc,
-              published_pure)
+              EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, update_shapes,
+              update_shapes_with, expanded_mods, check_front_with, is_prelude_effect,
+              builtin_schemes, builtin_docs, find_doc, published_pure)
 import diag (Parsed, parse_all, parse_at, outside_every_module, placed)
 import pkg (Pkgs, Closure, Package, Pinned, closure, empty, pins_of)
 import resolve (Pkg, resolve_packaged, no_pkgs)
 import std.hash (blake3)
 import std.pkg (Manifest)
 import fmt (item_range, replace_item)
+import rewrite (fn_has_update)
 
 fn joined(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
@@ -1721,7 +1722,10 @@ fn law_claim(r: Resolved, m: Int, module: Bytes, d: LawDef) -> Claim = {
 }
 
 fn claims_of(mods: List<Mod>, r: Resolved) -> List<Claim> =
-  fold(range(0, len(mods)), [], |acc: List<Claim>, i: Int| {
+  claims_of_modules(mods, r, range(0, len(mods)))
+
+fn claims_of_modules(mods: List<Mod>, r: Resolved, wanted: List<Int>) -> List<Claim> =
+  fold(wanted, [], |acc: List<Claim>, i: Int| {
     let m = at(mods, i);
     fold(m.module.items, acc, |a: List<Claim>, it: Item|
       match it {
@@ -1759,6 +1763,34 @@ pub fn claims(
       None -> panic("a program the front end checked does not check"),
       Some(shapes) -> claims_of(expanded_mods(x.mods, shapes), x.r),
     },
+  }
+}
+
+// The claims of the modules at `wanted`, ascending and closed under imports, lowered as `claims`
+// lowers them, from a program `analyse` checked: its parse and resolution are reused, and the checker
+// walks again only the definitions there that write a record update — the one thing lowering reads
+// from it — seeded with every other definition's and test's rows as the next analysis would be.
+pub fn claims_in(w: Whole, wanted: List<Int>) -> List<Claim> = {
+  let walked = fold(wanted, map_new(), |acc: Map<Bytes, Bool>, i: Int| {
+    let m = at(w.mods, i);
+    fold(m.module.items, acc, |a: Map<Bytes, Bool>, it: Item|
+      match it {
+        IFn(d) -> if fn_has_update(d) { map_insert(a, qualify(m.name, d.name.name), true) }
+        else { a },
+        _ -> a,
+      })
+  });
+  let rows = rows_of(w);
+  let known = taken(
+    w.mods,
+    w.index,
+    w.hashes,
+    filter(rows.defs, |r: KnownDefRow| !map_contains(walked, r.name)),
+    rows.tests,
+  );
+  match update_shapes_with(w.r, w.mods, known) {
+    None -> panic("a program the front end checked does not check"),
+    Some(shapes) -> claims_of_modules(expanded_mods(w.mods, shapes), w.r, wanted),
   }
 }
 
@@ -2584,6 +2616,21 @@ test "a record update reaches a claim as the literal it stands for" {
     ClaimDef(d) -> assert(bytes_index_of(code_text(d.body), b"upd(") != None),
     _ -> assert(false),
   }
+}
+
+test "claims lowered from an analysis are the claims lowered from its sources" {
+  let sources = [
+    {
+      name: b"base",
+      src: b"pub type P = { a: Int, b: Int }\npub fn bump(p: P) -> P ensures result.b == 3 = {..p, b: 3}\npub fn same(p: P) -> P = p\npub effect tally { write add[r](n: Int) -> Unit }\npub fn add_twice<[r]>(n: Int) -> Unit / {tally.add[r]} = { tally.add[r](n); tally.add[r](n) }\npub fn keyed<a>(k: a) -> Map<a, Int> where derivable(ord, a) = map_insert(map_new(), k, 1)\n",
+    },
+    {
+      name: b"app",
+      src: b"import base\nfn moved(p: base::P) -> Int requires {..p, a: 1}.a == 1 = base::same(p).a\nfn counted() -> Map<Int, Int> / {base::tally.add[c]} = { base::add_twice[c](2); {..base::bump({ a: 0, b: 0 }), a: 1}.a; base::keyed(4) }\nlaw \"bumped\" forall (p: base::P) { base::bump(p) == {..p, b: 3} }\ntest \"updated\" { assert_eq({..base::same({ a: 1, b: 2 }), a: 5}.a, 5) }\n",
+    },
+  ];
+  let w = whole_of(sources);
+  assert_eq(claims_in(w, range(0, len(w.mods))), claims(sources))
 }
 
 test "a builtin is published with its scheme and the names its parameters are documented under" {
