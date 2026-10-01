@@ -166,10 +166,11 @@ pub trait HostRuntime {
     fn park(&self) -> Result<(), Diagnostic>;
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic>;
 
-    /// Called on every exit path from an entry point, before the machine resets.
-    fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic> {
+    /// Called on every exit path from an entry point, before the machine resets; answers what its
+    /// ending warns of.
+    fn end_entry_point(&self, machine: MachineId) -> Vec<Diagnostic> {
         let _ = machine;
-        Ok(())
+        Vec::new()
     }
 
     /// Called when a production region retires `task`, whose id nothing will name again.
@@ -186,24 +187,16 @@ pub trait HostRuntime {
     }
 
     /// Called once, after the last entry point, before the process exits.
-    fn shutdown(&self, drain_ms: u64) -> ShutdownReport {
-        let _ = drain_ms;
+    fn shutdown(&self) -> ShutdownReport {
         ShutdownReport::default()
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct ShutdownReport {
-    pub transactions_rolled_back: usize,
-    pub connections_closed: Vec<String>,
-    /// Spans still open at teardown, closed as `Abandoned`.
-    pub spans_abandoned: usize,
-    /// `None` when no sink is bound.
-    pub records_flushed: Option<usize>,
-    pub problems: Vec<String>,
+    /// Spans left open when their task or entry point ended: the sum of what each `W0609` counted.
+    pub spans_left_open: usize,
 }
-
-impl ShutdownReport {}
 
 #[derive(Default)]
 pub struct HostRegistry {

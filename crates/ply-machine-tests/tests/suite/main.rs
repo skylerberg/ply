@@ -100,21 +100,8 @@ type Front = {
 type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
 
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
-type Stopping = {
-  signal: Option<String>,
-  listeners: Int,
-  connections: Int,
-  scopes: Int,
-  elapsed_ms: Int,
-}
-type Teardown = {
-  lead_ms: Int,
-  drain_ms: Int,
-  transactions_rolled_back: Int,
-  connections_closed: Int,
-  spans_abandoned: Int,
-  problems: List<String>,
-}
+type Stopping = { signal: Option<String>, listeners: Int, connections: Int, elapsed_ms: Int }
+type Teardown = { lead_ms: Int, drain_ms: Int, spans_left_open: Int }
 type Trace = { events: Int, spans: Int, abandoned: Int, flushed: Bool }
 type Json = | Null
 

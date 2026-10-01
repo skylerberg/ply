@@ -745,11 +745,11 @@ impl HostRuntime for Warns {
         Ok(Value::Unit)
     }
 
-    fn end_entry_point(&self, _: MachineId) -> Result<(), Diagnostic> {
-        Err(Diagnostic::warning(
+    fn end_entry_point(&self, _: MachineId) -> Vec<Diagnostic> {
+        vec![Diagnostic::warning(
             codes::SPAN_ABANDONED,
             "a span was still open when the entry point ended",
-        ))
+        )]
     }
 }
 

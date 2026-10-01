@@ -474,6 +474,53 @@ fn a_retired_tasks_open_span_is_still_reported_as_w0609_when_the_entry_point_end
     );
 }
 
+/// What a run reports left open is the sum of what its `W0609`s counted: a span an outer `exit`
+/// closed through is `Abandoned` without having been left open, and a retired task's span was.
+#[test]
+fn the_spans_left_open_are_what_the_warnings_counted() {
+    let f = fixture();
+    let outer = enter(&f, "orders", "place_order");
+    enter(&f, "orders", "reserve");
+    f.perform(Op::Exit, "orders", vec![outer, ctor("Ok", Vec::new())]);
+    f.as_task(
+        Some(TaskId(3)),
+        Op::Enter,
+        "db",
+        vec![ply_eval::Value::str("query"), no_fields()],
+    )
+    .unwrap_or_else(|d| panic!("{d:?}"));
+    f.trace.end_task(f.machine, TaskId(3));
+    enter(&f, "http", "request");
+
+    let first = f
+        .trace
+        .end_entry_point(f.machine)
+        .expect("two were left open");
+    assert!(
+        first.message.starts_with("2 spans were still open"),
+        "{}",
+        first.message
+    );
+    assert_eq!(f.trace.left_open(), 2);
+    assert_eq!(
+        f.trace.counts().abandoned,
+        3,
+        "the span closed through is `Abandoned` all the same"
+    );
+
+    enter(&f, "http", "request");
+    let second = f
+        .trace
+        .end_entry_point(f.machine)
+        .expect("one was left open");
+    assert!(
+        second.message.starts_with("1 span was still open"),
+        "{}",
+        second.message
+    );
+    assert_eq!(f.trace.left_open(), 3, "each entry point's count adds up");
+}
+
 /// After a discarded continuation, the span's record is all that says what the request was doing.
 #[test]
 fn teardown_writes_before_it_flushes() {

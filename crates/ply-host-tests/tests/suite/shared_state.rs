@@ -750,7 +750,7 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
     // The banner, printed after the entry point returned while the coordinator still dials.
     assert_eq!(
         shutdown.at_stop(),
-        (1, 1, 0),
+        (1, 1),
         "the counts are readable from the instant the run could notice the stop"
     );
     assert!(
@@ -764,5 +764,5 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
     while net.accepts_in_flight() > 0 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(shutdown.at_stop(), (1, 1, 0));
+    assert_eq!(shutdown.at_stop(), (1, 1));
 }
