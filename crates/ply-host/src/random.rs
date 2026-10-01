@@ -89,7 +89,7 @@ impl HostHandler for Entropy {
 /// `std.random`'s operations, as the declarations `std.random` writes them.
 pub fn registrations() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let host = Arc::new(RandomHost::new());
-    [Op::Next, Op::Below]
+    Op::ALL
         .iter()
         .map(|op| {
             (
@@ -108,27 +108,14 @@ pub fn register(registry: &mut HostRegistry) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Op {
-    Next,
-    Below,
+operations! {
+    what "random";
+    path "random";
+    Next = "next",
+    Below = "below",
 }
 
 impl Op {
-    pub fn name(self) -> &'static str {
-        match self {
-            Op::Next => "next",
-            Op::Below => "below",
-        }
-    }
-
-    pub fn path(self) -> &'static str {
-        match self {
-            Op::Next => "ply_host::random::next",
-            Op::Below => "ply_host::random::below",
-        }
-    }
-
     pub fn declaration(self) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),

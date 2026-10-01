@@ -32,13 +32,6 @@ pub fn take(arity: usize) -> Vec<Value> {
     Vec::with_capacity(arity)
 }
 
-/// A pooled vector holding exactly `values`; the callee drains it and gives it back.
-pub fn of<const N: usize>(values: [Value; N]) -> Vec<Value> {
-    let mut out = take(N);
-    out.extend(values);
-    out
-}
-
 pub fn give(args: Vec<Value>) {
     if !args.is_empty() {
         return;

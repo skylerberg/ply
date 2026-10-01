@@ -14,8 +14,8 @@ use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::region::StepSite;
 use ply_eval::sim::Access;
 use ply_eval::{
-    BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Resource, Span, Step,
-    Symbol, Value, codes, values_equal,
+    BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Resource, Span, Symbol,
+    Value, codes, values_equal,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -460,15 +460,12 @@ pub struct Ctx {
     pub(crate) cells: ply_eval::TaskRegions<Held>,
     /// The arena's `(total depth, live)` when the running entry began, for [`Ctx::cells_balanced`].
     cells_baseline: (usize, usize),
-    /// The arena `ply_eval::builtins::call` insists on; nothing reaching it uses it.
-    scratch: ply_eval::Arena,
     pub heap: Heap,
     /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
     last_entry: usize,
     pub tables: Arc<Tables>,
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
-    pub builtin_calls: u64,
     /// One per stack run in this entry, the entry's own first; `current` is the one running.
     pub(crate) stacks: Vec<Frames>,
     /// Indices of `stacks` a finished production task gave back, which nothing names any longer.
@@ -538,9 +535,7 @@ impl Ctx {
             tables,
             cells,
             cells_baseline: baseline,
-            scratch: ply_eval::Arena::new(),
             diagnostic: None,
-            builtin_calls: 0,
             stacks: vec![Frames::under(None)],
             free_stacks: Vec::new(),
             current: 0,
@@ -607,7 +602,6 @@ impl Ctx {
         self.heap.adopt_heap(std::mem::take(&mut branch.heap));
         self.ticks = self.ticks.saturating_add(branch.ticks);
         self.grown += branch.grown;
-        self.builtin_calls += branch.builtin_calls;
         self.performed.append(&mut branch.performed);
         self.host_use.atoms = self.host_use.atoms.union(&branch.host_use.atoms);
         self.host_use.operations += branch.host_use.operations;
@@ -980,7 +974,7 @@ impl Ctx {
         self.diagnostic.take()
     }
 
-    /// The interpreter value a word denotes, for a builtin or an error message.
+    /// The value a word denotes, for a builtin or an error message.
     pub(crate) fn value(&self, w: Word) -> Value {
         Heap::to_value(&self.tables.layouts, w)
     }
@@ -1039,8 +1033,7 @@ pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
     ctx.cells.close(RegionId::from_bits(region as u64));
 }
 
-/// Allocates a cell in the running stack's innermost region, shared with the interpreter's cell
-/// builtins.
+/// Allocates a cell in the running stack's innermost region.
 pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if !ctx.sims.is_empty() {
@@ -1465,7 +1458,7 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
 }
 
 /// `++`: two strings or two byte strings append natively, answering the kind they share; anything
-/// else raises the interpreter's error. Takes both.
+/// else raises what `strict_binary` raises. Takes both.
 pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let kind = heap::kind(a);
@@ -1483,37 +1476,33 @@ pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
-/// A builtin over taken arguments: natively over words where it can, else the interpreter's.
+/// A builtin over taken arguments, by this unit's index for it.
 pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let b = ctx.tables.builtins[index as usize];
-    let args = args_of(args, n);
-    ctx.builtin_calls += 1;
+    builtin(ctx, b, args_of(args, n))
+}
+
+/// Every call of a builtin, whether named or called through a value: natively over words where it
+/// can be, else over the values they denote. Takes the arguments.
+fn builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     if !ctx.sims.is_empty()
         && let Some(access) = crate::simulate::cell_access(ctx, b, args)
     {
         ctx.record_access(access);
     }
-    if let Some(w) = native_builtin(ctx, b, args) {
-        return w;
+    match native_builtin(ctx, b, args) {
+        Some(w) => w,
+        None => builtin_over_values(ctx, b, args),
     }
-    builtin_over_values(ctx, b, args)
 }
 
-/// The interpreter's implementation of `b` over the values the words denote. Takes the arguments.
+/// `b` over the values the words denote. Takes the arguments.
 fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
     let site = ctx.site();
-    match ply_eval::builtins::call(b, values, &mut ctx.scratch, site) {
-        Ok(Step::Done(v)) => ctx.word(&v),
-        // Unreachable: the emitter refuses higher-order builtins.
-        Ok(_) => {
-            let d = error(format!(
-                "`{}` suspended, which the fragment excludes",
-                b.name()
-            ));
-            ctx.fail(d)
-        }
+    match ply_eval::builtins::call(b, values, site) {
+        Ok(v) => ctx.word(&v),
         Err(d) => ctx.fail(d),
     }
 }
@@ -1522,7 +1511,6 @@ fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
 pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let pieces = args_of(args, n);
-    ctx.builtin_calls += 1;
     if pieces.iter().any(|w| heap::kind(*w) != KIND_BYTES) {
         let xs = ctx.heap.list_from(pieces);
         return builtin_over_values(ctx, Builtin::BytesConcatAll, &[xs]);
@@ -1596,7 +1584,7 @@ fn cell_read(ctx: &Ctx, slot: Slot, what: &str) -> Result<Word, Diagnostic> {
     }
 }
 
-/// The builtins answered over native words; `None` hands the call to the interpreter.
+/// The builtins answered over native words; `None` answers the call over values instead.
 fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> {
     match (which, args) {
         (Builtin::Len, [xs]) if heap::kind(*xs) == KIND_LIST => {
@@ -1658,6 +1646,20 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*c);
             Some(if ctx.failed != 0 { 0 } else { heap::unit() })
         }
+        // Only compiled code can enter a closure, so these answer whatever they are given.
+        (Builtin::Map, [xs, f]) => Some(unsafe { rt_map(std::ptr::from_mut(ctx), *xs, *f) }),
+        (Builtin::Filter, [xs, p]) => Some(unsafe { rt_filter(std::ptr::from_mut(ctx), *xs, *p) }),
+        (Builtin::Fold, [xs, init, f]) => {
+            Some(unsafe { rt_fold(std::ptr::from_mut(ctx), *xs, *init, *f) })
+        }
+        (Builtin::MapFold, [m, init, f]) => {
+            Some(unsafe { rt_map_fold(std::ptr::from_mut(ctx), *m, *init, *f) })
+        }
+        (Builtin::Iterate, [seed, budget, f]) => {
+            Some(unsafe { rt_iterate(std::ptr::from_mut(ctx), *seed, *budget, *f) })
+        }
+        (Builtin::MapUpdate, [m, k, f]) => Some(map_update(ctx, *m, *k, *f)),
+        (Builtin::BytesPosition, [b, from, p]) => Some(bytes_position(ctx, *b, *from, *p)),
         (Builtin::ListAt, [xs, i]) if heap::kind(*xs) == KIND_LIST => {
             let o = obj(*xs);
             let index = heap::as_int(*i)?;
@@ -1691,7 +1693,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let items: Vec<Word> = (a..b).map(heap::imm).collect();
             Some(ctx.heap.list_from(&items))
         }
-        // Anything the interpreter would raise on answers `None` before touching a count.
+        // Anything the value builtins would raise on answers `None` before touching a count.
         (Builtin::BytesLen, [b]) if heap::kind(*b) == KIND_BYTES => {
             let n = unsafe { (*obj(*b)).len } as i64;
             heap::dec(*b);
@@ -1804,7 +1806,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 unsafe { bytes_of(obj(*needle)) },
                 0,
             );
-            let out = position(ctx, at)?;
+            let out = position(ctx, at);
             heap::dec(*hay);
             heap::dec(*needle);
             Some(out)
@@ -1818,7 +1820,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 return None;
             }
             let at = find_bytes(h, unsafe { bytes_of(obj(*needle)) }, from);
-            let out = position(ctx, at)?;
+            let out = position(ctx, at);
             heap::dec(*hay);
             heap::dec(*needle);
             Some(out)
@@ -1826,7 +1828,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::BytesIndexOfByte, [hay, byte]) if heap::kind(*hay) == KIND_BYTES => {
             let byte = u8::try_from(heap::as_int(*byte)?).ok()?;
             let at = memchr::memchr(byte, unsafe { bytes_of(obj(*hay)) });
-            let out = position(ctx, at)?;
+            let out = position(ctx, at);
             heap::dec(*hay);
             Some(out)
         }
@@ -1980,7 +1982,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             if heap::kind(*s) == KIND_STR && heap::kind(*needle) == KIND_STR =>
         {
             let (x, y) = unsafe { (str_of(obj(*s)), str_of(obj(*needle))) };
-            // Absent is the interpreter's diagnostic to raise.
+            // Absent is the value builtins' diagnostic to raise.
             let at = x.find(y)?;
             let n = x[..at].chars().count() as i64;
             heap::dec(*s);
@@ -2077,7 +2079,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let entries = list::to_vec(obj(*xs));
             let n = entries.len();
             let (key, value) = (Symbol::new("key"), Symbol::new("value"));
-            // Any other entry shape is the interpreter's to raise on.
+            // Any other entry shape is the value builtins' to raise on.
             let mut pairs = Vec::with_capacity(n);
             for e in entries {
                 if heap::kind(e) != KIND_RECORD {
@@ -2140,7 +2142,7 @@ fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     memchr::memmem::find(&hay[from..], needle).map(|at| from + at)
 }
 
-/// The byte offset of the `n`-th character boundary, as the interpreter's `char_offset` finds it.
+/// The byte offset of the `n`-th character boundary, as the value builtins' `char_offset` finds it.
 fn char_offset(s: &str, n: usize) -> usize {
     s.char_indices()
         .map(|(i, _)| i)
@@ -2154,18 +2156,126 @@ fn list_of(ctx: &mut Ctx, items: &[Word]) -> Word {
     ctx.heap.list_from(items)
 }
 
-/// `Some(at)` or `None` as the prelude's constructors, when the unit knows them.
-fn position(ctx: &mut Ctx, at: Option<usize>) -> Option<Word> {
-    let some = ctx.tables.layouts.some?;
-    let none = ctx.tables.layouts.none?;
-    Some(match at {
-        Some(i) => {
+/// `Some(at)` or `None`, built over values when the unit does not know the prelude's constructors.
+fn position(ctx: &mut Ctx, at: Option<usize>) -> Word {
+    let layouts = &ctx.tables.layouts;
+    match (at, layouts.some, layouts.none) {
+        (Some(i), Some(some), _) => {
             let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
             unsafe { set_word(c, 0, heap::imm(i as i64)) };
             c as Word
         }
-        None => ctx.nullary(none),
-    })
+        (None, _, Some(none)) => ctx.nullary(none),
+        (Some(i), None, _) => ctx.word(&Value::ctor("Some", vec![Value::Int(i as i64)])),
+        (None, _, None) => ctx.word(&Value::ctor("None", Vec::new())),
+    }
+}
+
+/// `map_update(m, k, f)`: the entry leaves the map while `f` runs, so a map held once lends `f` a
+/// value held once. Takes all three.
+fn map_update(ctx: &mut Ctx, m: Word, k: Word, f: Word) -> Word {
+    let (rest, current) = if heap::kind(m) == KIND_MAP && heap::native_key(k) {
+        let tables = Arc::clone(&ctx.tables);
+        match map::get(&tables.layouts, obj(m), k) {
+            Some(v) => {
+                heap::inc(v);
+                (ctx.heap.map_remove(&tables.layouts, m, k), Some(v))
+            }
+            None => (m, None),
+        }
+    } else {
+        let (map, key) = (ctx.value(m), ctx.value(k));
+        heap::dec(m);
+        match ply_eval::map::take(map, &key, ctx.site()) {
+            Ok((map, v)) => (ctx.word(&map), v.map(|v| ctx.word(&v))),
+            Err(d) => {
+                heap::dec(k);
+                heap::dec(f);
+                return ctx.fail(d);
+            }
+        }
+    };
+    let Some(current) = current else {
+        heap::dec(k);
+        heap::dec(f);
+        return rest;
+    };
+    let updated = call_value(std::ptr::from_mut(ctx), f, &[current]);
+    heap::dec(f);
+    if ctx.failed != 0 {
+        heap::dec(rest);
+        heap::dec(k);
+        return 0;
+    }
+    builtin(ctx, Builtin::MapInsert, &[rest, k, updated])
+}
+
+/// `bytes_position(b, from, p)`: the first index at or past `from` whose byte `p` accepts. Takes
+/// all three.
+fn bytes_position(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Word {
+    let found = first_accepted(ctx, b, from, p);
+    heap::dec(b);
+    heap::dec(from);
+    heap::dec(p);
+    match found {
+        Some(at) => position(ctx, at),
+        None => 0,
+    }
+}
+
+/// `bytes_position`'s search, or `None` with the context failed. Reads all three.
+fn first_accepted(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Option<Option<usize>> {
+    // Only a payload too long for a native object stays bridged.
+    let bridged = (heap::kind(b) != KIND_BYTES).then(|| ctx.value(b));
+    let bytes: &[u8] = match &bridged {
+        None => unsafe { bytes_of(obj(b)) },
+        Some(Value::Bytes(bytes)) => bytes,
+        Some(other) => {
+            let d = error(format!(
+                "`bytes_position` needs Bytes, and this is {}",
+                other.type_name()
+            ));
+            ctx.fail(d);
+            return None;
+        }
+    };
+    let start = match heap::as_int(from) {
+        Some(n) if usize::try_from(n).is_ok_and(|n| n <= bytes.len()) => n as usize,
+        Some(n) => {
+            let site = ctx.site();
+            let d = ply_eval::builtins::start_outside(n, bytes.len(), site, "bytes_position");
+            ctx.fail(d);
+            return None;
+        }
+        None => {
+            let d = error(format!(
+                "`bytes_position` needs an Int start, and this is {}",
+                ctx.type_name(from)
+            ));
+            ctx.fail(d);
+            return None;
+        }
+    };
+    for (i, &byte) in bytes.iter().enumerate().skip(start) {
+        let r = call_value(std::ptr::from_mut(ctx), p, &[heap::imm(i64::from(byte))]);
+        if ctx.failed != 0 {
+            return None;
+        }
+        match heap::as_bool(r) {
+            Some(true) => return Some(Some(i)),
+            Some(false) => {}
+            None => {
+                let d = error(format!(
+                    "the predicate given to `bytes_position` answered {}, not a Bool",
+                    ctx.type_name(r)
+                ));
+                heap::dec(r);
+                ctx.fail(d);
+                return None;
+            }
+        }
+    }
+    Some(None)
 }
 
 /// A closure of compiled function `index` over `env`, its leading arguments. Takes the captures.
@@ -2520,7 +2630,7 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
     r
 }
 
-/// A builtin used as a value: the interpreter's own closure kind for it.
+/// A builtin used as a value, which a call through it answers as a named call would.
 pub unsafe extern "C" fn rt_builtin_value(ctx: *mut Ctx, index: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let b = ctx.tables.builtins[index as usize];
@@ -2648,23 +2758,7 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                 return c.fail(d);
             };
             match &closure.kind {
-                ClosureKind::Builtin(b) => {
-                    let b = *b;
-                    let values = values_taken(c, args);
-                    c.builtin_calls += 1;
-                    let site = c.site();
-                    match ply_eval::builtins::call(b, values, &mut c.scratch, site) {
-                        Ok(Step::Done(v)) => c.word(&v),
-                        Ok(_) => {
-                            let d = error(format!(
-                                "`{}` suspended, which the fragment excludes",
-                                b.name()
-                            ));
-                            c.fail(d)
-                        }
-                        Err(d) => c.fail(d),
-                    }
-                }
+                ClosureKind::Builtin(b) => builtin(c, *b, args),
                 ClosureKind::Ctor { name, arity } => {
                     if args.len() != *arity {
                         let d = error(format!(
@@ -3169,15 +3263,6 @@ pub unsafe extern "C" fn rt_alloc(
         .alloc(kind as u8, flags as u8, len as u32, layout as u32) as Word
 }
 
-/// A builtin called directly, natively where it can be, else over values. Takes the arguments.
-fn direct(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
-    ctx.builtin_calls += 1;
-    match native_builtin(ctx, b, args) {
-        Some(w) => w,
-        None => builtin_over_values(ctx, b, args),
-    }
-}
-
 /// The value inside an `Option` answer, held once more, or `0` for `None`; the answer is let go.
 fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
     if ctx.failed != 0 {
@@ -3197,11 +3282,11 @@ fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
 }
 
 pub unsafe extern "C" fn rt_list_index(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
-    direct(unsafe { &mut *ctx }, Builtin::ListAt, &[xs, i])
+    builtin(unsafe { &mut *ctx }, Builtin::ListAt, &[xs, i])
 }
 
 pub unsafe extern "C" fn rt_list_set(ctx: *mut Ctx, xs: i64, i: i64, v: i64) -> i64 {
-    direct(unsafe { &mut *ctx }, Builtin::ListSet, &[xs, i, v])
+    builtin(unsafe { &mut *ctx }, Builtin::ListSet, &[xs, i, v])
 }
 
 /// `list_at` for a `match` that unwraps its answer at once, like [`rt_map_lookup`].
@@ -3210,7 +3295,6 @@ pub unsafe extern "C" fn rt_list_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
     if heap::kind(xs) == KIND_LIST
         && let Some(index) = heap::as_int(i)
     {
-        ctx.builtin_calls += 1;
         let o = obj(xs);
         let w = if index >= 0 && (index as usize) < list::len(o) {
             let item = list::get(o, index as usize);
@@ -3229,50 +3313,44 @@ pub unsafe extern "C" fn rt_list_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
 pub unsafe extern "C" fn rt_push(ctx: *mut Ctx, xs: i64, x: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(xs) == KIND_LIST {
-        ctx.builtin_calls += 1;
         return ctx.heap.list_push(xs, x);
     }
-    direct(ctx, Builtin::Push, &[xs, x])
+    builtin(ctx, Builtin::Push, &[xs, x])
 }
 
 pub unsafe extern "C" fn rt_map_insert(ctx: *mut Ctx, m: i64, k: i64, v: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(m) == KIND_MAP && heap::native_key(k) {
-        ctx.builtin_calls += 1;
         let tables = Arc::clone(&ctx.tables);
         return ctx.heap.map_insert(&tables.layouts, m, k, v);
     }
-    direct(ctx, Builtin::MapInsert, &[m, k, v])
+    builtin(ctx, Builtin::MapInsert, &[m, k, v])
 }
 
 pub unsafe extern "C" fn rt_map_contains(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(m) == KIND_MAP && heap::native_key(k) {
-        ctx.builtin_calls += 1;
         let found = map::get(&ctx.tables.layouts, obj(m), k).is_some();
         heap::dec(m);
         heap::dec(k);
         return heap::bool(found);
     }
-    direct(ctx, Builtin::MapContains, &[m, k])
+    builtin(ctx, Builtin::MapContains, &[m, k])
 }
 
 pub unsafe extern "C" fn rt_map_get(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
-    direct(unsafe { &mut *ctx }, Builtin::MapGet, &[m, k])
+    builtin(unsafe { &mut *ctx }, Builtin::MapGet, &[m, k])
 }
 
 pub unsafe extern "C" fn rt_compare(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
-    direct(unsafe { &mut *ctx }, Builtin::Compare, &[a, b])
+    builtin(unsafe { &mut *ctx }, Builtin::Compare, &[a, b])
 }
 
 pub unsafe extern "C" fn rt_byte_of_int(ctx: *mut Ctx, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     match heap::as_int(n).and_then(|v| u8::try_from(v).ok()) {
-        Some(b) => {
-            ctx.builtin_calls += 1;
-            ctx.tables.byte(b)
-        }
-        None => direct(ctx, Builtin::ByteOfInt, &[n]),
+        Some(b) => ctx.tables.byte(b),
+        None => builtin(ctx, Builtin::ByteOfInt, &[n]),
     }
 }
 
@@ -3283,7 +3361,7 @@ pub unsafe extern "C" fn rt_bytes_scan(
     members: i64,
     max: i64,
 ) -> i64 {
-    direct(
+    builtin(
         unsafe { &mut *ctx },
         Builtin::BytesScan,
         &[hay, from, members, max],
@@ -3297,7 +3375,7 @@ pub unsafe extern "C" fn rt_bytes_scan_until(
     members: i64,
     max: i64,
 ) -> i64 {
-    direct(
+    builtin(
         unsafe { &mut *ctx },
         Builtin::BytesScanUntil,
         &[hay, from, members, max],
@@ -3305,9 +3383,9 @@ pub unsafe extern "C" fn rt_bytes_scan_until(
 }
 
 pub unsafe extern "C" fn rt_bytes_slice(ctx: *mut Ctx, b: i64, s: i64, e: i64) -> i64 {
-    direct(unsafe { &mut *ctx }, Builtin::BytesSlice, &[b, s, e])
+    builtin(unsafe { &mut *ctx }, Builtin::BytesSlice, &[b, s, e])
 }
 
 pub unsafe extern "C" fn rt_bytes_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
-    direct(unsafe { &mut *ctx }, Builtin::BytesConcat, &[a, b])
+    builtin(unsafe { &mut *ctx }, Builtin::BytesConcat, &[a, b])
 }

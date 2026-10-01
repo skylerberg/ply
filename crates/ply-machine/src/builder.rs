@@ -24,12 +24,12 @@ use std::sync::{Arc, Mutex};
 const EFFECT: &str = "builder";
 
 const OPERATIONS: [(&str, &str); 6] = [
-    ("loaded", "ply_machine::build::loaded"),
-    ("made", "ply_machine::build::made"),
-    ("previous", "ply_machine::build::previous"),
-    ("stored", "ply_machine::build::stored"),
-    ("unit", "ply_machine::build::unit"),
-    ("git", "ply_machine::build::git"),
+    ("loaded", "ply_machine::builder::loaded"),
+    ("made", "ply_machine::builder::made"),
+    ("previous", "ply_machine::builder::previous"),
+    ("stored", "ply_machine::builder::stored"),
+    ("unit", "ply_machine::builder::unit"),
+    ("git", "ply_machine::builder::git"),
 ];
 
 /// An entry into a compiled unit does not nest on a thread, and a build enters the emitter's while
@@ -41,7 +41,6 @@ const BUILD_STACK: usize = 256 << 20;
 pub fn lent() -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         program: Mutex::new(None),
-        deployed: Mutex::new(None),
     });
     OPERATIONS
         .into_iter()
@@ -56,7 +55,7 @@ fn registration(op: &str, path: &'static str) -> HostOp {
         resource: HostResource::Any,
         // A tree, a toolchain and a binary's own size are not functions of program state.
         determinism: Determinism::Nondeterministic,
-        // One load serves the whole command, and a build is a function of the names it is given.
+        // A load is a function of the root and front it is handed, a build of the names it is given.
         linearity: Linearity::Repeatable,
         blocking: false,
         secrets: false,
@@ -66,9 +65,8 @@ fn registration(op: &str, path: &'static str) -> HostOp {
 
 #[derive(Default)]
 struct Site {
+    /// The last load, which the ops after it build from.
     program: Mutex<Option<Result<Loaded, LoadError>>>,
-    /// `None` while `--diff`'s artifact has not been asked for.
-    deployed: Mutex<Option<Result<Deployed, Diagnostic>>>,
 }
 
 impl HostHandler for Site {
@@ -78,7 +76,7 @@ impl HostHandler for Site {
             ("loaded", [path, front]) => {
                 let path = PathBuf::from(path.as_str(span, "the program's root")?);
                 let front = handed_front_of(front, span)?;
-                let loaded = self.load_once(&path, &front);
+                let loaded = self.load(&path, &front);
                 self.loaded(loaded)
             }
             ("made", [entry, startup, reaches]) => self.made(
@@ -86,13 +84,7 @@ impl HostHandler for Site {
                 &texts(startup, span)?,
                 reaches.as_bool(span, "whether the closure is wanted")?,
             ),
-            ("previous", [diff]) => {
-                let deployed = self.deployed_once(diff, span)?;
-                answered(match deployed.as_ref().expect("the diff was read") {
-                    Ok(old) => Ok(deployed_value(old)),
-                    Err(diagnostic) => Err(diagnostic.clone()),
-                })
-            }
+            ("previous", [diff]) => answered(deployed(diff, span)?.map(|old| deployed_value(&old))),
             ("unit", [names]) => self.unit(&texts(names, span)?),
             ("git", [root, key]) => {
                 let root = PathBuf::from(root.as_str(span, "the project's root")?);
@@ -162,43 +154,14 @@ fn answered(answer: Result<PlyValue, Diagnostic>) -> PlyValue {
 // --- The program as it loaded -------------------------------------------------
 
 impl Site {
-    /// The deployed artifact `--diff` names is read at most once, on the op that asks for it.
-    fn deployed_once(
-        &self,
-        diff: &PlyValue,
-        span: Span,
-    ) -> Result<std::sync::MutexGuard<'_, Option<Result<Deployed, Diagnostic>>>, Diagnostic> {
-        let mut deployed = self.deployed.lock().unwrap_or_else(|e| e.into_inner());
-        if deployed.is_none() {
-            let read = match diff {
-                PlyValue::Ctor { name, args } if name.as_str() == "Some" => args
-                    .first()
-                    .map(|v| {
-                        v.as_str(span, "the deployed artifact's path")
-                            .map(str::to_string)
-                    })
-                    .transpose()?,
-                PlyValue::Ctor { name, .. } if name.as_str() == "None" => None,
-                _ => None,
-            };
-            *deployed = Some(match read {
-                Some(path) => read_deployed(Path::new(&path)),
-                None => Err(undeployed()),
-            });
-        }
-        Ok(deployed)
-    }
-
-    /// The load runs at most once, on the op that asks for it.
-    fn load_once(
+    /// A load is of the root and front end it is handed, whatever was loaded before.
+    fn load(
         &self,
         path: &Path,
         front: &HandedFront,
     ) -> std::sync::MutexGuard<'_, Option<Result<Loaded, LoadError>>> {
         let mut program = self.program.lock().unwrap_or_else(|e| e.into_inner());
-        if program.is_none() {
-            *program = Some(load_over_front(path, front));
-        }
+        *program = Some(load_over_front(path, front));
         program
     }
 
@@ -405,6 +368,24 @@ struct Deployed {
     digest: String,
     names: Vec<(String, DefHash)>,
     warnings: Vec<Diagnostic>,
+}
+
+/// The deployed artifact `--diff` names, read when the program asks for it.
+fn deployed(diff: &PlyValue, span: Span) -> Result<Result<Deployed, Diagnostic>, Diagnostic> {
+    let read = match diff {
+        PlyValue::Ctor { name, args } if name.as_str() == "Some" => args
+            .first()
+            .map(|v| {
+                v.as_str(span, "the deployed artifact's path")
+                    .map(str::to_string)
+            })
+            .transpose()?,
+        _ => None,
+    };
+    Ok(match read {
+        Some(path) => read_deployed(Path::new(&path)),
+        None => Err(undeployed()),
+    })
 }
 
 fn read_deployed(path: &Path) -> Result<Deployed, Diagnostic> {

@@ -554,6 +554,104 @@ fn a_callback_that_raises_declines_rather_than_answering() {
     );
 }
 
+const CALLBACK_BUILTINS: &str = r#"
+fn add(a: Int, b: Int) -> Int = a + b
+
+fn inc(x: Int) -> Int = x + 1
+
+fn space(c: Int) -> Bool = c == 32
+
+fn updated(n: Int) -> Int = {
+  let m = map_insert(map_new(), 1, n);
+  let twice = map_update(map_update(m, 1, |v: Int| v + 10), 1, |v: Int| v * 2);
+  let absent = map_update(twice, 2, |v: Int| v + 1000);
+  match map_get(absent, 1) { Some(v) -> v * 10 + map_len(absent), None -> 0 - 1 }
+}
+
+fn updated_beside(n: Int) -> Int = {
+  let m = map_insert(map_new(), 1, n);
+  let u = map_update(m, 1, |v: Int| v + 1);
+  match map_get(m, 1) { Some(a) -> match map_get(u, 1) { Some(b) -> a * 100 + b, None -> 0 - 2 }, None -> 0 - 1 }
+}
+
+fn updated_by_decimal(n: Int) -> Int = {
+  let k = decimal_of_int(1);
+  let m = map_update(map_insert(map_new(), k, n), k, |v: Int| v + 10);
+  match map_get(m, k) { Some(v) -> v, None -> 0 - 1 }
+}
+
+fn space_from(b: Bytes, from: Int) -> Int = match bytes_position(b, from, space) { Some(i) -> i, None -> 0 - 1 }
+
+fn position_by(f: (Bytes, Int, (Int) -> Bool) -> Option<Int>, b: Bytes) -> Int = match f(b, 0, space) { Some(i) -> i, None -> 0 - 1 }
+
+fn spaced(b: Bytes) -> Int = position_by(bytes_position, b)
+
+fn mapped(n: Int) -> Int = { let by = |f: (List<Int>, (Int) -> Int) -> List<Int>| f(range(0, n), inc); fold(by(map), 0, add) }
+
+fn kept(n: Int) -> Int = { let by = |f: (List<Int>, (Int) -> Bool) -> List<Int>| f(range(0, n), |x: Int| x % 2 == 0); len(by(filter)) }
+
+fn folded(n: Int) -> Int = { let by = |f: (List<Int>, Int, (Int, Int) -> Int) -> Int| f(range(0, n), 0, add); by(fold) }
+
+fn iterated(n: Int) -> Int = { let by = |f: (Int, Int, (Int) -> Iter<Int, Int>) -> Int| f(n, 1000, |s: Int| if s <= 0 { Stop(s - 100) } else { Continue(s - 1) }); by(iterate) }
+
+fn map_folded(n: Int) -> Int = { let by = |f: (Map<Int, Int>, Int, (Int, Int, Int) -> Int) -> Int| f(map_insert(map_insert(map_new(), 2, n), 1, 3), 0, |acc: Int, k: Int, v: Int| acc * 10 + k + v); by(map_fold) }
+
+fn updated_by(n: Int) -> Int = { let by = |f: (Map<Int, Int>, Int, (Int) -> Int) -> Map<Int, Int>| f(map_insert(map_new(), 1, n), 1, inc); match map_get(by(map_update), 1) { Some(v) -> v, None -> 0 - 1 } }
+"#;
+
+/// A builtin that calls back into the program answers whether it is named or passed as a value.
+#[test]
+fn a_callback_builtin_answers_named_and_as_a_value() {
+    let (_, unit) = unit(CALLBACK_BUILTINS);
+    let refused: Vec<String> = unit
+        .refusals()
+        .iter()
+        .filter(|(f, _)| f.starts_with("m."))
+        .map(|(f, c)| format!("{f}: {c}"))
+        .collect();
+    assert!(refused.is_empty(), "{refused:#?}");
+    let spaced = || Value::bytes(b"ab cd ef");
+    let cases: &[(&str, Vec<Value>, Value)] = &[
+        ("m.updated", vec![Value::Int(5)], Value::Int(301)),
+        ("m.updated_beside", vec![Value::Int(5)], Value::Int(506)),
+        ("m.updated_by_decimal", vec![Value::Int(5)], Value::Int(15)),
+        ("m.space_from", vec![spaced(), Value::Int(0)], Value::Int(2)),
+        ("m.space_from", vec![spaced(), Value::Int(3)], Value::Int(5)),
+        (
+            "m.space_from",
+            vec![spaced(), Value::Int(6)],
+            Value::Int(-1),
+        ),
+        (
+            "m.space_from",
+            vec![spaced(), Value::Int(8)],
+            Value::Int(-1),
+        ),
+        ("m.spaced", vec![spaced()], Value::Int(2)),
+        ("m.spaced", vec![Value::bytes(b"abcd")], Value::Int(-1)),
+        ("m.mapped", vec![Value::Int(4)], Value::Int(10)),
+        ("m.kept", vec![Value::Int(7)], Value::Int(4)),
+        ("m.folded", vec![Value::Int(10)], Value::Int(45)),
+        ("m.iterated", vec![Value::Int(5)], Value::Int(-100)),
+        ("m.map_folded", vec![Value::Int(4)], Value::Int(46)),
+        ("m.updated_by", vec![Value::Int(5)], Value::Int(6)),
+    ];
+    for (name, args, want) in cases {
+        let got = call(unit, name, args);
+        assert_eq!(
+            got.as_ref(),
+            Some(want),
+            "`{name}{args:?}` answered {got:?}, not {want:?}"
+        );
+    }
+    let past = raised(unit, "m.space_from", &[spaced(), Value::Int(9)]);
+    assert!(
+        past.message
+            .contains("`bytes_position` start 9 is outside a value of 8 bytes"),
+        "{past:?}"
+    );
+}
+
 #[test]
 fn a_definition_the_fragment_has_no_body_for_is_declined() {
     let (_, unit) = unit(ARITHMETIC);

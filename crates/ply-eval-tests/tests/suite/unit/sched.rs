@@ -1,12 +1,11 @@
 use ply_eval::arena::Slot;
-use ply_eval::cont::SimId;
 use ply_eval::host::{HostRuntime, MachineId, Pending};
 use ply_eval::region::{StepSite, Trail};
 use ply_eval::sched::*;
 use ply_eval::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use ply_eval::sim::{Answer, Handlers, signature};
 use ply_eval::{
-    Diagnostic, EffectAtom, Mode, Resource, SourceId, Span, Symbol, TaskHandle, Value, codes,
+    Diagnostic, EffectAtom, Mode, Resource, SimId, SourceId, Span, Symbol, TaskHandle, Value, codes,
 };
 
 type Sched = Scheduler<usize, Value>;
