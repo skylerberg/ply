@@ -31,6 +31,12 @@ mark=$caches/ply-c-corpus.mark
 grants=(--host --timeout 900000 --steps 0 --json
   --exec "ply=$ply" --allow machine --allow claims --fs work=. --fs "repo=$root")
 
+# Where a `ply test` spent its time, from its report: the front end, the C the backend emitted and
+# compiled, and the tests. A lane is mostly the first two, so this is what the cut is tuned on.
+spent() {
+  jq -r '"spent: front end \((.front_end.phases.total // 0) / 1000 | floor)s, C \((.backend.analysis_nanos // 0) / 1e9 | floor)s, tests \((.summary.duration_ms // 0) / 1000 | floor)s"' "$1" 2>/dev/null
+}
+
 run_one() {
   local id=$1 line path filter status=0 selected out
   shift
@@ -44,6 +50,7 @@ run_one() {
     "$ply" test "$path" ${filter:+--filter "$filter"} "${grants[@]}" "$@" > "$out" || status=$?
   fi
   jq -r '.results[]? | "\(.status)\t\(.key // .name)"' "$out" 2>/dev/null
+  spent "$out"
   selected=$(jq -s 'map(.results // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
   if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
     [ "$selected" -gt 0 ] || echo "corpus run $id selected no test (filter: ${filter:-none})" >&2
@@ -70,6 +77,7 @@ run_checks() {
   out=$(mktemp)
   "$ply" test "$path" "${args[@]}" "${grants[@]}" > "$out" || status=$?
   jq -r '.results[]? | "\(.status)\t\(.key // .name)"' "$out" 2>/dev/null
+  spent "$out"
   for i in "${!ids[@]}"; do
     n=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.key | contains($f))] | length' "$out" 2>/dev/null || echo 0)
     ms=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.key | contains($f)) | .duration_ms] | add // 0 | floor' "$out" 2>/dev/null || echo 0)
