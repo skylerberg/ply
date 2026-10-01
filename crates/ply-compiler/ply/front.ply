@@ -379,7 +379,7 @@ fn law_row(l: LawInfo, lits: List<Bytes>) -> LawRow =
     literals: lits,
   }
 
-fn op_row(module: Int, o: OpInfo) -> OpRow =
+fn op_row(module: Int, o: OpInfo, cr: Carrier) -> OpRow =
   {
     name: o.name,
     mode: mode_text(o.mode),
@@ -388,16 +388,17 @@ fn op_row(module: Int, o: OpInfo) -> OpRow =
     ret: canonical_type(o.ret),
     scheme: match o.scheme { Some(sc) -> Some(canonical_scheme(sc)), None -> None },
     at: span_at(module, o.at.span),
+    carries: map(carries(cr, [], o.params), grounded),
   }
 
-fn effect_row(e: EffectInfo, public: Bool) -> EffectRow =
+fn effect_row(e: EffectInfo, public: Bool, cr: Carrier) -> EffectRow =
   {
     name: e.name,
     module: e.module,
     simple_name: e.simple_name,
     public: public,
     nondet: e.nondet,
-    ops: map(e.ops, |o: OpInfo| op_row(e.at.module, o)),
+    ops: map(e.ops, |o: OpInfo| op_row(e.at.module, o, cr)),
     at: loc_at(e.at),
   }
 
@@ -710,13 +711,23 @@ fn root_keys(mods: List<Mod>, c: Front, h: HashOutput) -> List<KeyRow> = {
 // One root the emitter offers: a definition, a spec clause, a test or a law part, with the arity
 // its body is emitted at and whether every parameter and the answer is `Int` or `Bool`. `pure` is
 // a definition's published purity, which lets a memo answer for it; any other root runs each time.
-type EmitRoot = { root: Bytes, arity: Int, scalar: Bool, width: Bool, pure: Bool, at: At }
+// `params` and `answer` say how what it is entered with and answers read at the seam.
+type EmitRoot = {
+  root: Bytes,
+  arity: Int,
+  scalar: Bool,
+  pure: Bool,
+  at: At,
+  params: List<Carry>,
+  answer: Carry,
+}
 
 // The span of a root the tables do not place: a test or law whose check output has no row.
 fn no_at() -> At = { module: no_module(), start: 0, end: 0 }
 
-/// One constructor, with its arity; the emitter orders tags by position here.
-type EmitCtor = { name: Bytes, arity: Int }
+/// One constructor, with its arity and how its fields read over its type's parameters; the
+/// emitter orders tags by position here.
+type EmitCtor = { name: Bytes, arity: Int, fields: List<Carry> }
 
 // The walk's per-module place and its running place; `ordinal` counts tests, `law_ordinal` laws.
 type EmitTables = { fns: List<EmitRoot>, tests: List<EmitRoot>, specs: List<EmitRoot> }
@@ -730,31 +741,161 @@ type EmitWalk = {
 
 // The prelude's constructors, then each module's in program order: the order the emitted C
 // names tags by, which is not `CheckOutput::ctors`' dependency order.
-fn emit_ctors_of(mods: List<Mod>, c: Front) -> List<EmitCtor> = {
+fn emit_ctors_of(mods: List<Mod>, c: Front, cr: Carrier) -> List<EmitCtor> = {
   let prelude = filter(c.ctors, |k: CtorInfo| bytes_len(k.module) == 0);
   let rest = fold(mods, [], |acc: List<CtorInfo>, m: Mod|
     append(acc, filter(c.ctors, |k: CtorInfo| k.module == m.name)));
-  map(append(prelude, rest), |k: CtorInfo| { name: k.name, arity: k.arity })
+  map(append(prelude, rest), |k: CtorInfo|
+    { name: k.name, arity: k.arity, fields: carries(cr, k.scheme.ty_vars, k.fields) })
 }
 
-// A fixed width, which a value crossing the compiled seam cannot carry: it is held there as
-// a tagged `Int`, so a root whose scheme mentions one is not offered at the seam.
-fn width_type_name(name: Bytes) -> Bool =
-  name == b"U8" || name == b"U16" || name == b"U32" || name == b"U64" || name == b"I8"
-    || name == b"I16"
-    || name == b"I32"
-    || name == b"I64"
-    || name == b"U128"
-    || name == b"I128"
+// --- How a value reads at the compiled seam ------------------------------------
 
-fn mentions_width(t: Type) -> Bool =
+// Compiled code holds a width below 64 bits as a tagged `Int`, so only a value's type tells a `U8`
+// from an `Int`; every other word says what it is. A carry is that type, cut to what decides a
+// reading: `CPlain` where no width can sit, `CSum` a sum type at its parameters, whose
+// constructor's fields read as its declaration types them, and `CVar` a type variable of the
+// scheme around it, or a parameter of the declaration, by number. A function's words are never
+// read, but a function the prover generated shows what its variables are.
+pub type Carry =
+  | CPlain
+  | CWidth(Int)
+  | CList(Carry)
+  | CMap(Carry, Carry)
+  | CRecord(List<CarriedField>)
+  | CSum(List<Carry>)
+  | CFn(List<Carry>, Carry)
+  | CVar(Int)
+
+pub type CarriedField = { name: Bytes, carry: Carry }
+
+// A fixed width by the runtime's numbering, `ply_eval::INT_TYPES`.
+fn width_number(name: Bytes) -> Option<Int> =
+  if name == b"U8" { Some(0) }
+  else if name == b"U16" { Some(1) }
+  else if name == b"U32" { Some(2) }
+  else if name == b"U64" { Some(3) }
+  else if name == b"I8" { Some(4) }
+  else if name == b"I16" { Some(5) }
+  else if name == b"I32" { Some(6) }
+  else if name == b"I64" { Some(7) }
+  else if name == b"U128" { Some(8) }
+  else if name == b"I128" { Some(9) }
+  else { None }
+
+// Each sum type, and whether it holds a width whatever its parameters are.
+type Carrier = { sums: Map<Bytes, Bool> }
+
+fn carrier_of(ctors: List<CtorInfo>) -> Carrier = {
+  let held = holding_widths(ctors, []);
+  {
+    sums: map_of_entries(
+      map(ctors, |k: CtorInfo| { key: k.type_name, value: contains_bytes(held, k.type_name) }),
+    ),
+  }
+}
+
+// Grown to a fixpoint: a type may hold a width through itself or through another type.
+fn holding_widths(ctors: List<CtorInfo>, held: List<Bytes>) -> List<Bytes> = {
+  let grown = fold(ctors, held, |acc: List<Bytes>, k: CtorInfo|
+    if contains_bytes(acc, k.type_name) { acc }
+    else if fold(k.fields, false, |b: Bool, t: Type| b || reaches_width(t, acc)) {
+      push(acc, k.type_name)
+    } else { acc });
+  if len(grown) == len(held) { held } else { holding_widths(ctors, grown) }
+}
+
+// A function is a closure's word, which no reading looks inside.
+fn reaches_width(t: Type, held: List<Bytes>) -> Bool =
   match t {
     TyVar(_) -> false,
     TyCon(c) ->
-      width_type_name(c.name) || fold(c.args, false, |acc: Bool, a: Type| acc || mentions_width(a)),
-    TyFn(f) ->
-      fold(f.params, false, |acc: Bool, a: Type| acc || mentions_width(a)) || mentions_width(f.ret),
-    TyRecord(fields) -> fold(fields, false, |acc: Bool, f: Field| acc || mentions_width(f.ty)),
+      width_number(c.name) != None || contains_bytes(held, c.name)
+        || fold(c.args, false, |b: Bool, a: Type| b || reaches_width(a, held)),
+    TyFn(_) -> false,
+    TyRecord(fs) -> fold(fs, false, |b: Bool, f: Field| b || reaches_width(f.ty, held)),
+  }
+
+fn is_plain(c: Carry) -> Bool = match c { CPlain -> true, _ -> false }
+
+// `t`'s carry, each type variable numbered by its place in `vars`, and one not there past them.
+fn carry(cr: Carrier, vars: List<Int>, t: Type) -> Carry =
+  match t {
+    TyVar(v) -> CVar(var_number(vars, v)),
+    TyCon(c) -> match width_number(c.name) {
+      Some(n) -> CWidth(n),
+      None -> {
+        let args = carries(cr, vars, c.args);
+        let plain = fold(args, true, |b: Bool, a: Carry| b && is_plain(a));
+        if c.name == b"List" && len(args) == 1 { if plain { CPlain } else { CList(at(args, 0)) } }
+        else if c.name == b"Map" && len(args) == 2 {
+          if plain { CPlain } else { CMap(at(args, 0), at(args, 1)) }
+        } else {
+          match map_get(cr.sums, c.name) {
+            Some(holds) -> if holds || !plain { CSum(args) } else { CPlain },
+            None -> CPlain,
+          }
+        }
+      },
+    },
+    TyFn(f) -> {
+      let params = carries(cr, vars, f.params);
+      let ret = carry(cr, vars, f.ret);
+      if is_plain(ret) && fold(params, true, |b: Bool, p: Carry| b && is_plain(p)) { CPlain }
+      else { CFn(params, ret) }
+    },
+    TyRecord(fs) -> {
+      let fields = map(fs, |f: Field| { name: f.name, carry: carry(cr, vars, f.ty) });
+      if fold(fields, true, |b: Bool, f: CarriedField| b && is_plain(f.carry)) { CPlain }
+      else { CRecord(fields) }
+    },
+  }
+
+fn carries(cr: Carrier, vars: List<Int>, ts: List<Type>) -> List<Carry> =
+  map(ts, |t: Type| carry(cr, vars, t))
+
+// An operation's type variable is fixed where it is performed, which its host never sees: a value
+// there reads as it is, and the host takes it by its own contract.
+fn grounded(c: Carry) -> Carry =
+  match c {
+    CVar(_) -> CPlain,
+    CList(x) -> {
+      let g = grounded(x);
+      if is_plain(g) { CPlain } else { CList(g) }
+    },
+    CMap(k, v) -> {
+      let gk = grounded(k);
+      let gv = grounded(v);
+      if is_plain(gk) && is_plain(gv) { CPlain } else { CMap(gk, gv) }
+    },
+    CRecord(fs) -> {
+      let gs = map(fs, |f: CarriedField| { name: f.name, carry: grounded(f.carry) });
+      if fold(gs, true, |b: Bool, f: CarriedField| b && is_plain(f.carry)) { CPlain }
+      else { CRecord(gs) }
+    },
+    CSum(ps) -> CSum(map(ps, grounded)),
+    CFn(ps, r) -> {
+      let gs = map(ps, grounded);
+      let gr = grounded(r);
+      if is_plain(gr) && fold(gs, true, |b: Bool, p: Carry| b && is_plain(p)) { CPlain }
+      else { CFn(gs, gr) }
+    },
+    other -> other,
+  }
+
+fn var_number(vars: List<Int>, v: Int) -> Int =
+  fold(range(0, len(vars)), len(vars) + v, |acc: Int, i: Int|
+    if acc >= len(vars) && at(vars, i) == v { i } else { acc })
+
+// The type variables `ts` name, in the order they first appear.
+fn vars_in(ts: List<Type>) -> List<Int> = fold(ts, [], vars_of)
+
+fn vars_of(seen: List<Int>, t: Type) -> List<Int> =
+  match t {
+    TyVar(v) -> if contains_int(seen, v) { seen } else { push(seen, v) },
+    TyCon(c) -> fold(c.args, seen, vars_of),
+    TyFn(f) -> vars_of(fold(f.params, seen, vars_of), f.ret),
+    TyRecord(fs) -> fold(fs, seen, |acc: List<Int>, f: Field| vars_of(acc, f.ty)),
   }
 
 fn emit_is_scalar(t: Type) -> Bool =
@@ -766,8 +907,11 @@ fn emit_signature(t: Type) -> { params: List<Type>, ret: Type } =
 fn emit_scalar_params(ts: List<Type>) -> Bool =
   fold(ts, true, |ok: Bool, t: Type| ok && emit_is_scalar(t))
 
-// Every root is built here, so what the seam reads of it comes from the types it carries.
+// Every root is built here, so what the seam reads of it comes from the types it carries. `vars`
+// numbers the type variables those types share.
 fn emit_root(
+  cr: Carrier,
+  vars: List<Int>,
   root: Bytes,
   params: List<Type>,
   answer: Type,
@@ -779,18 +923,24 @@ fn emit_root(
     root: root,
     arity: len(params) + labels,
     scalar: emit_scalar_params(params) && emit_is_scalar(answer),
-    width: fold(push(params, answer), false, |acc: Bool, t: Type| acc || mentions_width(t)),
     pure: pure,
     at: place,
+    params: carries(cr, vars, params),
+    answer: carry(cr, vars, answer),
   }
 
-fn emit_proposition(root: Bytes, params: List<Type>, place: At) -> EmitRoot =
-  emit_root(root, params, t_bool(), 0, false, place)
+fn emit_proposition(
+  cr: Carrier,
+  vars: List<Int>,
+  root: Bytes,
+  params: List<Type>,
+  place: At,
+) -> EmitRoot = emit_root(cr, vars, root, params, t_bool(), 0, false, place)
 
 // Every root the emitter offers: the functions in source order, then the tests, then the spec
 // clauses and law parts. A label parameter is a trailing `Word` of the emitted body, so an
 // arity counts it.
-fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
+fn emit_roots(mods: List<Mod>, c: Front, cr: Carrier) -> List<EmitRoot> = {
   let defs = map_of_entries(map(c.defs, |d: DefInfo| { key: d.name, value: d }));
   let laws = map_of_entries(map(c.laws, |l: LawInfo| { key: l.key, value: l }));
   let tests = map_of_entries(map(c.tests, |t: TestInfo| { key: t.key, value: t }));
@@ -806,8 +956,11 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
               None -> a,
               Some(def) -> {
                 let sig = emit_signature(def.scheme.ty);
+                let vars = def.scheme.ty_vars;
                 let place = span_at(def.at.module, def.at.span);
                 let fn_row = emit_root(
+                  cr,
+                  vars,
                   name,
                   sig.params,
                   sig.ret,
@@ -822,13 +975,19 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
                     match at(d.spec, i).kind {
                       SRequires -> {
                         let root = key_clause_root(name, b"requires", b.requires);
-                        let row = emit_proposition(root, sig.params, place);
+                        let row = emit_proposition(cr, vars, root, sig.params, place);
                         { rows: push(b.rows, row), requires: b.requires + 1, ensures: b.ensures }
                       },
                       // `ensures` also takes `result`.
                       SEnsures -> {
                         let root = key_clause_root(name, b"ensures", b.ensures);
-                        let row = emit_proposition(root, push(sig.params, sig.ret), place);
+                        let row = emit_proposition(
+                          cr,
+                          vars,
+                          root,
+                          push(sig.params, sig.ret),
+                          place,
+                        );
                         { rows: push(b.rows, row), requires: b.requires, ensures: b.ensures + 1 }
                       },
                     }
@@ -844,7 +1003,7 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
               None -> no_at(),
             };
             let root = qualify(m.name, key_test_root(a.ordinal));
-            let row = emit_root(root, [], t_unit(), 0, false, place);
+            let row = emit_root(cr, [], root, [], t_unit(), 0, false, place);
             { ..a, tests: push(a.tests, row), ordinal: a.ordinal + 1 }
           },
           ILaw(d) -> {
@@ -852,9 +1011,16 @@ fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
             let law = map_get(laws, name);
             let guarded = match law { Some(l) -> l.has_guard, None -> false };
             let binders = match law { Some(l) -> map(l.binders, |b: LawBinder| b.ty), None -> [] };
+            let vars = vars_in(binders);
             let place = match law { Some(l) -> span_at(l.at.module, l.at.span), None -> no_at() };
             let rows = map(if guarded { [b"guard", b"body"] } else { [b"body"] }, |part: Bytes|
-              emit_proposition(qualify(m.name, key_law_root(a.law_ordinal, part)), binders, place));
+              emit_proposition(
+                cr,
+                vars,
+                qualify(m.name, key_law_root(a.law_ordinal, part)),
+                binders,
+                place,
+              ));
             { ..a, specs: append(a.specs, rows), law_ordinal: a.law_ordinal + 1 }
           },
           _ -> a,
@@ -900,6 +1066,7 @@ fn tables(
   let effs = effect_written(mods);
   let names = test_name_spans(mods);
   let lits = law_literals(mods);
+  let cr = carrier_of(c.ctors);
   {
     diags: map(warnings, answered_diag),
     order: map(r.order, |i: Int| at(mods, i).name),
@@ -911,13 +1078,13 @@ fn tables(
     types: type_rows(mods),
     tests: map(range(0, len(c.tests)), |i: Int| test_row(at(c.tests, i), at(names, i))),
     laws: map(range(0, len(c.laws)), |i: Int| law_row(at(c.laws, i), at(lits, i))),
-    effects: map(c.effects, |e: EffectInfo| effect_row(e, effect_public_of(effs, e))),
+    effects: map(c.effects, |e: EffectInfo| effect_row(e, effect_public_of(effs, e), cr)),
     ctors: map(c.ctors, ctor_row),
     hashes: hash_rows(index, h),
     hashes_digest: digest(h),
     keys: root_keys(mods, c, h),
-    emit_roots: emit_roots(mods, c),
-    emit_ctors: emit_ctors_of(mods, c),
+    emit_roots: emit_roots(mods, c, cr),
+    emit_ctors: emit_ctors_of(mods, c, cr),
     ordinals: map(mods, ordinal_row),
     bodies: h.bodies,
     test_bodies: h.test_bodies,
@@ -2040,6 +2207,7 @@ pub type LawRow = {
   literals: List<Bytes>,
 }
 
+// `carries` says how each argument a host handler is given reads at the compiled seam.
 pub type OpRow = {
   name: Bytes,
   mode: Bytes,
@@ -2048,6 +2216,7 @@ pub type OpRow = {
   ret: Type,
   scheme: Option<Scheme>,
   at: At,
+  carries: List<Carry>,
 }
 
 pub type EffectRow = {
@@ -2185,25 +2354,67 @@ test "a root is pure only as a definition with no row and no constraint" {
   ])
 }
 
-test "a root mentions a width only where a value it is entered with or answers does" {
+test "a root carries a width exactly where a value it is entered with or answers is one" {
   let src = b"fn low_bit(b: U8) -> Int requires int_of_u8(b) < 200 ensures result < 2 = int_of_u8(b & 1u8)\nfn narrow(n: Int) -> U8 requires n >= 0 ensures int_of_u8(result) == n = u8_of_int(n)\nfn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\ntest \"t\" { assert_eq(inc(1), 2) }\nlaw \"low\" forall (b: U8) where int_of_u8(b) > 0 { low_bit(b) < 2 }\nlaw \"grows\" forall (x: Int) where x > 0 { inc(x) > x }";
   let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
-  assert_eq(map(d.emit_roots, |r: EmitRoot| { root: r.root, width: r.width }), [
-    { root: b"m.low_bit", width: true },
-    { root: b"m.narrow", width: true },
-    { root: b"m.inc", width: false },
-    { root: b"m.test#0", width: false },
-    { root: b"m.low_bit#requires#0", width: true },
-    { root: b"m.low_bit#ensures#0", width: true },
-    { root: b"m.narrow#requires#0", width: false },
-    { root: b"m.narrow#ensures#0", width: true },
-    { root: b"m.inc#requires#0", width: false },
-    { root: b"m.inc#ensures#0", width: false },
-    { root: b"m.law#0.guard", width: true },
-    { root: b"m.law#0.body", width: true },
-    { root: b"m.law#1.guard", width: false },
-    { root: b"m.law#1.body", width: false },
-  ])
+  assert_eq(
+    map(d.emit_roots, |r: EmitRoot| { root: r.root, params: r.params, answer: r.answer }),
+    [
+      { root: b"m.low_bit", params: [CWidth(0)], answer: CPlain },
+      { root: b"m.narrow", params: [CPlain], answer: CWidth(0) },
+      { root: b"m.inc", params: [CPlain], answer: CPlain },
+      { root: b"m.test#0", params: [], answer: CPlain },
+      { root: b"m.low_bit#requires#0", params: [CWidth(0)], answer: CPlain },
+      { root: b"m.low_bit#ensures#0", params: [CWidth(0), CPlain], answer: CPlain },
+      { root: b"m.narrow#requires#0", params: [CPlain], answer: CPlain },
+      { root: b"m.narrow#ensures#0", params: [CPlain, CWidth(0)], answer: CPlain },
+      { root: b"m.inc#requires#0", params: [CPlain], answer: CPlain },
+      { root: b"m.inc#ensures#0", params: [CPlain, CPlain], answer: CPlain },
+      { root: b"m.law#0.guard", params: [CWidth(0)], answer: CPlain },
+      { root: b"m.law#0.body", params: [CWidth(0)], answer: CPlain },
+      { root: b"m.law#1.guard", params: [CPlain], answer: CPlain },
+      { root: b"m.law#1.body", params: [CPlain], answer: CPlain },
+    ],
+  )
+}
+
+test "a carry follows a width into lists, maps, records, sum types, functions and variables" {
+  let src = b"effect probe { write put(xs: List<U8>, n: Int) -> Unit }\ntype Byte = | Byte(U8)\ntype Tree = | Leaf | Node(Tree, I16, Tree)\ntype Pair<a, b> = | Pair(b, a)\ntype Color = | Red | Green\nfn wrap(xs: List<U8>) -> List<Byte> = map(xs, |x: U8| Byte(x))\nfn pick<a>(xs: List<a>, r: { v: I16, n: Int }) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\nfn swap(m: Map<String, I8>) -> Pair<Int, U64> = Pair(u64_of_int(1), 0)\nfn plain(c: Color, o: Option<Int>) -> Tree = Leaf\nfn apply<a>(f: (Int) -> a, x: Int) -> a = f(x)\nfn sent(xs: List<U8>) -> Unit / { probe.write } = probe.put(xs, 1)";
+  let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
+  assert_eq(
+    map(d.emit_roots, |r: EmitRoot| { root: r.root, params: r.params, answer: r.answer }),
+    [
+      { root: b"m.wrap", params: [CList(CWidth(0))], answer: CList(CSum([])) },
+      {
+        root: b"m.pick",
+        params: [
+          CList(CVar(0)),
+          CRecord([{ name: b"n", carry: CPlain }, { name: b"v", carry: CWidth(5) }]),
+        ],
+        answer: CSum([CVar(0)]),
+      },
+      { root: b"m.swap", params: [CMap(CPlain, CWidth(4))], answer: CSum([CPlain, CWidth(3)]) },
+      // A sum type that holds no width at these parameters reads as it is; one that holds a width
+      // through itself does whatever its parameters.
+      { root: b"m.plain", params: [CPlain, CPlain], answer: CSum([]) },
+      { root: b"m.apply", params: [CFn([CPlain], CVar(0)), CPlain], answer: CVar(0) },
+      { root: b"m.sent", params: [CList(CWidth(0))], answer: CPlain },
+    ],
+  );
+  assert_eq(map(effect_named(d, b"m.probe").ops, |o: OpRow| o.carries), [
+    [CList(CWidth(0)), CPlain],
+  ]);
+  let own = filter(d.emit_ctors, |k: EmitCtor| bytes_slice(k.name, 0, 2) == b"m.");
+  assert_eq(map(own, |k: EmitCtor| { name: k.name, fields: k.fields }), [
+    { name: b"m.Byte", fields: [CWidth(0)] },
+    { name: b"m.Leaf", fields: [] },
+    { name: b"m.Node", fields: [CSum([]), CWidth(5), CSum([])] },
+    { name: b"m.Pair", fields: [CVar(1), CVar(0)] },
+    { name: b"m.Red", fields: [] },
+    { name: b"m.Green", fields: [] },
+  ]);
+  let some = filter(d.emit_ctors, |k: EmitCtor| k.name == b"Some");
+  assert_eq(map(some, |k: EmitCtor| k.fields), [[CVar(0)]])
 }
 
 test "a program's answer holds its warnings, its order, its packages and its modules" {
@@ -2305,6 +2516,7 @@ test "an effect's row holds each operation with its mode, its types and its span
       ret: con_named(b"Unit"),
       scheme: None,
       at: { module: 0, start: 13, end: 38 },
+      carries: [CPlain],
     },
   ]);
   assert_eq(log.at, { module: 0, start: 0, end: 40 })
