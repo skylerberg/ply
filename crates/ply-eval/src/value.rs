@@ -2,7 +2,6 @@ use crate::arena::Slot;
 use crate::builtins::Builtin;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::sched::TaskHandle;
-use crate::sim::TaskId;
 use crate::{Diagnostic, IntTy, Span, Symbol, codes};
 use rpds::RedBlackTreeMap;
 pub use rust_decimal::Decimal;
@@ -152,7 +151,7 @@ pub enum Value {
     Closure(Arc<Closure>),
     /// An index and generation, so a cell of a closed region reads `None` instead of aliasing.
     Cell(Slot),
-    /// Compared by its task's id; its count is what tells a production region the task can retire.
+    /// Compared by region and id; its count is what tells a production region the task can retire.
     Task(TaskHandle),
     /// A credential; a distinct variant rather than a `Ctor`, so no pattern match can unwrap it.
     Secret(Arc<Value>),
@@ -399,9 +398,9 @@ impl Value {
         }
     }
 
-    pub fn as_task(&self, span: Span, what: &str) -> Result<TaskId, Diagnostic> {
+    pub fn as_task(&self, span: Span, what: &str) -> Result<&TaskHandle, Diagnostic> {
         match self {
-            Value::Task(handle) => Ok(handle.id()),
+            Value::Task(handle) => Ok(handle),
             other => Err(type_error(span, what, "Task", other)),
         }
     }
@@ -669,7 +668,7 @@ impl Ord for Value {
                 grow(|| n1.cmp(n2).then_with(|| a1.iter().cmp(a2.iter())))
             }
             (Value::Cell(x), Value::Cell(y)) => x.cmp(y),
-            (Value::Task(x), Value::Task(y)) => x.id().cmp(&y.id()),
+            (Value::Task(x), Value::Task(y)) => (x.region(), x.id()).cmp(&(y.region(), y.id())),
             // Unreachable from a well-typed program: a `Secret` has no order.
             (Value::Secret(x), Value::Secret(y)) => grow(|| x.cmp(y)),
             (Value::Closure(_), Value::Closure(_)) => Ordering::Equal,
@@ -860,7 +859,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             });
         }
         (Value::Cell(x), Value::Cell(y)) => x == y,
-        (Value::Task(x), Value::Task(y)) => x.id() == y.id(),
+        (Value::Task(x), Value::Task(y)) => x.region() == y.region() && x.id() == y.id(),
         (Value::Secret(x), Value::Secret(y)) => {
             return descend(span, depth, || match (&**x, &**y) {
                 (Value::Str(p), Value::Str(q)) => Ok(constant_time_eq(p.as_bytes(), q.as_bytes())),

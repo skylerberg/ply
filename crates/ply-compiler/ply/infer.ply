@@ -160,7 +160,10 @@ pub type LabelSite = { module: Int, span: Span, labels: List<Bytes> }
 pub type OperandSite = { module: Int, span: Span, ty: Bytes }
 type OperandAt = { module: Int, span: Span, ty: Type }
 type Assumed = { deriver: Deriver, vars: List<Int> }
-type SpawnSite = { span: Span, ty: Type }
+// A clause of a `handle` around a spawn, typed as the function its task calls by performing `op`.
+type ClauseSite = { span: Span, op: Atom, ty: Type }
+// `around` holds the clauses of every `handle` between the spawn and the region's open.
+type SpawnSite = { span: Span, ty: Type, around: List<ClauseSite> }
 type HandoffSite = { span: Span, ty: Type, op: Bytes }
 type OpenRegion = {
   name: Bytes,
@@ -184,7 +187,10 @@ type RegionSite = {
 // What may not outlive a region: a `with_cell[r]` region's cells, a `simulate` region's tasks.
 type Brand = | CellsOf(Bytes) | Tasks
 type Opened = { name: Bytes, span: Span }
-// `cells` are the bindings in scope at the open that hold a cell; `writes` go to `older` regions.
+// A local bound outside the innermost `simulate` region, named inside it.
+type Crossing = { name: Bytes, span: Span }
+type CellAccess = { span: Span, region: Bytes }
+// `cells` hold a cell at the open, `writes` and `reads` reach `older` regions' cells, `entering` brings a task.
 type Simulation = {
   module: Int,
   span: Span,
@@ -194,7 +200,9 @@ type Simulation = {
   exits: List<Span>,
   older: List<Opened>,
   cells: List<{ name: Bytes, ty: Type }>,
-  writes: List<{ span: Span, region: Bytes }>,
+  writes: List<CellAccess>,
+  reads: List<CellAccess>,
+  entering: List<{ name: Bytes, span: Span, ty: Type }>,
 }
 // `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
 type RigidParam = { name: Bytes, v: Int }
@@ -277,6 +285,9 @@ type Cx = {
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
   simulate_depth: Int,
+  // The scopes open around the innermost `simulate` body, and the locals of those it names.
+  sim_scope: Int,
+  crossings: List<Crossing>,
   open_regions: List<OpenRegion>,
   regions: List<RegionSite>,
   simulations: List<Simulation>,
@@ -2846,7 +2857,7 @@ fn infer_var(cx: Cx, q: QName) -> Inferred = {
       match env_lookup(k.cx.env, key.name) {
         Some(sc) -> {
           let inst = instantiate_with(sc, k.cx.fresh);
-          let c: Cx = { ..k.cx, fresh: inst.f };
+          let c: Cx = crossed({ ..k.cx, fresh: inst.f }, key.name, q.span);
           let noted: Cx = note_constraints(
             note_map_keys(c, q.span, inst.ty),
             q.span,
@@ -2865,6 +2876,16 @@ fn infer_var(cx: Cx, q: QName) -> Inferred = {
     },
   }
 }
+
+fn crossed(cx: Cx, name: Bytes, span: Span) -> Cx =
+  if cx.sim_scope == 0 { cx } else {
+    match env_depth_of(cx.env, name) {
+      Some(d) -> if d > 0 && d < cx.sim_scope {
+        { ..cx, crossings: push(cx.crossings, { name: name, span: span }) }
+      } else { cx },
+      None -> cx,
+    }
+  }
 
 // `Int` and the eight widths are the integer types; the bit operators are defined at those nine only.
 fn is_int_name(n: Bytes) -> Bool =
@@ -4383,7 +4404,15 @@ fn infer_perform(
   }
 }
 
-type HandleAcc = { cx: Cx, handled: List<Atom>, selected: List<OpKey>, clause_rows: Row }
+type HandleAcc = {
+  cx: Cx,
+  handled: List<Atom>,
+  selected: List<OpKey>,
+  clause_rows: Row,
+  around: List<ClauseSite>,
+}
+
+fn spawn_counts(cx: Cx) -> List<Int> = map(cx.open_regions, |r: OpenRegion| len(r.spawns))
 
 fn infer_handle(
   cx: Cx,
@@ -4394,6 +4423,7 @@ fn infer_handle(
 ) -> Inferred = {
   let mark = len(cx.performs);
   let b: Inferred = infer(cx, body);
+  let spawned = { before: spawn_counts(cx), after: spawn_counts(b.cx) };
   let general = fold(clauses, false, |acc: Bool, c: HandleClause|
     acc || (match c.resume { Some(_) -> true, None -> false }));
   let cont: { cx: Cx, v: Option<Int> } = if general {
@@ -4406,7 +4436,7 @@ fn infer_handle(
   } else { { cx: cont.cx, t: None } };
   let walked: HandleAcc = fold(
     clauses,
-    { cx: result_var.cx, handled: [], selected: [], clause_rows: row_empty() },
+    { cx: result_var.cx, handled: [], selected: [], clause_rows: row_empty(), around: [] },
     |acc: HandleAcc, clause: HandleClause| {
       let r: WithHit = resolve_op(acc.cx, clause.eff, clause.op);
       match r.hit {
@@ -4540,6 +4570,11 @@ fn infer_handle(
                   handled: atoms_insert(acc.handled, atom),
                   selected: push(acc.selected, key),
                   clause_rows: j.r,
+                  around: push(acc.around, {
+                    span: clause.span,
+                    op: { ..atom, op: Some(hit.op.name) },
+                    ty: t_fn(shape.params, shape.ret, body_.row),
+                  }),
                 }
               }
             },
@@ -4549,14 +4584,15 @@ fn infer_handle(
     },
   );
   let body_mark = len(b.cx.performs);
+  let under: Cx = spawned_under(walked.cx, spawned.before, spawned.after, walked.around);
   let returned = match ret {
     Some(rc) -> {
-      let pushed: Cx = { ..walked.cx, env: env_push(walked.cx.env) };
+      let pushed: Cx = { ..under, env: env_push(under.env) };
       let bound: Cx = { ..pushed, env: env_bind(pushed.env, rc.binder.name, mono(b.ty)) };
       let o: Inferred = infer(bound, rc.body);
       { cx: { ..o.cx, env: env_pop(o.cx.env) }, ty: o.ty, row: o.row }
     },
-    None -> { cx: walked.cx, ty: b.ty, row: row_empty() },
+    None -> { cx: under, ty: b.ty, row: row_empty() },
   };
   let agreed: Cx = match result_var.t {
     Some(t) ->
@@ -4779,7 +4815,26 @@ fn close_region(cx: Cx) -> ClosedRegion = {
 }
 
 fn sites_of(args: List<Expr>, tys: List<Type>) -> List<SpawnSite> =
-  map(range(0, len(args)), |i: Int| { span: expr_span(at(args, i)), ty: at(tys, i) })
+  map(range(0, len(args)), |i: Int| { span: expr_span(at(args, i)), ty: at(tys, i), around: [] })
+
+// The spawns each open region filed while a `handle`'s body ran perform against its clauses.
+fn spawned_under(cx: Cx, before: List<Int>, after: List<Int>, clauses: List<ClauseSite>) -> Cx =
+  if len(clauses) == 0 || before == after { cx } else {
+    {
+      ..cx,
+      open_regions: map(range(0, len(cx.open_regions)), |i: Int| {
+        let r = at(cx.open_regions, i);
+        {
+          ..r,
+          spawns: map(range(0, len(r.spawns)), |j: Int| {
+            let s = at(r.spawns, j);
+            if j >= at(before, i) && j < at(after, i) { { ..s, around: append(s.around, clauses) } }
+            else { s }
+          }),
+        }
+      }),
+    }
+  }
 
 // A `task.spawn` argument is filed against every open region with no `simulate` of its own between
 // the open and the spawn: that scheduler outlives the region, so its task can run past the close.
@@ -4901,31 +4956,83 @@ fn holds_cell(t: Type) -> Bool =
     TyVar(_) -> false,
   }
 
-// Every perform site that writes a cell of a region in `older`, the direct and the called alike.
-fn older_writes(
+// Every perform site of `mode` on a cell of a region in `older`, the direct and the called alike.
+fn older_cells(
+  cx: Cx,
   sites: List<PerformSite>,
   older: List<Opened>,
-) -> List<{ span: Span, region: Bytes }> =
-  fold(sites, [], |acc: List<{ span: Span, region: Bytes }>, s: PerformSite|
-    match s.atom.resource {
-      RNamed(r) -> if s.atom.effect == cell() && mode_eq(s.atom.mode, MWrite)
+  mode: Mode,
+) -> List<CellAccess> =
+  fold(sites, [], |acc: List<CellAccess>, s: PerformSite| {
+    let a = resolve_atom(cx.subst, s.atom);
+    match a.resource {
+      RNamed(r) -> if a.effect == cell() && mode_eq(a.mode, mode)
           && fold(older, false, |b: Bool, o: Opened| b || o.name == r) {
         push(acc, { span: s.span, region: r })
       } else { acc },
       _ -> acc,
+    }
+  })
+
+// By the types at the open: a binding whose type mentions a task only inside the region holds none.
+fn task_carriers(cx: Cx) -> List<{ name: Bytes, ty: Type }> =
+  fold(
+    env_locals(cx.env),
+    [],
+    |acc: List<{ name: Bytes, ty: Type }>, l: { name: Bytes, sc: Scheme }|
+      match env_lookup(cx.env, l.name) {
+        Some(sc) -> {
+          let ty = resolve(cx, sc.ty);
+          if holds_task(ty)
+              && !fold(acc, false, |b: Bool, x: { name: Bytes, ty: Type }| b || x.name == l.name) {
+            push(acc, { name: l.name, ty: ty })
+          } else { acc }
+        },
+        None -> acc,
+      },
+  )
+
+// A name the body takes from outside is the innermost binding of it, the one the open saw.
+fn carried_in(
+  xs: List<Crossing>,
+  carriers: List<{ name: Bytes, ty: Type }>,
+) -> List<{ name: Bytes, span: Span, ty: Type }> =
+  fold(xs, [], |acc: List<{ name: Bytes, span: Span, ty: Type }>, x: Crossing|
+    if fold(acc, false, |b: Bool, y: { name: Bytes, span: Span, ty: Type }| b || y.name == x.name) {
+      acc
+    } else {
+      match fold(carriers, None, |found: Option<Type>, k: { name: Bytes, ty: Type }|
+          match found {
+            Some(_) -> found,
+            None -> if k.name == x.name { Some(k.ty) } else { None },
+          }) {
+        Some(ty) -> push(acc, { name: x.name, span: x.span, ty: ty }),
+        None -> acc,
+      }
     })
 
 fn infer_simulate(cx: Cx, span: Span, body: Expr) -> Inferred = {
   let mark = len(cx.performs);
+  let crossed_at = len(cx.crossings);
   let older = map(cx.open_regions, |r: OpenRegion| { name: r.name, span: r.span });
   let cells = filter(
     map(env_locals(cx.env), |l: { name: Bytes, sc: Scheme }| { name: l.name, ty: l.sc.ty }),
     |l: { name: Bytes, ty: Type }| holds_cell(resolve(cx, l.ty)),
   );
-  let b: Inferred = infer({ ..cx, simulate_depth: cx.simulate_depth + 1 }, body);
-  let c: Cx = { ..b.cx, simulate_depth: b.cx.simulate_depth - 1 };
+  let carriers = task_carriers(cx);
+  let b: Inferred = infer(
+    { ..cx, simulate_depth: cx.simulate_depth + 1, sim_scope: len(cx.env.scopes) },
+    body,
+  );
+  let c: Cx = {
+    ..b.cx,
+    simulate_depth: b.cx.simulate_depth - 1,
+    sim_scope: cx.sim_scope,
+    crossings: take(b.cx.crossings, crossed_at),
+  };
   let handled = simulated_atoms();
   let discharged: Cx = discharge(c, mark, len(c.performs), handled);
+  let inside = drop(discharged.performs, mark);
   let noted: Cx = {
     ..discharged,
     simulations: push(discharged.simulations, {
@@ -4937,7 +5044,9 @@ fn infer_simulate(cx: Cx, span: Span, body: Expr) -> Inferred = {
       exits: region_exits(body, []),
       older: older,
       cells: cells,
-      writes: older_writes(drop(discharged.performs, mark), older),
+      writes: older_cells(discharged, inside, older, MWrite),
+      reads: older_cells(discharged, inside, older, MRead),
+      entering: carried_in(drop(b.cx.crossings, crossed_at), carriers),
     }),
   };
   let seed = seed_atom();
@@ -7019,9 +7128,113 @@ fn check_simulations(cx: Cx) -> Cx = {
     let nested: Cx = if atoms_contains(resolve_r(c, site.body_row).atoms, seed) {
       nested_simulation(c, site, sites)
     } else { c };
-    check_older_writes(check_simulation_exits(nested, site), site)
+    check_older_reads(
+      check_entering(check_older_writes(check_simulation_exits(nested, site), site), site),
+      site,
+    )
   })
 }
+
+// A closure's captures are not in its type, and a cell's contents enter a region only when read.
+fn holds_task(t: Type) -> Bool =
+  match t {
+    TyCon(c) ->
+      c.name == b"Task"
+        || (c.name != b"Cell" && fold(c.args, false, |b: Bool, a: Type| b || holds_task(a))),
+    TyRecord(fs) -> fold(fs, false, |b: Bool, f: Field| b || holds_task(f.ty)),
+    TyFn(_) -> false,
+    TyVar(_) -> false,
+  }
+
+fn entered() -> Bytes = b"a task enters a `simulate` region that did not spawn it"
+
+fn own_scheduler(site: Simulation) -> Label =
+  lab(
+    site.module,
+    site.span,
+    false,
+    b"the `simulate` region opens here, with a scheduler of its own",
+  )
+
+fn numbered_apart() -> Bytes =
+  b"a `Task` is a key into the scheduler that spawned it, and this region's scheduler numbers its own tasks, so the key names one of them or none"
+
+fn check_entering(cx: Cx, site: Simulation) -> Cx =
+  fold(site.entering, cx, |c: Cx, x: { name: Bytes, span: Span, ty: Type }|
+    err_labels(
+      c,
+      b"E0413",
+      entered(),
+      [
+        lab(
+          site.module,
+          x.span,
+          true,
+          bytes_concat_all([
+            b"`",
+            x.name,
+            b"` has type `",
+            type_text(x.ty),
+            b"`, and it was bound outside the region",
+          ]),
+        ),
+        own_scheduler(site),
+      ],
+      [
+        numbered_apart(),
+        b"spawn the task inside the region, or join it where it was spawned and pass in what it answers",
+      ],
+    ))
+
+// A region that also writes the cell is refused for the write, whose remedy covers the read.
+fn check_older_reads(cx: Cx, site: Simulation) -> Cx =
+  fold(site.older, cx, |c: Cx, o: Opened|
+    match first_access(site.reads, o.name) {
+      None -> c,
+      Some(at_) -> if first_access(site.writes, o.name) != None { c } else {
+        match task_holder(c, site.cells, o.name) {
+          None -> c,
+          Some(b) ->
+            err_labels(
+              c,
+              b"E0413",
+              entered(),
+              [
+                lab(
+                  site.module,
+                  at_,
+                  true,
+                  bytes_concat_all([
+                    b"this reads `",
+                    o.name,
+                    b"`, where `",
+                    b.name,
+                    b"` has type `",
+                    type_text(b.ty),
+                    b"`",
+                  ]),
+                ),
+                lab(
+                  site.module,
+                  o.span,
+                  false,
+                  bytes_concat_all([b"`", o.name, b"` opens here, before the region"]),
+                ),
+                own_scheduler(site),
+              ],
+              [
+                bytes_concat_all([
+                  b"`",
+                  o.name,
+                  b"` outlives the region, so a task its cells hold was spawned outside it",
+                ]),
+                numbered_apart(),
+                b"open the cell inside the `simulate` region, or keep what the tasks answered in it instead of the tasks",
+              ],
+            ),
+        }
+      },
+    })
 
 fn check_simulation_exits(cx: Cx, site: Simulation) -> Cx = {
   let ty = resolve(cx, site.body_ty);
@@ -7047,7 +7260,7 @@ fn check_simulation_exits(cx: Cx, site: Simulation) -> Cx = {
 // `Task` is written in types, so a store into a cell typed to hold one shows only as the write.
 fn check_older_writes(cx: Cx, site: Simulation) -> Cx =
   fold(site.older, cx, |c: Cx, o: Opened|
-    match first_write(site.writes, o.name) {
+    match first_access(site.writes, o.name) {
       None -> c,
       Some(at_) -> match task_holder(c, site.cells, o.name) {
         None -> c,
@@ -7096,8 +7309,8 @@ fn check_older_writes(cx: Cx, site: Simulation) -> Cx =
       },
     })
 
-fn first_write(writes: List<{ span: Span, region: Bytes }>, region: Bytes) -> Option<Span> =
-  fold(writes, None, |acc: Option<Span>, w: { span: Span, region: Bytes }|
+fn first_access(xs: List<CellAccess>, region: Bytes) -> Option<Span> =
+  fold(xs, None, |acc: Option<Span>, w: CellAccess|
     match acc { Some(_) -> acc, None -> if w.region == region { Some(w.span) } else { None } })
 
 fn task_holder(
@@ -7285,6 +7498,12 @@ fn check_region_stores(cx: Cx, site: RegionSite) -> Cx =
     } else { c }
   })
 
+fn outlived() -> List<Bytes> =
+  [
+    b"the scheduler that runs the task was installed outside the region, so the task can still be running when the region's memory is gone",
+    b"a `join` inside the region is not enough: nothing in the types says the task was joined, and a task nobody joins runs on after the region's `}`",
+  ]
+
 fn check_region_spawns(cx: Cx, site: RegionSite) -> Cx =
   fold(site.spawns, cx, |c: Cx, s: SpawnSite| {
     let ty = resolve(c, s.ty);
@@ -7306,9 +7525,8 @@ fn check_region_spawns(cx: Cx, site: RegionSite) -> Cx =
           ),
           lab(site.module, site.span, false, opens_here(site.name)),
         ],
-        [
-          b"the scheduler that runs the task was installed outside the region, so the task can still be running when the region's memory is gone",
-          b"a `join` inside the region is not enough: nothing in the types says the task was joined, and a task nobody joins runs on after the region's `}`",
+        push(
+          outlived(),
           bytes_concat_all([
             b"open the `simulate` region inside `with_cell[",
             site.name,
@@ -7316,10 +7534,89 @@ fn check_region_spawns(cx: Cx, site: RegionSite) -> Cx =
             site.name,
             b"`",
           ]),
-        ],
+        ),
       )
-    } else { c }
+    } else {
+      match reaching_clause(c, ty, s.around, site.name) {
+        None -> c,
+        Some(cl) -> {
+          let op = tick(
+            bytes_concat_all([
+              as_written({ ..c, module: site.module }, cl.op.effect),
+              b".",
+              match cl.op.op { Some(o) -> o, None -> mode_key(cl.op.mode) },
+            ]),
+          );
+          err_labels(
+            c,
+            b"E0446",
+            bytes_concat_all([
+              b"a value allocated in region `",
+              site.name,
+              b"` reaches another task through a handler around its spawn",
+            ]),
+            [
+              lab(
+                site.module,
+                s.span,
+                true,
+                bytes_concat_all([
+                  b"this task performs ",
+                  op,
+                  b", which a handler around the spawn answers",
+                ]),
+              ),
+              lab(
+                site.module,
+                cl.span,
+                false,
+                bytes_concat_all([b"this clause answers it, and reaches `", site.name, b"`"]),
+              ),
+              lab(site.module, site.span, false, opens_here(site.name)),
+            ],
+            append(
+              [
+                b"a task performs against the handlers around its `task.spawn`, so the clause runs on the task's behalf, whenever the task runs",
+              ],
+              push(
+                outlived(),
+                bytes_concat_all([
+                  b"open the `simulate` region inside `with_cell[",
+                  site.name,
+                  b"]`, or answer ",
+                  op,
+                  b" without touching `",
+                  site.name,
+                  b"`",
+                ]),
+              ),
+            ),
+          )
+        },
+      }
+    }
   })
+
+// The first clause around a spawn that its task can perform against and that reaches region `n`.
+fn reaching_clause(cx: Cx, task: Type, around: List<ClauseSite>, n: Bytes) -> Option<ClauseSite> =
+  fold(around, None, |acc: Option<ClauseSite>, cl: ClauseSite|
+    match acc {
+      Some(_) -> acc,
+      None -> if may_perform(task, cl.op) && brand_in(resolve(cx, cl.ty), CellsOf(n)) { Some(cl) }
+      else { None },
+    })
+
+// On any label: an open row may perform anything.
+fn may_perform(task: Type, op: Atom) -> Bool =
+  match task {
+    TyFn(f) ->
+      f.effects.tail != None
+        || fold(f.effects.atoms, false, |b: Bool, a: Atom|
+          b
+            || (a.effect == op.effect
+            && (a.op == op.op || (a.op == None && mode_eq(a.mode, op.mode))))),
+    _ -> true,
+  }
 
 fn check_region_handoffs(cx: Cx, site: RegionSite) -> Cx =
   fold(site.handoffs, cx, |c: Cx, h: HandoffSite| {
@@ -7502,6 +7799,8 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
     updates: [],
     update_shapes: [],
     simulate_depth: 0,
+    sim_scope: 0,
+    crossings: [],
     open_regions: [],
     regions: [],
     simulations: [],
@@ -8782,11 +9081,19 @@ test "a closure that captured a task leaves its `simulate` region by its row, an
     ),
     [[b"E0413", b"a task escapes the `simulate` region that spawned it", b"|| task.join(t)"]],
   );
+  // The region the closure opens is entered by the task as well.
   assert_eq(
-    check_codes(
+    refusals(
       b"fn later() -> () -> Int / {sim.read} = simulate { let t = task.spawn(|| 1); || simulate { task.join(t) } }",
     ),
-    [b"E0413"],
+    [
+      [b"E0413", b"a task enters a `simulate` region that did not spawn it", b"t"],
+      [
+        b"E0413",
+        b"a task escapes the `simulate` region that spawned it",
+        b"|| simulate { task.join(t) }",
+      ],
+    ],
   );
   assert_eq(
     check_codes(
@@ -8824,6 +9131,112 @@ test "a task stored in a cell older than its `simulate` region is refused, and i
   assert_eq(
     check_codes(
       b"fn listed() -> Int = { let none = []; let wait = |t| task.join(t); simulate { fold(push(none, task.spawn(|| 1)), 0, |n: Int, t: Task<Int>| n + wait(t)) } }",
+    ),
+    [],
+  )
+}
+
+test "a task from outside a `simulate` region is refused where the region names it or reads it" {
+  assert_eq(refusals(b"fn joined(t: Task<Int>) -> Int = simulate { task.join(t) }"), [
+    [b"E0413", b"a task enters a `simulate` region that did not spawn it", b"t"],
+  ]);
+  assert_eq(
+    check_codes(
+      b"fn captured(t: Task<Int>) -> Int = simulate { let wait = || task.join(t); wait() }",
+    ),
+    [b"E0413"],
+  );
+  assert_eq(
+    check_codes(
+      b"fn listed(ts: List<Task<Int>>) -> Int = simulate { fold(ts, 0, |n: Int, t: Task<Int>| n + task.join(t)) }",
+    ),
+    [b"E0413"],
+  );
+  assert_eq(
+    refusals(
+      b"fn read(t: Task<Int>) -> Int = with_cell[r](Some(t)) { c -> simulate { match cell_get(c) { Some(x) -> task.join(x), None -> 0 } } }",
+    ),
+    [[b"E0413", b"a task enters a `simulate` region that did not spawn it", b"cell_get(c)"]],
+  )
+}
+
+test "a `simulate` region keeps its own tasks, a name it shadows, and a function that only takes one" {
+  assert_eq(
+    check_codes(b"fn own() -> Int = simulate { let t = task.spawn(|| 1); task.join(t) }"),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"fn shadowed(t: Task<Int>) -> Int = task.join(t) + simulate { let t = task.spawn(|| 1); task.join(t) }",
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"fn handed(wait: (Task<Int>) -> Int / {task.join}) -> Int = simulate { wait(task.spawn(|| 1)) }",
+    ),
+    [],
+  )
+}
+
+fn noted(body: Bytes) -> Bytes =
+  bytes_concat(
+    b"effect note { read say() -> Int }\nfn work() -> Int / {note.read} = note.say()\n",
+    body,
+  )
+
+test "a task reaching a younger region's cell through a handler around its spawn is refused" {
+  let leak = noted(
+    b"fn leak() -> Task<Int> / {task.write} = with_cell[s](5) { c -> handle { task.spawn(|| work()) } with { note.say() -> cell_get(c) } }",
+  );
+  assert_eq(refusals(leak), [
+    [
+      b"E0446",
+      b"a value allocated in region `s` reaches another task through a handler around its spawn",
+      b"|| work()",
+    ],
+  ]);
+  assert_eq(
+    check_codes(
+      noted(
+        b"fn cycle() -> Int = simulate { with_cell[s](5) { c -> handle { task.join(task.spawn(|| work())) } with { note.say() -> cell_get(c) } } }",
+      ),
+    ),
+    [b"E0446"],
+  )
+}
+
+test "a handler around a spawn may answer from a cell the task cannot outlive, or for the spawner alone" {
+  assert_eq(
+    check_codes(
+      noted(
+        b"fn kept() -> Task<Int> / {task.write} = with_cell[s](5) { c -> handle { task.spawn(|| work()) } with { note.say() -> 7 } }",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      noted(
+        b"fn root() -> Int / {task.write} = with_cell[s](5) { c -> handle { let t = task.spawn(|| 1); note.say() + task.join(t) } with { note.say() -> cell_get(c) } }",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      noted(
+        b"fn inside() -> Int = with_cell[s](5) { c -> simulate { handle { task.join(task.spawn(|| work())) } with { note.say() -> cell_get(c) } } }",
+      ),
+    ),
+    [],
+  );
+  // A spawn a callee performs is judged where the callee opens regions of its own.
+  assert_eq(
+    check_codes(
+      noted(
+        b"fn spawned(n: Int, running: List<Task<Int>>) -> List<Task<Int>> / {task.write, note.read} = if n <= 0 { running } else { spawned(n - 1, push(running, task.spawn(|| work()))) }\nfn joined(ts: List<Task<Int>>) -> Int / {task.write} = fold(ts, 0, |n: Int, t: Task<Int>| n + task.join(t))\nfn serve() -> Int / {task.write} = with_cell[store](1) { c -> handle { joined(spawned(2, [])) } with { note.say() -> cell_get(c) } }",
+      ),
     ),
     [],
   )

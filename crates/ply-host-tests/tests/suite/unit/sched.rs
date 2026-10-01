@@ -251,7 +251,11 @@ fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
                             held.push(handle.clone());
                             sched.suspend(suspended(), Value::Task(handle))?;
                         }
-                        Act::Join(id) => sched.join(suspended(), TaskId(id), Span::DUMMY)?,
+                        Act::Join(id) => sched.join(
+                            suspended(),
+                            &TaskHandle::unowned(SimId(0), TaskId(id)),
+                            Span::DUMMY,
+                        )?,
                         Act::Wait(delay) => {
                             let pending = jobs().submit(delay, task.0 as i64);
                             sched.park_on_host(suspended(), pending, Span::DUMMY, rt)?;
