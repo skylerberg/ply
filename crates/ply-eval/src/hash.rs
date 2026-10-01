@@ -68,19 +68,9 @@ impl<'de> Deserialize<'de> for DefHash {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HashOutput {
     pub defs: IndexMap<Symbol, DefHash>,
-    /// `defs` with references by name, so it moves only with a definition's own text.
-    pub own: IndexMap<Symbol, DefHash>,
     /// `type` and `effect` declarations; `defs` holds only `fn`s, which a test can be selected on.
     pub decls: IndexMap<Symbol, DefHash>,
     pub tests: Vec<DefHash>,
-    /// Parallel to `CheckOutput::laws`.
-    pub laws: Vec<DefHash>,
-    /// Definition program-wide name -> one hash per `requires` / `ensures` clause, in source order.
-    pub specs: IndexMap<Symbol, Vec<DefHash>>,
-    /// The same clauses as `specs`, as sentences: references by name, and no owner hash.
-    pub spec_texts: IndexMap<Symbol, Vec<DefHash>>,
-    /// Parallel to `laws`; a sentence identity like [`HashOutput::spec_texts`].
-    pub law_texts: Vec<DefHash>,
     /// Direct references, definition name -> names it mentions.
     pub deps: IndexMap<Symbol, Vec<Symbol>>,
     /// Transitive closure, including the definition itself.

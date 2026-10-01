@@ -31,9 +31,10 @@ fn main() {
         }
     };
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    // Every command family's ops are lent unconfigured; the program configures what it drives.
+    // Every command family's ops are lent unconfigured to the `ply` program, which is this
+    // binary's own; the program configures what it drives.
     let binds = ply_machine::artifact::Binds {
-        lent: lent_all(),
+        lent: ply_machine::policy::all(),
         trust: ply_launcher::trust(),
         ..ply_machine::artifact::Binds::default()
     };
@@ -49,13 +50,4 @@ fn main() {
         }
     };
     std::process::exit(code);
-}
-
-/// The ops any command may perform, each configured by the program itself: every family the
-/// policy names, lent to the `ply` program, which is this binary's own.
-fn lent_all() -> Vec<(
-    ply_eval::host::HostOp,
-    std::sync::Arc<dyn ply_eval::host::HostHandler>,
-)> {
-    ply_machine::policy::all()
 }

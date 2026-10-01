@@ -8,9 +8,7 @@ use ply_eval::host::{
     HostRuntime, Linearity, MachineId, Pending,
 };
 use ply_eval::{Diagnostic, Seed, Span, Symbol, Value, codes};
-use ply_machine::engine::{
-    Binder, Hosting, Judgement, Mode, Obligation, ObligationKind, Prover, Strategy,
-};
+use ply_machine::engine::{Hosting, Judgement, Mode, Obligation, ObligationKind, Prover, Strategy};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,43 +40,30 @@ fn capped(n: Int) -> Int
 = if n > 10 { 10 } else { n }
 "#;
 
-fn binder(name: &str, text: &str) -> Binder {
-    Binder {
-        name: Symbol::new(name),
-        text: text.to_string(),
-    }
-}
-
-fn claim(owner: &str, kind: ObligationKind, binders: Vec<Binder>, guards: usize) -> Obligation {
+fn claim(owner: &str, kind: ObligationKind, guards: usize) -> Obligation {
     Obligation {
         owner: Symbol::new(owner),
         kind,
         span: Span::DUMMY,
-        binders,
-        result: None,
+        result: false,
         strategy: Strategy::Static,
         guards: vec![Span::DUMMY; guards],
     }
 }
 
 fn over_a_bool(owner: &str) -> Obligation {
-    claim(owner, ObligationKind::Law, vec![binder("b", "Bool")], 0)
+    claim(owner, ObligationKind::Law, 0)
 }
 
 fn over_an_int(owner: &str, guards: usize) -> Obligation {
-    claim(owner, ObligationKind::Law, vec![binder("n", "Int")], guards)
+    claim(owner, ObligationKind::Law, guards)
 }
 
 /// `capped`'s `ensures` clause `index`, under its one `requires`.
 fn capped(index: usize) -> Obligation {
     Obligation {
-        result: Some(binder("result", "Int")),
-        ..claim(
-            "m.capped",
-            ObligationKind::Ensures { index },
-            vec![binder("n", "Int")],
-            1,
-        )
+        result: true,
+        ..claim("m.capped", ObligationKind::Ensures { index }, 1)
     }
 }
 
@@ -201,16 +186,11 @@ fn an_ensures_calls_its_owner_for_the_result_it_states() {
     );
 }
 
-/// A binder the law does not take makes the tier decline the entry: Ply's failure, never the
+/// A value the law takes no binder for makes the tier decline the entry: Ply's failure, never the
 /// program's raise.
 #[test]
 fn an_entry_the_tier_declines_is_plys_failure() {
-    let mismatched = claim(
-        "m.halving a choice",
-        ObligationKind::Law,
-        vec![binder("b", "Bool"), binder("spare", "Bool")],
-        0,
-    );
+    let mismatched = over_a_bool("m.halving a choice");
     let judgements = judged(
         &mismatched,
         &[
