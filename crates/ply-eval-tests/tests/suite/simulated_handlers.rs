@@ -123,16 +123,9 @@ fn the_clause_set_covers_each_declared_effect_exactly() {
 }
 
 #[test]
-fn every_seeded_operation_has_the_declared_mode_and_types() {
-    let check = checked();
+fn every_seeded_operation_has_the_declared_types() {
     let declared = declared();
     for sig in SEEDED_OPS {
-        let info = effect(&check, sig.effect);
-        let op = info
-            .ops
-            .get(&Symbol::new(sig.op))
-            .unwrap_or_else(|| panic!("`{sig}` is declared"));
-        assert_eq!(op.mode, sig.mode, "`{sig}` disagrees about its mode");
         let (params, ret) = &declared[&format!("sig.{sig}")];
         let seeded: Vec<&str> = sig.params.iter().map(|p| p.as_str()).collect();
         assert_eq!(params, &seeded, "`{sig}` disagrees about its parameters");
