@@ -9,7 +9,9 @@ use ply_eval::{
     Symbol, Value, codes,
 };
 use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
-use ply_prove::{Binder, Binding, Discharge, Fault, Obligation, ObligationKind, ProvePlan, Strategy};
+use ply_prove::{
+    Binder, Binding, Discharge, Fault, Obligation, ObligationKind, ProvePlan, Strategy,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -209,13 +211,13 @@ pub enum Mode {
 
 impl Mode {
     fn ends(self, judgement: &Judgement) -> bool {
-        match (self, judgement) {
-            (_, Judgement::Faulted(_)) => true,
-            (Mode::Whole, Judgement::Failed | Judgement::Raised(_)) => true,
-            (Mode::Witness, Judgement::Held) => true,
-            (Mode::Domain, Judgement::Raised(_)) => true,
-            _ => false,
-        }
+        matches!(
+            (self, judgement),
+            (_, Judgement::Faulted(_))
+                | (Mode::Whole, Judgement::Failed | Judgement::Raised(_))
+                | (Mode::Witness, Judgement::Held)
+                | (Mode::Domain, Judgement::Raised(_))
+        )
     }
 }
 
@@ -246,9 +248,15 @@ fn unclaimed(obligation: &Obligation) -> Fault {
 fn unhosted(obligation: &Obligation) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("`{}` reaches the host, and this run binds none", obligation.owner),
+        format!(
+            "`{}` reaches the host, and this run binds none",
+            obligation.owner
+        ),
     )
-    .primary(obligation.span, "a `law/host` is judged against the host a run binds")
+    .primary(
+        obligation.span,
+        "a `law/host` is judged against the host a run binds",
+    )
     .note("the program judges a `law/host` only under `--host`; this is Ply's fault")
 }
 

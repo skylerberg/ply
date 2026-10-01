@@ -19,7 +19,6 @@ use std::time::Duration;
 /// Kept cases below which a run has concrete evidence and no coverage claim.
 pub const MIN_PROPERTY_CASES: u32 = 25;
 
-
 pub const DEFAULT_CASES: u32 = 200;
 pub const DEFAULT_PROVE_BUDGET: u32 = 10_000;
 pub const DEFAULT_SHRINK_BUDGET: u32 = 500;

@@ -835,7 +835,9 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                     use rayon::prelude::*;
                     batches
                         .par_iter()
-                        .map(|batch| judge_batch(&ready.prover, &obligations[batch.claim], &job.plan, batch))
+                        .map(|batch| {
+                            judge_batch(&ready.prover, &obligations[batch.claim], &job.plan, batch)
+                        })
                         .collect::<Vec<_>>()
                 };
                 let judged = match &pool {
@@ -853,7 +855,11 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                     return;
                 };
                 let discharge = match values_of(&points) {
-                    Ok(values) => ready.prover.searched(&obligations[claim], &job.plan, values, domain),
+                    Ok(values) => {
+                        ready
+                            .prover
+                            .searched(&obligations[claim], &job.plan, values, domain)
+                    }
                     Err(fault) => Discharge::Faulted(fault),
                 };
                 let _ = told.send(Step::Searched(Box::new(discharge)));
@@ -1020,7 +1026,12 @@ fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<Value>>, Fault> 
         })
 }
 
-fn judge_batch(prover: &crate::engine::Prover<'_>, obligation: &Obligation, plan: &ProvePlan, batch: &Batch) -> Vec<Judgement> {
+fn judge_batch(
+    prover: &crate::engine::Prover<'_>,
+    obligation: &Obligation,
+    plan: &ProvePlan,
+    batch: &Batch,
+) -> Vec<Judgement> {
     match values_of(&batch.points) {
         Ok(values) => prover.judged(obligation, plan, &values, batch.mode),
         Err(fault) => vec![Judgement::Faulted(*fault.diagnostic)],
@@ -1069,13 +1080,11 @@ struct Collection {
     host: bool,
 }
 
-
 struct Accepted {
     definitions: usize,
     stored: bool,
     warnings: Vec<Diagnostic>,
 }
-
 
 // --- The values the program reads -------------------------------------------------
 
@@ -1181,26 +1190,38 @@ fn rule_value(rule: &Rule) -> PlyValue {
         Rule::ExhaustiveEnumeration { domain, points } => case(
             "Rule",
             "ExhaustiveEnumeration",
-            fields(vec![("domain", PlyValue::str(domain.as_str())), ("points", tally(*points))]),
+            fields(vec![
+                ("domain", PlyValue::str(domain.as_str())),
+                ("points", tally(*points)),
+            ]),
         ),
         Rule::LinearArithmetic => case("Rule", "LinearArithmetic", Vec::new()),
         Rule::Propositional => case("Rule", "Propositional", Vec::new()),
         Rule::CaseSplit { ty, arms } => case(
             "Rule",
             "CaseSplit",
-            fields(vec![("ty", PlyValue::str(ty.as_str())), ("arms", tally(u64::from(*arms)))]),
+            fields(vec![
+                ("ty", PlyValue::str(ty.as_str())),
+                ("arms", tally(u64::from(*arms))),
+            ]),
         ),
         Rule::Congruence => case("Rule", "Congruence", Vec::new()),
         Rule::Injectivity => case("Rule", "Injectivity", Vec::new()),
         Rule::Unfold { def, depth } => case(
             "Rule",
             "Unfold",
-            fields(vec![("def", PlyValue::str(def.as_str())), ("depth", tally(u64::from(*depth)))]),
+            fields(vec![
+                ("def", PlyValue::str(def.as_str())),
+                ("depth", tally(u64::from(*depth))),
+            ]),
         ),
         Rule::Induction { binder, def } => case(
             "Rule",
             "Induction",
-            fields(vec![("binder", PlyValue::str(binder.as_str())), ("def", PlyValue::str(def.as_str()))]),
+            fields(vec![
+                ("binder", PlyValue::str(binder.as_str())),
+                ("def", PlyValue::str(def.as_str())),
+            ]),
         ),
         Rule::ExhaustiveInterleaving { interleavings } => case(
             "Rule",
@@ -1341,7 +1362,10 @@ fn judged_value(judgement: &Judgement) -> PlyValue {
             vec![record(vec![
                 ("code", PlyValue::str(diagnostic.code)),
                 ("message", PlyValue::str(&diagnostic.message)),
-                ("notes", strings(diagnostic.notes.iter().map(String::as_str))),
+                (
+                    "notes",
+                    strings(diagnostic.notes.iter().map(String::as_str)),
+                ),
                 ("values", shown_values(diagnostic)),
             ])],
         ),
@@ -1393,7 +1417,6 @@ fn outcome_value(discharge: &Discharge) -> PlyValue {
         Discharge::Faulted(fault) => case("Outcome", "Defect", vec![fault_value(fault)]),
     }
 }
-
 
 /// A baseline as the program reads one: the definition's hash and its spec, keyed by its name.
 fn record_value(name: &str, baseline: &ReviewRecord) -> PlyValue {
