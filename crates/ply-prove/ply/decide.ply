@@ -1,0 +1,216 @@
+// `decide` — the static proof tier: a decision procedure for the decidable fragment, and the
+// certificate a proof becomes.
+
+import compiler.code (Code)
+import context (Context)
+import goal (Goal, Binder, Limits, Reason, Open, BudgetSpent, Proof, Assertion, run, conjunction,
+             domain_inhabited, uninterpreted_sorts, float_in, int_ranges, with_true, appended)
+import induct (attempt)
+import lower (Lowering, Blocker, FloatTerm, lowering, bind_symbolic, lower_root, assume)
+import rules (Rule, RuleLog, no_rules, rules_of)
+import solve (Answer, Closed, Exhausted)
+import term (Terms, and, eq)
+
+pub type Decision =
+  | Proved(Proof)
+  | GuardUnsatisfiable(Int)
+  | Unknown({ reason: Reason, steps: Int })
+
+pub fn steps_of(d: Decision) -> Int =
+  match d { Proved(p) -> p.steps, GuardUnsatisfiable(s) -> s, Unknown(u) -> u.steps }
+
+// The word a report prints for it.
+pub fn decision_word(d: Decision) -> String =
+  match d {
+    Proved(_) -> "proved",
+    GuardUnsatisfiable(_) -> "guard_unsatisfiable",
+    Unknown(u) -> match u.reason { Open -> "open", BudgetSpent -> "budget_spent" },
+  }
+
+pub type Diagnosed = { decision: Decision, blockers: List<Blocker> }
+
+pub fn decide(cx: Context, g: Goal, limits: Limits) -> Decision =
+  decide_and_diagnose(cx, g, limits).decision
+
+fn inconclusive(a: Answer) -> Option<Reason> =
+  match a { Closed -> None, Exhausted -> Some(BudgetSpent), _ -> Some(Open) }
+
+pub fn decide_and_diagnose(cx: Context, g: Goal, limits: Limits) -> Diagnosed = {
+  let start = lowering(no_rules(), limits.unfold_depth);
+  let bound = fold(
+    g.binders,
+    { lw: start, ids: [] },
+    |acc: { lw: Lowering, ids: List<Int> }, b: Binder| {
+      let r = bind_symbolic(acc.lw, b.ty, cx);
+      { lw: r.lw, ids: push(acc.ids, r.id) }
+    },
+  );
+  // The evaluator stops at the first false `requires`, so a later one may assume the earlier.
+  let guarded = fold(
+    g.guards,
+    { lw: bound.lw, ids: [] },
+    |acc: { lw: Lowering, ids: List<Int> }, guard: Option<Code>| {
+      let r = lower_root(acc.lw, cx, guard, bound.ids);
+      { lw: assume(r.lw, r.id), ids: push(acc.ids, r.id) }
+    },
+  );
+  // Requirements before this mark decide the guard, so they may not assume it.
+  let guard_mark = len(guarded.lw.requirements);
+  let defined = match g.result {
+    Some(result_body) -> if len(bound.ids) == 0 { { lw: guarded.lw, def: None } } else {
+      let r = lower_root(guarded.lw, cx, result_body, take(bound.ids, len(bound.ids) - 1));
+      {
+        lw: r.lw,
+        def: Some({
+          symbol: match list_at(bound.ids, len(bound.ids) - 1) { Some(t) -> t, None -> 0 },
+          value: r.id,
+        }),
+      }
+    },
+    None -> { lw: guarded.lw, def: None },
+  };
+  let body = lower_root(defined.lw, cx, g.body, bound.ids);
+  let lw = body.lw;
+  let blockers = lw.blockers;
+  // `Float` is refused before any solver runs, so no proof or certificate can be built.
+  if lw.float || float_in(cx, lw.ts) {
+    {
+      decision: Unknown({ reason: Open, steps: 0 }),
+      blockers: if fold(blockers, false, |f: Bool, b: Blocker| f || b == FloatTerm) { blockers }
+      else { push(blockers, FloatTerm) },
+    }
+  } else {
+    let definition = match defined.def {
+      Some(d) -> {
+        let m = eq(lw.ts, d.symbol, d.value);
+        { ts: m.ts, eq: Some(m.id), symbol: Some(d.symbol) }
+      },
+      None -> { ts: lw.ts, eq: None, symbol: None },
+    };
+    let guards = map(guarded.ids, |t: Int| { term: t, polarity: true });
+    let ranges = int_ranges(definition.ts, definition.symbol, map_new());
+    let guard_needs = take(lw.requirements, guard_mark);
+    let body_needs = drop_front(lw.requirements, guard_mark);
+    // A guard that can raise has no domain, so the obligation is not decided at any tier.
+    let needed = conjunction(ranges.ts, guard_needs);
+    let checked = match needed.id {
+      None -> { ts: needed.ts, rules: lw.rules, budget: limits.steps, spent: 0, stop: None },
+      Some(conjoined) -> {
+        let r = run(
+          needed.ts,
+          cx,
+          lw.rules,
+          limits.steps,
+          limits,
+          push(ranges.out, { term: conjoined, polarity: false }),
+        );
+        {
+          ts: r.ts,
+          rules: r.rules,
+          budget: r.left,
+          spent: limits.steps - r.left,
+          stop: inconclusive(r.answer),
+        }
+      },
+    };
+    match checked.stop {
+      Some(reason) ->
+        { decision: Unknown({ reason: reason, steps: checked.spent }), blockers: blockers },
+      None -> {
+        let vacuity = if len(guards) == 0 {
+          { ts: checked.ts, budget: checked.budget, spent: checked.spent, vacuous: false }
+        } else {
+          let r = run(checked.ts, cx, no_rules(), checked.budget, limits, guards);
+          {
+            ts: r.ts,
+            budget: r.left,
+            spent: checked.spent + (checked.budget - r.left),
+            vacuous: r.answer == Closed,
+          }
+        };
+        if vacuity.vacuous { { decision: GuardUnsatisfiable(vacuity.spent), blockers: blockers } }
+        else {
+          let needs = conjunction(vacuity.ts, body_needs);
+          let claim = match needs.id {
+            Some(n) -> {
+              let m = and(needs.ts, body.id, n);
+              { ts: m.ts, id: m.id }
+            },
+            None -> { ts: needs.ts, id: body.id },
+          };
+          let assertions = push(
+            appended(appended(ranges.out, guards), match definition.eq {
+              Some(d) -> [{ term: d, polarity: true }],
+              None -> [],
+            }),
+            { term: claim.id, polarity: false },
+          );
+          let r = run(claim.ts, cx, checked.rules, vacuity.budget, limits, assertions);
+          let spent = vacuity.spent + (vacuity.budget - r.left);
+          match inconclusive(r.answer) {
+            Some(reason) -> {
+              let tried = attempt(cx, g, limits, r.left, spent, blockers);
+              match tried.proof {
+                Some(p) -> { decision: Proved(p), blockers: tried.blockers },
+                None ->
+                  { decision: Unknown({ reason: reason, steps: spent }), blockers: tried.blockers },
+              }
+            },
+            None -> {
+              let sat = if !domain_inhabited(cx, g.binders) { { ok: false, spent: spent } } else {
+                let all = conjunction(r.ts, guarded.ids);
+                match all.id {
+                  None -> { ok: true, spent: spent },
+                  // A valid guard over a non-empty domain admits a value.
+                  Some(a) -> {
+                    let v = run(all.ts, cx, no_rules(), r.left, limits, [
+                      { term: a, polarity: false },
+                    ]);
+                    { ok: v.answer == Closed, spent: spent + (r.left - v.left) }
+                  },
+                }
+              };
+              {
+                decision: Proved({
+                  rules: rules_of(r.rules),
+                  steps: sat.spent,
+                  sorts: uninterpreted_sorts(g.binders),
+                  guard_satisfiable: sat.ok,
+                }),
+                blockers: blockers,
+              }
+            },
+          }
+        }
+      },
+    }
+  }
+}
+
+// What a decision leaves the runtime to carry out: a certificate; one that stands once a kept case
+// witnesses the domain; a guard nothing satisfies; or nothing settled.
+pub type Static = | Certified(Settlement) | Unwitnessed(Settlement) | Unsatisfiable | Undecided
+
+pub type Settlement = { rules: List<Rule>, steps: Int, sorts: List<String> }
+
+pub fn static_of(d: Decision, variables: List<String>) -> Static =
+  match d {
+    GuardUnsatisfiable(_) -> Unsatisfiable,
+    Unknown(_) -> Undecided,
+    Proved(p) -> {
+      let s = {
+        rules: p.rules,
+        steps: p.steps,
+        sorts: map(p.sorts, |v: Int| match list_at(variables, v) { Some(n) -> n, None -> "" }),
+      };
+      if p.guard_satisfiable { Certified(s) } else { Unwitnessed(s) }
+    },
+  }
+
+fn take<a>(xs: List<a>, n: Int) -> List<a> =
+  fold(range(0, n), [], |acc: List<a>, i: Int|
+    match list_at(xs, i) { Some(x) -> push(acc, x), None -> acc })
+
+fn drop_front<a>(xs: List<a>, n: Int) -> List<a> =
+  fold(range(n, len(xs)), [], |acc: List<a>, i: Int|
+    match list_at(xs, i) { Some(x) -> push(acc, x), None -> acc })

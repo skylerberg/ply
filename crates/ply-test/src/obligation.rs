@@ -3,6 +3,7 @@
 use ply_eval::{DefHash, Diagnostic, codes};
 use ply_prove::{
     CaseReport, Certificate, Discharge, Evidence, Fault, Obligation, ProvePlan, ProveReport, Rule,
+    Static,
 };
 use ply_store::{
     CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule, Store,
@@ -133,11 +134,13 @@ pub struct Choice {
     pub to_discharge: Vec<usize>,
     /// Positions in `claims` the cache answered for, and the key each one's evidence is under.
     pub read: Vec<(usize, DefHash)>,
+    /// What the program's static prover answered for each of `to_discharge`, in order.
+    pub statics: Vec<Static>,
 }
 
 pub trait Discharger: Sync {
     /// Carries out the strategy the obligation holds.
-    fn discharge(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge;
+    fn discharge(&self, obligation: &Obligation, plan: &ProvePlan, settled: &Static) -> Discharge;
 }
 
 /// A program's decision, carried out up to what the cache answered, so a discharger is built only
@@ -146,7 +149,8 @@ pub struct Asked {
     obligations: Vec<Obligation>,
     /// The evidence read back for each position the cache answered for.
     cached: Vec<Option<Evidence>>,
-    to_discharge: Vec<usize>,
+    /// Each position to discharge, beside what the static prover answered for it.
+    to_discharge: Vec<(usize, Static)>,
     plan: ProvePlan,
     started: Instant,
 }
@@ -171,7 +175,12 @@ impl Asked {
         Asked {
             obligations,
             cached,
-            to_discharge: choice.to_discharge.clone(),
+            to_discharge: choice
+                .to_discharge
+                .iter()
+                .copied()
+                .zip(choice.statics.iter().cloned())
+                .collect(),
             plan: plan.clone().normalized(),
             started,
         }
@@ -193,8 +202,13 @@ impl Asked {
 
         let fresh: Vec<(usize, Discharge)> = to_discharge
             .par_iter()
-            .filter(|&&index| index < obligations.len())
-            .map(|&index| (index, discharger.discharge(&obligations[index], &plan)))
+            .filter(|(index, _)| *index < obligations.len())
+            .map(|(index, settled)| {
+                (
+                    *index,
+                    discharger.discharge(&obligations[*index], &plan, settled),
+                )
+            })
             .collect();
 
         let mut discharges: Vec<Option<Discharge>> = cached

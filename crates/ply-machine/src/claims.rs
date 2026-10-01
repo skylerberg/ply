@@ -22,8 +22,8 @@ use ply_eval::{DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, 
 use ply_prove::property::{GenStream, generate};
 use ply_prove::shrink::Target;
 use ply_prove::{
-    Binder, Discharge, Evidence, Fault, Gap, Obligation, ProvePlan, ProveReport, Tier, Vacuity,
-    VacuityKind, World,
+    Binder, Certificate, Discharge, Evidence, Fault, Gap, Obligation, ProvePlan, ProveReport, Rule,
+    Static, Tier, Vacuity, VacuityKind, World,
 };
 use ply_store::ReviewRecord;
 use ply_store::Store;
@@ -94,14 +94,13 @@ fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     ctor(home, name, args)
 }
 
-const OPERATIONS: [(&str, &str); 14] = [
+const OPERATIONS: [(&str, &str); 13] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
     ("outcomes", "ply_machine::claims::outcomes"),
     ("discharged", "ply_machine::claims::discharged"),
     ("record", "ply_machine::claims::record"),
     ("replay", "ply_machine::claims::replay"),
-    ("reaches", "ply_machine::claims::reaches"),
     ("shrink", "ply_machine::claims::shrink"),
     ("offers", "ply_machine::claims::offers"),
     ("would", "ply_machine::claims::would"),
@@ -232,7 +231,6 @@ impl HostHandler for Site {
                 u64::try_from(root.as_int(span, "the generator's root")?).unwrap_or(0),
                 u32::try_from(case.as_int(span, "the case to draw")?).unwrap_or(u32::MAX),
             )?,
-            ("reaches", [claims]) => self.reaches(indices(claims, span)?)?,
             ("baselines", [names]) => self.baselines(names_of(names, span)?)?,
             ("accepted", [records]) => self.accepted(records_of(records, span)?)?,
             (other, _) => return Err(unasked(other, span)),
@@ -244,11 +242,138 @@ impl HostHandler for Site {
 /// The decision, as the program sent it.
 fn choice_of(value: &PlyValue, span: Span) -> Result<obligation::Choice, Diagnostic> {
     use crate::payload::field_of;
+    let to_discharge = indices(field_of(value, "runs", span)?, span)?;
+    let statics = field_of(value, "statics", span)?
+        .as_list(span, "what the static prover answered")?
+        .iter()
+        .map(|settled| static_of(settled, span))
+        .collect::<Result<Vec<_>, _>>()?;
+    if statics.len() != to_discharge.len() {
+        return Err(malformed(
+            &format!(
+                "{} static answer(s) for {} claim(s) to discharge",
+                statics.len(),
+                to_discharge.len()
+            ),
+            span,
+        ));
+    }
     Ok(obligation::Choice {
         claims: indices(field_of(value, "claims", span)?, span)?,
-        to_discharge: indices(field_of(value, "runs", span)?, span)?,
+        to_discharge,
         read: filed_of(field_of(value, "read", span)?, span)?,
+        statics,
     })
+}
+
+/// A `proof.decide.Static`.
+fn static_of(value: &PlyValue, span: Span) -> Result<Static, Diagnostic> {
+    let (name, args) = case_of(value, "a static answer", span)?;
+    let settlement = || match args.first() {
+        Some(settled) => certificate_of(settled, span),
+        None => Err(malformed("a settlement is missing", span)),
+    };
+    Ok(match name {
+        "Certified" => Static::Proved(settlement()?),
+        "Unwitnessed" => Static::NeedsWitness(settlement()?),
+        "Unsatisfiable" => Static::Vacuous,
+        "Undecided" => Static::Inconclusive,
+        other => return Err(malformed(&format!("`{other}` is no static answer"), span)),
+    })
+}
+
+/// A `proof.decide.Settlement`: every certificate the program sends has its guard satisfied, by
+/// the prover or by the kept case that stands it.
+fn certificate_of(value: &PlyValue, span: Span) -> Result<Certificate, Diagnostic> {
+    use crate::payload::field_of;
+    Ok(Certificate {
+        rules: field_of(value, "rules", span)?
+            .as_list(span, "a proof's rules")?
+            .iter()
+            .map(|rule| rule_of(rule, span))
+            .collect::<Result<_, _>>()?,
+        steps: narrow(field_of(value, "steps", span)?, "a proof's steps", span)?,
+        guard_satisfiable: true,
+        sorts: field_of(value, "sorts", span)?
+            .as_list(span, "a proof's sorts")?
+            .iter()
+            .map(|sort| Ok(Symbol::new(sort.as_str(span, "a sort's name")?)))
+            .collect::<Result<_, Diagnostic>>()?,
+    })
+}
+
+/// A `proof.rules.Rule`.
+fn rule_of(value: &PlyValue, span: Span) -> Result<Rule, Diagnostic> {
+    use crate::payload::field_of;
+    let (name, args) = case_of(value, "a rule", span)?;
+    let fields = || {
+        args.first()
+            .ok_or_else(|| malformed(&format!("`{name}` is missing its fields"), span))
+    };
+    let field = |key: &str| field_of(fields()?, key, span);
+    let text = |key: &str| -> Result<Symbol, Diagnostic> {
+        Ok(Symbol::new(field(key)?.as_str(span, key)?))
+    };
+    Ok(match name {
+        "GroundEvaluation" => Rule::GroundEvaluation,
+        "ExhaustiveEnumeration" => Rule::ExhaustiveEnumeration {
+            domain: text("domain")?,
+            points: narrow(field("points")?, "points", span)?,
+        },
+        "LinearArithmetic" => Rule::LinearArithmetic,
+        "Propositional" => Rule::Propositional,
+        "CaseSplit" => Rule::CaseSplit {
+            ty: text("ty")?,
+            arms: narrow(field("arms")?, "arms", span)?,
+        },
+        "Congruence" => Rule::Congruence,
+        "Injectivity" => Rule::Injectivity,
+        "Unfold" => Rule::Unfold {
+            def: text("def")?,
+            depth: narrow(field("depth")?, "depth", span)?,
+        },
+        "Induction" => Rule::Induction {
+            binder: text("binder")?,
+            def: text("def")?,
+        },
+        "ExhaustiveInterleaving" => Rule::ExhaustiveInterleaving {
+            interleavings: narrow(fields()?, "interleavings", span)?,
+        },
+        other => return Err(malformed(&format!("`{other}` is no rule"), span)),
+    })
+}
+
+/// A constructor's simple name and its arguments.
+fn case_of<'v>(
+    value: &'v PlyValue,
+    what: &str,
+    span: Span,
+) -> Result<(&'v str, &'v [PlyValue]), Diagnostic> {
+    match value {
+        PlyValue::Ctor { name, args } => Ok((
+            name.as_str()
+                .rsplit_once('.')
+                .map_or(name.as_str(), |(_, simple)| simple),
+            args,
+        )),
+        _ => Err(malformed(&format!("{what} is no constructor"), span)),
+    }
+}
+
+/// A count the program sent, in the width the runtime holds it at.
+fn narrow<T: TryFrom<i64>>(value: &PlyValue, what: &str, span: Span) -> Result<T, Diagnostic> {
+    T::try_from(value.as_int(span, what)?)
+        .map_err(|_| malformed(&format!("{what} is out of range"), span))
+}
+
+/// A value the program's types promise a shape for, without it: Ply disagreeing with itself.
+fn malformed(why: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the program's decision is malformed: {why}"),
+    )
+    .primary(span, "this is what the program sent")
+    .note("`proof.decide` and this reader are one program's two halves; this is Ply's fault")
 }
 
 /// Positions in the run's claims, each with the key the program named for it.
@@ -626,30 +751,6 @@ impl Site {
         }
     }
 
-    /// What the static tier alone answers for each claim, cached or not: `None` for one it never
-    /// sees, such as a law over interleavings.
-    fn reaches(&self, wanted: Vec<usize>) -> Result<PlyValue, Diagnostic> {
-        let held = self.claims.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&index) = wanted.iter().find(|&&index| index >= *held) {
-            return Err(no_such_claim(index, *held));
-        }
-        drop(held);
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("reaches"))?;
-        machine.ask(Go::Reaches(wanted))?;
-        match machine.step()? {
-            Step::Reached(answer) => Ok(self.answered((*answer).map(|reached| {
-                PlyValue::list(
-                    reached
-                        .iter()
-                        .map(|reach| option(reach.as_ref().map(reach_value)))
-                        .collect(),
-                )
-            }))),
-            _ => Err(out_of_step("reaches")),
-        }
-    }
-
     /// The baseline a reader accepted for each of these definitions, where there is one.
     fn baselines(&self, names: Vec<Symbol>) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
@@ -730,7 +831,6 @@ enum Go {
     },
     /// What the static tier alone answers for each of these claims, by its place in the
     /// collection, whether or not anything discharged it this run.
-    Reaches(Vec<usize>),
     /// The baseline a reader accepted for each of these definitions.
     Baselines(Vec<Symbol>),
     Accept(Vec<(Symbol, ReviewRecord)>),
@@ -748,7 +848,6 @@ enum Step {
     Discharged(Box<Result<Verdicts, Refused>>),
     Recorded(Vec<Diagnostic>),
     Replayed(Box<Result<Point, Refused>>),
-    Reached(Box<Result<Vec<Option<crate::engine::Reach>>, Refused>>),
     Baselines(Vec<(String, ReviewRecord)>),
     Accepted(Box<Accepted>),
 }
@@ -870,7 +969,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
             }
             Ok(Go::Shrink(claim)) => {
                 if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &mut store));
+                    prepared = Some(prepare(&job, &loaded));
                 }
                 let start = match prepared.as_ref() {
                     Some(Ok(ready)) => walkable(claim, obligations, &report, ready.prover.world()),
@@ -926,7 +1025,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
             }
             Ok(Go::Discharge(wanted)) => {
                 if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &mut store));
+                    prepared = Some(prepare(&job, &loaded));
                 }
                 let ready = match prepared.as_ref() {
                     Some(Ok(ready)) => ready,
@@ -962,7 +1061,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
             }
             Ok(Go::Replay { index, root, case }) => {
                 if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &mut store));
+                    prepared = Some(prepare(&job, &loaded));
                 }
                 let answer = match prepared.as_ref() {
                     Some(Ok(ready)) => {
@@ -974,24 +1073,6 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                     None => return,
                 };
                 let _ = told.send(Step::Replayed(Box::new(answer)));
-            }
-            Ok(Go::Reaches(wanted)) => {
-                if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &mut store));
-                }
-                let answer = match prepared.as_ref() {
-                    Some(Ok(ready)) => Ok(wanted
-                        .iter()
-                        .map(|&index| {
-                            obligations
-                                .get(index)
-                                .and_then(|obligation| ready.prover.reach(obligation, &job.plan))
-                        })
-                        .collect()),
-                    Some(Err(refused)) => Err(refused.clone()),
-                    None => return,
-                };
-                let _ = told.send(Step::Reached(Box::new(answer)));
             }
             Ok(Go::Baselines(names)) => {
                 let baselines = names
@@ -1072,11 +1153,7 @@ struct Prepared<'a> {
     warnings: Vec<Diagnostic>,
 }
 
-fn prepare<'a>(
-    job: &'a Job,
-    loaded: &'a Loaded,
-    store: &mut Store,
-) -> Result<Prepared<'a>, Refused> {
+fn prepare<'a>(job: &'a Job, loaded: &'a Loaded) -> Result<Prepared<'a>, Refused> {
     let unbound = |diagnostics: Vec<Diagnostic>| Refused {
         why: Why::Unbound,
         diagnostics,
@@ -1115,17 +1192,9 @@ fn prepare<'a>(
                     as Arc<dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync + Send>
             }),
         });
-    let prover =
-        crate::engine::prover(loaded, &job.world, hosting, backend, store).map_err(|err| {
-            Refused {
-                why: Why::Broken,
-                diagnostics: err.diagnostics,
-                sources: err.sources,
-            }
-        })?;
     Ok(Prepared {
         _hosts: hosts,
-        prover,
+        prover: crate::engine::prover(loaded, &job.world, hosting, backend),
         warnings,
     })
 }
@@ -1487,30 +1556,6 @@ fn verdicts_value(verdicts: &Verdicts) -> PlyValue {
         ),
         ("duration_ms", millis(verdicts.duration)),
         ("warnings", diags_value(&verdicts.warnings)),
-    ])
-}
-
-/// What the static tier alone answered for one obligation, as the product carries it.
-fn reach_value(reach: &crate::engine::Reach) -> PlyValue {
-    record(vec![
-        ("decision", PlyValue::str(reach.decision.as_str())),
-        ("steps", tally(u64::from(reach.decision.steps()))),
-        (
-            "blockers",
-            PlyValue::list(
-                reach
-                    .blockers
-                    .iter()
-                    .map(|blocker| {
-                        let (kind, about) = blocker.parts();
-                        record(vec![
-                            ("kind", PlyValue::str(kind)),
-                            ("about", option(about.map(PlyValue::str))),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
     ])
 }
 
