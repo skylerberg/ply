@@ -5,7 +5,7 @@ import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, L
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad, has_or, alternatives_of)
 import exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf, EBlock,
               EList, ERecord, EField, ELambda, EMatch, EPerform, EHandle, EWithCell, ESimulate,
-              EBad, ERecordUpdate, ETry, Stmt, SLet, SLetElse, SExpr, RecField, expr_span)
+              EParallel, EBad, ERecordUpdate, ETry, Stmt, SLet, SLetElse, SExpr, RecField, expr_span)
 import items (Module, Item, IFn, parse)
 import rewrite (expand)
 
@@ -35,6 +35,8 @@ pub type Node =
   | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
   | NLambda({ params: Int, size: Int, caps: List<Cap>, body: Code })
   | NSim({ size: Int, caps: List<Cap>, body: Code })
+  // Each branch a nullary `NLambda`, which the run calls on whichever thread it chooses.
+  | NPar({ branches: List<Code> })
   | NHandle({ body: Code, clauses: List<CClause>, ret: Option<CRet> })
   | NField({ base: Code, field: Bytes })
   // `{..b, f: e}`, recognised in a plain literal where some field is `b.<its own name>` for one slot variable `b`.
@@ -254,6 +256,12 @@ fn dump_node(n: Node) -> Bytes =
         dump(c.init),
         b",",
         dump(c.body),
+        b")",
+      ]),
+    NPar(pr) ->
+      bytes_concat_all([
+        b"par(",
+        fold(pr.branches, b"", |acc: Bytes, x: Code| bytes_concat_all([acc, dump(x), b","])),
         b")",
       ]),
     NSim(sm) ->
@@ -736,6 +744,11 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         })
       },
     },
+    EParallel(x) ->
+      match lower_seq(map(x.branches, |b: Expr| ELambda({ span: expr_span(b), body: b, params: [], ret: None })), st) {
+        None -> None,
+        Some(r) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NPar({ branches: r.codes }) }, st: r.st }),
+      },
     // The body runs in the enclosing barrier; each clause opens its own, led by its parameters and `resume`.
     EHandle(x) -> match lower_in(x.body, st) {
       None -> None,
@@ -1420,6 +1433,10 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
         },
         live: w.live,
       }
+    },
+    NPar(pr) -> {
+      let r = mark_seq(pr.branches, live);
+      { code: { own: Borrowed, span: c.span, node: NPar({ branches: r.codes }) }, live: r.live }
     },
     // Captures are reads of this barrier on entry, as a lambda's are.
     NSim(sm) -> {

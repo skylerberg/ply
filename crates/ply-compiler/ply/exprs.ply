@@ -37,6 +37,8 @@ pub type Expr =
   | EHandle({ span: Span, body: Expr, ret: Option<ReturnClause>, clauses: List<HandleClause> })
   | EWithCell({ span: Span, resource: Ident, init: Expr, binder: Ident, body: Expr })
   | ESimulate({ span: Span, body: Expr })
+  // `parallel { a, b }`: the branches' answers as a tuple, which means evaluating them left to right.
+  | EParallel({ span: Span, branches: List<Expr> })
   | EBad({ span: Span })
 
 pub type RecField = { name: Ident, value: Expr }
@@ -98,6 +100,7 @@ pub fn expr_span(e: Expr) -> Span =
     EHandle(v) -> v.span,
     EWithCell(v) -> v.span,
     ESimulate(v) -> v.span,
+    EParallel(v) -> v.span,
     EBad(v) -> v.span,
   }
 
@@ -123,6 +126,7 @@ fn set_span(e: Expr, s: Span) -> Expr =
     EWithCell(v) ->
       EWithCell({ span: s, resource: v.resource, init: v.init, binder: v.binder, body: v.body }),
     ESimulate(v) -> ESimulate({ span: s, body: v.body }),
+    EParallel(v) -> EParallel({ span: s, branches: v.branches }),
     EBad(v) -> EBad({ span: s }),
   }
 
@@ -135,6 +139,7 @@ pub fn is_block_like(e: Expr) -> Bool =
     EHandle(v) -> true,
     EWithCell(v) -> true,
     ESimulate(v) -> true,
+    EParallel(v) -> true,
     _ -> false,
   }
 
@@ -519,12 +524,14 @@ fn primary_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   }
 }
 
-// Contextual, not reserved. `simulate` defers to `no_brace`, so `if simulate { .. }` is a name
-// and a block.
+// Contextual, not reserved. `simulate` and `parallel` defer to `no_brace`, so `if simulate { .. }`
+// is a name and a block.
 fn primary_ident(c: Ctx, p: P, name: Bytes) -> Result<R<Expr>, P> =
   if name == b"with_cell" && kind_at(c, p, 1) == t_lbracket() { with_cell_expr(c, p) }
   else if name == b"simulate" && !p.no_brace && kind_at(c, p, 1) == t_lbrace() {
     simulate_expr(c, p)
+  } else if name == b"parallel" && !p.no_brace && kind_at(c, p, 1) == t_lbrace() {
+    parallel_expr(c, p)
   } else {
     let { p, node: q } = qname(c, p, b"an expression")?;
     Ok({ p: p, node: EVar({ span: q.span, name: q }) })
@@ -1164,6 +1171,18 @@ fn simulate_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   Ok({ p: p, node: ESimulate({ span: span_to(st.node, expr_span(body)), body: body }) })
 }
 
+fn parallel_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
+  let st = advance(c, p);
+  let saved = st.p.no_brace;
+  let { p, node: brace } = expect(c, with_no_brace(st.p, false), t_lbrace(), b"`{` to start the branches")?;
+  let { p, node: branches } = comma_list(c, p, t_rbrace(), expr)?;
+  // One branch would be a tuple of one, which Ply has none of.
+  if len(branches) < 2 { Err(error_here(c, p, b"`,` and a second branch")) } else {
+    let { p, node: cl } = expect_close(c, p, t_rbrace(), brace, b"`}` to close the branches")?;
+    Ok({ p: with_no_brace(p, saved), node: EParallel({ span: span_to(st.node, cl), branches: branches }) })
+  }
+}
+
 // --- The dump ---------------------------------------------------------------
 
 pub fn dump_expr(e: Expr) -> Bytes =
@@ -1233,6 +1252,7 @@ pub fn dump_expr(e: Expr) -> Bytes =
         dump_expr(v.body),
       ]),
     ESimulate(v) -> bytes_concat(rec(v.span, b"esim"), dump_expr(v.body)),
+    EParallel(v) -> bytes_concat(rec(v.span, b"epar"), dump_list(v.branches, dump_expr)),
     EBad(v) -> rec(v.span, b"ebad"),
   }
 
@@ -1346,6 +1366,7 @@ pub fn node_count(e: Expr) -> Int =
         + (match v.ret { None -> 0, Some(r) -> 1 + node_count(r.body) }),
     EWithCell(v) -> 1 + node_count(v.init) + node_count(v.body),
     ESimulate(v) -> 1 + node_count(v.body),
+    EParallel(v) -> 1 + count_all(v.branches),
     EBad(v) -> 1,
   }
 
@@ -1816,4 +1837,15 @@ test "just under MAX_DEPTH it does not" {
   let r = expr(s.c, s.p);
   assert(!failed(r));
   assert_eq(len(settle(r, no_expr()).p.diags), 0);
+}
+
+test "`parallel` is contextual, takes two or more branches, and nests" {
+  assert_eq(
+    dump_expr_of(b"parallel { 1, f() }"),
+    "0:19:epar;#2;11:12:elit;%int;@31;14:17:eapp;14:15:evar;14:15:qname;?0;14:15:ident;@66;#0;#0;#0;#0;",
+  );
+  assert(string_contains(dump_expr_of(b"parallel { 1, parallel { 2, 3 }, }"), "14:31:epar;#2;"));
+  assert_eq(dump_expr_of(b"parallel"), "0:8:evar;0:8:qname;?0;0:8:ident;@706172616c6c656c;#0;");
+  assert(string_contains(dump_expr_of(b"if parallel { 1 }"), "3:11:evar;"));
+  assert(string_contains(dump_expr_of(b"parallel { 1 }"), "!E0001:"))
 }
