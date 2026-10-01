@@ -19,11 +19,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes};
-use ply_prove::concurrency::ValueDomain;
-use ply_prove::{
-    Certificate, Discharge, Evidence, Fault, Gap, Obligation, ProvePlan, Rule, Tier, Vacuity,
-    VacuityKind, World,
-};
+use ply_prove::{Certificate, Evidence, Fault, Obligation, ProvePlan, Rule, World};
 use ply_store::ReviewRecord;
 use ply_store::Store;
 use ply_test::obligation::{from_cached, to_cached};
@@ -48,14 +44,11 @@ pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
     ("proof.obligation", "Evidence", &["Proof", "Sampled"]),
     (
         "proof.obligation",
-        "Outcome",
-        &["Held", "Refuted", "Vacuous", "Unattempted", "Defect"],
-    ),
-    (
-        "proof.obligation",
         "Judged",
         &["JHeld", "JFailed", "JRejected", "JRaised", "JFaulted"],
     ),
+    ("sim.recording", "Access", &["AAtom", "ACell", "AAlloc"]),
+    ("sim.recording", "Verdict", &["Passed", "Failed"]),
     (
         "proof.rules",
         "Rule",
@@ -71,17 +64,6 @@ pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
             "Induction",
             "ExhaustiveInterleaving",
         ],
-    ),
-    ("proof.obligation", "Gap", &["Raised"]),
-    (
-        "proof.obligation",
-        "Tier",
-        &["Proved", "Property", "Example"],
-    ),
-    (
-        "proof.obligation",
-        "Vacuity",
-        &["Unsatisfiable", "NoCaseKept"],
     ),
 ];
 
@@ -105,7 +87,7 @@ const OPERATIONS: [(&str, &str); 10] = [
     ("prepared", "ply_machine::claims::prepared"),
     ("cached", "ply_machine::claims::cached"),
     ("judged", "ply_machine::claims::judged"),
-    ("searched", "ply_machine::claims::searched"),
+    ("interleaved", "ply_machine::claims::interleaved"),
     ("record", "ply_machine::claims::record"),
     ("baselines", "ply_machine::claims::baselines"),
     ("accepted", "ply_machine::claims::accepted"),
@@ -206,10 +188,13 @@ impl HostHandler for Site {
             ("prepared", _) => self.prepared()?,
             ("cached", [keys]) => self.cached(&texts_of(keys, "the keys to read", span)?)?,
             ("judged", [batches]) => self.judged(batches_of(batches, span)?)?,
-            ("searched", [claim, points, domain]) => self.searched(
+            ("interleaved", [claim, point, seed, steps]) => self.interleaved(
                 usize::try_from(claim.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
-                points_of(points, span)?,
-                domain_of(domain, span)?,
+                points_of(&PlyValue::list(vec![point.clone()]), span)?
+                    .pop()
+                    .unwrap_or_default(),
+                seed_of(seed, span)?,
+                u32::try_from(steps.as_int(span, "the scheduling steps")?).unwrap_or(u32::MAX),
             )?,
             ("record", [entries]) => self.record(filed_of(entries, span)?)?,
             ("baselines", [names]) => self.baselines(names_of(names, span)?)?,
@@ -271,29 +256,6 @@ fn points_of(value: &PlyValue, span: Span) -> Result<Vec<Vec<ply_eval::Plain>>, 
     Ok(out)
 }
 
-/// A `proof.property.Searched`: what a law over interleavings was searched at.
-fn domain_of(value: &PlyValue, span: Span) -> Result<ValueDomain, Diagnostic> {
-    use crate::payload::field_of;
-    let (name, args) = case_of(value, "a searched domain", span)?;
-    let fields = args
-        .first()
-        .ok_or_else(|| malformed("a searched domain is missing its fields", span))?;
-    Ok(match name {
-        "SEnumerated" => ValueDomain::Enumerated {
-            domain: Symbol::new(field_of(fields, "domain", span)?.as_str(span, "a domain")?),
-            points: narrow(field_of(fields, "points", span)?, "points", span)?,
-            kept: narrow(field_of(fields, "kept", span)?, "kept", span)?,
-        },
-        "SSampled" => ValueDomain::Sampled {
-            generated: narrow(field_of(fields, "generated", span)?, "generated", span)?,
-            kept: narrow(field_of(fields, "kept", span)?, "kept", span)?,
-            rejected: narrow(field_of(fields, "rejected", span)?, "rejected", span)?,
-            instantiations: instantiations_of(field_of(fields, "instantiations", span)?, span)?,
-        },
-        other => return Err(malformed(&format!("`{other}` is no searched domain"), span)),
-    })
-}
-
 fn instantiations_of(value: &PlyValue, span: Span) -> Result<Vec<(Symbol, String)>, Diagnostic> {
     use crate::payload::field_of;
     value
@@ -306,6 +268,27 @@ fn instantiations_of(value: &PlyValue, span: Span) -> Result<Vec<(Symbol, String
             ))
         })
         .collect()
+}
+
+/// A `sim.plan.Seed`: its root and the choices before the stream decides.
+fn seed_of(value: &PlyValue, span: Span) -> Result<ply_eval::Seed, Diagnostic> {
+    use crate::payload::field_of;
+    let root = match field_of(value, "root", span)? {
+        PlyValue::Fixed(f) => f.bits() as u64,
+        _ => return Err(malformed("a seed's root is no `U64`", span)),
+    };
+    let mut path = Vec::new();
+    for choice in field_of(value, "path", span)?.as_list(span, "a seed's path")? {
+        path.push(
+            u16::try_from(choice.as_int(span, "a choice")?).map_err(|_| {
+                malformed(
+                    "a seed's choice is past what a scheduling point offers",
+                    span,
+                )
+            })?,
+        );
+    }
+    Ok(ply_eval::Seed::at(root, path))
 }
 
 /// A `proof.obligation.Evidence`.
@@ -568,27 +551,29 @@ impl Site {
         }
     }
 
-    /// A law over interleavings, searched at the points its guard kept.
-    fn searched(
+    /// A law over interleavings, run at one of its points under one seed.
+    fn interleaved(
         &self,
         claim: usize,
-        points: Vec<Vec<ply_eval::Plain>>,
-        domain: ValueDomain,
+        point: Vec<ply_eval::Plain>,
+        seed: ply_eval::Seed,
+        steps: u32,
     ) -> Result<PlyValue, Diagnostic> {
         let claims = *self.claims.lock().unwrap_or_else(|e| e.into_inner());
         if claim >= claims {
             return Err(no_such_claim(claim, claims));
         }
         let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("searched"))?;
-        machine.ask(Go::Search {
+        let machine = held.as_ref().ok_or_else(|| unstarted("interleaved"))?;
+        machine.ask(Go::Interleave {
             claim,
-            points,
-            domain,
+            point,
+            seed,
+            steps,
         })?;
         match machine.step()? {
-            Step::Searched(discharge) => Ok(outcome_value(&discharge)),
-            _ => Err(out_of_step("searched")),
+            Step::Interleaved(run) => Ok(interleaved_value(&run)),
+            _ => Err(out_of_step("interleaved")),
         }
     }
 
@@ -657,10 +642,11 @@ enum Go {
     /// The evidence filed under these keys.
     Cached(Vec<String>),
     Judge(Vec<Batch>),
-    Search {
+    Interleave {
         claim: usize,
-        points: Vec<Vec<ply_eval::Plain>>,
-        domain: ValueDomain,
+        point: Vec<ply_eval::Plain>,
+        seed: ply_eval::Seed,
+        steps: u32,
     },
     /// File this evidence, each under the key the program chose for it.
     Record(Vec<(DefHash, Evidence)>),
@@ -676,7 +662,7 @@ enum Step {
     Prepared(Box<Result<Vec<Diagnostic>, Refused>>),
     Cached(Vec<Option<Evidence>>),
     Judged(Vec<Vec<Judgement>>),
-    Searched(Box<Discharge>),
+    Interleaved(Box<crate::engine::Interleaved>),
     Recorded(Vec<Diagnostic>),
     Baselines(Vec<(String, ReviewRecord)>),
     Accepted(Box<Accepted>),
@@ -835,23 +821,30 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                 };
                 let _ = told.send(Step::Judged(judged));
             }
-            Ok(Go::Search {
+            Ok(Go::Interleave {
                 claim,
-                points,
-                domain,
+                point,
+                seed,
+                steps,
             }) => {
                 let Some(Ok(ready)) = prepared.as_ref() else {
                     return;
                 };
-                let discharge = match values_of(&points) {
-                    Ok(values) => {
-                        ready
-                            .prover
-                            .searched(&obligations[claim], &job.plan, values, domain)
-                    }
-                    Err(fault) => Discharge::Faulted(fault),
+                let run = match values_of(&[point]) {
+                    Ok(mut values) => ready.prover.interleaved(
+                        &obligations[claim],
+                        &job.plan,
+                        &values.pop().unwrap_or_default(),
+                        &seed,
+                        steps,
+                    ),
+                    Err(fault) => crate::engine::Interleaved {
+                        interleaving: ply_eval::Interleaving::passed(Vec::new()),
+                        verdict: Some(Judgement::Faulted(*fault.diagnostic)),
+                        observed: false,
+                    },
                 };
-                let _ = told.send(Step::Searched(Box::new(discharge)));
+                let _ = told.send(Step::Interleaved(Box::new(run)));
             }
             Ok(Go::Record(entries)) => {
                 for (key, evidence) in entries {
@@ -1141,30 +1134,6 @@ fn collection_value(collection: Collection) -> PlyValue {
     ])
 }
 
-fn tier_value(tier: Tier) -> PlyValue {
-    let named = match tier {
-        Tier::Proved => "Proved",
-        Tier::Property => "Property",
-        Tier::Example => "Example",
-    };
-    case("Tier", named, Vec::new())
-}
-
-fn bindings_value(bindings: &[ply_prove::Binding]) -> PlyValue {
-    PlyValue::list(
-        bindings
-            .iter()
-            .map(|b| {
-                record(vec![
-                    ("name", PlyValue::str(b.name.as_str())),
-                    ("ty", PlyValue::str(&b.ty)),
-                    ("value", crate::payload::plain_value(&b.value)),
-                ])
-            })
-            .collect(),
-    )
-}
-
 /// The prover's own account of a proof, placed under `rules` as it wrote it: the program adds keys
 /// around this document rather than deriving a second spelling of it.
 fn rules_value(rules: &[Rule]) -> PlyValue {
@@ -1262,36 +1231,6 @@ fn evidence_value(evidence: &Evidence) -> PlyValue {
     }
 }
 
-fn gap_value(gap: &Gap) -> PlyValue {
-    let Gap::Raised {
-        bindings,
-        diagnostic,
-        ..
-    } = gap;
-    case(
-        "Gap",
-        "Raised",
-        vec![record(vec![
-            ("message", PlyValue::str(&diagnostic.message)),
-            ("values", shown_values(diagnostic)),
-            ("bindings", bindings_value(bindings)),
-        ])],
-    )
-}
-
-fn fault_value(fault: &Fault) -> PlyValue {
-    record(vec![
-        ("code", PlyValue::str(fault.diagnostic.code)),
-        ("message", PlyValue::str(&fault.diagnostic.message)),
-        (
-            "notes",
-            strings(fault.diagnostic.notes.iter().map(String::as_str)),
-        ),
-        ("values", shown_values(&fault.diagnostic)),
-        ("bindings", bindings_value(&fault.bindings)),
-    ])
-}
-
 /// The values a diagnostic's text names, which `std.value.filled` puts in place.
 fn shown_values(diagnostic: &Diagnostic) -> PlyValue {
     PlyValue::list(
@@ -1304,6 +1243,99 @@ fn shown_values(diagnostic: &Diagnostic) -> PlyValue {
 }
 
 /// One judgement as `proof.property` reads it.
+/// A `proof.property.Interleaved` reply's payload: the recording as `sim.recording` spells it.
+fn interleaved_value(run: &crate::engine::Interleaved) -> PlyValue {
+    let interleaving = &run.interleaving;
+    record(vec![
+        (
+            "interleaving",
+            record(vec![
+                (
+                    "steps",
+                    PlyValue::list(interleaving.steps.iter().map(step_value).collect()),
+                ),
+                (
+                    "verdict",
+                    match &run.verdict {
+                        None => case("Verdict", "Passed", Vec::new()),
+                        Some(judged) => case("Verdict", "Failed", vec![judged_value(judged)]),
+                    },
+                ),
+                ("virtual_time", PlyValue::Int(interleaving.virtual_time)),
+            ]),
+        ),
+        ("observed", PlyValue::Bool(run.observed)),
+    ])
+}
+
+fn step_value(step: &ply_eval::explore::Step) -> PlyValue {
+    let int = |n: u64| PlyValue::Int(i64::try_from(n).unwrap_or(i64::MAX));
+    record(vec![
+        ("region", int(u64::from(step.region.0))),
+        ("task", int(step.task.0)),
+        (
+            "enabled",
+            PlyValue::list(step.enabled.iter().map(|t| int(t.0)).collect()),
+        ),
+        ("choice", PlyValue::Int(i64::from(step.choice))),
+        (
+            "accesses",
+            PlyValue::list(step.accesses.accesses().map(access_value).collect()),
+        ),
+        (
+            "site",
+            record(vec![
+                (
+                    "definition",
+                    option(step.definition.as_ref().map(|d| PlyValue::str(d.as_str()))),
+                ),
+                ("span", at_value(&At::of(step.span))),
+            ]),
+        ),
+        (
+            "stamp",
+            PlyValue::list(step.stamp.iter().map(|&n| int(u64::from(n))).collect()),
+        ),
+    ])
+}
+
+fn access_value(access: &ply_eval::sim::Access) -> PlyValue {
+    use ply_eval::sim::Access;
+    match access {
+        Access::Atom(atom) => case(
+            "Access",
+            "AAtom",
+            vec![record(vec![
+                ("effect", PlyValue::str(atom.effect.as_str())),
+                (
+                    "resource",
+                    option(match &atom.resource {
+                        ply_eval::Resource::Named(name) => Some(PlyValue::str(name.as_str())),
+                        ply_eval::Resource::Var(n) => Some(PlyValue::str(format!("${n}"))),
+                        ply_eval::Resource::Every => Some(PlyValue::str("*")),
+                        ply_eval::Resource::Singleton => None,
+                    }),
+                ),
+                ("write", PlyValue::Bool(atom.mode == ply_eval::Mode::Write)),
+                (
+                    "op",
+                    option(atom.op.as_ref().map(|op| PlyValue::str(op.as_str()))),
+                ),
+            ])],
+        ),
+        Access::Cell { id, mode } => case(
+            "Access",
+            "ACell",
+            vec![record(vec![
+                ("index", PlyValue::Int(i64::from(id.index()))),
+                ("generation", PlyValue::Int(i64::from(id.generation()))),
+                ("write", PlyValue::Bool(*mode == ply_eval::Mode::Write)),
+            ])],
+        ),
+        Access::Alloc => case("Access", "AAlloc", Vec::new()),
+    }
+}
+
 fn judged_value(judgement: &Judgement) -> PlyValue {
     match judgement {
         Judgement::Held => case("Judged", "JHeld", Vec::new()),
@@ -1330,52 +1362,6 @@ fn judged_value(judgement: &Judgement) -> PlyValue {
                 ("values", shown_values(diagnostic)),
             ])],
         ),
-    }
-}
-
-fn vacuity_value(vacuity: &Vacuity) -> PlyValue {
-    record(vec![
-        ("guard", at_value(&At::of(vacuity.guard))),
-        (
-            "why",
-            match vacuity.kind {
-                VacuityKind::ProvedUnsatisfiable => case("Vacuity", "Unsatisfiable", Vec::new()),
-                VacuityKind::NoCaseKept { generated } => {
-                    case("Vacuity", "NoCaseKept", vec![tally(u64::from(generated))])
-                }
-            },
-        ),
-    ])
-}
-
-fn outcome_value(discharge: &Discharge) -> PlyValue {
-    match discharge {
-        Discharge::Held(evidence) => case(
-            "Outcome",
-            "Held",
-            vec![record(vec![
-                ("tier", tier_value(evidence.tier())),
-                ("evidence", evidence_value(evidence)),
-            ])],
-        ),
-        Discharge::Refuted(cx) => case(
-            "Outcome",
-            "Refuted",
-            vec![record(vec![
-                ("bindings", bindings_value(&cx.bindings)),
-                ("original", bindings_value(&cx.original)),
-                ("shrinks", tally(u64::from(cx.shrinks))),
-                ("root", tally(cx.root)),
-                ("case", tally(u64::from(cx.case))),
-                (
-                    "seed",
-                    option(cx.sim_seed.as_ref().map(|s| PlyValue::str(s.to_string()))),
-                ),
-            ])],
-        ),
-        Discharge::Vacuous(vacuity) => case("Outcome", "Vacuous", vec![vacuity_value(vacuity)]),
-        Discharge::Unattempted(gap) => case("Outcome", "Unattempted", vec![gap_value(gap)]),
-        Discharge::Faulted(fault) => case("Outcome", "Defect", vec![fault_value(fault)]),
     }
 }
 
