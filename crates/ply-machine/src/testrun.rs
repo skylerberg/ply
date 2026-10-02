@@ -2,7 +2,7 @@
 //! unit attached to this thread, the binding it may reach, and a Rust unwind out of it caught and
 //! reported as Ply's defect at the test's source. What the run comes to is the program's to say.
 
-use ply_eval::host::HostBinding;
+use ply_eval::host::{HostBinding, HostUse};
 use ply_eval::{Diagnostic, Interleaving, Seed, Span, codes};
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -63,7 +63,7 @@ impl<'a> Executor<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct Use {
     pub duration: Duration,
-    /// The run reached a host handler, so a re-run acts on the world again.
+    /// The run reached a nondeterministic host handler.
     pub host: bool,
     /// Bodies the test ran natively, and calls the backend was offered and declined.
     pub entries: u64,
@@ -103,7 +103,7 @@ fn entered(
     Ok(Entered {
         usage: Use {
             duration: Duration::ZERO,
-            host: machine.host_use().is_some(),
+            host: machine.host_use().is_some_and(HostUse::acted),
             entries,
             declines,
             performs: machine.trace().performs(),

@@ -33,6 +33,8 @@
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
 #   ci-shards.sh give-back RUN   delete the entries this run parked for its own
 #                                jobs, once every job that reads them is done
+#   ci-shards.sh supersede RUN REF
+#                                delete the entries of REF that this run's replaced
 
 set -euo pipefail
 
@@ -123,6 +125,9 @@ declare -a PROBE_JOBS=(
 # outlive a run -- the stage under `ply-c-stage-sources-`, and the object cache. `test-timings-` is
 # run-scoped too and stays: a later run reads it, through `restore-keys`.
 GIVE_BACK=(nextest-archive- ply-c-stage-emitter- test-shards-)
+
+# `<family>-<run id>` entries only the newest of which is ever restored.
+SUPERSEDED=(ply-upstream- ply-stores-)
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -449,11 +454,12 @@ living_durations() {
     echo "FAIL: cargo metadata named no test binary in $root" >&2
     return 1
   }
-  # A corpus row is the entry's own, and lives while the entry does.
+  # A corpus row is the entry's own, and lives while the entry does; a startup row is a package's.
   dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" -v placed="$(corpus_placed | tr '\n' ' ')" '
     BEGIN { n = split(placed, ids, " "); for (i = 1; i <= n; i++) corpus[ids[i]] = 1; n = 0 }
     NR == FNR { live[$0] = 1; next }
     $1 == "corpus" { if ($2 in corpus) print > out; else n++; next }
+    $1 == "startup" { print > out; next }
     $1 in live { print > out; next }
     { n++ }
     END { printf "%d", n }
@@ -481,7 +487,7 @@ shard_configs() {
     rm -rf "$tmp"
     return 3
   fi
-  awk -F"$TAB" -v corpus="$tmp/corpus" '$1 == "corpus" { print > corpus; next } { print }' \
+  awk -F"$TAB" -v corpus="$tmp/corpus" '$1 == "corpus" || $1 == "startup" { print > corpus; next } { print }' \
     "$tmp/living" > "$tmp/nextest"
   if [[ ! -s $tmp/nextest ]]; then
     echo "no measured durations name a test nextest runs" >&2
@@ -533,17 +539,27 @@ shard_configs() {
   rm -rf "$tmp"
 }
 
-# The corpus runs the partitions take, longest first onto the least loaded of every partition's
-# lanes, as `corpus-<k>.txt` of `lane entry` lines; the lanes are taken partition by partition, so
-# the first runs placed land on different runners. A run nothing measured counts as the median of
-# those that were, and is placed after them.
+# The corpus runs the partitions take, longest first onto the lane of every partition's that would
+# end soonest with it, as `corpus-<k>.txt` of `lane entry` lines; the lanes are taken partition by
+# partition, so the first runs placed land on different runners. A lane pays each package's startup
+# once. A run nothing measured counts as the median of those that were, and is placed after them.
 corpus_cut() {
   local dir=$1 rows=$2 k
   for ((k = 1; k <= PARTITIONS; k++)); do : > "$dir/corpus-$k.txt"; done
-  corpus_placed | awk -v rows="$rows" -v dir="$dir" -v p="$PARTITIONS" -v l="$CORPUS_LANES" '
+  corpus_placed | awk -v rows="$rows" -v dir="$dir" -v p="$PARTITIONS" -v l="$CORPUS_LANES" \
+    -v checks="$CORPUS_CHECKS" -v cli="$CLI_SUITE" '
+    function package(id) {
+      if (id ~ /^cli-/) return cli
+      if (id == "program" || id ~ /^package-/) return id
+      return checks
+    }
     BEGIN {
       FS = "\t"
-      while ((getline line < rows) > 0) { split(line, f, "\t"); ms[f[2]] = f[3] + 0 }
+      while ((getline line < rows) > 0) {
+        split(line, f, "\t")
+        if (f[1] == "startup") start[f[2]] = f[3] + 0
+        else ms[f[2]] = f[3] + 0
+      }
       FS = " "
     }
     { ids[++n] = $1 }
@@ -558,10 +574,18 @@ corpus_cut() {
       median = m ? ms[order[int((m + 1) / 2)]] : 60000
       for (i = 1; i <= n; i++) if (!(ids[i] in ms)) { order[++m] = ids[i]; ms[ids[i]] = median }
       lanes = p * l
+      # About two minutes unmeasured; a program or package suite row holds its startup whole.
+      start[checks] = (checks in start) ? start[checks] : 120000
+      start[cli] = (cli in start) ? start[cli] : 120000
       for (i = 1; i <= m; i++) {
-        best = 1
-        for (j = 2; j <= lanes; j++) if (load[j] < load[best]) best = j
-        load[best] += ms[order[i]]
+        pkg = package(order[i])
+        best = 0
+        for (j = 1; j <= lanes; j++) {
+          end = load[j] + ms[order[i]] + ((j SUBSEP pkg) in loads ? 0 : start[pkg])
+          if (best == 0 || end < bestend) { best = j; bestend = end }
+        }
+        load[best] = bestend
+        loads[best, pkg] = 1
         held[best]++
         printf "%d %s\n", int((best - 1) / p) + 1, order[i] >> (dir "/corpus-" ((best - 1) % p + 1) ".txt")
       }
@@ -738,6 +762,21 @@ cmd_give_back() {
       [[ -n $id ]] || continue
       gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id"
       echo "gave back $key$run, $((size / 1000000)) MB"
+    done <<< "$listing"
+  done
+}
+
+# A family only this run's entry replaces, so a job that wrote nothing keeps what it had.
+cmd_supersede() {
+  local run=${1:?usage: ci-shards.sh supersede RUN_ID REF} ref=${2:?a ref} prefix listing current key id
+  for prefix in "${SUPERSEDED[@]}"; do
+    listing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=$prefix&ref=$ref&per_page=100" \
+      -q '.actions_caches[] | "\(.key) \(.id)"')
+    current=$(awk -v suffix="-$run" '{ k = $1; n = length(suffix); if (substr(k, length(k) - n + 1) == suffix) print substr(k, 1, length(k) - n) }' <<< "$listing" | sort -u)
+    while read -r key id; do
+      [[ -n $id && $key != *-"$run" ]] || continue
+      grep -qxF "${key%-*}" <<< "$current" || continue
+      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "superseded $key"
     done <<< "$listing"
   done
 }
@@ -1208,8 +1247,9 @@ case "${1:-}" in
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;
   give-back) cmd_give_back "${2:?a run id}" ;;
+  supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|corpus-matrix|corpus-for-partition K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|corpus-matrix|corpus-for-partition K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN|supersede RUN REF}" >&2
     exit 2
     ;;
 esac

@@ -93,6 +93,11 @@ pub struct FrontFile {
 /// in order to report on both, so this side is handed the answer — the tables, and every source
 /// they name in the order their ids run — rather than walking and analysing a second time.
 pub fn load_over_front(path: &Path, handed: &HandedFront) -> Result<Loaded, LoadError> {
+    load_over_front_in(project_root(path), handed)
+}
+
+/// [`load_over_front`] with the root decided, so nothing on disk is read.
+pub fn load_over_front_in(root: PathBuf, handed: &HandedFront) -> Result<Loaded, LoadError> {
     let mut sources = SourceMap::new();
     let mut states = Vec::with_capacity(handed.files.len());
     for file in &handed.files {
@@ -108,7 +113,7 @@ pub fn load_over_front(path: &Path, handed: &HandedFront) -> Result<Loaded, Load
         });
     }
     Driver {
-        root: project_root(path),
+        root,
         incremental: handed.cached,
         answer: Some(handed.answer.clone()),
         project: SourceMap::new(),

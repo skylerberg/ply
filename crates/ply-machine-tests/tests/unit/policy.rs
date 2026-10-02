@@ -10,6 +10,7 @@ fn own(effect: &str) -> String {
         "archive" => "bootstrap",
         "tcb" => "hosts",
         "edit" => "replace",
+        "shipped" => "env",
         other => other,
     }
     .to_string()
@@ -37,22 +38,37 @@ fn every_family_lends_something_and_has_a_name_and_a_summary() {
     assert_eq!(names, unique, "a family is listed twice");
 }
 
-/// `--allow` refuses a family whose effect the program does not declare, so the effect a family
-/// names has to be the one every one of its operations is on.
+/// Only a family's hermetic half lends deterministic operations.
 #[test]
-fn a_family_lends_under_one_effect_and_that_is_the_one_a_program_declares() {
+fn a_family_lends_under_the_effect_a_program_declares_and_its_hermetic_half() {
     for family in policy::FAMILIES {
         let effect = policy::effect_of(family.name)
             .unwrap_or_else(|| panic!("`{}` lends under no effect", family.name));
+        let hermetic = policy::hermetic_of(family.name);
         let ops = policy::lent(family.name, &own).expect("the family is listed");
         for (op, _) in &ops {
-            assert_eq!(
-                op.effect.as_str(),
-                effect,
+            let on_half = Some(op.effect.as_str()) == hermetic;
+            assert!(
+                op.effect.as_str() == effect || on_half,
                 "`{}` lends `{}.{}`, of an effect it does not name",
                 family.name,
                 op.effect,
                 op.op
+            );
+            if on_half {
+                assert!(
+                    op.determinism.is_deterministic(),
+                    "`{}.{}` is the hermetic half's and answers nondeterministically",
+                    op.effect,
+                    op.op
+                );
+            }
+        }
+        if let Some(half) = hermetic {
+            assert!(
+                ops.iter().any(|(op, _)| op.effect.as_str() == half),
+                "`{}` names a hermetic half `{half}` and lends nothing of it",
+                family.name
             );
         }
     }

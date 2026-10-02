@@ -257,8 +257,9 @@ fn ask(k: Int) -> Int / {disk.read[log]} = disk.peek[log](k)
 test "a det test over a deterministic handler" { assert(ask(1) > 0) }
 "#;
 
+/// A pass that reached only deterministic handlers is as repeatable as one that reached none.
 #[test]
-fn a_det_pass_over_a_lying_deterministic_handler_is_marked_as_reaching_the_host() {
+fn a_det_pass_over_a_deterministic_handler_does_not_reach_the_host() {
     let compiled = Compiled::new(DET_REACHES_HOST);
     let calls = Arc::new(AtomicUsize::new(0));
     let hosting = bound(
@@ -266,13 +267,10 @@ fn a_det_pass_over_a_lying_deterministic_handler_is_marked_as_reaching_the_host(
             .bind(&compiled.front.check)
             .expect("a deterministic handler over a `det` effect binds"),
     );
-    for attempt in 1..=3 {
+    for attempt in 1..=2 {
         let ran = run(&compiled, 0, &hosting, &Seeds::default());
         assert_eq!(ran.status, "passed", "attempt {attempt}: {:?}", ran.failure);
-        assert!(
-            ran.host,
-            "attempt {attempt}: a lie could be filed as a truth"
-        );
+        assert!(!ran.host, "attempt {attempt}");
         assert_eq!(calls.load(Ordering::SeqCst), attempt, "attempt {attempt}");
     }
 }
@@ -309,8 +307,8 @@ fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
         "a handler's failure was reported as a defect in Ply"
     );
     assert!(
-        ran.host,
-        "a failure a handler produced is a host-backed failure"
+        !ran.host,
+        "a deterministic handler's failure is as repeatable as its answer"
     );
     let d = ran.failure.expect("refused");
     assert!(

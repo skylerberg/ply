@@ -28,6 +28,7 @@ pub mod policy;
 pub mod recording;
 pub mod reused;
 pub mod shelf;
+pub mod shipped;
 pub mod support;
 pub mod tester;
 pub mod testrun;
@@ -47,9 +48,12 @@ use std::sync::{Arc, Mutex};
 /// `machine.bound[m](..)`, `machine.enter[m]()`, `machine.reload[m]()`, `machine.drop[m]()`.
 pub const EFFECT: &str = "machine";
 
-const OPERATIONS: [(&str, &str); 10] = [
+pub const HERMETIC: &str = "hermetic_machine";
+
+const OPERATIONS: [(&str, &str); 11] = [
     ("configure", "ply_machine::configure"),
     ("load", "ply_machine::load"),
+    ("opened", "ply_machine::opened"),
     ("reuse", "ply_machine::reuse"),
     ("reload", "ply_machine::reload"),
     ("schema", "ply_machine::schema"),
@@ -58,6 +62,20 @@ const OPERATIONS: [(&str, &str); 10] = [
     ("call", "ply_machine::call"),
     ("accounting", "ply_machine::accounting"),
     ("drop", "ply_machine::drop"),
+];
+
+const HERMETIC_OPERATIONS: [(&str, &str); 11] = [
+    ("configure", "ply_machine::hermetic::configure"),
+    ("load", "ply_machine::hermetic::load"),
+    ("opened", "ply_machine::hermetic::opened"),
+    ("reuse", "ply_machine::hermetic::reuse"),
+    ("reload", "ply_machine::hermetic::reload"),
+    ("schema", "ply_machine::hermetic::schema"),
+    ("bound", "ply_machine::hermetic::bound"),
+    ("enter", "ply_machine::hermetic::enter"),
+    ("call", "ply_machine::hermetic::call"),
+    ("accounting", "ply_machine::hermetic::accounting"),
+    ("drop", "ply_machine::hermetic::drop"),
 ];
 
 /// The front end and the emitter recurse once per node on the native stack.
@@ -74,17 +92,44 @@ pub fn registrations_in(
     module: &str,
     options: drive::RunOptions,
 ) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
+    lent_by(module, options, false)
+}
+
+/// A machine that loads only what it is handed, binds no host, reads no clock and files nothing.
+pub fn hermetic_registrations_in(module: &str) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
+    let options = drive::RunOptions {
+        hermetic: true,
+        ..drive::RunOptions::default()
+    };
+    lent_by(module, options, true)
+}
+
+fn lent_by(
+    module: &str,
+    options: drive::RunOptions,
+    hermetic: bool,
+) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         module: module.to_string(),
+        hermetic,
         options,
         labels: Mutex::new(HashMap::new()),
         configured: Mutex::new(HashMap::new()),
     });
+    let (effect, operations) = if hermetic {
+        (HERMETIC, HERMETIC_OPERATIONS)
+    } else {
+        (EFFECT, OPERATIONS)
+    };
     // A load may be bound and entered any number of times.
-    OPERATIONS
+    operations
         .into_iter()
         .map(|(op, path)| {
-            let op = hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
+            let op = if hermetic {
+                hosts::hermetic_op(effect, op, Linearity::Repeatable, path)
+            } else {
+                hosts::privileged_op(effect, op, Linearity::Repeatable, path)
+            };
             (op, Arc::clone(&site))
         })
         .collect()
@@ -123,6 +168,7 @@ fn refused_value(refused: &drive::Refused) -> Value {
 
 struct Site {
     module: String,
+    hermetic: bool,
     options: drive::RunOptions,
     labels: Mutex<HashMap<String, Labelled>>,
     /// What a label was configured with before it loaded, if it was.
@@ -188,6 +234,7 @@ impl HostHandler for Site {
         let value = match (req.op.op.as_str(), req.args) {
             ("configure", [options]) => self.configure(&label, options, span)?,
             ("load", [root, front, keep]) => self.load(&label, root, front, keep, span)?,
+            ("opened", [path, bytes]) => self.opened(&label, path, bytes, span)?,
             ("reuse", [root, walked]) => self.reuse(&label, root, walked, span)?,
             ("reload", [front]) => {
                 let front = Box::new(crate::driver::handed_front_of(front, span)?);
@@ -277,7 +324,12 @@ fn label_of(req: &HostRequest<'_>, span: Span) -> Result<String, Diagnostic> {
 impl Site {
     /// The program parsed the line; the machine reads the record.
     fn configure(&self, label: &str, options: &Value, span: Span) -> Result<Value, Diagnostic> {
-        let parsed = drive::run_options_of(options, span)?;
+        let mut parsed = drive::run_options_of(options, span)?;
+        if self.hermetic {
+            // No clock bounds a hermetic run: its step budget does.
+            parsed.hermetic = true;
+            parsed.timeout = 0;
+        }
         self.configured
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -302,6 +354,7 @@ impl Site {
             .map(|front| crate::driver::handed_front_of(front, span))
             .transpose()?;
         let keep = crate::payload::option_of(keep, "a key", span)?
+            .filter(|_| !self.hermetic)
             .map(|key| key.as_str(span, "a key"))
             .transpose()?;
         // Taken before the front leaves for the machine's thread; the dump stays here as it came.
@@ -315,7 +368,10 @@ impl Site {
         });
         let mut options = self.taken(label);
         options.front = front;
-        let found = self.open(label, root, options, span)?;
+        let path = PathBuf::from(root);
+        let found = self.open(label, options, span, move |options| {
+            drive::Drive::open(options, &path)
+        })?;
         if let (Ok(drive::FoundData::Project { .. }), Some((key, placed)), Some(handed)) =
             (&found, kept, handed)
         {
@@ -342,6 +398,9 @@ impl Site {
         span: Span,
     ) -> Result<Value, Diagnostic> {
         use crate::payload::field_of;
+        if self.hermetic {
+            return Ok(payload::option(None));
+        }
         let root = root.as_str(span, "the program's root")?.to_string();
         let key = field_of(walked, "key", span)?.as_str(span, "a key")?;
         let files = |name: &str| -> Result<Vec<reused::Walked>, Diagnostic> {
@@ -373,7 +432,10 @@ impl Site {
             .cloned()
             .unwrap_or_else(|| self.options.clone());
         options.front = Some(front);
-        match self.open(label, root, options, span)? {
+        let path = PathBuf::from(root);
+        match self.open(label, options, span, move |options| {
+            drive::Drive::open(options, &path)
+        })? {
             Ok(found) => {
                 // A load that opens consumes its label's configuration.
                 self.taken(label);
@@ -387,6 +449,28 @@ impl Site {
         }
     }
 
+    /// `bytes` is `None` when nothing could be read at `path`.
+    fn opened(
+        &self,
+        label: &str,
+        path: &Value,
+        bytes: &Value,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        let path = PathBuf::from(path.as_str(span, "the artifact's path")?);
+        let bytes = crate::payload::option_of(bytes, "the artifact's bytes", span)?
+            .map(|b| b.as_bytes(span, "the artifact's bytes").map(|b| b.to_vec()))
+            .transpose()?;
+        let options = self.taken(label);
+        let found = self.open(label, options, span, move |options| {
+            drive::Drive::open_artifact(options, &path, bytes.as_deref())
+        })?;
+        Ok(match found {
+            Ok(found) => ok(drive::found_value(&found, &self.module)),
+            Err(refused) => refused_value(&refused),
+        })
+    }
+
     /// What the label was configured with, taken for the load that uses it.
     fn taken(&self, label: &str) -> drive::RunOptions {
         self.configured
@@ -396,14 +480,14 @@ impl Site {
             .unwrap_or_else(|| self.options.clone())
     }
 
-    /// The target at `root` opened on a thread of its own, and parked there under `label` when it
+    /// The target `start` opens, on a thread of its own, and parked there under `label` when it
     /// opens.
     fn open(
         &self,
         label: &str,
-        root: String,
         options: drive::RunOptions,
         span: Span,
+        start: impl FnOnce(drive::RunOptions) -> Result<drive::Drive, drive::Refused> + Send + 'static,
     ) -> Result<Result<drive::FoundData, drive::Refused>, Diagnostic> {
         if self
             .labels
@@ -419,11 +503,10 @@ impl Site {
         }
         let (reply, answered) = mpsc::channel();
         let (go, hearing) = mpsc::channel();
-        let path = PathBuf::from(root);
         let thread = std::thread::Builder::new()
             .name(format!("machine-{label}"))
             .stack_size(STACK)
-            .spawn(move || serve(options, path, reply, hearing))
+            .spawn(move || serve(start(options), reply, hearing))
             .map_err(|e| unspawned(label, &e))?;
         let found = answered.recv().map_err(|_| unanswered(label))?;
         if found.is_err() {
@@ -499,12 +582,11 @@ fn unanswered(label: &str) -> Diagnostic {
 // --- The thread the machine lives on -----------------------------------------------
 
 fn serve(
-    options: drive::RunOptions,
-    root: PathBuf,
+    opened: Result<drive::Drive, drive::Refused>,
     reply: Sender<Result<drive::FoundData, drive::Refused>>,
     hearing: mpsc::Receiver<Go>,
 ) {
-    match drive::Drive::open(options, &root) {
+    match opened {
         Ok(drive) => {
             let found = drive.found_data();
             let _ = reply.send(Ok(found));
