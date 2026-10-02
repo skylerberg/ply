@@ -478,15 +478,8 @@ impl HostListing {
         *hasher.finalize().as_bytes()
     }
 
-    /// `b3:` and the first twelve hex characters.
     pub fn digest_short(&self) -> String {
-        let digest = self.digest();
-        let mut out = String::with_capacity(15);
-        out.push_str("b3:");
-        for byte in &digest[..6] {
-            out.push_str(&format!("{byte:02x}"));
-        }
-        out
+        ply_std::short_digest(&self.digest())
     }
 }
 

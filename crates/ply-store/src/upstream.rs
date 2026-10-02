@@ -96,11 +96,7 @@ impl Upstream {
         }
         let dir = path.parent().expect("a shard directory");
         std::fs::create_dir_all(dir)?;
-        let temp = dir.join(format!(
-            "{}.{}.tmp",
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("entry"),
-            std::process::id()
-        ));
+        let temp = ply_eval::files::temp_beside(path);
         if let Err(e) = crate::disk::write_new(&temp, bytes) {
             let _ = std::fs::remove_file(&temp);
             return Err(e);

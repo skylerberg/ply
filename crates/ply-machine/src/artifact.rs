@@ -68,7 +68,7 @@ impl Artifact {
     }
 
     pub fn digest_short(&self) -> String {
-        short(&self.digest())
+        ply_std::short_digest(&self.digest())
     }
 
     /// The container `plyx.ply` places these sections in, with its digest written into the field
@@ -317,15 +317,6 @@ fn container_failed(why: String) -> Diagnostic {
     .note("this is Ply's fault: the compiler's own `plyx.ply` is what failed here")
 }
 
-/// `b3:` plus twelve hex characters, as `ply hosts --digest` and `ply std --digest` print.
-pub fn short(digest: &[u8; 32]) -> String {
-    let mut out = String::from("b3:");
-    for byte in &digest[..6] {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
 pub struct Built {
     pub artifact: Artifact,
     pub entry_name: Symbol,
@@ -349,7 +340,6 @@ struct Emission {
     warnings: Vec<Diagnostic>,
 }
 
-/// The transitive closure of the entry point and of the run's start-up definitions.
 /// What a build of a program is a function of, as one digest: its sources (already digested),
 /// the shelf, the emitter and the store versions a decode refuses a mismatch of. The launcher
 /// gates the committed CLI artifact on this: behind the sources, a binary runs the sources
@@ -776,8 +766,8 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
             path,
             format!(
                 "the artifact's digest is {} and its contents hash to {}",
-                short(&stated),
-                short(&computed)
+                ply_std::short_digest(&stated),
+                ply_std::short_digest(&computed)
             ),
         )
         .note("the file was altered or truncated after it was built; transfer it again"));
@@ -948,11 +938,13 @@ fn place_and_read(
     }
 }
 
-/// Where the front end's answer for one artifact is kept: beside the program, under a key that is
-/// the artifact's own bytes, but for its unit, plus what reads them.
+/// Where the front end's answer for one artifact is kept: in the stage's fronts directory, under a
+/// key that is the artifact's own bytes but for its unit, plus what reads them.
+///
 /// An artifact's digest covers what it holds, not what it was built against: the shipped library
 /// it closed over sits outside the hashed ranges. A reopened `Front` is an answer over that
 /// library, so the key names it rather than relying on where the file happens to sit.
+///
 /// The unit is emitted from the front after `build` reopens the closure, so leaving it out is what
 /// lets a built artifact's first run find the front its build answered.
 pub fn front_cache(artifact: &Artifact) -> PathBuf {
@@ -995,10 +987,7 @@ fn file_front(at: &Path, modules: &[String], dump: &ply_eval::Value) {
     let Ok(bytes) = ply_eval::codec::encode(&answer) else {
         return;
     };
-    let tmp = parent.join(format!("front.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, at).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = ply_eval::files::write_atomically(at, &bytes);
 }
 
 /// The `Front` an earlier run answered for this very artifact. A hit skips the check below that

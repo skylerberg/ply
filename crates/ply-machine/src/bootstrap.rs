@@ -7,10 +7,8 @@
 
 use crate::hosts::Lent;
 use crate::payload::{count, diags_value, option, places_value, record};
-use ply_eval::host::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
-};
-use ply_eval::{Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, codes};
+use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
+use ply_eval::{Diagnostic, SourceMap, Span, Value as PlyValue, codes};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,25 +29,14 @@ struct BootstrapOptions {
 
 pub fn lent() -> Vec<Lent> {
     let archive: Arc<dyn HostHandler> = Arc::new(Archive);
+    // The archive is written once a run.
     OPERATIONS
         .into_iter()
-        .map(|(op, path)| (registration(op, path), Arc::clone(&archive)))
+        .map(|(op, path)| {
+            let op = crate::hosts::privileged_op(EFFECT, op, Linearity::AtMostOnce, path);
+            (op, Arc::clone(&archive))
+        })
         .collect()
-}
-
-fn registration(op: &str, path: &'static str) -> HostOp {
-    HostOp {
-        effect: Symbol::new(EFFECT),
-        op: Symbol::new(op),
-        resource: HostResource::Any,
-        // A tree and the files beside it are not functions of program state.
-        determinism: Determinism::Nondeterministic,
-        linearity: Linearity::AtMostOnce,
-        // The handler emits here rather than dispatching: one entry, no other task to stall.
-        blocking: false,
-        secrets: false,
-        path,
-    }
 }
 
 /// What the emission came to, as `bootstrap.ply` reads it. `recorded` is what the archive on
@@ -105,7 +92,7 @@ impl HostHandler for Archive {
                     Err(why) => PlyValue::ctor("Err", vec![refusal_value(&why)]),
                 }
             }
-            other => return Err(unregistered(other, req.span)),
+            other => return Err(crate::hosts::unserved(EFFECT, other, req.span)),
         };
         Ok(HostAnswer::Value(value))
     }
@@ -215,16 +202,6 @@ fn unemitted(why: &str) -> Diagnostic {
 fn unwritten(path: &Path, why: &str) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, format!("{}: {why}", path.display()))
         .primary(Span::DUMMY, "the archive could not be written")
-}
-
-#[cold]
-fn unregistered(op: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("`{EFFECT}.{op}` is not an operation this command serves"),
-    )
-    .primary(span, "performed here")
-    .note("this is a defect in Ply's host dispatch rather than in the program")
 }
 
 fn options_of(v: &PlyValue, span: Span) -> Result<BootstrapOptions, Diagnostic> {

@@ -21,8 +21,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// What the machine is configured with when it is lent, as plain data: the shell's parsed flags
-/// convert into this.
+/// What the machine is configured with when it is lent, as plain data: the options record the
+/// program parsed converts into this.
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     /// The front end the CLI ran. A run without one is refused rather than loading again: the
