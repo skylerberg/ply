@@ -939,9 +939,11 @@ A definition's hash covers its normalized form: names, comments, formatting,
 imports, `pub`, specs and test labels are erased, and references are replaced by
 their referent's hash. A test runs exactly when its hash has no recorded pass,
 so renames and comment edits run nothing. `ply hash` prints the hashes.
-`--explain` says why each test was selected; `--filter SUBSTRING` matches
-`<module>.<label>`, and repeated it runs every test any of them matches;
-`--no-cache` bypasses both the result and the front-end cache.
+`--explain` says why each test was selected and where the run's time went, phase
+by phase from the process's start (`phases` in the `--json` report);
+`--filter SUBSTRING` matches `<module>.<label>`, and repeated it runs every test
+any of them matches; `--no-cache` bypasses both the result and the front-end
+cache.
 
 ### 8.3 Determinism
 

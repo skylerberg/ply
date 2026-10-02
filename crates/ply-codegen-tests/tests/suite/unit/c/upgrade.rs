@@ -1,4 +1,7 @@
-use ply_codegen::c::{Library, PRELUDE, helper_addresses, runtime_header, runtime_object, upgrade};
+use ply_codegen::c::{
+    Library, PRELUDE, compile_and_load, helper_addresses, runtime_header, runtime_object, upgrade,
+};
+use std::time::{Duration, SystemTime};
 
 /// Whether `n << 40` fits an immediate. Only an optimiser exploiting the signed shift in
 /// `ply_fits_imm` says it does for `n = 2^22`.
@@ -86,5 +89,48 @@ fn a_load_answers_with_the_fast_object_until_the_optimised_one_lands() {
             Some(had) => std::env::set_var("PLY_C_CACHE", had),
             None => std::env::remove_var("PLY_C_CACHE"),
         }
+    }
+}
+
+/// An object every run loads is compiled once, so a load that finds it records the use: the sweep
+/// goes least recently used first, and would otherwise take it before anything compiled later.
+#[test]
+fn a_load_that_finds_its_object_marks_it_used() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let _config = super::CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let restore = std::env::var("PLY_C_CACHE").ok();
+    unsafe { std::env::set_var("PLY_C_CACHE", dir.path()) };
+    let source = probe();
+    let used_at = match compile_and_load(&source, "probe") {
+        Ok(first) => {
+            let object = first.path().to_path_buf();
+            let long_ago = SystemTime::now() - Duration::from_secs(3600);
+            std::fs::File::open(&object)
+                .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(long_ago)))
+                .expect("the object's time can be set");
+            let again = compile_and_load(&source, "probe").expect("the object loads again");
+            assert_eq!(
+                again.path(),
+                object.as_path(),
+                "the second load compiled again"
+            );
+            std::fs::metadata(&object).and_then(|m| m.modified()).ok()
+        }
+        Err(e) if e.to_string().contains("could not run") => None,
+        Err(e) => panic!("{e:#}"),
+    };
+    unsafe {
+        match &restore {
+            Some(had) => std::env::set_var("PLY_C_CACHE", had),
+            None => std::env::remove_var("PLY_C_CACHE"),
+        }
+    }
+    if let Some(used_at) = used_at {
+        assert!(
+            used_at
+                .elapsed()
+                .is_ok_and(|age| age < Duration::from_secs(600)),
+            "a load that found the object left its time an hour old"
+        );
     }
 }
