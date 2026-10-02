@@ -926,7 +926,6 @@ fn shown_values(diagnostic: &Diagnostic) -> PlyValue {
     )
 }
 
-/// One judgement as `proof.property` reads it.
 /// A `proof.property.Interleaved` reply's payload: the recording as `sim.recording` spells it.
 fn interleaved_value(run: &crate::engine::Interleaved) -> PlyValue {
     record(vec![

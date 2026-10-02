@@ -36,10 +36,9 @@ pub mod trace;
 pub mod vcs;
 
 use ply_eval::host::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
-    HostRuntime, Linearity,
+    HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostRuntime, Linearity,
 };
-use ply_eval::{Diagnostic, Span, Symbol, Value, codes};
+use ply_eval::{Diagnostic, Span, Value, codes};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
@@ -81,9 +80,13 @@ pub fn registrations_in(
         labels: Mutex::new(HashMap::new()),
         configured: Mutex::new(HashMap::new()),
     });
+    // A load may be bound and entered any number of times.
     OPERATIONS
         .into_iter()
-        .map(|(op, path)| (registration(op, path), Arc::clone(&site)))
+        .map(|(op, path)| {
+            let op = hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
+            (op, Arc::clone(&site))
+        })
         .collect()
 }
 
@@ -101,23 +104,6 @@ pub fn register(registry: &mut HostRegistry) {
 pub fn register_with(registry: &mut HostRegistry, options: drive::RunOptions) {
     for (op, handler) in registrations_with(options) {
         registry.register(op, handler);
-    }
-}
-
-fn registration(op: &str, path: &'static str) -> HostOp {
-    HostOp {
-        effect: Symbol::new(EFFECT),
-        op: Symbol::new(op),
-        resource: HostResource::Any,
-        // A tree, a clock, a toolchain and a running program are not functions of program state.
-        determinism: Determinism::Nondeterministic,
-        // A load may be bound and entered any number of times.
-        linearity: Linearity::Repeatable,
-        // The answer is in hand when the operation returns: this thread waits for the one the
-        // machine lives on rather than being handed a token to poll.
-        blocking: false,
-        secrets: false,
-        path,
     }
 }
 

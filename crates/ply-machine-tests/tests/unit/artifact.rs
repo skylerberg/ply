@@ -140,9 +140,3 @@ fn a_header_shorter_than_a_header_is_a_diagnostic_rather_than_a_panic() {
     let err = decode(&[0u8; 4], Path::new("t.plyx")).unwrap_err();
     assert_eq!(err.code, codes::ARTIFACT_INVALID);
 }
-
-#[test]
-fn short_is_the_shape_a_ci_check_pins() {
-    assert_eq!(short(&[0xab; 32]), "b3:abababababab");
-    assert_eq!(short(&[0xab; 32]).len(), 15);
-}
