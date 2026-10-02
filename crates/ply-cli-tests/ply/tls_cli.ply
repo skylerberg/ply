@@ -1,0 +1,180 @@
+// `--tls NAME=CERT,KEY`: what `ply hosts` discloses of the TLS stack and the credentials a run is
+// given, what moves the binding's digest, and how a credential that does not load is refused.
+
+import harness (Ran, program, write, working, on_disk, in_memory, one, said, stdout, stderr,
+                json_of, at, path, nth, items, str, int, shown)
+import std.certgen (certgen)
+import std.json (Json, Str, Array)
+
+// Can create a TLS listener, which is what puts `ply_host::tls::listen` into the listing.
+fn secure() -> String =
+  \\import std.net
+  \\
+  \\fn main() -> Int / {net::net.write[listener]} = {
+  \\  let l = net::net.listen_tls[listener](0, "api");
+  \\  net::net.close[listener](l);
+  \\  l
+  \\}
+  \\
+
+// A plaintext listener whose row still admits `net.listen_tls`: a row names a resource and a mode,
+// not an operation.
+fn plain() -> String =
+  \\import std.net
+  \\
+  \\fn main() -> Int / {net::net.write[listener]} = {
+  \\  let l = net::net.listen[listener](0);
+  \\  net::net.close[listener](l);
+  \\  l
+  \\}
+  \\
+
+// Reaches the boundary without touching a socket.
+fn no_socket() -> String = "fn main() -> Int = simulate { spawn { 1 }; 2 }\n"
+
+// Generated rather than checked in: a private key in a repository leaks.
+type Credential = { cert: String, key: String }
+
+fn credential(name: String) -> Credential = {
+  let issued = certgen.issue();
+  write(name ++ ".pem", issued.certificate);
+  write(name ++ ".key", issued.key);
+  { cert: working() ++ "/" ++ name ++ ".pem", key: working() ++ "/" ++ name ++ ".key" }
+}
+
+fn spec(name: String, c: Credential) -> String = name ++ "=" ++ c.cert ++ "," ++ c.key
+
+test/nondet "the listing discloses the TLS stack and the credential it was given" {
+  program(secure());
+  let r = on_disk(["hosts", "--host", "--tls", spec("api", credential("api"))]);
+  assert(r.code == 0, Some(stderr(r)));
+  let text = stdout(r);
+  assert(
+    string_contains(text, "ply_host::tls::listen"),
+    Some("`net.listen_tls` must have its own line with its own handler:\n" ++ text),
+  );
+  assert(string_contains(text, "   transport"), Some(text));
+  assert(
+    string_contains(
+      text,
+      "tls  rustls 0.23.43 · provider ring · TLS 1.3, TLS 1.2 · alpn http/1.1",
+    ),
+    Some(text),
+  );
+  assert(string_contains(text, "   credentials"), Some(text));
+  assert(
+    string_contains(text, "api  sha256:") && string_contains(text, "1 certificate"),
+    Some("the credential must be named with its fingerprint:\n" ++ text),
+  );
+  assert(string_contains(text, "digest: b3:"), Some(text))
+}
+
+test/nondet "a program that touches no socket reports no transport" {
+  program(no_socket());
+  let text = stdout(on_disk(["hosts", "--host"]));
+  assert(!string_contains(text, "transport"), Some(text));
+  assert(!string_contains(text, "credentials"), Some(text));
+  assert(!string_contains(text, "ply_host::tls"), Some(text))
+}
+
+test/nondet "a plaintext program whose row admits listen_tls still discloses it" {
+  program(plain());
+  let text = stdout(on_disk(["hosts", "--host"]));
+  assert(string_contains(text, "ply_host::tcp::listen"), Some(text));
+  assert(string_contains(text, "ply_host::tls::listen"), Some(text));
+  assert(string_contains(text, "   transport"), Some(text))
+}
+
+test/nondet "a TLS program with no credential is told what will happen" {
+  program(secure());
+  let text = stdout(on_disk(["hosts", "--host"]));
+  assert(string_contains(text, "   transport"), Some(text));
+  assert(
+    string_contains(text, "`net.listen_tls` is E0429 until `--tls NAME=CERT,KEY` names one"),
+    Some(text),
+  )
+}
+
+fn digest(args: List<String>) -> String =
+  string_trim(stdout(on_disk(fold(args, ["hosts", "--host", "--digest"], push))))
+
+test/nondet "the digest is stable across a rotation and moves when a credential is added" {
+  program(secure());
+  let api = credential("api");
+  let one = ["--tls", spec("api", api)];
+  let before = digest(one);
+  assert(string_starts_with(before, "b3:"), Some(before));
+  // The same credential name, a different certificate: an operational fact.
+  assert(
+    before == digest(["--tls", spec("api", credential("rotated"))]),
+    Some("a renewed certificate must not move the digest"),
+  );
+  // A second credential: a structural change to what the run can serve.
+  assert(
+    before != digest(["--tls", spec("api", api), "--tls", spec("admin", credential("admin"))]),
+    Some("a second credential must move it"),
+  );
+  assert(before != digest([]), Some("removing one must move it"))
+}
+
+test/nondet "the JSON object carries the transport and the full fingerprint" {
+  program(secure());
+  let report = json_of(
+    on_disk(["hosts", "--host", "--json", "--tls", spec("api", credential("api"))]),
+  );
+  assert(str(at(report, "command")) == "hosts", Some(shown(report)));
+  assert(str(path(report, ["transport", "library"])) == "rustls", Some(shown(report)));
+  assert(str(path(report, ["transport", "provider"])) == "ring", Some(shown(report)));
+  assert(path(report, ["transport", "alpn"]) == Array([Str("http/1.1")]), Some(shown(report)));
+  let c = nth(path(report, ["transport", "credentials"]), 0);
+  assert(str(at(c, "name")) == "api", Some(shown(c)));
+  assert(int(at(c, "certificates")) == 1, Some(shown(c)));
+  let fingerprint = str(at(c, "fingerprint"));
+  assert(string_starts_with(fingerprint, "sha256:"), Some(fingerprint));
+  assert(
+    string_len(fingerprint) == string_len("sha256:") + 64,
+    Some("the object must carry the whole digest, not the abbreviation"),
+  )
+}
+
+test/nondet "a credential that does not load is E0430 naming the file" {
+  program(secure());
+  let api = credential("api");
+  write("broken.pem", "-----BEGIN CERTIFICATE-----\nnope\n");
+  let broken = { cert: working() ++ "/broken.pem", key: api.key };
+  let missing = { cert: working() ++ "/absent.pem", key: api.key };
+  fold([broken, missing], (), |u: Unit, bad: Credential| {
+    let r = on_disk(["run", "--host", "--tls", spec("api", bad)]);
+    assert(r.code == 2, Some(said(r)));
+    assert(string_contains(said(r), "E0430"), Some(said(r)))
+  });
+  // A key that is not the leaf's needs both files to catch, and is the one a deploy gets wrong.
+  let other = credential("other");
+  let r = on_disk(["run", "--host", "--tls", spec("api", { cert: api.cert, key: other.key })]);
+  assert(string_contains(said(r), "E0430"), Some(said(r)))
+}
+
+// A mistyped argument needs the form; a broken PEM needs the file.
+test/nondet "a malformed argument is refused with the form rather than a diagnostic" {
+  let r = in_memory(one(secure()), ["run", "--host", "--tls", "api"]);
+  assert(r.code != 0, Some(said(r)));
+  assert(string_contains(stderr(r), "--tls NAME=CERT.pem,KEY.pem"), Some(stderr(r)));
+  assert(!string_contains(stderr(r), "E0430"), Some(stderr(r)))
+}
+
+test/nondet "TLS without host is refused" {
+  fold(["run", "test", "hosts"], (), |u: Unit, command: String| {
+    let r = in_memory(one(secure()), [command, "--tls", "api=a.pem,b.key"]);
+    assert(r.code != 0, Some("`ply " ++ command ++ " --tls` without `--host` must be refused"))
+  })
+}
+
+test/nondet "a hermetic run reaches no credential and says so" {
+  program(secure());
+  let r = on_disk(["run"]);
+  assert(string_contains(said(r), "E0424"), Some(said(r)));
+  assert(
+    string_contains(said(r), "ply_host::tls::listen"),
+    Some("E0424 must name the handler that would have served it:\n" ++ said(r)),
+  )
+}

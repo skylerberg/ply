@@ -1,0 +1,83 @@
+// What the command line decides about a project's cache: where it goes, and that nothing about how
+// a run was scheduled reaches a hash.
+
+import harness (on_disk, project, working, json_of, at, path, items, str, shown, concatenated)
+import std.fs (fs, Entry, Dir)
+import std.json (Json)
+
+fn core() -> String =
+  \\pub type Money = Int
+  \\
+  \\pub type Item =
+  \\  | Book(String, Money)
+  \\  | Note(String)
+  \\
+  \\pub effect db {
+  \\  read  get[r](key: Int) -> Int
+  \\  write put[r](key: Int, value: Int) -> Int
+  \\}
+  \\
+  \\pub fn price(i: Item) -> Money =
+  \\  match i {
+  \\    Book(_, p) -> p,
+  \\    Note(_) -> 0,
+  \\  }
+  \\
+  \\pub fn label(i: Item) -> String =
+  \\  match i {
+  \\    Book(t, _) -> t,
+  \\    Note(t) -> t,
+  \\  }
+  \\
+  \\test "a note is free" {
+  \\  assert_eq(price(Note("n")), 0)
+  \\}
+  \\
+
+fn shop() -> String =
+  \\import core
+  \\
+  \\fn total(items: List<core::Item>) -> Int =
+  \\  fold(items, 0, |acc, i: core::Item| acc + core::price(i))
+  \\
+  \\fn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)
+  \\
+  \\test "a shelf adds up" {
+  \\  assert_eq(total([core::Book("b", 3), core::Note("n")]), 3)
+  \\}
+  \\
+
+fn corpus() -> Unit =
+  project([
+    { path: "core.ply", text: core() },
+    { path: "shop.ply", text: shop() },
+    { path: "leaf.ply", text: "pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n" },
+  ])
+
+fn test_hashes(extra: List<String>) -> List<String> = {
+  let v = json_of(on_disk(concatenated(["test", "--json"], extra)));
+  map(items(path(v, ["selection", "tests"])), |t: Json|
+    shown(at(t, "key")) ++ " " ++ shown(at(t, "hash")))
+}
+
+// The front end is serial, so the worker count must not reach a hash.
+test/nondet "the worker count does not reach a test hash" {
+  corpus();
+  let one = test_hashes(["--jobs", "1"]);
+  assert_eq(one, test_hashes(["--jobs", "10"]));
+  assert_eq(one, test_hashes(["--no-cache"]))
+}
+
+test/nondet "a relative and an absolute path share one cache" {
+  corpus();
+  // The front-end cache is opened by the load, so nothing has to run for this to be about it.
+  let _ = on_disk(["test", "--filter", "nonexistent"]);
+  assert_eq(on_disk(["test", "--filter", "nonexistent", working()]).code, 0);
+  // One cache under the project root either way: an absolute path must not open a second one.
+  let caches = match fs.walk[cwd](".") {
+    Some(entries) ->
+      filter(entries, |e: Entry| e.kind == Dir && string_ends_with(e.path, ".ply-cache")),
+    None -> panic("the working directory walks"),
+  };
+  assert_eq(len(caches), 1)
+}

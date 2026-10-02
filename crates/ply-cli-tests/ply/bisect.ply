@@ -1,0 +1,292 @@
+// A test that passed and now fails: which edit it was, found by running mixtures of the old and new
+// definitions, and what such a search can and cannot conclude.
+
+import harness (program, project, write, on_disk, spawned, said, stdout, json_of, at, path, nth,
+                items, str, int, shown, concatenated)
+import std.json
+import std.json (Json, Null, Array, Str)
+import std.string
+
+fn red() -> String =
+  \\fn balance() -> Int = 0 - 5
+  \\
+  \\fn main() -> Int = balance()
+  \\
+  \\test "balance never goes negative" { assert_eq(balance(), 0) }
+  \\
+  \\test "this one is fine" { assert_eq(1 + 1, 2) }
+  \\
+
+fn tested(flags: List<String>) -> Json = json_of(on_disk(concatenated(["test", "--json"], flags)))
+
+fn culprit_of(v: Json) -> Json = at(nth(at(v, "failures"), 0), "culprit")
+
+fn texts(xs: List<String>) -> Json = Array(map(xs, |x: String| Str(x)))
+
+// The program tested green, then edited into `edited`.
+fn passed_then(source: String, edited: String) -> Unit = {
+  program(source);
+  let r = on_disk(["test"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(edited != source, Some("the edit did not apply"));
+  write("m.ply", edited)
+}
+
+test/nondet "--bisect never reports not requested and is still one json object" {
+  program(red());
+  let r = on_disk(["test", "--json", "--bisect", "never"]);
+  assert(r.code == 1, Some(said(r)));
+  let v = json_of(r);
+  assert(str(path(v, ["options", "bisect"])) == "never", Some(shown(v)));
+  assert(int(path(v, ["options", "bisect_budget"])) == 64, Some(shown(v)));
+  let culprit = culprit_of(v);
+  assert(str(at(culprit, "verdict")) == "not_attempted", Some(shown(culprit)));
+  assert(str(at(culprit, "skipped")) == "not_requested", Some(shown(culprit)));
+  assert(str(at(culprit, "confidence")) == "none", Some(shown(culprit)));
+  assert(int(path(culprit, ["search", "evaluated"])) == 0, Some(shown(culprit)))
+}
+
+fn ledger() -> String =
+  \\fn normal_sign(n: Int) -> Int = if n < 0 { 0 - 1 } else { 1 }
+  \\
+  \\fn balance(a: Int, b: Int, c: Int) -> Int = (a + b) + c
+  \\
+  \\fn presented(a: Int, b: Int, c: Int) -> Int = balance(a, b, c) * normal_sign(a)
+  \\
+  \\test "balance never goes negative" { assert_eq(presented(1, 2, 3), 6) }
+  \\
+
+fn sign_flipped(s: String) -> String =
+  string::replace(s, "if n < 0 { 0 - 1 } else { 1 }", "if n < 0 { 0 - 1 } else { 0 - 1 }")
+
+// The edit that breaks the test, beside one that only regroups a sum.
+fn both_edits(s: String) -> String = string::replace(sign_flipped(s), "(a + b) + c", "a + (b + c)")
+
+test/nondet "two candidate edits are narrowed to the culprit by running the mixture" {
+  passed_then(ledger(), both_edits(ledger()));
+  let r = on_disk(["test"]);
+  assert(r.code == 1, Some(said(r)));
+  assert(
+    string_contains(stdout(r), "culprit: m.normal_sign"),
+    Some("the terminal block must lead with the culprit:\n" ++ stdout(r)),
+  );
+  let failure = nth(at(tested([]), "failures"), 0);
+  let culprit = at(failure, "culprit");
+  assert(str(at(culprit, "verdict")) == "bisected", Some(shown(culprit)));
+  assert(str(at(culprit, "confidence")) == "minimal", Some(shown(culprit)));
+  assert(at(culprit, "definitions") == texts(["m.normal_sign"]), Some(shown(culprit)));
+  assert(at(culprit, "skipped") == Null, Some(shown(culprit)));
+  assert(
+    int(path(culprit, ["search", "evaluated"])) > 0,
+    Some("a mixture was actually run: " ++ shown(culprit)),
+  );
+  // The suspects the program's own verdict marked, culprit first: the runtime ranked them from the
+  // run's evidence and the verdict says which of them the failure came from.
+  let suspects = at(failure, "suspects");
+  assert(str(at(nth(suspects, 0), "name")) == "m.normal_sign", Some(shown(failure)));
+  assert(at(nth(suspects, 0), "culprit") == json::Bool(true), Some(shown(failure)));
+  assert(str(at(nth(suspects, 1), "name")) == "m.balance", Some(shown(failure)));
+  assert(at(nth(suspects, 1), "culprit") == json::Bool(false), Some(shown(failure)))
+}
+
+test/nondet "an earlier file does not cost the failure its culprit" {
+  // Sorts before `m.ply`, so its tests take the indices `m`'s would otherwise line up against.
+  project([
+    { path: "m.ply", text: ledger() },
+    {
+      path: "a.ply",
+      text:
+        \\pub fn untouched(x: Int) -> Int = x
+        \\test "untouched is the identity" { assert_eq(untouched(1), 1) }
+        \\test "untouched keeps zero" { assert_eq(untouched(0), 0) }
+        \\
+    },
+  ]);
+  assert(on_disk(["test"]).code == 0, None);
+  write("m.ply", both_edits(ledger()));
+  let culprit = culprit_of(tested([]));
+  assert(str(at(culprit, "verdict")) == "bisected", Some(shown(culprit)));
+  assert(at(culprit, "definitions") == texts(["m.normal_sign"]), Some(shown(culprit)));
+  assert(int(path(culprit, ["search", "evaluated"])) > 0, Some(shown(culprit)))
+}
+
+test/nondet "--bisect never runs no mixture even when one could be built" {
+  passed_then(ledger(), sign_flipped(ledger()));
+  let culprit = culprit_of(tested(["--bisect", "never"]));
+  assert(str(at(culprit, "verdict")) == "not_attempted", Some(shown(culprit)));
+  assert(str(at(culprit, "skipped")) == "not_requested", Some(shown(culprit)));
+  assert(int(path(culprit, ["search", "evaluated"])) == 0, Some(shown(culprit)))
+}
+
+// Bisection proves things about mixtures, never about the program the user wrote.
+test/nondet "a bisected failure leaves the next run's suspects unchanged" {
+  passed_then(ledger(), both_edits(ledger()));
+  let names = |v: Json|
+    map(items(at(nth(at(v, "failures"), 0), "suspects")), |s: Json| str(at(s, "name")));
+  let first = tested([]);
+  let second = tested([]);
+  assert(names(first) != [], Some(shown(first)));
+  assert(names(first) == names(second), Some(shown(second)));
+  assert(
+    path(culprit_of(first), ["definitions"]) == path(culprit_of(second), ["definitions"]),
+    None,
+  )
+}
+
+fn five() -> String =
+  \\fn a(n: Int) -> Int = n + 1
+  \\fn b(n: Int) -> Int = n + 2
+  \\fn c(n: Int) -> Int = n + 3
+  \\fn d(n: Int) -> Int = n + 4
+  \\fn e(n: Int) -> Int = n + 5
+  \\fn all(n: Int) -> Int = a(n) + b(n) + c(n) + d(n) + e(n)
+  \\
+  \\test "sums" { assert_eq(all(0), 15) }
+  \\
+
+// Four edits that only move a sum's terms and one that changes it: the mixtures tell them apart, and
+// each one that went green is filed under its own key, so the next bisection reads it back.
+test/nondet "only the culprit among five edits is named and the next run reads its mixtures back" {
+  passed_then(
+    five(),
+    fold(
+      [
+        ["= n + 1", "= 1 + n"],
+        ["= n + 2", "= 2 + n"],
+        ["= n + 3", "= n + 9"],
+        ["= n + 4", "= 4 + n"],
+        ["= n + 5", "= 5 + n"],
+      ],
+      five(),
+      |s: String, edit: List<String>|
+        match edit { [from, to] -> string::replace(s, from, to), _ -> s },
+    ),
+  );
+  let culprit = culprit_of(tested([]));
+  assert(str(at(culprit, "verdict")) == "bisected", Some(shown(culprit)));
+  assert(at(culprit, "definitions") == texts(["m.c"]), Some(shown(culprit)));
+  assert(int(path(culprit, ["search", "cached"])) == 0, Some(shown(culprit)));
+  let again = culprit_of(tested([]));
+  assert(at(again, "definitions") == texts(["m.c"]), Some(shown(again)));
+  assert(
+    int(path(again, ["search", "cached"])) > 0,
+    Some("no mixture the first bisection proved was read back: " ++ shown(again)),
+  )
+}
+
+// Neither edit alone is a cause, so a search may not assume one is.
+test/nondet "two edits that only fail together are both named" {
+  let together =
+    \\fn flag() -> Bool = true
+    \\fn left() -> Int = 3 + 4
+    \\fn right() -> Int = 7
+    \\fn pick() -> Int = if flag() { left() } else { right() }
+    \\
+    \\test "pick" { assert_eq(pick(), 7) }
+    \\
+  ;
+  passed_then(
+    together,
+    string::replace(
+      string::replace(together, "fn flag() -> Bool = true", "fn flag() -> Bool = false"),
+      "fn right() -> Int = 7",
+      "fn right() -> Int = 8",
+    ),
+  );
+  let culprit = culprit_of(tested([]));
+  assert(str(at(culprit, "verdict")) == "bisected", Some(shown(culprit)));
+  assert(at(culprit, "definitions") == texts(["m.flag", "m.right"]), Some(shown(culprit)))
+}
+
+// Every mixture carries the test's own text, so no trial can clear it: the test is the cause, and the
+// definition that moved beside it is innocent.
+test/nondet "an edited test beside an edited definition names the test" {
+  let edited_test =
+    \\fn scale(n: Int) -> Int = n * 2
+    \\fn other(n: Int) -> Int = n + 1
+    \\
+    \\test "doubles" { assert_eq(scale(2) + other(0), 5) }
+    \\
+  ;
+  passed_then(
+    edited_test,
+    string::replace(
+      string::replace(edited_test, "+ other(0), 5", "+ other(0), 9"),
+      "fn other(n: Int) -> Int = n + 1",
+      "fn other(n: Int) -> Int = 1 + n",
+    ),
+  );
+  let failure = nth(at(tested([]), "failures"), 0);
+  assert(str(path(failure, ["culprit", "verdict"])) == "test_changed", Some(shown(failure)));
+  assert(path(failure, ["culprit", "definitions"]) == texts(["m.doubles"]), Some(shown(failure)));
+  assert(
+    len(
+        filter(items(at(failure, "suspects")), |s: Json|
+          str(at(s, "name")) == "m.other" && at(s, "culprit") == json::Bool(false)),
+      )
+      > 0,
+    Some(shown(failure)),
+  )
+}
+
+// A recursive group shares one component hash and one stored body, so no hybrid can flip one member
+// without the other.
+test/nondet "a recursive pair is reported as one fused group that says why" {
+  let parity =
+    \\fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
+    \\
+    \\fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
+    \\
+    \\test "parity" { assert(even(4)) }
+    \\
+  ;
+  passed_then(
+    parity,
+    string::replace(
+      parity,
+      "fn even(n: Int) -> Bool = if n == 0 { true }",
+      "fn even(n: Int) -> Bool = if n == 0 { false }",
+    ),
+  );
+  let culprit = culprit_of(tested([]));
+  assert(str(at(culprit, "confidence")) == "fused", Some(shown(culprit)));
+  assert(at(culprit, "groups") == Array([texts(["m.even", "m.odd"])]), Some(shown(culprit)));
+  assert(
+    string_contains(str(at(culprit, "reason")), "mutually recursive"),
+    Some("the artifact has to say why they are inseparable: " ++ shown(culprit)),
+  )
+}
+
+// What a bisection's mixtures proved is written after the run's own write, so the next process
+// answers them from the cache rather than building them again; the second run is a process of its
+// own to say so.
+test/nondet "a bisection's proven mixtures outlive the process that tried them" {
+  let summed = |b: String, c: String|
+    "fn a(n: Int) -> Int = n + 1\nfn b(n: Int) -> Int = n + " ++ b ++ "\nfn c(n: Int) -> Int = n + "
+      ++ c
+      ++ "\nfn all(n: Int) -> Int = a(n) + b(n) + c(n)\n\ntest \"sums\" { assert_eq(all(0), 6) }\n";
+  passed_then(summed("2", "3"), summed("5", "4"));
+  let first = tested([]);
+  assert(int(path(culprit_of(first), ["search", "cached"])) == 0, Some(shown(first)));
+  let second = json_of(spawned(["test", "--json"], []));
+  assert(
+    int(path(culprit_of(second), ["search", "cached"])) > 0,
+    Some("nothing the first bisection proved was read back: " ++ shown(second)),
+  )
+}
+
+// Attribution re-normalizes against the loaded tree, which every module of a load has.
+test/nondet "an earlier module does not lose the attribution" {
+  project([
+    { path: "a.ply", text: "fn one() -> Int = 1\n\ntest \"a is fine\" { assert_eq(one(), 1) }\n" },
+    { path: "b.ply", text: "fn two() -> Int = 2\n\ntest \"b holds\" { assert_eq(two(), 2) }\n" },
+  ]);
+  assert(on_disk(["test"]).code == 0, None);
+  write("b.ply", "fn two() -> Int = 2\n\ntest \"b holds\" { assert_eq(two(), 3) }\n");
+  let culprit = culprit_of(tested([]));
+  assert(
+    str(at(culprit, "verdict")) == "test_changed",
+    Some("only the test body moved: " ++ shown(culprit)),
+  );
+  assert(str(nth(at(culprit, "definitions"), 0)) == "b.b holds", Some(shown(culprit)))
+}
