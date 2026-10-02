@@ -1515,7 +1515,10 @@ calls `serve` itself, and `startup_parameters` is what they are sent as.
 start-up. The label is a namespace you choose (`config.read[credentials]`).
 Describe keys with `spec`, `required`, `optional` and `with_default`, and pass
 the `ConfigSpec` with `--config-schema`. A key the schema declares secret is
-readable only through `config.secret`; without a schema no key is secret.
+readable only through `config.secret`; without a schema no key is secret. Each
+supplied value is checked against its shape before anything is bound: an `SInt`
+is what `std.string.int_of_string` reads, an `SBool` is `true` or `false`, and
+an `SSecret` is not empty.
 
 ### 13.7 `std.trace`
 

@@ -9,7 +9,7 @@
 
 use crate::hosts::{self, Hosts, Lent};
 use crate::payload::{count, diags_value, field_of, json, option, raised_value, record, strings};
-use crate::support::{build_backend_over, enter_constant, module_texts, select_profile};
+use crate::support::{build_backend_over, module_texts, select_profile};
 use crate::testrun::{
     Executed, Executor, Hosting, Interleaved, Use, executed, interleaved, status_word,
 };
@@ -21,10 +21,12 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 /// The effect `crates/ply-cli/ply/tester.ply` declares.
 const EFFECT: &str = "tester";
 
-const OPERATIONS: [(&str, &str); 7] = [
+const OPERATIONS: [(&str, &str); 8] = [
     ("configure", "ply_machine::tester::configure"),
-    // The programs tests run in, the binding over the first, and what it came to.
+    // The programs tests run in, the schema the first one enters, the binding over it, and what
+    // it came to.
     ("unit", "ply_machine::tester::unit"),
+    ("schema", "ply_machine::tester::schema"),
     ("bound", "ply_machine::tester::bound"),
     ("hosted", "ply_machine::tester::hosted"),
     ("ended", "ply_machine::tester::ended"),
@@ -48,7 +50,6 @@ pub struct TestOptions {
     pub exec: Vec<ply_host::process::ExecSpec>,
     /// The privileged families `--allow` lends the tests, which the program must declare.
     pub allow: Vec<String>,
-    pub config: crate::config::ConfigOptions,
 }
 
 impl Default for TestOptions {
@@ -63,7 +64,6 @@ impl Default for TestOptions {
             fs: Vec::new(),
             exec: Vec::new(),
             allow: Vec::new(),
-            config: crate::config::ConfigOptions::default(),
         }
     }
 }
@@ -152,7 +152,11 @@ impl HostHandler for Site {
                 arg(req, 2)?.as_bool(span, "whether the unit reaches the binding")?,
                 span,
             )?,
-            "bound" => self.bound()?,
+            "schema" => {
+                let name = arg(req, 0)?.as_str(span, "a definition's name")?;
+                self.schema(name)?
+            }
+            "bound" => self.bound(crate::config::Configuration::of(arg(req, 0)?, span)?)?,
             "hosted" => self.hosted()?,
             "ended" => {
                 *self.run.write().unwrap_or_else(|e| e.into_inner()) = Run::default();
@@ -275,7 +279,18 @@ impl Site {
 
     /// The host binding over the first unit: the configuration, the programs `--exec` names, the
     /// families `--allow` lends, and what the program declares. A refusal binds nothing.
-    fn bound(&self) -> Result<PlyValue, Diagnostic> {
+    /// The value of the definition `--config-schema` names, entered on the first unit.
+    fn schema(&self, name: &str) -> Result<PlyValue, Diagnostic> {
+        let run = self.run.read().unwrap_or_else(|e| e.into_inner());
+        let unit = run.units.first().ok_or_else(|| out_of_step("schema"))?;
+        Ok(crate::config::schema_answer(crate::config::schema_of(
+            &unit.front.check,
+            unit.provider,
+            name,
+        )))
+    }
+
+    fn bound(&self, configuration: crate::config::Configuration) -> Result<PlyValue, Diagnostic> {
         let options = lock(&self.options).clone();
         let mut run = self.run.write().unwrap_or_else(|e| e.into_inner());
         let unit = run
@@ -284,16 +299,6 @@ impl Site {
             .cloned()
             .ok_or_else(|| out_of_step("bound"))?;
         let check = &unit.front.check;
-        let constant = |name: &str| enter_constant(unit.provider, name);
-        let (configuration, warnings) = match crate::config::Configuration::open(
-            check,
-            options.host,
-            &options.config,
-            &constant,
-        ) {
-            Ok(resolved) => resolved,
-            Err(diagnostics) => return Ok(err(diags_value(&diagnostics))),
-        };
         // A test is not a process: of `process` it binds only what names a program, and only the
         // programs `--exec` names, so under `--host` an unnamed label is unbound rather than withheld.
         let process = if options.host {
@@ -328,7 +333,7 @@ impl Site {
             runtime: hosts.runtime_factory(),
         };
         run.binding = Some(Bound { hosts, hosting });
-        Ok(ok(diags_value(&warnings)))
+        Ok(ok(PlyValue::Unit))
     }
 
     /// What the binding and the first unit's backend came to, once the run is over.
@@ -525,7 +530,7 @@ fn interleaved_value(run: &Interleaved) -> PlyValue {
 /// The options record as the program builds it from the parsed line, read for what the binding
 /// and the budgets need. The program validated already, so a bad value here is an internal error.
 pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnostic> {
-    use crate::payload::{opt_str_at, str_list_at};
+    use crate::payload::str_list_at;
     let bool_at = |name: &str| field_of(v, name, span)?.as_bool(span, name);
     let int_at = |name: &str| field_of(v, name, span)?.as_int(span, name);
     let str_at = |name: &str| {
@@ -561,7 +566,6 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
         }
         Ok(out)
     };
-    let config = field_of(v, "config", span)?;
     Ok(TestOptions {
         path: PathBuf::from(str_at("path")?),
         steps: int_at("steps")?,
@@ -590,14 +594,6 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
             })
             .collect(),
         allow: str_list_at(v, "allow", span)?,
-        config: crate::config::ConfigOptions {
-            set: str_list_at(config, "set", span)?,
-            files: str_list_at(config, "files", span)?
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
-            schema: opt_str_at(config, "schema", span)?,
-        },
     })
 }
 

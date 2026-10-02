@@ -955,11 +955,7 @@ fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
             .unwrap(),
     );
     assert_eq!(missing["ok"], false, "{missing}");
-    assert_eq!(
-        missing["diagnostics"][0]["code"],
-        codes::CONFIG_MISSING,
-        "{missing}"
-    );
+    assert_eq!(missing["diagnostics"][0]["code"], "E0441", "{missing}");
 
     // And starts once the key is supplied: the schema is applied, not merely present.
     let served = json_of(

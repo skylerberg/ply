@@ -85,6 +85,15 @@ fn options(root: &Path) -> Value {
     ])
 }
 
+/// What a run with no `--host` binds: no source was opened.
+fn unconfigured() -> Value {
+    record(vec![
+        ("values", Value::list(Vec::new())),
+        ("schema", option(None)),
+        ("opened", Value::Bool(false)),
+    ])
+}
+
 /// The value inside an `Ok`.
 fn ok(answer: Value) -> Value {
     match &answer {
@@ -164,12 +173,11 @@ fn a_second_configuration_is_a_second_run_over_its_own_project() {
                 "the second run collected the first project"
             );
         }
-        let warnings = ok(ask(
+        ok(ask(
             &lent,
             "prepared",
-            vec![Value::Int(ply_eval::DEFAULT_STEP_BUDGET)],
+            vec![Value::Int(ply_eval::DEFAULT_STEP_BUDGET), unconfigured()],
         ));
-        assert!(list(&warnings).is_empty(), "{warnings:?}");
         // Each law judged where every binder is zero, which each of them holds at.
         let batches = owed
             .iter()

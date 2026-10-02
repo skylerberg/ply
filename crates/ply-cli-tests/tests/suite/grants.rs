@@ -12,7 +12,8 @@ nondet effect machine {
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m]() -> Result<Target, Refusal>
-  read bound[m](entry: String) -> Result<Bound, Refusal>
+  read schema[m](name: String) -> Result<Value, List<Diag>>
+  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
@@ -33,6 +34,11 @@ type Target = Unit
 type Walked = Unit
 type Bound = Unit
 type Refusal = Unit
+type Configured = {
+  values: List<{ key: String, value: String, secret: Bool }>,
+  schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
+  opened: Bool,
+}
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
@@ -53,7 +59,7 @@ type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 
 fn main() -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
   match machine.load[m](\"inner\", None, None) {
-    Ok(_) -> match machine.bound[m](\"inner.main\") {
+    Ok(_) -> match machine.bound[m](\"inner.main\", { values: [], schema: None, opened: false }) {
       Ok(_) -> {
         let doubled = machine.call[m](\"inner.double\", [VInt(21)]);
         let spent = machine.accounting[m]();
@@ -145,7 +151,8 @@ nondet effect prover {
   write configure[claims](options: Unit, front: Unit, world: Unit) -> Unit
   read collected[claims]() -> Result<Unit, Unit>
   read cached[claims](keys: List<String>) -> List<Option<String>>
-  read prepared[claims](step_budget: Int) -> Result<List<Unit>, Unit>
+  read schema[claims](name: String) -> Result<Unit, Unit>
+  read prepared[claims](step_budget: Int, config: Unit) -> Result<Unit, Unit>
   read judged[claims](batches: List<Unit>) -> List<List<Unit>>
   read interleaved[claims](claim: Int, point: List<Unit>, seed: Unit, steps: Int) -> Unit
   read ended[claims]() -> List<Unit>

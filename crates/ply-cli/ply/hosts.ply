@@ -5,10 +5,14 @@
 
 import args (Flags, no_flags, style_of)
 import config_schema
+import configuration
+import configuration (Report, ReportKey, Resolution)
+import env (env)
+import std.value (Value)
 import program (Timed, front_of, no_front, timed_uncached)
 import builder (builder)
 import cache (Front)
-import std.fs (fs)
+import std.fs (fs, Missing)
 import std.time (time)
 import compiler.resolve (Diag)
 import diagnostic (Place, all_to_json, all_to_text)
@@ -19,7 +23,9 @@ import style (Style, plain, red)
 
 // The trusted computing base, as the Rust side assembles it under the host flags.
 pub nondet effect tcb {
-  read preview[r](root: String, options: machine::Options, front: Front) -> Preview
+  // The value of the nullary definition `--config-schema` names, entered on the program's unit.
+  read schema[r](root: String, front: Front, name: String) -> Result<Value, List<Diag>>
+  read preview[r](root: String, options: machine::Options, front: Front, config: machine::Configured) -> Previewed
 }
 
 // --- What the Rust side answers with ----------------------------------------
@@ -68,23 +74,6 @@ pub type Pool = {
   statement_cache: Int,
 }
 
-pub type Key = { name: String, value: String, source: String, secret: Bool }
-
-pub type KeyShape = { name: String, shape: String }
-
-pub type ConfigSchema = { function: String, keys: List<KeyShape> }
-
-pub type Configuration = {
-  sets: Int,
-  files: List<String>,
-  environment: Int,
-  defaults: Int,
-  schema: Option<ConfigSchema>,
-  resolved: Int,
-  secret: Int,
-  keys: List<Key>,
-}
-
 pub type Observability = {
   sink: String,
   destination: String,
@@ -95,6 +84,25 @@ pub type Observability = {
 
 pub type Stopping = { signals: List<String>, lead_ms: Int, drain_ms: Int }
 
+// What the Rust side answers: everything but the configuration, which the program resolved.
+pub type Previewed = {
+  stage: Stage,
+  // The root the load was rooted at, as a report prints it.
+  root: String,
+  handlers: Int,
+  rows: List<Row>,
+  digest: String,
+  // Whether the run binds nothing, which is so unless `--host` was passed.
+  hermetic: Bool,
+  transport: Option<Transport>,
+  filesystem: Option<Filesystem>,
+  observability: Option<Observability>,
+  shutdown: Option<Stopping>,
+  diags: List<Diag>,
+  places: List<Place>,
+}
+
+// The preview as the report reads it, with the configuration the program resolved.
 pub type Preview = {
   stage: Stage,
   // The root the load was rooted at, as a report prints it.
@@ -106,7 +114,7 @@ pub type Preview = {
   hermetic: Bool,
   transport: Option<Transport>,
   filesystem: Option<Filesystem>,
-  configuration: Option<Configuration>,
+  configuration: Option<Report>,
   observability: Option<Observability>,
   shutdown: Option<Stopping>,
   diags: List<Diag>,
@@ -240,7 +248,7 @@ fn filesystem_lines(f: Filesystem) -> List<String> =
       push(acc, padded(r.name, width) ++ "  " ++ r.path))
   }
 
-fn config_schema_line(c: Configuration) -> String =
+fn config_schema_line(c: Report) -> String =
   match c.schema {
     None ->
       "schema     none — without `--config-schema` a missing key is a `None` at the call site, later and per key",
@@ -252,7 +260,7 @@ fn config_schema_line(c: Configuration) -> String =
         ++ " secret",
   }
 
-fn configuration_lines(c: Configuration) -> List<String> = {
+fn configuration_lines(c: Report) -> List<String> = {
   let head = [
     "",
     "configuration",
@@ -265,7 +273,7 @@ fn configuration_lines(c: Configuration) -> List<String> = {
     config_schema_line(c),
   ];
   if c.resolved == 0 { head } else {
-    let keys = map(c.keys, |k: Key| k.name ++ "=" ++ k.value ++ " (" ++ k.source ++ ")");
+    let keys = map(c.keys, |k: ReportKey| k.name ++ "=" ++ k.value ++ " (" ++ k.source ++ ")");
     push(head, "keys       " ++ joined(keys, " · "))
   }
 }
@@ -377,49 +385,6 @@ fn filesystem_json(f: Filesystem) -> Json =
     },
   ])
 
-fn config_schema_json(s: Option<ConfigSchema>) -> Json =
-  match s {
-    None -> Null,
-    Some(v) ->
-      object([
-        { key: "function", value: Str(v.function) },
-        {
-          key: "keys",
-          value: Array(
-            map(v.keys, |k: KeyShape|
-              object([{ key: "name", value: Str(k.name) }, { key: "shape", value: Str(k.shape) }])),
-          ),
-        },
-      ]),
-  }
-
-fn configuration_json(c: Configuration) -> Json =
-  object([
-    {
-      key: "sources",
-      value: object([
-        { key: "set", value: num(c.sets) },
-        { key: "files", value: strings(c.files) },
-        { key: "environment", value: num(c.environment) },
-      ]),
-    },
-    { key: "schema", value: config_schema_json(c.schema) },
-    { key: "resolved", value: num(c.resolved) },
-    { key: "secret", value: num(c.secret) },
-    {
-      key: "keys",
-      value: Array(
-        map(c.keys, |k: Key|
-          object([
-            { key: "name", value: Str(k.name) },
-            { key: "value", value: Str(k.value) },
-            { key: "source", value: Str(k.source) },
-            { key: "secret", value: Bool(k.secret) },
-          ])),
-      ),
-    },
-  ])
-
 fn observability_json(o: Observability) -> Json =
   object([
     { key: "sink", value: Str(o.sink) },
@@ -450,7 +415,11 @@ fn report_json(p: Preview) -> Json = {
   ];
   let after_transport = block(head, "transport", mapped(p.transport, transport_json));
   let after_fs = block(after_transport, "filesystem", mapped(p.filesystem, filesystem_json));
-  let after_config = block(after_fs, "configuration", mapped(p.configuration, configuration_json));
+  let after_config = block(
+    after_fs,
+    "configuration",
+    mapped(p.configuration, configuration::report_json),
+  );
   let after_trace = block(
     after_config,
     "observability",
@@ -517,33 +486,69 @@ fn answered(s: Style, flags: Flags, p: Preview) -> Answer = {
 pub fn run(
   flags: Flags,
   options: machine::Options,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tcb.preview[host]} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tcb.schema[host], tcb.preview[host], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs]} = {
   let s: Style = style_of(flags);
   let t: Timed = timed_uncached(flags.paths);
   match t.program.whole {
     None -> refused(s, "hosts", t.program.diags, t.program.places),
     Some(w) -> match config_schema::refusal(w, options.config.schema) {
       Some(d) -> unbound(s, [d], t.program.places),
-      None -> binding_over(s, flags, options, front_of(t, w)),
+      None -> binding_over(s, flags, options, front_of(t, w), t.program.places),
     },
   }
 }
 
-// The binding, over the front end `run` loaded.
+// The preview the Rust side assembled, with the configuration this side resolved: shown only when a
+// source was read, and its warnings the binding's.
+fn shown(p: Previewed, r: Resolution) -> Preview =
+  {
+    stage: p.stage,
+    root: p.root,
+    handlers: p.handlers,
+    rows: p.rows,
+    digest: p.digest,
+    hermetic: p.hermetic,
+    transport: p.transport,
+    filesystem: p.filesystem,
+    configuration: if configuration::opened(r.configuration) {
+      Some(configuration::report(r.configuration))
+    } else { None },
+    observability: p.observability,
+    shutdown: p.shutdown,
+    diags: appended(r.warnings, p.diags),
+    places: p.places,
+  }
+
+// The binding, over the front end `run` loaded: its configuration first, whose schema the program's
+// own unit enters, then what the host flags open.
 fn binding_over(
   s: Style,
   flags: Flags,
   options: machine::Options,
   front: Front,
-) -> Answer / {tcb.preview[host]} = {
-  let p: Preview = tcb.preview[host](root_of(flags), options, front);
-  match p.stage {
-    NotLoaded -> refused(s, "hosts", p.diags, p.places),
-    NotResolved -> unresolved(s, p),
-    NotBound -> unbound(s, p.diags, p.places),
-    Bound -> answered(s, flags, p),
+  places: List<Place>,
+) -> Answer / {tcb.schema[host], tcb.preview[host], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs]} =
+  match configuration::opened_by(options.host, options.config, |name: String|
+      tcb.schema[host](root_of(flags), front, name)) {
+    Err(diags) -> unbound(s, diags, places),
+    Ok(r) -> {
+      let p = shown(
+        tcb.preview[host](
+          root_of(flags),
+          options,
+          front,
+          configuration::configured(r.configuration),
+        ),
+        r,
+      );
+      match p.stage {
+        NotLoaded -> refused(s, "hosts", p.diags, p.places),
+        NotResolved -> unresolved(s, p),
+        NotBound -> unbound(s, p.diags, p.places),
+        Bound -> answered(s, flags, p),
+      }
+    },
   }
-}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -724,7 +729,7 @@ test "the shutdown block says what a second signal does" {
 }
 
 test "the configuration block counts its sources and never prints a secret's value" {
-  let c: Configuration = {
+  let c: Report = {
     sets: 1,
     files: ["deploy.env"],
     environment: 40,
@@ -750,12 +755,38 @@ test "the configuration block counts its sources and never prints a secret's val
   assert(!string_contains(joined(lines, "\n"), "hunter2"))
 }
 
-// The run's own answer, over a preview the test hands it in place of the Rust side.
+// What the Rust side answers for a preview a test builds: the report's own, less the
+// configuration this side resolves.
+fn previewed(p: Preview) -> Previewed =
+  {
+    stage: p.stage,
+    root: p.root,
+    handlers: p.handlers,
+    rows: p.rows,
+    digest: p.digest,
+    hermetic: p.hermetic,
+    transport: p.transport,
+    filesystem: p.filesystem,
+    observability: p.observability,
+    shutdown: p.shutdown,
+    diags: p.diags,
+    places: p.places,
+  }
+
+// The run's own answer, over a preview the test hands it in place of the Rust side. Without
+// `--host` nothing is read, so the environment and the tree answer nothing.
 fn answered_over(p: Preview, flags: Flags) -> Answer =
   handle {
-    binding_over(plain(), flags, machine::default_options(), no_front())
+    binding_over(plain(), flags, machine::default_options(), no_front(), [])
   } with {
-    tcb.preview[host](root, options, front) -> p,
+    tcb.schema[host](root, front, name) -> Err([]),
+    tcb.preview[host](root, options, front, config) -> previewed(p),
+    env.vars[sys]() -> [],
+    env.pwd[sys]() -> "/w",
+    fs.resolved[cwd](path) -> Missing,
+    fs.resolved[abs](path) -> Missing,
+    fs.read_file[cwd](path) -> None,
+    fs.read_file[abs](path) -> None,
   }
 
 test "the listing opens on a blank line and every other line is indented" {
