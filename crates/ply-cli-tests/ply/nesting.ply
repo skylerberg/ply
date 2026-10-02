@@ -1,0 +1,156 @@
+// No shipped definition nests deeper than the emitter has ever been asked to walk. The emitter
+// recurses over an expression, so depth is what costs it and not size; past what the thread's stack
+// holds, `emit.emit_roots_answer` raises in the bootstrap fixpoint, the most expensive place in CI
+// to learn it. This is a source-level proxy for that walk: bracket nesting, plus a level for each
+// `?`, which wraps the rest of its block in a `match`, and each `else if`, one more nested `if`.
+
+import std.fs (fs)
+import std.string
+
+// Just past the deepest definition the compiler, the standard library and the program hold.
+// Raising it asks the emitter to recurse further than it ever has; flatten the definition instead.
+fn deepest() -> Int = 32
+
+// Where the shelf and the `ply` program's closure are kept.
+fn trees() -> List<String> =
+  [
+    "crates/ply-std/ply",
+    "crates/ply-compiler/ply",
+    "crates/ply-cli/ply",
+    "crates/ply-test/ply",
+    "crates/ply-sim/ply",
+    "crates/ply-prove/ply",
+  ]
+
+// The text with comments, string and byte literals and line strings removed, so brackets inside
+// them do not count.
+fn bare(text: Bytes) -> Bytes = bare_from(text, 0, [])
+
+fn bare_from(t: Bytes, i: Int, kept: List<Bytes>) -> Bytes = {
+  let n = bytes_len(t);
+  let stop = if i >= n { n } else { bytes_scan_until(t, i, b"/\\\"", n - i) };
+  let so_far = push(kept, bytes_slice(t, i, stop));
+  if stop >= n { bytes_concat_all(so_far) } else {
+    let c = bytes_at(t, stop);
+    let next = if stop + 1 < n { bytes_at(t, stop + 1) } else { -1 };
+    if (c == 47 && next == 47) || (c == 92 && next == 92) {
+      bare_from(t, line_end(t, stop), so_far)
+    } else if c == 34 { bare_from(t, quote_end(t, stop + 1), so_far) }
+    else { bare_from(t, stop + 1, push(so_far, bytes_slice(t, stop, stop + 1))) }
+  }
+}
+
+fn line_end(t: Bytes, i: Int) -> Int =
+  match bytes_index_of_from(t, b"\n", i) { Some(j) -> j, None -> bytes_len(t) }
+
+// Just past the quote closing a literal that opened before `i`.
+fn quote_end(t: Bytes, i: Int) -> Int =
+  iterate(i, bytes_len(t) + 1, |j: Int|
+    if j >= bytes_len(t) { Stop(j) }
+    else if bytes_at(t, j) == 92 { Continue(j + 2) }
+    else if bytes_at(t, j) == 34 { Stop(j + 1) }
+    else { Continue(j + 1) })
+
+fn count_of(t: Bytes, needle: Bytes) -> Int = len(bytes_split(t, needle)) - 1
+
+fn depth(body: Bytes) -> Int = {
+  let t = bare(body);
+  let walked = fold(
+    range(0, bytes_len(t)),
+    { at: 0, most: 0 },
+    |s: { at: Int, most: Int }, i: Int| {
+      let c = bytes_at(t, i);
+      if c == 40 || c == 91 || c == 123 {
+        { at: s.at + 1, most: if s.at + 1 > s.most { s.at + 1 } else { s.most } }
+      } else if c == 41 || c == 93 || c == 125 { { ..s, at: if s.at > 0 { s.at - 1 } else { 0 } } }
+      else { s }
+    },
+  );
+  walked.most + count_of(t, b"?") + count_of(t, b"else if")
+}
+
+// A line that opens a top-level item, and what to report it as.
+fn opens(line: String) -> Option<String> = {
+  let rest = if string_starts_with(line, "pub ") { string_slice(line, 4, string_len(line)) }
+  else { line };
+  fold(["fn", "type", "test"], None, |found: Option<String>, word: String|
+    match found {
+      Some(_) -> found,
+      None -> if string_starts_with(rest, word ++ " ") {
+        Some(word ++ " " ++ item_name(string_slice(rest, string_len(word) + 1, string_len(rest))))
+      } else { None },
+    })
+}
+
+fn item_name(tail: String) -> String = {
+  let b = bytes_of_string(tail);
+  let from = if bytes_len(b) > 0 && bytes_at(b, 0) == 34 { 1 } else { 0 };
+  let to = iterate(from, bytes_len(b) + 1, |j: Int|
+    if j < bytes_len(b) && is_name_byte(bytes_at(b, j)) { Continue(j + 1) } else { Stop(j) });
+  string_trim(string_of_bytes(bytes_slice(b, from, to)))
+}
+
+fn is_name_byte(c: Int) -> Bool =
+  (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 32
+
+type Item = { depth: Int, module: String, name: String }
+
+// Every top-level item of one module, each with its depth.
+fn items_of(module: String, text: String) -> List<Item> = {
+  let lines = string_split(text, "\n");
+  let heads = filter(range(0, len(lines)), |i: Int|
+    match list_at(lines, i) { Some(l) -> opens(l) != None, None -> false });
+  map(range(0, len(heads)), |n: Int| {
+    let i = match list_at(heads, n) { Some(x) -> x, None -> 0 };
+    let end = match list_at(heads, n + 1) { Some(x) -> x, None -> len(lines) };
+    let body = fold(range(i, end), "", |acc: String, j: Int|
+      acc ++ (match list_at(lines, j) { Some(l) -> l ++ "\n", None -> "" }));
+    let name = match list_at(lines, i) {
+      Some(l) -> match opens(l) { Some(n2) -> n2, None -> "" },
+      None -> "",
+    };
+    { depth: depth(bytes_of_string(body)), module: module, name: name }
+  })
+}
+
+fn every_item() -> List<Item> =
+  fold(trees(), [], |acc: List<Item>, dir: String|
+    match fs.list_dir[repo](dir) {
+      Some(names) ->
+        fold(names, acc, |a: List<Item>, name: String|
+          if !string_ends_with(name, ".ply") { a } else {
+            match fs.read_file[repo](dir ++ "/" ++ name) {
+              Some(text) ->
+                fold(
+                  items_of(dir ++ "/" ++ name, string_of_bytes(text)),
+                  a,
+                  |b: List<Item>, it: Item| push(b, it),
+                ),
+              None -> a,
+            }
+          }),
+      None -> panic("`" ++ dir ++ "` is in the repository"),
+    })
+
+fn shown_item(it: Item) -> String =
+  it.module ++ " " ++ it.name ++ " (" ++ int_to_string(it.depth) ++ ")"
+
+test/nondet "no shipped definition nests deeper than the emitter walks" {
+  let all = every_item();
+  assert(len(all) > 0, Some("no sources were scanned"));
+  let over = filter(all, |it: Item| it.depth > deepest());
+  assert(
+    len(over) == 0,
+    Some(
+      "these nest deeper than " ++ int_to_string(deepest())
+        ++ ", as deep as the emitter has ever walked; flatten them: "
+        ++ string::join(map(over, shown_item), ", "),
+    ),
+  );
+  // The bound is only worth keeping while something is near it.
+  let most = fold(all, 0, |m: Int, it: Item| if it.depth > m { it.depth } else { m });
+  assert(
+    most > deepest() / 2,
+    Some("nothing comes near " ++ int_to_string(deepest()) ++ " any more; lower the bound"),
+  )
+}

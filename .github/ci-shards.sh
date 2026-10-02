@@ -27,10 +27,8 @@
 #                                from the cut in DIR, or round robin without one
 #   ci-shards.sh corpus-line ID  the package one run tests and its filter
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the other
-#                                jobs: the solo tests, the shutdown suite and
-#                                the postgres packages
-#   ci-shards.sh gate-filter     the filterset the gates job runs: the shutdown
-#                                suite and the tree checks
+#                                jobs: the solo tests and the host packages
+#   ci-shards.sh gate-filter     the filterset the gates job runs: the tree checks
 #   ci-shards.sh host-filter     the filterset selecting the host packages
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
 #   ci-shards.sh give-back RUN   delete the entries this run parked for its own
@@ -50,24 +48,28 @@ TAB=$'\t'
 # Tests that get a runner of their own, as `id:package:target:test`. A long test is no reason: the
 # cut balances by duration. A test that must not share its runner is, since the cut cannot see that.
 SOLO=(
-  # Both take every test thread (nextest.toml), so in a shard they would run alone for their whole
-  # length on top of the shard's share.
+  # It takes every test thread (nextest.toml), so in a shard it would run alone for its whole length
+  # on top of the shard's share.
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
-  "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
 )
 
-# The corpus's Ply tests, one run an entry: the program's own, then each module of the checks package
-# that declares a test, selected by its name. Every check spawns `ply`, so a run takes its checks one
-# after another. The runs that start desks under load get a runner each; the rest go to the
-# partitions, round robin in entry order, after each partition's nextest run.
+# The Ply tests, one run an entry: the corpus program's own, each module of the corpus's checks package
+# that declares a test, and each module of the CLI's suite as `cli-<module>`, selected by its name.
+# Every check spawns `ply`, so a run takes its checks one after another, and the CLI's suite drives
+# `ply` in one working directory, so its runs take theirs one after another too. The runs that would
+# starve a partition get a runner each: the checks that start desks under load, and the compiler's
+# own tests on the tier, which take every core. The rest go to the partitions, beside their nextest
+# runs.
 CORPUS_PROGRAM=crates/ply-corpus/ply
 CORPUS_CHECKS=crates/ply-corpus/checks
-CORPUS_ALONE=(serving database)
+CLI_SUITE=crates/ply-cli-tests/ply
+CORPUS_ALONE=(serving database cli-compiler_on_the_tier)
 # Placed a test at a time rather than a module at a time: a whole module on one partition would
 # outlast the partition's nextest shard.
 CORPUS_BY_TEST=(audit generated toolchain)
-# Corpus processes a partition runs beside nextest, each a lane of the cut: its checks go in one
-# `ply test`, which loads the checks package's closure once. Two, measured against one: a partition's
+CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental registry)
+# Corpus processes a partition runs beside nextest, each a lane of the cut: its runs of one package go
+# in one `ply test`, which loads the package's closure once. Two, measured against one: a partition's
 # runs include the program's and the packages' own `ply test`s, each with a front end and C of its own,
 # which a single lane takes in turn and outlasts nextest's extra thread.
 CORPUS_LANES=2
@@ -85,13 +87,6 @@ PACKAGE_SUITES=(
 # host; the exclusion is the same and the name is not.
 HOST_PACKAGES=(ply-host-tests)
 
-# `-tests` packages with no same-named crate: the CLI's suite drives ply-launcher's binary, and
-# ply-cli is the program's sources, not a crate.
-UNPAIRED_TESTS=(ply-cli-tests)
-
-# `#![cfg(unix)]`, so the gates job asserts it ran.
-SHUTDOWN_FILTER='binary_id(=ply-cli-tests::suite) & test(/^shutdown::/)'
-
 # Crate directories that are deliberately not workspace members, as `name:why`.
 # Expanded as ${KNOWN_OUTSIDE[@]+...}: bash 3.2 treats an empty array as unset under `set -u`.
 declare -a KNOWN_OUTSIDE=(
@@ -107,10 +102,14 @@ TREE_CHECKS=(
   "ply-eval-tests:suite:armed::the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
   "ply-eval-tests:suite:armed::no_allowlist_entry_has_outlived_its_reason"
   "ply-eval-tests:suite:armed::ambiguous_enum_names_are_declared"
-  "ply-cli-tests:suite:fixtures::every_fixture_is_listed"
-  "ply-cli-tests:suite:fmt::the_maintained_sources_are_committed_formatted"
-  "ply-cli-tests:suite:tree::every_test_file_is_declared_and_every_declaration_has_a_file"
-  "ply-cli-tests:suite:tree::the_harness_is_the_only_place_the_ply_binary_is_named"
+)
+
+# Checks on the tree in the CLI's suite, as `module:test`. Each runs with its module's entry, so the
+# table asserts it is still declared there: a check that stops being declared reports nothing.
+CLI_TREE_CHECKS=(
+  "fixture_list:every fixture is listed"
+  "fmt:the maintained sources are committed formatted"
+  "tree:the harness is the only module that starts the \`ply\` binary"
 )
 
 # `probes/` directories no cargo build reaches, as `dir:job`; the job must be in `ci`'s `needs`.
@@ -191,21 +190,46 @@ cmd_solo_filter() {
   return 1
 }
 
-# One entry id a line: `program`, `package-<id>` per package suite, then every checks module that
-# declares a test, as `module` or, for a module placed a test at a time, `module:N` for its Nth test.
+# One entry id a line: `program`, `package-<id>` per package suite, every checks module that declares
+# a test, then every such module of the CLI's suite under `cli-`; each module as `module`, or, for one
+# placed a test at a time, `module:N` for its Nth test.
 corpus_entries() {
-  local file module count i entry
+  local entry
   printf 'program\n'
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
-  for file in "$root/$CORPUS_CHECKS"/*.ply; do
+  module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}"
+  module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
+}
+
+# `PREFIX<module>` per module of the package at DIR that declares a test, or `PREFIX<module>:N` per
+# test of a module the rest of the arguments place a test at a time.
+module_entries() {
+  local dir=$1 prefix=$2 file module count i
+  shift 2
+  for file in "$root/$dir"/*.ply; do
     grep -qE '^test(/[a-z]+)? "' "$file" || continue
     module=$(basename "$file" .ply)
-    if corpus_by_test "$module"; then
+    if named_in "$module" "$@"; then
       count=$(corpus_test_names "$file" | grep -c .)
-      for ((i = 1; i <= count; i++)); do printf '%s:%d\n' "$module" "$i"; done
+      for ((i = 1; i <= count; i++)); do printf '%s%s:%d\n' "$prefix" "$module" "$i"; done
     else
-      printf '%s\n' "$module"
+      printf '%s%s\n' "$prefix" "$module"
     fi
+  done
+}
+
+named_in() {
+  local x=$1 id
+  shift
+  for id in "$@"; do [[ $id == "$x" ]] && return 0; done
+  return 1
+}
+
+# The qualified name of every test the package at DIR declares, `<module>.<label>`.
+package_keys() {
+  local file
+  for file in "$root/$1"/*.ply; do
+    corpus_test_names "$file" | sed "s/^/$(basename "$file" .ply)./"
   done
 }
 
@@ -214,12 +238,6 @@ package_path() {
   for entry in "${PACKAGE_SUITES[@]}"; do
     [[ ${entry%%:*} == "$1" ]] && { printf '%s\n' "${entry#*:}"; return 0; }
   done
-  return 1
-}
-
-corpus_by_test() {
-  local id
-  for id in "${CORPUS_BY_TEST[@]}"; do [[ $id == "$1" ]] && return 0; done
   return 1
 }
 
@@ -268,10 +286,10 @@ cmd_corpus_for_partition() {
   done < <(corpus_placed)
 }
 
-# `path filter`: the program's entry takes every test of its package, a checks module's its own, and
+# `path filter`: the program's entry takes every test of its package, a module's its own, and
 # `module:N` its Nth test by the qualified name `ply test --filter` matches.
 cmd_corpus_line() {
-  local entry module n name entries
+  local entry entries
   # Read whole before the loop can return, so the lister never writes into a closed pipe.
   entries=$(corpus_entries)
   while read -r entry; do
@@ -280,17 +298,27 @@ cmd_corpus_line() {
       printf '%s\n' "$CORPUS_PROGRAM"
     elif [[ $entry == package-* ]]; then
       package_path "${entry#package-}"
-    elif [[ $entry == *:* ]]; then
-      module=${entry%%:*} n=${entry##*:}
-      name=$(corpus_test_names "$root/$CORPUS_CHECKS/$module.ply" | sed -n "${n}p")
-      printf '%s %s.%s\n' "$CORPUS_CHECKS" "$module" "$name"
+    elif [[ $entry == cli-* ]]; then
+      module_line "$CLI_SUITE" "${entry#cli-}"
     else
-      printf '%s %s.\n' "$CORPUS_CHECKS" "$entry"
+      module_line "$CORPUS_CHECKS" "$entry"
     fi
     return 0
   done <<< "$entries"
   echo "no corpus entry named '$1'" >&2
   return 1
+}
+
+# `path filter` of the run `module` or `module:N` of the package at DIR.
+module_line() {
+  local dir=$1 module=${2%%:*} n name
+  if [[ $2 == *:* ]]; then
+    n=${2##*:}
+    name=$(corpus_test_names "$root/$dir/$module.ply" | sed -n "${n}p")
+    printf '%s %s.%s\n' "$dir" "$module" "$name"
+  else
+    printf '%s %s.\n' "$dir" "$module"
+  fi
 }
 
 cmd_host_filter() {
@@ -308,13 +336,11 @@ cmd_tree_check_filter() {
   printf '\n'
 }
 
-cmd_gate_filter() {
-  printf '%s | %s\n' "$SHUTDOWN_FILTER" "$(cmd_tree_check_filter)"
-}
+cmd_gate_filter() { cmd_tree_check_filter; }
 
 # Solo tests are excluded by name, so a new test in one of their binaries still runs in a partition.
 cmd_exclude_filter() {
-  printf '%s | %s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$SHUTDOWN_FILTER" "$(cmd_host_filter)"
+  printf '%s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$(cmd_host_filter)"
 }
 
 cmd_partitions() {
@@ -875,8 +901,7 @@ cmd_verify() {
       echo "FAIL: Cargo.toml has no [profile.dev.package.$member] override, so its suite compiles at the library's opt-level" >&2
       failures=$((failures + 1))
     fi
-    if ! printf '%s\n' "${all_members[@]}" | grep -qx "${member%-tests}" \
-      && ! printf '%s\n' "${UNPAIRED_TESTS[@]}" | grep -qx "$member"; then
+    if ! printf '%s\n' "${all_members[@]}" | grep -qx "${member%-tests}"; then
       echo "FAIL: '$member' is a member and '${member%-tests}' is not, so its tests run without that crate's binaries beside them" >&2
       failures=$((failures + 1))
     fi
@@ -957,13 +982,9 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done < <(cmd_solo)
-  if [[ ! -f $(test_source_file ply-cli-tests suite shutdown::x) ]]; then
-    echo "FAIL: SHUTDOWN_FILTER names crates/ply-cli-tests/tests/suite/shutdown.rs, which does not exist" >&2
-    failures=$((failures + 1))
-  fi
-  # Cargo builds `ply` for ply-cli-tests only if ply-launcher has an integration test of its own.
+  # The archive carries `ply` only if ply-launcher has an integration test of its own.
   if ! ls "$root"/crates/ply-launcher/tests/*.rs >/dev/null 2>&1; then
-    echo "FAIL: crates/ply-launcher/tests/ has no .rs file, so cargo builds no 'ply' for ply-cli-tests' suite to run" >&2
+    echo "FAIL: crates/ply-launcher/tests/ has no .rs file, so cargo builds no 'ply' for the Ply runs to drive" >&2
     failures=$((failures + 1))
   fi
 
@@ -977,14 +998,14 @@ cmd_verify() {
     # Real tests with invented costs: the cut drops durations for tests the tree no longer has,
     # so a table it can check has to name ones it has.
     made_up_count=0
-    for made_up_file in "$root"/crates/ply-cli-tests/tests/suite/*.rs; do
+    for made_up_file in "$root"/crates/ply-machine-tests/tests/suite/*.rs; do
       made_up_mod=${made_up_file##*/}; made_up_mod=${made_up_mod%.rs}
       while read -r made_up_fn; do
         made_up_count=$((made_up_count + 1))
-        printf 'ply-cli-tests::suite\t%s::%s\t%d\n' \
+        printf 'ply-machine-tests::suite\t%s::%s\t%d\n' \
           "$made_up_mod" "$made_up_fn" $((made_up_count * 37 + 1)) >> "$made_up/timings.tsv"
         [[ $made_up_count -ge $((PARTITIONS + 4)) ]] && break 2
-      done < <(sed -n 's/^fn \([a-z0-9_]*\)(.*/\1/p' "$made_up_file")
+      done < <(awk '/^#\[test\]/ { t = 1; next } t && match($0, /^fn [a-z0-9_]+\(/) { print substr($0, 4, RLENGTH - 4); t = 0 }' "$made_up_file")
     done
     check_shards made-up "$made_up/timings.tsv" || failures=$((failures + 1))
     rm -rf "$made_up"
@@ -1055,9 +1076,9 @@ cmd_verify() {
     done
   fi
 
-  # --- the corpus's Ply tests -------------------------------------------------
+  # --- the Ply tests ----------------------------------------------------------
   local corpus_job
-  for dir in "$CORPUS_PROGRAM" "$CORPUS_CHECKS"; do
+  for dir in "$CORPUS_PROGRAM" "$CORPUS_CHECKS" "$CLI_SUITE"; do
     if [[ ! -f "$root/$dir/ply.pkg" ]]; then
       echo "FAIL: $dir holds no ply.pkg, and a corpus run tests it as a package" >&2
       failures=$((failures + 1))
@@ -1079,18 +1100,43 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
-  # A test placed by name is picked out by a substring of its qualified name, so no name in its module
-  # may hold another.
-  local module names
-  for module in "${CORPUS_BY_TEST[@]}"; do
-    names=$(corpus_test_names "$root/$CORPUS_CHECKS/$module.ply")
-    while IFS= read -r name; do
-      [[ -n $name ]] || continue
-      if [[ $(grep -cF -- "$name" <<< "$names") -gt 1 ]]; then
-        echo "FAIL: '$module.$name' is part of another test's name in $CORPUS_CHECKS/$module.ply, so its filter picks both" >&2
+  # A run is picked out by a substring of its tests' qualified names: a module's by `<module>.`, which
+  # no test of another module may hold, and a test placed by name by its own, which no other test of
+  # its module may hold.
+  local module names keys pair outside
+  for pair in "$CORPUS_CHECKS:${CORPUS_BY_TEST[*]}" "$CLI_SUITE:${CLI_BY_TEST[*]}"; do
+    dir=${pair%%:*}
+    keys=$(package_keys "$dir")
+    for module in $(sed 's/\..*//' <<< "$keys" | sort -u); do
+      outside=$(grep -F -- "$module." <<< "$keys" | grep -v "^$module\." || true)
+      if [[ -n $outside ]]; then
+        echo "FAIL: '$module.' is part of '${outside%%$'\n'*}', outside $dir/$module.ply, so the module's run picks that test too" >&2
         failures=$((failures + 1))
       fi
-    done <<< "$names"
+    done
+    for module in ${pair#*:}; do
+      if [[ ! -f "$root/$dir/$module.ply" ]]; then
+        echo "FAIL: $dir/$module.ply does not exist, and its tests are placed one at a time" >&2
+        failures=$((failures + 1))
+        continue
+      fi
+      names=$(corpus_test_names "$root/$dir/$module.ply")
+      while IFS= read -r name; do
+        [[ -n $name ]] || continue
+        if [[ $(grep -cF -- "$name" <<< "$names") -gt 1 ]]; then
+          echo "FAIL: '$module.$name' is part of another test's name in $dir/$module.ply, so its filter picks both" >&2
+          failures=$((failures + 1))
+        fi
+      done <<< "$names"
+    done
+  done
+  for entry in "${CLI_TREE_CHECKS[@]}"; do
+    module=${entry%%:*}
+    names=$(corpus_test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true)
+    if ! grep -qxF -- "${entry#*:}" <<< "$names"; then
+      echo "FAIL: $CLI_SUITE/$module.ply declares no test '${entry#*:}', and CLI_TREE_CHECKS names it" >&2
+      failures=$((failures + 1))
+    fi
   done
   # Every entry that does not run alone is some partition's, so the round robin stays total.
   local placed k
@@ -1142,7 +1188,7 @@ cmd_verify() {
   fi
   local cut="by test count, with nothing measured"
   [[ -s $TIMINGS ]] && cut="from $(grep -c . "$TIMINGS") measured durations"
-  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs; $PARTITIONS partitions cut $cut"
+  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks, ${#CLI_TREE_CHECKS[@]} in the CLI's suite, and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs; $PARTITIONS partitions cut $cut"
 }
 
 case "${1:-}" in

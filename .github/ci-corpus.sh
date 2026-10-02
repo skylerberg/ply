@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# The corpus's Ply runs (`ci-shards.sh`'s corpus entries), each `ply test` over the corpus with the
-# grants `benches/corpus.sh` gives the program. A run fails when a test fails, when the run refuses,
-# and when its filter selects no test, so a renamed test never stops being run quietly.
+# The Ply runs (`ci-shards.sh`'s corpus entries), each a `ply test`: over the corpus with the grants
+# `benches/corpus.sh` gives the program, or over the CLI's suite with the grants its harness drives
+# `ply` with, from a scratch directory of the run's own. A run fails when a test fails, when the run
+# refuses, and when its filter selects no test, so a renamed test never stops being run quietly.
 #
 #   ci-corpus.sh partition K TIMINGS [CUT]
 #       every run partition K takes (`ci-shards.sh corpus-for-partition K [CUT]`), each lane one
-#       process beside the others. A lane's checks go in one `ply test` with a `--filter` each, so
-#       the checks package's closure is loaded once a lane rather than once a run. Each run's
-#       milliseconds are appended to TIMINGS as `corpus <run> <ms>`: a check's are its tests' own,
-#       out of the report. With the program's own tests go those of the programs under `fixtures/`
-#       it runs, each of which must pass a test.
+#       process beside the others. A lane's runs of one package go in one `ply test` with a
+#       `--filter` each, so the package's closure is loaded once a lane rather than once a run. Each
+#       run's milliseconds are appended to TIMINGS as `corpus <run> <ms>`: a module's are its tests'
+#       own, out of the report. With the program's own tests go those of the programs under
+#       `fixtures/` it runs, each of which must pass a test.
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
 #   ci-corpus.sh mark                  the moment `keep` gathers from
 #   ci-corpus.sh keep DIR              the C `ply` emitted and compiled since `mark`, into DIR for a
@@ -23,6 +24,7 @@ set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ply="$root/target/debug/ply"
 shards="$root/.github/ci-shards.sh"
+cli_suite=crates/ply-cli-tests/ply
 # The caches `ply` reads, where the workflow restores them.
 caches=/tmp
 mark=$caches/ply-c-corpus.mark
@@ -30,6 +32,30 @@ mark=$caches/ply-c-corpus.mark
 # What a checks run is given after `ply test PATH`.
 grants=(--host --timeout 900000 --steps 0 --json
   --exec "ply=$ply" --allow machine --allow claims --fs work=. --fs "repo=$root")
+
+# What a run of the CLI's suite is given: the `ply` its tests start and the programs they start beside
+# it, its scratch directory and the filesystem, the repository, and every family a command drives a
+# machine with, since its tests run the commands in this process.
+cli_grants=(--host --timeout 900000 --steps 0 --json
+  --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
+  --fs cwd=. --fs abs=/ --fs "repo=$root"
+  --allow machine --allow tester --allow claims --allow builder --allow bootstrap --allow hosts)
+
+# `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
+# directory of its own, which its harness empties before each test and refuses without the marker.
+tested() {
+  local path=$1 status=0 dir
+  shift
+  if [[ $path == "$cli_suite" ]]; then
+    dir=$(mktemp -d)
+    touch "$dir/.ply-scratch"
+    (cd "$dir" && "$ply" test "$root/$path" "$@" "${cli_grants[@]}") || status=$?
+    rm -rf "$dir"
+  else
+    "$ply" test "$path" "$@" "${grants[@]}" || status=$?
+  fi
+  return "$status"
+}
 
 # Where a `ply test` spent its time, from its report: the front end, the C the backend emitted and
 # compiled, and the tests. A lane is mostly the first two, so this is what the cut is tuned on.
@@ -47,7 +73,7 @@ run_one() {
     # A package's own suite runs as `ply test` runs it: the corpus's grants are for the corpus.
     "$ply" test "$path" --json "$@" > "$out" || status=$?
   else
-    "$ply" test "$path" ${filter:+--filter "$filter"} "${grants[@]}" "$@" > "$out" || status=$?
+    tested "$path" ${filter:+--filter "$filter"} "$@" > "$out" || status=$?
   fi
   jq -r '.results[]? | "\(.status)\t\(.key // .name)"' "$out" 2>/dev/null
   spent "$out"
@@ -61,9 +87,10 @@ run_one() {
   rm -f "$out"
 }
 
-# The checks runs IDs, in one `ply test`: each run's milliseconds are the summed durations of the
-# tests whose `<module>.<label>` key its filter holds, and a run whose filter selected none fails.
-run_checks() {
+# The runs IDs, all of one package, in one `ply test`: each run's milliseconds are the summed
+# durations of the tests whose `<module>.<label>` key its filter holds, and a run whose filter
+# selected none fails.
+run_modules() {
   local timings=$1 id line path filter status=0 out bad=0 n ms i
   local -a filters=() ids=() args=()
   shift
@@ -75,7 +102,7 @@ run_checks() {
     args+=(--filter "$filter")
   done
   out=$(mktemp)
-  "$ply" test "$path" "${args[@]}" "${grants[@]}" > "$out" || status=$?
+  tested "$path" "${args[@]}" > "$out" || status=$?
   jq -r '.results[]? | "\(.status)\t\(.key // .name)"' "$out" 2>/dev/null
   spent "$out"
   for i in "${!ids[@]}"; do
@@ -112,10 +139,10 @@ fixtures() {
 }
 
 # One lane's runs, one after another: the program's own and each package's suite in a `ply test` of
-# their own, and every checks run in one.
+# their own, every checks run in one, and every run of the CLI's suite in one.
 lane() {
   local timings=$1 id started failed=0
-  local -a checks=()
+  local -a checks=() cli=()
   shift
   : > "$timings"
   for id in "$@"; do
@@ -128,12 +155,18 @@ lane() {
         printf 'corpus\t%s\t%s\n' "$id" "$(($(date +%s%3N) - started))" >> "$timings"
         echo "::endgroup::"
         ;;
+      cli-*) cli+=("$id") ;;
       *) checks+=("$id") ;;
     esac
   done
   if [ "${#checks[@]}" -gt 0 ]; then
     echo "::group::corpus checks ${checks[*]}"
-    run_checks "$timings" "${checks[@]}" || failed=1
+    run_modules "$timings" "${checks[@]}" || failed=1
+    echo "::endgroup::"
+  fi
+  if [ "${#cli[@]}" -gt 0 ]; then
+    echo "::group::the CLI's suite ${cli[*]}"
+    run_modules "$timings" "${cli[@]}" || failed=1
     echo "::endgroup::"
   fi
   return "$failed"

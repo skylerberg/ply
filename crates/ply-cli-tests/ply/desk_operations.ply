@@ -1,0 +1,263 @@
+// `examples/desk.ply` as an operator reads it: what each route's row says it reaches, where its
+// records and credentials go, and that its suite and laws hold without a host.
+
+import harness (Ran, project, repo_file, in_memory, tree, on_disk, said, stdout, concatenated)
+import std.fs (fs)
+import std.string
+
+fn desk() -> String = repo_file("examples/desk.ply")
+
+fn says(r: Ran, needle: String) -> Unit =
+  assert(
+    string_contains(said(r), needle),
+    Some("the run never mentioned `" ++ needle ++ "`\n\n" ++ said(r)),
+  )
+
+fn silent_about(r: Ran, needle: String) -> Unit =
+  assert(
+    !string_contains(said(r), needle),
+    Some("the run mentioned `" ++ needle ++ "`, which it must not\n\n" ++ said(r)),
+  )
+
+fn ok(r: Ran) -> Unit = assert(r.code == 0, Some(said(r)))
+
+// The signature line and the row lines that follow it, joined.
+fn signature_of(output: String, name: String) -> String = {
+  let lines = string_split(output, "\n");
+  let starts = |l: String| {
+    let t = string_trim(l);
+    string_starts_with(t, name ++ " ") && string_contains(t, " : ")
+  };
+  let found = fold(
+    lines,
+    { at: None, block: "", open: false },
+    |acc: { at: Option<Int>, block: String, open: Bool }, l: String|
+      match acc.at {
+        None -> if starts(l) { { at: Some(0), block: l, open: true } } else { acc },
+        Some(_) -> if !acc.open { acc }
+        // A continuation is indented past the name column and carries no `:` separator of its own.
+        else if string_starts_with(string_trim(l), "/")
+            || (string_starts_with(l, "      ") && !string_contains(l, " : ")) {
+          { ..acc, block: acc.block ++ " " ++ string_trim(l) }
+        } else { { ..acc, open: false } },
+      },
+  );
+  match found.at {
+    Some(_) -> found.block,
+    None -> panic("`ply check --types` printed no signature for `" ++ name ++ "`\n\n" ++ output),
+  }
+}
+
+fn desk_types() -> String = {
+  let r = in_memory(tree([{ path: "desk.ply", text: desk() }]), ["check", "--types", "desk.ply"]);
+  assert(r.code == 0, Some("`ply check --types` failed\n\n" ++ said(r)));
+  stdout(r)
+}
+
+test/nondet "health has no row and ready names what it verifies" {
+  let types = desk_types();
+  let health = signature_of(types, "health");
+  assert(
+    !string_contains(health, "/"),
+    Some("liveness must reach nothing, so that no outage can make it fail: " ++ health),
+  );
+  let ready = signature_of(types, "ready");
+  assert(
+    string_contains(ready, "std.db.db.query[items]"),
+    Some("a readiness route that does not reach the store checks nothing: " ++ ready),
+  );
+  assert(
+    string_contains(ready, "std.signal.signal.stopping"),
+    Some("readiness must also mean `nobody has asked this instance to stop`: " ++ ready),
+  );
+  assert(
+    string_contains(ready, "/ {std.db.db.query[items], std.signal.signal.stopping}"),
+    Some(
+      "a readiness probe that performed anything else would be a load generator with a two-second period: "
+        ++ ready,
+    ),
+  )
+}
+
+test/nondet "a row says which channels an endpoint records on" {
+  let types = desk_types();
+  fold(["place_order", "cancel_order"], (), |u: Unit, endpoint: String| {
+    let row = signature_of(types, endpoint);
+    fold(["orders", "items"], u, |v: Unit, channel: String|
+      assert(
+        string_contains(row, "std.trace.trace.event[" ++ channel ++ "]"),
+        Some(
+          "`" ++ endpoint ++ "` must publish the `" ++ channel ++ "` channel it records on: "
+            ++ row,
+        ),
+      ))
+  });
+  fold(
+    ["list_items", "featured", "get_item", "list_orders", "get_order"],
+    (),
+    |u: Unit, quiet: String| {
+      let row = signature_of(types, quiet);
+      assert(
+        !string_contains(row, "std.trace"),
+        Some("`" ++ quiet ++ "` records nothing, and its row must say so: " ++ row),
+      )
+    },
+  );
+  // The request span is the serving layer's, so `http` appears where the span is opened and
+  // nowhere below.
+  assert(string_contains(signature_of(types, "dispatch"), "std.trace.trace.enter[http]"), None);
+  assert(!string_contains(signature_of(types, "place_order"), "[http]"), None)
+}
+
+// A singleton `trace.write` would put every recording test in one concurrency group.
+test/nondet "two channels are two atoms rather than one recording capability" {
+  let row = signature_of(desk_types(), "move_stock");
+  assert(
+    string_contains(row, "std.trace.trace.event[items]") && !string_contains(row, "[orders]"),
+    Some("the shelf's own movement records on the shelf's channel and no other: " ++ row),
+  )
+}
+
+test/nondet "only the entry point reads settings and only one route reads a credential" {
+  let types = desk_types();
+  let main = signature_of(types, "main");
+  assert(string_contains(main, "std.config.config.get[server]"), Some(main));
+  assert(string_contains(main, "std.config.config.secret[credentials]"), Some(main));
+  // The serving layer carries the credential namespace, never settings: the port was resolved
+  // before a socket existed.
+  let dispatch = signature_of(types, "dispatch");
+  assert(string_contains(dispatch, "std.config.config.secret[credentials]"), Some(dispatch));
+  assert(
+    !string_contains(dispatch, "[server]"),
+    Some("a request must not re-read the deployment's settings: " ++ dispatch),
+  );
+  fold(["place_order", "list_items", "ready", "health"], (), |u: Unit, below: String|
+    assert(
+      !string_contains(signature_of(types, below), "std.config"),
+      Some("`" ++ below ++ "` must not consult configuration; the entry point already did"),
+    ))
+}
+
+fn stored(path: String) -> String =
+  match fs.read_file[cwd](path) { Some(b) -> string_of_bytes_lossy(b), None -> "" }
+
+test/nondet "the desk's credential reaches no line of a whole test run" {
+  project([{ path: "desk.ply", text: desk() }]);
+  let r = on_disk(["test", "--json"]);
+  assert(r.code == 0, Some("the desk's suite must be green\n\n" ++ said(r)));
+  silent_about(r, "twin-key-not-a-credential");
+  // The known hole: a literal is in the store, as part of the definition it was written in.
+  assert(
+    string_contains(stored(".ply-cache/store.dat"), "twin-key-not-a-credential"),
+    Some("a source literal is part of the body filed for its definition"),
+  )
+}
+
+fn fixture_checked(name: String) -> Ran =
+  in_memory(
+    tree([{ path: name ++ ".ply", text: repo_file("tests/fixtures/" ++ name ++ ".ply") }]),
+    ["check", name ++ ".ply"],
+  )
+
+test/nondet "every route out of a secret is a compile error" {
+  let r = fixture_checked("secret_containment");
+  assert(
+    r.code != 0,
+    Some("the containment fixture must not compile; every line in it is a leak\n\n" ++ said(r)),
+  );
+  // `++`, a trace field and a SQL parameter are `E0201`; binding the payload is `E0101`; a law
+  // over one is `E0418`.
+  fold(["E0201", "E0101", "E0418"], (), |u: Unit, code: String| says(r, code));
+  // A separate run: derivation refuses before inference, so one file would report `E0206` and hide
+  // the rest.
+  let derived = fixture_checked("secret_not_derivable");
+  assert(derived.code != 0, Some(said(derived)));
+  says(derived, "`json` cannot be derived");
+  says(derived, "`ord` cannot be derived")
+}
+
+test/nondet "the desk's suite is hermetic without host and says so" {
+  project([{ path: "desk.ply", text: desk() }]);
+  let first = on_disk(["test", "--explain"]);
+  ok(first);
+  // The twins are values in region-scoped cells, so nothing reaches the boundary.
+  says(first, "isolated 73 of 73");
+  silent_about(first, "isolation: host");
+  // And every one is cached: a twin-backed tracing test's row is empty after the region, so it is
+  // `det`.
+  let second = on_disk(["test"]);
+  ok(second);
+  says(second, "0 passed, 73 cached")
+}
+
+test/nondet "the desk's laws still hold over a service that records and authenticates" {
+  project([{ path: "desk.ply", text: desk() }]);
+  let r = on_disk(["prove", "desk.ply"]);
+  ok(r);
+  says(r, "7 held");
+  says(r, "2 proved");
+  // The placement laws drive the whole route, so an unverifiable credential would refute them.
+  says(r, "a placement the shelf can cover moves the shelf by exactly the drawdown")
+}
+
+test/nondet "hosts prints where records go, which channels exist, and what a signal does" {
+  project([{ path: "desk.ply", text: desk() }]);
+  let r = on_disk(["hosts", "desk.ply", "--host", "--trace", "json"]);
+  ok(r);
+  says(r, "observability");
+  says(r, "sink       ply_host::trace::json → stderr · level info");
+  // `http` for the request span, `orders` and `items` for the two tables.
+  says(r, "channels   http items orders");
+  says(r, "spans      per-task stack · closed at end_task or end_entry_point");
+  says(r, "shutdown");
+  says(r, "signals    INT TERM · lead 0ms · drain 30000ms · second signal exits 130/143");
+  // `--trace off` is a handler, not an absence, so it is named; a level on a discarding sink is
+  // not.
+  let off = on_disk(["hosts", "desk.ply", "--host", "--trace", "off"]);
+  ok(off);
+  says(off, "sink       ply_host::trace::discard → nothing");
+  silent_about(off, "→ nothing · level")
+}
+
+fn settings() -> List<String> =
+  [
+    "--config-schema",
+    "desk.config",
+    "--set",
+    "DESK_API_KEY=fixture-not-a-credential",
+    // The desk serves `db` itself, so where to reach its database is a setting the run needs.
+    "--set",
+    "DESK_DATABASE=postgres://fixture@localhost/desk",
+  ]
+
+fn digest(extra: List<String>) -> String = {
+  let argv = concatenated(
+    concatenated(["hosts", "desk.ply", "--host"], settings()),
+    push(extra, "--digest"),
+  );
+  let r = on_disk(argv);
+  ok(r);
+  string_trim(stdout(r))
+}
+
+// A structural change to the trusted computing base breaks CI; a deployment's own configuration
+// does not.
+test/nondet "the hosts digest moves with the sink and the drain and not with a value" {
+  project([{ path: "desk.ply", text: desk() }]);
+  let base = digest([]);
+  assert(string_starts_with(base, "b3:"), Some("got " ++ base));
+  // Structural: which sink, at which level, and how long a drain waits.
+  assert(base != digest(["--trace", "text"]), Some("the sink path"));
+  assert(base != digest(["--trace", "off"]), Some("the sink path"));
+  assert(base != digest(["--trace-level", "warn"]), Some("the level"));
+  assert(base != digest(["--drain-ms", "60000"]), Some("the drain window"));
+  assert(base != digest(["--drain-lead-ms", "2000"]), Some("the lead"));
+  // Not structural: what a key resolved to.
+  assert_eq(base, digest(["--set", "DESK_PORT=9999"]));
+  assert_eq(base, digest(["--set", "DESK_API_KEY=a-different-secret"]));
+  // And the credential is in none of it, printed or hashed.
+  let listing = on_disk(concatenated(["hosts", "desk.ply", "--host"], settings()));
+  ok(listing);
+  silent_about(listing, "fixture-not-a-credential");
+  says(listing, "DESK_API_KEY=**** (--set)")
+}

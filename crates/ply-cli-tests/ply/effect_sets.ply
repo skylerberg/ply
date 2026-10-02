@@ -1,0 +1,295 @@
+// `effect set`s as `ply check --types` prints them: the expansion and never the alias, wrapped at a
+// fixed column, with the alias, its uses and what a row declares beyond its body under `--explain`.
+
+import harness (program, project, repo_file, in_memory, one, tree, on_disk, said, stdout, json_of,
+                at, path, nth, items, str, int, shown)
+import std.fs (MemFs)
+import std.json (Json, Null, Array, Str)
+import std.string
+
+// Two `effect set`s, an endpoint that performs less than it declares, and endpoints that write their
+// rows out.
+fn service() -> String =
+  \\effect store {
+  \\  read  all[table]() -> List<Int>
+  \\  write save[table](rows: List<Int>) -> Unit
+  \\}
+  \\
+  \\effect set Reads = { store.read[orders], store.read[users] }
+  \\
+  \\effect set Web = { Reads, store.read[inventory], store.write[orders] }
+  \\
+  \\effect set Unused = { store.read[audit] }
+  \\
+  \\pub fn table() -> List<Int> = [1, 2, 3]
+  \\
+  \\pub fn health() -> Int = 200
+  \\
+  \\pub fn list_orders() -> Int / {Reads} = len(store.all[orders]())
+  \\
+  \\pub fn create_order() -> Int / {Web} = {
+  \\  store.save[orders](push(store.all[orders](), 1));
+  \\  len(store.all[inventory]())
+  \\}
+  \\
+  \\pub fn audit() -> Int / {store.read[audit], store.write[audit]} = {
+  \\  store.save[audit]([1]);
+  \\  len(store.all[audit]())
+  \\}
+  \\
+
+fn module_block(text: String) -> String =
+  match string::split_once(text, "\n   m ") {
+    Some(p) -> string::trim_end("   m " ++ p.tail),
+    None -> panic("no module heading in:\n" ++ text),
+  }
+
+fn columns(line: String) -> Int = len(string::code_points(line))
+
+// Every line a row occupies: the `/ {` line and the continuations hanging under it.
+fn row_lines(text: String) -> List<String> =
+  fold(
+    string_split(text, "\n"),
+    { out: [], hanging: None },
+    |acc: { out: List<String>, hanging: Option<Int> }, line: String| {
+      let indent = string_len(line) - string_len(string::trim_start(line));
+      let kept = match acc.hanging {
+        Some(column) -> if indent == column && !string_contains(line, " : ") {
+          { out: push(acc.out, line), hanging: acc.hanging }
+        } else { { out: acc.out, hanging: None } },
+        None -> acc,
+      };
+      match string::index_of(line, "/ {") {
+        Some(slash) -> if string::trim(string_slice(line, 0, slash)) == "" {
+          { out: push(kept.out, line), hanging: Some(slash + 3) }
+        } else { kept },
+        None -> kept,
+      }
+    },
+  ).out
+
+fn types(t: MemFs, extra: List<String>) -> String = {
+  let r = in_memory(t, fold(extra, ["check", "--types"], push));
+  assert(r.code == 0, Some(said(r)));
+  stdout(r)
+}
+
+fn block_of(lines: List<String>) -> String = string::join(lines, "\n")
+
+test/nondet "a service's per-endpoint footprints are legible in one command" {
+  assert_eq(
+    module_block(types(one(service()), [])),
+    block_of([
+      "   m m.ply",
+      "     effect store",
+      "       read all[r]() -> List<Int>",
+      "       write save[r](List<Int>) -> Unit",
+      "     table        : () -> List<Int>",
+      "     health       : () -> Int",
+      "     list_orders  : () -> Int",
+      "                    / {m.store.read[orders], m.store.read[users]}",
+      "     create_order : () -> Int",
+      "                    / {m.store.read[inventory], m.store.read[orders],",
+      "                       m.store.write[orders], m.store.read[users]}",
+      "     audit        : () -> Int",
+      "                    / {m.store.read[audit], m.store.write[audit]}",
+    ]),
+  )
+}
+
+test/nondet "the expansion is printed without a flag and the alias is not" {
+  let text = types(one(service()), []);
+  fold(["Web", "Reads", "Unused"], (), |u: Unit, alias: String|
+    assert(
+      !string_contains(text, alias),
+      Some("`ply check --types` printed the alias `" ++ alias ++ "`:\n" ++ text),
+    ));
+  assert(string_contains(text, "m.store.write[orders]"), Some(text))
+}
+
+// The width is fixed rather than the terminal's, because this output is diffed.
+test/nondet "no signature line runs past the column it wraps at" {
+  fold(
+    [types(one(service()), []), types(one(service()), ["--explain"])],
+    (),
+    |u: Unit, text: String|
+      fold(string_split(text, "\n"), u, |v: Unit, line: String|
+        assert(columns(line) <= 80, Some(int_to_string(columns(line)) ++ " columns: " ++ line))),
+  )
+}
+
+test/nondet "explain prints the set table, the alias and the difference it hides" {
+  assert_eq(
+    module_block(types(one(service()), ["--explain"])),
+    block_of([
+      "   m m.ply",
+      "     effect store",
+      "       read all[r]() -> List<Int>",
+      "       write save[r](List<Int>) -> Unit",
+      "",
+      "     effect set Reads",
+      "       = {m.store.read[orders], m.store.read[users]}",
+      "       used by 2 definitions",
+      "",
+      "     effect set Web",
+      "       = {m.store.read[inventory], m.store.read[orders], m.store.write[orders],",
+      "          m.store.read[users]}",
+      "       used by 1 definition",
+      "",
+      "     effect set Unused",
+      "       = {m.store.read[audit]}",
+      "       used by 0 definitions",
+      "",
+      "     table        : () -> List<Int>",
+      "     health       : () -> Int",
+      "     list_orders  : () -> Int",
+      "                    / {m.store.read[orders], m.store.read[users]}",
+      "       written as     / {Reads}",
+      "       body performs  {m.store.all[orders]}",
+      "       declared, not performed: m.store.read[users]",
+      "     create_order : () -> Int",
+      "                    / {m.store.read[inventory], m.store.read[orders],",
+      "                       m.store.write[orders], m.store.read[users]}",
+      "       written as     / {Web}",
+      "       body performs  {m.store.all[inventory], m.store.all[orders],",
+      "                       m.store.save[orders]}",
+      "       declared, not performed: m.store.read[users]",
+      "     audit        : () -> Int",
+      "                    / {m.store.read[audit], m.store.write[audit]}",
+    ]),
+  )
+}
+
+test/nondet "an included set counts the definitions that reach it" {
+  let text = types(one(service()), ["--explain"]);
+  match string::split_once(text, "effect set Reads") {
+    Some(p) ->
+      assert(
+        string_contains(p.tail, "used by 2 definitions"),
+        Some("`Reads` is named by `list_orders` and reached through `Web`:\n" ++ text),
+      ),
+    None -> panic("the block is there:\n" ++ text),
+  }
+}
+
+// Two runs over one tree, so the block is a function of the program and of nothing a run keeps.
+test/nondet "explain prints the same bytes on every run" {
+  program(service());
+  let typed = || {
+    let r = on_disk(["check", "--types", "--explain"]);
+    assert(r.code == 0, Some(said(r)));
+    module_block(stdout(r))
+  };
+  assert_eq(typed(), typed())
+}
+
+fn json_types(t: MemFs, extra: List<String>) -> Json =
+  json_of(in_memory(t, fold(extra, ["check", "--json"], push)))
+
+test/nondet "the JSON report carries the provenance only under explain" {
+  let plain = json_types(one(service()), []);
+  assert(at(nth(at(plain, "modules"), 0), "effect_sets") == Null, Some(shown(plain)));
+  assert(at(nth(at(plain, "definitions"), 0), "written_as") == Null, Some(shown(plain)));
+
+  let explained = json_types(one(service()), ["--explain"]);
+  let sets = items(at(nth(at(explained, "modules"), 0), "effect_sets"));
+  assert(
+    map(sets, |s: Json| str(at(s, "name"))) == ["Reads", "Web", "Unused"],
+    Some(shown(explained)),
+  );
+  assert(int(at(nth(Array(sets), 0), "used_by")) == 2, Some(shown(explained)));
+  assert(
+    at(nth(Array(sets), 0), "expansion")
+      == Array([Str("m.store.read[orders]"), Str("m.store.read[users]")]),
+    Some(shown(explained)),
+  );
+  let orders = match filter(items(at(explained, "definitions")), |d: Json|
+      str(at(d, "name")) == "m.list_orders") {
+    [d, ..] -> d,
+    [] -> panic("list_orders: " ++ shown(explained)),
+  };
+  assert(at(orders, "written_as") == Array([Str("Reads")]), Some(shown(orders)));
+  assert(at(orders, "performed") == Array([Str("m.store.all[orders]")]), Some(shown(orders)));
+  assert(
+    at(orders, "declared_not_performed") == Array([Str("m.store.read[users]")]),
+    Some(shown(orders)),
+  )
+}
+
+test/nondet "the JSON provenance is the same on every run" {
+  program(service());
+  let explained = || json_of(on_disk(["check", "--json", "--explain"]));
+  let once = explained();
+  let twice = explained();
+  assert(
+    at(nth(at(once, "modules"), 0), "effect_sets")
+      == at(nth(at(twice, "modules"), 0), "effect_sets"),
+    Some(shown(once)),
+  );
+  assert(at(once, "definitions") == at(twice, "definitions"), Some(shown(once)))
+}
+
+test/nondet "the example service reads as a map of the API to what it touches" {
+  let desk = tree([{ path: "desk.ply", text: repo_file("examples/desk.ply") }]);
+  let text = types(desk, []);
+  assert(
+    string_contains(text, "table") && string_contains(text, " / {"),
+    Some("a multi-route service must print both pure definitions and rows:\n" ++ text),
+  );
+  fold(row_lines(text), (), |u: Unit, line: String|
+    assert(columns(line) <= 80, Some(int_to_string(columns(line)) ++ " columns: " ++ line)));
+
+  // Whatever sets the example declares, `--types` alone names none of them.
+  let explained = json_types(desk, ["--explain"]);
+  let module = match filter(items(at(explained, "modules")), |m: Json|
+      str(at(m, "name")) == "desk") {
+    [m, ..] -> m,
+    [] -> panic("no module `desk` in " ++ shown(explained)),
+  };
+  let sets = map(items(at(module, "effect_sets")), |s: Json| str(at(s, "name")));
+  assert(
+    sets != [],
+    Some("the desk declares no `effect set`, so nothing here is checked: " ++ shown(module)),
+  );
+  let provenance = types(desk, ["--explain"]);
+  fold(sets, (), |u: Unit, name: String| {
+    assert(
+      !string_contains(text, name),
+      Some("`ply check --types` printed the alias `" ++ name ++ "`:\n" ++ text),
+    );
+    assert(
+      string_contains(provenance, "effect set " ++ name),
+      Some("`--explain` must add `" ++ name ++ "` back as provenance:\n" ++ provenance),
+    )
+  })
+}
+
+test/nondet "prove explain names what an over-broad row gave up" {
+  program(
+    \\effect store {
+    \\  read  all[table]() -> List<Int>
+    \\  write save[table](rows: List<Int>) -> Unit
+    \\}
+    \\
+    \\effect set Web = { store.read[orders], store.read[users], store.write[orders] }
+    \\
+    \\pub fn count() -> Int / {Web}
+    \\  ensures result >= 0
+    \\  = len(store.all[orders]())
+    \\
+  );
+  let text = stdout(on_disk(["prove", "--explain"]));
+  assert(
+    string_contains(text, "frame covers, body never touches:"),
+    Some("an `ensures` under a wider row must say what it gave up:\n" ++ text),
+  );
+  assert(string_contains(text, "m.store.read[users]"), Some(text));
+  assert(
+    !string_contains(text, "Web"),
+    Some("the alias name is provenance, never the claim:\n" ++ text),
+  );
+  // A row exactly its body's gives nothing up, so the line is absent rather than empty.
+  program("pub fn double(x: Int) -> Int\n  ensures result >= x\n  = x + x\n");
+  let tight = stdout(on_disk(["prove", "--explain"]));
+  assert(!string_contains(tight, "frame covers"), Some(tight))
+}

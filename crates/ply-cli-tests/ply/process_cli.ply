@@ -1,0 +1,268 @@
+// A program's own process under `ply run --host`: its arguments, streams, input and exit code, the
+// children it starts, and that none of them outlives the run. What a program writes goes to the
+// process's own streams, so every run here is one.
+
+import harness (Ran, Server, program, spawned, spawned_reading, speaking, next_line, signal_to,
+                ended, environment, said, stdout, stderr, json_of, at, str, int, truth, shown)
+import std.json (Json, Null)
+import std.process (process, Exited, Signalled, Terminate)
+import std.string
+import std.time (time)
+
+fn source() -> String =
+  \\import std.process (process)
+  \\
+  \\fn greeting(args: List<String>) -> String =
+  \\  fold(args, "hi", |acc: String, a: String| acc ++ " " ++ a)
+  \\
+  \\fn main() -> Unit / {process.read[proc], process.write[proc]} = {
+  \\  process.out[proc](greeting(process.args[proc]()));
+  \\  process.err[proc]("leaving");
+  \\  process.exit[proc](3);
+  \\  process.out[proc]("never written")
+  \\}
+  \\
+
+fn one_line() -> String =
+  \\import std.process (process)
+  \\
+  \\fn main() -> Unit / {process.write[proc]} =
+  \\  match process.line[proc]() {
+  \\    None -> process.out[proc]("end of input"),
+  \\    Some(line) -> process.out[proc]("read " ++ line),
+  \\  }
+  \\
+
+fn last_line(r: Ran) -> String = match list_at(r.out, len(r.out) - 1) { Some(l) -> l, None -> "" }
+
+test/nondet "run with host answers the arguments, writes each stream and exits with the code" {
+  program(source());
+  let r = spawned(["run", "m.ply", "--host", "--", "a", "b"], []);
+  assert(r.code == 3, Some(said(r)));
+  assert(
+    last_line(r) == "hi a b",
+    Some("the program's line is the last thing on stdout, and no value follows it:\n" ++ stdout(r)),
+  );
+  assert(!string_contains(stdout(r), "never written"), Some(stdout(r)));
+  assert(string_contains(stderr(r), "leaving"), Some(stderr(r)));
+  assert(
+    !string_contains(stderr(r), "E0455") && !string_contains(stderr(r), "raised at"),
+    Some("an exit the program asked for is not an error:\n" ++ stderr(r)),
+  )
+}
+
+test/nondet "run with host reads a line from standard input" {
+  program(one_line());
+  let r = spawned_reading(["run", "m.ply", "--host"], [], "hello\nrest\n");
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "read hello"), Some(stdout(r)));
+  assert(
+    !string_contains(stdout(r), "rest"),
+    Some("the whole input is not one call's answer:\n" ++ stdout(r)),
+  )
+}
+
+test/nondet "a line read past the end of input is None" {
+  program(one_line());
+  let r = spawned_reading(["run", "m.ply", "--host"], [], "");
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "end of input"), Some(stdout(r)))
+}
+
+test/nondet "without host the boundary refuses and names the handler" {
+  program(source());
+  let r = spawned(["run", "m.ply"], []);
+  assert(r.code == 1, Some(said(r)));
+  assert(string_contains(stderr(r), "E0424"), Some(stderr(r)));
+  assert(string_contains(stderr(r), "ply_host::process::args"), Some(stderr(r)));
+  assert(!string_contains(stdout(r), "hi"), Some("nothing ran"))
+}
+
+test/nondet "under json the object is alone on stdout and the lines go to stderr" {
+  program(source());
+  let r = spawned(["run", "m.ply", "--host", "--json", "--", "x"], []);
+  assert(r.code == 3, Some(said(r)));
+  let v = json_of(r);
+  assert(str(at(v, "command")) == "run", Some(shown(v)));
+  assert(!truth(at(v, "ok")), Some(shown(v)));
+  assert(int(at(v, "exit_code")) == 3, Some(shown(v)));
+  assert(at(v, "value") == Null, Some(shown(v)));
+  assert(str(at(v, "binding")) == "host", Some(shown(v)));
+  assert(string_contains(stderr(r), "hi x"), Some(stderr(r)));
+  assert(string_contains(stderr(r), "leaving"), Some(stderr(r)))
+}
+
+test/nondet "an exit code the shell could not carry is a runtime error" {
+  program(
+    "import std.process (process)\n\nfn main() -> Unit / {process.write[proc]} = process.exit[proc](300)\n",
+  );
+  let r = spawned(["run", "m.ply", "--host"], []);
+  assert(r.code == 1, Some(said(r)));
+  assert(string_contains(stderr(r), "E0502"), Some(stderr(r)));
+  assert(string_contains(stderr(r), "0 to 125"), Some(stderr(r)))
+}
+
+test/nondet "ply test withholds the process even with host" {
+  program(
+    \\import std.process (process)
+    \\
+    \\pub fn announce() -> Unit / {process.write[proc]} = process.out[proc]("ready")
+    \\
+    \\test/nondet "the announcement reaches the process" {
+    \\  announce()
+    \\}
+    \\
+  );
+  fold([["test", "--json"], ["test", "--host", "--json"]], (), |u: Unit, flags: List<String>| {
+    let r = spawned(flags, []);
+    assert(
+      string_contains(said(r), "E0424"),
+      Some(
+        "`ply " ++ string::join(flags, " ") ++ "` did not refuse `process.out` at the boundary\n\n"
+          ++ said(r),
+      ),
+    );
+    assert(
+      string_contains(said(r), "ply_host::process::out"),
+      Some("the refusal names the handler that would have served it\n\n" ++ said(r)),
+    )
+  })
+}
+
+test/nondet "a run that never exits prints its value as before" {
+  program(
+    "import std.process (process)\n\nfn main() -> Int / {process.read[proc]} = len(process.args[proc]())\n",
+  );
+  let v = json_of(spawned(["run", "m.ply", "--host", "--json", "--", "one", "two"], []));
+  assert(truth(at(v, "ok")), Some(shown(v)));
+  assert(int(at(v, "exit_code")) == 0, Some(shown(v)));
+  assert(str(at(v, "value")) == "2", Some(shown(v)))
+}
+
+// Says, for two labels, whether the run bound a program to each; it starts neither.
+fn asks_what_is_bound() -> String =
+  \\import std.process (process)
+  \\
+  \\fn said(label: String, bound: Bool) -> String =
+  \\  label ++ (if bound { " is bound" } else { " is not bound" })
+  \\
+  \\fn main() -> Unit / {process.bound[sh], process.bound[cc], process.out[proc]} = {
+  \\  process.out[proc](said("sh", process.bound[sh]()));
+  \\  process.out[proc](said("cc", process.bound[cc]()))
+  \\}
+  \\
+
+test/nondet "bound answers from the exec table the run was given" {
+  program(asks_what_is_bound());
+  fold(
+    [{ exec: ["--exec", "sh=/bin/sh"], sh: "sh is bound" }, { exec: [], sh: "sh is not bound" }],
+    (),
+    |u: Unit, c: { exec: List<String>, sh: String }| {
+      let r = spawned(fold(c.exec, ["run", "m.ply", "--host"], push), []);
+      assert(r.code == 0, Some(said(r)));
+      let lines = r.out;
+      assert(len(filter(lines, |l: String| l == c.sh)) > 0, Some(stdout(r)));
+      assert(len(filter(lines, |l: String| l == "cc is not bound")) > 0, Some(stdout(r)))
+    },
+  )
+}
+
+// Starts a child that says its pid and sleeps, says that pid, then ends as `ENDING` says.
+fn leaves_a_child() -> String =
+  \\import std.process
+  \\import std.process (process)
+  \\
+  \\fn main() -> Unit / {process.start[sh], process.output_line[sh], process.wait[sh], process.out[proc], process.exit[proc]} = {
+  \\  let started = process.start[sh](
+  \\    ["-c", "echo $$; exec sleep 600"],
+  \\    "",
+  \\    [process::var("PATH", "/usr/bin:/bin")],
+  \\    { input: false, out: process::Lines, err: process::Discard },
+  \\  );
+  \\  match started {
+  \\    Err(why) -> process.out[proc]("not started: " ++ why),
+  \\    Ok(child) -> {
+  \\      match process.output_line[sh](child, 10000) {
+  \\        process::Said(pid) -> process.out[proc]("pid " ++ pid),
+  \\        _ -> process.out[proc]("no pid"),
+  \\      };
+  \\      ENDING
+  \\    },
+  \\  }
+  \\}
+  \\
+
+fn waits_on_it() -> String = "let _ = process.wait[sh](child, -1);\n      ()"
+
+fn leaving(ending: String) -> Unit = program(string::replace(leaves_a_child(), "ENDING", ending))
+
+fn pid_in(line: String) -> Option<String> =
+  if string_starts_with(line, "pid ") { Some(string_trim(string_slice(line, 4, string_len(line)))) }
+  else { None }
+
+// Whether any process has this pid, as `kill -0` asks.
+fn alive(pid: String) -> Bool =
+  match process.spawn[sh](["-c", "kill -0 " ++ pid ++ " 2>/dev/null"], "", environment([])).ended {
+    Exited(c) -> c == 0,
+    Signalled(_) -> false,
+  }
+
+test/nondet "a child still running when the run ends does not outlive it" {
+  fold(
+    [
+      { ending: "()", code: 0 },
+      { ending: "process.exit[proc](3)", code: 3 },
+      { ending: "panic(\"the program gave up\")", code: 1 },
+    ],
+    (),
+    |u: Unit, c: { ending: String, code: Int }| {
+      leaving(c.ending);
+      let r = spawned(["run", "m.ply", "--host", "--exec", "sh=/bin/sh"], []);
+      assert(r.code == c.code, Some("ended by `" ++ c.ending ++ "`\n" ++ said(r)));
+      let pid = match fold(r.out, None, |found: Option<String>, l: String|
+          match found { Some(_) -> found, None -> pid_in(l) }) {
+        Some(p) -> p,
+        None -> panic("the run never said the child's pid:\n" ++ stdout(r)),
+      };
+      assert(
+        !alive(pid),
+        Some("the child " ++ pid ++ " outlived a run ended by `" ++ c.ending ++ "`"),
+      )
+    },
+  )
+}
+
+// The pid the run's child said, read as the run writes it.
+fn pid_said(s: Server) -> String =
+  match next_line(s, 300000) {
+    Some(line) -> match pid_in(line) { Some(pid) -> pid, None -> pid_said(s) },
+    None -> panic("the run never said the child's pid"),
+  }
+
+// A run waiting on its child, stopped from outside: how the run ended, and the child's pid.
+type Stopped = { code: Int, pid: String }
+
+fn stopped(flags: List<String>, signals: Int) -> Stopped = {
+  leaving(waits_on_it());
+  let run = speaking(fold(flags, ["run", "m.ply", "--host", "--exec", "sh=/bin/sh"], push), []);
+  let pid = pid_said(run);
+  assert(alive(pid), Some("the child " ++ pid ++ " is running"));
+  fold(range(0, signals), (), |u: Unit, i: Int| {
+    signal_to(run, Terminate);
+    time.sleep_ms(300)
+  });
+  let f = ended(run, 60000, "the run was still going a minute after it was stopped");
+  { code: match f.ended { Exited(c) -> c, Signalled(_) -> -1 }, pid: pid }
+}
+
+test/nondet "a second signal ends the children before the run exits" {
+  let s = stopped([], 2);
+  assert(s.code == 143, Some("a second `SIGTERM` exits 143"));
+  assert(!alive(s.pid), Some("the child " ++ s.pid ++ " outlived the second signal"))
+}
+
+test/nondet "a drain that runs out of time ends the children with the run" {
+  let s = stopped(["--drain-ms", "200"], 1);
+  assert(s.code == 3, Some("an expired drain exits 3"));
+  assert(!alive(s.pid), Some("the child " ++ s.pid ++ " outlived the drain"))
+}

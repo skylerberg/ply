@@ -1,0 +1,181 @@
+// `where derivable(..)`: a constraint nothing can satisfy is refused at the boundary, one that can
+// be is assumed inside the body, an inferred map key is checked like a written one, the constraint
+// is in the hash and its spelling is not, and a derivation cannot be hijacked by the deriving module.
+
+import harness (in_memory, on_disk, one, program, said, stdout, json_of, at, items, str, int)
+import std.json (Json)
+import std.string
+
+// What a check that refused the source said, and nothing for one that took it.
+fn codes_of(source: String) -> List<String> = {
+  let answer = json_of(in_memory(one(source), ["check", "--json"]));
+  if int(at(answer, "exit_code")) == 0 { [] }
+  else { map(items(at(answer, "diagnostics")), |d: Json| str(at(d, "code"))) }
+}
+
+fn refuses_with(source: String, code: String) -> Bool =
+  len(filter(codes_of(source), |c: String| c == code)) > 0
+
+fn hashes(source: String) -> List<String> =
+  map(items(at(json_of(in_memory(one(source), ["hash", "--json"])), "definitions")), |d: Json|
+    str(at(d, "hash")))
+
+fn run_main(source: String) -> String = {
+  program(source);
+  let r = on_disk(["run"]);
+  assert(r.code == 0, Some("the fixture did not run:\n" ++ said(r)));
+  string_trim(said(r))
+}
+
+// Each must be `E0206` statically, at the call site or the signature, never something that checks
+// and fails deeper.
+test/nondet "no unsatisfiable constraint is accepted at a boundary" {
+  let needs = "fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n";
+  let attempts = [
+    // Directly.
+    needs ++ "fn go() -> Int = needs(1.5)",
+    // Under a container the signature writes.
+    "fn needs<a>(xs: List<a>) -> Int where derivable(ord, a) = 1\nfn go() -> Int = needs([1.5])",
+    // Through a first-class use, where the constraint could be lost with the function's name.
+    needs
+      ++ "fn apply(f: (Float) -> Int, x: Float) -> Int = f(x)\nfn go() -> Int = apply(needs, 1.5)",
+    // Through a lambda, same question with a different binder.
+    needs ++ "fn go() -> Int = { let f = |x: Float| needs(x); f(1.5) }",
+    // A body assuming one constraint that calls something needing another.
+    needs ++ "fn caller<a>(x: a) -> Int where derivable(json, a) = needs(x)",
+    // A `Float` behind a nominal declaration.
+    "type Money = Cents(Float)\n" ++ needs ++ "fn go() -> Int = needs(Cents(1.5))",
+    // Behind a recursive declaration.
+    "type Chain = Nil | Link(Float, Chain)\n" ++ needs ++ "fn go() -> Int = needs(Nil)",
+    // Behind a type parameter of a declaration.
+    "type Box<a> = B(a)\n" ++ needs ++ "fn go() -> Int = needs(B(1.5))",
+    // Two constrained hops, so the failure has to travel.
+    "type Money = Cents(Float)\nfn inner<a>(x: a) -> Int where derivable(ord, a) = 1\n"
+      ++ "fn outer<a>(x: a) -> Int where derivable(ord, a) = inner(x)\n"
+      ++ "fn go() -> Int = outer(Cents(1.5))",
+  ];
+  fold(attempts, (), |u: Unit, source: String|
+    assert(
+      refuses_with(source, "E0206"),
+      Some(
+        "accepted a constraint it cannot satisfy (codes: " ++ string::join(codes_of(source), ", ")
+          ++ ") in:\n"
+          ++ source,
+      ),
+    ))
+}
+
+test/nondet "a satisfiable constraint is assumed inside the body" {
+  let sources = [
+    "fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\nfn go() -> Int = needs(1)",
+    "fn keyed<k>(x: k) -> Map<k, Int> where derivable(ord, k) = map_insert(map_new(), x, 1)\n"
+      ++ "fn go() -> Int = map_len(keyed(\"a\"))",
+    "fn inner<a>(x: a) -> Int where derivable(ord, a) = 1\n"
+      ++ "fn outer<a>(x: a) -> Int where derivable(ord, a) = inner(x)\nfn go() -> Int = outer(1)",
+    "type Money = Cents(Decimal)\nfn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n"
+      ++ "fn go() -> Int = needs(Cents(1.5m))",
+  ];
+  fold(sources, (), |u: Unit, source: String|
+    assert(codes_of(source) == [], Some("a satisfiable constraint was refused in:\n" ++ source)))
+}
+
+// Checked wherever the key type is inferred, where a check on the surface syntax would miss it.
+test/nondet "an inferred map key is checked like a written one" {
+  let sources = [
+    "fn go() -> Int = map_len(map_insert(map_new(), 1.5, 1))",
+    "type Money = Cents(Float)\nfn go() -> Int = map_len(map_insert(map_new(), Cents(1.5), 1))",
+    "fn go() -> Int = map_len(map_of_entries([{key: 1.5, value: 1}]))",
+    "fn go() -> Int = map_len(map_insert(map_new(), {rate: 1.5}, 1))",
+    "fn go() -> Int = map_len(map_insert(map_new(), [1.5], 1))",
+  ];
+  fold(sources, (), |u: Unit, source: String|
+    assert(refuses_with(source, "E0206"), Some("a `Float` reached a map key in:\n" ++ source)));
+  // The control: a `Float` *value* is fine, because only the key is ordered.
+  assert(
+    codes_of("fn go() -> Int = map_len(map_insert(map_new(), \"k\", 1.5))") == [],
+    Some("a `Float` value was refused"),
+  )
+}
+
+// A `where` clause narrows what a signature admits; if the hash ignored it, a caller would never be
+// rechecked.
+test/nondet "a constraint is in the hash and its spelling is not" {
+  let bare = hashes("fn f<a>(x: a) -> Int = 1\n");
+  let constrained = hashes("fn f<a>(x: a) -> Int where derivable(ord, a) = 1\n");
+  assert(bare != constrained, Some("adding a `where` moved no hash"));
+  assert(
+    hashes("fn f<a>(x: a) -> Int where derivable(ord, a), derivable(json, a) = 1\n")
+      == hashes("fn f<a>(x: a) -> Int where derivable(json, a), derivable(ord, a) = 1\n"),
+    Some("reordering two `where` clauses moved a hash"),
+  );
+  assert(
+    constrained == hashes("fn f<t>(x: t) -> Int where derivable(ord, t) = 1\n"),
+    Some("renaming the constrained type parameter moved a hash"),
+  )
+}
+
+// A control, so the two failures below are about hijacking rather than broken derivation.
+test/nondet "a derivation composed through the module binder is canonical" {
+  let printed = run_main(
+    \\import std.json
+    \\pub type Order = { id: Int, note: String }
+    \\derive json for Order
+    \\pub fn main() -> String = json::to_string((order_json().encode)({id: 1, note: "hi"}))
+    \\
+  );
+  assert(
+    string_contains(printed, "\\\"id\\\":1") && string_contains(printed, "\\\"note\\\":\\\"hi\\\""),
+    Some("the canonical encoding is not what came out: " ++ printed),
+  )
+}
+
+// `derive ord` emits `compare(a, b)` as a bare name, and a module's own items shadow the prelude.
+test/nondet "a derived ord is the language's order and not the module's" {
+  let printed = run_main(
+    \\pub type Point = P(Int)
+    \\derive ord for Point
+    \\fn compare<a>(x: a, y: a) -> Ordering = Greater
+    \\pub fn main() -> Ordering = (point_ord().compare)(P(1), P(1))
+    \\
+  );
+  assert(
+    string_contains(printed, "Equal"),
+    Some(
+      "a local `compare` replaced the language's order inside a derived dictionary: " ++ printed,
+    ),
+  )
+}
+
+test/nondet "a derived JSON codec cannot be supplied by the deriving module" {
+  let printed = run_main(
+    \\import std.json (Json, JsonCodec, Str, object, field, decode_error, to_string)
+    \\pub type Order = { id: Int, note: String }
+    \\derive json for Order
+    \\fn string_json() -> JsonCodec<String> = {
+    \\  encode: |s: String| Str("HIJACKED"),
+    \\  decode: |j: Json| Err(decode_error("no")),
+    \\}
+    \\fn int_json() -> JsonCodec<Int> = {
+    \\  encode: |i: Int| Str("ALSO HIJACKED"),
+    \\  decode: |j: Json| Err(decode_error("no")),
+    \\}
+    \\pub fn main() -> String = to_string((order_json().encode)({id: 1, note: "hi"}))
+    \\
+  );
+  assert(
+    !string_contains(printed, "HIJACKED"),
+    Some("the deriving module supplied the leaf codecs its own derivation used: " ++ printed),
+  )
+}
+
+// It emits the `==` operator, a token rather than a name, so nothing in scope can stand in for it.
+test/nondet "a derived eq uses an operator and so cannot be shadowed" {
+  let printed = run_main(
+    \\pub type Point = P(Int)
+    \\derive eq for Point
+    \\fn eq<a>(x: a, y: a) -> Bool = false
+    \\pub fn main() -> Bool = (point_eq().eq)(P(1), P(1))
+    \\
+  );
+  assert(string_contains(printed, "true"), Some("a derived `eq` was shadowed too: " ++ printed))
+}

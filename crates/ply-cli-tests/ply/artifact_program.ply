@@ -1,0 +1,277 @@
+// The committed `ply` program, the packages it is built from, and the shelf it is built against.
+// CI's `refresh` job rebuilds the artifact and its digest on main, so no pull request carries either.
+
+import harness (Package, Source, project, write, read, repo, repo_file, copy_from_repo, closure_of,
+                program_packages, shelved, on_disk, in_memory, tree, spawned, said, stdout, stderr,
+                json_of, at, path, items, first, str, int, truth, shown)
+import std.list (sort_by)
+import cli.sources (is_std, is_compiler)
+import std.fs (fs)
+import std.json (Json)
+import std.string
+
+fn package(prefix: String, deps: List<String>) -> Package = { prefix: prefix, deps: deps }
+
+test/nondet "the CLI tree is a package" {
+  assert(
+    closure_of(repo() ++ "/crates/ply-cli/ply")
+      == [
+        package("cli", ["suite", "sim", "store", "proof"]),
+        package("suite", []),
+        package("sim", []),
+        package("store", []),
+        package("proof", ["sim"]),
+        package("std", []),
+        package("compiler", ["std"]),
+      ],
+    Some(
+      "the CLI tree's ply.pkg names it the `cli` package, closed over the suite, the search, the store, the prove package and the two built-ins",
+    ),
+  )
+}
+
+// The digest a run in this process keys reuse on has to move with every package the program is
+// built from, or a run reuses what a program built from other sources filed.
+test/nondet "the in-process digest covers every package the CLI is built from" {
+  let built_from = filter(
+    map(closure_of(repo() ++ "/crates/ply-cli/ply"), |p: Package| p.prefix),
+    |n: String| n != "std" && n != "compiler",
+  );
+  let digested = map(program_packages(), |dir: String|
+    match closure_of(repo() ++ "/" ++ dir) {
+      [root, ..] -> root.prefix,
+      [] -> panic("`" ++ dir ++ "` loads nothing"),
+    });
+  assert(
+    sort_by(digested, |a: String, b: String| compare(a, b) == Less)
+      == sort_by(built_from, |a: String, b: String| compare(a, b) == Less),
+    Some(
+      "the harness digests " ++ string::join(digested, ", ") ++ " and the CLI is built from "
+        ++ string::join(built_from, ", "),
+    ),
+  )
+}
+
+test/nondet "the corpus tree is a package over the CLI" {
+  assert(
+    closure_of(repo() ++ "/crates/ply-corpus/ply")
+      == [
+        package("corpus", ["cli", "suite", "proof"]),
+        package("cli", ["suite", "sim", "store", "proof"]),
+        package("suite", []),
+        package("proof", ["sim"]),
+        package("sim", []),
+        package("store", []),
+        package("std", []),
+        package("compiler", ["std"]),
+      ],
+    Some(
+      "the corpus tree's ply.pkg names it the `corpus` package over the CLI's and the two packages it reads as the CLI does, the suite and the prove package",
+    ),
+  )
+}
+
+// Built by the binary, since the stamp is the launcher's identity of the program it ships.
+test/nondet "the committed program is what these sources build" {
+  project([]);
+  let built = spawned(
+    [
+      "build",
+      repo() ++ "/crates/ply-cli/ply",
+      "--entry",
+      "ply.main",
+      "-o",
+      "ply.plyx",
+      "--stamp",
+      "ply.digest",
+      "--json",
+    ],
+    [],
+  );
+  let report = json_of(built);
+  assert(truth(at(report, "ok")), Some(said(built)));
+  // Whatever else moves, the artifact has to carry the entry point the runner enters, compiled.
+  assert(str(at(report, "entry")) == "ply.main", Some(shown(report)));
+  assert(truth(at(report, "unit")), Some("no compiled unit was embedded: " ++ shown(report)));
+  // It opens as the program it names and enters `ply.main`, which asks for its arguments first.
+  let ran = spawned(["run", "ply.plyx"], []);
+  assert(string_contains(stdout(ran), "compiled unit embedded"), Some(said(ran)));
+  assert(string_contains(stderr(ran), "process.args[proc]"), Some(said(ran)));
+
+  // A pull request that touches the compiler moves the stamp, so the committed program is behind
+  // it; only main, after `refresh`, has the two agreeing.
+  match fs.read_file[repo]("crates/ply-cli/bootstrap/ply.plyx") {
+    None -> (),
+    Some(committed) -> if fs.read_file[repo]("crates/ply-cli/bootstrap/ply.digest")
+        == fs.read_file[cwd]("ply.digest") {
+      match fs.read_file[cwd]("ply.plyx") {
+        Some(ours) -> {
+          assert(
+            bytes_len(committed) == bytes_len(ours),
+            Some(
+              "the committed program is " ++ int_to_string(bytes_len(committed))
+                ++ " bytes and these sources build "
+                ++ int_to_string(bytes_len(ours)),
+            ),
+          );
+          assert(
+            committed == ours,
+            Some("the committed program differs from what these sources build, at the same length"),
+          )
+        },
+        None -> panic("the build wrote no artifact"),
+      }
+    },
+  }
+}
+
+test/nondet "the compiler is on the shelf under its own root and nothing may shadow it" {
+  let modules = map(items(at(json_of(spawned(["std", "--json"], [])), "modules")), |m: Json|
+    str(at(m, "module")));
+  assert(len(filter(modules, |m: String| m == "std.path")) == 1, Some(string::join(modules, " ")));
+  assert(is_compiler("compiler.fmt"), None);
+  assert(is_std("std.fs"), None);
+  assert(!is_compiler("compilers.fmt") && !is_std("compilers.fmt"), None);
+  assert(!is_compiler("fmt") && !is_std("fmt"), None);
+
+  let collided = json_of(
+    in_memory(tree([{ path: "compiler/fmt.ply", text: "pub fn f() -> Int = 1\n" }]), [
+      "check",
+      "--json",
+    ]),
+  );
+  let diagnostics = items(at(collided, "diagnostics"));
+  assert(len(diagnostics) == 1, Some(shown(collided)));
+  assert(str(at(first(diagnostics), "code")) == "E0133", Some(shown(collided)));
+  assert(
+    string_contains(str(at(first(diagnostics), "message")), "compiler.fmt"),
+    Some(shown(collided)),
+  );
+
+  // A name that merely starts with the letters is no collision.
+  let ok = in_memory(tree([{ path: "compilers.ply", text: "pub fn f() -> Int = 1\n" }]), ["check"]);
+  assert(ok.code == 0, Some("`compilers` is an ordinary module name: " ++ said(ok)))
+}
+
+// The module path an `import` line opens with.
+fn imported(line: String) -> String = {
+  let rest = bytes_of_string(string_slice(line, string_len("import "), string_len(line)));
+  let class = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
+  string_of_bytes(bytes_slice(rest, 0, bytes_scan(rest, 0, class, bytes_len(rest))))
+}
+
+// The shelf hands over text, and the front end and the emitter each parse it: every import a
+// shelved module makes must resolve there, an import of another package in full or the compiler
+// package's own sibling.
+test/nondet "every shelved module imports the shelf under the names it files them under" {
+  let modules = map(shelved(), |s: Source|
+    { name: string_slice(s.path, 0, string_len(s.path) - 4), text: s.text });
+  let filed = map(modules, |m: { name: String, text: String }| m.name);
+  let files = |n: String| len(filter(filed, |f: String| f == n)) > 0;
+  fold(modules, (), |u: Unit, m: { name: String, text: String }|
+    fold(
+      filter(string_split(m.text, "\n"), |l: String| string_starts_with(l, "import ")),
+      u,
+      |v: Unit, line: String| {
+        let p = imported(line);
+        assert(
+          files(p) || (is_compiler(m.name) && files("compiler." ++ p)),
+          Some(
+            "`" ++ m.name ++ "` imports `" ++ p ++ "`, which the shelf files under no such name",
+          ),
+        )
+      },
+    ))
+}
+
+test/nondet "a program may import the formatter off the shelf" {
+  project([
+    {
+      path: "app.ply",
+      text:
+        \\import compiler.fmt (fmt_source)
+        \\
+        \\fn main() -> Bool =
+        \\  match fmt_source(b"fn  f()->Int=1") {
+        \\    Ok(text) -> text != b"fn  f()->Int=1",
+        \\    Err(_) -> false,
+        \\  }
+        \\
+    },
+  ]);
+  let r = spawned(["check", "--json"], []);
+  assert(r.code == 0, Some(shown(json_of(r))))
+}
+
+// The whole closure, laid out the way a checkout has it: the CLI depends on the suite, the search
+// and the prove package by path, so a copy of the CLI's own modules alone would not load.
+test/nondet "the program's own tests pass" {
+  project([]);
+  fold(
+    ["crates/ply-cli/ply", "crates/ply-test/ply", "crates/ply-sim/ply", "crates/ply-prove/ply"],
+    (),
+    |u: Unit, dir: String| copy_from_repo(dir, dir),
+  );
+  let r = on_disk(["test", "crates/ply-cli/ply", "--json"]);
+  let v = json_of(r);
+  assert(int(at(v, "exit_code")) == 0, Some(red(v)));
+  assert(int(path(v, ["summary", "failed"])) == 0, Some(red(v)));
+  assert(
+    int(path(v, ["summary", "passed"])) > 0,
+    Some("the program declares no test: " ++ shown(at(v, "summary"))),
+  )
+}
+
+// The tests that failed and what each said, rather than a compiled unit's worth of timings.
+fn red(report: Json) -> String =
+  match items(at(report, "failures")) {
+    [] -> shown(at(report, "summary")),
+    failures ->
+      string::join(
+        map(failures, |f: Json|
+          str(at(f, "name")) ++ ": " ++ str(path(f, ["diagnostic", "code"])) ++ " "
+            ++ str(path(f, ["diagnostic", "message"]))),
+        "\n",
+      ),
+  }
+
+// The path argument every command defaults to is `.`, and a root bound to what that tidies to has
+// to be a directory that resolves: an empty one is `E0454` before the program runs at all.
+test/nondet "every ported command answers with no path argument" {
+  project([{ path: "m.ply", text: "pub fn one() -> Int = 1\n" }]);
+  // `ply fmt --check` over a tree that needs no rewriting writes nothing; every other row does.
+  fold(
+    [
+      { args: ["defs"], writes: true },
+      { args: ["defs", "--json"], writes: true },
+      { args: ["hash"], writes: true },
+      { args: ["hash", "--json"], writes: true },
+      { args: ["doc", "one"], writes: true },
+      { args: ["doc", "one", "--json"], writes: true },
+      { args: ["show", "one"], writes: true },
+      { args: ["show", "one", "--json"], writes: true },
+      { args: ["callers", "one"], writes: true },
+      { args: ["callers", "one", "--json"], writes: true },
+      { args: ["std"], writes: true },
+      { args: ["std", "--json"], writes: true },
+      { args: ["std", "--digest"], writes: true },
+      { args: ["explain", "E0001"], writes: true },
+      { args: ["hosts"], writes: true },
+      { args: ["hosts", "--json"], writes: true },
+      { args: ["hosts", "--digest"], writes: true },
+      { args: ["cache", "stats"], writes: true },
+      { args: ["cache", "stats", "--json"], writes: true },
+      { args: ["fmt", "--check"], writes: false },
+    ],
+    (),
+    |u: Unit, c: { args: List<String>, writes: Bool }| {
+      let r = on_disk(c.args);
+      let shown_as = "`ply " ++ string::join(c.args, " ") ++ "`";
+      assert(
+        r.code == 0,
+        Some(shown_as ++ " exited " ++ int_to_string(r.code) ++ "\n" ++ stderr(r)),
+      );
+      assert(!c.writes || len(r.out) > 0, Some(shown_as ++ " wrote nothing"))
+    },
+  )
+}
