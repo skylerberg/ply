@@ -59,8 +59,9 @@ pub fn handed(path: &Path) -> ply_eval::Value {
         manifest: None,
         supplied: Vec::new(),
     };
-    let pulled = producer::front_pulling_std_with(&own, ply_machine::shelf::sources(), &packages)
-        .expect("the front end runs");
+    let pulled =
+        producer::front_pulling_std_with(&own, ply_machine::shelf::sources(), &packages, &[])
+            .expect("the front end runs");
     for name in &pulled.modules {
         let module = ply_eval::ModuleName::from_dotted(name);
         if let Some(text) = ply_machine::shelf::source(&module) {
