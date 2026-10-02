@@ -406,7 +406,15 @@ pub fn free_vars(s: Subst, t: Type, acc: Free) -> Free =
     TyRecord(fs) -> fold(fs, acc, |a: Free, f: Field| free_vars(s, f.ty, a)),
   }
 
-pub fn unify(s: Subst, f: Fresh, expected: Type, found: Type) -> Unified = {
+// Immutable containers, which may hold a narrower function than their type says.
+pub fn covariant_con(name: Bytes) -> Bool =
+  name == b"List" || name == b"Option" || name == b"Result" || name == b"Map" || name == b"Iter"
+
+pub fn unify(s: Subst, f: Fresh, expected: Type, found: Type) -> Unified =
+  unify_at(s, f, expected, found, false)
+
+// `exact`: inside a parameter or another constructor, a row must not stand for a wider one.
+fn unify_at(s: Subst, f: Fresh, expected: Type, found: Type, exact: Bool) -> Unified = {
   let a = shallow(s, expected);
   let b = shallow(s, found);
   match a {
@@ -421,29 +429,33 @@ pub fn unify(s: Subst, f: Fresh, expected: Type, found: Type) -> Unified = {
     _ -> match b {
       TyVar(y) -> if !is_rigid_ty(s, y) { bind_ty(s, f, y, a) }
       else { failed(s, f, Mismatch({ expected: a, found: b })) },
-      _ -> unify_structural(s, f, a, b),
+      _ -> unify_structural(s, f, a, b, exact),
     },
   }
 }
 
-fn unify_structural(s: Subst, f: Fresh, a: Type, b: Type) -> Unified =
+fn unify_structural(s: Subst, f: Fresh, a: Type, b: Type, exact: Bool) -> Unified =
   match a {
     TyCon(c1) -> match b {
       TyCon(c2) -> if c1.name != c2.name || len(c1.args) != len(c2.args) {
         failed(s, f, Mismatch({ expected: a, found: b }))
-      } else { unify_all(s, f, c1.args, c2.args) },
+      } else if len(c1.args) == 0 { ok(s, f) }
+      else { unify_all(s, f, c1.args, c2.args, exact || !covariant_con(c1.name)) },
       _ -> failed(s, f, Mismatch({ expected: a, found: b })),
     },
     TyFn(f1) -> match b {
       TyFn(f2) -> if len(f1.params) != len(f2.params) {
         failed(s, f, Arity({ expected: len(f1.params), found: len(f2.params) }))
       } else {
-        let ps = unify_all(s, f, f1.params, f2.params);
+        let ps = unify_all(s, f, f1.params, f2.params, true);
         match ps.err {
           Some(_) -> ps,
           None -> {
-            let r = unify(ps.s, ps.f, f1.ret, f2.ret);
-            match r.err { Some(_) -> r, None -> unify_row(r.s, r.f, f1.effects, f2.effects) }
+            let r = unify_at(ps.s, ps.f, f1.ret, f2.ret, exact);
+            match r.err {
+              Some(_) -> r,
+              None -> unify_row_at(r.s, r.f, f1.effects, f2.effects, exact),
+            }
           },
         }
       },
@@ -453,15 +465,15 @@ fn unify_structural(s: Subst, f: Fresh, a: Type, b: Type) -> Unified =
       TyRecord(fs2) -> if len(fs1) != len(fs2)
           || map(fs1, |x: Field| x.name) != map(fs2, |x: Field| x.name) {
         failed(s, f, Mismatch({ expected: a, found: b }))
-      } else { unify_all(s, f, map(fs1, |x: Field| x.ty), map(fs2, |x: Field| x.ty)) },
+      } else { unify_all(s, f, map(fs1, |x: Field| x.ty), map(fs2, |x: Field| x.ty), exact) },
       _ -> failed(s, f, Mismatch({ expected: a, found: b })),
     },
     TyVar(_) -> failed(s, f, Mismatch({ expected: a, found: b })),
   }
 
-fn unify_all(s: Subst, f: Fresh, xs: List<Type>, ys: List<Type>) -> Unified =
+fn unify_all(s: Subst, f: Fresh, xs: List<Type>, ys: List<Type>, exact: Bool) -> Unified =
   fold(range(0, len(xs)), ok(s, f), |acc: Unified, i: Int|
-    match acc.err { Some(_) -> acc, None -> unify(acc.s, acc.f, at(xs, i), at(ys, i)) })
+    match acc.err { Some(_) -> acc, None -> unify_at(acc.s, acc.f, at(xs, i), at(ys, i), exact) })
 
 // A free label variable takes the resource the other row names for the same operation, so a
 // caller's concrete label reaches a callee's generic one through an argument's row.
@@ -502,14 +514,18 @@ fn partner(s: Subst, ys: List<Atom>, x: Atom, v: Int) -> Option<Type> =
       },
     })
 
-pub fn unify_row(s0: Subst, f: Fresh, expected: Row, found: Row) -> Unified = {
+pub fn unify_row(s0: Subst, f: Fresh, expected: Row, found: Row) -> Unified =
+  unify_row_at(s0, f, expected, found, false)
+
+fn unify_row_at(s0: Subst, f: Fresh, expected: Row, found: Row, exact: Bool) -> Unified = {
   let x = resolve_row(s0, expected);
   let y = resolve_row(s0, found);
   let s = bind_labels(bind_labels(s0, x.atoms, y.atoms), y.atoms, x.atoms);
   let moved = map_len(s.ty) != map_len(s0.ty);
   let a = if moved { resolve_row(s, x) } else { x };
   let b = if moved { resolve_row(s, y) } else { y };
-  let only_a = filter(a.atoms, |x: Atom| !almost_covered(b.atoms, x));
+  let only_a = filter(a.atoms, |x: Atom|
+    !(if exact { atoms_covered(b.atoms, x) } else { almost_covered(b.atoms, x) }));
   let only_b = filter(b.atoms, |x: Atom| !atoms_covered(a.atoms, x));
   let bad = RowMismatch({ expected: a, found: b });
   match a.tail {

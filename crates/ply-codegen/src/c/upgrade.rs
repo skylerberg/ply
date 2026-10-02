@@ -41,6 +41,11 @@ pub fn object(source: &str) -> Option<PathBuf> {
     Job::of(source).map(|job| job.object)
 }
 
+/// `source`'s optimised object when one is already built, starting no compile.
+pub fn built(source: &str) -> Option<Library> {
+    Job::of(source)?.open()
+}
+
 /// `source`'s object: the optimised one once it is built, else the development profile's, with the
 /// optimised compile started in the background when nobody has started it.
 pub fn load(source: &str, stem: &str) -> Result<Library> {
@@ -95,7 +100,10 @@ impl Job {
             return None;
         }
         match Library::open(&self.object) {
-            Ok(lib) => Some(lib),
+            Ok(lib) => {
+                super::sweep::used(&self.object);
+                Some(lib)
+            }
             Err(e) => {
                 let _ = std::fs::write(&self.failed, format!("{e:#}"));
                 let _ = std::fs::remove_file(&self.object);

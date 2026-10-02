@@ -8,6 +8,7 @@ use ply_launcher::Program;
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 
 fn main() {
+    ply_host::time::mark_start(std::time::Instant::now());
     let program = match ply_launcher::shipped::program() {
         Ok(bytes) => Program {
             artifact: bytes,

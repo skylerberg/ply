@@ -39,11 +39,11 @@ the runtime and the CLI.
 - The CLI's tests are the Ply package `crates/ply-cli-tests/ply`; `.github/ci-corpus.sh run
   cli-<module>` runs one module with the grants CI gives it.
 - CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its solo and gate tables and cuts
-  the test partitions from the durations CI measured.
+  the nextest shards and the corpus partitions from the durations CI measured.
 - Never commit `crates/ply-compiler/bootstrap`, `crates/ply-cli/bootstrap` or
   `crates/ply-codegen-tests/fixtures/goldens` in a pull request: CI regenerates all three on
   `main` after each merge (the `refresh` job), and a pull request runs its sources through the
-  checked-in bundle as a stage. A golden that moved is listed in the partition job's summary;
+  checked-in bundle as a stage. A golden that moved is listed in the nextest job's summary;
   read it, since nothing fails on it.
 - The bundle carries `crates/ply-compiler/ply` and the shipped modules it imports, pulled as a
   project's are (today `std.hash` alone), so only those cannot use a language rule the same pull
