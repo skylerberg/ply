@@ -64,6 +64,7 @@ fn an_answer_asked_again_of_one_emitter_is_read_back_rather_than_worked_out() {
 fn a_thread_taking_a_census_works_out_every_answer() {
     std::thread::spawn(|| {
         producer::ensure_default();
+        producer::call("hash.hex", &[fresh()]).expect("the emitter builds and answers");
         producer::reset_census();
         let args = [fresh()];
         producer::call("hash.hex", &args).expect("the entry answers");
