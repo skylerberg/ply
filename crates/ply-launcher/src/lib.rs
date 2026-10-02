@@ -46,31 +46,49 @@ const EVALUATOR_SOURCES: &str = env!("PLY_EVALUATOR_SOURCES");
 
 const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
 
-pub fn stamps(stage: &str) -> String {
-    let stamp = |domain: &str, sources: &str| {
+const FRONT_CODE: &str = env!("PLY_FRONT_CODE");
+
+const VERDICT_CODE: &str = env!("PLY_VERDICT_CODE");
+
+/// What a store's groups are a function of beyond their own keys, as `name hex` lines. A front-end
+/// entry is the evaluator's and the Ply that loads and files it; a pass or a claim's evidence is the
+/// runtime's, the Ply that decides and files it, and the emitter's that compiled what ran. A test's
+/// own hash covers every definition it reaches, so the rest of `ply` is in neither.
+pub fn stamps() -> String {
+    let stamp = |parts: &[&str]| {
         let mut h = blake3::Hasher::new();
-        for part in [domain, stage, sources] {
+        for part in parts {
             h.update(part.as_bytes());
             h.update(&[0]);
         }
         h.finalize().to_hex().to_string()
     };
+    let emitter =
+        ply_codegen::c::producer::identity_of(&ply_codegen::c::producer::Sources::Embedded);
     format!(
         "frontend {}\nruntime {}\n",
-        stamp("ply.stamp.frontend.1", EVALUATOR_SOURCES),
-        stamp("ply.stamp.runtime.1", RUNTIME_SOURCES)
+        stamp(&["ply.stamp.frontend.2", EVALUATOR_SOURCES, FRONT_CODE]),
+        stamp(&[
+            "ply.stamp.runtime.2",
+            RUNTIME_SOURCES,
+            VERDICT_CODE,
+            &emitter
+        ])
     )
 }
 
 /// Each file lands by a rename and the marker last, so a run that finds the marker finds it whole.
 pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
-    let dir = ply_codegen::c::bundle::stage_dir(&program.stage)
-        .join(format!("shelf-{}", &RUNTIME_SOURCES[..16]));
+    let stamps = stamps();
+    let dir = ply_codegen::c::bundle::stage_dir(&program.stage).join(format!(
+        "shelf-{}",
+        &blake3::hash(stamps.as_bytes()).to_hex()[..16]
+    ));
     if dir.join(SHELF_MARKER).exists() {
         ply_codegen::c::sweep::used(&ply_codegen::c::bundle::stage_dir(&program.stage));
         return Ok(dir);
     }
-    lay_out(&dir, &program.shelf, &stamps(&program.stage)).map_err(|e| {
+    lay_out(&dir, &program.shelf, &stamps).map_err(|e| {
         Diagnostic::error(
             codes::INTERNAL_ERROR,
             format!(
@@ -110,7 +128,7 @@ pub fn run(
         Ok(shelf) => shelf,
         Err(refused) => return Ended::refused(refused),
     };
-    ply_machine::shipped::stamp(stamps(&program.stage));
+    ply_machine::shipped::stamp(stamps());
     let path = PathBuf::from(&program.artifact_name);
     let artifact = match artifact::decode(&program.artifact, &path) {
         Ok((artifact, _)) => artifact,
@@ -196,6 +214,7 @@ pub fn run(
     }
 }
 
+pub mod code;
 pub mod count;
 pub mod env;
 pub mod shipped;
