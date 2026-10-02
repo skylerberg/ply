@@ -513,16 +513,21 @@ fn a_region_answers_the_operations_it_schedules_even_when_they_are_bound() {
         r#"
 fn outside() -> Int / {task.write, clock.read, clock.write, random.write} = {
   let t = task.spawn(|| clock.now());
-  clock.sleep(1);
-  task.join(t) + random.below(2)
+  clock.sleep(Duration(1));
+  let at = match task.join(t) { Instant(n) -> n };
+  at + random.below(2)
 }
 
 test/nondet "the region's own handlers answer" {
   let answered = simulate {
-    let t = task.spawn(|| clock.now() + random.below(4));
-    clock.sleep(5);
+    let t = task.spawn(|| {
+      let at = match clock.now() { Instant(n) -> n };
+      at + random.below(4)
+    });
+    clock.sleep(Duration(5));
     let mine = random.below(4);
-    task.join(t) + mine + clock.now()
+    let later = match clock.now() { Instant(n) -> n };
+    task.join(t) + mine + later
   };
   assert(answered > -1)
 }
@@ -879,7 +884,7 @@ fn a_production_region_never_answers_clock_from_the_seeded_table() {
         r#"
 test/nondet "reads a clock inside the production region" {
   let t = task.spawn(|| 1);
-  let at = clock.now();
+  let at = match clock.now() { Instant(n) -> n };
   assert_eq(task.join(t) + at, 1)
 }
 "#,

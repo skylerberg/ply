@@ -222,21 +222,43 @@ impl StepFootprint {
 pub enum SimTy {
     Int,
     Unit,
+    /// The prelude's `Instant(Int)`, nanoseconds on the region's clock.
+    Instant,
+    /// The prelude's `Duration(Int)`, nanoseconds between two instants.
+    Duration,
 }
 
 impl SimTy {
     pub fn holds(self, value: &Value) -> bool {
-        matches!(
-            (self, value),
-            (SimTy::Int, Value::Int(_)) | (SimTy::Unit, Value::Unit)
-        )
+        match (self, value) {
+            (SimTy::Int, Value::Int(_)) | (SimTy::Unit, Value::Unit) => true,
+            (SimTy::Instant | SimTy::Duration, Value::Ctor { name, args }) => {
+                name.as_str() == self.as_str() && matches!(args.as_slice(), [Value::Int(_)])
+            }
+            _ => false,
+        }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             SimTy::Int => "Int",
             SimTy::Unit => "Unit",
+            SimTy::Instant => "Instant",
+            SimTy::Duration => "Duration",
         }
+    }
+}
+
+/// The nanoseconds an `Instant(n)` or a `Duration(n)` holds.
+pub fn nanos_of(value: &Value, span: Span, what: &str) -> Result<i64, Diagnostic> {
+    match value {
+        Value::Ctor { args, .. } if args.len() == 1 => args[0].as_int(span, what),
+        other => Err(crate::value::type_error(
+            span,
+            what,
+            "an `Instant` or a `Duration`",
+            other,
+        )),
     }
 }
 
@@ -259,12 +281,12 @@ pub const SEEDED_OPS: &[OpSignature] = &[
         effect: "clock",
         op: "now",
         params: &[],
-        ret: SimTy::Int,
+        ret: SimTy::Instant,
     },
     OpSignature {
         effect: "clock",
         op: "sleep",
-        params: &[SimTy::Int],
+        params: &[SimTy::Duration],
         ret: SimTy::Unit,
     },
     OpSignature {
@@ -478,9 +500,12 @@ impl Handlers {
             ));
         }
         match (sig.effect, sig.op) {
-            ("clock", "now") => Ok(Answer::Value(Value::Int(self.clock.now()))),
+            ("clock", "now") => Ok(Answer::Value(Value::ctor(
+                "Instant",
+                vec![Value::Int(self.clock.now())],
+            ))),
             ("clock", "sleep") => {
-                let nanos = args[0].as_int(span, "`clock.sleep`")?;
+                let nanos = nanos_of(&args[0], span, "`clock.sleep`")?;
                 match self.clock.sleep(task, nanos, span)? {
                     Sleep::Yield => Ok(Answer::Value(Value::Unit)),
                     Sleep::Until(deadline) => Ok(Answer::Sleeping { deadline }),

@@ -469,7 +469,13 @@ Result<a, e>  = Ok(a) | Err(e)
 Ordering      = Less | Equal | Greater
 Rounding      = HalfEven | HalfUp | Down | Up | Ceiling | Floor
 Iter<s, r>    = Continue(s) | Stop(r)
+Instant       = Instant(Int)
+Duration      = Duration(Int)
 ```
+
+`Instant` is a reading of a clock and `Duration` the span between two, both in
+nanoseconds; they are separate types so a deadline cannot be added to a byte
+count. `std.time` builds and reads them (§13.10).
 
 A module that declares or unqualified-imports its own `Ok`, `Err`, `Some` or
 `None` loses `?`; one that declares its own `Stop` loses `iterate`.
@@ -1073,8 +1079,8 @@ scheduler:
 nondet effect task   { write spawn<a | e>(body: () -> a / e) -> Task<a> / e
                        write join<a>(t: Task<a>) -> a
                        write yield() -> Unit }
-nondet effect clock  { read  now() -> Int
-                       write sleep(nanos: Int) -> Unit }
+nondet effect clock  { read  now() -> Instant
+                       write sleep(d: Duration) -> Unit }
 nondet effect random { write next() -> Int
                        write below(bound: Int) -> Int }
 effect sim           { read  seed() -> Int }
@@ -1735,7 +1741,20 @@ pub nondet effect time {
 pub fn deadline_in(ms: Int) -> Int / {time.elapsed_ms}
 pub fn expired(deadline: Int) -> Bool / {time.elapsed_ms}
 pub fn since(started: Int) -> Int / {time.elapsed_ms}
+
+pub fn nanos(n: Int) -> Duration        // also micros, millis, seconds, minutes, hours
+pub fn as_nanos(d: Duration) -> Int     // also as_micros, as_millis, as_seconds, toward zero
+pub fn plus(a: Duration, b: Duration) -> Duration
+pub fn minus(a: Duration, b: Duration) -> Duration
+pub fn scaled(d: Duration, k: Int) -> Duration
+pub fn nanos_at(i: Instant) -> Int
+pub fn after(i: Instant, d: Duration) -> Instant
+pub fn between(earlier: Instant, later: Instant) -> Duration
 ```
+
+The prelude's `Instant` and `Duration` (§4.6) are what the simulation's `clock`
+reads and sleeps in, and these build and read them; every conversion is checked
+arithmetic.
 
 The host's real time, in two readings and a wait, none of them a function of the
 program state, so a definition that takes one is `nondet` and a `test` over it
