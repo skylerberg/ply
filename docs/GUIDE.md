@@ -325,8 +325,9 @@ and kept by a lock that already pins it.
 
 `ply build` records what it resolved in `ply.lock`, beside the package's own
 `ply.pkg`: every dependency's name, its version, and the BLAKE3 digest of the
-modules it contributed, sorted by name, and for a registry dependency the
-`archive` digest it was fetched as. A package is pinned by *what* it is and
+modules it contributed, sorted by name, with what they embed (§3.4), and for a
+registry dependency the `archive` digest it was fetched as. A package is pinned
+by *what* it is and
 never by where it was found, so a moved checkout keeps its pin. A build verifies
 the lock before it writes an artifact — a dependency whose sources moved since it
 was pinned is `E0138`, and a lock this `ply` cannot read is `E0139` — and writes
@@ -348,6 +349,24 @@ the packages that declare it, then the version and digest it resolved to.
 A command acts on the root package, the one whose tree it was given: a
 dependency's `main` is no entry point, and `ply test` runs the root package's
 tests and never a dependency's, which are that package's own to run.
+
+### 3.4 Embedding files
+
+```ply
+fn schema() -> Bytes = embed("schema.sql")
+fn fixtures() -> List<{ name: String, bytes: Bytes }> = embed_dir("fixtures")
+```
+
+`embed("path")` is the bytes of a file, and `embed_dir("path")` every file under
+a directory by its path below it (`a/b.txt`), in that order; nothing under a
+name starting with `.` is read. The path is a string literal (`E0147`), read
+relative to the module's own file when the program is loaded, and the call is
+written out as what was read before anything hashes or checks the module. The
+bytes are therefore part of the definition's hash: a test reading an embedded
+file reruns exactly when the file changes, and is cached while it does not. A
+path that does not exist, a directory handed to `embed`, a file handed to
+`embed_dir`, or a file that cannot be read is `E0146`, which refuses the load. A
+module that declares or imports its own `embed` or `embed_dir` calls that one.
 
 ## 4. Types
 
@@ -1010,8 +1029,8 @@ this. `--json` prints one object with each failure's diagnostic, declared
 footprint, suspects, culprit and replay command (`schema_version` 6); the
 suspects are ranked culprits first, then an edited definition before one whose
 hash only moved. Each result counts the operations its test performed,
-handled ones included, as `performs`. `--watch` re-runs on every `.ply` change,
-keeping caches in memory.
+handled ones included, as `performs`. `--watch` re-runs on every `.ply` change
+and on every change to what the last run embedded, keeping caches in memory.
 
 ### 8.5 Coverage and mutants
 
@@ -2948,7 +2967,8 @@ filed by a compiler whose shipped modules differed says so once, as `W0605`.
 `ply run` over sources goes further: once a load holds, the front end's answer
 is filed under a key of everything it and the `reuse fn` promise check (`E0127`)
 read — the name and bytes of every module the walk read, the root's manifest,
-each dependency's key, manifest and modules, the root's absolute path, the `ply`
+each dependency's key, manifest and modules, what the modules embed, the root's
+absolute path, the `ply`
 program and the modules it ships as the launcher gates them (so `PLY_C_EMITTER`
 too), the binary's version, and `--config-schema`. A later run whose walk hashes
 the same takes that answer and runs neither the front end nor the promise check,
@@ -3062,6 +3082,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0143` | a registry dependency no published version satisfies |
 | `E0144` | a publish or a yank the registry refused |
 | `E0145` | a package or a version no registry takes |
+| `E0146` | an embed whose file or directory could not be read |
+| `E0147` | an embed whose path is not a string literal |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
