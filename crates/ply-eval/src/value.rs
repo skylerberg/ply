@@ -133,6 +133,8 @@ impl<'a> IntoIterator for &'a Fields {
 pub enum Value {
     Int(i64),
     Fixed(Fixed),
+    /// A Unicode scalar value: what a `String` is a sequence of.
+    Char(char),
     Bool(bool),
     Float(f64),
     Decimal(Decimal),
@@ -307,6 +309,7 @@ impl Value {
         match self {
             Value::Int(_) => "Int",
             Value::Fixed(f) => f.ty.name(),
+            Value::Char(_) => "Char",
             Value::Bool(_) => "Bool",
             Value::Float(_) => "Float",
             Value::Decimal(_) => "Decimal",
@@ -339,6 +342,13 @@ impl Value {
         match self {
             Value::Fixed(f) => Ok(*f),
             other => Err(type_error(span, what, "a fixed-width integer", other)),
+        }
+    }
+
+    pub fn as_char(&self, span: Span, what: &str) -> Result<char, Diagnostic> {
+        match self {
+            Value::Char(c) => Ok(*c),
+            other => Err(type_error(span, what, "Char", other)),
         }
     }
 
@@ -639,6 +649,7 @@ fn discriminant(v: &Value) -> u8 {
         Value::Task(_) => 13,
         Value::Secret(_) => 14,
         Value::Fixed(_) => 15,
+        Value::Char(_) => 16,
     }
 }
 
@@ -655,6 +666,7 @@ impl Ord for Value {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
             // By value rather than by bits, so `I8` orders `-1` below `0`.
             (Value::Fixed(x), Value::Fixed(y)) => x.ty.cmp(&y.ty).then_with(|| x.value_cmp(*y)),
+            (Value::Char(x), Value::Char(y)) => x.cmp(y),
             (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
             // By numeric value, so `1.50m` and `1.5m` are one key.
             (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
@@ -798,6 +810,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Fixed(x), Value::Fixed(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         // IEEE `==`, so `NaN != NaN` and `0.0 == -0.0`.
         (Value::Float(x), Value::Float(y)) => x == y,
