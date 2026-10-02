@@ -135,7 +135,7 @@ declare -a PROBE_JOBS=(
 GIVE_BACK=(nextest-archive- ply-c-stage-emitter- test-shards-)
 
 # `<family>-<run id>` entries only the newest of which is ever restored.
-SUPERSEDED=(ply-upstream- ply-stores-)
+SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes-)
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
