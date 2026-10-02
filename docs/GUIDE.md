@@ -1158,8 +1158,9 @@ law "a credit and a matching debit leave an account exactly as it was"
   `ensures`; it is not checked at call sites and laws do not inherit it.
 * A law has a label, optional `forall` binders (typed; `E0418` if a type cannot
   be quantified), an optional `where` guard and a block body.
-* Specs, guards and law bodies must be pure (`E0417`), except that a law body
-  may be a `simulate` region. `law/host "..." { }` allows any effect but is
+* Specs, guards and law bodies must be pure (`E0417`), except that they may
+  raise (§6.8) and a law body may be a `simulate` region; a proposition that
+  raises is a gap in the claim. `law/host "..." { }` allows any effect but is
   never `proved` or cached, and is `W0604` under a hermetic run. Under `--host`
   its guard and body run against the host the run binds, and what their entries
   end with, such as a span left open (`W0609`), is reported once.
