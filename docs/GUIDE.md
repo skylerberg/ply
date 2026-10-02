@@ -472,9 +472,8 @@ checks see it.
 
 `(A, B) -> C` is pure; `(A) -> B / {db.read[users]}` and `(A) -> B / e` carry
 rows. With no `/`, the row is inferred in a signature and empty in a declared
-type. A function passed as an argument may perform less than its parameter's
-row permits (§6.2). Functions cannot be compared, encoded, ordered or used as
-map keys.
+type. A function value may perform less than the type it meets says (§6.2).
+Functions cannot be compared, encoded, ordered or used as map keys.
 
 * **Written:** every parameter and return type of a top-level `fn` (`E0126`),
   and every `forall` binder type.
@@ -753,17 +752,26 @@ gets the mode atom, which says the callee may perform any `write` of `net` on
 (`E0302`, naming the operation and offering the atom to add), and may call a
 callee written `/ {net.send[conn]}` but not one written `/ {net.write[conn]}`
 (`E0302`, naming the callee). `ply check --types --explain` prints the inferred
-row as `body performs`. Rows in types unify atom for atom: a function value
-whose row names an operation is not the same type as one whose row names the
-mode.
+row as `body performs`.
 
-An argument is the exception: a function passed where a function is expected
-may perform less than the parameter's row permits, though not more (`E0302`).
-So `run(|| a.x())` checks against `fn run(k: () -> Unit / {a.x, a.z})`, and two
-arguments may fill one row variable with both their rows: given
-`fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e`, the call
-`both(|| a.x(), || b.y())` performs exactly `{a.x, b.y}`. An operation's
-arguments follow the same rule.
+A function value may perform less than the type it meets says, though not more
+(`E0302`). It meets one as an argument to a call or an operation, against a
+written return type or a `let` annotation, and as one of the elements of a list
+or the branches of an `if`, a `match` or a `let ... else`, which meet each
+other; so does any function such a value holds in a record, a tuple, a `List`,
+an `Option`, a `Result`, a `Map` or an `Iter`, and the function a function
+returns. So `run(|| a.x())` checks against `fn run(k: () -> Unit / {a.x, a.z})`,
+a callback whose row names `net.send[conn]` is one a row written
+`/ {net.write[conn]}` admits, and two callbacks fill one row variable with both
+their rows: given `fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e`,
+`both(|| a.x(), || b.y())` performs exactly `{a.x, b.y}`, and
+`[|| a.x(), || b.y()]` is a `List<() -> Unit / {a.x, b.y}>`.
+
+Inside a function's parameter, a `Cell`, a `Task` or a sum type the program
+declares, rows must match exactly, because a function held there can be handed
+what its own type does not admit: a parameter typed
+`() -> Unit / {net.send[conn]}` is not one typed `() -> Unit / {net.write[conn]}`,
+in either direction.
 
 Resource labels are global — two modules writing `[users]` name one resource —
 and a definition may be generic over one (§4.5). Its binder shadows that global
@@ -2302,41 +2310,43 @@ negative, a surrogate (`U+D800` to `U+DFFF`) or past `U+10FFFF`.
 ### 13.26 `std.option`
 
 ```ply
-pub fn option_map<a, b>(o: Option<a>, f: (a) -> b) -> Option<b>
-pub fn option_and_then<a, b>(o: Option<a>, f: (a) -> Option<b>) -> Option<b>
-pub fn option_filter<a>(o: Option<a>, ok: (a) -> Bool) -> Option<a>
+pub fn option_map<a, b | e>(o: Option<a>, f: (a) -> b / e) -> Option<b> / e
+pub fn option_and_then<a, b | e>(o: Option<a>, f: (a) -> Option<b> / e) -> Option<b> / e
+pub fn option_filter<a | e>(o: Option<a>, ok: (a) -> Bool / e) -> Option<a> / e
 pub fn option_or<a>(o: Option<a>, fallback: Option<a>) -> Option<a>
 pub fn option_unwrap_or<a>(o: Option<a>, fallback: a) -> a
 pub fn option_expect<a>(o: Option<a>, message: String) -> a
 pub fn option_is_some<a>(o: Option<a>) -> Bool
 pub fn option_is_none<a>(o: Option<a>) -> Bool
 pub fn option_ok_or<a, e>(o: Option<a>, err: e) -> Result<a, e>
-pub fn option_or_else<a>(o: Option<a>, fallback: () -> Option<a>) -> Option<a>
-pub fn option_unwrap_or_else<a>(o: Option<a>, fallback: () -> a) -> a
-pub fn option_map_or<a, b>(o: Option<a>, fallback: b, f: (a) -> b) -> b
+pub fn option_or_else<a | e>(o: Option<a>, fallback: () -> Option<a> / e) -> Option<a> / e
+pub fn option_unwrap_or_else<a | e>(o: Option<a>, fallback: () -> a / e) -> a / e
+pub fn option_map_or<a, b | e>(o: Option<a>, fallback: b, f: (a) -> b / e) -> b / e
 ```
 
 `Option`'s constructors and `?` are the prelude's; this is the chain a caller reads
 with. Each is `option_`-prefixed because `map` and `and_then` are names a program
 already has (for lists, and for `std.parse`), and an unqualified `map` that
 silently took an `Option` would be a trap. `option_expect` is the one place an
-absent value is a defect, so its message says why it cannot happen.
+absent value is a defect, so its message says why it cannot happen. A callback
+may perform effects, and runs only where the value calls for it: `option_map`
+of `None` never calls `f`.
 
 ### 13.27 `std.result`
 
 ```ply
-pub fn result_map<a, b, e>(r: Result<a, e>, f: (a) -> b) -> Result<b, e>
-pub fn result_map_err<a, e, f>(r: Result<a, e>, g: (e) -> f) -> Result<a, f>
-pub fn result_and_then<a, b, e>(r: Result<a, e>, f: (a) -> Result<b, e>) -> Result<b, e>
+pub fn result_map<a, b, e | row>(r: Result<a, e>, f: (a) -> b / row) -> Result<b, e> / row
+pub fn result_map_err<a, e, f | row>(r: Result<a, e>, g: (e) -> f / row) -> Result<a, f> / row
+pub fn result_and_then<a, b, e | row>(r: Result<a, e>, f: (a) -> Result<b, e> / row) -> Result<b, e> / row
 pub fn result_unwrap_or<a, e>(r: Result<a, e>, fallback: a) -> a
 pub fn result_expect<a, e>(r: Result<a, e>, message: String) -> a
 pub fn result_ok<a, e>(r: Result<a, e>) -> Option<a>
 pub fn result_err<a, e>(r: Result<a, e>) -> Option<e>
 pub fn result_is_ok<a, e>(r: Result<a, e>) -> Bool
 pub fn result_is_err<a, e>(r: Result<a, e>) -> Bool
-pub fn result_or_else<a, e>(r: Result<a, e>, fallback: (e) -> Result<a, e>) -> Result<a, e>
-pub fn result_unwrap_or_else<a, e>(r: Result<a, e>, fallback: (e) -> a) -> a
-pub fn result_map_or<a, b, e>(r: Result<a, e>, fallback: b, f: (a) -> b) -> b
+pub fn result_or_else<a, e | row>(r: Result<a, e>, fallback: (e) -> Result<a, e> / row) -> Result<a, e> / row
+pub fn result_unwrap_or_else<a, e | row>(r: Result<a, e>, fallback: (e) -> a / row) -> a / row
+pub fn result_map_or<a, b, e | row>(r: Result<a, e>, fallback: b, f: (a) -> b / row) -> b / row
 ```
 
 The same shape over `Ok`/`Err`. `result_map_err` is how a low-level failure
@@ -2378,13 +2388,13 @@ pub fn take<a>(xs: List<a>, n: Int) -> List<a>
 pub fn drop<a>(xs: List<a>, n: Int) -> List<a>
 pub fn reverse<a>(xs: List<a>) -> List<a>
 pub fn concat<a>(xs: List<a>, ys: List<a>) -> List<a>
-pub fn flat_map<a, b>(xs: List<a>, f: (a) -> List<b>) -> List<b>
+pub fn flat_map<a, b | e>(xs: List<a>, f: (a) -> List<b> / e) -> List<b> / e
 pub fn zip<a, b>(xs: List<a>, ys: List<b>) -> List<{ first: a, second: b }>
-pub fn any<a>(xs: List<a>, ok: (a) -> Bool) -> Bool
-pub fn all<a>(xs: List<a>, ok: (a) -> Bool) -> Bool
-pub fn count<a>(xs: List<a>, ok: (a) -> Bool) -> Int
-pub fn find<a>(xs: List<a>, ok: (a) -> Bool) -> Option<a>
-pub fn find_index<a>(xs: List<a>, ok: (a) -> Bool) -> Option<Int>
+pub fn any<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Bool / e
+pub fn all<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Bool / e
+pub fn count<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Int / e
+pub fn find<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Option<a> / e
+pub fn find_index<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Option<Int> / e
 pub fn contains<a>(xs: List<a>, x: a) -> Bool where derivable(eq, a)
 pub fn index_of<a>(xs: List<a>, x: a) -> Option<Int> where derivable(eq, a)
 pub fn remove_first<a>(xs: List<a>, x: a) -> Option<List<a>> where derivable(eq, a)
@@ -2393,9 +2403,9 @@ pub fn max_of<a>(xs: List<a>) -> Option<a> where derivable(ord, a)
 pub fn min_of<a>(xs: List<a>) -> Option<a> where derivable(ord, a)
 pub fn is_sorted<a>(xs: List<a>) -> Bool where derivable(ord, a)
 pub fn sort<a>(xs: List<a>) -> List<a> where derivable(ord, a)
-pub fn sort_by<a>(xs: List<a>, before: (a, a) -> Bool) -> List<a>
+pub fn sort_by<a | e>(xs: List<a>, before: (a, a) -> Bool / e) -> List<a> / e
 pub fn flatten<a>(xss: List<List<a>>) -> List<a>
-pub fn partition<a>(xs: List<a>, ok: (a) -> Bool) -> { yes: List<a>, no: List<a> }
+pub fn partition<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> { yes: List<a>, no: List<a> } / e
 pub fn split_at<a>(xs: List<a>, n: Int) -> { head: List<a>, tail: List<a> }
 pub fn chunks<a>(xs: List<a>, n: Int) -> List<List<a>>
 pub fn intersperse<a>(xs: List<a>, sep: a) -> List<a>
@@ -2412,7 +2422,10 @@ halves of a list (`concat(take(xs, n), drop(xs, n))` is `xs`), `reverse` walks i
 index down while it appends, and `sort` is a merge sort — `n log n` comparisons
 whatever the input order is, and equal elements keep their relative order.
 `sort_by` is the same sort under a caller's `before`, which is how a key sort is
-written. `find` and `find_index` keep the first answer a scan meets. `partition`,
+written. `find` and `find_index` keep the first answer a scan meets. A callback
+may perform effects, as the prelude's `map` and `fold` allow: one given an
+element runs in list order, and `any`, `all`, `find` and `find_index` stop
+calling theirs once the answer is known. `partition`,
 `split_at` and `chunks` divide one list into others and keep the order;
 `flatten` is `flat_map` of the identity, `intersperse` puts its separator
 between the elements, and `unique` keeps each element's first occurrence — its
