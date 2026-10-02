@@ -11,11 +11,13 @@
 #                                later run reads, and every key over a crate's
 #                                Ply sources names every crate's
 #   ci-shards.sh cache-keys      just that last check
-#   ci-shards.sh partitions      the JSON matrix of partitions
-#   ci-shards.sh shard-configs D the nextest config each partition runs under,
-#                                cut from the durations CI measured; 3 when
-#                                there are none and the partitions fall back to
-#                                slicing by test count
+#   ci-shards.sh partitions      the JSON matrix of the corpus partitions
+#   ci-shards.sh nextest-shards  the JSON matrix of the nextest shards
+#   ci-shards.sh shard-configs D the nextest config each shard runs under and
+#                                the corpus runs each partition takes, cut from
+#                                the durations CI measured; 3 when there are
+#                                none and the shards fall back to slicing by
+#                                test count
 #   ci-shards.sh durations FILE  `binary_id test milliseconds` per test in a
 #                                nextest JUnit report
 #   ci-shards.sh solo-matrix     the JSON matrix of tests that run alone
@@ -40,7 +42,10 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+# Jobs of corpus lanes, and jobs of nextest. Apart, so a lane never shares a runner with
+# nextest's threads, and nextest, which needs only the archive, starts before `build-ply` ends.
 PARTITIONS=8
+NEXTEST_SHARDS=2
 
 # What the partitions of the last run measured, restored from the cache by the `plan` job.
 TIMINGS=/tmp/ply-test-timings/timings.tsv
@@ -354,12 +359,16 @@ cmd_exclude_filter() {
   printf '%s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$(cmd_host_filter)"
 }
 
-cmd_partitions() {
+cmd_partitions() { matrix "$PARTITIONS"; }
+
+cmd_nextest_shards() { matrix "$NEXTEST_SHARDS"; }
+
+matrix() {
   local i
   printf '{"include":['
-  for ((i = 1; i <= PARTITIONS; i++)); do
+  for ((i = 1; i <= $1; i++)); do
     ((i > 1)) && printf ','
-    printf '{"shard":"%d","of":"%d"}' "$i" "$PARTITIONS"
+    printf '{"shard":"%d","of":"%d"}' "$i" "$1"
   done
   printf ']}\n'
 }
@@ -387,7 +396,7 @@ cmd_durations() {
 # is the one that runs what no other shard names.
 assign() {
   LC_ALL=C sort -t"$TAB" -k3,3nr -k1,1 -k2,2 "$1" |
-    awk -F"$TAB" -v n="$PARTITIONS" '
+    awk -F"$TAB" -v n="$NEXTEST_SHARDS" '
       {
         best = 1
         for (i = 2; i <= n; i++) if (load[i] < load[best]) best = i
@@ -504,12 +513,12 @@ shard_configs() {
   assign "$timings" > "$tmp/assigned"
   catchall=$(awk -F"$TAB" '$1 == "catchall" { print $2 }' "$tmp/assigned")
   if awk -F"$TAB" '$1 == "load" && $4 == 0 { bare = 1 } END { exit !bare }' "$tmp/assigned"; then
-    echo "$(grep -c . "$timings") measured tests do not fill $PARTITIONS partitions" >&2
+    echo "$(grep -c . "$timings") measured tests do not fill $NEXTEST_SHARDS shards" >&2
     rm -rf "$tmp"
     return 3
   fi
   mkdir -p "$dir"
-  for ((i = 1; i <= PARTITIONS; i++)); do
+  for ((i = 1; i <= NEXTEST_SHARDS; i++)); do
     mkdir -p "$tmp/order.$i"
     awk -F"$TAB" -v s="$i" '$1 == "t" && $2 == s { printf "%s\t%s\t%s\n", $3, $4, $5 }' \
       "$tmp/assigned" > "$tmp/held.$i"
@@ -518,7 +527,7 @@ shard_configs() {
   {
     printf 'not ('
     first=1
-    for ((i = 1; i <= PARTITIONS; i++)); do
+    for ((i = 1; i <= NEXTEST_SHARDS; i++)); do
       [[ $i -eq $catchall ]] && continue
       ((first)) || printf ' | '
       first=0
@@ -527,7 +536,7 @@ shard_configs() {
     printf ')'
   } > "$tmp/negation"
   mv "$tmp/negation" "$tmp/filter.$catchall"
-  for ((i = 1; i <= PARTITIONS; i++)); do
+  for ((i = 1; i <= NEXTEST_SHARDS; i++)); do
     {
       printf '[profile.shard%d]\n' "$i"
       printf "default-filter = '''%s'''\n" "$(cat "$tmp/filter.$i")"
@@ -856,9 +865,9 @@ check_shards() {
   fi
   catchall=
   seen=0
-  for ((i = 1; i <= PARTITIONS; i++)); do
+  for ((i = 1; i <= NEXTEST_SHARDS; i++)); do
     if [[ ! -f "$dir/shard-$i.toml" ]]; then
-      echo "FAIL: the $what durations cut no shard $i, and a partition job runs one" >&2
+      echo "FAIL: the $what durations cut no shard $i, and a nextest job runs one" >&2
       bad=1
       continue
     fi
@@ -1035,8 +1044,8 @@ cmd_verify() {
 
   # --- the shards the durations cut -----------------------------------------
   local made_up made_up_test
-  if [[ $PARTITIONS -lt 2 ]]; then
-    echo "FAIL: PARTITIONS is $PARTITIONS, and one shard is the negation of the others" >&2
+  if [[ $NEXTEST_SHARDS -lt 2 ]]; then
+    echo "FAIL: NEXTEST_SHARDS is $NEXTEST_SHARDS, and one shard is the negation of the others" >&2
     failures=$((failures + 1))
   else
     made_up=$(mktemp -d)
@@ -1049,7 +1058,7 @@ cmd_verify() {
         made_up_count=$((made_up_count + 1))
         printf 'ply-machine-tests::suite\t%s::%s\t%d\n' \
           "$made_up_mod" "$made_up_fn" $((made_up_count * 37 + 1)) >> "$made_up/timings.tsv"
-        [[ $made_up_count -ge $((PARTITIONS + 4)) ]] && break 2
+        [[ $made_up_count -ge $((NEXTEST_SHARDS + 4)) ]] && break 2
       done < <(awk '/^#\[test\]/ { t = 1; next } t && match($0, /^fn [a-z0-9_]+\(/) { print substr($0, 4, RLENGTH - 4); t = 0 }' "$made_up_file")
     done
     check_shards made-up "$made_up/timings.tsv" || failures=$((failures + 1))
@@ -1195,13 +1204,13 @@ cmd_verify() {
     failures=$((failures + 1))
   fi
   # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
-  for corpus_command in corpus-matrix corpus-for-partition; do
-    corpus_job=$(awk -v c="ci-shards\\.sh $corpus_command" '
+  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition"; do
+    corpus_job=$(awk -v c="${corpus_command//./\\.}" '
       /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
       $0 ~ c { print job; exit }
     ' "$workflow")
     if [[ -z $corpus_job ]]; then
-      echo "FAIL: no job in $workflow runs \`ci-shards.sh $corpus_command\`, so its corpus runs run nowhere" >&2
+      echo "FAIL: no job in $workflow runs \`$corpus_command\`, so its corpus runs run nowhere" >&2
       failures=$((failures + 1))
     elif [[ " ${needs//[][,]/ } " != *" $corpus_job "* ]]; then
       echo "FAIL: job '$corpus_job' runs corpus tests, and is not in the \`ci\` job's needs list" >&2
@@ -1233,13 +1242,14 @@ cmd_verify() {
   fi
   local cut="by test count, with nothing measured"
   [[ -s $TIMINGS ]] && cut="from $(grep -c . "$TIMINGS") measured durations"
-  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks, ${#CLI_TREE_CHECKS[@]} in the CLI's suite, and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs; $PARTITIONS partitions cut $cut"
+  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks, ${#CLI_TREE_CHECKS[@]} in the CLI's suite, and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs in $PARTITIONS partitions; $NEXTEST_SHARDS nextest shards cut $cut"
 }
 
 case "${1:-}" in
   verify) cmd_verify ;;
   cache-keys) cmd_cache_keys ;;
   partitions) cmd_partitions ;;
+  nextest-shards) cmd_nextest_shards ;;
   shard-configs) cmd_shard_configs "${2:-}" ;;
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
   solo-matrix) cmd_solo_matrix ;;
@@ -1255,7 +1265,7 @@ case "${1:-}" in
   give-back) cmd_give_back "${2:?a run id}" ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|corpus-matrix|corpus-for-partition K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN|supersede RUN REF}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|nextest-shards|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|corpus-matrix|corpus-for-partition K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN|supersede RUN REF}" >&2
     exit 2
     ;;
 esac

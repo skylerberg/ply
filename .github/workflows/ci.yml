@@ -1,6 +1,6 @@
-# `build` compiles the workspace into one nextest archive; every test job runs a shard of it, cut
-# by `.github/ci-shards.sh` from the durations the last run measured. `ci` is the one check
-# that says a run is green.
+# `build` compiles the workspace into one nextest archive; each `nextest` job runs a shard of it and
+# each `lanes` job a partition of the Ply runs, both cut by `.github/ci-shards.sh` from the
+# durations the last run measured. `ci` is the one check that says a run is green.
 # The toolchain pin recurs in every workflow under .github/: raise it everywhere at once.
 
 name: CI
@@ -43,6 +43,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       partitions: ${{ steps.tables.outputs.partitions }}
+      nextest: ${{ steps.tables.outputs.nextest }}
       solo: ${{ steps.tables.outputs.solo }}
       corpus: ${{ steps.tables.outputs.corpus }}
       shards: ${{ steps.cut.outputs.shards }}
@@ -102,6 +103,7 @@ jobs:
         id: tables
         run: |
           echo "partitions=$(.github/ci-shards.sh partitions)" >> "$GITHUB_OUTPUT"
+          echo "nextest=$(.github/ci-shards.sh nextest-shards)" >> "$GITHUB_OUTPUT"
           echo "solo=$(.github/ci-shards.sh solo-matrix)" >> "$GITHUB_OUTPUT"
           echo "corpus=$(.github/ci-shards.sh corpus-matrix)" >> "$GITHUB_OUTPUT"
 
@@ -287,6 +289,9 @@ jobs:
             /tmp/ply-c-stage
           key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
           restore-keys: ply-c-stage-
+      # Before this job's first `ply`, so what it reads is newer than this and the rest is not.
+      - name: The moment this job's `ply`s start
+        run: touch /tmp/ply-c-used.mark
 
       # Here rather than in a later job: it compares mtimes, and a later checkout is newer than the binary.
       - name: The freshness check can still go red
@@ -297,6 +302,10 @@ jobs:
       # program never asks for: without this, every later job's first compiles built it again.
       - name: The emitter, for every job after this one
         run: .github/ci-warm.sh target/release/ply
+      # Every job restores what this one saves, so it saves what this job's `ply`s read and wrote.
+      - name: The stage, cut to what this job used
+        if: steps.stage-cache.outputs.cache-hit != 'true'
+        run: .github/ci-warm.sh used /tmp/ply-c-used.mark
       # What those `ply`s emitted, for the rest of the run: the suite jobs restore it rather than
       # repeat the emission. On main it is saved under the tree's own key, which a later run
       # restores, so main's next pull requests find it as soon as this job ends; a pull request's
@@ -335,11 +344,111 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  test:
-    name: test ${{ matrix.shard }}/${{ matrix.of }}
-    # The stage is a cache, not an input: a shard restores the emitter's own key from `build-ply`,
-    # so it does not wait the emitter's whole stage out. On a pull request, where `refresh` does not
-    # run, this is the run's critical path.
+  # Nextest needs the archive and nothing `build-ply` makes, so it starts once `build` ends, on
+  # runners of its own: the corpus lanes have theirs to themselves.
+  nextest:
+    name: nextest ${{ matrix.shard }}/${{ matrix.of }}
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.nextest) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: needs.plan.outputs.shards == 'true'
+        with:
+          path: /tmp/ply-shards
+          key: test-shards-${{ github.run_id }}
+          fail-on-cache-miss: true
+      - uses: ./.github/actions/suite
+
+      # A shard's profile names the tests it runs, except the catch-all's, which is the negation of
+      # every other shard: a test the durations do not name runs there, and only there.
+      # The awk strips colour first: nextest colours its summary line. A golden that moved is
+      # blessed rather than failed: the diff goes to the job summary, and `refresh` commits it on main.
+      - name: cargo nextest run
+        id: run
+        env:
+          SHARD: ${{ matrix.shard }}
+          OF: ${{ matrix.of }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
+          PLY_DIFF_BLESS: "1"
+        run: |
+          set -euo pipefail
+          exclude=$(.github/ci-shards.sh exclude-filter)
+          [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
+          config=/tmp/ply-shards/shard-$SHARD.toml
+          if [ "$SHARDS" = true ]; then
+            [ -f "$config" ] || { echo "the plan cut the shards and $config did not come back" >&2; exit 1; }
+            profile=shard$SHARD
+            cut=(--profile "$profile" --tool-config-file "shards:$config")
+          else
+            profile=default
+            cut=(--partition "slice:$SHARD/$OF")
+          fi
+          cargo-nextest nextest run \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            --no-fail-fast "${cut[@]}" \
+            -E "not ($exclude)" 2>&1 | tee /tmp/shard.log || nextest=$?
+          [ "${nextest:-0}" -eq 0 ] || exit "$nextest"
+          ran=$(awk '
+            { gsub(/\033\[[0-9;]*m/, "") }
+            /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
+            END { print n + 0 }
+          ' /tmp/shard.log)
+          echo "shard $SHARD ran $ran tests"
+          [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+          echo "ran=$ran" >> "$GITHUB_OUTPUT"
+
+      # What the next run cuts its shards from.
+      - name: The durations this shard measured
+        env:
+          SHARD: ${{ matrix.shard }}
+          PROFILE: ${{ steps.run.outputs.profile }}
+          RAN: ${{ steps.run.outputs.ran }}
+        run: |
+          set -euo pipefail
+          .github/ci-shards.sh durations "target/nextest/$PROFILE/junit.xml" > "/tmp/timings-nextest-$SHARD.tsv"
+          lines=$(grep -c . "/tmp/timings-nextest-$SHARD.tsv" || true)
+          [ "$lines" -eq "$RAN" ] || {
+            echo "the report has $lines durations and the shard ran $RAN tests" >&2
+            exit 1
+          }
+          echo "$lines durations"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: timings-nextest-${{ matrix.shard }}
+          path: /tmp/timings-nextest-${{ matrix.shard }}.tsv
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Goldens that moved
+        if: always()
+        run: |
+          set -euo pipefail
+          git add -N crates/ply-codegen-tests/fixtures/goldens
+          git diff --quiet -- crates/ply-codegen-tests/fixtures/goldens && exit 0
+          {
+            echo "### Goldens this partition re-blessed"
+            echo '```'
+            git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
+
+  # The corpus runs a partition takes, each lane a process beside the others.
+  lanes:
+    name: lanes ${{ matrix.shard }}/${{ matrix.of }}
+    # The stage is a cache, not an input: a partition restores the emitter's own key from
+    # `build-ply`, so it does not wait the emitter's whole stage out. On a pull request, where
+    # `refresh` does not run, this is the run's critical path.
     needs: [plan, build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -391,90 +500,20 @@ jobs:
             ply-stores-${{ matrix.shard }}-
             ply-stores-
 
-      # A shard's profile names the tests it runs, except the catch-all's, which is the negation of
-      # every other shard: a test the durations do not name runs there, and only there.
-      # The awk strips colour first: nextest colours its summary line. A golden that moved is
-      # blessed rather than failed: the diff goes to the job summary, and `refresh` commits it on main.
-      - name: cargo nextest run
-        id: run
+      - name: The corpus runs this partition takes
         env:
           SHARD: ${{ matrix.shard }}
-          OF: ${{ matrix.of }}
           SHARDS: ${{ needs.plan.outputs.shards }}
-          PLY_DIFF_BLESS: "1"
         run: |
           set -euo pipefail
-          exclude=$(.github/ci-shards.sh exclude-filter)
-          [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
-          # The corpus's runs this partition takes go beside nextest rather than after it, a lane to a
-          # process. A lane is about one busy thread, since its checks wait on the `ply` they spawn;
-          # nextest takes the threads the lanes leave, and one more so neither side idles at the end.
-          threads=()
           plan=()
           if [ "$SHARDS" = true ]; then plan=(/tmp/ply-shards); fi
-          runs=$(.github/ci-shards.sh corpus-for-partition "$SHARD" "${plan[@]}")
-          if [ -n "$runs" ]; then
-            .github/ci-corpus.sh partition "$SHARD" "/tmp/corpus-timings-$SHARD.tsv" "${plan[@]}" > /tmp/corpus.log 2>&1 &
-            corpus=$!
-            lanes=$(cut -d' ' -f1 <<< "$runs" | sort -u | wc -l)
-            threads=(--test-threads "$(($(nproc) - lanes + 1))")
-          else
-            : > "/tmp/corpus-timings-$SHARD.tsv"
-          fi
-          config=/tmp/ply-shards/shard-$SHARD.toml
-          if [ "$SHARDS" = true ]; then
-            [ -f "$config" ] || { echo "the plan cut the shards and $config did not come back" >&2; exit 1; }
-            profile=shard$SHARD
-            cut=(--profile "$profile" --tool-config-file "shards:$config")
-          else
-            profile=default
-            cut=(--partition "slice:$SHARD/$OF")
-          fi
-          cargo-nextest nextest run \
-            --binaries-metadata target/nextest/binaries-metadata.json \
-            --cargo-metadata target/nextest/cargo-metadata.json \
-            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast "${cut[@]}" "${threads[@]}" \
-            -E "not ($exclude)" 2>&1 | tee /tmp/partition.log || nextest=$?
-          # The corpus's log is printed whatever nextest did, so a red partition still shows both.
-          corpus_status=0
-          if [ -n "${corpus:-}" ]; then
-            wait "$corpus" || corpus_status=$?
-            cat /tmp/corpus.log
-          fi
-          [ "${nextest:-0}" -eq 0 ] || exit "$nextest"
-          ran=$(awk '
-            { gsub(/\033\[[0-9;]*m/, "") }
-            /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
-            END { print n + 0 }
-          ' /tmp/partition.log)
-          echo "shard $SHARD ran $ran tests"
-          [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
-          echo "profile=$profile" >> "$GITHUB_OUTPUT"
-          echo "ran=$ran" >> "$GITHUB_OUTPUT"
-          [ "$corpus_status" -eq 0 ] || { echo "a corpus run this partition took failed" >&2; exit 1; }
-
-      # What the next run cuts its shards from.
-      - name: The durations this shard measured
-        env:
-          SHARD: ${{ matrix.shard }}
-          PROFILE: ${{ steps.run.outputs.profile }}
-          RAN: ${{ steps.run.outputs.ran }}
-        run: |
-          set -euo pipefail
-          .github/ci-shards.sh durations "target/nextest/$PROFILE/junit.xml" > "/tmp/timings-$SHARD.tsv"
-          lines=$(grep -c . "/tmp/timings-$SHARD.tsv" || true)
-          [ "$lines" -eq "$RAN" ] || {
-            echo "the report has $lines durations and the shard ran $RAN tests" >&2
-            exit 1
-          }
-          echo "$lines durations"
-          # Each corpus run this partition took, as one `corpus <run> <ms>` row the cut weighs.
-          cat "/tmp/corpus-timings-$SHARD.tsv" >> "/tmp/timings-$SHARD.tsv"
+          .github/ci-corpus.sh partition "$SHARD" "/tmp/timings-lanes-$SHARD.tsv" "${plan[@]}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
         with:
-          name: timings-${{ matrix.shard }}
-          path: /tmp/timings-${{ matrix.shard }}.tsv
+          name: timings-lanes-${{ matrix.shard }}
+          path: /tmp/timings-lanes-${{ matrix.shard }}.tsv
           retention-days: 1
           if-no-files-found: error
 
@@ -503,27 +542,13 @@ jobs:
             crates/ply-test/ply/.ply-cache
           key: ply-stores-${{ matrix.shard }}-${{ github.run_id }}
 
-      - name: Goldens that moved
-        if: always()
-        run: |
-          set -euo pipefail
-          git add -N crates/ply-codegen-tests/fixtures/goldens
-          git diff --quiet -- crates/ply-codegen-tests/fixtures/goldens && exit 0
-          {
-            echo "### Goldens this partition re-blessed"
-            echo '```'
-            git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
-
   # The table the next run cuts its shards from. It needs every partition, so a run that went red
   # leaves the last whole one in place rather than a table missing whatever did not report. A pull
   # request writes one too, into its own cache: a branch cuts by what its own tree measured, and
   # main is never cut by a branch's.
   timings:
     name: what this run's tests cost
-    needs: [test]
+    needs: [nextest, lanes]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -551,7 +576,7 @@ jobs:
   passes:
     name: the passes this run published
     if: ${{ !cancelled() }}
-    needs: [test, corpus]
+    needs: [lanes, corpus]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -880,7 +905,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [plan, clippy, build, build-ply, test, solo, gates, test-hosts, corpus, refresh]
+    needs: [plan, clippy, build, build-ply, nextest, lanes, solo, gates, test-hosts, corpus, refresh]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
