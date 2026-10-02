@@ -1,0 +1,94 @@
+// The compiled package a project's loads read the shipped modules through, re-cut from a load's own
+// analysis when it pulls a module the package lacks, so keeping it costs no analysis of its own.
+
+import std.fs (fs)
+import std.bin
+import std.hash (blake3)
+import std.random (entropy)
+import std.time (time)
+import std.bytes (hex_of)
+import compiler.front (Whole)
+import compiler.hash (hex)
+import compiler.interface (CompiledPackage, CompiledModule, compile_package, compiled_package_bin)
+import compiler.resolve (Source, Mod)
+import store.engine (fresh_nonce)
+import loads (Place)
+
+// What the shelf is: every module's name and source, in name order.
+fn shelf_digest(shelved: List<Source>) -> String = {
+  let by_name = fold(shelved, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, blake3(s.src)));
+  let parts = map_fold(by_name, [], |acc: List<Bytes>, name: Bytes, h: Bytes|
+    push(push(push(acc, name), b"\0"), h));
+  string_of_bytes(bytes_slice(hex(blake3(bytes_concat_all(parts))), 0, 16))
+}
+
+fn interfaces_dir(place: Place) -> String = place.dir ++ "/interfaces"
+
+fn package_name(place: Place, shelved: List<Source>) -> String =
+  string_slice(place.stamps.frontend, 0, 16) ++ "-" ++ shelf_digest(shelved)
+
+// Discards every package kept for the project; false only when one is left behind.
+pub fn cleared<[r]>(place: Place) -> Bool / {fs.read[r], fs.write[r]} =
+  !fs.exists[r](interfaces_dir(place)) || fs.remove_tree[r](interfaces_dir(place))
+
+pub fn shelf_package<[r]>(
+  place: Place,
+  shelved: List<Source>,
+) -> Option<CompiledPackage> / {fs.read[r]} =
+  match fs.read_file[r](interfaces_dir(place) ++ "/" ++ package_name(place, shelved)) {
+    None -> None,
+    Some(bytes) -> match bin::decode(bytes, compiled_package_bin()) {
+      Ok(p) -> Some(p),
+      Err(_) -> None,
+    },
+  }
+
+fn pulled_of(w: Whole, shelved: List<Source>) -> List<Bytes> = {
+  let shipped = fold(shelved, map_new(), |acc: Map<Bytes, Bool>, s: Source|
+    map_insert(acc, s.name, true));
+  fold(w.mods, [], |acc: List<Bytes>, m: Mod|
+    if map_contains(shipped, m.name) { push(acc, m.name) } else { acc })
+}
+
+pub fn refreshed<[r]>(
+  place: Place,
+  shelved: List<Source>,
+  w: Whole,
+  through: List<CompiledPackage>,
+) -> Unit / {fs.read[r], fs.write[r], entropy.next, time.now_ms} = {
+  let pulled = pulled_of(w, shelved);
+  let covered = fold(through, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
+    fold(p.modules, acc, |a: Map<Bytes, Bool>, m: CompiledModule| map_insert(a, m.name, true)));
+  if fold(pulled, true, |all: Bool, n: Bytes| all && map_contains(covered, n)) { () } else {
+    kept[r](
+      place,
+      package_name(place, shelved),
+      bin::encode(compile_package(shelved, w, pulled, through), compiled_package_bin()),
+    )
+  }
+}
+
+// Renamed into place, so a reader finds a whole package or none; every other package is swept.
+fn kept<[r]>(
+  place: Place,
+  name: String,
+  bytes: Bytes,
+) -> Unit / {fs.read[r], fs.write[r], entropy.next, time.now_ms} = {
+  let root = interfaces_dir(place);
+  match fs.list_dir[r](root) {
+    None -> (),
+    Some(names) ->
+      fold(names, (), |u: Unit, n: String|
+        if n == name { u } else {
+          fs.remove[r](root ++ "/" ++ n);
+          u
+        }),
+  };
+  let path = root ++ "/" ++ name;
+  let temp = path ++ "." ++ hex_of(fresh_nonce()) ++ ".tmp";
+  if fs.create_dir[r](root) && fs.write_file[r](temp, bytes) {
+    fs.rename[r](temp, path);
+    ()
+  } else { () }
+}

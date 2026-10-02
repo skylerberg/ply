@@ -23,6 +23,8 @@ pub const REWRITE: &str = include_str!("../ply/rewrite.ply");
 
 pub const INFER: &str = include_str!("../ply/infer.ply");
 
+pub const INTERFACE: &str = include_str!("../ply/interface.ply");
+
 pub const DERIVE: &str = include_str!("../ply/derive.ply");
 
 pub const DIAG: &str = include_str!("../ply/diag.ply");
@@ -56,6 +58,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("front", FRONT),
     ("hash", HASH),
     ("infer", INFER),
+    ("interface", INTERFACE),
     ("items", ITEMS),
     ("lexer", LEXER),
     ("patterns", PATTERNS),

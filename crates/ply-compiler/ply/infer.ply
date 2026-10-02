@@ -243,9 +243,14 @@ type Shared = { labels: List<Int>, rows: List<Int> }
 // The rows the driver hands in for definitions whose hash has not moved, and test footprints, one
 // slot per `test`. The rest of a published interface is the written signature, which is on hand.
 pub type KnownDef = { footprint: List<Atom>, performed: List<Atom> }
-pub type Known = { defs: Map<Bytes, KnownDef>, tests: Map<Bytes, List<Option<List<Atom>>>> }
+// `effectful` is a compiled package's word for definitions whose bodies here are blanks.
+pub type Known = {
+  defs: Map<Bytes, KnownDef>,
+  tests: Map<Bytes, List<Option<List<Atom>>>>,
+  effectful: Map<Bytes, Bool>,
+}
 
-pub fn no_known() -> Known = { defs: map_new(), tests: map_new() }
+pub fn no_known() -> Known = { defs: map_new(), tests: map_new(), effectful: map_new() }
 
 type Cx = {
   r: Resolved,
@@ -434,9 +439,12 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"Iter", arity: 2 },
   ]
 
-fn builtin_type_arity(name: Bytes) -> Option<Int> =
-  fold(builtin_type_arities(), None, |acc: Option<Int>, x: { name: Bytes, arity: Int }|
-    match acc { Some(_) -> acc, None -> if x.name == name { Some(x.arity) } else { None } })
+// Pure and nullary, so the runtime builds it once and each type conversion only looks a name up.
+fn builtin_type_arity_map() -> Map<Bytes, Int> =
+  fold(builtin_type_arities(), map_new(), |acc: Map<Bytes, Int>, x: { name: Bytes, arity: Int }|
+    if map_contains(acc, x.name) { acc } else { map_insert(acc, x.name, x.arity) })
+
+fn builtin_type_arity(name: Bytes) -> Option<Int> = map_get(builtin_type_arity_map(), name)
 
 type Adt = {
   name: Bytes,
@@ -5274,12 +5282,18 @@ fn check_fns(cx: Cx, m: Mod) -> Cx = {
   );
   let fns = collected.fns;
   let names = collected.names;
+  let index = fold(range(0, len(names)), map_new(), |acc: Map<Bytes, Int>, i: Int| {
+    let n = at(names, i);
+    if map_contains(acc, n) { acc } else { map_insert(acc, n, i) }
+  });
   let adj = map(fns, |d: FnDef| {
     let refs = refs_of(d.body);
     fold(refs.names, [], |acc: List<Int>, q: QName|
       if !is_bare(q) { acc } else {
-        let i = position_bytes(names, q.name.name);
-        if i < 0 || contains_int(acc, i) { acc } else { push(acc, i) }
+        match map_get(index, q.name.name) {
+          Some(i) -> if contains_int(acc, i) { acc } else { push(acc, i) },
+          None -> acc,
+        }
       })
   });
   fold(sccs(len(fns), adj), collected.cx, |c: Cx, comp: List<Int>| check_component(c, m, fns, comp))
@@ -7878,7 +7892,10 @@ fn mark_internal_effects(cx: Cx) -> Cx = {
               };
               if at_ < 0 { a } else {
                 let refs = refs_of(def.body);
-                let flagged = if refs.effects { set_at(a.effects, at_, true) } else { a.effects };
+                let named = qualify(module_name(a.cx, mi), def.name.name);
+                let flagged = if refs.effects || map_contains(a.cx.known.effectful, named) {
+                  set_at(a.effects, at_, true)
+                } else { a.effects };
                 let params = map(def.params, |p: Param| p.name.name);
                 let callers = fold(refs.names, a.callers, |cs: List<List<Int>>, q: QName|
                   if is_bare(q) && contains_bytes(params, q.name.name) { cs } else {
@@ -8351,7 +8368,7 @@ fn known_of(cx: Cx) -> Known = {
       { next: slots.next, tests: map_insert(acc.tests, m.name, slots.slots) }
     },
   );
-  { defs: defs, tests: walked.tests }
+  { defs: defs, tests: walked.tests, effectful: map_new() }
 }
 
 // The program checked twice, the second time from what the first published.

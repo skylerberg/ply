@@ -2,6 +2,7 @@
 // A float literal hashes by its IEEE bit pattern.
 
 import spine (Span, Ident, QName, num)
+import std.bin
 import lexer (byte_of, widths, wide_decimal)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
               MWrite, MBad)
@@ -1742,12 +1743,16 @@ type Keyed = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, fresh: Map<Int,
 
 type Graph = { edges: List<List<Int>>, components: List<List<Int>>, scc: Sccs }
 
-fn graph_of(index: Index) -> Graph = {
+fn graph_of(index: Index) -> Graph = graph_with(index, map_new())
+
+// `extra` gives a node the references its compiled body has, where the body here is a blank.
+fn graph_with(index: Index, extra: Map<Int, List<Int>>) -> Graph = {
   let n = len(index.nodes);
   // A first pass with nothing known yields the reference graph, and a sketch that orders a cycle's members without source position.
   let first = map(index.nodes, |node: Node|
     finish(normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body)));
-  let edges = map(first, |f: Finished| f.refs);
+  let edges = map(range(0, n), |v: Int|
+    match map_get(extra, v) { Some(es) -> es, None -> at(first, v).refs });
   let sketches = map(first, |f: Finished| f.bytes);
   let components = tarjan(n, edges);
   let component_of = fold(
@@ -1775,66 +1780,115 @@ fn graph_of(index: Index) -> Graph = {
   { edges: edges, components: components, scc: { component_of: component_of, orders: orders } }
 }
 
-fn key_components(index: Index, g: Graph, pinned: Map<Int, Bytes>) -> Keyed =
+fn key_components(index: Index, g: Graph, pinned: Map<Int, Bytes>, held: Map<Int, Fixed>) -> Keyed =
   fold(
     range(0, len(g.components)),
     { hashes: map_new(), bodies: map_new(), fresh: map_new() },
     |acc: Keyed, ci: Int| {
       let component = at(g.components, ci);
-      let effects = slots(at(g.scc.orders, ci));
-      let own: Keyed = if is_cyclic(component, g.edges) {
-        let refined: Refined = hash_component(index, component, acc.hashes, effects);
-        fold(refined.members, acc, |a: Keyed, m: { node: Int, hash: Bytes }| {
-          let class = match map_get(refined.classes, m.node) { Some(c) -> c, None -> 0 };
-          {
-            ..a,
-            fresh: map_insert(a.fresh, m.node, m.hash),
-            bodies: map_insert(a.bodies, m.node, member_body(refined.packed, class)),
-          }
-        })
-      } else {
-        let v = at(component, 0);
-        let node = at(index.nodes, v);
-        let encoding = finish(
-          normalize_node(new_nz(index, node.module, acc.hashes, map_new(), effects), node.body),
-        ).bytes;
-        {
-          ..acc,
-          fresh: map_insert(acc.fresh, v, blake3(encoding)),
-          bodies: map_insert(acc.bodies, v, solo_body(encoding)),
-        }
-      };
-      {
-        ..own,
-        hashes: fold(component, own.hashes, |h: Map<Int, Bytes>, v: Int|
-          match map_get(pinned, v) {
-            Some(x) -> map_insert(h, v, x),
-            None -> match map_get(own.fresh, v) { Some(x) -> map_insert(h, v, x), None -> h },
-          }),
-      }
+      if fold(component, true, |all: Bool, v: Int| all && map_contains(held, v)) {
+        fold(component, acc, |a: Keyed, v: Int|
+          match map_get(held, v) {
+            None -> a,
+            Some(f) ->
+              {
+                hashes: map_insert(a.hashes, v, f.hash),
+                bodies: map_insert(a.bodies, v, f.body),
+                fresh: map_insert(a.fresh, v, f.hash),
+              },
+          })
+      } else { key_component(index, g, pinned, acc, ci, component) }
     },
   )
 
+fn key_component(
+  index: Index,
+  g: Graph,
+  pinned: Map<Int, Bytes>,
+  acc: Keyed,
+  ci: Int,
+  component: List<Int>,
+) -> Keyed = {
+  let effects = slots(at(g.scc.orders, ci));
+  let own: Keyed = if is_cyclic(component, g.edges) {
+    let refined: Refined = hash_component(index, component, acc.hashes, effects);
+    fold(refined.members, acc, |a: Keyed, m: { node: Int, hash: Bytes }| {
+      let class = match map_get(refined.classes, m.node) { Some(c) -> c, None -> 0 };
+      {
+        ..a,
+        fresh: map_insert(a.fresh, m.node, m.hash),
+        bodies: map_insert(a.bodies, m.node, member_body(refined.packed, class)),
+      }
+    })
+  } else {
+    let v = at(component, 0);
+    let node = at(index.nodes, v);
+    let encoding = finish(
+      normalize_node(new_nz(index, node.module, acc.hashes, map_new(), effects), node.body),
+    ).bytes;
+    {
+      ..acc,
+      fresh: map_insert(acc.fresh, v, blake3(encoding)),
+      bodies: map_insert(acc.bodies, v, solo_body(encoding)),
+    }
+  };
+  {
+    ..own,
+    hashes: fold(component, own.hashes, |h: Map<Int, Bytes>, v: Int|
+      match map_get(pinned, v) {
+        Some(x) -> map_insert(h, v, x),
+        None -> match map_get(own.fresh, v) { Some(x) -> map_insert(h, v, x), None -> h },
+      }),
+  }
+}
+
 pub fn hash_index(index: Index) -> HashOutput = hash_index_pinned(index, [])
 
-// The hashes of a program whose named nodes come back under the hashes `pins` fixes: an interface
-// package's definitions are pinned to the hashes it compiled under, so a dependent reaches them
-// without hashing their bodies and a reference into them reads the same hash either way.
-pub fn hash_index_pinned(index: Index, pins: List<Pin>) -> HashOutput = {
-  let g = graph_of(index);
+pub type NodeRef = { name: Bytes, decl: Bool }
+
+// What hashing derives from a node's body, which a stub lacks; `own` and specs are a function's.
+pub type Fixed = {
+  name: Bytes,
+  decl: Bool,
+  hash: Bytes,
+  own: Option<Bytes>,
+  specs: List<Bytes>,
+  spec_texts: List<Bytes>,
+  body: Bytes,
+  edges: List<NodeRef>,
+}
+
+derive bin for NodeRef
+
+derive bin for Fixed
+
+fn node_keys(index: Index) -> Map<Bytes, Int> =
+  fold(range(0, len(index.nodes)), map_new(), |acc: Map<Bytes, Int>, v: Int| {
+    let node = at(index.nodes, v);
+    map_insert(acc, pin_key(node.name, is_decl(node)), v)
+  })
+
+// A fixed node keeps the hash, references, forms and body it compiled with; none is hashed here.
+pub fn hash_index_pinned(index: Index, fixed: List<Fixed>) -> HashOutput = {
+  let keys = node_keys(index);
+  let held = fold(fixed, map_new(), |acc: Map<Int, Fixed>, f: Fixed|
+    match map_get(keys, pin_key(f.name, f.decl)) { Some(v) -> map_insert(acc, v, f), None -> acc });
+  let g = graph_with(
+    index,
+    map_fold(held, map_new(), |acc: Map<Int, List<Int>>, v: Int, f: Fixed|
+      map_insert(
+        acc,
+        v,
+        fold(f.edges, [], |es: List<Int>, r: NodeRef|
+          match map_get(keys, pin_key(r.name, r.decl)) { Some(w) -> push(es, w), None -> es }),
+      )),
+  );
   let components = g.components;
   let edges = g.edges;
   let scc = g.scc;
-  let wanted = fold(pins, map_new(), |acc: Map<Bytes, Bytes>, p: Pin|
-    map_insert(acc, pin_key(p.name, p.decl), p.hash));
-  let pinned = fold(range(0, len(index.nodes)), map_new(), |acc: Map<Int, Bytes>, v: Int| {
-    let node = at(index.nodes, v);
-    match map_get(wanted, pin_key(node.name, is_decl(node))) {
-      Some(h) -> map_insert(acc, v, h),
-      None -> acc,
-    }
-  });
-  let keyed = key_components(index, g, pinned);
+  let pinned = map_fold(held, map_new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed|
+    map_insert(acc, v, f.hash));
+  let keyed = key_components(index, g, pinned, held);
   let hashes = keyed.hashes;
   let tests = fold(
     index.tests,
@@ -1867,47 +1921,9 @@ pub fn hash_index_pinned(index: Index, pins: List<Pin>) -> HashOutput = {
     match e {
       EDef(v) -> {
         let node = at(index.nodes, v);
-        match node.body {
-          NFn(def) -> {
-            let form: Finished = encode_item(index, node.module, scc, hashes, true, |z: Nz|
-              normalize_node(z, NFn(def)));
-            let owned: Forms = {
-              ..acc,
-              own: push(acc.own, { name: node.name, hash: own_hash(form.bytes) }),
-            };
-            if len(def.spec) == 0 { owned } else {
-              match map_get(hashes, v) {
-                None -> owned,
-                Some(owner) -> {
-                  let clauses = map(range(0, len(def.spec)), |i: Int| {
-                    let c = at(def.spec, i);
-                    spec_hash(
-                      owner,
-                      spec_tag(c.kind),
-                      i,
-                      encode_item(index, node.module, scc, hashes, false, |z: Nz|
-                        spec_clause(z, def, c)).bytes,
-                    )
-                  });
-                  let texts = map(range(0, len(def.spec)), |i: Int| {
-                    let c = at(def.spec, i);
-                    spec_text_hash(
-                      spec_tag(c.kind),
-                      i,
-                      encode_item(index, node.module, scc, hashes, true, |z: Nz|
-                        spec_clause(z, def, c)).bytes,
-                    )
-                  });
-                  {
-                    ..owned,
-                    specs: push(owned.specs, { name: node.name, hashes: clauses }),
-                    spec_texts: push(owned.spec_texts, { name: node.name, hashes: texts }),
-                  }
-                },
-              }
-            }
-          },
-          _ -> acc,
+        match map_get(held, v) {
+          Some(f) -> fixed_forms(acc, node.name, f),
+          None -> unfixed_forms(index, scc, hashes, acc, v, node),
         }
       },
       _ -> acc,
@@ -1925,6 +1941,147 @@ pub fn hash_index_pinned(index: Index, pins: List<Pin>) -> HashOutput = {
     specs: forms.specs,
     spec_texts: forms.spec_texts,
   })
+}
+
+fn fixed_forms(acc: Forms, name: Bytes, f: Fixed) -> Forms = {
+  let owned: Forms = match f.own {
+    Some(o) -> { ..acc, own: push(acc.own, { name: name, hash: o }) },
+    None -> acc,
+  };
+  if len(f.specs) == 0 { owned } else {
+    {
+      ..owned,
+      specs: push(owned.specs, { name: name, hashes: f.specs }),
+      spec_texts: push(owned.spec_texts, { name: name, hashes: f.spec_texts }),
+    }
+  }
+}
+
+fn unfixed_forms(
+  index: Index,
+  scc: Sccs,
+  hashes: Map<Int, Bytes>,
+  acc: Forms,
+  v: Int,
+  node: Node,
+) -> Forms =
+  match node.body {
+    NFn(def) -> {
+      let form: Finished = encode_item(index, node.module, scc, hashes, true, |z: Nz|
+        normalize_node(z, NFn(def)));
+      let owned: Forms = {
+        ..acc,
+        own: push(acc.own, { name: node.name, hash: own_hash(form.bytes) }),
+      };
+      if len(def.spec) == 0 { owned } else {
+        match map_get(hashes, v) {
+          None -> owned,
+          Some(owner) -> {
+            let clauses = map(range(0, len(def.spec)), |i: Int| {
+              let c = at(def.spec, i);
+              spec_hash(
+                owner,
+                spec_tag(c.kind),
+                i,
+                encode_item(index, node.module, scc, hashes, false, |z: Nz|
+                  spec_clause(z, def, c)).bytes,
+              )
+            });
+            let texts = map(range(0, len(def.spec)), |i: Int| {
+              let c = at(def.spec, i);
+              spec_text_hash(
+                spec_tag(c.kind),
+                i,
+                encode_item(index, node.module, scc, hashes, true, |z: Nz|
+                  spec_clause(z, def, c)).bytes,
+              )
+            });
+            {
+              ..owned,
+              specs: push(owned.specs, { name: node.name, hashes: clauses }),
+              spec_texts: push(owned.spec_texts, { name: node.name, hashes: texts }),
+            }
+          },
+        }
+      }
+    },
+    _ -> acc,
+  }
+
+// Pairs nodes by `index.order`, as `assemble` pushed them; a node `applied` fixed keeps its edges.
+pub fn fixed_nodes(
+  index: Index,
+  h: HashOutput,
+  keep: Map<Bytes, Bool>,
+  applied: List<Fixed> = [],
+) -> List<Fixed> = {
+  let prior = fold(applied, map_new(), |acc: Map<Bytes, Fixed>, f: Fixed|
+    map_insert(acc, pin_key(f.name, f.decl), f));
+  let edges_of = |v: Int, node: Node, decl: Bool|
+    match map_get(prior, pin_key(node.name, decl)) {
+      Some(f) -> f.edges,
+      None ->
+        map(
+          finish(
+            normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body),
+          ).refs,
+          |r: Int| { name: at(index.nodes, r).name, decl: is_decl(at(index.nodes, r)) },
+        ),
+    };
+  let own = fold(h.own, map_new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
+    map_insert(acc, x.name, x.hash));
+  let specs = fold(
+    h.specs,
+    map_new(),
+    |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
+      map_insert(acc, x.name, x.hashes),
+  );
+  let texts = fold(
+    h.spec_texts,
+    map_new(),
+    |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
+      map_insert(acc, x.name, x.hashes),
+  );
+  let listed = |m: Map<Bytes, List<Bytes>>, name: Bytes|
+    match map_get(m, name) { Some(xs) -> xs, None -> [] };
+  let walked = fold(
+    index.order,
+    { body: 0, def: 0, decl: 0, out: [] },
+    |acc: { body: Int, def: Int, decl: Int, out: List<Fixed> }, e: Entry|
+      match e {
+        EDef(v) -> {
+          let node = at(index.nodes, v);
+          let decl = is_decl(node);
+          let body = at(h.bodies, acc.body);
+          if body.name != node.name {
+            panic("hashes and the index disagree on the order of nodes")
+          };
+          let next = {
+            ..acc,
+            body: acc.body + 1,
+            def: if decl { acc.def } else { acc.def + 1 },
+            decl: if decl { acc.decl + 1 } else { acc.decl },
+          };
+          if !map_contains(keep, at(index.mods, node.module).name) { next } else {
+            {
+              ..next,
+              out: push(next.out, {
+                name: node.name,
+                decl: decl,
+                hash: if decl { at(h.decls, acc.decl).hash } else { at(h.defs, acc.def).hash },
+                own: if decl { None } else { map_get(own, node.name) },
+                specs: if decl { [] } else { listed(specs, node.name) },
+                spec_texts: if decl { [] } else { listed(texts, node.name) },
+                body: body.body,
+                edges: edges_of(v, node, decl),
+              }),
+            }
+          }
+        },
+        _ -> acc,
+      },
+  );
+  walked.out
 }
 
 // Each body hashed with references as `pins` wrote them: an inherited move comes back to its pin, an edit does not.
@@ -1949,7 +2106,7 @@ pub fn rehash_index(index: Index, pins: List<Pin>) -> Rehashed = {
     }
   });
   let g = graph_of(index);
-  let keyed = key_components(index, g, pinned);
+  let keyed = key_components(index, g, pinned, map_new());
   let grouped = fold(range(0, len(g.components)), map_new(), |acc: Map<Int, Int>, ci: Int| {
     let c = at(g.components, ci);
     if len(c) < 2 { acc } else { fold(c, acc, |a: Map<Int, Int>, v: Int| map_insert(a, v, ci)) }
@@ -2129,7 +2286,14 @@ fn record(a: Recording, name: Bytes, deps: List<Bytes>, closure: Names) -> Recor
 
 type Reach = { seen: List<Bool>, frontier: List<Int> }
 
-pub fn unused(index: Index) -> List<Diag> = {
+// A fixed node is never reported: its own package's check answered for it.
+pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> = {
+  let keys = node_keys(index);
+  let held = fold(fixed, map_new(), |acc: Map<Int, Bool>, f: Fixed|
+    match map_get(keys, pin_key(f.name, f.decl)) {
+      Some(v) -> map_insert(acc, v, true),
+      None -> acc,
+    });
   let n = len(index.nodes);
   let edges = map(index.nodes, |node: Node| node_edges(index, node));
   let own = filter(range(0, n), |v: Int| is_root(index, at(index.nodes, v)));
@@ -2154,7 +2318,8 @@ pub fn unused(index: Index) -> List<Diag> = {
       )
     });
   fold(range(0, n), [], |acc: List<Diag>, v: Int|
-    if at(seen, v) { acc } else { push(acc, never_used(at(index.nodes, v))) })
+    if at(seen, v) || map_contains(held, v) { acc }
+    else { push(acc, never_used(at(index.nodes, v))) })
 }
 
 fn reach(r: Reach, v: Int) -> Reach =

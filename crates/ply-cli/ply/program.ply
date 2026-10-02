@@ -6,12 +6,15 @@
 import std.fs (fs)
 import std.time (time)
 import compiler.front (Refused, Analysed, Whole, Pulled, Rows, DefInterface,
-                       analyse_pulling_std_with, dump_of, filing, module_items, module_imports)
+                       analyse_pulling_std_with, dump_of, filing, module_items, module_imports,
+                       rows_of)
 import compiler.pkg (Pkgs, Supplied)
+import compiler.interface (CompiledPackage, merged_interfaces, stub_sources)
+import interfaces
 import compiler.hash (HashOutput, hex)
 import std.hash (blake3)
 import compiler.items (Item, IFn)
-import compiler.infer (DefInfo, Loc)
+import compiler.infer (DefInfo, TestInfo, LawInfo, Loc)
 import compiler.resolve (Source, Mod, Diag, Label, diag1, qualify)
 import compiler.tycore (TyCon, TyFn)
 import diagnostic (Place, spot_of)
@@ -26,14 +29,14 @@ import loads (Sources, SourceFile, SourcePackage, Recorded, StdlibMoved, Shipped
 import std.random (entropy)
 
 // `whole` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
-// `pkgs` is what the load was made of, kept so a command that re-analyses a spliced program —
-// `ply replace` — resolves imports the way this load did.
+// `pkgs` and `through` are kept so a re-analysis (`ply replace`, a mutant) reads what the load did.
 pub type Program = {
   files: List<File>,
   places: List<Place>,
   diags: List<Diag>,
   whole: Option<Whole>,
   pkgs: Pkgs,
+  through: List<CompiledPackage>,
 }
 
 pub type ModuleView = { name: String, path: String }
@@ -81,7 +84,14 @@ fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
 // --- Loading --------------------------------------------------------------------
 
 fn broken(project: Project, places: List<Place>, diags: List<Diag>) -> Program =
-  { files: project.files, places: places, diags: diags, whole: None, pkgs: pkgs_of(project) }
+  {
+    files: project.files,
+    places: places,
+    diags: diags,
+    whole: None,
+    pkgs: pkgs_of(project),
+    through: [],
+  }
 
 // What a load of this project is made of: its root key and manifest text, and every dependency
 // the walk read. The front end takes this as its package closure.
@@ -133,24 +143,61 @@ pub fn placed_of(project: Project) -> Placed =
     manifests: manifest_places(project),
   }
 
-fn analysed(project: Project, shelved: List<Source>, rows: Rows) -> Program = {
-  let texts = fold(shelved, map_new(), |acc: Map<String, Bytes>, s: Source|
-    map_insert(acc, string_of_bytes_lossy(s.name), s.src));
-  let pkgs: Pkgs = pkgs_of(project);
-  let pulled: Pulled = analyse_pulling_std_with(
-    project.sources,
-    shelved,
+// A covered module parses from its stub; its place keeps the source the emitter reads.
+fn front_end(
+  sources: List<Source>,
+  shelved: List<Source>,
+  rows: Rows,
+  pkgs: Pkgs,
+  through: List<CompiledPackage>,
+) -> Pulled = {
+  let stubs = fold(stub_sources(through), map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  let shipped = map(shelved, |s: Source|
+    match map_get(stubs, s.name) { Some(stub) -> { name: s.name, src: stub }, None -> s });
+  analyse_pulling_std_with(
+    sources,
+    shipped,
     rows.defs,
     rows.tests,
     pkgs,
-  );
+    merged_interfaces(through),
+  )
+}
+
+// Seeded with what the load published, so only what the splice moved is walked again.
+pub fn reanalysed(
+  p: Program,
+  w: Whole,
+  sources: List<Source>,
+  shelved: List<Source>,
+  pkgs: Pkgs,
+) -> Pulled = front_end(sources, shelved, rows_of(w), pkgs, p.through)
+
+fn analysed(
+  project: Project,
+  shelved: List<Source>,
+  rows: Rows,
+  through: List<CompiledPackage>,
+) -> Program = {
+  let texts = fold(shelved, map_new(), |acc: Map<String, Bytes>, s: Source|
+    map_insert(acc, string_of_bytes_lossy(s.name), s.src));
+  let pkgs: Pkgs = pkgs_of(project);
+  let pulled: Pulled = front_end(project.sources, shelved, rows, pkgs, through);
   let shelved_places = map(pulled.pulled, |n: Bytes| shelf_place(texts, string_of_bytes_lossy(n)));
   let own = placed_of(project);
   let places = appended(appended(own.modules, shelved_places), own.manifests);
   match pulled.out {
     Refused(ds) -> broken(project, places, ds),
     Analysed(w) ->
-      { files: project.files, places: places, diags: w.warnings, whole: Some(w), pkgs: pkgs },
+      {
+        files: project.files,
+        places: places,
+        diags: w.warnings,
+        whole: Some(w),
+        pkgs: pkgs,
+        through: through,
+      },
   }
 }
 
@@ -162,13 +209,56 @@ fn assembled(
   shelved: List<Source>,
   paths: List<paths::Resolved>,
   rows: Rows,
+  through: List<CompiledPackage> = [],
 ) -> Program =
   if len(project.diags) > 0 { broken(project, own_places(project), project.diags) }
   else if len(project.sources) == 0 {
     broken(project, [], [
       nothing_here(match list_at(paths, 0) { Some(r) -> r.display, None -> "." }),
     ])
-  } else { analysed(project, shelved, rows) }
+  } else { analysed(project, shelved, rows, through) }
+
+// The toolchain's own tree: its shipped modules are its roots, not a dependency.
+fn claims_the_shelf(project: Project, shelved: List<Source>) -> Bool = {
+  let names = fold(shelved, map_new(), |acc: Map<Bytes, Bool>, s: Source|
+    map_insert(acc, s.name, true));
+  fold(project.sources, false, |acc: Bool, s: Source| acc || map_contains(names, s.name))
+}
+
+fn interfaced_for(interfaced: Bool, project: Project, shelved: List<Source>) -> Bool =
+  interfaced && usable(project) && len(shelved) > 0 && !claims_the_shelf(project, shelved)
+
+fn through_of(
+  paths: List<paths::Resolved>,
+  project: Project,
+  shelved: List<Source>,
+  stamps: Stamps,
+  interfaced: Bool,
+) -> List<CompiledPackage> / {fs.read[cwd], fs.read[abs]} =
+  if !interfaced_for(interfaced, project, shelved) { [] } else {
+    let place = loads::place_of(paths, stamps);
+    let shelf = if place.label == "cwd" { interfaces::shelf_package[cwd](place, shelved) }
+    else { interfaces::shelf_package[abs](place, shelved) };
+    match shelf { Some(p) -> [p], None -> [] }
+  }
+
+fn refreshing(
+  paths: List<paths::Resolved>,
+  project: Project,
+  shelved: List<Source>,
+  stamps: Stamps,
+  interfaced: Bool,
+  through: List<CompiledPackage>,
+  p: Program,
+) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} =
+  match p.whole {
+    None -> (),
+    Some(w) -> if !interfaced_for(interfaced, project, shelved) { () } else {
+      let place = loads::place_of(paths, stamps);
+      if place.label == "cwd" { interfaces::refreshed[cwd](place, shelved, w, through) }
+      else { interfaces::refreshed[abs](place, shelved, w, through) }
+    },
+  }
 
 // --- The front-end cache ---------------------------------------------------------
 
@@ -336,14 +426,20 @@ fn filed(
     },
   }
 
+// `interfaced` is false for a run whose scope takes in the shipped modules: it reads their source.
 pub fn load_program(
   paths: List<paths::Resolved>,
+  interfaced: Bool = true,
 ) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let project: Project = load_resolved(paths);
   let shelved: List<Source> = if usable(project) { shelf() } else { [] };
   let stamps = loads::shelf_stamps();
   let k: Recorded = recorded_for(paths, project, shelved, stamps);
-  filed(paths, shelved, stamps, k, assembled(project, shelved, paths, rows_recorded(k)))
+  let rows = rows_recorded(k);
+  let through = through_of(paths, project, shelved, stamps, interfaced);
+  let p: Program = assembled(project, shelved, paths, rows, through);
+  refreshing(paths, project, shelved, stamps, interfaced, through, p);
+  filed(paths, shelved, stamps, k, p)
 }
 
 // A load that neither reads nor files the front-end cache: what `ply build` and `ply hosts` take,
@@ -378,9 +474,10 @@ pub fn no_front() -> Front =
 // read cost, what the front end cost over them, and what filing its answer cost.
 pub fn timed_load(
   paths: List<paths::Resolved>,
+  interfaced: Bool = true,
 ) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let started = time.elapsed_ms();
-  timed_over(paths, load_resolved(paths), started)
+  timed_over(paths, load_resolved(paths), started, interfaced)
 }
 
 // [`timed_load`] over a walk already made, with the clock as it read before the walk.
@@ -388,13 +485,17 @@ pub fn timed_over(
   paths: List<paths::Resolved>,
   project: Project,
   started: Int,
+  interfaced: Bool = true,
 ) -> Timed / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let shelved: List<Source> = if usable(project) { shelf() } else { [] };
   let stamps = loads::shelf_stamps();
   let k: Recorded = recorded_for(paths, project, shelved, stamps);
+  let rows = rows_recorded(k);
+  let through = through_of(paths, project, shelved, stamps, interfaced);
   let read_done = time.elapsed_ms();
-  let p: Program = assembled(project, shelved, paths, rows_recorded(k));
+  let p: Program = assembled(project, shelved, paths, rows, through);
   let front_done = time.elapsed_ms();
+  refreshing(paths, project, shelved, stamps, interfaced, through, p);
   let kept: Program = filed(paths, shelved, stamps, k, p);
   {
     program: kept,
@@ -475,6 +576,13 @@ fn first_primary(labels: List<Label>) -> Option<Label> =
     match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } })
 
 // A diagnostic raised inside a module the project did not write, which is the shelf's business.
+// A run reports its own modules' tests and laws, however its dependencies were read.
+pub fn own_tests(p: Program, w: Whole) -> List<TestInfo> =
+  filter(w.checked.tests, |x: TestInfo| x.at.module < len(p.files))
+
+pub fn own_laws(p: Program, w: Whole) -> List<LawInfo> =
+  filter(w.checked.laws, |x: LawInfo| x.at.module < len(p.files))
+
 pub fn is_shelved(p: Program, d: Diag) -> Bool =
   match first_primary(d.labels) { Some(l) -> l.module >= len(p.files), None -> false }
 
@@ -770,6 +878,7 @@ test "a span outside every module has no place and no location" {
     diags: [],
     whole: None,
     pkgs: { root: b"", manifest: None, supplied: [] },
+    through: [],
   };
   assert_eq(location_of(p, { module: 4294967295, span: { start: 0, end: 0 } }), None);
   assert_eq(location_of(p, { module: 0, span: { start: 3, end: 4 } }), Some("m.ply:1:4"))

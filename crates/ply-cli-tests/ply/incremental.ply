@@ -5,7 +5,8 @@
 
 import harness (scratch, Ran, Server, Source, project, write, read, working, repo, repo_file,
                 on_disk, serving, ended, finished, said, stderr, warm_agrees, seeding, seeding_at,
-                json_of, at, path, items, first, str, int, truth, shown)
+                json_of, at, path, items, first, str, int, truth, shown, in_memory, tree,
+                sources_here, comparable)
 import cli.machine (machine)
 import std.bytes (hex_of)
 import std.fs (fs)
@@ -539,5 +540,83 @@ test "a promise is known on every run and still refused" {
         Some(run ++ ": " ++ shown(answer)),
       )
     })
+  })
+}
+
+fn measured() -> String =
+  \\import std.math (abs)
+  \\
+  \\pub fn distance(a: Int, b: Int) -> Int = abs(a - b)
+  \\
+  \\test "distance is symmetric" { assert_eq(distance(2, 5), distance(5, 2)) }
+  \\
+
+type Kept = { name: String, bytes: Bytes }
+
+fn interfaces() -> String = ".ply-cache/interfaces"
+
+fn kept_package() -> Kept =
+  match fs.list_dir[cwd](interfaces()) {
+    Some([name]) -> match fs.read_file[cwd](interfaces() ++ "/" ++ name) {
+      Some(b) -> { name: name, bytes: b },
+      None -> panic("`" ++ name ++ "` does not read"),
+    },
+    Some(names) -> panic("the store keeps one package, not " ++ int_to_string(len(names))),
+    None -> panic("the store keeps no package"),
+  }
+
+test "a load through the compiled shelf answers what a load of its source does" {
+  scratch(|| {
+    project([{ path: "app.ply", text: measured() }]);
+    let _ = warm_agrees("the load that cuts the package");
+    let first = kept_package();
+    let _ = warm_agrees("a load through it");
+    assert(
+      kept_package() == first,
+      Some("a load that pulls nothing new keeps the package it read"),
+    );
+    write(
+      "more.ply",
+      "import std.option (option_unwrap_or)\npub fn or_zero(o: Option<Int>) -> Int = option_unwrap_or(o, 0)\n",
+    );
+    let _ = warm_agrees("a load that pulls a module the package lacks");
+    let second = kept_package();
+    assert(second.bytes != first.bytes, Some("the package is cut again to cover what was pulled"));
+    let _ = warm_agrees("a load through the package cut again");
+    let hashed = ["hash", "--deps", "--json"];
+    let warm_hashes = comparable(json_of(on_disk(hashed)));
+    let cold_hashes = comparable(json_of(in_memory(tree(sources_here()), hashed)));
+    assert(
+      warm_hashes == cold_hashes,
+      Some("warm: " ++ shown(warm_hashes) ++ "\ncold: " ++ shown(cold_hashes)),
+    );
+    let single = ["check", "app.ply", "--json"];
+    let warm_single = comparable(json_of(on_disk(single)));
+    let cold_single = comparable(json_of(in_memory(tree(sources_here()), single)));
+    assert(
+      warm_single == cold_single,
+      Some("warm: " ++ shown(warm_single) ++ "\ncold: " ++ shown(cold_single)),
+    );
+    assert(
+      kept_package() == second,
+      Some("a load that reaches part of the package keeps it whole"),
+    );
+    // `replace` and a mutant re-check a spliced program through the package the load read.
+    write("distance.txt", "pub fn distance(a: Int, b: Int) -> Int = abs(b - a)\n");
+    let replaced = on_disk(["replace", "distance", "--with", "distance.txt"]);
+    assert(replaced.code == 0, Some(said(replaced)));
+    let _ = warm_agrees("after a replacement");
+    let mutate = ["test", "--mutate", "distance", "--json"];
+    let warm = at(json_of(on_disk(mutate)), "mutants");
+    let cold = at(json_of(in_memory(tree(sources_here()), mutate)), "mutants");
+    assert(warm == cold, Some("warm: " ++ shown(warm) ++ "\ncold: " ++ shown(cold)));
+    write(interfaces() ++ "/" ++ second.name, "not a package");
+    let _ = warm_agrees("a load whose package does not read");
+    assert(
+      kept_package().bytes != b"not a package",
+      Some("a package that does not read is cut again"),
+    );
+    assert(on_disk(["cache", "clear"]).code == 0, None);
+    assert(!fs.exists[cwd](interfaces()), Some("clearing the cache discards the package"))
   })
 }
