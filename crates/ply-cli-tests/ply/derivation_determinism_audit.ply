@@ -1,0 +1,285 @@
+// A derived program's hashes are a function of its meaning: not of the process, the directory, the
+// import's spelling, a type parameter's name or the shipped modules' digest, while a field's order
+// and a variant's name, which are on the wire, move exactly what they reach.
+
+import harness (Ran, Source, project, write, repo_file, in_memory, tree, on_disk, said)
+import std.fs (MemFs)
+import std.string
+
+fn ran(r: Ran) -> Ran = {
+  assert(r.code == 0, Some(said(r)));
+  r
+}
+
+fn hashes_of(t: MemFs) -> String = said(ran(in_memory(t, ["hash"])))
+
+fn hashes_here() -> String = said(ran(on_disk(["hash"])))
+
+fn one_module(text: String) -> MemFs = tree([{ path: "m.ply", text: text }])
+
+// The hash `ply hash` prints for one definition, by its simple name.
+fn hash_of(text: String, name: String) -> String =
+  match filter(string_split(text, "\n"), |l: String|
+      match list_at(string::words(l), 1) { Some(n) -> n == name, None -> false }) {
+    [line, ..] -> match list_at(string::words(line), 0) { Some(h) -> h, None -> "" },
+    [] -> panic("no definition named `" ++ name ++ "` in:\n" ++ text),
+  }
+
+fn derived() -> String =
+  \\import std.json
+  \\
+  \\pub type Colour = Red | Green | Blue
+  \\pub type Shape = Blank | Circle(Decimal) | Rect(Decimal, Decimal)
+  \\pub type Pair<a, b> = { fst: a, snd: b }
+  \\pub type Tree = Leaf | Node(Tree, Tree)
+  \\pub type Doc = {
+  \\  by_name: Map<String, Shape>,
+  \\  by_num: Map<Int, List<Colour>>,
+  \\  tree: Tree,
+  \\  maybe: Option<Pair<Int, String>>,
+  \\}
+  \\
+  \\derive json for Colour
+  \\derive json for Shape
+  \\derive json for Pair
+  \\derive json for Tree
+  \\derive json for Doc
+  \\derive eq for Doc
+  \\derive ord for Colour
+  \\
+  \\pub fn wire(d: Doc) -> String = string_of_bytes(json::encode_bytes(d, doc_json()))
+  \\
+
+test/nondet "a derived program hashes identically in two runs and two directories" {
+  project([{ path: "m.ply", text: derived() }]);
+  let first = hashes_here();
+  assert(first == hashes_here(), Some("two runs of one program produced two hash sets"));
+  // Another absolute path, the same file names: a tree in memory sits under `/w`.
+  assert(
+    first == hashes_of(one_module(derived())),
+    Some("a project's hashes moved with the directory it sat in"),
+  )
+}
+
+// A generated body is written against the import's spelling: `json::object`, `j::object`, or a bare
+// `object`.
+test/nondet "a generated definition's hash does not depend on the import that spelled it" {
+  let body = "\npub type A = { x: Int, y: String }\npub type B = Left(Int) | Right(A)\nderive json for A\nderive json for B\n";
+  let pairs = map(
+    [
+      "import std.json",
+      "import std.json as j",
+      "import std.json (JsonCodec, Json, Member, DecodeError, object, field, variant, variant_of, variant_value, unknown_variant, decode_and_then, int_json, string_json)",
+    ],
+    |form: String| {
+      let text = hashes_of(one_module(form ++ body));
+      { form: form, a: hash_of(text, "a_json"), b: hash_of(text, "b_json") }
+    },
+  );
+  match pairs {
+    [] -> panic("three forms were hashed"),
+    [first, ..rest] ->
+      fold(rest, (), |u: Unit, p: { form: String, a: String, b: String }|
+        assert(
+          p.a == first.a && p.b == first.b,
+          Some("the import form `" ++ p.form ++ "` changed a generated definition's hash"),
+        )),
+  }
+}
+
+// The emitter's binder prefix walks away from the type parameters' names, so `Pair<a, b>` and
+// `Pair<d, e>` generate different source.
+test/nondet "renaming a type parameter does not move a generated hash" {
+  let with_params = |params: String, fst: String, snd: String|
+    "import std.json\npub type Pair<" ++ params ++ "> = { fst: " ++ fst ++ ", snd: " ++ snd
+      ++ " }\nderive json for Pair\n";
+  // `d` is the emitter's first-choice prefix, so this forces it to walk to `d_` and rename every
+  // binder.
+  assert(
+    hash_of(hashes_of(one_module(with_params("a, b", "a", "b"))), "pair_json")
+      == hash_of(hashes_of(one_module(with_params("d, e", "d", "e"))), "pair_json"),
+    Some("a type parameter's name reached a generated definition's hash"),
+  )
+}
+
+fn fields_source(fields: String) -> String =
+  "import std.json\npub type A = { " ++ fields
+    ++ " }\nderive json for A\npub fn wire() -> String = string_of_bytes(json::encode_bytes({x: 1, y: \"hi\"}, a_json()))\ntest \"the wire\" { assert_eq(wire(), \"{\\\"x\\\":1,\\\"y\\\":\\\"hi\\\"}\") }\n"
+
+test/nondet "reordering two fields moves the hash and leaves the wire alone" {
+  let declared = fields_source("x: Int, y: String");
+  let reordered = fields_source("y: String, x: Int");
+  assert(
+    hash_of(hashes_of(one_module(declared)), "a_json")
+      != hash_of(hashes_of(one_module(reordered)), "a_json"),
+    Some("a field reorder changes the decoder's visiting order, so it has to move the hash"),
+  );
+  fold([declared, reordered], (), |u: Unit, source: String| {
+    project([{ path: "m.ply", text: source }]);
+    let r = on_disk(["test"]);
+    assert(r.code == 0, Some("the wire is ascending by key either way:\n" ++ said(r)))
+  })
+}
+
+fn status_source(ty: String, codec: String, variant: String) -> String =
+  "import std.json\n\npub type Status = " ++ variant ++ " | Shipped(Int)\npub type " ++ ty
+    ++ " = { id: Int, status: Status }\nderive json for Status\nderive json for "
+    ++ ty
+    ++ "\n\nfn wire(o: "
+    ++ ty
+    ++ ") -> String = string_of_bytes(json::encode_bytes(o, "
+    ++ codec
+    ++ "()))\n\ntest \"an order encodes\" {\n  assert_eq(wire({id: 1, status: "
+    ++ variant
+    ++ "}), \"{\\\"id\\\":1,\\\"status\\\":\\\""
+    ++ variant
+    ++ "\\\"}\")\n}\n\ntest \"an unrelated arithmetic fact\" { assert_eq(1 + 1, 2) }\n"
+
+fn tested_saying(what: String, why: String) -> Unit = {
+  let r = on_disk(["test"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(said(r), what), Some(why ++ "\n" ++ said(r)))
+}
+
+test/nondet "renaming the type re-runs no test and renaming a variant re-runs its own" {
+  project([{ path: "m.ply", text: status_source("Order", "order_json", "Placed") }]);
+  tested_saying("selected 2 of 2 (0 cached)", "a first run runs both");
+  // The type's name is not in the encoding, so nothing it reaches moved.
+  write("m.ply", status_source("Purchase", "purchase_json", "Placed"));
+  tested_saying("selected 0 of 2 (2 cached)", "renaming the derived type re-ran a test:");
+  // The variant's name *is* the tag, so exactly the test that reaches it moves.
+  write("m.ply", status_source("Purchase", "purchase_json", "Created"));
+  tested_saying(
+    "selected 1 of 2 (1 cached)",
+    "renaming a variant must re-run its test and no other:",
+  )
+}
+
+test/nondet "a map in a derived encoding is byte-identical however it was built" {
+  project([
+    {
+      path: "m.ply",
+      text:
+        \\import std.json
+        \\
+        \\pub type Doc = { m: Map<String, Int>, n: Map<Int, List<String>> }
+        \\derive json for Doc
+        \\
+        \\fn build(ks: List<String>) -> Map<String, Int> =
+        \\  fold(ks, map_new(), |acc, k| map_insert(acc, k, string_len(k)))
+        \\
+        \\fn nums(ks: List<Int>) -> Map<Int, List<String>> =
+        \\  fold(ks, map_new(), |acc, k| map_insert(acc, k, ["a", "b"]))
+        \\
+        \\pub fn wire(ss: List<String>, ns: List<Int>) -> String =
+        \\  string_of_bytes(json::encode_bytes({m: build(ss), n: nums(ns)}, doc_json()))
+        \\
+        \\fn ascending() -> List<String> = ["a", "bb", "ccc", "dddd"]
+        \\fn descending() -> List<String> = ["dddd", "ccc", "bb", "a"]
+        \\fn shuffled() -> List<String> = ["ccc", "a", "dddd", "bb"]
+        \\
+        \\test "one map, one document" {
+        \\  assert_eq(wire(ascending(), [1, 2, 3]), wire(descending(), [3, 2, 1]));
+        \\  assert_eq(wire(ascending(), [1, 2, 3]), wire(shuffled(), [2, 3, 1]));
+        \\  assert_eq(wire(shuffled(), [3, 1, 2]),
+        \\            "{\"m\":{\"a\":1,\"bb\":2,\"ccc\":3,\"dddd\":4},\"n\":[{\"key\":1,\"value\":[\"a\",\"b\"]},{\"key\":2,\"value\":[\"a\",\"b\"]},{\"key\":3,\"value\":[\"a\",\"b\"]}]}")
+        \\}
+        \\
+    },
+  ]);
+  tested_saying("0 failed, 1 passed", "the encoding is one document");
+  // Cached under one order and read back under another: the same value, so the second run selects
+  // nothing.
+  tested_saying("selected 0 of 1 (1 cached)", "the second run believed the first:");
+  let r = on_disk(["test", "--no-cache"]);
+  assert(r.code == 0, Some(said(r)))
+}
+
+test/nondet "a decimal-keyed map encodes one body whichever spelling was written last" {
+  project([
+    {
+      path: "m.ply",
+      text:
+        \\import std.json
+        \\
+        \\pub type Catalogue = { prices: Map<Decimal, String> }
+        \\derive json for Catalogue
+        \\
+        \\fn from_catalogue() -> Catalogue =
+        \\  {prices: map_insert(map_insert(map_new(), 1.50m, "bolt"), 2.00m, "nut")}
+        \\
+        \\fn after_promotion() -> Catalogue =
+        \\  {prices: map_insert(from_catalogue().prices, 1.5m, "bolt")}
+        \\
+        \\fn body(c: Catalogue) -> String =
+        \\  string_of_bytes(json::encode_bytes(c, catalogue_json()))
+        \\
+        \\test "one catalogue, one document" {
+        \\  assert_eq(from_catalogue(), after_promotion());
+        \\  assert_eq(body(from_catalogue()), body(after_promotion()));
+        \\  assert_eq(body(after_promotion()),
+        \\            "{\"prices\":[{\"key\":1.5,\"value\":\"bolt\"},{\"key\":2,\"value\":\"nut\"}]}")
+        \\}
+        \\
+    },
+  ]);
+  tested_saying("0 failed, 1 passed", "one catalogue is one document");
+  let r = on_disk(["test", "--no-cache"]);
+  assert(r.code == 0, Some(said(r)))
+}
+
+test/nondet "pulling the stdlib into a program moves no hash outside it" {
+  let plain = {
+    path: "m.ply",
+    text: "pub fn total(xs: List<Int>) -> Int = fold(xs, 0, |a, x| a + x)\npub fn label(n: Int) -> String = \"n=\" ++ int_to_string(n)\n",
+  };
+  let user = {
+    path: "other.ply",
+    text: "import std.json\npub type A = { x: Int }\nderive json for A\n",
+  };
+  let a = hashes_of(tree([plain]));
+  let b = hashes_of(tree([plain, user]));
+  assert(
+    !string_contains(a, "std.json"),
+    Some("a program importing nothing from `std` loaded a shipped module:\n" ++ a),
+  );
+  assert(string_contains(b, "std.json"), Some(b));
+  fold(["total", "label"], (), |u: Unit, name: String|
+    assert(
+      hash_of(a, name) == hash_of(b, name),
+      Some("`" ++ name ++ "` imports nothing from `std`, so loading the stdlib may not move it"),
+    ))
+}
+
+test/nondet "a copied stdlib is the same definitions but cannot host a derivation" {
+  let json = repo_file("crates/ply-std/ply/json.ply");
+  let a = hashes_of(
+    one_module("import std.json\npub type A = { x: Int, y: String }\nderive json for A\n"),
+  );
+  let b = hashes_of(
+    tree([
+      { path: "json.ply", text: json },
+      { path: "m.ply", text: "import json\npub fn one() -> json::Json = json::Number(1m)\n" },
+    ]),
+  );
+  fold(["object", "field", "int_json", "string_json", "parse"], (), |u: Unit, name: String|
+    assert(
+      hash_of(a, name) == hash_of(b, name),
+      Some(
+        "`" ++ name
+          ++ "` moved between the shipped module and a copy of its source, so the `std` prefix or the pseudo-path reached a hash",
+      ),
+    ));
+  let r = in_memory(
+    tree([
+      { path: "json.ply", text: json },
+      { path: "m.ply", text: "import json\npub type A = { x: Int }\nderive json for A\n" },
+    ]),
+    ["check"],
+  );
+  assert(r.code != 0, Some(said(r)));
+  assert(
+    string_contains(said(r), "this module does not import `std.json`"),
+    Some("a `derive json` against a copy has to say which module it wanted:\n" ++ said(r)),
+  )
+}

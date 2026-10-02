@@ -1,0 +1,607 @@
+// Packages: path, git and registry dependencies, the judgments over a closure, `ply.lock` and what
+// it holds a build to, `ply why`, `ply vendor`, and a library built as a package.
+
+import harness (Ran, Source, project, write, read, fresh, working, environment, on_disk, said,
+                stdout, stderr, json_of, at, path, nth, str, int, truth, shown)
+import std.fs (fs)
+import std.json (Json, Array, Str)
+import std.process (process, Exited)
+import std.string
+
+fn manifest(name: String, deps: String) -> String =
+  "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name
+    ++ "\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: ["
+    ++ deps
+    ++ "], entry: None}\n"
+
+fn dep(name: String, at_path: String) -> String =
+  "{name: \"" ++ name ++ "\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\""
+    ++ at_path
+    ++ "\")}"
+
+// app -> lib -> base, with lib using base and a sibling of its own.
+fn graph() -> Unit =
+  project([
+    { path: "app/ply.pkg", text: manifest("app", dep("lib", "../lib")) },
+    {
+      path: "app/main.ply",
+      text: "import lib.answer\nfn main() -> Int = answer::answer()\ntest \"answers\" { assert_eq(answer::answer(), 42) }\n",
+    },
+    { path: "lib/ply.pkg", text: manifest("lib", dep("base", "../base")) },
+    {
+      path: "lib/answer.ply",
+      text: "import base.deep\nimport extra\npub fn answer() -> Int = deep::deep() + extra::hidden()\n",
+    },
+    { path: "lib/extra.ply", text: "pub fn hidden() -> Int = 35\n" },
+    { path: "base/ply.pkg", text: manifest("base", "") },
+    { path: "base/deep.ply", text: "pub fn deep() -> Int = 7\n" },
+  ])
+
+fn refused(r: Ran, code: String) -> Unit = {
+  assert(r.code == 2, Some(said(r)));
+  assert(string_contains(stderr(r), code), Some(stderr(r)))
+}
+
+fn says(r: Ran, needle: String) -> Unit =
+  assert(string_contains(stderr(r), needle), Some(stderr(r)))
+
+fn ok(r: Ran) -> Unit = assert(r.code == 0, Some(said(r)))
+
+fn exists(p: String) -> Bool = fs.exists[cwd](p)
+
+fn lock_of(p: String) -> String =
+  match read(p) { Some(t) -> t, None -> panic("`" ++ p ++ "` was written") }
+
+test/nondet "a path dependency serves its modules and runs them" {
+  graph();
+  fold(
+    [
+      { args: ["check", "app"], want: "checked 4 modules" },
+      { args: ["run", "app"], want: "42" },
+      { args: ["test", "app"], want: "1 passed" },
+      { args: ["build", "app", "-o", "app.plyx"], want: "built main.main" },
+    ],
+    (),
+    |u: Unit, c: { args: List<String>, want: String }| {
+      let r = on_disk(c.args);
+      assert(
+        r.code == 0 && string_contains(said(r), c.want),
+        Some(string::join(c.args, " ") ++ ": " ++ said(r)),
+      )
+    },
+  )
+}
+
+// A project's test run tests the project: a dependency's tests are that package's own to run.
+test/nondet "a test run tests the root package and never a dependency's" {
+  graph();
+  write(
+    "lib/extra.ply",
+    "pub fn hidden() -> Int = 35\ntest \"hidden is 35\" { assert_eq(hidden(), 35) }\n",
+  );
+  write("base/deep.ply", "pub fn deep() -> Int = 7\ntest \"deep is 7\" { assert_eq(deep(), 7) }\n");
+  let app = json_of(on_disk(["test", "app", "--json"]));
+  assert(int(path(app, ["selection", "total"])) == 1, Some(shown(app)));
+  assert(int(path(app, ["summary", "passed"])) == 1, Some(shown(app)));
+  // Not hidden by a filter either: the dependencies' tests are no part of this run at all.
+  assert(int(path(app, ["selection", "filtered_out"])) == 0, Some(shown(app)));
+  let lib = json_of(on_disk(["test", "lib", "--json"]));
+  assert(int(path(lib, ["selection", "total"])) == 1, Some(shown(lib)));
+  assert(
+    str(at(nth(path(lib, ["selection", "tests"]), 0), "key")) == "extra.hidden is 35",
+    Some(shown(lib)),
+  )
+}
+
+test/nondet "a transitive dependency the importer does not declare is refused" {
+  graph();
+  write("app/main.ply", "import base.deep\nfn main() -> Int = deep::deep()\n");
+  let r = on_disk(["check", "app"]);
+  refused(r, "E0132");
+  says(r, "`base`");
+  says(r, "`app`")
+}
+
+test/nondet "a dependency without a manifest is unusable where it is declared" {
+  graph();
+  assert(fs.remove[cwd]("lib/ply.pkg"), None);
+  let r = on_disk(["run", "app"]);
+  refused(r, "E0135");
+  says(r, "ply.pkg")
+}
+
+test/nondet "a root module may not squat on a dependency's prefix" {
+  graph();
+  write("app/lib/mine.ply", "fn mine() -> Int = 1\n");
+  refused(on_disk(["check", "app"]), "E0133")
+}
+
+test/nondet "a dependency cycle is refused naming the cycle" {
+  project([
+    { path: "app/ply.pkg", text: manifest("app", dep("lib", "../lib")) },
+    { path: "app/main.ply", text: "fn main() -> Int = 1\n" },
+    { path: "lib/ply.pkg", text: manifest("lib", dep("app", "../app")) },
+    { path: "lib/x.ply", text: "pub fn x() -> Int = 1\n" },
+  ]);
+  refused(on_disk(["check", "app"]), "E0134")
+}
+
+test/nondet "a git dependency that cannot be fetched says so" {
+  project([
+    {
+      path: "ply.pkg",
+      text: manifest(
+        "app",
+        "{name: \"glib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Git(\"https://example.invalid/glib\", \"abc123\")}",
+      ),
+    },
+    { path: "main.ply", text: "fn main() -> Int = 1\n" },
+  ]);
+  let r = on_disk(["check"]);
+  assert(r.code == 2, Some(said(r)));
+  // A url that does not resolve is the dependency's trouble, named as such: git could not fetch it,
+  // and nothing was read.
+  assert(
+    string_contains(stderr(r), "E0140") || string_contains(stderr(r), "E0135"),
+    Some(stderr(r)),
+  );
+  says(r, "glib")
+}
+
+// A registry dependency is read from the project's cache, and only `ply resolve` fills it.
+test/nondet "a registry dependency nothing fetched says what fetches it" {
+  project([
+    {
+      path: "ply.pkg",
+      text: manifest(
+        "app",
+        "{name: \"glib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}",
+      ),
+    },
+    { path: "main.ply", text: "fn main() -> Int = 1\n" },
+  ]);
+  let r = on_disk(["check"]);
+  refused(r, "E0135");
+  says(r, "`glib` has not been fetched");
+  says(r, "`ply resolve`");
+  // Resolving needs a registry to ask, and says which variable names it.
+  let resolved = on_disk(["resolve"]);
+  refused(resolved, "E0141");
+  says(resolved, "`PLY_REGISTRY` is not set")
+}
+
+test/nondet "a dependency may not reach back into the root package" {
+  graph();
+  // `onlyroot` exists only in the root package. A bare import inside a dependency names that
+  // package's own modules and nothing else, so the import finds no module.
+  write("app/onlyroot.ply", "fn shared() -> Int = 9\n");
+  write("lib/answer.ply", "import onlyroot\npub fn answer() -> Int = onlyroot::shared()\n");
+  let r = on_disk(["check", "app"]);
+  refused(r, "E0106");
+  says(r, "no module named `onlyroot`")
+}
+
+type Version = { major: Int, minor: Int, patch: Int }
+
+fn v(major: Int, minor: Int, patch: Int) -> Version = { major: major, minor: minor, patch: patch }
+
+fn spelled(x: Version) -> String =
+  "{major: " ++ int_to_string(x.major) ++ ", minor: " ++ int_to_string(x.minor) ++ ", patch: "
+    ++ int_to_string(x.patch)
+    ++ "}"
+
+// `manifest` with a version of its own and a dependency carrying a floor, for the version
+// judgments. Two manifests asking different floors of one package is legal; two places holding one
+// package is not.
+fn manifest_at(name: String, version: Version, deps: String) -> String =
+  "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name ++ "\", version: "
+    ++ spelled(version)
+    ++ ", prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: ["
+    ++ deps
+    ++ "], entry: None}\n"
+
+fn dep_at(name: String, floor: Version, at_path: String) -> String =
+  "{name: \"" ++ name ++ "\", prefix: None, min: " ++ spelled(floor) ++ ", source: Path(\""
+    ++ at_path
+    ++ "\")}"
+
+test/nondet "a dependency below the floor its importer asks for is refused" {
+  project([
+    {
+      path: "app/ply.pkg",
+      text: manifest_at("app", v(0, 1, 0), dep_at("lib", v(0, 2, 0), "../lib")),
+    },
+    { path: "app/main.ply", text: "import lib.x\nfn main() -> Int = x::x()\n" },
+    { path: "lib/ply.pkg", text: manifest_at("lib", v(0, 1, 3), "") },
+    { path: "lib/x.ply", text: "pub fn x() -> Int = 1\n" },
+  ]);
+  let r = on_disk(["check", "app"]);
+  refused(r, "E0136");
+  says(r, "is version 0.1.3");
+  says(r, "at least 0.2.0");
+  // The floor is a floor: the same tree with the dependency at or above it checks.
+  write("lib/ply.pkg", manifest_at("lib", v(0, 2, 0), ""));
+  ok(on_disk(["check", "app"]))
+}
+
+// The ordinary diamond: two packages depend on one package, at two floors of it. One version
+// serves the closure, so this is what a program over a shared dependency looks like.
+test/nondet "two dependents of one package resolve to its one version" {
+  project([
+    {
+      path: "app/ply.pkg",
+      text: manifest_at(
+        "app",
+        v(0, 1, 0),
+        dep_at("left", v(0, 1, 0), "../left") ++ ", " ++ dep_at("right", v(0, 1, 0), "../right"),
+      ),
+    },
+    {
+      path: "app/main.ply",
+      text: "import left.l\nimport right.r\nfn main() -> Int = l::l() + r::r()\n",
+    },
+    {
+      path: "left/ply.pkg",
+      text: manifest_at("left", v(0, 1, 0), dep_at("shared", v(0, 1, 0), "../shared")),
+    },
+    { path: "left/l.ply", text: "import shared.s\npub fn l() -> Int = s::s()\n" },
+    {
+      path: "right/ply.pkg",
+      text: manifest_at("right", v(0, 1, 0), dep_at("shared", v(0, 3, 0), "../shared")),
+    },
+    { path: "right/r.ply", text: "import shared.s\npub fn r() -> Int = s::s()\n" },
+    { path: "shared/ply.pkg", text: manifest_at("shared", v(0, 3, 0), "") },
+    { path: "shared/s.ply", text: "pub fn s() -> Int = 20\n" },
+  ]);
+  let r = on_disk(["run", "app"]);
+  assert(r.code == 0, Some(stderr(r)));
+  assert(string_contains(stdout(r), "40"), Some(said(r)))
+}
+
+test/nondet "one package of one name at two places has no version to pick" {
+  let sides = fold(
+    [{ side: "left", other: "d1" }, { side: "right", other: "d2" }],
+    [],
+    |acc: List<Source>, c: { side: String, other: String }|
+      fold(
+        [
+          {
+            path: c.side ++ "/ply.pkg",
+            text: manifest_at(c.side, v(0, 1, 0), dep_at("shared", v(0, 1, 0), "../" ++ c.other)),
+          },
+          {
+            path: c.side ++ "/" ++ c.side ++ ".ply",
+            text: "pub fn " ++ c.side ++ "() -> Int = 1\n",
+          },
+        ],
+        acc,
+        push,
+      ),
+  );
+  let shared = [
+    { path: "d1/ply.pkg", text: manifest_at("shared", v(0, 1, 0), "") },
+    { path: "d1/s.ply", text: "pub fn s() -> Int = 1\n" },
+    { path: "d2/ply.pkg", text: manifest_at("shared", v(0, 2, 0), "") },
+    { path: "d2/s.ply", text: "pub fn s() -> Int = 1\n" },
+  ];
+  project(
+    fold(
+      fold(shared, sides, push),
+      [
+        {
+          path: "app/ply.pkg",
+          text: manifest_at(
+            "app",
+            v(0, 1, 0),
+            dep_at("left", v(0, 1, 0), "../left") ++ ", "
+              ++ dep_at("right", v(0, 1, 0), "../right"),
+          ),
+        },
+        { path: "app/main.ply", text: "fn main() -> Int = 1\n" },
+      ],
+      push,
+    ),
+  );
+  let r = on_disk(["check", "app"]);
+  refused(r, "E0137");
+  says(r, "`shared` is reached at two places");
+  says(r, "`left` wants");
+  says(r, "`right` wants")
+}
+
+// A build records what it resolved, and refuses what the record does not describe.
+test/nondet "a build pins its dependencies and refuses what the lock pins differently" {
+  graph();
+  let build = || on_disk(["build", "app", "-o", "app.plyx"]);
+  ok(build());
+  let lock = lock_of("app/ply.lock");
+  fold(
+    ["\"name\":\"lib\"", "\"name\":\"base\"", "\"version\":\"0.0.1\"", "\"digest\":\"b3:"],
+    (),
+    |u: Unit, want: String|
+      assert(string_contains(lock, want), Some("`" ++ want ++ "` is not in the lock: " ++ lock)),
+  );
+  // The closure's packages are pinned, and the project's own sources are not.
+  assert(!string_contains(lock, "\"name\":\"app\""), Some(lock));
+  // The same tree builds again without moving the lock: a pin is not rewritten per run.
+  ok(build());
+  assert(lock_of("app/ply.lock") == lock, None);
+  // A dependency whose bytes moved is not the one the lock pins.
+  write("lib/answer.ply", "import base.deep\npub fn answer() -> Int = deep::deep() + 1\n");
+  let moved = build();
+  refused(moved, "E0138");
+  says(moved, "`lib` is not what `ply.lock` pins");
+  assert(lock_of("app/ply.lock") == lock, None);
+  // Pinning what is on disk now is a deliberate act, and the lock says so afterwards.
+  assert(fs.remove[cwd]("app/ply.lock"), None);
+  ok(build());
+  let repinned = lock_of("app/ply.lock");
+  assert(repinned != lock, Some("the digest did not move with the sources"));
+  let again = build();
+  assert(again.code == 0, Some("the new pin is the one in force: " ++ said(again)))
+}
+
+// A file argument's package is its directory: resolving the file pins what that directory's
+// manifest declares, in the lock beside it.
+test/nondet "resolving a file writes the lock beside it" {
+  graph();
+  let r = on_disk(["resolve", "app/main.ply"]);
+  ok(r);
+  assert(string_contains(stdout(r), "resolved 2 packages · app/ply.lock"), Some(stdout(r)));
+  let lock = lock_of("app/ply.lock");
+  assert(string_contains(lock, "\"name\":\"lib\""), Some(lock));
+  assert(string_contains(lock, "\"name\":\"base\""), Some(lock));
+  assert(fs.exists[cwd]("app/main.ply"), None)
+}
+
+// A build of one file is held to the lock beside it, as a build of its directory is.
+test/nondet "building a file is held to the lock beside it" {
+  graph();
+  ok(on_disk(["resolve", "app"]));
+  let lock = lock_of("app/ply.lock");
+  ok(on_disk(["build", "app/main.ply", "-o", "app.plyx"]));
+  assert(lock_of("app/ply.lock") == lock, None);
+  write("lib/answer.ply", "import base.deep\npub fn answer() -> Int = deep::deep() + 1\n");
+  let r = on_disk(["build", "app/main.ply", "-o", "stale.plyx"]);
+  refused(r, "E0138");
+  says(r, "`lib` is not what `ply.lock` pins");
+  assert(!exists("stale.plyx"), Some("an artifact was written"));
+  assert(lock_of("app/ply.lock") == lock, None)
+}
+
+test/nondet "a lockfile nothing can read is refused rather than ignored" {
+  graph();
+  write("app/ply.lock", "{ not json");
+  refused(on_disk(["build", "app", "-o", "app.plyx"]), "E0139");
+  assert(!exists("app.plyx"), Some("an artifact was written"))
+}
+
+// `ply resolve` is how a lockfile is written deliberately, after a dependency changed or in a fresh
+// checkout, and `ply why` says how a package got here.
+test/nondet "resolve writes the lock and why names the path to a package" {
+  graph();
+  let r = on_disk(["resolve", "app"]);
+  ok(r);
+  assert(string_contains(stdout(r), "resolved 2 packages"), Some(stdout(r)));
+  let lock = lock_of("app/ply.lock");
+  assert(string_contains(lock, "\"name\":\"lib\""), Some(lock));
+  assert(string_contains(lock, "\"name\":\"base\""), Some(lock));
+  // Why: the root's own module reaches `lib`, and `lib`'s reaches `base`.
+  let why = on_disk(["why", "lib", "app"]);
+  ok(why);
+  assert(string_contains(stdout(why), "app -> lib"), Some(stdout(why)));
+  assert(string_contains(stdout(why), "0.0.1"), Some(stdout(why)));
+  let base = json_of(on_disk(["why", "base", "app", "--json"]));
+  assert(str(at(base, "command")) == "why", Some(shown(base)));
+  assert(str(at(base, "package")) == "base", Some(shown(base)));
+  assert(at(base, "path") == Array([Str("app"), Str("lib"), Str("base")]), Some(shown(base)));
+  assert(!truth(at(base, "root")), Some(shown(base)));
+  assert(string_starts_with(str(at(base, "digest")), "b3:"), Some(shown(base)));
+  // The root package is what reaches, so its path is itself.
+  let app = json_of(on_disk(["why", "app", "app", "--json"]));
+  assert(truth(at(app, "root")), Some(shown(app)));
+  assert(at(app, "path") == Array([Str("app")]), Some(shown(app)));
+  // A name nothing declares is a query that found nothing, not a build failure.
+  let nope = on_disk(["why", "nope", "app"]);
+  refused(nope, "E0101");
+  says(nope, "is not a package in this closure")
+}
+
+test/nondet "a resolve re-pins a dependency whose sources moved" {
+  graph();
+  ok(on_disk(["resolve", "app"]));
+  let before = lock_of("app/ply.lock");
+  write("base/deep.ply", "pub fn deep() -> Int = 8\n");
+  // The build refuses what the lock pins differently, and `resolve` is what accepts it.
+  refused(on_disk(["build", "app", "-o", "app.plyx"]), "E0138");
+  ok(on_disk(["resolve", "app"]));
+  assert(lock_of("app/ply.lock") != before, Some("the pin did not move with the sources"));
+  ok(on_disk(["build", "app", "-o", "app.plyx"]))
+}
+
+// A library is a package, not a program: `ply build` writes the package itself, its sources, its
+// manifest and a compiled unit, under a container of its own.
+test/nondet "a library builds as a package and never as a program" {
+  fresh();
+  ok(on_disk(["new", "core", "--lib"]));
+  let built = on_disk(["build", "core", "--json"]);
+  ok(built);
+  let report = json_of(built);
+  assert(str(at(report, "command")) == "build", Some(shown(report)));
+  assert(truth(at(report, "library")), Some(shown(report)));
+  assert(str(at(report, "name")) == "core", Some(shown(report)));
+  assert(str(at(report, "version")) == "0.1.0", Some(shown(report)));
+  assert(int(at(report, "definitions")) == 1, Some(shown(report)));
+  assert(string_starts_with(str(at(report, "digest")), "b3:"), Some(shown(report)));
+  assert(truth(at(report, "unit")), Some(shown(report)));
+  let bytes = match fs.read_file[cwd]("core.plyz") {
+    Some(b) -> b,
+    None -> panic("the library is written"),
+  };
+  assert(bytes_slice(bytes, 0, 8) == b"PLYLIB01", Some("a library is not a program container"));
+  // A library is never entered: reading it as sources would report a container as text.
+  let ran = on_disk(["run", "core.plyz"]);
+  refused(ran, "");
+  says(ran, "is a library, and nothing to run");
+  says(ran, "declare it in a `ply.pkg`");
+  // A program package still builds a `.plyx`, and the library's own tests still run.
+  ok(on_disk(["new", "app"]));
+  let app = on_disk(["build", "app"]);
+  ok(app);
+  assert(exists("main.plyx"), Some(stdout(app)));
+  ok(on_disk(["test", "core"]))
+}
+
+// `git` run in `dir`, which must succeed.
+fn git(dir: String, args: List<String>) -> String = {
+  let f = process.spawn[git](args, dir, environment([]));
+  let out = string_of_bytes_lossy(f.out);
+  match f.ended {
+    Exited(0) -> out,
+    _ -> panic("`git " ++ string::join(args, " ") ++ "`: " ++ string_of_bytes_lossy(f.err)),
+  }
+}
+
+// A git repository with the one more commit `HEAD` points at, and that commit's id.
+fn git_repo(dir: String, source: String) -> String = {
+  if !fs.exists[cwd](dir ++ "/.git") {
+    let _ = git(dir, ["init", "--quiet"]);
+    ()
+  };
+  write(dir ++ "/ply.pkg", manifest("gitlib", ""));
+  write(dir ++ "/answer.ply", source);
+  let _ = git(dir, ["add", "-A"]);
+  let _ = git(dir, [
+    "-c",
+    "user.email=t@test",
+    "-c",
+    "user.name=test",
+    "commit",
+    "--quiet",
+    "-m",
+    "a",
+  ]);
+  string_trim(git(dir, ["rev-parse", "HEAD"]))
+}
+
+fn git_project(lib: String, rev: String) -> Unit = {
+  write(
+    "app/ply.pkg",
+    manifest(
+      "app",
+      "{name: \"gitlib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Git(\"" ++ lib
+        ++ "\", \""
+        ++ rev
+        ++ "\")}",
+    ),
+  );
+  write(
+    "app/main.ply",
+    "import gitlib.answer\nfn main() -> Int = answer::answer()\ntest \"answers\" { assert_eq(answer::answer(), 7) }\n",
+  )
+}
+
+fn lib_dir() -> String = working() ++ "/lib"
+
+test/nondet "a git dependency is fetched and reads like any other package" {
+  fresh();
+  assert(fs.create_dir[cwd]("lib"), None);
+  let rev = git_repo("lib", "pub fn answer() -> Int = 7\n");
+  git_project(lib_dir(), rev);
+  // The walk fetches it: `check` loads through the Ply walker, `run` through the machine's.
+  fold(
+    [
+      { args: ["check", "app"], want: "checked 2 modules" },
+      { args: ["run", "app"], want: "7" },
+      { args: ["test", "app"], want: "1 passed" },
+    ],
+    (),
+    |u: Unit, c: { args: List<String>, want: String }| {
+      let r = on_disk(c.args);
+      assert(r.code == 0, Some(string::join(c.args, " ") ++ ": " ++ said(r)));
+      assert(string_contains(said(r), c.want), Some(string::join(c.args, " ") ++ ": " ++ said(r)))
+    },
+  );
+  // The tree is fetched under the project's own cache, once, and `resolve` pins what it read.
+  assert(exists("app/.ply-cache/git"), None);
+  ok(on_disk(["resolve", "app"]));
+  assert(string_contains(lock_of("app/ply.lock"), "\"name\":\"gitlib\""), None);
+  // The cache is reused: a second load does not need a repository to fetch from.
+  assert(fs.remove_tree[cwd]("lib"), None);
+  ok(on_disk(["check", "app"]))
+}
+
+test/nondet "a git dependency whose branch moved is not what the lock pins" {
+  fresh();
+  assert(fs.create_dir[cwd]("lib"), None);
+  let _ = git_repo("lib", "pub fn answer() -> Int = 7\n");
+  git_project(lib_dir(), "HEAD");
+  write("app/main.ply", "import gitlib.answer\nfn main() -> Int = answer::answer()\n");
+  ok(on_disk(["resolve", "app"]));
+  let before = lock_of("app/ply.lock");
+  // A branch means what it means today, and the cache holds the tree the resolve fetched. A cleared
+  // cache is what asks the branch again, and then the lock is what says the sources moved, before a
+  // build writes anything.
+  let _ = git_repo("lib", "pub fn answer() -> Int = 8\n");
+  assert(fs.remove_tree[cwd]("app/.ply-cache/git"), None);
+  refused(on_disk(["build", "app", "-o", "app.plyx"]), "E0138");
+  assert(lock_of("app/ply.lock") == before, None);
+  // Accepting the new tip is `ply resolve`, and then the build is green again.
+  ok(on_disk(["resolve", "app"]));
+  assert(lock_of("app/ply.lock") != before, None);
+  ok(on_disk(["build", "app", "-o", "app.plyx"]))
+}
+
+// `ply vendor` copies the closure into `vendor/`, and a check that reads it needs neither the
+// repository the dependency came from nor the cache the fetch used.
+test/nondet "a vendored project builds with no repository and no cache" {
+  fresh();
+  assert(fs.create_dir[cwd]("lib"), None);
+  let _ = git_repo("lib", "pub fn answer() -> Int = 7\n");
+  write("lib/data.txt", "a package ships what it ships\n");
+  let rev = git_repo("lib", "pub fn answer() -> Int = 7\n");
+  git_project(lib_dir(), rev);
+  let r = on_disk(["vendor", "app"]);
+  ok(r);
+  assert(string_contains(stdout(r), "vendored 1 package"), Some(stdout(r)));
+  assert(string_contains(stdout(r), "vendor/gitlib"), Some(stdout(r)));
+  // The package whole: its `ply.pkg`, its modules, and the data it ships, and not the repository the
+  // fetch came from.
+  assert(exists("app/vendor/gitlib/ply.pkg"), None);
+  assert(exists("app/vendor/gitlib/answer.ply"), None);
+  assert(exists("app/vendor/gitlib/data.txt"), None);
+  assert(!exists("app/vendor/gitlib/.git"), None);
+  let index = lock_of("app/vendor/index");
+  assert(string_starts_with(index, "git+"), Some(index));
+  assert(string_ends_with(index, "vendor/gitlib\n"), Some(index));
+  // Vendoring twice writes the same index: one closure, one file.
+  ok(on_disk(["vendor", "app"]));
+  assert(lock_of("app/vendor/index") == index, None);
+  // With the repository and the cache gone, the walk reads `vendor/` and asks for nothing.
+  assert(fs.remove_tree[cwd]("lib"), None);
+  assert(fs.remove_tree[cwd]("app/.ply-cache"), None);
+  fold(
+    [
+      { args: ["check", "app"], want: "checked 3 modules" },
+      { args: ["run", "app"], want: "7" },
+      { args: ["resolve", "app"], want: "1 package" },
+    ],
+    (),
+    |u: Unit, c: { args: List<String>, want: String }| {
+      let run = on_disk(c.args);
+      assert(run.code == 0, Some(string::join(c.args, " ") ++ ": " ++ said(run)));
+      assert(
+        string_contains(said(run), c.want),
+        Some(string::join(c.args, " ") ++ ": " ++ said(run)),
+      )
+    },
+  )
+}
+
+test/nondet "a project with no dependencies vendors nothing" {
+  project([{ path: "m.ply", text: "fn main() -> Int = 1\n" }]);
+  let r = on_disk(["vendor"]);
+  ok(r);
+  assert(string_contains(stdout(r), "vendored 0 packages"), Some(stdout(r)));
+  assert(lock_of("vendor/index") == "", None)
+}

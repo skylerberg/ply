@@ -1,0 +1,179 @@
+// The example HTTP endpoint over a real socket under `--host`, and the same program hermetic
+// without it.
+
+import harness (Server, Source, project, repo_file, reserve, serving, connection, exchange, sent,
+                heard, dial, returned, on_disk, spawned, said)
+import std.time (time)
+
+// How long the server has to check the program and bind.
+fn startup_ms() -> Int = 30000
+
+// The example, verbatim: the port and the connection count a test chooses are the run's settings.
+fn hello() -> Unit = project([{ path: "hello.ply", text: repo_file("examples/hello.ply") }])
+
+// Listens on `port` and answers `connections` connections before it returns.
+fn started(port: Int, connections: Int) -> Server =
+  serving(
+    [
+      "run",
+      "--host",
+      "--set",
+      "HELLO_PORT=" ++ int_to_string(port),
+      "--set",
+      "HELLO_CONNECTIONS=" ++ int_to_string(connections),
+    ],
+    [],
+    port,
+  )
+
+test/nondet "a request over a real socket is answered by a Ply program" {
+  let port = reserve();
+  hello();
+  let server = started(port, 1);
+  let response = exchange(
+    connection(server, startup_ms()),
+    b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: ply-test\r\n\r\n",
+  );
+  assert(string_starts_with(response, "HTTP/1.1 200 OK\r\n"), Some("got:\n" ++ response));
+  assert(string_contains(response, "Content-Length: 15\r\n"), Some("got:\n" ++ response));
+  assert(string_contains(response, "Connection: close\r\n"), Some("got:\n" ++ response));
+  assert(string_ends_with(response, "\r\n\r\nhello from ply\n"), Some("got:\n" ++ response));
+  returned(server)
+}
+
+test/nondet "a malformed request is answered 400 and the server survives it" {
+  let port = reserve();
+  hello();
+  let server = started(port, 2);
+  let response = exchange(connection(server, startup_ms()), b"GET /\r\n\r\n");
+  assert(string_starts_with(response, "HTTP/1.1 400 Bad Request\r\n"), Some("got:\n" ++ response));
+  assert(
+    string_ends_with(response, "a request line is `METHOD TARGET VERSION`\n"),
+    Some("got:\n" ++ response),
+  );
+  // The listener is still there, which is the half of the claim a single request cannot make.
+  let second = exchange(
+    connection(server, startup_ms()),
+    b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+  );
+  assert(string_starts_with(second, "HTTP/1.1 200 OK\r\n"), Some("got:\n" ++ second));
+  returned(server)
+}
+
+test/nondet "a request split across writes is read to its terminator" {
+  let port = reserve();
+  hello();
+  let server = started(port, 1);
+  let c = connection(server, startup_ms());
+  fold(
+    [b"GET / HT", b"TP/1.1\r\nHost: 127.0.0", b".1\r\n\r", b"\n"],
+    (),
+    |u: Unit, piece: Bytes| {
+      sent(c, piece);
+      time.sleep_ms(20)
+    },
+  );
+  let response = heard(c, 10000);
+  assert(string_starts_with(response, "HTTP/1.1 200 OK\r\n"), Some("got:\n" ++ response));
+  returned(server)
+}
+
+test/nondet "the same program is hermetic under ply test" {
+  hello();
+  let r = on_disk(["test"]);
+  assert(r.code == 0, Some("got:\n" ++ said(r)));
+  assert(
+    !string_contains(said(r), "E0424"),
+    Some(
+      "the tests handle every `net` and `config` operation themselves, so none reaches the boundary:\n"
+        ++ said(r),
+    ),
+  )
+}
+
+test/nondet "without the flag the program never reaches the socket" {
+  let port = reserve();
+  hello();
+  // `--set` needs `--host`; a run that read this environment would listen where the check looks.
+  let r = spawned(["run"], [
+    { name: "HELLO_PORT", value: int_to_string(port) },
+    { name: "HELLO_CONNECTIONS", value: "1" },
+  ]);
+  assert(r.code != 0, Some("got:\n" ++ said(r)));
+  assert(string_contains(said(r), "E0424"), Some("got:\n" ++ said(r)));
+  assert(
+    string_contains(said(r), "ply_host::config::get") && !string_contains(said(r), "net.listen"),
+    Some("the run should be refused reading its settings, before any socket; got:\n" ++ said(r)),
+  );
+  match dial(port, 250) {
+    Some(c) -> panic("a hermetic run bound port " ++ int_to_string(port)),
+    None -> (),
+  }
+}
+
+fn reaching_test(port: Int) -> Unit =
+  project([
+    {
+      path: "touch.ply",
+      text: "import std.net (net)\n\nfn touch() -> Int / {net.write[listener]} {\n  let l = net.listen[listener]("
+        ++ int_to_string(port)
+        ++ ");\n  net.close[listener](l);\n  l\n}\n\ntest/nondet \"reaches the host\" { assert(touch() > 0) }\n",
+    },
+  ])
+
+test/nondet "a hermetic test that reaches the boundary names the handler it did not use" {
+  reaching_test(reserve());
+  let r = on_disk(["test"]);
+  assert(r.code != 0, Some("got:\n" ++ said(r)));
+  // The failure block prints the message, not the code, and E0424's message is one E0303 cannot
+  // produce.
+  assert(
+    string_contains(said(r), "reached the host boundary in a hermetic run"),
+    Some("got:\n" ++ said(r)),
+  );
+  assert(string_contains(said(r), "ply_host::tcp::listen"), Some("got:\n" ++ said(r)));
+  assert(!string_contains(said(r), "no handler for"), Some("got:\n" ++ said(r)))
+}
+
+test/nondet "a host-backed pass is never cached and never satisfies a hermetic run" {
+  reaching_test(reserve());
+  fold(range(0, 2), (), |u: Unit, attempt: Int| {
+    let r = on_disk(["test", "--host"]);
+    assert(r.code == 0, Some("attempt " ++ int_to_string(attempt) ++ ", got:\n" ++ said(r)));
+    assert(string_contains(said(r), "host-backed and not cached"), Some("got:\n" ++ said(r)));
+    assert(
+      !string_contains(said(r), ", 1 cached"),
+      Some("the second run believed the first:\n" ++ said(r)),
+    )
+  });
+  let r = on_disk(["test"]);
+  assert(r.code != 0, Some("a pass earned over a socket satisfied a hermetic run:\n" ++ said(r)));
+  assert(
+    string_contains(said(r), "reached the host boundary in a hermetic run"),
+    Some("got:\n" ++ said(r)),
+  )
+}
+
+test/nondet "task spawn under the flag runs on the production scheduler" {
+  project([
+    {
+      path: "tasks.ply",
+      text:
+        \\fn main() -> Int / {task.write} {
+        \\  let a = task.spawn(|| 1);
+        \\  let b = task.spawn(|| 2);
+        \\  task.join(a) + task.join(b)
+        \\}
+        \\
+    },
+  ]);
+  let r = on_disk(["run", "--host"]);
+  assert(r.code == 0, Some("got:\n" ++ said(r)));
+  assert(string_contains(said(r), "3"), Some("got:\n" ++ said(r)));
+  // Hermetically, the program reaches the boundary and is told both remedies rather than getting
+  // real threads.
+  let hermetic = on_disk(["run"]);
+  assert(hermetic.code != 0, Some("got:\n" ++ said(hermetic)));
+  assert(string_contains(said(hermetic), "E0424"), Some("got:\n" ++ said(hermetic)));
+  assert(string_contains(said(hermetic), "task.spawn"), Some("got:\n" ++ said(hermetic)))
+}

@@ -1,0 +1,520 @@
+// The front-end cache on the path every command takes: a load reads what the last one filed before
+// it analyses, and files what it answered after. A warm check answers what a cold one does; that a
+// seeded analysis is sound through every kind of edit is the compiler's own property, and
+// `crates/ply-compiler/ply/front.ply` tests it over sessions of edits.
+
+import harness (Ran, Server, Source, project, write, read, working, repo, repo_file, on_disk,
+                serving, ended, finished, said, stderr, warm_agrees, seeding, seeding_at, json_of,
+                at, path, items, first, str, int, truth, shown)
+import cli.machine (machine)
+import std.bytes (hex_of)
+import std.fs (fs)
+import std.json (Json)
+import std.string
+
+fn edit(name: String, from: String, to: String) -> Unit =
+  match read(name) {
+    None -> panic("`" ++ name ++ "` reads"),
+    Some(text) -> {
+      assert(
+        string_contains(text, from),
+        Some("`" ++ from ++ "` is not in " ++ name ++ "; the fixture drifted"),
+      );
+      write(name, string::replace(text, from, to))
+    },
+  }
+
+fn removed(name: String) -> Unit = assert(fs.remove[cwd](name), Some("`" ++ name ++ "` is removed"))
+
+fn core() -> String =
+  \\pub type Money = Int
+  \\
+  \\pub type Item =
+  \\  | Book(String, Money)
+  \\  | Note(String)
+  \\
+  \\pub effect db {
+  \\  read  get[r](key: Int) -> Int
+  \\  write put[r](key: Int, value: Int) -> Int
+  \\}
+  \\
+  \\pub fn price(i: Item) -> Money =
+  \\  match i {
+  \\    Book(_, p) -> p,
+  \\    Note(_) -> 0,
+  \\  }
+  \\
+  \\pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))
+  \\
+  \\pub fn label(i: Item) -> String =
+  \\  match i {
+  \\    Book(t, _) -> t,
+  \\    Note(t) -> t,
+  \\  }
+  \\
+  \\test "a note is free" {
+  \\  assert_eq(price(Note("n")), 0)
+  \\}
+  \\
+
+fn shop() -> String =
+  \\import core
+  \\
+  \\fn total(items: List<core::Item>) -> Int =
+  \\  fold(items, 0, |acc, i: core::Item| acc + core::price(i))
+  \\
+  \\fn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)
+  \\
+  \\fn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)
+  \\
+  \\test "a shelf adds up" {
+  \\  assert_eq(total([core::Book("b", 3), core::Note("n")]), 3)
+  \\}
+  \\
+
+fn leaf() -> String = "pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n"
+
+fn corpus() -> Unit =
+  project([
+    { path: "core.ply", text: core() },
+    { path: "shop.ply", text: shop() },
+    { path: "leaf.ply", text: leaf() },
+  ])
+
+// Nothing in the corpus imports a shipped module, so every definition is the project's own.
+test/nondet "a second check is seeded whole and an edit checks only what it moved" {
+  corpus();
+  let cold = seeding();
+  assert(cold.seeded == 0, Some("a cold cache seeds nothing"));
+  let all = cold.checked;
+  assert(all > 0, None);
+  let warm = seeding();
+  assert(
+    warm.seeded == all && warm.checked == 0,
+    Some("a warm check takes every definition from its filed rows"),
+  );
+  // Nothing references `two`, so its own hash is the only one the edit moves.
+  edit("leaf.ply", "one() + one()", "one() + one() + 0");
+  let edited = seeding();
+  assert(
+    edited.seeded == all - 1 && edited.checked == 1,
+    Some("the edited definition is checked and every other one is seeded"),
+  );
+  let _ = warm_agrees("after the edit");
+  ()
+}
+
+test/nondet "a whole editing session agrees at every step" {
+  corpus();
+  let _ = warm_agrees("step 0");
+  let _ = warm_agrees("step 0, warm");
+  edit("leaf.ply", "one() + one()", "one() + 1");
+  let _ = warm_agrees("step 1: body");
+  edit("core.ply", "pub fn label(", "pub fn title(");
+  let _ = warm_agrees("step 2: rename");
+  edit("core.ply", "Money", "Cost");
+  let _ = warm_agrees("step 3: rename a type");
+  write("extra.ply", "import leaf\npub fn four() -> Int = leaf::two() + 2\n");
+  let _ = warm_agrees("step 4: add a file");
+  edit("extra.ply", "leaf::two() + 2", "leaf::two() + 3");
+  let _ = warm_agrees("step 5: edit the new file");
+  removed("extra.ply");
+  let _ = warm_agrees("step 6: delete it again");
+  edit("core.ply", "effect db", "effect ledger");
+  edit("shop.ply", "core::db.", "core::ledger.");
+  let _ = warm_agrees("step 7: rename an effect");
+  ()
+}
+
+fn examples() -> Unit =
+  match fs.list_dir[repo]("examples") {
+    None -> panic("the example corpus must be present"),
+    Some(names) ->
+      project(
+        map(filter(names, |n: String| string_ends_with(n, ".ply")), |n: String|
+          { path: n, text: repo_file("examples/" ++ n) }),
+      ),
+  }
+
+test/nondet "the example corpus agrees cold and warm" {
+  examples();
+  let _ = warm_agrees("cold");
+  let _ = warm_agrees("warm");
+  ()
+}
+
+fn is_word_byte(b: Int) -> Bool =
+  (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128
+
+// Renames every whole-identifier `from` in `name`, so which occurrences move is the program's
+// business and not its layout's.
+fn rename(name: String, from: String, to: String) -> Unit = {
+  let text = match read(name) {
+    Some(t) -> bytes_of_string(t),
+    None -> panic("`" ++ name ++ "` reads"),
+  };
+  let needle = bytes_of_string(from);
+  write(name, string_of_bytes(renamed_from(text, needle, bytes_of_string(to), 0, 0, b"")))
+}
+
+fn renamed_from(
+  text: Bytes,
+  needle: Bytes,
+  to: Bytes,
+  from_at: Int,
+  kept: Int,
+  out: Bytes,
+) -> Bytes =
+  match bytes_index_of_from(text, needle, from_at) {
+    None -> bytes_concat(out, bytes_slice(text, kept, bytes_len(text))),
+    Some(at) -> {
+      let end = at + bytes_len(needle);
+      let before = at > 0 && is_word_byte(bytes_at(text, at - 1));
+      let after = end < bytes_len(text) && is_word_byte(bytes_at(text, end));
+      if before || after { renamed_from(text, needle, to, at + 1, kept, out) } else {
+        renamed_from(
+          text,
+          needle,
+          to,
+          end,
+          end,
+          bytes_concat_all([out, bytes_slice(text, kept, at), to]),
+        )
+      }
+    },
+  }
+
+// Whether a step's edit landed, asked of the checker rather than of the files: `module` declares
+// every name in `now` and none in `gone`, and the program still checks.
+fn landed(
+  answer: Json,
+  step: String,
+  module: String,
+  now: List<String>,
+  gone: List<String>,
+) -> Unit = {
+  let declared = match filter(items(at(answer, "modules")), |m: Json|
+      str(at(m, "name")) == module) {
+    [m, ..] -> map(items(at(m, "items")), str),
+    [] -> panic(step ++ ": the answer has no module `" ++ module ++ "`"),
+  };
+  let has = |n: String| len(filter(declared, |d: String| d == n)) > 0;
+  assert(
+    truth(at(answer, "ok")) && len(filter(now, has)) == len(now) && len(filter(gone, has)) == 0,
+    Some(
+      step ++ ": `" ++ module ++ "` should declare " ++ string::join(now, ", ") ++ " and not "
+        ++ string::join(gone, ", ")
+        ++ " in a program that checks; it declares "
+        ++ string::join(declared, ", ")
+        ++ ", with diagnostics "
+        ++ shown(at(answer, "diagnostics")),
+    ),
+  )
+}
+
+// One cache for every mutation: an invalidation is only ever wrong in some sequence of edits. Real
+// code exercises handlers, regions, `nondet` effects and cross-module types the synthetic corpora
+// do not, and the session ends by undoing every edit so a wrong answer shows up as a final state
+// that is not the one it began in.
+test/nondet "a long session over the example corpus agrees at every step" {
+  examples();
+  let start = warm_agrees("step 0");
+  let original = |name: String| match read(name) { Some(t) -> t, None -> panic(name ++ " reads") };
+  let clock = original("clock.ply");
+  let report = original("report.ply");
+  let ledger = original("ledger.ply");
+
+  write("clock.ply", clock ++ "\npub fn ticks() -> Int = 0\n");
+  let s1 = "step 1: a definition appeared";
+  landed(warm_agrees(s1), s1, "clock", ["clock.ticks"], []);
+
+  write("report.ply", "// a note\n" ++ report);
+  let _ = warm_agrees("step 2: a comment");
+
+  rename("ledger.ply", "presented", "presented_value");
+  rename("report.ply", "presented", "presented_value");
+  let s3 = "step 3: a rename across modules";
+  landed(warm_agrees(s3), s3, "ledger", ["ledger.presented_value"], ["ledger.presented"]);
+
+  rename("report.ply", "Line", "Row");
+  let s4 = "step 4: a type rename";
+  landed(warm_agrees(s4), s4, "report", ["report.Row"], ["report.Line"]);
+
+  write("spare.ply", "pub fn spare() -> Int = 9\n");
+  let _ = warm_agrees("step 5: a module appeared");
+
+  assert(fs.rename[cwd]("spare.ply", "kept.ply"), Some("the module is renamed"));
+  let _ = warm_agrees("step 6: it was renamed");
+
+  removed("kept.ply");
+  let _ = warm_agrees("step 7: and deleted");
+
+  write("clock.ply", clock);
+  write("report.ply", report);
+  write("ledger.ply", ledger);
+  let end = warm_agrees("step 8: back to where it started");
+  assert(start == end, Some("an undone session must land on the state it began in"))
+}
+
+// A deleted import is an error however much of the program the cache still holds rows for.
+test/nondet "deleting a file is reported rather than skipped past" {
+  corpus();
+  write("extra.ply", "import leaf\npub fn three() -> Int = leaf::two()\n");
+  let _ = warm_agrees("cold");
+  removed("leaf.ply");
+  let answer = warm_agrees("a dangling import");
+  assert(int(at(answer, "exit_code")) == 2, Some(shown(answer)));
+  assert(
+    len(filter(items(at(answer, "diagnostics")), |d: Json| str(at(d, "code")) == "E0106")) > 0,
+    Some(shown(answer)),
+  )
+}
+
+fn inspected(name: String) -> Json =
+  match items(at(json_of(on_disk(["cache", "inspect", name, "--json"])), "matches")) {
+    [m, ..] -> m,
+    [] -> panic("the cache holds no `" ++ name ++ "`"),
+  }
+
+// Structurally identical definitions in two modules share a hash while their schemes name different
+// types: each is filed under its own name, and each is seeded with its own row.
+test/nondet "two definitions that share a hash each keep their own interface" {
+  let body = "pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
+  project([{ path: "a.ply", text: body }, { path: "b.ply", text: body }]);
+  let _ = warm_agrees("cold");
+  let warm = warm_agrees("warm");
+  let type_of = |name: String|
+    match filter(items(at(warm, "definitions")), |d: Json| str(at(d, "name")) == name) {
+      [d, ..] -> str(at(d, "type")),
+      [] -> panic("`" ++ name ++ "` is in the answer"),
+    };
+  assert(
+    type_of("a.peel") != type_of("b.peel"),
+    Some("each definition's scheme must name its own module's type"),
+  );
+  let a = inspected("a.peel");
+  let b = inspected("b.peel");
+  assert(
+    str(at(a, "hash")) == str(at(b, "hash")),
+    Some(
+      "the fixture is only interesting while the two hash alike: " ++ shown(a) ++ " " ++ shown(b),
+    ),
+  );
+  // Each has a slot of its own under the shared hash, holding its own interface.
+  assert(str(path(a, ["interface", "type"])) == "(a.Thing) -> Int", Some(shown(a)));
+  assert(str(path(b, ["interface", "type"])) == "(b.Thing) -> Int", Some(shown(b)))
+}
+
+test/nondet "a corrupt front-end cache degrades to a cold check and is repaired" {
+  corpus();
+  let _ = warm_agrees("cold");
+  write(".ply-cache/store.idx", "not an index at all");
+  let r = on_disk(["check", "--json"]);
+  assert(r.code == 0, Some(said(r)));
+  let answer = json_of(r);
+  assert(
+    len(
+        filter(items(at(answer, "diagnostics")), |d: Json|
+          string_starts_with(str(at(d, "code")), "W06")),
+      )
+      > 0,
+    Some("a discarded cache is reported: " ++ shown(answer)),
+  );
+  assert(
+    int(path(answer, ["front_end", "definitions", "seeded"])) == 0,
+    Some("nothing is taken from a cache that did not read"),
+  );
+  let _ = warm_agrees("after the cache was rewritten");
+  assert(seeding().checked == 0, Some("the run that met the damage filed a whole cache"))
+}
+
+// Mangled in the payload rather than replaced: a valid header over undecodable entries is what a
+// half-written append leaves.
+test/nondet "a cache mangled mid-session degrades and recovers" {
+  corpus();
+  let _ = warm_agrees("cold");
+  edit("leaf.ply", "pub fn one() -> Int = 1", "pub fn one() -> Int = 2");
+  let _ = warm_agrees("edited");
+  let data = ".ply-cache/store.dat";
+  let bytes = match fs.read_file[cwd](data) { Some(b) -> b, None -> panic("the data file reads") };
+  let mangled = bytes_concat_all(
+    map(range(0, bytes_len(bytes)), |i: Int|
+      byte_of_int(if i < 64 { bytes_at(bytes, i) } else { bytes_at(bytes, i) ^ 90 })),
+  );
+  assert(fs.write_file[cwd](data, mangled), Some("the data file is written"));
+  let _ = warm_agrees("the cache was mangled");
+  let _ = warm_agrees("and the run after that");
+  ()
+}
+
+// The shape a half-finished garbage collection would leave: an index whose data file is gone.
+test/nondet "fingerprints without their interfaces are refused rather than believed" {
+  corpus();
+  let _ = warm_agrees("cold");
+  removed(".ply-cache/store.dat");
+  let _ = warm_agrees("fingerprints with no interfaces behind them");
+  let _ = warm_agrees("and the run after that");
+  ()
+}
+
+// Only a load of the whole project drops what the cache holds for files it did not read.
+test/nondet "a single-file run does not spoil the whole project run after it" {
+  corpus();
+  let _ = warm_agrees("cold");
+  let r = on_disk(["check", "leaf.ply"]);
+  assert(r.code == 0, Some(said(r)));
+  let stats = json_of(on_disk(["cache", "stats", "--json"]));
+  assert(
+    int(path(stats, ["frontend", "sources"])) >= 3,
+    Some("a single-file run must not have pruned the rest of the project: " ++ shown(stats)),
+  );
+  let _ = warm_agrees("whole project after a single-file run");
+  ()
+}
+
+// Two processes, so each files what it checked while the other may be reading.
+test/nondet "two overlapping runs leave a cache that still agrees" {
+  corpus();
+  let one = serving(["check"], [], 0);
+  let two = serving(["check", "."], [], 0);
+  fold([one, two], (), |u: Unit, s: Server| {
+    let r = finished(ended(s, 120000, "`ply check` never ended"));
+    assert(r.code == 0, Some(said(r)))
+  });
+  let _ = warm_agrees("after two overlapping runs");
+  edit("leaf.ply", "pub fn one() -> Int = 1", "pub fn one() -> Int = 3");
+  let _ = warm_agrees("and an edit after them");
+  ()
+}
+
+fn filed_nothing(what: String) -> Unit =
+  assert(
+    !fs.exists[cwd](".ply-cache/store.idx") && !fs.exists[cwd](".ply-cache/store.dat"),
+    Some(what ++ " filed a front-end cache"),
+  )
+
+// What turns caching off files nothing: `ply build`, `ply hosts`, `--no-cache` and a program's own
+// load of a program.
+test/nondet "a load that does not cache files nothing" {
+  project([
+    { path: "m.ply", text: "pub fn main() -> Int = 1\ntest \"one\" { assert_eq(main(), 1) }\n" },
+  ]);
+  // This test is a program, and loads one through the machine it is lent.
+  match machine.load[run](working(), None, None) {
+    Ok(_) -> (),
+    Err(_) -> panic("the program loads"),
+  };
+  machine.drop[run]();
+  filed_nothing("a program's own load");
+  let tested = on_disk(["test", "--no-cache"]);
+  assert(tested.code == 0, Some(said(tested)));
+  filed_nothing("`ply test --no-cache`");
+  let hosts = on_disk(["hosts"]);
+  assert(hosts.code == 0, Some(said(hosts)));
+  filed_nothing("`ply hosts`");
+  let built = on_disk(["build", ".", "--digest"]);
+  assert(built.code == 0, Some(said(built)));
+  filed_nothing("`ply build`")
+}
+
+fn manifest(name: String, deps: String) -> String =
+  "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name
+    ++ "\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: ["
+    ++ deps
+    ++ "], entry: None}\n"
+
+fn lib_dep(at_path: String) -> String =
+  "{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"" ++ at_path
+    ++ "\")}"
+
+// A dependency's module is filed under its package's identity, so moving the package keeps what was
+// filed for it, and a changed dependency is checked again.
+test/nondet "a dependency module is filed under its package and survives the package moving" {
+  project([
+    { path: "app/ply.pkg", text: manifest("app", lib_dep("../lib")) },
+    { path: "app/main.ply", text: "import lib.answer\nfn main() -> Int = answer::answer()\n" },
+    { path: "lib/ply.pkg", text: manifest("lib", "") },
+    { path: "lib/answer.ply", text: "pub fn answer() -> Int = 42\n" },
+  ]);
+  let r = on_disk(["check", "app"]);
+  assert(r.code == 0, Some(stderr(r)));
+  // The package is checked out somewhere else, and its manifest is unchanged: the rows filed for it
+  // are the moved package's too.
+  assert(fs.create_dir[cwd]("vendor"), None);
+  assert(fs.rename[cwd]("lib", "vendor/lib"), Some("the package moves"));
+  write("app/ply.pkg", manifest("app", lib_dep("../vendor/lib")));
+  assert(seeding_at("app").checked == 0, Some("a moved package keeps the rows filed for it"));
+  // A changed dependency is a different program: its edited definition and the one calling it are
+  // checked.
+  write("vendor/lib/answer.ply", "pub fn answer() -> Int = 43\n");
+  assert(
+    seeding_at("app").checked == 2,
+    Some("the edit and its caller are checked, and nothing else"),
+  )
+}
+
+// A warm `ply prove` answers every obligation from the cache, across modules that import one
+// another.
+test/nondet "a warm prove answers every obligation from the cache" {
+  project([
+    {
+      path: "base.ply",
+      text:
+        \\pub fn one() -> Int = 1
+        \\
+        \\pub fn bump(x: Int) -> Int
+        \\  requires x < 100
+        \\  ensures result > x
+        \\= x + one()
+        \\
+    },
+    {
+      path: "app.ply",
+      text:
+        \\import base
+        \\
+        \\fn more(x: Int) -> Int
+        \\  requires x < 50
+        \\  ensures result > x
+        \\= base::bump(x)
+        \\
+    },
+    {
+      path: "side.ply",
+      text:
+        \\fn zero(x: Int) -> Int
+        \\  ensures result == 0
+        \\= x - x
+        \\
+    },
+  ]);
+  let first_run = on_disk(["prove", "."]);
+  assert(first_run.code == 0, Some(said(first_run)));
+  let r = on_disk(["prove", ".", "--json"]);
+  assert(r.code == 0, Some(said(r)));
+  let v = json_of(r);
+  assert(len(items(at(v, "obligations"))) == 3, Some(shown(v)));
+  assert(
+    int(at(v, "cached")) == 3,
+    Some("every obligation is answered from the cache: " ++ shown(v)),
+  )
+}
+
+// A `reuse fn` is checked whole-program, so a warm check must refuse a broken promise as a cold one
+// does.
+test/nondet "a promise is known on every run and still refused" {
+  project([
+    {
+      path: "grow.ply",
+      text: "reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {\n  let ys = push(xs, n);\n  if len(xs) < 0 { xs } else { ys }\n}\n",
+    },
+  ]);
+  fold(["first", "second"], (), |u: Unit, run: String| {
+    let answer = warm_agrees(run);
+    assert(int(at(answer, "exit_code")) == 2, Some(run ++ ": " ++ shown(answer)));
+    assert(
+      len(filter(items(at(answer, "diagnostics")), |d: Json| str(at(d, "code")) == "E0127")) > 0,
+      Some(run ++ ": " ++ shown(answer)),
+    )
+  })
+}
