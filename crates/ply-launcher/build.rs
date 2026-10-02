@@ -9,32 +9,60 @@
 //! needs the *files*, and the meaning of a manifest is the front end's (`crates/ply-compiler/ply/
 //! pkg.ply`), which this deliberately does not duplicate.
 //!
-//! The store stamps digest the Rust sources, not the binary, so both build profiles file the same.
+//! The store stamps digest sources, not the binary, so both build profiles file the same: the Rust
+//! of what runs a front end or a verdict, and the Ply of `ply` that decides and files each.
+
+#[path = "src/code.rs"]
+mod code;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const EVALUATOR: &[&str] = &["ply-eval", "ply-codegen"];
 
-const RUNTIME: &[&str] = &[
-    "ply-eval",
-    "ply-codegen",
-    "ply-host",
-    "ply-machine",
-    "ply-launcher",
-];
+/// What runs a test or a law. `ply-host` is not: every handler it serves is nondeterministic, so
+/// nothing a store keeps reached it, which `ply-host-tests` holds it to.
+const RUNTIME: &[&str] = &["ply-eval", "ply-codegen", "ply-machine"];
+
+/// The modules of `ply` whose closures load and file a front-end entry, and decide and file a pass
+/// or a claim's evidence.
+const FRONT: &[&str] = &["program"];
+const VERDICT: &[&str] = &["tests", "prove"];
 
 fn main() {
-    let repo = normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    let repo = code::normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    let root = repo.join("crates/ply-cli/ply");
+    let std_dir = repo.join("crates/ply-std/ply");
+    let compiler_dir = repo.join("crates/ply-compiler/ply");
+    let shelf = code::Shelf {
+        std: &std_dir,
+        compiler: &compiler_dir,
+    };
+    let lock = std::fs::read_to_string(repo.join("Cargo.lock")).expect("Cargo.lock reads");
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo.join("Cargo.lock").display()
+    );
     println!(
         "cargo:rustc-env=PLY_EVALUATOR_SOURCES={}",
-        sources_digest(&repo, EVALUATOR, &[])
+        digest(&repo, &crate_files(&repo, EVALUATOR), &[])
     );
     println!(
         "cargo:rustc-env=PLY_RUNTIME_SOURCES={}",
-        sources_digest(&repo, RUNTIME, &["Cargo.lock"])
+        digest(
+            &repo,
+            &crate_files(&repo, RUNTIME),
+            &[code::lock_closure(&lock, RUNTIME).as_bytes()]
+        )
     );
-    let root = repo.join("crates/ply-cli/ply");
+    println!(
+        "cargo:rustc-env=PLY_FRONT_CODE={}",
+        digest(&repo, &code::closure(&shelf, &root, FRONT), &[])
+    );
+    println!(
+        "cargo:rustc-env=PLY_VERDICT_CODE={}",
+        digest(&repo, &code::closure(&shelf, &root, VERDICT), &[])
+    );
     let packages = closure(&root);
 
     // The root package's own modules, as every consumer that names one looks them up.
@@ -81,10 +109,10 @@ fn main() {
 /// The CLI package and, breadth-first, every package it depends on by path: `(directory, key)` with
 /// the root first. A package reachable twice is laid out once.
 fn closure(root: &Path) -> Vec<(PathBuf, String)> {
-    let repo = normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    let repo = code::normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     let mut out: Vec<(PathBuf, String)> = Vec::new();
-    let mut queue: Vec<PathBuf> = vec![normalize(root)];
+    let mut queue: Vec<PathBuf> = vec![code::normalize(root)];
     while let Some(dir) = queue.pop() {
         if !seen.insert(dir.clone()) {
             continue;
@@ -96,10 +124,7 @@ fn closure(root: &Path) -> Vec<(PathBuf, String)> {
             file.display()
         );
         println!("cargo:rerun-if-changed={}", file.display());
-        let text = std::fs::read_to_string(&file).expect("a manifest reads");
-        for dep in path_dependencies(&text) {
-            queue.push(normalize(&dir.join(dep)));
-        }
+        queue.extend(code::path_dependencies(&file));
         let key = dir
             .strip_prefix(&repo)
             .unwrap_or_else(|_| panic!("{} is inside the repository", dir.display()))
@@ -112,24 +137,6 @@ fn closure(root: &Path) -> Vec<(PathBuf, String)> {
 
 fn manifest(dir: &Path) -> PathBuf {
     dir.join("ply.pkg")
-}
-
-/// Every `Path("...")` a manifest names, as written: a build script needs the directories, not the
-/// resolution.
-fn path_dependencies(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(at) = rest.find("Path(\"") {
-        rest = &rest[at + "Path(\"".len()..];
-        match rest.find('"') {
-            Some(end) => {
-                out.push(rest[..end].to_string());
-                rest = &rest[end + 1..];
-            }
-            None => break,
-        }
-    }
-    out
 }
 
 /// The `.ply` modules of one package, ascending by stem, as `(name, path)`.
@@ -154,23 +161,26 @@ fn modules(dir: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Every file under each crate's `src/`, and each named file of the repository, keyed by its path
-/// relative to the repository.
-fn sources_digest(repo: &Path, crates: &[&str], files: &[&str]) -> String {
+/// Every file under each crate's `src/`, and each crate's manifest.
+fn crate_files(repo: &Path, crates: &[&str]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for name in crates {
-        let src = repo.join("crates").join(name).join("src");
-        println!("cargo:rerun-if-changed={}", src.display());
-        walk(&src, &mut paths);
+        let dir = repo.join("crates").join(name);
+        println!("cargo:rerun-if-changed={}", dir.join("src").display());
+        walk(&dir.join("src"), &mut paths);
+        paths.push(dir.join("Cargo.toml"));
     }
-    for file in files {
-        let path = repo.join(file);
-        println!("cargo:rerun-if-changed={}", path.display());
-        paths.push(path);
-    }
+    paths
+}
+
+/// The files keyed by their paths relative to the repository, then `extra`.
+fn digest(repo: &Path, files: &[PathBuf], extra: &[&[u8]]) -> String {
+    let mut paths = files.to_vec();
     paths.sort();
+    paths.dedup();
     let mut h = blake3::Hasher::new();
     for path in &paths {
+        println!("cargo:rerun-if-changed={}", path.display());
         let name = path
             .strip_prefix(repo)
             .expect("every file digested is in the repository")
@@ -182,6 +192,10 @@ fn sources_digest(repo: &Path, crates: &[&str], files: &[&str]) -> String {
         h.update(name.as_bytes());
         h.update(&(bytes.len() as u64).to_le_bytes());
         h.update(&bytes);
+    }
+    for bytes in extra {
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
     }
     h.finalize().to_hex().to_string()
 }
@@ -197,20 +211,4 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
-}
-
-/// Lexical, because a dependency is written as `../../x` and `Path::join` keeps the `..`s: the keys
-/// have to line up with the repository's own paths.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
