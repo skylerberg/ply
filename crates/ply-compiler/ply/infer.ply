@@ -402,9 +402,15 @@ fn with_unified(cx: Cx, u: Unified) -> Cx = { ..cx, subst: u.s, fresh: u.f }
 
 // --- The prelude ----------------------------------------------------------------------
 
-fn prelude_effect_names() -> List<Bytes> = [b"task", b"clock", b"random", b"sim"]
+fn prelude_effect_names() -> List<Bytes> = [b"task", b"clock", b"random", b"sim", b"abort"]
 pub fn is_prelude_effect(name: Bytes) -> Bool = contains_bytes(prelude_effect_names(), name)
 fn simulated_names() -> List<Bytes> = [b"task", b"clock", b"random"]
+
+fn is_abort(e: EffectInfo) -> Bool = e.name == b"abort" && e.module == b""
+
+// A raise does not come back, so a clause for it answers for the whole `handle`, as one that binds
+// `resume` does.
+fn answers_abort(c: HandleClause) -> Bool = is_bare(c.eff) && c.eff.name.name == b"abort"
 
 fn seed_atom() -> Atom = { effect: b"sim", resource: RSingleton, mode: MRead, op: None }
 
@@ -577,7 +583,7 @@ fn prelude_op(
     }),
   }
 
-fn prelude_effects() -> List<EffectInfo> = {
+pub fn prelude_effects() -> List<EffectInfo> = {
   let ta = TyVar(0);
   let body = t_fn([], ta, row_open(0));
   let task = con1(b"Task", ta);
@@ -624,6 +630,14 @@ fn prelude_effects() -> List<EffectInfo> = {
       nondet: false,
       at: none,
       ops: [prelude_op(b"seed", MRead, [], [], [], t_int(), row_empty())],
+    },
+    {
+      name: b"abort",
+      module: b"",
+      simple_name: b"abort",
+      nondet: false,
+      at: none,
+      ops: [prelude_op(b"raise", MRead, [0], [], [t_string()], ta, row_empty())],
     },
   ]
 }
@@ -1859,7 +1873,7 @@ fn collect_effects(cx: Cx, m: Mod) -> Cx =
             bytes_concat_all([b"`", name, b"` is a prelude effect"]),
             b"declared by the language",
             [
-              b"the language declares `task`, `clock`, `random` and `sim`; `simulate { .. }` handles the first three",
+              b"the language declares `task`, `clock`, `random`, `sim` and `abort`; `simulate { .. }` handles the first three",
               bytes_concat_all([
                 b"rename this effect, or put it in a named module, where its program-wide name would be `<module>.",
                 def.name.name,
@@ -4632,11 +4646,12 @@ fn infer_handle(
   let spawned = { before: spawn_counts(cx), after: spawn_counts(b.cx) };
   let general = fold(clauses, false, |acc: Bool, c: HandleClause|
     acc || (match c.resume { Some(_) -> true, None -> false }));
+  let escapes = fold(clauses, general, |acc: Bool, c: HandleClause| acc || answers_abort(c));
   let cont: { cx: Cx, v: Option<Int> } = if general {
     let o: WithVar = new_row_var(b.cx);
     { cx: o.cx, v: Some(o.v) }
   } else { { cx: b.cx, v: None } };
-  let result_var: { cx: Cx, t: Option<Type> } = if general {
+  let result_var: { cx: Cx, t: Option<Type> } = if escapes {
     let o: WithTy = new_ty(cont.cx);
     { cx: o.cx, t: Some(o.t) }
   } else { { cx: cont.cx, t: None } };
@@ -4725,6 +4740,7 @@ fn infer_handle(
                   Some(t) -> { ..bound, env: env_bind(bound.env, t.name, mono(t_string())) },
                   None -> bound,
                 };
+                let raise = is_abort(hit.info);
                 let with_resume: Cx = match clause.resume {
                   Some(k) -> {
                     let result = match result_var.t {
@@ -4735,13 +4751,23 @@ fn infer_handle(
                       Some(v) -> v,
                       None -> panic("a general clause is present"),
                     };
-                    {
+                    let bound_k: Cx = {
                       ..with_label,
                       env: env_bind(
                         with_label.env,
                         k.name,
                         mono(t_fn([shape.ret], result, row_open(row))),
                       ),
+                    };
+                    if !raise { bound_k } else {
+                      err1(
+                        bound_k,
+                        b"E0201",
+                        k.span,
+                        b"a clause for `abort.raise` cannot bind `resume`",
+                        b"a raise does not come back to be resumed",
+                        [b"drop `resume`: the clause's value is the `handle`'s"],
+                      )
                     }
                   },
                   None -> with_label,
@@ -4757,7 +4783,15 @@ fn infer_handle(
                       body_.ty,
                       b"a clause that binds a continuation returns the `handle`'s result",
                     ).cx,
-                  None -> {
+                  None -> if raise {
+                    expect(
+                      popped,
+                      expr_span(clause.body),
+                      match result_var.t { Some(t) -> t, None -> shape.ret },
+                      body_.ty,
+                      b"a clause for `abort.raise` answers for the whole `handle`",
+                    ).cx
+                  } else {
                     let x: Expected = expect(
                       popped,
                       expr_span(clause.body),
@@ -9426,6 +9460,40 @@ test "a clause for an operation discharges that operation's atom" {
       ),
     ),
     [b"E0305"],
+  )
+}
+
+test "the prelude's effect names are the effects it declares" {
+  assert_eq(prelude_effect_names(), map(prelude_effects(), |e: EffectInfo| e.name))
+}
+
+test "a clause for `abort.raise` answers for the whole `handle`, and binds no `resume`" {
+  let raises = b"fn digit(b: Int) -> Int / {abort.raise} = if b >= 48 && b <= 57 { b - 48 } else { abort.raise(\"not a digit\") }\n";
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        raises,
+        b"fn digit_or(b: Int) -> Result<Int, String> / {} = handle { digit(b) } with { abort.raise(m) -> Err(m), return v -> Ok(v) }",
+      ),
+    ),
+    [],
+  );
+  assert_eq(check_codes(b"fn f() -> Int / {} = handle { 1 } with { abort.raise(m) -> m }"), [
+    b"E0201",
+  ]);
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int / {} = handle { abort.raise(\"x\") } with { abort.raise(m) resume k -> 0 }",
+    ),
+    [b"E0201"],
+  )
+}
+
+test "a raise is in the row, and a clause for it discharges it" {
+  assert_eq(check_codes(b"fn f() -> Int / {} = abort.raise(\"x\")"), [b"E0302"]);
+  assert_eq(
+    check_codes(b"fn f() -> Int / {} = handle { abort.raise(\"x\") } with { abort.raise(m) -> 0 }"),
+    [],
   )
 }
 

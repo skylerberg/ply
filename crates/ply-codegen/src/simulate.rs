@@ -3,7 +3,8 @@
 
 use crate::heap::{self, Word};
 use crate::rt::{
-    Ctx, FAILED_UNWIND, Frames, HandlerFrame, call_value, drop_frame, inherit_frames, values_taken,
+    Ctx, FAILED_ABORT, FAILED_UNWIND, Frames, HandlerFrame, call_value, drop_frame, inherit_frames,
+    values_taken,
 };
 use crate::stack::{Stack, switch};
 use ply_eval::host::Pending;
@@ -357,7 +358,8 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
         }
         Request::Failed => {
             release(c, task);
-            if c.failed == FAILED_UNWIND {
+            // Bound for a frame around the region, which carries it on once the region is over.
+            if c.failed == FAILED_UNWIND || c.failed == FAILED_ABORT {
                 return Err(None);
             }
             let failure = c.diagnostic.take().unwrap_or_else(|| {

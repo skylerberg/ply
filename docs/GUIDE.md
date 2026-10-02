@@ -725,7 +725,7 @@ nondet effect clock {
 Each operation is `read` or `write`. `[r]` makes it resource-parameterized: a
 perform must supply a label (`E0304`). `nondet` marks results that are not a
 function of program state (§8.3). Effects are nominal. `task`, `clock`,
-`random`, `sim` and `cell` are taken (`E0105`).
+`random`, `sim`, `abort` and `cell` are taken (`E0105`).
 
 An operation's type parameters sit just before its parameters,
 `read take[r]<a>(key: Int) -> a`, and are its only type variables: its
@@ -879,7 +879,8 @@ by its type.
 
 In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
 continuation; the clause then has the `handle`'s type and may call `k` any
-number of times. Without `resume`, a clause's value returns to the perform site.
+number of times. Without `resume`, a clause's value returns to the perform site,
+except a clause for `abort.raise` (§6.8).
 
 ### 6.7 Unhandled effects
 
@@ -889,6 +890,30 @@ escaped inference (a compiler defect). `E0305`: a `handle` lacks a clause for
 an operation its body performs on an atom it handles. `E0424`: an operation
 reached the host boundary with nothing bound — pass `--host` or handle it
 (§14).
+
+### 6.8 Raising
+
+```ply
+fn digit(b: Int) -> Int / {abort.raise} =
+  if b >= 48 && b <= 57 { b - 48 } else { abort.raise("not a digit") }
+
+fn digit_or(b: Int, fallback: Int) -> Int / {} =
+  handle { digit(b) } with { abort.raise(reason) -> fallback }
+```
+
+The prelude declares `effect abort { read raise<a>(message: String) -> a }`.
+`abort.raise(m)` puts `abort.raise` in the row as any perform does, and does not
+come back. A clause for it has the `handle`'s type: its value is the `handle`'s,
+`return` is not applied to it, and it cannot bind `resume` (`E0201`). It runs
+outside its `handle`, once the body is abandoned and the regions the body opened
+are closed, so a raise in another clause goes to a `handle` further out than the
+one whose clause raised. A raise no clause answers ends the run, as `panic`
+does (`E0502`).
+
+A `parallel` branch's raise is answered around the block. A task's raise goes
+to the task's own `handle`s and then to those around its `simulate` region,
+never to the copies its spawn inherited (§9); outside `simulate` it ends the
+run. A `cell_update` whose function raised leaves the cell as it was.
 
 ## 7. Cells and regions
 
@@ -1244,7 +1269,7 @@ authority when this page and it disagree.
 | --- | --- |
 | `assert(cond: Bool, message: Option<String> = None) -> Unit` | `E0501` |
 | `assert_eq<a>(actual: a, expected: a) -> Unit` | `E0501` |
-| `panic<a>(message: String) -> a` | `E0502` |
+| `panic<a>(message: String) -> a` | `E0502`; no `handle` answers it, unlike `abort.raise` (§6.8) |
 | `compare<a>(x: a, y: a) -> Ordering` | total order; needs `derivable(ord, a)` |
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same, under a reserved name |
 | `min`, `max` `(a: Int, b: Int) -> Int` | |
@@ -3121,8 +3146,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 
 ## 18. What Ply does not have
 
-* No loops, `break` or `return` (`?` is the only early exit); no mutable
-  variables; no exceptions; no typeclasses, implicits or method syntax; no
+* No loops, `break` or `return` (`?` is the only early exit, and `abort.raise`
+  the only one past the caller, §6.8); no mutable variables; no exceptions
+  outside the row; no typeclasses, implicits or method syntax; no
   modules-as-values or first-class effects; no `unsafe` or FFI.
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads; only a `parallel` block's branches run on threads
