@@ -480,18 +480,18 @@ fn work(n: Int) -> Int / {clock.read, clock.write} {
   clock.now() + n
 }
 
-fn ordered(seed: Int) -> Int =
+fn ordered(seed: Int) -> Int / {sim.read} =
   simulate {
     let a = task.spawn(|| work(seed));
     let b = task.spawn(|| work(seed * 2));
     task.join(a) * 1000 + task.join(b)
   }
 
-fn timed(n: Int) -> Int = simulate { clock.sleep(n); clock.now() }
+fn timed(n: Int) -> Int / {sim.read} = simulate { clock.sleep(n); clock.now() }
 
-fn drawn(bound: Int) -> Int = simulate { random.below(bound) * 7 + random.below(bound) }
+fn drawn(bound: Int) -> Int / {sim.read} = simulate { random.below(bound) * 7 + random.below(bound) }
 
-fn racing(n: Int) -> Int =
+fn racing(n: Int) -> Int / {sim.read} =
   with_cell[r](0) { c ->
     simulate {
       let t = task.spawn(|| {
@@ -702,7 +702,7 @@ fn joined(s: String) -> String =
     return x -> x
   }
 
-fn shared(seed: Int) -> Int =
+fn shared(seed: Int) -> Int / {cell.read[trace], cell.write[trace]} =
   with_cell[trace](seed) { c -> {
     let answer = handle {
       let b = amb.flip[coin]();
@@ -725,7 +725,7 @@ fn siblings(seed: Int) -> Int =
     return x -> x
   }
 
-fn across(seed: Int) -> Int =
+fn across(seed: Int) -> Int / {cell.read[n], cell.write[n], sim.read} =
   with_cell[n](seed) { c -> {
     handle {
       simulate {
