@@ -12,11 +12,11 @@
 #       own, out of the report.
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
 #   ci-corpus.sh mark                  the moment `keep` gathers from
-#   ci-corpus.sh keep DIR              the C `ply` emitted and compiled since `mark`, into DIR for a
-#                                      later run: a body is keyed by its definition, the emitter and
-#                                      the runtime's sources, so another tree reuses what still
-#                                      applies. The packages' stores stay out: they hold test results,
-#                                      which a runtime a later run builds could not vouch for.
+#   ci-corpus.sh keep DIR              the C `ply` emitted, compiled or read since `mark`, into DIR
+#                                      for a later run: a body is keyed by its definition, the emitter
+#                                      and the runtime's sources, so another tree reuses what still
+#                                      applies. The stages are build-ply's to ship, and the packages'
+#                                      stores are carried apart.
 #   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
 #   ci-corpus.sh upstream-mark         the moment `upstream-new` gathers from
 #   ci-corpus.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
@@ -223,7 +223,7 @@ case "${1:-}" in
     [ -f "$mark" ] || { echo "nothing is marked: run 'ci-corpus.sh mark' before the runs" >&2; exit 2; }
     rm -rf "$dir"
     mkdir -p "$dir"
-    (cd "$caches" && find ply-c-cache ply-c-stage -type f -newer "$mark" -print0 2>/dev/null |
+    (cd "$caches" && find ply-c-cache -type f -newer "$mark" -print0 2>/dev/null |
       tar --null -T - -cf -) | tar -xf - -C "$dir" || exit 1
     du -sh "$dir"
     ;;
