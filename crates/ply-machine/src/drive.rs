@@ -10,7 +10,7 @@ use crate::config::Configuration;
 use crate::hosts::Hosts;
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
-use crate::support::{enter_constant, prover_backend, select_profile};
+use crate::support::{prover_backend, select_profile};
 use ply_eval::{
     CheckOutput, Diagnostic, Ended, Front, ModuleName, SourceMap, Span, Symbol, Value as PlyValue,
     codes,
@@ -39,7 +39,6 @@ pub struct RunOptions {
     pub tls: crate::options::TlsOptions,
     pub fs: Vec<ply_host::fs::RootSpec>,
     pub exec: Vec<ply_host::process::ExecSpec>,
-    pub config: crate::config::ConfigOptions,
     pub trace: crate::trace::TraceOptions,
     pub shutdown: crate::options::ShutdownOptions,
     pub profile: String,
@@ -61,7 +60,6 @@ impl Default for RunOptions {
             tls: crate::options::TlsOptions::default(),
             fs: Vec::new(),
             exec: Vec::new(),
-            config: crate::config::ConfigOptions::default(),
             trace: crate::trace::TraceOptions::default(),
             shutdown: crate::options::ShutdownOptions::default(),
             profile: "development".to_string(),
@@ -269,6 +267,8 @@ pub struct Measured {
 pub struct Drive {
     options: RunOptions,
     target: Target,
+    /// The target's compiled unit, built once for the schema and the binding alike.
+    tier: Option<&'static dyn ply_eval::Provider>,
     bound: Option<(String, Bound)>,
     /// What the calls since the last `accounting` read measured, reset by that read.
     accounting: Measured,
@@ -281,6 +281,7 @@ impl Drive {
         Ok(Drive {
             options,
             target,
+            tier: None,
             bound: None,
             accounting: Measured::default(),
         })
@@ -301,13 +302,35 @@ impl Drive {
             Target::Deployed(d) => d.path.clone(),
         });
         self.target = Target::open(&path, Some(front))?;
+        self.tier = None;
         self.bound = None;
         Ok(())
     }
 
-    /// Bind the hosts `entry` may reach; the disclosure a `bound` op hands back. Before the
-    /// entry runs, so a run that fails to bind never started.
-    pub fn bound(&mut self, entry: &str) -> Result<Disclosed, Refused> {
+    fn tier(&mut self) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+        if let Some(tier) = self.tier {
+            return Ok(tier);
+        }
+        let tier = self.target.tier(&self.options)?;
+        self.tier = Some(tier);
+        Ok(tier)
+    }
+
+    /// The value of the definition `--config-schema` names, entered on the target's own unit.
+    pub fn schema(&mut self, name: &str) -> Result<ply_eval::Plain, Diagnostic> {
+        let tier = self.tier()?;
+        crate::config::schema_of(self.target.check(), Some(tier), name)
+    }
+
+    /// Bind the hosts `entry` may reach, answering `config` as the program resolved it; the
+    /// disclosure a `bound` op hands back. Before the entry runs, so a run that fails to bind never
+    /// started.
+    pub fn bound(
+        &mut self,
+        entry: &str,
+        configuration: Configuration,
+    ) -> Result<Disclosed, Refused> {
+        let tier = self.tier();
         let options = &self.options;
         let target = &self.target;
         let refuse = |diagnostics: Vec<Diagnostic>| Refused {
@@ -321,17 +344,10 @@ impl Drive {
             .defs
             .get(&Symbol::new(entry))
             .map(|d| d.footprint.clone());
-        // Before the configuration: its schema is entered on this unit.
-        let tier = match target.tier(options) {
+        let tier = match tier {
             Ok(tier) => tier,
             Err(diagnostic) => return Err(refuse(vec![diagnostic])),
         };
-        let constant = |name: &str| enter_constant(Some(tier), name);
-        let (configuration, warnings) =
-            match Configuration::open(target.check(), options.host, &options.config, &constant) {
-                Ok(resolved) => resolved,
-                Err(diagnostics) => return Err(refuse(diagnostics)),
-            };
         // Before the binding, which decides whether `signal` is bound.
         let shutdown = options
             .host
@@ -363,7 +379,7 @@ impl Drive {
             Ok(hosts) => hosts,
             Err(diagnostics) => return Err(refuse(diagnostics)),
         };
-        let disclosed = disclosed(options, &hosts, shutdown.as_ref(), warnings);
+        let disclosed = disclosed(options, &hosts, shutdown.as_ref());
         self.bound = Some((
             entry.to_string(),
             Bound {
@@ -510,7 +526,6 @@ impl Drive {
                 crate::hosts::handshake_lines(&bound.hosts.handshakes())
             },
             hosts: bound.hosts.summary_json(),
-            configuration: bound.hosts.configuration().to_json(),
         };
         // The program chose its code and returned no value, so none is carried.
         if ended.exit.is_some() {
@@ -547,22 +562,13 @@ fn process_host(options: &RunOptions) -> Result<ProcessHost, Diagnostic> {
     Ok(ProcessHost::new(options.argv.clone(), Sink::Real { out }).executing(executables))
 }
 
-fn disclosed(
-    options: &RunOptions,
-    hosts: &Hosts,
-    shutdown: Option<&Arc<Shutdown>>,
-    warnings: Vec<Diagnostic>,
-) -> Disclosed {
+fn disclosed(options: &RunOptions, hosts: &Hosts, shutdown: Option<&Arc<Shutdown>>) -> Disclosed {
     let listing = hosts.listing();
     let facilities = hosts.disclosures();
     Disclosed {
         hermetic: hosts.is_hermetic(),
         operations: listing.rows.len(),
         digest: crate::hosts::digest_short(listing, &facilities),
-        config: facilities
-            .configuration
-            .as_ref()
-            .map(|_| hosts.configuration().banner()),
         trace: facilities.observability.as_ref().map(|o| o.banner()),
         signals: shutdown.map(|s| Signals {
             names: s
@@ -573,7 +579,6 @@ fn disclosed(
             lead_ms: options.shutdown.drain_lead_ms,
             drain_ms: options.shutdown.drain_ms,
         }),
-        warnings,
     }
 }
 
@@ -851,10 +856,8 @@ pub struct Disclosed {
     hermetic: bool,
     operations: usize,
     digest: String,
-    config: Option<String>,
     trace: Option<String>,
     signals: Option<Signals>,
-    warnings: Vec<Diagnostic>,
 }
 
 pub struct Stopped {
@@ -883,7 +886,6 @@ pub struct Outcome {
     trace: Option<ply_host::trace::Counts>,
     handshakes: Vec<String>,
     hosts: serde_json::Value,
-    configuration: serde_json::Value,
 }
 
 impl Outcome {
@@ -911,7 +913,6 @@ impl Outcome {
             trace: None,
             handshakes: Vec::new(),
             hosts: serde_json::Value::Null,
-            configuration: serde_json::Value::Null,
         }
     }
 }
@@ -932,7 +933,6 @@ pub fn disclosed_value(d: &Disclosed) -> PlyValue {
         ("hermetic", PlyValue::Bool(d.hermetic)),
         ("operations", count(d.operations)),
         ("digest", PlyValue::str(&d.digest)),
-        ("config", option(d.config.as_deref().map(PlyValue::str))),
         ("trace", option(d.trace.as_deref().map(PlyValue::str))),
         (
             "signals",
@@ -944,7 +944,6 @@ pub fn disclosed_value(d: &Disclosed) -> PlyValue {
                 ])
             })),
         ),
-        ("warnings", diags_value(&d.warnings)),
     ])
 }
 
@@ -993,7 +992,6 @@ pub fn outcome_value(o: &Outcome) -> PlyValue {
             strings(o.handshakes.iter().map(String::as_str)),
         ),
         ("hosts", json(&o.hosts)),
-        ("configuration", json(&o.configuration)),
     ])
 }
 
@@ -1109,7 +1107,6 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
         None => None,
     };
     let tls = cred_list("tls")?;
-    let config_v = get("config")?;
     let trace_v = get("trace")?;
     Ok(RunOptions {
         front: None,
@@ -1148,14 +1145,6 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
                 path: std::path::PathBuf::from(path),
             })
             .collect(),
-        config: crate::config::ConfigOptions {
-            set: crate::payload::str_list_at(config_v, "set", span)?,
-            files: crate::payload::str_list_at(config_v, "files", span)?
-                .into_iter()
-                .map(std::path::PathBuf::from)
-                .collect(),
-            schema: crate::payload::opt_str_at(config_v, "schema", span)?,
-        },
         trace: crate::trace::TraceOptions {
             sink: match crate::payload::field_of(trace_v, "sink", span)?
                 .as_str(span, "the trace sink")?

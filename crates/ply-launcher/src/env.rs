@@ -14,8 +14,9 @@ use std::sync::Arc;
 /// `env.binary_version[e]()`.
 pub const EFFECT: &str = "env";
 
-const OPERATIONS: [(&str, &str); 5] = [
+const OPERATIONS: [(&str, &str); 6] = [
     ("var", "ply_launcher::env::var"),
+    ("vars", "ply_launcher::env::vars"),
     ("terminal", "ply_launcher::env::terminal"),
     ("binary_version", "ply_launcher::env::binary_version"),
     ("pwd", "ply_launcher::env::pwd"),
@@ -50,6 +51,20 @@ impl HostHandler for Site {
                     Err(_) => Value::ctor("None", Vec::new()),
                 }
             }
+            // A name or value that is not UTF-8 is no configuration key's, and is left out.
+            ("vars", []) => Value::list(
+                std::env::vars_os()
+                    .filter_map(|(name, value)| {
+                        Some((name.into_string().ok()?, value.into_string().ok()?))
+                    })
+                    .map(|(name, value)| {
+                        ply_machine::payload::record(vec![
+                            ("name", Value::str(name)),
+                            ("value", Value::str(value)),
+                        ])
+                    })
+                    .collect(),
+            ),
             ("terminal", [stream]) => {
                 let stream = stream.as_str(req.span, "a stream's name")?;
                 let terminal = match stream {

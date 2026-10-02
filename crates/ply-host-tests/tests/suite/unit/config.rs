@@ -1,168 +1,24 @@
+use ply_eval::Symbol;
 use ply_eval::host::{Determinism, Linearity};
-use ply_eval::{Diagnostic, Symbol, codes};
 use ply_host::config::*;
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-    pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect()
-}
-
-fn sets(args: &[&str]) -> Vec<String> {
-    args.iter().map(|a| (*a).to_string()).collect()
-}
-
-/// In memory, so a test about precedence is not also a test about `std::fs`.
-fn files(entries: &[(&str, &str)]) -> impl Fn(&Path) -> std::io::Result<String> + use<> {
-    let entries: BTreeMap<String, String> = entries
-        .iter()
-        .map(|(p, t)| ((*p).to_string(), (*t).to_string()))
-        .collect();
-    move |path: &Path| {
+fn snapshot(entries: &[(&str, &str, bool)], has_spec: bool) -> Snapshot {
+    Snapshot::new(
         entries
-            .get(&path.display().to_string())
-            .cloned()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))
-    }
-}
-
-fn read(
-    set: &[&str],
-    paths: &[&str],
-    environment: &[(&str, &str)],
-    tree: &[(&str, &str)],
-) -> Result<Sources, Vec<Diagnostic>> {
-    let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    Sources::read_with(&sets(set), &paths, &env(environment), &files(tree))
-}
-
-fn spec(keys: Vec<Key>) -> Spec {
-    Spec::new(keys).expect("the fixture declares each key once")
-}
-
-fn key(name: &str, shape: Shape) -> Key {
-    Key {
-        name: name.to_string(),
-        shape,
-        required: false,
-        default: None,
-    }
-}
-
-fn required(name: &str, shape: Shape) -> Key {
-    Key {
-        required: true,
-        ..key(name, shape)
-    }
-}
-
-fn with_default(name: &str, shape: Shape, value: &str) -> Key {
-    Key {
-        default: Some(value.to_string()),
-        ..key(name, shape)
-    }
-}
-
-fn resolve(sources: &Sources, spec: Option<&Spec>) -> Report {
-    Snapshot::resolve(sources, spec).expect("this fixture resolves")
-}
-
-fn codes_of(diagnostics: &[Diagnostic]) -> Vec<&'static str> {
-    diagnostics.iter().map(|d| d.code).collect()
-}
-
-fn renders(diagnostic: &Diagnostic) -> String {
-    let mut out = format!("{} {}", diagnostic.code, diagnostic.message);
-    for label in &diagnostic.labels {
-        out.push(' ');
-        out.push_str(&label.message);
-    }
-    for note in &diagnostic.notes {
-        out.push(' ');
-        out.push_str(note);
-    }
-    out
-}
-
-#[test]
-fn precedence_walks_down_as_sources_are_removed() {
-    let schema = spec(vec![with_default("DESK_REGION", Shape::Text, "default")]);
-    let tree = [("deploy.env", "DESK_REGION=file\n")];
-
-    let all = read(
-        &["DESK_REGION=set"],
-        &["deploy.env"],
-        &[("DESK_REGION", "environment")],
-        &tree,
+            .iter()
+            .map(|(key, value, secret)| {
+                (
+                    (*key).to_string(),
+                    Entry {
+                        value: (*value).to_string(),
+                        secret: *secret,
+                    },
+                )
+            })
+            .collect(),
+        has_spec,
     )
-    .expect("every source is well formed");
-    let snapshot = resolve(&all, Some(&schema)).snapshot;
-    assert_eq!(snapshot.get("DESK_REGION"), Some("set"));
-    assert_eq!(
-        snapshot.values["DESK_REGION"].source,
-        Source::Set,
-        "`--set` is the highest-precedence source"
-    );
-
-    let without_set = read(
-        &[],
-        &["deploy.env"],
-        &[("DESK_REGION", "environment")],
-        &tree,
-    )
-    .expect("it is well formed");
-    let snapshot = resolve(&without_set, Some(&schema)).snapshot;
-    assert_eq!(snapshot.get("DESK_REGION"), Some("file"));
-    assert_eq!(
-        snapshot.values["DESK_REGION"].source,
-        Source::File("deploy.env".to_string())
-    );
-
-    let without_files =
-        read(&[], &[], &[("DESK_REGION", "environment")], &tree).expect("it is well formed");
-    let snapshot = resolve(&without_files, Some(&schema)).snapshot;
-    assert_eq!(snapshot.get("DESK_REGION"), Some("environment"));
-    assert_eq!(snapshot.values["DESK_REGION"].source, Source::Environment);
-
-    let nothing = read(&[], &[], &[], &tree).expect("it is well formed");
-    let snapshot = resolve(&nothing, Some(&schema)).snapshot;
-    assert_eq!(snapshot.get("DESK_REGION"), Some("default"));
-    assert_eq!(snapshot.values["DESK_REGION"].source, Source::Default);
-}
-
-#[test]
-fn a_later_config_file_wins_over_an_earlier_one() {
-    let tree = [
-        ("base.env", "DESK_REGION=eu\nDESK_PORT=8137\n"),
-        ("override.env", "DESK_REGION=us\n"),
-    ];
-    let sources = read(&[], &["base.env", "override.env"], &[], &tree).expect("both parse");
-    let snapshot = resolve(&sources, None).snapshot;
-    assert_eq!(snapshot.get("DESK_REGION"), Some("us"));
-    assert_eq!(snapshot.get("DESK_PORT"), Some("8137"));
-}
-
-#[test]
-fn the_last_set_of_a_key_wins() {
-    let sources = read(&["K=first", "K=second"], &[], &[], &[]).expect("both parse");
-    assert_eq!(resolve(&sources, None).snapshot.get("K"), Some("second"));
-}
-
-#[test]
-fn the_environment_is_read_once_and_the_snapshot_never_changes() {
-    let sources = read(&[], &[], &[("DESK_REGION", "eu")], &[]).expect("it is well formed");
-    let snapshot = resolve(&sources, None).snapshot;
-    assert_eq!(snapshot.get("DESK_REGION"), Some("eu"));
-
-    // A second read of a different environment leaves the first snapshot as it was.
-    let later = read(&[], &[], &[("DESK_REGION", "us")], &[]).expect("it is well formed");
-    let later = resolve(&later, None).snapshot;
-    assert_eq!(later.get("DESK_REGION"), Some("us"));
-    assert_eq!(snapshot.get("DESK_REGION"), Some("eu"));
 }
 
 #[test]
@@ -170,304 +26,18 @@ fn an_unopened_snapshot_answers_nothing() {
     let snapshot = Snapshot::unopened();
     assert_eq!(snapshot.get("PATH"), None);
     assert_eq!(snapshot.plaintext("PATH"), None);
-    assert_eq!(snapshot.counts(), Counts::default());
     assert!(!snapshot.has_spec());
 }
 
 #[test]
-fn a_malformed_config_file_names_the_file_and_the_line() {
-    let tree = [(
-        "deploy.env",
-        "DESK_REGION=eu\nthis line has no equals\n=empty\nDESK-PORT=8137\n",
-    )];
-    let errors = read(&[], &["deploy.env"], &[], &tree).expect_err("three lines are malformed");
-    assert_eq!(
-        codes_of(&errors),
-        [
-            codes::CONFIG_UNAVAILABLE,
-            codes::CONFIG_UNAVAILABLE,
-            codes::CONFIG_UNAVAILABLE
-        ]
-    );
-    assert!(
-        errors[0].message.contains("deploy.env"),
-        "{}",
-        errors[0].message
-    );
-    assert!(
-        errors[0].message.contains("line 2"),
-        "{}",
-        errors[0].message
-    );
-    assert!(
-        errors[0].message.contains("no `=`"),
-        "{}",
-        errors[0].message
-    );
-    assert!(
-        errors[1].message.contains("line 3"),
-        "{}",
-        errors[1].message
-    );
-    assert!(
-        errors[1].message.contains("empty key"),
-        "{}",
-        errors[1].message
-    );
-    assert!(
-        errors[2].message.contains("line 4"),
-        "{}",
-        errors[2].message
-    );
-    assert!(
-        errors[2].message.contains('-'),
-        "the character that is not a key character is named: {}",
-        errors[2].message
-    );
-}
-
-#[test]
-fn an_unreadable_config_file_is_e0440_naming_it() {
-    let errors = read(&[], &["missing.env"], &[], &[]).expect_err("the file is not there");
-    assert_eq!(codes_of(&errors), [codes::CONFIG_UNAVAILABLE]);
-    assert!(
-        errors[0].message.contains("missing.env"),
-        "{}",
-        errors[0].message
-    );
-}
-
-#[test]
-fn a_set_that_is_not_key_equals_value_is_e0440_with_the_form() {
-    for bad in ["DESK_PORT", "=8137", "1DESK=8137"] {
-        let errors = read(&[bad], &[], &[], &[]).expect_err("`{bad}` is not `KEY=VALUE`");
-        assert_eq!(codes_of(&errors), [codes::CONFIG_UNAVAILABLE], "{bad}");
-        assert!(
-            renders(&errors[0]).contains("--set KEY=VALUE"),
-            "`{bad}` was refused without saying what to write"
-        );
-    }
-}
-
-/// There is no quoting to escape a `#` with, so a password containing one must survive.
-#[test]
-fn comments_are_whole_lines_and_a_hash_in_a_value_survives() {
-    let tree = [(
-        "deploy.env",
-        "# a comment\n\n   # an indented comment\nDESK_REGION = eu \nDESK_KEY=pa#ss\n\t\n",
-    )];
-    let sources = read(&[], &["deploy.env"], &[], &tree).expect("it parses");
-    let snapshot = resolve(&sources, None).snapshot;
-    assert_eq!(snapshot.get("DESK_REGION"), Some("eu"));
-    assert_eq!(snapshot.get("DESK_KEY"), Some("pa#ss"));
-}
-
-#[test]
-fn the_value_is_the_rest_of_the_line() {
-    let sources = read(&["DESK_DSN=a=b=c"], &[], &[], &[]).expect("it parses");
-    assert_eq!(
-        resolve(&sources, None).snapshot.get("DESK_DSN"),
-        Some("a=b=c")
-    );
-}
-
-#[test]
-fn an_empty_value_is_a_value() {
-    let sources = read(&["DESK_REGION="], &[], &[], &[]).expect("it parses");
-    assert_eq!(
-        resolve(&sources, None).snapshot.get("DESK_REGION"),
-        Some("")
-    );
-}
-
-/// Refusing would fail `ply run --host` on any machine with an exported bash function.
-#[test]
-fn an_environment_name_that_is_not_a_key_is_skipped_rather_than_refused() {
-    let sources = read(
-        &[],
-        &[],
-        &[("BASH_FUNC_x%%", "() { :; }"), ("DESK_REGION", "eu")],
-        &[],
-    )
-    .expect("an environment is never a refusal");
-    let snapshot = resolve(&sources, None).snapshot;
-    assert_eq!(snapshot.get("DESK_REGION"), Some("eu"));
-    assert_eq!(snapshot.get("BASH_FUNC_x%%"), None);
-}
-
-#[test]
-fn a_required_key_nothing_supplies_is_e0441_naming_the_four_sources() {
-    let schema = spec(vec![required("DESK_API_KEY", Shape::Secret)]);
-    let sources = read(
-        &[],
-        &["deploy.env"],
-        &[("PATH", "/bin")],
-        &[("deploy.env", "")],
-    )
-    .expect("the file is empty and parses");
-    let errors = Snapshot::resolve(&sources, Some(&schema)).expect_err("nothing supplies it");
-    assert_eq!(codes_of(&errors), [codes::CONFIG_MISSING]);
-    let rendered = renders(&errors[0]);
-    assert!(rendered.contains("DESK_API_KEY"), "{rendered}");
-    assert!(rendered.contains("SSecret"), "{rendered}");
-    assert!(rendered.contains("`--set`"), "{rendered}");
-    assert!(rendered.contains("deploy.env"), "{rendered}");
-    assert!(rendered.contains("environment variable"), "{rendered}");
-    assert!(rendered.contains("default"), "{rendered}");
-}
-
-#[test]
-fn a_required_key_with_a_default_is_supplied() {
-    let schema = spec(vec![Key {
-        required: true,
-        ..with_default("DESK_REGION", Shape::Text, "eu")
-    }]);
-    let sources = read(&[], &[], &[], &[]).expect("nothing to parse");
-    let snapshot = resolve(&sources, Some(&schema)).snapshot;
-    assert_eq!(snapshot.get("DESK_REGION"), Some("eu"));
-}
-
-#[test]
-fn a_value_that_is_not_of_its_shape_is_e0442_naming_the_source() {
-    let schema = spec(vec![required("DESK_PORT", Shape::Int)]);
-    let sources = read(&["DESK_PORT=eight"], &[], &[], &[]).expect("it parses");
-    let errors = Snapshot::resolve(&sources, Some(&schema)).expect_err("`eight` is not an Int");
-    assert_eq!(codes_of(&errors), [codes::CONFIG_INVALID]);
-    let rendered = renders(&errors[0]);
-    assert!(rendered.contains("DESK_PORT"), "{rendered}");
-    assert!(rendered.contains("SInt"), "{rendered}");
-    assert!(rendered.contains("--set"), "{rendered}");
-    assert!(
-        rendered.contains("eight"),
-        "a non-secret value is printed, because an operator debugging it needs to see it: {rendered}"
-    );
-}
-
-#[test]
-fn a_bool_is_true_or_false_and_nothing_else() {
-    let schema = spec(vec![required("DESK_DEBUG", Shape::Bool)]);
-    for good in ["true", "false"] {
-        let sources = read(&[&format!("DESK_DEBUG={good}")], &[], &[], &[]).expect("it parses");
-        assert_eq!(
-            resolve(&sources, Some(&schema)).snapshot.get("DESK_DEBUG"),
-            Some(good)
-        );
-    }
-    for bad in ["True", "yes", "1", ""] {
-        let sources = read(&[&format!("DESK_DEBUG={bad}")], &[], &[], &[]).expect("it parses");
-        let errors = Snapshot::resolve(&sources, Some(&schema))
-            .expect_err("`{bad}` is neither `true` nor `false`");
-        assert_eq!(codes_of(&errors), [codes::CONFIG_INVALID], "{bad}");
-    }
-}
-
-#[test]
-fn a_malformed_secret_is_e0442_without_printing_the_value() {
-    let schema = spec(vec![required("DESK_API_KEY", Shape::Secret)]);
-    let sources = read(&["DESK_API_KEY="], &[], &[], &[]).expect("it parses");
-    let errors = Snapshot::resolve(&sources, Some(&schema)).expect_err("an empty credential");
-    assert_eq!(codes_of(&errors), [codes::CONFIG_INVALID]);
-    let rendered = renders(&errors[0]);
-    assert!(rendered.contains("DESK_API_KEY"), "{rendered}");
-    assert!(rendered.contains("SSecret"), "{rendered}");
-    assert!(
-        rendered.contains("not printed"),
-        "the refusal says why the value is absent: {rendered}"
-    );
-
-    // Non-empty too, so the omission is shown to belong to the shape, not to emptiness.
-    let schema = spec(vec![Key {
-        shape: Shape::Secret,
-        ..required("DESK_API_KEY", Shape::Int)
-    }]);
-    let sources = read(&["DESK_API_KEY=  "], &[], &[], &[]).expect("it parses");
-    let errors = Snapshot::resolve(&sources, Some(&schema)).expect_err("it trims to empty");
-    assert!(
-        !renders(&errors[0]).contains("  "),
-        "the value must not appear: {}",
-        renders(&errors[0])
-    );
-}
-
-#[test]
-fn an_undeclared_explicit_key_is_w0607_and_an_undeclared_environment_key_is_not() {
-    let schema = spec(vec![key("DESK_REGION", Shape::Text)]);
-    let tree = [("deploy.env", "DESK_RGION=eu\n")];
-    let sources = read(
-        &["DESK_PROT=8137"],
-        &["deploy.env"],
-        &[("PATH", "/bin"), ("HOME", "/root")],
-        &tree,
-    )
-    .expect("everything parses");
-    let report = resolve(&sources, Some(&schema));
-    assert_eq!(
-        codes_of(&report.warnings),
-        [codes::CONFIG_UNDECLARED, codes::CONFIG_UNDECLARED],
-        "the two typos are warned about and the two environment names are not"
-    );
-    let messages: Vec<&str> = report.warnings.iter().map(|w| w.message.as_str()).collect();
-    assert!(
-        messages.iter().any(|m| m.contains("DESK_PROT")),
-        "{messages:?}"
-    );
-    assert!(
-        messages.iter().any(|m| m.contains("DESK_RGION")),
-        "{messages:?}"
-    );
-    assert!(
-        renders(&report.warnings[0]).contains("DESK_REGION"),
-        "the warning lists what the schema does declare, because the fix is a spelling"
-    );
-}
-
-#[test]
-fn without_a_schema_nothing_is_undeclared() {
-    let sources = read(&["ANYTHING=1"], &[], &[], &[]).expect("it parses");
-    assert!(resolve(&sources, None).warnings.is_empty());
-}
-
-/// Which of two disagreeing declarations applied would depend on the schema's list order.
-#[test]
-fn a_schema_that_declares_a_key_twice_is_refused() {
-    let error = Spec::new(vec![
-        key("DESK_REGION", Shape::Text),
-        key("DESK_REGION", Shape::Int),
-    ])
-    .expect_err("one name, two declarations");
-    assert_eq!(error.code, codes::CONFIG_UNAVAILABLE);
-    assert!(error.message.contains("DESK_REGION"), "{}", error.message);
-}
-
-#[test]
-fn every_missing_and_invalid_key_is_reported_at_once() {
-    let schema = spec(vec![
-        required("A", Shape::Text),
-        required("B", Shape::Text),
-        required("C", Shape::Int),
-    ]);
-    let sources = read(&["C=three"], &[], &[], &[]).expect("it parses");
-    let errors = Snapshot::resolve(&sources, Some(&schema)).expect_err("two missing, one invalid");
-    assert_eq!(
-        codes_of(&errors),
-        [
-            codes::CONFIG_MISSING,
-            codes::CONFIG_MISSING,
-            codes::CONFIG_INVALID
-        ]
-    );
-}
-
-#[test]
 fn get_refuses_a_secret_key_and_secret_refuses_a_plain_one() {
-    let schema = spec(vec![
-        required("DESK_API_KEY", Shape::Secret),
-        required("DESK_REGION", Shape::Text),
-    ]);
-    let sources =
-        read(&["DESK_API_KEY=s3cret", "DESK_REGION=eu"], &[], &[], &[]).expect("both parse");
-    let snapshot = resolve(&sources, Some(&schema)).snapshot;
-
+    let snapshot = snapshot(
+        &[
+            ("DESK_API_KEY", "s3cret", true),
+            ("DESK_REGION", "eu", false),
+        ],
+        true,
+    );
     assert_eq!(
         snapshot.get("DESK_API_KEY"),
         None,
@@ -484,90 +54,17 @@ fn get_refuses_a_secret_key_and_secret_refuses_a_plain_one() {
 
 #[test]
 fn without_a_schema_containment_is_only_as_strong_as_the_schema() {
-    let sources = read(&["DESK_API_KEY=s3cret"], &[], &[], &[]).expect("it parses");
-    let snapshot = resolve(&sources, None).snapshot;
+    let snapshot = snapshot(&[("DESK_API_KEY", "s3cret", false)], false);
     assert_eq!(snapshot.get("DESK_API_KEY"), Some("s3cret"));
     assert_eq!(snapshot.plaintext("DESK_API_KEY"), Some("s3cret"));
 }
 
 /// `None`, not an empty `Secret`, so unset and set-to-nothing stay distinguishable.
 #[test]
-fn an_unsupplied_optional_secret_answers_none_from_both() {
-    let schema = spec(vec![key("DESK_API_KEY", Shape::Secret)]);
-    let sources = read(&[], &[], &[], &[]).expect("nothing to parse");
-    let snapshot = resolve(&sources, Some(&schema)).snapshot;
+fn an_unsupplied_secret_answers_none_from_both() {
+    let snapshot = snapshot(&[], true);
     assert_eq!(snapshot.get("DESK_API_KEY"), None);
     assert_eq!(snapshot.plaintext("DESK_API_KEY"), None);
-}
-
-#[test]
-fn a_report_prints_a_value_for_every_key_but_a_secret() {
-    let schema = spec(vec![
-        required("DESK_API_KEY", Shape::Secret),
-        with_default("DESK_REGION", Shape::Text, "eu"),
-        required("DESK_PORT", Shape::Int),
-    ]);
-    let sources = read(&["DESK_PORT=8137"], &[], &[("DESK_API_KEY", "s3cret")], &[])
-        .expect("everything parses");
-    let snapshot = resolve(&sources, Some(&schema)).snapshot;
-
-    let shown: Vec<(String, String, String)> = snapshot
-        .declared()
-        .map(|(k, r)| {
-            (
-                k.to_string(),
-                r.shown().to_string(),
-                r.source.as_str().to_string(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        shown,
-        [
-            (
-                "DESK_API_KEY".to_string(),
-                REDACTED.to_string(),
-                "env".to_string()
-            ),
-            (
-                "DESK_PORT".to_string(),
-                "8137".to_string(),
-                "--set".to_string()
-            ),
-            (
-                "DESK_REGION".to_string(),
-                "eu".to_string(),
-                "default".to_string()
-            ),
-        ]
-    );
-    assert_eq!(
-        snapshot.counts(),
-        Counts {
-            keys: 3,
-            set: 1,
-            file: 0,
-            environment: 1,
-            default: 1,
-            secret: 1,
-        }
-    );
-}
-
-#[test]
-fn a_report_lists_only_the_declared_keys() {
-    let schema = spec(vec![key("DESK_REGION", Shape::Text)]);
-    let sources = read(
-        &[],
-        &[],
-        &[("DESK_REGION", "eu"), ("AWS_SECRET_ACCESS_KEY", "nope")],
-        &[],
-    )
-    .expect("it parses");
-    let snapshot = resolve(&sources, Some(&schema)).snapshot;
-    let listed: Vec<&str> = snapshot.declared().map(|(k, _)| k).collect();
-    assert_eq!(listed, ["DESK_REGION"]);
-    assert_eq!(snapshot.environment, 2, "the count is printed");
 }
 
 #[test]

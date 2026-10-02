@@ -5,7 +5,7 @@ use ply_eval::host::{
     HostAnswer, HostOp, HostRegistry, HostRequest, HostRuntime, MachineId, Pending,
 };
 use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value, codes};
-use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
+use ply_host::config::{Entry, Snapshot};
 use ply_host::signal::{Accepting, Bounds, Shutdown, Signal};
 use ply_host::tcp::{Net, TcpHost};
 use ply_host::trace::sink::Recording;
@@ -420,42 +420,31 @@ fn the_run_level_counts_are_a_sum_over_every_entry_point() {
     assert_eq!(d.trace.open_spans(), 1, "`b`'s is still open");
 }
 
-fn snapshot(set: &[&str], env: &[(&str, &str)], keys: Vec<Key>) -> Snapshot {
-    let set: Vec<String> = set.iter().map(|s| (*s).to_string()).collect();
-    let env: Vec<(String, String)> = env
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect();
-    let sources = Sources::read_with(&set, &[], &env, &|_| {
-        Err(std::io::Error::other("no `--config` file in this test"))
-    })
-    .expect("the sources read");
-    let spec = Spec::new(keys).expect("the schema is well formed");
-    Snapshot::resolve(&sources, Some(&spec))
-        .expect("the schema resolves")
-        .snapshot
-}
-
-fn key(name: &str, shape: Shape) -> Key {
-    Key {
-        name: name.to_string(),
-        shape,
-        required: false,
-        default: None,
-    }
+fn snapshot(entries: &[(&str, &str, bool)]) -> Snapshot {
+    Snapshot::new(
+        entries
+            .iter()
+            .map(|(key, value, secret)| {
+                (
+                    (*key).to_string(),
+                    Entry {
+                        value: (*value).to_string(),
+                        secret: *secret,
+                    },
+                )
+            })
+            .collect(),
+        true,
+    )
 }
 
 #[test]
 fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
-    let before = snapshot(
-        &["DESK_REGION=eu"],
-        &[("DESK_PORT", "8137"), ("DESK_API_KEY", "hunter2")],
-        vec![
-            key("DESK_REGION", Shape::Text),
-            key("DESK_PORT", Shape::Int),
-            key("DESK_API_KEY", Shape::Secret),
-        ],
-    );
+    let before = snapshot(&[
+        ("DESK_REGION", "eu", false),
+        ("DESK_PORT", "8137", false),
+        ("DESK_API_KEY", "hunter2", true),
+    ]);
     let shared = Arc::new(before.clone());
 
     std::thread::scope(|scope| {
@@ -482,16 +471,8 @@ fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
 
 #[test]
 fn two_snapshots_in_one_process_do_not_see_each_other() {
-    let one = snapshot(
-        &["DESK_REGION=eu"],
-        &[],
-        vec![key("DESK_REGION", Shape::Text)],
-    );
-    let two = snapshot(
-        &["DESK_REGION=us"],
-        &[],
-        vec![key("DESK_REGION", Shape::Text)],
-    );
+    let one = snapshot(&[("DESK_REGION", "eu", false)]);
+    let two = snapshot(&[("DESK_REGION", "us", false)]);
     assert_eq!(one.get("DESK_REGION"), Some("eu"));
     assert_eq!(two.get("DESK_REGION"), Some("us"));
     // Built second, and the first is unchanged: the only route between two tests' configurations.

@@ -1,5 +1,5 @@
 //! The environment a launched program reads, end to end: a program performs `env.var`,
-//! `env.terminal` and `env.binary_version` and the launcher answers.
+//! `env.vars`, `env.terminal` and `env.binary_version` and the launcher answers.
 
 /// The counting allocator is a whole-binary decision, so this test binary installs it too, which
 /// is what makes the window tests meaningful here.
@@ -15,20 +15,24 @@ use std::sync::Arc;
 const ASKER: &str = r#"
 nondet effect env {
   read var[e](name: String) -> Option<String>
+  read vars[e]() -> List<{ name: String, value: String }>
   read terminal[e](stream: String) -> Bool
   read binary_version[e]() -> String
   read pwd[e]() -> String
   read shipped_digest[e]() -> String
 }
 
-fn main() -> String / {env.var[e], env.terminal[e], env.binary_version[e]} = {
+fn main() -> String / {env.var[e], env.vars[e], env.terminal[e], env.binary_version[e]} = {
   let found = env.var[e]("PLY_LAUNCHER_TEST_MARK");
+  let listed = filter(env.vars[e](), |v: { name: String, value: String }|
+    v.name == "PLY_LAUNCHER_TEST_MARK" && v.value == "here");
   let missing = env.var[e]("PLY_LAUNCHER_TEST_ABSENT");
   let term = env.terminal[e]("stdout");
   let version = env.binary_version[e]();
   let mark = match found { Some(v) -> v, None -> "unset" };
   let miss = match missing { Some(_) -> "present", None -> "absent" };
-  mark ++ "|" ++ miss ++ "|" ++ (if term { "terminal" } else { "piped" }) ++ "|" ++ version
+  mark ++ "|" ++ miss ++ "|" ++ (if len(listed) == 1 { "listed" } else { "unlisted" }) ++ "|"
+    ++ (if term { "terminal" } else { "piped" }) ++ "|" ++ version
 }
 "#;
 
@@ -64,7 +68,10 @@ fn a_program_reads_its_environment() {
     // Safety: the test is alone in its process (nextest), so the variable is its own.
     unsafe { std::env::set_var("PLY_LAUNCHER_TEST_MARK", "here") };
     let answer = ask();
-    assert_eq!(answer, ply_eval::Value::str("here|absent|piped|9.9.9-test"));
+    assert_eq!(
+        answer,
+        ply_eval::Value::str("here|absent|listed|piped|9.9.9-test")
+    );
     unsafe { std::env::remove_var("PLY_LAUNCHER_TEST_MARK") };
 }
 

@@ -227,17 +227,6 @@ pub fn option_of<'v>(
     }
 }
 
-pub fn opt_str_at(value: &PlyValue, name: &str, span: Span) -> Result<Option<String>, Diagnostic> {
-    match field_of(value, name, span)? {
-        PlyValue::Ctor { name, args } if name.as_str() == "Some" => Ok(args
-            .first()
-            .map(|v| v.as_str(span, "a value").map(str::to_string))
-            .transpose()?),
-        PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
-        other => Err(shape(other, span)),
-    }
-}
-
 pub fn opt_int_at(value: &PlyValue, name: &str, span: Span) -> Result<Option<i64>, Diagnostic> {
     match field_of(value, name, span)? {
         PlyValue::Ctor { name, args } if name.as_str() == "Some" => Ok(args
