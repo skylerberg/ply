@@ -57,10 +57,11 @@ reach: the passes and discharged obligations found there count here, and this
 run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads only). Entries
 are keyed by content and by the shape of what is stored, so nothing
 machine-specific is ever shared; `--no-cache` ignores it. What the front end
-filed is believed only by a `ply` built from the same shipped modules and
-evaluator, and a pass or a discharged obligation only by one built from the same
-Rust runtime too: another build files them again (`W0603`), and an upstream
-answers only builds of its runtime. A dependency's own
+filed is believed only by a `ply` whose evaluator and loading code are the same,
+and a pass or a discharged obligation only by one whose runtime, emitter and
+code that decides a verdict are the same too: another build files them again
+(`W0603`), and an upstream answers only builds of its runtime. The rest of
+`ply`, its other commands among it, is in neither. A dependency's own
 modules are keyed by its manifest rather than by where it sits, so moving or
 re-checking-out a dependency keeps what was cached for it.
 
