@@ -18,8 +18,8 @@ import tycore (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, Ty
 import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEffect,
                 resolve_modules, qualify, lookup, find, is_bare, diag1, backticked,
                 import_module_name, path_span)
-import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index, hash_index, hex,
-             digest, unused, Pin, Rehash, Rehashed, rehash_index)
+import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index, hash_index,
+             hash_index_pinned, hex, digest, unused, Pin, Rehash, Rehashed, rehash_index)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, update_shapes,
               update_shapes_with, expanded_mods, check_front_with, is_prelude_effect,
@@ -1516,6 +1516,22 @@ pub fn filing(w: Whole) -> Filing = {
   }
 }
 
+// What a dependent trusts of its compiled dependencies instead of walking their bodies: the rows
+// that seed their definitions, the hashes those definitions compiled under, and the bodies the
+// emitter reads. The stub sources the dependent parses in their place travel as package modules.
+pub type Interfaces = { defs: List<KnownDefRow>, pins: List<Pin>, bodies: List<BodyRow> }
+
+pub fn no_interfaces() -> Interfaces = { defs: [], pins: [], bodies: [] }
+
+// The dependents' real bodies replace the blanks their stubs hashed to, keyed by name; a name the
+// interface answers for carries no blank through.
+fn splice_bodies(h: HashOutput, bodies: List<BodyRow>) -> HashOutput =
+  if len(bodies) == 0 { h } else {
+    let named = fold(bodies, map_new(), |acc: Map<Bytes, Bool>, b: BodyRow|
+      map_insert(acc, b.name, true));
+    { ..h, bodies: append(filter(h.bodies, |b: BodyRow| !map_contains(named, b.name)), bodies) }
+  }
+
 pub fn analyse(parsed: List<Parsed>) -> Analysis = analyse_with(parsed, [], [])
 
 pub fn analyse_with(
@@ -1523,6 +1539,7 @@ pub fn analyse_with(
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
   pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
+  ifaces: Interfaces = { defs: [], pins: [], bodies: [] },
 ) -> Analysis = {
   let clo = closure(pkgs, map(parsed, |p: Parsed| p.name));
   let all = fold(clo.modules, parsed, |acc: List<Parsed>, m: { pkg: Int, src: Source }|
@@ -1530,7 +1547,7 @@ pub fn analyse_with(
   // The toolchain's own tree loads without its implicit self; this path has no shelf list to
   // check the coverage half of that against, and only the toolchain's listings use it.
   let toolchain = fold(parsed, true, |acc: Bool, p: Parsed| acc && is_std(p.name));
-  analyse_closure(all, clo, defs, tests, len(parsed), toolchain)
+  analyse_closure(all, clo, append(defs, ifaces.defs), tests, len(parsed), toolchain, ifaces)
 }
 
 // The packages of a load as the front end's tables take them: the root package first, the
@@ -1622,6 +1639,7 @@ fn analyse_closure(
   tests: List<KnownTestRow>,
   root_count: Int,
   toolchain: Bool,
+  ifaces: Interfaces = { defs: [], pins: [], bodies: [] },
 ) -> Analysis = {
   // The packages' identity reports ahead of anything the program text has to say: manifest
   // and graph diags point one slot past every module, in manifest order.
@@ -1653,7 +1671,10 @@ fn analyse_closure(
           let built = build_index(x.mods, x.r);
           if len(built.diags) > 0 { Refused(map(built.diags, outside_every_module)) } else {
             // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
-            let hashes: HashOutput = hash_index(built.index);
+            let hashes: HashOutput = splice_bodies(
+              hash_index_pinned(built.index, ifaces.pins),
+              ifaces.bodies,
+            );
             let checked: Front = check_front_with(
               x.r,
               x.mods,
