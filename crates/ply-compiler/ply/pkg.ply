@@ -10,6 +10,7 @@ import patterns (LInt, LBool, LStr, LUnit)
 import types (TCon, ty_span)
 import hash (hex, sort_bytes)
 import resolve (Source)
+import embed (EmbedAt, EmbedFile)
 import std.json (Json, Null, Bool, Number, Str, Member, object, array, variant, error_to_string)
 import std.hash (blake3)
 import std.pkg (Manifest, Version, Dep, Path, Git, Registry, manifest_json, prefix_of)
@@ -733,8 +734,8 @@ pub type Pinned = { name: Bytes, version: Bytes, digest: Bytes }
 fn digest_domain() -> Bytes = b"ply.lock.package.1"
 
 /// The closure's dependencies, in package order: the root package is the project's own sources and
-/// is not pinned.
-pub fn pins_of(clo: Closure) -> List<Pinned> =
+/// is not pinned. A dependency is its modules and what they embed.
+pub fn pins_of(clo: Closure, embeds: List<EmbedAt> = []) -> List<Pinned> =
   fold(range(1, len(clo.packages)), [], |acc: List<Pinned>, i: Int| {
     let p = at(clo.packages, i);
     match p.manifest {
@@ -743,19 +744,39 @@ pub fn pins_of(clo: Closure) -> List<Pinned> =
         push(acc, {
           name: bytes_of_string(m.name),
           version: version_text(m.version),
-          digest: package_digest(i, clo),
+          digest: package_digest(i, clo, embeds),
         }),
     }
   })
 
-fn package_digest(pkg: Int, clo: Closure) -> Bytes = {
-  let parts = map(
-    filter(clo.modules, |m: { pkg: Int, src: Source }| m.pkg == pkg),
-    |m: { pkg: Int, src: Source }| bytes_concat_all([m.src.name, b"\0", m.src.src, b"\0"]),
-  );
+fn package_digest(pkg: Int, clo: Closure, embeds: List<EmbedAt>) -> Bytes = {
+  let mine = filter(clo.modules, |m: { pkg: Int, src: Source }| m.pkg == pkg);
+  let parts = map(mine, |m: { pkg: Int, src: Source }|
+    bytes_concat_all([m.src.name, b"\0", m.src.src, b"\0"]));
+  let names = fold(mine, map_new(), |acc: Map<Bytes, Bool>, m: { pkg: Int, src: Source }|
+    map_insert(acc, m.src.name, true));
+  let embedded = map(filter(embeds, |e: EmbedAt| map_contains(names, e.module)), embed_part);
   let modules = bytes_concat_all(sort_bytes(parts));
-  bytes_concat(b"b3:", hex(blake3(bytes_concat_all([digest_domain(), modules]))))
+  // A package that embeds nothing keeps the digest its modules alone give it.
+  let tail = if len(embedded) == 0 { b"" }
+  else { bytes_concat(b"\x01embeds", bytes_concat_all(sort_bytes(embedded))) };
+  bytes_concat(b"b3:", hex(blake3(bytes_concat_all([digest_domain(), modules, tail]))))
 }
+
+fn embed_part(e: EmbedAt) -> Bytes =
+  bytes_concat_all([
+    e.module,
+    b"\0",
+    e.key,
+    b"\0",
+    match e.read {
+      Ok(files) ->
+        bytes_concat_all(
+          map(files, |f: EmbedFile| bytes_concat_all([f.name, b"\0", hex(blake3(f.bytes)), b"\0"])),
+        ),
+      Err(why) -> bytes_concat_all([b"\x01", why, b"\0"]),
+    },
+  ])
 
 // --- The graph's judgments ------------------------------------------------------
 
