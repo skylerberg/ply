@@ -3337,6 +3337,53 @@ fn group_ty_text(cx: Cx, callee: Bytes, t: Type) -> Bytes =
     None -> bytes_concat_all([b"`", print_ty(group_printer(cx), t).s, b"`"]),
   }
 
+// Widened tails are closed after the last argument, so a row the arguments share holds just theirs.
+fn expect_arguments(
+  cx: Cx,
+  params: List<Type>,
+  found: List<Type>,
+  expect_one: (Cx, Int) -> Cx,
+) -> Cx = {
+  let argued: { cx: Cx, tails: List<Int> } = fold(
+    range(0, len(params)),
+    { cx: cx, tails: [] },
+    |acc: { cx: Cx, tails: List<Int> }, i: Int|
+      match widened(acc.cx, at(params, i), at(found, i)) {
+        Some(w) -> { cx: w.cx, tails: push(acc.tails, w.tail) },
+        None -> { cx: expect_one(acc.cx, i), tails: acc.tails },
+      },
+  );
+  fold(argued.tails, argued.cx, close_tail)
+}
+
+// `None` falls back to the unwidened check, so a refusal reads as the argument's row was written.
+fn widened(cx: Cx, expected: Type, found: Type) -> Option<{ cx: Cx, tail: Int }> =
+  match shallow(cx.subst, expected) {
+    TyFn(_) -> match shallow(cx.subst, found) {
+      TyFn(g) -> {
+        let row = resolve_r(cx, g.effects);
+        match row.tail {
+          Some(_) -> None,
+          None -> {
+            let v: WithVar = new_row_var(cx);
+            let open = t_fn(g.params, g.ret, { atoms: row.atoms, tail: Some(v.v) });
+            let u = unify(v.cx.subst, v.cx.fresh, expected, open);
+            match u.err { None -> Some({ cx: with_unified(v.cx, u), tail: v.v }), Some(_) -> None }
+          },
+        }
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn close_tail(cx: Cx, tail: Int) -> Cx =
+  match resolved_tail(cx.subst, row_open(tail)) {
+    Some(v) -> if is_rigid_row(cx.subst, v) { cx }
+    else { with_unified(cx, unify_row(cx.subst, cx.fresh, row_empty(), row_open(v))) },
+    None -> cx,
+  }
+
 // An argument against its parameter, where a call inside the group being walked is monomorphic:
 // a mismatch on the group's row, or on the callee's own type parameter, is refused as that.
 fn expect_argument(cx: Cx, span: Span, expected: Type, found: Type, callee: Option<Bytes>) -> Cx = {
@@ -3470,7 +3517,7 @@ fn infer_app_general(
     } else {
       let source = callee_source(c, func);
       let callee: Option<Bytes> = group_callee(c, source);
-      let checked: Cx = fold(range(0, len(args)), c, |cc: Cx, i: Int|
+      let checked: Cx = expect_arguments(c, fn_.params, as_.tys, |cc: Cx, i: Int|
         expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(as_.tys, i), callee));
       // `forall a.` alone would admit two `String`s, so the integer obligation goes on the instantiated variable here.
       let obliged: Cx = if is_int_builtin(func) && len(fn_.params) > 0 {
@@ -4408,7 +4455,7 @@ fn infer_perform(
               row: as_.row,
             }
           } else {
-            let checked: Cx = fold(range(0, len(args)), shape.cx, |c: Cx, i: Int|
+            let checked: Cx = expect_arguments(shape.cx, shape.params, as_.tys, |c: Cx, i: Int|
               expect(
                 c,
                 expr_span(at(args, i)),
@@ -8628,7 +8675,78 @@ test "a call inside a recursive group keeps the row the group was called with" {
   ]);
   assert_eq(map(at(diags, 0).labels, |l: Label| l.text), [
     b"the group's row here is e, and this argument's is {m.tick.now}",
-  ])
+  ]);
+  let quiet = bytes_concat_all([
+    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n == 0 { f() } else { pong(n - 1, f) }\n",
+    b"fn pong<|e>(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, || ())",
+  ]);
+  assert_eq(check_codes(quiet), [])
+}
+
+test "two callbacks that perform different things fill one row variable with both" {
+  let src = bytes_concat_all([
+    b"effect a { write x() -> Unit }\n",
+    b"effect b { write y() -> Unit }\n",
+    b"fn both<|e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e = { f(); g() }\n",
+    b"fn fa() -> Unit = a.x()\n",
+    b"fn go() -> Unit = both(|| a.x(), || b.y())\n",
+    b"fn named() -> Unit = both(fa, || ())\n",
+    b"fn apart() -> (Unit, Unit) = parallel { both(|| a.x(), || a.x()), b.y() }",
+  ]);
+  assert_eq(check_codes(src), []);
+  let dump = check_dump([{ name: b"m", src: src }]);
+  assert(string_contains(dump, "F;m.go;() -> Unit / {m.a.x, m.b.y};"));
+  assert(string_contains(dump, "F;m.named;() -> Unit / {m.a.x};"));
+  assert(string_contains(dump, "F;m.apart;() -> (Unit, Unit) / {m.a.x, m.b.y};"));
+  let clash = bytes_concat_all([
+    b"effect a { write x() -> Unit }\n",
+    b"effect b { write y() -> Unit }\n",
+    b"fn both<|e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e = { f(); g() }\n",
+    b"fn shared() -> (Unit, Unit) = parallel { both(|| a.x(), || b.y()), b.y() }",
+  ]);
+  assert_eq(check_codes(clash), [b"E0309"])
+}
+
+test "a callback may perform less than its parameter's row permits, and nothing it does not permit" {
+  let ops = b"effect a { write x() -> Unit\n write z() -> Unit }\n";
+  let run = bytes_concat(ops, b"fn run(k: () -> Unit / {a.x, a.z}) -> Unit / {a.x, a.z} = k()\n");
+  assert_eq(check_codes(bytes_concat(run, b"fn go() -> Unit = run(|| a.x())")), []);
+  assert_eq(check_codes(bytes_concat(run, b"fn go() -> Unit = run(|| ())")), []);
+  let narrow = bytes_concat(
+    ops,
+    b"fn run(k: () -> Unit / {a.x}) -> Unit / {a.x} = k()\nfn go() -> Unit = run(|| a.z())",
+  );
+  let diags = check_diags(narrow);
+  assert_eq(map(diags, |dg: Diag| dg.code), [b"E0302"]);
+  assert_eq(map(diags, |dg: Diag| at(dg.labels, 0).text), [b"expected {m.a.x}, found {m.a.z}"]);
+  let held = |body: Bytes|
+    bytes_concat_all([
+      ops,
+      b"fn go<|e>(k: (() -> Unit / {a.x | e}) -> Unit / {a.x | e}) -> Unit / {a.x | e} = k(",
+      body,
+      b")",
+    ]);
+  assert_eq(check_codes(held(b"|| a.x()")), []);
+  assert_eq(check_codes(held(b"|| a.z()")), [b"E0302"]);
+  let handed = bytes_concat(
+    ops,
+    b"effect ctl { write run(k: () -> Unit / {a.x, a.z}) -> Unit }\nfn go() -> Unit / {ctl.write} = ctl.run(|| a.x())",
+  );
+  assert_eq(check_codes(handed), [])
+}
+
+test "a claim may hand a pure callback to a function generic over its row" {
+  assert_eq(
+    check_codes(
+      bytes_concat_all([
+        b"fn total(xs: List<Int>) -> Int\n",
+        b"  requires fold(xs, 0, |s: Int, x: Int| s + x) < 100\n",
+        b"= fold(xs, 0, |s: Int, x: Int| s + x)\n",
+        b"law \"a fold over nothing is its seed\" { fold([], 7, |s: Int, x: Int| s + x) == 7 }",
+      ]),
+    ),
+    [],
+  )
 }
 
 test "the members of a recursive group bind the same row parameters" {
