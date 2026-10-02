@@ -19,7 +19,7 @@ import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEff
                 resolve_modules, qualify, lookup, find, is_bare, diag1, backticked,
                 import_module_name, path_span)
 import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index, hash_index,
-             hash_index_pinned, hex, digest, unused, Pin, Rehash, Rehashed, rehash_index)
+             hash_index_pinned, hex, digest, unused, Pin, Fixed, Rehash, Rehashed, rehash_index)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, update_shapes,
               update_shapes_with, expanded_mods, check_front_with, is_prelude_effect,
@@ -551,7 +551,7 @@ fn hash_rows(index: Index, h: HashOutput) -> List<HashFrame> = {
 
 // One root the emitter caches a compiled body under, and the key it caches it by: a digest of
 // what emitting it reads of the rest of the program. `crates/ply-codegen`'s `Source` reads these.
-type KeyRow = { root: Bytes, key: Bytes }
+pub type KeyRow = { root: Bytes, key: Bytes }
 
 // The walk's place: the rows so far, this module's test and law ordinals, and which law text the
 // next law is keyed by.
@@ -720,7 +720,14 @@ fn root_keys(mods: List<Mod>, c: Front, h: HashOutput) -> List<KeyRow> = {
 // its body is emitted at. `pure` is a definition's published purity, which lets a memo answer for
 // it; any other root runs each time. `params` and `answer` say how what it is entered with and
 // answers read at the seam.
-type EmitRoot = { root: Bytes, arity: Int, pure: Bool, at: At, params: List<Carry>, answer: Carry }
+pub type EmitRoot = {
+  root: Bytes,
+  arity: Int,
+  pure: Bool,
+  at: At,
+  params: List<Carry>,
+  answer: Carry,
+}
 
 // The span of a root the tables do not place: a test or law whose check output has no row.
 fn no_at() -> At = { module: no_module(), start: 0, end: 0 }
@@ -1101,6 +1108,8 @@ pub type Whole = {
   // What each dependency is, as `ply.lock` pins it.
   pins: List<Pinned>,
   mod_pkg: List<Int>,
+  // The modules a compiled package's stubs stand for: their bodies are blanks.
+  stubs: List<Bytes>,
 }
 
 // A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
@@ -1183,11 +1192,14 @@ fn taken(
   h: HashOutput,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
+  effectful: List<Bytes> = [],
 ) -> Known =
-  if len(defs) == 0 && len(tests) == 0 { no_known() } else {
+  if len(defs) == 0 && len(tests) == 0 && len(effectful) == 0 { no_known() } else {
     {
       defs: known_defs(by_name_one(h.defs), by_name_one(h.decls), defs),
       tests: known_tests(test_hashes(index, h), by_name_one(h.decls), mods, tests),
+      effectful: fold(effectful, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
+        map_insert(acc, n, true)),
     }
   }
 
@@ -1516,21 +1528,15 @@ pub fn filing(w: Whole) -> Filing = {
   }
 }
 
-// What a dependent trusts of its compiled dependencies instead of walking their bodies: the rows
-// that seed their definitions, the hashes those definitions compiled under, and the bodies the
-// emitter reads. The stub sources the dependent parses in their place travel as package modules.
-pub type Interfaces = { defs: List<KnownDefRow>, pins: List<Pin>, bodies: List<BodyRow> }
+// What a load takes from compiled packages in place of their modules' bodies, which are blanks.
+pub type Interfaces = {
+  modules: List<Bytes>,
+  defs: List<KnownDefRow>,
+  fixed: List<Fixed>,
+  effectful: List<Bytes>,
+}
 
-pub fn no_interfaces() -> Interfaces = { defs: [], pins: [], bodies: [] }
-
-// The dependents' real bodies replace the blanks their stubs hashed to, keyed by name; a name the
-// interface answers for carries no blank through.
-fn splice_bodies(h: HashOutput, bodies: List<BodyRow>) -> HashOutput =
-  if len(bodies) == 0 { h } else {
-    let named = fold(bodies, map_new(), |acc: Map<Bytes, Bool>, b: BodyRow|
-      map_insert(acc, b.name, true));
-    { ..h, bodies: append(filter(h.bodies, |b: BodyRow| !map_contains(named, b.name)), bodies) }
-  }
+pub fn no_interfaces() -> Interfaces = { modules: [], defs: [], fixed: [], effectful: [] }
 
 pub fn analyse(parsed: List<Parsed>) -> Analysis = analyse_with(parsed, [], [])
 
@@ -1539,7 +1545,7 @@ pub fn analyse_with(
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
   pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
-  ifaces: Interfaces = { defs: [], pins: [], bodies: [] },
+  ifaces: Interfaces = { modules: [], defs: [], fixed: [], effectful: [] },
 ) -> Analysis = {
   let clo = closure(pkgs, map(parsed, |p: Parsed| p.name));
   let all = fold(clo.modules, parsed, |acc: List<Parsed>, m: { pkg: Int, src: Source }|
@@ -1639,7 +1645,7 @@ fn analyse_closure(
   tests: List<KnownTestRow>,
   root_count: Int,
   toolchain: Bool,
-  ifaces: Interfaces = { defs: [], pins: [], bodies: [] },
+  ifaces: Interfaces = { modules: [], defs: [], fixed: [], effectful: [] },
 ) -> Analysis = {
   // The packages' identity reports ahead of anything the program text has to say: manifest
   // and graph diags point one slot past every module, in manifest order.
@@ -1671,14 +1677,11 @@ fn analyse_closure(
           let built = build_index(x.mods, x.r);
           if len(built.diags) > 0 { Refused(map(built.diags, outside_every_module)) } else {
             // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
-            let hashes: HashOutput = splice_bodies(
-              hash_index_pinned(built.index, ifaces.pins),
-              ifaces.bodies,
-            );
+            let hashes: HashOutput = hash_index_pinned(built.index, ifaces.fixed);
             let checked: Front = check_front_with(
               x.r,
               x.mods,
-              taken(x.mods, built.index, hashes, defs, tests),
+              taken(x.mods, built.index, hashes, defs, tests, ifaces.effectful),
             );
             if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
               Analysed({
@@ -1687,11 +1690,12 @@ fn analyse_closure(
                 checked: checked,
                 index: built.index,
                 hashes: hashes,
-                warnings: map(unused(built.index), outside_every_module),
+                warnings: map(unused(built.index, ifaces.fixed), outside_every_module),
                 manifest: at(clo.packages, 0).manifest,
                 packages: tables.pkgs,
                 pins: pins_of(clo),
                 mod_pkg: tables.mod_pkg,
+                stubs: ifaces.modules,
               })
             }
           }
@@ -1886,13 +1890,14 @@ fn lowered(r: Resolved, m: Int, params: List<Bytes>, e: Expr) -> Option<Code> =
 fn lowered_at(r: Resolved, m: Int, params: List<Bytes>, e: Expr) -> Lowered =
   { at: span_at(m, expr_span(e)), code: lowered(r, m, params, e) }
 
-// `result` takes the slot after the parameters, as the obligation's binders place it.
-fn def_claim(r: Resolved, m: Int, module: Bytes, d: FnDef) -> Claim = {
+// `result` takes the slot after the parameters, as the obligation's binders place it. An opaque
+// definition is claimed by its spec alone: what it promises, not how it is written.
+fn def_claim(r: Resolved, m: Int, module: Bytes, d: FnDef, opaque: Bool) -> Claim = {
   let params = map(d.params, |p: Param| p.name.name);
   ClaimDef({
     name: qualify(module, d.name.name),
     params: len(params),
-    body: lowered(r, m, params, d.body),
+    body: if opaque { None } else { lowered(r, m, params, d.body) },
     spec: map(d.spec, |c: SpecClause|
       {
         kind: c.kind,
@@ -1916,14 +1921,19 @@ fn law_claim(r: Resolved, m: Int, module: Bytes, d: LawDef) -> Claim = {
 }
 
 fn claims_of(mods: List<Mod>, r: Resolved) -> List<Claim> =
-  claims_of_modules(mods, r, range(0, len(mods)))
+  claims_of_modules(mods, r, range(0, len(mods)), |m: Bytes| false)
 
-fn claims_of_modules(mods: List<Mod>, r: Resolved, wanted: List<Int>) -> List<Claim> =
+fn claims_of_modules(
+  mods: List<Mod>,
+  r: Resolved,
+  wanted: List<Int>,
+  opaque: (Bytes) -> Bool,
+) -> List<Claim> =
   fold(wanted, [], |acc: List<Claim>, i: Int| {
     let m = at(mods, i);
     fold(m.module.items, acc, |a: List<Claim>, it: Item|
       match it {
-        IFn(d) -> push(a, def_claim(r, i, m.name, d)),
+        IFn(d) -> push(a, def_claim(r, i, m.name, d, opaque(m.name))),
         // A split over a type is sound only with every variant in hand.
         IType(d) -> match d.body {
           TDSum(vs) -> push(a, ClaimSum({ name: qualify(m.name, d.name.name), variants: len(vs) })),
@@ -1964,7 +1974,13 @@ pub fn claims(
 // lowers them, from a program `analyse` checked: its parse and resolution are reused, and the checker
 // walks again only the definitions there that write a record update — the one thing lowering reads
 // from it — seeded with every other definition's and test's rows as the next analysis would be.
-pub fn claims_in(w: Whole, wanted: List<Int>) -> List<Claim> = {
+// A module the run does not own is claimed by its specs, so its source and its stub answer alike.
+pub fn claims_in(
+  w: Whole,
+  wanted: List<Int>,
+  owned: (Bytes) -> Bool = |m: Bytes| true,
+) -> List<Claim> = {
+  let stubs = fold(w.stubs, map_new(), |acc: Map<Bytes, Bool>, s: Bytes| map_insert(acc, s, true));
   let walked = fold(wanted, map_new(), |acc: Map<Bytes, Bool>, i: Int| {
     let m = at(w.mods, i);
     fold(m.module.items, acc, |a: Map<Bytes, Bool>, it: Item|
@@ -1984,7 +2000,9 @@ pub fn claims_in(w: Whole, wanted: List<Int>) -> List<Claim> = {
   );
   match update_shapes_with(w.r, w.mods, known) {
     None -> panic("a program the front end checked does not check"),
-    Some(shapes) -> claims_of_modules(expanded_mods(w.mods, shapes), w.r, wanted),
+    Some(shapes) ->
+      claims_of_modules(expanded_mods(w.mods, shapes), w.r, wanted, |m: Bytes|
+        map_contains(stubs, m) || !owned(m)),
   }
 }
 
@@ -2150,6 +2168,7 @@ pub fn analyse_pulling_std_with(
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
   pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
+  ifaces: Interfaces = { modules: [], defs: [], fixed: [], effectful: [] },
 ) -> Pulled = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
@@ -2171,8 +2190,9 @@ pub fn analyse_pulling_std_with(
   });
   {
     pulled: x.pulled,
-    out: if len(x.diags) > 0 { Refused(x.diags) }
-    else { analyse_closure(x.parsed, clo, defs, tests, len(user), toolchain) },
+    out: if len(x.diags) > 0 { Refused(x.diags) } else {
+      analyse_closure(x.parsed, clo, append(defs, ifaces.defs), tests, len(user), toolchain, ifaces)
+    },
   }
 }
 
@@ -2184,6 +2204,7 @@ pub type FrontAnswer = { pulled: List<Bytes>, dump: Dump }
 // `analyse_pulling_std_with`'s answer as the rows it holds: what the driver reads. The rows handed
 // in are the last answer's: what this program hashes the same is taken from them, and only what
 // moved is walked.
+// The runtime calls this at a fixed arity, so interfaces go through `analyse_pulling_std_with`.
 pub fn answer_pulling_std_with(
   user: List<Source>,
   shipped: List<Source>,
