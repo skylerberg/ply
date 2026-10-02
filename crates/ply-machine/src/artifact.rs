@@ -1,6 +1,7 @@
 //! The deployable artifact: the transitive closure of one entry point, in the same bytes the
 //! content-addressed store already holds.
 
+use crate::body::StoredBody;
 use crate::load::Loaded;
 use crate::payload::record;
 use ply_eval::decode::{self, At};
@@ -8,7 +9,6 @@ use ply_eval::{
     DefHash, DefInfo, Diagnostic, Ended, Front, HashOutput, ModuleName, Severity, SourceMap, Span,
     Symbol, Value, codes,
 };
-use ply_store::body::StoredBody;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -30,11 +30,23 @@ pub struct EmbeddedUnit {
     pub text: Vec<u8>,
 }
 
+/// The compiler that built an artifact, as the digest of its sources: one built by another reads its
+/// closure and bodies another way.
+pub fn compiler() -> [u8; 32] {
+    *blake3::hash(ply_codegen::c::producer::identity().as_bytes()).as_bytes()
+}
+
+/// The runtime an artifact's unit was compiled against, as the digest of the helper table it calls.
+pub fn runtime() -> [u8; 32] {
+    *blake3::hash(ply_codegen::c::exports::helpers_digest().as_bytes()).as_bytes()
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Artifact {
+    /// [`compiler`] where it was built.
     pub frontend: [u8; 32],
+    /// [`runtime`] where it was built.
     pub runtime: [u8; 32],
-    pub body_encoding: u32,
     pub std: [u8; 32],
     pub entry: DefHash,
     /// Sorted by hash, which makes two builds byte-identical.
@@ -77,7 +89,6 @@ impl Artifact {
         let head = record(vec![
             ("frontend", Value::bytes(self.frontend)),
             ("runtime", Value::bytes(self.runtime)),
-            ("body_encoding", Value::Int(i64::from(self.body_encoding))),
             ("stdlib", Value::bytes(self.std)),
             ("entry", Value::bytes(self.entry.0)),
         ]);
@@ -242,7 +253,6 @@ struct Placed {
 struct Container {
     frontend: [u8; 32],
     runtime: [u8; 32],
-    body_encoding: u32,
     std: [u8; 32],
     entry: DefHash,
     digest: [u8; 32],
@@ -267,7 +277,6 @@ fn container(bytes: &[u8], path: &Path) -> Result<Container, Diagnostic> {
         Ok(Ok(Container {
             frontend: hash("frontend")?,
             runtime: hash("runtime")?,
-            body_encoding: opened.field("body_encoding")?.number()?,
             std: hash("stdlib")?,
             entry: DefHash(hash("entry")?),
             digest: hash("digest")?,
@@ -341,23 +350,19 @@ struct Emission {
 }
 
 /// What a build of a program is a function of, as one digest: its sources (already digested),
-/// the shelf, the emitter and the store versions a decode refuses a mismatch of. The launcher
-/// gates the committed CLI artifact on this: behind the sources, a binary runs the sources
-/// instead.
+/// the shelf, the compiler and the runtime a decode refuses a mismatch of. The launcher gates the
+/// committed CLI artifact on this: behind the sources, a binary runs the sources instead.
 pub fn toolchain_stamp(program_digest: &str) -> String {
-    let (frontend_version, runtime_version, body_encoding) = crate::shelf::store_versions();
     let mut hasher = blake3::Hasher::new();
     for part in [
-        program_digest,
-        ply_codegen::c::producer::digest_of(crate::shelf::sources()).as_str(),
-        ply_codegen::c::producer::identity().as_str(),
-        frontend_version,
-        runtime_version,
+        program_digest.as_bytes(),
+        ply_codegen::c::producer::digest_of(crate::shelf::sources()).as_bytes(),
+        &compiler(),
+        &runtime(),
     ] {
-        hasher.update(part.as_bytes());
+        hasher.update(part);
         hasher.update(&[0]);
     }
-    hasher.update(&body_encoding.to_le_bytes());
     hasher.finalize().to_hex()[..16].to_string()
 }
 
@@ -368,7 +373,7 @@ pub fn build(
 ) -> Result<Built, Vec<Diagnostic>> {
     let front = &loaded.front;
     let hashes = &front.hashes;
-    let bodies = ply_store::body::of_front(front);
+    let bodies = crate::body::of_front(front);
     let Some(entry_hash) = hashes.defs.get(&entry.name).copied() else {
         return Err(vec![missing_entry(&entry.name)]);
     };
@@ -381,9 +386,8 @@ pub fn build(
     }
 
     let mut out = Artifact {
-        frontend: *blake3::hash(ply_store::FRONTEND_VERSION.as_bytes()).as_bytes(),
-        runtime: *blake3::hash(ply_store::RUNTIME_VERSION.as_bytes()).as_bytes(),
-        body_encoding: ply_store::BODY_ENCODING,
+        frontend: compiler(),
+        runtime: runtime(),
         std: ply_std::digest(),
         entry: entry_hash,
         bodies: BTreeMap::new(),
@@ -433,11 +437,10 @@ pub fn build(
 
 /// What a library's `.plyz` carries: the compiled unit for a set of definitions, and the head a
 /// consumer's gate reads. A library has no artifact — no entry, no closure — so the head fields
-/// are the same three a program's artifact computes.
+/// are the ones a program's artifact computes.
 pub struct LibraryUnit {
     pub frontend: [u8; 32],
     pub runtime: [u8; 32],
-    pub body_encoding: u32,
     pub stdlib: [u8; 32],
     pub payload: Vec<u8>,
 }
@@ -460,9 +463,8 @@ pub fn library_unit(loaded: &Loaded, names: &[String]) -> Result<LibraryUnit, Ve
                 )]
             })?;
             Ok(LibraryUnit {
-                frontend: *blake3::hash(ply_store::FRONTEND_VERSION.as_bytes()).as_bytes(),
-                runtime: *blake3::hash(ply_store::RUNTIME_VERSION.as_bytes()).as_bytes(),
-                body_encoding: ply_store::BODY_ENCODING,
+                frontend: compiler(),
+                runtime: runtime(),
                 stdlib: ply_std::digest(),
                 payload,
             })
@@ -641,12 +643,7 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
     let container = container(bytes, path)?;
     let stated = container.digest;
 
-    check_versions(
-        path,
-        container.frontend,
-        container.runtime,
-        container.body_encoding,
-    )?;
+    check_versions(path, container.frontend, container.runtime)?;
     let mut warnings = Vec::new();
     if container.std != ply_std::digest() {
         warnings.push(stdlib_changed());
@@ -655,7 +652,6 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
     let mut out = Artifact {
         frontend: container.frontend,
         runtime: container.runtime,
-        body_encoding: container.body_encoding,
         std: container.std,
         entry: container.entry,
         bodies: BTreeMap::new(),
@@ -794,41 +790,17 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
     Ok((out, warnings))
 }
 
-fn check_versions(
-    path: &Path,
-    frontend: [u8; 32],
-    runtime: [u8; 32],
-    body_encoding: u32,
-) -> Result<(), Diagnostic> {
-    let mine_frontend = *blake3::hash(ply_store::FRONTEND_VERSION.as_bytes()).as_bytes();
-    let mine_runtime = *blake3::hash(ply_store::RUNTIME_VERSION.as_bytes()).as_bytes();
-    if body_encoding != ply_store::BODY_ENCODING {
+fn check_versions(path: &Path, frontend: [u8; 32], runtime: [u8; 32]) -> Result<(), Diagnostic> {
+    if frontend != compiler() {
         return Err(version(
             path,
-            format!(
-                "the artifact's definition bodies are encoding {body_encoding} and this `ply` \
-                 reads encoding {}",
-                ply_store::BODY_ENCODING
-            ),
+            "the artifact was built by another compiler than this `ply` ships",
         ));
     }
-    if frontend != mine_frontend {
+    if runtime != self::runtime() {
         return Err(version(
             path,
-            format!(
-                "the artifact was built by a different front end; this `ply` is FRONTEND_VERSION \
-                 {}",
-                ply_store::FRONTEND_VERSION
-            ),
-        ));
-    }
-    if runtime != mine_runtime {
-        return Err(version(
-            path,
-            format!(
-                "the artifact was built for a different runtime; this `ply` is RUNTIME_VERSION {}",
-                ply_store::RUNTIME_VERSION
-            ),
+            "the artifact was compiled for another runtime than this `ply` runs",
         ));
     }
     Ok(())
@@ -956,8 +928,6 @@ pub fn front_cache(artifact: &Artifact) -> PathBuf {
     // What the entry is written as is part of its key.
     hasher.update(b"front.FrontAnswer as ply_eval::codec\0");
     hasher.update(&closure.digest());
-    hasher.update(ply_store::FRONTEND_VERSION.as_bytes());
-    hasher.update(&[0]);
     hasher.update(ply_codegen::c::producer::identity().as_bytes());
     hasher.update(&[0]);
     hasher.update(&ply_std::digest());
@@ -1046,7 +1016,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     let front = answered.front;
 
     let hashes = &front.hashes;
-    let bodies = ply_store::body::of_front(&front);
+    let bodies = crate::body::of_front(&front);
     let mut rebuilt: BTreeMap<DefHash, StoredBody> = BTreeMap::new();
     for (name, hash) in &artifact.names {
         let symbol = Symbol::new(name);

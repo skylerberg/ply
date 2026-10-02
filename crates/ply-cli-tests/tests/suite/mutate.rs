@@ -57,7 +57,11 @@ fn a_mutant_the_tests_let_through_survives_and_fails_the_run() {
 fn every_mutant_of_a_well_tested_definition_is_killed_and_the_cache_is_untouched() {
     let dir = project(SOURCE);
     ply(dir.path()).arg("test").assert().success();
-    let before = std::fs::read(dir.path().join(".ply-cache/results.json")).unwrap();
+    let stored = || {
+        ["store.idx", "store.dat"]
+            .map(|f| std::fs::read(dir.path().join(".ply-cache").join(f)).unwrap())
+    };
+    let before = stored();
 
     let out = ply(dir.path())
         .args(["test", "--mutate", "m.add", "--json"])
@@ -69,8 +73,7 @@ fn every_mutant_of_a_well_tested_definition_is_killed_and_the_cache_is_untouched
     assert!(m["killed"].as_u64().unwrap() >= 1, "{m}");
     assert_eq!(v["exit_code"], 0, "{v}");
 
-    let after = std::fs::read(dir.path().join(".ply-cache/results.json")).unwrap();
-    assert_eq!(before, after, "a mutant left something in the cache");
+    assert!(before == stored(), "a mutant left something in the cache");
 }
 
 #[test]

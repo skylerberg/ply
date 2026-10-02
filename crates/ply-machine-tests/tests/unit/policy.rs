@@ -56,9 +56,9 @@ fn a_family_lends_under_one_effect_and_that_is_the_one_a_program_declares() {
             );
         }
     }
-    // The two whose effect is not named for the family: a grant is checked against the effect.
+    // The one whose effect is not named for the family: a grant is checked against the effect.
     assert_eq!(policy::effect_of("claims"), Some("prover"));
-    assert_eq!(policy::effect_of("cache"), Some("store"));
+    assert_eq!(policy::effect_of("cache"), None);
     assert_eq!(policy::effect_of("everything"), None);
 }
 
@@ -90,7 +90,7 @@ fn a_familys_values_are_named_by_the_module_the_program_declares_it_in() {
     // These families build values of types their program declares; lending one to a consumer that
     // imports the CLI's modules is the same operations, named as it names them.
     let consumer = |effect: &str| format!("cli.{}", own(effect));
-    for family in ["machine", "claims", "cache", "hosts"] {
+    for family in ["machine", "claims", "hosts"] {
         let as_cli = policy::lent(family, &own).expect("the family is there");
         let as_consumer = policy::lent(family, &consumer).expect("the family is there");
         assert_eq!(

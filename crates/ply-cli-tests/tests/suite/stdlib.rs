@@ -1,7 +1,6 @@
 use crate::harness::{json_of, ply, repo, warm_agrees, write};
 use ply_eval::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_machine::load::{LoadError, Loaded, load};
-use ply_store::{ContentHash, Store};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -248,14 +247,10 @@ fn a_shipped_module_is_fingerprinted_under_its_pseudo_path() {
 
     let path = ply_std::pseudo_path("std.net");
     assert_eq!(path, PathBuf::from("<std>/net.ply"));
-    let store = Store::open(dir.path()).unwrap();
-    let fingerprint = store
-        .fingerprint(&path)
-        .expect("the shipped module is filed under its pseudo-path");
     assert_eq!(
-        fingerprint.content_hash,
-        ContentHash::of(ply_std::NET.as_bytes()),
-        "the fingerprint must key on the embedded source bytes"
+        filed_files(dir.path(), "std.net.drain"),
+        ["<std>/net.ply"],
+        "the shipped module is filed under its pseudo-path"
     );
 }
 
@@ -424,34 +419,6 @@ fn ply_std_show_written_bare_prints_every_shipped_source() {
     assert_eq!(listed, shipped, "got:\n{text}");
 }
 
-#[test]
-fn a_cache_written_under_another_digest_warns_once_and_says_how_much_moved() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "app.ply", IMPORTER);
-
-    assert!(stdlib_notices(dir.path()).is_empty(), "a cold cache warns");
-    assert_eq!(
-        Store::open(dir.path()).unwrap().stdlib_digest().as_deref(),
-        Some(ply_std::digest_short().as_str())
-    );
-
-    // A warm cache written by a build whose stdlib was something else.
-    std::fs::write(dir.path().join(".ply-cache/stdlib"), "b3:000000000000\n").unwrap();
-    let notices = stdlib_notices(dir.path());
-    assert_eq!(notices.len(), 1, "{notices:?}");
-    let rendered = notices[0].to_string();
-    assert!(rendered.contains("b3:000000000000"), "{rendered}");
-    assert!(rendered.contains(&ply_std::digest_short()), "{rendered}");
-    // Nothing moved: the shipped sources are the last run's; only the recorded digest was a lie.
-    assert!(
-        rendered.contains("no definition this program reaches changed"),
-        "{rendered}"
-    );
-
-    // Once. The run that saw it recorded the digest, so the next is quiet.
-    assert!(stdlib_notices(dir.path()).is_empty());
-}
-
 /// The `W0605` notices a `ply check` at `dir` gives.
 fn stdlib_notices(dir: &Path) -> Vec<Value> {
     let answer = json_of(&ply(dir).args(["check", "--json"]).output().unwrap());
@@ -465,10 +432,27 @@ fn stdlib_notices(dir: &Path) -> Vec<Value> {
 }
 
 #[test]
-fn a_cold_cache_does_not_warn_about_the_stdlib() {
+fn neither_a_cold_cache_nor_a_warm_one_warns_about_the_stdlib() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "app.ply", IMPORTER);
-    assert!(stdlib_notices(dir.path()).is_empty());
+    assert!(stdlib_notices(dir.path()).is_empty(), "cold");
+    assert!(stdlib_notices(dir.path()).is_empty(), "warm");
+}
+
+/// What `ply cache inspect` says is filed for `name`: each match's file.
+fn filed_files(dir: &Path, name: &str) -> Vec<String> {
+    let answer = json_of(
+        &ply(dir)
+            .args(["cache", "inspect", name, "--json"])
+            .output()
+            .unwrap(),
+    );
+    answer["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["file"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// The port's answer over a flat directory, pulling in the shipped modules itself, and the driver's.
@@ -688,22 +672,17 @@ fn compaction_keeps_the_shipped_modules_it_loaded() {
     write(dir.path(), "app.ply", IMPORTER);
     ply(dir.path()).arg("test").output().unwrap();
 
-    let path = ply_std::pseudo_path("std.net");
-    assert!(
-        Store::open(dir.path())
-            .unwrap()
-            .fingerprint(&path)
-            .is_some(),
+    assert_eq!(
+        filed_files(dir.path(), "std.net.drain"),
+        ["<std>/net.ply"],
         "the run recorded nothing to compact"
     );
 
     let out = ply(dir.path()).args(["cache", "compact"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "got:\n{}", output(&out));
-    assert!(
-        Store::open(dir.path())
-            .unwrap()
-            .fingerprint(&path)
-            .is_some(),
+    assert_eq!(
+        filed_files(dir.path(), "std.net.drain"),
+        ["<std>/net.ply"],
         "compaction dropped a module this binary still ships"
     );
 }

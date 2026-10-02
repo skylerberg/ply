@@ -1537,7 +1537,7 @@ fn cache_stats_counts_what_a_run_recorded() {
     assert_eq!(v["action"], "stats");
     // Two tests plus the definition each vouched for.
     assert!(v["entries"].as_u64().unwrap() >= 2);
-    assert_eq!(v["runtime_version"], ply_store::RUNTIME_VERSION);
+    assert!(v["format"].is_number());
 }
 
 #[test]
@@ -1558,7 +1558,7 @@ fn cache_clear_makes_the_next_run_re_prove_everything() {
 fn a_corrupt_cache_degrades_to_an_empty_one_rather_than_crashing() {
     let dir = project(GREEN);
     ply(dir.path()).arg("test").assert().success();
-    std::fs::write(dir.path().join(".ply-cache/results.json"), "{ truncated").unwrap();
+    std::fs::write(dir.path().join(".ply-cache/store.idx"), "{ truncated").unwrap();
 
     let out = ply(dir.path()).arg("test").output().unwrap();
     assert_eq!(out.status.code(), Some(0));
@@ -1601,23 +1601,33 @@ fn an_earlier_module_does_not_lose_the_attribution() {
     assert_eq!(culprit["definitions"][0], "b.b holds");
 }
 
-/// The baseline is read while diagnosing a failure, after every other point the run collects store warnings.
+/// Mangles every entry the store's data file holds, past its header: what a half-written append leaves.
+fn mangle_the_store(dir: &std::path::Path) {
+    let data = dir.join(".ply-cache/store.dat");
+    let mut bytes = std::fs::read(&data).unwrap();
+    for byte in bytes.iter_mut().skip(64) {
+        *byte ^= 0x5a;
+    }
+    std::fs::write(&data, &bytes).unwrap();
+}
+
+/// Damage is said in the text and in the document, and the run goes on as if nothing was kept.
 #[test]
-fn a_corrupt_baseline_is_reported_rather_than_read_as_never_passed() {
+fn a_damaged_store_is_reported_and_the_run_goes_on() {
     let dir = project(GREEN);
     ply(dir.path()).arg("test").assert().success();
-    std::fs::write(dir.path().join(".ply-cache/passes.json"), "{ truncated").unwrap();
+    mangle_the_store(dir.path());
     std::fs::write(dir.path().join("m.ply"), GREEN.replace("x * 2", "x * 3")).unwrap();
 
     let out = ply(dir.path()).arg("test").output().unwrap();
     assert_eq!(out.status.code(), Some(1), "the edit has to fail a test");
     let text = stdout_of(&out);
     assert!(
-        text.contains("pass records") && text.contains("corrupt"),
-        "the unreadable baseline must be named:\n{text}"
+        text.contains("corrupt"),
+        "the damage must be named:\n{text}"
     );
 
-    std::fs::write(dir.path().join(".ply-cache/passes.json"), "{ truncated").unwrap();
+    mangle_the_store(dir.path());
     let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
     let codes: Vec<&str> = v["warnings"]
         .as_array()
@@ -1659,7 +1669,6 @@ fn cache_stats_reports_open_time_and_the_front_end_files() {
     assert!(v["frontend"]["sources"].as_u64().unwrap() >= 1);
     assert!(v["frontend"]["bodies"].is_number());
     assert_eq!(v["frontend"]["compact_suggested"], false);
-    assert!(v["results_bytes"].as_u64().unwrap() > 0);
 }
 
 #[test]
@@ -1851,65 +1860,51 @@ fn cache_inspect_reports_a_test_and_whether_it_is_proven() {
 }
 
 #[test]
-fn an_unreadable_front_end_cache_says_the_results_survived_it() {
+fn a_cache_left_by_the_earlier_format_is_explained_once_and_removed() {
     let dir = project(GREEN);
-    ply(dir.path()).arg("test").assert().success();
-
-    let index = dir.path().join(".ply-cache/frontend.idx");
-    assert!(index.is_file(), "the front-end index should exist by now");
-    std::fs::write(&index, b"PLYFEIDX not really an index").unwrap();
-
-    let out = ply(dir.path()).arg("test").output().unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    let text = stdout_of(&out);
-    assert!(
-        text.contains("selected 0 of 2 (2 cached)"),
-        "the result cache is versioned apart and must survive:\n{text}"
-    );
-    assert!(
-        text.contains("no test re-runs"),
-        "the user has to be told what survived:\n{text}"
-    );
-}
-
-#[test]
-fn a_leftover_json_front_end_cache_is_explained_and_then_removed() {
-    let dir = project(GREEN);
-    ply(dir.path()).arg("test").assert().success();
-
     let cache = dir.path().join(".ply-cache");
-    std::fs::remove_file(cache.join("frontend.idx")).unwrap();
-    std::fs::remove_file(cache.join("frontend.dat")).unwrap();
-    std::fs::write(cache.join("frontend.json"), "{\"format\":2,\"defs\":{}}").unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    for old in [
+        "frontend.idx",
+        "frontend.dat",
+        "results.json",
+        "passes.json",
+    ] {
+        std::fs::write(cache.join(old), "{}").unwrap();
+    }
 
     let out = ply(dir.path()).arg("test").output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     let text = stdout_of(&out);
     assert!(text.contains("format changed"), "got:\n{text}");
-    assert!(text.contains("no test re-runs"), "got:\n{text}");
-    assert!(
-        text.contains("selected 0 of 2 (2 cached)"),
-        "the result cache must survive the migration:\n{text}"
-    );
+    assert!(text.contains("selected 2 of 2 (0 cached)"), "got:\n{text}");
+    for old in [
+        "frontend.idx",
+        "frontend.dat",
+        "results.json",
+        "passes.json",
+    ] {
+        assert!(
+            !cache.join(old).exists(),
+            "`{old}` must not be left behind forever"
+        );
+    }
 
-    assert!(
-        !cache.join("frontend.json").exists(),
-        "the unreadable file must not be left behind forever"
-    );
     let text = stdout_of(&ply(dir.path()).arg("test").output().unwrap());
     assert!(
         !text.contains("format changed"),
         "the migration is reported once, not every run:\n{text}"
     );
+    assert!(text.contains("selected 0 of 2 (2 cached)"), "got:\n{text}");
 }
 
 #[test]
-fn cache_stats_reports_a_discarded_front_end_cache_too() {
+fn cache_stats_reports_a_discarded_store_too() {
     let dir = project(GREEN);
     ply(dir.path()).arg("test").assert().success();
     std::fs::write(
-        dir.path().join(".ply-cache/frontend.idx"),
-        b"PLYFEIDX not really an index",
+        dir.path().join(".ply-cache/store.idx"),
+        b"PLYSTIDX not really an index",
     )
     .unwrap();
 
@@ -1925,7 +1920,7 @@ fn cache_stats_reports_a_discarded_front_end_cache_too() {
         .iter()
         .map(|w| w["code"].as_str().unwrap())
         .collect();
-    assert!(codes.contains(&"W0603"), "got {codes:?}");
+    assert!(codes.contains(&"W0602"), "got {codes:?}");
 }
 
 #[test]
@@ -2448,11 +2443,11 @@ fn an_unreadable_cache_file_is_reported_once_not_once_per_read() {
         .iter()
         .map(|w| w["message"].as_str().unwrap())
         .collect();
-    let passes: Vec<&&str> = messages
+    let unreadable: Vec<&&str> = messages
         .iter()
-        .filter(|m| m.contains("passes.json"))
+        .filter(|m| m.contains("the store is unreadable"))
         .collect();
-    assert_eq!(passes.len(), 1, "{messages:#?}");
+    assert_eq!(unreadable.len(), 1, "{messages:#?}");
 
     let mut unique = messages.clone();
     unique.sort_unstable();

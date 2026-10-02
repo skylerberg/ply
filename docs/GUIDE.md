@@ -42,15 +42,17 @@ directory name and file stem must be an identifier (`E0111`). `std` and
 named under either collides with its prefix (`E0133`). Naming a single file
 makes its parent the root and loads only that file.
 
-**The cache.** `.ply-cache/` at the root holds the front-end, result and
-obligation caches, the review baseline, and the git dependencies that were
-fetched; `vendor/` holds the ones `ply vendor` copied, which is what a checkout
-that must not reach the network carries. It is safe to delete
-(`ply cache clear`); add it to `.gitignore`. `PLY_CACHE_UPSTREAM=DIR` names a
-second cache shared between checkouts and machines, a directory on any storage
-they all reach: the passes and discharged obligations found there count here,
-and this run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads
-only). Entries are keyed by content and by the `ply` version, so nothing
+**The cache.** `.ply-cache/` at the root holds the store — what the front end
+filed for each file, the tests' passes and baselines, the discharged
+obligations and the review baselines, in one data file (`store.dat`) found
+through one index (`store.idx`) — and the git dependencies that were fetched;
+`vendor/` holds the ones `ply vendor` copied, which is what a checkout that must
+not reach the network carries. It is safe to delete (`ply cache clear` discards
+the store); add it to `.gitignore`. `PLY_CACHE_UPSTREAM=DIR` names a second
+cache shared between checkouts and machines, a directory on any storage they all
+reach: the passes and discharged obligations found there count here, and this
+run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads only). Entries
+are keyed by content and by the shape of what is stored, so nothing
 machine-specific is ever shared; `--no-cache` ignores it. A dependency's own
 modules are keyed by its manifest rather than by where it sits, so moving or
 re-checking-out a dependency keeps what was cached for it.
@@ -2658,7 +2660,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `cache` (`store`), `bootstrap` (`archive`), `hosts` (`tcb`) or `edit` (`ply run`, `ply test`); `E0459` otherwise |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `bootstrap` (`archive`), `hosts` (`tcb`) or `edit` (`ply run`, `ply test`); `E0459` otherwise |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -2698,7 +2700,8 @@ BLAKE3 digest covers those and the entry point, so an edit nothing reaches
 leaves it unchanged; a failure raised by a run of it carries no line number. A
 body or closure that fails verification is `E0443`, as is a build whose closure
 holds two identical declarations it cannot tell apart (two effects, or two
-members of one recursive group); an artifact from another version is `E0444`.
+members of one recursive group); an artifact built by another compiler, or
+compiled for another runtime, is `E0444`: rebuild it with this `ply`.
 `--config-schema` ships that function too, resolved as a run resolves it: a name
 that is not a nullary pure function returning a `ConfigSpec` is `E0440`.
 
@@ -2819,7 +2822,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |
 | `ply bootstrap <path>` | writes the front end as the bundle the runtime builds it from: `unit.c.gz` beside `SOURCES.digest`; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing), `--profile` (default `release`) |
-| `ply cache clear\|stats\|compact [path]` | discard results / report size and reclaimable space / reclaim it |
+| `ply cache clear\|stats\|compact [path]` | discard the store / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
@@ -2853,7 +2856,7 @@ A run whose work is interpreted has no such frames: its allocations are the
 interpreter's, and they are what the totals are made of.
 What a host may lend is a policy with names, one family each:
 `machine` (load, bind, enter and call a nested program), `tester`, `claims`,
-`builder`, `cache`, `bootstrap`, `hosts` and `edit`, each with a summary a
+`builder`, `bootstrap`, `hosts` and `edit`, each with a summary a
 reviewer can read. The launcher lends its own program every family; another host
 names the ones it means, so `machine` — which drives another machine — is
 granted on purpose and not by accident.
@@ -3033,7 +3036,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0441` | required configuration key missing |
 | `E0442` | configuration value of the wrong shape |
 | `E0443` | artifact does not verify |
-| `E0444` | artifact built under another version |
+| `E0444` | artifact built by another compiler or for another runtime |
 | `E0445` | `trace.exit` of a span not open on this task |
 | `E0446` | value outlives its region |
 | `E0448` | definition the compiled tier cannot compile |

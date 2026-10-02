@@ -67,12 +67,3 @@ pub fn is_pseudo_path(path: &Path) -> bool {
             .to_str()
             .is_some_and(|p| p.starts_with(&format!("{COMPILER_PSEUDO_ROOT}/")))
 }
-
-/// The three store versions a decode refuses a mismatch of, as the runtime's store keeps them.
-pub fn store_versions() -> (&'static str, &'static str, u32) {
-    (
-        ply_store::FRONTEND_VERSION,
-        ply_store::RUNTIME_VERSION,
-        ply_store::BODY_ENCODING,
-    )
-}

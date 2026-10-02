@@ -105,7 +105,7 @@ fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments()
     }
 }
 
-/// A failing assertion's diagnostic is what `ply-store` caches in a failing outcome.
+/// A failing assertion's diagnostic is what a report prints and a failure document carries.
 #[test]
 fn the_assertion_differ_never_descends_into_a_credential() {
     let hidden = "hunter2";

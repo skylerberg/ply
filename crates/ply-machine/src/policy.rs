@@ -37,11 +37,6 @@ pub const FAMILIES: &[Family] = &[
         summary: "build an artifact and stamp it",
     },
     Family {
-        name: "cache",
-        effect: "store",
-        summary: "read, reclaim and discard what the caches hold",
-    },
-    Family {
         name: "bootstrap",
         effect: "archive",
         summary: "emit the compiler's own bundle",
@@ -93,7 +88,6 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
         "tester" => crate::tester::Session::new().lent(),
         "claims" => crate::claims::lent(&declared("prover")),
         "builder" => crate::builder::lent(),
-        "cache" => crate::cache::lent(&declared("store")),
         "bootstrap" => crate::bootstrap::lent(),
         "hosts" => crate::hosts::lent(&declared("tcb")),
         "edit" => crate::edit::lent(),
@@ -102,7 +96,7 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
 }
 
 /// The effect a family's operations are performed under, which is what a program must declare to
-/// be lent it: `claims` lends `prover` and `cache` lends `store`, so the family's name is not it.
+/// be lent it: `claims` lends `prover`, so the family's name is not it.
 pub fn effect_of(family: &str) -> Option<&'static str> {
     FAMILIES.iter().find(|f| f.name == family).map(|f| f.effect)
 }
