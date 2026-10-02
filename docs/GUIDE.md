@@ -434,7 +434,8 @@ set of row binders, taken in order whatever each member calls them, so a
 definition generic over a row may call a mutually recursive sibling and the row
 crosses the cycle. Members binding different numbers of them are `E0307`, as
 with labels, and a call inside the group keeps the row the group was called
-with: an argument carrying another row is `E0308`. Type parameters are *not*
+with: an argument may perform less than it, and one that performs anything the
+group's row does not hold is `E0308`. Type parameters are *not*
 shared — each definition keeps its own — so a call inside a group that would
 need the callee's type parameter at another type is polymorphic recursion, which
 Ply does not infer. That is `E0308` as well: break the cycle so the callee is
@@ -471,7 +472,9 @@ checks see it.
 
 `(A, B) -> C` is pure; `(A) -> B / {db.read[users]}` and `(A) -> B / e` carry
 rows. With no `/`, the row is inferred in a signature and empty in a declared
-type. Functions cannot be compared, encoded, ordered or used as map keys.
+type. A function passed as an argument may perform less than its parameter's
+row permits (§6.2). Functions cannot be compared, encoded, ordered or used as
+map keys.
 
 * **Written:** every parameter and return type of a top-level `fn` (`E0126`),
   and every `forall` binder type.
@@ -753,6 +756,14 @@ callee written `/ {net.send[conn]}` but not one written `/ {net.write[conn]}`
 row as `body performs`. Rows in types unify atom for atom: a function value
 whose row names an operation is not the same type as one whose row names the
 mode.
+
+An argument is the exception: a function passed where a function is expected
+may perform less than the parameter's row permits, though not more (`E0302`).
+So `run(|| a.x())` checks against `fn run(k: () -> Unit / {a.x, a.z})`, and two
+arguments may fill one row variable with both their rows: given
+`fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e`, the call
+`both(|| a.x(), || b.y())` performs exactly `{a.x, b.y}`. An operation's
+arguments follow the same rule.
 
 Resource labels are global — two modules writing `[users]` name one resource —
 and a definition may be generic over one (§4.5). Its binder shadows that global
