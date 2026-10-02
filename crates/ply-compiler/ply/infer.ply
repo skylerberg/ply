@@ -17,19 +17,20 @@ import tycore (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar,
                TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity,
                OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
                atoms_union, atoms_contains, atoms_difference, resource_covers, row_empty, row_open,
-               row_closed, row_singleton, row_is_pure, row_union, row_without, row_without_covered,
-               atom_conflicts, con, con1, t_int, t_bool, t_string, t_bytes, t_float, t_decimal,
-               t_unit, t_list, t_option, t_map, t_iter, t_secret, t_fn, mono, fields_sorted,
-               field_get, mentions_secret, at, set_at, take, drop, append, contains_int,
-               contains_bytes, ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var,
-               fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row,
-               is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row,
-               occurs_ty, solve_continuation_row, free_vars, unify, unify_row, covariant_con,
-               env_new, env_push, env_pop, env_bind, env_bind_global, env_remove_global, env_lookup,
-               env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme, generalize,
-               region_prefix, region_of, label_type, label_of, resolve_atom, atom_text, atoms_text,
-               resource_text, scheme_text, type_text, row_text, Printer, printer_new,
-               printer_naming, print_ty, print_row)
+               row_closed, row_singleton, row_is_pure, row_is_pure_but_raise, without_abort,
+               row_union, row_without, row_without_covered, atom_conflicts, con, con1, t_int,
+               t_bool, t_string, t_bytes, t_float, t_decimal, t_unit, t_list, t_option, t_map,
+               t_iter, t_secret, t_fn, mono, fields_sorted, field_get, mentions_secret, at, set_at,
+               take, drop, append, contains_int, contains_bytes, ints_insert, ints_union,
+               ints_difference, fresh_new, fresh_ty_var, fresh_ty, fresh_row_var, fresh_row,
+               subst_new, mark_rigid_ty, mark_rigid_row, is_rigid_ty, is_rigid_row, shallow,
+               resolve_ty, resolved_tail, resolve_row, occurs_ty, solve_continuation_row, free_vars,
+               unify, unify_row, covariant_con, env_new, env_push, env_pop, env_bind,
+               env_bind_global, env_remove_global, env_lookup, env_depth_of, env_locals,
+               instantiate_with, instantiate, rename_scheme, generalize, region_prefix, region_of,
+               label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
+               scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
+               print_row)
 import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Edit,
                 Fix, with_fix, insertion, Ns, NValue, NType, NEffect, resolve_modules, Resolved_,
                 Failed, Expanded, find, lookup, dlookup, space, qualify, default_binder, dump_diags,
@@ -6444,7 +6445,8 @@ fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
   }
 }
 
-// A binder's type must be one the generator can inhabit: no handler, written row, `Cell`, `Task` or `Secret`.
+// A binder's type must be one the generator can inhabit: no handler, written row beyond a raise,
+// `Cell`, `Task` or `Secret`.
 fn law_binder(cx: Cx, b: Binder) -> { cx: Cx, t: Type } =
   match handler_mention(cx, b.ty) {
     Some(span) ->
@@ -6534,6 +6536,8 @@ fn first_handler_mention(cx: Cx, ts: List<TypeExpr>) -> Option<Span> =
 fn first_reason<a>(xs: List<a>, f: (a) -> Option<Bytes>) -> Option<Bytes> =
   fold(xs, None, |acc: Option<Bytes>, x: a| match acc { Some(_) -> acc, None -> f(x) })
 
+fn raises(a: AtomExpr) -> Bool = is_bare(a.eff) && a.eff.name.name == b"abort"
+
 fn written_row_reason(te: TypeExpr) -> Option<Bytes> =
   match te {
     TVar(_) -> None,
@@ -6549,7 +6553,7 @@ fn written_row_reason(te: TypeExpr) -> Option<Bytes> =
             Some(
               b"an effect variable has no binder here, and a law quantifies over values rather than over rows",
             ),
-          None -> match list_at(row.atoms, 0) {
+          None -> match list_at(filter(row.atoms, |a: AtomExpr| !raises(a)), 0) {
             Some(a) ->
               Some(
                 bytes_concat_all([
@@ -6594,7 +6598,7 @@ fn ungeneratable(cx: Cx, ty: Type, seen: List<Bytes>) -> Option<Bytes> =
         },
       }
     },
-    TyFn(f) -> if !row_is_pure(f.effects) {
+    TyFn(f) -> if !row_is_pure_but_raise(f.effects) {
       Some(
         bytes_concat_all([
           b"a function with row ",
@@ -6633,7 +6637,7 @@ fn site_short(s: SpecSite) -> Bytes =
 fn check_spec_purity(cx: Cx, site: SpecSite, allowed: List<Atom>, at_: Span, row: Row) -> Cx = {
   let law_body = match site { SSLawBody -> true, _ -> false };
   let c1: Cx = fold(
-    filter(row.atoms, |a: Atom| !atoms_covered(allowed, a)),
+    filter(without_abort(row.atoms), |a: Atom| !atoms_covered(allowed, a)),
     cx,
     |c: Cx, atom: Atom| {
       let found = site_for(c, atom);
@@ -8252,7 +8256,8 @@ pub fn check_front_with(r: Resolved, mods: List<Mod>, known: Known) -> Front = {
 }
 
 // The one purity the root keys, the emitter's constant table and the seam's memo all read.
-pub fn published_pure(d: DefInfo) -> Bool = len(d.footprint) == 0 && len(d.constraints) == 0
+pub fn published_pure(d: DefInfo) -> Bool =
+  len(without_abort(d.footprint)) == 0 && len(d.constraints) == 0
 
 // What the emitter needs from the checker: the definitions published pure, for its constant table,
 // the labels every call fills, the shape of every record update, and every operator's operand type.
@@ -9493,6 +9498,15 @@ test "a raise is in the row, and a clause for it discharges it" {
   assert_eq(check_codes(b"fn f() -> Int / {} = abort.raise(\"x\")"), [b"E0302"]);
   assert_eq(
     check_codes(b"fn f() -> Int / {} = handle { abort.raise(\"x\") } with { abort.raise(m) -> 0 }"),
+    [],
+  )
+}
+
+test "a spec may raise, and a function type that only raises can be generated" {
+  assert_eq(
+    check_codes(
+      b"fn safe(n: Int) -> Int / {abort.raise} = if n < 0 { abort.raise(\"negative\") } else { n }\nfn f(n: Int) -> Int requires safe(n) >= 0 = n\nlaw \"applies\" forall (g: (Int) -> Int / {abort.raise}) { g(1) == g(1) }",
+    ),
     [],
   )
 }
