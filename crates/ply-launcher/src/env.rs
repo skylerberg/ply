@@ -5,10 +5,8 @@
 //!
 //! Colour is decided here and nowhere else: a program has no terminal to ask.
 
-use ply_eval::host::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
-};
-use ply_eval::{Diagnostic, Symbol, Value, codes};
+use ply_eval::host::{HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity};
+use ply_eval::{Diagnostic, Value, codes};
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -31,22 +29,11 @@ pub fn registrations(version: &str) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     });
     OPERATIONS
         .into_iter()
-        .map(|(op, path)| (registration(op, path), Arc::clone(&site)))
+        .map(|(op, path)| {
+            let op = ply_machine::hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
+            (op, Arc::clone(&site))
+        })
         .collect()
-}
-
-fn registration(op: &str, path: &'static str) -> HostOp {
-    HostOp {
-        effect: Symbol::new(EFFECT),
-        op: Symbol::new(op),
-        resource: HostResource::Any,
-        // The environment is not a function of program state.
-        determinism: Determinism::Nondeterministic,
-        linearity: Linearity::Repeatable,
-        blocking: false,
-        secrets: false,
-        path,
-    }
 }
 
 struct Site {

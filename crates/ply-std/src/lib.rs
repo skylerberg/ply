@@ -164,14 +164,18 @@ pub fn digest() -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// `b3:` plus twelve hex characters, as `ply hosts --digest` prints.
-pub fn digest_short() -> String {
-    let bytes = digest();
+/// `b3:` plus a digest's first twelve hex characters: every digest Ply prints for a person to
+/// compare is written this way.
+pub fn short_digest(digest: &[u8; 32]) -> String {
     let mut out = String::from("b3:");
-    for byte in &bytes[..6] {
+    for byte in &digest[..6] {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+pub fn digest_short() -> String {
+    short_digest(&digest())
 }
 
 #[cfg(test)]
@@ -225,6 +229,11 @@ mod tests {
         assert!(!is_std("stdlib"));
         assert!(!is_std("mine.std"));
         assert!(!is_std(""));
+    }
+
+    #[test]
+    fn a_short_digest_is_its_prefix_and_six_bytes_of_hex() {
+        assert_eq!(short_digest(&[0xab; 32]), "b3:abababababab");
     }
 
     #[test]

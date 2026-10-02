@@ -167,9 +167,9 @@ struct DepPackage {
 }
 
 /// The modules a package root holds, named relative to it; a root with no readable `ply.pkg`
-/// answers nothing, and the front end's `E0135` says why.
-/// One package root as a walk found it: the key it is named by, and the directory its files are in.
-/// They are the same thing for a path dependency, and a fetched tree's directory for a git one.
+/// answers nothing, and the front end's `E0135` says why. `root` is the key the walk names the
+/// package by and `dir` the directory its files are in: the same for a path dependency, and a
+/// fetched tree's directory for a git one.
 fn read_package(root: &str, dir: &Path) -> DepPackage {
     // The walk records its paths tidied, so `./vendor/x` is stripped from them as `vendor/x`.
     let dir = crate::load::tidy(dir);
@@ -200,8 +200,6 @@ fn read_package(root: &str, dir: &Path) -> DepPackage {
     }
 }
 
-/// What the manifests on hand ask for, round by round, until nothing is new: the closure of
-/// the root package's path dependencies.
 /// The directories `ply vendor` wrote, by the want each answers: `<want>\t<dir>` a line, read once
 /// per walk. A project that was not vendored has no index and reads nothing extra.
 fn vendored(root: &Path) -> Vec<(String, PathBuf)> {
@@ -216,6 +214,8 @@ fn vendored(root: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
+/// What the manifests on hand ask for, round by round, until nothing is new: the closure of the
+/// root package's dependencies, each read from its vendored copy, its path or its fetched tree.
 fn walk_packages(
     root: &Path,
     manifest: &Option<(PathBuf, Arc<str>)>,

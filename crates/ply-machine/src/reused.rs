@@ -10,7 +10,6 @@ use ply_codegen::c::{bundle, sweep};
 use ply_eval::decode::{At, Error};
 use ply_eval::{ModuleName, SourceId, Value};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// What an entry is, as its `format` field says: one of any other shape is no entry.
@@ -125,16 +124,5 @@ pub fn file(key: &str, files: &[(String, String)], dump: &Value) {
     let Ok(bytes) = ply_eval::codec::encode(&entry) else {
         return;
     };
-    static WRITES: AtomicU64 = AtomicU64::new(0);
-    let tmp = dir.join(format!(
-        "{key}.{}.{}.tmp",
-        std::process::id(),
-        WRITES.fetch_add(1, Ordering::Relaxed)
-    ));
-    if std::fs::write(&tmp, &bytes)
-        .and_then(|()| std::fs::rename(&tmp, &path))
-        .is_err()
-    {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = ply_eval::files::write_atomically(&path, &bytes);
 }
