@@ -1,0 +1,332 @@
+// `std.trace` as a row, a schedule and a sink: a function's row names its channels, two channels do
+// not conflict, a task's spans nest in its own, and the records go to the error stream. A record
+// the sink writes goes to the process's own stream, so a run that writes one is a process.
+
+import harness (Ran, project, in_memory, one, on_disk, spawned, said, stderr, json_of, at, path,
+                items, str, int, truth, shown)
+import std.json
+import std.json (Json, Bool)
+import std.string
+
+fn service() -> String =
+  \\import std.trace
+  \\import std.trace (trace)
+  \\
+  \\pub fn place_order(sku: String) -> Int / {trace.enter[orders], trace.exit[orders], trace.count[orders]} {
+  \\  let span = trace.enter[orders]("place_order", map_new());
+  \\  trace.count[orders]("orders_placed", 1, map_new());
+  \\  trace.exit[orders](span, trace::Ok);
+  \\  1
+  \\}
+  \\
+  \\pub fn restock(sku: String) -> Int / {trace.event[items]} {
+  \\  trace.event[items](trace::Info, "restocked", map_new());
+  \\  2
+  \\}
+  \\
+  \\test "what place_order records is a claim a test can assert on" {
+  \\  with_cell[collector](trace::sink()) { s -> {
+  \\    handle {
+  \\      assert_eq(place_order("BOLT-1"), 1)
+  \\    } with {
+  \\      trace.enter[orders](n, fs) -> {
+  \\        let out = trace::enter_step(cell_get(s), "orders", n, fs);
+  \\        cell_set(s, out.sink);
+  \\        out.span
+  \\      },
+  \\      trace.exit[orders](sp, o) -> {
+  \\        let out = trace::exit_step(cell_get(s), sp, o);
+  \\        cell_set(s, out.sink);
+  \\        assert(out.ok)
+  \\      },
+  \\      trace.count[orders](n, d, fs) ->
+  \\        cell_set(s, trace::count_step(cell_get(s), "orders", n, d, fs)),
+  \\    };
+  \\    let rs = trace::drain(cell_get(s));
+  \\    assert_eq(len(rs), 3);
+  \\    assert_eq(trace::counter_total(rs, "orders_placed"), 1);
+  \\    assert_eq(len(trace::on_channel(rs, "items")), 0)
+  \\  } }
+  \\}
+  \\
+  \\test "what restock records is recorded on its own channel" {
+  \\  with_cell[collector](trace::sink()) { s -> {
+  \\    handle {
+  \\      assert_eq(restock("BOLT-1"), 2)
+  \\    } with {
+  \\      trace.event[items](l, n, fs) ->
+  \\        cell_set(s, trace::event_step(cell_get(s), "items", l, n, fs)),
+  \\    };
+  \\    assert_eq(len(trace::on_channel(trace::drain(cell_get(s)), "items")), 1)
+  \\  } }
+  \\}
+  \\
+
+fn codes_of(report: Json) -> List<String> =
+  map(items(at(report, "diagnostics")), |d: Json| str(at(d, "code")))
+
+// Every record the sink wrote, one JSON object a line on the error stream.
+fn records_of(r: Ran) -> List<Json> =
+  map(filter(r.err, |l: String| string_starts_with(l, "{")), |l: String|
+    match json::parse_string(l) {
+      Ok(j) -> j,
+      Err(e) -> panic(json::error_to_string(e) ++ ": " ++ l),
+    })
+
+test/nondet "a function's row names the channels it records on" {
+  // Whitespace-insensitive: a long row wraps, and the claim is about the atoms.
+  let text = string::join(
+    string::words(said(in_memory(one(service()), ["check", "--types"]))),
+    " ",
+  );
+  assert(
+    string_contains(
+      text,
+      "place_order : (String) -> Int / {std.trace.trace.count[orders], std.trace.trace.enter[orders], std.trace.trace.exit[orders]}",
+    ),
+    Some(text),
+  );
+  assert(
+    string_contains(text, "restock : (String) -> Int / {std.trace.trace.event[items]}"),
+    Some(text),
+  )
+}
+
+test/nondet "two channels do not conflict and two definitions on one channel do" {
+  // Host-backed, so the atoms survive into the schedule rather than being discharged by a handler.
+  project([
+    {
+      path: "app.ply",
+      text:
+        \\import std.trace
+        \\import std.trace (trace)
+        \\
+        \\test/nondet "records on orders" {
+        \\  trace.event[orders](trace::Info, "a", map_new())
+        \\}
+        \\
+        \\test/nondet "records on orders too" {
+        \\  trace.event[orders](trace::Info, "b", map_new())
+        \\}
+        \\
+        \\test/nondet "records on items" {
+        \\  trace.event[items](trace::Info, "c", map_new())
+        \\}
+        \\
+    },
+  ]);
+  let explained = json_of(spawned(["test", "--host", "--explain", "--json"], []));
+  let selection = at(explained, "selection");
+  let group_of = |name: String|
+    match filter(items(at(selection, "tests")), |t: Json| str(at(t, "name")) == name) {
+      [t, ..] -> int(at(t, "group")),
+      [] -> panic("no test `" ++ name ++ "`: " ++ shown(explained)),
+    };
+  assert(
+    group_of("records on orders") != group_of("records on orders too"),
+    Some("two tests recording on one channel conflict and are serialised: " ++ shown(explained)),
+  );
+  assert(
+    group_of("records on orders") == group_of("records on items"),
+    Some("two channels do not conflict, so these two run beside each other: " ++ shown(explained)),
+  );
+  // Three tests, two groups.
+  assert(int(path(selection, ["parallelism", "groups"])) == 2, Some(shown(explained)))
+}
+
+test/nondet "two tasks interleaving spans nest into their own and not each other's" {
+  project([
+    {
+      path: "app.ply",
+      text:
+        \\import std.trace
+        \\import std.trace (trace)
+        \\
+        \\fn work(name: String) -> Int / {trace.write[http], task.write} {
+        \\  let outer = trace.enter[http](name, map_new());
+        \\  task.yield();
+        \\  let inner = trace.enter[http](string_concat(name, "-inner"), map_new());
+        \\  task.yield();
+        \\  trace.exit[http](inner, trace::Ok);
+        \\  trace.exit[http](outer, trace::Ok);
+        \\  1
+        \\}
+        \\
+        \\pub fn main() -> Int / {trace.write[http], task.write} {
+        \\  let a = task.spawn(|| work("a"));
+        \\  let b = task.spawn(|| work("b"));
+        \\  task.join(a) + task.join(b)
+        \\}
+        \\
+    },
+  ]);
+  let r = spawned(["run", "--host", "--trace", "json"], []);
+  let records = records_of(r);
+  assert(len(records) == 8, Some("two spans per task, entered and exited: " ++ stderr(r)));
+  let name_of = |id: Json|
+    match filter(records, |rec: Json| at(rec, "span") == id && str(at(rec, "kind")) == "enter") {
+      [rec, ..] -> str(at(rec, "name")),
+      [] -> "-",
+    };
+  let parent_of = |name: String|
+    match filter(records, |rec: Json|
+        str(at(rec, "name")) == name && str(at(rec, "kind")) == "enter") {
+      [rec, ..] -> name_of(at(rec, "parent")),
+      [] -> panic("no `" ++ name ++ "`: " ++ stderr(r)),
+    };
+  assert(parent_of("a") == "-", Some(stderr(r)));
+  assert(parent_of("b") == "-", Some("task 2's span is not inside task 1's: " ++ stderr(r)));
+  assert(parent_of("a-inner") == "a", Some(stderr(r)));
+  assert(parent_of("b-inner") == "b", Some(stderr(r)));
+  assert(
+    len(filter(records, |rec: Json| str(at(rec, "outcome")) == "abandoned")) == 0,
+    Some("every span was closed by the task that opened it: " ++ stderr(r)),
+  )
+}
+
+test/nondet "a continuation resumed twice across a span is E0426" {
+  project([
+    {
+      path: "app.ply",
+      text:
+        \\import std.trace
+        \\import std.trace (trace)
+        \\
+        \\effect ask { read pick() -> Int }
+        \\
+        \\fn body() -> Int / {trace.write[http], ask.read} {
+        \\  let n = ask.pick();
+        \\  let span = trace.enter[http]("work", map_new());
+        \\  trace.exit[http](span, trace::Ok);
+        \\  n
+        \\}
+        \\
+        \\pub fn main() -> Int / {trace.write[http]} =
+        \\  handle { body() } with {
+        \\    ask.pick() resume k -> k(1) + k(2),
+        \\  }
+        \\
+    },
+  ]);
+  let report = json_of(spawned(["run", "--host", "--trace", "json", "--json"], []));
+  assert(
+    len(filter(codes_of(report), |c: String| c == "E0426")) > 0,
+    Some("a replayed span is a wrong answer about what happened: " ++ shown(report)),
+  )
+}
+
+// `nondet` on the declaration is load-bearing: only a collecting handler makes such a test compile.
+test/nondet "a det test reaching an unhandled trace operation is E0412" {
+  project([
+    {
+      path: "app.ply",
+      text:
+        \\import std.trace
+        \\import std.trace (trace)
+        \\
+        \\test "this cannot be deterministic" {
+        \\  trace.event[orders](trace::Info, "x", map_new())
+        \\}
+        \\
+    },
+  ]);
+  fold([["test", "--json"], ["test", "--host", "--json"]], (), |u: Unit, args: List<String>| {
+    let report = json_of(on_disk(args));
+    assert(
+      len(filter(codes_of(report), |c: String| c == "E0412")) > 0,
+      Some("with " ++ string::join(args, " ") ++ ", expected E0412: " ++ shown(report)),
+    )
+  })
+}
+
+test/nondet "a twin-backed tracing test is det, cached and hermetic" {
+  project([{ path: "app.ply", text: service() }]);
+  let first = json_of(on_disk(["test", "--json"]));
+  assert(int(at(first, "exit_code")) == 0, Some(shown(first)));
+  assert(int(path(first, ["summary", "passed"])) == 2, Some(shown(first)));
+  assert(int(path(first, ["summary", "failed"])) == 0, Some(shown(first)));
+  assert(
+    int(path(first, ["summary", "cached"])) == 0,
+    Some("a first run has nothing cached: " ++ shown(first)),
+  );
+  // Hermetic: no `--host` was passed and nothing refused.
+  assert(
+    !string_contains(said(on_disk(["test"])), "E0424"),
+    Some("a twin-backed test must not reach the boundary"),
+  );
+  let second = json_of(on_disk(["test", "--json"]));
+  assert(
+    int(path(second, ["summary", "cached"])) == 2,
+    Some("a trace-collecting test is a `det` test and re-runs never: " ++ shown(second)),
+  );
+  assert(int(path(second, ["summary", "passed"])) == 0, Some(shown(second)))
+}
+
+// "Discarding records" and "writing JSON" are different facts, so `--trace off` binds a real,
+// listed handler.
+test/nondet "ply hosts lists the sink per channel and names the one that serves the run" {
+  project([{ path: "app.ply", text: service() }]);
+  let listing = json_of(on_disk(["hosts", "--host", "--trace", "off", "--json"]));
+  let traced = filter(items(at(listing, "hosts")), |r: Json|
+    str(at(r, "effect")) == "std.trace.trace");
+  assert(
+    traced != [],
+    Some("the sink is a member of the trusted computing base: " ++ shown(listing)),
+  );
+  assert(
+    len(filter(traced, |r: Json| str(at(r, "handler")) != "ply_host::trace::discard")) == 0,
+    Some("`--trace off` is a listed handler, not an empty registry: " ++ shown(listing)),
+  );
+  // One row per channel the program actually records on, never a `*`.
+  let atoms = map(traced, |r: Json| str(at(r, "triple")));
+  let has = |a: String| len(filter(atoms, |x: String| x == a)) > 0;
+  assert(
+    has("std.trace.trace.count[orders]") && has("std.trace.trace.event[items]")
+      && !has("std.trace.trace.count[items]"),
+    Some("the listing expands to the channels the program uses: " ++ string::join(atoms, ", ")),
+  );
+  assert(
+    len(
+        filter(traced, |r: Json|
+          at(r, "deterministic") != Bool(false) || str(at(r, "linearity")) != "at_most_once"
+            || at(r, "blocking") != Bool(false)),
+      )
+      == 0,
+    Some(shown(listing)),
+  );
+  // Four rows: `enter`, `exit` and `count` on `orders`, `event` on `items`; an operation the
+  // program never performs on a channel is not a row.
+  assert(len(traced) == 4, Some(shown(listing)))
+}
+
+test/nondet "a trace line goes to stderr and leaves the JSON document on stdout intact" {
+  project([
+    {
+      path: "app.ply",
+      text:
+        \\import std.trace
+        \\import std.trace (trace)
+        \\
+        \\pub fn main() -> Int / {trace.write[orders]} {
+        \\  let span = trace.enter[orders]("main", map_new());
+        \\  trace.event[orders](trace::Info, "working",
+        \\    map_insert(map_new(), "sku", trace::FText("BOLT-1")));
+        \\  trace.exit[orders](span, trace::Ok);
+        \\  0
+        \\}
+        \\
+    },
+  ]);
+  let r = spawned(["run", "--host", "--trace", "json", "--json"], []);
+  let document = json_of(r);
+  assert(int(at(document, "exit_code")) == 0, Some(shown(document)));
+  let lines = records_of(r);
+  assert(len(lines) == 3, Some("an enter, an event and an exit: " ++ stderr(r)));
+  let line = |i: Int| match list_at(lines, i) { Some(l) -> l, None -> json::Null };
+  assert(str(at(line(0), "kind")) == "enter", Some(stderr(r)));
+  assert(str(at(line(0), "channel")) == "orders", Some(stderr(r)));
+  assert(str(path(line(1), ["fields", "sku"])) == "BOLT-1", Some(stderr(r)));
+  assert(str(at(line(2), "kind")) == "exit", Some(stderr(r)));
+  assert(str(at(line(2), "outcome")) == "ok", Some(stderr(r)));
+  assert(at(line(2), "span") == at(line(0), "span"), Some(stderr(r)))
+}

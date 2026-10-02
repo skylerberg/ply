@@ -5,7 +5,9 @@
 //! One binary. The engine's own unit tests, one per module of `crates/ply-machine/src`, are in
 //! `tests/unit`.
 
+mod artifact_enter;
 mod claims;
+mod driver_port;
 mod fixture;
 mod judged_effect;
 mod judging;

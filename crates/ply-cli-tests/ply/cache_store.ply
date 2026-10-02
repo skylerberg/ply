@@ -1,0 +1,276 @@
+// `ply cache`, and a store a run could not read: what the commands report and change, and that a
+// damaged file costs a run what it held and never the run.
+
+import harness (program, project, write, read, on_disk, said, stdout, stderr, json_of, at, path,
+                nth, items, str, int, truth, shown, contains_text)
+import std.bytes (xor_byte)
+import std.fs (fs, File)
+import std.json
+import std.json (Json, Null, Number)
+import std.string
+
+fn green() -> String =
+  \\fn double(x: Int) -> Int = x * 2
+  \\
+  \\fn main() -> Int = double(21)
+  \\
+  \\test "double doubles" { assert_eq(double(4), 8) }
+  \\
+  \\test "double of zero is zero" { assert_eq(double(0), 0) }
+  \\
+
+fn is_number(j: Json) -> Bool = match j { Number(_) -> true, _ -> false }
+
+fn stats() -> Json = json_of(on_disk(["cache", "stats", "--json"]))
+
+fn inspected(what: String) -> Json = json_of(on_disk(["cache", "inspect", what, "--json"]))
+
+fn codes_of(warnings: Json) -> List<String> = map(items(warnings), |w: Json| str(at(w, "code")))
+
+// `green` tested once, so the store holds what a run files.
+fn tested_once() -> Unit = {
+  program(green());
+  let r = on_disk(["test"]);
+  assert(r.code == 0, Some(said(r)))
+}
+
+test/nondet "cache stats counts what a run recorded" {
+  program(green());
+  let empty = stdout(on_disk(["cache", "stats"]));
+  assert(string_contains(empty, "0 cached results"), Some(empty));
+  assert(on_disk(["test"]).code == 0, None);
+  let v = stats();
+  assert(str(at(v, "command")) == "cache", Some(shown(v)));
+  assert(str(at(v, "action")) == "stats", Some(shown(v)));
+  // Two tests plus the definition each vouched for.
+  assert(int(at(v, "entries")) >= 2, Some(shown(v)));
+  assert(is_number(at(v, "format")), Some(shown(v)))
+}
+
+test/nondet "cache clear makes the next run re-prove everything" {
+  tested_once();
+  assert(string_contains(stdout(on_disk(["test"])), "selected 0 of 2"), None);
+  let r = on_disk(["cache", "clear"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "cleared"), Some(stdout(r)));
+  let text = stdout(on_disk(["test"]));
+  assert(string_contains(text, "selected 2 of 2 (0 cached)"), Some(text))
+}
+
+test/nondet "a corrupt cache degrades to an empty one rather than crashing" {
+  tested_once();
+  write(".ply-cache/store.idx", "{ truncated");
+  let r = on_disk(["test"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "selected 2 of 2 (0 cached)"), Some(stdout(r)));
+  assert(
+    string_contains(stdout(r), "warning"),
+    Some("the degradation must be reported:\n" ++ stdout(r)),
+  )
+}
+
+// Every entry the store's data file holds mangled past its header: what a half-written append leaves.
+fn mangle_the_store() -> Unit = {
+  let data = ".ply-cache/store.dat";
+  match fs.read_file[cwd](data) {
+    None -> panic("the run filed no store"),
+    Some(b) -> if bytes_len(b) > 64 {
+      let mangled = bytes_concat(
+        bytes_slice(b, 0, 64),
+        xor_byte(bytes_slice(b, 64, bytes_len(b)), 0x5a),
+      );
+      if !fs.write_file[cwd](data, mangled) { panic("could not mangle the store") }
+    },
+  }
+}
+
+// Damage is said in the text and in the document, and the run goes on as if nothing was kept.
+test/nondet "a damaged store is reported and the run goes on" {
+  tested_once();
+  mangle_the_store();
+  write("m.ply", string::replace(green(), "x * 2", "x * 3"));
+  let r = on_disk(["test"]);
+  assert(r.code == 1, Some("the edit has to fail a test: " ++ said(r)));
+  assert(string_contains(stdout(r), "corrupt"), Some("the damage must be named:\n" ++ stdout(r)));
+  mangle_the_store();
+  let v = json_of(on_disk(["test", "--json"]));
+  assert(
+    contains_text(codes_of(at(v, "warnings")), "W0602"),
+    Some("the machine artifact carries the same warning: " ++ shown(at(v, "warnings"))),
+  )
+}
+
+test/nondet "cache stats reports open time and the front-end files" {
+  tested_once();
+  let text = stdout(on_disk(["cache", "stats"]));
+  assert(string_contains(text, "opened in"), Some("the open cost is the claim:\n" ++ text));
+  assert(string_contains(text, "index"), Some("the front-end files must be sized:\n" ++ text));
+  assert(string_contains(text, "reclaimable"), Some(text));
+  let v = stats();
+  assert(is_number(at(v, "open_ms")), Some(shown(v)));
+  assert(int(path(v, ["frontend", "index_bytes"])) > 0, Some(shown(v)));
+  assert(is_number(path(v, ["frontend", "data_bytes"])), Some(shown(v)));
+  assert(int(path(v, ["frontend", "sources"])) >= 1, Some(shown(v)));
+  assert(is_number(path(v, ["frontend", "bodies"])), Some(shown(v)));
+  assert(path(v, ["frontend", "compact_suggested"]) == json::Bool(false), Some(shown(v)))
+}
+
+test/nondet "cache compact drops a deleted file and keeps the rest" {
+  project([{ path: "m.ply", text: green() }, { path: "gone.ply", text: "fn gone() -> Int = 9\n" }]);
+  assert(on_disk(["test"]).code == 0, None);
+  assert(int(path(stats(), ["frontend", "sources"])) == 2, None);
+  assert(fs.remove[cwd]("gone.ply"), None);
+  let r = on_disk(["cache", "compact"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "compacted"), Some(stdout(r)));
+  assert(string_contains(stdout(r), "dropped 1 file"), Some(stdout(r)));
+  let v = stats();
+  assert(int(path(v, ["frontend", "sources"])) == 1, Some(shown(v)));
+  // Compaction is a front-end garbage collection.
+  assert(int(at(v, "entries")) >= 2, Some(shown(v)));
+  let text = stdout(on_disk(["test"]));
+  assert(
+    string_contains(text, "selected 0 of 2 (2 cached)"),
+    Some("compaction must not cost a test:\n" ++ text),
+  )
+}
+
+test/nondet "cache compact --json is one object" {
+  tested_once();
+  let v = json_of(on_disk(["cache", "compact", "--json"]));
+  assert(str(at(v, "command")) == "cache", Some(shown(v)));
+  assert(str(at(v, "action")) == "compact", Some(shown(v)));
+  assert(truth(at(v, "ok")), Some(shown(v)));
+  assert(int(at(v, "exit_code")) == 0, Some(shown(v)));
+  assert(int(at(v, "files_kept")) == 1, Some(shown(v)));
+  assert(is_number(path(v, ["dropped", "definitions"])), Some(shown(v)));
+  assert(is_number(at(v, "bytes_before")), Some(shown(v)));
+  assert(is_number(at(v, "reclaimed_bytes")), Some(shown(v)))
+}
+
+test/nondet "cache inspect prints a resolved type rather than a serialization" {
+  program(
+    "effect db {\n  read all[t]() -> List<Int>\n}\nfn active(n: Int) -> List<Int> / {db.read[users]} = db.all[users]()\n",
+  );
+  assert(on_disk(["check"]).code == 0, None);
+  let r = on_disk(["cache", "inspect", "active"]);
+  assert(r.code == 0, Some(said(r)));
+  let text = stdout(r);
+  assert(string_contains(text, "m.active"), Some(text));
+  assert(
+    string_contains(text, "(Int) -> List<Int> / {m.db.read[users]}"),
+    Some("the type must read as a signature, not as JSON:\n" ++ text),
+  );
+  assert(string_contains(text, "footprint  {m.db.read[users]}"), Some(text));
+  assert(
+    string_contains(text, "m.ply:4:"),
+    Some("the declaring position must be shown:\n" ++ text),
+  );
+  assert(string_contains(text, "witness"), Some(text));
+  assert(string_contains(text, "body"), Some(text));
+  assert(string_contains(text, "result"), Some(text))
+}
+
+test/nondet "cache inspect accepts a hash prefix and emits json" {
+  program(green());
+  assert(on_disk(["check"]).code == 0, None);
+  let v = inspected("double");
+  assert(str(at(v, "command")) == "cache", Some(shown(v)));
+  assert(str(at(v, "action")) == "inspect", Some(shown(v)));
+  assert(len(items(at(v, "matches"))) == 1, Some(shown(v)));
+  let found = nth(at(v, "matches"), 0);
+  assert(str(at(found, "name")) == "m.double", Some(shown(found)));
+  assert(str(at(found, "kind")) == "fn", Some(shown(found)));
+  assert(str(at(found, "file")) == "m.ply", Some(shown(found)));
+  assert(at(found, "stale") == json::Bool(false), Some(shown(found)));
+  assert(str(path(found, ["interface", "type"])) == "(Int) -> Int", Some(shown(found)));
+  let by_prefix = inspected(string_slice(str(at(found, "hash")), 0, 6));
+  assert(str(at(nth(at(by_prefix, "matches"), 0), "name")) == "m.double", Some(shown(by_prefix)));
+  // A stored span is a range into the bytes as cached, so a same-length edit still invalidates it.
+  write("m.ply", string::replace(green(), "x * 2", "x + 2"));
+  let edited = nth(at(inspected("double"), "matches"), 0);
+  assert(at(edited, "stale") == json::Bool(true), Some(shown(edited)));
+  assert(at(edited, "location") == Null, Some(shown(edited)))
+}
+
+test/nondet "cache inspect of an unknown name is E0101 and exits two" {
+  program(green());
+  assert(on_disk(["check"]).code == 0, None);
+  let r = on_disk(["cache", "inspect", "no_such_thing"]);
+  assert(r.code == 2, Some(said(r)));
+  assert(string_contains(stderr(r), "E0101"), Some(stderr(r)));
+  let j = on_disk(["cache", "inspect", "no_such_thing", "--json"]);
+  assert(j.code == 2, Some(said(j)));
+  let v = json_of(j);
+  assert(at(v, "ok") == json::Bool(false), Some(shown(v)));
+  assert(str(at(nth(at(v, "diagnostics"), 0), "code")) == "E0101", Some(shown(v)))
+}
+
+test/nondet "cache inspect reports a test and whether it is proven" {
+  program(green());
+  assert(on_disk(["check"]).code == 0, None);
+  let before = nth(at(inspected("double doubles"), "matches"), 0);
+  assert(str(at(before, "kind")) == "test", Some(shown(before)));
+  assert(string_contains(str(at(before, "result")), "not proven"), Some(shown(before)));
+  assert(on_disk(["test"]).code == 0, None);
+  let after = nth(at(inspected("double doubles"), "matches"), 0);
+  assert(string_contains(str(at(after, "result")), "passed"), Some(shown(after)));
+  assert(path(after, ["interface", "nondet"]) == json::Bool(false), Some(shown(after)))
+}
+
+// What a cache of the format before the store kept: each is removed once, and said once.
+fn earlier_format() -> List<String> =
+  ["frontend.idx", "frontend.dat", "results.json", "passes.json"]
+
+test/nondet "a cache left by the earlier format is explained once and removed" {
+  program(green());
+  fold(earlier_format(), (), |u: Unit, old: String| write(".ply-cache/" ++ old, "{}"));
+  let r = on_disk(["test"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "format changed"), Some(stdout(r)));
+  assert(string_contains(stdout(r), "selected 2 of 2 (0 cached)"), Some(stdout(r)));
+  fold(earlier_format(), (), |u: Unit, old: String|
+    assert(
+      !fs.exists[cwd](".ply-cache/" ++ old),
+      Some("`" ++ old ++ "` must not be left behind forever"),
+    ));
+  let again = stdout(on_disk(["test"]));
+  assert(
+    !string_contains(again, "format changed"),
+    Some("the migration is reported once, not every run:\n" ++ again),
+  );
+  assert(string_contains(again, "selected 0 of 2 (2 cached)"), Some(again))
+}
+
+test/nondet "cache stats reports a discarded store too" {
+  tested_once();
+  write(".ply-cache/store.idx", "PLYSTIDX not really an index");
+  let v = stats();
+  assert(contains_text(codes_of(at(v, "warnings")), "W0602"), Some(shown(at(v, "warnings"))))
+}
+
+// One unreadable file is found by more than one read: a lazy consult and a flush that re-reads to
+// merge.
+test/nondet "an unreadable cache file is reported once, not once per read" {
+  tested_once();
+  let names = match fs.list_dir[cwd](".ply-cache") {
+    Some(ns) -> ns,
+    None -> panic("the run left no cache"),
+  };
+  fold(names, (), |u: Unit, name: String| {
+    let file = ".ply-cache/" ++ name;
+    if fs.kind[cwd](file) == File { write(file, "garbage") }
+  });
+  let r = on_disk(["test", "--json"]);
+  let messages = map(items(at(json_of(r), "warnings")), |w: Json| str(at(w, "message")));
+  let listed = string::join(messages, "\n");
+  assert(
+    len(filter(messages, |m: String| string_contains(m, "the store is unreadable"))) == 1,
+    Some(listed),
+  );
+  assert(
+    len(filter(messages, |m: String| len(filter(messages, |n: String| n == m)) > 1)) == 0,
+    Some("a warning was repeated:\n" ++ listed),
+  );
+  assert(r.code == 0, Some(said(r)))
+}

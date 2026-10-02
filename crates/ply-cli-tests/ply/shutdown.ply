@@ -1,0 +1,496 @@
+// A service stopped by a signal: it drains what is in flight within `--drain-ms`, says what it
+// abandoned when it cannot, and a second signal ends it at once.
+
+import harness (Server, project, repo_file, reserve, serving, connected, connection, dial, sent,
+                heard, hang_up, signal_to, ended, stop, finished, on_disk, said, stdout, stderr,
+                concatenated, at, path, items, str, int, shown)
+import std.json
+import std.json (Json)
+import std.net
+import std.net (net)
+import std.process (Exited, Signalled, Terminate)
+import std.string
+import std.time (time)
+
+// The status line and headers both programs answer with, as Ply source. The `HEAD` token in the
+// sources below is replaced with it, so an edit cannot leave the two answers disagreeing.
+fn head() -> String =
+  \\b"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Test-Nonce: NONCE\r\nContent-Length: "
+
+fn server_source() -> String =
+  \\import std.net
+  \\import std.net (net)
+  \\import std.signal (signal)
+  \\
+  \\// What a readiness probe reads. Its row says exactly what it consults, and a
+  \\// route whose row is empty is a route that checks nothing.
+  \\pub fn body() -> Bytes / {signal.read} =
+  \\  if signal.stopping() { b"draining" } else { b"ok" }
+  \\
+  \\fn answer(c: Int) -> Unit / {net.write[conn], signal.read} = {
+  \\  let _ = net.recv[conn](c, 4096, 20000);
+  \\  let payload = body();
+  \\  let head = bytes_concat(
+  \\    HEAD,
+  \\    bytes_concat(bytes_of_string(int_to_string(bytes_len(payload))), b"\r\n\r\n"));
+  \\  let _ = net::send_all[conn](c, bytes_concat(head, payload), 20000);
+  \\  net.close[conn](c)
+  \\}
+  \\
+  \\fn serve(l: Int, served: Int) -> Int / {net.write[listener], net.write[conn], signal.read} = {
+  \\  let c = net.accept[listener](l);
+  \\  if c == 0 {
+  \\    served
+  \\  } else {
+  \\    answer(c);
+  \\    serve(l, served + 1)
+  \\  }
+  \\}
+  \\
+  \\fn main() -> Int / {net.write[listener], net.write[conn], signal.read} = {
+  \\  let l = net.listen[listener](PORT);
+  \\  let served = serve(l, 0);
+  \\  net.close[listener](l);
+  \\  served
+  \\}
+  \\
+
+fn port_attempts() -> Int = 3
+
+fn probe_ms() -> Int = 60000
+
+// A token this test's server echoes in its answer, so a probe cannot read another run's server
+// on the same port as this one.
+fn nonce(port: Int) -> String = int_to_string(port) ++ "-" ++ int_to_string(time.elapsed_us())
+
+// Whether the answer on the reserved address is *this* test's server: a `200 OK` on the port is
+// not proof, because the port is the kernel's to hand out twice.
+fn ready(answer: String, token: String) -> Bool = string_contains(answer, token)
+
+fn the_request() -> Bytes = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+
+// A whole request and everything said back, `c` then closed.
+fn request(c: Int) -> String = {
+  sent(c, the_request());
+  heard(c, 20000)
+}
+
+fn start(flags: List<String>) -> Server = start_with(server_source(), flags)
+
+// Retries on a fresh port if this one was taken before `ply run` could claim it.
+fn start_with(source: String, flags: List<String>) -> Server = attempt(source, flags, [])
+
+fn attempt(source: String, flags: List<String>, refused: List<String>) -> Server =
+  if len(refused) == port_attempts() {
+    panic(
+      "`ply run --host` never answered a probe, on " ++ int_to_string(port_attempts())
+        ++ " ports:\n\n"
+        ++ string::join(refused, "\n\n"),
+    )
+  } else {
+    let port = reserve();
+    let token = nonce(port);
+    let text = string::replace(
+      string::replace(string::replace(source, "HEAD", head()), "PORT", int_to_string(port)),
+      "NONCE",
+      token,
+    );
+    project([{ path: "main.ply", text: text }]);
+    let server = serving(concatenated(["run", "--host"], flags), [], port);
+    // The probe is a whole request and response, and the answer has to carry this test's token.
+    let probed = connected(server, probe_ms(), |c: Int| {
+      sent(c, the_request());
+      ready(string_of_bytes_lossy(net::drain[client](c, b"", 20000)), token)
+    });
+    match probed {
+      Ok(c) -> {
+        hang_up(c);
+        server
+      },
+      Err(why) -> {
+        stop(server);
+        attempt(source, flags, push(refused, why))
+      },
+    }
+  }
+
+// What `fixture` hands back: the server, and the connection that found it listening.
+type Held = { server: Server, held: Int }
+
+// `tests/fixtures/<name>.ply` as committed, told its port by the setting `port_key`. It cannot echo
+// a token, so the connection that found it listening is handed back as the test's own.
+fn fixture(name: String, port_key: String, flags: List<String>) -> Held = {
+  let port = reserve();
+  let file = name ++ ".ply";
+  project([{ path: file, text: repo_file("tests/fixtures/" ++ file) }]);
+  let server = serving(
+    concatenated(concatenated(["run", "--host"], flags), [
+      "--set",
+      port_key ++ "=" ++ int_to_string(port),
+    ]),
+    [],
+    port,
+  );
+  { server: server, held: connection(server, probe_ms()) }
+}
+
+// A connection of the test's own to the running server.
+fn connect(s: Server) -> Int =
+  match dial(s.port, 5000) {
+    Some(c) -> c,
+    None -> {
+      stop(s);
+      panic("the server is not listening on " ++ int_to_string(s.port))
+    },
+  }
+
+// How the run ended, and everything it wrote, where `W0608` and the shutdown banner land.
+type Done = { code: Int, out: String, err: String }
+
+fn output(d: Done) -> String = d.out ++ d.err
+
+// A signal's death is `-1`: a killed run did not drain.
+fn finish(s: Server) -> Done = {
+  let f = ended(s, 60000, "the run never exited, so the drain hung rather than being bounded");
+  let r = finished(f);
+  { code: match f.ended { Exited(c) -> c, Signalled(_) -> -1 }, out: stdout(r), err: stderr(r) }
+}
+
+// Two runs can be handed the same port, and the one that loses the bind answers the winner's probe
+// with what looks like readiness. The token in the answer is what tells them apart, so this holds
+// `ready` to it rather than to the status line.
+test/nondet "a 200 OK from another server is not readiness" {
+  let decoy = net.listen[decoy](0);
+  let port = match net.local_port[decoy](decoy) { Some(p) -> p, None -> panic("a decoy port") };
+  let probe = match dial(port, 5000) { Some(c) -> c, None -> panic("the decoy listens") };
+  sent(probe, the_request());
+  let c = net.accept[decoy](decoy);
+  let _ = net.recv[decoy](c, 4096, 5000);
+  let _ = net::send_all[decoy](c, b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nok", 5000);
+  net.close[decoy](c);
+  net.close[decoy](decoy);
+  let answer = heard(probe, 5000);
+  assert(
+    string_contains(answer, "200 OK"),
+    Some("the decoy did not answer the probe, so this test proves nothing: " ++ answer),
+  );
+  assert(
+    !ready(answer, "the-token-this-test-asked-for"),
+    Some("a server that is not this test's read as ready:\n\n" ++ answer),
+  )
+}
+
+test/nondet "a request in flight at the signal gets its response and the run exits zero" {
+  let server = start(["--drain-ms", "30000"]);
+  let held = connect(server);
+  // The server is inside `net.recv` with a 20s deadline, so the signal lands with a request in
+  // flight.
+  time.sleep_ms(200);
+  signal_to(server, Terminate);
+  time.sleep_ms(200);
+  let answer = request(held);
+  assert(
+    string_contains(answer, "200 OK"),
+    Some("the in-flight request was dropped by the drain: " ++ answer),
+  );
+  assert(
+    string_ends_with(answer, "draining"),
+    Some(
+      "the route read the stop flag and answered `" ++ answer
+        ++ "`, so `signal.stopping()` did not reach the handler",
+    ),
+  );
+  let done = finish(server);
+  assert(done.code == 0, Some("a clean drain exits 0\n\n" ++ output(done)));
+  assert(
+    !string_contains(output(done), "W0608"),
+    Some("a drain that finished reported the deadline expiring\n\n" ++ output(done)),
+  );
+  assert(
+    string_contains(output(done), "stopping"),
+    Some("a stopping service prints what it is doing\n\n" ++ output(done)),
+  );
+  assert(
+    string_contains(output(done), "1 listener(s) closed"),
+    Some("the banner reports the listener the run actually closed\n\n" ++ output(done)),
+  );
+  assert(
+    string_contains(output(done), "1 connection(s) in flight"),
+    Some("the banner reports the connection that was actually open\n\n" ++ output(done)),
+  )
+}
+
+test/nondet "a connection opened after the stop gets no response" {
+  let server = start(["--drain-ms", "30000"]);
+  assert(string_contains(request(connect(server)), "200 OK"), None);
+  signal_to(server, Terminate);
+  // Phase 2 dials the parked `accept` awake and it answers `0`, so this connection is refused or
+  // accepted and closed.
+  time.sleep_ms(400);
+  match dial(server.port, 500) {
+    Some(late) -> {
+      let _ = net::send_all[client](late, the_request(), 3000);
+      let answer = heard(late, 3000);
+      assert(
+        answer == "",
+        Some("a connection opened after the run stopped accepting was answered " ++ answer),
+      )
+    },
+    None -> (),
+  };
+  let done = finish(server);
+  assert(done.code == 0, Some(output(done)))
+}
+
+// There is no cancellation, so the task is not unwound and is not handed a `503`.
+test/nondet "a drain that expires reports W0608 and exits three" {
+  let server = start(["--drain-ms", "300"]);
+  let held = connect(server);
+  // Held open and silent inside a 20s `net.recv`, so this request cannot finish inside a 300ms
+  // drain.
+  time.sleep_ms(200);
+  signal_to(server, Terminate);
+  let answer = heard(held, 30000);
+  assert(
+    answer == "",
+    Some(
+      "W5 has no cancellation, so a request live at the deadline gets nothing rather than a partial response; this client read "
+        ++ answer,
+    ),
+  );
+  let done = finish(server);
+  assert(
+    done.code == 3,
+    Some("a drain that dropped requests must not report success\n\n" ++ output(done)),
+  );
+  assert(
+    string_contains(output(done), "W0608"),
+    Some("the run exited 3 and never said why\n\n" ++ output(done)),
+  );
+  assert(
+    string_contains(output(done), "drain-ms"),
+    Some("`W0608` has to say what to do about it\n\n" ++ output(done)),
+  )
+}
+
+// `tests/fixtures/drain_incomplete.ply`: a head announcing a body that never comes keeps its
+// request reading for up to the program's `body_timeout_ms`, and a 300ms drain cannot wait that
+// out.
+test/nondet "the drain fixture abandons a request still reading its body" {
+  let f = fixture("drain_incomplete", "DRAIN_PORT", ["--json", "--drain-ms", "300"]);
+  sent(f.held, b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n");
+  time.sleep_ms(200);
+  signal_to(f.server, Terminate);
+  let answer = heard(f.held, 30000);
+  assert(
+    answer == "",
+    Some("a request live at the deadline is closed with no response; this client read " ++ answer),
+  );
+  let done = finish(f.server);
+  let report = match json::parse_string(done.out) {
+    Ok(j) -> j,
+    Err(e) ->
+      panic(
+        "`--json` writes one document on stdout: " ++ json::error_to_string(e) ++ "\n"
+          ++ output(done),
+      ),
+  };
+  assert(done.code == 3, Some(shown(report)));
+  assert(int(at(report, "exit_code")) == 3, Some(shown(report)));
+  assert(str(path(report, ["shutdown", "signal"])) == "TERM", Some(shown(report)));
+  assert(int(path(report, ["shutdown", "drain_ms"])) == 300, Some(shown(report)));
+  let diagnostics = items(at(report, "diagnostics"));
+  assert(
+    len(filter(diagnostics, |d: Json| str(at(d, "severity")) == "error")) == 0,
+    Some("the expired drain is the run's only failure: " ++ shown(report)),
+  );
+  let drained = match filter(diagnostics, |d: Json| str(at(d, "code")) == "W0608") {
+    [d, ..] -> d,
+    [] -> panic("the run exited 3 and never said why: " ++ shown(report)),
+  };
+  assert(str(at(drained, "severity")) == "warning", Some(shown(drained)));
+  assert(str(at(drained, "message")) == "the drain deadline expired", Some(shown(drained)));
+  let notes = map(items(at(drained, "notes")), str);
+  fold(
+    [
+      "1 connection(s) abandoned with no response written",
+      "raise `--drain-ms` above the program's own body_timeout_ms + write_timeout_ms",
+    ],
+    (),
+    |u: Unit, note: String|
+      assert(
+        len(filter(notes, |n: String| n == note)) > 0,
+        Some("`W0608` lacks `" ++ note ++ "`: " ++ shown(drained)),
+      ),
+  )
+}
+
+test/nondet "a second signal exits immediately and says what it abandoned" {
+  let server = start(["--drain-ms", "60000"]);
+  let held = connect(server);
+  time.sleep_ms(200);
+  signal_to(server, Terminate);
+  time.sleep_ms(300);
+  signal_to(server, Terminate);
+  let done = finish(server);
+  assert(
+    done.code == 143,
+    Some(
+      "a second SIGTERM exits 128+15, which is the number a supervisor would have read from a process that never caught it\n\n"
+        ++ output(done),
+    ),
+  );
+  assert(
+    string_contains(output(done), "abandoned"),
+    Some("a second signal prints what it cost before it goes\n\n" ++ output(done)),
+  );
+  hang_up(held)
+}
+
+test/nondet "during the lead the run still accepts and already says it is stopping" {
+  let server = start(["--drain-ms", "30000", "--drain-lead-ms", "2000"]);
+  assert(string_ends_with(request(connect(server)), "ok"), Some("not stopping yet"));
+  signal_to(server, Terminate);
+  time.sleep_ms(300);
+  // Inside the lead a new connection is still accepted, and the route reads the flag and sheds.
+  let answer = request(connect(server));
+  assert(
+    string_contains(answer, "200 OK") && string_ends_with(answer, "draining"),
+    Some("the lead phase stopped accepting, or the flag had not reached the program: " ++ answer),
+  );
+  let done = finish(server);
+  assert(done.code == 0, Some(output(done)));
+  assert(
+    string_contains(output(done), "lead 2000ms"),
+    Some(
+      "the run has to say what it will do on a signal before it does it, so the number can be compared by eye against the program's own body_timeout_ms + write_timeout_ms\n\n"
+        ++ output(done),
+    ),
+  );
+  assert(string_contains(output(done), "signals INT TERM"), Some(output(done)))
+}
+
+// A stop requested once would end every test after it: a coupling the footprint graph cannot see.
+test/nondet "signal is withheld under ply test and names the twin" {
+  project([
+    {
+      path: "main.ply",
+      text:
+        \\import std.signal (signal)
+        \\
+        \\pub fn shedding() -> Bool / {signal.read} = signal.stopping()
+        \\
+        \\test/nondet "a stop reaches the program" {
+        \\  assert(!shedding())
+        \\}
+        \\
+    },
+  ]);
+  // `--json` because the human projection renders the message rather than the code.
+  fold([["test", "--json"], ["test", "--host", "--json"]], (), |u: Unit, flags: List<String>| {
+    let r = on_disk(flags);
+    let shown_as = "`ply " ++ string::join(flags, " ") ++ "`";
+    assert(
+      string_contains(said(r), "E0424"),
+      Some(shown_as ++ " did not refuse `signal.stopping` at the boundary\n\n" ++ said(r)),
+    );
+    assert(
+      string_contains(said(r), "std.signal"),
+      Some("the refusal has to name the twin a test handles it over\n\n" ++ said(r)),
+    );
+    assert(
+      string_contains(said(r), "ply_host::signal::stopping"),
+      Some(
+        "the refusal has to name the handler that would have served it, which is the whole difference between `E0424` and `E0303`\n\n"
+          ++ said(r),
+      ),
+    )
+  })
+}
+
+// A task per connection: the shape the drain's unfinished-request case is about.
+fn concurrent() -> String =
+  \\import std.net
+  \\import std.net (net)
+  \\import std.signal (signal)
+  \\
+  \\fn answer(c: Int) -> Int / {net.write[conn], signal.read} = {
+  \\  let _ = net.recv[conn](c, 4096, 20000);
+  \\  let payload = if signal.stopping() { b"draining" } else { b"ok" };
+  \\  let head = bytes_concat(
+  \\    HEAD,
+  \\    bytes_concat(bytes_of_string(int_to_string(bytes_len(payload))), b"\r\n\r\n"));
+  \\  let _ = net::send_all[conn](c, bytes_concat(head, payload), 20000);
+  \\  net.close[conn](c);
+  \\  1
+  \\}
+  \\
+  \\fn joined(ts: List<Task<Int>>) -> Int / {task.write} =
+  \\  match ts { [] -> 0, [t, ..rest] -> task.join(t) + joined(rest) }
+  \\
+  \\fn serve(l: Int, running: List<Task<Int>>) -> Int
+  \\  / {net.write[listener], net.write[conn], signal.read, task.write} = {
+  \\  let c = net.accept[listener](l);
+  \\  if c == 0 {
+  \\    joined(running)
+  \\  } else {
+  \\    serve(l, push(running, task.spawn(|| answer(c))))
+  \\  }
+  \\}
+  \\
+  \\fn main() -> Int / {net.write[listener], net.write[conn], signal.read, task.write} = {
+  \\  let l = net.listen[listener](PORT);
+  \\  let served = serve(l, []);
+  \\  net.close[listener](l);
+  \\  served
+  \\}
+  \\
+
+test/nondet "a spawned task still serving at the signal finishes and the run exits zero" {
+  let server = start_with(concurrent(), ["--drain-ms", "30000"]);
+  let held = connect(server);
+  time.sleep_ms(200);
+  signal_to(server, Terminate);
+  time.sleep_ms(300);
+  let answer = request(held);
+  assert(
+    string_contains(answer, "200 OK"),
+    Some("a task in flight at the signal was dropped: " ++ answer),
+  );
+  let done = finish(server);
+  assert(done.code == 0, Some("a clean drain exits 0\n\n" ++ output(done)));
+  assert(!string_contains(output(done), "W0608"), Some(output(done)))
+}
+
+test/nondet "a task blocked on a host handler does not outlast the drain" {
+  let server = start_with(concurrent(), ["--drain-ms", "400"]);
+  let held = connect(server);
+  // Connected and silent: the spawned task is inside `net.recv` and will be for twenty seconds.
+  time.sleep_ms(200);
+  let signalled = time.elapsed_ms();
+  signal_to(server, Terminate);
+  let answer = heard(held, 30000);
+  assert(
+    answer == "",
+    Some("W5 has no cancellation, so the blocked task is not handed a 503: " ++ answer),
+  );
+  let done = finish(server);
+  let waited = time.elapsed_ms() - signalled;
+  assert(
+    done.code == 3,
+    Some("a drain that abandoned a request must not report success\n\n" ++ output(done)),
+  );
+  assert(
+    string_contains(output(done), "W0608"),
+    Some("the run exited 3 and never said why\n\n" ++ output(done)),
+  );
+  // `--drain-ms 400` plus the teardown's floor, plus slack.
+  assert(
+    waited < 5000,
+    Some(
+      "the drain waited " ++ int_to_string(waited)
+        ++ "ms, so it was hostage to the host operation rather than bounded by `--drain-ms` plus the teardown's floor\n\n"
+        ++ output(done),
+    ),
+  )
+}
