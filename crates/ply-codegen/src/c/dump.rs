@@ -47,6 +47,12 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
         })
     })?;
     front.mod_pkg = d.field("mod_pkg")?.items(|i| i.number())?;
+    // The committed emitter answering for a stage may predate embeds, and embedded nothing.
+    if let Ok(embeds) = d.field("embeds")
+        && embeds.list()?.len() > 0
+    {
+        front.embeds = ply_eval::codec::encode(embeds.value()).map_err(|e| embeds.error(e))?;
+    }
     for m in d.field("modules")?.list()? {
         let name = m.field("name")?.utf8()?;
         let index = m.field("index")?;
