@@ -210,7 +210,9 @@ pub fn build(src: &Sources) -> Result<PlyProducer, String> {
             }
         }
     };
-    PlyProducer::new(native).map_err(|e| format!("{e:#}"))
+    PlyProducer::new(native)
+        .map(|p| p.keeping(emitter_of(&identity)))
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// The committed emitter emitting `src`, written as the stage for `identity` so no later process
@@ -453,6 +455,9 @@ pub struct PlyProducer {
     answered: Cell<u64>,
     /// Why the emitter raised over a program, by the program's address.
     failed: RefCell<HashMap<usize, String>>,
+    /// The emitter its answers are kept under: set only where the unit was emitted from the sources
+    /// it names, which a committed emitter emitting a stage of other sources is not.
+    kept: Option<String>,
 }
 
 /// Entered as `(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg)`: every module at once, so
@@ -470,7 +475,14 @@ impl PlyProducer {
             asked: Cell::new(0),
             answered: Cell::new(0),
             failed: RefCell::new(HashMap::new()),
+            kept: None,
         })
+    }
+
+    /// Its answers kept under `emitter`, which names the sources its unit was emitted from.
+    pub fn keeping(mut self, emitter: String) -> PlyProducer {
+        self.kept = Some(emitter);
+        self
     }
 
     /// Why the emitter raised over `loaded`, when it did.
@@ -687,6 +699,7 @@ pub struct Census {
 }
 
 thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
     static CENSUS: RefCell<Census> = const {
         RefCell::new(Census {
             entries: 0,
@@ -712,9 +725,11 @@ fn note_census(ctx: &crate::rt::Ctx) {
     });
 }
 
-/// Starts this thread's census afresh, so a test reads only what it entered.
+/// Starts this thread's census afresh, so a test reads only what it entered. A thread that counts
+/// works out every answer, so it reads none that was kept.
 pub fn reset_census() {
     CENSUS.with(|c| *c.borrow_mut() = Census::default());
+    COUNTING.with(|c| c.set(true));
 }
 
 pub fn census() -> Census {
@@ -1091,10 +1106,22 @@ pub fn checked_front_with_std(user: &[(String, String)]) -> Result<FrontWithStd>
 }
 
 /// Enters `name` in this thread's compiled emitter, building it first when the thread has none.
+/// An answer is kept under the emitter, the entry and the arguments, and read back when asked again.
 pub fn call(name: &str, args: &[Value]) -> Result<Value> {
-    with_current(|p| p.call(name, args)).unwrap_or_else(|| {
+    let key = with_current(|p| p.kept.clone())
+        .flatten()
+        .filter(|_| !COUNTING.with(Cell::get))
+        .and_then(|emitter| super::answers::key(&emitter, name, args));
+    if let Some(answer) = key.as_deref().and_then(super::answers::read) {
+        return Ok(answer);
+    }
+    let answer = with_current(|p| p.call(name, args)).unwrap_or_else(|| {
         bail!("no Ply emitter serves on this thread: it is being built, or building it failed")
-    })
+    })?;
+    if let Some(key) = &key {
+        super::answers::write(key, &answer);
+    }
+    Ok(answer)
 }
 
 /// Each root's `emit.RootAnswer`. A body whose tables list members is a group's, and answers for
