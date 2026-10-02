@@ -6,14 +6,14 @@
 import harness (scratch, Ran, Server, Source, project, write, read, working, repo, repo_file,
                 on_disk, serving, ended, finished, said, stderr, warm_agrees, seeding, seeding_at,
                 json_of, at, path, items, first, str, int, truth, shown, in_memory, tree,
-                sources_here, comparable)
+                sources_here, comparable, Here, Reached, Shelf)
 import cli.machine (machine)
 import std.bytes (hex_of)
 import std.fs (fs)
 import std.json (Json)
 import std.string
 
-fn edit(name: String, from: String, to: String) -> Unit =
+fn edit(name: String, from: String, to: String) -> Unit / {Here} =
   match read(name) {
     None -> panic("`" ++ name ++ "` reads"),
     Some(text) -> {
@@ -25,7 +25,8 @@ fn edit(name: String, from: String, to: String) -> Unit =
     },
   }
 
-fn removed(name: String) -> Unit = assert(fs.remove[cwd](name), Some("`" ++ name ++ "` is removed"))
+fn removed(name: String) -> Unit / {fs.remove[cwd]} =
+  assert(fs.remove[cwd](name), Some("`" ++ name ++ "` is removed"))
 
 fn core() -> String =
   \\pub type Money = Int
@@ -75,7 +76,7 @@ fn shop() -> String =
 
 fn leaf() -> String = "pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n"
 
-fn corpus() -> Unit =
+fn corpus() -> Unit / {Here} =
   project([
     { path: "core.ply", text: core() },
     { path: "shop.ply", text: shop() },
@@ -131,7 +132,7 @@ test "a whole editing session agrees at every step" {
   })
 }
 
-fn examples() -> Unit =
+fn examples() -> Unit / {Here, fs.read[repo]} =
   match fs.list_dir[repo]("examples") {
     None -> panic("the example corpus must be present"),
     Some(names) ->
@@ -153,7 +154,7 @@ fn is_word_byte(b: Int) -> Bool =
 
 // Renames every whole-identifier `from` in `name`, so which occurrences move is the program's
 // business and not its layout's.
-fn rename(name: String, from: String, to: String) -> Unit = {
+fn rename(name: String, from: String, to: String) -> Unit / {Here} = {
   let text = match read(name) {
     Some(t) -> bytes_of_string(t),
     None -> panic("`" ++ name ++ "` reads"),
@@ -277,7 +278,7 @@ test "deleting a file is reported rather than skipped past" {
   })
 }
 
-fn inspected(name: String) -> Json =
+fn inspected(name: String) -> Json / {Reached, Shelf} =
   match items(at(json_of(on_disk(["cache", "inspect", name, "--json"])), "matches")) {
     [m, ..] -> m,
     [] -> panic("the cache holds no `" ++ name ++ "`"),
@@ -407,7 +408,7 @@ test/nondet "two overlapping runs leave a cache that still agrees" {
   ()
 }
 
-fn filed_nothing(what: String) -> Unit =
+fn filed_nothing(what: String) -> Unit / {fs.exists[cwd]} =
   assert(
     !fs.exists[cwd](".ply-cache/store.idx") && !fs.exists[cwd](".ply-cache/store.dat"),
     Some(what ++ " filed a front-end cache"),
@@ -464,13 +465,10 @@ test/nondet "a dependency module is filed under its package and survives the pac
   assert(fs.rename[cwd]("lib", "vendor/lib"), Some("the package moves"));
   write("app/ply.pkg", manifest("app", lib_dep("../vendor/lib")));
   assert(seeding_at("app").checked == 0, Some("a moved package keeps the rows filed for it"));
-  // A changed dependency is a different program: its edited definition and the one calling it are
-  // checked.
+  // A changed dependency is checked again where it changed; its caller reads only its contract,
+  // which the edit left alone.
   write("vendor/lib/answer.ply", "pub fn answer() -> Int = 43\n");
-  assert(
-    seeding_at("app").checked == 2,
-    Some("the edit and its caller are checked, and nothing else"),
-  )
+  assert(seeding_at("app").checked == 1, Some("the edit is checked, and nothing else"))
 }
 
 // A warm `ply prove` answers every obligation from the cache, across modules that import one
@@ -555,7 +553,7 @@ type Kept = { name: String, bytes: Bytes }
 
 fn interfaces() -> String = ".ply-cache/interfaces"
 
-fn kept_package() -> Kept =
+fn kept_package() -> Kept / {fs.list_dir[cwd], fs.read_file[cwd]} =
   match fs.list_dir[cwd](interfaces()) {
     Some([name]) -> match fs.read_file[cwd](interfaces() ++ "/" ++ name) {
       Some(b) -> { name: name, bytes: b },
@@ -620,3 +618,94 @@ test "a load through the compiled shelf answers what a load of its source does" 
     assert(!fs.exists[cwd](interfaces()), Some("clearing the cache discards the package"))
   })
 }
+
+fn packaged_project() -> Unit / {Here} =
+  project([
+    { path: "app/ply.pkg", text: manifest("app", lib_dep("../lib")) },
+    {
+      path: "app/main.ply",
+      text:
+        \\import lib.answer
+        \\import lib.more
+        \\
+        \\pub fn main() -> Int = answer::answer() + more::more(1)
+        \\
+        \\pub fn bump(x: Int) -> Int
+        \\  requires x < 100
+        \\  ensures result > x
+        \\= more::more(x)
+        \\
+        \\pub fn kept(x: Int) -> Int
+        \\  ensures result == x
+        \\= {
+        \\  let _ = answer::answer();
+        \\  x
+        \\}
+        \\
+        \\test "main answers" { assert(main() > 0) }
+        \\
+    },
+    { path: "lib/ply.pkg", text: manifest("lib", "") },
+    { path: "lib/answer.ply", text: "pub fn answer() -> Int = 42\n\nfn helper() -> Int = 0\n" },
+    {
+      path: "lib/more.ply",
+      text:
+        \\import answer
+        \\
+        \\pub fn more(x: Int) -> Int
+        \\  requires x < 100
+        \\  ensures result > x
+        \\= x + answer::answer()
+        \\
+    },
+  ])
+
+fn codes(v: Json) -> List<String> = map(items(at(v, "diagnostics")), |d: Json| str(at(d, "code")))
+
+fn owners(v: Json) -> List<String> = map(items(at(v, "obligations")), |o: Json| str(at(o, "owner")))
+
+test "a dependency read through its compiled package answers what its source does" {
+  scratch(|| {
+    packaged_project();
+    let check = ["check", "app", "--explain", "--json"];
+    let agrees = |what: String| {
+      let warm = comparable(json_of(on_disk(check)));
+      let cold = comparable(json_of(in_memory(tree(sources_here()), check)));
+      assert(warm == cold, Some(what ++ "\nwarm: " ++ shown(warm) ++ "\ncold: " ++ shown(cold)))
+    };
+    agrees("the load that cuts the package");
+    agrees("a load through it");
+    assert(seeding_at("app").checked == 0, Some("the dependency is read through its stubs"));
+    // A dependency's unused definition is its own package's to report.
+    assert(!contains_code(codes(json_of(on_disk(["check", "app", "--json"]))), "W0611"), None);
+    assert(contains_code(codes(json_of(on_disk(["check", "lib", "--json"]))), "W0611"), None);
+    assert(on_disk(["prove", "app"]).code == 0, None);
+    assert(on_disk(["test", "app"]).code == 0, None);
+    edit("lib/answer.ply", "= 42", "= 43");
+    // The dependency's body moved and its contract did not: its own definitions are checked again
+    // and the app's are not. A proof stands, and what runs the body runs again: the sampled
+    // `ensures` and the test.
+    assert(seeding_at("app").checked == 2, Some("only the edited dependency is walked"));
+    let proved = json_of(on_disk(["prove", "app", "--json"]));
+    assert(int(at(proved, "cached")) == 1, Some(shown(proved)));
+    assert(
+      int(path(json_of(on_disk(["test", "app", "--json"])), ["selection", "cached"])) == 0,
+      None,
+    );
+    agrees("after the dependency moved");
+    agrees("through the package cut again");
+    // A run answers for its own package; the dependency's obligation is its own run's.
+    assert_eq(owners(json_of(on_disk(["prove", "app", "--json"]))), ["main.bump", "main.kept"]);
+    assert_eq(owners(json_of(on_disk(["prove", "lib", "--json"]))), ["more.more"]);
+    // `--workspace` runs each package it reaches by path as its own root, dependencies first.
+    let both = items(at(json_of(on_disk(["prove", "app", "--workspace", "--json"])), "packages"));
+    assert_eq(map(both, |p: Json| str(at(p, "root"))), ["lib", "app"]);
+    assert_eq(map(both, |p: Json| owners(at(p, "answer"))), [
+      ["more.more"],
+      ["main.bump", "main.kept"],
+    ])
+  })
+}
+
+fn contains_code(xs: List<String>, code: String) -> Bool =
+  fold(xs, false, |found: Bool, x: String| found || x == code)

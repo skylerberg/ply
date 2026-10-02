@@ -1,10 +1,13 @@
-// Name resolution over a whole program: module index, declarations, scopes, dependency order and defaults.
+// Name resolution over a whole program: module index, declarations, scopes, dependency order, effect
+// sets and defaults.
 // Ordered tables are lists in insertion order: the dump encodes that order and a `Map` sorts its keys.
 
 import spine (Span, Ident, QName, span_to, dummy_span, num)
+import types (TypeExpr, TCon, TFn, TRecord, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef,
               TypeDefBody, TDSum, TDAlias, VariantDef, SpecClause, Binder, Vis, VPub, VPriv,
-              ImportDecl, ImportKind, IModule, IAlias, INames, Derived, parse, dump_module)
+              ImportDecl, ImportKind, IModule, IAlias, INames, Derived, EffectSetDef, OpDef, parse,
+              dump_module)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
@@ -18,7 +21,7 @@ pub type Source = { name: Bytes, src: Bytes }
 // `derived` is what `derive.ply`'s expansion generated into `module`, for the checker.
 pub type Mod = { name: Bytes, module: Module, derived: List<Derived> }
 
-pub type Ns = | NValue | NType | NEffect
+pub type Ns = | NValue | NType | NEffect | NSet
 
 pub type Declared = { name: Bytes, qualified: Bytes, public: Bool, span: Span }
 // The lists keep insertion order, which the dump encodes; the maps answer lookups. A name's first entry wins in both.
@@ -26,18 +29,22 @@ pub type Decls = {
   values: List<Declared>,
   types: List<Declared>,
   effects: List<Declared>,
+  sets: List<Declared>,
   by_value: Map<Bytes, Declared>,
   by_type: Map<Bytes, Declared>,
   by_effect: Map<Bytes, Declared>,
+  by_set: Map<Bytes, Declared>,
 }
 pub type Binding = { name: Bytes, qualified: Bytes, owner: Int, span: Span }
 pub type Bindings = {
   values: List<Binding>,
   types: List<Binding>,
   effects: List<Binding>,
+  sets: List<Binding>,
   by_value: Map<Bytes, Binding>,
   by_type: Map<Bytes, Binding>,
   by_effect: Map<Bytes, Binding>,
+  by_set: Map<Bytes, Binding>,
 }
 pub type ModBind = { binder: Bytes, target: Int, span: Span }
 pub type Scope = {
@@ -80,24 +87,28 @@ fn no_decls() -> Decls =
     values: [],
     types: [],
     effects: [],
+    sets: [],
     by_value: map_new(),
     by_type: map_new(),
     by_effect: map_new(),
+    by_set: map_new(),
   }
 fn no_bindings() -> Bindings =
   {
     values: [],
     types: [],
     effects: [],
+    sets: [],
     by_value: map_new(),
     by_type: map_new(),
     by_effect: map_new(),
+    by_set: map_new(),
   }
 
-fn spaces() -> List<Ns> = [NValue, NType, NEffect]
+fn spaces() -> List<Ns> = [NValue, NType, NEffect, NSet]
 
 pub fn space(d: Decls, ns: Ns) -> List<Declared> =
-  match ns { NValue -> d.values, NType -> d.types, NEffect -> d.effects }
+  match ns { NValue -> d.values, NType -> d.types, NEffect -> d.effects, NSet -> d.sets }
 
 fn first_declared(m: Map<Bytes, Declared>, x: Declared) -> Map<Bytes, Declared> =
   if map_contains(m, x.name) { m } else { map_insert(m, x.name, x) }
@@ -110,10 +121,14 @@ fn dpush(d: Decls, ns: Ns, x: Declared) -> Decls =
     NValue -> { ..d, values: push(d.values, x), by_value: first_declared(d.by_value, x) },
     NType -> { ..d, types: push(d.types, x), by_type: first_declared(d.by_type, x) },
     NEffect -> { ..d, effects: push(d.effects, x), by_effect: first_declared(d.by_effect, x) },
+    NSet -> { ..d, sets: push(d.sets, x), by_set: first_declared(d.by_set, x) },
   }
 
 pub fn dlookup(d: Decls, ns: Ns, name: Bytes) -> Option<Declared> =
-  map_get(match ns { NValue -> d.by_value, NType -> d.by_type, NEffect -> d.by_effect }, name)
+  map_get(
+    match ns { NValue -> d.by_value, NType -> d.by_type, NEffect -> d.by_effect, NSet -> d.by_set },
+    name,
+  )
 
 fn with_bspace(b: Bindings, ns: Ns, xs: List<Binding>) -> Bindings = {
   let by = fold(xs, map_new(), |m: Map<Bytes, Binding>, x: Binding| first_binding(m, x));
@@ -121,6 +136,7 @@ fn with_bspace(b: Bindings, ns: Ns, xs: List<Binding>) -> Bindings = {
     NValue -> { ..b, values: xs, by_value: by },
     NType -> { ..b, types: xs, by_type: by },
     NEffect -> { ..b, effects: xs, by_effect: by },
+    NSet -> { ..b, sets: xs, by_set: by },
   }
 }
 
@@ -129,10 +145,14 @@ fn bpush(b: Bindings, ns: Ns, x: Binding) -> Bindings =
     NValue -> { ..b, values: push(b.values, x), by_value: first_binding(b.by_value, x) },
     NType -> { ..b, types: push(b.types, x), by_type: first_binding(b.by_type, x) },
     NEffect -> { ..b, effects: push(b.effects, x), by_effect: first_binding(b.by_effect, x) },
+    NSet -> { ..b, sets: push(b.sets, x), by_set: first_binding(b.by_set, x) },
   }
 
 pub fn lookup(b: Bindings, ns: Ns, name: Bytes) -> Option<Binding> =
-  map_get(match ns { NValue -> b.by_value, NType -> b.by_type, NEffect -> b.by_effect }, name)
+  map_get(
+    match ns { NValue -> b.by_value, NType -> b.by_type, NEffect -> b.by_effect, NSet -> b.by_set },
+    name,
+  )
 
 pub fn find_modbind(xs: List<ModBind>, binder: Bytes) -> Option<ModBind> =
   fold(xs, None, |acc: Option<ModBind>, x: ModBind|
@@ -254,10 +274,15 @@ pub fn list_names(xs: List<Bytes>) -> Bytes =
   }
 
 pub fn ns_describe(ns: Ns) -> Bytes =
-  match ns { NValue -> b"definition", NType -> b"type", NEffect -> b"effect" }
+  match ns {
+    NValue -> b"definition",
+    NType -> b"type",
+    NEffect -> b"effect",
+    NSet -> b"effect set",
+  }
 
 pub fn ns_keyword(ns: Ns) -> Bytes =
-  match ns { NValue -> b"fn", NType -> b"type", NEffect -> b"effect" }
+  match ns { NValue -> b"fn", NType -> b"type", NEffect -> b"effect", NSet -> b"effect set" }
 
 pub fn exported_names(d: Decls) -> List<Bytes> =
   fold(spaces(), [], |acc: List<Bytes>, ns: Ns|
@@ -272,6 +297,7 @@ fn declarations_of(m: Mod) -> Decls =
     match it {
       IFn(f) -> declare(d, NValue, m.name, f.name, f.vis),
       IEffect(e) -> declare(d, NEffect, m.name, e.name, e.vis),
+      IEffectSet(e) -> declare(d, NSet, m.name, e.name, e.vis),
       IType(t) -> {
         let d2 = declare(d, NType, m.name, t.name, t.vis);
         match t.body {
@@ -1215,6 +1241,908 @@ fn qfields(r: Resolved, q: Qual, xs: List<RecField>) -> { q: Qual, xs: List<RecF
 fn decl_public(r: Resolved, owner: Int, name: Bytes) -> Bool =
   match dlookup(at(r.declarations, owner), NValue, name) { Some(d) -> d.public, None -> false }
 
+// --- Effect sets ---------------------------------------------------------------------------
+// A set stands for its atoms, each meaning what it means in the module that wrote it. A row of that
+// module gets them as written; a row anywhere else gets them through the module that declares the
+// effect, which the row's module then reaches under a binder no import can write, so no import of
+// its own can stand in for it.
+
+pub fn reached_binder(module: Bytes) -> Bytes = bytes_concat(b"@", module)
+
+fn first_n<a>(xs: List<a>, n: Int) -> List<a> = map(range(0, n), |i: Int| at(xs, i))
+
+fn after_n<a>(xs: List<a>, n: Int) -> List<a> = map(range(n, len(xs)), |i: Int| at(xs, i))
+
+fn bytes_before(a: Bytes, b: Bytes) -> Bool = match compare(a, b) { Less -> true, _ -> false }
+
+// One atom a set stands for, and the module whose scope wrote it.
+type Member = { atom: AtomExpr, home: Int }
+
+// A set of the program: its item and module, the sets it includes, whether it lies on a cycle, and
+// once expanded every atom it stands for.
+type SetNode = {
+  def: EffectSetDef,
+  module: Int,
+  includes: List<Option<Int>>,
+  cyclic: Bool,
+  members: List<Member>,
+}
+
+// Each module's sets by name; the first declaration of a name is the set.
+type SetTable = { nodes: List<SetNode>, by_module: List<Map<Bytes, Int>>, diags: List<Diag> }
+
+fn set_table(mods: List<Mod>) -> SetTable =
+  fold(range(0, len(mods)), { nodes: [], by_module: [], diags: [] }, |t: SetTable, m: Int|
+    fold(
+      at(mods, m).module.items,
+      { ..t, by_module: push(t.by_module, map_new()) },
+      |acc: SetTable, it: Item|
+        match it {
+          IEffectSet(d) -> {
+            let mine = at(acc.by_module, m);
+            match map_get(mine, d.name.name) {
+              Some(first) ->
+                {
+                  ..acc,
+                  diags: push(
+                    acc.diags,
+                    diag2(
+                      b"E0105",
+                      m,
+                      d.name.span,
+                      bytes_concat_all([b"duplicate effect set `", d.name.name, b"`"]),
+                      b"redefined here",
+                      m,
+                      at(acc.nodes, first).def.name.span,
+                      b"first defined here",
+                      [b"rename one of them; every effect set in a module needs a distinct name"],
+                    ),
+                  ),
+                },
+              None ->
+                {
+                  ..acc,
+                  by_module: set_at(
+                    acc.by_module,
+                    m,
+                    map_insert(mine, d.name.name, len(acc.nodes)),
+                  ),
+                  nodes: push(acc.nodes, {
+                    def: d,
+                    module: m,
+                    includes: [],
+                    cyclic: false,
+                    members: [],
+                  }),
+                },
+            }
+          },
+          _ -> acc,
+        },
+    ))
+
+fn unknown_set(r: Resolved, m: Int, q: QName) -> Diag = {
+  let scope = at(r.scopes, m);
+  let n = q.name.name;
+  let effect_notes = match lookup(scope.bound, NEffect, n) {
+    Some(_) ->
+      [
+        bytes_concat_all([
+          b"`",
+          n,
+          b"` is an effect, and a member of a set is an atom: write `",
+          n,
+          b".read[..]` or `",
+          n,
+          b".write[..]`",
+        ]),
+        b"a whole effect is every resource label anywhere in the program, so naming one would let an unrelated module change this row and therefore this definition's hash",
+      ],
+    None -> [],
+  };
+  let named = map(scope.bound.sets, |b: Binding| b.name);
+  let known = if len(named) == 0 {
+    b"this module names no `effect set`: declare one, or import one by name from the module that declares it `pub`"
+  } else { bytes_concat(b"the sets this module names: ", backticked(named, b", ")) };
+  diag1(
+    b"E0114",
+    m,
+    q.span,
+    bytes_concat_all([b"no `effect set` named `", n, b"` here"]),
+    b"neither declared nor imported here",
+    push(effect_notes, known),
+  )
+}
+
+// The set `q` names in module `m`: one it declares or imports by name, or one a module binder reaches.
+fn set_named(r: Resolved, t: SetTable, m: Int, q: QName) -> Result<Int, Diag> = {
+  let scope = at(r.scopes, m);
+  let name = q.name.name;
+  match q.module {
+    None -> match lookup(scope.bound, NSet, name) {
+      Some(b) -> match map_get(at(t.by_module, b.owner), name) {
+        Some(id) -> Ok(id),
+        None -> Err(unknown_set(r, m, q)),
+      },
+      None -> Err(unknown_set(r, m, q)),
+    },
+    Some(binder) -> match find_modbind(scope.modules, binder.name) {
+      None ->
+        Err(
+          diag1(
+            b"E0114",
+            m,
+            q.span,
+            bytes_concat_all([b"no module is imported as `", binder.name, b"`"]),
+            b"not a module imported by this file",
+            [b"import the module that declares the set, or import the set by name"],
+          ),
+        ),
+      Some(mb) -> {
+        let module = at(r.scopes, mb.target).module;
+        match dlookup(at(r.declarations, mb.target), NSet, name) {
+          None -> {
+            let exported = map(
+              filter(at(r.declarations, mb.target).sets, |d: Declared| d.public),
+              |d: Declared| d.name,
+            );
+            Err(
+              diag1(
+                b"E0114",
+                m,
+                q.span,
+                bytes_concat_all([
+                  b"module `",
+                  module,
+                  b"` declares no `effect set` named `",
+                  name,
+                  b"`",
+                ]),
+                bytes_concat_all([b"not found in `", module, b"`"]),
+                [
+                  if len(exported) == 0 {
+                    bytes_concat_all([b"`", module, b"` exports no effect set"])
+                  } else {
+                    bytes_concat_all([b"`", module, b"` exports ", backticked(exported, b", ")])
+                  },
+                ],
+              ),
+            )
+          },
+          Some(d) -> if !d.public && mb.target != m {
+            Err(private_name(m, q.span, mb.target, d.span, NSet, name, module))
+          } else {
+            match map_get(at(t.by_module, mb.target), name) {
+              Some(id) -> Ok(id),
+              None -> Err(unknown_set(r, m, q)),
+            }
+          },
+        }
+      },
+    },
+  }
+}
+
+fn set_includes(r: Resolved, t: SetTable) -> SetTable =
+  fold(range(0, len(t.nodes)), t, |acc: SetTable, id: Int| {
+    let node = at(acc.nodes, id);
+    let walked = fold(
+      node.def.includes,
+      { diags: acc.diags, xs: [] },
+      |w: { diags: List<Diag>, xs: List<Option<Int>> }, q: QName|
+        match set_named(r, acc, node.module, q) {
+          Ok(i) -> { ..w, xs: push(w.xs, Some(i)) },
+          Err(d) -> { diags: push(w.diags, d), xs: push(w.xs, None) },
+        },
+    );
+    { ..acc, diags: walked.diags, nodes: set_at(acc.nodes, id, { ..node, includes: walked.xs }) }
+  })
+
+type SetDfs = {
+  color: List<Int>,
+  path: List<Int>,
+  work: List<{ node: Int, next: Int }>,
+  t: SetTable,
+}
+
+fn set_cycles(t: SetTable) -> SetTable = {
+  let n = len(t.nodes);
+  let steps = fold(t.nodes, 0, |acc: Int, s: SetNode| acc + len(s.includes));
+  let start: SetDfs = { color: map(range(0, n), |i: Int| 0), path: [], work: [], t: t };
+  let done = fold(range(0, n), start, |d: SetDfs, root: Int|
+    if at(d.color, root) != 0 { d } else {
+      let opened: SetDfs = {
+        ..d,
+        color: set_at(d.color, root, 1),
+        path: push(d.path, root),
+        work: [{ node: root, next: 0 }],
+      };
+      iterate(opened, 2 * (n + steps) + 4, |x: SetDfs|
+        if len(x.work) == 0 { Stop(x) } else { Continue(set_dfs_step(x)) })
+    });
+  done.t
+}
+
+fn set_dfs_step(d: SetDfs) -> SetDfs = {
+  let top = at(d.work, len(d.work) - 1);
+  let rest = first_n(d.work, len(d.work) - 1);
+  let out = at(d.t.nodes, top.node).includes;
+  if top.next >= len(out) {
+    { ..d, color: set_at(d.color, top.node, 2), work: rest, path: take(d.path, len(d.path) - 1) }
+  } else {
+    let advanced = push(rest, { node: top.node, next: top.next + 1 });
+    match at(out, top.next) {
+      None -> { ..d, work: advanced },
+      Some(target) -> {
+        let c = at(d.color, target);
+        if c == 0 {
+          {
+            ..d,
+            work: push(advanced, { node: target, next: 0 }),
+            color: set_at(d.color, target, 1),
+            path: push(d.path, target),
+          }
+        } else if c == 1 {
+          let st = match position(d.path, target) { Some(p) -> p, None -> 0 };
+          let cycle = drop(d.path, st);
+          let t2 = {
+            ..d.t,
+            diags: push(d.t.diags, set_cycle(d.t, cycle)),
+            nodes: fold(cycle, d.t.nodes, |ns: List<SetNode>, i: Int|
+              set_at(ns, i, { ..at(ns, i), cyclic: true })),
+          };
+          { ..d, work: advanced, t: t2 }
+        } else { { ..d, work: advanced } }
+      },
+    }
+  }
+}
+
+fn set_cycle(t: SetTable, cycle: List<Int>) -> Diag = {
+  let head = at(t.nodes, at(cycle, 0));
+  let others = drop(cycle, 1);
+  let names = push(map(cycle, |i: Int| at(t.nodes, i).def.name.name), head.def.name.name);
+  let primary = if len(cycle) == 1 { b"this set names itself" } else {
+    bytes_concat_all([
+      b"expands through ",
+      backticked(map(others, |i: Int| at(t.nodes, i).def.name.name), b", "),
+      b" and back",
+    ])
+  };
+  diag(
+    b"E0115",
+    bytes_concat_all([b"effect set `", head.def.name.name, b"` contains itself"]),
+    fold(
+      others,
+      [lab(head.module, head.def.name.span, true, primary)],
+      |ls: List<Label>, i: Int|
+        push(ls, lab(at(t.nodes, i).module, at(t.nodes, i).def.name.span, false, b"on the cycle")),
+    ),
+    [
+      bytes_concat(b"the cycle is ", backticked(names, b" -> ")),
+      b"expansion is a fixed point, and a cycle has none: break it by inlining the atoms one of these sets needs",
+    ],
+  )
+}
+
+// The module that declares the effect `q` names in `home`, and its name there: none for a prelude
+// effect, or one nothing declares.
+fn effect_owner(r: Resolved, home: Int, q: QName) -> Option<{ target: Int, name: Bytes }> = {
+  let scope = at(r.scopes, home);
+  match q.module {
+    Some(b) -> match find_modbind(scope.modules, b.name) {
+      Some(mb) -> match dlookup(at(r.declarations, mb.target), NEffect, q.name.name) {
+        Some(_) -> Some({ target: mb.target, name: q.name.name }),
+        None -> None,
+      },
+      None -> None,
+    },
+    None -> match lookup(scope.bound, NEffect, q.name.name) {
+      Some(b) -> Some({ target: b.owner, name: b.name }),
+      None -> None,
+    },
+  }
+}
+
+fn mode_word(m: Mode) -> Bytes = match m { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
+
+// What an atom names, wherever it was written: its effect's program-wide name, mode, operation and label.
+fn member_key(r: Resolved, mb: Member) -> Bytes = {
+  let a = mb.atom;
+  let eff = match effect_owner(r, mb.home, a.eff) {
+    Some(o) -> qualify(at(r.scopes, o.target).module, o.name),
+    None -> match a.eff.module {
+      Some(b) -> bytes_concat_all([b.name, b"::", a.eff.name.name]),
+      None -> a.eff.name.name,
+    },
+  };
+  bytes_concat_all([
+    eff,
+    b" ",
+    mode_word(a.mode),
+    b" ",
+    match a.op { Some(o) -> o.name, None -> b"" },
+    b" ",
+    if a.every { b"*" } else { match a.resource { Some(x) -> x.name, None -> b"" } },
+  ])
+}
+
+type Keyed = { key: Bytes, mb: Member }
+
+fn insert_keyed(sorted: List<Keyed>, k: Keyed) -> List<Keyed> = {
+  let n = len(sorted);
+  let i = fold(range(0, n), n, |acc: Int, j: Int|
+    if acc < n { acc } else if bytes_before(k.key, at(sorted, j).key) { j } else { acc });
+  fold(after_n(sorted, i), push(first_n(sorted, i), k), |acc: List<Keyed>, x: Keyed| push(acc, x))
+}
+
+// Ordered by what each atom names; of two that name the same, the first written is kept.
+fn canonical_members(r: Resolved, xs: List<Member>) -> List<Member> = {
+  let sorted = fold(xs, [], |acc: List<Keyed>, mb: Member|
+    insert_keyed(acc, { key: member_key(r, mb), mb: mb }));
+  map(
+    fold(sorted, [], |acc: List<Keyed>, k: Keyed|
+      if len(acc) > 0 && at(acc, len(acc) - 1).key == k.key { acc } else { push(acc, k) }),
+    |k: Keyed| k.mb,
+  )
+}
+
+type SetWork = { t: SetTable, done: List<Bool>, work: List<{ node: Int, visited: Bool }> }
+
+fn set_expand_all(r: Resolved, t: SetTable) -> SetTable = {
+  let n = len(t.nodes);
+  let steps = fold(t.nodes, 0, |acc: Int, s: SetNode| acc + len(s.includes));
+  let start: SetWork = { t: t, done: map(range(0, n), |i: Int| false), work: [] };
+  let finished = fold(range(0, n), start, |x: SetWork, root: Int|
+    if at(x.done, root) || at(x.t.nodes, root).cyclic { x } else {
+      iterate({ ..x, work: [{ node: root, visited: false }] }, 4 * (n + steps) + 4, |y: SetWork|
+        if len(y.work) == 0 { Stop(y) } else { Continue(set_expand_step(r, y)) })
+    });
+  finished.t
+}
+
+fn set_expand_step(r: Resolved, x: SetWork) -> SetWork = {
+  let top = at(x.work, len(x.work) - 1);
+  let rest = first_n(x.work, len(x.work) - 1);
+  let node = at(x.t.nodes, top.node);
+  if at(x.done, top.node) || node.cyclic { { ..x, work: rest } } else if !top.visited {
+    let pushed = fold(
+      node.includes,
+      push(rest, { node: top.node, visited: true }),
+      |w: List<{ node: Int, visited: Bool }>, e: Option<Int>|
+        match e {
+          Some(i) -> if !at(x.done, i) && !at(x.t.nodes, i).cyclic {
+            push(w, { node: i, visited: false })
+          } else { w },
+          None -> w,
+        },
+    );
+    { ..x, work: pushed }
+  } else {
+    let own = map(node.def.atoms, |a: AtomExpr| { atom: a, home: node.module });
+    let all = fold(node.includes, own, |acc: List<Member>, e: Option<Int>|
+      match e {
+        Some(i) -> fold(at(x.t.nodes, i).members, acc, |ms: List<Member>, mb: Member| push(ms, mb)),
+        None -> acc,
+      });
+    {
+      ..x,
+      work: rest,
+      done: set_at(x.done, top.node, true),
+      t: {
+        ..x.t,
+        nodes: set_at(x.t.nodes, top.node, { ..node, members: canonical_members(r, all) }),
+      },
+    }
+  }
+}
+
+fn moved_to(a: AtomExpr, span: Span) -> AtomExpr =
+  {
+    eff: {
+      module: match a.eff.module { Some(b) -> Some({ name: b.name, span: span }), None -> None },
+      name: { name: a.eff.name.name, span: span },
+      span: span,
+    },
+    mode: a.mode,
+    op: match a.op { Some(o) -> Some({ name: o.name, span: span }), None -> None },
+    resource: match a.resource { Some(x) -> Some({ name: x.name, span: span }), None -> None },
+    every: a.every,
+    span: span,
+  }
+
+type Usable = { atom: AtomExpr, bind: Option<ModBind> }
+
+// A member as module `m` writes it at `span`: as written in its own module, and through the module
+// that declares its effect anywhere else. An effect that resolves to no module, a prelude one or a
+// misspelling, keeps its written name, and the checker answers for it where the set is named.
+fn usable(r: Resolved, m: Int, mb: Member, span: Span) -> Usable =
+  if mb.home == m { { atom: mb.atom, bind: None } } else {
+    let moved = moved_to(mb.atom, span);
+    match effect_owner(r, mb.home, mb.atom.eff) {
+      None -> { atom: moved, bind: None },
+      Some(o) -> {
+        let module = at(r.scopes, o.target).module;
+        if bytes_len(module) == 0 { { atom: moved, bind: None } } else {
+          let binder = reached_binder(module);
+          {
+            atom: {
+              ..moved,
+              eff: {
+                module: Some({ name: binder, span: span }),
+                name: { name: o.name, span: span },
+                span: span,
+              },
+            },
+            bind: Some({ binder: binder, target: o.target, span: dummy_span() }),
+          }
+        }
+      },
+    }
+  }
+
+fn with_reach(xs: List<ModBind>, b: Option<ModBind>) -> List<ModBind> =
+  match b {
+    None -> xs,
+    Some(x) -> match find_modbind(xs, x.binder) { Some(_) -> xs, None -> push(xs, x) },
+  }
+
+type Rows = { r: Resolved, t: SetTable, module: Int, reached: List<ModBind>, diags: List<Diag> }
+
+type Rowed = { s: Rows, r: RowExpr }
+
+fn row_with_sets(s: Rows, row: RowExpr) -> Rowed =
+  if len(row.aliases) == 0 { { s: s, r: row } } else {
+    let o = fold(
+      row.aliases,
+      { s: s, atoms: row.atoms },
+      |acc: { s: Rows, atoms: List<AtomExpr> }, q: QName|
+        match set_named(acc.s.r, acc.s.t, acc.s.module, q) {
+          Err(d) -> { ..acc, s: { ..acc.s, diags: push(acc.s.diags, d) } },
+          Ok(id) ->
+            fold(
+              at(acc.s.t.nodes, id).members,
+              acc,
+              |a: { s: Rows, atoms: List<AtomExpr> }, mb: Member| {
+                let u = usable(a.s.r, a.s.module, mb, q.span);
+                {
+                  s: { ..a.s, reached: with_reach(a.s.reached, u.bind) },
+                  atoms: push(a.atoms, u.atom),
+                }
+              },
+            ),
+        },
+    );
+    { s: o.s, r: { atoms: o.atoms, aliases: row.aliases, tail: row.tail, span: row.span } }
+  }
+
+// Each row of the module with every set it names expanded; each set's own item with all it stands for.
+fn module_sets(r: Resolved, t: SetTable, m: Int, md: Mod) -> { md: Mod, s: Rows } = {
+  let start: Rows = { r: r, t: t, module: m, reached: [], diags: [] };
+  let walked = fold(
+    md.module.items,
+    { s: start, items: [] },
+    |acc: { s: Rows, items: List<Item> }, it: Item|
+      match it {
+        IEffectSet(d) -> match map_get(at(t.by_module, m), d.name.name) {
+          Some(id) -> if at(t.nodes, id).def.span == d.span {
+            let us = map(at(t.nodes, id).members, |mb: Member| usable(r, m, mb, d.name.span));
+            {
+              s: {
+                ..acc.s,
+                reached: fold(us, acc.s.reached, |xs: List<ModBind>, u: Usable|
+                  with_reach(xs, u.bind)),
+              },
+              items: push(acc.items, IEffectSet({ ..d, expansion: map(us, |u: Usable| u.atom) })),
+            }
+          } else { { ..acc, items: push(acc.items, it) } },
+          None -> { ..acc, items: push(acc.items, it) },
+        },
+        _ -> {
+          let o = rows_item(acc.s, it);
+          { s: o.s, items: push(acc.items, o.it) }
+        },
+      },
+  );
+  {
+    md: {
+      name: md.name,
+      module: { imports: md.module.imports, items: walked.items },
+      derived: md.derived,
+    },
+    s: walked.s,
+  }
+}
+
+// Every row an item writes, with the sets it names expanded. Rows are walked on lambda parameter
+// types and `let` annotations, never on a lambda's return type.
+
+fn rows_opt(s: Rows, r: Option<RowExpr>) -> { s: Rows, r: Option<RowExpr> } =
+  match r {
+    None -> { s: s, r: None },
+    Some(x) -> {
+      let o = row_with_sets(s, x);
+      { s: o.s, r: Some(o.r) }
+    },
+  }
+
+fn rows_ty(s: Rows, t: TypeExpr) -> { s: Rows, t: TypeExpr } =
+  match t {
+    TCon(c) -> {
+      let o = rows_tys(s, c.args);
+      { s: o.s, t: TCon({ span: c.span, name: c.name, args: o.ts }) }
+    },
+    TFn(ft) -> {
+      let ps = rows_tys(s, ft.params);
+      let r = rows_ty(ps.s, ft.ret);
+      let e = rows_opt(r.s, ft.effects);
+      { s: e.s, t: TFn({ span: ft.span, params: ps.ts, ret: r.t, effects: e.r }) }
+    },
+    TRecord(r) -> {
+      let fs = fold(
+        r.fields,
+        { s: s, fs: [] },
+        |acc: { s: Rows, fs: List<{ name: Ident, ty: TypeExpr }> }, fd: { name: Ident, ty: TypeExpr }| {
+          let o = rows_ty(acc.s, fd.ty);
+          { s: o.s, fs: push(acc.fs, { name: fd.name, ty: o.t }) }
+        },
+      );
+      { s: fs.s, t: TRecord({ span: r.span, fields: fs.fs }) }
+    },
+    _ -> { s: s, t: t },
+  }
+
+fn rows_tys(s: Rows, ts: List<TypeExpr>) -> { s: Rows, ts: List<TypeExpr> } =
+  fold(ts, { s: s, ts: [] }, |acc: { s: Rows, ts: List<TypeExpr> }, t: TypeExpr| {
+    let o = rows_ty(acc.s, t);
+    { s: o.s, ts: push(acc.ts, o.t) }
+  })
+
+fn rows_opt_ty(s: Rows, t: Option<TypeExpr>) -> { s: Rows, t: Option<TypeExpr> } =
+  match t {
+    None -> { s: s, t: None },
+    Some(x) -> {
+      let o = rows_ty(s, x);
+      { s: o.s, t: Some(o.t) }
+    },
+  }
+
+fn rows_params(s: Rows, ps: List<Param>) -> { s: Rows, ps: List<Param> } =
+  fold(ps, { s: s, ps: [] }, |acc: { s: Rows, ps: List<Param> }, p: Param| {
+    let o = rows_opt_ty(acc.s, p.ty);
+    { s: o.s, ps: push(acc.ps, { name: p.name, ty: o.t, default: p.default, span: p.span }) }
+  })
+
+fn rows_exprs(s: Rows, xs: List<Expr>) -> { s: Rows, xs: List<Expr> } =
+  fold(xs, { s: s, xs: [] }, |acc: { s: Rows, xs: List<Expr> }, x: Expr| {
+    let o = rows_expr(acc.s, x);
+    { s: o.s, xs: push(acc.xs, o.e) }
+  })
+
+fn rows_fields(s: Rows, fs: List<RecField>) -> { s: Rows, fs: List<RecField> } =
+  fold(fs, { s: s, fs: [] }, |acc: { s: Rows, fs: List<RecField> }, fd: RecField| {
+    let o = rows_expr(acc.s, fd.value);
+    { s: o.s, fs: push(acc.fs, { name: fd.name, value: o.e }) }
+  })
+
+fn rows_opt_expr(s: Rows, e: Option<Expr>) -> { s: Rows, e: Option<Expr> } =
+  match e {
+    None -> { s: s, e: None },
+    Some(x) -> {
+      let o = rows_expr(s, x);
+      { s: o.s, e: Some(o.e) }
+    },
+  }
+
+fn rows_expr(s: Rows, e: Expr) -> { s: Rows, e: Expr } =
+  match e {
+    EBinary(b) -> {
+      let l = rows_expr(s, b.lhs);
+      let r = rows_expr(l.s, b.rhs);
+      { s: r.s, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+    },
+    EUnary(u) -> {
+      let o = rows_expr(s, u.operand);
+      { s: o.s, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
+    },
+    ELambda(l) -> {
+      let ps = rows_params(s, l.params);
+      let b = rows_expr(ps.s, l.body);
+      { s: b.s, e: ELambda({ span: l.span, body: b.e, params: ps.ps, ret: l.ret }) }
+    },
+    EApp(a) -> {
+      let callee = rows_expr(s, a.func);
+      let args = rows_exprs(callee.s, a.args);
+      let named = fold(
+        a.named,
+        { s: args.s, ns: [] },
+        |acc: { s: Rows, ns: List<NamedArg> }, n: NamedArg| {
+          let o = rows_expr(acc.s, n.value);
+          { s: o.s, ns: push(acc.ns, { name: n.name, value: o.e, span: n.span }) }
+        },
+      );
+      {
+        s: named.s,
+        e: EApp({ span: a.span, func: callee.e, named: named.ns, args: args.xs, labels: a.labels }),
+      }
+    },
+    EIf(i) -> {
+      let c = rows_expr(s, i.cond);
+      let t = rows_expr(c.s, i.then_branch);
+      let el = rows_expr(t.s, i.else_branch);
+      { s: el.s, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
+    },
+    EMatch(m) -> {
+      let sc = rows_expr(s, m.scrutinee);
+      let arms = fold(
+        m.arms,
+        { s: sc.s, arms: [] },
+        |acc: { s: Rows, arms: List<MatchArm> }, arm: MatchArm| {
+          let g = rows_opt_expr(acc.s, arm.guard);
+          let b = rows_expr(g.s, arm.body);
+          { s: b.s, arms: push(acc.arms, { pat: arm.pat, guard: g.e, body: b.e, span: arm.span }) }
+        },
+      );
+      { s: arms.s, e: EMatch({ span: m.span, scrutinee: sc.e, arms: arms.arms }) }
+    },
+    EBlock(b) -> {
+      let stmts = fold(b.stmts, { s: s, ss: [] }, |acc: { s: Rows, ss: List<Stmt> }, sm: Stmt|
+        match sm {
+          SLet(l) -> {
+            let t = rows_opt_ty(acc.s, l.ty);
+            let v = rows_expr(t.s, l.value);
+            { s: v.s, ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: t.t, value: v.e })) }
+          },
+          SLetElse(l) -> {
+            let t = rows_opt_ty(acc.s, l.ty);
+            let v = rows_expr(t.s, l.value);
+            let fb = rows_expr(v.s, l.fallback);
+            {
+              s: fb.s,
+              ss: push(
+                acc.ss,
+                SLetElse({ span: l.span, pat: l.pat, ty: t.t, value: v.e, fallback: fb.e }),
+              ),
+            }
+          },
+          SExpr(x) -> {
+            let o = rows_expr(acc.s, x);
+            { s: o.s, ss: push(acc.ss, SExpr(o.e)) }
+          },
+        });
+      let tl = rows_opt_expr(stmts.s, b.tail);
+      { s: tl.s, e: EBlock({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
+    },
+    ERecord(r) -> {
+      let o = rows_fields(s, r.fields);
+      { s: o.s, e: ERecord({ span: r.span, fields: o.fs }) }
+    },
+    ERecordUpdate(r) -> {
+      let b = rows_expr(s, r.base);
+      let o = rows_fields(b.s, r.fields);
+      { s: o.s, e: ERecordUpdate({ span: r.span, base: b.e, fields: o.fs }) }
+    },
+    EField(fd) -> {
+      let o = rows_expr(s, fd.base);
+      { s: o.s, e: EField({ span: fd.span, base: o.e, field: fd.field }) }
+    },
+    ETry(t) -> {
+      let o = rows_expr(s, t.operand);
+      { s: o.s, e: ETry({ span: t.span, operand: o.e }) }
+    },
+    EList(l) -> {
+      let o = rows_exprs(s, l.items);
+      { s: o.s, e: EList({ span: l.span, items: o.xs }) }
+    },
+    EPerform(p) -> {
+      let o = rows_exprs(s, p.args);
+      {
+        s: o.s,
+        e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }),
+      }
+    },
+    EHandle(h) -> {
+      let b = rows_expr(s, h.body);
+      let cs = fold(
+        h.clauses,
+        { s: b.s, cs: [] },
+        |acc: { s: Rows, cs: List<HandleClause> }, c: HandleClause| {
+          let o = rows_expr(acc.s, c.body);
+          {
+            s: o.s,
+            cs: push(acc.cs, {
+              eff: c.eff,
+              op: c.op,
+              resource: c.resource,
+              every_label: c.every_label,
+              label_binder: c.label_binder,
+              resume: c.resume,
+              body: o.e,
+              span: c.span,
+              params: c.params,
+            }),
+          }
+        },
+      );
+      let r = match h.ret {
+        None -> { s: cs.s, r: None },
+        Some(rc) -> {
+          let o = rows_expr(cs.s, rc.body);
+          { s: o.s, r: Some({ binder: rc.binder, body: o.e, span: rc.span }) }
+        },
+      };
+      { s: r.s, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
+    },
+    EWithCell(c) -> {
+      let i = rows_expr(s, c.init);
+      let b = rows_expr(i.s, c.body);
+      {
+        s: b.s,
+        e: EWithCell({
+          span: c.span,
+          resource: c.resource,
+          init: i.e,
+          binder: c.binder,
+          body: b.e,
+        }),
+      }
+    },
+    ESimulate(x) -> {
+      let o = rows_expr(s, x.body);
+      { s: o.s, e: ESimulate({ span: x.span, body: o.e }) }
+    },
+    EParallel(x) -> {
+      let o = rows_exprs(s, x.branches);
+      { s: o.s, e: EParallel({ span: x.span, branches: o.xs }) }
+    },
+    _ -> { s: s, e: e },
+  }
+
+fn rows_item(s: Rows, it: Item) -> { s: Rows, it: Item } =
+  match it {
+    IFn(d) -> {
+      let ps = rows_params(s, d.params);
+      let r = rows_opt_ty(ps.s, d.ret);
+      let ef = rows_opt(r.s, d.effects);
+      let spec = fold(
+        d.spec,
+        { s: ef.s, xs: [] },
+        |acc: { s: Rows, xs: List<SpecClause> }, c: SpecClause| {
+          let o = rows_expr(acc.s, c.expr);
+          { s: o.s, xs: push(acc.xs, { kind: c.kind, expr: o.e, span: c.span }) }
+        },
+      );
+      let b = rows_expr(spec.s, d.body);
+      {
+        s: b.s,
+        it: IFn({
+          vis: d.vis,
+          name: d.name,
+          generics: d.generics,
+          params: ps.ps,
+          ret: r.t,
+          effects: ef.r,
+          constraints: d.constraints,
+          spec: spec.xs,
+          reuse: d.reuse,
+          body: b.e,
+          span: d.span,
+        }),
+      }
+    },
+    IType(d) -> match d.body {
+      TDAlias(t) -> {
+        let o = rows_ty(s, t);
+        {
+          s: o.s,
+          it: IType({
+            vis: d.vis,
+            name: d.name,
+            params: d.params,
+            body: TDAlias(o.t),
+            span: d.span,
+          }),
+        }
+      },
+      TDSum(vs) -> {
+        let out = fold(
+          vs,
+          { s: s, vs: [] },
+          |acc: { s: Rows, vs: List<VariantDef> }, v: VariantDef| {
+            let o = rows_tys(acc.s, v.fields);
+            { s: o.s, vs: push(acc.vs, { name: v.name, fields: o.ts, span: v.span }) }
+          },
+        );
+        {
+          s: out.s,
+          it: IType({
+            vis: d.vis,
+            name: d.name,
+            params: d.params,
+            body: TDSum(out.vs),
+            span: d.span,
+          }),
+        }
+      },
+    },
+    IEffect(d) -> {
+      let ops = fold(d.ops, { s: s, ops: [] }, |acc: { s: Rows, ops: List<OpDef> }, op: OpDef| {
+        let ps = rows_tys(acc.s, op.params);
+        let r = rows_ty(ps.s, op.ret);
+        {
+          s: r.s,
+          ops: push(acc.ops, {
+            name: op.name,
+            mode: op.mode,
+            resource_param: op.resource_param,
+            ty_params: op.ty_params,
+            params: ps.ts,
+            ret: r.t,
+            span: op.span,
+          }),
+        }
+      });
+      {
+        s: ops.s,
+        it: IEffect({
+          vis: d.vis,
+          name: d.name,
+          is_nondet: d.is_nondet,
+          ops: ops.ops,
+          span: d.span,
+        }),
+      }
+    },
+    ITest(d) -> {
+      let o = rows_expr(s, d.body);
+      {
+        s: o.s,
+        it: ITest({
+          name: d.name,
+          name_span: d.name_span,
+          is_nondet: d.is_nondet,
+          body: o.e,
+          span: d.span,
+        }),
+      }
+    },
+    ILaw(d) -> {
+      let bs = fold(d.binders, { s: s, bs: [] }, |acc: { s: Rows, bs: List<Binder> }, b: Binder| {
+        let o = rows_ty(acc.s, b.ty);
+        { s: o.s, bs: push(acc.bs, { name: b.name, ty: o.t, span: b.span }) }
+      });
+      let g = rows_opt_expr(bs.s, d.guard);
+      let b = rows_expr(g.s, d.body);
+      {
+        s: b.s,
+        it: ILaw({
+          name: d.name,
+          name_span: d.name_span,
+          host: d.host,
+          binders: bs.bs,
+          guard: g.e,
+          body: b.e,
+          span: d.span,
+        }),
+      }
+    },
+    _ -> { s: s, it: it },
+  }
+
+type SetsExpanded = { r: Resolved, mods: List<Mod>, diags: List<Diag> }
+
+fn expand_sets(r: Resolved, mods: List<Mod>) -> SetsExpanded = {
+  let t = set_expand_all(r, set_cycles(set_includes(r, set_table(mods))));
+  fold(range(0, len(mods)), { r: r, mods: [], diags: t.diags }, |acc: SetsExpanded, m: Int| {
+    let o = module_sets(r, t, m, at(mods, m));
+    {
+      r: fold(o.s.reached, acc.r, |rr: Resolved, mb: ModBind| reach(rr, m, mb.binder, mb.target)),
+      mods: push(acc.mods, o.md),
+      diags: bytes_concat_diags(acc.diags, o.s.diags),
+    }
+  })
+}
+
 // --- Defaults: the signatures ---------------------------------------------------------------
 
 type PInfo = { name: Bytes, default: Option<Expr>, imports: List<ModBind> }
@@ -1974,8 +2902,10 @@ fn resolve_with(
       imports: map(edges, |es: List<{ from: Int, target: Int, span: Span }>|
         map(es, |e: { from: Int, target: Int, span: Span }| e.target)),
     };
-    if !defaults { Resolved_({ r: r, mods: mods, diags: [] }) } else {
-      let x = expand(r, mods, []);
+    let sets = expand_sets(r, mods);
+    if len(sets.diags) > 0 { Failed(sets.diags) }
+    else if !defaults { Resolved_({ r: sets.r, mods: sets.mods, diags: [] }) } else {
+      let x = expand(sets.r, sets.mods, []);
       if len(x.diags) > 0 { Failed(x.diags) } else { Resolved_(x) }
     }
   }
@@ -2031,6 +2961,7 @@ fn dump_scope(i: Int, s: Scope) -> Bytes =
     bytes_concat_all(map(s.bound.values, |b: Binding| dump_binding(b"V", b))),
     bytes_concat_all(map(s.bound.types, |b: Binding| dump_binding(b"T", b))),
     bytes_concat_all(map(s.bound.effects, |b: Binding| dump_binding(b"E", b))),
+    bytes_concat_all(map(s.bound.sets, |b: Binding| dump_binding(b"R", b))),
   ])
 
 fn dump_order(order: List<Int>) -> Bytes =
@@ -2144,5 +3075,97 @@ test "two modules resolve to the tables the reference builds" {
       dump,
       "R;2;M;0;base;V;one;base.one;0;7:10;M;1;app;S;base;0;7:11;V;two;app.two;1;21:24;V;one;base.one;0;13:16;O;0,1;D;0;",
     ),
+  )
+}
+
+// Each atom of the first `fn`'s written row in module `m`, as the expansion left it.
+fn first_row(x: Expanded, m: Int) -> List<Bytes> = {
+  let f = fold(at(x.mods, m).module.items, None, |acc: Option<FnDef>, it: Item|
+    match acc { Some(_) -> acc, None -> match it { IFn(d) -> Some(d), _ -> None } });
+  match f {
+    None -> panic("the module writes a fn"),
+    Some(d) -> match d.effects {
+      None -> [],
+      Some(r) ->
+        map(r.atoms, |a: AtomExpr|
+          bytes_concat_all([
+            match a.eff.module { Some(b) -> bytes_concat(b.name, b"::"), None -> b"" },
+            a.eff.name.name,
+            b".",
+            match a.op { Some(o) -> o.name, None -> mode_word(a.mode) },
+            match a.resource { Some(l) -> bytes_concat_all([b"[", l.name, b"]"]), None -> b"" },
+          ])),
+    },
+  }
+}
+
+fn resolved(sources: List<Source>) -> Expanded =
+  match resolve(sources) {
+    Resolved_(x) -> x,
+    Failed(ds) -> panic(string_of_bytes(bytes_concat(b"refused: ", dump_diags(ds)))),
+  }
+
+fn refused_codes(sources: List<Source>) -> List<Bytes> =
+  match resolve(sources) { Resolved_(_) -> [], Failed(ds) -> map(ds, |d: Diag| d.code) }
+
+fn store_base() -> Bytes =
+  b"pub effect store { read get[t](k: Int) -> Int }\npub effect set Reads = {store.read[orders], log.write}\nfn own() -> Int / {Reads} = 1\n"
+
+test "a `pub` set is named by import or through its module, and means what it means where it was written" {
+  let by_name = resolved([
+    { name: b"base", src: store_base() },
+    { name: b"app", src: b"import base (Reads)\nfn f() -> Int / {Reads} = 1" },
+  ]);
+  // The declaring module writes its own atoms; another reaches the effect's module itself.
+  assert_eq(first_row(by_name, 0), [b"store.read[orders]", b"log.write"]);
+  assert_eq(first_row(by_name, 1), [b"@base::store.read[orders]", b"log.write"]);
+  assert(find_modbind(at(by_name.r.scopes, 1).modules, b"@base") != None);
+  let through = resolved([
+    { name: b"base", src: store_base() },
+    { name: b"app", src: b"import base\nfn f() -> Int / {base::Reads} = 1" },
+  ]);
+  assert_eq(first_row(through, 1), [b"@base::store.read[orders]", b"log.write"])
+}
+
+test "a set may include another module's, and a third module names the whole of it" {
+  let x = resolved([
+    { name: b"base", src: store_base() },
+    { name: b"mid", src: b"import base (Reads)\npub effect set All = {Reads, clock.read}" },
+    { name: b"app", src: b"import mid (All)\nfn f() -> Int / {All} = 1" },
+  ]);
+  assert_eq(first_row(x, 2), [b"@base::store.read[orders]", b"clock.read", b"log.write"])
+}
+
+test "a set is refused where it is named when nothing declares it, its module keeps it, or it names itself" {
+  assert_eq(refused_codes([{ name: b"app", src: b"fn f() -> Int / {Nope} = 1" }]), [b"E0114"]);
+  let hidden = b"effect set Hidden = {log.write}\n";
+  assert_eq(
+    refused_codes([
+      { name: b"base", src: hidden },
+      { name: b"app", src: b"import base\nfn f() -> Int / {base::Hidden} = 1" },
+    ]),
+    [b"E0107"],
+  );
+  assert_eq(
+    refused_codes([
+      { name: b"base", src: hidden },
+      { name: b"app", src: b"import base (Hidden)\nfn f() -> Int = 1" },
+    ]),
+    [b"E0107"],
+  );
+  assert_eq(
+    refused_codes([
+      { name: b"app", src: b"effect set A = {B}\neffect set B = {A}\nfn f() -> Int / {A} = 1" },
+    ]),
+    [b"E0115"],
+  );
+  assert_eq(
+    refused_codes([
+      {
+        name: b"app",
+        src: b"effect set A = {log.write}\neffect set A = {clock.read}\nfn f() -> Int = 1",
+      },
+    ]),
+    [b"E0105"],
   )
 }

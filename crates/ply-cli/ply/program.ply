@@ -9,7 +9,7 @@ import compiler.front (Refused, Analysed, Whole, Pulled, Rows, DefInterface,
                        analyse_pulling_std_with, dump_of, filing, module_items, module_imports,
                        rows_of)
 import compiler.pkg (Pkgs, Supplied)
-import compiler.interface (CompiledPackage, merged_interfaces, stub_sources)
+import compiler.interface (CompiledPackage, Original, merged_interfaces)
 import interfaces
 import compiler.hash (HashOutput, hex)
 import std.hash (blake3)
@@ -95,7 +95,7 @@ fn broken(project: Project, places: List<Place>, diags: List<Diag>) -> Program =
 
 // What a load of this project is made of: its root key and manifest text, and every dependency
 // the walk read. The front end takes this as its package closure.
-fn pkgs_of(project: Project) -> Pkgs =
+pub fn pkgs_of(project: Project) -> Pkgs =
   {
     root: bytes_of_string(project.root_key),
     manifest: match project.manifest { None -> None, Some(f) -> Some(f.text) },
@@ -150,20 +150,15 @@ fn front_end(
   rows: Rows,
   pkgs: Pkgs,
   through: List<CompiledPackage>,
-) -> Pulled = {
-  let stubs = fold(stub_sources(through), map_new(), |acc: Map<Bytes, Bytes>, s: Source|
-    map_insert(acc, s.name, s.src));
-  let shipped = map(shelved, |s: Source|
-    match map_get(stubs, s.name) { Some(stub) -> { name: s.name, src: stub }, None -> s });
+) -> Pulled =
   analyse_pulling_std_with(
     sources,
-    shipped,
+    shelved,
     rows.defs,
     rows.tests,
     pkgs,
     merged_interfaces(through),
   )
-}
 
 // Seeded with what the load published, so only what the splice moved is walked again.
 pub fn reanalysed(
@@ -228,6 +223,9 @@ fn claims_the_shelf(project: Project, shelved: List<Source>) -> Bool = {
 fn interfaced_for(interfaced: Bool, project: Project, shelved: List<Source>) -> Bool =
   interfaced && usable(project) && len(shelved) > 0 && !claims_the_shelf(project, shelved)
 
+fn originals_of(project: Project, shelved: List<Source>) -> List<Original> =
+  interfaces::originals(pkgs_of(project), map(project.sources, |s: Source| s.name), shelved)
+
 fn through_of(
   paths: List<paths::Resolved>,
   project: Project,
@@ -237,9 +235,9 @@ fn through_of(
 ) -> List<CompiledPackage> / {fs.read[cwd], fs.read[abs]} =
   if !interfaced_for(interfaced, project, shelved) { [] } else {
     let place = loads::place_of(paths, stamps);
-    let shelf = if place.label == "cwd" { interfaces::shelf_package[cwd](place, shelved) }
-    else { interfaces::shelf_package[abs](place, shelved) };
-    match shelf { Some(p) -> [p], None -> [] }
+    let found = originals_of(project, shelved);
+    if place.label == "cwd" { interfaces::read_through[cwd](place, found) }
+    else { interfaces::read_through[abs](place, found) }
   }
 
 fn refreshing(
@@ -255,8 +253,9 @@ fn refreshing(
     None -> (),
     Some(w) -> if !interfaced_for(interfaced, project, shelved) { () } else {
       let place = loads::place_of(paths, stamps);
-      if place.label == "cwd" { interfaces::refreshed[cwd](place, shelved, w, through) }
-      else { interfaces::refreshed[abs](place, shelved, w, through) }
+      let found = originals_of(project, shelved);
+      if place.label == "cwd" { interfaces::refreshed[cwd](place, found, w, through) }
+      else { interfaces::refreshed[abs](place, found, w, through) }
     },
   }
 
@@ -575,6 +574,17 @@ fn first_primary(labels: List<Label>) -> Option<Label> =
   fold(labels, None, |acc: Option<Label>, l: Label|
     match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } })
 
+// What a run answers for: its root package's modules, and the shipped ones when it asks for them.
+// Another package's definitions are claimed by their specs: that package's own run proves them.
+pub fn owned_of(w: Whole, std: Bool) -> (Bytes) -> Bool = {
+  let roots = fold(range(0, len(w.mods)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
+    match ((list_at(w.mods, i), list_at(w.mod_pkg, i))) {
+      (Some(m), Some(pkg)) -> if pkg == 0 { map_insert(acc, m.name, true) } else { acc },
+      _ -> acc,
+    });
+  |m: Bytes| map_contains(roots, m) || (std && is_shipped(string_of_bytes_lossy(m)))
+}
+
 // A diagnostic raised inside a module the project did not write, which is the shelf's business.
 // A run reports its own modules' tests and laws, however its dependencies were read.
 pub fn own_tests(p: Program, w: Whole) -> List<TestInfo> =
@@ -783,7 +793,6 @@ fn named(name: Bytes, simple: Bytes) -> DefInfo =
     row_aliases: [],
     constraints: [],
     spec: [],
-    internally_effectful: false,
     at: { module: 0, span: { start: 0, end: 0 } },
   }
 
@@ -828,6 +837,8 @@ fn two_defs() -> HashOutput =
     ],
     bodies: [],
     test_bodies: [],
+    checks: [],
+    spec_checks: [],
   }
 
 test "a moved stdlib is said once, counting what reaches a shipped definition that moved" {
