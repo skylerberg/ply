@@ -174,6 +174,16 @@ impl Trail {
         }
     }
 
+    /// Adds `access` to every step `task` of `region` has taken so far: a cancel is known only once
+    /// it happens, and each of the task's earlier steps could have been after it instead.
+    pub fn mark_steps_of(&mut self, region: SimId, task: TaskId, access: Access) {
+        for step in self.steps.iter_mut() {
+            if step.region == region && step.task == task {
+                step.accesses.insert(access.clone());
+            }
+        }
+    }
+
     /// A step that touched nothing a task can share is placed where it gave control back.
     pub fn end_step(&mut self, yielded: StepSite) {
         if let Some(step) = self.steps.last_mut() {

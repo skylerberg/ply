@@ -433,7 +433,7 @@ fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
         "FxHashMap",
         "FxHashSet",
         "SystemTime",
-        "Instant",
+        "Instant::now",
         "thread::",
         "rayon",
         "as_ptr",

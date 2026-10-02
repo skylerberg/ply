@@ -1078,7 +1078,9 @@ scheduler:
 ```ply
 nondet effect task   { write spawn<a | e>(body: () -> a / e) -> Task<a> / e
                        write join<a>(t: Task<a>) -> a
-                       write yield() -> Unit }
+                       write yield() -> Unit
+                       write cancel<a>(t: Task<a>) -> Bool
+                       write await<a>(t: Task<a>) -> Option<a> }
 nondet effect clock  { read  now() -> Instant
                        write sleep(d: Duration) -> Unit }
 nondet effect random { write next() -> Int
@@ -1109,6 +1111,16 @@ effect sim           { read  seed() -> Int }
 * A `parallel` block (§5.9) inside a region runs its branches in turn, so the
   scheduler sees nothing of it. A branch may not open a region (`E0309`): a
   region's schedule is drawn from its entry's seed in the order regions open.
+
+`task.cancel(t)` stops `t` where it stands: a sleep, a join or a host operation
+it waits on is let go, and it performs nothing more. When it next runs it only
+unwinds, releasing what it holds. The cancel answers `false` for a task that had
+already ended and leaves its answer alone. `task.await(t)` is a join that answers
+`Some` of what `t` answered, or `None` once it was cancelled; `task.join` of a
+cancelled task has nothing to answer and raises `E0502`. A task cannot cancel
+itself or the region's body. A deadline is the two together: one task sleeps and
+cancels the other, which a third awaits. Every step a cancelled task took is read
+against the cancel, so the search tries cancelling it earlier and later.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -3167,7 +3179,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   moves between OS threads; only a `parallel` block's branches run on threads
   of the runtime's own.
 * No file handles — `fs` reads a range and appends by path, with nothing open
-  between calls; no cancellation or backpressure; no migrations or live schema
+  between calls; no backpressure; no migrations or live schema
   check; HTTP/1.1 only; no authentication framework.
 
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no
