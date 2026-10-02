@@ -591,7 +591,7 @@ jobs:
           git pull --rebase origin main || { git rebase --abort; echo "main moved; the next run refreshes"; exit 0; }
           git push origin HEAD:main || echo "main moved; the next run refreshes"
 
-  # Tests that must be seen to run: the `#![cfg(unix)]` shutdown suite and the tree checks by name.
+  # Tests that must be seen to run: the tree checks, by name.
   gates:
     name: test gates
     needs: [plan, build, build-ply]
@@ -613,7 +613,7 @@ jobs:
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --no-fail-fast -E "$filter" 2>&1 | tee /tmp/gates.log
 
-      - name: Every tree check and the shutdown suite ran
+      - name: Every tree check ran
         run: |
           set -euo pipefail
           ran=0
@@ -631,16 +631,6 @@ jobs:
           done < <(.github/ci-shards.sh tree-checks)
           echo "$ran tree checks ran"
           [ "$ran" -gt 0 ] || { echo "the table is empty" >&2; exit 1; }
-          w5=$(awk '
-            { gsub(/\033\[[0-9;]*m/, "") }
-            $1 == "PASS" && $(NF - 1) == "ply-cli-tests::suite" && $NF ~ /^shutdown::/ { n++ }
-            END { print n + 0 }
-          ' /tmp/gates.log)
-          [ "$w5" -gt 0 ] || {
-            echo "the log names no shutdown test — #![cfg(unix)] compiled it away" >&2
-            exit 1
-          }
-          echo "shutdown: $w5 test(s) ran"
 
       # On the merge with main, not only the branch: two changes that each re-pinned their own tree
       # leave main's lock stale, and main's refresh is the first build that verifies it. Here, beside
@@ -678,10 +668,11 @@ jobs:
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --no-fail-fast --success-output immediate -E "$filter"
 
-  # The corpus's checks that start desks under load, a runner each (`ci-shards.sh corpus-matrix`): they
-  # spawn this run's `ply` over desks and floors with the grants `benches/corpus.sh` gives the program.
-  # Postgres beside them holds the desk's schema, and the database checks are handed its URL as
-  # `CORPUS_DB`. The corpus's other runs go to the partitions.
+  # The Ply runs that would starve a partition, a runner each (`ci-shards.sh corpus-matrix`): the
+  # corpus's checks that start desks under load, which spawn this run's `ply` over desks and floors
+  # with the grants `benches/corpus.sh` gives the program, and the CLI suite's `cli-` runs that take
+  # every core. Postgres beside them holds the desk's schema, and the database checks are handed its
+  # URL as `CORPUS_DB`. The other runs go to the partitions.
   corpus:
     name: test corpus ${{ matrix.id }}
     needs: [plan, build, build-ply]
@@ -722,13 +713,16 @@ jobs:
       - name: The moment this job's compiling starts
         run: .github/ci-corpus.sh mark
       - name: psql, and the libpq the floor links
+        if: ${{ !startsWith(matrix.id, 'cli-') }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-client libpq-dev
       - name: The desk's schema
+        if: ${{ !startsWith(matrix.id, 'cli-') }}
         run: psql -v ON_ERROR_STOP=1 -q -h 127.0.0.1 -U postgres -d desk -f examples/desk.sql
       # Built as `benches/corpus.sh` builds them; the checks ask `process.bound` for each.
       - name: The floors the served tables are compared with
+        if: ${{ !startsWith(matrix.id, 'cli-') }}
         run: |
           set -euo pipefail
           cc -O2 -o target/http-floor benches/http-floor/floor.c -lpthread
@@ -738,9 +732,12 @@ jobs:
         env:
           ID: ${{ matrix.id }}
         run: |
-          .github/ci-corpus.sh run "$ID" \
-            --exec "http_floor=$PWD/target/http-floor" --exec "pg_floor=$PWD/target/pg-floor" \
-            --set CORPUS_DB=postgres://postgres@127.0.0.1:5432/desk
+          case "$ID" in
+            cli-*) .github/ci-corpus.sh run "$ID" ;;
+            *) .github/ci-corpus.sh run "$ID" \
+                 --exec "http_floor=$PWD/target/http-floor" --exec "pg_floor=$PWD/target/pg-floor" \
+                 --set CORPUS_DB=postgres://postgres@127.0.0.1:5432/desk ;;
+          esac
       # From main, what this run compiled, for every later run's corpus lanes.
       - name: What this run compiled
         if: github.event_name == 'push'

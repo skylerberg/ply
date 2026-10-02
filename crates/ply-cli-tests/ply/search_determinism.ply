@@ -1,0 +1,485 @@
+// A simulated search is a function of its seed and its program: not of the process, the worker
+// count, the company a test keeps, a warm cache, or what ran on the thread before it.
+
+import harness (Ran, program, on_disk, spawned, json_of, at, path, items, first, str, int, shown,
+                concatenated)
+import std.json
+import std.json (Json, Object, Array, Str)
+import std.string
+
+// Failures, exhaustive searches and ordinary cached tests at once, so a difference in any of them
+// shows.
+fn corpus() -> String =
+  \\effect counter {
+  \\  read  get[r]() -> Int
+  \\  write put[r](v: Int) -> Unit
+  \\}
+  \\
+  \\fn bump() -> Unit / {counter.read[n], counter.write[n], clock.read} = {
+  \\  let seen = counter.get[n]();
+  \\  clock.now();
+  \\  counter.put[n](seen + 1)
+  \\}
+  \\
+  \\test "two increments race" {
+  \\  with_cell[n](0) { c ->
+  \\    handle {
+  \\      simulate {
+  \\        let a = task.spawn(|| bump());
+  \\        let b = task.spawn(|| bump());
+  \\        task.join(a);
+  \\        task.join(b);
+  \\        assert_eq(counter.get[n](), 2)
+  \\      }
+  \\    } with {
+  \\      counter.get[n]() -> cell_get(c),
+  \\      counter.put[n](v) -> cell_set(c, v),
+  \\    }
+  \\  }
+  \\}
+  \\
+  \\test "two increments land in some order" {
+  \\  with_cell[n](0) { c ->
+  \\    handle {
+  \\      simulate {
+  \\        let a = task.spawn(|| bump());
+  \\        let b = task.spawn(|| bump());
+  \\        task.join(a);
+  \\        task.join(b);
+  \\        assert(counter.get[n]() >= 1)
+  \\      }
+  \\    } with {
+  \\      counter.get[n]() -> cell_get(c),
+  \\      counter.put[n](v) -> cell_set(c, v),
+  \\    }
+  \\  }
+  \\}
+  \\
+  \\test "a sleeper costs no wall clock" {
+  \\  simulate {
+  \\    let t = task.spawn(|| { clock.sleep(30000000000); clock.now() });
+  \\    assert_eq(task.join(t), 30000000000)
+  \\  }
+  \\}
+  \\
+  \\test "the arithmetic is not concurrent" { assert_eq(1 + 1, 2) }
+  \\
+
+// Everything a run is allowed to differ in, and nothing else: its clocks, its front end, its pool,
+// and the units the tier builds a worker each.
+fn scrub(value: Json) -> Json =
+  match value {
+    Object(fields) ->
+      Object(
+        map_fold(fields, map_new(), |acc: Map<String, Json>, k: String, v: Json|
+          if string_contains(k, "duration") || string_ends_with(k, "_ms")
+              || string_ends_with(k, "_nanos")
+              || k == "front_end"
+              || k == "workers"
+              || k == "units"
+              || k == "elapsed" { acc }
+          else { map_insert(acc, k, scrub(v)) }),
+      ),
+    Array(xs) -> Array(map(xs, scrub)),
+    other -> other,
+  }
+
+// Where two artifacts first differ, as a path into them.
+fn difference(a: Json, b: Json, at_path: String) -> Option<String> =
+  if a == b { None } else {
+    let plainly = Some(at_path ++ ": " ++ shown(a) ++ " against " ++ shown(b));
+    match a {
+      Object(x) -> match b {
+        Object(y) -> {
+          let inner = map_fold(x, None, |found: Option<String>, k: String, v: Json|
+            match found {
+              Some(_) -> found,
+              None ->
+                difference(
+                  v,
+                  match map_get(y, k) { Some(w) -> w, None -> json::Null },
+                  at_path ++ "." ++ k,
+                ),
+            });
+          match inner { Some(d) -> Some(d), None -> Some(at_path ++ ": a key only the second has") }
+        },
+        _ -> plainly,
+      },
+      Array(xs) -> match b {
+        Array(ys) -> if len(xs) != len(ys) { plainly } else {
+          fold(range(0, len(xs)), None, |found: Option<String>, i: Int|
+            match found {
+              Some(_) -> found,
+              None ->
+                difference(
+                  match list_at(xs, i) { Some(v) -> v, None -> json::Null },
+                  match list_at(ys, i) { Some(v) -> v, None -> json::Null },
+                  at_path ++ "[" ++ int_to_string(i) ++ "]",
+                ),
+            })
+        },
+        _ -> plainly,
+      },
+      _ -> plainly,
+    }
+  }
+
+// The same artifact, or the test fails saying where the two part.
+fn agree(a: Json, b: Json, what: String) -> Unit =
+  match difference(a, b, "") { None -> (), Some(d) -> panic(what ++ ": " ++ d) }
+
+fn argv_of(args: List<String>) -> List<String> =
+  concatenated(["test", "--json", "--no-cache"], args)
+
+fn artifact(args: List<String>) -> Json = scrub(json_of(on_disk(argv_of(args))))
+
+// The same artifact from a `ply` of its own.
+fn artifact_apart(args: List<String>) -> Json = scrub(json_of(spawned(argv_of(args), [])))
+
+fn result_for(a: Json, key: String) -> Json =
+  match filter(items(at(a, "results")), |r: Json| string_ends_with(str(at(r, "key")), key)) {
+    [r, ..] -> r,
+    [] -> panic("no result for `" ++ key ++ "` in " ++ shown(a)),
+  }
+
+fn is_text(j: Json) -> Bool = match j { Str(_) -> true, _ -> false }
+
+test/nondet "one seed is one artifact across separate processes" {
+  program(corpus());
+  let once = artifact_apart(["--seed", "0"]);
+  fold(range(1, 8), (), |u: Unit, run: Int|
+    agree(
+      artifact_apart(["--seed", "0"]),
+      once,
+      "process " ++ int_to_string(run) ++ " produced a different artifact for one seed",
+    ))
+}
+
+test/nondet "a whole search is one artifact across separate processes" {
+  program(corpus());
+  let once = artifact_apart([]);
+  fold(range(1, 6), (), |u: Unit, run: Int|
+    agree(artifact_apart([]), once, "process " ++ int_to_string(run) ++ " searched differently"));
+  // The artifact must carry the race's own failure with a seed, or this test would pass on an empty
+  // run, or on one the tier declined.
+  assert(
+    len(
+        filter(items(at(once, "failures")), |f: Json|
+          is_text(at(f, "seed")) && str(path(f, ["diagnostic", "code"])) == "E0501"),
+      )
+      > 0,
+    Some(
+      "the corpus must produce a seeded failure, or these comparisons prove nothing: "
+        ++ shown(once),
+    ),
+  )
+}
+
+// Each run a process of its own, as each of these comparisons is about what a run decides from
+// nothing: a run in this process starts from the compiled program the last one left.
+test/nondet "the worker count does not reach a scheduling decision" {
+  program(corpus());
+  let one = artifact_apart(["--jobs", "1"]);
+  fold(["2", "3", "8", "17"], (), |u: Unit, jobs: String|
+    agree(
+      artifact_apart(["--jobs", jobs]),
+      one,
+      "`--jobs " ++ jobs ++ "` disagreed with `--jobs 1`",
+    ))
+}
+
+test/nondet "running a test alone reports what it reports in company" {
+  program(corpus());
+  let whole = artifact([]);
+  fold(
+    ["two increments race", "two increments land in some order", "a sleeper costs no wall clock"],
+    (),
+    |u: Unit, name: String|
+      assert(
+        result_for(artifact(["--filter", name]), name) == result_for(whole, name),
+        Some("`" ++ name ++ "` reported differently when run alone"),
+      ),
+  )
+}
+
+test/nondet "a warm front-end cache does not change an interleaving" {
+  program(corpus());
+  let cold = artifact_apart([]);
+  // Populate the front-end cache, then run against it.
+  let _ = spawned(["test", "--json"], []);
+  agree(artifact_apart([]), cold, "a warm front-end cache changed what the search did")
+}
+
+test/nondet "the seed a failure prints replays that failure" {
+  program(corpus());
+  let searched = artifact_apart([]);
+  let failure = match filter(items(at(searched, "failures")), |f: Json| is_text(at(f, "seed"))) {
+    [f, ..] -> f,
+    [] -> panic("the racy test must fail with a seed: " ++ shown(searched)),
+  };
+  assert(
+    str(path(failure, ["diagnostic", "code"])) == "E0501",
+    Some("the race's own assertion is what the seed names: " ++ shown(failure)),
+  );
+  let seed = str(at(failure, "seed"));
+  let replayed = artifact_apart(["--seed", seed]);
+  let again = match filter(items(at(replayed, "failures")), |f: Json| str(at(f, "seed")) == seed) {
+    [f, ..] -> f,
+    [] -> panic("seed " ++ seed ++ " did not reproduce the failure: " ++ shown(replayed)),
+  };
+  assert(
+    path(again, ["diagnostic", "message"]) == path(failure, ["diagnostic", "message"]),
+    Some("seed " ++ seed ++ " reproduced a different failure"),
+  );
+  // Twice more, in two more processes, because a repro that works once is not a repro.
+  fold(range(0, 2), (), |u: Unit, i: Int|
+    agree(artifact_apart(["--seed", seed]), replayed, "a replay"))
+}
+
+test/nondet "a seed actually decides which interleaving runs" {
+  program(corpus());
+  let verdicts = fold(range(0, 24), [], |acc: List<String>, root: Int| {
+    let status = str(
+      at(result_for(artifact(["--seed", int_to_string(root)]), "two increments race"), "status"),
+    );
+    if len(filter(acc, |v: String| v == status)) > 0 { acc } else { push(acc, status) }
+  });
+  assert(
+    len(verdicts) > 1,
+    Some(
+      "24 seeds gave one verdict on a racy test, so the seed decides nothing: "
+        ++ string::join(verdicts, ", "),
+    ),
+  )
+}
+
+// The tasks touch the cell themselves, so a race is reported over the cell's name rather than over
+// an effect's atom.
+fn cell_race(name: String) -> String =
+  "test \"" ++ name
+    ++ "\" {\n  with_cell[n](0) { c ->\n    simulate {\n      let a = task.spawn(|| { let seen = cell_get(c); clock.now(); cell_set(c, seen + 1) });\n      let b = task.spawn(|| { let seen = cell_get(c); clock.now(); cell_set(c, seen + 1) });\n      task.join(a);\n      task.join(b);\n      assert_eq(cell_get(c), 2)\n    }\n  }\n}\n"
+
+// Each interleaving is an entry on the tier the test runs on, as is every search before it on that
+// thread, so a race names the cell as a fresh tier does or the report depends on what ran first.
+test/nondet "every search on one thread names a race's cell alike" {
+  program(
+    string::join(
+      map(range(0, 3), |i: Int| cell_race("a lost update on cell " ++ int_to_string(i))),
+      "",
+    ),
+  );
+  let run = artifact(["--jobs", "1"]);
+  let races = map(items(at(run, "failures")), |f: Json| at(f, "race"));
+  assert(len(races) == 3, Some("each copy reaches the lost update: " ++ shown(run)));
+  // Each copy has spans and a name of its own; what it names of the cell is the same.
+  let named = |r: Json|
+    [
+      at(r, "at"),
+      path(r, ["left", "task"]),
+      path(r, ["left", "access"]),
+      path(r, ["right", "task"]),
+      path(r, ["right", "access"]),
+    ];
+  fold(races, (), |u: Unit, race: Json| {
+    fold(["left", "right"], u, |v: Unit, side: String| {
+      let access = str(path(race, [side, "access"]));
+      assert(
+        string_starts_with(access, "cell.") && string_ends_with(access, "[@0.0]"),
+        Some("the test's one cell, named as a fresh tier names it: " ++ shown(race)),
+      )
+    });
+    assert(
+      named(race) == named(first(races)),
+      Some("a later search on the thread named the race differently"),
+    )
+  })
+}
+
+fn counter_effect() -> String =
+  \\effect counter {
+  \\  read  get[r]() -> Int
+  \\  write put[r](v: Int) -> Unit
+  \\}
+  \\
+  \\fn bump() -> Unit / {counter.read[n], counter.write[n], clock.read} = {
+  \\  let seen = counter.get[n]();
+  \\  clock.now();
+  \\  counter.put[n](seen + 1)
+  \\}
+  \\
+
+fn two_regions() -> String =
+  counter_effect()
+    ++
+    \\
+    \\test "a race in the first region and a quiet second one" {
+    \\  with_cell[n](0) { c ->
+    \\    handle {
+    \\      {
+    \\        simulate {
+    \\          let a = task.spawn(|| bump());
+    \\          let b = task.spawn(|| bump());
+    \\          task.join(a);
+    \\          task.join(b)
+    \\        };
+    \\        simulate {
+    \\          clock.now();
+    \\          ()
+    \\        };
+    \\        assert_eq(counter.get[n](), 2)
+    \\      }
+    \\    } with {
+    \\      counter.get[n]() -> cell_get(c),
+    \\      counter.put[n](v) -> cell_set(c, v),
+    \\    }
+    \\  }
+    \\}
+    \\
+
+fn region_in_a_helper() -> String =
+  counter_effect()
+    ++
+    \\
+    \\fn race() -> Unit / {counter.read[n], counter.write[n], sim.read} = simulate {
+    \\  let a = task.spawn(|| bump());
+    \\  let b = task.spawn(|| bump());
+    \\  task.join(a);
+    \\  task.join(b)
+    \\}
+    \\
+    \\test "the same region twice through a call" {
+    \\  with_cell[n](0) { c ->
+    \\    handle {
+    \\      {
+    \\        race();
+    \\        race();
+    \\        assert_eq(counter.get[n](), 4)
+    \\      }
+    \\    } with {
+    \\      counter.get[n]() -> cell_get(c),
+    \\      counter.put[n](v) -> cell_set(c, v),
+    \\    }
+    \\  }
+    \\}
+    \\
+
+// The fixture's assertion seeing an update lost: a failed test whose diagnostic says so.
+fn assert_lost_update(run: Json, total: Int, what: String) -> Unit = {
+  let failure = match items(at(run, "failures")) {
+    [f, ..] -> f,
+    [] -> panic(what ++ ": no interleaving failed: " ++ shown(run)),
+  };
+  assert(
+    str(path(failure, ["diagnostic", "code"])) == "E0501",
+    Some(what ++ ": " ++ shown(failure)),
+  );
+  let message = str(path(failure, ["diagnostic", "message"]));
+  let lost = "assertion failed: expected " ++ int_to_string(total) ++ ", found ";
+  assert(
+    string_starts_with(message, lost) && message != lost ++ int_to_string(total),
+    Some(what ++ ": " ++ message),
+  );
+  assert(
+    is_text(at(failure, "seed")),
+    Some(what ++ ": a lost update names its seed: " ++ shown(failure)),
+  )
+}
+
+test/nondet "a second simulate region does not hide the first region's race" {
+  fold(
+    [
+      { source: two_regions(), name: "two regions written out", total: 2 },
+      { source: region_in_a_helper(), name: "one region reached twice through a call", total: 4 },
+    ],
+    (),
+    |u: Unit, c: { source: String, name: String, total: Int }| {
+      program(c.source);
+      assert_lost_update(
+        artifact(["--sim", "random", "--seeds", "64"]),
+        c.total,
+        "`" ++ c.name
+          ++ "`: the fixture must contain a reachable lost update, or it proves nothing",
+      );
+      assert_lost_update(
+        artifact(["--sim-budget", "1024"]),
+        c.total,
+        "`" ++ c.name ++ "`: the search",
+      )
+    },
+  )
+}
+
+// The second region's shape depends on what the first raced to, so replaying a branch rebuilds a
+// region whose enabled sets differ from the recording's only if the replay strayed.
+fn shape_follows_a_race() -> String =
+  \\effect counter {
+  \\  read  get[r]() -> Int
+  \\  write put[r](v: Int) -> Unit
+  \\  write note[r](v: Int) -> Unit
+  \\}
+  \\
+  \\fn bump() -> Unit / {counter.get[n], counter.put[n], clock.now} = {
+  \\  let seen = counter.get[n]();
+  \\  clock.now();
+  \\  counter.put[n](seen + 1)
+  \\}
+  \\
+  \\fn noise() -> Unit / {counter.get[n], counter.note[m], clock.now} = {
+  \\  let seen = counter.get[n]();
+  \\  clock.now();
+  \\  counter.note[m](seen)
+  \\}
+  \\
+  \\test "the second region's shape depends on what the first raced to" {
+  \\  with_cell[n](0) { c -> {
+  \\  with_cell[m](0) { d ->
+  \\    handle {
+  \\      {
+  \\        simulate {
+  \\          let a = task.spawn(|| bump());
+  \\          let b = task.spawn(|| bump());
+  \\          task.join(a);
+  \\          task.join(b)
+  \\        };
+  \\        simulate {
+  \\          if counter.get[n]() == 2 {
+  \\            let a = task.spawn(|| noise());
+  \\            let b = task.spawn(|| noise());
+  \\            task.join(a);
+  \\            task.join(b)
+  \\          } else {
+  \\            let a = task.spawn(|| noise());
+  \\            task.join(a)
+  \\          }
+  \\        };
+  \\        assert(cell_get(d) >= 0)
+  \\      }
+  \\    } with {
+  \\      counter.get[n]() -> cell_get(c),
+  \\      counter.put[n](v) -> cell_set(c, v),
+  \\      counter.note[m](v) -> cell_set(d, v),
+  \\    }
+  \\  }
+  \\  } }
+  \\}
+  \\
+
+test/nondet "a legal program is never reported as a simulation divergence" {
+  program(shape_follows_a_race());
+  let run = artifact([]);
+  match items(at(run, "failures")) {
+    [failure, ..] -> {
+      assert(
+        str(path(failure, ["diagnostic", "code"])) != "E0415",
+        Some("a legal program was blamed on Ply's simulation: " ++ shown(failure)),
+      );
+      panic("its assertion holds in every interleaving, and a run failed: " ++ shown(failure))
+    },
+    [] -> (),
+  };
+  // Replay is checked on a branch, so a search that took none compared nothing.
+  assert(
+    int(path(first(items(at(run, "results"))), ["simulation", "explored"])) > 1,
+    Some(shown(run)),
+  )
+}

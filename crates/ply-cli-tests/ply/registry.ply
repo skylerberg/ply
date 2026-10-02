@@ -1,0 +1,280 @@
+// The registry end to end: the service `crates/ply-registry/ply` run by `ply run --host` on a port
+// of its own, and the commands that talk to it (`ply publish`, `ply resolve`, `ply yank`) over a
+// real socket, with the store a directory the test reads back.
+
+import harness (Ran, Server, write, read, fresh, working, repo, reserve, serving, connected, sent,
+                hang_up, stop, on_disk, on_disk_with, spawned, said, stdout, json_of, at, path, nth,
+                str, truth, int, shown, concatenated)
+import std.certgen (certgen)
+import std.fs (fs)
+import std.json
+import std.json (Json)
+import std.net
+
+import std.string
+
+// The registry is a program that pulls in the compiler's manifest judgment, so its first run
+// compiles more than a hello-world does.
+fn startup_ms() -> Int = 180000
+
+fn token() -> String = "t0k-for-orders"
+
+// The running service, the URL a client names it by, and the certificate a client names in
+// `PLY_TRUST` when it serves over TLS.
+type Registry = { server: Server, url: String, trust: Option<String> }
+
+type Tls = { certificate: String, key: String }
+
+// Over plain HTTP, or over `--tls` with the certificate and key files `tls` names.
+fn start(tls: Option<Tls>) -> Registry = {
+  let port = reserve();
+  if !fs.create_dir[cwd]("store") { panic("the store is made") };
+  write("tokens.conf", "token.orders=" ++ token() ++ "\n");
+  let here = working();
+  let plain = [
+    "run",
+    repo() ++ "/crates/ply-registry/ply",
+    "--host",
+    "--fs",
+    "store=" ++ here ++ "/store",
+    "--set",
+    "port=" ++ int_to_string(port),
+    "--config",
+    here ++ "/tokens.conf",
+  ];
+  let argv = match tls {
+    None -> plain,
+    Some(t) ->
+      concatenated(plain, [
+        "--tls",
+        "registry=" ++ here ++ "/" ++ t.certificate ++ "," ++ here ++ "/" ++ t.key,
+        "--set",
+        "tls=registry",
+      ]),
+  };
+  let server = serving(argv, [], port);
+  let secure = match tls { Some(_) -> true, None -> false };
+  // Over plain HTTP, the registry's own answer for a package nobody published proves the port is
+  // its; over TLS the reservation already made the port this registry's alone.
+  let probed = connected(server, startup_ms(), |c: Int|
+    secure
+      || {
+        sent(c, b"GET /nobody/index.json HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        string_starts_with(string_of_bytes_lossy(net::drain[client](c, b"", 10000)), "HTTP/1.1 404")
+      });
+  match probed {
+    Ok(c) -> hang_up(c),
+    Err(why) -> {
+      stop(server);
+      panic(why)
+    },
+  };
+  {
+    server: server,
+    url: if secure { "https://localhost:" ++ int_to_string(port) }
+    else { "http://127.0.0.1:" ++ int_to_string(port) },
+    trust: match tls { Some(t) -> Some(here ++ "/" ++ t.certificate), None -> None },
+  }
+}
+
+fn index(name: String) -> Json =
+  match read("store/" ++ name ++ "/index.json") {
+    Some(text) -> match json::parse_string(text) {
+      Ok(j) -> j,
+      Err(e) -> panic("the index is JSON: " ++ json::error_to_string(e)),
+    },
+    None -> panic("the registry wrote the index"),
+  }
+
+// `ply` pointed at the registry, with the publisher's token when `with_token` says so.
+fn asking(r: Registry, with_token: Bool, argv: List<String>) -> Ran = {
+  let named = [{ name: "PLY_REGISTRY", value: r.url }];
+  let vars = if with_token { push(named, { name: "PLY_REGISTRY_TOKEN", value: token() }) }
+  else { named };
+  match r.trust {
+    // The launcher reads `PLY_TRUST`, so only a process is handed it.
+    Some(certificate) -> spawned(argv, push(vars, { name: "PLY_TRUST", value: certificate })),
+    None -> on_disk_with(argv, vars, None),
+  }
+}
+
+fn ok(r: Ran) -> Unit = assert(r.code == 0, Some(said(r)))
+
+fn refused(r: Ran, code: String, words: String) -> Unit = {
+  assert(r.code == 2, Some(said(r)));
+  assert(string_contains(said(r), code), Some(code ++ " is not in:\n" ++ said(r)));
+  assert(string_contains(said(r), words), Some("`" ++ words ++ "` is not in:\n" ++ said(r)))
+}
+
+// The first `from` in the file at `p` made `to`.
+fn replaced(p: String, from: String, to: String) -> Unit =
+  match read(p) {
+    None -> panic("`" ++ p ++ "` reads"),
+    Some(text) -> match string::split_once(text, from) {
+      Some(parts) -> write(p, parts.head ++ to ++ parts.tail),
+      None -> panic("`" ++ p ++ "` no longer holds `" ++ from ++ "`"),
+    },
+  }
+
+fn exists(p: String) -> Bool = fs.exists[cwd](p)
+
+fn removed_tree(p: String) -> Unit =
+  if !fs.remove_tree[cwd](p) { panic("could not remove `" ++ p ++ "`") }
+
+fn removed(p: String) -> Unit = if !fs.remove[cwd](p) { panic("could not remove `" ++ p ++ "`") }
+
+fn copied(from: String, to: String) -> Unit =
+  if !fs.copy[cwd](from, to) { panic("could not copy `" ++ from ++ "` to `" ++ to ++ "`") }
+
+// A program depending on `orders` from the registry, at least 0.1.0.
+fn an_app() -> Unit = {
+  write(
+    "app/ply.pkg",
+    "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"app\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 1, patch: 0}, dependencies: [{name: \"orders\", prefix: None, min: {major: 0, minor: 1, patch: 0}, source: Registry}], entry: None}\n",
+  );
+  write("app/main.ply", "import orders.lib\nfn main() -> Int = lib::double(21)\n")
+}
+
+fn lock() -> Json =
+  match read("app/ply.lock") {
+    Some(text) -> match json::parse_string(text) {
+      Ok(j) -> j,
+      Err(e) -> panic("the lock is JSON: " ++ json::error_to_string(e)),
+    },
+    None -> panic("the lock was written"),
+  }
+
+fn pinned(field: String) -> Json = at(nth(at(lock(), "packages"), 0), field)
+
+test/nondet "a library is published, resolved, built, and its tampered archive refused" {
+  fresh();
+  let registry = start(None);
+
+  ok(on_disk(["new", "orders", "--lib"]));
+  let out = asking(registry, true, ["publish", "orders", "--json"]);
+  ok(out);
+  let v = json_of(out);
+  assert_eq(str(at(v, "command")), "publish");
+  assert_eq(str(at(v, "version")), "0.1.0");
+  let published = str(at(v, "digest"));
+  assert(string_len(published) == string_len("b3:") + 64, Some(published));
+  assert_eq(str(at(nth(at(index("orders"), "versions"), 0), "digest")), published);
+  assert_eq(read("store/orders/0.1.0/package.plyz.b3"), Some(published ++ "\n"));
+
+  // A version is published once; a publish needs a token the name maps to.
+  refused(asking(registry, true, ["publish", "orders"]), "E0144", "409");
+  refused(asking(registry, false, ["publish", "orders"]), "E0141", "PLY_REGISTRY_TOKEN");
+
+  // Nothing reads the registry but `ply resolve`: before it, the dependency is not there.
+  an_app();
+  refused(on_disk(["check", "app"]), "E0135", "has not been fetched");
+  ok(asking(registry, false, ["resolve", "app"]));
+  assert_eq(str(pinned("name")), "orders");
+  assert_eq(str(pinned("version")), "0.1.0");
+  assert_eq(str(pinned("archive")), published);
+  assert(exists("app/.ply-cache/registry/orders/ply.pkg"), None);
+  assert(exists("app/.ply-cache/registry/orders@0.1.0.plyz"), None);
+
+  // Every other command reads the cache, the machine's walk included.
+  ok(on_disk(["build", "app", "-o", "app.plyx"]));
+  let ran = on_disk(["run", "app.plyx"]);
+  ok(ran);
+  assert(string_contains(stdout(ran), "42"), Some(said(ran)));
+  ok(on_disk(["vendor", "app"]));
+  assert(exists("app/vendor/orders/lib.ply"), None);
+  removed_tree("app/vendor");
+
+  // A second version, then the first yanked: a lock that pins it keeps it, and a fresh resolution
+  // passes it over.
+  replaced(
+    "orders/ply.pkg",
+    "version: { major: 0, minor: 1, patch: 0 }",
+    "version: { major: 0, minor: 2, patch: 0 }",
+  );
+  ok(asking(registry, true, ["publish", "orders"]));
+  ok(asking(registry, true, ["yank", "orders", "0.1.0"]));
+  let versions = at(index("orders"), "versions");
+  assert(truth(at(nth(versions, 0), "yanked")), Some(shown(versions)));
+  assert_eq(str(at(nth(versions, 1), "version")), "0.2.0");
+  ok(asking(registry, false, ["resolve", "app"]));
+  assert_eq(str(pinned("version")), "0.1.0");
+  removed("app/ply.lock");
+  ok(asking(registry, false, ["resolve", "app"]));
+  let fresh_lock = lock();
+  assert_eq(str(at(nth(at(fresh_lock, "packages"), 0), "version")), "0.2.0");
+
+  // The registry now serves other bytes for 0.2.0, sealed and all: what the lock pins decides.
+  fold(["ply.pkg", "lib.ply"], (), |u: Unit, file: String|
+    match read("orders/" ++ file) {
+      Some(text) -> write("evil/" ++ file, text),
+      None -> panic("`orders/" ++ file ++ "` reads"),
+    });
+  replaced("evil/lib.ply", "n * 2", "n * 3");
+  ok(on_disk(["build", "evil", "-o", "evil.plyz"]));
+  copied("evil.plyz", "store/orders/0.2.0/package.plyz");
+  removed_tree("app/.ply-cache");
+  refused(asking(registry, false, ["resolve", "app"]), "E0142", "`ply.lock` pins it");
+  assert(lock() == fresh_lock, Some("a refused resolve wrote the lock"));
+  assert(!exists("app/.ply-cache/registry/orders"), None);
+  // With no lock, the index's own digest is what the archive is held to.
+  removed("app/ply.lock");
+  refused(asking(registry, false, ["resolve", "app"]), "E0142", "index lists");
+  stop(registry.server)
+}
+
+// A registry under a certificate no public root signed, a company's own CA, here one issued for the
+// test, is reached by naming that certificate in `PLY_TRUST`, and refused by name without it.
+test/nondet "a registry under a private certificate is reached through PLY_TRUST" {
+  fresh();
+  let issued = certgen.issue();
+  write("registry.pem", issued.certificate);
+  write("registry.key", issued.key);
+  let registry = start(Some({ certificate: "registry.pem", key: "registry.key" }));
+
+  ok(on_disk(["new", "orders", "--lib"]));
+  ok(asking(registry, true, ["publish", "orders"]));
+  an_app();
+  ok(asking(registry, false, ["resolve", "app"]));
+  assert_eq(str(pinned("version")), "0.1.0");
+
+  // The same registry with nothing naming its certificate: the handshake is what fails.
+  let out = spawned(["resolve", "app"], [{ name: "PLY_REGISTRY", value: registry.url }]);
+  refused(out, "E0141", "did not complete a TLS handshake");
+  assert(string_contains(said(out), "PLY_TRUST"), Some(said(out)));
+
+  // A file `PLY_TRUST` names that does not load stops the command before it runs.
+  let absent = spawned(["check", "app"], [
+    { name: "PLY_TRUST", value: working() ++ "/absent.pem" },
+  ]);
+  assert(absent.code != 0, Some(said(absent)));
+  assert(string_contains(said(absent), "E0430"), Some(said(absent)));
+  assert(string_contains(said(absent), "absent.pem"), Some(said(absent)));
+  stop(registry.server)
+}
+
+test/nondet "a program and a path dependency are not published" {
+  fresh();
+  ok(on_disk(["new", "app"]));
+  refused(on_disk(["publish", "app"]), "E0145", "is a program");
+  ok(on_disk(["new", "lib", "--lib"]));
+  ok(on_disk(["new", "base", "--lib"]));
+  replaced(
+    "lib/ply.pkg",
+    "dependencies: [],",
+    "dependencies: [{ name: \"base\", prefix: None, min: { major: 0, minor: 1, patch: 0 }, source: Path(\"../base\") }],",
+  );
+  refused(on_disk(["publish", "lib"]), "E0145", "the path `../base`")
+}
+
+// The service's own tests: the store over a twin, the upload judgment, and every route.
+test/nondet "the registry's own suite runs green" {
+  fresh();
+  let r = on_disk(["test", repo() ++ "/crates/ply-registry/ply", "--no-cache", "--json"]);
+  let report = json_of(r);
+  assert(truth(at(report, "ok")), Some(said(r)));
+  assert(int(path(report, ["summary", "failed"])) == 0, Some(shown(at(report, "summary"))));
+  assert(
+    int(path(report, ["summary", "passed"])) >= 13,
+    Some("the suite is smaller than it was: " ++ shown(at(report, "summary"))),
+  )
+}

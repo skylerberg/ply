@@ -1,0 +1,719 @@
+// The commands as a person meets them: `check`, `run`, `hosts`, `hash` and `--help`, and what each
+// prints, exits with and refuses.
+
+import harness (Ran, Source, in_memory, on_disk, spawned, tree, one, program, project, write, read,
+                stdout, stderr, said, json_of, at, path, nth, items, str, int, truth, shown,
+                contains_text)
+import std.fs (fs, Dir)
+import std.json
+import std.json (Json, Null, Array, Str)
+import std.string
+
+fn green() -> String =
+  \\fn double(x: Int) -> Int = x * 2
+  \\
+  \\fn main() -> Int = double(21)
+  \\
+  \\test "double doubles" { assert_eq(double(4), 8) }
+  \\
+  \\test "double of zero is zero" { assert_eq(double(0), 0) }
+  \\
+
+fn broken() -> String = "fn f() -> Int = true\n"
+
+fn unparseable() -> String = "fn f(( = )\n"
+
+fn refused(v: Json) -> Bool = at(v, "ok") == json::Bool(false)
+
+fn diagnostic(v: Json) -> Json = nth(at(v, "diagnostics"), 0)
+
+fn code_of(v: Json) -> String = str(at(diagnostic(v), "code"))
+
+// The diagnostic of `code` a report carries, which a test fails on when there is none.
+fn raised(v: Json, code: String) -> Json =
+  match filter(items(at(v, "diagnostics")), |d: Json| str(at(d, "code")) == code) {
+    [d, ..] -> d,
+    [] -> panic("no " ++ code ++ ": " ++ shown(v)),
+  }
+
+fn last_line(r: Ran) -> String =
+  match list_at(r.out, len(r.out) - 1) { Some(l) -> string::trim(l), None -> "" }
+
+// --- check -------------------------------------------------------------------
+
+test/nondet "check accepts a good module" {
+  let r = in_memory(one(green()), ["check"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "checked 1 module, 2 definitions, 2 tests"), Some(stdout(r)))
+}
+
+test/nondet "check --types prints signatures and footprints" {
+  let r = in_memory(
+    one(
+      "effect db {\n  read all[t]() -> List<Int>\n}\nfn rows() -> List<Int> / {db.read[users]} = db.all[users]()\n",
+    ),
+    ["check", "--types"],
+  );
+  assert(r.code == 0, Some(said(r)));
+  assert(
+    string_contains(stdout(r), "     rows : () -> List<Int>\n            / {m.db.read[users]}\n"),
+    Some(stdout(r)),
+  );
+  assert(string_contains(stdout(r), "effect db"), Some(stdout(r)))
+}
+
+test/nondet "check --costs separates two spellings of one computation" {
+  let r = in_memory(
+    one(
+      \\fn grows_last(n: Int, xs: List<Int>) -> List<Int> =
+      \\  if n == 0 { xs } else { grows_last(n - 1, push(xs, n)) }
+      \\fn grows_shared(xs: List<Int>, n: Int) -> List<Int> = {
+      \\  let ys = push(xs, n);
+      \\  if len(xs) < 0 { xs } else if n == 0 { ys } else { grows_shared(ys, n - 1) }
+      \\}
+      \\
+    ),
+    ["check", "--costs"],
+  );
+  assert(r.code == 0, Some(said(r)));
+  let text = stdout(r);
+  assert(
+    string_contains(text, "m.grows_last  1 reuses"),
+    Some("the last-use spelling must read `reuses`:\n" ++ text),
+  );
+  assert(
+    string_contains(text, "m.grows_shared  1 COPIES"),
+    Some("the read-again spelling must read `COPIES`:\n" ++ text),
+  );
+  // The warning names the restructuring and never recommends `copy`.
+  assert(
+    string_contains(text, "fix: make the append the binding's last use"),
+    Some("a copy must name its edit:\n" ++ text),
+  );
+  assert(!string_contains(text, "copy("), Some("`copy` is never the recommended fix:\n" ++ text));
+  assert(
+    string_contains(text, "2 appends: 1 reuse, 1 copy, 0 undecided"),
+    Some("the whole-program tally:\n" ++ text),
+  )
+}
+
+test/nondet "check --costs says so when there is nothing to cost" {
+  let r = in_memory(one(green()), ["check", "--costs"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "no appends: nothing to cost"), Some(stdout(r)))
+}
+
+test/nondet "check exits two on a type error and says nothing on stdout" {
+  let r = in_memory(one(broken()), ["check"]);
+  assert(r.code == 2, Some(said(r)));
+  assert(stdout(r) == "", Some(stdout(r)));
+  assert(string_contains(stderr(r), "E0201"), Some("expected a type mismatch, got:\n" ++ stderr(r)))
+}
+
+// A body that ends on a value is the program's mistake, so it is refused before anything runs
+// rather than reaching the runtime, where only Ply can be at fault.
+test/nondet "a test whose body ends on a value is a type error" {
+  let t = one("test \"t\" { 1 }\n");
+  let r = in_memory(t, ["check"]);
+  assert(r.code == 2, Some(said(r)));
+  assert(stdout(r) == "", Some(stdout(r)));
+  fold(
+    [
+      "Error[E0201]: type mismatch: the body of test `t`",
+      "expected `Unit`, found `Int`",
+      "= fix: end the body with `()`",
+    ],
+    (),
+    |u: Unit, s: String|
+      assert(string_contains(stderr(r), s), Some("no " ++ s ++ " in:\n" ++ stderr(r))),
+  );
+  let tested = in_memory(t, ["test", "--json"]);
+  assert(tested.code == 2, Some(said(tested)));
+  assert(code_of(json_of(tested)) == "E0201", Some(said(tested)))
+}
+
+test/nondet "check exits two on a syntax error" {
+  let r = in_memory(one(unparseable()), ["check"]);
+  assert(r.code == 2, Some(said(r)));
+  assert(string_contains(stderr(r), "E0001"), Some(stderr(r)))
+}
+
+// Run twice, so a warning survives whatever the second run answers from.
+test/nondet "an unused definition warns without failing check or test" {
+  program(
+    "fn dead() -> Int = 1\npub fn live() -> Int = 2\ntest \"live is two\" { assert_eq(live(), 2) }\n",
+  );
+  fold([["check"], ["check"], ["test"]], (), |u: Unit, argv: List<String>| {
+    let r = on_disk(argv);
+    let what = string::join(argv, " ");
+    assert(r.code == 0, Some(what ++ ":\n" ++ said(r)));
+    assert(
+      string_contains(stdout(r), "warning: fn `m.dead` is never used"),
+      Some(what ++ ":\n" ++ stdout(r)),
+    );
+    assert(!string_contains(stdout(r), "`m.live`"), Some(what ++ ":\n" ++ stdout(r)))
+  });
+  let v = json_of(on_disk(["check", "--json"]));
+  assert(truth(at(v, "ok")), Some(shown(v)));
+  let d = diagnostic(v);
+  assert(str(at(d, "code")) == "W0611", Some(shown(v)));
+  assert(str(at(d, "severity")) == "warning", Some(shown(v)));
+  assert(str(at(nth(at(d, "labels"), 0), "snippet")) == "dead", Some(shown(v)))
+}
+
+test/nondet "check --json is a single object even when the module is broken" {
+  let r = in_memory(one(broken()), ["check", "--json"]);
+  assert(r.code == 2, Some(said(r)));
+  let v = json_of(r);
+  assert(str(at(v, "command")) == "check", Some(shown(v)));
+  assert(refused(v), Some(shown(v)));
+  assert(code_of(v) == "E0201", Some(shown(v)));
+  let label = nth(at(diagnostic(v), "labels"), 0);
+  assert(str(at(label, "file")) == "m.ply", Some(shown(v)));
+  assert(int(path(label, ["start", "line"])) == 1, Some(shown(v)))
+}
+
+// Three ways a call can fail to settle a label, all one code: nothing written and nothing to infer
+// it from, a count that does not match the binders, and a use as a value instead of a call.
+test/nondet "a call that does not settle a label is refused with its own code" {
+  let generic = "effect net {\n  write send[s](payload: Bytes) -> Unit\n}\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\n";
+  fold(
+    [
+      {
+        tail: "fn go(b: Bytes) -> Unit / {net.send[conn]} = relay(b)\n",
+        message: "this call leaves a label of `relay` unfilled",
+      },
+      {
+        tail: "fn go(b: Bytes) -> Unit / {net.send[conn]} = relay[conn, spare](b)\n",
+        message: "`relay` takes 1 label parameter, but 2 are written",
+      },
+      {
+        tail: "fn as_value() -> (Bytes) -> Unit / {net.send[conn]} = relay\n",
+        message: "`relay` must be called directly",
+      },
+    ],
+    (),
+    |u: Unit, c: { tail: String, message: String }| {
+      let r = in_memory(one(generic ++ c.tail), ["check", "--json"]);
+      assert(r.code == 2, Some(c.tail));
+      let v = json_of(r);
+      assert(refused(v), Some(c.tail));
+      let d = raised(v, "E0306");
+      assert(str(at(d, "message")) == c.message, Some(c.tail ++ shown(d)));
+      assert(
+        items(at(d, "notes")) != [],
+        Some(c.tail ++ " left the reader nothing to do: " ++ shown(d)),
+      )
+    },
+  )
+}
+
+// The members of a recursive group are checked with one set of label binders, so a member that
+// binds another number of them is refused where it is declared, against the member it agrees with.
+test/nondet "mutually recursive definitions that bind different labels are refused" {
+  let r = in_memory(
+    one(
+      \\effect net {
+      \\  write send[s](payload: Bytes) -> Unit
+      \\}
+      \\fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} =
+      \\  if n == 0 { net.send[l](b) } else { pong(n - 1, b) }
+      \\fn pong(n: Int, b: Bytes) -> Unit / {net.send[conn]} = ping(n - 1, b)
+      \\
+    ),
+    ["check", "--json"],
+  );
+  assert(r.code == 2, Some(said(r)));
+  let d = raised(json_of(r), "E0307");
+  assert(
+    str(at(d, "message"))
+      == "`pong` and `ping` are mutually recursive, so they are checked with one set of label parameters",
+    Some(shown(d)),
+  );
+  assert(
+    str(at(nth(at(d, "labels"), 0), "message")) == "binds no label parameters",
+    Some(shown(d)),
+  );
+  assert(str(at(nth(at(d, "labels"), 1), "message")) == "binds 1 label parameter", Some(shown(d)))
+}
+
+// --- Modules -----------------------------------------------------------------
+
+fn multi_module() -> List<Source> =
+  [
+    { path: "src/a.ply", text: "pub fn a() -> Int = 1\n" },
+    { path: "src/z.ply", text: "import src.a\npub fn z() -> Int = a::a() + 1\n" },
+    { path: "src/t.ply", text: "import src.z (z)\ntest \"z is two\" { assert_eq(z(), 2) }\n" },
+  ]
+
+test/nondet "every file under a directory is its own module" {
+  project(multi_module());
+  let r = on_disk(["test"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "selected 1 of 1"), Some(stdout(r)));
+  let v = json_of(in_memory(tree(multi_module()), ["check", "--json"]));
+  assert(
+    at(v, "files") == Array([Str("src/a.ply"), Str("src/t.ply"), Str("src/z.ply")]),
+    Some(shown(v)),
+  );
+  assert(
+    map(items(at(v, "modules")), |m: Json| str(at(m, "name"))) == ["src.a", "src.t", "src.z"],
+    Some(shown(v)),
+  );
+  assert(str(at(nth(at(v, "definitions"), 0), "name")) == "src.a.a", Some(shown(v)));
+  assert(str(at(nth(at(v, "tests"), 0), "key")) == "src.t.z is two", Some(shown(v)))
+}
+
+// What a load of two files answers, which a test fails on unless it is a refusal.
+fn refusal_of(files: List<Source>) -> Json = {
+  let r = in_memory(tree(files), ["check", "--json"]);
+  assert(r.code == 2, Some(said(r)));
+  json_of(r)
+}
+
+test/nondet "a directory is no longer concatenated into one module" {
+  let v = refusal_of([
+    { path: "a.ply", text: "pub fn a() -> Int = 1\n" },
+    { path: "b.ply", text: "fn b() -> Int = a()\n" },
+  ]);
+  assert(code_of(v) == "E0101", Some(shown(v)))
+}
+
+test/nondet "a private name is reported against its declaration" {
+  let v = refusal_of([
+    { path: "a.ply", text: "fn secret() -> Int = 1\n" },
+    { path: "b.ply", text: "import a\nfn b() -> Int = a::secret()\n" },
+  ]);
+  assert(code_of(v) == "E0107", Some(shown(v)))
+}
+
+test/nondet "a module cycle is rejected with exit two" {
+  let v = refusal_of([
+    { path: "a.ply", text: "import b\npub fn a() -> Int = b::b()\n" },
+    { path: "b.ply", text: "import a\npub fn b() -> Int = a::a()\n" },
+  ]);
+  assert(code_of(v) == "E0109", Some(shown(v)))
+}
+
+test/nondet "a file that cannot name a module is E0111" {
+  let v = refusal_of([{ path: "not-a-module.ply", text: "fn f() -> Int = 1\n" }]);
+  assert(code_of(v) == "E0111", Some(shown(v)));
+  assert(str(at(nth(at(diagnostic(v), "labels"), 0), "file")) == "not-a-module.ply", Some(shown(v)))
+}
+
+test/nondet "two modules may label a test identically and the output says which is which" {
+  project([
+    { path: "alpha.ply", text: "test \"shared\" { assert_eq(1, 1) }\n" },
+    { path: "beta.ply", text: "test \"shared\" { assert_eq(2, 3) }\n" },
+  ]);
+  let r = on_disk(["test"]);
+  assert(r.code == 1, Some(said(r)));
+  assert(string_contains(stdout(r), "alpha.shared"), Some(stdout(r)));
+  assert(string_contains(stdout(r), "beta.shared"), Some(stdout(r)))
+}
+
+test/nondet "filter accepts a module prefix" {
+  project([
+    { path: "alpha.ply", text: "test \"shared\" { assert_eq(1, 1) }\n" },
+    { path: "beta.ply", text: "test \"shared\" { assert_eq(2, 2) }\n" },
+  ]);
+  let v = json_of(on_disk(["test", "--json", "--filter", "beta."]));
+  assert(int(path(v, ["selection", "total"])) == 1, Some(shown(v)));
+  assert(str(at(nth(path(v, ["selection", "tests"]), 0), "key")) == "beta.shared", Some(shown(v)))
+}
+
+test/nondet "the cache directory is never parsed as source" {
+  program(green());
+  assert(on_disk(["test"]).code == 0, None);
+  assert(fs.kind[cwd](".ply-cache") == Dir, None);
+  write(".ply-cache/decoy.ply", "!!! not ply !!!\n");
+  let r = on_disk(["test"]);
+  assert(r.code == 0, Some(said(r)))
+}
+
+test/nondet "a missing path is a diagnostic with exit two" {
+  let r = in_memory(tree([]), ["check", "nowhere.ply"]);
+  assert(r.code == 2, Some(said(r)));
+  assert(string_contains(stderr(r), "nowhere.ply"), Some(stderr(r)))
+}
+
+// --- run ---------------------------------------------------------------------
+
+test/nondet "run evaluates main" {
+  program(green());
+  let r = on_disk(["run"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string::trim(stdout(r)) == "42", Some(stdout(r)))
+}
+
+test/nondet "run --json reports the value" {
+  program(green());
+  let v = json_of(on_disk(["run", "--json"]));
+  assert(str(at(v, "command")) == "run", Some(shown(v)));
+  assert(truth(at(v, "ok")), Some(shown(v)));
+  assert(str(at(v, "value")) == "42", Some(shown(v)))
+}
+
+test/nondet "run without a main explains what to add" {
+  program("fn f() -> Int = 1\n");
+  let r = on_disk(["run"]);
+  assert(r.code == 2, Some(said(r)));
+  assert(string_contains(stderr(r), "no `main` to run"), Some(stderr(r)));
+  assert(string_contains(stderr(r), "fn main"), Some(stderr(r)))
+}
+
+test/nondet "a raising main exits one" {
+  program("fn main() -> Unit = panic(\"nope\")\n");
+  let r = on_disk(["run"]);
+  assert(r.code == 1, Some(said(r)));
+  assert(string_contains(stderr(r), "nope"), Some(stderr(r)))
+}
+
+fn spins() -> String = "fn spin(n: Int) -> Int = spin(n + 1)\nfn main() -> Int = spin(0)\n"
+
+// The entry is bounded by the flags and by nothing else. A bound that reached the entry from
+// somewhere other than these two flags — a process-wide default, or the scope the tool's own
+// program runs in — would make `--steps` and `--timeout` quietly stop working.
+test/nondet "the entry is bounded by the steps the flag names" {
+  program(spins());
+  let r = on_disk(["run", "--json", "--steps", "1000"]);
+  let v = json_of(r);
+  assert(r.code == 1, Some(shown(v)));
+  assert(code_of(v) == "E0503", Some(shown(v)));
+  assert(string_contains(str(at(diagnostic(v), "message")), "budget of 1000 calls"), Some(shown(v)))
+}
+
+// The clock describes the machine, so what it stops is no verdict: the run is abandoned where it
+// stood and attributed to no line of the program.
+test/nondet "the entry is bounded by the clock the flag names" {
+  program(spins());
+  let r = on_disk(["run", "--json", "--timeout", "300"]);
+  let v = json_of(r);
+  assert(r.code == 1, Some(shown(v)));
+  assert(code_of(v) == "W0612", Some(shown(v)))
+}
+
+test/nondet "run finds the one main wherever it lives" {
+  project([
+    { path: "lib.ply", text: "pub fn answer() -> Int = 42\n" },
+    { path: "app.ply", text: "import lib\nfn main() -> Int = lib::answer()\n" },
+  ]);
+  let v = json_of(on_disk(["run", "--json"]));
+  assert(truth(at(v, "ok")), Some(shown(v)));
+  assert(str(at(v, "value")) == "42", Some(shown(v)));
+  assert(str(at(v, "entry")) == "app.main", Some(shown(v)));
+  assert(str(at(v, "module")) == "app", Some(shown(v)))
+}
+
+test/nondet "two mains are reported rather than resolved by load order" {
+  project([
+    { path: "one.ply", text: "fn main() -> Int = 1\n" },
+    { path: "two.ply", text: "fn main() -> Int = 2\n" },
+  ]);
+  let r = on_disk(["run", "--json"]);
+  assert(r.code == 2, Some(said(r)));
+  let v = json_of(r);
+  assert(code_of(v) == "E0112", Some(shown(v)));
+  let notes = shown(at(diagnostic(v), "notes"));
+  assert(string_contains(notes, "one.ply") && string_contains(notes, "two.ply"), Some(notes));
+  // Naming the file picks the module, which is the fix the notes suggest.
+  let picked = json_of(on_disk(["run", "two.ply", "--json"]));
+  assert(str(at(picked, "value")) == "2", Some(shown(picked)));
+  assert(str(at(picked, "entry")) == "two.main", Some(shown(picked)))
+}
+
+test/nondet "run is hermetic by default and reports its binding" {
+  program(green());
+  let v = json_of(on_disk(["run", "--json"]));
+  assert(str(at(v, "binding")) == "hermetic", Some(shown(v)));
+  assert(str(at(v, "value")) == "42", Some(shown(v)));
+  let bound = json_of(on_disk(["run", "--host", "--json"]));
+  assert(str(at(bound, "binding")) == "host", Some(shown(bound)));
+  assert(str(at(bound, "value")) == "42", Some("a binding may not change what a program computes"))
+}
+
+test/nondet "a task under --host performs against the handlers around its spawn" {
+  program(
+    \\effect note {
+    \\  read say() -> Int
+    \\}
+    \\
+    \\fn work() -> Int / {note.read} = note.say()
+    \\
+    \\fn main() -> Int / {task.write} =
+    \\  handle {
+    \\    let t = task.spawn(|| work());
+    \\    task.join(t)
+    \\  } with {
+    \\    note.say() -> 41,
+    \\  }
+    \\
+  );
+  let r = on_disk(["run", "--host"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(last_line(r) == "41", Some(stdout(r)))
+}
+
+// Spawned, since what this guards against is the process going down with the task.
+test/nondet "a task that fails under --host is reported rather than aborting the process" {
+  program(
+    \\effect note {
+    \\  read say() -> Int
+    \\}
+    \\effect other {
+    \\  read what() -> Int
+    \\}
+    \\
+    \\fn work() -> Int / {other.read} = other.what()
+    \\
+    \\fn main() -> Int / {task.write, other.read} =
+    \\  handle {
+    \\    handle {
+    \\      let t = task.spawn(|| work());
+    \\      task.join(t)
+    \\    } with {
+    \\      note.say() -> 42,
+    \\    }
+    \\  } with {
+    \\    note.say() -> 41,
+    \\  }
+    \\
+  );
+  let r = spawned(["run", "--host"], []);
+  assert(r.code == 1, Some(said(r)));
+  assert(string_contains(stderr(r), "E0303"), Some(stderr(r)));
+  assert(!string_contains(stderr(r), "panicked"), Some(stderr(r)))
+}
+
+// A clause that binds `resume` would capture the spawner's continuation, not the task's. Spawned,
+// since what this guards against is a panic.
+test/nondet "a task reaching a clause that binds resume is refused with a diagnostic" {
+  program(
+    \\effect ask {
+    \\  read q() -> Int
+    \\}
+    \\
+    \\fn work() -> Int / {ask.read} = ask.q()
+    \\
+    \\test "a task cannot reach a clause that binds resume" {
+    \\  let r = simulate {
+    \\    handle {
+    \\      let t = task.spawn(|| work());
+    \\      task.join(t)
+    \\    } with {
+    \\      ask.q() resume k -> k(1) + k(2),
+    \\    }
+    \\  };
+    \\  assert_eq(r, 3)
+    \\}
+    \\
+  );
+  let r = spawned(["test", "--no-cache"], []);
+  assert(r.code != 0, Some(said(r)));
+  assert(string_contains(said(r), "resumes off the tail"), Some(said(r)));
+  assert(!string_contains(said(r), "panicked"), Some(said(r)))
+}
+
+// A run generates its own certificate: nothing checked in is trusted by anything.
+test/nondet "a program under --host generates a certificate for itself" {
+  program(
+    \\import std.certgen (certgen)
+    \\
+    \\fn main() -> Int / {certgen.issue} = {
+    \\  let issued = certgen.issue();
+    \\  assert(string_starts_with(issued.certificate, "-----BEGIN CERTIFICATE-----"));
+    \\  assert(string_starts_with(issued.key, "-----BEGIN PRIVATE KEY-----"));
+    \\  assert(string_starts_with(issued.fingerprint, "sha256:"));
+    \\  bytes_len(issued.der)
+    \\}
+    \\
+  );
+  let r = on_disk(["run", "--host"]);
+  assert(r.code == 0, Some(said(r)));
+  let der = match string::int_of_string(last_line(r)) { Some(n) -> n, None -> 0 };
+  assert(der > 0, Some("the certificate has no DER: " ++ stdout(r)))
+}
+
+// `ply run` chooses which interleaving rather than how many: exploration is a test-time activity.
+test/nondet "run accepts a seed and takes only that interleaving" {
+  program(green());
+  let r = on_disk(["run", "--json", "--seed", "3:1"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(str(at(json_of(r), "value")) == "42", Some(said(r)));
+  assert(in_memory(one(green()), ["run", "--seed", "3:"]).code == 2, None)
+}
+
+// The count is the launcher's to make, so these run as processes: the program never sees the
+// flag, and the run writes what the entry allocated.
+fn counted(flag: String, file: String) -> Json = {
+  program(green());
+  let r = spawned([flag ++ "=" ++ file, "run"], []);
+  assert(r.code == 0, Some(said(r)));
+  match read(file) {
+    None -> panic("the count is not written"),
+    Some(text) -> match json::parse_string(text) {
+      Ok(v) -> v,
+      Err(e) -> panic("the count is not JSON: " ++ json::error_to_string(e) ++ "\n" ++ text),
+    },
+  }
+}
+
+test/nondet "--count-allocs writes what the entry allocated" {
+  let v = counted("--count-allocs", "counted.json");
+  assert(int(at(v, "allocations")) > 0, Some("nothing was counted: " ++ shown(v)));
+  assert(int(at(v, "bytes")) > 0, Some(shown(v)))
+}
+
+// The wider record: the same totals, and the `ply_*` frames each allocation came from, with every
+// allocation walked.
+test/nondet "--count-alloc-sites-exact writes where the entry allocated" {
+  let v = counted("--count-alloc-sites-exact", "sites.json");
+  assert(at(v, "exact") == json::Bool(true), Some(shown(v)));
+  assert(int(at(v, "sampled_every")) == 1, Some(shown(v)));
+  let total = int(at(v, "allocations"));
+  assert(total > 0, Some("nothing was counted: " ++ shown(v)));
+  let sites = items(at(v, "sites"));
+  assert(sites != [], Some("the sites are empty: " ++ shown(v)));
+  assert(
+    fold(sites, 0, |n: Int, s: Json| n + int(at(s, "allocations"))) == total,
+    Some("every allocation was walked, so the rows are the total: " ++ shown(v)),
+  )
+}
+
+// The default samples: every allocation is counted, one in `sampled_every` is walked, and the report
+// says so rather than presenting an estimate as a census. A program this small may sample nothing.
+test/nondet "--count-alloc-sites samples by default and says so" {
+  let v = counted("--count-alloc-sites", "sites.json");
+  assert(at(v, "exact") == json::Bool(false), Some(shown(v)));
+  assert(
+    int(at(v, "sampled_every")) > 1,
+    Some("a sample of every one is not a sample: " ++ shown(v)),
+  );
+  assert(int(at(v, "allocations")) > 0, Some(shown(v)));
+  assert(
+    match at(v, "sites") { Array(_) -> true, _ -> false },
+    Some("the sites are there: " ++ shown(v)),
+  )
+}
+
+// --- hosts -------------------------------------------------------------------
+
+test/nondet "hosts defaults to hermetic and still says what would bind" {
+  program(green());
+  let r = on_disk(["hosts"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "hermetic"), Some(stdout(r)));
+  assert(
+    string_contains(stdout(r), "no host handler is bound"),
+    Some(
+      "an empty listing is indistinguishable from a registry that failed to load:\n" ++ stdout(r),
+    ),
+  );
+  // Never a bare "nothing here": an empty trusted computing base must read differently from an
+  // unasked binding.
+  assert(len(filter(r.out, |l: String| string::trim(l) != "")) >= 2, Some(stdout(r)))
+}
+
+test/nondet "hosts is byte-identical across runs" {
+  program(green());
+  let once = on_disk(["hosts", "--host"]);
+  let twice = on_disk(["hosts", "--host"]);
+  assert(once.code == 0, Some(said(once)));
+  assert(stdout(once) == stdout(twice), None);
+  assert(string_contains(stdout(once), "trusted computing base"), Some(stdout(once)));
+  assert(string_contains(stdout(once), "digest: b3:"), Some(stdout(once)))
+}
+
+// The one line a CI check pins.
+test/nondet "hosts --digest is one line and does not depend on the flag" {
+  program(green());
+  let bare = on_disk(["hosts", "--digest"]);
+  let bound = on_disk(["hosts", "--host", "--digest"]);
+  assert(bare.code == 0, Some(said(bare)));
+  assert(len(bare.out) == 1, Some(stdout(bare)));
+  let digest = string::join(bare.out, "");
+  assert(string_starts_with(digest, "b3:"), Some(digest));
+  assert(bare.out == bound.out, Some(stdout(bound)));
+  let v = json_of(on_disk(["hosts", "--json"]));
+  assert(str(at(v, "digest")) == string::trim(digest), Some(shown(v)))
+}
+
+test/nondet "hosts --json is one object carrying the binding and every row" {
+  program(green());
+  let v = json_of(on_disk(["hosts", "--json"]));
+  assert(str(at(v, "command")) == "hosts", Some(shown(v)));
+  assert(int(at(v, "schema_version")) == 1, Some(shown(v)));
+  assert(truth(at(v, "ok")), Some(shown(v)));
+  assert(int(at(v, "exit_code")) == 0, Some(shown(v)));
+  assert(str(at(v, "binding")) == "hermetic", Some(shown(v)));
+  assert(match at(v, "hosts") { Array(_) -> true, _ -> false }, Some(shown(v)));
+  assert(
+    int(at(v, "operations")) == len(items(at(v, "hosts"))),
+    Some("the count and the rows are one claim"),
+  );
+  let bound = json_of(on_disk(["hosts", "--host", "--json"]));
+  assert(str(at(bound, "binding")) == "host", Some(shown(bound)));
+  // Only the binding moves: the trusted computing base is the same either way.
+  assert(at(bound, "hosts") == at(v, "hosts"), None);
+  assert(at(bound, "digest") == at(v, "digest"), None)
+}
+
+test/nondet "hosts on a broken program is a compile error with a clean stdout" {
+  program(broken());
+  let r = on_disk(["hosts", "--host"]);
+  assert(r.code == 2, Some(said(r)));
+  assert(stdout(r) == "", Some(stdout(r)));
+  assert(string_contains(stderr(r), "E0201"), Some(stderr(r)))
+}
+
+// --- hash --------------------------------------------------------------------
+
+test/nondet "hash prints a short hash per definition" {
+  let r = in_memory(one(green()), ["hash"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(stdout(r), "double"), Some(stdout(r)));
+  assert(string_contains(stdout(r), "2 definitions · 2 tests · 1 module"), Some(stdout(r)))
+}
+
+test/nondet "hash --deps shows the graph" {
+  let text = stdout(in_memory(one(green()), ["hash", "--deps"]));
+  assert(string_contains(text, "deps: m.double"), Some(text));
+  assert(string_contains(text, "closure:"), Some(text))
+}
+
+test/nondet "hash --json gives full hex and the closure" {
+  let v = json_of(in_memory(one(green()), ["hash", "--json", "--deps"]));
+  assert(str(at(v, "command")) == "hash", Some(shown(v)));
+  let def = nth(at(v, "definitions"), 0);
+  assert(string_len(str(at(def, "hash"))) == 64, Some(shown(v)));
+  assert(match at(def, "closure") { Array(_) -> true, _ -> false }, Some(shown(v)));
+  assert(string_len(str(at(nth(at(v, "tests"), 0), "hash"))) == 64, Some(shown(v)))
+}
+
+test/nondet "hash groups by module and says the module is not hashed" {
+  let text = stdout(in_memory(tree(multi_module()), ["hash"]));
+  assert(string_contains(text, "src.a"), Some(text));
+  assert(string_contains(text, "src.z"), Some(text));
+  assert(string_contains(text, "2 definitions · 1 test · 3 modules"), Some(text));
+  assert(string_contains(text, "changes no hash"), Some(text));
+  let v = json_of(in_memory(tree(multi_module()), ["hash", "--json"]));
+  assert(at(v, "module_is_hashed") == json::Bool(false), Some(shown(v)));
+  let def = nth(at(v, "definitions"), 0);
+  assert(str(at(def, "module")) == "src.a", Some(shown(v)));
+  assert(str(at(def, "name")) == "src.a.a", Some(shown(v)));
+  assert(str(at(def, "simple_name")) == "a", Some(shown(v)))
+}
+
+// --- help --------------------------------------------------------------------
+
+test/nondet "every subcommand answers --help and exits zero" {
+  fold(["check", "test", "run", "hash", "cache"], (), |u: Unit, sub: String| {
+    let r = in_memory(tree([]), [sub, "--help"]);
+    assert(r.code == 0, Some("`" ++ sub ++ " --help` failed:\n" ++ said(r)));
+    assert(stdout(r) != "", Some("`" ++ sub ++ " --help` printed nothing"))
+  })
+}
+
+test/nondet "an unknown subcommand is rejected" {
+  assert(in_memory(tree([]), ["frobnicate"]).code != 0, None)
+}
