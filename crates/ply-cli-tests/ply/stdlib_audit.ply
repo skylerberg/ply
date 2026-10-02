@@ -1,0 +1,247 @@
+// What a project can do to the shipped modules, and what an upgrade of them does to a project: no
+// project names a module under `std`, a project module beside a shipped one collides loudly, and a
+// compiler that ships other modules re-runs exactly what the change reached.
+
+import harness (Ran, Source, project, write, in_memory, tree, on_disk, on_disk_shipping,
+                warm_agrees, repo_file, shelved, said, json_of, at, items, first, str, int, shown)
+import cli.sources (is_std)
+import std.json (Json)
+import std.string
+
+fn codes_of(r: Ran) -> List<String> =
+  map(items(at(json_of(r), "diagnostics")), |d: Json| str(at(d, "code")))
+
+fn checked(files: List<Source>) -> Ran = in_memory(tree(files), ["check", "--json"])
+
+// Every definition's or declaration's hash, by its program-wide name.
+fn hash_of(answer: Json, name: String) -> String =
+  match filter(items(at(answer, "definitions")), |d: Json| str(at(d, "name")) == name) {
+    [d, ..] -> str(at(d, "hash")),
+    [] -> panic("`" ++ name ++ "` is not in the program: " ++ shown(answer)),
+  }
+
+fn test_hash(answer: Json, key: String) -> String =
+  match filter(items(at(answer, "tests")), |t: Json| str(at(t, "key")) == key) {
+    [t, ..] -> str(at(t, "hash")),
+    [] -> panic("no test `" ++ key ++ "`: " ++ shown(answer)),
+  }
+
+fn hashed(files: List<Source>) -> Json = json_of(in_memory(tree(files), ["hash", "--json"]))
+
+// Handles every atom, so its test is `det` and cacheable, which makes "did it re-run?" answerable.
+fn importer() -> String =
+  \\import std.net (net, drain)
+  \\
+  \\pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = drain[conn](c, b"", 1000)
+  \\
+  \\test "reads to the end" {
+  \\  handle { assert_eq(read_all(1), b"") } with { net.recv[conn](c, m, t) -> Some(b"") }
+  \\}
+  \\
+
+test/nondet "nothing a project can name lands under the reserved root" {
+  // Every one of these derives a module name at or under `std`.
+  fold(
+    [
+      { rel: "std.ply", expected: "std" },
+      { rel: "std/json.ply", expected: "std.json" },
+      { rel: "std/net.ply", expected: "std.net" },
+      { rel: "std/http/server.ply", expected: "std.http.server" },
+    ],
+    (),
+    |u: Unit, c: { rel: String, expected: String }| {
+      let codes = codes_of(checked([{ path: c.rel, text: "pub fn f() -> Int = 1\n" }]));
+      assert(
+        len(filter(codes, |x: String| x == "E0133")) > 0,
+        Some(
+          "`" ++ c.rel ++ "` would be `" ++ c.expected ++ "` and was accepted: "
+            ++ string::join(codes, ", "),
+        ),
+      )
+    },
+  );
+  // Near misses keep working: reserving a prefix reserves no name that merely starts with it.
+  fold(["stdlib.ply", "mine/std_helpers.ply", "a/std_thing.ply"], (), |u: Unit, rel: String| {
+    let r = checked([{ path: rel, text: "pub fn f() -> Int = 1\n" }]);
+    assert(r.code == 0, Some("`" ++ rel ++ "` was refused: " ++ said(r)))
+  })
+}
+
+test/nondet "naming a file under std directly cannot smuggle it in as a std module" {
+  let answer = json_of(
+    in_memory(tree([{ path: "std/json.ply", text: "pub fn parse(x: Int) -> Int = x\n" }]), [
+      "check",
+      "std/json.ply",
+      "--json",
+    ]),
+  );
+  let own = filter(map(items(at(answer, "modules")), |m: Json| str(at(m, "name"))), |n: String|
+    !is_std(n));
+  assert(own == ["json"], Some("a file under `std/` became a `std` module: " ++ shown(answer)));
+  assert(
+    len(filter(items(at(answer, "definitions")), |d: Json| str(at(d, "name")) == "json.parse"))
+      == 1,
+    Some(shown(answer)),
+  )
+}
+
+test/nondet "a project module named net beside std.net is a loud collision" {
+  let net = {
+    path: "net.ply",
+    text: "pub nondet effect net { read recv[r](conn: Int, max: Int) -> Bytes }\npub fn drain(c: Int, acc: Bytes) -> Bytes / {net.read[conn]} = acc\n",
+  };
+  let codes = codes_of(
+    checked([
+      net,
+      { path: "app.ply", text: "import net\nimport std.net\npub fn f() -> Int = 1\n" },
+    ]),
+  );
+  assert(
+    len(filter(codes, |c: String| c == "E0110")) > 0,
+    Some("one of the two silently won: " ++ string::join(codes, ", ")),
+  );
+  // `as` is the escape hatch: the two `net` effects then produce atoms under different
+  // program-wide names.
+  let r = checked([
+    net,
+    {
+      path: "app.ply",
+      text: "import net as mine\nimport std.net\npub fn f(c: Int) -> Bytes / {mine::net.read[conn]} = mine::drain(c, b\"\")\n",
+    },
+  ]);
+  assert(r.code == 0, Some("`as` disambiguates: " ++ said(r)));
+  let f = first(
+    filter(items(at(json_of(r), "definitions")), |d: Json| str(at(d, "name")) == "app.f"),
+  );
+  assert(
+    map(items(at(f, "atoms")), str) == ["net.net.read[conn]"],
+    Some("the project's effect and the shipped one are not distinct: " ++ shown(f)),
+  )
+}
+
+test/nondet "no cycle can be built between a project and the stdlib" {
+  // A project module named after one `std.json` imports, in case the shipped import could be
+  // captured.
+  let answer = json_of(
+    checked([{ path: "app.ply", text: "import std.json\npub fn f() -> Int = 1\n" }]),
+  );
+  fold(items(at(answer, "modules")), (), |u: Unit, m: Json|
+    if !is_std(str(at(m, "name"))) { u } else {
+      fold(items(at(m, "imports")), u, |v: Unit, i: Json|
+        assert(
+          is_std(str(i)),
+          Some("the shipped module `" ++ str(at(m, "name")) ++ "` imports `" ++ str(i) ++ "`"),
+        ))
+    });
+  fold(
+    filter(shelved(), |s: Source| string_starts_with(s.path, "std.")),
+    (),
+    |u: Unit, s: Source|
+      fold(
+        filter(string_split(s.text, "\n"), |l: String| string_starts_with(l, "import ")),
+        u,
+        |v: Unit, l: String|
+          assert(
+            string_starts_with(string_slice(l, 7, string_len(l)), "std."),
+            Some("`" ++ s.path ++ "` imports something outside `std`: " ++ l),
+          ),
+      ),
+  )
+}
+
+test/nondet "a definition that does not import std is unmoved by one that does" {
+  let pure = {
+    path: "pure.ply",
+    text: "pub fn add(a: Int, b: Int) -> Int = a + b\ntest \"add\" { assert_eq(add(1, 2), 3) }\n",
+  };
+  let before = hashed([pure]);
+  let after = hashed([
+    pure,
+    {
+      path: "uses.ply",
+      text: "import std.json\nimport std.net\npub fn zero() -> json::Json = json::Null\n",
+    },
+  ]);
+  assert_eq(hash_of(before, "pure.add"), hash_of(after, "pure.add"));
+  assert(
+    test_hash(before, "pure.add") == test_hash(after, "pure.add"),
+    Some("a test re-runs because an unrelated module imported `std`"),
+  )
+}
+
+// `std.net` as the compiler before this one shipped it: `edit` of what this one ships.
+fn an_older_net(edit: (String) -> String) -> List<Source> = {
+  let now = repo_file("crates/ply-std/ply/net.ply");
+  let was = edit(now);
+  assert(was != now, Some("the older `std.net` is the one this binary ships"));
+  [{ path: "std.net.ply", text: was }]
+}
+
+fn with_comment(text: String) -> String = text ++ "\n// what the last compiler shipped\n"
+
+fn green(r: Ran) -> Unit = assert(r.code == 0, Some(said(r)))
+
+test/nondet "an upgrade that moves no definition re-runs nothing" {
+  project([{ path: "app.ply", text: importer() }]);
+  green(on_disk_shipping(["test"], an_older_net(with_comment)));
+  // The test the project owns is unchanged, so `ply test` selects nothing.
+  let r = on_disk(["test"]);
+  assert(
+    string_contains(said(r), "selected 0 of 1"),
+    Some("an upgrade that moved no definition re-ran a test:\n" ++ said(r)),
+  )
+}
+
+test/nondet "an upgrade that moved a definition invalidates exactly its dependents" {
+  project([
+    { path: "app.ply", text: importer() },
+    {
+      path: "elsewhere.ply",
+      text: "pub fn untouched() -> Int = 41 + 1\ntest \"untouched\" { assert_eq(untouched(), 42) }\n",
+    },
+  ]);
+  green(
+    on_disk_shipping(
+      ["test"],
+      an_older_net(|t: String|
+        string::replace(
+          t,
+          "match net.recv[l](c, 4096, timeout_ms) {",
+          "match net.recv[l](c, 4095, timeout_ms) {",
+        )),
+    ),
+  );
+  // A cache written under an older `std.net` may be believed for none of what it moved.
+  let _ = warm_agrees("after an upgrade that moved `std.net.drain`");
+  ()
+}
+
+fn reader(drain_name: String) -> String =
+  "import mine (net, " ++ drain_name ++ ")\npub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = "
+    ++ drain_name
+    ++ "[conn](c, b\"\", 1000)\ntest \"reads\" {\n  handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m, t) -> Some(b\"\") }\n}\n"
+
+test/nondet "renaming a shipped definition moves no hash" {
+  let net = repo_file("crates/ply-std/ply/net.ply");
+  let before = hashed([
+    { path: "mine.ply", text: net },
+    { path: "reader.ply", text: reader("drain") },
+  ]);
+  // Renaming it, and every reference to it, across a module boundary.
+  let after = hashed([
+    { path: "mine.ply", text: string::replace(net, "drain", "read_to_end") },
+    { path: "reader.ply", text: reader("read_to_end") },
+  ]);
+  assert(
+    hash_of(before, "mine.drain") == hash_of(after, "mine.read_to_end"),
+    Some("renaming a shipped definition moved its own hash"),
+  );
+  assert(
+    hash_of(before, "reader.read_all") == hash_of(after, "reader.read_all"),
+    Some("renaming a shipped definition moved a caller's hash"),
+  );
+  assert(
+    test_hash(before, "reader.reads") == test_hash(after, "reader.reads"),
+    Some("renaming a shipped definition re-selected a test"),
+  )
+}

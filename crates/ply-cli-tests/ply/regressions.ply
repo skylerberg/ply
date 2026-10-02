@@ -1,0 +1,214 @@
+// Bugs found once, each pinned where it was found: in the warm check, the result cache, handler
+// clauses, the run's spans, constructor resolution and the compiled tier.
+
+import harness (Ran, project, write, on_disk, in_memory, one, tree, warm_agrees, said, json_of, at,
+                path, nth, items, str, int, shown)
+import std.fs (fs)
+import std.json (Json, Str)
+
+fn codes_of(answer: Json) -> List<String> =
+  map(items(at(answer, "diagnostics")), |d: Json| str(at(d, "code")))
+
+// An imported but unused name is in no `deps` entry, so deleting it leaves every hash the importer
+// names untouched.
+test/nondet "deleting an unused selectively imported name is reported, not skipped past" {
+  project([
+    { path: "lib.ply", text: "pub fn used() -> Int = 1\npub fn spare() -> Int = 2\n" },
+    { path: "app.ply", text: "import lib (used, spare)\nfn go() -> Int = used()\n" },
+  ]);
+  let _ = warm_agrees("cold");
+  let _ = warm_agrees("warm");
+  write("lib.ply", "pub fn used() -> Int = 1\n");
+  let answer = warm_agrees("the imported name deleted");
+  assert(
+    int(at(answer, "exit_code")) == 2,
+    Some("an import of a deleted name must be an error, not a skipped file: " ++ shown(answer)),
+  );
+  assert(len(filter(codes_of(answer), |c: String| c == "E0101")) > 0, Some(shown(answer)))
+}
+
+// Inference walks modules dependency-first, so check order depends on what the cache held.
+test/nondet "the published order is the same warm as cold" {
+  project([
+    {
+      path: "app.ply",
+      text:
+        \\import lib
+        \\pub effect audit { write note[log](m: Int) -> Unit }
+        \\pub type Wrapped = | Wrap(Int) | Empty
+        \\fn second() -> Int = lib::base()
+        \\fn first() -> Int = second()
+        \\
+    },
+    {
+      path: "lib.ply",
+      text:
+        \\pub effect db { read get[t](k: Int) -> Int }
+        \\pub type Row = | Cell(Int)
+        \\pub fn base() -> Int = 1
+        \\
+    },
+  ]);
+  // A warm check publishes in the order a cold one does.
+  let _ = warm_agrees("cold");
+  let warm = warm_agrees("warm");
+  // The run's own order: files sorted, then each file's items as written.
+  assert(
+    map(items(at(warm, "definitions")), |d: Json| str(at(d, "name")))
+      == ["app.second", "app.first", "lib.base"],
+    Some(shown(at(warm, "definitions"))),
+  )
+}
+
+test/nondet "an unwritable store never fails a compile and says what failed" {
+  project([{ path: "m.ply", text: "pub fn f() -> Int = 1\n" }]);
+  // `rename` cannot replace a directory, so only the index's atomic write fails.
+  if !fs.create_dir[cwd](".ply-cache/store.idx") { panic("the blocking directory is made") };
+  let r = on_disk(["check", "--json"]);
+  assert(r.code == 0, Some("an unwritable cache never fails a compile: " ++ said(r)));
+  let warnings = map(
+    filter(items(at(json_of(r), "diagnostics")), |d: Json| str(at(d, "code")) == "W0601"),
+    |d: Json| str(at(d, "message")),
+  );
+  assert(
+    len(filter(warnings, |m: String| string_contains(m, "the store's index could not be written")))
+      > 0,
+    Some("the failing write has to be named: " ++ said(r)),
+  )
+}
+
+fn checked(source: String) -> Json = json_of(in_memory(one(source), ["check", "--json"]))
+
+test/nondet "three operations sharing one atom are three reachable clauses" {
+  let answer = checked(
+    \\import std.net (net)
+    \\pub fn touch(c: Int) -> Int / {net.recv[conn]} = {
+    \\  let _ = net.recv[conn](c, 16, 1000);
+    \\  0
+    \\}
+    \\pub fn boom() -> Int = nope(1)
+    \\test "three operations, one atom" {
+    \\  handle { assert_eq(touch(3), 0) } with {
+    \\    net.recv[conn](c, m, t) -> Some(b""),
+    \\    net.send[conn](c, p, t) -> Some(bytes_len(p)),
+    \\    net.close[conn](c) -> (),
+    \\  }
+    \\}
+    \\
+  );
+  assert(
+    len(filter(codes_of(answer), |c: String| c == "E0105")) == 0,
+    Some("no clause here is unreachable: " ++ shown(answer)),
+  );
+  assert(
+    len(filter(items(at(answer, "diagnostics")), |d: Json| str(at(d, "severity")) == "error")) == 1,
+    Some("only `nope` is an error: " ++ shown(answer)),
+  )
+}
+
+// The warning names the operation, not the atom: the atom is not what the second clause lost to.
+test/nondet "the same operation handled twice is still reported" {
+  let answer = checked(
+    \\import std.net (net)
+    \\pub fn touch(c: Int) -> Int / {net.recv[conn]} = {
+    \\  let _ = net.recv[conn](c, 16, 1000);
+    \\  0
+    \\}
+    \\pub fn boom() -> Int = nope(1)
+    \\test "one operation, twice" {
+    \\  handle { assert_eq(touch(3), 0) } with {
+    \\    net.recv[conn](c, m, t) -> Some(b""),
+    \\    net.recv[conn](c, m, t) -> Some(b"x"),
+    \\  }
+    \\}
+    \\
+  );
+  match filter(items(at(answer, "diagnostics")), |d: Json| str(at(d, "code")) == "E0105") {
+    [d, ..] ->
+      assert(
+        string_contains(str(at(d, "message")), "net.recv[conn]"),
+        Some("the operation is what was duplicated: " ++ shown(d)),
+      ),
+    [] -> panic("the second clause is unreachable: " ++ shown(answer)),
+  }
+}
+
+fn failed_line(text: String) -> Int = {
+  write("m.ply", text);
+  let report = json_of(on_disk(["run", "m.ply", "--json"]));
+  int(path(nth(at(nth(at(report, "diagnostics"), 0), "labels"), 0), ["start", "line"]))
+}
+
+test/nondet "a failure is placed in the text that ran after its definition moved" {
+  project([]);
+  // The hash of `main` is the same in both texts; only where it sits moved.
+  assert_eq(failed_line("\n\n\nfn main() -> Int = 1 / 0\n"), 4);
+  assert_eq(failed_line("fn main() -> Int = 1 / 0\n"), 1)
+}
+
+// A constructor is the one its own module declares, even when another imported module declares a
+// constructor of the same name and is imported first.
+test/nondet "a constructor name is the module it was imported from and not any module that declares it" {
+  project([
+    {
+      path: "first.ply",
+      text:
+        \\pub type Colour = | Nondet | Other
+        \\
+        \\pub fn code(c: Colour) -> Int =
+        \\  match c {
+        \\    Nondet -> 11,
+        \\    Other -> 12,
+        \\  }
+        \\
+    },
+    {
+      path: "second.ply",
+      text:
+        \\pub type Skipped = | Nondet | Panicked
+        \\
+        \\pub fn skipped_code(s: Skipped) -> Int =
+        \\  match s {
+        \\    Nondet -> 21,
+        \\    Panicked -> 22,
+        \\  }
+        \\
+    },
+    {
+      path: "use.ply",
+      text:
+        \\// `second` comes first and declares a `Nondet` of its own.
+        \\import second (Panicked, Skipped, skipped_code)
+        \\import first (Colour, Nondet, Other, code)
+        \\
+        \\test "the imported constructor is the one that was imported" {
+        \\  assert_eq(code(Nondet), 11);
+        \\  assert_eq(code(Other), 12)
+        \\}
+        \\
+    },
+  ]);
+  let r = on_disk(["test", "-j", "1"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(string_contains(said(r), "1 passed"), Some(said(r)))
+}
+
+// An `Int` at or beyond `2^62` does not fit an immediate and is boxed; a self tail call once
+// released that boxed word on every restart. The whole pipeline is the point, so it is a `ply run`.
+test/nondet "a boxed Int passes through a self tail call" {
+  project([
+    {
+      path: "m.ply",
+      text:
+        \\fn countdown(n: Int, k: Int) -> Int = if k == 0 { n } else { countdown(n, k - 1) }
+        \\pub fn main() -> Unit {
+        \\  assert_eq(countdown(4611686018427387904, 1), 4611686018427387904);
+        \\  assert_eq(countdown(4611686018427387904, 1000), 4611686018427387904);
+        \\  assert_eq(countdown(0 - 4611686018427387905, 1), 0 - 4611686018427387905)
+        \\}
+        \\
+    },
+  ]);
+  let r = on_disk(["run", "--color", "never"]);
+  assert(r.code == 0, Some(said(r)))
+}

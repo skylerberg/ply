@@ -1,0 +1,100 @@
+// A program over bytes and text: it passes, its pass is cached, a rename moves no hash, and a
+// partial builtin refuses rather than clamping.
+
+import harness (Ran, on_disk, program, write, stdout, said)
+import std.string
+
+fn server() -> String =
+  \\fn head(a: Bytes, b: Bytes, c: Bytes) -> Bytes =
+  \\  bytes_concat(bytes_concat(a, b), c)
+  \\
+  \\fn is_get(head: Bytes) -> Bool = bytes_slice(head, 0, 4) == b"GET "
+  \\
+  \\fn first_line(head: Bytes) -> String =
+  \\  string_of_bytes(bytes_slice(head, 0, crlf(head)))
+  \\
+  \\fn crlf(head: Bytes) -> Int =
+  \\  fold(range(0, bytes_len(head) - 1), -1, |found, i|
+  \\    if found >= 0 { found }
+  \\    else if bytes_at(head, i) == 13 && bytes_at(head, i + 1) == 10 { i }
+  \\    else { found })
+  \\
+  \\fn header_value(line: String) -> String =
+  \\  if string_contains(line, ": ") {
+  \\    string_trim(string_slice(line, string_find(line, ": ") + 2, string_len(line)))
+  \\  } else {
+  \\    ""
+  \\  }
+  \\
+  \\test "a head split across reads parses" {
+  \\  let h = head(b"GET /a HT", b"TP/1.1\r\nHost: ex", b"ample.com\r\n\r\n");
+  \\  assert(is_get(h));
+  \\  assert_eq(first_line(h), "GET /a HTTP/1.1");
+  \\  assert_eq(string_split(first_line(h), " "), ["GET", "/a", "HTTP/1.1"])
+  \\}
+  \\
+  \\test "a header value is trimmed and case folded" {
+  \\  let lines = string_split("Host: Example.COM \r\nAccept: */*", "\r\n");
+  \\  assert_eq(string_lower(header_value("Host: Example.COM ")), "example.com");
+  \\  assert_eq(len(lines), 2);
+  \\  assert(string_starts_with("Content-Type: text/plain", "Content-"));
+  \\  assert(string_ends_with("Content-Type: text/plain", "plain"))
+  \\}
+  \\
+  \\test "text that is not ascii survives the round trip" {
+  \\  let body = "héllo — ✓";
+  \\  assert_eq(string_of_bytes(bytes_of_string(body)), body);
+  \\  assert_eq(string_len(body), 9);
+  \\  assert_eq(bytes_len(bytes_of_string(body)), 14);
+  \\  assert_eq(string_slice(body, 0, 2), "hé")
+  \\}
+  \\
+  \\test "a cut multi-byte character is refused rather than replaced" {
+  \\  let cut = bytes_slice(bytes_of_string("é"), 0, 1);
+  \\  assert(!bytes_is_utf8(cut));
+  \\  assert_eq(string_of_bytes_lossy(cut), "�");
+  \\  assert_eq(string_len(string_of_bytes_lossy(cut)), 1)
+  \\}
+  \\
+
+// Kept out of `server` so the green run stays green: a partial builtin at an input it refuses.
+fn refusals() -> String =
+  \\test "a slice past the end is refused" {
+  \\  assert_eq(bytes_len(bytes_slice(b"abc", 0, 4)), 0)
+  \\}
+  \\
+
+fn green_twice() -> Ran = {
+  program(server());
+  let first = on_disk(["test"]);
+  assert(first.code == 0, Some(said(first)));
+  first
+}
+
+test/nondet "a program over bytes and text passes" {
+  let r = green_twice();
+  assert(string_contains(stdout(r), "4 passed"), Some(stdout(r)))
+}
+
+// A `Bytes` literal that normalized unstably would re-run every test on every invocation.
+test/nondet "a second run over bytes selects nothing" {
+  let _ = green_twice();
+  let again = stdout(on_disk(["test"]));
+  assert(string_contains(again, "selected 0 of 4"), Some(again))
+}
+
+// The literal tag carries a length, and a length written against the wrong cursor moves every hash
+// after it.
+test/nondet "renaming a definition over bytes selects nothing" {
+  let _ = green_twice();
+  write("m.ply", string::replace(server(), "first_line", "request_line"));
+  let again = stdout(on_disk(["test"]));
+  assert(string_contains(again, "selected 0 of 4"), Some(again))
+}
+
+test/nondet "a slice past the end fails the test rather than clamping" {
+  program(refusals());
+  let r = on_disk(["test"]);
+  assert(r.code != 0, Some(stdout(r)));
+  assert(string_contains(stdout(r), "never clamped"), Some(stdout(r)))
+}

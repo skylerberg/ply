@@ -1,0 +1,185 @@
+// The compiled tier as `ply test` and `ply run` attach it: entered over every kind of value, empty
+// when nothing is selected, and honest about a failure it raises.
+
+import harness (program, on_disk, json_of, at, path, int, str, truth, shown)
+import std.json (Json, Str, Array)
+
+// Ints, bools, containers, strings and a self-handled effect, so the seam carries each kind.
+fn corpus() -> String =
+  \\effect tally {
+  \\  read  base[log]() -> Int
+  \\  write note[log](what: Int) -> Unit
+  \\}
+  \\
+  \\fn double(x: Int) -> Int = x * 2
+  \\
+  \\fn even(x: Int) -> Bool = x % 2 == 0
+  \\
+  \\fn triple(x: Int) -> Int = x * 3
+  \\
+  \\fn pair(x: Int) -> List<Int> = [x, x]
+  \\
+  \\fn label(x: Int) -> String = "n"
+  \\
+  \\fn grade(x: Int) -> Float = 1.5
+  \\
+  \\fn refused(x: Int) -> Int = if 1.5 > 0.5 { x + 1 } else { x }
+  \\
+  \\fn measured(n: Int) -> Int / {tally.read[log], tally.write[log]} = {
+  \\  let b = tally.base[log]();
+  \\  tally.note[log](n + 1);
+  \\  b + n
+  \\}
+  \\
+  \\pub fn handled(n: Int) -> Int =
+  \\  with_cell[log](0) { c -> {
+  \\    let out = handle {
+  \\      measured(n)
+  \\    } with {
+  \\      tally.base[log]() -> 7,
+  \\      tally.note[log](what) -> cell_set(c, cell_get(c) + what),
+  \\    };
+  \\    out + cell_get(c)
+  \\  } }
+  \\
+  \\test "double doubles" { assert_eq(double(4), 8) }
+  \\test "even is even" { assert(even(4)) }
+  \\test "triple triples" { assert_eq(triple(5), 15) }
+  \\test "a pair has two" { assert_eq(len(pair(7)), 2) }
+  \\test "a pair holds its number" { assert_eq(pair(7), [7, 7]) }
+  \\test "a refused body adds one" { assert_eq(refused(2), 3) }
+  \\test "a label is a word" { assert_eq(label(7), "n") }
+  \\test "a grade is a float" { assert(grade(7) == 1.5) }
+  \\test "a self handled effect still answers" { assert_eq(handled(1), 10) }
+  \\
+
+fn tested() -> Json = json_of(on_disk(["test", "-j", "1", "--json"]))
+
+fn backend(report: Json, field: String) -> Int = int(path(report, ["backend", field]))
+
+test/nondet "the honest code generator agrees over the corpus and enters it" {
+  program(corpus());
+  let report = tested();
+  let b = shown(at(report, "backend"));
+  assert(truth(at(report, "ok")), Some(shown(report)));
+  assert(int(path(report, ["summary", "failed"])) == 0, Some(shown(report)));
+  assert(str(path(report, ["backend", "name"])) == "c", Some(shown(report)));
+  assert(
+    backend(report, "entered") > 0,
+    Some("the code generator entered nothing, so the seam was never reached: " ++ b),
+  );
+  // The C tier carries the whole language, so it declines nothing.
+  assert(backend(report, "declined") == 0, Some(b));
+  assert(backend(report, "fragment") > 0, Some(b));
+  // Only `Int`s go in, which are immediates and build nothing; a list and a string are read back
+  // out.
+  assert(
+    backend(report, "converted_in") == 0,
+    Some("an immediate argument built an object at the seam: " ++ b),
+  );
+  assert(
+    backend(report, "converted_out") > 0,
+    Some(
+      "the seam read nothing back out of a corpus that answers lists and strings, so the census is not counting: "
+        ++ b,
+    ),
+  );
+  // A code generator compiled something, and the report says how much it cost.
+  assert(
+    backend(report, "units") > 0,
+    Some("no unit was compiled, so `c` installed something that is not a code generator: " ++ b),
+  )
+}
+
+test/nondet "run attaches a backend to main" {
+  program(
+    "fn double(x: Int) -> Int = x * 2\nfn main() -> Int = fold(range(0, 10), 0, |acc: Int, i: Int| acc + double(i))\n",
+  );
+  let r = on_disk(["run", "--json"]);
+  let report = json_of(r);
+  assert(at(report, "value") == Str("90"), Some(shown(report)));
+  assert(r.code == 0, Some(shown(report)))
+}
+
+test/nondet "a backed run that selects nothing compiles nothing" {
+  program(corpus());
+  assert(
+    backend(tested(), "fragment") > 0,
+    Some("the control did not compile a fragment, so the next assertion proves nothing"),
+  );
+  let report = json_of(on_disk(["test", "--filter", "nothing-matches-this", "--json"]));
+  assert(truth(at(report, "ok")), Some(shown(report)));
+  assert(
+    backend(report, "fragment") == 0,
+    Some(
+      "a run that selected no test compiled a fragment anyway: " ++ shown(at(report, "backend")),
+    ),
+  );
+  assert(
+    at(report, "diagnostics") == Array([]),
+    Some(
+      "a run that built no backend reported a disagreement about which engine it was: "
+        ++ shown(report),
+    ),
+  )
+}
+
+// A label is a trailing parameter in compiled code and a name in the machine's, so one definition
+// called under two labels has to answer the same on both.
+fn two_labels() -> String =
+  \\effect net {
+  \\  write send[s](payload: Bytes) -> Int
+  \\}
+  \\
+  \\fn relay<[l]>(payload: Bytes) -> Int / {net.send[l]} = net.send[l](payload)
+  \\
+  \\pub fn both(payload: Bytes) -> Int =
+  \\  with_cell[seen](0) { c -> {
+  \\    let sent = handle {
+  \\      relay[conn](payload) + relay[upstream](payload)
+  \\    } with {
+  \\      net.send[conn](p) -> { cell_set(c, cell_get(c) + 1); bytes_len(p) },
+  \\      net.send[upstream](p) -> { cell_set(c, cell_get(c) + 10); bytes_len(p) },
+  \\    };
+  \\    sent + cell_get(c)
+  \\  } }
+  \\
+  \\fn main() -> Int = both(b"ping")
+  \\
+  \\test "each label reaches the clause written for it" { assert_eq(both(b"ping"), 19) }
+  \\
+
+test/nondet "a definition generic over a label answers through the compiled tier" {
+  program(two_labels());
+  let r = on_disk(["run", "--json"]);
+  let ran = json_of(r);
+  assert(at(ran, "value") == Str("19"), Some(shown(ran)));
+  assert(r.code == 0, Some(shown(ran)));
+  let report = tested();
+  assert(truth(at(report, "ok")), Some(shown(report)));
+  assert(
+    backend(report, "entered") > 0,
+    Some("the label-generic body never reached the seam: " ++ shown(at(report, "backend"))),
+  )
+}
+
+test/nondet "a test body is entered whole and a failing one still fails" {
+  program(
+    \\fn double(x: Int) -> Int = x * 2
+    \\
+    \\test "doubles" { assert_eq(double(21), 42) }
+    \\
+    \\test "wrong" { assert_eq(double(21), 41) }
+    \\
+  );
+  let report = tested();
+  assert(int(path(report, ["summary", "failed"])) == 1, Some(shown(report)));
+  assert(
+    backend(report, "entered") == 2,
+    Some("both bodies are entered, and the failing one raises: " ++ shown(at(report, "backend"))),
+  );
+  assert(
+    backend(report, "declined") == 0,
+    Some("a raised failure is a verdict, not a decline: " ++ shown(at(report, "backend"))),
+  )
+}

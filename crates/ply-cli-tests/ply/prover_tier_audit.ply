@@ -1,0 +1,371 @@
+// What each tier claims about the corpus and about claims chosen to sit at its edges, read from the
+// document `ply prove --json` writes: a certificate's rules, a tier, a gap.
+
+import harness (program, repo, on_disk, json_of, at, path, nth, items, str, int, truth, shown,
+                concatenated)
+import std.json
+import std.json (Json, Null, Str, Object, Array, Number)
+import std.string
+
+// `proof.goal`'s `default_unfold_depth`: no certificate inlines deeper.
+fn unfold_depth() -> Int = 3
+
+fn proved(source: String) -> Json = {
+  program(source);
+  proved_here([])
+}
+
+fn proved_here(flags: List<String>) -> Json =
+  json_of(on_disk(concatenated(["prove", "--no-cache", "--json"], flags)))
+
+// What `ply prove` answers for `relative` under the repository, discharged afresh.
+fn corpus_report(relative: String, flags: List<String>) -> Json =
+  json_of(
+    on_disk(concatenated(["prove", repo() ++ "/" ++ relative, "--no-cache", "--json"], flags)),
+  )
+
+// The repository's own claims, and fixtures that sit at each tier's edges.
+fn corpus() -> List<String> =
+  [
+    "examples",
+    "tests/fixtures/refuted_law.ply",
+    "tests/fixtures/vacuous_law.ply",
+    "tests/fixtures/obligation_not_discharged.ply",
+    "tests/fixtures/concurrency_law_binder.ply",
+  ]
+
+fn obligations(report: Json) -> List<Json> = items(at(report, "obligations"))
+
+fn obligation(report: Json, needle: String) -> Json =
+  match filter(obligations(report), |o: Json| string_contains(str(at(o, "label")), needle)) {
+    [o, ..] -> o,
+    [] -> panic("no obligation labelled `" ++ needle ++ "` in " ++ shown(report)),
+  }
+
+fn tier(o: Json) -> String = str(at(o, "tier"))
+
+fn outcome(o: Json) -> String = str(at(o, "outcome"))
+
+// The fields of every rule of `o`'s certificate tagged `tag`: `Null` for a rule with none.
+fn rules(o: Json, tag: String) -> List<Json> =
+  fold(items(path(o, ["certificate", "rules"])), [], |acc: List<Json>, rule: Json|
+    match rule {
+      Str(named) -> if named == tag { push(acc, Null) } else { acc },
+      Object(fields) -> match map_get(fields, tag) { Some(f) -> push(acc, f), None -> acc },
+      _ -> acc,
+    })
+
+// A run's document, less the clock.
+fn timeless(report: Json) -> Json =
+  match report { Object(m) -> Object(map_insert(m, "duration_ms", Null)), other -> other }
+
+test/nondet "the certificate audit" {
+  let proofs = fold(corpus(), 0, |count: Int, relative: String| {
+    let report = corpus_report(relative, []);
+    let budget = int(path(report, ["plan", "prove_budget"]));
+    assert(budget >= 0, Some("the plan names its budget: " ++ shown(report)));
+    fold(
+      filter(obligations(report), |o: Json| at(o, "certificate") != Null),
+      count,
+      |n: Int, o: Json| {
+        let certificate = at(o, "certificate");
+        let owner = str(at(o, "owner"));
+        assert(
+          truth(at(certificate, "guard_satisfiable")),
+          Some(owner ++ " holds a certificate that did not establish its guard"),
+        );
+        assert(
+          items(at(certificate, "rules")) != [],
+          Some(owner ++ " is proved by no rule at all"),
+        );
+        fold(rules(o, "unfold"), (), |u: Unit, unfolded: Json|
+          assert(
+            int(at(unfolded, "depth")) >= 0 && int(at(unfolded, "depth")) <= unfold_depth(),
+            Some(owner ++ " unfolded past the bound: " ++ shown(unfolded)),
+          ));
+        fold(rules(o, "exhaustive_interleaving"), (), |u: Unit, searched: Json| {
+          assert(
+            int(at(searched, "interleavings")) > 0,
+            Some(owner ++ " is proved by an exhaustive search that ran no interleaving"),
+          );
+          assert(
+            at(certificate, "sorts") == Array([]),
+            Some(owner ++ " is a proof about one program, so it has no uninterpreted sorts"),
+          )
+        });
+        fold(rules(o, "induction"), (), |u: Unit, inducted: Json|
+          assert(
+            len(
+                filter(rules(o, "unfold"), |unfolded: Json|
+                  at(unfolded, "def") == at(inducted, "def")),
+              )
+              > 0,
+            Some(
+              owner ++ " claims induction over " ++ shown(at(inducted, "def"))
+                ++ " without unrolling it",
+            ),
+          ));
+        // An enumeration spends a step a point, and anything else at most the prove budget.
+        let walked = fold(rules(o, "exhaustive_enumeration"), 0, |most: Int, e: Json|
+          if int(at(e, "points")) > most { int(at(e, "points")) } else { most });
+        let steps = int(at(certificate, "steps"));
+        assert(
+          steps >= 0 && steps <= (if budget > walked { budget } else { walked }),
+          Some(owner ++ " spent " ++ int_to_string(steps) ++ " steps"),
+        );
+        n + 1
+      },
+    )
+  });
+  assert(proofs >= 10, Some("the corpus produced only " ++ int_to_string(proofs) ++ " proofs"))
+}
+
+// A run is a function of the program and the plan: the worker pool decides nothing, and a
+// refutation shrinks to the same value every time.
+test/nondet "two runs over one corpus agree" {
+  fold(corpus(), (), |u: Unit, relative: String|
+    assert(
+      timeless(corpus_report(relative, ["--jobs", "1"]))
+        == timeless(corpus_report(relative, ["--jobs", "4"])),
+      Some("in " ++ relative),
+    ))
+}
+
+test/nondet "a refutation names the value it shrank to" {
+  let o = obligation(
+    corpus_report("tests/fixtures/refuted_law.ply", []),
+    "settling a day's payments drops nothing",
+  );
+  assert(outcome(o) == "refuted", Some("the fixture exists to be refuted: " ++ shown(o)));
+  assert(items(path(o, ["counterexample", "bindings"])) != [], Some(shown(o)))
+}
+
+test/nondet "a finite domain is proved by covering it" {
+  let o = obligation(
+    proved("law \"excluded middle\" forall (b: Bool) { b || !b }\n"),
+    "excluded middle",
+  );
+  assert(tier(o) == "proved", Some(shown(o)));
+  assert(
+    len(filter(rules(o, "exhaustive_enumeration"), |e: Json| int(at(e, "points")) == 2)) > 0
+      || rules(o, "propositional") != [],
+    Some(shown(o)),
+  )
+}
+
+test/nondet "a ground law is proved rather than exemplified" {
+  let o = obligation(
+    proved(
+      \\fn stock() -> String = "abc"
+      \\
+      \\law "the stock is three deep" {
+      \\  string_len(stock()) == 3
+      \\}
+      \\
+    ),
+    "the stock is three deep",
+  );
+  assert(tier(o) == "proved", Some(shown(o)));
+  assert(rules(o, "ground_evaluation") != [], Some(shown(o)))
+}
+
+// Stopping the unfolding at a general statement is what induction is for, and there is none here.
+test/nondet "a recursive definition is never unfolded" {
+  let report = proved(
+    \\fn rev_onto(xs: List<Int>, acc: List<Int>) -> List<Int> =
+    \\  match xs {
+    \\    [x, ..rest] -> rev_onto(rest, push(acc, x)),
+    \\    _ -> acc,
+    \\  }
+    \\
+    \\fn rev(xs: List<Int>) -> List<Int> = rev_onto(xs, [])
+    \\
+    \\law "reverse is an involution"
+    \\  forall (xs: List<Int>) {
+    \\    rev(rev(xs)) == xs
+    \\  }
+    \\
+  );
+  assert(
+    tier(obligation(report, "reverse is an involution")) == "property",
+    Some("a claim over unbounded data cannot be decided without induction"),
+  )
+}
+
+test/nondet "a term outside the fragment is never proved" {
+  let o = obligation(
+    proved("law \"halving and doubling cancel\"\n  forall (x: Int) {\n    x / 2 * 2 == x\n  }\n"),
+    "halving and doubling cancel",
+  );
+  assert(
+    outcome(o) == "refuted",
+    Some("an uninterpreted `/` must not be reasoned about: " ++ shown(o)),
+  )
+}
+
+test/nondet "an uninterpreted function closes under congruence" {
+  let o = obligation(
+    proved(
+      "law \"a pure function is a function\"\n  forall (f: (Int) -> Int, x: Int) {\n    f(x) == f(x)\n  }\n",
+    ),
+    "a pure function is a function",
+  );
+  assert(tier(o) == "proved", Some(shown(o)));
+  assert(rules(o, "congruence") != [], Some(shown(o)))
+}
+
+// Refuted only if compiled code applies the generated functions it is handed; a raise is a gap.
+test/nondet "a higher-order law is sampled on the tier" {
+  let o = obligation(
+    proved(
+      "law \"two functions agree\"\n  forall (f: (Int) -> Int, g: (Int) -> Int, x: Int) {\n    f(x) == g(x)\n  }\n",
+    ),
+    "two functions agree",
+  );
+  assert(outcome(o) == "refuted", Some(shown(o)));
+  assert(
+    string_starts_with(str(at(nth(path(o, ["counterexample", "bindings"]), 0), "value")), "<fn |"),
+    Some(shown(o)),
+  )
+}
+
+test/nondet "a proved polymorphic law records its sorts" {
+  let o = obligation(
+    proved(
+      "fn pair<a>(x: a) -> a = x\n\nlaw \"identity is identity\"\n  forall (x: a) {\n    pair(x) == x\n  }\n",
+    ),
+    "identity is identity",
+  );
+  assert(tier(o) == "proved", Some(shown(o)));
+  assert(
+    path(o, ["certificate", "sorts"]) == Array([Str("a")]),
+    Some(
+      "a proof over a type variable names the sort it left uninterpreted as the binder prints it: "
+        ++ shown(o),
+    ),
+  )
+}
+
+test/nondet "a spent budget reports the weaker tier" {
+  let label = "below, equal to, or above";
+  program(
+    "law \"one is below, equal to, or above the other\"\n  forall (x: Int, y: Int) {\n    (x < y) || (x == y) || (x > y)\n  }\n",
+  );
+  let decided = obligation(proved_here([]), label);
+  assert(
+    tier(decided) == "proved",
+    Some(
+      "case analysis over the comparisons decides this when the budget allows: " ++ shown(decided),
+    ),
+  );
+  assert(
+    int(path(decided, ["certificate", "steps"])) > 1,
+    Some(
+      "a law a budget of one already settles cannot test what a spent one does: " ++ shown(decided),
+    ),
+  );
+  let starved = obligation(proved_here(["--prove-budget", "1"]), label);
+  assert(
+    tier(starved) == "property",
+    Some("a spent budget is inconclusive, and inconclusive is the weaker tier: " ++ shown(starved)),
+  )
+}
+
+test/nondet "an unsatisfiable guard is vacuous rather than proved" {
+  let report = corpus_report("tests/fixtures/vacuous_law.ply", []);
+  assert(obligations(report) != [], Some(shown(report)));
+  fold(obligations(report), (), |u: Unit, o: Json| {
+    assert(outcome(o) == "vacuous", Some(shown(o)));
+    assert(at(o, "tier") == Null, Some(shown(o)))
+  })
+}
+
+// Checking an `ensures` means calling the definition, and one that performs needs a handler nothing
+// supplies; a spec that raises is not false, so it is neither a refutation nor a hold.
+test/nondet "a gap is reported as one and carries no tier" {
+  let report = corpus_report("tests/fixtures/obligation_not_discharged.ply", []);
+  let recorded = obligation(report, "recorded");
+  assert(outcome(recorded) == "unattempted", Some(shown(recorded)));
+  assert(string_contains(str(at(recorded, "gap")), "no handler"), Some(shown(recorded)));
+  let share = obligation(report, "share");
+  assert(outcome(share) == "unattempted", Some(shown(share)));
+  assert(
+    string_starts_with(str(at(share, "gap")), "raised: ")
+      && string_contains(str(at(share, "gap")), "division by zero"),
+    Some(shown(share)),
+  );
+  assert(at(recorded, "tier") == Null && at(share, "tier") == Null, Some(shown(report)))
+}
+
+test/nondet "a ground concurrency law whose search is exhaustive is proved" {
+  let label = "no interleaving of two guarded settlements";
+  let o = obligation(corpus_report("examples", ["--filter", label]), label);
+  assert(tier(o) == "proved", Some(shown(o)));
+  assert(
+    rules(o, "exhaustive_interleaving") != [],
+    Some("an execution-derived proof names the rule that says so: " ++ shown(o)),
+  );
+  // One interleaving is one concrete case, which is not a coverage claim at all.
+  let once = corpus_report("examples", ["--filter", label, "--seed", "7"]);
+  assert(tier(obligation(once, label)) == "example", Some(shown(once)))
+}
+
+test/nondet "a precondition alone is not an obligation" {
+  let report = proved(
+    "fn withdraw(balance: Int, amount: Int) -> Int\n  requires amount > 0\n= balance - amount\n",
+  );
+  assert(
+    obligations(report) == [],
+    Some("a `requires` is a filter on a domain, not a claim to discharge: " ++ shown(report)),
+  )
+}
+
+test/nondet "each postcondition is discharged at its own tier" {
+  let report = corpus_report("examples/ledger.ply", []);
+  let tiers = map(
+    filter(obligations(report), |o: Json|
+      string_ends_with(str(at(o, "owner")), "ledger.transfer") && str(at(o, "kind")) == "ensures"),
+    tier,
+  );
+  assert(
+    tiers == ["proved", "proved", "property"],
+    Some(
+      "one clause per obligation, or the pair would share the weaker label: "
+        ++ string::join(tiers, ", "),
+    ),
+  )
+}
+
+test/nondet "a total index is proved where a raising one is a gap" {
+  let report = proved(
+    \\fn peek(xs: List<Int>, i: Int) -> Int =
+    \\  match list_at(xs, i) { Some(v) -> v, None -> 0 }
+    \\
+    \\fn bpeek(b: Bytes, i: Int) -> Int = bytes_at(b, i)
+    \\
+    \\law "a total index peeks at every index"
+    \\  forall (xs: List<Int>, i: Int) {
+    \\    peek(xs, i) == peek(xs, i)
+    \\  }
+    \\
+    \\law "a raising index does not"
+    \\  forall (b: Bytes, i: Int) {
+    \\    bpeek(b, i) == bpeek(b, i)
+    \\  }
+    \\
+  );
+  assert(
+    tier(obligation(report, "a total index peeks at every index")) == "proved",
+    Some("an unguarded `list_at` peek is a value, so the claim is a case split over its answer"),
+  );
+  let raising = obligation(report, "a raising index does not");
+  assert(
+    outcome(raising) == "unattempted",
+    Some("the control must raise, or the arm above is compared with nothing: " ++ shown(raising)),
+  );
+  assert(
+    string_starts_with(str(at(raising, "gap")), "raised: `bytes_at` index"),
+    Some("the control raises at its index: " ++ shown(raising)),
+  );
+  assert(at(raising, "tier") == Null, Some(shown(raising)))
+}

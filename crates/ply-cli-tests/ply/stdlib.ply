@@ -1,0 +1,623 @@
+// The shipped modules as a project meets them: imported, checked, bound, hashed, tested and proved
+// like its own, under a prefix no project may take, and never counted as the project's.
+
+import harness (Ran, Source, project, program, write, read, repo_file, shelved, in_memory, one,
+                tree, on_disk, warm_agrees, seeding, said, stdout, stderr, json_of, at, path, nth,
+                items, first, str, int, truth, shown)
+import std.fs (MemFs)
+import std.json (Json, Null)
+import std.json
+import std.list (sort_by)
+import std.string
+
+// Handles every atom it can perform, so its test is `det` and cacheable.
+fn importer() -> String =
+  \\import std.net (net)
+  \\
+  \\fn touch(port: Int) -> Int / {net.listen[listener], net.close[listener]} {
+  \\  let l = net.listen[listener](port);
+  \\  net.close[listener](l);
+  \\  l
+  \\}
+  \\
+  \\test "the imported effect is handled in memory" {
+  \\  handle {
+  \\    assert_eq(touch(8080), 3)
+  \\  } with {
+  \\    net.listen[listener](p) -> 3,
+  \\    net.close[listener](l) -> (),
+  \\  }
+  \\}
+  \\
+
+fn app(text: String) -> MemFs = tree([{ path: "app.ply", text: text }])
+
+fn checked(t: MemFs) -> Json = json_of(in_memory(t, ["check", "--json"]))
+
+fn named(list: Json, name: String) -> Option<Json> =
+  match filter(items(list), |d: Json| str(at(d, "name")) == name) { [d, ..] -> Some(d), [] -> None }
+
+fn has_named(list: Json, name: String) -> Bool = named(list, name) != None
+
+// A definition's hash, as `ply hash --json` gives it.
+fn hash_of(answer: Json, name: String) -> String =
+  match named(at(answer, "definitions"), name) {
+    Some(d) -> str(at(d, "hash")),
+    None -> panic("`" ++ name ++ "` is not in the program: " ++ shown(answer)),
+  }
+
+fn hashed(t: MemFs) -> Json = json_of(in_memory(t, ["hash", "--json"]))
+
+fn tests_hashed(answer: Json) -> List<String> =
+  map(items(at(answer, "tests")), |t: Json| str(at(t, "hash")))
+
+// What the cache holds for a definition or a declaration, by its program-wide name.
+fn inspected(name: String) -> Json =
+  match items(at(json_of(on_disk(["cache", "inspect", name, "--json"])), "matches")) {
+    [m, ..] -> m,
+    [] -> panic("the cache holds no `" ++ name ++ "`"),
+  }
+
+// What `ply cache inspect` says is filed for `name`: each match's file.
+fn filed_files(name: String) -> List<String> =
+  map(items(at(json_of(on_disk(["cache", "inspect", name, "--json"])), "matches")), |m: Json|
+    str(at(m, "file")))
+
+test/nondet "a project module can import std.net and it checks" {
+  let answer = checked(app(importer()));
+  assert(truth(at(answer, "ok")), Some(shown(answer)));
+  assert(
+    has_named(at(answer, "modules"), "std.net"),
+    Some("the shipped module is not in the program"),
+  );
+  // `ply_host::tcp` registers against the program-wide name, qualified by the declaring module.
+  assert(
+    len(
+        filter(items(at(answer, "effects")), |e: Json|
+          str(at(e, "module")) == "std.net" && str(at(e, "name")) == "std.net.net"),
+      )
+      == 1,
+    Some(shown(at(answer, "effects"))),
+  );
+  assert(has_named(at(answer, "definitions"), "std.net.drain"), None);
+  // The row a host handler binds against, written in the qualified name.
+  match named(at(answer, "definitions"), "app.touch") {
+    Some(touch) ->
+      assert_eq(
+        str(at(touch, "footprint")),
+        "{std.net.net.close[listener], std.net.net.listen[listener]}",
+      ),
+    None -> panic("`app.touch` is in the program"),
+  }
+}
+
+test/nondet "a project that imports std.net tests green" {
+  program(importer());
+  let r = on_disk(["test"]);
+  assert(r.code == 0, Some("got:\n" ++ said(r)));
+  assert(string_contains(said(r), "the imported effect is handled"), Some(said(r)))
+}
+
+test/nondet "ply hosts binds the shipped declaration under its qualified name" {
+  project([{ path: "app.ply", text: importer() }]);
+  let r = on_disk(["hosts", "--host", "--json"]);
+  assert(r.code == 0, Some("got:\n" ++ said(r)));
+  let rows = items(at(json_of(r), "hosts"));
+  assert(rows != [], Some("nothing bound: " ++ said(r)));
+  assert(
+    len(filter(rows, |row: Json| str(at(row, "effect")) != "std.net.net")) == 0,
+    Some(said(r)),
+  );
+  assert(
+    len(filter(rows, |row: Json| str(at(row, "triple")) == "std.net.net.listen[listener]")) > 0,
+    Some(said(r)),
+  );
+  // A program declaring its own `net` reaches no handler: the registration names `std.net.net`
+  // only.
+  project([
+    {
+      path: "app.ply",
+      text: "nondet effect net {\n  write listen[s](port: Int) -> Int\n}\nfn f() -> Int / {net.write[listener]} = net.listen[listener](1)\n",
+    },
+  ]);
+  let other = on_disk(["hosts", "--host"]);
+  assert(
+    string_contains(said(other), "none serves an atom this program performs"),
+    Some("a copied declaration must not bind:\n" ++ said(other)),
+  )
+}
+
+test/nondet "a project file under std collides with the built-in package" {
+  let answer = checked(tree([{ path: "std/json.ply", text: "pub fn parse() -> Int = 1\n" }]));
+  let diagnostics = items(at(answer, "diagnostics"));
+  assert(len(diagnostics) == 1, Some(shown(answer)));
+  let d = first(diagnostics);
+  assert(str(at(d, "code")) == "E0133", Some(shown(d)));
+  assert(string_contains(str(at(d, "message")), "std.json"), Some(shown(d)));
+  assert(
+    items(at(d, "labels")) != [],
+    Some("E0133 must point at the file it is about: " ++ shown(d)),
+  )
+}
+
+// Easy to miss when the rule is written as a prefix check.
+test/nondet "a project file named std also collides" {
+  let answer = checked(tree([{ path: "std.ply", text: "pub fn f() -> Int = 1\n" }]));
+  assert(str(at(first(items(at(answer, "diagnostics"))), "code")) == "E0133", Some(shown(answer)));
+  // And a name that merely starts with the letters is no collision.
+  let ok = in_memory(tree([{ path: "stdlib.ply", text: "pub fn f() -> Int = 1\n" }]), ["check"]);
+  assert(ok.code == 0, Some("`stdlib` is an ordinary module name: " ++ said(ok)))
+}
+
+test/nondet "importing a module that does not ship lists the ones that do" {
+  let answer = checked(app("import std.nonesuch\nfn f() -> Int = 1\n"));
+  let d = first(items(at(answer, "diagnostics")));
+  assert(str(at(d, "code")) == "E0106", Some(shown(d)));
+  assert(string_contains(shown(d), "std.net"), Some(shown(d)));
+  assert(
+    items(at(d, "labels")) != [],
+    Some("the diagnostic must point at the import: " ++ shown(d)),
+  )
+}
+
+test/nondet "a program importing nothing from std loads nothing" {
+  let answer = checked(app("fn f() -> Int = 1\n"));
+  assert(len(items(at(answer, "modules"))) == 1, Some(shown(answer)));
+  assert(
+    len(
+        filter(items(at(answer, "definitions")), |d: Json|
+          string_starts_with(str(at(d, "name")), "std.")),
+      )
+      == 0,
+    Some(shown(answer)),
+  );
+  assert(len(items(at(answer, "files"))) == 1, Some(shown(answer)))
+}
+
+fn net() -> String = repo_file("crates/ply-std/ply/net.ply")
+
+test/nondet "copying a shipped module into a project produces identical hashes" {
+  let shipped = hashed(app(importer()));
+  let copied_tree = tree([
+    { path: "mine.ply", text: net() },
+    {
+      path: "app.ply",
+      text: string::replace(importer(), "import std.net (net)", "import mine (net)"),
+    },
+  ]);
+  let copied = hashed(copied_tree);
+  assert(
+    hash_of(shipped, "std.net.drain") == hash_of(copied, "mine.drain"),
+    Some("a stdlib definition must hash like a project one"),
+  );
+  // A reference contributes the referent's hash, so the importer is one definition in both
+  // programs.
+  assert_eq(hash_of(shipped, "app.touch"), hash_of(copied, "app.touch"));
+  // An effect declaration is a declaration like any other, as the cache files it.
+  program(importer());
+  assert(on_disk(["check"]).code == 0, None);
+  let shipped_net = str(at(inspected("std.net.net"), "hash"));
+  project([
+    { path: "mine.ply", text: net() },
+    {
+      path: "app.ply",
+      text: string::replace(importer(), "import std.net (net)", "import mine (net)"),
+    },
+  ]);
+  assert(on_disk(["check"]).code == 0, None);
+  assert(
+    str(at(inspected("mine.net"), "hash")) == shipped_net,
+    Some("an effect declaration is a declaration like any other"),
+  )
+}
+
+test/nondet "a shipped module is filed under its pseudo-path" {
+  program(importer());
+  let r = on_disk(["check"]);
+  assert(r.code == 0, Some(said(r)));
+  // Filed under the name a shipped module is keyed by, which no file on disk has.
+  assert_eq(filed_files("std.net.drain"), ["<std>/net.ply"])
+}
+
+test/nondet "a warm check agrees with a cold one over a program that imports std" {
+  project([{ path: "app.ply", text: importer() }]);
+  let _ = warm_agrees("cold");
+  let warm = warm_agrees("warm");
+  assert(
+    has_named(at(warm, "definitions"), "std.net.drain"),
+    Some("the shipped module is part of the answer: " ++ shown(warm)),
+  )
+}
+
+test/nondet "renaming a project definition that calls std moves no hash" {
+  let before = hashed(app(importer()));
+  let after = hashed(app(string::replace(importer(), "touch", "poke")));
+  assert(
+    hash_of(before, "app.touch") == hash_of(after, "app.poke"),
+    Some("renaming a definition changed its hash"),
+  );
+  assert_eq(hash_of(before, "std.net.drain"), hash_of(after, "std.net.drain"));
+  assert(tests_hashed(before) == tests_hashed(after), Some("a test re-runs"))
+}
+
+test/nondet "a shipped module's tests are not a project's" {
+  let shipped = len(
+    filter(items(at(checked(app(importer())), "tests")), |t: Json|
+      str(at(t, "module")) == "std.net"),
+  );
+  assert(shipped > 0, Some("the fixture needs a shipped test to hide"));
+  program(importer());
+  let v = json_of(on_disk(["test", "--json"]));
+  assert(int(path(v, ["selection", "total"])) == 1, Some(shown(v)));
+  // A shipped test was never in this project's denominator, so it is not "filtered out" either.
+  assert(int(path(v, ["selection", "filtered_out"])) == 0, Some(shown(v)));
+  let all = json_of(on_disk(["test", "--std", "--json"]));
+  assert(int(path(all, ["selection", "total"])) == 1 + shipped, Some(shown(all)));
+  assert(int(at(all, "exit_code")) == 0, Some(shown(all)));
+  // The run wrote nothing about the shipped test, so `--std` still has work to do.
+  assert(int(path(all, ["selection", "cached"])) == 1, Some(shown(all)));
+  assert(int(path(all, ["selection", "selected"])) == shipped, Some(shown(all)))
+}
+
+// A stdlib `main` would make `ply run` ambiguous in a directory the user did not write.
+test/nondet "entry points exclude the shipped modules" {
+  project([{ path: "app.ply", text: "import std.net (net)\nfn main() -> Int = 1\n" }]);
+  let r = on_disk(["run"]);
+  assert(r.code == 0, Some(said(r)));
+  assert(
+    string_trim(match list_at(r.out, len(r.out) - 1) { Some(l) -> l, None -> "" }) == "1",
+    Some(said(r)),
+  )
+}
+
+// The shipped modules in the table's order: sorted, as the shelf files them.
+fn shipped_modules() -> List<Source> =
+  sort_sources(
+    map(filter(shelved(), |s: Source| string_starts_with(s.path, "std.")), |s: Source|
+      { path: string_slice(s.path, 0, string_len(s.path) - 4), text: s.text }),
+  )
+
+fn sort_sources(xs: List<Source>) -> List<Source> =
+  sort_by(xs, |a: Source, b: Source| compare(a.path, b.path) == Less)
+
+test/nondet "ply std lists the modules and prints a stable digest" {
+  let t = app("fn f() -> Int = 1\n");
+  let listing = in_memory(t, ["std"]);
+  assert(listing.code == 0, Some("got:\n" ++ said(listing)));
+  fold(["std.net", "std.json", "digest: b3:"], (), |u: Unit, needle: String|
+    assert(string_contains(said(listing), needle), Some("got:\n" ++ said(listing))));
+  let digest = || stdout(in_memory(t, ["std", "--digest"]));
+  let once = digest();
+  assert(once == digest(), Some("the digest moved between two runs"));
+  assert(string_starts_with(once, "b3:"), Some(once));
+  assert(string_len(string_trim(once)) == 15, Some(once));
+  assert(
+    string_contains(said(listing), string_trim(once)),
+    Some("the two forms disagree:\n" ++ said(listing)),
+  );
+  let v = json_of(in_memory(t, ["std", "--json"]));
+  assert(str(at(v, "digest")) == string_trim(once), Some(shown(v)));
+  let listed = map(items(at(v, "modules")), |m: Json| str(at(m, "module")));
+  assert(listed == map(shipped_modules(), |s: Source| s.path), Some("got:\n" ++ said(listing)));
+  fold(items(at(v, "modules")), (), |u: Unit, m: Json|
+    assert(
+      int(at(m, "definitions")) >= 2,
+      Some("`" ++ str(at(m, "module")) ++ "` lists no definitions"),
+    ))
+}
+
+test/nondet "ply std show written bare prints every shipped source" {
+  let t = app("fn f() -> Int = 1\n");
+  let r = in_memory(t, ["std", "--show"]);
+  assert(r.code == 0, Some("got:\n" ++ said(r)));
+  let every = fold(shipped_modules(), "", |acc: String, s: Source| acc ++ s.text);
+  assert(stdout(r) == every, Some("`--show` did not print every source, back to back"));
+  let v = json_of(in_memory(t, ["std", "--show", "--json"]));
+  assert(
+    map(items(at(v, "sources")), |s: Json| str(at(s, "module")))
+      == map(shipped_modules(), |s: Source| s.path),
+    Some(shown(v)),
+  )
+}
+
+// The `W0605` notices a `ply check` gives.
+fn stdlib_notices() -> List<Json> =
+  filter(items(at(json_of(on_disk(["check", "--json"])), "diagnostics")), |d: Json|
+    str(at(d, "code")) == "W0605")
+
+test/nondet "neither a cold cache nor a warm one warns about the stdlib" {
+  project([{ path: "app.ply", text: importer() }]);
+  assert(stdlib_notices() == [], Some("cold"));
+  assert(stdlib_notices() == [], Some("warm"))
+}
+
+fn reader(drain_name: String) -> String =
+  "import mine (net, " ++ drain_name ++ ")\npub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = "
+    ++ drain_name
+    ++ "[conn](c, b\"\", 1000)\ntest \"reads\" {\n  handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m, t) -> Some(b\"\") }\n}\n"
+
+fn test_hash(answer: Json, label: String) -> String =
+  match filter(items(at(answer, "tests")), |t: Json| string_ends_with(str(at(t, "key")), label)) {
+    [t, ..] -> str(at(t, "hash")),
+    [] -> panic("no test labelled `" ++ label ++ "`"),
+  }
+
+test/nondet "editing one shipped definition moves exactly what reaches it" {
+  let elsewhere = {
+    path: "elsewhere.ply",
+    text: "pub fn untouched() -> Int = 41 + 1\ntest \"untouched\" { assert_eq(untouched(), 42) }\n",
+  };
+  let before = hashed(
+    tree([
+      { path: "mine.ply", text: net() },
+      { path: "reader.ply", text: reader("drain") },
+      elsewhere,
+    ]),
+  );
+  // The edit a compiler upgrade would make: one definition's body, nothing else in the module.
+  let edited = string::replace(
+    net(),
+    "net.recv[l](c, 4096, timeout_ms)",
+    "net.recv[l](c, 8192, timeout_ms)",
+  );
+  assert(edited != net(), Some("the edit landed"));
+  let after = hashed(
+    tree([
+      { path: "mine.ply", text: edited },
+      { path: "reader.ply", text: reader("drain") },
+      elsewhere,
+    ]),
+  );
+  assert(
+    hash_of(before, "mine.drain") != hash_of(after, "mine.drain"),
+    Some("the edited definition"),
+  );
+  assert(
+    hash_of(before, "reader.read_all") != hash_of(after, "reader.read_all"),
+    Some("a reference contributes the referent's hash, so a caller moves with it"),
+  );
+  // Everything else stands: the module's other definitions, and a module that reaches none of them.
+  fold(["mine.head", "mine.tail", "elsewhere.untouched"], (), |u: Unit, name: String|
+    assert(hash_of(before, name) == hash_of(after, name), Some(name)));
+  // And the tests: exactly the one that reaches the edit is re-selected.
+  assert(test_hash(before, "reads") != test_hash(after, "reads"), None);
+  assert(test_hash(before, "untouched") == test_hash(after, "untouched"), None)
+}
+
+// `ply cache compact` walks the files on disk, and a shipped module has none.
+test/nondet "compaction keeps the shipped modules it loaded" {
+  program(importer());
+  let _ = on_disk(["test"]);
+  assert(
+    filed_files("std.net.drain") == ["<std>/net.ply"],
+    Some("the run recorded nothing to compact"),
+  );
+  let r = on_disk(["cache", "compact"]);
+  assert(r.code == 0, Some("got:\n" ++ said(r)));
+  assert(
+    filed_files("std.net.drain") == ["<std>/net.ply"],
+    Some("compaction dropped a module this binary still ships"),
+  )
+}
+
+test/nondet "the shipped modules' own tests and laws all pass" {
+  program(fold(shipped_modules(), "", |acc: String, s: Source| acc ++ "import " ++ s.path ++ "\n"));
+  let tested = json_of(on_disk(["test", "--std", "--json"]));
+  assert(int(at(tested, "exit_code")) == 0, Some(shown(at(tested, "summary"))));
+  assert(int(path(tested, ["summary", "failed"])) == 0, Some(shown(at(tested, "summary"))));
+  assert(
+    int(path(tested, ["summary", "passed"])) > 0,
+    Some("the shipped modules declare no test: " ++ shown(at(tested, "summary"))),
+  );
+  let proved = json_of(on_disk(["prove", "--std", "--json"]));
+  assert(int(at(proved, "exit_code")) == 0, Some(shown(at(proved, "summary"))));
+  assert(items(at(proved, "obligations")) != [], Some("the shipped modules carry no obligation"))
+}
+
+test/nondet "a shipped module's laws are not a project's" {
+  program("import std.json\npub fn twice(n: Int) -> Int ensures result == n + n = n * 2\n");
+  let mine = json_of(on_disk(["prove", "--json"]));
+  let all = json_of(on_disk(["prove", "--std", "--json"]));
+  assert(int(at(mine, "exit_code")) == 0, Some(shown(mine)));
+  let owners = map(items(at(mine, "obligations")), |o: Json| str(at(o, "owner")));
+  assert(owners == ["app.twice"] || owners == ["m.twice"], Some(shown(mine)));
+  assert(len(items(at(all, "obligations"))) > len(owners), Some("`--std` adds nothing"));
+  // The coverage denominator is the project's definitions, not the stdlib's.
+  assert(int(path(mine, ["coverage", "definitions"])) == 1, Some(shown(mine)));
+  assert(int(path(all, ["coverage", "definitions"])) > 100, Some(shown(at(all, "coverage"))))
+}
+
+fn routed(literal: String) -> String =
+  "import std.router\nimport std.http\npub type Endpoint = Health | GetItem\npub fn table() -> List<router::Route<Endpoint>> = [\n  {method: http::Get, path: router::pattern_of_string(\"/health\"), endpoint: Health},\n  {method: http::Get, path: router::pattern_of_string(\"/items/{sku}\"), endpoint: GetItem},\n]\npub fn slug(s: String) -> String = string_concat(\""
+    ++ literal
+    ++ "\", s)\npub fn hits(p: String) -> Bool =\n  match router::route(table(), http::Get, p) {\n    router::Found(_) -> true,\n    _ -> false,\n  }\ntest \"the table routes an item\" { assert_eq(hits(slug(\"bolt\")), true) }\n"
+
+// A shipped module's tests are never resolved without `--std`, so its definitions must not stay
+// permanently "changed".
+test/nondet "a shipped definition the project never touched is not a suspect" {
+  project([{ path: "app.ply", text: routed("/items/") }]);
+  let first_run = on_disk(["test"]);
+  assert(first_run.code == 0, Some(said(first_run)));
+  // One edit, to one definition the project owns.
+  write("app.ply", routed("/goods/"));
+  let v = json_of(on_disk(["test", "--json"]));
+  let failure = nth(at(v, "failures"), 0);
+  let suspects = map(items(at(failure, "suspects")), |s: Json| str(at(s, "name")));
+  assert(suspects != [], Some("the edit has to be attributed to something: " ++ shown(v)));
+  let shipped = filter(suspects, |n: String| string_starts_with(n, "std."));
+  assert(
+    shipped == [],
+    Some(
+      "nothing under `std` moved, so nothing under `std` is a suspect: "
+        ++ string::join(shipped, ", "),
+    ),
+  );
+  assert(str(nth(path(failure, ["culprit", "definitions"]), 0)) == "app.slug", Some(shown(v)))
+}
+
+// `std.http` with each run of whitespace squeezed to one space, and to none inside a brace, so that
+// the scrapes below ask what it says rather than how the formatter laid it out.
+fn shipped_http() -> String = {
+  let source = bytes_of_string(repo_file("crates/ply-std/ply/http.ply"));
+  string_of_bytes(
+    fold(range(0, bytes_len(source)), b"", |out: Bytes, i: Int| {
+      let c = bytes_at(source, i);
+      let last = if bytes_len(out) == 0 { 0 } else { bytes_at(out, bytes_len(out) - 1) };
+      if c == 32 || c == 10 || c == 9 || c == 13 {
+        if bytes_len(out) == 0 || last == 32 || last == 123 { out } else { bytes_concat(out, b" ") }
+      } else if c == 125 && last == 32 {
+        bytes_concat(bytes_slice(out, 0, bytes_len(out) - 1), b"}")
+      } else { bytes_concat(out, byte_of_int(c)) }
+    }),
+  )
+}
+
+fn after(text: String, marker: String) -> String =
+  match string::split_once(text, marker) {
+    Some(p) -> p.tail,
+    None -> panic("`" ++ marker ++ "` is not in std.http"),
+  }
+
+fn before(text: String, marker: String) -> String =
+  match string::split_once(text, marker) { Some(p) -> p.head, None -> text }
+
+fn limits_fields() -> List<String> = {
+  let block = before(after(shipped_http(), "pub type Limits = {"), "}");
+  let fields = fold(string_split(block, ","), [], |acc: List<String>, field: String|
+    match string::split_once(field, ":") {
+      Some(p) -> push(acc, string_trim(p.head)),
+      None -> acc,
+    });
+  assert(
+    len(fields) >= 13,
+    Some(
+      "`Limits` shrank to " ++ int_to_string(len(fields))
+        ++ " fields; these tests are about the cost of it growing",
+    ),
+  );
+  fields
+}
+
+type Spread = { base: String, fields: List<{ name: String, value: String }> }
+
+// `func`'s `{..base, name: value, ..}` as written: the base, then each field it names.
+fn record_update(func: String) -> Spread = {
+  let body = after(shipped_http(), "fn " ++ func ++ "(");
+  let inner = before(after(body, "{.."), "}");
+  match filter(map(string_split(inner, ","), string_trim), |p: String| p != "") {
+    [] -> panic("a spread names its base"),
+    [base, ..rest] ->
+      {
+        base: base,
+        fields: map(rest, |part: String|
+          match string::split_once(part, ":") {
+            Some(p) -> { name: string_trim(p.head), value: string_trim(p.tail) },
+            None -> panic("`" ++ part ++ "` in `" ++ func ++ "` is not `name: value`"),
+          }),
+      },
+  }
+}
+
+// The field of `base` this value reads, if it reads one directly.
+fn read_of_base(value: String, base: String) -> Option<String> =
+  if string_starts_with(value, base ++ ".") {
+    let rest = string_slice(value, string_len(base) + 1, string_len(value));
+    if string_contains(rest, ".") { None } else { Some(rest) }
+  } else { None }
+
+// Every `Limits` field `func` names must be one it deliberately varies; the spread copies the rest.
+fn copies_every_limit_it_does_not_vary(
+  func: String,
+  base: String,
+  varied: List<{ name: String, from: Option<String> }>,
+) -> Unit = {
+  let spread = record_update(func);
+  assert(
+    spread.base == base,
+    Some("`" ++ func ++ "` spreads `" ++ spread.base ++ "`, not `" ++ base ++ "`"),
+  );
+  let limits = limits_fields();
+  fold(spread.fields, (), |u: Unit, f: { name: String, value: String }|
+    assert(
+      len(filter(limits, |l: String| l == f.name)) > 0,
+      Some("`" ++ func ++ "` sets `" ++ f.name ++ "`, which `Limits` does not have"),
+    ));
+  let actual = fold(
+    spread.fields,
+    [],
+    |acc: List<{ name: String, from: Option<String> }>, f: { name: String, value: String }|
+      match read_of_base(f.value, base) {
+        Some(from) -> if from == f.name { acc }
+        else { push(acc, { name: f.name, from: Some(from) }) },
+        None -> push(acc, { name: f.name, from: None }),
+      },
+  );
+  assert(
+    actual == varied,
+    Some(
+      "in `" ++ func ++ "`, exactly these bounds may differ from `" ++ base
+        ++ "`'s bound of their own name; anything else here is a mispaired limit",
+    ),
+  )
+}
+
+test/nondet "chunk_trailers copies every limit it does not replace" {
+  copies_every_limit_it_does_not_vary("chunk_trailers", "state.limits", [
+    { name: "max_header_bytes", from: Some("max_trailer_bytes") },
+  ])
+}
+
+test/nondet "the limits helpers vary only the bounds they are named for" {
+  copies_every_limit_it_does_not_vary("limits_keeping", "base", [
+    { name: "max_keep_alive", from: None },
+  ]);
+  copies_every_limit_it_does_not_vary("limits_streaming", "base", [
+    { name: "max_stream_chunks", from: None },
+  ]);
+  copies_every_limit_it_does_not_vary(
+    "limits_with",
+    "base",
+    map(
+      [
+        "max_request_line",
+        "max_header_bytes",
+        "max_header_count",
+        "max_body",
+        "max_chunk_size",
+        "max_chunk_line",
+        "max_trailer_bytes",
+      ],
+      |n: String| { name: n, from: None },
+    ),
+  )
+}
+
+// Its seven written bounds are all `Int` parameters, so `max_chunk_size: chunk_line` would
+// type-check.
+test/nondet "limits_with pairs each bound with the parameter named after it" {
+  let params = fold(
+    string_split(before(after(shipped_http(), "fn limits_with("), ")"), ","),
+    [],
+    |acc: List<String>, p: String|
+      match string::split_once(p, ":") { Some(x) -> push(acc, string_trim(x.head)), None -> acc },
+  );
+  let paired = fold(
+    record_update("limits_with").fields,
+    0,
+    |n: Int, f: { name: String, value: String }|
+      if len(filter(params, |p: String| p == f.value)) == 0 { n } else {
+        assert(
+          f.name == "max_" ++ f.value,
+          Some(
+            "`limits_with` passes `" ++ f.value ++ "` as `" ++ f.name
+              ++ "`, and every `Limits` field is `Int`, so nothing else would have caught it",
+          ),
+        );
+        n + 1
+      },
+  );
+  assert(
+    paired == len(params),
+    Some("every parameter of `limits_with` must reach a bound, or one of them is dead"),
+  )
+}

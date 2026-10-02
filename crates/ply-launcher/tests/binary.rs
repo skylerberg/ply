@@ -1,7 +1,7 @@
 //! Keeps `target/debug/ply` built. Cargo builds a package's binaries only for
-//! that package's own integration tests, and the suite that drives the binary
-//! lives in `crates/ply-cli-tests`. Without an integration test here, that
-//! suite would find no `ply` to run.
+//! that package's own integration tests, and the suites that drive the binary
+//! are Ply packages, the CLI's in `crates/ply-cli-tests/ply` among them. Without
+//! an integration test here, they would find no `ply` to run.
 
 use assert_cmd::Command;
 

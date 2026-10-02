@@ -1,0 +1,895 @@
+// Every test drives `ply` from this module, and no other names it. Three ways, cheapest first:
+// `in_memory` runs the program over a tree held as a value; `on_disk` runs it in the scratch
+// directory the run was started in, through the machine families `--allow` lends; `spawned` starts
+// the binary `--exec ply` names, for what only a process has: the launcher, its environment and
+// exit codes, signals, and the output of a program it runs. `serving` leaves one running for a
+// test to talk to over a socket.
+
+import cli.ply (main)
+import cli.paths
+import cli.program (timed_uncached)
+import compiler.pkg (Supplied)
+import compiler.resolve (Pkg)
+import cli.bootstrap (archive)
+import cli.builder (builder)
+import cli.claims (prover)
+import cli.env (env)
+import cli.hosts (tcb)
+import cli.machine (machine)
+import cli.replace (edit)
+import cli.tester (tester)
+import std.bytes (hex_of)
+import std.config (config)
+import std.fs
+import std.fs (fs, MemFs, Entry, File)
+import std.json
+import std.json (Json, Null, Number, Str, Array, Object)
+import std.list (sort_by)
+import std.net
+import std.net (net)
+import std.random (entropy)
+import std.process (process, Var, Finished, Exited, Signalled, Captured, captured, args_step,
+                    out_step, err_step, exit_step, Keep, Lines, Discard, Said, Signal, Kill)
+import std.time (time)
+
+// --- What a run said ---------------------------------------------------------
+
+// The lines a run wrote to each stream, and the code it ended with: a signal's as a shell reports
+// it, 128 and the signal's number.
+pub type Ran = { out: List<String>, err: List<String>, code: Int }
+
+fn ran_of(c: Captured) -> Ran =
+  { out: c.out, err: c.err, code: match c.code { Some(n) -> n, None -> 0 } }
+
+// A stream as a process writes it: every line ended by a newline.
+pub fn text(lines: List<String>) -> String =
+  fold(lines, "", |acc: String, l: String| acc ++ l ++ "\n")
+
+pub fn stdout(r: Ran) -> String = text(r.out)
+
+pub fn stderr(r: Ran) -> String = text(r.err)
+
+// Both streams, the output first: what a test searches when it does not care which said it.
+pub fn said(r: Ran) -> String = stdout(r) ++ stderr(r)
+
+// The one document `--json` writes on the output stream.
+pub fn json_of(r: Ran) -> Json =
+  match json::parse_string(stdout(r)) {
+    Ok(j) -> j,
+    Err(e) ->
+      panic("`--json` wrote no one document: " ++ json::error_to_string(e) ++ "\n" ++ said(r)),
+  }
+
+// --- Reading a report --------------------------------------------------------
+
+// A member, or `Null` when there is none, as a reader of a report wants.
+pub fn at(j: Json, name: String) -> Json = match json::get(j, name) { Some(v) -> v, None -> Null }
+
+pub fn path(j: Json, names: List<String>) -> Json = fold(names, j, at)
+
+pub fn nth(j: Json, i: Int) -> Json =
+  match j { Array(xs) -> match list_at(xs, i) { Some(v) -> v, None -> Null }, _ -> Null }
+
+pub fn items(j: Json) -> List<Json> = match j { Array(xs) -> xs, _ -> [] }
+
+// The first of a list, or `Null` for an empty one.
+pub fn first(xs: List<Json>) -> Json = match list_at(xs, 0) { Some(x) -> x, None -> Null }
+
+pub fn str(j: Json) -> String = match j { Str(s) -> s, _ -> "" }
+
+// `-1` for anything but a whole number, which no count or code a report carries is.
+pub fn int(j: Json) -> Int =
+  match j { Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> -1 }, _ -> -1 }
+
+pub fn truth(j: Json) -> Bool = match j { json::Bool(b) -> b, _ -> false }
+
+pub fn shown(j: Json) -> String = json::to_string(j)
+
+// --- The working directory ---------------------------------------------------
+
+// What a scratch directory holds to say it may be emptied.
+pub fn scratch_marker() -> String = ".ply-scratch"
+
+// A file of a project: its path from the project's directory, and its text.
+pub type Source = { path: String, text: String }
+
+// The working directory emptied for one test, its marker kept. One without the marker is never
+// emptied: a run started anywhere else deletes nothing.
+pub fn fresh() -> Unit =
+  match fs.list_dir[cwd](".") {
+    None -> panic("the working directory cannot be listed"),
+    Some(names) -> if !contains_text(names, scratch_marker()) {
+      panic(
+        "`on_disk` empties the working directory, and this one holds no `" ++ scratch_marker()
+          ++ "`: start `ply test` in a scratch directory that holds one",
+      )
+    } else {
+      fold(names, (), |u: Unit, name: String|
+        if name == scratch_marker() || fs.remove_tree[cwd](name) { u }
+        else { panic("could not empty the working directory of `" ++ name ++ "`") })
+    },
+  }
+
+// `text` at `path` under the working directory, every directory above it made.
+pub fn write(path: String, text: String) -> Unit = {
+  let dir = parent(path);
+  if dir != "" && !fs.create_dir[cwd](dir) { panic("could not make `" ++ dir ++ "`") };
+  if !fs.write_file[cwd](path, bytes_of_string(text)) { panic("could not write `" ++ path ++ "`") }
+}
+
+// A fresh working directory holding `files`.
+pub fn project(files: List<Source>) -> Unit = {
+  fresh();
+  fold(files, (), |u: Unit, f: Source| write(f.path, f.text))
+}
+
+// A fresh working directory holding one module, `m.ply`.
+pub fn program(text: String) -> Unit = project([{ path: "m.ply", text: text }])
+
+// What a file under the working directory holds, as text.
+pub fn read(path: String) -> Option<String> =
+  match fs.read_file[cwd](path) { Some(b) -> Some(string_of_bytes(b)), None -> None }
+
+// The working directory's absolute path, which is the run's own.
+pub fn working() -> String =
+  match fs.canonical[cwd](".") { Some(p) -> p, None -> panic("the working directory has no path") }
+
+// The repository's absolute path, which a test hands `ply` to reach a tree it ships.
+pub fn repo() -> String =
+  match fs.canonical[repo](".") {
+    Some(p) -> p,
+    None -> panic("`--fs repo=PATH` names the repository"),
+  }
+
+// A file the repository holds, as text.
+pub fn repo_file(path: String) -> String =
+  match fs.read_file[repo](path) {
+    Some(b) -> string_of_bytes(b),
+    None -> panic("the repository holds no `" ++ path ++ "`"),
+  }
+
+// The files under a directory the repository holds, by their paths below it, its caches left behind.
+pub fn repo_sources(from: String) -> List<Source> =
+  match fs.walk[repo](from) {
+    None -> panic("the repository holds no directory `" ++ from ++ "`"),
+    Some(entries) ->
+      fold(entries, [], |acc: List<Source>, e: fs::Entry| {
+        let rest = string_slice(e.path, string_len(from) + 1, string_len(e.path));
+        if e.kind != fs::File || is_cached(rest) { acc }
+        else { push(acc, { path: rest, text: repo_file(e.path) }) }
+      }),
+  }
+
+// A tree the repository holds, copied into the working directory under `to`, its caches left behind.
+pub fn copy_from_repo(from: String, to: String) -> Unit =
+  match fs.walk[repo](from) {
+    None -> panic("the repository holds no directory `" ++ from ++ "`"),
+    Some(entries) ->
+      fold(entries, (), |u: Unit, e: fs::Entry| {
+        let rest = string_slice(e.path, string_len(from) + 1, string_len(e.path));
+        if is_cached(rest) { u } else {
+          match e.kind {
+            fs::Dir -> if fs.create_dir[cwd](joined(to, rest)) { u }
+            else { panic("could not make `" ++ joined(to, rest) ++ "`") },
+            fs::File -> match fs.read_file[repo](e.path) {
+              Some(body) -> write(joined(to, rest), string_of_bytes(body)),
+              None -> panic("could not read `" ++ e.path ++ "`"),
+            },
+            _ -> u,
+          }
+        }
+      }),
+  }
+
+// A hidden segment is a cache's or a tool's, never a source.
+fn is_cached(rest: String) -> Bool =
+  fold(string_split(rest, "/"), false, |hit: Bool, s: String| hit || string_starts_with(s, "."))
+
+// --- Warm and cold -----------------------------------------------------------
+
+// Every source under the working directory, and nothing a cache or the scratch marker holds.
+pub fn sources_here() -> List<Source> =
+  match fs.walk[cwd](".") {
+    Some(entries) ->
+      fold(entries, [], |acc: List<Source>, e: Entry|
+        if e.kind != File || is_cached(e.path) { acc } else {
+          match read(e.path) { Some(t) -> push(acc, { path: e.path, text: t }), None -> acc }
+        }),
+    None -> panic("the working directory walks"),
+  }
+
+// The cache's own diagnostics, which two checks of one program may differ by.
+fn about_the_cache() -> List<String> = ["W0601", "W0602", "W0603", "W0605"]
+
+fn without(j: Json, keys: List<String>) -> Json =
+  match j {
+    Object(m) -> Object(fold(keys, m, |acc: Map<String, Json>, k: String| map_remove(acc, k))),
+    other -> other,
+  }
+
+// What `ply check --explain --json` answered, less what two runs of one program may differ by:
+// where the project is, what each phase cost and where its answer came from, and the cache's
+// warnings.
+pub fn comparable(v: Json) -> Json =
+  match without(v, ["root", "files", "front_end"]) {
+    Object(m) ->
+      Object(
+        map_insert(
+          map_insert(
+            m,
+            "modules",
+            Array(map(items(at(v, "modules")), |x: Json| without(x, ["file"]))),
+          ),
+          "diagnostics",
+          Array(
+            filter(items(at(v, "diagnostics")), |d: Json|
+              !contains_text(about_the_cache(), str(at(d, "code")))),
+          ),
+        ),
+      ),
+    other -> other,
+  }
+
+// The working directory's program checked as it stands: seeded from its cache and filing into it.
+pub fn check_answer() -> Json = comparable(json_of(on_disk(["check", "--explain", "--json"])))
+
+// The same sources checked from nothing: in memory, beside no cache.
+pub fn cold_answer() -> Json =
+  comparable(json_of(in_memory(tree(sources_here()), ["check", "--explain", "--json"])))
+
+// A check seeded from the cache answers what a cold check of the same sources does. The warm run
+// goes first, so the cache it reads is the one the last step left.
+pub fn warm_agrees(what: String) -> Json = {
+  let warm = check_answer();
+  let cold = cold_answer();
+  assert(
+    warm == cold,
+    Some(
+      what
+        ++ ": a check seeded from the cache answered differently from one that started cold\nwarm: "
+        ++ shown(warm)
+        ++ "\ncold: "
+        ++ shown(cold),
+    ),
+  );
+  warm
+}
+
+// How many definitions a check took from the cache, and how many it checked.
+pub type Seeding = { seeded: Int, checked: Int }
+
+pub fn seeding() -> Seeding = seeding_at(".")
+
+// The same of the project at `dir`.
+pub fn seeding_at(dir: String) -> Seeding = {
+  let d = path(json_of(on_disk(["check", dir, "--json"])), ["front_end", "definitions"]);
+  { seeded: int(at(d, "seeded")), checked: int(at(d, "checked")) }
+}
+
+// A package as the front end publishes it: its prefix and the prefixes it depends on.
+pub type Package = { prefix: String, deps: List<String> }
+
+// A load of a package's directory: the package closure it resolves, the root first, and the
+// directory each package of it was read from, the root's first.
+pub type Closure = { packages: List<Package>, dirs: List<String> }
+
+// `dir` loaded as `ply` loads it.
+pub fn loaded_closure(dir: String) -> Closure = {
+  let pwd = working();
+  handle {
+    let program = timed_uncached([paths::resolve(dir)]).program;
+    match program.whole {
+      Some(w) ->
+        {
+          packages: map(w.packages, |p: Pkg|
+            { prefix: string_of_bytes(p.prefix), deps: map(p.deps, string_of_bytes) }),
+          dirs: fold(
+            program.pkgs.supplied,
+            [string_of_bytes(program.pkgs.root)],
+            |acc: List<String>, s: Supplied| push(acc, string_of_bytes(s.root)),
+          ),
+        },
+      None -> panic("`" ++ dir ++ "` does not load"),
+    }
+  } with {
+    env.pwd[sys]() -> pwd,
+    fs.list_dir[shelf](_) -> shelf_names(),
+    fs.read_file[shelf](name) -> shelf_file(name),
+  }
+}
+
+// The package closure a load of `dir` resolves, the root first.
+pub fn closure_of(dir: String) -> List<Package> = loaded_closure(dir).packages
+
+// --- The shipped modules -----------------------------------------------------
+
+// Where the launcher's shelf comes from: the modules this binary ships, as files.
+fn shelves() -> List<{ prefix: String, dir: String }> =
+  [
+    { prefix: "std.", dir: "crates/ply-std/ply" },
+    { prefix: "compiler.", dir: "crates/ply-compiler/ply" },
+  ]
+
+// The shelf as the launcher lays it out: one flat directory of `<dotted name>.ply`.
+fn shelf_names() -> Option<List<String>> =
+  Some(
+    fold(shelves(), [], |acc: List<String>, s: { prefix: String, dir: String }|
+      match fs.list_dir[repo](s.dir) {
+        Some(names) ->
+          fold(names, acc, |a: List<String>, n: String|
+            if string_ends_with(n, ".ply") { push(a, s.prefix ++ n) } else { a }),
+        None -> acc,
+      }),
+  )
+
+// Every module the shelf files, by the name it files it under.
+pub fn shelved() -> List<Source> =
+  match shelf_names() {
+    Some(names) ->
+      map(names, |n: String|
+        { path: n, text: match shelf_file(n) { Some(b) -> string_of_bytes(b), None -> "" } }),
+    None -> [],
+  }
+
+fn shelf_file(name: String) -> Option<Bytes> =
+  fold(shelves(), None, |found: Option<Bytes>, s: { prefix: String, dir: String }|
+    match found {
+      Some(_) -> found,
+      None -> if string_starts_with(name, s.prefix) {
+        fs.read_file[repo](
+          s.dir ++ "/" ++ string_slice(name, string_len(s.prefix), string_len(name)),
+        )
+      } else { None },
+    })
+
+// The binary's version: the workspace's, which `Cargo.toml` gives and the launcher reports.
+pub fn version() -> String =
+  match fs.read_file[repo]("Cargo.toml") {
+    None -> panic("`--fs repo=PATH` names the repository, and it holds no `Cargo.toml`"),
+    Some(toml) ->
+      fold(string_split(string_of_bytes(toml), "\n"), "", |found: String, line: String|
+        if found == "" && string_starts_with(line, "version = \"") {
+          string_slice(line, 11, string_len(line) - 1)
+        } else { found }),
+  }
+
+// The packages the `ply` program run in this process is built from, beside the shelf it is handed.
+pub fn program_packages() -> List<String> =
+  [
+    "crates/ply-cli/ply",
+    "crates/ply-test/ply",
+    "crates/ply-sim/ply",
+    "crates/ply-store/ply",
+    "crates/ply-prove/ply",
+  ]
+
+// Every tree a `ply` binary ships: the shelf's and the program's.
+pub fn shipped_dirs() -> List<String> =
+  concatenated(map(shelves(), |s: { prefix: String, dir: String }| s.dir), program_packages())
+
+// What the `ply` program run in this process is a function of, as the launcher's stamp is of the
+// one it ships: the binary's version, the shelf, and the program's own sources. A run's reuse key
+// carries it, so nothing filed by another toolchain is taken for this one's.
+pub fn in_process_digest() -> String = {
+  let own = fold(program_packages(), [], |acc: List<Source>, dir: String|
+    concatenated(
+      acc,
+      map(repo_sources(dir), |f: Source| { path: dir ++ "/" ++ f.path, text: f.text }),
+    ));
+  let all = sort_by(concatenated(shelved(), own), |a: Source, b: Source|
+    compare(a.path, b.path) == Less);
+  hex_of(
+    bytes_blake3(
+      bytes_concat_all(
+        push(
+          map(all, |f: Source|
+            bytes_concat_all([
+              bytes_of_string(f.path),
+              b"\0",
+              bytes_blake3(bytes_of_string(f.text)),
+            ])),
+          bytes_of_string(version()),
+        ),
+      ),
+    ),
+  )
+}
+
+// --- In memory ---------------------------------------------------------------
+
+// Where a tree in memory sits: its root is the filesystem's, and the run's working directory is
+// `/w`, so a test can place a file beside the project as well as in it.
+pub fn memory_pwd() -> String = "/w"
+
+// A tree whose working directory holds `files`.
+pub fn tree(files: List<Source>) -> MemFs =
+  fold(files, fs::mem_create_dir(fs::mem_empty(), "w").fs, |t: MemFs, f: Source| {
+    let at = "w/" ++ f.path;
+    fs::mem_write(fs::mem_create_dir(t, parent(at)).fs, at, bytes_of_string(f.text)).fs
+  })
+
+// A tree whose working directory holds one module, `m.ply`.
+pub fn one(text: String) -> MemFs = tree([{ path: "m.ply", text: text }])
+
+// What a file under a tree's working directory holds, as text.
+pub fn file_of(t: MemFs, path: String) -> Option<String> =
+  match fs::mem_read(t, in_w(path)) { Some(b) -> Some(string_of_bytes(b)), None -> None }
+
+// What a run in memory said, and the tree it left.
+pub type Kept = { ran: Ran, tree: MemFs }
+
+// `ply` over `t`, nothing leaving the tree: its answer is a function of the tree and the line. A
+// command that would drive a machine panics, because only `on_disk` lends one.
+pub fn in_memory(t: MemFs, argv: List<String>) -> Ran = kept_in_memory(t, argv, [], None).ran
+
+// `stdin` is what `ply replace` reads when no `--with` names a file.
+// The row is written so an operation `main` gains and this handler misses is a type error, not a
+// run that reaches the disk.
+pub fn kept_in_memory(
+  t: MemFs,
+  argv: List<String>,
+  vars: List<Var>,
+  stdin: Option<String>,
+) -> Kept / {fs.read_file[repo], fs.list_dir[repo], fs.walk[repo]} =
+  with_cell[mem_io](captured(argv)) { io ->
+    with_cell[mem_disk](t) { disk ->
+      with_cell[mem_entropy](0) { drawn -> {
+        let kept = |w: fs::Written| {
+          cell_set(disk, w.fs);
+          w.ok
+        };
+        let appended = |a: fs::Appended| {
+          cell_set(disk, a.fs);
+          a.at
+        };
+        let made = |m: fs::Made, working: Bool| {
+          cell_set(disk, m.fs);
+          match m.path { Some(p) -> Some(if working { out_of_w(p) } else { p }), None -> None }
+        };
+        handle {
+          main()
+        } with {
+          process.args[proc]() -> args_step(cell_get(io)),
+          process.out[proc](line) -> cell_set(io, out_step(cell_get(io), line)),
+          process.err[proc](line) -> cell_set(io, err_step(cell_get(io), line)),
+          process.exit[proc](code) resume k -> cell_set(io, exit_step(cell_get(io), code)),
+          env.var[sys](name) -> var_of(vars, name),
+          env.vars[sys]() -> vars,
+          env.terminal[sys](_) -> false,
+          env.binary_version[sys]() -> version(),
+          env.pwd[sys]() -> memory_pwd(),
+          env.shipped_digest[sys]() -> in_process_digest(),
+          fs.kind[cwd](p) -> fs::mem_kind(cell_get(disk), in_w(p)),
+          fs.kind[abs](p) -> fs::mem_kind(cell_get(disk), p),
+          fs.resolved[cwd](p) -> fs::mem_resolved(cell_get(disk), in_w(p)),
+          fs.resolved[abs](p) -> fs::mem_resolved(cell_get(disk), p),
+          fs.list_dir[cwd](p) -> fs::mem_list(cell_get(disk), in_w(p)),
+          fs.list_dir[abs](p) -> fs::mem_list(cell_get(disk), p),
+          fs.read_file[cwd](p) -> fs::mem_read(cell_get(disk), in_w(p)),
+          fs.read_file[abs](p) -> fs::mem_read(cell_get(disk), p),
+          fs.file_size[cwd](p) -> fs::mem_size(cell_get(disk), in_w(p)),
+          fs.file_size[abs](p) -> fs::mem_size(cell_get(disk), p),
+          fs.modified_ms[cwd](p) -> fs::mem_modified(cell_get(disk), in_w(p)),
+          fs.modified_ms[abs](p) -> fs::mem_modified(cell_get(disk), p),
+          fs.write_file[cwd](p, body) -> kept(fs::mem_write(cell_get(disk), in_w(p), body)),
+          fs.write_file[abs](p, body) -> kept(fs::mem_write(cell_get(disk), p, body)),
+          fs.create_dir[cwd](p) -> kept(fs::mem_create_dir(cell_get(disk), in_w(p))),
+          fs.create_dir[abs](p) -> kept(fs::mem_create_dir(cell_get(disk), p)),
+          fs.remove[cwd](p) -> kept(fs::mem_remove(cell_get(disk), in_w(p))),
+          fs.remove[abs](p) -> kept(fs::mem_remove(cell_get(disk), p)),
+          fs.rename[cwd](from, to) -> kept(fs::mem_rename(cell_get(disk), in_w(from), in_w(to))),
+          fs.rename[abs](from, to) -> kept(fs::mem_rename(cell_get(disk), from, to)),
+          fs.read_at[cwd](p, at, n) -> fs::mem_read_at(cell_get(disk), in_w(p), at, n),
+          fs.read_at[abs](p, at, n) -> fs::mem_read_at(cell_get(disk), p, at, n),
+          fs.exists[cwd](p) -> fs::mem_exists(cell_get(disk), in_w(p)),
+          fs.exists[abs](p) -> fs::mem_exists(cell_get(disk), p),
+          fs.canonical[cwd](p) -> fs::mem_canonical(cell_get(disk), "", in_w(p)),
+          fs.canonical[abs](p) -> fs::mem_canonical(cell_get(disk), "", p),
+          fs.mode[cwd](p) -> fs::mem_mode(cell_get(disk), in_w(p)),
+          fs.mode[abs](p) -> fs::mem_mode(cell_get(disk), p),
+          fs.read_link[cwd](p) -> fs::mem_read_link(cell_get(disk), in_w(p)),
+          fs.read_link[abs](p) -> fs::mem_read_link(cell_get(disk), p),
+          fs.walk[cwd](p) -> match fs::mem_walk(cell_get(disk), in_w(p)) {
+            Some(es) -> Some(map(es, |e: Entry| { ..e, path: out_of_w(e.path) })),
+            None -> None,
+          },
+          fs.walk[abs](p) -> fs::mem_walk(cell_get(disk), p),
+          fs.append[cwd](p, body) -> appended(fs::mem_append(cell_get(disk), in_w(p), body)),
+          fs.append[abs](p, body) -> appended(fs::mem_append(cell_get(disk), p, body)),
+          fs.sync[cwd](p) -> fs::mem_sync(cell_get(disk), in_w(p)),
+          fs.sync[abs](p) -> fs::mem_sync(cell_get(disk), p),
+          fs.lock[cwd](p) -> kept(fs::mem_lock(cell_get(disk), in_w(p))),
+          fs.lock[abs](p) -> kept(fs::mem_lock(cell_get(disk), p)),
+          fs.unlock[cwd](p) -> kept(fs::mem_unlock(cell_get(disk), in_w(p))),
+          fs.unlock[abs](p) -> kept(fs::mem_unlock(cell_get(disk), p)),
+          fs.copy[cwd](from, to) -> kept(fs::mem_copy(cell_get(disk), in_w(from), in_w(to))),
+          fs.copy[abs](from, to) -> kept(fs::mem_copy(cell_get(disk), from, to)),
+          fs.remove_tree[cwd](p) -> kept(fs::mem_remove_tree(cell_get(disk), in_w(p))),
+          fs.remove_tree[abs](p) -> kept(fs::mem_remove_tree(cell_get(disk), p)),
+          fs.temp_dir[cwd](dir, prefix) ->
+            made(fs::mem_temp_dir(cell_get(disk), in_w(dir), prefix), true),
+          fs.temp_dir[abs](dir, prefix) ->
+            made(fs::mem_temp_dir(cell_get(disk), dir, prefix), false),
+          fs.set_mode[cwd](p, m) -> kept(fs::mem_set_mode(cell_get(disk), in_w(p), m)),
+          fs.set_mode[abs](p, m) -> kept(fs::mem_set_mode(cell_get(disk), p, m)),
+          fs.symlink[cwd](p, to) -> kept(fs::mem_symlink(cell_get(disk), in_w(p), to)),
+          fs.symlink[abs](p, to) -> kept(fs::mem_symlink(cell_get(disk), p, to)),
+          fs.set_modified[cwd](p, ms) -> kept(fs::mem_set_modified(cell_get(disk), in_w(p), ms)),
+          fs.set_modified[abs](p, ms) -> kept(fs::mem_set_modified(cell_get(disk), p, ms)),
+          fs.list_dir[shelf](_) -> shelf_names(),
+          fs.read_file[shelf](name) -> shelf_file(name),
+          entropy.next() -> {
+            let n = cell_get(drawn);
+            cell_set(drawn, n + 1);
+            n
+          },
+          time.now_ms() -> 0,
+          time.elapsed_ms() -> 0,
+          time.elapsed_us() -> 0,
+          time.sleep_ms(_) -> panic("`--watch` waits on a disk; in memory nothing changes"),
+          edit.item[replace](from) ->
+            replacement(from, stdin, |file: String|
+              match fs::mem_read(cell_get(disk), in_w(file)) {
+                Some(b) -> Some(string_of_bytes(b)),
+                None -> None,
+              }),
+          builder.git[vcs](_, _) -> panic(no_machine("git")),
+          builder.loaded[build](_, _) -> panic(no_machine("the builder")),
+          builder.made[build](_, _, _) -> panic(no_machine("the builder")),
+          builder.previous[build](_) -> panic(no_machine("the builder")),
+          builder.stored[build](_, _) -> panic(no_machine("the builder")),
+          builder.unit[build](_) -> panic(no_machine("the builder")),
+          archive.emitted[bootstrap](_) -> panic(no_machine("the emitter")),
+          tcb.schema[host](_, _, _) -> panic(no_machine("the host binding")),
+          tcb.preview[host](_, _, _, _) -> panic(no_machine("the host binding")),
+          machine.configure[run](_) -> (),
+          machine.load[run](_, _, _) -> panic(no_machine("the machine")),
+          machine.reuse[run](_, _) -> panic(no_machine("the machine")),
+          machine.reload[run](_) -> panic(no_machine("the machine")),
+          machine.schema[run](_) -> panic(no_machine("the machine")),
+          machine.bound[run](_, _) -> panic(no_machine("the machine")),
+          machine.enter[run]() -> panic(no_machine("the machine")),
+          machine.drop[run]() -> (),
+          tester.configure[corpus](_) -> (),
+          tester.unit[corpus](_, _, _) -> panic(no_machine("the tester")),
+          tester.schema[corpus](_) -> panic(no_machine("the tester")),
+          tester.bound[corpus](_) -> panic(no_machine("the tester")),
+          tester.hosted[corpus]() -> panic(no_machine("the tester")),
+          tester.ended[corpus]() -> (),
+          tester.executed[corpus](_, _) -> panic(no_machine("the tester")),
+          tester.interleaved[corpus](_, _, _, _, _) -> panic(no_machine("the tester")),
+          prover.configure[claims](_, _, _) -> (),
+          prover.collected[claims]() -> panic(no_machine("the prover")),
+          prover.schema[claims](_) -> panic(no_machine("the prover")),
+          prover.prepared[claims](_, _) -> panic(no_machine("the prover")),
+          prover.judged[claims](_) -> panic(no_machine("the prover")),
+          prover.interleaved[claims](_, _, _, _) -> panic(no_machine("the prover")),
+          prover.ended[claims]() -> panic(no_machine("the prover")),
+          net.connect[registry](_, _, _) -> panic(no_machine("a registry")),
+          net.connect_tls[registry](_, _, _) -> panic(no_machine("a registry")),
+          net.handshake[registry](_) -> panic(no_machine("a registry")),
+          net.send[registry](_, _, _) -> panic(no_machine("a registry")),
+          net.recv[registry](_, _, _) -> panic(no_machine("a registry")),
+          net.close[registry](_) -> panic(no_machine("a registry")),
+        };
+        { ran: ran_of(cell_get(io)), tree: cell_get(disk) }
+      } }
+    }
+  }
+
+fn no_machine(what: String) -> String =
+  "a run in memory reaches no " ++ what ++ "; run this command `on_disk`"
+
+// A working-directory path as the tree spells it, and one the tree spelled as the working
+// directory's.
+fn in_w(p: String) -> String = joined("w", p)
+
+fn out_of_w(p: String) -> String =
+  if p == "w" { "." }
+  else if string_starts_with(p, "w/") { string_slice(p, 2, string_len(p)) }
+  else { p }
+
+// What `ply replace` puts in a definition's place: the file `--with` names, or what a test hands
+// in as its standard input, which is empty when it hands in none.
+fn replacement<| e>(
+  from: Option<String>,
+  stdin: Option<String>,
+  read_at: (String) -> Option<String> / e,
+) -> Result<String, String> / e =
+  match from {
+    Some(file) -> match read_at(file) {
+      Some(t) -> Ok(t),
+      None -> Err("could not read `" ++ file ++ "`: No such file or directory (os error 2)"),
+    },
+    None -> match stdin { Some(t) -> Ok(t), None -> Ok("") },
+  }
+
+// --- On disk -----------------------------------------------------------------
+
+// `ply` in the working directory, bound as the launcher binds it: `cwd` and `abs` are the run's
+// own roots and every family a command drives a machine with is lent by `--allow`. The streams,
+// the environment, the text `ply replace` reads and the shelf are the harness's.
+pub fn on_disk(argv: List<String>) -> Ran = on_disk_with(argv, [], None)
+
+// `stdin` is what `ply replace` reads when no `--with` names a file.
+pub fn on_disk_with(argv: List<String>, vars: List<Var>, stdin: Option<String>) -> Ran =
+  on_disk_over(argv, vars, stdin, [])
+
+// `ply` handed a shelf in which each of `shipped`, named as the shelf files it, stands in for the
+// module this binary ships: what a compiler that shipped those would have run.
+pub fn on_disk_shipping(argv: List<String>, shipped: List<Source>) -> Ran =
+  on_disk_over(argv, [], None, shipped)
+
+fn on_disk_over(
+  argv: List<String>,
+  vars: List<Var>,
+  stdin: Option<String>,
+  shipped: List<Source>,
+) -> Ran = {
+  // A command that failed past its load left the machine holding it under the one label.
+  machine.drop[run]();
+  with_cell[disk_io](captured(argv)) { io -> {
+    let pwd = working();
+    handle {
+      main()
+    } with {
+      process.args[proc]() -> args_step(cell_get(io)),
+      process.out[proc](line) -> cell_set(io, out_step(cell_get(io), line)),
+      process.err[proc](line) -> cell_set(io, err_step(cell_get(io), line)),
+      process.exit[proc](code) resume k -> cell_set(io, exit_step(cell_get(io), code)),
+      env.var[sys](name) -> var_of(vars, name),
+      env.vars[sys]() -> vars,
+      env.terminal[sys](_) -> false,
+      env.binary_version[sys]() -> version(),
+      env.pwd[sys]() -> pwd,
+      env.shipped_digest[sys]() -> in_process_digest(),
+      edit.item[replace](from) -> replacement(from, stdin, read),
+      fs.list_dir[shelf](_) -> shelf_names(),
+      fs.read_file[shelf](name) -> match filter(shipped, |f: Source| f.path == name) {
+        [f, ..] -> Some(bytes_of_string(f.text)),
+        [] -> shelf_file(name),
+      },
+    };
+    ran_of(cell_get(io))
+  } }
+}
+
+// --- As a process ------------------------------------------------------------
+
+// What a `ply` child inherits of this run's environment: where the toolchain is found and where
+// caches default to, and nothing else, so no variable in the shell that started the run decides
+// what a test asserts.
+fn inherited() -> List<String> = ["PATH", "HOME", "TMPDIR", "TEMP", "TMP"]
+
+pub fn environment(vars: List<Var>) -> List<Var> =
+  fold(inherited(), vars, |acc: List<Var>, name: String|
+    match config.get[env](name) { Some(v) -> push(acc, { name: name, value: v }), None -> acc })
+
+// The binary `--exec ply` names, started in the working directory with `--color never` ahead of
+// `argv`, so one that spells `--color` itself wins.
+pub fn spawned(argv: List<String>, vars: List<Var>) -> Ran = spawned_in("", argv, vars)
+
+// As `spawned`, started in `dir` under the working directory.
+pub fn spawned_in(dir: String, argv: List<String>, vars: List<Var>) -> Ran =
+  finished(process.spawn[ply](concatenated(["--color", "never"], argv), dir, environment(vars)))
+
+pub fn finished(f: Finished) -> Ran =
+  {
+    out: lines_of(f.out),
+    err: lines_of(f.err),
+    code: match f.ended { Exited(c) -> c, Signalled(s) -> 128 + s },
+  }
+
+// --- A server ----------------------------------------------------------------
+
+// A `ply` left running in the working directory, and the port it was told to take.
+pub type Server = { child: Int, port: Int }
+
+// A port nothing listened on a moment ago, for a server to be told to take. Every test that takes
+// one writes `ports`, so no two run at once and none is handed a port another holds.
+pub fn reserve() -> Int = {
+  let l = net.listen[ports](0);
+  let port = match net.local_port[ports](l) {
+    Some(p) -> p,
+    None -> panic("a listener asked for port 0 was given none"),
+  };
+  net.close[ports](l);
+  port
+}
+
+// The binary started as `spawned` starts it and left running, its streams kept for `ended`.
+pub fn serving(argv: List<String>, vars: List<Var>, port: Int) -> Server =
+  match process.start[ply](concatenated(["--color", "never"], argv), "", environment(vars), {
+      input: false,
+      out: Keep,
+      err: Keep,
+    }) {
+    Ok(child) -> { child: child, port: port },
+    Err(why) -> panic("`ply` did not start: " ++ why),
+  }
+
+// The binary started as `spawned` starts it and left running, its output handed over a line at a
+// time through `next_line` and its error stream dropped.
+pub fn speaking(argv: List<String>, vars: List<Var>) -> Server =
+  match process.start[ply](concatenated(["--color", "never"], argv), "", environment(vars), {
+      input: false,
+      out: Lines,
+      err: Discard,
+    }) {
+    Ok(child) -> { child: child, port: 0 },
+    Err(why) -> panic("`ply` did not start: " ++ why),
+  }
+
+// The next line the server wrote, or `None` when it wrote none within `ms` or ended.
+pub fn next_line(s: Server, ms: Int) -> Option<String> =
+  match process.output_line[ply](s.child, ms) { Said(line) -> Some(line), _ -> None }
+
+// The binary run as `spawned` runs it, reading `input` and then the end of its input.
+pub fn spawned_reading(argv: List<String>, vars: List<Var>, input: String) -> Ran =
+  match process.start[ply](concatenated(["--color", "never"], argv), "", environment(vars), {
+      input: true,
+      out: Keep,
+      err: Keep,
+    }) {
+    Err(why) -> panic("`ply` did not start: " ++ why),
+    Ok(child) -> {
+      let _ = process.input[ply](child, bytes_of_string(input));
+      process.end_input[ply](child);
+      match process.wait[ply](child, -1) {
+        Some(f) -> finished(f),
+        None -> panic("a wait with no timeout came back with nothing"),
+      }
+    },
+  }
+
+// A connection to the server's port that `ready` accepts, or why none came within `ms`: the
+// server exited, or nothing it answered was accepted.
+pub fn connected<| e>(
+  s: Server,
+  ms: Int,
+  ready: (Int) -> Bool / e,
+) -> Result<Int, String> / {process.wait[ply], net.connect[client], net.close[client], time.elapsed_ms, time.sleep_ms | e} =
+  connected_by(s, time.elapsed_ms() + ms, ms, ready)
+
+fn connected_by<| e>(
+  s: Server,
+  until: Int,
+  ms: Int,
+  ready: (Int) -> Bool / e,
+) -> Result<Int, String> / {process.wait[ply], net.connect[client], net.close[client], time.elapsed_ms, time.sleep_ms | e} =
+  match process.wait[ply](s.child, 0) {
+    Some(f) -> Err("`ply run --host` exited before listening:\n" ++ said(finished(f))),
+    None -> {
+      let probe = match net.connect[client]("127.0.0.1", s.port, 250) {
+        Some(c) -> if ready(c) { Some(c) } else {
+          net.close[client](c);
+          None
+        },
+        None -> None,
+      };
+      match probe {
+        Some(c) -> Ok(c),
+        None -> if time.elapsed_ms() >= until {
+          Err(
+            "nothing listening on 127.0.0.1:" ++ int_to_string(s.port) ++ " after "
+              ++ int_to_string(ms)
+              ++ "ms",
+          )
+        } else {
+          time.sleep_ms(25);
+          connected_by(s, until, ms, ready)
+        },
+      }
+    },
+  }
+
+// The first connection the server takes, or the test fails saying why there was none.
+pub fn connection(s: Server, ms: Int) -> Int =
+  match connected(s, ms, |_c: Int| true) {
+    Ok(c) -> c,
+    Err(why) -> {
+      stop(s);
+      panic(why)
+    },
+  }
+
+pub fn dial(port: Int, ms: Int) -> Option<Int> = net.connect[client]("127.0.0.1", port, ms)
+
+pub fn sent(c: Int, bytes: Bytes) -> Unit =
+  if !net::send_all[client](c, bytes, 10000) { panic("the other end stopped taking what was sent") }
+
+// Everything the other end says until it closes, or falls silent for `ms`; `c` is then closed.
+pub fn heard(c: Int, ms: Int) -> String = {
+  let answer = net::drain[client](c, b"", ms);
+  net.close[client](c);
+  string_of_bytes_lossy(answer)
+}
+
+// `request` written, and everything said back before the other end closed.
+pub fn exchange(c: Int, request: Bytes) -> String = {
+  sent(c, request);
+  heard(c, 10000)
+}
+
+pub fn hang_up(c: Int) -> Unit = net.close[client](c)
+
+pub fn signal_to(s: Server, sig: Signal) -> Unit =
+  if !process.signal[ply](s.child, sig) { panic("the server had already ended") }
+
+// How the server ended and what it wrote, once it has; one still running after `ms` is killed,
+// and the test fails with `why`.
+pub fn ended(s: Server, ms: Int, why: String) -> Finished =
+  match process.wait[ply](s.child, ms) {
+    Some(f) -> f,
+    None -> {
+      let _ = process.signal[ply](s.child, Kill);
+      match process.wait[ply](s.child, -1) {
+        Some(f) -> panic(why ++ "\n" ++ said(finished(f))),
+        None -> panic(why),
+      }
+    },
+  }
+
+// A server asked for a fixed number of connections and given them returns on its own, cleanly.
+pub fn returned(s: Server) -> Unit = {
+  let f = ended(
+    s,
+    30000,
+    "the server was still running 30s after every connection it was asked for; `serve` should have returned",
+  );
+  match f.ended {
+    Exited(c) -> if c != 0 {
+      panic("the server exited " ++ int_to_string(c) ++ " after answering:\n" ++ said(finished(f)))
+    },
+    Signalled(n) ->
+      panic("the server was killed by signal " ++ int_to_string(n) ++ ":\n" ++ said(finished(f))),
+  }
+}
+
+// The server killed, for a test that is done with it whatever state it is in.
+pub fn stop(s: Server) -> Unit = {
+  let _ = process.signal[ply](s.child, Kill);
+  let _ = process.wait[ply](s.child, -1);
+  ()
+}
+
+// A stream's lines, the newline that ends the last one not making another.
+pub fn lines_of(b: Bytes) -> List<String> = {
+  let all = string_split(string_of_bytes_lossy(b), "\n");
+  let n = len(all);
+  match list_at(all, n - 1) {
+    Some("") ->
+      fold(range(0, n - 1), [], |acc: List<String>, i: Int|
+        match list_at(all, i) { Some(l) -> push(acc, l), None -> acc }),
+    _ -> all,
+  }
+}
+
+// --- Small things ------------------------------------------------------------
+
+pub fn var_of(vars: List<Var>, name: String) -> Option<String> =
+  fold(vars, None, |found: Option<String>, v: Var|
+    match found { Some(_) -> found, None -> if v.name == name { Some(v.value) } else { None } })
+
+pub fn contains_text(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |hit: Bool, y: String| hit || y == x)
+
+pub fn concatenated<a>(xs: List<a>, ys: List<a>) -> List<a> =
+  fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
+
+// `dir` and `name` as one path, a `.` or empty directory adding nothing.
+pub fn joined(dir: String, name: String) -> String = {
+  let d = segments(dir);
+  let n = segments(name);
+  fold(concatenated(d, n), "", |acc: String, s: String| if acc == "" { s } else { acc ++ "/" ++ s })
+}
+
+fn segments(p: String) -> List<String> =
+  filter(string_split(p, "/"), |s: String| s != "" && s != ".")
+
+// The directory a path sits in, and `""` for one with a single segment.
+pub fn parent(p: String) -> String = {
+  let segs = segments(p);
+  fold(range(0, len(segs) - 1), "", |acc: String, i: Int|
+    match list_at(segs, i) { Some(s) -> if acc == "" { s } else { acc ++ "/" ++ s }, None -> acc })
+}

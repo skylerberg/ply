@@ -1,0 +1,302 @@
+// `ply fmt`: a file formatted in place and left a fixed point, `--check` naming what would move and
+// writing nothing, a file that does not parse or cannot be read refused by name, the repository's
+// maintained sources committed formatted, and the corpora formatting to a fixed point that checks
+// as it did.
+
+import harness (Kept, Source, repo, repo_file, in_memory, kept_in_memory, tree, file_of, on_disk,
+                said, stdout, stderr, json_of, at, items, first, str, int, truth, shown)
+import std.fs
+import std.fs (fs, MemFs, Mode)
+import std.json (Json, Array)
+import std.list (sort)
+import std.string
+
+fn unformatted() -> String =
+  \\// A leading comment.
+  \\fn   add(a: Int,b: Int)->Int = a+b // trailing
+  \\
+  \\
+  \\fn main() -> Int = { let x = 0xFF; add(x, 1_000) }
+  \\
+
+fn formatted() -> String =
+  \\// A leading comment.
+  \\fn add(a: Int, b: Int) -> Int = a + b  // trailing
+  \\
+  \\fn main() -> Int = {
+  \\  let x = 0xFF;
+  \\  add(x, 1_000)
+  \\}
+  \\
+
+fn kept(t: MemFs, argv: List<String>) -> Kept = kept_in_memory(t, argv, [], None)
+
+fn text_at(t: MemFs, path: String) -> String = match file_of(t, path) { Some(x) -> x, None -> "" }
+
+test/nondet "a file is formatted in place and a second run changes nothing" {
+  let k = kept(tree([{ path: "m.ply", text: unformatted() }]), ["fmt", "m.ply"]);
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(stdout(k.ran), "formatted m.ply\n");
+  assert_eq(text_at(k.tree, "m.ply"), formatted());
+  let again = kept(k.tree, ["fmt", "--check", "--json"]);
+  assert_eq(again.ran.code, 0);
+  let v = json_of(again.ran);
+  assert_eq(str(at(v, "command")), "fmt");
+  assert(truth(at(v, "ok")), Some(shown(v)));
+  let file = first(items(at(v, "files")));
+  assert_eq(str(at(file, "path")), "m.ply");
+  assert(!truth(at(file, "changed")), Some(shown(v)));
+  assert(items(at(v, "errors")) == [], Some(shown(v)));
+  assert_eq(text_at(again.tree, "m.ply"), formatted())
+}
+
+test/nondet "check names the file that would change and writes nothing" {
+  let t = tree([{ path: "m.ply", text: unformatted() }]);
+  let k = kept(t, ["fmt", "--check"]);
+  assert_eq(k.ran.code, 1);
+  assert_eq(stdout(k.ran), "would format m.ply\n");
+  assert_eq(text_at(k.tree, "m.ply"), unformatted());
+  let v = json_of(in_memory(t, ["fmt", "--check", "--json"]));
+  assert_eq(int(at(v, "exit_code")), 1);
+  assert(truth(at(first(items(at(v, "files"))), "changed")), Some(shown(v)))
+}
+
+test/nondet "a file that does not parse exits two and is left alone" {
+  let broken = "fn f( = 1\n";
+  let t = tree([{ path: "m.ply", text: broken }]);
+  let k = kept(t, ["fmt"]);
+  assert_eq(k.ran.code, 2);
+  assert(
+    string_contains(stderr(k.ran), "m.ply") && string_contains(stderr(k.ran), "E0001"),
+    Some(stderr(k.ran)),
+  );
+  assert_eq(text_at(k.tree, "m.ply"), broken);
+  let v = json_of(in_memory(t, ["fmt", "--check", "--json"]));
+  assert_eq(int(at(v, "exit_code")), 2);
+  assert_eq(str(at(first(items(at(v, "errors"))), "path")), "m.ply")
+}
+
+// A tree in memory has its root beside the working directory, so `/p` is a project elsewhere.
+test/nondet "a directory outside the working directory is checked and formatted where it is" {
+  let t = fs::mem_write(
+    fs::mem_create_dir(tree([]), "p/sub").fs,
+    "p/sub/m.ply",
+    bytes_of_string(unformatted()),
+  ).fs;
+  let shown_as = "/p/sub/m.ply";
+  let checked = kept(t, ["fmt", "--check", "/p"]);
+  assert(checked.ran.code == 1, Some(stderr(checked.ran)));
+  assert_eq(stdout(checked.ran), "would format " ++ shown_as ++ "\n");
+  assert(fs::mem_read(checked.tree, "p/sub/m.ply") == Some(bytes_of_string(unformatted())), None);
+  let made = kept(t, ["fmt", "/p"]);
+  assert(made.ran.code == 0, Some(stderr(made.ran)));
+  assert_eq(stdout(made.ran), "formatted " ++ shown_as ++ "\n");
+  assert(fs::mem_read(made.tree, "p/sub/m.ply") == Some(bytes_of_string(formatted())), None);
+  let after = kept(made.tree, ["fmt", "--check", "--json", "/p"]);
+  assert_eq(after.ran.code, 0);
+  let v = json_of(after.ran);
+  assert_eq(str(at(first(items(at(v, "files"))), "path")), shown_as);
+  assert(!truth(at(first(items(at(v, "files"))), "changed")), Some(shown(v)));
+  assert(items(at(v, "errors")) == [], Some(shown(v)))
+}
+
+fn mode(text: String) -> Mode =
+  match fs::mode_of_text(text) { Some(m) -> m, None -> panic("`" ++ text ++ "` is a mode") }
+
+test/nondet "a file that cannot be read fails the check and the run" {
+  let readable = tree([
+    { path: "m.ply", text: formatted() },
+    { path: "locked.ply", text: unformatted() },
+  ]);
+  let t = fs::mem_set_mode(readable, "w/locked.ply", mode("---------")).fs;
+  assert(file_of(t, "locked.ply") == None, Some("the test needs a file nobody can read"));
+
+  let checked = in_memory(t, ["fmt", "--check"]);
+  assert(checked.code == 2, Some(stderr(checked)));
+  assert(
+    string_contains(stderr(checked), "error: locked.ply: could not read"),
+    Some(stderr(checked)),
+  );
+  assert_eq(stdout(checked), "");
+
+  let v = json_of(in_memory(t, ["fmt", "--check", "--json"]));
+  assert_eq(int(at(v, "exit_code")), 2);
+  assert(!truth(at(v, "ok")), Some(shown(v)));
+  let refused = first(items(at(v, "errors")));
+  assert_eq(str(at(refused, "path")), "locked.ply");
+  assert_eq(str(at(refused, "error")), "could not read");
+
+  let k = kept(t, ["fmt"]);
+  assert(k.ran.code == 2, Some(stderr(k.ran)));
+  assert(string_contains(stderr(k.ran), "error: locked.ply: could not read"), Some(stderr(k.ran)));
+  assert_eq(
+    text_at(fs::mem_set_mode(k.tree, "w/locked.ply", mode("rw-r--r--")).fs, "locked.ply"),
+    unformatted(),
+  )
+}
+
+// The diagnostic codes `ply check` reports for one file of `t`, sorted: what formatting must not
+// change.
+fn check_codes(t: MemFs, target: String) -> List<String> =
+  sort(
+    map(items(at(json_of(in_memory(t, ["check", target, "--json"])), "diagnostics")), |d: Json|
+      str(at(d, "code"))),
+  )
+
+fn changed_paths(report: Json) -> List<String> =
+  map(filter(items(at(report, "files")), |f: Json| truth(at(f, "changed"))), |f: Json|
+    str(at(f, "path")))
+
+// The first line where a second pass differs from the first, with five lines of context from each.
+fn first_difference(file: String, once: String, twice: String) -> String = {
+  let a = string_split(once, "\n");
+  let b = string_split(twice, "\n");
+  let width = if len(a) > len(b) { len(a) } else { len(b) };
+  let at_line = match filter(range(0, width), |i: Int| list_at(a, i) != list_at(b, i)) {
+    [i, ..] -> i,
+    [] -> 0,
+  };
+  let window = |lines: List<String>| {
+    let lo = if at_line > 5 { at_line - 5 } else { 0 };
+    let hi = if at_line + 6 < len(lines) { at_line + 6 } else { len(lines) };
+    fold(range(lo, hi), "", |acc: String, i: Int|
+      acc ++ string::pad_left(int_to_string(i + 1), 5, " ") ++ " | "
+        ++ (match list_at(lines, i) { Some(l) -> l, None -> "" })
+        ++ "\n")
+  };
+  "--- " ++ file ++ ": line " ++ int_to_string(at_line + 1) ++ " differs\n--- first pass:\n"
+    ++ window(a)
+    ++ "--- second pass:\n"
+    ++ window(b)
+}
+
+// Formats a copy of every `.ply` file directly under `relative` and requires the result to be a
+// fixed point that `ply check` reads the same way it read the original. One `ply fmt` over the
+// corpus: the command walks the tree and reports every file it took.
+fn corpus_round_trip(relative: String) -> Unit = {
+  let names = match fs.list_dir[repo](relative) {
+    Some(ns) -> sort(filter(ns, |n: String| string_ends_with(n, ".ply"))),
+    None -> panic(relative ++ " is not a directory"),
+  };
+  assert(names != [], Some(relative ++ " holds no .ply files"));
+  let original = |name: String| repo_file(relative ++ "/" ++ name);
+  let t = tree(map(names, |n: String| { path: n, text: original(n) }));
+
+  // What the formatter would move, and what it will not parse.
+  let planned = json_of(in_memory(t, ["fmt", "--check", "--json"]));
+  let reported = map(items(at(planned, "files")), |f: Json| str(at(f, "path")));
+  let moving = changed_paths(planned);
+  let refused = map(items(at(planned, "errors")), |e: Json|
+    { path: str(at(e, "path")), error: str(at(e, "error")) });
+  let refused_names = map(refused, |r: { path: String, error: String }| r.path);
+  let has = |xs: List<String>, x: String| len(filter(xs, |y: String| y == x)) > 0;
+
+  // Every file is one the formatter named or one it refused.
+  fold(names, (), |u: Unit, name: String|
+    assert(
+      has(reported, name) || has(refused_names, name),
+      Some(
+        relative ++ "/" ++ name
+          ++ ": ply fmt --check named neither that it would move nor that it refused",
+      ),
+    ));
+
+  // What `ply check` said about every file the formatter will touch.
+  let before = map(concatenated_names(moving, refused_names), |name: String|
+    { name: name, codes: check_codes(t, name) });
+  let codes_before = |name: String|
+    match filter(before, |b: { name: String, codes: List<String> }| b.name == name) {
+      [b, ..] -> b.codes,
+      [] -> [],
+    };
+  fold(refused, (), |u: Unit, r: { path: String, error: String }| {
+    assert(string_contains(r.error, "E0"), Some(relative ++ "/" ++ r.path ++ ": " ++ r.error));
+    assert(
+      len(filter(codes_before(r.path), |c: String| string_starts_with(c, "E"))) > 0,
+      Some(
+        relative ++ "/" ++ r.path ++ ": ply fmt refused it (" ++ r.error
+          ++ ") but `ply check` raised no error",
+      ),
+    )
+  });
+
+  // One `ply fmt` over the corpus, writing: exit 2 exactly when a file was refused.
+  let written = kept(t, ["fmt"]);
+  assert(
+    written.ran.code == 2 == (refused != []),
+    Some(
+      relative ++ ": ply fmt exited " ++ int_to_string(written.ran.code) ++ " with "
+        ++ int_to_string(len(refused))
+        ++ " refused file(s)",
+    ),
+  );
+  // A fixture written to exercise the parser's recovery does not parse, and stays as it was.
+  fold(refused, (), |u: Unit, r: { path: String, error: String }|
+    assert(
+      file_of(written.tree, r.path) == Some(original(r.path)),
+      Some(relative ++ "/" ++ r.path ++ " was rewritten although it does not parse"),
+    ));
+
+  // The answer is a fixed point: a second check finds nothing left to move.
+  let again = json_of(in_memory(written.tree, ["fmt", "--check", "--json"]));
+  let moved = changed_paths(again);
+  if moved != [] {
+    let report = fold(moved, "", |acc: String, file: String| {
+      let once = text_at(written.tree, file);
+      let twice = text_at(kept(written.tree, ["fmt", file]).tree, file);
+      acc ++ first_difference(file, once, twice)
+    });
+    panic(relative ++ " is not a fixed point:\n" ++ shown(again) ++ "\n" ++ report)
+  };
+
+  // Formatting moved no diagnostic, for every file it touched.
+  fold(moving, (), |u: Unit, name: String|
+    assert(
+      check_codes(written.tree, name) == codes_before(name),
+      Some(relative ++ "/" ++ name ++ " checks differently after formatting"),
+    ))
+}
+
+fn concatenated_names(xs: List<String>, ys: List<String>) -> List<String> = fold(ys, xs, push)
+
+// Every `.ply` source the repository maintains, as against the fixtures written to be malformed or
+// to pin a golden.
+fn maintained() -> List<String> =
+  [
+    "crates/ply-compiler/ply",
+    "crates/ply-cli/ply",
+    "crates/ply-cli-tests/ply",
+    "crates/ply-std/ply",
+    "crates/ply-corpus/ply",
+    "crates/ply-corpus/checks",
+    "crates/ply-test/ply",
+    "crates/ply-prove/ply",
+    "crates/ply-sim/ply",
+    "crates/ply-store/ply",
+    "crates/ply-registry/ply",
+    "benches",
+    "tests/lang",
+    "examples",
+  ]
+
+// A layout only a scratch copy is ever held to is not canonical. A source committed unformatted
+// puts its reformatting into the next change that touches it, where it is indistinguishable from
+// that change.
+test/nondet "the maintained sources are committed formatted" {
+  let r = on_disk(
+    fold(map(maintained(), |dir: String| repo() ++ "/" ++ dir), ["fmt", "--check"], push),
+  );
+  assert(
+    r.code == 0,
+    Some(
+      "`ply fmt` would rewrite sources that are committed as they are; run it and commit that:\n"
+        ++ said(r),
+    ),
+  )
+}
+
+test/nondet "the examples format to a fixed point and still check" { corpus_round_trip("examples") }
+
+test/nondet "the parser fixtures format to a fixed point and still check" {
+  corpus_round_trip("crates/ply-codegen-tests/fixtures")
+}

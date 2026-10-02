@@ -1,0 +1,198 @@
+// The corpora the repository ships, run green on the compiled tier: the examples, the standard
+// library and the language corpus.
+
+import harness (Ran, project, program, write, repo, working, repo_file, reserve, serving,
+                connection, sent, heard, ended, finished, on_disk, spawned, said, stderr, json_of,
+                at, path, items, str, int, truth, shown)
+import std.fs (fs)
+import std.json (Json)
+import std.string
+import std.string (int_of_string)
+
+fn report_of(r: Ran) -> Json = json_of(r)
+
+// The whole report is too long for a CI log line, so a red one names its failures and their
+// diagnostics.
+pub fn green(report: Json, what: String) -> Unit = {
+  let failures = string::join(
+    map(items(at(report, "failures")), |f: Json|
+      str(at(f, "name")) ++ ": " ++ str(path(f, ["diagnostic", "code"])) ++ " "
+        ++ str(path(f, ["diagnostic", "message"]))),
+    "\n",
+  );
+  let why = if failures == "" { shown(at(report, "summary")) } else { failures };
+  assert(truth(at(report, "ok")), Some(what ++ " is red:\n" ++ why));
+  assert(int(path(report, ["summary", "failed"])) == 0, Some(what ++ " is red:\n" ++ why))
+}
+
+pub fn entered(report: Json, what: String) -> Unit =
+  assert(
+    int(path(report, ["backend", "entered"])) > 0,
+    Some(
+      what ++ " entered nothing, so the run is green over a seam no call reached: "
+        ++ shown(at(report, "backend")),
+    ),
+  )
+
+fn succeeded(r: Ran) -> Unit = assert(r.code == 0, Some(said(r)))
+
+// The count a `ply emitter answered N ...` line opens with, and `0` for any other line.
+fn emitter_answered(line: String) -> Int = {
+  let lead = "ply emitter answered ";
+  if !string_starts_with(line, lead) { 0 } else {
+    let rest = string_slice(line, string_len(lead), string_len(line));
+    let first = match string::split_once(rest, " ") { Some(p) -> p.head, None -> rest };
+    match int_of_string(first) { Some(n) -> n, None -> 0 }
+  }
+}
+
+test/nondet "the code generator runs examples green and enters the seam" {
+  let report = report_of(on_disk(["test", repo() ++ "/examples", "--json"]));
+  green(report, "the code generator over examples/");
+  assert(str(path(report, ["backend", "name"])) == "c", Some(shown(at(report, "backend"))));
+  entered(report, "the code generator");
+  assert(
+    int(path(report, ["backend", "units"])) > 0,
+    Some(
+      "no unit was compiled, so `c` is not a code generator here: " ++ shown(at(report, "backend")),
+    ),
+  )
+}
+
+test/nondet "the Ply emitter produces the unit and examples runs green" {
+  project([]);
+  let r = spawned(["test", repo() ++ "/examples", "--no-cache", "--json"], [
+    { name: "PLY_C_CACHE", value: working() ++ "/cache" },
+    { name: "PLY_C_REFUSALS", value: "1" },
+  ]);
+  let answered = len(filter(r.err, |l: String| emitter_answered(l) > 0)) > 0;
+  assert(answered, Some("the Ply emitter answered nothing, or was never asked:\n" ++ stderr(r)));
+  green(report_of(r), "the C tier with the chain entered whole, over examples/")
+}
+
+// `std.json` parses an array by a cycle of tail calls, so on the compiled tier an array's length
+// is bounded by memory and not by the call budget.
+test/nondet "the compiled tier decodes a long array without nesting" {
+  program(
+    \\import std.json (parse, Json, Array)
+    \\
+    \\fn long_array(n: Int) -> Bytes =
+    \\  bytes_concat_all([b"[", bytes_concat_all(map(range(0, n), |_i: Int| b"7,")), b"7]"])
+    \\
+    \\test "a long array decodes" {
+    \\  assert_eq(
+    \\    match parse(long_array(100_000)) { Ok(Array(items)) -> len(items), _ -> -1 },
+    \\    100_001)
+    \\}
+    \\
+  );
+  let report = report_of(on_disk(["test", ".", "--no-cache", "--json"]));
+  green(report, "a long array on the compiled tier");
+  entered(report, "the compiled tier")
+}
+
+test/nondet "the language corpus is green" {
+  succeeded(on_disk(["test", repo() ++ "/tests/lang", "--no-cache"]))
+}
+
+test/nondet "the compiled tier is the only engine over examples and the standard library" {
+  fold(["examples", "crates/ply-std/ply"], (), |u: Unit, corpus: String|
+    succeeded(on_disk(["test", repo() ++ "/" ++ corpus, "--no-cache"])))
+}
+
+test/nondet "the compiled tier judges the corpus specifications" {
+  project([]);
+  fold(["examples", "crates/ply-std/ply"], (), |u: Unit, corpus: String| {
+    let r = spawned(["prove", repo() ++ "/" ++ corpus, "--no-cache", "--json"], [
+      { name: "PLY_C_REFUSALS", value: "1" },
+      { name: "PLY_C_PHASES", value: "1" },
+    ]);
+    assert(
+      len(filter(r.err, |l: String| string_starts_with(l, "entry:"))) > 0,
+      Some("the tier entered nothing while proving " ++ corpus ++ ":\n" ++ stderr(r)),
+    );
+    let report = report_of(r);
+    let summary = at(report, "summary");
+    assert(
+      truth(at(report, "ok")) && int(at(summary, "obligations")) > 0
+        && int(at(summary, "refuted")) == 0,
+      Some("the tier did not judge " ++ corpus ++ "'s specifications cleanly: " ++ shown(summary)),
+    )
+  })
+}
+
+test/nondet "a served example with the tier holding its accept loop" {
+  let port = reserve();
+  project([{ path: "hello.ply", text: repo_file("examples/hello.ply") }]);
+  let server = serving(
+    [
+      "run",
+      "--host",
+      "--set",
+      "HELLO_PORT=" ++ int_to_string(port),
+      "--set",
+      "HELLO_CONNECTIONS=1",
+    ],
+    [{ name: "PLY_C_CACHE", value: working() ++ "/cache" }, { name: "PLY_C_REFUSALS", value: "1" }],
+    port,
+  );
+  let c = connection(server, 120000);
+  sent(c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+  let answer = heard(c, 30000);
+  let out = finished(ended(server, 30000, "the server did not return after its one connection"));
+  assert(
+    string_contains(answer, "hello from ply"),
+    Some("the server did not answer the request:\n" ++ answer ++ "\n" ++ stderr(out)),
+  );
+  assert(
+    !string_contains(stderr(out), "c tier refused `hello."),
+    Some("the tier refused part of the example, so the machine served it:\n" ++ stderr(out)),
+  );
+  assert(
+    len(
+        filter(out.err, |l: String|
+          string_starts_with(l, "c tier took ") && string_contains(l, " definitions")),
+      )
+      > 0,
+    Some("no tier ran:\n" ++ stderr(out)),
+  );
+  assert(out.code == 0, Some("the run exited " ++ int_to_string(out.code) ++ ":\n" ++ stderr(out)))
+}
+
+// The bytes a literal spells, escaped where a byte is not printable or would end the literal.
+fn literal_of(n: Int) -> String =
+  "b\""
+    ++ string::join(
+      map(range(0, n), |i: Int| {
+        let b = i % 251;
+        if b < 32 || b > 126 || b == 34 || b == 92 { "\\x" ++ hex2(b) }
+        else { string_of_bytes(byte_of_int(b)) }
+      }),
+      "",
+    )
+    ++ "\""
+
+fn hex2(b: Int) -> String = {
+  let digits = "0123456789abcdef";
+  string_slice(digits, b / 16, b / 16 + 1) ++ string_slice(digits, b % 16, b % 16 + 1)
+}
+
+// Sixty-four chunks: long enough that every loop comes round with a record its tier may have held
+// back.
+test/nondet "the C tier hashes a long input consistently" {
+  project([
+    { path: "input.ply", text: "pub fn long() -> Bytes = " ++ literal_of(65536) ++ "\n" },
+    {
+      path: "h.ply",
+      text:
+        \\import std.hash (blake3)
+        \\import input (long)
+        \\test "a long input hashes to a stable digest" {
+        \\  assert_eq(blake3(long()), blake3(long()))
+        \\}
+        \\pub fn digest() -> Bytes = blake3(long())
+        \\
+    },
+  ]);
+  green(report_of(on_disk(["test", ".", "--no-cache", "--json"])), "the C tier over a long input")
+}
