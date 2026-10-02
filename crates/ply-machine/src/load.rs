@@ -281,7 +281,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 /// keyed in the cache: `./m.ply` and `m.ply` are one file, and only one of them is a spelling a
 /// reader can compare. A path that is nothing but `.` keeps it — the empty path names no
 /// directory, and the root a `--fs` binding resolves before anything runs is `E0454` when it is
-/// one. This is `ply_store`'s `source_key` rule, on the argument side of the same boundary.
+/// one. This is the store package's `source_key` rule, on the argument side of the same boundary.
 pub fn tidy(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {

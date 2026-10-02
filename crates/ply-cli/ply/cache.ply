@@ -1,55 +1,28 @@
-// `ply cache` — what the store under `.ply-cache` holds, and what clearing or compacting it did.
-// Opening, locking, sweeping and flushing a store is the Rust side's: a reader of the on-disk
-// format written here would be a second implementation of it. Everything below decides what the
-// four subcommands say, in both forms, and what they exit with.
+// `ply cache` — what the store under `.ply-cache` holds, and what clearing or compacting it did,
+// read and worked through the `store` package, and what the four subcommands say about it in both
+// forms.
 
 import args (Flags, no_flags, style_of)
-import compiler.front (DefInterface, DeclInterface, Dump, FiledOp, FiledVariant, Filing,
-                       KnownTestRow)
+import compiler.front (DefInterface, DeclInterface, Dump, FiledOp, FiledVariant, KnownTestRow,
+                       def_interface_bin, decl_interface_bin, known_test_row_bin)
+import diagnostic (spot_of)
+import loads
+import loads (SourceFile)
+import paths
+import walk
+import std.bin
+import std.fs (fs)
+import std.hash (blake3)
+import std.random (entropy)
+import std.time (time)
+import store.engine
+import store.tables
 import compiler.hash (hex)
 import compiler.resolve (Diag)
 import diagnostic (all_to_json, all_to_text)
 import report (Answer, ind, ok_code, compile_error, count_of, plural, warning_lines)
 import std.json (Json, Null, Str, Bool, Number, Array, Member, object, to_string)
 import style (Style, plain, bold, dim, green, yellow)
-
-// The store this project keeps, as the Rust side opens and works it. One operation per `ply cache`
-// subcommand, whose action has already run when the program performs it, so what comes back is
-// what was done; and the front-end cache every load reads before it analyses and files after.
-pub nondet effect store {
-  read statistics[r](root: String) -> Result<Stats, Refusal>
-  read matches[r](query: String, root: String) -> Result<Matches, Refusal>
-  write compacted[r](root: String) -> Result<Compacted, Refusal>
-  write cleared[r](root: String) -> Result<Cleared, Refusal>
-  read known[r](root: String, sources: Sources) -> Recorded
-  write file[r](root: String, sources: Sources, filing: Filing, whole: Bool) -> List<Diag>
-}
-
-// --- What a load reads and files ----------------------------------------------
-
-// One file a load read: where from, the module it is, and its bytes. The store keys it by its path,
-// a dependency's under its package's identity, and a shipped module's by its pseudo-path.
-pub type SourceFile = { path: String, name: String, text: Bytes }
-
-// A dependency package's root, and the identity its files are keyed under: its manifest's digest.
-pub type SourcePackage = { root: String, digest: String }
-
-pub type Sources = { files: List<SourceFile>, packages: List<SourcePackage> }
-
-// A shipped module's entry as the store last filed it.
-pub type ShippedEntry = { name: Bytes, hash: Bytes }
-
-// What the shipped modules were when the store was last filed, by a compiler whose were different.
-pub type StdlibMoved = { was: String, now: String, entries: List<ShippedEntry> }
-
-// What the store holds for the files a load reads: every definition's and test's filed rows,
-// whatever hash each was filed under, and what opening and reading the store degraded past.
-pub type Recorded = {
-  defs: List<DefInterface>,
-  tests: List<KnownTestRow>,
-  stdlib: Option<StdlibMoved>,
-  warnings: List<Diag>,
-}
 
 // What a load answered, which the Rust side reads rather than loading the program again.
 pub type Front = {
@@ -61,7 +34,7 @@ pub type Front = {
   cached: Bool,
 }
 
-// --- What the Rust side answers with ----------------------------------------
+// --- What each subcommand found ---------------------------------------------
 
 // Why an action did not finish.
 pub type Refusal = {
@@ -75,18 +48,14 @@ pub type Stats = {
   directory: String,
   // What the store degraded past on the way here; every subcommand reports them.
   warnings: List<Diag>,
-  runtime_version: String,
-  frontend_version: String,
-  prover_version: String,
+  format: Int,
   root: String,
-  results_file: String,
-  frontend_file: String,
-  frontend_data_file: String,
+  index_file: String,
+  data_file: String,
   // Whole microseconds; the report prints milliseconds.
   open_us: Int,
   results: Int,
   definitions_seen: Int,
-  results_bytes: Int,
   obligations: Int,
   reviews: Int,
   sources: Int,
@@ -95,8 +64,8 @@ pub type Stats = {
   bodies: Int,
   index_bytes: Int,
   data_bytes: Int,
-  // `None` when the store cannot say which data bytes no index record names.
-  garbage_bytes: Option<Int>,
+  // The data bytes no index record names, which compaction reclaims.
+  garbage_bytes: Int,
 }
 
 pub type Pruned = { sources: Int, defs: Int, decls: Int, bodies: Int }
@@ -108,7 +77,7 @@ pub type Compacted = {
   dropped: Pruned,
   bytes_before: Int,
   bytes_after: Int,
-  // The result cache, which compaction leaves alone.
+  // The results compaction keeps.
   results: Int,
 }
 
@@ -201,8 +170,6 @@ fn yes_no(flag: Bool) -> String = if flag { "yes" } else { "no" }
 
 fn num(n: Int) -> Json = Number(decimal_of_int(n))
 
-fn opt_num(v: Option<Int>) -> Json = match v { Some(n) -> num(n), None -> Null }
-
 fn opt_str(v: Option<String>) -> Json = match v { Some(s) -> Str(s), None -> Null }
 
 fn strings(xs: List<String>) -> Json = Array(map(xs, |x: String| Str(x)))
@@ -248,8 +215,7 @@ fn share(part: Int, whole: Int, per: Int) -> Int =
   if whole == 0 { 0 } else { (part * per + whole / 2) / whole }
 
 // Suggested, never done: dropping an interface costs a recheck, and dead code tends to come back.
-fn compact_suggested(st: Stats) -> Bool =
-  match st.garbage_bytes { None -> false, Some(g) -> st.data_bytes > 0 && g * 2 > st.data_bytes }
+fn compact_suggested(st: Stats) -> Bool = st.data_bytes > 0 && st.garbage_bytes * 2 > st.data_bytes
 
 // --- The refusals -----------------------------------------------------------
 
@@ -298,10 +264,7 @@ fn nothing_cached(query: String) -> Diag =
 // --- `ply cache stats` ------------------------------------------------------
 
 fn frontend_json(st: Stats) -> Json = {
-  let ratio = match st.garbage_bytes {
-    None -> Null,
-    Some(g) -> decimal(fixed(share(g, st.data_bytes, 1000000), 6)),
-  };
+  let ratio = decimal(fixed(share(st.garbage_bytes, st.data_bytes, 1000000), 6));
   object([
     { key: "sources", value: num(st.sources) },
     { key: "definitions", value: num(st.defs) },
@@ -309,7 +272,7 @@ fn frontend_json(st: Stats) -> Json = {
     { key: "bodies", value: num(st.bodies) },
     { key: "index_bytes", value: num(st.index_bytes) },
     { key: "data_bytes", value: num(st.data_bytes) },
-    { key: "garbage_bytes", value: opt_num(st.garbage_bytes) },
+    { key: "garbage_bytes", value: num(st.garbage_bytes) },
     { key: "garbage_ratio", value: ratio },
     { key: "compact_suggested", value: Bool(compact_suggested(st)) },
   ])
@@ -321,18 +284,14 @@ fn stats_json(st: Stats) -> Json =
     { key: "action", value: Str("stats") },
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: num(ok_code()) },
-    { key: "runtime_version", value: Str(st.runtime_version) },
-    { key: "frontend_version", value: Str(st.frontend_version) },
+    { key: "format", value: num(st.format) },
     { key: "root", value: Str(st.root) },
     { key: "directory", value: Str(st.directory) },
-    { key: "results_file", value: Str(st.results_file) },
-    { key: "frontend_file", value: Str(st.frontend_file) },
-    { key: "frontend_data_file", value: Str(st.frontend_data_file) },
+    { key: "index_file", value: Str(st.index_file) },
+    { key: "data_file", value: Str(st.data_file) },
     { key: "open_ms", value: decimal(fixed(st.open_us, 3)) },
     { key: "entries", value: num(st.results) },
     { key: "definitions_seen", value: num(st.definitions_seen) },
-    { key: "results_bytes", value: num(st.results_bytes) },
-    { key: "prover_version", value: Str(st.prover_version) },
     { key: "obligations", value: num(st.obligations) },
     { key: "reviews", value: num(st.reviews) },
     { key: "frontend", value: frontend_json(st) },
@@ -340,32 +299,31 @@ fn stats_json(st: Stats) -> Json =
   ])
 
 fn reclaimable(s: Style, st: Stats) -> String =
-  match st.garbage_bytes {
-    None -> dim(s, "— (this store cannot say what is unreachable)"),
-    Some(g) -> dim(s, size_text(g) ++ " (" ++ int_to_string(share(g, st.data_bytes, 100)) ++ "%)"),
-  }
+  dim(
+    s,
+    size_text(st.garbage_bytes) ++ " ("
+      ++ int_to_string(share(st.garbage_bytes, st.data_bytes, 100))
+      ++ "%)",
+  )
 
 fn stats_lines(s: Style, st: Stats) -> List<String> = {
   let opened = fixed(share(st.open_us, 1000, 100), 2) ++ "ms";
   let head = [
     ind() ++ dim(s, st.directory),
     ind() ++ "opened in " ++ bold(s, opened),
-    ind() ++ "runtime " ++ st.runtime_version ++ " · " ++ bold(s, int_to_string(st.results))
-      ++ " cached "
+    ind() ++ "store format " ++ int_to_string(st.format),
+    ind() ++ "results · " ++ bold(s, int_to_string(st.results)) ++ " cached "
       ++ plural(st.results, "result")
       ++ " · "
       ++ count_of(st.definitions_seen, "definition")
-      ++ " seen · "
-      ++ dim(s, size_text(st.results_bytes)),
-    ind() ++ "prover " ++ st.prover_version ++ " · " ++ bold(s, int_to_string(st.obligations))
-      ++ " discharged "
+      ++ " seen",
+    ind() ++ "prover · " ++ bold(s, int_to_string(st.obligations)) ++ " discharged "
       ++ plural(st.obligations, "obligation")
       ++ " · "
       ++ int_to_string(st.reviews)
       ++ " accepted "
       ++ plural(st.reviews, "review"),
-    ind() ++ "front end " ++ st.frontend_version ++ " · " ++ bold(s, int_to_string(st.sources))
-      ++ " "
+    ind() ++ "front end · " ++ bold(s, int_to_string(st.sources)) ++ " "
       ++ plural(st.sources, "file")
       ++ " · "
       ++ count_of(st.defs, "definition")
@@ -451,7 +409,7 @@ fn compact_lines(s: Style, c: Compacted) -> List<String> = {
         ++ " reclaimed)",
     )
   };
-  push(sized, ind() ++ "  " ++ dim(s, "the result cache is untouched, so no test re-runs"))
+  push(sized, ind() ++ "  " ++ dim(s, "every result is kept, so no test re-runs"))
 }
 
 // --- `ply cache clear` ------------------------------------------------------
@@ -831,21 +789,276 @@ fn matched(s: Style, query: String, m: Matches) -> Answer = {
 fn inspect_answer(s: Style, query: String, answer: Result<Matches, Refusal>) -> Answer =
   match answer { Err(why) -> stopped(s, "inspect", why), Ok(m) -> matched(s, query, m) }
 
+// --- Working the store ------------------------------------------------------
+
+fn shown(place: loads::Place, name: String) -> String =
+  paths::displayed({
+    label: place.label,
+    path: if name == "" { place.dir } else { place.dir ++ "/" ++ name },
+  })
+
+fn size_of<[r]>(place: loads::Place, name: String) -> Int / {fs.read[r]} =
+  match fs.file_size[r](place.dir ++ "/" ++ name) { Some(n) -> n, None -> 0 }
+
+fn stats_of<[r]>(place: loads::Place) -> Stats / {fs.read[r], time.elapsed_us} = {
+  let started = time.elapsed_us();
+  let c = tables::open_cache[r](place.dir, place.root, []);
+  let open_us = time.elapsed_us() - started;
+  let u = tables::usage(c);
+  {
+    directory: shown(place, ""),
+    warnings: loads::diags_of(tables::warnings(c)),
+    format: engine::format(),
+    root: paths::displayed({
+      label: place.label,
+      path: if place.label == "cwd" { place.root }
+      else { string_slice(place.root, 1, string_len(place.root)) },
+    }),
+    index_file: shown(place, "store.idx"),
+    data_file: shown(place, "store.dat"),
+    open_us: open_us,
+    results: u.counts.passed,
+    definitions_seen: u.counts.seen,
+    obligations: u.counts.evidence,
+    reviews: u.counts.reviews,
+    sources: u.counts.sources,
+    defs: u.counts.defs,
+    decls: u.counts.decls,
+    bodies: u.counts.bodies,
+    index_bytes: size_of[r](place, "store.idx"),
+    data_bytes: u.data_bytes,
+    garbage_bytes: if u.data_bytes > u.live_bytes { u.data_bytes - u.live_bytes } else { 0 },
+  }
+}
+
+// The files the store keeps an entry for and may keep: every `.ply` file under the root, and the
+// shipped modules, which have no file.
+fn kept_keys<[r]>(
+  place: loads::Place,
+  c: tables::Cache,
+) -> List<String> / {fs.read[r], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
+  let root_spelling = if place.label == "cwd" { place.root }
+  else { string_slice(place.root, 1, string_len(place.root)) };
+  let found = walk::named(walk::nothing(), { label: place.label, path: root_spelling });
+  let files = map_fold(
+    found.files,
+    [],
+    |ks: List<String>, shown_path: String, at: paths::Rooted|
+      match tables::source_key(c, if at.label == "cwd" { at.path } else { "/" ++ at.path }) {
+        Some(k) -> push(ks, k),
+        None -> ks,
+      },
+  );
+  let held = tables::source_keys[r](c);
+  fold(match held.value { Some(ks) -> ks, None -> [] }, files, |ks: List<String>, k: String|
+    if string_starts_with(k, "<std>/") { push(ks, k) } else { ks })
+}
+
+fn compacted_of<[r]>(
+  place: loads::Place,
+) -> Compacted / {fs.read[r], fs.write[r], entropy.next, time.now_ms, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
+  let before = size_of[r](place, "store.idx") + size_of[r](place, "store.dat");
+  let c = tables::open_cache[r](place.dir, place.root, []);
+  let keep = kept_keys[r](place, c);
+  let pruned = tables::prune[r](c, keep);
+  let done = tables::compact_cache[r](pruned.cache);
+  {
+    directory: shown(place, ""),
+    warnings: push_all(loads::diags_of(tables::warnings(done)), loads::retired[r](place)),
+    files_kept: len(keep),
+    dropped: {
+      sources: pruned.pruned.sources,
+      defs: pruned.pruned.defs,
+      decls: pruned.pruned.decls,
+      bodies: pruned.pruned.bodies,
+    },
+    bytes_before: before,
+    bytes_after: size_of[r](place, "store.idx") + size_of[r](place, "store.dat"),
+    results: tables::counts(done).passed,
+  }
+}
+
+fn push_all<a>(xs: List<a>, ys: List<a>) -> List<a> =
+  fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
+
+fn cleared_of<[r]>(place: loads::Place) -> Result<Cleared, Refusal> / {fs.read[r], fs.write[r]} = {
+  let c = tables::open_cache[r](place.dir, place.root, []);
+  let before = tables::counts(c).passed;
+  let gone = fold(["store.dat", "store.idx"], true, |ok: Bool, name: String|
+    if fs.exists[r](place.dir ++ "/" ++ name) { fs.remove[r](place.dir ++ "/" ++ name) && ok }
+    else { ok });
+  let warnings = push_all(loads::diags_of(tables::warnings(c)), loads::retired[r](place));
+  if gone { Ok({ directory: shown(place, ""), warnings: warnings, cleared: before }) } else {
+    Err({
+      directory: Some(shown(place, "")),
+      diags: [
+        {
+          code: b"E0502",
+          notes: 1,
+          labels: [],
+          text: b"",
+          message: bytes_of_string("could not clear the cache at `" ++ shown(place, "") ++ "`"),
+          notes_text: [b"check the directory's permissions, or delete it by hand"],
+          severity: b"error",
+          fixes: [],
+        },
+      ],
+      warnings: warnings,
+    })
+  }
+}
+
+fn kind_of(e: tables::DefEntry) -> Kind =
+  match e.kind { tables::KFn -> AFn, tables::KType -> AType, tables::KEffect -> AnEffect }
+
+// A key back under its root, as the run that recorded it spelled the path.
+fn file_of(place: loads::Place, key: String) -> String =
+  if string_starts_with(key, "<") || place.root == "." { key } else { place.root ++ "/" ++ key }
+
+// `None` once the file was edited: a stored span is a range into the bytes as they were cached.
+fn located<[r]>(
+  path: String,
+  label: String,
+  content: Bytes,
+  span: tables::FileSpan,
+) -> Option<String> / {fs.read[r]} = {
+  let at = if label == "cwd" { path } else { string_slice(path, 1, string_len(path)) };
+  match fs.read_file[r](at) {
+    None -> None,
+    Some(text) -> if blake3(text) != content || span.start > bytes_len(text) { None } else {
+      let spot = spot_of(text, span.start);
+      Some(path ++ ":" ++ int_to_string(spot.line) ++ ":" ++ int_to_string(spot.col))
+    },
+  }
+}
+
+fn hit_of<[r]>(
+  place: loads::Place,
+  c: tables::Cache,
+  m: tables::Match,
+) -> { hit: Hit, cache: tables::Cache, unread: Option<String> } / {fs.read[r]} =
+  match m {
+    tables::MatchDef(d) -> {
+      let fp = tables::fingerprint[r](c, d.key);
+      let content = match fp.value { Some(f) -> f.content, None -> b"" };
+      let path = file_of(place, d.key);
+      let location = located[r](path, place.label, content, d.entry.span);
+      let slot = if d.entry.kind == tables::KFn {
+        tables::def_of[r](fp.cache, d.entry.hash, d.entry.name)
+      } else { tables::decl_of[r](fp.cache, d.entry.hash, d.entry.name) };
+      let decoded = match slot.value {
+        None -> { filed: Unfiled, unread: None },
+        Some(bytes) -> if d.entry.kind == tables::KFn {
+          match bin::decode(bytes, def_interface_bin()) {
+            Ok(v) -> { filed: FiledDefinition(v), unread: None },
+            Err(e) -> { filed: Unfiled, unread: Some(bin::error_to_string(e)) },
+          }
+        } else {
+          match bin::decode(bytes, decl_interface_bin()) {
+            Ok(v) -> { filed: FiledDeclaration(v), unread: None },
+            Err(e) -> { filed: Unfiled, unread: Some(bin::error_to_string(e)) },
+          }
+        },
+      };
+      let body = tables::body[r](slot.cache, d.entry.hash);
+      {
+        hit: {
+          name: d.entry.name,
+          kind: kind_of(d.entry),
+          hash: string_of_bytes(hex(d.entry.hash)),
+          file: path,
+          location: location,
+          stale: location == None,
+          filed: decoded.filed,
+          body: match body.value {
+            Some(b) -> Some({ encoding: b.encoding, bytes: bytes_len(b.bytes) }),
+            None -> None,
+          },
+          outcome: None,
+        },
+        cache: body.cache,
+        unread: decoded.unread,
+      }
+    },
+    tables::MatchTest(t) -> {
+      let fp = tables::fingerprint[r](c, t.key);
+      let content = match fp.value { Some(f) -> f.content, None -> b"" };
+      let path = file_of(place, t.key);
+      let location = located[r](path, place.label, content, t.entry.span);
+      let decoded = match bin::decode(t.entry.row, known_test_row_bin()) {
+        Ok(v) -> { filed: FiledTestRow(v), unread: None },
+        Err(e) -> { filed: Unfiled, unread: Some(bin::error_to_string(e)) },
+      };
+      let body = tables::body[r](fp.cache, t.entry.hash);
+      let passed = tables::passed[r](body.cache, t.entry.hash);
+      {
+        hit: {
+          name: t.entry.name,
+          kind: ATest(t.entry.nondet),
+          hash: string_of_bytes(hex(t.entry.hash)),
+          file: path,
+          location: location,
+          stale: location == None,
+          filed: decoded.filed,
+          body: match body.value {
+            Some(b) -> Some({ encoding: b.encoding, bytes: bytes_len(b.bytes) }),
+            None -> None,
+          },
+          outcome: if passed.value == Some(true) { Some(Passed) } else { None },
+        },
+        cache: passed.cache,
+        unread: decoded.unread,
+      }
+    },
+  }
+
+fn matches_of<[r]>(place: loads::Place, query: String) -> Matches / {fs.read[r]} = {
+  let c = tables::open_cache[r](place.dir, place.root, []);
+  let found = tables::lookup[r](c, query);
+  let walked = fold(
+    match found.value { Some(ms) -> ms, None -> [] },
+    { hits: [], cache: found.cache, unread: None },
+    |acc: { hits: List<Hit>, cache: tables::Cache, unread: Option<String> }, m: tables::Match| {
+      let h = hit_of[r](place, acc.cache, m);
+      {
+        hits: push(acc.hits, h.hit),
+        cache: h.cache,
+        unread: match acc.unread { Some(_) -> acc.unread, None -> h.unread },
+      }
+    },
+  );
+  {
+    directory: shown(place, ""),
+    warnings: push_all(loads::diags_of(tables::warnings(walked.cache)), match walked.unread {
+      Some(why) -> [loads::unreadable_value(why)],
+      None -> [],
+    }),
+    entries: walked.hits,
+  }
+}
+
 // The parser has already refused a word that is not one of the four, so the last arm is `inspect`.
 pub fn run(
   flags: Flags,
-) -> Answer / {store.statistics[cache], store.matches[cache], store.compacted[cache], store.cleared[cache]} = {
+) -> Answer / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_us, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
   let s: Style = style_of(flags);
-  if flags.action == "stats" { stats_answer(s, store.statistics[cache](path_of_flags(flags))) }
-  else if flags.action == "compact" {
-    compact_answer(s, store.compacted[cache](path_of_flags(flags)))
-  } else if flags.action == "clear" { clear_answer(s, store.cleared[cache](path_of_flags(flags))) }
-  else { inspect_answer(s, flags.query, store.matches[cache](flags.query, path_of_flags(flags))) }
+  let place = loads::place_of(flags.paths);
+  let cwd = place.label == "cwd";
+  if flags.action == "stats" {
+    stats_answer(s, Ok(if cwd { stats_of[cwd](place) } else { stats_of[abs](place) }))
+  } else if flags.action == "compact" {
+    compact_answer(s, Ok(if cwd { compacted_of[cwd](place) } else { compacted_of[abs](place) }))
+  } else if flags.action == "clear" {
+    clear_answer(s, if cwd { cleared_of[cwd](place) } else { cleared_of[abs](place) })
+  } else {
+    inspect_answer(
+      s,
+      flags.query,
+      Ok(if cwd { matches_of[cwd](place, flags.query) }
+      else { matches_of[abs](place, flags.query) }),
+    )
+  }
 }
-
-// The store's root is the line's path, resolved, or the working directory.
-fn path_of_flags(flags: Flags) -> String =
-  match list_at(flags.paths, 0) { Some(r) -> r.machine, None -> "." }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -853,17 +1066,13 @@ fn no_stats() -> Stats =
   {
     directory: "/p/.ply-cache",
     warnings: [],
-    runtime_version: "0.16.0",
-    frontend_version: "0.26.0",
-    prover_version: "0.7.0",
+    format: 1,
     root: "/p",
-    results_file: "/p/.ply-cache/results.json",
-    frontend_file: "/p/.ply-cache/frontend.idx",
-    frontend_data_file: "/p/.ply-cache/frontend.dat",
+    index_file: "/p/.ply-cache/store.idx",
+    data_file: "/p/.ply-cache/store.dat",
     open_us: 0,
     results: 0,
     definitions_seen: 0,
-    results_bytes: 0,
     obligations: 0,
     reviews: 0,
     sources: 0,
@@ -872,7 +1081,7 @@ fn no_stats() -> Stats =
     bodies: 0,
     index_bytes: 0,
     data_bytes: 0,
-    garbage_bytes: None,
+    garbage_bytes: 0,
   }
 
 fn an_entry() -> Entry =
@@ -898,11 +1107,10 @@ test "a size is exact in bytes and two decimals above that" {
 }
 
 test "a half-wasted data file is where compaction starts being suggested" {
-  let half: Stats = { ..no_stats(), data_bytes: 1000, garbage_bytes: Some(400) };
+  let half: Stats = { ..no_stats(), data_bytes: 1000, garbage_bytes: 400 };
   assert(!compact_suggested(half));
-  assert(compact_suggested({ ..half, garbage_bytes: Some(501) }));
-  // An unmeasurable share is not a reason to suggest anything.
-  assert(!compact_suggested({ ..half, garbage_bytes: None }))
+  assert(compact_suggested({ ..half, garbage_bytes: 501 }));
+  assert(!compact_suggested({ ..half, data_bytes: 0, garbage_bytes: 0 }))
 }
 
 test "the statistics read as four lines and the sizes under them" {
@@ -911,7 +1119,6 @@ test "the statistics read as four lines and the sizes under them" {
     open_us: 1234,
     results: 2,
     definitions_seen: 3,
-    results_bytes: 2048,
     obligations: 1,
     reviews: 0,
     sources: 1,
@@ -920,32 +1127,26 @@ test "the statistics read as four lines and the sizes under them" {
     bodies: 4,
     index_bytes: 512,
     data_bytes: 1000,
-    garbage_bytes: Some(250),
+    garbage_bytes: 250,
   };
   let lines = stats_lines(plain(), st);
   assert_eq(at(lines, 0, ""), "   /p/.ply-cache");
   assert_eq(at(lines, 1, ""), "   opened in 1.23ms");
-  assert_eq(
-    at(lines, 2, ""),
-    "   runtime 0.16.0 · 2 cached results · 3 definitions seen · 2.00 KB",
-  );
-  assert_eq(at(lines, 3, ""), "   prover 0.7.0 · 1 discharged obligation · 0 accepted reviews");
-  assert_eq(
-    at(lines, 4, ""),
-    "   front end 0.26.0 · 1 file · 4 definitions · 1 declaration · 4 bodies",
-  );
-  assert_eq(at(lines, 5, ""), "     index 512 B · data 1000 B · reclaimable 250 B (25%)");
-  assert_eq(at(lines, 6, ""), "     a result entry is one proven configuration, not one test")
-}
-
-test "a store that cannot say what is unreachable says so instead of a figure" {
-  let lines = stats_lines(plain(), { ..no_stats(), index_bytes: 1, data_bytes: 2 });
+  assert_eq(at(lines, 2, ""), "   store format 1");
+  assert_eq(at(lines, 3, ""), "   results · 2 cached results · 3 definitions seen");
+  assert_eq(at(lines, 4, ""), "   prover · 1 discharged obligation · 0 accepted reviews");
   assert_eq(
     at(lines, 5, ""),
-    "     index 1 B · data 2 B · reclaimable — (this store cannot say what is unreachable)",
+    "   front end · 1 file · 4 definitions · 1 declaration · 4 bodies",
   );
-  // Nothing cached, so the note about what an entry counts is withheld.
-  assert_eq(len(lines), 6)
+  assert_eq(at(lines, 6, ""), "     index 512 B · data 1000 B · reclaimable 250 B (25%)");
+  assert_eq(at(lines, 7, ""), "     a result entry is one proven configuration, not one test")
+}
+
+test "an empty store has nothing to reclaim and no note about what an entry counts" {
+  let lines = stats_lines(plain(), { ..no_stats(), index_bytes: 1, data_bytes: 2 });
+  assert_eq(at(lines, 6, ""), "     index 1 B · data 2 B · reclaimable 0 B (0%)");
+  assert_eq(len(lines), 7)
 }
 
 test "compaction that dropped nothing and reclaimed nothing still says what it did" {
@@ -961,7 +1162,7 @@ test "compaction that dropped nothing and reclaimed nothing still says what it d
   assert_eq(compact_lines(plain(), c), [
     "   compacted /p/.ply-cache",
     "     900 B · nothing to reclaim",
-    "     the result cache is untouched, so no test re-runs",
+    "     every result is kept, so no test re-runs",
   ]);
   let swept: Compacted = {
     ..c,
@@ -972,7 +1173,7 @@ test "compaction that dropped nothing and reclaimed nothing still says what it d
     "   compacted /p/.ply-cache",
     "     dropped 1 file · 2 definitions · 0 declarations · 2 bodies",
     "     900 B → 400 B (500 B reclaimed)",
-    "     the result cache is untouched, so no test re-runs",
+    "     every result is kept, so no test re-runs",
   ])
 }
 
@@ -1077,22 +1278,20 @@ test "a second match is separated by a blank line and counted under both" {
   assert_eq(len(inspect_lines(plain(), "shared", [one])), 5)
 }
 
-// The run's own answer, over a store the test hands it in place of the Rust side.
+// The answer the subcommand the flags name gives, over what the store was found to hold.
 fn answered_over(
   flags: Flags,
   answer: Result<Stats, Refusal>,
   hits: Result<Matches, Refusal>,
   swept: Result<Compacted, Refusal>,
   emptied: Result<Cleared, Refusal>,
-) -> Answer =
-  handle {
-    run(flags)
-  } with {
-    store.statistics[cache](root) -> answer,
-    store.matches[cache](query, root) -> hits,
-    store.compacted[cache](root) -> swept,
-    store.cleared[cache](root) -> emptied,
-  }
+) -> Answer = {
+  let s: Style = style_of(flags);
+  if flags.action == "stats" { stats_answer(s, answer) }
+  else if flags.action == "compact" { compact_answer(s, swept) }
+  else if flags.action == "clear" { clear_answer(s, emptied) }
+  else { inspect_answer(s, flags.query, hits) }
+}
 
 fn nowhere() -> Refusal = { directory: None, diags: [], warnings: [] }
 
@@ -1112,7 +1311,7 @@ test "the action picks the subcommand, and its object keys off `command` and `ac
   assert(string_contains(text, "\"exit_code\":0"));
   assert(string_contains(text, "\"entries\":2"));
   assert(string_contains(text, "\"compact_suggested\":false"));
-  assert(string_contains(text, "\"runtime_version\":\"0.16.0\""))
+  assert(string_contains(text, "\"format\":1"))
 }
 
 test "a store that never opened is exit 2 and names no cache" {

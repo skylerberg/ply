@@ -3,8 +3,7 @@
 //! seeded analysis is sound through every kind of edit is the compiler's own property, and
 //! `crates/ply-compiler/ply/front.ply` tests it over sessions of edits.
 
-use crate::harness::{ply, seeding, warm_agrees, write};
-use ply_store::{ContentHash, Store};
+use crate::harness::{json_of, ply, seeding, warm_agrees, write};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -330,29 +329,34 @@ fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
         "each definition's scheme must name its own module's type"
     );
 
-    let store = Store::open(dir.path()).unwrap();
-    let hash_of = |file: &str, name: &str| {
-        store
-            .fingerprint(&dir.path().join(file))
-            .expect("the file is on record")
-            .defs
-            .iter()
-            .find(|e| e.name.as_str() == name)
-            .expect("the definition is on record")
-            .hash
-    };
-    let shared = hash_of("a.ply", "a.peel");
+    let inspected = json_of(
+        &ply(dir.path())
+            .args(["cache", "inspect", "peel", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let filed: Vec<(&str, &str, &str)> = inspected["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["name"].as_str().unwrap(),
+                m["hash"].as_str().unwrap(),
+                m["interface"]["type"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(filed.len(), 2, "{inspected}");
     assert_eq!(
-        shared,
-        hash_of("b.ply", "b.peel"),
+        filed[0].1, filed[1].1,
         "the fixture is only interesting while the two hash alike"
     );
-    for name in ["a.peel", "b.peel"] {
-        assert!(
-            store.def_of(shared, &ply_eval::Symbol::new(name)).is_some(),
-            "`{name}` has a slot of its own under the shared hash"
-        );
-    }
+    assert_eq!(
+        [filed[0].2, filed[1].2],
+        ["(a.Thing) -> Int", "(b.Thing) -> Int"],
+        "each definition has a slot of its own under the shared hash"
+    );
 }
 
 #[test]
@@ -360,7 +364,7 @@ fn a_corrupt_front_end_cache_degrades_to_a_cold_check_and_is_repaired() {
     let dir = corpus();
     warm_agrees(dir.path(), "cold");
     fs::write(
-        dir.path().join(".ply-cache/frontend.idx"),
+        dir.path().join(".ply-cache/store.idx"),
         "not an index at all",
     )
     .unwrap();
@@ -402,7 +406,7 @@ fn a_cache_mangled_mid_session_degrades_and_recovers() {
     );
     warm_agrees(dir.path(), "edited");
 
-    let data = dir.path().join(".ply-cache/frontend.dat");
+    let data = dir.path().join(".ply-cache/store.dat");
     let mut bytes = fs::read(&data).unwrap();
     for byte in bytes.iter_mut().skip(64) {
         *byte ^= 0x5a;
@@ -417,7 +421,7 @@ fn a_cache_mangled_mid_session_degrades_and_recovers() {
 fn fingerprints_without_their_interfaces_are_refused_rather_than_believed() {
     let dir = corpus();
     warm_agrees(dir.path(), "cold");
-    fs::remove_file(dir.path().join(".ply-cache/frontend.dat")).unwrap();
+    fs::remove_file(dir.path().join(".ply-cache/store.dat")).unwrap();
     warm_agrees(dir.path(), "fingerprints with no interfaces behind them");
     warm_agrees(dir.path(), "and the run after that");
 }
@@ -432,9 +436,15 @@ fn a_single_file_run_does_not_spoil_the_whole_project_run_after_it() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
+    let stats = json_of(
+        &ply(dir.path())
+            .args(["cache", "stats", "--json"])
+            .output()
+            .unwrap(),
+    );
     assert!(
-        Store::open(dir.path()).unwrap().sources_len() >= 3,
-        "a single-file run must not have pruned the rest of the project"
+        stats["frontend"]["sources"].as_u64().unwrap() >= 3,
+        "a single-file run must not have pruned the rest of the project: {stats}"
     );
     warm_agrees(dir.path(), "whole project after a single-file run");
 }
@@ -471,7 +481,7 @@ fn a_load_that_does_not_cache_files_nothing() {
     );
     let untouched = |what: &str| {
         let cache = dir.path().join(".ply-cache");
-        let filed = cache.join("frontend.idx").exists() || cache.join("frontend.dat").exists();
+        let filed = cache.join("store.idx").exists() || cache.join("store.dat").exists();
         assert!(!filed, "{what} filed a front-end cache");
     };
     ply_machine::load::load(dir.path()).expect("the program loads");
@@ -515,8 +525,7 @@ fn a_dependency_module_is_filed_under_its_package_and_survives_the_package_movin
         "app/main.ply",
         "import lib.answer\nfn main() -> Int = answer::answer()\n",
     );
-    let lib_manifest = manifest("lib", "");
-    write(root, "lib/ply.pkg", &lib_manifest);
+    write(root, "lib/ply.pkg", &manifest("lib", ""));
     write(root, "lib/answer.ply", "pub fn answer() -> Int = 42\n");
     let app = root.join("app");
 
@@ -527,25 +536,6 @@ fn a_dependency_module_is_filed_under_its_package_and_survives_the_package_movin
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let identity = ContentHash::of(lib_manifest.as_bytes()).to_hex();
-    let mut store = Store::open(&app).unwrap();
-    assert!(
-        store
-            .source_keys()
-            .contains(&format!("{identity}/answer.ply")),
-        "the dependency's module is keyed by its package's identity: {:?}",
-        store.source_keys()
-    );
-    store.set_packages(vec![(PathBuf::from("/anywhere"), identity.clone())]);
-    let filed = store
-        .fingerprint(Path::new("/anywhere/answer.ply"))
-        .expect("found by the package it belongs to");
-    assert_eq!(
-        filed.module, "lib.answer",
-        "filed under the name the front end gave it"
-    );
-    drop(store);
-
     // The package is checked out somewhere else, and its manifest is unchanged: the rows filed for
     // it are the moved package's too.
     fs::create_dir_all(root.join("vendor")).unwrap();

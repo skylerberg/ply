@@ -1,10 +1,8 @@
-//! The stored form of a definition body: DESIGN.md §3's `Definition`, the one element of `Hash ->
-//! (Definition, Type, Footprint)` the store never held.
+//! A definition body as the front end writes it: its canonical bytes in an envelope that checks
+//! them against the hash they are filed under. An artifact carries its closure's bodies so.
 
 use indexmap::IndexMap;
 use ply_eval::{DefHash, Symbol};
-
-use crate::{BODY_ENCODING, DefBody, Store};
 
 /// A definition that is its own strongly connected component: the payload is its normalized bytes
 /// and `blake3(payload)` is the key.
@@ -32,7 +30,7 @@ enum Shape<'a> {
 }
 
 impl StoredBody {
-    /// Bytes read back from a store.
+    /// Bytes read back from where they were filed.
     pub fn from_bytes(bytes: Vec<u8>) -> Option<StoredBody> {
         let body = StoredBody(bytes);
         body.shape()?;
@@ -101,7 +99,7 @@ impl StoredBody {
     }
 }
 
-/// The bodies out of a front end's answer, keyed the way the store files them.
+/// The bodies out of a front end's answer, keyed by the hash each is filed under.
 ///
 /// The front end writes each body as [`StoredBody::as_bytes`]; `from_bytes` reads that envelope
 /// back, so `key()` re-derives the hash the definition is filed under rather than being told it. A
@@ -177,42 +175,5 @@ impl BodySet {
 
     pub fn is_empty(&self) -> bool {
         self.defs.is_empty() && self.tests.is_empty()
-    }
-}
-
-impl DefBody {
-    pub fn of(body: StoredBody) -> DefBody {
-        DefBody::new(BODY_ENCODING, body.into_bytes())
-    }
-
-    /// `None` for an encoding this build does not speak, or bytes that are not a body envelope.
-    pub fn stored(&self) -> Option<StoredBody> {
-        if self.encoding() != BODY_ENCODING {
-            return None;
-        }
-        StoredBody::from_bytes(self.as_bytes().to_vec())
-    }
-
-    pub fn key(&self) -> Option<DefHash> {
-        self.stored()?.key()
-    }
-
-    pub fn verifies_as(&self, hash: DefHash) -> bool {
-        self.key() == Some(hash)
-    }
-}
-
-impl Store {
-    /// `hashes` must already be closed: finding what a body reaches means decoding it.
-    pub fn body_set(&self, hashes: impl IntoIterator<Item = DefHash>) -> (BodySet, Vec<DefHash>) {
-        let mut set = BodySet::default();
-        let mut missing = Vec::new();
-        for hash in hashes {
-            match self.body(hash).and_then(|b| b.stored()) {
-                Some(body) if body.verify(hash) => set.insert(hash, body),
-                _ => missing.push(hash),
-            }
-        }
-        (set, missing)
     }
 }

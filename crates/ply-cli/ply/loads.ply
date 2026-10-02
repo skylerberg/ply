@@ -1,0 +1,425 @@
+// What a load reads from the store before the front end and files there after it: every row filed
+// for the files it reads, then the fingerprints, interfaces and bodies the front end published.
+
+import std.bin
+import std.fs (fs, mem_empty)
+import std.random (entropy)
+import std.time (time)
+import std.hash (blake3)
+import compiler.front (DefInterface, KnownTestRow, Filing, FiledModule, FiledEntry, FiledTest,
+                       FiledDef, FiledDecl, FiledBody, FiledMember, FiledSpan, body_encoding,
+                       def_interface_bin, decl_interface_bin, known_test_row_bin)
+import compiler.resolve (Diag)
+import paths
+import store.engine (Warning, Unreadable, Corrupt, OtherVersion)
+import store.tables (Cache, Fingerprint, DefEntry, TestEntry, Member, FileSpan, DefKind, KFn, KType,
+                     KEffect, Package, Body, open_cache, flush_cache, fingerprint, put_fingerprint,
+                     def_of, put_def, put_decl, put_body, prune, source_key, source_keys,
+                     shipped_digest, put_shipped_digest, warnings)
+import store.twin (on_twin)
+
+// One file a load read: where from, the module it is, and its bytes. The store keys it by its path,
+// a dependency's under its package's identity, and a shipped module's by its pseudo-path.
+pub type SourceFile = { path: String, name: String, text: Bytes }
+
+// A dependency package's root, and the identity its files are keyed under: its manifest's digest.
+pub type SourcePackage = { root: String, digest: String }
+
+pub type Sources = { files: List<SourceFile>, packages: List<SourcePackage> }
+
+// A shipped module's entry as the store last filed it.
+pub type ShippedEntry = { name: Bytes, hash: Bytes }
+
+// What the shipped modules were when the store was last filed, by a compiler whose were different.
+pub type StdlibMoved = { was: String, now: String, entries: List<ShippedEntry> }
+
+// What the store holds for the files a load reads: every definition's and test's filed rows,
+// whatever hash each was filed under, and what opening and reading the store degraded past.
+pub type Recorded = {
+  defs: List<DefInterface>,
+  tests: List<KnownTestRow>,
+  stdlib: Option<StdlibMoved>,
+  warnings: List<Diag>,
+}
+
+// Where a load keeps its store: `.ply-cache` in the project root, under the root's own label, with
+// the root as the machine spells the files it keys.
+pub type Place = { label: String, dir: String, root: String }
+
+pub fn place_of(paths: List<paths::Resolved>) -> Place =
+  match list_at(paths, 0) {
+    Some(r) ->
+      {
+        label: r.label,
+        dir: paths::in_root(r, ".ply-cache").path,
+        root: if r.label == "cwd" { r.spelling } else { "/" ++ r.spelling },
+      },
+    None -> { label: "cwd", dir: ".ply-cache", root: "." },
+  }
+
+fn packages_of(ps: List<SourcePackage>) -> List<Package> =
+  map(ps, |p: SourcePackage| { root: p.root, identity: p.digest })
+
+fn opened<[r]>(place: Place, sources: Sources) -> Cache / {fs.read[r]} =
+  open_cache[r](place.dir, place.root, packages_of(sources.packages))
+
+fn warning(code: Bytes, message: String, notes: List<String>) -> Diag =
+  {
+    code: code,
+    notes: len(notes),
+    labels: [],
+    text: b"",
+    message: bytes_of_string(message),
+    notes_text: map(notes, bytes_of_string),
+    severity: b"warning",
+    fixes: [],
+  }
+
+// The store's own account of what it degraded past, in the codes a report names them by.
+pub fn diags_of(ws: List<Warning>) -> List<Diag> =
+  map(ws, |w: Warning|
+    match w.trouble {
+      Unreadable ->
+        warning(b"W0601", w.message, [
+          "this run is unaffected; the next one will do this work again",
+        ]),
+      Corrupt ->
+        warning(b"W0602", "the cache is corrupt: " ++ w.message, [
+          "whatever needed it is recomputed, and `ply cache compact` rewrites the data file",
+        ]),
+      OtherVersion -> warning(b"W0603", w.message, ["the store is rebuilt as this run files"]),
+    })
+
+pub fn unreadable_value(why: String) -> Diag =
+  warning(b"W0602", "the cache is corrupt: a filed value does not read back: " ++ why, [
+    "that entry is treated as absent, and what it answered for is checked again",
+  ])
+
+// The files the store kept before it was one data file and one index.
+fn retired_names() -> List<String> =
+  [
+    "frontend.json",
+    "frontend.idx",
+    "frontend.dat",
+    "results.json",
+    "passes.json",
+    "obligations.json",
+    "reviews.json",
+    "stdlib",
+    "lock",
+  ]
+
+fn retired_temp(name: String) -> Bool =
+  string_ends_with(name, ".tmp")
+    && fold(
+      ["results.", "passes.", "obligations.", "reviews.", "frontend."],
+      false,
+      |hit: Bool, stem: String| hit || string_starts_with(name, stem),
+    )
+
+// Removes what an earlier format left, and says so the one time there was something to remove.
+pub fn retired<[r]>(place: Place) -> List<Diag> / {fs.read[r], fs.write[r]} =
+  match fs.list_dir[r](place.dir) {
+    None -> [],
+    Some(names) -> {
+      let old = filter(names, |n: String|
+        fold(retired_names(), false, |hit: Bool, r: String| hit || r == n) || retired_temp(n));
+      let removed = fold(old, 0, |n: Int, name: String|
+        if fs.remove[r](place.dir ++ "/" ++ name) { n + 1 } else { n });
+      if removed == 0 { [] } else {
+        [
+          warning(
+            b"W0603",
+            "the cache's format changed; the files the old format kept were removed",
+            [
+              "the results, proofs and front end it held are rebuilt as runs go, so tests re-run once",
+            ],
+          ),
+        ]
+      }
+    },
+  }
+
+// --- Reading ----------------------------------------------------------------
+
+type Gathered = {
+  cache: Cache,
+  defs: List<DefInterface>,
+  tests: List<KnownTestRow>,
+  unread: Option<String>,
+}
+
+fn decoded<a>(
+  g: Gathered,
+  bytes: Bytes,
+  codec: bin::BinCodec<a>,
+) -> { value: Option<a>, g: Gathered } =
+  match bin::decode(bytes, codec) {
+    Ok(v) -> { value: Some(v), g: g },
+    Err(e) ->
+      {
+        value: None,
+        g: {
+          ..g,
+          unread: match g.unread { Some(_) -> g.unread, None -> Some(bin::error_to_string(e)) },
+        },
+      },
+  }
+
+// Every row filed for a definition or a test the files declare, whatever its hash: the front end
+// takes a row only where the hash it was filed under is still the item's.
+fn gathered<[r]>(g0: Gathered, f: SourceFile) -> Gathered / {fs.read[r]} =
+  match source_key(g0.cache, f.path) {
+    None -> g0,
+    Some(key) -> {
+      let got = fingerprint[r](g0.cache, key);
+      match got.value {
+        None -> { ..g0, cache: got.cache },
+        Some(fp) -> {
+          let withdefs = fold(fp.defs, { ..g0, cache: got.cache }, |g: Gathered, e: DefEntry|
+            if e.kind != KFn { g } else {
+              let slot = def_of[r](g.cache, e.hash, e.name);
+              match slot.value {
+                None -> { ..g, cache: slot.cache },
+                Some(bytes) -> {
+                  let d = decoded({ ..g, cache: slot.cache }, bytes, def_interface_bin());
+                  match d.value { Some(v) -> { ..d.g, defs: push(d.g.defs, v) }, None -> d.g }
+                },
+              }
+            });
+          fold(fp.tests, withdefs, |g: Gathered, t: TestEntry| {
+            let d = decoded(g, t.row, known_test_row_bin());
+            match d.value { Some(v) -> { ..d.g, tests: push(d.g.tests, v) }, None -> d.g }
+          })
+        },
+      }
+    },
+  }
+
+fn is_shipped_key(key: String) -> Bool = string_starts_with(key, "<std>/")
+
+// The shipped modules' entries as they were filed, when a compiler whose shipped modules differ
+// filed them: the program says what that change reached.
+fn moved<[r]>(
+  c: Cache,
+  now: String,
+) -> { moved: Option<StdlibMoved>, cache: Cache } / {fs.read[r]} = {
+  let was = shipped_digest[r](c);
+  match was.value {
+    None -> { moved: None, cache: was.cache },
+    Some(d) -> if d == now { { moved: None, cache: was.cache } } else {
+      let ks = source_keys[r](was.cache);
+      let walked = fold(
+        filter(match ks.value { Some(xs) -> xs, None -> [] }, is_shipped_key),
+        { entries: [], cache: ks.cache },
+        |acc: { entries: List<ShippedEntry>, cache: Cache }, k: String| {
+          let got = fingerprint[r](acc.cache, k);
+          match got.value {
+            None -> { entries: acc.entries, cache: got.cache },
+            Some(fp) ->
+              {
+                entries: fold(fp.defs, acc.entries, |es: List<ShippedEntry>, e: DefEntry|
+                  push(es, { name: bytes_of_string(e.name), hash: e.hash })),
+                cache: got.cache,
+              },
+          }
+        },
+      );
+      { moved: Some({ was: d, now: now, entries: walked.entries }), cache: walked.cache }
+    },
+  }
+}
+
+// What the store holds for the files a load is about to read. `now` is the shipped modules' digest.
+pub fn known<[r]>(place: Place, sources: Sources, now: String) -> Recorded / {fs.read[r]} = {
+  let g = fold(
+    sources.files,
+    { cache: opened[r](place, sources), defs: [], tests: [], unread: None },
+    |acc: Gathered, f: SourceFile| gathered[r](acc, f),
+  );
+  let m = moved[r](g.cache, now);
+  {
+    defs: g.defs,
+    tests: g.tests,
+    stdlib: m.moved,
+    warnings: push_all(diags_of(warnings(m.cache)), match g.unread {
+      Some(why) -> [unreadable_value(why)],
+      None -> [],
+    }),
+  }
+}
+
+fn push_all<a>(xs: List<a>, ys: List<a>) -> List<a> =
+  fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
+
+// --- Filing -----------------------------------------------------------------
+
+fn span_of(s: FiledSpan) -> FileSpan = { start: s.start, end: s.end }
+
+fn kind_of(k: Bytes) -> DefKind =
+  if k == b"fn" { KFn } else if k == b"type" { KType } else { KEffect }
+
+fn entry_of(e: FiledEntry) -> DefEntry =
+  {
+    name: string_of_bytes_lossy(e.name),
+    hash: e.hash,
+    span: span_of(e.span),
+    kind: kind_of(e.kind),
+    members: map(e.members, |m: FiledMember|
+      { name: string_of_bytes_lossy(m.name), span: span_of(m.span) }),
+  }
+
+fn test_of(t: FiledTest) -> TestEntry =
+  {
+    name: string_of_bytes_lossy(t.name),
+    hash: t.hash,
+    nondet: t.nondet,
+    span: span_of(t.span),
+    row: bin::encode(t.row, known_test_row_bin()),
+  }
+
+fn print_of(c: Cache, sources: Sources, m: FiledModule) -> Option<Fingerprint> =
+  match list_at(sources.files, m.source) {
+    None -> None,
+    Some(f) -> match source_key(c, f.path) {
+      None -> None,
+      Some(key) ->
+        Some({
+          key: key,
+          content: blake3(f.text),
+          module: string_of_bytes_lossy(m.name),
+          defs: map(m.entries, entry_of),
+          tests: map(m.tests, test_of),
+        }),
+    },
+  }
+
+// Files what an analysis published. A load of the whole project also drops what no file of it
+// names. Nothing here fails the run: the store's trouble is warned about, and the next run does this
+// work again.
+pub fn file<[r]>(
+  place: Place,
+  sources: Sources,
+  filing: Filing,
+  whole: Bool,
+  now: String,
+) -> List<Diag> / {fs.read[r], fs.write[r], entropy.next, time.now_ms} = {
+  let c0 = opened[r](place, sources);
+  let c1 = fold(filing.modules, c0, |c: Cache, m: FiledModule|
+    match print_of(c, sources, m) { Some(fp) -> put_fingerprint[r](c, fp), None -> c });
+  let c2 = fold(filing.defs, c1, |c: Cache, d: FiledDef|
+    put_def[r](
+      c,
+      d.hash,
+      string_of_bytes_lossy(d.name),
+      bin::encode(d.interface, def_interface_bin()),
+    ));
+  let c3 = fold(filing.decls, c2, |c: Cache, d: FiledDecl|
+    put_decl[r](
+      c,
+      d.hash,
+      string_of_bytes_lossy(d.name),
+      bin::encode(d.interface, decl_interface_bin()),
+    ));
+  let c4 = fold(filing.bodies, c3, |c: Cache, b: FiledBody|
+    put_body[r](c, b.hash, { encoding: body_encoding(), bytes: b.body }));
+  let c5 = if whole {
+    prune[r](
+      c4,
+      fold(sources.files, [], |ks: List<String>, f: SourceFile|
+        match source_key(c4, f.path) { Some(k) -> push(ks, k), None -> ks }),
+    ).cache
+  } else { c4 };
+  let was = shipped_digest[r](c5);
+  let c6 = if was.value == Some(now) { was.cache } else { put_shipped_digest(was.cache, now) };
+  let kept = diags_of(warnings(flush_cache[r](c6)));
+  fold(retired[r](place), kept, |ds: List<Diag>, d: Diag| push(ds, d))
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_place() -> Place = { label: "mem", dir: "cache", root: "" }
+
+fn shipped_sources() -> Sources =
+  {
+    files: [{ path: "<std>/net.ply", name: "std.net", text: b"pub fn drain() -> Int = 0\n" }],
+    packages: [],
+  }
+
+fn drain_entry() -> DefEntry =
+  {
+    name: "std.net.drain",
+    hash: blake3(b"drain"),
+    span: { start: 0, end: 1 },
+    kind: KFn,
+    members: [],
+  }
+
+// What a load whose shipped modules digest to `now` is told, over a store last filed under `was`.
+fn told(was: String, now: String) -> { before: Option<StdlibMoved>, after: Option<StdlibMoved> } =
+  on_twin(mem_empty(), || {
+    let c0 = put_fingerprint[mem](open_cache[mem]("cache", "", []), {
+      key: "<std>/net.ply",
+      content: blake3(b"what the last compiler shipped"),
+      module: "std.net",
+      defs: [drain_entry()],
+      tests: [],
+    });
+    let c1 = flush_cache[mem](put_shipped_digest(c0, was));
+    let before = known[mem](a_place(), shipped_sources(), now).stdlib;
+    let filed = file[mem](
+      a_place(),
+      shipped_sources(),
+      { modules: [], defs: [], decls: [], bodies: [] },
+      false,
+      now,
+    );
+    { before: before, after: known[mem](a_place(), shipped_sources(), now).stdlib }
+  }).value
+
+test "a store filed under other shipped modules says what it held for them, until it is filed again" {
+  let t = told("b3:old", "b3:new");
+  assert_eq(
+    t.before,
+    Some({
+      was: "b3:old",
+      now: "b3:new",
+      entries: [{ name: b"std.net.drain", hash: blake3(b"drain") }],
+    }),
+  );
+  assert_eq(t.after, None)
+}
+
+test "a store filed under these shipped modules says nothing moved" {
+  assert_eq(told("b3:same", "b3:same"), { before: None, after: None })
+}
+
+test "a cold store has no shipped modules to compare against" {
+  let run = on_twin(mem_empty(), || {
+    let r = known[mem](a_place(), shipped_sources(), "b3:new");
+    let c = flush_cache[mem](open_cache[mem]("cache", "", []));
+    r
+  });
+  assert_eq(run.value.stdlib, None);
+  assert_eq(run.value.warnings, [])
+}
+
+// Writes `names` into the store's directory, under the row the twin handles.
+fn planted<[r]>(names: List<String>) -> Bool / {fs.read[r], fs.write[r]} =
+  fs.create_dir[r]("cache")
+    && fold(names, true, |ok: Bool, n: String| ok && fs.write_file[r]("cache/" ++ n, b""))
+
+fn listed<[r]>() -> Option<List<String>> / {fs.read[r]} = fs.list_dir[r]("cache")
+
+test "the files an earlier format kept are removed once, and said so once" {
+  let run = on_twin(mem_empty(), || {
+    let wrote = planted[mem](["results.json", "frontend.idx.tmp", "keep.me"]);
+    let first = retired[mem](a_place());
+    let c = flush_cache[mem](open_cache[mem]("cache", "", []));
+    { wrote: wrote, first: len(first), second: len(retired[mem](a_place())), left: listed[mem]() }
+  });
+  assert_eq(run.value.wrote, true);
+  assert_eq(run.value.first, 1);
+  assert_eq(run.value.second, 0);
+  assert_eq(run.value.left, Some(["keep.me"]))
+}

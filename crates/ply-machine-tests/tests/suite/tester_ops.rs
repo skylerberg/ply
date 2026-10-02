@@ -1,7 +1,7 @@
 //! The `tester` family as a program drives it: a unit over a project, the binding over it, each
-//! test run once on the thread that asks, what the binding came to, and the result cache read and
-//! written under keys the program names. Which tests run and what their results establish are the
-//! program's; this checks the runtime carries out what it is asked and answers what it saw.
+//! test run once on the thread that asks, and what the binding came to. Which tests run, what their
+//! results establish and what the cache keeps are the program's; this checks the runtime carries out
+//! what it is asked and answers what it saw.
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{Machine, Provider, Span, Value};
@@ -19,11 +19,6 @@ nondet effect tester {
   read hosted[r]() -> Hosted
   write ended[r]() -> Unit
   read executed[r](unit: Int, index: Int) -> Executed
-  read opened[r]() -> List<Diag>
-  read outcomes[r](keys: List<String>) -> List<Option<String>>
-  read seen[r](hashes: List<String>) -> List<Bool>
-  read baselines[r](keys: List<String>) -> List<Option<PassRecord>>
-  write filed[r](filing: Filing) -> Filed
 }
 
 type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
@@ -71,14 +66,6 @@ type Hosted = {
   cores: Int,
   backend: Compiled,
 }
-type Named = { name: String, hash: String }
-type PassRecord = { test: String, closure: List<Named>, decls: List<Named> }
-type Filing = {
-  passes: List<String>,
-  records: List<{ key: String, record: PassRecord }>,
-  seen: List<String>,
-}
-type Filed = { unflushed: Option<String>, warnings: List<Diag> }
 type Front = {
   dump: Bytes,
   files: List<{ path: String, name: String, text: Bytes }>,
@@ -119,30 +106,15 @@ fn options(root: String) -> Options =
     config: { set: [], files: [], schema: None },
   }
 
-fn key(digit: String) -> String = fold(range(0, 64), "", |acc: String, i: Int| acc ++ digit)
-
-fn said(xs: List<Option<String>>) -> String =
-  fold(xs, "", |acc: String, x: Option<String>|
-    acc ++ (if acc == "" { "" } else { "," }) ++ (match x { Some(w) -> w, None -> "none" }))
-
-fn flags(xs: List<Bool>) -> String =
-  fold(xs, "", |acc: String, x: Bool|
-    acc ++ (if acc == "" { "" } else { "," }) ++ (if x { "yes" } else { "no" }))
-
-fn held(xs: List<Option<PassRecord>>) -> String =
-  fold(xs, "", |acc: String, x: Option<PassRecord>|
-    acc ++ (if acc == "" { "" } else { "," }) ++ (match x { Some(r) -> r.test, None -> "none" }))
 "#;
 
-/// One run over a project: its tests, the binding, and the store written and read back.
+/// One run over a project: its tests and the binding.
 const ONE_RUN: &str = r#"
 fn main(root: String, front: Front) -> String / {
   tester.configure[r], tester.unit[r], tester.bound[r], tester.hosted[r], tester.ended[r],
-  tester.executed[r], tester.opened[r], tester.outcomes[r], tester.seen[r], tester.baselines[r],
-  tester.filed[r],
+  tester.executed[r],
 } = {
   tester.configure[r](options(root));
-  let opened = tester.opened[r]();
   match tester.unit[r](front, true, true) {
     Err(_) -> "no unit",
     Ok(u) -> match tester.bound[r]() {
@@ -152,53 +124,30 @@ fn main(root: String, front: Front) -> String / {
         let wrong = tester.executed[r](u, 1);
         let peeks = tester.executed[r](u, 2);
         let h = tester.hosted[r]();
-        let filed = tester.filed[r]({
-          passes: [key("a")],
-          records: [
-            {
-              key: "m.adds",
-              record: { test: key("a"), closure: [{ name: "m.add", hash: key("b") }], decls: [] },
-            },
-          ],
-          seen: [key("b")],
-        });
-        let back = said(tester.outcomes[r]([key("a"), key("c")]));
-        let records = held(tester.baselines[r](["m.adds", "m.wrong"]));
-        let known = flags(tester.seen[r]([key("b"), key("c")]));
         tester.ended[r]();
         adds.status ++ " " ++ wrong.status ++ " " ++ peeks.status ++ " "
           ++ int_to_string(peeks.usage.performs) ++ " " ++ int_to_string(adds.usage.performs) ++ " "
-          ++ h.label ++ " " ++ (if h.backend.fragment > 0 { "compiled" } else { "empty" }) ++ " "
-          ++ (match filed.unflushed { Some(_) -> "unflushed", None -> "flushed" }) ++ " "
-          ++ back ++ " " ++ records ++ " " ++ known ++ " "
-          ++ int_to_string(len(opened))
+          ++ h.label ++ " " ++ (if h.backend.fragment > 0 { "compiled" } else { "empty" })
       },
     },
   }
 }
 "#;
 
-/// Two runs over two projects, neither ended: each one's unit, its first test, and what its store
-/// held before it filed a pass.
+/// Two runs over two projects, neither ended: each one's unit and its first test.
 const TWO_RUNS: &str = r#"
 fn first_of(root: String, front: Front) -> String / {
-  tester.configure[r], tester.unit[r], tester.executed[r], tester.outcomes[r], tester.filed[r],
+  tester.configure[r], tester.unit[r], tester.executed[r],
 } = {
   tester.configure[r](options(root));
-  let known = said(tester.outcomes[r]([key("a")]));
   match tester.unit[r](front, true, false) {
     Err(_) -> "no unit",
-    Ok(u) -> {
-      let ran = tester.executed[r](u, 0).status;
-      let filed = tester.filed[r]({ passes: [key("a")], records: [], seen: [] });
-      int_to_string(u) ++ " " ++ ran ++ " " ++ known ++ " "
-        ++ (match filed.unflushed { Some(_) -> "unflushed", None -> "flushed" })
-    },
+    Ok(u) -> int_to_string(u) ++ " " ++ tester.executed[r](u, 0).status,
   }
 }
 
 fn main(root: String, front: Front, other: String, other_front: Front) -> String / {
-  tester.configure[r], tester.unit[r], tester.executed[r], tester.outcomes[r], tester.filed[r],
+  tester.configure[r], tester.unit[r], tester.executed[r],
 } = first_of(root, front) ++ " | " ++ first_of(other, other_front)
 "#;
 
@@ -240,7 +189,7 @@ fn driving(main: &str) -> Machine<'static> {
     // Only what this program declares: a family's operation the program does not declare is a
     // registration the binding refuses.
     for (op, handler) in ply_machine::tester::Session::new().lent() {
-        if !["interleaved", "bodies", "interfaces"].contains(&op.op.as_str()) {
+        if op.op.as_str() != "interleaved" {
             registry.register(op, handler);
         }
     }
@@ -269,17 +218,16 @@ fn a_program_runs_its_tests_through_the_family_and_files_what_it_decided() {
     let project = crate::fixture::project(PROJECT);
     let answer = answer_of(&mut driving(ONE_RUN), root_and_front(&project).to_vec());
     // The runtime runs exactly what it is asked and says how each ended; a handled operation is
-    // performed all the same, and a test's count starts over with it. What was filed reads back
-    // under the keys the program named, and nothing else does.
-    let expected = format!(
-        "passed failed passed 3 0 hermetic compiled flushed passed,none {},none yes,no 0",
-        "a".repeat(64)
+    // performed all the same, and a test's count starts over with it.
+    assert_eq!(
+        answer,
+        Value::str("passed failed passed 3 0 hermetic compiled"),
+        "the program saw: {answer:?}"
     );
-    assert_eq!(answer, Value::str(expected), "the program saw: {answer:?}");
 }
 
 /// A configuration begins a run whether or not the last one ended: the last run's units and binding
-/// go, and so does its store when the project is another.
+/// go.
 #[test]
 fn a_configuration_begins_a_run_over_the_project_it_names() {
     let first = crate::fixture::project("test \"holds\" { assert(true) }\n");
@@ -289,7 +237,7 @@ fn a_configuration_begins_a_run_over_the_project_it_names() {
     let answer = answer_of(&mut driving(TWO_RUNS), args);
     assert_eq!(
         answer,
-        Value::str("0 passed none flushed | 0 failed none flushed"),
+        Value::str("0 passed | 0 failed"),
         "the program saw: {answer:?}"
     );
 }

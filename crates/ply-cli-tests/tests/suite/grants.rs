@@ -179,14 +179,14 @@ fn a_family_is_granted_to_a_program_declaring_the_effect_it_lends() {
 fn a_refused_grant_names_the_effect_the_program_would_have_to_declare() {
     let dir = project(PROVING);
     let out = ply(dir.path())
-        .args(["run", "--host", "--allow", "cache", "m.ply"])
+        .args(["run", "--host", "--allow", "bootstrap", "m.ply"])
         .output()
         .unwrap();
     assert_ne!(out.status.code(), Some(0), "an undeclared grant ran");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("E0459"), "{err}");
     assert!(
-        err.contains("`--allow cache`") && err.contains("no `store` effect"),
+        err.contains("`--allow bootstrap`") && err.contains("no `archive` effect"),
         "{err}"
     );
 }

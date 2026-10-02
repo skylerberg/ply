@@ -203,10 +203,6 @@ impl Site {
                         record(vec![
                             ("frontend", PlyValue::bytes(unit.frontend)),
                             ("runtime", PlyValue::bytes(unit.runtime)),
-                            (
-                                "body_encoding",
-                                PlyValue::Int(i64::from(unit.body_encoding)),
-                            ),
                             ("stdlib", PlyValue::bytes(unit.stdlib)),
                             ("entry", PlyValue::bytes([])),
                         ]),
@@ -311,10 +307,6 @@ fn made_value(built: &Built, reaches: bool) -> PlyValue {
             record(vec![
                 ("frontend", PlyValue::bytes(artifact.frontend)),
                 ("runtime", PlyValue::bytes(artifact.runtime)),
-                (
-                    "body_encoding",
-                    PlyValue::Int(i64::from(artifact.body_encoding)),
-                ),
                 ("stdlib", PlyValue::bytes(artifact.std)),
                 ("entry", PlyValue::bytes(artifact.entry.0)),
             ]),
