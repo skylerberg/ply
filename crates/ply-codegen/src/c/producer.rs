@@ -168,18 +168,46 @@ fn own_sources(src: &Sources) -> Vec<(String, String)> {
 pub fn build(src: &Sources) -> Result<PlyProducer, String> {
     let identity = identity_of(src);
     let carried = super::bundle::embedded();
+    let started = std::time::Instant::now();
+    let phases = std::env::var_os("PLY_C_PHASES").is_some();
     let (native, _refused) = if carried.sources_digest() == Some(identity.as_str()) {
-        super::bundle::build(&carried).map_err(|e| format!("{e:#}"))?
+        let built = super::bundle::build(&carried).map_err(|e| format!("{e:#}"))?;
+        if phases {
+            eprintln!(
+                "phases: emitter {identity} from the committed bundle, {}ms",
+                started.elapsed().as_millis()
+            );
+        }
+        built
     } else {
         let dir = super::bundle::stage_dir(&identity);
-        let staged =
-            super::bundle::from_dir(&dir).and_then(|stage| super::bundle::build(&stage).ok());
+        let staged = match super::bundle::from_dir(&dir) {
+            None => Err("there is none".to_string()),
+            Some(stage) => super::bundle::build(&stage).map_err(|e| format!("{e:#}")),
+        };
         match staged {
-            Some(built) => {
+            Ok(built) => {
                 super::sweep::used(&dir);
+                if phases {
+                    eprintln!(
+                        "phases: emitter {identity} from its stage, {}ms",
+                        started.elapsed().as_millis()
+                    );
+                }
                 built
             }
-            None => emit_stage(src, &identity)?,
+            Err(why) => {
+                let built = emit_stage(src, &identity)?;
+                if phases {
+                    eprintln!(
+                        "phases: emitter {identity} emitted, since its stage at {} would not \
+                         build ({why}), {}ms",
+                        dir.display(),
+                        started.elapsed().as_millis()
+                    );
+                }
+                built
+            }
         }
     };
     PlyProducer::new(native).map_err(|e| format!("{e:#}"))
