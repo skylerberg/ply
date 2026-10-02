@@ -45,10 +45,13 @@ makes its parent the root and loads only that file.
 **The cache.** `.ply-cache/` at the root holds the store — what the front end
 filed for each file, the tests' passes and baselines, the discharged
 obligations and the review baselines, in one data file (`store.dat`) found
-through one index (`store.idx`) — and the git dependencies that were fetched;
+through one index (`store.idx`) — the compiled package the project's loads
+read the shipped modules through (`interfaces/`, §16), and the git dependencies
+that were fetched;
 `vendor/` holds the ones `ply vendor` copied, which is what a checkout that must
 not reach the network carries. It is safe to delete (`ply cache clear` discards
-the store); add it to `.gitignore`. `PLY_CACHE_UPSTREAM=DIR` names a second
+the store and the compiled package); add it to `.gitignore`.
+`PLY_CACHE_UPSTREAM=DIR` names a second
 cache shared between checkouts and machines, a directory on any storage they all
 reach: the passes and discharged obligations found there count here, and this
 run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads only). Entries
@@ -595,8 +598,10 @@ the checker infers for it, wherever that type was declared — another module's
 otherwise copies one path of the list's trie. A copy is caused by a second
 owner: a binding read again after the `push`, a closure capture, a value read
 out with `cell_get`/`map_get` (use `cell_update`/`map_update`), or a caller that
-keeps using what it passed. `ply check --costs` reports every copying `push`
-with its cause and fix. A `reuse fn` turns that into an error, `E0127`:
+keeps using what it passed. `ply check --costs` reports every copying `push` in
+the run's own modules with its cause and fix. A `reuse fn` there turns that into
+an error, `E0127`; a dependency's, the shipped modules' included, is checked
+when that package is the one checked:
 
 ```ply
 reuse fn collect(xs: List<Int>, n: Int) -> List<Int> =
@@ -1132,7 +1137,10 @@ claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`; and
 induction on a `List` binder: a definition whose self calls take a tail its
 list patterns exposed is unrolled, and the claim is proved at `[]` and then at
 `[h, ..t]` from itself at `t`, with `len` and `push` reduced over the spine in
-view and `len` known to lie below `i64::MAX`.
+view and `len` known to lie below `i64::MAX`. Outside `--std` a shipped module's
+definition is claimed by its `requires` and `ensures` alone: a proof may use
+what it promises and never unfolds its body, which the toolchain's own run
+proves.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
@@ -2829,9 +2837,9 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply yank NAME VERSION` | mark a published version yanked, under `PLY_REGISTRY_TOKEN`; no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
-| `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |
+| `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
 | `ply bootstrap <path>` | writes the front end as the bundle the runtime builds it from: `unit.c.gz` beside `SOURCES.digest`; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing), `--profile` (default `release`) |
-| `ply cache clear\|stats\|compact [path]` | discard the store / report what it holds and its reclaimable space / reclaim it |
+| `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
@@ -2875,10 +2883,18 @@ run loads the compiled object and the front end it filed beside it. A command
 that loads a program reads the front-end cache under `.ply-cache` before it
 analyses and files what it answered after: a definition whose hash has not moved
 since it was filed is taken from its filed rows, so a run checks what an edit
-moved and what reaches it, and a definition generic over an effect row every
-time. `ply build`, `ply hosts`, `ply test
---no-cache` and `--no-incremental` neither read nor file it, and a program's own
-`machine.load` of a program runs the whole front end. A cache that will not read
+moved and what reaches it, and a definition generic over an effect row or a
+label every time. The shipped modules a load pulls are read through the
+compiled package an earlier load kept in `.ply-cache/interfaces/`: each module
+with its function bodies cut out, beside every definition's hash, references,
+effects and specifications, which the front end takes as they are. A load that
+pulls a module the package lacks reads that one from source and grows the
+package from its own analysis, so a package costs no analysis of its own; a
+project keeps one, for the `ply` and the shelf that cut it. A run about the shipped
+modules — `--std`, or a project whose own modules ship — reads them from
+source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
+read and file neither, and a program's own `machine.load` of a program runs the
+whole front end. A cache that will not read
 is a warning and a cold check, never a failure; the run that files over one
 filed by a compiler whose shipped modules differed says so once, as `W0605`.
 
