@@ -111,6 +111,9 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `"text"` | `String` | UTF-8; no line breaks. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
+| `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
+| `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
+| `#[1, 2]` | `Map<a, Unit>` | A set: each element a key whose value is `()`. |
 | `true`, `false` / `()` | `Bool` / `Unit` | |
 
 `1`, `1.0`, `1m` and `1u32` have four types and never convert implicitly
@@ -118,8 +121,13 @@ These are keywords only in the position shown and identifiers elsewhere:
 minus, except in a pattern. The smallest signed value of a width cannot be
 written as a literal; use `i8_of_int(-128)`.
 
-String escapes are `\n` `\t` `\r` `\0` `\\` `\"` (no `\u`). Byte strings add
-`\xNN` and refuse source characters above `U+007F`.
+String and character escapes are `\n` `\t` `\r` `\0` `\\` `\"` `\'` and `\u{...}`, one to six hex
+digits naming a Unicode scalar value (a surrogate or a value past `10FFFF` is `E0211`). Byte
+strings add `\xNN`, refuse `\u{...}` and refuse source characters above `U+007F`.
+
+A map literal is the call `map_of_entries([{key: k, value: v}, ..])` and a set literal the same
+with `()` for each value, so either spelling is one definition with one hash; `ply fmt` keeps the
+one written.
 
 A line string is a run of lines that each start with `\\`, led only by blanks.
 Everything after the `\\` to the end of its line is text, verbatim: nothing is
@@ -158,8 +166,9 @@ Loosest to tightest; all binary operators are left-associative:
 | — | postfix `f(x)` `r.field` `e.op[r](x)` `e?` | |
 
 * `==`/`!=` are structural at every type except functions. `Float` equality is
-  IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work only on numeric types; order
-  anything else with `compare`.
+  IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work on numeric types and on `Char`,
+  by scalar value; order anything else with `compare`. Arithmetic on a `Char` is
+  `E0201`: go through `int_of_char`.
 * Both operands have one type; there is no widening (`U8 + U16` is `E0201`).
 * Arithmetic is checked: overflow, division by zero, and a shift count that is
   negative or not less than the type's width raise `E0502`. `<<` discards
@@ -353,6 +362,7 @@ signatures are checked, not inferred (§4.7).
 | `Float` | IEEE-754 binary64 |
 | `Decimal` | exact base 10; `+ - * %` are exact or raise |
 | `Bool`, `Unit` | `true`/`false`, `()` |
+| `Char` | one Unicode scalar value: `U+0000` to `U+10FFFF` without the surrogates |
 | `String` | UTF-8, indexed and sliced by character |
 | `Bytes` | immutable bytes, indexed by byte |
 
@@ -381,11 +391,18 @@ A tuple is a record with positional fields: `(A, B)` is `{_0: A, _1: B}` in
 types, values and patterns, accessed as `t._0`. `(A)` only groups; `()` is
 `Unit`.
 
+An alias may take parameters and name a type that constrains them, as
+`type Set<a> = Map<a, Unit>` names a map keyed by `a`. The alias carries no
+constraint: each signature that uses it promises what its expansion needs,
+`where derivable(ord, a)` here, and one that does not is `E0206` where it names
+the alias.
+
 ### 4.3 Lists and maps
 
 `List<a>` is an immutable homogeneous sequence `[a, b, c]` (§5.6). `Map<k, v>`
-is an immutable sorted map with no literal; build it with `map_new`,
-`map_insert` or `map_of_entries`. It iterates in `compare` order. Its key type
+is an immutable sorted map, written `#{k: v}` or built with `map_new`,
+`map_insert` or `map_of_entries`; a set is a `Map` whose values are `()`,
+written `#[a, b]`. It iterates in `compare` order. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell` and
 `Task` are refused (`E0206`).
 
@@ -1232,7 +1249,8 @@ module imported (`import std.json`, `import std.bin`), or the `derive` is
 
 ## 12. Builtins
 
-In scope everywhere; a module may shadow any except `compare_values` (`E0105`).
+In scope everywhere; a module may shadow any except `compare_values` and
+`map_of_entries`, which the map and set literals are written in (`E0105`).
 Out-of-range indexes and slices raise `E0502` unless noted; nothing is clamped.
 `ply doc NAME` prints any of these from the compiler's own table, which is the
 authority when this page and it disagree.
@@ -1289,6 +1307,10 @@ Strings are indexed by character, bytes by byte.
 | `string_trim`, `string_lower`, `string_upper` `(s: String) -> String` | |
 | `string_starts_with`, `string_ends_with`, `string_contains` `(s: String, t: String) -> Bool` | |
 | `string_find(s: String, needle: String) -> Int` | raises if absent |
+| `string_chars(s: String) -> List<Char>` | each character in order |
+| `string_of_chars(cs: List<Char>) -> String` | |
+| `char_of_int(n: Int) -> Option<Char>` | `None` for a negative, a surrogate or past `U+10FFFF` |
+| `int_of_char(c: Char) -> Int` | the scalar value |
 | `string_concat(a: String, b: String) -> String` | `a ++ b` |
 | `int_to_string(n: Int) -> String` | |
 | `float_to_string(f: Float) -> String` | shortest round-trip; `Infinity`, `-Infinity` and `NaN` |
@@ -2482,11 +2504,9 @@ pub fn is_subset<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Bool
 pub fn is_superset<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Bool
 ```
 
-A set is a `Map` whose values are `Unit` and nothing else, and there is no set
-type in the language yet: an alias would read better — `type Set<a>` — but a
-`Map` key has to be ordered, the constraint would have to ride on the alias, and a
-type alias cannot carry `derivable` (card `313874be`). Until it can, the parameter
-is the map and the constraint is on the signature. The key order is the set's
+A set is a `Map` whose values are `Unit` and nothing else, written `#[a, b]`,
+and each signature here spells the map out with the constraint its key needs.
+The key order is the set's
 order, so `elements` is stable. `union` is `map_merge`, which is why a duplicate
 is inserted once however many times it appears in the `of_list`; `intersection`
 and `difference` walk one set's elements and ask the other, so each is `n log n`.
@@ -2591,7 +2611,7 @@ below that and an infinity above `2^1023`.
 ```ply
 pub type Value =
   | VUnit | VBool(Bool) | VInt(Int) | VFloat(Float) | VDecimal(Decimal)
-  | VFixed(String, U128) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
+  | VFixed(String, U128) | VChar(Char) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
   | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
   | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
 pub type Field = { name: String, value: Value }
