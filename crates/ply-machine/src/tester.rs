@@ -14,9 +14,7 @@ use crate::support::{build_backend_over, enter_constant, module_texts, select_pr
 use crate::testrun::{
     Executed, Executor, Hosting, Interleaved, Use, executed, interleaved, status_word,
 };
-use ply_eval::host::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
-};
+use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
 use ply_eval::{DefHash, Diagnostic, Seed, Span, Symbol, Value as PlyValue, codes};
 use ply_store::{Outcome, PassRecord, Store};
 use std::collections::BTreeMap;
@@ -97,9 +95,13 @@ impl Session {
 
     pub fn lent(&self) -> Vec<Lent> {
         let site: Arc<dyn HostHandler> = Arc::clone(&self.0) as Arc<dyn HostHandler>;
+        // A watching run asks for report after report from inside one entry.
         OPERATIONS
             .into_iter()
-            .map(|(op, path)| (registration(op, path), Arc::clone(&site)))
+            .map(|(op, path)| {
+                let op = crate::hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
+                (op, Arc::clone(&site))
+            })
             .collect()
     }
 }
@@ -107,22 +109,6 @@ impl Session {
 impl Default for Session {
     fn default() -> Session {
         Session::new()
-    }
-}
-
-fn registration(op: &str, path: &'static str) -> HostOp {
-    HostOp {
-        effect: Symbol::new(EFFECT),
-        op: Symbol::new(op),
-        resource: HostResource::Any,
-        // A tree, a clock and a cache are not functions of program state.
-        determinism: Determinism::Nondeterministic,
-        // A watching run asks for report after report from inside one entry.
-        linearity: Linearity::Repeatable,
-        // The answer is in hand when the operation returns.
-        blocking: false,
-        secrets: false,
-        path,
     }
 }
 
@@ -240,7 +226,7 @@ impl HostHandler for Site {
                 let filing = filing_of(arg(req, 0)?, span)?;
                 self.cached(|cache| filed(cache, filing))
             }
-            other => return Err(unasked(other, span)),
+            other => return Err(crate::hosts::unserved(EFFECT, other, span)),
         };
         Ok(HostAnswer::Value(value))
     }
@@ -253,7 +239,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn arg<'a>(req: &'a HostRequest<'_>, at: usize) -> Result<&'a PlyValue, Diagnostic> {
     req.args
         .get(at)
-        .ok_or_else(|| unasked(req.op.op.as_str(), req.span))
+        .ok_or_else(|| crate::hosts::unserved(EFFECT, req.op.op.as_str(), req.span))
 }
 
 fn index_arg(req: &HostRequest<'_>, at: usize, what: &str) -> Result<usize, Diagnostic> {
@@ -937,14 +923,4 @@ fn out_of_step(op: &str) -> Diagnostic {
         format!("`{EFFECT}.{op}` was performed before the run it asks about was bound"),
     )
     .note("the operations are performed in order; this is Ply's fault")
-}
-
-#[cold]
-fn unasked(op: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("`{EFFECT}.{op}` reached the binding, and `ply test` serves no such operation"),
-    )
-    .primary(span, "this perform reached `ply test`")
-    .note("the effect and its handler are written together; this is Ply's fault")
 }

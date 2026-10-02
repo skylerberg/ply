@@ -20,6 +20,34 @@ pub fn registry() -> HostRegistry {
 /// One host operation and the handler that serves it, as a caller lends it to an entry.
 pub type Lent = (HostOp, Arc<dyn HostHandler>);
 
+/// One operation of a privileged family. Each family reads the world, a tree, a clock, a cache, a
+/// toolchain or the process environment, so none is a function of program state; each answers
+/// before the perform returns rather than handing back a token to poll; and none is handed a
+/// `Secret`.
+pub fn privileged_op(effect: &str, op: &str, linearity: Linearity, path: &'static str) -> HostOp {
+    HostOp {
+        effect: Symbol::new(effect),
+        op: Symbol::new(op),
+        resource: HostResource::Any,
+        determinism: Determinism::Nondeterministic,
+        linearity,
+        blocking: false,
+        secrets: false,
+        path,
+    }
+}
+
+/// A perform of a privileged family's operation that its handler does not serve.
+#[cold]
+pub fn unserved(effect: &str, op: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        ply_eval::codes::INTERNAL_ERROR,
+        format!("`{effect}.{op}` is not an operation this command serves"),
+    )
+    .primary(span, "performed here")
+    .note("the effect and its handler are written together; this is Ply's fault")
+}
+
 fn registry_for(trace: Option<Arc<ply_host::trace::Trace>>) -> HostRegistry {
     match trace {
         Some(trace) => ply_host::registry_over(trace),
@@ -619,13 +647,7 @@ pub fn digest_short(listing: &HostListing, disclosures: &Disclosures) -> String 
         hasher.update(SHUTDOWN_DOMAIN);
         shutdown.hash_into(&mut hasher);
     }
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(15);
-    out.push_str("b3:");
-    for byte in &digest.as_bytes()[..6] {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    ply_std::short_digest(hasher.finalize().as_bytes())
 }
 
 /// Domain-separated so a listing with an empty disclosure cannot collide with one that has none.
@@ -647,19 +669,8 @@ const PREVIEW: &str = "ply_machine::hosts::preview";
 
 /// `module` is where the program lent it declares `tcb`, which is where `Stage` is declared too.
 pub fn lent(module: &str) -> Vec<Lent> {
-    let op = HostOp {
-        effect: Symbol::new(EFFECT),
-        op: Symbol::new("preview"),
-        resource: HostResource::Any,
-        // The flags, the tree and the process environment are not functions of program state.
-        determinism: Determinism::Nondeterministic,
-        linearity: Linearity::Repeatable,
-        blocking: false,
-        secrets: false,
-        path: PREVIEW,
-    };
     vec![(
-        op,
+        privileged_op(EFFECT, "preview", Linearity::Repeatable, PREVIEW),
         Arc::new(Facility {
             module: module.to_string(),
         }),
@@ -680,7 +691,7 @@ impl HostHandler for Facility {
                 let front = crate::driver::handed_front_of(front, span)?;
                 Assembled::of(&path, &options, &front).preview(&self.module)
             }
-            (other, _) => return Err(unregistered(other, span)),
+            (other, _) => return Err(unserved(EFFECT, other, span)),
         };
         Ok(HostAnswer::Value(value))
     }
@@ -1002,14 +1013,4 @@ fn shutdown_value(shutdown: &Shutdown) -> PlyValue {
         ("lead_ms", PlyValue::Int(shutdown.lead_ms as i64)),
         ("drain_ms", PlyValue::Int(shutdown.drain_ms as i64)),
     ])
-}
-
-#[cold]
-fn unregistered(op: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        ply_eval::codes::INTERNAL_ERROR,
-        format!("`{EFFECT}.{op}` reached the binding, and nothing here serves it"),
-    )
-    .primary(span, "this perform reached `ply hosts`")
-    .note("the registrations and the handler are written together; this is Ply's fault")
 }

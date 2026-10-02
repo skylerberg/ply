@@ -11,9 +11,7 @@ use crate::driver::{HandedFront, handed_front_of, load_over_front};
 use crate::hosts::Lent;
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, diags_value, option, places_value, record};
-use ply_eval::host::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
-};
+use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
 use ply_eval::{DefHash, DefInfo, Diagnostic, Severity, Span, Symbol, Value as PlyValue, codes};
 use std::path::Path;
 use std::path::PathBuf;
@@ -42,25 +40,14 @@ pub fn lent() -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         program: Mutex::new(None),
     });
+    // A load is a function of the root and front it is handed, a build of the names it is given.
     OPERATIONS
         .into_iter()
-        .map(|(op, path)| (registration(op, path), Arc::clone(&site)))
+        .map(|(op, path)| {
+            let op = crate::hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
+            (op, Arc::clone(&site))
+        })
         .collect()
-}
-
-fn registration(op: &str, path: &'static str) -> HostOp {
-    HostOp {
-        effect: Symbol::new(EFFECT),
-        op: Symbol::new(op),
-        resource: HostResource::Any,
-        // A tree, a toolchain and a binary's own size are not functions of program state.
-        determinism: Determinism::Nondeterministic,
-        // A load is a function of the root and front it is handed, a build of the names it is given.
-        linearity: Linearity::Repeatable,
-        blocking: false,
-        secrets: false,
-        path,
-    }
 }
 
 #[derive(Default)]
@@ -104,7 +91,7 @@ impl HostHandler for Site {
                 )
                 .map(|()| PlyValue::Unit),
             ),
-            (other, _) => return Err(unasked(other, span)),
+            (other, _) => return Err(crate::hosts::unserved(EFFECT, other, span)),
         };
         Ok(HostAnswer::Value(value))
     }
@@ -372,16 +359,12 @@ struct Deployed {
 
 /// The deployed artifact `--diff` names, read when the program asks for it.
 fn deployed(diff: &PlyValue, span: Span) -> Result<Result<Deployed, Diagnostic>, Diagnostic> {
-    let read = match diff {
-        PlyValue::Ctor { name, args } if name.as_str() == "Some" => args
-            .first()
-            .map(|v| {
-                v.as_str(span, "the deployed artifact's path")
-                    .map(str::to_string)
-            })
-            .transpose()?,
-        _ => None,
-    };
+    let read = crate::payload::option_of(diff, "the deployed artifact's path", span)?
+        .map(|v| {
+            v.as_str(span, "the deployed artifact's path")
+                .map(str::to_string)
+        })
+        .transpose()?;
     Ok(match read {
         Some(path) => read_deployed(Path::new(&path)),
         None => Err(undeployed()),
@@ -393,7 +376,7 @@ fn read_deployed(path: &Path) -> Result<Deployed, Diagnostic> {
     let (old, warnings) = artifact::decode(&bytes, path)?;
     let digest = artifact::digest_of(&bytes).unwrap_or([0; 32]);
     Ok(Deployed {
-        digest: artifact::short(&digest),
+        digest: ply_std::short_digest(&digest),
         names: old.names,
         warnings,
     })
@@ -487,14 +470,4 @@ fn unnamed(name: &str) -> Diagnostic {
     )
     .primary(Span::DUMMY, "the choice and the program disagree")
     .note("the names offered and the name picked are written together; this is Ply's fault")
-}
-
-#[cold]
-fn unasked(op: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("`{EFFECT}.{op}` reached the binding, and `ply build` serves no such operation"),
-    )
-    .primary(span, "this perform reached `ply build`")
-    .note("the effect and its handler are written together; this is Ply's fault")
 }
