@@ -1175,6 +1175,15 @@ fn read_const(c: At<'_>) -> Result<Value, decode::Error> {
                 fixed.field("bits")?.int()? as u128,
             ))
         }
+        "ConstChar" => {
+            let point = c.arg(0)?;
+            Value::Char(
+                u32::try_from(point.int()?)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or_else(|| point.error("a character that is not a Unicode scalar value"))?,
+            )
+        }
         // A 128-bit literal, as the two words an `Int` each holds.
         "ConstWide" => {
             let wide = c.arg(0)?;

@@ -12,7 +12,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
               ReturnClause, RecField, expr_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
-                 LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, pat_span, has_or)
+                 LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import tycore (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
                TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity,
                OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
@@ -209,6 +209,7 @@ type Simulation = {
 type ParallelSite = { module: Int, span: Span, branches: List<{ span: Span, row: Row }> }
 // `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
 type RigidParam = { name: Bytes, v: Int }
+// `via` is the alias a use named when the `Map` came from its expansion, else empty.
 type MapKeySite = {
   module: Int,
   span: Span,
@@ -216,6 +217,7 @@ type MapKeySite = {
   key: Type,
   assumed: List<Int>,
   params: List<RigidParam>,
+  via: Bytes,
 }
 type ConstraintSite = {
   module: Int,
@@ -426,6 +428,7 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"I128", arity: 0 },
     { name: b"Float", arity: 0 },
     { name: b"Decimal", arity: 0 },
+    { name: b"Char", arity: 0 },
     { name: b"Unit", arity: 0 },
     { name: b"List", arity: 1 },
     { name: b"Map", arity: 2 },
@@ -750,6 +753,10 @@ pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc
     { name: b"string_ends_with", sc: mono_fn([t_string(), t_string()], t_bool()) },
     { name: b"string_contains", sc: mono_fn([t_string(), t_string()], t_bool()) },
     { name: b"string_find", sc: mono_fn([t_string(), t_string()], t_int()) },
+    { name: b"char_of_int", sc: mono_fn([t_int()], t_option(con(b"Char"))) },
+    { name: b"int_of_char", sc: mono_fn([con(b"Char")], t_int()) },
+    { name: b"string_chars", sc: mono_fn([t_string()], t_list(con(b"Char"))) },
+    { name: b"string_of_chars", sc: mono_fn([t_list(con(b"Char"))], t_string()) },
     { name: b"compare", sc: poly_fn([a], [], [ta, ta], ordering, row_empty()) },
     { name: b"compare_values", sc: poly_fn([a], [], [ta, ta], ordering, row_empty()) },
     { name: b"map_new", sc: poly_fn([a, b], [], [], map_ty, row_empty()) },
@@ -910,6 +917,10 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
     bdoc(b"string_ends_with", [b"s", b"suffix"], b""),
     bdoc(b"string_contains", [b"s", b"t"], b""),
     bdoc(b"string_find", [b"s", b"needle"], b"raises if absent"),
+    bdoc(b"char_of_int", [b"n"], b"`None` for a surrogate, a negative or past `U+10FFFF`"),
+    bdoc(b"int_of_char", [b"c"], b"the Unicode scalar value"),
+    bdoc(b"string_chars", [b"s"], b"each character in order"),
+    bdoc(b"string_of_chars", [b"cs"], b""),
     bdoc(b"compare", [b"x", b"y"], b"a total order; needs `derivable(ord, a)`"),
     bdoc(b"compare_values", [b"x", b"y"], b"`compare` under a name no module may shadow"),
     bdoc(b"map_new", [], b""),
@@ -1458,6 +1469,8 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
                     |m: Map<Bytes, Type>, i: Int|
                       map_insert(m, at(decl.params, i), at(converted.ts, i)),
                   );
+                  let outermost = len(g.cx.alias_stack) == 0;
+                  let before = len(g.cx.map_keys);
                   let inner: Cx = {
                     ..g.cx,
                     ty_params: bound,
@@ -1465,12 +1478,17 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
                     module: decl.owner,
                   };
                   let o: WithTy = conv_type(inner, alias);
+                  // A `Map` key's order is the using signature's to promise, so a refusal names the use.
+                  let keys = if outermost {
+                    relocated_keys(o.cx.map_keys, before, g.cx.module, span, name.name.name)
+                  } else { o.cx.map_keys };
                   {
                     cx: {
                       ..o.cx,
                       ty_params: saved,
                       alias_stack: take(o.cx.alias_stack, len(o.cx.alias_stack) - 1),
                       module: g.cx.module,
+                      map_keys: keys,
                     },
                     t: o.t,
                   }
@@ -2215,6 +2233,7 @@ fn lit_type(l: Lit) -> Type =
     LBytes(_) -> t_bytes(),
     LFloat(_) -> t_float(),
     LDec(_) -> t_decimal(),
+    LChar(_) -> con(b"Char"),
     _ -> t_unit(),
   }
 
@@ -5444,6 +5463,20 @@ fn check_fns(cx: Cx, m: Mod) -> Cx = {
               ],
             ),
           }
+        } else if def.name.name == b"map_of_entries" {
+          {
+            ..acc,
+            cx: err1(
+              acc.cx,
+              b"E0105",
+              def.name.span,
+              b"`map_of_entries` is a builtin",
+              b"cannot be redefined",
+              [
+                b"a map literal `#{k: v}` and a set literal `#[a]` are written in its name, so a module that redefined it would change what they mean",
+              ],
+            ),
+          }
         } else { { cx: acc.cx, fns: push(acc.fns, def), names: push(acc.names, def.name.name) } },
         _ -> acc,
       },
@@ -5992,7 +6025,9 @@ fn settle_numerics(cx: Cx) -> Cx = {
           ],
         ),
       TyCon(k) -> if len(k.args) != 0 { numeric_mismatch(c, entry, ty, what) }
-      else if is_int_name(k.name) || k.name == b"Float" { c } else if k.name == b"Decimal" {
+      else if is_int_name(k.name) || k.name == b"Float" { c }
+      // Characters order by scalar value, which is what a range test such as `c >= 'a'` reads.
+      else if k.name == b"Char" && is_ordered(entry.op) { c } else if k.name == b"Decimal" {
         if entry.op == b"div" {
           err1(
             c,
@@ -7012,11 +7047,25 @@ fn note_map_keys(cx: Cx, span: Span, ty: Type) -> Cx = {
             key: k,
             assumed: assumed,
             params: params,
+            via: b"",
           }),
       ),
     }
   }
 }
+
+// The sites an alias expansion recorded from `from` on, moved to where the alias was named.
+fn relocated_keys(
+  sites: List<MapKeySite>,
+  from: Int,
+  module: Int,
+  span: Span,
+  alias: Bytes,
+) -> List<MapKeySite> =
+  fold(range(from, len(sites)), sites, |acc: List<MapKeySite>, i: Int| {
+    let s = at(acc, i);
+    set_at(acc, i, { ..s, module: module, span: span, via: alias })
+  })
 
 // A reference that instantiated a parameter its callee constrained.
 fn note_constraints(cx: Cx, span: Span, callee: Bytes, args: List<Type>) -> Cx =
@@ -7074,7 +7123,10 @@ fn check_map_keys(cx: Cx) -> Cx = {
                     b"` is not an ordered type, so it cannot be a `Map` key",
                   ]),
                   bytes_concat_all([b"this map's key type is `", rendered, b"`"]),
-                  why_notes_for_map_key(blocked.why, blocked, blocker, site.params),
+                  alias_noted(
+                    why_notes_for_map_key(blocked.why, blocked, blocker, site.params),
+                    site.via,
+                  ),
                 ),
               ),
               seen: push(acc.seen, { scope: site.scope, text: rendered }),
@@ -7086,6 +7138,14 @@ fn check_map_keys(cx: Cx) -> Cx = {
   );
   walked.cx
 }
+
+fn alias_noted(notes: List<Bytes>, via: Bytes) -> List<Bytes> =
+  if via == b"" { notes } else {
+    push(
+      notes,
+      bytes_concat_all([b"`", via, b"` is a type alias, and the `Map` is in what it names"]),
+    )
+  }
 
 fn check_constraints(cx: Cx) -> Cx = {
   let adts = adt_shapes(cx);

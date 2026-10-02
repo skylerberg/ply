@@ -66,8 +66,7 @@ name a server.
 The compiler is Ply source under `crates/ply-compiler/ply`, compiled to C and
 committed as `crates/ply-compiler/bootstrap/unit.c.gz` beside `SOURCES.digest`, a
 digest of those sources and of the shipped modules they import, which the compiler
-pulls from `crates/ply-std/ply` the way it pulls a project's (today `std.hash`
-alone). A binary whose bundle is behind its sources has the bundle's emitter emit
+pulls from `crates/ply-std/ply` the way it pulls a project's. A binary whose bundle is behind its sources has the bundle's emitter emit
 them once, keeps that stage under the unit cache, and runs the sources from then on.
 So the compiler and what it imports cannot use a language rule the same change
 introduces; the rest of the standard library can. Never commit the bundle: CI

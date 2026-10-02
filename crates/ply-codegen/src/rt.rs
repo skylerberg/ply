@@ -229,6 +229,7 @@ pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
         Value::Ctor { args, .. } => args.iter().find_map(holds_a_handle),
         Value::Int(_)
         | Value::Fixed(_)
+        | Value::Char(_)
         | Value::Bool(_)
         | Value::Float(_)
         | Value::Decimal(_)
