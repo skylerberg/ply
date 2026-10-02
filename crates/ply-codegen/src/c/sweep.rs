@@ -1,7 +1,6 @@
 //! Keeping the content-addressed object cache and the stage directory to a size, gated by a stamp
-//! and run on a background thread so no build waits on it. The object cache goes oldest-written
-//! first (true LRU would write on every hit); the stage directory goes oldest-used first, since a
-//! stage is written once and then used by every run of the binary it serves.
+//! and run on a background thread so no build waits on it. Both go least recently used first: a
+//! read of an entry is recorded by [`used`], since an entry every run reads is written only once.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -71,10 +70,11 @@ pub fn claim(root: &std::path::Path, interval: std::time::Duration) -> bool {
 struct Entry {
     path: PathBuf,
     bytes: u64,
-    written: std::time::SystemTime,
+    last_used: std::time::SystemTime,
 }
 
-/// Remove entries under `root`, oldest first, until the rest fits in `budget`. Errors are ignored.
+/// Remove entries under `root`, least recently used first, until the rest fits in `budget`. Errors
+/// are ignored.
 pub fn sweep(root: &Path, budget: u64) -> u64 {
     let mut entries = Vec::new();
     let mut total: u64 = 0;
@@ -96,7 +96,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
             entries.push(Entry {
                 path,
                 bytes: meta.len(),
-                written: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                last_used: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
             });
         }
     };
@@ -106,7 +106,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
     if total <= budget {
         return 0;
     }
-    entries.sort_by_key(|e| e.written);
+    entries.sort_by_key(|e| e.last_used);
     let mut freed = 0;
     for entry in entries {
         if total <= budget {
@@ -137,11 +137,12 @@ const BY_FILE: [&str; 2] = [FRONTS, RUNS];
 /// An entry used within this long is never swept: a run may still be reading it.
 const RECENT: Duration = Duration::from_secs(3600);
 
-/// Records that a stage directory, or a file in one of [`BY_FILE`], was just used.
+/// Records that a stage directory or a cached file was just used. A file is opened for reading
+/// only: an object a loader has mapped may refuse a writer.
 pub fn used(path: &Path) {
     if path.is_dir() {
         let _ = std::fs::write(path.join(USED), b"");
-    } else if let Ok(f) = std::fs::File::options().write(true).open(path) {
+    } else if let Ok(f) = std::fs::File::open(path) {
         let _ = f.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
     }
 }
@@ -178,7 +179,7 @@ pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
                 entries.push(Entry {
                     path,
                     bytes: meta.len(),
-                    written: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    last_used: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
                 });
             }
             continue;
@@ -194,14 +195,17 @@ pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
         entries.push(Entry {
             path,
             bytes,
-            written: last,
+            last_used: last,
         });
     }
     if total <= budget {
         return 0;
     }
-    entries.retain(|e| now.duration_since(e.written).is_ok_and(|age| age >= RECENT));
-    entries.sort_by_key(|e| e.written);
+    entries.retain(|e| {
+        now.duration_since(e.last_used)
+            .is_ok_and(|age| age >= RECENT)
+    });
+    entries.sort_by_key(|e| e.last_used);
     let mut freed = 0;
     for entry in entries {
         if total <= budget {

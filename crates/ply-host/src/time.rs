@@ -46,9 +46,18 @@ impl Op {
     }
 }
 
-/// The run's two clocks: the system's, and one counting from the moment this host was built.
+/// The run's two clocks: the system's, and one counting from the process's start when it was
+/// marked, else from the moment this host was built.
 pub struct TimeHost {
     started: Instant,
+}
+
+static PROCESS: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Marks when the process started, so a program's first reading of the clock says what came
+/// before it. The first mark wins.
+pub fn mark_start(at: Instant) {
+    let _ = PROCESS.set(at);
 }
 
 impl Default for TimeHost {
@@ -60,7 +69,7 @@ impl Default for TimeHost {
 impl TimeHost {
     pub fn new() -> TimeHost {
         TimeHost {
-            started: Instant::now(),
+            started: PROCESS.get().copied().unwrap_or_else(Instant::now),
         }
     }
 
