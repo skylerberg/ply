@@ -1,0 +1,219 @@
+// A compiled package: the stubs a dependent parses in place of a dependency's source, and the
+// facts it trusts of that dependency rather than re-deriving them — the hashes its definitions
+// compiled under, the rows that seed them, and the bodies the emitter reads. A stub keeps every
+// declaration and signature verbatim and replaces each function body with `panic("stub")`; the
+// dependent pins the hashes, so a reference into the package reads the same hash either way and the
+// blank is never hashed, and seeds the definitions, so no body is walked. The package's tests and
+// laws do not travel.
+
+import spine (Span, num)
+import exprs (expr_span)
+import items (Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, Vis, VPub, VPriv,
+              Derived, ImportDecl)
+import resolve (Source, Mod)
+import diag (parse_all)
+import hash (Pin)
+import front (Whole, Analysis, Analysed, Refused, Interfaces, no_interfaces, rows_of, BodyRow,
+              KnownDefRow, analyse, analyse_with)
+import infer (DefInfo)
+import tycore (append, Scheme, scheme_text)
+
+pub type CompiledModule = { name: Bytes, stub: Bytes }
+
+pub type CompiledPackage = {
+  modules: List<CompiledModule>,
+  defs: List<KnownDefRow>,
+  pins: List<Pin>,
+  bodies: List<BodyRow>,
+}
+
+// --- Stub generation --------------------------------------------------------
+
+fn pub_prefix(v: Vis) -> Bytes = match v { VPub -> b"pub ", VPriv -> b"" }
+
+fn span_key(s: Span) -> Bytes = bytes_concat_all([num(s.start), b":", num(s.end)])
+
+// The index just past the last non-blank byte of `s[0..i]`.
+fn trimmed_end(s: Bytes, i: Int) -> Int =
+  if i <= 0 { 0 } else {
+    let c = bytes_at(s, i - 1);
+    if c == 32 || c == 9 || c == 10 || c == 13 { trimmed_end(s, i - 1) } else { i }
+  }
+
+// The signature text with its body separator dropped: the bytes up to the body, with trailing
+// blanks and a single trailing `=` removed. A `{ .. }` body has no `=`, an `= expr` body one.
+fn signature(src: Bytes, from: Int, body_start: Int) -> Bytes = {
+  let head = bytes_slice(src, from, body_start);
+  let e1 = trimmed_end(head, bytes_len(head));
+  let e2 = if e1 > 0 && bytes_at(head, e1 - 1) == 61 { e1 - 1 } else { e1 };
+  bytes_slice(head, 0, trimmed_end(head, e2))
+}
+
+fn stub_fn(src: Bytes, d: FnDef) -> Bytes = {
+  let reuse = match d.reuse { Some(_) -> b"reuse ", None -> b"" };
+  bytes_concat_all([
+    pub_prefix(d.vis),
+    reuse,
+    signature(src, d.span.start, expr_span(d.body).start),
+    b" = panic(\"stub\")",
+  ])
+}
+
+fn verbatim(src: Bytes, vis: Bytes, s: Span) -> Bytes =
+  bytes_concat(vis, bytes_slice(src, s.start, s.end))
+
+// A module's items as stub text: signatures with blank bodies, declarations verbatim, `derive`
+// items kept so the dependent regenerates the same definitions, and tests and laws dropped. A
+// generated definition carries its `derive` item's span, so it is left to that regeneration.
+fn stub_items(src: Bytes, m: Mod) -> List<Bytes> = {
+  let generated = fold(m.derived, map_new(), |acc: Map<Bytes, Bool>, d: Derived|
+    map_insert(acc, span_key(d.span), true));
+  fold(m.module.items, [], |acc: List<Bytes>, it: Item|
+    match it {
+      IFn(d) -> if map_contains(generated, span_key(d.span)) { acc }
+      else { push(acc, stub_fn(src, d)) },
+      IType(d) -> push(acc, verbatim(src, pub_prefix(d.vis), d.span)),
+      IEffect(d) -> push(acc, verbatim(src, pub_prefix(d.vis), d.span)),
+      IEffectSet(d) -> push(acc, verbatim(src, b"", d.span)),
+      IDerive(d) -> push(acc, verbatim(src, b"", d.span)),
+      ITest(_) -> acc,
+      ILaw(_) -> acc,
+    })
+}
+
+fn joined_lines(xs: List<Bytes>) -> Bytes =
+  fold(xs, b"", |acc: Bytes, x: Bytes| bytes_concat_all([acc, x, b"\n"]))
+
+pub fn stub_module(src: Bytes, m: Mod) -> Bytes = {
+  let imports = map(m.module.imports, |imp: ImportDecl|
+    bytes_slice(src, imp.span.start, imp.span.end));
+  bytes_concat(joined_lines(imports), joined_lines(stub_items(src, m)))
+}
+
+// --- Extraction -------------------------------------------------------------
+
+// The module a qualified name belongs to: its name without the final segment.
+fn module_of(name: Bytes) -> Bytes = {
+  let i = last_dot(name, bytes_len(name));
+  if i < 0 { b"" } else { bytes_slice(name, 0, i) }
+}
+
+fn last_dot(s: Bytes, i: Int) -> Int =
+  if i <= 0 { 0 - 1 } else if bytes_at(s, i - 1) == 46 { i - 1 } else { last_dot(s, i - 1) }
+
+fn source_named(sources: List<Source>, name: Bytes) -> Bytes =
+  fold(sources, b"", |acc: Bytes, s: Source| if s.name == name { s.src } else { acc })
+
+fn mod_named(mods: List<Mod>, name: Bytes) -> Mod =
+  match fold(mods, None, |acc: Option<Mod>, m: Mod|
+      match acc { Some(_) -> acc, None -> if m.name == name { Some(m) } else { None } }) {
+    Some(m) -> m,
+    None -> panic("the package's module is in the analysis"),
+  }
+
+// A package's interface, cut from a whole-program analysis that still holds its source: the stubs
+// of its modules, the rows that seed its definitions, the hashes they compiled under (pinned for
+// both definitions and declarations), and the bodies its emitter reads.
+pub fn compile_package(sources: List<Source>, w: Whole, modules: List<Bytes>) -> CompiledPackage = {
+  let members = fold(modules, map_new(), |acc: Map<Bytes, Bool>, m: Bytes|
+    map_insert(acc, m, true));
+  let mine = |name: Bytes| map_contains(members, module_of(name));
+  let def_pins = fold(w.hashes.defs, [], |acc: List<Pin>, d: { name: Bytes, hash: Bytes }|
+    if mine(d.name) { push(acc, { name: d.name, decl: false, hash: d.hash }) } else { acc });
+  {
+    modules: map(modules, |name: Bytes|
+      { name: name, stub: stub_module(source_named(sources, name), mod_named(w.mods, name)) }),
+    defs: filter(rows_of(w).defs, |r: KnownDefRow| mine(r.name)),
+    pins: fold(w.hashes.decls, def_pins, |acc: List<Pin>, d: { name: Bytes, hash: Bytes }|
+      if mine(d.name) { push(acc, { name: d.name, decl: true, hash: d.hash }) } else { acc }),
+    bodies: filter(w.hashes.bodies, |b: BodyRow| mine(b.name)),
+  }
+}
+
+// --- Loading ----------------------------------------------------------------
+
+pub fn merged_interfaces(packages: List<CompiledPackage>) -> Interfaces =
+  fold(packages, no_interfaces(), |acc: Interfaces, p: CompiledPackage|
+    {
+      defs: append(acc.defs, p.defs),
+      pins: append(acc.pins, p.pins),
+      bodies: append(acc.bodies, p.bodies),
+    })
+
+fn stub_sources(packages: List<CompiledPackage>) -> List<Source> =
+  fold(packages, [], |acc: List<Source>, p: CompiledPackage|
+    append(acc, map(p.modules, |m: CompiledModule| { name: m.name, src: m.stub })))
+
+// Analyse `root` with each dependency supplied as a compiled package: its stubs are parsed in place
+// of its source, its hashes pinned and its definitions seeded. Imports must name the stub modules,
+// which for bare imports means the stubs resolve among the roots.
+pub fn analyse_with_interfaces(root: List<Source>, packages: List<CompiledPackage>) -> Analysis =
+  analyse_with(
+    parse_all(append(root, stub_sources(packages))),
+    [],
+    [],
+    { root: b"", manifest: None, supplied: [] },
+    merged_interfaces(packages),
+  )
+
+// --- Tests ------------------------------------------------------------------
+
+fn hash_named(xs: List<{ name: Bytes, hash: Bytes }>, name: Bytes) -> Bytes =
+  fold(xs, b"", |acc: Bytes, x: { name: Bytes, hash: Bytes }|
+    if x.name == name { x.hash } else { acc })
+
+fn body_named(xs: List<BodyRow>, name: Bytes) -> Bytes =
+  fold(xs, b"", |acc: Bytes, x: BodyRow| if x.name == name { x.body } else { acc })
+
+fn whole_of(a: Analysis) -> Whole =
+  match a { Analysed(w) -> w, Refused(ds) -> panic("analysis refused") }
+
+fn def_scheme(w: Whole, name: Bytes) -> Scheme =
+  match fold(w.checked.defs, None, |acc: Option<DefInfo>, d: DefInfo|
+      match acc { Some(_) -> acc, None -> if d.name == name { Some(d) } else { None } }) {
+    Some(d) -> d.scheme,
+    None -> panic("the definition is in the analysis"),
+  }
+
+test "a dependency reached through its interface answers the same hashes, defs and bodies" {
+  let base = {
+    name: b"base",
+    src: b"pub fn one() -> Int = 1\npub fn two(x: Int) -> Int = one() + x\npub type Pair = { a: Int, b: Int }\npub fn mk(x: Int) -> Pair = { a: x, b: two(x) }",
+  };
+  let app = {
+    name: b"app",
+    src: b"import base (one, two, Pair, mk)\npub fn four() -> Int = two(two(one()))\npub fn pair() -> Pair = mk(four())",
+  };
+  let full = whole_of(analyse(parse_all([app, base])));
+  let iface = compile_package([base], full, [b"base"]);
+  let viaface = whole_of(analyse_with_interfaces([app], [iface]));
+  // The roots hash the same whether the dependency was source or an interface.
+  assert_eq(
+    hash_named(viaface.hashes.defs, b"app.four"),
+    hash_named(full.hashes.defs, b"app.four"),
+  );
+  assert_eq(
+    hash_named(viaface.hashes.defs, b"app.pair"),
+    hash_named(full.hashes.defs, b"app.pair"),
+  );
+  // The dependency's own hashes come back pinned, and so unchanged.
+  assert_eq(
+    hash_named(viaface.hashes.defs, b"base.two"),
+    hash_named(full.hashes.defs, b"base.two"),
+  );
+  assert_eq(hash_named(viaface.hashes.defs, b"base.mk"), hash_named(full.hashes.defs, b"base.mk"));
+  // The dependency's real bodies replace the blanks its stubs hashed to.
+  assert_eq(
+    body_named(viaface.hashes.bodies, b"base.two"),
+    body_named(full.hashes.bodies, b"base.two"),
+  );
+  assert_eq(
+    body_named(viaface.hashes.bodies, b"base.mk"),
+    body_named(full.hashes.bodies, b"base.mk"),
+  );
+  // The roots are checked identically.
+  assert_eq(
+    scheme_text(def_scheme(viaface, b"app.four")),
+    scheme_text(def_scheme(full, b"app.four")),
+  )
+}

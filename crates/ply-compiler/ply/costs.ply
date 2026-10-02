@@ -36,6 +36,43 @@ type RState = | RFresh | RParam(Int) | RShared(Why) | RUnsure(Why)
 
 type Tables = { params: List<List<PState>>, rets: List<RState> }
 
+// A caller reads only a callee's return state, and a return state is a property of the callee's
+// body, so a compiled dependency's is settled once and trusted. The reason a shared or unsure
+// return carries is dependency-internal, so a dependent keeps only the shape.
+pub type RKind = | KFresh | KParam(Int) | KShared | KUnsure
+
+pub type CostSummary = { name: Bytes, ret: RKind }
+
+fn dep_why() -> Why =
+  { cause: CCall, text: b"a compiled dependency answers a value it may also hold" }
+
+fn rstate_of(k: RKind) -> RState =
+  match k {
+    KFresh -> RFresh,
+    KParam(i) -> RParam(i),
+    KShared -> RShared(dep_why()),
+    KUnsure -> RUnsure(dep_why()),
+  }
+
+fn rkind_of(r: RState) -> RKind =
+  match r { RFresh -> KFresh, RParam(i) -> KParam(i), RShared(_) -> KShared, RUnsure(_) -> KUnsure }
+
+// The return states a dependent pins for its dependencies, by definition index in this program.
+fn fixed_rets(index: Map<Bytes, Int>, fixed: List<CostSummary>) -> Map<Int, RState> =
+  fold(fixed, map_new(), |acc: Map<Int, RState>, s: CostSummary|
+    match map_get(index, s.name) { Some(i) -> map_insert(acc, i, rstate_of(s.ret)), None -> acc })
+
+fn seed_rets(t: Tables, fixed: Map<Int, RState>) -> Tables =
+  if map_len(fixed) == 0 { t } else {
+    {
+      ..t,
+      rets: map(range(0, len(t.rets)), |i: Int|
+        match map_get(fixed, i) { Some(r) -> r, None -> at(t.rets, i) }),
+    }
+  }
+
+fn is_fixed(fixed: Map<Int, RState>, def: Int) -> Bool = def >= 0 && map_contains(fixed, def)
+
 type Bind = { slot: Int, owner: Owner }
 
 type Demand = { callee: Int, param: Int, owner: Owner }
@@ -601,10 +638,10 @@ fn settle(p: Prog, found: List<Found>, t: Tables) -> Tables =
     if b.def < 0 { demanded } else { with_ret(demanded, b.def, ret_of(f.ret)) }
   })
 
-fn fixpoint(p: Prog, t: Tables, rounds: Int) -> Settled = {
-  let next = settle(p, round(p, t), t);
+fn fixpoint(p: Prog, t: Tables, rounds: Int, fixed: Map<Int, RState>) -> Settled = {
+  let next = seed_rets(settle(p, round(p, t), t), fixed);
   if next == t || rounds + 1 >= 24 { { tables: next, rounds: rounds + 1 } }
-  else { fixpoint(p, next, rounds + 1) }
+  else { fixpoint(p, next, rounds + 1, fixed) }
 }
 
 fn fix(c: Option<Cause>) -> Bytes =
@@ -816,18 +853,31 @@ fn program_of(
   }
 }
 
-// Every append of the program with its verdict.
+// Every append of the program with its verdict. The runtime invokes this entry by a fixed arity,
+// so the pinned-dependencies form is a separate function rather than a defaulted parameter.
 pub fn costs(
   names: List<Bytes>,
   srcs: List<Bytes>,
   pkgs: List<Pkg>,
   mod_pkg: List<Int>,
   shelf: Int,
+) -> Report = costs_pinned(names, srcs, pkgs, mod_pkg, shelf, [])
+
+// `costs` with each dependency's return summaries pinned, so its appends are not re-costed and only
+// this program's are reported.
+pub fn costs_pinned(
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  pkgs: List<Pkg>,
+  mod_pkg: List<Int>,
+  shelf: Int,
+  fixed: List<CostSummary>,
 ) -> Report =
   match program_of(names, srcs, pkgs, mod_pkg, shelf) {
     None -> { ok: false, rounds: 0, defs: [] },
     Some(p) -> {
-      let settled = fixpoint(p, start_tables(p.defs), 0);
+      let pinned = fixed_rets(p.index, fixed);
+      let settled = fixpoint(p, seed_rets(start_tables(p.defs), pinned), 0, pinned);
       // Verdicts come from a walk under the settled tables, not the round that produced them.
       let found = round(p, settled.tables);
       {
@@ -836,7 +886,9 @@ pub fn costs(
         defs: fold(range(0, len(p.bodies)), [], |acc: List<Costed>, i: Int| {
           let b: Body = at(p.bodies, i);
           let f: Found = at(found, i);
-          if len(f.sites) == 0 { acc } else {
+          // A compiled dependency's appends were costed when it was compiled; this program verifies
+          // only its own.
+          if is_fixed(pinned, b.def) || len(f.sites) == 0 { acc } else {
             push(acc, {
               kind: b.kind,
               module: b.module,
@@ -849,6 +901,24 @@ pub fn costs(
           }
         }),
       }
+    },
+  }
+
+// Every definition's return summary, for a dependent to pin instead of walking the body: this is
+// what `costs` reads of a callee, computed once when the package is compiled.
+pub fn summaries(
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  pkgs: List<Pkg>,
+  mod_pkg: List<Int>,
+  shelf: Int,
+) -> List<CostSummary> =
+  match program_of(names, srcs, pkgs, mod_pkg, shelf) {
+    None -> [],
+    Some(p) -> {
+      let settled = fixpoint(p, start_tables(p.defs), 0, map_new());
+      map(range(0, len(p.defs)), |i: Int|
+        { name: at(p.defs, i).name, ret: rkind_of(at(settled.tables.rets, i)) })
     },
   }
 
@@ -867,4 +937,34 @@ test "an append comes back with its place, its verdict, why, and the edit that w
   assert_eq(s.reason, b"`map_get` answers a clone the map still holds");
   assert_eq(s.fix, b"`map_update`");
   assert_eq(s.param, 0 - 1)
+}
+
+fn verdicts(r: Report, label: Bytes) -> List<Bytes> =
+  fold(r.defs, [], |acc: List<Bytes>, d: Costed|
+    if d.label == label { map(d.sites, |s: Site| s.verdict) } else { acc })
+
+fn reported(r: Report, label: Bytes) -> Bool =
+  fold(r.defs, false, |acc: Bool, d: Costed| acc || d.label == label)
+
+fn has_prefix(s: Bytes, p: Bytes) -> Bool =
+  bytes_len(s) >= bytes_len(p) && bytes_slice(s, 0, bytes_len(p)) == p
+
+test "a dependency's returns pinned cost its callers the same as walking its body" {
+  let base = b"pub fn keep(xs: List<Int>) -> List<Int> = xs\npub fn fresh() -> List<Int> = []\n";
+  let app = b"import base (keep, fresh)\nreuse fn grow() -> List<Int> = push(fresh(), 1)\nreuse fn hold(xs: List<Int>) -> List<Int> = push(keep(xs), 2)\n";
+  let full = costs([b"app", b"base"], [app, base], [], [], 0);
+  assert(full.ok);
+  // Only `base`'s return summaries are pinned; the stub's blank bodies would say otherwise.
+  let sums = filter(summaries([b"app", b"base"], [app, base], [], [], 0), |s: CostSummary|
+    has_prefix(s.name, b"base."));
+  let stub = b"pub fn keep(xs: List<Int>) -> List<Int> = panic(\"stub\")\npub fn fresh() -> List<Int> = panic(\"stub\")\n";
+  let via = costs_pinned([b"app", b"base"], [app, stub], [], [], 0, sums);
+  assert(via.ok);
+  // The roots cost the same whether `base` was walked or pinned.
+  assert_eq(verdicts(via, b"app.grow"), verdicts(full, b"app.grow"));
+  assert_eq(verdicts(via, b"app.hold"), verdicts(full, b"app.hold"));
+  // `grow` appends onto a fresh list and keeps its promise either way.
+  assert_eq(verdicts(full, b"app.grow"), [b"reuses"]);
+  // The dependency's own appends are not re-reported.
+  assert(!reported(via, b"base.keep"))
 }
