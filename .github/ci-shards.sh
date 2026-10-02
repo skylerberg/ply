@@ -63,13 +63,15 @@ SOLO=(
 # own tests on the tier, which take every core. The rest go to the partitions, beside their nextest
 # runs.
 CORPUS_PROGRAM=crates/ply-corpus/ply
+# The programs the corpus program runs, each a `ply test` of its own whose tests must pass.
+CORPUS_FIXTURES=crates/ply-corpus/fixtures
 CORPUS_CHECKS=crates/ply-corpus/checks
 CLI_SUITE=crates/ply-cli-tests/ply
 CORPUS_ALONE=(serving database cli-compiler_on_the_tier)
 # Placed a test at a time rather than a module at a time: a whole module on one partition would
 # outlast the partition's nextest shard.
 CORPUS_BY_TEST=(audit generated toolchain)
-CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental registry)
+CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental lang_fixtures registry)
 # Corpus processes a partition runs beside nextest, each a lane of the cut: its runs of one package go
 # in one `ply test`, which loads the package's closure once. Two, measured against one: a partition's
 # runs include the program's and the packages' own `ply test`s, each with a front end and C of its own,
@@ -78,6 +80,7 @@ CORPUS_LANES=2
 # Packages whose own suites run as corpus entries too, as `id:path`: each failing test is named in
 # the log, where a Rust test wrapping the run would report one failure for all of them.
 PACKAGE_SUITES=(
+  "cli:crates/ply-cli/ply"
   "prove:crates/ply-prove/ply"
   "sim:crates/ply-sim/ply"
   "store:crates/ply-store/ply"
@@ -195,12 +198,13 @@ cmd_solo_filter() {
   return 1
 }
 
-# One entry id a line: `program`, `package-<id>` per package suite, every checks module that declares
-# a test, then every such module of the CLI's suite under `cli-`; each module as `module`, or, for one
-# placed a test at a time, `module:N` for its Nth test.
+# One entry id a line: `program`, `fixture-<name>` per fixture, `package-<id>` per package suite,
+# every checks module that declares a test, then every such module of the CLI's suite under `cli-`;
+# each module as `module`, or, for one placed a test at a time, `module:N` for its Nth test.
 corpus_entries() {
-  local entry
+  local entry file
   printf 'program\n'
+  for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
   module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}"
   module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
@@ -301,6 +305,8 @@ cmd_corpus_line() {
     [[ $entry == "$1" ]] || continue
     if [[ $entry == program ]]; then
       printf '%s\n' "$CORPUS_PROGRAM"
+    elif [[ $entry == fixture-* ]]; then
+      printf '%s/%s.ply\n' "$CORPUS_FIXTURES" "${entry#fixture-}"
     elif [[ $entry == package-* ]]; then
       package_path "${entry#package-}"
     elif [[ $entry == cli-* ]]; then
@@ -550,7 +556,7 @@ corpus_cut() {
     -v checks="$CORPUS_CHECKS" -v cli="$CLI_SUITE" '
     function package(id) {
       if (id ~ /^cli-/) return cli
-      if (id == "program" || id ~ /^package-/) return id
+      if (id == "program" || id ~ /^package-/ || id ~ /^fixture-/) return id
       return checks
     }
     BEGIN {

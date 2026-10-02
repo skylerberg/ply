@@ -61,7 +61,7 @@ pub fn fragment_digest(names: &[&str]) -> String {
 
 /// Why this definition was refused last time, if it was.
 pub fn read_refusal(key: &str) -> Option<String> {
-    std::fs::read_to_string(dir().join(format!("{key}.refused"))).ok()
+    read_used(&dir().join(format!("{key}.refused")))
 }
 
 pub fn write_refusal(key: &str, reason: &str) {
@@ -74,7 +74,14 @@ pub fn write_refusal(key: &str, reason: &str) {
 
 /// The body kept under `key`, if one is.
 pub fn read(key: &str) -> Option<(String, Tables)> {
-    decode(&std::fs::read_to_string(dir().join(format!("{key}.body"))).ok()?)
+    decode(&read_used(&dir().join(format!("{key}.body")))?)
+}
+
+/// A kept entry's text, recorded as used so the sweep leaves what runs keep reading.
+fn read_used(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    super::sweep::used(path);
+    Some(text)
 }
 
 /// Keep this body; a failed write is ignored. A group's body is kept under each member's key.
@@ -321,7 +328,7 @@ pub static BUCKETS_REUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 
 /// The object a unit key was built as, so a worker skips assembling the C entirely.
 pub fn read_unit(key: &str) -> Option<String> {
-    let s = std::fs::read_to_string(dir().join(format!("{key}.unit"))).ok()?;
+    let s = read_used(&dir().join(format!("{key}.unit")))?;
     let object = s.trim();
     (!object.is_empty() && object.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| object.to_string())
