@@ -1857,8 +1857,8 @@ pub fn narrowed(k: Int) -> U32 = narrow(7u32, k)
 #[test]
 fn a_recursive_group_holding_a_handle_is_emitted_per_definition() {
     let source = r#"
-fn a(n: Int) -> Int = if n == 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> clock.now(), } } else { b(n - 1) }
-fn b(n: Int) -> Int = if n == 0 { clock.now(); 0 } else { a(n - 1) }
+fn a(n: Int) -> Int = if n == 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> Instant(7), } } else { b(n - 1) }
+fn b(n: Int) -> Int = if n == 0 { match clock.now() { Instant(t) -> t } } else { a(n - 1) }
 "#;
     let Some(loaded) = tests_support::keyed(source) else {
         return;

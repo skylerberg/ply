@@ -1,6 +1,6 @@
 //! Deterministic simulation: seeds, the steps a run records, and seeded `clock`/`random`.
 
-use crate::{Diagnostic, EffectAtom, Mode, Span, codes};
+use crate::{Diagnostic, EffectAtom, Mode, Span, Symbol, codes};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -313,7 +313,18 @@ pub fn signature(effect: &str, op: &str) -> Option<&'static OpSignature> {
 }
 
 /// Answered by the scheduler, not [`Handlers`]: they are polymorphic and use scheduler state.
-pub const TASK_OPS: &[&str] = &["spawn", "join", "yield"];
+pub const TASK_OPS: &[&str] = &["spawn", "join", "yield", "cancel", "await"];
+
+/// What a cancel writes and every step of the cancelled task reads, so the search sees that
+/// cancelling earlier or later is a different run.
+pub fn liveness(task: TaskId, mode: Mode) -> Access {
+    Access::Atom(EffectAtom {
+        effect: Symbol::new("task.alive"),
+        resource: crate::footprint::Resource::Named(Symbol::new(format!("@{}", task.0))),
+        mode,
+        op: None,
+    })
+}
 
 /// Whether a `simulate` region's delimiter answers this operation.
 pub fn is_scheduled(effect: &str, op: &str) -> bool {
@@ -391,6 +402,11 @@ impl Clock {
 
     pub fn sleepers(&self) -> usize {
         self.timers.len()
+    }
+
+    /// Drops a cancelled sleeper's timer, so time no longer advances on its account.
+    pub fn cancel(&mut self, task: TaskId) {
+        self.timers.retain(|&(_, t)| t != task);
     }
 
     pub fn advance(&mut self) -> Option<Wake> {

@@ -233,7 +233,7 @@ fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
         let text = whole.split("#[cfg(test)]").next().unwrap_or(&whole);
         for banned in [
             "SystemTime",
-            "Instant",
+            "Instant::now",
             "std::time",
             "rand::",
             "thread_rng",
