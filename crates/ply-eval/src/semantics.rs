@@ -47,9 +47,11 @@ pub fn strict_binary(
                 (Value::Fixed(a), Value::Fixed(b)) if a.ty == b.ty => a.value_cmp(*b),
                 (Value::Str(a), Value::Str(b)) => a.as_ref().cmp(b.as_ref()),
                 (Value::Decimal(a), Value::Decimal(b)) => a.cmp(b),
+                (Value::Char(a), Value::Char(b)) => a.cmp(b),
                 (
                     Value::Int(_)
                     | Value::Fixed(_)
+                    | Value::Char(_)
                     | Value::Str(_)
                     | Value::Decimal(_)
                     | Value::Float(_),

@@ -10,6 +10,7 @@ pub fn world_independent(value: &Value) -> bool {
         match value {
             Value::Int(_)
             | Value::Fixed(_)
+            | Value::Char(_)
             | Value::Bool(_)
             | Value::Float(_)
             | Value::Decimal(_)

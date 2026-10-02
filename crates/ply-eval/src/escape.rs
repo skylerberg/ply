@@ -242,6 +242,7 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
 
         Value::Int(_)
         | Value::Fixed(_)
+        | Value::Char(_)
         | Value::Bool(_)
         | Value::Float(_)
         | Value::Decimal(_)

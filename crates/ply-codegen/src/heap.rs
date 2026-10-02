@@ -1421,6 +1421,7 @@ fn crosses_threads(v: &Value) -> bool {
         Value::Ctor { args, .. } => args.iter().all(crosses_threads),
         Value::Int(_)
         | Value::Fixed(_)
+        | Value::Char(_)
         | Value::Bool(_)
         | Value::Float(_)
         | Value::Decimal(_)
@@ -1789,6 +1790,7 @@ fn rank(w: Word) -> u8 {
                 Value::Task(_) => 13,
                 Value::Secret(_) => 14,
                 Value::Fixed(_) => 15,
+                Value::Char(_) => 16,
             },
             other => panic!("a word of kind {other} was ordered after its object died"),
         }
