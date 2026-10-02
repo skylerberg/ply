@@ -7,7 +7,7 @@
 
 use crate::artifact::{self, Built};
 
-use crate::driver::{HandedFront, handed_front_of, load_over_front};
+use crate::driver::{HandedFront, handed_front_of, load_over_front, load_over_front_in};
 use crate::hosts::Lent;
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, diags_value, option, places_value, record};
@@ -21,37 +21,62 @@ use std::sync::{Arc, Mutex};
 /// else: `ply run` and the shipped program open artifacts too, and neither is a program.
 const EFFECT: &str = "builder";
 
-const OPERATIONS: [(&str, &str); 6] = [
+const HERMETIC: &str = "hermetic_builder";
+
+const OPERATIONS: [(&str, &str); 5] = [
     ("loaded", "ply_machine::builder::loaded"),
     ("made", "ply_machine::builder::made"),
     ("previous", "ply_machine::builder::previous"),
-    ("stored", "ply_machine::builder::stored"),
     ("unit", "ply_machine::builder::unit"),
     ("git", "ply_machine::builder::git"),
+];
+
+const HERMETIC_OPERATIONS: [(&str, &str); 5] = [
+    ("loaded", "ply_machine::builder::hermetic::loaded"),
+    ("made", "ply_machine::builder::hermetic::made"),
+    ("previous", "ply_machine::builder::hermetic::previous"),
+    ("unit", "ply_machine::builder::hermetic::unit"),
+    ("git", "ply_machine::builder::hermetic::git"),
 ];
 
 /// An entry into a compiled unit does not nest on a thread, and a build enters the emitter's while
 /// the program's own entry is live; the stack is a front end's, not a report's.
 const BUILD_STACK: usize = 256 << 20;
 
-/// The ops and the one handler serving them. Nothing is read before the program asks: `loaded`
-/// reads the front end it is handed, `previous` the artifact it names.
+/// The ops and the one handler serving them, and the hermetic half's.
 pub fn lent() -> Vec<Lent> {
+    let mut ops = lent_by(false);
+    ops.extend(lent_by(true));
+    ops
+}
+
+fn lent_by(hermetic: bool) -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
+        hermetic,
         program: Mutex::new(None),
     });
+    let (effect, operations) = if hermetic {
+        (HERMETIC, HERMETIC_OPERATIONS)
+    } else {
+        (EFFECT, OPERATIONS)
+    };
     // A load is a function of the root and front it is handed, a build of the names it is given.
-    OPERATIONS
+    operations
         .into_iter()
         .map(|(op, path)| {
-            let op = crate::hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
+            let op = if hermetic {
+                crate::hosts::hermetic_op(effect, op, Linearity::Repeatable, path)
+            } else {
+                crate::hosts::privileged_op(effect, op, Linearity::Repeatable, path)
+            };
             (op, Arc::clone(&site))
         })
         .collect()
 }
 
-#[derive(Default)]
 struct Site {
+    /// Answers from what it is handed alone: it measures no binary and fetches nothing.
+    hermetic: bool,
     /// The last load, which the ops after it build from.
     program: Mutex<Option<Result<Loaded, LoadError>>>,
 }
@@ -71,8 +96,18 @@ impl HostHandler for Site {
                 &texts(startup, span)?,
                 reaches.as_bool(span, "whether the closure is wanted")?,
             ),
-            ("previous", [diff]) => answered(deployed(diff, span)?.map(|old| deployed_value(&old))),
+            ("previous", [path, bytes]) => {
+                let path = PathBuf::from(path.as_str(span, "the deployed artifact's path")?);
+                let bytes =
+                    crate::payload::option_of(bytes, "the deployed artifact's bytes", span)?
+                        .map(|b| b.as_bytes(span, "the deployed artifact's bytes"))
+                        .transpose()?;
+                answered(
+                    read_deployed(&path, bytes.map(|b| &b[..])).map(|old| deployed_value(&old)),
+                )
+            }
             ("unit", [names]) => self.unit(&texts(names, span)?),
+            ("git", [_, _]) if self.hermetic => answered(Err(hermetic_fetch())),
             ("git", [root, key]) => {
                 let root = PathBuf::from(root.as_str(span, "the project's root")?);
                 let key = key.as_str(span, "a git dependency's key")?.to_string();
@@ -84,13 +119,6 @@ impl HostHandler for Site {
                         .map(|dir| PlyValue::str(dir.display().to_string())),
                 )
             }
-            ("stored", [path, body]) => answered(
-                stored(
-                    Path::new(path.as_str(span, "a file to write")?),
-                    body.as_bytes(span, "an artifact")?,
-                )
-                .map(|()| PlyValue::Unit),
-            ),
             (other, _) => return Err(crate::hosts::unserved(EFFECT, other, span)),
         };
         Ok(HostAnswer::Value(value))
@@ -148,7 +176,11 @@ impl Site {
         front: &HandedFront,
     ) -> std::sync::MutexGuard<'_, Option<Result<Loaded, LoadError>>> {
         let mut program = self.program.lock().unwrap_or_else(|e| e.into_inner());
-        *program = Some(load_over_front(path, front));
+        *program = Some(if self.hermetic {
+            load_over_front_in(crate::load::tidy(path), front)
+        } else {
+            load_over_front(path, front)
+        });
         program
     }
 
@@ -177,7 +209,11 @@ impl Site {
                 ("modules", crate::drive::modules_value(loaded)),
                 ("places", places_value(&loaded.sources)),
                 ("pins", pins_value(&loaded.front.pins)),
-                ("binary_bytes", option(binary_bytes().map(size))),
+                // The running binary's size is no part of what a hermetic build answers.
+                (
+                    "binary_bytes",
+                    option(binary_bytes().filter(|_| !self.hermetic).map(size)),
+                ),
                 ("version", PlyValue::str(env!("CARGO_PKG_VERSION"))),
             ])],
         )
@@ -349,24 +385,11 @@ struct Deployed {
     warnings: Vec<Diagnostic>,
 }
 
-/// The deployed artifact `--diff` names, read when the program asks for it.
-fn deployed(diff: &PlyValue, span: Span) -> Result<Result<Deployed, Diagnostic>, Diagnostic> {
-    let read = crate::payload::option_of(diff, "the deployed artifact's path", span)?
-        .map(|v| {
-            v.as_str(span, "the deployed artifact's path")
-                .map(str::to_string)
-        })
-        .transpose()?;
-    Ok(match read {
-        Some(path) => read_deployed(Path::new(&path)),
-        None => Err(undeployed()),
-    })
-}
-
-fn read_deployed(path: &Path) -> Result<Deployed, Diagnostic> {
-    let bytes = artifact::bytes_of(path)?;
-    let (old, warnings) = artifact::decode(&bytes, path)?;
-    let digest = artifact::digest_of(&bytes).unwrap_or([0; 32]);
+/// The deployed artifact `--diff` names, from the bytes its caller read there.
+fn read_deployed(path: &Path, bytes: Option<&[u8]>) -> Result<Deployed, Diagnostic> {
+    let bytes = bytes.ok_or_else(|| artifact::unreadable(path))?;
+    let (old, warnings) = artifact::decode(bytes, path)?;
+    let digest = artifact::digest_of(bytes).unwrap_or([0; 32]);
     Ok(Deployed {
         digest: ply_std::short_digest(&digest),
         names: old.names,
@@ -380,25 +403,6 @@ fn deployed_value(old: &Deployed) -> PlyValue {
         ("names", named_value(&old.names)),
         ("warnings", diags_value(&old.warnings)),
     ])
-}
-
-// --- Where the artifact lands -------------------------------------------------
-
-fn stored(path: &Path, bytes: &[u8]) -> Result<(), Diagnostic> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return Err(unwritable(path, &e));
-    }
-    std::fs::write(path, bytes).map_err(|e| unwritable(path, &e))
-}
-
-fn unwritable(path: &Path, e: &std::io::Error) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("could not write `{}`: {e}", path.display()),
-    )
-    .primary(Span::DUMMY, "the artifact was built but not stored")
 }
 
 // --- Small things -------------------------------------------------------------
@@ -446,12 +450,12 @@ fn unloaded() -> Diagnostic {
 }
 
 #[cold]
-fn undeployed() -> Diagnostic {
+fn hermetic_fetch() -> Diagnostic {
     Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        "a deployed artifact was asked for and `--diff` named none",
+        codes::CAPABILITY_UNDECLARED,
+        "`hermetic_builder` fetches nothing, and the project names a git dependency",
     )
-    .note("the flag and the report that reads it are written together; this is Ply's fault")
+    .note("a program whose build fetches reads the network, and performs `builder`")
 }
 
 #[cold]

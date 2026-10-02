@@ -19,6 +19,9 @@
 #                                      applies. The packages' stores stay out: they hold test results,
 #                                      which a runtime a later run builds could not vouch for.
 #   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
+#   ci-corpus.sh upstream-mark         the moment `upstream-new` gathers from
+#   ci-corpus.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
+#   ci-corpus.sh upstream-merge DIR    every job's TAR under DIR merged, keeping this run's runtimes
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,6 +31,9 @@ cli_suite=crates/ply-cli-tests/ply
 # The caches `ply` reads, where the workflow restores them.
 caches=/tmp
 mark=$caches/ply-c-corpus.mark
+upstream=$caches/ply-upstream
+upstream_mark=$caches/ply-upstream.mark
+export PLY_CACHE_UPSTREAM=$upstream
 
 # What a checks run is given after `ply test PATH`.
 grants=(--host --timeout 900000 --steps 0 --json
@@ -39,7 +45,8 @@ grants=(--host --timeout 900000 --steps 0 --json
 cli_grants=(--host --timeout 900000 --steps 0 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
   --fs cwd=. --fs abs=/ --fs "repo=$root"
-  --allow machine --allow tester --allow claims --allow builder --allow bootstrap --allow hosts)
+  --allow machine --allow tester --allow claims --allow builder --allow bootstrap --allow hosts
+  --allow shipped)
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
 # directory of its own, which its harness empties before each test and refuses without the marker.
@@ -67,6 +74,11 @@ red() {
   ' "$1" 2>/dev/null || cat "$1"
 }
 
+# Each test a run ran, with how it ended, and each it took from the cache.
+listed() {
+  jq -r '(.results[]? | "\(.status)\t\(.key // .name)"), (.selection.tests[]? | select(.reason == "cached") | "cached\t\(.key)")' "$1" 2>/dev/null
+}
+
 # Where a `ply test` spent its time, from its report: the front end, the C the backend emitted and
 # compiled, and the tests. A lane is mostly the first two, so this is what the cut is tuned on.
 spent() {
@@ -85,9 +97,9 @@ run_one() {
   else
     tested "$path" ${filter:+--filter "$filter"} "$@" > "$out" || status=$?
   fi
-  jq -r '.results[]? | "\(.status)\t\(.key // .name)"' "$out" 2>/dev/null
+  listed "$out"
   spent "$out"
-  selected=$(jq -s 'map(.results // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
+  selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
   if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
     [ "$selected" -gt 0 ] || echo "corpus run $id selected no test (filter: ${filter:-none})" >&2
     red "$out"
@@ -112,11 +124,17 @@ run_modules() {
     args+=(--filter "$filter")
   done
   out=$(mktemp)
+  started=$(date +%s%3N)
   tested "$path" "${args[@]}" > "$out" || status=$?
-  jq -r '.results[]? | "\(.status)\t\(.key // .name)"' "$out" 2>/dev/null
+  wall=$(($(date +%s%3N) - started))
+  listed "$out"
   spent "$out"
+  # The startup the cut charges a lane once per package.
+  ran=$(jq '(.summary.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
+  printf 'startup\t%s\t%s\n' "$path" "$((wall > ran ? wall - ran : 0))" >> "$timings"
   for i in "${!ids[@]}"; do
-    n=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.key | contains($f))] | length' "$out" 2>/dev/null || echo 0)
+    # Every test the filter names, run or cached: a module whose tests all passed before selects them.
+    n=$(jq --arg f "${filters[$i]}" '[.selection.tests[]? | select(.key | contains($f))] | length' "$out" 2>/dev/null || echo 0)
     ms=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.key | contains($f)) | .duration_ms] | add // 0 | floor' "$out" 2>/dev/null || echo 0)
     if [ "$n" -eq 0 ]; then
       echo "corpus run ${ids[$i]} selected no test (filter: ${filters[$i]})" >&2
@@ -226,8 +244,41 @@ case "${1:-}" in
     [ -d "$dir" ] || exit 0
     tar -C "$dir" -cf - . | tar -C "$caches" --skip-old-files -xf -
     ;;
+  upstream-mark)
+    mkdir -p "$upstream"
+    touch "$upstream_mark"
+    find "$upstream" -type f | wc -l | sed 's/^ */upstream entries restored: /'
+    ;;
+  upstream-new)
+    tar_out=${2:?a tar file}
+    [ -f "$upstream_mark" ] || { echo "nothing is marked: run 'ci-corpus.sh upstream-mark' first" >&2; exit 2; }
+    mkdir -p "$upstream"
+    (cd "$upstream" && find . -type f -newer "$upstream_mark" ! -name '*.tmp' -print0 |
+      tar --null -T - -cf "$tar_out")
+    tar -tf "$tar_out" | wc -l | sed 's/^ */upstream entries published: /'
+    ;;
+  upstream-merge)
+    parts=${2:?a directory of tars}
+    mkdir -p "$upstream"
+    published=()
+    for part in "$parts"/*.tar; do
+      [ -f "$part" ] || continue
+      tar -C "$upstream" -xf "$part"
+      while IFS= read -r stamp; do published+=("$stamp"); done < <(tar -tf "$part" | awk -F/ '$2 == "v2" && $3 != "" { print $3 }')
+    done
+    # A pass filed under an older runtime is never read again.
+    if [ "${#published[@]}" -gt 0 ] && [ -d "$upstream/v2" ]; then
+      for dir in "$upstream"/v2/*; do
+        name=${dir##*/}
+        keep=no
+        for stamp in "${published[@]}"; do [ "$stamp" = "$name" ] && keep=yes; done
+        [ "$keep" = yes ] || rm -rf "$dir"
+      done
+    fi
+    find "$upstream" -type f | wc -l | sed 's/^ */upstream entries kept: /'
+    ;;
   *)
-    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | run ID [ARG...] | mark | keep DIR | restore DIR" >&2
+    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | run ID [ARG...] | mark | keep DIR | restore DIR | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
     exit 2
     ;;
 esac

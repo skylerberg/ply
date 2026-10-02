@@ -10,6 +10,8 @@ pub struct Family {
     pub name: &'static str,
     /// The effect whose operations the family lends, which a program must declare to reach them.
     pub effect: &'static str,
+    /// The same operations answered from what they are handed alone, by deterministic handlers.
+    pub hermetic: Option<&'static str>,
     pub summary: &'static str,
 }
 
@@ -19,37 +21,50 @@ pub const FAMILIES: &[Family] = &[
     Family {
         name: "machine",
         effect: "machine",
+        hermetic: Some("hermetic_machine"),
         summary: "load, bind, enter and call a nested program",
     },
     Family {
         name: "tester",
         effect: "tester",
-        summary: "run a project's tests, and report what ran",
+        hermetic: Some("hermetic_tester"),
+        summary: "run a project's tests, and report what ran; `hermetic_tester` runs them binding nothing",
     },
     Family {
         name: "claims",
         effect: "prover",
+        hermetic: Some("hermetic_prover"),
         summary: "discharge a project's obligations",
     },
     Family {
         name: "builder",
         effect: "builder",
+        hermetic: Some("hermetic_builder"),
         summary: "build an artifact and stamp it",
     },
     Family {
         name: "bootstrap",
         effect: "archive",
+        hermetic: None,
         summary: "emit the compiler's own bundle",
     },
     Family {
         name: "hosts",
         effect: "tcb",
+        hermetic: Some("hermetic_tcb"),
         summary: "preview what a run would bind",
     },
     Family {
         name: "edit",
         effect: "edit",
+        hermetic: None,
         summary: "replace one item of a file with another",
+    },
+    Family {
+        name: "shipped",
+        effect: "shipped",
+        hermetic: None,
+        summary: "read the modules and the version this binary ships",
     },
 ];
 
@@ -74,6 +89,7 @@ fn own(effect: &str) -> String {
         "archive" => "bootstrap",
         "tcb" => "hosts",
         "edit" => "replace",
+        "shipped" => "env",
         other => other,
     }
     .to_string()
@@ -83,14 +99,22 @@ fn own(effect: &str) -> String {
 pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
     Some(match family {
         "machine" => {
-            crate::registrations_in(&declared("machine"), crate::drive::RunOptions::default())
+            let mut ops =
+                crate::registrations_in(&declared("machine"), crate::drive::RunOptions::default());
+            ops.extend(crate::hermetic_registrations_in(&declared("machine")));
+            ops
         }
-        "tester" => crate::tester::Session::new().lent(),
+        "tester" => {
+            let mut ops = crate::tester::Session::new().lent();
+            ops.extend(crate::tester::Session::hermetic().lent());
+            ops
+        }
         "claims" => crate::claims::lent(&declared("prover")),
         "builder" => crate::builder::lent(),
         "bootstrap" => crate::bootstrap::lent(),
         "hosts" => crate::hosts::lent(&declared("tcb")),
         "edit" => crate::edit::lent(),
+        "shipped" => crate::shipped::lent(),
         _ => return None,
     })
 }
@@ -99,6 +123,10 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
 /// be lent it: `claims` lends `prover`, so the family's name is not it.
 pub fn effect_of(family: &str) -> Option<&'static str> {
     FAMILIES.iter().find(|f| f.name == family).map(|f| f.effect)
+}
+
+pub fn hermetic_of(family: &str) -> Option<&'static str> {
+    FAMILIES.iter().find(|f| f.name == family)?.hermetic
 }
 
 /// The operations of the named families, or why one of them is not a family.

@@ -12,10 +12,10 @@ import compiler.front (DefInterface, KnownTestRow, Filing, FiledModule, FiledEnt
 import compiler.resolve (Diag)
 import paths
 import store.engine (Warning, Unreadable, Corrupt, OtherVersion)
-import store.tables (Cache, Fingerprint, DefEntry, TestEntry, Member, FileSpan, DefKind, KFn, KType,
-                     KEffect, Package, Body, open_cache, flush_cache, fingerprint, put_fingerprint,
-                     def_of, put_def, put_decl, put_body, prune, source_key, source_keys,
-                     shipped_digest, put_shipped_digest, warnings)
+import store.tables (Cache, Stamps, Fingerprint, DefEntry, TestEntry, Member, FileSpan, DefKind,
+                     KFn, KType, KEffect, Package, Body, open_cache, flush_cache, fingerprint,
+                     put_fingerprint, def_of, put_def, put_decl, put_body, prune, source_key,
+                     source_keys, shipped_digest, put_shipped_digest, warnings)
 import store.twin (on_twin)
 
 // One file a load read: where from, the module it is, and its bytes. The store keys it by its path,
@@ -44,24 +44,40 @@ pub type Recorded = {
 
 // Where a load keeps its store: `.ply-cache` in the project root, under the root's own label, with
 // the root as the machine spells the files it keys.
-pub type Place = { label: String, dir: String, root: String }
+pub type Place = { label: String, dir: String, root: String, stamps: Stamps }
 
-pub fn place_of(paths: List<paths::Resolved>) -> Place =
+pub fn place_of(paths: List<paths::Resolved>, stamps: Stamps) -> Place =
   match list_at(paths, 0) {
     Some(r) ->
       {
         label: r.label,
         dir: paths::in_root(r, ".ply-cache").path,
         root: if r.label == "cwd" { r.spelling } else { "/" ++ r.spelling },
+        stamps: stamps,
       },
-    None -> { label: "cwd", dir: ".ply-cache", root: "." },
+    None -> { label: "cwd", dir: ".ply-cache", root: ".", stamps: stamps },
   }
+
+// The launcher lays `stamps` beside the shelf as `name digest` lines.
+pub fn shelf_stamps() -> Stamps / {fs.read_file[shelf]} =
+  match fs.read_file[shelf]("stamps") {
+    None -> panic("the shelf carries no stamps; the launcher lays them out beside the modules"),
+    Some(b) -> stamps_of(string_of_bytes_lossy(b)),
+  }
+
+pub fn stamps_of(text: String) -> Stamps =
+  fold(string_split(text, "\n"), { frontend: "", runtime: "" }, |s: Stamps, line: String|
+    match string_split(line, " ") {
+      ["frontend", digest] -> { ..s, frontend: digest },
+      ["runtime", digest] -> { ..s, runtime: digest },
+      _ -> s,
+    })
 
 fn packages_of(ps: List<SourcePackage>) -> List<Package> =
   map(ps, |p: SourcePackage| { root: p.root, identity: p.digest })
 
 fn opened<[r]>(place: Place, sources: Sources) -> Cache / {fs.read[r]} =
-  open_cache[r](place.dir, place.root, packages_of(sources.packages))
+  open_cache[r](place.dir, place.root, packages_of(sources.packages), place.stamps)
 
 fn warning(code: Bytes, message: String, notes: List<String>) -> Diag =
   {
@@ -338,7 +354,14 @@ pub fn file<[r]>(
 
 // --- Tests ------------------------------------------------------------------
 
-fn a_place() -> Place = { label: "mem", dir: "cache", root: "" }
+test "the shelf's stamps are read a name to a line, and a line naming nothing is passed over" {
+  assert_eq(stamps_of("frontend aa\nruntime bb\n"), { frontend: "aa", runtime: "bb" });
+  assert_eq(stamps_of("runtime bb\nother cc\n"), { frontend: "", runtime: "bb" })
+}
+
+fn a_place() -> Place = { label: "mem", dir: "cache", root: "", stamps: built() }
+
+fn built() -> Stamps = { frontend: "frontend", runtime: "runtime" }
 
 fn shipped_sources() -> Sources =
   {
@@ -358,7 +381,7 @@ fn drain_entry() -> DefEntry =
 // What a load whose shipped modules digest to `now` is told, over a store last filed under `was`.
 fn told(was: String, now: String) -> { before: Option<StdlibMoved>, after: Option<StdlibMoved> } =
   on_twin(mem_empty(), || {
-    let c0 = put_fingerprint[mem](open_cache[mem]("cache", "", []), {
+    let c0 = put_fingerprint[mem](open_cache[mem]("cache", "", [], built()), {
       key: "<std>/net.ply",
       content: blake3(b"what the last compiler shipped"),
       module: "std.net",
@@ -397,7 +420,7 @@ test "a store filed under these shipped modules says nothing moved" {
 test "a cold store has no shipped modules to compare against" {
   let run = on_twin(mem_empty(), || {
     let r = known[mem](a_place(), shipped_sources(), "b3:new");
-    let c = flush_cache[mem](open_cache[mem]("cache", "", []));
+    let c = flush_cache[mem](open_cache[mem]("cache", "", [], built()));
     r
   });
   assert_eq(run.value.stdlib, None);
@@ -415,7 +438,7 @@ test "the files an earlier format kept are removed once, and said so once" {
   let run = on_twin(mem_empty(), || {
     let wrote = planted[mem](["results.json", "frontend.idx.tmp", "keep.me"]);
     let first = retired[mem](a_place());
-    let c = flush_cache[mem](open_cache[mem]("cache", "", []));
+    let c = flush_cache[mem](open_cache[mem]("cache", "", [], built()));
     { wrote: wrote, first: len(first), second: len(retired[mem](a_place())), left: listed[mem]() }
   });
   assert_eq(run.value.wrote, true);

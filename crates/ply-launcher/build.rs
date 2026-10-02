@@ -8,12 +8,32 @@
 //! The dependency walk reads the manifest's text for `Path("...")` and nothing else: a build script
 //! needs the *files*, and the meaning of a manifest is the front end's (`crates/ply-compiler/ply/
 //! pkg.ply`), which this deliberately does not duplicate.
+//!
+//! The store stamps digest the Rust sources, not the binary, so both build profiles file the same.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+const EVALUATOR: &[&str] = &["ply-eval", "ply-codegen"];
+
+const RUNTIME: &[&str] = &[
+    "ply-eval",
+    "ply-codegen",
+    "ply-host",
+    "ply-machine",
+    "ply-launcher",
+];
+
 fn main() {
     let repo = normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    println!(
+        "cargo:rustc-env=PLY_EVALUATOR_SOURCES={}",
+        sources_digest(&repo, EVALUATOR, &[])
+    );
+    println!(
+        "cargo:rustc-env=PLY_RUNTIME_SOURCES={}",
+        sources_digest(&repo, RUNTIME, &["Cargo.lock"])
+    );
     let root = repo.join("crates/ply-cli/ply");
     let packages = closure(&root);
 
@@ -132,6 +152,51 @@ fn modules(dir: &Path) -> Vec<(String, PathBuf)> {
     }
     out.sort();
     out
+}
+
+/// Every file under each crate's `src/`, and each named file of the repository, keyed by its path
+/// relative to the repository.
+fn sources_digest(repo: &Path, crates: &[&str], files: &[&str]) -> String {
+    let mut paths = Vec::new();
+    for name in crates {
+        let src = repo.join("crates").join(name).join("src");
+        println!("cargo:rerun-if-changed={}", src.display());
+        walk(&src, &mut paths);
+    }
+    for file in files {
+        let path = repo.join(file);
+        println!("cargo:rerun-if-changed={}", path.display());
+        paths.push(path);
+    }
+    paths.sort();
+    let mut h = blake3::Hasher::new();
+    for path in &paths {
+        let name = path
+            .strip_prefix(repo)
+            .expect("every file digested is in the repository")
+            .to_string_lossy()
+            .into_owned();
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|e| panic!("the source file {} reads: {e}", path.display()));
+        h.update(&(name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+    }
+    h.finalize().to_hex().to_string()
+}
+
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("the source directory {} reads: {e}", dir.display()))
+    {
+        let path = entry.expect("a directory entry").path();
+        if path.is_dir() {
+            walk(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
 }
 
 /// Lexical, because a dependency is written as `../../x` and `Path::join` keeps the `..`s: the keys

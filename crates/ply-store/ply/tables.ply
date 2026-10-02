@@ -26,15 +26,6 @@ fn t_reviews() -> Int = 9
 fn t_shipped() -> Int = 10
 fn t_stamps() -> Int = 11
 
-// --- Versions ---------------------------------------------------------------
-
-// Each moves when what its tables hold changes meaning without changing shape: what the front end
-// files, what a run proves, and what the prover discharges. Entries filed under another version are
-// not believed.
-pub fn frontend_version() -> String = "0.33.0"
-pub fn runtime_version() -> String = "0.16.0"
-pub fn prover_version() -> String = "0.8.0"
-
 // --- Records ----------------------------------------------------------------
 
 // A byte range in one source file, as a span degrades to outside the run that made it.
@@ -77,8 +68,8 @@ type Named<a> = { name: String, value: a }
 // What a human last accepted for a definition: its hash, and its own clauses' and laws' keys.
 pub type Review = { def: Bytes, specs: List<Bytes> }
 
-// The versions the versioned tables were filed under.
-pub type Stamps = { frontend: String, runtime: String, prover: String }
+// The build the versioned groups were filed by: its front end's digest and its runtime's.
+pub type Stamps = { frontend: String, runtime: String }
 
 derive bin for FileSpan
 derive bin for DefKind
@@ -114,88 +105,87 @@ pub type Cache = {
   store: Store,
   root: String,
   packages: List<Package>,
+  stamps: Stamps,
   upstream: Option<Upstream>,
   shared: Map<Bytes, Bool>,
 }
 
-pub fn open_cache<[r]>(dir: String, root: String, packages: List<Package>) -> Cache / {fs.read[r]} =
+pub fn open_cache<[r]>(
+  dir: String,
+  root: String,
+  packages: List<Package>,
+  stamps: Stamps,
+) -> Cache / {fs.read[r]} =
   {
-    store: stamped[r](open[r](dir, schema())),
+    store: stamped[r](open[r](dir, schema()), stamps),
     root: root,
     packages: packages,
+    stamps: stamps,
     upstream: None,
     shared: map_new(),
   }
 
-pub fn stamps() -> Stamps =
-  { frontend: frontend_version(), runtime: runtime_version(), prover: prover_version() }
-
 fn stamps_key() -> Bytes = named_key("stamps")
 
-// A versioned group of tables, and the version its entries were filed under.
+// A versioned group of tables, and the stamp its entries were filed under.
 type Group = { what: String, was: String, now: String, tables: List<Int> }
 
-fn groups(was: Stamps) -> List<Group> =
+fn groups(was: Stamps, now: Stamps) -> List<Group> =
   [
     {
       what: "the front end's entries",
       was: was.frontend,
-      now: frontend_version(),
+      now: now.frontend,
       tables: [t_sources(), t_defs(), t_decls()],
     },
     {
-      what: "the test results",
+      what: "the test results and discharged obligations",
       was: was.runtime,
-      now: runtime_version(),
-      tables: [t_passed(), t_pass_records(), t_seen()],
-    },
-    {
-      what: "the discharged obligations",
-      was: was.prover,
-      now: prover_version(),
-      tables: [t_evidence()],
+      now: now.runtime,
+      tables: [t_passed(), t_pass_records(), t_seen(), t_evidence()],
     },
   ]
 
 fn emptied(s: Store, g: Group) -> Store =
   fold(g.tables, s, |s1: Store, t: Int| fold(keys(s1, t), s1, |s2: Store, k: Bytes| drop(s2, t, k)))
 
-fn restamped(s: Store) -> Store =
-  put(s, t_stamps(), stamps_key(), bin::encode(stamps(), stamps_bin()))
+fn restamped(s: Store, now: Stamps) -> Store =
+  put(s, t_stamps(), stamps_key(), bin::encode(now, stamps_bin()))
 
-// What a store says its versioned groups were filed under.
+fn short_stamp(stamp: String) -> String =
+  if string_len(stamp) > 12 { "b3:" ++ string_slice(stamp, 0, 12) } else { stamp }
+
 type Stamped = | Known(Stamps) | Unstamped | Garbled
 
-// The groups filed under another version are dropped, each said once; a store whose versions are
-// missing or do not read keeps none of them. A store with nothing versioned in it is stamped when it
-// is flushed.
-fn stamped<[r]>(s: Store) -> Store / {fs.read[r]} = {
+// Groups filed under other stamps are dropped, each warned once; unreadable stamps drop them all.
+fn stamped<[r]>(s: Store, now: Stamps) -> Store / {fs.read[r]} = {
   let was = match get[r](s, t_stamps(), stamps_key()) {
     Hit(bytes) -> match bin::decode(bytes, stamps_bin()) { Ok(st) -> Known(st), Err(_) -> Garbled },
     Miss -> Unstamped,
     Bad(_) -> Garbled,
   };
-  let all = groups(stamps());
+  let all = groups(now, now);
   let dropped = |why: Trouble, message: String|
-    restamped(warn(fold(all, s, emptied), why, message));
+    restamped(warn(fold(all, s, emptied), why, message), now);
   match was {
-    Known(st) -> if st == stamps() { s } else {
+    Known(st) -> if st == now { s } else {
       restamped(
-        fold(filter(groups(st), |g: Group| g.was != g.now), s, |s1: Store, g: Group|
+        fold(filter(groups(st, now), |g: Group| g.was != g.now), s, |s1: Store, g: Group|
           warn(
             emptied(s1, g),
             OtherVersion,
-            g.what ++ " were filed by version " ++ g.was ++ ", and this is " ++ g.now
-              ++ "; they are filed again",
+            g.what ++ " were filed by another build (" ++ short_stamp(g.was) ++ "; this one is "
+              ++ short_stamp(g.now)
+              ++ "), so they are filed again",
           )),
+        now,
       )
     },
     Unstamped -> if fold(all, true, |none: Bool, g: Group|
         none && fold(g.tables, true, |n: Bool, t: Int| n && len(keys(s, t)) == 0)) { s } else {
-      dropped(OtherVersion, "the store names no versions for its entries; they are filed again")
+      dropped(OtherVersion, "the store names no stamps for its entries; they are filed again")
     },
-    Garbled ->
-      dropped(Corrupt, "the store's versions do not read back; its entries are filed again"),
+    Garbled -> dropped(Corrupt, "the store's stamps do not read back; its entries are filed again"),
   }
 }
 
@@ -204,7 +194,7 @@ fn stamped<[r]>(s: Store) -> Store / {fs.read[r]} = {
 pub fn with_upstream<[u]>(c: Cache, root: String, publish: Bool) -> Cache / {fs.read[u]} = {
   let up = {
     root: root,
-    schema: digest(schema() ++ bin::encode(stamps(), stamps_bin())),
+    schema: digest(schema() ++ bytes_of_string(c.stamps.runtime)),
     publish: publish,
   };
   {
@@ -234,13 +224,16 @@ fn puts_in(s: Store, tables: List<Int>) -> List<Put> =
     } else { acc })
 
 pub fn flush_cache<[r]>(c: Cache) -> Cache / {fs.read[r], fs.write[r], entropy.next, time.now_ms} =
-  { ..c, store: flush[r](if pending(c.store) == 0 { c.store } else { current[r](c.store) }) }
+  {
+    ..c,
+    store: flush[r](if pending(c.store) == 0 { c.store } else { current[r](c.store, c.stamps) }),
+  }
 
-// Whatever a flush writes goes under this build's versions.
-fn current<[r]>(s: Store) -> Store / {fs.read[r]} =
+// Whatever a flush writes goes under this build's stamps.
+fn current<[r]>(s: Store, now: Stamps) -> Store / {fs.read[r]} =
   match get[r](s, t_stamps(), stamps_key()) {
-    Hit(b) -> if b == bin::encode(stamps(), stamps_bin()) { s } else { restamped(s) },
-    _ -> restamped(s),
+    Hit(b) -> if b == bin::encode(now, stamps_bin()) { s } else { restamped(s, now) },
+    _ -> restamped(s, now),
   }
 
 // The local write comes first, so an upstream that cannot be reached never costs a run its own record.
@@ -747,6 +740,8 @@ pub fn compact_cache<[r]>(
 
 fn h(name: String) -> Bytes = bytes_blake3(bytes_of_string(name))
 
+fn built() -> Stamps = { frontend: "frontend", runtime: "runtime" }
+
 fn span() -> FileSpan = { start: 0, end: 4 }
 
 fn entry(name: String) -> DefEntry =
@@ -775,7 +770,7 @@ fn record(names: List<String>) -> PassRecord =
 test "every table round-trips through a flush and a reopen" {
   let b = solo(b"body bytes");
   let run = on_twin(mem_empty(), || {
-    let c0 = open_cache[mem]("cache", "", []);
+    let c0 = open_cache[mem]("cache", "", [], built());
     let c1 = put_fingerprint(c0, print("a.ply", ["m.f"]));
     let c2 = put_def[mem](put_def[mem](c1, h("same"), "m.f", b"F"), h("same"), "m.g", b"G");
     let c3 = put_body(put_decl[mem](c2, h("ty"), "m.T", b"T"), key_of_body(b), b);
@@ -792,7 +787,7 @@ test "every table round-trips through a flush and a reopen" {
       "b3:000000000000",
     );
     let c = flush_cache[mem](c5);
-    let r = open_cache[mem]("cache", "", []);
+    let r = open_cache[mem]("cache", "", [], built());
     assert_eq(fingerprint[mem](r, "a.ply").value, Some(print("a.ply", ["m.f"])));
     assert_eq(def_of[mem](r, h("same"), "m.f").value, Some(b"F"));
     assert_eq(def_of[mem](r, h("same"), "m.g").value, Some(b"G"));
@@ -823,13 +818,13 @@ test "a body is filed only under the hash its envelope names" {
   assert_eq(body_key(b"\x07"), None);
   let run = on_twin(mem_empty(), || {
     let c = put_body(
-      put_body(open_cache[mem]("cache", "", []), h("wrong"), b),
+      put_body(open_cache[mem]("cache", "", [], built()), h("wrong"), b),
       key_of_body(member),
       member,
     );
-    let r = open_cache[mem]("cache", "", []);
+    let r = open_cache[mem]("cache", "", [], built());
     let flushed = flush_cache[mem](c);
-    let again = open_cache[mem]("cache", "", []);
+    let again = open_cache[mem]("cache", "", [], built());
     [
       body[mem](again, h("wrong")).value == None,
       body[mem](again, key_of_body(member)).value == Some(member),
@@ -842,7 +837,7 @@ fn h_bytes(b: Bytes) -> Bytes = bytes_blake3(b)
 
 test "prune keeps what the kept files and the pass records reach, and drops the rest" {
   let run = on_twin(mem_empty(), || {
-    let c0 = open_cache[mem]("cache", "", []);
+    let c0 = open_cache[mem]("cache", "", [], built());
     let c1 = put_fingerprint(
       put_fingerprint(c0, print("a.ply", ["m.a"])),
       print("gone.ply", ["m.gone"]),
@@ -852,9 +847,9 @@ test "prune keeps what the kept files and the pass records reach, and drops the 
       put_def[mem](c, h(n), n, b"v"));
     let c4 = put_body(c3, key_of_body(solo(b"orphan")), solo(b"orphan"));
     let p = prune[mem](flush_cache[mem](c4), ["a.ply"]);
-    let after = open_cache[mem]("cache", "", []);
+    let after = open_cache[mem]("cache", "", [], built());
     let kept = flush_cache[mem](p.cache);
-    let r = open_cache[mem]("cache", "", []);
+    let r = open_cache[mem]("cache", "", [], built());
     {
       pruned: p.pruned,
       sources: source_keys[mem](r).value,
@@ -870,7 +865,7 @@ test "prune keeps what the kept files and the pass records reach, and drops the 
 test "lookup finds a definition by its name, its simple name and a prefix of its hash" {
   let run = on_twin(mem_empty(), || {
     let c = flush_cache[mem](
-      put_fingerprint(open_cache[mem]("cache", "", []), print("a.ply", ["m.f", "m.g"])),
+      put_fingerprint(open_cache[mem]("cache", "", [], built()), print("a.ply", ["m.f", "m.g"])),
     );
     let names = |q: String|
       match lookup[mem](c, q).value {
@@ -895,6 +890,7 @@ test "a project's file is keyed by its path inside the root, a dependency's by i
     store: open_free(),
     root: "proj",
     packages: [{ root: "proj/vendor/lib", identity: "b3:lib" }],
+    stamps: built(),
     upstream: None,
     shared: map_new(),
   };
@@ -919,11 +915,11 @@ test "the schema is a function of the stored shapes alone" {
 
 test "two runs filing different entries both keep theirs" {
   let run = on_twin(mem_empty(), || {
-    let a = put_fingerprint(open_cache[mem]("cache", "", []), print("a.ply", ["m.a"]));
-    let b = put_fingerprint(open_cache[mem]("cache", "", []), print("b.ply", ["m.b"]));
+    let a = put_fingerprint(open_cache[mem]("cache", "", [], built()), print("a.ply", ["m.a"]));
+    let b = put_fingerprint(open_cache[mem]("cache", "", [], built()), print("b.ply", ["m.b"]));
     let a1 = flush_cache[mem](a);
     let b1 = flush_cache[mem](b);
-    source_keys[mem](open_cache[mem]("cache", "", [])).value
+    source_keys[mem](open_cache[mem]("cache", "", [], built())).value
   });
   assert_eq(run.value, Some(["a.ply", "b.ply"]))
 }
@@ -933,7 +929,7 @@ test "filing what is already filed writes nothing, and a second body for one has
   let run = on_twin(mem_empty(), || {
     let c0 = put_body(
       put_def(
-        put_fingerprint(open_cache[mem]("cache", "", []), print("a.ply", ["m.f"])),
+        put_fingerprint(open_cache[mem]("cache", "", [], built()), print("a.ply", ["m.f"])),
         h("m.f"),
         "m.f",
         b"F",
@@ -944,7 +940,7 @@ test "filing what is already filed writes nothing, and a second body for one has
     let c1 = flush_cache[mem](c0);
     let again = put_body(
       put_def(
-        put_fingerprint(open_cache[mem]("cache", "", []), print("a.ply", ["m.f"])),
+        put_fingerprint(open_cache[mem]("cache", "", [], built()), print("a.ply", ["m.f"])),
         h("m.f"),
         "m.f",
         b"F",
@@ -961,12 +957,12 @@ test "filing what is already filed writes nothing, and a second body for one has
 
 test "an upstream's passes and evidence answer here, and what this run learns is published there" {
   let run = on_twin(mem_empty(), || {
-    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", []), "shared", true);
+    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", true);
     let a1 = flush_shared[mem, mem](
       put_evidence(put_passed(a, h("pass")), h("claim"), b"evidence"),
     );
-    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", []), "shared", true);
-    let lonely = open_cache[mem]("three/cache", "three", []);
+    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", [], built()), "shared", true);
+    let lonely = open_cache[mem]("three/cache", "three", [], built());
     [
       passed[mem](b, h("pass")).value == Some(true),
       evidence_shared[mem, mem](b, h("claim")).value == Some(b"evidence"),
@@ -980,9 +976,9 @@ test "an upstream's passes and evidence answer here, and what this run learns is
 
 test "a read-only upstream answers and is not written" {
   let run = on_twin(mem_empty(), || {
-    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", []), "shared", false);
+    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", false);
     let a1 = flush_shared[mem, mem](put_passed(a, h("pass")));
-    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", []), "shared", true);
+    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", [], built()), "shared", true);
     passed[mem](b, h("pass")).value
   });
   assert_eq(run.value, Some(false))
@@ -990,14 +986,18 @@ test "a read-only upstream answers and is not written" {
 
 test "two runs publishing one pass race harmlessly, and an unwritable upstream is a warning" {
   let run = on_twin(mem_empty(), || {
-    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", []), "shared", true);
-    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", []), "shared", true);
+    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", true);
+    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", [], built()), "shared", true);
     let a1 = flush_shared[mem, mem](put_passed(a, h("pass")));
     let b1 = flush_shared[mem, mem](put_passed(b, h("pass")));
     let blocked = fs.write_file[mem]("blocked", b"a file where the upstream should be");
-    let c = with_upstream[mem](open_cache[mem]("three/cache", "three", []), "blocked", true);
+    let c = with_upstream[mem](
+      open_cache[mem]("three/cache", "three", [], built()),
+      "blocked",
+      true,
+    );
     let c1 = flush_shared[mem, mem](put_passed(c, h("mine")));
-    let again = open_cache[mem]("three/cache", "three", []);
+    let again = open_cache[mem]("three/cache", "three", [], built());
     {
       clean: warnings(a1) == [] && warnings(b1) == [],
       warned: messages(warnings(c1)),
@@ -1011,36 +1011,71 @@ test "two runs publishing one pass race harmlessly, and an unwritable upstream i
   assert_eq(run.value.kept, Some(true))
 }
 
-test "entries filed under another version are dropped group by group, and said once" {
+test "entries filed under another build's stamp are dropped group by group, and said once" {
   let run = on_twin(mem_empty(), || {
     let c0 = put_passed(
-      put_fingerprint(open_cache[mem]("cache", "", []), print("a.ply", ["m.f"])),
+      put_fingerprint(open_cache[mem]("cache", "", [], built()), print("a.ply", ["m.f"])),
       h("t"),
     );
     let c1 = put_review(c0, "m.f", { def: h("m.f"), specs: [] });
-    let old = { ..stamps(), frontend: "0.0.1" };
     let written = flush_cache[mem](c1);
-    let aged = flush[mem](
-      put(open[mem]("cache", schema()), t_stamps(), stamps_key(), bin::encode(old, stamps_bin())),
-    );
-    let r = open_cache[mem]("cache", "", []);
+    let moved = { ..built(), frontend: "elsewhere" };
+    let r = open_cache[mem]("cache", "", [], moved);
     let warned = messages(r.store.warnings);
-    let again = open_cache[mem]("cache", "", []);
-    let refiled = flush_cache[mem](again);
+    let refiled = flush_cache[mem](open_cache[mem]("cache", "", [], moved));
     {
       warned: warned,
       fingerprint: fingerprint[mem](r, "a.ply").value == None,
       passed: passed[mem](r, h("t")).value,
       review: review[mem](r, "m.f").value != None,
-      later: messages(open_cache[mem]("cache", "", []).store.warnings),
+      later: messages(open_cache[mem]("cache", "", [], moved).store.warnings),
     }
   });
   assert_eq(run.value.warned, [
-    "the front end's entries were filed by version 0.0.1, and this is " ++ frontend_version()
-      ++ "; they are filed again",
+    "the front end's entries were filed by another build (frontend; this one is elsewhere), so they are filed again",
   ]);
   assert(run.value.fingerprint);
   assert_eq(run.value.passed, Some(true));
   assert(run.value.review);
   assert_eq(run.value.later, [])
+}
+
+test "a pass or a claim's evidence filed by another runtime is not believed" {
+  let run = on_twin(mem_empty(), || {
+    let c0 = put_evidence(
+      put_passed(
+        put_fingerprint(open_cache[mem]("cache", "", [], built()), print("a.ply", ["m.f"])),
+        h("t"),
+      ),
+      h("claim"),
+      b"evidence",
+    );
+    let written = flush_cache[mem](c0);
+    let r = open_cache[mem]("cache", "", [], { ..built(), runtime: "another runtime" });
+    {
+      warned: len(messages(r.store.warnings)),
+      fingerprint: fingerprint[mem](r, "a.ply").value != None,
+      passed: passed[mem](r, h("t")).value,
+      evidence: evidence[mem](r, h("claim")).value,
+    }
+  });
+  assert_eq(run.value.warned, 1);
+  assert(run.value.fingerprint);
+  assert_eq(run.value.passed, Some(false));
+  assert_eq(run.value.evidence, None)
+}
+
+test "an upstream answers only the runtime that published to it" {
+  let run = on_twin(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", [], built()), "shared", true);
+    let published = flush_shared[mem, mem](put_passed(a, h("pass")));
+    let same = with_upstream[mem](open_cache[mem]("two/cache", "two", [], built()), "shared", true);
+    let other = with_upstream[mem](
+      open_cache[mem]("three/cache", "three", [], { ..built(), runtime: "another runtime" }),
+      "shared",
+      true,
+    );
+    [passed[mem](same, h("pass")).value, passed[mem](other, h("pass")).value]
+  });
+  assert_eq(run.value, [Some(true), Some(false)])
 }
