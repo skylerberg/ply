@@ -46,8 +46,9 @@ the runtime and the CLI.
   checked-in bundle as a stage. A golden that moved is listed in the nextest job's summary;
   read it, since nothing fails on it.
 - The bundle carries `crates/ply-compiler/ply` and the shipped modules it imports, pulled as a
-  project's are (today `std.hash` alone), so only those cannot use a language rule the same pull
-  request introduces. The rest of `crates/ply-std/ply` can.
+  project's are (`grep '^import std' crates/ply-compiler/ply/*.ply` and what those import), so
+  only those cannot use a language rule the same pull request introduces. The rest of
+  `crates/ply-std/ply` can.
 - `crates/ply-cli` is the CLI as a Ply program plus the artifact `ply build` makes of it
   (`bootstrap/ply.plyx`); it is not a cargo crate. The `refresh` job rebuilds the artifact on
   main by driving the released binary, so the checkout can rebuild itself without cargo.

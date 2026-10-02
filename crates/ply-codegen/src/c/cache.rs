@@ -167,6 +167,7 @@ pub(super) fn encode_const(v: &Value) -> String {
         Value::Str(s) => format!("s {}", hex(s.as_bytes())),
         Value::Bytes(b) => format!("b {}", hex(b)),
         Value::Fixed(f) => format!("f {} {}", f.ty as u8, f.bits()),
+        Value::Char(c) => format!("c {}", u32::from(*c)),
         Value::Float(x) => format!("x {:016x}", x.to_bits()),
         Value::Decimal(d) => format!("d {} {}", d.mantissa(), d.scale()),
         other => unreachable!("a constant this tier does not pool: {other:?}"),
@@ -191,6 +192,7 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
                 let ty = ply_eval::INT_TYPES.iter().find(|t| **t as u8 == n)?;
                 Value::Fixed(ply_eval::Fixed::new(*ty, bits.parse().ok()?))
             }
+            "c" => Value::Char(char::from_u32(rest.parse().ok()?)?),
             "x" => Value::Float(f64::from_bits(u64::from_str_radix(rest, 16).ok()?)),
             "d" => {
                 let (mantissa, scale) = rest.split_once(' ')?;

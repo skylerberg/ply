@@ -143,6 +143,11 @@ pub enum Builtin {
     CheckedSub,
     CheckedMul,
     CheckedNeg,
+    /// `None` for a surrogate or past `U+10FFFF`, which no `Char` is.
+    CharOfInt,
+    IntOfChar,
+    StringChars,
+    StringOfChars,
 }
 
 impl Builtin {
@@ -248,6 +253,10 @@ impl Builtin {
             "checked_sub" => Builtin::CheckedSub,
             "checked_mul" => Builtin::CheckedMul,
             "checked_neg" => Builtin::CheckedNeg,
+            "char_of_int" => Builtin::CharOfInt,
+            "int_of_char" => Builtin::IntOfChar,
+            "string_chars" => Builtin::StringChars,
+            "string_of_chars" => Builtin::StringOfChars,
             _ => return None,
         })
     }
@@ -368,6 +377,10 @@ impl Builtin {
             Builtin::CheckedSub => "checked_sub",
             Builtin::CheckedMul => "checked_mul",
             Builtin::CheckedNeg => "checked_neg",
+            Builtin::CharOfInt => "char_of_int",
+            Builtin::IntOfChar => "int_of_char",
+            Builtin::StringChars => "string_chars",
+            Builtin::StringOfChars => "string_of_chars",
         }
     }
 
@@ -425,6 +438,10 @@ impl Builtin {
             | Builtin::U128OfString
             | Builtin::I128OfString
             | Builtin::CheckedNeg
+            | Builtin::CharOfInt
+            | Builtin::IntOfChar
+            | Builtin::StringChars
+            | Builtin::StringOfChars
             | Builtin::IntOfU8
             | Builtin::IntOfU16
             | Builtin::IntOfU32
@@ -643,6 +660,10 @@ impl Builtin {
             Builtin::CheckedSub,
             Builtin::CheckedMul,
             Builtin::CheckedNeg,
+            Builtin::CharOfInt,
+            Builtin::IntOfChar,
+            Builtin::StringChars,
+            Builtin::StringOfChars,
         ]
     }
 }
@@ -1095,6 +1116,37 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::StringOfBytesLossy => {
             let b = args[0].as_bytes(span, "`string_of_bytes_lossy`")?;
             Ok(Value::str(String::from_utf8_lossy(b)))
+        }
+
+        Builtin::CharOfInt => {
+            let n = args[0].as_int(span, "`char_of_int`")?;
+            Ok(option(
+                u32::try_from(n)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(Value::Char),
+            ))
+        }
+
+        Builtin::IntOfChar => Ok(Value::Int(i64::from(u32::from(
+            args[0].as_char(span, "`int_of_char`")?,
+        )))),
+
+        Builtin::StringChars => Ok(Value::list(
+            args[0]
+                .as_str(span, "`string_chars`")?
+                .chars()
+                .map(Value::Char)
+                .collect(),
+        )),
+
+        Builtin::StringOfChars => {
+            let items = args[0].as_list(span, "`string_of_chars`")?;
+            let mut out = String::with_capacity(items.len());
+            for c in items.iter() {
+                out.push(c.as_char(span, "`string_of_chars`")?);
+            }
+            Ok(Value::str(out))
         }
 
         Builtin::StringLen => Ok(Value::Int(
