@@ -119,6 +119,9 @@ pub struct Front {
     pub types: IndexMap<Symbol, TypeDecl>,
     /// Whether each `effect` was written `pub`; a prelude effect has no entry and is public.
     pub effects_written: IndexMap<Symbol, Visibility>,
+    /// What the front end embedded, its `List<embed.EmbedAt>` as [`crate::codec`] encodes it and
+    /// empty when nothing was: every pass that parses the program's text again is handed it back.
+    pub embeds: Vec<u8>,
 }
 
 impl Front {

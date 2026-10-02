@@ -1,0 +1,403 @@
+// `embed("path")` and `embed_dir("path")`: a file's bytes, or a directory's files, as constants a
+// definition's hash covers. The driver reads what a module asks for, relative to the module's own
+// file, and the front end writes each call out as that literal before anything hashes it, so a
+// changed file is a changed definition.
+
+import spine (Span, Ident, PDiag, diag1)
+import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
+              EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, MatchArm, HandleClause,
+              ReturnClause, RecField, NamedArg)
+import patterns (LStr, LBytes)
+import items (Module, Item, IFn, ITest, ILaw, ImportDecl, INames, SpecClause)
+
+// One file an embed read: its name in the directory, and empty for `embed`'s one file.
+pub type EmbedFile = { name: Bytes, bytes: Bytes }
+
+// What a driver read for one embed: `embed`'s file as the one entry, `embed_dir`'s files in name
+// order, or why it could not. No constructor of the compiler's own is in it, so it reads the same in
+// every program that hands it on.
+pub type EmbedRead = Result<List<EmbedFile>, Bytes>
+
+// One embed a module asks for: its path as written, and whether it names a directory.
+pub type EmbedWant = { path: Bytes, dir: Bool }
+
+// The key a read is handed under.
+pub fn embed_key(w: EmbedWant) -> Bytes =
+  bytes_concat(if w.dir { b"dir:" } else { b"file:" }, w.path)
+
+// One read the front end wrote out, by the module's name in the program. The answer carries them,
+// so a pass that parses the program's text again writes the same literals.
+pub type EmbedAt = { module: Bytes, key: Bytes, read: EmbedRead }
+
+pub fn embed_tables(embeds: List<EmbedAt>) -> Map<Bytes, Map<Bytes, EmbedRead>> =
+  fold(embeds, map_new(), |acc: Map<Bytes, Map<Bytes, EmbedRead>>, e: EmbedAt| {
+    let was = match map_get(acc, e.module) { Some(t) -> t, None -> map_new() };
+    map_insert(acc, e.module, map_insert(was, e.key, e.read))
+  })
+
+// The module named `name` with its embeds written out, over a program the front end already
+// answered for: a module it embedded nothing for has no call to write.
+pub fn rewritten(
+  tables: Map<Bytes, Map<Bytes, EmbedRead>>,
+  name: Bytes,
+  m: Module,
+) -> { module: Module, diags: List<PDiag> } =
+  match map_get(tables, name) { None -> { module: m, diags: [] }, Some(t) -> embedded(m, t, []) }
+
+type Call = { want: EmbedWant, span: Span, literal: Bool }
+
+// The names the module binds itself, which a bare call of `embed` then means instead.
+fn own_names(m: Module) -> List<Bytes> = {
+  let declared = fold(m.items, [], |acc: List<Bytes>, it: Item|
+    match it { IFn(d) -> push(acc, d.name.name), _ -> acc });
+  fold(m.imports, declared, |acc: List<Bytes>, i: ImportDecl|
+    match i.kind {
+      INames(names) -> fold(names, acc, |a: List<Bytes>, n: Ident| push(a, n.name)),
+      _ -> acc,
+    })
+}
+
+fn has(xs: List<Bytes>, x: Bytes) -> Bool = fold(xs, false, |acc: Bool, y: Bytes| acc || y == x)
+
+// A bare `embed(...)` or `embed_dir(...)` the module does not bind itself.
+fn call_of(own: List<Bytes>, e: Expr) -> Option<Call> =
+  match e {
+    EApp(a) -> match a.func {
+      EVar(v) -> {
+        let n = v.name.name.name;
+        if v.name.module != None || (n != b"embed" && n != b"embed_dir") || has(own, n) { None }
+        else {
+          let path = if len(a.args) == 1 && len(a.named) == 0 {
+            match list_at(a.args, 0) {
+              Some(arg) -> match arg {
+                ELit(l) -> match l.lit { LStr(p) -> Some(p), _ -> None },
+                _ -> None,
+              },
+              None -> None,
+            }
+          } else { None };
+          Some({
+            want: { path: match path { Some(p) -> p, None -> b"" }, dir: n == b"embed_dir" },
+            span: a.span,
+            literal: path != None,
+          })
+        }
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+// Every embed the module asks for with a literal path, each once.
+pub fn wants_of(m: Module) -> List<EmbedWant> = {
+  let own = own_names(m);
+  let found = walk_module(m, { own: own, read: map_new(), diags: [], wants: [] }, false);
+  found.st.wants
+}
+
+// The module with every embed written out as what was read for it; a path that is not a literal,
+// and one nothing could be read for, is a diagnostic.
+pub fn embedded(
+  m: Module,
+  read: Map<Bytes, EmbedRead>,
+  diags: List<PDiag>,
+) -> { module: Module, diags: List<PDiag> } = {
+  let walked = walk_module(m, { own: own_names(m), read: read, diags: diags, wants: [] }, true);
+  { module: walked.m, diags: walked.st.diags }
+}
+
+type St = {
+  own: List<Bytes>,
+  read: Map<Bytes, EmbedRead>,
+  diags: List<PDiag>,
+  wants: List<EmbedWant>,
+}
+
+fn noted(st: St, w: EmbedWant) -> St =
+  if fold(st.wants, false, |acc: Bool, x: EmbedWant| acc || (x.path == w.path && x.dir == w.dir)) {
+    st
+  } else { { ..st, wants: push(st.wants, w) } }
+
+fn written(st: St, c: Call) -> { st: St, e: Expr } =
+  if !c.literal {
+    {
+      st: {
+        ..st,
+        diags: push(
+          st.diags,
+          diag1(
+            b"E0147",
+            c.span,
+            b"an embed's path is a string literal",
+            b"read when the program is loaded, so it cannot be computed",
+            [],
+          ),
+        ),
+      },
+      e: EBad({ span: c.span }),
+    }
+  } else {
+    let unread = |why: Bytes|
+      {
+        st: {
+          ..st,
+          diags: push(
+            st.diags,
+            diag1(
+              b"E0146",
+              c.span,
+              bytes_concat_all([b"`", c.want.path, b"` could not be embedded"]),
+              why,
+              [b"the path is read relative to the module's own file"],
+            ),
+          ),
+        },
+        e: EBad({ span: c.span }),
+      };
+    match map_get(st.read, embed_key(c.want)) {
+      None -> unread(b"nothing was read for it"),
+      Some(Err(why)) -> unread(why),
+      Some(Ok(files)) -> if !c.want.dir {
+        match files {
+          [f, ..] -> { st: st, e: ELit({ span: c.span, lit: LBytes(f.bytes) }) },
+          [] -> unread(b"nothing was read for it"),
+        }
+      } else {
+        {
+          st: st,
+          e: EList({
+            span: c.span,
+            items: map(files, |f: EmbedFile|
+              ERecord({
+                span: c.span,
+                fields: [
+                  {
+                    name: { name: b"name", span: c.span },
+                    value: ELit({ span: c.span, lit: LStr(f.name) }),
+                  },
+                  {
+                    name: { name: b"bytes", span: c.span },
+                    value: ELit({ span: c.span, lit: LBytes(f.bytes) }),
+                  },
+                ],
+              })),
+          }),
+        }
+      },
+    }
+  }
+
+// --- The walk ---------------------------------------------------------------------------------
+// Every expression a module holds, children first; `writing` rewrites the embeds it meets, and
+// otherwise it only notes what they ask for.
+
+type Out = { st: St, e: Expr }
+
+fn walk_module(m: Module, st: St, writing: Bool) -> { st: St, m: Module } = {
+  let w = fold(m.items, { st: st, items: [] }, |acc: { st: St, items: List<Item> }, it: Item| {
+    let o = walk_item(acc.st, it, writing);
+    { st: o.st, items: push(acc.items, o.it) }
+  });
+  { st: w.st, m: { imports: m.imports, items: w.items } }
+}
+
+fn walk_item(st: St, it: Item, writing: Bool) -> { st: St, it: Item } =
+  match it {
+    IFn(d) -> {
+      let b = walk(st, d.body, writing);
+      let s = fold(
+        d.spec,
+        { st: b.st, xs: [] },
+        |acc: { st: St, xs: List<SpecClause> }, c: SpecClause| {
+          let o = walk(acc.st, c.expr, writing);
+          { st: o.st, xs: push(acc.xs, { ..c, expr: o.e }) }
+        },
+      );
+      let p = walk_params(s.st, d.params, writing);
+      { st: p.st, it: IFn({ ..d, body: b.e, spec: s.xs, params: p.xs }) }
+    },
+    ITest(d) -> {
+      let b = walk(st, d.body, writing);
+      { st: b.st, it: ITest({ ..d, body: b.e }) }
+    },
+    ILaw(d) -> {
+      let b = walk(st, d.body, writing);
+      match d.guard {
+        None -> { st: b.st, it: ILaw({ ..d, body: b.e }) },
+        Some(g) -> {
+          let o = walk(b.st, g, writing);
+          { st: o.st, it: ILaw({ ..d, body: b.e, guard: Some(o.e) }) }
+        },
+      }
+    },
+    other -> { st: st, it: other },
+  }
+
+fn walk_params(st: St, ps: List<Param>, writing: Bool) -> { st: St, xs: List<Param> } =
+  fold(ps, { st: st, xs: [] }, |acc: { st: St, xs: List<Param> }, p: Param|
+    match p.default {
+      None -> { st: acc.st, xs: push(acc.xs, p) },
+      Some(v) -> {
+        let o = walk(acc.st, v, writing);
+        { st: o.st, xs: push(acc.xs, { ..p, default: Some(o.e) }) }
+      },
+    })
+
+fn walk_all(st: St, xs: List<Expr>, writing: Bool) -> { st: St, xs: List<Expr> } =
+  fold(xs, { st: st, xs: [] }, |acc: { st: St, xs: List<Expr> }, x: Expr| {
+    let o = walk(acc.st, x, writing);
+    { st: o.st, xs: push(acc.xs, o.e) }
+  })
+
+fn walk_opt(st: St, x: Option<Expr>, writing: Bool) -> { st: St, x: Option<Expr> } =
+  match x {
+    None -> { st: st, x: None },
+    Some(v) -> {
+      let o = walk(st, v, writing);
+      { st: o.st, x: Some(o.e) }
+    },
+  }
+
+fn walk_fields(st: St, fs: List<RecField>, writing: Bool) -> { st: St, xs: List<RecField> } =
+  fold(fs, { st: st, xs: [] }, |acc: { st: St, xs: List<RecField> }, f: RecField| {
+    let o = walk(acc.st, f.value, writing);
+    { st: o.st, xs: push(acc.xs, { ..f, value: o.e }) }
+  })
+
+fn walk(st: St, e: Expr, writing: Bool) -> Out =
+  match call_of(st.own, e) {
+    Some(c) -> if writing { written(st, c) }
+    else { { st: if c.literal { noted(st, c.want) } else { st }, e: e } },
+    None -> walk_children(st, e, writing),
+  }
+
+fn walk_children(st: St, e: Expr, writing: Bool) -> Out =
+  match e {
+    EBinary(b) -> {
+      let l = walk(st, b.lhs, writing);
+      let r = walk(l.st, b.rhs, writing);
+      { st: r.st, e: EBinary({ ..b, lhs: l.e, rhs: r.e }) }
+    },
+    EUnary(u) -> {
+      let o = walk(st, u.operand, writing);
+      { st: o.st, e: EUnary({ ..u, operand: o.e }) }
+    },
+    ELambda(l) -> {
+      let b = walk(st, l.body, writing);
+      let p = walk_params(b.st, l.params, writing);
+      { st: p.st, e: ELambda({ ..l, body: b.e, params: p.xs }) }
+    },
+    EApp(a) -> {
+      let f = walk(st, a.func, writing);
+      let xs = walk_all(f.st, a.args, writing);
+      let n = fold(
+        a.named,
+        { st: xs.st, xs: [] },
+        |acc: { st: St, xs: List<NamedArg> }, x: NamedArg| {
+          let o = walk(acc.st, x.value, writing);
+          { st: o.st, xs: push(acc.xs, { ..x, value: o.e }) }
+        },
+      );
+      { st: n.st, e: EApp({ ..a, func: f.e, args: xs.xs, named: n.xs }) }
+    },
+    EIf(i) -> {
+      let c = walk(st, i.cond, writing);
+      let t = walk(c.st, i.then_branch, writing);
+      let x = walk(t.st, i.else_branch, writing);
+      { st: x.st, e: EIf({ ..i, cond: c.e, then_branch: t.e, else_branch: x.e }) }
+    },
+    EMatch(m) -> {
+      let s = walk(st, m.scrutinee, writing);
+      let arms = fold(
+        m.arms,
+        { st: s.st, xs: [] },
+        |acc: { st: St, xs: List<MatchArm> }, arm: MatchArm| {
+          let g = walk_opt(acc.st, arm.guard, writing);
+          let b = walk(g.st, arm.body, writing);
+          { st: b.st, xs: push(acc.xs, { ..arm, guard: g.x, body: b.e }) }
+        },
+      );
+      { st: arms.st, e: EMatch({ ..m, scrutinee: s.e, arms: arms.xs }) }
+    },
+    EBlock(b) -> {
+      let stmts = fold(b.stmts, { st: st, xs: [] }, |acc: { st: St, xs: List<Stmt> }, s: Stmt|
+        match s {
+          SLet(l) -> {
+            let o = walk(acc.st, l.value, writing);
+            { st: o.st, xs: push(acc.xs, SLet({ ..l, value: o.e })) }
+          },
+          SLetElse(l) -> {
+            let v = walk(acc.st, l.value, writing);
+            let f = walk(v.st, l.fallback, writing);
+            { st: f.st, xs: push(acc.xs, SLetElse({ ..l, value: v.e, fallback: f.e })) }
+          },
+          SExpr(x) -> {
+            let o = walk(acc.st, x, writing);
+            { st: o.st, xs: push(acc.xs, SExpr(o.e)) }
+          },
+        });
+      let t = walk_opt(stmts.st, b.tail, writing);
+      { st: t.st, e: EBlock({ ..b, stmts: stmts.xs, tail: t.x }) }
+    },
+    ERecord(r) -> {
+      let f = walk_fields(st, r.fields, writing);
+      { st: f.st, e: ERecord({ ..r, fields: f.xs }) }
+    },
+    ERecordUpdate(r) -> {
+      let b = walk(st, r.base, writing);
+      let f = walk_fields(b.st, r.fields, writing);
+      { st: f.st, e: ERecordUpdate({ ..r, base: b.e, fields: f.xs }) }
+    },
+    ETry(t) -> {
+      let o = walk(st, t.operand, writing);
+      { st: o.st, e: ETry({ ..t, operand: o.e }) }
+    },
+    EField(f) -> {
+      let o = walk(st, f.base, writing);
+      { st: o.st, e: EField({ ..f, base: o.e }) }
+    },
+    EList(l) -> {
+      let xs = walk_all(st, l.items, writing);
+      { st: xs.st, e: EList({ ..l, items: xs.xs }) }
+    },
+    EPerform(p) -> {
+      let xs = walk_all(st, p.args, writing);
+      { st: xs.st, e: EPerform({ ..p, args: xs.xs }) }
+    },
+    EHandle(h) -> {
+      let b = walk(st, h.body, writing);
+      let cs = fold(
+        h.clauses,
+        { st: b.st, xs: [] },
+        |acc: { st: St, xs: List<HandleClause> }, c: HandleClause| {
+          let o = walk(acc.st, c.body, writing);
+          { st: o.st, xs: push(acc.xs, { ..c, body: o.e }) }
+        },
+      );
+      match h.ret {
+        None -> { st: cs.st, e: EHandle({ ..h, body: b.e, clauses: cs.xs }) },
+        Some(rc) -> {
+          let o = walk(cs.st, rc.body, writing);
+          {
+            st: o.st,
+            e: EHandle({ ..h, body: b.e, clauses: cs.xs, ret: Some({ ..rc, body: o.e }) }),
+          }
+        },
+      }
+    },
+    EWithCell(c) -> {
+      let i = walk(st, c.init, writing);
+      let b = walk(i.st, c.body, writing);
+      { st: b.st, e: EWithCell({ ..c, init: i.e, body: b.e }) }
+    },
+    ESimulate(s) -> {
+      let o = walk(st, s.body, writing);
+      { st: o.st, e: ESimulate({ ..s, body: o.e }) }
+    },
+    EParallel(p) -> {
+      let xs = walk_all(st, p.branches, writing);
+      { st: xs.st, e: EParallel({ ..p, branches: xs.xs }) }
+    },
+    other -> { st: st, e: other },
+  }
