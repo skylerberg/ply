@@ -463,7 +463,35 @@ pub type Ran = {
   warnings: List<Diag>,
   mutants: Option<Mutants>,
   coverage: Option<Coverage>,
+  spent: Spent,
 }
+
+// Where a run's time went, in microseconds of its clock: before the load began, then each phase
+// after it. The load's own phases are `Phases`.
+pub type Spent = {
+  before_us: Int,
+  promises_us: Int,
+  store_us: Int,
+  selection_us: Int,
+  handoff_us: Int,
+  unit_us: Int,
+  bind_us: Int,
+  tests_us: Int,
+  conclude_us: Int,
+}
+
+fn no_spent() -> Spent =
+  {
+    before_us: 0,
+    promises_us: 0,
+    store_us: 0,
+    selection_us: 0,
+    handoff_us: 0,
+    unit_us: 0,
+    bind_us: 0,
+    tests_us: 0,
+    conclude_us: 0,
+  }
 
 // --- Small things -----------------------------------------------------------
 
@@ -748,6 +776,41 @@ fn phase_lines(s: Style, f: Phases) -> List<String> = {
   )
 }
 
+fn run_rows(f: Phases, x: Spent) -> List<Phase> =
+  [
+    { label: "before", us: x.before_us },
+    { label: "load", us: phase_total(f) },
+    { label: "promises", us: x.promises_us },
+    { label: "store", us: x.store_us },
+    { label: "selection", us: x.selection_us },
+    { label: "handoff", us: x.handoff_us },
+    { label: "unit", us: x.unit_us },
+    { label: "bind", us: x.bind_us },
+    { label: "tests", us: x.tests_us },
+    { label: "conclude", us: x.conclude_us },
+  ]
+
+fn run_total(f: Phases, x: Spent) -> Int = fold(run_rows(f, x), 0, |n: Int, p: Phase| n + p.us)
+
+fn run_phase_lines(s: Style, f: Phases, x: Spent) -> List<String> = {
+  let total = run_total(f, x);
+  appended(
+    appended(
+      ["", ind() ++ bold(s, "run time")],
+      map(ordered(run_rows(f, x)), |p: Phase| phase_line(s, p, total)),
+    ),
+    [ind() ++ "  " ++ padded("total", 11) ++ " " ++ aligned(ms2(total), 8) ++ "ms"],
+  )
+}
+
+fn run_phases_json(f: Phases, x: Spent) -> Json =
+  object(
+    push(map(run_rows(f, x), |p: Phase| { key: p.label, value: millis(p.us) }), {
+      key: "total",
+      value: millis(run_total(f, x)),
+    }),
+  )
+
 // --- `--explain` ------------------------------------------------------------
 
 fn explain_atoms(iso: String, c: Case) -> String =
@@ -882,7 +945,7 @@ fn explain_lines(s: Style, p: Program, r: Ran, dec: Decided) -> List<String> =
       ),
       concurrency_lines(s, p, counts_of(p, r), dec),
     ),
-    phase_lines(s, p.phases),
+    appended(phase_lines(s, p.phases), run_phase_lines(s, p.phases, r.spent)),
   )
 
 // --- One test's line --------------------------------------------------------
@@ -1449,6 +1512,7 @@ fn document(
             { key: "phases", value: phases_json(p.phases) },
           ]),
         },
+        { key: "phases", value: run_phases_json(p.phases, r.spent) },
         { key: "ok", value: Bool(ok) },
         { key: "exit_code", value: num(if ok { ok_code() } else { run_failed() }) },
         { key: "root", value: Str(p.root) },
@@ -1607,6 +1671,7 @@ pub fn iterated(
   held: Option<Timed>,
 ) -> Iteration / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs]} = {
   let s: Style = style_of(flags);
+  let begun = time.elapsed_us();
   let t: Timed = loaded(flags, options, held);
   match t.program.whole {
     // Every diagnostic, as `check` refuses: an error is the whole answer, so the shelved-module
@@ -1614,7 +1679,7 @@ pub fn iterated(
     None -> { answer: refused(s, "test", t.program.diags, t.program.places), held: None },
     Some(w) -> match config_schema::refusal(w, options.config.schema) {
       Some(d) -> { answer: unbound(s, { diags: [d], places: t.program.places }), held: None },
-      None -> { answer: tests_over(flags, s, options, t, w), held: Some(t) },
+      None -> { answer: tests_over(flags, s, options, t, w, begun), held: Some(t) },
     },
   }
 }
@@ -1846,6 +1911,7 @@ fn tests_over(
   options: Options,
   t: Timed,
   w: Whole,
+  begun: Int,
 ) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs]} = {
   let aimed: Result<Option<List<DefInfo>>, Diag> = match options.mutate {
     Some(query) -> match targets(w, query) { Ok(defs) -> Ok(Some(defs)), Err(d) -> Err(d) },
@@ -1854,9 +1920,12 @@ fn tests_over(
   match aimed {
     Err(d) -> refused(s, "test", [d], t.program.places),
     Ok(targeted) -> {
+      let loaded_at = time.elapsed_us();
       let broken = broken_promises(t.program, w);
+      let promised_at = time.elapsed_us();
+      let spent = { ..no_spent(), before_us: begun, promises_us: promised_at - loaded_at };
       if len(broken) > 0 { refused(s, "test", broken, t.program.places) }
-      else { selected(flags, s, options, t, w, targeted) }
+      else { selected(flags, s, options, t, w, targeted, spent) }
     },
   }
 }
@@ -1868,10 +1937,13 @@ fn selected(
   t: Timed,
   w: Whole,
   targeted: Option<List<DefInfo>>,
+  spent: Spent,
 ) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs]} = {
+  let configuring = time.elapsed_us();
   tester.configure[corpus](options);
   results::with_ledger(results::kept_at(flags.paths, options.no_cache), || {
     let opened = if options.no_cache { [] } else { ledger.opened() };
+    let selecting = time.elapsed_us();
     let scope = scope_of(w, options);
     let p = program_of(options, t, w, root_of(flags.paths), scope, opened);
     // Which tests run is the program's to say, and so is every key the store is asked about or a
@@ -1892,41 +1964,56 @@ fn selected(
     );
     // A run that executes nothing builds no unit, unless a schema has constants to enter.
     let build = len(decided.runs) > 0 || options.config.schema != None;
-    match tester.unit[corpus](front_of(t, w), build, true) {
+    let handing = time.elapsed_us();
+    let handed = front_of(t, w);
+    let building = time.elapsed_us();
+    match tester.unit[corpus](handed, build, true) {
       Err(diags) -> {
         tester.ended[corpus]();
         unbound(s, { diags: diags, places: p.places })
       },
-      Ok(_) -> match configuration::opened_by(options.host, options.config, |name: String|
-          tester.schema[corpus](name)) {
-        Err(diags) -> {
-          tester.ended[corpus]();
-          unbound(s, { diags: diags, places: p.places })
-        },
-        Ok(r) -> match tester.bound[corpus](configuration::configured(r.configuration)) {
+      Ok(_) -> {
+        let binding = time.elapsed_us();
+        match configuration::opened_by(options.host, options.config, |name: String|
+            tester.schema[corpus](name)) {
           Err(diags) -> {
             tester.ended[corpus]();
             unbound(s, { diags: diags, places: p.places })
           },
-          Ok(_) -> {
-            let answer = concluded_run(
-              flags,
-              s,
-              options,
-              p,
-              t,
-              w,
-              scope,
-              decisions,
-              decided,
-              searching,
-              r.warnings,
-              targeted,
-            );
-            tester.ended[corpus]();
-            answer
+          Ok(r) -> match tester.bound[corpus](configuration::configured(r.configuration)) {
+            Err(diags) -> {
+              tester.ended[corpus]();
+              unbound(s, { diags: diags, places: p.places })
+            },
+            Ok(_) -> {
+              let bound = time.elapsed_us();
+              let answer = concluded_run(
+                flags,
+                s,
+                options,
+                p,
+                t,
+                w,
+                scope,
+                decisions,
+                decided,
+                searching,
+                r.warnings,
+                targeted,
+                {
+                  ..spent,
+                  store_us: selecting - configuring,
+                  selection_us: handing - selecting,
+                  handoff_us: building - handing,
+                  unit_us: binding - building,
+                  bind_us: bound - binding,
+                },
+              );
+              tester.ended[corpus]();
+              answer
+            },
           },
-        },
+        }
       },
     }
   })
@@ -1947,6 +2034,7 @@ fn concluded_run(
   searching: plan::Plan,
   configured: List<Diag>,
   targeted: Option<List<DefInfo>>,
+  spent: Spent,
 ) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_us, tester.unit[corpus], tester.hosted[corpus], tester.executed[corpus], tester.interleaved[corpus], ledger.opened, ledger.outcomes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed} = {
   let asked = {
     plan: searching,
@@ -2007,11 +2095,17 @@ fn concluded_run(
     )
   };
   let lazily = if options.no_cache { [] } else { ledger.opened() };
+  let concluding = time.elapsed_us() - started - elapsed;
   answered(
     s,
     flags,
     p,
-    { ..r, failures: found.failures, warnings: appended(appended(r.warnings, proved), lazily) },
+    {
+      ..r,
+      failures: found.failures,
+      warnings: appended(appended(r.warnings, proved), lazily),
+      spent: { ..spent, tests_us: elapsed, conclude_us: concluding },
+    },
     cause.faults,
     decided,
   )
@@ -2507,6 +2601,7 @@ fn ran_of(
     warnings: appended(appended(teardown, map(c.notices, notice_of)), said),
     mutants: None,
     coverage: if options.coverage { Some(coverage(w)) } else { None },
+    spent: no_spent(),
   }
 }
 
@@ -2935,6 +3030,7 @@ fn a_run(results: List<Outcome>, failed: Int) -> Ran =
     warnings: [],
     mutants: None,
     coverage: None,
+    spent: no_spent(),
   }
 
 fn no_bisect() -> Bisect =
@@ -3408,6 +3504,27 @@ test "a phase reading is two decimals of a millisecond, longest phase first" {
     "     read            2.00ms   2.0%",
     "     write back      0.00ms   0.0%",
     "     total         100.00ms",
+  ])
+}
+
+test "a run's time is its load and every phase after it, longest first" {
+  let load = { ..no_phases(), front_us: 2000 };
+  let spent = { ..no_spent(), before_us: 1000, handoff_us: 5000, tests_us: 2000 };
+  assert_eq(run_total(load, spent), 10000);
+  assert_eq(run_phase_lines(plain(), load, spent), [
+    "",
+    "   run time",
+    "     handoff         5.00ms  50.0%",
+    "     load            2.00ms  20.0%",
+    "     tests           2.00ms  20.0%",
+    "     before          1.00ms  10.0%",
+    "     promises        0.00ms   0.0%",
+    "     store           0.00ms   0.0%",
+    "     selection       0.00ms   0.0%",
+    "     unit            0.00ms   0.0%",
+    "     bind            0.00ms   0.0%",
+    "     conclude        0.00ms   0.0%",
+    "     total          10.00ms",
   ])
 }
 

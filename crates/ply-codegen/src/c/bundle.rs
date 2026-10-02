@@ -119,14 +119,17 @@ pub fn exists(dir: &Path) -> bool {
 /// names no place. A bundle emitted against a helper table this runtime's does not start with
 /// fails here with [`super::exports::Unserved`].
 ///
-/// A bundle loads through [`super::upgrade`], except under nextest, where a background compile
-/// would contend with the suite and change which object a later test loads.
+/// A bundle loads through [`super::upgrade`]. Under nextest it starts no background compile, which
+/// would contend with the suite, but takes an optimised object a `ply` before it already built.
 pub fn build(bundle: &Bundle) -> Result<(Native, Vec<Refused>)> {
     let text = text_of(bundle)?;
     let lib = if std::env::var_os("NEXTEST").is_none() {
         super::upgrade::load(&text, "bootstrap")?
     } else {
-        super::load::compile_and_load(&text, "bootstrap")?
+        match super::upgrade::built(&text) {
+            Some(lib) => lib,
+            None => super::load::compile_and_load(&text, "bootstrap")?,
+        }
     };
     super::build::finish_unit(lib, None)
 }

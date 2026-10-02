@@ -9,15 +9,14 @@
 #       process beside the others. A lane's runs of one package go in one `ply test` with a
 #       `--filter` each, so the package's closure is loaded once a lane rather than once a run. Each
 #       run's milliseconds are appended to TIMINGS as `corpus <run> <ms>`: a module's are its tests'
-#       own, out of the report. With the program's own tests go those of the programs under
-#       `fixtures/` it runs, each of which must pass a test.
+#       own, out of the report.
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
 #   ci-corpus.sh mark                  the moment `keep` gathers from
-#   ci-corpus.sh keep DIR              the C `ply` emitted and compiled since `mark`, into DIR for a
-#                                      later run: a body is keyed by its definition, the emitter and
-#                                      the runtime's sources, so another tree reuses what still
-#                                      applies. The packages' stores stay out: they hold test results,
-#                                      which a runtime a later run builds could not vouch for.
+#   ci-corpus.sh keep DIR              the C `ply` emitted, compiled or read since `mark`, into DIR
+#                                      for a later run: a body is keyed by its definition, the emitter
+#                                      and the runtime's sources, so another tree reuses what still
+#                                      applies. The stages are build-ply's to ship, and the packages'
+#                                      stores are carried apart.
 #   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
 #   ci-corpus.sh upstream-mark         the moment `upstream-new` gathers from
 #   ci-corpus.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
@@ -79,26 +78,32 @@ listed() {
   jq -r '(.results[]? | "\(.status)\t\(.key // .name)"), (.selection.tests[]? | select(.reason == "cached") | "cached\t\(.key)")' "$1" 2>/dev/null
 }
 
-# Where a `ply test` spent its time, from its report: the front end, the C the backend emitted and
-# compiled, and the tests. A lane is mostly the first two, so this is what the cut is tuned on.
+# Where a `ply test` spent its wall clock WALL (ms), from its report: the phases its clock, which
+# counts from the process's start, measured, and `other` for what follows the report.
 spent() {
-  jq -r '"spent: front end \((.front_end.phases.total // 0) / 1000 | floor)s, C \((.backend.analysis_nanos // 0) / 1e9 | floor)s, tests \((.summary.duration_ms // 0) / 1000 | floor)s"' "$1" 2>/dev/null
+  jq -r --argjson wall "$2" '
+    def s(ms): (ms / 1000 | floor | tostring) + "s";
+    (.phases // {}) as $p
+    | "spent: before \(s($p.before // 0)), load \(s($p.load // 0)), promises \(s($p.promises // 0)), store \(s($p.store // 0)), selection \(s($p.selection // 0)), handoff \(s($p.handoff // 0)), unit \(s($p.unit // 0)) (C analysis \(s((.backend.analysis_nanos // 0) / 1e6)), codegen \(s((.backend.codegen_nanos // 0) / 1e6))), bind \(s($p.bind // 0)), tests \(s($p.tests // 0)), conclude \(s($p.conclude // 0)), other \(s([$wall - ($p.total // 0), 0] | max))"
+  ' "$1" 2>/dev/null
 }
 
 run_one() {
-  local id=$1 line path filter status=0 selected out
+  local id=$1 line path filter status=0 selected out started
   shift
   line=$("$shards" corpus-line "$id") || return 2
   read -r path filter <<< "$line"
   out=$(mktemp)
-  if [[ $id == package-* ]]; then
-    # A package's own suite runs as `ply test` runs it: the corpus's grants are for the corpus.
+  started=$(date +%s%3N)
+  if [[ $id == package-* || $id == fixture-* ]]; then
+    # A package's own suite and a fixture run as `ply test` runs them: the corpus's grants are for
+    # the corpus.
     "$ply" test "$path" --json "$@" > "$out" || status=$?
   else
     tested "$path" ${filter:+--filter "$filter"} "$@" > "$out" || status=$?
   fi
   listed "$out"
-  spent "$out"
+  spent "$out" "$(($(date +%s%3N) - started))"
   selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
   if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
     [ "$selected" -gt 0 ] || echo "corpus run $id selected no test (filter: ${filter:-none})" >&2
@@ -128,7 +133,7 @@ run_modules() {
   tested "$path" "${args[@]}" > "$out" || status=$?
   wall=$(($(date +%s%3N) - started))
   listed "$out"
-  spent "$out"
+  spent "$out" "$wall"
   # The startup the cut charges a lane once per package.
   ran=$(jq '(.summary.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
   printf 'startup\t%s\t%s\n' "$path" "$((wall > ran ? wall - ran : 0))" >> "$timings"
@@ -150,24 +155,8 @@ run_modules() {
   rm -f "$out"
 }
 
-fixtures() {
-  local fixture failed=0 out
-  out=$(mktemp)
-  for fixture in "$root"/crates/ply-corpus/fixtures/*.ply; do
-    if ! "$ply" test "$fixture" --no-cache --json > "$out"; then
-      red "$out"
-      failed=1
-    elif ! jq -e '.summary.passed > 0' "$out" > /dev/null; then
-      echo "$fixture tested nothing" >&2
-      failed=1
-    fi
-  done
-  rm -f "$out"
-  return "$failed"
-}
-
-# One lane's runs, one after another: the program's own and each package's suite in a `ply test` of
-# their own, every checks run in one, and every run of the CLI's suite in one.
+# One lane's runs, one after another: the program's own, each fixture's and each package's suite in a
+# `ply test` of their own, every checks run in one, and every run of the CLI's suite in one.
 lane() {
   local timings=$1 id started failed=0
   local -a checks=() cli=()
@@ -175,11 +164,10 @@ lane() {
   : > "$timings"
   for id in "$@"; do
     case "$id" in
-      program | package-*)
+      program | package-* | fixture-*)
         echo "::group::corpus $id"
         started=$(date +%s%3N)
         run_one "$id" || failed=1
-        if [ "$id" = program ]; then fixtures || failed=1; fi
         printf 'corpus\t%s\t%s\n' "$id" "$(($(date +%s%3N) - started))" >> "$timings"
         echo "::endgroup::"
         ;;
@@ -235,7 +223,7 @@ case "${1:-}" in
     [ -f "$mark" ] || { echo "nothing is marked: run 'ci-corpus.sh mark' before the runs" >&2; exit 2; }
     rm -rf "$dir"
     mkdir -p "$dir"
-    (cd "$caches" && find ply-c-cache ply-c-stage -type f -newer "$mark" -print0 2>/dev/null |
+    (cd "$caches" && find ply-c-cache -type f -newer "$mark" -print0 2>/dev/null |
       tar --null -T - -cf -) | tar -xf - -C "$dir" || exit 1
     du -sh "$dir"
     ;;

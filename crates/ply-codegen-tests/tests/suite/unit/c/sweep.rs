@@ -1,4 +1,4 @@
-use ply_codegen::c::sweep::{FRONTS, RUNS, STAMP, USED, claim, sweep, sweep_stages};
+use ply_codegen::c::sweep::{FRONTS, RUNS, STAMP, USED, claim, sweep, sweep_stages, used};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -57,6 +57,20 @@ fn an_object_is_as_removable_as_a_body() {
     assert_eq!(
         present(dir.path(), &names),
         vec!["emit/new.body".to_string()]
+    );
+}
+
+/// An object every run loads was written once, long ago: its use, not its writing, is its age.
+#[test]
+fn an_object_used_lately_outlives_one_written_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = ["loaded.dylib", "obj/later.o", "emit/latest.body"];
+    stock(dir.path(), &names, 100);
+    used(&dir.path().join("loaded.dylib"));
+    sweep(dir.path(), 200);
+    assert_eq!(
+        present(dir.path(), &names),
+        vec!["loaded.dylib".to_string(), "emit/latest.body".to_string()]
     );
 }
 
