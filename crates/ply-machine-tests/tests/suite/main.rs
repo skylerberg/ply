@@ -8,6 +8,7 @@
 mod artifact_enter;
 mod claims;
 mod driver_port;
+mod embeds;
 mod fixture;
 mod judged_effect;
 mod judging;
