@@ -24,12 +24,12 @@ import tycore (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar,
                contains_bytes, ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var,
                fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row,
                is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row,
-               occurs_ty, solve_continuation_row, free_vars, unify, unify_row, env_new, env_push,
-               env_pop, env_bind, env_bind_global, env_remove_global, env_lookup, env_depth_of,
-               env_locals, instantiate_with, instantiate, rename_scheme, generalize, region_prefix,
-               region_of, label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
-               scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
-               print_row)
+               occurs_ty, solve_continuation_row, free_vars, unify, unify_row, covariant_con,
+               env_new, env_push, env_pop, env_bind, env_bind_global, env_remove_global, env_lookup,
+               env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme, generalize,
+               region_prefix, region_of, label_type, label_of, resolve_atom, atom_text, atoms_text,
+               resource_text, scheme_text, type_text, row_text, Printer, printer_new,
+               printer_naming, print_ty, print_row)
 import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Edit,
                 Fix, with_fix, insertion, Ns, NValue, NType, NEffect, resolve_modules, Resolved_,
                 Failed, Expanded, find, lookup, dlookup, space, qualify, default_binder, dump_diags,
@@ -2580,7 +2580,7 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
       let checked: Cx = match l.ret {
         Some(written) -> {
           let w: WithTy = conv_type(body.cx, written);
-          expect(w.cx, expr_span(l.body), w.t, body.ty, b"the lambda's written return type").cx
+          expect_met(w.cx, expr_span(l.body), w.t, body.ty, b"the lambda's written return type")
         },
         None -> body.cx,
       };
@@ -2596,16 +2596,16 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
       let cc: Cx = expect(c.cx, expr_span(i.cond), t_bool(), c.ty, b"condition of `if`").cx;
       let t: Inferred = infer(cc, i.then_branch);
       let el: Inferred = infer(t.cx, i.else_branch);
-      let agreed: Cx = expect(
+      let agreed: { cx: Cx, ty: Type } = agree(
         el.cx,
         expr_span(i.else_branch),
         t.ty,
         el.ty,
         b"branches of `if` must agree",
-      ).cx;
-      let j1: WithRow = join(agreed, i.span, c.row, t.row);
+      );
+      let j1: WithRow = join(agreed.cx, i.span, c.row, t.row);
       let j2: WithRow = join(j1.cx, i.span, j1.r, el.row);
-      { cx: j2.cx, ty: t.ty, row: j2.r }
+      { cx: j2.cx, ty: agreed.ty, row: j2.r }
     },
     EMatch(m) -> infer_match(cx, m.span, m.scrutinee, m.arms),
     EBlock(b) -> {
@@ -2634,15 +2634,14 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
         },
         None -> { cx: stmts.cx, ty: t_unit(), row: stmts.row },
       };
-      let agreed: Cx = fold(stmts.fallbacks, tail.cx, |c: Cx, f: Fallback|
-        expect(
-          c,
-          f.span,
-          tail.ty,
-          f.ty,
-          b"the `else` of a `let ... else` is its block's value",
-        ).cx);
-      { cx: { ..agreed, env: env_pop(agreed.env) }, ty: tail.ty, row: tail.row }
+      let agreed: Joined = fold(
+        stmts.fallbacks,
+        { cx: tail.cx, ty: tail.ty, tails: [] },
+        |acc: Joined, f: Fallback|
+          join_next(acc, f.span, f.ty, b"the `else` of a `let ... else` is its block's value"),
+      );
+      let closed: Cx = close_tails(agreed.cx, agreed.tails);
+      { cx: { ..closed, env: env_pop(closed.env) }, ty: agreed.ty, row: tail.row }
     },
     ERecord(r) -> {
       let fs = fold(
@@ -2700,14 +2699,20 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
       let elem: WithTy = new_ty(cx);
       let items = fold(
         l.items,
-        { cx: elem.cx, row: row_empty() },
-        |acc: { cx: Cx, row: Row }, x: Expr| {
+        { cx: elem.cx, row: row_empty(), ty: elem.t, tails: [] },
+        |acc: { cx: Cx, row: Row, ty: Type, tails: List<Int> }, x: Expr| {
           let o: Inferred = infer(acc.cx, x);
           let j: WithRow = join(o.cx, l.span, acc.row, o.row);
-          { cx: expect(j.cx, expr_span(x), elem.t, o.ty, b"list elements must agree").cx, row: j.r }
+          let n: Joined = join_next(
+            { cx: j.cx, ty: acc.ty, tails: acc.tails },
+            expr_span(x),
+            o.ty,
+            b"list elements must agree",
+          );
+          { cx: n.cx, row: j.r, ty: n.ty, tails: n.tails }
         },
       );
-      { cx: items.cx, ty: t_list(elem.t), row: items.row }
+      { cx: close_tails(items.cx, items.tails), ty: t_list(items.ty), row: items.row }
     },
     EPerform(p) -> infer_perform(cx, p.span, p.eff, p.op, p.resource, p.args),
     EHandle(h) -> infer_handle(cx, h.span, h.body, h.clauses, h.ret),
@@ -3118,8 +3123,7 @@ fn let_bound(cx: Cx, pat: Pattern, annotation: Option<TypeExpr>, value: Expr) ->
   let annotated: { cx: Cx, ty: Type } = match annotation {
     Some(te) -> {
       let w: WithTy = conv_type(v.cx, te);
-      let x: Expected = expect(w.cx, expr_span(value), w.t, v.ty, b"`let` annotation");
-      { cx: x.cx, ty: w.t }
+      { cx: expect_met(w.cx, expr_span(value), w.t, v.ty, b"`let` annotation"), ty: w.t }
     },
     None -> { cx: v.cx, ty: v.ty },
   };
@@ -3337,6 +3341,163 @@ fn group_ty_text(cx: Cx, callee: Bytes, t: Type) -> Bytes =
     None -> bytes_concat_all([b"`", print_ty(group_printer(cx), t).s, b"`"]),
   }
 
+type Met = { cx: Cx, tails: List<Int> }
+
+type Widened = { cx: Cx, ty: Type, tails: List<Int> }
+
+type Items<a> = { cx: Cx, items: List<a>, tails: List<Int> }
+
+fn unwidened(cx: Cx, t: Type) -> Widened = { cx: cx, ty: t, tails: [] }
+
+// `g`'s closed row given a fresh tail, after its result came back widened as `r`.
+fn widen_fn(r: Widened, t: Type, g: { params: List<Type>, ret: Type, effects: Row }) -> Widened = {
+  let row = resolve_r(r.cx, g.effects);
+  match row.tail {
+    Some(_) -> if len(r.tails) == 0 { unwidened(r.cx, t) }
+    else { { cx: r.cx, ty: t_fn(g.params, r.ty, g.effects), tails: r.tails } },
+    None -> {
+      let v: WithVar = new_row_var(r.cx);
+      {
+        cx: v.cx,
+        ty: t_fn(g.params, r.ty, { atoms: row.atoms, tail: Some(v.v) }),
+        tails: push(r.tails, v.v),
+      }
+    },
+  }
+}
+
+// A fresh tail on each closed row of a function the value holds where a narrower one may stand.
+fn open_rows(cx: Cx, t: Type) -> Widened =
+  match shallow(cx.subst, t) {
+    TyFn(g) -> widen_fn(open_rows(cx, g.ret), t, g),
+    TyRecord(fs) -> {
+      let o: Items<Field> = fold(
+        range(0, len(fs)),
+        { cx: cx, items: fs, tails: [] },
+        |acc: Items<Field>, i: Int| {
+          let x = at(fs, i);
+          let w: Widened = open_rows(acc.cx, x.ty);
+          if len(w.tails) == 0 { acc } else {
+            {
+              cx: w.cx,
+              items: set_at(acc.items, i, { name: x.name, ty: w.ty }),
+              tails: append(acc.tails, w.tails),
+            }
+          }
+        },
+      );
+      if len(o.tails) == 0 { unwidened(cx, t) }
+      else { { cx: o.cx, ty: TyRecord(o.items), tails: o.tails } }
+    },
+    TyCon(c) -> if !covariant_con(c.name) { unwidened(cx, t) } else {
+      let o: Items<Type> = fold(
+        range(0, len(c.args)),
+        { cx: cx, items: c.args, tails: [] },
+        |acc: Items<Type>, i: Int| {
+          let w: Widened = open_rows(acc.cx, at(c.args, i));
+          if len(w.tails) == 0 { acc } else {
+            { cx: w.cx, items: set_at(acc.items, i, w.ty), tails: append(acc.tails, w.tails) }
+          }
+        },
+      );
+      if len(o.tails) == 0 { unwidened(cx, t) }
+      else { { cx: o.cx, ty: TyCon({ name: c.name, args: o.items }), tails: o.tails } }
+    },
+    TyVar(_) -> unwidened(cx, t),
+  }
+
+// What will not meet its type as written meets it again widened, which costs a walk, so only then.
+fn expect_met(cx: Cx, span: Span, expected: Type, found: Type, context: Bytes) -> Cx = {
+  let u = unify(cx.subst, cx.fresh, expected, found);
+  match u.err {
+    None -> with_unified(cx, u),
+    Some(_) -> {
+      let o: Widened = open_rows(cx, found);
+      let w = unify(o.cx.subst, o.cx.fresh, expected, o.ty);
+      match w.err {
+        None -> close_tails(with_unified(o.cx, w), o.tails),
+        Some(_) -> expect(cx, span, expected, found, context).cx,
+      }
+    },
+  }
+}
+
+type Joined = { cx: Cx, ty: Type, tails: List<Int> }
+
+// List elements or `match` arms: as written while they agree, else widened with the join so far.
+fn join_next(acc: Joined, span: Span, found: Type, context: Bytes) -> Joined = {
+  let u = unify(acc.cx.subst, acc.cx.fresh, acc.ty, found);
+  match u.err {
+    None -> { cx: with_unified(acc.cx, u), ty: acc.ty, tails: acc.tails },
+    Some(_) -> {
+      let a: Widened = open_rows(acc.cx, acc.ty);
+      let b: Widened = open_rows(a.cx, found);
+      let w = unify(b.cx.subst, b.cx.fresh, a.ty, b.ty);
+      match w.err {
+        None ->
+          {
+            cx: with_unified(b.cx, w),
+            ty: a.ty,
+            tails: append(acc.tails, append(a.tails, b.tails)),
+          },
+        Some(_) ->
+          {
+            cx: expect(close_tails(acc.cx, acc.tails), span, acc.ty, found, context).cx,
+            ty: acc.ty,
+            tails: [],
+          },
+      }
+    },
+  }
+}
+
+fn agree(cx: Cx, span: Span, first: Type, second: Type, context: Bytes) -> { cx: Cx, ty: Type } = {
+  let j: Joined = join_next({ cx: cx, ty: first, tails: [] }, span, second, context);
+  { cx: close_tails(j.cx, j.tails), ty: j.ty }
+}
+
+// As written; a refusal retries the call with every argument widened, and stands if that fails.
+fn expect_arguments(
+  cx: Cx,
+  params: List<Type>,
+  found: List<Type>,
+  expect_one: (Cx, Int) -> Cx,
+) -> Cx = {
+  let written: Cx = fold(range(0, len(params)), cx, |c: Cx, i: Int| expect_one(c, i));
+  if len(written.diags) == len(cx.diags) { written }
+  else { match arguments_widened(cx, params, found) { Some(c) -> c, None -> written } }
+}
+
+fn arguments_widened(cx: Cx, params: List<Type>, found: List<Type>) -> Option<Cx> = {
+  let m: Option<Met> = fold(
+    range(0, len(params)),
+    Some({ cx: cx, tails: [] }),
+    |acc: Option<Met>, i: Int|
+      match acc {
+        None -> None,
+        Some(a) -> {
+          let o: Widened = open_rows(a.cx, at(found, i));
+          let u = unify(o.cx.subst, o.cx.fresh, at(params, i), o.ty);
+          match u.err {
+            None -> Some({ cx: with_unified(o.cx, u), tails: append(a.tails, o.tails) }),
+            Some(_) -> None,
+          }
+        },
+      },
+  );
+  match m { None -> None, Some(a) -> Some(close_tails(a.cx, a.tails)) }
+}
+
+// After everything that must agree has met, so a row the values share holds just their union.
+fn close_tails(cx: Cx, tails: List<Int>) -> Cx = fold(tails, cx, close_tail)
+
+fn close_tail(cx: Cx, tail: Int) -> Cx =
+  match resolved_tail(cx.subst, row_open(tail)) {
+    Some(v) -> if is_rigid_row(cx.subst, v) { cx }
+    else { with_unified(cx, unify_row(cx.subst, cx.fresh, row_empty(), row_open(v))) },
+    None -> cx,
+  }
+
 // An argument against its parameter, where a call inside the group being walked is monomorphic:
 // a mismatch on the group's row, or on the callee's own type parameter, is refused as that.
 fn expect_argument(cx: Cx, span: Span, expected: Type, found: Type, callee: Option<Bytes>) -> Cx = {
@@ -3470,7 +3631,7 @@ fn infer_app_general(
     } else {
       let source = callee_source(c, func);
       let callee: Option<Bytes> = group_callee(c, source);
-      let checked: Cx = fold(range(0, len(args)), c, |cc: Cx, i: Int|
+      let checked: Cx = expect_arguments(c, fn_.params, as_.tys, |cc: Cx, i: Int|
         expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(as_.tys, i), callee));
       // `forall a.` alone would admit two `String`s, so the integer obligation goes on the instantiated variable here.
       let obliged: Cx = if is_int_builtin(func) && len(fn_.params) > 0 {
@@ -3841,10 +4002,10 @@ fn binder_ty(bs: List<{ name: Bytes, ty: Type }>, name: Bytes) -> Option<Type> =
 fn infer_match(cx: Cx, span: Span, scrutinee: Expr, arms: List<MatchArm>) -> Inferred = {
   let s: Inferred = infer(cx, scrutinee);
   let result: WithTy = new_ty(s.cx);
-  let walked: WithBodyRow = fold(
+  let walked: { cx: Cx, row: Row, ty: Type, tails: List<Int> } = fold(
     arms,
-    { cx: result.cx, row: s.row },
-    |acc: { cx: Cx, row: Row }, arm: MatchArm| {
+    { cx: result.cx, row: s.row, ty: result.t, tails: [] },
+    |acc: { cx: Cx, row: Row, ty: Type, tails: List<Int> }, arm: MatchArm| {
       let pushed: Cx = { ..acc.cx, env: env_push(acc.cx.env) };
       let b: Bound = bind_pattern(pushed, arm.pat, s.ty, []);
       let bound: Cx = bind_all(b.cx, b.out);
@@ -3860,13 +4021,20 @@ fn infer_match(cx: Cx, span: Span, scrutinee: Expr, arms: List<MatchArm>) -> Inf
       let body: Inferred = infer(guarded.cx, arm.body);
       let j: WithRow = join(body.cx, span, guarded.row, body.row);
       let popped: Cx = { ..j.cx, env: env_pop(j.cx.env) };
-      {
-        cx: expect(popped, expr_span(arm.body), result.t, body.ty, b"match arms must agree").cx,
-        row: j.r,
-      }
+      let n: Joined = join_next(
+        { cx: popped, ty: acc.ty, tails: acc.tails },
+        expr_span(arm.body),
+        body.ty,
+        b"match arms must agree",
+      );
+      { cx: n.cx, row: j.r, ty: n.ty, tails: n.tails }
     },
   );
-  { cx: check_exhaustive(walked.cx, span, arms), ty: result.t, row: walked.row }
+  {
+    cx: check_exhaustive(close_tails(walked.cx, walked.tails), span, arms),
+    ty: walked.ty,
+    row: walked.row,
+  }
 }
 
 // --- Exhaustiveness: usefulness over a matrix with one row per unguarded arm ---------------------
@@ -4408,7 +4576,7 @@ fn infer_perform(
               row: as_.row,
             }
           } else {
-            let checked: Cx = fold(range(0, len(args)), shape.cx, |c: Cx, i: Int|
+            let checked: Cx = expect_arguments(shape.cx, shape.params, as_.tys, |c: Cx, i: Int|
               expect(
                 c,
                 expr_span(at(args, i)),
@@ -5617,13 +5785,13 @@ fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
   let bound: Cx = fold(range(0, len(def.params)), pushed, |c: Cx, i: Int|
     { ..c, env: env_bind(c.env, at(def.params, i).name.name, mono(at(sig.params, i))) });
   let body: Inferred = infer(bound, def.body);
-  let checked: Cx = expect(
+  let checked: Cx = expect_met(
     body.cx,
     expr_span(def.body),
     sig.ret,
     body.ty,
     b"function body type",
-  ).cx;
+  );
   let popped: Cx = { ..checked, env: env_pop(checked.env) };
   let rowed: Cx = match sig.declared {
     Some(declared) -> check_upper_bound(popped, def, declared, body.row),
@@ -8628,7 +8796,118 @@ test "a call inside a recursive group keeps the row the group was called with" {
   ]);
   assert_eq(map(at(diags, 0).labels, |l: Label| l.text), [
     b"the group's row here is e, and this argument's is {m.tick.now}",
-  ])
+  ]);
+  let quiet = bytes_concat_all([
+    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n == 0 { f() } else { pong(n - 1, f) }\n",
+    b"fn pong<|e>(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, || ())",
+  ]);
+  assert_eq(check_codes(quiet), [])
+}
+
+test "two callbacks that perform different things fill one row variable with both" {
+  let src = bytes_concat_all([
+    b"effect a { write x() -> Unit }\n",
+    b"effect b { write y() -> Unit }\n",
+    b"fn both<|e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e = { f(); g() }\n",
+    b"fn fa() -> Unit = a.x()\n",
+    b"fn go() -> Unit = both(|| a.x(), || b.y())\n",
+    b"fn named() -> Unit = both(fa, || ())\n",
+    b"fn apart() -> (Unit, Unit) = parallel { both(|| a.x(), || a.x()), b.y() }",
+  ]);
+  assert_eq(check_codes(src), []);
+  let dump = check_dump([{ name: b"m", src: src }]);
+  assert(string_contains(dump, "F;m.go;() -> Unit / {m.a.x, m.b.y};"));
+  assert(string_contains(dump, "F;m.named;() -> Unit / {m.a.x};"));
+  assert(string_contains(dump, "F;m.apart;() -> (Unit, Unit) / {m.a.x, m.b.y};"));
+  let clash = bytes_concat_all([
+    b"effect a { write x() -> Unit }\n",
+    b"effect b { write y() -> Unit }\n",
+    b"fn both<|e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e = { f(); g() }\n",
+    b"fn shared() -> (Unit, Unit) = parallel { both(|| a.x(), || b.y()), b.y() }",
+  ]);
+  assert_eq(check_codes(clash), [b"E0309"])
+}
+
+test "a callback may perform less than its parameter's row permits, and nothing it does not permit" {
+  let ops = b"effect a { write x() -> Unit\n write z() -> Unit }\n";
+  let run = bytes_concat(ops, b"fn run(k: () -> Unit / {a.x, a.z}) -> Unit / {a.x, a.z} = k()\n");
+  assert_eq(check_codes(bytes_concat(run, b"fn go() -> Unit = run(|| a.x())")), []);
+  assert_eq(check_codes(bytes_concat(run, b"fn go() -> Unit = run(|| ())")), []);
+  let narrow = bytes_concat(
+    ops,
+    b"fn run(k: () -> Unit / {a.x}) -> Unit / {a.x} = k()\nfn go() -> Unit = run(|| a.z())",
+  );
+  let diags = check_diags(narrow);
+  assert_eq(map(diags, |dg: Diag| dg.code), [b"E0302"]);
+  assert_eq(map(diags, |dg: Diag| at(dg.labels, 0).text), [b"expected {m.a.x}, found {m.a.z}"]);
+  let held = |body: Bytes|
+    bytes_concat_all([
+      ops,
+      b"fn go<|e>(k: (() -> Unit / {a.x | e}) -> Unit / {a.x | e}) -> Unit / {a.x | e} = k(",
+      body,
+      b")",
+    ]);
+  assert_eq(check_codes(held(b"|| a.x()")), []);
+  assert_eq(check_codes(held(b"|| a.z()")), [b"E0302"]);
+  let handed = bytes_concat(
+    ops,
+    b"effect ctl { write run(k: () -> Unit / {a.x, a.z}) -> Unit }\nfn go() -> Unit / {ctl.write} = ctl.run(|| a.x())",
+  );
+  assert_eq(check_codes(handed), [])
+}
+
+test "a claim may hand a pure callback to a function generic over its row" {
+  assert_eq(
+    check_codes(
+      bytes_concat_all([
+        b"fn total(xs: List<Int>) -> Int\n",
+        b"  requires fold(xs, 0, |s: Int, x: Int| s + x) < 100\n",
+        b"= fold(xs, 0, |s: Int, x: Int| s + x)\n",
+        b"law \"a fold over nothing is its seed\" { fold([], 7, |s: Int, x: Int| s + x) == 7 }",
+      ]),
+    ),
+    [],
+  )
+}
+
+test "a list, a branch, a return, an annotation and a value's fields take functions that perform less" {
+  let src = bytes_concat_all([
+    b"effect a { write x() -> Unit\n write z() -> Unit }\n",
+    b"effect b { write y() -> Unit }\n",
+    b"fn each<|e>(fs: List<() -> Unit / e>) -> Unit / e = ()\n",
+    b"fn pair<|e>(h: { ok: () -> Unit / e, err: () -> Unit / e }) -> Unit / e = ()\n",
+    b"fn listed() -> Unit = each([|| a.x(), || b.y()])\n",
+    b"fn paired() -> Unit = pair({ ok: || a.x(), err: || b.y() })\n",
+    b"fn branched(c: Bool) -> () -> Unit / {a.x, b.y} = if c { || a.x() } else { || b.y() }\n",
+    b"fn matched(n: Int) -> () -> Unit / {a.x, b.y} = match n { 0 -> || a.x(), _ -> || b.y() }\n",
+    b"fn fell(o: Option<Int>) -> () -> Unit / {a.x, b.y} = { let Some(_) = o else { || b.y() }; || a.x() }\n",
+    b"fn returned() -> () -> Unit / {a.x, a.z} = || a.x()\n",
+    b"fn annotated() -> Unit / {a.x, a.z} = { let f: () -> Unit / {a.x, a.z} = || a.x(); f() }\n",
+    b"fn held() -> Option<() -> Unit / {a.x, a.z}> = Some(|| a.x())",
+  ]);
+  assert_eq(check_codes(src), []);
+  let dump = check_dump([{ name: b"m", src: src }]);
+  assert(string_contains(dump, "F;m.listed;() -> Unit / {m.a.x, m.b.y};"));
+  assert(string_contains(dump, "F;m.paired;() -> Unit / {m.a.x, m.b.y};"))
+}
+
+test "a function's parameter and a declared type hold their rows exactly" {
+  let net = b"effect net { write send[s](p: Bytes) -> Unit\n write recv[s](n: Int) -> Bytes }\n";
+  // `sender` handles what its parameter's row names, so a callback that may receive would escape it.
+  let escaping = bytes_concat_all([
+    net,
+    b"fn sender(f: () -> Unit / {net.send[x]}) -> Unit = handle { f() } with { net.send[x](p) -> () }\n",
+    b"fn run(k: (() -> Unit / {net.write[x]}) -> Unit) -> Unit = k(|| { let _ = net.recv[x](1); () })\n",
+    b"fn go() -> Unit = run(sender)",
+  ]);
+  assert_eq(check_codes(escaping), [b"E0302"]);
+  let boxed = bytes_concat_all([
+    net,
+    b"type Box<a> = Box(a)\n",
+    b"fn open(b: Box<() -> Unit / {net.write[x]}>) -> Unit / {net.write[x]} = match b { Box(f) -> f() }\n",
+    b"fn go(f: () -> Unit / {net.send[x]}) -> Unit / {net.write[x]} = open(Box(f))",
+  ]);
+  assert_eq(check_codes(boxed), [b"E0302"])
 }
 
 test "the members of a recursive group bind the same row parameters" {
