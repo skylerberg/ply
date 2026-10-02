@@ -248,6 +248,8 @@ pub const FAILED_UNWIND: i64 = 4;
 pub const FAILED_ABANDONED: i64 = 5;
 /// The entry spent its step budget without finishing.
 pub const FAILED_OUT_OF_STEPS: i64 = 6;
+/// A raise of `abort.raise`: `Ctx::aborting` names the `handle` whose clause answers it.
+pub const FAILED_ABORT: i64 = 7;
 
 /// An installed handler: pushed by a `handle` site, searched innermost-out by a `perform`.
 pub struct HandlerFrame {
@@ -265,6 +267,16 @@ pub struct HandlerFrame {
 }
 
 impl HandlerFrame {
+    /// The closure of the clause for `abort.raise`, taken out of the frame, which keeps the rest.
+    pub(crate) fn take_abort_clause(&mut self) -> Word {
+        let at = self
+            .clauses
+            .iter()
+            .position(FrameClause::answers_abort)
+            .expect("a raise is bound for a frame with a clause for it");
+        self.clauses.swap_remove(at).closure
+    }
+
     fn simulate(regions: usize) -> HandlerFrame {
         HandlerFrame {
             clauses: Vec::new(),
@@ -311,6 +323,15 @@ impl Frames {
     }
 }
 
+/// A raise on its way to the `handle` that answers it: that frame's stack and depth, the message
+/// its clause is given, and what the entry fails with should the frame be gone.
+pub(crate) struct Aborting {
+    pub(crate) stack: usize,
+    pub(crate) depth: usize,
+    pub(crate) message: String,
+    pub(crate) diagnostic: Diagnostic,
+}
+
 /// One clause, under program-wide effect and resource names.
 pub(crate) struct FrameClause {
     effect: Symbol,
@@ -324,6 +345,10 @@ pub(crate) struct FrameClause {
 }
 
 impl FrameClause {
+    fn answers_abort(&self) -> bool {
+        self.effect.as_str() == "abort" && self.op.as_str() == "raise"
+    }
+
     fn answers(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) -> bool {
         self.effect == *effect
             && self.op == *op
@@ -374,10 +399,20 @@ pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
 pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
     clone_frames(list)
         .into_iter()
-        .map(|f| HandlerFrame {
-            detached: None,
-            regions: 0,
-            ..f
+        .map(|f| {
+            // The `handle` a copy stands for may be over before the task raises, so a raise the task
+            // does not answer itself leaves for the region's own surroundings instead.
+            let (raises, clauses): (Vec<FrameClause>, Vec<FrameClause>) =
+                f.clauses.into_iter().partition(FrameClause::answers_abort);
+            for cl in raises {
+                heap::dec(cl.closure);
+            }
+            HandlerFrame {
+                clauses,
+                detached: None,
+                regions: 0,
+                ..f
+            }
         })
         .collect()
 }
@@ -507,6 +542,7 @@ pub struct Ctx {
     pub(crate) entered_sims: u32,
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
     pub(crate) unwind: Option<(usize, usize, Word)>,
+    pub(crate) aborting: Option<Aborting>,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
     resumed: Option<Word>,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
@@ -561,6 +597,7 @@ impl Ctx {
             record: None,
             entered_sims: 0,
             unwind: None,
+            aborting: None,
             resumed: None,
             outer: (std::ptr::null_mut(), std::ptr::null()),
         }
@@ -677,6 +714,7 @@ impl Ctx {
         self.record = None;
         self.entered_sims = 0;
         self.unwind = None;
+        self.aborting = None;
         self.resumed = None;
         // Every path out of an entry calls `end`; this catches one that did not, before the
         // detached bodies that pin regions are dropped.
@@ -897,6 +935,52 @@ impl Ctx {
         self.fail_with(1, d)
     }
 
+    /// Fails as a raise of `abort.raise`, bound for the innermost `handle` in reach with a clause
+    /// for it; with none, the entry fails with `d` as [`Ctx::fail`] would.
+    pub(crate) fn raise(&mut self, d: Diagnostic, message: String) -> i64 {
+        if self.failed != 0 {
+            return 0;
+        }
+        let Some((stack, depth)) = self.abort_handler() else {
+            return self.fail(d);
+        };
+        let diagnostic = self.placed(d);
+        self.aborting = Some(Aborting {
+            stack,
+            depth,
+            message,
+            diagnostic,
+        });
+        self.failed = FAILED_ABORT;
+        0
+    }
+
+    /// Searched as a `perform` searches, so frames hidden while a clause runs are passed over.
+    fn abort_handler(&self) -> Option<(usize, usize)> {
+        let mut stack = self.current;
+        loop {
+            let frames = &self.stacks[stack].list;
+            if let Some(depth) = frames
+                .iter()
+                .rposition(|f| f.clauses.iter().any(FrameClause::answers_abort))
+            {
+                return Some((stack, depth));
+            }
+            stack = self.stacks[stack].parent?;
+        }
+    }
+
+    /// How a finished branch failed, a raise bound past it as the failure it carries.
+    pub(crate) fn take_branch_failure(&mut self) -> Option<(i64, Option<Diagnostic>)> {
+        if self.failed == 0 {
+            return None;
+        }
+        Some(match self.aborting.take() {
+            Some(a) if self.failed == FAILED_ABORT => (1, Some(a.diagnostic)),
+            _ => (self.failed, self.diagnostic.take()),
+        })
+    }
+
     fn fail_with(&mut self, code: i64, d: Diagnostic) -> i64 {
         if self.failed == 0 {
             self.failed = code;
@@ -970,7 +1054,9 @@ impl Ctx {
     }
 
     pub fn take_failure(&mut self) -> Option<Diagnostic> {
-        self.diagnostic.take()
+        self.diagnostic
+            .take()
+            .or_else(|| self.aborting.take().map(|a| a.diagnostic))
     }
 
     /// The value a word denotes, for a builtin or an error message.
@@ -1635,11 +1721,14 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 heap::dec(*c);
                 return Some(ctx.fail(no_such_cell(site, slot)));
             };
+            // A raise caught while the cell is still open must find it as it was, so with a clause
+            // for one in reach the contents are held twice, and `f` updates a copy.
+            let kept = ctx.abort_handler().is_some().then(|| current.clone());
             let updated = call_value(std::ptr::from_mut(ctx), *f, &[current.into_word()]);
-            let held = if ctx.failed != 0 {
-                Held::default()
-            } else {
-                Held(updated)
+            let held = match kept {
+                Some(old) if ctx.failed == FAILED_ABORT => old,
+                _ if ctx.failed != 0 => Held::default(),
+                _ => Held(updated),
             };
             ctx.cells.arena_mut().put_back(slot, held);
             heap::dec(*c);
@@ -2422,6 +2511,9 @@ pub unsafe extern "C" fn rt_perform(
     let c = unsafe { &mut *ctx };
     let effect = c.tables.fields[effect as usize].clone();
     let op = c.tables.fields[op as usize].clone();
+    if effect.as_str() == "abort" && op.as_str() == "raise" {
+        return raise_from_perform(c, args_of(args, n));
+    }
     let resource = (resource >= 0).then(|| c.tables.fields[resource as usize].clone());
     let atom = EffectAtom::operation(
         effect.clone(),
@@ -2541,6 +2633,18 @@ pub unsafe extern "C" fn rt_perform(
     }
 }
 
+/// `abort.raise(message)`, which no clause answers where it is performed: the frame whose clause
+/// does is unwound to first. Takes the message.
+fn raise_from_perform(c: &mut Ctx, args: &[Word]) -> i64 {
+    let message = match values_taken(c, args).first() {
+        Some(Value::Str(s)) => s.to_string(),
+        _ => String::new(),
+    };
+    let d = Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
+        .primary(c.site(), "raised here");
+    c.raise(d, message)
+}
+
 /// `simulate { body }`: runs the nullary `body` as a region's root task on this stack.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
@@ -2593,6 +2697,21 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
     };
     for f in popped {
         drop_frame(f);
+    }
+    if c.failed == FAILED_ABORT
+        && let Some(a) = c.aborting.take_if(|a| a.stack == stack && a.depth == depth)
+    {
+        c.failed = 0;
+        let mut f = mine.expect("a raise is bound for a frame still installed");
+        let owner = c.owner();
+        c.cells.close_regions_above(owner, f.regions);
+        let closure = f.take_abort_clause();
+        drop_frame(f);
+        // The clause runs outside its `handle`, which is over: its value is the `handle`'s.
+        let message = c.word(&Value::str(a.message));
+        let r = call_value(ctx, closure, &[message]);
+        heap::dec(closure);
+        return r;
     }
     if c.failed == FAILED_UNWIND
         && let Some((target_stack, target, v)) = c.unwind.take()

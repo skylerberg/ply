@@ -468,7 +468,7 @@ impl Bodies {
                     .primary(ctx.site(), "the call that overran it"),
                 )
             } else {
-                ctx.diagnostic.take().or_else(|| {
+                ctx.take_failure().or_else(|| {
                     (ctx.failed == crate::rt::FAILED_UNWIND).then(|| {
                         ply_eval::Diagnostic::error(
                             ply_eval::codes::RUNTIME_ERROR,
