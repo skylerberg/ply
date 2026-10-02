@@ -57,6 +57,16 @@ tested() {
   return "$status"
 }
 
+# What a red run said: each failure's test and diagnostic, and a refused run's diagnostics. The report
+# itself is one line too long for a log to show.
+red() {
+  jq -r '
+    (.failures[]? | ("FAILED \(.key // .name): \(.diagnostic.code // "") \(.diagnostic.message // "")",
+      (.diagnostic.notes[]? | "  \(.)"))),
+    (.diagnostics[]? | "\(.severity // "error") \(.code // ""): \(.message // "")")
+  ' "$1" 2>/dev/null || cat "$1"
+}
+
 # Where a `ply test` spent its time, from its report: the front end, the C the backend emitted and
 # compiled, and the tests. A lane is mostly the first two, so this is what the cut is tuned on.
 spent() {
@@ -80,7 +90,7 @@ run_one() {
   selected=$(jq -s 'map(.results // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
   if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
     [ "$selected" -gt 0 ] || echo "corpus run $id selected no test (filter: ${filter:-none})" >&2
-    cat "$out"
+    red "$out"
     rm -f "$out"
     return 1
   fi
@@ -115,7 +125,7 @@ run_modules() {
     printf 'corpus\t%s\t%s\n' "${ids[$i]}" "$ms" >> "$timings"
   done
   if [ "$status" -ne 0 ] || [ "$bad" -ne 0 ]; then
-    cat "$out"
+    red "$out"
     rm -f "$out"
     return 1
   fi
@@ -127,7 +137,7 @@ fixtures() {
   out=$(mktemp)
   for fixture in "$root"/crates/ply-corpus/fixtures/*.ply; do
     if ! "$ply" test "$fixture" --no-cache --json > "$out"; then
-      cat "$out"
+      red "$out"
       failed=1
     elif ! jq -e '.summary.passed > 0' "$out" > /dev/null; then
       echo "$fixture tested nothing" >&2
