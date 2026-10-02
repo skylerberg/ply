@@ -665,16 +665,25 @@ const SHUTDOWN_DOMAIN: &[u8] = b"ply.hosts.shutdown.v1\0";
 /// else: what a run would bind is assembled here, and the program is handed what it says.
 const EFFECT: &str = "tcb";
 
-const PREVIEW: &str = "ply_machine::hosts::preview";
+const OPERATIONS: [(&str, &str); 2] = [
+    ("schema", "ply_machine::hosts::schema"),
+    ("preview", "ply_machine::hosts::preview"),
+];
 
 /// `module` is where the program lent it declares `tcb`, which is where `Stage` is declared too.
 pub fn lent(module: &str) -> Vec<Lent> {
-    vec![(
-        privileged_op(EFFECT, "preview", Linearity::Repeatable, PREVIEW),
-        Arc::new(Facility {
-            module: module.to_string(),
-        }),
-    )]
+    let facility: Arc<dyn HostHandler> = Arc::new(Facility {
+        module: module.to_string(),
+    });
+    OPERATIONS
+        .into_iter()
+        .map(|(op, path)| {
+            (
+                privileged_op(EFFECT, op, Linearity::Repeatable, path),
+                Arc::clone(&facility),
+            )
+        })
+        .collect()
 }
 
 struct Facility {
@@ -685,16 +694,42 @@ impl HostHandler for Facility {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
-            ("preview", [path, options, front]) => {
+            ("schema", [path, front, name]) => {
+                let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
+                let front = crate::driver::handed_front_of(front, span)?;
+                let name = name.as_str(span, "a definition's name")?;
+                crate::config::schema_answer(schema(&path, &front, name))
+            }
+            ("preview", [path, options, front, config]) => {
                 let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
                 let options = crate::drive::run_options_of(options, span)?;
                 let front = crate::driver::handed_front_of(front, span)?;
-                Assembled::of(&path, &options, &front).preview(&self.module)
+                let configuration = Configuration::of(config, span)?;
+                Assembled::of(&path, &options, &front, configuration).preview(&self.module)
             }
             (other, _) => return Err(unserved(EFFECT, other, span)),
         };
         Ok(HostAnswer::Value(value))
     }
+}
+
+/// The value of the definition `--config-schema` names, entered on a unit built for it alone: this
+/// command runs nothing else.
+fn schema(
+    path: &std::path::Path,
+    front: &crate::driver::HandedFront,
+    name: &str,
+) -> Result<ply_eval::Plain, Diagnostic> {
+    let loaded = crate::driver::load_over_front(path, front).map_err(|err| {
+        err.diagnostics.into_iter().next().unwrap_or_else(|| {
+            Diagnostic::error(
+                ply_eval::codes::INTERNAL_ERROR,
+                "the program would not load, and said nothing",
+            )
+        })
+    })?;
+    let backend = crate::support::prover_backend(&loaded)?;
+    crate::config::schema_of(&loaded.check, Some(backend), name)
 }
 
 /// The binding this invocation's flags define.
@@ -706,7 +741,7 @@ struct Assembled {
     disclosures: Disclosures,
     digest: String,
     hermetic: bool,
-    /// The refusal that stopped it, else the warnings the configuration raised.
+    /// The refusal that stopped it, if one did.
     diagnostics: Vec<Diagnostic>,
     sources: SourceMap,
 }
@@ -716,6 +751,7 @@ impl Assembled {
         path: &std::path::Path,
         options: &crate::drive::RunOptions,
         front: &crate::driver::HandedFront,
+        configuration: Configuration,
     ) -> Assembled {
         let loaded = match crate::driver::load_over_front(path, front) {
             Ok(loaded) => loaded,
@@ -729,7 +765,7 @@ impl Assembled {
             }
         };
         let root = loaded.root.display().to_string();
-        match bind(options, &loaded) {
+        match bind(options, &loaded, configuration) {
             Ok(bound) => Assembled {
                 stage: "Bound",
                 root,
@@ -737,7 +773,7 @@ impl Assembled {
                 hermetic: bound.hermetic,
                 listing: bound.listing,
                 disclosures: bound.disclosures,
-                diagnostics: bound.warnings,
+                diagnostics: Vec::new(),
                 sources: loaded.sources,
             },
             Err((stage, diagnostics)) => {
@@ -788,10 +824,6 @@ impl Assembled {
                 option(d.filesystem.as_ref().map(filesystem_value)),
             ),
             (
-                "configuration",
-                option(d.configuration.as_ref().map(configuration_value)),
-            ),
-            (
                 "observability",
                 option(d.observability.as_ref().map(observability_value)),
             ),
@@ -807,13 +839,16 @@ struct Bound {
     listing: HostListing,
     disclosures: Disclosures,
     hermetic: bool,
-    warnings: Vec<Diagnostic>,
 }
 
 /// The stage that refused, and why.
 type Refusal = (&'static str, Vec<Diagnostic>);
 
-fn bind(args: &crate::drive::RunOptions, loaded: &crate::load::Loaded) -> Result<Bound, Refusal> {
+fn bind(
+    args: &crate::drive::RunOptions,
+    loaded: &crate::load::Loaded,
+    configuration: Configuration,
+) -> Result<Bound, Refusal> {
     // Whether or not `--host` was passed: a digest that moved with a flag would pin nothing.
     let trace = args.trace.open();
     let stopping = ply_host::signal::Shutdown::new(args.shutdown.bounds());
@@ -834,14 +869,6 @@ fn bind(args: &crate::drive::RunOptions, loaded: &crate::load::Loaded) -> Result
     // Likewise, so an unresolvable root is `E0454` before the listing overstates what is reached.
     let roots = ply_host::fs::Roots::load(&args.fs, Span::DUMMY)
         .map_err(|diagnostic| ("NotBound", vec![diagnostic]))?;
-    // Built only for a schema: this command runs nothing else.
-    let constant = |name: &str| {
-        let backend = crate::support::prover_backend(loaded)?;
-        crate::support::enter_constant(Some(backend), name)
-    };
-    let (configuration, warnings) =
-        Configuration::open(&loaded.check, args.host, &args.config, &constant)
-            .map_err(|diagnostics| ("NotBound", diagnostics))?;
     Ok(Bound {
         disclosures: Disclosures::of(
             &listing,
@@ -854,7 +881,6 @@ fn bind(args: &crate::drive::RunOptions, loaded: &crate::load::Loaded) -> Result
         ),
         listing,
         hermetic: binding.is_hermetic(),
-        warnings,
     })
 }
 
@@ -928,71 +954,6 @@ fn filesystem_value(filesystem: &Filesystem) -> PlyValue {
                 .collect(),
         ),
     )])
-}
-
-fn configuration_value(configuration: &Configuration) -> PlyValue {
-    let snapshot = &configuration.snapshot;
-    let counts = snapshot.counts();
-    record(vec![
-        ("sets", count(snapshot.sets)),
-        (
-            "files",
-            PlyValue::list(
-                snapshot
-                    .files
-                    .iter()
-                    .map(|p| PlyValue::str(p.display().to_string()))
-                    .collect(),
-            ),
-        ),
-        ("environment", count(snapshot.environment)),
-        ("defaults", count(counts.default)),
-        (
-            "schema",
-            option(configuration.schema.as_ref().map(|view| {
-                record(vec![
-                    ("function", PlyValue::str(&view.name)),
-                    (
-                        "keys",
-                        PlyValue::list(
-                            view.keys
-                                .iter()
-                                .map(|(name, shape)| {
-                                    record(vec![
-                                        ("name", PlyValue::str(name)),
-                                        ("shape", PlyValue::str(shape.as_str())),
-                                    ])
-                                })
-                                .collect(),
-                        ),
-                    ),
-                ])
-            })),
-        ),
-        ("resolved", count(counts.keys)),
-        ("secret", count(counts.secret)),
-        (
-            "keys",
-            PlyValue::list(
-                snapshot
-                    .declared()
-                    .map(|(name, resolved)| {
-                        record(vec![
-                            ("name", PlyValue::str(name)),
-                            ("value", PlyValue::str(resolved.shown())),
-                            ("source", PlyValue::str(resolved.source.as_str())),
-                            (
-                                "secret",
-                                PlyValue::Bool(
-                                    resolved.shape == Some(ply_host::config::Shape::Secret),
-                                ),
-                            ),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-    ])
 }
 
 fn observability_value(observability: &Observability) -> PlyValue {

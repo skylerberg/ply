@@ -19,6 +19,9 @@ import appends (broken_promises)
 import args (Flags, from_argv, style_of)
 import compiler.front (Whole)
 import config_schema
+import configuration
+import configuration (Configuration, Resolution)
+import std.config (SInt, SSecret)
 import compiler.resolve (Diag, Label)
 import diagnostic (Place, Raised, Spot, shown, spot_of, all_to_json, all_to_text)
 import entry (Main, Module, entry_point, no_module)
@@ -94,16 +97,15 @@ fn entry_of(t: Target) -> Result<String, Diag> =
 // --- What is disclosed before the entry runs ---------------------------------
 
 // The one line that says what this run may reach, and each facility's own under it.
-fn binding_lines(s: Style, b: Bound) -> List<String> =
+fn binding_lines(s: Style, b: Bound, c: Configuration) -> List<String> =
   if b.hermetic { [] } else {
     let head = [
       ind()
         ++ dim(s, "binding host · " ++ count_of(b.operations, "operation") ++ " · " ++ b.digest),
     ];
-    let configured = match b.config {
-      Some(banner) -> push(head, ind() ++ dim(s, "config      " ++ banner)),
-      None -> head,
-    };
+    let configured = if configuration::opened(c) {
+      push(head, ind() ++ dim(s, "config      " ++ configuration::banner(c)))
+    } else { head };
     match b.trace {
       Some(banner) -> push(configured, ind() ++ dim(s, "trace       " ++ banner)),
       None -> configured,
@@ -165,10 +167,17 @@ fn disclosed(
   flags: Flags,
   t: Target,
   b: Bound,
+  c: Resolution,
 ) -> Unit / {process.out[proc], process.err[proc]} =
   if flags.json { () } else {
-    warned(all_to_text(s, b.warnings, places_of(t)), 0);
-    wrote(also(also(warning_lines(s, told_of(t)), binding_lines(s, b)), program_lines(s, t)), 0);
+    warned(all_to_text(s, c.warnings, places_of(t)), 0);
+    wrote(
+      also(
+        also(warning_lines(s, told_of(t)), binding_lines(s, b, c.configuration)),
+        program_lines(s, t),
+      ),
+      0,
+    );
     warned(signal_lines(s, b), 0)
   }
 
@@ -314,6 +323,7 @@ fn document(
   t: Target,
   en: String,
   b: Bound,
+  c: Resolution,
   e: Ended,
   ok: Bool,
   code: Int,
@@ -336,7 +346,10 @@ fn document(
         { key: "counters", value: counters_json(e.counters) },
         { key: "hosts", value: e.hosts },
         { key: "value", value: match e.value { Some(v) -> Str(render(v)), None -> Null } },
-        { key: "configuration", value: e.configuration },
+        {
+          key: "configuration",
+          value: configuration::report_json(configuration::report(c.configuration)),
+        },
         { key: "shutdown", value: shutdown_json(e) },
         { key: "diagnostics", value: all_to_json(diags, places_of(t)) },
       ],
@@ -346,13 +359,13 @@ fn document(
 // --- The answer -------------------------------------------------------------
 
 // Everything the run has to say about itself that is not the entry's own answer.
-fn noted(t: Target, b: Bound, e: Ended) -> List<Diag> =
-  also(also(also(told_of(t), b.warnings), e.cycles), e.warnings)
+fn noted(t: Target, c: Resolution, e: Ended) -> List<Diag> =
+  also(also(also(told_of(t), c.warnings), e.cycles), e.warnings)
 
 // The program chose its code and returned no value, so none is printed.
-fn exited(s: Style, t: Target, en: String, b: Bound, e: Ended, code: Int) -> Answer =
+fn exited(s: Style, t: Target, en: String, b: Bound, c: Resolution, e: Ended, code: Int) -> Answer =
   {
-    json: document(t, en, b, e, code == ok_code(), code, noted(t, b, e)),
+    json: document(t, en, b, c, e, code == ok_code(), code, noted(t, c, e)),
     lines: handshake_lines(s, e),
     errs: also(
       also(all_to_text(s, e.cycles, places_of(t)), stop_lines(s, e)),
@@ -361,9 +374,9 @@ fn exited(s: Style, t: Target, en: String, b: Bound, e: Ended, code: Int) -> Ans
     code: code,
   }
 
-fn answered(s: Style, t: Target, en: String, b: Bound, e: Ended) -> Answer =
+fn answered(s: Style, t: Target, en: String, b: Bound, c: Resolution, e: Ended) -> Answer =
   {
-    json: document(t, en, b, e, true, ok_code(), noted(t, b, e)),
+    json: document(t, en, b, c, e, true, ok_code(), noted(t, c, e)),
     lines: also(handshake_lines(s, e), [
       ind() ++ (match e.value { Some(v) -> render(v), None -> "" }),
     ]),
@@ -374,10 +387,10 @@ fn answered(s: Style, t: Target, en: String, b: Bound, e: Ended) -> Answer =
     code: ok_code(),
   }
 
-fn raised(s: Style, t: Target, en: String, b: Bound, e: Ended, d: Diag) -> Answer = {
+fn raised(s: Style, t: Target, en: String, b: Bound, c: Resolution, e: Ended, d: Diag) -> Answer = {
   let code = if drained(d) { drain_incomplete() } else { failed() };
   {
-    json: document(t, en, b, e, false, code, push(noted(t, b, e), d)),
+    json: document(t, en, b, c, e, false, code, push(noted(t, c, e), d)),
     lines: [],
     errs: also(
       also(
@@ -393,12 +406,12 @@ fn raised(s: Style, t: Target, en: String, b: Bound, e: Ended, d: Diag) -> Answe
   }
 }
 
-fn ended(s: Style, t: Target, en: String, b: Bound, e: Ended) -> Answer =
+fn ended(s: Style, t: Target, en: String, b: Bound, c: Resolution, e: Ended) -> Answer =
   match e.exit {
-    Some(code) -> exited(s, t, en, b, e, code),
+    Some(code) -> exited(s, t, en, b, c, e, code),
     None -> match e.raised {
-      None -> answered(s, t, en, b, e),
-      Some(r) -> raised(s, t, en, b, e, shown(r)),
+      None -> answered(s, t, en, b, c, e),
+      Some(r) -> raised(s, t, en, b, c, e, shown(r)),
     },
   }
 
@@ -463,17 +476,23 @@ fn unbound(s: Style, why: Refusal) -> Answer = {
   }
 }
 
+// A configuration that did not resolve refuses the run before anything is bound; one that did is
+// what the binding answers from.
 fn started(
   s: Style,
   flags: Flags,
   t: Target,
   en: String,
+  cfg: Result<Resolution, List<Diag>>,
 ) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} =
-  match machine.bound[run](en) {
-    Err(why) -> unbound(s, why),
-    Ok(b) -> {
-      disclosed(s, flags, t, b);
-      ended(s, t, en, b, machine.enter[run]())
+  match cfg {
+    Err(diags) -> unbound(s, { diags: diags, places: places_of(t), artifact: None }),
+    Ok(r) -> match machine.bound[run](en, configuration::configured(r.configuration)) {
+      Err(why) -> unbound(s, why),
+      Ok(b) -> {
+        disclosed(s, flags, t, b, r);
+        ended(s, t, en, b, r, machine.enter[run]())
+      },
     },
   }
 
@@ -481,13 +500,26 @@ fn chosen(
   s: Style,
   flags: Flags,
   t: Target,
+  cfg: Result<Resolution, List<Diag>>,
 ) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} =
-  match entry_of(t) { Err(d) -> unentered(s, t, d), Ok(en) -> started(s, flags, t, en) }
+  match entry_of(t) { Err(d) -> unentered(s, t, d), Ok(en) -> started(s, flags, t, en, cfg) }
+
+// The configuration a run binds, read once its target loaded, whose own unit enters the schema.
+fn configured_over(
+  target: Result<Target, Refusal>,
+  options: Options,
+) -> Result<Resolution, List<Diag>> / {machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs]} =
+  match target {
+    Err(_) -> Ok({ configuration: configuration::unopened(), warnings: [] }),
+    Ok(_) ->
+      configuration::opened_by(options.host, options.config, |name: String|
+        machine.schema[run](name)),
+  }
 
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.configure[run], machine.load[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
+) -> Answer / {builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.configure[run], machine.load[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs]} = {
   let s: Style = style_of(flags);
   // An artifact is not a program to analyse: what it holds is its own definitions, and the front
   // end never sees it. Only sources are a load this side runs, so only their schema is resolved
@@ -497,7 +529,8 @@ pub fn run(
       Some(d) -> unbound(s, { diags: [d], places: [], artifact: None }),
       None -> {
         machine.configure[run](options);
-        over(s, flags, machine.load[run](root_of(flags), None, None))
+        let target = machine.load[run](root_of(flags), None, None);
+        over(s, flags, target, configured_over(target, options))
       },
     }
   } else { sourced(s, flags, options) }
@@ -514,7 +547,7 @@ fn sourced(
   s: Style,
   flags: Flags,
   options: Options,
-) -> Answer / {builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.configure[run], machine.load[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
+) -> Answer / {builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.configure[run], machine.load[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs]} = {
   let started = time.elapsed_ms();
   let project: sources::Project = load_resolved(flags.paths);
   let tools: Toolchain = { stamp: env.shipped_digest[sys](), version: env.binary_version[sys]() };
@@ -524,15 +557,17 @@ fn sourced(
   let kept: Option<Target> = if usable(project) { machine.reuse[run](root_of(flags), walk) }
   else { None };
   match kept {
-    Some(t) ->
-      loaded_over(s, flags, Ok(t), {
+    Some(t) -> {
+      let l = {
         reused: true,
         key: walk.key,
         read_ms: asked - started,
         front_ms: 0,
         file_ms: 0,
         load_ms: time.elapsed_ms() - asked,
-      }),
+      };
+      loaded_over(s, flags, Ok(t), configured_over(Ok(t), options), l)
+    },
     None -> built(s, flags, options, project, walk.key, started),
   }
 }
@@ -546,7 +581,7 @@ fn built(
   project: sources::Project,
   key: String,
   started: Int,
-) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
+) -> Answer / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs]} = {
   let t: Timed = timed_over(flags.paths, project, started);
   match t.program.whole {
     // A load refusal, in the shape the machine's own refusals take: nothing ran, and the
@@ -555,7 +590,7 @@ fn built(
     Some(w) -> match config_schema::refusal(w, options.config.schema) {
       Some(d) -> unbound(s, { diags: [d], places: t.program.places, artifact: None }),
       None -> match broken_promises(t.program, w) {
-        [] -> loaded_built(s, flags, t, w, key),
+        [] -> loaded_built(s, flags, options, t, w, key),
         broken -> unloaded(s, { diags: broken, places: t.program.places, artifact: None }),
       },
     },
@@ -566,20 +601,22 @@ fn built(
 fn loaded_built(
   s: Style,
   flags: Flags,
+  options: Options,
   t: Timed,
   w: Whole,
   key: String,
-) -> Answer / {time.elapsed_ms, machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} = {
+) -> Answer / {time.elapsed_ms, machine.load[run], machine.schema[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs]} = {
   let asked = time.elapsed_ms();
   let target = machine.load[run](root_of(flags), Some(front_of(t, w)), Some(key));
-  loaded_over(s, flags, target, {
+  let l = {
     reused: false,
     key: key,
     read_ms: t.read_ms,
     front_ms: t.front_ms,
     file_ms: t.file_ms,
     load_ms: time.elapsed_ms() - asked,
-  })
+  };
+  loaded_over(s, flags, target, configured_over(target, options), l)
 }
 
 // The run over the target the machine loaded, or the machine's refusal of it.
@@ -587,8 +624,9 @@ fn over(
   s: Style,
   flags: Flags,
   target: Result<Target, Refusal>,
+  cfg: Result<Resolution, List<Diag>>,
 ) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} =
-  match target { Err(why) -> unloaded(s, why), Ok(t) -> chosen(s, flags, t) }
+  match target { Err(why) -> unloaded(s, why), Ok(t) -> chosen(s, flags, t, cfg) }
 
 // The same over sources, saying where the load's time went when `--explain` asks: aloud before
 // the entry runs, or in the one document under `--json`.
@@ -596,13 +634,14 @@ fn loaded_over(
   s: Style,
   flags: Flags,
   target: Result<Target, Refusal>,
+  cfg: Result<Resolution, List<Diag>>,
   l: Loading,
 ) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} =
   match target {
     Err(why) -> unloaded(s, why),
     Ok(t) -> {
       if flags.explain && !flags.json { process.err[proc](loading_line(s, l)) };
-      explained(flags, l, chosen(s, flags, t))
+      explained(flags, l, chosen(s, flags, t, cfg))
     },
   }
 
@@ -685,26 +724,15 @@ fn an_artifact() -> Target =
     warnings: [],
   })
 
-fn hermetic() -> Bound =
-  {
-    hermetic: true,
-    operations: 0,
-    digest: "",
-    config: None,
-    trace: None,
-    signals: None,
-    warnings: [],
-  }
+fn hermetic() -> Bound = { hermetic: true, operations: 0, digest: "", trace: None, signals: None }
 
 fn a_binding() -> Bound =
   {
     hermetic: false,
     operations: 7,
     digest: "b3:aabbccddeeff",
-    config: Some("2 keys · 1 secret"),
     trace: Some("json on stderr · info"),
     signals: Some({ names: ["SIGINT", "SIGTERM"], lead_ms: 0, drain_ms: 30000 }),
-    warnings: [],
   }
 
 fn no_counters() -> Counters = { updates: 0, updates_in_place: 0, in_place: None, cycles: 0 }
@@ -724,7 +752,6 @@ fn answered_with(value: Value) -> Ended =
     trace: None,
     handshakes: [],
     hosts: Null,
-    configuration: Null,
   }
 
 fn unvalued(d: Diag) -> Raised = { diag: d, values: [] }
@@ -748,21 +775,49 @@ fn nothing() -> Refusal = { diags: [], places: [], artifact: None }
 type Ran = { answer: Answer, out: List<String>, err: List<String> }
 
 fn ran_over(flags: Flags, t: Result<Target, Refusal>, b: Result<Bound, Refusal>, e: Ended) -> Ran =
-  ran_loaded(flags, t, b, e, None)
+  ran_loaded(flags, t, Ok(unconfigured()), b, e, None)
+
+fn unconfigured() -> Resolution = { configuration: configuration::unopened(), warnings: [] }
+
+// Two keys the schema declares, one of them secret, both from the environment.
+fn configured_desk() -> Resolution =
+  match configuration::sources_of([], [], [
+      { name: "PORT", value: "8137" },
+      { name: "TOKEN", value: "t" },
+    ]) {
+    Err(_) -> panic("the fixture's sources read"),
+    Ok(sources) -> match configuration::resolved(
+        sources,
+        Some({
+          function: "m.spec",
+          keys: [
+            { name: "PORT", shape: SInt, required: true, default: None },
+            { name: "TOKEN", shape: SSecret, required: true, default: None },
+          ],
+        }),
+      ) {
+      Err(_) -> panic("the fixture resolves"),
+      Ok(r) -> r,
+    },
+  }
 
 // The same over sources, whose load `l` says where the time went, when there is one to say.
 fn ran_loaded(
   flags: Flags,
   t: Result<Target, Refusal>,
+  cfg: Result<Resolution, List<Diag>>,
   b: Result<Bound, Refusal>,
   e: Ended,
   l: Option<Loading>,
 ) -> Ran =
   with_cell[twin](captured([])) { io -> {
     let answer: Answer = handle {
-      match l { None -> over(plain(), flags, t), Some(l) -> loaded_over(plain(), flags, t, l) }
+      match l {
+        None -> over(plain(), flags, t, cfg),
+        Some(l) -> loaded_over(plain(), flags, t, cfg, l),
+      }
     } with {
-      machine.bound[run](named) -> b,
+      machine.bound[run](named, config) -> b,
       machine.enter[run]() -> e,
       process.out[proc](text) -> cell_set(io, out_step(cell_get(io), text)),
       process.err[proc](text) -> cell_set(io, err_step(cell_get(io), text)),
@@ -801,10 +856,17 @@ test "the object keys off `command` and `exit_code`, and names the entry and its
 // What a run may reach is disclosed while the entry is still ahead of it, so it goes out on the
 // stream as the program runs rather than in the answer collected after it.
 test "a bound run discloses what it may reach before the entry is entered" {
-  let ran = ran_over(bare(), Ok(a_program()), Ok(a_binding()), answered_with(VInt(42)));
+  let ran = ran_loaded(
+    bare(),
+    Ok(a_program()),
+    Ok(configured_desk()),
+    Ok(a_binding()),
+    answered_with(VInt(42)),
+    None,
+  );
   assert_eq(ran.out, [
     "   binding host · 7 operations · b3:aabbccddeeff",
-    "   config      2 keys · 1 secret",
+    "   config      2 keys · 2 environment · 1 secret (values not shown)",
     "   trace       json on stderr · info",
   ]);
   assert_eq(ran.err, [
@@ -1079,7 +1141,14 @@ fn a_build() -> Loading =
 fn explaining() -> Flags = from_argv("run", ["--explain"])
 
 fn loaded(flags: Flags, l: Loading) -> Ran =
-  ran_loaded(flags, Ok(a_program()), Ok(a_binding()), answered_with(VInt(42)), Some(l))
+  ran_loaded(
+    flags,
+    Ok(a_program()),
+    Ok(unconfigured()),
+    Ok(a_binding()),
+    answered_with(VInt(42)),
+    Some(l),
+  )
 
 test "a run over a reused front end answers exactly as one over a front end it ran" {
   assert_eq(loaded(bare(), a_reuse()), loaded(bare(), a_build()));
@@ -1123,6 +1192,7 @@ test "a load the machine refused says nothing about where its time went" {
   let ran = ran_loaded(
     explaining(),
     Err(why),
+    Ok(unconfigured()),
     Err(nothing()),
     answered_with(VUnit),
     Some(a_build()),
