@@ -5,9 +5,12 @@ import std.bin
 import std.fs (fs, mem_empty)
 import std.random (entropy)
 import std.time (time)
-import engine (Store, Found, Hit, Miss, Bad, Warning, Corrupt, open, get, put, drop, keys, flush,
-               compact, stats, warn)
+import std.bytes (hex_of)
+import compiler.front (body_key)
+import engine (Store, Found, Hit, Miss, Bad, Warning, Trouble, Corrupt, Unreadable, OtherVersion,
+               open, get, put, drop, keys, flush, compact, stats, warn, messages, pending)
 import twin (on_twin)
+import upstream (Upstream, read_entry, entry_keys, publish)
 
 // --- Tables -----------------------------------------------------------------
 
@@ -21,6 +24,16 @@ fn t_seen() -> Int = 7
 fn t_evidence() -> Int = 8
 fn t_reviews() -> Int = 9
 fn t_shipped() -> Int = 10
+fn t_stamps() -> Int = 11
+
+// --- Versions ---------------------------------------------------------------
+
+// Each moves when what its tables hold changes meaning without changing shape: what the front end
+// files, what a run proves, and what the prover discharges. Entries filed under another version are
+// not believed.
+pub fn frontend_version() -> String = "0.33.0"
+pub fn runtime_version() -> String = "0.16.0"
+pub fn prover_version() -> String = "0.8.0"
 
 // --- Records ----------------------------------------------------------------
 
@@ -53,11 +66,6 @@ pub type Fingerprint = {
   tests: List<TestEntry>,
 }
 
-// What the front end filed under one hash for one name; two definitions may share a hash.
-pub type Slot = { name: String, value: Bytes }
-
-type Slots = { hash: Bytes, slots: List<Slot> }
-
 pub type Body = { encoding: Int, bytes: Bytes }
 
 // The definitions a test last passed against: functions and declarations apart, since a `fn` and a
@@ -69,27 +77,29 @@ type Named<a> = { name: String, value: a }
 // What a human last accepted for a definition: its hash, and its own clauses' and laws' keys.
 pub type Review = { def: Bytes, specs: List<Bytes> }
 
+// The versions the versioned tables were filed under.
+pub type Stamps = { frontend: String, runtime: String, prover: String }
+
 derive bin for FileSpan
 derive bin for DefKind
 derive bin for Member
 derive bin for DefEntry
 derive bin for TestEntry
 derive bin for Fingerprint
-derive bin for Slot
-derive bin for Slots
 derive bin for Body
 derive bin for PassRecord
 derive bin for Named
 derive bin for Review
+derive bin for Stamps
 
 // Every stored record's shape, so a store written under another encoding of any of them is not read.
 pub fn schema() -> Bytes =
   bytes_concat_all([
     bin::shape_digest(fingerprint_bin()),
-    bin::shape_digest(slots_bin()),
     bin::shape_digest(body_bin()),
     bin::shape_digest(named_bin(pass_record_bin())),
     bin::shape_digest(named_bin(review_bin())),
+    bin::shape_digest(stamps_bin()),
     bin::shape_digest(bin::bytes_bin()),
     bin::shape_digest(bin::string_bin()),
   ])
@@ -98,14 +108,161 @@ pub fn schema() -> Bytes =
 
 pub type Package = { root: String, identity: String }
 
-// One run's view of the store: the engine's, and how this run's paths are keyed.
-pub type Cache = { store: Store, root: String, packages: List<Package> }
+// One run's view of the store: the engine's, how this run's paths are keyed, and the upstream it
+// shares passes and evidence with, whose passes it read when it attached.
+pub type Cache = {
+  store: Store,
+  root: String,
+  packages: List<Package>,
+  upstream: Option<Upstream>,
+  shared: Map<Bytes, Bool>,
+}
 
 pub fn open_cache<[r]>(dir: String, root: String, packages: List<Package>) -> Cache / {fs.read[r]} =
-  { store: open[r](dir, schema()), root: root, packages: packages }
+  {
+    store: stamped[r](open[r](dir, schema())),
+    root: root,
+    packages: packages,
+    upstream: None,
+    shared: map_new(),
+  }
+
+pub fn stamps() -> Stamps =
+  { frontend: frontend_version(), runtime: runtime_version(), prover: prover_version() }
+
+fn stamps_key() -> Bytes = named_key("stamps")
+
+// A versioned group of tables, and the version its entries were filed under.
+type Group = { what: String, was: String, now: String, tables: List<Int> }
+
+fn groups(was: Stamps) -> List<Group> =
+  [
+    {
+      what: "the front end's entries",
+      was: was.frontend,
+      now: frontend_version(),
+      tables: [t_sources(), t_defs(), t_decls()],
+    },
+    {
+      what: "the test results",
+      was: was.runtime,
+      now: runtime_version(),
+      tables: [t_passed(), t_pass_records(), t_seen()],
+    },
+    {
+      what: "the discharged obligations",
+      was: was.prover,
+      now: prover_version(),
+      tables: [t_evidence()],
+    },
+  ]
+
+fn emptied(s: Store, g: Group) -> Store =
+  fold(g.tables, s, |s1: Store, t: Int| fold(keys(s1, t), s1, |s2: Store, k: Bytes| drop(s2, t, k)))
+
+fn restamped(s: Store) -> Store =
+  put(s, t_stamps(), stamps_key(), bin::encode(stamps(), stamps_bin()))
+
+// What a store says its versioned groups were filed under.
+type Stamped = | Known(Stamps) | Unstamped | Garbled
+
+// The groups filed under another version are dropped, each said once; a store whose versions are
+// missing or do not read keeps none of them. A store with nothing versioned in it is stamped when it
+// is flushed.
+fn stamped<[r]>(s: Store) -> Store / {fs.read[r]} = {
+  let was = match get[r](s, t_stamps(), stamps_key()) {
+    Hit(bytes) -> match bin::decode(bytes, stamps_bin()) { Ok(st) -> Known(st), Err(_) -> Garbled },
+    Miss -> Unstamped,
+    Bad(_) -> Garbled,
+  };
+  let all = groups(stamps());
+  let dropped = |why: Trouble, message: String|
+    restamped(warn(fold(all, s, emptied), why, message));
+  match was {
+    Known(st) -> if st == stamps() { s } else {
+      restamped(
+        fold(filter(groups(st), |g: Group| g.was != g.now), s, |s1: Store, g: Group|
+          warn(
+            emptied(s1, g),
+            OtherVersion,
+            g.what ++ " were filed by version " ++ g.was ++ ", and this is " ++ g.now
+              ++ "; they are filed again",
+          )),
+      )
+    },
+    Unstamped -> if fold(all, true, |none: Bool, g: Group|
+        none && fold(g.tables, true, |n: Bool, t: Int| n && len(keys(s, t)) == 0)) { s } else {
+      dropped(OtherVersion, "the store names no versions for its entries; they are filed again")
+    },
+    Garbled ->
+      dropped(Corrupt, "the store's versions do not read back; its entries are filed again"),
+  }
+}
+
+// Passes published there answer here; what this run learns is published back unless `publish` is
+// off. The upstream is reached under a label of its own, since it is rarely under the project.
+pub fn with_upstream<[u]>(c: Cache, root: String, publish: Bool) -> Cache / {fs.read[u]} = {
+  let up = {
+    root: root,
+    schema: digest(schema() ++ bin::encode(stamps(), stamps_bin())),
+    publish: publish,
+  };
+  {
+    ..c,
+    upstream: Some(up),
+    shared: fold(entry_keys[u](up, t_passed()), map_new(), |m: Map<Bytes, Bool>, k: Bytes|
+      map_insert(m, k, true)),
+  }
+}
+
+type Put = { table: Int, key: Bytes, payload: Bytes }
+
+fn published_failures(n: Int, root: String) -> String =
+  (if n == 1 { "1 entry" } else { int_to_string(n) ++ " entries" })
+    ++ " could not be published to the upstream store `"
+    ++ root
+    ++ "`; this run is unaffected"
+
+fn puts_in(s: Store, tables: List<Int>) -> List<Put> =
+  map_fold(s.puts, [], |acc: List<Put>, sl: Bytes, payload: Bytes|
+    if fold(tables, false, |hit: Bool, t: Int| hit || t == bytes_at(sl, 0)) {
+      push(acc, {
+        table: bytes_at(sl, 0),
+        key: bytes_slice(sl, 1, bytes_len(sl)),
+        payload: payload,
+      })
+    } else { acc })
 
 pub fn flush_cache<[r]>(c: Cache) -> Cache / {fs.read[r], fs.write[r], entropy.next, time.now_ms} =
-  { ..c, store: flush[r](c.store) }
+  { ..c, store: flush[r](if pending(c.store) == 0 { c.store } else { current[r](c.store) }) }
+
+// Whatever a flush writes goes under this build's versions.
+fn current<[r]>(s: Store) -> Store / {fs.read[r]} =
+  match get[r](s, t_stamps(), stamps_key()) {
+    Hit(b) -> if b == bin::encode(stamps(), stamps_bin()) { s } else { restamped(s) },
+    _ -> restamped(s),
+  }
+
+// The local write comes first, so an upstream that cannot be reached never costs a run its own record.
+pub fn flush_shared<[r], [u]>(
+  c: Cache,
+) -> Cache / {fs.read[r], fs.write[r], fs.read[u], fs.write[u], entropy.next, time.now_ms} = {
+  let shared = puts_in(c.store, [t_passed(), t_evidence()]);
+  let flushed = flush_cache[r](c);
+  match c.upstream {
+    None -> flushed,
+    Some(up) -> if !up.publish { flushed } else {
+      let fresh = filter(shared, |p: Put| p.table != t_passed() || !map_contains(c.shared, p.key));
+      let failed = fold(fresh, 0, |n: Int, p: Put|
+        if publish[u](up, p.table, p.key, p.payload) { n } else { n + 1 });
+      let known = fold(fresh, flushed.shared, |m: Map<Bytes, Bool>, p: Put|
+        if p.table == t_passed() { map_insert(m, p.key, true) } else { m });
+      let out = { ..flushed, shared: known };
+      if failed == 0 { out }
+      else { { ..out, store: warn(out.store, Unreadable, published_failures(failed, up.root)) } }
+    },
+  }
+}
 
 pub fn warnings(c: Cache) -> List<Warning> = c.store.warnings
 
@@ -139,6 +296,20 @@ fn damaged(what: String, why: String) -> String =
 
 fn write<a>(c: Cache, table: Int, key: Bytes, codec: bin::BinCodec<a>, value: a) -> Cache =
   { ..c, store: put(c.store, table, key, bin::encode(value, codec)) }
+
+// A write of what is already there is no write, so a run that changed nothing flushes nothing.
+fn renew<a, [r]>(
+  c: Cache,
+  table: Int,
+  key: Bytes,
+  codec: bin::BinCodec<a>,
+  value: a,
+) -> Cache / {fs.read[r]} =
+  match get[r](c.store, table, key) {
+    Hit(old) -> if old == bin::encode(value, codec) { c }
+    else { write(c, table, key, codec, value) },
+    _ -> write(c, table, key, codec, value),
+  }
 
 // --- Keying -----------------------------------------------------------------
 
@@ -195,8 +366,8 @@ pub fn fingerprint<[r]>(c: Cache, key: String) -> Read<Fingerprint> / {fs.read[r
   }
 }
 
-pub fn put_fingerprint(c: Cache, f: Fingerprint) -> Cache =
-  write(c, t_sources(), named_key(f.key), fingerprint_bin(), f)
+pub fn put_fingerprint<[r]>(c: Cache, f: Fingerprint) -> Cache / {fs.read[r]} =
+  renew[r](c, t_sources(), named_key(f.key), fingerprint_bin(), f)
 
 pub fn forget_source(c: Cache, key: String) -> Cache =
   { ..c, store: drop(c.store, t_sources(), named_key(key)) }
@@ -217,61 +388,47 @@ pub fn source_keys<[r]>(c: Cache) -> Read<List<String>> / {fs.read[r]} = {
   { value: Some(map_keys(walked.found)), cache: walked.cache }
 }
 
-fn slots_of<[r]>(c: Cache, table: Int, hash: Bytes) -> Read<Slots> / {fs.read[r]} =
-  read[r](c, table, hash, slots_bin(), "slot")
+// What the front end filed for one name under one hash, keyed by both: two definitions may share a
+// hash, and each keeps its own interface.
+fn pair_key(hash: Bytes, name: String) -> Bytes = digest(hash ++ bytes_of_string(name))
 
-fn slot_of<[r]>(c: Cache, table: Int, hash: Bytes, name: String) -> Read<Bytes> / {fs.read[r]} = {
-  let got = slots_of[r](c, table, hash);
-  match got.value {
-    None -> { value: None, cache: got.cache },
-    Some(s) ->
-      {
-        value: fold(s.slots, None, |acc: Option<Bytes>, x: Slot|
-          match acc { Some(_) -> acc, None -> if x.name == name { Some(x.value) } else { None } }),
-        cache: got.cache,
-      },
+fn interface_of<[r]>(
+  c: Cache,
+  table: Int,
+  hash: Bytes,
+  name: String,
+) -> Read<Bytes> / {fs.read[r]} =
+  match get[r](c.store, table, pair_key(hash, name)) {
+    Miss -> { value: None, cache: c },
+    Bad(why) -> { value: None, cache: noted(c, damaged("interface", why)) },
+    Hit(bytes) -> { value: Some(bytes), cache: c },
   }
-}
 
-// The other names filed under the hash keep their slots.
-fn put_slot<[r]>(
+fn put_interface<[r]>(
   c: Cache,
   table: Int,
   hash: Bytes,
   name: String,
   value: Bytes,
 ) -> Cache / {fs.read[r]} = {
-  let got = slots_of[r](c, table, hash);
-  let others = match got.value {
-    Some(s) -> if s.hash == hash { filter(s.slots, |x: Slot| x.name != name) } else { [] },
-    None -> [],
-  };
-  write(got.cache, table, hash, slots_bin(), {
-    hash: hash,
-    slots: push(others, { name: name, value: value }),
-  })
+  let k = pair_key(hash, name);
+  match get[r](c.store, table, k) {
+    Hit(old) -> if old == value { c } else { { ..c, store: put(c.store, table, k, value) } },
+    _ -> { ..c, store: put(c.store, table, k, value) },
+  }
 }
 
 pub fn def_of<[r]>(c: Cache, hash: Bytes, name: String) -> Read<Bytes> / {fs.read[r]} =
-  slot_of[r](c, t_defs(), hash, name)
+  interface_of[r](c, t_defs(), hash, name)
 
 pub fn decl_of<[r]>(c: Cache, hash: Bytes, name: String) -> Read<Bytes> / {fs.read[r]} =
-  slot_of[r](c, t_decls(), hash, name)
+  interface_of[r](c, t_decls(), hash, name)
 
 pub fn put_def<[r]>(c: Cache, hash: Bytes, name: String, value: Bytes) -> Cache / {fs.read[r]} =
-  put_slot[r](c, t_defs(), hash, name, value)
+  put_interface[r](c, t_defs(), hash, name, value)
 
 pub fn put_decl<[r]>(c: Cache, hash: Bytes, name: String, value: Bytes) -> Cache / {fs.read[r]} =
-  put_slot[r](c, t_decls(), hash, name, value)
-
-// The one hash a body's envelope may be filed under: its bytes' digest for a definition alone, and
-// for a member of a recursive group the group's digest with the member's class.
-pub fn body_key(bytes: Bytes) -> Option<Bytes> =
-  if bytes_len(bytes) == 0 { None }
-  else if bytes_at(bytes, 0) == 0 { Some(digest(bytes_slice(bytes, 1, bytes_len(bytes)))) }
-  else if bytes_at(bytes, 0) == 1 && bytes_len(bytes) >= 5 {
-    Some(digest(digest(bytes_slice(bytes, 5, bytes_len(bytes))) ++ bytes_slice(bytes, 1, 5)))
-  } else { None }
+  put_interface[r](c, t_decls(), hash, name, value)
 
 pub fn body<[r]>(c: Cache, hash: Bytes) -> Read<Body> / {fs.read[r]} = {
   let got = read[r](c, t_bodies(), hash, body_bin(), "body");
@@ -284,20 +441,44 @@ pub fn body<[r]>(c: Cache, hash: Bytes) -> Read<Body> / {fs.read[r]} = {
 }
 
 // A body whose envelope does not name `hash` is not filed: it could never be read back.
-pub fn put_body(c: Cache, hash: Bytes, b: Body) -> Cache =
-  if body_key(b.bytes) == Some(hash) { write(c, t_bodies(), hash, body_bin(), b) } else { c }
+// A body is keyed by a digest of itself, so a different body already there means its encoding
+// depends on something the hash does not cover: the one stored is kept and the run warned.
+pub fn put_body<[r]>(c: Cache, hash: Bytes, b: Body) -> Cache / {fs.read[r]} =
+  if body_key(b.bytes) != Some(hash) { c } else {
+    match get[r](c.store, t_bodies(), hash) {
+      Hit(old) -> if old == bin::encode(b, body_bin()) { c } else {
+        noted(
+          c,
+          "two different bodies were stored for definition `" ++ string_slice(hex_of(hash), 0, 12)
+            ++ "`; the one already stored is kept",
+        )
+      },
+      _ -> write(c, t_bodies(), hash, body_bin(), b),
+    }
+  }
 
 // --- Test results -----------------------------------------------------------
 
 pub fn passed<[r]>(c: Cache, key: Bytes) -> Read<Bool> / {fs.read[r]} =
   match get[r](c.store, t_passed(), key) {
     Hit(_) -> { value: Some(true), cache: c },
-    Miss -> { value: Some(false), cache: c },
-    Bad(why) -> { value: Some(false), cache: noted(c, damaged("result", why)) },
+    Miss -> { value: Some(map_contains(c.shared, key)), cache: c },
+    Bad(why) ->
+      { value: Some(map_contains(c.shared, key)), cache: noted(c, damaged("result", why)) },
   }
 
 pub fn put_passed(c: Cache, key: Bytes) -> Cache =
   { ..c, store: put(c.store, t_passed(), key, b"") }
+
+// Every key a pass is filed under here or in the upstream, read from the index alone.
+pub fn passed_keys(c: Cache) -> List<Bytes> =
+  map_keys(
+    fold(keys(c.store, t_passed()), c.shared, |m: Map<Bytes, Bool>, k: Bytes|
+      map_insert(m, k, true)),
+  )
+
+// Every definition hash this store has seen pass, read from the index alone.
+pub fn seen_keys(c: Cache) -> List<Bytes> = keys(c.store, t_seen())
 
 pub fn pass_record<[r]>(c: Cache, label: String) -> Read<PassRecord> / {fs.read[r]} = {
   let got = read[r](
@@ -313,8 +494,8 @@ pub fn pass_record<[r]>(c: Cache, label: String) -> Read<PassRecord> / {fs.read[
   }
 }
 
-pub fn put_pass_record(c: Cache, label: String, record: PassRecord) -> Cache =
-  write(c, t_pass_records(), named_key(label), named_bin(pass_record_bin()), {
+pub fn put_pass_record<[r]>(c: Cache, label: String, record: PassRecord) -> Cache / {fs.read[r]} =
+  renew[r](c, t_pass_records(), named_key(label), named_bin(pass_record_bin()), {
     name: label,
     value: record,
   })
@@ -329,6 +510,29 @@ pub fn observe_definition(c: Cache, hash: Bytes) -> Cache =
 
 pub fn evidence<[r]>(c: Cache, key: Bytes) -> Read<Bytes> / {fs.read[r]} =
   read[r](c, t_evidence(), key, bin::bytes_bin(), "evidence")
+
+// The local entry, or else the upstream's.
+pub fn evidence_shared<[r], [u]>(c: Cache, key: Bytes) -> Read<Bytes> / {fs.read[r], fs.read[u]} = {
+  let local = evidence[r](c, key);
+  match local.value {
+    Some(_) -> local,
+    None -> match c.upstream {
+      None -> local,
+      Some(up) -> match read_entry[u](up, t_evidence(), key) {
+        Hit(payload) -> match bin::decode(payload, bin::bytes_bin()) {
+          Ok(v) -> { value: Some(v), cache: local.cache },
+          Err(e) ->
+            {
+              value: None,
+              cache: noted(local.cache, damaged("upstream evidence", bin::error_to_string(e))),
+            },
+        },
+        Miss -> local,
+        Bad(why) -> { value: None, cache: noted(local.cache, damaged("upstream evidence", why)) },
+      },
+    },
+  }
+}
 
 pub fn put_evidence(c: Cache, key: Bytes, encoded: Bytes) -> Cache =
   write(c, t_evidence(), key, bin::bytes_bin(), encoded)
@@ -383,86 +587,105 @@ pub fn counts(c: Cache) -> Counts =
 
 pub type Pruned = { sources: Int, defs: Int, decls: Int, bodies: Int }
 
-type Walk = { live: Map<Bytes, Bool>, cache: Cache, dropped: Int }
+// What the walk has found alive: bodies by hash, interfaces by their name and hash.
+type Live = { hashes: Map<Bytes, Bool>, pairs: Map<Bytes, Bool> }
 
-fn reached(live: Map<Bytes, Bool>, names: Map<String, Bytes>) -> Map<Bytes, Bool> =
-  map_fold(names, live, |m: Map<Bytes, Bool>, name: String, hash: Bytes| map_insert(m, hash, true))
+type Walk = { live: Live, cache: Cache, dropped: Int }
 
-// Drops the fingerprints of files outside `keep` and every slot and body that neither a surviving
-// fingerprint nor a pass record reaches. Call only once every file of the program is known.
+fn alive(live: Live, name: String, hash: Bytes) -> Live =
+  {
+    hashes: map_insert(live.hashes, hash, true),
+    pairs: map_insert(live.pairs, pair_key(hash, name), true),
+  }
+
+fn reached(live: Live, names: Map<String, Bytes>) -> Live =
+  map_fold(names, live, |l: Live, name: String, hash: Bytes| alive(l, name, hash))
+
+// Drops the fingerprints of files outside `keep` and every interface and body that neither a
+// surviving fingerprint nor a pass record reaches. Call only once every file of the program is known.
 pub fn prune<[r]>(c: Cache, keep: List<String>) -> { pruned: Pruned, cache: Cache } / {fs.read[r]} = {
   let kept = fold(keep, map_new(), |m: Map<String, Bool>, k: String| map_insert(m, k, true));
-  let walked = fold(
-    keys(c.store, t_sources()),
-    { live: map_new(), cache: c, dropped: 0 },
-    |acc: Walk, k: Bytes| {
-      let got = read[r](acc.cache, t_sources(), k, fingerprint_bin(), "fingerprint");
+  let kept_keys = map_fold(kept, map_new(), |m: Map<Bytes, Bool>, k: String, v: Bool|
+    map_insert(m, named_key(k), true));
+  let stray = fold(keys(c.store, t_sources()), false, |any: Bool, k: Bytes|
+    any || !map_contains(kept_keys, k));
+  let refiled = map_fold(c.store.puts, false, |any: Bool, sl: Bytes, p: Bytes|
+    any || bytes_at(sl, 0) == t_sources());
+  // Nothing can have become unreachable when every file was kept and none was filed again.
+  if !stray && !refiled { { pruned: { sources: 0, defs: 0, decls: 0, bodies: 0 }, cache: c } }
+  else {
+    let walked = fold(
+      keys(c.store, t_sources()),
+      { live: { hashes: map_new(), pairs: map_new() }, cache: c, dropped: 0 },
+      |acc: Walk, k: Bytes| {
+        let got = read[r](acc.cache, t_sources(), k, fingerprint_bin(), "fingerprint");
+        match got.value {
+          Some(f) -> if map_contains(kept, f.key) {
+            {
+              live: fold(f.defs, acc.live, |l: Live, d: DefEntry| alive(l, d.name, d.hash)),
+              cache: got.cache,
+              dropped: acc.dropped,
+            }
+          } else {
+            {
+              live: acc.live,
+              cache: { ..got.cache, store: drop(got.cache.store, t_sources(), k) },
+              dropped: acc.dropped + 1,
+            }
+          },
+          None ->
+            {
+              live: acc.live,
+              cache: { ..got.cache, store: drop(got.cache.store, t_sources(), k) },
+              dropped: acc.dropped + 1,
+            },
+        }
+      },
+    );
+    let roots = fold(keys(walked.cache.store, t_pass_records()), walked, |acc: Walk, k: Bytes| {
+      let got = read[r](
+        acc.cache,
+        t_pass_records(),
+        k,
+        named_bin(pass_record_bin()),
+        "pass record",
+      );
       match got.value {
-        Some(f) -> if map_contains(kept, f.key) {
+        Some(n) ->
           {
-            live: fold(f.defs, acc.live, |m: Map<Bytes, Bool>, d: DefEntry|
-              map_insert(m, d.hash, true)),
+            live: reached(reached(acc.live, n.value.closure), n.value.decls),
             cache: got.cache,
             dropped: acc.dropped,
-          }
-        } else {
-          {
-            live: acc.live,
-            cache: { ..got.cache, store: drop(got.cache.store, t_sources(), k) },
-            dropped: acc.dropped + 1,
-          }
-        },
-        None ->
-          {
-            live: acc.live,
-            cache: { ..got.cache, store: drop(got.cache.store, t_sources(), k) },
-            dropped: acc.dropped + 1,
           },
+        None -> { ..acc, cache: got.cache },
       }
-    },
-  );
-  let roots = fold(keys(walked.cache.store, t_pass_records()), walked, |acc: Walk, k: Bytes| {
-    let got = read[r](acc.cache, t_pass_records(), k, named_bin(pass_record_bin()), "pass record");
-    match got.value {
-      Some(n) ->
+    });
+    let swept = fold(
+      [t_defs(), t_decls(), t_bodies()],
+      { cache: roots.cache, gone: [] },
+      |acc: { cache: Cache, gone: List<Int> }, t: Int| {
+        let live = if t == t_bodies() { roots.live.hashes } else { roots.live.pairs };
+        let dead = filter(keys(acc.cache.store, t), |k: Bytes| !map_contains(live, k));
         {
-          live: reached(reached(acc.live, n.value.closure), n.value.decls),
-          cache: got.cache,
-          dropped: acc.dropped,
-        },
-      None -> { ..acc, cache: got.cache },
+          cache: {
+            ..acc.cache,
+            store: fold(dead, acc.cache.store, |s: Store, k: Bytes| drop(s, t, k)),
+          },
+          gone: push(acc.gone, len(dead)),
+        }
+      },
+    );
+    let gone = |i: Int| match list_at(swept.gone, i) { Some(n) -> n, None -> 0 };
+    {
+      pruned: { sources: walked.dropped, defs: gone(0), decls: gone(1), bodies: gone(2) },
+      cache: swept.cache,
     }
-  });
-  let swept = fold(
-    [t_defs(), t_decls(), t_bodies()],
-    { cache: roots.cache, gone: [] },
-    |acc: { cache: Cache, gone: List<Int> }, t: Int| {
-      let dead = filter(keys(acc.cache.store, t), |hash: Bytes| !map_contains(roots.live, hash));
-      {
-        cache: {
-          ..acc.cache,
-          store: fold(dead, acc.cache.store, |s: Store, hash: Bytes| drop(s, t, hash)),
-        },
-        gone: push(acc.gone, len(dead)),
-      }
-    },
-  );
-  let gone = |i: Int| match list_at(swept.gone, i) { Some(n) -> n, None -> 0 };
-  {
-    pruned: { sources: walked.dropped, defs: gone(0), decls: gone(1), bodies: gone(2) },
-    cache: swept.cache,
   }
 }
 
 pub type Match =
   | MatchDef({ key: String, entry: DefEntry })
   | MatchTest({ key: String, entry: TestEntry })
-
-fn hex_digit(n: Int) -> String = string_slice("0123456789abcdef", n, n + 1)
-
-pub fn hex(b: Bytes) -> String =
-  fold(range(0, bytes_len(b)), "", |acc: String, i: Int|
-    acc ++ hex_digit(bytes_at(b, i) >>> 4) ++ hex_digit(bytes_at(b, i) & 15))
 
 fn simple_name(name: String) -> String = {
   let parts = string_split(name, ".");
@@ -479,7 +702,7 @@ fn hex_prefix(q: String) -> Option<String> = {
 }
 
 fn hash_matches(hash: Bytes, prefix: Option<String>) -> Bool =
-  match prefix { Some(p) -> string_starts_with(hex(hash), p), None -> false }
+  match prefix { Some(p) -> string_starts_with(hex_of(hash), p), None -> false }
 
 // A program-wide name, a name as its module wrote it, or a prefix of a hash's hex.
 pub fn lookup<[r]>(c: Cache, query: String) -> Read<List<Match>> / {fs.read[r]} = {
@@ -584,7 +807,7 @@ test "every table round-trips through a flush and a reopen" {
     assert_eq(review[mem](r, "m.f").value, Some({ def: h("m.f"), specs: [h("s")] }));
     assert_eq(shipped_digest[mem](r).value, Some("b3:000000000000"));
     assert_eq(source_keys[mem](r).value, Some(["a.ply"]));
-    assert_eq(counts(r).defs, 1);
+    assert_eq(counts(r).defs, 2);
     warnings(c)
   });
   assert_eq(run.value, [])
@@ -659,7 +882,7 @@ test "lookup finds a definition by its name, its simple name and a prefix of its
     [
       names("m.f"),
       names("g"),
-      names(string_slice(hex(h("m.g")), 0, 6)),
+      names(string_slice(hex_of(h("m.g")), 0, 6)),
       names("t"),
       names("nothing"),
     ]
@@ -672,6 +895,8 @@ test "a project's file is keyed by its path inside the root, a dependency's by i
     store: open_free(),
     root: "proj",
     packages: [{ root: "proj/vendor/lib", identity: "b3:lib" }],
+    upstream: None,
+    shared: map_new(),
   };
   assert_eq(source_key(c, "proj/src/./a.ply"), Some("src/a.ply"));
   assert_eq(source_key(c, "proj/vendor/lib/x.ply"), Some("b3:lib/x.ply"));
@@ -701,4 +926,121 @@ test "two runs filing different entries both keep theirs" {
     source_keys[mem](open_cache[mem]("cache", "", [])).value
   });
   assert_eq(run.value, Some(["a.ply", "b.ply"]))
+}
+
+test "filing what is already filed writes nothing, and a second body for one hash is refused" {
+  let b = solo(b"body");
+  let run = on_twin(mem_empty(), || {
+    let c0 = put_body(
+      put_def(
+        put_fingerprint(open_cache[mem]("cache", "", []), print("a.ply", ["m.f"])),
+        h("m.f"),
+        "m.f",
+        b"F",
+      ),
+      key_of_body(b),
+      b,
+    );
+    let c1 = flush_cache[mem](c0);
+    let again = put_body(
+      put_def(
+        put_fingerprint(open_cache[mem]("cache", "", []), print("a.ply", ["m.f"])),
+        h("m.f"),
+        "m.f",
+        b"F",
+      ),
+      key_of_body(b),
+      b,
+    );
+    let pruned = prune(again, ["a.ply"]);
+    let other = put_body(pruned.cache, key_of_body(b), { encoding: 8, bytes: b.bytes });
+    { pending: pending(other.store), warned: len(warnings(other)) }
+  });
+  assert_eq(run.value, { pending: 0, warned: 1 })
+}
+
+test "an upstream's passes and evidence answer here, and what this run learns is published there" {
+  let run = on_twin(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", []), "shared", true);
+    let a1 = flush_shared[mem, mem](
+      put_evidence(put_passed(a, h("pass")), h("claim"), b"evidence"),
+    );
+    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", []), "shared", true);
+    let lonely = open_cache[mem]("three/cache", "three", []);
+    [
+      passed[mem](b, h("pass")).value == Some(true),
+      evidence_shared[mem, mem](b, h("claim")).value == Some(b"evidence"),
+      passed[mem](lonely, h("pass")).value == Some(false),
+      passed[mem](b, h("other")).value == Some(false),
+      warnings(a1) == [],
+    ]
+  });
+  assert_eq(run.value, [true, true, true, true, true])
+}
+
+test "a read-only upstream answers and is not written" {
+  let run = on_twin(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", []), "shared", false);
+    let a1 = flush_shared[mem, mem](put_passed(a, h("pass")));
+    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", []), "shared", true);
+    passed[mem](b, h("pass")).value
+  });
+  assert_eq(run.value, Some(false))
+}
+
+test "two runs publishing one pass race harmlessly, and an unwritable upstream is a warning" {
+  let run = on_twin(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", "one", []), "shared", true);
+    let b = with_upstream[mem](open_cache[mem]("two/cache", "two", []), "shared", true);
+    let a1 = flush_shared[mem, mem](put_passed(a, h("pass")));
+    let b1 = flush_shared[mem, mem](put_passed(b, h("pass")));
+    let blocked = fs.write_file[mem]("blocked", b"a file where the upstream should be");
+    let c = with_upstream[mem](open_cache[mem]("three/cache", "three", []), "blocked", true);
+    let c1 = flush_shared[mem, mem](put_passed(c, h("mine")));
+    let again = open_cache[mem]("three/cache", "three", []);
+    {
+      clean: warnings(a1) == [] && warnings(b1) == [],
+      warned: messages(warnings(c1)),
+      kept: passed[mem](again, h("mine")).value,
+    }
+  });
+  assert(run.value.clean);
+  assert_eq(run.value.warned, [
+    "1 entry could not be published to the upstream store `blocked`; this run is unaffected",
+  ]);
+  assert_eq(run.value.kept, Some(true))
+}
+
+test "entries filed under another version are dropped group by group, and said once" {
+  let run = on_twin(mem_empty(), || {
+    let c0 = put_passed(
+      put_fingerprint(open_cache[mem]("cache", "", []), print("a.ply", ["m.f"])),
+      h("t"),
+    );
+    let c1 = put_review(c0, "m.f", { def: h("m.f"), specs: [] });
+    let old = { ..stamps(), frontend: "0.0.1" };
+    let written = flush_cache[mem](c1);
+    let aged = flush[mem](
+      put(open[mem]("cache", schema()), t_stamps(), stamps_key(), bin::encode(old, stamps_bin())),
+    );
+    let r = open_cache[mem]("cache", "", []);
+    let warned = messages(r.store.warnings);
+    let again = open_cache[mem]("cache", "", []);
+    let refiled = flush_cache[mem](again);
+    {
+      warned: warned,
+      fingerprint: fingerprint[mem](r, "a.ply").value == None,
+      passed: passed[mem](r, h("t")).value,
+      review: review[mem](r, "m.f").value != None,
+      later: messages(open_cache[mem]("cache", "", []).store.warnings),
+    }
+  });
+  assert_eq(run.value.warned, [
+    "the front end's entries were filed by version 0.0.1, and this is " ++ frontend_version()
+      ++ "; they are filed again",
+  ]);
+  assert(run.value.fingerprint);
+  assert_eq(run.value.passed, Some(true));
+  assert(run.value.review);
+  assert_eq(run.value.later, [])
 }

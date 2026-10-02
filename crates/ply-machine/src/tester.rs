@@ -1,12 +1,11 @@
 //! What `ply test` loads, binds and runs, as `crates/ply-cli/ply/tests.ply` asks for it through the
 //! effect `tester.ply` declares: a unit per program its tests run in, the host binding over the
-//! first, one test or one interleaving of one on whichever thread asks, and the reads and writes of
-//! the result cache.
+//! first, and one test or one interleaving of one on whichever thread asks.
 //!
-//! A compiled unit, the host binding and a Rust unwind are not values a program can hold, and the
-//! cache's on-disk format has one reader, so those stay here. Which tests run, the keys each result
-//! is read and filed under, how the run concludes, why a failure happened, the mutants and mixtures
-//! that are tried and everything said about all of it are the program's.
+//! A compiled unit, the host binding and a Rust unwind are not values a program can hold, so those
+//! stay here. Which tests run, the keys each result is read and filed under, what the cache keeps,
+//! how the run concludes, why a failure happened, the mutants and mixtures that are tried and
+//! everything said about all of it are the program's.
 
 use crate::hosts::{self, Hosts, Lent};
 use crate::payload::{count, diags_value, field_of, json, option, raised_value, record, strings};
@@ -15,16 +14,14 @@ use crate::testrun::{
     Executed, Executor, Hosting, Interleaved, Use, executed, interleaved, status_word,
 };
 use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
-use ply_eval::{DefHash, Diagnostic, Seed, Span, Symbol, Value as PlyValue, codes};
-use ply_store::{Outcome, PassRecord, Store};
-use std::collections::BTreeMap;
+use ply_eval::{DefHash, Diagnostic, Seed, Span, Value as PlyValue, codes};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 /// The effect `crates/ply-cli/ply/tester.ply` declares.
 const EFFECT: &str = "tester";
 
-const OPERATIONS: [(&str, &str); 14] = [
+const OPERATIONS: [(&str, &str); 7] = [
     ("configure", "ply_machine::tester::configure"),
     // The programs tests run in, the binding over the first, and what it came to.
     ("unit", "ply_machine::tester::unit"),
@@ -34,20 +31,12 @@ const OPERATIONS: [(&str, &str); 14] = [
     // A test once, or one interleaving of it, on whichever thread asks.
     ("executed", "ply_machine::tester::executed"),
     ("interleaved", "ply_machine::tester::interleaved"),
-    // The result cache.
-    ("opened", "ply_machine::tester::opened"),
-    ("outcomes", "ply_machine::tester::outcomes"),
-    ("seen", "ply_machine::tester::seen"),
-    ("baselines", "ply_machine::tester::baselines"),
-    ("bodies", "ply_machine::tester::bodies"),
-    ("interfaces", "ply_machine::tester::interfaces"),
-    ("filed", "ply_machine::tester::filed"),
 ];
 
 /// What the binding and the budgets are read from, out of the options record the program parsed.
 #[derive(Clone, Debug)]
 pub struct TestOptions {
-    /// The project the result cache belongs to.
+    /// The project the run loads.
     pub path: PathBuf,
     pub steps: i64,
     pub timeout: u64,
@@ -89,7 +78,6 @@ impl Session {
             options: Mutex::new(TestOptions::default()),
             run: RwLock::new(Run::default()),
             warm: Mutex::new(None),
-            cache: Mutex::new(None),
         }))
     }
 
@@ -119,8 +107,6 @@ struct Site {
     /// The compiled program the last run's first unit was, kept for a later run over the same
     /// definitions: a `--watch` save that moved nothing compiles nothing.
     warm: Mutex<Option<Warm>>,
-    /// The result cache, opened by the first operation that reads or writes it.
-    cache: Mutex<Option<Cache>>,
 }
 
 struct Warm {
@@ -155,13 +141,8 @@ impl HostHandler for Site {
         let value = match req.op.op.as_str() {
             "configure" => {
                 let options = test_options_of(arg(req, 0)?, span)?;
-                // A run begins whatever the last one left; the store is kept only for its project.
-                let mut held = lock(&self.options);
-                if crate::load::project_root(&held.path) != crate::load::project_root(&options.path)
-                {
-                    *lock(&self.cache) = None;
-                }
-                *held = options;
+                // A run begins whatever the last one left.
+                *lock(&self.options) = options;
                 *self.run.write().unwrap_or_else(|e| e.into_inner()) = Run::default();
                 PlyValue::Unit
             }
@@ -191,41 +172,6 @@ impl HostHandler for Site {
                 let steps = u32::try_from(steps.max(1)).unwrap_or(u32::MAX);
                 self.interleaved(unit, test, &seed, steps, re_executed)?
             }
-            "opened" => diags_value(&self.cached(|cache| cache.take_warnings())),
-            "outcomes" => {
-                let keys = texts_of(arg(req, 0)?, span, "the keys to look up")?;
-                self.cached(|cache| outcomes(cache, &keys))
-            }
-            "seen" => {
-                let hashes = texts_of(arg(req, 0)?, span, "the hashes asked about")?;
-                self.cached(|cache| seen(cache, &hashes))
-            }
-            "baselines" => {
-                let keys = texts_of(arg(req, 0)?, span, "the tests asked about")?;
-                self.cached(|cache| baselines(cache, &keys))
-            }
-            "bodies" => {
-                let hashes = texts_of(arg(req, 0)?, span, "the bodies asked for")?;
-                self.cached(|cache| bodies(cache, &hashes))
-            }
-            "interfaces" => {
-                let mut asked = Vec::new();
-                for item in arg(req, 0)?.as_list(span, "the interfaces asked for")? {
-                    asked.push((
-                        field_of(item, "hash", span)?
-                            .as_str(span, "a hash")?
-                            .to_string(),
-                        field_of(item, "name", span)?
-                            .as_str(span, "a name")?
-                            .to_string(),
-                    ));
-                }
-                self.cached(|cache| interfaces(cache, &asked))
-            }
-            "filed" => {
-                let filing = filing_of(arg(req, 0)?, span)?;
-                self.cached(|cache| filed(cache, filing))
-            }
             other => return Err(crate::hosts::unserved(EFFECT, other, span)),
         };
         Ok(HostAnswer::Value(value))
@@ -247,15 +193,6 @@ fn index_arg(req: &HostRequest<'_>, at: usize, what: &str) -> Result<usize, Diag
     usize::try_from(n).map_err(|_| crate::payload::missing(what, req.span))
 }
 
-fn texts_of(v: &PlyValue, span: Span, what: &str) -> Result<Vec<String>, Diagnostic> {
-    let mut out = Vec::new();
-    for item in v.as_list(span, what)? {
-        out.push(item.as_str(span, what)?.to_string());
-    }
-    Ok(out)
-}
-
-/// `Ok(v)` or `Err(e)`, as the program reads an operation's answer.
 fn ok(value: PlyValue) -> PlyValue {
     PlyValue::ctor("Ok", vec![value])
 }
@@ -580,247 +517,6 @@ fn interleaved_value(run: &Interleaved) -> PlyValue {
         ),
         ("observed", PlyValue::Bool(run.observed)),
         ("usage", use_value(&run.usage)),
-    ])
-}
-
-// --- The result cache ----------------------------------------------------------
-
-/// The store a process's runs share, or why there is none: an unusable cache never stops a run.
-struct Cache {
-    store: Option<Store>,
-    /// Said by the next `opened`, once.
-    warnings: Vec<Diagnostic>,
-}
-
-impl Cache {
-    fn open(path: &std::path::Path) -> Cache {
-        let root = crate::load::project_root(path);
-        match Store::open(&root) {
-            Ok(mut store) => {
-                let opened = store.take_warnings();
-                let mut warnings: Vec<Diagnostic> = crate::migrate::notice(&store, &opened)
-                    .into_iter()
-                    .collect();
-                warnings.extend(opened);
-                Cache {
-                    store: Some(store.with_upstream(ply_store::Upstream::from_env())),
-                    warnings,
-                }
-            }
-            Err(e) => Cache {
-                store: None,
-                warnings: vec![
-                    Diagnostic::warning(
-                        codes::RUNTIME_ERROR,
-                        format!("could not open the cache under `{}`: {e:#}", root.display()),
-                    )
-                    .note("every test ran, and nothing this run proved was recorded")
-                    .note("check the directory's permissions to get caching back"),
-                ],
-            },
-        }
-    }
-
-    fn take_warnings(&mut self) -> Vec<Diagnostic> {
-        let mut warnings = std::mem::take(&mut self.warnings);
-        if let Some(store) = &mut self.store {
-            warnings.extend(store.take_warnings());
-        }
-        warnings
-    }
-}
-
-impl Site {
-    fn cached<R>(&self, f: impl FnOnce(&mut Cache) -> R) -> R {
-        let path = lock(&self.options).path.clone();
-        let mut cache = lock(&self.cache);
-        f(cache.get_or_insert_with(|| Cache::open(&path)))
-    }
-}
-
-fn hash(hex: &str) -> Option<DefHash> {
-    DefHash::from_hex(hex)
-}
-
-/// The store's answer under each key, as a report prints one: `passed`, `failed`, or nothing.
-fn outcomes(cache: &mut Cache, keys: &[String]) -> PlyValue {
-    PlyValue::list(
-        keys.iter()
-            .map(|key| {
-                let outcome = cache
-                    .store
-                    .as_ref()
-                    .zip(hash(key))
-                    .and_then(|(store, h)| store.get(h));
-                option(
-                    outcome.map(|o| PlyValue::str(if o.is_pass() { "passed" } else { "failed" })),
-                )
-            })
-            .collect(),
-    )
-}
-
-/// Whether the store has recorded seeing each definition.
-fn seen(cache: &mut Cache, hashes: &[String]) -> PlyValue {
-    PlyValue::list(
-        hashes
-            .iter()
-            .map(|h| {
-                PlyValue::Bool(
-                    cache
-                        .store
-                        .as_ref()
-                        .zip(hash(h))
-                        .is_some_and(|(store, h)| store.knows_definition(h)),
-                )
-            })
-            .collect(),
-    )
-}
-
-fn named_value(names: &BTreeMap<Symbol, DefHash>) -> PlyValue {
-    PlyValue::list(
-        names
-            .iter()
-            .map(|(name, h)| {
-                record(vec![
-                    ("name", PlyValue::str(name.as_str())),
-                    ("hash", PlyValue::str(h.to_hex())),
-                ])
-            })
-            .collect(),
-    )
-}
-
-/// The definition set each test was last seen to pass at.
-fn baselines(cache: &mut Cache, keys: &[String]) -> PlyValue {
-    PlyValue::list(
-        keys.iter()
-            .map(|key| {
-                let held = cache
-                    .store
-                    .as_ref()
-                    .and_then(|store| store.pass_record(&Symbol::new(key.as_str())));
-                option(held.map(|r| {
-                    record(vec![
-                        ("test", PlyValue::str(r.test_hash.to_hex())),
-                        ("closure", named_value(&r.closure)),
-                        ("decls", named_value(&r.decls)),
-                    ])
-                }))
-            })
-            .collect(),
-    )
-}
-
-/// The stored body each hash is filed under, as the front end wrote it.
-fn bodies(cache: &mut Cache, hashes: &[String]) -> PlyValue {
-    PlyValue::list(
-        hashes
-            .iter()
-            .map(|h| {
-                let body = cache
-                    .store
-                    .as_ref()
-                    .zip(hash(h))
-                    .and_then(|(store, h)| store.body(h))
-                    .and_then(|b| b.stored());
-                option(body.map(|b| PlyValue::bytes(b.as_bytes())))
-            })
-            .collect(),
-    )
-}
-
-/// Each definition's interface as the front end filed it under that hash: the compiler's own value,
-/// handed back without reading it.
-fn interfaces(cache: &mut Cache, asked: &[(String, String)]) -> PlyValue {
-    PlyValue::list(
-        asked
-            .iter()
-            .map(|(h, name)| {
-                let slot = cache
-                    .store
-                    .as_ref()
-                    .zip(hash(h))
-                    .and_then(|(store, h)| store.def_of(h, &Symbol::new(name.as_str())));
-                option(slot.and_then(|slot| ply_eval::codec::decode(&slot.value).ok()))
-            })
-            .collect(),
-    )
-}
-
-/// What a run or a bisection established, as the program decided to file it.
-struct Filing {
-    passes: Vec<DefHash>,
-    records: Vec<(Symbol, PassRecord)>,
-    seen: Vec<DefHash>,
-}
-
-fn filing_of(v: &PlyValue, span: Span) -> Result<Filing, Diagnostic> {
-    let key = |v: &PlyValue| -> Result<DefHash, Diagnostic> {
-        let hex = v.as_str(span, "a key")?;
-        hash(hex).ok_or_else(|| {
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("`{hex}` is not a key the store could be written under"),
-            )
-            .primary(span, "the program handed this key over")
-        })
-    };
-    let keys = |v: &PlyValue, what: &str| -> Result<Vec<DefHash>, Diagnostic> {
-        v.as_list(span, what)?.iter().map(key).collect()
-    };
-    let named = |v: &PlyValue| -> Result<BTreeMap<Symbol, DefHash>, Diagnostic> {
-        let mut out = BTreeMap::new();
-        for item in v.as_list(span, "a closure")? {
-            out.insert(
-                Symbol::new(field_of(item, "name", span)?.as_str(span, "a name")?),
-                key(field_of(item, "hash", span)?)?,
-            );
-        }
-        Ok(out)
-    };
-    let mut records = Vec::new();
-    for item in field_of(v, "records", span)?.as_list(span, "the pass records")? {
-        let held = field_of(item, "record", span)?;
-        records.push((
-            Symbol::new(field_of(item, "key", span)?.as_str(span, "a test")?),
-            PassRecord {
-                test_hash: key(field_of(held, "test", span)?)?,
-                closure: named(field_of(held, "closure", span)?)?,
-                decls: named(field_of(held, "decls", span)?)?,
-            },
-        ));
-    }
-    Ok(Filing {
-        passes: keys(field_of(v, "passes", span)?, "the passes")?,
-        records,
-        seen: keys(field_of(v, "seen", span)?, "the definitions seen")?,
-    })
-}
-
-/// Writes the filing and flushes, answering why the flush failed when it did, and what the store
-/// had to say.
-fn filed(cache: &mut Cache, filing: Filing) -> PlyValue {
-    let Some(store) = &mut cache.store else {
-        return record(vec![
-            ("unflushed", option(None)),
-            ("warnings", diags_value(&cache.take_warnings())),
-        ]);
-    };
-    for key in filing.passes {
-        store.put(key, Outcome::Pass);
-    }
-    for (key, held) in filing.records {
-        store.put_pass_record(key, held);
-    }
-    if !filing.seen.is_empty() {
-        store.observe_definitions(filing.seen);
-    }
-    let unflushed = store.flush().err().map(|e| PlyValue::str(format!("{e:#}")));
-    record(vec![
-        ("unflushed", option(unflushed)),
-        ("warnings", diags_value(&cache.take_warnings())),
     ])
 }
 

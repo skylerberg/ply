@@ -6,6 +6,5 @@ mod costs;
 mod drive;
 mod hosts;
 mod load;
-mod migrate;
 mod payload;
 mod policy;

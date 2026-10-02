@@ -1,0 +1,451 @@
+// What a command keeps in the store between runs and reads back: for `ply test` the keys passes are
+// filed under, each test's baseline, the definitions seen pass, and the bodies and interfaces a
+// failure's diagnosis reads; for `ply prove` and `ply review` evidence and accepted baselines.
+
+import std.bin
+import std.fs (fs, mem_empty)
+import std.random (entropy)
+import std.time (time)
+import std.bytes (bytes_of_hex, hex_of)
+import compiler.front (DefInterface, body_encoding, body_key, def_interface_bin)
+import compiler.resolve (Diag)
+import loads
+import paths
+import store.tables
+import store.twin (on_twin)
+import suite.conclude (Filing, Named, PassRecord)
+import claims (proofs, Accepted)
+import env (env)
+import proof.obligation (Record)
+import tester (ledger, Filed)
+
+// The upstream `PLY_CACHE_UPSTREAM` names, as an absolute path read under `abs`.
+pub type Shared = { root: String, publish: Bool }
+
+// The store a run reads its results from and files them in.
+pub type Kept = { place: loads::Place, cache: tables::Cache }
+
+fn under_abs(path: String) -> String =
+  if string_starts_with(path, "/") { string_slice(path, 1, string_len(path)) } else { path }
+
+// The store a command reads and files in: none under `--no-cache`, which also ignores the upstream.
+pub fn kept_at(
+  paths: List<paths::Resolved>,
+  no_cache: Bool,
+) -> Option<Kept> / {fs.read[cwd], fs.read[abs], env.var[sys], env.pwd[sys]} =
+  if no_cache { None } else { Some(opened(paths, shared_of_env())) }
+
+fn shared_of_env() -> Option<Shared> / {env.var[sys], env.pwd[sys]} =
+  match env.var[sys]("PLY_CACHE_UPSTREAM") {
+    None -> None,
+    Some(root) -> if root == "" { None } else {
+      {
+        let absolute = if string_starts_with(root, "/") { root }
+        else { env.pwd[sys]() ++ "/" ++ root };
+        Some({ root: absolute, publish: env.var[sys]("PLY_CACHE_UPSTREAM_READONLY") == None })
+      }
+    },
+  }
+
+pub fn opened(
+  paths: List<paths::Resolved>,
+  shared: Option<Shared>,
+) -> Kept / {fs.read[cwd], fs.read[abs]} = {
+  let place = loads::place_of(paths);
+  let c = if place.label == "cwd" { tables::open_cache[cwd](place.dir, place.root, []) }
+  else { tables::open_cache[abs](place.dir, place.root, []) };
+  {
+    place: place,
+    cache: match shared {
+      Some(up) -> tables::with_upstream[abs](c, under_abs(up.root), up.publish),
+      None -> c,
+    },
+  }
+}
+
+fn hex_set(xs: List<Bytes>) -> Map<String, Bool> =
+  fold(xs, map_new(), |m: Map<String, Bool>, k: Bytes| map_insert(m, hex_of(k), true))
+
+// --- The tests' -------------------------------------------------------------
+
+// An answer read from the store, and the store as reading it left it.
+type Over<a> = { value: a, cache: tables::Cache }
+
+fn outcomes_over<[r]>(
+  c0: tables::Cache,
+  keys: List<String>,
+) -> Over<List<Option<String>>> / {fs.read[r]} =
+  fold(keys, { value: [], cache: c0 }, |acc: Over<List<Option<String>>>, key: String| {
+    let got = tables::passed[r](acc.cache, bytes_of_hex(key));
+    {
+      value: push(acc.value, if got.value == Some(true) { Some("passed") } else { None }),
+      cache: got.cache,
+    }
+  })
+
+fn seen_over<[r]>(c: tables::Cache, hashes: List<String>) -> List<Bool> / {fs.read[r]} =
+  map(hashes, |h: String| tables::knows_definition[r](c, bytes_of_hex(h)))
+
+fn named_list(m: Map<String, Bytes>) -> List<Named> =
+  map_fold(m, [], |acc: List<Named>, name: String, hash: Bytes|
+    push(acc, { name: name, hash: hex_of(hash) }))
+
+fn named_map(xs: List<Named>) -> Map<String, Bytes> =
+  fold(xs, map_new(), |m: Map<String, Bytes>, n: Named| map_insert(m, n.name, bytes_of_hex(n.hash)))
+
+fn pass_records_over<[r]>(
+  c0: tables::Cache,
+  keys: List<String>,
+) -> Over<List<Option<PassRecord>>> / {fs.read[r]} =
+  fold(keys, { value: [], cache: c0 }, |acc: Over<List<Option<PassRecord>>>, key: String| {
+    let got = tables::pass_record[r](acc.cache, key);
+    {
+      value: push(acc.value, match got.value {
+        Some(rec) ->
+          Some({
+            test: hex_of(rec.test_hash),
+            closure: named_list(rec.closure),
+            decls: named_list(rec.decls),
+          }),
+        None -> None,
+      }),
+      cache: got.cache,
+    }
+  })
+
+// A body filed under another encoding is not one this compiler reads.
+fn bodies_over<[r]>(
+  c0: tables::Cache,
+  hashes: List<String>,
+) -> Over<List<Option<Bytes>>> / {fs.read[r]} =
+  fold(hashes, { value: [], cache: c0 }, |acc: Over<List<Option<Bytes>>>, h: String| {
+    let got = tables::body[r](acc.cache, bytes_of_hex(h));
+    {
+      value: push(acc.value, match got.value {
+        Some(b) -> if b.encoding == body_encoding() { Some(b.bytes) } else { None },
+        None -> None,
+      }),
+      cache: got.cache,
+    }
+  })
+
+fn interfaces_over<[r]>(
+  c0: tables::Cache,
+  asked: List<{ hash: String, name: String }>,
+) -> Over<List<Option<DefInterface>>> / {fs.read[r]} =
+  fold(
+    asked,
+    { value: [], cache: c0 },
+    |acc: Over<List<Option<DefInterface>>>, a: { hash: String, name: String }| {
+      let got = tables::def_of[r](acc.cache, bytes_of_hex(a.hash), a.name);
+      {
+        value: push(acc.value, match got.value {
+          Some(bytes) -> match bin::decode(bytes, def_interface_bin()) {
+            Ok(v) -> Some(v),
+            Err(_) -> None,
+          },
+          None -> None,
+        }),
+        cache: got.cache,
+      }
+    },
+  )
+
+// What a filing puts, before anything is flushed: a pass or a sighting already kept is not put again.
+fn noted<[r]>(c0: tables::Cache, f: Filing) -> tables::Cache / {fs.read[r]} = {
+  let passed = hex_set(tables::passed_keys(c0));
+  let seen = hex_set(tables::seen_keys(c0));
+  let c1 = fold(f.passes, c0, |c: tables::Cache, key: String|
+    if map_contains(passed, key) { c } else { tables::put_passed(c, bytes_of_hex(key)) });
+  let c2 = fold(f.records, c1, |c: tables::Cache, e: { key: String, record: PassRecord }|
+    tables::put_pass_record[r](c, e.key, {
+      test_hash: bytes_of_hex(e.record.test),
+      closure: named_map(e.record.closure),
+      decls: named_map(e.record.decls),
+    }));
+  fold(f.seen, c2, |c: tables::Cache, hash: String|
+    if map_contains(seen, hash) { c } else { tables::observe_definition(c, bytes_of_hex(hash)) })
+}
+
+fn filed_over<[r]>(
+  c: tables::Cache,
+  f: Filing,
+) -> tables::Cache / {fs.read[r], fs.write[r], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} =
+  tables::flush_shared[r, abs](noted[r](c, f))
+
+// The store with what it had to say taken.
+fn quiet(k: Kept) -> Kept = { ..k, cache: { ..k.cache, store: { ..k.cache.store, warnings: [] } } }
+
+fn said(c: tables::Cache) -> List<Diag> = loads::diags_of(tables::warnings(c))
+
+// `ply test`'s reads and writes, over the store a run opened, each said once.
+pub fn with_ledger<a | e>(
+  kept: Option<Kept>,
+  go: () -> a / {ledger.opened, ledger.outcomes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed | e},
+) -> a / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
+  with_cell[books](kept) { held -> {
+    let read = |k: Kept, c: tables::Cache| cell_set(held, Some({ ..k, cache: c }));
+    handle {
+      go()
+    } with {
+      ledger.opened() -> match cell_get(held) {
+        None -> [],
+        Some(k) -> {
+          cell_set(held, Some(quiet(k)));
+          said(k.cache)
+        },
+      },
+      ledger.outcomes(keys) -> match cell_get(held) {
+        None -> map(keys, |key: String| None),
+        Some(k) -> {
+          let o = if k.place.label == "cwd" { outcomes_over[cwd](k.cache, keys) }
+          else { outcomes_over[abs](k.cache, keys) };
+          read(k, o.cache);
+          o.value
+        },
+      },
+      ledger.seen(hashes) -> match cell_get(held) {
+        None -> map(hashes, |h: String| false),
+        Some(k) -> if k.place.label == "cwd" { seen_over[cwd](k.cache, hashes) }
+        else { seen_over[abs](k.cache, hashes) },
+      },
+      ledger.baselines(keys) -> match cell_get(held) {
+        None -> map(keys, |key: String| None),
+        Some(k) -> {
+          let o = if k.place.label == "cwd" { pass_records_over[cwd](k.cache, keys) }
+          else { pass_records_over[abs](k.cache, keys) };
+          read(k, o.cache);
+          o.value
+        },
+      },
+      ledger.bodies(hashes) -> match cell_get(held) {
+        None -> map(hashes, |h: String| None),
+        Some(k) -> {
+          let o = if k.place.label == "cwd" { bodies_over[cwd](k.cache, hashes) }
+          else { bodies_over[abs](k.cache, hashes) };
+          read(k, o.cache);
+          o.value
+        },
+      },
+      ledger.interfaces(asked) -> match cell_get(held) {
+        None -> map(asked, |a: { hash: String, name: String }| None),
+        Some(k) -> {
+          let o = if k.place.label == "cwd" { interfaces_over[cwd](k.cache, asked) }
+          else { interfaces_over[abs](k.cache, asked) };
+          read(k, o.cache);
+          o.value
+        },
+      },
+      ledger.filed(f) -> match cell_get(held) {
+        None -> { unflushed: None, warnings: [] },
+        Some(k) -> {
+          let c = if k.place.label == "cwd" { filed_over[cwd](k.cache, f) }
+          else { filed_over[abs](k.cache, f) };
+          cell_set(held, Some(quiet({ ..k, cache: c })));
+          { unflushed: None, warnings: said(c) }
+        },
+      },
+    }
+  } }
+
+// --- The prover's -----------------------------------------------------------
+
+fn cached_over<[r]>(
+  c: tables::Cache,
+  keys: List<String>,
+) -> List<Option<Bytes>> / {fs.read[r], fs.read[abs]} =
+  map(keys, |key: String| tables::evidence_shared[r, abs](c, bytes_of_hex(key)).value)
+
+fn cached_of(
+  kept: Option<Kept>,
+  keys: List<String>,
+) -> List<Option<Bytes>> / {fs.read[cwd], fs.read[abs]} =
+  match kept {
+    None -> map(keys, |k: String| None),
+    Some(k) -> if k.place.label == "cwd" { cached_over[cwd](k.cache, keys) }
+    else { cached_over[abs](k.cache, keys) },
+  }
+
+type Wrote = { kept: Option<Kept>, diags: List<Diag> }
+
+// The store after a write, its warnings said once.
+fn wrote(k: Kept, c: tables::Cache) -> Wrote =
+  {
+    kept: Some({ ..k, cache: { ..c, store: { ..c.store, warnings: [] } } }),
+    diags: loads::diags_of(tables::warnings(c)),
+  }
+
+fn flushed(
+  k: Kept,
+  c: tables::Cache,
+) -> Wrote / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} =
+  wrote(k, if k.place.label == "cwd" { tables::flush_shared[cwd, abs](c) }
+  else { tables::flush_shared[abs, abs](c) })
+
+fn recorded(
+  kept: Option<Kept>,
+  entries: List<{ key: String, evidence: Bytes }>,
+) -> Wrote / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} =
+  match kept {
+    None -> { kept: None, diags: [] },
+    Some(k) ->
+      flushed(
+        k,
+        fold(entries, k.cache, |c: tables::Cache, e: { key: String, evidence: Bytes }|
+          tables::put_evidence(c, bytes_of_hex(e.key), e.evidence)),
+      ),
+  }
+
+fn baselines_over<[r]>(
+  c: tables::Cache,
+  names: List<String>,
+) -> List<{ name: String, record: Record }> / {fs.read[r]} =
+  fold(names, [], |acc: List<{ name: String, record: Record }>, name: String|
+    match tables::review[r](c, name).value {
+      None -> acc,
+      Some(rv) ->
+        push(acc, {
+          name: name,
+          record: { def_hash: hex_of(rv.def), specs: map(rv.specs, hex_of) },
+        }),
+    })
+
+fn baselines_of(
+  kept: Option<Kept>,
+  names: List<String>,
+) -> List<{ name: String, record: Record }> / {fs.read[cwd], fs.read[abs]} =
+  match kept {
+    None -> [],
+    Some(k) -> if k.place.label == "cwd" { baselines_over[cwd](k.cache, names) }
+    else { baselines_over[abs](k.cache, names) },
+  }
+
+fn accepted_of(
+  kept: Option<Kept>,
+  records: List<{ name: String, record: Record }>,
+) -> { kept: Option<Kept>, accepted: Accepted } / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} =
+  match kept {
+    None -> { kept: None, accepted: { definitions: len(records), stored: false, warnings: [] } },
+    Some(k) -> {
+      let w = flushed(
+        k,
+        fold(records, k.cache, |c: tables::Cache, r: { name: String, record: Record }|
+          tables::put_review(c, r.name, {
+            def: bytes_of_hex(r.record.def_hash),
+            specs: map(r.record.specs, bytes_of_hex),
+          })),
+      );
+      {
+        kept: w.kept,
+        accepted: {
+          definitions: len(records),
+          stored: !fold(w.diags, false, |hit: Bool, d: Diag| hit || d.code == b"W0601"),
+          warnings: w.diags,
+        },
+      }
+    },
+  }
+
+// The prover's reads and writes, over the store a run opened: evidence by key, its own or the
+// upstream's.
+pub fn with_evidence<a | e>(
+  kept: Option<Kept>,
+  go: () -> a / {proofs.cached, proofs.record | e},
+) -> a / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
+  with_cell[store](kept) { held -> {
+    handle {
+      go()
+    } with {
+      proofs.cached(keys) -> cached_of(cell_get(held), keys),
+      proofs.record(entries) -> {
+        let w = recorded(cell_get(held), entries);
+        cell_set(held, w.kept);
+        w.diags
+      },
+    }
+  } }
+
+// The same, and the baseline a reader accepted for each definition.
+pub fn with_review<a | e>(
+  kept: Option<Kept>,
+  go: () -> a / {proofs.cached, proofs.record, proofs.baselines, proofs.accepted | e},
+) -> a / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
+  with_cell[store](kept) { held -> {
+    handle {
+      go()
+    } with {
+      proofs.cached(keys) -> cached_of(cell_get(held), keys),
+      proofs.record(entries) -> {
+        let w = recorded(cell_get(held), entries);
+        cell_set(held, w.kept);
+        w.diags
+      },
+      proofs.baselines(names) -> baselines_of(cell_get(held), names),
+      proofs.accepted(records) -> {
+        let a = accepted_of(cell_get(held), records);
+        cell_set(held, a.kept);
+        a.accepted
+      },
+    }
+  } }
+
+// --- Tests ------------------------------------------------------------------
+
+fn hx(s: String) -> String = hex_of(bytes_blake3(bytes_of_string(s)))
+
+// A body that is its own component, filed under the hash of its payload.
+fn solo(payload: String) -> { hash: Bytes, body: Bytes } = {
+  let body = byte_of_int(0) ++ bytes_of_string(payload);
+  { hash: match body_key(body) { Some(k) -> k, None -> b"" }, body: body }
+}
+
+fn a_filing() -> Filing =
+  {
+    passes: [hx("t key")],
+    records: [
+      {
+        key: "m.t",
+        record: { test: hx("t"), closure: [{ name: "m.f", hash: hx("f") }], decls: [] },
+      },
+    ],
+    seen: [hx("f")],
+  }
+
+// What a later run reads back of a filing, beside a body filed before it.
+fn read_back(
+  f: Filing,
+) -> { outcomes: List<Option<String>>, seen: List<Bool>, baselines: List<Option<PassRecord>>, bodies: List<Option<Bytes>> } = {
+  let b = solo("old f");
+  on_twin(mem_empty(), || {
+    let c0 = tables::put_body[mem](tables::open_cache[mem]("cache", "", []), b.hash, {
+      encoding: body_encoding(),
+      bytes: b.body,
+    });
+    let c1 = tables::flush_cache[mem](noted[mem](c0, f));
+    let r = tables::open_cache[mem]("cache", "", []);
+    {
+      outcomes: outcomes_over[mem](r, [hx("t key"), hx("other")]).value,
+      seen: seen_over[mem](r, [hx("f"), hx("g")]),
+      baselines: pass_records_over[mem](r, ["m.t", "m.u"]).value,
+      bodies: bodies_over[mem](r, [hex_of(b.hash), hx("missing")]).value,
+    }
+  }).value
+}
+
+test "a run's passes, baselines and sightings are kept, and read back by key" {
+  let back = read_back(a_filing());
+  assert_eq(back.outcomes, [Some("passed"), None]);
+  assert_eq(back.seen, [true, false]);
+  assert_eq(back.baselines, [
+    Some({ test: hx("t"), closure: [{ name: "m.f", hash: hx("f") }], decls: [] }),
+    None,
+  ]);
+  assert_eq(back.bodies, [Some(solo("old f").body), None])
+}
+
+test "a filing of nothing keeps nothing" {
+  let back = read_back({ passes: [], records: [], seen: [] });
+  assert_eq(back.outcomes, [None, None]);
+  assert_eq(back.seen, [false, false]);
+  assert_eq(back.baselines, [None, None])
+}
