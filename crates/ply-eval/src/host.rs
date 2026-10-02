@@ -241,6 +241,11 @@ impl HostRegistry {
         let rows = resolve(&self.entries, &self.withheld, check)?;
         let footprint = Footprint::from_atoms(rows.iter().map(|r| r.atom.clone()));
         let atoms = rows.iter().map(|r| r.atom.clone()).collect();
+        let nondeterministic = rows
+            .iter()
+            .filter(|r| !r.deterministic)
+            .map(|r| r.atom.clone())
+            .collect();
         let index = rows
             .iter()
             .enumerate()
@@ -256,6 +261,7 @@ impl HostRegistry {
             listing,
             footprint,
             atoms,
+            nondeterministic,
             index,
             bound: true,
         })
@@ -495,6 +501,7 @@ pub struct HostBinding {
     listing: HostListing,
     footprint: Footprint,
     atoms: BTreeSet<EffectAtom>,
+    nondeterministic: BTreeSet<EffectAtom>,
     /// Triple -> index into `listing.rows`.
     index: BTreeMap<RowKey, usize>,
     bound: bool,
@@ -529,6 +536,7 @@ impl HostBinding {
             listing: HostListing::default(),
             footprint: Footprint::empty(),
             atoms: BTreeSet::new(),
+            nondeterministic: BTreeSet::new(),
             index: BTreeMap::new(),
             bound: false,
         }
@@ -547,8 +555,11 @@ impl HostBinding {
         self.atoms.iter().any(|row| atom.covers(row))
     }
 
+    /// Only a nondeterministic handler makes a run unrepeatable.
     pub fn reaches(&self, footprint: &Footprint) -> bool {
-        footprint.atoms().any(|a| self.serves(a))
+        footprint
+            .atoms()
+            .any(|a| self.nondeterministic.iter().any(|row| a.covers(row)))
     }
 
     pub fn listing(&self) -> &HostListing {
@@ -631,6 +642,7 @@ pub struct HostUse {
     pub atoms: Footprint,
     /// Every host operation answered, `Repeatable` ones included.
     pub operations: u64,
+    pub nondeterministic: u64,
 }
 
 impl HostUse {
@@ -638,9 +650,22 @@ impl HostUse {
         self.operations == 0
     }
 
-    pub fn record(&mut self, atom: &EffectAtom) {
+    pub fn acted(&self) -> bool {
+        self.nondeterministic > 0
+    }
+
+    pub fn record(&mut self, atom: &EffectAtom, determinism: Determinism) {
         self.atoms = self.atoms.union(&Footprint::from_atoms([atom.clone()]));
         self.operations += 1;
+        if !determinism.is_deterministic() {
+            self.nondeterministic += 1;
+        }
+    }
+
+    pub fn absorb(&mut self, other: &HostUse) {
+        self.atoms = self.atoms.union(&other.atoms);
+        self.operations += other.operations;
+        self.nondeterministic += other.nondeterministic;
     }
 }
 

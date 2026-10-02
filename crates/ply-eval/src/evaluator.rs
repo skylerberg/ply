@@ -276,8 +276,7 @@ impl<'a> Machine<'a> {
             self.trace.record(atom);
         }
         let (used, ops) = self.compiled.take_host_use();
-        self.host_use.atoms = self.host_use.atoms.union(&used.atoms);
-        self.host_use.operations += used.operations;
+        self.host_use.absorb(&used);
         self.host_ops = self.host_ops.saturating_add(ops);
     }
 

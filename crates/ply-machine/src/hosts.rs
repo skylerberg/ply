@@ -37,6 +37,14 @@ pub fn privileged_op(effect: &str, op: &str, linearity: Linearity, path: &'stati
     }
 }
 
+/// One operation of a hermetic half, served by a deterministic handler.
+pub fn hermetic_op(effect: &str, op: &str, linearity: Linearity, path: &'static str) -> HostOp {
+    HostOp {
+        determinism: Determinism::Deterministic,
+        ..privileged_op(effect, op, linearity, path)
+    }
+}
+
 /// A perform of a privileged family's operation that its handler does not serve.
 #[cold]
 pub fn unserved(effect: &str, op: &str, span: Span) -> Diagnostic {
@@ -665,29 +673,52 @@ const SHUTDOWN_DOMAIN: &[u8] = b"ply.hosts.shutdown.v1\0";
 /// else: what a run would bind is assembled here, and the program is handed what it says.
 const EFFECT: &str = "tcb";
 
+/// A preview that would read a credential or a root off the disk is refused.
+const HERMETIC: &str = "hermetic_tcb";
+
 const OPERATIONS: [(&str, &str); 2] = [
     ("schema", "ply_machine::hosts::schema"),
     ("preview", "ply_machine::hosts::preview"),
 ];
 
+const HERMETIC_OPERATIONS: [(&str, &str); 2] = [
+    ("schema", "ply_machine::hosts::hermetic::schema"),
+    ("preview", "ply_machine::hosts::hermetic::preview"),
+];
+
 /// `module` is where the program lent it declares `tcb`, which is where `Stage` is declared too.
 pub fn lent(module: &str) -> Vec<Lent> {
+    let mut ops = lent_by(module, false);
+    ops.extend(lent_by(module, true));
+    ops
+}
+
+fn lent_by(module: &str, hermetic: bool) -> Vec<Lent> {
     let facility: Arc<dyn HostHandler> = Arc::new(Facility {
         module: module.to_string(),
+        hermetic,
     });
-    OPERATIONS
+    let operations = if hermetic {
+        HERMETIC_OPERATIONS
+    } else {
+        OPERATIONS
+    };
+    operations
         .into_iter()
         .map(|(op, path)| {
-            (
-                privileged_op(EFFECT, op, Linearity::Repeatable, path),
-                Arc::clone(&facility),
-            )
+            let op = if hermetic {
+                hermetic_op(HERMETIC, op, Linearity::Repeatable, path)
+            } else {
+                privileged_op(EFFECT, op, Linearity::Repeatable, path)
+            };
+            (op, Arc::clone(&facility))
         })
         .collect()
 }
 
 struct Facility {
     module: String,
+    hermetic: bool,
 }
 
 impl HostHandler for Facility {
@@ -698,11 +729,12 @@ impl HostHandler for Facility {
                 let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
                 let front = crate::driver::handed_front_of(front, span)?;
                 let name = name.as_str(span, "a definition's name")?;
-                crate::config::schema_answer(schema(&path, &front, name))
+                crate::config::schema_answer(schema(&path, &front, name, self.hermetic))
             }
             ("preview", [path, options, front, config]) => {
                 let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
-                let options = crate::drive::run_options_of(options, span)?;
+                let mut options = crate::drive::run_options_of(options, span)?;
+                options.hermetic = self.hermetic;
                 let front = crate::driver::handed_front_of(front, span)?;
                 let configuration = Configuration::of(config, span)?;
                 Assembled::of(&path, &options, &front, configuration).preview(&self.module)
@@ -719,8 +751,9 @@ fn schema(
     path: &std::path::Path,
     front: &crate::driver::HandedFront,
     name: &str,
+    hermetic: bool,
 ) -> Result<ply_eval::Plain, Diagnostic> {
-    let loaded = crate::driver::load_over_front(path, front).map_err(|err| {
+    let loaded = loaded_over(path, front, hermetic).map_err(|err| {
         err.diagnostics.into_iter().next().unwrap_or_else(|| {
             Diagnostic::error(
                 ply_eval::codes::INTERNAL_ERROR,
@@ -753,7 +786,7 @@ impl Assembled {
         front: &crate::driver::HandedFront,
         configuration: Configuration,
     ) -> Assembled {
-        let loaded = match crate::driver::load_over_front(path, front) {
+        let loaded = match loaded_over(path, front, options.hermetic) {
             Ok(loaded) => loaded,
             Err(err) => {
                 return Assembled::refused(
@@ -844,11 +877,29 @@ struct Bound {
 /// The stage that refused, and why.
 type Refusal = (&'static str, Vec<Diagnostic>);
 
+/// The root is decided lexically when nothing may be read off the disk.
+fn loaded_over(
+    path: &std::path::Path,
+    front: &crate::driver::HandedFront,
+    hermetic: bool,
+) -> Result<crate::load::Loaded, crate::load::LoadError> {
+    if hermetic {
+        crate::driver::load_over_front_in(crate::load::tidy(path), front)
+    } else {
+        crate::driver::load_over_front(path, front)
+    }
+}
+
 fn bind(
     args: &crate::drive::RunOptions,
     loaded: &crate::load::Loaded,
     configuration: Configuration,
 ) -> Result<Bound, Refusal> {
+    if args.hermetic
+        && !(args.tls.tls.is_empty() && args.tls.trust.is_empty() && args.fs.is_empty())
+    {
+        return Err(("NotBound", vec![hermetic_disk()]));
+    }
     // Whether or not `--host` was passed: a digest that moved with a flag would pin nothing.
     let trace = args.trace.open();
     let stopping = ply_host::signal::Shutdown::new(args.shutdown.bounds());
@@ -882,6 +933,17 @@ fn bind(
         listing,
         hermetic: binding.is_hermetic(),
     })
+}
+
+#[cold]
+fn hermetic_disk() -> Diagnostic {
+    Diagnostic::error(
+        ply_eval::codes::CAPABILITY_UNDECLARED,
+        format!(
+            "`{HERMETIC}` reads nothing off the disk, and the run names a credential or a root"
+        ),
+    )
+    .note("a preview of `--tls`, `--trust` or `--fs` reads files, and performs `tcb`")
 }
 
 // --- The payload -------------------------------------------------------------

@@ -436,6 +436,24 @@ fn reaches_is_footprint_intersection() {
     assert!(!binding.reaches(&Footprint::empty()));
 }
 
+#[test]
+fn a_footprint_that_reaches_only_deterministic_handlers_reaches_nothing_that_acts() {
+    let deterministic = HostOp {
+        determinism: Determinism::Deterministic,
+        ..op("db", "get", HostResource::Any)
+    };
+    let binding = registry(vec![deterministic])
+        .bind(&check(DB))
+        .expect("binds");
+    let touched = Footprint::from_atoms([EffectAtom::new(
+        "db",
+        Resource::Named(Symbol::new("users")),
+        ply_eval::Mode::Read,
+    )]);
+    assert!(!binding.is_hermetic(), "the handler is bound");
+    assert!(!binding.reaches(&touched));
+}
+
 /// CI diffs the digest, so every column has to move it.
 #[test]
 fn the_digest_covers_every_column() {
@@ -653,11 +671,16 @@ fn host_use_records_what_actually_happened() {
         Resource::Named(Symbol::new("users")),
         ply_eval::Mode::Read,
     );
-    use_.record(&atom);
-    use_.record(&atom);
+    use_.record(&atom, Determinism::Deterministic);
+    assert!(
+        !use_.acted(),
+        "a deterministic handler answers a re-run the same"
+    );
+    use_.record(&atom, Determinism::Nondeterministic);
     assert_eq!(use_.operations, 2, "operations count, atoms deduplicate");
     assert_eq!(use_.atoms.atoms().count(), 1);
     assert!(!use_.is_empty());
+    assert!(use_.acted());
 }
 
 #[test]
