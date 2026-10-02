@@ -125,7 +125,12 @@ fn key_over(cc: &str, level: &str, pieces: &[&str]) -> String {
 /// twenty-nine megabytes of C to discover the name of an object it already has.
 pub(super) fn open_by_key(key: &str) -> Option<Library> {
     let path = cache_dir().join(format!("{key}.{}", ext()));
-    path.is_file().then(|| Library::open(&path).ok()).flatten()
+    let library = path
+        .is_file()
+        .then(|| Library::open(&path).ok())
+        .flatten()?;
+    super::sweep::used(&path);
+    Some(library)
 }
 
 /// The key an assembled source and the current compiler settle on, so it can be recorded beside
@@ -242,6 +247,7 @@ pub(super) fn compile_and_load_timed(source: &str, stem: &str) -> Result<(Librar
     if cached.is_file()
         && let Ok(library) = Library::open(&cached)
     {
+        super::sweep::used(&cached);
         return Ok((library, Duration::ZERO));
     }
     // A directory of its own per build, not per process. A run compiles the unit once per worker
@@ -336,7 +342,9 @@ fn objects_of(
             "{}.o",
             key_over(toolchain.cc, toolchain.level, &[parts.header, *text])
         ));
-        if !target.is_file() {
+        if target.is_file() {
+            super::sweep::used(&target);
+        } else {
             missing.push((objects.len(), label.as_str(), *text, target.clone()));
         }
         objects.push(target);
