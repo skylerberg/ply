@@ -47,11 +47,12 @@ use std::sync::{Arc, Mutex};
 /// `machine.bound[m](..)`, `machine.enter[m]()`, `machine.reload[m]()`, `machine.drop[m]()`.
 pub const EFFECT: &str = "machine";
 
-const OPERATIONS: [(&str, &str); 9] = [
+const OPERATIONS: [(&str, &str); 10] = [
     ("configure", "ply_machine::configure"),
     ("load", "ply_machine::load"),
     ("reuse", "ply_machine::reuse"),
     ("reload", "ply_machine::reload"),
+    ("schema", "ply_machine::schema"),
     ("bound", "ply_machine::bound"),
     ("enter", "ply_machine::enter"),
     ("call", "ply_machine::call"),
@@ -154,8 +155,13 @@ impl Drop for Labelled {
 /// The steps' answers cross as plain data; a `Value` is not `Send`, so the handler thread builds
 /// the one the program reads.
 enum Go {
+    Schema {
+        name: String,
+        reply: Sender<Result<ply_eval::Plain, Diagnostic>>,
+    },
     Bound {
         entry: String,
+        configuration: crate::config::Configuration,
         reply: Sender<Result<drive::Disclosed, drive::Refused>>,
     },
     Enter {
@@ -192,10 +198,21 @@ impl HostHandler for Site {
                     Err(refused) => refused_value(&refused),
                 }
             }
-            ("bound", [entry]) => {
+            ("schema", [name]) => {
+                let name = name.as_str(span, "a definition's name")?.to_string();
+                let answer: Result<ply_eval::Plain, Diagnostic> =
+                    self.ask(&label, span, |reply| Go::Schema { name, reply })?;
+                crate::config::schema_answer(answer)
+            }
+            ("bound", [entry, config]) => {
                 let entry = entry.as_str(span, "an entry point's name")?.to_string();
+                let configuration = crate::config::Configuration::of(config, span)?;
                 let answer: Result<drive::Disclosed, drive::Refused> =
-                    self.ask(&label, span, |reply| Go::Bound { entry, reply })?;
+                    self.ask(&label, span, |reply| Go::Bound {
+                        entry,
+                        configuration,
+                        reply,
+                    })?;
                 match answer {
                     Ok(disclosed) => ok(drive::disclosed_value(&disclosed)),
                     Err(refused) => refused_value(&refused),
@@ -502,8 +519,15 @@ fn serve(
 fn park(mut drive: drive::Drive, hearing: mpsc::Receiver<Go>) {
     while let Ok(go) = hearing.recv() {
         match go {
-            Go::Bound { entry, reply } => {
-                let _ = reply.send(drive.bound(&entry));
+            Go::Schema { name, reply } => {
+                let _ = reply.send(drive.schema(&name));
+            }
+            Go::Bound {
+                entry,
+                configuration,
+                reply,
+            } => {
+                let _ = reply.send(drive.bound(&entry, configuration));
             }
             Go::Enter { reply } => {
                 let _ = reply.send(drive.enter());

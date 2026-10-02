@@ -28,12 +28,20 @@ nondet effect machine {
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
-  read bound[m](entry: String) -> Result<Bound, Refusal>
+  read schema[m](name: String) -> Result<Value, List<Diag>>
+  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
+
+type Configured = {
+  values: List<{ key: String, value: String, secret: Bool }>,
+  schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
+  opened: Bool,
+}
+fn unconfigured() -> Configured = { values: [], schema: None, opened: false }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Raised = { diag: Diag, values: List<Value> }
@@ -83,11 +91,9 @@ type Bound = {
   hermetic: Bool,
   operations: Int,
   digest: String,
-  config: Option<String>,
   trace: Option<String>,
   database: Option<String>,
   signals: Option<Signals>,
-  warnings: List<Diag>,
 }
 
 type Front = {
@@ -118,13 +124,12 @@ type Ended = {
   trace: Option<Trace>,
   handshakes: List<String>,
   hosts: Json,
-  configuration: Json,
 }
 
 fn main(root: String, front: Front) -> Ended / {machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
   match machine.load[m](root, Some(front), None) {
     Ok(_t) -> {
-      match machine.bound[m]("inner.main") {
+      match machine.bound[m]("inner.main", unconfigured()) {
         Ok(_b) -> {
           let ended = machine.enter[m]();
           machine.drop[m]();
@@ -306,12 +311,20 @@ nondet effect machine {
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
-  read bound[m](entry: String) -> Result<Bound, Refusal>
+  read schema[m](name: String) -> Result<Value, List<Diag>>
+  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
+
+type Configured = {
+  values: List<{ key: String, value: String, secret: Bool }>,
+  schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
+  opened: Bool,
+}
+fn unconfigured() -> Configured = { values: [], schema: None, opened: false }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
@@ -347,7 +360,7 @@ type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
 
 fn main(root: String, front: Front) -> Called / {machine.load[m], machine.bound[m], machine.call[m], machine.drop[m]} = {
   let _loaded = machine.load[m](root, Some(front), None);
-  let _bound = machine.bound[m]("inner.main");
+  let _bound = machine.bound[m]("inner.main", unconfigured());
   let called = machine.call[m]("inner.main", []);
   machine.drop[m]();
   called
@@ -455,12 +468,20 @@ nondet effect machine {
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
-  read bound[m](entry: String) -> Result<Bound, Refusal>
+  read schema[m](name: String) -> Result<Value, List<Diag>>
+  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
+
+type Configured = {
+  values: List<{ key: String, value: String, secret: Bool }>,
+  schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
+  opened: Bool,
+}
+fn unconfigured() -> Configured = { values: [], schema: None, opened: false }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
@@ -509,11 +530,9 @@ type Bound = {
   hermetic: Bool,
   operations: Int,
   digest: String,
-  config: Option<String>,
   trace: Option<String>,
   database: Option<String>,
   signals: Option<Signals>,
-  warnings: List<Diag>,
 }
 
 type Front = {
@@ -529,7 +548,7 @@ type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String
 type Ended = { exit: Option<Int>, value: Option<Value>, raised: Option<Raised>, rest: Int }
 
 fn once() -> Option<Value> / {machine.bound[m], machine.enter[m]} = {
-  let _b = machine.bound[m]("inner.main");
+  let _b = machine.bound[m]("inner.main", unconfigured());
   (machine.enter[m]()).value
 }
 
@@ -601,12 +620,20 @@ nondet effect machine {
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
-  read bound[m](entry: String) -> Result<Bound, Refusal>
+  read schema[m](name: String) -> Result<Value, List<Diag>>
+  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
+
+type Configured = {
+  values: List<{ key: String, value: String, secret: Bool }>,
+  schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
+  opened: Bool,
+}
+fn unconfigured() -> Configured = { values: [], schema: None, opened: false }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
@@ -686,11 +713,9 @@ type Bound = {
   hermetic: Bool,
   operations: Int,
   digest: String,
-  config: Option<String>,
   trace: Option<String>,
   database: Option<String>,
   signals: Option<Signals>,
-  warnings: List<Diag>,
 }
 type Front = {
   dump: Bytes,
@@ -739,7 +764,7 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
   match machine.load[m](root, Some(front), None) {
     Err(_) -> false,
     Ok(_t) -> {
-      let bound = machine.bound[m]("inner.main");
+      let bound = machine.bound[m]("inner.main", unconfigured());
       match bound {
         Err(_) -> false,
         Ok(b) -> {
@@ -791,12 +816,20 @@ nondet effect machine {
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
-  read bound[m](entry: String) -> Result<Bound, Refusal>
+  read schema[m](name: String) -> Result<Value, List<Diag>>
+  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
+
+type Configured = {
+  values: List<{ key: String, value: String, secret: Bool }>,
+  schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
+  opened: Bool,
+}
+fn unconfigured() -> Configured = { values: [], schema: None, opened: false }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
@@ -833,7 +866,7 @@ type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
 fn main(root: String, front: Front) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
   match machine.load[m](root, Some(front), None) {
-    Ok(_) -> match machine.bound[m]("inner.main") {
+    Ok(_) -> match machine.bound[m]("inner.main", unconfigured()) {
       Ok(_) -> {
         let doubled = machine.call[m]("inner.double", [VInt(21)]);
         let first = machine.accounting[m]();
@@ -938,12 +971,20 @@ nondet effect machine {
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
-  read bound[m](entry: String) -> Result<Bound, Refusal>
+  read schema[m](name: String) -> Result<Value, List<Diag>>
+  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Called
   read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
+
+type Configured = {
+  values: List<{ key: String, value: String, secret: Bool }>,
+  schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
+  opened: Bool,
+}
+fn unconfigured() -> Configured = { values: [], schema: None, opened: false }
 
 type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
@@ -985,7 +1026,7 @@ fn answered(c: Called) -> Int =
 
 fn main(root: String, front: Front) -> Spent / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
   let _loaded = machine.load[m](root, Some(front), None);
-  let _bound = machine.bound[m]("inner.main");
+  let _bound = machine.bound[m]("inner.main", unconfigured());
   let first = answered(machine.call[m]("inner.constant", []));
   let ran = spent();
   let again = answered(machine.call[m]("inner.constant", []));

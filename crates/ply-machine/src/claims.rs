@@ -13,7 +13,7 @@ use crate::engine::{Interleaved, Judgement, Mode, Obligation};
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
 use crate::payload::{ctor, diags_value, places_value, record, strings};
-use crate::support::{enter_constant, prover_backend};
+use crate::support::prover_backend;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
@@ -55,9 +55,10 @@ fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     ctor(home, name, args)
 }
 
-const OPERATIONS: [(&str, &str); 6] = [
+const OPERATIONS: [(&str, &str); 7] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
+    ("schema", "ply_machine::claims::schema"),
     ("prepared", "ply_machine::claims::prepared"),
     ("judged", "ply_machine::claims::judged"),
     ("interleaved", "ply_machine::claims::interleaved"),
@@ -85,7 +86,6 @@ pub struct Job {
 pub struct Binding {
     pub tls: crate::options::TlsOptions,
     pub fs: Vec<ply_host::fs::RootSpec>,
-    pub config: crate::config::ConfigOptions,
     pub trace: crate::trace::TraceOptions,
 }
 
@@ -154,9 +154,11 @@ impl HostHandler for Site {
                 PlyValue::Unit
             }
             ("collected", _) => self.collected()?,
-            ("prepared", [step_budget]) => {
-                self.prepared(step_budget.as_int(span, "the calls an evaluation may make")?)?
-            }
+            ("schema", [name]) => self.schema(name.as_str(span, "a definition's name")?)?,
+            ("prepared", [step_budget, config]) => self.prepared(
+                step_budget.as_int(span, "the calls an evaluation may make")?,
+                Configuration::of(config, span)?,
+            )?,
             ("judged", [batches]) => self.judged(batches_of(batches, span)?)?,
             ("interleaved", [claim, point, seed, steps]) => self.interleaved(
                 usize::try_from(claim.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
@@ -270,16 +272,31 @@ impl Site {
         }
     }
 
-    /// Binds the hosts and builds the prover a discharge runs against, once, each evaluation of a
-    /// claim bounded by `step_budget` calls, and answers what opening the hosts had to say.
-    fn prepared(&self, step_budget: i64) -> Result<PlyValue, Diagnostic> {
+    /// The value of the definition `--config-schema` names, entered on the program's unit.
+    fn schema(&self, name: &str) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("schema"))?;
+        machine.ask(Go::Schema(name.to_string()))?;
+        match machine.step()? {
+            Step::Schema(answer) => Ok(crate::config::schema_answer(answer)),
+            _ => Err(out_of_step("schema")),
+        }
+    }
+
+    /// Binds the hosts, answering `config` as the program resolved it, and builds the prover a
+    /// discharge runs against, once, each evaluation of a claim bounded by `step_budget` calls.
+    fn prepared(
+        &self,
+        step_budget: i64,
+        configuration: Configuration,
+    ) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("prepared"))?;
-        machine.ask(Go::Prepare(step_budget))?;
+        machine.ask(Go::Prepare(step_budget, configuration))?;
         match machine.step()? {
             Step::Prepared(answer) => Ok(self.answered((*answer).map(|ready| {
                 *self.judging.write().unwrap_or_else(|e| e.into_inner()) = Some(ready.judging);
-                diags_value(&ready.warnings)
+                PlyValue::Unit
             }))),
             _ => Err(out_of_step("prepared")),
         }
@@ -347,13 +364,16 @@ impl Site {
 
 /// What the program asks the machine for next.
 enum Go {
-    /// Bind the hosts and build the prover a discharge runs against, with the calls each
-    /// evaluation of a claim may make.
-    Prepare(i64),
+    /// Enter the definition `--config-schema` names on the program's unit.
+    Schema(String),
+    /// Bind the hosts over the configuration the program resolved and build the prover a
+    /// discharge runs against, with the calls each evaluation of a claim may make.
+    Prepare(i64, Configuration),
 }
 
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
+    Schema(Result<ply_eval::Plain, Diagnostic>),
     Prepared(Box<Result<Ready, Refused>>),
 }
 
@@ -427,18 +447,29 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
         host: job.binding.is_some(),
     }))));
 
-    // Built by the first step that runs an obligation, and kept: every batch a discharge judges
-    // is judged by the same prover over the same hosts.
+    // Built by the first step that needs one and kept: the schema and every batch a discharge
+    // judges run on the same unit, and the batches over the same hosts.
+    let mut backend: Option<Result<&'static dyn ply_eval::Provider, Diagnostic>> = None;
     let mut prepared: Option<Result<Prepared, Refused>> = None;
     loop {
         match asked.recv() {
-            Ok(Go::Prepare(step_budget)) => {
+            Ok(Go::Schema(name)) => {
+                let built = backend.get_or_insert_with(|| prover_backend(&loaded));
+                let answer = match built {
+                    Ok(unit) => crate::config::schema_of(&loaded.check, Some(*unit), &name),
+                    Err(diagnostic) => Err(diagnostic.clone()),
+                };
+                let _ = told.send(Step::Schema(answer));
+            }
+            Ok(Go::Prepare(step_budget, configuration)) => {
                 if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, step_budget));
+                    let built = backend
+                        .get_or_insert_with(|| prover_backend(&loaded))
+                        .clone();
+                    prepared = Some(prepare(&job, &loaded, built, step_budget, configuration));
                 }
                 let answer = match prepared.as_ref() {
                     Some(Ok(ready)) => Ok(Ready {
-                        warnings: ready.warnings.clone(),
                         judging: Arc::clone(&ready.judging),
                     }),
                     Some(Err(refused)) => Err(refused.clone()),
@@ -481,8 +512,6 @@ struct Prepared {
     /// Kept alive for the prover's lifetime, which is the run's.
     _hosts: Option<Hosts>,
     judging: Arc<Judging>,
-    /// What opening the hosts had to say, reported by the discharge that reads them.
-    warnings: Vec<Diagnostic>,
 }
 
 impl Drop for Prepared {
@@ -494,7 +523,6 @@ impl Drop for Prepared {
 
 /// What preparing answers: what opening the hosts had to say, and the prover it built.
 struct Ready {
-    warnings: Vec<Diagnostic>,
     judging: Arc<Judging>,
 }
 
@@ -569,34 +597,32 @@ impl Judging {
     }
 }
 
-fn prepare(job: &Job, loaded: &Loaded, step_budget: i64) -> Result<Prepared, Refused> {
+fn prepare(
+    job: &Job,
+    loaded: &Loaded,
+    backend: Result<&'static dyn ply_eval::Provider, Diagnostic>,
+    step_budget: i64,
+    configuration: Configuration,
+) -> Result<Prepared, Refused> {
     let unbound = |diagnostics: Vec<Diagnostic>| Refused {
         why: Why::Unbound,
         diagnostics,
         sources: loaded.sources.clone(),
     };
-    let backend = prover_backend(loaded).map_err(|d| unbound(vec![d]))?;
-    let constant = |name: &str| enter_constant(Some(backend), name);
-    let mut warnings = Vec::new();
+    let backend = backend.map_err(|d| unbound(vec![d]))?;
     let hosts = match &job.binding {
         None => None,
-        Some(binding) => {
-            let (configuration, opened) =
-                Configuration::open(&loaded.check, true, &binding.config, &constant)
-                    .map_err(&unbound)?;
-            warnings.extend(opened);
-            Some(
-                Hosts::open(
-                    &loaded.check,
-                    true,
-                    &binding.tls,
-                    &binding.fs,
-                    configuration,
-                    &binding.trace,
-                )
-                .map_err(&unbound)?,
+        Some(binding) => Some(
+            Hosts::open(
+                &loaded.check,
+                true,
+                &binding.tls,
+                &binding.fs,
+                configuration,
+                &binding.trace,
             )
-        }
+            .map_err(&unbound)?,
+        ),
     };
     let hosting = hosts.as_ref().map(|hosts| crate::engine::Hosting {
         binding: hosts.binding(),
@@ -611,7 +637,6 @@ fn prepare(job: &Job, loaded: &Loaded, step_budget: i64) -> Result<Prepared, Ref
             open: AtomicBool::new(true),
             ended: Mutex::new(Vec::new()),
         }),
-        warnings,
     })
 }
 
@@ -817,7 +842,7 @@ fn unread_world(why: &ply_eval::decode::Error, span: Span) -> Diagnostic {
 
 /// The job record as the program builds it from the parsed line, read field by field.
 fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
-    use crate::payload::{field_of, opt_str_at, str_list_at};
+    use crate::payload::{field_of, str_list_at};
     let bool_at = |name: &str| field_of(v, name, span)?.as_bool(span, name);
     let str_at = |name: &str| {
         field_of(v, name, span)?
@@ -848,7 +873,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
                 path: PathBuf::from(field_of(item, "path", span)?.as_str(span, "a path")?),
             });
         }
-        let config = field_of(v, "config", span)?;
         let trace = field_of(v, "trace", span)?;
         Some(Binding {
             tls: crate::options::TlsOptions {
@@ -859,14 +883,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
                     .collect(),
             },
             fs,
-            config: crate::config::ConfigOptions {
-                set: str_list_at(config, "set", span)?,
-                files: str_list_at(config, "files", span)?
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .collect(),
-                schema: opt_str_at(config, "schema", span)?,
-            },
             trace: crate::trace::TraceOptions {
                 sink: match field_of(trace, "sink", span)?.as_str(span, "the trace sink")? {
                     "text" => crate::trace::SinkArg::Text,

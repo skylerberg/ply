@@ -15,10 +15,17 @@ import std.value (Value)
 nondet effect tester {
   write configure[r](options: Options) -> Unit
   write unit[r](front: Front, build: Bool, hosted: Bool) -> Result<Int, List<Diag>>
-  write bound[r]() -> Result<List<Diag>, List<Diag>>
+  read schema[r](name: String) -> Result<Value, List<Diag>>
+  write bound[r](config: Configured) -> Result<Unit, List<Diag>>
   read hosted[r]() -> Hosted
   write ended[r]() -> Unit
   read executed[r](unit: Int, index: Int) -> Executed
+}
+
+type Configured = {
+  values: List<{ key: String, value: String, secret: Bool }>,
+  schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
+  opened: Bool,
 }
 
 type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
@@ -117,7 +124,7 @@ fn main(root: String, front: Front) -> String / {
   tester.configure[r](options(root));
   match tester.unit[r](front, true, true) {
     Err(_) -> "no unit",
-    Ok(u) -> match tester.bound[r]() {
+    Ok(u) -> match tester.bound[r]({ values: [], schema: None, opened: false }) {
       Err(_) -> "unbound",
       Ok(_) -> {
         let adds = tester.executed[r](u, 0);

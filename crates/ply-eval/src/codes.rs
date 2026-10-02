@@ -65,11 +65,8 @@ pub const TLS_CREDENTIAL_UNKNOWN: &str = "E0429";
 pub const TLS_CREDENTIAL_INVALID: &str = "E0430";
 /// A `Secret` passed to a host operation whose registration does not accept one.
 pub const SECRET_TO_HOST: &str = "E0439";
-/// A `--config` file or `--set` that cannot be read or is not `KEY=VALUE`.
+/// A configuration source, or the `--config-schema` definition, that the run cannot read.
 pub const CONFIG_UNAVAILABLE: &str = "E0440";
-/// A key the run's `--config-schema` marks `required` that no source supplies.
-pub const CONFIG_MISSING: &str = "E0441";
-pub const CONFIG_INVALID: &str = "E0442";
 /// A deployable artifact whose contents do not verify against its own digests.
 pub const ARTIFACT_INVALID: &str = "E0443";
 /// An artifact built under a different frontend, runtime or body-encoding version.
@@ -113,8 +110,6 @@ pub const CACHE_CORRUPT: &str = "W0602";
 pub const CACHE_VERSION_CHANGED: &str = "W0603";
 /// The stdlib shipped with this compiler differs from the one the cache was written under.
 pub const STDLIB_CHANGED: &str = "W0605";
-/// An explicitly supplied configuration key the run's schema does not declare.
-pub const CONFIG_UNDECLARED: &str = "W0607";
 /// The drain deadline expired with connections still in flight.
 pub const DRAIN_INCOMPLETE: &str = "W0608";
 /// Spans still open when their task or the entry point ended, reported when the entry point ends.

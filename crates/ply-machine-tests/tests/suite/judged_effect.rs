@@ -16,7 +16,8 @@ import std.value (Value, VInt, render)
 nondet effect prover {
   write configure[claims](options: Options, front: Front, world: World) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
-  read prepared[claims](step_budget: Int) -> Result<List<Diag>, Refusal>
+  read schema[claims](name: String) -> Result<Value, List<Diag>>
+  read prepared[claims](step_budget: Int, config: Configured) -> Result<Unit, Refusal>
   read cached[claims](keys: List<String>) -> List<Option<String>>
   read judged[claims](batches: List<Batch>) -> List<List<Judged>>
   read interleaved[claims](claim: Int, point: List<Value>, seed: Seed, steps: Int) -> LawRun
@@ -24,6 +25,12 @@ nondet effect prover {
   write record[claims](entries: List<{ key: String, evidence: String }>) -> List<Diag>
   read baselines[claims](names: List<String>) -> List<Baseline>
   write accepted[claims](records: List<Baseline>) -> Accepted
+}
+
+type Configured = {
+  values: List<{ key: String, value: String, secret: Bool }>,
+  schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
+  opened: Bool,
 }
 
 // The world's vocabulary is a shape this fixture only carries: it never reads one, so it names
@@ -160,7 +167,7 @@ fn main(root: String, index: Int, front: Front, world: World) -> Answer / {prove
       measure_reduction: false,
     },
   }, front, world);
-  match (prover.collected[claims](), prover.prepared[claims](1000000000)) {
+  match (prover.collected[claims](), prover.prepared[claims](1000000000, { values: [], schema: None, opened: false })) {
     (Ok(_), Ok(_)) -> judged_at(index),
     _ -> { failed: 0 - 1, held: 0, rejected: 0, first: "" },
   }
