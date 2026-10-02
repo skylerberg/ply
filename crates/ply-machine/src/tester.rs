@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 /// The effect `crates/ply-cli/ply/tester.ply` declares.
 const EFFECT: &str = "tester";
 
+const HERMETIC: &str = "hermetic_tester";
+
 const OPERATIONS: [(&str, &str); 8] = [
     ("configure", "ply_machine::tester::configure"),
     // The programs tests run in, the schema the first one enters, the binding over it, and what
@@ -33,6 +35,17 @@ const OPERATIONS: [(&str, &str); 8] = [
     // A test once, or one interleaving of it, on whichever thread asks.
     ("executed", "ply_machine::tester::executed"),
     ("interleaved", "ply_machine::tester::interleaved"),
+];
+
+const HERMETIC_OPERATIONS: [(&str, &str); 8] = [
+    ("configure", "ply_machine::tester::hermetic::configure"),
+    ("unit", "ply_machine::tester::hermetic::unit"),
+    ("schema", "ply_machine::tester::hermetic::schema"),
+    ("bound", "ply_machine::tester::hermetic::bound"),
+    ("hosted", "ply_machine::tester::hermetic::hosted"),
+    ("ended", "ply_machine::tester::hermetic::ended"),
+    ("executed", "ply_machine::tester::hermetic::executed"),
+    ("interleaved", "ply_machine::tester::hermetic::interleaved"),
 ];
 
 /// What the binding and the budgets are read from, out of the options record the program parsed.
@@ -74,7 +87,17 @@ pub struct Session(Arc<Site>);
 
 impl Session {
     pub fn new() -> Session {
+        Session::of(false)
+    }
+
+    /// Binds no host, reads no clock, builds every unit afresh and measures nothing.
+    pub fn hermetic() -> Session {
+        Session::of(true)
+    }
+
+    fn of(hermetic: bool) -> Session {
         Session(Arc::new(Site {
+            hermetic,
             options: Mutex::new(TestOptions::default()),
             run: RwLock::new(Run::default()),
             warm: Mutex::new(None),
@@ -83,11 +106,20 @@ impl Session {
 
     pub fn lent(&self) -> Vec<Lent> {
         let site: Arc<dyn HostHandler> = Arc::clone(&self.0) as Arc<dyn HostHandler>;
+        let (effect, operations) = if self.0.hermetic {
+            (HERMETIC, HERMETIC_OPERATIONS)
+        } else {
+            (EFFECT, OPERATIONS)
+        };
         // A watching run asks for report after report from inside one entry.
-        OPERATIONS
+        operations
             .into_iter()
             .map(|(op, path)| {
-                let op = crate::hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
+                let op = if self.0.hermetic {
+                    crate::hosts::hermetic_op(effect, op, Linearity::Repeatable, path)
+                } else {
+                    crate::hosts::privileged_op(effect, op, Linearity::Repeatable, path)
+                };
                 (op, Arc::clone(&site))
             })
             .collect()
@@ -101,6 +133,7 @@ impl Default for Session {
 }
 
 struct Site {
+    hermetic: bool,
     options: Mutex<TestOptions>,
     /// The run in progress, which every thread the program runs a test on reads.
     run: RwLock<Run>,
@@ -219,12 +252,20 @@ impl Site {
     ) -> Result<PlyValue, Diagnostic> {
         let path = lock(&self.options).path.clone();
         let profile = lock(&self.options).profile.clone();
-        if let Err(diagnostic) = select_profile(&profile) {
+        // Which C compiler ran is no part of what a test answers.
+        if !self.hermetic
+            && let Err(diagnostic) = select_profile(&profile)
+        {
             return Ok(err(diags_value(&[diagnostic])));
         }
         // Read on this thread: a `Value` may not cross to another.
         let handed = crate::driver::handed_front_of(front, span)?;
-        let loaded = match crate::driver::load_over_front(&path, &handed) {
+        let root = if self.hermetic {
+            crate::load::tidy(&path)
+        } else {
+            crate::load::project_root(&path)
+        };
+        let loaded = match crate::driver::load_over_front_in(root, &handed) {
             Ok(loaded) => loaded,
             Err(refused) => return Ok(err(diags_value(&refused.diagnostics))),
         };
@@ -258,6 +299,9 @@ impl Site {
         loaded: &crate::load::Loaded,
         first: bool,
     ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+        if self.hermetic {
+            return build_backend_over(&loaded.front, module_texts(&loaded.check, &loaded.sources));
+        }
         let mut warm = lock(&self.warm);
         if first
             && let Some(held) = warm.as_ref()
@@ -298,6 +342,9 @@ impl Site {
             .first()
             .cloned()
             .ok_or_else(|| out_of_step("bound"))?;
+        if self.hermetic && options.host {
+            return Ok(err(diags_value(&[hermetic_host()])));
+        }
         let check = &unit.front.check;
         // A test is not a process: of `process` it binds only what names a program, and only the
         // programs `--exec` names, so under `--host` an unnamed label is unbound rather than withheld.
@@ -351,7 +398,11 @@ impl Site {
             .filter(|(_, t)| hosts.reaches(&t.footprint))
             .map(|(i, _)| count(i))
             .collect();
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let cores = if self.hermetic {
+            1
+        } else {
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        };
         Ok(record(vec![
             ("hermetic", PlyValue::Bool(hosts.is_hermetic())),
             ("label", PlyValue::str(hosts.label())),
@@ -371,7 +422,7 @@ impl Site {
             ("hosts", json(&hosts.summary_json())),
             ("reaches", PlyValue::list(reaches)),
             ("cores", count(cores)),
-            ("backend", compiled_value(unit.provider)),
+            ("backend", compiled_value(unit.provider, self.hermetic)),
         ]))
     }
 
@@ -399,7 +450,10 @@ impl Site {
     fn budgeted<R>(&self, f: impl FnOnce() -> R) -> R {
         let (steps, timeout) = {
             let options = lock(&self.options);
-            (options.steps, options.timeout)
+            (
+                options.steps,
+                if self.hermetic { 0 } else { options.timeout },
+            )
         };
         ply_codegen::rt::with_step_budget(steps, || ply_codegen::rt::with_time_budget(timeout, f))
     }
@@ -416,6 +470,14 @@ impl Site {
                 self.budgeted(|| executed(&executor, test))
             }
             None => Executed::refused(nothing_built()),
+        };
+        let once = if self.hermetic {
+            Executed {
+                usage: unmeasured(once.usage),
+                ..once
+            }
+        } else {
+            once
         };
         Ok(executed_value(&once))
     }
@@ -440,14 +502,25 @@ impl Site {
             }
             None => Interleaved::refused(nothing_built()),
         };
+        let run = if self.hermetic {
+            Interleaved {
+                usage: unmeasured(run.usage),
+                ..run
+            }
+        } else {
+            run
+        };
         Ok(interleaved_value(&run))
     }
 }
 
 /// What the first unit's backend did, apart from the entries its tests counted.
-fn compiled_value(provider: Option<&'static dyn ply_eval::Provider>) -> PlyValue {
+fn compiled_value(provider: Option<&'static dyn ply_eval::Provider>, hermetic: bool) -> PlyValue {
     let offers = provider.map_or_else(Default::default, ply_eval::Provider::offers);
-    let compiled = provider.and_then(ply_eval::Provider::compilation);
+    // What compiling cost is the machine's state and clock, not the program's.
+    let compiled = provider
+        .and_then(ply_eval::Provider::compilation)
+        .filter(|_| !hermetic);
     let tally = |n: u64| PlyValue::Int(i64::try_from(n).unwrap_or(i64::MAX));
     record(vec![
         (
@@ -598,6 +671,23 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
 }
 
 // --- Small things -------------------------------------------------------------
+
+/// The wall clock is the machine's, not the program's.
+fn unmeasured(usage: Use) -> Use {
+    Use {
+        duration: std::time::Duration::ZERO,
+        ..usage
+    }
+}
+
+#[cold]
+fn hermetic_host() -> Diagnostic {
+    Diagnostic::error(
+        codes::CAPABILITY_UNDECLARED,
+        format!("`{HERMETIC}` binds no host, and the run asked for `--host`"),
+    )
+    .note("a test that drives a run reaching the host performs `tester`, and is `test/nondet`")
+}
 
 #[cold]
 fn nothing_built() -> Diagnostic {

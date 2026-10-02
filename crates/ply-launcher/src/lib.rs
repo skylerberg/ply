@@ -39,15 +39,38 @@ pub fn trust() -> Vec<PathBuf> {
     }
 }
 
-/// The shelf laid out once per identity. Each file lands by a rename and the marker lands last,
-/// so a run that finds the marker finds every module whole.
+/// Not a `.ply` file, so the program's own listing passes over it.
+const STAMPS: &str = "stamps";
+
+const EVALUATOR_SOURCES: &str = env!("PLY_EVALUATOR_SOURCES");
+
+const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
+
+pub fn stamps(stage: &str) -> String {
+    let stamp = |domain: &str, sources: &str| {
+        let mut h = blake3::Hasher::new();
+        for part in [domain, stage, sources] {
+            h.update(part.as_bytes());
+            h.update(&[0]);
+        }
+        h.finalize().to_hex().to_string()
+    };
+    format!(
+        "frontend {}\nruntime {}\n",
+        stamp("ply.stamp.frontend.1", EVALUATOR_SOURCES),
+        stamp("ply.stamp.runtime.1", RUNTIME_SOURCES)
+    )
+}
+
+/// Each file lands by a rename and the marker last, so a run that finds the marker finds it whole.
 pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
-    let dir = ply_codegen::c::bundle::stage_dir(&program.stage).join("shelf");
+    let dir = ply_codegen::c::bundle::stage_dir(&program.stage)
+        .join(format!("shelf-{}", &RUNTIME_SOURCES[..16]));
     if dir.join(SHELF_MARKER).exists() {
         ply_codegen::c::sweep::used(&ply_codegen::c::bundle::stage_dir(&program.stage));
         return Ok(dir);
     }
-    lay_out(&dir, &program.shelf).map_err(|e| {
+    lay_out(&dir, &program.shelf, &stamps(&program.stage)).map_err(|e| {
         Diagnostic::error(
             codes::INTERNAL_ERROR,
             format!(
@@ -63,12 +86,13 @@ pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
     Ok(dir)
 }
 
-fn lay_out(dir: &Path, sources: &[(String, String)]) -> std::io::Result<()> {
+fn lay_out(dir: &Path, sources: &[(String, String)], stamps: &str) -> std::io::Result<()> {
     use ply_eval::files::write_atomically;
     std::fs::create_dir_all(dir)?;
     for (name, text) in sources {
         write_atomically(&dir.join(format!("{name}.ply")), text.as_bytes())?;
     }
+    write_atomically(&dir.join(STAMPS), stamps.as_bytes())?;
     write_atomically(&dir.join(SHELF_MARKER), b"ok")
 }
 
@@ -86,6 +110,7 @@ pub fn run(
         Ok(shelf) => shelf,
         Err(refused) => return Ended::refused(refused),
     };
+    ply_machine::shipped::stamp(stamps(&program.stage));
     let path = PathBuf::from(&program.artifact_name);
     let artifact = match artifact::decode(&program.artifact, &path) {
         Ok((artifact, _)) => artifact,

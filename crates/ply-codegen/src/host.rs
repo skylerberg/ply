@@ -185,7 +185,7 @@ pub unsafe fn perform(
             None => handler.call(&Unbound, &request),
         }
     };
-    c.host_use.record(&atom);
+    c.host_use.record(&atom, declaration.determinism);
     if declaration.linearity.is_linear() {
         c.host_ops = c.host_ops.saturating_add(1);
         c.last_linear = Some(HostMark {

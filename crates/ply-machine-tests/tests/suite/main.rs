@@ -28,6 +28,7 @@ import std.value (Value, VInt)
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
@@ -311,6 +312,7 @@ import std.value (Value, VInt)
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
@@ -468,6 +470,7 @@ import std.value (Value, VInt)
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
@@ -620,6 +623,7 @@ import std.value (Value, VInt)
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
@@ -816,6 +820,7 @@ import std.value (Value, VInt)
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>
@@ -971,6 +976,7 @@ import std.value (Value, VInt)
 nondet effect machine {
   write configure[m](options: Options) -> Unit
   read load[m](root: String, front: Option<Front>, keep: Option<String>) -> Result<Target, Refusal>
+  read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   read reuse[m](root: String, walked: Walked) -> Option<Target>
   read reload[m](front: Front) -> Result<Target, Refusal>
   read schema[m](name: String) -> Result<Value, List<Diag>>

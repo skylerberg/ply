@@ -818,6 +818,11 @@ pub fn bytes_of(path: &Path) -> Result<Vec<u8>, Diagnostic> {
     })
 }
 
+pub fn unreadable(path: &Path) -> Diagnostic {
+    invalid(path, format!("could not read `{}`", path.display()))
+        .note("name the `.plyx` file `ply build` wrote")
+}
+
 pub struct Opened {
     pub sources: SourceMap,
     pub front: Front,

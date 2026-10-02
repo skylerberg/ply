@@ -53,7 +53,11 @@ cache shared between checkouts and machines, a directory on any storage they all
 reach: the passes and discharged obligations found there count here, and this
 run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads only). Entries
 are keyed by content and by the shape of what is stored, so nothing
-machine-specific is ever shared; `--no-cache` ignores it. A dependency's own
+machine-specific is ever shared; `--no-cache` ignores it. What the front end
+filed is believed only by a `ply` built from the same shipped modules and
+evaluator, and a pass or a discharged obligation only by one built from the same
+Rust runtime too: another build files them again (`W0603`), and an upstream
+answers only builds of its runtime. A dependency's own
 modules are keyed by its manifest rather than by where it sits, so moving or
 re-checking-out a dependency keeps what was cached for it.
 
@@ -2640,8 +2644,10 @@ public too.
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
-handler that would serve it. With `--host`, a test that reaches a bound handler
-always runs and is never cached. An operation performed inside a `simulate`
+handler that would serve it. With `--host`, a test that can reach a bound
+nondeterministic handler always runs and is never cached; one that reaches only
+deterministic handlers, whose answers are a function of what they are handed, is
+cached like any other. An operation performed inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
@@ -2663,7 +2669,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `bootstrap` (`archive`), `hosts` (`tcb`) or `edit` (`ply run`, `ply test`); `E0459` otherwise |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `builder`, `bootstrap` (`archive`), `hosts` (`tcb`), `edit` or `shipped` (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims`, `builder` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules and version this binary ships |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3060,7 +3066,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0505` | Ply broke one of its own invariants |
 | `W0601` | cache unreadable |
 | `W0602` | cache corrupt |
-| `W0603` | cache from another version |
+| `W0603` | cache from another build |
 | `W0604` | obligation undecided at every tier |
 | `W0605` | standard library changed since the cache was written |
 | `W0607` | supplied configuration key the schema does not declare |

@@ -26,6 +26,9 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 /// obligations and nowhere else.
 const EFFECT: &str = "prover";
 
+/// A law that reaches the host is refused rather than bound.
+const HERMETIC: &str = "hermetic_prover";
+
 /// Where each type this side marshals is declared, by the type's own name, with every case of it
 /// this side builds.
 ///
@@ -65,6 +68,16 @@ const OPERATIONS: [(&str, &str); 7] = [
     ("ended", "ply_machine::claims::ended"),
 ];
 
+const HERMETIC_OPERATIONS: [(&str, &str); 7] = [
+    ("configure", "ply_machine::claims::hermetic::configure"),
+    ("collected", "ply_machine::claims::hermetic::collected"),
+    ("schema", "ply_machine::claims::hermetic::schema"),
+    ("prepared", "ply_machine::claims::hermetic::prepared"),
+    ("judged", "ply_machine::claims::hermetic::judged"),
+    ("interleaved", "ply_machine::claims::hermetic::interleaved"),
+    ("ended", "ply_machine::claims::hermetic::ended"),
+];
+
 /// A compiled body honours its call bound on the native stack, where unoptimised frames run to
 /// kilobytes. Reserved, not committed.
 const CLAIMS_STACK: usize = 256 << 20;
@@ -80,6 +93,8 @@ pub struct Job {
     /// What `--host` binds, which a `law/host` is discharged against; `None` without it, which
     /// is every `ply review`.
     pub binding: Option<Binding>,
+    /// Loads only what it is handed and binds no host: see [`HERMETIC`].
+    pub hermetic: bool,
 }
 
 /// What a `law/host` is discharged against.
@@ -92,26 +107,42 @@ pub struct Binding {
 /// The operations, for a program that declares `prover` in `module`: a value this side builds of a
 /// type that module declares is named as that program names it.
 pub fn lent(module: &str) -> Vec<Lent> {
+    let mut ops = lent_by(module, false);
+    ops.extend(lent_by(module, true));
+    ops
+}
+
+fn lent_by(module: &str, hermetic: bool) -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
+        hermetic,
         job: Mutex::new(None),
         machine: Mutex::new(None),
         claims: Mutex::new(0),
         judging: RwLock::new(None),
         module: module.to_string(),
     });
-    OPERATIONS
+    let operations = if hermetic {
+        HERMETIC_OPERATIONS
+    } else {
+        OPERATIONS
+    };
+    operations
         .into_iter()
-        .map(|(op, path)| (registration(op, path), Arc::clone(&site)))
+        .map(|(op, path)| (registration(op, path, hermetic), Arc::clone(&site)))
         .collect()
 }
 
-fn registration(op: &str, path: &'static str) -> HostOp {
+fn registration(op: &str, path: &'static str, hermetic: bool) -> HostOp {
     HostOp {
-        effect: Symbol::new(EFFECT),
+        effect: Symbol::new(if hermetic { HERMETIC } else { EFFECT }),
         op: Symbol::new(op),
         resource: HostResource::Any,
         // A tree, a cache on disk and a clock are not functions of program state.
-        determinism: Determinism::Nondeterministic,
+        determinism: if hermetic {
+            Determinism::Deterministic
+        } else {
+            Determinism::Nondeterministic
+        },
         // Each step is performed once, in order; nothing here is replayed.
         linearity: Linearity::Repeatable,
         // The answer is in hand when the operation returns: this thread waits for the one the
@@ -123,6 +154,8 @@ fn registration(op: &str, path: &'static str) -> HostOp {
 }
 
 struct Site {
+    /// Loads only what it is handed and binds no host.
+    hermetic: bool,
     /// Taken by the first operation, which is what starts the machine.
     job: Mutex<Option<Job>>,
     machine: Mutex<Option<Machine>>,
@@ -141,6 +174,7 @@ impl HostHandler for Site {
         let value = match (req.op.op.as_str(), req.args) {
             ("configure", [options, front, world]) => {
                 let mut job = job_of(options, span)?;
+                job.hermetic = self.hermetic;
                 job.front = Some(crate::driver::handed_front_of(front, span)?);
                 job.obligations =
                     crate::engine::obligations_of(ply_eval::decode::At::new("the world", world))
@@ -501,7 +535,11 @@ fn load(job: &Job) -> Result<Loaded, LoadError> {
             ],
         });
     };
-    crate::driver::load_over_front(&job.path, front)
+    if job.hermetic {
+        crate::driver::load_over_front_in(crate::load::tidy(&job.path), front)
+    } else {
+        crate::driver::load_over_front(&job.path, front)
+    }
 }
 
 // --- Discharging ---------------------------------------------------------------
@@ -610,6 +648,9 @@ fn prepare(
         sources: loaded.sources.clone(),
     };
     let backend = backend.map_err(|d| unbound(vec![d]))?;
+    if job.hermetic && job.binding.is_some() {
+        return Err(unbound(vec![hermetic_host()]));
+    }
     let hosts = match &job.binding {
         None => None,
         Some(binding) => Some(
@@ -905,5 +946,15 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
         front: None,
         obligations: Vec::new(),
         binding,
+        hermetic: false,
     })
+}
+
+#[cold]
+fn hermetic_host() -> Diagnostic {
+    Diagnostic::error(
+        codes::CAPABILITY_UNDECLARED,
+        format!("`{HERMETIC}` binds no host, and the run asked for `--host`"),
+    )
+    .note("a program that discharges a `law/host` reaches the host, and performs `prover`")
 }

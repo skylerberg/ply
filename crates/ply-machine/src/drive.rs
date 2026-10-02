@@ -45,6 +45,8 @@ pub struct RunOptions {
     /// The privileged families `--allow` granted the program being run, by name. What may drive
     /// a machine is a decision with a name, and one the program has to have declared.
     pub allow: Vec<String>,
+    /// No host, clock, load from disk or measurement.
+    pub hermetic: bool,
 }
 
 impl Default for RunOptions {
@@ -64,13 +66,14 @@ impl Default for RunOptions {
             shutdown: crate::options::ShutdownOptions::default(),
             profile: "development".to_string(),
             allow: Vec::new(),
+            hermetic: false,
         }
     }
 }
 
 // --- The target ---------------------------------------------------------------
 
-/// A program the front end loaded, or an artifact opened from a file.
+/// A program the front end loaded, or an artifact opened from its bytes.
 pub enum Target {
     Project(Box<Loaded>),
     Deployed(Box<Deployment>),
@@ -94,40 +97,28 @@ pub struct Refused {
 }
 
 impl Target {
-    /// An artifact runs out of its own verified definitions, not a source tree.
+    /// `front` is `None` when a program loads a tree of its own.
     pub fn open(
         path: &std::path::Path,
         front: Option<&crate::driver::HandedFront>,
+        hermetic: bool,
     ) -> Result<Target, Refused> {
-        if path.extension().is_some_and(|e| e == artifact::EXTENSION) {
-            return deployment(path).map(|d| Target::Deployed(Box::new(d)));
+        if let Some(refused) = library(path) {
+            return Err(refused);
         }
-        // A library is a package to depend on, not a program: reading it as sources would report a
-        // container as text that is not UTF-8.
-        if path
-            .extension()
-            .is_some_and(|e| e == artifact::LIBRARY_EXTENSION)
-        {
-            return Err(Refused {
-                diagnostics: vec![
-                    Diagnostic::error(
-                        codes::ARTIFACT_INVALID,
-                        format!("`{}` is a library, and nothing to run", path.display()),
-                    )
-                    .primary(Span::DUMMY, "not a program")
-                    .note("a `.plyz` is a package: declare it in a `ply.pkg` and depend on it")
-                    .note("`ply build` writes a program's artifact as a `.plyx`"),
-                ],
-                sources: SourceMap::new(),
-                artifact: None,
-            });
+        if path.extension().is_some_and(|e| e == artifact::EXTENSION) {
+            return Err(unhanded(path));
         }
         // A front end handed over is the CLI's own load, read here rather than repeated. A load with
         // none is a *program* loading a program of its own, at a root it chose while running: nobody
         // could have handed one, so the compiler is lent for that load and that load only.
-        let loaded = match front {
-            Some(front) => crate::driver::load_over_front(path, front),
-            None => crate::load::load(path),
+        let loaded = match (front, hermetic) {
+            (Some(front), false) => crate::driver::load_over_front(path, front),
+            (Some(front), true) => {
+                crate::driver::load_over_front_in(crate::load::tidy(path), front)
+            }
+            (None, false) => crate::load::load(path),
+            (None, true) => return Err(hermetic_load(path)),
         }
         .map_err(|err| Refused {
             diagnostics: err.diagnostics,
@@ -194,9 +185,20 @@ impl Target {
         }
     }
 
+    /// An artifact runs out of its own verified definitions, not a source tree.
+    pub fn artifact(path: &std::path::Path, bytes: Option<&[u8]>) -> Result<Target, Refused> {
+        if let Some(refused) = library(path) {
+            return Err(refused);
+        }
+        deployment(path, bytes).map(|d| Target::Deployed(Box::new(d)))
+    }
+
     /// The unit this run evaluates on: an artifact's own as built, else one over the sources.
     fn tier(&self, options: &RunOptions) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
-        select_profile(&options.profile)?;
+        // Which C compiler ran is no part of what a hermetic run answers.
+        if !options.hermetic {
+            select_profile(&options.profile)?;
+        }
         match self {
             Target::Project(loaded) => prover_backend(loaded),
             Target::Deployed(d) => {
@@ -211,13 +213,68 @@ impl Target {
     }
 }
 
-fn deployment(path: &std::path::Path) -> Result<Deployment, Refused> {
+/// A library is a package to depend on, not a program: reading it as sources would report a
+/// container as text that is not UTF-8.
+fn library(path: &std::path::Path) -> Option<Refused> {
+    path.extension()
+        .is_some_and(|e| e == artifact::LIBRARY_EXTENSION)
+        .then(|| Refused {
+            diagnostics: vec![
+                Diagnostic::error(
+                    codes::ARTIFACT_INVALID,
+                    format!("`{}` is a library, and nothing to run", path.display()),
+                )
+                .primary(Span::DUMMY, "not a program")
+                .note("a `.plyz` is a package: declare it in a `ply.pkg` and depend on it")
+                .note("`ply build` writes a program's artifact as a `.plyx`"),
+            ],
+            sources: SourceMap::new(),
+            artifact: None,
+        })
+}
+
+fn unhanded(path: &std::path::Path) -> Refused {
+    Refused {
+        diagnostics: vec![
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!(
+                    "`{}` is an artifact, and a load opens sources",
+                    path.display()
+                ),
+            )
+            .note("`machine.opened` opens an artifact from the bytes its caller read"),
+        ],
+        sources: SourceMap::new(),
+        artifact: Some(path.display().to_string()),
+    }
+}
+
+fn hermetic_load(path: &std::path::Path) -> Refused {
+    Refused {
+        diagnostics: vec![
+            Diagnostic::error(
+                codes::CAPABILITY_UNDECLARED,
+                format!(
+                    "`hermetic_machine` loads what it is handed, and `{}` came with no front end",
+                    path.display()
+                ),
+            )
+            .note("a program that loads sources of its own reads the disk, and performs `machine`"),
+        ],
+        sources: SourceMap::new(),
+        artifact: None,
+    }
+}
+
+fn deployment(path: &std::path::Path, bytes: Option<&[u8]>) -> Result<Deployment, Refused> {
     let about = |diagnostics: Vec<Diagnostic>| Refused {
         diagnostics,
         sources: SourceMap::new(),
         artifact: Some(path.display().to_string()),
     };
-    let (container, mut warnings) = artifact::read(path).map_err(|d| about(vec![d]))?;
+    let bytes = bytes.ok_or_else(|| about(vec![artifact::unreadable(path)]))?;
+    let (container, mut warnings) = artifact::decode(bytes, path).map_err(|d| about(vec![d]))?;
     let opened = artifact::open(&container, path).map_err(about)?;
     let unit = artifact::servable(&container);
     if container.has_unit() && !unit {
@@ -277,14 +334,26 @@ pub struct Drive {
 impl Drive {
     /// Load the target at `path`; the answer a `load` op hands back.
     pub fn open(options: RunOptions, path: &std::path::Path) -> Result<Drive, Refused> {
-        let target = Target::open(path, options.front.as_ref())?;
-        Ok(Drive {
+        let target = Target::open(path, options.front.as_ref(), options.hermetic)?;
+        Ok(Drive::over(options, target))
+    }
+
+    pub fn open_artifact(
+        options: RunOptions,
+        path: &std::path::Path,
+        bytes: Option<&[u8]>,
+    ) -> Result<Drive, Refused> {
+        Ok(Drive::over(options, Target::artifact(path, bytes)?))
+    }
+
+    fn over(options: RunOptions, target: Target) -> Drive {
+        Drive {
             options,
             target,
             tier: None,
             bound: None,
             accounting: Measured::default(),
-        })
+        }
     }
 
     /// What `load` answers with, as plain data for the calling thread to value-ify.
@@ -301,7 +370,7 @@ impl Drive {
             Target::Project(loaded) => loaded.root.display().to_string(),
             Target::Deployed(d) => d.path.clone(),
         });
-        self.target = Target::open(&path, Some(front))?;
+        self.target = Target::open(&path, Some(front), self.options.hermetic)?;
         self.tier = None;
         self.bound = None;
         Ok(())
@@ -348,6 +417,9 @@ impl Drive {
             Ok(tier) => tier,
             Err(diagnostic) => return Err(refuse(vec![diagnostic])),
         };
+        if options.hermetic && options.host {
+            return Err(refuse(vec![hermetic_host()]));
+        }
         // Before the binding, which decides whether `signal` is bound.
         let shutdown = options
             .host
@@ -445,7 +517,7 @@ impl Drive {
             })
         });
         // A call that raised still did the work its accounting counts.
-        note_measurement(&mut self.accounting, &compiled, started);
+        note_measurement(&mut self.accounting, &compiled, started, options.hermetic);
         ended.map(|answer| answer.map(|value| ply_eval::Plain::of(&value)))
     }
 
@@ -490,7 +562,7 @@ impl Drive {
                 )
             })
         });
-        note_measurement(&mut self.accounting, &compiled, started);
+        note_measurement(&mut self.accounting, &compiled, started, options.hermetic);
         let (answer, warnings) = ended.into_parts();
         let counters = ply_eval::rc::stats();
         // A cycle among escaped values is never collected, so only this run can report it.
@@ -587,14 +659,26 @@ fn note_measurement(
     accounting: &mut Measured,
     compiled: &std::rc::Rc<dyn ply_eval::Compiled>,
     started: Instant,
+    hermetic: bool,
 ) {
     accounting.steps += compiled.steps();
-    accounting.micros += u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if !hermetic {
+        accounting.micros += u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    }
     let seen = ply_eval::rc::stats();
     accounting.counters.updates += seen.updates;
     accounting.counters.updates_in_place += seen.updates_in_place;
     accounting.counters.elements_copied += seen.elements_copied;
     accounting.counters.cycles += seen.cycles;
+}
+
+#[cold]
+fn hermetic_host() -> Diagnostic {
+    Diagnostic::error(
+        codes::CAPABILITY_UNDECLARED,
+        "`hermetic_machine` binds no host, and the run asked for `--host`",
+    )
+    .note("a program that drives a run reaching the host performs `machine`, and is `test/nondet`")
 }
 
 /// The definition a call enters: its program-wide name and the arguments it takes.
@@ -1110,6 +1194,7 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
     let trace_v = get("trace")?;
     Ok(RunOptions {
         front: None,
+        hermetic: false,
         argv: str_list("argv")?,
         allow: str_list("allow")?,
         json: bool_at("json")?,

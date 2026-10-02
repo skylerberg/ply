@@ -603,8 +603,7 @@ impl Ctx {
         self.ticks = self.ticks.saturating_add(branch.ticks);
         self.grown += branch.grown;
         self.performed.append(&mut branch.performed);
-        self.host_use.atoms = self.host_use.atoms.union(&branch.host_use.atoms);
-        self.host_use.operations += branch.host_use.operations;
+        self.host_use.absorb(&branch.host_use);
         self.host_ops = self.host_ops.saturating_add(branch.host_ops);
         if branch.last_linear.is_some() {
             self.last_linear = branch.last_linear.take();
