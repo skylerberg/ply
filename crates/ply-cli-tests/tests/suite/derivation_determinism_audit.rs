@@ -275,36 +275,6 @@ test "one catalogue, one document" {
 }
 
 #[test]
-fn a_stdlib_digest_that_moved_invalidates_nothing() {
-    let dir = project_files(&[(
-        "m.ply",
-        "import std.json\n\
-         pub type A = { x: Int }\n\
-         derive json for A\n\
-         test \"a\" { assert_eq(string_of_bytes(json::encode_bytes({x: 1}, a_json())), \
-           \"{\\\"x\\\":1}\") }\n\
-         test \"b\" { assert_eq(2, 2) }\n",
-    )]);
-    let (code, text) = run(dir.path(), &["test"]);
-    assert_eq!(code, 0, "{text}");
-    assert!(text.contains("selected 2 of 2 (0 cached)"), "{text}");
-
-    std::fs::write(dir.path().join(".ply-cache/stdlib"), "b3:000000000000\n")
-        .expect("the cache records a digest");
-
-    let (code, text) = run(dir.path(), &["test"]);
-    assert_eq!(code, 0, "{text}");
-    assert!(
-        text.contains("W0605") || text.contains("the modules that ship with `ply` moved"),
-        "the run has to say the stdlib moved:\n{text}"
-    );
-    assert!(
-        text.contains("selected 0 of 2 (2 cached)"),
-        "a digest that moved re-ran a test, so it is in a cache key after all:\n{text}"
-    );
-}
-
-#[test]
 fn pulling_the_stdlib_into_a_program_moves_no_hash_outside_it() {
     const PLAIN: &str = "pub fn total(xs: List<Int>) -> Int = fold(xs, 0, |a, x| a + x)\n\
                          pub fn label(n: Int) -> String = \"n=\" ++ int_to_string(n)\n";

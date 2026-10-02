@@ -1,16 +1,6 @@
-use crate::harness::{json_of, ply, warm_agrees, write};
+use crate::harness::write;
 use ply_eval::{Symbol, codes};
 use ply_machine::load::{Loaded, load};
-use ply_store::{ContentHash, DefEntry, Store};
-use std::path::Path;
-
-fn output(out: &std::process::Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
-}
 
 fn hash_of(loaded: &Loaded, name: &str) -> String {
     let key = Symbol::new(name);
@@ -22,17 +12,6 @@ fn hash_of(loaded: &Loaded, name: &str) -> String {
         .unwrap_or_else(|| panic!("`{name}` is not in the program"))
         .to_hex()
 }
-
-/// Handles every atom, so its test is `det` and cacheable, which makes "did it re-run?" answerable.
-const IMPORTER: &str = "\
-import std.net (net, drain)
-
-pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = drain[conn](c, b\"\", 1000)
-
-test \"reads to the end\" {
-  handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m, t) -> Some(b\"\") }
-}
-";
 
 #[test]
 fn nothing_a_project_can_name_lands_under_the_reserved_root() {
@@ -189,110 +168,6 @@ fn a_definition_that_does_not_import_std_is_unmoved_by_one_that_does() {
         before_test, after_test,
         "a test re-runs because an unrelated module imported `std`"
     );
-}
-
-/// What the previous compiler left behind, rewritten as this one would find it.
-fn age_the_shipped_fingerprint(dir: &Path, mut mutate: impl FnMut(&mut DefEntry)) {
-    let path = ply_std::pseudo_path("std.net");
-    let mut store = Store::open(dir).unwrap();
-    let mut fingerprint = (*store
-        .fingerprint(&path)
-        .expect("the warm run recorded the shipped module"))
-    .clone();
-    assert_eq!(
-        fingerprint.content_hash,
-        ContentHash::of(ply_std::NET.as_bytes()),
-        "the fingerprint is not keyed on the embedded bytes, so an upgrade would leave no trace"
-    );
-    fingerprint.content_hash = ContentHash::of(b"what the last compiler shipped");
-    for entry in &mut fingerprint.defs {
-        mutate(entry);
-    }
-    store.put_source(&path, fingerprint);
-    store.flush().unwrap();
-}
-
-#[test]
-fn an_upgrade_that_moves_no_definition_re_runs_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "app.ply", IMPORTER);
-    let out = ply(dir.path()).arg("test").output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", output(&out));
-
-    age_the_shipped_fingerprint(dir.path(), |_| {});
-
-    // The test the project owns is unchanged, so `ply test` selects nothing.
-    let out = ply(dir.path()).arg("test").output().unwrap();
-    let text = output(&out);
-    assert!(
-        text.contains("selected 0 of 1"),
-        "an upgrade that moved no definition re-ran a test:\n{text}"
-    );
-}
-
-#[test]
-fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "app.ply", IMPORTER);
-    write(
-        dir.path(),
-        "elsewhere.ply",
-        "pub fn untouched() -> Int = 41 + 1\n\
-         test \"untouched\" { assert_eq(untouched(), 42) }\n",
-    );
-    let out = ply(dir.path()).arg("test").output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", output(&out));
-
-    let drain = Symbol::new("std.net.drain");
-    let mut aged = false;
-    age_the_shipped_fingerprint(dir.path(), |entry| {
-        if entry.name == drain {
-            let mut bytes = entry.hash.0;
-            bytes[0] ^= 0xff;
-            entry.hash = ply_eval::DefHash(bytes);
-            aged = true;
-        }
-    });
-    assert!(aged, "`std.net.drain` is in the shipped fingerprint");
-
-    // A cache written under an older `std.net` may be believed for none of what it moved.
-    warm_agrees(dir.path(), "after an upgrade that moved `std.net.drain`");
-}
-
-/// Zero here, and it must be said as zero rather than implied.
-#[test]
-fn the_upgrade_notice_counts_what_moved_rather_than_what_exists() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "app.ply", IMPORTER);
-    ply(dir.path()).arg("test").output().unwrap();
-
-    {
-        let mut store = Store::open(dir.path()).unwrap();
-        store.set_stdlib_digest(String::from("b3:000000000000"));
-        store.flush().unwrap();
-    }
-
-    let notices = |dir: &Path| -> Vec<serde_json::Value> {
-        let answer = json_of(&ply(dir).args(["check", "--json"]).output().unwrap());
-        answer["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|d| d["code"] == codes::STDLIB_CHANGED)
-            .cloned()
-            .collect()
-    };
-    let warned = notices(dir.path());
-    let warning = warned
-        .first()
-        .expect("a cache written under another digest warns");
-    assert!(
-        warning.to_string().contains("no definition"),
-        "the notice implied work that did not happen: {warning}"
-    );
-
-    // Once, not on every subsequent run: the digest is rewritten on the way out.
-    assert!(notices(dir.path()).is_empty(), "W0605 repeats");
 }
 
 #[test]

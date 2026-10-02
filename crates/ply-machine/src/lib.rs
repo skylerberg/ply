@@ -10,9 +10,9 @@
 //! targets, bindings, teardown — is `crate::drive`.
 
 pub mod artifact;
+pub mod body;
 pub mod bootstrap;
 pub mod builder;
-pub mod cache;
 pub mod claims;
 pub mod config;
 pub mod costs;
@@ -22,7 +22,6 @@ pub mod edit;
 pub mod engine;
 pub mod hosts;
 pub mod load;
-pub mod migrate;
 pub mod options;
 pub mod payload;
 pub mod policy;

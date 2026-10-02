@@ -1,6 +1,6 @@
 use ply_eval::{DefHash, codes};
 use ply_machine::artifact::*;
-use ply_store::body::StoredBody;
+use ply_machine::body::StoredBody;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -20,9 +20,8 @@ fn sample() -> Artifact {
     }
     names.sort();
     Artifact {
-        frontend: *blake3::hash(ply_store::FRONTEND_VERSION.as_bytes()).as_bytes(),
-        runtime: *blake3::hash(ply_store::RUNTIME_VERSION.as_bytes()).as_bytes(),
-        body_encoding: ply_store::BODY_ENCODING,
+        frontend: compiler(),
+        runtime: runtime(),
         std: ply_std::digest(),
         entry,
         bodies,
@@ -69,11 +68,20 @@ fn a_closure_round_trips_and_is_believed_only_as_bytes() {
 }
 
 #[test]
-fn a_foreign_body_encoding_is_a_version_refusal_and_not_a_corruption_one() {
-    let mut artifact = sample();
-    artifact.body_encoding += 1;
-    let err = decode(&written(&artifact), Path::new("t.plyx")).unwrap_err();
-    assert_eq!(err.code, codes::ARTIFACT_VERSION);
+fn another_compiler_or_runtime_is_a_version_refusal_and_not_a_corruption_one() {
+    for stale in [
+        Artifact {
+            frontend: [7; 32],
+            ..sample()
+        },
+        Artifact {
+            runtime: [7; 32],
+            ..sample()
+        },
+    ] {
+        let err = decode(&written(&stale), Path::new("t.plyx")).unwrap_err();
+        assert_eq!(err.code, codes::ARTIFACT_VERSION);
+    }
 }
 
 #[test]

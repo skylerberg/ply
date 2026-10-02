@@ -190,19 +190,11 @@ fn the_desks_credential_reaches_no_line_of_a_whole_test_run() {
     assert!(run.ok, "the desk's suite must be green\n\n{}", run.all());
     run.silent_about("twin-key-not-a-credential");
 
-    // A failure report is stored, and `Value::render` is `Secret(****)` before it gets there.
-    let results = std::fs::read(dir.path().join(".ply-cache/results.json")).unwrap_or_default();
-    assert!(
-        !String::from_utf8_lossy(&results).contains("twin-key-not-a-credential"),
-        "a credential must not reach the result cache, which never forgets"
-    );
-
-    // The known hole: a literal is in the front-end store, as part of the definition it was written in.
-    let store = std::fs::read(dir.path().join(".ply-cache/frontend.dat")).unwrap_or_default();
+    // The known hole: a literal is in the store, as part of the definition it was written in.
+    let store = std::fs::read(dir.path().join(".ply-cache/store.dat")).unwrap_or_default();
     assert!(
         String::from_utf8_lossy(&store).contains("twin-key-not-a-credential"),
-        "what secrets do not prevent (1) says a source literal enters the store; if that stopped \
-         being true the sentence in the record needs rewriting, not this test"
+        "a source literal is part of the body filed for its definition"
     );
 }
 

@@ -1,26 +1,23 @@
 //! What `ply prove` and `ply review` load, discharge, review and accept, as the program in
 //! `crates/ply-cli/ply` performs it.
 //!
-//! The store and the prover's entries stay here: discharging a claim enters compiled bodies. The
-//! obligations, the types they are written over and the search each one goes to are the program's
-//! (`proof.world`), handed over with the front end; which claims are asked for, the keys their
-//! evidence is read and filed under, the evidence itself (`proof.evidence`, which the store holds as
-//! text it never reads), what the review, the coverage and the baseline come to, every line and key
-//! of both reports and the code each run exits with are the program's too, in
-//! `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
+//! The prover's entries stay here: discharging a claim enters compiled bodies. The obligations, the
+//! types they are written over and the search each one goes to are the program's (`proof.world`),
+//! handed over with the front end; which claims are asked for, the keys their evidence is read and
+//! filed under, the evidence and the store that keeps it, what the review, the coverage and the
+//! baseline come to, every line and key of both reports and the code each run exits with are the
+//! program's too, in `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
 
 use crate::config::Configuration;
 use crate::engine::{Interleaved, Judgement, Mode, Obligation};
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
-use crate::payload::{count, ctor, diags_value, places_value, record, strings};
+use crate::payload::{ctor, diags_value, places_value, record, strings};
 use crate::support::{enter_constant, prover_backend};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{DefHash, Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes};
-use ply_store::ReviewRecord;
-use ply_store::Store;
+use ply_eval::{Diagnostic, SourceMap, Span, Symbol, Value as PlyValue, Value, codes};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
@@ -58,17 +55,13 @@ fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     ctor(home, name, args)
 }
 
-const OPERATIONS: [(&str, &str); 10] = [
+const OPERATIONS: [(&str, &str); 6] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
     ("prepared", "ply_machine::claims::prepared"),
-    ("cached", "ply_machine::claims::cached"),
     ("judged", "ply_machine::claims::judged"),
     ("interleaved", "ply_machine::claims::interleaved"),
     ("ended", "ply_machine::claims::ended"),
-    ("record", "ply_machine::claims::record"),
-    ("baselines", "ply_machine::claims::baselines"),
-    ("accepted", "ply_machine::claims::accepted"),
 ];
 
 /// A compiled body honours its call bound on the native stack, where unoptimised frames run to
@@ -83,7 +76,6 @@ pub struct Job {
     pub front: Option<crate::driver::HandedFront>,
     /// The obligations the program owes, as it built them.
     pub obligations: Vec<Obligation>,
-    pub use_cache: bool,
     /// What `--host` binds, which a `law/host` is discharged against; `None` without it, which
     /// is every `ply review`.
     pub binding: Option<Binding>,
@@ -165,7 +157,6 @@ impl HostHandler for Site {
             ("prepared", [step_budget]) => {
                 self.prepared(step_budget.as_int(span, "the calls an evaluation may make")?)?
             }
-            ("cached", [keys]) => self.cached(&texts_of(keys, "the keys to read", span)?)?,
             ("judged", [batches]) => self.judged(batches_of(batches, span)?)?,
             ("interleaved", [claim, point, seed, steps]) => self.interleaved(
                 usize::try_from(claim.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
@@ -176,22 +167,10 @@ impl HostHandler for Site {
                 u32::try_from(steps.as_int(span, "the scheduling steps")?).unwrap_or(u32::MAX),
             )?,
             ("ended", []) => diags_value(&self.judging("ended")?.take_ended()),
-            ("record", [entries]) => self.record(filed_of(entries, span)?)?,
-            ("baselines", [names]) => self.baselines(names_of(names, span)?)?,
-            ("accepted", [records]) => self.accepted(records_of(records, span)?)?,
             (other, _) => return Err(unasked(other, span)),
         };
         Ok(HostAnswer::Value(value))
     }
-}
-
-/// A list of text the program sent.
-fn texts_of(value: &PlyValue, what: &str, span: Span) -> Result<Vec<String>, Diagnostic> {
-    let mut out = Vec::new();
-    for item in value.as_list(span, what)? {
-        out.push(item.as_str(span, what)?.to_string());
-    }
-    Ok(out)
 }
 
 /// One batch of points the program sent: whose claim, the points as plain values, and how they are
@@ -236,21 +215,6 @@ fn points_of(value: &PlyValue, span: Span) -> Result<Vec<Vec<ply_eval::Plain>>, 
     Ok(out)
 }
 
-/// The evidence the program decided to file, each under the key it chose, as the text
-/// `proof.evidence` wrote: the store holds it and never reads it.
-fn filed_of(value: &PlyValue, span: Span) -> Result<Vec<(DefHash, serde_json::Value)>, Diagnostic> {
-    use crate::payload::field_of;
-    let mut out = Vec::new();
-    for entry in value.as_list(span, "the evidence to file")? {
-        let key = key_of(field_of(entry, "key", span)?.as_str(span, "a key")?, span)?;
-        let text = field_of(entry, "evidence", span)?.as_str(span, "evidence")?;
-        let evidence = serde_json::from_str(text)
-            .map_err(|e| malformed(&format!("the evidence to file is no JSON: {e}"), span))?;
-        out.push((key, evidence));
-    }
-    Ok(out)
-}
-
 /// A constructor's simple name and its arguments.
 fn case_of<'v>(
     value: &'v PlyValue,
@@ -276,46 +240,6 @@ fn malformed(why: &str, span: Span) -> Diagnostic {
     )
     .primary(span, "this is what the program sent")
     .note("`proof.decide` and this reader are one program's two halves; this is Ply's fault")
-}
-
-/// The baselines the program decided to record, each keyed by the definition's name.
-fn records_of(value: &PlyValue, span: Span) -> Result<Vec<(Symbol, ReviewRecord)>, Diagnostic> {
-    use crate::payload::field_of;
-    let mut out = Vec::new();
-    for entry in value.as_list(span, "the baselines to record")? {
-        let name = field_of(entry, "name", span)?.as_str(span, "a definition's name")?;
-        let record = field_of(entry, "record", span)?;
-        let def_hash = key_of(
-            field_of(record, "def_hash", span)?.as_str(span, "a definition's hash")?,
-            span,
-        )?;
-        let mut specs = Vec::new();
-        for spec in field_of(record, "specs", span)?.as_list(span, "a definition's spec")? {
-            specs.push(key_of(spec.as_str(span, "a spec's hash")?, span)?);
-        }
-        out.push((Symbol::new(name), ReviewRecord::new(def_hash, specs)));
-    }
-    Ok(out)
-}
-
-/// A hash the program handed over, as the store keys one.
-fn key_of(hex: &str, span: Span) -> Result<DefHash, Diagnostic> {
-    DefHash::from_hex(hex).ok_or_else(|| {
-        Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!("`{hex}` is not a hash the store could be read or written under"),
-        )
-        .primary(span, "the program handed this over")
-    })
-}
-
-/// Definitions by program-wide name, as the program handed them over.
-fn names_of(value: &PlyValue, span: Span) -> Result<Vec<Symbol>, Diagnostic> {
-    value
-        .as_list(span, "the definitions to read baselines for")?
-        .iter()
-        .map(|item| Ok(Symbol::new(item.as_str(span, "a definition's name")?)))
-        .collect()
 }
 
 impl Site {
@@ -358,21 +282,6 @@ impl Site {
                 diags_value(&ready.warnings)
             }))),
             _ => Err(out_of_step("prepared")),
-        }
-    }
-
-    /// The text the store holds under each key.
-    fn cached(&self, keys: &[String]) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("cached"))?;
-        machine.ask(Go::Cached(keys.to_vec()))?;
-        match machine.step()? {
-            Step::Cached(read) => Ok(PlyValue::list(
-                read.iter()
-                    .map(|text| crate::payload::option(text.as_deref().map(PlyValue::str)))
-                    .collect(),
-            )),
-            _ => Err(out_of_step("cached")),
         }
     }
 
@@ -422,48 +331,6 @@ impl Site {
             &judging.interleaved(claim, point, &seed, steps),
         ))
     }
-
-    /// Files the evidence the program chose, each under the key it chose.
-    fn record(&self, entries: Vec<(DefHash, serde_json::Value)>) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("record"))?;
-        machine.ask(Go::Record(entries))?;
-        match machine.step()? {
-            Step::Recorded(warnings) => Ok(diags_value(&warnings)),
-            _ => Err(out_of_step("record")),
-        }
-    }
-
-    /// The baseline a reader accepted for each of these definitions, where there is one.
-    fn baselines(&self, names: Vec<Symbol>) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("baselines"))?;
-        machine.ask(Go::Baselines(names))?;
-        match machine.step()? {
-            Step::Baselines(baselines) => Ok(PlyValue::list(
-                baselines
-                    .iter()
-                    .map(|(name, baseline)| record_value(name, baseline))
-                    .collect(),
-            )),
-            _ => Err(out_of_step("baselines")),
-        }
-    }
-
-    fn accepted(&self, records: Vec<(Symbol, ReviewRecord)>) -> Result<PlyValue, Diagnostic> {
-        let mut held = self.held();
-        let step = {
-            let machine = held.as_ref().ok_or_else(|| unstarted("accepted"))?;
-            machine.ask(Go::Accept(records))?;
-            machine.step()?
-        };
-        // Nothing follows an acceptance: the thread it happened on is joined here.
-        held.take();
-        match step {
-            Step::Accepted(accepted) => Ok(accepted_value(&accepted)),
-            _ => Err(out_of_step("accepted")),
-        }
-    }
 }
 
 /// `Ok(v)` or `Err(Refusal)`, as the program reads an operation's answer.
@@ -483,23 +350,11 @@ enum Go {
     /// Bind the hosts and build the prover a discharge runs against, with the calls each
     /// evaluation of a claim may make.
     Prepare(i64),
-    /// What the store holds under these keys. The program computes them — a plan key is part of
-    /// the obligation's own encoding — so no row could carry the answers.
-    Cached(Vec<String>),
-    /// File this evidence, each under the key the program chose for it.
-    Record(Vec<(DefHash, serde_json::Value)>),
-    /// The baseline a reader accepted for each of these definitions.
-    Baselines(Vec<Symbol>),
-    Accept(Vec<(Symbol, ReviewRecord)>),
 }
 
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
     Prepared(Box<Result<Ready, Refused>>),
-    Cached(Vec<Option<String>>),
-    Recorded(Vec<Diagnostic>),
-    Baselines(Vec<(String, ReviewRecord)>),
-    Accepted(Box<Accepted>),
 }
 
 /// The thread the load and the store live on, and the prover is built on. Claims are judged on the
@@ -549,23 +404,7 @@ impl Drop for Machine {
 }
 
 fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
-    let root = crate::load::project_root(&job.path);
-    let mut store = match Store::open(&root) {
-        Ok(store) => store.with_upstream(if job.use_cache {
-            ply_store::Upstream::from_env()
-        } else {
-            None
-        }),
-        Err(e) => {
-            let _ = told.send(Step::Collected(Box::new(Err(Refused {
-                why: Why::Trouble,
-                diagnostics: vec![unopened(&root, &e)],
-                sources: SourceMap::new(),
-            }))));
-            return;
-        }
-    };
-    let mut warnings = store.take_warnings();
+    let mut warnings = Vec::new();
     let loaded = match load(&job) {
         Ok(loaded) => loaded,
         Err(err) => {
@@ -577,7 +416,6 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
             return;
         }
     };
-    warnings.extend(store.take_warnings());
     warnings.extend(loaded.frontend.warnings.iter().cloned());
 
     let obligations: &[Obligation] = &job.obligations;
@@ -608,52 +446,6 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                 };
                 let _ = told.send(Step::Prepared(Box::new(answer)));
             }
-            Ok(Go::Cached(keys)) => {
-                let read = keys
-                    .iter()
-                    .map(|key| {
-                        let entry =
-                            DefHash::from_hex(key).and_then(|hash| store.obligation(hash))?;
-                        Some(entry.to_string())
-                    })
-                    .collect();
-                let _ = told.send(Step::Cached(read));
-            }
-            Ok(Go::Record(entries)) => {
-                for (key, evidence) in entries {
-                    store.put_obligation(key, evidence);
-                }
-                let warnings = flushed(&mut store);
-                let _ = told.send(Step::Recorded(warnings));
-            }
-            Ok(Go::Baselines(names)) => {
-                let baselines = names
-                    .iter()
-                    .filter_map(|name| {
-                        Some((
-                            name.as_str().to_string(),
-                            store.review_record(name)?.clone(),
-                        ))
-                    })
-                    .collect();
-                let _ = told.send(Step::Baselines(baselines));
-            }
-            Ok(Go::Accept(records)) => {
-                let definitions = records.len();
-                for (name, record) in records {
-                    store.put_review_record(name, record);
-                }
-                let trouble = store.flush().err().map(|e| unaccepted(&e));
-                let mut warnings = store.take_warnings();
-                let stored = trouble.is_none();
-                warnings.extend(trouble);
-                let _ = told.send(Step::Accepted(Box::new(Accepted {
-                    definitions,
-                    stored,
-                    warnings,
-                })));
-                return;
-            }
             Err(_) => return,
         }
     }
@@ -679,18 +471,6 @@ fn load(job: &Job) -> Result<Loaded, LoadError> {
         });
     };
     crate::driver::load_over_front(&job.path, front)
-}
-
-fn flushed(store: &mut Store) -> Vec<Diagnostic> {
-    let mut out = match store.flush() {
-        Ok(()) => Vec::new(),
-        Err(e) => vec![
-            Diagnostic::warning(codes::CACHE_UNREADABLE, format!("{e:#}"))
-                .note("nothing was recorded; the next run discharges everything again"),
-        ],
-    };
-    out.extend(store.take_warnings());
-    out
 }
 
 // --- Discharging ---------------------------------------------------------------
@@ -859,7 +639,6 @@ fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<Value>>, Diagnos
 enum Why {
     Broken,
     Unbound,
-    Trouble,
 }
 
 #[derive(Clone)]
@@ -879,19 +658,12 @@ struct Collection {
     host: bool,
 }
 
-struct Accepted {
-    definitions: usize,
-    stored: bool,
-    warnings: Vec<Diagnostic>,
-}
-
 // --- The values the program reads -------------------------------------------------
 
 fn refusal_value(refused: &Refused, module: &str) -> PlyValue {
     let named = match refused.why {
         Why::Broken => "Broken",
         Why::Unbound => "Unbound",
-        Why::Trouble => "Trouble",
     };
     ctor(
         module,
@@ -901,10 +673,6 @@ fn refusal_value(refused: &Refused, module: &str) -> PlyValue {
             ("places", places_value(&refused.sources)),
         ])],
     )
-}
-
-fn hashes_value(hashes: &[DefHash]) -> PlyValue {
-    PlyValue::list(hashes.iter().map(|h| PlyValue::str(h.to_hex())).collect())
 }
 
 fn collection_value(collection: Collection) -> PlyValue {
@@ -969,44 +737,7 @@ fn judged_value(judgement: &Judgement) -> PlyValue {
     }
 }
 
-/// A baseline as the program reads one: the definition's hash and its spec, keyed by its name.
-fn record_value(name: &str, baseline: &ReviewRecord) -> PlyValue {
-    record(vec![
-        ("name", PlyValue::str(name)),
-        (
-            "record",
-            record(vec![
-                ("def_hash", PlyValue::str(baseline.def_hash.to_hex())),
-                ("specs", hashes_value(&baseline.specs)),
-            ]),
-        ),
-    ])
-}
-
-fn accepted_value(accepted: &Accepted) -> PlyValue {
-    record(vec![
-        ("definitions", count(accepted.definitions)),
-        ("stored", PlyValue::Bool(accepted.stored)),
-        ("warnings", diags_value(&accepted.warnings)),
-    ])
-}
-
 // --- Small things -------------------------------------------------------------
-
-#[cold]
-fn unopened(root: &std::path::Path, e: &impl std::fmt::Display) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("could not open the cache under `{}`: {e:#}", root.display()),
-    )
-    .note("check the directory's permissions")
-}
-
-#[cold]
-fn unaccepted(e: &impl std::fmt::Display) -> Diagnostic {
-    Diagnostic::error(codes::CACHE_UNREADABLE, format!("{e:#}"))
-        .note("nothing was accepted; the baseline is unchanged")
-}
 
 #[cold]
 fn unspawned(e: &std::io::Error) -> Diagnostic {
@@ -1157,7 +888,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
         path: PathBuf::from(str_at("path")?),
         front: None,
         obligations: Vec::new(),
-        use_cache: !bool_at("no_cache")?,
         binding,
     })
 }

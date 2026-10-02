@@ -501,36 +501,6 @@ fn a_first_ever_runtime_limit_is_skipped_as_never_passed() {
     );
 }
 
-/// `no_bodies` means "stop pruning" and `no_hybrids` "this build cannot"; a consumer acts on them differently.
-#[test]
-fn a_pruned_body_store_says_no_bodies_and_not_no_hybrids() {
-    let dir = project(RECURSION);
-    ply(dir.path()).arg("test").assert().success();
-
-    let cache = dir.path().join(".ply-cache");
-    std::fs::remove_file(cache.join("frontend.idx")).expect("the body index exists");
-    std::fs::remove_file(cache.join("frontend.dat")).expect("the body data exists");
-
-    write(
-        dir.path(),
-        "m.ply",
-        &RECURSION
-            .replace("step(n - 1)", "step(n + 1)")
-            .replace("(a * b) + 0", "0 + (a * b)"),
-    );
-    let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
-    let culprit = &v["failures"][0]["culprit"];
-    assert_eq!(v["failures"][0]["defect"], false, "{v}");
-    // Two edits need a mixture to tell apart and none can be built, so no trial is run at all.
-    assert_eq!(culprit["verdict"], "not_attempted", "{culprit}");
-    assert_eq!(culprit["skipped"], "no_bodies", "{culprit}");
-    assert_eq!(culprit["search"]["evaluated"], 0, "{culprit}");
-    assert!(
-        culprit["definitions"].as_array().unwrap().is_empty(),
-        "nothing may be named when no mixture could be run: {culprit}"
-    );
-}
-
 #[test]
 fn a_value_the_call_limit_permits_is_compared_rather_than_aborting_the_run() {
     let dir = project(

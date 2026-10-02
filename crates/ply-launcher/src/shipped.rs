@@ -50,8 +50,8 @@ pub fn lay_out(stage: &Path) -> std::io::Result<()> {
 }
 
 /// What the built program is a function of: its sources, the shelf it is closed over as the shelf
-/// hands it out, the emitter that compiled it, and the three store versions a decode refuses a
-/// mismatch of. The artifact the program is built into carries the same digest as its stamp.
+/// hands it out, and the compiler and runtime a decode refuses a mismatch of. The artifact the
+/// program is built into carries the same digest as its stamp.
 pub fn identity() -> String {
     ply_machine::artifact::toolchain_stamp(&producer::digest_of(&program_sources()))
 }

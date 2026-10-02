@@ -70,11 +70,11 @@ fn the_published_order_is_the_same_warm_as_cold() {
 }
 
 #[test]
-fn a_result_cache_write_failure_is_not_blamed_on_the_front_end() {
+fn an_unwritable_store_never_fails_a_compile_and_says_what_failed() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "m.ply", "pub fn f() -> Int = 1\n");
-    // `rename` cannot replace a directory, so only the result cache's atomic write fails.
-    fs::create_dir_all(dir.path().join(".ply-cache/results.json")).unwrap();
+    // `rename` cannot replace a directory, so only the index's atomic write fails.
+    fs::create_dir_all(dir.path().join(".ply-cache/store.idx")).unwrap();
 
     let out = ply(dir.path()).args(["check", "--json"]).output().unwrap();
     assert_eq!(
@@ -91,12 +91,10 @@ fn a_result_cache_write_failure_is_not_blamed_on_the_front_end() {
         .map(|d| d["message"].as_str().unwrap())
         .collect();
     assert!(
-        warnings.iter().any(|m| m.contains("result cache")),
-        "the failing cache has to be named: {warnings:?}"
-    );
-    assert!(
-        warnings.iter().all(|m| !m.contains("front-end cache")),
-        "the front-end cache is not what failed: {warnings:?}"
+        warnings
+            .iter()
+            .any(|m| m.contains("the store's index could not be written")),
+        "the failing write has to be named: {warnings:?}"
     );
 }
 

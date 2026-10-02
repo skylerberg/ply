@@ -57,6 +57,7 @@ pub type Store = {
   puts: Map<Bytes, Bytes>,
   drops: Map<Bytes, Bool>,
   warnings: List<Warning>,
+  data: Bytes,
 }
 
 // What a warning reports: the store could not be read or written, held something that did not
@@ -67,7 +68,8 @@ pub type Warning = { trouble: Trouble, message: String }
 
 pub type Found = | Hit(Bytes) | Miss | Bad(String)
 
-type Disk = { nonce: Bytes, data_len: Int, index: Bytes, sections: List<Section> }
+// `data` is the data file read whole when it fits one read, else empty, and frames are read one by one.
+type Disk = { nonce: Bytes, data_len: Int, index: Bytes, sections: List<Section>, data: Bytes }
 
 type Problem = { trouble: Trouble, why: String }
 
@@ -77,7 +79,7 @@ fn corrupt(why: String) -> Problem = { trouble: Corrupt, why: why }
 
 fn foreign(why: String) -> Problem = { trouble: OtherVersion, why: why }
 
-fn empty_disk() -> Disk = { nonce: b"", data_len: 0, index: b"", sections: [] }
+fn empty_disk() -> Disk = { nonce: b"", data_len: 0, index: b"", sections: [], data: b"" }
 
 fn with_disk(dir: String, schema: Bytes, d: Disk, warnings: List<Warning>) -> Store =
   {
@@ -90,6 +92,7 @@ fn with_disk(dir: String, schema: Bytes, d: Disk, warnings: List<Warning>) -> St
     puts: map_new(),
     drops: map_new(),
     warnings: warnings,
+    data: d.data,
   }
 
 // One warning per distinct reason, however often a run meets it.
@@ -126,8 +129,22 @@ fn load<[r]>(dir: String, schema: Bytes) -> Loaded / {fs.read[r]} =
     None -> Cold,
     Some(idx) -> match parse_index(idx, schema) {
       Err(p) -> Unusable(p),
-      Ok(d) -> match data_problem[r](dir, d, schema) { None -> Valid(d), Some(p) -> Unusable(p) },
+      Ok(d) -> match data_problem[r](dir, d, schema) {
+        None -> Valid({ ..d, data: whole[r](dir, d.data_len) }),
+        Some(p) -> Unusable(p),
+      },
     },
+  }
+
+// The most `fs.read_file` answers in one read.
+fn read_cap() -> Int = 64 * 1024 * 1024
+
+fn whole<[r]>(dir: String, data_len: Int) -> Bytes / {fs.read[r]} =
+  if data_len > read_cap() { b"" } else {
+    match fs.read_file[r](path(dir, data_name())) {
+      Some(b) -> if bytes_len(b) >= data_len { b } else { b"" },
+      None -> b"",
+    }
   }
 
 fn parse_index(b: Bytes, schema: Bytes) -> Result<Disk, Problem> =
@@ -152,7 +169,13 @@ fn parse_index(b: Bytes, schema: Bytes) -> Result<Disk, Problem> =
       match sections_from(b, 0, count, records, 0 - 1, []) {
         Err(why) -> Err(why),
         Ok(secs) ->
-          Ok({ nonce: bytes_slice(b, 12, 28), data_len: u64_at(b, 28), index: b, sections: secs }),
+          Ok({
+            nonce: bytes_slice(b, 12, 28),
+            data_len: u64_at(b, 28),
+            index: b,
+            sections: secs,
+            data: b"",
+          }),
       }
     }
   }
@@ -208,32 +231,49 @@ fn record_at(sec: Section, i: Int) -> Int = sec.start + i * record_width()
 fn key_at(index: Bytes, sec: Section, i: Int) -> Bytes =
   bytes_slice(index, record_at(sec, i), record_at(sec, i) + key_width())
 
-fn lower_bound(index: Bytes, sec: Section, key: Bytes, lo: Int, hi: Int) -> Int =
+// A key's first four bytes, high first: keys whose prefixes differ order as their prefixes do, so a
+// search slices a key only where two prefixes tie.
+fn prefix_at(b: Bytes, at: Int) -> Int = {
+  let le = u32_at(b, at);
+  (le & 255) << 24 | (le >> 8 & 255) << 16 | (le >> 16 & 255) << 8 | le >> 24 & 255
+}
+
+fn below(index: Bytes, at: Int, key: Bytes, prefix: Int) -> Bool = {
+  let p = prefix_at(index, at);
+  if p != prefix { p < prefix }
+  else { compare_values(bytes_slice(index, at, at + key_width()), key) == Less }
+}
+
+fn lower_bound(index: Bytes, sec: Section, key: Bytes, prefix: Int, lo: Int, hi: Int) -> Int =
   if lo >= hi { lo } else {
     let mid = lo + (hi - lo) / 2;
-    if compare_values(key_at(index, sec, mid), key) == Less {
-      lower_bound(index, sec, key, mid + 1, hi)
-    } else { lower_bound(index, sec, key, lo, mid) }
+    if below(index, record_at(sec, mid), key, prefix) {
+      lower_bound(index, sec, key, prefix, mid + 1, hi)
+    } else { lower_bound(index, sec, key, prefix, lo, mid) }
   }
 
 fn located(index: Bytes, table: Int, sections: List<Section>, key: Bytes) -> Option<Int> =
-  match section_of(sections, table) {
-    None -> None,
-    Some(sec) -> {
-      let i = lower_bound(index, sec, key, 0, sec.count);
-      if i < sec.count && key_at(index, sec, i) == key { Some(record_at(sec, i)) } else { None }
-    },
+  if bytes_len(key) != key_width() { None } else {
+    match section_of(sections, table) {
+      None -> None,
+      Some(sec) -> {
+        let i = lower_bound(index, sec, key, prefix_at(key, 0), 0, sec.count);
+        if i < sec.count && key_at(index, sec, i) == key { Some(record_at(sec, i)) } else { None }
+      },
+    }
   }
 
-pub fn get<[r]>(s: Store, table: Int, key: Bytes) -> Found / {fs.read[r]} =
-  match map_get(s.puts, slot(table, key)) {
+pub fn get<[r]>(s: Store, table: Int, key: Bytes) -> Found / {fs.read[r]} = {
+  let unwritten = map_len(s.puts) == 0 && map_len(s.drops) == 0;
+  match if unwritten { None } else { map_get(s.puts, slot(table, key)) } {
     Some(payload) -> Hit(payload),
-    None -> if map_contains(s.drops, slot(table, key)) { Miss } else {
+    None -> if !unwritten && map_contains(s.drops, slot(table, key)) { Miss } else {
       match located(s.index, table, s.sections, key) {
         None -> Miss,
         Some(at) ->
           frame_at[r](
             s.dir,
+            s.data,
             s.data_len,
             table,
             u64_at(s.index, at + key_width()),
@@ -242,16 +282,30 @@ pub fn get<[r]>(s: Store, table: Int, key: Bytes) -> Found / {fs.read[r]} =
       }
     },
   }
+}
 
 fn checksum(head: Bytes, payload: Bytes) -> Bytes = bytes_slice(bytes_blake3(head ++ payload), 0, 8)
 
-fn frame(table: Int, payload: Bytes) -> Bytes = {
+// A payload as the store writes it anywhere: its table, its length and a checksum before it.
+pub fn frame(table: Int, payload: Bytes) -> Bytes = {
   let head = byte_of_int(table) ++ u32_le(bytes_len(payload));
   bytes_concat_all([head, checksum(head, payload), payload])
 }
 
+// The payload of exactly one frame of `table`, or why these bytes are not one.
+pub fn unframe(table: Int, b: Bytes) -> Found =
+  if bytes_len(b) < frame_header() || u32_at(b, 1) != bytes_len(b) - frame_header() {
+    Bad("the bytes end inside a frame")
+  } else if bytes_at(b, 0) != table { Bad("a frame of another table") } else {
+    let payload = bytes_slice(b, frame_header(), bytes_len(b));
+    if checksum(bytes_slice(b, 0, 5), payload) != bytes_slice(b, 5, frame_header()) {
+      Bad("a frame does not match its checksum")
+    } else { Hit(payload) }
+  }
+
 fn frame_at<[r]>(
   dir: String,
+  data: Bytes,
   data_len: Int,
   table: Int,
   offset: Int,
@@ -260,18 +314,16 @@ fn frame_at<[r]>(
   if offset < data_header() || offset + frame_header() + len > data_len {
     Bad("an index entry points outside the data file")
   } else {
-    match fs.read_at[r](path(dir, data_name()), offset, frame_header() + len) {
+    let read = if bytes_len(data) >= data_len {
+      Some(bytes_slice(data, offset, offset + frame_header() + len))
+    } else { fs.read_at[r](path(dir, data_name()), offset, frame_header() + len) };
+    match read {
       None -> Bad("the data file could not be read"),
       Some(b) -> if bytes_len(b) != frame_header() + len {
         Bad("the data file ends inside a frame")
       } else if bytes_at(b, 0) != table || u32_at(b, 1) != len {
         Bad("an index entry does not name its frame")
-      } else {
-        let payload = bytes_slice(b, frame_header(), frame_header() + len);
-        if checksum(bytes_slice(b, 0, 5), payload) != bytes_slice(b, 5, frame_header()) {
-          Bad("a frame does not match its checksum")
-        } else { Hit(payload) }
-      },
+      } else { unframe(table, b) },
     }
   }
 
@@ -331,7 +383,7 @@ pub fn pending(s: Store) -> Int = map_len(s.puts) + map_len(s.drops)
 fn not_kept(s: Store, why: String) -> Store =
   warn(s, Unreadable, why ++ "; this run's entries were not kept")
 
-fn fresh_nonce() -> Bytes / {entropy.next, time.now_ms} =
+pub fn fresh_nonce() -> Bytes / {entropy.next, time.now_ms} =
   bytes_slice(bytes_blake3(u64_le(entropy.next()) ++ u64_le(time.now_ms())), 0, 16)
 
 fn data_head(nonce: Bytes, schema: Bytes) -> Bytes =
@@ -380,7 +432,7 @@ fn started<[r]>(
   let file = path(dir, data_name());
   if fs.write_file[r](file, data_head(nonce, schema)) && fs.sync[r](file) {
     {
-      disk: Some({ nonce: nonce, data_len: data_header(), index: b"", sections: [] }),
+      disk: Some({ nonce: nonce, data_len: data_header(), index: b"", sections: [], data: b"" }),
       warnings: warnings,
     }
   } else { { disk: None, warnings: warnings } }
@@ -592,7 +644,14 @@ fn copy_table<[r]>(dir: String, d: Disk, sec: Section, acc0: Copied) -> Copied /
     |acc: { frames: List<Bytes>, size: Int, records: List<Bytes>, dropped: Int }, i: Int| {
       let at = record_at(sec, i);
       let len = u32_at(d.index, at + key_width() + 8);
-      match frame_at[r](dir, d.data_len, sec.table, u64_at(d.index, at + key_width()), len) {
+      match frame_at[r](
+          dir,
+          d.data,
+          d.data_len,
+          sec.table,
+          u64_at(d.index, at + key_width()),
+          len,
+        ) {
         Hit(payload) -> {
           let f = frame(sec.table, payload);
           {

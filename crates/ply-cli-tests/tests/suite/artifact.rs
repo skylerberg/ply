@@ -269,8 +269,8 @@ fn a_flipped_bit_in_a_body_is_e0443_naming_the_definition() {
     let mut bytes = written(&artifact);
 
     // The first record starts past the header and section descriptors; its payload, past the 32-byte key and length prefix.
-    let sections = u32::from_le_bytes(bytes[180..184].try_into().unwrap()) as usize;
-    let record = 188 + 24 * sections;
+    let sections = u32::from_le_bytes(bytes[176..180].try_into().unwrap()) as usize;
+    let record = 184 + 24 * sections;
     bytes[record + 36] ^= 0x40;
     let path = dir.path().join("bad.plyx");
     std::fs::write(&path, &bytes).unwrap();
@@ -340,10 +340,10 @@ fn removing_a_body_is_e0443() {
 
 /// Rebuild the artifact versus transfer it again: opposite responses, so two codes.
 #[test]
-fn a_foreign_encoding_is_e0444_and_not_e0443() {
+fn another_compiler_or_runtime_is_e0444_and_not_e0443() {
     let dir = project(PROGRAM);
     let mut artifact = artifact_of(dir.path());
-    artifact.body_encoding += 1;
+    artifact.frontend = [7; 32];
     let path = dir.path().join("old.plyx");
     write_artifact(&path, &artifact);
 
@@ -353,11 +353,6 @@ fn a_foreign_encoding_is_e0444_and_not_e0443() {
         .unwrap();
     let report = json_of(&output);
     assert_eq!(report["diagnostics"][0]["code"], "E0444");
-
-    let mut stale = artifact_of(dir.path());
-    stale.frontend = [7; 32];
-    let err = artifact::decode(&written(&stale), &path).unwrap_err();
-    assert_eq!(err.code, codes::ARTIFACT_VERSION);
 
     let mut future = artifact_of(dir.path());
     future.runtime = [7; 32];

@@ -16,9 +16,13 @@ import compiler.resolve (Source, Mod, Diag, Label, diag1, qualify)
 import compiler.tycore (TyCon, TyFn)
 import diagnostic (Place, spot_of)
 import paths
-import sources (File, Project, DepPackage, load_resolved, shelf, nothing_here, is_std, is_compiler)
+import sources (File, Project, DepPackage, load_resolved, shelf, nothing_here, is_std, is_compiler,
+                shipped_digest_of)
 import builder (builder)
-import cache (store, Front, Sources, SourceFile, SourcePackage, Recorded, StdlibMoved, ShippedEntry)
+import cache (Front)
+import loads
+import loads (Sources, SourceFile, SourcePackage, Recorded, StdlibMoved, ShippedEntry)
+import std.random (entropy)
 
 // `whole` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
 // `pkgs` is what the load was made of, kept so a command that re-analyses a spliced program —
@@ -174,17 +178,12 @@ fn nothing_recorded() -> Recorded = { defs: [], tests: [], stdlib: None, warning
 fn rows_recorded(k: Recorded) -> Rows =
   { defs: map(k.defs, |d: DefInterface| d.row), tests: k.tests }
 
-// Where the store lives, as the machine names the root it loads: the first path, or the working
-// directory.
-fn store_root(paths: List<paths::Resolved>) -> String =
-  match list_at(paths, 0) { Some(r) -> r.machine, None -> "." }
-
 // Only a load of the whole project may drop what the cache holds for files it did not read.
 fn whole_project(paths: List<paths::Resolved>) -> Bool =
   match paths { [] -> true, [r] -> r.inside == ".", _ -> false }
 
-// A package's manifest digest is the identity the store files its sources under, and it is the one
-// `ply-store` computes: blake3 of the manifest text. A package with no manifest has no modules.
+// A package's manifest digest is the identity the store files its sources under: blake3 of the
+// manifest text. A package with no manifest has no modules.
 fn packages_of(pkgs: Pkgs) -> List<SourcePackage> =
   fold(pkgs.supplied, [], |acc: List<SourcePackage>, s: Supplied|
     match s.manifest {
@@ -234,9 +233,14 @@ fn recorded_for(
   paths: List<paths::Resolved>,
   project: Project,
   shelved: List<Source>,
-) -> Recorded / {store.known[cache]} =
-  if usable(project) { store.known[cache](store_root(paths), read_sources(project, shelved)) }
-  else { nothing_recorded() }
+) -> Recorded / {fs.read[cwd], fs.read[abs]} =
+  if usable(project) {
+    let place = loads::place_of(paths);
+    let sources = read_sources(project, shelved);
+    let now = shipped_digest_of(shelved);
+    if place.label == "cwd" { loads::known[cwd](place, sources, now) }
+    else { loads::known[abs](place, sources, now) }
+  } else { nothing_recorded() }
 
 fn same_diag(a: Diag, b: Diag) -> Bool = a.code == b.code && a.message == b.message
 
@@ -304,16 +308,21 @@ pub fn stdlib_notice(moved: Option<StdlibMoved>, h: HashOutput) -> List<Diag> =
 
 // A load that checked files what it published; the store's trouble is the run's warnings and
 // never its failure.
-fn filed(paths: List<paths::Resolved>, k: Recorded, p: Program) -> Program / {store.file[cache]} =
+fn filed(
+  paths: List<paths::Resolved>,
+  shelved: List<Source>,
+  k: Recorded,
+  p: Program,
+) -> Program / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} =
   match p.whole {
     None -> { ..p, diags: appended(k.warnings, p.diags) },
     Some(w) -> {
-      let more = store.file[cache](
-        store_root(paths),
-        { files: placed_sources(p, w), packages: packages_of(p.pkgs) },
-        filing(w),
-        whole_project(paths),
-      );
+      let place = loads::place_of(paths);
+      let sources = { files: placed_sources(p, w), packages: packages_of(p.pkgs) };
+      let now = shipped_digest_of(shelved);
+      let more = if place.label == "cwd" {
+        loads::file[cwd](place, sources, filing(w), whole_project(paths), now)
+      } else { loads::file[abs](place, sources, filing(w), whole_project(paths), now) };
       {
         ..p,
         diags: appended(
@@ -326,11 +335,11 @@ fn filed(paths: List<paths::Resolved>, k: Recorded, p: Program) -> Program / {st
 
 pub fn load_program(
   paths: List<paths::Resolved>,
-) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], store.known[cache], store.file[cache]} = {
+) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let project: Project = load_resolved(paths);
   let shelved: List<Source> = if usable(project) { shelf() } else { [] };
   let k: Recorded = recorded_for(paths, project, shelved);
-  filed(paths, k, assembled(project, shelved, paths, rows_recorded(k)))
+  filed(paths, shelved, k, assembled(project, shelved, paths, rows_recorded(k)))
 }
 
 // A load that neither reads nor files the front-end cache: what `ply build` and `ply hosts` take,
@@ -365,7 +374,7 @@ pub fn no_front() -> Front =
 // read cost, what the front end cost over them, and what filing its answer cost.
 pub fn timed_load(
   paths: List<paths::Resolved>,
-) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, store.known[cache], store.file[cache]} = {
+) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let started = time.elapsed_ms();
   timed_over(paths, load_resolved(paths), started)
 }
@@ -375,13 +384,13 @@ pub fn timed_over(
   paths: List<paths::Resolved>,
   project: Project,
   started: Int,
-) -> Timed / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, store.known[cache], store.file[cache]} = {
+) -> Timed / {builder.git[vcs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms} = {
   let shelved: List<Source> = if usable(project) { shelf() } else { [] };
   let k: Recorded = recorded_for(paths, project, shelved);
   let read_done = time.elapsed_ms();
   let p: Program = assembled(project, shelved, paths, rows_recorded(k));
   let front_done = time.elapsed_ms();
-  let kept: Program = filed(paths, k, p);
+  let kept: Program = filed(paths, shelved, k, p);
   {
     program: kept,
     read_ms: read_done - started,

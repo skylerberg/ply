@@ -56,9 +56,9 @@ fn a_family_lends_under_one_effect_and_that_is_the_one_a_program_declares() {
             );
         }
     }
-    // The two whose effect is not named for the family: a grant is checked against the effect.
+    // The one whose effect is not named for the family: a grant is checked against the effect.
     assert_eq!(policy::effect_of("claims"), Some("prover"));
-    assert_eq!(policy::effect_of("cache"), Some("store"));
+    assert_eq!(policy::effect_of("cache"), None);
     assert_eq!(policy::effect_of("everything"), None);
 }
 

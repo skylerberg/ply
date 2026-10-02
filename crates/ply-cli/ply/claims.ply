@@ -8,7 +8,7 @@
 import cmdline (Parsed, has, parse_nat, value, values_of)
 import proof.property (Ask, AskJudged, AskInterleaved, Asked, Batch, Judgements, Interleaved,
                        LawRun, discharged)
-import proof.evidence (evidence_of, evidence_text, evidence_tier)
+import proof.evidence (evidence_of, evidence_bytes, evidence_tier)
 import sim.plan
 import sim.plan (Seed)
 import proof.world (Built, Obligation, World, walks)
@@ -84,9 +84,6 @@ pub nondet effect prover {
   // `discharged` names by position.
   write configure[claims](options: Options, front: Front, world: World) -> Unit
   read collected[claims]() -> Result<Collected, Refusal>
-  // The text filed under each key the program names, which only `proof.evidence` reads. Every key
-  // is the program's: this is the only side that encodes one.
-  read cached[claims](keys: List<String>) -> List<Option<String>>
   // Binds what a discharge runs against, once, with the calls each evaluation of a claim may make,
   // and answers what opening the hosts had to say.
   read prepared[claims](step_budget: Int) -> Result<List<Diag>, Refusal>
@@ -99,12 +96,18 @@ pub nondet effect prover {
   // What the entries judging made ended with since the last read, such as spans a `law/host` left
   // open, whichever thread judged them; the read takes them.
   read ended[claims]() -> List<Diag>
+}
+
+// What a run reads from the store and files there, which whoever opened the store handles: the
+// evidence filed under each key this program names, and the baseline a reader accepted for each
+// definition. Every key is the program's: this is the only side that encodes one.
+pub effect proofs {
+  read cached(keys: List<String>) -> List<Option<Bytes>>
   // Files each discharge's evidence under the key this program chose for it, and answers what
   // storing it had to say.
-  write record[claims](entries: List<{ key: String, evidence: String }>) -> List<Diag>
-  // The baseline a reader accepted for each of these definitions, where there is one.
-  read baselines[claims](names: List<String>) -> List<{ name: String, record: Record }>
-  write accepted[claims](records: List<{ name: String, record: Record }>) -> Accepted
+  write record(entries: List<{ key: String, evidence: Bytes }>) -> List<Diag>
+  read baselines(names: List<String>) -> List<{ name: String, record: Record }>
+  write accepted(records: List<{ name: String, record: Record }>) -> Accepted
 }
 
 // --- What the Rust side answers with ---
@@ -604,15 +607,14 @@ pub fn decided<| e>(
   statics: Statics,
   reach: Bool,
   discharge: (List<Int>, List<Static>) -> Result<Discharged, Refusal> / e,
-) -> Result<Verdicts, Refusal> / {prover.cached[claims], prover.record[claims] | e} = {
+) -> Result<Verdicts, Refusal> / {proofs.cached, proofs.record | e} = {
   let digest = plan_digest_of(c.plan);
   let asked = map(wanted, |i: Int| blank_claim(c.claims, i));
   let keys = map(asked, |claim: Claim|
     { bare: claim.key, planned: hex_of(prove_key(bytes_of_hex(claim.key), digest)) });
   // What each claim's two keys hold, read once: the verdict is decided from it, and a cached
   // claim's evidence is read back from it.
-  let held = map(keys, |k: { bare: String, planned: String }|
-    prover.cached[claims]([k.bare, k.planned]));
+  let held = map(keys, |k: { bare: String, planned: String }| proofs.cached([k.bare, k.planned]));
   let answers = map(range(0, len(keys)), |i: Int| {
     let k = blank_keys(keys, i);
     let h = match list_at(held, i) { Some(texts) -> texts, None -> [] };
@@ -642,13 +644,13 @@ pub fn decided<| e>(
       let outcomes = answered(asked, selection.from, read, selection.to_discharge, d.outcomes);
       let filed = filings(keys, hosted, map(outcomes, tier_of), selection.to_discharge, use_cache);
       let stored = if len(filed) == 0 { [] } else {
-        prover.record[claims](
+        proofs.record(
           fold(
             filed,
             [],
-            |acc: List<{ key: String, evidence: String }>, f: { at: Int, key: String }|
+            |acc: List<{ key: String, evidence: Bytes }>, f: { at: Int, key: String }|
               match list_at(outcomes, f.at) {
-                Some(Held(h)) -> push(acc, { key: f.key, evidence: evidence_text(h.evidence) }),
+                Some(Held(h)) -> push(acc, { key: f.key, evidence: evidence_bytes(h.evidence) }),
                 _ -> acc,
               },
           ),
@@ -682,7 +684,7 @@ fn blank_keys(
 
 // What a key holds as the cache's verdict reads it: a proof, a sample, or something no discharge
 // files.
-fn filed_kind(text: Option<String>) -> Option<String> =
+fn filed_kind(text: Option<Bytes>) -> Option<String> =
   match text {
     None -> None,
     Some(t) ->
@@ -814,7 +816,7 @@ fn judged_lanes(
   }
 
 // The n-th answer, or none when the runtime answered fewer than were asked.
-fn held_at(held: List<Option<String>>, i: Int) -> Option<String> =
+fn held_at(held: List<Option<Bytes>>, i: Int) -> Option<Bytes> =
   match list_at(held, i) { Some(x) -> x, None -> None }
 
 // The claim at a collection index, or a blank one: a fixture's collection may be shorter than the
