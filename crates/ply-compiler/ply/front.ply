@@ -25,13 +25,15 @@ import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, L
               update_shapes_with, expanded_mods, check_front_with, is_prelude_effect,
               builtin_schemes, builtin_docs, find_doc, published_pure)
 import diag (Parsed, parse_all, parse_at, outside_every_module, placed)
-import pkg (Pkgs, Closure, Package, Pinned, closure, empty, pins_of)
+import pkg (Pkgs, Supplied, Closure, Package, Pinned, closure, empty, pins_of)
 import resolve (Pkg, resolve_packaged, no_pkgs)
 import std.bin
 import std.hash (blake3)
 import std.pkg (Manifest)
 import fmt (item_range, replace_item)
 import rewrite (fn_has_update)
+import embed (EmbedAt, EmbedRead, EmbedWant, embed_key, embed_tables, embedded, rewritten, wants_of)
+import items (parse)
 
 fn joined(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
@@ -1063,6 +1065,7 @@ fn tables(
   packages: List<Pkg>,
   pins: List<Pinned>,
   mod_pkg: List<Int>,
+  embeds: List<EmbedAt>,
 ) -> Dump = {
   let fns = fn_written(mods);
   let effs = effect_written(mods);
@@ -1090,6 +1093,7 @@ fn tables(
     ordinals: map(mods, ordinal_row),
     bodies: h.bodies,
     test_bodies: h.test_bodies,
+    embeds: embeds,
   }
 }
 
@@ -1112,6 +1116,8 @@ pub type Whole = {
   mod_pkg: List<Int>,
   // The modules a compiled package's stubs stand for: their bodies are blanks.
   stubs: List<Bytes>,
+  // What each module embeds, for every pass that parses its text again.
+  embeds: List<EmbedAt>,
 }
 
 // A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
@@ -1670,6 +1676,7 @@ fn analyse_closure(
   root_count: Int,
   toolchain: Bool,
   ifaces: Interfaces = { stubs: [], defs: [], fixed: [] },
+  embeds: List<EmbedAt> = [],
 ) -> Analysis = {
   // The packages' identity reports ahead of anything the program text has to say: manifest
   // and graph diags point one slot past every module, in manifest order.
@@ -1727,9 +1734,10 @@ fn analyse_closure(
                 ),
                 manifest: at(clo.packages, 0).manifest,
                 packages: tables.pkgs,
-                pins: pins_of(clo),
+                pins: pins_of(clo, embeds),
                 mod_pkg: tables.mod_pkg,
                 stubs: map(ifaces.stubs, |s: Source| s.name),
+                embeds: embeds,
               })
             }
           }
@@ -1764,9 +1772,21 @@ pub fn dump_of(a: Analysis) -> Dump =
         ordinals: [],
         bodies: [],
         test_bodies: [],
+        embeds: [],
       },
     Analysed(w) ->
-      tables(w.warnings, w.mods, w.r, w.checked, w.index, w.hashes, w.packages, w.pins, w.mod_pkg),
+      tables(
+        w.warnings,
+        w.mods,
+        w.r,
+        w.checked,
+        w.index,
+        w.hashes,
+        w.packages,
+        w.pins,
+        w.mod_pkg,
+        w.embeds,
+      ),
   }
 
 // A builtin as the checker binds it, and the names its parameters are documented under.
@@ -2049,8 +2069,11 @@ pub fn rehash(
   pkgs: List<Pkg> = [],
   mod_pkg: List<Int> = [],
   shelf: Int = 0,
+  embeds: List<EmbedAt> = [],
 ) -> Rehashed = {
-  let mods = map(parse_all(sources), |p: Parsed| p.module);
+  let tables = embed_tables(embeds);
+  let mods = map(parse_all(sources), |p: Parsed|
+    { ..p.module, module: rewritten(tables, p.name, p.module.module).module });
   let packaged = if len(pkgs) == 0 { no_pkgs(mods) }
   else { { pkgs: pkgs, mod_pkg: mod_pkg, std: shelf - 2, compiler: shelf - 1, shelf: shelf } };
   match resolve_packaged(
@@ -2203,17 +2226,24 @@ pub fn analyse_pulling_std_with(
   tests: List<KnownTestRow>,
   pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
   ifaces: Interfaces = { stubs: [], defs: [], fixed: [] },
+  embeds: List<Embedded> = [],
 ) -> Pulled = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let stubs = stubbed(ifaces);
   let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, read_as(stubs, s).src));
-  let assembled = fold(
+  let parsed = fold(
     clo.modules,
     parse_all(user),
     |acc: List<Parsed>, m: { pkg: Int, src: Source }|
       push(acc, parse_at(len(acc), read_as(stubs, m.src))),
   );
+  let mentions = append(
+    map(user, |s: Source| names_embed(s.src)),
+    map(clo.modules, |m: { pkg: Int, src: Source }| names_embed(m.src.src)),
+  );
+  let written = embedded_all(parsed, own_names(pkgs, user), mentions, embeds);
+  let assembled = written.parsed;
   // The toolchain's own tree loads without its implicit self: every root module under `std`
   // with the whole shipped set among them is the built-in package's sources.
   let toolchain = fold(user, true, |acc: Bool, s: Source| acc && is_std(s.name))
@@ -2227,9 +2257,85 @@ pub fn analyse_pulling_std_with(
   {
     pulled: x.pulled,
     out: if len(x.diags) > 0 { Refused(x.diags) } else {
-      analyse_closure(x.parsed, clo, append(defs, ifaces.defs), tests, len(user), toolchain, ifaces)
+      analyse_closure(
+        x.parsed,
+        clo,
+        append(defs, ifaces.defs),
+        tests,
+        len(user),
+        toolchain,
+        ifaces,
+        written.at,
+      )
     },
   }
+}
+
+// --- Embeds ----------------------------------------------------------------------------------
+
+// What the driver read for one embed: the module by its package's root key and its own name in that
+// package, what it asked for, and what was read.
+pub type Embedded = { root: Bytes, module: Bytes, want: EmbedWant, read: EmbedRead }
+
+fn names_embed(src: Bytes) -> Bool = bytes_index_of(src, b"embed") != None
+
+// What the modules of the package at `root` ask to embed. Only a module whose text names `embed`
+// is parsed for it.
+pub fn embeds_wanted(root: Bytes, sources: List<Source>) -> List<Embedded> =
+  fold(sources, [], |acc: List<Embedded>, s: Source|
+    if !names_embed(s.src) { acc } else {
+      fold(wants_of(parse(s.src).node), acc, |a: List<Embedded>, w: EmbedWant|
+        push(a, { root: root, module: s.name, want: w, read: Err(b"not read yet") }))
+    })
+
+fn embed_slot(root: Bytes, module: Bytes) -> Bytes = bytes_concat_all([root, b"\x00", module])
+
+// Each parsed module's package root and own name, in the order the program and its dependencies
+// were parsed.
+fn own_names(pkgs: Pkgs, user: List<Source>) -> List<Bytes> =
+  fold(
+    pkgs.supplied,
+    map(user, |s: Source| embed_slot(pkgs.root, s.name)),
+    |acc: List<Bytes>, sp: Supplied|
+      fold(sp.modules, acc, |a: List<Bytes>, s: Source| push(a, embed_slot(sp.root, s.name))),
+  )
+
+// Every module that names `embed` with its embeds written out, a read that failed as its
+// diagnostic, and the reads by each module's name in the program.
+fn embedded_all(
+  parsed: List<Parsed>,
+  slots: List<Bytes>,
+  mentions: List<Bool>,
+  embeds: List<Embedded>,
+) -> { parsed: List<Parsed>, at: List<EmbedAt> } = {
+  let tables = fold(embeds, map_new(), |acc: Map<Bytes, Map<Bytes, EmbedRead>>, e: Embedded| {
+    let slot = embed_slot(e.root, e.module);
+    let was = match map_get(acc, slot) { Some(t) -> t, None -> map_new() };
+    map_insert(acc, slot, map_insert(was, embed_key(e.want), e.read))
+  });
+  fold(
+    range(0, len(parsed)),
+    { parsed: [], at: [] },
+    |acc: { parsed: List<Parsed>, at: List<EmbedAt> }, i: Int| {
+      let p = at(parsed, i);
+      match ((list_at(slots, i), list_at(mentions, i))) {
+        (Some(slot), Some(true)) -> {
+          let table = match map_get(tables, slot) { Some(t) -> t, None -> map_new() };
+          let r = embedded(p.module.module, table, []);
+          {
+            parsed: push(acc.parsed, {
+              ..p,
+              module: { ..p.module, module: r.module },
+              diags: append(p.diags, map(r.diags, |d: PDiag| placed(i, d))),
+            }),
+            at: map_fold(table, acc.at, |a: List<EmbedAt>, key: Bytes, read: EmbedRead|
+              push(a, { module: p.name, key: key, read: read })),
+          }
+        },
+        _ -> { ..acc, parsed: push(acc.parsed, p) },
+      }
+    },
+  )
 }
 
 // The front end's answer as values: the shipped modules pulled in, in the order a label's module
@@ -2247,8 +2353,17 @@ pub fn answer_pulling_std_with(
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
   pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
+  embeds: List<Embedded> = [],
 ) -> FrontAnswer = {
-  let x: Pulled = analyse_pulling_std_with(user, shipped, defs, tests, pkgs);
+  let x: Pulled = analyse_pulling_std_with(
+    user,
+    shipped,
+    defs,
+    tests,
+    pkgs,
+    no_interfaces(),
+    embeds,
+  );
   { pulled: x.pulled, dump: dump_of(x.out) }
 }
 
@@ -2406,6 +2521,7 @@ pub type Dump = {
   ordinals: List<OrdinalRow>,
   bodies: List<BodyRow>,
   test_bodies: List<Bytes>,
+  embeds: List<EmbedAt>,
 }
 
 pub fn has_error(ds: List<Diag>) -> Bool =
@@ -4023,6 +4139,24 @@ fn hash_of(sources: List<Source>, name: Bytes) -> Bytes =
     },
   }
 
+test "a map or a set literal and the call it builds are one definition" {
+  let lit = [
+    {
+      name: b"m",
+      src: b"pub fn two() -> Map<Int, Int> = #{1: 2, 3: 4}\npub fn s() -> Map<Int, Unit> = #[5]",
+    },
+  ];
+  let call = [
+    {
+      name: b"m",
+      src: b"pub fn two() -> Map<Int, Int> = map_of_entries([{key: 1, value: 2}, {key: 3, value: 4}])\npub fn s() -> Map<Int, Unit> = map_of_entries([{key: 5, value: ()}])",
+    },
+  ];
+  assert(hash_of(lit, b"m.two") != b"");
+  assert_eq(hash_of(lit, b"m.two"), hash_of(call, b"m.two"));
+  assert_eq(hash_of(lit, b"m.s"), hash_of(call, b"m.s"))
+}
+
 test "a qualified name that is not exported moves the hash of everything that names it" {
   let caller = b"import a\npub fn two() -> Int = a::one()";
   let exported = [{ name: b"a", src: b"pub fn one() -> Int = 1" }, { name: b"b", src: caller }];
@@ -4192,3 +4326,140 @@ test "a cycle of packages is refused, naming the cycle" {
 
 fn has_diag(diags: List<{ slot: Int, diag: PDiag }>, code: Bytes) -> Bool =
   fold(diags, false, |acc: Bool, sd: { slot: Int, diag: PDiag }| acc || sd.diag.code == code)
+
+// --- Embeds: tests ---------------------------------------------------------------
+
+type Read = { want: EmbedWant, read: EmbedRead }
+
+fn embedding_in(pkgs: Pkgs, user: List<Source>, reads: List<Read>) -> Analysis =
+  analyse_pulling_std_with(
+    user,
+    [],
+    [],
+    [],
+    pkgs,
+    no_interfaces(),
+    map(reads, |r: Read| { root: pkgs.root, module: b"m", want: r.want, read: r.read }),
+  ).out
+
+fn embedding(src: Bytes, reads: List<Read>) -> Analysis =
+  embedding_in({ root: b"r", manifest: None, supplied: [] }, [{ name: b"m", src: src }], reads)
+
+fn a_file(bytes: Bytes) -> Read =
+  { want: { path: b"d.txt", dir: false }, read: Ok([{ name: b"", bytes: bytes }]) }
+
+fn checked_whole(a: Analysis) -> Whole =
+  match a {
+    Refused(ds) ->
+      panic(
+        string_of_bytes_lossy(
+          joined(map(ds, |d: Diag| bytes_concat_all([d.code, b": ", d.message])), b"; "),
+        ),
+      ),
+    Analysed(w) -> w,
+  }
+
+fn def_hash_in(a: Analysis, name: Bytes) -> Bytes =
+  match filter(checked_whole(a).hashes.defs, |d: { name: Bytes, hash: Bytes }| d.name == name) {
+    [d, ..] -> d.hash,
+    [] -> panic("no such definition"),
+  }
+
+fn refused_codes(a: Analysis) -> List<Bytes> =
+  match a { Refused(ds) -> map(ds, |d: Diag| d.code), Analysed(_) -> [] }
+
+test "an embed is the bytes read for it, and other bytes are another definition" {
+  let src = b"fn data() -> Bytes = embed(\"d.txt\")\nfn other() -> Int = 1\n";
+  let one = embedding(src, [a_file(b"one")]);
+  let two = embedding(src, [a_file(b"two")]);
+  assert(def_hash_in(one, b"m.data") != def_hash_in(two, b"m.data"));
+  assert_eq(def_hash_in(one, b"m.other"), def_hash_in(two, b"m.other"));
+  assert_eq(
+    def_hash_in(one, b"m.data"),
+    def_hash_in(
+      embedding(b"fn data() -> Bytes = b\"one\"\nfn other() -> Int = 1\n", []),
+      b"m.data",
+    ),
+  )
+}
+
+test "a directory embed is its files as records, by their paths below it" {
+  let src = b"fn tree() -> List<{ name: String, bytes: Bytes }> = embed_dir(\"t\")\n";
+  let w = checked_whole(
+    embedding(src, [
+      {
+        want: { path: b"t", dir: true },
+        read: Ok([{ name: b"a", bytes: b"1" }, { name: b"b/c", bytes: b"2" }]),
+      },
+    ]),
+  );
+  assert_eq(map(w.embeds, |e: EmbedAt| e.key), [b"dir:t"])
+}
+
+test "an embed's path is a literal, and an embed nothing could be read for is refused" {
+  assert_eq(
+    refused_codes(
+      embedding(b"fn p() -> String = \"d.txt\"\nfn data() -> Bytes = embed(p())\n", []),
+    ),
+    [b"E0147"],
+  );
+  assert_eq(
+    refused_codes(
+      embedding(b"fn data() -> Bytes = embed(\"d.txt\")\n", [
+        { want: { path: b"d.txt", dir: false }, read: Err(b"`d.txt` does not exist") },
+      ]),
+    ),
+    [b"E0146"],
+  );
+  assert_eq(refused_codes(embedding(b"fn data() -> Bytes = embed(\"d.txt\")\n", [])), [b"E0146"])
+}
+
+test "a module that binds `embed` itself calls its own" {
+  let w = checked_whole(
+    embedding(
+      b"fn embed(p: String) -> Bytes = b\"mine\"\nfn data() -> Bytes = embed(\"d.txt\")\n",
+      [],
+    ),
+  );
+  assert_eq(w.embeds, [])
+}
+
+test "a rehash writes the embeds the answer carries" {
+  let sources = [{ name: b"m", src: b"fn data() -> Bytes = embed(\"d.txt\")\n" }];
+  let w = checked_whole(
+    embedding_in({ root: b"r", manifest: None, supplied: [] }, sources, [a_file(b"one")]),
+  );
+  assert(len(rehash(sources, [], w.packages, w.mod_pkg, len(w.packages), w.embeds).nodes) > 0)
+}
+
+test "a dependency is pinned by what its modules embed as well as by their text" {
+  let user = [{ name: b"main", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  let pkgs = with_lib(user);
+  let embedding_lib = |read: Option<Bytes>| {
+    let lib = at(pkgs.supplied, 0);
+    let src = match read {
+      Some(_) -> b"pub fn answer() -> Int = bytes_len(embed(\"n.txt\"))",
+      None -> b"pub fn answer() -> Int = 42",
+    };
+    let changed = { ..pkgs, supplied: [{ ..lib, modules: [{ name: b"answer", src: src }] }] };
+    let reads = match read {
+      Some(b) ->
+        [
+          {
+            root: b"lib",
+            module: b"answer",
+            want: { path: b"n.txt", dir: false },
+            read: Ok([{ name: b"", bytes: b }]),
+          },
+        ],
+      None -> [],
+    };
+    map(
+      checked_whole(
+        analyse_pulling_std_with(user, [], [], [], changed, no_interfaces(), reads).out,
+      ).pins,
+      |p: Pinned| p.digest,
+    )
+  };
+  assert(embedding_lib(Some(b"one")) != embedding_lib(Some(b"two")))
+}

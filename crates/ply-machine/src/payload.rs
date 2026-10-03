@@ -295,6 +295,7 @@ pub fn plain_value(p: &Plain) -> PlyValue {
                 PlyValue::Fixed(ply_eval::Fixed::new(IntTy::U128, *bits)),
             ],
         ),
+        Plain::Char(c) => value_ctor("VChar", vec![PlyValue::Char(*c)]),
         Plain::Str(s) => value_ctor("VStr", vec![PlyValue::str(s)]),
         Plain::Bytes(b) => value_ctor("VBytes", vec![PlyValue::bytes(b)]),
         Plain::List(items) => value_ctor(
@@ -438,6 +439,12 @@ pub fn value_plain(v: &PlyValue, span: Span) -> Result<Plain, Diagnostic> {
                 ty,
                 bits: ty.normalize(bits.bits()) & mask(ty),
             }
+        }
+        "VChar" => {
+            let PlyValue::Char(c) = arg(0)? else {
+                return Err(bad("holds no `Char`"));
+            };
+            Plain::Char(*c)
         }
         "VStr" => Plain::Str(text(arg(0)?)?),
         "VBytes" => Plain::Bytes(arg(0)?.as_bytes(span, "a `std.value` bytes")?.to_vec()),

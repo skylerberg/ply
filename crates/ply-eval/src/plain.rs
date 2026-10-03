@@ -45,6 +45,7 @@ pub enum Plain {
     /// What a bounded snapshot left out: `n` more items of a list or map, or with `0`, all
     /// that was nested deeper.
     Elided(u64),
+    Char(char),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -87,6 +88,7 @@ impl Plain {
             Plain::Float(f) => Value::Float(f),
             Plain::Decimal(d) => Value::Decimal(d),
             Plain::Fixed { ty, bits } => Value::Fixed(crate::Fixed::new(ty, bits)),
+            Plain::Char(c) => Value::Char(c),
             Plain::Str(s) => Value::str(s),
             Plain::Bytes(b) => Value::bytes(b),
             Plain::List(items) => Value::list(grow(|| values(items))?),
@@ -137,6 +139,7 @@ impl Plain {
             Plain::Float(_) => "a `Float`",
             Plain::Decimal(_) => "a `Decimal`",
             Plain::Fixed { .. } => "a fixed-width integer",
+            Plain::Char(_) => "a `Char`",
             Plain::Str(_) => "a `String`",
             Plain::Bytes(_) => "a `Bytes`",
             Plain::List(_) => "a `List`",
@@ -187,6 +190,7 @@ fn snapshot(v: &Value, bound: Option<(usize, usize)>, depth: usize) -> Plain {
             ty: f.ty,
             bits: f.raw(),
         },
+        Value::Char(c) => Plain::Char(*c),
         Value::Str(s) => Plain::Str(s.to_string()),
         Value::Bytes(b) => Plain::Bytes(b.to_vec()),
         Value::List(items) => {

@@ -112,6 +112,9 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `"text"` | `String` | UTF-8; no line breaks. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
+| `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
+| `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
+| `#[1, 2]` | `Map<a, Unit>` | A set: each element a key whose value is `()`. |
 | `true`, `false` / `()` | `Bool` / `Unit` | |
 
 `1`, `1.0`, `1m` and `1u32` have four types and never convert implicitly
@@ -119,8 +122,13 @@ These are keywords only in the position shown and identifiers elsewhere:
 minus, except in a pattern. The smallest signed value of a width cannot be
 written as a literal; use `i8_of_int(-128)`.
 
-String escapes are `\n` `\t` `\r` `\0` `\\` `\"` (no `\u`). Byte strings add
-`\xNN` and refuse source characters above `U+007F`.
+String and character escapes are `\n` `\t` `\r` `\0` `\\` `\"` `\'` and `\u{...}`, one to six hex
+digits naming a Unicode scalar value (a surrogate or a value past `10FFFF` is `E0211`). Byte
+strings add `\xNN`, refuse `\u{...}` and refuse source characters above `U+007F`.
+
+A map literal is the call `map_of_entries([{key: k, value: v}, ..])` and a set literal the same
+with `()` for each value, so either spelling is one definition with one hash; `ply fmt` keeps the
+one written.
 
 A line string is a run of lines that each start with `\\`, led only by blanks.
 Everything after the `\\` to the end of its line is text, verbatim: nothing is
@@ -159,8 +167,9 @@ Loosest to tightest; all binary operators are left-associative:
 | — | postfix `f(x)` `r.field` `e.op[r](x)` `e?` | |
 
 * `==`/`!=` are structural at every type except functions. `Float` equality is
-  IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work only on numeric types; order
-  anything else with `compare`.
+  IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work on numeric types and on `Char`,
+  by scalar value; order anything else with `compare`. Arithmetic on a `Char` is
+  `E0201`: go through `int_of_char`.
 * Both operands have one type; there is no widening (`U8 + U16` is `E0201`).
 * Arithmetic is checked: overflow, division by zero, and a shift count that is
   negative or not less than the type's width raise `E0502`. `<<` discards
@@ -316,8 +325,9 @@ and kept by a lock that already pins it.
 
 `ply build` records what it resolved in `ply.lock`, beside the package's own
 `ply.pkg`: every dependency's name, its version, and the BLAKE3 digest of the
-modules it contributed, sorted by name, and for a registry dependency the
-`archive` digest it was fetched as. A package is pinned by *what* it is and
+modules it contributed, sorted by name, with what they embed (§3.4), and for a
+registry dependency the `archive` digest it was fetched as. A package is pinned
+by *what* it is and
 never by where it was found, so a moved checkout keeps its pin. A build verifies
 the lock before it writes an artifact — a dependency whose sources moved since it
 was pinned is `E0138`, and a lock this `ply` cannot read is `E0139` — and writes
@@ -346,6 +356,24 @@ check`, `ply test`, `ply prove`) runs the command for every package the path
 reaches by a path dependency as well, each as its own root with its own cache,
 dependencies first; a fetched or vendored dependency is never one of them.
 
+### 3.4 Embedding files
+
+```ply
+fn schema() -> Bytes = embed("schema.sql")
+fn fixtures() -> List<{ name: String, bytes: Bytes }> = embed_dir("fixtures")
+```
+
+`embed("path")` is the bytes of a file, and `embed_dir("path")` every file under
+a directory by its path below it (`a/b.txt`), in that order; nothing under a
+name starting with `.` is read. The path is a string literal (`E0147`), read
+relative to the module's own file when the program is loaded, and the call is
+written out as what was read before anything hashes or checks the module. The
+bytes are therefore part of the definition's hash: a test reading an embedded
+file reruns exactly when the file changes, and is cached while it does not. A
+path that does not exist, a directory handed to `embed`, a file handed to
+`embed_dir`, or a file that cannot be read is `E0146`, which refuses the load. A
+module that declares or imports its own `embed` or `embed_dir` calls that one.
+
 ## 4. Types
 
 Types are inferred by Hindley–Milner unification with row polymorphism. Written
@@ -360,6 +388,7 @@ signatures are checked, not inferred (§4.7).
 | `Float` | IEEE-754 binary64 |
 | `Decimal` | exact base 10; `+ - * %` are exact or raise |
 | `Bool`, `Unit` | `true`/`false`, `()` |
+| `Char` | one Unicode scalar value: `U+0000` to `U+10FFFF` without the surrogates |
 | `String` | UTF-8, indexed and sliced by character |
 | `Bytes` | immutable bytes, indexed by byte |
 
@@ -388,11 +417,18 @@ A tuple is a record with positional fields: `(A, B)` is `{_0: A, _1: B}` in
 types, values and patterns, accessed as `t._0`. `(A)` only groups; `()` is
 `Unit`.
 
+An alias may take parameters and name a type that constrains them, as
+`type Set<a> = Map<a, Unit>` names a map keyed by `a`. The alias carries no
+constraint: each signature that uses it promises what its expansion needs,
+`where derivable(ord, a)` here, and one that does not is `E0206` where it names
+the alias.
+
 ### 4.3 Lists and maps
 
 `List<a>` is an immutable homogeneous sequence `[a, b, c]` (§5.6). `Map<k, v>`
-is an immutable sorted map with no literal; build it with `map_new`,
-`map_insert` or `map_of_entries`. It iterates in `compare` order. Its key type
+is an immutable sorted map, written `#{k: v}` or built with `map_new`,
+`map_insert` or `map_of_entries`; a set is a `Map` whose values are `()`,
+written `#[a, b]`. It iterates in `compare` order. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell` and
 `Task` are refused (`E0206`).
 
@@ -1006,8 +1042,8 @@ this. `--json` prints one object with each failure's diagnostic, declared
 footprint, suspects, culprit and replay command (`schema_version` 6); the
 suspects are ranked culprits first, then an edited definition before one whose
 hash only moved. Each result counts the operations its test performed,
-handled ones included, as `performs`. `--watch` re-runs on every `.ply` change,
-keeping caches in memory.
+handled ones included, as `performs`. `--watch` re-runs on every `.ply` change
+and on every change to what the last run embedded, keeping caches in memory.
 
 ### 8.5 Coverage and mutants
 
@@ -1250,7 +1286,8 @@ module imported (`import std.json`, `import std.bin`), or the `derive` is
 
 ## 12. Builtins
 
-In scope everywhere; a module may shadow any except `compare_values` (`E0105`).
+In scope everywhere; a module may shadow any except `compare_values` and
+`map_of_entries`, which the map and set literals are written in (`E0105`).
 Out-of-range indexes and slices raise `E0502` unless noted; nothing is clamped.
 `ply doc NAME` prints any of these from the compiler's own table, which is the
 authority when this page and it disagree.
@@ -1307,6 +1344,10 @@ Strings are indexed by character, bytes by byte.
 | `string_trim`, `string_lower`, `string_upper` `(s: String) -> String` | |
 | `string_starts_with`, `string_ends_with`, `string_contains` `(s: String, t: String) -> Bool` | |
 | `string_find(s: String, needle: String) -> Int` | raises if absent |
+| `string_chars(s: String) -> List<Char>` | each character in order |
+| `string_of_chars(cs: List<Char>) -> String` | |
+| `char_of_int(n: Int) -> Option<Char>` | `None` for a negative, a surrogate or past `U+10FFFF` |
+| `int_of_char(c: Char) -> Int` | the scalar value |
 | `string_concat(a: String, b: String) -> String` | `a ++ b` |
 | `int_to_string(n: Int) -> String` | |
 | `float_to_string(f: Float) -> String` | shortest round-trip; `Infinity`, `-Infinity` and `NaN` |
@@ -2500,11 +2541,9 @@ pub fn is_subset<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Bool
 pub fn is_superset<a>(a: Map<a, Unit>, b: Map<a, Unit>) -> Bool
 ```
 
-A set is a `Map` whose values are `Unit` and nothing else, and there is no set
-type in the language yet: an alias would read better — `type Set<a>` — but a
-`Map` key has to be ordered, the constraint would have to ride on the alias, and a
-type alias cannot carry `derivable` (card `313874be`). Until it can, the parameter
-is the map and the constraint is on the signature. The key order is the set's
+A set is a `Map` whose values are `Unit` and nothing else, written `#[a, b]`,
+and each signature here spells the map out with the constraint its key needs.
+The key order is the set's
 order, so `elements` is stable. `union` is `map_merge`, which is why a duplicate
 is inserted once however many times it appears in the `of_list`; `intersection`
 and `difference` walk one set's elements and ask the other, so each is `n log n`.
@@ -2609,7 +2648,7 @@ below that and an infinity above `2^1023`.
 ```ply
 pub type Value =
   | VUnit | VBool(Bool) | VInt(Int) | VFloat(Float) | VDecimal(Decimal)
-  | VFixed(String, U128) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
+  | VFixed(String, U128) | VChar(Char) | VStr(String) | VBytes(Bytes) | VList(List<Value>)
   | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>)
   | VFn(Fun) | VCell({ index: Int, generation: Int }) | VTask(Int) | VSecret | VElided(Int)
 pub type Field = { name: String, value: Value }
@@ -2949,7 +2988,8 @@ filed by a compiler whose shipped modules differed says so once, as `W0605`.
 `ply run` over sources goes further: once a load holds, the front end's answer
 is filed under a key of everything it and the `reuse fn` promise check (`E0127`)
 read — the name and bytes of every module the walk read, the root's manifest,
-each dependency's key, manifest and modules, the root's absolute path, the `ply`
+each dependency's key, manifest and modules, what the modules embed, the root's
+absolute path, the `ply`
 program and the modules it ships as the launcher gates them (so `PLY_C_EMITTER`
 too), the binary's version, and `--config-schema`. A later run whose walk hashes
 the same takes that answer and runs neither the front end nor the promise check,
@@ -3063,6 +3103,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0143` | a registry dependency no published version satisfies |
 | `E0144` | a publish or a yank the registry refused |
 | `E0145` | a package or a version no registry takes |
+| `E0146` | an embed whose file or directory could not be read |
+| `E0147` | an embed whose path is not a string literal |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |

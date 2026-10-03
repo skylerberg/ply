@@ -15,7 +15,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               EParallel, EBad, RecField, NamedArg, Param, Stmt, SLet, SLetElse, SExpr, MatchArm,
               HandleClause, ReturnClause, expr_span, is_block_like)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
-                 LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad, pat_span)
+                 LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
 
 // --- The entry point --------------------------------------------------------
 
@@ -461,6 +461,7 @@ fn lit_text(p: Pr, s: Span, l: Lit) -> Bytes =
     LBytes(_) -> unparen(p, s),
     LFloat(r) -> r,
     LDec(r) -> r,
+    LChar(_) -> unparen(p, s),
     LUnit -> b"()",
     LBad -> b"()",
   }
@@ -741,14 +742,17 @@ fn flat_expr(p: Pr, e: Expr) -> Option<Bytes> =
     EUnary(v) ->
       cat([Some(unary_text(v.op)), wrap(flat_expr(p, v.operand), parens_unary(v.operand))]),
     ELambda(v) -> cat([Some(lambda_head(p, v.params, v.ret)), Some(b" "), flat_expr(p, v.body)]),
-    EApp(v) ->
-      cat([
-        wrap(flat_expr(p, v.func), parens_callee(v.func)),
-        Some(call_labels(v.labels)),
-        Some(b"("),
-        flat_args(p, v.args, v.named),
-        Some(b")"),
-      ]),
+    EApp(v) -> match literal_of(p, e) {
+      Some(m) -> flat_literal(p, m),
+      None ->
+        cat([
+          wrap(flat_expr(p, v.func), parens_callee(v.func)),
+          Some(call_labels(v.labels)),
+          Some(b"("),
+          flat_args(p, v.args, v.named),
+          Some(b")"),
+        ]),
+    },
     EIf(v) ->
       cat([
         Some(b"if "),
@@ -885,10 +889,13 @@ fn broken(p: Pr, st: St, e: Expr, indent: Int, cont: Int, after: Int) -> St =
     EUnary(v) ->
       operand(p, emit(st, unary_text(v.op)), v.operand, parens_unary(v.operand), indent, after),
     ELambda(v) -> lambda(p, st, v.params, v.ret, v.body, indent, after),
-    EApp(v) -> {
-      let ls = call_labels(v.labels);
-      let s1 = operand(p, st, v.func, parens_callee(v.func), indent, 1 + bytes_len(ls));
-      call(p, emit(s1, ls), v.args, v.named, v.span, indent, after)
+    EApp(v) -> match literal_of(p, e) {
+      Some(m) -> literal(p, st, m, indent),
+      None -> {
+        let ls = call_labels(v.labels);
+        let s1 = operand(p, st, v.func, parens_callee(v.func), indent, 1 + bytes_len(ls));
+        call(p, emit(s1, ls), v.args, v.named, v.span, indent, after)
+      },
     },
     EIf(_) -> if_chain(p, st, e, indent, after),
     EMatch(v) -> match_expr(p, st, v.scrutinee, v.arms, v.span, indent),
@@ -1081,6 +1088,86 @@ fn elements(
   let s2 = fold(range(0, len(items)), s1, |s: St, i: Int|
     element(p, s, at(items, i), indent + 2, i == len(items) - 1));
   close(p, s2, sp.end, indent, closer)
+}
+
+// A map or set literal the parser built a `map_of_entries` call of: the source still opens it with
+// `#{` or `#[`, which a call spelled out never does.
+type Literal = { set: Bool, entries: List<{ key: Expr, value: Expr }>, span: Span }
+
+fn literal_of(p: Pr, e: Expr) -> Option<Literal> =
+  match e {
+    EApp(a) -> match a.func {
+      EVar(f) -> if f.name.module != None || f.name.name.name != b"map_of_entries" { None } else {
+        let opener = bytes_slice(p.src, a.span.start, a.span.start + 2);
+        match a.args {
+          [EList(l)] -> if opener == b"#{" || opener == b"#[" {
+            Some({
+              set: opener == b"#[",
+              entries: map(l.items, |x: Expr|
+                match x {
+                  ERecord(r) ->
+                    { key: field_value(r.fields, b"key"), value: field_value(r.fields, b"value") },
+                  _ -> { key: x, value: x },
+                }),
+              span: a.span,
+            })
+          } else { None },
+          _ -> None,
+        }
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn field_value(fields: List<RecField>, name: Bytes) -> Expr =
+  fold(fields, ELit({ span: { start: 0, end: 0 }, lit: LUnit }), |acc: Expr, f: RecField|
+    if f.name.name == name { f.value } else { acc })
+
+fn flat_literal(p: Pr, m: Literal) -> Option<Bytes> =
+  if m.set {
+    cat([
+      Some(b"#["),
+      sep(map(m.entries, |en: { key: Expr, value: Expr }| flat_expr(p, en.key)), b", "),
+      Some(b"]"),
+    ])
+  } else {
+    cat([
+      Some(b"#{"),
+      sep(
+        map(m.entries, |en: { key: Expr, value: Expr }|
+          cat([flat_expr(p, en.key), Some(b": "), flat_expr(p, en.value)])),
+        b", ",
+      ),
+      Some(b"}"),
+    ])
+  }
+
+// One entry a line, as a record's fields are; a key stays on its line, flat.
+fn literal(p: Pr, st: St, m: Literal, indent: Int) -> St = {
+  let open = if m.set { b"#[" } else { b"#{" };
+  let s1 = set_prev(trail(p, emit(st, open), m.span.start + 2), m.span.start + 2);
+  let n = len(m.entries);
+  let s2 = fold(range(0, n), s1, |s: St, i: Int| {
+    let en = at(m.entries, i);
+    let ks = expr_span(en.key);
+    let o = open_line(p, s, ks.start, indent + 2, false);
+    if m.set {
+      let v = separated(p, expr(p, o, en.key, indent + 2, 1), en.key, i == n - 1);
+      trail(p, set_prev(v, ks.end), ks.end)
+    } else {
+      let vs = expr_span(en.value);
+      let k = match flat_expr(p, en.key) { Some(f) -> f, None -> b"()" };
+      let v = separated(
+        p,
+        expr(p, emit(o, bytes_concat(k, b": ")), en.value, indent + 2, 1),
+        en.value,
+        i == n - 1,
+      );
+      trail(p, set_prev(v, vs.end), vs.end)
+    }
+  });
+  close(p, s2, m.span.end, indent, if m.set { b"]" } else { b"}" })
 }
 
 fn record(p: Pr, st: St, base: Option<Expr>, fields: List<RecField>, sp: Span, indent: Int) -> St = {
@@ -1780,6 +1867,28 @@ test "a program is printed back with its comments, and printing it again changes
     b"// top\nfn f(a: Int, b: Int) -> Int = a + b  // add\n\nfn g() -> List<Int> = [1_000, 0xFF]\n",
   );
   assert(stable(src))
+}
+
+test "a map or a set literal prints as the literal it was, and a spelled-out call as a call" {
+  lays_out(
+    b"fn f() -> Map<String, Int> = #{ \"a\" : 1,\"b\":2 }\n",
+    b"fn f() -> Map<String, Int> = #{\"a\": 1, \"b\": 2}\n",
+  );
+  lays_out(b"fn f() -> Map<Int, Unit> = #[ 3,1 ]\n", b"fn f() -> Map<Int, Unit> = #[3, 1]\n");
+  lays_out(b"fn f() -> Map<Int, Int> = #{}\n", b"fn f() -> Map<Int, Int> = #{}\n");
+  lays_out(
+    b"fn f() -> Map<Int, Int> = map_of_entries([{key: 1, value: 2}])\n",
+    b"fn f() -> Map<Int, Int> = map_of_entries([{ key: 1, value: 2 }])\n",
+  )
+}
+
+test "a map literal too long for its line breaks one entry a line" {
+  let src = b"fn f() -> Map<String, Int> = #{\"alpha\": 1, \"beta\": 2, \"gamma\": 3, \"delta\": 4, \"epsilon\": 5, \"zeta\": 6, \"eta\": 7, \"theta\": 8, \"iota\": 9}\n";
+  let out = formatted(src);
+  assert(bytes_index_of(out, b"#{\n") != None);
+  assert(bytes_index_of(out, b"\"zeta\": 6,\n") != None);
+  assert(stable(src));
+  assert_eq(tree_of(out), tree_of(src))
 }
 
 test "an or-pattern parts its alternatives with ` | `, keeping a parenthesised choice" {
