@@ -7,7 +7,7 @@
 
 import compiler.load (LoadedAnalysis)
 import args (Flags, from_argv, kept, style_of)
-import units (emit)
+import units (emit, Emitted, whole_emitted)
 import appends (broken_promises, priced)
 import builder (builder)
 import env (env)
@@ -25,7 +25,8 @@ import configuration
 import surface
 import machine
 import compiler.diagnostics (parse_all)
-import compiler.front (Analysed, Refused, Analysis, analyse, ModuleSpan, no_module)
+import compiler.front (Analysed, Refused, Analysis, analyse, ModuleSpan, no_module, test_roots)
+import compiler.unit (codes)
 import compiler.hash (closure_of)
 import compiler.infer (DefInfo, TestInfo)
 import compiler.resolve (Diag, Label, Source)
@@ -68,9 +69,9 @@ import suite.delta (Delta, DefKey, Edited, Facts, Value, classified, flipped_key
                     ns_word)
 import suite.diagnose (Attribution, Evidence, Suspect, diagnose)
 import suite.select
-import suite.select (Cached, Decision, New, Nondet, PreviousFailure, Reason, Row, Search, Unhashed,
-                     answers_per_root, decide, digest_of, filed, key_of, narrowed, owed_roots,
-                     seed_keys, to_run, word)
+import suite.select (Cached, Decision, New, Nondet, PreviousFailure, Reason, Row, SameCode, Search,
+                     Unhashed, answers_per_root, asked_by_code, by_code, code_keys, decide,
+                     digest_of, filed, key_of, narrowed, owed_roots, seed_keys, to_run, word)
 import std.bytes (bytes_of_hex, hex_of)
 import sim.plan
 import sim.plan (Seed)
@@ -182,6 +183,10 @@ fn selected_count(program: Program, decided: Decided) -> Int =
 
 fn cached_count(program: Program, decided: Decided) -> Int =
   len(program.cases) - selected_count(program, decided)
+
+// The cached tests a pass answered by the code they compile to rather than by their own key.
+fn by_code_count(program: Program, decided: Decided) -> Int =
+  len(filter(program.cases, |case: Case| reason_of(decided, case.index) == SameCode))
 
 // What the program decided about the conflict graph: the classes it coloured, the summary over
 // them, and which class each test landed in — which is only the tests that run, since a class is
@@ -648,6 +653,8 @@ fn why(reason: String) -> String =
     "the cache holds a failure, and a failure is never trusted"
   } else if reason == "cached" {
     "this exact hash already passed; re-running cannot reveal anything new"
+  } else if reason == "same code" {
+    "this hash is new, but the code it compiles to already passed; re-running cannot reveal anything new"
   } else { "no hash was produced, so the cache cannot answer for it" }
 
 // `region`, `shared` or `host`: a socket lives outside every region, so a host-backed test is
@@ -680,7 +687,12 @@ fn selected_line(style: Style, program: Program, decided: Decided) -> String / {
     ++ int_to_string(len(program.cases))
     ++ " ("
     ++ int_to_string(cached_count(program, decided))
-    ++ " cached)"
+    ++ " cached"
+    ++ (match by_code_count(program, decided) {
+      0 -> "",
+      n -> ", " ++ int_to_string(n) ++ " by code",
+    })
+    ++ ")"
 
 fn group_line(decided: Decided, workers: Int) -> List<String> / {abort.raise} =
   if len(decided.classes) == 0 { [] } else {
@@ -928,7 +940,8 @@ fn unkeyed_note(case: Case) -> String =
 fn key_lines(style: Style, program: Program) -> List<String> / {abort.raise} = {
   let filed = match program.filed_under {
     Some(stamp) ->
-      "a pass is filed under its test's hash and the runtime stamp " ++ short_of(Some(stamp)),
+      "a pass is filed under its test's hash and the runtime stamp " ++ short_of(Some(stamp))
+        ++ ", and under the code the test ran",
     None -> "no pass is filed: `--no-cache` reads and writes none",
   };
   let reading = len(filter(program.cases, |case: Case| len(unkeyed_texts(case)) > 0));
@@ -1626,6 +1639,7 @@ fn selection_json(program: Program, report: RunReport, decided: Decided) -> Json
     { key: "total", value: num(len(program.cases)) },
     { key: "selected", value: num(selected_count(program, decided)) },
     { key: "cached", value: num(cached_count(program, decided)) },
+    { key: "by_code", value: num(by_code_count(program, decided)) },
     { key: "filtered_out", value: num(program.filtered_out) },
     { key: "filed_under", value: opt_str(program.filed_under) },
     {
@@ -2182,73 +2196,126 @@ fn selected(
     // pass is filed under: the runtime answers what the store holds and does what it is told.
     let searching = machine::sim_plan_of(options.sim);
     let search = search_of(searching);
-    let decisions = decide(cases_of(rows_of(analysis), search, options.no_cache));
-    // Which tests may share a worker is the program's to say, from the atoms each row carries.
-    let visible = set_of(scope.visible);
-    let classes = classes_of(p, filter(to_run(decisions), |i: Int| map_contains(visible, i)));
-    let decided = decided_of(
-      p,
-      decisions,
-      search,
-      sim_json(searching, options.sim),
-      map(classes, |class: List<Int>| group_of_class(analysis, class)),
-      classes,
-    );
-    // A run that executes nothing builds no unit, unless a schema has constants to enter.
-    let build = len(decided.runs) > 0 || options.config.schema != None;
+    let first = decide(cases_of(rows_of(analysis), search, options.no_cache));
     let handing = time.elapsed_us();
     let handed = front_of(timed, analysis);
     let building = time.elapsed_us();
-    match unit_over(handed, build, true) {
+    // What a test runs is the unit's to say, so a run that would execute anything emits it before
+    // deciding: a test nothing answered by its own key may be answered by its code.
+    match unit_for(handed, len(to_run(first)) > 0 || options.config.schema != None) {
       Err(diags) -> {
         tester.ended[corpus]();
         unbound(style, { diags: diags, places: p.places })
       },
-      Ok(_) -> {
-        let binding = time.elapsed_us();
-        match configuration::opened_by(options.host, options.config, |name: String|
-            tester.schema[corpus](name)) {
+      Ok(unit) -> {
+        let keyed = match unit {
+          Some(e) -> if options.no_cache { map_new() }
+          else { code_keys(first, codes_of(handed, e), search) },
+          None -> map_new(),
+        };
+        let answered = by_code(first, passed_by_code(first, keyed), search);
+        let decisions = answered.decisions;
+        // Which tests may share a worker is the program's to say, from the atoms each row carries.
+        let visible = set_of(scope.visible);
+        let classes = classes_of(p, filter(to_run(decisions), |i: Int| map_contains(visible, i)));
+        let decided = decided_of(
+          p,
+          decisions,
+          search,
+          sim_json(searching, options.sim),
+          map(classes, |class: List<Int>| group_of_class(analysis, class)),
+          classes,
+        );
+        // A run that executes nothing builds no unit, unless a schema has constants to enter.
+        let build = len(decided.runs) > 0 || options.config.schema != None;
+        let text = match unit { Some(e) -> if build { Some(e.text) } else { None }, None -> None };
+        match tester.unit[corpus](handed, text, true) {
           Err(diags) -> {
             tester.ended[corpus]();
             unbound(style, { diags: diags, places: p.places })
           },
-          Ok(r) -> match tester.bound[corpus](configuration::configured(r.configuration)) {
-            Err(diags) -> {
-              tester.ended[corpus]();
-              unbound(style, { diags: diags, places: p.places })
-            },
-            Ok(_) -> {
-              let bound = time.elapsed_us();
-              let answer = concluded_run(
-                flags,
-                style,
-                options,
-                p,
-                timed,
-                analysis,
-                scope,
-                decisions,
-                decided,
-                searching,
-                r.warnings,
-                targeted,
-                {
-                  ..spent,
-                  store_us: selecting - configuring,
-                  selection_us: handing - selecting,
-                  handoff_us: building - handing,
-                  unit_us: binding - building,
-                  bind_us: bound - binding,
+          Ok(_) -> {
+            let binding = time.elapsed_us();
+            match configuration::opened_by(options.host, options.config, |name: String|
+                tester.schema[corpus](name)) {
+              Err(diags) -> {
+                tester.ended[corpus]();
+                unbound(style, { diags: diags, places: p.places })
+              },
+              Ok(r) -> match tester.bound[corpus](configuration::configured(r.configuration)) {
+                Err(diags) -> {
+                  tester.ended[corpus]();
+                  unbound(style, { diags: diags, places: p.places })
                 },
-              );
-              tester.ended[corpus]();
-              answer
-            },
+                Ok(_) -> {
+                  let bound = time.elapsed_us();
+                  let answer = concluded_run(
+                    flags,
+                    style,
+                    options,
+                    p,
+                    timed,
+                    analysis,
+                    scope,
+                    decisions,
+                    decided,
+                    keyed,
+                    answered.refiled,
+                    searching,
+                    r.warnings,
+                    targeted,
+                    {
+                      ..spent,
+                      store_us: selecting - configuring,
+                      selection_us: handing - selecting,
+                      handoff_us: building - handing,
+                      unit_us: binding - building,
+                      bind_us: bound - binding,
+                    },
+                  );
+                  tester.ended[corpus]();
+                  answer
+                },
+              },
+            }
           },
         }
       },
     }
   })
+}
+
+// The unit a run would execute in, or none for a run that would execute nothing.
+fn unit_for(
+  front: LoadedAnalysis,
+  wanted: Bool,
+) -> Result<Option<Emitted>, List<Diag>> / {emit.unit} =
+  if !wanted { Ok(None) }
+  else { match whole_emitted(front) { Ok(e) -> Ok(Some(e)), Err(diags) -> Err(diags) } }
+
+// Each test's code by index: the digest of what its root runs in the unit.
+fn codes_of(front: LoadedAnalysis, emitted: Emitted) -> Map<Int, String> / {abort.raise} = {
+  let ran = codes(emitted.made);
+  let roots = test_roots(front.dump);
+  fold(range(0, len(roots)), map_new(), |acc: Map<Int, String>, i: Int|
+    match map_get(ran, at(roots, i, b"")) { Some(c) -> map_insert(acc, i, hex_of(c)), None -> acc })
+}
+
+// The tests the store holds a pass for under the code they run.
+fn passed_by_code(
+  decisions: List<Decision>,
+  keyed: Map<Int, String>,
+) -> Map<Int, Bool> / {ledger.code_outcomes, abort.raise} = {
+  let asked = asked_by_code(decisions, keyed);
+  let answers = if len(asked) == 0 { [] }
+  else { ledger.code_outcomes(map(asked, |a: { index: Int, key: String }| a.key)) };
+  fold(range(0, len(asked)), map_new(), |acc: Map<Int, Bool>, i: Int|
+    match list_at(answers, i) {
+      Some(Some(word)) -> if word == "passed" {
+        map_insert(acc, at(asked, i, { index: 0 - 1, key: "" }).index, true)
+      } else { acc },
+      _ -> acc,
+    })
 }
 
 // The run itself, what it establishes, filed, and what it is asked after: a mutation of a green
@@ -2263,6 +2330,8 @@ fn concluded_run(
   scope: Scope,
   decisions: List<Decision>,
   decided: Decided,
+  keyed: Map<Int, String>,
+  refiled: List<String>,
   searching: plan::Plan,
   configured: List<Diag>,
   targeted: Option<List<DefInfo>>,
@@ -2316,6 +2385,8 @@ fn concluded_run(
         |acc: Map<Int, List<String>>, e: { index: Int, keys: List<String> }|
           if map_contains(running, e.index) { map_insert(acc, e.index, e.keys) } else { acc },
       ),
+      codes: map_fold(keyed, map_new(), |acc: Map<Int, List<String>>, i: Int, k: String|
+        if map_contains(running, i) { map_insert(acc, i, [k]) } else { acc }),
       reasons: fold(decisions, map_new(), |acc: Map<Int, Reason>, d: Decision|
         map_insert(acc, d.case.index, d.reason)),
       out_of_scope: scope.out,
@@ -2325,7 +2396,7 @@ fn concluded_run(
   );
   let stored = if options.no_cache { [] } else {
     filing_said(
-      ledger.filed(c.filing),
+      ledger.filed({ ..c.filing, passes: appended(c.filing.passes, refiled) }),
       "could not write the test cache: ",
       "the run itself is valid; every test will simply be re-run next time",
     )
@@ -2355,7 +2426,7 @@ fn concluded_run(
   let cause = decided_faults({ ..r, failures: found.failures }, found.benches, diagnosing(options));
   let proved = if options.no_cache || len(cause.proved) == 0 { [] } else {
     filing_said(
-      ledger.filed({ passes: cause.proved, records: [], seen: [] }),
+      ledger.filed({ passes: cause.proved, codes: [], records: [], seen: [] }),
       "could not write what the bisection's mixtures proved: ",
       "every verdict stands; the next bisection runs those mixtures again",
     )
@@ -3670,7 +3741,10 @@ test "`--explain` says what a pass is filed under and names what no key covers" 
   assert(!string_contains(at(lines, 2, ""), "outside its key"));
   assert(said(lines, "   key"));
   assert(
-    said(lines, "     a pass is filed under its test's hash and the runtime stamp aabbccddeeff"),
+    said(
+      lines,
+      "     a pass is filed under its test's hash and the runtime stamp aabbccddeeff, and under the code the test ran",
+    ),
   );
   assert(
     said(
@@ -4019,14 +4093,16 @@ test "a bounded naive count makes the ratio a lower bound" {
 }
 
 test "every reason has an explanation of its own" {
-  let lines = map(["new", "nondet", "previous failure", "cached", "unhashed"], why);
-  assert_eq(len(lines), 5);
+  let lines = map(
+    map([New, Nondet, PreviousFailure, Cached, SameCode, Unhashed], |r: Reason| word(r)),
+    why,
+  );
   assert_eq(
     len(
-      filter(range(0, 5), |i: Int|
-        len(filter(range(0, 5), |j: Int| at(lines, i, "") == at(lines, j, ""))) == 1),
+      filter(range(0, 6), |i: Int|
+        len(filter(range(0, 6), |j: Int| at(lines, i, "") == at(lines, j, ""))) == 1),
     ),
-    5,
+    6,
   )
 }
 
