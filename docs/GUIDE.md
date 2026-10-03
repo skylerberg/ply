@@ -24,8 +24,8 @@ fn main() -> Unit = assert_eq(greeting(), "hello from ply")
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
 Each takes a `.ply` file or a project root, defaulting to `.`.
 `ply check --types` prints every definition's inferred signature, each atom of
-its row marked with how many times a call performs it (§6.2), and `div` on one
-whose calls may not return (§5.10).
+its row marked with how many times a call performs it (§6.2), and `diverges` on
+one whose calls may not return (§5.10).
 
 **Starting a package.** `ply new demo` writes `demo/ply.pkg` and
 `demo/main.ply` — a manifest (§3.3), a `main` and one test — and `cd demo &&
@@ -835,24 +835,43 @@ fn halves(n: Int) -> Int
 The checker reads each recursive group, mutual recursion included, for a
 measure that every loop of calls back into the group lowers (size-change
 termination): a part of an argument — a constructor's field, a record's field,
-a list's element or tail, at any depth, and an element `map`, `filter` or
-`fold` hands a callback — or an integer moving toward a bound that a guard on
-the way to the call holds it beyond, as `down` does, or as
-`if i >= len(xs) { .. } else { walk(xs, i + 1) }` does. A loop may lower
-different measures at different calls, as Ackermann's function does. A guard
-of `n == 0` bounds nothing: from `-1`, `n - 1` never meets it. A member of the
-group handed as a value to anything but those builtins is called with nothing
-known, and so is one inside a lambda, whose parameters are unknown.
+a list's element or tail, a map's key, value or entry, at any depth — or an
+integer moving toward a bound that a guard on the way to the call holds it
+beyond, as `down` does, or as `if i >= len(xs) { .. } else { walk(xs, i + 1) }`
+does. A quotient by a literal greater than one, a shift right by one, and a
+remainder by the measure itself lower an integer the guard holds at one or
+more. A loop may lower different measures at different calls, as Ackermann's
+function does, and a guard in one member of a group bounds the loops through
+the others. A guard of `n == 0` bounds nothing: from `-1`, `n - 1` never
+meets it.
+
+A guard is a condition on the way to the call: an `if`, a `match` arm's guard,
+the failed guard of an earlier arm whose pattern always matches, a condition
+matched against `true` or `false`, or `list_at` or `array_at` answering
+`Some`, which holds the index below the length. `list_set` and `array_set`
+keep the length. A list written of parts, one they are pushed onto, one
+`filter` keeps, one `map` makes of a part of each element, and what `fold`
+answers when each step answers the accumulator or a part (a lookup that starts
+at `None`) are made of parts.
+
+A function handed to `map`, `filter` or `fold` is called with each element; one
+handed to a definition outside the group is called as that definition calls
+it, with the parts of its arguments it hands on; and a lambda bound by `let` is
+read where it is called. A member of the group handed anywhere else, or one
+called from a lambda whose calls the checker cannot see, is called with nothing
+known.
 
 A definition whose group descends ends, and so does one calling only
-definitions that end. `ply check --types` marks `div` on any other: its group
-is not seen to descend, or it calls a definition that may not return.
+definitions that end. `ply check --types` marks `diverges` on any other and
+says why: its own recursion is not seen to descend, or it calls a definition,
+which it names, that may not return.
 
 `decreases <measure>`, after the other clauses, states an `Int` over the
 parameters that every call the group makes back into itself lowers while it
 stays non-negative; a group that descends with its stated measures counted is
 read as ending, and the checker takes the measure at its word. It is pure, as a
-clause is (`E0417`), and writing one moves no hash.
+clause is (`E0417`), and part of the definition's hash, since it decides what
+the definition is read to do.
 
 ## 6. Effects and handlers
 
@@ -872,7 +891,7 @@ nondet effect clock {
 Each operation is `read` or `write`. `[r]` makes it resource-parameterized: a
 perform must supply a label (`E0304`). `nondet` marks results that are not a
 function of program state (§8.3). Effects are nominal. `task`, `clock`,
-`random`, `sim`, `abort`, `div` and `cell` are taken (`E0105`).
+`random`, `sim`, `abort`, `diverges` and `cell` are taken (`E0105`).
 
 An operation's type parameters sit just before its parameters,
 `read take[r]<a>(key: Int) -> a`, and are its only type variables: its
@@ -888,7 +907,7 @@ set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 `/ {store::db.read[users]}`. An atom may instead name an operation,
 `net.send[conn]`, which the mode atom of the same effect and resource
 (`net.write[conn]`) covers; naming an operation the effect does not declare is
-`E0104`. `div`, written bare, is the atom of a call that may not return
+`E0104`. `diverges`, written bare, is the atom of a call that may not return
 (§5.10); it names no operation, and nothing handles it.
 
 An inferred row names operations: `net.send[conn](..)` adds `net.send[conn]`,
