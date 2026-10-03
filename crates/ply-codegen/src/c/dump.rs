@@ -57,6 +57,9 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
     if let Ok(rows) = d.field("rows") {
         front.rows = ply_eval::codec::encode(rows.value()).map_err(|e| rows.error(e))?;
     }
+    if let Ok(walked) = d.field("walked") {
+        front.walked = walked.bytes()?.to_vec();
+    }
     for m in d.field("modules")?.list()? {
         let name = m.field("name")?.utf8()?;
         let index = m.field("index")?;
@@ -75,6 +78,17 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Front, Error> {
                 imports: m
                     .field("imports")?
                     .items(|i| Ok(ModuleName::from_dotted(i.utf8()?)))?,
+                // The committed emitter answering for a stage may predate them, and cut nothing.
+                cuts: match m.field("cuts") {
+                    Ok(cuts) => cuts.items(|c| {
+                        Ok(ply_eval::Cut {
+                            start: c.field("start")?.number()?,
+                            end: c.field("end")?.number()?,
+                            braced: c.field("braced")?.bool()?,
+                        })
+                    })?,
+                    Err(_) => Vec::new(),
+                },
             },
         );
     }
