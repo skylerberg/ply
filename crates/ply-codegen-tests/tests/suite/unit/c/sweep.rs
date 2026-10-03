@@ -1,4 +1,6 @@
-use ply_codegen::c::sweep::{ANSWERED, REUSED, STAMP, USED, claim, sweep, sweep_stages, used};
+use ply_codegen::c::sweep::{
+    ANSWERED, BEGUN, REUSED, STAMP, USED, claim, due, finished, sweep, sweep_stages, used,
+};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -123,46 +125,67 @@ fn a_temporary_is_never_swept() {
     );
 }
 
+/// So processes starting together do not all walk.
 #[test]
-fn one_caller_an_interval_sweeps_and_the_rest_do_not() {
+fn one_process_a_lease_begins_a_sweep_and_the_rest_do_not() {
     let dir = tempfile::tempdir().unwrap();
     assert!(
-        claim(dir.path(), Duration::from_secs(600)),
-        "the first caller, with no stamp, sweeps"
+        claim(dir.path(), Duration::from_secs(120)),
+        "the first caller, with no sweep begun, begins one"
     );
+    assert!(dir.path().join(BEGUN).exists());
     assert!(
-        !claim(dir.path(), Duration::from_secs(600)),
-        "the second inside the interval does not"
+        !claim(dir.path(), Duration::from_secs(120)),
+        "the second inside the lease does not"
     );
     assert!(
         claim(dir.path(), Duration::from_secs(0)),
-        "and an interval that has passed hands it back"
+        "and a lease that has lapsed hands it back"
     );
 }
 
-/// So two processes starting together do not both walk.
+/// A process that exits mid-walk finished nothing, so the next one past the lease sweeps.
 #[test]
-fn the_stamp_is_marked_by_taking_the_claim_not_by_finishing_the_sweep() {
+fn a_sweep_is_owed_until_one_finishes() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(claim(dir.path(), Duration::from_secs(600)));
+    assert!(due(dir.path(), Duration::from_secs(600)));
+    assert!(claim(dir.path(), Duration::from_secs(120)));
     assert!(
-        dir.path().join(STAMP).exists(),
-        "the stamp is there before any entry has been removed"
+        due(dir.path(), Duration::from_secs(600)),
+        "beginning a sweep is not finishing one"
+    );
+    finished(dir.path());
+    assert!(!due(dir.path(), Duration::from_secs(600)));
+    assert!(
+        due(dir.path(), Duration::from_secs(0)),
+        "and an interval that has passed owes the next"
     );
 }
 
-/// A sweep that removed it would hand the claim to the next process a second later.
+/// The sweep's own marks are not entries: removing them would hand the sweep to the next process.
 #[test]
-fn the_stamp_survives_a_sweep_that_empties_the_cache() {
+fn the_marks_survive_a_sweep_that_empties_the_cache() {
     let dir = tempfile::tempdir().unwrap();
     let names = ["bodies/a", "bodies/b"];
     stock(dir.path(), &names, 100);
-    assert!(claim(dir.path(), Duration::from_secs(600)));
-    sweep(dir.path(), 0);
-    assert!(
-        !claim(dir.path(), Duration::from_secs(600)),
-        "the stamp is younger than the interval, so the next caller still skips"
+    assert!(claim(dir.path(), Duration::from_secs(120)));
+    finished(dir.path());
+    set_file(
+        &dir.path().join(STAMP),
+        SystemTime::now() - Duration::from_secs(20_000),
     );
+    set_file(
+        &dir.path().join(BEGUN),
+        SystemTime::now() - Duration::from_secs(20_000),
+    );
+    assert_eq!(sweep(dir.path(), 0), 200);
+    assert!(dir.path().join(STAMP).exists() && dir.path().join(BEGUN).exists());
+}
+
+fn set_file(path: &Path, when: SystemTime) {
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(when))
+        .unwrap();
 }
 
 #[test]

@@ -39,20 +39,16 @@ pub fn trust() -> Vec<PathBuf> {
     }
 }
 
-/// Not a `.ply` file, so the program's own listing passes over it.
+/// Not `.ply` files, so the program's own listing passes over them.
 const STAMPS: &str = "stamps";
+
+const DEFINITIONS: &str = "definitions";
 
 const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
 
-const FRONT_CODE: &str = env!("PLY_FRONT_CODE");
-
-const VERDICT_CODE: &str = env!("PLY_VERDICT_CODE");
-
-/// What a store's groups are a function of beyond their own keys, as `name hex` lines. A front-end
-/// entry is the evaluator's and the Ply that loads and files it; a pass or a claim's evidence is the
-/// runtime's and the Ply that decides and files it, and the CLI adds the emitter's identity, which
-/// is the shelf's to say. A test's own hash covers every definition it reaches, so the rest of `ply`
-/// is in neither.
+/// The runtime's side of what a store's groups are a function of beyond their own keys, as
+/// `name hex` lines: a front-end entry is the evaluator's, and a pass or a claim's evidence the
+/// whole runtime's. The program adds its own side to each, from the definitions it is told it has.
 pub fn stamps() -> String {
     let stamp = |parts: &[&str]| {
         let mut h = blake3::Hasher::new();
@@ -64,27 +60,25 @@ pub fn stamps() -> String {
     };
     format!(
         "frontend {}\nruntime {}\n",
-        stamp(&[
-            "ply.stamp.frontend.3",
-            ply_codegen::c::semantics_digest(),
-            FRONT_CODE
-        ]),
-        stamp(&["ply.stamp.runtime.3", RUNTIME_SOURCES, VERDICT_CODE])
+        stamp(&["ply.stamp.frontend.4", ply_codegen::c::semantics_digest()]),
+        stamp(&["ply.stamp.runtime.4", RUNTIME_SOURCES])
     )
 }
 
 /// Each file lands by a rename and the marker last, so a run that finds the marker finds it whole.
-pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
+pub fn shelf(program: &Program, definitions: &str) -> Result<PathBuf, Diagnostic> {
     let stamps = stamps();
-    let dir = ply_codegen::c::stage::stage_dir(&program.stage).join(format!(
-        "shelf-{}",
-        &blake3::hash(stamps.as_bytes()).to_hex()[..16]
-    ));
+    let mut laid = blake3::Hasher::new();
+    laid.update(stamps.as_bytes());
+    laid.update(&[0]);
+    laid.update(definitions.as_bytes());
+    let dir = ply_codegen::c::stage::stage_dir(&program.stage)
+        .join(format!("shelf-{}", &laid.finalize().to_hex()[..16]));
     if dir.join(SHELF_MARKER).exists() {
         ply_codegen::c::sweep::used(&ply_codegen::c::stage::stage_dir(&program.stage));
         return Ok(dir);
     }
-    lay_out(&dir, &program.shelf, &stamps).map_err(|e| {
+    lay_out(&dir, &program.shelf, &stamps, definitions).map_err(|e| {
         Diagnostic::error(
             codes::INTERNAL_ERROR,
             format!(
@@ -100,13 +94,19 @@ pub fn shelf(program: &Program) -> Result<PathBuf, Diagnostic> {
     Ok(dir)
 }
 
-fn lay_out(dir: &Path, sources: &[(String, String)], stamps: &str) -> std::io::Result<()> {
+fn lay_out(
+    dir: &Path,
+    sources: &[(String, String)],
+    stamps: &str,
+    definitions: &str,
+) -> std::io::Result<()> {
     use ply_eval::files::write_atomically;
     std::fs::create_dir_all(dir)?;
     for (name, text) in sources {
         write_atomically(&dir.join(format!("{name}.ply")), text.as_bytes())?;
     }
     write_atomically(&dir.join(STAMPS), stamps.as_bytes())?;
+    write_atomically(&dir.join(DEFINITIONS), definitions.as_bytes())?;
     write_atomically(&dir.join(SHELF_MARKER), b"ok")
 }
 
@@ -120,11 +120,13 @@ pub fn run(
     mut binds: Binds,
     count: Option<crate::count::Asked>,
 ) -> Ended<i32> {
-    let shelf = match shelf(&program) {
+    let definitions = ply_machine::shipped::definitions(&program.runnable.front.answer);
+    let shelf = match shelf(&program, &definitions) {
         Ok(shelf) => shelf,
         Err(refused) => return Ended::refused(refused),
     };
     ply_machine::shipped::stamp(stamps());
+    ply_machine::shipped::entered(definitions);
     let version = program.version.clone();
     let opened = match enter::opened_runnable(program.runnable, Path::new(shipped::ROOT)) {
         Ok(opened) => opened,
