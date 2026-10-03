@@ -178,9 +178,10 @@ impl Unit {
         Ok(Box::leak(Box::new(unit)))
     }
 
-    /// An artifact's unit, produced elsewhere; loaded once here to read its table.
-    pub fn embedded(front: &ply_eval::Front, text: String) -> Result<&'static Unit> {
-        let exports = crate::c::Exports::read(&crate::c::compile_and_load(&text, "artifact")?)?;
+    /// A unit the program produced, its C handed over whole: compiled and loaded once here to read
+    /// the table it embeds, and loaded again by each worker that attaches it.
+    pub fn handed(front: &ply_eval::Front, text: String) -> Result<&'static Unit> {
+        let exports = crate::c::Exports::read(&crate::c::compile_and_load(&text, "unit")?)?;
         let identity = front.hashes_digest;
         let front: &'static ply_eval::Front = Box::leak(Box::new(front.clone()));
         let source: &'static Source = Box::leak(Box::new(Source::from_front(front)));
@@ -243,7 +244,7 @@ impl Unit {
     fn build(&'static self) -> Result<Bodies> {
         let started = std::time::Instant::now();
         let native = match &self.embedded {
-            Some(text) => crate::c::load_unit(text, Some(self.source), "artifact")?.0,
+            Some(text) => crate::c::load_unit(text, Some(self.source), "unit")?.0,
             // The same set as the pre-flight, so the unit key matches and the unit is read back.
             None => {
                 let candidates = self.source.functions();

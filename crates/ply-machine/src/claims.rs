@@ -13,7 +13,7 @@ use crate::engine::{Interleaved, Judgement, Mode, Obligation};
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
 use crate::payload::{ctor, diags_value, places_value, record, strings};
-use crate::support::prover_backend;
+use crate::support::unit_of;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
@@ -66,9 +66,10 @@ fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     ctor(home, name, args)
 }
 
-const OPERATIONS: [(&str, &str); 7] = [
+const OPERATIONS: [(&str, &str); 8] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
+    ("compiled", "ply_machine::claims::compiled"),
     ("schema", "ply_machine::claims::schema"),
     ("prepared", "ply_machine::claims::prepared"),
     ("judged", "ply_machine::claims::judged"),
@@ -76,9 +77,10 @@ const OPERATIONS: [(&str, &str); 7] = [
     ("ended", "ply_machine::claims::ended"),
 ];
 
-const HERMETIC_OPERATIONS: [(&str, &str); 7] = [
+const HERMETIC_OPERATIONS: [(&str, &str); 8] = [
     ("configure", "ply_machine::claims::hermetic::configure"),
     ("collected", "ply_machine::claims::hermetic::collected"),
+    ("compiled", "ply_machine::claims::hermetic::compiled"),
     ("schema", "ply_machine::claims::hermetic::schema"),
     ("prepared", "ply_machine::claims::hermetic::prepared"),
     ("judged", "ply_machine::claims::hermetic::judged"),
@@ -196,6 +198,7 @@ impl HostHandler for Site {
                 PlyValue::Unit
             }
             ("collected", _) => self.collected()?,
+            ("compiled", [unit]) => self.compiled(unit.as_bytes(span, "the program's unit")?)?,
             ("schema", [name]) => self.schema(name.as_str(span, "a definition's name")?)?,
             ("prepared", [step_budget, config]) => self.prepared(
                 step_budget.as_int(span, "the calls an evaluation may make")?,
@@ -320,6 +323,22 @@ impl Site {
         }
     }
 
+    /// The program's unit, compiled from the C it handed over: what the schema and every batch a
+    /// discharge judges run on.
+    fn compiled(&self, unit: &[u8]) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("compiled"))?;
+        machine.ask(Go::Compiled(unit.to_vec()))?;
+        match machine.step()? {
+            Step::Compiled(Ok(())) => Ok(PlyValue::ctor("Ok", vec![PlyValue::Unit])),
+            Step::Compiled(Err(diagnostic)) => Ok(PlyValue::ctor(
+                "Err",
+                vec![diags_value(std::slice::from_ref(&diagnostic))],
+            )),
+            _ => Err(out_of_step("compiled")),
+        }
+    }
+
     /// The value of the definition `--config-schema` names, entered on the program's unit.
     fn schema(&self, name: &str) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
@@ -412,6 +431,8 @@ impl Site {
 
 /// What the program asks the machine for next.
 enum Go {
+    /// Compile the program's unit from the C it handed over.
+    Compiled(Vec<u8>),
     /// Enter the definition `--config-schema` names on the program's unit.
     Schema(String),
     /// Bind the hosts over the configuration the program resolved and build the prover a
@@ -421,6 +442,7 @@ enum Go {
 
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
+    Compiled(Result<(), Diagnostic>),
     Schema(Result<ply_eval::Plain, Diagnostic>),
     Prepared(Box<Result<Ready, Refused>>),
 }
@@ -495,25 +517,28 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
         host: job.binding.is_some(),
     }))));
 
-    // Built by the first step that needs one and kept: the schema and every batch a discharge
-    // judges run on the same unit, and the batches over the same hosts.
-    let mut backend: Option<Result<&'static dyn ply_eval::Provider, Diagnostic>> = None;
+    // The unit the program handed over, and the hosts once bound: the schema and every batch a
+    // discharge judges run on the same unit, and the batches over the same hosts.
+    let mut backend: Option<&'static dyn ply_eval::Provider> = None;
     let mut prepared: Option<Result<Prepared, Refused>> = None;
     loop {
         match asked.recv() {
+            Ok(Go::Compiled(unit)) => {
+                let built = unit_of(&loaded.front, &unit).map(|unit| {
+                    backend = Some(unit);
+                });
+                let _ = told.send(Step::Compiled(built));
+            }
             Ok(Go::Schema(name)) => {
-                let built = backend.get_or_insert_with(|| prover_backend(&loaded));
-                let answer = match built {
-                    Ok(unit) => crate::config::schema_of(&loaded.check, Some(*unit), &name),
-                    Err(diagnostic) => Err(diagnostic.clone()),
+                let answer = match backend {
+                    Some(unit) => crate::config::schema_of(&loaded.check, Some(unit), &name),
+                    None => Err(uncompiled()),
                 };
                 let _ = told.send(Step::Schema(answer));
             }
             Ok(Go::Prepare(step_budget, configuration)) => {
                 if prepared.is_none() {
-                    let built = backend
-                        .get_or_insert_with(|| prover_backend(&loaded))
-                        .clone();
+                    let built = backend.ok_or_else(uncompiled);
                     prepared = Some(prepare(&job, &loaded, built, step_budget, configuration));
                 }
                 let answer = match prepared.as_ref() {
@@ -980,4 +1005,13 @@ fn hermetic_host() -> Diagnostic {
         format!("`{HERMETIC}` binds no host, and the run asked for `--host`"),
     )
     .note("a program that discharges a `law/host` reaches the host, and performs `prover`")
+}
+
+/// A step that enters the program's unit, asked before the program handed one over.
+fn uncompiled() -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "the prover was asked to enter the program before the program handed its unit over",
+    )
+    .note("`prover.compiled` comes first: the unit is the program's to produce")
 }

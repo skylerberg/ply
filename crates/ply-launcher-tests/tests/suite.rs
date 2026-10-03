@@ -21,6 +21,7 @@ nondet effect env {
   read pwd[e]() -> String
   read shipped_digest[e]() -> String
   read fronts[e]() -> String
+  read bodies[e]() -> String
 }
 
 fn main() -> String / {env.var[e], env.vars[e], env.terminal[e], env.binary_version[e]} = {

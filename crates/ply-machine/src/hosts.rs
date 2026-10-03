@@ -725,11 +725,12 @@ impl HostHandler for Facility {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
-            ("schema", [path, front, name]) => {
+            ("schema", [path, front, unit, name]) => {
                 let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
                 let front = crate::driver::handed_front_of(front, span)?;
+                let unit = unit.as_bytes(span, "the program's unit")?;
                 let name = name.as_str(span, "a definition's name")?;
-                crate::config::schema_answer(schema(&path, &front, name, self.hermetic))
+                crate::config::schema_answer(schema(&path, &front, unit, name, self.hermetic))
             }
             ("preview", [path, options, front, config]) => {
                 let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
@@ -745,11 +746,12 @@ impl HostHandler for Facility {
     }
 }
 
-/// The value of the definition `--config-schema` names, entered on a unit built for it alone: this
-/// command runs nothing else.
+/// The value of the definition `--config-schema` names, entered on the unit the program handed over
+/// for it alone: this command runs nothing else.
 fn schema(
     path: &std::path::Path,
     front: &crate::driver::HandedFront,
+    unit: &[u8],
     name: &str,
     hermetic: bool,
 ) -> Result<ply_eval::Plain, Diagnostic> {
@@ -761,7 +763,7 @@ fn schema(
             )
         })
     })?;
-    let backend = crate::support::prover_backend(&loaded)?;
+    let backend = crate::support::unit_of(&loaded.front, unit)?;
     crate::config::schema_of(&loaded.check, Some(backend), name)
 }
 

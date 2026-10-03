@@ -6,11 +6,9 @@ use ply_machine::policy;
 fn own(effect: &str) -> String {
     match effect {
         "prover" => "claims",
-        "store" => "cache",
-        "archive" => "bootstrap",
         "tcb" => "hosts",
         "edit" => "replace",
-        "shipped" => "env",
+        "shipped" => "compiler.unit",
         other => other,
     }
     .to_string()
