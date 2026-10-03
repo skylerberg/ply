@@ -1,12 +1,14 @@
 // A path on the command line turned into the front end's input: the files under it, each named by
 // its place relative to the root, and the shipped modules the run binds as the root `shelf`.
 
+import std.fs
 import std.fs (fs)
 import std.bytes (u64_le)
 import std.hash (blake3)
 import compiler.hash (hex)
-import std.path (join)
-import compiler.front (module_of)
+import std.path (join, is_absolute, normalize, parent)
+import compiler.front (module_of, Embedded, embeds_wanted)
+import compiler.embed (EmbedRead, EmbedWant)
 import compiler.resolve (Source, Diag, Label, diag1)
 import builder (builder)
 import compiler.pkg (Supplied, wants)
@@ -47,7 +49,12 @@ pub type Project = {
   packages: List<DepPackage>,
   // The key the package walk rooted at, which dependency paths resolve against.
   root_key: String,
+  embeds: List<Embed>,
 }
+
+// One embed as the load read it, beside the file of the module that asked: a watching run reads it
+// again from there.
+pub type Embed = { embedded: Embedded, file: Rooted }
 
 pub fn is_std(name: String) -> Bool = name == "std" || string_starts_with(name, "std.")
 
@@ -127,7 +134,7 @@ fn one_file(
   }
 
 fn empty() -> Project =
-  { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "" }
+  { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "", embeds: [] }
 
 // Every `.ply` file the walk found, in path order, with the ones that cannot be modules refused.
 fn read(
@@ -149,14 +156,120 @@ pub fn load_resolved(
     merge(acc, with_manifest(r, read(named(nothing(), paths::rooted(r)), paths::root_prefix(r)))));
   match list_at(rs, 0) {
     None -> merged,
-    Some(first) ->
-      {
+    Some(first) -> {
+      let walked = {
         ..merged,
         packages: walk_packages(first.absolute, merged.manifest),
         root_key: first.absolute,
-      },
+      };
+      { ..walked, embeds: embeds_of(walked) }
+    },
   }
 }
+
+// --- Embeds -------------------------------------------------------------------------------------
+// What the loaded packages' modules embed, each read relative to its module's own file: the front
+// end writes every one out as what was read here, so a definition's hash covers the bytes it embeds.
+
+fn embeds_of(
+  project: Project,
+) -> List<Embed> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  fold(
+    project.packages,
+    read_embeds(bytes_of_string(project.root_key), project.files),
+    |acc: List<Embed>, p: DepPackage| appended(acc, read_embeds(bytes_of_string(p.root), p.files)),
+  )
+
+fn appended<a>(xs: List<a>, ys: List<a>) -> List<a> =
+  fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
+
+fn read_embeds(
+  root: Bytes,
+  files: List<File>,
+) -> List<Embed> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  fold(files, [], |acc: List<Embed>, f: File|
+    fold(
+      embeds_wanted(root, [{ name: bytes_of_string(f.module), src: f.text }]),
+      acc,
+      |a: List<Embed>, e: Embedded|
+        push(a, { embedded: { ..e, read: read_embed(f.at, e.want) }, file: f.at }),
+    ))
+
+// Whether any embed reads otherwise now than the load read it.
+pub fn embeds_moved(
+  embeds: List<Embed>,
+) -> Bool / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  fold(embeds, false, |acc: Bool, e: Embed|
+    acc || read_embed(e.file, e.embedded.want) != e.embedded.read)
+
+// A path relative to the directory of the module's own file, under the same root.
+fn embed_target(at: Rooted, path: String) -> Rooted =
+  if is_absolute(path) { paths::spelled(path) }
+  else { { label: at.label, path: normalize(join(parent(at.path), path)) } }
+
+fn unread(target: Rooted, what: String) -> EmbedRead =
+  Err(bytes_of_string("`" ++ displayed(target) ++ "` " ++ what))
+
+fn read_embed(
+  at: Rooted,
+  w: EmbedWant,
+) -> EmbedRead / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+  let target = embed_target(at, string_of_bytes_lossy(w.path));
+  match paths::kind(target) {
+    fs::Missing -> unread(target, "does not exist"),
+    fs::Dir -> if w.dir { read_dir(target) }
+    else { unread(target, "is a directory, and `embed` takes a file") },
+    fs::File -> if w.dir { unread(target, "is a file, and `embed_dir` takes a directory") }
+    else { read_one(target) },
+    fs::Symlink -> if w.dir { read_dir(target) } else { read_one(target) },
+  }
+}
+
+fn read_one(target: Rooted) -> EmbedRead / {fs.read_file[cwd], fs.read_file[abs]} =
+  match read_file(target) {
+    Some(b) -> Ok([{ name: b"", bytes: b }]),
+    None -> unread(target, "could not be read"),
+  }
+
+// Every file under the directory, by its path below it and in that order; nothing under a name
+// starting with `.` is read.
+fn read_dir(
+  target: Rooted,
+) -> EmbedRead / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} =
+  match listed(target, "", map_new()) {
+    Err(why) -> Err(why),
+    Ok(found) ->
+      map_fold(found, Ok([]), |acc: EmbedRead, name: String, at: Rooted|
+        match acc {
+          Err(_) -> acc,
+          Ok(files) -> match read_file(at) {
+            Some(b) -> Ok(push(files, { name: bytes_of_string(name), bytes: b })),
+            None -> unread(at, "could not be read"),
+          },
+        }),
+  }
+
+fn listed(
+  dir: Rooted,
+  below: String,
+  found: Map<String, Rooted>,
+) -> Result<Map<String, Rooted>, Bytes> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
+  match paths::list_dir(dir) {
+    None -> Err(bytes_of_string("`" ++ displayed(dir) ++ "` could not be listed")),
+    Some(names) ->
+      fold(names, Ok(found), |acc: Result<Map<String, Rooted>, Bytes>, n: String|
+        match acc {
+          Err(_) -> acc,
+          Ok(m) -> if string_starts_with(n, ".") { acc } else {
+            let entry = paths::child(dir, n);
+            let name = if below == "" { n } else { below ++ "/" ++ n };
+            match paths::kind(entry) {
+              fs::Dir -> listed(entry, name, m),
+              _ -> Ok(map_insert(m, name, entry)),
+            }
+          },
+        }),
+  }
 
 // --- The package walk ---------------------------------------------------------
 // What the root's manifest asks for, round by round, under `abs` so a sibling directory is
@@ -342,6 +455,7 @@ fn merge(a: Project, b: Project) -> Project = {
     manifest: match a.manifest { Some(_) -> a.manifest, None -> b.manifest },
     packages: fold(b.packages, a.packages, |acc: List<DepPackage>, p: DepPackage| push(acc, p)),
     root_key: if a.root_key == "" { b.root_key } else { a.root_key },
+    embeds: appended(a.embeds, b.embeds),
   }
 }
 

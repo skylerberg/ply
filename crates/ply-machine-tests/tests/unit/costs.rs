@@ -62,7 +62,7 @@ fn the_port_keeps_a_promise_over_a_fresh_list_and_refuses_one_over_a_map_entry()
     assert_eq!(d.code, ply_eval::codes::REUSE_BROKEN);
     assert_eq!(
         d.message,
-        "`grow` is a `reuse fn`, and this append copies its list: `map_get` answers a clone the \
+        "`grow` is a `reuse fn`, and this `push` copies its list: `map_get` answers a clone the \
          map still holds"
     );
     assert_eq!(d.notes, ["fix: `map_update`"]);
@@ -81,7 +81,7 @@ fn the_port_keeps_a_promise_over_a_fresh_list_and_refuses_one_over_a_map_entry()
     assert_eq!(
         labels,
         [
-            (true, "this append", "push(xs, n)".to_string()),
+            (true, "this update", "push(xs, n)".to_string()),
             (false, "the promise", "reuse".to_string()),
         ]
     );

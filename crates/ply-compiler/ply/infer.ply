@@ -12,7 +12,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
               ReturnClause, RecField, expr_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
-                 LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, pat_span, has_or)
+                 LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import tycore (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
                TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity,
                OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
@@ -210,6 +210,7 @@ type Simulation = {
 type ParallelSite = { module: Int, span: Span, branches: List<{ span: Span, row: Row }> }
 // `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
 type RigidParam = { name: Bytes, v: Int }
+// `via` is the alias a use named when the `Map` came from its expansion, else empty.
 type MapKeySite = {
   module: Int,
   span: Span,
@@ -217,6 +218,7 @@ type MapKeySite = {
   key: Type,
   assumed: List<Int>,
   params: List<RigidParam>,
+  via: Bytes,
 }
 type ConstraintSite = {
   module: Int,
@@ -440,8 +442,10 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"I128", arity: 0 },
     { name: b"Float", arity: 0 },
     { name: b"Decimal", arity: 0 },
+    { name: b"Char", arity: 0 },
     { name: b"Unit", arity: 0 },
     { name: b"List", arity: 1 },
+    { name: b"Array", arity: 1 },
     { name: b"Map", arity: 2 },
     { name: b"Cell", arity: 1 },
     { name: b"Secret", arity: 1 },
@@ -451,6 +455,8 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"Ordering", arity: 0 },
     { name: b"Rounding", arity: 0 },
     { name: b"Iter", arity: 2 },
+    { name: b"Instant", arity: 0 },
+    { name: b"Duration", arity: 0 },
   ]
 
 // Pure and nullary, so the runtime builds it once and each type conversion only looks a name up.
@@ -460,6 +466,7 @@ fn builtin_type_arity_map() -> Map<Bytes, Int> =
 
 fn builtin_type_arity(name: Bytes) -> Option<Int> = map_get(builtin_type_arity_map(), name)
 
+// A field names one of `params`, or else a builtin type.
 type Adt = {
   name: Bytes,
   params: List<Bytes>,
@@ -504,6 +511,9 @@ fn prelude_adts() -> List<Adt> =
       params: [b"s", b"r"],
       variants: [{ name: b"Continue", fields: [b"s"] }, { name: b"Stop", fields: [b"r"] }],
     },
+    // Nanoseconds: a point on a clock, and a span between two points, kept apart by their types.
+    { name: b"Instant", params: [], variants: [{ name: b"Instant", fields: [b"Int"] }] },
+    { name: b"Duration", params: [], variants: [{ name: b"Duration", fields: [b"Int"] }] },
   ]
 
 fn position_bytes(xs: List<Bytes>, v: Bytes) -> Int =
@@ -516,7 +526,10 @@ fn install_prelude_adts(cx: Cx) -> Cx =
     let result = TyCon({ name: adt.name, args: map(vars, |v: Int| TyVar(v)) });
     fold(range(0, len(adt.variants)), c, |c2: Cx, index: Int| {
       let v = at(adt.variants, index);
-      let fields = map(v.fields, |p: Bytes| TyVar(position_bytes(adt.params, p)));
+      let fields = map(v.fields, |p: Bytes| {
+        let at = position_bytes(adt.params, p);
+        if at >= 0 { TyVar(at) } else { con(p) }
+      });
       let ty = if len(fields) == 0 { result } else { t_fn(fields, result, row_empty()) };
       let sc = { ty_vars: vars, row_vars: [], label_vars: [], ty: ty };
       add_ctor({ ..c2, env: env_bind_global(c2.env, v.name, sc) }, {
@@ -605,8 +618,13 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       at: none,
       ops: [
         prelude_op(b"spawn", MWrite, [0], [0], [body], task, row_open(0)),
-        prelude_op(b"join", MWrite, [0], [], [task], ta, row_empty()),
+        // A join of a cancelled task raises; `await` answers `None` for one.
+        prelude_op(b"join", MWrite, [0], [], [task], ta, abort_row()),
         prelude_op(b"yield", MWrite, [], [], [], t_unit(), row_empty()),
+        // Stops a task where it stands; `true` when it had not yet ended.
+        prelude_op(b"cancel", MWrite, [0], [], [task], t_bool(), row_empty()),
+        // A join that answers `None` for a cancelled task.
+        prelude_op(b"await", MWrite, [0], [], [task], t_option(ta), row_empty()),
       ],
     },
     {
@@ -616,8 +634,8 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       nondet: true,
       at: none,
       ops: [
-        prelude_op(b"now", MRead, [], [], [], t_int(), row_empty()),
-        prelude_op(b"sleep", MWrite, [], [], [t_int()], t_unit(), row_empty()),
+        prelude_op(b"now", MRead, [], [], [], con(b"Instant"), row_empty()),
+        prelude_op(b"sleep", MWrite, [], [], [con(b"Duration")], t_unit(), row_empty()),
       ],
     },
     {
@@ -672,6 +690,7 @@ pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc
   let ordering = con(b"Ordering");
   let rounding = con(b"Rounding");
   let cell_ty = TyCon({ name: b"Cell", args: [tb, ta] });
+  let array_ty = TyCon({ name: b"Array", args: [ta] });
   [
     {
       name: b"assert",
@@ -682,6 +701,13 @@ pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc
     { name: b"push", sc: poly_fn([a], [], [t_list(ta), ta], t_list(ta), row_empty()) },
     { name: b"list_at", sc: poly_fn([a], [], [t_list(ta), t_int()], t_option(ta), row_empty()) },
     { name: b"list_set", sc: poly_fn([a], [], [t_list(ta), t_int(), ta], t_list(ta), abort_row()) },
+    { name: b"array_new", sc: poly_fn([a], [], [t_int(), ta], array_ty, abort_row()) },
+    { name: b"array_of_list", sc: poly_fn([a], [], [t_list(ta)], array_ty, row_empty()) },
+    { name: b"array_to_list", sc: poly_fn([a], [], [array_ty], t_list(ta), row_empty()) },
+    { name: b"array_len", sc: poly_fn([a], [], [array_ty], t_int(), row_empty()) },
+    { name: b"array_at", sc: poly_fn([a], [], [array_ty, t_int()], t_option(ta), row_empty()) },
+    { name: b"array_get", sc: poly_fn([a], [], [array_ty, t_int()], ta, abort_row()) },
+    { name: b"array_set", sc: poly_fn([a], [], [array_ty, t_int(), ta], array_ty, abort_row()) },
     { name: b"map", sc: poly_fn([a, b], [e], [t_list(ta), t_fn([ta], tb, re)], t_list(tb), re) },
     {
       name: b"filter",
@@ -796,6 +822,10 @@ pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc
     { name: b"string_ends_with", sc: mono_fn([t_string(), t_string()], t_bool()) },
     { name: b"string_contains", sc: mono_fn([t_string(), t_string()], t_bool()) },
     { name: b"string_find", sc: poly_fn([], [], [t_string(), t_string()], t_int(), abort_row()) },
+    { name: b"char_of_int", sc: mono_fn([t_int()], t_option(con(b"Char"))) },
+    { name: b"int_of_char", sc: mono_fn([con(b"Char")], t_int()) },
+    { name: b"string_chars", sc: mono_fn([t_string()], t_list(con(b"Char"))) },
+    { name: b"string_of_chars", sc: mono_fn([t_list(con(b"Char"))], t_string()) },
     { name: b"compare", sc: poly_fn([a], [], [ta, ta], ordering, row_empty()) },
     { name: b"compare_values", sc: poly_fn([a], [], [ta, ta], ordering, row_empty()) },
     { name: b"map_new", sc: poly_fn([a, b], [], [], map_ty, row_empty()) },
@@ -865,6 +895,17 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
     bdoc(b"push", [b"xs", b"x"], b"a new list with `x` at the end"),
     bdoc(b"list_at", [b"xs", b"i"], b"`None` if `i` is negative or past the end"),
     bdoc(b"list_set", [b"xs", b"i", b"v"], b"raises if `i` is out of range"),
+    bdoc(b"array_new", [b"n", b"x"], b"`n` of `x`; raises if `n` is negative or past `2^26`"),
+    bdoc(b"array_of_list", [b"xs"], b""),
+    bdoc(b"array_to_list", [b"xs"], b""),
+    bdoc(b"array_len", [b"xs"], b""),
+    bdoc(b"array_at", [b"xs", b"i"], b"`None` if `i` is negative or past the end"),
+    bdoc(b"array_get", [b"xs", b"i"], b"raises if `i` is out of range"),
+    bdoc(
+      b"array_set",
+      [b"xs", b"i", b"v"],
+      b"in place when the caller holds the last reference; raises if `i` is out of range",
+    ),
     bdoc(b"map", [b"xs", b"f"], b""),
     bdoc(b"filter", [b"xs", b"f"], b""),
     bdoc(b"fold", [b"xs", b"init", b"f"], b"left to right"),
@@ -959,6 +1000,10 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
     bdoc(b"string_ends_with", [b"s", b"suffix"], b""),
     bdoc(b"string_contains", [b"s", b"t"], b""),
     bdoc(b"string_find", [b"s", b"needle"], b"raises if absent"),
+    bdoc(b"char_of_int", [b"n"], b"`None` for a surrogate, a negative or past `U+10FFFF`"),
+    bdoc(b"int_of_char", [b"c"], b"the Unicode scalar value"),
+    bdoc(b"string_chars", [b"s"], b"each character in order"),
+    bdoc(b"string_of_chars", [b"cs"], b""),
     bdoc(b"compare", [b"x", b"y"], b"a total order; needs `derivable(ord, a)`"),
     bdoc(b"compare_values", [b"x", b"y"], b"`compare` under a name no module may shadow"),
     bdoc(b"map_new", [], b""),
@@ -1507,6 +1552,8 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
                     |m: Map<Bytes, Type>, i: Int|
                       map_insert(m, at(decl.params, i), at(converted.ts, i)),
                   );
+                  let outermost = len(g.cx.alias_stack) == 0;
+                  let before = len(g.cx.map_keys);
                   let inner: Cx = {
                     ..g.cx,
                     ty_params: bound,
@@ -1514,12 +1561,17 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
                     module: decl.owner,
                   };
                   let o: WithTy = conv_type(inner, alias);
+                  // A `Map` key's order is the using signature's to promise, so a refusal names the use.
+                  let keys = if outermost {
+                    relocated_keys(o.cx.map_keys, before, g.cx.module, span, name.name.name)
+                  } else { o.cx.map_keys };
                   {
                     cx: {
                       ..o.cx,
                       ty_params: saved,
                       alias_stack: take(o.cx.alias_stack, len(o.cx.alias_stack) - 1),
                       module: g.cx.module,
+                      map_keys: keys,
                     },
                     t: o.t,
                   }
@@ -2264,6 +2316,7 @@ fn lit_type(l: Lit) -> Type =
     LBytes(_) -> t_bytes(),
     LFloat(_) -> t_float(),
     LDec(_) -> t_decimal(),
+    LChar(_) -> con(b"Char"),
     _ -> t_unit(),
   }
 
@@ -5589,6 +5642,20 @@ fn check_fns(cx: Cx, m: Mod) -> Cx = {
               ],
             ),
           }
+        } else if def.name.name == b"map_of_entries" {
+          {
+            ..acc,
+            cx: err1(
+              acc.cx,
+              b"E0105",
+              def.name.span,
+              b"`map_of_entries` is a builtin",
+              b"cannot be redefined",
+              [
+                b"a map literal `#{k: v}` and a set literal `#[a]` are written in its name, so a module that redefined it would change what they mean",
+              ],
+            ),
+          }
         } else { { cx: acc.cx, fns: push(acc.fns, def), names: push(acc.names, def.name.name) } },
         _ -> acc,
       },
@@ -6137,7 +6204,9 @@ fn settle_numerics(cx: Cx) -> Cx = {
           ],
         ),
       TyCon(k) -> if len(k.args) != 0 { numeric_mismatch(c, entry, ty, what) }
-      else if is_int_name(k.name) || k.name == b"Float" { c } else if k.name == b"Decimal" {
+      else if is_int_name(k.name) || k.name == b"Float" { c }
+      // Characters order by scalar value, which is what a range test such as `c >= 'a'` reads.
+      else if k.name == b"Char" && is_ordered(entry.op) { c } else if k.name == b"Decimal" {
         if entry.op == b"div" {
           err1(
             c,
@@ -7160,11 +7229,25 @@ fn note_map_keys(cx: Cx, span: Span, ty: Type) -> Cx = {
             key: k,
             assumed: assumed,
             params: params,
+            via: b"",
           }),
       ),
     }
   }
 }
+
+// The sites an alias expansion recorded from `from` on, moved to where the alias was named.
+fn relocated_keys(
+  sites: List<MapKeySite>,
+  from: Int,
+  module: Int,
+  span: Span,
+  alias: Bytes,
+) -> List<MapKeySite> =
+  fold(range(from, len(sites)), sites, |acc: List<MapKeySite>, i: Int| {
+    let s = at(acc, i);
+    set_at(acc, i, { ..s, module: module, span: span, via: alias })
+  })
 
 // A reference that instantiated a parameter its callee constrained.
 fn note_constraints(cx: Cx, span: Span, callee: Bytes, args: List<Type>) -> Cx =
@@ -7222,7 +7305,10 @@ fn check_map_keys(cx: Cx) -> Cx = {
                     b"` is not an ordered type, so it cannot be a `Map` key",
                   ]),
                   bytes_concat_all([b"this map's key type is `", rendered, b"`"]),
-                  why_notes_for_map_key(blocked.why, blocked, blocker, site.params),
+                  alias_noted(
+                    why_notes_for_map_key(blocked.why, blocked, blocker, site.params),
+                    site.via,
+                  ),
                 ),
               ),
               seen: push(acc.seen, { scope: site.scope, text: rendered }),
@@ -7234,6 +7320,14 @@ fn check_map_keys(cx: Cx) -> Cx = {
   );
   walked.cx
 }
+
+fn alias_noted(notes: List<Bytes>, via: Bytes) -> List<Bytes> =
+  if via == b"" { notes } else {
+    push(
+      notes,
+      bytes_concat_all([b"`", via, b"` is a type alias, and the `Map` is in what it names"]),
+    )
+  }
 
 fn check_constraints(cx: Cx) -> Cx = {
   let adts = adt_shapes(cx);
@@ -7882,15 +7976,20 @@ fn nested_simulation(cx: Cx, site: Simulation, sites: List<Simulation>) -> Cx = 
   }
 }
 
-fn task_join() -> Atom = { effect: b"task", resource: RSingleton, mode: MWrite, op: Some(b"join") }
+fn task_op(op: Bytes) -> Atom =
+  { effect: b"task", resource: RSingleton, mode: MWrite, op: Some(op) }
 
-// A cell is reached by atoms naming its region; a task only by a join, or a `simulate` around one.
+// A cell is reached by atoms naming its region; a task only by a join, an await or a cancel, or a
+// `simulate` around one.
 fn row_brands(row: Row, brand: Brand) -> Bool =
   match brand {
     CellsOf(r) ->
       fold(row.atoms, false, |b: Bool, a: Atom|
         b || (a.effect == cell() && a.resource == RNamed(r))),
-    Tasks -> atoms_covered(row.atoms, task_join()) || atoms_covered(row.atoms, seed_atom()),
+    Tasks ->
+      atoms_covered(row.atoms, task_op(b"join")) || atoms_covered(row.atoms, task_op(b"await"))
+        || atoms_covered(row.atoms, task_op(b"cancel"))
+        || atoms_covered(row.atoms, seed_atom()),
   }
 
 // Whether a resolved type carries a region's brand, by either route a brand travels.

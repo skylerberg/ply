@@ -11,9 +11,9 @@ import std.decimal
 import std.float (is_finite, is_nan, is_infinite, is_sign_negative, trunc)
 import std.float
 import std.string (code_points, of_code_points)
-import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VStr, VBytes, VList, VRecord,
-                  VCtor, VMap, VFn, VCell, VTask, VSecret, VElided, Field, Entry, FNamed,
-                  FAnonymous, FConst, FProject, FTable, map_of)
+import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VList,
+                  VArray, VRecord, VCtor, VMap, VFn, VCell, VTask, VSecret, VElided, Field, Entry,
+                  FNamed, FAnonymous, FConst, FProject, FTable, map_of)
 import domain (Ty, Var, Fn, Record, Con)
 import gen
 import gen (Types, Typed, Ungeneratable, UCell, UTask, USecret, UEffectful, UUninhabited, UTooDeep,
@@ -209,9 +209,11 @@ pub fn size(v: Value, ts: Types) -> U128 =
     VUnit -> 0u128,
     VFloat(f) -> float_size(f),
     VDecimal(d) -> decimal_size(d),
+    VChar(c) -> wide(1 + int_of_char(c)),
     VStr(s) -> sum(code_points(s), |c: Int| wide(1 + c)),
     VBytes(b) -> sum(range(0, bytes_len(b)), |i: Int| wide(1 + bytes_at(b, i))),
     VList(items) -> plus(wide(len(items)), sum(items, |x: Value| size(x, ts))),
+    VArray(items) -> plus(wide(len(items)), sum(items, |x: Value| size(x, ts))),
     // Keys count too, so replacing a key with a smaller one is a strict shrink.
     VMap(entries) ->
       plus(wide(len(entries)), sum(entries, |e: Entry| plus(size(e.key, ts), size(e.value, ts)))),
@@ -275,11 +277,14 @@ fn minimal_at(t: Ty, ts: Types, depth: Int) -> Result<Value, Ungeneratable> =
       // `0.0`, not `-0.0`: the two are different values and the positive one is the floor.
       else if name == "Float" { Ok(VFloat(0.0)) }
       else if name == "Decimal" { Ok(VDecimal(0m)) }
+      // The letter strings shrink their characters toward, so the two agree.
+      else if name == "Char" { Ok(VChar('a')) }
       else if name == "Bool" { Ok(VBool(false)) }
       else if name == "String" { Ok(VStr("")) }
       else if name == "Bytes" { Ok(VBytes(b"")) }
       else if name == "Unit" { Ok(VUnit) }
       else if name == "List" { Ok(VList([])) }
+      else if name == "Array" { Ok(VArray([])) }
       else if name == "Map" { Ok(VMap([])) }
       else if name == "Cell" { Err(UCell) }
       else if name == "Task" { Err(UTask) }
@@ -354,9 +359,12 @@ fn candidates_at(v: Value, t: Ty, ts: Types, depth: Int) -> List<Value> =
       VFloat(f) -> map(float_candidates(f), |c: Float| VFloat(c)),
       VDecimal(d) -> map(decimal_candidates(d), |c: Decimal| VDecimal(c)),
       VBool(b) -> if b { [VBool(false)] } else { [] },
+      VChar(c) -> char_candidates(c),
       VStr(s) -> string_candidates(s),
       VBytes(b) -> bytes_candidates(b),
-      VList(items) -> list_candidates(items, list_elem(t), ts, depth),
+      VList(items) -> list_candidates(items, list_elem(t), ts, depth, |xs: List<Value>| VList(xs)),
+      VArray(items) ->
+        list_candidates(items, list_elem(t), ts, depth, |xs: List<Value>| VArray(xs)),
       VMap(entries) -> {
         let kv = map_types(t);
         map_candidates(entries, kv.key, kv.value, ts, depth)
@@ -399,7 +407,7 @@ fn int_ty() -> Ty = Con("Int", [])
 
 fn list_elem(t: Ty) -> Ty =
   match t {
-    Con(name, args) -> if name == "List" {
+    Con(name, args) -> if name == "List" || name == "Array" {
       match list_at(args, 0) { Some(a) -> a, None -> int_ty() }
     } else { int_ty() },
     _ -> int_ty(),
@@ -544,6 +552,16 @@ fn bytes_candidates(b: Bytes) -> List<Value> =
   }
 
 // As `bytes_candidates`, a character at a time, lowered toward `a`.
+// Toward `a`, as a string's characters are lowered: to it, then halfway.
+fn char_candidates(c: Char) -> List<Value> = {
+  let code = int_of_char(c);
+  if code <= 97 { [] } else {
+    fold([97, 97 + (code - 97) / 2], [], |acc: List<Value>, lowered: Int|
+      if lowered == code { acc }
+      else { match char_of_int(lowered) { Some(x) -> push(acc, VChar(x)), None -> acc } })
+  }
+}
+
 fn string_candidates(s: String) -> List<Value> = {
   let chars = code_points(s);
   if len(chars) == 0 { [] } else {
@@ -585,20 +603,27 @@ fn slice<a>(xs: List<a>, from: Int, to: Int) -> List<a> =
   fold(range(from, to), [], |out: List<a>, i: Int|
     match list_at(xs, i) { Some(x) -> push(out, x), None -> out })
 
-fn list_candidates(items: List<Value>, elem: Ty, ts: Types, depth: Int) -> List<Value> =
+// A list's candidates, or an array's: `made` builds the one the items are.
+fn list_candidates(
+  items: List<Value>,
+  elem: Ty,
+  ts: Types,
+  depth: Int,
+  made: (List<Value>) -> Value,
+) -> List<Value> =
   if len(items) == 0 { [] } else {
     let mid = len(items) / 2;
     let start = if len(items) >= 2 {
-      [VList([]), VList(slice(items, 0, mid)), VList(slice(items, mid, len(items)))]
-    } else { [VList([])] };
+      [made([]), made(slice(items, 0, mid)), made(slice(items, mid, len(items)))]
+    } else { [made([])] };
     let removed = fold(range(0, len(items)), start, |out: List<Value>, i: Int|
-      push(out, VList(without(items, i))));
+      push(out, made(without(items, i))));
     fold(range(0, len(items)), removed, |out: List<Value>, i: Int|
       match list_at(items, i) {
         None -> out,
         Some(item) ->
           fold(candidates_at(item, elem, ts, depth + 1), out, |acc: List<Value>, c: Value|
-            push(acc, VList(list_set(items, i, c)))),
+            push(acc, made(list_set(items, i, c)))),
       })
   }
 
@@ -755,6 +780,15 @@ test "a list shrinks by halves and by dropping an item before its items shrink" 
     VList(ints([4, 1])),
   ])
 }
+
+test "an array shrinks as a list does and stays an array" {
+  let cs = candidates(VArray(ints([4, 2])), Con("Array", [int_ty()]), no_types());
+  assert_eq(take(cs, 3), [VArray([]), VArray(ints([4])), VArray(ints([2]))]);
+  assert_eq(len(cs), 11);
+  assert_eq(minimal(Con("Array", [int_ty()]), no_types()), Ok(VArray([])))
+}
+
+fn take(xs: List<Value>, n: Int) -> List<Value> = slice(xs, 0, min(n, len(xs)))
 
 fn fixed(ty: String, n: Int) -> Value =
   VFixed(ty, if n >= 0 { u128_of_int(n) }
