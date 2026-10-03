@@ -82,6 +82,8 @@ pub struct Exports {
     pub builtins: Vec<ply_eval::Builtin>,
     pub shapes: Vec<Vec<Symbol>>,
     pub lambdas: Vec<String>,
+    /// Each bucket's table by the bucket's id: the unit's position of every key its C names.
+    pub buckets: Vec<(u8, Vec<u32>)>,
 }
 
 impl Exports {
@@ -162,6 +164,14 @@ impl Exports {
             &self.shapes,
             &self.lambdas,
         ));
+        out.push_str(&format!("buckets {}\n", self.buckets.len()));
+        for (id, places) in &self.buckets {
+            out.push_str(&id.to_string());
+            for place in places {
+                out.push_str(&format!(" {place}"));
+            }
+            out.push('\n');
+        }
         out
     }
 
@@ -221,6 +231,21 @@ impl Exports {
             refusals.push((function, construct));
         }
         let t = decode_tables(s, &mut at)?;
+        // A unit whose C writes the unit's positions itself has no bucket tables to fill.
+        let n = if at == s.len() {
+            0
+        } else {
+            count(line(s, &mut at)?, "buckets")?
+        };
+        let mut buckets = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut parts = line(s, &mut at)?.split(' ');
+            let id = parts.next()?.parse().ok()?;
+            let places = parts
+                .map(|p| p.parse().ok())
+                .collect::<Option<Vec<u32>>>()?;
+            buckets.push((id, places));
+        }
         Some(Exports {
             helpers,
             ctors,
@@ -233,6 +258,7 @@ impl Exports {
             builtins: t.builtins,
             shapes: t.shapes,
             lambdas: t.lambdas,
+            buckets,
         })
     }
 
