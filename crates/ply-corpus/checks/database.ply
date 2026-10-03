@@ -12,6 +12,8 @@ import corpus.report (Report, Judged)
 import corpus.w4
 import corpus.w5
 import std.config (config)
+import std.db
+import std.db (db, stmt, PText, Rows, CText, Failed, ReadCommitted, ReadOnly)
 
 fn database() -> String / {config.get[env]} =
   match config.get[env]("CORPUS_DB") {
@@ -123,4 +125,58 @@ test/nondet "the ladder's postgres rungs are taken, and every point it serves is
       ),
   );
   ()
+}
+
+fn name_of(sku: String) -> String / {db.query[items]} =
+  match db.query[items](stmt("select name from items where sku = $1"), [PText(sku)]) {
+    Rows([r]) -> match map_get(r, "name") { Some(CText(n)) -> n, _ -> "?" },
+    Rows([]) -> "-",
+    Rows(_) -> "more than one",
+    Failed(e) -> "failed " ++ e.code,
+    _ -> "a count",
+  }
+
+// What reaches the server, counted on its way there.
+fn counting<a>(
+  go: () -> a / {db.query[items], db.batch[items]},
+) -> { value: a, statements: Int } / {db.query[items], db.batch[items]} =
+  with_cell[sent](0) { n -> {
+    let value = handle {
+      go()
+    } with {
+      db.query[items](s, ps) -> {
+        cell_set(n, cell_get(n) + 1);
+        db.query[items](s, ps)
+      },
+      db.batch[items](s, each) -> {
+        cell_set(n, cell_get(n) + 1);
+        db.batch[items](s, each)
+      },
+    };
+    { value: value, statements: cell_get(n) }
+  } }
+
+test/nondet "a lookup batched over the desk's items is one statement, and answers what one query each would" {
+  let skus = ["bolt", "gasket", "widget", "nope", "bolt", "gasket"];
+  match db::with_server(database(), 2, || {
+      let alone = map(skus, name_of);
+      let together = counting(|| db::batched[items](skus, name_of));
+      let inside = db::transaction(ReadCommitted, ReadOnly, || db::batched[items](skus, name_of));
+      { alone: alone, together: together, inside: inside }
+    }) {
+    Err(why) -> panic(why),
+    Ok(r) -> {
+      assert_eq(r.alone, [
+        "hex bolt",
+        "copper gasket",
+        "left-handed widget",
+        "-",
+        "hex bolt",
+        "copper gasket",
+      ]);
+      assert_eq(r.together.value, r.alone);
+      assert_eq(r.together.statements, 1);
+      assert_eq(match r.inside { Ok(names) -> names, Err(_) -> [] }, r.alone)
+    },
+  }
 }
