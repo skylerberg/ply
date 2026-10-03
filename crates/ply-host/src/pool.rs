@@ -25,7 +25,7 @@ pub enum Ended {
 }
 
 /// A `std.process.Finished`: how a child ended and what it left in each stream.
-pub struct Exit {
+pub struct Finished {
     pub ended: Ended,
     pub out: Vec<u8>,
     pub err: Vec<u8>,
@@ -39,7 +39,7 @@ pub enum Heard {
     Closed,
 }
 
-pub enum Done {
+pub enum JobOutput {
     Int(i64),
     /// Whether a write happened; a filesystem's state is not the program's error.
     Bool(bool),
@@ -55,16 +55,16 @@ pub enum Done {
     MaybeMode(Option<u32>),
     /// A constructor with no fields, by the program-wide name the declaring module gives it.
     Ctor(&'static str),
-    Finished(Exit),
+    Finished(Finished),
     /// `None` when the child was still running at the deadline.
-    MaybeFinished(Option<Exit>),
+    MaybeFinished(Option<Finished>),
     Heard(Heard),
     /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
     Refused(Diagnostic),
 }
 
-type Job = Box<dyn FnOnce() -> Done + Send + 'static>;
+type Job = Box<dyn FnOnce() -> JobOutput + Send + 'static>;
 
 /// Rung by every pool it is handed to whenever one of their operations finishes, so one wait can
 /// cover several pools: separate condition variables cannot be waited on together.
@@ -121,7 +121,7 @@ struct Waiting {
 #[derive(Default)]
 struct State {
     waiting: HashMap<u64, Waiting>,
-    done: HashMap<u64, Done>,
+    done: HashMap<u64, JobOutput>,
 }
 
 struct Shared {
@@ -338,17 +338,17 @@ fn take(state: &mut State, token: u64) -> Taken {
         None => (Span::DUMMY, "a host operation"),
     };
     Taken::Ready(match done {
-        Done::Int(i) => Ok(Value::Int(i)),
-        Done::Bool(b) => Ok(Value::Bool(b)),
-        Done::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
-        Done::MaybeInt(n) => Ok(option(n.map(Value::Int))),
-        Done::MaybeStrings(names) => {
+        JobOutput::Int(i) => Ok(Value::Int(i)),
+        JobOutput::Bool(b) => Ok(Value::Bool(b)),
+        JobOutput::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
+        JobOutput::MaybeInt(n) => Ok(option(n.map(Value::Int))),
+        JobOutput::MaybeStrings(names) => {
             Ok(option(names.map(|names| {
                 Value::list(names.into_iter().map(Value::str).collect())
             })))
         }
-        Done::MaybeString(text) => Ok(option(text.map(Value::str))),
-        Done::MaybeEntries(entries) => Ok(option(entries.map(|entries| {
+        JobOutput::MaybeString(text) => Ok(option(text.map(Value::str))),
+        JobOutput::MaybeEntries(entries) => Ok(option(entries.map(|entries| {
             Value::list(
                 entries
                     .into_iter()
@@ -356,13 +356,13 @@ fn take(state: &mut State, token: u64) -> Taken {
                     .collect(),
             )
         }))),
-        Done::MaybeMode(bits) => Ok(option(bits.map(mode))),
-        Done::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
-        Done::Finished(exit) => Ok(finished(exit)),
-        Done::MaybeFinished(exit) => Ok(option(exit.map(finished))),
-        Done::Heard(heard) => Ok(heard_value(heard)),
-        Done::Refused(diagnostic) => Err(diagnostic),
-        Done::Failed(message) => Err(Diagnostic::error(
+        JobOutput::MaybeMode(bits) => Ok(option(bits.map(mode))),
+        JobOutput::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
+        JobOutput::Finished(exit) => Ok(finished(exit)),
+        JobOutput::MaybeFinished(exit) => Ok(option(exit.map(finished))),
+        JobOutput::Heard(heard) => Ok(heard_value(heard)),
+        JobOutput::Refused(diagnostic) => Err(diagnostic),
+        JobOutput::Failed(message) => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,
             format!("{what} failed: {message}"),
         )
@@ -371,7 +371,7 @@ fn take(state: &mut State, token: u64) -> Taken {
 }
 
 /// The record `std.process.Finished` names, built where the `Value` will live.
-fn finished(exit: Exit) -> Value {
+fn finished(exit: Finished) -> Value {
     let ended = match exit.ended {
         Ended::Exited(code) => Value::ctor("std.process.Exited", vec![Value::Int(code)]),
         Ended::Signalled(signal) => Value::ctor("std.process.Signalled", vec![Value::Int(signal)]),

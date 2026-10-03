@@ -217,13 +217,13 @@ pub struct ModuleInfo {
     /// Each module this one imports, as the program names it.
     pub imports: Vec<ModuleName>,
     /// What a stub of this module blanks, in source order.
-    pub cuts: Vec<Cut>,
+    pub cuts: Vec<BlankedSpan>,
 }
 
 /// A span of a module a stub blanks: a body, which keeps its braces as an empty block, or a whole
 /// test or law.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cut {
+pub struct BlankedSpan {
     pub start: usize,
     pub end: usize,
     pub braced: bool,

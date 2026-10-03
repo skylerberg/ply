@@ -1,4 +1,4 @@
-//! Which C toolchain this tier compiles with.
+//! Which C toolchain this backend compiles with.
 //!
 //! A warm run reads its unit back out of a cache. An *edit* recompiles it, and `cc -O2` over a
 //! large unit is the slow part of that. So there are two things to compile for, and one compiler

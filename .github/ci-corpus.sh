@@ -233,15 +233,13 @@ marked() {
   [ -f "$mark" ] || { echo "nothing is marked: run 'ci-corpus.sh mark' before the runs" >&2; return 1; }
 }
 
-# The bodies and answers `ply` emitted or read since the mark, into DIR.
+# The emitter's answers `ply` wrote or read since the mark, into DIR.
 kept_c() {
-  local dir=$1 sub
-  local -a kept=()
+  local dir=$1
   rm -rf "$dir"
   mkdir -p "$dir"
-  for sub in emit answers bodies; do [ -d "$caches/ply-c-cache/$sub" ] && kept+=("ply-c-cache/$sub"); done
-  [ "${#kept[@]}" -gt 0 ] || return 0
-  (cd "$caches" && find "${kept[@]}" -type f -newer "$mark" ! -name '*.tmp' -print0 |
+  [ -d "$caches/ply-c-cache/bodies" ] || return 0
+  (cd "$caches" && find ply-c-cache/bodies -type f -newer "$mark" ! -name '*.tmp' -print0 |
     tar --null -T - -cf -) | tar -xf - -C "$dir"
 }
 

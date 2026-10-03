@@ -1,4 +1,4 @@
-//! Keeping the content-addressed object cache and the stage directory to a size, gated by a stamp
+//! Keeping the content-addressed C cache and the stage directory to a size, gated by a stamp
 //! and run on a background thread so no build waits on it. Both go least recently used first: a
 //! read of an entry is recorded by [`used`], since an entry every run reads is written only once.
 
@@ -101,9 +101,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
         }
     };
     walk(root);
-    walk(&root.join("emit"));
     walk(&root.join("obj"));
-    walk(&root.join("answers"));
     walk(&root.join("bodies"));
     if total <= budget {
         return 0;

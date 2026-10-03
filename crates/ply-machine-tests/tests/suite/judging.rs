@@ -235,10 +235,10 @@ fn an_ensures_calls_its_owner_for_the_result_it_states() {
     );
 }
 
-/// A value the law takes no binder for makes the tier decline the entry: Ply's failure, never the
-/// program's raise.
+/// A value the law takes no binder for makes the backend decline the entry: Ply's failure, never
+/// the program's raise.
 #[test]
-fn an_entry_the_tier_declines_is_plys_failure() {
+fn an_entry_the_backend_declines_is_plys_failure() {
     let mismatched = over_a_bool("m.halving a choice");
     let judgements = judged(
         &mismatched,

@@ -251,7 +251,7 @@ impl Provider for Unit {
         match self.build() {
             Ok(bodies) => Rc::new(bodies),
             Err(e) => {
-                eprintln!("the C tier built no unit for this program: {e:#}");
+                eprintln!("the C backend built no unit for this program: {e:#}");
                 self.poisoned.fetch_add(1, Ordering::Relaxed);
                 Rc::new(Absent { unit: self })
             }
@@ -376,7 +376,7 @@ impl Bodies {
         })
     }
 
-    /// Entries the tier answered or raised, a memo's answers among them, over this backend's
+    /// Entries the backend answered or raised, a memo's answers among them, over this backend's
     /// whole life.
     pub fn entered(&self) -> u64 {
         self.entered.get()
@@ -407,14 +407,14 @@ impl Bodies {
         self.declines.get()
     }
 
-    fn decline(&self, mut f: impl FnMut(&mut Declines)) -> Run {
+    fn decline(&self, mut f: impl FnMut(&mut Declines)) -> EntryOutcome {
         let mut d = self.declines.get();
         f(&mut d);
         self.declines.set(d);
-        Run::Declined
+        EntryOutcome::Declined
     }
 
-    fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> Run {
+    fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> EntryOutcome {
         *self.last.borrow_mut() = LastEntry::default();
         let Some(admitted) = self.admitted.get(name) else {
             return self.decline(|d| d.not_compiled += 1);
@@ -435,7 +435,7 @@ impl Bodies {
             drop(ctx);
             self.unit.counters.note_converted(0, 0);
             self.entered.set(self.entered.get() + 1);
-            return Run::Answered(value);
+            return EntryOutcome::Answered(value);
         }
         ctx.begin(i64::try_from(fuel).unwrap_or(i64::MAX));
         // Values are deep-converted in and out: nothing outside the entry ever holds a word.
@@ -458,7 +458,7 @@ impl Bodies {
             drop(ctx);
             self.unit.counters.note_converted(0, 0);
             self.entered.set(self.entered.get() + 1);
-            return Run::Answered(value);
+            return EntryOutcome::Answered(value);
         }
         let inward = (ctx.heap.allocated() - before) as u64;
         // SAFETY: `self._code` owns the entry's pages, `ctx` is uniquely borrowed, and
@@ -480,7 +480,7 @@ impl Bodies {
 
         if ctx.failed != 0 {
             let raised = if ctx.failed == crate::rt::FAILED_OUT_OF_FUEL {
-                // Tier-only: no machine follows, so the budget is reported from here.
+                // The backend alone: no machine follows, so the budget is reported from here.
                 Some(
                     ply_eval::Diagnostic::error(
                         ply_eval::codes::RUNTIME_ERROR,
@@ -502,8 +502,8 @@ impl Bodies {
             drop(ctx);
             self.entered.set(self.entered.get() + 1);
             return match raised {
-                Some(raised) => Run::Raised(raised),
-                None => Run::Declined,
+                Some(raised) => EntryOutcome::Raised(raised),
+                None => EntryOutcome::Declined,
             };
         }
         crate::detached::release_all(&mut ctx);
@@ -545,7 +545,7 @@ impl Bodies {
                 .unwrap_or(ply_eval::Span::DUMMY);
             if let Err(refused) = ply_eval::escape::check(&boundary, &value, span) {
                 self.entered.set(self.entered.get() + 1);
-                return Run::Raised(refused);
+                return EntryOutcome::Raised(refused);
             }
             return self.decline(|d| d.answer += 1);
         }
@@ -557,22 +557,22 @@ impl Bodies {
         }
         self.unit.counters.note_converted(inward, walked.read);
         self.entered.set(self.entered.get() + 1);
-        Run::Answered(value)
+        EntryOutcome::Answered(value)
     }
 }
 
 /// How one entry ended.
-enum Run {
+enum EntryOutcome {
     Answered(Value),
     Raised(Diagnostic),
     Declined,
 }
 
-impl Run {
+impl EntryOutcome {
     fn answer(self) -> Option<Value> {
         match self {
-            Run::Answered(value) => Some(value),
-            Run::Raised(_) | Run::Declined => None,
+            EntryOutcome::Answered(value) => Some(value),
+            EntryOutcome::Raised(_) | EntryOutcome::Declined => None,
         }
     }
 }
@@ -590,18 +590,18 @@ impl ply_eval::Compiled for Bodies {
     fn enter_test(&self, name: &Symbol, budget: usize) -> Entered {
         self.unit.counters.note_offer(&[]);
         match self.run(name, &[], budget) {
-            Run::Answered(value) => Entered::Answered(value),
-            Run::Raised(raised) => Entered::Raised(raised),
-            Run::Declined => Entered::Declined,
+            EntryOutcome::Answered(value) => Entered::Answered(value),
+            EntryOutcome::Raised(raised) => Entered::Raised(raised),
+            EntryOutcome::Declined => Entered::Declined,
         }
     }
 
     fn enter_whole(&self, name: &Symbol, args: &[Value], budget: usize) -> Entered {
         self.unit.counters.note_offer(args);
         match self.run(name, args, budget) {
-            Run::Answered(value) => Entered::Answered(value),
-            Run::Raised(raised) => Entered::Raised(raised),
-            Run::Declined => Entered::Declined,
+            EntryOutcome::Answered(value) => Entered::Answered(value),
+            EntryOutcome::Raised(raised) => Entered::Raised(raised),
+            EntryOutcome::Declined => Entered::Declined,
         }
     }
 

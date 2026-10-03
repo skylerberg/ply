@@ -9,6 +9,7 @@ import std.time (time)
 import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface,
                        analyse_pulling_std_with, dump_of, filing, module_items, module_imports,
                        no_rows, rows_of)
+import compiler.embed (EmbedFile)
 import compiler.pkg (PackageSources, Supplied)
 import compiler.interface (CompiledPackage, Original, merged_interfaces)
 import interfaces
@@ -297,7 +298,8 @@ fn refreshing(
 
 // --- The front-end cache ---------------------------------------------------------
 
-fn nothing_recorded() -> Recorded = { defs: [], tests: [], stdlib: None, warnings: [] }
+fn nothing_recorded() -> Recorded =
+  { defs: [], tests: [], stdlib: None, warnings: [], intact: map_new(), filed_load: None }
 
 fn rows_recorded(k: Recorded) -> Rows =
   { defs: map(k.defs, |d: DefInterface| d.row), tests: k.tests }
@@ -420,6 +422,52 @@ pub fn stdlib_notice(moved: Option<StdlibMoved>, h: HashOutput) -> List<Diag> =
     },
   }
 
+// What a filing writes, beyond the compiler the store's stamp names: the files the load placed and
+// the packages their keys name, each name's hashes, the shipped modules and the load's reach. An
+// interface or a body is a function of the hash it is filed under.
+fn load_digest(
+  files: List<SourceFile>,
+  packages: List<SourcePackage>,
+  hashes: HashOutput,
+  now: String,
+  whole: Bool,
+) -> Bytes = {
+  let counted = |count: Int| bytes_of_string(int_to_string(count) ++ "\0");
+  let named = |entries: List<{ name: Bytes, hash: Bytes }>|
+    bytes_concat(
+      counted(len(entries)),
+      bytes_concat_all(
+        map(entries, |entry: { name: Bytes, hash: Bytes }|
+          bytes_concat_all([entry.name, b"\0", entry.hash])),
+      ),
+    );
+  blake3(
+    bytes_concat_all([
+      b"ply.load.1\0",
+      counted(len(files)),
+      bytes_concat_all(
+        map(files, |file: SourceFile|
+          bytes_concat_all([
+            bytes_of_string(file.path ++ "\0" ++ file.name ++ "\0"),
+            blake3(file.text),
+          ])),
+      ),
+      counted(len(packages)),
+      bytes_concat_all(
+        map(packages, |package: SourcePackage|
+          bytes_of_string(package.root ++ "\0" ++ package.digest ++ "\0")),
+      ),
+      named(hashes.defs),
+      named(hashes.checks),
+      named(hashes.decls),
+      counted(len(hashes.tests)),
+      bytes_concat_all(hashes.tests),
+      bytes_of_string(now),
+      if whole { b"\0whole" } else { b"\0part" },
+    ]),
+  )
+}
+
 // A load that checked files what it published; the store's trouble is the run's warnings and
 // never its failure.
 fn filed(
@@ -435,9 +483,19 @@ fn filed(
       let place = loads::place_of(paths, stamps);
       let sources = { files: placed_sources(program, w), packages: packages_of(program.pkgs) };
       let now = shipped_digest_of(shelved);
-      let more = if place.label == "cwd" {
-        loads::file[cwd](place, sources, filing(w), whole_project(paths), now)
-      } else { loads::file[abs](place, sources, filing(w), whole_project(paths), now) };
+      let whole = whole_project(paths);
+      let load = load_digest(sources.files, sources.packages, w.hashes, now, whole);
+      let held = fold(range(0, len(w.mods)), true, |all: Bool, i: Int|
+        all
+          && (match list_at(sources.files, i) {
+            Some(f) -> map_contains(k.intact, f.path),
+            None -> true,
+          }));
+      // The last filing was of this load and the store still holds all it wrote: filing it again
+      // would write nothing.
+      let more = if held && len(k.warnings) == 0 && k.filed_load == Some(load) { [] }
+      else if place.label == "cwd" { loads::file[cwd](place, sources, filing(w), whole, now, load) }
+      else { loads::file[abs](place, sources, filing(w), whole, now, load) };
       {
         ..program,
         diags: appended(
@@ -917,6 +975,19 @@ test "only a load of one directory is a load of the whole project" {
   assert(whole_project([here]));
   assert(!whole_project([{ ..here, inside: "m.ply" }]));
   assert(!whole_project([here, here]))
+}
+
+test "a load's digest moves with each file, hash, shipped module and reach its filing writes for" {
+  let files = [{ path: "m.ply", name: "m", text: b"f" }];
+  let h = { ..hash::no_hashes(), defs: [{ name: b"m.f", hash: blake3(b"f") }] };
+  let base = load_digest(files, [], h, "b3:now", true);
+  assert_eq(load_digest(files, [], h, "b3:now", true), base);
+  assert(load_digest([{ path: "m.ply", name: "m", text: b"g" }], [], h, "b3:now", true) != base);
+  assert(load_digest(files, [{ root: "dep", digest: "d" }], h, "b3:now", true) != base);
+  assert(load_digest(files, [], { ..h, checks: h.defs }, "b3:now", true) != base);
+  assert(load_digest(files, [], { ..h, tests: [blake3(b"t")] }, "b3:now", true) != base);
+  assert(load_digest(files, [], h, "b3:later", true) != base);
+  assert(load_digest(files, [], h, "b3:now", false) != base)
 }
 
 test "a warning the cache read already gave is not given again by the filing" {

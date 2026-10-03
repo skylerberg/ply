@@ -4,7 +4,7 @@
 //! label variables numbered where they first appear, so an answer reads to one structure however
 //! the checker happened to number them.
 
-use ply_eval::decode::{At, Error};
+use ply_eval::decode::{AnswerValue, Error};
 use ply_eval::{
     Analysis, Carry, DefHash, DefInfo, DefWritten, Diagnostic, Edit, EffectAtom, EffectInfo,
     EmitterRoot, Fix, Footprint, HashOutput, INT_TYPES, Label, LawInfo, Mode, ModuleInfo,
@@ -22,7 +22,7 @@ const NO_MODULE: u32 = u32::MAX;
 /// `sources[i]` is the source a module index `i` names: the program's own modules, the shipped
 /// ones pulled after them, then any manifest the answer places past those.
 pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
-    let d = At::new(ANSWER, dump);
+    let d = AnswerValue::new(ANSWER, dump);
     let r = Reader { sources };
     let mut front = Analysis {
         diagnostics: d.field("diags")?.items(|x| r.diagnostic(x))?,
@@ -81,7 +81,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
                 // The committed emitter answering for a stage may predate them, and cut nothing.
                 cuts: match m.field("cuts") {
                     Ok(cuts) => cuts.items(|c| {
-                        Ok(ply_eval::Cut {
+                        Ok(ply_eval::BlankedSpan {
                             start: c.field("start")?.number()?,
                             end: c.field("end")?.number()?,
                             braced: c.field("braced")?.bool()?,
@@ -167,7 +167,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
 
 /// The hasher's rows in its item order. A test's or a law's row is numbered by the item it is
 /// about, so the tests and laws are read before them.
-fn hashes(rows: At<'_>, front: &mut Analysis) -> Result<(), Error> {
+fn hashes(rows: AnswerValue<'_>, front: &mut Analysis) -> Result<(), Error> {
     let tests = front.check.tests.len();
     let laws = front.check.laws.len();
     let mut test_hashes: Vec<Option<DefHash>> = vec![None; tests];
@@ -207,7 +207,7 @@ fn hashes(rows: At<'_>, front: &mut Analysis) -> Result<(), Error> {
 }
 
 /// A `fn`'s, `type`'s or `effect`'s row: one per name, a name in two namespaces included.
-fn def_hash(h: At<'_>, out: &mut HashOutput) -> Result<(), Error> {
+fn def_hash(h: AnswerValue<'_>, out: &mut HashOutput) -> Result<(), Error> {
     let name = Symbol::new(h.field("name")?.utf8()?);
     if out.deps.contains_key(&name) {
         return Err(h.error(format!("`{name}` is hashed twice")));
@@ -223,7 +223,7 @@ fn def_hash(h: At<'_>, out: &mut HashOutput) -> Result<(), Error> {
 }
 
 /// The test or law a hash row numbers, which the rows before it declared.
-fn item(h: At<'_>, declared: usize, of: &str) -> Result<usize, Error> {
+fn item(h: AnswerValue<'_>, declared: usize, of: &str) -> Result<usize, Error> {
     let index = h.field("index")?;
     let i: usize = index.number()?;
     if i >= declared {
@@ -233,7 +233,11 @@ fn item(h: At<'_>, declared: usize, of: &str) -> Result<usize, Error> {
 }
 
 /// A test's or a law's hash; its references merge into what its key already holds.
-fn item_hash(h: At<'_>, declared: &Symbol, out: &mut HashOutput) -> Result<DefHash, Error> {
+fn item_hash(
+    h: AnswerValue<'_>,
+    declared: &Symbol,
+    out: &mut HashOutput,
+) -> Result<DefHash, Error> {
     let key = h.field("key")?;
     if key.utf8()? != declared.as_str() {
         return Err(key.error(format!("the item this row numbers is keyed `{declared}`")));
@@ -249,16 +253,16 @@ fn item_hash(h: At<'_>, declared: &Symbol, out: &mut HashOutput) -> Result<DefHa
 }
 
 /// A hash as the hasher's rows hold one: sixty-four hex digits.
-fn hash_of(x: At<'_>) -> Result<DefHash, Error> {
+fn hash_of(x: AnswerValue<'_>) -> Result<DefHash, Error> {
     let text = x.utf8()?;
     DefHash::from_hex(text).ok_or_else(|| x.error(format!("`{text}` is not a hash")))
 }
 
-fn symbols(list: At<'_>) -> Result<Vec<Symbol>, Error> {
+fn symbols(list: AnswerValue<'_>) -> Result<Vec<Symbol>, Error> {
     list.items(|s| Ok(Symbol::new(s.utf8()?)))
 }
 
-fn strings(list: At<'_>) -> Result<Vec<String>, Error> {
+fn strings(list: AnswerValue<'_>) -> Result<Vec<String>, Error> {
     list.items(|s| Ok(s.utf8()?.to_string()))
 }
 
@@ -271,7 +275,7 @@ fn visibility(public: bool) -> Visibility {
 }
 
 /// `fn <name>[ <kind>,<kind>]`, `test <name>` or `law <name>`: one keyable item of a module.
-fn ordinal(x: At<'_>) -> Result<Ordinal, Error> {
+fn ordinal(x: AnswerValue<'_>) -> Result<Ordinal, Error> {
     let text = x.utf8()?;
     let Some((kind, item)) = text.split_once(' ') else {
         return Err(x.error(format!("`{text}` is not `<fn|test|law> <name>`")));
@@ -302,7 +306,7 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     /// A record's `module`, `start` and `end`: a row's `At`, a label or an edit alike.
-    fn span(&self, at: At<'_>) -> Result<Span, Error> {
+    fn span(&self, at: AnswerValue<'_>) -> Result<Span, Error> {
         let index = at.field("module")?;
         let module: u32 = index.number()?;
         let source = if module == NO_MODULE {
@@ -322,7 +326,7 @@ impl Reader<'_> {
         ))
     }
 
-    fn diagnostic(&self, d: At<'_>) -> Result<Diagnostic, Error> {
+    fn diagnostic(&self, d: AnswerValue<'_>) -> Result<Diagnostic, Error> {
         let severity = d.field("severity")?;
         Ok(Diagnostic {
             severity: match severity.utf8()? {
@@ -358,7 +362,7 @@ impl Reader<'_> {
         })
     }
 
-    fn def(&self, d: At<'_>) -> Result<(DefInfo, DefWritten), Error> {
+    fn def(&self, d: AnswerValue<'_>) -> Result<(DefInfo, DefWritten), Error> {
         let info = DefInfo {
             name: Symbol::new(d.field("name")?.utf8()?),
             module: ModuleName::from_dotted(d.field("module")?.utf8()?),
@@ -380,7 +384,7 @@ impl Reader<'_> {
         Ok((info, written))
     }
 
-    fn type_decl(&self, t: At<'_>) -> Result<TypeDecl, Error> {
+    fn type_decl(&self, t: AnswerValue<'_>) -> Result<TypeDecl, Error> {
         Ok(TypeDecl {
             name: Symbol::new(t.field("name")?.utf8()?),
             module: ModuleName::from_dotted(t.field("module")?.utf8()?),
@@ -392,7 +396,7 @@ impl Reader<'_> {
     }
 
     /// A test's or a law's `index`, which must be its place among them.
-    fn placed(&self, row: At<'_>, at: usize) -> Result<usize, Error> {
+    fn placed(&self, row: AnswerValue<'_>, at: usize) -> Result<usize, Error> {
         let index = row.field("index")?;
         let i: usize = index.number()?;
         if i != at {
@@ -401,7 +405,7 @@ impl Reader<'_> {
         Ok(i)
     }
 
-    fn test(&self, t: At<'_>, at: usize) -> Result<TestInfo, Error> {
+    fn test(&self, t: AnswerValue<'_>, at: usize) -> Result<TestInfo, Error> {
         Ok(TestInfo {
             name: t.field("name")?.utf8()?.to_string(),
             module: ModuleName::from_dotted(t.field("module")?.utf8()?),
@@ -413,7 +417,7 @@ impl Reader<'_> {
         })
     }
 
-    fn law(&self, l: At<'_>, at: usize) -> Result<LawInfo, Error> {
+    fn law(&self, l: AnswerValue<'_>, at: usize) -> Result<LawInfo, Error> {
         Ok(LawInfo {
             name: l.field("name")?.utf8()?.to_string(),
             module: ModuleName::from_dotted(l.field("module")?.utf8()?),
@@ -425,7 +429,7 @@ impl Reader<'_> {
         })
     }
 
-    fn effect(&self, e: At<'_>) -> Result<(EffectInfo, Visibility), Error> {
+    fn effect(&self, e: AnswerValue<'_>) -> Result<(EffectInfo, Visibility), Error> {
         let mut effect = EffectInfo {
             name: Symbol::new(e.field("name")?.utf8()?),
             module: ModuleName::from_dotted(e.field("module")?.utf8()?),
@@ -444,7 +448,7 @@ impl Reader<'_> {
         Ok((effect, visibility(e.field("public")?.bool()?)))
     }
 
-    fn op(&self, o: At<'_>) -> Result<OpInfo, Error> {
+    fn op(&self, o: AnswerValue<'_>) -> Result<OpInfo, Error> {
         let mode = o.field("mode")?;
         Ok(OpInfo {
             name: Symbol::new(o.field("name")?.utf8()?),
@@ -462,12 +466,12 @@ impl Reader<'_> {
 
 // --- Carries -------------------------------------------------------------------------------
 
-fn carries(list: At<'_>) -> Result<Vec<Carry>, Error> {
+fn carries(list: AnswerValue<'_>) -> Result<Vec<Carry>, Error> {
     list.items(carry)
 }
 
 /// A `front.Carry`.
-fn carry(c: At<'_>) -> Result<Carry, Error> {
+fn carry(c: AnswerValue<'_>) -> Result<Carry, Error> {
     let k = c.ctor()?;
     Ok(match k.name() {
         "CPlain" => Carry::Plain,
@@ -496,7 +500,7 @@ fn carry(c: At<'_>) -> Result<Carry, Error> {
 // --- Footprints ----------------------------------------------------------------------------
 
 /// A footprint binds every label variable it names, numbered in the order they first appear.
-fn footprint(atoms: At<'_>) -> Result<Footprint, Error> {
+fn footprint(atoms: AnswerValue<'_>) -> Result<Footprint, Error> {
     let mut labels: Vec<i64> = Vec::new();
     Ok(Footprint::from_atoms(
         atoms.items(|a| atom(a, &mut labels))?,
@@ -504,7 +508,7 @@ fn footprint(atoms: At<'_>) -> Result<Footprint, Error> {
 }
 
 /// An operation atom takes its declaration's mode, which [`resolve_op_modes`] gives it.
-fn atom(a: At<'_>, labels: &mut Vec<i64>) -> Result<EffectAtom, Error> {
+fn atom(a: AnswerValue<'_>, labels: &mut Vec<i64>) -> Result<EffectAtom, Error> {
     let effect = Symbol::new(a.field("effect")?.utf8()?);
     let resource = resource(a.field("resource")?, labels)?;
     if let Some(op) = a.field("op")?.option()? {
@@ -524,7 +528,7 @@ fn atom(a: At<'_>, labels: &mut Vec<i64>) -> Result<EffectAtom, Error> {
     Ok(EffectAtom::new(effect, resource, mode))
 }
 
-fn resource(r: At<'_>, labels: &mut Vec<i64>) -> Result<Resource, Error> {
+fn resource(r: AnswerValue<'_>, labels: &mut Vec<i64>) -> Result<Resource, Error> {
     let c = r.ctor()?;
     Ok(match c.name() {
         "RNamed" => Resource::Named(Symbol::new(c.arg(0)?.utf8()?)),

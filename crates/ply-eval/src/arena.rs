@@ -127,7 +127,7 @@ impl fmt::Display for Slot {
 }
 
 #[derive(Clone, Copy)]
-struct Meta {
+struct SlotMeta {
     generation: u32,
     /// The slot its region allocated before it, [`NIL`] for the region's first, or [`FREE`].
     link: u32,
@@ -138,7 +138,7 @@ struct Scope {
     /// Rises each time the scope is freed.
     generation: u32,
     state: State,
-    /// The region's newest slot, from which [`Meta::link`] reaches the rest.
+    /// The region's newest slot, from which [`SlotMeta::link`] reaches the rest.
     newest: u32,
     cells: usize,
 }
@@ -199,12 +199,13 @@ pub struct Stats {
 
 impl Stats {}
 
-/// Slots in chunks and regions nesting per owner, over interpreter values or the tier's heap words.
+/// Slots in chunks and regions nesting per owner, over interpreter values or the C backend's heap
+/// words.
 pub struct Arena<V = Value> {
     /// `chunks[c][o]` is the value at index `c * CHUNK + o`; a free slot holds `V::default()`.
     chunks: Vec<Vec<V>>,
     /// A position's generation only rises until [`Arena::renew`], so a stale slot never matches.
-    meta: Vec<Vec<Meta>>,
+    meta: Vec<Vec<SlotMeta>>,
     live: usize,
     /// Every index from here up is free.
     top: usize,
@@ -422,7 +423,7 @@ impl<V: Clone + Default> Arena<V> {
                     values.resize_with(CHUNK, V::default);
                     self.chunks.push(values);
                     self.meta.push(vec![
-                        Meta {
+                        SlotMeta {
                             generation: 0,
                             link: FREE,
                         };

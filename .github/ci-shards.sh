@@ -69,8 +69,8 @@ CLI_SUITE=crates/ply-cli-tests/ply
 # duration over `DESK_RUNNERS` runners beside a postgres each, the `corpus` job's `desks-<k>`.
 CORPUS_DESKS=(serving database)
 DESK_RUNNERS=3
-# Runs that take a runner each: the compiler's own tests on the tier take every core.
-CORPUS_ALONE=(cli-compiler_on_the_tier)
+# Runs that take a runner each: the compiler's own tests, compiled, take every core.
+CORPUS_ALONE=(cli-compiler_compiled)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)

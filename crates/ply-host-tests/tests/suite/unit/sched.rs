@@ -8,7 +8,7 @@ use ply_eval::{
 };
 use ply_host::sched::*;
 use ply_host::trace::sink::Recording;
-use ply_host::trace::{self, Kind, Level, Outcome, Sink, Trace};
+use ply_host::trace::{self, Level, Outcome, RecordKind, Sink, Trace};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -675,7 +675,7 @@ fn a_retired_tasks_open_span_is_closed_abandoned_at_retirement() {
     let last = sink.records().pop().expect("the span's records");
     assert_eq!(
         (last.kind, last.name.as_str(), last.outcome),
-        (Kind::Exit, "request", Outcome::Abandoned)
+        (RecordKind::Exit, "request", Outcome::Abandoned)
     );
     let records = sink.records().len();
     let warnings = rt.end_entry_point(machine);

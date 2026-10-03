@@ -185,7 +185,7 @@ pub enum ClosureKind {
         arity: usize,
         captured: Vec<Value>,
     },
-    /// A function the prover generated: data rather than a body, so the compiled tier applies it.
+    /// A function the prover generated: data rather than a body, so the C backend applies it.
     Synth {
         arity: usize,
         rule: Synth,
