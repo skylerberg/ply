@@ -363,7 +363,7 @@ fn err_drain_incomplete(shutdown: &Shutdown, connections: usize) -> Diagnostic {
             elapsed.as_millis()
         ))
         .note("raise `--drain-ms` above the program's own body_timeout_ms + write_timeout_ms")
-        .note("W5 has no cancellation, so a request still running here is not unwound and is not handed a 503: its connection closes with no response")
+        .note("Ply has no cancellation, so a request still running here is not unwound and is not handed a 503: its connection closes with no response")
 }
 
 #[cold]

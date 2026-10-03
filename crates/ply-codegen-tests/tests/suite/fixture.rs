@@ -10,30 +10,14 @@ pub static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// What the builder makes of `files`, `(path, text)` each: the front end's answer, a refusal's
 /// included, and the unit's C, every root offered.
 pub fn made(files: &[(String, String)]) -> ply_machine::runnable::Runnable {
-    let bytes = ply_machine::builds::answered(files)
-        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
-    ply_machine::runnable::decode(&bytes).unwrap_or_else(|why| panic!("the answer reads: {why}"))
+    ply_machine::builds::answered_program(files)
+        .unwrap_or_else(|d| panic!("the builder answers: {d}"))
 }
 
-/// [`made`] over `modules`, `(module name, text)` each written to the file its name spells,
-/// which have to check.
+/// What the builder makes of `modules`, `(module name, text)` each, which have to check.
 pub fn answered(modules: &[(&str, &str)]) -> ply_machine::runnable::Runnable {
-    let files: Vec<(String, String)> = modules
-        .iter()
-        .map(|(name, text)| {
-            (
-                format!("{}.ply", name.replace('.', "/")),
-                (*text).to_string(),
-            )
-        })
-        .collect();
-    let answer = made(&files);
-    assert!(
-        !answer.front.answer.has_error(),
-        "the fixture checks: {:?}",
-        answer.front.answer.diagnostics
-    );
-    answer
+    ply_machine::builds::checked_program(&ply_machine::builds::module_files(modules))
+        .unwrap_or_else(|d| panic!("the fixture checks: {d}"))
 }
 
 /// `answer`'s unit loaded over its front end's answer, and the refusals it records; nothing

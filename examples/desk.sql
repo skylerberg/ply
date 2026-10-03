@@ -8,9 +8,8 @@
 -- **This file is not the authority and must not become one.** `schema()` in
 -- `examples/desk.ply` is, and the statements below are what `db::create_schema`
 -- renders it to, written out so that a database can be created without a Ply
--- program having to be the thing that creates it — W4 ships a schema as a value
--- and refuses to ship a migration tool, and this is the honest shape of that
--- refusal.
+-- program having to be the thing that creates it — `std.db` ships a schema as a
+-- value and no migration tool, and this is the honest shape of that refusal.
 --
 -- Nothing checks the two against each other: a change to `schema()` and a change
 -- to this file are one change by hand, and a drift surfaces as a failed statement
@@ -42,7 +41,7 @@ create table "orders" (
   "customer" text not null,
   -- `lines` is a `List<Line>` and `state` is a sum, and `derive row` flattens
   -- neither: both are `jsonb` columns written through the json codec this
-  -- service already derived for its wire format. W4 has no opinion about
+  -- service already derived for its wire format. `std.db` has no opinion about
   -- normalization — a desk that wanted `order_lines` as a table of its own
   -- would write two codecs and two statements.
   "lines" jsonb not null,
