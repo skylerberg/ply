@@ -1077,7 +1077,7 @@ impl Heap {
         }
     }
 
-    /// The compiled word for an interpreter value: deep, and every object fresh in the entry.
+    /// The compiled word for a `Value`: deep, and every object fresh in the entry.
     pub fn to_word(&mut self, layouts: &Layouts, v: &Value) -> Word {
         match v {
             Value::Int(n) => self.boxed_int(*n),
@@ -1122,7 +1122,7 @@ impl Heap {
                 }
                 o as Word
             }
-            // The interpreter iterates in key order, which is the tree's order too.
+            // A `Value::Map` iterates in key order, which is the tree's order too.
             Value::Map(entries) => {
                 let words: Vec<(Word, Word)> = entries
                     .iter()
@@ -1670,9 +1670,9 @@ pub fn world_independent(w: Word) -> bool {
     true
 }
 
-/// Whether `w` reaches cell `slot`, within the interpreter's walk budget.
+/// Whether `w` reaches cell `slot`, within the budget `rc::value_reaches_cell` spends.
 pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
-    let mut budget = 256usize;
+    let mut budget = ply_eval::rc::CYCLE_WALK_BUDGET;
     let mut pending = vec![w];
     while let Some(w) = pending.pop() {
         if is_imm(w) {
@@ -1776,7 +1776,7 @@ pub fn as_bool(w: Word) -> Option<bool> {
     }
 }
 
-/// The interpreter's rank of a value's variant, which orders values of different kinds.
+/// `Value`'s rank of a variant (its `discriminant`), which orders values of different kinds.
 fn rank(w: Word) -> u8 {
     if is_imm(w) {
         return 2;
@@ -1821,7 +1821,7 @@ fn rank(w: Word) -> u8 {
     }
 }
 
-/// `Value::cmp` over words, so a map crosses the seam in the interpreter's key order.
+/// `Value::cmp` over words, so a map crosses the seam in `Value`'s key order.
 pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
     if a == b {
         return Ordering::Equal;

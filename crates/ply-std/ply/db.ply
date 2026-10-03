@@ -96,7 +96,9 @@ fn attempt<a | e>(body: () -> a / e) -> Result<a, Rollback> / e =
   }
 
 // A transaction that always rolls back, whatever the body did.
-pub fn sandbox<a | e>(body: () -> a / e) -> a / {db.begin bounded, db.abort bounded | e bounded} =
+pub fn sandbox<a | e>(
+  body: () -> a / e,
+) -> a / {abort.raise, db.begin bounded, db.abort bounded | e bounded} =
   bracket(|| assert(opened(db.begin(ReadCommitted, ReadWrite))), |u: Unit| aborted(), |u: Unit|
     body())
 
@@ -122,12 +124,13 @@ type Pending<b> = | Looked(b) | Asking({ s: Stmt, ps: List<Param>, next: (Answer
 pub fn batched<a, b, [t]>(
   xs: List<a>,
   lookup: (a) -> b / {db.query[t]},
-) -> List<b> / {db.query[t], db.batch[t]} = rounds[t](map(xs, |x: a| stepped[t](|| lookup(x))))
+) -> List<b> / {db.query[t], db.batch[t], abort.raise} =
+  rounds[t](map(xs, |x: a| stepped[t](|| lookup(x))))
 
 fn stepped<b, [t]>(go: () -> b / {db.query[t]}) -> Pending<b> =
   handle { Looked(go()) } with { db.query[t](s, ps) resume k -> Asking({ s: s, ps: ps, next: k }) }
 
-fn rounds<b, [t]>(ps: List<Pending<b>>) -> List<b> / {db.query[t], db.batch[t]} = {
+fn rounds<b, [t]>(ps: List<Pending<b>>) -> List<b> / {db.query[t], db.batch[t], abort.raise} = {
   let waiting = filter(range(0, len(ps)), |i: Int|
     match list_at(ps, i) { Some(Asking(_)) -> true, _ -> false });
   if len(waiting) == 0 {
@@ -154,7 +157,7 @@ fn rounds<b, [t]>(ps: List<Pending<b>>) -> List<b> / {db.query[t], db.batch[t]} 
 fn asked<b, [t]>(
   ps: List<Pending<b>>,
   waiting: List<Int>,
-) -> Map<Int, Answer> / {db.query[t], db.batch[t]} = {
+) -> Map<Int, Answer> / {db.query[t], db.batch[t], abort.raise} = {
   let groups = fold(waiting, [], |acc: List<{ s: Stmt, at: List<Int> }>, i: Int|
     match list_at(ps, i) {
       Some(Asking(a)) -> match fold(range(0, len(acc)), None, |found: Option<Int>, g: Int|
@@ -609,18 +612,18 @@ pub fn column_default(name: String, ty: ColumnType, nullable: Bool, d: Default) 
 
 // --- The DDL a schema renders to ------------------------------------------------
 
-pub fn create_schema(s: Schema) -> List<Stmt> =
+pub fn create_schema(s: Schema) -> List<Stmt> / {abort.raise} =
   fold(s.tables, sequence_statements(s), |acc: List<Stmt>, t: Table|
     push(acc, stmt(create_table_sql(t))))
 
-pub fn drop_schema(s: Schema) -> List<Stmt> = {
+pub fn drop_schema(s: Schema) -> List<Stmt> / {abort.raise} = {
   let drops = fold(reverse_list(s.tables), [], |acc: List<Stmt>, t: Table|
     push(acc, stmt("drop table if exists " ++ quote_ident(t.name) ++ " cascade")));
   fold(sequence_names(s), drops, |acc: List<Stmt>, n: String|
     push(acc, stmt("drop sequence if exists " ++ quote_ident(n))))
 }
 
-fn sequence_statements(s: Schema) -> List<Stmt> =
+fn sequence_statements(s: Schema) -> List<Stmt> / {abort.raise} =
   fold(sequence_names(s), [], |acc: List<Stmt>, n: String|
     push(acc, stmt("create sequence " ++ quote_ident(n))))
 
@@ -629,7 +632,7 @@ fn sequence_names(s: Schema) -> List<String> =
     fold(t.columns, acc, |inner: List<String>, c: Column|
       match c.default { DSequence(n) -> push(inner, n), DNone -> inner, DLiteral(_) -> inner }))
 
-fn create_table_sql(t: Table) -> String = {
+fn create_table_sql(t: Table) -> String / {abort.raise} = {
   let cols = map(t.columns, |c: Column| column_sql(c));
   let pk = if len(t.primary_key) == 0 { [] }
   else { ["primary key (" ++ comma(map(t.primary_key, |n: String| quote_ident(n))) ++ ")"] };
@@ -652,7 +655,7 @@ fn create_table_sql(t: Table) -> String = {
     ++ ")"
 }
 
-fn column_sql(c: Column) -> String =
+fn column_sql(c: Column) -> String / {abort.raise} =
   quote_ident(c.name) ++ " " ++ type_sql(c.ty) ++ (if c.nullable { "" } else { " not null" })
     ++ (match c.default {
       DNone -> "",
@@ -673,7 +676,7 @@ fn type_sql(t: ColumnType) -> String =
   }
 
 // Only for a `CREATE TABLE`'s `DEFAULT` clause, never for a value a request supplied.
-fn literal_sql(p: Param) -> String =
+fn literal_sql(p: Param) -> String / {abort.raise} =
   match p {
     PNull -> "null",
     PInt(n) -> int_to_string(n),
@@ -686,7 +689,8 @@ fn literal_sql(p: Param) -> String =
     PArray(_) -> "null",
   }
 
-fn quote_ident(s: String) -> String = "\"" ++ string::join(string_split(s, "\""), "\"\"") ++ "\""
+fn quote_ident(s: String) -> String / {abort.raise} =
+  "\"" ++ string::join(string_split(s, "\""), "\"\"") ++ "\""
 
 fn comma(pieces: List<String>) -> String = string::join(pieces, ", ")
 
@@ -784,22 +788,22 @@ fn ident_rest() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXY
 fn ident_start() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 
 // `-1` is the end of the input, which is in no set.
-fn in_set(set: Bytes, c: Int) -> Bool =
+fn in_set(set: Bytes, c: Int) -> Bool / {abort.raise} =
   if c < 0 { false } else { match bytes_index_of_byte(set, c) { Some(_) -> true, None -> false } }
 
-fn byte_at(src: Bytes, i: Int) -> Int =
+fn byte_at(src: Bytes, i: Int) -> Int / {abort.raise} =
   if i < 0 || i >= bytes_len(src) { -1 } else { bytes_at(src, i) }
 
-fn scan_set(src: Bytes, i: Int, set: Bytes) -> Int =
+fn scan_set(src: Bytes, i: Int, set: Bytes) -> Int / {abort.raise} =
   if i >= bytes_len(src) { bytes_len(src) } else { bytes_scan(src, i, set, bytes_len(src)) }
 
-fn lex_all(sql: String) -> Result<List<Tok>, DbError> = {
+fn lex_all(sql: String) -> Result<List<Tok>, DbError> / {abort.raise} = {
   let src = bytes_of_string(sql);
   if !bytes_is_utf8(src) { Err(unsupported("statement text that is not valid UTF-8")) }
   else { lex(src, 0, []) }
 }
 
-reuse fn lex(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+reuse fn lex(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> / {abort.raise} = {
   let j = scan_set(src, i, sql_ws());
   let c = byte_at(src, j);
   if c < 0 { Ok(acc) }
@@ -820,11 +824,11 @@ reuse fn lex(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> =
   else { lex_symbol(src, j, acc) }
 }
 
-fn line_comment_end(src: Bytes, i: Int) -> Int =
+fn line_comment_end(src: Bytes, i: Int) -> Int / {abort.raise} =
   if i >= bytes_len(src) || byte_at(src, i) == 10 { i + 1 } else { line_comment_end(src, i + 1) }
 
 // Postgres nests block comments, so scanning to the first `*/` would leak an outer comment's tail.
-fn block_comment_end(src: Bytes, i: Int, depth: Int) -> Option<Int> =
+fn block_comment_end(src: Bytes, i: Int, depth: Int) -> Option<Int> / {abort.raise} =
   if depth == 0 { Some(i) }
   else if i >= bytes_len(src) { None } else if byte_at(src, i) == 47 && byte_at(src, i + 1) == 42 {
     block_comment_end(src, i + 2, depth + 1)
@@ -832,7 +836,11 @@ fn block_comment_end(src: Bytes, i: Int, depth: Int) -> Option<Int> =
     block_comment_end(src, i + 2, depth - 1)
   } else { block_comment_end(src, i + 1, depth) }
 
-reuse fn lex_number(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+reuse fn lex_number(
+  src: Bytes,
+  i: Int,
+  acc: List<Tok>,
+) -> Result<List<Tok>, DbError> / {abort.raise} = {
   let whole = scan_set(src, i, sql_digits());
   let end = if byte_at(src, whole) == 46 { scan_set(src, whole + 1, sql_digits()) } else { whole };
   let after = byte_at(src, end);
@@ -847,7 +855,7 @@ reuse fn lex_string(
   i: Int,
   so_far: Bytes,
   acc: List<Tok>,
-) -> Result<List<Tok>, DbError> = {
+) -> Result<List<Tok>, DbError> / {abort.raise} = {
   let stop = if i >= bytes_len(src) { bytes_len(src) }
   else { bytes_scan_until(src, i, b"'", bytes_len(src)) };
   if stop >= bytes_len(src) { Err(unsupported("a string literal with no closing quote")) } else {
@@ -862,7 +870,7 @@ reuse fn lex_quoted(
   i: Int,
   so_far: Bytes,
   acc: List<Tok>,
-) -> Result<List<Tok>, DbError> = {
+) -> Result<List<Tok>, DbError> / {abort.raise} = {
   let stop = if i >= bytes_len(src) { bytes_len(src) }
   else { bytes_scan_until(src, i, b"\"", bytes_len(src)) };
   if stop >= bytes_len(src) { Err(unsupported("a quoted identifier with no closing quote")) } else {
@@ -872,7 +880,11 @@ reuse fn lex_quoted(
   }
 }
 
-reuse fn lex_param(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+reuse fn lex_param(
+  src: Bytes,
+  i: Int,
+  acc: List<Tok>,
+) -> Result<List<Tok>, DbError> / {abort.raise} = {
   let end = scan_set(src, i + 1, sql_digits());
   if end == i + 1 { Err(unsupported("a dollar-quoted string, or a `$` that is not a parameter")) }
   else {
@@ -883,7 +895,11 @@ reuse fn lex_param(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbEr
   }
 }
 
-reuse fn lex_symbol(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
+reuse fn lex_symbol(
+  src: Bytes,
+  i: Int,
+  acc: List<Tok>,
+) -> Result<List<Tok>, DbError> / {abort.raise} = {
   let c = byte_at(src, i);
   let d = byte_at(src, i + 1);
   let two = if (c == 60 && d == 62) || (c == 33 && d == 61) { "<>" }
@@ -998,35 +1014,37 @@ fn parse_colref(ts: List<Tok>) -> Result<Cut<String>, DbError> = {
   if tok_sym(c.rest) == "." { parse_name(rest_of(c.rest)) } else { Ok(c) }
 }
 
-fn parse_expr_text(s: String) -> Result<Expr, DbError> = {
+fn parse_expr_text(s: String) -> Result<Expr, DbError> / {abort.raise} = {
   let ts = lex_all(s)?;
   let c = parse_or(ts)?;
   if len(c.rest) == 0 { Ok(c.value) } else { Err(expected("the end of the expression", c.rest)) }
 }
 
-fn parse_or(ts: List<Tok>) -> Result<Cut<Expr>, DbError> = parse_or_more(parse_and(ts)?)
+fn parse_or(ts: List<Tok>) -> Result<Cut<Expr>, DbError> / {abort.raise} =
+  parse_or_more(parse_and(ts)?)
 
-fn parse_or_more(c: Cut<Expr>) -> Result<Cut<Expr>, DbError> =
+fn parse_or_more(c: Cut<Expr>) -> Result<Cut<Expr>, DbError> / {abort.raise} =
   if tok_word(c.rest) == "or" {
     let r = parse_and(rest_of(c.rest))?;
     parse_or_more(cut(XOr(c.value, r.value), r.rest))
   } else { Ok(c) }
 
-fn parse_and(ts: List<Tok>) -> Result<Cut<Expr>, DbError> = parse_and_more(parse_not(ts)?)
+fn parse_and(ts: List<Tok>) -> Result<Cut<Expr>, DbError> / {abort.raise} =
+  parse_and_more(parse_not(ts)?)
 
-fn parse_and_more(c: Cut<Expr>) -> Result<Cut<Expr>, DbError> =
+fn parse_and_more(c: Cut<Expr>) -> Result<Cut<Expr>, DbError> / {abort.raise} =
   if tok_word(c.rest) == "and" {
     let r = parse_not(rest_of(c.rest))?;
     parse_and_more(cut(XAnd(c.value, r.value), r.rest))
   } else { Ok(c) }
 
-fn parse_not(ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+fn parse_not(ts: List<Tok>) -> Result<Cut<Expr>, DbError> / {abort.raise} =
   if tok_word(ts) == "not" {
     let c = parse_not(rest_of(ts))?;
     Ok(cut(XNot(c.value), c.rest))
   } else { parse_pred_tail(parse_primary(ts)?) }
 
-fn parse_pred_tail(c: Cut<Expr>) -> Result<Cut<Expr>, DbError> = {
+fn parse_pred_tail(c: Cut<Expr>) -> Result<Cut<Expr>, DbError> / {abort.raise} = {
   let w = tok_word(c.rest);
   let s = tok_sym(c.rest);
   if s == "=" || s == "<>" || s == "<" || s == "<=" || s == ">" || s == ">=" {
@@ -1059,13 +1077,20 @@ fn parse_is(c: Cut<Expr>, ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
     Ok(cut(XIsNull(c.value, false), rest_of(rest_of(ts))))
   } else { Err(expected("`null` or `not null` after `is`", ts)) }
 
-fn parse_in(c: Cut<Expr>, negated: Bool, ts: List<Tok>) -> Result<Cut<Expr>, DbError> = {
+fn parse_in(
+  c: Cut<Expr>,
+  negated: Bool,
+  ts: List<Tok>,
+) -> Result<Cut<Expr>, DbError> / {abort.raise} = {
   let after = want_sym(ts, "(")?;
   let items = parse_expr_list(after, [])?;
   Ok(cut(XIn(c.value, items.value, negated), items.rest))
 }
 
-fn parse_expr_list(ts: List<Tok>, acc: List<Expr>) -> Result<Cut<List<Expr>>, DbError> = {
+fn parse_expr_list(
+  ts: List<Tok>,
+  acc: List<Expr>,
+) -> Result<Cut<List<Expr>>, DbError> / {abort.raise} = {
   let c = parse_or(ts)?;
   let items = push(acc, c.value);
   if tok_sym(c.rest) == "," { parse_expr_list(rest_of(c.rest), items) } else {
@@ -1074,20 +1099,28 @@ fn parse_expr_list(ts: List<Tok>, acc: List<Expr>) -> Result<Cut<List<Expr>>, Db
   }
 }
 
-fn parse_between(c: Cut<Expr>, negated: Bool, ts: List<Tok>) -> Result<Cut<Expr>, DbError> = {
+fn parse_between(
+  c: Cut<Expr>,
+  negated: Bool,
+  ts: List<Tok>,
+) -> Result<Cut<Expr>, DbError> / {abort.raise} = {
   let lo = parse_primary(ts)?;
   let after = want_word(lo.rest, "and")?;
   let hi = parse_primary(after)?;
   Ok(cut(XBetween(c.value, lo.value, hi.value, negated), hi.rest))
 }
 
-fn parse_like(c: Cut<Expr>, negated: Bool, ts: List<Tok>) -> Result<Cut<Expr>, DbError> = {
+fn parse_like(
+  c: Cut<Expr>,
+  negated: Bool,
+  ts: List<Tok>,
+) -> Result<Cut<Expr>, DbError> / {abort.raise} = {
   let p = parse_primary(ts)?;
   if tok_word(p.rest) == "escape" { Err(unsupported("`like ... escape`")) }
   else { Ok(cut(XLike(c.value, p.value, negated), p.rest)) }
 }
 
-fn parse_primary(ts: List<Tok>) -> Result<Cut<Expr>, DbError> =
+fn parse_primary(ts: List<Tok>) -> Result<Cut<Expr>, DbError> / {abort.raise} =
   match ts {
     [] -> Err(unsupported("the statement ended where a value was expected")),
     [TParam(n), ..t] -> Ok(cut(XParam(n), t)),
@@ -1123,7 +1156,11 @@ fn parse_column_tail(name: String, ts: List<Tok>) -> Result<Cut<Expr>, DbError> 
   else { Ok(cut(XCol(name), ts)) }
 
 // A literal with a `.` is `numeric` and one without is `integer`, as in postgres.
-fn num_literal(s: String, negative: Bool, ts: List<Tok>) -> Result<Cut<Expr>, DbError> = {
+fn num_literal(
+  s: String,
+  negative: Bool,
+  ts: List<Tok>,
+) -> Result<Cut<Expr>, DbError> / {abort.raise} = {
   let text = if negative { "-" ++ s } else { s };
   if string_contains(s, ".") {
     match decimal_of_string(text) {
@@ -1140,13 +1177,13 @@ fn num_literal(s: String, negative: Bool, ts: List<Tok>) -> Result<Cut<Expr>, Db
 
 // --- The statement parser --------------------------------------------------------
 
-fn parse_statement(sql: String) -> Result<Query, DbError> = {
+fn parse_statement(sql: String) -> Result<Query, DbError> / {abort.raise} = {
   let ts = lex_all(sql)?;
   let c = parse_query(ts)?;
   if len(c.rest) == 0 { Ok(c.value) } else { Err(expected("the end of the statement", c.rest)) }
 }
 
-fn parse_query(ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
+fn parse_query(ts: List<Tok>) -> Result<Cut<Query>, DbError> / {abort.raise} = {
   let w = tok_word(ts);
   if w == "select" { parse_select(rest_of(ts)) }
   else if w == "insert" { parse_insert(rest_of(ts)) }
@@ -1157,14 +1194,18 @@ fn parse_query(ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
   else { Err(expected("`select`, `insert`, `update` or `delete`", ts)) }
 }
 
-fn parse_select(ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
+fn parse_select(ts: List<Tok>) -> Result<Cut<Query>, DbError> / {abort.raise} = {
   let p = parse_proj(ts)?;
   let after = want_word(p.rest, "from")?;
   let src = parse_name(after)?;
   parse_select_tail(src.value, p.value, src.rest)
 }
 
-fn parse_select_tail(source: String, proj: Proj, ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
+fn parse_select_tail(
+  source: String,
+  proj: Proj,
+  ts: List<Tok>,
+) -> Result<Cut<Query>, DbError> / {abort.raise} = {
   let w = parse_where(ts)?;
   let o = parse_order(w.rest)?;
   let lo = parse_limit_offset(o.rest)?;
@@ -1210,7 +1251,7 @@ fn parse_alias(ts: List<Tok>, dflt: String) -> Result<Cut<String>, DbError> =
     Ok(cut(n.value, n.rest))
   } else { Ok(cut(dflt, ts)) }
 
-fn parse_where(ts: List<Tok>) -> Result<Cut<Option<Expr>>, DbError> =
+fn parse_where(ts: List<Tok>) -> Result<Cut<Option<Expr>>, DbError> / {abort.raise} =
   if tok_word(ts) == "where" {
     let c = parse_or(rest_of(ts))?;
     Ok(cut(Some(c.value), c.rest))
@@ -1246,19 +1287,22 @@ fn parse_nulls(ts: List<Tok>, desc: Bool) -> Result<Cut<Bool>, DbError> =
 
 type Slice = { limit: Option<Expr>, offset: Option<Expr> }
 
-fn parse_limit_offset(ts: List<Tok>) -> Result<Cut<Slice>, DbError> = {
+fn parse_limit_offset(ts: List<Tok>) -> Result<Cut<Slice>, DbError> / {abort.raise} = {
   let l = parse_one_bound(ts, "limit")?;
   let o = parse_one_bound(l.rest, "offset")?;
   Ok(cut({ limit: l.value, offset: o.value }, o.rest))
 }
 
-fn parse_one_bound(ts: List<Tok>, word: String) -> Result<Cut<Option<Expr>>, DbError> =
+fn parse_one_bound(
+  ts: List<Tok>,
+  word: String,
+) -> Result<Cut<Option<Expr>>, DbError> / {abort.raise} =
   if tok_word(ts) == word {
     let c = parse_primary(rest_of(ts))?;
     Ok(cut(Some(c.value), c.rest))
   } else { Ok(cut(None, ts)) }
 
-fn parse_insert(ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
+fn parse_insert(ts: List<Tok>) -> Result<Cut<Query>, DbError> / {abort.raise} = {
   let a = want_word(ts, "into")?;
   let src = parse_name(a)?;
   let cols = parse_insert_columns(src.rest)?;
@@ -1294,7 +1338,10 @@ fn parse_name_list(ts: List<Tok>, acc: List<String>) -> Result<Cut<List<String>>
   }
 }
 
-fn parse_tuples(ts: List<Tok>, acc: List<List<Expr>>) -> Result<Cut<List<List<Expr>>>, DbError> = {
+fn parse_tuples(
+  ts: List<Tok>,
+  acc: List<List<Expr>>,
+) -> Result<Cut<List<List<Expr>>>, DbError> / {abort.raise} = {
   let a = want_sym(ts, "(")?;
   let c = parse_expr_list(a, [])?;
   let tuples = push(acc, c.value);
@@ -1312,7 +1359,7 @@ fn parse_returning(ts: List<Tok>) -> Result<Cut<Option<Proj>>, DbError> =
     }
   } else { Ok(cut(None, ts)) }
 
-fn parse_update(ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
+fn parse_update(ts: List<Tok>) -> Result<Cut<Query>, DbError> / {abort.raise} = {
   let src = parse_name(ts)?;
   let a = want_word(src.rest, "set")?;
   let sets = parse_assignments(a, [])?;
@@ -1328,7 +1375,10 @@ fn parse_update(ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
   }
 }
 
-fn parse_assignments(ts: List<Tok>, acc: List<Assign>) -> Result<Cut<List<Assign>>, DbError> = {
+fn parse_assignments(
+  ts: List<Tok>,
+  acc: List<Assign>,
+) -> Result<Cut<List<Assign>>, DbError> / {abort.raise} = {
   let n = parse_name(ts)?;
   let a = want_sym(n.rest, "=")?;
   let v = parse_primary(a)?;
@@ -1337,7 +1387,7 @@ fn parse_assignments(ts: List<Tok>, acc: List<Assign>) -> Result<Cut<List<Assign
   else { Ok(cut(sets, v.rest)) }
 }
 
-fn parse_delete(ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
+fn parse_delete(ts: List<Tok>) -> Result<Cut<Query>, DbError> / {abort.raise} = {
   let a = want_word(ts, "from")?;
   let src = parse_name(a)?;
   if tok_word(src.rest) == "using" { Err(unsupported("`delete ... using`")) } else {
@@ -1398,7 +1448,7 @@ fn datum_type(v: Datum) -> String =
     CArray(_) -> "array",
   }
 
-fn eval_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> =
+fn eval_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} =
   match e {
     XLit(v) -> Ok(v),
     XCol(n) -> match map_get(r, n) { None -> Err(undefined_column(n)), Some(v) -> Ok(v) },
@@ -1417,12 +1467,12 @@ fn eval_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> =
     XLike(_, _, _) -> eval_bool_value(r, ps, e),
   }
 
-fn eval_bool_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> = {
+fn eval_bool_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} = {
   let t = eval_pred(r, ps, e)?;
   Ok(match t { TriTrue -> CBool(true), TriFalse -> CBool(false), TriUnknown -> CNull })
 }
 
-fn eval_pred(r: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> =
+fn eval_pred(r: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> / {abort.raise} =
   match e {
     XNot(x) -> {
       let t = eval_pred(r, ps, x)?;
@@ -1452,7 +1502,7 @@ fn eval_pred(r: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> =
     XDefault -> Err(unsupported("`default` in a predicate")),
   }
 
-fn eval_pred_of_value(r: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> = {
+fn eval_pred_of_value(r: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> / {abort.raise} = {
   let v = eval_value(r, ps, e)?;
   match v {
     CNull -> Ok(TriUnknown),
@@ -1462,7 +1512,13 @@ fn eval_pred_of_value(r: Row, ps: List<Param>, e: Expr) -> Result<Tri, DbError> 
   }
 }
 
-fn eval_compare(r: Row, ps: List<Param>, op: Cmp, a: Expr, b: Expr) -> Result<Tri, DbError> = {
+fn eval_compare(
+  r: Row,
+  ps: List<Param>,
+  op: Cmp,
+  a: Expr,
+  b: Expr,
+) -> Result<Tri, DbError> / {abort.raise} = {
   let av = eval_value(r, ps, a)?;
   let bv = eval_value(r, ps, b)?;
   let o = datum_cmp(av, bv)?;
@@ -1488,7 +1544,7 @@ fn eval_in(
   x: Expr,
   items: List<Expr>,
   negated: Bool,
-) -> Result<Tri, DbError> = {
+) -> Result<Tri, DbError> / {abort.raise} = {
   let v = eval_value(r, ps, x)?;
   let t = in_scan(r, ps, v, items, TriFalse)?;
   Ok(if negated { tri_not(t) } else { t })
@@ -1500,7 +1556,7 @@ fn in_scan(
   v: Datum,
   items: List<Expr>,
   so_far: Tri,
-) -> Result<Tri, DbError> =
+) -> Result<Tri, DbError> / {abort.raise} =
   match items {
     [] -> Ok(so_far),
     [h, ..t] -> {
@@ -1520,19 +1576,25 @@ fn eval_between(
   lo: Expr,
   hi: Expr,
   negated: Bool,
-) -> Result<Tri, DbError> = {
+) -> Result<Tri, DbError> / {abort.raise} = {
   let a = eval_compare(r, ps, CmpGe, x, lo)?;
   let b = eval_compare(r, ps, CmpLe, x, hi)?;
   Ok(if negated { tri_not(tri_and(a, b)) } else { tri_and(a, b) })
 }
 
-fn eval_like(r: Row, ps: List<Param>, x: Expr, p: Expr, negated: Bool) -> Result<Tri, DbError> = {
+fn eval_like(
+  r: Row,
+  ps: List<Param>,
+  x: Expr,
+  p: Expr,
+  negated: Bool,
+) -> Result<Tri, DbError> / {abort.raise} = {
   let xv = eval_value(r, ps, x)?;
   let pv = eval_value(r, ps, p)?;
   like_of(xv, pv, negated)
 }
 
-fn like_of(xv: Datum, pv: Datum, negated: Bool) -> Result<Tri, DbError> =
+fn like_of(xv: Datum, pv: Datum, negated: Bool) -> Result<Tri, DbError> / {abort.raise} =
   match xv {
     CNull -> Ok(TriUnknown),
     CText(s) -> match pv {
@@ -1547,7 +1609,7 @@ fn like_of(xv: Datum, pv: Datum, negated: Bool) -> Result<Tri, DbError> =
   }
 
 // `_` matches one character, not one byte, or non-ASCII text stops matching.
-fn like_match(s: String, p: String, si: Int, pi: Int) -> Bool =
+fn like_match(s: String, p: String, si: Int, pi: Int) -> Bool / {abort.raise} =
   if pi >= string_len(p) { si >= string_len(s) } else {
     let pc = string_slice(p, pi, pi + 1);
     if pc == "%" { like_star(s, p, si, pi + 1) }
@@ -1562,7 +1624,7 @@ fn like_match(s: String, p: String, si: Int, pi: Int) -> Bool =
     } else { false }
   }
 
-fn like_star(s: String, p: String, si: Int, pi: Int) -> Bool =
+fn like_star(s: String, p: String, si: Int, pi: Int) -> Bool / {abort.raise} =
   if like_match(s, p, si, pi) { true }
   else if si >= string_len(s) { false }
   else { like_star(s, p, si + 1, pi) }
@@ -1629,7 +1691,7 @@ fn no_operator(a: Datum, b: Datum) -> DbError =
 
 // --- Column types, and what a value has to become to be stored -------------------
 
-fn decimal_scale_of(d: Decimal) -> Int = {
+fn decimal_scale_of(d: Decimal) -> Int / {abort.raise} = {
   let s = decimal_to_string(d);
   if string_contains(s, ".") { string_len(s) - string_find(s, ".") - 1 } else { 0 }
 }
@@ -1637,7 +1699,7 @@ fn decimal_scale_of(d: Decimal) -> Int = {
 fn zeros(n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ "0")
 
 // A `numeric(p, s)` column stores exactly `s` fractional digits: `1.00` becomes `1.0000`.
-fn rescale(d: Decimal, s: Int) -> Option<Decimal> = {
+fn rescale(d: Decimal, s: Int) -> Option<Decimal> / {abort.raise} = {
   let reduced = if decimal_scale_of(d) > s { decimal_round(d, s, HalfUp) } else { d };
   let text = decimal_to_string(reduced);
   let have = decimal_scale_of(reduced);
@@ -1646,13 +1708,13 @@ fn rescale(d: Decimal, s: Int) -> Option<Decimal> = {
   else { decimal_of_string(text ++ zeros(s - have)) }
 }
 
-fn strip_leading_zeros(s: String) -> String =
+fn strip_leading_zeros(s: String) -> String / {abort.raise} =
   if string_len(s) > 1 && string_starts_with(s, "0") {
     strip_leading_zeros(string_slice(s, 1, string_len(s)))
   } else if s == "0" { "" }
   else { s }
 
-fn numeric_fits(d: Decimal, p: Int, s: Int) -> Bool = {
+fn numeric_fits(d: Decimal, p: Int, s: Int) -> Bool / {abort.raise} = {
   let text = decimal_to_string(d);
   let unsigned = if string_starts_with(text, "-") { string_slice(text, 1, string_len(text)) }
   else { text };
@@ -1676,7 +1738,12 @@ fn wrong_type(c: Column, v: Datum, from_param: Bool, want: String) -> DbError =
     )
   }
 
-fn coerce(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result<Datum, DbError> =
+fn coerce(
+  c: Column,
+  ty: ColumnType,
+  v: Datum,
+  from_param: Bool,
+) -> Result<Datum, DbError> / {abort.raise} =
   match v { CNull -> Ok(CNull), _ -> coerce_value(c, ty, v, from_param) }
 
 // The name postgres prints for a column type in a `22P02` or `42804`.
@@ -1693,14 +1760,19 @@ pub fn type_name(ty: ColumnType) -> String =
   }
 
 // Postgres parses an `unknown` string at the type it is assigned or compared to.
-fn coerce_value(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result<Datum, DbError> =
+fn coerce_value(
+  c: Column,
+  ty: ColumnType,
+  v: Datum,
+  from_param: Bool,
+) -> Result<Datum, DbError> / {abort.raise} =
   match v {
     CText(s) -> if from_param { coerce_typed(c, ty, v, from_param) }
     else { coerce_unknown(c, ty, s) },
     _ -> coerce_typed(c, ty, v, from_param),
   }
 
-fn coerce_unknown(c: Column, ty: ColumnType, s: String) -> Result<Datum, DbError> =
+fn coerce_unknown(c: Column, ty: ColumnType, s: String) -> Result<Datum, DbError> / {abort.raise} =
   match unknown_datum(ty, s) {
     None -> Err(bad_input(ty, s)),
     Some(v) -> coerce_typed(c, ty, v, false),
@@ -1745,7 +1817,12 @@ fn unknown_bool(s: String) -> Option<Datum> = {
   else { None }
 }
 
-fn coerce_typed(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result<Datum, DbError> =
+fn coerce_typed(
+  c: Column,
+  ty: ColumnType,
+  v: Datum,
+  from_param: Bool,
+) -> Result<Datum, DbError> / {abort.raise} =
   match ty {
     TInt -> match v {
       CInt(_) -> Ok(v),
@@ -1774,14 +1851,14 @@ fn coerce_typed(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result
     },
   }
 
-fn int_from_decimal(d: Decimal) -> Result<Datum, DbError> =
+fn int_from_decimal(d: Decimal) -> Result<Datum, DbError> / {abort.raise} =
   match int_of_decimal(decimal_round(d, 0, HalfUp), Down) {
     None -> Err(db_error("22003", "", "bigint out of range")),
     Some(n) -> Ok(CInt(n)),
   }
 
 // Overflow is checked before the rescale, which would exhaust `Decimal` and answer `0A000`.
-fn numeric_into(c: Column, d: Decimal, p: Int, s: Int) -> Result<Datum, DbError> =
+fn numeric_into(c: Column, d: Decimal, p: Int, s: Int) -> Result<Datum, DbError> / {abort.raise} =
   if !numeric_fits(d, p, s) { Err(numeric_overflow(p, s)) } else {
     match rescale(d, s) {
       None -> Err(unsupported("a `numeric` outside `Decimal`'s 96 bits or scale 28")),
@@ -1805,7 +1882,7 @@ fn coerce_elements(
   xs: List<Datum>,
   from_param: Bool,
   acc: List<Datum>,
-) -> Result<Datum, DbError> =
+) -> Result<Datum, DbError> / {abort.raise} =
   match xs {
     [] -> Ok(CArray(acc)),
     [h, ..t] -> match h {
@@ -1842,7 +1919,12 @@ fn cell_of(r: Row, n: String) -> Datum = match map_get(r, n) { None -> CNull, So
 fn not_null_here(def: Table, c: Column) -> Bool = !c.nullable || has_string(def.primary_key, c.name)
 
 // Postgres's order: not-null, check, unique; referential integrity runs after the statement.
-fn validate_row(def: Table, rows: List<Row>, row: Row, skip: Int) -> Option<DbError> =
+fn validate_row(
+  def: Table,
+  rows: List<Row>,
+  row: Row,
+  skip: Int,
+) -> Option<DbError> / {abort.raise} =
   match check_not_null(def, def.columns, row) {
     Some(e) -> Some(e),
     None -> match check_checks(def, def.checks, row) {
@@ -1868,7 +1950,7 @@ fn check_not_null(def: Table, cs: List<Column>, row: Row) -> Option<DbError> =
   }
 
 // A `CHECK` fails only when false and passes when unknown, the opposite of a `WHERE`.
-fn check_checks(def: Table, cs: List<Check>, row: Row) -> Option<DbError> =
+fn check_checks(def: Table, cs: List<Check>, row: Row) -> Option<DbError> / {abort.raise} =
   match cs {
     [] -> None,
     [c, ..t] -> match parse_expr_text(c.expr) {
@@ -1999,11 +2081,11 @@ fn fk_pairs(parent: Row, child: Row, cs: List<String>, rs: List<String>) -> Bool
 // --- Executing a statement -------------------------------------------------------
 
 // The answer's shape follows the statement: a `RETURNING` answers `Rows` and a bare write `Count`.
-pub fn step(d: MemDb, s: Stmt, ps: List<Param>) -> Outcome =
+pub fn step(d: MemDb, s: Stmt, ps: List<Param>) -> Outcome / {abort.raise} =
   if d.failed { fail(d, in_failed_txn()) }
   else { match parse_statement(s.sql) { Err(e) -> fail(d, e), Ok(q) -> exec(d, q, ps) } }
 
-fn exec(d: MemDb, q: Query, ps: List<Param>) -> Outcome =
+fn exec(d: MemDb, q: Query, ps: List<Param>) -> Outcome / {abort.raise} =
   match q {
     QSelect(sq) -> exec_select(d, sq, ps),
     QInsert(iq) -> if read_only(d) { fail(d, read_only_txn("INSERT")) }
@@ -2165,7 +2247,7 @@ fn check_returning(def: Table, r: Option<Proj>) -> Option<DbError> = {
 
 // --- select ----------------------------------------------------------------------
 
-fn exec_select(d: MemDb, q: SelectQ, ps: List<Param>) -> Outcome =
+fn exec_select(d: MemDb, q: SelectQ, ps: List<Param>) -> Outcome / {abort.raise} =
   match find_table(d.tables, q.source) {
     None -> fail(d, undefined_table(q.source)),
     Some(mt) -> match plan_select(mt.def, q) {
@@ -2201,7 +2283,7 @@ fn select_rows(
   ps: List<Param>,
   filter: Option<Expr>,
   acc: List<Row>,
-) -> Result<List<Row>, DbError> =
+) -> Result<List<Row>, DbError> / {abort.raise} =
   match rows {
     [] -> Ok(acc),
     [h, ..t] -> {
@@ -2210,7 +2292,7 @@ fn select_rows(
     },
   }
 
-fn keeps(r: Row, ps: List<Param>, filter: Option<Expr>) -> Result<Bool, DbError> =
+fn keeps(r: Row, ps: List<Param>, filter: Option<Expr>) -> Result<Bool, DbError> / {abort.raise} =
   match filter {
     None -> Ok(true),
     Some(e) -> {
@@ -2219,7 +2301,13 @@ fn keeps(r: Row, ps: List<Param>, filter: Option<Expr>) -> Result<Bool, DbError>
     },
   }
 
-fn finish_select(d: MemDb, mt: MemTable, q: SelectQ, ps: List<Param>, rows: List<Row>) -> Outcome =
+fn finish_select(
+  d: MemDb,
+  mt: MemTable,
+  q: SelectQ,
+  ps: List<Param>,
+  rows: List<Row>,
+) -> Outcome / {abort.raise} =
   match q.proj {
     PCount(name) -> if len(q.order) > 0 || is_bound(q.limit) || is_bound(q.offset) {
       fail(d, unsupported("`count(*)` with an `order by`, `limit` or `offset`"))
@@ -2237,7 +2325,7 @@ fn ordered_slice(
   ps: List<Param>,
   rows: List<Row>,
   proj: Proj,
-) -> Outcome =
+) -> Outcome / {abort.raise} =
   match check_order_columns(mt.def, q.order) {
     Some(e) -> fail(d, e),
     None -> match sort_rows(rows, q.order, []) {
@@ -2261,7 +2349,7 @@ fn slice_and_project(
   ps: List<Param>,
   rows: List<Row>,
   proj: Proj,
-) -> Outcome =
+) -> Outcome / {abort.raise} =
   match eval_bound(ps, q.offset, 0, "2201X", "OFFSET") {
     Err(e) -> fail(d, e),
     Ok(off) -> match eval_bound(ps, q.limit, -1, "2201W", "LIMIT") {
@@ -2283,7 +2371,7 @@ fn eval_bound(
   dflt: Int,
   code: String,
   what: String,
-) -> Result<Int, DbError> =
+) -> Result<Int, DbError> / {abort.raise} =
   match e {
     None -> Ok(dflt),
     Some(x) -> {
@@ -2379,7 +2467,7 @@ type RowAcc = { seqs: Map<String, Int>, row: Row, err: Option<DbError> }
 
 type Build = { seqs: Map<String, Int>, rows: List<Row>, err: Option<DbError> }
 
-fn exec_insert(d: MemDb, q: InsertQ, ps: List<Param>) -> Outcome =
+fn exec_insert(d: MemDb, q: InsertQ, ps: List<Param>) -> Outcome / {abort.raise} =
   match find_table(d.tables, q.source) {
     None -> fail(d, undefined_table(q.source)),
     Some(mt) -> {
@@ -2413,7 +2501,7 @@ fn insert_build(
   cols: List<String>,
   q: InsertQ,
   ps: List<Param>,
-) -> Outcome = {
+) -> Outcome / {abort.raise} = {
   let b = fold(
     q.tuples,
     { seqs: d.sequences, rows: [], err: None },
@@ -2429,7 +2517,7 @@ fn build_tuple(
   exprs: List<Expr>,
   ps: List<Param>,
   acc: Build,
-) -> Build =
+) -> Build / {abort.raise} =
   match acc.err {
     Some(_) -> acc,
     None -> if len(exprs) != len(cols) {
@@ -2470,7 +2558,7 @@ fn build_columns(
   exprs: List<Expr>,
   ps: List<Param>,
   acc: RowAcc,
-) -> RowAcc =
+) -> RowAcc / {abort.raise} =
   match cs {
     [] -> acc,
     [c, ..rest] -> match acc.err {
@@ -2485,7 +2573,7 @@ fn build_column(
   exprs: List<Expr>,
   ps: List<Param>,
   acc: RowAcc,
-) -> RowAcc =
+) -> RowAcc / {abort.raise} =
   match index_of(cols, c.name) {
     None -> default_into(c, acc),
     Some(i) -> match nth(exprs, i) {
@@ -2499,7 +2587,12 @@ fn build_column(
 
 fn is_param(e: Expr) -> Bool = match e { XParam(_) -> true, _ -> false }
 
-fn store_value(c: Column, r: Result<Datum, DbError>, from_param: Bool, acc: RowAcc) -> RowAcc =
+fn store_value(
+  c: Column,
+  r: Result<Datum, DbError>,
+  from_param: Bool,
+  acc: RowAcc,
+) -> RowAcc / {abort.raise} =
   match r {
     Err(e) -> { seqs: acc.seqs, row: acc.row, err: Some(e) },
     Ok(v) -> match coerce(c, c.ty, v, from_param) {
@@ -2508,7 +2601,7 @@ fn store_value(c: Column, r: Result<Datum, DbError>, from_param: Bool, acc: RowA
     },
   }
 
-fn default_into(c: Column, acc: RowAcc) -> RowAcc =
+fn default_into(c: Column, acc: RowAcc) -> RowAcc / {abort.raise} =
   match c.default {
     DNone -> { seqs: acc.seqs, row: map_insert(acc.row, c.name, CNull), err: None },
     DLiteral(p) -> store_value(c, Ok(param_datum(p)), false, acc),
@@ -2522,7 +2615,7 @@ fn default_into(c: Column, acc: RowAcc) -> RowAcc =
     },
   }
 
-fn insert_rows(d: MemDb, mt: MemTable, rows: List<Row>, q: InsertQ) -> Outcome =
+fn insert_rows(d: MemDb, mt: MemTable, rows: List<Row>, q: InsertQ) -> Outcome / {abort.raise} =
   match append_rows(mt, rows) {
     Err(e) -> fail(d, e),
     Ok(mt2) -> {
@@ -2535,7 +2628,7 @@ fn insert_rows(d: MemDb, mt: MemTable, rows: List<Row>, q: InsertQ) -> Outcome =
     },
   }
 
-fn append_rows(mt: MemTable, rows: List<Row>) -> Result<MemTable, DbError> =
+fn append_rows(mt: MemTable, rows: List<Row>) -> Result<MemTable, DbError> / {abort.raise} =
   match rows {
     [] -> Ok(mt),
     [h, ..t] -> match validate_row(mt.def, mt.rows, h, -1) {
@@ -2559,7 +2652,7 @@ type Changed = { at: Int, row: Row }
 
 type UpAcc = { rows: List<Row>, changed: List<Changed>, at: Int, err: Option<DbError> }
 
-fn exec_update(d: MemDb, q: UpdateQ, ps: List<Param>) -> Outcome =
+fn exec_update(d: MemDb, q: UpdateQ, ps: List<Param>) -> Outcome / {abort.raise} =
   match find_table(d.tables, q.source) {
     None -> fail(d, undefined_table(q.source)),
     Some(mt) -> match plan_update(mt.def, q, ps) {
@@ -2576,7 +2669,11 @@ fn exec_update(d: MemDb, q: UpdateQ, ps: List<Param>) -> Outcome =
     },
   }
 
-fn plan_update(def: Table, q: UpdateQ, ps: List<Param>) -> Result<UpdateQ, DbError> =
+fn plan_update(
+  def: Table,
+  q: UpdateQ,
+  ps: List<Param>,
+) -> Result<UpdateQ, DbError> / {abort.raise} =
   match check_returning(def, q.returning) {
     Some(e) -> Err(e),
     None -> match constant_sets(def, q.sets, ps) {
@@ -2589,7 +2686,11 @@ fn plan_update(def: Table, q: UpdateQ, ps: List<Param>) -> Result<UpdateQ, DbErr
   }
 
 // A constant `set` is coerced at plan time, so one that cannot fit fails even when no row matches.
-fn constant_sets(def: Table, sets: List<Assign>, ps: List<Param>) -> Option<DbError> =
+fn constant_sets(
+  def: Table,
+  sets: List<Assign>,
+  ps: List<Param>,
+) -> Option<DbError> / {abort.raise} =
   match sets {
     [] -> None,
     [s, ..t] -> match find_column(def.columns, s.column) {
@@ -2614,7 +2715,13 @@ fn constant_of(e: Expr, ps: List<Param>) -> Option<Datum> =
     _ -> None,
   }
 
-fn update_walk(def: Table, rows: List<Row>, q: UpdateQ, ps: List<Param>, acc: UpAcc) -> UpAcc =
+fn update_walk(
+  def: Table,
+  rows: List<Row>,
+  q: UpdateQ,
+  ps: List<Param>,
+  acc: UpAcc,
+) -> UpAcc / {abort.raise} =
   match rows {
     [] -> acc,
     [h, ..t] -> match acc.err {
@@ -2623,14 +2730,26 @@ fn update_walk(def: Table, rows: List<Row>, q: UpdateQ, ps: List<Param>, acc: Up
     },
   }
 
-fn update_one(def: Table, r: Row, q: UpdateQ, ps: List<Param>, acc: UpAcc) -> UpAcc =
+fn update_one(
+  def: Table,
+  r: Row,
+  q: UpdateQ,
+  ps: List<Param>,
+  acc: UpAcc,
+) -> UpAcc / {abort.raise} =
   match keeps(r, ps, q.filter) {
     Err(e) -> { rows: acc.rows, changed: acc.changed, at: acc.at, err: Some(e) },
     Ok(hit) -> if hit { update_hit(def, r, q, ps, acc) }
     else { { rows: push(acc.rows, r), changed: acc.changed, at: acc.at + 1, err: None } },
   }
 
-fn update_hit(def: Table, r: Row, q: UpdateQ, ps: List<Param>, acc: UpAcc) -> UpAcc =
+fn update_hit(
+  def: Table,
+  r: Row,
+  q: UpdateQ,
+  ps: List<Param>,
+  acc: UpAcc,
+) -> UpAcc / {abort.raise} =
   match apply_sets(def, r, q.sets, ps) {
     Err(e) -> { rows: acc.rows, changed: acc.changed, at: acc.at, err: Some(e) },
     Ok(nr) ->
@@ -2642,7 +2761,12 @@ fn update_hit(def: Table, r: Row, q: UpdateQ, ps: List<Param>, acc: UpAcc) -> Up
       },
   }
 
-fn apply_sets(def: Table, r: Row, sets: List<Assign>, ps: List<Param>) -> Result<Row, DbError> =
+fn apply_sets(
+  def: Table,
+  r: Row,
+  sets: List<Assign>,
+  ps: List<Param>,
+) -> Result<Row, DbError> / {abort.raise} =
   match sets {
     [] -> Ok(r),
     [s, ..t] -> match find_column(def.columns, s.column) {
@@ -2655,7 +2779,7 @@ fn apply_sets(def: Table, r: Row, sets: List<Assign>, ps: List<Param>) -> Result
   }
 
 // Sequences are threaded through `insert` only, so `set c = default` on one is refused.
-fn set_value(c: Column, r: Row, e: Expr, ps: List<Param>) -> Result<Row, DbError> =
+fn set_value(c: Column, r: Row, e: Expr, ps: List<Param>) -> Result<Row, DbError> / {abort.raise} =
   match e {
     XDefault -> match c.default {
       DSequence(_) -> Err(unsupported("`set ... = default` on a sequence column")),
@@ -2672,7 +2796,7 @@ fn set_value(c: Column, r: Row, e: Expr, ps: List<Param>) -> Result<Row, DbError
     },
   }
 
-fn finish_update(d: MemDb, mt: MemTable, acc: UpAcc, q: UpdateQ) -> Outcome =
+fn finish_update(d: MemDb, mt: MemTable, acc: UpAcc, q: UpdateQ) -> Outcome / {abort.raise} =
   match validate_changed(mt.def, acc.rows, acc.changed) {
     Some(e) -> fail(d, e),
     None -> {
@@ -2690,7 +2814,11 @@ fn finish_update(d: MemDb, mt: MemTable, acc: UpAcc, q: UpdateQ) -> Outcome =
     },
   }
 
-fn validate_changed(def: Table, rows: List<Row>, cs: List<Changed>) -> Option<DbError> =
+fn validate_changed(
+  def: Table,
+  rows: List<Row>,
+  cs: List<Changed>,
+) -> Option<DbError> / {abort.raise} =
   match cs {
     [] -> None,
     [h, ..t] -> match validate_row(def, rows, h.row, h.at) {
@@ -2703,7 +2831,7 @@ fn validate_changed(def: Table, rows: List<Row>, cs: List<Changed>) -> Option<Db
 
 type DelAcc = { rows: List<Row>, gone: List<Row>, err: Option<DbError> }
 
-fn exec_delete(d: MemDb, q: DeleteQ, ps: List<Param>) -> Outcome =
+fn exec_delete(d: MemDb, q: DeleteQ, ps: List<Param>) -> Outcome / {abort.raise} =
   match find_table(d.tables, q.source) {
     None -> fail(d, undefined_table(q.source)),
     Some(mt) -> match plan_delete(mt.def, q) {
@@ -2739,7 +2867,12 @@ fn plan_delete(def: Table, q: DeleteQ) -> Result<DeleteQ, DbError> =
     },
   }
 
-fn delete_walk(rows: List<Row>, q: DeleteQ, ps: List<Param>, acc: DelAcc) -> DelAcc =
+fn delete_walk(
+  rows: List<Row>,
+  q: DeleteQ,
+  ps: List<Param>,
+  acc: DelAcc,
+) -> DelAcc / {abort.raise} =
   match rows {
     [] -> acc,
     [h, ..t] -> match acc.err {
@@ -2897,11 +3030,11 @@ fn t_bin() -> Table =
     checks: [{ name: "bin_qty_check", expr: "qty >= 0" }],
   }
 
-fn t_run(d: MemDb, sql: String, ps: List<Param>) -> Outcome = step(d, stmt(sql), ps)
+fn t_run(d: MemDb, sql: String, ps: List<Param>) -> Outcome / {abort.raise} = step(d, stmt(sql), ps)
 
-fn t_out(d: MemDb, sql: String, ps: List<Param>) -> Answer = t_run(d, sql, ps).out
+fn t_out(d: MemDb, sql: String, ps: List<Param>) -> Answer / {abort.raise} = t_run(d, sql, ps).out
 
-fn t_seed() -> MemDb = {
+fn t_seed() -> MemDb / {abort.raise} = {
   let a = t_run(open(t_schema()), "insert into part (sku, price, tag, n) values ($1,$2,$3,$4)", [
     PText("a"),
     PNumeric(1m),
@@ -3309,7 +3442,7 @@ type Pool = { idle: List<Link>, opened: Int, made: Int, open: List<Scope> }
 
 // --- The text of a value ---------------------------------------------------------
 
-fn hex_of(b: Bytes) -> String =
+fn hex_of(b: Bytes) -> String / {abort.raise} =
   fold(range(0, bytes_len(b)), "", |acc: String, i: Int| {
     let v = bytes_at(b, i);
     acc ++ string_slice("0123456789abcdef", v >>> 4, (v >>> 4) + 1)
@@ -3322,7 +3455,7 @@ fn hex_value(c: Int) -> Int =
   else if c >= 65 && c <= 70 { c - 55 }
   else { 0 }
 
-fn unhex_text(text: String) -> Bytes = {
+fn unhex_text(text: String) -> Bytes / {abort.raise} = {
   let b = bytes_of_string(text);
   bytes_concat_all(
     map(range(0, bytes_len(b) / 2), |i: Int|
@@ -3331,11 +3464,11 @@ fn unhex_text(text: String) -> Bytes = {
 }
 
 // Bytea's hex output is introduced by `\x`; the older escape format is read as its own bytes.
-fn bytes_of_bytea(text: String) -> Bytes =
+fn bytes_of_bytea(text: String) -> Bytes / {abort.raise} =
   if string_starts_with(text, "\\x") { unhex_text(string_slice(text, 2, string_len(text))) }
   else { bytes_of_string(text) }
 
-fn signed_digits(text: String) -> Int = {
+fn signed_digits(text: String) -> Int / {abort.raise} = {
   let b = bytes_of_string(text);
   let negative = bytes_len(b) > 0 && bytes_at(b, 0) == 45;
   let from = if negative { 1 } else { 0 };
@@ -3346,7 +3479,7 @@ fn signed_digits(text: String) -> Int = {
   if negative { 0 - magnitude } else { magnitude }
 }
 
-fn nat_of_text(text: String) -> Int =
+fn nat_of_text(text: String) -> Int / {abort.raise} =
   fold(range(0, string_len(text)), 0, |acc: Int, i: Int| {
     let c = bytes_at(bytes_of_string(string_slice(text, i, i + 1)), 0);
     if c >= 48 && c <= 57 { acc * 10 + c - 48 } else { acc }
@@ -3357,7 +3490,7 @@ fn float_of_text(text: String) -> Float = match float_of_string(text) { Some(f) 
 fn decimal_of_text(text: String) -> Decimal =
   match decimal_of_string(text) { Some(d) -> d, None -> decimal_of_int(0) }
 
-fn json_of_text(text: String) -> json::Json =
+fn json_of_text(text: String) -> json::Json / {abort.raise} =
   match json::parse_string(text) { Ok(j) -> j, Err(_) -> json::Str(text) }
 
 // The element type of an array type, or `0` when the OID is not one this reads.
@@ -3387,7 +3520,7 @@ type Scanning = {
   done: Bool,
 }
 
-fn array_values(element: Int, text: String) -> List<Datum> = {
+fn array_values(element: Int, text: String) -> List<Datum> / {abort.raise} = {
   let inner = if string_len(text) >= 2 { string_slice(text, 1, string_len(text) - 1) } else { "" };
   let end = fold(
     range(0, string_len(inner)),
@@ -3412,10 +3545,10 @@ fn array_values(element: Int, text: String) -> List<Datum> = {
   else { push(end.items, array_value(element, end.piece, end.was_quoted)) }
 }
 
-fn array_value(element: Int, piece: String, was_quoted: Bool) -> Datum =
+fn array_value(element: Int, piece: String, was_quoted: Bool) -> Datum / {abort.raise} =
   if !was_quoted && piece == "NULL" { CNull } else { datum_of(element, Some(piece)) }
 
-fn datum_of(oid: Int, text: Option<String>) -> Datum =
+fn datum_of(oid: Int, text: Option<String>) -> Datum / {abort.raise} =
   match text {
     None -> CNull,
     Some(t) -> if oid == 16 { CBool(t == "t") }
@@ -3430,10 +3563,10 @@ fn datum_of(oid: Int, text: Option<String>) -> Datum =
 
 // What the server sent for one column: text, except that bytea's hex form and the text of every
 // other type are read by `datum_of`. `string_of_bytes_lossy` because a bytea is bytes, not text.
-fn datum_bytes(oid: Int, raw: Option<Bytes>) -> Datum =
+fn datum_bytes(oid: Int, raw: Option<Bytes>) -> Datum / {abort.raise} =
   match raw { None -> CNull, Some(b) -> datum_of(oid, Some(string_of_bytes_lossy(b))) }
 
-fn param_text(p: Param) -> Option<String> =
+fn param_text(p: Param) -> Option<String> / {abort.raise} =
   match p {
     PNull -> None,
     PInt(n) -> Some(int_to_string(n)),
@@ -3448,7 +3581,7 @@ fn param_text(p: Param) -> Option<String> =
   }
 
 // An array element is always quoted, which is the one form whose escaping is two characters.
-fn array_element_text(p: Param) -> String =
+fn array_element_text(p: Param) -> String / {abort.raise} =
   match param_text(p) {
     None -> "NULL",
     Some(t) ->
@@ -3462,15 +3595,21 @@ fn array_element_text(p: Param) -> String =
 
 // --- The answer a statement makes ------------------------------------------------
 
-fn last_word(text: String) -> Option<String> =
+fn last_word(text: String) -> Option<String> / {abort.raise} =
   fold(string_split(text, " "), None, |acc: Option<String>, w: String|
     if string_len(w) > 0 { Some(w) } else { acc })
 
 // `SELECT 3`, `INSERT 0 1`, `UPDATE 2`: the count is the tag's last number, and a tag with none
 // (`BEGIN`) counts nothing.
-fn count_of(tag: String) -> Int = match last_word(tag) { Some(w) -> nat_of_text(w), None -> 0 }
+fn count_of(tag: String) -> Int / {abort.raise} =
+  match last_word(tag) { Some(w) -> nat_of_text(w), None -> 0 }
 
-fn row_of(columns: List<pg::Column>, values: List<Option<Bytes>>, i: Int, acc: Row) -> Row =
+fn row_of(
+  columns: List<pg::Column>,
+  values: List<Option<Bytes>>,
+  i: Int,
+  acc: Row,
+) -> Row / {abort.raise} =
   if i >= len(columns) { acc } else {
     match list_at(columns, i) {
       None -> acc,
@@ -3481,7 +3620,10 @@ fn row_of(columns: List<pg::Column>, values: List<Option<Bytes>>, i: Int, acc: R
     }
   }
 
-fn rows_of(columns: List<pg::Column>, rows: List<List<Option<Bytes>>>) -> List<Row> =
+fn rows_of(
+  columns: List<pg::Column>,
+  rows: List<List<Option<Bytes>>>,
+) -> List<Row> / {abort.raise} =
   map(rows, |r: List<Option<Bytes>>| row_of(columns, r, 0, map_new()))
 
 // --- The scope a statement runs in -----------------------------------------------
@@ -3543,7 +3685,7 @@ fn within(p: Pool, scope: Scope) -> Decided =
 fn busy(p: Pool, n: Int) -> Pool =
   { ..p, open: map(p.open, |s: Scope| if s.n == n { { ..s, busy: true } } else { s }) }
 
-fn for_statement(p: Pool, size: Int, what: String) -> Decided =
+fn for_statement(p: Pool, size: Int, what: String) -> Decided / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous(what)),
     Own(scope) -> within(p, scope),
@@ -3552,7 +3694,7 @@ fn for_statement(p: Pool, size: Int, what: String) -> Decided =
 
 // A `begin` inside the performer's transaction is a savepoint of it; any other opens a transaction
 // on a connection of its own.
-fn for_begin(p: Pool, size: Int, level: Isolation, access: Access) -> Decided =
+fn for_begin(p: Pool, size: Int, level: Isolation, access: Access) -> Decided / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous("`db.begin`")),
     NoTransaction -> outside(p, size),
@@ -3578,7 +3720,7 @@ type ToClose = { pool: Pool, closing: Closing }
 
 // A transaction whose connection is lost has nothing to send: the server ended it when the
 // connection went, and `lost` is the answer.
-fn for_close(p: Pool, what: String, lost: Answer) -> ToClose =
+fn for_close(p: Pool, what: String, lost: Answer) -> ToClose / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous(what)),
     NoTransaction -> { pool: p, closing: Settled(Failed(no_transaction(what))) },
@@ -3676,13 +3818,13 @@ pub type SqlTables = { written: List<String>, read: List<String> }
 
 pub fn no_sql_tables() -> SqlTables = { written: [], read: [] }
 
-fn sql_note_written(t: SqlTables, name: String) -> SqlTables =
+fn sql_note_written(t: SqlTables, name: String) -> SqlTables / {abort.raise} =
   { ..t, written: sql_insert_table(t.written, name), read: sql_without_table(t.read, name) }
 
-fn sql_note_read(t: SqlTables, name: String) -> SqlTables =
+fn sql_note_read(t: SqlTables, name: String) -> SqlTables / {abort.raise} =
   if sql_has_table(t.written, name) { t } else { { ..t, read: sql_insert_table(t.read, name) } }
 
-fn sql_absorb_tables(t: SqlTables, other: SqlTables) -> SqlTables =
+fn sql_absorb_tables(t: SqlTables, other: SqlTables) -> SqlTables / {abort.raise} =
   fold(
     other.written,
     fold(other.read, t, |acc: SqlTables, n: String| sql_note_read(acc, n)),
@@ -3694,10 +3836,14 @@ fn sql_has_table(names: List<String>, name: String) -> Bool =
 
 // Sorted, so one set is one list: two statements that touch the same tables read the same however
 // they were written, and a comparison against a row does not depend on the order of the text.
-fn sql_insert_table(names: List<String>, name: String) -> List<String> =
+fn sql_insert_table(names: List<String>, name: String) -> List<String> / {abort.raise} =
   if sql_has_table(names, name) { names } else { sql_in_order(names, name, []) }
 
-fn sql_in_order(names: List<String>, name: String, before: List<String>) -> List<String> =
+fn sql_in_order(
+  names: List<String>,
+  name: String,
+  before: List<String>,
+) -> List<String> / {abort.raise} =
   match names {
     [] -> push(before, name),
     [h, ..rest] -> if sql_name_before(name, h) { concat_lists(push(before, name), names) }
@@ -3706,10 +3852,10 @@ fn sql_in_order(names: List<String>, name: String, before: List<String>) -> List
 
 // A name's bytes, compared as postgres compares them: byte by byte, so `"Items"` sorts before
 // `items`.
-fn sql_name_before(a: String, b: String) -> Bool =
+fn sql_name_before(a: String, b: String) -> Bool / {abort.raise} =
   sql_bytes_cmp(bytes_of_string(a), bytes_of_string(b)) < 0
 
-fn sql_bytes_cmp(a: Bytes, b: Bytes) -> Int =
+fn sql_bytes_cmp(a: Bytes, b: Bytes) -> Int / {abort.raise} =
   if bytes_len(a) == 0 { if bytes_len(b) == 0 { 0 } else { -1 } }
   else if bytes_len(b) == 0 { 1 } else {
     let x = bytes_at(a, 0);
@@ -3720,9 +3866,10 @@ fn sql_bytes_cmp(a: Bytes, b: Bytes) -> Int =
   }
 
 // Every table the statement names, written and read as one sorted list.
-pub fn scan_table_names(t: SqlTables) -> List<String> = sql_merge_names(t.written, t.read)
+pub fn scan_table_names(t: SqlTables) -> List<String> / {abort.raise} =
+  sql_merge_names(t.written, t.read)
 
-fn sql_merge_names(a: List<String>, b: List<String>) -> List<String> =
+fn sql_merge_names(a: List<String>, b: List<String>) -> List<String> / {abort.raise} =
   match a {
     [] -> b,
     [ah, ..at] -> match b {
@@ -3758,12 +3905,16 @@ pub fn sql_is_semi(t: SqlTok) -> Bool = match t { SqlSemi -> true, _ -> false }
 
 // The tokens of `sql`, in order. Whitespace and comments are dropped, and a quote that is never
 // closed is refused rather than guessed at: past one, the reader cannot tell text from statement.
-pub fn tokenize(sql: String) -> Result<List<SqlTokAt>, DbError> = {
+pub fn tokenize(sql: String) -> Result<List<SqlTokAt>, DbError> / {abort.raise} = {
   let b = bytes_of_string(sql);
   sql_tokens_from(b, 0, [])
 }
 
-fn sql_tokens_from(b: Bytes, at: Int, acc: List<SqlTokAt>) -> Result<List<SqlTokAt>, DbError> = {
+fn sql_tokens_from(
+  b: Bytes,
+  at: Int,
+  acc: List<SqlTokAt>,
+) -> Result<List<SqlTokAt>, DbError> / {abort.raise} = {
   let i = sql_skip_trivia(b, at)?;
   if i >= bytes_len(b) { Ok(acc) } else {
     let step = sql_next_token(b, i)?;
@@ -3771,7 +3922,7 @@ fn sql_tokens_from(b: Bytes, at: Int, acc: List<SqlTokAt>) -> Result<List<SqlTok
   }
 }
 
-fn sql_skip_trivia(b: Bytes, at: Int) -> Result<Int, DbError> =
+fn sql_skip_trivia(b: Bytes, at: Int) -> Result<Int, DbError> / {abort.raise} =
   if at >= bytes_len(b) { Ok(at) }
   else if is_space_byte(bytes_at(b, at)) { sql_skip_trivia(b, at + 1) }
   else if bytes_at(b, at) == 45 && sql_byte_is(b, at + 1, 45) {
@@ -3783,22 +3934,26 @@ fn sql_skip_trivia(b: Bytes, at: Int) -> Result<Int, DbError> =
     }
   } else { Ok(at) }
 
-fn sql_byte_is(b: Bytes, at: Int, c: Int) -> Bool = at < bytes_len(b) && bytes_at(b, at) == c
+fn sql_byte_is(b: Bytes, at: Int, c: Int) -> Bool / {abort.raise} =
+  at < bytes_len(b) && bytes_at(b, at) == c
 
-fn sql_past_line(b: Bytes, at: Int) -> Int =
+fn sql_past_line(b: Bytes, at: Int) -> Int / {abort.raise} =
   if at >= bytes_len(b) { at }
   else if bytes_at(b, at) == 10 { at + 1 }
   else { sql_past_line(b, at + 1) }
 
 // Postgres nests block comments, so stopping at the first `*/` would leave statement text behind.
-fn sql_past_comment(b: Bytes, at: Int, depth: Int) -> Result<Int, Int> =
+fn sql_past_comment(b: Bytes, at: Int, depth: Int) -> Result<Int, Int> / {abort.raise} =
   if at >= bytes_len(b) { Err(at) } else if bytes_at(b, at) == 47 && sql_byte_is(b, at + 1, 42) {
     sql_past_comment(b, at + 2, depth + 1)
   } else if bytes_at(b, at) == 42 && sql_byte_is(b, at + 1, 47) {
     if depth == 1 { Ok(at + 2) } else { sql_past_comment(b, at + 2, depth - 1) }
   } else { sql_past_comment(b, at + 1, depth) }
 
-fn sql_next_token(b: Bytes, at: Int) -> Result<{ tok: SqlTokAt, next: Int }, DbError> = {
+fn sql_next_token(
+  b: Bytes,
+  at: Int,
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> / {abort.raise} = {
   let c = bytes_at(b, at);
   if c == 59 { Ok(sql_filled(b, at, at + 1, SqlSemi)) }
   else if c == 39 { sql_literal(b, at, at + 1, at, false) }
@@ -3826,7 +3981,12 @@ fn sql_next_token(b: Bytes, at: Int) -> Result<{ tok: SqlTokAt, next: Int }, DbE
   } else { Ok(sql_filled(b, at, at + 1, SqlPunct(string_of_bytes(bytes_slice(b, at, at + 1))))) }
 }
 
-fn sql_filled(b: Bytes, at: Int, next: Int, tok: SqlTok) -> { tok: SqlTokAt, next: Int } =
+fn sql_filled(
+  b: Bytes,
+  at: Int,
+  next: Int,
+  tok: SqlTok,
+) -> { tok: SqlTokAt, next: Int } / {abort.raise} =
   { tok: { tok: tok, at: at, text: string_of_bytes(bytes_slice(b, at, next)) }, next: next }
 
 fn sql_unclosed(b: Bytes, at: Int, what: String) -> DbError =
@@ -3837,7 +3997,7 @@ fn sql_unclosed(b: Bytes, at: Int, what: String) -> DbError =
       ++ " is never closed, and past one the reader cannot tell text from statement",
   )
 
-fn sql_lower_bytes(b: Bytes, at: Int, end: Int) -> String =
+fn sql_lower_bytes(b: Bytes, at: Int, end: Int) -> String / {abort.raise} =
   string_of_bytes(
     fold(range(at, end), b"", |acc: Bytes, i: Int| {
       let c = bytes_at(b, i);
@@ -3846,7 +4006,12 @@ fn sql_lower_bytes(b: Bytes, at: Int, end: Int) -> String =
   )
 
 // The end of a string sql_literal, from just after its opening quote.
-fn sql_end_of_literal(b: Bytes, at: Int, open: Int, escapes: Bool) -> Result<Int, DbError> =
+fn sql_end_of_literal(
+  b: Bytes,
+  at: Int,
+  open: Int,
+  escapes: Bool,
+) -> Result<Int, DbError> / {abort.raise} =
   if at >= bytes_len(b) { Err(sql_unclosed(b, open, "a string sql_literal")) }
   else if escapes && bytes_at(b, at) == 92 { sql_end_of_literal(b, at + 2, open, escapes) }
   else if bytes_at(b, at) == 39 && sql_byte_is(b, at + 1, 39) {
@@ -3860,13 +4025,13 @@ fn sql_literal(
   body: Int,
   quote: Int,
   escapes: Bool,
-) -> Result<{ tok: SqlTokAt, next: Int }, DbError> =
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> / {abort.raise} =
   match sql_end_of_literal(b, body, quote, escapes) {
     Err(e) -> Err(e),
     Ok(e) -> Ok(sql_filled(b, start, e, SqlText)),
   }
 
-fn sql_end_of_quoted(b: Bytes, at: Int, open: Int) -> Result<Int, DbError> =
+fn sql_end_of_quoted(b: Bytes, at: Int, open: Int) -> Result<Int, DbError> / {abort.raise} =
   if at >= bytes_len(b) { Err(sql_unclosed(b, open, "a quoted identifier")) }
   else if bytes_at(b, at) == 34 && sql_byte_is(b, at + 1, 34) { sql_end_of_quoted(b, at + 2, open) }
   else if bytes_at(b, at) == 34 { Ok(at + 1) }
@@ -3877,7 +4042,7 @@ fn sql_quoted_word(
   start: Int,
   body: Int,
   quote: Int,
-) -> Result<{ tok: SqlTokAt, next: Int }, DbError> =
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> / {abort.raise} =
   match sql_end_of_quoted(b, body, quote) {
     Err(e) -> Err(e),
     Ok(e) ->
@@ -3887,19 +4052,22 @@ fn sql_quoted_word(
   }
 
 // The name inside `"…"`, with a doubled quote standing for one.
-fn sql_unquoted(b: Bytes, at: Int, end: Int, acc: Bytes) -> String =
+fn sql_unquoted(b: Bytes, at: Int, end: Int, acc: Bytes) -> String / {abort.raise} =
   if at >= end { string_of_bytes(acc) }
   else if bytes_at(b, at) == 34 && sql_byte_is(b, at + 1, 34) {
     sql_unquoted(b, at + 2, end, bytes_concat(acc, byte_of_int(34)))
   } else { sql_unquoted(b, at + 1, end, bytes_concat(acc, byte_of_int(bytes_at(b, at)))) }
 
 // `$1` … `$9`: where the digits end, or `None` when this is a dollar quote instead.
-fn sql_digit_end(b: Bytes, at: Int) -> Option<Int> =
+fn sql_digit_end(b: Bytes, at: Int) -> Option<Int> / {abort.raise} =
   if at >= bytes_len(b) || !sql_is_digit(bytes_at(b, at)) { None }
   else { Some(sql_past_number(b, at)) }
 
 // `$tag$ … $tag$`, where the tag may be empty.
-fn sql_dollar_quoted(b: Bytes, at: Int) -> Result<{ tok: SqlTokAt, next: Int }, DbError> = {
+fn sql_dollar_quoted(
+  b: Bytes,
+  at: Int,
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> / {abort.raise} = {
   let tag_end = sql_past_tag(b, at + 1);
   if !sql_byte_is(b, tag_end, 36) { Err(sql_unclosed(b, at, "a dollar-quoted string")) } else {
     let tag = bytes_slice(b, at, tag_end + 1);
@@ -3910,27 +4078,27 @@ fn sql_dollar_quoted(b: Bytes, at: Int) -> Result<{ tok: SqlTokAt, next: Int }, 
   }
 }
 
-fn sql_past_tag(b: Bytes, at: Int) -> Int =
+fn sql_past_tag(b: Bytes, at: Int) -> Int / {abort.raise} =
   if at < bytes_len(b) && (sql_is_name_byte(bytes_at(b, at)) || sql_is_digit(bytes_at(b, at))) {
     sql_past_tag(b, at + 1)
   } else { at }
 
-fn sql_find_tag(b: Bytes, tag: Bytes, at: Int) -> Option<Int> =
+fn sql_find_tag(b: Bytes, tag: Bytes, at: Int) -> Option<Int> / {abort.raise} =
   if at + bytes_len(tag) > bytes_len(b) { None }
   else if sql_tag_at(b, tag, at) { Some(at) }
   else { sql_find_tag(b, tag, at + 1) }
 
-fn sql_tag_at(b: Bytes, tag: Bytes, at: Int) -> Bool =
+fn sql_tag_at(b: Bytes, tag: Bytes, at: Int) -> Bool / {abort.raise} =
   fold(range(0, bytes_len(tag)), true, |acc: Bool, i: Int|
     acc && bytes_at(b, at + i) == bytes_at(tag, i))
 
 // A number runs to the next byte that is not part of one, as postgres' own lexer reads it.
-fn sql_past_number(b: Bytes, at: Int) -> Int =
+fn sql_past_number(b: Bytes, at: Int) -> Int / {abort.raise} =
   if at < bytes_len(b) && (is_word_byte(bytes_at(b, at)) || bytes_at(b, at) == 46) {
     sql_past_number(b, at + 1)
   } else { at }
 
-fn sql_past_word(b: Bytes, at: Int) -> Int =
+fn sql_past_word(b: Bytes, at: Int) -> Int / {abort.raise} =
   if at < bytes_len(b)
       && (sql_is_name_byte(bytes_at(b, at)) || sql_is_digit(bytes_at(b, at))
       || bytes_at(b, at) == 36) { sql_past_word(b, at + 1) }
@@ -3953,7 +4121,7 @@ pub fn sql_token_summary(t: SqlTokAt) -> String =
     SqlSemi -> "semi",
   }
 
-pub fn sql_tokenize_summary(sql: String) -> Result<List<String>, DbError> =
+pub fn sql_tokenize_summary(sql: String) -> Result<List<String>, DbError> / {abort.raise} =
   match tokenize(sql) {
     Err(e) -> Err(e),
     Ok(ts) -> Ok(map(ts, |t: SqlTokAt| sql_token_summary(t))),
@@ -4303,7 +4471,7 @@ fn sql_reject_in(toks: List<SqlTokAt>, p: SqlAt) -> Result<SqlAt, DbError> =
 
 // --- The statement ------------------------------------------------------------------
 
-fn sql_statement(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+fn sql_statement(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> / {abort.raise} = {
   let deeper = { ..p, depth: p.depth + 1 };
   if deeper.depth > sql_nesting() {
     Err(sql_here(p, "this statement nests deeper than the reader will follow"))
@@ -4317,7 +4485,7 @@ fn sql_statement(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
 
 // `with` is the one admitted construct that can hide a verb: a CTE's body is a whole statement, so
 // a `delete` inside one makes a statement led by `select` a write.
-fn sql_with_clause(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+fn sql_with_clause(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> / {abort.raise} = {
   let opening = sql_eat_word(p, "with");
   if !opening.ate { sql_body(p) } else {
     let recursive = sql_eat_word(opening.p, "recursive");
@@ -4329,7 +4497,7 @@ fn sql_cte_list(
   p: SqlAt,
   recursive: Bool,
   gathered: SqlTables,
-) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> =
+) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> / {abort.raise} =
   match sql_cte(p, recursive) {
     Err(e) -> Err(e),
     Ok(one) -> {
@@ -4348,7 +4516,10 @@ fn sql_cte_list(
     },
   }
 
-fn sql_cte(p: SqlAt, recursive: Bool) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+fn sql_cte(
+  p: SqlAt,
+  recursive: Bool,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let named = sql_identifier(p, "a common table expression's name")?;
   // A `recursive` CTE names itself in its body, so its name is in scope before the body is read.
   let scope = if recursive { push(named.p.ctes, named.name) } else { named.p.ctes };
@@ -4392,7 +4563,7 @@ fn sql_without_names(tables: SqlTables, names: List<String>) -> SqlTables =
     read: fold(names, tables.read, |acc: List<String>, n: String| sql_without_table(acc, n)),
   }
 
-fn sql_body(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> =
+fn sql_body(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> / {abort.raise} =
   match sql_head(p.toks) {
     None -> Err(sql_here(p, "this statement is empty")),
     Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) }
@@ -4418,7 +4589,7 @@ fn sql_body(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> =
     },
   }
 
-fn sql_select_stmt(p: SqlAt) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+fn sql_select_stmt(p: SqlAt) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   match sql_select_core(p) {
     Err(e) -> Err(e),
     Ok(core) -> {
@@ -4432,7 +4603,7 @@ fn sql_select_stmt(p: SqlAt) -> Result<{ p: SqlAt, tables: SqlTables }, DbError>
 fn sql_select_arms(
   p: SqlAt,
   tables: SqlTables,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   if sql_at_word(p, "union") || sql_at_word(p, "intersect") || sql_at_word(p, "except") {
     let opened = sql_step(p);
     let quantified = sql_eat_word(sql_eat_word(opened, "all").p, "distinct");
@@ -4445,7 +4616,7 @@ fn sql_select_arms(
 fn sql_select_tail(
   p: SqlAt,
   tables: SqlTables,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let ordered = sql_eat_word(p, "order");
   let after_order = if ordered.ate {
     match sql_expect_word(ordered.p, "by") {
@@ -4459,7 +4630,7 @@ fn sql_select_tail(
 fn sql_select_tails(
   p: SqlAt,
   tables: SqlTables,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   if sql_at_word(p, "limit") || sql_at_word(p, "offset") {
     let opened = sql_step(p);
     match sql_skip_expr(opened, tables, ["limit", "offset", "fetch", "for"], false) {
@@ -4479,7 +4650,7 @@ fn sql_select_tails(
     }
   } else { Ok({ p: p, tables: tables }) }
 
-fn sql_select_core(p: SqlAt) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+fn sql_select_core(p: SqlAt) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let open = sql_eat_punct(p, "(");
   if open.ate {
     match sql_select_stmt(open.p) {
@@ -4518,7 +4689,7 @@ fn sql_select_core(p: SqlAt) -> Result<{ p: SqlAt, tables: SqlTables }, DbError>
 
 fn sql_select_rest(
   at: { p: SqlAt, tables: SqlTables },
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let from = sql_source_after_from(at)?;
   let filtered = sql_select_filter(from)?;
   let grouped = sql_select_grouped(filtered)?;
@@ -4527,21 +4698,21 @@ fn sql_select_rest(
 
 fn sql_source_after_from(
   at: { p: SqlAt, tables: SqlTables },
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let from = sql_eat_word(at.p, "from");
   if from.ate { sql_source_list(from.p, at.tables) } else { Ok(at) }
 }
 
 fn sql_select_filter(
   at: { p: SqlAt, tables: SqlTables },
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let where_ = sql_eat_word(at.p, "where");
   if where_.ate { sql_skip_expr(where_.p, at.tables, sql_clause_words(), false) } else { Ok(at) }
 }
 
 fn sql_select_grouped(
   at: { p: SqlAt, tables: SqlTables },
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let group = sql_eat_word(at.p, "group");
   if group.ate {
     match sql_expect_word(group.p, "by") {
@@ -4553,7 +4724,7 @@ fn sql_select_grouped(
 
 fn sql_select_having(
   at: { p: SqlAt, tables: SqlTables },
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let having = sql_eat_word(at.p, "having");
   let after = if having.ate { sql_skip_expr(having.p, at.tables, sql_clause_words(), false) }
   else { Ok(at) };
@@ -4571,7 +4742,7 @@ fn sql_select_having(
 fn sql_source_list(
   p: SqlAt,
   tables: SqlTables,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   match sql_source_item(p, tables) {
     Err(e) -> Err(e),
     Ok(one) -> {
@@ -4583,10 +4754,13 @@ fn sql_source_list(
 fn sql_source_item(
   p: SqlAt,
   tables: SqlTables,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   match sql_source_base(p, tables) { Err(e) -> Err(e), Ok(base) -> sql_joins(base.p, base.tables) }
 
-fn sql_joins(p: SqlAt, tables: SqlTables) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+fn sql_joins(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let natural = sql_eat_word(p, "natural");
   let joined = sql_at_word(natural.p, "join") || sql_at_word(natural.p, "inner")
     || sql_at_word(natural.p, "left")
@@ -4634,7 +4808,7 @@ fn sql_joins(p: SqlAt, tables: SqlTables) -> Result<{ p: SqlAt, tables: SqlTable
 fn sql_source_base(
   p: SqlAt,
   tables: SqlTables,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let lateral = sql_eat_word(p, "lateral");
   let open_at = match sql_head(lateral.p.toks) { Some(t) -> t.at, None -> lateral.p.end_pos };
   let open = sql_eat_punct(lateral.p, "(");
@@ -4688,7 +4862,7 @@ fn sql_source_base(
 fn sql_target_list(
   p: SqlAt,
   tables: SqlTables,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   match sql_skip_expr(p, tables, sql_clause_words(), true) {
     Err(e) -> Err(e),
     Ok(item) -> {
@@ -4709,7 +4883,7 @@ fn sql_target_list(
 
 // --- The four verbs -----------------------------------------------------------------
 
-fn sql_insert(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+fn sql_insert(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> / {abort.raise} = {
   let after_insert = sql_expect_word(p, "insert")?;
   let into = sql_expect_word(after_insert, "into")?;
   let named = sql_qualified_name(into, 0)?;
@@ -4751,7 +4925,7 @@ fn sql_insert(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
 fn sql_insert_source(
   default: { p: SqlAt, ate: Bool },
   after_columns: SqlAt,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   if default.ate {
     match sql_expect_word(default.p, "values") {
       Err(e) -> Err(e),
@@ -4759,7 +4933,7 @@ fn sql_insert_source(
     }
   } else { sql_select_stmt(after_columns) }
 
-fn sql_update(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+fn sql_update(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> / {abort.raise} = {
   let after_update = sql_expect_word(p, "update")?;
   let only = sql_eat_word(after_update, "only");
   let named = sql_qualified_name(only.p, 0)?;
@@ -4787,7 +4961,7 @@ fn sql_update(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
   }
 }
 
-fn sql_delete(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+fn sql_delete(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> / {abort.raise} = {
   let after_delete = sql_expect_word(p, "delete")?;
   let from = sql_expect_word(after_delete, "from")?;
   let only = sql_eat_word(from, "only");
@@ -4813,7 +4987,10 @@ fn sql_delete(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
   }
 }
 
-fn sql_returning(p: SqlAt, tables: SqlTables) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+fn sql_returning(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let returning = sql_eat_word(p, "returning");
   if returning.ate { sql_skip_expr(returning.p, tables, [], false) }
   else { Ok({ p: p, tables: tables }) }
@@ -4865,7 +5042,7 @@ fn sql_skip_expr(
   tables: SqlTables,
   stops: List<String>,
   stop_at_comma: Bool,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   match sql_head(p.toks) {
     None -> Ok({ p: p, tables: tables }),
     Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) }
@@ -4881,7 +5058,7 @@ fn sql_skip_word(
   tables: SqlTables,
   stops: List<String>,
   stop_at_comma: Bool,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   match t.tok {
     SqlWord(w) -> if !w.quoted && sql_has_table(stops, w.text) { Ok({ p: p, tables: tables }) }
     else {
@@ -4903,7 +5080,7 @@ fn sql_skip_paren(
   tables: SqlTables,
   stops: List<String>,
   stop_at_comma: Bool,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} = {
   let opened = sql_step(p);
   if sql_at_word(opened, "select") || sql_at_word(opened, "values") || sql_at_word(opened, "with") {
     match sql_statement(opened) {
@@ -4927,7 +5104,7 @@ fn sql_skip_group(
   p: SqlAt,
   tables: SqlTables,
   depth: Int,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   match sql_head(p.toks) {
     None -> Err(sql_here(p, "this group is never closed")),
     Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) } else if sql_is_punct(t.tok, "(") {
@@ -4959,7 +5136,7 @@ fn sql_skip_group(
 fn sql_skip_parens(
   p: SqlAt,
   tables: SqlTables,
-) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> / {abort.raise} =
   match sql_skip_group(p, tables, 1) {
     Err(e) -> Err(e),
     Ok(closed) -> Ok({ p: closed.p, tables: closed.tables }),
@@ -4970,7 +5147,7 @@ fn sql_skip_parens(
 // What `sql` does and which tables it reaches, or why it is refused. Nothing below the driver's
 // own read of the verb depends on a guess: an unmodelled construct is a table set that would be
 // wrong, and a wrong table set is a scheduler that runs two writers beside each other.
-pub fn scan_statement(sql: String) -> Result<SqlScan, DbError> =
+pub fn scan_statement(sql: String) -> Result<SqlScan, DbError> / {abort.raise} =
   match tokenize(sql) {
     Err(e) -> Err(e),
     Ok(toks) -> match sql_statement({
@@ -4998,7 +5175,7 @@ type Ran = { session: pg::Session, answer: Answer }
 // The statement's own check, before it takes a connection. A statement's tables are a function of
 // its text rather than of the call site's label, so a join reaches tables the label never named —
 // and the atom the scheduler records is the label's, so the label has to be one of them.
-fn check_statement(s: Stmt, reads_only: Bool, label: String) -> Unit = {
+fn check_statement(s: Stmt, reads_only: Bool, label: String) -> Unit / {abort.raise} = {
   let scanned = match scan_statement(s.sql) { Err(e) -> panic(e.detail), Ok(scanned) -> scanned };
   if !sql_has_table(scan_table_names(scanned.tables), label) {
     panic(
@@ -5029,7 +5206,7 @@ fn run_checked(
   ps: List<Param>,
   rows: Bool,
   cfg: Server,
-) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link]} =
+) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link], abort.raise} =
   match pg::extended_query[link](session, s.sql, map(ps, |p: Param| param_text(p)), cfg.client) {
     Err(e) -> Err(e),
     Ok(reply) ->
@@ -5045,14 +5222,14 @@ fn control(
   session: pg::Session,
   sql: String,
   cfg: Server,
-) -> Result<pg::Reply, pg::ClientError> / {net.send[link], net.recv[link]} =
+) -> Result<pg::Reply, pg::ClientError> / {net.send[link], net.recv[link], abort.raise} =
   pg::simple_query[link](session, sql, cfg.client)
 
 fn linked(
   cfg: Server,
   nonce: String,
   c: Claim,
-) -> Result<Link, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+) -> Result<Link, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match c {
     Idle(l) -> Ok(l),
     Fresh(n) -> match pg::connect[link](
@@ -5072,7 +5249,11 @@ fn linked(
 
 // An exchange outside any transaction that failed: a refusal leaves the server talking on the
 // connection, and anything else ends it.
-fn let_go(l: Link, e: pg::ClientError, cfg: Server) -> Left / {net.send[link], net.close[link]} =
+fn let_go(
+  l: Link,
+  e: pg::ClientError,
+  cfg: Server,
+) -> Left / {net.send[link], net.close[link], abort.raise} =
   match e {
     pg::Rejected(session, server) ->
       {
@@ -5099,7 +5280,7 @@ fn failed_within(
   e: pg::ClientError,
   cfg: Server,
   deeper: Int,
-) -> Left / {net.send[link], net.close[link]} =
+) -> Left / {net.send[link], net.close[link], abort.raise} =
   match e {
     pg::Rejected(after, server) ->
       {
@@ -5126,7 +5307,7 @@ fn statement_outside(
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
-) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match linked(cfg, nonce, c) {
     Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
     Ok(l) -> match run_checked(l.session, s, ps, rows, cfg) {
@@ -5148,7 +5329,7 @@ fn statement_within(
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
-) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
   match run_checked(session, s, ps, rows, cfg) {
     Ok(ran) ->
       { answer: ran.answer, n: scope.n, scope: Some(kept(scope, ran.session, 0)), freed: None },
@@ -5161,7 +5342,7 @@ fn opening(
   c: Claim,
   level: Isolation,
   access: Access,
-) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise} =
   match linked(cfg, nonce, c) {
     Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
     Ok(l) -> match control(
@@ -5191,7 +5372,7 @@ fn nesting(
   cfg: Server,
   scope: Scope,
   session: pg::Session,
-) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
   match control(session, "savepoint " ++ savepoint_name(scope.depth + 1), cfg) {
     Ok(reply) ->
       { answer: Count(0), n: scope.n, scope: Some(kept(scope, reply.session, 1)), freed: None },
@@ -5208,7 +5389,7 @@ fn committing(
   cfg: Server,
   scope: Scope,
   session: pg::Session,
-) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
   if scope.depth > 1 {
     match control(session, "release savepoint " ++ savepoint_name(scope.depth), cfg) {
       Ok(reply) ->
@@ -5234,7 +5415,7 @@ fn aborting(
   cfg: Server,
   scope: Scope,
   session: pg::Session,
-) -> Left / {net.send[link], net.recv[link], net.close[link]} =
+) -> Left / {net.send[link], net.recv[link], net.close[link], abort.raise} =
   if scope.depth > 1 {
     // A savepoint outlives a rollback to it, so it is released too.
     let name = savepoint_name(scope.depth);
@@ -5261,7 +5442,7 @@ pub fn serve<a | e>(
   size: Int,
   nonce: String,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> a / {net.connect[link], net.send[link], net.recv[link], net.close[link] | e} =
+) -> a / {abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link] | e} =
   with_cell[dbpool]({ idle: [], opened: 0, made: 0, open: [] }) { pool -> {
     let taken = |d: Decided| {
       cell_set(pool, d.pool);
@@ -5372,7 +5553,10 @@ pub fn serve<a | e>(
 // ask's rows, so the answers come apart in order. `None` when the asks cannot share one statement:
 // text the reader cannot take apart, an ask whose parameters are not the placeholders', or more
 // parameters than one statement may carry.
-fn coalesced(s: Stmt, each: List<List<Param>>) -> Option<{ s: Stmt, ps: List<Param> }> =
+fn coalesced(
+  s: Stmt,
+  each: List<List<Param>>,
+) -> Option<{ s: Stmt, ps: List<Param> }> / {abort.raise} =
   match tokenize(s.sql) {
     Err(_) -> None,
     Ok(ts) -> match statement_body(s.sql, ts) {
@@ -5400,7 +5584,7 @@ fn coalesced(s: Stmt, each: List<List<Param>>) -> Option<{ s: Stmt, ps: List<Par
   }
 
 // The statement's text short of a closing `;`; `None` when a `;` comes before its end.
-fn statement_body(sql: String, ts: List<SqlTokAt>) -> Option<String> = {
+fn statement_body(sql: String, ts: List<SqlTokAt>) -> Option<String> / {abort.raise} = {
   let semis = filter(range(0, len(ts)), |i: Int|
     match list_at(ts, i) { Some(t) -> sql_is_semi(t.tok), None -> false });
   match semis {
@@ -5415,11 +5599,11 @@ fn statement_body(sql: String, ts: List<SqlTokAt>) -> Option<String> = {
   }
 }
 
-fn placeholder_number(text: String) -> Int =
+fn placeholder_number(text: String) -> Int / {abort.raise} =
   match string::int_of_string(string_slice(text, 1, string_len(text))) { Some(n) -> n, None -> 0 }
 
 // Each placeholder `$k` of `body` written `$(k + by)`.
-fn renumbered(body: String, places: List<SqlTokAt>, by: Int) -> String = {
+fn renumbered(body: String, places: List<SqlTokAt>, by: Int) -> String / {abort.raise} = {
   let b = bytes_of_string(body);
   let walked = fold(places, { at: 0, out: b"" }, |acc: { at: Int, out: Bytes }, t: SqlTokAt|
     if t.at < acc.at || t.at >= bytes_len(b) { acc } else {
@@ -5455,7 +5639,7 @@ fn split_asks(rows: List<Row>, asks: Int) -> List<Answer> = {
 
 // Every connection the pool still holds once its body has returned, told it is done and closed:
 // the idle ones, and one a body returned from inside its transaction, which the server rolls back.
-fn finished(p: Pool, cfg: Server) -> Unit / {net.send[link], net.close[link]} = {
+fn finished(p: Pool, cfg: Server) -> Unit / {net.send[link], net.close[link], abort.raise} = {
   fold(p.idle, (), |done: Unit, l: Link| pg::finish[link](l.session, cfg.client));
   fold(p.open, (), |done: Unit, scope: Scope|
     match scope.session { Some(session) -> pg::finish[link](session, cfg.client), None -> () })
@@ -5469,7 +5653,7 @@ fn finished(p: Pool, cfg: Server) -> Unit / {net.send[link], net.close[link]} = 
 type Split = { head: String, tail: String }
 
 // Around the first `sep`; the URL grammar needs no regular expressions.
-fn split_at(text: String, sep: String) -> Option<Split> =
+fn split_at(text: String, sep: String) -> Option<Split> / {abort.raise} =
   match bytes_index_of(bytes_of_string(text), bytes_of_string(sep)) {
     None -> None,
     Some(i) -> {
@@ -5484,7 +5668,7 @@ fn split_at(text: String, sep: String) -> Option<Split> =
 
 // Around the last `sep`, which is what separates the userinfo from the host: a password may
 // hold an `@`.
-fn rsplit_at(text: String, sep: String) -> Option<Split> = {
+fn rsplit_at(text: String, sep: String) -> Option<Split> / {abort.raise} = {
   let whole = bytes_of_string(text);
   let needle = bytes_of_string(sep);
   let last = fold(range(0, bytes_len(whole)), 0 - 1, |acc: Int, i: Int|
@@ -5500,14 +5684,14 @@ fn rsplit_at(text: String, sep: String) -> Option<Split> = {
 }
 
 // `%XX` as the byte it names; anything else is itself, so a password may hold a `:` or an `@`.
-fn unpercent(text: String) -> Result<String, String> =
+fn unpercent(text: String) -> Result<String, String> / {abort.raise} =
   match unpercent_from(bytes_of_string(text), 0, b"") {
     Err(why) -> Err(why),
     Ok(bytes) -> if bytes_is_utf8(bytes) { Ok(string_of_bytes(bytes)) }
     else { Err("a `%` escape in the URL is not UTF-8") },
   }
 
-fn unpercent_from(whole: Bytes, at: Int, acc: Bytes) -> Result<Bytes, String> =
+fn unpercent_from(whole: Bytes, at: Int, acc: Bytes) -> Result<Bytes, String> / {abort.raise} =
   if at >= bytes_len(whole) { Ok(acc) } else if bytes_at(whole, at) == 37 {
     if at + 2 >= bytes_len(whole) || !is_hex(bytes_at(whole, at + 1))
         || !is_hex(bytes_at(whole, at + 2)) {
@@ -5531,7 +5715,7 @@ fn url_refusal(url: String) -> String =
     "this is libpq's keyword/value form; the URI form is `postgres://user@host:5432/database`"
   } else { "a connection string begins `postgres://`, as in `postgres://user@host:5432/database`" }
 
-pub fn server_of(url: String) -> Result<Server, String> =
+pub fn server_of(url: String) -> Result<Server, String> / {abort.raise} =
   match split_at(url, "://") {
     None -> Err(url_refusal(url)),
     Some(scheme) -> if scheme.head != "postgres" && scheme.head != "postgresql" {
@@ -5544,7 +5728,7 @@ pub fn server_of(url: String) -> Result<Server, String> =
 
 type Credentials = { user: String, password: Option<String> }
 
-fn credentials_of(userinfo: String) -> Result<Credentials, String> =
+fn credentials_of(userinfo: String) -> Result<Credentials, String> / {abort.raise} =
   match split_at(userinfo, ":") {
     None -> match unpercent(userinfo) {
       Err(why) -> Err(why),
@@ -5565,7 +5749,7 @@ fn checked_user(user: String, password: Option<String>) -> Result<Credentials, S
 
 type HostPort = { host: String, port: Int }
 
-fn hostport_of(text: String) -> Result<HostPort, String> =
+fn hostport_of(text: String) -> Result<HostPort, String> / {abort.raise} =
   match rsplit_at(text, ":") {
     None -> checked_host(text, 5432),
     Some(s) -> match natural_of(s.tail) {
@@ -5576,7 +5760,7 @@ fn hostport_of(text: String) -> Result<HostPort, String> =
   }
 
 // A decimal number, and nothing that merely begins with one.
-fn natural_of(text: String) -> Option<Int> =
+fn natural_of(text: String) -> Option<Int> / {abort.raise} =
   if string_len(text) == 0 { None } else {
     let value = nat_of_text(text);
     if string_len(int_to_string(value)) == string_len(text) { Some(value) } else { None }
@@ -5588,7 +5772,7 @@ fn checked_host(host: String, port: Int) -> Result<HostPort, String> =
 
 type Database = { name: String, query: String }
 
-fn database_of(path_and_query: String) -> Result<Database, String> = {
+fn database_of(path_and_query: String) -> Result<Database, String> / {abort.raise} = {
   let split = match split_at(path_and_query, "?") {
     Some(s) -> s,
     None -> { head: path_and_query, tail: "" },
@@ -5600,7 +5784,7 @@ fn database_of(path_and_query: String) -> Result<Database, String> = {
   }
 }
 
-fn server_parts(rest: String) -> Result<Server, String> = {
+fn server_parts(rest: String) -> Result<Server, String> / {abort.raise} = {
   let split = match split_at(rest, "/") { Some(s) -> s, None -> { head: rest, tail: "" } };
   match rsplit_at(split.head, "@") {
     None ->
@@ -5623,7 +5807,7 @@ fn server_parts(rest: String) -> Result<Server, String> = {
 
 // `sslmode` is read and nothing more: TLS to postgres is not wired up. Every other parameter is a
 // setting the server is told at start-up, under the name postgres gives it.
-fn with_query(query: String, s: Server) -> Result<Server, String> =
+fn with_query(query: String, s: Server) -> Result<Server, String> / {abort.raise} =
   if string_len(query) == 0 { Ok(s) } else {
     fold(string_split(query, "&"), Ok(s), |acc: Result<Server, String>, pair: String|
       match acc {
@@ -5638,7 +5822,7 @@ fn with_query(query: String, s: Server) -> Result<Server, String> =
       })
   }
 
-fn with_setting(s: Server, key: String, value: String) -> Result<Server, String> =
+fn with_setting(s: Server, key: String, value: String) -> Result<Server, String> / {abort.raise} =
   if key == "sslmode" {
     if value == "disable" || value == "prefer" { Ok(s) } else {
       Err(
@@ -5670,7 +5854,7 @@ fn once<a>(given: Option<a>, key: String, set: Server) -> Result<Server, String>
   match given { Some(_) -> Err("`" ++ key ++ "` is given twice"), None -> Ok(set) }
 
 // Postgres reads a timeout written without a unit as milliseconds, and `0` as none at all.
-fn millis_of(key: String, text: String) -> Result<Int, String> =
+fn millis_of(key: String, text: String) -> Result<Int, String> / {abort.raise} =
   match natural_of(text) {
     None -> Err("`" ++ key ++ "=" ++ text ++ "`: a timeout is a whole number of milliseconds"),
     Some(ms) -> if ms > most_millis() {
@@ -5690,7 +5874,7 @@ pub fn with_server<a | e>(
   url: String,
   size: Int,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> Result<a, String> / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
+) -> Result<a, String> / {abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
   match server_of(url) { Err(why) -> Err(why), Ok(cfg) -> Ok(serve(cfg, size, nonce(), body)) }
 
 // --- Tests ------------------------------------------------------------------
@@ -5804,14 +5988,15 @@ fn refused<a>(r: Result<List<a>, DbError>) -> Bool = match r { Err(_) -> true, O
 // statements, the same tables, and the same refusals. A reader that accepts one of these is a
 // footprint that under-reports, which is the one failure that corrupts scheduling silently.
 
-fn scan_ok(sql: String) -> SqlScan =
+fn scan_ok(sql: String) -> SqlScan / {abort.raise} =
   match scan_statement(sql) { Err(e) -> panic(e.detail), Ok(s) -> s }
 
-fn scan_names(sql: String) -> List<String> = scan_table_names(scan_ok(sql).tables)
+fn scan_names(sql: String) -> List<String> / {abort.raise} = scan_table_names(scan_ok(sql).tables)
 
-fn scan_refused(sql: String) -> Bool = match scan_statement(sql) { Err(_) -> true, Ok(_) -> false }
+fn scan_refused(sql: String) -> Bool / {abort.raise} =
+  match scan_statement(sql) { Err(_) -> true, Ok(_) -> false }
 
-fn scan_refused_at(sql: String, byte: Int) -> Bool =
+fn scan_refused_at(sql: String, byte: Int) -> Bool / {abort.raise} =
   match scan_statement(sql) {
     Err(e) -> string_contains(e.detail, "byte " ++ int_to_string(byte)),
     Ok(_) -> false,
@@ -6197,7 +6382,7 @@ test "what a connection string cannot mean is refused rather than guessed" {
   assert_err("postgres://ply@db/app?sslmode", "key=value")
 }
 
-fn assert_err(url: String, wanted: String) -> Unit =
+fn assert_err(url: String, wanted: String) -> Unit / {abort.raise} =
   match server_of(url) {
     Ok(_) -> panic("`" ++ url ++ "` was accepted"),
     Err(why) ->
@@ -6259,19 +6444,19 @@ type Fed = { wire: Wire, refusals: List<Refusal> }
 
 type Scripted<a> = { value: a, wires: List<Wire> }
 
-fn t_frame(kind: Int, body: Bytes) -> Bytes =
+fn t_frame(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
   bytes_concat_all([byte_of_int(kind), u32_be(bytes_len(body) + 4), body])
 
 fn t_text(s: String) -> Bytes = bytes_concat(bytes_of_string(s), b"\x00")
 
-fn t_ready(status: Int) -> Bytes = t_frame(90, byte_of_int(status))
+fn t_ready(status: Int) -> Bytes / {abort.raise} = t_frame(90, byte_of_int(status))
 
-fn t_done(tag: String) -> Bytes = t_frame(67, t_text(tag))
+fn t_done(tag: String) -> Bytes / {abort.raise} = t_frame(67, t_text(tag))
 
 fn t_field(code: String, text: String) -> Bytes =
   if text == "" { b"" } else { bytes_concat(bytes_of_string(code), t_text(text)) }
 
-fn t_error(severity: String, r: Refusal) -> Bytes =
+fn t_error(severity: String, r: Refusal) -> Bytes / {abort.raise} =
   t_frame(
     69,
     bytes_concat_all([
@@ -6293,7 +6478,7 @@ fn t_aborted() -> Refusal =
     "",
   )
 
-fn t_greeted() -> Wire =
+fn t_greeted() -> Wire / {abort.raise} =
   {
     inbox: b"",
     outbox: bytes_concat(t_frame(82, u32_be(0)), t_ready(73)),
@@ -6306,18 +6491,19 @@ fn t_greeted() -> Wire =
 
 type Said = { bytes: Bytes, status: Int }
 
-fn t_tagged(tag: String, status: Int) -> Said = { bytes: t_done(tag), status: status }
+fn t_tagged(tag: String, status: Int) -> Said / {abort.raise} =
+  { bytes: t_done(tag), status: status }
 
-fn t_in_failed() -> Said = { bytes: t_error("ERROR", t_aborted()), status: 69 }
+fn t_in_failed() -> Said / {abort.raise} = { bytes: t_error("ERROR", t_aborted()), status: 69 }
 
 // Rolling back to a savepoint un-aborts the transaction, and the release that follows closes it.
-fn t_rolled_back_to() -> Said =
+fn t_rolled_back_to() -> Said / {abort.raise} =
   { bytes: bytes_concat(t_done("ROLLBACK"), t_done("RELEASE")), status: 84 }
 
-fn t_answer(sql: String, status: Int, extended: Bool) -> Said =
+fn t_answer(sql: String, status: Int, extended: Bool) -> Said / {abort.raise} =
   if extended { t_extended(sql, status) } else { t_simple(sql, status) }
 
-fn t_extended(sql: String, status: Int) -> Said =
+fn t_extended(sql: String, status: Int) -> Said / {abort.raise} =
   if status == 69 { t_in_failed() } else {
     {
       bytes: bytes_concat_all([
@@ -6330,7 +6516,7 @@ fn t_extended(sql: String, status: Int) -> Said =
     }
   }
 
-fn t_simple(sql: String, status: Int) -> Said =
+fn t_simple(sql: String, status: Int) -> Said / {abort.raise} =
   if string_starts_with(sql, "begin") { t_tagged("BEGIN", 84) }
   else if sql == "commit" { t_tagged(if status == 69 { "ROLLBACK" } else { "COMMIT" }, 73) }
   else if sql == "rollback" { t_tagged("ROLLBACK", 73) }
@@ -6358,7 +6544,12 @@ fn t_pick(refusals: List<Refusal>, sql: String) -> Picked =
       Some(_) -> { ..acc, rest: push(acc.rest, r) },
     })
 
-fn t_statement(w: Wire, refusals: List<Refusal>, sql: String, extended: Bool) -> Fed = {
+fn t_statement(
+  w: Wire,
+  refusals: List<Refusal>,
+  sql: String,
+  extended: Bool,
+) -> Fed / {abort.raise} = {
   let heard = { ..w, said: push(w.said, sql) };
   let picked = t_pick(refusals, sql);
   match picked.found {
@@ -6392,11 +6583,11 @@ fn t_statement(w: Wire, refusals: List<Refusal>, sql: String, extended: Bool) ->
   }
 }
 
-fn t_cstring(b: Bytes, at: Int) -> String =
+fn t_cstring(b: Bytes, at: Int) -> String / {abort.raise} =
   match pg::read_cstring(b, at) { Some(c) -> c.text, None -> "" }
 
 // A `Query` or a `Parse` while a reply is unread is a second conversation on the connection.
-fn t_message(w: Wire, refusals: List<Refusal>, kind: Int, body: Bytes) -> Fed =
+fn t_message(w: Wire, refusals: List<Refusal>, kind: Int, body: Bytes) -> Fed / {abort.raise} =
   if (kind == 81 || kind == 80) && bytes_len(w.outbox) > 0 {
     panic("a connection was sent a statement before its last one was answered")
   } else if kind == 81 { t_statement(w, refusals, t_cstring(body, 0), false) } else if kind == 80 {
@@ -6410,7 +6601,7 @@ fn t_message(w: Wire, refusals: List<Refusal>, kind: Int, body: Bytes) -> Fed =
   else { { wire: w, refusals: refusals } }
 
 // Every whole message in the inbox; the start-up message has no kind byte.
-fn t_feed(w: Wire, refusals: List<Refusal>) -> Fed =
+fn t_feed(w: Wire, refusals: List<Refusal>) -> Fed / {abort.raise} =
   if !w.started {
     match u32_be_at(w.inbox, 0) {
       None -> { wire: w, refusals: refusals },
@@ -6433,7 +6624,7 @@ fn t_feed(w: Wire, refusals: List<Refusal>) -> Fed =
     }
   }
 
-fn t_sent(f: Fake, c: Int, payload: Bytes) -> Fake =
+fn t_sent(f: Fake, c: Int, payload: Bytes) -> Fake / {abort.raise} =
   match list_at(f.wires, c) {
     None -> panic("a send on a connection the script never opened"),
     Some(w) -> if !w.open { f } else {
@@ -6444,7 +6635,7 @@ fn t_sent(f: Fake, c: Int, payload: Bytes) -> Fake =
 
 type Heard = { fake: Fake, bytes: Bytes }
 
-fn t_read(f: Fake, c: Int) -> Heard =
+fn t_read(f: Fake, c: Int) -> Heard / {abort.raise} =
   match list_at(f.wires, c) {
     None -> panic("a read on a connection the script never opened"),
     Some(w) -> if bytes_len(w.outbox) > 0 {
@@ -6453,7 +6644,7 @@ fn t_read(f: Fake, c: Int) -> Heard =
     else { { fake: f, bytes: b"" } },
   }
 
-fn t_closed(f: Fake, c: Int) -> Fake =
+fn t_closed(f: Fake, c: Int) -> Fake / {abort.raise} =
   match list_at(f.wires, c) {
     None -> f,
     Some(w) -> { ..f, wires: list_set(f.wires, c, { ..w, open: false }) },
@@ -6465,7 +6656,7 @@ fn over_script<a | e>(
   size: Int,
   refusals: List<Refusal>,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> Scripted<a> / {task.yield | e} =
+) -> Scripted<a> / {abort.raise, task.yield | e} =
   with_cell[wire]({ wires: [], refusals: refusals }) { fake -> {
     let value = handle {
       serve(server("db", 5432, "ply", "ply", None), size, "t", body)
@@ -6771,8 +6962,8 @@ test "a connection lost inside a transaction fails the rest of it, and nothing o
 
 // A store of `id * 10` for every id, answering each ask alone, counting what it was asked.
 fn tens<a>(
-  go: () -> a / {db.query[items], db.batch[items]},
-) -> { value: a, queries: Int, batches: Int } =
+  go: () -> a / {db.query[items], db.batch[items], abort.raise},
+) -> { value: a, queries: Int, batches: Int } / {abort.raise} =
   with_cell[asked]({ queries: 0, batches: 0 }) { counts -> {
     let row = |ps: List<Param>|
       match ps {

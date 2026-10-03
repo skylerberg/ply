@@ -203,7 +203,7 @@ fn each_root_reads_the_purity_the_compiler_published() {
 }
 
 const WIDTHS: &str = "fn low_bit(b: U8) -> Int requires int_of_u8(b) < 200 ensures result < 2 = int_of_u8(b & 1u8)\n\
-fn narrow(n: Int) -> U8 requires n >= 0 ensures int_of_u8(result) == n = u8_of_int(n)\n\
+fn narrow(n: Int) -> U8 / {abort.raise} requires n >= 0 ensures int_of_u8(result) == n = u8_of_int(n)\n\
 fn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\n\
 law \"low\" forall (b: U8) where int_of_u8(b) > 0 { low_bit(b) < 2 }\n\
 law \"grows\" forall (x: Int) where x > 0 { inc(x) > x }\n";

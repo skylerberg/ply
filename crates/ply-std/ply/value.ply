@@ -86,10 +86,10 @@ fn rendered(v: Value, depth: Int, bounded: Bool) -> String =
 // A constructor shows by the name its module declares it under, as source writes it there: where
 // the module stands is no part of the value.
 fn simple(name: String) -> String =
-  match list_at(string_split(name, "."), len(string_split(name, ".")) - 1) {
-    Some(last) -> last,
-    None -> name,
-  }
+  string_of_chars(
+    fold(string_chars(name), [], |acc: List<Char>, c: Char|
+      if c == '.' { [] } else { push(acc, c) }),
+  )
 
 fn elided(n: Int) -> String = if n == 0 { "…" } else { "… " ++ int_to_string(n) ++ " more" }
 
@@ -165,12 +165,12 @@ fn table_text(entries: List<Entry>, default: Value) -> String =
 // --- Slots ------------------------------------------------------------------
 
 // A runtime diagnostic's text stands `values[i]` in as `\x01`, `i` in decimal, `\x02`.
-fn opener() -> String = string_of_bytes(b"\x01")
+fn opener() -> String / {abort.raise} = string_of_bytes(b"\x01")
 
-fn closer() -> String = string_of_bytes(b"\x02")
+fn closer() -> String / {abort.raise} = string_of_bytes(b"\x02")
 
 // `text` with each slot replaced by its value, rendered.
-pub fn filled(text: String, values: List<Value>) -> String =
+pub fn filled(text: String, values: List<Value>) -> String / {abort.raise} =
   match string_split(text, opener()) {
     [head, ..pieces] ->
       fold(pieces, head, |acc: String, piece: String| acc ++ slot_piece(piece, values)),
@@ -178,7 +178,7 @@ pub fn filled(text: String, values: List<Value>) -> String =
   }
 
 // A slot naming no value is kept as it came.
-fn slot_piece(piece: String, values: List<Value>) -> String =
+fn slot_piece(piece: String, values: List<Value>) -> String / {abort.raise} =
   match string_split(piece, closer()) {
     [index, ..rest] -> match slot_value(index, values) {
       Some(v) -> render(v) ++ joined(rest, closer()),
@@ -187,7 +187,7 @@ fn slot_piece(piece: String, values: List<Value>) -> String =
     [] -> opener() ++ piece,
   }
 
-fn slot_value(index: String, values: List<Value>) -> Option<Value> = {
+fn slot_value(index: String, values: List<Value>) -> Option<Value> / {abort.raise} = {
   let digits = bytes_of_string(index);
   if bytes_len(digits) == 0 || bytes_len(digits) > 9
       || !fold(range(0, bytes_len(digits)), true, |ok: Bool, i: Int|
@@ -347,57 +347,46 @@ fn inserted(sorted: List<Entry>, e: Entry) -> List<Entry> = {
 
 // --- Text -------------------------------------------------------------------
 
-fn escaped(s: String) -> String =
-  string_of_bytes(
-    escape_each(bytes_of_string(s), |c: Int|
-      if c == 10 { Some(b"\\n") }
-      else if c == 9 { Some(b"\\t") }
-      else if c == 13 { Some(b"\\r") }
-      else if c == 0 { Some(b"\\0") }
-      else if c == 92 { Some(b"\\\\") }
-      else if c == 34 { Some(b"\\\"") }
-      else { None }),
-  )
+fn escaped(s: String) -> String = string_of_chars(escaped_chars(string_chars(s), '"'))
 
 // As a character literal is written: a quote of its own kind is the one escaped.
-fn char_escaped(c: Char) -> String =
-  string_of_bytes(
-    escape_each(bytes_of_string(string_of_chars([c])), |b: Int|
-      if b == 10 { Some(b"\\n") }
-      else if b == 9 { Some(b"\\t") }
-      else if b == 13 { Some(b"\\r") }
-      else if b == 0 { Some(b"\\0") }
-      else if b == 92 { Some(b"\\\\") }
-      else if b == 39 { Some(b"\\'") }
-      else { None }),
-  )
+fn char_escaped(c: Char) -> String = string_of_chars(escaped_chars([c], '\''))
 
-// Only ASCII is replaced, so UTF-8 stays whole.
-fn escape_each(b: Bytes, swap: (Int) -> Option<Bytes>) -> Bytes =
-  bytes_concat_all(
-    map(range(0, bytes_len(b)), |i: Int|
-      match swap(bytes_at(b, i)) { Some(r) -> r, None -> bytes_slice(b, i, i + 1) }),
-  )
+fn escaped_chars(cs: List<Char>, quote: Char) -> List<Char> =
+  fold(cs, [], |acc: List<Char>, c: Char|
+    if c == '\n' { push(push(acc, '\\'), 'n') }
+    else if c == '\t' { push(push(acc, '\\'), 't') }
+    else if c == '\r' { push(push(acc, '\\'), 'r') }
+    else if c == '\0' { push(push(acc, '\\'), '0') }
+    else if c == '\\' || c == quote { push(push(acc, '\\'), c) }
+    else { push(acc, c) })
 
 fn bytes_text(b: Bytes, bounded: Bool) -> String = {
   let n = bytes_len(b);
   let cut = bounded && n > shown_items();
-  let head = if cut { bytes_slice(b, 0, shown_items()) } else { b };
-  let body = escape_each(head, |c: Int|
-    if c == 10 { Some(b"\\n") }
-    else if c == 9 { Some(b"\\t") }
-    else if c == 13 { Some(b"\\r") }
-    else if c == 92 { Some(b"\\\\") }
-    else if c == 34 { Some(b"\\\"") }
-    else if c >= 32 && c <= 126 { None }
-    else { Some(bytes_concat(b"\\x", hex2(c))) });
+  let shown = if cut { shown_items() } else { n };
+  // Every index read is below the length, so the clause never answers.
+  let body = handle {
+    fold(range(0, shown), [], |acc: List<Char>, i: Int| byte_chars(acc, bytes_at(b, i)))
+  } with {
+    abort.raise(_) -> [],
+  };
   let more = if cut { " " ++ elided(n - shown_items()) } else { "" };
-  "b\"" ++ string_of_bytes(body) ++ "\"" ++ more
+  "b\"" ++ string_of_chars(body) ++ "\"" ++ more
 }
 
-fn hex2(c: Int) -> Bytes = bytes_concat(hex_digit(c / 16), hex_digit(c % 16))
+// A byte as a bytes literal writes it: printable ASCII as itself, any other byte in hex.
+fn byte_chars(acc: List<Char>, c: Int) -> List<Char> =
+  if c == 10 { push(push(acc, '\\'), 'n') }
+  else if c == 9 { push(push(acc, '\\'), 't') }
+  else if c == 13 { push(push(acc, '\\'), 'r') }
+  else if c == 92 { push(push(acc, '\\'), '\\') }
+  else if c == 34 { push(push(acc, '\\'), '"') }
+  else if c >= 32 && c <= 126 { match char_of_int(c) { Some(ch) -> push(acc, ch), None -> acc } }
+  else { push(push(push(push(acc, '\\'), 'x'), hex_digit(c / 16)), hex_digit(c % 16)) }
 
-fn hex_digit(d: Int) -> Bytes = bytes_slice(b"0123456789abcdef", d, d + 1)
+fn hex_digit(d: Int) -> Char =
+  match list_at(string_chars("0123456789abcdef"), d) { Some(c) -> c, None -> '0' }
 
 // --- Tests ------------------------------------------------------------------
 

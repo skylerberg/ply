@@ -90,7 +90,7 @@ type Pair = { x: Int, y: Int }
 
 fn spin(p: Pair) -> Pair = { let a = p.x; let b = p.y; {x: b + 1, y: a} }
 
-fn spun(n: Int) -> Int = { let p = iterate({x: n, y: 0}, 100, |q: Pair| if q.x > 40 { Stop(q) } else { Continue(spin(q)) }); p.x * 100 + p.y }
+fn spun(n: Int) -> Int / {abort.raise} = { let p = iterate({x: n, y: 0}, 100, |q: Pair| if q.x > 40 { Stop(q) } else { Continue(spin(q)) }); p.x * 100 + p.y }
 
 fn shared(n: Int) -> Int = { let p = {x: n, y: 1}; let q = spin(p); p.x * 1000 + q.x * 10 + q.y }
 
@@ -116,11 +116,11 @@ fn indexed(n: Int) -> Int = { let xs = map(range(0, n), |x: Int| x + 1); match l
 
 fn indexed_past(n: Int) -> Int = match list_at(map(range(0, n), |x: Int| x + 1), n + 5) { Some(_) -> 1, None -> 0 - 1 }
 
-fn replaced(n: Int) -> Int = { let xs = map(range(0, n), |x: Int| x + 1); match list_at(list_set(xs, 2, 100), 2) { Some(v) -> v, None -> 0 - 1 } }
+fn replaced(n: Int) -> Int / {abort.raise} = { let xs = map(range(0, n), |x: Int| x + 1); match list_at(list_set(xs, 2, 100), 2) { Some(v) -> v, None -> 0 - 1 } }
 
-fn replaced_beside(n: Int) -> Int = { let xs = map(range(0, n), |x: Int| x + 1); let ys = list_set(xs, 2, 100); fold(ys, 0, |acc: Int, x: Int| acc + x) + (match list_at(xs, 2) { Some(v) -> v * 1000, None -> 0 - 1 }) }
+fn replaced_beside(n: Int) -> Int / {abort.raise} = { let xs = map(range(0, n), |x: Int| x + 1); let ys = list_set(xs, 2, 100); fold(ys, 0, |acc: Int, x: Int| acc + x) + (match list_at(xs, 2) { Some(v) -> v * 1000, None -> 0 - 1 }) }
 
-fn replaced_at(n: Int, i: Int) -> Int = len(list_set(map(range(0, n), |x: Int| x + 1), i, 0))
+fn replaced_at(n: Int, i: Int) -> Int / {abort.raise} = len(list_set(map(range(0, n), |x: Int| x + 1), i, 0))
 
 fn ordered(a: Int, b: Int) -> Int = match compare(a, b) { Less -> 0 - 1, Equal -> 0, Greater -> 1 }
 
@@ -152,15 +152,15 @@ fn read_by_step(acc: Pair, i: Int) -> Int = acc.x + i
 
 fn lent_to_a_step(n: Int) -> Int = { let p = {x: n, y: 0}; fold(range(0, 3), 0, |acc: Int, i: Int| acc + read_by_step(p, i)) + p.y }
 
-fn filled(n: Int) -> Int = { let a = fold(range(0, n), array_new(n, 0), |acc: Array<Int>, i: Int| array_set(acc, i, i * i)); fold(range(0, n), 0, |s: Int, i: Int| s + array_get(a, i)) }
+fn filled(n: Int) -> Int / {abort.raise} = { let a = fold(range(0, n), array_new(n, 0), |acc: Array<Int>, i: Int| array_set(acc, i, i * i)); fold(range(0, n), 0, |s: Int, i: Int| s + array_get(a, i)) }
 
-fn set_beside(n: Int) -> Int = { let a = array_new(n, 1); let b = array_set(a, 0, 100); array_get(a, 0) * 1000 + array_get(b, 0) }
+fn set_beside(n: Int) -> Int / {abort.raise} = { let a = array_new(n, 1); let b = array_set(a, 0, 100); array_get(a, 0) * 1000 + array_get(b, 0) }
 
 fn arrayed_at(n: Int, i: Int) -> Int = match array_at(array_of_list(range(0, n)), i) { Some(v) -> v * 10, None -> 0 - 1 }
 
-fn got(a: Array<Int>, i: Int) -> Int = array_get(a, i)
+fn got(a: Array<Int>, i: Int) -> Int / {abort.raise} = array_get(a, i)
 
-fn got_at(n: Int, i: Int) -> Int = got(array_new(n, 7), i)
+fn got_at(n: Int, i: Int) -> Int / {abort.raise} = got(array_new(n, 7), i)
 
 fn counted_in(a: Array<Int>) -> Int = array_len(a)
 
@@ -190,9 +190,9 @@ fn scaled_sum(n: Int, k: Int) -> Int = fold(map(range(0, n), |x| x * k), 0, |a, 
 
 fn even_count(n: Int) -> Int = len(filter(range(0, n), |x| x % 2 == 0))
 
-fn countdown(n: Int) -> Int = iterate(n, 1000, |s| if s <= 0 { Stop(s) } else { Continue(s - 1) })
+fn countdown(n: Int) -> Int / {abort.raise} = iterate(n, 1000, |s| if s <= 0 { Stop(s) } else { Continue(s - 1) })
 
-fn stuck(n: Int) -> Int = iterate(n, 3, |s| Continue(s + 1))
+fn stuck(n: Int) -> Int / {abort.raise} = iterate(n, 3, |s| Continue(s + 1))
 
 fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))
 
@@ -228,7 +228,7 @@ fn bump(a: Acc, x: Int) -> Acc = {..a, total: a.total + x, count: a.count + 1}
 
 fn totals(n: Int) -> Int = { let a = fold(range(0, n), {total: 0, count: 0}, bump); a.total + a.count }
 
-fn walked(n: Int, k: Int) -> Int = iterate({total: 0, count: 0}, n + 1, |a: Acc| if a.count >= n { Stop(a.total) } else { Continue({..a, total: a.total + k, count: a.count + 1}) })
+fn walked(n: Int, k: Int) -> Int / {abort.raise} = iterate({total: 0, count: 0}, n + 1, |a: Acc| if a.count >= n { Stop(a.total) } else { Continue({..a, total: a.total + k, count: a.count + 1}) })
 
 fn huge(n: Int) -> Int = fold(range(0, 20000000 + n), 0, add)
 
@@ -628,11 +628,11 @@ fn updated_by_decimal(n: Int) -> Int = {
   match map_get(m, k) { Some(v) -> v, None -> 0 - 1 }
 }
 
-fn space_from(b: Bytes, from: Int) -> Int = match bytes_position(b, from, space) { Some(i) -> i, None -> 0 - 1 }
+fn space_from(b: Bytes, from: Int) -> Int / {abort.raise} = match bytes_position(b, from, space) { Some(i) -> i, None -> 0 - 1 }
 
-fn position_by(f: (Bytes, Int, (Int) -> Bool) -> Option<Int>, b: Bytes) -> Int = match f(b, 0, space) { Some(i) -> i, None -> 0 - 1 }
+fn position_by(f: (Bytes, Int, (Int) -> Bool) -> Option<Int> / {abort.raise}, b: Bytes) -> Int / {abort.raise} = match f(b, 0, space) { Some(i) -> i, None -> 0 - 1 }
 
-fn spaced(b: Bytes) -> Int = position_by(bytes_position, b)
+fn spaced(b: Bytes) -> Int / {abort.raise} = position_by(bytes_position, b)
 
 fn mapped(n: Int) -> Int = { let by = |f: (List<Int>, (Int) -> Int) -> List<Int>| f(range(0, n), inc); fold(by(map), 0, add) }
 
@@ -640,7 +640,7 @@ fn kept(n: Int) -> Int = { let by = |f: (List<Int>, (Int) -> Bool) -> List<Int>|
 
 fn folded(n: Int) -> Int = { let by = |f: (List<Int>, Int, (Int, Int) -> Int) -> Int| f(range(0, n), 0, add); by(fold) }
 
-fn iterated(n: Int) -> Int = { let by = |f: (Int, Int, (Int) -> Iter<Int, Int>) -> Int| f(n, 1000, |s: Int| if s <= 0 { Stop(s - 100) } else { Continue(s - 1) }); by(iterate) }
+fn iterated(n: Int) -> Int / {abort.raise} = { let by = |f: (Int, Int, (Int) -> Iter<Int, Int>) -> Int / {abort.raise}| f(n, 1000, |s: Int| if s <= 0 { Stop(s - 100) } else { Continue(s - 1) }); by(iterate) }
 
 fn map_folded(n: Int) -> Int = { let by = |f: (Map<Int, Int>, Int, (Int, Int, Int) -> Int) -> Int| f(map_insert(map_insert(map_new(), 2, n), 1, 3), 0, |acc: Int, k: Int, v: Int| acc * 10 + k + v); by(map_fold) }
 

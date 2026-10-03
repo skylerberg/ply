@@ -953,14 +953,14 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Where two unequal values first part, and what each holds there.
 #[derive(Debug)]
 pub struct Difference {
-    pub path: Vec<Step>,
+    pub path: Vec<PathStep>,
     pub expected: Value,
     pub actual: Value,
 }
 
 /// One step into a value.
 #[derive(Debug)]
-pub enum Step {
+pub enum PathStep {
     Index(usize),
     Key(Value),
     Field(Symbol),
@@ -971,13 +971,13 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> 
     fn go(
         actual: &Value,
         expected: &Value,
-        path: &mut Vec<Step>,
+        path: &mut Vec<PathStep>,
         depth: usize,
     ) -> Option<Difference> {
         if depth >= MAX_VALUE_DEPTH {
             return None;
         }
-        let within = |step: Step, x: &Value, y: &Value, path: &mut Vec<Step>| {
+        let within = |step: PathStep, x: &Value, y: &Value, path: &mut Vec<PathStep>| {
             path.push(step);
             let found = go(x, y, path, depth + 1);
             if found.is_none() {
@@ -990,26 +990,26 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> 
                 a.iter()
                     .zip(e.iter())
                     .enumerate()
-                    .find_map(|(i, (x, y))| within(Step::Index(i), x, y, path))
+                    .find_map(|(i, (x, y))| within(PathStep::Index(i), x, y, path))
             }),
             (Value::Array(a), Value::Array(e)) if a.len() == e.len() => grow(|| {
                 a.iter()
                     .zip(e.iter())
                     .enumerate()
-                    .find_map(|(i, (x, y))| within(Step::Index(i), x, y, path))
+                    .find_map(|(i, (x, y))| within(PathStep::Index(i), x, y, path))
             }),
             // Only when key sets agree, so a differing shape reports the whole maps.
             (Value::Map(a), Value::Map(e)) if a.size() == e.size() && a.keys().eq(e.keys()) => {
                 grow(|| {
                     a.iter()
                         .zip(e.values())
-                        .find_map(|((k, x), y)| within(Step::Key(k.clone()), x, y, path))
+                        .find_map(|((k, x), y)| within(PathStep::Key(k.clone()), x, y, path))
                 })
             }
             (Value::Record(a), Value::Record(e)) if a.keys().eq(e.keys()) => grow(|| {
                 a.iter()
                     .zip(e.values())
-                    .find_map(|((k, x), y)| within(Step::Field(k.clone()), x, y, path))
+                    .find_map(|((k, x), y)| within(PathStep::Field(k.clone()), x, y, path))
             }),
             (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 })
                 if n1 == n2 && a1.len() == a2.len() =>
@@ -1018,7 +1018,7 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> 
                     a1.iter()
                         .zip(a2.iter())
                         .enumerate()
-                        .find_map(|(i, (x, y))| within(Step::Arg(n1.clone(), i), x, y, path))
+                        .find_map(|(i, (x, y))| within(PathStep::Arg(n1.clone(), i), x, y, path))
                 })
             }
             (a, e) => {

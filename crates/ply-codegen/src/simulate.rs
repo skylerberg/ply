@@ -4,7 +4,7 @@
 use crate::heap::{self, Word};
 use crate::rt::{
     Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_UNWIND, Frames, HandlerFrame, call_value,
-    drop_frame, inherit_frames, values_taken,
+    drop_frame, inherit_frames, raise_error, values_taken,
 };
 use crate::stack::{Stack, switch};
 use ply_eval::host::Pending;
@@ -58,7 +58,7 @@ enum Request {
     Join(TaskHandle),
     Await(TaskHandle),
     Cancel(TaskHandle),
-    Channel(i64),
+    Channel(usize),
     Send(ChanHandle, Value),
     Recv(ChanHandle),
     Close(ChanHandle),
@@ -315,7 +315,8 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
                 k
             }
             Resumption::Raise { k, failure } => {
-                c.fail(failure);
+                let message = failure.message.clone();
+                c.raise(failure, message);
                 k
             }
         };
@@ -390,7 +391,7 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
         }
         Request::Channel(capacity) => {
             let records = sim.sched.records_steps();
-            let applied = sim.sched.channel(k, capacity, site);
+            let applied = sim.sched.channel(k, capacity);
             if records {
                 c.record_access(channel_made());
             }
@@ -568,9 +569,13 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
         ("task", "channel") => {
             let capacity = c.value(args[0]);
             heap::dec(args[0]);
-            match capacity.as_int(c.site(), "`task.channel`") {
-                Ok(n) => Request::Channel(n),
+            let n = match capacity.as_int(c.site(), "`task.channel`") {
+                Ok(n) => n,
                 Err(d) => return c.fail(d),
+            };
+            match ply_eval::sched::capacity_of(n, c.site()) {
+                Ok(n) => Request::Channel(n),
+                Err(d) => return raise_error(c, d),
             }
         }
         ("task", "send") => {
@@ -607,7 +612,14 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
                 .note("a `simulate` region answers `task`, `clock` and `random`");
                 return c.fail(d);
             };
-            Request::Seeded(sig, values_taken(c, args))
+            let values = values_taken(c, args);
+            if let (("random", "below"), [Value::Int(bound)]) =
+                ((effect.as_str(), op.as_str()), values.as_slice())
+                && let Err(d) = ply_eval::sim::bound_of(*bound, c.site())
+            {
+                return raise_error(c, d);
+            }
+            Request::Seeded(sig, values)
         }
     };
     let sim = c.sims.last_mut().expect("a region is running");
