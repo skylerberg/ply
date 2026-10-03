@@ -18,8 +18,6 @@ mod code;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-const EVALUATOR: &[&str] = &["ply-eval", "ply-codegen"];
-
 /// What runs a test or a law. `ply-host` is not: every handler it serves is nondeterministic, so
 /// nothing a store keeps reached it, which `ply-host-tests` holds it to.
 const RUNTIME: &[&str] = &["ply-eval", "ply-codegen", "ply-machine"];
@@ -42,10 +40,6 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         repo.join("Cargo.lock").display()
-    );
-    println!(
-        "cargo:rustc-env=PLY_EVALUATOR_SOURCES={}",
-        digest(&repo, &crate_files(&repo, EVALUATOR), &[])
     );
     println!(
         "cargo:rustc-env=PLY_RUNTIME_SOURCES={}",
