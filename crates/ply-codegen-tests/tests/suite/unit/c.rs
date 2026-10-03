@@ -222,6 +222,77 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
 /// `PLY_C_CACHE`, `PLY_C_SKIP` and `cache::UNITS_REUSED` are process-wide: a test that changes or counts them takes this for writing, every other build for reading.
 pub(super) static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// What a unit says about itself reads back from its text as it was embedded, so whether it serves
+/// this runtime is known before anything is compiled.
+#[test]
+fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
+    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
+        "m".to_string(),
+        "pub type Shape = | Dot | Line(Int)\nfn double(x: Int) -> Int = x * 2\n\
+         fn named(s: Shape) -> Bytes = match s { Dot -> b\"dot\", Line(_) -> b\"a \\\"line\\\"?\" }\n"
+            .to_string(),
+    )])
+    .expect("the program checks");
+    let front: &'static ply_eval::Front = Box::leak(Box::new(answered.front));
+    let source: &'static ply_codegen::Source = Box::leak(Box::new(
+        ply_codegen::Source::from_front(front).with_texts(answered.modules.into_iter().collect()),
+    ));
+    let produced =
+        ply_codegen::c::produce(source, &["m.double", "m.named"]).expect("the unit emits");
+    let read = ply_codegen::c::Exports::from_text(&produced.text).expect("the table reads back");
+    assert_eq!(read.encode(), produced.exports.encode());
+    assert!(read.unserved().is_none());
+    // A table whose first helper this runtime does not have is one that does not serve.
+    let first = &produced.exports.helpers[0].name;
+    let head = produced
+        .text
+        .rfind("const char ply_exports[] =")
+        .expect("the unit embeds its table");
+    let (code, table) = produced.text.split_at(head);
+    let foreign = format!(
+        "{code}{}",
+        table.replacen(
+            &format!("\"{first} "),
+            &format!("\"{first}_from_elsewhere "),
+            1
+        )
+    );
+    let read = ply_codegen::c::Exports::from_text(&foreign).expect("the table still reads");
+    assert!(read.unserved().is_some());
+    assert!(ply_codegen::c::Exports::from_text("int main(void) { return 0; }").is_none());
+}
+
+/// A pre-flight loads the unit it decides the set from; the first backend on its thread takes that
+/// unit rather than mapping the object again, and a later one reads it back from the cache.
+#[test]
+fn the_first_backend_on_the_preflights_thread_takes_the_unit_it_loaded() {
+    use ply_eval::{Provider, Symbol, Value};
+    use std::sync::atomic::Ordering::Relaxed;
+    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
+        "m".to_string(),
+        "fn double(x: Int) -> Int = x * 2\n".to_string(),
+    )])
+    .expect("the program checks");
+    let front: &'static ply_eval::Front = Box::leak(Box::new(answered.front));
+    // Writing: `UNITS_REUSED` below counts every build in the process.
+    let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let unit = ply_codegen::Unit::over_front(front, answered.modules.into_iter().collect())
+        .expect("this host has a C compiler");
+    let reused = || ply_codegen::c::cache::UNITS_REUSED.load(Relaxed);
+    let before = reused();
+    let first = unit.attach();
+    assert_eq!(reused(), before, "the first backend loaded the unit again");
+    let second = unit.attach();
+    assert_eq!(reused(), before + 1, "a later backend reads the unit back");
+    assert_eq!(unit.compilation().units, 2);
+    for backend in [&first, &second] {
+        assert_eq!(
+            backend.enter(&Symbol::new("m.double"), &[Value::Int(21)], 10_000),
+            Some(Value::Int(42))
+        );
+    }
+}
+
 pub mod tests_support {
     use ply_codegen::c::Native;
     use ply_codegen::source::Source;

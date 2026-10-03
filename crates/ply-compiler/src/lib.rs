@@ -16,6 +16,9 @@ pub const TYPES: &str = include_str!("../ply/types.ply");
 
 pub const TYCORE: &str = include_str!("../ply/tycore.ply");
 
+/// Whether a recursive group's calls back into itself descend a measure.
+pub const TERMINATION: &str = include_str!("../ply/termination.ply");
+
 pub const RESOLVE: &str = include_str!("../ply/resolve.ply");
 
 /// Effect sets, the `?` operator, and the record update a checked program writes out.
@@ -78,6 +81,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("resolve", RESOLVE),
     ("rewrite", REWRITE),
     ("spine", SPINE),
+    ("termination", TERMINATION),
     ("tycore", TYCORE),
     ("types", TYPES),
     ("unit", UNIT),

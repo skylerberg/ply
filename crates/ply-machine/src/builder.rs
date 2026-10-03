@@ -13,6 +13,7 @@ use crate::load::{LoadError, Loaded};
 use crate::payload::{count, diags_value, option, places_value, record};
 use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity};
 use ply_eval::{DefHash, DefInfo, Diagnostic, Severity, Span, Symbol, Value as PlyValue, codes};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -256,7 +257,10 @@ impl Site {
             return answered(Err(unloaded()));
         };
         let built = aside(|| build(loaded, entry, startup));
-        answered(built.map(|built| made_value(&built, reaches)))
+        answered(built.map(|built| {
+            let reached = reaches.then(|| loaded.hashes.reaches_among(&built.reachable));
+            made_value(&built, reached.as_ref())
+        }))
     }
 }
 
@@ -295,7 +299,8 @@ fn build(loaded: &Loaded, entry: &str, startup: &[String]) -> Result<Built, Diag
     artifact::build(loaded, entry, &roots).map_err(first_of)
 }
 
-fn made_value(built: &Built, reaches: bool) -> PlyValue {
+/// `reached` is what each reachable definition reaches, when the caller asked for it.
+fn made_value(built: &Built, reached: Option<&BTreeMap<Symbol, BTreeSet<Symbol>>>) -> PlyValue {
     let artifact = &built.artifact;
     let sections: Vec<PlyValue> = artifact
         .sections()
@@ -308,23 +313,19 @@ fn made_value(built: &Built, reaches: bool) -> PlyValue {
             ])
         })
         .collect();
-    let reached: Vec<PlyValue> = if reaches {
-        built
-            .closure
-            .iter()
-            .map(|(name, to)| {
-                record(vec![
-                    ("name", PlyValue::str(name)),
-                    (
-                        "reaches",
-                        PlyValue::list(to.iter().map(PlyValue::str).collect()),
-                    ),
-                ])
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let reached: Vec<PlyValue> = reached
+        .into_iter()
+        .flatten()
+        .map(|(name, to)| {
+            record(vec![
+                ("name", PlyValue::str(name.as_str())),
+                (
+                    "reaches",
+                    PlyValue::list(to.iter().map(|n| PlyValue::str(n.as_str())).collect()),
+                ),
+            ])
+        })
+        .collect();
     record(vec![
         ("entry", PlyValue::str(built.entry_name.as_str())),
         ("entry_hash", PlyValue::str(artifact.entry.to_hex())),
