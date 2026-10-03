@@ -5,7 +5,7 @@ mod children;
 
 pub(crate) use children::{Children, Io, Output, Signal};
 
-use crate::pool::{Bell, Done, Exit, Inbox, PROCESS_FIRST_TOKEN, Pool};
+use crate::pool::{Bell, Finished, Inbox, JobOutput, PROCESS_FIRST_TOKEN, Pool};
 use children::{Child, Launch, Refusal, Unusable};
 use ply_eval::host::HostRegistry;
 use ply_eval::{
@@ -539,7 +539,7 @@ impl HostHandler for Operation {
                     "process-wait",
                     Op::Wait.what(),
                     Box::new(move || match child.wait(deadline) {
-                        Ok(exit) => Done::MaybeFinished(exit),
+                        Ok(exit) => JobOutput::MaybeFinished(exit),
                         Err(refusal) => refused(Op::Wait, handle, &child, refusal, span),
                     }),
                 )?;
@@ -560,7 +560,7 @@ impl HostHandler for Operation {
                     span,
                     "process-input",
                     Op::Input.what(),
-                    Box::new(move || Done::Bool(child.input(&bytes))),
+                    Box::new(move || JobOutput::Bool(child.input(&bytes))),
                 )?;
                 Ok(HostAnswer::Pending(pending))
             }
@@ -577,7 +577,7 @@ impl HostHandler for Operation {
                     "process-output-line",
                     Op::OutputLine.what(),
                     Box::new(move || match child.next_line(deadline) {
-                        Ok(heard) => Done::Heard(heard),
+                        Ok(heard) => JobOutput::Heard(heard),
                         Err(refusal) => refused(Op::OutputLine, handle, &child, refusal, span),
                     }),
                 )?;
@@ -711,31 +711,31 @@ fn deadline(ms: i64) -> Option<Instant> {
     Instant::now().checked_add(Duration::from_millis(ms))
 }
 
-fn refused(op: Op, handle: i64, child: &Child, refusal: Refusal, span: Span) -> Done {
+fn refused(op: Op, handle: i64, child: &Child, refusal: Refusal, span: Span) -> JobOutput {
     match refusal {
-        Refusal::Spent => Done::Refused(raced(op, handle, span)),
+        Refusal::Spent => JobOutput::Refused(raced(op, handle, span)),
         Refusal::TooMuch { out, err } => {
-            Done::Refused(too_much(op, child.program(), out, err, span))
+            JobOutput::Refused(too_much(op, child.program(), out, err, span))
         }
         Refusal::Unreaped(why) => {
-            Done::Failed(format!("child {handle}'s ending could not be read: {why}"))
+            JobOutput::Failed(format!("child {handle}'s ending could not be read: {why}"))
         }
     }
 }
 
 /// One line of this process's standard input, without its ending; `None` at end of input. Read in
 /// the pool, because a console waits for a person.
-fn read_line() -> Done {
+fn read_line() -> JobOutput {
     let mut text = String::new();
     match std::io::stdin().read_line(&mut text) {
-        Ok(0) => Done::MaybeString(None),
+        Ok(0) => JobOutput::MaybeString(None),
         Ok(_) => {
             while text.ends_with('\n') || text.ends_with('\r') {
                 text.pop();
             }
-            Done::MaybeString(Some(text))
+            JobOutput::MaybeString(Some(text))
         }
-        Err(e) => Done::Failed(format!("standard input could not be read: {e}")),
+        Err(e) => JobOutput::Failed(format!("standard input could not be read: {e}")),
     }
 }
 
@@ -759,15 +759,15 @@ fn run_to_end(
     dir: &str,
     env: &[(String, String)],
     span: Span,
-) -> Done {
+) -> JobOutput {
     match command(program, args, dir, env)
         .stdin(Stdio::null())
         .output()
     {
-        Err(e) => Done::Failed(format!("`{}` could not be started: {e}", program.display())),
+        Err(e) => JobOutput::Failed(format!("`{}` could not be started: {e}", program.display())),
         Ok(done) => {
             if done.stdout.len() > MAX_CAPTURE_BYTES || done.stderr.len() > MAX_CAPTURE_BYTES {
-                return Done::Refused(too_much(
+                return JobOutput::Refused(too_much(
                     Op::Spawn,
                     program,
                     done.stdout.len(),
@@ -775,7 +775,7 @@ fn run_to_end(
                     span,
                 ));
             }
-            Done::Finished(Exit {
+            JobOutput::Finished(Finished {
                 ended: children::ending(&done.status),
                 out: done.stdout,
                 err: done.stderr,

@@ -25,26 +25,26 @@ pub struct Executor<'a> {
 }
 
 impl<'a> Executor<'a> {
-    /// The tier this thread runs the unit on, attached once per thread: a test is a fresh machine
-    /// over it, never a fresh attachment.
-    fn tier(&self) -> Rc<dyn ply_eval::Compiled> {
+    /// The backend this thread runs the unit on, attached once per thread: a test is a fresh
+    /// machine over it, never a fresh attachment.
+    fn backend(&self) -> Rc<dyn ply_eval::Compiled> {
         thread_local! {
             static ATTACHED: std::cell::RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
                 const { std::cell::RefCell::new(Vec::new()) };
         }
         let key = std::ptr::from_ref(self.provider).cast::<()>() as usize;
         ATTACHED.with(|attached| {
-            if let Some((_, tier)) = attached.borrow().iter().find(|(k, _)| *k == key) {
-                return Rc::clone(tier);
+            if let Some((_, backend)) = attached.borrow().iter().find(|(k, _)| *k == key) {
+                return Rc::clone(backend);
             }
-            let tier = self.provider.attach();
-            attached.borrow_mut().push((key, Rc::clone(&tier)));
-            tier
+            let backend = self.provider.attach();
+            attached.borrow_mut().push((key, Rc::clone(&backend)));
+            backend
         })
     }
 
     fn machine(&self, index: usize) -> Result<ply_eval::Machine<'a>, Diagnostic> {
-        let mut machine = ply_eval::Machine::new(self.front, self.tier())?;
+        let mut machine = ply_eval::Machine::new(self.front, self.backend())?;
         if let Some(binding) = &self.hosting.binding {
             machine.set_host_binding(Arc::clone(binding));
         }

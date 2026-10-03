@@ -1,5 +1,5 @@
 //! Stacks the runtime owns, and the [`switch`] between them: a suspended computation in the
-//! compiled tier is a C stack, and nothing emitted knows which stack it is on.
+//! C backend is a C stack, and nothing emitted knows which stack it is on.
 
 use std::ptr;
 

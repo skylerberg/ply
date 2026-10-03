@@ -4,7 +4,7 @@
 use super::Refused;
 use super::exports::{Exports, Taken};
 use super::load::{Library, compile_and_load};
-use super::tables::{Unit, root_id};
+use super::tables::{UnitTables, root_id};
 use super::{HELPERS, helper_addresses};
 use crate::heap::{Heap, Word, mark_immortal};
 use crate::rt::Entry;
@@ -89,7 +89,7 @@ fn refused_of(exports: &Exports) -> Vec<Refused> {
 }
 
 /// A loaded object plus its `Exports`, made into an enterable `Native`; `source` places its sites.
-/// Invariant: every field of `Unit` must be recorded in `Exports`, or the ids move.
+/// Invariant: every field of `UnitTables` must be recorded in `Exports`, or the ids move.
 fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Native> {
     // Before binding: the C reads the first `n` helpers of the table it is handed.
     if let Some(why) = exports.unserved() {
@@ -111,7 +111,8 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     } = exports;
     bind(&lib)?;
     filled(&lib, &buckets)?;
-    let Some(unit) = Unit::from_tables(ctors.clone(), consts, fields, builtins, shapes, lambdas)
+    let Some(unit) =
+        UnitTables::from_tables(ctors.clone(), consts, fields, builtins, shapes, lambdas)
     else {
         bail!("a unit's shapes do not intern to the ids its C was emitted against");
     };
@@ -119,14 +120,14 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     let mut functions = Vec::with_capacity(unit.lambdas.len());
     for symbol in &unit.lambdas {
         let Some(p) = lib.symbol(symbol) else {
-            bail!("the unit the C tier built has no `{symbol}`");
+            bail!("the unit the C backend built has no `{symbol}`");
         };
         functions.push(p as usize);
     }
     let mut entries = HashMap::new();
     for t in &taken {
         let Some(p) = lib.symbol(&t.entry) else {
-            bail!("the unit the C tier built has no `{}`", t.entry);
+            bail!("the unit the C backend built has no `{}`", t.entry);
         };
         entries.insert(
             t.name.clone(),
@@ -170,7 +171,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
 fn constants_of(
     constants: &[String],
     taken: &[Taken],
-    unit: &Unit,
+    unit: &UnitTables,
 ) -> Result<HashMap<String, usize>> {
     let entries: HashMap<&str, &str> = taken
         .iter()
@@ -196,7 +197,7 @@ fn filled(lib: &Library, buckets: &[(u8, Vec<u32>)]) -> Result<()> {
     for (id, places) in buckets {
         let name = format!("ply_bk_{id:02x}");
         let Some(p) = lib.symbol(&name) else {
-            bail!("the unit the C tier built has no `{name}`");
+            bail!("the unit the C backend built has no `{name}`");
         };
         let table = p as *mut u32;
         for (j, place) in places.iter().enumerate() {
@@ -208,7 +209,7 @@ fn filled(lib: &Library, buckets: &[(u8, Vec<u32>)]) -> Result<()> {
 
 fn bind(lib: &Library) -> Result<()> {
     let Some(p) = lib.symbol("ply_bind") else {
-        bail!("the unit the C tier built has no `ply_bind`");
+        bail!("the unit the C backend built has no `ply_bind`");
     };
     let bind: unsafe extern "C" fn(*const *mut std::ffi::c_void) =
         unsafe { std::mem::transmute(p) };
@@ -216,7 +217,7 @@ fn bind(lib: &Library) -> Result<()> {
     debug_assert_eq!(addrs.len(), HELPERS.len());
     unsafe { bind(addrs.as_ptr()) };
     let Some(p) = lib.symbol("ply_bind_singletons") else {
-        bail!("the unit the C tier built has no `ply_bind_singletons`");
+        bail!("the unit the C backend built has no `ply_bind_singletons`");
     };
     let singletons: unsafe extern "C" fn(Word, Word, Word) = unsafe { std::mem::transmute(p) };
     unsafe {
@@ -229,7 +230,7 @@ fn bind(lib: &Library) -> Result<()> {
     Ok(())
 }
 
-fn tables_of(mut unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
+fn tables_of(mut unit: UnitTables, ctors: &[(Symbol, usize)]) -> Tables {
     unit.layouts.index_fields(&unit.fields);
     let mut immortals = Heap::persistent();
     let mut const_words = Vec::with_capacity(unit.consts.len());

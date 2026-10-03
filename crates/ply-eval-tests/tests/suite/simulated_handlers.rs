@@ -1,5 +1,5 @@
 use crate::fixture::port_check;
-use ply_eval::decode::At;
+use ply_eval::decode::AnswerValue;
 use ply_eval::{
     Answer, CheckOutput, EffectInfo, Handlers, SEEDED_OPS, SimTy, SourceId, Span, Symbol, TaskId,
     Value,
@@ -45,7 +45,7 @@ fn effect<'a>(check: &'a CheckOutput, simple: &str) -> &'a EffectInfo {
 }
 
 /// A declared operation's type as the compiler prints one: a constructor and its arguments.
-fn printed(t: At<'_>) -> String {
+fn printed(t: AnswerValue<'_>) -> String {
     let ty = t.ctor().expect("a type is a constructor of `types.Type`");
     assert_eq!(
         ty.name(),
@@ -76,7 +76,7 @@ fn declared() -> HashMap<String, (Vec<String>, String)> {
     let bytes = ply_machine::builds::answered(&files).expect("the builder answers");
     let front = ply_machine::runnable::front_value(&bytes).expect("the answer reads");
     let mut out = HashMap::new();
-    let effects = At::new("the answer", &front)
+    let effects = AnswerValue::new("the answer", &front)
         .field("dump")
         .and_then(|d| d.field("effects"))
         .and_then(|e| e.list())

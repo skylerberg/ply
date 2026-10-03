@@ -75,7 +75,7 @@ pub const ARTIFACT_VERSION: &str = "E0444";
 pub const SPAN_UNBALANCED: &str = "E0445";
 /// A value branded with a region's name would outlive the region.
 pub const REGION_ESCAPE: &str = "E0446";
-/// A definition the program reaches that the compiled tier cannot compile.
+/// A definition the program reaches that the C backend cannot compile.
 pub const DEFINITION_REFUSED: &str = "E0448";
 /// A cell, task or continuation crossing a runtime boundary, where no type is left to check it.
 pub const REGION_ESCAPE_AT_BOUNDARY: &str = "E0449";

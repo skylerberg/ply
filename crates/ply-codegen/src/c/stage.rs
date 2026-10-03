@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 /// The stage `identity` names. A stage is a product of what it was built from alone, so it lives
-/// beside the unit cache rather than under it: a run with a cache of its own still finds the stage
+/// beside the C cache rather than under it: a run with a cache of its own still finds the stage
 /// an earlier one wrote. `PLY_C_STAGE` names another root.
 pub fn stage_dir(identity: &str) -> PathBuf {
     stage_root().join(identity)

@@ -18,7 +18,7 @@ const STACK: usize = 256 << 20;
 pub struct Program {
     pub runnable: Runnable,
     pub shelf: Vec<(String, String)>,
-    /// The stage's identity: the shelf lands beside the unit cache under it.
+    /// The stage's identity: the shelf lands under it, beside the C cache.
     pub stage: String,
     pub version: String,
 }
