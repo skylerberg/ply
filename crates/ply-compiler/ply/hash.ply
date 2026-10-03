@@ -1527,6 +1527,10 @@ pub type HashOutput = {
   closure: List<{ name: Bytes, names: Names }>,
   bodies: List<{ name: Bytes, body: Bytes }>,
   test_bodies: List<Bytes>,
+  // What a definition's checked rows and proofs are filed under: its body and the contracts of what
+  // it reaches in other packages. A fixed definition's is its hash.
+  checks: List<{ name: Bytes, hash: Bytes }>,
+  spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
 }
 
 // `deps` and `closure` are lists the dump writes in order; the maps index them, or recording is quadratic.
@@ -1724,6 +1728,7 @@ type Forms = {
   own: List<{ name: Bytes, hash: Bytes }>,
   specs: List<{ name: Bytes, hashes: List<Bytes> }>,
   spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
+  spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
 }
 
 type Hashed = {
@@ -1738,6 +1743,8 @@ type Hashed = {
   own: List<{ name: Bytes, hash: Bytes }>,
   specs: List<{ name: Bytes, hashes: List<Bytes> }>,
   spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
+  checks: Map<Int, Bytes>,
+  spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
 }
 
 // `hashes` is the table references are written from; `fresh` is what each body hashed to under it.
@@ -1871,7 +1878,7 @@ fn node_keys(index: Index) -> Map<Bytes, Int> =
   })
 
 // A fixed node keeps the hash, references, forms and body it compiled with; none is hashed here.
-pub fn hash_index_pinned(index: Index, fixed: List<Fixed>) -> HashOutput = {
+pub fn hash_index_pinned(index: Index, fixed: List<Fixed>, packages: List<Int> = []) -> HashOutput = {
   let keys = node_keys(index);
   let held = fold(fixed, map_new(), |acc: Map<Int, Fixed>, f: Fixed|
     match map_get(keys, pin_key(f.name, f.decl)) { Some(v) -> map_insert(acc, v, f), None -> acc });
@@ -1892,6 +1899,7 @@ pub fn hash_index_pinned(index: Index, fixed: List<Fixed>) -> HashOutput = {
     map_insert(acc, v, f.hash));
   let keyed = key_components(index, g, pinned, held);
   let hashes = keyed.hashes;
+  let cut = cut_components(index, g, held, packages, hashes);
   let tests = fold(
     index.tests,
     { hashes: [], bodies: [], refs: [] },
@@ -1919,17 +1927,24 @@ pub fn hash_index_pinned(index: Index, fixed: List<Fixed>) -> HashOutput = {
       }
     },
   );
-  let forms = fold(index.order, { own: [], specs: [], spec_texts: [] }, |acc: Forms, e: Entry|
-    match e {
-      EDef(v) -> {
-        let node = at(index.nodes, v);
-        match map_get(held, v) {
-          Some(f) -> fixed_forms(acc, node.name, f),
-          None -> unfixed_forms(index, scc, hashes, acc, v, node),
-        }
+  let forms = fold(
+    index.order,
+    { own: [], specs: [], spec_texts: [], spec_checks: [] },
+    |acc: Forms, e: Entry|
+      match e {
+        EDef(v) -> {
+          let node = at(index.nodes, v);
+          match map_get(held, v) {
+            Some(f) -> fixed_forms(acc, node.name, f),
+            None -> {
+              let view = viewed_refs(index, g, held, packages, hashes, cut, v).view;
+              unfixed_forms(index, scc, hashes, view, cut.checks, acc, v, node)
+            },
+          }
+        },
+        _ -> acc,
       },
-      _ -> acc,
-    });
+  );
   assemble(index, components, edges, {
     hashes: hashes,
     bodies: keyed.bodies,
@@ -1942,8 +1957,119 @@ pub fn hash_index_pinned(index: Index, fixed: List<Fixed>) -> HashOutput = {
     own: forms.own,
     specs: forms.specs,
     spec_texts: forms.spec_texts,
+    checks: cut.checks,
+    spec_checks: forms.spec_checks,
   })
 }
+
+// --- Early cutoff -------------------------------------------------------------------
+
+fn contract_domain() -> Bytes = b"ply.contract.1"
+
+fn package_of(index: Index, packages: List<Int>, v: Int) -> Int =
+  match list_at(packages, at(index.nodes, v).module) { Some(p) -> p, None -> 0 }
+
+// What another package reads of a definition: its signature and specifications, its body a unit.
+fn contract_of(index: Index, g: Graph, hashes: Map<Int, Bytes>, v: Int) -> Bytes = {
+  let node = at(index.nodes, v);
+  match node.body {
+    NFn(d) -> {
+      let signature = encode_item(index, node.module, g.scc, hashes, false, |z: Nz|
+        normalize_node(z, NFn({ ..d, body: ELit({ span: d.name.span, lit: LUnit }) }))).bytes;
+      // Normalizing erases the specifications, which a dependent is owed as much as the types.
+      let clauses = map(d.spec, |c: SpecClause|
+        encode_item(index, node.module, g.scc, hashes, false, |z: Nz| spec_clause(z, d, c)).bytes);
+      blake3(bytes_concat_all([contract_domain(), signature, bytes_concat_all(clauses)]))
+    },
+    _ -> match map_get(hashes, v) { Some(h) -> h, None -> b"" },
+  }
+}
+
+type Cut = { checks: Map<Int, Bytes>, contracts: Map<Int, Bytes> }
+
+type Viewed = { cut: Cut, view: Map<Int, Bytes> }
+
+// The table a node's check key reads its references from: a definition in another package by its
+// contract, a fixed one by its hash, and any other by its check key.
+fn viewed_refs(
+  index: Index,
+  g: Graph,
+  held: Map<Int, Fixed>,
+  packages: List<Int>,
+  hashes: Map<Int, Bytes>,
+  cut: Cut,
+  v: Int,
+) -> Viewed = {
+  let own = package_of(index, packages, v);
+  fold(at(g.edges, v), { cut: cut, view: map_new() }, |acc: Viewed, r: Int|
+    if package_of(index, packages, r) != own {
+      match map_get(acc.cut.contracts, r) {
+        Some(c) -> { ..acc, view: map_insert(acc.view, r, c) },
+        None -> {
+          let c = contract_of(index, g, hashes, r);
+          {
+            cut: { ..acc.cut, contracts: map_insert(acc.cut.contracts, r, c) },
+            view: map_insert(acc.view, r, c),
+          }
+        },
+      }
+    } else {
+      let k = if map_contains(held, r) { map_get(hashes, r) }
+      else { match map_get(acc.cut.checks, r) { Some(x) -> Some(x), None -> map_get(hashes, r) } };
+      match k { Some(x) -> { ..acc, view: map_insert(acc.view, r, x) }, None -> acc }
+    })
+}
+
+// Dependency-first, as the hashes are: a component whose references all read as their hashes keeps
+// them, and any other is keyed again under its view.
+fn cut_components(
+  index: Index,
+  g: Graph,
+  held: Map<Int, Fixed>,
+  packages: List<Int>,
+  hashes: Map<Int, Bytes>,
+) -> Cut =
+  fold(
+    range(0, len(g.components)),
+    { checks: map_new(), contracts: map_new() },
+    |acc: Cut, ci: Int| {
+      let component = at(g.components, ci);
+      let gathered = fold(component, { cut: acc, view: map_new() }, |a: Viewed, v: Int| {
+        let x = viewed_refs(index, g, held, packages, hashes, a.cut, v);
+        {
+          cut: x.cut,
+          view: map_fold(x.view, a.view, |m: Map<Int, Bytes>, r: Int, k: Bytes|
+            if at(g.scc.component_of, r) == ci { m } else { map_insert(m, r, k) }),
+        }
+      });
+      let unmoved = map_fold(gathered.view, true, |all: Bool, r: Int, k: Bytes|
+        all && map_get(hashes, r) == Some(k));
+      if unmoved || fold(component, true, |all: Bool, v: Int| all && map_contains(held, v)) {
+        fold(component, gathered.cut, |c: Cut, v: Int|
+          match map_get(hashes, v) {
+            Some(h) -> { ..c, checks: map_insert(c.checks, v, h) },
+            None -> c,
+          })
+      } else {
+        let effects = slots(at(g.scc.orders, ci));
+        if is_cyclic(component, g.edges) {
+          let refined: Refined = hash_component(index, component, gathered.view, effects);
+          fold(refined.members, gathered.cut, |c: Cut, m: { node: Int, hash: Bytes }|
+            { ..c, checks: map_insert(c.checks, m.node, m.hash) })
+        } else {
+          let v = at(component, 0);
+          let node = at(index.nodes, v);
+          let encoding = finish(
+            normalize_node(
+              new_nz(index, node.module, gathered.view, map_new(), effects),
+              node.body,
+            ),
+          ).bytes;
+          { ..gathered.cut, checks: map_insert(gathered.cut.checks, v, blake3(encoding)) }
+        }
+      }
+    },
+  )
 
 fn fixed_forms(acc: Forms, name: Bytes, f: Fixed) -> Forms = {
   let owned: Forms = match f.own {
@@ -1955,6 +2081,7 @@ fn fixed_forms(acc: Forms, name: Bytes, f: Fixed) -> Forms = {
       ..owned,
       specs: push(owned.specs, { name: name, hashes: f.specs }),
       spec_texts: push(owned.spec_texts, { name: name, hashes: f.spec_texts }),
+      spec_checks: push(owned.spec_checks, { name: name, hashes: f.specs }),
     }
   }
 }
@@ -1963,6 +2090,8 @@ fn unfixed_forms(
   index: Index,
   scc: Sccs,
   hashes: Map<Int, Bytes>,
+  view: Map<Int, Bytes>,
+  checks: Map<Int, Bytes>,
   acc: Forms,
   v: Int,
   node: Node,
@@ -1998,10 +2127,22 @@ fn unfixed_forms(
                   spec_clause(z, def, c)).bytes,
               )
             });
+            let cut_owner = match map_get(checks, v) { Some(k) -> k, None -> owner };
+            let cuts = map(range(0, len(def.spec)), |i: Int| {
+              let c = at(def.spec, i);
+              spec_hash(
+                cut_owner,
+                spec_tag(c.kind),
+                i,
+                encode_item(index, node.module, scc, view, false, |z: Nz|
+                  spec_clause(z, def, c)).bytes,
+              )
+            });
             {
               ..owned,
               specs: push(owned.specs, { name: node.name, hashes: clauses }),
               spec_texts: push(owned.spec_texts, { name: node.name, hashes: texts }),
+              spec_checks: push(owned.spec_checks, { name: node.name, hashes: cuts }),
             }
           },
         }
@@ -2183,6 +2324,8 @@ fn assemble(
     closure: [],
     bodies: [],
     test_bodies: h.test_bodies,
+    checks: [],
+    spec_checks: h.spec_checks,
   };
   fold(
     index.order,
@@ -2199,7 +2342,15 @@ fn assemble(
           let keyed: HashOutput = match map_get(h.hashes, v) {
             None -> bodied,
             Some(hash) -> match node.body {
-              NFn(_) -> { ..bodied, defs: push(bodied.defs, { name: node.name, hash: hash }) },
+              NFn(_) ->
+                {
+                  ..bodied,
+                  defs: push(bodied.defs, { name: node.name, hash: hash }),
+                  checks: push(bodied.checks, {
+                    name: node.name,
+                    hash: match map_get(h.checks, v) { Some(k) -> k, None -> hash },
+                  }),
+                },
               _ -> { ..bodied, decls: push(bodied.decls, { name: node.name, hash: hash }) },
             },
           };
@@ -2487,7 +2638,7 @@ pub fn hash_dump(sources: List<Source>) -> String = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
     let r = parse(s.src);
-    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let x = expand(r.node, r.p.diags);
     let d: Expansion = expand_derives(i, s.name, x.module);
     { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
   });
@@ -4167,11 +4318,7 @@ fn indexed(sources: List<Source>) -> Index =
   match resolve_modules(
       map(range(0, len(sources)), |i: Int| {
         let r = parse(at(sources, i).src);
-        let d: Expansion = expand_derives(
-          i,
-          at(sources, i).name,
-          expand(r.node, r.p.uses_sets, r.p.diags).module,
-        );
+        let d: Expansion = expand_derives(i, at(sources, i).name, expand(r.node, r.p.diags).module);
         { name: at(sources, i).name, module: d.module, derived: d.derived }
       }),
     ) {
@@ -4535,6 +4682,8 @@ test "the published hashes digest to a pinned value" {
     closure: [],
     bodies: [],
     test_bodies: [],
+    checks: [],
+    spec_checks: [],
   };
   assert_eq(
     hex(digest(sample)),
