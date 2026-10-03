@@ -313,7 +313,7 @@ it means the day it is fetched — the fetched tree is reused without asking the
 remote again, so a cleared cache is what picks up a moved branch, and `ply.lock`'s
 digest is what catches it when that happens. The fetch runs the `git` on
 `PATH`, with the run's own environment. A fetch that git cannot do, or a run
-with no `git` to do it, is `E0140`.
+with no `git` to do it, leaves a dependency that was not fetched (`E0135`).
 
 A `Registry` dependency is the package of that `name` from the registry
 `PLY_REGISTRY` names (§15.1), at least `min`; its `name` must be a package name
@@ -3650,7 +3650,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0137` | one package reached at two places, where a closure pins one version |
 | `E0138` | a dependency whose sources are not what `ply.lock` pinned |
 | `E0139` | a `ply.lock` that does not decode or is from another format |
-| `E0140` | a git dependency that could not be fetched |
 | `E0141` | a registry that could not be asked: unset, malformed or not answering |
 | `E0142` | a registry archive that is not the one the lock pins or the index lists |
 | `E0143` | a registry dependency no published version satisfies |
