@@ -856,10 +856,10 @@ fn float_bits(b: Builtin, args: &[f64]) -> u64 {
     }
 }
 
-/// The bits `tests/lang/floats` pins for the compiled tier, answered here by the builtins
-/// themselves: the float functions are one implementation, whichever tier asks.
+/// The bits `tests/lang/floats` pins for the C backend, answered here by the builtins
+/// themselves: the float functions are one implementation, whichever backend asks.
 #[test]
-fn the_float_functions_answer_the_bits_the_compiled_tier_pins() {
+fn the_float_functions_answer_the_bits_the_c_backend_pins() {
     let cases: &[(Builtin, &[f64], u64)] = &[
         (Builtin::Sin, &[1.0], 0x3FEA_ED54_8F09_0CEE),
         (Builtin::Cos, &[1.0], 0x3FE1_4A28_0FB5_068C),

@@ -29,7 +29,7 @@ pub fn checked(module: &str, source: &str) -> ply_eval::Analysis {
 
 /// [`checked`], and the unit compiled from it.
 #[track_caller]
-pub fn tiered(module: &str, source: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+pub fn compiled(module: &str, source: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
     let answer = answered(module, source);
     let front = answer.front.answer;
     assert!(

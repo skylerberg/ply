@@ -68,7 +68,7 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
     );
     let lib = match compile_and_load(&src, "probe") {
         Ok(l) => l,
-        // A machine with no C compiler is not one this tier is for.
+        // A machine with no C compiler is not one this backend is for.
         Err(e) if e.to_string().contains("could not run") => return,
         Err(e) => panic!("{e}"),
     };
@@ -87,7 +87,7 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
 }
 
 #[test]
-fn the_tier_answers_what_the_interpreter_answers() {
+fn the_c_backend_answers_calls_recursion_widths_and_records() {
     let source = r#"
 fn double(x: Int) -> Int = x * 2
 fn even(x: Int) -> Bool = x % 2 == 0
@@ -274,7 +274,7 @@ fn the_first_backend_on_the_handing_thread_takes_the_unit_it_loaded() {
 }
 
 #[test]
-fn the_tier_answers_what_the_program_means() {
+fn the_c_backend_answers_what_the_program_means() {
     let source = r#"
 type Quad = { a: U32, b: U32, c: U32, d: U32 }
 fn g(q: Quad, mx: U32) -> Quad = {
@@ -341,7 +341,7 @@ pub fn looped(n: Int) -> Int / {abort.raise} =
             .map(|a| ctx.heap.to_word(unsafe { &*layouts_ptr }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
         assert_eq!(got, want, "`{name}{args:?}`");
     }
@@ -349,7 +349,7 @@ pub fn looped(n: Int) -> Int / {abort.raise} =
 
 /// A `U64` past `2^62` is not an immediate (tagging eats its top bit), so it is held as the machine's own value.
 #[test]
-fn a_width_the_tier_cannot_carry_in_a_register_still_answers() {
+fn a_width_the_c_backend_cannot_carry_in_a_register_still_answers() {
     let source = r#"
 pub fn wide(n: Int) -> Int / {abort.raise} = {
   let a = u64_of_int(n);
@@ -392,7 +392,7 @@ pub fn narrow(n: Int) -> Int / {abort.raise} = int_of_u32(rotr(wrap_mul(u32_of_i
             let answer = unsafe { entry(&mut ctx, [word].as_ptr()) };
             match want {
                 Some(want) => {
-                    assert_eq!(ctx.failed, 0, "`{name}({n})` raised in the C tier");
+                    assert_eq!(ctx.failed, 0, "`{name}({n})` raised in the C backend");
                     let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
                     assert_eq!(got, ply_eval::Value::Int(want), "`{name}({n})`");
                 }
@@ -463,7 +463,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
             .map(|a| ctx.heap.to_word(unsafe { &*layouts_ptr }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{which}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{which}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
         assert_eq!(got, want, "`{which}`");
     }
@@ -523,7 +523,7 @@ pub fn named(b: Bytes) -> Int = code(TName(b))
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         assert_eq!(&got, want, "`{name}{args:?}`");
     }
@@ -576,7 +576,7 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         assert_eq!(&got, want, "`{name}{args:?}`");
     }

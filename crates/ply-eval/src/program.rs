@@ -97,10 +97,10 @@ pub struct Analysis {
     pub pins: Vec<Pinned>,
     /// Each module's package, in program order: an index into `packages`, or one past the end
     /// for a module the toolchain ships.
-    pub mod_pkg: Vec<usize>,
+    pub module_packages: Vec<usize>,
     pub check: CheckOutput,
     pub hashes: HashOutput,
-    /// The digest of [`hashes`](Front::hashes), as the compiler computed it.
+    /// The digest of [`hashes`](Analysis::hashes), as the compiler computed it.
     pub hashes_digest: DefHash,
     /// The emitter's root cache keys, by root name, as the compiler computed them.
     pub keys: IndexMap<Symbol, String>,
@@ -128,7 +128,7 @@ pub struct Analysis {
     /// What every definition and test published, its `front.Rows` as [`crate::codec`] encodes it
     /// and empty when the answer carried none: the emitter walks only the bodies it lowers.
     pub rows: Vec<u8>,
-    /// What the front end's check read of the bodies it walked, a `front.Walked` in the encoding
+    /// What the front end's check read of the bodies it walked, a `front.WalkedFacts` in the encoding
     /// `std.bin` reads it with, empty when the answer carried none.
     pub walked: Vec<u8>,
 }
@@ -216,17 +216,6 @@ pub struct ModuleInfo {
     pub items: Vec<Symbol>,
     /// Each module this one imports, as the program names it.
     pub imports: Vec<ModuleName>,
-    /// What a stub of this module blanks, in source order.
-    pub cuts: Vec<BlankedSpan>,
-}
-
-/// A span of a module a stub blanks: a body, which keeps its braces as an empty block, or a whole
-/// test or law.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlankedSpan {
-    pub start: usize,
-    pub end: usize,
-    pub braced: bool,
 }
 
 /// Every map is keyed by program-wide name, so entries from different modules cannot collide.

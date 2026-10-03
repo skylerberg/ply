@@ -22,12 +22,12 @@ pub fn named() -> String / {entropy.next} = nonce()
 pub fn no_range() -> Int / {entropy.below} = below(0)
 "#;
 
-fn tiered(service: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
-    crate::support::answered::tiered("m", service)
+fn compiled(service: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+    crate::support::answered::compiled("m", service)
 }
 fn call(entry: &str) -> Result<Value, ply_eval::Diagnostic> {
     let host = std::sync::Arc::new(ply_host::Host::new());
-    let (front, unit) = tiered(PROGRAM);
+    let (front, unit) = compiled(PROGRAM);
     let binding = host
         .registry()
         .bind(&front.check)
