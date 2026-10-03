@@ -5,7 +5,7 @@ use crate::semantics::arity_error;
 use crate::value::{
     Decimal, Fixed, FixedOp, List, Value, first_difference, type_error, values_equal,
 };
-use crate::{Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, map, slot};
+use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, map, slot};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -164,6 +164,13 @@ pub enum Builtin {
     Reflect,
     /// BLAKE3 of the value's canonical encoding, under `derivable(hash, a)`.
     Digest,
+    /// An operator over a `numeric` or `integer` type parameter: `?numeric_binary(op, witness, x,
+    /// y)`, its operands read as the type the witness names. No source can spell it; the
+    /// elaboration writes it.
+    NumericBinary,
+    NumericUnary,
+    /// `numeric_of_int(n)`, called with the witness the elaboration passes first.
+    NumericOfInt,
 }
 
 impl Builtin {
@@ -282,6 +289,9 @@ impl Builtin {
             "array_set" => Builtin::ArraySet,
             "reflect" => Builtin::Reflect,
             "digest" => Builtin::Digest,
+            "?numeric_binary" => Builtin::NumericBinary,
+            "?numeric_unary" => Builtin::NumericUnary,
+            "numeric_of_int" => Builtin::NumericOfInt,
             _ => return None,
         })
     }
@@ -415,6 +425,9 @@ impl Builtin {
             Builtin::ArraySet => "array_set",
             Builtin::Reflect => "reflect",
             Builtin::Digest => "digest",
+            Builtin::NumericBinary => "?numeric_binary",
+            Builtin::NumericUnary => "?numeric_unary",
+            Builtin::NumericOfInt => "numeric_of_int",
         }
     }
 
@@ -530,6 +543,7 @@ impl Builtin {
             | Builtin::Rotr32
             | Builtin::Rotr
             | Builtin::Range
+            | Builtin::NumericOfInt
             | Builtin::ArrayNew
             | Builtin::ArrayAt
             | Builtin::ArrayGet => (2, 2),
@@ -537,6 +551,7 @@ impl Builtin {
             | Builtin::Iterate
             | Builtin::ListSet
             | Builtin::ArraySet
+            | Builtin::NumericUnary
             | Builtin::BytesSlice
             | Builtin::BytesIndexOfFrom
             | Builtin::BytesPosition
@@ -545,7 +560,10 @@ impl Builtin {
             | Builtin::MapFold
             | Builtin::MapUpdate
             | Builtin::DecimalRound => (3, 3),
-            Builtin::BytesScan | Builtin::BytesScanUntil | Builtin::DecimalDiv => (4, 4),
+            Builtin::BytesScan
+            | Builtin::BytesScanUntil
+            | Builtin::DecimalDiv
+            | Builtin::NumericBinary => (4, 4),
         }
     }
 
@@ -716,6 +734,9 @@ impl Builtin {
             Builtin::ArraySet,
             Builtin::Reflect,
             Builtin::Digest,
+            Builtin::NumericBinary,
+            Builtin::NumericUnary,
+            Builtin::NumericOfInt,
         ]
     }
 }
@@ -746,6 +767,70 @@ fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     let copied = list.set(at, v);
     crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
     Ok(xs)
+}
+
+/// A value of a `numeric` or `integer` parameter, read as the type its witness names: one of the
+/// runtime's ten widths, else `Int`, `Float` or `Decimal`, which every word already says it is.
+fn witnessed(v: Value, w: i64, span: Span) -> Result<Value, Diagnostic> {
+    match (usize::try_from(w).ok().and_then(|i| INT_TYPES.get(i)), &v) {
+        (Some(t), Value::Int(n)) => Fixed::of(*t, i128::from(*n))
+            .map(Value::Fixed)
+            .ok_or_else(|| type_error(span, "a witnessed operand", t.name(), &v)),
+        _ => Ok(v),
+    }
+}
+
+/// The witness of `Int`, which is also a parameter's when nothing shows its type: the prover draws
+/// every type variable as `Int`, and so does an entry whose arguments hold no value of it.
+pub const INT_WITNESS: i64 = 10;
+pub const FLOAT_WITNESS: i64 = 11;
+pub const DECIMAL_WITNESS: i64 = 12;
+
+/// The witness a value of a `numeric` or `integer` parameter shows: its width's place among
+/// [`INT_TYPES`], else `Int`'s, `Float`'s or `Decimal`'s, which follow them.
+pub fn witness_of(v: &Value) -> i64 {
+    match v {
+        Value::Fixed(f) => INT_TYPES
+            .iter()
+            .position(|t| *t == f.ty)
+            .map_or(INT_WITNESS, |i| i as i64),
+        Value::Float(_) => FLOAT_WITNESS,
+        Value::Decimal(_) => DECIMAL_WITNESS,
+        _ => INT_WITNESS,
+    }
+}
+
+/// The operators a witnessed parameter takes, numbered as the elaboration writes them.
+pub const NUMERIC_OPS: [BinOp; 15] = [
+    BinOp::Add,
+    BinOp::Sub,
+    BinOp::Mul,
+    BinOp::Div,
+    BinOp::Rem,
+    BinOp::Lt,
+    BinOp::Le,
+    BinOp::Gt,
+    BinOp::Ge,
+    BinOp::BitAnd,
+    BinOp::BitOr,
+    BinOp::BitXor,
+    BinOp::Shl,
+    BinOp::Shr,
+    BinOp::Ushr,
+];
+
+fn numeric_op(op: &Value, span: Span) -> Result<BinOp, Diagnostic> {
+    let n = op.as_int(span, "an operator")?;
+    usize::try_from(n)
+        .ok()
+        .and_then(|i| NUMERIC_OPS.get(i).copied())
+        .ok_or_else(|| {
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("operator {n} is no operator over a numeric parameter"),
+            )
+            .primary(span, "this is Ply's fault")
+        })
 }
 
 /// `array_set`, taking the array out of its arguments so the last holder writes in place.
@@ -847,14 +932,15 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(Value::list((lo..hi).map(Value::Int).collect()))
         }
 
+        // In `compare`'s order, the first of two equal ones.
         Builtin::Min | Builtin::Max => {
-            let x = args[0].as_int(span, &format!("`{}`", b.name()))?;
-            let y = args[1].as_int(span, &format!("`{}`", b.name()))?;
-            Ok(Value::Int(if b == Builtin::Min {
-                x.min(y)
-            } else {
-                x.max(y)
-            }))
+            crate::value::secret_has_no_order(&args[0], b.name(), span)?;
+            let first = match args[0].cmp(&args[1]) {
+                std::cmp::Ordering::Less => b == Builtin::Min,
+                std::cmp::Ordering::Greater => b == Builtin::Max,
+                std::cmp::Ordering::Equal => true,
+            };
+            Ok(args.swap_remove(if first { 0 } else { 1 }))
         }
 
         Builtin::Rotr32 => {
@@ -1269,6 +1355,67 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::Reflect => Ok(crate::reflect::value_of(&Plain::of(&args[0]))),
 
         Builtin::Digest => Ok(Value::bytes(crate::digest::digest(&args[0], span)?)),
+
+        Builtin::NumericBinary => {
+            let op = numeric_op(&args[0], span)?;
+            let w = args[1].as_int(span, "a witness")?;
+            let l = witnessed(args[2].clone(), w, span)?;
+            // A shift's count is an `Int` whatever the word is.
+            let r = if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
+                args[3].clone()
+            } else {
+                witnessed(args[3].clone(), w, span)?
+            };
+            crate::semantics::strict_binary(op, &l, &r, span, span, span)
+        }
+
+        Builtin::NumericUnary => {
+            let w = args[1].as_int(span, "a witness")?;
+            let x = witnessed(args[2].clone(), w, span)?;
+            if args[0].as_int(span, "an operator")? == 1 {
+                return Ok(match x {
+                    Value::Fixed(f) => Value::Fixed(Fixed::new(f.ty, !f.bits())),
+                    other => Value::Int(!other.as_int(span, "`~`")?),
+                });
+            }
+            match x {
+                Value::Float(f) => Ok(Value::Float(-f)),
+                Value::Decimal(d) => Ok(Value::Decimal(-d)),
+                Value::Fixed(f) => f.checked_neg().map(Value::Fixed).ok_or_else(|| {
+                    Diagnostic::error(codes::RUNTIME_ERROR, "negation overflowed its width")
+                        .primary(span, "negated here")
+                }),
+                other => other
+                    .as_int(span, "negation")?
+                    .checked_neg()
+                    .map(Value::Int)
+                    .ok_or_else(|| {
+                        Diagnostic::error(codes::RUNTIME_ERROR, "integer overflow in negation")
+                            .primary(span, "negated here")
+                    }),
+            }
+        }
+
+        Builtin::NumericOfInt => {
+            let w = args[0].as_int(span, "a witness")?;
+            let n = args[1].as_int(span, "`numeric_of_int`")?;
+            match usize::try_from(w).ok().and_then(|i| INT_TYPES.get(i)) {
+                Some(t) => Fixed::of(*t, i128::from(n))
+                    .map(Value::Fixed)
+                    .ok_or_else(|| {
+                        Diagnostic::error(
+                            codes::RUNTIME_ERROR,
+                            format!("`numeric_of_int({n})` is outside `{}`", t.name()),
+                        )
+                        .primary(span, "converted here")
+                    }),
+                None => Ok(match w {
+                    FLOAT_WITNESS => Value::Float(n as f64),
+                    DECIMAL_WITNESS => Value::Decimal(Decimal::from(n)),
+                    _ => Value::Int(n),
+                }),
+            }
+        }
 
         Builtin::StringSlice => {
             let s = args[0].as_str(span, "`string_slice`")?;
