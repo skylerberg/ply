@@ -31,6 +31,7 @@ pub enum Builtin {
     Filter,
     Fold,
     Iterate,
+    Metered,
     Range,
     WrapAdd,
     WrapSub,
@@ -317,6 +318,7 @@ impl Builtin {
             "map_fold" => Builtin::MapFold,
             "map_update" => Builtin::MapUpdate,
             "iterate" => Builtin::Iterate,
+            "metered" => Builtin::Metered,
             "decimal_div" => Builtin::DecimalDiv,
             "decimal_round" => Builtin::DecimalRound,
             "decimal_of_int" => Builtin::DecimalOfInt,
@@ -396,6 +398,7 @@ impl Builtin {
             Builtin::Filter => "filter",
             Builtin::Fold => "fold",
             Builtin::Iterate => "iterate",
+            Builtin::Metered => "metered",
             Builtin::Range => "range",
             Builtin::WrapAdd => "wrap_add",
             Builtin::Min => "min",
@@ -623,7 +626,8 @@ impl Builtin {
             | Builtin::IntOfI8
             | Builtin::IntOfI16
             | Builtin::IntOfI32
-            | Builtin::IntOfI64 => (1, 1),
+            | Builtin::IntOfI64
+            | Builtin::Metered => (1, 1),
             Builtin::AssertEq
             | Builtin::Push
             | Builtin::ListAt
@@ -745,6 +749,7 @@ impl Builtin {
             Builtin::Filter,
             Builtin::Fold,
             Builtin::Iterate,
+            Builtin::Metered,
             Builtin::Range,
             Builtin::WrapAdd,
             Builtin::WrapSub,
@@ -1056,6 +1061,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::Filter
         | Builtin::Fold
         | Builtin::Iterate
+        | Builtin::Metered
         | Builtin::BytesPosition
         | Builtin::MapUpdate
         | Builtin::MapFold

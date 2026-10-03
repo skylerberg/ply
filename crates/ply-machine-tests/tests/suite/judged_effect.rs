@@ -47,7 +47,7 @@ type Kind = | Ensures(Int) | Law(Option<String>)
 type Frame = | Pure | Writes(List<String>)
 type Points = | Every({ shapes: List<Unit>, points: Int }, String) | Drawn
 type Unsettled = | Unhandled(String) | Run(Points)
-type Strategy = | Interleave(Points) | Hosted | Static(Unsettled)
+type Strategy = | Interleave(Points) | Hosted | Static(Unsettled) | Fitting
 type Bound = { name: String, ty: Shape, text: String }
 type Claimed = {
   key: String,
@@ -104,7 +104,7 @@ type Front = {
   file_ms: Int,
   cached: Bool,
 }
-type Mode = | MWhole | MWitness | MDomain
+type Mode = | MWhole | MWitness | MDomain | MCost(Int)
 type Batch = { claim: Int, points: List<List<Value>>, mode: Mode }
 type Judged =
   | JHeld
@@ -112,6 +112,8 @@ type Judged =
   | JRejected
   | JRaised({ message: String, values: List<Value> })
   | JFaulted({ code: String, message: String, notes: List<String>, values: List<Value> })
+  | JMeasured({ steps: Int, bound: Int })
+  | JSpent(Int)
 
 type Answer = { failed: Int, held: Int, rejected: Int, first: String }
 

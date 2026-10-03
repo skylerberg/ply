@@ -19,22 +19,27 @@ import std.bin
 import std.json (Array, Json, Null, Number, Object, Str)
 import std.value (Value, filled)
 import rules (Rule, Unfold, induction_rule, rule_json, rule_bin)
+import fit (Fit, fit_bin, fit_summary, fitted, min_fitted_sizes, unfitted_summary)
 
 // What an obligation is about: one of a definition's own `ensures` clauses, or a whole law.
 pub type Kind = | Ensures(Int) | Law(Option<String>)
 
 // How strong a discharge was. `Proved` is the only one that covers every case; a sampled discharge
-// is what it is, and an example is an example.
-pub type Tier = | Proved | Property | Example
+// is what it is, a cost law's fit is a trend over its sizes, and an example is an example.
+pub type Tier = | Proved | Property | Example | Fitted
 
 pub fn tier_word(t: Tier) -> String =
-  match t { Proved -> "proved", Property -> "property", Example -> "example" }
+  match t { Proved -> "proved", Property -> "property", Example -> "example", Fitted -> "fitted" }
 
 // The strength order, which is not the declaration order: `Proved` is last, not first.
-pub fn tier_rank(t: Tier) -> Int = match t { Proved -> 2, Property -> 1, Example -> 0 }
+pub fn tier_rank(t: Tier) -> Int = match t { Proved -> 3, Property -> 2, Fitted -> 1, Example -> 0 }
 
 // Ascending strength, which is the order a coverage summary reads in.
-pub fn tiers() -> List<Tier> = [Example, Property, Proved]
+pub fn tiers() -> List<Tier> = [Example, Fitted, Property, Proved]
+
+// A fit over enough sizes is a trend; over fewer, an example.
+pub fn fit_tier(f: Fit) -> Tier =
+  if len(fitted(f)) >= min_fitted_sizes() { Fitted } else { Example }
 
 // What each law speaks about, and the sentence it was written as.
 pub type Laws = {
@@ -471,7 +476,7 @@ pub type Cases = {
   instantiations: List<Instantiation>,
 }
 
-pub type Evidence = | Proof(Certificate) | Sampled(Cases)
+pub type Evidence = | Proof(Certificate) | Sampled(Cases) | Measured(Fit)
 
 derive bin for Tier
 derive bin for Certificate
@@ -508,10 +513,16 @@ pub type Judged =
   | JRaised({ message: String, values: List<Value> })
   // Ply failed, which says nothing about the claim.
   | JFaulted({ code: String, message: String, notes: List<String>, values: List<Value> })
+  // A cost law's size: the steps its body took, and its bound there.
+  | JMeasured({ steps: Int, bound: Int })
+  // A cost law's size whose run took more steps than it was allowed, which were this many.
+  | JSpent(Int)
 
 pub type Outcome =
   | Held({ tier: Tier, evidence: Evidence })
   | Refuted(Counter)
+  // A cost law whose steps grew faster than its bound over the last sizes it was measured at.
+  | Outgrown(Fit)
   // Where the claim is written, as the CLI points at it, spelled out so this package carries no
   // opinion about a label.
   | Vacuous({ guard: { module: Int, start: Int, end: Int }, why: Vacuity })
@@ -612,7 +623,11 @@ pub fn cases_summary(tier: Tier, c: Cases) -> String / {abort.raise} = {
 }
 
 pub fn evidence_summary(tier: Tier, e: Evidence) -> String / {abort.raise} =
-  match e { Proof(c) -> certificate_summary(c), Sampled(c) -> cases_summary(tier, c) }
+  match e {
+    Proof(c) -> certificate_summary(c),
+    Sampled(c) -> cases_summary(tier, c),
+    Measured(f) -> fit_summary(f),
+  }
 
 // A count of them wears its word. This is a package, so it carries the one it needs rather than
 // reaching into the CLI's report.
@@ -787,6 +802,7 @@ test "the strongest discharge is what a definition is covered by" {
   // Ascending strength, and `proved` is last because it is the strongest.
   assert_eq(c.by_tier, [
     { tier: Example, count: 0 },
+    { tier: Fitted, count: 0 },
     { tier: Property, count: 1 },
     { tier: Proved, count: 1 },
   ]);
@@ -796,6 +812,7 @@ test "the strongest discharge is what a definition is covered by" {
   assert_eq(c.uncovered, ["m.insert", "m.other", "m.sort"]);
   assert_eq(c.by_tier, [
     { tier: Example, count: 0 },
+    { tier: Fitted, count: 0 },
     { tier: Property, count: 0 },
     { tier: Proved, count: 0 },
   ])
@@ -1082,8 +1099,9 @@ test "every word a report prints for a reason, a tier, or a move" {
   assert_eq(tier_word(Proved), "proved");
   assert_eq(tier_word(Example), "example");
   assert_eq(tier_rank(Proved) > tier_rank(Property), true);
-  assert_eq(tier_rank(Property) > tier_rank(Example), true);
-  assert_eq(tiers(), [Example, Property, Proved]);
+  assert_eq(tier_rank(Property) > tier_rank(Fitted), true);
+  assert_eq(tier_rank(Fitted) > tier_rank(Example), true);
+  assert_eq(tiers(), [Example, Fitted, Property, Proved]);
   assert_eq(moved_word(Never), "never")
 }
 
@@ -1105,6 +1123,8 @@ pub type Gap =
   | ReachesHost(String)
   // The obligation's points are not drawn one at a time, so there is no case to re-run.
   | NotDrawn
+  // A cost law measured at too few sizes to read a trend from.
+  | Unfitted(Fit)
 
 pub fn gap_summary(g: Gap) -> String / {abort.raise} =
   match g {
@@ -1119,6 +1139,7 @@ pub fn gap_summary(g: Gap) -> String / {abort.raise} =
         ++ " cases, but it does admit a value",
     ReachesHost(row) -> "reaches the host (" ++ row ++ "); run `ply prove --host`",
     NotDrawn -> "its points are not drawn one at a time",
+    Unfitted(f) -> unfitted_summary(f),
   }
 
 // A gap's kind, as a document names it for a reader that counts gaps rather than reading them.
@@ -1130,6 +1151,7 @@ pub fn gap_word(g: Gap) -> String =
     GuardNotSampled(_) -> "guard_not_sampled",
     ReachesHost(_) -> "reaches_host",
     NotDrawn -> "not_drawn",
+    Unfitted(_) -> "unfitted",
   }
 
 // Ply's own failure while discharging a claim, and the point it was judging, if one was.
@@ -1192,6 +1214,7 @@ test "every kind of gap has a word of its own" {
     GuardNotSampled({ generated: 200, witness: [] }),
     ReachesHost("{db.read[users]}"),
     NotDrawn,
+    Unfitted({ measures: [], spent: None }),
   ];
   let words = map(every, gap_word);
   assert_eq(words, [
@@ -1201,6 +1224,7 @@ test "every kind of gap has a word of its own" {
     "guard_not_sampled",
     "reaches_host",
     "not_drawn",
+    "unfitted",
   ]);
   // Two gaps of one kind with different particulars are one word.
   assert_eq(gap_word(UnhandledEffect(Some("{db.read[rows]}"))), gap_word(UnhandledEffect(None)))

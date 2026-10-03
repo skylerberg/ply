@@ -14,7 +14,9 @@ import resolve (Mod, Source, Resolved_, Failed, Diag, resolve_modules, Resolved,
                 ModBind, Pkg, resolve_packaged, no_pkgs, default_binder, find_modbind, qualify)
 import derive (expand_derives)
 import infer (emit_facts, Facts, Refuses, LabelSite, OperandSite, expanded_mods, sccs,
-              prelude_effects, EffectInfo, OpInfo)
+              prelude_effects, EffectInfo, OpInfo, Known, KnownDef, no_known)
+import tycore (Atom, read_atoms)
+import front (Rows, KnownDefRow, KnownTestRow)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock,
               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EWithCell, HandleClause,
               MatchArm, RecField, Stmt, SLet, SLetElse, SExpr)
@@ -7637,7 +7639,7 @@ fn others_of(m: Module, program: List<ModDefs>) -> List<ModAliases> =
     }
   })
 
-fn defs_in(module: Bytes, m: Module, pure: List<Bytes>, program: List<ModDefs>) -> List<Def> = {
+fn defs_in(module: Bytes, m: Module, pure: Map<Bytes, Bool>, program: List<ModDefs>) -> List<Def> = {
   let aliases = aliases_in(m);
   let others = others_of(m, program);
   fold(m.items, [], |acc: List<Def>, it: Item|
@@ -7647,7 +7649,7 @@ fn defs_in(module: Bytes, m: Module, pure: List<Bytes>, program: List<ModDefs>) 
           name: d.name.name,
           ret: match param_kind_with(aliases, others, d.ret) { Some(r) -> Some(r.k), None -> None },
           ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
-          pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == qualify(module, d.name.name)),
+          pure: map_contains(pure, qualify(module, d.name.name)),
           arity: len(d.params) + len(d.generics.labels),
         }),
       _ -> acc,
@@ -7669,6 +7671,52 @@ test "the emitter writes an embed out as the front end's answer says it was read
         bytes_index_of(r.why, b"unknown name `embed`") != None,
         Some(string_of_bytes_lossy(r.why)),
       ),
+  }
+}
+
+fn pure_row(name: Bytes) -> KnownDefRow =
+  { name: name, hash: b"", witness: [], footprint: b"", performed: b"" }
+
+test "a body emitted with the program's rows is the body emitted without them" {
+  let a = b"import b\nfn f(x: Int) -> Int = b::g(x) + 1\ntest \"adds\" { assert(f(1) == 3) }\n";
+  let b = b"pub fn g(x: Int) -> Int = x * 2\ntest \"doubles\" { assert(g(1) == 2) }\n";
+  let rows = {
+    defs: [pure_row(b"a.f"), pure_row(b"b.g")],
+    tests: [
+      { key: b"a.adds", hash: b"", witness: [], footprint: b"" },
+      { key: b"b.doubles", hash: b"", witness: [], footprint: b"" },
+    ],
+  };
+  let wanted = [b"a.f", b"a.test#0"];
+  assert_eq(
+    emit_roots_answer([b"a", b"b"], [a, b], [], [], wanted, [], [], [], rows),
+    emit_roots_answer([b"a", b"b"], [a, b], [], [], wanted, [], [], []),
+  )
+}
+
+// The driver hands over a lowered module's imports and nothing else, reading roots the same way:
+// `producer::module_of_root`'s test holds the same cases.
+test "a root is in the module its owner is in" {
+  assert_eq(module_of_root(b"app.cli.main"), b"app.cli");
+  assert_eq(module_of_root(b"app.cli.main#requires#0"), b"app.cli");
+  assert_eq(module_of_root(b"app.test#3"), b"app");
+  assert_eq(module_of_root(b"app.law#2.body"), b"app");
+  assert_eq(module_of_root(b"main"), b"")
+}
+
+test "a body in a module no wanted root is in is not walked: its row stands for it" {
+  let a = b"import b\nfn f() -> Int = b::g() + 1\n";
+  // Walked, `g` answers a `Bool` where it promises an `Int`, and the program is refused.
+  let b = b"pub fn g() -> Int = true\n";
+  let call = |rows: Rows|
+    at(emit_roots_answer([b"a", b"b"], [a, b], [], [], [b"a.f"], [], [], [], rows), 0).answer;
+  match call({ defs: [pure_row(b"b.g")], tests: [] }) {
+    Body(_) -> (),
+    Refused(r) -> panic(string_of_bytes_lossy(r.why)),
+  };
+  match call({ defs: [], tests: [] }) {
+    Body(_) -> panic("with no row for `g`, its body is walked and refuses the program"),
+    Refused(_) -> (),
   }
 }
 
@@ -7713,6 +7761,70 @@ fn refused_rather_than_emitted(
     |n: Bytes| { name: n, text: b"", tables: no_tables(), why: Some(why), handles: [] },
   )
 
+// The modules a wanted root is in, which are the only ones lowered; `None` lowers them all.
+fn lowered_modules(wanted: Option<Map<Bytes, Bool>>) -> Option<Map<Bytes, Bool>> / {abort.raise} =
+  match wanted {
+    None -> None,
+    Some(w) ->
+      Some(
+        map_fold(w, map_new(), |acc: Map<Bytes, Bool>, root: Bytes, _: Bool|
+          map_insert(acc, module_of_root(root), true)),
+      ),
+  }
+
+fn lowers(lowered: Option<Map<Bytes, Bool>>, module: Bytes) -> Bool =
+  match lowered { None -> true, Some(m) -> map_contains(m, module) }
+
+// A clause's, test's or law's root is its owner's name then `#`; a module is a name less its last
+// segment.
+fn module_of_root(root: Bytes) -> Bytes / {abort.raise} = {
+  let owner = match bytes_index_of(root, b"#") { Some(i) -> bytes_slice(root, 0, i), None -> root };
+  let dot = fold(range(0, bytes_len(owner)), 0 - 1, |acc: Int, i: Int|
+    if bytes_at(owner, i) == 46 { i } else { acc });
+  if dot < 0 { b"" } else { bytes_slice(owner, 0, dot) }
+}
+
+// Every definition and test outside the lowered modules as the front end published it, so the
+// check behind this answer walks only the bodies it lowers. The rows are this program's own: they
+// came with its texts, so no hash is checked.
+fn seeds(mods: List<Mod>, lowered: Option<Map<Bytes, Bool>>, rows: Rows) -> Known / {abort.raise} =
+  match lowered {
+    None -> no_known(),
+    Some(walked) -> {
+      let tests = fold(rows.tests, map_new(), |acc: Map<Bytes, Bytes>, r: KnownTestRow|
+        map_insert(acc, r.key, r.footprint));
+      {
+        defs: fold(rows.defs, map_new(), |acc: Map<Bytes, KnownDef>, r: KnownDefRow|
+          if map_contains(walked, module_of_root(r.name)) { acc } else {
+            match read_atoms(r.footprint) {
+              None -> acc,
+              Some(footprint) -> match read_atoms(r.performed) {
+                None -> acc,
+                Some(performed) ->
+                  map_insert(acc, r.name, { footprint: footprint, performed: performed }),
+              },
+            }
+          }),
+        tests: fold(mods, map_new(), |acc: Map<Bytes, List<Option<List<Atom>>>>, m: Mod|
+          if map_contains(walked, m.name) { acc } else {
+            map_insert(
+              acc,
+              m.name,
+              fold(m.module.items, [], |slots: List<Option<List<Atom>>>, it: Item|
+                match it {
+                  ITest(d) ->
+                    push(slots, match map_get(tests, qualify(m.name, d.name)) {
+                      None -> None,
+                      Some(text) -> read_atoms(text),
+                    }),
+                  _ -> slots,
+                }),
+            )
+          }),
+      }
+    },
+  }
+
 // Resolved together first, so defaults are filled and derives expanded; a program that does not resolve emits nothing.
 // Every root is resolved against, but only those `wanted` names are emitted; `None` wants them all.
 // `pkgs` and `mod_pkg` are the program's package tables, empty for one without packages:
@@ -7726,6 +7838,7 @@ fn emit_program(
   pkgs: List<Pkg>,
   mod_pkg: List<Int>,
   embeds: List<EmbedAt> = [],
+  rows: Rows = { defs: [], tests: [] },
 ) -> List<Emitted> / {abort.raise} = {
   let tables = embed_tables(embeds);
   let parsed = map(range(0, len(sources)), |i: Int| {
@@ -7777,46 +7890,51 @@ fn emit_program(
           packaged.shelf,
         ) {
         Failed(diags) -> refused_rather_than_emitted(sources, wanted, said(diags)),
-        Resolved_(x) -> match emit_facts(x.r, x.mods) {
-          Refuses(diags) -> refused_rather_than_emitted(sources, wanted, said(diags)),
-          Facts(facts) -> {
-            let pure = facts.pure;
-            // The checker has the shape of every update, so the literals they stand for are written in here.
-            let mods: List<Mod> = expanded_mods(x.mods, facts.elaboration);
-            let with_aliases = map(mods, |m: Mod|
-              { module: m.name, defs: [], aliases: aliases_in(m.module) });
-            let program = map(mods, |m: Mod|
-              {
-                module: m.name,
-                defs: defs_in(m.name, m.module, pure, with_aliases),
-                aliases: aliases_in(m.module),
-              });
-            fold(range(0, len(mods)), [], |acc: List<Emitted>, i: Int|
-              match list_at(mods, i) {
-                None -> acc,
-                Some(m) ->
-                  fold(
-                    emit_module(
-                      m.name,
-                      m.module,
-                      ctors,
-                      builtins,
-                      program,
-                      pure,
-                      effects_in(x.r, i, mods),
-                      release,
-                      wanted,
-                      sites_in(facts.label_sites, i),
-                      operands_in(facts.operands, i),
-                      x.r,
-                      i,
-                      mods,
-                    ),
-                    acc,
-                    |a: List<Emitted>, e: Emitted| push(a, e),
-                  ),
-              })
-          },
+        Resolved_(x) -> {
+          let lowered = lowered_modules(wanted);
+          match emit_facts(x.r, x.mods, seeds(x.mods, lowered, rows)) {
+            Refuses(diags) -> refused_rather_than_emitted(sources, wanted, said(diags)),
+            Facts(facts) -> {
+              let pure = fold(facts.pure, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
+                map_insert(acc, n, true));
+              // The checker has the shape of every update, so the literals they stand for are written in here.
+              let mods: List<Mod> = expanded_mods(x.mods, facts.elaboration);
+              let with_aliases = map(mods, |m: Mod|
+                { module: m.name, defs: [], aliases: aliases_in(m.module) });
+              let program = map(mods, |m: Mod|
+                {
+                  module: m.name,
+                  defs: defs_in(m.name, m.module, pure, with_aliases),
+                  aliases: aliases_in(m.module),
+                });
+              fold(range(0, len(mods)), [], |acc: List<Emitted>, i: Int|
+                match list_at(mods, i) {
+                  None -> acc,
+                  Some(m) -> if !lowers(lowered, m.name) { acc } else {
+                    fold(
+                      emit_module(
+                        m.name,
+                        m.module,
+                        ctors,
+                        builtins,
+                        program,
+                        pure,
+                        effects_in(x.r, i, mods),
+                        release,
+                        wanted,
+                        sites_in(facts.label_sites, i),
+                        operands_in(facts.operands, i),
+                        x.r,
+                        i,
+                        mods,
+                      ),
+                      acc,
+                      |a: List<Emitted>, e: Emitted| push(a, e),
+                    )
+                  },
+                })
+            },
+          }
         },
       }
     },
@@ -7883,7 +8001,7 @@ fn emit_module(
   ctors: List<Bytes>,
   builtins: List<Bytes>,
   program: List<ModDefs>,
-  pure: List<Bytes>,
+  pure: Map<Bytes, Bool>,
   effects: List<EffectName>,
   release: Bool,
   wanted: Option<Map<Bytes, Bool>>,
@@ -7914,7 +8032,7 @@ fn emit_module(
           name: d.name.name,
           ret: match param_kind_with(aliases, others, d.ret) { Some(r) -> Some(r.k), None -> None },
           ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
-          pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == qualify(module, d.name.name)),
+          pure: map_contains(pure, qualify(module, d.name.name)),
           arity: len(d.params) + len(d.generics.labels),
         }),
       _ -> acc,
@@ -8593,7 +8711,8 @@ pub type RootAnswer = { name: Bytes, answer: Answer }
 
 // The roots `wanted` names, resolved against the whole program: one entry per root emitted or
 // refused, in its order, so the driver can drop what was refused. `embeds` is what the front end's
-// answer says it embedded.
+// answer says it embedded, and `rows` what it published for every definition and test, which spare
+// a walk of every module no wanted root is in.
 pub fn emit_roots_answer(
   names: List<Bytes>,
   srcs: List<Bytes>,
@@ -8603,6 +8722,7 @@ pub fn emit_roots_answer(
   pkgs: List<Pkg>,
   mod_pkg: List<Int>,
   embeds: List<EmbedAt>,
+  rows: Rows = { defs: [], tests: [] },
 ) -> List<RootAnswer> / {abort.raise} =
   map(
     emit_program(
@@ -8614,6 +8734,7 @@ pub fn emit_roots_answer(
       pkgs,
       mod_pkg,
       embeds,
+      rows,
     ),
     answer_of,
   )

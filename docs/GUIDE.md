@@ -93,7 +93,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `as` | in an `import`, after the module path |
 | `read`, `write` | opening an operation declaration, or after `.` in an atom |
 | `set` | `effect set X = {..}` |
-| `law`, `host`, `forall` | `law "..."` or `law/host` at item position; `forall` after the label |
+| `law`, `host`, `forall`, `cost` | `law "..."` or `law/host` at item position; `forall` after the label; `cost` after a law's binders and guard |
 | `derive`, `for`, `reuse`, `transparent` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn` and `transparent reuse fn` at item position |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
@@ -1108,6 +1108,24 @@ it finishes, so one that ends on a value, such as a comparison missing its
 `assert_eq(actual, expected)` fail with `E0501`, the latter reporting both
 values and their first difference. Any other failure is `E0502`.
 
+`metered(f)` answers `f()` with what it cost, in resources the runtime counts
+rather than time: `steps`, the calls it made, each counted as `--steps`
+counts them; `allocations`, the objects it built; and `performs`, each atom it
+performed with how many times, ordered by the atom's qualified name. A
+memoized constant costs what computing it costs, whether or not an earlier call
+computed it, so a cost is the same however often it is read, and the same
+under either profile (§8.6):
+
+```ply
+test "ten more elements cost twenty more steps: one in each closure" {
+  let small = metered(|| total(squares(10)));
+  let large = metered(|| total(squares(20)));
+  assert_eq(large.steps - small.steps, 20)
+}
+```
+
+A cost law (§10) states how `steps` grows with a size instead of pinning it.
+
 ### 8.2 Selection
 
 A definition's hash covers its normalized form: names, comments, formatting,
@@ -1321,7 +1339,8 @@ law "a credit and a matching debit leave an account exactly as it was"
   `result` is bound in `ensures`. `requires` restricts the domain of its
   `ensures`; it is not checked at call sites and laws do not inherit it.
 * A law has a label, optional `forall` binders (typed; `E0418` if a type cannot
-  be quantified), an optional `where` guard and a block body.
+  be quantified), an optional `where` guard, an optional `cost` bound (below)
+  and a block body.
 * Specs, guards and law bodies must be pure (`E0417`), except that they may
   raise (§6.8) and a law body may be a `simulate` region; a proposition that
   raises is a gap in the claim. `law/host "..." { }` allows any effect but is
@@ -1337,6 +1356,7 @@ law "a credit and a matching debit leave an account exactly as it was"
 | `proved` | holds for every input satisfying the guard |
 | `property` | randomized cases passed; failures shrink |
 | `example` | concrete cases passed |
+| `fitted` | a cost law's steps kept its bound's pace over eight or more sizes |
 | `unattempted` (`W0604`) | undecided; never green, never cached |
 | `defect` | Ply failed rather than the program: nothing is claimed, never cached, exit 1 |
 
@@ -1362,7 +1382,8 @@ values. A proposition that raises is a gap in the claim; one the compiled tier
 declines, or any other failure that is Ply's own, is a `defect` reported under
 Ply's code (`E0505`), as `ply test` reports one. Under `--json` a gap carries
 its sentence as `gap` and its kind as `gap_kind` (`unhandled_effect`,
-`ungeneratable`, `raised`, `guard_not_sampled`, `reaches_host`, `not_drawn`), a
+`ungeneratable`, `raised`, `guard_not_sampled`, `reaches_host`, `not_drawn`,
+`unfitted`), a
 defect carries `defect` — its `code`, `message`, the `bindings` Ply failed at,
 and a `summary` — and `summary` counts defects as `defect`. A claim's type
 variables are lettered by where they first appear among
@@ -1382,6 +1403,33 @@ not, and under `--json` each then carries `reach`: what it decided (`proved`,
 `guard_unsatisfiable`, `open` or `budget_spent`), the steps it spent, and each
 place it left the decidable fragment as `{kind, about}` — `null` for a law over
 interleavings, which the static tier never sees.
+
+A cost law states how fast a body's steps may grow with a size:
+
+```ply
+import std.list (sort)
+import std.math (ilog2)
+
+law "sorting is n log n" forall (n: Int) where n > 1 cost n * ilog2(n) {
+  sort(map(range(0, n), |i: Int| i * 7919 % n))
+}
+```
+
+`cost` follows the guard with the bound, an `Int` over the law's one binder,
+which is an `Int` size; a cost law is never `law/host`, and its body performs
+nothing (`E0463`). `ply prove` runs the body at each of the sizes 1, 2, 4 …
+4096 the guard keeps, counting its steps as `metered` (§8.1) does, and stops at
+a size that takes more than 10000000 (or `--prove-steps`, if lower). A size
+whose bound is not positive is not read. Over the last two spans between the
+sizes read, the steps may grow no faster than the bound does, give or take a
+twentieth of a doubling each, so constant factors and lower-order terms do not
+count. Steps that outgrow the bound over both spans are `outgrown` (`E0464`),
+which fails the run as a refutation does and lists every size with its steps
+and bound. A law that keeps pace is `fitted` over eight sizes or more and
+`example` over fewer, and one with fewer than three sizes to read is the gap
+`unfitted`. Under `--json` each carries `fit`: its `measures` (`size`, `steps`,
+`bound`), the size that took more steps than it was allowed as `spent` (`size`,
+`limit`), and a `summary`; and `summary` counts `fitted` and `outgrown`.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
@@ -1474,6 +1522,7 @@ authority when this page and it disagree.
 | `range(lo: Int, hi: Int) -> List<Int>` | `[lo, hi)` |
 | `iterate<a, b \| e>(seed: a, budget: Int, step: (a) -> Iter<a, b> / e) -> b / e` | |
 | `bracket<a, b \| e>(acquire: () -> a / e, release: (a) -> Unit / e, body: (a) -> b / e) -> b / e` | what `body` answers; `release` runs on what `acquire` answered however `body` ends but a failure (§6.6); the three run as one, so each may perform what the others do |
+| `metered<a \| e>(f: () -> a / e) -> {value: a, steps: Int, allocations: Int, performs: List<{atom: String, count: Int}>} / e` | `f()` and what it cost (§8.1) |
 | `map_new<k, v>() -> Map<k, v>` | |
 | `map_insert<k, v>(m: Map<k, v>, key: k, value: v) -> Map<k, v>` | |
 | `map_get<k, v>(m: Map<k, v>, key: k) -> Option<v>` | |
@@ -2241,7 +2290,7 @@ type Attestation = {
   name: String, version: Version, archive: String, semantics: String, builder: String,
   checked: Bool, promises: Bool,
   tests: { passed: Int, failed: Int },
-  proofs: { proved: Int, property: Int, example: Int, refuted: Int, unattempted: Int },
+  proofs: { proved: Int, property: Int, example: Int, fitted: Int, refuted: Int, unattempted: Int },
 }
 ```
 
@@ -2629,6 +2678,7 @@ pub fn pow(base: Int, exponent: Int) -> Int
 pub fn is_prime(n: Int) -> Bool
 pub fn factorial(n: Int) -> Int
 pub fn isqrt(n: Int) -> Int
+pub fn ilog2(n: Int) -> Int
 ```
 
 `min` and `max` are prelude builtins and stay there. `abs`, `sign`, `clamp`,
@@ -2636,8 +2686,9 @@ pub fn isqrt(n: Int) -> Int
 raise, so `abs(min_int())` and a width's overflowing `sum` raise; an empty
 list's `sum` is zero and its `product` one. The rest is `Int`. `gcd` and `lcm`
 are never negative, and `gcd(0, 0)` is `0`. `is_prime` says no for zero, one and
-every negative, `factorial` is `1` at and below one, and `isqrt` is the greatest
-`r` with `r * r <= n` — `0` for a negative `n`, which has none.
+every negative, `factorial` is `1` at and below one, `isqrt` is the greatest
+`r` with `r * r <= n` — `0` for a negative `n`, which has none — and `ilog2`
+the greatest `k` with `pow(2, k) <= n`, `0` at and below one.
 
 ### 13.29 `std.list`
 
@@ -3511,6 +3562,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0460` | artifact `--require-signer` refuses: unsigned, signed for other bytes, or by no trusted key |
 | `E0461` | `ply build --verify`: a file or signature that is not what these sources build |
 | `E0462` | key file that cannot be read, decoded or written |
+| `E0463` | cost law that cannot be measured: not one `Int` size, `law/host`, or a body that performs |
+| `E0464` | cost law whose steps outgrew its bound |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
