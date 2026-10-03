@@ -25,9 +25,8 @@ pub fn write(dir: &Path, name: &str, text: &str) {
     std::fs::write(path, text).expect("the fixture is written");
 }
 
-/// The runnable the builder writes of the file, or the project walked, at `path`: its front end's
-/// answer, a refusal's included, and its unit, every definition offered.
-fn answered(path: &Path) -> Vec<u8> {
+/// The file, or the project walked, at `path`, as the files the builder is handed.
+fn files_at(path: &Path) -> Vec<(String, String)> {
     let root = ply_machine::load::project_root(path);
     let mut paths = Vec::new();
     if path.is_file() {
@@ -36,7 +35,7 @@ fn answered(path: &Path) -> Vec<u8> {
         collect(path, &mut paths);
     }
     paths.sort();
-    let files: Vec<(String, String)> = paths
+    paths
         .iter()
         .map(|p| {
             (
@@ -44,15 +43,22 @@ fn answered(path: &Path) -> Vec<u8> {
                 std::fs::read_to_string(p).expect("the fixture is read"),
             )
         })
-        .collect();
-    ply_machine::builds::answered(&files)
-        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message))
+        .collect()
+}
+
+/// What the builder makes of the file or the project at `path`: its front end's answer, a
+/// refusal's included, and its unit, every definition offered.
+fn program_at(path: &Path) -> ply_machine::runnable::Runnable {
+    ply_machine::builds::answered_program(&files_at(path))
+        .unwrap_or_else(|d| panic!("the builder answers: {d}"))
 }
 
 /// The front end the CLI would hand a machine for the file, or the project, at `path`, as the record
 /// the effects take.
 pub fn handed(path: &Path) -> ply_eval::Value {
-    ply_machine::runnable::front_value(&answered(path))
+    let bytes = ply_machine::builds::answered(&files_at(path))
+        .unwrap_or_else(|d| panic!("the builder answers: {d}"));
+    ply_machine::runnable::front_value(&bytes)
         .unwrap_or_else(|why| panic!("the front end's answer reads: {why}"))
 }
 
@@ -93,10 +99,7 @@ pub fn loaded(path: &Path) -> ply_machine::load::Loaded {
 
 /// The errors the front end refused the program at `path` with.
 pub fn refusal(path: &Path) -> Vec<ply_eval::Diagnostic> {
-    let front = ply_machine::runnable::decode(&answered(path))
-        .unwrap_or_else(|why| panic!("the runnable reads: {why}"))
-        .front
-        .answer;
+    let front = program_at(path).front.answer;
     assert!(front.has_error(), "the program was not refused");
     front
         .diagnostics
@@ -108,10 +111,7 @@ pub fn refusal(path: &Path) -> Vec<ply_eval::Diagnostic> {
 /// The C of the unit of the program at `path`, every definition offered: what the CLI's emitter
 /// hands a machine.
 pub fn unit_text(path: &Path) -> Vec<u8> {
-    ply_machine::runnable::decode(&answered(path))
-        .unwrap_or_else(|why| panic!("the runnable reads: {why}"))
-        .unit
-        .into_bytes()
+    program_at(path).unit.into_bytes()
 }
 
 /// The C of the unit of the program at `path`, as the value a program hands `machine.load`.
@@ -200,25 +200,19 @@ pub fn int_laws(laws: &[(&str, &[&str])]) -> ply_eval::Value {
 /// What the builder makes of `source`, the module `module` names.
 #[track_caller]
 pub fn answer_for(module: &str, source: &str) -> ply_machine::runnable::Runnable {
-    let files = [(
-        format!("{}.ply", module.replace('.', "/")),
-        source.to_string(),
-    )];
-    let bytes = ply_machine::builds::answered(&files)
-        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
-    ply_machine::runnable::decode(&bytes).unwrap_or_else(|why| panic!("the answer reads: {why}"))
+    let files = ply_machine::builds::module_files(&[(module, source)]);
+    ply_machine::builds::answered_program(&files)
+        .unwrap_or_else(|d| panic!("the builder answers: {d}"))
 }
 
 /// The front end's answer for `source`, which has to check, and the unit compiled from it.
 #[track_caller]
 pub fn built(module: &str, source: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
-    let answer = answer_for(module, source);
-    let front = answer.front.answer;
-    assert!(
-        !front.has_error(),
-        "the fixture checks: {:?}",
-        front.diagnostics
-    );
-    let unit = ply_codegen::Unit::handed(&front, answer.unit).expect("this host has a C toolchain");
+    let files = ply_machine::builds::module_files(&[(module, source)]);
+    let program = ply_machine::builds::checked_program(&files)
+        .unwrap_or_else(|d| panic!("the fixture checks: {d}"));
+    let front = program.front.answer;
+    let unit =
+        ply_codegen::Unit::handed(&front, program.unit).expect("this host has a C toolchain");
     (front, unit)
 }
