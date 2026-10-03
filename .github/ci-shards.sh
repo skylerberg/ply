@@ -20,13 +20,18 @@
 #                                test count
 #   ci-shards.sh durations FILE  `binary_id test milliseconds` per test in a
 #                                nextest JUnit report
+#   ci-shards.sh timings BEFORE  the table the next run is cut by, from this
+#                                run's rows on stdin and the table BEFORE
 #   ci-shards.sh solo-matrix     the JSON matrix of tests that run alone
 #   ci-shards.sh solo-filter ID  the nextest filterset selecting one solo test
-#   ci-shards.sh corpus-matrix   the JSON matrix of the corpus runs that get a
-#                                runner of their own
+#   ci-shards.sh corpus-matrix   the JSON matrix of the corpus runs that get
+#                                runners of their own: the desk runners, then
+#                                each run alone
 #   ci-shards.sh corpus-for-partition K [DIR]
 #                                `lane entry` per corpus run partition K takes,
 #                                from the cut in DIR, or round robin without one
+#   ci-shards.sh desks-for-runner K [DIR]
+#                                the desk runs runner K takes, likewise
 #   ci-shards.sh corpus-line ID  the package one run tests and its filter
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the other
 #                                jobs: the solo tests and the host packages
@@ -52,8 +57,9 @@ TIMINGS=/tmp/ply-test-timings/timings.tsv
 
 TAB=$'\t'
 
-# Tests that get a runner of their own, as `id:package:target:test`. A long test is no reason: the
-# cut balances by duration. A test that must not share its runner is, since the cut cannot see that.
+# Tests that run alone, as `id:package:target:test`, after the gates on the gates job's runner. A long
+# test is no reason: the cut balances by duration. A test that must not share its runner is, since the
+# cut cannot see that.
 SOLO=(
   # It takes every test thread (nextest.toml), so in a shard it would run alone for its whole length
   # on top of the shard's share.
@@ -64,15 +70,18 @@ SOLO=(
 # that declares a test, and each module of the CLI's suite as `cli-<module>`, selected by its name.
 # Every check spawns `ply`, so a run takes its checks one after another, and the CLI's suite drives
 # `ply` in one working directory, so its runs take theirs one after another too. The runs that would
-# starve a partition get a runner each: the checks that start desks under load, and the compiler's
-# own tests on the tier, which take every core. The rest go to the partitions, beside their nextest
-# runs.
+# starve a partition get runners of their own; the rest go to the partitions.
 CORPUS_PROGRAM=crates/ply-corpus/ply
 # The programs the corpus program runs, each a `ply test` of its own whose tests must pass.
 CORPUS_FIXTURES=crates/ply-corpus/fixtures
 CORPUS_CHECKS=crates/ply-corpus/checks
 CLI_SUITE=crates/ply-cli-tests/ply
-CORPUS_ALONE=(serving database cli-compiler_on_the_tier)
+# The checks that start desks under load and drive them over postgres: a test at a time, cut by
+# duration over `DESK_RUNNERS` runners beside a postgres each, the `corpus` job's `desks-<k>`.
+CORPUS_DESKS=(serving database)
+DESK_RUNNERS=3
+# Runs that take a runner each: the compiler's own tests on the tier take every core.
+CORPUS_ALONE=(cli-compiler_on_the_tier)
 # Placed a test at a time rather than a module at a time: a whole module on one partition would
 # outlast the partition's nextest shard.
 CORPUS_BY_TEST=(audit generated toolchain)
@@ -92,9 +101,8 @@ PACKAGE_SUITES=(
   "suite:crates/ply-test/ply"
 )
 
-# The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes.
-# `test-hosts` runs them in one job. The set was named for postgres when the driver lived in the
-# host; the exclusion is the same and the name is not.
+# The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes. The
+# gates job runs them after its own tests.
 HOST_PACKAGES=(ply-host-tests)
 
 # Crate directories that are deliberately not workspace members, as `name:why`.
@@ -130,12 +138,11 @@ declare -a PROBE_JOBS=(
 # What a run parks for its own jobs, as the literal ci.yml writes before `${{ github.run_id }}`:
 # the archive every partition unpacks, the emitter's stage, and the shard cut. No later run can
 # name one, so a green run gives them back, and the repository's 10 GB cache stays for what does
-# outlive a run -- the stage under `ply-c-stage-sources-`, and the object cache. `test-timings-` is
-# run-scoped too and stays: a later run reads it, through `restore-keys`.
+# outlive a run -- the stage under `ply-c-stage-sources-`, and the object cache.
 GIVE_BACK=(nextest-archive- ply-c-stage-emitter- test-shards-)
 
 # `<family>-<run id>` entries only the newest of which is ever restored.
-SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest-)
+SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- test-timings-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
@@ -215,7 +222,7 @@ corpus_entries() {
   printf 'program\n'
   for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
-  module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}"
+  module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
   module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
 }
 
@@ -270,9 +277,19 @@ corpus_alone() {
   return 1
 }
 
+# Whether the entry is a test of a module whose checks start desks.
+corpus_desk() {
+  named_in "${1%%:*}" "${CORPUS_DESKS[@]}"
+}
+
 cmd_corpus_matrix() {
-  local id first=1
+  local id k first=1
   printf '{"include":['
+  for ((k = 1; k <= DESK_RUNNERS; k++)); do
+    ((first)) || printf ','
+    first=0
+    printf '{"id":"desks-%d"}' "$k"
+  done
   for id in "${CORPUS_ALONE[@]}"; do
     ((first)) || printf ','
     first=0
@@ -281,12 +298,34 @@ cmd_corpus_matrix() {
   printf ']}\n'
 }
 
-# Every entry that does not run alone.
+# Every entry the partitions take: neither alone nor a desk run.
 corpus_placed() {
   local id
   while read -r id; do
-    corpus_alone "$id" || printf '%s\n' "$id"
+    corpus_alone "$id" || corpus_desk "$id" || printf '%s\n' "$id"
   done < <(corpus_entries)
+}
+
+# Every entry the desk runners take.
+desk_placed() {
+  local id
+  while read -r id; do
+    if corpus_desk "$id"; then printf '%s\n' "$id"; fi
+  done < <(corpus_entries)
+}
+
+# The desk runs runner K takes, one a line: the plan's cut when DIR holds one, else round robin.
+cmd_desks_for_runner() {
+  local k=$1 dir=${2:-} id n=0
+  if [[ -n $dir ]]; then
+    [[ -f $dir/desks-$k.txt ]] || { echo "the plan's cut in $dir holds no desks-$k.txt" >&2; return 1; }
+    cat "$dir/desks-$k.txt"
+    return 0
+  fi
+  while read -r id; do
+    (((n % DESK_RUNNERS) + 1 == k)) && printf '%s\n' "$id"
+    n=$((n + 1))
+  done < <(desk_placed)
 }
 
 # `lane entry` per corpus run partition K takes: the plan's cut when DIR holds one, which it does for
@@ -395,6 +434,31 @@ cmd_durations() {
   ' "$@"
 }
 
+# The table the next run is cut by, from this run's rows on stdin and BEFORE, the table this run was
+# cut by: one duration a test, the longest any job measured. A corpus or startup row is what it cost
+# when no corpus test came from the cache, so a run that took some keeps BEFORE's: cut by a warm
+# run's costs, a cold run piles what the cache had saved onto one partition. `cached` rows only say
+# which run this was.
+cmd_timings() {
+  local before=$1
+  awk -F"$TAB" -v OFS="$TAB" -v before="$before" '
+    BEGIN {
+      while ((getline line < before) > 0) {
+        split(line, f, "\t")
+        if (f[1] == "corpus" || f[1] == "startup") kept[f[1] "\t" f[2]] = f[3]
+      }
+    }
+    $1 == "cached" { if ($3 + 0 > 0) warm = 1; next }
+    NF == 3 { k = $1 OFS $2; if (!(k in ms) || $3 + 0 > ms[k]) ms[k] = $3 + 0 }
+    END {
+      for (k in ms) {
+        split(k, f, OFS)
+        print k, ((warm && (f[1] == "corpus" || f[1] == "startup") && (k in kept)) ? kept[k] : ms[k])
+      }
+    }
+  ' | LC_ALL=C sort -t"$TAB" -k1,1 -k2,2
+}
+
 # `t shard binary test ms` per timed test, longest first onto the least loaded shard, then
 # `load shard ms tests` per shard and `catchall shard`: the shard with the most room left, which
 # is the one that runs what no other shard names.
@@ -474,7 +538,7 @@ living_durations() {
     return 1
   }
   # A corpus row is the entry's own, and lives while the entry does; a startup row is a package's.
-  dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" -v placed="$(corpus_placed | tr '\n' ' ')" '
+  dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" -v placed="$({ corpus_placed; desk_placed; } | tr '\n' ' ')" '
     BEGIN { n = split(placed, ids, " "); for (i = 1; i <= n; i++) corpus[ids[i]] = 1; n = 0 }
     NR == FNR { live[$0] = 1; next }
     $1 == "corpus" { if ($2 in corpus) print > out; else n++; next }
@@ -555,7 +619,46 @@ shard_configs() {
   ' "$tmp/assigned"
   touch "$tmp/corpus"
   corpus_cut "$dir" "$tmp/corpus"
+  desk_cut "$dir" "$tmp/corpus"
   rm -rf "$tmp"
+}
+
+# The desk runs, longest first onto the runner that would end soonest with it, as `desks-<k>.txt` of
+# an entry a line. Every runner loads the checks once, so no startup tips the choice. A run nothing
+# measured counts as the median of those that were, and is placed after them.
+desk_cut() {
+  local dir=$1 rows=$2 k
+  for ((k = 1; k <= DESK_RUNNERS; k++)); do : > "$dir/desks-$k.txt"; done
+  desk_placed | awk -v rows="$rows" -v dir="$dir" -v n="$DESK_RUNNERS" '
+    BEGIN {
+      FS = "\t"
+      while ((getline line < rows) > 0) {
+        split(line, f, "\t")
+        if (f[1] == "corpus") ms[f[2]] = f[3] + 0
+      }
+      FS = " "
+    }
+    { ids[++m] = $1 }
+    END {
+      for (i = 1; i <= m; i++) if (ids[i] in ms) { t++; order[t] = ids[i] }
+      # Longest first, ties in entry order.
+      for (i = 2; i <= t; i++) {
+        x = order[i]
+        for (j = i - 1; j >= 1 && ms[order[j]] < ms[x]; j--) order[j + 1] = order[j]
+        order[j + 1] = x
+      }
+      median = t ? ms[order[int((t + 1) / 2)]] : 60000
+      for (i = 1; i <= m; i++) if (!(ids[i] in ms)) { order[++t] = ids[i]; ms[ids[i]] = median }
+      for (i = 1; i <= t; i++) {
+        best = 1
+        for (k = 2; k <= n; k++) if (load[k] < load[best]) best = k
+        load[best] += ms[order[i]]
+        held[best]++
+        print order[i] >> (dir "/desks-" best ".txt")
+      }
+      for (k = 1; k <= n; k++) printf "desks %d: %d runs, %.1fs\n", k, held[k], load[k] / 1000
+    }
+  '
 }
 
 # The corpus runs the partitions take, longest first onto the lane of every partition's that would
@@ -643,6 +746,7 @@ cmd_cache_keys() {
     function note(kind, value, key) {
       key = literal(value)
       if (key == "") return
+      steplit[++nlit] = key
       if (kind == "save") {
         if (key in saved) return
         saved[key] = 1
@@ -656,12 +760,35 @@ cmd_cache_keys() {
         read[key] = 1
       }
     }
-    FNR == 1 { mode = ""; inkeys = 0; indent = 0 }
+    # A step is done: what it saves is saved from its path, and what it restores is only an entry
+    # saved from the same path, since a path is part of an entry'"'"'s version.
+    function flush(i) {
+      for (i = 1; i <= nlit; i++) {
+        if (mode == "save") savepath[steplit[i]] = steppath
+        else if (mode == "restore") { rlit[++nr] = steplit[i]; rpath[nr] = steppath; rwhere[nr] = stepwhere }
+      }
+      nlit = 0; steppath = ""; inpath = 0
+    }
+    FNR == 1 { flush(); mode = ""; inkeys = 0; indent = 0 }
     # A new list item is a new step; the rules below read the one they are in.
-    /^[[:space:]]*-[[:space:]]/ { mode = ""; inkeys = 0 }
-    /uses:[[:space:]]*actions\/cache\/save@/ { mode = "save"; inkeys = 0; next }
-    /uses:[[:space:]]*actions\/cache\/restore@/ { mode = "restore"; inkeys = 0; next }
+    /^[[:space:]]*-[[:space:]]/ { flush(); mode = ""; inkeys = 0 }
+    /uses:[[:space:]]*actions\/cache\/save@/ { mode = "save"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
+    /uses:[[:space:]]*actions\/cache\/restore@/ { mode = "restore"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
     mode == "" { next }
+    inpath {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      if (line != "" && length($0) - length(line) > pindent) { steppath = steppath (steppath == "" ? "" : ",") line; next }
+      inpath = 0
+    }
+    /^[[:space:]]*path:/ {
+      rest = $0
+      sub(/.*path:[[:space:]]*/, "", rest)
+      pindent = match($0, /[^ ]/) - 1
+      if (rest == "|") inpath = 1
+      else steppath = rest
+      next
+    }
     inkeys && /^[[:space:]]*$/ { next }
     inkeys {
       line = $0
@@ -683,7 +810,15 @@ cmd_cache_keys() {
       note(mode, rest)
     }
     END {
+      flush()
       bad = 0
+      for (i = 1; i <= nr; i++)
+        for (k in savepath)
+          if (index(k, rlit[i]) == 1 && savepath[k] != rpath[i] && !((rwhere[i], rlit[i]) in told)) {
+            told[rwhere[i], rlit[i]] = 1
+            printf "FAIL: %s restores \"%s\" into %s, and \"%s\" is saved from %s: a path is part of an entry'"'"'s version, so the restore never finds it\n", rwhere[i], rlit[i], rpath[i], k, savepath[k] > "/dev/stderr"
+            bad = 1
+          }
       if (n == 0 || length(read) == 0) {
         printf "FAIL: read %d cache key literal(s) written and %d restored -- the check would pass vacuously\n", n, length(read) > "/dev/stderr"
         exit 1
@@ -953,6 +1088,13 @@ check_shards() {
     echo "FAIL: the $what cut's corpus runs are not every run a partition takes, each once" >&2
     bad=1
   fi
+  for ((i = 1; i <= DESK_RUNNERS; i++)); do
+    cmd_desks_for_runner "$i" "$dir"
+  done | LC_ALL=C sort > "$tmp/desks-cut"
+  if ! cmp -s "$tmp/desks-cut" <(desk_placed | LC_ALL=C sort); then
+    echo "FAIL: the $what cut's desk runs are not every desk run, each once" >&2
+    bad=1
+  fi
   rm -rf "$tmp"
   return "$bad"
 }
@@ -1091,7 +1233,7 @@ cmd_verify() {
   fi
 
   # --- the shards the durations cut -----------------------------------------
-  local made_up made_up_test
+  local made_up
   if [[ $NEXTEST_SHARDS -lt 2 ]]; then
     echo "FAIL: NEXTEST_SHARDS is $NEXTEST_SHARDS, and one shard is the negation of the others" >&2
     failures=$((failures + 1))
@@ -1115,6 +1257,30 @@ cmd_verify() {
       check_shards measured "$TIMINGS" || failures=$((failures + 1))
     fi
   fi
+
+  # --- the table the next run is cut by -------------------------------------
+  local table warm cold
+  made_up=$(mktemp -d)
+  printf 'corpus\ta\t100\nstartup\tp\t90000\nx::y\tt\t5\n' > "$made_up/before.tsv"
+  printf 'corpus\ta\t3\ncorpus\ta\t7\ncorpus\tb\t40\nstartup\tp\t20000\nx::y\tt\t9\n' > "$made_up/measured.tsv"
+  warm="corpus a 100;corpus b 40;startup p 90000;x::y t 9;"
+  cold="corpus a 7;corpus b 40;startup p 20000;x::y t 9;"
+  table=$({ cat "$made_up/measured.tsv"; printf 'cached\tp\t12\n'; } | cmd_timings "$made_up/before.tsv" | tr '\t\n' ' ;')
+  if [[ $table != "$warm" ]]; then
+    echo "FAIL: a run that took tests from the cache wrote '$table', not the corpus rows it was cut by: '$warm'" >&2
+    failures=$((failures + 1))
+  fi
+  table=$({ cat "$made_up/measured.tsv"; printf 'cached\tp\t0\n'; } | cmd_timings "$made_up/before.tsv" | tr '\t\n' ' ;')
+  if [[ $table != "$cold" ]]; then
+    echo "FAIL: a run that took nothing from the cache wrote '$table', not the longest it measured: '$cold'" >&2
+    failures=$((failures + 1))
+  fi
+  table=$(cmd_timings "$made_up/none.tsv" < "$made_up/measured.tsv" | tr '\t\n' ' ;')
+  if [[ $table != "$cold" ]]; then
+    echo "FAIL: a run with no table before it wrote '$table', not the longest it measured: '$cold'" >&2
+    failures=$((failures + 1))
+  fi
+  rm -rf "$made_up"
 
   # --- probes ---------------------------------------------------------------
   local workflow="$root/.github/workflows/ci.yml"
@@ -1202,11 +1368,21 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  for module in "${CORPUS_DESKS[@]}"; do
+    if ! grep -qx "$module:1" <<< "$entries"; then
+      echo "FAIL: '$module' runs on the desk runners and $CORPUS_CHECKS/$module.ply declares no test" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ $DESK_RUNNERS -lt 1 ]]; then
+    echo "FAIL: DESK_RUNNERS is $DESK_RUNNERS, so the desk runs run nowhere" >&2
+    failures=$((failures + 1))
+  fi
   # A run is picked out by a substring of its tests' qualified names: a module's by `<module>.`, which
   # no test of another module may hold, and a test placed by name by its own, which no other test of
   # its module may hold.
   local module names keys pair outside
-  for pair in "$CORPUS_CHECKS:${CORPUS_BY_TEST[*]}" "$CLI_SUITE:${CLI_BY_TEST[*]}"; do
+  for pair in "$CORPUS_CHECKS:${CORPUS_BY_TEST[*]} ${CORPUS_DESKS[*]}" "$CLI_SUITE:${CLI_BY_TEST[*]}"; do
     dir=${pair%%:*}
     keys=$(package_keys "$dir")
     for module in $(sed 's/\..*//' <<< "$keys" | sort -u); do
@@ -1240,11 +1416,15 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
-  # Every entry that does not run alone is some partition's, so the round robin stays total.
+  # Every entry is a partition's, a desk runner's or alone, once, so the round robins stay total.
   local placed k
-  placed=$(for ((k = 1; k <= PARTITIONS; k++)); do cmd_corpus_for_partition "$k"; done | cut -d' ' -f2 | sort)
-  if [[ $placed != "$(grep -vxF -f <(printf '%s\n' "${CORPUS_ALONE[@]}") <<< "$entries" | sort)" ]]; then
-    echo "FAIL: the partitions' corpus runs are not every entry that does not run alone" >&2
+  placed=$(
+    for ((k = 1; k <= PARTITIONS; k++)); do cmd_corpus_for_partition "$k" | cut -d' ' -f2; done
+    for ((k = 1; k <= DESK_RUNNERS; k++)); do cmd_desks_for_runner "$k"; done
+    printf '%s\n' "${CORPUS_ALONE[@]}"
+  )
+  if [[ $(sort <<< "$placed") != "$(sort <<< "$entries")" ]]; then
+    echo "FAIL: the partitions', desk runners' and lone corpus runs are not every entry, each once" >&2
     failures=$((failures + 1))
   fi
   if ! grep -q 'ci-corpus\.sh' "$workflow"; then
@@ -1252,7 +1432,7 @@ cmd_verify() {
     failures=$((failures + 1))
   fi
   # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
-  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition"; do
+  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition" "ci-corpus.sh desks"; do
     corpus_job=$(awk -v c="${corpus_command//./\\.}" '
       /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
       $0 ~ c { print job; exit }
@@ -1300,10 +1480,12 @@ case "${1:-}" in
   nextest-shards) cmd_nextest_shards ;;
   shard-configs) cmd_shard_configs "${2:-}" ;;
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
+  timings) cmd_timings "${2:?the table this run was cut by, which need not exist}" ;;
   solo-matrix) cmd_solo_matrix ;;
   solo-filter) cmd_solo_filter "${2:?a solo id}" ;;
   corpus-matrix) cmd_corpus_matrix ;;
   corpus-for-partition) cmd_corpus_for_partition "${2:?a partition}" "${3:-}" ;;
+  desks-for-runner) cmd_desks_for_runner "${2:?a desk runner}" "${3:-}" ;;
   corpus-line) cmd_corpus_line "${2:?a corpus entry}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
@@ -1313,7 +1495,7 @@ case "${1:-}" in
   give-back) cmd_give_back "${2:?a run id}" ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|nextest-shards|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|corpus-matrix|corpus-for-partition K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN|supersede RUN REF}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|solo-matrix|solo-filter ID|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|give-back RUN|supersede RUN REF}" >&2
     exit 2
     ;;
 esac

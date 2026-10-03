@@ -160,6 +160,8 @@ pub enum Builtin {
     ArrayGet,
     /// In place while the array has one holder; raises out of range.
     ArraySet,
+    /// The value as a `std.value.Value`, whole: what `std.show.show` renders.
+    Reflect,
 }
 
 impl Builtin {
@@ -321,6 +323,7 @@ impl Builtin {
             "array_at" => Builtin::ArrayAt,
             "array_get" => Builtin::ArrayGet,
             "array_set" => Builtin::ArraySet,
+            "reflect" => Builtin::Reflect,
             _ => return None,
         })
     }
@@ -452,6 +455,7 @@ impl Builtin {
             Builtin::ArrayAt => "array_at",
             Builtin::ArrayGet => "array_get",
             Builtin::ArraySet => "array_set",
+            Builtin::Reflect => "reflect",
         }
     }
 
@@ -516,6 +520,7 @@ impl Builtin {
             | Builtin::ArrayOfList
             | Builtin::ArrayToList
             | Builtin::ArrayLen
+            | Builtin::Reflect
             | Builtin::IntOfU8
             | Builtin::IntOfU16
             | Builtin::IntOfU32
@@ -749,6 +754,7 @@ impl Builtin {
             Builtin::ArrayAt,
             Builtin::ArrayGet,
             Builtin::ArraySet,
+            Builtin::Reflect,
         ]
     }
 }
@@ -1298,6 +1304,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::ArraySet => array_set(args, span),
+
+        Builtin::Reflect => Ok(crate::reflect::value_of(&Plain::of(&args[0]))),
 
         Builtin::StringSlice => {
             let s = args[0].as_str(span, "`string_slice`")?;

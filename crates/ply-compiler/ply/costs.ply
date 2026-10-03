@@ -4,7 +4,8 @@ import spine (Span, Ident, QName, num, dummy_span)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
              NCell, NLambda, NSim, NPar, NHandle, NField, NUpd, NLabel, CStmt, CLet, CLetPat, CDo,
              CArm, CField, CClause, Cap, Own, Owned, pat_slots, lower_fn)
-import items (Module, Derived, Item, IFn, ITest, ILaw, Binder, parse)
+import items (Module, Derived, Item, IFn, ITest, ILaw, Binder, FnDef, ReturnsFresh, ReturnsParam,
+              parse)
 import exprs (Param, Expr)
 import rewrite (expand)
 import embed (EmbedAt, embed_tables, rewritten)
@@ -52,7 +53,17 @@ type Arms = { st: St, owner: Option<Owner> }
 
 type Args = { st: St, res: List<Owner> }
 
-type Def = { name: Bytes, arity: Int }
+// A definition, and what its `returns` clause says of its answer. A definition of another package is
+// never walked: a call of it answers what the clause says, and nothing is known without one.
+type Def = {
+  name: Bytes,
+  module: Int,
+  module_name: Bytes,
+  params: List<Bytes>,
+  arity: Int,
+  own: Bool,
+  says: Option<{ ret: RState, span: Span }>,
+}
 
 // `def` is the index in `Prog.defs`, or -1 for a test or a law, which has no caller.
 type Body = {
@@ -571,7 +582,21 @@ fn interpret(o: Owner, caller: Int, t: Tables, at_: Bytes) -> PState =
 fn start_tables(defs: List<Def>) -> Tables =
   {
     params: map(defs, |d: Def| map(range(0, d.arity), |_: Int| PSole)),
-    rets: map(defs, |_d: Def| RFresh),
+    rets: map(defs, |d: Def|
+      if d.own { RFresh } else {
+        match d.says {
+          Some(x) -> x.ret,
+          None ->
+            RUnsure({
+              cause: CCall,
+              text: bytes_concat_all([
+                b"`",
+                d.name,
+                b"` is another package's, and its signature writes no `returns`",
+              ]),
+            }),
+        }
+      }),
   }
 
 fn walk_body(env: Env, b: Body) -> Found / {abort.raise} =
@@ -659,8 +684,19 @@ pub type Costed = {
   sites: List<Site>,
 }
 
+// A `returns` clause the body does not keep: where it is written, and what the body answers instead.
+pub type Unkept = {
+  module: Int,
+  module_name: Bytes,
+  name: Bytes,
+  start: Int,
+  end: Int,
+  said: Bytes,
+  answers: Bytes,
+}
+
 // `ok` is false for a program that did not resolve, which costs nothing rather than nothing costing.
-pub type Report = { ok: Bool, rounds: Int, defs: List<Costed> }
+pub type Report = { ok: Bool, rounds: Int, defs: List<Costed>, unkept: List<Unkept> }
 
 fn finish(raw: Raw, def: Int, t: Tables) -> Site = {
   let sited = |verdict: Bytes, reason: Bytes, cause: Option<Cause>, param: Int|
@@ -739,10 +775,14 @@ fn quoted(s: Bytes) -> Bytes / {abort.raise} =
 fn lowered(names: List<Bytes>, labels: List<Bytes>, body: Expr) -> Option<Code> / {abort.raise} =
   match lower_fn(names, labels, map_new(), body) { Some(l) -> Some(l.code), None -> None }
 
-fn bodies_of(mods: List<Mod>, index: Map<Bytes, Int>) -> List<Body> / {abort.raise} =
+fn bodies_of(
+  mods: List<Mod>,
+  index: Map<Bytes, Int>,
+  own: (Int) -> Bool,
+) -> List<Body> / {abort.raise} =
   fold(range(0, len(mods)), [], |acc: List<Body>, i: Int| {
     let m: Mod = at(mods, i);
-    fold(m.module.items, acc, |a: List<Body>, it: Item|
+    fold(if own(i) { m.module.items } else { [] }, acc, |a: List<Body>, it: Item|
       match it {
         IFn(d) -> {
           let labels = map(d.generics.labels, |g: Ident| g.name);
@@ -793,6 +833,76 @@ fn bodies_of(mods: List<Mod>, index: Map<Bytes, Int>) -> List<Body> / {abort.rai
       })
   })
 
+fn def_of_fn(module: Bytes, i: Int, own: Bool, d: FnDef) -> Def / {abort.raise} = {
+  let params = map(d.params, |p: Param| p.name.name);
+  {
+    name: qualify(module, d.name.name),
+    module: i,
+    module_name: module,
+    params: params,
+    arity: len(d.params),
+    own: own,
+    says: match d.returns {
+      None -> None,
+      Some(ReturnsFresh(sp)) -> Some({ ret: RFresh, span: sp }),
+      Some(ReturnsParam(x)) ->
+        Some({
+          ret: RParam(
+            fold(range(0, len(params)), 0, |acc: Int, k: Int|
+              if at(params, k) == x.name { k } else { acc }),
+          ),
+          span: x.span,
+        }),
+    },
+  }
+}
+
+// What a body answering `got` breaks of a clause saying `said`: fresh keeps either clause, and a
+// parameter keeps only the clause naming it.
+fn breaks(said: RState, got: RState) -> Bool =
+  match got {
+    RFresh -> false,
+    RParam(k) -> match said { RParam(j) -> j != k, _ -> true },
+    _ -> true,
+  }
+
+fn ret_text(d: Def, r: RState) -> Bytes =
+  match r {
+    RFresh -> b"fresh",
+    RParam(k) ->
+      bytes_concat_all([
+        b"its parameter `",
+        match list_at(d.params, k) { Some(n) -> n, None -> num(k) },
+        b"`",
+      ]),
+    RShared(w) -> w.text,
+    RUnsure(w) -> w.text,
+  }
+
+fn unkept_of(p: Prog, t: Tables) -> List<Unkept> / {abort.raise} =
+  fold(range(0, len(p.defs)), [], |acc: List<Unkept>, i: Int| {
+    let d: Def = at(p.defs, i);
+    match d.says {
+      None -> acc,
+      Some(x) -> if !d.own { acc } else {
+        match list_at(t.rets, i) {
+          Some(got) -> if !breaks(x.ret, got) { acc } else {
+            push(acc, {
+              module: d.module,
+              module_name: d.module_name,
+              name: d.name,
+              start: x.span.start,
+              end: x.span.end,
+              said: ret_text(d, x.ret),
+              answers: ret_text(d, got),
+            })
+          },
+          None -> acc,
+        }
+      },
+    }
+  })
+
 // Every name the checker binds as a builtin, which is what tells a call to `push` from a call to
 // a definition.
 fn builtins() -> List<Bytes> / {abort.raise} =
@@ -838,19 +948,20 @@ fn program_of(
         None -> None,
         Some(shapes) -> {
           let mods = expanded_mods(x.mods, shapes);
-          let defs = fold(mods, [], |acc: List<Def>, m: Mod|
+          // The root package's: the one the program's own appends and promises are in.
+          let own = |i: Int| match list_at(packaged.mod_pkg, i) { Some(k) -> k == 0, None -> true };
+          let defs = fold(range(0, len(mods)), [], |acc: List<Def>, i: Int| {
+            let m: Mod = at(mods, i);
             fold(m.module.items, acc, |a: List<Def>, it: Item|
-              match it {
-                IFn(d) -> push(a, { name: qualify(m.name, d.name.name), arity: len(d.params) }),
-                _ -> a,
-              }));
+              match it { IFn(d) -> push(a, def_of_fn(m.name, i, own(i), d)), _ -> a })
+          });
           let index = fold(range(0, len(defs)), map_new(), |acc: Map<Bytes, Int>, i: Int|
             map_insert(acc, at(defs, i).name, i));
           Some({
             r: x.r,
             index: index,
             defs: defs,
-            bodies: bodies_of(mods, index),
+            bodies: bodies_of(mods, index, own),
             builtins: fold(builtins(), map_new(), |acc: Map<Bytes, Bool>, b: Bytes|
               map_insert(acc, b, true)),
           })
@@ -871,7 +982,7 @@ pub fn costs(
   embeds: List<EmbedAt> = [],
 ) -> Report / {abort.raise} =
   match program_of(names, srcs, pkgs, mod_pkg, shelf, embeds) {
-    None -> { ok: false, rounds: 0, defs: [] },
+    None -> { ok: false, rounds: 0, defs: [], unkept: [] },
     Some(p) -> {
       let settled = fixpoint(p, start_tables(p.defs), 0);
       // Verdicts come from a walk under the settled tables, not the round that produced them.
@@ -894,6 +1005,7 @@ pub fn costs(
             })
           }
         }),
+        unkept: unkept_of(p, settled.tables),
       }
     },
   }
@@ -943,4 +1055,44 @@ test "an array or list element replaced in place is an update, and one read out 
   ]);
   let bumped = site_of(b"bump");
   assert_eq([bumped.op, bumped.verdict], [b"list_set", b"reuses"])
+}
+
+fn verdicts(r: Report) -> List<Bytes> =
+  fold(r.defs, [], |acc: List<Bytes>, d: Costed|
+    fold(d.sites, acc, |a: List<Bytes>, s: Site|
+      push(a, bytes_concat_all([d.name, b" ", s.verdict]))))
+
+test "a `returns` clause is shown of its body, and one the body does not keep is named" {
+  let src = bytes_concat_all([
+    b"fn mk(n: Int) -> List<Int> returns fresh = range(0, n)\n",
+    b"fn pick(xs: List<Int>, ys: List<Int>) -> List<Int> returns ys = xs\n",
+    b"fn same(xs: List<Int>) -> List<Int> returns xs = xs\n",
+    b"fn folded(xs: List<Int>) -> List<Int> returns fresh = fold(xs, [], |acc: List<Int>, x: Int| push(acc, x))\n",
+  ]);
+  let r = costs([b"m"], [src], [], [], 0);
+  assert(r.ok);
+  assert_eq(map(r.unkept, |u: Unkept| (u.name, u.said, u.answers)), [
+    (b"m.pick", b"its parameter `ys`", b"its parameter `xs`"),
+    (b"m.folded", b"fresh", b"`fold` answers whatever its callback answered"),
+  ]);
+  assert_eq(bytes_slice(src, at(r.unkept, 0).start, at(r.unkept, 0).end), b"ys")
+}
+
+test "another package's definition answers what its `returns` clause says, its body unread" {
+  let lib = bytes_concat_all([
+    b"pub fn made(n: Int) -> List<Int> returns fresh = fold(range(0, n), [], |acc: List<Int>, x: Int| push(acc, x))\n",
+    b"pub fn plain(n: Int) -> List<Int> = range(0, n)\n",
+  ]);
+  let app = b"import lib.more\nreuse fn grow(n: Int) -> List<Int> = push(more::made(n), n)\nreuse fn other(n: Int) -> List<Int> = push(more::plain(n), n)\n";
+  let pkgs = [
+    { prefix: b"", deps: [b"lib"] },
+    { prefix: b"lib", deps: [] },
+    { prefix: b"std", deps: [] },
+    { prefix: b"compiler", deps: [] },
+  ];
+  let r = costs([b"app", b"lib.more"], [app, lib], pkgs, [0, 1], 4);
+  assert(r.ok);
+  assert_eq(verdicts(r), [b"grow reuses", b"other unknown"]);
+  // The dependency's clause is its own run's to show.
+  assert_eq(r.unkept, [])
 }

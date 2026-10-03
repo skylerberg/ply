@@ -1,7 +1,7 @@
 // Where an update (`push`, `list_set`, `array_set`) copies, before the program runs: `ply check
 // --costs` reads it out, and a `reuse fn` whose body copies is refused with it.
 
-import compiler.costs (Report, Costed, Site, costs)
+import compiler.costs (Report, Costed, Site, Unkept, costs)
 import compiler.front (Whole)
 import compiler.items (Item, IFn)
 import compiler.resolve (Source, Mod, Diag, diag1, diag2)
@@ -28,22 +28,44 @@ pub fn costs_of(p: Program, w: Whole) -> Report / {abort.raise} = {
   { ..r, defs: filter(r.defs, |d: Costed| d.module < len(p.files)) }
 }
 
-// A `reuse fn` whose promise the cost checker cannot show, as the diagnostics a run is refused
-// with; nothing at all when none of the run's own modules declares one.
+// A `reuse fn` whose promise the cost checker cannot show, and a `returns` clause it cannot show of
+// its body, as the diagnostics a run is refused with; nothing at all when none of the run's own
+// modules writes either.
 pub fn broken_promises(p: Program, w: Whole) -> List<Diag> / {abort.raise} =
   if !promised(p, w) { [] } else {
     let r = costs_of(p, w);
-    if !r.ok { [unresolved()] } else { promises(r) }
+    if !r.ok { [unresolved()] }
+    else { fold(r.unkept, promises(r), |acc: List<Diag>, u: Unkept| push(acc, unkept_returns(u))) }
   }
 
-// Whether one of the run's own modules declares a `reuse fn`, so the promise check can be skipped.
+// Whether one of the run's own modules writes a `reuse fn` or a `returns` clause, so the promise
+// check can be skipped.
 pub fn promised(p: Program, w: Whole) -> Bool =
   fold(w.mods, { i: 0, any: false }, |acc: { i: Int, any: Bool }, m: Mod|
     { i: acc.i + 1, any: acc.any || (acc.i < len(p.files) && promises_reuse(m)) }).any
 
 fn promises_reuse(m: Mod) -> Bool =
   fold(m.module.items, false, |a: Bool, it: Item|
-    match it { IFn(d) -> a || (match d.reuse { Some(_) -> true, None -> false }), _ -> a })
+    match it { IFn(d) -> a || d.reuse != None || d.returns != None, _ -> a })
+
+fn unkept_returns(u: Unkept) -> Diag =
+  diag1(
+    b"E0148",
+    u.module,
+    { start: u.start, end: u.end },
+    bytes_concat_all([
+      b"`",
+      u.name,
+      b"` says it returns ",
+      u.said,
+      b", and its body answers ",
+      u.answers,
+    ]),
+    b"the clause",
+    [
+      b"a caller in another package reads this clause in place of the body: write what the body answers, or change the body",
+    ],
+  )
 
 // --- The listing ------------------------------------------------------------------
 
@@ -240,10 +262,10 @@ test "a definition's tally names only the verdicts it has, in one order" {
 }
 
 test "a program that updates nothing is told so on one line" {
-  assert_eq(report_lines({ styled: false }, place(), { ok: true, rounds: 1, defs: [] }), [
-    "",
-    "   no updates: nothing to cost",
-  ])
+  assert_eq(
+    report_lines({ styled: false }, place(), { ok: true, rounds: 1, defs: [], unkept: [] }),
+    ["", "   no updates: nothing to cost"],
+  )
 }
 
 test "a site is placed by its file's base name and the verdict column does not move" {
@@ -251,6 +273,7 @@ test "a site is placed by its file's base name and the verdict column does not m
     ok: true,
     rounds: 2,
     defs: [costed(b"fn", [site(b"copies", b"read again", b"bind it first", 0 - 1)], None)],
+    unkept: [],
   };
   assert_eq(report_lines({ styled: false }, place(), r), [
     "",
@@ -269,6 +292,7 @@ test "a `reuse fn` is refused for a copy its own body causes and for nothing els
     ok: true,
     rounds: 1,
     defs: [costed(b"fn", [site(b"reuses", b"fine", b"", 0 - 1)], promise)],
+    unkept: [],
   };
   assert_eq(promises(kept), []);
   // An update of the definition's own parameter is the caller's business, not this body's.
@@ -276,12 +300,14 @@ test "a `reuse fn` is refused for a copy its own body causes and for nothing els
     ok: true,
     rounds: 1,
     defs: [costed(b"fn", [site(b"copies", b"a caller keeps it", b"", 0)], promise)],
+    unkept: [],
   };
   assert_eq(promises(caller), []);
   let broken: Report = {
     ok: true,
     rounds: 1,
     defs: [costed(b"fn", [site(b"copies", b"read again", b"`map_update`", 0 - 1)], promise)],
+    unkept: [],
   };
   let raised = promises(broken);
   assert_eq(len(raised), 1);
@@ -295,6 +321,7 @@ test "a `reuse fn` is refused for a copy its own body causes and for nothing els
     ok: true,
     rounds: 1,
     defs: [costed(b"fn", [site(b"unknown", b"a call", b"", 0 - 1)], promise)],
+    unkept: [],
   };
   assert_eq(map(promises(hopeless), |x: Diag| x.message), [
     b"`grow` is a `reuse fn`, and this `push` cannot be shown to reuse its list: a call",
@@ -305,6 +332,7 @@ test "a `reuse fn` is refused for a copy its own body causes and for nothing els
     defs: [
       costed(b"fn", [{ ..site(b"copies", b"read again", b"", 0 - 1), op: b"array_set" }], promise),
     ],
+    unkept: [],
   };
   assert_eq(map(promises(array), |x: Diag| x.message), [
     b"`grow` is a `reuse fn`, and this `array_set` copies its array: read again",
@@ -316,6 +344,24 @@ test "a definition with no promise is costed and never refused" {
     ok: true,
     rounds: 1,
     defs: [costed(b"fn", [site(b"copies", b"read again", b"", 0 - 1)], None)],
+    unkept: [],
   };
   assert_eq(promises(r), [])
+}
+
+test "a `returns` clause its body does not keep is refused where it is written" {
+  let d = unkept_returns({
+    module: 0,
+    module_name: b"m",
+    name: b"m.pick",
+    start: 40,
+    end: 42,
+    said: b"its parameter `ys`",
+    answers: b"its parameter `xs`",
+  });
+  assert_eq(d.code, b"E0148");
+  assert_eq(
+    d.message,
+    b"`m.pick` says it returns its parameter `ys`, and its body answers its parameter `xs`",
+  )
 }

@@ -3,8 +3,9 @@
 // A `Value` pins `Arc` for shared payloads and `Rc` for shared code, so none of these `Arc`s can be `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
+use ply_eval::reflect::{plain_of, value_of};
 use ply_eval::{Diagnostic, Fixed, IntTy, Plain, Span, Symbol, Value, codes, slot};
-use ply_machine::payload::{diag_value, plain_value, raised_value, value_plain};
+use ply_machine::payload::{diag_value, raised_value};
 
 /// A record with the fields a program declared, as a value.
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -25,8 +26,8 @@ fn field(value: &Value, name: &str) -> Value {
 
 /// The whole trip a `machine.call` argument takes, and its answer takes back.
 fn crossed(value: &Value) -> Value {
-    let data = plain_value(&Plain::of(value));
-    value_plain(&data, Span::DUMMY)
+    let data = value_of(&Plain::of(value));
+    plain_of(&data, Span::DUMMY)
         .expect("`std.value` data reads back")
         .into_value()
         .expect("a crossable value becomes one again")
@@ -58,7 +59,7 @@ fn every_crossable_value_survives_the_crossing() {
 
 #[test]
 fn a_fixed_width_integer_crosses_as_the_pattern_its_width_reads() {
-    let data = plain_value(&Plain::of(&Value::Fixed(Fixed::of(IntTy::I8, -5).unwrap())));
+    let data = value_of(&Plain::of(&Value::Fixed(Fixed::of(IntTy::I8, -5).unwrap())));
     assert_eq!(
         data,
         Value::ctor(
@@ -78,7 +79,7 @@ fn a_generated_function_crosses_as_its_rule_and_is_callable_again() {
         entries: vec![(Plain::Int(1), Plain::Bool(true))],
         default: Box::new(Plain::Bool(false)),
     });
-    let back = value_plain(&plain_value(&table), Span::DUMMY).expect("reads back");
+    let back = plain_of(&value_of(&table), Span::DUMMY).expect("reads back");
     assert_eq!(back, table);
     let called = back
         .into_value()
@@ -125,8 +126,7 @@ fn a_value_only_its_own_run_can_hold_is_refused_by_what_it_is() {
 #[test]
 fn an_answer_that_is_no_std_value_is_refused() {
     let foreign = Value::ctor(Symbol::new("other.Thing"), vec![Value::Int(1)]);
-    value_plain(&foreign, Span::DUMMY)
-        .expect_err("a foreign constructor is not a `std.value.Value`");
+    plain_of(&foreign, Span::DUMMY).expect_err("a foreign constructor is not a `std.value.Value`");
 }
 
 #[test]
@@ -146,8 +146,8 @@ fn a_raise_hands_over_its_values_and_a_plain_crossing_says_what_they_are() {
     assert_eq!(
         field(&raised, "values"),
         Value::list(vec![
-            plain_value(&Plain::Int(1)),
-            plain_value(&Plain::Str("a".to_string()))
+            value_of(&Plain::Int(1)),
+            value_of(&Plain::Str("a".to_string()))
         ])
     );
 
