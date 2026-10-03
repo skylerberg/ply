@@ -98,7 +98,7 @@ fn entered_with(
     };
     let process = ply_host::process::ProcessHost::new(
         argv,
-        ply_host::process::Sink::Real {
+        ply_host::process::OutputSink::Real {
             out: ply_host::process::Stream::Out,
         },
     )

@@ -40,7 +40,7 @@ pub enum Stream {
     Err,
 }
 
-pub enum Sink {
+pub enum OutputSink {
     /// The process's own streams; `out` is where `process.out` goes, since `--json` reserves stdout.
     Real {
         out: Stream,
@@ -48,14 +48,14 @@ pub enum Sink {
     Captured(Mutex<Vec<(Stream, String)>>),
 }
 
-impl Sink {
-    pub fn captured() -> Sink {
-        Sink::Captured(Mutex::new(Vec::new()))
+impl OutputSink {
+    pub fn captured() -> OutputSink {
+        OutputSink::Captured(Mutex::new(Vec::new()))
     }
 
     fn write(&self, stream: Stream, text: &str) -> std::io::Result<()> {
         match self {
-            Sink::Real { out } => {
+            OutputSink::Real { out } => {
                 let stream = match stream {
                     Stream::Out => *out,
                     Stream::Err => Stream::Err,
@@ -73,7 +73,7 @@ impl Sink {
                     }
                 }
             }
-            Sink::Captured(lines) => {
+            OutputSink::Captured(lines) => {
                 lock(lines).push((stream, text.to_string()));
                 Ok(())
             }
@@ -201,7 +201,7 @@ fn is_executable(_: &Path) -> bool {
 pub struct ProcessHost {
     argv: Vec<String>,
     /// Shared with the drains that forward an inheriting child's lines to a captured sink.
-    sink: Arc<Sink>,
+    sink: Arc<OutputSink>,
     exit: Mutex<Option<i32>>,
     /// The programs `--exec NAME=PATH` bound, which `bound` reads; a label outside them is `E0456`.
     executables: Executables,
@@ -214,7 +214,7 @@ pub struct ProcessHost {
 }
 
 impl ProcessHost {
-    pub fn new(argv: Vec<String>, sink: Sink) -> ProcessHost {
+    pub fn new(argv: Vec<String>, sink: OutputSink) -> ProcessHost {
         ProcessHost {
             argv,
             sink: Arc::new(sink),
@@ -232,7 +232,7 @@ impl ProcessHost {
     pub fn spawning(executables: Executables) -> ProcessHost {
         ProcessHost {
             whole: false,
-            ..ProcessHost::new(Vec::new(), Sink::captured())
+            ..ProcessHost::new(Vec::new(), OutputSink::captured())
         }
         .executing(executables)
     }
@@ -301,8 +301,8 @@ impl ProcessHost {
     /// Every line a captured sink took, in order; a real sink keeps nothing.
     pub fn captured(&self) -> Vec<(Stream, String)> {
         match &*self.sink {
-            Sink::Captured(lines) => lock(lines).clone(),
-            Sink::Real { .. } => Vec::new(),
+            OutputSink::Captured(lines) => lock(lines).clone(),
+            OutputSink::Real { .. } => Vec::new(),
         }
     }
 

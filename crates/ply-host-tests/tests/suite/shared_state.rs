@@ -6,7 +6,7 @@ use ply_eval::host::{
 };
 use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value, codes};
 use ply_host::config::{Entry, Snapshot};
-use ply_host::signal::{Accepting, Bounds, Shutdown, Signal};
+use ply_host::signal::{Accepting, Bounds, Shutdown, ShutdownSignal};
 use ply_host::tcp::{Net, TcpHost};
 use ply_host::trace::sink::Recording;
 use ply_host::trace::{Clock, Level, Op, Outcome, OwnedRecord, RecordKind, Sink, Trace};
@@ -523,7 +523,7 @@ fn until_phase_two(shutdown: &Arc<Shutdown>) {
 fn a_stop_one_run_asked_for_reaches_nothing_that_did_not() {
     let asked = Shutdown::new(Bounds::default());
     let untouched = Shutdown::new(Bounds::default());
-    assert!(asked.request(Signal::Terminate));
+    assert!(asked.request(ShutdownSignal::Terminate));
 
     assert!(asked.stopping());
     assert!(
@@ -544,7 +544,7 @@ fn a_stop_one_run_asked_for_reaches_nothing_that_did_not() {
 #[test]
 fn a_host_with_no_coordinator_is_never_stopping() {
     let stopping = Shutdown::new(Bounds::default());
-    assert!(stopping.request(Signal::Interrupt));
+    assert!(stopping.request(ShutdownSignal::Interrupt));
     until_phase_two(&stopping);
 
     let hermetic = ply_host::Host::new();
@@ -598,7 +598,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
         drain: Duration::from_secs(5),
     });
     // The signal arrives after `signal::listen` and before `Host::stopping_on`.
-    assert!(shutdown.request(Signal::Terminate));
+    assert!(shutdown.request(ShutdownSignal::Terminate));
     until_phase_two(&shutdown);
 
     // Wired to the coordinator exactly as `Hosts::open_stopping` wires them.
@@ -637,7 +637,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
         &late,
         late.listen(&listener_label(), 0, Span::DUMMY),
     ));
-    assert!(shutdown.request(Signal::Terminate));
+    assert!(shutdown.request(ShutdownSignal::Terminate));
     until_phase_two(&shutdown);
     shutdown.attach_net(Arc::clone(&late) as Arc<dyn Accepting>);
     assert_eq!(
@@ -664,7 +664,7 @@ fn a_signal_after_the_coordinator_is_wired_stops_accept() {
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
     let listener = int(&settle(&net, net.listen(&listener_label(), 0, Span::DUMMY)));
 
-    assert!(shutdown.request(Signal::Terminate));
+    assert!(shutdown.request(ShutdownSignal::Terminate));
     until_phase_two(&shutdown);
 
     assert_eq!(
@@ -715,7 +715,7 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
         drain: Duration::from_secs(30),
     });
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
-    assert!(shutdown.request(Signal::Terminate));
+    assert!(shutdown.request(ShutdownSignal::Terminate));
 
     // Wait until the run stops: every `net.accept` answers `0`.
     let until = Instant::now() + Duration::from_secs(5);

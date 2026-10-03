@@ -69,7 +69,7 @@ fn a_running_service_has_no_deadline() {
 #[test]
 fn the_lead_is_not_charged_to_the_drain() {
     let shutdown = Shutdown::new(bounds(150, 5_000));
-    assert!(shutdown.request(Signal::Terminate));
+    assert!(shutdown.request(ShutdownSignal::Terminate));
     assert!(shutdown.stopping(), "the flag is set before anything else");
     // Still leading: nothing has stopped accepting and the drain has not begun.
     assert!(!shutdown.drain_expired());
@@ -94,7 +94,7 @@ fn the_lead_is_not_charged_to_the_drain() {
 #[test]
 fn a_drain_that_runs_out_says_so() {
     let shutdown = Shutdown::new(bounds(0, 30));
-    assert!(shutdown.request(Signal::Interrupt));
+    assert!(shutdown.request(ShutdownSignal::Interrupt));
     until_stopped_accepting(&shutdown);
     let until = Instant::now() + Duration::from_secs(5);
     while !shutdown.drain_expired() && Instant::now() < until {
@@ -112,23 +112,26 @@ fn a_drain_that_runs_out_says_so() {
 #[test]
 fn a_second_signal_is_refused_rather_than_started_again() {
     let shutdown = Shutdown::new(bounds(0, 5_000));
-    assert!(shutdown.request(Signal::Terminate), "the first one starts");
     assert!(
-        !shutdown.request(Signal::Interrupt),
+        shutdown.request(ShutdownSignal::Terminate),
+        "the first one starts"
+    );
+    assert!(
+        !shutdown.request(ShutdownSignal::Interrupt),
         "the second one is the caller's cue to exit"
     );
     assert!(shutdown.second_requested());
     assert_eq!(
         shutdown.signal(),
-        Some(Signal::Terminate),
+        Some(ShutdownSignal::Terminate),
         "the run reports the signal that started the drain, not the one that ended the wait"
     );
 }
 
 #[test]
 fn the_exit_codes_are_the_shell_convention() {
-    assert_eq!(Signal::Interrupt.exit_code(), 130);
-    assert_eq!(Signal::Terminate.exit_code(), 143);
+    assert_eq!(ShutdownSignal::Interrupt.exit_code(), 130);
+    assert_eq!(ShutdownSignal::Terminate.exit_code(), 143);
 }
 
 #[test]
@@ -139,7 +142,7 @@ fn accept_answers_zero_once_the_run_has_stopped_accepting() {
 
     let shutdown = Shutdown::new(bounds(0, 5_000));
     shutdown.attach_net(Arc::clone(&host) as Arc<dyn Accepting>);
-    assert!(shutdown.request(Signal::Terminate));
+    assert!(shutdown.request(ShutdownSignal::Terminate));
     until_stopped_accepting(&shutdown);
 
     let answered = int(&settle(&host, host.accept(&at(), listener, Span::DUMMY)));
@@ -161,7 +164,7 @@ fn the_program_can_still_close_a_listener_the_drain_closed() {
     let listener = int(&settle(&host, host.listen(&at(), 0, Span::DUMMY)));
     let shutdown = Shutdown::new(bounds(0, 5_000));
     shutdown.attach_net(Arc::clone(&host) as Arc<dyn Accepting>);
-    shutdown.request(Signal::Terminate);
+    shutdown.request(ShutdownSignal::Terminate);
     until_stopped_accepting(&shutdown);
 
     host.close(&at(), listener, Span::DUMMY)
@@ -193,7 +196,7 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
 
     let shutdown = Shutdown::new(bounds(0, 5_000));
     shutdown.attach_net(Arc::clone(&host) as Arc<dyn Accepting>);
-    shutdown.request(Signal::Terminate);
+    shutdown.request(ShutdownSignal::Terminate);
     until_stopped_accepting(&shutdown);
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -232,7 +235,7 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
 
     let shutdown = Shutdown::new(bounds(0, 5_000));
     shutdown.attach_net(Arc::clone(&host) as Arc<dyn Accepting>);
-    shutdown.request(Signal::Terminate);
+    shutdown.request(ShutdownSignal::Terminate);
     until_stopped_accepting(&shutdown);
 
     let mut client = TcpStream::connect_timeout(&address, Duration::from_millis(500))
@@ -368,7 +371,7 @@ fn the_handler_answers_the_flag_and_the_clock() {
     assert_eq!(answer(stopping), Value::Bool(false));
     assert_eq!(answer(deadline), Value::Int(-1));
 
-    shutdown.request(Signal::Interrupt);
+    shutdown.request(ShutdownSignal::Interrupt);
     assert_eq!(answer(stopping), Value::Bool(true));
     assert!(int(&answer(deadline)) > 0);
 

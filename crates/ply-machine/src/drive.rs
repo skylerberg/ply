@@ -14,7 +14,7 @@ use ply_eval::{
     Analysis, CheckOutput, DefHash, Diagnostic, Ended, ModuleName, SourceMap, Span, Symbol,
     Value as PlyValue, codes,
 };
-use ply_host::process::{Executables, ProcessHost, Sink, Stream};
+use ply_host::process::{Executables, OutputSink, ProcessHost, Stream};
 use ply_host::signal::{self, Shutdown};
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -306,7 +306,7 @@ impl Bound {
 pub struct Measured {
     pub steps: u64,
     pub micros: u64,
-    pub counters: ply_eval::rc::Stats,
+    pub counters: ply_eval::rc::RcStats,
 }
 
 /// The machine's state on its own thread: the target, and the binding once `bound` made it.
@@ -631,7 +631,7 @@ fn process_host(options: &RunOptions) -> Result<ProcessHost, Diagnostic> {
         Stream::Out
     };
     let executables = Executables::load(&options.exec, Span::DUMMY)?;
-    Ok(ProcessHost::new(options.argv.clone(), Sink::Real { out }).executing(executables))
+    Ok(ProcessHost::new(options.argv.clone(), OutputSink::Real { out }).executing(executables))
 }
 
 fn disclosed(options: &RunOptions, hosts: &Hosts, shutdown: Option<&Arc<Shutdown>>) -> Disclosed {
@@ -731,15 +731,15 @@ pub fn place_the_unplaced(mut d: Diagnostic, entry: &str) -> Diagnostic {
 // --- The values that cross --------------------------------------------------------
 
 /// Where a definition is written, as a label points at it.
-pub struct At {
+pub struct ModuleSpan {
     pub module: u32,
     pub start: u32,
     pub end: u32,
 }
 
-impl At {
-    fn of(span: Span) -> At {
-        At {
+impl ModuleSpan {
+    fn of(span: Span) -> ModuleSpan {
+        ModuleSpan {
             module: span.source.0,
             start: span.start,
             end: span.end,
@@ -751,13 +751,13 @@ pub struct Named {
     pub name: String,
     pub module: String,
     pub path: String,
-    pub at: At,
+    pub at: ModuleSpan,
 }
 
 pub struct Placed {
     pub name: String,
     pub path: String,
-    at: At,
+    at: ModuleSpan,
 }
 
 /// The load's answer as plain data: what `machine.Project` carries.
@@ -807,7 +807,7 @@ fn mains_of(loaded: &Loaded) -> Vec<Named> {
             name: def.name.as_str().to_string(),
             module: def.module.to_string(),
             path: file_of(loaded, &def.module),
-            at: At::of(def.span),
+            at: ModuleSpan::of(def.span),
         })
         .collect()
 }
@@ -826,7 +826,7 @@ fn modules_of(loaded: &Loaded) -> Vec<Placed> {
             Placed {
                 name: view.name.to_string(),
                 path: view.path.display().to_string(),
-                at: At {
+                at: ModuleSpan {
                     module: view.info.source.0,
                     start: end,
                     end,
@@ -885,7 +885,7 @@ fn placed_values(modules: &[Placed]) -> PlyValue {
     )
 }
 
-fn at_value(at: &At) -> PlyValue {
+fn at_value(at: &ModuleSpan) -> PlyValue {
     record(vec![
         ("module", PlyValue::Int(i64::from(at.module))),
         ("start", PlyValue::Int(i64::from(at.start))),
@@ -924,7 +924,7 @@ pub struct Outcome {
     exit: Option<i32>,
     value: Option<ply_eval::Plain>,
     raised: Option<Diagnostic>,
-    counters: ply_eval::rc::Stats,
+    counters: ply_eval::rc::RcStats,
     cycles: Vec<Diagnostic>,
     /// What the entry ended with, such as the spans it left open.
     warnings: Vec<Diagnostic>,
@@ -948,7 +948,7 @@ impl Outcome {
                 )
                 .note("the operations are performed in order; this is Ply's fault"),
             ),
-            counters: ply_eval::rc::Stats::default(),
+            counters: ply_eval::rc::RcStats::default(),
             cycles: Vec::new(),
             warnings: Vec::new(),
             stopping: None,
@@ -1066,7 +1066,7 @@ pub fn accounting_value(m: &Measured) -> PlyValue {
     ])
 }
 
-fn counters_value(stats: &ply_eval::rc::Stats) -> PlyValue {
+fn counters_value(stats: &ply_eval::rc::RcStats) -> PlyValue {
     record(vec![
         ("updates", tally(stats.updates)),
         ("updates_in_place", tally(stats.updates_in_place)),
