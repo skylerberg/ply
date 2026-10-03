@@ -252,7 +252,7 @@ nondet effect net {
 
 fn wide(c: Int) -> Bytes / {net.write[c]} = net.recv[c](16)
 
-fn narrow(c: Int) -> Bytes = net.recv[c](16)
+fn narrow(c: Int) -> Bytes / {net.recv[c]} = net.recv[c](16)
 "#;
     let program = check(source);
     let binding = registry(vec![
@@ -311,9 +311,9 @@ nondet effect db {
   write put[r](key: Int, value: Int) -> Int
 }
 
-fn lookup(k: Int) -> Int = db.get[users](k)
+fn lookup(k: Int) -> Int / {db.get[users]} = db.get[users](k)
 
-fn store(k: Int) -> Int = db.put[orders](k, 1)
+fn store(k: Int) -> Int / {db.put[orders]} = db.put[orders](k, 1)
 "#;
     let binding = registry(vec![
         op("db", "get", HostResource::Any),
