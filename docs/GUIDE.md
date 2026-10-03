@@ -3451,7 +3451,8 @@ The first run after `ply` or the program itself changes compiles the program's u
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
 run loads the compiled object and the front end it filed beside it. A command
 that loads a program reads the front-end cache under `.ply-cache` before it
-analyses and files what it answered after: a definition whose hash has not moved
+analyses and files what it answered after, unless the cache already holds all of
+it from the same load: a definition whose hash has not moved
 since it was filed is taken from its filed rows, so a run checks what an edit
 moved and what reaches it, and a definition generic over an effect row or a
 label every time. The hash it is filed under reads a definition of another
