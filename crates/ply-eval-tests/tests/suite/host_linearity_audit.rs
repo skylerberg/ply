@@ -123,7 +123,7 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
     let binding = registry
         .bind(&compiled.front.check)
         .unwrap_or_else(|d| panic!("the registry binds: {d:#?}"));
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(binding));
     if runtime {
         machine.set_host_runtime(std::sync::Arc::new(|| {
@@ -239,7 +239,7 @@ test/nondet "three resumptions, nothing bound" {
         op("net", "send", Linearity::AtMostOnce),
         counter.clone() as Arc<dyn HostHandler>,
     )]);
-    let mut machine = compiled.machine_on_tier();
+    let mut machine = compiled.machine_on_backend();
     machine.set_host_binding(Arc::new(HostBinding::hermetic_with(registry)));
     machine
         .eval_test(0)

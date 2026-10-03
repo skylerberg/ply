@@ -46,7 +46,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
             digest: p.field("digest")?.utf8()?.to_string(),
         })
     })?;
-    front.mod_pkg = d.field("mod_pkg")?.items(|i| i.number())?;
+    front.module_packages = d.field("mod_pkg")?.items(|i| i.number())?;
     // The committed emitter answering for a stage may predate embeds, and embedded nothing.
     if let Ok(embeds) = d.field("embeds")
         && embeds.list()?.len() > 0
@@ -78,17 +78,6 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
                 imports: m
                     .field("imports")?
                     .items(|i| Ok(ModuleName::from_dotted(i.utf8()?)))?,
-                // The committed emitter answering for a stage may predate them, and cut nothing.
-                cuts: match m.field("cuts") {
-                    Ok(cuts) => cuts.items(|c| {
-                        Ok(ply_eval::BlankedSpan {
-                            start: c.field("start")?.number()?,
-                            end: c.field("end")?.number()?,
-                            braced: c.field("braced")?.bool()?,
-                        })
-                    })?,
-                    Err(_) => Vec::new(),
-                },
             },
         );
     }

@@ -172,7 +172,7 @@ pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
     backend.enter(&Symbol::new(name), args, 10_000)
 }
 
-/// What `name` raised: the tier ran it, where [`call`]'s `None` is a raise and a decline alike.
+/// What `name` raised: the backend ran it, where [`call`]'s `None` is a raise and a decline alike.
 #[track_caller]
 pub fn raised(unit: &'static Unit, name: &str, args: &[Value]) -> ply_eval::Diagnostic {
     match unit.attach().enter_whole(&Symbol::new(name), args, 10_000) {

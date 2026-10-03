@@ -68,7 +68,7 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
     );
     let lib = match compile_and_load(&src, "probe") {
         Ok(l) => l,
-        // A machine with no C compiler is not one this tier is for.
+        // A machine with no C compiler is not one this backend is for.
         Err(e) if e.to_string().contains("could not run") => return,
         Err(e) => panic!("{e}"),
     };
@@ -87,7 +87,7 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
 }
 
 #[test]
-fn the_tier_answers_what_the_interpreter_answers() {
+fn the_c_backend_answers_calls_recursion_widths_and_records() {
     let source = r#"
 fn double(x: Int) -> Int = x * 2
 fn even(x: Int) -> Bool = x % 2 == 0
@@ -247,6 +247,20 @@ fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
     assert!(ply_codegen::c::Exports::from_text("int main(void) { return 0; }").is_none());
 }
 
+/// Each bucket's table reads back as the loader fills it, and a table whose C writes the unit's
+/// positions itself names none.
+#[test]
+fn a_units_bucket_tables_read_back_and_a_table_without_them_names_none() {
+    let tables = "helpers 0\nctors 0\ntaken 0\nconstants 0\nmodules 0\nrefused 0\n\
+                  consts 0\nbuiltins 0\nfields 0\nshapes 0\nlambdas 0\n";
+    let with = format!("{tables}buckets 2\n3 0 2\n58 1\n");
+    let read = ply_codegen::c::Exports::decode(&with).expect("the table reads");
+    assert_eq!(read.buckets, vec![(3, vec![0, 2]), (58, vec![1])]);
+    assert_eq!(read.encode(), with);
+    let without = ply_codegen::c::Exports::decode(tables).expect("the table reads");
+    assert!(without.buckets.is_empty());
+}
+
 /// A unit handed over is loaded once, to read what it holds; the first backend on that thread takes
 /// that load rather than mapping the image again, and a later one maps it anew.
 #[test]
@@ -274,7 +288,7 @@ fn the_first_backend_on_the_handing_thread_takes_the_unit_it_loaded() {
 }
 
 #[test]
-fn the_tier_answers_what_the_program_means() {
+fn the_c_backend_answers_what_the_program_means() {
     let source = r#"
 type Quad = { a: U32, b: U32, c: U32, d: U32 }
 fn g(q: Quad, mx: U32) -> Quad = {
@@ -341,7 +355,7 @@ pub fn looped(n: Int) -> Int / {abort.raise} =
             .map(|a| ctx.heap.to_word(unsafe { &*layouts_ptr }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
         assert_eq!(got, want, "`{name}{args:?}`");
     }
@@ -349,7 +363,7 @@ pub fn looped(n: Int) -> Int / {abort.raise} =
 
 /// A `U64` past `2^62` is not an immediate (tagging eats its top bit), so it is held as the machine's own value.
 #[test]
-fn a_width_the_tier_cannot_carry_in_a_register_still_answers() {
+fn a_width_the_c_backend_cannot_carry_in_a_register_still_answers() {
     let source = r#"
 pub fn wide(n: Int) -> Int / {abort.raise} = {
   let a = u64_of_int(n);
@@ -392,7 +406,7 @@ pub fn narrow(n: Int) -> Int / {abort.raise} = int_of_u32(rotr(wrap_mul(u32_of_i
             let answer = unsafe { entry(&mut ctx, [word].as_ptr()) };
             match want {
                 Some(want) => {
-                    assert_eq!(ctx.failed, 0, "`{name}({n})` raised in the C tier");
+                    assert_eq!(ctx.failed, 0, "`{name}({n})` raised in the C backend");
                     let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
                     assert_eq!(got, ply_eval::Value::Int(want), "`{name}({n})`");
                 }
@@ -463,7 +477,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
             .map(|a| ctx.heap.to_word(unsafe { &*layouts_ptr }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{which}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{which}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
         assert_eq!(got, want, "`{which}`");
     }
@@ -523,7 +537,7 @@ pub fn named(b: Bytes) -> Int = code(TName(b))
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         assert_eq!(&got, want, "`{name}{args:?}`");
     }
@@ -576,7 +590,7 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C backend");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         assert_eq!(&got, want, "`{name}{args:?}`");
     }
@@ -741,6 +755,19 @@ mod numbering_support {
         &body[..body.find("\n}\n").map_or(body.len(), |end| end + 3)]
     }
 
+    /// The unit's position of each literal a body reads, through its bucket's table.
+    pub fn literal_places(produced: &super::Produced, body: &str) -> Vec<u32> {
+        body.match_indices("rt_lit_p(ctx, ply_bk_")
+            .filter_map(|(at, read)| {
+                let rest = &body[at + read.len()..];
+                let id = u8::from_str_radix(rest.get(..2)?, 16).ok()?;
+                let slot: usize = rest.get(3..rest.find(']')?)?.parse().ok()?;
+                let (_, places) = produced.exports.buckets.iter().find(|(b, _)| *b == id)?;
+                places.get(slot).copied()
+            })
+            .collect()
+    }
+
     /// The C the unit published for `name`; a test reads a symbol rather than spelling one.
     pub fn symbol(produced: &super::Produced, name: &str) -> String {
         produced
@@ -813,7 +840,7 @@ pub fn two(n: Int) -> Bytes = if n > 0 { b"shared-constant" } else { b"two" }
         let symbol = numbering_support::symbol(&produced, name);
         let body = numbering_support::body(&produced.text, &symbol);
         assert!(
-            body.contains(&format!("rt_lit_p(ctx, {at})")),
+            numbering_support::literal_places(&produced, body).contains(&(*at as u32)),
             "`{name}` does not read the shared constant from its one entry:\n{body}"
         );
     }
