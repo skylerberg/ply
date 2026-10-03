@@ -94,7 +94,7 @@ fn a_test_root_the_tier_did_not_run_is_plys_defect_and_counted_as_declined() {
     let d = outcome.expect_err("a declined test answers nothing");
     assert_eq!(d.code, codes::INTERNAL_ERROR, "{d:?}");
     assert!(
-        d.message.starts_with("the compiled tier declined to enter"),
+        d.message.starts_with("the C backend declined to enter"),
         "{d:?}"
     );
     assert_eq!(counts, (0, 1));
@@ -127,7 +127,7 @@ fn an_entry_point_the_tier_declined_is_plys_defect_and_counted_as_declined() {
         .expect_err("a declined entry answers nothing");
     assert_eq!(d.code, codes::INTERNAL_ERROR, "{d:?}");
     assert!(
-        d.message.starts_with("the compiled tier declined to enter"),
+        d.message.starts_with("the C backend declined to enter"),
         "{d:?}"
     );
     assert_eq!(machine.compiled_counts(), (0, 1));

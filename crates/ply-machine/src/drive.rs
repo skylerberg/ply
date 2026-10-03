@@ -250,7 +250,10 @@ impl Target {
     }
 
     /// The unit this run evaluates on, compiled from the C the target came with.
-    fn tier(&self, options: &RunOptions) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+    fn provider(
+        &self,
+        options: &RunOptions,
+    ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
         // Which C compiler ran is no part of what a hermetic run answers.
         if !options.hermetic {
             select_profile(&options.profile)?;
@@ -282,18 +285,18 @@ fn unemitted(path: &std::path::Path) -> Refused {
 pub struct Bound {
     hosts: Hosts,
     declared: Option<ply_eval::Footprint>,
-    tier: &'static dyn ply_eval::Provider,
-    /// The tier, attached once and entered any number of times: building it per call would put
-    /// the build in every measurement the call is asked for.
+    provider: &'static dyn ply_eval::Provider,
+    /// The provider's backend, attached once and entered any number of times: building it per call
+    /// would put the build in every measurement the call is asked for.
     compiled: RefCell<Option<std::rc::Rc<dyn ply_eval::Compiled>>>,
     shutdown: Option<Arc<Shutdown>>,
 }
 
 impl Bound {
-    /// This binding's compiled tier, built on the first call that wants it.
+    /// This binding's C backend, built on the first call that wants it.
     fn compiled(&self) -> std::rc::Rc<dyn ply_eval::Compiled> {
         let mut slot = self.compiled.borrow_mut();
-        slot.get_or_insert_with(|| self.tier.attach()).clone()
+        slot.get_or_insert_with(|| self.provider.attach()).clone()
     }
 }
 
@@ -311,7 +314,7 @@ pub struct Drive {
     options: RunOptions,
     target: Target,
     /// The target's compiled unit, built once for the schema and the binding alike.
-    tier: Option<&'static dyn ply_eval::Provider>,
+    provider: Option<&'static dyn ply_eval::Provider>,
     bound: Option<(String, Bound)>,
     /// What the calls since the last `accounting` read measured, reset by that read.
     accounting: Measured,
@@ -346,7 +349,7 @@ impl Drive {
         Drive {
             options,
             target,
-            tier: None,
+            provider: None,
             bound: None,
             accounting: Measured::default(),
         }
@@ -368,24 +371,24 @@ impl Drive {
     ) -> Result<(), Refused> {
         let path = self.target.loaded.root.clone();
         self.target = Target::open(&path, Some(front), Some(unit), self.options.hermetic)?;
-        self.tier = None;
+        self.provider = None;
         self.bound = None;
         Ok(())
     }
 
-    fn tier(&mut self) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
-        if let Some(tier) = self.tier {
-            return Ok(tier);
+    fn provider(&mut self) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+        if let Some(provider) = self.provider {
+            return Ok(provider);
         }
-        let tier = self.target.tier(&self.options)?;
-        self.tier = Some(tier);
-        Ok(tier)
+        let provider = self.target.provider(&self.options)?;
+        self.provider = Some(provider);
+        Ok(provider)
     }
 
     /// The value of the definition `--config-schema` names, entered on the target's own unit.
     pub fn schema(&mut self, name: &str) -> Result<ply_eval::Plain, Diagnostic> {
-        let tier = self.tier()?;
-        crate::config::schema_of(self.target.check(), Some(tier), name)
+        let provider = self.provider()?;
+        crate::config::schema_of(self.target.check(), Some(provider), name)
     }
 
     /// Bind the hosts `entry` may reach, answering `config` as the program resolved it; the
@@ -396,7 +399,7 @@ impl Drive {
         entry: &str,
         configuration: Configuration,
     ) -> Result<Disclosed, Refused> {
-        let tier = self.tier();
+        let provider = self.provider();
         let options = &self.options;
         let target = &self.target;
         let refuse = |diagnostics: Vec<Diagnostic>| Refused {
@@ -410,8 +413,8 @@ impl Drive {
             .defs
             .get(&Symbol::new(entry))
             .map(|d| d.footprint.clone());
-        let tier = match tier {
-            Ok(tier) => tier,
+        let provider = match provider {
+            Ok(provider) => provider,
             Err(diagnostic) => return Err(refuse(vec![diagnostic])),
         };
         if options.hermetic && options.host {
@@ -454,7 +457,7 @@ impl Drive {
             Bound {
                 hosts,
                 declared,
-                tier,
+                provider,
                 compiled: RefCell::new(None),
                 shutdown,
             },

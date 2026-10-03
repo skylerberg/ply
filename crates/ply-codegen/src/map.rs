@@ -139,7 +139,7 @@ pub fn to_vec(m: *mut Obj) -> Vec<(Word, Word)> {
 }
 
 /// An insert's result: the node to hold now, its greatest key, and a right sibling if it split.
-struct Put {
+struct Inserted {
     node: Word,
     max: Word,
     split: Option<(Word, Word)>,
@@ -282,7 +282,7 @@ impl Heap {
         m as Word
     }
 
-    fn put(&mut self, layouts: &Layouts, node: Word, k: Word, v: Word) -> Put {
+    fn put(&mut self, layouts: &Layouts, node: Word, k: Word, v: Word) -> Inserted {
         let o = self.writable_node(node);
         if is_leaf(o) {
             return self.put_leaf(layouts, o, k, v);
@@ -301,7 +301,7 @@ impl Heap {
         }
         let n = count(o);
         if n <= WIDTH {
-            return Put {
+            return Inserted {
                 node: o as Word,
                 max: child_max(o, n - 1),
                 split: None,
@@ -321,7 +321,7 @@ impl Heap {
             (*right).len = (n - half) as u32;
             (*o).len = half as u32;
         }
-        Put {
+        Inserted {
             node: o as Word,
             max: child_max(o, half - 1),
             split: Some((right as Word, child_max(right, n - half - 1))),
@@ -344,7 +344,7 @@ impl Heap {
         }
     }
 
-    fn put_leaf(&mut self, layouts: &Layouts, leaf: *mut Obj, k: Word, v: Word) -> Put {
+    fn put_leaf(&mut self, layouts: &Layouts, leaf: *mut Obj, k: Word, v: Word) -> Inserted {
         let n = count(leaf);
         match leaf_find(layouts, leaf, k) {
             Ok(i) => {
@@ -354,7 +354,7 @@ impl Heap {
                     set_word(leaf, 2 * i, k);
                     set_word(leaf, 2 * i + 1, v);
                 }
-                Put {
+                Inserted {
                     node: leaf as Word,
                     max: leaf_key(leaf, n - 1),
                     split: None,
@@ -369,7 +369,7 @@ impl Heap {
                     set_word(leaf, 2 * i + 1, v);
                     (*leaf).len = n as u32 + 1;
                 }
-                Put {
+                Inserted {
                     node: leaf as Word,
                     max: leaf_key(leaf, n),
                     split: None,
@@ -402,7 +402,7 @@ impl Heap {
                     set_word(target, 2 * at + 1, v);
                     (*target).len = t as u32 + 1;
                 }
-                Put {
+                Inserted {
                     node: leaf as Word,
                     max: leaf_key(leaf, count(leaf) - 1),
                     split: Some((right as Word, leaf_key(right, count(right) - 1))),

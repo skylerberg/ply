@@ -197,7 +197,7 @@ fn ordering_on_a_string_is_refused_before_any_backend_sees_it() {
 
 /// Nothing in `tripled`'s `Int -> Int` signature says a callback is under it.
 #[test]
-fn a_higher_order_builtin_answers_under_the_tier() {
+fn a_higher_order_builtin_answers_on_the_c_backend() {
     let mut h = harness(hazards());
     // `pure.step(n) + pure.step(n + 1)`.
     for (n, want) in [(0, 5), (1, 11), (5, 35)] {
@@ -384,7 +384,7 @@ fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     );
     assert_eq!(
         declined.message,
-        "the compiled tier declined to enter `pure.step`"
+        "the C backend declined to enter `pure.step`"
     );
 
     let after = h.run("pure.step", &[Value::Int(5)]);

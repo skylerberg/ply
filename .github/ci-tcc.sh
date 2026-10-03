@@ -5,9 +5,9 @@
 #   .github/ci-tcc.sh harvest   the .deb packages, into ./tcc, for the cache the jobs share
 #   .github/ci-tcc.sh install   install it: those packages, or apt if the cache was evicted
 #
-# The tier keys every compiled object by the compiler and the flags it was given, so two jobs that
-# installed different tccs would share no object at all, and a job that installed none falls back
-# to `cc -O0`. That is why this is one place: the job that fills the cache and the jobs that
+# The C backend keys every compiled object by the compiler and the flags it was given, so two jobs
+# that installed different tccs would share no object at all, and a job that installed none falls
+# back to `cc -O0`. That is why this is one place: the job that fills the cache and the jobs that
 # install from it must name the same package.
 set -euo pipefail
 

@@ -17,7 +17,7 @@ pub struct Defined {
 
 /// What one body names of the unit around it, by the positions its own text uses.
 #[derive(Default, Clone)]
-pub struct Tables {
+pub struct BodyTables {
     pub consts: Vec<Value>,
     pub builtins: Vec<Builtin>,
     pub fields: Vec<Symbol>,
@@ -40,7 +40,7 @@ pub struct Tables {
 /// What an emitted unit accumulates that is not code, with each entry's position. A unit being
 /// built sorts every table by content, so a position is a rank among what the unit holds; a unit
 /// read back keeps the order its C was emitted against, whatever that was.
-pub struct Unit {
+pub struct UnitTables {
     pub consts: Vec<Value>,
     pub fields: Vec<Symbol>,
     pub builtins: Vec<Builtin>,
@@ -57,14 +57,14 @@ fn sorted(names: &[Symbol]) -> Vec<Symbol> {
     names
 }
 
-impl Unit {
+impl UnitTables {
     /// The union of what `bodies` name and the lambda symbols given, each table sorted by
     /// content and duplicate-free.
     pub fn of<'a>(
         ctors: Vec<(Symbol, usize)>,
-        bodies: impl IntoIterator<Item = &'a Tables>,
+        bodies: impl IntoIterator<Item = &'a BodyTables>,
         lambdas: impl IntoIterator<Item = String>,
-    ) -> Unit {
+    ) -> UnitTables {
         let mut consts: Vec<(String, Value)> = Vec::new();
         let mut fields: Vec<Symbol> = Vec::new();
         let mut builtins: Vec<Builtin> = Vec::new();
@@ -87,7 +87,7 @@ impl Unit {
         shapes.dedup();
         lambdas.sort();
         lambdas.dedup();
-        Unit::from_tables(
+        UnitTables::from_tables(
             ctors,
             consts.into_iter().map(|(_, v)| v).collect(),
             fields,
@@ -107,7 +107,7 @@ impl Unit {
         builtins: Vec<Builtin>,
         shapes: Vec<Vec<Symbol>>,
         lambdas: Vec<String>,
-    ) -> Option<Unit> {
+    ) -> Option<UnitTables> {
         let layouts = Layouts::of(ctors, &shapes);
         let placed = layouts.shape_count() >= shapes.len()
             && shapes
@@ -117,7 +117,7 @@ impl Unit {
         if !placed {
             return None;
         }
-        Some(Unit {
+        Some(UnitTables {
             consts,
             fields,
             builtins,
