@@ -5,8 +5,10 @@
 use crate::load::{
     Discovered, Found, LoadError, Loaded, anchor, discover, project_root, tidy, unreadable,
 };
-use ply_codegen::c::producer;
-use ply_eval::{Diagnostic, Front, ModuleName, SourceId, SourceMap, Span, codes};
+use crate::payload::record;
+use ply_codegen::c::producer::{self, KnownRows};
+use ply_eval::decode::At;
+use ply_eval::{Diagnostic, Front, ModuleName, SourceId, SourceMap, Span, Value, codes};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -126,14 +128,74 @@ pub fn load_over_front_in(root: PathBuf, handed: &HandedFront) -> Result<Loaded,
             front: handed.front,
             write_back: handed.write_back,
         },
+        known: KnownRows::default(),
+        keep: false,
+        kept: None,
+        seeded: 0,
     }
     .finish()
+    .map(|seeded| seeded.loaded)
 }
 
-/// The load a program runs of a program of its own: the walk and the whole front end, from nothing.
+/// The load a program runs of a program of its own: the walk and the whole front end.
 pub(crate) fn run(path: &Path) -> Result<Loaded, LoadError> {
     let (root, discovered) = discover(path).map_err(LoadError::bare)?;
-    Driver::new(root, discovered)?.finish()
+    Ok(Driver::new(root, discovered)?.finish()?.loaded)
+}
+
+/// What a seeded load leaves for the next process: the rows that seed the next load of the same
+/// program, and its front, which [`kept_front`] reads back in place of the front end.
+pub struct Seeded {
+    pub loaded: Loaded,
+    pub rows: KnownRows,
+    /// `None` when the answer would not encode.
+    pub front: Option<Vec<u8>>,
+    /// How many definitions the front end took from the rows it was seeded with.
+    pub seeded: usize,
+}
+
+/// [`run`] seeded with `known`.
+pub(crate) fn run_seeded(path: &Path, known: KnownRows) -> Result<Seeded, LoadError> {
+    let (root, discovered) = discover(path).map_err(LoadError::bare)?;
+    let mut driver = Driver::new(root, discovered)?;
+    driver.known = known;
+    driver.keep = true;
+    driver.finish()
+}
+
+/// What [`Seeded::front`] is, as its `format` field says.
+const KEPT: &str = "ply kept front 1";
+
+/// A front [`Seeded::front`] kept, read back: every file it was over, and the front end's answer.
+/// `None` when the bytes are not one.
+pub fn kept_front(bytes: &[u8]) -> Option<HandedFront> {
+    let started = Instant::now();
+    let kept = ply_eval::codec::decode(bytes).ok()?;
+    let at = At::new("a kept front", &kept);
+    if at.field("format").ok()?.str().ok()? != KEPT {
+        return None;
+    }
+    let files = at
+        .field("files")
+        .ok()?
+        .items(|file| {
+            Ok(FrontFile {
+                path: file.field("path")?.str()?.to_string(),
+                name: file.field("name")?.str()?.to_string(),
+                text: file.field("text")?.str()?.to_string(),
+            })
+        })
+        .ok()?;
+    let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
+    let answer = ply_codegen::c::dump::read(at.field("dump").ok()?.value(), &ids).ok()?;
+    Some(HandedFront {
+        answer,
+        files,
+        read: Duration::ZERO,
+        front: started.elapsed(),
+        write_back: Duration::ZERO,
+        cached: false,
+    })
 }
 
 struct FileState {
@@ -162,6 +224,12 @@ struct Driver {
     sources: SourceMap,
     files: Vec<FileState>,
     phases: Phases,
+    /// Whether this is a seeded load: seeded with `known`, which it replaces with the rows it
+    /// published, and keeping its answer encoded as `kept` for [`Seeded::front`].
+    keep: bool,
+    known: KnownRows,
+    kept: Option<Vec<u8>>,
+    seeded: usize,
 }
 
 /// One dependency package of the walk: its manifest text, and its modules by file.
@@ -450,12 +518,16 @@ impl Driver {
             sources,
             files,
             phases,
+            known: KnownRows::default(),
+            keep: false,
+            kept: None,
+            seeded: 0,
         };
         driver.place(&[]);
         Ok(driver)
     }
 
-    fn finish(mut self) -> Result<Loaded, LoadError> {
+    fn finish(mut self) -> Result<Seeded, LoadError> {
         let front = self.ask_the_port()?;
         if front.has_error() {
             return Err(LoadError {
@@ -479,7 +551,7 @@ impl Driver {
             .collect();
         // Whether the whole-program promise check has anything to check.
         let promised = front.defs_written.values().any(|w| w.reuse);
-        Ok(Loaded {
+        let loaded = Loaded {
             root: self.root,
             files,
             sources: self.sources,
@@ -492,6 +564,12 @@ impl Driver {
                 warnings,
             },
             promised,
+        };
+        Ok(Seeded {
+            loaded,
+            rows: self.known,
+            front: self.kept,
+            seeded: self.seeded,
         })
     }
 
@@ -537,9 +615,17 @@ impl Driver {
         let embeds = self
             .embeds(&packages.root)
             .map_err(|e| self.seam_failed(&e))?;
-        let pulled =
-            ply_codegen::c::producer::front_pulling_std_with(&own, shelf, &packages, &embeds)
-                .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
+        let pulled = if self.keep {
+            let answered =
+                producer::front_rows_pulling_std_with(&own, shelf, &packages, &embeds, &self.known)
+                    .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
+            self.known = answered.rows;
+            self.seeded = answered.seeded;
+            answered.pulled
+        } else {
+            producer::front_pulling_std_with(&own, shelf, &packages, &embeds)
+                .map_err(|e| self.seam_failed(&format!("{e:#}")))?
+        };
         self.place(&pulled.modules);
         // The front end parses the root's modules, then the dependency modules in walk order,
         // then the pulled shelf; the manifest slots follow them all.
@@ -584,8 +670,33 @@ impl Driver {
             });
         }
         let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
+        if self.keep {
+            self.kept = self.encoded(&pulled.dump);
+        }
         ply_codegen::c::dump::read(&pulled.dump, &ids)
             .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))
+    }
+
+    /// The answer as [`kept_front`] reads it back: every file's place, module and text in the
+    /// order the dump's module indices run, and the dump.
+    fn encoded(&self, dump: &Value) -> Option<Vec<u8>> {
+        let files = self
+            .files
+            .iter()
+            .map(|f| {
+                record(vec![
+                    ("path", Value::str(f.path.to_string_lossy())),
+                    ("name", Value::str(f.module.to_string())),
+                    ("text", Value::str(&*f.text)),
+                ])
+            })
+            .collect();
+        ply_eval::codec::encode(&record(vec![
+            ("format", Value::str(KEPT)),
+            ("files", Value::list(files)),
+            ("dump", dump.clone()),
+        ]))
+        .ok()
     }
 
     /// Shipped modules follow the project's files, placed as the port pulls them in.

@@ -1220,6 +1220,122 @@ pub fn front_pulling_std_with(
     Ok(Pulled { modules, dump })
 }
 
+const ANSWER_ROWS: &str = "front.answer_rows_pulling_std_with";
+
+/// The rows one load published, `front.Rows` in the codec's bytes, kept to seed a later load of
+/// the same program. Empty is none. The front end takes a row only while the definition's check
+/// key and the declarations its row names are unchanged, so rows from an older load cannot change
+/// an answer, only spare its walks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KnownRows(Vec<u8>);
+
+impl KnownRows {
+    pub fn from_bytes(bytes: Vec<u8>) -> KnownRows {
+        KnownRows(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The `defs` and `tests` lists the front end takes; two empty lists for none, or for bytes
+    /// that do not read as rows.
+    fn lists(&self) -> (Value, Value) {
+        let none = || (Value::list(Vec::new()), Value::list(Vec::new()));
+        if self.0.is_empty() {
+            return none();
+        }
+        let Ok(rows) = ply_eval::codec::decode(&self.0) else {
+            return none();
+        };
+        let at = At::new("kept rows", &rows);
+        match (at.field("defs"), at.field("tests")) {
+            (Ok(defs), Ok(tests)) => (defs.value().clone(), tests.value().clone()),
+            _ => none(),
+        }
+    }
+}
+
+/// Where the rows a driver's loads published are kept between processes: beside the stages, under
+/// the emitter that answered and the runtime it ran on, since another checker's rows are no
+/// evidence for this one.
+fn kept_rows_dir() -> std::path::PathBuf {
+    let mut h = blake3::Hasher::new();
+    for part in ["ply-rows-1", super::RUNTIME, &identity()] {
+        h.update(part.as_bytes());
+        h.update(&[0]);
+    }
+    super::bundle::stage_dir(&format!("rows-{}", &h.finalize().to_hex()[..16]))
+}
+
+/// The rows the last load of `program` kept, or none.
+pub fn kept_rows(program: &str) -> KnownRows {
+    let dir = kept_rows_dir();
+    match std::fs::read(dir.join(program)) {
+        Ok(bytes) => {
+            super::sweep::used(&dir);
+            KnownRows(bytes)
+        }
+        Err(_) => KnownRows::default(),
+    }
+}
+
+/// Keeps `rows` for the next load of `program`; a failed write costs that load its seeding only.
+pub fn keep_rows(program: &str, rows: &KnownRows) {
+    if rows.0.is_empty() {
+        return;
+    }
+    let dir = kept_rows_dir();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = ply_eval::files::write_atomically(&dir.join(program), &rows.0);
+        super::sweep::used(&dir);
+    }
+}
+
+/// What [`front_rows_pulling_std_with`] answered.
+pub struct RowsAnswered {
+    pub pulled: Pulled,
+    /// The rows this load published, for the next.
+    pub rows: KnownRows,
+    /// How many definitions were taken from the rows handed in rather than walked.
+    pub seeded: usize,
+}
+
+/// [`front_pulling_std_with`] seeded with `known`, answering the rows this load published beside it.
+pub fn front_rows_pulling_std_with(
+    user: &[(String, String)],
+    shipped: &[(String, String)],
+    packages: &Packages,
+    embeds: &[ReadEmbed],
+    known: &KnownRows,
+) -> Result<RowsAnswered> {
+    let (defs, tests) = known.lists();
+    let answer = call(
+        ANSWER_ROWS,
+        &[
+            source_list(user),
+            source_list(shipped),
+            defs,
+            tests,
+            packages.value(),
+            Value::list(embeds.iter().map(ReadEmbed::value).collect()),
+        ],
+    )?;
+    let what = format!("`{ANSWER_ROWS}`'s answer");
+    let at = At::new(&what, &answer);
+    let modules = strings(at.field("pulled")?)?;
+    let dump = at.field("dump")?.value().clone();
+    let rows = ply_eval::codec::encode(at.field("rows")?.value())
+        .map_err(|e| anyhow!("the rows `{ANSWER_ROWS}` answered do not encode: {e}"))?;
+    let seeded = usize::try_from(at.field("seeded")?.int()?).unwrap_or(0);
+    tally(|census| census.modules += user.len() + modules.len());
+    Ok(RowsAnswered {
+        pulled: Pulled { modules, dump },
+        rows: KnownRows(rows),
+        seeded,
+    })
+}
+
 /// [`front`] over the default producer, with the program's errors raised rather than answered.
 pub fn checked_front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
     ensure_default();

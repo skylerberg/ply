@@ -21,6 +21,15 @@ pub use load::{Library, Parts, compile_and_load, split};
 pub use prelude::{HELPERS, PRELUDE, RUNTIME_MARK, pointer_name, runtime_header, runtime_object};
 pub use toolchain::{Profile, select as select_profile};
 
+/// The sources of the runtime the emitter runs on, as `build.rs` digests them. Not the binary: a
+/// change anywhere else in `ply`, or the other build profile, answers and emits the same.
+const RUNTIME: &str = env!("PLY_RUNTIME_DIGEST");
+
+/// [`RUNTIME`], for what is kept under the runtime that answered it.
+pub fn runtime_digest() -> &'static str {
+    RUNTIME
+}
+
 /// What the emitter refused, and where.
 #[derive(Debug)]
 pub struct Refused {

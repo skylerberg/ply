@@ -1,6 +1,8 @@
 //! Turning a path into the front end's checked answer.
 
 use crate::driver::FrontEnd;
+pub use crate::driver::Seeded;
+use ply_codegen::c::producer::KnownRows;
 use ply_eval::{
     CheckOutput, DefInfo, Diagnostic, Front, HashOutput, ModuleInfo, ModuleName, SourceId,
     SourceMap, Span, Symbol, TestInfo, codes,
@@ -199,6 +201,12 @@ pub fn project_root(path: &Path) -> PathBuf {
 /// A program's load of a program of its own, from scratch: no cache is read and none is written.
 pub fn load(path: &Path) -> Result<Loaded, LoadError> {
     crate::driver::run(path)
+}
+
+/// [`load`] seeded with the rows an earlier load of the same program published, answering what the
+/// next process takes in its place: the rows this one published and the front it answered.
+pub fn load_seeded(path: &Path, known: KnownRows) -> Result<Seeded, LoadError> {
+    crate::driver::run_seeded(path, known)
 }
 
 pub(crate) struct Discovered {
