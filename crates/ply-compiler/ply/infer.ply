@@ -5,11 +5,11 @@ import parsing (Span, Ident, QName, span_to, dummy_span, int_to_bytes, span_key,
 import std.bin
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, ty_span)
-import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
-              TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
-              Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger,
-              is_predicate, deriver_text, deriver_tag, SpecKind, SRequires, SEnsures, SpecClause,
-              Derived, DeriveDef, parse)
+import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, IExtern, FnDef,
+              ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef,
+              EffectDef, OpDef, TestDef, LawDef, Binder, Constraint, Deriver, DJson, DEq, DOrd,
+              DBin, DShow, DHash, DNumeric, DInteger, is_predicate, deriver_text, deriver_tag,
+              SpecKind, SRequires, SEnsures, SpecClause, Derived, DeriveDef, parse)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
@@ -45,6 +45,8 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 backticked, describe_namespace, private_name, pattern_binders)
 import rewrite (expand, expand_record_updates, expand_witnesses, NumericWitness, ConcreteWitness,
                 ParamWitness, numeric_witness_bin)
+import embed (EmbedAt, embed_tables, rewritten)
+import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
                NullInsideOption, HoldsSecret, ConstructorShape, Leaf, Structural, Refused, Nominal,
                constructor_shape, null_encoded_name, Expansion, expand_derives, refusal_note,
@@ -557,8 +559,6 @@ pub fn abort_atom() -> Atom =
 
 fn abort_row() -> Row = row_singleton(abort_atom())
 
-fn raising(r: Row) -> Row / {abort.raise} = { ..r, atoms: atoms_insert(r.atoms, abort_atom()) }
-
 fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
   [
     { name: b"Int", arity: 0 },
@@ -828,621 +828,248 @@ fn simulated_atoms() -> List<Atom> / {abort.raise} =
         }))
     } else { acc })
 
-fn mono_fn(params: List<Type>, ret: Type) -> Scheme = monomorphic(fn_type(params, ret, row_empty()))
-fn poly_fn(tys: List<Int>, rows: List<Int>, params: List<Type>, ret: Type, eff: Row) -> Scheme =
-  { ty_vars: tys, row_vars: rows, label_vars: [], ty: fn_type(params, ret, eff) }
+// --- The prelude's functions -------------------------------------------------------------------
 
-// Every builtin's scheme over the type variables `a`, `b`, `c` and the row variable `e`.
-pub fn builtin_schemes(
-  a: Int,
-  b: Int,
-  c: Int,
-  e: Int,
-) -> List<{ name: Bytes, sc: Scheme }> / {abort.raise} = {
-  let ta = TyVar(a);
-  let tb = TyVar(b);
-  let tc = TyVar(c);
-  let re = row_open(e);
-  let map_ty = map_type(ta, tb);
-  let entry_ty = TyRecord(fields_sorted([{ name: b"key", ty: ta }, { name: b"value", ty: tb }]));
-  let performed_ty = TyRecord(
-    fields_sorted([{ name: b"atom", ty: string_type() }, { name: b"count", ty: int_type() }]),
-  );
-  let metered_ty = TyRecord(
-    fields_sorted([
-      { name: b"value", ty: ta },
-      { name: b"steps", ty: int_type() },
-      { name: b"allocations", ty: int_type() },
-      { name: b"performs", ty: list_type(performed_ty) },
-    ]),
-  );
-  let ordering = named_type(b"Ordering");
-  let rounding = named_type(b"Rounding");
-  let cell_ty = TyCon({ name: b"Cell", args: [tb, ta] });
-  let array_ty = TyCon({ name: b"Array", args: [ta] });
-  [
-    {
-      name: b"assert",
-      sc: poly_fn([], [], [bool_type(), option_type(string_type())], unit_type(), abort_row()),
-    },
-    { name: b"assert_eq", sc: poly_fn([a], [], [ta, ta], unit_type(), abort_row()) },
-    { name: b"len", sc: poly_fn([a], [], [list_type(ta)], int_type(), row_empty()) },
-    { name: b"push", sc: poly_fn([a], [], [list_type(ta), ta], list_type(ta), row_empty()) },
-    {
-      name: b"list_at",
-      sc: poly_fn([a], [], [list_type(ta), int_type()], option_type(ta), row_empty()),
-    },
-    {
-      name: b"list_set",
-      sc: poly_fn([a], [], [list_type(ta), int_type(), ta], list_type(ta), abort_row()),
-    },
-    { name: b"array_new", sc: poly_fn([a], [], [int_type(), ta], array_ty, abort_row()) },
-    { name: b"array_of_list", sc: poly_fn([a], [], [list_type(ta)], array_ty, row_empty()) },
-    { name: b"array_to_list", sc: poly_fn([a], [], [array_ty], list_type(ta), row_empty()) },
-    { name: b"array_len", sc: poly_fn([a], [], [array_ty], int_type(), row_empty()) },
-    {
-      name: b"array_at",
-      sc: poly_fn([a], [], [array_ty, int_type()], option_type(ta), row_empty()),
-    },
-    { name: b"array_get", sc: poly_fn([a], [], [array_ty, int_type()], ta, abort_row()) },
-    { name: b"array_set", sc: poly_fn([a], [], [array_ty, int_type(), ta], array_ty, abort_row()) },
-    { name: b"reflect", sc: poly_fn([a], [], [ta], named_type(b"std.value.Value"), row_empty()) },
-    { name: b"digest", sc: poly_fn([a], [], [ta], bytes_type(), row_empty()) },
-    { name: b"numeric_of_int", sc: poly_fn([a], [], [int_type()], ta, abort_row()) },
-    {
-      name: b"map",
-      sc: poly_fn([a, b], [e], [list_type(ta), fn_type([ta], tb, re)], list_type(tb), re),
-    },
-    {
-      name: b"filter",
-      sc: poly_fn([a], [e], [list_type(ta), fn_type([ta], bool_type(), re)], list_type(ta), re),
-    },
-    {
-      name: b"fold",
-      sc: poly_fn([a, b], [e], [list_type(ta), tb, fn_type([tb, ta], tb, re)], tb, re),
-    },
-    {
-      name: b"iterate",
-      sc: poly_fn(
-        [a, b],
-        [e],
-        [ta, int_type(), fn_type([ta], iter_type(ta, tb), re)],
-        tb,
-        raising(re),
-      ),
-    },
-    {
-      name: b"bracket",
-      sc: poly_fn(
-        [a, b],
-        [e],
-        [fn_type([], ta, re), fn_type([ta], unit_type(), re), fn_type([ta], tb, re)],
-        tb,
-        re,
-      ),
-    },
-    { name: b"metered", sc: poly_fn([a], [e], [fn_type([], ta, re)], metered_ty, re) },
-    { name: b"range", sc: mono_fn([int_type(), int_type()], list_type(int_type())) },
-    // The wrapping family is `forall a. (a, a) -> a`; `infer_app` attaches the integer obligation at each call.
-    { name: b"wrap_add", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
-    { name: b"wrap_sub", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
-    { name: b"wrap_mul", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
-    { name: b"rotr", sc: poly_fn([a], [], [ta, int_type()], ta, row_empty()) },
-    { name: b"rotr32", sc: mono_fn([int_type(), int_type()], int_type()) },
-    { name: b"checked_add", sc: poly_fn([a], [], [ta, ta], option_type(ta), row_empty()) },
-    { name: b"checked_sub", sc: poly_fn([a], [], [ta, ta], option_type(ta), row_empty()) },
-    { name: b"checked_mul", sc: poly_fn([a], [], [ta, ta], option_type(ta), row_empty()) },
-    { name: b"checked_neg", sc: poly_fn([a], [], [ta], option_type(ta), row_empty()) },
-    { name: b"u8_of_int", sc: poly_fn([], [], [int_type()], named_type(b"U8"), abort_row()) },
-    { name: b"u16_of_int", sc: poly_fn([], [], [int_type()], named_type(b"U16"), abort_row()) },
-    { name: b"u32_of_int", sc: poly_fn([], [], [int_type()], named_type(b"U32"), abort_row()) },
-    { name: b"u64_of_int", sc: poly_fn([], [], [int_type()], named_type(b"U64"), abort_row()) },
-    { name: b"i8_of_int", sc: poly_fn([], [], [int_type()], named_type(b"I8"), abort_row()) },
-    { name: b"i16_of_int", sc: poly_fn([], [], [int_type()], named_type(b"I16"), abort_row()) },
-    { name: b"i32_of_int", sc: poly_fn([], [], [int_type()], named_type(b"I32"), abort_row()) },
-    { name: b"i64_of_int", sc: poly_fn([], [], [int_type()], named_type(b"I64"), abort_row()) },
-    { name: b"u128_of_int", sc: poly_fn([], [], [int_type()], named_type(b"U128"), abort_row()) },
-    { name: b"i128_of_int", sc: poly_fn([], [], [int_type()], named_type(b"I128"), abort_row()) },
-    { name: b"int_of_u8", sc: mono_fn([named_type(b"U8")], int_type()) },
-    { name: b"int_of_u16", sc: mono_fn([named_type(b"U16")], int_type()) },
-    { name: b"int_of_u32", sc: mono_fn([named_type(b"U32")], int_type()) },
-    { name: b"int_of_u64", sc: poly_fn([], [], [named_type(b"U64")], int_type(), abort_row()) },
-    { name: b"int_of_i8", sc: mono_fn([named_type(b"I8")], int_type()) },
-    { name: b"int_of_i16", sc: mono_fn([named_type(b"I16")], int_type()) },
-    { name: b"int_of_i32", sc: mono_fn([named_type(b"I32")], int_type()) },
-    { name: b"int_of_i64", sc: mono_fn([named_type(b"I64")], int_type()) },
-    { name: b"int_of_u128", sc: poly_fn([], [], [named_type(b"U128")], int_type(), abort_row()) },
-    { name: b"int_of_i128", sc: poly_fn([], [], [named_type(b"I128")], int_type(), abort_row()) },
-    { name: b"u128_to_string", sc: mono_fn([named_type(b"U128")], string_type()) },
-    { name: b"i128_to_string", sc: mono_fn([named_type(b"I128")], string_type()) },
-    { name: b"u128_of_string", sc: mono_fn([string_type()], option_type(named_type(b"U128"))) },
-    { name: b"i128_of_string", sc: mono_fn([string_type()], option_type(named_type(b"I128"))) },
-    { name: b"min", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
-    { name: b"max", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
-    { name: b"byte_of_int", sc: poly_fn([], [], [int_type()], bytes_type(), abort_row()) },
-    { name: b"int_to_string", sc: mono_fn([int_type()], string_type()) },
-    { name: b"float_to_string", sc: mono_fn([float_type()], string_type()) },
-    { name: b"string_concat", sc: mono_fn([string_type(), string_type()], string_type()) },
-    { name: b"bytes_len", sc: mono_fn([bytes_type()], int_type()) },
-    { name: b"bytes_at", sc: poly_fn([], [], [bytes_type(), int_type()], int_type(), abort_row()) },
-    {
-      name: b"bytes_u32_le",
-      sc: poly_fn([], [], [bytes_type(), int_type()], named_type(b"U32"), abort_row()),
-    },
-    {
-      name: b"bytes_slice",
-      sc: poly_fn([], [], [bytes_type(), int_type(), int_type()], bytes_type(), abort_row()),
-    },
-    { name: b"bytes_concat", sc: mono_fn([bytes_type(), bytes_type()], bytes_type()) },
-    { name: b"bytes_blake3", sc: mono_fn([bytes_type()], bytes_type()) },
-    { name: b"bytes_gzip", sc: mono_fn([bytes_type()], bytes_type()) },
-    { name: b"bytes_gunzip", sc: mono_fn([bytes_type()], option_type(bytes_type())) },
-    { name: b"bytes_concat_all", sc: mono_fn([list_type(bytes_type())], bytes_type()) },
-    { name: b"bytes_of_string", sc: mono_fn([string_type()], bytes_type()) },
-    { name: b"bytes_is_utf8", sc: mono_fn([bytes_type()], bool_type()) },
-    { name: b"bytes_index_of", sc: mono_fn([bytes_type(), bytes_type()], option_type(int_type())) },
-    {
-      name: b"bytes_index_of_from",
-      sc: poly_fn(
-        [],
-        [],
-        [bytes_type(), bytes_type(), int_type()],
-        option_type(int_type()),
-        abort_row(),
-      ),
-    },
-    {
-      name: b"bytes_index_of_byte",
-      sc: poly_fn([], [], [bytes_type(), int_type()], option_type(int_type()), abort_row()),
-    },
-    { name: b"bytes_starts_with", sc: mono_fn([bytes_type(), bytes_type()], bool_type()) },
-    { name: b"bytes_ends_with", sc: mono_fn([bytes_type(), bytes_type()], bool_type()) },
-    {
-      name: b"bytes_split",
-      sc: poly_fn([], [], [bytes_type(), bytes_type()], list_type(bytes_type()), abort_row()),
-    },
-    {
-      name: b"bytes_scan",
-      sc: poly_fn(
-        [],
-        [],
-        [bytes_type(), int_type(), bytes_type(), int_type()],
-        int_type(),
-        abort_row(),
-      ),
-    },
-    {
-      name: b"bytes_scan_until",
-      sc: poly_fn(
-        [],
-        [],
-        [bytes_type(), int_type(), bytes_type(), int_type()],
-        int_type(),
-        abort_row(),
-      ),
-    },
-    {
-      name: b"bytes_position",
-      sc: poly_fn(
-        [],
-        [e],
-        [bytes_type(), int_type(), fn_type([int_type()], bool_type(), re)],
-        option_type(int_type()),
-        raising(re),
-      ),
-    },
-    { name: b"string_of_bytes", sc: poly_fn([], [], [bytes_type()], string_type(), abort_row()) },
-    { name: b"string_of_bytes_lossy", sc: mono_fn([bytes_type()], string_type()) },
-    { name: b"string_len", sc: mono_fn([string_type()], int_type()) },
-    {
-      name: b"string_slice",
-      sc: poly_fn([], [], [string_type(), int_type(), int_type()], string_type(), abort_row()),
-    },
-    {
-      name: b"string_split",
-      sc: poly_fn([], [], [string_type(), string_type()], list_type(string_type()), abort_row()),
-    },
-    { name: b"string_trim", sc: mono_fn([string_type()], string_type()) },
-    { name: b"string_lower", sc: mono_fn([string_type()], string_type()) },
-    { name: b"string_upper", sc: mono_fn([string_type()], string_type()) },
-    { name: b"string_starts_with", sc: mono_fn([string_type(), string_type()], bool_type()) },
-    { name: b"string_ends_with", sc: mono_fn([string_type(), string_type()], bool_type()) },
-    { name: b"string_contains", sc: mono_fn([string_type(), string_type()], bool_type()) },
-    {
-      name: b"string_find",
-      sc: poly_fn([], [], [string_type(), string_type()], int_type(), abort_row()),
-    },
-    { name: b"char_of_int", sc: mono_fn([int_type()], option_type(named_type(b"Char"))) },
-    { name: b"int_of_char", sc: mono_fn([named_type(b"Char")], int_type()) },
-    { name: b"string_chars", sc: mono_fn([string_type()], list_type(named_type(b"Char"))) },
-    { name: b"string_of_chars", sc: mono_fn([list_type(named_type(b"Char"))], string_type()) },
-    { name: b"compare", sc: poly_fn([a], [], [ta, ta], ordering, row_empty()) },
-    { name: b"compare_values", sc: poly_fn([a], [], [ta, ta], ordering, row_empty()) },
-    { name: b"map_new", sc: poly_fn([a, b], [], [], map_ty, row_empty()) },
-    { name: b"map_insert", sc: poly_fn([a, b], [], [map_ty, ta, tb], map_ty, row_empty()) },
-    {
-      name: b"map_update",
-      sc: poly_fn([a, b], [e], [map_ty, ta, fn_type([tb], tb, re)], map_ty, re),
-    },
-    { name: b"map_get", sc: poly_fn([a, b], [], [map_ty, ta], option_type(tb), row_empty()) },
-    { name: b"map_contains", sc: poly_fn([a, b], [], [map_ty, ta], bool_type(), row_empty()) },
-    { name: b"map_remove", sc: poly_fn([a, b], [], [map_ty, ta], map_ty, row_empty()) },
-    { name: b"map_len", sc: poly_fn([a, b], [], [map_ty], int_type(), row_empty()) },
-    { name: b"map_keys", sc: poly_fn([a, b], [], [map_ty], list_type(ta), row_empty()) },
-    { name: b"map_values", sc: poly_fn([a, b], [], [map_ty], list_type(tb), row_empty()) },
-    { name: b"map_entries", sc: poly_fn([a, b], [], [map_ty], list_type(entry_ty), row_empty()) },
-    {
-      name: b"map_of_entries",
-      sc: poly_fn([a, b], [], [list_type(entry_ty)], map_ty, row_empty()),
-    },
-    { name: b"map_merge", sc: poly_fn([a, b], [], [map_ty, map_ty], map_ty, row_empty()) },
-    {
-      name: b"map_fold",
-      sc: poly_fn([a, b, c], [e], [map_ty, tc, fn_type([tc, ta, tb], tc, re)], tc, re),
-    },
-    {
-      name: b"decimal_div",
-      sc: poly_fn(
-        [],
-        [],
-        [decimal_type(), decimal_type(), int_type(), rounding],
-        decimal_type(),
-        abort_row(),
-      ),
-    },
-    {
-      name: b"decimal_round",
-      sc: poly_fn([], [], [decimal_type(), int_type(), rounding], decimal_type(), abort_row()),
-    },
-    { name: b"decimal_of_int", sc: mono_fn([int_type()], decimal_type()) },
-    { name: b"int_of_decimal", sc: mono_fn([decimal_type(), rounding], option_type(int_type())) },
-    { name: b"float_of_decimal", sc: mono_fn([decimal_type()], float_type()) },
-    { name: b"decimal_of_float", sc: mono_fn([float_type()], option_type(decimal_type())) },
-    { name: b"decimal_of_string", sc: mono_fn([string_type()], option_type(decimal_type())) },
-    { name: b"float_of_string", sc: mono_fn([string_type()], option_type(float_type())) },
-    { name: b"float_of_int", sc: mono_fn([int_type()], float_type()) },
-    { name: b"int_of_float", sc: mono_fn([float_type(), rounding], option_type(int_type())) },
-    { name: b"round", sc: mono_fn([float_type(), rounding], float_type()) },
-    { name: b"floor", sc: mono_fn([float_type()], float_type()) },
-    { name: b"ceil", sc: mono_fn([float_type()], float_type()) },
-    { name: b"sqrt", sc: mono_fn([float_type()], float_type()) },
-    { name: b"exp", sc: mono_fn([float_type()], float_type()) },
-    { name: b"ln", sc: mono_fn([float_type()], float_type()) },
-    { name: b"log2", sc: mono_fn([float_type()], float_type()) },
-    { name: b"log10", sc: mono_fn([float_type()], float_type()) },
-    { name: b"sin", sc: mono_fn([float_type()], float_type()) },
-    { name: b"cos", sc: mono_fn([float_type()], float_type()) },
-    { name: b"tan", sc: mono_fn([float_type()], float_type()) },
-    { name: b"asin", sc: mono_fn([float_type()], float_type()) },
-    { name: b"acos", sc: mono_fn([float_type()], float_type()) },
-    { name: b"atan", sc: mono_fn([float_type()], float_type()) },
-    { name: b"pow", sc: mono_fn([float_type(), float_type()], float_type()) },
-    { name: b"atan2", sc: mono_fn([float_type(), float_type()], float_type()) },
-    { name: b"hypot", sc: mono_fn([float_type(), float_type()], float_type()) },
-    { name: b"decimal_to_string", sc: mono_fn([decimal_type()], string_type()) },
-    { name: b"bits_of_float", sc: mono_fn([float_type()], int_type()) },
-    { name: b"float_of_bits", sc: mono_fn([int_type()], float_type()) },
-    { name: b"panic", sc: poly_fn([a], [], [string_type()], ta, abort_row()) },
-    // The identity a benchmark pins a measured value with; the emitter makes the call opaque,
-    // so the C compiler cannot drop a pure computation whose value is only observed.
-    { name: b"observe", sc: poly_fn([a], [], [ta], ta, row_empty()) },
-    { name: b"secret_of_string", sc: mono_fn([string_type()], secret_type(string_type())) },
-    {
-      name: b"secret_verify",
-      sc: mono_fn([secret_type(string_type()), string_type()], bool_type()),
-    },
-    { name: b"secret_is_empty", sc: poly_fn([a], [], [secret_type(ta)], bool_type(), row_empty()) },
-    { name: b"cell_get", sc: poly_fn([a, b], [], [cell_ty], ta, row_empty()) },
-    { name: b"cell_set", sc: poly_fn([a, b], [], [cell_ty, ta], unit_type(), row_empty()) },
-    {
-      name: b"cell_update",
-      sc: poly_fn([a, b], [e], [cell_ty, fn_type([ta], ta, re)], unit_type(), row_empty()),
-    },
-  ]
+// A function the prelude declares: its scheme, the names its declaration gives its parameters, the
+// comment above it, and what a call must show of the types it fixes.
+pub type Builtin = {
+  name: Bytes,
+  scheme: Scheme,
+  params: List<Bytes>,
+  note: Bytes,
+  constraints: List<DefConstraint>,
 }
 
-pub type BuiltinDoc = { name: Bytes, params: List<Bytes>, note: Bytes }
+// What a declaration's types are read against: the variables its generic list binds, and the types
+// the prelude imports, each under the name its module declares it by.
+type Declaring = {
+  fresh: Fresh,
+  tys: Map<Bytes, Type>,
+  rows: Map<Bytes, Int>,
+  imported: Map<Bytes, Bytes>,
+}
 
-fn builtin_doc(name: Bytes, params: List<Bytes>, note: Bytes) -> BuiltinDoc =
-  { name: name, params: params, note: note }
+fn misdeclared(what: Bytes, name: Bytes) -> String =
+  "the prelude " ++ string_of_bytes_lossy(what) ++ ": `" ++ string_of_bytes_lossy(name) ++ "`"
 
-// Every builtin's parameter names and its one-line note, which `ply doc` prints beside the scheme.
-pub fn builtin_docs() -> List<BuiltinDoc> =
-  [
-    builtin_doc(
-      b"assert",
-      [b"cond", b"message"],
-      b"E0501 when `cond` is false; `message` defaults to `None`",
-    ),
-    builtin_doc(b"assert_eq", [b"actual", b"expected"], b"E0501 when they differ"),
-    builtin_doc(b"len", [b"xs"], b""),
-    builtin_doc(b"push", [b"xs", b"x"], b"a new list with `x` at the end"),
-    builtin_doc(b"list_at", [b"xs", b"i"], b"`None` if `i` is negative or past the end"),
-    builtin_doc(b"list_set", [b"xs", b"i", b"v"], b"raises if `i` is out of range"),
-    builtin_doc(
-      b"array_new",
-      [b"n", b"x"],
-      b"`n` of `x`; raises if `n` is negative or past `2^26`",
-    ),
-    builtin_doc(b"array_of_list", [b"xs"], b""),
-    builtin_doc(b"array_to_list", [b"xs"], b""),
-    builtin_doc(b"array_len", [b"xs"], b""),
-    builtin_doc(b"array_at", [b"xs", b"i"], b"`None` if `i` is negative or past the end"),
-    builtin_doc(b"array_get", [b"xs", b"i"], b"raises if `i` is out of range"),
-    builtin_doc(
-      b"array_set",
-      [b"xs", b"i", b"v"],
-      b"in place when the caller holds the last reference; raises if `i` is out of range",
-    ),
-    builtin_doc(
-      b"reflect",
-      [b"x"],
-      b"the value as a `std.value.Value`; a width below 64 bits the program does not fix reads as its `Int`",
-    ),
-    builtin_doc(b"map", [b"xs", b"f"], b""),
-    builtin_doc(b"filter", [b"xs", b"f"], b""),
-    builtin_doc(b"fold", [b"xs", b"init", b"f"], b"left to right"),
-    builtin_doc(
-      b"iterate",
-      [b"seed", b"budget", b"step"],
-      b"`step` answers `Continue(next)` or `Stop(result)`; the budget bounds the steps",
-    ),
-    builtin_doc(
-      b"metered",
-      [b"f"],
-      b"`f()` and what it cost: the calls it made, the objects it allocated, and how many times it performed each atom",
-    ),
-    builtin_doc(
-      b"bracket",
-      [b"acquire", b"release", b"body"],
-      b"what `body` answers for what `acquire` answered, with `release` run on it however `body` ends but a failure",
-    ),
-    builtin_doc(b"range", [b"lo", b"hi"], b"`[lo, hi)`"),
-    builtin_doc(b"wrap_add", [b"a", b"b"], b"any integer type; wraps at its width"),
-    builtin_doc(b"wrap_sub", [b"a", b"b"], b"any integer type; wraps at its width"),
-    builtin_doc(b"wrap_mul", [b"a", b"b"], b"any integer type; wraps at its width"),
-    builtin_doc(b"rotr", [b"x", b"n"], b"any integer type; rotated right by `n` bits at its width"),
-    builtin_doc(b"rotr32", [b"x", b"n"], b"the low thirty-two bits of `x`, rotated right by `n`"),
-    builtin_doc(b"checked_add", [b"a", b"b"], b"any integer type; `None` where the sum leaves it"),
-    builtin_doc(
-      b"checked_sub",
-      [b"a", b"b"],
-      b"any integer type; `None` where the difference leaves it",
-    ),
-    builtin_doc(
-      b"checked_mul",
-      [b"a", b"b"],
-      b"any integer type; `None` where the product leaves it",
-    ),
-    builtin_doc(b"checked_neg", [b"a"], b"any integer type; `None` where the negation leaves it"),
-    builtin_doc(b"u8_of_int", [b"n"], b"raises if out of range"),
-    builtin_doc(b"u16_of_int", [b"n"], b"raises if out of range"),
-    builtin_doc(b"u32_of_int", [b"n"], b"raises if out of range"),
-    builtin_doc(b"u64_of_int", [b"n"], b"raises if out of range"),
-    builtin_doc(b"i8_of_int", [b"n"], b"raises if out of range"),
-    builtin_doc(b"i16_of_int", [b"n"], b"raises if out of range"),
-    builtin_doc(b"i32_of_int", [b"n"], b"raises if out of range"),
-    builtin_doc(b"i64_of_int", [b"n"], b"raises if out of range"),
-    builtin_doc(b"u128_of_int", [b"n"], b"raises if negative"),
-    builtin_doc(b"i128_of_int", [b"n"], b"total"),
-    builtin_doc(b"int_of_u8", [b"n"], b"total"),
-    builtin_doc(b"int_of_u16", [b"n"], b"total"),
-    builtin_doc(b"int_of_u32", [b"n"], b"total"),
-    builtin_doc(b"int_of_u64", [b"n"], b"raises above `Int`'s maximum"),
-    builtin_doc(b"int_of_i8", [b"n"], b"total"),
-    builtin_doc(b"int_of_i16", [b"n"], b"total"),
-    builtin_doc(b"int_of_i32", [b"n"], b"total"),
-    builtin_doc(b"int_of_i64", [b"n"], b"total"),
-    builtin_doc(b"int_of_u128", [b"n"], b"raises above `Int`'s maximum"),
-    builtin_doc(b"int_of_i128", [b"n"], b"raises outside `Int`'s range"),
-    builtin_doc(b"u128_to_string", [b"n"], b"decimal"),
-    builtin_doc(b"i128_to_string", [b"n"], b"decimal, with a leading `-` when negative"),
-    builtin_doc(
-      b"u128_of_string",
-      [b"s"],
-      b"decimal digits only; `None` otherwise or out of range",
-    ),
-    builtin_doc(
-      b"i128_of_string",
-      [b"s"],
-      b"an optional `-` and decimal digits; `None` otherwise or out of range",
-    ),
-    builtin_doc(
-      b"min",
-      [b"a", b"b"],
-      b"in `compare`'s order, `a` when they are equal; needs `derivable(ord, a)`",
-    ),
-    builtin_doc(
-      b"max",
-      [b"a", b"b"],
-      b"in `compare`'s order, `a` when they are equal; needs `derivable(ord, a)`",
-    ),
-    builtin_doc(b"byte_of_int", [b"n"], b"one byte; raises outside `0..=255`"),
-    builtin_doc(b"int_to_string", [b"n"], b""),
-    builtin_doc(b"float_to_string", [b"f"], b"shortest round-trip; `Infinity` and `NaN`"),
-    builtin_doc(b"string_concat", [b"a", b"b"], b"`a ++ b`"),
-    builtin_doc(b"bytes_len", [b"b"], b""),
-    builtin_doc(b"bytes_at", [b"b", b"i"], b"`0..=255`; raises out of range"),
-    builtin_doc(b"bytes_u32_le", [b"b", b"i"], b"four bytes at `i`, little-endian"),
-    builtin_doc(b"bytes_slice", [b"b", b"start", b"end"], b"raises out of range"),
-    builtin_doc(b"bytes_concat", [b"a", b"b"], b"`a ++ b`"),
-    builtin_doc(b"bytes_blake3", [b"b"], b"the 32-byte BLAKE3 digest of `b`"),
-    builtin_doc(b"bytes_gzip", [b"b"], b"gzip at the best level, the same bytes on every machine"),
-    builtin_doc(b"bytes_gunzip", [b"b"], b"`None` when `b` is not gzip"),
-    builtin_doc(b"bytes_concat_all", [b"bs"], b"one allocation"),
-    builtin_doc(b"bytes_of_string", [b"s"], b"UTF-8"),
-    builtin_doc(b"bytes_is_utf8", [b"b"], b""),
-    builtin_doc(b"bytes_index_of", [b"hay", b"needle"], b""),
-    builtin_doc(b"bytes_index_of_from", [b"hay", b"needle", b"from"], b""),
-    builtin_doc(b"bytes_index_of_byte", [b"hay", b"byte"], b""),
-    builtin_doc(b"bytes_starts_with", [b"b", b"prefix"], b""),
-    builtin_doc(b"bytes_ends_with", [b"b", b"suffix"], b""),
-    builtin_doc(b"bytes_split", [b"b", b"sep"], b""),
-    builtin_doc(
-      b"bytes_scan",
-      [b"hay", b"from", b"class", b"budget"],
-      b"the first index at or after `from` whose byte is not in `class`; `from + budget` if none",
-    ),
-    builtin_doc(
-      b"bytes_scan_until",
-      [b"hay", b"from", b"class", b"budget"],
-      b"the first index at or after `from` whose byte is in `class`; `from + budget` if none",
-    ),
-    builtin_doc(
-      b"bytes_position",
-      [b"b", b"from", b"f"],
-      b"the first index at or after `from` whose byte satisfies `f`",
-    ),
-    builtin_doc(b"string_of_bytes", [b"b"], b"raises on invalid UTF-8"),
-    builtin_doc(b"string_of_bytes_lossy", [b"b"], b"U+FFFD for invalid UTF-8"),
-    builtin_doc(b"string_len", [b"s"], b"in characters"),
-    builtin_doc(
-      b"string_slice",
-      [b"s", b"start", b"end"],
-      b"character indexes; raises out of range",
-    ),
-    builtin_doc(b"string_split", [b"s", b"sep"], b""),
-    builtin_doc(b"string_trim", [b"s"], b""),
-    builtin_doc(b"string_lower", [b"s"], b""),
-    builtin_doc(b"string_upper", [b"s"], b""),
-    builtin_doc(b"string_starts_with", [b"s", b"prefix"], b""),
-    builtin_doc(b"string_ends_with", [b"s", b"suffix"], b""),
-    builtin_doc(b"string_contains", [b"s", b"t"], b""),
-    builtin_doc(b"string_find", [b"s", b"needle"], b"raises if absent"),
-    builtin_doc(b"char_of_int", [b"n"], b"`None` for a surrogate, a negative or past `U+10FFFF`"),
-    builtin_doc(b"int_of_char", [b"c"], b"the Unicode scalar value"),
-    builtin_doc(b"string_chars", [b"s"], b"each character in order"),
-    builtin_doc(b"string_of_chars", [b"cs"], b""),
-    builtin_doc(b"compare", [b"x", b"y"], b"a total order; needs `derivable(ord, a)`"),
-    builtin_doc(b"compare_values", [b"x", b"y"], b"`compare` under a name no module may shadow"),
-    builtin_doc(
-      b"numeric_of_int",
-      [b"n"],
-      b"`n` as the `numeric` type the call is at; raises past a width's range",
-    ),
-    builtin_doc(
-      b"digest",
-      [b"x"],
-      b"BLAKE3 of the value's canonical encoding: equal values, equal digests; needs `derivable(hash, a)`",
-    ),
-    builtin_doc(b"map_new", [], b""),
-    builtin_doc(b"map_insert", [b"m", b"key", b"value"], b"replaces"),
-    builtin_doc(b"map_update", [b"m", b"key", b"f"], b"no-op if `key` is absent"),
-    builtin_doc(b"map_get", [b"m", b"key"], b""),
-    builtin_doc(b"map_contains", [b"m", b"key"], b""),
-    builtin_doc(b"map_remove", [b"m", b"key"], b""),
-    builtin_doc(b"map_len", [b"m"], b""),
-    builtin_doc(b"map_keys", [b"m"], b"ascending"),
-    builtin_doc(b"map_values", [b"m"], b"key order"),
-    builtin_doc(b"map_entries", [b"m"], b"key order"),
-    builtin_doc(b"map_of_entries", [b"es"], b"a later entry wins"),
-    builtin_doc(b"map_merge", [b"a", b"b"], b"`b` wins"),
-    builtin_doc(b"map_fold", [b"m", b"init", b"f"], b"key order"),
-    builtin_doc(b"decimal_div", [b"a", b"b", b"scale", b"mode"], b"raises on a zero divisor"),
-    builtin_doc(b"decimal_round", [b"d", b"scale", b"mode"], b""),
-    builtin_doc(b"decimal_of_int", [b"n"], b""),
-    builtin_doc(
-      b"int_of_decimal",
-      [b"d", b"mode"],
-      b"`None` if the rounded value does not fit an `Int`",
-    ),
-    builtin_doc(b"float_of_decimal", [b"d"], b"nearest"),
-    builtin_doc(b"float_of_int", [b"n"], b"nearest; exact up to `2^53`"),
-    builtin_doc(
-      b"int_of_float",
-      [b"x", b"mode"],
-      b"`x` rounded to a whole number by `mode`; `None` for `NaN`, an infinity, or one past `Int`",
-    ),
-    builtin_doc(b"round", [b"x", b"mode"], b"`x` at a whole number, chosen as `mode` chooses"),
-    builtin_doc(b"floor", [b"x"], b"the greatest whole number at or below `x`"),
-    builtin_doc(b"ceil", [b"x"], b"the least whole number at or above `x`"),
-    builtin_doc(b"sqrt", [b"x"], b"correctly rounded; `NaN` below zero"),
-    builtin_doc(b"exp", [b"x"], b""),
-    builtin_doc(b"ln", [b"x"], b"the natural logarithm; `-inf` at zero, `NaN` below it"),
-    builtin_doc(b"log2", [b"x"], b""),
-    builtin_doc(b"log10", [b"x"], b""),
-    builtin_doc(b"sin", [b"x"], b"of `x` radians"),
-    builtin_doc(b"cos", [b"x"], b"of `x` radians"),
-    builtin_doc(b"tan", [b"x"], b"of `x` radians"),
-    builtin_doc(b"asin", [b"x"], b"radians in `[-pi/2, pi/2]`; `NaN` outside `[-1, 1]`"),
-    builtin_doc(b"acos", [b"x"], b"radians in `[0, pi]`; `NaN` outside `[-1, 1]`"),
-    builtin_doc(b"atan", [b"x"], b"radians in `[-pi/2, pi/2]`"),
-    builtin_doc(b"pow", [b"x", b"y"], b"`x` to the power `y`"),
-    builtin_doc(b"atan2", [b"y", b"x"], b"the angle of `(x, y)` in radians, in `[-pi, pi]`"),
-    builtin_doc(b"hypot", [b"x", b"y"], b"`sqrt(x * x + y * y)` without overflow on the way"),
-    builtin_doc(b"decimal_of_float", [b"f"], b"`None` for `inf` or `NaN`"),
-    builtin_doc(b"decimal_of_string", [b"s"], b""),
-    builtin_doc(
-      b"float_of_string",
-      [b"s"],
-      b"`Float` literal syntax with a sign; `None` for `inf` or `NaN`",
-    ),
-    builtin_doc(b"decimal_to_string", [b"d"], b""),
-    builtin_doc(b"bits_of_float", [b"f"], b"the IEEE-754 bit pattern; total"),
-    builtin_doc(b"float_of_bits", [b"n"], b"the IEEE-754 bit pattern; total"),
-    builtin_doc(b"panic", [b"message"], b"raises `message`; unanswered, E0502"),
-    builtin_doc(b"observe", [b"value"], b"the value, kept"),
-    builtin_doc(b"secret_of_string", [b"s"], b""),
-    builtin_doc(b"secret_verify", [b"stored", b"supplied"], b"constant-time; not rate-limited"),
-    builtin_doc(b"secret_is_empty", [b"s"], b""),
-    builtin_doc(b"cell_get", [b"c"], b""),
-    builtin_doc(b"cell_set", [b"c", b"v"], b""),
-    builtin_doc(b"cell_update", [b"c", b"f"], b"the cell is unreadable while `f` runs"),
-  ]
+fn declared_types(
+  d: Declaring,
+  tys: List<TypeExpr>,
+) -> { d: Declaring, tys: List<Type> } / {abort.raise} =
+  fold(tys, { d: d, tys: [] }, |acc: { d: Declaring, tys: List<Type> }, ty: TypeExpr| {
+    let o = declared_type(acc.d, ty);
+    { d: o.d, tys: push(acc.tys, o.ty) }
+  })
 
-pub fn find_doc(docs: List<BuiltinDoc>, name: Bytes) -> Option<BuiltinDoc> =
-  fold(docs, None, |acc: Option<BuiltinDoc>, d: BuiltinDoc|
-    match acc { Some(_) -> acc, None -> if d.name == name { Some(d) } else { None } })
+// A type as a declaration writes it. Only the language's own types and the prelude's imports are
+// in reach of one, and a cell's region is the call's to fix, so a declaration is generic over it.
+fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {abort.raise} =
+  match ty {
+    TVar(id) -> match map_get(d.tys, id.name) {
+      Some(t) -> { d: d, ty: t },
+      None -> panic(misdeclared(b"names a type variable no generic list binds", id.name)),
+    },
+    TUnit(_) -> { d: d, ty: unit_type() },
+    TBad(_) -> panic("the prelude does not parse"),
+    TRecord(r) -> {
+      let fs = fold(
+        r.fields,
+        { d: d, fs: [] },
+        |acc: { d: Declaring, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
+          let o = declared_type(acc.d, f.ty);
+          { d: o.d, fs: push(acc.fs, { name: f.name.name, ty: o.ty }) }
+        },
+      );
+      { d: fs.d, ty: TyRecord(fields_sorted(fs.fs)) }
+    },
+    TFn(f) -> {
+      let ps = declared_types(d, f.params);
+      let r = declared_type(ps.d, f.ret);
+      { d: r.d, ty: fn_type(ps.tys, r.ty, declared_row(r.d, f.effects)) }
+    },
+    TCon(c) -> {
+      let name = c.name.name.name;
+      match map_get(d.tys, name) {
+        Some(t) -> { d: d, ty: t },
+        None -> match map_get(d.imported, name) {
+          Some(full) -> { d: d, ty: named_type(full) },
+          None -> {
+            let args = declared_types(d, c.args);
+            if builtin_type_arity(name) != Some(len(args.tys)) {
+              panic(misdeclared(b"names a type that is not the language's own at that arity", name))
+            } else if name == b"Cell" {
+              let region = fresh_ty(args.d.fresh);
+              {
+                d: { ..args.d, fresh: region.fresh },
+                ty: TyCon({ name: name, args: [region.ty, at(args.tys, 0)] }),
+              }
+            } else { { d: args.d, ty: TyCon({ name: name, args: args.tys }) } }
+          },
+        },
+      }
+    },
+  }
 
-fn fn_arity(ty: Type) -> Int = match ty { TyFn(f) -> len(f.params), _ -> -1 }
+// A declaration's row: `abort.raise`, a row variable, both or neither.
+fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
+  match row {
+    None -> row_empty(),
+    Some(r) ->
+      {
+        atoms: fold(r.atoms, [], |acc: List<Atom>, a: AtomExpr|
+          if is_bare(a.eff) && a.eff.name.name == b"abort"
+              && (match a.op { Some(op) -> op.name == b"raise", None -> false }) {
+            atoms_insert(acc, abort_atom())
+          } else { panic(misdeclared(b"performs more than `abort.raise`", a.eff.name.name)) }),
+        tail: match r.tail {
+          None -> None,
+          Some(v) -> match map_get(d.rows, v.name) {
+            Some(var) -> Some(var),
+            None -> panic(misdeclared(b"names a row variable no generic list binds", v.name)),
+          },
+        },
+      },
+  }
 
-test "every builtin is documented with one name per parameter" {
-  let schemes = builtin_schemes(0, 1, 2, 0);
-  let docs = builtin_docs();
-  assert_eq(len(docs), len(schemes));
-  fold(schemes, (), |acc: Unit, x: { name: Bytes, sc: Scheme }|
-    match find_doc(docs, x.name) {
-      None -> panic("undocumented builtin: " ++ string_of_bytes(x.name)),
-      Some(d) -> assert_eq(len(d.params), fn_arity(x.sc.ty)),
+// Each type the prelude imports by name, under the name its module declares it by.
+fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
+  fold(imports, map_new(), |acc: Map<Bytes, Bytes>, decl: ImportDecl|
+    match decl.kind {
+      INames(names) -> {
+        let module = fold(decl.path, b"", |path: Bytes, segment: Ident|
+          bytes_concat_all([path, segment.name, b"."]));
+        fold(names, acc, |m: Map<Bytes, Bytes>, n: Ident|
+          map_insert(m, n.name, bytes_concat(module, n.name)))
+      },
+      _ -> acc,
     })
+
+// Where the line holding byte `at` starts.
+fn line_start(text: Bytes, at: Int) -> Int / {abort.raise} =
+  if at <= 0 { 0 } else if bytes_at(text, at - 1) == 10 { at } else { line_start(text, at - 1) }
+
+// The `//` lines directly above the line at `at`, joined: the note a declaration carries.
+fn note_above(text: Bytes, at: Int, below: Bytes) -> Bytes / {abort.raise}
+  decreases at
+=
+  if at <= 0 { below } else {
+    let start = line_start(text, at - 1);
+    let line = bytes_slice(text, start, at - 1);
+    if !bytes_starts_with(line, b"// ") { below } else {
+      let words = bytes_slice(line, 3, bytes_len(line));
+      note_above(text, start, if bytes_len(below) == 0 { words }
+      else { bytes_concat_all([words, b" ", below]) })
+    }
+  }
+
+fn declared(imported: Map<Bytes, Bytes>, text: Bytes, def: ExternDef) -> Builtin / {abort.raise} = {
+  let tys = fold(
+    def.generics.types,
+    { fresh: fresh_new(), tys: map_new() },
+    |acc: { fresh: Fresh, tys: Map<Bytes, Type> }, p: Ident| {
+      let o = fresh_ty(acc.fresh);
+      { fresh: o.fresh, tys: map_insert(acc.tys, p.name, o.ty) }
+    },
+  );
+  let rows = fold(
+    def.generics.effects,
+    { fresh: tys.fresh, rows: map_new() },
+    |acc: { fresh: Fresh, rows: Map<Bytes, Int> }, p: Ident| {
+      let o = fresh_row_var(acc.fresh);
+      { fresh: o.fresh, rows: map_insert(acc.rows, p.name, o.var) }
+    },
+  );
+  let params = declared_types(
+    { fresh: rows.fresh, tys: tys.tys, rows: rows.rows, imported: imported },
+    map(def.params, |p: Param|
+      match p.ty {
+        Some(t) -> t,
+        None -> panic(misdeclared(b"leaves a parameter untyped", p.name.name)),
+      }),
+  );
+  let ret = declared_type(params.d, def.ret);
+  let found = fold(def.constraints, [], |acc: List<DefConstraint>, c: Constraint| {
+    let param = fold(range(0, len(def.generics.types)), 0 - 1, |p: Int, i: Int|
+      if p >= 0 { p } else if at(def.generics.types, i).name == c.param.name { i } else { p });
+    if param < 0 { panic(misdeclared(b"constrains what no generic list binds", c.param.name)) }
+    else { insert_constraint(acc, { deriver: c.deriver, param: param }) }
+  });
+  {
+    name: def.name.name,
+    scheme: {
+      ty_vars: range(0, ret.d.fresh.next_ty),
+      row_vars: range(0, ret.d.fresh.next_row),
+      label_vars: [],
+      ty: fn_type(params.tys, ret.ty, declared_row(ret.d, def.effects)),
+    },
+    params: map(def.params, |p: Param| p.name.name),
+    note: note_above(text, def.span.start, b""),
+    constraints: dedup_constraints(found),
+  }
 }
 
-// The constraints the prelude's builtins carry, checked at a call as a definition's are.
-pub fn builtin_constraints() -> List<{ name: Bytes, cs: List<DefConstraint> }> =
-  [
-    { name: b"compare", cs: [{ deriver: DOrd, param: 0 }] },
-    { name: b"compare_values", cs: [{ deriver: DOrd, param: 0 }] },
-    { name: b"min", cs: [{ deriver: DOrd, param: 0 }] },
-    { name: b"max", cs: [{ deriver: DOrd, param: 0 }] },
-    { name: b"digest", cs: [{ deriver: DHash, param: 0 }] },
-    { name: b"numeric_of_int", cs: [{ deriver: DNumeric, param: 0 }] },
-  ]
+// Every function the prelude declares, in its order. Pure and nullary, so the runtime reads the
+// prelude once.
+pub fn builtins() -> List<Builtin> / {abort.raise} = {
+  let text = prelude_source::text();
+  let parsed = parse(text);
+  if len(parsed.parser.diags) > 0 { panic("the prelude does not parse") } else {
+    let imported = prelude_imports(parsed.node.imports);
+    fold(parsed.node.items, [], |acc: List<Builtin>, item: Item|
+      match item { IExtern(def) -> push(acc, declared(imported, text, def)), _ -> acc })
+  }
+}
 
-// The builtin signatures use the first three type variables and the first row variable, so `fresh` starts past them.
+pub fn builtin_named(name: Bytes) -> Option<Builtin> / {abort.raise} =
+  fold(builtins(), None, |acc: Option<Builtin>, b: Builtin|
+    match acc { Some(_) -> acc, None -> if b.name == name { Some(b) } else { None } })
+
+// A builtin's scheme is over variables numbered from zero, so `fresh` starts past every one.
 fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
   let checker = install_prelude_adts(bare);
-  let a: WithVar = new_ty_var(checker);
-  let b: WithVar = new_ty_var(a.checker);
-  let c: WithVar = new_ty_var(b.checker);
-  let e: WithVar = new_row_var(c.checker);
-  let bound: Checker = fold(
-    builtin_schemes(a.var, b.var, c.var, e.var),
-    e.checker,
-    |c2: Checker, x: { name: Bytes, sc: Scheme }|
-      { ..c2, env: env_bind_global(c2.env, x.name, x.sc) },
-  );
-  let constrained: Checker = {
-    ..bound,
-    constraints: fold(
-      builtin_constraints(),
-      bound.constraints,
-      |m: Map<Bytes, List<DefConstraint>>, b: { name: Bytes, cs: List<DefConstraint> }|
-        map_insert(m, b.name, b.cs),
-    ),
-  };
-  fold(prelude_effects(), constrained, |c2: Checker, effect_info: EffectInfo|
-    add_effect(c2, effect_info))
+  let bound: Checker = fold(builtins(), checker, |c: Checker, b: Builtin|
+    {
+      ..c,
+      env: env_bind_global(c.env, b.name, b.scheme),
+      constraints: if len(b.constraints) == 0 { c.constraints }
+      else { map_insert(c.constraints, b.name, b.constraints) },
+      fresh: {
+        next_ty: max(c.fresh.next_ty, len(b.scheme.ty_vars)),
+        next_row: max(c.fresh.next_row, len(b.scheme.row_vars)),
+      },
+    });
+  fold(prelude_effects(), bound, |c2: Checker, effect_info: EffectInfo| add_effect(c2, effect_info))
 }
+
+// The name the shelf holds the prelude under, which no project's module can take.
+fn prelude_module() -> Bytes = b"compiler.prelude"
+
+// Only the prelude declares what the runtime implements.
+fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
+  fold(
+    if parsed.name == prelude_module() { [] } else { parsed.module.items },
+    checker,
+    |c: Checker, item: Item|
+      match item {
+        IExtern(def) ->
+          report_error_at(
+            c,
+            b"E0151",
+            def.name.span,
+            bytes_concat_all([
+              b"`extern fn ",
+              def.name.name,
+              b"` declares a function the runtime implements",
+            ]),
+            b"only the prelude declares one",
+            [
+              b"the runtime implements the builtins the prelude lists and nothing else, so a declaration here has nothing to name",
+              b"write the function's body, or reach what it needs through an `effect` a handler answers",
+            ],
+          ),
+        _ -> c,
+      },
+  )
 
 // --- Names ------------------------------------------------------------------------------
 
@@ -6903,7 +6530,7 @@ fn reverse_ints(xs: List<Int>) -> List<Int> / {abort.raise} =
 fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
   let collected = fold(
     parsed.module.items,
-    { checker: checker, fns: [], names: [] },
+    { checker: refuse_externs(checker, parsed), fns: [], names: [] },
     |acc: { checker: Checker, fns: List<FnDef>, names: List<Bytes> }, item: Item|
       match item {
         IFn(def) -> if contains_bytes(acc.names, def.name.name) {
@@ -11214,15 +10841,27 @@ fn dedup_diags(diags: List<Diag>) -> List<Diag> =
 
 type Parsed = { name: Bytes, module: Module, derived: List<Derived>, diags: List<Diag> }
 
-// The driver's order: parse with the rewrites, expand every `derive`, resolve, check. A reporting expansion stops there.
-pub fn check_dump(sources: List<Source>) -> String / {abort.raise} = {
-  let parsed = map(range(0, len(sources)), |i: Int| {
+// Each source parsed with the rewrites, every `derive` expanded, and what a driver read for its
+// embeds written out.
+fn parsed_all(sources: List<Source>, embeds: List<EmbedAt>) -> List<Parsed> / {abort.raise} = {
+  let tables = embed_tables(embeds);
+  map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
     let r = parse(s.src);
     let x = expand(r.node, r.parser.diags);
     let d: Expansion = expand_derives(i, s.name, x.module);
-    { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
-  });
+    {
+      name: s.name,
+      module: rewritten(tables, s.name, d.module).module,
+      derived: d.derived,
+      diags: d.diags,
+    }
+  })
+}
+
+// The driver's order: parse with the rewrites, expand every `derive`, resolve, check. A reporting expansion stops there.
+pub fn check_dump(sources: List<Source>, embeds: List<EmbedAt> = []) -> String / {abort.raise} = {
+  let parsed = parsed_all(sources, embeds);
   let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
   let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
   let head = bytes_concat_all([b"K;", dump_int(len(sources)), b";"]);
@@ -11272,14 +10911,11 @@ fn known_of(checker: Checker) -> Known / {abort.raise} = {
 }
 
 // The program checked twice, the second time from what the first published.
-pub fn check_dump_known(sources: List<Source>) -> String / {abort.raise} = {
-  let parsed = map(range(0, len(sources)), |i: Int| {
-    let s = at(sources, i);
-    let r = parse(s.src);
-    let x = expand(r.node, r.parser.diags);
-    let d: Expansion = expand_derives(i, s.name, x.module);
-    { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
-  });
+pub fn check_dump_known(
+  sources: List<Source>,
+  embeds: List<EmbedAt> = [],
+) -> String / {abort.raise} = {
+  let parsed = parsed_all(sources, embeds);
   let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
   let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
   let head = bytes_concat_all([b"K;", dump_int(len(sources)), b";"]);
@@ -13574,6 +13210,81 @@ test "a guard an earlier arm failed, an index found, and a write that keeps the 
       b"zero",
     ),
   )
+}
+
+fn declared_as(name: Bytes) -> Builtin / {abort.raise} =
+  match builtin_named(name) {
+    Some(b) -> b,
+    None -> panic("the prelude declares `" ++ string_of_bytes(name) ++ "`"),
+  }
+
+test "a builtin is what the prelude declares: its scheme, its parameters' names and the comment above it" {
+  let slice = declared_as(b"bytes_slice");
+  assert_eq(slice.params, [b"b", b"start", b"end"]);
+  assert_eq(slice.note, b"raises out of range");
+  assert_eq(slice.scheme, {
+    ty_vars: [],
+    row_vars: [],
+    label_vars: [],
+    ty: fn_type([bytes_type(), int_type(), int_type()], bytes_type(), row_singleton(abort_atom())),
+  });
+  assert_eq(declared_as(b"len").note, b"");
+  // A note over several lines reads as one.
+  assert_eq(
+    declared_as(b"reflect").note,
+    b"the value as a `std.value.Value`; a width below 64 bits the program does not fix reads as its `Int`",
+  )
+}
+
+test "a declaration's generic list is its scheme's variables, numbered from zero" {
+  assert_eq(declared_as(b"map").scheme, {
+    ty_vars: [0, 1],
+    row_vars: [0],
+    label_vars: [],
+    ty: fn_type(
+      [list_type(TyVar(0)), fn_type([TyVar(0)], TyVar(1), row_open(0))],
+      list_type(TyVar(1)),
+      row_open(0),
+    ),
+  });
+  assert_eq(
+    declared_as(b"iterate").scheme.ty,
+    fn_type(
+      [TyVar(0), int_type(), fn_type([TyVar(0)], iter_type(TyVar(0), TyVar(1)), row_open(0))],
+      TyVar(1),
+      { atoms: [abort_atom()], tail: Some(0) },
+    ),
+  )
+}
+
+test "a declaration's `where` is what a call must show, by the parameter's place" {
+  assert_eq(declared_as(b"compare").constraints, [{ deriver: DOrd, param: 0 }]);
+  assert_eq(declared_as(b"numeric_of_int").constraints, [{ deriver: DNumeric, param: 0 }]);
+  assert_eq(declared_as(b"push").constraints, [])
+}
+
+test "a cell's region is a variable of the declaration's own, after the ones it writes" {
+  assert_eq(declared_as(b"cell_get").scheme, {
+    ty_vars: [0, 1],
+    row_vars: [],
+    label_vars: [],
+    ty: fn_type([TyCon({ name: b"Cell", args: [TyVar(1), TyVar(0)] })], TyVar(0), row_empty()),
+  })
+}
+
+test "a type the prelude imports is the one its module declares" {
+  assert_eq(
+    declared_as(b"reflect").scheme.ty,
+    fn_type([TyVar(0)], named_type(b"std.value.Value"), row_empty()),
+  )
+}
+
+test "every builtin is in reach of a module that imports nothing" {
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int = len(push(xs, 1))\n"), [])
+}
+
+test "an `extern fn` outside the prelude is refused" {
+  assert_eq(check_codes(b"extern fn secret(x: Int) -> Int\nfn f() -> Int = 1\n"), [b"E0151"])
 }
 
 test "a constant past Int's range leaves the termination check unsure rather than broken" {

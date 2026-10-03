@@ -1593,8 +1593,11 @@ In scope everywhere; a module may shadow any except `compare_values` and
 `map_of_entries`, which the map and set literals are written in (`E0105`).
 Out-of-range indexes and slices raise (§6.8) unless noted; nothing is clamped, and
 a builtin that can raise carries `abort.raise` in its row.
-`ply doc NAME` prints any of these from the compiler's own table, which is the
-authority when this page and it disagree.
+Each is declared in the compiler's prelude as an `extern fn`: a signature the
+runtime implements, with a row and a `where` like any other and no body.
+`ply doc NAME` prints any of these from that declaration, which is the
+authority when this page and it disagree. Only the prelude declares one; an
+`extern fn` in a module is `E0151`.
 
 ### 12.1 Core, lists and maps
 
@@ -3660,6 +3663,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0148` | a `returns` clause the body does not keep |
 | `E0149` | a dependency's published interface that does not re-derive from its source |
 | `E0150` | a version whose changes need a larger bump than it makes |
+| `E0151` | an `extern fn` outside the prelude |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
@@ -3750,7 +3754,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 * No loops, `break` or `return` (`?` is the only early exit, and `abort.raise`
   the only one past the caller, §6.8); no mutable variables; no exceptions
   outside the row; no typeclasses, implicits or method syntax; no
-  modules-as-values or first-class effects; no `unsafe` or FFI.
+  modules-as-values or first-class effects; no `unsafe` or FFI: what a program
+  reaches outside itself is an effect a handler answers, and the builtins are the
+  only functions the runtime implements (§12).
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads; only a `parallel` block's branches run on threads
   of the runtime's own.
