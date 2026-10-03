@@ -1315,7 +1315,8 @@ rather than raised.
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix; the unit is then partial and a caller of what was dropped is declined, not raised |
-| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, and allocation counts |
+| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, what the builder's steps took when it builds a stage, and allocation counts by kind |
+| `PLY_HEAP_CENSUS=1` | count allocations by constructor, record shape and length class as well, which `PLY_C_PHASES` then prints; a map insert per allocation |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 
