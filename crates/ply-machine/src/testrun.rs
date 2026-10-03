@@ -245,7 +245,7 @@ fn panic_diagnostic(
         codes::INTERNAL_ERROR,
         format!("test `{name}` panicked: {message}"),
     )
-    .primary(span, "the interpreter panicked while running this test")
+    .primary(span, "Ply panicked while running this test")
     .note("a panic is a defect in Ply itself, not in the test; please report it with this source")
     .note("the other tests still ran, and this one was not cached")
 }

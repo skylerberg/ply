@@ -199,7 +199,7 @@ pub struct ArenaStats {
 
 impl ArenaStats {}
 
-/// Slots in chunks and regions nesting per owner, over interpreter values or the C backend's heap
+/// Slots in chunks and regions nesting per owner, over `Value`s or the C backend's heap
 /// words.
 pub struct Arena<V = Value> {
     /// `chunks[c][o]` is the value at index `c * CHUNK + o`; a free slot holds `V::default()`.

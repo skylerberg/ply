@@ -146,7 +146,8 @@ pub fn note_cell_cycle(slot: Slot, span: Span) {
     let _ = CYCLES.try_with(|c| c.borrow_mut().push(d));
 }
 
-const CYCLE_WALK_BUDGET: u32 = 256;
+/// How many objects a check for a cycle through a cell may visit, on either side of the seam.
+pub const CYCLE_WALK_BUDGET: u32 = 256;
 
 /// Depth- and node-bounded: the program chooses the shape, and the walk spends stack and time.
 fn reaches_cell(v: &Value, slot: Slot, depth: usize, budget: &mut u32) -> bool {
