@@ -460,7 +460,7 @@ pub struct PlyProducer {
     kept: Option<String>,
 }
 
-/// Entered as `(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg, embeds)`: every module at
+/// Entered as `(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg, embeds, rows)`: every module at
 /// once, so they resolve together, emitting the roots `wanted` names.
 const ENTRY: &str = "emit.emit_roots_answer";
 
@@ -564,15 +564,22 @@ impl PlyProducer {
 
     /// One entry over the whole program, emitting `wanted`'s roots.
     fn enter(&self, loaded: &Source, wanted: &[String]) -> Result<Bodies> {
+        let front = loaded.front;
+        let needed = imported_closure(front, wanted.iter().map(|r| module_of_root(r)));
         let mut names = Vec::new();
         let mut srcs = Vec::new();
-        for module in loaded.module_names() {
+        let mut placed = Vec::new();
+        for (at, module) in loaded.module_names().enumerate() {
             let name = module.to_string();
+            if !needed.contains(name.as_str()) {
+                continue;
+            }
             let Some(text) = loaded.texts.get(&name) else {
                 bail!("no source text for module `{name}`, and the emitter reads a program's text");
             };
             names.push(Value::bytes(name.as_bytes()));
             srcs.push(Value::bytes(text.as_bytes()));
+            placed.push(at);
         }
         let ctors = Value::list(
             loaded
@@ -588,7 +595,6 @@ impl PlyProducer {
                 .collect(),
         );
         let roots = wanted.iter().map(|n| Value::bytes(n.as_bytes())).collect();
-        let front = loaded.front;
         let (pkgs, mod_pkg) = if front.packages.is_empty() {
             (
                 vec![record(vec![
@@ -615,10 +621,11 @@ impl PlyProducer {
                     })
                     .collect(),
                 Value::list(
-                    front
-                        .mod_pkg
+                    placed
                         .iter()
-                        .map(|i| Value::Int(*i as i64))
+                        .map(|&at| {
+                            Value::Int(front.mod_pkg.get(at).copied().unwrap_or_default() as i64)
+                        })
                         .collect(),
                 ),
             )
@@ -632,6 +639,7 @@ impl PlyProducer {
             Value::list(pkgs),
             mod_pkg,
             embeds_of(front)?,
+            rows_of(front)?,
         ];
         tally(|census| census.wanted.push(wanted.to_vec()));
         let value = self.call(ENTRY, &args)?;
@@ -766,6 +774,43 @@ pub fn embeds_of(front: &Front) -> Result<Value> {
         return Ok(Value::list(Vec::new()));
     }
     ply_eval::codec::decode(&front.embeds).map_err(|e| anyhow!("the answer's embeds: {e}"))
+}
+
+/// The module a root is in: a clause's, test's or law's root is its owner's name then `#`, and a
+/// module is a name less its last segment. The emitter's `module_of_root` reads roots the same way.
+pub fn module_of_root(root: &str) -> &str {
+    let owner = root.split_once('#').map_or(root, |(owner, _)| owner);
+    owner.rsplit_once('.').map_or("", |(module, _)| module)
+}
+
+/// `modules` and every module they import, directly or not, by what the answer says each imports:
+/// all the emitter reads to lower a body of one of them.
+pub fn imported_closure<'a>(
+    front: &Front,
+    modules: impl IntoIterator<Item = &'a str>,
+) -> HashSet<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = modules.into_iter().map(str::to_string).collect();
+    while let Some(module) = stack.pop() {
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        if let Some(info) = front.check.modules.get(&Symbol::new(&module)) {
+            stack.extend(info.imports.iter().map(|m| m.as_str().to_string()));
+        }
+    }
+    seen
+}
+
+/// What every definition and test published, as the emitter takes it; none seeds nothing.
+pub fn rows_of(front: &Front) -> Result<Value> {
+    if front.rows.is_empty() {
+        return Ok(record(vec![
+            ("defs", Value::list(Vec::new())),
+            ("tests", Value::list(Vec::new())),
+        ]));
+    }
+    ply_eval::codec::decode(&front.rows).map_err(|e| anyhow!("the answer's rows: {e}"))
 }
 
 /// The package tables a caller passes to a resolving entry, as values: what [`Front`]

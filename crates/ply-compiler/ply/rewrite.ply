@@ -1,5 +1,5 @@
-// The rewrites over a parsed module: the try operator, run with the grammar, and the record update,
-// which needs the checker's answer for its base and so runs after the check.
+// The rewrites over a parsed module: the try operator and the cost law, run with the grammar, and the
+// record update, which needs the checker's answer for its base and so runs after the check.
 
 import spine (Span, Ident, QName, PDiag, Label, span_to, dummy_span, bare, num, span_key, diag1,
               diag2, pdiag, plabel, dump_diags)
@@ -1408,6 +1408,7 @@ fn try_item(cx0: TryCx, it: Item) -> { cx: TryCx, it: Item } / {abort.raise} = {
           host: d.host,
           binders: d.binders,
           guard: g.e,
+          cost: d.cost,
           body: b.e,
           span: d.span,
         }),
@@ -1507,13 +1508,121 @@ fn any_in(e: Expr, p: (Expr) -> Bool) -> Bool =
       _ -> false,
     })
 
-// Only when the grammar met a `?`. A record update needs the checker's answer for its base, so
-// `expand_record_updates` runs later, over a checked program.
+// --- The cost law ----------------------------------------------------------------------------
+
+// A cost law measures its body: at each size it is run at, it holds the steps the body took beside
+// the bound they are fitted against. `cost` stays on the law, so the checker and the prover know it
+// for one; what it bounds is now in the body, where its binder is in scope. `captured` says what
+// would take the call to the builtin `metered` for its own, and the law is refused rather than
+// measured with it.
+fn measured(d: LawDef, captured: Option<Bytes>) -> { law: LawDef, diag: Option<PDiag> } =
+  match d.cost {
+    None -> { law: d, diag: None },
+    Some(bound) -> {
+      let at = expr_span(d.body);
+      let named = |t: Bytes| { name: t, span: at };
+      let call = EApp({
+        span: at,
+        func: EVar({ span: at, name: { module: None, name: named(b"metered"), span: at } }),
+        named: [],
+        args: [ELambda({ span: at, body: d.body, params: [], ret: None })],
+        labels: [],
+      });
+      let binds = fold(d.binders, false, |found: Bool, b: Binder|
+        found || b.name.name == b"metered");
+      let why = if binds {
+        Some(
+          b"this law names its size `metered`, which would capture the call it measures its body with; rename the size",
+        )
+      } else { captured };
+      let steps = match why {
+        Some(_) -> EBad({ span: at }),
+        None -> EField({ span: at, base: call, field: named(b"steps") }),
+      };
+      {
+        law: {
+          ..d,
+          body: ERecord({
+            span: at,
+            fields: [
+              { name: named(b"bound"), value: bound },
+              { name: named(b"steps"), value: steps },
+            ],
+          }),
+        },
+        diag: match why {
+          None -> None,
+          Some(note) ->
+            Some(
+              diag1(
+                b"E0463",
+                d.name_span,
+                b"this cost law cannot measure its body",
+                b"a cost law measures its body with the builtin `metered`",
+                [note],
+              ),
+            ),
+        },
+      }
+    },
+  }
+
+// A `metered` of the module's own, or one it imports unqualified, would capture the call a cost law
+// measures its body with.
+fn metered_captured(m: Module) -> Option<Bytes> = {
+  let declared = fold(m.items, false, |found: Bool, it: Item|
+    found || (match it { IFn(f) -> f.name.name == b"metered", _ -> false }));
+  let imported = fold(m.imports, false, |found: Bool, d: ImportDecl|
+    found
+      || (match d.kind {
+        INames(ns) -> fold(ns, false, |named: Bool, n: Ident| named || n.name == b"metered"),
+        _ -> false,
+      }));
+  if declared {
+    Some(
+      b"this module declares its own `metered`, which would capture the call a cost law measures its body with; rename it",
+    )
+  } else if imported {
+    Some(
+      b"this module imports `metered` unqualified, which would capture the call a cost law measures its body with; import the module instead and qualify the name",
+    )
+  } else { None }
+}
+
+fn has_cost_law(m: Module) -> Bool =
+  fold(m.items, false, |b: Bool, it: Item|
+    b || (match it { ILaw(d) -> d.cost != None, _ -> false }))
+
+fn measured_laws(m: Module, diags: List<PDiag>) -> { module: Module, diags: List<PDiag> } =
+  if !has_cost_law(m) { { module: m, diags: diags } } else {
+    let captured = metered_captured(m);
+    let walked = fold(
+      m.items,
+      { items: [], diags: diags },
+      |acc: { items: List<Item>, diags: List<PDiag> }, it: Item|
+        match it {
+          ILaw(d) -> {
+            let x = measured(d, captured);
+            {
+              items: push(acc.items, ILaw(x.law)),
+              diags: match x.diag { Some(g) -> push(acc.diags, g), None -> acc.diags },
+            }
+          },
+          other -> { ..acc, items: push(acc.items, other) },
+        },
+    );
+    { module: { ..m, items: walked.items }, diags: walked.diags }
+  }
+
+// Only when the grammar met a `?` or a cost law. A record update needs the checker's answer for its
+// base, so `expand_record_updates` runs later, over a checked program.
 pub fn expand(
   m: Module,
   diags: List<PDiag>,
-) -> { module: Module, diags: List<PDiag> } / {abort.raise} =
-  if has_try(m) { expand_try(m, diags) } else { { module: m, diags: diags } }
+) -> { module: Module, diags: List<PDiag> } / {abort.raise} = {
+  let tried = if has_try(m) { expand_try(m, diags) } else { { module: m, diags: diags } };
+  measured_laws(tried.module, tried.diags)
+}
 
 pub fn dump_expanded(src: Bytes) -> String / {abort.raise} = {
   let r = parse(src);
@@ -1522,6 +1631,23 @@ pub fn dump_expanded(src: Bytes) -> String / {abort.raise} = {
 }
 
 // --- Tests ------------------------------------------------------------------
+
+test "a cost law's body is measured with the builtin `metered`, beside its bound" {
+  let dumped = dump_expanded(b"law \"l\" forall (n: Int) cost n { n }");
+  // `metered` and `steps`, as the dump spells a name.
+  assert(string_contains(dumped, "@6d657465726564"));
+  assert(string_contains(dumped, "@7374657073"));
+  assert(!string_contains(dumped, "E0463"))
+}
+
+test "a `metered` of the module's own, an unqualified import of one, or a size named so is refused" {
+  let refused = |src: Bytes| string_contains(dump_expanded(src), "E0463");
+  assert(refused(b"fn metered(n: Int) -> Int = n\nlaw \"l\" forall (n: Int) cost n { n }"));
+  assert(refused(b"import m (metered)\nlaw \"l\" forall (n: Int) cost n { n }"));
+  assert(refused(b"law \"l\" forall (metered: Int) cost metered { metered }"));
+  // Only a cost law calls it, so an ordinary law may share a module with one.
+  assert(!refused(b"fn metered(n: Int) -> Int = n\nlaw \"l\" forall (n: Int) { metered(n) == n }"))
+}
 
 test "a `?` on a `let` splits the block at that statement, failure arm first" {
   assert_eq(

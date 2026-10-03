@@ -35,19 +35,20 @@ import style (Style, plain, dim, red, green, yellow)
 import proof.obligation (Binding, CacheRefused, Cases, Certificate, Change, Changed, ClaimRow,
                          Counter, Coverage, Def, Defect, Ensures, Evidence, Example, Falsified,
                          Fault, Frame, Fresh, FromProof, FromSample, Gap, GuardNotSampled, Held,
-                         Instantiation, Judged, Kept, Kind, Law, Laws, Moved, Never, NoCaseKept,
-                         NotDrawn, Outcome, Point, Proof, Property, Proved, Pure, Raised,
-                         ReachesHost, Reason, Record, Refuted, Rejected, Sampled, Tier, Unattempted,
-                         Uncached, Unchanged, Undrawn, Ungeneratable, UnhandledEffect,
-                         Unsatisfiable, Vacuity, Vacuous, Writes, Written, cases_summary,
-                         certificate_summary, coverage, evidence_summary, fault_message,
-                         fault_notes, fault_summary, filings, frame_summary, gap_summary, gap_word,
-                         hits, laws_of, reason_word, select, specified, tier_word, vacuity_summary,
-                         verdict_of)
+                         Instantiation, Judged, Kept, Kind, Law, Laws, Measured, Moved, Never,
+                         NoCaseKept, NotDrawn, Outcome, Outgrown, Point, Proof, Property, Proved,
+                         Pure, Raised, ReachesHost, Reason, Record, Refuted, Rejected, Sampled,
+                         Tier, Unattempted, Uncached, Unchanged, Undrawn, Ungeneratable,
+                         UnhandledEffect, Unsatisfiable, Vacuity, Vacuous, Writes, Written,
+                         cases_summary, certificate_summary, coverage, evidence_summary,
+                         fault_message, fault_notes, fault_summary, filings, frame_summary,
+                         gap_summary, gap_word, hits, laws_of, reason_word, select, specified,
+                         tier_word, vacuity_summary, verdict_of)
 import std.value (Value, VBool, VInt, VList, render)
 import std.time (time)
 import proof.rules (Rule, CaseSplit, Congruence, ExhaustiveEnumeration, LinearArithmetic,
                     Propositional, Unfold, rules_json)
+import proof.fit (Fit, Measure, fit_summary, measure_lines, outgrowth)
 
 // What the Rust side collects, discharges, reviews and accepts, in that order. Collecting comes
 // first and once; a run then either accepts a baseline or discharges what it was asked for, and
@@ -479,6 +480,7 @@ pub fn outcome_word(o: Outcome) -> String =
   match o {
     Held(h) -> tier_word(h.tier),
     Refuted(_) -> "refuted",
+    Outgrown(_) -> "outgrown",
     Vacuous(_) -> "vacuous",
     Unattempted(_) -> "unattempted",
     Defect(_) -> "defect",
@@ -502,6 +504,7 @@ pub fn detail_of(r: Row, places: List<Place>) -> String / {abort.raise} =
     Unattempted(gap) -> gap_summary(gap),
     Vacuous(v) -> vacuity_summary(v.why),
     Refuted(_) -> match located(places, r.claim.at) { Some(at) -> at, None -> "" },
+    Outgrown(_) -> match located(places, r.claim.at) { Some(at) -> at, None -> "" },
     Defect(f) -> fault_summary(f),
   }
 
@@ -525,6 +528,9 @@ pub fn at_tier(rows: List<Row>, tier: Tier) -> Int =
 pub fn refuted_of(rows: List<Row>) -> Int =
   count_where(rows, |o: Outcome| match o { Refuted(_) -> true, _ -> false })
 
+pub fn outgrown_of(rows: List<Row>) -> Int =
+  count_where(rows, |o: Outcome| match o { Outgrown(_) -> true, _ -> false })
+
 pub fn vacuous_of(rows: List<Row>) -> Int =
   count_where(rows, |o: Outcome| match o { Vacuous(_) -> true, _ -> false })
 
@@ -536,9 +542,10 @@ pub fn defect_of(rows: List<Row>) -> Int =
 
 pub fn held_of(rows: List<Row>) -> Int = count_where(rows, |o: Outcome| holds(o))
 
-// A refuted or vacuous claim fails the run, as Ply's own failure on one does; a gap does not.
+// A refuted, outgrown or vacuous claim fails the run, as Ply's own failure on one does; a gap does
+// not.
 pub fn failed(rows: List<Row>) -> Bool =
-  refuted_of(rows) > 0 || vacuous_of(rows) > 0 || defect_of(rows) > 0
+  refuted_of(rows) > 0 || outgrown_of(rows) > 0 || vacuous_of(rows) > 0 || defect_of(rows) > 0
 
 // At least one claim the program makes does not hold, or Ply failed discharging one.
 pub fn failure() -> Int = 1
@@ -710,6 +717,8 @@ fn filed_kind(text: Option<Bytes>) -> Option<String> / {abort.raise} =
       Some(match evidence_of(t) {
         Ok(Proof(_)) -> "proof",
         Ok(Sampled(_)) -> "sample",
+        // A fit is a sample of sizes, filed under the plan that measured it.
+        Ok(Measured(_)) -> "sample",
         Err(_) -> "other",
       }),
   }
@@ -940,6 +949,30 @@ fn cases_json(tier: Tier, c: Cases) -> Json / {abort.raise} =
     { key: "summary", value: Str(cases_summary(tier, c)) },
   ])
 
+fn fit_json(f: Fit) -> Json / {abort.raise} =
+  object([
+    {
+      key: "measures",
+      value: Array(
+        map(f.measures, |m: Measure|
+          object([
+            { key: "size", value: num(m.size) },
+            { key: "steps", value: num(m.steps) },
+            { key: "bound", value: num(m.bound) },
+          ])),
+      ),
+    },
+    {
+      key: "spent",
+      value: match f.spent {
+        Some(s) ->
+          object([{ key: "size", value: num(s.size) }, { key: "limit", value: num(s.limit) }]),
+        None -> Null,
+      },
+    },
+    { key: "summary", value: Str(fit_summary(f)) },
+  ])
+
 fn counterexample_json(cx: Counter) -> Json / {abort.raise} =
   object([
     { key: "bindings", value: bindings_json(cx.bindings) },
@@ -956,8 +989,10 @@ fn outcome_members(o: Outcome) -> List<Member> / {abort.raise} =
     Held(h) -> match h.evidence {
       Proof(c) -> [{ key: "certificate", value: certificate_json(c) }],
       Sampled(c) -> [{ key: "cases", value: cases_json(h.tier, c) }],
+      Measured(f) -> [{ key: "fit", value: fit_json(f) }],
     },
     Refuted(cx) -> [{ key: "counterexample", value: counterexample_json(cx) }],
+    Outgrown(f) -> [{ key: "fit", value: fit_json(f) }],
     Vacuous(v) -> [{ key: "vacuity", value: Str(vacuity_summary(v.why)) }],
     Unattempted(gap) ->
       also(
@@ -1096,6 +1131,17 @@ fn refutation(r: Row, cx: Counter) -> Diag / {abort.raise} = {
   )
 }
 
+// The sizes are the evidence, so they are written out: a reader can check the verdict against them.
+fn outgrew(r: Row, f: Fit) -> Diag / {abort.raise} =
+  diag1(
+    b"E0464",
+    r.claim.at.module,
+    span_of(r.claim.at),
+    bytes_of_string(label_of(r.claim) ++ " outgrew its bound: " ++ outgrowth(f)),
+    b"this cost law does not hold",
+    map(measure_lines(f), bytes_of_string),
+  )
+
 fn vacuity(r: Row, guard: At, why: Vacuity) -> Diag / {abort.raise} =
   diag1(
     b"E0420",
@@ -1150,6 +1196,7 @@ pub fn diagnostics_of(rows: List<Row>) -> List<Diag> / {abort.raise} =
     match r.outcome {
       Held(_) -> acc,
       Refuted(cx) -> push(acc, refutation(r, cx)),
+      Outgrown(f) -> push(acc, outgrew(r, f)),
       Vacuous(v) -> push(acc, vacuity(r, v.guard, v.why)),
       Unattempted(gap) -> push(acc, undischarged(r, gap)),
       Defect(f) -> push(acc, defect(r, f)),
@@ -1354,6 +1401,48 @@ test "a refuted claim is E0419 over the claim, and a gap is W0604 over the same 
     w.message,
     b"m.stored ensures #0 was not discharged: performs {db.read[rows]}: no handler",
   )
+}
+
+test "an outgrown cost law is E0464 naming both spans, fails the run, and is discharged" {
+  let fit = {
+    measures: [
+      { size: 1, steps: 1, bound: 1 },
+      { size: 2, steps: 4, bound: 2 },
+      { size: 4, steps: 16, bound: 4 },
+    ],
+    spent: Some({ size: 8, limit: 10 }),
+  };
+  let r: Row = {
+    claim: a_claim("m.slow", Law(Some("pairs are linear"))),
+    outcome: Outgrown(fit),
+    reason: Fresh,
+    reach: None,
+  };
+  let d: Diag = match diagnostics_of([r]) { [x] -> x, _ -> panic("one diagnostic") };
+  assert_eq(d.code, b"E0464");
+  assert_eq(
+    d.message,
+    b"law \"pairs are linear\" outgrew its bound: from 1 to 2 steps grew 4.00\xc3\x97, the bound 2.00\xc3\x97; from 2 to 4 steps grew 4.00\xc3\x97, the bound 2.00\xc3\x97",
+  );
+  assert_eq(d.notes_text, [
+    b"at 1: 1 steps, bound 1",
+    b"at 2: 4 steps, bound 2",
+    b"at 4: 16 steps, bound 4",
+    b"8 took more than 10 steps, so no larger size was run",
+  ]);
+  assert_eq(code_of([r]), failure());
+  assert(
+    string_starts_with(
+      row_head(plain(), r, [a_place()]),
+      "   ✗ outgrown    law \"pairs are linear\"",
+    ),
+  );
+  let row: ClaimRow = match claim_rows(a_collection_of([r.claim]), [0], [r.outcome]) {
+    [x] -> x,
+    _ -> panic("one row"),
+  };
+  assert_eq(row.holds, false);
+  assert_eq(row.discharged, true)
 }
 
 pub fn a_fault() -> Fault =

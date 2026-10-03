@@ -48,6 +48,8 @@ pub enum Strategy {
     Hosted,
     /// The static prover first, then the claim's points.
     Static,
+    /// A cost law, measured at its sizes.
+    Fitting,
 }
 
 /// The obligations a `proof.world.World` owes, in the order the program listed them, which is the
@@ -82,6 +84,7 @@ fn obligation_of(at: At<'_>) -> Result<Obligation, DecodeError> {
             "Interleave" => Strategy::Interleave,
             "Hosted" => Strategy::Hosted,
             "Static" => Strategy::Static,
+            "Fitting" => Strategy::Fitting,
             _ => return Err(strategy.unknown()),
         },
     })
@@ -251,6 +254,15 @@ pub enum Judgement {
     Raised(Diagnostic),
     /// Ply failed rather than the program, so the point says nothing about the claim.
     Faulted(Diagnostic),
+    /// A cost law's size: the steps its body took, and its bound there.
+    Measured {
+        steps: i64,
+        bound: i64,
+    },
+    /// A cost law's size whose run took more than `limit` steps.
+    Spent {
+        limit: i64,
+    },
 }
 
 impl Judgement {
@@ -272,6 +284,8 @@ pub enum Mode {
     Witness,
     /// The guard alone at every point, until it raises.
     Domain,
+    /// A cost law's sizes, each within `limit` steps, until one raises or takes more.
+    Cost { limit: i64 },
 }
 
 impl Mode {
@@ -282,6 +296,10 @@ impl Mode {
                 | (Mode::Whole, Judgement::Failed | Judgement::Raised(_))
                 | (Mode::Witness, Judgement::Held)
                 | (Mode::Domain, Judgement::Raised(_))
+                | (
+                    Mode::Cost { .. },
+                    Judgement::Raised(_) | Judgement::Spent { .. }
+                )
         )
     }
 }
@@ -340,6 +358,7 @@ impl Prover {
         for values in points {
             let judgement = match mode {
                 Mode::Whole => cases.judge(values),
+                Mode::Cost { limit } => cases.measure(values, limit),
                 Mode::Witness | Mode::Domain => match cases.guard(values) {
                     Ok(true) => Judgement::Held,
                     Ok(false) => Judgement::Rejected,
@@ -445,8 +464,17 @@ impl Cases<'_> {
     /// One entry through the claim's machine, within the claim's budget, keeping what it ended
     /// with.
     fn enter(&mut self, root: &Symbol, args: Vec<Value>) -> Result<Value, Diagnostic> {
+        self.enter_within(root, args, self.step_budget)
+    }
+
+    fn enter_within(
+        &mut self,
+        root: &Symbol,
+        args: Vec<Value>,
+        step_budget: i64,
+    ) -> Result<Value, Diagnostic> {
         let (machine, span) = (&mut self.machine, self.span);
-        let (answer, warnings) = ply_codegen::rt::with_step_budget(self.step_budget, || {
+        let (answer, warnings) = ply_codegen::rt::with_step_budget(step_budget, || {
             machine.call(root.as_str(), args, span)
         })
         .into_parts();
@@ -479,6 +507,31 @@ impl Cases<'_> {
                 Ok(true) => Judgement::Held,
                 Ok(false) => Judgement::Failed,
             },
+        }
+    }
+
+    /// A cost law's size: guard first, then its body within `limit` steps, or the claim's budget
+    /// where that is smaller. A body that takes more is spent rather than raised: running out is
+    /// what ends the measuring, not a fault of the program.
+    fn measure(&mut self, values: &[Value], limit: i64) -> Judgement {
+        match self.guard(values) {
+            Err(d) => return Judgement::stopped(d),
+            Ok(false) => return Judgement::Rejected,
+            Ok(true) => {}
+        }
+        let budget = if self.step_budget > 0 {
+            self.step_budget.min(limit)
+        } else {
+            limit
+        };
+        let root = self.body_root.clone();
+        match self.enter_within(&root, values.to_vec(), budget) {
+            Ok(value) => match measure_of(&value) {
+                Some((steps, bound)) => Judgement::Measured { steps, bound },
+                None => Judgement::Faulted(body_was_not_a_measure(&value, self.span)),
+            },
+            Err(d) if d.code == codes::STEP_BUDGET => Judgement::Spent { limit: budget },
+            Err(d) => Judgement::stopped(d),
         }
     }
 
@@ -525,6 +578,28 @@ impl Interleaved {
             warnings: Vec::new(),
         }
     }
+}
+
+/// A cost law's body answers `{bound, steps}`.
+fn measure_of(value: &Value) -> Option<(i64, i64)> {
+    let Value::Record(fields) = value else {
+        return None;
+    };
+    let int = |name: &str| match fields.named(name) {
+        Some(Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    Some((int("steps")?, int("bound")?))
+}
+
+fn body_was_not_a_measure(value: &Value, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("a cost law's body came to `{}` rather than to a measure", ply_eval::slot(0)),
+    )
+    .showing(vec![ply_eval::Plain::shown(value)])
+    .primary(span, "a cost law's body is `{bound: Int, steps: Int}`")
+    .note("the rewrite builds that record and the checker holds it to the type, so reaching this is a defect in Ply")
 }
 
 fn body_was_not_boolean(value: &Value, span: Span) -> Diagnostic {

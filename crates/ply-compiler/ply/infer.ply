@@ -108,6 +108,8 @@ pub type LawInfo = {
   binders: List<LawBinder>,
   has_guard: Bool,
   host: Bool,
+  // A cost law: its body answers the steps it took beside its bound.
+  cost: Bool,
   footprint: List<Atom>,
   at: Loc,
 }
@@ -719,6 +721,17 @@ pub fn builtin_schemes(
   let re = row_open(e);
   let map_ty = t_map(ta, tb);
   let entry_ty = TyRecord(fields_sorted([{ name: b"key", ty: ta }, { name: b"value", ty: tb }]));
+  let performed_ty = TyRecord(
+    fields_sorted([{ name: b"atom", ty: t_string() }, { name: b"count", ty: t_int() }]),
+  );
+  let metered_ty = TyRecord(
+    fields_sorted([
+      { name: b"value", ty: ta },
+      { name: b"steps", ty: t_int() },
+      { name: b"allocations", ty: t_int() },
+      { name: b"performs", ty: t_list(performed_ty) },
+    ]),
+  );
   let ordering = con(b"Ordering");
   let rounding = con(b"Rounding");
   let cell_ty = TyCon({ name: b"Cell", args: [tb, ta] });
@@ -763,6 +776,7 @@ pub fn builtin_schemes(
         re,
       ),
     },
+    { name: b"metered", sc: poly_fn([a], [e], [t_fn([], ta, re)], metered_ty, re) },
     { name: b"range", sc: mono_fn([t_int(), t_int()], t_list(t_int())) },
     // The wrapping family is `forall a. (a, a) -> a`; `infer_app` attaches the integer obligation at each call.
     { name: b"wrap_add", sc: poly_fn([a], [], [ta, ta], ta, row_empty()) },
@@ -982,6 +996,11 @@ pub fn builtin_docs() -> List<BuiltinDoc> =
       b"iterate",
       [b"seed", b"budget", b"step"],
       b"`step` answers `Continue(next)` or `Stop(result)`; the budget bounds the steps",
+    ),
+    bdoc(
+      b"metered",
+      [b"f"],
+      b"`f()` and what it cost: the calls it made, the objects it allocated, and how many times it performed each atom",
     ),
     bdoc(
       b"bracket",
@@ -7276,6 +7295,24 @@ fn debug_quoted(s: Bytes) -> Bytes / {abort.raise} =
     b"\"",
   ])
 
+// What a cost law's body answers at each size: the steps it took, beside its bound there.
+pub fn measure_ty() -> Type / {abort.raise} =
+  TyRecord(fields_sorted([{ name: b"bound", ty: t_int() }, { name: b"steps", ty: t_int() }]))
+
+// A cost law is run at sizes its one `Int` binder takes, so it binds exactly one, and measures what
+// the program does, never what a host does.
+fn sized(cx: Cx, def: LawDef, tys: List<Type>) -> Cx = {
+  let refuse = |why: Bytes|
+    err1(cx, b"E0463", def.name_span, why, b"a cost law ranges over one size", [
+      b"write `forall (n: Int)` and build the input of size `n` in the body: `cost n { sort(shuffled(n)) }`",
+    ]);
+  if def.host { refuse(b"a cost law measures the program, so it is never `law/host`") }
+  else if len(tys) != 1 { refuse(b"a cost law binds exactly one size") }
+  else if !(match list_at(tys, 0) { Some(t) -> t == t_int(), None -> false }) {
+    refuse(b"a cost law's size is an `Int`")
+  } else { cx }
+}
+
 fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx / {abort.raise} = {
   let cx: Cx = {
     ..cx0,
@@ -7316,16 +7353,35 @@ fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx / {abort.raise} = {
     None -> bound,
   };
   let body: Inferred = infer({ ..guarded, performs: [] }, def.body);
-  let c2: Cx = expect(
-    body.cx,
-    expr_span(def.body),
-    t_bool(),
-    body.ty,
-    b"a law states a proposition",
-  ).cx;
+  let c2: Cx = match def.cost {
+    None ->
+      expect(body.cx, expr_span(def.body), t_bool(), body.ty, b"a law states a proposition").cx,
+    Some(bound) ->
+      sized(
+        expect(
+          body.cx,
+          expr_span(bound),
+          measure_ty(),
+          body.ty,
+          b"a cost law's bound is an `Int` over its size",
+        ).cx,
+        def,
+        map(types.ts, |t: Type| resolve(body.cx, t)),
+      ),
+  };
   let row = resolve_r(c2, body.row);
-  let c3: Cx = if def.host { c2 }
-  else { check_spec_purity(c2, SSLawBody, [seed_atom()], expr_span(def.body), row) };
+  let c3: Cx = if def.host { c2 } else if def.cost != None && len(without_abort(row.atoms)) > 0 {
+    err1(
+      c2,
+      b"E0463",
+      expr_span(def.body),
+      b"a cost law's body performs nothing",
+      b"this body performs an effect",
+      [
+        b"a cost law runs its body once at each size and counts the steps it took, so a run that a handler or a schedule could change counts nothing",
+      ],
+    )
+  } else { check_spec_purity(c2, SSLawBody, [seed_atom()], expr_span(def.body), row) };
   let popped: Cx = { ..c3, env: env_pop(c3.env) };
   let binders = map(range(0, len(def.binders)), |i: Int| {
     let b = at(def.binders, i);
@@ -7343,6 +7399,7 @@ fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx / {abort.raise} = {
       binders: binders,
       has_guard: match def.guard { Some(_) -> true, None -> false },
       host: def.host,
+      cost: def.cost != None,
       footprint: row.atoms,
       at: here(popped, def.span),
     }),
@@ -9408,8 +9465,10 @@ fn elaboration_of(cx: Cx) -> Elaboration / {abort.raise} =
 // The caller is the one that reports them, so the caller is the one that gets them.
 pub type CheckedFacts = | Facts(EmitFacts) | Refuses(List<Diag>)
 
-pub fn emit_facts(r: Resolved, mods: List<Mod>) -> CheckedFacts / {abort.raise} = {
-  let out = check_program(r, mods);
+// A definition or test `known` holds a row for is published from it and its facts are not gathered,
+// so the caller seeds only what it will not lower.
+pub fn emit_facts(r: Resolved, mods: List<Mod>, known: Known) -> CheckedFacts / {abort.raise} = {
+  let out = check_program_with(r, mods, known);
   if !out.ok { Refuses(out.cx.diags) } else {
     Facts({
       pure: fold(out.cx.defs, [], |acc: List<Bytes>, d: DefInfo|
@@ -10396,6 +10455,21 @@ test "an operation's type variables are the ones its own list declares" {
     ),
     [],
   )
+}
+
+test "a cost law ranges over one `Int` size, measures the program alone, and bounds it with an `Int`" {
+  assert_eq(
+    check_codes(b"fn f(n: Int) -> Int = n\nlaw \"l\" forall (n: Int) where n > 0 cost n { f(n) }"),
+    [],
+  );
+  assert_eq(check_codes(b"law \"l\" forall (n: Int, m: Int) cost n { n + m }"), [b"E0463"]);
+  assert_eq(check_codes(b"law \"l\" forall (b: Bool) cost 1 { b }"), [b"E0463"]);
+  assert_eq(check_codes(b"law \"l\" cost 1 { 1 }"), [b"E0463"]);
+  assert_eq(check_codes(b"law/host \"l\" forall (n: Int) cost n { n }"), [b"E0463"]);
+  assert_eq(check_codes(b"law \"l\" forall (n: Int) cost n { simulate { n } }"), [b"E0463"]);
+  // A raise is a gap at the size it happens at, as in any law, and not an effect.
+  assert_eq(check_codes(b"law \"l\" forall (n: Int) cost n { 100 / n }"), []);
+  assert_eq(check_codes(b"law \"l\" forall (n: Int) cost true { n }"), [b"E0201"])
 }
 
 test "a law binder naming a type nothing declares is refused, and a lowercase one is a variable" {

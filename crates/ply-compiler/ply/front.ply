@@ -24,7 +24,7 @@ import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index,
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, elaboration,
               elaboration_with, updated_mods, check_front_with, is_prelude_effect, builtin_schemes,
-              builtin_docs, builtin_constraints, find_doc, published_pure)
+              builtin_docs, builtin_constraints, find_doc, published_pure, measure_ty)
 import diag (Parsed, parse_all, parse_at, outside_every_module, placed)
 import pkg (Pkgs, Supplied, Closure, Package, Pinned, closure, empty, pins_of)
 import resolve (Pkg, resolve_packaged, no_pkgs)
@@ -336,9 +336,20 @@ pub fn module_imports(m: Mod) -> List<Bytes> / {abort.raise} =
     if fold(acc, false, |b: Bool, x: Bytes| b || x == name) { acc } else { push(acc, name) }
   })
 
-fn module_row(i: Int, m: Mod, r: Resolved, effects: List<EffectInfo>) -> ModuleRow / {abort.raise} = {
+// `imports` names each module this one imports as the program names it, which a dependency's bare
+// sibling import does not.
+fn module_row(
+  i: Int,
+  m: Mod,
+  r: Resolved,
+  effects: List<EffectInfo>,
+  names: List<Bytes>,
+) -> ModuleRow / {abort.raise} = {
   let items = module_items(m);
-  let imports = module_imports(m);
+  let imports = fold(at(r.imports, i), [], |acc: List<Bytes>, t: Int| {
+    let name = at(names, t);
+    if fold(acc, false, |b: Bool, x: Bytes| b || x == name) { acc } else { push(acc, name) }
+  });
   let sets = effect_sets_of(r, effects, i, m);
   { name: m.name, index: i, items: items, imports: imports, sets: sets }
 }
@@ -389,6 +400,7 @@ fn law_row(l: LawInfo, lits: List<Bytes>) -> LawRow / {abort.raise} =
       { name: b.name, at: span_at(l.at.module, b.span), ty: canonical_type(b.ty) }),
     has_guard: l.has_guard,
     host: l.host,
+    cost: l.cost,
     footprint: canonical_atoms(l.footprint),
     at: loc_at(l.at),
     literals: lits,
@@ -1038,18 +1050,16 @@ fn emit_roots(mods: List<Mod>, c: Front, cr: Carrier) -> List<EmitRoot> / {abort
             let name = qualify(m.name, d.name);
             let law = map_get(laws, name);
             let guarded = match law { Some(l) -> l.has_guard, None -> false };
+            let measured = match law { Some(l) -> l.cost, None -> false };
             let binders = match law { Some(l) -> map(l.binders, |b: LawBinder| b.ty), None -> [] };
             let vars = vars_in(binders);
             let place = match law { Some(l) -> span_at(l.at.module, l.at.span), None -> no_at() };
-            let rows = map(if guarded { [b"guard", b"body"] } else { [b"body"] }, |part: Bytes|
-              emit_proposition(
-                cr,
-                vars,
-                [],
-                qualify(m.name, key_law_root(a.law_ordinal, part)),
-                binders,
-                place,
-              ));
+            let rows = map(if guarded { [b"guard", b"body"] } else { [b"body"] }, |part: Bytes| {
+              let root = qualify(m.name, key_law_root(a.law_ordinal, part));
+              if measured && part == b"body" {
+                emit_root(cr, vars, [], root, binders, measure_ty(), 0, false, place)
+              } else { emit_proposition(cr, vars, [], root, binders, place) }
+            });
             { ..a, specs: append(a.specs, rows), law_ordinal: a.law_ordinal + 1 }
           },
           _ -> a,
@@ -1097,13 +1107,14 @@ fn tables(
   let names = test_name_spans(mods);
   let lits = law_literals(mods);
   let cr = carrier_of(c.ctors);
+  let mod_names = map(mods, |m: Mod| m.name);
   {
     diags: map(warnings, answered_diag),
     order: map(r.order, |i: Int| at(mods, i).name),
     packages: packages,
     pins: pins,
     mod_pkg: mod_pkg,
-    modules: map(range(0, len(mods)), |i: Int| module_row(i, at(mods, i), r, c.effects)),
+    modules: map(range(0, len(mods)), |i: Int| module_row(i, at(mods, i), r, c.effects, mod_names)),
     defs: map(c.defs, |d: DefInfo| def_row(d, written_of(fns, d.name))),
     types: type_rows(mods),
     tests: map(range(0, len(c.tests)), |i: Int| test_row(at(c.tests, i), at(names, i))),
@@ -1119,6 +1130,7 @@ fn tables(
     bodies: h.bodies,
     test_bodies: h.test_bodies,
     embeds: embeds,
+    rows: rows_from(c, h),
   }
 }
 
@@ -1272,17 +1284,19 @@ fn test_known_row(
 pub type Rows = { defs: List<KnownDefRow>, tests: List<KnownTestRow> }
 
 // What an analysis publishes, as the rows the next one is handed, each under the hash it has now.
-pub fn rows_of(w: Whole) -> Rows / {abort.raise} = {
-  let hashed = by_name_one(w.hashes.checks);
-  let decls = by_name_one(w.hashes.decls);
+pub fn rows_of(w: Whole) -> Rows / {abort.raise} = rows_from(w.checked, w.hashes)
+
+fn rows_from(c: Front, h: HashOutput) -> Rows / {abort.raise} = {
+  let hashed = by_name_one(h.checks);
+  let decls = by_name_one(h.decls);
   {
-    defs: fold(w.checked.defs, [], |acc: List<KnownDefRow>, d: DefInfo|
+    defs: fold(c.defs, [], |acc: List<KnownDefRow>, d: DefInfo|
       match map_get(hashed, d.name) {
-        Some(h) -> push(acc, def_known_row(decls, d, h)),
+        Some(x) -> push(acc, def_known_row(decls, d, x)),
         None -> acc,
       }),
-    tests: map(range(0, len(w.checked.tests)), |i: Int|
-      test_known_row(decls, at(w.checked.tests, i), at(w.hashes.tests, i))),
+    tests: map(range(0, len(c.tests)), |i: Int|
+      test_known_row(decls, at(c.tests, i), at(h.tests, i))),
   }
 }
 
@@ -1802,6 +1816,7 @@ pub fn dump_of(a: Analysis) -> Dump / {abort.raise} =
         bodies: [],
         test_bodies: [],
         embeds: [],
+        rows: { defs: [], tests: [] },
       },
     Analysed(w) ->
       tables(
@@ -2472,6 +2487,7 @@ pub type LawRow = {
   binders: List<BinderRow>,
   has_guard: Bool,
   host: Bool,
+  cost: Bool,
   footprint: List<Atom>,
   at: At,
   literals: List<Bytes>,
@@ -2562,6 +2578,9 @@ pub type Dump = {
   bodies: List<BodyRow>,
   test_bodies: List<Bytes>,
   embeds: List<EmbedAt>,
+  // What every definition and test published, which spares the emitter a walk of the bodies it
+  // does not lower.
+  rows: Rows,
 }
 
 pub fn has_error(ds: List<Diag>) -> Bool =
@@ -2973,6 +2992,7 @@ test "a law's row holds its binders with their spans and types, and its hashes c
       binders: [{ name: b"x", at: { module: 0, start: 203, end: 209 }, ty: con_named(b"Int") }],
       has_guard: true,
       host: false,
+      cost: false,
       footprint: [],
       at: { module: 0, start: 179, end: 237 },
       literals: [b"int 0"],

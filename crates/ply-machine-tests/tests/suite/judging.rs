@@ -38,6 +38,10 @@ fn capped(n: Int) -> Int
   ensures result <= 1000
   ensures result == n
 = if n > 10 { 10 } else { n }
+
+fn summed(n: Int) -> Int = fold(range(0, n), 0, |a: Int, x: Int| a + x)
+
+law "summing is linear" forall (n: Int) where n > 1 cost n { summed(n) }
 "#;
 
 fn claim(owner: &str, kind: ObligationKind, guards: usize) -> Obligation {
@@ -101,8 +105,54 @@ fn shown(judgements: &[Judgement]) -> Vec<String> {
             Judgement::Rejected => "rejected".to_string(),
             Judgement::Raised(d) => format!("raised {}", d.code),
             Judgement::Faulted(d) => format!("faulted {}", d.code),
+            Judgement::Measured { bound, .. } => format!("measured at {bound}"),
+            Judgement::Spent { limit } => format!("spent past {limit}"),
         })
         .collect()
+}
+
+/// The steps each measured size took, in order.
+fn steps(judgements: &[Judgement]) -> Vec<i64> {
+    judgements
+        .iter()
+        .filter_map(|j| match j {
+            Judgement::Measured { steps, .. } => Some(*steps),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `summed` folds once per element, so a size takes at least that many steps, and the one that
+/// would take more than the limit ends the batch rather than raising.
+#[test]
+fn a_cost_laws_sizes_are_measured_in_order_until_one_takes_more_than_it_may() {
+    let law = Obligation {
+        strategy: Strategy::Fitting,
+        ..over_an_int("m.summing is linear", 1)
+    };
+    let sizes = ints(&[1, 2, 4, 8, 1024, 4096, 8192]);
+    let judgements = judged(&law, &sizes, Mode::Cost { limit: 3000 });
+    assert_eq!(
+        shown(&judgements),
+        [
+            "rejected",
+            "measured at 2",
+            "measured at 4",
+            "measured at 8",
+            "measured at 1024",
+            "spent past 3000"
+        ]
+    );
+    let counted = steps(&judgements);
+    assert!(
+        counted.windows(2).all(|w| w[0] < w[1]) && counted[3] >= 1024,
+        "the steps grow with the size: {counted:?}"
+    );
+    // A count is a function of the program and the size alone.
+    assert_eq!(
+        steps(&judged(&law, &sizes, Mode::Cost { limit: 3000 })),
+        counted
+    );
 }
 
 #[test]

@@ -1,6 +1,7 @@
 mod answers;
 mod cache;
 mod dump;
+mod producer;
 mod sweep;
 mod toolchain;
 mod upgrade;
@@ -28,10 +29,10 @@ fn every_declared_helper_has_an_address() {
 fn an_entry_entered_with_too_few_arguments_is_refused_rather_than_read_past() {
     ply_codegen::c::producer::ensure_default();
     let err = ply_codegen::c::producer::call("emit.emit_roots_answer", &[])
-        .expect_err("`emit.emit_roots_answer` takes eight arguments");
+        .expect_err("`emit.emit_roots_answer` takes nine arguments");
     let text = err.to_string();
     assert!(
-        text.contains("`emit.emit_roots_answer` takes 8 arguments and was entered with 0"),
+        text.contains("`emit.emit_roots_answer` takes 9 arguments and was entered with 0"),
         "the refusal names the entry and both counts: {text}"
     );
 }
