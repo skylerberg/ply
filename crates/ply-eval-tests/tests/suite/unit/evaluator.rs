@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const PROGRAM: &str = "fn main() -> Int = 3\n\ntest \"main answers\" { assert_eq(main(), 3) }\n";
 
-/// A tier whose every entry leaves a span open in its body, which it says as the body ends.
+/// A backend whose every entry leaves a span open in its body, which it says as the body ends.
 struct Leaves {
     program: DefHash,
     answer: Box<dyn Fn() -> Entered>,
@@ -97,12 +97,12 @@ fn machine_over(
     front: &Analysis,
     answer: impl Fn() -> Entered + 'static,
 ) -> (Machine<'_>, Arc<AtomicU32>) {
-    let tier = Rc::new(Leaves {
+    let backend = Rc::new(Leaves {
         program: front.hashes_digest,
         answer: Box::new(answer),
         left: RefCell::new(Vec::new()),
     });
-    let mut machine = Machine::new(front, tier).expect("the tier describes the program");
+    let mut machine = Machine::new(front, backend).expect("the backend describes the program");
     let ended = Arc::new(AtomicU32::new(0));
     let counted = Arc::clone(&ended);
     machine.set_host_runtime(Arc::new(move || {
@@ -157,7 +157,8 @@ fn a_raise_hands_back_its_warnings_beside_the_diagnostic() {
 #[test]
 fn an_entry_refused_before_it_ran_ended_nothing_and_warns_of_nothing() {
     let front = port_front(&[("m", PROGRAM)]);
-    let (mut machine, ended) = machine_over(&front, || panic!("a refused entry reached the tier"));
+    let (mut machine, ended) =
+        machine_over(&front, || panic!("a refused entry reached the backend"));
     let (answer, warnings) = machine.eval_test(7).into_parts();
     assert_eq!(
         answer.expect_err("there is no eighth test").code,
