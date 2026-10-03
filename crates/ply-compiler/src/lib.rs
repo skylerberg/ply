@@ -106,8 +106,8 @@ pub mod bootstrap {
     pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bootstrap");
 
     /// The builder's runnable as `ply bootstrap` last wrote it, empty when none is committed.
-    pub const BUILDER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/builder.run"));
+    pub const BUILDER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build.run"));
 
     /// The digest of the shelf and runtime the committed builder was built for, empty with it.
-    pub const BUILDER_DIGEST: &str = include_str!(concat!(env!("OUT_DIR"), "/builder.digest"));
+    pub const BUILDER_DIGEST: &str = include_str!(concat!(env!("OUT_DIR"), "/build.digest"));
 }
