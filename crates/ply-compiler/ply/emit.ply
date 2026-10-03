@@ -19,7 +19,8 @@ import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, E
               MatchArm, RecField, Stmt, SLet, SLetElse, SExpr)
 import types (MWrite, TypeExpr, TVar, TCon, TRecord)
 import rewrite (expand)
-import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
+import embed (EmbedAt, embed_tables, rewritten)
+import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 
 // `KBoxed` is a tagged word; `KInt` is the untagged 64 bits inside one.
 pub type Kind =
@@ -3853,6 +3854,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       LUnit -> Some(from_table(em, l)),
       LFloat(_) -> Some(from_table(em, l)),
       LDec(_) -> Some(from_table(em, l)),
+      LChar(_) -> Some(from_table(em, l)),
       _ -> Some(refused(em, b"a literal this port does not pool")),
     },
     NVar(v) -> match v.slot {
@@ -7074,6 +7076,7 @@ pub type Const =
   | ConstWide({ width: Int, high: Int, low: Int })
   | ConstFloat(Bytes)
   | ConstDecimal(Bytes)
+  | ConstChar(Int)
   | ConstUnit
 
 // What the emitted C calls one definition, and the entry the loader binds it by.
@@ -7122,6 +7125,7 @@ fn const_of_lit(l: Lit) -> Const =
     },
     LFloat(x) -> ConstFloat(unspaced(x)),
     LDec(x) -> ConstDecimal(unspaced(x)),
+    LChar(v) -> ConstChar(v),
     _ -> ConstUnit,
   }
 
@@ -7440,7 +7444,7 @@ test "the emitter answers each root it was asked for, a body's tables as values"
   let src = b"fn greet() -> Bytes = b\"hi\"\nfn twice(x: Int) -> Int = x + x\nfn guarded() -> Option<Int> = handle { Some(clock.now()) } with { clock.now() -> 7, }\n";
   let wanted = [b"m.greet", b"m.twice", b"m.guarded"];
   // No constructor is in the table, so the body that builds one is refused.
-  let answers = emit_roots_answer([b"m"], [src], [], [], wanted, [], []);
+  let answers = emit_roots_answer([b"m"], [src], [], [], wanted, [], [], []);
   assert_eq(map(answers, |a: RootAnswer| a.name), wanted);
   match at(answers, 0).answer {
     Body(b) -> {
@@ -7539,6 +7543,24 @@ fn defs_in(module: Bytes, m: Module, pure: List<Bytes>, program: List<ModDefs>) 
     })
 }
 
+test "the emitter writes an embed out as the front end's answer says it was read" {
+  let src = b"fn data() -> Bytes = embed(\"d.txt\")\n";
+  let read = [{ module: b"m", key: b"file:d.txt", read: Ok([{ name: b"", bytes: b"one" }]) }];
+  match at(emit_roots_answer([b"m"], [src], [], [], [b"m.data"], [], [], read), 0).answer {
+    Body(b) -> assert_eq(b.tables.consts, [ConstBytes(b"one")]),
+    Refused(r) -> panic(string_of_bytes_lossy(r.why)),
+  };
+  // The front end refuses a program whose embed was not read, so here the call names nothing.
+  match at(emit_roots_answer([b"m"], [src], [], [], [b"m.data"], [], [], []), 0).answer {
+    Body(_) -> panic("an embed the answer carries nothing for has no body"),
+    Refused(r) ->
+      assert(
+        bytes_index_of(r.why, b"unknown name `embed`") != None,
+        Some(string_of_bytes_lossy(r.why)),
+      ),
+  }
+}
+
 fn emit_all_program(
   sources: List<Source>,
   ctors: List<Bytes>,
@@ -7592,19 +7614,24 @@ fn emit_program(
   wanted: Option<Map<Bytes, Bool>>,
   pkgs: List<Pkg>,
   mod_pkg: List<Int>,
+  embeds: List<EmbedAt> = [],
 ) -> List<Emitted> = {
+  let tables = embed_tables(embeds);
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = match list_at(sources, i) { Some(x) -> x, None -> { name: b"", src: b"" } };
     let r = parse(s.src);
     let x = expand(r.node, r.p.diags);
     let d = expand_derives(i, s.name, x.module);
+    let e = rewritten(tables, s.name, d.module);
     {
       name: s.name,
-      module: d.module,
+      module: e.module,
       derived: d.derived,
-      bad: len(r.p.diags) > 0 || len(d.diags) > 0,
+      bad: len(r.p.diags) > 0 || len(d.diags) > 0 || len(e.diags) > 0,
       // A module that does not parse is not also reported against what its recovery expanded to.
-      why: if len(r.p.diags) > 0 { said_p(r.p.diags) } else { said(d.diags) },
+      why: if len(r.p.diags) > 0 { said_p(r.p.diags) }
+      else if len(d.diags) > 0 { said(d.diags) }
+      else { said_p(e.diags) },
     }
   });
   match fold(
@@ -8444,7 +8471,8 @@ pub type Answer =
 pub type RootAnswer = { name: Bytes, answer: Answer }
 
 // The roots `wanted` names, resolved against the whole program: one entry per root emitted or
-// refused, in its order, so the driver can drop what was refused.
+// refused, in its order, so the driver can drop what was refused. `embeds` is what the front end's
+// answer says it embedded.
 pub fn emit_roots_answer(
   names: List<Bytes>,
   srcs: List<Bytes>,
@@ -8453,6 +8481,7 @@ pub fn emit_roots_answer(
   wanted: List<Bytes>,
   pkgs: List<Pkg>,
   mod_pkg: List<Int>,
+  embeds: List<EmbedAt>,
 ) -> List<RootAnswer> =
   map(
     emit_program(
@@ -8463,6 +8492,7 @@ pub fn emit_roots_answer(
       Some(fold(wanted, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true))),
       pkgs,
       mod_pkg,
+      embeds,
     ),
     answer_of,
   )

@@ -21,6 +21,7 @@ const LIST: u8 = 9;
 const MAP: u8 = 10;
 const RECORD: u8 = 11;
 const CTOR: u8 = 12;
+const CHAR: u8 = 13;
 
 pub fn encode(v: &Value) -> Result<Vec<u8>, String> {
     let mut e = Encoder {
@@ -79,6 +80,10 @@ impl<'v> Encoder<'v> {
                 if f.ty.bits() == 128 {
                     self.varint((f.bits() >> 64) as u64);
                 }
+            }
+            &Value::Char(c) => {
+                self.out.push(CHAR);
+                self.varint(u64::from(u32::from(c)));
             }
             Value::Str(s) => {
                 self.out.push(STR);
@@ -183,6 +188,12 @@ impl Decoder<'_> {
                 };
                 Value::Fixed(Fixed::new(ty, high | low))
             }
+            CHAR => Value::Char(
+                u32::try_from(self.varint()?)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or("a character that is not a Unicode scalar value")?,
+            ),
             STR => {
                 let b = self.blob()?;
                 Value::str(std::str::from_utf8(b).map_err(|_| "a string that is not UTF-8")?)

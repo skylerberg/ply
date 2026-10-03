@@ -455,8 +455,8 @@ pub struct PlyProducer {
     failed: RefCell<HashMap<usize, String>>,
 }
 
-/// Entered as `(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg)`: every module at once, so
-/// they resolve together, emitting the roots `wanted` names.
+/// Entered as `(names, srcs, ctors, builtins, wanted, pkgs, mod_pkg, embeds)`: every module at
+/// once, so they resolve together, emitting the roots `wanted` names.
 const ENTRY: &str = "emit.emit_roots_answer";
 
 impl PlyProducer {
@@ -619,6 +619,7 @@ impl PlyProducer {
             Value::list(roots),
             Value::list(pkgs),
             mod_pkg,
+            embeds_of(front)?,
         ];
         tally(|census| census.wanted.push(wanted.to_vec()));
         let value = self.call(ENTRY, &args)?;
@@ -642,13 +643,16 @@ impl PlyProducer {
             .native
             .arity(name)
             .ok_or_else(|| anyhow!("`{name}` was compiled without an arity"))?;
-        if arity != args.len() {
+        if arity > args.len() {
             bail!(
                 "`{name}` takes {arity} argument{} and was entered with {}",
                 if arity == 1 { "" } else { "s" },
                 args.len()
             );
         }
+        // An entry gains arguments only at its end, and the committed emitter emitting a stage may
+        // predate the last: the compiler's own sources need none of them.
+        let args = &args[..arity];
         let mut ctx = self.native.context();
         ctx.begin(i64::MAX / 2);
         let layouts: *const crate::heap::Layouts = &self.native.tables().layouts;
@@ -739,6 +743,14 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
 /// [`super::dump::read`], its failure the front end's.
 fn read_front(dump: &Value, ids: &[SourceId]) -> Result<Front> {
     super::dump::read(dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))
+}
+
+/// What the front end embedded, as the compiler's passes take it back.
+pub fn embeds_of(front: &Front) -> Result<Value> {
+    if front.embeds.is_empty() {
+        return Ok(Value::list(Vec::new()));
+    }
+    ply_eval::codec::decode(&front.embeds).map_err(|e| anyhow!("the answer's embeds: {e}"))
 }
 
 /// The package tables a caller passes to a resolving entry, as values: what [`Front`]
@@ -953,7 +965,7 @@ pub fn front_pulling_std(
     user: &[(String, String)],
     shipped: &[(String, String)],
 ) -> Result<Pulled> {
-    front_pulling_std_with(user, shipped, &Packages::anonymous(String::new()))
+    front_pulling_std_with(user, shipped, &Packages::anonymous(String::new()), &[])
 }
 
 /// A dependency package the walk read: its root, its manifest text when the root holds one,
@@ -1018,6 +1030,75 @@ impl Packages {
     }
 }
 
+/// One embed a load read, as `front.Embedded` takes it: the module by its package's root and its
+/// own name there, what it asked for, and the files read (`embed`'s one file unnamed) or why none
+/// were.
+pub struct ReadEmbed {
+    pub root: String,
+    pub module: String,
+    pub path: String,
+    pub dir: bool,
+    pub read: std::result::Result<Vec<(String, Vec<u8>)>, String>,
+}
+
+impl ReadEmbed {
+    fn value(&self) -> Value {
+        record(vec![
+            ("root", Value::bytes(self.root.as_bytes())),
+            ("module", Value::bytes(self.module.as_bytes())),
+            (
+                "want",
+                record(vec![
+                    ("path", Value::bytes(self.path.as_bytes())),
+                    ("dir", Value::Bool(self.dir)),
+                ]),
+            ),
+            (
+                "read",
+                match &self.read {
+                    Ok(files) => Value::ctor(
+                        "Ok",
+                        vec![Value::list(
+                            files
+                                .iter()
+                                .map(|(name, bytes)| {
+                                    record(vec![
+                                        ("name", Value::bytes(name.as_bytes())),
+                                        ("bytes", Value::bytes(bytes)),
+                                    ])
+                                })
+                                .collect(),
+                        )],
+                    ),
+                    Err(why) => Value::ctor("Err", vec![Value::bytes(why.as_bytes())]),
+                },
+            ),
+        ])
+    }
+}
+
+const WANTED: &str = "front.embeds_wanted";
+
+/// What the modules of the package at `root` ask to embed, as `(module, path, dir)`.
+pub fn embeds_wanted(
+    root: &str,
+    modules: &[(String, String)],
+) -> Result<Vec<(String, String, bool)>> {
+    let answer = call(
+        WANTED,
+        &[Value::bytes(root.as_bytes()), source_list(modules)],
+    )?;
+    let what = format!("`{WANTED}`'s answer");
+    Ok(At::new(&what, &answer).items(|e| {
+        let want = e.field("want")?;
+        Ok((
+            e.field("module")?.utf8()?.to_string(),
+            want.field("path")?.utf8()?.to_string(),
+            want.field("dir")?.bool()?,
+        ))
+    })?)
+}
+
 /// The front end over `user` plus each module of `shipped` it imports, transitively, placed as
 /// the CLI driver places them: a round of newly imported modules at a time, each in byte order.
 /// Nothing is handed in: the rows a previous answer published are the CLI's to seed it with.
@@ -1025,6 +1106,7 @@ pub fn front_pulling_std_with(
     user: &[(String, String)],
     shipped: &[(String, String)],
     packages: &Packages,
+    embeds: &[ReadEmbed],
 ) -> Result<Pulled> {
     let answer = call(
         ANSWER,
@@ -1034,6 +1116,7 @@ pub fn front_pulling_std_with(
             Value::list(Vec::new()),
             Value::list(Vec::new()),
             packages.value(),
+            Value::list(embeds.iter().map(ReadEmbed::value).collect()),
         ],
     )?;
     let what = format!("`{ANSWER}`'s answer");
@@ -1174,6 +1257,15 @@ fn read_const(c: At<'_>) -> Result<Value, decode::Error> {
                 *ty,
                 fixed.field("bits")?.int()? as u128,
             ))
+        }
+        "ConstChar" => {
+            let point = c.arg(0)?;
+            Value::Char(
+                u32::try_from(point.int()?)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or_else(|| point.error("a character that is not a Unicode scalar value"))?,
+            )
         }
         // A 128-bit literal, as the two words an `Int` each holds.
         "ConstWide" => {
