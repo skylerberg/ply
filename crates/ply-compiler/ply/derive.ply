@@ -1,9 +1,9 @@
 // `derive D for T` becomes an ordinary definition: generated as source, parsed back, and retargeted.
 
-import spine (Span, Ident, QName, span_to, num)
+import parsing (Span, Ident, QName, span_to, int_to_bytes)
 import lexer (byte_of)
-import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-              MWrite, MBad, ty_span)
+import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
+                    MWrite, MBad, ty_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
@@ -14,29 +14,35 @@ import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TD
               DInteger, deriver_text, deriver_tag, ImportDecl, ImportKind, IModule, IAlias, INames,
               Vis, VPub, VPriv, Derived, Constraint, SpecClause, parse, constraint_written)
 import rewrite (expand)
-import resolve (Diag, Source, diag1, diag2, is_bare, dump_diags)
+import resolve (Diag, Source, error_at, error_at_and, is_bare, dump_diags)
 
 // --- Rules ---------------------------------------------------------------------------------------
 
-pub type Why = | WFunction | WHandle | WFloat | WUnconstrained(Int) | WNullInsideOption | WSecret
-pub type ConShape = | Leaf | Structural | Refused(Why) | Nominal
+pub type DeriveRefusal =
+  | HoldsFunction
+  | HoldsHandle
+  | HoldsFloat
+  | Unconstrained(Int)
+  | NullInsideOption
+  | HoldsSecret
+pub type ConstructorShape = | Leaf | Structural | Refused(DeriveRefusal) | Nominal
 
 // The one table the deriver and the checker's `derivable` both read, so the two cannot disagree.
-pub fn con_shape(d: Deriver, name: Bytes) -> ConShape =
+pub fn constructor_shape(deriver: Deriver, name: Bytes) -> ConstructorShape =
   if name == b"Int" || name == b"Bool" || name == b"String" || name == b"Bytes" || name == b"Unit"
       || name == b"Decimal"
       || name == b"Char" { Leaf } else if name == b"Float" {
-    match d { DOrd -> Refused(WFloat), DHash -> Refused(WFloat), _ -> Leaf }
+    match deriver { DOrd -> Refused(HoldsFloat), DHash -> Refused(HoldsFloat), _ -> Leaf }
   } else if name == b"List" || name == b"Array" || name == b"Option" || name == b"Map"
       || name == b"Result"
       || name == b"Ordering"
       || name == b"Rounding"
       || name == b"Instant"
       || name == b"Duration" { Structural }
-  else if same_deriver(d, DBin) && is_fixed_width(name) { Leaf }
-  else if same_deriver(d, DBin) && name == b"Iter" { Structural }
-  else if name == b"Cell" || name == b"Task" || name == b"Chan" { Refused(WHandle) }
-  else if name == b"Secret" { match d { DEq -> Leaf, _ -> Refused(WSecret) } }
+  else if same_deriver(deriver, DBin) && is_fixed_width(name) { Leaf }
+  else if same_deriver(deriver, DBin) && name == b"Iter" { Structural }
+  else if name == b"Cell" || name == b"Task" || name == b"Chan" { Refused(HoldsHandle) }
+  else if name == b"Secret" { match deriver { DEq -> Leaf, _ -> Refused(HoldsSecret) } }
   else { Nominal }
 
 // Whether a type constructor's JSON encoding can be the document `null`.
@@ -53,43 +59,43 @@ fn is_fixed_width(name: Bytes) -> Bool =
 pub fn same_deriver(a: Deriver, b: Deriver) -> Bool = deriver_tag(a) == deriver_tag(b)
 
 // The module whose definitions a generated body calls, if any.
-fn runtime_module(d: Deriver) -> Option<Bytes> =
-  match d {
+fn runtime_module(deriver: Deriver) -> Option<Bytes> =
+  match deriver {
     DJson -> Some(b"std.json"),
     DBin -> Some(b"std.bin"),
     DShow -> Some(b"std.show"),
     _ -> None,
   }
 
-fn runtime_path(d: Deriver) -> List<Bytes> =
-  match d {
+fn runtime_path(deriver: Deriver) -> List<Bytes> =
+  match deriver {
     DJson -> [b"std", b"json"],
     DBin -> [b"std", b"bin"],
     DShow -> [b"std", b"show"],
     _ -> [],
   }
 
-fn is_upper_b(c: Int) -> Bool = c >= 65 && c <= 90
-fn is_lower_b(c: Int) -> Bool = c >= 97 && c <= 122
-fn is_digit_b(c: Int) -> Bool = c >= 48 && c <= 57
-fn lower_byte(c: Int) -> Int = if is_upper_b(c) { c + 32 } else { c }
+fn is_upper_byte(c: Int) -> Bool = c >= 65 && c <= 90
+fn is_lower_byte(c: Int) -> Bool = c >= 97 && c <= 122
+fn is_digit_byte(c: Int) -> Bool = c >= 48 && c <= 57
+fn lower_byte(c: Int) -> Int = if is_upper_byte(c) { c + 32 } else { c }
 
 // `_` before an uppercase after a lowercase or digit, and before the last of an uppercase run a lowercase follows.
 pub fn snake_case(name: Bytes) -> Bytes / {abort.raise} = {
   let n = bytes_len(name);
   fold(range(0, n), b"", |out: Bytes, i: Int| {
     let c = bytes_at(name, i);
-    let sep = if i > 0 && is_upper_b(c) {
+    let sep = if i > 0 && is_upper_byte(c) {
       let prev = bytes_at(name, i - 1);
-      let next_lower = i + 1 < n && is_lower_b(bytes_at(name, i + 1));
-      is_lower_b(prev) || is_digit_b(prev) || (is_upper_b(prev) && next_lower)
+      let next_lower = i + 1 < n && is_lower_byte(bytes_at(name, i + 1));
+      is_lower_byte(prev) || is_digit_byte(prev) || (is_upper_byte(prev) && next_lower)
     } else { false };
     bytes_concat_all([out, if sep { b"_" } else { b"" }, byte_of(lower_byte(c))])
   })
 }
 
-pub fn generated_name(d: Deriver, type_name: Bytes) -> Bytes / {abort.raise} =
-  bytes_concat_all([snake_case(type_name), b"_", deriver_text(d)])
+pub fn generated_name(deriver: Deriver, type_name: Bytes) -> Bytes =
+  bytes_concat_all([snake_case(type_name), b"_", deriver_text(deriver)])
 
 fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
   match list_at(xs, i) { Some(x) -> x, None -> panic("an index the deriver does not hold") }
@@ -107,23 +113,28 @@ fn has(xs: List<Bytes>, x: Bytes) -> Bool = fold(xs, false, |found: Bool, y: Byt
 // `reason` completes the label at `span`; `note` is the advice only a `Secret` refusal carries.
 type Blocker = { span: Span, reason: Bytes, note: Option<Bytes>, variant: Option<Bytes> }
 
-fn check_decl(d: Deriver, def: TypeDef) -> Option<Blocker> / {abort.raise} =
+fn check_decl(deriver: Deriver, def: TypeDef) -> Option<Blocker> =
   match def.body {
-    TDAlias(body) -> check_te(d, body),
+    TDAlias(body) -> check_type_expr(deriver, body),
     TDSum(variants) ->
-      fold(variants, None, |acc: Option<Blocker>, v: VariantDef|
+      fold(variants, None, |acc: Option<Blocker>, variant: VariantDef|
         match acc {
           Some(_) -> acc,
-          None -> match first_blocked_te(d, v.fields) {
+          None -> match first_blocked_type_expr(deriver, variant.fields) {
             Some(b) ->
-              Some({ span: b.span, reason: b.reason, note: b.note, variant: Some(v.name.name) }),
+              Some({
+                span: b.span,
+                reason: b.reason,
+                note: b.note,
+                variant: Some(variant.name.name),
+              }),
             None -> None,
           },
         }),
   }
 
-fn function_refusal(d: Deriver) -> Bytes =
-  match d {
+fn function_refusal(deriver: Deriver) -> Bytes =
+  match deriver {
     DJson -> b"a function has no JSON encoding",
     DEq -> b"functions cannot be compared for equality",
     DOrd -> b"functions cannot be ordered",
@@ -134,23 +145,23 @@ fn function_refusal(d: Deriver) -> Bytes =
     DInteger -> b"a function is not an integer",
   }
 
-pub fn refusal_reason(w: Why, d: Deriver, simple: Bytes) -> Bytes =
+pub fn refusal_reason(w: DeriveRefusal, deriver: Deriver, simple: Bytes) -> Bytes =
   match w {
-    WFloat -> float_reason(d),
-    WHandle -> bytes_concat_all([b"a `", simple, b"` names a location rather than a value"]),
-    WSecret -> secret_reason(d),
+    HoldsFloat -> float_reason(deriver),
+    HoldsHandle -> bytes_concat_all([b"a `", simple, b"` names a location rather than a value"]),
+    HoldsSecret -> secret_reason(deriver),
     _ -> b"",
   }
 
-pub fn float_reason(d: Deriver) -> Bytes =
-  match d {
+pub fn float_reason(deriver: Deriver) -> Bytes =
+  match deriver {
     DHash ->
       b"`Float` has no hash that agrees with `==`: `NaN != NaN`, and `0.0 == -0.0` in different bits",
     _ -> b"`Float` is not ordered: `NaN != NaN`",
   }
 
-pub fn secret_reason(d: Deriver) -> Bytes =
-  match d {
+pub fn secret_reason(deriver: Deriver) -> Bytes =
+  match deriver {
     DJson -> b"a derived codec would write the credential into the document",
     DOrd -> b"a credential has no order",
     DEq -> b"a credential has no structural equality to derive",
@@ -161,9 +172,9 @@ pub fn secret_reason(d: Deriver) -> Bytes =
     DInteger -> b"a credential is not an integer",
   }
 
-pub fn refusal_note(w: Why, d: Deriver) -> Option<Bytes> =
+pub fn refusal_note(w: DeriveRefusal, deriver: Deriver) -> Option<Bytes> =
   match w {
-    WSecret -> match d {
+    HoldsSecret -> match deriver {
       DOrd ->
         Some(
           b"an ordering over a credential leaks a bit of position per comparison and recovers the value in calls proportional to its length; `derive eq` is available, and `secret_verify` is the check a program actually wants",
@@ -194,25 +205,25 @@ pub fn null_in_option(inner: Bytes) -> Bytes =
     b"` encodes as `null`, which is how an `Option` writes `None`, so `Some` and `None` are the same document",
   ])
 
-fn first_blocked_te(d: Deriver, ts: List<TypeExpr>) -> Option<Blocker> / {abort.raise} =
-  fold(ts, None, |acc: Option<Blocker>, t: TypeExpr|
-    match acc { Some(_) -> acc, None -> check_te(d, t) })
+fn first_blocked_type_expr(deriver: Deriver, tys: List<TypeExpr>) -> Option<Blocker> =
+  fold(tys, None, |acc: Option<Blocker>, ty: TypeExpr|
+    match acc { Some(_) -> acc, None -> check_type_expr(deriver, ty) })
 
-fn null_encoded_te(te: TypeExpr) -> Bool =
-  match te { TUnit(_) -> true, TCon(c) -> null_encoded_name(c.name.name.name), _ -> false }
+fn null_encoded_type_expr(ty: TypeExpr) -> Bool =
+  match ty { TUnit(_) -> true, TCon(c) -> null_encoded_name(c.name.name.name), _ -> false }
 
 // A type parameter is derivable by assumption; a record field is blamed as a whole.
-fn check_te(d: Deriver, te: TypeExpr) -> Option<Blocker> / {abort.raise} =
-  match te {
+fn check_type_expr(deriver: Deriver, ty: TypeExpr) -> Option<Blocker> =
+  match ty {
     TVar(_) -> None,
     TUnit(_) -> None,
     TBad(_) -> None,
-    TFn(f) -> Some({ span: f.span, reason: function_refusal(d), note: None, variant: None }),
+    TFn(f) -> Some({ span: f.span, reason: function_refusal(deriver), note: None, variant: None }),
     TRecord(r) ->
       fold(r.fields, None, |acc: Option<Blocker>, f: { name: Ident, ty: TypeExpr }|
         match acc {
           Some(_) -> acc,
-          None -> match check_te(d, f.ty) {
+          None -> match check_type_expr(deriver, f.ty) {
             Some(b) ->
               Some({
                 span: span_to(f.name.span, ty_span(f.ty)),
@@ -225,27 +236,27 @@ fn check_te(d: Deriver, te: TypeExpr) -> Option<Blocker> / {abort.raise} =
         }),
     TCon(c) -> {
       let simple = c.name.name.name;
-      match con_shape(d, simple) {
+      match constructor_shape(deriver, simple) {
         Refused(why) ->
           Some({
             span: c.span,
             reason: bytes_concat_all([
-              refusal_reason(why, d, simple),
+              refusal_reason(why, deriver, simple),
               b", so `",
               simple,
               b"` has no derivation",
             ]),
-            note: refusal_note(why, d),
+            note: refusal_note(why, deriver),
             variant: None,
           }),
-        _ -> if same_deriver(d, DJson) && simple == b"Option" && len(c.args) > 0
-            && null_encoded_te(at(c.args, 0)) {
+        _ -> if same_deriver(deriver, DJson) && simple == b"Option" && len(c.args) > 0
+            && null_encoded_type_expr(at(c.args, 0)) {
           let inner = match at(c.args, 0) { TCon(k) -> k.name.name.name, _ -> b"Unit" };
           Some({ span: c.span, reason: null_in_option(inner), note: None, variant: None })
         } else {
           // A `Map`'s key type must be ordered whichever deriver is walking.
           let key = if simple == b"Map" && len(c.args) > 0 {
-            match check_te(DOrd, at(c.args, 0)) {
+            match check_type_expr(DOrd, at(c.args, 0)) {
               Some(b) ->
                 Some({
                   span: b.span,
@@ -256,7 +267,7 @@ fn check_te(d: Deriver, te: TypeExpr) -> Option<Blocker> / {abort.raise} =
               None -> None,
             }
           } else { None };
-          match key { Some(b) -> Some(b), None -> first_blocked_te(d, c.args) }
+          match key { Some(b) -> Some(b), None -> first_blocked_type_expr(deriver, c.args) }
         },
       }
     },
@@ -268,7 +279,7 @@ type Alias = { name: Bytes, body: TypeExpr }
 
 // `b` prefixes every generated binder, chosen so none can shadow a dictionary parameter; `path` is the
 // module's; `cycle` holds the types whose codecs call the target's and are called back by it.
-type Emitter = {
+type DeriveEmitter = {
   d: Deriver,
   rt: Bytes,
   b: Bytes,
@@ -278,39 +289,45 @@ type Emitter = {
 }
 
 fn emitter(
-  d: Deriver,
+  deriver: Deriver,
   rt: Bytes,
   params: List<Ident>,
   aliases: List<Alias>,
   path: Bytes,
   cycle: List<Bytes>,
-) -> Emitter / {abort.raise} = {
+) -> DeriveEmitter / {abort.raise} = {
   let b = iterate(b"d", len(params) + 2, |x: Bytes|
-    if fold(params, false, |acc: Bool, p: Ident| acc || bytes_starts_with(p.name, x)) {
+    if fold(params, false, |acc: Bool, ident: Ident| acc || bytes_starts_with(ident.name, x)) {
       Continue(bytes_concat(x, b"_"))
     } else { Stop(x) });
-  { d: d, rt: rt, b: b, aliases: aliases, path: path, cycle: cycle }
+  { d: deriver, rt: rt, b: b, aliases: aliases, path: path, cycle: cycle }
 }
 
 fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
-  fold(aliases, None, |acc: Option<TypeExpr>, a: Alias|
-    match acc { Some(_) -> acc, None -> if a.name == name { Some(a.body) } else { None } })
+  fold(aliases, None, |acc: Option<TypeExpr>, alias: Alias|
+    match acc { Some(_) -> acc, None -> if alias.name == name { Some(alias.body) } else { None } })
 
 pub fn target_type(def: TypeDef) -> Bytes / {abort.raise} =
   if len(def.params) == 0 { def.name.name } else {
-    bytes_concat_all([def.name.name, b"<", join(map(def.params, |p: Ident| p.name), b", "), b">"])
+    bytes_concat_all([
+      def.name.name,
+      b"<",
+      join(map(def.params, |ident: Ident| ident.name), b", "),
+      b">",
+    ])
   }
 
 // A codec on a cycle is two definitions: the named one starts `_at` at the runtime's `max_depth`, and
 // `_at` hands its cycle one less, so its recursion is seen to end.
-fn emit_item(e: Emitter, def: TypeDef) -> Bytes / {abort.raise} = {
-  let name = generated_name(e.d, def.name.name);
+fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> Bytes = {
+  let name = generated_name(emitter.d, def.name.name);
   let target = target_type(def);
   let ps = map(def.params, |p: Ident| p.name);
   let generics = if len(ps) == 0 { b"" } else { bytes_concat_all([b"<", join(ps, b", "), b">"]) };
-  let dicts = map(ps, |p: Bytes| bytes_concat_all([p, b": ", dict_type(e, p)]));
-  let constraints = if len(ps) == 0 { b"" }
-  else { bytes_concat(b" where ", join(map(ps, |p: Bytes| constraint_written(e.d, p)), b", ")) };
+  let dicts = map(ps, |p: Bytes| bytes_concat_all([p, b": ", dict_type(emitter, p)]));
+  let constraints = if len(ps) == 0 { b"" } else {
+    bytes_concat(b" where ", join(map(ps, |p: Bytes| constraint_written(emitter.d, p)), b", "))
+  };
   let head = |fname: Bytes, params: List<Bytes>|
     bytes_concat_all([
       b"fn ",
@@ -319,38 +336,39 @@ fn emit_item(e: Emitter, def: TypeDef) -> Bytes / {abort.raise} = {
       b"(",
       join(params, b", "),
       b") -> ",
-      dict_type(e, target),
+      dict_type(emitter, target),
       constraints,
       b" = ",
     ]);
   let vis = match def.vis { VPub -> b"pub ", VPriv -> b"" };
-  if len(e.cycle) == 0 { bytes_concat_all([vis, head(name, dicts), dictionary(e, def, target)]) }
-  else {
+  if len(emitter.cycle) == 0 {
+    bytes_concat_all([vis, head(name, dicts), dictionary(emitter, def, target)])
+  } else {
     let at_name = bytes_concat(name, b"_at");
     bytes_concat_all([
       vis,
       head(name, dicts),
       at_name,
       b"(",
-      join(push(ps, bytes_concat(e.rt, b"max_depth()")), b", "),
+      join(push(ps, bytes_concat(emitter.rt, b"max_depth()")), b", "),
       b")\n",
-      head(at_name, push(dicts, bytes_concat(e.b, b"depth: Int"))),
+      head(at_name, push(dicts, bytes_concat(emitter.b, b"depth: Int"))),
       b"if ",
-      e.b,
+      emitter.b,
       b"depth <= 0 {",
-      e.rt,
+      emitter.rt,
       b"too_deep()} else {",
-      dictionary(e, def, target),
+      dictionary(emitter, def, target),
       b"}",
     ])
   }
 }
 
 // `JsonCodec<a>` and `BinCodec<a>` ship with their runtime modules; `EqDict` and `OrdDict` are structural.
-fn dict_type(e: Emitter, arg: Bytes) -> Bytes =
-  match e.d {
-    DJson -> bytes_concat_all([e.rt, b"JsonCodec<", arg, b">"]),
-    DBin -> bytes_concat_all([e.rt, b"BinCodec<", arg, b">"]),
+fn dict_type(emitter: DeriveEmitter, arg: Bytes) -> Bytes =
+  match emitter.d {
+    DJson -> bytes_concat_all([emitter.rt, b"JsonCodec<", arg, b">"]),
+    DBin -> bytes_concat_all([emitter.rt, b"BinCodec<", arg, b">"]),
     DShow -> bytes_concat_all([b"{show: (", arg, b") -> String}"]),
     DHash -> bytes_concat_all([b"{hash: (", arg, b") -> Bytes}"]),
     DEq -> bytes_concat_all([b"{eq: (", arg, b", ", arg, b") -> Bool}"]),
@@ -359,110 +377,121 @@ fn dict_type(e: Emitter, arg: Bytes) -> Bytes =
     _ -> b"()",
   }
 
-fn dictionary(e: Emitter, def: TypeDef, target: Bytes) -> Bytes / {abort.raise} =
-  match e.d {
+fn dictionary(emitter: DeriveEmitter, def: TypeDef, target: Bytes) -> Bytes =
+  match emitter.d {
     DEq ->
       bytes_concat_all([
         b"{eq: |",
-        e.b,
+        emitter.b,
         b"a: ",
         target,
         b", ",
-        e.b,
+        emitter.b,
         b"b: ",
         target,
         b"| ",
-        e.b,
+        emitter.b,
         b"a == ",
-        e.b,
+        emitter.b,
         b"b}",
       ]),
     DOrd ->
       bytes_concat_all([
         b"{compare: |",
-        e.b,
+        emitter.b,
         b"a: ",
         target,
         b", ",
-        e.b,
+        emitter.b,
         b"b: ",
         target,
         b"| compare_values(",
-        e.b,
+        emitter.b,
         b"a, ",
-        e.b,
+        emitter.b,
         b"b)}",
       ]),
     DShow ->
-      bytes_concat_all([b"{show: |", e.b, b"a: ", target, b"| ", e.rt, b"show(", e.b, b"a)}"]),
-    DHash -> bytes_concat_all([b"{hash: |", e.b, b"a: ", target, b"| digest(", e.b, b"a)}"]),
+      bytes_concat_all([
+        b"{show: |",
+        emitter.b,
+        b"a: ",
+        target,
+        b"| ",
+        emitter.rt,
+        b"show(",
+        emitter.b,
+        b"a)}",
+      ]),
+    DHash ->
+      bytes_concat_all([b"{hash: |", emitter.b, b"a: ", target, b"| digest(", emitter.b, b"a)}"]),
     DJson -> match def.body {
-      TDAlias(body) -> codec(e, body, target),
-      TDSum(variants) -> json_sum(e, variants, target),
+      TDAlias(body) -> codec(emitter, body, target),
+      TDSum(variants) -> json_sum(emitter, variants, target),
     },
     DBin -> match def.body {
-      TDAlias(body) -> codec(e, body, target),
-      TDSum(variants) -> bin_sum(e, def, variants, target),
+      TDAlias(body) -> codec(emitter, body, target),
+      TDSum(variants) -> bin_sum(emitter, def, variants, target),
     },
     _ -> b"()",
   }
 
 // An expression of the codec type of `te`: `JsonCodec<te>` or `BinCodec<te>`.
-fn codec(e: Emitter, te: TypeExpr, annotation: Bytes) -> Bytes / {abort.raise} =
+fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes =
   match te {
     TVar(p) -> p.name,
-    TUnit(_) -> bytes_concat_all([e.rt, b"unit_", deriver_text(e.d), b"()"]),
+    TUnit(_) -> bytes_concat_all([emitter.rt, b"unit_", deriver_text(emitter.d), b"()"]),
     TBad(_) -> b"()",
     TFn(_) -> b"()",
-    TRecord(r) -> match e.d {
-      DBin -> bin_record(e, r.fields, annotation),
-      _ -> json_record(e, r.fields, annotation),
+    TRecord(r) -> match emitter.d {
+      DBin -> bin_record(emitter, r.fields, annotation),
+      _ -> json_record(emitter, r.fields, annotation),
     },
     TCon(c) -> {
       let simple = c.name.name.name;
-      let codecs = map(c.args, |a: TypeExpr| codec(e, a, render_type(a)));
+      let codecs = map(c.args, |a: TypeExpr| codec(emitter, a, render_type(a)));
       // A JSON object's keys are strings, so a `Map<String, v>` has an object form.
-      if same_deriver(e.d, DJson) && simple == b"Map" && len(c.args) == 2
-          && is_string(e, at(c.args, 0)) {
-        bytes_concat_all([e.rt, b"string_map_json(", at(codecs, 1), b")"])
+      if same_deriver(emitter.d, DJson) && simple == b"Map" && len(c.args) == 2
+          && is_string(emitter, at(c.args, 0)) {
+        bytes_concat_all([emitter.rt, b"string_map_json(", at(codecs, 1), b")"])
       } else {
         let call = bytes_concat_all([
           snake_case(simple),
           b"_",
-          deriver_text(e.d),
+          deriver_text(emitter.d),
           b"(",
           join(codecs, b", "),
           b")",
         ]);
         // A named type is composed through by name, never inlined.
-        match con_shape(e.d, simple) {
+        match constructor_shape(emitter.d, simple) {
           Nominal -> match c.name.module {
             Some(m) -> bytes_concat_all([m.name, b"::", call]),
-            None -> if has(e.cycle, simple) {
+            None -> if has(emitter.cycle, simple) {
               bytes_concat_all([
                 snake_case(simple),
                 b"_",
-                deriver_text(e.d),
+                deriver_text(emitter.d),
                 b"_at(",
-                join(push(codecs, bytes_concat(e.b, b"depth - 1")), b", "),
+                join(push(codecs, bytes_concat(emitter.b, b"depth - 1")), b", "),
                 b")",
               ])
             } else { call },
           },
-          _ -> bytes_concat(e.rt, call),
+          _ -> bytes_concat(emitter.rt, call),
         }
       }
     },
   }
 
 // Whether a written type *is* `String`, following the module's own parameterless aliases.
-fn is_string(e: Emitter, te: TypeExpr) -> Bool / {abort.raise} =
-  iterate({ cur: te, n: 0 }, 66, |s: { cur: TypeExpr, n: Int }|
+fn is_string(emitter: DeriveEmitter, ty: TypeExpr) -> Bool =
+  iterate({ cur: ty, n: 0 }, 66, |s: { cur: TypeExpr, n: Int }|
     if s.n >= 64 { Stop(false) } else {
       match s.cur {
         TCon(c) -> if !is_bare(c.name) || len(c.args) > 0 { Stop(false) }
         else if c.name.name.name == b"String" { Stop(true) } else {
-          match find_alias(e.aliases, c.name.name.name) {
+          match find_alias(emitter.aliases, c.name.name.name) {
             Some(body) -> Continue({ cur: body, n: s.n + 1 }),
             None -> Stop(false),
           }
@@ -472,7 +501,7 @@ fn is_string(e: Emitter, te: TypeExpr) -> Bool / {abort.raise} =
     })
 
 fn json_record(
-  e: Emitter,
+  emitter: DeriveEmitter,
   fields: List<{ name: Ident, ty: TypeExpr }>,
   annotation: Bytes,
 ) -> Bytes / {abort.raise} = {
@@ -481,26 +510,26 @@ fn json_record(
       b"{key: \"",
       f.name.name,
       b"\", value: (",
-      codec(e, f.ty, render_type(f.ty)),
+      codec(emitter, f.ty, render_type(f.ty)),
       b".encode)(",
-      e.b,
+      emitter.b,
       b"v.",
       f.name.name,
       b")}",
     ]));
   let encode = bytes_concat_all([
     b"|",
-    e.b,
+    emitter.b,
     b"v: ",
     annotation,
     b"| ",
-    e.rt,
+    emitter.rt,
     b"object([",
     join(entries, b", "),
     b"])",
   ]);
   let built = map(range(0, len(fields)), |i: Int|
-    bytes_concat_all([at(fields, i).name.name, b": ", e.b, num(i)]));
+    bytes_concat_all([at(fields, i).name.name, b": ", emitter.b, int_to_bytes(i)]));
   let decode = fold(
     range(0, len(fields)),
     bytes_concat_all([b"Ok({", join(built, b", "), b"})"]),
@@ -509,20 +538,20 @@ fn json_record(
       let f = at(fields, i);
       bytes_concat_all([
         b"match ",
-        e.rt,
+        emitter.rt,
         b"field(",
-        e.b,
+        emitter.b,
         b"j, \"",
         f.name.name,
         b"\", ",
-        codec(e, f.ty, render_type(f.ty)),
+        codec(emitter, f.ty, render_type(f.ty)),
         b") {Err(",
-        e.b,
+        emitter.b,
         b"e) -> Err(",
-        e.b,
+        emitter.b,
         b"e), Ok(",
-        e.b,
-        num(i),
+        emitter.b,
+        int_to_bytes(i),
         b") -> ",
         acc,
         b"}",
@@ -533,9 +562,9 @@ fn json_record(
     b"{encode: ",
     encode,
     b", decode: |",
-    e.b,
+    emitter.b,
     b"j: ",
-    e.rt,
+    emitter.rt,
     b"Json| ",
     decode,
     b"}",
@@ -543,24 +572,24 @@ fn json_record(
 }
 
 // A variant is encoded by its declared name and its fields in order.
-fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes / {abort.raise} = {
+fn json_sum(emitter: DeriveEmitter, variants: List<VariantDef>, target: Bytes) -> Bytes = {
   let arms = map(variants, |v: VariantDef| {
-    let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(e.b, num(i)));
+    let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, int_to_bytes(i)));
     let pat = if len(binders) == 0 { v.name.name }
     else { bytes_concat_all([v.name.name, b"(", join(binders, b", "), b")"]) };
     let values = map(range(0, len(v.fields)), |i: Int|
       bytes_concat_all([
         b"(",
-        codec(e, at(v.fields, i), render_type(at(v.fields, i))),
+        codec(emitter, at(v.fields, i), render_type(at(v.fields, i))),
         b".encode)(",
-        e.b,
-        num(i),
+        emitter.b,
+        int_to_bytes(i),
         b")",
       ]));
     bytes_concat_all([
       pat,
       b" -> ",
-      e.rt,
+      emitter.rt,
       b"variant(\"",
       v.name.name,
       b"\", [",
@@ -570,11 +599,11 @@ fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes / {a
   });
   let encode = bytes_concat_all([
     b"|",
-    e.b,
+    emitter.b,
     b"v: ",
     target,
     b"| match ",
-    e.b,
+    emitter.b,
     b"v {",
     join(arms, b", "),
     b"}",
@@ -582,13 +611,23 @@ fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes / {a
   let names = map(variants, |v: VariantDef| bytes_concat_all([b"\"", v.name.name, b"\""]));
   let chain = fold(
     range(0, len(variants)),
-    bytes_concat_all([e.rt, b"unknown_variant(", e.b, b"t.tag, [", join(names, b", "), b"])"]),
+    bytes_concat_all([
+      emitter.rt,
+      b"unknown_variant(",
+      emitter.b,
+      b"t.tag, [",
+      join(names, b", "),
+      b"])",
+    ]),
     |acc: Bytes, k: Int| {
       let v = at(variants, len(variants) - 1 - k);
       let ctor_args = if len(v.fields) == 0 { b"" } else {
         bytes_concat_all([
           b"(",
-          join(map(range(0, len(v.fields)), |i: Int| bytes_concat(e.b, num(i))), b", "),
+          join(
+            map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, int_to_bytes(i))),
+            b", ",
+          ),
           b")",
         ])
       };
@@ -599,22 +638,22 @@ fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes / {a
           let i = len(v.fields) - 1 - kk;
           bytes_concat_all([
             b"match ",
-            e.rt,
+            emitter.rt,
             b"decode_and_then(",
-            e.rt,
+            emitter.rt,
             b"variant_value(",
-            e.b,
+            emitter.b,
             b"t, ",
-            num(i),
+            int_to_bytes(i),
             b"), ",
-            codec(e, at(v.fields, i), render_type(at(v.fields, i))),
+            codec(emitter, at(v.fields, i), render_type(at(v.fields, i))),
             b".decode) {Err(",
-            e.b,
+            emitter.b,
             b"e) -> Err(",
-            e.b,
+            emitter.b,
             b"e), Ok(",
-            e.b,
-            num(i),
+            emitter.b,
+            int_to_bytes(i),
             b") -> ",
             inner,
             b"}",
@@ -623,27 +662,29 @@ fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes / {a
       );
       // On a cycle the test is a call: the emitter keys an operator's settled type by span, every
       // operator here is on the `derive` item's one span, and a depth's are `Int`s.
-      let tested = if len(e.cycle) == 0 {
-        bytes_concat_all([e.b, b"t.tag == \"", v.name.name, b"\""])
-      } else { bytes_concat_all([e.rt, b"has_tag(", e.b, b"t, \"", v.name.name, b"\")"]) };
+      let tested = if len(emitter.cycle) == 0 {
+        bytes_concat_all([emitter.b, b"t.tag == \"", v.name.name, b"\""])
+      } else {
+        bytes_concat_all([emitter.rt, b"has_tag(", emitter.b, b"t, \"", v.name.name, b"\")"])
+      };
       bytes_concat_all([b"if ", tested, b" {", built, b"} else {", acc, b"}"])
     },
   );
   let decode = bytes_concat_all([
     b"|",
-    e.b,
+    emitter.b,
     b"j: ",
-    e.rt,
+    emitter.rt,
     b"Json| match ",
-    e.rt,
+    emitter.rt,
     b"variant_of(",
-    e.b,
+    emitter.b,
     b"j) {Err(",
-    e.b,
+    emitter.b,
     b"e) -> Err(",
-    e.b,
+    emitter.b,
     b"e), Ok(",
-    e.b,
+    emitter.b,
     b"t) -> ",
     chain,
     b"}",
@@ -652,33 +693,43 @@ fn json_sum(e: Emitter, variants: List<VariantDef>, target: Bytes) -> Bytes / {a
 }
 
 // A scalar is written and read by `std.bin`'s own functions rather than through a codec.
-fn bin_scalar(te: TypeExpr) -> Option<Bytes> / {abort.raise} =
-  match te {
+fn bin_scalar(ty: TypeExpr) -> Option<Bytes> =
+  match ty {
     TUnit(_) -> Some(b"unit"),
-    TCon(c) -> match con_shape(DBin, c.name.name.name) {
+    TCon(c) -> match constructor_shape(DBin, c.name.name.name) {
       Leaf -> Some(snake_case(c.name.name.name)),
       _ -> None,
     },
     _ -> None,
   }
 
-fn bin_put(e: Emitter, te: TypeExpr, w: Bytes, x: Bytes) -> Bytes / {abort.raise} =
-  match bin_scalar(te) {
-    Some(s) -> bytes_concat_all([e.rt, b"put_", s, b"(", w, b", ", x, b")"]),
-    None -> bytes_concat_all([b"(", codec(e, te, render_type(te)), b".put)(", w, b", ", x, b")"]),
+fn bin_put(emitter: DeriveEmitter, ty: TypeExpr, w: Bytes, x: Bytes) -> Bytes =
+  match bin_scalar(ty) {
+    Some(s) -> bytes_concat_all([emitter.rt, b"put_", s, b"(", w, b", ", x, b")"]),
+    None ->
+      bytes_concat_all([b"(", codec(emitter, ty, render_type(ty)), b".put)(", w, b", ", x, b")"]),
   }
 
-fn bin_take(e: Emitter, te: TypeExpr, from: Bytes) -> Bytes / {abort.raise} =
-  match bin_scalar(te) {
-    Some(s) -> bytes_concat_all([e.rt, b"take_", s, b"(", e.b, b"d, ", from, b")"]),
+fn bin_take(emitter: DeriveEmitter, ty: TypeExpr, from: Bytes) -> Bytes =
+  match bin_scalar(ty) {
+    Some(s) -> bytes_concat_all([emitter.rt, b"take_", s, b"(", emitter.b, b"d, ", from, b")"]),
     None ->
-      bytes_concat_all([b"(", codec(e, te, render_type(te)), b".take)(", e.b, b"d, ", from, b")"]),
+      bytes_concat_all([
+        b"(",
+        codec(emitter, ty, render_type(ty)),
+        b".take)(",
+        emitter.b,
+        b"d, ",
+        from,
+        b")",
+      ]),
   }
 
 // Each of `tys` read where the last ended, the first at `start`, then `built` over their values.
-fn bin_takes(e: Emitter, tys: List<TypeExpr>, start: Bytes, built: Bytes) -> Bytes / {abort.raise} = {
+fn bin_takes(emitter: DeriveEmitter, tys: List<TypeExpr>, start: Bytes, built: Bytes) -> Bytes = {
   let n = len(tys);
-  let end_of = |i: Int| if i < 0 { start } else { bytes_concat_all([e.b, num(i), b".at"]) };
+  let end_of = |i: Int|
+    if i < 0 { start } else { bytes_concat_all([emitter.b, int_to_bytes(i), b".at"]) };
   fold(
     range(0, n),
     bytes_concat_all([b"Ok({value: ", built, b", at: ", end_of(n - 1), b"})"]),
@@ -686,14 +737,14 @@ fn bin_takes(e: Emitter, tys: List<TypeExpr>, start: Bytes, built: Bytes) -> Byt
       let i = n - 1 - k;
       bytes_concat_all([
         b"match ",
-        bin_take(e, at(tys, i), end_of(i - 1)),
+        bin_take(emitter, at(tys, i), end_of(i - 1)),
         b" {Err(",
-        e.b,
+        emitter.b,
         b"e) -> Err(",
-        e.b,
+        emitter.b,
         b"e), Ok(",
-        e.b,
-        num(i),
+        emitter.b,
+        int_to_bytes(i),
         b") -> ",
         acc,
         b"}",
@@ -702,20 +753,24 @@ fn bin_takes(e: Emitter, tys: List<TypeExpr>, start: Bytes, built: Bytes) -> Byt
   )
 }
 
-fn values_of(e: Emitter, n: Int) -> List<Bytes> =
-  map(range(0, n), |i: Int| bytes_concat_all([e.b, num(i), b".value"]))
+fn values_of(emitter: DeriveEmitter, n: Int) -> List<Bytes> =
+  map(range(0, n), |i: Int| bytes_concat_all([emitter.b, int_to_bytes(i), b".value"]))
 
-fn shapes_of(e: Emitter, tys: List<TypeExpr>) -> Bytes / {abort.raise} =
-  join(map(tys, |t: TypeExpr| bytes_concat(codec(e, t, render_type(t)), b".shape")), b", ")
+fn shapes_of(emitter: DeriveEmitter, tys: List<TypeExpr>) -> Bytes =
+  join(map(tys, |ty: TypeExpr| bytes_concat(codec(emitter, ty, render_type(ty)), b".shape")), b", ")
 
 fn bin_record(
-  e: Emitter,
+  emitter: DeriveEmitter,
   fields: List<{ name: Ident, ty: TypeExpr }>,
   annotation: Bytes,
-) -> Bytes / {abort.raise} = {
-  let put = fold(fields, bytes_concat(e.b, b"w"), |acc: Bytes, f: { name: Ident, ty: TypeExpr }|
-    bin_put(e, f.ty, acc, bytes_concat_all([e.b, b"v.", f.name.name])));
-  let values = values_of(e, len(fields));
+) -> Bytes = {
+  let put = fold(
+    fields,
+    bytes_concat(emitter.b, b"w"),
+    |acc: Bytes, f: { name: Ident, ty: TypeExpr }|
+      bin_put(emitter, f.ty, acc, bytes_concat_all([emitter.b, b"v.", f.name.name])),
+  );
+  let values = values_of(emitter, len(fields));
   let built = map(range(0, len(fields)), |i: Int|
     bytes_concat_all([at(fields, i).name.name, b": ", at(values, i)]));
   let shapes = map(fields, |f: { name: Ident, ty: TypeExpr }|
@@ -723,37 +778,37 @@ fn bin_record(
       b"{name: \"",
       f.name.name,
       b"\", shape: ",
-      codec(e, f.ty, render_type(f.ty)),
+      codec(emitter, f.ty, render_type(f.ty)),
       b".shape}",
     ]));
   bytes_concat_all([
     b"{put: |",
-    e.b,
+    emitter.b,
     b"w: Bytes, ",
-    e.b,
+    emitter.b,
     b"v: ",
     annotation,
     b"| ",
     put,
     b", take: |",
-    e.b,
+    emitter.b,
     b"d: Bytes, ",
-    e.b,
+    emitter.b,
     b"n: Int| ",
     bin_takes(
-      e,
+      emitter,
       map(fields, |f: { name: Ident, ty: TypeExpr }| f.ty),
-      bytes_concat(e.b, b"n"),
+      bytes_concat(emitter.b, b"n"),
       bytes_concat_all([b"{", join(built, b", "), b"}"]),
     ),
     b", shape: |",
-    e.b,
+    emitter.b,
     b"s: ",
-    e.rt,
+    emitter.rt,
     b"Shapes| ",
-    e.rt,
+    emitter.rt,
     b"record_shape(",
-    e.b,
+    emitter.b,
     b"s, [",
     join(shapes, b", "),
     b"])}",
@@ -762,78 +817,96 @@ fn bin_record(
 
 // A variant is its index among the declared constructors, then its fields in order.
 fn bin_sum(
-  e: Emitter,
+  emitter: DeriveEmitter,
   def: TypeDef,
   variants: List<VariantDef>,
   target: Bytes,
-) -> Bytes / {abort.raise} = {
+) -> Bytes = {
   let count = len(variants);
   let arms = map(range(0, count), |vi: Int| {
     let v = at(variants, vi);
-    let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(e.b, num(i)));
+    let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, int_to_bytes(i)));
     let pat = if len(binders) == 0 { v.name.name }
     else { bytes_concat_all([v.name.name, b"(", join(binders, b", "), b")"]) };
-    let tagged = bytes_concat_all([e.rt, b"put_tag(", e.b, b"w, ", num(vi), b")"]);
+    let tagged = bytes_concat_all([
+      emitter.rt,
+      b"put_tag(",
+      emitter.b,
+      b"w, ",
+      int_to_bytes(vi),
+      b")",
+    ]);
     let body = fold(range(0, len(v.fields)), tagged, |acc: Bytes, i: Int|
-      bin_put(e, at(v.fields, i), acc, at(binders, i)));
+      bin_put(emitter, at(v.fields, i), acc, at(binders, i)));
     bytes_concat_all([pat, b" -> ", body])
   });
   let cases = map(range(0, count), |vi: Int| {
     let v = at(variants, vi);
     let args = if len(v.fields) == 0 { b"" }
-    else { bytes_concat_all([b"(", join(values_of(e, len(v.fields)), b", "), b")"]) };
+    else { bytes_concat_all([b"(", join(values_of(emitter, len(v.fields)), b", "), b")"]) };
     bytes_concat_all([
-      if vi == count - 1 { b"_" } else { num(vi) },
+      if vi == count - 1 { b"_" } else { int_to_bytes(vi) },
       b" -> ",
-      bin_takes(e, v.fields, bytes_concat(e.b, b"t.at"), bytes_concat(v.name.name, args)),
+      bin_takes(
+        emitter,
+        v.fields,
+        bytes_concat(emitter.b, b"t.at"),
+        bytes_concat(v.name.name, args),
+      ),
     ])
   });
   let shapes = map(variants, |v: VariantDef|
-    bytes_concat_all([b"{name: \"", v.name.name, b"\", fields: [", shapes_of(e, v.fields), b"]}"]));
-  let params = join(map(def.params, |p: Ident| bytes_concat(p.name, b".shape")), b", ");
+    bytes_concat_all([
+      b"{name: \"",
+      v.name.name,
+      b"\", fields: [",
+      shapes_of(emitter, v.fields),
+      b"]}",
+    ]));
+  let params = join(map(def.params, |ident: Ident| bytes_concat(ident.name, b".shape")), b", ");
   bytes_concat_all([
     b"{put: |",
-    e.b,
+    emitter.b,
     b"w: Bytes, ",
-    e.b,
+    emitter.b,
     b"v: ",
     target,
     b"| match ",
-    e.b,
+    emitter.b,
     b"v {",
     join(arms, b", "),
     b"}, take: |",
-    e.b,
+    emitter.b,
     b"d: Bytes, ",
-    e.b,
+    emitter.b,
     b"n: Int| match ",
-    e.rt,
+    emitter.rt,
     b"take_tag(",
-    e.b,
+    emitter.b,
     b"d, ",
-    e.b,
+    emitter.b,
     b"n, ",
-    num(count),
+    int_to_bytes(count),
     b") {Err(",
-    e.b,
+    emitter.b,
     b"e) -> Err(",
-    e.b,
+    emitter.b,
     b"e), Ok(",
-    e.b,
+    emitter.b,
     b"t) -> match ",
-    e.b,
+    emitter.b,
     b"t.value {",
     join(cases, b", "),
     b"}}, shape: |",
-    e.b,
+    emitter.b,
     b"s: ",
-    e.rt,
+    emitter.rt,
     b"Shapes| ",
-    e.rt,
+    emitter.rt,
     b"sum_shape(",
-    e.b,
+    emitter.b,
     b"s, \"",
-    e.path,
+    emitter.path,
     b".",
     def.name.name,
     b"\", \"",
@@ -846,14 +919,17 @@ fn bin_sum(
   ])
 }
 
-fn qname_text(q: QName) -> Bytes =
-  match q.module { Some(m) -> bytes_concat_all([m.name, b"::", q.name.name]), None -> q.name.name }
+fn qname_text(qname: QName) -> Bytes =
+  match qname.module {
+    Some(m) -> bytes_concat_all([m.name, b"::", qname.name.name]),
+    None -> qname.name.name,
+  }
 
-fn mode_text(m: Mode) -> Bytes = match m { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
+fn mode_text(mode: Mode) -> Bytes = match mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
 
 // A type back as source, for the annotations a generated lambda needs.
-pub fn render_type(te: TypeExpr) -> Bytes / {abort.raise} =
-  match te {
+pub fn render_type(ty: TypeExpr) -> Bytes =
+  match ty {
     TVar(i) -> i.name,
     TUnit(_) -> b"()",
     TBad(_) -> b"()",
@@ -890,260 +966,272 @@ fn render_row(row: RowExpr) -> Bytes / {abort.raise} = {
   }
 }
 
-fn render_atom(a: AtomExpr) -> Bytes = {
-  let resource = if a.every { b"[*]" }
-  else { match a.resource { Some(r) -> bytes_concat_all([b"[", r.name, b"]"]), None -> b"" } };
+fn render_atom(atom: AtomExpr) -> Bytes = {
+  let resource = if atom.every { b"[*]" }
+  else { match atom.resource { Some(r) -> bytes_concat_all([b"[", r.name, b"]"]), None -> b"" } };
   bytes_concat_all([
-    qname_text(a.eff),
+    qname_text(atom.eff),
     b".",
-    match a.op { Some(o) -> o.name, None -> mode_text(a.mode) },
+    match atom.op { Some(o) -> o.name, None -> mode_text(atom.mode) },
     resource,
   ])
 }
 
 // --- Every span in a generated definition becomes the `derive` item's ----------------------------
 
-fn ident_at(i: Ident, s: Span) -> Ident = { name: i.name, span: s }
+fn ident_at(ident: Ident, span: Span) -> Ident = { name: ident.name, span: span }
 
-fn qname_at(q: QName, s: Span) -> QName =
+fn qname_at(qname: QName, span: Span) -> QName =
   {
-    module: match q.module { Some(m) -> Some(ident_at(m, s)), None -> None },
-    name: ident_at(q.name, s),
-    span: s,
+    module: match qname.module { Some(m) -> Some(ident_at(m, span)), None -> None },
+    name: ident_at(qname.name, span),
+    span: span,
   }
 
-fn opt_ident_at(o: Option<Ident>, s: Span) -> Option<Ident> =
-  match o { Some(i) -> Some(ident_at(i, s)), None -> None }
+fn opt_ident_at(o: Option<Ident>, span: Span) -> Option<Ident> =
+  match o { Some(i) -> Some(ident_at(i, span)), None -> None }
 
-fn retarget_fn(def: FnDef, s: Span) -> FnDef =
+fn retarget_fn(def: FnDef, span: Span) -> FnDef =
   {
     vis: def.vis,
-    name: ident_at(def.name, s),
+    name: ident_at(def.name, span),
     generics: {
-      types: map(def.generics.types, |g: Ident| ident_at(g, s)),
-      effects: map(def.generics.effects, |g: Ident| ident_at(g, s)),
-      labels: map(def.generics.labels, |g: Ident| ident_at(g, s)),
+      types: map(def.generics.types, |ident: Ident| ident_at(ident, span)),
+      effects: map(def.generics.effects, |ident: Ident| ident_at(ident, span)),
+      labels: map(def.generics.labels, |ident: Ident| ident_at(ident, span)),
     },
-    params: map(def.params, |p: Param| retarget_param(p, s)),
-    ret: match def.ret { Some(t) -> Some(retarget_ty(t, s)), None -> None },
-    effects: match def.effects { Some(r) -> Some(retarget_row(r, s)), None -> None },
+    params: map(def.params, |param: Param| retarget_param(param, span)),
+    ret: match def.ret { Some(t) -> Some(retarget_ty(t, span)), None -> None },
+    effects: match def.effects { Some(r) -> Some(retarget_row(r, span)), None -> None },
     constraints: map(def.constraints, |c: Constraint|
-      { deriver: c.deriver, deriver_span: s, param: ident_at(c.param, s), span: s }),
-    spec: map(def.spec, |c: SpecClause| { kind: c.kind, expr: retarget_expr(c.expr, s), span: s }),
+      { deriver: c.deriver, deriver_span: span, param: ident_at(c.param, span), span: span }),
+    spec: map(def.spec, |c: SpecClause|
+      { kind: c.kind, expr: retarget_expr(c.expr, span), span: span }),
     returns: def.returns,
     reuse: def.reuse,
     transparent: def.transparent,
-    decreases: match def.decreases { Some(e) -> Some(retarget_expr(e, s)), None -> None },
-    body: retarget_expr(def.body, s),
-    span: s,
+    decreases: match def.decreases { Some(e) -> Some(retarget_expr(e, span)), None -> None },
+    body: retarget_expr(def.body, span),
+    span: span,
   }
 
 // A parameter's default is deliberately not retargeted.
-fn retarget_param(p: Param, s: Span) -> Param =
+fn retarget_param(param: Param, span: Span) -> Param =
   {
-    name: ident_at(p.name, s),
-    ty: match p.ty { Some(t) -> Some(retarget_ty(t, s)), None -> None },
-    default: p.default,
-    span: s,
+    name: ident_at(param.name, span),
+    ty: match param.ty { Some(t) -> Some(retarget_ty(t, span)), None -> None },
+    default: param.default,
+    span: span,
   }
 
-fn retarget_ty(t: TypeExpr, s: Span) -> TypeExpr =
+fn retarget_ty(t: TypeExpr, span: Span) -> TypeExpr =
   match t {
-    TVar(i) -> TVar(ident_at(i, s)),
+    TVar(i) -> TVar(ident_at(i, span)),
     TCon(c) ->
       TCon({
-        span: s,
-        name: qname_at(c.name, s),
-        args: map(c.args, |a: TypeExpr| retarget_ty(a, s)),
+        span: span,
+        name: qname_at(c.name, span),
+        args: map(c.args, |a: TypeExpr| retarget_ty(a, span)),
       }),
     TFn(f) ->
       TFn({
-        span: s,
-        params: map(f.params, |p: TypeExpr| retarget_ty(p, s)),
-        ret: retarget_ty(f.ret, s),
-        effects: match f.effects { Some(r) -> Some(retarget_row(r, s)), None -> None },
+        span: span,
+        params: map(f.params, |p: TypeExpr| retarget_ty(p, span)),
+        ret: retarget_ty(f.ret, span),
+        effects: match f.effects { Some(r) -> Some(retarget_row(r, span)), None -> None },
       }),
     TRecord(r) ->
       TRecord({
-        span: s,
+        span: span,
         fields: map(r.fields, |f: { name: Ident, ty: TypeExpr }|
-          { name: ident_at(f.name, s), ty: retarget_ty(f.ty, s) }),
+          { name: ident_at(f.name, span), ty: retarget_ty(f.ty, span) }),
       }),
-    TUnit(_) -> TUnit({ span: s }),
-    TBad(_) -> TBad({ span: s }),
+    TUnit(_) -> TUnit({ span: span }),
+    TBad(_) -> TBad({ span: span }),
   }
 
-fn retarget_row(r: RowExpr, s: Span) -> RowExpr =
+fn retarget_row(row: RowExpr, span: Span) -> RowExpr =
   {
-    atoms: map(r.atoms, |a: AtomExpr|
+    atoms: map(row.atoms, |atom: AtomExpr|
       {
-        eff: qname_at(a.eff, s),
-        mode: a.mode,
-        op: opt_ident_at(a.op, s),
-        resource: opt_ident_at(a.resource, s),
-        every: a.every,
-        bounded: a.bounded,
-        span: s,
+        eff: qname_at(atom.eff, span),
+        mode: atom.mode,
+        op: opt_ident_at(atom.op, span),
+        resource: opt_ident_at(atom.resource, span),
+        every: atom.every,
+        bounded: atom.bounded,
+        span: span,
       }),
-    aliases: map(r.aliases, |q: QName| qname_at(q, s)),
-    tail: opt_ident_at(r.tail, s),
-    tail_bounded: r.tail_bounded,
-    span: s,
+    aliases: map(row.aliases, |qname: QName| qname_at(qname, span)),
+    tail: opt_ident_at(row.tail, span),
+    tail_bounded: row.tail_bounded,
+    span: span,
   }
 
-fn retarget_opt_expr(o: Option<Expr>, s: Span) -> Option<Expr> =
-  match o { Some(e) -> Some(retarget_expr(e, s)), None -> None }
+fn retarget_opt_expr(expr: Option<Expr>, span: Span) -> Option<Expr> =
+  match expr { Some(e) -> Some(retarget_expr(e, span)), None -> None }
 
-fn retarget_field(f: RecField, s: Span) -> RecField =
-  { name: ident_at(f.name, s), value: retarget_expr(f.value, s) }
+fn retarget_field(field: RecField, span: Span) -> RecField =
+  { name: ident_at(field.name, span), value: retarget_expr(field.value, span) }
 
-fn retarget_expr(e: Expr, s: Span) -> Expr =
+fn retarget_expr(e: Expr, span: Span) -> Expr =
   match e {
-    ELit(l) -> ELit({ span: s, lit: l.lit }),
-    EVar(v) -> EVar({ span: s, name: qname_at(v.name, s) }),
+    ELit(l) -> ELit({ span: span, lit: l.lit }),
+    EVar(v) -> EVar({ span: span, name: qname_at(v.name, span) }),
     EBinary(b) ->
-      EBinary({ span: s, op: b.op, lhs: retarget_expr(b.lhs, s), rhs: retarget_expr(b.rhs, s) }),
-    EUnary(u) -> EUnary({ span: s, op: u.op, operand: retarget_expr(u.operand, s) }),
+      EBinary({
+        span: span,
+        op: b.op,
+        lhs: retarget_expr(b.lhs, span),
+        rhs: retarget_expr(b.rhs, span),
+      }),
+    EUnary(u) -> EUnary({ span: span, op: u.op, operand: retarget_expr(u.operand, span) }),
     // A lambda's written return type is deliberately not retargeted.
     ELambda(l) ->
       ELambda({
-        span: s,
-        body: retarget_expr(l.body, s),
-        params: map(l.params, |p: Param| retarget_param(p, s)),
+        span: span,
+        body: retarget_expr(l.body, span),
+        params: map(l.params, |p: Param| retarget_param(p, span)),
         ret: l.ret,
       }),
     EApp(a) ->
       EApp({
-        span: s,
-        func: retarget_expr(a.func, s),
-        named: map(a.named, |n: NamedArg|
-          { name: n.name, value: retarget_expr(n.value, s), span: n.span }),
-        args: map(a.args, |x: Expr| retarget_expr(x, s)),
-        labels: map(a.labels, |l: Ident| ident_at(l, s)),
+        span: span,
+        func: retarget_expr(a.func, span),
+        named: map(a.named, |arg: NamedArg|
+          { name: arg.name, value: retarget_expr(arg.value, span), span: arg.span }),
+        args: map(a.args, |x: Expr| retarget_expr(x, span)),
+        labels: map(a.labels, |l: Ident| ident_at(l, span)),
       }),
     EIf(i) ->
       EIf({
-        span: s,
-        cond: retarget_expr(i.cond, s),
-        then_branch: retarget_expr(i.then_branch, s),
-        else_branch: retarget_expr(i.else_branch, s),
+        span: span,
+        cond: retarget_expr(i.cond, span),
+        then_branch: retarget_expr(i.then_branch, span),
+        else_branch: retarget_expr(i.else_branch, span),
       }),
     EMatch(m) ->
       EMatch({
-        span: s,
-        scrutinee: retarget_expr(m.scrutinee, s),
+        span: span,
+        scrutinee: retarget_expr(m.scrutinee, span),
         arms: map(m.arms, |arm: MatchArm|
           {
-            pat: retarget_pat(arm.pat, s),
-            guard: retarget_opt_expr(arm.guard, s),
-            body: retarget_expr(arm.body, s),
-            span: s,
+            pat: retarget_pat(arm.pat, span),
+            guard: retarget_opt_expr(arm.guard, span),
+            body: retarget_expr(arm.body, span),
+            span: span,
           }),
       }),
     EBlock(b) ->
       EBlock({
-        span: s,
-        tail: retarget_opt_expr(b.tail, s),
-        stmts: map(b.stmts, |st: Stmt|
-          match st {
+        span: span,
+        tail: retarget_opt_expr(b.tail, span),
+        stmts: map(b.stmts, |stmt: Stmt|
+          match stmt {
             SLet(l) ->
               SLet({
-                span: s,
-                pat: retarget_pat(l.pat, s),
-                ty: match l.ty { Some(t) -> Some(retarget_ty(t, s)), None -> None },
-                value: retarget_expr(l.value, s),
+                span: span,
+                pat: retarget_pat(l.pat, span),
+                ty: match l.ty { Some(t) -> Some(retarget_ty(t, span)), None -> None },
+                value: retarget_expr(l.value, span),
               }),
             SLetElse(l) ->
               SLetElse({
-                span: s,
-                pat: retarget_pat(l.pat, s),
-                ty: match l.ty { Some(t) -> Some(retarget_ty(t, s)), None -> None },
-                value: retarget_expr(l.value, s),
-                fallback: retarget_expr(l.fallback, s),
+                span: span,
+                pat: retarget_pat(l.pat, span),
+                ty: match l.ty { Some(t) -> Some(retarget_ty(t, span)), None -> None },
+                value: retarget_expr(l.value, span),
+                fallback: retarget_expr(l.fallback, span),
               }),
-            SExpr(x) -> SExpr(retarget_expr(x, s)),
+            SExpr(x) -> SExpr(retarget_expr(x, span)),
           }),
       }),
-    ERecord(r) -> ERecord({ span: s, fields: map(r.fields, |f: RecField| retarget_field(f, s)) }),
+    ERecord(r) ->
+      ERecord({ span: span, fields: map(r.fields, |f: RecField| retarget_field(f, span)) }),
     ERecordUpdate(r) ->
       ERecordUpdate({
-        span: s,
-        base: retarget_expr(r.base, s),
-        fields: map(r.fields, |f: RecField| retarget_field(f, s)),
+        span: span,
+        base: retarget_expr(r.base, span),
+        fields: map(r.fields, |f: RecField| retarget_field(f, span)),
       }),
-    ETry(t) -> ETry({ span: s, operand: retarget_expr(t.operand, s) }),
-    EField(f) -> EField({ span: s, base: retarget_expr(f.base, s), field: ident_at(f.field, s) }),
-    EList(l) -> EList({ span: s, items: map(l.items, |x: Expr| retarget_expr(x, s)) }),
+    ETry(t) -> ETry({ span: span, operand: retarget_expr(t.operand, span) }),
+    EField(f) ->
+      EField({ span: span, base: retarget_expr(f.base, span), field: ident_at(f.field, span) }),
+    EList(l) -> EList({ span: span, items: map(l.items, |x: Expr| retarget_expr(x, span)) }),
     EPerform(p) ->
       EPerform({
-        span: s,
-        eff: qname_at(p.eff, s),
-        op: ident_at(p.op, s),
-        resource: opt_ident_at(p.resource, s),
-        args: map(p.args, |x: Expr| retarget_expr(x, s)),
+        span: span,
+        eff: qname_at(p.eff, span),
+        op: ident_at(p.op, span),
+        resource: opt_ident_at(p.resource, span),
+        args: map(p.args, |x: Expr| retarget_expr(x, span)),
       }),
     EHandle(h) ->
       EHandle({
-        span: s,
-        body: retarget_expr(h.body, s),
+        span: span,
+        body: retarget_expr(h.body, span),
         ret: match h.ret {
           Some(rc) ->
-            Some({ binder: ident_at(rc.binder, s), body: retarget_expr(rc.body, s), span: s }),
+            Some({
+              binder: ident_at(rc.binder, span),
+              body: retarget_expr(rc.body, span),
+              span: span,
+            }),
           None -> None,
         },
         clauses: map(h.clauses, |c: HandleClause|
           {
-            eff: qname_at(c.eff, s),
-            op: ident_at(c.op, s),
-            resource: opt_ident_at(c.resource, s),
+            eff: qname_at(c.eff, span),
+            op: ident_at(c.op, span),
+            resource: opt_ident_at(c.resource, span),
             every_label: c.every_label,
-            label_binder: opt_ident_at(c.label_binder, s),
-            resume: opt_ident_at(c.resume, s),
-            body: retarget_expr(c.body, s),
-            span: s,
-            params: map(c.params, |p: Ident| ident_at(p, s)),
+            label_binder: opt_ident_at(c.label_binder, span),
+            resume: opt_ident_at(c.resume, span),
+            body: retarget_expr(c.body, span),
+            span: span,
+            params: map(c.params, |p: Ident| ident_at(p, span)),
           }),
       }),
     EWithCell(c) ->
       EWithCell({
-        span: s,
-        resource: ident_at(c.resource, s),
-        init: retarget_expr(c.init, s),
-        binder: ident_at(c.binder, s),
-        body: retarget_expr(c.body, s),
+        span: span,
+        resource: ident_at(c.resource, span),
+        init: retarget_expr(c.init, span),
+        binder: ident_at(c.binder, span),
+        body: retarget_expr(c.body, span),
       }),
-    ESimulate(x) -> ESimulate({ span: s, body: retarget_expr(x.body, s) }),
+    ESimulate(x) -> ESimulate({ span: span, body: retarget_expr(x.body, span) }),
     EParallel(x) ->
-      EParallel({ span: s, branches: map(x.branches, |b: Expr| retarget_expr(b, s)) }),
-    EBad(_) -> EBad({ span: s }),
+      EParallel({ span: span, branches: map(x.branches, |b: Expr| retarget_expr(b, span)) }),
+    EBad(_) -> EBad({ span: span }),
   }
 
-fn retarget_pat(p: Pattern, s: Span) -> Pattern =
+fn retarget_pat(p: Pattern, span: Span) -> Pattern =
   match p {
-    PWild(_) -> PWild({ span: s }),
-    PVar(v) -> PVar({ span: s, name: ident_at(v.name, s) }),
-    PLit(l) -> PLit({ span: s, lit: l.lit }),
+    PWild(_) -> PWild({ span: span }),
+    PVar(v) -> PVar({ span: span, name: ident_at(v.name, span) }),
+    PLit(l) -> PLit({ span: span, lit: l.lit }),
     PCtor(c) ->
       PCtor({
-        span: s,
-        name: qname_at(c.name, s),
-        args: map(c.args, |a: Pattern| retarget_pat(a, s)),
+        span: span,
+        name: qname_at(c.name, span),
+        args: map(c.args, |a: Pattern| retarget_pat(a, span)),
       }),
     PRecord(r) ->
       PRecord({
-        span: s,
+        span: span,
         rest: r.rest,
         fields: map(r.fields, |f: { name: Ident, pat: Pattern }|
-          { name: ident_at(f.name, s), pat: retarget_pat(f.pat, s) }),
+          { name: ident_at(f.name, span), pat: retarget_pat(f.pat, span) }),
       }),
     PList(l) ->
       PList({
-        span: s,
-        rest: match l.rest { Some(r) -> Some(retarget_pat(r, s)), None -> None },
-        items: map(l.items, |i: Pattern| retarget_pat(i, s)),
+        span: span,
+        rest: match l.rest { Some(r) -> Some(retarget_pat(r, span)), None -> None },
+        items: map(l.items, |i: Pattern| retarget_pat(i, span)),
       }),
-    POr(o) -> POr({ span: s, alts: map(o.alts, |a: Pattern| retarget_pat(a, s)) }),
-    PBad(_) -> PBad({ span: s }),
+    POr(o) -> POr({ span: span, alts: map(o.alts, |a: Pattern| retarget_pat(a, span)) }),
+    PBad(_) -> PBad({ span: span }),
   }
 
 // --- The expander --------------------------------------------------------------------------------
@@ -1151,7 +1239,7 @@ fn retarget_pat(p: Pattern, s: Span) -> Pattern =
 type Runtime = { wanted: Bytes, prefix: Bytes, added: Option<ImportDecl> }
 type Claimed = { name: Bytes, def: DeriveDef }
 type Generated = { source: Bytes, defs: List<FnDef>, derived: Derived }
-type Ex = {
+type Expander = {
   m: Int,
   path: Bytes,
   module: Module,
@@ -1162,41 +1250,52 @@ type Ex = {
   runtimes: List<Runtime>,
   diags: List<Diag>,
 }
-type WithPrefix = { ex: Ex, prefix: Option<Bytes> }
+type WithPrefix = { ex: Expander, prefix: Option<Bytes> }
 
 pub type Expansion = { module: Module, derived: List<Derived>, diags: List<Diag> }
 
-fn report(ex: Ex, d: Diag) -> Ex = { ..ex, diags: push(ex.diags, d) }
+fn report(expander: Expander, diag: Diag) -> Expander =
+  { ..expander, diags: push(expander.diags, diag) }
 
 fn find_type(types: List<TypeDef>, name: Bytes) -> Option<TypeDef> =
-  fold(types, None, |acc: Option<TypeDef>, t: TypeDef|
-    match acc { Some(_) -> acc, None -> if t.name.name == name { Some(t) } else { None } })
+  fold(types, None, |acc: Option<TypeDef>, type_def: TypeDef|
+    match acc {
+      Some(_) -> acc,
+      None -> if type_def.name.name == name { Some(type_def) } else { None },
+    })
 
 fn find_claimed(xs: List<Claimed>, name: Bytes) -> Option<DeriveDef> =
-  fold(xs, None, |acc: Option<DeriveDef>, c: Claimed|
-    match acc { Some(_) -> acc, None -> if c.name == name { Some(c.def) } else { None } })
+  fold(xs, None, |acc: Option<DeriveDef>, claimed: Claimed|
+    match acc {
+      Some(_) -> acc,
+      None -> if claimed.name == name { Some(claimed.def) } else { None },
+    })
 
 fn find_runtime(xs: List<Runtime>, wanted: Bytes) -> Option<Runtime> =
-  fold(xs, None, |acc: Option<Runtime>, r: Runtime|
-    match acc { Some(_) -> acc, None -> if r.wanted == wanted { Some(r) } else { None } })
+  fold(xs, None, |acc: Option<Runtime>, runtime: Runtime|
+    match acc {
+      Some(_) -> acc,
+      None -> if runtime.wanted == wanted { Some(runtime) } else { None },
+    })
 
-fn dotted(i: ImportDecl) -> Bytes / {abort.raise} = join(map(i.path, |s: Ident| s.name), b".")
+fn dotted(decl: ImportDecl) -> Bytes = join(map(decl.path, |ident: Ident| ident.name), b".")
 
-fn find_import(imports: List<ImportDecl>, wanted: Bytes) -> Option<ImportDecl> / {abort.raise} =
-  fold(imports, None, |acc: Option<ImportDecl>, i: ImportDecl|
-    match acc { Some(_) -> acc, None -> if dotted(i) == wanted { Some(i) } else { None } })
+fn find_import(imports: List<ImportDecl>, wanted: Bytes) -> Option<ImportDecl> =
+  fold(imports, None, |acc: Option<ImportDecl>, decl: ImportDecl|
+    match acc { Some(_) -> acc, None -> if dotted(decl) == wanted { Some(decl) } else { None } })
 
 // The hidden import an interpolating module gets has no binder generated source can spell.
-fn import_binder(i: ImportDecl) -> Option<Bytes> / {abort.raise} =
-  match i.kind {
-    IModule -> if len(i.path) == 0 { None } else { Some(at(i.path, len(i.path) - 1).name) },
+fn import_binder(decl: ImportDecl) -> Option<Bytes> =
+  match decl.kind {
+    IModule -> if len(decl.path) == 0 { None }
+    else { Some(at(decl.path, len(decl.path) - 1).name) },
     IAlias(a) -> if a.name == shown_binder() { None } else { Some(a.name) },
     INames(_) -> None,
   }
 
-fn path_span(i: ImportDecl) -> Span / {abort.raise} =
-  if len(i.path) == 0 { i.span }
-  else { span_to(at(i.path, 0).span, at(i.path, len(i.path) - 1).span) }
+fn path_span(decl: ImportDecl) -> Span =
+  if len(decl.path) == 0 { decl.span }
+  else { span_to(at(decl.path, 0).span, at(decl.path, len(decl.path) - 1).span) }
 
 fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
   bytes_len(a) == bytes_len(b)
@@ -1204,12 +1303,12 @@ fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
       acc && lower_byte(bytes_at(a, i)) == lower_byte(bytes_at(b, i)))
 
 // Each table keeps the first of a name on its own, so an alias may follow a same-named sum type.
-fn new_expander(m: Int, path: Bytes, module: Module) -> Ex = {
+fn new_expander(m: Int, path: Bytes, module: Module) -> Expander = {
   let walked = fold(
     module.items,
     { types: [], aliases: [] },
-    |acc: { types: List<TypeDef>, aliases: List<Alias> }, it: Item|
-      match it {
+    |acc: { types: List<TypeDef>, aliases: List<Alias> }, item: Item|
+      match item {
         IType(d) -> {
           let types = match find_type(acc.types, d.name.name) {
             Some(_) -> acc.types,
@@ -1240,22 +1339,22 @@ fn new_expander(m: Int, path: Bytes, module: Module) -> Ex = {
   }
 }
 
-fn run_expander(ex: Ex) -> Ex / {abort.raise} =
-  fold(ex.module.items, ex, |acc: Ex, it: Item|
-    match it { IDerive(def) -> one(acc, def), _ -> acc })
+fn run_expander(expander: Expander) -> Expander =
+  fold(expander.module.items, expander, |acc: Expander, item: Item|
+    match item { IDerive(def) -> one(acc, def), _ -> acc })
 
-fn one(ex: Ex, def: DeriveDef) -> Ex / {abort.raise} =
-  match find_type(ex.types, def.target.name) {
-    None -> orphan(ex, def),
+fn one(expander: Expander, def: DeriveDef) -> Expander =
+  match find_type(expander.types, def.target.name) {
+    None -> orphan(expander, def),
     Some(target) -> {
       let name = generated_name(def.deriver, def.target.name);
-      match find_claimed(ex.claimed, name) {
-        Some(prev) -> collision(ex, def, prev, name),
+      match find_claimed(expander.claimed, name) {
+        Some(prev) -> collision(expander, def, prev, name),
         None -> match check_decl(def.deriver, target) {
-          Some(blocker) -> not_derivable(ex, def, blocker),
+          Some(blocker) -> not_derivable(expander, def, blocker),
           None -> {
-            let rt: WithPrefix = runtime_prefix(ex, def);
-            let ex1: Ex = rt.ex;
+            let rt: WithPrefix = runtime_prefix(expander, def);
+            let ex1: Expander = rt.ex;
             match rt.prefix {
               None -> ex1,
               Some(prefix) -> {
@@ -1288,9 +1387,9 @@ fn one(ex: Ex, def: DeriveDef) -> Ex / {abort.raise} =
 // Parsing what was just printed is the deriver's own round-trip check.
 fn parse_generated(source: Bytes, span: Span, count: Int) -> Option<List<FnDef>> / {abort.raise} = {
   let r = parse(source);
-  let x = expand(r.node, r.p.diags);
-  let defs = fold(x.module.items, [], |acc: List<FnDef>, it: Item|
-    match it { IFn(d) -> push(acc, retarget_fn(d, span)), _ -> acc });
+  let x = expand(r.node, r.parser.diags);
+  let defs = fold(x.module.items, [], |acc: List<FnDef>, item: Item|
+    match item { IFn(d) -> push(acc, retarget_fn(d, span)), _ -> acc });
   if len(x.diags) > 0 || len(x.module.items) != count || len(defs) != count { None }
   else { Some(defs) }
 }
@@ -1300,42 +1399,49 @@ fn parse_generated(source: Bytes, span: Span, count: Int) -> Option<List<FnDef>>
 // A type this module derives with a codec deriver, and the derived types its codec calls by name.
 type Calls = { name: Bytes, calls: List<Bytes> }
 
-fn codec_calls(ex: Ex, d: Deriver) -> List<Calls> =
-  match d { DJson -> derived_calls(ex, d), DBin -> derived_calls(ex, d), _ -> [] }
+fn codec_calls(expander: Expander, deriver: Deriver) -> List<Calls> =
+  match deriver {
+    DJson -> derived_calls(expander, deriver),
+    DBin -> derived_calls(expander, deriver),
+    _ -> [],
+  }
 
-fn derived_calls(ex: Ex, d: Deriver) -> List<Calls> = {
-  let targets = fold(ex.module.items, [], |acc: List<TypeDef>, it: Item|
-    match it {
-      IDerive(def) -> if !same_deriver(def.deriver, d) { acc }
-      else { match find_type(ex.types, def.target.name) { Some(t) -> push(acc, t), None -> acc } },
+fn derived_calls(expander: Expander, deriver: Deriver) -> List<Calls> = {
+  let targets = fold(expander.module.items, [], |acc: List<TypeDef>, item: Item|
+    match item {
+      IDerive(def) -> if !same_deriver(def.deriver, deriver) { acc } else {
+        match find_type(expander.types, def.target.name) { Some(t) -> push(acc, t), None -> acc }
+      },
       _ -> acc,
     });
   let names = map(targets, |t: TypeDef| t.name.name);
   map(targets, |t: TypeDef|
-    { name: t.name.name, calls: filter(named_in_def(d, t), |n: Bytes| has(names, n)) })
+    { name: t.name.name, calls: filter(named_in_def(deriver, t), |n: Bytes| has(names, n)) })
 }
 
-fn named_in_def(d: Deriver, t: TypeDef) -> List<Bytes> =
-  match t.body {
-    TDAlias(body) -> named_in(d, body),
+fn named_in_def(deriver: Deriver, type_def: TypeDef) -> List<Bytes> =
+  match type_def.body {
+    TDAlias(body) -> named_in(deriver, body),
     TDSum(variants) ->
-      fold(variants, [], |acc: List<Bytes>, v: VariantDef|
-        fold(v.fields, acc, |inner: List<Bytes>, f: TypeExpr| append(inner, named_in(d, f)))),
+      fold(variants, [], |acc: List<Bytes>, variant: VariantDef|
+        fold(variant.fields, acc, |inner: List<Bytes>, ty: TypeExpr|
+          append(inner, named_in(deriver, ty)))),
   }
 
 // The types `codec` composes through by a name of this module's.
-fn named_in(d: Deriver, te: TypeExpr) -> List<Bytes> =
+fn named_in(deriver: Deriver, te: TypeExpr) -> List<Bytes> =
   match te {
     TCon(c) -> {
-      let inner = fold(c.args, [], |acc: List<Bytes>, a: TypeExpr| append(acc, named_in(d, a)));
-      match con_shape(d, c.name.name.name) {
+      let inner = fold(c.args, [], |acc: List<Bytes>, a: TypeExpr|
+        append(acc, named_in(deriver, a)));
+      match constructor_shape(deriver, c.name.name.name) {
         Nominal -> if is_bare(c.name) { push(inner, c.name.name.name) } else { inner },
         _ -> inner,
       }
     },
     TRecord(r) ->
       fold(r.fields, [], |acc: List<Bytes>, f: { name: Ident, ty: TypeExpr }|
-        append(acc, named_in(d, f.ty))),
+        append(acc, named_in(deriver, f.ty))),
     _ -> [],
   }
 
@@ -1355,19 +1461,19 @@ fn cycle_of(calls: List<Calls>, target: Bytes) -> List<Bytes> =
   filter(reached(calls, target), |n: Bytes| has(reached(calls, n), target))
 
 // How this module writes a name that lives in the deriver's runtime module.
-fn runtime_prefix(ex: Ex, def: DeriveDef) -> WithPrefix / {abort.raise} =
+fn runtime_prefix(expander: Expander, def: DeriveDef) -> WithPrefix =
   match runtime_module(def.deriver) {
-    None -> { ex: ex, prefix: Some(b"") },
-    Some(wanted) -> match find_runtime(ex.runtimes, wanted) {
-      Some(r) -> { ex: ex, prefix: Some(r.prefix) },
-      None -> match find_import(ex.module.imports, wanted) {
+    None -> { ex: expander, prefix: Some(b"") },
+    Some(wanted) -> match find_runtime(expander.runtimes, wanted) {
+      Some(r) -> { ex: expander, prefix: Some(r.prefix) },
+      None -> match find_import(expander.module.imports, wanted) {
         None ->
           {
             ex: report(
-              ex,
-              diag1(
+              expander,
+              error_at(
                 b"E0206",
-                ex.m,
+                expander.m,
                 def.span,
                 bytes_concat_all([
                   b"`",
@@ -1392,7 +1498,7 @@ fn runtime_prefix(ex: Ex, def: DeriveDef) -> WithPrefix / {abort.raise} =
           let bound: { binder: Bytes, added: Option<ImportDecl> } = match import_binder(decl) {
             Some(b) -> { binder: b, added: None },
             None -> {
-              let b = free_binder(ex, def.deriver);
+              let b = free_binder(expander, def.deriver);
               let span = path_span(decl);
               {
                 binder: b,
@@ -1407,8 +1513,12 @@ fn runtime_prefix(ex: Ex, def: DeriveDef) -> WithPrefix / {abort.raise} =
           let prefix = bytes_concat(bound.binder, b"::");
           {
             ex: {
-              ..ex,
-              runtimes: push(ex.runtimes, { wanted: wanted, prefix: prefix, added: bound.added }),
+              ..expander,
+              runtimes: push(expander.runtimes, {
+                wanted: wanted,
+                prefix: prefix,
+                added: bound.added,
+              }),
             },
             prefix: Some(prefix),
           }
@@ -1418,32 +1528,33 @@ fn runtime_prefix(ex: Ex, def: DeriveDef) -> WithPrefix / {abort.raise} =
   }
 
 // A module binder nothing in this file already binds.
-fn free_binder(ex: Ex, d: Deriver) -> Bytes / {abort.raise} = {
-  let path = runtime_path(d);
+fn free_binder(expander: Expander, deriver: Deriver) -> Bytes = {
+  let path = runtime_path(deriver);
   let base = if len(path) == 0 { b"" } else { at(path, len(path) - 1) };
-  iterate(base, len(ex.module.imports) + len(ex.runtimes) + 2, |x: Bytes| {
-    let by_import = fold(ex.module.imports, false, |acc: Bool, i: ImportDecl|
-      acc || (match import_binder(i) { Some(b) -> b == x, None -> false }));
-    let by_runtime = fold(ex.runtimes, false, |acc: Bool, r: Runtime|
-      acc || r.prefix == bytes_concat(x, b"::"));
+  iterate(base, len(expander.module.imports) + len(expander.runtimes) + 2, |x: Bytes| {
+    let by_import = fold(expander.module.imports, false, |acc: Bool, decl: ImportDecl|
+      acc || (match import_binder(decl) { Some(b) -> b == x, None -> false }));
+    let by_runtime = fold(expander.runtimes, false, |acc: Bool, runtime: Runtime|
+      acc || runtime.prefix == bytes_concat(x, b"::"));
     if by_import || by_runtime { Continue(bytes_concat(x, b"_")) } else { Stop(x) }
   })
 }
 
-fn orphan(ex: Ex, def: DeriveDef) -> Ex / {abort.raise} = {
-  let near = fold(ex.types, None, |acc: Option<Bytes>, t: TypeDef|
+fn orphan(expander: Expander, def: DeriveDef) -> Expander = {
+  let near = fold(expander.types, None, |acc: Option<Bytes>, type_def: TypeDef|
     match acc {
       Some(_) -> acc,
-      None -> if eq_ignore_case(t.name.name, def.target.name) { Some(t.name.name) } else { None },
+      None -> if eq_ignore_case(type_def.name.name, def.target.name) { Some(type_def.name.name) }
+      else { None },
     });
   let notes = [
     b"a `derive` may only name a type its own module declares, so that one type has one canonical encoding rather than one per module that thought of it",
   ];
   report(
-    ex,
-    diag1(
+    expander,
+    error_at(
       b"E0208",
-      ex.m,
+      expander.m,
       def.target.span,
       bytes_concat_all([b"`", def.target.name, b"` is not a type this module declares"]),
       b"declared in another module, or not at all",
@@ -1455,7 +1566,7 @@ fn orphan(ex: Ex, def: DeriveDef) -> Ex / {abort.raise} = {
   )
 }
 
-fn collision(ex: Ex, def: DeriveDef, prev: DeriveDef, name: Bytes) -> Ex = {
+fn collision(expander: Expander, def: DeriveDef, prev: DeriveDef, name: Bytes) -> Expander = {
   let note = if prev.target.name == def.target.name {
     bytes_concat_all([
       b"`derive ",
@@ -1476,14 +1587,14 @@ fn collision(ex: Ex, def: DeriveDef, prev: DeriveDef, name: Bytes) -> Ex = {
     ])
   };
   report(
-    ex,
-    diag2(
+    expander,
+    error_at_and(
       b"E0105",
-      ex.m,
+      expander.m,
       def.span,
       bytes_concat_all([b"`", name, b"` is generated twice"]),
       b"this derivation generates it",
-      ex.m,
+      expander.m,
       prev.span,
       b"and so does this one",
       [note],
@@ -1491,7 +1602,7 @@ fn collision(ex: Ex, def: DeriveDef, prev: DeriveDef, name: Bytes) -> Ex = {
   )
 }
 
-fn not_derivable(ex: Ex, def: DeriveDef, b: Blocker) -> Ex = {
+fn not_derivable(expander: Expander, def: DeriveDef, blocker: Blocker) -> Expander = {
   let head = bytes_concat_all([
     b"`derive ",
     deriver_text(def.deriver),
@@ -1499,8 +1610,8 @@ fn not_derivable(ex: Ex, def: DeriveDef, b: Blocker) -> Ex = {
     def.target.name,
     b"` requires every field to be derivable",
   ]);
-  let with_note = match b.note { Some(n) -> [head, n], None -> [head] };
-  let with_variant = match b.variant {
+  let with_note = match blocker.note { Some(n) -> [head, n], None -> [head] };
+  let with_variant = match blocker.variant {
     Some(v) -> push(with_note, bytes_concat_all([b"the field is in variant `", v, b"`"])),
     None -> with_note,
   };
@@ -1513,11 +1624,11 @@ fn not_derivable(ex: Ex, def: DeriveDef, b: Blocker) -> Ex = {
     ]),
   );
   report(
-    ex,
-    diag2(
+    expander,
+    error_at_and(
       b"E0206",
-      ex.m,
-      b.span,
+      expander.m,
+      blocker.span,
       bytes_concat_all([
         b"`",
         deriver_text(def.deriver),
@@ -1525,8 +1636,8 @@ fn not_derivable(ex: Ex, def: DeriveDef, b: Blocker) -> Ex = {
         def.target.name,
         b"`",
       ]),
-      b.reason,
-      ex.m,
+      blocker.reason,
+      expander.m,
       def.span,
       b"required by this derivation",
       notes,
@@ -1534,12 +1645,12 @@ fn not_derivable(ex: Ex, def: DeriveDef, b: Blocker) -> Ex = {
   )
 }
 
-fn internal(ex: Ex, def: DeriveDef, source: Bytes) -> Ex =
+fn internal(expander: Expander, def: DeriveDef, source: Bytes) -> Expander =
   report(
-    ex,
-    diag1(
+    expander,
+    error_at(
       b"E0505",
-      ex.m,
+      expander.m,
       def.span,
       bytes_concat_all([
         b"the `",
@@ -1555,44 +1666,45 @@ fn internal(ex: Ex, def: DeriveDef, source: Bytes) -> Ex =
   )
 
 // Appends the generated definitions and any import a runtime module needed; `path` names the module.
-pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion / {abort.raise} =
-  if !fold(module.items, false, |b: Bool, it: Item|
-      b || (match it { IDerive(_) -> true, _ -> false })) {
+pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion =
+  if !fold(module.items, false, |b: Bool, item: Item|
+      b || (match item { IDerive(_) -> true, _ -> false })) {
     { module: module, derived: [], diags: [] }
   } else {
     let ex = run_expander(new_expander(m, path, module));
-    let added = fold(ex.runtimes, [], |acc: List<ImportDecl>, r: Runtime|
-      match r.added { Some(i) -> push(acc, i), None -> acc });
+    let added = fold(ex.runtimes, [], |acc: List<ImportDecl>, runtime: Runtime|
+      match runtime.added { Some(i) -> push(acc, i), None -> acc });
     {
       module: {
         imports: append(module.imports, added),
-        items: fold(ex.generated, module.items, |acc: List<Item>, g: Generated|
-          append(acc, map(g.defs, |d: FnDef| IFn(d)))),
+        items: fold(ex.generated, module.items, |acc: List<Item>, generated: Generated|
+          append(acc, map(generated.defs, |def: FnDef| IFn(def)))),
       },
-      derived: map(ex.generated, |g: Generated| g.derived),
+      derived: map(ex.generated, |generated: Generated| generated.derived),
       diags: ex.diags,
     }
   }
 
 // The source each of this module's derivations generates, in `derive` order.
-pub fn preview(path: Bytes, module: Module) -> List<Bytes> / {abort.raise} =
-  map(run_expander(new_expander(0, path, module)).generated, |g: Generated| g.source)
+pub fn preview(path: Bytes, module: Module) -> List<Bytes> =
+  map(run_expander(new_expander(0, path, module)).generated, |generated: Generated|
+    generated.source)
 
 // Each module expanded on its own: its generated sources length-prefixed, then its diagnostics.
 pub fn derive_dump(sources: List<Source>) -> String / {abort.raise} = {
   let out = fold(range(0, len(sources)), b"", |acc: Bytes, i: Int| {
     let s = at(sources, i);
     let r = parse(s.src);
-    let x = expand(r.node, r.p.diags);
+    let x = expand(r.node, r.parser.diags);
     let generated = preview(s.name, x.module);
     let d: Expansion = expand_derives(i, s.name, x.module);
     bytes_concat_all([
       acc,
       b"M;",
-      num(len(generated)),
+      int_to_bytes(len(generated)),
       b";",
       bytes_concat_all(
-        map(generated, |g: Bytes| bytes_concat_all([b"S;", num(bytes_len(g)), b";", g])),
+        map(generated, |g: Bytes| bytes_concat_all([b"S;", int_to_bytes(bytes_len(g)), b";", g])),
       ),
       dump_diags(d.diags),
     ])
@@ -1702,20 +1814,20 @@ test "every span in a generated definition is the derive item's" {
 
 test "an orphan, a collision, a missing runtime and a refused field each report as the reference does" {
   let orphan_ = expand_derives(0, b"t", parse(b"import std.json\nderive json for Order").node);
-  assert_eq(map(orphan_.diags, |d: Diag| d.code), [b"E0208"]);
+  assert_eq(map(orphan_.diags, |diag: Diag| diag.code), [b"E0208"]);
   let twice = expand_derives(
     0,
     b"t",
     parse(b"type Order = {id: Int}\nderive eq for Order\nderive eq for Order").node,
   );
-  assert_eq(map(twice.diags, |d: Diag| d.code), [b"E0105"]);
+  assert_eq(map(twice.diags, |diag: Diag| diag.code), [b"E0105"]);
   assert_eq(len(at(twice.diags, 0).labels), 2);
   let missing = expand_derives(
     0,
     b"t",
     parse(b"type Order = {id: Int}\nderive json for Order").node,
   );
-  assert_eq(map(missing.diags, |d: Diag| d.code), [b"E0206"]);
+  assert_eq(map(missing.diags, |diag: Diag| diag.code), [b"E0206"]);
   let refused = expand_derives(
     0,
     b"t",
@@ -1723,7 +1835,7 @@ test "an orphan, a collision, a missing runtime and a refused field each report 
       b"import std.json\ntype Order = {id: Int, on_complete: (Int) -> Unit}\nderive json for Order",
     ).node,
   );
-  assert_eq(map(refused.diags, |d: Diag| d.code), [b"E0206"]);
+  assert_eq(map(refused.diags, |diag: Diag| diag.code), [b"E0206"]);
   let first = at(at(refused.diags, 0).labels, 0);
   assert_eq(first.start, 39);
   assert_eq(first.end, 65)

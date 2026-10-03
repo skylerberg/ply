@@ -1,12 +1,12 @@
-use ply_eval::{CheckOutput, Diagnostic, Front, Machine, ModuleName, Provider, SourceId};
+use ply_eval::{Analysis, CheckOutput, Diagnostic, Machine, ModuleName, Provider, SourceId};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 /// `sources[i]` is `(module name, text)` for `SourceId(i)`.
 #[track_caller]
-pub fn port_front(sources: &[(&str, &str)]) -> Front {
+pub fn port_front(sources: &[(&str, &str)]) -> Analysis {
     let (named, ids) = inputs(sources);
-    ply_codegen::c::producer::checked_front(&named, &ids)
+    ply_codegen::c::producer::checked_analysis(&named, &ids)
         .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
 }
 
@@ -44,7 +44,7 @@ fn inputs(sources: &[(&str, &str)]) -> (Vec<(String, String)>, Vec<SourceId>) {
 }
 
 pub struct Compiled {
-    pub front: Front,
+    pub front: Analysis,
     /// Keyed by `m.name.to_string()`: the Ply emitter re-parses source text, not the AST.
     pub texts: HashMap<String, String>,
 }
@@ -110,9 +110,9 @@ impl Compiled {
     /// The unit over every definition, loaded bare, so a test enters its bodies without a machine.
     pub fn native(&self) -> ply_codegen::c::Native {
         ply_codegen::c::producer::ensure_default();
-        let front: &'static Front = Box::leak(Box::new(self.front.clone()));
+        let front: &'static Analysis = Box::leak(Box::new(self.front.clone()));
         let source: &'static ply_codegen::Source = Box::leak(Box::new(
-            ply_codegen::Source::from_front(front).with_texts(self.texts.clone()),
+            ply_codegen::Source::from_analysis(front).with_texts(self.texts.clone()),
         ));
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();

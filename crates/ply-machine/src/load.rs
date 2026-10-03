@@ -4,7 +4,7 @@ use crate::driver::FrontEnd;
 pub use crate::driver::Seeded;
 use ply_codegen::c::producer::KnownRows;
 use ply_eval::{
-    CheckOutput, DefInfo, Diagnostic, Front, HashOutput, ModuleInfo, ModuleName, SourceId,
+    Analysis, CheckOutput, DefInfo, Diagnostic, HashOutput, ModuleInfo, ModuleName, SourceId,
     SourceMap, Span, Symbol, TestInfo, codes,
 };
 use std::path::{Component, Path, PathBuf};
@@ -23,10 +23,10 @@ pub struct Loaded {
     pub files: Vec<Found>,
     pub sources: SourceMap,
     /// Handed to `ply_codegen::Unit::over_front` so one invocation runs one front end.
-    pub front: std::sync::Arc<Front>,
-    /// [`Front::check`].
+    pub front: std::sync::Arc<Analysis>,
+    /// [`Analysis::check`].
     pub check: CheckOutput,
-    /// [`Front::hashes`].
+    /// [`Analysis::hashes`].
     pub hashes: HashOutput,
     pub frontend: FrontEnd,
 }

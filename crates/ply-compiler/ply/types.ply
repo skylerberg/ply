@@ -1,595 +1,1541 @@
-// Type expressions, generics and effect rows.
+// The type language, unification, the type environment and the type printer `infer.ply` checks with.
 
-import spine (push_front, positional, Span, Ident, QName, Ctx, P, R, Ate, Acc, PDiag, span_to,
-              dummy_span, no_ident, no_qname, unexpected, diag1, push_diag, error_here, unclosed,
-              kind, kind_at, cur_span, span_at, prev_span, at, at_eof, at_ident_text, starts_upper,
-              advance, bump, eat, expect, expect_close, expect_ident, expect_field_name, expect_gt,
-              with_no_brace, deeper, shallower, qname, comma_list, settle, failed, t_lparen,
-              t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket, t_comma, t_colon, t_dot,
-              t_arrow, t_lt, t_gt, t_ge, t_pipe, t_slash, t_star, num, rec, nlist, opt, payload,
-              word, dump_list, dump_opt, dump_ident, dump_qname, dump_diags, start)
-import lexer (Tok, TIdent, TPunct)
+import type_syntax (Mode, MRead, MWrite, MBad)
 
-// --- The AST ----------------------------------------------------------------
+// --- Atoms and rows ---------------------------------------------------------------
 
-// Fields stay inline records: a named record alias mutually recursive with an ADT is an unexercised shape.
-pub type TypeExpr =
-  | TVar(Ident)
-  | TCon({ span: Span, name: QName, args: List<TypeExpr> })
-  | TFn({ span: Span, params: List<TypeExpr>, ret: TypeExpr, effects: Option<RowExpr> })
-  | TRecord({ span: Span, fields: List<{ name: Ident, ty: TypeExpr }> })
-  | TUnit({ span: Span })
-  // A placeholder no parse produces, so a leaked one shows up as a mismatch rather than agreeing with a real node.
-  | TBad({ span: Span })
+// `RVar` is a label a definition is generic over: the id is a type variable, bound to `label_type`.
+pub type Resource = | RNamed(Bytes) | RSingleton | RVar(Int) | RAny
 
-pub type Mode = | MRead | MWrite | MBad
+// `op: None` is the mode atom `effect.mode[resource]`; `Some` names one operation of that effect.
+pub type Atom = { effect: Bytes, resource: Resource, mode: Mode, op: Option<Bytes> }
 
-// `op: Some` names an operation instead of a mode.
-pub type AtomExpr = {
-  eff: QName,
-  mode: Mode,
-  op: Option<Ident>,
-  resource: Option<Ident>,
-  // `[*]`: the atom stands for the operation on every label, which is how a row says what a
-  // handler consumes.
-  every: Bool,
-  // `bounded`: a definition's row promises the atom a number of performs no input decides.
-  bounded: Bool,
-  span: Span,
-}
+// `atoms` stays sorted by `atom_lt` and duplicate-free.
+pub type Row = { atoms: List<Atom>, tail: Option<Int> }
 
-// `tail_bounded`: the row variable's effects are performed a number of times no input decides.
-pub type RowExpr = {
-  atoms: List<AtomExpr>,
-  aliases: List<QName>,
-  tail: Option<Ident>,
-  tail_bounded: Bool,
-  span: Span,
-}
+pub fn bytes_lt(a: Bytes, b: Bytes) -> Bool = match compare(a, b) { Less -> true, _ -> false }
 
-pub type RowMember = | RMAtom(AtomExpr) | RMSet(QName)
-
-// `labels` are the bracketed binders: `fn relay<[l] | e>(..)`.
-pub type Generics = { types: List<Ident>, effects: List<Ident>, labels: List<Ident> }
-
-pub fn ty_span(t: TypeExpr) -> Span =
-  match t {
-    TVar(i) -> i.span,
-    TCon(x) -> x.span,
-    TFn(x) -> x.span,
-    TRecord(x) -> x.span,
-    TUnit(x) -> x.span,
-    TBad(x) -> x.span,
-  }
-
-pub fn no_ty() -> TypeExpr = TBad({ span: dummy_span() })
-
-pub fn no_row() -> RowExpr =
-  { atoms: [], aliases: [], tail: None, tail_bounded: false, span: dummy_span() }
-
-pub fn no_atom() -> AtomExpr =
-  {
-    eff: no_qname(),
-    mode: MBad,
-    op: None,
-    resource: None,
-    every: false,
-    bounded: false,
-    span: dummy_span(),
-  }
-
-pub fn no_generics() -> Generics = { types: [], effects: [], labels: [] }
-
-fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(m) -> false }
-
-// --- Modes ------------------------------------------------------------------
-
-// `read` and `write` are contextual: lexed as identifiers and reserved nowhere.
-pub fn mode(c: Ctx, p: P) -> Result<R<Mode>, P> / {abort.raise} =
-  if at_ident_text(c, p, b"read") { Ok({ p: bump(c, p), node: MRead }) }
-  else if at_ident_text(c, p, b"write") { Ok({ p: bump(c, p), node: MWrite }) }
-  else { Err(error_here(c, p, b"`read` or `write` to start an operation")) }
-
-// --- Type expressions -------------------------------------------------------
-
-// `{` in a type always opens a record. No `?`: `no_brace` must be restored on the error path too.
-pub fn ty(c: Ctx, p: P) -> Result<R<TypeExpr>, P> / {abort.raise} =
-  match ty_inner(c, with_no_brace(p, false)) {
-    Err(q) -> Err(with_no_brace(q, p.no_brace)),
-    Ok(r) -> Ok({ p: with_no_brace(r.p, p.no_brace), node: r.node }),
-  }
-
-// No `?` on `ty_body`: `shallower` must run on both paths.
-fn ty_inner(c: Ctx, p: P) -> Result<R<TypeExpr>, P> / {abort.raise} = {
-  let d = deeper(c, p)?;
-  match ty_body(c, d) {
-    Err(q) -> Err(shallower(q)),
-    Ok(r) -> Ok({ p: shallower(r.p), node: r.node }),
-  }
-}
-
-fn ty_body(c: Ctx, p: P) -> Result<R<TypeExpr>, P> / {abort.raise} = {
-  let st = cur_span(c, p);
-  match kind(c, p) {
-    TPunct(s) -> if s == b"lparen" { ty_paren(c, p, st) }
-    else if s == b"lbrace" { ty_record(c, p) }
-    else { Err(error_here(c, p, b"a type")) },
-    TIdent(n) -> ty_named(c, p, st),
-    _ -> Err(error_here(c, p, b"a type")),
-  }
-}
-
-fn ty_paren(c: Ctx, p: P, st: Span) -> Result<R<TypeExpr>, P> / {abort.raise} = {
-  let o = advance(c, p);
-  if at(c, o.p, t_rparen()) {
-    let cl = advance(c, o.p);
-    let ar = eat(c, cl.p, t_arrow());
-    if ar.ok { fn_ty(c, ar.p, [], st) }
-    else { Ok({ p: ar.p, node: TUnit({ span: span_to(o.node, cl.node) }) }) }
-  } else {
-    let ps = comma_list(c, o.p, t_rparen(), ty)?;
-    let cl = expect_close(c, ps.p, t_rparen(), o.node, b"`)`")?;
-    let ar = eat(c, cl.p, t_arrow());
-    if ar.ok { fn_ty(c, ar.p, ps.node, st) } else {
-      match ps.node {
-        [only] -> Ok({ p: ar.p, node: only }),
-        // Two or more make a tuple: the record `{_0: A, _1: B}` over the elements' spans.
-        items ->
-          Ok({
-            p: ar.p,
-            node: TRecord({
-              span: span_to(o.node, cl.node),
-              fields: map(range(0, len(items)), |i: Int| -> { name: Ident, ty: TypeExpr } {
-                match list_at(items, i) {
-                  Some(t) -> { name: positional(i, ty_span(t)), ty: t },
-                  None -> { name: positional(i, o.node), ty: TUnit({ span: o.node }) },
-                }
-              }),
-            }),
-          }),
-      }
-    }
-  }
-}
-
-fn ty_record(c: Ctx, p: P) -> Result<R<TypeExpr>, P> / {abort.raise} = {
-  let o = advance(c, p);
-  let { p, node: fs } = comma_list(c, o.p, t_rbrace(), ty_field)?;
-  let { p, node: cl } = expect_close(c, p, t_rbrace(), o.node, b"`}`")?;
-  Ok({ p: p, node: TRecord({ span: span_to(o.node, cl), fields: fs }) })
-}
-
-fn ty_named(c: Ctx, p: P, st: Span) -> Result<R<TypeExpr>, P> / {abort.raise} = {
-  let q = qname(c, p, b"a type")?;
-  if at(c, q.p, t_lt()) {
-    let o = advance(c, q.p);
-    let args = comma_list(c, o.p, t_gt(), ty)?;
-    let cl = expect_gt(c, args.p, b"`>` to close the type arguments")?;
-    Ok({ p: cl.p, node: TCon({ span: span_to(st, cl.node), name: q.node, args: args.node }) })
-  }
-  // Type parameters are never qualified, so only a bare lowercase name is one.
-  else if is_bare(q.node) && !starts_upper(q.node.name.name) {
-    Ok({ p: q.p, node: TVar(q.node.name) })
-  } else { Ok({ p: q.p, node: TCon({ span: q.node.span, name: q.node, args: [] }) }) }
-}
-
-fn fn_ty(c: Ctx, p: P, params: List<TypeExpr>, st: Span) -> Result<R<TypeExpr>, P> / {abort.raise} = {
-  let { p, node: r } = ty(c, p)?;
-  let sl = eat(c, p, t_slash());
-  if !sl.ok {
-    Ok({
-      p: sl.p,
-      node: TFn({ span: span_to(st, ty_span(r)), params: params, ret: r, effects: None }),
-    })
-  } else {
-    let { p, node: e } = row(c, sl.p)?;
-    Ok({ p: p, node: TFn({ span: span_to(st, e.span), params: params, ret: r, effects: Some(e) }) })
-  }
-}
-
-fn ty_field(c: Ctx, p: P) -> Result<R<{ name: Ident, ty: TypeExpr }>, P> / {abort.raise} = {
-  let { p, node: f } = expect_field_name(c, p, b"a field name")?;
-  let n = f.name;
-  let { p, .. } = expect(c, p, t_colon(), b"`:` after the field name")?;
-  let { p, node: t } = ty(c, p)?;
-  Ok({ p: p, node: { name: n, ty: t } })
-}
-
-// --- Effect rows ------------------------------------------------------------
-
-// Each round grows one list, and each literal writes that list last, or it is copied instead of updated in place.
-type RowAcc = { p: P, aliases: List<QName>, atoms: List<AtomExpr> }
-
-type RowOut = { aliases: List<QName>, atoms: List<AtomExpr> }
-
-pub fn row(c: Ctx, p: P) -> Result<R<RowExpr>, P> / {abort.raise} = {
-  let st = cur_span(c, p);
-  if at(c, p, t_lbrace()) { row_braced(c, p, st) } else {
-    // A bare name is a row variable: a set is only ever written inside braces.
-    let { p, node: t } = expect_ident(c, p, b"an effect row: `{..}` or a row variable")?;
-    let b = bounded_word(c, p);
-    let sp = if b.node { span_to(t.span, prev_span(c, b.p)) } else { t.span };
-    Ok({ p: b.p, node: { atoms: [], aliases: [], tail: Some(t), tail_bounded: b.node, span: sp } })
-  }
-}
-
-fn row_braced(c: Ctx, p: P, st: Span) -> Result<R<RowExpr>, P> / {abort.raise} = {
-  let o = advance(c, p);
-  let { p, node: ms } = row_members(c, o.p, o.node)?;
-  let pi = eat(c, p, t_pipe());
-  let opt_tail = if pi.ok { expect_ident(c, pi.p, b"an effect row variable after `|`") }
-  else { Ok({ p: pi.p, node: no_ident() }) };
-  let { p, node: tl } = opt_tail?;
-  let b = if pi.ok { bounded_word(c, p) } else { { p: p, node: false } };
-  let { p, node: cl } = expect_close(c, b.p, t_rbrace(), o.node, b"`}` to close the effect row")?;
-  Ok({
-    p: p,
-    node: {
-      atoms: ms.atoms,
-      aliases: ms.aliases,
-      tail: if pi.ok { Some(tl) } else { None },
-      tail_bounded: b.node,
-      span: span_to(st, cl),
+fn resource_lt(a: Resource, b: Resource) -> Bool =
+  match a {
+    RNamed(x) -> match b {
+      RNamed(y) -> bytes_lt(x, y),
+      RVar(_) -> true,
+      RSingleton -> true,
+      RAny -> false,
     },
-  })
+    RVar(x) -> match b { RNamed(_) -> false, RVar(y) -> x < y, RSingleton -> true, RAny -> false },
+    RSingleton -> false,
+    RAny -> false,
+  }
+
+// Whether `a` stands for every ground label `b` can be: `RAny` is what a handler clause written
+// `[*]` discharges, and it is never equal to a label, only broader than one.
+pub fn resource_covers(a: Resource, b: Resource) -> Bool =
+  match a {
+    RAny -> true,
+    RNamed(x) -> match b { RNamed(y) -> x == y, _ -> false },
+    RVar(x) -> match b { RVar(y) -> x == y, _ -> false },
+    RSingleton -> match b { RSingleton -> true, _ -> false },
+  }
+
+fn mode_rank(mode: Mode) -> Int = match mode { MRead -> 0, MWrite -> 1, MBad -> 2 }
+
+fn op_lt(a: Option<Bytes>, b: Option<Bytes>) -> Bool =
+  match a {
+    None -> match b { Some(_) -> true, None -> false },
+    Some(x) -> match b { Some(y) -> bytes_lt(x, y), None -> false },
+  }
+
+pub fn atom_lt(a: Atom, b: Atom) -> Bool =
+  bytes_lt(a.effect, b.effect)
+    || (a.effect == b.effect
+    && (resource_lt(a.resource, b.resource)
+    || (a.resource == b.resource
+    && (mode_rank(a.mode) < mode_rank(b.mode)
+    || (mode_rank(a.mode) == mode_rank(b.mode) && op_lt(a.op, b.op))))))
+
+// The mode atom of an effect and resource covers every operation atom of the same mode, on a
+// resource it covers.
+pub fn atom_covers(a: Atom, b: Atom) -> Bool =
+  a.effect == b.effect && resource_covers(a.resource, b.resource)
+    && (a == b
+    || (match a.op {
+      // A mode atom covers every operation of its mode; an operation covers the same operation,
+      // which is what lets a row written `op[*]` cover `op[any label]`.
+      None -> mode_rank(a.mode) == mode_rank(b.mode),
+      Some(_) -> a.op == b.op,
+    }))
+
+pub fn atoms_covered(atoms: List<Atom>, x: Atom) -> Bool =
+  fold(atoms, false, |acc: Bool, y: Atom| acc || atom_covers(y, x))
+
+// An atom that permits rather than names: `op[*]` permits its operation on every label, and a
+// mode atom permits every operation of its mode. A row written with one is a licence, so a
+// narrower row satisfies it.
+fn permits_only(atom: Atom) -> Bool =
+  match atom.resource { RAny -> true, _ -> match atom.op { None -> true, Some(_) -> false } }
+
+pub fn almost_covered(found: List<Atom>, atom: Atom) -> Bool =
+  atoms_covered(found, atom) || permits_only(atom)
+
+pub fn atom_conflicts(a: Atom, b: Atom) -> Bool =
+  a.effect == b.effect && a.resource == b.resource
+    && (mode_rank(a.mode) == 1 || mode_rank(b.mode) == 1)
+
+// Keeps the list sorted and duplicate-free.
+pub fn atoms_insert(atoms: List<Atom>, atom: Atom) -> List<Atom> = {
+  let n = len(atoms);
+  let i = fold(range(0, n), n, |acc: Int, j: Int|
+    if acc < n { acc }
+    else if atom_lt(atom, at(atoms, j)) || at(atoms, j) == atom { j }
+    else { acc });
+  if i < n && at(atoms, i) == atom { atoms }
+  else { append(push(take(atoms, i), atom), drop(atoms, i)) }
 }
 
-// The contextual word after an atom or a row variable.
-fn bounded_word(c: Ctx, p: P) -> R<Bool> =
-  if at_ident_text(c, p, b"bounded") { { p: advance(c, p).p, node: true } }
-  else { { p: p, node: false } }
+pub fn atoms_union(a: List<Atom>, b: List<Atom>) -> List<Atom> =
+  fold(b, a, |acc: List<Atom>, atom: Atom| atoms_insert(acc, atom))
 
-// Not `comma_list`: it stops on `}` or `|` and sorts members into two lists.
-fn row_members(c: Ctx, p: P, open: Span) -> Result<R<RowOut>, P> / {abort.raise} =
-  iterate({ p: p, aliases: [], atoms: [] }, c.ntok - p.pos + 1, |s: RowAcc|
-    if at(c, s.p, t_rbrace()) || at(c, s.p, t_pipe()) {
-      Stop(Ok({ p: s.p, node: { aliases: s.aliases, atoms: s.atoms } }))
-    } else if at_eof(c, s.p) { Stop(Err(unclosed(c, s.p, open, b"`}` to close the effect row"))) }
-    else {
-      match row_member(c, s.p) {
-        Err(q) -> Stop(Err(q)),
-        Ok(m) -> {
-          let e = eat(c, m.p, t_comma());
-          match m.node {
-            RMAtom(a) -> if e.ok {
-              Continue({ p: e.p, aliases: s.aliases, atoms: push(s.atoms, a) })
-            } else { Stop(Ok({ p: e.p, node: { aliases: s.aliases, atoms: push(s.atoms, a) } })) },
-            RMSet(q) -> if e.ok {
-              Continue({ p: e.p, atoms: s.atoms, aliases: push(s.aliases, q) })
-            } else { Stop(Ok({ p: e.p, node: { atoms: s.atoms, aliases: push(s.aliases, q) } })) },
+// Ordered by `atom_lt` and each atom once, as inserting them one at a time leaves them, by merging.
+pub fn atoms_sorted(atoms: List<Atom>) -> List<Atom> = {
+  let n = len(atoms);
+  if n < 2 { atoms }
+  else { atoms_merged(atoms_sorted(take(atoms, n / 2)), atoms_sorted(drop(atoms, n / 2))) }
+}
+
+fn atoms_merged(a: List<Atom>, b: List<Atom>) -> List<Atom> = {
+  let last = |out: List<Atom>, atom: Atom|
+    if len(out) > 0 && at(out, len(out) - 1) == atom { out } else { push(out, atom) };
+  iterate({ i: 0, j: 0, out: [] }, len(a) + len(b) + 1, |s: { i: Int, j: Int, out: List<Atom> }|
+    if s.i >= len(a) {
+      Stop(fold(range(s.j, len(b)), s.out, |out: List<Atom>, k: Int| last(out, at(b, k))))
+    } else if s.j >= len(b) {
+      Stop(fold(range(s.i, len(a)), s.out, |out: List<Atom>, k: Int| last(out, at(a, k))))
+    } else if atom_lt(at(b, s.j), at(a, s.i)) {
+      Continue({ ..s, j: s.j + 1, out: last(s.out, at(b, s.j)) })
+    } else { Continue({ ..s, i: s.i + 1, out: last(s.out, at(a, s.i)) }) })
+}
+
+pub fn atoms_contains(atoms: List<Atom>, x: Atom) -> Bool =
+  fold(atoms, false, |acc: Bool, y: Atom| acc || y == x)
+
+pub fn atoms_difference(a: List<Atom>, b: List<Atom>) -> List<Atom> =
+  filter(a, |atom: Atom| !atoms_contains(b, atom))
+
+pub fn row_empty() -> Row = { atoms: [], tail: None }
+pub fn row_open(v: Int) -> Row = { atoms: [], tail: Some(v) }
+pub fn row_closed(atoms: List<Atom>) -> Row =
+  { atoms: fold(atoms, [], |acc: List<Atom>, atom: Atom| atoms_insert(acc, atom)), tail: None }
+pub fn row_singleton(atom: Atom) -> Row = { atoms: [atom], tail: None }
+pub fn row_is_pure(row: Row) -> Bool =
+  len(row.atoms) == 0 && (match row.tail { None -> true, Some(_) -> false })
+
+// A raise changes no state and answers alike for equal calls, so what asks only that, such as a
+// spec, a memoized constant or a generated function, ignores it.
+pub fn without_abort(atoms: List<Atom>) -> List<Atom> =
+  filter(atoms, |atom: Atom| atom.effect != b"abort")
+
+// Divergence: a definition whose recursion no measure is seen to descend. It names no operation, so
+// it is written, and printed, as the bare `div`.
+pub fn div_atom() -> Atom = { effect: b"div", resource: RSingleton, mode: MRead, op: None }
+
+pub fn is_div(atom: Atom) -> Bool = atom.effect == b"div"
+
+pub fn row_is_pure_but_raise(row: Row) -> Bool =
+  row_is_pure({ ..row, atoms: without_abort(row.atoms) })
+
+pub fn row_union(a: Row, b: Row) -> Row / {abort.raise} =
+  { atoms: atoms_union(a.atoms, b.atoms), tail: match a.tail { Some(_) -> a.tail, None -> b.tail } }
+
+pub fn row_without(row: Row, removed: List<Atom>) -> Row =
+  { atoms: atoms_difference(row.atoms, removed), tail: row.tail }
+
+pub fn row_without_covered(row: Row, removed: List<Atom>) -> Row =
+  { atoms: filter(row.atoms, |atom: Atom| !atoms_covered(removed, atom)), tail: row.tail }
+
+// --- Types -------------------------------------------------------------------------
+
+pub type Field = { name: Bytes, ty: Type }
+
+pub type Type =
+  | TyVar(Int)
+  | TyCon({ name: Bytes, args: List<Type> })
+  | TyFn({ params: List<Type>, ret: Type, effects: Row })
+  // Sorted by field name.
+  | TyRecord(List<Field>)
+
+pub type Scheme = { ty_vars: List<Int>, row_vars: List<Int>, label_vars: List<Int>, ty: Type }
+
+pub fn named_type(name: Bytes) -> Type = TyCon({ name: name, args: [] })
+pub fn applied_type(name: Bytes, ty: Type) -> Type = TyCon({ name: name, args: [ty] })
+pub fn int_type() -> Type = named_type(b"Int")
+pub fn bool_type() -> Type = named_type(b"Bool")
+pub fn string_type() -> Type = named_type(b"String")
+pub fn bytes_type() -> Type = named_type(b"Bytes")
+pub fn float_type() -> Type = named_type(b"Float")
+pub fn decimal_type() -> Type = named_type(b"Decimal")
+pub fn unit_type() -> Type = named_type(b"Unit")
+pub fn list_type(ty: Type) -> Type = applied_type(b"List", ty)
+pub fn option_type(ty: Type) -> Type = applied_type(b"Option", ty)
+pub fn map_type(k: Type, v: Type) -> Type = TyCon({ name: b"Map", args: [k, v] })
+pub fn iter_type(s: Type, r: Type) -> Type = TyCon({ name: b"Iter", args: [s, r] })
+pub fn secret_type(ty: Type) -> Type = applied_type(b"Secret", ty)
+pub fn fn_type(params: List<Type>, ret: Type, effects: Row) -> Type =
+  TyFn({ params: params, ret: ret, effects: effects })
+pub fn monomorphic(ty: Type) -> Scheme = { ty_vars: [], row_vars: [], label_vars: [], ty: ty }
+
+pub fn fields_sorted(fields: List<Field>) -> List<Field> =
+  fold(fields, [], |acc: List<Field>, field: Field| field_insert(acc, field))
+
+// A later field of the same name replaces the earlier one.
+fn field_insert(sorted: List<Field>, field: Field) -> List<Field> = {
+  let n = len(sorted);
+  let i = fold(range(0, n), n, |acc: Int, j: Int|
+    if acc < n { acc } else if !bytes_lt(at(sorted, j).name, field.name) { j } else { acc });
+  if i < n && at(sorted, i).name == field.name { set_at(sorted, i, field) }
+  else { append(push(take(sorted, i), field), drop(sorted, i)) }
+}
+
+pub fn field_get(fields: List<Field>, name: Bytes) -> Option<Type> =
+  fold(fields, None, |acc: Option<Type>, field: Field|
+    match acc { Some(_) -> acc, None -> if field.name == name { Some(field.ty) } else { None } })
+
+pub fn mentions_secret(t: Type) -> Bool =
+  match t {
+    TyCon(c) ->
+      c.name == b"Secret" || fold(c.args, false, |acc: Bool, a: Type| acc || mentions_secret(a)),
+    TyFn(f) ->
+      fold(f.params, false, |acc: Bool, p: Type| acc || mentions_secret(p))
+        || mentions_secret(f.ret),
+    TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
+    TyVar(_) -> false,
+  }
+
+// Two or more fields named exactly `_0`, `_1`, ... with none missing.
+pub fn tuple_arity(fields: List<Field>) -> Option<Int> = {
+  let n = len(fields);
+  if n < 2 { None } else {
+    let all = fold(range(0, n), true, |acc: Bool, i: Int|
+      acc
+        && (match field_get(fields, bytes_concat(b"_", bytes_of_string(int_to_string(i)))) {
+          Some(_) -> true,
+          None -> false,
+        }));
+    if all { Some(n) } else { None }
+  }
+}
+
+// --- Small list helpers ---------------------------------------------------------------
+
+pub fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the checker does not hold") }
+
+pub fn set_at<a>(xs: List<a>, i: Int, v: a) -> List<a> / {abort.raise} = list_set(xs, i, v)
+
+pub fn take<a>(xs: List<a>, n: Int) -> List<a> / {abort.raise} =
+  map(range(0, n), |i: Int| at(xs, i))
+
+pub fn drop<a>(xs: List<a>, n: Int) -> List<a> / {abort.raise} =
+  map(range(n, len(xs)), |i: Int| at(xs, i))
+
+pub fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
+
+pub fn contains_int(xs: List<Int>, v: Int) -> Bool =
+  fold(xs, false, |acc: Bool, x: Int| acc || x == v)
+
+pub fn contains_bytes(xs: List<Bytes>, v: Bytes) -> Bool =
+  fold(xs, false, |acc: Bool, x: Bytes| acc || x == v)
+
+pub fn ints_insert(xs: List<Int>, v: Int) -> List<Int> / {abort.raise} = {
+  let n = len(xs);
+  let i = fold(range(0, n), n, |acc: Int, j: Int|
+    if acc < n { acc } else if at(xs, j) >= v { j } else { acc });
+  if i < n && at(xs, i) == v { xs } else { append(push(take(xs, i), v), drop(xs, i)) }
+}
+
+pub fn ints_union(a: List<Int>, b: List<Int>) -> List<Int> / {abort.raise} =
+  fold(b, a, |acc: List<Int>, v: Int| ints_insert(acc, v))
+
+pub fn ints_difference(a: List<Int>, b: List<Int>) -> List<Int> =
+  filter(a, |v: Int| !contains_int(b, v))
+
+// --- Fresh variables and the substitution -----------------------------------------------
+
+pub type Fresh = { next_ty: Int, next_row: Int }
+
+pub fn fresh_new() -> Fresh = { next_ty: 0, next_row: 0 }
+
+pub fn fresh_ty_var(fresh: Fresh) -> { fresh: Fresh, var: Int } =
+  { fresh: { next_ty: fresh.next_ty + 1, next_row: fresh.next_row }, var: fresh.next_ty }
+pub fn fresh_ty(fresh: Fresh) -> { fresh: Fresh, ty: Type } = {
+  let o = fresh_ty_var(fresh);
+  { fresh: o.fresh, ty: TyVar(o.var) }
+}
+pub fn fresh_row_var(fresh: Fresh) -> { fresh: Fresh, var: Int } =
+  { fresh: { next_ty: fresh.next_ty, next_row: fresh.next_row + 1 }, var: fresh.next_row }
+pub fn fresh_row(fresh: Fresh) -> { fresh: Fresh, row: Row } = {
+  let o = fresh_row_var(fresh);
+  { fresh: o.fresh, row: row_open(o.var) }
+}
+
+pub type Subst = {
+  ty: Map<Int, Type>,
+  row: Map<Int, Row>,
+  rigid_ty: Map<Int, Bool>,
+  rigid_row: Map<Int, Bool>,
+}
+
+pub fn subst_new() -> Subst =
+  { ty: map_new(), row: map_new(), rigid_ty: map_new(), rigid_row: map_new() }
+
+pub fn mark_rigid_ty(subst: Subst, v: Int) -> Subst =
+  {
+    ty: subst.ty,
+    row: subst.row,
+    rigid_ty: map_insert(subst.rigid_ty, v, true),
+    rigid_row: subst.rigid_row,
+  }
+pub fn mark_rigid_row(subst: Subst, v: Int) -> Subst =
+  {
+    ty: subst.ty,
+    row: subst.row,
+    rigid_ty: subst.rigid_ty,
+    rigid_row: map_insert(subst.rigid_row, v, true),
+  }
+pub fn is_rigid_ty(subst: Subst, v: Int) -> Bool = map_contains(subst.rigid_ty, v)
+pub fn is_rigid_row(subst: Subst, v: Int) -> Bool = map_contains(subst.rigid_row, v)
+
+// The budget cannot run out: bindings never form a cycle, so a chain is at most `map_len(s.ty)` long.
+pub fn shallow(subst: Subst, ty: Type) -> Type =
+  iterate(ty, map_len(subst.ty) + 2, |cur: Type|
+    match cur {
+      TyVar(v) -> match map_get(subst.ty, v) { Some(next) -> Continue(next), None -> Stop(cur) },
+      _ -> Stop(cur),
+    })
+
+pub fn resolve_ty(subst: Subst, t: Type) -> Type =
+  match shallow(subst, t) {
+    TyVar(v) -> TyVar(v),
+    TyCon(c) -> TyCon({ name: c.name, args: map(c.args, |a: Type| resolve_ty(subst, a)) }),
+    TyFn(f) ->
+      TyFn({
+        params: map(f.params, |p: Type| resolve_ty(subst, p)),
+        ret: resolve_ty(subst, f.ret),
+        effects: resolve_row(subst, f.effects),
+      }),
+    TyRecord(fs) -> TyRecord(map(fs, |f: Field| { name: f.name, ty: resolve_ty(subst, f.ty) })),
+  }
+
+pub fn resolved_tail(subst: Subst, row: Row) -> Option<Int> = {
+  let bound = map_len(subst.row);
+  iterate({ tail: row.tail, hops: 0 }, bound + 2, |st: { tail: Option<Int>, hops: Int }|
+    match st.tail {
+      None -> Stop(None),
+      Some(v) -> match map_get(subst.row, v) {
+        Some(next) -> if next.tail == Some(v) { Stop(Some(v)) }
+        else if st.hops + 1 > bound { Stop(next.tail) }
+        else { Continue({ tail: next.tail, hops: st.hops + 1 }) },
+        None -> Stop(Some(v)),
+      },
+    })
+}
+
+// A label variable bound since the atom was built may now name the same resource as another atom,
+// so the atoms are rebuilt through `atoms_insert` rather than kept.
+pub fn resolve_row(subst: Subst, row: Row) -> Row = {
+  let bound = map_len(subst.row);
+  let walked = iterate(
+    { atoms: row.atoms, tail: row.tail, seen: [] },
+    bound + 2,
+    |st: { atoms: List<Atom>, tail: Option<Int>, seen: List<Int> }|
+      match st.tail {
+        None -> Stop({ atoms: st.atoms, tail: None }),
+        Some(v) -> if contains_int(st.seen, v) { Stop({ atoms: st.atoms, tail: st.tail }) } else {
+          match map_get(subst.row, v) {
+            Some(next) ->
+              Continue({
+                atoms: atoms_union(st.atoms, next.atoms),
+                tail: next.tail,
+                seen: push(st.seen, v),
+              }),
+            None -> Stop({ atoms: st.atoms, tail: st.tail }),
           }
         },
-      }
-    })
-
-// A `.` after the name makes it an atom; otherwise it names an `effect set`.
-pub fn row_member(c: Ctx, p: P) -> Result<R<RowMember>, P> / {abort.raise} = {
-  let { p, node: q } = qname(c, p, b"an effect atom, or the name of an `effect set`")?;
-  if !at(c, p, t_dot()) { Ok({ p: p, node: RMSet(q) }) } else {
-    let { p, node: a } = atom_rest(c, bump(c, p), q)?;
-    Ok({ p: p, node: RMAtom(a) })
+      },
+  );
+  if !fold(walked.atoms, false, |acc: Bool, atom: Atom|
+      acc || (match atom.resource { RVar(_) -> true, _ -> false })) { walked } else {
+    {
+      atoms: fold(walked.atoms, [], |acc: List<Atom>, atom: Atom|
+        atoms_insert(acc, resolve_atom(subst, atom))),
+      tail: walked.tail,
+    }
   }
 }
 
-// The atom after its effect name and the `.` have been consumed.
-pub fn atom_rest(c: Ctx, p: P, ef: QName) -> Result<R<AtomExpr>, P> / {abort.raise} = {
-  let { p, node: a } = atom_access(c, p)?;
-  let { p, node: r } = atom_resource(c, p)?;
-  let span = span_to(ef.span, prev_span(c, p));
-  let b = bounded_word(c, p);
-  Ok({
-    p: b.p,
-    node: {
-      eff: ef,
-      mode: a.mode,
-      op: a.op,
-      resource: r.name,
-      every: r.every,
-      bounded: b.node,
-      span: span,
-    },
-  })
-}
+// The label prefix marks the nullary constructor a bound label variable stands for, as regions do.
+pub fn label_prefix() -> Bytes = b"#label:"
 
-type Access = { mode: Mode, op: Option<Ident> }
+pub fn label_type(name: Bytes) -> Type = named_type(bytes_concat(label_prefix(), name))
 
-// An operation atom's mode is `MWrite` until the checker resolves the name against the effect's declaration.
-fn atom_access(c: Ctx, p: P) -> Result<R<Access>, P> / {abort.raise} =
-  match kind(c, p) {
-    TIdent(name) -> if name != b"read" && name != b"write" {
-      let a = advance(c, p);
-      Ok({ p: a.p, node: { mode: MWrite, op: Some({ name: name, span: a.node }) } })
-    } else { mode_access(c, p) },
-    _ -> mode_access(c, p),
+pub fn label_of(ty: Type) -> Option<Bytes> =
+  match ty {
+    TyCon(c) -> if len(c.args) == 0 && bytes_starts_with(c.name, label_prefix()) {
+      Some(bytes_slice(c.name, bytes_len(label_prefix()), bytes_len(c.name)))
+    } else { None },
+    _ -> None,
   }
 
-fn mode_access(c: Ctx, p: P) -> Result<R<Access>, P> / {abort.raise} =
-  match mode(c, p) { Err(q) -> Err(q), Ok(m) -> Ok({ p: m.p, node: { mode: m.node, op: None } }) }
+pub fn resolve_atom(subst: Subst, atom: Atom) -> Atom =
+  match atom.resource {
+    RVar(v) ->
+      {
+        effect: atom.effect,
+        resource: resource_of(shallow(subst, TyVar(v)), v),
+        mode: atom.mode,
+        op: atom.op,
+      },
+    _ -> atom,
+  }
 
-type AtomRes = { every: Bool, name: Option<Ident> }
+fn resource_of(ty: Type, v: Int) -> Resource =
+  match label_of(ty) {
+    Some(n) -> RNamed(n),
+    None -> match ty { TyVar(w) -> RVar(w), _ -> RVar(v) },
+  }
 
-fn atom_resource(c: Ctx, p: P) -> Result<R<AtomRes>, P> / {abort.raise} =
-  if !at(c, p, t_lbracket()) { Ok({ p: p, node: { every: false, name: None } }) } else {
-    let o = advance(c, p);
-    if at(c, o.p, t_star()) {
-      let st = advance(c, o.p);
-      let { p, .. } = expect_close(c, st.p, t_rbracket(), o.node, b"`]`")?;
-      Ok({ p: p, node: { every: true, name: None } })
-    } else {
-      let { p, node: n } = expect_ident(c, o.p, b"a resource name or `*` inside `[..]`")?;
-      let { p, .. } = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
-      Ok({ p: p, node: { every: false, name: Some(n) } })
+pub fn occurs_ty(v: Int, t: Type) -> Bool =
+  match t {
+    TyVar(w) -> w == v,
+    TyCon(c) -> fold(c.args, false, |acc: Bool, a: Type| acc || occurs_ty(v, a)),
+    TyFn(f) ->
+      fold(f.params, false, |acc: Bool, p: Type| acc || occurs_ty(v, p)) || occurs_ty(v, f.ret),
+    TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || occurs_ty(v, f.ty)),
+  }
+
+pub type UnifyError =
+  | Mismatch({ expected: Type, found: Type })
+  | Arity({ expected: Int, found: Int })
+  | OccursTy({ v: Int, ty: Type })
+  | OccursRow({ v: Int, row: Row })
+  | RowMismatch({ expected: Row, found: Row })
+
+pub type Unified = { subst: Subst, fresh: Fresh, error: Option<UnifyError> }
+
+fn unified(subst: Subst, fresh: Fresh) -> Unified = { subst: subst, fresh: fresh, error: None }
+fn unify_failed(subst: Subst, fresh: Fresh, error: UnifyError) -> Unified =
+  { subst: subst, fresh: fresh, error: Some(error) }
+
+fn bind_ty(subst: Subst, fresh: Fresh, v: Int, ty: Type) -> Unified = {
+  let r = resolve_ty(subst, ty);
+  if r == TyVar(v) { unified(subst, fresh) }
+  else if occurs_ty(v, r) { unify_failed(subst, fresh, OccursTy({ v: v, ty: r })) } else {
+    unified(
+      {
+        ty: map_insert(subst.ty, v, r),
+        row: subst.row,
+        rigid_ty: subst.rigid_ty,
+        rigid_row: subst.rigid_row,
+      },
+      fresh,
+    )
+  }
+}
+
+fn bind_row(subst: Subst, fresh: Fresh, v: Int, row: Row) -> Unified =
+  if len(row.atoms) == 0 && row.tail == Some(v) { unified(subst, fresh) }
+  else if row.tail == Some(v) { unify_failed(subst, fresh, OccursRow({ v: v, row: row })) } else {
+    unified(
+      {
+        ty: subst.ty,
+        row: map_insert(subst.row, v, row),
+        rigid_ty: subst.rigid_ty,
+        rigid_row: subst.rigid_row,
+      },
+      fresh,
+    )
+  }
+
+pub fn solve_continuation_row(subst: Subst, v: Int, row: Row) -> Subst =
+  if map_contains(subst.row, v) { subst } else {
+    let solved = resolve_row(subst, row);
+    let closed = if solved.tail == Some(v) { { atoms: solved.atoms, tail: None } } else { solved };
+    {
+      ty: subst.ty,
+      row: map_insert(subst.row, v, closed),
+      rigid_ty: subst.rigid_ty,
+      rigid_row: subst.rigid_row,
     }
   }
 
-// --- Generics and parameters ------------------------------------------------
+pub type Free = { tys: List<Int>, rows: List<Int> }
 
-type IdAcc = { p: P, out: List<Ident> }
-
-type GenAcc = { p: P, types: List<Ident>, labels: List<Ident> }
-
-type GenOut = { types: List<Ident>, labels: List<Ident> }
-
-pub fn generics(c: Ctx, p: P) -> Result<R<Generics>, P> / {abort.raise} = {
-  let { p, .. } = expect(c, p, t_lt(), b"`<`")?;
-  let { p, node: ts } = generic_params(c, p)?;
-  let pi = eat(c, p, t_pipe());
-  let opt_es = if pi.ok { effect_params(c, pi.p) } else { Ok({ p: pi.p, node: [] }) };
-  let { p, node: es } = opt_es?;
-  let { p, .. } = expect_gt(c, p, b"`>` to close the type parameter list")?;
-  Ok({ p: p, node: { types: ts.types, effects: es, labels: ts.labels } })
-}
-
-// Not `comma_list`: it stops on `>`, on a not-yet-split `>=`, or on `|`. A bracketed name binds a label.
-fn generic_params(c: Ctx, p: P) -> Result<R<GenOut>, P> / {abort.raise} =
-  iterate({ p: p, types: [], labels: [] }, c.ntok - p.pos + 1, |s: GenAcc|
-    if at(c, s.p, t_gt()) || at(c, s.p, t_ge()) || at(c, s.p, t_pipe()) {
-      Stop(Ok({ p: s.p, node: { types: s.types, labels: s.labels } }))
-    } else if at_eof(c, s.p) {
-      Stop(Err(error_here(c, s.p, b"`>` to close the type parameter list")))
-    } else if at(c, s.p, t_lbracket()) {
-      match label_params(c, s.p) {
-        Err(q) -> Stop(Err(q)),
-        Ok(n) -> {
-          let e = eat(c, n.p, t_comma());
-          let ls = fold(n.node, s.labels, |acc: List<Ident>, x: Ident| push(acc, x));
-          if e.ok { Continue({ p: e.p, types: s.types, labels: ls }) }
-          else { Stop(Ok({ p: e.p, node: { types: s.types, labels: ls } })) }
-        },
-      }
-    } else {
-      match expect_ident(c, s.p, b"a type parameter name, or `[l]` for a label") {
-        Err(q) -> Stop(Err(q)),
-        Ok(n) -> {
-          let e = eat(c, n.p, t_comma());
-          if e.ok { Continue({ p: e.p, types: push(s.types, n.node), labels: s.labels }) }
-          else { Stop(Ok({ p: e.p, node: { types: push(s.types, n.node), labels: s.labels } })) }
-        },
-      }
-    })
-
-// One bracket may bind several labels: `<[l, k]>` is `<[l], [k]>`.
-fn label_params(c: Ctx, p: P) -> Result<R<List<Ident>>, P> / {abort.raise} = {
-  let o = advance(c, p);
-  let { p, node: ns } = comma_list(c, o.p, t_rbracket(), label_name)?;
-  let { p, .. } = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
-  Ok({ p: p, node: ns })
-}
-
-fn label_name(c: Ctx, p: P) -> Result<R<Ident>, P> / {abort.raise} =
-  expect_ident(c, p, b"a label name inside `[..]`")
-
-fn effect_params(c: Ctx, p: P) -> Result<R<List<Ident>>, P> / {abort.raise} =
-  iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: IdAcc|
-    if at(c, s.p, t_gt()) || at(c, s.p, t_ge()) { Stop(Ok({ p: s.p, node: s.out })) }
-    else if at_eof(c, s.p) {
-      Stop(Err(error_here(c, s.p, b"`>` to close the type parameter list")))
-    } else {
-      match expect_ident(c, s.p, b"an effect parameter name") {
-        Err(q) -> Stop(Err(q)),
-        Ok(n) -> {
-          let e = eat(c, n.p, t_comma());
-          if e.ok { Continue({ p: e.p, out: push(s.out, n.node) }) }
-          else { Stop(Ok({ p: e.p, node: push(s.out, n.node) })) }
-        },
-      }
-    })
-
-// --- The dump ---------------------------------------------------------------
-
-pub fn dump_ty(t: TypeExpr) -> Bytes / {abort.raise} =
-  match t {
-    TVar(i) -> bytes_concat(rec(i.span, b"tvar"), dump_ident(i)),
-    TCon(x) ->
-      bytes_concat_all([rec(x.span, b"tcon"), dump_qname(x.name), dump_list(x.args, dump_ty)]),
-    TFn(x) ->
-      bytes_concat_all([
-        rec(x.span, b"tfn"),
-        dump_list(x.params, dump_ty),
-        dump_ty(x.ret),
-        dump_opt(x.effects, dump_row),
-      ]),
-    TRecord(x) -> bytes_concat(rec(x.span, b"trec"), dump_list(x.fields, dump_ty_field)),
-    TUnit(x) -> rec(x.span, b"tuni"),
-    TBad(x) -> rec(x.span, b"tbad"),
+pub fn free_vars(subst: Subst, ty: Type, acc: Free) -> Free =
+  match shallow(subst, ty) {
+    TyVar(v) -> { tys: ints_insert(acc.tys, v), rows: acc.rows },
+    TyCon(c) -> fold(c.args, acc, |a: Free, x: Type| free_vars(subst, x, a)),
+    TyFn(fn_) -> {
+      let ps = fold(fn_.params, acc, |a: Free, x: Type| free_vars(subst, x, a));
+      let r = free_vars(subst, fn_.ret, ps);
+      let row = resolve_row(subst, fn_.effects);
+      let ls = fold(row.atoms, r, |a: Free, x: Atom|
+        match x.resource { RVar(v) -> { tys: ints_insert(a.tys, v), rows: a.rows }, _ -> a });
+      match row.tail { Some(v) -> { tys: ls.tys, rows: ints_insert(ls.rows, v) }, None -> ls }
+    },
+    TyRecord(fs) -> fold(fs, acc, |a: Free, field: Field| free_vars(subst, field.ty, a)),
   }
 
-fn dump_ty_field(f: { name: Ident, ty: TypeExpr }) -> Bytes / {abort.raise} =
-  bytes_concat(dump_ident(f.name), dump_ty(f.ty))
+// Immutable containers, which may hold a narrower function than their type says.
+pub fn covariant_con(name: Bytes) -> Bool =
+  name == b"List" || name == b"Array" || name == b"Option" || name == b"Result" || name == b"Map"
+    || name == b"Iter"
 
-pub fn dump_row(r: RowExpr) -> Bytes / {abort.raise} =
-  bytes_concat_all([
-    rec(r.span, b"row"),
-    dump_list(r.atoms, dump_atom),
-    dump_list(r.aliases, dump_qname),
-    dump_opt(r.tail, dump_ident),
-    if r.tail_bounded { word(b"bounded") } else { b"" },
-  ])
+pub fn unify(subst: Subst, fresh: Fresh, expected: Type, found: Type) -> Unified =
+  unify_at(subst, fresh, expected, found, false)
 
-pub fn dump_atom(a: AtomExpr) -> Bytes / {abort.raise} =
-  bytes_concat_all([
-    rec(a.span, b"atm"),
-    dump_qname(a.eff),
-    dump_mode(a.mode),
-    match a.op { Some(op) -> dump_ident(op), None -> b"" },
-    dump_opt(a.resource, dump_ident),
-    if a.bounded { word(b"bounded") } else { b"" },
-  ])
-
-pub fn dump_mode(m: Mode) -> Bytes =
-  match m { MRead -> word(b"read"), MWrite -> word(b"write"), MBad -> word(b"badmode") }
-
-// `Generics` has no span, so its dump leads with a word.
-pub fn dump_generics(g: Generics) -> Bytes / {abort.raise} =
-  bytes_concat_all([
-    word(b"gen"),
-    dump_list(g.types, dump_ident),
-    dump_list(g.effects, dump_ident),
-    dump_list(g.labels, dump_ident),
-  ])
-
-// --- The area's own entry point ---------------------------------------------
-
-// Parses one type on its own, for the tests below.
-pub fn dump_type_of(src: Bytes) -> String / {abort.raise} = {
-  let s = start(src);
-  let r = settle(ty(s.c, s.p), no_ty());
-  string_of_bytes(bytes_concat(dump_ty(r.node), dump_diags(r.p.diags)))
+// `exact`: inside a parameter or another constructor, a row must not stand for a wider one.
+fn unify_at(subst: Subst, fresh: Fresh, expected: Type, found: Type, exact: Bool) -> Unified = {
+  let a = shallow(subst, expected);
+  let b = shallow(subst, found);
+  match a {
+    TyVar(x) -> match b {
+      TyVar(y) -> if x == y { unified(subst, fresh) }
+      else if !is_rigid_ty(subst, x) { bind_ty(subst, fresh, x, b) }
+      else if !is_rigid_ty(subst, y) { bind_ty(subst, fresh, y, a) }
+      else { unify_failed(subst, fresh, Mismatch({ expected: a, found: b })) },
+      _ -> if !is_rigid_ty(subst, x) { bind_ty(subst, fresh, x, b) }
+      else { unify_failed(subst, fresh, Mismatch({ expected: a, found: b })) },
+    },
+    _ -> match b {
+      TyVar(y) -> if !is_rigid_ty(subst, y) { bind_ty(subst, fresh, y, a) }
+      else { unify_failed(subst, fresh, Mismatch({ expected: a, found: b })) },
+      _ -> unify_structural(subst, fresh, a, b, exact),
+    },
+  }
 }
 
-pub fn dump_generics_of(src: Bytes) -> String / {abort.raise} = {
-  let s = start(src);
-  let r = settle(generics(s.c, s.p), no_generics());
-  string_of_bytes(bytes_concat(dump_generics(r.node), dump_diags(r.p.diags)))
+fn unify_structural(subst: Subst, fresh: Fresh, a: Type, b: Type, exact: Bool) -> Unified =
+  match a {
+    TyCon(c1) -> match b {
+      TyCon(c2) -> if c1.name != c2.name || len(c1.args) != len(c2.args) {
+        unify_failed(subst, fresh, Mismatch({ expected: a, found: b }))
+      } else if len(c1.args) == 0 { unified(subst, fresh) }
+      else { unify_all(subst, fresh, c1.args, c2.args, exact || !covariant_con(c1.name)) },
+      _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
+    },
+    TyFn(f1) -> match b {
+      TyFn(f2) -> if len(f1.params) != len(f2.params) {
+        unify_failed(subst, fresh, Arity({ expected: len(f1.params), found: len(f2.params) }))
+      } else {
+        let ps = unify_all(subst, fresh, f1.params, f2.params, true);
+        match ps.error {
+          Some(_) -> ps,
+          None -> {
+            let r = unify_at(ps.subst, ps.fresh, f1.ret, f2.ret, exact);
+            match r.error {
+              Some(_) -> r,
+              None -> unify_row_at(r.subst, r.fresh, f1.effects, f2.effects, exact),
+            }
+          },
+        }
+      },
+      _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
+    },
+    TyRecord(fs1) -> match b {
+      TyRecord(fs2) -> if len(fs1) != len(fs2)
+          || map(fs1, |field: Field| field.name) != map(fs2, |field: Field| field.name) {
+        unify_failed(subst, fresh, Mismatch({ expected: a, found: b }))
+      } else {
+        unify_all(
+          subst,
+          fresh,
+          map(fs1, |field: Field| field.ty),
+          map(fs2, |field: Field| field.ty),
+          exact,
+        )
+      },
+      _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
+    },
+    TyVar(_) -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
+  }
+
+fn unify_all(subst: Subst, fresh: Fresh, xs: List<Type>, ys: List<Type>, exact: Bool) -> Unified =
+  fold(range(0, len(xs)), unified(subst, fresh), |acc: Unified, i: Int|
+    match acc.error {
+      Some(_) -> acc,
+      None -> unify_at(acc.subst, acc.fresh, at(xs, i), at(ys, i), exact),
+    })
+
+// A free label variable takes the resource the other row names for the same operation, so a
+// caller's concrete label reaches a callee's generic one through an argument's row.
+fn bind_labels(subst: Subst, xs: List<Atom>, ys: List<Atom>) -> Subst =
+  fold(xs, subst, |acc: Subst, atom: Atom| {
+    let a = resolve_atom(acc, atom);
+    match a.resource {
+      RVar(v) -> if is_rigid_ty(acc, v) { acc } else {
+        match partner(acc, ys, a, v) {
+          None -> acc,
+          Some(t) ->
+            {
+              ty: map_insert(acc.ty, v, t),
+              row: acc.row,
+              rigid_ty: acc.rigid_ty,
+              rigid_row: acc.rigid_row,
+            },
+        }
+      },
+      _ -> acc,
+    }
+  })
+
+fn partner(subst: Subst, atoms: List<Atom>, x: Atom, v: Int) -> Option<Type> =
+  fold(atoms, None, |acc: Option<Type>, y: Atom|
+    match acc {
+      Some(_) -> acc,
+      None -> {
+        let b = resolve_atom(subst, y);
+        if b.effect == x.effect && mode_rank(b.mode) == mode_rank(x.mode) && b.op == x.op {
+          match b.resource {
+            RNamed(n) -> Some(label_type(n)),
+            RVar(w) -> if w == v { None } else { Some(TyVar(w)) },
+            RSingleton -> None,
+            RAny -> None,
+          }
+        } else { None }
+      },
+    })
+
+pub fn unify_row(subst: Subst, fresh: Fresh, expected: Row, found: Row) -> Unified =
+  unify_row_at(subst, fresh, expected, found, false)
+
+fn unify_row_at(subst: Subst, fresh: Fresh, expected: Row, found: Row, exact: Bool) -> Unified = {
+  let x = resolve_row(subst, expected);
+  let y = resolve_row(subst, found);
+  let s = bind_labels(bind_labels(subst, x.atoms, y.atoms), y.atoms, x.atoms);
+  let moved = map_len(s.ty) != map_len(subst.ty);
+  let a = if moved { resolve_row(s, x) } else { x };
+  let b = if moved { resolve_row(s, y) } else { y };
+  let only_a = filter(a.atoms, |x: Atom|
+    !(if exact { atoms_covered(b.atoms, x) } else { almost_covered(b.atoms, x) }));
+  let only_b = filter(b.atoms, |x: Atom| !atoms_covered(a.atoms, x));
+  let bad = RowMismatch({ expected: a, found: b });
+  match a.tail {
+    None -> match b.tail {
+      None -> if len(only_a) == 0 && len(only_b) == 0 { unified(s, fresh) }
+      else { unify_failed(s, fresh, bad) },
+      Some(v) -> if len(only_b) > 0 || is_rigid_row(s, v) { unify_failed(s, fresh, bad) }
+      else { bind_row(s, fresh, v, row_closed(only_a)) },
+    },
+    Some(v1) -> match b.tail {
+      None -> if len(only_a) > 0 || is_rigid_row(s, v1) { unify_failed(s, fresh, bad) }
+      else { bind_row(s, fresh, v1, row_closed(only_b)) },
+      Some(v2) -> if v1 == v2 {
+        if len(only_a) == 0 && len(only_b) == 0 { unified(s, fresh) }
+        else if is_rigid_row(s, v1) { unify_failed(s, fresh, bad) } else {
+          let nv = fresh_row_var(fresh);
+          bind_row(s, nv.fresh, v1, { atoms: atoms_union(only_a, only_b), tail: Some(nv.var) })
+        }
+      } else {
+        let r1 = is_rigid_row(s, v1);
+        let r2 = is_rigid_row(s, v2);
+        if r1 && r2 { unify_failed(s, fresh, bad) } else if r1 {
+          if len(only_b) > 0 { unify_failed(s, fresh, bad) }
+          else { bind_row(s, fresh, v2, { atoms: only_a, tail: Some(v1) }) }
+        } else if r2 {
+          if len(only_a) > 0 { unify_failed(s, fresh, bad) }
+          else { bind_row(s, fresh, v1, { atoms: only_b, tail: Some(v2) }) }
+        } else {
+          let nv = fresh_row_var(fresh);
+          let first = bind_row(s, nv.fresh, v1, { atoms: only_b, tail: Some(nv.var) });
+          match first.error {
+            Some(_) -> first,
+            None -> bind_row(first.subst, first.fresh, v2, { atoms: only_a, tail: Some(nv.var) }),
+          }
+        }
+      },
+    },
+  }
 }
+
+// --- The environment ----------------------------------------------------------------------
+
+pub type Scope = { schemes: Map<Bytes, Scheme>, open: List<Bytes> }
+pub type TypeEnv = { scopes: List<Scope> }
+
+pub fn env_new() -> TypeEnv = { scopes: [{ schemes: map_new(), open: [] }] }
+pub fn env_push(env: TypeEnv) -> TypeEnv =
+  { scopes: push(env.scopes, { schemes: map_new(), open: [] }) }
+pub fn env_pop(env: TypeEnv) -> TypeEnv =
+  if len(env.scopes) > 1 { { scopes: take(env.scopes, len(env.scopes) - 1) } } else { env }
+
+pub fn env_bind(env: TypeEnv, name: Bytes, scheme: Scheme) -> TypeEnv = {
+  let last = len(env.scopes) - 1;
+  let s = at(env.scopes, last);
+  {
+    scopes: set_at(env.scopes, last, {
+      schemes: map_insert(s.schemes, name, scheme),
+      open: push(s.open, name),
+    }),
+  }
+}
+
+pub fn env_bind_global(env: TypeEnv, name: Bytes, scheme: Scheme) -> TypeEnv = {
+  let s = at(env.scopes, 0);
+  {
+    scopes: set_at(env.scopes, 0, {
+      schemes: map_insert(s.schemes, name, scheme),
+      open: push(s.open, name),
+    }),
+  }
+}
+
+pub fn env_remove_global(env: TypeEnv, name: Bytes) -> TypeEnv = {
+  let s = at(env.scopes, 0);
+  {
+    scopes: set_at(env.scopes, 0, {
+      schemes: map_remove(s.schemes, name),
+      open: filter(s.open, |n: Bytes| n != name),
+    }),
+  }
+}
+
+pub fn env_lookup(env: TypeEnv, name: Bytes) -> Option<Scheme> =
+  fold(env.scopes, None, |acc: Option<Scheme>, scope: Scope|
+    match map_get(scope.schemes, name) { Some(x) -> Some(x), None -> acc })
+
+// The innermost scope holding `name`, as a depth; `0` is the globals.
+pub fn env_depth_of(env: TypeEnv, name: Bytes) -> Option<Int> =
+  fold(range(0, len(env.scopes)), None, |acc: Option<Int>, i: Int|
+    if map_contains(at(env.scopes, i).schemes, name) { Some(i) } else { acc })
+
+pub fn env_locals(env: TypeEnv) -> List<{ name: Bytes, sc: Scheme }> =
+  fold(drop(env.scopes, 1), [], |acc: List<{ name: Bytes, sc: Scheme }>, scope: Scope|
+    map_fold(
+      scope.schemes,
+      acc,
+      |a: List<{ name: Bytes, sc: Scheme }>, k: Bytes, scheme: Scheme|
+        push(a, { name: k, sc: scheme }),
+    ))
+
+fn scheme_free(subst: Subst, scheme: Scheme) -> Free = {
+  let fv = free_vars(subst, scheme.ty, { tys: [], rows: [] });
+  {
+    tys: ints_difference(ints_difference(fv.tys, scheme.ty_vars), scheme.label_vars),
+    rows: ints_difference(fv.rows, scheme.row_vars),
+  }
+}
+
+// Also closes every binding that reaches no free variable.
+pub fn env_free_vars(subst: Subst, env: TypeEnv) -> { e: TypeEnv, free: Free } = {
+  let walked = fold(
+    env.scopes,
+    { scopes: [], free: { tys: [], rows: [] } },
+    |acc: { scopes: List<Scope>, free: Free }, scope: Scope| {
+      let kept = fold(
+        scope.open,
+        { open: [], free: acc.free },
+        |a: { open: List<Bytes>, free: Free }, name: Bytes|
+          match map_get(scope.schemes, name) {
+            None -> a,
+            Some(scheme) -> {
+              let fv = scheme_free(subst, scheme);
+              if len(fv.tys) == 0 && len(fv.rows) == 0 { a } else {
+                {
+                  open: push(a.open, name),
+                  free: {
+                    tys: ints_union(a.free.tys, fv.tys),
+                    rows: ints_union(a.free.rows, fv.rows),
+                  },
+                }
+              }
+            },
+          },
+      );
+      { scopes: push(acc.scopes, { schemes: scope.schemes, open: kept.open }), free: kept.free }
+    },
+  );
+  { e: { scopes: walked.scopes }, free: walked.free }
+}
+
+fn rename(t: Type, tys: Map<Int, Type>, rows: Map<Int, Int>) -> Type / {abort.raise} =
+  match t {
+    TyVar(v) -> match map_get(tys, v) { Some(x) -> x, None -> t },
+    TyCon(c) -> TyCon({ name: c.name, args: map(c.args, |a: Type| rename(a, tys, rows)) }),
+    TyFn(f) ->
+      TyFn({
+        params: map(f.params, |p: Type| rename(p, tys, rows)),
+        ret: rename(f.ret, tys, rows),
+        effects: {
+          atoms: fold(f.effects.atoms, [], |acc: List<Atom>, a: Atom|
+            atoms_insert(acc, rename_atom(a, tys))),
+          tail: match f.effects.tail {
+            None -> None,
+            Some(v) -> Some(match map_get(rows, v) { Some(w) -> w, None -> v }),
+          },
+        },
+      }),
+    TyRecord(fs) -> TyRecord(map(fs, |x: Field| { name: x.name, ty: rename(x.ty, tys, rows) })),
+  }
+
+fn rename_atom(atom: Atom, tys: Map<Int, Type>) -> Atom =
+  match atom.resource {
+    RVar(v) -> match map_get(tys, v) {
+      Some(t) -> { effect: atom.effect, resource: resource_of(t, v), mode: atom.mode, op: atom.op },
+      None -> atom,
+    },
+    _ -> atom,
+  }
+
+// `labels` are the fresh variables the scheme's label parameters became, in declaration order.
+pub type Instantiated = { fresh: Fresh, ty: Type, args: List<Type>, labels: List<Type> }
+
+pub fn instantiate_with(scheme: Scheme, fresh: Fresh) -> Instantiated =
+  if len(scheme.ty_vars) == 0 && len(scheme.row_vars) == 0 && len(scheme.label_vars) == 0 {
+    { fresh: fresh, ty: scheme.ty, args: [], labels: [] }
+  } else {
+    let tys = fold(
+      scheme.ty_vars,
+      { f: fresh, m: map_new(), args: [] },
+      |acc: { f: Fresh, m: Map<Int, Type>, args: List<Type> }, v: Int| {
+        let o = fresh_ty(acc.f);
+        { f: o.fresh, m: map_insert(acc.m, v, o.ty), args: push(acc.args, o.ty) }
+      },
+    );
+    let labels = fold(
+      scheme.label_vars,
+      { f: tys.f, m: tys.m, args: [] },
+      |acc: { f: Fresh, m: Map<Int, Type>, args: List<Type> }, v: Int| {
+        let o = fresh_ty(acc.f);
+        { f: o.fresh, m: map_insert(acc.m, v, o.ty), args: push(acc.args, o.ty) }
+      },
+    );
+    let rows = fold(
+      scheme.row_vars,
+      { f: labels.f, m: map_new() },
+      |acc: { f: Fresh, m: Map<Int, Int> }, v: Int| {
+        let o = fresh_row_var(acc.f);
+        { f: o.fresh, m: map_insert(acc.m, v, o.var) }
+      },
+    );
+    { fresh: rows.f, ty: rename(scheme.ty, labels.m, rows.m), args: tys.args, labels: labels.args }
+  }
+
+pub fn instantiate(scheme: Scheme, fresh: Fresh) -> { fresh: Fresh, ty: Type } = {
+  let o = instantiate_with(scheme, fresh);
+  { fresh: o.fresh, ty: o.ty }
+}
+
+pub fn rename_scheme(
+  scheme: Scheme,
+  ty_vars: List<Int>,
+  row_vars: List<Int>,
+  label_vars: List<Int>,
+) -> Type = {
+  let tys = fold(range(0, len(scheme.ty_vars)), map_new(), |m: Map<Int, Type>, i: Int|
+    map_insert(m, at(scheme.ty_vars, i), TyVar(at(ty_vars, i))));
+  let both = fold(range(0, len(scheme.label_vars)), tys, |m: Map<Int, Type>, i: Int|
+    map_insert(m, at(scheme.label_vars, i), TyVar(at(label_vars, i))));
+  let rows = fold(range(0, len(scheme.row_vars)), map_new(), |m: Map<Int, Int>, i: Int|
+    map_insert(m, at(scheme.row_vars, i), at(row_vars, i)));
+  rename(scheme.ty, both, rows)
+}
+
+pub fn generalize(subst: Subst, e: TypeEnv, t: Type) -> { env: TypeEnv, scheme: Scheme } = {
+  let ty = resolve_ty(subst, t);
+  let env = env_free_vars(subst, e);
+  let fv = free_vars(subst, ty, { tys: [], rows: [] });
+  {
+    env: env.e,
+    scheme: {
+      ty_vars: ints_difference(fv.tys, env.free.tys),
+      row_vars: ints_difference(fv.rows, env.free.rows),
+      label_vars: [],
+      ty: ty,
+    },
+  }
+}
+
+// --- One numbering per text ------------------------------------------------------------------
+// The checker numbers variables as it meets them, so two answers about one program may number
+// them apart. Renamed in the order their text names them, a scheme's head first, the two are one
+// value.
+
+type Naming = { tys: Map<Int, Int>, rows: Map<Int, Int> }
+
+fn no_naming() -> Naming = { tys: map_new(), rows: map_new() }
+
+// A label variable is a type variable's id, so the two share one numbering.
+fn name_ty(naming: Naming, v: Int) -> Naming =
+  if map_contains(naming.tys, v) { naming }
+  else { { ..naming, tys: map_insert(naming.tys, v, map_len(naming.tys)) } }
+
+fn name_row(naming: Naming, v: Int) -> Naming =
+  if map_contains(naming.rows, v) { naming }
+  else { { ..naming, rows: map_insert(naming.rows, v, map_len(naming.rows)) } }
+
+fn name_atoms(n: Naming, atoms: List<Atom>) -> Naming =
+  fold(atoms, n, |m: Naming, atom: Atom| match atom.resource { RVar(v) -> name_ty(m, v), _ -> m })
+
+fn name_in(n: Naming, ty: Type) -> Naming =
+  match ty {
+    TyVar(v) -> name_ty(n, v),
+    TyCon(c) -> fold(c.args, n, name_in),
+    TyFn(f) -> {
+      let m = name_atoms(name_in(fold(f.params, n, name_in), f.ret), f.effects.atoms);
+      match f.effects.tail { Some(v) -> name_row(m, v), None -> m }
+    },
+    TyRecord(fs) -> fold(fs, n, |m: Naming, field: Field| name_in(m, field.ty)),
+  }
+
+fn as_types(naming: Naming) -> Map<Int, Type> =
+  map_fold(naming.tys, map_new(), |m: Map<Int, Type>, k: Int, v: Int| map_insert(m, k, TyVar(v)))
+
+fn renamed(m: Map<Int, Int>, v: Int) -> Int = match map_get(m, v) { Some(w) -> w, None -> v }
+
+pub fn canonical_type(ty: Type) -> Type = {
+  let n = name_in(no_naming(), ty);
+  rename(ty, as_types(n), n.rows)
+}
+
+pub fn canonical_atoms(atoms: List<Atom>) -> List<Atom> / {abort.raise} = {
+  let tys = as_types(name_atoms(no_naming(), atoms));
+  atoms_sorted(map(atoms, |atom: Atom| rename_atom(atom, tys)))
+}
+
+pub fn canonical_scheme(scheme: Scheme) -> Scheme = {
+  let head = fold(
+    scheme.row_vars,
+    fold(scheme.label_vars, fold(scheme.ty_vars, no_naming(), name_ty), name_ty),
+    name_row,
+  );
+  let n = name_in(head, scheme.ty);
+  {
+    ty_vars: map(scheme.ty_vars, |v: Int| renamed(n.tys, v)),
+    row_vars: map(scheme.row_vars, |v: Int| renamed(n.rows, v)),
+    label_vars: map(scheme.label_vars, |v: Int| renamed(n.tys, v)),
+    ty: rename(scheme.ty, as_types(n), n.rows),
+  }
+}
+
+// --- The printer --------------------------------------------------------------------------
+
+// `taken` holds the concrete resource names the text names: a label variable may take none of them.
+pub type Printer = {
+  ty_names: Map<Int, Bytes>,
+  row_names: Map<Int, Bytes>,
+  label_names: Map<Int, Bytes>,
+  taken: Map<Bytes, Bool>,
+}
+
+pub fn printer_new() -> Printer =
+  { ty_names: map_new(), row_names: map_new(), label_names: map_new(), taken: map_new() }
+
+// A variable printed under the name a signature wrote for it, rather than the next free letter.
+pub fn printer_naming(printer: Printer, v: Int, name: Bytes) -> Printer =
+  { ..printer, ty_names: map_insert(printer.ty_names, v, name) }
+
+fn ty_letters() -> Bytes = b"abcdghijklmnopqrsuvwxyz"
+fn row_letters() -> Bytes = b"eft"
+fn label_letters() -> Bytes = b"lmn"
+
+fn letter_name(letters: Bytes, i: Int) -> Bytes / {abort.raise} = {
+  let n = bytes_len(letters);
+  let letter = bytes_slice(letters, i % n, i % n + 1);
+  if i < n { letter } else { bytes_concat(letter, bytes_of_string(int_to_string(i / n))) }
+}
+
+// The name the `i`th type variable a fresh printer meets is printed under.
+pub fn ty_letter(i: Int) -> Bytes / {abort.raise} = letter_name(ty_letters(), i)
+
+fn ty_name(printer: Printer, v: Int) -> { printer: Printer, name: Bytes } =
+  match map_get(printer.ty_names, v) {
+    Some(n) -> { printer: printer, name: n },
+    None -> {
+      let name = letter_name(ty_letters(), map_len(printer.ty_names));
+      { printer: { ..printer, ty_names: map_insert(printer.ty_names, v, name) }, name: name }
+    },
+  }
+
+fn row_name(printer: Printer, v: Int) -> { printer: Printer, name: Bytes } =
+  match map_get(printer.row_names, v) {
+    Some(n) -> { printer: printer, name: n },
+    None -> {
+      let name = letter_name(row_letters(), map_len(printer.row_names));
+      { printer: { ..printer, row_names: map_insert(printer.row_names, v, name) }, name: name }
+    },
+  }
+
+fn label_name(printer: Printer, v: Int) -> { printer: Printer, name: Bytes } =
+  match map_get(printer.label_names, v) {
+    Some(n) -> { printer: printer, name: n },
+    None -> {
+      let name = free_label(printer, 0);
+      { printer: { ..printer, label_names: map_insert(printer.label_names, v, name) }, name: name }
+    },
+  }
+
+// The first label letter, then round, that no resource in this text and no other label holds, so
+// `[l]` in a printed row or footprint means one thing.
+fn free_label(printer: Printer, i: Int) -> Bytes = {
+  let name = letter_name(label_letters(), i);
+  if map_contains(printer.taken, name) || label_held(printer.label_names, name) {
+    free_label(printer, i + 1)
+  } else { name }
+}
+
+fn label_held(names: Map<Int, Bytes>, name: Bytes) -> Bool =
+  map_fold(names, false, |acc: Bool, v: Int, held: Bytes| acc || held == name)
+
+// Every concrete resource a text names, gathered before a label variable in it is given a name.
+fn reserve_resource(printer: Printer, resource: Resource) -> Printer =
+  match resource {
+    RNamed(n) -> { ..printer, taken: map_insert(printer.taken, n, true) },
+    _ -> printer,
+  }
+
+// What a caller that lays a row out itself must hand the printer before it names anything.
+pub fn reserve_atoms(printer: Printer, atoms: List<Atom>) -> Printer =
+  fold(atoms, printer, |acc: Printer, atom: Atom| reserve_resource(acc, atom.resource))
+
+fn reserve_ty(printer: Printer, t: Type) -> Printer =
+  match t {
+    TyVar(_) -> printer,
+    TyCon(c) -> fold(c.args, printer, |acc: Printer, a: Type| reserve_ty(acc, a)),
+    TyFn(f) ->
+      reserve_atoms(
+        reserve_ty(fold(f.params, printer, |acc: Printer, x: Type| reserve_ty(acc, x)), f.ret),
+        f.effects.atoms,
+      ),
+    TyRecord(fs) -> fold(fs, printer, |acc: Printer, f: Field| reserve_ty(acc, f.ty)),
+  }
+
+pub fn region_prefix() -> Bytes = b"#region:"
+
+pub fn region_of(ty: Type) -> Option<Bytes> =
+  match ty {
+    TyCon(c) -> if len(c.args) == 0 && bytes_starts_with(c.name, region_prefix()) {
+      Some(bytes_slice(c.name, bytes_len(region_prefix()), bytes_len(c.name)))
+    } else { None },
+    _ -> None,
+  }
+
+pub fn print_resource(printer: Printer, resource: Resource) -> { printer: Printer, text: Bytes } =
+  match resource {
+    RNamed(n) -> { printer: printer, text: bytes_concat_all([b"[", n, b"]"]) },
+    RVar(v) -> {
+      let o = label_name(printer, v);
+      { printer: o.printer, text: bytes_concat_all([b"[", o.name, b"]"]) }
+    },
+    RSingleton -> { printer: printer, text: b"" },
+    RAny -> { printer: printer, text: b"[*]" },
+  }
+
+pub fn print_atom(printer: Printer, atom: Atom) -> { printer: Printer, text: Bytes } =
+  if is_div(atom) { { printer: printer, text: b"div" } } else {
+    let r = print_resource(printer, atom.resource);
+    {
+      printer: r.printer,
+      text: bytes_concat_all([
+        atom.effect,
+        b".",
+        match atom.op {
+          Some(op) -> op,
+          None -> match atom.mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" },
+        },
+        r.text,
+      ]),
+    }
+  }
+
+// A fresh printer, so a lone atom names its label from the start of the alphabet.
+pub fn atom_text(atom: Atom) -> Bytes = print_atom(printer_new(), atom).text
+
+pub fn resource_text(resource: Resource) -> Bytes = print_resource(printer_new(), resource).text
+
+fn join_bytes(xs: List<Bytes>, sep: Bytes) -> Bytes / {abort.raise} =
+  fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
+    if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
+
+pub fn print_ty(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } =
+  printed(reserve_ty(printer, ty), ty)
+
+// Its resources already reserved, all of them at once, so no part of the type walks them again.
+fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } =
+  match ty {
+    TyVar(v) -> {
+      let o = ty_name(printer, v);
+      { printer: o.printer, text: o.name }
+    },
+    TyCon(c) -> if c.name == b"Cell" && len(c.args) == 2 {
+      let elem = printed(printer, at(c.args, 1));
+      match region_of(at(c.args, 0)) {
+        Some(r) ->
+          { printer: elem.printer, text: bytes_concat_all([b"Cell[", r, b"]<", elem.text, b">"]) },
+        None -> { printer: elem.printer, text: bytes_concat_all([b"Cell<", elem.text, b">"]) },
+      }
+    } else if len(c.args) == 0 { { printer: printer, text: c.name } } else {
+      let args = print_tys(printer, c.args);
+      {
+        printer: args.printer,
+        text: bytes_concat_all([c.name, b"<", join_bytes(args.texts, b", "), b">"]),
+      }
+    },
+    TyFn(f) -> {
+      let ps = print_tys(printer, f.params);
+      let r = printed(ps.printer, f.ret);
+      let head = bytes_concat_all([b"(", join_bytes(ps.texts, b", "), b") -> ", r.text]);
+      if row_is_pure(f.effects) { { printer: r.printer, text: head } } else {
+        let row = print_row(r.printer, f.effects);
+        { printer: row.printer, text: bytes_concat_all([head, b" / ", row.text]) }
+      }
+    },
+    TyRecord(fs) -> match tuple_arity(fs) {
+      Some(n) -> {
+        let ts = print_tys(
+          printer,
+          map(range(0, n), |i: Int|
+            match field_get(fs, bytes_concat(b"_", bytes_of_string(int_to_string(i)))) {
+              Some(x) -> x,
+              None -> panic("a tuple field"),
+            }),
+        );
+        { printer: ts.printer, text: bytes_concat_all([b"(", join_bytes(ts.texts, b", "), b")"]) }
+      },
+      None -> {
+        let out = fold(
+          fs,
+          { printer: printer, texts: [] },
+          |acc: { printer: Printer, texts: List<Bytes> }, f: Field| {
+            let v = printed(acc.printer, f.ty);
+            {
+              printer: v.printer,
+              texts: push(acc.texts, bytes_concat_all([f.name, b": ", v.text])),
+            }
+          },
+        );
+        { printer: out.printer, text: bytes_concat_all([b"{", join_bytes(out.texts, b", "), b"}"]) }
+      },
+    },
+  }
+
+fn print_tys(printer: Printer, tys: List<Type>) -> { printer: Printer, texts: List<Bytes> } =
+  fold(
+    tys,
+    { printer: printer, texts: [] },
+    |acc: { printer: Printer, texts: List<Bytes> }, ty: Type| {
+      let o = printed(acc.printer, ty);
+      { printer: o.printer, texts: push(acc.texts, o.text) }
+    },
+  )
+
+// One printer for the whole list, so two label variables in it are told apart. Each atom on its
+// own, for a caller that places them itself.
+pub fn print_atom_list(
+  printer: Printer,
+  atoms: List<Atom>,
+) -> { printer: Printer, texts: List<Bytes> } = {
+  let p = reserve_atoms(printer, atoms);
+  fold(
+    atoms,
+    { printer: p, texts: [] },
+    |acc: { printer: Printer, texts: List<Bytes> }, atom: Atom| {
+      let o = print_atom(acc.printer, atom);
+      { printer: o.printer, texts: push(acc.texts, o.text) }
+    },
+  )
+}
+
+pub fn print_atoms(
+  printer: Printer,
+  atoms: List<Atom>,
+  sep: Bytes,
+) -> { printer: Printer, text: Bytes } = {
+  let out = print_atom_list(printer, atoms);
+  { printer: out.printer, text: join_bytes(out.texts, sep) }
+}
+
+fn holds_label(vs: List<Int>, v: Int) -> Bool = fold(vs, false, |acc: Bool, x: Int| acc || x == v)
+
+// The labels the atoms name are bound in a head, as a scheme's head binds its own: without them a
+// label a caller fills reads back as a resource of that name.
+pub fn atoms_text(atoms: List<Atom>, sep: Bytes) -> Bytes / {abort.raise} = {
+  let out = print_atoms(printer_new(), atoms, sep);
+  let vars = fold(atoms, [], |acc: List<Int>, atom: Atom|
+    match atom.resource {
+      RVar(v) -> if holds_label(acc, v) { acc } else { push(acc, v) },
+      _ -> acc,
+    });
+  if len(vars) == 0 { out.text } else {
+    let head = fold(
+      vars,
+      { printer: out.printer, texts: [] },
+      |acc: { printer: Printer, texts: List<Bytes> }, v: Int| {
+        let o = label_name(acc.printer, v);
+        { printer: o.printer, texts: push(acc.texts, bytes_concat_all([b"[", o.name, b"]"])) }
+      },
+    );
+    bytes_concat_all([b"<", join_bytes(head.texts, sep), b">", out.text])
+  }
+}
+
+// --- Reading atoms back -------------------------------------------------------------------
+
+fn last_dot(b: Bytes) -> Int / {abort.raise} =
+  fold(range(0, bytes_len(b)), 0 - 1, |acc: Int, i: Int| if bytes_at(b, i) == 46 { i } else { acc })
+
+type Split = { name: Bytes, resource: Resource }
+
+fn read_atom(text: Bytes) -> Option<Atom> / {abort.raise} =
+  if text == b"div" { Some(div_atom()) } else {
+    let n = bytes_len(text);
+    let split: Option<Split> = match bytes_index_of(text, b"[") {
+      None -> Some({ name: text, resource: RSingleton }),
+      Some(i) -> if n == 0 || bytes_at(text, n - 1) != 93 || i == 0 { None } else {
+        Some({ name: bytes_slice(text, 0, i), resource: RNamed(bytes_slice(text, i + 1, n - 1)) })
+      },
+    };
+    match split {
+      None -> None,
+      Some(s) -> {
+        let d = last_dot(s.name);
+        if d <= 0 || d >= bytes_len(s.name) - 1 { None } else {
+          let eff = bytes_slice(s.name, 0, d);
+          let access = bytes_slice(s.name, d + 1, bytes_len(s.name));
+          if access == b"read" {
+            Some({ effect: eff, resource: s.resource, mode: MRead, op: None })
+          } else if access == b"write" {
+            Some({ effect: eff, resource: s.resource, mode: MWrite, op: None })
+          }
+          // An operation's mode is its declaration's, which this text does not carry; the caller settles it.
+          else { Some({ effect: eff, resource: s.resource, mode: MWrite, op: Some(access) }) }
+        }
+      },
+    }
+  }
+
+// The inverse of `atoms_text(_, b",")`. A text that binds label variables names them from the start
+// of the alphabet, so nothing in it says which parameter each one was: that text reads as nothing.
+pub fn read_atoms(text: Bytes) -> Option<List<Atom>> / {abort.raise} =
+  if bytes_len(text) == 0 { Some([]) }
+  else if bytes_at(text, 0) == 60 { None } else {
+    fold(bytes_split(text, b","), Some([]), |acc: Option<List<Atom>>, piece: Bytes|
+      match acc {
+        None -> None,
+        Some(xs) -> match read_atom(piece) { Some(a) -> Some(push(xs, a)), None -> None },
+      })
+  }
+
+pub fn print_row(printer: Printer, row: Row) -> { printer: Printer, text: Bytes } = {
+  let out = print_atoms(printer, row.atoms, b", ");
+  match row.tail {
+    None -> { printer: out.printer, text: bytes_concat_all([b"{", out.text, b"}"]) },
+    Some(v) -> {
+      let n = row_name(out.printer, v);
+      if len(row.atoms) == 0 { { printer: n.printer, text: n.name } } else {
+        { printer: n.printer, text: bytes_concat_all([b"{", out.text, b" | ", n.name, b"}"]) }
+      }
+    },
+  }
+}
+
+pub fn print_scheme(printer: Printer, scheme: Scheme) -> { printer: Printer, text: Bytes } = {
+  // Named in the order a call fills them, against every resource the body names, so the head and
+  // the body read the same there.
+  let p = reserve_ty(printer, scheme.ty);
+  let body = printed(
+    fold(scheme.label_vars, p, |acc: Printer, v: Int| label_name(acc, v).printer),
+    scheme.ty,
+  );
+  if len(scheme.ty_vars) == 0 && len(scheme.row_vars) == 0 && len(scheme.label_vars) == 0 { body }
+  else {
+    let tys = fold(
+      scheme.ty_vars,
+      { printer: body.printer, texts: [] },
+      |acc: { printer: Printer, texts: List<Bytes> }, v: Int| {
+        let o = ty_name(acc.printer, v);
+        { printer: o.printer, texts: push(acc.texts, o.name) }
+      },
+    );
+    let labels = fold(
+      scheme.label_vars,
+      tys,
+      |acc: { printer: Printer, texts: List<Bytes> }, v: Int| {
+        let o = label_name(acc.printer, v);
+        { printer: o.printer, texts: push(acc.texts, bytes_concat_all([b"[", o.name, b"]"])) }
+      },
+    );
+    let rows = fold(
+      scheme.row_vars,
+      { printer: labels.printer, texts: [] },
+      |acc: { printer: Printer, texts: List<Bytes> }, v: Int| {
+        let o = row_name(acc.printer, v);
+        { printer: o.printer, texts: push(acc.texts, o.name) }
+      },
+    );
+    let head = if len(labels.texts) > 0 && len(rows.texts) > 0 {
+      bytes_concat_all([
+        b"<",
+        join_bytes(labels.texts, b", "),
+        b" | ",
+        join_bytes(rows.texts, b", "),
+        b">",
+      ])
+    } else if len(labels.texts) > 0 {
+      bytes_concat_all([b"<", join_bytes(labels.texts, b", "), b">"])
+    } else { bytes_concat_all([b"<| ", join_bytes(rows.texts, b", "), b">"]) };
+    { printer: rows.printer, text: bytes_concat(head, body.text) }
+  }
+}
+
+// A fresh printer per scheme, so each one names its variables from the start of the alphabet.
+pub fn scheme_text(scheme: Scheme) -> Bytes = print_scheme(printer_new(), scheme).text
+pub fn type_text(ty: Type) -> Bytes = print_ty(printer_new(), ty).text
+pub fn row_text(row: Row) -> Bytes = print_row(printer_new(), row).text
 
 // --- Tests ------------------------------------------------------------------
 
-test "a bare uppercase name is a nullary constructor, a lowercase one a variable" {
-  assert_eq(dump_type_of(b"Int"), "0:3:tcon;0:3:qname;?0;0:3:ident;@496e74;#0;#0;");
-  assert_eq(dump_type_of(b"a"), "0:1:tvar;0:1:ident;@61;#0;")
+test "unification binds a variable once and refuses the occurs case" {
+  let f0 = fresh_new();
+  let a = fresh_ty(f0);
+  let u = unify(subst_new(), a.fresh, a.ty, list_type(int_type()));
+  assert_eq(type_text(resolve_ty(u.subst, a.ty)), b"List<Int>");
+  let bad = unify(u.subst, u.fresh, a.ty, list_type(a.ty));
+  assert_eq(match bad.error { Some(Mismatch(_)) -> 1, Some(_) -> 2, None -> 0 }, 1)
 }
 
-test "unit, records and type arguments" {
-  assert_eq(dump_type_of(b"()"), "0:2:tuni;#0;");
-  assert_eq(dump_type_of(b"{}"), "0:2:trec;#0;#0;");
+test "a row unifies atom-wise and a closed row refuses what it lacks" {
+  let db = { effect: b"db", resource: RNamed(b"users"), mode: MRead, op: None };
+  let f0 = fresh_new();
+  let e = fresh_row(f0);
+  let u = unify_row(subst_new(), e.fresh, e.row, row_singleton(db));
+  assert_eq(row_text(resolve_row(u.subst, e.row)), b"{db.read[users]}");
+  let bad = unify_row(u.subst, u.fresh, row_empty(), row_singleton(db));
+  assert(match bad.error { Some(RowMismatch(_)) -> true, _ -> false })
+}
+
+test "an operation atom sorts after its mode atom, which covers it" {
+  let wr = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: None };
+  let send = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") };
+  let recv = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"recv") };
+  let rd = { effect: b"net", resource: RNamed(b"conn"), mode: MRead, op: None };
+  assert(atom_lt(wr, send));
+  assert(!atom_lt(send, wr));
+  assert(atom_lt(recv, send));
   assert_eq(
-    dump_type_of(b"List<a>"),
-    "0:7:tcon;0:4:qname;?0;0:4:ident;@4c697374;#1;5:6:tvar;5:6:ident;@61;#0;",
+    row_text(row_closed([send, wr, recv])),
+    b"{net.write[conn], net.recv[conn], net.send[conn]}",
+  );
+  assert(atom_covers(wr, send));
+  assert(atom_covers(send, send));
+  assert(!atom_covers(send, wr));
+  assert(!atom_covers(rd, send));
+  assert(atoms_covered([rd, wr], send));
+  assert(!atoms_covered([rd], send));
+  assert_eq(
+    row_text(row_without_covered(row_closed([send, wr, recv, rd]), [wr])),
+    b"{net.read[conn]}",
   );
   assert_eq(
-    dump_type_of(b"{x: Int, y: a}"),
-    "0:14:trec;#2;1:2:ident;@78;4:7:tcon;4:7:qname;?0;4:7:ident;@496e74;#0;9:10:ident;@79;12:13:tvar;12:13:ident;@61;#0;",
+    row_text(row_without_covered(row_closed([send, recv, rd]), [send])),
+    b"{net.read[conn], net.recv[conn]}",
   )
 }
 
-test "nested type arguments close on two `>` tokens" {
+test "atoms read back as the atoms they were printed from" {
+  let rd = { effect: b"m.db", resource: RNamed(b"users"), mode: MRead, op: None };
+  let wr = { effect: b"m.net", resource: RSingleton, mode: MWrite, op: None };
+  let send = { effect: b"m.net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") };
+  assert_eq(read_atoms(b""), Some([]));
+  assert_eq(read_atoms(atoms_text([rd], b",")), Some([rd]));
+  assert_eq(read_atoms(atoms_text([rd, wr], b",")), Some([rd, wr]));
+  assert_eq(read_atoms(atoms_text([send], b",")), Some([send]));
+  // A label variable's name is the printer's, not the parameter's, so a text that binds one is refused.
   assert_eq(
-    dump_type_of(b"Map<K, List<V>>"),
-    "0:15:tcon;0:3:qname;?0;0:3:ident;@4d6170;#2;4:5:tcon;4:5:qname;?0;4:5:ident;@4b;#0;7:14:tcon;7:11:qname;?0;7:11:ident;@4c697374;#1;12:13:tcon;12:13:qname;?0;12:13:ident;@56;#0;#0;",
-  )
-}
-
-test "a `>=` closing a type argument list is split into `>` and `=`" {
-  assert_eq(
-    dump_type_of(b"Pair<a>="),
-    "0:7:tcon;0:4:qname;?0;0:4:ident;@50616972;#1;5:6:tvar;5:6:ident;@61;#0;",
-  )
-}
-
-test "a parenthesised type keeps the inner node's own span" {
-  assert_eq(dump_type_of(b"(a)"), "1:2:tvar;1:2:ident;@61;#0;")
-}
-
-test "function types, with and without an effect row" {
-  assert_eq(
-    dump_type_of(b"(Int) -> Bool"),
-    "0:13:tfn;#1;1:4:tcon;1:4:qname;?0;1:4:ident;@496e74;#0;9:13:tcon;9:13:qname;?0;9:13:ident;@426f6f6c;#0;?0;#0;",
+    read_atoms(
+      atoms_text([{ effect: b"m.net", resource: RVar(4), mode: MWrite, op: Some(b"send") }], b","),
+    ),
+    None,
   );
+  assert_eq(read_atoms(b"db"), None);
+  assert_eq(read_atoms(b".read"), None);
+  assert_eq(read_atoms(b"m.db."), None);
+  assert_eq(read_atoms(b"m.db.read[users"), None)
+}
+
+test "the printer names variables in the order it meets them, rows apart" {
+  let sc = {
+    ty_vars: [7, 3],
+    row_vars: [2],
+    label_vars: [],
+    ty: fn_type([TyVar(3), TyVar(7)], list_type(TyVar(3)), row_open(2)),
+  };
+  assert_eq(scheme_text(sc), b"<b, a | e>(a, b) -> List<a> / e");
   assert_eq(
-    dump_type_of(b"() -> Int / e"),
-    "0:13:tfn;#0;6:9:tcon;6:9:qname;?0;6:9:ident;@496e74;#0;?1;12:13:row;#0;#0;?1;12:13:ident;@65;#0;",
+    type_text(
+      TyRecord(fields_sorted([{ name: b"_1", ty: int_type() }, { name: b"_0", ty: bool_type() }])),
+    ),
+    b"(Bool, Int)",
   )
 }
 
-test "an atom carries its mode and its resource, and the row carries its tail" {
+test "two schemes alike but for how their variables are numbered are one scheme renamed" {
+  let send = |v: Int| { effect: b"net", resource: RVar(v), mode: MWrite, op: Some(b"send") };
+  let one = {
+    ty_vars: [7, 3],
+    row_vars: [12],
+    label_vars: [5],
+    ty: fn_type([TyVar(3), list_type(TyVar(7))], TyVar(3), { atoms: [send(5)], tail: Some(12) }),
+  };
+  let two = {
+    ty_vars: [40, 21],
+    row_vars: [2],
+    label_vars: [9],
+    ty: fn_type([TyVar(21), list_type(TyVar(40))], TyVar(21), { atoms: [send(9)], tail: Some(2) }),
+  };
+  assert(one != two);
+  assert_eq(canonical_scheme(one), canonical_scheme(two));
+  assert_eq(canonical_scheme(one), {
+    ty_vars: [0, 1],
+    row_vars: [0],
+    label_vars: [2],
+    ty: fn_type([TyVar(1), list_type(TyVar(0))], TyVar(1), { atoms: [send(2)], tail: Some(0) }),
+  });
+  // Renaming is invisible to the printer.
+  assert_eq(scheme_text(canonical_scheme(one)), scheme_text(one));
+  assert_eq(canonical_type(list_type(TyVar(8))), list_type(TyVar(0)));
+  // A footprint's labels are numbered as its sorted atoms name them, and stay sorted.
+  let recv = { ..send(30), op: Some(b"recv") };
+  assert_eq(canonical_atoms([send(12), recv]), [send(0), { ..send(1), op: Some(b"recv") }])
+}
+
+test "a label variable sorts between a name and the singleton, and resolves to what it binds" {
+  let named = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") };
+  let var_ = { effect: b"net", resource: RVar(4), mode: MWrite, op: Some(b"send") };
+  let single = { effect: b"net", resource: RSingleton, mode: MWrite, op: Some(b"send") };
+  assert(atom_lt(named, var_));
+  assert(atom_lt(var_, single));
   assert_eq(
-    dump_type_of(b"() -> Int / {db.read[users] | e}"),
-    "0:32:tfn;#0;6:9:tcon;6:9:qname;?0;6:9:ident;@496e74;#0;?1;12:32:row;#1;13:27:atm;13:15:qname;?0;13:15:ident;@6462;%read;?1;21:26:ident;@7573657273;#0;?1;30:31:ident;@65;#0;",
-  )
-}
-
-test "an atom may name an operation instead of a mode" {
-  assert_eq(
-    dump_type_of(b"() -> Int / {net.send[conn]}"),
-    "0:28:tfn;#0;6:9:tcon;6:9:qname;?0;6:9:ident;@496e74;#0;?1;12:28:row;#1;13:27:atm;13:16:qname;?0;13:16:ident;@6e6574;%write;17:21:ident;@73656e64;?1;22:26:ident;@636f6e6e;#0;?0;#0;",
-  )
-}
-
-test "a row separates the sets it names from the atoms it writes" {
-  assert_eq(
-    dump_type_of(b"(Int) -> Bool / {Web, io.write}"),
-    "0:31:tfn;#1;1:4:tcon;1:4:qname;?0;1:4:ident;@496e74;#0;9:13:tcon;9:13:qname;?0;9:13:ident;@426f6f6c;#0;?1;16:31:row;#1;22:30:atm;22:24:qname;?0;22:24:ident;@696f;%write;?0;#1;17:20:qname;?0;17:20:ident;@576562;?0;#0;",
-  )
-}
-
-test "a module-qualified type keeps both halves" {
-  assert_eq(dump_type_of(b"m::T"), "0:4:tcon;0:4:qname;?1;0:1:ident;@6d;3:4:ident;@54;#0;#0;")
-}
-
-test "a parenthesised list that is not a parameter list is a tuple type" {
-  assert_eq(
-    dump_type_of(b"(Int, Bool)"),
-    "0:11:trec;#2;1:4:ident;@5f30;1:4:tcon;1:4:qname;?0;1:4:ident;@496e74;#0;6:10:ident;@5f31;6:10:tcon;6:10:qname;?0;6:10:ident;@426f6f6c;#0;#0;",
-  )
-}
-
-test "an unclosed delimiter labels the opener as well as the offending token" {
-  assert_eq(dump_type_of(b"("), "0:0:tbad;#1;!E0001:1:1:2:0;=1:1:1;=0:1:0;")
-}
-
-// `push_diag` drops the `expect_close` that trips at the same offset with the same code.
-test "a token that cannot start a type is one diagnostic and no more" {
-  assert_eq(dump_type_of(b"<"), "0:0:tbad;#1;!E0001:0:1:1:0;=0:1:1;");
-  assert_eq(dump_type_of(b"{x: }"), "0:0:tbad;#1;!E0001:4:5:1:0;=4:5:1;")
-}
-
-test "a type parameter list, with and without effect parameters" {
-  assert_eq(dump_generics_of(b"<a>"), "%gen;#1;1:2:ident;@61;#0;#0;#0;");
-  assert_eq(dump_generics_of(b"<a, b>"), "%gen;#2;1:2:ident;@61;4:5:ident;@62;#0;#0;#0;");
-  assert_eq(dump_generics_of(b"<a | e>"), "%gen;#1;1:2:ident;@61;#1;5:6:ident;@65;#0;#0;");
-  assert_eq(
-    dump_generics_of(b"<a, b | e, f>"),
-    "%gen;#2;1:2:ident;@61;4:5:ident;@62;#2;8:9:ident;@65;11:12:ident;@66;#0;#0;",
-  )
-}
-
-test "a bracketed name in the type parameter list binds a label" {
-  assert_eq(dump_generics_of(b"<[l]>"), "%gen;#0;#0;#1;2:3:ident;@6c;#0;");
-  assert_eq(
-    dump_generics_of(b"<a, [l] | e>"),
-    "%gen;#1;1:2:ident;@61;#1;10:11:ident;@65;#1;5:6:ident;@6c;#0;",
+    row_text(row_closed([single, var_, named])),
+    b"{net.send[conn], net.send[l], net.send}",
   );
-  // One bracket may bind several labels, and two brackets bind the same two.
-  assert_eq(dump_generics_of(b"<[l, k]>"), "%gen;#0;#0;#2;2:3:ident;@6c;5:6:ident;@6b;#0;");
-  assert_eq(dump_generics_of(b"<[l], [k]>"), "%gen;#0;#0;#2;2:3:ident;@6c;7:8:ident;@6b;#0;")
+  // Bound to the label `conn`, the variable atom is the named one and the row holds it once.
+  let s = {
+    ty: map_insert(map_new(), 4, label_type(b"conn")),
+    row: map_new(),
+    rigid_ty: map_new(),
+    rigid_row: map_new(),
+  };
+  assert_eq(atom_text(resolve_atom(s, var_)), b"net.send[conn]");
+  assert_eq(row_text(resolve_row(s, row_closed([var_, named]))), b"{net.send[conn]}")
 }
 
-test "either half of a type parameter list may be empty" {
-  assert_eq(dump_generics_of(b"<|e>"), "%gen;#0;#1;2:3:ident;@65;#0;#0;");
-  assert_eq(dump_generics_of(b"<>"), "%gen;#0;#0;#0;#0;");
-  assert_eq(dump_generics_of(b"<a"), "%gen;#0;#0;#0;#1;!E0001:2:2:1:0;=2:2:1;")
-}
-
-test "an unclosed record type labels its opening brace; a `<` has no opener to label" {
-  assert_eq(dump_type_of(b"{x: Int"), "0:0:tbad;#1;!E0001:7:7:2:0;=7:7:1;=0:1:0;");
-  assert_eq(dump_type_of(b"List<a"), "0:0:tbad;#1;!E0001:6:6:1:0;=6:6:1;")
-}
-
-// `comma_list` breaks on the missing comma, then the close check sees `}`.
-test "a trailing comma in a record type is allowed" {
+// Without the head, a reader has nothing to tell `[l]` the parameter from `[l]` the resource by.
+test "a footprint's text binds the labels its atoms name" {
+  let named = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") };
+  let first = { effect: b"net", resource: RVar(4), mode: MWrite, op: Some(b"recv") };
+  let second = { effect: b"net", resource: RVar(9), mode: MWrite, op: Some(b"send") };
+  assert_eq(atoms_text([named], b","), b"net.send[conn]");
+  assert_eq(atoms_text([], b","), b"");
   assert_eq(
-    dump_type_of(b"{x: Int, }"),
-    "0:10:trec;#1;1:2:ident;@78;4:7:tcon;4:7:qname;?0;4:7:ident;@496e74;#0;#0;",
+    atoms_text([first, second, first], b","),
+    b"<[l],[m]>net.recv[l],net.send[m],net.recv[l]",
+  );
+  assert_eq(atoms_text([named, second], b","), b"<[l]>net.send[conn],net.send[l]")
+}
+
+// The shape `crates/ply-eval-tests` pins for the Rust printer: the two must answer it alike, or a
+// text one of them wrote reads back as something else in the other.
+test "a label variable steps past a resource of its name" {
+  let named = { effect: b"net", resource: RNamed(b"l"), mode: MWrite, op: Some(b"send") };
+  let var_ = { effect: b"net", resource: RVar(4), mode: MWrite, op: Some(b"recv") };
+  assert_eq(atoms_text([named, var_], b","), b"<[m]>net.send[l],net.recv[m]");
+  assert_eq(row_text(row_closed([named, var_])), b"{net.send[l], net.recv[m]}");
+  // One operation under a resource and under the variable: two atoms, and two names.
+  let same_op = { effect: b"net", resource: RVar(4), mode: MWrite, op: Some(b"send") };
+  assert_eq(atoms_text([named, same_op], b","), b"<[m]>net.send[l],net.send[m]");
+  let sc = {
+    ty_vars: [],
+    row_vars: [],
+    label_vars: [4],
+    ty: fn_type([], unit_type(), row_closed([named, var_])),
+  };
+  assert_eq(scheme_text(sc), b"<[m]>() -> Unit / {net.send[l], net.recv[m]}");
+  // A second name in the way takes the next letter again.
+  let held = { effect: b"net", resource: RNamed(b"m"), mode: MWrite, op: Some(b"close") };
+  assert_eq(atoms_text([named, held, var_], b","), b"<[n]>net.send[l],net.close[m],net.recv[n]");
+  // Every letter held, so the variable takes the round.
+  let last = { effect: b"net", resource: RNamed(b"n"), mode: MWrite, op: Some(b"connect") };
+  assert_eq(
+    atoms_text([named, held, last, var_], b","),
+    b"<[l1]>net.send[l],net.close[m],net.connect[n],net.recv[l1]",
   )
+}
+
+test "a free label variable takes the resource the other row names for its operation" {
+  let f0 = fresh_new();
+  let v = fresh_ty_var(f0);
+  let generic = row_closed([
+    { effect: b"net", resource: RVar(v.var), mode: MWrite, op: Some(b"send") },
+  ]);
+  let concrete = row_closed([
+    { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") },
+  ]);
+  let u = unify_row(subst_new(), v.fresh, generic, concrete);
+  assert(match u.error { None -> true, Some(_) -> false });
+  assert_eq(row_text(resolve_row(u.subst, generic)), b"{net.send[conn]}");
+  // A rigid one is the definition's own label and unifies with nothing else.
+  let bad = unify_row(mark_rigid_ty(subst_new(), v.var), v.fresh, generic, concrete);
+  assert(match bad.error { Some(RowMismatch(_)) -> true, _ -> false })
+}
+
+test "a scheme prints its label parameters bracketed, among the type parameters" {
+  let atom = { effect: b"net", resource: RVar(5), mode: MWrite, op: Some(b"send") };
+  let sc = {
+    ty_vars: [1],
+    row_vars: [2],
+    label_vars: [5],
+    ty: fn_type([TyVar(1)], unit_type(), { atoms: [atom], tail: Some(2) }),
+  };
+  assert_eq(scheme_text(sc), b"<a, [l] | e>(a) -> Unit / {net.send[l] | e}");
+  // Renaming the label variable leaves the printed scheme alone.
+  let other = {
+    ty_vars: [1],
+    row_vars: [2],
+    label_vars: [9],
+    ty: fn_type([TyVar(1)], unit_type(), {
+      atoms: [{ effect: b"net", resource: RVar(9), mode: MWrite, op: Some(b"send") }],
+      tail: Some(2),
+    }),
+  };
+  assert_eq(scheme_text(other), scheme_text(sc))
+}
+
+test "instantiating a scheme freshens its label parameters and hands them back" {
+  let atom = { effect: b"net", resource: RVar(5), mode: MWrite, op: Some(b"send") };
+  let sc = {
+    ty_vars: [],
+    row_vars: [],
+    label_vars: [5],
+    ty: fn_type([], unit_type(), row_closed([atom])),
+  };
+  let inst = instantiate_with(sc, fresh_new());
+  assert_eq(len(inst.labels), 1);
+  let bound = match at(inst.labels, 0) { TyVar(v) -> v, _ -> 0 - 1 };
+  assert(bound >= 0);
+  let s = {
+    ty: map_insert(map_new(), bound, label_type(b"conn")),
+    row: map_new(),
+    rigid_ty: map_new(),
+    rigid_row: map_new(),
+  };
+  assert_eq(type_text(resolve_ty(s, inst.ty)), b"() -> Unit / {net.send[conn]}")
+}
+
+test "generalization skips what the environment still reaches" {
+  let f0 = fresh_new();
+  let a = fresh_ty(f0);
+  let b = fresh_ty(a.fresh);
+  let env = env_bind_global(env_new(), b"outer", monomorphic(a.ty));
+  let g = generalize(subst_new(), env, fn_type([a.ty], b.ty, row_empty()));
+  assert_eq(len(g.scheme.ty_vars), 1)
 }

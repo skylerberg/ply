@@ -1,6 +1,6 @@
 // The lowered form the code generator reads: slots resolved and ownership marked.
 
-import spine (Span, Ident, QName, dummy_span, num, span_key)
+import parsing (Span, Ident, QName, dummy_span, int_to_bytes, span_key)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, Lit, LInt, LFixed,
                  LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, has_or,
                  alternatives_of)
@@ -35,14 +35,14 @@ pub type Node =
   // One label argument of a call: the field-table entry of a resource named here.
   | NLabel(Bytes)
   | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
-  | NLambda({ params: Int, size: Int, caps: List<Cap>, body: Code })
-  | NSim({ size: Int, caps: List<Cap>, body: Code })
+  | NLambda({ params: Int, size: Int, captures: List<Capture>, body: Code })
+  | NSimulate({ size: Int, captures: List<Capture>, body: Code })
   // Each branch a nullary `NLambda`, which the run calls on whichever thread it chooses.
-  | NPar({ branches: List<Code> })
-  | NHandle({ body: Code, clauses: List<CClause>, ret: Option<CRet> })
+  | NParallel({ branches: List<Code> })
+  | NHandle({ body: Code, clauses: List<CClause>, ret: Option<CReturn> })
   | NField({ base: Code, field: Bytes })
   // `{..b, f: e}`, recognised in a plain literal where some field is `b.<its own name>` for one slot variable `b`.
-  | NUpd({ base: Code, copies: List<Bytes>, sets: List<CField> })
+  | NUpdate({ base: Code, copies: List<Bytes>, sets: List<CField> })
 
 pub type CField = { name: Bytes, value: Code }
 
@@ -60,7 +60,7 @@ pub type CPatField = { name: Bytes, pat: CPat }
 pub type CArm = { pat: CPat, guard: Option<Code>, body: Code }
 
 // A free name a barrier copies in on entry: its slot outside, its slot here, and how the copy reads it.
-pub type Cap = { src: Int, dst: Int, own: Own }
+pub type Capture = { src: Int, dst: Int, own: Own }
 
 // A handler clause opens its own barrier: its parameters and `resume` binder take the leading slots.
 pub type CClause = {
@@ -74,11 +74,11 @@ pub type CClause = {
   binds_label: Bool,
   resume: Bool,
   size: Int,
-  caps: List<Cap>,
+  captures: List<Capture>,
   body: Code,
 }
 
-pub type CRet = { size: Int, caps: List<Cap>, body: Code }
+pub type CReturn = { size: Int, captures: List<Capture>, body: Code }
 
 // `CLet`'s slot is what the ownership pass drops when it walks backwards past the binder.
 pub type CStmt =
@@ -90,25 +90,32 @@ pub type CStmt =
 // --- the dump ---------------------------------------------------------------
 
 // A resource a label parameter names is the slot it reads, which stays one comma-free word.
-fn res_tag(name: Bytes, label: Option<Code>) -> Bytes =
+fn resource_tag(name: Bytes, label: Option<Code>) -> Bytes =
   match label {
     None -> name,
     Some(c) -> match c.node { NVar(v) -> bytes_concat(b"$", slot_tag(v.slot)), _ -> name },
   }
 
-pub fn dump_lit(l: Lit) -> Bytes / {abort.raise} =
-  match l {
-    LInt(n) -> bytes_concat(b"i", num(n)),
+pub fn dump_lit(literal: Lit) -> Bytes =
+  match literal {
+    LInt(n) -> bytes_concat(b"i", int_to_bytes(n)),
     // Lowercased, so the dump has one spelling whatever case the suffix was written in.
-    LFixed(name, bits) -> bytes_concat_all([b"x", lower_bytes(name), b":", num(bits)]),
+    LFixed(name, bits) -> bytes_concat_all([b"x", lower_bytes(name), b":", int_to_bytes(bits)]),
     LWide(name, high, low) ->
-      bytes_concat_all([b"x", lower_bytes(name), b":", num(high), b":", num(low)]),
+      bytes_concat_all([
+        b"x",
+        lower_bytes(name),
+        b":",
+        int_to_bytes(high),
+        b":",
+        int_to_bytes(low),
+      ]),
     LBool(b) -> if b { b"T" } else { b"F" },
-    LStr(s) -> bytes_concat_all([b"s", num(bytes_len(s)), b":", hex(s)]),
-    LBytes(s) -> bytes_concat_all([b"y", num(bytes_len(s)), b":", hex(s)]),
+    LStr(s) -> bytes_concat_all([b"s", int_to_bytes(bytes_len(s)), b":", hex(s)]),
+    LBytes(s) -> bytes_concat_all([b"y", int_to_bytes(bytes_len(s)), b":", hex(s)]),
     LFloat(_) -> b"f",
-    LDec(r) -> bytes_concat_all([b"d", num(bytes_len(r)), b":", hex(r)]),
-    LChar(v) -> bytes_concat(b"c", num(v)),
+    LDec(r) -> bytes_concat_all([b"d", int_to_bytes(bytes_len(r)), b":", hex(r)]),
+    LChar(v) -> bytes_concat(b"c", int_to_bytes(v)),
     // Parser placeholders: never in a checked program's tree, so they dump as themselves.
     LUnit -> b"u",
     LBad -> b"!",
@@ -128,13 +135,20 @@ pub fn hex(s: Bytes) -> Bytes / {abort.raise} =
     bytes_concat_all([acc, hex_digit(byte / 16), hex_digit(byte % 16)])
   })
 
-fn slot_tag(s: Option<Int>) -> Bytes = match s { Some(n) -> num(n), None -> b"-" }
+fn slot_tag(s: Option<Int>) -> Bytes = match s { Some(n) -> int_to_bytes(n), None -> b"-" }
 
-fn dump_caps(cs: List<Cap>) -> Bytes =
+fn dump_caps(captures: List<Capture>) -> Bytes =
   bytes_concat_all([
     b"[",
-    fold(cs, b"", |acc: Bytes, c: Cap|
-      bytes_concat_all([acc, num(c.src), b">", num(c.dst), own_tag(c.own), b" "])),
+    fold(captures, b"", |acc: Bytes, capture: Capture|
+      bytes_concat_all([
+        acc,
+        int_to_bytes(capture.src),
+        b">",
+        int_to_bytes(capture.dst),
+        own_tag(capture.own),
+        b" ",
+      ])),
     b"]",
   ])
 
@@ -167,7 +181,7 @@ pub fn dump_pat(p: CPat) -> Bytes / {abort.raise} =
       ]),
   }
 
-pub fn dump(c: Code) -> Bytes / {abort.raise} = bytes_concat(own_tag(c.own), dump_node(c.node))
+pub fn dump(code: Code) -> Bytes = bytes_concat(own_tag(code.own), dump_node(code.node))
 
 fn dump_node(n: Node) -> Bytes / {abort.raise} =
   match n {
@@ -179,7 +193,7 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
       bytes_concat_all([
         b"app(",
         dump(a.func),
-        fold(a.args, b"", |acc: Bytes, x: Code| bytes_concat_all([acc, b",", dump(x)])),
+        fold(a.args, b"", |acc: Bytes, code: Code| bytes_concat_all([acc, b",", dump(code)])),
         b")",
       ]),
     NIf(i) ->
@@ -195,10 +209,18 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
     NBlock(b) ->
       bytes_concat_all([
         b"block(",
-        fold(b.stmts, b"", |acc: Bytes, s: CStmt|
-          bytes_concat(acc, match s {
+        fold(b.stmts, b"", |acc: Bytes, stmt: CStmt|
+          bytes_concat(acc, match stmt {
             CLet(l) ->
-              bytes_concat_all([b"let(v:", l.name, b":", num(l.slot), b",", dump(l.value), b"),"]),
+              bytes_concat_all([
+                b"let(v:",
+                l.name,
+                b":",
+                int_to_bytes(l.slot),
+                b",",
+                dump(l.value),
+                b"),",
+              ]),
             CLetPat(l) -> bytes_concat_all([b"let(", dump_pat(l.pat), b",", dump(l.value), b"),"]),
             CDo(d) -> bytes_concat_all([b"do(", dump(d.code), b"),"]),
           })),
@@ -208,7 +230,7 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
     NList(l) ->
       bytes_concat_all([
         b"list(",
-        fold(l.items, b"", |acc: Bytes, x: Code| bytes_concat_all([acc, dump(x), b","])),
+        fold(l.items, b"", |acc: Bytes, code: Code| bytes_concat_all([acc, dump(code), b","])),
         b")",
       ]),
     NRecord(r) ->
@@ -243,7 +265,7 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
         b",",
         p.op,
         b",",
-        res_tag(p.resource, p.label),
+        resource_tag(p.resource, p.label),
         fold(p.args, b"", |acc: Bytes, a: Code| bytes_concat_all([acc, b",", dump(a)])),
         b")",
       ]),
@@ -261,18 +283,18 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
         dump(c.body),
         b")",
       ]),
-    NPar(pr) ->
+    NParallel(pr) ->
       bytes_concat_all([
         b"par(",
-        fold(pr.branches, b"", |acc: Bytes, x: Code| bytes_concat_all([acc, dump(x), b","])),
+        fold(pr.branches, b"", |acc: Bytes, code: Code| bytes_concat_all([acc, dump(code), b","])),
         b")",
       ]),
-    NSim(sm) ->
+    NSimulate(sm) ->
       bytes_concat_all([
         b"sim(",
-        num(sm.size),
+        int_to_bytes(sm.size),
         b",",
-        dump_caps(sm.caps),
+        dump_caps(sm.captures),
         b",",
         dump(sm.body),
         b")",
@@ -289,15 +311,15 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
             b",",
             c.op,
             b",",
-            res_tag(c.resource, c.label),
+            resource_tag(c.resource, c.label),
             b",",
-            num(c.params),
+            int_to_bytes(c.params),
             b",",
             if c.resume { b"true" } else { b"false" },
             b",",
-            num(c.size),
+            int_to_bytes(c.size),
             b",",
-            dump_caps(c.caps),
+            dump_caps(c.captures),
             b",",
             dump(c.body),
             b")",
@@ -306,9 +328,9 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
           Some(r) ->
             bytes_concat_all([
               b",ret(",
-              num(r.size),
+              int_to_bytes(r.size),
               b",",
-              dump_caps(r.caps),
+              dump_caps(r.captures),
               b",",
               dump(r.body),
               b")",
@@ -320,17 +342,17 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
     NLambda(l) ->
       bytes_concat_all([
         b"lam(",
-        num(l.params),
+        int_to_bytes(l.params),
         b",",
-        num(l.size),
+        int_to_bytes(l.size),
         b",",
-        dump_caps(l.caps),
+        dump_caps(l.captures),
         b",",
         dump(l.body),
         b")",
       ]),
     NField(f) -> bytes_concat_all([b"fld(", dump(f.base), b",", f.field, b")"]),
-    NUpd(u) ->
+    NUpdate(u) ->
       bytes_concat_all([
         b"upd(",
         dump(u.base),
@@ -348,53 +370,59 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
 type Bind = { name: Bytes, slot: Int }
 
 // `names` is the barrier's window in order; `scope` is what is visible here, innermost last.
-type Frame = { names: List<Bytes>, scope: List<Bind>, caps: List<Cap>, capnames: List<Bytes> }
+type Frame = {
+  names: List<Bytes>,
+  scope: List<Bind>,
+  captures: List<Capture>,
+  capture_names: List<Bytes>,
+}
 
-fn bind(f: Frame, name: Bytes) -> Frame =
+fn bind(frame: Frame, name: Bytes) -> Frame =
   {
-    names: push(f.names, name),
-    scope: push(f.scope, { name: name, slot: len(f.names) }),
-    caps: f.caps,
-    capnames: f.capnames,
+    names: push(frame.names, name),
+    scope: push(frame.scope, { name: name, slot: len(frame.names) }),
+    captures: frame.captures,
+    capture_names: frame.capture_names,
   }
 
-fn find(f: Frame, name: Bytes) -> Option<Int> =
-  fold(f.scope, None, |acc: Option<Int>, b: Bind| if b.name == name { Some(b.slot) } else { acc })
+fn find(frame: Frame, name: Bytes) -> Option<Int> =
+  fold(frame.scope, None, |acc: Option<Int>, b: Bind|
+    if b.name == name { Some(b.slot) } else { acc })
 
 // The barriers in scope, innermost last. A free name is threaded through every barrier between use and binding.
 type Stack = { frames: List<Frame>, labels: List<Bytes>, sites: Map<Bytes, List<Bytes>> }
 
-fn st_top(st: Stack) -> Frame =
-  match list_at(st.frames, len(st.frames) - 1) { Some(f) -> f, None -> empty_frame() }
+fn st_top(stack: Stack) -> Frame =
+  match list_at(stack.frames, len(stack.frames) - 1) { Some(f) -> f, None -> empty_frame() }
 
-fn empty_frame() -> Frame = { names: [], scope: [], caps: [], capnames: [] }
+fn empty_frame() -> Frame = { names: [], scope: [], captures: [], capture_names: [] }
 
-fn st_at(st: Stack, i: Int) -> Frame =
-  match list_at(st.frames, i) { Some(f) -> f, None -> empty_frame() }
+fn st_at(stack: Stack, i: Int) -> Frame =
+  match list_at(stack.frames, i) { Some(f) -> f, None -> empty_frame() }
 
-fn st_set(st: Stack, i: Int, f: Frame) -> Stack =
+fn st_set(stack: Stack, i: Int, frame: Frame) -> Stack =
   {
-    frames: map(range(0, len(st.frames)), |j: Int| if j == i { f } else { st_at(st, j) }),
-    labels: st.labels,
-    sites: st.sites,
+    frames: map(range(0, len(stack.frames)), |j: Int| if j == i { frame } else { st_at(stack, j) }),
+    labels: stack.labels,
+    sites: stack.sites,
   }
 
-fn st_top_set(st: Stack, f: Frame) -> Stack = st_set(st, len(st.frames) - 1, f)
+fn st_top_set(stack: Stack, frame: Frame) -> Stack = st_set(stack, len(stack.frames) - 1, frame)
 
-fn st_push(st: Stack, f: Frame) -> Stack =
-  { frames: push(st.frames, f), labels: st.labels, sites: st.sites }
+fn st_push(stack: Stack, frame: Frame) -> Stack =
+  { frames: push(stack.frames, frame), labels: stack.labels, sites: stack.sites }
 
-fn st_pop(st: Stack) -> Stack =
+fn st_pop(stack: Stack) -> Stack =
   {
-    frames: map(range(0, len(st.frames) - 1), |j: Int| st_at(st, j)),
-    labels: st.labels,
-    sites: st.sites,
+    frames: map(range(0, len(stack.frames) - 1), |j: Int| st_at(stack, j)),
+    labels: stack.labels,
+    sites: stack.sites,
   }
 
 // The depth whose barrier has `name` in scope or already captures it, innermost first.
-fn st_depth(st: Stack, name: Bytes) -> Option<Int> =
-  fold(range(0, len(st.frames)), None, |acc: Option<Int>, i: Int| {
-    let f = st_at(st, i);
+fn st_depth(stack: Stack, name: Bytes) -> Option<Int> =
+  fold(range(0, len(stack.frames)), None, |acc: Option<Int>, i: Int| {
+    let f = st_at(stack, i);
     match find(f, name) {
       Some(_) -> Some(i),
       None -> match find_cap(f, name) { Some(_) -> Some(i), None -> acc },
@@ -405,78 +433,87 @@ fn slot_in(f: Frame, name: Bytes) -> Option<Int> =
   match find(f, name) { Some(s) -> Some(s), None -> find_cap(f, name) }
 
 // Resolves `name` at the innermost barrier, threading a capture through every barrier between when it is free.
-type Resolved = { slot: Option<Int>, st: Stack }
+type SlotLookup = { slot: Option<Int>, stack: Stack }
 
-fn resolve(st: Stack, name: Bytes) -> Resolved =
-  match st_depth(st, name) {
-    None -> { slot: None, st: st },
+fn resolve(stack: Stack, name: Bytes) -> SlotLookup =
+  match st_depth(stack, name) {
+    None -> { slot: None, stack: stack },
     Some(d) -> {
-      let start = match slot_in(st_at(st, d), name) { Some(s) -> s, None -> 0 };
-      fold(range(d + 1, len(st.frames)), { slot: Some(start), st: st }, |acc: Resolved, i: Int| {
-        let f = st_at(acc.st, i);
-        let from = match acc.slot { Some(s) -> s, None -> 0 };
-        match find_cap(f, name) {
-          Some(s) -> { slot: Some(s), st: acc.st },
-          None -> {
-            let g = capture(f, name, from);
-            { slot: find_cap(g, name), st: st_set(acc.st, i, g) }
-          },
-        }
-      })
+      let start = match slot_in(st_at(stack, d), name) { Some(s) -> s, None -> 0 };
+      fold(
+        range(d + 1, len(stack.frames)),
+        { slot: Some(start), stack: stack },
+        |acc: SlotLookup, i: Int| {
+          let f = st_at(acc.stack, i);
+          let from = match acc.slot { Some(s) -> s, None -> 0 };
+          match find_cap(f, name) {
+            Some(s) -> { slot: Some(s), stack: acc.stack },
+            None -> {
+              let g = capture(f, name, from);
+              { slot: find_cap(g, name), stack: st_set(acc.stack, i, g) }
+            },
+          }
+        },
+      )
     },
   }
 
 // A resource a label binder holds is read like any other name, captures threaded and all.
-fn label_code(st: Stack, name: Bytes) -> Option<Out> =
-  if !has_bytes(st.labels, name) { None } else {
-    let r = resolve(st, name);
+fn label_code(stack: Stack, name: Bytes) -> Option<Lowered> =
+  if !has_bytes(stack.labels, name) { None } else {
+    let r = resolve(stack, name);
     Some({
       code: { own: Borrowed, span: dummy_span(), node: NVar({ name: name, slot: r.slot }) },
-      st: r.st,
+      stack: r.stack,
     })
   }
 
-type Labels = { codes: List<Code>, st: Stack }
+type Labels = { codes: List<Code>, stack: Stack }
 
 // The labels a call fills: this body's own parameter, or a field-table entry of the name.
-fn label_args(st: Stack, s: Span) -> Labels =
+fn label_args(stack: Stack, span: Span) -> Labels =
   fold(
-    match map_get(st.sites, span_key(s)) { Some(xs) -> xs, None -> [] },
-    { codes: [], st: st },
+    match map_get(stack.sites, span_key(span)) { Some(xs) -> xs, None -> [] },
+    { codes: [], stack: stack },
     |acc: Labels, n: Bytes|
-      match label_code(acc.st, n) {
-        Some(o) -> { codes: push(acc.codes, o.code), st: o.st },
+      match label_code(acc.stack, n) {
+        Some(o) -> { codes: push(acc.codes, o.code), stack: o.stack },
         None ->
           {
             codes: push(acc.codes, { own: Borrowed, span: dummy_span(), node: NLabel(n) }),
-            st: acc.st,
+            stack: acc.stack,
           },
       },
   )
 
 // A block's binders leave scope at its end, but the slots they took are never reused.
-fn bind_st(st: Stack, name: Bytes) -> Stack = st_top_set(st, bind(st_top(st), name))
+fn bind_st(stack: Stack, name: Bytes) -> Stack = st_top_set(stack, bind(st_top(stack), name))
 
-fn unscope(f: Frame, to: Int) -> Frame =
-  { names: f.names, scope: take(f.scope, to), caps: f.caps, capnames: f.capnames }
+fn unscope(frame: Frame, to: Int) -> Frame =
+  {
+    names: frame.names,
+    scope: take(frame.scope, to),
+    captures: frame.captures,
+    capture_names: frame.capture_names,
+  }
 
-fn unscope_st(st: Stack, to: Int) -> Stack = st_top_set(st, unscope(st_top(st), to))
+fn unscope_st(stack: Stack, to: Int) -> Stack = st_top_set(stack, unscope(st_top(stack), to))
 
-fn depth_of(st: Stack) -> Int = len(st_top(st).scope)
+fn depth_of(stack: Stack) -> Int = len(st_top(stack).scope)
 
-fn find_cap(f: Frame, name: Bytes) -> Option<Int> =
-  fold(range(0, len(f.capnames)), None, |acc: Option<Int>, i: Int|
-    if nth_bytes(f.capnames, i) == name {
-      match list_at(f.caps, i) { Some(c) -> Some(c.dst), None -> acc }
+fn find_cap(frame: Frame, name: Bytes) -> Option<Int> =
+  fold(range(0, len(frame.capture_names)), None, |acc: Option<Int>, i: Int|
+    if nth_bytes(frame.capture_names, i) == name {
+      match list_at(frame.captures, i) { Some(c) -> Some(c.dst), None -> acc }
     } else { acc })
 
 // The own mark is `Borrowed` here; the enclosing barrier's backward pass rewrites it.
-fn capture(f: Frame, name: Bytes, src: Int) -> Frame =
+fn capture(frame: Frame, name: Bytes, src: Int) -> Frame =
   {
-    names: push(f.names, name),
-    scope: f.scope,
-    caps: push(f.caps, { src: src, dst: len(f.names), own: Borrowed }),
-    capnames: push(f.capnames, name),
+    names: push(frame.names, name),
+    scope: frame.scope,
+    captures: push(frame.captures, { src: src, dst: len(frame.names), own: Borrowed }),
+    capture_names: push(frame.capture_names, name),
   }
 
 fn take(xs: List<Bind>, n: Int) -> List<Bind> =
@@ -507,11 +544,12 @@ pub fn covers() -> List<Bytes> =
     b"handle with its clauses and return arm, and simulate",
   ]
 
-type Out = { code: Code, st: Stack }
+type Lowered = { code: Code, stack: Stack }
 
-fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
+fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
   match e {
-    ELit(x) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NLit(x.lit) }, st: st }),
+    ELit(x) ->
+      Some({ code: { own: Borrowed, span: expr_span(e), node: NLit(x.lit) }, stack: stack }),
     // `ERecordUpdate` is written out as a literal before lowering; `as_update` recognises the result.
     EVar(x) -> match x.name.module {
       // A qualified name is a global, never a slot: a module binder cannot be shadowed by a local.
@@ -522,28 +560,28 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
             span: expr_span(e),
             node: NVar({ name: bytes_concat_all([m.name, b"::", x.name.name.name]), slot: None }),
           },
-          st: st,
+          stack: stack,
         }),
       None -> {
         let name = x.name.name.name;
-        let r = resolve(st, name);
+        let r = resolve(stack, name);
         Some({
           code: { own: Borrowed, span: expr_span(e), node: NVar({ name: name, slot: r.slot }) },
-          st: r.st,
+          stack: r.stack,
         })
       },
     },
-    EUnary(x) -> match lower_in(x.operand, st) {
+    EUnary(x) -> match lower_in(x.operand, stack) {
       Some(o) ->
         Some({
           code: { own: Borrowed, span: expr_span(e), node: NUnary({ op: x.op, operand: o.code }) },
-          st: o.st,
+          stack: o.stack,
         }),
       None -> None,
     },
-    EBinary(x) -> match lower_in(x.lhs, st) {
+    EBinary(x) -> match lower_in(x.lhs, stack) {
       None -> None,
-      Some(l) -> match lower_in(x.rhs, l.st) {
+      Some(l) -> match lower_in(x.rhs, l.stack) {
         None -> None,
         Some(r) ->
           Some({
@@ -552,15 +590,15 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
               span: expr_span(e),
               node: NBinary({ op: x.op, lhs: l.code, rhs: r.code }),
             },
-            st: r.st,
+            stack: r.stack,
           }),
       },
     },
-    EIf(x) -> match lower_in(x.cond, st) {
+    EIf(x) -> match lower_in(x.cond, stack) {
       None -> None,
-      Some(c) -> match lower_in(x.then_branch, c.st) {
+      Some(c) -> match lower_in(x.then_branch, c.stack) {
         None -> None,
-        Some(t) -> match lower_in(x.else_branch, t.st) {
+        Some(t) -> match lower_in(x.else_branch, t.stack) {
           None -> None,
           Some(el) ->
             Some({
@@ -569,12 +607,12 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
                 span: expr_span(e),
                 node: NIf({ cond: c.code, then_branch: t.code, else_branch: el.code }),
               },
-              st: el.st,
+              stack: el.stack,
             }),
         },
       },
     },
-    EField(x) -> match lower_in(x.base, st) {
+    EField(x) -> match lower_in(x.base, stack) {
       Some(b) ->
         Some({
           code: {
@@ -582,21 +620,21 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
             span: expr_span(e),
             node: NField({ base: b.code, field: x.field.name }),
           },
-          st: b.st,
+          stack: b.stack,
         }),
       None -> None,
     },
-    EList(x) -> match lower_seq(x.items, st) {
+    EList(x) -> match lower_seq(x.items, stack) {
       Some(r) ->
         Some({
           code: { own: Borrowed, span: expr_span(e), node: NList({ items: r.codes }) },
-          st: r.st,
+          stack: r.stack,
         }),
       None -> None,
     },
-    ERecord(x) -> match as_update(x.fields, st) {
+    ERecord(x) -> match as_update(x.fields, stack) {
       Some(u) -> Some(u),
-      None -> match lower_seq(map(x.fields, |fd: RecField| fd.value), st) {
+      None -> match lower_seq(map(x.fields, |field: RecField| field.value), stack) {
         None -> None,
         Some(r) ->
           Some({
@@ -608,52 +646,52 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
                   { name: field_name(x.fields, i), value: nth(r.codes, i) }),
               }),
             },
-            st: r.st,
+            stack: r.stack,
           }),
       },
     },
     EApp(x) -> if len(x.named) > 0 { None } else {
-      match lower_in(x.func, st) {
+      match lower_in(x.func, stack) {
         None -> None,
-        Some(fu) -> match lower_seq(x.args, fu.st) {
+        Some(fu) -> match lower_seq(x.args, fu.stack) {
           Some(r) -> {
-            let ls = label_args(r.st, expr_span(e));
+            let ls = label_args(r.stack, expr_span(e));
             Some({
               code: {
                 own: Borrowed,
                 span: expr_span(e),
                 node: NApp({
                   func: fu.code,
-                  args: fold(ls.codes, r.codes, |acc: List<Code>, cd: Code| push(acc, cd)),
+                  args: fold(ls.codes, r.codes, |acc: List<Code>, code: Code| push(acc, code)),
                 }),
               },
-              st: ls.st,
+              stack: ls.stack,
             })
           },
           None -> None,
         },
       }
     },
-    EMatch(x) -> match lower_in(x.scrutinee, st) {
+    EMatch(x) -> match lower_in(x.scrutinee, stack) {
       None -> None,
       Some(sc) -> {
-        let depth = depth_of(sc.st);
+        let depth = depth_of(sc.stack);
         let walked = fold(
           one_per_alternative(x.arms),
-          { arms: [], st: sc.st, ok: true },
-          |acc: ArmAcc, a: MatchArm|
+          { arms: [], stack: sc.stack, ok: true },
+          |acc: ArmAcc, arm: MatchArm|
             if !acc.ok { acc } else {
               // Arm binders leave scope at the arm's end; their slots are not reused.
-              let pd = depth_of(acc.st);
-              let pat = lower_pat(a.pat, acc.st);
-              match lower_guard(a.guard, pat.st) {
-                None -> { arms: acc.arms, st: acc.st, ok: false },
-                Some(g) -> match lower_in(a.body, g.st) {
-                  None -> { arms: acc.arms, st: acc.st, ok: false },
+              let pd = depth_of(acc.stack);
+              let pat = lower_pat(arm.pat, acc.stack);
+              match lower_guard(arm.guard, pat.stack) {
+                None -> { arms: acc.arms, stack: acc.stack, ok: false },
+                Some(g) -> match lower_in(arm.body, g.stack) {
+                  None -> { arms: acc.arms, stack: acc.stack, ok: false },
                   Some(b) ->
                     {
                       arms: push(acc.arms, { pat: pat.pat, guard: g.code, body: b.code }),
-                      st: unscope_st(b.st, pd),
+                      stack: unscope_st(b.stack, pd),
                       ok: true,
                     },
                 },
@@ -667,16 +705,16 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
               span: expr_span(e),
               node: NMatch({ scrutinee: sc.code, arms: walked.arms }),
             },
-            st: unscope_st(walked.st, depth),
+            stack: unscope_st(walked.stack, depth),
           })
         }
       },
     },
-    EPerform(x) -> match lower_seq(x.args, st) {
+    EPerform(x) -> match lower_seq(x.args, stack) {
       None -> None,
       Some(r) -> {
         let name = match x.resource { Some(id) -> id.name, None -> b"" };
-        let lb = label_code(r.st, name);
+        let lb = label_code(r.stack, name);
         Some({
           code: {
             own: Borrowed,
@@ -689,16 +727,16 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
               args: r.codes,
             }),
           },
-          st: match lb { Some(o) -> o.st, None -> r.st },
+          stack: match lb { Some(o) -> o.stack, None -> r.stack },
         })
       },
     },
     // The binder is in scope for the body only; the init is evaluated before it exists.
-    EWithCell(x) -> match lower_in(x.init, st) {
+    EWithCell(x) -> match lower_in(x.init, stack) {
       None -> None,
       Some(i) -> {
-        let depth = depth_of(i.st);
-        let inner = bind_st(i.st, x.binder.name);
+        let depth = depth_of(i.stack);
+        let inner = bind_st(i.stack, x.binder.name);
         match lower_in(x.body, inner) {
           None -> None,
           Some(b) ->
@@ -714,57 +752,61 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
                   body: b.code,
                 }),
               },
-              st: unscope_st(b.st, depth),
+              stack: unscope_st(b.stack, depth),
             }),
         }
       },
     },
     // A lambda opens its own barrier; a name it reads from outside becomes a capture.
     ELambda(x) -> {
-      let params = map(x.params, |p: Param| p.name.name);
+      let params = map(x.params, |param: Param| param.name.name);
       let inner = fold(
         params,
-        { names: [], scope: [], caps: [], capnames: [] },
+        { names: [], scope: [], captures: [], capture_names: [] },
         |g: Frame, n: Bytes| bind(g, n),
       );
-      match lower_in(x.body, st_push(st, inner)) {
+      match lower_in(x.body, st_push(stack, inner)) {
         None -> None,
         Some(b) -> Some(lam_of(params, b)),
       }
     },
     // `simulate` opens a barrier, as a lambda does, and takes no parameters.
-    ESimulate(x) -> match lower_in(x.body, st_push(st, empty_frame())) {
+    ESimulate(x) -> match lower_in(x.body, st_push(stack, empty_frame())) {
       None -> None,
       Some(b) -> {
-        let inner = st_top(b.st);
+        let inner = st_top(b.stack);
         Some({
           code: {
             own: Borrowed,
             span: expr_span(e),
-            node: NSim({ size: len(inner.names), caps: inner.caps, body: mark(b.code, []).code }),
+            node: NSimulate({
+              size: len(inner.names),
+              captures: inner.captures,
+              body: mark(b.code, []).code,
+            }),
           },
-          st: st_pop(b.st),
+          stack: st_pop(b.stack),
         })
       },
     },
     EParallel(x) -> match lower_seq(
         map(x.branches, |b: Expr| ELambda({ span: expr_span(b), body: b, params: [], ret: None })),
-        st,
+        stack,
       ) {
       None -> None,
       Some(r) ->
         Some({
-          code: { own: Borrowed, span: expr_span(e), node: NPar({ branches: r.codes }) },
-          st: r.st,
+          code: { own: Borrowed, span: expr_span(e), node: NParallel({ branches: r.codes }) },
+          stack: r.stack,
         }),
     },
     // The body runs in the enclosing barrier; each clause opens its own, led by its parameters and `resume`.
-    EHandle(x) -> match lower_in(x.body, st) {
+    EHandle(x) -> match lower_in(x.body, stack) {
       None -> None,
       Some(b) -> {
         let cls = fold(
           x.clauses,
-          { clauses: [], st: b.st, ok: true },
+          { clauses: [], stack: b.stack, ok: true },
           |acc: ClauseAcc, c: HandleClause|
             if !acc.ok { acc } else {
               let named = map(c.params, |i: Ident| i.name);
@@ -782,12 +824,12 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
               // label the table is asked about.
               let res = if c.every_label { b"*" }
               else { match c.resource { Some(id) -> id.name, None -> b"" } };
-              let lb = label_code(acc.st, res);
-              let outer = match lb { Some(o) -> o.st, None -> acc.st };
+              let lb = label_code(acc.stack, res);
+              let outer = match lb { Some(o) -> o.stack, None -> acc.stack };
               match lower_in(c.body, st_push(outer, inner)) {
-                None -> { clauses: acc.clauses, st: acc.st, ok: false },
+                None -> { clauses: acc.clauses, stack: acc.stack, ok: false },
                 Some(cb) -> {
-                  let f = st_top(cb.st);
+                  let f = st_top(cb.stack);
                   {
                     clauses: push(acc.clauses, {
                       effect: qname_text(c.eff),
@@ -798,10 +840,10 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
                       binds_label: match c.label_binder { Some(_) -> true, None -> false },
                       resume: match c.resume { Some(_) -> true, None -> false },
                       size: len(f.names),
-                      caps: f.caps,
+                      captures: f.captures,
                       body: mark(cb.code, []).code,
                     }),
-                    st: st_pop(cb.st),
+                    stack: st_pop(cb.stack),
                     ok: true,
                   }
                 },
@@ -817,14 +859,14 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
                   span: expr_span(e),
                   node: NHandle({ body: b.code, clauses: cls.clauses, ret: None }),
                 },
-                st: cls.st,
+                stack: cls.stack,
               }),
             Some(r) -> {
               let inner = bind(empty_frame(), r.binder.name);
-              match lower_in(r.body, st_push(cls.st, inner)) {
+              match lower_in(r.body, st_push(cls.stack, inner)) {
                 None -> None,
                 Some(rb) -> {
-                  let f = st_top(rb.st);
+                  let f = st_top(rb.stack);
                   Some({
                     code: {
                       own: Borrowed,
@@ -834,12 +876,12 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
                         clauses: cls.clauses,
                         ret: Some({
                           size: len(f.names),
-                          caps: f.caps,
+                          captures: f.captures,
                           body: mark(rb.code, []).code,
                         }),
                       }),
                     },
-                    st: st_pop(rb.st),
+                    stack: st_pop(rb.stack),
                   })
                 },
               }
@@ -848,7 +890,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> / {abort.raise} =
         }
       },
     },
-    EBlock(x) -> lower_block(x.stmts, x.tail, st),
+    EBlock(x) -> lower_block(x.stmts, x.tail, stack),
     _ -> None,
   }
 
@@ -859,14 +901,14 @@ fn field_name(fs: List<RecField>, i: Int) -> Bytes =
 // the base is read after every written field, which `mark` has to reflect.
 fn as_update(
   fields: List<RecField>,
-  st: Stack,
-) -> Option<{ code: Code, st: Stack }> / {abort.raise} = {
+  stack: Stack,
+) -> Option<{ code: Code, stack: Stack }> / {abort.raise} = {
   // Two different copied-from variables make this a plain literal.
   let copies = fold(
     fields,
     { names: [], bad: false },
     |acc: { names: List<Bytes>, bad: Bool }, f: RecField|
-      match copy_base(f, st) {
+      match copy_base(f, stack) {
         None -> acc,
         Some(n) -> if len(acc.names) == 0 { { names: [n], bad: acc.bad } }
         else if nth_bytes(acc.names, 0) == n { acc }
@@ -879,41 +921,46 @@ fn as_update(
       fold(fields, None, |acc: Option<Bytes>, f: RecField|
         match acc {
           Some(_) -> acc,
-          None -> if copy_base(f, st) != None { None } else { projected_var(f.value, st, []) },
+          None -> if copy_base(f, stack) != None { None }
+          else { projected_var(f.value, stack, []) },
         })
     };
     match base {
       None -> None,
       Some(name) -> {
         // Walked in field order, so each copy resolves the base, and each capture is numbered, where it stands.
-        let walked = fold(fields, Some({ codes: [], st: st }), |acc: Option<Seq>, f: RecField|
-          match acc {
-            None -> None,
-            Some(a) -> if copy_base(f, st) == Some(name) {
-              Some({ codes: a.codes, st: resolve(a.st, name).st })
-            } else {
-              match lower_in(f.value, a.st) {
-                None -> None,
-                Some(o) -> Some({ codes: push(a.codes, o.code), st: o.st }),
-              }
+        let walked = fold(
+          fields,
+          Some({ codes: [], stack: stack }),
+          |acc: Option<Seq>, f: RecField|
+            match acc {
+              None -> None,
+              Some(a) -> if copy_base(f, stack) == Some(name) {
+                Some({ codes: a.codes, stack: resolve(a.stack, name).stack })
+              } else {
+                match lower_in(f.value, a.stack) {
+                  None -> None,
+                  Some(o) -> Some({ codes: push(a.codes, o.code), stack: o.stack }),
+                }
+              },
             },
-          });
+        );
         match walked {
           None -> None,
-          Some(o) -> match resolve(o.st, name).slot {
+          Some(o) -> match resolve(o.stack, name).slot {
             None -> None,
             Some(sl) -> {
               let copied = fold(fields, [], |acc: List<Bytes>, f: RecField|
-                match copy_base(f, st) {
+                match copy_base(f, stack) {
                   Some(n) -> if n == name { push(acc, f.name.name) } else { acc },
                   None -> acc,
                 });
-              let sets = filter(fields, |f: RecField| copy_base(f, st) != Some(name));
+              let sets = filter(fields, |f: RecField| copy_base(f, stack) != Some(name));
               Some({
                 code: {
                   own: Borrowed,
                   span: dummy_span(),
-                  node: NUpd({
+                  node: NUpdate({
                     base: {
                       own: Borrowed,
                       span: dummy_span(),
@@ -927,7 +974,7 @@ fn as_update(
                       }),
                   }),
                 },
-                st: o.st,
+                stack: o.stack,
               })
             },
           },
@@ -938,12 +985,15 @@ fn as_update(
 }
 
 // The bare in-scope variable a field copies from, when the field is `b.<its own name>`.
-fn copy_base(f: RecField, st: Stack) -> Option<Bytes> =
-  match f.value {
-    EField(x) -> if x.field.name != f.name.name { None } else {
+fn copy_base(field: RecField, stack: Stack) -> Option<Bytes> =
+  match field.value {
+    EField(x) -> if x.field.name != field.name.name { None } else {
       match x.base {
         EVar(v) -> if v.name.module != None { None } else {
-          match st_depth(st, v.name.name.name) { Some(_) -> Some(v.name.name.name), None -> None }
+          match st_depth(stack, v.name.name.name) {
+            Some(_) -> Some(v.name.name.name),
+            None -> None,
+          }
         },
         _ -> None,
       }
@@ -952,68 +1002,68 @@ fn copy_base(f: RecField, st: Stack) -> Option<Bytes> =
   }
 
 // The first in-scope variable a field read projects from inside `e`; a name `e` binds itself is never the base.
-fn projected_var(e: Expr, st: Stack, inner: List<Bytes>) -> Option<Bytes> = {
-  let first = |xs: List<Expr>|
-    fold(xs, None, |acc: Option<Bytes>, x: Expr|
-      match acc { Some(_) -> acc, None -> projected_var(x, st, inner) });
+fn projected_var(e: Expr, stack: Stack, inner: List<Bytes>) -> Option<Bytes> = {
+  let first = |exprs: List<Expr>|
+    fold(exprs, None, |acc: Option<Bytes>, x: Expr|
+      match acc { Some(_) -> acc, None -> projected_var(x, stack, inner) });
   match e {
     EField(x) -> match x.base {
       EVar(v) -> if v.name.module == None && !has_bytes(inner, v.name.name.name)
-          && st_depth(st, v.name.name.name) != None { Some(v.name.name.name) }
-      else { projected_var(x.base, st, inner) },
-      _ -> projected_var(x.base, st, inner),
+          && st_depth(stack, v.name.name.name) != None { Some(v.name.name.name) }
+      else { projected_var(x.base, stack, inner) },
+      _ -> projected_var(x.base, stack, inner),
     },
-    EUnary(x) -> projected_var(x.operand, st, inner),
+    EUnary(x) -> projected_var(x.operand, stack, inner),
     EBinary(x) -> first([x.lhs, x.rhs]),
     EApp(x) -> first(push_front(x.args, x.func)),
     EIf(x) -> first([x.cond, x.then_branch, x.else_branch]),
-    EMatch(x) -> projected_var(x.scrutinee, st, inner),
+    EMatch(x) -> projected_var(x.scrutinee, stack, inner),
     EBlock(x) -> {
       let walked = fold(
         x.stmts,
         { found: None, inner: inner },
-        |acc: { found: Option<Bytes>, inner: List<Bytes> }, s: Stmt|
+        |acc: { found: Option<Bytes>, inner: List<Bytes> }, stmt: Stmt|
           match acc.found {
             Some(_) -> acc,
-            None -> match s {
+            None -> match stmt {
               SLet(l) ->
                 {
-                  found: projected_var(l.value, st, acc.inner),
+                  found: projected_var(l.value, stack, acc.inner),
                   inner: pat_binders(l.pat, acc.inner),
                 },
               SLetElse(l) ->
                 {
-                  found: match projected_var(l.value, st, acc.inner) {
+                  found: match projected_var(l.value, stack, acc.inner) {
                     Some(n) -> Some(n),
-                    None -> projected_var(l.fallback, st, acc.inner),
+                    None -> projected_var(l.fallback, stack, acc.inner),
                   },
                   inner: pat_binders(l.pat, acc.inner),
                 },
-              SExpr(v) -> { found: projected_var(v, st, acc.inner), inner: acc.inner },
+              SExpr(v) -> { found: projected_var(v, stack, acc.inner), inner: acc.inner },
             },
           },
       );
       match walked.found {
         Some(n) -> Some(n),
-        None -> match x.tail { Some(t) -> projected_var(t, st, walked.inner), None -> None },
+        None -> match x.tail { Some(t) -> projected_var(t, stack, walked.inner), None -> None },
       }
     },
-    ERecord(x) -> first(map(x.fields, |f: RecField| f.value)),
-    ERecordUpdate(x) -> first(push_front(map(x.fields, |f: RecField| f.value), x.base)),
-    ETry(x) -> projected_var(x.operand, st, inner),
+    ERecord(x) -> first(map(x.fields, |field: RecField| field.value)),
+    ERecordUpdate(x) -> first(push_front(map(x.fields, |field: RecField| field.value), x.base)),
+    ETry(x) -> projected_var(x.operand, stack, inner),
     EList(x) -> first(x.items),
     EPerform(x) -> first(x.args),
-    EHandle(x) -> projected_var(x.body, st, inner),
-    EWithCell(x) -> match projected_var(x.init, st, inner) {
+    EHandle(x) -> projected_var(x.body, stack, inner),
+    EWithCell(x) -> match projected_var(x.init, stack, inner) {
       Some(n) -> Some(n),
-      None -> projected_var(x.body, st, push(inner, x.binder.name)),
+      None -> projected_var(x.body, stack, push(inner, x.binder.name)),
     },
     _ -> None,
   }
 }
 
-fn push_front(xs: List<Expr>, x: Expr) -> List<Expr> =
-  fold(xs, [x], |acc: List<Expr>, y: Expr| push(acc, y))
+fn push_front(exprs: List<Expr>, x: Expr) -> List<Expr> =
+  fold(exprs, [x], |acc: List<Expr>, y: Expr| push(acc, y))
 
 fn has_bytes(xs: List<Bytes>, x: Bytes) -> Bool =
   fold(xs, false, |acc: Bool, y: Bytes| acc || y == x)
@@ -1035,27 +1085,27 @@ fn pat_binders(p: Pattern, out: List<Bytes>) -> List<Bytes> =
     PBad(_) -> out,
   }
 
-fn nth(cs: List<Code>, i: Int) -> Code =
-  match list_at(cs, i) {
+fn nth(codes: List<Code>, i: Int) -> Code =
+  match list_at(codes, i) {
     Some(c) -> c,
     None -> { own: Borrowed, span: dummy_span(), node: NLit(LUnit) },
   }
 
-type Seq = { codes: List<Code>, st: Stack }
+type Seq = { codes: List<Code>, stack: Stack }
 
-fn lower_seq(xs: List<Expr>, st: Stack) -> Option<Seq> / {abort.raise} =
-  fold(xs, Some({ codes: [], st: st }), |acc: Option<Seq>, x: Expr|
+fn lower_seq(exprs: List<Expr>, stack: Stack) -> Option<Seq> =
+  fold(exprs, Some({ codes: [], stack: stack }), |acc: Option<Seq>, expr: Expr|
     match acc {
       None -> None,
-      Some(s) -> match lower_in(x, s.st) {
-        Some(o) -> Some({ codes: push(s.codes, o.code), st: o.st }),
+      Some(s) -> match lower_in(expr, s.stack) {
+        Some(o) -> Some({ codes: push(s.codes, o.code), stack: o.stack }),
         None -> None,
       },
     })
 
 // Pops the lambda's barrier; the stack below keeps the captures threaded into it.
-fn lam_of(params: List<Bytes>, b: Out) -> Out = {
-  let inner = st_top(b.st);
+fn lam_of(params: List<Bytes>, b: Lowered) -> Lowered = {
+  let inner = st_top(b.stack);
   {
     code: {
       own: Borrowed,
@@ -1063,49 +1113,49 @@ fn lam_of(params: List<Bytes>, b: Out) -> Out = {
       node: NLambda({
         params: len(params),
         size: len(inner.names),
-        caps: inner.caps,
+        captures: inner.captures,
         body: mark(b.code, []).code,
       }),
     },
-    st: st_pop(b.st),
+    stack: st_pop(b.stack),
   }
 }
 
-type ClauseAcc = { clauses: List<CClause>, st: Stack, ok: Bool }
+type ClauseAcc = { clauses: List<CClause>, stack: Stack, ok: Bool }
 
-type ArmAcc = { arms: List<CArm>, st: Stack, ok: Bool }
+type ArmAcc = { arms: List<CArm>, stack: Stack, ok: Bool }
 
-type GuardOut = { code: Option<Code>, st: Stack }
+type GuardOut = { code: Option<Code>, stack: Stack }
 
-fn lower_guard(g: Option<Expr>, st: Stack) -> Option<GuardOut> / {abort.raise} =
-  match g {
-    None -> Some({ code: None, st: st }),
-    Some(e) -> match lower_in(e, st) {
+fn lower_guard(expr: Option<Expr>, stack: Stack) -> Option<GuardOut> =
+  match expr {
+    None -> Some({ code: None, stack: stack }),
+    Some(e) -> match lower_in(e, stack) {
       None -> None,
-      Some(o) -> Some({ code: Some(o.code), st: o.st }),
+      Some(o) -> Some({ code: Some(o.code), stack: o.stack }),
     },
   }
 
-type BlockAcc = { stmts: List<CStmt>, st: Stack, ok: Bool }
+type BlockAcc = { stmts: List<CStmt>, stack: Stack, ok: Bool }
 
 // An arm per alternative of each or-pattern, each with the arm's guard and body: a guard is tried
 // again for every alternative that matches, in order.
 fn one_per_alternative(arms: List<MatchArm>) -> List<MatchArm> =
-  fold(arms, [], |acc: List<MatchArm>, a: MatchArm|
-    if !has_or(a.pat) { push(acc, a) } else {
-      fold(alternatives_of(a.pat), acc, |out: List<MatchArm>, p: Pattern|
-        push(out, { pat: p, guard: a.guard, body: a.body, span: a.span }))
+  fold(arms, [], |acc: List<MatchArm>, arm: MatchArm|
+    if !has_or(arm.pat) { push(acc, arm) } else {
+      fold(alternatives_of(arm.pat), acc, |out: List<MatchArm>, pattern: Pattern|
+        push(out, { pat: pattern, guard: arm.guard, body: arm.body, span: arm.span }))
     })
 
 // A statement whose pattern can fail, or whose alternatives bind in different places, is a `match`
 // over the rest of the block; `let ... else` adds its `else` as the arm for everything else.
-fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Out> / {abort.raise} =
+fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, stack: Stack) -> Option<Lowered> / {abort.raise} =
   match branching(stmts) {
-    None -> lower_straight(stmts, tail, st),
+    None -> lower_straight(stmts, tail, stack),
     Some(k) -> {
       let before = map(range(0, k), |i: Int| nth_stmt(stmts, i));
       let after = map(range(k + 1, len(stmts)), |i: Int| nth_stmt(stmts, i));
-      lower_straight(before, Some(branched(nth_stmt(stmts, k), after, tail)), st)
+      lower_straight(before, Some(branched(nth_stmt(stmts, k), after, tail)), stack)
     },
   }
 
@@ -1123,8 +1173,8 @@ fn branching(stmts: List<Stmt>) -> Option<Int> =
 fn nth_stmt(stmts: List<Stmt>, i: Int) -> Stmt =
   match list_at(stmts, i) { Some(s) -> s, None -> SExpr(EBad({ span: dummy_span() })) }
 
-fn branched(s: Stmt, after: List<Stmt>, tail: Option<Expr>) -> Expr =
-  match s {
+fn branched(stmt: Stmt, after: List<Stmt>, tail: Option<Expr>) -> Expr =
+  match stmt {
     SLetElse(l) -> {
       let rest = EBlock({ span: l.span, stmts: after, tail: tail });
       EMatch({
@@ -1148,38 +1198,38 @@ fn branched(s: Stmt, after: List<Stmt>, tail: Option<Expr>) -> Expr =
     SExpr(e) -> e,
   }
 
-fn lower_straight(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Out> / {abort.raise} = {
-  let depth = depth_of(st);
-  let walked = fold(stmts, { stmts: [], st: st, ok: true }, |acc: BlockAcc, st: Stmt|
+fn lower_straight(stmts: List<Stmt>, tail: Option<Expr>, stack: Stack) -> Option<Lowered> / {abort.raise} = {
+  let depth = depth_of(stack);
+  let walked = fold(stmts, { stmts: [], stack: stack, ok: true }, |acc: BlockAcc, stack: Stmt|
     if !acc.ok { acc } else {
-      match st {
-        SExpr(e) -> match lower_in(e, acc.st) {
-          Some(o) -> { stmts: push(acc.stmts, CDo({ code: o.code })), st: o.st, ok: true },
-          None -> { stmts: acc.stmts, st: acc.st, ok: false },
+      match stack {
+        SExpr(e) -> match lower_in(e, acc.stack) {
+          Some(o) -> { stmts: push(acc.stmts, CDo({ code: o.code })), stack: o.stack, ok: true },
+          None -> { stmts: acc.stmts, stack: acc.stack, ok: false },
         },
         // `lower_block` made a `match` of it before this walk began.
-        SLetElse(_) -> { stmts: acc.stmts, st: acc.st, ok: false },
+        SLetElse(_) -> { stmts: acc.stmts, stack: acc.stack, ok: false },
         SLet(l) -> match binder_of(l.pat) {
-          None -> match lower_in(l.value, acc.st) {
-            None -> { stmts: acc.stmts, st: acc.st, ok: false },
+          None -> match lower_in(l.value, acc.stack) {
+            None -> { stmts: acc.stmts, stack: acc.stack, ok: false },
             Some(o) -> {
-              let p = lower_pat(l.pat, o.st);
+              let p = lower_pat(l.pat, o.stack);
               {
                 stmts: push(acc.stmts, CLetPat({ span: l.span, pat: p.pat, value: o.code })),
-                st: p.st,
+                stack: p.stack,
                 ok: true,
               }
             },
           },
-          Some(name) -> match lower_in(l.value, acc.st) {
-            None -> { stmts: acc.stmts, st: acc.st, ok: false },
+          Some(name) -> match lower_in(l.value, acc.stack) {
+            None -> { stmts: acc.stmts, stack: acc.stack, ok: false },
             Some(o) ->
               {
                 stmts: push(
                   acc.stmts,
-                  CLet({ name: name, slot: len(st_top(o.st).names), value: o.code }),
+                  CLet({ name: name, slot: len(st_top(o.stack).names), value: o.code }),
                 ),
-                st: bind_st(o.st, name),
+                stack: bind_st(o.stack, name),
                 ok: true,
               },
           },
@@ -1195,9 +1245,9 @@ fn lower_straight(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Ou
             span: dummy_span(),
             node: NBlock({ stmts: walked.stmts, tail: None }),
           },
-          st: unscope_st(walked.st, depth),
+          stack: unscope_st(walked.stack, depth),
         }),
-      Some(t) -> match lower_in(t, walked.st) {
+      Some(t) -> match lower_in(t, walked.stack) {
         None -> None,
         Some(o) ->
           Some({
@@ -1206,36 +1256,36 @@ fn lower_straight(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Ou
               span: dummy_span(),
               node: NBlock({ stmts: walked.stmts, tail: Some(o.code) }),
             },
-            st: unscope_st(o.st, depth),
+            stack: unscope_st(o.stack, depth),
           }),
       },
     }
   }
 }
 
-type PatOut = { pat: CPat, st: Stack }
+type PatOut = { pat: CPat, stack: Stack }
 
 // Binders take slots in walk order. A bare name may be a nullary constructor, so it takes a slot either way.
-fn lower_pat(p: Pattern, st: Stack) -> PatOut / {abort.raise} =
-  match p {
-    PWild(_) -> { pat: PxWild, st: st },
+fn lower_pat(pattern: Pattern, stack: Stack) -> PatOut =
+  match pattern {
+    PWild(_) -> { pat: PxWild, stack: stack },
     PVar(v) -> {
       let name = v.name.name;
-      let g = bind_st(st, name);
-      { pat: PxVar({ name: name, slot: slot_in(st_top(g), name) }), st: g }
+      let g = bind_st(stack, name);
+      { pat: PxVar({ name: name, slot: slot_in(st_top(g), name) }), stack: g }
     },
-    PLit(v) -> { pat: PxLit(v.lit), st: st },
+    PLit(v) -> { pat: PxLit(v.lit), stack: stack },
     PCtor(c) -> {
-      let r = lower_pats(c.args, st);
-      { pat: PxCtor({ name: qname_text(c.name), args: r.pats }), st: r.st }
+      let r = lower_pats(c.args, stack);
+      { pat: PxCtor({ name: qname_text(c.name), args: r.pats }), stack: r.stack }
     },
     PRecord(r) -> {
       let walked = fold(
         r.fields,
-        { pats: [], st: st, names: [] },
+        { pats: [], stack: stack, names: [] },
         |acc: PatFields, fd: { name: Ident, pat: Pattern }| {
-          let o = lower_pat(fd.pat, acc.st);
-          { pats: push(acc.pats, o.pat), st: o.st, names: push(acc.names, fd.name.name) }
+          let o = lower_pat(fd.pat, acc.stack);
+          { pats: push(acc.pats, o.pat), stack: o.stack, names: push(acc.names, fd.name.name) }
         },
       );
       {
@@ -1244,42 +1294,42 @@ fn lower_pat(p: Pattern, st: Stack) -> PatOut / {abort.raise} =
             { name: nth_bytes(walked.names, i), pat: nth_pat(walked.pats, i) }),
           rest: r.rest,
         }),
-        st: walked.st,
+        stack: walked.stack,
       }
     },
     PList(l) -> {
-      let r = lower_pats(l.items, st);
+      let r = lower_pats(l.items, stack);
       match l.rest {
-        None -> { pat: PxList({ items: r.pats, rest: None }), st: r.st },
+        None -> { pat: PxList({ items: r.pats, rest: None }), stack: r.stack },
         Some(rp) -> {
-          let o = lower_pat(rp, r.st);
-          { pat: PxList({ items: r.pats, rest: Some(o.pat) }), st: o.st }
+          let o = lower_pat(rp, r.stack);
+          { pat: PxList({ items: r.pats, rest: Some(o.pat) }), stack: o.stack }
         },
       }
     },
     // `one_per_alternative` and `lower_block` leave no or-pattern for this to meet.
     POr(_) -> panic("an or-pattern reached the lowering unexpanded"),
-    PBad(_) -> { pat: PxWild, st: st },
+    PBad(_) -> { pat: PxWild, stack: stack },
   }
 
-fn lower_pats(ps: List<Pattern>, st: Stack) -> PatSeq / {abort.raise} =
-  fold(ps, { pats: [], st: st }, |acc: PatSeq, p: Pattern| {
-    let o = lower_pat(p, acc.st);
-    { pats: push(acc.pats, o.pat), st: o.st }
+fn lower_pats(patterns: List<Pattern>, stack: Stack) -> PatSeq =
+  fold(patterns, { pats: [], stack: stack }, |acc: PatSeq, pattern: Pattern| {
+    let o = lower_pat(pattern, acc.stack);
+    { pats: push(acc.pats, o.pat), stack: o.stack }
   })
 
-type PatFields = { pats: List<CPat>, st: Stack, names: List<Bytes> }
-type PatSeq = { pats: List<CPat>, st: Stack }
+type PatFields = { pats: List<CPat>, stack: Stack, names: List<Bytes> }
+type PatSeq = { pats: List<CPat>, stack: Stack }
 
 fn nth_bytes(xs: List<Bytes>, i: Int) -> Bytes = match list_at(xs, i) { Some(x) -> x, None -> b"" }
 
 fn nth_pat(xs: List<CPat>, i: Int) -> CPat = match list_at(xs, i) { Some(x) -> x, None -> PxWild }
 
-pub fn qname_text(q: QName) -> Bytes =
-  match q.module {
+pub fn qname_text(qname: QName) -> Bytes =
+  match qname.module {
     // `::`, not the source's `.`: the dump must match the Rust side's spelling.
-    Some(m) -> bytes_concat_all([m.name, b"::", q.name.name]),
-    None -> q.name.name,
+    Some(m) -> bytes_concat_all([m.name, b"::", qname.name.name]),
+    None -> qname.name.name,
   }
 
 // The slots a pattern binds; the ownership pass drops them walking back past it.
@@ -1298,7 +1348,8 @@ pub fn pat_slots(p: CPat) -> List<Int> =
   }
 
 // Only a single-name binder; any other pattern lowers as `CLetPat`.
-fn binder_of(p: Pattern) -> Option<Bytes> = match p { PVar(id) -> Some(id.name.name), _ -> None }
+fn binder_of(pattern: Pattern) -> Option<Bytes> =
+  match pattern { PVar(id) -> Some(id.name.name), _ -> None }
 
 // --- ownership --------------------------------------------------------------
 // Backwards: a read is `Owned` when its slot is not read again after it, else `Borrowed`.
@@ -1317,7 +1368,7 @@ fn live_union(a: List<Int>, b: List<Int>) -> List<Int> =
 fn live_drop(live: List<Int>, s: Int) -> List<Int> = filter(live, |x: Int| x != s)
 
 // The slot a projection reads through, when its base is a bare variable.
-fn base_slot(c: Code) -> Option<Int> = match c.node { NVar(v) -> v.slot, _ -> None }
+fn base_slot(code: Code) -> Option<Int> = match code.node { NVar(v) -> v.slot, _ -> None }
 
 pub fn mark(c: Code, live: List<Int>) -> Marked =
   match c.node {
@@ -1336,7 +1387,7 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
         },
     },
     // The base is read after every written field, so backwards it is marked first.
-    NUpd(u) -> {
+    NUpdate(u) -> {
       let s = match base_slot(u.base) { Some(x) -> x, None -> -1 };
       let owned = s >= 0 && !live_has(live, s);
       let base = {
@@ -1350,7 +1401,7 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
         code: {
           own: Borrowed,
           span: c.span,
-          node: NUpd({
+          node: NUpdate({
             base: base,
             copies: u.copies,
             sets: map(range(0, len(u.sets)), |i: Int|
@@ -1436,36 +1487,39 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
     },
     // The body was marked when lowered; the captures are reads of this barrier where the closure is made.
     NLambda(l) -> {
-      let w = mark_caps(l.caps, live);
+      let w = mark_caps(l.captures, live);
       {
         code: {
           own: Borrowed,
           span: c.span,
-          node: NLambda({ params: l.params, size: l.size, caps: w.caps, body: l.body }),
+          node: NLambda({ params: l.params, size: l.size, captures: w.captures, body: l.body }),
         },
         live: w.live,
       }
     },
-    NPar(pr) -> {
+    NParallel(pr) -> {
       let r = mark_seq(pr.branches, live);
-      { code: { own: Borrowed, span: c.span, node: NPar({ branches: r.codes }) }, live: r.live }
+      {
+        code: { own: Borrowed, span: c.span, node: NParallel({ branches: r.codes }) },
+        live: r.live,
+      }
     },
     // Captures are reads of this barrier on entry, as a lambda's are.
-    NSim(sm) -> {
-      let w = mark_caps(sm.caps, live);
+    NSimulate(sm) -> {
+      let w = mark_caps(sm.captures, live);
       {
         code: {
           own: Borrowed,
           span: c.span,
-          node: NSim({ size: sm.size, caps: w.caps, body: sm.body }),
+          node: NSimulate({ size: sm.size, captures: w.captures, body: sm.body }),
         },
         live: w.live,
       }
     },
     NHandle(h) -> {
-      let cls = fold(h.clauses, { caps: [], live: live }, |acc: CapMark, c: CClause| {
-        let w = mark_caps(c.caps, acc.live);
-        { caps: acc.caps, live: w.live }
+      let cls = fold(h.clauses, { captures: [], live: live }, |acc: CapMark, c: CClause| {
+        let w = mark_caps(c.captures, acc.live);
+        { captures: acc.captures, live: w.live }
       });
       let marked = map(h.clauses, |c: CClause| c);
       let b = mark(h.body, cls.live);
@@ -1566,8 +1620,8 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
       let walked = fold(
         rev_stmts(b.stmts),
         { codes: [], live: after.live },
-        |acc: Seq2, st: CStmt|
-          match st {
+        |acc: StmtSeq, stack: CStmt|
+          match stack {
             CDo(d) -> {
               let m = mark(d.code, acc.live);
               { codes: push(acc.codes, CDo({ code: m.code })), live: m.live }
@@ -1605,34 +1659,38 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
     },
   }
 
-type CapMark = { caps: List<Cap>, live: List<Int> }
+type CapMark = { captures: List<Capture>, live: List<Int> }
 
 // A capture reads the enclosing barrier's slot, `Owned` when nothing after it wants that slot.
-fn mark_caps(caps: List<Cap>, live: List<Int>) -> CapMark = {
-  let walked = fold(rev_caps(caps), { caps: [], live: live }, |acc: CapMark, cp: Cap|
-    {
-      caps: push(acc.caps, {
-        src: cp.src,
-        dst: cp.dst,
-        own: if live_has(acc.live, cp.src) { Borrowed } else { Owned },
-      }),
-      live: live_add(acc.live, cp.src),
-    });
-  { caps: rev_caps(walked.caps), live: walked.live }
+fn mark_caps(caps: List<Capture>, live: List<Int>) -> CapMark = {
+  let walked = fold(
+    rev_caps(caps),
+    { captures: [], live: live },
+    |acc: CapMark, capture: Capture|
+      {
+        captures: push(acc.captures, {
+          src: capture.src,
+          dst: capture.dst,
+          own: if live_has(acc.live, capture.src) { Borrowed } else { Owned },
+        }),
+        live: live_add(acc.live, capture.src),
+      },
+  );
+  { captures: rev_caps(walked.captures), live: walked.live }
 }
 
 type ArmMark = { arms: List<CArm>, live: List<Int> }
 
 type GuardMark = { guard: Option<Code>, live: List<Int> }
 
-type Seq2 = { codes: List<CStmt>, live: List<Int> }
+type StmtSeq = { codes: List<CStmt>, live: List<Int> }
 
 fn cfield_name(fs: List<CField>, i: Int) -> Bytes =
   match list_at(fs, i) { Some(fd) -> fd.name, None -> b"" }
 
-fn mark_seq(xs: List<Code>, live: List<Int>) -> MarkedSeq = {
-  let walked = fold(rev_codes(xs), { codes: [], live: live }, |acc: MarkedSeq, x: Code| {
-    let m = mark(x, acc.live);
+fn mark_seq(codes: List<Code>, live: List<Int>) -> MarkedSeq = {
+  let walked = fold(rev_codes(codes), { codes: [], live: live }, |acc: MarkedSeq, code: Code| {
+    let m = mark(code, acc.live);
     { codes: push(acc.codes, m.code), live: m.live }
   });
   { codes: rev_codes(walked.codes), live: walked.live }
@@ -1640,10 +1698,10 @@ fn mark_seq(xs: List<Code>, live: List<Int>) -> MarkedSeq = {
 
 type MarkedSeq = { codes: List<Code>, live: List<Int> }
 
-fn rev_codes(xs: List<Code>) -> List<Code> =
-  map(range(0, len(xs)), |i: Int| nth(xs, len(xs) - 1 - i))
+fn rev_codes(codes: List<Code>) -> List<Code> =
+  map(range(0, len(codes)), |i: Int| nth(codes, len(codes) - 1 - i))
 
-fn rev_caps(xs: List<Cap>) -> List<Cap> =
+fn rev_caps(xs: List<Capture>) -> List<Capture> =
   map(range(0, len(xs)), |i: Int|
     match list_at(xs, len(xs) - 1 - i) { Some(x) -> x, None -> { src: 0, dst: 0, own: Borrowed } })
 
@@ -1682,25 +1740,25 @@ pub fn lower_fn(
 ) -> Option<{ code: Code, size: Int }> / {abort.raise} = {
   let start = fold(
     params,
-    { names: [], scope: [], caps: [], capnames: [] },
-    |f: Frame, p: Bytes| bind(f, p),
+    { names: [], scope: [], captures: [], capture_names: [] },
+    |frame: Frame, p: Bytes| bind(frame, p),
   );
   match lower_in(body, { frames: [start], labels: labels, sites: sites }) {
     None -> None,
-    Some(o) -> Some({ code: mark(o.code, []).code, size: len(st_top(o.st).names) }),
+    Some(o) -> Some({ code: mark(o.code, []).code, size: len(st_top(o.stack).names) }),
   }
 }
 
 pub fn lower_module(src: Bytes) -> LowerOut / {abort.raise} = {
   let r = parse(src);
-  let x = expand(r.node, r.p.diags);
-  fold(x.module.items, { dump: b"L;1;", lowered: 0, skipped: 0 }, |acc: LowerOut, it: Item|
-    match it {
+  let x = expand(r.node, r.parser.diags);
+  fold(x.module.items, { dump: b"L;1;", lowered: 0, skipped: 0 }, |acc: LowerOut, item: Item|
+    match item {
       IFn(d) -> {
-        let labels = map(d.generics.labels, |g: Ident| g.name);
+        let labels = map(d.generics.labels, |ident: Ident| ident.name);
         let names = fold(
           labels,
-          map(d.params, |p: Param| p.name.name),
+          map(d.params, |param: Param| param.name.name),
           |xs: List<Bytes>, n: Bytes| push(xs, n),
         );
         match lower_fn(names, labels, map_new(), d.body) {
@@ -1712,9 +1770,9 @@ pub fn lower_module(src: Bytes) -> LowerOut / {abort.raise} = {
                 b"f:m.",
                 d.name.name,
                 b":",
-                num(len(names)),
+                int_to_bytes(len(names)),
                 b":",
-                num(l.size),
+                int_to_bytes(l.size),
                 b";",
                 dump(l.code),
                 b";",

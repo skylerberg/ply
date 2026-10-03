@@ -5,18 +5,18 @@
 // as its definition's, with the lambda's parameters unknown, unless a builtin that iterates over a
 // list calls it once per element.
 
-import spine (Span, Ident, QName)
+import parsing (Span, Ident, QName)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PBad, LInt)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
               EParallel, EBad, Stmt, SLet, SLetElse, SExpr, Param, NamedArg, MatchArm, HandleClause,
               RecField)
 import items (FnDef)
-import tycore (Type, TyVar, TyCon, TyFn, TyRecord, Field, at, contains_bytes)
+import types (Type, TyVar, TyCon, TyFn, TyRecord, Field, at, contains_bytes)
 
 // What a name the walk did not bind names: a member of the group, a builtin, another definition
 // by its qualified name, or something else.
-pub type Callee = | CMember(Int) | CBuiltin(Bytes) | CDefined(Bytes) | COther
+pub type Callee = | GroupMember(Int) | BuiltinCallee(Bytes) | DefinedCallee(Bytes) | OtherCallee
 
 // How a definition's calls are known to return.
 pub type Ending =
@@ -41,25 +41,25 @@ pub type Group = {
 type Place = { param: Int, path: List<Bytes> }
 
 // What an integer is offset from: a place, or a length the place decides.
-type Base = | BPlace(Place) | BLen({ name: Bytes, of: Place })
+type Base = | PlaceBase(Place) | LengthBase({ name: Bytes, of: Place })
 
 // `base + k`; no base is the constant `k`.
-type Lin = { base: Option<Base>, k: Int }
+type Linear = { base: Option<Base>, k: Int }
 
 // What the walk knows of a value, in the terms of the definition it is in.
 type Term =
   // Exactly this; a place with `k == 0` is the place itself, at any type.
-  | TExact(Lin)
+  | Exactly(Linear)
   // A part of the place: smaller than it, however deep.
-  | TBelow(Place)
+  | Below(Place)
   // A value whose every part is a part of the place, though it need not be smaller itself.
-  | TParts(Place)
+  | PartsOf(Place)
   // A record written out, its unwritten fields those of `base`.
-  | TRecord({ base: Option<Term>, fields: List<{ name: Bytes, term: Term }> })
-  | TUnknown
+  | RecordTerm({ base: Option<Term>, fields: List<{ name: Bytes, term: Term }> })
+  | UnknownTerm
 
 // `lo < hi`, or `lo <= hi` when not `strict`.
-type Fact = { lo: Lin, hi: Lin, strict: Bool }
+type Fact = { lo: Linear, hi: Linear, strict: Bool }
 
 type Scope = { locals: Map<Bytes, Term>, facts: List<Fact> }
 
@@ -70,11 +70,14 @@ type Outside = { name: Bytes, span: Span }
 
 type Seen = { calls: List<Call>, outside: List<Outside> }
 
-type Cx = { group: Group, me: Int }
+type MemberContext = { group: Group, me: Int }
 
 // The structural size of a place; `hi - lo`, which a shrinking call must find bounded below; or the
 // measure a `decreases` states, which every call between two members stating one is owed to shrink.
-type Measure = | MSize(Place) | MDiff({ hi: Option<Base>, lo: Option<Base> }) | MStated
+type Measure =
+  | SizeMeasure(Place)
+  | DifferenceMeasure({ hi: Option<Base>, lo: Option<Base> })
+  | StatedMeasure
 
 // From the caller's measure `a` to the callee's `b`: smaller when `strict`, otherwise no larger.
 type Arc = { a: Int, b: Int, strict: Bool }
@@ -88,8 +91,8 @@ type Graph = { from: Int, to: Int, arcs: List<Arc>, span: Span }
 pub fn ending(g: Group) -> Ending / {abort.raise} = {
   let seen = map(range(0, len(g.defs)), |i: Int| seen_of({ group: g, me: i }, at(g.defs, i)));
   let calls = map(seen, |x: Seen| x.calls);
-  let stating = fold(g.defs, false, |acc: Bool, d: FnDef|
-    acc || (match d.decreases { Some(_) -> true, None -> false }));
+  let stating = fold(g.defs, false, |acc: Bool, def: FnDef|
+    acc || (match def.decreases { Some(_) -> true, None -> false }));
   let own = match looping(g, calls, false) {
     None -> Ends,
     Some(at_) -> if !stating { Diverges(at_) }
@@ -108,14 +111,15 @@ fn weaker(a: Ending, b: Ending) -> Ending =
 fn looping(g: Group, calls: List<List<Call>>, stated: Bool) -> Option<Span> / {abort.raise} = {
   let measures = map(range(0, len(g.defs)), |i: Int| measures_of(g, i, at(calls, i), stated));
   let graphs = fold(range(0, len(g.defs)), [], |acc: List<Graph>, i: Int|
-    fold(at(calls, i), acc, |gs: List<Graph>, c: Call| added(gs, call_graph(g, measures, i, c))));
+    fold(at(calls, i), acc, |gs: List<Graph>, call: Call|
+      added(gs, call_graph(g, measures, i, call))));
   searched(len(g.defs), graphs)
 }
 
-fn idempotent(x: Graph) -> Bool / {abort.raise} = same_arcs(composed(x, x).arcs, x.arcs)
+fn idempotent(graph: Graph) -> Bool = same_arcs(composed(graph, graph).arcs, graph.arcs)
 
-fn shrinks(x: Graph) -> Bool =
-  fold(x.arcs, false, |acc: Bool, r: Arc| acc || (r.strict && r.a == r.b))
+fn shrinks(graph: Graph) -> Bool =
+  fold(graph.arcs, false, |acc: Bool, r: Arc| acc || (r.strict && r.a == r.b))
 
 // Every path the calls can take, as a graph, each path extended by one call at a time so every
 // path is found once its prefix is: the first loop found that shrinks no measure, or `None` once
@@ -128,31 +132,32 @@ fn searched(n: Int, calls: List<Graph>) -> Option<Span> / {abort.raise} = {
   let start = fold(
     calls,
     { buckets: map_new(), queue: [], next: 0, bad: None },
-    |c: Closure, x: Graph| enqueued(c, n, x),
+    |closure: Closure, x: Graph| enqueued(closure, n, x),
   );
-  iterate(start, closure_bound() + 2, |c: Closure|
-    match c.bad {
-      Some(_) -> Stop(c.bad),
-      None -> if c.next >= len(c.queue) { Stop(None) }
-      else if len(c.queue) > closure_bound() { Stop(Some(at(c.queue, 0).span)) } else {
-        let x = at(c.queue, c.next);
-        let grown = fold(at(from, x.to), c, |acc: Closure, y: Graph|
+  iterate(start, closure_bound() + 2, |closure: Closure|
+    match closure.bad {
+      Some(_) -> Stop(closure.bad),
+      None -> if closure.next >= len(closure.queue) { Stop(None) }
+      else if len(closure.queue) > closure_bound() { Stop(Some(at(closure.queue, 0).span)) } else {
+        let x = at(closure.queue, closure.next);
+        let grown = fold(at(from, x.to), closure, |acc: Closure, y: Graph|
           enqueued(acc, n, composed(x, y)));
-        Continue({ ..grown, next: c.next + 1 })
+        Continue({ ..grown, next: closure.next + 1 })
       },
     })
 }
 
-fn enqueued(c: Closure, n: Int, x: Graph) -> Closure / {abort.raise} = {
+fn enqueued(closure: Closure, n: Int, x: Graph) -> Closure = {
   let key = x.from * n + x.to;
-  let bucket = match map_get(c.buckets, key) { Some(b) -> b, None -> [] };
-  if fold(bucket, false, |found: Bool, y: Graph| found || same_arcs(y.arcs, x.arcs)) { c } else {
+  let bucket = match map_get(closure.buckets, key) { Some(b) -> b, None -> [] };
+  if fold(bucket, false, |found: Bool, y: Graph| found || same_arcs(y.arcs, x.arcs)) { closure }
+  else {
     {
-      ..c,
-      buckets: map_insert(c.buckets, key, push(bucket, x)),
-      queue: push(c.queue, x),
-      bad: match c.bad {
-        Some(_) -> c.bad,
+      ..closure,
+      buckets: map_insert(closure.buckets, key, push(bucket, x)),
+      queue: push(closure.queue, x),
+      bad: match closure.bad {
+        Some(_) -> closure.bad,
         None -> if x.from == x.to && idempotent(x) && !shrinks(x) { Some(x.span) } else { None },
       },
     }
@@ -197,29 +202,25 @@ fn with_arc(xs: List<Arc>, r: Arc) -> List<Arc> / {abort.raise} =
 
 // Each parameter's size, each deeper place a call passes a part of, and each distance a fact at a
 // call bounds.
-fn measures_of(
-  g: Group,
-  me: Int,
-  calls: List<Call>,
-  stated: Bool,
-) -> List<Measure> / {abort.raise} = {
-  let sized = map(range(0, len(at(g.defs, me).params)), |i: Int| MSize({ param: i, path: [] }));
+fn measures_of(g: Group, me: Int, calls: List<Call>, stated: Bool) -> List<Measure> = {
+  let sized = map(range(0, len(at(g.defs, me).params)), |i: Int|
+    SizeMeasure({ param: i, path: [] }));
   let params = match at(g.defs, me).decreases {
-    Some(_) -> if stated { push(sized, MStated) } else { sized },
+    Some(_) -> if stated { push(sized, StatedMeasure) } else { sized },
     None -> sized,
   };
-  let deep = fold(calls, params, |acc: List<Measure>, c: Call|
-    fold(c.args, acc, |a: List<Measure>, t: Term| deeper_places(a, t)));
-  fold(calls, deep, |acc: List<Measure>, c: Call|
-    fold(c.facts, acc, |a: List<Measure>, f: Fact|
+  let deep = fold(calls, params, |acc: List<Measure>, call: Call|
+    fold(call.args, acc, |a: List<Measure>, t: Term| deeper_places(a, t)));
+  fold(calls, deep, |acc: List<Measure>, call: Call|
+    fold(call.facts, acc, |a: List<Measure>, f: Fact|
       if f.hi.base == f.lo.base { a }
-      else { with_measure(a, MDiff({ hi: f.hi.base, lo: f.lo.base })) }))
+      else { with_measure(a, DifferenceMeasure({ hi: f.hi.base, lo: f.lo.base })) }))
 }
 
 fn deeper_places(acc: List<Measure>, t: Term) -> List<Measure> =
   match t {
-    TBelow(p) -> if len(p.path) == 0 { acc } else { with_measure(acc, MSize(p)) },
-    TRecord(r) -> {
+    Below(p) -> if len(p.path) == 0 { acc } else { with_measure(acc, SizeMeasure(p)) },
+    RecordTerm(r) -> {
       let based = match r.base { Some(b) -> deeper_places(acc, b), None -> acc };
       fold(r.fields, based, |a: List<Measure>, f: { name: Bytes, term: Term }|
         deeper_places(a, f.term))
@@ -231,47 +232,53 @@ fn with_measure(xs: List<Measure>, m: Measure) -> List<Measure> =
   if fold(xs, false, |found: Bool, x: Measure| found || x == m) { xs } else { push(xs, m) }
 
 // What one call does to each pair of the caller's and the callee's measures.
-fn call_graph(g: Group, measures: List<List<Measure>>, me: Int, c: Call) -> Graph / {abort.raise} = {
+fn call_graph(g: Group, measures: List<List<Measure>>, me: Int, call: Call) -> Graph = {
   let mine = at(measures, me);
-  let theirs = at(measures, c.callee);
+  let theirs = at(measures, call.callee);
   {
     from: me,
-    to: c.callee,
+    to: call.callee,
     arcs: fold(range(0, len(theirs)), [], |acc: List<Arc>, j: Int| {
-      let value = measured(g, c, at(theirs, j));
+      let value = measured(g, call, at(theirs, j));
       fold(range(0, len(mine)), acc, |a: List<Arc>, i: Int|
-        match relation(g, me, c, at(mine, i), value) {
+        match relation(g, me, call, at(mine, i), value) {
           None -> a,
           Some(strict) -> with_arc(a, { a: i, b: j, strict: strict }),
         })
     }),
-    span: c.span,
+    span: call.span,
   }
 }
 
 // A callee's measure at the call, in the caller's terms.
-type Valued = | VSize(Term) | VDiff({ hi: Option<Lin>, lo: Option<Lin> }) | VStated
+type Valued =
+  | SizeValue(Term)
+  | DifferenceValue({ hi: Option<Linear>, lo: Option<Linear> })
+  | StatedValue
 
-fn measured(g: Group, c: Call, m: Measure) -> Valued =
+fn measured(g: Group, call: Call, m: Measure) -> Valued =
   match m {
-    MSize(q) -> VSize(along(arg(c, q.param), q.path)),
-    MDiff(d) -> VDiff({ hi: substituted(c, d.hi), lo: substituted(c, d.lo) }),
-    MStated -> VStated,
+    SizeMeasure(q) -> SizeValue(along(arg(call, q.param), q.path)),
+    DifferenceMeasure(d) ->
+      DifferenceValue({ hi: substituted(call, d.hi), lo: substituted(call, d.lo) }),
+    StatedMeasure -> StatedValue,
   }
 
-fn arg(c: Call, i: Int) -> Term = match list_at(c.args, i) { Some(t) -> t, None -> TUnknown }
+fn arg(call: Call, i: Int) -> Term =
+  match list_at(call.args, i) { Some(t) -> t, None -> UnknownTerm }
 
 fn along(t: Term, path: List<Bytes>) -> Term = fold(path, t, |x: Term, f: Bytes| project(x, f))
 
 // A callee's base at the call, as an offset from one of the caller's.
-fn substituted(c: Call, b: Option<Base>) -> Option<Lin> =
+fn substituted(c: Call, b: Option<Base>) -> Option<Linear> =
   match b {
     None -> Some({ base: None, k: 0 }),
-    Some(BPlace(q)) -> match along(arg(c, q.param), q.path) { TExact(l) -> Some(l), _ -> None },
-    Some(BLen(n)) -> match along(arg(c, n.of.param), n.of.path) {
-      TExact(l) -> match l.base {
-        Some(BPlace(p)) -> if l.k == 0 { Some({ base: Some(BLen({ name: n.name, of: p })), k: 0 }) }
-        else { None },
+    Some(PlaceBase(q)) -> match along(arg(c, q.param), q.path) { Exactly(l) -> Some(l), _ -> None },
+    Some(LengthBase(n)) -> match along(arg(c, n.of.param), n.of.path) {
+      Exactly(l) -> match l.base {
+        Some(PlaceBase(p)) -> if l.k == 0 {
+          Some({ base: Some(LengthBase({ name: n.name, of: p })), k: 0 })
+        } else { None },
         _ -> None,
       },
       _ -> None,
@@ -279,17 +286,14 @@ fn substituted(c: Call, b: Option<Base>) -> Option<Lin> =
   }
 
 // `Some(true)` when the callee's measure is below the caller's, `Some(false)` when it is no larger.
-fn relation(
-  g: Group,
-  me: Int,
-  c: Call,
-  mine: Measure,
-  value: Valued,
-) -> Option<Bool> / {abort.raise} =
+fn relation(g: Group, me: Int, call: Call, mine: Measure, value: Valued) -> Option<Bool> =
   match mine {
-    MSize(p) -> match value { VSize(t) -> size_relation(t, p, place_type(g, me, p)), _ -> None },
-    MDiff(d) -> match value {
-      VDiff(v) -> match v.hi {
+    SizeMeasure(p) -> match value {
+      SizeValue(t) -> size_relation(t, p, place_type(g, me, p)),
+      _ -> None,
+    },
+    DifferenceMeasure(d) -> match value {
+      DifferenceValue(v) -> match v.hi {
         None -> None,
         Some(hi) -> match v.lo {
           None -> None,
@@ -297,13 +301,13 @@ fn relation(
             let delta = hi.k - lo.k;
             if delta > 0 { None }
             else if delta == 0 { Some(false) }
-            else { Some(bounded(c.facts, d.hi, d.lo)) }
+            else { Some(bounded(call.facts, d.hi, d.lo)) }
           },
         },
       },
       _ -> None,
     },
-    MStated -> match value { VStated -> Some(true), _ -> None },
+    StatedMeasure -> match value { StatedValue -> Some(true), _ -> None },
   }
 
 // A fact at the call bounds `hi - lo` below, so a shrinking step cannot repeat without end.
@@ -312,27 +316,27 @@ fn bounded(facts: List<Fact>, hi: Option<Base>, lo: Option<Base>) -> Bool =
 
 fn size_relation(t: Term, p: Place, ty: Option<Type>) -> Option<Bool> / {abort.raise} =
   match t {
-    TExact(l) -> match l.base {
-      Some(BPlace(q)) -> if l.k != 0 { None }
+    Exactly(l) -> match l.base {
+      Some(PlaceBase(q)) -> if l.k != 0 { None }
       else if q == p { Some(false) }
       else if within(q, p) { Some(true) }
       else { None },
       _ -> None,
     },
-    TBelow(q) -> if q == p || within(q, p) { Some(true) } else { None },
-    TRecord(r) -> match ty {
+    Below(q) -> if q == p || within(q, p) { Some(true) } else { None },
+    RecordTerm(r) -> match ty {
       Some(TyRecord(fs)) ->
-        fold(fs, Some(false), |acc: Option<Bool>, f: Field|
+        fold(fs, Some(false), |acc: Option<Bool>, field: Field|
           match acc {
             None -> None,
             Some(strict) -> {
-              let value = match field_term(r.fields, f.name) {
+              let value = match field_term(r.fields, field.name) {
                 Some(x) -> x,
-                None -> match r.base { Some(b) -> project(b, f.name), None -> TUnknown },
+                None -> match r.base { Some(b) -> project(b, field.name), None -> UnknownTerm },
               };
-              match size_relation(value, { ..p, path: push(p.path, f.name) }, Some(f.ty)) {
+              match size_relation(value, { ..p, path: push(p.path, field.name) }, Some(field.ty)) {
                 Some(s) -> Some(strict || s),
-                None -> if atomic(f.ty) { acc } else { None },
+                None -> if atomic(field.ty) { acc } else { None },
               }
             },
           }),
@@ -351,8 +355,8 @@ fn field_term(fs: List<{ name: Bytes, term: Term }>, name: Bytes) -> Option<Term
     match acc { Some(_) -> acc, None -> if f.name == name { Some(f.term) } else { None } })
 
 // A value of this type has one size whatever it holds.
-fn atomic(t: Type) -> Bool =
-  match t {
+fn atomic(ty: Type) -> Bool =
+  match ty {
     TyCon(c) ->
       len(c.args) == 0
         && (is_integer_name(c.name)
@@ -378,10 +382,10 @@ fn place_type(g: Group, me: Int, p: Place) -> Option<Type> / {abort.raise} =
       fold(p.path, Some(t), |acc: Option<Type>, f: Bytes|
         match acc {
           Some(TyRecord(fs)) ->
-            fold(fs, None, |found: Option<Type>, x: Field|
+            fold(fs, None, |found: Option<Type>, field: Field|
               match found {
                 Some(_) -> found,
-                None -> if x.name == f { Some(x.ty) } else { None },
+                None -> if field.name == f { Some(field.ty) } else { None },
               }),
           _ -> None,
         }),
@@ -397,139 +401,139 @@ fn integer_place(g: Group, me: Int, p: Place) -> Bool / {abort.raise} =
 
 fn project(t: Term, field: Bytes) -> Term =
   match t {
-    TExact(l) -> match l.base {
-      Some(BPlace(p)) -> if l.k != 0 { TUnknown }
-      else { TExact({ base: Some(BPlace({ ..p, path: push(p.path, field) })), k: 0 }) },
-      _ -> TUnknown,
+    Exactly(l) -> match l.base {
+      Some(PlaceBase(p)) -> if l.k != 0 { UnknownTerm }
+      else { Exactly({ base: Some(PlaceBase({ ..p, path: push(p.path, field) })), k: 0 }) },
+      _ -> UnknownTerm,
     },
-    TBelow(p) -> TBelow(p),
-    TParts(p) -> TBelow(p),
-    TRecord(r) -> match field_term(r.fields, field) {
+    Below(p) -> Below(p),
+    PartsOf(p) -> Below(p),
+    RecordTerm(r) -> match field_term(r.fields, field) {
       Some(x) -> x,
-      None -> match r.base { Some(b) -> project(b, field), None -> TUnknown },
+      None -> match r.base { Some(b) -> project(b, field), None -> UnknownTerm },
     },
-    TUnknown -> TUnknown,
+    UnknownTerm -> UnknownTerm,
   }
 
 // A part of the value: a constructor's field, or a list's element or tail.
 fn below(t: Term) -> Term =
   match t {
-    TExact(l) -> match l.base {
-      Some(BPlace(p)) -> if l.k == 0 { TBelow(p) } else { TUnknown },
-      _ -> TUnknown,
+    Exactly(l) -> match l.base {
+      Some(PlaceBase(p)) -> if l.k == 0 { Below(p) } else { UnknownTerm },
+      _ -> UnknownTerm,
     },
-    TBelow(p) -> TBelow(p),
-    TParts(p) -> TBelow(p),
-    _ -> TUnknown,
+    Below(p) -> Below(p),
+    PartsOf(p) -> Below(p),
+    _ -> UnknownTerm,
   }
 
 // An element of a list a builtin makes of a map: a key or a value is a part of the map, and an
 // entry is made of one of each, so it is smaller than anything the map is a part of.
-fn element(c: Cx, s: Scope, list: Expr) -> Term / {abort.raise} =
+fn element(c: MemberContext, scope: Scope, list: Expr) -> Term =
   match list {
-    EApp(a) -> match builtin(c, s, a.func) {
-      Some(name) -> if len(a.args) != 1 { below(term(c, s, list)) }
-      else if name == b"map_keys" || name == b"map_values" { below(term(c, s, at(a.args, 0))) }
+    EApp(a) -> match builtin(c, scope, a.func) {
+      Some(name) -> if len(a.args) != 1 { below(term(c, scope, list)) }
+      else if name == b"map_keys" || name == b"map_values" { below(term(c, scope, at(a.args, 0))) }
       else if name == b"map_entries" {
-        match term(c, s, at(a.args, 0)) {
-          TExact(l) -> match l.base {
-            Some(BPlace(p)) -> if l.k == 0 { TParts(p) } else { TUnknown },
-            _ -> TUnknown,
+        match term(c, scope, at(a.args, 0)) {
+          Exactly(l) -> match l.base {
+            Some(PlaceBase(p)) -> if l.k == 0 { PartsOf(p) } else { UnknownTerm },
+            _ -> UnknownTerm,
           },
-          TBelow(p) -> TBelow(p),
-          TParts(p) -> TParts(p),
-          _ -> TUnknown,
+          Below(p) -> Below(p),
+          PartsOf(p) -> PartsOf(p),
+          _ -> UnknownTerm,
         }
-      } else { below(term(c, s, list)) },
-      None -> below(term(c, s, list)),
+      } else { below(term(c, scope, list)) },
+      None -> below(term(c, scope, list)),
     },
-    _ -> below(term(c, s, list)),
+    _ -> below(term(c, scope, list)),
   }
 
-fn term(c: Cx, s: Scope, e: Expr) -> Term / {abort.raise} =
-  match e {
-    ELit(l) -> match l.lit { LInt(k) -> TExact({ base: None, k: k }), _ -> TUnknown },
+fn term(c: MemberContext, s: Scope, expr: Expr) -> Term =
+  match expr {
+    ELit(l) -> match l.lit { LInt(k) -> Exactly({ base: None, k: k }), _ -> UnknownTerm },
     EVar(v) -> match v.name.module {
-      Some(_) -> TUnknown,
-      None -> match map_get(s.locals, v.name.name.name) { Some(t) -> t, None -> TUnknown },
+      Some(_) -> UnknownTerm,
+      None -> match map_get(s.locals, v.name.name.name) { Some(t) -> t, None -> UnknownTerm },
     },
     EField(f) -> project(term(c, s, f.base), f.field.name),
     EBinary(b) -> if b.op == b"add" { offset(c, term(c, s, b.lhs), term(c, s, b.rhs), 1) }
     else if b.op == b"sub" {
       match term(c, s, b.rhs) {
-        TExact(r) -> match r.base {
+        Exactly(r) -> match r.base {
           None -> shifted(c, term(c, s, b.lhs), 0 - r.k),
-          Some(_) -> TUnknown,
+          Some(_) -> UnknownTerm,
         },
-        _ -> TUnknown,
+        _ -> UnknownTerm,
       }
-    } else { TUnknown },
-    ERecord(r) -> TRecord({ base: None, fields: field_terms(c, s, r.fields) }),
+    } else { UnknownTerm },
+    ERecord(r) -> RecordTerm({ base: None, fields: field_terms(c, s, r.fields) }),
     ERecordUpdate(r) ->
-      TRecord({ base: Some(term(c, s, r.base)), fields: field_terms(c, s, r.fields) }),
+      RecordTerm({ base: Some(term(c, s, r.base)), fields: field_terms(c, s, r.fields) }),
     EApp(a) -> length(c, s, a.func, a.args),
     EBlock(b) -> match b.tail {
-      None -> TUnknown,
-      Some(t) -> term(c, fold(b.stmts, s, |sc: Scope, x: Stmt| statement_scope(c, sc, x)), t),
+      None -> UnknownTerm,
+      Some(t) -> term(c, fold(b.stmts, s, |sc: Scope, stmt: Stmt| statement_scope(c, sc, stmt)), t),
     },
-    _ -> TUnknown,
+    _ -> UnknownTerm,
   }
 
 fn field_terms(
-  c: Cx,
-  s: Scope,
-  fs: List<RecField>,
-) -> List<{ name: Bytes, term: Term }> / {abort.raise} =
-  map(fs, |f: RecField| { name: f.name.name, term: term(c, s, f.value) })
+  c: MemberContext,
+  scope: Scope,
+  fields: List<RecField>,
+) -> List<{ name: Bytes, term: Term }> =
+  map(fields, |field: RecField| { name: field.name.name, term: term(c, scope, field.value) })
 
-fn offset(c: Cx, a: Term, b: Term, sign: Int) -> Term / {abort.raise} =
+fn offset(c: MemberContext, a: Term, b: Term, sign: Int) -> Term / {abort.raise} =
   match b {
-    TExact(r) -> match r.base {
+    Exactly(r) -> match r.base {
       None -> shifted(c, a, sign * r.k),
       Some(_) -> match a {
-        TExact(l) -> match l.base { None -> shifted(c, b, sign * l.k), Some(_) -> TUnknown },
-        _ -> TUnknown,
+        Exactly(l) -> match l.base { None -> shifted(c, b, sign * l.k), Some(_) -> UnknownTerm },
+        _ -> UnknownTerm,
       },
     },
-    _ -> TUnknown,
+    _ -> UnknownTerm,
   }
 
 // An integer moved by `k`; a place that is not an integer has no such neighbour.
-fn shifted(c: Cx, t: Term, k: Int) -> Term / {abort.raise} =
+fn shifted(c: MemberContext, t: Term, k: Int) -> Term / {abort.raise} =
   match t {
-    TExact(l) -> if integer(c, l) { TExact({ ..l, k: l.k + k }) } else { TUnknown },
-    _ -> TUnknown,
+    Exactly(l) -> if integer(c, l) { Exactly({ ..l, k: l.k + k }) } else { UnknownTerm },
+    _ -> UnknownTerm,
   }
 
-fn integer(c: Cx, l: Lin) -> Bool / {abort.raise} =
+fn integer(c: MemberContext, l: Linear) -> Bool / {abort.raise} =
   match l.base {
     None -> true,
-    Some(BPlace(p)) -> integer_place(c.group, c.me, p),
-    Some(BLen(_)) -> true,
+    Some(PlaceBase(p)) -> integer_place(c.group, c.me, p),
+    Some(LengthBase(_)) -> true,
   }
 
 fn length_builtin(name: Bytes) -> Bool =
   name == b"len" || name == b"bytes_len" || name == b"string_len" || name == b"map_len"
 
-fn length(c: Cx, s: Scope, func: Expr, args: List<Expr>) -> Term / {abort.raise} =
-  match builtin(c, s, func) {
-    Some(name) -> if !length_builtin(name) || len(args) != 1 { TUnknown } else {
-      match term(c, s, at(args, 0)) {
-        TExact(l) -> match l.base {
-          Some(BPlace(p)) -> if l.k == 0 {
-            TExact({ base: Some(BLen({ name: name, of: p })), k: 0 })
-          } else { TUnknown },
-          _ -> TUnknown,
+fn length(c: MemberContext, scope: Scope, func: Expr, args: List<Expr>) -> Term =
+  match builtin(c, scope, func) {
+    Some(name) -> if !length_builtin(name) || len(args) != 1 { UnknownTerm } else {
+      match term(c, scope, at(args, 0)) {
+        Exactly(l) -> match l.base {
+          Some(PlaceBase(p)) -> if l.k == 0 {
+            Exactly({ base: Some(LengthBase({ name: name, of: p })), k: 0 })
+          } else { UnknownTerm },
+          _ -> UnknownTerm,
         },
-        _ -> TUnknown,
+        _ -> UnknownTerm,
       }
     },
-    None -> TUnknown,
+    None -> UnknownTerm,
   }
 
 // An integer-valued term, the only kind a fact relates.
-fn lin(c: Cx, s: Scope, e: Expr) -> Option<Lin> / {abort.raise} =
-  match term(c, s, e) { TExact(l) -> if integer(c, l) { Some(l) } else { None }, _ -> None }
+fn linear(c: MemberContext, scope: Scope, expr: Expr) -> Option<Linear> =
+  match term(c, scope, expr) { Exactly(l) -> if integer(c, l) { Some(l) } else { None }, _ -> None }
 
 // --- Scope ----------------------------------------------------------------------------------------
 
@@ -539,15 +543,16 @@ fn entry_scope(def: FnDef) -> Scope / {abort.raise} =
       map_insert(
         m,
         at(def.params, i).name.name,
-        TExact({ base: Some(BPlace({ param: i, path: [] })), k: 0 }),
+        Exactly({ base: Some(PlaceBase({ param: i, path: [] })), k: 0 }),
       )),
     facts: [],
   }
 
-fn bound(s: Scope, name: Bytes, t: Term) -> Scope = { ..s, locals: map_insert(s.locals, name, t) }
+fn bound(scope: Scope, name: Bytes, t: Term) -> Scope =
+  { ..scope, locals: map_insert(scope.locals, name, t) }
 
-fn unknown_params(s: Scope, ps: List<Param>) -> Scope =
-  fold(ps, s, |sc: Scope, p: Param| bound(sc, p.name.name, TUnknown))
+fn unknown_params(s: Scope, params: List<Param>) -> Scope =
+  fold(params, s, |sc: Scope, param: Param| bound(sc, param.name.name, UnknownTerm))
 
 fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
   match p {
@@ -574,7 +579,7 @@ fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
           let other = bind(s, alt, t);
           fold(pattern_names(alt), sc, |acc: Scope, n: Bytes|
             if map_get(acc.locals, n) == map_get(other.locals, n) { acc }
-            else { bound(acc, n, TUnknown) })
+            else { bound(acc, n, UnknownTerm) })
         })
       },
     },
@@ -601,41 +606,41 @@ fn pattern_names(p: Pattern) -> List<Bytes> =
 fn append_names(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
   fold(b, a, |acc: List<Bytes>, x: Bytes| push(acc, x))
 
-fn statement_scope(c: Cx, s: Scope, x: Stmt) -> Scope / {abort.raise} =
-  match x {
-    SLet(l) -> bind(s, l.pat, term(c, s, l.value)),
-    SLetElse(l) -> bind(s, l.pat, term(c, s, l.value)),
-    SExpr(_) -> s,
+fn statement_scope(c: MemberContext, scope: Scope, stmt: Stmt) -> Scope =
+  match stmt {
+    SLet(l) -> bind(scope, l.pat, term(c, scope, l.value)),
+    SLetElse(l) -> bind(scope, l.pat, term(c, scope, l.value)),
+    SExpr(_) -> scope,
   }
 
-// What holds where `e` evaluated to `truth`.
-fn assume(c: Cx, s: Scope, e: Expr, truth: Bool) -> Scope / {abort.raise} =
-  match e {
-    EUnary(u) -> if u.op == b"not" { assume(c, s, u.operand, !truth) } else { s },
+// What holds where `expr` evaluated to `truth`.
+fn assume(c: MemberContext, scope: Scope, expr: Expr, truth: Bool) -> Scope =
+  match expr {
+    EUnary(u) -> if u.op == b"not" { assume(c, scope, u.operand, !truth) } else { scope },
     EBinary(b) -> if b.op == b"and" {
-      if truth { assume(c, assume(c, s, b.lhs, true), b.rhs, true) } else { s }
+      if truth { assume(c, assume(c, scope, b.lhs, true), b.rhs, true) } else { scope }
     } else if b.op == b"or" {
-      if truth { s } else { assume(c, assume(c, s, b.lhs, false), b.rhs, false) }
+      if truth { scope } else { assume(c, assume(c, scope, b.lhs, false), b.rhs, false) }
     } else {
-      match lin(c, s, b.lhs) {
-        None -> s,
-        Some(l) -> match lin(c, s, b.rhs) {
-          None -> s,
-          Some(r) -> { ..s, facts: append_facts(s.facts, compared(b.op, l, r, truth)) },
+      match linear(c, scope, b.lhs) {
+        None -> scope,
+        Some(l) -> match linear(c, scope, b.rhs) {
+          None -> scope,
+          Some(r) -> { ..scope, facts: append_facts(scope.facts, compared(b.op, l, r, truth)) },
         },
       }
     },
-    EBlock(b) -> if len(b.stmts) > 0 { s }
-    else { match b.tail { Some(t) -> assume(c, s, t, truth), None -> s } },
-    _ -> s,
+    EBlock(b) -> if len(b.stmts) > 0 { scope }
+    else { match b.tail { Some(t) -> assume(c, scope, t, truth), None -> scope } },
+    _ -> scope,
   }
 
 fn append_facts(a: List<Fact>, b: List<Fact>) -> List<Fact> =
   fold(b, a, |acc: List<Fact>, f: Fact| push(acc, f))
 
-fn compared(op: Bytes, l: Lin, r: Lin, truth: Bool) -> List<Fact> = {
-  let lt = |a: Lin, b: Lin| { lo: a, hi: b, strict: true };
-  let le = |a: Lin, b: Lin| { lo: a, hi: b, strict: false };
+fn compared(op: Bytes, l: Linear, r: Linear, truth: Bool) -> List<Fact> = {
+  let lt = |a: Linear, b: Linear| { lo: a, hi: b, strict: true };
+  let le = |a: Linear, b: Linear| { lo: a, hi: b, strict: false };
   if truth {
     if op == b"lt" { [lt(l, r)] }
     else if op == b"le" { [le(l, r)] }
@@ -655,38 +660,41 @@ fn compared(op: Bytes, l: Lin, r: Lin, truth: Bool) -> List<Fact> = {
 
 // --- The walk -------------------------------------------------------------------------------------
 
-fn seen_of(c: Cx, def: FnDef) -> Seen / {abort.raise} = {
+fn seen_of(c: MemberContext, def: FnDef) -> Seen / {abort.raise} = {
   let s = entry_scope(def);
-  let defaults = fold(def.params, { calls: [], outside: [] }, |acc: Seen, p: Param|
-    match p.default { Some(d) -> walk(c, s, acc, d), None -> acc });
+  let defaults = fold(def.params, { calls: [], outside: [] }, |acc: Seen, param: Param|
+    match param.default { Some(d) -> walk(c, s, acc, d), None -> acc });
   walk(c, s, defaults, def.body)
 }
 
-fn called(acc: Seen, x: Call) -> Seen = { ..acc, calls: push(acc.calls, x) }
+fn called(acc: Seen, call: Call) -> Seen = { ..acc, calls: push(acc.calls, call) }
 
 // What a free name names; a name the walk bound is its own.
-fn callee_of(c: Cx, s: Scope, q: QName) -> Callee / {abort.raise} =
-  match q.module {
-    None -> match map_get(s.locals, q.name.name) { Some(_) -> COther, None -> c.group.resolve(q) },
-    Some(_) -> c.group.resolve(q),
+fn callee_of(c: MemberContext, scope: Scope, qname: QName) -> Callee =
+  match qname.module {
+    None -> match map_get(scope.locals, qname.name.name) {
+      Some(_) -> OtherCallee,
+      None -> c.group.resolve(qname),
+    },
+    Some(_) -> c.group.resolve(qname),
   }
 
-fn member(c: Cx, s: Scope, q: QName) -> Option<Int> / {abort.raise} =
-  match callee_of(c, s, q) { CMember(i) -> Some(i), _ -> None }
+fn member(c: MemberContext, scope: Scope, qname: QName) -> Option<Int> =
+  match callee_of(c, scope, qname) { GroupMember(i) -> Some(i), _ -> None }
 
-fn builtin(c: Cx, s: Scope, func: Expr) -> Option<Bytes> / {abort.raise} =
+fn builtin(c: MemberContext, scope: Scope, func: Expr) -> Option<Bytes> =
   match func {
-    EVar(v) -> match callee_of(c, s, v.name) { CBuiltin(n) -> Some(n), _ -> None },
+    EVar(v) -> match callee_of(c, scope, v.name) { BuiltinCallee(n) -> Some(n), _ -> None },
     _ -> None,
   }
 
-fn walk(c: Cx, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.raise} =
-  match e {
+fn walk(c: MemberContext, s: Scope, acc: Seen, expr: Expr) -> Seen =
+  match expr {
     ELit(_) -> acc,
     // A member named but not called here is called wherever the value goes, with nothing known.
     EVar(v) -> match callee_of(c, s, v.name) {
-      CMember(t) -> called(acc, { callee: t, args: [], facts: [], span: v.span }),
-      CDefined(n) -> { ..acc, outside: push(acc.outside, { name: n, span: v.span }) },
+      GroupMember(t) -> called(acc, { callee: t, args: [], facts: [], span: v.span }),
+      DefinedCallee(n) -> { ..acc, outside: push(acc.outside, { name: n, span: v.span }) },
       _ -> acc,
     },
     EBinary(b) -> if b.op == b"and" {
@@ -738,24 +746,27 @@ fn walk(c: Cx, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.raise} =
     EHandle(h) -> {
       let body = walk(c, s, acc, h.body);
       let returned = match h.ret {
-        Some(r) -> walk(c, bound(s, r.binder.name, TUnknown), body, r.body),
+        Some(r) -> walk(c, bound(s, r.binder.name, UnknownTerm), body, r.body),
         None -> body,
       };
-      fold(h.clauses, returned, |a: Seen, k: HandleClause| {
-        let params = fold(k.params, s, |sc: Scope, p: Ident| bound(sc, p.name, TUnknown));
-        let resumed = match k.resume { Some(r) -> bound(params, r.name, TUnknown), None -> params };
-        walk(c, resumed, a, k.body)
+      fold(h.clauses, returned, |a: Seen, clause: HandleClause| {
+        let params = fold(clause.params, s, |sc: Scope, p: Ident| bound(sc, p.name, UnknownTerm));
+        let resumed = match clause.resume {
+          Some(r) -> bound(params, r.name, UnknownTerm),
+          None -> params,
+        };
+        walk(c, resumed, a, clause.body)
       })
     },
-    EWithCell(w) -> walk(c, bound(s, w.binder.name, TUnknown), walk(c, s, acc, w.init), w.body),
+    EWithCell(w) -> walk(c, bound(s, w.binder.name, UnknownTerm), walk(c, s, acc, w.init), w.body),
     ESimulate(x) -> walk(c, s, acc, x.body),
     EParallel(p) -> fold(p.branches, acc, |a: Seen, x: Expr| walk(c, s, a, x)),
     EBad(_) -> acc,
   }
 
 fn applied(
-  c: Cx,
-  s: Scope,
+  c: MemberContext,
+  scope: Scope,
   acc: Seen,
   func: Expr,
   args: List<Expr>,
@@ -764,43 +775,43 @@ fn applied(
 ) -> Seen / {abort.raise} = {
   let walked = fold(
     named,
-    fold(args, acc, |a: Seen, x: Expr| walk(c, s, a, x)),
-    |a: Seen, n: NamedArg| walk(c, s, a, n.value),
+    fold(args, acc, |a: Seen, expr: Expr| walk(c, scope, a, expr)),
+    |a: Seen, arg: NamedArg| walk(c, scope, a, arg.value),
   );
   match func {
-    EVar(v) -> match callee_of(c, s, v.name) {
-      CMember(t) ->
+    EVar(v) -> match callee_of(c, scope, v.name) {
+      GroupMember(t) ->
         called(walked, {
           callee: t,
-          args: arguments(c, s, t, args, named),
-          facts: s.facts,
+          args: arguments(c, scope, t, args, named),
+          facts: scope.facts,
           span: span,
         }),
-      CBuiltin(name) -> match element_callback(name) {
-        Some(shape) -> iterated(c, s, acc, args, named, shape),
+      BuiltinCallee(name) -> match element_callback(name) {
+        Some(shape) -> iterated(c, scope, acc, args, named, shape),
         None -> walked,
       },
-      _ -> walk(c, s, walked, func),
+      _ -> walk(c, scope, walked, func),
     },
-    _ -> walk(c, s, walked, func),
+    _ -> walk(c, scope, walked, func),
   }
 }
 
 // A call's arguments by the callee's parameters; one left to its default is unknown.
 fn arguments(
-  c: Cx,
-  s: Scope,
+  c: MemberContext,
+  scope: Scope,
   t: Int,
   args: List<Expr>,
   named: List<NamedArg>,
-) -> List<Term> / {abort.raise} = {
+) -> List<Term> = {
   let params = at(c.group.defs, t).params;
   map(range(0, len(params)), |i: Int|
     match list_at(args, i) {
-      Some(x) -> term(c, s, x),
+      Some(x) -> term(c, scope, x),
       None ->
-        fold(named, TUnknown, |found: Term, n: NamedArg|
-          if n.name.name == at(params, i).name.name { term(c, s, n.value) } else { found }),
+        fold(named, UnknownTerm, |found: Term, arg: NamedArg|
+          if arg.name.name == at(params, i).name.name { term(c, scope, arg.value) } else { found }),
     })
 }
 
@@ -814,15 +825,18 @@ fn element_callback(name: Bytes) -> Option<Iterates> =
   else { None }
 
 fn iterated(
-  c: Cx,
+  c: MemberContext,
   s: Scope,
   acc: Seen,
   args: List<Expr>,
   named: List<NamedArg>,
   shape: Iterates,
-) -> Seen / {abort.raise} = {
-  let others = fold(named, acc, |a: Seen, n: NamedArg| walk(c, s, a, n.value));
-  let element = match list_at(args, shape.list) { Some(x) -> element(c, s, x), None -> TUnknown };
+) -> Seen = {
+  let others = fold(named, acc, |a: Seen, arg: NamedArg| walk(c, s, a, arg.value));
+  let element = match list_at(args, shape.list) {
+    Some(x) -> element(c, s, x),
+    None -> UnknownTerm,
+  };
   fold(range(0, len(args)), others, |a: Seen, i: Int| {
     let x = at(args, i);
     if i != shape.callback { walk(c, s, a, x) } else {
@@ -830,7 +844,7 @@ fn iterated(
         ELambda(l) -> {
           let params = fold(range(0, len(l.params)), s, |sc: Scope, j: Int|
             bound(sc, at(l.params, j).name.name, if j == shape.param { element }
-            else { TUnknown }));
+            else { UnknownTerm }));
           walk(c, params, a, l.body)
         },
         EVar(v) -> match member(c, s, v.name) {
@@ -838,7 +852,7 @@ fn iterated(
             called(a, {
               callee: t,
               args: map(range(0, len(at(c.group.defs, t).params)), |j: Int|
-                if j == shape.param { element } else { TUnknown }),
+                if j == shape.param { element } else { UnknownTerm }),
               facts: s.facts,
               span: v.span,
             }),

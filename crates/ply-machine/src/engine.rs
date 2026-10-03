@@ -6,8 +6,8 @@ use crate::load::Loaded;
 use ply_eval::decode::{At, Error as DecodeError};
 use ply_eval::host::HostBinding;
 use ply_eval::{
-    DEFAULT_MAX_CALLS, DefInfo, Diagnostic, Front, LawInfo, Machine, Seed, SourceId, Span, Symbol,
-    Value, codes,
+    Analysis, DEFAULT_MAX_CALLS, DefInfo, Diagnostic, LawInfo, Machine, Seed, SourceId, Span,
+    Symbol, Value, codes,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -119,7 +119,7 @@ enum Claim<'s> {
 
 /// It owns what it judges, so a run can judge on whichever threads the program asks from.
 pub struct Prover {
-    front: Arc<Front>,
+    front: Arc<Analysis>,
     /// Each law's place among its module's laws, which names its roots, and its place in the
     /// program's.
     laws: HashMap<Symbol, (usize, usize)>,

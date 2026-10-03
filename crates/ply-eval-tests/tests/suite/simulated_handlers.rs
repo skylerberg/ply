@@ -53,7 +53,7 @@ fn declared() -> HashMap<String, (Vec<String>, String)> {
         .expect("the front end answers")
         .dump;
     let printed = |t: At<'_>| -> String {
-        let text = producer::call("tycore.type_text", &[t.value().clone()])
+        let text = producer::call("types.type_text", &[t.value().clone()])
             .expect("the compiler prints a type");
         At::new("a printed type", &text)
             .utf8()

@@ -40,7 +40,7 @@ fn fixture() -> String {
 }
 
 fn check(source: &str) -> CheckOutput {
-    ply_codegen::c::producer::checked_front(
+    ply_codegen::c::producer::checked_analysis(
         &[(MODULE.to_string(), source.to_string())],
         &[SourceId(0)],
     )

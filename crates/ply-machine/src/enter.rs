@@ -2,7 +2,7 @@
 //! carries, its unit's C compiled, its hosts bound from what the caller lends, and its entry called.
 
 use crate::runnable::Runnable;
-use ply_eval::{Diagnostic, Ended, Front, SourceMap, Span, Symbol, codes};
+use ply_eval::{Analysis, Diagnostic, Ended, SourceMap, Span, Symbol, codes};
 use std::path::{Path, PathBuf};
 
 /// What a caller lends an entered program: the roots it may reach, the programs its
@@ -23,7 +23,7 @@ pub const EXIT_OK: i32 = 0;
 /// A program opened to be entered.
 pub struct Opened {
     pub sources: SourceMap,
-    pub front: Front,
+    pub front: Analysis,
     /// The name the entry point answers to in this program.
     pub entry: Symbol,
 }
@@ -39,7 +39,7 @@ pub struct OpenedRunnable {
 pub fn opened_runnable(runnable: Runnable, root: &Path) -> Result<OpenedRunnable, Diagnostic> {
     let Runnable { entry, front, unit } = runnable;
     let loaded =
-        crate::driver::load_over_front_taken(root.to_path_buf(), front).map_err(|err| {
+        crate::driver::load_over_analysis_taken(root.to_path_buf(), front).map_err(|err| {
             err.diagnostics.into_iter().next().unwrap_or_else(|| {
                 Diagnostic::error(
                     codes::INTERNAL_ERROR,

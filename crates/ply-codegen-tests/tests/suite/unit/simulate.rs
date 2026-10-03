@@ -2,7 +2,7 @@ use ply_codegen::Source;
 use ply_codegen::c::Native;
 use ply_codegen::heap::{Heap, imm};
 use ply_eval::{
-    Determinism, Diagnostic, Front, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry,
+    Analysis, Determinism, Diagnostic, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry,
     HostRequest, HostResource, HostRuntime, Linearity, SourceId, Symbol, Value,
 };
 use std::collections::HashMap;
@@ -18,13 +18,13 @@ impl HostHandler for Scheduled {
 }
 
 /// The front and the unit over `text`, module `m`; `None` on a host with no C compiler.
-fn built(text: &str) -> Option<(&'static Front, Native)> {
+fn built(text: &str) -> Option<(&'static Analysis, Native)> {
     let named = [("m".to_string(), text.to_string())];
-    let front: &'static Front = Box::leak(Box::new(
-        ply_codegen::c::producer::checked_front(&named, &[SourceId(0)]).expect("checks"),
+    let front: &'static Analysis = Box::leak(Box::new(
+        ply_codegen::c::producer::checked_analysis(&named, &[SourceId(0)]).expect("checks"),
     ));
     let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(front).with_texts(HashMap::from(named)),
+        Source::from_analysis(front).with_texts(HashMap::from(named)),
     ));
     let names = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -40,7 +40,7 @@ fn built(text: &str) -> Option<(&'static Front, Native)> {
 }
 
 /// What `ply run --host` binds `task` to, which is what lets a `task` operation open a region.
-fn tasks_bound(front: &Front) -> HostBinding {
+fn tasks_bound(front: &Analysis) -> HostBinding {
     let mut registry = HostRegistry::new();
     for op in ply_eval::sim::TASK_OPS {
         registry.register(

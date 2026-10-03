@@ -3,7 +3,9 @@
 //! walk fetches. Which entry is built, what the artifact holds and how it is made, where it lands
 //! and what the report says are the program's.
 
-use crate::driver::{HandedFront, handed_front_of, load_over_front, load_over_front_in};
+use crate::driver::{
+    LoadedAnalysis, load_over_analysis, load_over_analysis_in, loaded_analysis_of,
+};
 use crate::hosts::Lent;
 use crate::load::{LoadError, Loaded};
 use crate::payload::{diags_value, option, places_value, record};
@@ -66,7 +68,7 @@ impl HostHandler for Site {
         let value = match (req.op.op.as_str(), req.args) {
             ("loaded", [path, front]) => {
                 let path = PathBuf::from(path.as_str(span, "the program's root")?);
-                let front = handed_front_of(front, span)?;
+                let front = loaded_analysis_of(front, span)?;
                 self.loaded(&self.load(&path, &front))
             }
             ("git", [_, _]) if self.hermetic => answered(Err(hermetic_fetch())),
@@ -104,11 +106,11 @@ fn answered(answer: Result<PlyValue, Diagnostic>) -> PlyValue {
 
 impl Site {
     /// A load is of the root and front end it is handed.
-    fn load(&self, path: &Path, front: &HandedFront) -> Result<Loaded, LoadError> {
+    fn load(&self, path: &Path, front: &LoadedAnalysis) -> Result<Loaded, LoadError> {
         if self.hermetic {
-            load_over_front_in(crate::load::tidy(path), front)
+            load_over_analysis_in(crate::load::tidy(path), front)
         } else {
-            load_over_front(path, front)
+            load_over_analysis(path, front)
         }
     }
 

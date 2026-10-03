@@ -2,10 +2,10 @@
 // record update, which needs the checker's answer for its base and so runs after the check.
 
 import std.bin
-import spine (Span, Ident, QName, PDiag, Label, span_to, dummy_span, bare, num, span_key, diag1,
-              diag2, pdiag, plabel, dump_diags)
-import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
-              MWrite, MBad)
+import parsing (Span, Ident, QName, ParseDiag, Label, span_to, dummy_span, bare, int_to_bytes,
+                span_key, error_at, error_at_and, parse_diag, parse_label, dump_diags)
+import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
+                    MWrite, MBad)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause, SRequires, SEnsures,
               EffectSetDef, ImportDecl, ImportKind, INames, Binder, OpDef, EffectDef, TestDef,
@@ -30,21 +30,24 @@ fn drop<a>(xs: List<a>, n: Int) -> List<a> / {abort.raise} =
 
 fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
 
-fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(_) -> false }
+fn is_bare(qname: QName) -> Bool = match qname.module { None -> true, Some(_) -> false }
 
 fn max_alias_depth() -> Int = 16
 
 // This module's own `type` items; the first declaration of a name wins.
-fn collect_types(m: Module) -> List<TypeDef> =
-  fold(m.items, [], |acc: List<TypeDef>, it: Item|
-    match it {
+fn collect_types(module: Module) -> List<TypeDef> =
+  fold(module.items, [], |acc: List<TypeDef>, item: Item|
+    match item {
       IType(d) -> match find_type(acc, d.name.name) { Some(_) -> acc, None -> push(acc, d) },
       _ -> acc,
     })
 
 fn find_type(ts: List<TypeDef>, name: Bytes) -> Option<TypeDef> =
-  fold(ts, None, |acc: Option<TypeDef>, t: TypeDef|
-    match acc { Some(_) -> acc, None -> if t.name.name == name { Some(t) } else { None } })
+  fold(ts, None, |acc: Option<TypeDef>, type_def: TypeDef|
+    match acc {
+      Some(_) -> acc,
+      None -> if type_def.name.name == name { Some(type_def) } else { None },
+    })
 
 // Evaluates without calling or performing anything.
 pub fn is_pure(e: Expr) -> Bool =
@@ -68,9 +71,9 @@ pub fn is_pure(e: Expr) -> Bool =
         && fold(m.arms, true, |acc: Bool, arm: MatchArm|
           acc && is_pure(arm.body) && (match arm.guard { None -> true, Some(g) -> is_pure(g) })),
     EBlock(b) ->
-      fold(b.stmts, true, |acc: Bool, s: Stmt|
+      fold(b.stmts, true, |acc: Bool, stmt: Stmt|
           acc
-            && (match s {
+            && (match stmt {
               SLet(l) -> is_pure(l.value),
               SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
               SExpr(x) -> is_pure(x),
@@ -88,14 +91,14 @@ pub fn is_pure(e: Expr) -> Bool =
 // base, keyed by the update's span, so this runs after the check and not with the other rewrites.
 
 fn too_deep() -> Bytes =
-  bytes_concat_all([b"more than ", num(max_alias_depth()), b" type aliases deep"])
+  bytes_concat_all([b"more than ", int_to_bytes(max_alias_depth()), b" type aliases deep"])
 
 // The literal an update stands for: the base's other fields, in the record's own order, then the
 // written ones. A call is bound to a name first, so it runs once however many fields are copied.
 fn expand_update(span: Span, base: Expr, written: List<RecField>, names: List<Bytes>) -> Expr = {
   let base_span = expr_span(base);
   let bound: Option<Ident> = match base {
-    EApp(_) -> Some({ name: bytes_concat(b"?u", num(base_span.start)), span: base_span }),
+    EApp(_) -> Some({ name: bytes_concat(b"?u", int_to_bytes(base_span.start)), span: base_span }),
     _ -> None,
   };
   let source = match bound { Some(b) -> EVar({ span: base_span, name: bare(b) }), None -> base };
@@ -133,7 +136,8 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
       EApp({
         span: a.span,
         func: go(a.func),
-        named: map(a.named, |n: NamedArg| { name: n.name, value: go(n.value), span: n.span }),
+        named: map(a.named, |arg: NamedArg|
+          { name: arg.name, value: go(arg.value), span: arg.span }),
         args: map(a.args, go),
         labels: a.labels,
       }),
@@ -155,8 +159,8 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
       EBlock({
         span: b.span,
         tail: opt(b.tail),
-        stmts: map(b.stmts, |st: Stmt|
-          match st {
+        stmts: map(b.stmts, |stmt: Stmt|
+          match stmt {
             SLet(l) -> SLet({ span: l.span, pat: l.pat, ty: l.ty, value: go(l.value) }),
             SLetElse(l) ->
               SLetElse({
@@ -212,15 +216,16 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
 }
 
 // Every expression an item holds, through `map_expr`.
-fn map_item(it: Item, f: (Expr) -> Expr) -> Item = {
+fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
   let go = |x: Expr| map_expr(x, f);
-  match it {
+  match item {
     IFn(d) ->
       IFn({
         ..d,
-        params: map(d.params, |p: Param|
-          { ..p, default: match p.default { None -> None, Some(x) -> Some(go(x)) } }),
-        spec: map(d.spec, |c: SpecClause| { kind: c.kind, expr: go(c.expr), span: c.span }),
+        params: map(d.params, |param: Param|
+          { ..param, default: match param.default { None -> None, Some(x) -> Some(go(x)) } }),
+        spec: map(d.spec, |clause: SpecClause|
+          { kind: clause.kind, expr: go(clause.expr), span: clause.span }),
         body: go(d.body),
       }),
     ITest(d) -> ITest({ ..d, body: go(d.body) }),
@@ -230,26 +235,27 @@ fn map_item(it: Item, f: (Expr) -> Expr) -> Item = {
         guard: match d.guard { None -> None, Some(g) -> Some(go(g)) },
         body: go(d.body),
       }),
-    _ -> it,
+    _ -> item,
   }
 }
 
 // A span the table does not hold belongs to a program that did not check; the lowering declines it.
-fn expanded_update(sh: Map<Bytes, List<Bytes>>, e: Expr) -> Expr =
-  match e {
+fn expanded_update(sh: Map<Bytes, List<Bytes>>, expr: Expr) -> Expr =
+  match expr {
     ERecordUpdate(r) -> match map_get(sh, span_key(r.span)) {
-      None -> e,
+      None -> expr,
       Some(names) -> expand_update(r.span, r.base, r.fields, names),
     },
-    _ -> e,
+    _ -> expr,
   }
 
 // Every update of a checked module replaced by the literal it stands for.
-pub fn expand_record_updates(m: Module, shapes: Map<Bytes, List<Bytes>>) -> Module =
-  if !has_update(m) { m } else {
+pub fn expand_record_updates(module: Module, shapes: Map<Bytes, List<Bytes>>) -> Module =
+  if !has_update(module) { module } else {
     {
-      imports: m.imports,
-      items: map(m.items, |it: Item| map_item(it, |e: Expr| expanded_update(shapes, e))),
+      imports: module.imports,
+      items: map(module.items, |item: Item|
+        map_item(item, |expr: Expr| expanded_update(shapes, expr))),
     }
   }
 
@@ -259,9 +265,9 @@ pub fn expand_record_updates(m: Module, shapes: Map<Bytes, List<Bytes>>) -> Modu
 // Its operators over the parameter read that witness, and every call of it passes one: a type's
 // number, or the caller's own.
 
-pub type Witness = | WType(Bytes) | WParam(Bytes)
+pub type NumericWitness = | ConcreteWitness(Bytes) | ParamWitness(Bytes)
 
-derive bin for Witness
+derive bin for NumericWitness
 
 // No source can spell it, so it never collides with a binder the program wrote.
 pub fn witness_param(param: Bytes) -> Bytes = bytes_concat(b"?w_", param)
@@ -297,10 +303,10 @@ pub fn witness_code(name: Bytes) -> Int =
     None -> 10,
   }
 
-fn witness_expr(w: Witness, sp: Span) -> Expr =
+fn witness_expr(w: NumericWitness, span: Span) -> Expr =
   match w {
-    WType(n) -> ELit({ span: sp, lit: LInt(witness_code(n)) }),
-    WParam(p) -> EVar({ span: sp, name: bare({ name: witness_param(p), span: sp }) }),
+    ConcreteWitness(n) -> ELit({ span: span, lit: LInt(witness_code(n)) }),
+    ParamWitness(p) -> EVar({ span: span, name: bare({ name: witness_param(p), span: span }) }),
   }
 
 // The runtime's numbering of the operators a witnessed parameter takes; `-` and `~` are 0 and 1.
@@ -336,22 +342,22 @@ fn numeric_op_code(op: Bytes) -> Int =
     None -> 0 - 1,
   }
 
-fn hidden_call(sp: Span, name: Bytes, args: List<Expr>) -> Expr =
+fn hidden_call(span: Span, name: Bytes, args: List<Expr>) -> Expr =
   EApp({
-    span: sp,
-    func: EVar({ span: sp, name: bare({ name: name, span: sp }) }),
+    span: span,
+    func: EVar({ span: span, name: bare({ name: name, span: span }) }),
     named: [],
     args: args,
     labels: [],
   })
 
-fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<Witness>>, e: Expr) -> Expr =
+fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<NumericWitness>>, e: Expr) -> Expr =
   match e {
     EBinary(b) -> match map_get(ops, span_key(b.span)) {
       Some(p) -> if b.op == b"eq" || b.op == b"ne" { e } else {
         hidden_call(b.span, b"?numeric_binary", [
           ELit({ span: b.span, lit: LInt(numeric_op_code(b.op)) }),
-          witness_expr(WParam(p), b.span),
+          witness_expr(ParamWitness(p), b.span),
           b.lhs,
           b.rhs,
         ])
@@ -362,7 +368,7 @@ fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<Witness>>, e: Expr) -
       Some(p) ->
         hidden_call(u.span, b"?numeric_unary", [
           ELit({ span: u.span, lit: LInt(if u.op == b"bitnot" { 1 } else { 0 }) }),
-          witness_expr(WParam(p), u.span),
+          witness_expr(ParamWitness(p), u.span),
           u.operand,
         ]),
       None -> e,
@@ -374,7 +380,7 @@ fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<Witness>>, e: Expr) -
             ..a,
             args: fold(
               a.args,
-              map(ws, |w: Witness| witness_expr(w, v.span)),
+              map(ws, |w: NumericWitness| witness_expr(w, v.span)),
               |acc: List<Expr>, x: Expr| push(acc, x),
             ),
           }),
@@ -385,10 +391,10 @@ fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<Witness>>, e: Expr) -
     _ -> e,
   }
 
-fn witness_params(orders: Map<Bytes, List<Bytes>>, it: Item) -> Item =
-  match it {
+fn witness_params(orders: Map<Bytes, List<Bytes>>, item: Item) -> Item =
+  match item {
     IFn(d) -> match map_get(orders, d.name.name) {
-      None -> it,
+      None -> item,
       Some(ws) ->
         IFn({
           ..d,
@@ -407,63 +413,63 @@ fn witness_params(orders: Map<Bytes, List<Bytes>>, it: Item) -> Item =
                 default: None,
                 span: d.name.span,
               }),
-            |acc: List<Param>, p: Param| push(acc, p),
+            |acc: List<Param>, param: Param| push(acc, param),
           ),
         }),
     },
-    _ -> it,
+    _ -> item,
   }
 
 // `orders` holds each witnessed definition's parameters by simple name, as the checker ordered them.
 pub fn expand_witnesses(
-  m: Module,
+  module: Module,
   ops: Map<Bytes, Bytes>,
-  refs: Map<Bytes, List<Witness>>,
+  refs: Map<Bytes, List<NumericWitness>>,
   orders: Map<Bytes, List<Bytes>>,
 ) -> Module =
-  if map_len(ops) == 0 && map_len(refs) == 0 && map_len(orders) == 0 { m } else {
+  if map_len(ops) == 0 && map_len(refs) == 0 && map_len(orders) == 0 { module } else {
     {
-      imports: m.imports,
-      items: map(m.items, |it: Item|
-        witness_params(orders, map_item(it, |e: Expr| witnessed(ops, refs, e)))),
+      imports: module.imports,
+      items: map(module.items, |item: Item|
+        witness_params(orders, map_item(item, |expr: Expr| witnessed(ops, refs, expr)))),
     }
   }
 
 // --- The try operator ------------------------------------------------------------------------
 
-type TryMode = | MResult | MOption
+type TryMode = | TryResult | TryOption
 
 // `shadowed` is the note for a module whose own `Ok`/`Err`/`Some`/`None` would capture the expansion.
-type TryCx = {
+type TryState = {
   types: List<TypeDef>,
   shadowed: Option<Bytes>,
-  diags: List<PDiag>,
+  diags: List<ParseDiag>,
   mode: Option<TryMode>,
   fresh: Int,
 }
 
 type Lift = { operand: Expr, binder: Ident, at: Span }
-type Scan = | SFound(Lift) | SPure | SImpure
-type Scanned = { cx: TryCx, s: Scan, e: Expr }
-type TryOut = { cx: TryCx, e: Expr }
+type Scan = | ScanFound(Lift) | ScanPure | ScanImpure
+type Scanned = { cx: TryState, s: Scan, e: Expr }
+type TryOut = { cx: TryState, e: Expr }
 
 fn is_expansion_name(name: Bytes) -> Bool =
   name == b"Ok" || name == b"Err" || name == b"Some" || name == b"None"
 
-fn shadowing_ctor(m: Module) -> Option<Bytes> = {
-  let imported = fold(m.imports, None, |acc: Option<Bytes>, d: ImportDecl|
+fn shadowing_ctor(module: Module) -> Option<Bytes> = {
+  let imported = fold(module.imports, None, |acc: Option<Bytes>, d: ImportDecl|
     match acc {
       Some(_) -> acc,
       None -> match d.kind {
         INames(ns) ->
-          fold(ns, None, |b: Option<Bytes>, n: Ident|
+          fold(ns, None, |b: Option<Bytes>, ident: Ident|
             match b {
               Some(_) -> b,
-              None -> if is_expansion_name(n.name) {
+              None -> if is_expansion_name(ident.name) {
                 Some(
                   bytes_concat_all([
                     b"this module imports `",
-                    n.name,
+                    ident.name,
                     b"` unqualified, which would capture the `match` `?` expands to; import the module instead and qualify the name, or write the `match` out",
                   ]),
                 )
@@ -475,20 +481,20 @@ fn shadowing_ctor(m: Module) -> Option<Bytes> = {
   match imported {
     Some(_) -> imported,
     None ->
-      fold(m.items, None, |acc: Option<Bytes>, it: Item|
+      fold(module.items, None, |acc: Option<Bytes>, item: Item|
         match acc {
           Some(_) -> acc,
-          None -> match it {
+          None -> match item {
             IType(d) -> match d.body {
               TDSum(vs) ->
-                fold(vs, None, |b: Option<Bytes>, v: VariantDef|
+                fold(vs, None, |b: Option<Bytes>, variant: VariantDef|
                   match b {
                     Some(_) -> b,
-                    None -> if is_expansion_name(v.name.name) {
+                    None -> if is_expansion_name(variant.name.name) {
                       Some(
                         bytes_concat_all([
                           b"this module declares its own `",
-                          v.name.name,
+                          variant.name.name,
                           b"`, which would capture the `match` `?` expands to; rename it, or write the `match` out",
                         ]),
                       )
@@ -518,22 +524,22 @@ fn no_return_type() -> Bytes =
 fn not_in_a_function(what: Bytes) -> Bytes =
   bytes_concat(what, b" has no written return type, and `?` needs one")
 
-fn mode_of(cx: TryCx, t: TypeExpr, depth: Int) -> Result<TryMode, Bytes> =
+fn mode_of(state: TryState, ty: TypeExpr, depth: Int) -> Result<TryMode, Bytes> =
   if depth > max_alias_depth() { Err(too_deep()) } else {
-    match t {
+    match ty {
       TCon(c) -> if !is_bare(c.name) {
         Err(
           b"the return type is named through another module, and `?` reads only this file \xe2\x80\x94 a meaning read across a module boundary would go stale in a file that never changed",
         )
-      } else if c.name.name.name == b"Result" { Ok(MResult) }
-      else if c.name.name.name == b"Option" { Ok(MOption) } else {
+      } else if c.name.name.name == b"Result" { Ok(TryResult) }
+      else if c.name.name.name == b"Option" { Ok(TryOption) } else {
         let n = c.name.name.name;
-        match find_type(cx.types, n) {
+        match find_type(state.types, n) {
           None -> Err(not_result_or_option(n)),
           Some(d) -> if len(d.params) > 0 { Err(unreadable()) } else {
             match d.body {
               TDSum(_) -> Err(not_result_or_option(n)),
-              TDAlias(inner) -> mode_of(cx, inner, depth + 1),
+              TDAlias(inner) -> mode_of(state, inner, depth + 1),
             }
           },
         }
@@ -542,20 +548,20 @@ fn mode_of(cx: TryCx, t: TypeExpr, depth: Int) -> Result<TryMode, Bytes> =
     }
   }
 
-fn mode_for(cx: TryCx, ret: Option<TypeExpr>) -> Result<TryMode, Bytes> =
-  match cx.shadowed {
+fn mode_for(state: TryState, ret: Option<TypeExpr>) -> Result<TryMode, Bytes> =
+  match state.shadowed {
     Some(why) -> Err(why),
-    None -> match ret { None -> Err(no_return_type()), Some(ty) -> mode_of(cx, ty, 0) },
+    None -> match ret { None -> Err(no_return_type()), Some(ty) -> mode_of(state, ty, 0) },
   }
 
 // The outermost barrier is the one named.
 fn under(barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
   match barrier { Some(_) -> barrier, None -> Some(what) }
 
-fn fresh_binder(cx: TryCx, span: Span) -> { cx: TryCx, b: Ident } =
+fn fresh_binder(state: TryState, span: Span) -> { cx: TryState, b: Ident } =
   {
-    cx: { ..cx, fresh: cx.fresh + 1 },
-    b: { name: bytes_concat(b"?", bytes_of_string(int_to_string(cx.fresh))), span: span },
+    cx: { ..state, fresh: state.fresh + 1 },
+    b: { name: bytes_concat(b"?", bytes_of_string(int_to_string(state.fresh))), span: span },
   }
 
 fn var_of(name: Ident) -> Expr = EVar({ span: name.span, name: bare(name) })
@@ -566,11 +572,14 @@ fn ctor_pattern(name: Bytes, args: List<Pattern>, span: Span) -> Pattern =
   PCtor({ span: span, name: bare({ name: name, span: span }), args: args })
 
 // `match operand { <failure>, <success>(pat) -> body }`, failure arm first.
-fn wrap(cx: TryCx, operand: Expr, at_: Span, pat: Pattern, body: Expr) -> TryOut / {abort.raise} = {
-  let mode = match cx.mode { Some(m) -> m, None -> panic("a mode is established before any lift") };
+fn wrap(state: TryState, operand: Expr, at_: Span, pat: Pattern, body: Expr) -> TryOut = {
+  let mode = match state.mode {
+    Some(m) -> m,
+    None -> panic("a mode is established before any lift"),
+  };
   match mode {
-    MResult -> {
-      let fb = fresh_binder(cx, at_);
+    TryResult -> {
+      let fb = fresh_binder(state, at_);
       let fail_pat = ctor_pattern(b"Err", [var_pattern(fb.b)], at_);
       let fail_body = EApp({
         span: at_,
@@ -591,11 +600,11 @@ fn wrap(cx: TryCx, operand: Expr, at_: Span, pat: Pattern, body: Expr) -> TryOut
         }),
       }
     },
-    MOption -> {
+    TryOption -> {
       let fail_pat = ctor_pattern(b"None", [], at_);
       let fail_body = var_of({ name: b"None", span: at_ });
       {
-        cx: cx,
+        cx: state,
         e: EMatch({
           span: at_,
           scrutinee: operand,
@@ -609,61 +618,65 @@ fn wrap(cx: TryCx, operand: Expr, at_: Span, pat: Pattern, body: Expr) -> TryOut
   }
 }
 
-fn purity(pure: Bool) -> Scan = if pure { SPure } else { SImpure }
+fn purity(pure: Bool) -> Scan = if pure { ScanPure } else { ScanImpure }
 
 // Sub-expressions left to right, stopping at the first `?` and at the first impure one.
-fn sequence(
-  cx: TryCx,
-  parts: List<Expr>,
-) -> { cx: TryCx, s: Scan, xs: List<Expr> } / {abort.raise} =
+fn sequence(state: TryState, parts: List<Expr>) -> { cx: TryState, s: Scan, xs: List<Expr> } =
   fold(
     parts,
-    { cx: cx, s: SPure, xs: [] },
-    |acc: { cx: TryCx, s: Scan, xs: List<Expr> }, p: Expr|
+    { cx: state, s: ScanPure, xs: [] },
+    |acc: { cx: TryState, s: Scan, xs: List<Expr> }, expr: Expr|
       match acc.s {
-        SPure -> {
-          let o = scan(acc.cx, p);
+        ScanPure -> {
+          let o = scan(acc.cx, expr);
           { cx: o.cx, s: o.s, xs: push(acc.xs, o.e) }
         },
-        _ -> { ..acc, xs: push(acc.xs, p) },
+        _ -> { ..acc, xs: push(acc.xs, expr) },
       },
   )
 
 // Lifts the first `?` reachable in evaluation order, leaving its binder in its place.
-fn scan(cx: TryCx, e: Expr) -> Scanned / {abort.raise} =
-  match e {
-    ELit(_) -> { cx: cx, s: SPure, e: e },
-    EVar(_) -> { cx: cx, s: SPure, e: e },
-    EBad(_) -> { cx: cx, s: SPure, e: e },
+fn scan(state: TryState, expr: Expr) -> Scanned =
+  match expr {
+    ELit(_) -> { cx: state, s: ScanPure, e: expr },
+    EVar(_) -> { cx: state, s: ScanPure, e: expr },
+    EBad(_) -> { cx: state, s: ScanPure, e: expr },
     ETry(t) -> {
-      let inner = scan(cx, t.operand);
+      let inner = scan(state, t.operand);
       match inner.s {
-        SFound(_) -> { cx: inner.cx, s: inner.s, e: ETry({ span: t.span, operand: inner.e }) },
+        ScanFound(_) -> { cx: inner.cx, s: inner.s, e: ETry({ span: t.span, operand: inner.e }) },
         _ -> {
           let fb = fresh_binder(inner.cx, t.span);
-          { cx: fb.cx, s: SFound({ operand: inner.e, binder: fb.b, at: t.span }), e: var_of(fb.b) }
+          {
+            cx: fb.cx,
+            s: ScanFound({ operand: inner.e, binder: fb.b, at: t.span }),
+            e: var_of(fb.b),
+          }
         },
       }
     },
     EBinary(b) -> {
       let short = b.op == b"and" || b.op == b"or";
-      let l = scan(cx, b.lhs);
+      let l = scan(state, b.lhs);
       match l.s {
-        SFound(_) ->
+        ScanFound(_) ->
           { cx: l.cx, s: l.s, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: b.rhs }) },
-        SImpure -> { cx: l.cx, s: SImpure, e: e },
-        SPure -> if short { { cx: l.cx, s: purity(is_pure(b.rhs)), e: e } } else {
+        ScanImpure -> { cx: l.cx, s: ScanImpure, e: expr },
+        ScanPure -> if short { { cx: l.cx, s: purity(is_pure(b.rhs)), e: expr } } else {
           let r = scan(l.cx, b.rhs);
           { cx: r.cx, s: r.s, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
         },
       }
     },
     EUnary(u) -> {
-      let o = scan(cx, u.operand);
+      let o = scan(state, u.operand);
       { cx: o.cx, s: o.s, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
     },
     EApp(a) -> {
-      let o = sequence(cx, append(append([a.func], a.args), map(a.named, |n: NamedArg| n.value)));
+      let o = sequence(
+        state,
+        append(append([a.func], a.args), map(a.named, |n: NamedArg| n.value)),
+      );
       let func = at(o.xs, 0);
       let args = take(drop(o.xs, 1), len(a.args));
       let nvals = drop(o.xs, 1 + len(a.args));
@@ -673,12 +686,12 @@ fn scan(cx: TryCx, e: Expr) -> Scanned / {abort.raise} =
       });
       let rebuilt = EApp({ span: a.span, func: func, named: named, args: args, labels: a.labels });
       match o.s {
-        SFound(_) -> { cx: o.cx, s: o.s, e: rebuilt },
-        _ -> { cx: o.cx, s: SImpure, e: rebuilt },
+        ScanFound(_) -> { cx: o.cx, s: o.s, e: rebuilt },
+        _ -> { cx: o.cx, s: ScanImpure, e: rebuilt },
       }
     },
     EPerform(p) -> {
-      let o = sequence(cx, p.args);
+      let o = sequence(state, p.args);
       let rebuilt = EPerform({
         span: p.span,
         eff: p.eff,
@@ -687,12 +700,12 @@ fn scan(cx: TryCx, e: Expr) -> Scanned / {abort.raise} =
         args: o.xs,
       });
       match o.s {
-        SFound(_) -> { cx: o.cx, s: o.s, e: rebuilt },
-        _ -> { cx: o.cx, s: SImpure, e: rebuilt },
+        ScanFound(_) -> { cx: o.cx, s: o.s, e: rebuilt },
+        _ -> { cx: o.cx, s: ScanImpure, e: rebuilt },
       }
     },
     ERecord(r) -> {
-      let o = sequence(cx, map(r.fields, |f: RecField| f.value));
+      let o = sequence(state, map(r.fields, |f: RecField| f.value));
       {
         cx: o.cx,
         s: o.s,
@@ -704,15 +717,15 @@ fn scan(cx: TryCx, e: Expr) -> Scanned / {abort.raise} =
       }
     },
     EList(l) -> {
-      let o = sequence(cx, l.items);
+      let o = sequence(state, l.items);
       { cx: o.cx, s: o.s, e: EList({ span: l.span, items: o.xs }) }
     },
     EField(f) -> {
-      let o = scan(cx, f.base);
+      let o = scan(state, f.base);
       { cx: o.cx, s: o.s, e: EField({ span: f.span, base: o.e, field: f.field }) }
     },
     ERecordUpdate(r) -> {
-      let o = sequence(cx, append([r.base], map(r.fields, |f: RecField| f.value)));
+      let o = sequence(state, append([r.base], map(r.fields, |f: RecField| f.value)));
       {
         cx: o.cx,
         s: o.s,
@@ -725,7 +738,7 @@ fn scan(cx: TryCx, e: Expr) -> Scanned / {abort.raise} =
       }
     },
     EIf(i) -> {
-      let c = scan(cx, i.cond);
+      let c = scan(state, i.cond);
       let rebuilt = EIf({
         span: i.span,
         cond: c.e,
@@ -733,19 +746,19 @@ fn scan(cx: TryCx, e: Expr) -> Scanned / {abort.raise} =
         else_branch: i.else_branch,
       });
       match c.s {
-        SFound(_) -> { cx: c.cx, s: c.s, e: rebuilt },
-        SImpure -> { cx: c.cx, s: SImpure, e: rebuilt },
-        SPure ->
+        ScanFound(_) -> { cx: c.cx, s: c.s, e: rebuilt },
+        ScanImpure -> { cx: c.cx, s: ScanImpure, e: rebuilt },
+        ScanPure ->
           { cx: c.cx, s: purity(is_pure(i.then_branch) && is_pure(i.else_branch)), e: rebuilt },
       }
     },
     EMatch(m) -> {
-      let sc = scan(cx, m.scrutinee);
+      let sc = scan(state, m.scrutinee);
       let rebuilt = EMatch({ span: m.span, scrutinee: sc.e, arms: m.arms });
       match sc.s {
-        SFound(_) -> { cx: sc.cx, s: sc.s, e: rebuilt },
-        SImpure -> { cx: sc.cx, s: SImpure, e: rebuilt },
-        SPure ->
+        ScanFound(_) -> { cx: sc.cx, s: sc.s, e: rebuilt },
+        ScanImpure -> { cx: sc.cx, s: ScanImpure, e: rebuilt },
+        ScanPure ->
           {
             cx: sc.cx,
             s: purity(
@@ -759,14 +772,14 @@ fn scan(cx: TryCx, e: Expr) -> Scanned / {abort.raise} =
     },
     // A nested block is not entered; a lambda, handler, cell, region, `simulate` or `parallel` is a
     // barrier to `?`.
-    _ -> { cx: cx, s: purity(is_pure(e)), e: e },
+    _ -> { cx: state, s: purity(is_pure(expr)), e: expr },
   }
 
-// One `match` per `?` lifted from `e`'s head, with the rewritten `e` as the success arm's body.
-fn region_cond(cx: TryCx, e: Expr) -> TryOut / {abort.raise} = {
-  let found = scan_head(cx, e);
+// One `match` per `?` lifted from `expr`'s head, with the rewritten `expr` as the success arm's body.
+fn region_cond(state: TryState, expr: Expr) -> TryOut = {
+  let found = scan_head(state, expr);
   match found.s {
-    SFound(l) -> {
+    ScanFound(l) -> {
       let w = wrap(found.cx, l.operand, l.at, var_pattern(l.binder), found.e);
       match w.e {
         EMatch(m) -> {
@@ -791,10 +804,10 @@ fn region_cond(cx: TryCx, e: Expr) -> TryOut / {abort.raise} = {
   }
 }
 
-fn scan_head(cx: TryCx, e: Expr) -> Scanned / {abort.raise} =
-  match e {
+fn scan_head(state: TryState, expr: Expr) -> Scanned =
+  match expr {
     EIf(i) -> {
-      let c = scan(cx, i.cond);
+      let c = scan(state, i.cond);
       {
         cx: c.cx,
         s: c.s,
@@ -802,26 +815,26 @@ fn scan_head(cx: TryCx, e: Expr) -> Scanned / {abort.raise} =
       }
     },
     EMatch(m) -> {
-      let sc = scan(cx, m.scrutinee);
+      let sc = scan(state, m.scrutinee);
       { cx: sc.cx, s: sc.s, e: EMatch({ span: m.span, scrutinee: sc.e, arms: m.arms }) }
     },
-    _ -> scan(cx, e),
+    _ -> scan(state, expr),
   }
 
 // An expression in return position.
-fn ret(cx: TryCx, e: Expr) -> TryOut / {abort.raise} =
-  match e {
-    EBlock(_) -> block(cx, e),
+fn ret(state: TryState, expr: Expr) -> TryOut =
+  match expr {
+    EBlock(_) -> block(state, expr),
     EIf(i) -> {
-      let t = ret(cx, i.then_branch);
+      let t = ret(state, i.then_branch);
       let el = ret(t.cx, i.else_branch);
       region_cond(el.cx, EIf({ span: i.span, cond: i.cond, then_branch: t.e, else_branch: el.e }))
     },
     EMatch(m) -> {
       let arms = fold(
         m.arms,
-        { cx: cx, arms: [] },
-        |acc: { cx: TryCx, arms: List<MatchArm> }, arm: MatchArm| {
+        { cx: state, arms: [] },
+        |acc: { cx: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let b = ret(acc.cx, arm.body);
           {
             cx: b.cx,
@@ -831,17 +844,17 @@ fn ret(cx: TryCx, e: Expr) -> TryOut / {abort.raise} =
       );
       region_cond(arms.cx, EMatch({ span: m.span, scrutinee: m.scrutinee, arms: arms.arms }))
     },
-    _ -> region_cond(cx, e),
+    _ -> region_cond(state, expr),
   }
 
 // A block in return position: split at the first statement a `?` can be lifted from.
-fn block(cx: TryCx, e: Expr) -> TryOut / {abort.raise} =
-  match e {
+fn block(state: TryState, expr: Expr) -> TryOut =
+  match expr {
     EBlock(b) -> {
       let split = fold(
         range(0, len(b.stmts)),
-        { cx: cx, stmts: b.stmts, tail: b.tail, done: false },
-        |acc: { cx: TryCx, stmts: List<Stmt>, tail: Option<Expr>, done: Bool }, i: Int|
+        { cx: state, stmts: b.stmts, tail: b.tail, done: false },
+        |acc: { cx: TryState, stmts: List<Stmt>, tail: Option<Expr>, done: Bool }, i: Int|
           if acc.done { acc } else {
             let o = split_at(acc.cx, acc.stmts, acc.tail, i);
             match o.split {
@@ -866,19 +879,19 @@ fn block(cx: TryCx, e: Expr) -> TryOut / {abort.raise} =
   }
 
 type Taken = {
-  cx: TryCx,
+  cx: TryState,
   stmt: Stmt,
   take: Option<{ operand: Expr, at: Span, pat: Pattern, consumes: Bool }>,
 }
 
 fn split_at(
-  cx: TryCx,
+  state: TryState,
   stmts: List<Stmt>,
   tail: Option<Expr>,
   i: Int,
-) -> { cx: TryCx, stmts: List<Stmt>, split: Option<Expr> } / {abort.raise} = {
+) -> { cx: TryState, stmts: List<Stmt>, split: Option<Expr> } / {abort.raise} = {
   let st = at(stmts, i);
-  let taken = take_stmt(cx, st);
+  let taken = take_stmt(state, st);
   match taken.take {
     None -> { cx: taken.cx, stmts: set_at(stmts, i, taken.stmt), split: None },
     Some(t) -> {
@@ -893,13 +906,13 @@ fn split_at(
   }
 }
 
-fn take_stmt(cx: TryCx, st: Stmt) -> Taken / {abort.raise} =
-  match st {
+fn take_stmt(state: TryState, stmt: Stmt) -> Taken =
+  match stmt {
     // Never consumed, since its pattern is not the success arm's. Its `else` block is the block's
     // value, so it is a return position: expanded once, when no `?` is left in the initializer.
     SLetElse(l) -> match l.value {
       ETry(t) -> {
-        let fb = fresh_binder(cx, t.span);
+        let fb = fresh_binder(state, t.span);
         let o = take_try(fb.cx, t.operand, t.span, var_pattern(fb.b));
         if o.take.consumes {
           {
@@ -921,9 +934,9 @@ fn take_stmt(cx: TryCx, st: Stmt) -> Taken / {abort.raise} =
         }
       },
       _ -> {
-        let o = scan(cx, l.value);
+        let o = scan(state, l.value);
         match o.s {
-          SFound(lift) ->
+          ScanFound(lift) ->
             {
               cx: o.cx,
               stmt: SLetElse({ ..l, value: o.e }),
@@ -945,7 +958,7 @@ fn take_stmt(cx: TryCx, st: Stmt) -> Taken / {abort.raise} =
       ETry(t) -> match l.ty {
         // The annotation stays: the `let` now binds the success arm's binder.
         Some(_) -> {
-          let fb = fresh_binder(cx, t.span);
+          let fb = fresh_binder(state, t.span);
           let o = take_try(fb.cx, t.operand, t.span, var_pattern(fb.b));
           if o.take.consumes {
             {
@@ -972,7 +985,7 @@ fn take_stmt(cx: TryCx, st: Stmt) -> Taken / {abort.raise} =
           }
         },
         None -> {
-          let o = take_try(cx, t.operand, t.span, l.pat);
+          let o = take_try(state, t.operand, t.span, l.pat);
           {
             cx: o.cx,
             stmt: SLet({
@@ -986,9 +999,9 @@ fn take_stmt(cx: TryCx, st: Stmt) -> Taken / {abort.raise} =
         },
       },
       _ -> {
-        let o = scan(cx, l.value);
+        let o = scan(state, l.value);
         match o.s {
-          SFound(lift) ->
+          ScanFound(lift) ->
             {
               cx: o.cx,
               stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e }),
@@ -999,13 +1012,13 @@ fn take_stmt(cx: TryCx, st: Stmt) -> Taken / {abort.raise} =
                 consumes: false,
               }),
             },
-          _ -> { cx: o.cx, stmt: st, take: None },
+          _ -> { cx: o.cx, stmt: stmt, take: None },
         }
       },
     },
     SExpr(v) -> match v {
       ETry(t) -> {
-        let o = take_try(cx, t.operand, t.span, PWild({ span: v_span(v) }));
+        let o = take_try(state, t.operand, t.span, PWild({ span: v_span(v) }));
         {
           cx: o.cx,
           stmt: SExpr(ETry({ span: t.span, operand: o.operand_left })),
@@ -1013,9 +1026,9 @@ fn take_stmt(cx: TryCx, st: Stmt) -> Taken / {abort.raise} =
         }
       },
       _ -> {
-        let o = scan(cx, v);
+        let o = scan(state, v);
         match o.s {
-          SFound(lift) ->
+          ScanFound(lift) ->
             {
               cx: o.cx,
               stmt: SExpr(o.e),
@@ -1026,25 +1039,25 @@ fn take_stmt(cx: TryCx, st: Stmt) -> Taken / {abort.raise} =
                 consumes: false,
               }),
             },
-          _ -> { cx: o.cx, stmt: st, take: None },
+          _ -> { cx: o.cx, stmt: stmt, take: None },
         }
       },
     },
   }
 
-fn v_span(e: Expr) -> Span = expr_span(e)
+fn v_span(expr: Expr) -> Span = expr_span(expr)
 
 type TryTaken = {
-  cx: TryCx,
+  cx: TryState,
   operand_left: Expr,
   take: { operand: Expr, at: Span, pat: Pattern, consumes: Bool },
 }
 
 // An inner `?` in the operand is lifted first and the statement stays; otherwise the statement is consumed.
-fn take_try(cx: TryCx, operand: Expr, span: Span, pat: Pattern) -> TryTaken / {abort.raise} = {
-  let o = scan(cx, operand);
+fn take_try(state: TryState, operand: Expr, span: Span, pat: Pattern) -> TryTaken = {
+  let o = scan(state, operand);
   match o.s {
-    SFound(lift) ->
+    ScanFound(lift) ->
       {
         cx: o.cx,
         operand_left: o.e,
@@ -1064,18 +1077,13 @@ fn take_try(cx: TryCx, operand: Expr, span: Span, pat: Pattern) -> TryTaken / {a
   }
 }
 
-// Refuses and unwraps every `?` left in `e`: `E0118` when `scope` or `barrier` says why, else `E0119`.
-fn sweep(
-  cx: TryCx,
-  e: Expr,
-  scope: Option<Bytes>,
-  barrier: Option<Bytes>,
-) -> TryOut / {abort.raise} = {
-  let refused = match e {
+// Refuses and unwraps every `?` left in `expr`: `E0118` when `scope` or `barrier` says why, else `E0119`.
+fn sweep(state: TryState, expr: Expr, scope: Option<Bytes>, barrier: Option<Bytes>) -> TryOut = {
+  let refused = match expr {
     ETry(t) -> {
       let d = match barrier {
         Some(what) ->
-          diag1(
+          error_at(
             b"E0118",
             t.span,
             b"this file gives `?` no meaning here",
@@ -1090,7 +1098,7 @@ fn sweep(
           ),
         None -> match scope {
           Some(why) ->
-            diag1(
+            error_at(
               b"E0118",
               t.span,
               b"this file gives `?` no meaning here",
@@ -1098,7 +1106,7 @@ fn sweep(
               [why],
             ),
           None ->
-            diag1(
+            error_at(
               b"E0119",
               t.span,
               b"this `?` is not in a position it can be expanded from",
@@ -1109,46 +1117,46 @@ fn sweep(
             ),
         },
       };
-      { cx: { ..cx, diags: push(cx.diags, d) }, e: t.operand }
+      { cx: { ..state, diags: push(state.diags, d) }, e: t.operand }
     },
-    _ -> { cx: cx, e: e },
+    _ -> { cx: state, e: expr },
   };
   sweep_inner(refused.cx, refused.e, scope, barrier)
 }
 
 fn sweep_inner(
-  cx: TryCx,
-  e: Expr,
+  state: TryState,
+  expr: Expr,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-) -> TryOut / {abort.raise} =
-  match e {
+) -> TryOut =
+  match expr {
     ETry(t) -> {
-      let o = sweep(cx, t.operand, scope, barrier);
+      let o = sweep(state, t.operand, scope, barrier);
       { cx: o.cx, e: ETry({ span: t.span, operand: o.e }) }
     },
     EBinary(b) -> {
-      let l = sweep(cx, b.lhs, scope, barrier);
+      let l = sweep(state, b.lhs, scope, barrier);
       let r = sweep(l.cx, b.rhs, scope, barrier);
       { cx: r.cx, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
     },
     EUnary(u) -> {
-      let o = sweep(cx, u.operand, scope, barrier);
+      let o = sweep(state, u.operand, scope, barrier);
       { cx: o.cx, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
     },
     ELambda(l) -> match l.ret {
       None -> {
-        let o = sweep(cx, l.body, scope, under(barrier, b"a lambda"));
+        let o = sweep(state, l.body, scope, under(barrier, b"a lambda"));
         { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: None }) }
       },
-      Some(ty) -> match mode_for(cx, Some(ty)) {
+      Some(ty) -> match mode_for(state, Some(ty)) {
         Err(why) -> {
-          let o = sweep(cx, l.body, Some(why), None);
+          let o = sweep(state, l.body, Some(why), None);
           { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: Some(ty) }) }
         },
         Ok(m) -> {
-          let saved = cx.mode;
-          let r = ret({ ..cx, mode: Some(m) }, l.body);
+          let saved = state.mode;
+          let r = ret({ ..state, mode: Some(m) }, l.body);
           let s: TryOut = sweep(r.cx, r.e, None, None);
           {
             cx: { ..s.cx, mode: saved },
@@ -1158,14 +1166,14 @@ fn sweep_inner(
       },
     },
     EApp(a) -> {
-      let f = sweep(cx, a.func, scope, barrier);
+      let f = sweep(state, a.func, scope, barrier);
       let args = sweep_all(f.cx, a.args, scope, barrier);
       let named = fold(
         a.named,
         { cx: args.cx, ns: [] },
-        |acc: { cx: TryCx, ns: List<NamedArg> }, n: NamedArg| {
-          let o = sweep(acc.cx, n.value, scope, barrier);
-          { cx: o.cx, ns: push(acc.ns, { name: n.name, value: o.e, span: n.span }) }
+        |acc: { cx: TryState, ns: List<NamedArg> }, arg: NamedArg| {
+          let o = sweep(acc.cx, arg.value, scope, barrier);
+          { cx: o.cx, ns: push(acc.ns, { name: arg.name, value: o.e, span: arg.span }) }
         },
       );
       {
@@ -1174,17 +1182,17 @@ fn sweep_inner(
       }
     },
     EIf(i) -> {
-      let c = sweep(cx, i.cond, scope, barrier);
+      let c = sweep(state, i.cond, scope, barrier);
       let t = sweep(c.cx, i.then_branch, scope, barrier);
       let el = sweep(t.cx, i.else_branch, scope, barrier);
       { cx: el.cx, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
     },
     EMatch(m) -> {
-      let sc = sweep(cx, m.scrutinee, scope, barrier);
+      let sc = sweep(state, m.scrutinee, scope, barrier);
       let arms = fold(
         m.arms,
         { cx: sc.cx, arms: [] },
-        |acc: { cx: TryCx, arms: List<MatchArm> }, arm: MatchArm| {
+        |acc: { cx: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let g = match arm.guard {
             None -> { cx: acc.cx, e: None },
             Some(x) -> {
@@ -1204,9 +1212,9 @@ fn sweep_inner(
     EBlock(b) -> {
       let stmts = fold(
         b.stmts,
-        { cx: cx, ss: [] },
-        |acc: { cx: TryCx, ss: List<Stmt> }, st: Stmt|
-          match st {
+        { cx: state, ss: [] },
+        |acc: { cx: TryState, ss: List<Stmt> }, stmt: Stmt|
+          match stmt {
             SLet(l) -> {
               let o = sweep(acc.cx, l.value, scope, barrier);
               {
@@ -1235,35 +1243,35 @@ fn sweep_inner(
       { cx: tl.cx, e: EBlock({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
     },
     ERecord(r) -> {
-      let o = sweep_fields(cx, r.fields, scope, barrier);
+      let o = sweep_fields(state, r.fields, scope, barrier);
       { cx: o.cx, e: ERecord({ span: r.span, fields: o.fs }) }
     },
     ERecordUpdate(r) -> {
-      let b = sweep(cx, r.base, scope, barrier);
+      let b = sweep(state, r.base, scope, barrier);
       let o = sweep_fields(b.cx, r.fields, scope, barrier);
       { cx: o.cx, e: ERecordUpdate({ span: r.span, base: b.e, fields: o.fs }) }
     },
     EField(f) -> {
-      let o = sweep(cx, f.base, scope, barrier);
+      let o = sweep(state, f.base, scope, barrier);
       { cx: o.cx, e: EField({ span: f.span, base: o.e, field: f.field }) }
     },
     EList(l) -> {
-      let o = sweep_all(cx, l.items, scope, barrier);
+      let o = sweep_all(state, l.items, scope, barrier);
       { cx: o.cx, e: EList({ span: l.span, items: o.xs }) }
     },
     EPerform(p) -> {
-      let o = sweep_all(cx, p.args, scope, barrier);
+      let o = sweep_all(state, p.args, scope, barrier);
       {
         cx: o.cx,
         e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }),
       }
     },
     EHandle(h) -> {
-      let b = sweep(cx, h.body, scope, under(barrier, b"a `handle` body"));
+      let b = sweep(state, h.body, scope, under(barrier, b"a `handle` body"));
       let cs = fold(
         h.clauses,
         { cx: b.cx, cs: [] },
-        |acc: { cx: TryCx, cs: List<HandleClause> }, c: HandleClause| {
+        |acc: { cx: TryState, cs: List<HandleClause> }, c: HandleClause| {
           let o = sweep(acc.cx, c.body, scope, under(barrier, b"a `handle` clause"));
           {
             cx: o.cx,
@@ -1291,7 +1299,7 @@ fn sweep_inner(
       { cx: r.cx, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
     },
     EWithCell(c) -> {
-      let i = sweep(cx, c.init, scope, barrier);
+      let i = sweep(state, c.init, scope, barrier);
       let b = sweep(i.cx, c.body, scope, under(barrier, b"a `with_cell` body"));
       {
         cx: b.cx,
@@ -1305,55 +1313,59 @@ fn sweep_inner(
       }
     },
     ESimulate(x) -> {
-      let o = sweep(cx, x.body, scope, under(barrier, b"a `simulate` body"));
+      let o = sweep(state, x.body, scope, under(barrier, b"a `simulate` body"));
       { cx: o.cx, e: ESimulate({ span: x.span, body: o.e }) }
     },
     EParallel(x) -> {
-      let o = sweep_all(cx, x.branches, scope, under(barrier, b"a `parallel` branch"));
+      let o = sweep_all(state, x.branches, scope, under(barrier, b"a `parallel` branch"));
       { cx: o.cx, e: EParallel({ span: x.span, branches: o.xs }) }
     },
-    _ -> { cx: cx, e: e },
+    _ -> { cx: state, e: expr },
   }
 
 fn sweep_all(
-  cx: TryCx,
-  xs: List<Expr>,
+  state: TryState,
+  exprs: List<Expr>,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-) -> { cx: TryCx, xs: List<Expr> } / {abort.raise} =
-  fold(xs, { cx: cx, xs: [] }, |acc: { cx: TryCx, xs: List<Expr> }, x: Expr| {
-    let o = sweep(acc.cx, x, scope, barrier);
+) -> { cx: TryState, xs: List<Expr> } =
+  fold(exprs, { cx: state, xs: [] }, |acc: { cx: TryState, xs: List<Expr> }, expr: Expr| {
+    let o = sweep(acc.cx, expr, scope, barrier);
     { cx: o.cx, xs: push(acc.xs, o.e) }
   })
 
 fn sweep_fields(
-  cx: TryCx,
-  fs: List<RecField>,
+  state: TryState,
+  fields: List<RecField>,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-) -> { cx: TryCx, fs: List<RecField> } / {abort.raise} =
-  fold(fs, { cx: cx, fs: [] }, |acc: { cx: TryCx, fs: List<RecField> }, f: RecField| {
-    let o = sweep(acc.cx, f.value, scope, barrier);
-    { cx: o.cx, fs: push(acc.fs, { name: f.name, value: o.e }) }
-  })
+) -> { cx: TryState, fs: List<RecField> } =
+  fold(
+    fields,
+    { cx: state, fs: [] },
+    |acc: { cx: TryState, fs: List<RecField> }, field: RecField| {
+      let o = sweep(acc.cx, field.value, scope, barrier);
+      { cx: o.cx, fs: push(acc.fs, { name: field.name, value: o.e }) }
+    },
+  )
 
-fn try_item(cx0: TryCx, it: Item) -> { cx: TryCx, it: Item } / {abort.raise} = {
+fn try_item(cx0: TryState, item: Item) -> { cx: TryState, it: Item } = {
   let cx = { ..cx0, fresh: 0, mode: None };
-  match it {
+  match item {
     IFn(d) -> {
-      let spec: { cx: TryCx, xs: List<SpecClause> } = fold(
+      let spec: { cx: TryState, xs: List<SpecClause> } = fold(
         d.spec,
         { cx: cx, xs: [] },
-        |acc: { cx: TryCx, xs: List<SpecClause> }, c: SpecClause| {
-          let what = match c.kind {
+        |acc: { cx: TryState, xs: List<SpecClause> }, clause: SpecClause| {
+          let what = match clause.kind {
             SRequires -> b"a `requires` clause",
             SEnsures -> b"an `ensures` clause",
           };
-          let o = sweep(acc.cx, c.expr, Some(not_in_a_function(what)), None);
-          { cx: o.cx, xs: push(acc.xs, { kind: c.kind, expr: o.e, span: c.span }) }
+          let o = sweep(acc.cx, clause.expr, Some(not_in_a_function(what)), None);
+          { cx: o.cx, xs: push(acc.xs, { kind: clause.kind, expr: o.e, span: clause.span }) }
         },
       );
-      let measured: { cx: TryCx, e: Option<Expr> } = match d.decreases {
+      let measured: { cx: TryState, e: Option<Expr> } = match d.decreases {
         None -> { cx: spec.cx, e: None },
         Some(e) -> {
           let o = sweep(spec.cx, e, Some(not_in_a_function(b"a `decreases` clause")), None);
@@ -1425,51 +1437,52 @@ fn try_item(cx0: TryCx, it: Item) -> { cx: TryCx, it: Item } / {abort.raise} = {
         }),
       }
     },
-    _ -> { cx: cx, it: it },
+    _ -> { cx: cx, it: item },
   }
 }
 
 pub fn expand_try(
-  m: Module,
-  diags: List<PDiag>,
-) -> { module: Module, diags: List<PDiag> } / {abort.raise} = {
+  module: Module,
+  diags: List<ParseDiag>,
+) -> { module: Module, diags: List<ParseDiag> } = {
   let start = {
-    types: collect_types(m),
-    shadowed: shadowing_ctor(m),
+    types: collect_types(module),
+    shadowed: shadowing_ctor(module),
     diags: diags,
     mode: None,
     fresh: 0,
   };
   let walked = fold(
-    m.items,
+    module.items,
     { cx: start, items: [] },
-    |acc: { cx: TryCx, items: List<Item> }, it: Item| {
-      let o = try_item(acc.cx, it);
+    |acc: { cx: TryState, items: List<Item> }, item: Item| {
+      let o = try_item(acc.cx, item);
       { cx: o.cx, items: push(acc.items, o.it) }
     },
   );
-  { module: { imports: m.imports, items: walked.items }, diags: walked.cx.diags }
+  { module: { imports: module.imports, items: walked.items }, diags: walked.cx.diags }
 }
 
 // --- Running the rewrites --------------------------------------------------------------------
 
-fn has_update(m: Module) -> Bool = any_expr(m, is_update)
+fn has_update(module: Module) -> Bool = any_expr(module, is_update)
 
-fn is_update(e: Expr) -> Bool = match e { ERecordUpdate(_) -> true, _ -> false }
+fn is_update(expr: Expr) -> Bool = match expr { ERecordUpdate(_) -> true, _ -> false }
 
 // Whether a definition writes a record update anywhere: its body, a clause, or a default.
-pub fn fn_has_update(d: FnDef) -> Bool = any_expr({ imports: [], items: [IFn(d)] }, is_update)
+pub fn fn_has_update(def: FnDef) -> Bool = any_expr({ imports: [], items: [IFn(def)] }, is_update)
 
-fn has_try(m: Module) -> Bool = any_expr(m, |e: Expr| match e { ETry(_) -> true, _ -> false })
+fn has_try(m: Module) -> Bool = any_expr(m, |expr: Expr| match expr { ETry(_) -> true, _ -> false })
 
-fn any_expr(m: Module, p: (Expr) -> Bool) -> Bool =
-  fold(m.items, false, |acc: Bool, it: Item|
+fn any_expr(module: Module, p: (Expr) -> Bool) -> Bool =
+  fold(module.items, false, |acc: Bool, item: Item|
     acc
-      || (match it {
+      || (match item {
         IFn(d) ->
-          any_in(d.body, p) || fold(d.spec, false, |b: Bool, c: SpecClause| b || any_in(c.expr, p))
-            || fold(d.params, false, |b: Bool, x: Param|
-              b || (match x.default { None -> false, Some(v) -> any_in(v, p) })),
+          any_in(d.body, p)
+            || fold(d.spec, false, |b: Bool, clause: SpecClause| b || any_in(clause.expr, p))
+            || fold(d.params, false, |b: Bool, param: Param|
+              b || (match param.default { None -> false, Some(v) -> any_in(v, p) })),
         ITest(d) -> any_in(d.body, p),
         ILaw(d) -> any_in(d.body, p) || (match d.guard { None -> false, Some(g) -> any_in(g, p) }),
         _ -> false,
@@ -1486,7 +1499,7 @@ fn any_in(e: Expr, p: (Expr) -> Bool) -> Bool =
             b || (match x.default { None -> false, Some(v) -> any_in(v, p) })),
       EApp(a) ->
         any_in(a.func, p) || fold(a.args, false, |b: Bool, x: Expr| b || any_in(x, p))
-          || fold(a.named, false, |b: Bool, n: NamedArg| b || any_in(n.value, p)),
+          || fold(a.named, false, |b: Bool, arg: NamedArg| b || any_in(arg.value, p)),
       EIf(i) -> any_in(i.cond, p) || any_in(i.then_branch, p) || any_in(i.else_branch, p),
       EMatch(m) ->
         any_in(m.scrutinee, p)
@@ -1494,9 +1507,9 @@ fn any_in(e: Expr, p: (Expr) -> Bool) -> Bool =
             b || any_in(arm.body, p)
               || (match arm.guard { None -> false, Some(g) -> any_in(g, p) })),
       EBlock(b) ->
-        fold(b.stmts, false, |acc: Bool, s: Stmt|
+        fold(b.stmts, false, |acc: Bool, stmt: Stmt|
             acc
-              || (match s {
+              || (match stmt {
                 SLet(l) -> any_in(l.value, p),
                 SLetElse(l) -> any_in(l.value, p) || any_in(l.fallback, p),
                 SExpr(x) -> any_in(x, p),
@@ -1526,21 +1539,21 @@ fn any_in(e: Expr, p: (Expr) -> Bool) -> Bool =
 // for one; what it bounds is now in the body, where its binder is in scope. `captured` says what
 // would take the call to the builtin `metered` for its own, and the law is refused rather than
 // measured with it.
-fn measured(d: LawDef, captured: Option<Bytes>) -> { law: LawDef, diag: Option<PDiag> } =
-  match d.cost {
-    None -> { law: d, diag: None },
+fn measured(law_def: LawDef, captured: Option<Bytes>) -> { law: LawDef, diag: Option<ParseDiag> } =
+  match law_def.cost {
+    None -> { law: law_def, diag: None },
     Some(bound) -> {
-      let at = expr_span(d.body);
+      let at = expr_span(law_def.body);
       let named = |t: Bytes| { name: t, span: at };
       let call = EApp({
         span: at,
         func: EVar({ span: at, name: { module: None, name: named(b"metered"), span: at } }),
         named: [],
-        args: [ELambda({ span: at, body: d.body, params: [], ret: None })],
+        args: [ELambda({ span: at, body: law_def.body, params: [], ret: None })],
         labels: [],
       });
-      let binds = fold(d.binders, false, |found: Bool, b: Binder|
-        found || b.name.name == b"metered");
+      let binds = fold(law_def.binders, false, |found: Bool, binder: Binder|
+        found || binder.name.name == b"metered");
       let why = if binds {
         Some(
           b"this law names its size `metered`, which would capture the call it measures its body with; rename the size",
@@ -1552,7 +1565,7 @@ fn measured(d: LawDef, captured: Option<Bytes>) -> { law: LawDef, diag: Option<P
       };
       {
         law: {
-          ..d,
+          ..law_def,
           body: ERecord({
             span: at,
             fields: [
@@ -1565,9 +1578,9 @@ fn measured(d: LawDef, captured: Option<Bytes>) -> { law: LawDef, diag: Option<P
           None -> None,
           Some(note) ->
             Some(
-              diag1(
+              error_at(
                 b"E0463",
-                d.name_span,
+                law_def.name_span,
                 b"this cost law cannot measure its body",
                 b"a cost law measures its body with the builtin `metered`",
                 [note],
@@ -1580,13 +1593,14 @@ fn measured(d: LawDef, captured: Option<Bytes>) -> { law: LawDef, diag: Option<P
 
 // A `metered` of the module's own, or one it imports unqualified, would capture the call a cost law
 // measures its body with.
-fn metered_captured(m: Module) -> Option<Bytes> = {
-  let declared = fold(m.items, false, |found: Bool, it: Item|
-    found || (match it { IFn(f) -> f.name.name == b"metered", _ -> false }));
-  let imported = fold(m.imports, false, |found: Bool, d: ImportDecl|
+fn metered_captured(module: Module) -> Option<Bytes> = {
+  let declared = fold(module.items, false, |found: Bool, item: Item|
+    found || (match item { IFn(f) -> f.name.name == b"metered", _ -> false }));
+  let imported = fold(module.imports, false, |found: Bool, decl: ImportDecl|
     found
-      || (match d.kind {
-        INames(ns) -> fold(ns, false, |named: Bool, n: Ident| named || n.name == b"metered"),
+      || (match decl.kind {
+        INames(ns) ->
+          fold(ns, false, |named: Bool, ident: Ident| named || ident.name == b"metered"),
         _ -> false,
       }));
   if declared {
@@ -1600,18 +1614,21 @@ fn metered_captured(m: Module) -> Option<Bytes> = {
   } else { None }
 }
 
-fn has_cost_law(m: Module) -> Bool =
-  fold(m.items, false, |b: Bool, it: Item|
-    b || (match it { ILaw(d) -> d.cost != None, _ -> false }))
+fn has_cost_law(module: Module) -> Bool =
+  fold(module.items, false, |b: Bool, item: Item|
+    b || (match item { ILaw(d) -> d.cost != None, _ -> false }))
 
-fn measured_laws(m: Module, diags: List<PDiag>) -> { module: Module, diags: List<PDiag> } =
-  if !has_cost_law(m) { { module: m, diags: diags } } else {
-    let captured = metered_captured(m);
+fn measured_laws(
+  module: Module,
+  diags: List<ParseDiag>,
+) -> { module: Module, diags: List<ParseDiag> } =
+  if !has_cost_law(module) { { module: module, diags: diags } } else {
+    let captured = metered_captured(module);
     let walked = fold(
-      m.items,
+      module.items,
       { items: [], diags: diags },
-      |acc: { items: List<Item>, diags: List<PDiag> }, it: Item|
-        match it {
+      |acc: { items: List<Item>, diags: List<ParseDiag> }, item: Item|
+        match item {
           ILaw(d) -> {
             let x = measured(d, captured);
             {
@@ -1622,22 +1639,23 @@ fn measured_laws(m: Module, diags: List<PDiag>) -> { module: Module, diags: List
           other -> { ..acc, items: push(acc.items, other) },
         },
     );
-    { module: { ..m, items: walked.items }, diags: walked.diags }
+    { module: { ..module, items: walked.items }, diags: walked.diags }
   }
 
 // Only when the grammar met a `?` or a cost law. A record update needs the checker's answer for its
 // base, so `expand_record_updates` runs later, over a checked program.
 pub fn expand(
-  m: Module,
-  diags: List<PDiag>,
-) -> { module: Module, diags: List<PDiag> } / {abort.raise} = {
-  let tried = if has_try(m) { expand_try(m, diags) } else { { module: m, diags: diags } };
+  module: Module,
+  diags: List<ParseDiag>,
+) -> { module: Module, diags: List<ParseDiag> } = {
+  let tried = if has_try(module) { expand_try(module, diags) }
+  else { { module: module, diags: diags } };
   measured_laws(tried.module, tried.diags)
 }
 
 pub fn dump_expanded(src: Bytes) -> String / {abort.raise} = {
   let r = parse(src);
-  let x = expand(r.node, r.p.diags);
+  let x = expand(r.node, r.parser.diags);
   string_of_bytes(bytes_concat(dump_module(x.module), dump_diags(x.diags)))
 }
 
