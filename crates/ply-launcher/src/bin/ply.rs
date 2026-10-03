@@ -10,8 +10,8 @@ static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 fn main() {
     ply_host::time::mark_start(std::time::Instant::now());
     let program = match ply_launcher::shipped::program() {
-        Ok(bytes) => Program {
-            artifact: bytes,
+        Ok(image) => Program {
+            image,
             artifact_name: ply_launcher::shipped::ARTIFACT.to_string(),
             shelf: ply_machine::shelf::sources().to_vec(),
             stage: format!("cli-{}", ply_launcher::shipped::identity()),
@@ -39,7 +39,7 @@ fn main() {
         trust: ply_launcher::trust(),
         ..ply_machine::artifact::Binds::default()
     };
-    let (answer, warnings) = ply_launcher::run(&program, &root, argv, binds, count).into_parts();
+    let (answer, warnings) = ply_launcher::run(program, &root, argv, binds, count).into_parts();
     for warning in warnings {
         eprintln!("{warning}");
     }

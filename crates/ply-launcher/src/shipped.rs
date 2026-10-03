@@ -2,6 +2,7 @@
 
 use ply_codegen::c::{bundle, producer};
 use ply_eval::{Diagnostic, Span, codes};
+use ply_machine::load::Loaded;
 use std::path::{Path, PathBuf};
 
 include!(concat!(env!("OUT_DIR"), "/program_sources.rs"));
@@ -53,12 +54,16 @@ pub fn lay_out(stage: &Path) -> std::io::Result<()> {
 /// hands it out, and the compiler and runtime a decode refuses a mismatch of. The artifact the
 /// program is built into carries the same digest as its stamp.
 pub fn identity() -> String {
-    ply_machine::artifact::toolchain_stamp(&producer::digest_of(&program_sources()))
+    static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            ply_machine::artifact::toolchain_stamp(&producer::digest_of(&program_sources()))
+        })
+        .clone()
 }
 
-/// Where a program built for `identity` is kept between runs, beside the emitter's own stages. The
-/// `Front` an opened artifact answers with is kept here too, since it is a function of the same
-/// sources.
+/// Where what `identity` names is kept between runs, beside the emitter's own stages: the front an
+/// opened artifact answers with, and the load of the sources when no committed artifact serves.
 pub fn stage() -> PathBuf {
     bundle::stage_dir(&format!("cli-{}", identity()))
 }
@@ -74,94 +79,83 @@ pub fn committed() -> PathBuf {
     Path::new(DIR).join(ARTIFACT)
 }
 
+/// What the `ply` program is entered from.
+pub enum Image {
+    /// The committed artifact, which these very sources built.
+    Committed(Vec<u8>),
+    /// The sources' own load: this process's, or the one an earlier process kept for them.
+    Loaded(Box<Loaded>),
+}
+
 /// The `ply` program: the committed artifact when it was built from these very sources, else the
-/// stage an earlier run kept for them, else one built now and kept there. A binary whose committed
-/// artifact is behind its sources therefore runs the sources, never the artifact.
-pub fn program() -> Result<Vec<u8>, Diagnostic> {
+/// load of them an earlier run kept, else one made now and kept. A binary whose committed artifact
+/// is behind its sources therefore runs the sources, never the artifact.
+pub fn program() -> Result<Image, Diagnostic> {
     if committed_digest().as_deref() == Some(identity().as_str())
         && let Ok(bytes) = std::fs::read(committed())
     {
-        return Ok(bytes);
+        return Ok(Image::Committed(bytes));
     }
-    let staged = stage().join(ARTIFACT);
-    if let Ok(bytes) = std::fs::read(&staged) {
+    if let Ok(bytes) = std::fs::read(kept_front())
+        && let Some(handed) = ply_machine::driver::kept_front(&bytes)
+        && let Ok(loaded) = ply_machine::driver::load_over_front_in(PathBuf::from(ROOT), &handed)
+    {
         ply_codegen::c::sweep::used(&stage());
-        return Ok(bytes);
+        return Ok(Image::Loaded(Box::new(loaded)));
     }
-    let bytes = build()?;
-    land(&staged, &bytes);
-    Ok(bytes)
+    Ok(Image::Loaded(Box::new(load_in(&laid_out()?.join(ROOT))?)))
 }
 
-/// The program built from its sources here and now, as `ply build` would build it: written into a
-/// directory of its own, loaded whole, and closed over its one `main`.
-pub fn build() -> Result<Vec<u8>, Diagnostic> {
-    let stage = stage().join(format!("src.{}", std::process::id()));
-    if let Err(e) = lay_out(&stage) {
-        return Err(unbuilt(format!(
+/// The sources laid out once under the stage, so the places a kept load names stay on disk with
+/// it. Laid out aside and renamed in whole: a directory that is there is complete.
+fn laid_out() -> Result<PathBuf, Diagnostic> {
+    let at = stage().join("src");
+    if at.is_dir() {
+        return Ok(at);
+    }
+    let aside = stage().join(format!("src.{}", std::process::id()));
+    lay_out(&aside).map_err(|e| {
+        unbuilt(format!(
             "its sources could not be placed in `{}`: {e}",
-            stage.display()
-        )));
+            aside.display()
+        ))
+    })?;
+    // Another process that laid them out first wins, and its copy is the same.
+    if std::fs::rename(&aside, &at).is_err() {
+        let _ = std::fs::remove_dir_all(&aside);
     }
-    let built = build_in(&stage.join(ROOT));
-    let _ = std::fs::remove_dir_all(&stage);
-    built
+    Ok(at)
 }
 
-fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
-    let loaded = ply_machine::load::load(dir).map_err(|err| {
-        // With where it happened: this program is only ever built from sources in the tree, so a
-        // refusal is a defect someone has to find, not a user's mistake to summarise.
+/// Where the load of these sources is kept: under their identity and the runtime that answered it,
+/// which the identity names only by its helper table.
+fn kept_front() -> PathBuf {
+    stage().join(format!("front-{}", &ply_codegen::c::runtime_digest()[..16]))
+}
+
+/// What the launcher's rows are kept under, beside the stages.
+const ROWS: &str = "cli";
+
+/// The sources at `dir` loaded, seeded with the rows the last load kept, and what the next process
+/// takes in its place kept: the rows this load published and its front.
+fn load_in(dir: &Path) -> Result<Loaded, Diagnostic> {
+    let seeded = ply_machine::load::load_seeded(dir, producer::kept_rows(ROWS)).map_err(|err| {
+        // With where it happened: this program is only ever built from sources in the tree, so
+        // a refusal is a defect someone has to find, not a user's mistake to summarise.
         unbuilt(match err.diagnostics.first() {
             Some(d) => format!("it does not check:\n{}", d.clone().placed(&err.sources)),
             None => "it does not check, and nothing said why".to_string(),
         })
     })?;
-    let entry = loaded
+    seeded
+        .loaded
         .sole_entry_point()
         .map_err(|d| unbuilt(format!("{} [{}]", d.message, d.code)))?;
-    // With its notes: a refusal here states the symptom and carries the reason in a note, so
-    // dropping them leaves a reader the one thing that cannot be acted on.
-    let built =
-        crate::artifact::build(&loaded, entry, &[]).map_err(|diagnostics| {
-            match diagnostics.first() {
-                Some(d) => d.notes.iter().fold(
-                    unbuilt(format!("{} [{}]", d.message, d.code)),
-                    |out, note| out.note(note.clone()),
-                ),
-                None => unbuilt("nothing said why".to_string()),
-            }
-        })?;
-    // `ply` enters the artifact's own unit and nothing else, so an artifact whose unit holds no
-    // body for `main` cannot run. It is not landed: the failure belongs to the build, where the
-    // emitter's reasons are still in hand, not to the next run, which would have none.
-    if !built.entry_compiled {
-        return Err(refused_entry(&built));
+    producer::keep_rows(ROWS, &seeded.rows);
+    if let Some(front) = &seeded.front {
+        land(&kept_front(), front);
     }
-    built.artifact.encode()
-}
-
-#[cold]
-fn refused_entry(built: &crate::artifact::Built) -> Diagnostic {
-    let why = if built.artifact.has_unit() {
-        format!(
-            "its compiled unit holds no body for `{}`, so nothing could be entered",
-            built.entry_name
-        )
-    } else {
-        "no compiled unit could be produced for it at all".to_string()
-    };
-    // The production's own account, which is the only thing that says why there is no unit; a
-    // reader left without it can do nothing but guess at which half of the build gave way.
-    let diagnostic = built
-        .warnings
-        .iter()
-        .fold(unbuilt(why), |d, w| d.note(w.message.clone()));
-    if built.refused.is_empty() {
-        return diagnostic
-            .note("the emitter refused nothing, so the entry was never offered to it");
-    }
-    diagnostic.note(crate::artifact::refusal_list(&built.refused))
+    Ok(seeded.loaded)
 }
 
 fn land(at: &Path, bytes: &[u8]) {
