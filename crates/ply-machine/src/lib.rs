@@ -4,10 +4,10 @@
 //! evaluate bodies, `build` enters the emitter. A compiled body entered while another entry holds
 //! the thread is declined, so the machine these operations drive lives on a thread of its own per
 //! resource label, parked on a channel between operations: `load[m]` opens the target rooted at a
-//! path (`reload[m]` asks again, and `reuse[m]` opens it over the front end an earlier run filed),
-//! `bound[m]` binds the hosts the named entry may reach and answers the disclosure, `enter[m]`
-//! runs it and answers how it ended, `drop[m]` lets the thread go. The run flow itself —
-//! targets, bindings, teardown — is `crate::drive`.
+//! path (`reload[m]` asks again, and `reuse[m]` opens it over the entry an earlier run filed, which
+//! `filed[m]` encodes), `bound[m]` binds the hosts the named entry may reach and answers the
+//! disclosure, `enter[m]` runs it and answers how it ended, `drop[m]` lets the thread go. The run
+//! flow itself — targets, bindings, teardown — is `crate::drive`.
 
 pub mod artifact;
 pub mod body;
@@ -50,11 +50,12 @@ pub const EFFECT: &str = "machine";
 
 pub const HERMETIC: &str = "hermetic_machine";
 
-const OPERATIONS: [(&str, &str); 11] = [
+const OPERATIONS: [(&str, &str); 12] = [
     ("configure", "ply_machine::configure"),
     ("load", "ply_machine::load"),
     ("opened", "ply_machine::opened"),
     ("reuse", "ply_machine::reuse"),
+    ("filed", "ply_machine::filed"),
     ("reload", "ply_machine::reload"),
     ("schema", "ply_machine::schema"),
     ("bound", "ply_machine::bound"),
@@ -64,11 +65,12 @@ const OPERATIONS: [(&str, &str); 11] = [
     ("drop", "ply_machine::drop"),
 ];
 
-const HERMETIC_OPERATIONS: [(&str, &str); 11] = [
+const HERMETIC_OPERATIONS: [(&str, &str); 12] = [
     ("configure", "ply_machine::hermetic::configure"),
     ("load", "ply_machine::hermetic::load"),
     ("opened", "ply_machine::hermetic::opened"),
     ("reuse", "ply_machine::hermetic::reuse"),
+    ("filed", "ply_machine::hermetic::filed"),
     ("reload", "ply_machine::hermetic::reload"),
     ("schema", "ply_machine::hermetic::schema"),
     ("bound", "ply_machine::hermetic::bound"),
@@ -95,7 +97,7 @@ pub fn registrations_in(
     lent_by(module, options, false)
 }
 
-/// A machine that loads only what it is handed, binds no host, reads no clock and files nothing.
+/// A machine that loads only what it is handed, binds no host and reads no clock.
 pub fn hermetic_registrations_in(module: &str) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let options = drive::RunOptions {
         hermetic: true,
@@ -233,9 +235,10 @@ impl HostHandler for Site {
         let label = label_of(req, span)?;
         let value = match (req.op.op.as_str(), req.args) {
             ("configure", [options]) => self.configure(&label, options, span)?,
-            ("load", [root, front, keep]) => self.load(&label, root, front, keep, span)?,
+            ("load", [root, front]) => self.load(&label, root, front, span)?,
             ("opened", [path, bytes]) => self.opened(&label, path, bytes, span)?,
-            ("reuse", [root, walked]) => self.reuse(&label, root, walked, span)?,
+            ("reuse", [root, walked, entry]) => self.reuse(&label, root, walked, entry, span)?,
+            ("filed", [front]) => filed(front, span)?,
             ("reload", [front]) => {
                 let front = Box::new(crate::driver::handed_front_of(front, span)?);
                 let answer: Result<drive::FoundData, drive::Refused> =
@@ -307,6 +310,34 @@ impl HostHandler for Site {
     }
 }
 
+/// The entry a later run's `reuse` takes `front` back from: the places and modules of its files,
+/// and the front end's answer. Only a front a load held over is worth filing.
+fn filed(front: &Value, span: Span) -> Result<Value, Diagnostic> {
+    use crate::payload::field_of;
+    let placed: Vec<(String, String)> = field_of(front, "files", span)?
+        .as_list(span, "a front's files")?
+        .iter()
+        .map(|file| {
+            Ok((
+                field_of(file, "path", span)?
+                    .as_str(span, "a path")?
+                    .to_string(),
+                field_of(file, "name", span)?
+                    .as_str(span, "a module")?
+                    .to_string(),
+            ))
+        })
+        .collect::<Result<_, Diagnostic>>()?;
+    let entry = reused::entry(&placed, field_of(front, "dump", span)?).ok_or_else(|| {
+        Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "a front end's answer does not encode",
+        )
+        .primary(span, "this is Ply's fault")
+    })?;
+    Ok(Value::bytes(entry))
+}
+
 fn label_of(req: &HostRequest<'_>, span: Span) -> Result<String, Diagnostic> {
     match &req.atom.resource {
         ply_eval::Resource::Named(name) => Ok(name.to_string()),
@@ -337,72 +368,44 @@ impl Site {
         Ok(Value::Unit)
     }
 
-    /// `keep` is the key the front is filed under once the load holds, for a later run of the same
-    /// closure to take in place of its front end.
     fn load(
         &self,
         label: &str,
         root: &Value,
         front: &Value,
-        keep: &Value,
         span: Span,
     ) -> Result<Value, Diagnostic> {
         let root = root.as_str(span, "the program's root")?.to_string();
         // `None` is a program loading a program of its own, at a root it chose while running.
-        let handed = crate::payload::option_of(front, "a front end", span)?;
-        let front = handed
+        let front = crate::payload::option_of(front, "a front end", span)?
             .map(|front| crate::driver::handed_front_of(front, span))
             .transpose()?;
-        let keep = crate::payload::option_of(keep, "a key", span)?
-            .filter(|_| !self.hermetic)
-            .map(|key| key.as_str(span, "a key"))
-            .transpose()?;
-        // Taken before the front leaves for the machine's thread; the dump stays here as it came.
-        let kept = keep.zip(front.as_ref()).map(|(key, front)| {
-            let placed: Vec<(String, String)> = front
-                .files
-                .iter()
-                .map(|f| (f.path.clone(), f.name.clone()))
-                .collect();
-            (key, placed)
-        });
         let mut options = self.taken(label);
         options.front = front;
         let path = PathBuf::from(root);
         let found = self.open(label, options, span, move |options| {
             drive::Drive::open(options, &path)
         })?;
-        if let (Ok(drive::FoundData::Project { .. }), Some((key, placed)), Some(handed)) =
-            (&found, kept, handed)
-        {
-            crate::reused::file(
-                key,
-                &placed,
-                crate::payload::field_of(handed, "dump", span)?,
-            );
-        }
         Ok(match found {
             Ok(found) => ok(drive::found_value(&found, &self.module)),
             Err(refused) => refused_value(&refused),
         })
     }
 
-    /// The load an earlier run filed under the walk's key, over this run's own files, or `None`
-    /// when nothing readable is filed there: then the label is left as it was, configuration and
-    /// all, for the load the caller makes over a front end of its own.
+    /// The load `entry` filed, over this run's own files, or `None` when the entry does not read:
+    /// then the label is left as it was, configuration and all, for the load the caller makes over
+    /// a front end of its own.
     fn reuse(
         &self,
         label: &str,
         root: &Value,
         walked: &Value,
+        entry: &Value,
         span: Span,
     ) -> Result<Value, Diagnostic> {
         use crate::payload::field_of;
-        if self.hermetic {
-            return Ok(payload::option(None));
-        }
         let root = root.as_str(span, "the program's root")?.to_string();
-        let key = field_of(walked, "key", span)?.as_str(span, "a key")?;
+        let entry = entry.as_bytes(span, "a filed entry")?;
         let files = |name: &str| -> Result<Vec<reused::Walked>, Diagnostic> {
             field_of(walked, name, span)?
                 .as_list(span, name)?
@@ -420,8 +423,7 @@ impl Site {
                 })
                 .collect()
         };
-        let Some((front, entry)) = reused::front(key, files("modules")?, files("manifests")?)
-        else {
+        let Some(front) = reused::front(entry, files("modules")?, files("manifests")?) else {
             return Ok(payload::option(None));
         };
         let mut options = self
@@ -439,7 +441,6 @@ impl Site {
             Ok(found) => {
                 // A load that opens consumes its label's configuration.
                 self.taken(label);
-                ply_codegen::c::sweep::used(&entry);
                 Ok(payload::option(Some(drive::found_value(
                     &found,
                     &self.module,
