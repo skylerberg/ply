@@ -6,10 +6,10 @@
 
 use ply_eval::decode::{AnswerValue, Error};
 use ply_eval::{
-    Analysis, Carry, DefHash, DefInfo, DefWritten, Diagnostic, Edit, EffectAtom, EffectInfo,
-    EmitterRoot, Fix, Footprint, HashOutput, INT_TYPES, Label, LawInfo, Mode, ModuleInfo,
-    ModuleName, OpInfo, Ordinal, Pinned, Resource, Severity, SourceId, Span, SpecKind, Symbol,
-    TestInfo, TypeDecl, Value, Visibility, WrittenParam, intern_code,
+    Analysis, Carry, DefHash, DefInfo, Diagnostic, Edit, EffectAtom, EffectInfo, EmitterRoot, Fix,
+    Footprint, HashOutput, INT_TYPES, Label, LawInfo, Mode, ModuleInfo, ModuleName, OpInfo,
+    Ordinal, Pinned, Resource, Severity, SourceId, Span, SpecKind, Symbol, TestInfo, TypeDecl,
+    Value, Visibility, intern_code,
 };
 use std::collections::BTreeMap;
 
@@ -47,19 +47,6 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
         })
     })?;
     front.module_packages = d.field("module_packages")?.items(|i| i.number())?;
-    // The committed emitter answering for a stage may predate embeds, and embedded nothing.
-    if let Ok(embeds) = d.field("embeds")
-        && embeds.list()?.len() > 0
-    {
-        front.embeds = ply_eval::codec::encode(embeds.value()).map_err(|e| embeds.error(e))?;
-    }
-    // Likewise one that predates rows, which then walks every body it is asked to emit.
-    if let Ok(rows) = d.field("rows") {
-        front.rows = ply_eval::codec::encode(rows.value()).map_err(|e| rows.error(e))?;
-    }
-    if let Ok(walked) = d.field("walked") {
-        front.walked = walked.bytes()?.to_vec();
-    }
     for m in d.field("modules")?.list()? {
         let name = m.field("name")?.utf8()?;
         let index = m.field("index")?;
@@ -82,8 +69,7 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
         );
     }
     for def in d.field("defs")?.list()? {
-        let (info, written) = r.def(def)?;
-        front.defs_written.insert(info.name.clone(), written);
+        let info = r.def(def)?;
         front.check.defs.insert(info.name.clone(), info);
     }
     for t in d.field("types")?.list()? {
@@ -97,18 +83,11 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
         front.check.laws.push(r.law(l, i)?);
     }
     for e in d.field("effects")?.list()? {
-        let (effect, vis) = r.effect(e)?;
-        front.effects_written.insert(effect.name.clone(), vis);
+        let effect = r.effect(e)?;
         front.check.effects.insert(effect.name.clone(), effect);
     }
     hashes(d.field("hashes")?, &mut front)?;
     front.hashes_digest = DefHash(d.field("hashes_digest")?.byte_array()?);
-    for k in d.field("keys")?.list()? {
-        front.keys.insert(
-            Symbol::new(k.field("root")?.utf8()?),
-            k.field("key")?.utf8()?.to_string(),
-        );
-    }
     front.emitter_roots = d.field("emitter_roots")?.items(|e| {
         Ok(EmitterRoot {
             root: Symbol::new(e.field("root")?.utf8()?),
@@ -135,21 +114,6 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
             o.field("items")?.items(ordinal)?,
         ))
     })?;
-    front.bodies = d.field("bodies")?.items(|b| {
-        Ok((
-            Symbol::new(b.field("name")?.utf8()?),
-            b.field("body")?.bytes()?.to_vec(),
-        ))
-    })?;
-    let bodies = d.field("test_bodies")?;
-    front.test_bodies = bodies.items(|b| Ok(b.bytes()?.to_vec()))?;
-    if front.test_bodies.len() != front.check.tests.len() {
-        return Err(bodies.error(format!(
-            "{} test bodies beside {} tests",
-            front.test_bodies.len(),
-            front.check.tests.len()
-        )));
-    }
     resolve_op_modes(&mut front);
     Ok(front)
 }
@@ -351,26 +315,15 @@ impl Reader<'_> {
         })
     }
 
-    fn def(&self, d: AnswerValue<'_>) -> Result<(DefInfo, DefWritten), Error> {
-        let info = DefInfo {
+    fn def(&self, d: AnswerValue<'_>) -> Result<DefInfo, Error> {
+        Ok(DefInfo {
             name: Symbol::new(d.field("name")?.utf8()?),
             module: ModuleName::from_dotted(d.field("module")?.utf8()?),
             simple_name: Symbol::new(d.field("simple_name")?.utf8()?),
             footprint: footprint(d.field("footprint")?)?,
             performed: footprint(d.field("performed")?)?,
             span: self.span(d.field("at")?)?,
-        };
-        let written = DefWritten {
-            vis: visibility(d.field("public")?.bool()?),
-            reuse: d.field("reuse")?.bool()?,
-            params: d.field("params")?.items(|p| {
-                Ok(WrittenParam {
-                    name: Symbol::new(p.field("name")?.utf8()?),
-                    span: self.span(p.field("at")?)?,
-                })
-            })?,
-        };
-        Ok((info, written))
+        })
     }
 
     fn type_decl(&self, t: AnswerValue<'_>) -> Result<TypeDecl, Error> {
@@ -418,7 +371,7 @@ impl Reader<'_> {
         })
     }
 
-    fn effect(&self, e: AnswerValue<'_>) -> Result<(EffectInfo, Visibility), Error> {
+    fn effect(&self, e: AnswerValue<'_>) -> Result<EffectInfo, Error> {
         let mut effect = EffectInfo {
             name: Symbol::new(e.field("name")?.utf8()?),
             module: ModuleName::from_dotted(e.field("module")?.utf8()?),
@@ -434,7 +387,7 @@ impl Reader<'_> {
             }
             effect.ops.insert(op.name.clone(), op);
         }
-        Ok((effect, visibility(e.field("public")?.bool()?)))
+        Ok(effect)
     }
 
     fn op(&self, o: AnswerValue<'_>) -> Result<OpInfo, Error> {
