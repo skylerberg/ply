@@ -28,9 +28,9 @@ pub fn is_shipped_name(name: &str) -> bool {
     ply_std::is_std(name) || is_compiler(name)
 }
 
-/// The whole shelf the port pulls from, in the order the two tables hold it. Built once: the
-/// front end and the emitter must be handed the same bytes, or they resolve the same module two
-/// ways.
+/// The whole shelf the port pulls from, in the order the two tables hold it, then what the
+/// compiler embeds from beside its package. Built once: the front end and the emitter must be
+/// handed the same bytes, or they resolve the same module two ways.
 pub fn sources() -> &'static [(String, String)] {
     static SHELF: OnceLock<Vec<(String, String)>> = OnceLock::new();
     SHELF.get_or_init(|| {
@@ -40,6 +40,10 @@ pub fn sources() -> &'static [(String, String)] {
                 ply_compiler::sources()
                     .map(|(name, text)| (format!("{COMPILER_ROOT}.{name}"), text.to_string())),
             )
+            .chain([(
+                format!("{COMPILER_ROOT}.{}", ply_compiler::PRELUDE_NAME),
+                ply_compiler::PRELUDE.to_string(),
+            )])
             .collect()
     })
 }
