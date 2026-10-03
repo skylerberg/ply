@@ -1,6 +1,7 @@
 //! Emitted bodies and units, kept between runs. A body names tables by its own positions
 //! (`@@c3@@`), so a cached body is a function of the body alone.
 
+use super::RUNTIME;
 use super::tables::{Defined, Tables};
 use ply_eval::files::write_atomically;
 use ply_eval::{Symbol, Value};
@@ -9,10 +10,6 @@ use std::path::PathBuf;
 fn dir() -> PathBuf {
     super::load::cache_dir().join("emit")
 }
-
-/// The sources of the runtime the emitter runs on, as `build.rs` digests them. Not the binary: a
-/// change anywhere else in `ply`, or the other build profile, emits the same bodies.
-const RUNTIME: &str = env!("PLY_RUNTIME_DIGEST");
 
 /// What a body's C is a function of: its root's key (`Source::keys`), which names the emitter, the
 /// constructor table, the helper table and the runtime.
