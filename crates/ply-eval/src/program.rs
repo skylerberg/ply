@@ -125,6 +125,9 @@ pub struct Front {
     /// What the front end embedded, its `List<embed.EmbedAt>` as [`crate::codec`] encodes it and
     /// empty when nothing was: every pass that parses the program's text again is handed it back.
     pub embeds: Vec<u8>,
+    /// What every definition and test published, its `front.Rows` as [`crate::codec`] encodes it
+    /// and empty when the answer carried none: the emitter walks only the bodies it lowers.
+    pub rows: Vec<u8>,
 }
 
 impl Front {
