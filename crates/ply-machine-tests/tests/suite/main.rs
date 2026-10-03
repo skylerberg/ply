@@ -615,7 +615,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
 }
 
 /// `configure` before `load`: the program parsed the line and the machine reads the record. A
-/// configured `--host` binds the nested program's `process`, which a hermetic run refuses.
+/// configured `--host` binds the nested program's `process`, which a hermetic run refuses, and a
+/// `drop` forgets the record with the program.
 #[test]
 fn a_configured_machine_binds_what_the_options_say() {
     let outer = r#"
@@ -783,31 +784,58 @@ fn main(root: String, front: Front) -> Bool / {machine.configure[m], machine.loa
     },
   }
 }
+
+fn forgotten(root: String, front: Front) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.drop[m]} = {
+  machine.configure[m](opts(true));
+  machine.drop[m]();
+  match machine.load[m](root, Some(front), None) {
+    Err(_) -> false,
+    Ok(_t) -> {
+      let bound = machine.bound[m]("inner.main", unconfigured());
+      machine.drop[m]();
+      match bound {
+        Err(_) -> false,
+        Ok(b) -> b.hermetic,
+      }
+    },
+  }
+}
 "#;
 
     let project = tempfile::tempdir().expect("a temporary directory");
     std::fs::write(project.path().join("inner.ply"), "fn main() -> Int = 77\n").unwrap();
 
     let (front, unit) = built(outer);
-    let mut machine =
-        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
     let mut registry = HostRegistry::new();
     ply_machine::register(&mut registry);
-    let binding = registry.bind(&front.check).expect("the machine ops bind");
-    machine.set_host_binding(Arc::new(binding));
-    let answer = machine
-        .call(
-            "m.main",
-            vec![
-                Value::str(project.path().display().to_string()),
-                crate::fixture::handed(project.path()),
-            ],
-            Span::DUMMY,
-        )
-        .into_parts()
-        .0
-        .expect("the outer main ran");
-    assert_eq!(answer, Value::Bool(true), "the configured host bound");
+    let binding = Arc::new(registry.bind(&front.check).expect("the machine ops bind"));
+    let call = |entry: &str| {
+        let mut machine =
+            Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
+        machine.set_host_binding(Arc::clone(&binding));
+        machine
+            .call(
+                entry,
+                vec![
+                    Value::str(project.path().display().to_string()),
+                    crate::fixture::handed(project.path()),
+                ],
+                Span::DUMMY,
+            )
+            .into_parts()
+            .0
+            .expect("the entry ran")
+    };
+    assert_eq!(
+        call("m.main"),
+        Value::Bool(true),
+        "the configured host bound"
+    );
+    assert_eq!(
+        call("m.forgotten"),
+        Value::Bool(true),
+        "a load after a drop binds as an unconfigured label does"
+    );
 }
 
 // --- `machine.call` ----------------------------------------------------------
