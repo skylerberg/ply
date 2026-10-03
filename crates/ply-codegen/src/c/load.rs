@@ -128,12 +128,6 @@ fn key_over(cc: &str, level: &str, pieces: &[&str]) -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// The optimisation flag, in one place: three callers ask, and one of them asking differently
-/// would have the unit cache record a key the object cache never writes.
-fn opt_level() -> String {
-    super::toolchain::Profile::current().opt_level()
-}
-
 pub(super) fn ext() -> &'static str {
     if cfg!(target_os = "macos") {
         "dylib"
@@ -216,11 +210,9 @@ pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
 /// the program. The objects that link into it are one per bucket, each keyed by its C and kept
 /// under `obj/`, so an edit that reached one bucket compiles one bucket.
 pub(super) fn compile_and_load_timed(source: &str, stem: &str) -> Result<(Library, Duration)> {
-    // The other place the cache is written, and the one that writes the large files. A run that
-    // only loads a bootstrap bundle never reaches `build`, and would otherwise add an object per
-    // run to a directory nothing swept. `sweep::once` is what makes calling it twice free.
+    // Compiling is what grows the cache, so it is swept here, at most once a process.
     super::sweep::once();
-    let level = opt_level();
+    let level = super::toolchain::Profile::current().opt_level();
     let ext = ext();
     // A unit already compiled from this source, by this compiler, on these flags is this object:
     // load it rather than spend the process again. The C backend's compile is what keeps it off
