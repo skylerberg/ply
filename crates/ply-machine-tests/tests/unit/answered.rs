@@ -1,28 +1,15 @@
-//! The programs a test drives, as the builder answers for them: the front end's answer, and the
-//! unit's C compiled here.
+//! The programs a test drives, as the builder answers for them.
 
-/// What the builder makes of `source`, the module `module` names.
+/// What the builder makes of `source`, which has to check.
 #[track_caller]
-pub fn answered(module: &str, source: &str) -> ply_machine::runnable::Runnable {
-    let files = [(
-        format!("{}.ply", module.replace('.', "/")),
-        source.to_string(),
-    )];
-    let bytes = ply_machine::builds::answered(&files)
-        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
-    ply_machine::runnable::decode(&bytes).unwrap_or_else(|why| panic!("the answer reads: {why}"))
+fn checked_program(module: &str, source: &str) -> ply_machine::runnable::Runnable {
+    let files = ply_machine::builds::module_files(&[(module, source)]);
+    ply_machine::builds::checked_program(&files)
+        .unwrap_or_else(|d| panic!("the fixture checks: {d}"))
 }
 
 /// The front end's answer for `source`, which has to check.
 #[track_caller]
 pub fn checked(module: &str, source: &str) -> ply_eval::Analysis {
-    let front = answered(module, source).front.answer;
-    let errors: Vec<String> = front
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == ply_eval::Severity::Error)
-        .map(|d| format!("{}: {}", d.code, d.message))
-        .collect();
-    assert!(errors.is_empty(), "the fixture checks: {errors:?}");
-    front
+    checked_program(module, source).front.answer
 }

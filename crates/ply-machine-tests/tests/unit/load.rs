@@ -9,10 +9,8 @@ fn loaded(files: &[(&str, &str)]) -> Loaded {
         .iter()
         .map(|(path, text)| (path.to_string(), text.to_string()))
         .collect();
-    let bytes = ply_machine::builds::answered(&files)
-        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
-    let answer = ply_machine::runnable::decode(&bytes)
-        .unwrap_or_else(|why| panic!("the answer reads: {why}"));
+    let answer = ply_machine::builds::answered_program(&files)
+        .unwrap_or_else(|d| panic!("the builder answers: {d}"));
     ply_machine::driver::load_over_analysis_taken(PathBuf::from("."), answer.front)
         .unwrap_or_else(|e| panic!("it loads: {:?}", e.diagnostics))
 }
