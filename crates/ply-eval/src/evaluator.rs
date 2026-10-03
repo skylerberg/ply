@@ -419,6 +419,7 @@ pub fn carries_secret(v: &Value) -> bool {
     match v {
         Value::Secret(_) => true,
         Value::List(xs) => crate::limit::grow(|| xs.iter().any(carries_secret)),
+        Value::Array(xs) => crate::limit::grow(|| xs.iter().any(carries_secret)),
         Value::Map(m) => crate::limit::grow(|| {
             m.iter()
                 .any(|(k, v)| carries_secret(k) || carries_secret(v))

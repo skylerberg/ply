@@ -46,6 +46,7 @@ pub enum Plain {
     /// that was nested deeper.
     Elided(u64),
     Char(char),
+    Array(Vec<Plain>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -92,6 +93,7 @@ impl Plain {
             Plain::Str(s) => Value::str(s),
             Plain::Bytes(b) => Value::bytes(b),
             Plain::List(items) => Value::list(grow(|| values(items))?),
+            Plain::Array(items) => Value::array(grow(|| values(items))?),
             Plain::Record(fields) => Value::Record(Arc::new(Fields::from_unsorted(
                 fields
                     .into_iter()
@@ -143,6 +145,7 @@ impl Plain {
             Plain::Str(_) => "a `String`",
             Plain::Bytes(_) => "a `Bytes`",
             Plain::List(_) => "a `List`",
+            Plain::Array(_) => "an `Array`",
             Plain::Record(_) => "a record",
             Plain::Ctor(..) => "a variant",
             Plain::Map(_) => "a `Map`",
@@ -199,6 +202,13 @@ fn snapshot(v: &Value, bound: Option<(usize, usize)>, depth: usize) -> Plain {
                 out.push(Plain::Elided((items.len() - out.len()) as u64));
             }
             Plain::List(out)
+        }
+        Value::Array(items) => {
+            let mut out: Vec<Plain> = items.iter().take(kept(items.len())).map(inner).collect();
+            if out.len() < items.len() {
+                out.push(Plain::Elided((items.len() - out.len()) as u64));
+            }
+            Plain::Array(out)
         }
         Value::Map(entries) => {
             let mut out: Vec<(Plain, Plain)> = entries

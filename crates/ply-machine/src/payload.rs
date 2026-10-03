@@ -304,6 +304,12 @@ pub fn plain_value(p: &Plain) -> PlyValue {
                 items.iter().map(plain_value).collect()
             }))],
         ),
+        Plain::Array(items) => value_ctor(
+            "VArray",
+            vec![PlyValue::list(grow(|| {
+                items.iter().map(plain_value).collect()
+            }))],
+        ),
         Plain::Record(fields) => value_ctor(
             "VRecord",
             vec![PlyValue::list(grow(|| {
@@ -449,6 +455,12 @@ pub fn value_plain(v: &PlyValue, span: Span) -> Result<Plain, Diagnostic> {
         "VStr" => Plain::Str(text(arg(0)?)?),
         "VBytes" => Plain::Bytes(arg(0)?.as_bytes(span, "a `std.value` bytes")?.to_vec()),
         "VList" => Plain::List(grow(|| {
+            list(arg(0)?)?
+                .iter()
+                .map(|x| value_plain(x, span))
+                .collect::<Result<_, Diagnostic>>()
+        })?),
+        "VArray" => Plain::Array(grow(|| {
             list(arg(0)?)?
                 .iter()
                 .map(|x| value_plain(x, span))
