@@ -49,6 +49,12 @@ pub const EMBED: &str = include_str!("../ply/embed.ply");
 /// `ply fmt`: the tree printed back as source.
 pub const FMT: &str = include_str!("../ply/fmt.ply");
 
+/// The bodies the emitter answered, closed under calls and placed as one translation unit.
+pub const UNIT: &str = include_str!("../ply/unit.ply");
+
+/// A program read from a directory, checked and emitted, as a program that drives another hands it.
+pub const LOAD: &str = include_str!("../ply/load.ply");
+
 /// The order is part of the identity: the producer digests these texts in this order.
 pub const MODULES: &[(&str, &str)] = &[
     ("code", CODE),
@@ -65,6 +71,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("interface", INTERFACE),
     ("items", ITEMS),
     ("lexer", LEXER),
+    ("load", LOAD),
     ("patterns", PATTERNS),
     ("pkg", PKG),
     ("plyx", PLYX),
@@ -73,6 +80,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("spine", SPINE),
     ("tycore", TYCORE),
     ("types", TYPES),
+    ("unit", UNIT),
 ];
 
 pub fn sources() -> impl Iterator<Item = (&'static str, &'static str)> {

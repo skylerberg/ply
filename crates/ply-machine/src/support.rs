@@ -52,27 +52,17 @@ pub fn module_texts(
         .collect()
 }
 
-/// The unit over the whole program, its laws' and clauses' roots included.
-pub fn prover_backend(
-    loaded: &crate::load::Loaded,
-) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
-    build_backend_over(&loaded.front, module_texts(&loaded.check, &loaded.sources))
-}
-
-/// Every command that loaded a program uses this, so an invocation runs one front end.
-pub fn build_backend_over(
+/// The unit the program produced for `front`, its C compiled and loaded here. What the program
+/// reaches was settled where the C was produced, so a refusal is this host failing to build it.
+pub fn unit_of(
     front: &ply_eval::Front,
-    texts: std::collections::HashMap<String, String>,
+    text: &[u8],
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
-    ply_codegen::c::producer::ensure_default();
-    // A refused definition is already a diagnostic about the program; anything else is this
-    // host failing to make a backend at all.
-    ply_codegen::Unit::over_front(front, texts)
+    let text =
+        String::from_utf8(text.to_vec()).map_err(|_| unbuilt("the unit's C is not UTF-8"))?;
+    ply_codegen::Unit::handed(front, text)
         .map(|unit| unit as &'static dyn ply_eval::Provider)
-        .map_err(|error| match ply_codegen::c::refused_in(&error) {
-            Some(refusals) => refusals.diagnostic().clone(),
-            None => unbuilt(&error),
-        })
+        .map_err(|error| unbuilt(&error))
 }
 
 /// A pure nullary definition entered on `provider`'s unit: how a schema function is evaluated.

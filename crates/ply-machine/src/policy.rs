@@ -43,12 +43,6 @@ pub const FAMILIES: &[Family] = &[
         summary: "build an artifact and stamp it",
     },
     Family {
-        name: "bootstrap",
-        effect: "archive",
-        hermetic: None,
-        summary: "emit the compiler's own bundle",
-    },
-    Family {
         name: "hosts",
         effect: "tcb",
         hermetic: Some("hermetic_tcb"),
@@ -85,11 +79,9 @@ pub type Declared<'a> = &'a dyn Fn(&str) -> String;
 fn own(effect: &str) -> String {
     match effect {
         "prover" => "claims",
-        "store" => "cache",
-        "archive" => "bootstrap",
         "tcb" => "hosts",
         "edit" => "replace",
-        "shipped" => "env",
+        "shipped" => "compiler.unit",
         other => other,
     }
     .to_string()
@@ -111,7 +103,6 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<Lent>> {
         }
         "claims" => crate::claims::lent(&declared("prover")),
         "builder" => crate::builder::lent(),
-        "bootstrap" => crate::bootstrap::lent(),
         "hosts" => crate::hosts::lent(&declared("tcb")),
         "edit" => crate::edit::lent(),
         "shipped" => crate::shipped::lent(),

@@ -1207,11 +1207,20 @@ pub(crate) fn tier(
         };
         let text = ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?;
         let provider: &'static dyn ply_eval::Provider =
-            ply_codegen::Unit::embedded(&opened.front, text).map_err(|e| unit_error(&e))?;
+            ply_codegen::Unit::handed(&opened.front, text).map_err(|e| unit_error(&e))?;
         return Ok(provider);
     }
+    ply_codegen::c::producer::ensure_default();
     let texts = crate::support::module_texts(&opened.front.check, &opened.sources);
-    crate::support::build_backend_over(&opened.front, texts)
+    ply_codegen::Unit::over_front(&opened.front, texts)
+        .map(|unit| unit as &'static dyn ply_eval::Provider)
+        .map_err(|error| match ply_codegen::c::refused_in(&error) {
+            Some(refusals) => refusals.diagnostic().clone(),
+            None => Diagnostic::error(
+                codes::BACKEND_UNAVAILABLE,
+                format!("the C backend could not be built: {error:#}"),
+            ),
+        })
 }
 
 fn evaluate(

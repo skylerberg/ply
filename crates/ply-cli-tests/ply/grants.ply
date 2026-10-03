@@ -1,19 +1,23 @@
 // `--allow`: which privileged families a run lends the program it drives, by name.
 
-import harness (in_memory, on_disk, project, program, tree, said, stderr, Source)
+import harness (in_memory, on_disk, project, program, tree, said, stdout, stderr, Source)
+import std.list (sort)
 import std.string (int_of_string)
 
 // The outer program: declare `machine`, and drive one; the values it hands back are `std.value`'s.
 fn outer() -> String =
   \\import std.value (Value, VInt)
+  \\import std.fs (fs)
+  \\import compiler.load (Front, load)
+  \\import compiler.unit (shipped)
   \\
   \\nondet effect machine {
   \\  write configure[m](options: Options) -> Unit
-  \\  read load[m](root: String, front: Option<Front>) -> Result<Target, Refusal>
+  \\  read load[m](root: String, front: Front, unit: Bytes) -> Result<Target, Refusal>
   \\  read opened[m](path: String, bytes: Option<Bytes>) -> Result<Target, Refusal>
   \\  read reuse[m](root: String, walked: Walked, entry: Bytes) -> Option<Target>
-  \\  read filed[m](front: Front) -> Bytes
-  \\  read reload[m]() -> Result<Target, Refusal>
+  \\  read filed[m](front: Front, unit: Bytes) -> Option<Bytes>
+  \\  read reload[m](front: Front, unit: Bytes) -> Result<Target, Refusal>
   \\  read schema[m](name: String) -> Result<Value, List<Diag>>
   \\  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
   \\  write enter[m]() -> Ended
@@ -22,14 +26,6 @@ fn outer() -> String =
   \\  write drop[m]() -> Unit
   \\}
   \\
-  \\type Front = {
-  \\  dump: Bytes,
-  \\  files: List<{ path: String, name: String, text: Bytes }>,
-  \\  read_ms: Int,
-  \\  front_ms: Int,
-  \\  file_ms: Int,
-  \\  cached: Bool,
-  \\}
   \\type Options = Unit
   \\type Ended = Unit
   \\type Target = Unit
@@ -59,23 +55,25 @@ fn outer() -> String =
   \\type Raised = { diag: Diag, values: List<Value> }
   \\type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
   \\
-  \\fn main() -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
-  \\  match machine.load[m]("inner", None) {
-  \\    Ok(_) -> match machine.bound[m]("inner.main", { values: [], schema: None, opened: false }) {
-  \\      Ok(_) -> {
-  \\        let doubled = machine.call[m]("inner.double", [VInt(21)]);
-  \\        let spent = machine.accounting[m]();
-  \\        machine.drop[m]();
-  \\        match doubled.answer {
-  \\          Ok(v) -> match v { VInt(i) -> i + spent.steps, _ -> 0 - 2 },
-  \\          Err(_) -> 0 - 1,
-  \\        }
+  \\fn main() -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m], fs.list_dir[here], fs.kind[here], fs.read_file[here], shipped.names, shipped.module, shipped.runtime} =
+  \\  match load[here]("inner") {
+  \\    Err(_) -> 0 - 7,
+  \\    Ok(loaded) -> match machine.load[m]("inner", loaded.front, loaded.unit) {
+  \\      Ok(_) -> match machine.bound[m]("inner.main", { values: [], schema: None, opened: false }) {
+  \\        Ok(_) -> {
+  \\          let doubled = machine.call[m]("inner.double", [VInt(21)]);
+  \\          let spent = machine.accounting[m]();
+  \\          machine.drop[m]();
+  \\          match doubled.answer {
+  \\            Ok(v) -> match v { VInt(i) -> i + spent.steps, _ -> 0 - 2 },
+  \\            Err(_) -> 0 - 1,
+  \\          }
+  \\        },
+  \\        Err(_) -> 0 - 5,
   \\      },
-  \\      Err(_) -> 0 - 5,
+  \\      Err(_) -> 0 - 6,
   \\    },
-  \\    Err(_) -> 0 - 6,
   \\  }
-  \\}
   \\
 
 fn inner() -> String =
@@ -93,7 +91,17 @@ fn last_line(lines: List<String>) -> String =
 
 test/nondet "a granted family is bound and the program drives a machine" {
   project(driving());
-  let r = on_disk(["run", "--host", "--allow", "machine", "m.ply"]);
+  let r = on_disk([
+    "run",
+    "--host",
+    "--fs",
+    "here=.",
+    "--allow",
+    "machine",
+    "--allow",
+    "shipped",
+    "m.ply",
+  ]);
   assert(r.code == 0, Some(said(r)));
   let value = match int_of_string(last_line(r.out)) { Some(n) -> n, None -> 0 };
   assert(
@@ -107,7 +115,17 @@ test/nondet "a granted family is bound and the program drives a machine" {
 
 test/nondet "a family the program does not declare is refused" {
   project(driving());
-  let r = on_disk(["run", "--host", "--allow", "tester", "m.ply"]);
+  let r = on_disk([
+    "run",
+    "--host",
+    "--fs",
+    "here=.",
+    "--allow",
+    "shipped",
+    "--allow",
+    "tester",
+    "m.ply",
+  ]);
   assert(r.code != 0, Some("an undeclared grant ran"));
   assert(string_contains(stderr(r), "E0459"), Some(stderr(r)));
   assert(string_contains(stderr(r), "`tester`"), Some(stderr(r)))
@@ -115,7 +133,7 @@ test/nondet "a family the program does not declare is refused" {
 
 test/nondet "without the grant the machine is not bound" {
   project(driving());
-  let r = on_disk(["run", "--host", "m.ply"]);
+  let r = on_disk(["run", "--host", "--fs", "here=.", "--allow", "shipped", "m.ply"]);
   assert(r.code != 0, Some("a program drove a machine with no grant"));
   let err = stderr(r);
   assert(
@@ -132,6 +150,7 @@ fn proving() -> String =
   \\nondet effect prover {
   \\  write configure[claims](options: Unit, front: Unit, world: Unit) -> Unit
   \\  read collected[claims]() -> Result<Unit, Unit>
+  \\  write compiled[claims](unit: Bytes) -> Result<Unit, Unit>
   \\  read cached[claims](keys: List<String>) -> List<Option<String>>
   \\  read schema[claims](name: String) -> Result<Unit, Unit>
   \\  read prepared[claims](step_budget: Int, config: Unit) -> Result<Unit, Unit>
@@ -156,14 +175,37 @@ test/nondet "a family is granted to a program declaring the effect it lends" {
 
 test/nondet "a refused grant names the effect the program would have to declare" {
   program(proving());
-  let r = on_disk(["run", "--host", "--allow", "bootstrap", "m.ply"]);
+  let r = on_disk(["run", "--host", "--allow", "edit", "m.ply"]);
   assert(r.code != 0, Some("an undeclared grant ran"));
   let err = stderr(r);
   assert(string_contains(err, "E0459"), Some(err));
   assert(
-    string_contains(err, "`--allow bootstrap`") && string_contains(err, "no `archive` effect"),
+    string_contains(err, "`--allow edit`") && string_contains(err, "no `edit` effect"),
     Some(err),
   )
+}
+
+fn backticked(line: String) -> List<String> = {
+  let parts = string_split(line, "`");
+  fold(range(0, len(parts)), [], |acc: List<String>, i: Int|
+    match list_at(parts, i) { Some(p) -> if i % 2 == 1 { push(acc, p) } else { acc }, None -> acc })
+}
+
+// What follows `marker` on the line of `text` that holds it.
+fn after(text: String, marker: String) -> String =
+  fold(string_split(text, "\n"), "", |found: String, l: String|
+    match list_at(string_split(l, marker), 1) { Some(rest) -> rest, None -> found })
+
+test/nondet "the help names every family a run lends, and no other" {
+  program("fn main() -> Int = 0\n");
+  let help = on_disk(["run", "--help"]);
+  let named = sort(backticked(after(stdout(help), "--allow <NAME>")));
+  let refused = on_disk(["run", "--host", "--allow", "nonsense", "m.ply"]);
+  let lent = sort(
+    map(string_split(after(stderr(refused), "it lends "), ","), |f: String| string_trim(f)),
+  );
+  assert(len(lent) > 1, Some(said(refused)));
+  assert_eq(named, lent)
 }
 
 test "the grant requires a host" {

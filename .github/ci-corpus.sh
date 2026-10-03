@@ -52,7 +52,7 @@ durations=$caches/ply-test-durations.tsv
 
 # What a checks run is given after `ply test PATH`.
 grants=(--host --timeout 900000 --steps 0 --json
-  --exec "ply=$ply" --allow machine --allow claims --fs work=. --fs "repo=$root")
+  --exec "ply=$ply" --allow machine --allow claims --allow shipped --fs work=. --fs "repo=$root")
 
 # What a run of the CLI's suite is given: the `ply` its tests start and the programs they start beside
 # it, its scratch directory and the filesystem, the repository, and every family a command drives a
@@ -60,7 +60,7 @@ grants=(--host --timeout 900000 --steps 0 --json
 cli_grants=(--host --timeout 900000 --steps 0 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
   --fs cwd=. --fs abs=/ --fs "repo=$root"
-  --allow machine --allow tester --allow claims --allow builder --allow bootstrap --allow hosts
+  --allow machine --allow tester --allow claims --allow builder --allow hosts
   --allow shipped)
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a

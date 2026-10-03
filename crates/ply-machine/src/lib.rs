@@ -12,11 +12,9 @@
 
 pub mod artifact;
 pub mod body;
-pub mod bootstrap;
 pub mod builder;
 pub mod claims;
 pub mod config;
-pub mod costs;
 pub mod drive;
 pub mod driver;
 pub mod edit;
@@ -226,6 +224,7 @@ enum Go {
     },
     Reload {
         front: Box<crate::driver::HandedFront>,
+        unit: Vec<u8>,
         reply: Sender<Result<drive::FoundData, drive::Refused>>,
     },
 }
@@ -236,14 +235,15 @@ impl HostHandler for Site {
         let label = label_of(req, span)?;
         let value = match (req.op.op.as_str(), req.args) {
             ("configure", [options]) => self.configure(&label, options, span)?,
-            ("load", [root, front]) => self.load(&label, root, front, span)?,
+            ("load", [root, front, unit]) => self.load(&label, root, front, unit, span)?,
             ("opened", [path, bytes]) => self.opened(&label, path, bytes, span)?,
             ("reuse", [root, walked, entry]) => self.reuse(&label, root, walked, entry, span)?,
-            ("filed", [front]) => filed(front, span)?,
-            ("reload", [front]) => {
+            ("filed", [front, unit]) => filed(front, unit, span)?,
+            ("reload", [front, unit]) => {
                 let front = Box::new(crate::driver::handed_front_of(front, span)?);
+                let unit = unit.as_bytes(span, "the program's unit")?.to_vec();
                 let answer: Result<drive::FoundData, drive::Refused> =
-                    self.ask(&label, span, |reply| Go::Reload { reply, front })?;
+                    self.ask(&label, span, |reply| Go::Reload { reply, front, unit })?;
                 match answer {
                     Ok(found) => ok(drive::found_value(&found, &self.module)),
                     Err(refused) => refused_value(&refused),
@@ -311,9 +311,10 @@ impl HostHandler for Site {
     }
 }
 
-/// The entry a later run's `reuse` takes `front` back from: the places and modules of its files,
-/// and the front end's answer. Only a front a load held over is worth filing.
-fn filed(front: &Value, span: Span) -> Result<Value, Diagnostic> {
+/// The entry a later run's `reuse` takes `front` and `unit` back from: the places and modules of its
+/// files, the front end's answer, and the unit's C. Only a load that held is worth filing, and none
+/// is answered for a load whose entry would not read back whole.
+fn filed(front: &Value, unit: &Value, span: Span) -> Result<Value, Diagnostic> {
     use crate::payload::field_of;
     let placed: Vec<(String, String)> = field_of(front, "files", span)?
         .as_list(span, "a front's files")?
@@ -329,14 +330,9 @@ fn filed(front: &Value, span: Span) -> Result<Value, Diagnostic> {
             ))
         })
         .collect::<Result<_, Diagnostic>>()?;
-    let entry = reused::entry(&placed, field_of(front, "dump", span)?).ok_or_else(|| {
-        Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            "a front end's answer does not encode",
-        )
-        .primary(span, "this is Ply's fault")
-    })?;
-    Ok(Value::bytes(entry))
+    let unit = unit.as_bytes(span, "the program's unit")?;
+    let entry = reused::entry(&placed, field_of(front, "dump", span)?, unit);
+    Ok(payload::option(entry.map(Value::bytes)))
 }
 
 fn label_of(req: &HostRequest<'_>, span: Span) -> Result<String, Diagnostic> {
@@ -369,20 +365,21 @@ impl Site {
         Ok(Value::Unit)
     }
 
+    /// The program the caller loaded and emitted: its front end and its unit's C.
     fn load(
         &self,
         label: &str,
         root: &Value,
         front: &Value,
+        unit: &Value,
         span: Span,
     ) -> Result<Value, Diagnostic> {
         let root = root.as_str(span, "the program's root")?.to_string();
-        // `None` is a program loading a program of its own, at a root it chose while running.
-        let front = crate::payload::option_of(front, "a front end", span)?
-            .map(|front| crate::driver::handed_front_of(front, span))
-            .transpose()?;
+        let handed = crate::driver::handed_front_of(front, span)?;
+        let unit = unit.as_bytes(span, "the program's unit")?.to_vec();
         let mut options = self.taken(label);
-        options.front = front;
+        options.front = Some(handed);
+        options.unit = Some(unit);
         let path = PathBuf::from(root);
         let found = self.open(label, options, span, move |options| {
             drive::Drive::open(options, &path)
@@ -424,7 +421,8 @@ impl Site {
                 })
                 .collect()
         };
-        let Some(front) = reused::front(entry, files("modules")?, files("manifests")?) else {
+        let Some((front, unit)) = reused::front(entry, files("modules")?, files("manifests")?)
+        else {
             return Ok(payload::option(None));
         };
         let mut options = self
@@ -435,6 +433,7 @@ impl Site {
             .cloned()
             .unwrap_or_else(|| self.options.clone());
         options.front = Some(front);
+        options.unit = Some(unit);
         let path = PathBuf::from(root);
         match self.open(label, options, span, move |options| {
             drive::Drive::open(options, &path)
@@ -626,8 +625,8 @@ fn park(mut drive: drive::Drive, hearing: mpsc::Receiver<Go>) {
             Go::Accounting { reply } => {
                 let _ = reply.send(drive.accounting());
             }
-            Go::Reload { reply, front } => {
-                let answer = drive.reload(&front).map(|()| drive.found_data());
+            Go::Reload { reply, front, unit } => {
+                let answer = drive.reload(&front, &unit).map(|()| drive.found_data());
                 let _ = reply.send(answer);
             }
         }

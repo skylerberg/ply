@@ -1,0 +1,1056 @@
+// A unit: the bodies the emitter answered, closed under calls and placed as one translation unit
+// that says what it holds, so the runtime loads it without reading a source. The runtime's own C
+// and its helper table are the runtime's to say, and are handed in.
+
+import spine (num)
+import hash (hex)
+import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstFixed,
+             ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, answer_bin,
+             emit_roots_answer, module_of_root)
+import front (Dump, EmitRoot, EmitCtor, KeyRow, ModuleRow, OrdinalRow)
+import interface (stubbed)
+import resolve (Pkg, Diag, Label, diag)
+import std.bin
+import std.bytes (u32_at)
+import std.hash (blake3)
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
+
+fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
+
+// --- What crosses the seam ----------------------------------------------------
+
+// A helper the runtime binds by position: its arguments past the context, and whether it answers.
+pub type Helper = { name: Bytes, args: Int, answers: Bool }
+
+// The runtime a unit is compiled against: the C every unit opens with, through the runtime's
+// declarations, and closes with, its definitions; the helpers those bind by position; the builtins
+// a body may call; and the digest of the runtime's sources and helper table.
+pub type Runtime = {
+  head: Bytes,
+  tail: Bytes,
+  helpers: List<Helper>,
+  builtins: List<Bytes>,
+  identity: Bytes,
+}
+
+// What this binary ships, a function of the binary alone: the modules on its shelf, its version,
+// what its store's groups are a function of, and the runtime a unit is compiled against.
+pub effect shipped {
+  read names() -> List<String>
+  read module(name: String) -> Option<Bytes>
+  read version() -> String
+  read stamps() -> String
+  read runtime() -> Runtime
+}
+
+// A root a unit is offered: its arity, and whether it is pure and takes nothing, which the unit
+// gives a memo slot.
+pub type Offered = { name: Bytes, arity: Int, constant: Bool }
+
+pub type Ctor = { name: Bytes, arity: Int }
+
+// What the fixpoint dropped and why: the emitter refused it, or it calls `missing`, which the unit
+// does not take.
+pub type Dropped = { function: Bytes, construct: Bytes, missing: Option<Bytes> }
+
+// A unit's C, the roots it takes, and what it dropped, in the order it dropped them.
+pub type Produced = { text: Bytes, taken: List<Bytes>, dropped: List<Dropped> }
+
+// A unit produced over answers an earlier run kept and answers the emitter gave now: how many of
+// the offered roots each covered.
+pub type Emission = { produced: Produced, kept: Int, asked: Int }
+
+// Each root's answer, a group's one body answering for every member.
+pub fn answers_of(rows: List<RootAnswer>) -> Map<Bytes, Answer> =
+  fold(rows, map_new(), |acc: Map<Bytes, Answer>, r: RootAnswer|
+    match r.answer {
+      Body(b) -> if len(b.tables.members) == 0 { map_insert(acc, r.name, r.answer) } else {
+        fold(b.tables.members, acc, |into: Map<Bytes, Answer>, m: Bytes|
+          map_insert(into, m, r.answer))
+      },
+      Refused(_) -> map_insert(acc, r.name, r.answer),
+    })
+
+// --- Order --------------------------------------------------------------------
+
+fn before(a: Bytes, b: Bytes) -> Bool = match compare_values(a, b) { Greater -> false, _ -> true }
+
+fn merged(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
+  iterate({ i: 0, j: 0, out: [] }, len(a) + len(b) + 1, |s: { i: Int, j: Int, out: List<Bytes> }|
+    if s.i >= len(a) {
+      Stop(fold(range(s.j, len(b)), s.out, |acc: List<Bytes>, k: Int| push(acc, at(b, k))))
+    } else if s.j >= len(b) {
+      Stop(fold(range(s.i, len(a)), s.out, |acc: List<Bytes>, k: Int| push(acc, at(a, k))))
+    } else if before(at(a, s.i), at(b, s.j)) {
+      Continue({ ..s, i: s.i + 1, out: push(s.out, at(a, s.i)) })
+    } else { Continue({ ..s, j: s.j + 1, out: push(s.out, at(b, s.j)) }) })
+
+fn slice<a>(xs: List<a>, from: Int, to: Int) -> List<a> =
+  fold(range(from, to), [], |acc: List<a>, i: Int| push(acc, at(xs, i)))
+
+// Ascending by byte, duplicates kept, as `Vec::sort` leaves names.
+fn sorted(xs: List<Bytes>) -> List<Bytes> =
+  if len(xs) <= 1 { xs } else {
+    let half = len(xs) / 2;
+    merged(sorted(slice(xs, 0, half)), sorted(slice(xs, half, len(xs))))
+  }
+
+// Ascending by byte, each once.
+fn ordered(xs: List<Bytes>) -> List<Bytes> =
+  map_keys(fold(xs, map_new(), |acc: Map<Bytes, Bool>, x: Bytes| map_insert(acc, x, true)))
+
+// A shape's names joined by a byte below every name's, so shapes sort as their name lists do.
+fn shape_key(names: List<Bytes>) -> Bytes =
+  fold(range(0, len(names)), b"", |acc: Bytes, i: Int|
+    if i == 0 { at(names, i) } else { bytes_concat_all([acc, b"\x00", at(names, i)]) })
+
+fn positions(keys: List<Bytes>) -> Map<Bytes, Int> =
+  fold(range(0, len(keys)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+    map_insert(acc, at(keys, i), i))
+
+// --- The fixpoint ---------------------------------------------------------------
+
+// A body the unit holds once: a group's under its first member.
+type Kept = { name: Bytes, text: Bytes, tables: Tables }
+
+type Round = { kept: List<Kept>, symbols: Map<Bytes, Defined>, out: List<Dropped> }
+
+type Settled = {
+  taken: List<Bytes>,
+  kept: List<Kept>,
+  symbols: Map<Bytes, Defined>,
+  dropped: List<Dropped>,
+}
+
+fn refused_one(name: Bytes, why: Bytes) -> Dropped =
+  { function: name, construct: why, missing: None }
+
+fn lost(name: Bytes, callee: Bytes) -> Dropped =
+  {
+    function: name,
+    construct: bytes_concat_all([b"`", callee, b"`, which is not in this compiled unit"]),
+    missing: Some(callee),
+  }
+
+// The C a body publishes for `name`: its place among the members, or the body's one definition.
+fn defines(name: Bytes, t: Tables) -> Defined = {
+  let found = fold(range(0, len(t.members)), 0 - 1, |acc: Int, i: Int|
+    if acc < 0 && at(t.members, i) == name { i } else { acc });
+  match list_at(t.symbols, if found < 0 { 0 } else { found }) {
+    Some(d) -> d,
+    None -> panic("an emitted body publishes the C it defines"),
+  }
+}
+
+fn first_missing(calls: List<Bytes>, taken: Map<Bytes, Bool>) -> Option<Bytes> =
+  fold(calls, None, |acc: Option<Bytes>, c: Bytes|
+    match acc { Some(_) -> acc, None -> if map_contains(taken, c) { None } else { Some(c) } })
+
+fn heads_its_group(name: Bytes, t: Tables) -> Bool = len(t.members) == 0 || at(t.members, 0) == name
+
+fn round_over(answers: Map<Bytes, Answer>, taken: List<Bytes>) -> Round = {
+  let set = fold(taken, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
+  fold(taken, { kept: [], symbols: map_new(), out: [] }, |r: Round, name: Bytes|
+    match map_get(answers, name) {
+      None -> { ..r, out: push(r.out, refused_one(name, b"which the Ply emitter did not answer")) },
+      Some(Refused(why)) -> { ..r, out: push(r.out, refused_one(name, why.why)) },
+      Some(Body(b)) -> match first_missing(b.tables.calls, set) {
+        Some(callee) -> { ..r, out: push(r.out, lost(name, callee)) },
+        None ->
+          {
+            kept: if heads_its_group(name, b.tables) {
+              push(r.kept, { name: name, text: b.text, tables: b.tables })
+            } else { r.kept },
+            symbols: map_insert(r.symbols, name, defines(name, b.tables)),
+            out: r.out,
+          },
+      },
+    })
+}
+
+// Dropping a body can drop its callers, so rounds repeat until one drops nothing.
+fn settle(answers: Map<Bytes, Answer>, taken: List<Bytes>, dropped: List<Dropped>) -> Settled = {
+  let r = round_over(answers, taken);
+  if len(r.out) == 0 { { taken: taken, kept: r.kept, symbols: r.symbols, dropped: dropped } } else {
+    let gone = fold(r.out, map_new(), |acc: Map<Bytes, Bool>, d: Dropped|
+      map_insert(acc, d.function, true));
+    settle(answers, filter(taken, |n: Bytes| !map_contains(gone, n)), append(dropped, r.out))
+  }
+}
+
+// The dropped bodies that are errors, given what was `offered`. A body dropped because a callee was
+// never offered is the offer's doing, as is anything that lost a callee to such a body; every other
+// drop is a definition the program reaches and cannot run.
+pub fn fatal(offered: List<Bytes>, dropped: List<Dropped>) -> List<Dropped> = {
+  let asked = fold(offered, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
+  let narrowed = iterate(map_new(), len(dropped) + 1, |nar: Map<Bytes, Bool>| {
+    let grew = filter(dropped, |d: Dropped|
+      !map_contains(nar, d.function)
+        && (match d.missing {
+          None -> false,
+          Some(m) -> !map_contains(asked, m) || map_contains(nar, m),
+        }));
+    if len(grew) == 0 { Stop(nar) } else {
+      Continue(
+        fold(grew, nar, |acc: Map<Bytes, Bool>, d: Dropped| map_insert(acc, d.function, true)),
+      )
+    }
+  });
+  filter(dropped, |d: Dropped| !map_contains(narrowed, d.function))
+}
+
+// --- Constants ------------------------------------------------------------------
+
+fn hex_digit(v: Int) -> Bytes = bytes_slice(b"0123456789abcdef", v, v + 1)
+
+// An `Int`'s 64 bits as sixteen hex digits, its sign bit included.
+fn hex16(n: Int) -> Bytes =
+  bytes_concat_all(map(range(0, 16), |i: Int| hex_digit(n >>> 60 - 4 * i & 15)))
+
+// `n`'s two's-complement pattern at 128 bits, as a cast to `u128` widens it.
+fn wide_of(n: Int) -> U128 = if n >= 0 { u128_of_int(n) } else { ~u128_of_int(0 - (n + 1)) }
+
+// The low 64 bits of `n`, as an unsigned word.
+fn word_of(n: Int) -> U128 = wide_of(n) & wrap_sub(1u128 << 64, 1u128)
+
+fn width_bits(w: Int) -> Int =
+  if w == 0 || w == 4 { 8 }
+  else if w == 1 || w == 5 { 16 }
+  else if w == 2 || w == 6 { 32 }
+  else if w == 3 || w == 7 { 64 }
+  else { 128 }
+
+fn width_signed(w: Int) -> Bool = (w >= 4 && w <= 7) || w == 9
+
+// Truncated to the width, then zero- or sign-extended: every fixed-width value is held so.
+fn normalized(w: Int, bits: U128) -> U128 = {
+  let n = width_bits(w);
+  if n == 128 { bits } else {
+    let low = bits & ~0u128 >>> 128 - n;
+    if width_signed(w) && low >>> n - 1 == 1u128 { low | ~0u128 << n } else { low }
+  }
+}
+
+fn fixed_line(w: Int, bits: U128) -> Bytes =
+  bytes_concat_all([b"f ", num(w), b" ", bytes_of_string(u128_to_string(normalized(w, bits)))])
+
+fn without(s: Bytes, byte: Int) -> Bytes =
+  bytes_concat_all(
+    map(range(0, bytes_len(s)), |i: Int|
+      if bytes_at(s, i) == byte { b"" } else { bytes_slice(s, i, i + 1) }),
+  )
+
+fn float_line(literal: Bytes) -> Bytes =
+  match float_of_string(string_of_bytes(without(literal, 95))) {
+    Some(x) -> bytes_concat(b"x ", hex16(bits_of_float(x))),
+    None -> panic("the emitter wrote a float literal that does not read"),
+  }
+
+fn trimmed_m(s: Bytes) -> Bytes =
+  iterate(s, bytes_len(s) + 1, |t: Bytes|
+    if bytes_len(t) > 0 && bytes_at(t, bytes_len(t) - 1) == 109 {
+      Continue(bytes_slice(t, 0, bytes_len(t) - 1))
+    } else { Stop(t) })
+
+// A decimal as its mantissa and scale, read off the text that keeps its scale.
+fn decimal_line(literal: Bytes) -> Bytes =
+  match decimal_of_string(string_of_bytes(trimmed_m(without(literal, 95)))) {
+    None -> panic("the emitter wrote a decimal literal that does not read"),
+    Some(d) -> {
+      let text = bytes_of_string(decimal_to_string(d));
+      let negative = bytes_len(text) > 0 && bytes_at(text, 0) == 45;
+      let body = if negative { bytes_slice(text, 1, bytes_len(text)) } else { text };
+      let point = match bytes_index_of(body, b".") { Some(i) -> i, None -> bytes_len(body) };
+      let digits = without(body, 46);
+      let lead = iterate(0, bytes_len(digits) + 1, |i: Int|
+        if i < bytes_len(digits) - 1 && bytes_at(digits, i) == 48 { Continue(i + 1) }
+        else { Stop(i) });
+      let mantissa = bytes_slice(digits, lead, bytes_len(digits));
+      let signed = if negative && mantissa != b"0" { bytes_concat(b"-", mantissa) }
+      else { mantissa };
+      bytes_concat_all([
+        b"d ",
+        signed,
+        b" ",
+        num(if point < bytes_len(body) { bytes_len(body) - point - 1 } else { 0 }),
+      ])
+    },
+  }
+
+// One pooled constant's line: its identity, which the pool sorts and deduplicates by, and what the
+// runtime reads it back from.
+pub fn const_line(c: Const) -> Bytes =
+  match c {
+    ConstUnit -> b"u",
+    ConstStr(s) -> bytes_concat(b"s ", hex(s)),
+    ConstBytes(b) -> bytes_concat(b"b ", hex(b)),
+    ConstFixed(f) -> fixed_line(f.width, wide_of(f.bits)),
+    ConstWide(x) -> fixed_line(x.width, word_of(x.high) << 64 | word_of(x.low)),
+    ConstChar(v) -> bytes_concat(b"c ", num(v)),
+    ConstFloat(x) -> float_line(x),
+    ConstDecimal(x) -> decimal_line(x),
+  }
+
+// --- The unit's tables ------------------------------------------------------------
+
+// What a unit names that is not code, each table sorted by content and each entry once, so a
+// position is a rank among what the unit holds and a body's C is a function of the unit's content.
+type Pools = {
+  consts: List<Bytes>,
+  fields: List<Bytes>,
+  builtins: List<Bytes>,
+  shapes: List<List<Bytes>>,
+  lambdas: List<Bytes>,
+}
+
+fn entry_fields() -> List<Bytes> = [b"key", b"value"]
+
+fn pools_of(kept: List<Kept>, constant_entries: List<Bytes>) -> Pools = {
+  let ts = map(kept, |k: Kept| k.tables);
+  let all = |pick: (Tables) -> List<Bytes>|
+    fold(ts, [], |acc: List<Bytes>, t: Tables| append(acc, pick(t)));
+  let shapes = fold(
+    ts,
+    map_insert(map_new(), shape_key(entry_fields()), entry_fields()),
+    |acc: Map<Bytes, List<Bytes>>, t: Tables|
+      fold(t.shapes, acc, |into: Map<Bytes, List<Bytes>>, names: List<Bytes>| {
+        let s = sorted(names);
+        map_insert(into, shape_key(s), s)
+      }),
+  );
+  {
+    consts: ordered(
+      fold(ts, [], |acc: List<Bytes>, t: Tables| append(acc, map(t.consts, const_line))),
+    ),
+    fields: ordered(all(|t: Tables| t.fields)),
+    builtins: ordered(all(|t: Tables| t.builtins)),
+    shapes: map_values(shapes),
+    lambdas: ordered(append(constant_entries, all(|t: Tables| t.lambdas))),
+  }
+}
+
+type Placed = {
+  consts: Map<Bytes, Int>,
+  fields: Map<Bytes, Int>,
+  builtins: Map<Bytes, Int>,
+  shapes: Map<Bytes, Int>,
+  lambdas: Map<Bytes, Int>,
+}
+
+fn placed_of(p: Pools) -> Placed =
+  {
+    consts: positions(p.consts),
+    fields: positions(p.fields),
+    builtins: positions(p.builtins),
+    shapes: positions(map(p.shapes, shape_key)),
+    lambdas: positions(p.lambdas),
+  }
+
+fn place(m: Map<Bytes, Int>, key: Bytes) -> Int =
+  match map_get(m, key) {
+    Some(i) -> i,
+    None -> panic("the unit's tables hold everything its bodies name"),
+  }
+
+// --- Sites ----------------------------------------------------------------------
+
+// The id a body's failure sites name their root by: a digest of its name, so a body's C does not
+// depend on which other roots the unit holds. Non-negative, since the C stores it in an `int64_t`.
+pub fn root_id(name: Bytes) -> Int = {
+  let h = blake3(name);
+  let low = match u32_at(h, 0) { Some(v) -> v, None -> 0 };
+  let high = match u32_at(h, 4) { Some(v) -> v, None -> 0 };
+  high << 31 | low >>> 1
+}
+
+// The bucket a body compiles in: the top bits of its root id, so it is a function of the name
+// alone and an edit recompiles the one bucket holding the body.
+pub fn bucket_of(name: Bytes) -> Int = root_id(name) >>> 57
+
+fn bucket_mark(id: Int) -> Bytes =
+  bytes_concat_all([b"/* --- bucket ", hex_digit(id / 16), hex_digit(id % 16), b" --- */"])
+
+type Indexed = {
+  consts: List<Int>,
+  fields: List<Int>,
+  builtins: List<Int>,
+  shapes: List<Int>,
+  lambdas: List<Int>,
+}
+
+fn indexed(t: Tables, p: Placed) -> Indexed =
+  {
+    consts: map(t.consts, |c: Const| place(p.consts, const_line(c))),
+    fields: map(t.fields, |f: Bytes| place(p.fields, f)),
+    builtins: map(t.builtins, |b: Bytes| place(p.builtins, b)),
+    shapes: map(t.shapes, |s: List<Bytes>| place(p.shapes, shape_key(sorted(s)))),
+    lambdas: map(t.lambdas, |l: Bytes| place(p.lambdas, l)),
+  }
+
+fn digits_of(b: Bytes) -> Int =
+  fold(range(0, bytes_len(b)), 0, |acc: Int, i: Int| acc * 10 + bytes_at(b, i) - 48)
+
+// A body's `@@kN@@` placeholders, rewritten from its own table positions to the unit's: `@@r@@` is
+// the body's own root and `@@rN@@` a group's `N`th member.
+fn resolved(text: Bytes, t: Tables, name: Bytes, at_unit: Indexed) -> Bytes = {
+  let value = |kind: Int, digits: Bytes|
+    if kind == 114 {
+      if bytes_len(digits) == 0 { root_id(name) } else { root_id(at(t.members, digits_of(digits))) }
+    } else {
+      let i = digits_of(digits);
+      if kind == 99 { at(at_unit.consts, i) }
+      else if kind == 98 { at(at_unit.builtins, i) }
+      else if kind == 102 { at(at_unit.fields, i) }
+      else if kind == 115 { at(at_unit.shapes, i) }
+      else if kind == 108 { at(at_unit.lambdas, i) }
+      else { panic("an emitted placeholder of no kind the unit resolves") }
+    };
+  let pieces = iterate(
+    { from: 0, out: [] },
+    bytes_len(text) + 1,
+    |s: { from: Int, out: List<Bytes> }|
+      match bytes_index_of_from(text, b"@@", s.from) {
+        None -> Stop(push(s.out, bytes_slice(text, s.from, bytes_len(text)))),
+        Some(open) -> match bytes_index_of_from(text, b"@@", open + 2) {
+          None -> panic("an emitted placeholder always closes"),
+          Some(close) ->
+            Continue({
+              from: close + 2,
+              out: push(
+                push(s.out, bytes_slice(text, s.from, open)),
+                num(value(bytes_at(text, open + 2), bytes_slice(text, open + 3, close))),
+              ),
+            }),
+        },
+      },
+  );
+  bytes_concat_all(pieces)
+}
+
+// --- What the unit says about itself ---------------------------------------------
+
+type Taken = { name: Bytes, arity: Int, symbol: Bytes, entry: Bytes }
+
+fn bit(b: Bool) -> Bytes = if b { b"1" } else { b"0" }
+
+fn counted(label: Bytes, n: Int) -> Bytes = bytes_concat_all([label, b" ", num(n), b"\n"])
+
+fn lines(label: Bytes, xs: List<Bytes>) -> Bytes =
+  bytes_concat_all(append([counted(label, len(xs))], map(xs, |x: Bytes| bytes_concat(x, b"\n"))))
+
+fn exports_text(
+  helpers: List<Helper>,
+  ctors: List<Ctor>,
+  taken: List<Taken>,
+  constants: List<Bytes>,
+  modules: Int,
+  dropped: List<Dropped>,
+  p: Pools,
+) -> Bytes =
+  bytes_concat_all([
+    lines(
+      b"helpers",
+      map(helpers, |h: Helper| bytes_concat_all([h.name, b" ", num(h.args), b" ", bit(h.answers)])),
+    ),
+    lines(b"ctors", map(ctors, |c: Ctor| bytes_concat_all([c.name, b" ", num(c.arity)]))),
+    lines(
+      b"taken",
+      map(taken, |t: Taken|
+        bytes_concat_all([t.name, b" ", num(t.arity), b" ", t.symbol, b" ", t.entry])),
+    ),
+    lines(b"constants", constants),
+    counted(b"modules", modules),
+    counted(b"refused", len(dropped)),
+    bytes_concat_all(
+      map(dropped, |d: Dropped| bytes_concat_all([d.function, b"\n", d.construct, b"\n"])),
+    ),
+    lines(b"consts", p.consts),
+    lines(b"builtins", p.builtins),
+    lines(b"fields", p.fields),
+    lines(
+      b"shapes",
+      map(p.shapes, |names: List<Bytes>|
+        fold(range(0, len(names)), b"", |acc: Bytes, i: Int|
+          if i == 0 { at(names, i) } else { bytes_concat_all([acc, b" ", at(names, i)]) })),
+    ),
+    lines(b"lambdas", p.lambdas),
+  ])
+
+fn octal(b: Int) -> Bytes = bytes_concat_all([b"\\", num(b / 64), num(b / 8 % 8), num(b % 8)])
+
+// The bytes a C string literal holds as they are: the printable ones but for the quote, the
+// backslash and `?`, which could open a trigraph.
+fn plain() -> Bytes =
+  bytes_concat_all(map(filter(range(32, 127), |b: Int| b != 34 && b != 63 && b != 92), byte_of_int))
+
+fn escaped(piece: Bytes) -> Bytes = {
+  let n = bytes_len(piece);
+  bytes_concat_all(
+    iterate({ from: 0, out: [] }, n + 1, |s: { from: Int, out: List<Bytes> }|
+      if s.from >= n { Stop(s.out) } else {
+        let stop = bytes_scan(piece, s.from, plain(), n - s.from);
+        if stop > s.from {
+          Continue({ from: stop, out: push(s.out, bytes_slice(piece, s.from, stop)) })
+        } else {
+          let b = bytes_at(piece, s.from);
+          Continue({
+            from: s.from + 1,
+            out: push(s.out, if b == 34 { b"\\\"" } else if b == 92 { b"\\\\" } else { octal(b) }),
+          })
+        }
+      }),
+  )
+}
+
+// Bytes per C string literal, so no literal exceeds what compilers accept.
+fn piece_len() -> Int = 2000
+
+fn literal_lines(line: Bytes) -> Bytes = {
+  let n = bytes_len(line);
+  let count = if n == 0 { 1 } else { (n + piece_len() - 1) / piece_len() };
+  bytes_concat_all(
+    map(range(0, count), |i: Int| {
+      let piece = bytes_slice(line, i * piece_len(), if (i + 1) * piece_len() < n {
+        (i + 1) * piece_len()
+      } else { n });
+      bytes_concat_all([b"\"", escaped(piece), if i == count - 1 { b"\\n" } else { b"" }, b"\"\n"])
+    }),
+  )
+}
+
+// The text's lines as `str::lines` reads them: a final newline ends the last line rather than
+// opening another, and a carriage return before a newline is part of the ending.
+fn split_lines(text: Bytes) -> List<Bytes> = {
+  let parts = bytes_split(text, b"\n");
+  let whole = if len(parts) > 0 && bytes_len(at(parts, len(parts) - 1)) == 0 {
+    slice(parts, 0, len(parts) - 1)
+  } else { parts };
+  map(whole, |l: Bytes|
+    if bytes_len(l) > 0 && bytes_at(l, bytes_len(l) - 1) == 13 {
+      bytes_slice(l, 0, bytes_len(l) - 1)
+    } else { l })
+}
+
+// The table as C string literals, non-printable bytes and `?` in octal.
+fn embedded(exports: Bytes) -> Bytes =
+  bytes_concat_all([
+    b"\n/* --- what this unit says about itself, read by the loader --- */\n",
+    b"const char ply_exports[] =\n",
+    bytes_concat_all(map(split_lines(exports), literal_lines)),
+    b";\n",
+  ])
+
+// --- Placing it -----------------------------------------------------------------
+
+type Placing = { name: Bytes, bucket: Int, text: Bytes, reaches: List<Bytes> }
+
+// What a body's C names of the unit's definitions: its own, a group's every member, and its calls.
+fn reaches_of(name: Bytes, t: Tables) -> List<Bytes> =
+  ordered(append(t.calls, if len(t.members) == 0 { [name] } else { t.members }))
+
+fn prototype(symbol: Bytes, arity: Int) -> Bytes =
+  bytes_concat_all([
+    b"Word ",
+    symbol,
+    b"(PlyCtx*",
+    bytes_concat_all(map(range(0, arity), |_: Int| b", Word")),
+    b");\n",
+  ])
+
+fn bucket_key(p: Placing) -> Bytes =
+  bytes_concat_all([hex_digit(p.bucket / 16), hex_digit(p.bucket % 16), b"\x00", p.name])
+
+// The header, then a marked bucket per class of names opening with the prototypes of what its
+// bodies reach, then the runtime's definitions and the table: one translation unit that the loader
+// also compiles in parts, cut on the marks.
+fn assembled(
+  runtime: Runtime,
+  bodies: List<Placing>,
+  taken: Map<Bytes, Taken>,
+  exports: Bytes,
+) -> Bytes = {
+  let by_bucket = fold(bodies, map_new(), |acc: Map<Bytes, Placing>, p: Placing|
+    map_insert(acc, bucket_key(p), p));
+  let groups = fold(map_values(by_bucket), [], |acc: List<List<Placing>>, p: Placing| {
+    let last = len(acc) - 1;
+    if last >= 0 && at(at(acc, last), 0).bucket == p.bucket {
+      list_set(acc, last, push(at(acc, last), p))
+    } else { push(acc, [p]) }
+  });
+  bytes_concat_all([
+    runtime.head,
+    bytes_concat_all(
+      map(groups, |group: List<Placing>|
+        bytes_concat_all([
+          bucket_mark(at(group, 0).bucket),
+          b"\n",
+          bytes_concat_all(
+            map(
+              ordered(fold(group, [], |acc: List<Bytes>, p: Placing| append(acc, p.reaches))),
+              |name: Bytes|
+                match map_get(taken, name) { Some(t) -> prototype(t.symbol, t.arity), None -> b"" },
+            ),
+          ),
+          b"\n",
+          bytes_concat_all(map(group, |p: Placing| bytes_concat(p.text, b"\n"))),
+        ])),
+    ),
+    runtime.tail,
+    embedded(exports),
+  ])
+}
+
+// The unit over `offered`, from each root's answer: closed under calls, its tables sorted by
+// content, its bodies resolved against them and bucketed, and what it holds embedded in its C.
+// `modules` is how many modules the program it was emitted from has.
+pub fn produce(
+  runtime: Runtime,
+  ctors: List<Ctor>,
+  offered: List<Offered>,
+  modules: Int,
+  answers: Map<Bytes, Answer>,
+) -> Produced = {
+  let arity = fold(offered, map_new(), |acc: Map<Bytes, Offered>, o: Offered|
+    map_insert(acc, o.name, o));
+  let s = settle(answers, sorted(map(offered, |o: Offered| o.name)), []);
+  let published = |n: Bytes|
+    match map_get(s.symbols, n) {
+      Some(d) -> d,
+      None -> panic("every definition a unit takes emitted, and an emitted body publishes its C"),
+    };
+  let constants = filter(s.taken, |n: Bytes|
+    match map_get(arity, n) { Some(o) -> o.constant, None -> false });
+  let pools = pools_of(s.kept, map(constants, |n: Bytes| published(n).entry));
+  let placed = placed_of(pools);
+  let taken = map(s.taken, |n: Bytes| {
+    let d = published(n);
+    {
+      name: n,
+      arity: match map_get(arity, n) { Some(o) -> o.arity, None -> 0 },
+      symbol: d.symbol,
+      entry: d.entry,
+    }
+  });
+  let bodies = map(s.kept, |k: Kept|
+    {
+      name: k.name,
+      bucket: bucket_of(k.name),
+      text: resolved(k.text, k.tables, k.name, indexed(k.tables, placed)),
+      reaches: reaches_of(k.name, k.tables),
+    });
+  let exports = exports_text(runtime.helpers, ctors, taken, constants, modules, s.dropped, pools);
+  {
+    text: assembled(
+      runtime,
+      bodies,
+      fold(taken, map_new(), |acc: Map<Bytes, Taken>, t: Taken| map_insert(acc, t.name, t)),
+      exports,
+    ),
+    taken: s.taken,
+    dropped: s.dropped,
+  }
+}
+
+// --- Emitting what no earlier run kept --------------------------------------------
+
+// What the front end's answer says the emitter works over: each root, the modules in program order,
+// and what each module imports.
+type Program = {
+  roots: Map<Bytes, EmitRoot>,
+  keys: Map<Bytes, Bytes>,
+  modules: List<ModuleRow>,
+  imports: Map<Bytes, List<Bytes>>,
+  sources: List<Bytes>,
+}
+
+fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
+  let by_name = fold(dump.modules, map_new(), |acc: Map<Bytes, ModuleRow>, m: ModuleRow|
+    map_insert(acc, m.name, m));
+  {
+    roots: fold(dump.emit_roots, map_new(), |acc: Map<Bytes, EmitRoot>, r: EmitRoot|
+      map_insert(acc, r.root, r)),
+    keys: fold(dump.keys, map_new(), |acc: Map<Bytes, Bytes>, k: KeyRow|
+      map_insert(acc, k.root, k.key)),
+    // The emitter walks modules in the front end's ordinal order, so this order is not ours to pick.
+    modules: fold(dump.ordinals, [], |acc: List<ModuleRow>, o: OrdinalRow|
+      match map_get(by_name, o.module) { Some(m) -> push(acc, m), None -> acc }),
+    imports: map_fold(by_name, map_new(), |acc: Map<Bytes, List<Bytes>>, n: Bytes, m: ModuleRow|
+      map_insert(acc, n, m.imports)),
+    sources: sources,
+  }
+}
+
+fn text_at(p: Program, index: Int) -> Option<Bytes> = list_at(p.sources, index)
+
+// `modules` and every module they import, directly or not: all the emitter reads to lower a body
+// of one of them.
+fn imported(p: Program, modules: List<Bytes>) -> Map<Bytes, Bool> = {
+  let start = ordered(modules);
+  iterate(
+    { seen: map_new(), stack: start },
+    len(start) + map_fold(p.imports, 1, |n: Int, _: Bytes, xs: List<Bytes>| n + len(xs)),
+    |s: { seen: Map<Bytes, Bool>, stack: List<Bytes> }|
+      match s.stack {
+        [] -> Stop(s.seen),
+        [m, ..rest] -> if map_contains(s.seen, m) { Continue({ seen: s.seen, stack: rest }) } else {
+          Continue({
+            seen: map_insert(s.seen, m, true),
+            stack: append(rest, match map_get(p.imports, m) { Some(xs) -> xs, None -> [] }),
+          })
+        },
+      },
+  )
+}
+
+// What a kept answer is a function of beyond the emitter and the runtime: the root's name, the key
+// the front end gave it, and the text it is written in, since its sites are offsets into that text.
+// `None` for a root with no key or no place, which is asked again every time.
+fn root_material(p: Program, name: Bytes) -> Option<Bytes> =
+  match map_get(p.keys, name) {
+    None -> None,
+    Some(key) -> match map_get(p.roots, name) {
+      None -> None,
+      Some(r) -> match text_at(p, r.at.module) {
+        None -> None,
+        Some(text) -> if r.at.start < 0 || r.at.end > bytes_len(text) || r.at.start > r.at.end {
+          None
+        } else {
+          Some(
+            bytes_concat_all([
+              name,
+              b"\x00",
+              key,
+              b"\x00",
+              blake3(bytes_slice(text, r.at.start, r.at.end)),
+            ]),
+          )
+        },
+      },
+    },
+  }
+
+fn kept_key(parts: List<Bytes>) -> Bytes =
+  hex(blake3(bytes_concat_all(map(parts, |b: Bytes| bytes_concat(b, b"\x00")))))
+
+// A group's kept body stands only when every member is offered and each member's kept answer is
+// that same group; otherwise the group is asked again, and the emitter groups what is wanted now.
+fn standing(looked: Map<Bytes, Answer>, offered: Map<Bytes, Bool>) -> Map<Bytes, Answer> =
+  map_fold(looked, map_new(), |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+    match a {
+      Refused(_) -> map_insert(acc, n, a),
+      Body(b) -> if fold(b.tables.members, true, |ok: Bool, m: Bytes|
+          ok && map_contains(offered, m)
+            && (match map_get(looked, m) {
+              Some(Body(other)) -> other.tables.members == b.tables.members,
+              _ -> false,
+            })) { map_insert(acc, n, a) }
+      else { acc },
+    })
+
+fn decoded(bytes: Option<Bytes>) -> Option<Answer> =
+  match bytes {
+    None -> None,
+    Some(b) -> match bin::decode(b, answer_bin()) { Ok(a) -> Some(a), Err(_) -> None },
+  }
+
+// The unit over `offered`: each root's answer taken from what an earlier run kept where it stands,
+// the emitter entered once for the rest, what it answered kept for the next run, and the unit
+// produced over all of it. `emitter` names the compiler doing the emitting, which every kept answer
+// is a function of. `Err` says why the emitter answered nothing at all.
+pub fn emitted<| e>(
+  runtime: Runtime,
+  dump: Dump,
+  sources: List<Bytes>,
+  offered: List<Bytes>,
+  emitter: Bytes,
+  read: (Bytes) -> Option<Bytes> / e,
+  write: (Bytes, Bytes) -> Unit / e,
+) -> Result<Emission, Bytes> / e = {
+  let p = program_of(dump, sources);
+  let ctors = map(dump.emit_ctors, |c: EmitCtor| { name: c.name, arity: c.arity });
+  let asked = fold(offered, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
+  let common = [
+    b"ply.unit.answer.1",
+    hex(bin::shape_digest(answer_bin())),
+    runtime.identity,
+    emitter,
+    kept_key(map(ctors, |c: Ctor| bytes_concat_all([c.name, b" ", num(c.arity)]))),
+  ];
+  let fragment = kept_key(sorted(offered));
+  let body_key = |m: Bytes| kept_key(append(common, [b"body", m]));
+  let refusal_key = |m: Bytes| kept_key(append(common, [b"refusal", fragment, m]));
+  let looked = fold(offered, map_new(), |acc: Map<Bytes, Answer>, n: Bytes|
+    match root_material(p, n) {
+      None -> acc,
+      Some(m) -> match decoded(read(refusal_key(m))) {
+        Some(a) -> map_insert(acc, n, a),
+        None -> match decoded(read(body_key(m))) { Some(a) -> map_insert(acc, n, a), None -> acc },
+      },
+    });
+  let kept = standing(looked, asked);
+  let missed = filter(offered, |n: Bytes| !map_contains(kept, n));
+  let fresh = if len(missed) == 0 { [] } else {
+    let lowered = fold(missed, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
+      map_insert(acc, module_of_root(n), true));
+    let needed = imported(p, map_keys(lowered));
+    let placed = filter(range(0, len(p.modules)), |i: Int|
+      map_contains(needed, at(p.modules, i).name));
+    let names = map(placed, |i: Int| at(p.modules, i).name);
+    // A module no wanted root is in is read for its declarations, its rows standing for its bodies.
+    let text_of = |m: ModuleRow| {
+      let text = match text_at(p, m.index) { Some(t) -> t, None -> b"" };
+      if map_contains(lowered, m.name) { text } else { stubbed(text, m.cuts) }
+    };
+    emit_roots_answer(
+      names,
+      map(placed, |i: Int| text_of(at(p.modules, i))),
+      map(ctors, |c: Ctor| c.name),
+      runtime.builtins,
+      missed,
+      if len(dump.packages) == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
+      if len(dump.packages) == 0 { map(names, |_: Bytes| 0) }
+      else { map(placed, |i: Int| match list_at(dump.mod_pkg, i) { Some(k) -> k, None -> 0 }) },
+      dump.embeds,
+      dump.rows,
+      dump.walked,
+    )
+  };
+  if len(missed) > 0 && len(fresh) == 0 {
+    Err(
+      bytes_concat_all([
+        b"it answered nothing for the ",
+        num(len(missed)),
+        b" root(s) it was asked for, so no body was emitted: a module it cannot parse, a package it ",
+        b"cannot resolve, or a program its own check refuses",
+      ]),
+    )
+  } else {
+    let answered = answers_of(fresh);
+    map_fold(answered, (), |_: Unit, n: Bytes, a: Answer|
+      match root_material(p, n) {
+        None -> (),
+        Some(m) -> match a {
+          Body(_) -> write(body_key(m), bin::encode(a, answer_bin())),
+          Refused(_) -> write(refusal_key(m), bin::encode(a, answer_bin())),
+        },
+      });
+    Ok({
+      produced: produce(
+        runtime,
+        ctors,
+        map(offered, |n: Bytes|
+          match map_get(p.roots, n) {
+            Some(r) -> { name: n, arity: r.arity, constant: r.pure && r.arity == 0 },
+            None -> { name: n, arity: 0, constant: false },
+          }),
+        len(p.modules),
+        map_fold(answered, kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+          map_insert(acc, n, a)),
+      ),
+      kept: map_len(kept),
+      asked: len(missed),
+    })
+  }
+}
+
+// --- What a program is told -------------------------------------------------------
+
+fn outside() -> Int = 4294967295
+
+fn place_of(dump: Dump, name: Bytes) -> { module: Int, start: Int, end: Int } =
+  fold(
+    dump.emit_roots,
+    { module: outside(), start: 0, end: 0 },
+    |acc: { module: Int, start: Int, end: Int }, r: EmitRoot|
+      if r.root == name { { module: r.at.module, start: r.at.start, end: r.at.end } } else { acc },
+  )
+
+fn label_of(dump: Dump, d: Dropped, primary: Bool) -> Label = {
+  let at = place_of(dump, d.function);
+  { module: at.module, start: at.start, end: at.end, primary: primary, text: d.construct }
+}
+
+// Definitions the program reaches that the emitter refused, in the order the fixpoint dropped them,
+// so the first is a cause and the rest what that cause carried.
+fn refused_reach(dump: Dump, dropped: List<Dropped>) -> Diag = {
+  let listed = fold(
+    dropped,
+    b"the emitter refused, in the order it dropped them:",
+    |acc: Bytes, d: Dropped|
+      bytes_concat_all([acc, b"\n  `", d.function, b"` (", d.construct, b")"]),
+  );
+  diag(
+    b"E0448",
+    bytes_concat_all([
+      b"the compiled tier cannot compile ",
+      num(len(dropped)),
+      b" of the definitions this program reaches",
+    ]),
+    fold(range(0, len(dropped)), [], |acc: List<Label>, i: Int|
+      if i > 4 { acc } else { push(acc, label_of(dump, at(dropped, i), i == 0)) }),
+    [
+      listed,
+      b"compiled code is the only evaluator, so a definition it cannot compile is one nothing can enter; the build fails here, where the construct that refused it is still in hand, rather than at the call that would find no body",
+    ],
+  )
+}
+
+fn unanswered(why: Bytes) -> Diag =
+  diag(
+    b"E0450",
+    bytes_concat(
+      b"the C backend could not be built: the Ply emitter failed over the program: ",
+      why,
+    ),
+    [],
+    [
+      b"compiled code is the only evaluator, so a run without a backend would be reported green over a seam nothing reached",
+    ],
+  )
+
+// The unit's C as the runtime compiles it, or why there is none: an emitter that answered nothing
+// at all, or a definition the program reaches that the emitter refused. A definition dropped only
+// because a narrowed offer left its callee out is no refusal of the program's.
+pub fn held(
+  dump: Dump,
+  offered: List<Bytes>,
+  emission: Result<Emission, Bytes>,
+) -> Result<Bytes, List<Diag>> =
+  match emission {
+    Err(why) -> Err([unanswered(why)]),
+    Ok(e) -> {
+      let errors = fatal(offered, e.produced.dropped);
+      if len(errors) == 0 { Ok(e.produced.text) } else { Err([refused_reach(dump, errors)]) }
+    },
+  }
+
+// The unit over `offered`, held as `held` holds it. What is kept between runs is `read` and
+// `write`'s, under keys that name `emitter`.
+pub fn compiled<| e>(
+  runtime: Runtime,
+  dump: Dump,
+  sources: List<Bytes>,
+  offered: List<Bytes>,
+  emitter: Bytes,
+  read: (Bytes) -> Option<Bytes> / e,
+  write: (Bytes, Bytes) -> Unit / e,
+) -> Result<Bytes, List<Diag>> / e =
+  held(dump, offered, emitted(runtime, dump, sources, offered, emitter, read, write))
+
+// --- Tests ------------------------------------------------------------------
+
+test "a pooled constant's line is the one the runtime reads it back from" {
+  assert_eq(const_line(ConstUnit), b"u");
+  assert_eq(const_line(ConstStr(b"hi")), b"s 6869");
+  assert_eq(const_line(ConstBytes(b"\x00\xff")), b"b 00ff");
+  assert_eq(const_line(ConstChar(65)), b"c 65");
+  assert_eq(const_line(ConstFixed({ width: 0, bits: 255 })), b"f 0 255");
+  assert_eq(const_line(ConstFixed({ width: 4, bits: 127 })), b"f 4 127")
+}
+
+test "a fixed-width constant is held truncated to its width, a signed one sign-extended" {
+  assert_eq(
+    const_line(ConstFixed({ width: 4, bits: 0 - 1 })),
+    b"f 4 340282366920938463463374607431768211455",
+  );
+  assert_eq(const_line(ConstFixed({ width: 1, bits: 0 - 1 })), b"f 1 65535");
+  assert_eq(
+    const_line(ConstWide({ width: 8, high: 0 - 1, low: 0 - 1 })),
+    b"f 8 340282366920938463463374607431768211455",
+  );
+  assert_eq(const_line(ConstWide({ width: 9, high: 0, low: 5 })), b"f 9 5");
+  assert_eq(const_line(ConstWide({ width: 8, high: 1, low: 0 })), b"f 8 18446744073709551616")
+}
+
+test "a float is its bits and a decimal its mantissa and scale, as the literal reads" {
+  assert_eq(const_line(ConstFloat(b"1.5")), b"x 3ff8000000000000");
+  assert_eq(const_line(ConstFloat(b"-2_000.0")), b"x c09f400000000000");
+  assert_eq(const_line(ConstDecimal(b"1.50m")), b"d 150 2");
+  assert_eq(const_line(ConstDecimal(b"-0.05m")), b"d -5 2");
+  assert_eq(const_line(ConstDecimal(b"12m")), b"d 12 0")
+}
+
+test "a C string literal holds printable bytes as they are and the rest in octal" {
+  assert_eq(escaped(b"a\"b\\c?\n\x01z"), b"a\\\"b\\\\c\\077\\012\\001z");
+  assert_eq(literal_lines(b""), b"\"\\n\"\n");
+  let long = bytes_concat_all(map(range(0, 2001), |_: Int| b"x"));
+  let pieces = bytes_split(literal_lines(long), b"\n");
+  assert_eq(len(pieces), 3);
+  assert_eq(bytes_len(at(pieces, 0)), 2002);
+  assert_eq(at(pieces, 1), b"\"x\\n\"")
+}
+
+test "lines are read as a final newline ends the last one" {
+  assert_eq(split_lines(b"a\nb\n"), [b"a", b"b"]);
+  assert_eq(split_lines(b"a\r\n\nb"), [b"a", b"", b"b"])
+}
+
+test "a body dropped for a callee never offered is the offer's doing, and so is its fallout" {
+  let dropped = [
+    { function: b"m.a", construct: b"why", missing: None },
+    { function: b"m.b", construct: b"lost", missing: Some(b"m.out") },
+    { function: b"m.c", construct: b"lost", missing: Some(b"m.b") },
+    { function: b"m.d", construct: b"lost", missing: Some(b"m.a") },
+  ];
+  assert_eq(map(fatal([b"m.a", b"m.b", b"m.c", b"m.d"], dropped), |d: Dropped| d.function), [
+    b"m.a",
+    b"m.d",
+  ])
+}
+
+fn one_body(name: Bytes, calls: List<Bytes>) -> Answer =
+  Body({
+    text: bytes_concat_all([b"Word f_", name, b"(PlyCtx *ctx) { return @@c0@@ + @@r@@; }"]),
+    tables: {
+      consts: [ConstStr(name)],
+      builtins: [],
+      fields: [],
+      shapes: [],
+      lambdas: [],
+      calls: calls,
+      performs: [],
+      handles: [],
+      members: [],
+      symbols: [{ symbol: bytes_concat(b"f_", name), entry: bytes_concat(b"e_", name) }],
+    },
+  })
+
+test "a unit takes what its callees let it, resolves its bodies and says what it holds" {
+  let runtime = {
+    head: b"/* head */\n",
+    tail: b"/* tail */\n",
+    helpers: [{ name: b"rt_a", args: 1, answers: true }],
+    builtins: [],
+    identity: b"r",
+  };
+  let answers = map_insert(
+    map_insert(map_new(), b"m.f", one_body(b"m.f", [])),
+    b"m.g",
+    one_body(b"m.g", [b"m.gone"]),
+  );
+  let p = produce(
+    runtime,
+    [{ name: b"None", arity: 0 }],
+    [{ name: b"m.g", arity: 0, constant: false }, { name: b"m.f", arity: 0, constant: true }],
+    1,
+    answers,
+  );
+  assert_eq(p.taken, [b"m.f"]);
+  assert_eq(map(p.dropped, |d: Dropped| d.function), [b"m.g"]);
+  assert(bytes_index_of(p.text, b"Word f_m.f(PlyCtx *ctx) { return 0 + ") != None, None);
+  assert(bytes_index_of(p.text, b"Word f_m.f(PlyCtx*);\n") != None, None);
+  assert(
+    bytes_index_of(p.text, b"/* tail */\n\n/* --- what this unit says about itself") != None,
+    None,
+  );
+  assert(
+    bytes_index_of(
+        p.text,
+        b"\"taken 1\\n\"\n\"m.f 0 f_m.f e_m.f\\n\"\n\"constants 1\\n\"\n\"m.f\\n\"",
+      )
+      != None,
+    None,
+  )
+}
