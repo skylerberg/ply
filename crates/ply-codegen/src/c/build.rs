@@ -5,7 +5,7 @@ use super::Refused;
 use super::exports::{Exports, Taken};
 use super::load::{Library, compile_and_load, compile_and_load_timed};
 use super::tables::{Defined, Positions, Unit, bucket_mark, bucket_of, root_id};
-use super::{HELPERS, PRELUDE, helper_addresses, runtime_header, runtime_object};
+use super::{HELPERS, helper_addresses, runtime_object};
 use crate::heap::{Heap, Word, mark_immortal};
 use crate::rt::Entry;
 use crate::rt::{Ctx, Root, Tables};
@@ -217,25 +217,6 @@ fn emit_all(
         );
         if let Some((asked, answered)) = super::producer::with_current(|p| p.counts()) {
             eprintln!("ply emitter answered {answered} of {asked} bodies asked of it");
-        }
-    }
-    if let Ok(want) = std::env::var("PLY_C_DUMP") {
-        if want == "*" {
-            let mut sizes: Vec<(usize, &str)> = bodies
-                .iter()
-                .map(|b| (b.text.lines().count(), b.name.as_str()))
-                .collect();
-            sizes.sort_by(|a, b| b.0.cmp(&a.0));
-            let lines: usize = sizes.iter().map(|(n, _)| n).sum();
-            eprintln!("unit: {lines} lines over {} bodies", bodies.len());
-            for (n, name) in sizes.iter().take(8) {
-                eprintln!("  {n:6} lines  {name}");
-            }
-        }
-        for body in &bodies {
-            if body.name == want {
-                eprintln!("--- {} ---\n{}", body.name, body.text);
-            }
         }
     }
     Emitted {
@@ -751,9 +732,7 @@ fn resolve(
 /// ([`Exports::embed`] is `embedded`). `super::load::split` cuts it back on those marks.
 fn assemble(bodies: &[Body], exports: &Exports, embedded: &str) -> String {
     let taken: HashMap<&str, &Taken> = exports.taken.iter().map(|t| (t.name.as_str(), t)).collect();
-    let mut out = String::from(PRELUDE);
-    out.push_str(&runtime_header());
-    out.push('\n');
+    let mut out = super::unit_head();
     let mut bucketed: Vec<(u8, &Body)> = bodies
         .iter()
         .map(|body| (bucket_of(&body.name), body))

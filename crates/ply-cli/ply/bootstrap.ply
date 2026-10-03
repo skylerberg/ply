@@ -1,28 +1,27 @@
-// `ply bootstrap` — the front end written out as the bundle the runtime builds it from: the C
-// gzipped as `unit.c.gz`, beside the `SOURCES.digest` of the modules it came from. Producing
-// that C, hashing it and landing the two files is the emitter's work, which is the host's side
-// of this command; what `--verify` makes of it and what either run says are here.
+// `ply bootstrap` — the compiler written out as the bundle the runtime builds its emitter from: its
+// unit's C gzipped as `unit.c.gz`, beside the `SOURCES.digest` of the modules it came from. The
+// front end, the emission and the unit are this program's, and so is what `--verify` makes of them.
 
 import args (Flags, style_of)
+import cache (Front)
+import builder (builder)
 import diagnostic (Place)
-import program (outside)
+import paths (Rooted, child, create_dir, read_file, spelled, write_file)
+import program (Timed, front_of, outside, timed_load)
 import report (Answer, ok_code, compile_error, refused, reported)
 import style (Style, plain)
+import units (emit, every_root, whole)
+import compiler.front (ModuleRow)
+import compiler.hash (hex)
 import compiler.resolve (Diag, diag1)
+import std.fs (fs)
+import std.hash (blake3)
 import std.json (Json, Str, Bool, Number, Array, object)
-
-// The emission, which runs when the program performs it: what comes back is what was done, the
-// bundle on disk beside whatever `--verify` read back from it.
-pub nondet effect archive {
-  write emitted[r](options: Options) -> Result<Emitted, Refusal>
-}
+import std.random (entropy)
+import std.time (time)
 
 // What `ply bootstrap` is configured with, as the program parses it.
-pub type Options = { path: String, out: String, verify: Bool, profile: String }
-
-// Why nothing was emitted. `compilation` is a program that did not check, which is the user's to
-// fix and is tallied as such.
-pub type Refusal = { diags: List<Diag>, places: List<Place>, compilation: Bool }
+pub type Options = { out: String, verify: Bool }
 
 // The two digests an archive is described by: over the sources it came from, and over the
 // gzipped C it holds.
@@ -34,7 +33,6 @@ pub type Emitted = {
   // Over `unit.c.gz`, which is what `--verify` checks.
   artifact: String,
   definitions: Int,
-  refusals: Int,
   bytes: Int,
   // Where the bundle lives, whether or not one is there.
   at: String,
@@ -56,12 +54,7 @@ fn nowhere(message: String, label: Bytes) -> Diag =
 fn no_archive(at: String) -> Diag =
   nowhere("no archive at " ++ at, b"`--verify` compares against an archive already written")
 
-fn stopped(s: Style, why: Refusal) -> Answer =
-  if why.compilation { refused(s, "bootstrap", why.diags, why.places) }
-  else { reported(s, "bootstrap", why.diags, why.places) }
-
-fn refusing(s: Style, d: Diag) -> Answer =
-  stopped(s, { diags: [d], places: [], compilation: false })
+fn refusing(s: Style, d: Diag) -> Answer = reported(s, "bootstrap", [d], [])
 
 // --- `--verify` -------------------------------------------------------------------
 
@@ -115,9 +108,7 @@ pub fn wrote(e: Emitted) -> Answer =
       { key: "archive", value: described(e) },
     ]),
     lines: [
-      int_to_string(e.definitions) ++ " definitions, " ++ int_to_string(e.refusals) ++ " refused, "
-        ++ int_to_string(e.bytes)
-        ++ " bytes of C",
+      int_to_string(e.definitions) ++ " definitions, " ++ int_to_string(e.bytes) ++ " bytes of C",
       "source   " ++ e.source,
       "artifact " ++ e.artifact,
       "wrote    " ++ e.at,
@@ -126,22 +117,88 @@ pub fn wrote(e: Emitted) -> Answer =
     code: ok_code(),
   }
 
-pub fn run(flags: Flags) -> Answer / {archive.emitted[bootstrap]} = {
+fn unit_file() -> String = "unit.c.gz"
+
+fn sources_file() -> String = "SOURCES.digest"
+
+// The version an archive is of: every module the program was built from, its own and the shipped
+// ones it pulled, by name, as the runtime digests the emitter it embeds.
+fn sources_digest(front: Front) -> String = {
+  let named = map_values(
+    fold(front.dump.modules, map_new(), |acc: Map<Bytes, Bytes>, m: ModuleRow|
+      map_insert(
+        acc,
+        m.name,
+        bytes_concat_all([
+          m.name,
+          b"\x00",
+          match list_at(front.files, m.index) { Some(f) -> f.text, None -> b"" },
+          b"\x00",
+        ]),
+      )),
+  );
+  string_slice(string_of_bytes(hex(blake3(bytes_concat_all(named)))), 0, 16)
+}
+
+fn unwritable(at: String) -> Diag =
+  nowhere("could not write the archive at " ++ at, b"the archive could not be written")
+
+fn recorded_at(out: Rooted) -> Option<Described> / {fs.read_file[cwd], fs.read_file[abs]} =
+  match read_file(child(out, sources_file())) {
+    None -> None,
+    Some(digest) -> match read_file(child(out, unit_file())) {
+      None -> None,
+      Some(unit) ->
+        Some({
+          source: string_trim(string_of_bytes(digest)),
+          artifact: string_of_bytes(hex(blake3(unit))),
+        }),
+    },
+  }
+
+fn landed(
+  out: Rooted,
+  packed: Bytes,
+  source: String,
+) -> Bool / {fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs]} =
+  create_dir(out) && write_file(child(out, unit_file()), packed)
+    && write_file(child(out, sources_file()), bytes_of_string(source ++ "\n"))
+
+pub fn run(
+  flags: Flags,
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, emit.unit} = {
   let s = style_of(flags);
-  match archive.emitted[bootstrap](options_of(flags)) {
-    Err(why) -> stopped(s, why),
-    Ok(e) -> if flags.action == "verify" { verified(s, e) } else { wrote(e) },
+  let options = options_of(flags);
+  let t: Timed = timed_load(flags.paths, false, false);
+  match t.program.whole {
+    None -> refused(s, "bootstrap", t.program.diags, t.program.places),
+    Some(w) -> {
+      let front = front_of(t, w);
+      match whole(front) {
+        Err(diags) -> reported(s, "bootstrap", diags, t.program.places),
+        Ok(text) -> {
+          let packed = bytes_gzip(text);
+          let out = spelled(options.out);
+          let emitted = {
+            source: sources_digest(front),
+            artifact: string_of_bytes(hex(blake3(packed))),
+            definitions: len(every_root(front)),
+            bytes: bytes_len(text),
+            at: options.out,
+            recorded: None,
+          };
+          if options.verify { verified(s, { ..emitted, recorded: recorded_at(out) }) }
+          else if landed(out, packed, emitted.source) { wrote(emitted) }
+          else { refusing(s, unwritable(options.out)) }
+        },
+      }
+    },
   }
 }
 
 // The options the archive is written under, from the parsed line.
 fn options_of(flags: Flags) -> Options =
-  {
-    path: match list_at(flags.paths, 0) { Some(r) -> r.machine, None -> "." },
-    out: match flags.out { Some(o) -> o, None -> "bootstrap" },
-    verify: flags.action == "verify",
-    profile: match flags.profile { Some(p) -> p, None -> "release" },
-  }
+  { out: match flags.out { Some(o) -> o, None -> "bootstrap" }, verify: flags.action == "verify" }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -150,7 +207,6 @@ fn an_archive() -> Emitted =
     source: "1a2b",
     artifact: "3c4d",
     definitions: 12,
-    refusals: 0,
     bytes: 4096,
     at: "bootstrap",
     recorded: None,
@@ -160,7 +216,7 @@ test "a run that wrote the archive reports both digests and where it landed" {
   let answer = wrote(an_archive());
   assert_eq(answer.code, 0);
   assert_eq(answer.lines, [
-    "12 definitions, 0 refused, 4096 bytes of C",
+    "12 definitions, 4096 bytes of C",
     "source   1a2b",
     "artifact 3c4d",
     "wrote    bootstrap",

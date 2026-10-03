@@ -558,8 +558,6 @@ impl Driver {
                 path: f.path.clone(),
             })
             .collect();
-        // Whether the whole-program promise check has anything to check.
-        let promised = front.defs_written.values().any(|w| w.reuse);
         let loaded = Loaded {
             root: self.root,
             files,
@@ -572,7 +570,6 @@ impl Driver {
                 phases: self.phases,
                 warnings,
             },
-            promised,
         };
         Ok(Seeded {
             loaded,
