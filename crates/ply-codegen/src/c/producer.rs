@@ -1256,42 +1256,6 @@ impl KnownRows {
     }
 }
 
-/// Where the rows a driver's loads published are kept between processes: beside the stages, under
-/// the emitter that answered and the runtime it ran on, since another checker's rows are no
-/// evidence for this one.
-fn kept_rows_dir() -> std::path::PathBuf {
-    let mut h = blake3::Hasher::new();
-    for part in ["ply-rows-1", super::RUNTIME, &identity()] {
-        h.update(part.as_bytes());
-        h.update(&[0]);
-    }
-    super::bundle::stage_dir(&format!("rows-{}", &h.finalize().to_hex()[..16]))
-}
-
-/// The rows the last load of `program` kept, or none.
-pub fn kept_rows(program: &str) -> KnownRows {
-    let dir = kept_rows_dir();
-    match std::fs::read(dir.join(program)) {
-        Ok(bytes) => {
-            super::sweep::used(&dir);
-            KnownRows(bytes)
-        }
-        Err(_) => KnownRows::default(),
-    }
-}
-
-/// Keeps `rows` for the next load of `program`; a failed write costs that load its seeding only.
-pub fn keep_rows(program: &str, rows: &KnownRows) {
-    if rows.0.is_empty() {
-        return;
-    }
-    let dir = kept_rows_dir();
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = ply_eval::files::write_atomically(&dir.join(program), &rows.0);
-        super::sweep::used(&dir);
-    }
-}
-
 /// What [`front_rows_pulling_std_with`] answered.
 pub struct RowsAnswered {
     pub pulled: Pulled,

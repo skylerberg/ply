@@ -14,6 +14,7 @@ mod judged_effect;
 mod judging;
 mod prover_runs;
 mod reused;
+mod runnable;
 mod seeded;
 mod tester_ops;
 mod testrun;

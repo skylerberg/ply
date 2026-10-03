@@ -1,22 +1,22 @@
-//! The launcher: enter a shipped artifact with the command line, its shelf beside it, and its
+//! The launcher: enter a shipped program with the command line, its shelf beside it, and its
 //! environment lent.
 //!
 //! This is the whole of what stands between the operating system and the program `ply` is: the
-//! big-stack thread, the artifact open, the `cwd` and `shelf` roots, the process and environment
+//! big-stack thread, the runnable opened, the `cwd` and `shelf` roots, the process and environment
 //! bindings, and the exit code.
 
 use ply_eval::{Diagnostic, Ended, codes};
-use ply_machine::artifact::{self, Artifact, Binds, Opened};
+use ply_machine::artifact::{self, Binds};
+use ply_machine::runnable::Runnable;
 use std::path::{Path, PathBuf};
 
 /// The front end and emitter recurse once per node on the native stack.
 const STACK: usize = 256 << 20;
 
-/// What a launched program is: what it is entered from, the shelf its modules lay out as, the root
-/// its `cwd` names, and the binary's version for the environment it may ask about.
+/// What a launched program is: the runnable it is entered from, the shelf its modules lay out as,
+/// the root its `cwd` names, and the binary's version for the environment it may ask about.
 pub struct Program {
-    pub image: shipped::Image,
-    pub artifact_name: String,
+    pub runnable: Runnable,
     pub shelf: Vec<(String, String)>,
     /// The stage's identity: the shelf lands beside the unit cache under it.
     pub stage: String,
@@ -132,7 +132,7 @@ pub fn run(
     };
     ply_machine::shipped::stamp(stamps());
     let version = program.version.clone();
-    let (artifact, opened) = match opened(program) {
+    let opened = match artifact::opened_runnable(program.runnable, Path::new(shipped::ROOT)) {
         Ok(opened) => opened,
         Err(refused) => return Ended::refused(refused),
     };
@@ -167,7 +167,7 @@ pub fn run(
                     let (answer, counted, sites) = crate::count::window_sampled(
                         || {
                             ply_codegen::rt::unbounded(|| {
-                                entered(artifact.as_ref(), &opened, argv, binds)
+                                artifact::enter_runnable(opened, argv, binds)
                             })
                         },
                         asked.every(),
@@ -184,7 +184,7 @@ pub fn run(
                     answer
                 }
                 None => {
-                    ply_codegen::rt::unbounded(|| entered(artifact.as_ref(), &opened, argv, binds))
+                    ply_codegen::rt::unbounded(|| artifact::enter_runnable(opened, argv, binds))
                 }
             }
         });
@@ -203,51 +203,7 @@ pub fn run(
     }
 }
 
-/// The program opened from its image: the committed artifact decoded and opened, or the sources'
-/// load as it stands.
-fn opened(program: Program) -> Result<(Option<Artifact>, Opened), Diagnostic> {
-    match program.image {
-        shipped::Image::Committed(bytes) => {
-            let path = PathBuf::from(&program.artifact_name);
-            let (artifact, _) = artifact::decode(&bytes, &path)?;
-            let opened = artifact::open(&artifact, &path).map_err(|diagnostics| {
-                diagnostics.into_iter().next().unwrap_or_else(|| {
-                    Diagnostic::error(
-                        codes::INTERNAL_ERROR,
-                        "the program did not open, and nothing said why",
-                    )
-                })
-            })?;
-            Ok((Some(artifact), opened))
-        }
-        shipped::Image::Loaded(loaded) => {
-            let entry = loaded.sole_entry_point()?.name.clone();
-            let loaded = *loaded;
-            let front = std::sync::Arc::try_unwrap(loaded.front).unwrap_or_else(|f| (*f).clone());
-            Ok((
-                None,
-                Opened {
-                    sources: loaded.sources,
-                    front,
-                    entry,
-                },
-            ))
-        }
-    }
-}
-
-fn entered(
-    artifact: Option<&Artifact>,
-    opened: &Opened,
-    argv: Vec<String>,
-    binds: Binds,
-) -> Ended<i32> {
-    match artifact {
-        Some(artifact) => artifact::enter(artifact, opened, argv, binds),
-        None => artifact::enter_loaded(opened, argv, binds),
-    }
-}
-
+pub mod builder;
 pub mod code;
 pub mod count;
 pub mod env;

@@ -10,9 +10,8 @@ static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 fn main() {
     ply_host::time::mark_start(std::time::Instant::now());
     let program = match ply_launcher::shipped::program() {
-        Ok(image) => Program {
-            image,
-            artifact_name: ply_launcher::shipped::ARTIFACT.to_string(),
+        Ok(runnable) => Program {
+            runnable,
             shelf: ply_machine::shelf::sources().to_vec(),
             stage: format!("cli-{}", ply_launcher::shipped::identity()),
             version: env!("CARGO_PKG_VERSION").to_string(),
